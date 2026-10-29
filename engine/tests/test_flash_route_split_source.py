@@ -4,7 +4,7 @@
 
 1. OFF surface: the decode router (k_router_linear / glue.cuh / flash_mlp.cuh / rank.cuh / flash_step.cuh) and the router kernels
    themselves keep BASE's bytes, except NK's additive prefill-only MhcFabricPeerBlock; Expert::pre_routed is the LAST member of
-   Expert; launch_route runs k_pf_route unless pre_routed,
+   Expert but the Flash-only G6_PF_Q8 fields after it; launch_route runs k_pf_route unless pre_routed,
    count and fill always (the skip sits INSIDE bindp::launch_route, so every caller inherits it); the OFF block calls
    launch_router on all M exactly as before.
 2. ON order: router on own rows -> own-row route -> publish -> hx -> shared -> receive -> pre_routed -> experts.
@@ -68,7 +68,9 @@ class OffSurface(unittest.TestCase):
     def test_pre_routed_is_last_member(self):
         s = src('engine/kernels/bind_prefill.cuh')
         body = between(s, 'struct Expert\n{', '\n};\n')
-        decl = [l for l in body.split('\n') if re.match(r'    (int|const|float|__half|uint|long)', l)]
+        q8 = body.find('#if G6_MODEL_FLASH', body.index('int pre_routed'))   # the Flash-only G6_PF_Q8 fields follow it
+        core = body if q8 < 0 else body[:q8]
+        decl = [l for l in core.split('\n') if re.match(r'    (int|const|float|__half|uint|long)', l)]
         self.assertTrue(decl[-1].startswith('    int pre_routed = 0;'), decl[-1])
         self.assertEqual(body.count('pre_routed'), 1)
 

@@ -323,6 +323,9 @@ inline void bind_mlp_prefill(Model& m, Prefill& P, cudaStream_t st)
         }
 }
 
+// G6_PF_SP_FIND (FlashPrefill only): the MoE final sum writes its rows straight into the reduce-scatter send slot
+template <class Pf> auto pf_fin_rs(Pf& p, int) -> decltype(p.fin_rs, (const bindp::RsOut*)nullptr) { return p.fin_rs.base ? &p.fin_rs : nullptr; }
+template <class Pf> const bindp::RsOut* pf_fin_rs(Pf&, long) { return nullptr; }
 template <class Prefill>
 inline void pf_mlp_block_gemm(Model& m, Prefill& P, int i, int M, cudaStream_t st)
 {
@@ -389,6 +392,7 @@ inline void pf_mlp_block_gemm(Model& m, Prefill& P, int i, int M, cudaStream_t s
 
     if (L.moe)
     {
+        if (const bindp::RsOut* o = pf_fin_rs(P, 0)) L.ex.rs = *o;
         // FP32 router input (no BF16 rounding before top-k), 0-ULP bit-identical to flash_mlp::k_linear
         // G6_PF_ROUTER_SPLIT (opt-in): this rank routes its own rows only, publishes them, and takes the peers' rows after the
         // hx / shared launches; launch_route then skips k_pf_route (Expert::pre_routed). Off: the replicated path below.

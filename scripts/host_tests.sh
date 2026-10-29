@@ -1,20 +1,11 @@
 #!/bin/bash
-# Host-only tests (g++, no CUDA): the switchless relay's ring and credit accounting, the S2 batch planner
-# (engine/runtime/s2_batch.h, with a DFlash2 session, its reuse (G6_DFL_REUSE) and the insert
-# rule), the S2 control barrier, the pool's page lists
-# Host-only tests (g++, no CUDA): the fabric's QP MTU choice, the fabric pool's groups (#154), the switchless relay's ring and credit accounting, the S2 batch planner
-# (engine/runtime/s2_batch.h, with a DFlash2 session and the insert rule), the S2 control barrier, the pool's page lists
-# (engine/runtime/s2_batch.h, with a DFlash2 session, its reuse (G6_DFL_REUSE), the insert rule
-# and the MTP confidence stop), the S2 control barrier, the pool's page lists
-# (engine/runtime/s2_batch.h, with a DFlash2 session, its reuse (G6_DFL_REUSE), the insert rule,
-# the MTP confidence stop and the parallel drafter step (G6_DRAFT_PAR)), the S2 control barrier, the pool's page lists
-# and prefix reuse (s2/pool.h over the Rust pool in engine/kvman-rs, and pool_diff_test: that pool against the C++ one
-# it replaced), runs that grow on demand through Driver::step (driver_grow_test, with insert rules), the scheduler's
-# prefill choice and its deferral bound (scheduler_fair_test), its notice target's sizing (scheduler_horizon_test),
-# the pool's block
-# store in lock-step with its copies run through memory, a file and a loopback KV node (pool_stash_test), the commit
-# frame (s2/control_protocol.h), the pack manifest parser (engine/loader/g6pack.cpp), and the host memory reclaim
-# after load (engine/runtime/host_reclaim.h), and steering profile contracts/validation.
+# Host-only tests (g++ and cargo, no CUDA) of the engine's CPU-side logic: the build's object cache, steering contracts,
+# the fabric (QP MTU choice, the pool's groups, the switchless relay's ring and credits), the S2 batch planner
+# (engine/runtime/s2_batch.h: DFlash2 sessions and their reuse, the insert rule, the MTP confidence stop, the parallel
+# drafter step), the scheduler, the KV pool over the Rust page allocator in engine/kvman-rs and its block stores (memory,
+# a file, loopback KV nodes), the control protocol, the pack manifest parser, host memory reclaim, and the Flash ring,
+# checkpoint and prefill split rules.
+# .github/ci/cpu-tests.sh engine (./gr8 test engine) runs it with the other host tests.
 #   scripts/host_tests.sh
 set -eu
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -27,7 +18,8 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engin
 "$T/steering_test" "$REPO/engine/runtime/tests/fixtures/steering_contract.json"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/fabric_mtu_test.cpp" -o "$T/fabric_mtu_test"
 "$T/fabric_mtu_test"
-g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/tests/relay_test.cpp" -o "$T/relay_test"
+g++ -std=c++17 -O2 -Wall -fsanitize=address,undefined -I "$REPO/engine/comms" "$REPO/engine/comms/tests/relay_test.cpp" \
+  -o "$T/relay_test"
 "$T/relay_test"
 python3 "$REPO/engine/comms/tests/relay_loop_test.py"
 # the fabric pool (engine/comms/fabric_pool.h, #154): boot, groups and their ports over loopback, no leaked descriptor
@@ -48,6 +40,11 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 "$T/batch_dflash_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dsel_test.cpp" -o "$T/batch_dsel_test"
 "$T/batch_dsel_test"
+# the n-gram table as a draft source (G6_NGRAM, #56): the table file, chains, the round choice, exact output
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_ngram_test.cpp" -o "$T/batch_ngram_test"
+"$T/batch_ngram_test" 2>/dev/null    # the G6_MTP_LPLOG case prints its round lines
+g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/ngram_lookup_check.cpp" -o "$T/ngram_lookup_check"
+(cd "$REPO/tools/ngram/tests" && NGRAM_LOOKUP_CHECK="$T/ngram_lookup_check" python3 -m unittest -q test_ngram.ExportTest)
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dflreuse_test.cpp" -o "$T/batch_dflreuse_test"
 "$T/batch_dflreuse_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_insert_test.cpp" -o "$T/batch_insert_test"
@@ -100,11 +97,31 @@ if [ -x "$NODE" ]; then   # a small unlocked node on loopback (RLIMIT_MEMLOCK in
   for _ in $(seq 50); do [ -s "$T/node.json" ] && break; sleep 0.1; done
   PORT=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$T/node.json")
   [ -n "$PORT" ] && STORES+=("remote:127.0.0.1:$PORT")
+  # the same node with --lazy-lock: each lease's range is backed only while it lives (it locks where RLIMIT_MEMLOCK
+  # allows the lease, and runs unlocked otherwise)
+  LOCK=--no-lock; [ "$(ulimit -l)" = unlimited ] || [ "$(ulimit -l)" -ge 131072 ] && LOCK=
+  "$NODE" --gb 0.05 --port 0 --bind 127.0.0.1 --min-free-gb 0 $LOCK --lazy-lock --ready "$T/lazy.json" > "$T/lazy.log" 2>&1 &
+  LAZY_PID=$!
+  for _ in $(seq 50); do [ -s "$T/lazy.json" ] && break; sleep 0.1; done
+  LPORT=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$T/lazy.json")
+  [ -n "$LPORT" ] && STORES+=("remote:127.0.0.1:$LPORT")
 fi
 "$T/pool_stash_test" "${STORES[@]}"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_namespace_test.cpp" "${KVLIB[@]}" -o "$T/pool_namespace_test"
 "$T/pool_namespace_test" "${STORES[@]}"
 [ -n "${NODE_PID:-}" ] && kill "$NODE_PID"
+[ -n "${LAZY_PID:-}" ] && kill "$LAZY_PID"
+# a pool tier on a group lease that grows into the node's grant, gives a segment back when another cluster asks, and
+# shrinks to its floor, through the C interface (s2/kv_share.h): a second node with 2 MiB segments and no margin
+if [ -x "$NODE" ]; then
+  g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/kv_share_test.cpp" "${KVLIB[@]}" -o "$T/kv_share_test"
+  "$NODE" --gb 0.05 --seg-mb 2 --margin-s 0 --port 0 --bind 127.0.0.1 --min-free-gb 0 --no-lock --no-rdma --ready "$T/share.json" > "$T/share.log" 2>&1 &
+  SHARE_PID=$!
+  for _ in $(seq 50); do [ -s "$T/share.json" ] && break; sleep 0.1; done
+  SPORT=$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$T/share.json")
+  "$T/kv_share_test" "remote:127.0.0.1:$SPORT"
+  kill "$SHARE_PID"
+fi
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_protocol_test.cpp" -o "$T/control_protocol_test"
 "$T/control_protocol_test"
 # a held event boundary (Commit::hold): queued admissions chained at one boundary, three ranks on socket pairs
@@ -143,8 +160,18 @@ g++ -std=c++17 -O2 -ffp-contract=off -DG6_MODEL_FLASH=1 "$REPO/engine/kda/tests/
 "$T/kda_carry_cpu_test"
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_tp2_test.cpp" -o "$T/control_tp2_test"
 "$T/control_tp2_test"
+# FLASH_CAP_POLICY=borrow-idle's rule (s2/flash_lend.h) and the ACK's room (Ack::room): lend once idle, recall before a
+# request that needs the chunks, the head admits within the least room over the ranks
+g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/flash_lend_test.cpp" -o "$T/flash_lend_test"
+"$T/flash_lend_test"
+# the Flash prefill checkpoint waits for the boundary's commits (s2/flash_native.cuh h.before_work): a grow announced
+# during the prefill lands before the capture, on two ranks through the real Service loop
+g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/flash_capture_order_test.cpp" "${KVLIB[@]}" -o "$T/flash_capture_order_test"
+(cd "$T" && "$T/flash_capture_order_test" 2>/dev/null)
 g++ -std=c++17 -O2 -Wall "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_flash_s2_cost"
 "$T/test_flash_s2_cost"
+g++ -std=c++17 -O2 -Wall -DG6_NR=3 "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_flash_s2_cost_tp3"
+"$T/test_flash_s2_cost_tp3"
 g++ -std=c++17 -O2 -Wall -DG6_MODEL_FLASH=0 "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_full_s2_cost"
 "$T/test_full_s2_cost"
 python3 "$REPO/engine/tests/test_flash_serve_check.py"
@@ -161,3 +188,43 @@ for t in test_flash_route_split test_flash_route_split_tp4 test_flash_route_spli
   "$T/$t"
 done
 python3 "$REPO/engine/tests/test_flash_route_split_source.py"
+# Flash session checkpoints (G6_FLASH_CACHE): aligned points, the index's match/LRU/first-fit, the manifest seal.
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/tests/test_flash_ckpt_index.cpp" -o "$T/test_flash_ckpt_index"
+"$T/test_flash_ckpt_index"
+# G6_FLASH_CACHE=terminal: the actual retain hook against CPU mocks (rows, ring slot, tokens, nothing kept).
+python3 "$REPO/engine/tests/test_flash_terminal_retain.py"
+# G6_FLASH_CACHE=terminal, a cancel at the boundary the aligned capture waits for: flash_native.cuh's own hooks through
+# the real Service on two ranks; the entry stays aligned and a longer prompt keeps its own aligned checkpoint
+python3 "$REPO/engine/tests/test_flash_terminal_cancel.py"
+# the adaptive draft length decision, and the top-k selection
+g++ -std=c++17 -O2 "$REPO/engine/tests/test_spec_len.cpp" -o "$T/test_spec_len"
+"$T/test_spec_len"
+g++ -std=c++17 -O2 -I "$REPO/engine/kernels" "$REPO/engine/tests/test_topk.cpp" -o "$T/test_topk"
+"$T/test_topk"
+# the control channel: requests, sync, and idle peers (the socketpair cases; the silent-peer case needs a network
+# namespace)
+for t in control_request_test control_sync_test control_idle_test; do
+  g++ -std=c++17 -O2 -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/$t.cpp" -o "$T/$t"
+  "$T/$t"
+done
+g++ -std=c++17 -O1 -fsanitize=address,undefined -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/serve_parse_test.cpp" \
+  -o "$T/serve_parse_test"
+"$T/serve_parse_test"
+# the fabric's progress CPU lists; needs 3 or more CPUs
+g++ -std=c++20 -O1 -pthread -I "$REPO/engine/comms" "$REPO/tools/health/test_progress_cpus.cpp" -o "$T/test_progress_cpus"
+"$T/test_progress_cpus"
+# CP batching on the CPU, the Flash DSA full-attention schedule, the Flash pool owner's rows and TP2 wire format, the
+# MoE top-k env parse, the Flash per-request speculation reset
+g++ -std=c++17 -O2 "$REPO/engine/runtime/tests/cp_batch_cpu_test.cpp" -o "$T/cp_batch_cpu_test"
+"$T/cp_batch_cpu_test"
+g++ -std=c++17 -O2 "$REPO/engine/runtime/tests/flash_dsa_full_schedule_test.cpp" -o "$T/flash_dsa_full_schedule_test"
+"$T/flash_dsa_full_schedule_test"
+g++ -std=c++17 -O2 "$REPO/engine/tests/test_flash_pool_owner.cpp" -o "$T/test_flash_pool_owner"
+"$T/test_flash_pool_owner"
+g++ -std=c++17 -O2 -I "$REPO/engine/runtime" "$REPO/engine/tests/test_moe_topk_env.cpp" -o "$T/test_moe_topk_env"
+"$T/test_moe_topk_env"
+g++ -std=c++17 -O2 -DG6_MODEL_FLASH=1 "$REPO/engine/tests/test_spec_reset.cpp" -o "$T/test_spec_reset"
+"$T/test_spec_reset"
+# the glue kda_g9_test.cu feeds the KDA G9 CPU emulation with (kda_g9_glue.h), on two heads
+g++ -std=c++17 -O3 -fopenmp -DG6_MODEL_FLASH=1 "$REPO/engine/kda/tests/kda_g9_glue_test.cpp" -o "$T/kda_g9_glue_test"
+"$T/kda_g9_glue_test"

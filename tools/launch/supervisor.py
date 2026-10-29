@@ -23,6 +23,8 @@ import urllib.request
 import fabric
 import handshake
 import hfsource
+import kvnode
+import mlsource
 import mentat
 import models
 import modelset
@@ -146,11 +148,20 @@ def resolve_model(o, refresh=False, log=log):
         steering = steering_hf.request(o)
         if steering and not hf:
             raise modelset.ModelError('--steering-profile hf:... requires an HF release (--model https://...)')
-        if hf:
+        if models.of(o) is models.PSEUDO:
+            if not modelset.is_pseudo(model):
+                raise modelset.ModelError(f'--model {model}: want a pseudo engine release, a directory with '
+                                          'responses.toml and the tokenizer files')
+            ms = modelset.pseudo_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
+        elif hf:
             if not o.get('MODEL_CACHE'):
                 raise modelset.ModelError(f'--model {model} needs --model-cache <local dir>: each box fetches its part '
                                           'there')
-            release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log)
+            if o.get('FETCH') == 'model-loader':
+                release = mlsource.of(o, *hf, log=log)
+            else:
+                release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log,
+                                           layout=o.get('LAYOUT'))
             release.fetch_meta(steering[0] if steering else None)
             o.values['V2'], o.values['V2_SLICES'] = release.v2, release.slices
             model = release.dir
@@ -164,6 +175,8 @@ def resolve_model(o, refresh=False, log=log):
             raise modelset.ModelError(f'--model {model}: want an exlr8 release, https://huggingface.co/<org>/<repo>[@rev] '
                                       'or a local copy of one (dense/, experts/, index-slices/, manifests/)'
                                       if model else 'no model: pass --model <exlr8 release URL or directory>')
+        # a release for the other model is refused here, by name, before the variant, the drafter or any weights
+        models.check_config(models.of(o), ms.tokenizer)
         o.values['V2_DENSE'] = model
         ms.release = release
         search = [model]
@@ -171,7 +184,6 @@ def resolve_model(o, refresh=False, log=log):
         variant = modelset.resolve_variant(spec, o.get('V2'), search, int(o.get('TP')), models.of(o))
         if variant.path:
             o.values['V2_WIDTHS'] = variant.path
-        models.check_config(models.of(o), ms.tokenizer)
         if o.get('GRAMMAR') == '1' and not o.get('GRAMMAR_DIR'):
             o.values['GRAMMAR_DIR'] = ms.tokenizer
         if o.get('GRAMMAR') != '1' or models.of(o) is not models.GLM53:   # Flash serves outside the S2 dispatch
@@ -199,8 +211,11 @@ def drafter_of(o, ms, refresh, log):
             raise modelset.ModelError('--drafter needs --model-cache <local dir>: each box converts its rank there')
         if o.get('DFLASH') == '0':
             return None
-        d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(o.get('DRAFTER')), refresh=refresh, log=log,
-                             tp=int(o.get('TP')))
+        if o.get('FETCH') == 'model-loader':
+            d = mlsource.drafter_of(o, *hfsource.parse_url(o.get('DRAFTER')), log=log)
+        else:
+            d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(o.get('DRAFTER')), refresh=refresh,
+                                 log=log, tp=int(o.get('TP')))
         o.values['DFLASH_DIR'] = d.out
         return d
     if o.get('DFLASH') == '0' or o.get('DFLASH_DIR'):
@@ -265,12 +280,15 @@ class Supervisor:
         self.head_ready = threading.Event()
         self.engine = None
         self.helpers = {}             # the head's front end and shim: name -> Popen
+        self.donor = False            # a KV node beside a Flash serve runs (donate)
         self.agent = self.api_agent = None
         self.rank, self.lan, self.members, self.hs = None, None, [], {}
         self.state = 'starting'
         self.servers = []
         self.locked = self.started = False
         self.ms, self.model_error, self.rails, self.fabric_error = None, '', ('', ''), ''
+        # --shape ring with mentat: the plan, this box's devices, and the client link that holds the ring claim
+        self.ring, self.ring_devs, self.ring_ports, self.claim_link = '', None, {}, None
         self.offers = self.variant = self.model_id = None
         self.lingered = False
         self.check_n, self.check_lock = 0, threading.Lock()   # the engine's DIR/check.<n>, numbered per boot
@@ -446,6 +464,8 @@ class Supervisor:
             log(f'warning: {w}')
         log(f'gr8 {version(self.home)}, options ({o.file or "no config file"}; command line > file > environment > default):')
         log(opt.summary(o))
+        for line in opt.kv_describe(o):
+            log(line)
         tp = int(o.get('TP'))
         # a box that cannot resolve its model still joins, so every box hears why the boot stops
         self.ms, self.variant, self.model_error = resolve_model(o)
@@ -463,7 +483,8 @@ class Supervisor:
         self.offers = None if self.ms else []     # a release serves any rank; a box without a model serves none
         log(f'this box can serve rank {mentat.format_offers(self.offers) or "none"} of the model set')
         self.rendezvous(tp)
-        c, text, digest = opt.canonical(o, self.tmpl, self.members if opt.mode(o) == 'peers' else None, self.variant)
+        c, text, digest = opt.canonical(o, self.tmpl, self.members if opt.mode(o) == 'peers' else None, self.variant,
+                                        ring=self.ring)
         self.opts, self.digest = c, digest
         log(f'rank {self.rank} of {tp} ({self.lan}, rails {self.rails[0]} {self.rails[1]}), cluster options '
             f'{digest[:16]}, engine {self.build[:16]}')
@@ -483,7 +504,7 @@ class Supervisor:
                  'engine_build': self.build, 'fails': fails, 'version': version(self.home),
                  'offers': mentat.format_offers(self.offers)}
         self.set_state('handshake')
-        verdict = self.handshake_head(hello) if self.rank == 0 else self.handshake_worker(hello)
+        verdict = self.handshake(hello)
         if verdict.get('t') == 'ok' and fails:   # never boot past a failed check, whatever the verdict
             verdict = {'t': 'refused', 'field': 'checks', 'values': {}, 'detail': '; '.join(fails), 'exit': 4}
         if verdict.get('t') != 'ok':
@@ -517,10 +538,14 @@ class Supervisor:
             self.agent = mentat.Agent(self.daemon, group, f'{group}@gr8@{node_ip}', node_ip, log=log)
             self.agent.set_meta(**{'gr8.version': version(self.home), 'gr8.tp': tp, 'gr8.shape': o.get('SHAPE'),
                                    'gr8.state': 'joining', 'gr8.offers': mentat.format_offers(self.offers)})
+            publish = self.ring_publisher() if o.get('SHAPE') == 'ring' else None
+            if publish:
+                self.claim_link = mentat.ClaimLink(self.daemon, group, f'{group}@gr8-ring@{node_ip}')
             self.agent.start()
             self.set_state('joining')
             try:
-                ranks, _ = mentat.elect(self.daemon, group, tp, o.get('HEAD'), o.int('JOIN_TIMEOUT'), log=log)
+                ranks, _ = mentat.elect(self.daemon, group, tp, o.get('HEAD'), o.int('JOIN_TIMEOUT'), log=log,
+                                        ring=self.claim_link, publish=publish)
             except mentat.NoAssignment as e:
                 raise Stop(4, str(e))
             except RuntimeError as e:
@@ -530,11 +555,13 @@ class Supervisor:
                 raise Stop(1, f'this box ({node_ip}) is not among the members {",".join(self.members)}')
             self.rank, self.lan = self.members.index(node_ip), node_ip
             log(f'mentat group {group}: {",".join(self.members)}; this box is rank {self.rank}')
+            if publish:
+                self.ring_from(ranks)
             if not o.get('IPS') and o.get('SHAPE') != 'ring':
                 self.rails = ranks[self.rank][2]
                 for p in mentat.probe_problems(local, ranks, node_ip, self.rails):
                     log(f'warning: {p}')
-        if o.get('SHAPE') == 'ring':    # no switch: the engine bootstraps over the LAN and finds its devices by name
+        if o.get('SHAPE') == 'ring' or not models.of(o).fabric:   # no switch: the engine bootstraps over the LAN
             self.rails = (self.lan, self.lan)
         elif o.get('IPS'):
             self.rails = (opt.split_list(o.get('IPS'))[self.rank], opt.split_list(o.get('IPS2'))[self.rank])
@@ -545,6 +572,69 @@ class Supervisor:
                 self.fabric_error = f'fabric: {e}'
                 log(self.fabric_error)
 
+    def ring_publisher(self):
+        """--shape ring in mentat mode: a callable that publishes this box's gr8.roots meta (its RoCE v2 addresses and
+        their PCIe root) when it changes. Stop(1) when this box has no RoCE v2 address."""
+        def read_ports():
+            try:
+                return fabric.ring_ports()
+            except OSError as e:
+                raise Stop(1, f'--shape ring: cannot read /sys/class/infiniband ({e})')
+        self.ring_ports = read_ports()
+        if not self.ring_ports:
+            raise Stop(1, '--shape ring: no ACTIVE RoCE v2 address under /sys/class/infiniband: are the ring cables '
+                          'in and addressed?')
+        said = [None]
+
+        def publish():
+            # read again each time: a port that finishes link training during the wait joins the ring
+            self.ring_ports = read_ports()
+            text = mentat.format_roots({a: r for a, (_, r) in self.ring_ports.items()})
+            if text != said[0]:
+                said[0] = text
+                self.agent.set_meta(**{mentat.ROOTS_META: text})
+        return publish
+
+    def handshake(self, hello):
+        """The handshake's verdict, after which the ring claim is let go: every box that passed it has the view, and
+        one that failed claims afresh on its next boot."""
+        try:
+            return self.handshake_head(hello) if self.rank == 0 else self.handshake_worker(hello)
+        finally:
+            self.release_claim()
+
+    def release_claim(self):
+        """Close the ring claim's link: once every box has, mentat drops the claim and the next boot solves afresh."""
+        if self.claim_link:
+            self.claim_link.close()
+
+    def ring_from(self, ranks):
+        """This box's --ring-devs from the ring mentat's probes form: its four addresses, mapped to device names. An
+        explicit --ring-devs wins."""
+        ports = ranks[self.rank][2]
+        self.ring = mentat.ring_text([lan for lan, _, _ in ranks], [p for _, _, p in ranks], self.claim_link.tag)
+        log(f'ring (mentat claim {self.claim_link.tag}): {" -> ".join(lan for lan, _, _ in ranks)} -> {ranks[0][0]}; '
+            f'this box\'s relay-out, next, relay-in, prev: {",".join(ports)}')
+        devs = [self.ring_ports[a][0] for a in ports]
+        for a, d in zip(ports, devs):
+            others = sorted(x for x, (dd, _) in self.ring_ports.items() if dd == d and x != a)
+            if others:   # the engine takes the device's first RoCE v2 IPv4 GID (fabric.cpp ring_gid_index)
+                log(f'warning: --shape ring: {d} carries {a} and {", ".join(others)}; the engine uses its first RoCE '
+                    'v2 address, which may not be the one on the cable')
+        if self.o.get('RING_DEVS'):
+            if opt.split_list(self.o.get('RING_DEVS')) != devs:
+                log(f'warning: --ring-devs {self.o.get("RING_DEVS")} overrides the cabling mentat found '
+                    f'({",".join(devs)})')
+        else:
+            self.ring_devs = ','.join(devs)
+
+    def ring_args(self):
+        """The engine's ring flags: --ring, and --ring-devs from the option or else from mentat's probes."""
+        if self.o.get('SHAPE') != 'ring':
+            return []
+        devs = self.o.get('RING_DEVS') or self.ring_devs
+        return ['--ring', *(['--ring-devs', devs] if devs else [])]
+
     def checks(self, copy=True):
         """What would stop this box's boot, as text. copy: fetch this rank's model files first. The rank's files are
         checked only once the rank is known, and the front end only on rank 0."""
@@ -554,9 +644,9 @@ class Supervisor:
                 pass
             elif copy:
                 rel = self.ms.release
-                if rel and rel.check(int(o.get('TP')), self.rank, self.variant):
+                if rel and (getattr(rel, 'pins', False) or rel.check(int(o.get('TP')), self.rank, self.variant)):
                     rel.fetch_rank(int(o.get('TP')), self.rank, self.variant)
-                if self.ms.drafter and self.ms.drafter.check(self.rank):
+                if self.ms.drafter and (getattr(self.ms.drafter, 'pins', False) or self.ms.drafter.check(self.rank)):
                     self.ms.drafter.fetch_rank(self.rank)
             if self.ms and self.rank is not None:
                 if self.ms.release:
@@ -579,7 +669,7 @@ class Supervisor:
             name = engine_bin(o)
             fails.append(f'no {self.home}/bin/{name}: ' + ('KV_FORMAT=int4 ' if name.endswith('-int4') else '') +
                          f'./gr8 {models.of(o).name} build')
-        if not os.path.isdir('/dev/infiniband'):
+        if models.of(o).fabric and not os.path.isdir('/dev/infiniband'):
             fails.append('no /dev/infiniband')
         if self.rank == 0:
             if not os.access(self.front_bin(), os.X_OK):
@@ -656,7 +746,15 @@ class Supervisor:
         lib = os.path.join(self.home, 'bin', 'lib')
         if os.path.isdir(lib):        # cuBLAS from build.sh BUNDLE_LIBS=1, at any TP
             env['LD_LIBRARY_PATH'] = lib
+        if self.borrow_idle(plan.get('knobs') or {}):
+            # this box's host ledger (donate() creates it); the engine writes the bytes it may lend next to it (.gpu)
+            out = kvnode.out_dir(kvnode.parse(['--g6-home', self.home], dict(os.environ)))
+            os.makedirs(out, exist_ok=True)
+            env['G6_FLASH_KV_LEDGER'] = os.path.join(out, 'ledger')
         return env
+
+    def borrow_idle(self, knobs):
+        return models.of(self.o).name == 'glm53f' and knobs.get('FLASH_CAP_POLICY') == 'borrow-idle'
 
     # ---- after the handshake --------------------------------------------------------------------------------------
     def front_bin(self):
@@ -694,8 +792,7 @@ class Supervisor:
             return None
         target = self.kv_node('--kv-store')
         log(f'KV store: the KV node at {target}')
-        return ';'.join(t['text'].replace('remote:auto', f'remote:{target}', 1) if t['host'] == 'auto' else t['text']
-                        for t in stores)
+        return opt.kv_store_with(self.o, target)
 
     def kv_rows(self):
         """KV_ROWS for this box's engine: remote:auto becomes the KV node by this box's rails, as for KV_STORE (odd ranks
@@ -721,8 +818,7 @@ class Supervisor:
         ips2 = '--ips2' if models.of(o).name == 'glm53' else '--pf-ips2'
         argv = ['./bin/' + engine_bin(o), '--rank', str(r), '--ips', ','.join(hs['ips']), ips2, ','.join(hs['ips2']),
                 '--proxy-cpu', o.get('PROXY_CPU'), *plan['args']]
-        if o.get('SHAPE') == 'ring':
-            argv[1:1] = ['--ring', *(['--ring-devs', o.get('RING_DEVS')] if o.get('RING_DEVS') else [])]
+        argv[1:1] = self.ring_args()
         log(f'engine: {" ".join(plan["env"])} {" ".join(argv)}')
         rotate_logs(self.out, [f'g6m4.r{r}.txt', f'g6m4.r{r}.err'])
         with open(os.path.join(self.out, f'g6m4.r{r}.txt'), 'wb') as so, \
@@ -758,7 +854,59 @@ class Supervisor:
         if r == 0:
             log(f'engines ready after {time.monotonic() - t0:.0f}s')
             self.start_shim(work)
+        self.donate(plan['knobs'])
         self.run_forever()
+
+    def donate(self, knobs):
+        """GLM-5.3-Flash with FLASH_KV_DONATE_GIB > 0: lend this box's spare memory, measured now that the serve has
+        booted, to a KV node beside it (D-331 M7): flash_donor_budget GiB, a host ledger crediting them to the node,
+        and ./gr8 kv up --lazy-lock --ledger. The node is its own supervisor: its failure, or no budget, leaves the
+        serve as it is."""
+        if models.of(self.o).name != 'glm53f' or float(knobs.get('FLASH_KV_DONATE_GIB') or 0) <= 0:
+            return
+        ko = kvnode.parse(['--g6-home', self.home], dict(os.environ))
+        env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'KV_MIN_FREE_GB': ko.get('KV_MIN_FREE_GB'),
+               **{k: knobs.get(k) or '' for k in ('FLASH_KV_DONATE_GIB', 'FLASH_KV_GROWTH_GIB')}}
+        script = os.path.join(opt.REPO, 'scripts', 'engine_args.sh')
+        r = subprocess.run(['bash', '-c', '. "$0"; flash_donor_budget', script], env=env, capture_output=True,
+                           text=True)
+        gib = int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else 0
+        if gib <= 0:
+            why = r.stderr.strip() or 'MemAvailable leaves nothing above FLASH_KV_GROWTH_GIB + KV_MIN_FREE_GB'
+            log(f'KV donation: none ({why})')
+            return
+        out = kvnode.out_dir(ko)
+        os.makedirs(out, exist_ok=True)
+        ledger = os.path.join(out, 'ledger')
+        # FLASH_CAP_POLICY=borrow-idle: the GPU's lendable KV chunks (the engine wrote their bytes at boot) are booked
+        # as the GPU's, and the node may grow into them once lent
+        gpu = gpu_lendable(ledger) if self.borrow_idle(knobs) else 0
+        if self.borrow_idle(knobs) and not gpu:
+            log(f'KV donation: no {ledger}.gpu from the engine; it lends no GPU chunks')
+        lb = ledger_bin(self.home)
+        try:
+            if not lb:
+                raise RuntimeError('no kvman-ledger: ./gr8 glm53 build')
+            # a transfer left pending by a node or rank that died with its memory: its bytes go to free
+            subprocess.run([lb, ledger, 'recover', '--stale-s', '0'], capture_output=True, text=True)
+            n = str(gib << 30)
+            for argv in ([lb, ledger, 'init', '--total', str((gib << 30) + gpu), '--node', n, '--gpu', str(gpu)],
+                         [sys.executable, kvnode.HERE, 'up', '--g6-home', self.home, '--gb', str(gib + (gpu >> 30)),
+                          '--lazy-lock',
+                          '--ledger', ledger, '--group', knobs['FLASH_KV_GROUP'],
+                          # this serve's mentat, or none when it finds its boxes by PEERS (kv up announces through
+                          # localhost otherwise, and fails on a box without mentatd)
+                          '--mentat', self.o.get('MENTAT') or 'none']):
+                p = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                if p.returncode:
+                    raise RuntimeError(f'{os.path.basename(argv[1] if argv[0] == sys.executable else argv[0])}: '
+                                       f'{(p.stderr or p.stdout).strip()[-400:]}')
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+            log(f'KV donation of {gib} GiB failed; the serve goes on without it: {e}')
+            return
+        self.donor = True
+        log(f'KV donation: a KV node beside the serve for group {knobs["FLASH_KV_GROUP"]}, {gib} GiB, locked lease '
+            f'by lease (ledger {ledger})' + (f', and {gpu} bytes of GPU KV chunks lent while idle' if gpu else ''))
 
     def start_front(self, plan):
         o = self.o
@@ -905,8 +1053,13 @@ class Supervisor:
                               'epoch': self.hs['epoch']})
         elif self.hs and self.rank and code and not self.stop_failed:
             self.tell_head({'t': 'abort', 'rank': self.rank, 'why': first})
+        if self.donor:
+            subprocess.run([sys.executable, kvnode.HERE, 'down', '--g6-home', self.home], capture_output=True,
+                           timeout=60, stdin=subprocess.DEVNULL)
+            self.donor = False
         if self.started:
             stop_local(self.home, log)
+        self.release_claim()
         if self.agent:
             self.agent.stop()
         if self.api_agent:
@@ -915,6 +1068,24 @@ class Supervisor:
             self.set_state('stopped')
         for s in self.servers:
             s.shutdown()
+
+
+def gpu_lendable(ledger):
+    """The bytes of KV chunks the Flash engine may lend (it writes LEDGER.gpu at boot under borrow-idle), or 0."""
+    try:
+        with open(ledger + '.gpu') as f:
+            v = f.read().strip()
+    except OSError:
+        return 0
+    return int(v) if v.isdigit() else 0
+
+
+def ledger_bin(home):
+    for p in (os.path.join(home, 'bin', 'kvman-ledger'),
+              os.path.join(opt.REPO, 'engine', 'kvman-rs', 'target', 'release', 'kvman-ledger')):
+        if os.access(p, os.X_OK):
+            return p
+    return None
 
 
 def engine_bin(o):

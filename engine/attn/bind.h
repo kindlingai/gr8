@@ -42,6 +42,8 @@ struct G6AttnBinding {
     void *storage, *scratch;
     size_t storage_bytes, scratch_bytes;
     int rank, layer, head_begin, capacity, max_rows, full_index;
+    // Flash, G6_FLASH_KV_CHUNKS: the MLA and index caches' regions (G6KvChunks*, kvchunks.h; caller-owned), else null
+    void* kv_chunks[2];
 };
 
 // Binding must initially be zero-initialized and must NOT be copied after create.
@@ -54,6 +56,16 @@ extern "C" int g6a_bind_create(G6AttnBinding*, const G6AttnPack*, int rank,
 // instead of a slice of storage. Bindings may share one ext_scratch only if their runs never overlap (one stream).
 extern "C" int g6a_bind_create_ext(G6AttnBinding*, const G6AttnPack*, int rank,
     int layer, int capacity, int max_rows, int query_tile, void* stream, void* ext_scratch, size_t ext_bytes);
+#if G6_MODEL_FLASH
+struct G6KvChunks;
+// Flash (G6_FLASH_KV_CHUNKS): the MLA and index caches are the two regions (kvchunks.h, each at least the capacity's
+// pages; the caller frees them after release), the rest is storage as g6_attn_bind_create. Kernels see the same
+// pointers; no step may reach a page whose chunk is offline. Reset zeroes only what the regions back.
+extern "C" int g6_attn_bind_create_chunked(G6AttnBinding*, const G6AttnPack*, int rank, int layer, int capacity,
+    int max_rows, int query_tile, void* stream, G6KvChunks* mla, G6KvChunks* idx);
+// Pages of the smallest chunk that gives back all its bytes: its MLA and index bytes are whole granules (0: none).
+extern "C" uint32_t g6_flash_kv_chunk_pages(size_t granule);
+#endif
 // Decode scratch bytes a binding with these heads / capacity / max_rows / query_tile needs (0: invalid).
 extern "C" size_t g6a_bind_scratch_need(int heads, int capacity, int max_rows, int query_tile);
 #if defined(G6_CP) && G6_CP
@@ -83,5 +95,9 @@ extern "C" int g6a_bind_reset(G6AttnBinding*, void* stream);
 // #50: rows x 512 E4M3 weights with f32 scales [rows][4] (one per row and 128-column block) -> BF16 [rows][512], each
 // BF16(e4m3 x scale): the bytes the BF16 loader stores for the same weights (engine/loader-rs/src/release.rs).
 extern "C" int g6a_kvb_bf16(const void* fp8, const float* scale, void* bf16, int rows, void* stream);
+// Flash: the reset with the caches cleared on the first `pages` pages only (the caller keeps every later page zero), and
+// a check that sets *flag |= 1 if any cache byte on pages [from, page_count) is not zero (flash_bind.cu)
+extern "C" int g6a_bind_reset_pages(G6AttnBinding*, int pages, void* stream);
+extern "C" int g6a_bind_check_clear(G6AttnBinding*, int from, unsigned* flag, void* stream);
 // Complete outstanding uses before release; frees ONLY binder-owned storage.
 extern "C" int g6a_bind_release(G6AttnBinding*);

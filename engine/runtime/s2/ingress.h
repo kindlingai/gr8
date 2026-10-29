@@ -22,7 +22,8 @@ inline uint64_t number(const std::string& s) {
     for (char c:s) { require(c>='0' && c<='9' && n <= (UINT64_MAX-unsigned(c-'0'))/10, "bad/overflow number"); n=n*10+unsigned(c-'0'); }
     return n;
 }
-struct Command { bool admit=false; uint64_t epoch=0, request=0, hash=0; };
+// resize: a Resize event the head makes itself (Service share poll), never from the ingress files
+struct Command { bool admit=false; uint64_t epoch=0, request=0, hash=0; std::optional<Resize> resize{}; };
 inline Command parse_command(const std::string& text, uint64_t epoch) {
     std::istringstream in(text); std::string kind,e,r,h,extra;
     require(bool(in>>kind>>e>>r>>h) && !(in>>extra), "invalid ingress command");
@@ -34,12 +35,20 @@ inline std::string capability(Config c, unsigned ranks) {
     c.validate(); require(ranks==2 || ranks==3 || ranks==4 || ranks==5 || ranks==6, "invalid rank count");
     const std::string base=std::to_string(c.epoch)+" "+std::to_string(ranks)+" "+std::to_string(c.pool_rows)+" "+
         std::to_string(c.mtp)+" "+std::to_string(c.guard())+" "+std::to_string(c.max_rows)+" "+std::to_string(g6rt::LP_MAX);
-    // Version 3 adds insert rules. Version 4 appends the immutable steering receipt.
+    // Version 3 adds insert rules. Version 4 appends the immutable steering receipt of one profile, version 5 that
+    // of several: the scope, their count, then each one's name, digest and layer count in slot order.
     if (!c.steering.loaded) return "G6S2 3 "+base+"\n";
     const auto& s=c.steering;
-    return "G6S2 4 "+base+" "+s.profile_name+" "+g6rt::steering::digest_hex(s.profile_digest)+" "+
-        g6rt::steering::scope_name(s.scope)+" "+std::to_string(s.active_layers)+" "+std::to_string(s.forced)+" "+
-        std::to_string(s.forced_scale_bits)+"\n";
+    if (s.profiles.size()==1) {
+        const auto& p=s.profiles[0];
+        return "G6S2 4 "+base+" "+p.name+" "+g6rt::steering::digest_hex(p.profile_digest)+" "+
+            g6rt::steering::scope_name(s.scope)+" "+std::to_string(p.active_layers)+" "+std::to_string(s.forced)+" "+
+            std::to_string(s.forced_scale_bits)+"\n";
+    }
+    std::string out="G6S2 5 "+base+" "+g6rt::steering::scope_name(s.scope)+" "+std::to_string(s.profiles.size());
+    for (const auto& p : s.profiles)
+        out+=" "+p.name+" "+g6rt::steering::digest_hex(p.profile_digest)+" "+std::to_string(p.active_layers);
+    return out+"\n";
 }
 class Ingress {
     std::string dir_; uint64_t epoch_, next_=0;

@@ -18,6 +18,7 @@ struct SimplePrefill
     float *xn = nullptr, *xn2 = nullptr;
     __half *x = nullptr, *x2 = nullptr;
     __nv_bfloat16* part[2] = {};
+    FlashRouteSplit route_split;
 };
 
 inline void pf_dsa_block_p1_ref(Model& m, SimplePrefill& P, int i, int M, int context, cudaStream_t st)

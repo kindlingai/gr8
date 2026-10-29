@@ -11,3 +11,4 @@ bench/results.jsonl
 /serve/
 /venv/
 /docker/.env
+frontend/pseudo-engine/target/

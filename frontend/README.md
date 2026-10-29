@@ -3,7 +3,7 @@
 An OpenAI/vLLM-compatible HTTP server in front of the gr8 engine. It talks to the engine's shim over a Unix socket using
 the protocol in `../PROTOCOL.md`, and handles tokenization, the chat template, the GLM reasoning and tool parser,
 streaming and `/metrics`. It is one static Rust binary, `g6front-rs/`, which `./gr8 glm53 up` runs. The Python code
-under `frontend/` is the shim and the mock engine (and the frame codec they share, `wire.py`), not a second front end.
+under `frontend/` is the shim (and its frame codec, `wire.py`), not a second front end.
 
 ## Endpoints
 
@@ -75,7 +75,7 @@ Read as TensorFold 0.6.1 reads them (`server/request_options.py`). The code is `
 | `reasoning_effort`, top level or `chat_template_kwargs.reasoning_effort` (top level wins) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; anything else is a 400 | The template gets the nearest level it names, on the ladder max > xhigh > high > medium > low > minimal, ties going higher. The names come from the template's text (a quoted `minimal`, `low`, `medium`, `high`, `xhigh` or `max`): GLM 5.3's are low, high and max. A template that names none gets the value as sent. `none` is a 400, unless `enable_thinking` is `true`, which wins and leaves the effort unset (as in TensorFold), or the front end runs with `--allow-thinking-off` (Thinking off, below) |
 | `chat_template_kwargs.enable_thinking` | `true`, or unset; `false` with `--allow-thinking-off` | `false` (or another false value) is a 400: GLM 5.3's template cannot turn thinking off. With `--allow-thinking-off` it turns thinking off (below). The front end adds no `enable_thinking` kwarg of its own |
 | `thinking_budget` (top level) | an integer, an integral float, a string holding an integer, or null. Anything else is a 400 | 0, null or unset: `--default-thinking-budget` (TensorFold's `int(budget or default)`). Negative: no limit. N: while the think block is open, the reply's Nth token is replaced by `\n</think>\n\n`, even when it is `</think>` itself, so N-1 reasoning tokens come first (TensorFold's ThinkBudget). `max_tokens` may cut the close short. It applies to a chat prompt that leaves a think block open. The close has no logprobs, so naming both `thinking_budget` and `logprobs` is a 400 |
-| `response_format` (chat) | absent, null, `{"type": "text"}`, `{"type": "json_object"}`, `{"type": "json_schema", "json_schema": {"name": str, "schema": object}}` | `json_object`/`json_schema` are enforced after generation (the engine has no constrained decoding yet): a prompt hint asks for JSON, content is withheld in the stream until the end, the first JSON value in the reply is extracted, and `json_schema` is checked against the schema. No JSON found, or a schema mismatch: the reply is returned unchanged with a `warnings` entry (stream: on the last choice). Anything else is a 400 |
+| `response_format` (chat) | absent, null, `{"type": "text"}`, `{"type": "json_object"}`, `{"type": "json_schema", "json_schema": {"name": str, "schema": object}}` | `json_object`/`json_schema`: the engine constrains decoding to the grammar where it can (`GRAMMAR=1`, no tools), and the front end checks after generation (below): a prompt hint asks for JSON, content is withheld in the stream until the end, the first JSON value in the reply is extracted, and `json_schema` is checked against the schema. No JSON found, or a schema mismatch: the reply is returned unchanged with a `warnings` entry (stream: on the last choice). Anything else is a 400 |
 | `response_format` (`/v1/completions`) | absent, null, `{"type": "text"}` | any other type is a 400: the legacy route has no JSON handling |
 
 ### Thinking off
@@ -92,7 +92,7 @@ Chat usage carries `completion_tokens_details.reasoning_tokens`: the reply's tok
 them when the reply never closes its think block (TensorFold counts the same way). The response and the last stream
 chunk carry the count. The `continuous_usage_stats` chunks leave the count out.
 
-How a budget cuts. When the engine's hello says `"insert": true` (g6m4 since ready.s2 version 3, and the mock), the
+How a budget cuts. When the engine's hello says `"insert": true` (g6m4 since ready.s2 version 3, and g6pseudo), the
 front end sends the budget as `generate`'s insert rule (PROTOCOL.md): after N - 1 reply tokens without `</think>`, the
 close takes the next token's place. The engine applies it at the token itself, on every rank, and the reply goes on in
 the same run (engine/runtime/s2_batch.h). The close's three tokens cost one more main step and its draft.
@@ -102,8 +102,8 @@ on in a new `generate` whose prompt is the prompt, the reply so far and the clos
 less the reply's length. The client sees one response or one SSE stream either way. Usage counts every reply token
 once: the close counts, and tokens the cut run made past the cut do not. `cached_tokens` is the first run's. The
 continuation is a second request to the engine, and S2's prefix reuse keeps only the prompt's whole 4,096-row prefill
-cells (decoded rows never count), so it prefills the prompt's last partial cell, the reasoning and the close again. On
-the mock with S2's reuse rule and TP=4's cold prefill rate (`--reuse-block 4096 --prefill-tps 1374 --no-insert`):
+cells (decoded rows never count), so it prefills the prompt's last partial cell, the reasoning and the close again. On a
+mock engine with S2's reuse rule, TP=4's cold prefill rate (1,374 tokens/s) and no insert rule:
 
 | prompt | budget | rows prefilled again | added time |
 |---|---|---|---|
@@ -143,7 +143,7 @@ the request's step time. `generated_tokens` exceeds `completion_tokens` when a s
 engine stops: the front end then cancels the run and, for a request with the field, waits for its `finish` (about one
 engine step) before it writes the usage. With a thinking budget on an engine without insert rules, the counters are
 the sum of both runs. The times are left out when the engine does not report them, and `step_stats` is left out when a
-run did not report its counters (the mock engine reports both).
+run did not report its counters (g6pseudo reports both when its weights set `draft_k`).
 
 ## Metrics mapping
 
@@ -200,7 +200,7 @@ How it differs inside (not in its output):
 - **Memory goes back to the OS.** It uses mimalloc. Loading `tokenizer.json` peaks at ~280 MB, and it is collected
   after load and after each long encode, off the request path, instead of staying resident.
 
-Measured in a linux/aarch64 container (12 CPUs, so 6 encode threads; mock engine with instant prefill), beside the
+Measured in a linux/aarch64 container (12 CPUs, so 6 encode threads; a mock engine with instant prefill), beside the
 Python implementation it replaced:
 
 | | Python | this one |
@@ -224,8 +224,9 @@ Known rough edges, outside what the clients send:
 - `top_k` beyond 64 bits is sent to the engine as 0 (off) instead of the exact integer.
 - Templates using transformers' `{% generation %}` tag are not supported. GLM's template does not use it.
 
-Tests: `cargo test --release` (unit tests); `python -m unittest tests.test_api` with `tests/serve_mock.sh` up (HTTP,
-streaming, tools, thinking); and `bench/pbench.py` runs against it unchanged.
+Tests: `cargo test --release` (unit tests), and `tests/api.sh TOKENIZER_DIR` (HTTP, streaming, tools, thinking,
+`return_step_stats`): `tests/test_api.py` against the front end and the pseudo engine (`pseudo-engine/`), with the
+weights in `tests/api_responses.toml`.
 
 ## Real engine through files: g6s2shim.py
 
@@ -266,20 +267,19 @@ tools/s2_costfit.py --selftest
 
 `G6_S2_TIMELINE=N` (every rank, through `G6ENV_X`) splits the time between decode steps into main-stream work and host round trip. Every N main steps each rank prints `# s2_tl rank R mains N: per main step: main-stream gap <ms> (host between steps <ms>), drafting GPU span <ms>`, then per step kind (`main`, `draft`, `chain`, `dfl_ctx`, `dfl_query`) the mean GPU span (CUDA events around the graph launch), host input prep, launch call and fence wait, and per transition (`main>draft`, `draft>dfl_ctx`, ...) the mean main-stream gap from one step's end to the next step's start and the host time from the fence to the next launch. The gap is bounded by events on the main stream only: it is not total GPU idle time — with `G6_DRAFT_PAR` the drafter's side stream can execute inside it. The `drafting GPU span` figure includes side-stream spans alongside all other non-main spans; `dfl_ctx_par` / `dfl_query_par` report mean side-stream spans per step. Gaps over 20 ms (event fences, an idle engine) count as `breaks`, not transitions. With `G6_DRAFT_PAR` a solo DFlash2 round's drafter step on its own stream is `dfl_ctx_par` / `dfl_query_par`: span = its GPU start to end on that stream (overlapping the first form and chain), wait = the wait at the end of the round alone (the tail they did not hide); it is in no transition. Off, it costs nothing. It also prints the mean GPU span per step kind and row count (`# s2_tl rank R rows <kind> M <rows> n <steps> span <ms> ms`). `tools/s2_dsel_table.py rank*.log` turns a boot's lines (with `G6_MTP_LPLOG=1` on rank 0 for the MTP rounds' accept counts) into the drafter choice's cost table, `G6_S2_DSEL_TABLE`; `--selftest` runs its tests.
 
-## Mock engine and tests
+## Tests against the pseudo engine
 
-`mock_engine.py` speaks PROTOCOL.md with no model, so the front end and the old benchmark tools can run anywhere:
+`pseudo-engine/` (g6pseudo) speaks PROTOCOL.md with no model, from a TOML file of rules, so the front end runs end to
+end anywhere. `tests/api.sh TOKENIZER_DIR` boots it with `tests/api_responses.toml`, then runs `tests/test_api.py`
+against two front ends: one with the defaults, one with `--allow-thinking-off`. To run the tests against a front end
+you started yourself:
 
 ```bash
-python mock_engine.py --model-dir <tokenizer dir> --sock /tmp/g6-mock.sock \
-  [--prefill-tps 50000] [--rounds-per-s 100] [--max-model-len 200000] [--reuse-block 64] [--reasoning-repeat 1]
-tests/serve_mock.sh start|stop      # mock + front end on :8100 (env PY, MODEL_DIR, PORT, ROUNDS, FRONT, FRONT_ARGS, MOCK_ARGS)
-python -m unittest tests.test_api                     # with the mock + front end running
+URL=http://127.0.0.1:8100 SUP_PORT=8198 python3 -m unittest tests.test_api   # front end with --supervisor 127.0.0.1:8198
 ```
 
-`--reuse-block 4096` reuses prefixes as S2 does, in whole 4,096-row prefill cells. `--reasoning-repeat N` makes the
-canned reasoning N times longer, for thinking budgets past its 17 tokens. `serve_mock.sh` runs `../bin/g6front-rs`
-(`FRONT` names another binary), which is the front end.
+`[engine] draft_k = 3` in those weights makes g6pseudo report speculative-decoding counters, which
+`return_step_stats` tests read.
 
 ## Deviations from vLLM
 

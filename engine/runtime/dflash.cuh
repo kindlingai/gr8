@@ -2,10 +2,10 @@
 //
 // The drafter (a separate pack per rank, engine/loader-rs/src/dflash2.rs) drafts a block of K = 7 tokens in one forward:
 //   context  for every accepted row of the last target step: the target residual after the layers in
-//            target_layer_ids (6), concatenated -> fc (this rank's 6144/NR columns) -> all-gather (collective 0) ->
+//            target_layer_ids (NT), concatenated -> fc (this rank's HID/NR columns) -> all-gather (collective 0) ->
 //            hidden_norm -> per drafter layer j: k_norm(k_proj) with RoPE and v_proj of this rank's KV heads, stored in
 //            the ring at the row's position
-//   block    8 rows at positions q0..q0+7: the bonus token (row 0) and 7 mask tokens, through 6 layers. Per layer:
+//   block    8 rows at positions q0..q0+7: the bonus token (row 0) and 7 mask tokens, through L layers. Per layer:
 //            in_norm -> conv prepare -> q, k, v of this rank's heads (q_norm / k_norm, NeoX RoPE; the block's k, v go
 //            into the ring) -> attention (a query sees every row of the block, and the context keys k with
 //            q - k < window) -> o_proj partial, all-reduce (collective 1 + 2j) -> conv finish -> residual ->
@@ -30,7 +30,8 @@
 // summed per vocab slice). Real collectives left: the head (2L + 1) and the fill's NT feature gathers, plus the fill's
 // collective NT with no payload (a barrier: a rank publishes the next fill's gathers only after every peer received
 // this one's, so the proxy never misses a doorbell). Two query steps of a rank are always separated by a target step.
-// The target step writes its residual rows after the tapped layers into Dfl::feat (Model::dfl_tap, inside its graph).
+// The target step writes its residual rows after the tapped layers into Dfl::feat (Model::dfl_tap, inside its graph;
+// Flash: the mean of the four mHC streams).
 // Prompt context: the prefill sub-batches write the owner rows of the last WIN prompt positions into Dfl::pf_feat
 // (Prefill::dfl_tap); after the prefill, fill steps gather them 8 rows at a time (collectives 0..NT-1: every rank's rows,
 // zero where it is not the owner, summed: exact) and run the context part on them (fc slices on collective NT).
@@ -42,15 +43,15 @@ namespace g6rt
 namespace dfl
 {
 constexpr int B = 8, K = B - 1;               // block rows (bonus + drafts) = verify rows
-constexpr int L = 6, NT = 6;                  // drafter layers, tapped target layers
-constexpr int HD = 128, NH = 64, NKV = 8, INTER = 12288;
+constexpr int L = geom::DFL_L, NT = geom::DFL_NT;   // drafter layers, tapped target layers (6, 6; Flash 5, 5)
+constexpr int HD = 128, NH = geom::DFL_NH, NKV = 8, INTER = 12288;   // q heads: 64, Flash 32
 constexpr bool OK_NR = NKV % g6nr::NR == 0;   // TP4 (and TP1/2/8): the body split across the ranks
 constexpr bool REP = !OK_NR;                  // TP6 (TP3 builds, g6m4 refuses it): the replicated body (header)
 constexpr int DNR = REP ? 1 : g6nr::NR;       // the body's split
 constexpr int NHR = NH / DNR, NKR = NKV / DNR;
 constexpr int NIR = INTER / DNR, NFR = HID / DNR;
 constexpr int KS = REP ? 4 : 1;               // REP: o_proj / down_proj K-slices (TP4's ranks), each its own partial
-constexpr int KO = NH * HD / 4, KD = INTER / 4;   // REP: their K (2048, 3072)
+constexpr int KO = NH * HD / 4, KD = INTER / 4;   // REP: their K (2048, 3072; Flash 1024, 3072)
 constexpr int RING = 4096, WIN = 2048;
 constexpr int GS = 16, NG = HID / GS, CPO = 4 * NG;    // conv group size, groups, kernel_projection outputs (2 sides x 2 taps)
 constexpr int TOPK = 16, SELR = 256;
@@ -86,7 +87,7 @@ struct DLayer
     bind::Gv kvc, ac, q, kv, o, mc, gu, down;
     bind::Gv ok[dfl::KS], dk[dfl::KS];   // REP: o_proj / down_proj K-slice v (o and down unused)
     const __nv_bfloat16 *in_norm = nullptr, *post_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr;
-    const __nv_bfloat16 *abase = nullptr, *mbase = nullptr;   // [2 sides][2 taps][6144]
+    const __nv_bfloat16 *abase = nullptr, *mbase = nullptr;   // [2 sides][2 taps][HID]
 };
 
 struct Dfl
@@ -112,16 +113,16 @@ struct Dfl
     const __nv_bfloat16 *hnorm = nullptr, *norm = nullptr, *pred = nullptr, *succ = nullptr, *emb = nullptr;
     const int* emb_rows = nullptr;    // dfltest: block row r reads row r of its small embedding table
     // buffers (device)
-    __half* feat = nullptr;           // [B][NT][6144] fp16, FEAT_SCALE x the target residual
-    __half* pf_feat = nullptr;        // [WIN][NT][6144] prompt context rows written by the prefill (this rank's owner rows)
+    __half* feat = nullptr;           // [B][NT][HID] fp16, FEAT_SCALE x the target residual
+    __half* pf_feat = nullptr;        // [WIN][NT][HID] prompt context rows written by the prefill (this rank's owner rows)
     int pf_lo = 0, pf_hi = 0;         // the prompt positions the prefill taps keep, this request (pf_lo = row 0 of pf_feat)
     u32 *xf_feat = nullptr, *xb_feat = nullptr;
     float* fco = nullptr;             // [B][NFR] this rank's fc columns
-    __half* ctxn = nullptr;           // [B][6144]
+    __half* ctxn = nullptr;           // [B][HID]
     u32 *xf_ctxn = nullptr, *xb_ctxn = nullptr;
     __half* kvc = nullptr;            // [L][B][2 NKR HD]
     __half *kring = nullptr, *vring = nullptr;   // [L][NKR][RING][HD]
-    float* resid = nullptr;           // [B][6144]
+    float* resid = nullptr;           // [B][HID]
     __half *x = nullptr, *xc = nullptr;
     u32 *xf_x = nullptr, *xb_x = nullptr, *xf_xc = nullptr, *xb_xc = nullptr;
     float *dlt_a = nullptr, *dlt_m = nullptr;   // [B][CPO]
@@ -130,7 +131,7 @@ struct Dfl
     float* apart = nullptr;           // [NHR][SPLIT][B][HD + 4]
     __half* ao = nullptr;             // [B][NHR HD]
     u32 *xf_ao = nullptr, *xb_ao = nullptr;
-    uint16_t* part = nullptr;         // [B][6144] BF16 partial staging (REP: [KS][B][6144], slice v's partial at v)
+    uint16_t* part = nullptr;         // [B][HID] BF16 partial staging (REP: [KS][B][HID], slice v's partial at v)
     __half *guo = nullptr, *act = nullptr;      // [B][2 NIR], [B][NIR]
     u32 *xf_act = nullptr, *xb_act = nullptr;
     // head
@@ -175,6 +176,17 @@ __global__ void __launch_bounds__(256) k_tap(const float* resid, __half* feat, i
     const int m = blockIdx.y, c = blockIdx.x * 256 + threadIdx.x;
     feat[((size_t)m * NT + s) * HID + c] = __float2half_rn(resid[(size_t)m * HID + c] * FEAT_SCALE);
 }
+#if G6_MODEL_FLASH
+// Flash: the mean of the four mHC streams [M][4][HID] after the layer's MLP consume (hc_post applied), summed in stream
+// order, as k_mhc_out_inv_final forms it before the final norm -> fp16 features of tap slot s. grid (HID / 256, M), block 256
+static_assert(geom::HC == 4, "k_tap_mhc: four mHC streams");
+__global__ void __launch_bounds__(256) k_tap_mhc(const float* streams, __half* feat, int s)
+{
+    const int m = blockIdx.y, c = blockIdx.x * 256 + threadIdx.x;
+    const float* x = streams + (size_t)m * 4 * HID + c;
+    feat[((size_t)m * NT + s) * HID + c] = __float2half_rn((x[0] + x[HID] + x[2 * HID] + x[3 * HID]) * .25f * FEAT_SCALE);
+}
+#endif
 
 // collective 0: every rank's [B][NFR] fp32 fc columns -> the full rows -> hidden_norm -> fp16. grid (RN_CL, B), block RN_T
 struct CtxArgs { g6::FabricDev f; const u64* stepp; int c; const __nv_bfloat16* w; __half* out; float eps; };
@@ -336,7 +348,7 @@ struct ArArgs
     const u64* stepp;
     int c;
     const float* dlt;                 // [B][CPO]; side 1 at + 2 NG
-    const __nv_bfloat16* base;        // [2][2][6144]; side 1 at + 2 HID
+    const __nv_bfloat16* base;        // [2][2][HID]; side 1 at + 2 HID
     float* resid;
     const __nv_bfloat16* w;
     __half* out;
@@ -535,7 +547,7 @@ __global__ void __launch_bounds__(128) k_fill_put(const __half* pf, const int* c
     }
     glue::publish(f, s, g6::coll_seq(step, s, f.ncoll), ticket);
 }
-// fill: collectives 0..NT-1 summed over the ranks (one owner per row, zeros elsewhere) -> feat [B][NT][6144].
+// fill: collectives 0..NT-1 summed over the ranks (one owner per row, zeros elsewhere) -> feat [B][NT][HID].
 // grid (HID / 256, B, NT), block 256; after the NT waits
 __global__ void __launch_bounds__(256) k_fill_get(g6::FabricDev f, const u64* stepp, __half* feat)
 {
@@ -559,7 +571,7 @@ __global__ void __launch_bounds__(32) k_out(OutArgs a)
 // ---------------------------------------------------------------- build
 // find: the drafter pack (engine/loader-rs/src/dflash2.rs); main: the built target model (embedding, lm_head, vocab slice).
 // meta: manifest values (mask id, target layers, theta, eps). f: a fabric region with dfl::NC collectives and slots of at
-// least B x 6144 BF16. sel: the DFlash2 selector (needs D.sel.* in the pack).
+// least B x HID BF16. sel: the DFlash2 selector (needs D.sel.* in the pack).
 // REP: a kernel view of a local buffer as a fabric (rank -1, ncoll 0): peer_slot(f, step, 0, p) = base + p x stride, for
 // the consume kernels (k_ctx_norm, k_ar_conv_norm) at c = 0. Never published to or waited on.
 inline g6::FabricDev dfl_local(void* base, int nr, size_t stride)
@@ -570,26 +582,32 @@ inline g6::FabricDev dfl_local(void* base, int nr, size_t stride)
     return f;
 }
 struct DflMeta { int mask_id = 0, nr = 0, block = 0, layers = 0, window = 0; int tl[dfl::NT] = {}; float theta = 0, eps = 0; bool sel = false; };
-// D.meta (engine/loader-rs/src/dflash2.rs META): int32 [17]
+// D.meta (engine/loader-rs/src/dflash2.rs meta_fields): int32 [11 + taps], the target layers at 5..: its length carries
+// the tap count. The drafter's sizes (layers, taps) must be this build's (model_geom.h)
 inline DflMeta dfl_read_meta(const Find& find)
 {
     const TensorRef t = find("D.meta");
-    if (!t.p || t.nd != 1 || t.shape[0] != 17) die("dflash pack has no D.meta [17] (engine/loader-rs/src/dflash2.rs)");
-    int v[17];
-    G6RT_CK(cudaMemcpy(v, t.p, sizeof v, cudaMemcpyDeviceToHost));
+    if (!t.p || t.nd != 1 || t.shape[0] < 12) die("dflash pack has no D.meta (engine/loader-rs/src/dflash2.rs)");
+    std::vector<int> v(t.shape[0]);
+    G6RT_CK(cudaMemcpy(v.data(), t.p, v.size() * 4, cudaMemcpyDeviceToHost));
+    if ((int)v.size() != 11 + dfl::NT || v[3] != dfl::L)
+        die("dflash pack: a drafter of " + std::to_string(v[3]) + " layers tapping " + std::to_string(v.size() - 11) +
+            " target layers; this build's has " + std::to_string(dfl::L) + " and " + std::to_string(dfl::NT) +
+            " (engine/model_geom.h: a drafter of the other model?)");
     DflMeta m;
     m.mask_id = v[0]; m.nr = v[1]; m.block = v[2]; m.layers = v[3]; m.window = v[4];
     for (int i = 0; i < dfl::NT; ++i) m.tl[i] = v[5 + i];
-    m.theta = (float)v[11];
-    memcpy(&m.eps, &v[12], 4);
-    m.sel = v[13] != 0;
-    if (m.sel && (v[13] != dfl::SELR || v[14] != dfl::TOPK)) die("dflash pack: selector rank / top-k " + std::to_string(v[13]) + " / " +
-                                                                std::to_string(v[14]) + ", this engine has 256 / 16");
-    if (v[15] != dfl::GS || v[16] != 2) die("dflash pack: conv group / taps " + std::to_string(v[15]) + " / " + std::to_string(v[16]) + ", want 16 / 2");
+    const int* w = v.data() + 5 + dfl::NT;   // theta, eps_bits, sel_rank, sel_topk, conv_group, conv_kernel
+    m.theta = (float)w[0];
+    memcpy(&m.eps, &w[1], 4);
+    m.sel = w[2] != 0;
+    if (m.sel && (w[2] != dfl::SELR || w[3] != dfl::TOPK)) die("dflash pack: selector rank / top-k " + std::to_string(w[2]) + " / " +
+                                                              std::to_string(w[3]) + ", this engine has 256 / 16");
+    if (w[4] != dfl::GS || w[5] != 2) die("dflash pack: conv group / taps " + std::to_string(w[4]) + " / " + std::to_string(w[5]) + ", want 16 / 2");
     if (m.mask_id < 0 || m.mask_id >= glue::VOCAB) die("dflash pack: mask token id out of the vocabulary");
     return m;
 }
-// pf: the prompt-context taps (Dfl::pf_feat, WIN x 73.7 KB) for a driver that prefills
+// pf: the prompt-context taps (Dfl::pf_feat, WIN x NT x HID fp16: 151 MB, Flash 84 MB) for a driver that prefills
 inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta& meta, const g6::FabricDev& f, u64* stepp, bool sel,
                       cudaStream_t st, bool pf = false)
 {
@@ -597,7 +615,7 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
     if (meta.nr != g6nr::NR || meta.block != B || meta.layers != L || meta.window != WIN)
         die("dflash pack: built for " + std::to_string(meta.nr) + " ranks, block " + std::to_string(meta.block) + ", " +
             std::to_string(meta.layers) + " layers, window " + std::to_string(meta.window) + "; this engine needs " +
-            std::to_string(g6nr::NR) + " ranks, block 8, 6 layers, window 2048");
+            std::to_string(g6nr::NR) + " ranks, block 8, " + std::to_string(L) + " layers, window 2048");
     if (f.ncoll != NC || f.stride < (size_t)B * HID * 2 + 8) die("dflash fabric: wrong collective count or slot size");
     D.rank = main.rank; D.f = f; D.stepp = stepp; D.sel = sel;
     D.mask_id = meta.mask_id; D.theta = meta.theta; D.eps = meta.eps;
@@ -707,7 +725,22 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
     sc.xf_head = D.xf_head;
     bind::HeadIo io;
     io.h = D.x; io.logits = D.hlog;
+#if G6_MODEL_FLASH
+    {   // Flash's lm_head is FP8R (row scales) or BF16: the codec rule of head_for, on fp16 fragments (BF16: bf16 ones)
+        const int codec = ht.lm_head_scale.p ? bind::FP8R : ht.lm_head.shape[2] == 528 ? bind::MXFP8 : bind::BF16W;
+        D.head = bind::Head();
+        D.head.M = B; D.head.vlo = main.vlo; D.head.vn = main.vn;
+        if (const char* e = bind::make_gv(ht.lm_head, codec, 1, 32, B, D.xf_head, D.hlog, gv::O_F32, D.head.lm_head,
+                                          static_cast<const float*>(ht.lm_head_scale.p)))
+            die(std::string("dflash head: ") + e);
+        if (D.head.lm_head.K != HID || D.head.lm_head.O != D.vn) die("dflash head: G.lm_head is not this rank's vocab slice");
+        bind::Xfrag& x = D.head.xf_h;
+        x.on = 1; x.src = D.x; x.ld = HID; x.K = HID; x.M = B;
+        (codec == bind::BF16W ? x.bf16 : x.f16) = D.xf_head;
+    }
+#else
     if (const char* e = bind::make_head(ht, D.rank, B, sc, io, D.head)) die(std::string("dflash head: ") + e);
+#endif
     G6RT_CK(cudaStreamSynchronize(st));
     size_t wb = 0;
     auto gvb = [&](const bind::Gv& g) { wb += bind::gv_bytes(g); };
@@ -1001,7 +1034,7 @@ inline void dfl_fill_step(Dfl& D, cudaStream_t st)
 
 // G6_DFL_DUMP=<file> (measurement, rank 0): after a draft or fill step, one record: int32 kind (0 = context rows only,
 // 1 = context rows + drafts), ctx_pos0, ctx_rows, q0, tok0, drafts[7]; then the context rows' features, fp16
-// [ctx_rows][NT][6144] (FEAT_SCALE x the target residual). kind 2 = the committed tokens of the request: int32 n, then n ids.
+// [ctx_rows][NT][HID] (FEAT_SCALE x the target residual). kind 2 = the committed tokens of the request: int32 n, then n ids.
 inline void dfl_dump_step(FILE* f, const Dfl& D, const DflIn& di, const DflOut* o)
 {
     if (!f) return;
@@ -1022,7 +1055,8 @@ inline void dfl_dump_tokens(FILE* f, const std::vector<int>& t)
 }
 
 // ---------------------------------------------------------------- the target side
-// Model::dfl_tap hook: after layer i's second consume, the residual rows of a tapped layer -> Dfl::feat
+// Model::dfl_tap hook: after layer i's second consume, the residual rows of a tapped layer -> Dfl::feat (Flash: the
+// mean of the mHC streams, launch_step_flash)
 inline Dfl*& dfl_of(const Model& m)
 {
     static Dfl* by_rank[8] = {};
@@ -1032,7 +1066,12 @@ inline void dfl_tap_launch(Model& m, int i, int M, cudaStream_t st)
 {
     Dfl* D = dfl_of(m);
     for (int s = 0; s < dfl::NT; ++s)
-        if (D->tlayer[s] == m.layers[i].l) dflk::k_tap<<<dim3(HID / 256, M), 256, 0, st>>>(m.resid, D->feat, s);
+        if (D->tlayer[s] == m.layers[i].l)
+#if G6_MODEL_FLASH
+            dflk::k_tap_mhc<<<dim3(HID / 256, M), 256, 0, st>>>(m.resid4, D->feat, s);
+#else
+            dflk::k_tap<<<dim3(HID / 256, M), 256, 0, st>>>(m.resid, D->feat, s);
+#endif
 }
 // Prefill::dfl_tap hook: after layer i of a prefill sub-batch, this rank's up-to-date rows (its owner rows in the RS form;
 // rank 0 alone in the all-reduce form, so a gathered row is never summed twice) -> Dfl::pf_feat
@@ -1083,6 +1122,9 @@ inline std::vector<int> dflash_sequence(const Plan& p, u64& main_step, u64& draf
     const u64 step0 = main_step;
     std::vector<int> tokens = p.prompt;
     int d[B] = {};
+#if G6_MODEL_FLASH
+    int kcur = 0;                     // KDA ring: the slot with the committed state (prompt steps: slot 0)
+#endif
     const float dtemp = p.rs ? 0.f : p.inv_temp;   // rejection sampling: greedy drafts (they must not use the target's noise)
     auto draft = [&](int rows, int pos0, int bonus, bool query, int s, double& ms) {
         DflIn di;
@@ -1123,13 +1165,23 @@ inline std::vector<int> dflash_sequence(const Plan& p, u64& main_step, u64& draf
             si.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, base + r + 1, 0, p.top_p, p.lp > 0 ? 1 : 0};
             si.tgt[r] = -1;
             si.steering_scale[r] = p.steering_scale;
+            si.steering_slot[r] = p.steering_slot;
+#if G6_MODEL_FLASH
+            si.kslot[r] = r;                     // slot r ends with the state after rows 0..r (Model::kda_ring >= B)
+#endif
         }
+#if G6_MODEL_FLASH
+        si.kda_src = kcur;
+#endif
         si.context = base + k + 1;
         double tv = 0, tf = 0;
         const StepOut so = run_main(si, s, tv);
         int a = 0;
         while (a < k && d[a + 1] == so.tok[a]) ++a;
         for (int r = 0; r <= a; ++r) tokens.push_back(so.tok[r]);
+#if G6_MODEL_FLASH
+        kcur = a;
+#endif
         if (ad)
         {
             sl->observe(k, a, dl, pe);

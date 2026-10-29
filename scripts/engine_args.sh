@@ -1,7 +1,8 @@
 # The engine command line. The per-box supervisor (tools/launch) sources this file. KNOBS.md lists
 # the knobs. docs/SETTINGS.md explains every engine variable and flag.
 #
-# GR8_MODEL picks the model: glm53 (unset) or glm53f, GLM-5.3-Flash (bin/g6m4_flash, TP 4 or 2).
+# GR8_MODEL picks the model: glm53 (unset), glm53f, GLM-5.3-Flash (bin/g6m4_flash, TP 4 or 2), or pseudo, the pseudo
+# engine (bin/g6pseudo, frontend/pseudo-engine).
 #
 #   engine_defaults          needs TP (4, 6, 3 or 5); sets every knob that is unset to its default for this TP. An unset CAP
 #                            follows SHARE_LIMIT, so the KV pool keeps the same physical pages per rank (share_cap below)
@@ -12,6 +13,7 @@
 #                            rank<R>.{manifest.json,pack} (unused with V2_DENSE: the release is the model), AUX_PACKS
 #                            the drafter and QO packs, HOME is G6_HOME
 #                            (the s2/ directory), EPOCH the S2 epoch. SET_ID, when set, adds --set-id.
+#   flash_donor_budget [KIB] GLM-5.3-Flash: the whole GiB this box lends a KV node next to the serve (below)
 
 # share_cap P: the CAP that gives P physical KV pages per rank at this SHARE_LIMIT. Each rank holds the first
 # SHARE_LIMIT tokens of a session (64 per page) and 1/TP of the rest.
@@ -65,10 +67,53 @@ flash_defaults() {
   [ "$SESS" = 1 ] || [ $((SESS * (MTP + 1))) -le 32 ] ||
     { echo "engine_defaults: SESS=$SESS MTP=$MTP: a round of $((SESS * (MTP + 1))) rows; GLM-5.3-Flash steps hold 32" >&2; return 2; }
   S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=0
+  flash_donor_defaults
+}
+
+# A KV node next to the Flash serve (D-331 M7): FLASH_KV_DONATE_GIB > 0 lends at most that many GiB of this box to a
+# ./gr8 kv up --lazy-lock node once the serve has booted. FLASH_KV_GROWTH_GIB is what the serve may still allocate after
+# boot; it has no default because it is not measured yet. FLASH_KV_GROUP is the mentat group the node serves (the cluster
+# that borrows from it, not this serve's), also without a default. FLASH_CAP_POLICY=protected: the configured CAP's memory is
+# never lent. borrow-idle (needs a donation): the KV pool in chunks (G6_FLASH_KV_CHUNKS=1), every chunk but one lent to
+# the node once the serve has been idle FLASH_KV_IDLE_S (default 60), recalled before a request that needs it is
+# admitted (the request waits for the recall; s2/flash_lend.h).
+num_ok() { [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]]; }
+flash_donor_defaults() {
+  FLASH_KV_DONATE_GIB=${FLASH_KV_DONATE_GIB:-0}; FLASH_CAP_POLICY=${FLASH_CAP_POLICY:-protected}
+  num_ok "$FLASH_KV_DONATE_GIB" || { echo "engine_defaults: FLASH_KV_DONATE_GIB=$FLASH_KV_DONATE_GIB: want GiB" >&2; return 2; }
+  case $FLASH_CAP_POLICY in
+    protected) ;;
+    borrow-idle)
+      [ "$FLASH_KV_DONATE_GIB" = 0 ] && { echo "engine_defaults: FLASH_CAP_POLICY=borrow-idle needs FLASH_KV_DONATE_GIB > 0 (a KV node to lend to)" >&2; return 2; }
+      FLASH_KV_IDLE_S=${FLASH_KV_IDLE_S:-60}
+      [[ $FLASH_KV_IDLE_S =~ ^[0-9]+$ ]] && [ "$FLASH_KV_IDLE_S" -ge 1 ] || { echo "engine_defaults: FLASH_KV_IDLE_S=$FLASH_KV_IDLE_S: want whole seconds >= 1" >&2; return 2; } ;;
+    *) echo "engine_defaults: FLASH_CAP_POLICY=$FLASH_CAP_POLICY: want protected or borrow-idle" >&2; return 2 ;;
+  esac
+  [ "$FLASH_KV_DONATE_GIB" = 0 ] && return 0
+  num_ok "${FLASH_KV_GROWTH_GIB:-}" || { echo "engine_defaults: FLASH_KV_DONATE_GIB=$FLASH_KV_DONATE_GIB needs FLASH_KV_GROWTH_GIB, the GiB the serve may still allocate after boot (not measured yet)" >&2; return 2; }
+  [ -n "${FLASH_KV_GROUP:-}" ] || { echo "engine_defaults: FLASH_KV_DONATE_GIB=$FLASH_KV_DONATE_GIB needs FLASH_KV_GROUP, the mentat group of the cluster that borrows the node (not this serve's)" >&2; return 2; }
+  return 0
+}
+# flash_donor_budget [KIB]: FLASH_KV_DONATE_GIB, or less when MemAvailable (KIB, else /proc/meminfo, read after the
+# serve booted) - FLASH_KV_GROWTH_GIB - KV_MIN_FREE_GB (the node's own floor, 10) is less; whole GiB, 0 = no node.
+flash_donor_budget() {
+  local kib=${1:-}
+  [ "${FLASH_KV_DONATE_GIB:-0}" = 0 ] && { echo 0; return 0; }
+  [ -n "$kib" ] || kib=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo)
+  num_ok "$kib" || { echo "flash_donor_budget: MemAvailable $kib: want KiB" >&2; return 2; }
+  awk -v kib="$kib" -v g="${FLASH_KV_GROWTH_GIB:-0}" -v r="${KV_MIN_FREE_GB:-10}" -v w="$FLASH_KV_DONATE_GIB" \
+    'BEGIN { b = kib / 1048576 - g - r; if (b > w) b = w; if (b < 0) b = 0; printf "%d\n", b }'
+}
+
+# The pseudo engine: no KV pool to size, MTP, drafter or fabric. CAP bounds a request's prompt plus max_tokens.
+pseudo_defaults() {
+  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-202752}; READY_TMO=${READY_TMO:-60}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+  MTP=0; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=0
 }
 
 engine_defaults() {
   [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_defaults; return; }
+  [ "${GR8_MODEL:-glm53}" = pseudo ] && { pseudo_defaults; return; }
   case $TP in
     4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        DFLASH=${DFLASH:-1}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1}
@@ -114,7 +159,7 @@ engine_defaults() {
 # GLM-5.3-Flash: the prefill speed stack at top-k 8 (docs/FLASH.md). G6_PF_RS, G6_PF_OWN and CP stay off.
 flash_env() {
   ENGINE_BIN=g6m4_flash
-  ENGINE_ENV="G6_CP=0 G6_PF_RS=0 G6_PF_OWN=0 G6_PF_POOL_OWNER=0 G6_PF_STRIPE=0 G6_FPF_P1=0 G6_FPF_DSA_P1=0 \
+  ENGINE_ENV="G6_CP=0 G6_PF_RS=0 G6_PF_OWN=0 G6_PF_POOL_OWNER=0 G6_FPF_P1=0 G6_FPF_DSA_P1=0 \
 G6_FPF_ATTN_P1=0 G6_PF_SPARSE_MLA_P1=0 G6_PF_SPARSE_MLA_HYBRID=0 G6_PF_SPARSE_MLA=1 G6_PF_SPARSE_MLA_512=1 \
 G6_PF_SPARSE_MLA_V2=1 G6_PF_SPARSE_MLA_H16C=1 G6_PF_DTR8=1 G6_PF_SHFP8=1 G6_PF_FC2V2=1 G6_PF_KDA_WS=1 \
 G6_PF_DSA_FULL_GV=1 G6_PF_ROUTER_SPLIT=1 G6_PF_DSA_F16GEMM=1 G6_PF_PREWARM=1 G6_PF_MHC_STAGE=1 G6_PF_MHC_FUSE=2 \
@@ -122,11 +167,26 @@ G6_PF_TIMES=1 G6_PF_STAGE_ASYNC=1"
   # the peer-partial staging (G6_PF_STAGE_ASYNC) runs at any rank count; the G9 KDA scan is a precision arm, not the
   # same bytes as the scan it replaces, so it stays where it was chosen: TP2 (it would change TP4's output)
   [ "$TP" = 4 ] || ENGINE_ENV="$ENGINE_ENV G9_KDA_SCAN=1 G9_KDA_VS=2"
+  # FLASH_CAP_POLICY=borrow-idle: the KV pool in chunks, lent once idle (the supervisor adds G6_FLASH_KV_LEDGER, the box's)
+  if [ "${FLASH_CAP_POLICY:-protected}" = borrow-idle ]; then
+    ENGINE_ENV="$ENGINE_ENV G6_FLASH_KV_CHUNKS=1 G6_FLASH_KV_LEND_MS=$((${FLASH_KV_IDLE_S:-60} * 1000))"
+  fi
+  # FLASH_CACHE: session checkpoints at prefill quantum boundaries (docs/FLASH.md), off unless set
+  if [ -n "${FLASH_CACHE:-}" ] && [ "$FLASH_CACHE" != off ]; then
+    ENGINE_ENV="$ENGINE_ENV G6_FLASH_CACHE=$FLASH_CACHE"
+    [ -n "${FLASH_STATE_BUDGET_MIB:-}" ] && ENGINE_ENV="$ENGINE_ENV G6_FLASH_STATE_BUDGET_MIB=$FLASH_STATE_BUDGET_MIB"
+  fi
+  # its KV_STORE on a group lease: when it gives segments to other groups (KV_SHARE_WHEN; docs/SETTINGS.md)
+  ENGINE_ENV="$ENGINE_ENV${KV_SHARE_WHEN:+ G6_KV_SHARE_WHEN=$KV_SHARE_WHEN}"
+  # TP=3 ring: leave G6_PF_STRIPE to the engine default (on for a three-rank ring: large prefill writes also use the
+  # devices on the other PCIe root); other TPs keep it off as before
+  [ "$TP" = 3 ] || ENGINE_ENV="$ENGINE_ENV G6_PF_STRIPE=0"
   ENGINE_ENV="$ENGINE_ENV ${G6ENV_X:-}"
 }
 
 engine_env() {
   [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_env; return 0; }
+  [ "${GR8_MODEL:-glm53}" = pseudo ] && { ENGINE_BIN=g6pseudo; ENGINE_ENV=""; return 0; }
   ENGINE_BIN=g6m4; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=g6m4-int4
   ENGINE_ENV="G6_PF_TILE=64 G6_PF_DENSE=8192 G6_PF_RS=1 G6_PF_STREAMS=2 G6_PF_ATTN_ROWS=${PF_ATTN_ROWS:-1024} G6_PF_OWN=$PF_OWN \
 G6_PF_BLAS_ROWS=1024 G6_PF_TIMES=1 G6_PF_HASH_GPU=1 G6_PF_RSDIRECT=1 G6_DEC_SPLIT=3 G6_DEC_SHARED_SCRATCH=1 \
@@ -136,6 +196,8 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   fi
   # DFlash2 after a prefix-reuse hit (DFL_REUSE, DFL_REUSE_MIN; docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${DFL_REUSE:+ G6_DFL_REUSE=$DFL_REUSE}"
+  # a KV_STORE group= lease: when it gives segments to other groups (KV_SHARE_WHEN; docs/SETTINGS.md)
+  ENGINE_ENV="$ENGINE_ENV${KV_SHARE_WHEN:+ G6_KV_SHARE_WHEN=$KV_SHARE_WHEN}"
   ENGINE_ENV="$ENGINE_ENV${DFL_REUSE_MIN:+ G6_DFL_REUSE_MIN=$DFL_REUSE_MIN}"
   # the MTP confidence stop for solo MTP rounds (MTP_KSTOP, MTP_KSTOP_KMAX, MTP_KSTOP_TAU; docs/SETTINGS.md): off
   # unless set. G6_MTP_KSTOP_SEED3 and the round log G6_MTP_LPLOG stay engine environment (G6ENV_X)
@@ -194,6 +256,12 @@ G6_CP=1 G6_CP_R=$SHARE_LIMIT G6_CP_S3=1 G6_CP_PF_VERIFY=1 G6_CP_PF_HASH2=1 ${G6E
   # the drafter choice's frozen cost table (DSEL_MODEL, DSEL_TABLE; docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${DSEL_MODEL:+ G6_S2_DSEL_MODEL=$DSEL_MODEL}"
   ENGINE_ENV="$ENGINE_ENV${DSEL_TABLE:+ G6_S2_DSEL_TABLE=$DSEL_TABLE}"
+  # the n-gram table as a draft source (NGRAM, NGRAM_KMAX, NGRAM_KMIN, NGRAM_MARGIN; docs/SETTINGS.md, #56): off unless
+  # set. G6_NGRAM_LOG stays engine environment (G6ENV_X)
+  ENGINE_ENV="$ENGINE_ENV${NGRAM:+ G6_NGRAM=$NGRAM}"
+  ENGINE_ENV="$ENGINE_ENV${NGRAM_KMAX:+ G6_NGRAM_KMAX=$NGRAM_KMAX}"
+  ENGINE_ENV="$ENGINE_ENV${NGRAM_KMIN:+ G6_NGRAM_KMIN=$NGRAM_KMIN}"
+  ENGINE_ENV="$ENGINE_ENV${NGRAM_MARGIN:+ G6_NGRAM_MARGIN=$NGRAM_MARGIN}"
   # the per-session MTP confidence stop in shared rounds (MTP_KSTOPB, MTP_KSTOPB_KMIN, MTP_KSTOPB_TAU, MTP_KSTOPB_TAU_S;
   # docs/SETTINGS.md): off unless set. MTP_KSTOPB_TAU_S="1:0.7,0.7/2:0.7,0.8" sets G6_MTP_KSTOPB_TAU_S1 and _S2.
   # G6_MTP_KSTOPB_EXPLORE stays engine environment (G6ENV_X)
@@ -256,6 +324,11 @@ engine_args() {
   [ "$PF_OWN" = 3 ] && [ -z "${V2_DENSE:-}" ] && qo="--qo-manifest $ap/qo.manifest.json --qo-pack $ap/qo.pack"
   a="--manifest $rp/rank$r.manifest.json --pack $rp/rank$r.pack --image --layers all"
   [ -n "${V2_DENSE:-}" ] && a="--image --layers all"
+  if [ "${GR8_MODEL:-glm53}" = pseudo ]; then
+    a="--model $V2_DENSE --cap $CAP --serve $home/s2 --s2-sessions $SESS --s2-epoch $epoch ${SET_ID:+--set-id $SET_ID}"
+    (set -f; echo $a)
+    return
+  fi
   # a release only, SESS sessions (flash_defaults). --chunk 1: a prompt tail goes one row a step, and a session's rows
   # in a main step stay within its KDA state ring (MTP + 1)
   if [ "${GR8_MODEL:-glm53}" = glm53f ]; then
@@ -263,6 +336,12 @@ engine_args() {
 --pf-lanes 2 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
     [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
     [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
+    # FLASH_CACHE keeps its checkpoints in the KV_STORE store (one at most), else in memory
+    if [ -n "${FLASH_CACHE:-}" ] && [ "$FLASH_CACHE" != off ] && [ -n "${KV_STORE:-}" ] && [ "$KV_STORE" != off ]; then
+      local t IFS=';'
+      for t in $KV_STORE; do [ -n "$t" ] && a="$a --kv-store $t"; done
+      unset IFS
+    fi
     (set -f; echo $a)
     return
   fi

@@ -1,12 +1,15 @@
 """Drafter step check: engine/runtime/dfltest against the NumPy reference (dflash2_ref.py).
 
-python3 engine/ref/dflash2_check.py gen DIR --glm GLM_DIR [--n 20] [--p0 1000] [--bonus 13] [--seed 1] [--scale 4]
+python3 engine/ref/dflash2_check.py gen DIR --src DRAFTER --glm GLM_DIR [--n 20] [--p0 1000] [--bonus 13] [--seed 1]
+                                      [--scale 4]
     case.bin: n context rows of random target features (normal, std --scale) at positions p0.., the bonus token, and the
     embedding rows of [bonus, mask x 7] from the GLM checkpoint
 python3 engine/ref/dflash2_check.py ref DIR --src DRAFTER --glm GLM_DIR [--quant mxfp8|bf16]
     ref.<quant>.npz: the reference's final-norm rows, context K/V of the last chunk, top-16 and the walk
-python3 engine/ref/dflash2_check.py cmp DIR [--quant mxfp8] [--sel 1]
+python3 engine/ref/dflash2_check.py cmp DIR --src DRAFTER [--quant mxfp8] [--sel 1]
     compares out.<sel>.bin (dfltest) with ref.<quant>.npz
+The sizes (taps, hidden, layers) are the drafter's (--src): GLM 5.3's, or GLM 5.3 Flash's with a Flash GLM_DIR and a
+Flash dfltest (EXTRA=-DG6_MODEL_FLASH=1).
 """
 import argparse
 import json
@@ -19,14 +22,20 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dflash2_ref as R  # noqa: E402
 
-B, NT, HID, NKV, HD = 8, 6, 6144, 8, 128
+B, NKV, HD = 8, 8, 128
+
+
+def sizes(src):
+    """(taps, hidden, layers) of the drafter at src"""
+    c = json.load(open(os.path.join(src, 'config.json')))
+    return len(c['dflash_config']['target_layer_ids']), c['hidden_size'], c['num_hidden_layers']
 
 
 def gen(a):
+    NT, HID, _ = sizes(a.src)
     rng = np.random.default_rng(a.seed)
     feat = (rng.standard_normal((a.n, NT * HID)) * a.scale).astype(np.float32)
-    cfg = json.load(open(os.path.join(a.src, 'config.json'))) if a.src else {'dflash_config': {'mask_token_id': 154856}}
-    mask = cfg['dflash_config']['mask_token_id']
+    mask = json.load(open(os.path.join(a.src, 'config.json')))['dflash_config']['mask_token_id']
     st = R.ST(os.path.join(a.glm, 'model-embed.safetensors'))
     emb = np.stack([R.bf(st.get('model.embed_tokens.weight', rows=(t, t + 1))[0]) for t in [a.bonus] + [mask] * 7])
     with open(os.path.join(a.dir, 'case.bin'), 'wb') as f:
@@ -36,7 +45,8 @@ def gen(a):
     print(f'case: {a.n} rows at {a.p0}, bonus {a.bonus}, mask {mask}')
 
 
-def load_case(d):
+def load_case(d, src):
+    NT, HID, _ = sizes(src)
     raw = open(os.path.join(d, 'case.bin'), 'rb').read()
     n, p0, bonus, lo = struct.unpack('<4i', raw[:16])
     feat = np.frombuffer(raw, np.float32, n * NT * HID, 16).reshape(n, NT * HID)
@@ -45,7 +55,7 @@ def load_case(d):
 
 
 def ref(a):
-    n, p0, bonus, lo, feat, emb = load_case(a.dir)
+    n, p0, bonus, lo, feat, emb = load_case(a.dir, a.src)
     D = R.Drafter(a.src, None if a.quant == 'bf16' else a.quant)
     # the engine stores the features as fp16 of residual / 64 (dflash.cuh FEAT_SCALE); fc is linear
     f16 = (feat / 64).astype(np.float16).astype(np.float32) * 64
@@ -64,14 +74,15 @@ def ref(a):
 
 
 def cmp(a):
-    n, p0, bonus, lo, feat, emb = load_case(a.dir)
+    n, p0, bonus, lo, feat, emb = load_case(a.dir, a.src)
+    _, HID, L = sizes(a.src)
     r = np.load(os.path.join(a.dir, f'ref.{a.quant}.npz'))
     raw = open(os.path.join(a.dir, f'out.{a.sel}.bin'), 'rb').read()
     tok = np.frombuffer(raw, np.int32, B)
     x = np.frombuffer(raw, np.float32, B * HID, 4 * B).reshape(B, HID)
     last = r['k'].shape[1]
-    kv = np.frombuffer(raw, np.float32, 6 * 2 * NKV * last * HD,
-                       4 * B + x.nbytes).reshape(6, 2, NKV, last, HD)
+    kv = np.frombuffer(raw, np.float32, L * 2 * NKV * last * HD,
+                       4 * B + x.nbytes).reshape(L, 2, NKV, last, HD)
     rel = lambda e, g: float(np.linalg.norm(e - g) / max(np.linalg.norm(g), 1e-30))
     cos = lambda e, g: float((e * g).sum() / max(np.linalg.norm(e) * np.linalg.norm(g), 1e-30))
     out = dict(x_rel=rel(x, r['x']), x_cos_min=min(cos(x[i], r['x'][i]) for i in range(B)))
@@ -90,7 +101,7 @@ def main():
     ap.add_argument('cmd', choices=['gen', 'ref', 'cmp'])
     ap.add_argument('dir')
     ap.add_argument('--glm')
-    ap.add_argument('--src')
+    ap.add_argument('--src', required=True, help='the drafter: config.json + model.safetensors')
     ap.add_argument('--n', type=int, default=20)
     ap.add_argument('--p0', type=int, default=1000)
     ap.add_argument('--bonus', type=int, default=13)

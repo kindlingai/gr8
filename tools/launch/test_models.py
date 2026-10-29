@@ -12,9 +12,11 @@ import modelset as M  # noqa: E402
 import models  # noqa: E402
 import options as opt  # noqa: E402
 import supervisor as S  # noqa: E402
+from test_modelset import make_release  # noqa: E402
 from test_variant import manifest  # noqa: E402
 
 PEERS = '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'
+GLM = {'GR8_MODEL': 'glm53'}   # the model: a boot names it (no default)
 
 
 def flash(*argv, peers=PEERS):
@@ -28,7 +30,7 @@ class OptionTests(unittest.TestCase):
         o = flash()
         self.assertEqual((models.of(o), o.get('GROUP'), S.engine_bin(o)), (models.GLM53F, 'gr8-glm53f', 'g6m4_flash'))
         self.assertEqual(flash('--group', 'mine').get('GROUP'), 'mine')
-        glm = opt.parse(['--no-config', '--peers', PEERS], {})
+        glm = opt.parse(['--no-config', '--peers', PEERS], GLM)
         self.assertEqual((models.of(glm), glm.get('GROUP')), (models.GLM53, 'gr8-glm53'))
 
     def test_refusals(self):
@@ -38,9 +40,6 @@ class OptionTests(unittest.TestCase):
             with self.assertRaises(opt.OptionError) as e:
                 flash(*argv)
             self.assertIn(want, str(e.exception))
-        with self.assertRaises(opt.OptionError) as e:
-            opt.parse(['--no-config', '--gr8-model', 'glm9'], {})
-        self.assertIn('want glm53 or glm53f', str(e.exception))
         for argv, want in ((['--reuse', '1'], 'GLM-5.3-Flash has no REUSE'), (['--sess', '9'], 'serves 1 to 8 sessions'),
                            (['--sess', '0'], 'serves 1 to 8 sessions'),
                            (['--sess', '8', '--mtp', '4'], 'a round of 40 rows')):
@@ -61,6 +60,39 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '1')
             self.assertEqual(plan['args'][plan['args'].index('--chunk') + 1], '1')
             self.assertIn('G6_PF_DSA_F16GEMM=1', plan['env'])
+
+    def test_flash_cache(self):
+        plan = opt.engine_plan(flash())
+        self.assertFalse([e for e in plan['env'] if e.startswith('G6_FLASH_')])
+        self.assertNotIn('--kv-store', plan['args'])
+        plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--flash-state-budget-mib', '4096'))
+        self.assertIn('G6_FLASH_CACHE=aligned', plan['env'])
+        self.assertIn('G6_FLASH_STATE_BUDGET_MIB=4096', plan['env'])
+        self.assertNotIn('--kv-store', plan['args'])
+        plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/fc,size=64G'))
+        self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], 'ssd:/tmp/fc,size=64G')
+        plan = opt.engine_plan(flash('--flash-cache', 'terminal'))
+        self.assertIn('G6_FLASH_CACHE=terminal', plan['env'])
+        # the checkpoint store on a group lease (D-331 M8 (c)): the store as given, KV_SHARE_WHEN reaches the engine
+        g = 'remote:192.0.2.5:7350,size=1G,group=flash'
+        plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', g, '--kv-share-when', 'always'))
+        self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], g)
+        self.assertIn('G6_KV_SHARE_WHEN=always', plan['env'])
+        self.assertNotIn('G6_KV_SHARE_WHEN', ' '.join(opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', g))['env']))
+        for argv, want in ((['--flash-cache', 'sessions'], 'want off, aligned or terminal'),
+                           (['--flash-state-budget-mib', '0'], 'whole number of MiB'),
+                           (['--kv-store', 'ssd:/tmp/fc,size=64G'], 'needs --flash-cache aligned or terminal'),
+                           (['--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/a,size=1G', '--kv-store',
+                             'ssd:/tmp/b,size=1G'], 'give one --kv-store'),
+                           (['--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/a,size=1G,persist=on'],
+                            'do not persist')):
+            with self.assertRaises(opt.OptionError) as e:
+                flash(*argv)
+            self.assertIn(want, str(e.exception))
+        glm = opt.parse(['--no-config', '--peers', PEERS, '--flash-cache', 'aligned'], GLM)
+        with self.assertRaises(opt.OptionError) as e:
+            opt.validate(glm)
+        self.assertIn('glm53f only', str(e.exception))
 
     def test_cap(self):
         """CAP: a 262,144-token request and a page for the guard rows (2 at MTP=1) at either TP, as no CP leaves every
@@ -87,7 +119,7 @@ class OptionTests(unittest.TestCase):
             self.assertNotIn('--reuse-prefix', plan['args'])
 
     def test_model_counts_in_the_canonical_options(self):
-        glm = opt.parse(['--no-config', '--peers', PEERS], {})
+        glm = opt.parse(['--no-config', '--peers', PEERS], GLM)
         opt.validate(glm)
         c, _, _ = opt.canonical(glm, opt.engine_plan(glm), opt.split_list(PEERS))
         self.assertNotIn('model', c)
@@ -117,6 +149,94 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(models.ModelMismatch) as e:
             models.check_config(models.GLM53, self.t)
         self.assertIn('./gr8 glm53f serves it', str(e.exception))
+
+class RequiredTests(unittest.TestCase):
+    """The runner names the model: no model, an unknown name or a release of the other model stops the boot before any
+    download, in one line naming what is wrong and the models (pseudo, the test engine, only when asked for)."""
+
+    def test_no_model(self):
+        for env in ({}, {'GR8_MODEL': ''}):
+            o = opt.parse(['--no-config', '--peers', PEERS], env)            # down, status and logs need none
+            with self.assertRaises(opt.OptionError) as e:
+                opt.validate(o)                                              # up, check, prepare, show-config
+            self.assertIn('no model: set GR8_MODEL to glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash)', str(e.exception))
+            self.assertNotIn('pseudo', str(e.exception))
+
+    def test_an_unknown_name(self):
+        for argv, env, src in ((['--gr8-model', 'glm9'], {}, 'command line'),
+                               ([], {'GR8_MODEL': 'glm53x'}, 'environment')):
+            with self.assertRaises(opt.OptionError) as e:
+                opt.parse(['--no-config', *argv], env)
+            self.assertIn(f'from the {src}: not a model gr8 serves. Want glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash)',
+                          str(e.exception))
+            self.assertNotIn('pseudo', str(e.exception))
+        self.assertIs(models.of(opt.parse(['--no-config'], {'GR8_MODEL': 'pseudo'})), models.PSEUDO)   # asked for
+
+    def test_a_release_of_the_other_model_is_named_before_the_variant(self):
+        t = tempfile.mkdtemp()
+        # TP=3 GLM-5.3 wants bit225 or down1, and Flash k4: neither release has the other's, so the variant step would
+        # fail first, on a missing manifest, if the architecture were not checked before it
+        for name, arch, peers, want in (
+                ('glm53', 'Glm5NextForConditionalGeneration', '10.0.0.1,10.0.0.2,10.0.0.3', './gr8 glm53f serves it'),
+                ('glm53f', 'GlmMoeDsaForCausalLM', PEERS, './gr8 glm53 serves it')):
+            rel = make_release(os.path.join(t, name), variants=('k4',) if name == 'glm53' else ('home',))
+            with open(os.path.join(rel, 'config.json'), 'w') as f:
+                json.dump({'architectures': [arch]}, f)
+            o = opt.parse(['--no-config', '--peers', peers, '--model', rel], {'GR8_MODEL': name})
+            opt.validate(o)
+            ms, variant, err = S.resolve_model(o)
+            self.assertIn(f'is {arch}, and ./gr8 {name} serves', err)
+            self.assertIn(want, err)
+            self.assertIsNone(variant)
+            self.assertIsNone(o.get('V2_DENSE'))
+
+    def test_the_listing(self):
+        glm, flash = models.describe(models.GLM53), models.describe(models.GLM53F)
+        self.assertIn('--tp       4, 6, 3 or 5', glm)
+        self.assertIn('TP=3 bit225 else down1', glm)
+        self.assertIn(models.GLM53.release, glm)
+        self.assertIn('--tp       4, 3 or 2', flash)
+        self.assertNotIn('--drafter', flash)
+        self.assertEqual(models.SERVED, (models.GLM53, models.GLM53F))
+
+
+class PseudoTests(unittest.TestCase):
+    """GR8_MODEL=pseudo: the pseudo engine's command line and its release, a directory with responses.toml."""
+
+    def setUp(self):
+        self.t = tempfile.mkdtemp()
+        self.rel = os.path.join(self.t, 'rel')
+        os.makedirs(self.rel)
+        for n in (*M.TOKENIZER, 'responses.toml'):
+            with open(os.path.join(self.rel, n), 'w') as f:
+                f.write(n)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.t)
+
+    def pseudo(self, *argv):
+        o = opt.parse(['--no-config', '--peers', '127.0.0.1', '--model', self.rel, *argv], {'GR8_MODEL': 'pseudo'})
+        opt.validate(o)
+        return o
+
+    def test_engine_plan(self):
+        o = self.pseudo()
+        self.assertEqual((o.get('TP'), o.get('GROUP'), S.engine_bin(o)), ('1', 'gr8-pseudo', 'g6pseudo'))
+        ms, variant, err = S.resolve_model(o)
+        self.assertEqual((err, variant.name, ms.set['source']['kind']), ('', 'home', 'pseudo'))
+        plan = opt.engine_plan(o, rank=0, home='/h', epoch=3, set_id=ms.id)
+        self.assertEqual(plan['env'], [])
+        self.assertEqual(plan['args'], ['--model', self.rel, '--cap', '202752', '--serve', '/h/s2', '--s2-sessions', '8',
+                                        '--s2-epoch', '3', '--set-id', ms.id])
+
+    def test_the_rules_are_the_weights(self):
+        first = M.pseudo_set(self.rel, 1).id
+        with open(os.path.join(self.rel, 'responses.toml'), 'a') as f:
+            f.write('\n')
+        self.assertNotEqual(M.pseudo_set(self.rel, 1).id, first)
+        os.unlink(os.path.join(self.rel, 'responses.toml'))
+        self.assertIn('want a pseudo engine release', S.resolve_model(self.pseudo())[2])
 
 
 if __name__ == '__main__':

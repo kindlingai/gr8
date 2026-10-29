@@ -23,15 +23,17 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # key: (scope, default, meaning). A default of None means unset, or the engine's default for the TP
 # (scripts/engine_args.sh). The flag is --<key in lower case, _ as ->, except where FLAGS says otherwise.
 KEYS = {
-    'GR8_MODEL': ('cluster', 'glm53', 'the model the engine serves: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash); ./gr8 '
-                                      '<model> sets it'),
+    'GR8_MODEL': ('cluster', None, 'the model the engine serves, required: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash); '
+                                   './gr8 <model> sets it, and ./gr8 models lists what each one takes'),
     'TP': ('cluster', None, 'tensor-parallel size: 4, 6, 3 or 5 (glm53f: 4, 3 or 2)'),
-    'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: each box's f0 port "
-                                 "cabled to the f1 port of the next box in --peers order, the last to the first)"),
+    'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: with --peers, each box's "
+                                 "f0 port cabled to the f1 port of the next box in --peers order, the last to the "
+                                 "first; with mentat, the order and the devices follow the cables mentat's ring "
+                                 "claim finds)"),
     'PEERS': ('cluster', None, 'LAN addresses of every box in rank order; the first is the head'),
     'MENTAT': ('box', None, "the local mentat daemon (localhost) to find the other boxes through"),
     'GROUP': ('cluster', None, "mentat group the boxes join (default gr8-<model>: gr8-glm53, gr8-glm53f)"),
-    'HEAD': ('cluster', None, 'mentat mode: the head LAN address, instead of the lowest one'),
+    'HEAD': ('cluster', None, 'mentat mode: the head LAN address, or a name that resolves to it, instead of the lowest one'),
     'IPS': ('cluster', None, 'rail-0 fabric address of every rank (skips fabric discovery)'),
     'IPS2': ('cluster', None, 'rail-1 fabric address of every rank'),
     'CONTROL_PORT': ('cluster', '7340', 'the supervisors\' TCP port on the LAN'),
@@ -39,12 +41,23 @@ KEYS = {
     'S2PORT': ('cluster', None, 'the S2 control port on the head (7341)'),
     'MODEL': ('box', None, 'the exlr8 release: https://huggingface.co/<org>/<repo>[@rev], or a local copy (an NFS '
                            'mount works) used in place'),
-    'MODEL_CACHE': ('box', None, "with an https:// --model: this box's local directory for its part of the release"),
+    'MODEL_CACHE': ('box', None, "with an https:// --model: this box's local directory for its part of the release "
+                                 '(FETCH=model-loader: the model-loader store, which gr8 reads and may mount read-only)'),
+    'FETCH': ('box', 'legacy', 'with an https:// --model: who fetches the weights. legacy: gr8 itself, from Hugging Face. '
+                               "model-loader: the box's model-loader (MODEL_LOADER), into its store (MODEL_CACHE). "
+                               'Default: model-loader when MODEL_LOADER is set, else legacy'),
+    'MODEL_LOADER': ('box', None, "FETCH=model-loader: the local model-loader's request API, unix:PATH or host:port "
+                                  '(default unix:<MODEL_CACHE>/model-loader.sock). host:port needs '
+                                  'MODEL_LOADER_LOCAL_TOKEN in the environment'),
+    'MODEL_LOADER_DRAFTER_MODEL': ('box', None, "FETCH=model-loader: the drafter's name in model-loader's catalog, when "
+                                                "the catalog cannot be asked (default: the entry whose source is DRAFTER's repo)"),
+    'MODEL_LOADER_MODEL': ('box', None, "FETCH=model-loader: the release's name in model-loader's catalog, when the "
+                                        "catalog cannot be asked (default: the entry whose source is MODEL's repo)"),
     'MODEL_DIR': ('box', None, 'tokenizer directory, when the model directory has none'),
     'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, run/'),
     'PROXY_CPU': ('box', '19', "CPU core for this rank's fabric proxy thread"),
-    'RING_DEVS': ('box', None, "--shape ring: this box's RDMA devices as relay-out,next,relay-in,prev (default "
-                               'rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1)'),
+    'RING_DEVS': ('box', None, "--shape ring: this box's RDMA devices as relay-out,next,relay-in,prev (default: from "
+                               "mentat's ring claim, or with --peers rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1)"),
     'NODE_IP': ('box', None, "this box's LAN address, when the peer list cannot tell"),
     'PY': ('box', None, 'python for the shim (default $G6_HOME/venv/bin/python)'),
     'FRONT_BIN': ('box', None, 'the Rust front end binary (default bin/g6front-rs)'),
@@ -76,15 +89,27 @@ KEYS = {
     'SPEC_LEVELS': ('cluster', None, 'draft counts SPEC_ADAPT may choose'),
     'SPEC_ACCEPT': ('cluster', None, 'draft acceptance'),
     'REUSE': ('cluster', None, 'prefix reuse'),
+    'FLASH_CACHE': ('cluster', None, 'glm53f, experimental: Flash session checkpoints, off (default), aligned or terminal. '
+                                     'aligned: a prompt keeps its pages and KDA state at its last cold prefill grid point, '
+                                     'and a later prompt that starts with those tokens is prefilled from there, bit-exact. '
+                                     'terminal: aligned, and also a checkpoint at the end of every request; NOT cold-exact '
+                                     '(docs/FLASH.md)'),
+    'FLASH_STATE_BUDGET_MIB': ('cluster', None, 'glm53f, FLASH_CACHE: the checkpoint store in MiB a rank, in memory, '
+                                                'when no KV_STORE names one (8192)'),
     'KV_STORE': ('cluster', None, 'experimental: block stores below the KV pool, tried in order: STORE,size=N(M|G|T) each, '
                                   'separated by ; (or --kv-store given again). STORE: ssd:PATH (a folder on each box\'s own SSD), '
                                   'remote:HOST:PORT or remote:auto (a KV node on another machine; auto = the one the mentat '
                                   'group announces). Sizes per rank. An SSD store starts empty at every boot; '
-                                  ',persist=on keeps it across restarts'),
+                                  ',persist=on keeps it across restarts. An entry cache:NAME,kind=spare_ram[,floor=N(M|G)] and a store\'s '
+                                  ',cache=NAME cache its blocks in spare memory the kernel may take back, while '
+                                  'MemAvailable is above floor (default 2G). @FILE reads the same from a YAML file '
+                                  '(kvman-rs REMOTE-TIER.md), relative to the config file it is named in'),
     'KV_KEEP': ('cluster', None, 'what the stores keep: system (system prompts and tools that KV_SYSTEM_AFTER conversations '
                                  'started with), sessions (those, and evicted runs that continued their conversation) or all '
                                  '(every eviction). Default system'),
     'KV_SYSTEM_AFTER': ('cluster', None, 'conversations a system prefix must start before the stores keep it (2)'),
+    'KV_SHARE_WHEN': ('cluster', None, 'a KV_STORE group= lease gives segments to other groups only while the engine is '
+                                       'idle (idle, default) or whenever the node asks (always) (G6_KV_SHARE_WHEN)'),
     'KV_WRITE_LIMIT': ('cluster', None, 'the stores write at most this many page blocks per page of KV computed (off)'),
     'KV_ROWS': ('cluster', None, 'experimental: remote attention rows: the rows past SHARE_LIMIT in a rows store, read back '
                                  'as decode selects them. STORE,size=N(M|G|T)[,local=PAGES][,pool=SLOTS][,place=PAGES]'
@@ -94,6 +119,20 @@ KEYS = {
     'KV_TIER': ('cluster', None, 'deprecated: KV_STORE with keep=evicted|shared|all per tier (any evicted or all maps to '
                                  'KV_KEEP=all, else system)'),
     'KV_SHARED_AFTER': ('cluster', None, 'deprecated: KV_SYSTEM_AFTER'),
+    'FLASH_KV_DONATE_GIB': ('box', None, 'GLM-5.3-Flash: once the serve booted, lend at most this many GiB of this '
+                                        'box to a KV node beside it (./gr8 kv up --lazy-lock --ledger), less when '
+                                        'MemAvailable - FLASH_KV_GROWTH_GIB - KV_MIN_FREE_GB is less. 0 (default) = '
+                                        'none'),
+    'FLASH_KV_GROWTH_GIB': ('box', None, 'with FLASH_KV_DONATE_GIB: the GiB the Flash serve may still allocate after '
+                                        'boot (no default: not measured yet)'),
+    'FLASH_KV_GROUP': ('box', None, 'with FLASH_KV_DONATE_GIB: the mentat group the KV node joins, the cluster that '
+                                   'borrows from it (e.g. the GLM-5.3 serve\'s), not this serve\'s. No default'),
+    'FLASH_CAP_POLICY': ('cluster', None, "protected (default): the configured CAP's memory is never lent. "
+                                         'borrow-idle: with FLASH_KV_DONATE_GIB, the Flash KV pool in chunks '
+                                         '(G6_FLASH_KV_CHUNKS=1) lends all but one chunk to the KV node once idle '
+                                         'FLASH_KV_IDLE_S, and a request that needs them waits for their recall'),
+    'FLASH_KV_IDLE_S': ('cluster', None, 'with FLASH_CAP_POLICY=borrow-idle: idle seconds before a lend (default 60, '
+                                        'not measured)'),
     'PF_OWN': ('cluster', None, 'prefill attention ownership'),
     'QP_ROLL': ('cluster', None, 'PF_OWN=4 rolling pair slots'),
     'QP_CTX': ('cluster', None, 'PF_OWN=4 QO key table size'),
@@ -129,6 +168,10 @@ KEYS = {
     'PF_SELX_CTX': ('cluster', None, 'prefill selx at context >= this; 0 = SEL32 (G6_PF_SELX_CTX)'),
     'DSEL_MODEL': ('cluster', None, 'drafter choice priced from a frozen cost table, MTP rounds as the confidence stop runs them (G6_S2_DSEL_MODEL)'),
     'DSEL_TABLE': ('cluster', None, 'DSEL_MODEL: the cost table, key:value list or a file (G6_S2_DSEL_TABLE; tools/s2_dsel_table.py)'),
+    'NGRAM': ('cluster', None, 'a solo DFlash2 request also drafts from this n-gram table file (G6_NGRAM; tools/ngram/ngram.py export)'),
+    'NGRAM_KMAX': ('cluster', None, 'NGRAM: the longest table chain a round verifies, 1..dflash-k (G6_NGRAM_KMAX)'),
+    'NGRAM_KMIN': ('cluster', None, 'NGRAM: the shortest table chain worth a round (G6_NGRAM_KMIN)'),
+    'NGRAM_MARGIN': ('cluster', None, 'NGRAM: how much more tokens per verify ms a chain must promise than the drafter (G6_NGRAM_MARGIN)'),
     'MTP_KSTOPB': ('cluster', None, 'shared rounds: each session verifies its own count of the MTP drafts (G6_MTP_KSTOPB)'),
     'MTP_KSTOPB_KMIN': ('cluster', None, 'MTP_KSTOPB: the least drafts a session verifies, 0 or 1 (G6_MTP_KSTOPB_KMIN)'),
     'MTP_KSTOPB_TAU': ('cluster', None, 'MTP_KSTOPB thresholds t1,t2,... at every session count (G6_MTP_KSTOPB_TAU)'),
@@ -173,7 +216,8 @@ KEYS = {
     'DRAFTER': ('box', None, 'TP=4 or 6: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
                              'converted on this box'),
     'DFLASH_DIR': ('box', None, 'the directory holding dflash.r<r>.*, when it is not the model set\'s'),
-    'STEERING_PROFILE': ('box', None, 'verified schema-v1 profile directory, or hf:default / hf:NAME from the model release'),
+    'STEERING_PROFILE': ('box', None, 'verified schema-v1 profile directory (several: comma-separated, a request picks one by '
+                                      'name), or hf:default / hf:NAME from the model release'),
     'STEERING_CHAT_TEMPLATE': ('box', None, 'served chat template file; resolved from the model'),
     'STEERING_FORCE': ('cluster', None, 'force the loaded steering profile at this request scale'),
     'STEERING_MODEL_REVISION': ('cluster', None, 'exact model revision recorded by the steering profile'),
@@ -327,11 +371,18 @@ def parse(argv, environ=None):
         values['MENTAT'], origin['MENTAT'] = 'localhost', 'default'
     if '--no-check' in switches:
         values['CHECK'], origin['CHECK'] = '0', 'command line'
+    # A box that names its model-loader fetches through it: model-loader's own deploy trees (deploy/compose/gr8.yml,
+    # deploy/spark-os/gr8.override.yml, deploy/k8s/examples/gr8) set MODEL_LOADER and MODEL_CACHE, not FETCH.
+    if origin['FETCH'] == 'default' and values['MODEL_LOADER']:
+        values['FETCH'], origin['FETCH'] = 'model-loader', f'MODEL_LOADER, from the {origin["MODEL_LOADER"]}'
     deprecated_kv(values, origin, warnings)
-    if values['GR8_MODEL'] not in models.MODELS:
-        raise OptionError(f'--gr8-model {values["GR8_MODEL"]}: want {" or ".join(models.MODELS)}')
-    if not values['GROUP']:
-        values['GROUP'] = models.MODELS[values['GR8_MODEL']].group
+    kv_store_files(values, origin, path)
+    model = values['GR8_MODEL']
+    if model and model not in models.MODELS:
+        raise OptionError(f'GR8_MODEL={model}, from the {origin["GR8_MODEL"]}: not a model gr8 serves. Want '
+                          f'{models.CHOICES} (./gr8 models lists them)')
+    if model and not values['GROUP']:
+        values['GROUP'] = models.MODELS[model].group
     opts = Options(values, origin, path, args, switches, warnings)
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
@@ -341,7 +392,9 @@ def parse(argv, environ=None):
                 (k == 'STEERING_PROFILE' and values[k].startswith('hf:')) or \
                 (k == 'VARIANT' and '/' not in values[k] and not values[k].endswith('.json')):
             continue
-        values[k] = os.path.abspath(values[k])   # the engine runs in G6_HOME
+        # the engine runs in G6_HOME. STEERING_PROFILE may list several directories
+        values[k] = ','.join(d if not d or d.startswith('hf:') else os.path.abspath(d) for d in values[k].split(',')) \
+            if k == 'STEERING_PROFILE' else os.path.abspath(values[k])
     return opts
 
 
@@ -356,6 +409,9 @@ def mode(o):
 
 def validate(o):
     """Refuse what this version cannot boot, with the reason."""
+    if not o.get('GR8_MODEL'):
+        raise OptionError(f'no model: set GR8_MODEL to {models.CHOICES}, in the config file or the environment, or '
+                          'run ./gr8 <model> (./gr8 models lists them)')
     model = models.of(o)
     tp = o.get('TP')
     if tp is None:
@@ -406,9 +462,11 @@ def validate(o):
         raise OptionError('--kvb fp8 needs a release boot (--model <release> or --v2-dense): packs hold kv_b in BF16')
     if o.get('LAYOUT') and not os.path.isfile(o.get('LAYOUT')):
         raise OptionError(f'--layout {o.get("LAYOUT")}: no such file')
-    if o.get('LAYOUT') and looks_remote(o.get('MODEL') or ''):
-        raise OptionError('--layout needs a local copy of the release (--model DIR): a box\'s cache holds only the '
-                          'pieces the formulas give its rank')
+    if o.get('FETCH') not in ('legacy', 'model-loader'):
+        raise OptionError(f'--fetch {o.get("FETCH")}: want legacy or model-loader')
+    if o.get('FETCH') == 'legacy' and o.get('MODEL_LOADER'):
+        raise OptionError(f'--fetch legacy with --model-loader {o.get("MODEL_LOADER")}: gr8 fetches its own weights then, '
+                          'and does not ask model-loader. Unset one')
     if o.plain == '1':
         raise OptionError('PLAIN=1 (the one-request loop) is retired at every TP: unset it')
     steering = o.get('STEERING_PROFILE')
@@ -419,7 +477,12 @@ def validate(o):
             raise OptionError('--steering-profile requires weight hash checks (unset NOHASH)')
         bundled = steering.startswith('hf:')
         if bundled and not re.fullmatch(r'hf:[A-Za-z0-9][A-Za-z0-9._-]{0,127}', steering):
-            raise OptionError('--steering-profile: want a profile directory, hf:default or hf:NAME')
+            raise OptionError('--steering-profile: want profile directories, hf:default or hf:NAME')
+        dirs = steering.split(',')
+        if len(dirs) > 1 and (any(d.startswith('hf:') or not d for d in dirs) or len(dirs) > 8):
+            raise OptionError('--steering-profile: a list holds up to 8 profile directories (hf: selects one profile)')
+        if len(dirs) > 1 and o.get('STEERING_FORCE'):
+            raise OptionError('--steering-force needs exactly one --steering-profile')
         missing = [flag_of(k) for k in ('STEERING_MODEL_REVISION', 'STEERING_TOKENIZER_REVISION',
                                         'STEERING_CHAT_TEMPLATE_SHA256') if not o.get(k)]
         if missing and not bundled:
@@ -441,8 +504,6 @@ def validate(o):
     if o.get('SHAPE') == 'ring':
         if tp not in ('3', '4'):
             raise OptionError(f'--shape ring: TP=3 or 4, not {tp}')
-        if mode(o) != 'peers':
-            raise OptionError('--shape ring needs --peers: their order is the cable order')
         if o.get('IPS'):
             raise OptionError('--shape ring takes no --ips/--ips2: the engine finds its devices by name (--ring-devs) '
                               'and bootstraps over the LAN')
@@ -458,9 +519,24 @@ def validate(o):
     for k in ('CONTROL_PORT', 'PORT', 'PROXY_CPU', 'JOIN_TIMEOUT'):
         o.int(k)
     stores = kv_stores(o)
+    cache = o.get('FLASH_CACHE')
+    if cache not in (None, 'off', 'aligned', 'terminal'):
+        raise OptionError(f'--flash-cache {cache}: want off, aligned or terminal')
+    if cache not in (None, 'off') and model.name != 'glm53f':
+        raise OptionError(f'--flash-cache: Flash session checkpoints are glm53f only, not {model.name}')
+    budget = o.get('FLASH_STATE_BUDGET_MIB')
+    if budget is not None and not (str(budget).isdigit() and int(budget) >= 1):
+        raise OptionError(f'--flash-state-budget-mib {budget}: want a whole number of MiB from 1')
+    if model.name == 'glm53f' and stores:
+        if cache in (None, 'off'):
+            raise OptionError('--kv-store on glm53f holds Flash session checkpoints: it needs --flash-cache aligned or terminal')
+        if len(stores) > 1:
+            raise OptionError('--flash-cache keeps its checkpoints in one store: give one --kv-store')
+        if any(t['persist'] for t in stores):
+            raise OptionError('--flash-cache: Flash checkpoints do not persist across boots (persist=on)')
+    elif stores and o.get('REUSE') == '0':
+        raise OptionError('--kv-store keeps the runs prefix reuse retains: it needs REUSE (on by default)')
     if stores:
-        if o.get('REUSE') == '0':
-            raise OptionError('--kv-store keeps the runs prefix reuse retains: it needs REUSE (on by default)')
         if any(t['host'] == 'auto' for t in stores) and mode(o) == 'peers':
             raise OptionError('--kv-store remote:auto finds a KV node through mentat: with --peers, name it (remote:HOST:PORT)')
     rows = kv_rows(o)
@@ -472,6 +548,8 @@ def validate(o):
         raise OptionError(f'--kv-format int4: {model.name} has an fp8 KV build only')
     if o.get('KV_FORMAT') not in (None, 'fp8', 'int4'):
         raise OptionError(f'--kv-format {o.get("KV_FORMAT")}: want fp8 or int4')
+    if o.get('KV_SHARE_WHEN') not in (None, 'idle', 'always'):
+        raise OptionError(f'--kv-share-when {o.get("KV_SHARE_WHEN")}: want idle or always')
     if o.get('KV_KEEP') not in (None, 'system', 'sessions', 'all'):
         raise OptionError(f'--kv-keep {o.get("KV_KEEP")}: want system, sessions or all')
     sa = o.get('KV_SYSTEM_AFTER')
@@ -501,42 +579,359 @@ def deprecated_kv(values, origin, warnings):
     values['KV_TIER'] = values['KV_SHARED_AFTER'] = None
 
 
-def kv_stores(o):
-    """KV_STORE parsed, in order: [{'text', 'store', 'kind': 'ssd' | 'remote', 'path', 'host', 'port', 'size',
-    'persist', 'keep'}] ([] when unset or off; keep None = KV_KEEP). Raises OptionError naming the bad store."""
-    v = o.get('KV_STORE')
-    if v in (None, 'off'):
-        return []
-    out = []
-    for text in [t.strip() for t in v.split(';') if t.strip()]:
-        store, *kvs = text.split(',')
-        m = re.fullmatch(r'ssd:(.+)', store) or re.fullmatch(r'remote:([^:,]+)(?::(\d+))?', store)
-        if not m or (store.startswith('remote:auto') and m.group(2)):
-            raise OptionError(f'--kv-store {text}: the store is ssd:PATH, remote:HOST:PORT or remote:auto')
-        t = {'text': text, 'store': store, 'kind': 'ssd' if store.startswith('ssd:') else 'remote', 'path': None,
-             'host': None, 'port': None, 'size': None, 'persist': False, 'keep': None}
+# KV_STORE's one-line form: entries separated by ;, each a head then ,key=value settings:
+#   cache:NAME,kind=spare_ram[,floor=N(M|G)]
+#   ssd:PATH,size=N(M|G|T)[,persist=on|off][,keep=RULE][,name=NAME][,cache=NAME]
+#   remote:HOST:PORT|remote:auto,size=N(M|G|T)[,keep=RULE][,name=NAME][,cache=NAME][,group=NAME[,cap=N(M|G|T)][,weight=N]]
+# A YAML store file says the same things (kv_store_file), with these key names: {kind: {one-line key: YAML key}}
+KV_KEYS = {'cache': {'kind': 'kind', 'floor': 'floor'},
+           'ssd': {'size': 'size_per_rank', 'persist': 'persist', 'keep': 'keep', 'name': 'name', 'cache': 'cache'},
+           'remote': {'size': 'size_per_rank', 'keep': 'keep', 'name': 'name', 'cache': 'cache', 'group': 'group',
+                      'cap': 'cap_per_rank', 'weight': 'weight'}}
+CACHE_KINDS = ('spare_ram',)
+SIZE = r'\d+(\.\d+)?[MGT]'
+WORD = r'[A-Za-z0-9_.-]+'
+# in the design but not built: refused by name so a file written for them fails loudly
+NOT_BUILT = {'caches': ('takes', 'holds', 'size', 'overflow'), 'tiers': ('transforms', 'tag_restored'),
+             'top': ('runs',)}
+TYPE_WORDS = {str: 'a string', bool: 'true or false', int: 'a whole number', dict: 'a mapping', list: 'a list'}
+
+
+class KvError(OptionError):
+    """A bad KV_STORE. `where` is ('cache', NAME), ('tier', INDEX) or None, so a store file can name its key."""
+
+    def __init__(self, msg, where=None):
+        super().__init__(msg)
+        self.where = where
+
+
+def kv_parse(v):
+    """KV_STORE's one-line form parsed and checked: (caches {NAME: {'kind', 'floor'}}, stores in cascade order
+    [{'text', 'store', 'kind': 'ssd' | 'remote', 'path', 'host', 'port', 'size', 'persist', 'keep', 'name', 'cache',
+    'group', 'cap', 'weight', 'settings': [(key, value) as written]}]). keep None = KV_KEEP; name defaults to the kind.
+    Raises KvError naming the entry."""
+    caches, stores = {}, []
+    for text in [t.strip() for t in (v or '').split(';') if t.strip()]:
+        head, *kvs = text.split(',')
+        if re.search(r'\s', text):
+            raise KvError(f'--kv-store {text}: no spaces')
+        settings = [kv.partition('=')[::2] for kv in kvs]
+        keys = [k for k, _ in settings]
+        if len(set(keys)) != len(keys):
+            raise KvError(f'--kv-store {text}: a setting given twice')
+        if head.startswith('cache:'):
+            name, where = head[6:], ('cache', head[6:])
+            if not re.fullmatch(WORD, name):
+                raise KvError(f'--kv-store {text}: cache:NAME, NAME of letters, digits and _.-', where)
+            if name in caches:
+                raise KvError(f'--kv-store {text}: a second cache {name}', where)
+            c = dict(settings)
+            for k in c:
+                if k not in KV_KEYS['cache']:
+                    raise KvError(f'--kv-store {text}: {k}: a cache takes kind= and floor=', where)
+            if c.get('kind') not in CACHE_KINDS:
+                raise KvError(f'--kv-store {text}: kind={" or ".join(CACHE_KINDS)}', where)
+            if 'floor' in c and not (re.fullmatch(r'\d+(\.\d+)?[MG]', c['floor']) and float(c['floor'][:-1]) > 0):
+                raise KvError(f'--kv-store {text}: floor=N(M|G)', where)
+            caches[name] = {'kind': c['kind'], 'floor': c.get('floor')}
+            continue
+        where = ('tier', len(stores))
+        m = re.fullmatch(r'ssd:(.+)', head) or re.fullmatch(r'remote:([^:,]+)(?::(\d+))?', head)
+        if not m or (head.startswith('remote:auto') and m.group(2)):
+            raise KvError(f'--kv-store {text}: the store is ssd:PATH, remote:HOST:PORT or remote:auto', where)
+        t = {'text': text, 'store': head, 'kind': 'ssd' if head.startswith('ssd:') else 'remote', 'path': None,
+             'host': None, 'port': None, 'size': None, 'persist': False, 'keep': None, 'name': None, 'cache': None,
+             'group': None, 'cap': None, 'weight': None, 'settings': settings}
         if t['kind'] == 'ssd':
             t['path'] = m.group(1)
         else:
             t['host'], t['port'] = m.group(1), m.group(2)
-        for kv in kvs:
-            k, _, x = kv.partition('=')
-            if k == 'size' and re.fullmatch(r'\d+(\.\d+)?[MGT]', x) and float(x[:-1]) > 0:
-                t['size'] = x
+        for k, x in settings:
+            if k == 'persist' and t['kind'] != 'ssd':
+                raise KvError(f'--kv-store {text}: persist= is for ssd: stores', where)
+            if k in ('group', 'cap', 'weight') and t['kind'] != 'remote':
+                raise KvError(f'--kv-store {text}: {k}= is for remote: stores', where)
+            if k in ('spare_ram_cache', 'spare_ram_floor'):
+                raise KvError(f'--kv-store {text}: {k}= is the engine\'s; name a cache: cache:NAME,kind=spare_ram '
+                              'and ,cache=NAME on the store', where)
+            if k in ('size', 'cap') and re.fullmatch(SIZE, x) and float(x[:-1]) > 0:
+                t[k] = x
             elif k == 'persist' and x in ('on', 'off'):
-                if t['kind'] != 'ssd' and x == 'on':
-                    raise OptionError(f'--kv-store {text}: persist=on is for ssd: stores')
                 t['persist'] = x == 'on'
+            elif k in ('group', 'name', 'cache') and re.fullmatch(WORD, x):
+                t[k] = x
+            elif k == 'weight' and re.fullmatch(r'[1-9]\d*', x) and int(x) <= 1000000:
+                t['weight'] = int(x)
             elif k == 'keep':
                 if x not in ('system', 'sessions', 'all'):
-                    raise OptionError(f'--kv-store {text}: keep=system, sessions or all (this store\'s KV_KEEP)')
+                    raise KvError(f'--kv-store {text}: keep=system, sessions or all (this store\'s KV_KEEP)', where)
                 t['keep'] = x
             else:
-                raise OptionError(f'--kv-store {text}: {kv}: want size=N(M|G|T), persist=on|off or keep=RULE')
+                raise KvError(f'--kv-store {text}: {k}={x}: want size=N(M|G|T), persist=on|off (ssd:), keep=RULE, '
+                              'name=NAME, cache=NAME, or group=NAME[,cap=N(M|G|T)][,weight=N] (remote:)', where)
         if not t['size']:
-            raise OptionError(f'--kv-store {text}: size=N(G|T) is needed (per rank)')
-        out.append(t)
+            raise KvError(f'--kv-store {text}: size=N(G|T) is needed (per rank)', where)
+        if (t['cap'] or t['weight']) and not t['group']:
+            raise KvError(f'--kv-store {text}: cap= and weight= need group=', where)
+        stores.append(t)
+    # an unnamed store is named for its kind, or kind-N when its kind repeats
+    unnamed = {k: [t for t in stores if t['kind'] == k and not t['name']] for k in ('ssd', 'remote')}
+    for k, ts in unnamed.items():
+        for n, t in enumerate(ts, 1):
+            t['auto'] = k if len(ts) == 1 else f'{k}-{n}'
+    names = {}
+    for i, t in enumerate(stores):
+        name = t['name'] or t['auto']
+        if name in names:
+            raise KvError(f'--kv-store {t["text"]}: the name {name} is also store {names[name] + 1}\'s', ('tier', i))
+        names[name] = i
+        t['name'] = name
+        if t['cache']:
+            if t['cache'] not in caches:
+                raise KvError(f'--kv-store {t["text"]}: no cache {t["cache"]} (caches: {", ".join(caches) or "none"})',
+                              ('tier', i))
+            if t['group']:
+                raise KvError(f'--kv-store {t["text"]}: a cache needs a fixed lease (no group=)', ('tier', i))
+    for name in caches:
+        if not any(t['cache'] == name for t in stores):
+            raise KvError(f'--kv-store cache:{name}: no store uses it', ('cache', name))
+    if caches and not stores:
+        raise KvError('--kv-store: caches but no store')
+    return caches, stores
+
+
+def kv_stores(o):
+    """KV_STORE's stores in cascade order, as kv_parse gives them ([] when unset or off)."""
+    v = o.get('KV_STORE')
+    return [] if v in (None, 'off') else kv_parse(v)[1]
+
+
+def kv_line(caches, stores):
+    """kv_parse's result as KV_STORE's one-line form: caches first by name, then the stores, settings in KV_KEYS
+    order."""
+    def store(t):
+        given = dict(t['settings'])
+        return ','.join([t['store']] + [f'{k}={given[k]}' for k in KV_KEYS[t['kind']] if k in given])
+
+    return ';'.join([f'cache:{n},kind={c["kind"]}' + (f',floor={c["floor"]}' if c['floor'] else '') for n, c in sorted(caches.items())] +
+                    [store(t) for t in stores])
+
+
+def kv_yaml(caches, stores):
+    """kv_parse's result as a YAML store file (kv_store_text reads it back to the same result)."""
+    import yaml
+
+    def q(x):   # a YAML scalar, quoted where YAML would read it as something else
+        return yaml.safe_dump(x, default_flow_style=True, width=1 << 20).strip().removesuffix('\n...').removesuffix('...').strip()
+
+    def flow(d):
+        return '{' + ', '.join(f'{k}: {q(x)}' for k, x in d.items()) + '}'
+
+    def value(k, x):
+        return x == 'on' if k == 'persist' else int(x) if k == 'weight' else x
+
+    lines = []
+    if caches:
+        lines.append('caches:')
+        lines += [f'  {q(n)}: ' + flow({k: c[k] for k in KV_KEYS['cache'] if c[k]}) for n, c in sorted(caches.items())]
+    lines.append('tiers:')
+    for t in stores:
+        given = dict(t['settings'])
+        tier = {KV_KEYS[t['kind']][k]: given[k] for k in ('keep', 'name', 'cache') if k in given}
+        store = {('path' if t['kind'] == 'ssd' else 'address'): t['store'].split(':', 1)[1]}
+        store.update({KV_KEYS[t['kind']][k]: value(k, x) for k, x in t['settings'] if k not in ('keep', 'name', 'cache')})
+        head = '- '
+        for k, x in tier.items():
+            lines.append(f'{head}{k}: {q(x)}')
+            head = '  '
+        lines += [f'{head}store:', f'    {t["kind"]}: {flow(store)}']
+    return '\n'.join(lines) + '\n'
+
+
+def kv_describe(o):
+    """Log lines for KV_STORE: the one-line form, then the same stores as a YAML store file."""
+    v = o.get('KV_STORE')
+    if v in (None, 'off'):
+        return []
+    caches, stores = kv_parse(v)
+    out = [f'KV_STORE={kv_line(caches, stores)}']
+    try:
+        out += ['KV_STORE as YAML:'] + ['  ' + line for line in kv_yaml(caches, stores).splitlines()]
+    except ImportError:
+        out.append('KV_STORE as YAML: needs PyYAML (python3-yaml)')
     return out
+
+
+def kv_store_with(o, target):
+    """KV_STORE with each remote:auto naming the KV node at `target`."""
+    caches, stores = kv_parse(o.get('KV_STORE'))
+    for t in stores:
+        if t['host'] == 'auto':
+            t['store'] = f'remote:{target}'
+    return kv_line(caches, stores)
+
+
+def kv_engine(v):
+    """KV_STORE as the engine takes it (--kv-store each, g6m4.cu): a store's cache becomes spare_ram_cache=on and
+    spare_ram_floor=, and name= and the cache entries go. Settings come in KV_KEYS order."""
+    if v in (None, 'off'):
+        return v
+    caches, stores = kv_parse(v)
+    out = []
+    for t in stores:
+        given = dict(t['settings'])
+        parts = [t['store']] + [f'{k}={given[k]}' for k in KV_KEYS[t['kind']] if k in given and k not in ('name', 'cache')]
+        if t['cache']:
+            floor = caches[t['cache']]['floor']
+            parts += ['spare_ram_cache=on'] + ([f'spare_ram_floor={floor}'] if floor else [])
+        out.append(','.join(parts))
+    return ';'.join(out)
+
+
+def kv_store_files(values, origin, config):
+    """Each @FILE in KV_STORE replaced by the stores it holds, in the one-line form. A relative FILE is relative to the
+    config file that names it, else to the working directory."""
+    v = values.get('KV_STORE')
+    if not v or '@' not in v:
+        return
+    base = os.path.dirname(config) if config and origin['KV_STORE'] in ('config file', '@file') else os.getcwd()
+    texts, files = [], []
+    for t in [t.strip() for t in v.split(';') if t.strip()]:
+        if t.startswith('@'):
+            files.append(os.path.join(base, t[1:]))
+            t = kv_store_file(files[-1])
+        texts.append(t)
+    values['KV_STORE'] = ';'.join(texts)
+    origin['KV_STORE'] += ' via ' + ', '.join(files)
+
+
+def _yaml_loader():
+    import yaml
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    def mapping(loader, node):   # PyYAML keeps the last of two equal keys: refuse them
+        seen = set()
+        for k, _ in node.value:
+            key = loader.construct_object(k)
+            if key in seen:
+                raise yaml.constructor.ConstructorError(None, None, f'{key} given twice', k.start_mark)
+            seen.add(key)
+        return yaml.SafeLoader.construct_mapping(loader, node)
+
+    def integer(loader, node):   # YAML 1.1 reads 0777 as octal and 1:20 as base 60: plain decimal only
+        if not re.fullmatch(r'-?(0|[1-9]\d*)', node.value):
+            raise yaml.constructor.ConstructorError(None, None, f'{node.value}: write a whole number in plain decimal',
+                                                    node.start_mark)
+        return int(node.value)
+
+    Loader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
+    Loader.add_constructor('tag:yaml.org,2002:int', integer)
+    return yaml, Loader
+
+
+def kv_store_text(text, path='-'):
+    """A YAML store file's text as KV_STORE's one-line form (kv_line). Shapes and types are checked here; everything
+    else by kv_parse, so the two forms refuse the same things. Raises OptionError naming the file and the key.
+
+        caches:
+          spare: {kind: spare_ram, floor: 2G}      # memory the kernel may take back
+        tiers:                                     # tried in order: a full tier passes entries to the next
+          - keep: system
+            cache: spare
+            store:
+              ssd: {path: /nvme/gr8kv, size_per_rank: 4G, persist: true}
+          - keep: all
+            cache: spare
+            store:
+              remote: {address: auto, size_per_rank: 4G}
+    """
+    def fail(where, msg):
+        raise OptionError(f'KV_STORE=@{path}: {where}: {msg}')
+
+    def want(where, x, t):
+        if type(x) is not t:   # a YAML 1.1 on/yes is a bool, a bare 4 an int, 1:20 a base-60 int
+            fail(where, f'want {TYPE_WORDS[t]}, got {x!r}')
+        return x
+
+    def keys(where, d, allowed, not_built=()):
+        for k in d:
+            if k in not_built:
+                fail(f'{where}.{k}', 'not built yet')
+            if k not in allowed:
+                fail(f'{where}.{k}', f'want {", ".join(allowed)}')
+
+    def one(x):   # a YAML value in the one-line form
+        return ('on' if x else 'off') if isinstance(x, bool) else str(x)
+
+    try:
+        yaml, loader = _yaml_loader()
+    except ImportError:
+        raise OptionError(f'KV_STORE=@{path}: needs PyYAML (python3-yaml)') from None
+    try:
+        doc = yaml.load(text, Loader=loader)
+    except yaml.YAMLError as e:
+        raise OptionError(f'KV_STORE=@{path}: {e}') from None
+    want('the file', doc, dict)
+    keys('the file', doc, ('caches', 'tiers'), NOT_BUILT['top'])
+    caches = want('caches', doc.get('caches', {}), dict)
+    entries, tier_keys = [], {}
+    for name, c in caches.items():
+        where = f'caches.{name}'
+        want(where, name, str)
+        keys(where, want(where, c, dict), tuple(KV_KEYS['cache'].values()), NOT_BUILT['caches'])
+        for k, x in c.items():
+            want(f'{where}.{k}', x, str)
+            if re.search(r'[,;=\s]', x):
+                fail(f'{where}.{k}', f'{x!r}: no commas, semicolons, = or spaces')
+        if re.search(r'[,;=\s]', name):
+            fail(where, f'{name!r}: no commas, semicolons, = or spaces in a cache name')
+        entries.append(','.join([f'cache:{name}'] + [f'{k}={c[k]}' for k in KV_KEYS['cache'] if k in c]))
+    if 'tiers' not in doc:
+        fail('tiers', 'no tiers')
+    tiers = want('tiers', doc['tiers'], list)
+    if not tiers:
+        fail('tiers', 'no tiers')
+    for i, t in enumerate(tiers):
+        where = f'tiers[{i}]'
+        keys(where, want(where, t, dict), ('name', 'keep', 'cache', 'store'), NOT_BUILT['tiers'])
+        if 'store' not in t:
+            fail(where, 'no store')
+        store = want(f'{where}.store', t['store'], dict)
+        if len(store) != 1 or next(iter(store)) not in ('ssd', 'remote'):
+            fail(f'{where}.store', 'want one of ssd: or remote:')
+        kind, s = next(iter(store.items()))
+        where_s = f'{where}.store.{kind}'
+        address = 'path' if kind == 'ssd' else 'address'
+        on_store = {y: k for k, y in KV_KEYS[kind].items() if y not in ('keep', 'name', 'cache')}
+        keys(where_s, want(where_s, s, dict), (address, *on_store))
+        if address not in s:
+            fail(where_s, f'no {address}')
+        settings = [(f'{where}.{y}', k, t[y]) if y in ('keep', 'name', 'cache') else (f'{where_s}.{y}', k, s[y])
+                    for k, y in KV_KEYS[kind].items() if y in (t if y in ('keep', 'name', 'cache') else s)]
+        for w, k, x in [(f'{where_s}.{address}', None, s[address])] + settings:
+            want(w, x, {'persist': bool, 'weight': int}.get(k, str))
+            if isinstance(x, str) and re.search(r'[,;=\s]', x):
+                fail(w, f'{x!r}: no commas, semicolons, = or spaces')
+        entries.append(','.join([f'{kind}:{s[address]}'] + [f'{k}={one(x)}' for _, k, x in settings]))
+        tier_keys[i] = where
+    try:
+        return kv_line(*kv_parse(';'.join(entries)))
+    except KvError as e:
+        where = {'cache': lambda n: f'caches.{n}', 'tier': lambda i: tier_keys.get(i, 'tiers')}[e.where[0]](e.where[1]) \
+            if e.where else 'the file'
+        fail(where, str(e))
+
+
+def kv_store_file(path):
+    """kv_store_text of the file at `path`."""
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError as e:
+        raise OptionError(f'KV_STORE=@{path}: {e.strerror}') from None
+    return kv_store_text(text, path)
 
 
 def kv_rows(o):
@@ -619,6 +1014,8 @@ def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOM
         env['STEERING_CHAT_TEMPLATE'] = '@STEERING_CHAT_TEMPLATE'
     if kv_store:
         env['KV_STORE'] = kv_store
+    if env.get('KV_STORE'):
+        env['KV_STORE'] = kv_engine(env['KV_STORE'])
     if kv_rows:
         env['KV_ROWS'] = kv_rows
     if rank == '@R':   # the template: v2 paths are per box
@@ -655,9 +1052,10 @@ def file_sha256(path):
     return h.hexdigest()
 
 
-def canonical(o, plan, members, variant=None):
+def canonical(o, plan, members, variant=None, ring=''):
     """The cluster options as sorted key=value lines, and their sha256. members: the peer list (peers mode) or None.
-    variant: the resolved exlr8 v2 variant (modelset.Variant), whose name and manifest sha256 count."""
+    variant: the resolved exlr8 v2 variant (modelset.Variant), whose name and manifest sha256 count. ring: --shape ring
+    with mentat, the ring this box planned from mentat's claim (mentat.ring_text), so every box must have the same."""
     c = {'tp': o.get('TP'), 'shape': o.get('SHAPE'), 'mode': mode(o), 'fabric_port': str(FABRIC_PORT)}
     if models.of(o) is not models.GLM53:   # GLM-5.3's lines stay as they were, so a mixed upgrade still agrees
         c['model'] = models.of(o).name
@@ -675,6 +1073,8 @@ def canonical(o, plan, members, variant=None):
     if variant:
         c['variant'] = variant.name
         c['variant.sha256'] = variant.sha256 or ''
+    if ring:
+        c['ring'] = ring
     if o.get('LAYOUT'):   # a path per box: its bytes are what every rank must agree on
         c['layout.sha256'] = file_sha256(o.get('LAYOUT'))
     c['engine.env'] = ' '.join(sorted(plan['env']))

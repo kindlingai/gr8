@@ -41,13 +41,18 @@
 //! serves the same blocks from another box's locked memory over RDMA or TCP (REMOTE-TIER.md). The engine uses
 //! neither.
 //!
+//! src/ledger.rs is the host ledger of a box shared by a Flash rank and a KV node (D-331 M7): who may count each
+//! exchangeable byte, and GPU <-> node transfers as transactions (kvman-ledger is its command line).
+//!
 //! src/rows.rs is the remote attention rows tier (the engine's G6_RT_STORE): a group's latent rows past L in a
 //! store, and a helper thread that fetches the rows a decode step selects into the engine's resident slots.
 
 pub mod blocks;
 pub mod canon;
+pub mod ledger;
 pub mod ffi;
 pub mod pool;
+pub mod ram;
 pub mod remote;
 pub mod reuse;
 pub mod rows;

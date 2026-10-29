@@ -15,6 +15,7 @@
 namespace g6rt::steering {
 
 constexpr float SCALE_MAX = 4.0f;
+constexpr uint32_t PROFILES_MAX = 8;    // profiles one boot may load
 constexpr size_t MANIFEST_MAX_BYTES = 1u << 20;
 constexpr size_t DIRECTIONS_MAX_BYTES = 64u << 20;
 
@@ -90,12 +91,13 @@ struct Identity {
     Scope scope = Scope::Full;
     std::array<uint8_t, 32> schedule_digest{};
     uint32_t scale_bits = 0;
+    uint32_t slot = 0;               // index of the profile in the boot's load order; the digest also identifies it
 
     static Identity off() { return {}; }
     bool operator==(const Identity& b) const {
         if (enabled != b.enabled) return false;
         return !enabled || (profile_digest == b.profile_digest && scope == b.scope &&
-                            schedule_digest == b.schedule_digest && scale_bits == b.scale_bits);
+                            schedule_digest == b.schedule_digest && scale_bits == b.scale_bits && slot == b.slot);
     }
     bool operator!=(const Identity& b) const { return !(*this == b); }
 };
@@ -149,37 +151,52 @@ struct RequestFields {
     bool any() const { return has_profile || has_scale; }
 };
 
-// One immutable loaded profile per boot. This keeps request resolution independent of global mutable state while still
-// making forced qualification mode use the exact per-request identity and kernels.
+// The immutable profiles loaded at boot, in load order (a request's slot). All share one scope. Forced mode needs
+// exactly one profile and makes every request use it.
 struct BootConfig {
+    struct Slot {
+        std::string name;
+        std::array<uint8_t, 32> profile_digest{}, schedule_digest{};
+        uint32_t active_layers = 0;
+    };
     bool loaded = false, forced = false;
-    std::string profile_name;
-    std::array<uint8_t, 32> profile_digest{}, schedule_digest{};
+    std::vector<Slot> profiles;
     Scope scope = Scope::Full;
     uint32_t forced_scale_bits = 0;
-    uint32_t active_layers = 0;
 
-    static BootConfig from_profile(const Profile& p) {
-        BootConfig b; b.loaded = true; b.profile_name = p.name; b.profile_digest = p.manifest_digest;
-        b.schedule_digest = p.schedule_digest; b.scope = p.scope; b.active_layers = uint32_t(p.layers.size()); return b;
+    static BootConfig from_profiles(const std::vector<Profile>& ps) {
+        BootConfig b;
+        for (const auto& p : ps) {
+            if (b.loaded && p.scope != b.scope) throw std::runtime_error("steering: loaded profiles differ in scope");
+            for (const auto& q : b.profiles)
+                if (q.name == p.name) throw std::runtime_error("steering: two loaded profiles are named " + p.name);
+            if (b.profiles.size() == PROFILES_MAX)
+                throw std::runtime_error("steering: at most " + std::to_string(PROFILES_MAX) + " profiles");
+            b.loaded = true; b.scope = p.scope;
+            b.profiles.push_back({p.name, p.manifest_digest, p.schedule_digest, uint32_t(p.layers.size())});
+        }
+        return b;
     }
-    Identity selected(uint32_t bits) const {
+    static BootConfig from_profile(const Profile& p) { return from_profiles({p}); }
+    Identity selected(uint32_t bits, uint32_t slot = 0) const {
         bits = canonical_scale_bits(bits_float(bits));
         if (!bits) return Identity::off();
         if (!loaded) throw std::runtime_error("no steering profile is loaded");
-        return {true, profile_digest, scope, schedule_digest, bits};
+        const Slot& p = profiles.at(slot);
+        return {true, p.profile_digest, scope, p.schedule_digest, bits, slot};
     }
     Identity resolve(const RequestFields& f) const {
-        uint32_t bits = 0;
+        uint32_t bits = 0, slot = 0;
         if (f.has_profile) {
             if (!loaded) throw std::runtime_error("steering is not enabled on this server");
-            if (f.profile != profile_name) throw std::runtime_error("unknown steering_profile");
+            while (slot < profiles.size() && profiles[slot].name != f.profile) ++slot;
+            if (slot == profiles.size()) throw std::runtime_error("unknown steering_profile");
             bits = f.has_scale ? canonical_scale_bits(f.scale) : canonical_scale_bits(1.0);
         } else if (f.has_scale) {
             bits = canonical_scale_bits(f.scale);
             if (bits) throw std::runtime_error("steering_scale requires steering_profile");
         }
-        const Identity requested = selected(bits);
+        const Identity requested = selected(bits, slot);
         if (!forced) return requested;
         const Identity imposed = selected(forced_scale_bits);
         if (f.any() && requested != imposed) throw std::runtime_error("request steering conflicts with forced mode");
@@ -191,13 +208,15 @@ inline void hash_boot(uint64_t& h, const BootConfig& b) {
     auto add = [&](uint8_t v) { h = (h ^ v) * 1099511628211ull; };
     add(b.loaded); add(b.forced);
     if (!b.loaded) return;
-    for (char c : b.profile_name) add(uint8_t(c));
-    add(0);
-    for (uint8_t v : b.profile_digest) add(v);
-    add(uint8_t(b.scope));
-    for (uint8_t v : b.schedule_digest) add(v);
-    for (unsigned i = 0; i < 4; ++i) add(uint8_t(b.forced_scale_bits >> (8 * i)));
-    for (unsigned i = 0; i < 4; ++i) add(uint8_t(b.active_layers >> (8 * i)));
+    for (const auto& p : b.profiles) {
+        for (char c : p.name) add(uint8_t(c));
+        add(0);
+        for (uint8_t v : p.profile_digest) add(v);
+        add(uint8_t(b.scope));
+        for (uint8_t v : p.schedule_digest) add(v);
+        for (unsigned i = 0; i < 4; ++i) add(uint8_t(b.forced_scale_bits >> (8 * i)));
+        for (unsigned i = 0; i < 4; ++i) add(uint8_t(p.active_layers >> (8 * i)));
+    }
 }
 
 // CPU oracle for the writer-side operator. A zero effective alpha performs no loads or stores through `row`.

@@ -16,7 +16,7 @@ static void equal(const SpecLen& a, const SpecLen& b) {
     }
 }
 static void test(std::vector<int> levels) {
-    SpecLen spec; spec.on = true; assert(spec.set_levels(levels)); spec.flash_tp2();
+    SpecLen spec; spec.on = true; assert(spec.set_levels(levels)); spec.flash_cost(2);
     spec.pos_decay = .85; spec.bucket_decay = .99; spec.prior = 3; spec.seed[2] = .61;
     const SpecLen spec_initial = spec;
     float lp[8] = {}; for (int j = 1; j < 8; ++j) lp[j] = std::log(.75f);

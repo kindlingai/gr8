@@ -8,6 +8,7 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
   engine rank 0 -> DIR/ready.s2        "G6S2 3 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows> <max_lp>" once all ranks
                                        booted (version 1 has no <max_lp>; version 2 has no insert rule). Version 4 appends
                                        the steering receipt: <profile> <digest> <scope> <layers> <forced> <scale_bits>.
+                                       Version 5 has several profiles: <scope> <n>, then n x <profile> <digest> <layers>.
   engine rank 0 -> DIR/status.s2       JSON (resident, queued, free_pages, ...), rewritten on queue/lifecycle changes
   shim -> DIR/req.<id>                 written as req.<id>.tmp, then renamed. Two lines:
         n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float> [lp <k>] [plp <k>]
@@ -72,15 +73,41 @@ def payload_hash(data: bytes) -> int:
     return h
 
 
+PROFILE_NAME = r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}'
+PROFILES_MAX = 8  # engine/runtime/steering.h
+
+
+def _ready_base(w):
+    if not all(x.isdigit() for x in w[2:9]):
+        raise ValueError(f'bad ready.s2: {" ".join(w)!r}')
+    base = ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows', 'max_lp')
+    return dict(zip(base, map(int, w[2:9])))
+
+
 def parse_ready(text: str) -> dict:
     w = text.split()
-    if len(w) >= 2 and w[:2] == ['G6S2', '4']:
-        if len(w) != 15 or not all(x.isdigit() for x in w[2:9]):
+    if len(w) >= 2 and w[:2] == ['G6S2', '5']:
+        if len(w) < 11 or not w[10].isdigit():
             raise ValueError(f'bad ready.s2: {text!r}')
-        base = ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows', 'max_lp')
-        c = dict(zip(base, map(int, w[2:9])))
+        c = _ready_base(w)
+        scope, n = w[9], int(w[10])
+        if scope not in ('shared', 'full') or not 2 <= n <= PROFILES_MAX or len(w) != 11 + 3 * n:
+            raise ValueError(f'bad ready.s2 steering receipt: {text!r}')
+        profiles = []
+        for name, digest, layers in zip(w[11::3], w[12::3], w[13::3]):
+            if (not re.fullmatch(PROFILE_NAME, name) or not re.fullmatch(r'[0-9a-f]{64}', digest)
+                    or not layers.isdigit() or int(layers) < 1 or name in (p['profile'] for p in profiles)):
+                raise ValueError(f'bad ready.s2 steering receipt: {text!r}')
+            profiles.append({'profile': name, 'digest': digest, 'layers': int(layers)})
+        c['steering'] = {**profiles[0], 'scope': scope, 'forced': False, 'forced_scale': 0.0, 'profiles': profiles}
+        c['insert'] = True
+        return c
+    if len(w) >= 2 and w[:2] == ['G6S2', '4']:
+        if len(w) != 15:
+            raise ValueError(f'bad ready.s2: {text!r}')
+        c = _ready_base(w)
         name, digest, scope, layers_s, forced, scale_bits_s = w[9:]
-        if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', name) or not re.fullmatch(r'[0-9a-f]{64}', digest)
+        if (not re.fullmatch(PROFILE_NAME, name) or not re.fullmatch(r'[0-9a-f]{64}', digest)
                 or scope not in ('shared', 'full') or not layers_s.isdigit() or forced not in ('0', '1')
                 or not scale_bits_s.isdigit()):
             raise ValueError(f'bad ready.s2 steering receipt: {text!r}')
@@ -188,7 +215,7 @@ def _steering_header(f: dict, capability: dict | None):
         return '', None
     if not capability or not capability.get('profile'):
         return None, 'steering is not enabled on this server'
-    if profile != capability.get('profile'):
+    if profile not in [p['profile'] for p in capability.get('profiles') or [capability]]:
         return None, 'unknown steering_profile'
     if capability.get('forced') and scale != capability.get('forced_scale'):
         return None, 'request steering conflicts with forced mode'

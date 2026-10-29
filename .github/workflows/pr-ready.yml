@@ -1,24 +1,23 @@
-# The merge queue's ready flag (queue:ready) and maintainer-requested CI (ci:requested), set and cleared only here.
-#   /ready, /unready and /ci, commented on an open PR by a maintainer in READY_USERS, set or clear them. Commands need
-#   no write access, so a maintainer with read access can use them. /ready needs a risk:* category label
-#   (pr-category.yml); /ci runs CI without queueing the PR.
-#   Either label added by anyone else is removed again. A push to the PR clears both: they always refer to the commits
-#   a maintainer looked at. A command is refused if the PR's head was pushed after the comment, and a label is dropped
-#   again if the head moves while the command is handled.
-#   ci.yml's jobs run on a PR only while it carries one of the labels: setting one re-runs the PR's latest CI run (or
-#   approves it, if it waits for approval), since labels added with GITHUB_TOKEN cannot start workflows.
-#   /ready on an open PR labelled risk:docs-tests that changes only Markdown files squash-merges it. Not eligible: files
-#   under .github/, AGENTS.md and CLAUDE.md (read by GitHub and by coding agents), symlinks, mode changes, and PRs too
-#   large to list completely. The bot also approves it as github-actions[bot] when "Allow GitHub Actions to create and
-#   approve pull requests" is on (org and repo), which a required review needs. The review and the merge name the head
-#   the bot checked.
+# The merge queue's ready flag (queue:ready), set and cleared only here.
+#   /ready and /unready, commented on an open PR by a maintainer in READY_USERS, set or clear it. Commands need no write
+#   access, so a maintainer with read access can use them. The label added by anyone else is removed again. A push to
+#   the PR clears it: it always refers to the commits a maintainer looked at. A command is refused if the PR's head was
+#   pushed after the comment, and the label is dropped again if the head moves while the command is handled.
+#   ci.yml runs on every push to a PR, and its Finalize reads queue:ready when it runs, so /ready, /unready and a
+#   maintainer adding or removing the label re-run that job alone on a run that has finished. /ready on a run that waits
+#   for approval (a first-time contributor's) approves it.
+#   /ready on an open PR that changes only Markdown files squash-merges it once its CI run's Finalize passes (the run
+#   checks nothing else for such a PR). Not eligible: files under .github/, AGENTS.md and CLAUDE.md (read by GitHub and
+#   by coding agents), symlinks, mode changes, and PRs too large to list completely. The bot also approves it as
+#   github-actions[bot] when "Allow GitHub Actions to create and approve pull requests" is on (org and repo), which a
+#   required review needs. The review and the merge name the head the bot checked.
 # pull_request_target and issue_comment run the default branch's copy; neither checks out or runs the PR's code.
 name: PR ready
 on:
   issue_comment:
     types: [created]
   pull_request_target:
-    types: [labeled, synchronize]
+    types: [labeled, unlabeled, synchronize]
 
 permissions:
   actions: write
@@ -30,7 +29,6 @@ permissions:
 env:
   READY_USERS: coffee-the-dev,mmastrac,chuck-ads
   READY_LABEL: queue:ready
-  CI_LABEL: ci:requested
 
 jobs:
   ready:
@@ -38,11 +36,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        env:
+          # A maintainer's fine-grained token with Actions: Read and write on this repository only. Used only to
+          # re-run Finalize and approve runs; everything else uses GITHUB_TOKEN. May be empty.
+          CI_TRIGGER_TOKEN: ${{ secrets.CI_TRIGGER_TOKEN }}
         with:
           script: |
             const allowed = process.env.READY_USERS.split(",");
             const label = process.env.READY_LABEL;
-            const ciLabel = process.env.CI_LABEL;
             const { owner, repo } = context.repo;
             const ev = context.eventName;
             const sender = context.payload.sender.login;
@@ -51,13 +52,9 @@ jobs:
             const remove = name => github.rest.issues.removeLabel({ owner, repo, issue_number, name })
               .then(() => true, () => false);
             const pull = async () => (await github.rest.pulls.get({ owner, repo, pull_number: issue_number })).data;
-            const liveLabels = async () => (await github.rest.issues.listLabelsOnIssue(
-              { owner, repo, issue_number, per_page: 100 })).data.map(l => l.name);
             const sleep = ms => new Promise(r => setTimeout(r, ms));
             await github.rest.issues.createLabel({ owner, repo, name: label, color: "5319e7",
               description: "Marked ready for the merge queue by a maintainer (/ready)" }).catch(() => {});
-            await github.rest.issues.createLabel({ owner, repo, name: ciLabel, color: "bfd4f2",
-              description: "CI requested by a maintainer (/ci), without queueing" }).catch(() => {});
 
             // When GitHub first saw this commit: the earliest check suite on it, created on the push. Server time, so a
             // backdated commit cannot hide a push behind a maintainer's comment. null if there is no suite.
@@ -67,78 +64,100 @@ jobs:
               return suites.length ? Math.min(...suites) : null;
             };
 
-            // Start CI on the PR head: find its latest ci.yml run, approve it if it waits for approval, and re-run it
-            // once its ready gate has turned it away. Waits up to 5 minutes for the gate; reports anything else.
-            // The org's Actions policy can refuse runs started by github-actions[bot]: GitHub accepts the re-run and
-            // fails it at startup a few seconds later. The bot watches for that and asks a maintainer to re-run the
-            // run themselves, which the policy allows.
-            const askHuman = (run, why) => say(`CI on ${run.head_sha.slice(0, 7)} is cleared to run, but ${why}. ` +
-              `A maintainer with write access can start it: open ${run.html_url} and choose **Re-run all jobs**.`);
-            const rerunCI = async p => {
-              const head = p.head.sha;
-              let approved = false;
-              for (let i = 0; i < 30; i++) {
-                const runs = (await github.rest.actions.listWorkflowRuns(
-                  { owner, repo, workflow_id: "ci.yml", head_sha: head, per_page: 20 })).data.workflow_runs
-                  .filter(r => r.event === "pull_request" && (r.pull_requests.some(x => x.number === issue_number) ||
-                    (r.head_repository && r.head_repository.full_name === p.head.repo.full_name &&
-                     r.head_branch === p.head.ref)));
-                if (!runs.length) {
-                  if (i < 6) { await sleep(10000); continue; }
-                  await say(`No CI run found for ${head.slice(0, 7)} (a Markdown-only PR runs none), so there is nothing to start.`);
-                  return;
-                }
-                const run = runs[0];
-                if (run.conclusion === "action_required") {
-                  if (approved) { await sleep(10000); continue; }
-                  approved = true;
-                  try {
-                    await github.rest.actions.approveWorkflowRun({ owner, repo, run_id: run.id });
-                  } catch (e) {
-                    await say(`CI for ${head.slice(0, 7)} waits for approval and the bot could not approve it ` +
-                      `(${e.message}): approve it at ${run.html_url}.`);
-                    return;
-                  }
-                  await sleep(10000);
-                  continue;
-                }
-                if (run.conclusion === "startup_failure") {
-                  await askHuman(run, "its last start failed (the bot cannot start it)");
-                  return;
-                }
+            // Re-runs and approvals use CI_TRIGGER_TOKEN when the secret is set, so they run as that maintainer: one
+            // started with GITHUB_TOKEN can fail at startup (GitHub accepts it, then fails it seconds later).
+            const token = process.env.CI_TRIGGER_TOKEN;
+            const starter = token
+              ? (typeof getOctokit === "function" ? getOctokit(token) : new github.constructor({ auth: token }))
+              : github;
+
+            // the PR head's ci.yml runs started by EVENTS, newest first
+            const prRuns = async (p, events = ["pull_request"]) => (await github.rest.actions.listWorkflowRuns(
+              { owner, repo, workflow_id: "ci.yml", head_sha: p.head.sha, per_page: 20 })).data.workflow_runs
+              .filter(r => events.includes(r.event) && (r.pull_requests.some(x => x.number === issue_number) ||
+                (r.head_repository && r.head_repository.full_name === p.head.repo.full_name &&
+                 r.head_branch === p.head.ref)));
+            // ci.yml's Finalize reads queue:ready when it runs. Once it has run, re-run it alone so it sees the label as
+            // it is now; one still waiting for the other jobs reads it when it starts.
+            const refinalize = async run => {
+              for (let i = 0; i < 12; i++) {
                 const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,
                   { owner, repo, run_id: run.id, filter: "latest" });
-                const gate = jobs.find(j => j.name === "Ready gate");
-                if (gate && gate.status === "completed") {
-                  if (jobs.some(j => j !== gate && j.conclusion !== "skipped")) return;   // already building
-                  if (run.status === "completed") {
-                    try {
-                      await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
-                    } catch (e) {
-                      await askHuman(run, `the bot could not re-run it (${e.message})`);
+                const fin = jobs.find(j => j.name === "Finalize");
+                if (!fin || (fin.status !== "in_progress" && fin.status !== "completed")) return;
+                if (fin.status === "in_progress") { await sleep(10000); continue; }
+                try {
+                  await starter.rest.actions.reRunJobForWorkflowRun({ owner, repo, job_id: fin.id });
+                } catch (e) {
+                  await say(`The bot could not re-run Finalize (${e.message}): open ${run.html_url} and re-run that job.`);
+                }
+                return;
+              }
+            };
+            // the newest PR run and the newest dispatched run of the head, after queue:ready came or went
+            const finalizeAgain = async p => {
+              const runs = await prRuns(p, ["pull_request", "workflow_dispatch"]);
+              for (const ev of ["pull_request", "workflow_dispatch"]) {
+                const run = runs.find(r => r.event === ev);
+                if (run) await refinalize(run);
+              }
+            };
+            // A run GitHub refused to start ("Actor is not allowed to trigger Actions workflows", which a PR's author can
+            // get) has no jobs and cannot be re-run. A same-repo branch gets a dispatched run instead, whose Finalize
+            // counts for the PR; a fork's branch cannot be dispatched, so the bot says so.
+            const restart = async (p, run) => {
+              if (p.head.repo && p.head.repo.full_name === `${owner}/${repo}`) {
+                const since = Date.now() - 5000;
+                try {
+                  await starter.rest.actions.createWorkflowDispatch({ owner, repo, workflow_id: "ci.yml", ref: p.head.ref });
+                  for (let i = 0; i < 9; i++) {
+                    await sleep(10000);
+                    const d = (await prRuns(p, ["workflow_dispatch"])).find(r => Date.parse(r.created_at) >= since);
+                    if (d && d.conclusion === "startup_failure") break;
+                    if (d) {
+                      await say(`CI for ${p.head.sha.slice(0, 7)} failed to start, so the bot dispatched it: ${d.html_url}. ` +
+                        `The PR's checks do not list this run.`);
                       return;
                     }
-                    for (let k = 0; k < 9; k++) {
-                      await sleep(10000);
-                      const now = (await github.rest.actions.getWorkflowRun({ owner, repo, run_id: run.id })).data;
-                      if (now.conclusion === "startup_failure") {
-                        await askHuman(run, "the org's Actions policy stopped the bot's re-run from starting");
-                        return;
-                      }
-                      if (now.status !== "completed") return;      // the re-run is running
-                    }
-                    await askHuman(run, "the bot's re-run has not started after 90 seconds");
-                    return;
                   }
+                } catch (e) {
+                  core.info(`workflow_dispatch failed: ${e.message}`);
                 }
-                await sleep(10000);
               }
-              await say(`Timed out waiting for CI on ${head.slice(0, 7)} to reach its ready gate.`);
+              await say(`CI for ${p.head.sha.slice(0, 7)} failed to start (${run.html_url}) and the bot could not start ` +
+                `it: push again, or run ci.yml on the branch from the Actions tab.`);
+            };
+            // /ready: approve the PR's run if it waits for approval, start it again if GitHub refused it, else re-run
+            // Finalize
+            const kick = async p => {
+              const run = (await prRuns(p))[0];
+              if (run && run.conclusion === "startup_failure") return restart(p, run);
+              if (!run || run.conclusion !== "action_required") return finalizeAgain(p);
+              try {
+                await starter.rest.actions.approveWorkflowRun({ owner, repo, run_id: run.id });
+              } catch (e) {
+                await say(`CI for ${p.head.sha.slice(0, 7)} waits for approval and the bot could not approve it ` +
+                  `(${e.message}): approve it at ${run.html_url}.`);
+              }
+            };
+            // Whether a ci.yml run of the PR head has passed Finalize, which needs queue:ready. Waits up to 6 minutes,
+            // enough for a Markdown-only run, which has only changes, zip-check and Finalize.
+            const finalized = async p => {
+              for (let i = 0; i < 36; i++) {
+                await sleep(10000);
+                for (const run of await prRuns(p, ["pull_request", "workflow_dispatch"])) {
+                  const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun,
+                    { owner, repo, run_id: run.id, filter: "latest" });
+                  const fin = jobs.find(j => j.name === "Finalize");
+                  if (fin && fin.conclusion === "success") return true;
+                }
+              }
+              return false;
             };
 
             if (ev === "issue_comment") {
               const cmd = (context.payload.comment.body || "").trim().split(/\s+/)[0];
-              if (cmd !== "/ready" && cmd !== "/unready" && cmd !== "/ci") return;
+              if (cmd !== "/ready" && cmd !== "/unready") return;
               const react = content => github.rest.reactions.createForIssueComment(
                 { owner, repo, comment_id: context.payload.comment.id, content });
               if (!allowed.includes(sender)) {
@@ -149,6 +168,7 @@ jobs:
               if (cmd === "/unready") {
                 await remove(label);
                 await react("+1");
+                await finalizeAgain(await pull());
                 return;
               }
               const p = await pull();
@@ -164,36 +184,24 @@ jobs:
                 await say(`@${sender}, new commits arrived after your \`${cmd}\`: check ${p.head.sha.slice(0, 7)} and comment again.`);
                 return;
               }
-              const name = cmd === "/ci" ? ciLabel : label;
-              if (cmd === "/ready" && !(await liveLabels()).some(n => n.startsWith("risk:"))) {
-                await react("confused");
-                await say(`@${sender}, this PR has no merge-queue category yet: tick one in the description first.`);
-                return;
-              }
-              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [name] });
+              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [label] });
               const after = await pull();
               if (after.head.sha !== p.head.sha) {
-                await remove(name);
+                await remove(label);
                 await react("confused");
                 await say(`@${sender}, the PR moved to ${after.head.sha.slice(0, 7)} while \`${cmd}\` was handled: check it and comment again.`);
                 return;
               }
               await react("+1");
-              if (cmd === "/ci" || !(await liveLabels()).includes("risk:docs-tests")) {
-                await rerunCI(p);
-                return;
-              }
+              await kick(p);
 
-              // Markdown-only docs PRs merge on /ready; anything else falls back to CI.
+              // Markdown-only PRs merge on /ready; anything else waits for a maintainer to merge it.
               const head = p.head.sha;
               const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: issue_number });
               const md = f => /\.md$/i.test(f);
               const names = files.flatMap(f => f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]);
-              if (!files.length || !names.every(md)) {      // not Markdown-only: it has CI, run that
-                await rerunCI(p);
-                return;
-              }
-              // Markdown-only, so it has no CI run either: merge it, or say why not.
+              if (!files.length || !names.every(md)) return;
+              // Markdown-only: merge it once Finalize passes, or say why not.
               let why = null;
               if (files.length >= 3000 || files.length !== p.changed_files) why = "the file list is incomplete";
               else if (files.length > 50) why = "it changes more than 50 files";
@@ -213,6 +221,10 @@ jobs:
               }
               if (why) {
                 await say(`Markdown-only PR marked ready, but not merged automatically because ${why}: merge it by hand.`);
+                return;
+              }
+              if (!(await finalized(p))) {
+                await say(`Markdown-only PR marked ready, but its Finalize check has not passed: see its CI run.`);
                 return;
               }
               // Approval is best effort: it needs "Allow GitHub Actions to create and approve pull requests", and the merge
@@ -235,15 +247,15 @@ jobs:
 
             const act = context.payload.action;
             const added = act === "labeled" ? context.payload.label.name : null;
-            if ((added === label || added === ciLabel) && !allowed.includes(sender)) {
+            if (added === label && !allowed.includes(sender)) {
               await remove(added);
-              const how = added === label ? "/ready" : "/ci";
-              await say(`@${sender}, \`${added}\` is set by a maintainer commenting \`${how}\`, so it was removed.`);
-            } else if (added === label || added === ciLabel) {
-              await rerunCI(await pull());
+              await say(`@${sender}, \`${added}\` is set by a maintainer commenting \`/ready\`, so it was removed.`);
+            } else if (added === label) {
+              await kick(await pull());
+            } else if (act === "unlabeled" && context.payload.label.name === label) {
+              await finalizeAgain(await pull());
             } else if (act === "synchronize") {
-              // Remove both whatever the event's labels say: a label added after the event was built must go too.
-              await remove(ciLabel);
+              // Remove it whatever the event's labels say: a label added after the event was built must go too.
               if (await remove(label)) {
                 await say(`New commits since this PR was marked ready: \`${label}\` cleared. A maintainer can comment \`/ready\` again.`);
               }

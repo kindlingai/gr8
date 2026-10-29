@@ -37,6 +37,7 @@ except ImportError:
     HAVE = False
 
 RELEASE = 'fakeorg/glm-exlr8'
+GLM = {'GR8_MODEL': 'glm53'}   # the model: a boot names it (no default)
 LAYERS = (3, 4)
 NE = 2                  # experts per layer in the synthetic files: small files, the same layout
 LFS_MIN = 4096          # files at least this big are served as LFS files: a redirect to the "CDN"
@@ -51,6 +52,28 @@ def manifest(width_of):
         str(l): {'gate': [[width_of('gate', e, h) for h in range(16)] for e in range(NE)],
                  'up': [[width_of('up', e, h) for h in range(16)] for e in range(NE)],
                  'down': [width_of('down', e, 0) for e in range(NE)], 'shared': 0} for l in LAYERS}}
+
+
+def half_spans(l, width, owned):
+    """{(width file, offset, nbytes)} of layer l's halves owned(e) gives. width(proj) -> k."""
+    keep, v2.N_EXP = v2.N_EXP, NE
+    try:
+        with tempfile.TemporaryDirectory() as d:     # the release's index file says where each half sits
+            v2synth.make_layer(d, l, (2, 3), NE, seed=l, shared=False)
+            L = v2.V2Layer(d, l)
+            out = {(v2.WIDTH_FILE.format(l=l, k=width(p)),) + tuple(L.loc(e, p, h, width(p))[1:])
+                   for e in range(NE) for h in owned(e) for p in v2.PROJ}
+            L.close()
+            return out
+    finally:
+        v2.N_EXP = keep
+
+
+def layout_halves(path, rank, l):
+    """owned(e) for a layout file: the halves of layer l's expert e it gives rank."""
+    with open(path) as f:
+        g = json.load(f)['groups']
+    return lambda e: [h for h, r in enumerate(g[f'halves {l} {e}']) if r == rank]
 
 
 def same_halves(release, v2_dir, l, tp, rank, width):
@@ -316,11 +339,48 @@ class HFTests(unittest.TestCase):
         self.assertFalse(os.path.samefile(os.path.join(r.dir, 'dense', dense), os.path.join(r1.dir, 'dense', dense)))
         same_halves(r3, r.v2, 3, 4, 1, lambda p: 3)
 
+    def test_a_layout_fetches_only_the_halves_the_box_lacks(self):
+        # a box that holds rank 1 of a TP=4 formula cache (b of a, b, c, d) goes to TP=3 with a planned layout (a, b, d)
+        r = self.release()
+        v = self.variant(r)
+        r.fetch_rank(4, 1, v)
+        g6layout = os.path.join(os.path.dirname(hfsource.fetch_ranks().g6load()), 'g6layout')
+        t4, p3 = os.path.join(self.cache, 't4.json'), os.path.join(self.cache, 'p3.json')
+        for argv in (['formula', '--members', 'a,b,c,d', '--out', t4],
+                     ['plan', '--from', t4, '--members', 'a,b,d', '--out', p3]):
+            subprocess.run([g6layout] + argv + ['--widths', v.path], check=True, capture_output=True)
+        lr = hfsource.Release(self.cache, RELEASE, 'main', log=self.logs.append, layout=p3)
+        self.assertEqual(lr.check(3, 1, v), [f'{RELEASE}@{C1[:12]} rank 1 of TP=3, variant home, layout '
+                                             f'{modelset.sha256_file(p3)[:12]}, is not in the cache yet'])
+        n = len(self.hub.log)
+        lr.fetch_rank(3, 1, v)
+        self.assertEqual(lr.check(3, 1, v), [])
+        self.assertEqual(r.check(4, 1, v), [])                    # the formula's marker stands
+        self.assertIn('.layout-', os.path.basename(lr.marker(3, 1, v)))
+        self.assertEqual(sorted(os.listdir(os.path.join(r.slices, 'tp3', 'k3'))),
+                         [f'rank{i}.safetensors' for i in range(3)])   # every rank's slices list the layout's halves
+        got = [(re.sub(r'.*/', '', x[1]), *map(int, x[2].split('=')[1].split('-')))
+               for x in self.hub.log[n:] if x[2] and 'exlr8-layer-' in x[1] and not x[2].startswith('bytes=0-7')]
+        for l in LAYERS:
+            held = half_spans(l, lambda p: 3, lambda e: v2.owned_halves(e, l, 4, 1))
+            want = half_spans(l, lambda p: 3, layout_halves(p3, 1, l))
+            self.assertTrue(want - held, f'layer {l}: the layout gives the box nothing new')
+            # the new halves came from the hub, and none it held already
+            for name, off, nb in want - held:
+                self.assertTrue(any(f == name and a <= off and off + nb - 1 <= b for f, a, b in got), (name, off))
+            for name, off, nb in held:
+                self.assertFalse(any(f == name and a <= off and off + nb - 1 <= b for f, a, b in got), (name, off))
+            for name, off, nb in want:
+                with open(os.path.join(self.r1, 'experts', name), 'rb') as a, open(os.path.join(r.v2, name), 'rb') as b:
+                    a.seek(off)
+                    b.seek(off)
+                    self.assertEqual(a.read(nb), b.read(nb), (name, off))
+
     def test_the_release_alone_is_the_model(self):
         import options as opt
         import supervisor as S
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--model',
-                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0'], {})
+                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0'], GLM)
         opt.validate(o)
         ms, v, err = S.resolve_model(o, log=self.logs.append)
         self.assertEqual(err, '')
@@ -336,7 +396,7 @@ class HFTests(unittest.TestCase):
         import options as opt
         import supervisor as S
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--model',
-                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0', '--kvb', 'fp8'], {})
+                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0', '--kvb', 'fp8'], GLM)
         opt.validate(o)                                          # V2_DENSE is set later, by resolve_model
         ms, v, err = S.resolve_model(o, log=self.logs.append)
         self.assertEqual(err, '')
@@ -673,7 +733,7 @@ class DrafterTests(unittest.TestCase):
         logs = []
 
         def boot(*argv):
-            o = opt.parse([*base, *argv], {})
+            o = opt.parse([*base, *argv], GLM)
             opt.validate(o)
             return o, S.resolve_model(o, log=logs.append)
         o, (ms, v, err) = boot()
@@ -690,7 +750,7 @@ class DrafterTests(unittest.TestCase):
         self.assertNotEqual(modelset.model_id(ms, v), ms.id)
         with self.assertRaises(opt.OptionError):
             opt.validate(opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3', '--drafter',
-                                    'https://huggingface.co/fakeorg/drafter'], {}))
+                                    'https://huggingface.co/fakeorg/drafter'], GLM))
 
     def test_the_tp6_boot(self):
         """TP=6: MTP only unless --dflash 1; with it, the drafter is converted in the replicated layout (--nr 6)."""
@@ -702,7 +762,7 @@ class DrafterTests(unittest.TestCase):
         logs = []
 
         def boot(*argv):
-            o = opt.parse([*base, *argv], {})
+            o = opt.parse([*base, *argv], GLM)
             opt.validate(o)
             return o, S.resolve_model(o, log=logs.append)
         o, (ms, v, err) = boot()

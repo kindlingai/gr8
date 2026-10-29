@@ -1,13 +1,12 @@
 #!/bin/bash
-# build the M4 drivers. usage: build_m4.sh <arch: 121a (DGX Spark GB10) | 120a (RTX 50xx)> [sim|g6|all|dfl|rs|tests]
-# sim / g6 / all: m4sim and g6m4, one binary each that runs every TP width in WIDTHS (default 6; below), and with all a
-# dtr_test_tp<N> per width. JOBS: compiles at once (default: the CPU count; each takes under 1 GB).
-# tests: only the unit tests (tests/row_budget_test.cu, tests/s2_attn_test.cu) into $OUT; scripts/c1_tests.sh builds and runs them.
+# build the M4 drivers. usage: build_m4.sh <arch: 121a (DGX Spark GB10) | 120a (RTX 50xx)> [sim|g6|all|dfl|rs]
+# sim / g6 / all: m4sim and g6m4, one binary each that runs every TP width in WIDTHS (default 6; below).
+# JOBS: compiles at once (default: the CPU count; each takes under 1 GB).
 # m4sim: one GPU, NR simulated ranks. g6m4: one rank on the real fabric (needs libibverbs; Spark only).
 # dfl: dfltest and dflreplay only, the DFlash2 drafter step of all ranks on one GPU (engine/ref/dflash2_check.py; the
 #      G6_DFL_BODY_I4 replay of a G6_DFL_DUMP)
 # rs: rstest only, the head kernels of all ranks on one GPU: rejection sampling vs the target distribution.
-# tests, dfl and rs build the one width EXTRA names (EXTRA="-DG6_NR=4 -DDEC_S2"; default 6).
+# dfl and rs build the one width EXTRA names (EXTRA="-DG6_NR=4 -DDEC_S2"; default 6).
 # EXTRA=-DG6_MODEL_FLASH=1: the GLM 5.3 Flash geometry (engine/model_geom.h); scripts/build.sh MODEL=flash names the results *_flash.
 set -e
 cd "$(dirname "$0")"
@@ -29,13 +28,6 @@ cache_counts() { [ -f $G6_NVCC_CACHE_LOG ] && echo "nvcc cache: $(grep -c '^hit'
 # flash_bind.cu + ops_flash.cu (Flash: NoPE MLA + kpool indexer)
 ATTN_CU=../attn/attn.cu; ATTN_BIND_CU=../attn/bind.cu; ATTN_OPS_CU=../attn/ops_glm.cu
 case " $EXTRA " in *" -DG6_MODEL_FLASH=1 "*) ATTN_CU=../attn/flash_attn.cu; ATTN_BIND_CU=../attn/flash_bind.cu; ATTN_OPS_CU=../attn/ops_flash.cu ;; esac
-if [ "$WHAT" = tests ]; then
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/row_budget_test tests/row_budget_test.cu
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/s2_attn_test tests/s2_attn_test.cu $ATTN_CU $ATTN_BIND_CU $ATTN_OPS_CU -lcublas
-  ls -la $OUT/row_budget_test $OUT/s2_attn_test
-  cache_counts
-  exit 0
-fi
 if [ "$WHAT" = rs ]; then
   nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/rstest rstest.cu
   ls -la $OUT/rstest
@@ -43,13 +35,18 @@ if [ "$WHAT" = rs ]; then
   exit 0
 fi
 nice -n 19 $GXX -O3 -std=c++20 $CPU -pthread -c ../loader/g6pack.cpp -o $O/g6pack.o
+# Flash: the kvchunks regions of G6_FLASH_KV_CHUNKS (runtime/flash_kv.h), one object for every width
+KVC=
+if [ "$ATTN_CU" = ../attn/flash_attn.cu ]; then
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -c ../attn/kvchunks.cu -o $O/kvchunks.o; KVC="$O/kvchunks.o"
+fi
 nice -n 19 $GXX -O3 -std=c++20 $CPU -pthread -I/usr/local/cuda/include -c ../loader/devimage.cpp -o $O/devimage.o
 if [ "$WHAT" = dfl ]; then
   nice -n 19 $NVCC -O3 -std=c++17 $GEN -c $ATTN_CU -o $O/attn.o
   nice -n 19 $NVCC -O3 -std=c++17 $GEN -c $ATTN_BIND_CU -o $O/attn_bind.o
   nice -n 19 $NVCC -O3 -std=c++17 $GEN -c $ATTN_OPS_CU -o $O/attn_ops.o
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dfltest dfltest.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dflreplay dflreplay.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dfltest dfltest.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $KVC $O/g6pack.o $O/devimage.o -lcublas -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dflreplay dflreplay.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $KVC $O/g6pack.o $O/devimage.o -lcublas -lpthread
   ls -la $OUT/dfltest $OUT/dflreplay
   cache_counts
   exit 0
@@ -60,23 +57,20 @@ RSDEF=""
 RSLINK=""
 if [ -f "$RSLIB" ]; then RSDEF="-DG6_RS_LOADER"; RSLINK="$RSLIB -ldl -lm"; fi
 # request grammars (grammar.h): G6_XGRAMMAR=DIR, an XGrammar source tree (scripts/build.sh finds the one the front end's
-# xgrammar crate pins). Built once per object directory with CMake, Python bindings off. g6m4 then takes --grammar-dir;
-# without G6_XGRAMMAR a gram request is refused
+# xgrammar crate pins). Its library is built once per object directory (xgrammar_build.sh), or comes prebuilt from
+# G6_XGRAMMAR_LIB. g6m4 then takes --grammar-dir; without G6_XGRAMMAR a gram request is refused
 GRDEF=""
 GRLINK=""
 if [ -n "${G6_XGRAMMAR:-}" ] && [ "$WHAT" != sim ]; then
-  XB=$O/xgrammar
-  if [ ! -f "$XB/libxgrammar.a" ]; then
-    mkdir -p "$XB"
-    echo 'set(XGRAMMAR_BUILD_PYTHON_BINDINGS OFF CACHE BOOL "" FORCE)' > "$XB/config.cmake"   # the tree reads it from -B
-    { cmake -S "$G6_XGRAMMAR" -B "$XB" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++ \
-          -DCMAKE_CXX_FLAGS=-Wno-deprecated-declarations -DCMAKE_POSITION_INDEPENDENT_CODE=ON &&
-      cmake --build "$XB" -j "$(nproc)" --target xgrammar; } > "$XB/build.log" 2>&1 || { echo "XGrammar: $XB/build.log"; exit 1; }
+  XLIB=${G6_XGRAMMAR_LIB:-$O/xgrammar/libxgrammar.a}
+  if [ ! -f "$XLIB" ]; then
+    [ -z "${G6_XGRAMMAR_LIB:-}" ] || { echo "G6_XGRAMMAR_LIB=$G6_XGRAMMAR_LIB: no such file"; exit 1; }
+    bash xgrammar_build.sh "$G6_XGRAMMAR" "$O/xgrammar" || exit 1
   fi
   GRDEF="-DG6_GRAMMAR=1"
   g++ -O2 -std=c++17 -DG6_GRAMMAR=1 -I"$G6_XGRAMMAR/include" -I"$G6_XGRAMMAR/3rdparty/dlpack/include" \
       -I"$G6_XGRAMMAR/3rdparty/picojson" -c grammar.cc -o $O/grammar.o || exit 1
-  GRLINK="$O/grammar.o $XB/libxgrammar.a"
+  GRLINK="$O/grammar.o $XLIB"
   g++ -O2 -std=c++17 -DG6_GRAMMAR=1 -I. -o $OUT/grammar_test tests/grammar_test.cc $GRLINK -lpthread || exit 1
   $OUT/grammar_test || exit 1
 fi
@@ -118,15 +112,11 @@ for n in $WIDTHS; do
   job $O/attn_ops.w$n.log $NVCC -O3 -std=c++17 $F -c $ATTN_OPS_CU -o $O/attn_ops.w$n.o
   if [ "$WHAT" != g6 ]; then job $O/m4sim.w$n.log $NVCC -O2 -std=c++17 $F $RSDEF -c m4sim.cu -o $O/m4sim.w$n.o; fi
   if [ "$WHAT" != sim ]; then job $O/g6m4.w$n.log $NVCC -O2 -std=c++17 $F $RSDEF $GRDEF -c g6m4.cu -o $O/g6m4.w$n.o; fi
-  # dense trellis matrices: build only. dtr_test runs on the release's files (engine/ref/dtr_ref.py)
-  if [ "$WHAT" = all ]; then
-    job $O/dtr_test.w$n.log $NVCC -O2 -std=c++17 $F -I ../kernels -o $OUT/dtr_test_tp$n ../kernels/tests/dtr_test.cu -lcublas
-  fi
 done
 wait
 cat $O/*.log
 if ls $O/*.failed > /dev/null 2>&1; then echo "build_m4.sh failed: $(cd $O && ls *.failed | sed 's/\.log\.failed//')"; exit 1; fi
-SHARED="$O/g6pack.o $O/devimage.o $KVLIB"
+SHARED="$O/g6pack.o $O/devimage.o ${KVC%% *} $KVLIB"
 if [ "$WHAT" != sim ]; then SHARED="$SHARED $O/fabric.o"; fi
 if [ -n "$RSDEF" ]; then SHARED="$SHARED $RSLIB"; fi
 nm --defined-only -g $SHARED 2> /dev/null | awk 'NF == 3 { print $3 }' | sort -u > $O/shared.syms
@@ -141,13 +131,13 @@ inst() {   # inst <bin> <width>: $O/<bin>.w<width>.i.o, the width's instance of 
 if [ "$WHAT" != g6 ]; then
   I=""
   for n in $WIDTHS; do inst m4sim $n; I="$I $O/m4sim.w$n.i.o"; done
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -DM4SIM -o $OUT/m4sim widths.cpp $I $O/g6pack.o $O/devimage.o $RSLINK $KVLIB -ldl -lm -lcublas -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -DM4SIM -o $OUT/m4sim widths.cpp $I $O/g6pack.o $O/devimage.o $KVC $RSLINK $KVLIB -ldl -lm -lcublas -lcublasLt -lpthread
   ls -la $OUT/m4sim
 fi
 if [ "$WHAT" != sim ]; then
   I=""
   for n in $WIDTHS; do inst g6m4 $n; I="$I $O/g6m4.w$n.i.o"; done
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN $GRDEF -o $OUT/g6m4 widths.cpp $I $O/fabric.o $O/g6pack.o $O/devimage.o $GRLINK $RSLINK $KVLIB -ldl -lm -lcublas -libverbs -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN $GRDEF -o $OUT/g6m4 widths.cpp $I $O/fabric.o $O/g6pack.o $O/devimage.o $KVC $GRLINK $RSLINK $KVLIB -ldl -lm -lcublas -lcublasLt -libverbs -lpthread
   if [ -n "$GRDEF" ]; then echo "g6m4: request grammars (XGrammar) linked"; fi
   if [ -n "$RSDEF" ]; then echo "g6m4: Rust pack loader linked"; else echo "g6m4: no $RSLIB, C++ pack loader only"; fi
   ls -la $OUT/g6m4

@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import options as opt  # noqa: E402
 
 PEERS = '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'
+GLM = {'GR8_MODEL': 'glm53'}   # the model: a boot names it (no default)
 
 
 def write(d, name, text):
@@ -69,7 +70,7 @@ class PrecedenceTests(unittest.TestCase):
 
     def test_hosts_are_peers(self):
         p = write(self.d, 'old.env', 'HOSTS="10.0.0.1 10.0.0.2 10.0.0.3"\nIPS=a,b,c\nIPS2=d,e,f\n')
-        o = opt.parse(['@' + p], {})
+        o = opt.parse(['@' + p], GLM)
         self.assertEqual((opt.mode(o), o.get('PEERS')), ('peers', '10.0.0.1,10.0.0.2,10.0.0.3'))
         opt.validate(o)
         self.assertEqual(o.get('TP'), '3')
@@ -105,15 +106,22 @@ class PrecedenceTests(unittest.TestCase):
 
 class ValidateTests(unittest.TestCase):
     def check(self, argv, want, env=None):
-        o = opt.parse(['--no-config', *argv], env or {})
+        o = opt.parse(['--no-config', *argv], {**GLM, **(env or {})})
         with self.assertRaises(opt.OptionError) as e:
             opt.validate(o)
         self.assertIn(want, str(e.exception))
 
+    def test_a_ring_with_mentat(self):
+        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '3', '--shape', 'ring'], GLM)
+        opt.validate(o)
+        self.assertEqual((opt.mode(o), o.get('SHAPE')), ('mentat', 'ring'))
+
     def test_refusals(self):
         self.check(['--peers', PEERS, '--shape', 'star'], 'want mesh or ring')
         self.check(['--peers', ','.join(f'10.0.0.{i}' for i in range(1, 7)), '--shape', 'ring'], 'TP=3 or 4')
-        self.check(['--mentat', 'localhost', '--tp', '4', '--shape', 'ring'], 'needs --peers')
+        self.check(['--mentat', 'localhost', '--tp', '6', '--shape', 'ring'], 'TP=3 or 4')
+        self.check(['--mentat', 'localhost', '--tp', '4', '--shape', 'ring', '--ips', 'a,b,c,d', '--ips2', 'a,b,c,d'],
+                   'no --ips')
         self.check(['--peers', PEERS, '--shape', 'ring', '--ips', 'a,b,c,d', '--ips2', 'a,b,c,d'], 'no --ips')
         self.check(['--peers', PEERS, '--shape', 'ring', '--ring-devs', 'a,b'], 'want four devices')
         self.check(['--peers', PEERS, '--tp', '7'], 'want 4, 6, 3 or 5')
@@ -127,17 +135,17 @@ class ValidateTests(unittest.TestCase):
         self.check(['--peers', PEERS, '--default-reasoning-effort', 'auto'], 'want minimal, low, medium')
         self.check(['--peers', PEERS, '--default-thinking-budget', '-1'], 'want a whole number')
         o = opt.parse(['--no-config', '--peers', PEERS, '--default-reasoning-effort', 'medium',
-                       '--default-thinking-budget', '4096'], {})
+                       '--default-thinking-budget', '4096'], GLM)
         opt.validate(o)
         self.assertEqual((o.get('DEFAULT_REASONING_EFFORT'), o.get('DEFAULT_THINKING_BUDGET')), ('medium', '4096'))
         self.check(['--peers', PEERS, '--allow-thinking-off', 'yes'], 'want 0 or 1')
         self.check(['--peers', PEERS, '--grammar', '2'], 'want 0 or 1')
         self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('GRAMMAR'), '1')
         # a grammar directory reaches the engine as --grammar-dir, a path per box
-        o = opt.parse(['--no-config', '--peers', PEERS, '--grammar', '1', '--grammar-dir', '/t'], {})
+        o = opt.parse(['--no-config', '--peers', PEERS, '--grammar', '1', '--grammar-dir', '/t'], GLM)
         opt.validate(o)
         self.assertIn('--grammar-dir @GRAMMAR_DIR', ' '.join(opt.engine_plan(o)['args']))
-        o = opt.parse(['--no-config', '--peers', PEERS, '--allow-thinking-off', '1'], {})
+        o = opt.parse(['--no-config', '--peers', PEERS, '--allow-thinking-off', '1'], GLM)
         opt.validate(o)
         self.assertEqual(o.get('ALLOW_THINKING_OFF'), '1')
 
@@ -157,7 +165,7 @@ class GetTests(unittest.TestCase):
     """launch.py get: TP for ./gr8 glm53 build, PORT for smoke and bench, on a box whose options need not boot."""
     def get(self, *argv):
         r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'launch.py'), 'get',
-                            *argv], capture_output=True, text=True, timeout=60)
+                            *argv], env={**os.environ, **GLM}, capture_output=True, text=True, timeout=60)
         return r.returncode, r.stdout.strip(), r.stderr
 
     def test_port_needs_no_bootable_options(self):
@@ -207,7 +215,7 @@ class PathTests(unittest.TestCase):
 
 class CanonicalTests(unittest.TestCase):
     def digest(self, *argv, env=None):
-        o = opt.parse(['--no-config', '--peers', PEERS, *argv], env or {})
+        o = opt.parse(['--no-config', '--peers', PEERS, *argv], {**GLM, **(env or {})})
         opt.validate(o)
         c, text, d = opt.canonical(o, opt.engine_plan(o), opt.split_list(PEERS))
         return c, text, d
@@ -286,6 +294,13 @@ class CanonicalTests(unittest.TestCase):
         _, text, _ = self.digest('--dsel-model', '1', '--dsel-table', tab)
         self.assertIn(' G6_S2_DSEL_MODEL=1 G6_S2_DSEL_TABLE=' + tab, text)
 
+    def test_ngram_reaches_every_rank(self):
+        _, text, _ = self.digest()
+        self.assertNotIn('G6_NGRAM', text)
+        _, text, _ = self.digest('--ngram', '/tables/ngram.tab', '--ngram-kmax', '5', '--ngram-kmin', '3',
+                                 '--ngram-margin', '0.2')
+        self.assertIn(' G6_NGRAM=/tables/ngram.tab G6_NGRAM_KMAX=5 G6_NGRAM_KMIN=3 G6_NGRAM_MARGIN=0.2', text)
+
     def test_release_alone_has_no_rank_pack(self):
         _, text, _ = self.digest('--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel')
         self.assertIn('--v2-dense @V2_DENSE', text)
@@ -295,7 +310,7 @@ class CanonicalTests(unittest.TestCase):
                                  '--v2-dense-form', 'rounded')
         self.assertIn('--v2-dense @V2_DENSE --v2-dense-form rounded', text)
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4,10.0.0.5,10.0.0.6', '--v2', '/v2',
-                       '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel'], {})
+                       '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel'], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')
         self.assertIn('G6_PF_OWN=3', p['env'])
@@ -315,12 +330,12 @@ class CanonicalTests(unittest.TestCase):
                 self.digest('--mtp-kstopb', '1', '--mtp-kstopb-tau-s', bad)
     def test_kvb_fp8_needs_a_release(self):
         rel = ['--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel']
-        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'] + rel + ['--kvb', 'fp8'], {})
+        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'] + rel + ['--kvb', 'fp8'], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')
         self.assertIn('G6_KVB=fp8', p['env'])
         self.assertNotEqual(self.digest(*rel)[2], self.digest(*rel, '--kvb', 'fp8')[2])   # a cluster option
-        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'] + rel, {})
+        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'] + rel, GLM)
         opt.validate(o)
         self.assertNotIn('G6_KVB', opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')['env'])
         with self.assertRaises(opt.OptionError):
@@ -344,11 +359,11 @@ class CanonicalTests(unittest.TestCase):
             self.assertNotEqual(da, self.digest(*rel)[2])
             with self.assertRaises(opt.OptionError):
                 self.digest(*rel, '--layout', os.path.join(d, 'none.json'))
-            with self.assertRaises(opt.OptionError):
-                self.digest('--model', 'https://huggingface.co/org/repo', '--layout', a)
+            # a box's cache fetches the layout's pieces (hfsource.Release)
+            self.digest('--model', 'https://huggingface.co/org/repo', '--layout', a)
 
     def test_tp3_is_s2_without_drafter(self):
-        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3'], {})
+        o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3'], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
         self.assertIn('G6_PF_OWN=1', p['env'])
@@ -363,7 +378,7 @@ class CanonicalTests(unittest.TestCase):
               'G6_ATTN_SEL2=16', 'G6_IDX_GRP=16', 'G6_ATTN_QT=1', 'G6_ATTN_FRONT=1', 'G6_IDX_VEC=1', 'G6_DEC_BK=512',
               'G6_S2_ADAPT=1', 'G6_S2_DECODE_PF=4096', 'G6_S2_ADMIT_HOLD=1', 'G6_PF_SELX_CTX=53248']
         def env(peers, *argv):
-            o = opt.parse(['--no-config', '--peers', peers, *argv], {})
+            o = opt.parse(['--no-config', '--peers', peers, *argv], GLM)
             opt.validate(o)
             return opt.engine_plan(o, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env']
         e = env(PEERS)
@@ -382,7 +397,7 @@ class CanonicalTests(unittest.TestCase):
         self.assertFalse(any(a.split('=')[0] in [v.split('=')[0] for v in on] for a in e))
     def test_tp5_prefills_with_pf_own_3(self):
         def env(*argv):
-            o = opt.parse(['--no-config', '--peers', ','.join(f'10.0.0.{i}' for i in range(1, 6)), *argv], {})
+            o = opt.parse(['--no-config', '--peers', ','.join(f'10.0.0.{i}' for i in range(1, 6)), *argv], GLM)
             opt.validate(o)
             return opt.engine_plan(o, rank=4, rank_dir='/r', aux_dir='/a', home='/h')['env']
         self.assertIn('G6_PF_OWN=3', env())
@@ -390,7 +405,7 @@ class CanonicalTests(unittest.TestCase):
 
     def test_tp4_tr3_w2all_default_on_and_override(self):
         def env(peers, *argv):
-            o = opt.parse(['--no-config', '--peers', peers, *argv], {})
+            o = opt.parse(['--no-config', '--peers', peers, *argv], GLM)
             opt.validate(o)
             return [a for a in opt.engine_plan(o, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env'] if a.startswith('G6_TR3_W2ALL=')]
         self.assertEqual(env(PEERS), ['G6_TR3_W2ALL=1'])
@@ -400,7 +415,7 @@ class CanonicalTests(unittest.TestCase):
 
     def test_tp6_is_s2_without_drafter(self):
         peers = ','.join(f'10.0.0.{i}' for i in range(1, 7))
-        o = opt.parse(['--no-config', '--peers', peers], {})
+        o = opt.parse(['--no-config', '--peers', peers], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
         self.assertIn('G6_PF_OWN=3', p['env'])
@@ -411,14 +426,14 @@ class CanonicalTests(unittest.TestCase):
         self.assertNotIn('--spec-adaptive', p['args'])
         self.assertFalse(any(a.startswith('--dflash') for a in p['args']))
         # --dflash 1: the drafter (its body replicated on every rank), adaptive draft count as at TP=4
-        o = opt.parse(['--no-config', '--peers', peers, '--dflash', '1'], {})
+        o = opt.parse(['--no-config', '--peers', peers, '--dflash', '1'], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
         self.assertIn('/a/dflash.r2.manifest.json', p['args'])
         self.assertIn('/a/dflash.r2.pack', p['args'])
         self.assertIn('--spec-adaptive', p['args'])
         # PF_OWN=1 is the fallback: no QO pack
-        o = opt.parse(['--no-config', '--peers', peers, '--pf-own', '1'], {})
+        o = opt.parse(['--no-config', '--peers', peers, '--pf-own', '1'], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
         self.assertIn('G6_PF_OWN=1', p['env'])
@@ -427,7 +442,7 @@ class CanonicalTests(unittest.TestCase):
 
 class KvStoreTests(unittest.TestCase):
     def plan(self, *argv, kv_store=None, env=None):
-        o = opt.parse(['--no-config', '--peers', PEERS, *argv], env or {})
+        o = opt.parse(['--no-config', '--peers', PEERS, *argv], {**GLM, **(env or {})})
         opt.validate(o)
         return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_store=kv_store)
 
@@ -443,6 +458,15 @@ class KvStoreTests(unittest.TestCase):
         for a in ('--kv-store', '--kv-keep', '--kv-system-after', '--kv-write-limit', '--kv-tier'):
             self.assertNotIn(a, p['args'])
         self.assertNotIn('--kv-store', self.plan('--kv-store', 'off')[1]['args'])
+
+    def test_a_group_lease_gives_when_idle_or_always(self):
+        b = 'remote:192.0.2.5:7350,size=8G,group=glm,cap=32G,weight=2000'
+        o, p = self.plan('--kv-store', b, '--kv-share-when', 'always')
+        self.assertEqual(self.stores(p), [b])
+        self.assertIn('G6_KV_SHARE_WHEN=always', p['env'])
+        self.assertNotIn('G6_KV_SHARE_WHEN', ' '.join(self.plan('--kv-store', b)[1]['env']))
+        with self.assertRaises(opt.OptionError):
+            self.plan('--kv-store', b, '--kv-share-when', 'busy')
 
     def test_stores_in_flag_order_and_what_they_keep(self):
         a, b = 'ssd:/nvme/gr8kv,size=200G', 'remote:192.0.2.5:7350,size=8G'
@@ -460,6 +484,10 @@ class KvStoreTests(unittest.TestCase):
         o, p = self.plan('--kv-store', a + ',persist=on,keep=system', '--kv-store', b + ',keep=all')
         self.assertEqual(self.stores(p), [a + ',persist=on,keep=system', b + ',keep=all'])
         self.assertEqual([x['keep'] for x in opt.kv_stores(o)], ['system', 'all'])
+        # a named cache reaches the engine as the store's spare_ram_cache=on
+        o, p = self.plan('--kv-store', 'cache:s,kind=spare_ram,floor=3G', '--kv-store', b + ',name=far,cache=s')
+        self.assertEqual(self.stores(p), [b + ',spare_ram_cache=on,spare_ram_floor=3G'])
+        self.assertEqual([(t['name'], t['cache']) for t in opt.kv_stores(o)], [('far', 's')])
         # the same from the environment, stores separated by ;
         self.assertEqual(self.stores(self.plan(env={'KV_STORE': f'{a};{b}'})[1]), [a, b])
 
@@ -475,7 +503,7 @@ class KvStoreTests(unittest.TestCase):
         self.assertEqual(self.arg(p, '--kv-keep'), 'sessions', 'an explicit KV_KEEP wins')
 
     def test_remote_auto_is_resolved_per_box(self):
-        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-store', 'remote:auto,size=8G'], {})
+        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-store', 'remote:auto,size=8G'], GLM)
         opt.validate(o)
         self.assertEqual(opt.kv_stores(o)[0]['host'], 'auto')
         p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_store='remote:192.0.2.5:7350,size=8G')
@@ -488,6 +516,9 @@ class KvStoreTests(unittest.TestCase):
                            (['--kv-store', 'ssd:/x,size=8'], 'want size='), (['--kv-store', 'ssd:/x,size=8G,keep=most'], 'keep=system, sessions or all'),
                            (['--kv-store', 'remote:192.0.2.5:7350,size=8G,persist=on'], 'for ssd:'),
                            (['--kv-store', 'ssd:/x,size=8G,persist=yes'], 'persist=on|off'),
+                           (['--kv-store', 'ssd:/x,size=8G,spare_ram_cache=on'], "is the engine's"),
+                           (['--kv-store', 'cache:s,kind=spare_ram', '--kv-store',
+                             'remote:192.0.2.5:7350,size=8G,group=g,cache=s'], 'fixed lease'),
                            (['--kv-store', 'remote:auto,size=8G'], 'name it'), (['--kv-store', 'ssd:/x,size=8G', '--reuse', '0'], 'needs REUSE'),
                            (['--kv-store', 'ssd:/x,size=8G', '--kv-system-after', '0'], 'from 1'),
                            (['--kv-store', 'ssd:/x,size=8G', '--kv-keep', 'most'], 'system, sessions or all'),
@@ -495,9 +526,220 @@ class KvStoreTests(unittest.TestCase):
             v.check(['--peers', PEERS, *argv], want)
 
 
+class KvStoreFileTests(unittest.TestCase):
+    """KV_STORE=@FILE: tiers in a YAML file, lowered to the one-line form the engine and the logs take."""
+    FILE = """
+caches:
+  spare: {kind: spare_ram, floor: 2G}
+tiers:                       # tried in order
+  - keep: system
+    cache: spare
+    store:
+      ssd: {path: /nvme/gr8kv, size_per_rank: 4G, persist: true}
+  - keep: all
+    cache: spare
+    store:
+      remote: {address: auto, size_per_rank: 8G}
+"""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def lower(self, text):
+        return opt.kv_store_file(write(self.d, 'kv.yaml', text))
+
+    def test_lowers_in_cascade_order(self):
+        self.assertEqual(self.lower(self.FILE), 'cache:spare,kind=spare_ram,floor=2G;ssd:/nvme/gr8kv,size=4G,persist=on,'
+                                                'keep=system,cache=spare;remote:auto,size=8G,keep=all,cache=spare')
+        self.assertEqual(self.lower('tiers:\n- store:\n    remote: {address: "192.0.2.5:7350", size_per_rank: 8G, '
+                                    'group: g, cap_per_rank: 32G, weight: 2000}\n'),
+                         'remote:192.0.2.5:7350,size=8G,group=g,cap=32G,weight=2000')
+        # two tiers of one kind need names
+        two = 'tiers:\n- {name: a, store: {ssd: {path: /a, size_per_rank: 4G}}}\n' \
+              '- {name: b, store: {ssd: {path: /b, size_per_rank: 4G}}}\n'
+        self.assertEqual(self.lower(two), 'ssd:/a,size=4G,name=a;ssd:/b,size=4G,name=b')
+        # unnamed stores of one kind are named kind-N
+        self.assertEqual([t['name'] for t in opt.kv_parse('ssd:/a,size=4G;remote:auto,size=4G;ssd:/b,size=4G')[1]],
+                         ['ssd-1', 'remote', 'ssd-2'])
+
+    def test_at_file_beside_the_config_file(self):
+        write(self.d, 'kv.yaml', 'tiers:\n- store: {ssd: {path: /x, size_per_rank: 4G}}\n')
+        cfg = write(self.d, 'c.env', f'PEERS={PEERS}\nKV_STORE=@kv.yaml\n')
+        o = opt.parse(['@' + cfg], {})
+        self.assertEqual(o.get('KV_STORE'), 'ssd:/x,size=4G')
+        self.assertIn('via ' + os.path.join(self.d, 'kv.yaml'), opt.summary(o))
+        # an @FILE among one-line stores, from the command line: relative to the working directory
+        o = opt.parse(['--no-config', '--kv-store', 'remote:192.0.2.5:7350,size=8G', '--kv-store',
+                       '@' + os.path.join(self.d, 'kv.yaml')], {})
+        self.assertEqual(o.get('KV_STORE'), 'remote:192.0.2.5:7350,size=8G;ssd:/x,size=4G')
+
+    def test_the_log_shows_both_forms(self):
+        o = opt.parse(['--no-config', '--kv-store', '@' + write(self.d, 'kv.yaml', self.FILE)], {})
+        lines = opt.kv_describe(o)
+        self.assertEqual(lines[0], 'KV_STORE=' + self.lower(self.FILE))
+        self.assertEqual(lines[1], 'KV_STORE as YAML:')
+        self.assertEqual(opt.kv_store_text('\n'.join(x[2:] for x in lines[2:])), self.lower(self.FILE))
+        self.assertEqual(opt.kv_describe(opt.parse(['--no-config'], {})), [])
+
+    def test_refusals_name_the_key(self):
+        ssd = '{ssd: {path: /x, size_per_rank: 4G}}'
+        for text, want in [
+            ('', 'the file: want a mapping'),
+            ('caches: {}\n', 'tiers: no tiers'),
+            ('tiers: []\n', 'tiers: no tiers'),
+            ('runs: []\ntiers: []\n', 'the file.runs: not built yet'),
+            ('tier: []\n', 'the file.tier: want caches, tiers'),
+            (f'tiers:\n- {{keep: all}}\n', 'tiers[0]: no store'),
+            ('tiers:\n- store: {nvme: {path: /x}}\n', 'tiers[0].store: want one of ssd: or remote:'),
+            ('tiers:\n- store: {ssd: {size_per_rank: 4G}}\n', 'tiers[0].store.ssd: no path'),
+            ('tiers:\n- store: {ssd: {path: /x, size: 4G}}\n', 'tiers[0].store.ssd.size: want path, size_per_rank, persist'),
+            ('tiers:\n- store: {ssd: {path: /x, size_per_rank: 4G, persist: on}}\n', None),
+            ('tiers:\n- store: {ssd: {path: /x, size_per_rank: 4G, persist: maybe}}\n',
+             "tiers[0].store.ssd.persist: want true or false, got 'maybe'"),
+            ('tiers:\n- store: {ssd: {path: /x, size_per_rank: 4}}\n', 'tiers[0].store.ssd.size_per_rank: want a string'),
+            ('tiers:\n- store: {ssd: {path: /x}}\n', 'tiers[0]: --kv-store ssd:/x: size=N(G|T) is needed'),
+            (f'tiers:\n- {{name: ssd-2, store: {ssd}}}\n- store: {ssd}\n- store: {ssd}\n',
+             'tiers[2]: --kv-store ssd:/x,size=4G: the name ssd-2 is also store 1\'s'),
+            (f'tiers:\n- {{store: {ssd}, transforms: []}}\n', 'tiers[0].transforms: not built yet'),
+            (f'tiers:\n- {{store: {ssd}, cache: spar}}\n', 'tiers[0]: --kv-store ssd:/x,size=4G,cache=spar: no cache spar (caches: none)'),
+            (f'caches: {{spare: {{kind: fixed_ram}}}}\ntiers:\n- store: {ssd}\n', 'caches.spare: --kv-store cache:spare,kind=fixed_ram: kind=spare_ram'),
+            (f'caches: {{spare: {{kind: spare_ram, takes: [system]}}}}\ntiers:\n- store: {ssd}\n',
+             'caches.spare.takes: not built yet'),
+            (f'tiers:\n- {{keep: most, store: {ssd}}}\n', 'keep=system, sessions or all'),
+            ('caches: {s: {kind: spare_ram}}\ntiers:\n- cache: s\n  store: {remote: {address: "192.0.2.5:7350", '
+             'size_per_rank: 8G, group: g}}\n', 'fixed lease'),
+            ('tiers: [\n', 'KV_STORE=@'),
+            ('tiers:\n- store: {remote: {address: auto, size_per_rank: 8G, group: g, weight: 02000}}\n', 'plain decimal'),
+            ('tiers:\n- store: {remote: {address: 7350:1, size_per_rank: 8G}}\n', 'plain decimal'),
+            ('a: 1\na: 2\n', 'a given twice'),
+        ]:
+            with self.subTest(text=text):
+                if want is None:   # YAML 1.1: on is true
+                    self.assertEqual(self.lower(text), 'ssd:/x,size=4G,persist=on')
+                    continue
+                with self.assertRaises(opt.OptionError) as e:
+                    self.lower(text)
+                self.assertIn(want, str(e.exception))
+        with self.assertRaises(opt.OptionError) as e:
+            opt.kv_store_file(os.path.join(self.d, 'missing.yaml'))
+        self.assertIn('No such file', str(e.exception))
+
+
+class KvFuzzTests(unittest.TestCase):
+    """The one-line form and the YAML store file accept and refuse the same stores, and mean the same thing."""
+    N = 3000
+
+    @staticmethod
+    def setup(rng):
+        """Random caches and tiers, valid or not, as ([(name, kind, floor)], [(kind, address, {YAML key: value})])."""
+        pick = rng.choice
+        def some(good, bad):   # mostly good values, so both kinds of outcome get tested
+            return pick(good) if rng.random() < 0.93 else pick(bad)
+
+        caches = [(some(['spare', 's2'], ['bad name', 'a;b', 'a=b']), some(['spare_ram'], ['fixed_ram', None]),
+                   some([None, '2G', '512M', '1.5G'], ['0G', '4T', 'x'])) for _ in range(pick([0, 0, 1, 1, 2]))]
+        names = [c[0] for c in caches] + ['nope']
+        tiers = []
+        for _ in range(pick([0, 1, 1, 2, 3])):
+            kind = pick(['ssd', 'remote'])
+            address = some(['/nvme/a', '/b'], ['/x y', '/a,b', '']) if kind == 'ssd' else \
+                some(['auto', '192.0.2.5:7350', 'kv:7350'], ['auto:7350', '', 'a;b'])
+            t = {}
+            if rng.random() < 0.97:
+                t['size_per_rank'] = some(['4G', '1.5T', '512M'], ['4', '0G', 'x'])
+            for key, good, bad, p in (('persist', [True, False], [], 0.4 if kind == 'ssd' else 0.03),
+                                      ('keep', ['system', 'all', 'sessions'], ['most'], 0.5),
+                                      ('name', ['a', 'b', 'c', 'd'], ['ssd', 'remote', 'x y'], 0.4),
+                                      ('cache', names[:-1] or ['nope'], ['nope'], 0.4),
+                                      ('group', ['g', 'h'], ['g;h'], 0.15 if kind == 'remote' else 0.02),
+                                      ('cap_per_rank', ['32G'], ['x'], 0.1), ('weight', [2000, 1], [0, 'abc'], 0.1)):
+                if rng.random() < p:
+                    t[key] = some(good, bad or good)
+            tiers.append((kind, address, t))
+        return caches, tiers
+
+    @staticmethod
+    def line(caches, tiers, rng):
+        one = {'size_per_rank': 'size', 'cap_per_rank': 'cap'}
+        entries = [f'cache:{n}' + (f',kind={k}' if k else '') + (f',floor={f}' if f else '') for n, k, f in caches]
+        for kind, address, t in tiers:
+            settings = [f'{one.get(k, k)}={("on" if x else "off") if isinstance(x, bool) else x}' for k, x in t.items()]
+            rng.shuffle(settings)
+            entries.append(','.join([f'{kind}:{address}'] + settings))
+        stores = iter([e for e in entries if not e.startswith('cache:')])
+        rng.shuffle(entries)   # caches may come anywhere; the stores keep their order
+        return ';'.join(e if e.startswith('cache:') else next(stores) for e in entries)
+
+    @staticmethod
+    def yaml_text(caches, tiers):
+        import yaml
+        doc = {}
+        if caches:
+            doc['caches'] = {n: {k: x for k, x in (('kind', kind), ('floor', f)) if x} for n, kind, f in caches}
+        doc['tiers'] = []
+        for kind, address, t in tiers:
+            on_tier = {k: x for k, x in t.items() if k in ('keep', 'name', 'cache')}
+            store = {('path' if kind == 'ssd' else 'address'): address}
+            store.update({k: x for k, x in t.items() if k not in on_tier})
+            doc['tiers'].append({**on_tier, 'store': {kind: store}})
+        return yaml.safe_dump(doc, sort_keys=False)
+
+    @staticmethod
+    def outcome(f, *a):
+        try:
+            return f(*a)
+        except opt.OptionError as e:
+            return e
+
+    def test_both_forms_agree(self):
+        import random
+        rng, agreed = random.Random(239), {True: 0, False: 0}
+        for i in range(self.N):
+            caches, tiers = self.setup(rng)
+            if len({c[0] for c in caches}) < len(caches) or not (caches or tiers):
+                continue   # a YAML mapping has no second key of one name; an empty one-line form is off
+            line, text = self.line(caches, tiers, rng), self.yaml_text(caches, tiers)
+            a, b = self.outcome(opt.kv_parse, line), self.outcome(opt.kv_store_text, text)
+            if not isinstance(a, Exception) and not a[1]:
+                a = opt.OptionError('no stores')   # caches alone: kv_parse refuses an unused cache first
+            with self.subTest(i=i, line=line, yaml=text):
+                self.assertEqual(isinstance(a, Exception), isinstance(b, Exception), f'{a!r} / {b!r}')
+                agreed[not isinstance(a, Exception)] += 1
+                if isinstance(a, Exception):
+                    continue
+                self.assertEqual(opt.kv_line(*a), b)
+                self.assertEqual(opt.kv_engine(line), opt.kv_engine(b))
+                self.assertEqual(opt.kv_store_text(opt.kv_yaml(*a)), b, 'the logged YAML reads back')
+        self.assertGreater(min(agreed.values()), self.N // 10, f'too few of one kind: {agreed}')
+
+    def test_mutations_only_refuse(self):
+        import random
+        rng = random.Random(7)
+        line = ('cache:spare,kind=spare_ram,floor=2G;ssd:/nvme/gr8kv,size=4G,persist=on,keep=system,cache=spare;'
+                'remote:192.0.2.5:7350,size=8G,keep=all,name=far,group=g,cap=32G,weight=2000')
+        texts = [(opt.kv_parse, line), (opt.kv_store_text, opt.kv_yaml(*opt.kv_parse(line)))]
+        alphabet = ',;=:{}[]-#&*!|>\'"\n\t ' + 'abcz019GT._/'
+        for i in range(self.N):
+            f, text = texts[i % 2]
+            chars = list(text)
+            for _ in range(rng.randint(1, 4)):
+                at = rng.randrange(len(chars) + 1)
+                if chars and rng.random() < 0.5:
+                    del chars[min(at, len(chars) - 1)]
+                else:
+                    chars.insert(at, rng.choice(alphabet))
+            got = ''.join(chars)
+            with self.subTest(i=i, text=got):
+                r = self.outcome(f, got)   # anything but an OptionError fails the test
+                if isinstance(r, Exception):
+                    continue
+                caches, stores = opt.kv_parse(opt.kv_line(*r)) if f is opt.kv_parse else opt.kv_parse(r)
+                self.assertEqual(opt.kv_store_text(opt.kv_yaml(caches, stores)), opt.kv_line(caches, stores))
+
+
 class KvRowsTests(unittest.TestCase):
     def plan(self, *argv, kv_rows=None, env=None):
-        o = opt.parse(['--no-config', '--peers', PEERS, *argv], env or {})
+        o = opt.parse(['--no-config', '--peers', PEERS, *argv], {**GLM, **(env or {})})
         opt.validate(o)
         return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_rows=kv_rows)
 
@@ -523,7 +765,7 @@ class KvRowsTests(unittest.TestCase):
                          {'G6_RT_STORE': 'mem:', 'G6_RT_SIZE': str(1 << 30), 'G6_RT_LOCAL': '8'})
 
     def test_remote_auto_is_resolved_per_box(self):
-        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-rows', 'remote:auto,size=8G,local=40'], {})
+        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-rows', 'remote:auto,size=8G,local=40'], GLM)
         opt.validate(o)
         self.assertEqual(opt.kv_rows(o)['host'], 'auto')
         rows = opt.kv_rows_with(o, '10.1.0.20:7351')
@@ -547,7 +789,7 @@ class KvRowsTests(unittest.TestCase):
 class KvFormatTests(unittest.TestCase):
     def plan(self, *argv, tp='4'):
         o = opt.parse(['--no-config', '--peers', ','.join(PEERS.split(',')[:int(tp)]) if tp != '6' else
-                       ','.join(f'10.0.0.{i}' for i in range(1, 7)), *argv], {})
+                       ','.join(f'10.0.0.{i}' for i in range(1, 7)), *argv], GLM)
         opt.validate(o)
         return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')
 

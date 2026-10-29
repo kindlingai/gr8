@@ -11,7 +11,7 @@
 //   TIME   one step's phase-1 body (the 7 / 9 launches above) inside a graph of K steps, median of TR alternating trials,
 //          hot (no flush) and cold (a 96 MB L2 flush before every step, subtracted: the served case, the experts stream
 //          between layers). Saved per layer, and per step x 78 layers (every layer takes the CP block past R).
-// Arms: env CPG_ARMS="arm arm ..." with an arm = comma-separated KEY=VALUE attention flags (SC2 TR CTX2 CTX3 HG CTX4) or
+// Arms: env CPG_ARMS="arm arm ..." with an arm = comma-separated KEY=VALUE attention flags (SC2 TR CTX2 CTX3 HG) or
 // "stock" (all 0); default "SC2=4,TR=2,CTX2=4,CTX3=2 stock" (the measured attention set of docs/SETTINGS.md, then the
 // kernels without it).
 // build (from engine/attn/tests), with the engine's flags (scripts/build.sh K1H2_FLAGS, -DG6_NR=4 -DDEC_S2 -DPF_F12):
@@ -64,14 +64,14 @@ static float run_us(cudaGraphExec_t x,cudaStream_t st,int reps){   // us per gra
     CK(cudaEventRecord(b,st));CK(cudaEventSynchronize(b));float ms;CK(cudaEventElapsedTime(&ms,a,b));
     cudaEventDestroy(a);cudaEventDestroy(b);return ms*1000.f/reps;
 }
-struct Arm{int sc,tr,ctx2,ctx3,hg,ctx4;};
-static void set_arm(const Arm& x){ga::attn_sc2()=x.sc;ga::attn_sc2_tr()=x.tr;ga::attn_ctx2()=x.ctx2;ga::attn_ctx3()=x.ctx3;ga::attn_ctx3_hg()=x.hg;ga::attn_ctx4()=x.ctx4;}
+struct Arm{int sc,tr,ctx2,ctx3,hg;};
+static void set_arm(const Arm& x){ga::attn_sc2()=x.sc;ga::attn_sc2_tr()=x.tr;ga::attn_ctx2()=x.ctx2;ga::attn_ctx3()=x.ctx3;ga::attn_ctx3_hg()=x.hg;}
 static bool parse_arm(const std::string& s,Arm& x){
-    x=Arm{0,0,0,0,0,0};if(s=="stock")return true;
+    x=Arm{0,0,0,0,0};if(s=="stock")return true;
     size_t i=0;while(i<s.size()){size_t e=s.find(',',i);if(e==std::string::npos)e=s.size();const std::string kv=s.substr(i,e-i);i=e+1;
         const size_t q=kv.find('=');if(q==std::string::npos)return false;const std::string k=kv.substr(0,q);const int v=atoi(kv.c_str()+q+1);
         if(k=="SC2")x.sc=v;else if(k=="TR")x.tr=v;else if(k=="CTX2")x.ctx2=v;else if(k=="CTX3")x.ctx3=v;else if(k=="HG")x.hg=v;
-        else if(k=="CTX4")x.ctx4=v;else return false;}
+        else return false;}
     return true;
 }
 

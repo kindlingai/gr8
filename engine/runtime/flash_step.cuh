@@ -59,6 +59,7 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
     m.srow=dmalloc<glue::SampleRow>(MX); m.tk=dmalloc<glue::TkRes>(1); m.topp_miss=dmalloc<unsigned>(1);
     m.tok=dmalloc<int>(MX); m.pos=dmalloc<int>(MX); m.tok_out=dmalloc<int>(MX); m.tgt=dmalloc<int>(MX);
     m.steering_scale=dmalloc<float>(MX);   // k_step_in copies StepIn::steering_scale here every step
+    m.steering_slot=dmalloc<int>(MX);
     m.lp=dmalloc<float>(MX); m.lpt=dmalloc<float>(MX);
     m.scratch=dmalloc<char>(bind::scratch_bytes()); m.sc=bind::scratch_at(m.scratch);
     m.flash_mlp_sc=flash_mlp::workspace_at(dmalloc<char>(flash_mlp::workspace_bytes(MX)),MX);
@@ -365,6 +366,7 @@ inline void launch_step_flash(Model& m,int M,int context,cudaStream_t st,int par
         else launch_dense_block(m,i,M,st);
         launch_consume_mhc(m,2*i+1,M,st);
         if(residual_copy) residual_copy(2*i+2,M);
+        if(m.dfl_tap) m.dfl_tap(m,i,M,st);
     }
     if(part!=0) { launch_head_local(m,M,st); launch_head_merge(m,M,st); launch_step_out(m,M,st); dmark(DP_STEP,st); }
     ep.rec=false;

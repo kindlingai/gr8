@@ -9,7 +9,7 @@ class ResetPlacement(unittest.TestCase):
         self.assertIn('else if (a == "--spec-reset-per-request") spec_reset_per_request = true;', source)
         self.assertIn('if (spec_reset_per_request && s2mode) die(', source)
         snapshot = source.index('const SpecLen spec_initial = spec;')
-        self.assertLess(source.index('spec.flash_tp2();'), snapshot)
+        self.assertLess(source.index('spec.flash_cost(g6nr::NR);'), snapshot)
         loop = source.index('for (size_t q = 0; !s2mode && q < plans.size(); ++q)')
         reset = source.index('if (spec_reset_per_request) spec = spec_initial;')
         self.assertLess(snapshot, loop)

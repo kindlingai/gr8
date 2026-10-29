@@ -11,6 +11,11 @@ TP=3 (a three-box ring, variant k4) or TP=2. The engine is `bin/g6m4_flash`, a b
     ./gr8 glm53f up --model https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 --model-cache DIR --tp 4 ...
     ./gr8 glm53f smoke
 
+With the box's model-loader fetching the weights ([DEPLOY.md](DEPLOY.md#with-model-loader)), give its store instead:
+`--model-loader unix:/var/lib/model-loader/model-loader.sock --model-cache /var/lib/model-loader`, or in Docker add `-f docker/model-loader.yaml`. gr8 finds
+the Flash release in model-loader's catalog by its repo. Its catalog needs an entry for the Flash release, with the width files in small
+segments as for GLM-5.3. GLM-5.3 and Flash then share one store and its disk budget.
+
 `./gr8 glm53f` takes the options of `./gr8 glm53` (KNOBS.md). Each box fetches its rank's part of the release and loads
 it through the same release planner as GLM-5.3 (`engine/loader-rs`): `release::plan` reads the model from the release's
 own metadata (`hidden_size` 4096) and maps Flash's tensors with `engine/loader-rs/src/flash.rs`. The width manifests are
@@ -84,9 +89,89 @@ rounds share main and draft steps, and their KV runs share the `CAP` pool (`--s2
 The memory these take (slots and graphs), the speed of shared steps and the output of sessions sharing steps have not
 been measured on Flash yet.
 
+## Session checkpoints (`G6_FLASH_CACHE=aligned`, experimental)
+
+Off by default. With `FLASH_CACHE=aligned` (`G6_FLASH_CACHE=aligned`), a prompt's prefill keeps a checkpoint at its last
+cold prefill grid point, and a later prompt that starts with the same tokens is prefilled from that point, not from 0.
+This is the Flash form of prefix reuse for an agent's next turn. The code is `engine/runtime/s2/flash_checkpoint.h` (the
+index, the aligned point, the manifest) and `flash_checkpoint.cuh` (the store), hooked into `s2/flash_native.cuh`.
+
+- The grid is the prefill quantum: `--prefill` rows times the lanes, 4,096 x 2 = 8,192 rows. A prompt of N tokens keeps
+  a checkpoint at `p = floor((N - 1) / 8192) * 8192`, so prompts of 8,192 tokens or fewer keep none.
+- A checkpoint holds rows `[0, p)` of the 12 attention bindings (the latent rows and the indexer keys), KDA slot 0's
+  state and conv history, and the prompt's tokens `[0, p]`. A later prompt hits it when it starts with those `p + 1`
+  tokens under the same cache namespace (the steering profile); the longest entry wins, then the newest.
+- A hit restores the checkpoint at bind, after the cold reset, and prefills from `p`.
+
+Why the output is bit-exact against no cache: a cold prefill runs its quanta as `[kG, (k+1)G)`, and the KDA prefill is
+chunked by quantum, so a warm prefill from `p = kG` runs the same quanta on the same KDA state and the same pages. The
+MTP layer's row `p - 1` reads token `p`, which is why the match runs through token `p`. The indexer's pools are
+recomputed from the raw rows (`engine/attn/kpool.cuh`), so no other state is kept. Rows past `p` and the other KDA slots
+are as a cold bind leaves them.
+
+Why a checkpoint is not taken at the end of the prompt: decode advances the KDA state one row at a time
+(`engine/kda/kda.cuh`), and the prefill runs it in chunks of 64 rows (`engine/kda/kda_prefill.cuh`). The two orders of
+fp32 arithmetic give different state, so a state taken after decode is not the state a cold prefill of the same tokens
+gives. A terminal checkpoint is not cold-exact by construction.
+
+`FLASH_CACHE=terminal` (`G6_FLASH_CACHE=terminal`, experimental, **NOT cold-exact**) keeps aligned's checkpoints and
+one more at the end of every request: `p` = the rows the request consumed (prompt and output; its last output token is
+still pending and becomes token `p`), with the KDA state the verify ring holds for `p` and the pages through `p`, the
+last one partial. A later prompt that starts with those `p + 1` tokens (an agent's next turn sent as raw tokens) is
+prefilled from `p`. Its output differs from a cold prefill's: the KDA state comes from decode, and the prefill from `p`
+runs quanta a cold prefill does not. How much is measured (token diff against no cache on the same trace, NLL delta,
+needles), not argued. After a terminal hit the request keeps no aligned checkpoint (its rows are not cold rows), so
+aligned entries stay exact. The MTP layer's row `p - 1` may not hold the last token's draft row; that changes only
+which drafts are accepted. The boot and request log lines say `terminal`. Aligned stays the mode to use when the output
+must match no cache.
+
+The store: the one `KV_STORE` (`--kv-store`; `mem:`, `ssd:PATH` or `remote:HOST:PORT`, `persist=on` refused), else
+this process's memory, `FLASH_STATE_BUDGET_MIB` (8,192) a rank. An SSD folder starts empty at every boot. On a KV node
+the lease is `g6m4f-ckpt-<host>-<epoch>-r<rank>`, never the pool stash's. Each checkpoint is one contiguous range of
+blocks with a manifest and GPU checksums of every extent; a restore that does not match its checksums stops the engine.
+A full store drops the least recently used checkpoints. Every rank keeps the same index, and its digest joins the pool
+digest the ranks compare.
+
+`group=` on the store (`remote:HOST:PORT,size=N,group=G[,cap=,weight=]`, experimental, D-331 M8 (c)): the lease is a
+member of group `G` on the KV node, the way a full model's `--kv-store group=` tier is, so the two models share the
+node's memory. It starts at `size=`; the head reports to the node every `G6_S2_SHARE_MS` and asks for segments when
+captures drop entries, an entry does not fit at all, or the next capture would drop one (after a capture, or at any
+report while a request is resident or queued; the node holds the room an ask made another group give and grants it at
+the next report, so the grow lands before the capture that would drop), and offers what giving would
+drop (the least recently used checkpoints' ages) only while idle (`KV_SHARE_WHEN=idle`, default; `always`). A grant
+or give is a Resize event every rank applies at the same commit: a grow adds blocks; a shrink drops the least recently
+used checkpoints until the rest fit, copies the ones above the new end down, then gives the top segments back. The log
+prints `# rank R: flash ckpt share: now S segments, B blocks (N entries, D dropped) in T ms`. Not measured on a box.
+
+Size the floor for the prompts that come back. The node rounds `size=` up to whole segments of whole blocks, and
+a 1 GiB segment holds 840 blocks of Flash's TP=2 block (1,277,952 B), which is just under 1 GiB. So `size=1G` is 2
+segments (2.00 GiB, 1,680 blocks) and `size=2G` is 3 (3.00 GiB, 2,520 blocks). One checkpoint at 16,384 rows is 317
+blocks, so `size=1G` holds 5 and `size=2G` holds 7. A cycle of more prompts than the lease holds restores nothing: each
+capture drops the least recently used, the one the cycle needs next. With no `cap=` the lease asks and grows past
+the floor, as far as the node has room.
+
+The boot log prints `# rank R: flash ckpt aligned: ...`, and each request prints `flash ckpt request ... kept ...` or
+`... restored ...` with the time.
+
+Measured on one RTX 5090 (`engine/tests/test_flash_ckpt.cu`, Flash's TP=2 geometry, 100 pages, 161 blocks): a capture
+(161 blocks) takes 26-50 ms and a restore 21-25 ms through memory, an SSD file and a loopback KV node. Not measured on GB10, and the
+end-to-end bit-exact check against no cache on a cluster has not run yet.
+
+Limits:
+
+- Checkpoints are not entries of the pool's block stash (`engine/kvman-rs` `stash.rs`); a `group=` store shares and
+  resizes through its own index (above), with the same report rule.
+- Each capture writes the whole prefix `[0, p)`, not only the rows past the entry it started from.
+- `terminal` is not cold-exact (above).
+- One session: the engine refuses `G6_FLASH_CACHE` and `G6_FLASH_KV_CHUNKS` with `--s2-sessions` above 1 (the
+  checkpoints keep session 0's KDA ring).
+
 ## Not yet
 
-- CP, prefix reuse and DFlash2: the engine refuses them under `--serve`.
+- CP, prefix reuse and DFlash2: the engine refuses them under `--serve`. `G6_FLASH_CACHE=aligned` (above) is the
+  experimental Flash form of prefix reuse. DFlash2 runs offline (`g6m4_flash --dflash-manifest`, at a TP that splits
+  its 8 KV heads), and with `--prefill` only without the drafter's prompt context (`G6_DFL_PFCTX=0`). Its taps are the
+  mean of the four mHC streams after each tapped layer.
 - MTP drafts beyond the first: the KDA state does not roll back a rejected draft yet, so the launcher runs MTP=1.
 - The int4 KV build.
 - The vision tower: the engine serves text, and the fetch skips `dense/vision-*`.

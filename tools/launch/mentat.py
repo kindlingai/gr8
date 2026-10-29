@@ -6,8 +6,15 @@ group's live agents that report a GPU, one per node_ip; rank r is the r-th addre
 computes the same ranks from the same snapshot: each box publishes in `gr8.offers` the ranks its model set can serve
 (`any`, or a list), the boxes that offer particular ranks get them first, and the rest take the free ranks in
 address order. The head's API is announced under a second agent id, so the member row never changes.
+
+With --shape ring there is no switch, so the cables decide the order. Every box sends the same ring claim (mentat
+0.24.0+: PROTOCOL.md "Claims"). The head solves it once over the group's nodes, and every holder gets that one view:
+the cycle and every probed link between members. Each box publishes the PCIe root of its RoCE addresses in
+`gr8.roots`, and ring_plan turns the view into the rank order and each rank's addresses toward the next and previous
+ranks. A box holds the claim on an open client link (ClaimLink) until the handshake, so every box sees one view.
 """
 import ipaddress
+import itertools
 import json
 import os
 import select
@@ -21,6 +28,13 @@ PROTO = '0.99'
 PING_S = 2.0
 # the service a KV node (./gr8 kv up) announces
 KV_SERVICE = 'gr8-kv'
+# --shape ring: the agent meta key with this box's {RoCE address: PCIe root}; how long a full group whose links form
+# no ring waits for more probes before the boot is refused (three default 15 s probe rounds); and how many claims
+# (one probe round apart) a TP=4 ring gets to find its relay pairs
+ROOTS_META = 'gr8.roots'
+RING_SETTLE_S = 45.0
+RING_RETRY_S = 15.0
+RING_ATTEMPTS = 4
 
 
 def frame(header):
@@ -94,15 +108,26 @@ def rdma_addrs(tags):
     return sorted(out, key=ipaddress.ip_address)
 
 
-def members(snap, group):
-    """[(node_ip, node_id, offers)] of the group's live GPU agents, one per node, sorted by address. offers is the
-    agent's gr8.offers meta, or None before it has published one."""
+def member_rows(snap, group):
+    """{node_ip: (node_id, meta)} of the group's live GPU agents, the first agent of each node."""
     agents = ((snap.get('groups') or {}).get(group) or {}).get('agents') or {}
     seen = {}
     for a in agents.values():
         if a.get('alive') and (a.get('machine') or {}).get('gpus') and a.get('node_ip'):
-            seen.setdefault(a['node_ip'], (a.get('node_id', ''), (a.get('meta') or {}).get('gr8.offers')))
-    return sorted(((ip, n, o) for ip, (n, o) in seen.items()), key=lambda x: ipaddress.ip_address(x[0]))
+            seen.setdefault(a['node_ip'], (a.get('node_id', ''), a.get('meta') or {}))
+    return seen
+
+
+def members(snap, group):
+    """[(node_ip, node_id, offers)] of the group's live GPU agents, one per node, sorted by address. offers is the
+    agent's gr8.offers meta, or None before it has published one."""
+    seen = member_rows(snap, group)
+    return sorted(((ip, n, m.get('gr8.offers')) for ip, (n, m) in seen.items()), key=lambda x: ipaddress.ip_address(x[0]))
+
+
+def member_meta(snap, group, key):
+    """{node_ip: the meta value, or None before the box has published it} of the group's members."""
+    return {ip: m.get(key) for ip, (_, m) in member_rows(snap, group).items()}
 
 
 def kv_nodes(snap, group):
@@ -168,6 +193,154 @@ def assign_ranks(ips, offers, tp, head=None):
     for ip, r in zip(rest, [r for r in range(tp) if r not in taken]):
         taken[r] = ip
     return [taken[r] for r in range(tp)]
+
+
+def ip_key(a):
+    return ipaddress.ip_address(a)
+
+
+def head_address(head):
+    """--head as a LAN address. A name, such as a LeaderWorkerSet's LWS_LEADER_ADDRESS (the leader pod's DNS name, its
+    box's address on the host network), resolves to its IPv4 address. Raises OSError, naming it, while it does not."""
+    try:
+        ipaddress.ip_address(head)
+        return head
+    except ValueError:
+        pass
+    try:
+        return socket.gethostbyname(head)
+    except OSError as e:
+        raise OSError(f'--head {head} does not resolve ({e})') from None
+
+
+def format_roots(roots):
+    """{address: PCIe root} -> the gr8.roots meta text 'addr=root,...'."""
+    return ','.join(f'{a}={r}' for a, r in sorted(roots.items(), key=lambda x: ip_key(x[0])))
+
+
+def parse_roots(text):
+    out = {}
+    for item in filter(None, (text or '').split(',')):
+        a, _, r = item.partition('=')
+        out[a] = int(r)
+    return out
+
+
+def ring_shape(tp):
+    """The claim every box of a --shape ring group sends. driver: ignore (mentat 0.23.0+) makes the answer and its
+    order independent of which box claims first."""
+    return {'sets': [{'name': 'ring', 'bundles': int(tp), 'link': 'rdma', 'layout': 'ring'}], 'driver': 'ignore'}
+
+
+def ring_name(group, tp, attempt):
+    return f'{group}-ring{tp}' + (f'-{attempt}' if attempt else '')
+
+
+class Incomplete(NoAssignment):
+    """The claimed ring lacks a pair the plan needs, perhaps because its probes were not all in yet."""
+
+
+class Stale(NoAssignment):
+    """The claim's view is not of this group's members: a box of an earlier boot still holds the name."""
+
+
+def view_pairs(view, lan_of, key='ring'):
+    """{(lan, lan): {(address, address)}} of the probed links in a claim view (links[set], mentat 0.23.0+), both ways."""
+    pairs = {}
+    for link in (view.get('links') or {}).get(key) or []:
+        a, b = link.get('a') or {}, link.get('b') or {}
+        x, y = lan_of.get(a.get('node')), lan_of.get(b.get('node'))
+        if x is None or y is None or x == y or not a.get('addr') or not b.get('addr'):
+            continue
+        pairs.setdefault((x, y), set()).add((a['addr'], b['addr']))
+        pairs.setdefault((y, x), set()).add((b['addr'], a['addr']))
+    return pairs
+
+
+def ring_why(pairs, roots, tp, why):
+    """Why the probed links of a group form no ring, naming the pair: pairs as view_pairs gives them (from any view of
+    the members), roots {lan: {address: root}}, why mentat's own reason."""
+    ips = sorted(roots, key=ip_key)
+    nbrs = {ip: sorted({b for a, b in pairs if a == ip}, key=ip_key) for ip in ips}
+    short = [ip for ip in ips if len(nbrs[ip]) < 2]
+    idle = [f'{a} on {ip}' for ip in ips for a in sorted(roots[ip], key=ip_key)
+            if not any(a == p[0] for k, v in pairs.items() if k[0] == ip for p in v)]
+    out = f'the probed links of {len(ips)} boxes form no ring of {tp}'
+    if len(short) == 2 and short[1] not in nbrs[short[0]]:
+        out += f': no cable works between {short[0]} and {short[1]}'
+    elif short:
+        out += ': ' + ', '.join(f'{ip} reaches {" and ".join(nbrs[ip]) or "no box"}' for ip in short)
+    if idle:
+        out += f'. Ports that reach no box: {", ".join(idle)}'
+    links = sorted({tuple(sorted(k, key=ip_key)) for k in pairs}, key=lambda k: (ip_key(k[0]), ip_key(k[1])))
+    return out + '. Links: ' + (', '.join(f'{a}-{b}' for a, b in links) or 'none') + f'. mentat: {why}'
+
+
+def ring_plan(view, ids, roots, tp, offers, head=None):
+    """The ring a mentat ring claim found, as gr8 runs it. view: the claim_ok view; ids: {lan: node_id} of the members;
+    roots: {lan: {address: PCIe root}} (each box's gr8.roots); offers: {lan: None (any) or [ranks]}. Returns (order,
+    ports): the LAN addresses in rank order, and for each rank its addresses as (relay-out, direct-next, relay-in,
+    direct-prev), the order of --ring-devs. Every box gets the same view, so every box computes the same answer.
+    mentat's cycle is turned and reflected so rank 0 is --head, or else the lowest address the offers allow, and rank
+    1 its lower neighbour. On each cable the pair from the higher PCIe roots carries the direct writes and a second
+    pair, other addresses at both ends, the relay (TP=4). Raises NoAssignment when the ring does not fit gr8, and
+    Incomplete when the view lacks the TP=4 relay pair."""
+    n = int(tp)
+    ips = sorted(ids, key=ip_key)
+    lan_of = {v: k for k, v in ids.items()}
+    nodes = [m.get('node') for m in (view.get('sets') or {}).get('ring') or []]
+    if sorted(nodes) != sorted(ids.values()) or len(nodes) != n:
+        hosts = ', '.join(lan_of.get(x) or str(x) for x in nodes)
+        raise Stale(f"mentat's ring ({hosts or 'empty'}) is not the group's {n} members ({', '.join(ips)})")
+    if head and head not in ids:
+        raise NoAssignment(f'--head {head} is not a member ({", ".join(ips)})')
+    cycle = tuple(lan_of[x] for x in nodes)
+    root = {a: r for ip in ips for a, r in (roots.get(ip) or {}).items()}
+    # only addresses behind a RoCE v2 device on their box (gr8.roots) can carry the engine's ring
+    pairs = {k: {p for p in v if p[0] in root and p[1] in root} for k, v in view_pairs(view, lan_of).items()}
+    orders = {d[k:] + d[:k] for d in (cycle, cycle[::-1]) for k in range(n)}
+    fits = [o for o in orders if (not head or o[0] == head)
+            and all(offers.get(o[r]) is None or r in offers[o[r]] for r in range(n))]
+    if not fits:
+        ring = min((cycle, (cycle[0], *cycle[:0:-1])), key=lambda o: [ip_key(a) for a in o])
+        raise NoAssignment(f'no rank order along the ring ({" - ".join(ring)}) fits '
+                           + (f'--head {head} and ' if head else '') + 'the model set on each box, which offers: '
+                           + ', '.join(f'{ip} {format_offers(offers.get(ip)) or "no rank"}' for ip in ips))
+    order = min(fits, key=lambda o: [ip_key(a) for a in o])
+    edges = []
+    for r in range(n):
+        a, b = order[r], order[(r + 1) % n]
+        ps = sorted(pairs.get((a, b)) or (), key=lambda p: (root[p[0]], root[p[1]], ip_key(p[0]), ip_key(p[1])))
+        if not ps:
+            raise NoAssignment(f"mentat's ring puts {a} next to {b}, but no link between them joins two RoCE v2 "
+                               'addresses (gr8.roots): is each ring port addressed and its RoCE device ACTIVE?')
+        direct = ps[-1]
+        if n == 3:      # TP=3 opens only the direct devices (fabric.cpp): the relay fields repeat them
+            edges.append((direct, direct))
+            continue
+        relay = next((p for p in ps if p[0] != direct[0] and p[1] != direct[1]), None)
+        if relay is None:
+            ends = lambda ip: ', '.join(f'{x} (root {root[x]})' for x in sorted(roots.get(ip) or {}, key=ip_key))  # noqa: E731,E501
+            raise Incomplete(f'{a} and {b} link on one port pair only ({direct[0]} - {direct[1]}): TP=4 relays '
+                             'over a second pair on the same cable, from the other PCIe root at both ends. '
+                             f'{a} has {ends(a) or "no address"}; {b} has {ends(b) or "no address"}. Is that pair '
+                             'addressed, tagged rdma, and answering mentat\'s probes?')
+        edges.append((direct, relay))
+    ports = []
+    for r in range(n):
+        (dn, ro), (dp, ri) = edges[r], edges[r - 1]
+        p = (ro[0], dn[0], ri[1], dp[1])
+        both = {p[0], p[1]} & {p[2], p[3]}
+        if both:
+            raise NoAssignment(f'{order[r]} reaches both its ring neighbours from {", ".join(sorted(both))}: '
+                               '--shape ring wants one cable to each neighbour')
+        ports.append(p)
+    return list(order), ports
+
+
+def ring_text(order, ports, claim=''):
+    """One line naming the ring plan and the claim it came from, so the handshake can check every box has the same."""
+    return ' '.join(f'{ip}:{",".join(p)}' for ip, p in zip(order, ports)) + (f' claim={claim}' if claim else '')
 
 
 def rails_of(snap, node_id):
@@ -283,26 +456,177 @@ class Agent:
                     self.sock.sendall(frame({'t': 'pong', 'req': h.get('req', 0)}))
 
 
-def elect(daemon, group, tp, head=None, timeout=600, hold_s=5.0, log=print, sleep=time.sleep, clock=time.monotonic):
+class ClaimLink:
+    """A client link (session: false) that sends this box's claims and holds them while it is open (mentat 0.24.0+:
+    a client with no session lets go of its claims when its last link closes). The local daemon relays it to the
+    head, the one daemon that solves claims. Kept open from the claim through the handshake, so a box that claims
+    later gets the same view; closed after it, so the next boot solves afresh."""
+
+    def __init__(self, daemon, group, client_id=None):
+        self.daemon, self.group = daemon, group
+        self.client_id = client_id or f'gr8-ring-{socket.gethostname()}-{os.getpid()}'
+        self.sock, self.req, self.tag = None, 0, ''
+
+    def claim(self, name, shape):
+        """The daemon's reply to a claim: claim_ok, or err with code and error. OSError when the link fails (its
+        claims go with it)."""
+        try:
+            if self.sock is None:
+                s = socket.create_connection((self.daemon.host, self.daemon.port), timeout=30)
+                try:
+                    s.sendall(frame({'t': 'hello', 'req': 1, 'proto': PROTO, 'client_id': self.client_id,
+                                     'group': self.group, 'session': False, 'kind': 'cli'}))
+                    h = read_frame(s)
+                except BaseException:
+                    s.close()
+                    raise
+                if h.get('t') != 'hello_ok':
+                    s.close()
+                    return h
+                self.sock, self.req = s, 1
+            self.req += 1
+            self.sock.sendall(frame({'t': 'claim', 'req': self.req, 'name': name, 'shape': shape}))
+            return read_frame(self.sock)
+        except (OSError, ValueError):
+            self.close()
+            raise
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            finally:
+                self.sock = None
+
+
+# the codes a claim gets while the cables or the head are still settling
+CLAIM_WAIT = ('unsolvable_claim', 'not_head', 'no_head')
+
+
+def why_no_ring(daemon, group, tp, ids, roots, why):
+    """The probed links between the members, from a claim that asks for any layout (it lists every link, ring or
+    not), worded as ring_why. The claim's link closes at once, so it holds nothing."""
+    link = ClaimLink(daemon, group, f'gr8-ring-why-{socket.gethostname()}-{os.getpid()}')
+    try:
+        h = link.claim(f'{group}-ring-why', {'sets': [{'name': 'ring', 'bundles': int(tp), 'link': 'rdma',
+                                                        'layout': 'any'}], 'driver': 'ignore'})
+    except OSError:
+        h = {}
+    finally:
+        link.close()
+    lan_of = {v: k for k, v in ids.items()}
+    pairs = view_pairs(h.get('view') or {}, lan_of) if h.get('t') == 'claim_ok' else {}
+    pairs = {k: v for k, v in pairs.items() if all(p[0] in roots.get(k[0], {}) for p in v)}
+    return ring_why(pairs, roots, tp, why)
+
+
+def claim_ring(daemon, link, group, tp, ms, snap, head, deadline, hold_s, log, sleep, clock, settle, retry,
+               attempts):
+    """--shape ring: claim the ring on link, and plan it (ring_plan). ms: the members. Every box tries the same names
+    in the same order: a TP=4 view without a relay pair is the same on every box, so each moves to the next name,
+    whose claim solves on probes a round newer. Returns [(lan, node_id, ports)] in rank order, and sets link.tag to
+    the claim it came from."""
+    ids = {ip: n for ip, n, _ in ms}
+    offers = {ip: parse_offers(o) for ip, _, o in ms}
+    roots = {ip: parse_roots(t) for ip, t in member_meta(snap, group, ROOTS_META).items() if ip in ids}
+    shape, attempt, unsolved, said = ring_shape(tp), 0, None, None
+    while True:
+        name = ring_name(group, tp, attempt)
+        try:
+            h = link.claim(name, shape)
+        except OSError as e:
+            h = {'t': 'err', 'code': 'link', 'error': f'the claim link failed: {e}'}
+        if h.get('t') == 'claim_ok':
+            view = h.get('view') or {}
+            if 'links' not in view:
+                raise NoAssignment("mentat's claim view has no links: --shape ring needs mentatd 0.24.0 or later on "
+                                   'every box')
+            try:
+                order, ports = ring_plan(view, ids, roots, tp, offers, head)
+            except Incomplete as e:
+                attempt += 1
+                if attempt >= attempts:
+                    raise NoAssignment(f'{e} ({attempts} claims, {retry:.0f}s apart)')
+                if clock() >= deadline:
+                    raise RuntimeError(f'the ring claim of group {group} timed out: {e}')
+                log(f'{e}; claiming again as {ring_name(group, tp, attempt)} in {retry:.0f}s')
+                sleep(retry)
+                continue
+            except Stale as e:
+                # let go of the old view, and claim again once its last holder has gone
+                link.close()
+                if clock() >= deadline:
+                    raise RuntimeError(f'the ring claim of group {group} timed out: {e}')
+                if said is None or clock() - said >= 60:
+                    said = clock()
+                    log(f'{e}: a box of an earlier boot still holds the claim {name}; waiting for it to let go')
+                sleep(hold_s)
+                continue
+            link.tag = f'{name}@{h.get("head_node_id", "")}:{h.get("generation", "")}'
+            return [(ip, ids[ip], p) for ip, p in zip(order, ports)]
+        code, err = h.get('code') or h.get('t'), h.get('error') or ''
+        if code not in CLAIM_WAIT and code != 'link':
+            raise NoAssignment(f'mentat refused the ring claim {name}: {err} ({code})')
+        now = clock()
+        if code == 'unsolvable_claim':
+            if unsolved is None:
+                unsolved = now
+                log(f'mentat: no ring yet ({err}); waiting up to {settle:.0f}s for more probes')
+            elif now - unsolved >= settle:
+                raise NoAssignment(why_no_ring(daemon, group, tp, ids, roots, err))
+        elif said is None or now - said >= 60:
+            said = now
+            log(f'mentat: the ring claim waits: {err} ({code})')
+        if now >= deadline:
+            raise RuntimeError(f'the ring claim of group {group} timed out: {err} ({code})')
+        sleep(hold_s)
+
+
+def elect(daemon, group, tp, head=None, timeout=600, hold_s=5.0, log=print, sleep=time.sleep, clock=time.monotonic,
+          ring=None, publish=None, ring_settle=RING_SETTLE_S, ring_retry=RING_RETRY_S, ring_attempts=RING_ATTEMPTS):
     """Wait until the group has tp live members, with their offers, the same on two reads hold_s apart; returns
     (ranks, snapshot), where ranks is [(lan, node_id, (rail0, rail1))] in rank order. Raises NoAssignment when the
-    offers fit no assignment, and RuntimeError on a timeout or a bad membership."""
+    offers fit no assignment, and RuntimeError on a timeout or a bad membership.
+
+    ring: for --shape ring, a ClaimLink. Every member's gr8.roots then counts toward the two equal reads, the ranks
+    follow the ring mentat's claim solves (claim_ring), and the third field of each rank is its (relay-out,
+    direct-next, relay-in, direct-prev) addresses. publish: a callable run before each read, which republishes this
+    box's gr8.roots. A ring the cables do not form gets ring_settle seconds of new probes before the NoAssignment."""
     t0, last, said = clock(), None, -60
     while True:
+        if publish:
+            publish()
         try:
             snap = daemon.group_status(group)
             ms = members(snap, group)
+            roots = member_meta(snap, group, ROOTS_META) if ring else {}
         except (OSError, RuntimeError, ValueError) as e:
-            snap, ms = None, []
+            snap, ms, roots = None, [], {}
             err = str(e)
         else:
             err = ''
+        lan_head = None
+        if head:
+            try:
+                lan_head = head_address(head)
+            except OSError as e:     # a pod's name resolves once the pod has an address: wait for it like a member
+                err = str(e)
         if len(ms) > tp:
             raise RuntimeError(f'group {group} has {len(ms)} members for --tp {tp} '
                                f'({", ".join(m[0] for m in ms)}); stop one, or use --group')
-        if len(ms) == tp and all(o is not None for _, _, o in ms):
-            if ms == last:
-                ips = assign_ranks([ip for ip, _, _ in ms], {ip: parse_offers(o) for ip, _, o in ms}, tp, head)
+        waited = clock() - t0
+        if timeout and waited >= timeout:
+            raise RuntimeError(f'waited {waited:.0f}s for {tp} members in group {group}, have {len(ms)} '
+                               f'({", ".join(m[0] for m in ms) or "none"})' + (f': {err}' if err else ''))
+        if len(ms) == tp and (lan_head or not head) and all(o is not None for _, _, o in ms) \
+                and all(v is not None for v in roots.values()):
+            key = (ms, sorted(roots.items()))
+            if key == last and ring:
+                deadline = t0 + timeout if timeout else float('inf')
+                return claim_ring(daemon, ring, group, tp, ms, snap, lan_head, deadline, hold_s, log, sleep, clock,
+                                  ring_settle, ring_retry, ring_attempts), snap
+            if key == last:
+                ips = assign_ranks([ip for ip, _, _ in ms], {ip: parse_offers(o) for ip, _, o in ms}, tp, lan_head)
                 ids = {ip: n for ip, n, _ in ms}
                 ranks = []
                 for ip in ips:
@@ -313,14 +637,10 @@ def elect(daemon, group, tp, head=None, timeout=600, hold_s=5.0, log=print, slee
                                            'en*f*np*=connectx+rdma,en*=lan (or pass --ips and --ips2)')
                     ranks.append((ip, ids[ip], tuple(rails)))
                 return ranks, snap
-            last = ms
+            last = key
             sleep(hold_s)
             continue
         last = None
-        waited = clock() - t0
-        if timeout and waited >= timeout:
-            raise RuntimeError(f'waited {waited:.0f}s for {tp} members in group {group}, have {len(ms)} '
-                               f'({", ".join(m[0] for m in ms) or "none"}){": " + err if err else ""}')
         if waited - said >= 60:
             log(f'waiting for {tp} members in group {group}, have {len(ms)} ({", ".join(m[0] for m in ms) or "none"})'
                 + (f': {err}' if err else ''))

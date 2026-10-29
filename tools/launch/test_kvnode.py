@@ -2,6 +2,7 @@
 """./gr8 kv: options, the node's STATS answer, and the supervisor against a stub node (stubs/kvman-remote) and a fake
 mentat daemon: it starts the node, announces it without GPUs, and stops both.
     python3 -m unittest discover -s tools/launch"""
+import io
 import json
 import os
 import socket
@@ -20,6 +21,7 @@ import options as opt  # noqa: E402
 from test_mentat import FakeDaemon, agent, snapshot  # noqa: E402
 
 STUB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stubs', 'kvman-remote')
+GLM = {'GR8_MODEL': 'glm53'}   # the model: a boot names it (no default)
 
 
 def free_port():
@@ -48,6 +50,19 @@ class OptionTests(unittest.TestCase):
         o = K.parse([f'@{f.name}'], {})
         self.assertEqual((o.get('GROUP'), o.get('KV_GB')), ('gr8-test', '3'))
         os.unlink(f.name)
+
+    def test_lazy_lock_and_its_guard(self):
+        o = K.parse(['--no-config', '--gb', '8'], {})
+        K.validate(o)
+        self.assertNotIn('--lazy-lock', K.node_argv(o, 'kvman-remote', 'r.json'), 'off by default: the node as before')
+        for a in (['--lazy-lock'], ['KV_LAZY_LOCK=1', '--guard-every-s', '0.5']):
+            o = K.parse(['--no-config', '--gb', '8', *a], {})
+            K.validate(o)
+            v = K.node_argv(o, 'kvman-remote', 'r.json')
+            self.assertEqual(v[v.index('--lazy-lock'):], ['--lazy-lock', '--guard-every-s', '0.5' if len(a) > 1 else '1'])
+        for bad in (['KV_LAZY_LOCK=yes'], ['--guard-every-s', '-1'], ['--guard-every-s', 'often']):
+            with self.assertRaises(opt.OptionError):
+                K.validate(K.parse(['--no-config', '--gb', '8', *bad], {}))
 
     def test_up_needs_a_size(self):
         for a in ([], ['--gb', '0'], ['--gb', 'lots']):
@@ -120,10 +135,17 @@ class SupervisorTests(unittest.TestCase):
         home = tempfile.mkdtemp()
         port = free_port()
         cli = [sys.executable, K.HERE]
+        health = [*cli, 'health', '--no-config', '--g6-home', home]
+        r = subprocess.run(health, capture_output=True, text=True, timeout=30)
+        self.assertEqual((r.returncode, r.stdout), (1, 'KV node: not serving, no supervisor runs (last state none)\n'))
+        self.assertFalse(os.path.exists(os.path.join(home, 'out/kv/kv.lock')), 'health takes no lock')
         r = subprocess.run([*cli, 'up', *argv(home, '--mentat', 'none', port=port)], capture_output=True, text=True,
                            timeout=30)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn('serving 0.50 GiB on port', r.stdout)
+        r = subprocess.run(health, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(r.stdout.startswith(f'KV node: serving on port {port}, supervisor pid '), r.stdout)
         r2 = subprocess.run([*cli, 'up', *argv(home, '--mentat', 'none', port=port)], capture_output=True, text=True,
                             timeout=30)
         self.assertEqual(r2.returncode, 1)
@@ -141,6 +163,56 @@ class SupervisorTests(unittest.TestCase):
         r = subprocess.run([*cli, 'status', '--no-config', '--g6-home', home], capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 3)
         self.assertIn('last state: stopped', r.stdout)
+        r = subprocess.run(health, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(r.stdout, 'KV node: not serving, no supervisor runs (last state stopped)\n')
+
+
+class HealthTests(unittest.TestCase):
+    """./gr8 kv health: exit 0 only while this box's KV supervisor reports serving and it and its node still run."""
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.out = os.path.join(self.home, 'out', 'kv')
+        os.makedirs(self.out)
+
+    def process(self, *words):
+        p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', *words])
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        return p.pid
+
+    def write(self, state, pid, node=None):
+        with open(os.path.join(self.out, 'state.json'), 'w') as f:
+            json.dump({'state': state, 'pid': pid, 'time': time.time(), 'port': 7350, 'node_pid': node}, f)
+
+    def health(self, *more):
+        with mock.patch('sys.stdout', new_callable=io.StringIO) as so:
+            rc = K.main(['health', '--no-config', '--g6-home', self.home, *more])
+        return rc, so.getvalue()
+
+    def test_states(self):
+        sup = self.process(os.path.join(self.home, 'kvnode.py'), 'supervise')
+        node = self.process('kvman-remote')
+        self.write('starting', sup)
+        self.assertEqual(self.health(), (1, f'KV node: starting, supervisor pid {sup}\n'))
+        self.write('serving', sup, node)
+        self.assertEqual(self.health(), (0, f'KV node: serving on port 7350, supervisor pid {sup}, kvman-remote pid '
+                                            f'{node}\n'))
+        p = subprocess.Popen([sys.executable, '-c', 'pass'])
+        p.wait()
+        self.write('serving', sup, p.pid)                           # the node died and the supervisor has not seen it
+        rc, line = self.health()
+        self.assertEqual(rc, 1)
+        self.assertIn(f'kvman-remote (pid {p.pid}) is gone', line)
+        self.write('serving', os.getpid(), node)                    # a live pid that is not a KV supervisor
+        self.assertEqual(self.health(), (1, 'KV node: not serving, no supervisor runs (last state serving)\n'))
+        self.write('serving', self.process(os.path.join(self.home, 'launch.py'), 'supervise'), node)   # the model's
+        self.assertEqual(self.health()[0], 1)
+
+    def test_bad_options_exit_1_not_docker_reserved_2(self):
+        rc, line = self.health('--no-such-option', 'x')
+        self.assertEqual(rc, 1)
+        self.assertIn('unknown option --no-such-option', line)
 
 
 if __name__ == '__main__':
@@ -151,11 +223,11 @@ class KvRowsTargetTests(unittest.TestCase):
     """KV_ROWS remote:auto takes KV_STORE's node rule: an RDMA address on one of the box's rails, odd ranks on the
     second rail, so the ranks split over the node's two PCIe roots."""
     def test_ranks_split_over_the_rails(self):
-        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-rows', 'remote:auto,size=8G,local=40'], {})
+        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-rows', 'remote:auto,size=8G,local=40'], GLM)
         opt.validate(o)
         nodes = [('192.0.2.20', 7351, {'gr8.kv.rdma': '10.2.0.20,10.1.0.20'})]
         rows = [opt.kv_rows_with(o, M.kv_target(nodes, ('10.1.0.3', '10.2.0.3'), r)) for r in range(4)]
         self.assertEqual(rows, ['remote:10.1.0.20:7351,size=8G,local=40', 'remote:10.2.0.20:7351,size=8G,local=40'] * 2)
         # a named node stays as written
-        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-rows', 'remote:192.0.2.9:7350,size=8G'], {})
+        o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-rows', 'remote:192.0.2.9:7350,size=8G'], GLM)
         self.assertEqual(opt.kv_rows_with(o, '10.1.0.20:7351'), 'remote:192.0.2.9:7350,size=8G')

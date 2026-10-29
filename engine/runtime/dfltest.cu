@@ -5,9 +5,9 @@
 //   DIR/dflash.r<r>.manifest.json + .pack   drafter packs (engine/loader-rs/src/dflash2.rs)
 //   DIR/head.r<r>.manifest.json + .pack     the target lm_head slice of rank r, G.lm_head.mx.gv (dflash2.py --head)
 //   DIR/case.bin   int32 n (context rows), p0 (first position), bonus (token), lo (first position the sequence wrote);
-//                  float32 feat [n][6 x 6144] (the target residual rows), float32 emb [8][6144] (embedding rows of the
+//                  float32 feat [n][NT x HID] (the target residual rows), float32 emb [8][HID] (embedding rows of the
 //                  bonus and 7 mask tokens, which stand in for the 1.9 GB table)
-//   DIR/out.<sel>.bin  int32 drafts [8] (rank 0; [0] unused), float32 x [8][6144] (rank 0's final-norm rows),
+//   DIR/out.<sel>.bin  int32 drafts [8] (rank 0; [0] unused), float32 x [8][HID] (rank 0's final-norm rows),
 //                      float32 kv [L][2 (k, v)][NKV][n_last][128] (the ring at the last chunk's positions, every rank)
 // The context rows go through context-only steps of 8 rows, the last chunk through the whole step. --fill 1: the context
 // rows but the last chunk's go through fill steps instead (dfl_fill_phase, the served prompt-context path): each row

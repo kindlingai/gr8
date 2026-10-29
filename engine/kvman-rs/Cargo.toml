@@ -5,7 +5,7 @@ edition = "2021"
 description = "gr8 S2 KV page allocator: every rank's pool of KV pages, the page list of each live and retained run"
 
 [lib]
-crate-type = ["staticlib", "rlib"]
+crate-type = ["staticlib", "rlib", "cdylib"]
 
 [profile.release]
 opt-level = 3

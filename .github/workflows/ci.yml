@@ -1,16 +1,18 @@
 # CPU tests, the Rust binaries, the arm64 engine build, the tester zip and the container image, which goes to
 # ghcr.io/kindlingai/gr8 from main and from tags.
 #
-# Every job runs on GitHub's hosted runners, for every pull request, forks included, except a pull request or push that
-# changes only Markdown files. The engine job builds the Dockerfile's binaries on arm64 runners, one per KV format, no
+# Every job runs on GitHub's hosted runners, on every push to a pull request, forks included (with a read-only token),
+# and on main and tags, except a push that changes only Markdown files. The engine job builds the Dockerfile's binaries on arm64 runners, one per KV format, no
 # GPU needed to compile. The image job assembles the runtime image from both of their artifacts, and only it can write
 # packages: it pushes from main and from tags, never from a pull request.
 #
-# On a pull request every job waits for a maintainer: the `ready` job reads the PR's labels and the others run only if
-# it carries queue:ready (/ready, which also queues the PR) or ci:requested (/ci, CI only; pr-ready.yml). Until then the
-# gate fails, so the PR shows red. A push to the PR clears both labels, so a run started by a push skips. Either command
-# re-runs the PR's latest run, which then goes through. Pushes to main, tags and manual runs always build. The gate is a
-# cost control, not a security boundary: a fork PR runs its own copy of this file, with a read-only token.
+# On a pull request the changes job picks the jobs from the files it changes (dorny/paths-filter, below): the
+# front-end and engine halves of the CPU tests, the Rust binaries, and the engine builds with the image around them.
+# Markdown files start nothing, so a PR that changes only them runs just changes, zip-check and Finalize. Pushes to main,
+# tags and manual runs always build everything: the image pushed from main is built from all of the tree.
+#
+# Finalize is the one check a PR needs to land: green when every job passed or skipped and the PR carries queue:ready
+# (a maintainer's /ready, pr-ready.yml). A PR whose CI passes stays red there until /ready.
 name: ci
 
 on:
@@ -19,60 +21,118 @@ on:
     tags: ['v*', 'beta-*']
     paths-ignore: ['**.md']
   pull_request:
-    paths-ignore: ['**.md']
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# A pull request's new push cancels its old run. Each push to main or a tag runs in its own group: one group per ref
+# keeps a single pending run, and a newer one cancels it, so in a burst of merges only the first and last were tested.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}${{ github.event_name == 'push' && format('-{0}', github.sha) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  ready:
-    name: Ready gate
+  changes:
+    name: Detect changes
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: read
     outputs:
-      go: ${{ steps.check.outputs.go }}
+      cpu: ${{ github.event_name != 'pull_request' && '["frontend","engine"]' || steps.cpu.outputs.changes }}
+      rust: ${{ github.event_name != 'pull_request' || steps.build.outputs.rust == 'true' }}
+      engine: ${{ github.event_name != 'pull_request' || steps.build.outputs.engine == 'true' }}
     steps:
-      - id: check
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+      # A pull request's files come from the API, so nothing is checked out. A filter matches a file that matches one
+      # of its paths and is not Markdown. Every filter lists ci.yml, so a change to this file runs everything.
+      - name: The CPU tests' halves (cpu-tests.sh)
+        id: cpu
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         with:
-          script: |
-            // Labels are read live, not from the event: a re-run carries the original event's labels and action. A
-            // run started by a push skips (the push cleared the labels), unless it is a re-run, which the bot starts
-            // after a maintainer's /ci or /ready.
-            let go = true;
-            if (context.eventName === "pull_request") {
-              const pr = context.payload.pull_request;
-              const labels = (await github.rest.issues.listLabelsOnIssue(
-                { ...context.repo, issue_number: pr.number, per_page: 100 })).data.map(l => l.name);
-              const rerun = Number(process.env.GITHUB_RUN_ATTEMPT) > 1;
-              go = (context.payload.action !== "synchronize" || rerun) &&
-                (labels.includes("queue:ready") || labels.includes("ci:requested"));
-            }
-            core.setOutput("go", go ? "true" : "false");
-            // Red, not green: jobs skipped by a condition count as passed.
-            if (!go) core.setFailed("CI has not run: it waits for a maintainer's /ci or /ready on this PR.");
+          predicate-quantifier: some-with-excludes
+          filters: |
+            # the front end, the shim, the launcher and the pseudo engine. Their tests compile the engine's S2 and
+            # steering headers and build g6load, and the launcher imports tools/steering.
+            frontend:
+              - '!**/*.md'
+              - '.github/workflows/ci.yml'
+              - '.github/ci/**'
+              - 'frontend/**'
+              - 'tools/launch/**'
+              - 'tools/steering/**'
+              - 'smoketest/**'
+              - 'gr8'
+              - 'engine/**'
+              - 'scripts/engine_args.sh'
+            # the host tests, the tools' and the bench gate's tests, the compose file, the Helm chart and the engine's
+            # Rust crates; bash -n of the recipes' scripts
+            engine:
+              - '!**/*.md'
+              - '.github/workflows/ci.yml'
+              - '.github/ci/**'
+              - 'engine/**'
+              - 'scripts/**'
+              - 'tools/steering/**'
+              - 'tools/convert/**'
+              - 'tools/health/**'
+              - 'tools/ngram/**'
+              - 'tools/query/**'
+              - 'tools/*.py'
+              - 'bench/**'
+              - 'docker/**'
+              - 'deploy/**'
+              - 'recipes/**/*.sh'
+      - name: The builds
+        id: build
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
+        with:
+          predicate-quantifier: some-with-excludes
+          filters: |
+            # the Dockerfile's rust-dist: the loader, the page allocator and the front end
+            rust:
+              - '!**/*.md'
+              - '.github/workflows/ci.yml'
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'engine/loader-rs/**'
+              - 'engine/kvman-rs/**'
+              - 'frontend/g6front-rs/**'
+            # the engine builds and the image: what the Dockerfile's engine stages copy (the front end's Cargo files
+            # pin the XGrammar sources the engine compiles), and the entrypoint the image's smoke test runs
+            engine:
+              - '!**/*.md'
+              - '.github/workflows/ci.yml'
+              - 'Dockerfile'
+              - '.dockerignore'
+              - 'engine/**'
+              - 'scripts/build.sh'
+              - 'tools/health/gpuprobe.cu'
+              - 'frontend/g6front-rs/Cargo.toml'
+              - 'frontend/g6front-rs/Cargo.lock'
+              - 'frontend/g6front-rs/rust-toolchain.toml'
+              - 'docker/entrypoint.sh'
 
   cpu:
-    name: CPU tests
-    needs: ready
-    if: needs.ready.outputs.go == 'true'
+    name: CPU tests (${{ matrix.part }})
+    needs: changes
+    if: needs.changes.outputs.cpu != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: ${{ fromJSON(needs.changes.outputs.cpu) }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.12"
       - name: Python packages
-        run: python -m pip install numpy xxhash
+        run: python -m pip install numpy xxhash pyyaml
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: |
@@ -82,15 +142,54 @@ jobs:
             engine/loader-rs/target
             engine/kvman-rs/target
             frontend/g6front-rs/target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/rust-toolchain.toml') }}
-          restore-keys: cargo-${{ runner.os }}-
+            frontend/pseudo-engine/target
+          key: cargo-${{ matrix.part }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/rust-toolchain.toml') }}
+          restore-keys: cargo-${{ matrix.part }}-${{ runner.os }}-
+      - name: Tokenizer for the pseudo engine's tests
+        if: matrix.part == 'frontend'
+        run: |
+          .github/ci/fetch-tokenizer.sh "$RUNNER_TEMP/tokenizer"
+          echo "GR8_PSEUDO_TOKENIZER=$RUNNER_TEMP/tokenizer" >> "$GITHUB_ENV"
       - name: Tests
-        run: .github/ci/cpu-tests.sh
+        run: .github/ci/cpu-tests.sh ${{ matrix.part }}
+
+  cpu-macos:
+    name: CPU tests (frontend, macOS)
+    needs: changes
+    if: contains(fromJSON(needs.changes.outputs.cpu), 'frontend')
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Python packages
+        run: python -m pip install numpy xxhash pyyaml
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.rustup/toolchains
+            engine/loader-rs/target
+            frontend/g6front-rs/target
+            frontend/pseudo-engine/target
+          key: cargo-frontend-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/rust-toolchain.toml') }}
+          restore-keys: cargo-frontend-${{ runner.os }}-
+      - name: Tokenizer for the pseudo engine's tests
+        run: |
+          .github/ci/fetch-tokenizer.sh "$RUNNER_TEMP/tokenizer"
+          echo "GR8_PSEUDO_TOKENIZER=$RUNNER_TEMP/tokenizer" >> "$GITHUB_ENV"
+      - name: The loopback addresses the launch end to end test uses
+        run: for a in 127.0.0.{2,3,4} 127.0.{1,2}.{1,2,3,4}; do sudo ifconfig lo0 alias "$a" up; done
+      - name: Tests
+        run: .github/ci/cpu-tests.sh frontend
 
   rust:
     name: Rust binaries (arm64)
-    needs: ready
-    if: needs.ready.outputs.go == 'true'
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
@@ -104,7 +203,9 @@ jobs:
           platforms: linux/arm64
           outputs: type=local,dest=rust-dist
           cache-from: type=gha,scope=rust
-          cache-to: type=gha,scope=rust,mode=max
+          # Only main writes the cache. A pull request reads main's but keeps what it writes to itself, under its
+          # own ref, so each one that wrote added a copy no other run could use.
+          cache-to: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'type=gha,scope=rust,mode=max' || '' }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: rust-bin-arm64
@@ -113,29 +214,52 @@ jobs:
           if-no-files-found: error
 
   engine:
-    # The two KV formats are the whole cost of a build and share no compilation,
-    # so they get a runner each: on one runner they spent most of their lives
-    # competing for its four cores (fp8 ~1,000 s, int4 ~551 s, job 1,187 s).
-    name: Engine build (${{ matrix.kv }} KV, arm64, CUDA 13, sm_121a)
-    needs: ready
-    if: needs.ready.outputs.go == 'true'
+    # The four parts (GLM with the fp8 KV, GLM with the int4 KV, Flash, and the
+    # test binaries) are the whole cost of a build and share no compilation, so
+    # they get a runner each. Two on one runner spend most of their time
+    # competing for its four cores: the fp8 leg, with Flash and the tests, took
+    # 27-42 min while int4 alone took 6-11.
+    name: Engine build (${{ matrix.label }}, arm64, CUDA 13, sm_121a)
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Both legs share every stage before the compile (toolchain, rust,
-          # the three cargo builds, engine-src), and neither leg's own compile
-          # layer survives a change under engine/, which is most pull requests.
-          # So one leg exports the cache for both: a scope each would double
-          # what this repo keeps in a cache that is already at its 10 GB cap.
-          - kv: fp8
+          # Every leg shares the stages before its compile (toolchain, rust,
+          # the three cargo builds, XGrammar, engine-src). The fp8 leg exports
+          # them in scope gr8 and every leg reads it. Each leg also exports its
+          # own scope, so a pull request that leaves engine/ alone reuses every
+          # compile. Within a ref the cache stores a layer once whichever scopes
+          # name it, so a leg's scope adds only its own compile layer.
+          - leg: fp8
+            label: fp8 KV
             target: dist-fp8
+            cache_from: type=gha,scope=gr8
             cache_to: type=gha,scope=gr8,mode=max
-          - kv: int4
+          - leg: int4
+            label: int4 KV
             target: dist-int4
-            cache_to: ''
+            cache_from: |
+              type=gha,scope=gr8
+              type=gha,scope=gr8-int4
+            cache_to: type=gha,scope=gr8-int4,mode=max
+          - leg: flash
+            label: Flash
+            target: dist-flash
+            cache_from: |
+              type=gha,scope=gr8
+              type=gha,scope=gr8-flash
+            cache_to: type=gha,scope=gr8-flash,mode=max
+          - leg: tests
+            label: tests
+            target: dist-tests
+            cache_from: |
+              type=gha,scope=gr8
+              type=gha,scope=gr8-tests
+            cache_to: type=gha,scope=gr8-tests,mode=max
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - name: Free disk space
@@ -147,13 +271,17 @@ jobs:
       - name: Widths
         # A pull request compiles the three widths whose code differs: 1, the
         # PF_F12 fat-CTA width 4, and the largest. main and tags compile all
-        # six, so a width-specific break still fails before a release.
+        # seven, so a width-specific break still fails before a release.
         id: w
         run: |
           widths=''
           [ "${{ github.event_name }}" = pull_request ] && widths='1 4 8'
           echo "widths=$widths" >> "$GITHUB_OUTPUT"
-          echo "${{ matrix.kv }} KV, TP widths ${widths:-1 2 3 4 6 8}" >> "$GITHUB_STEP_SUMMARY"
+          case "${{ matrix.leg }}" in
+            flash) echo "Flash, TP widths 2 3 4" ;;
+            tests) echo "test binaries, dtr_test at TP widths ${widths:-1 2 3 4 5 6 8}" ;;
+            *) echo "${{ matrix.label }}, TP widths ${widths:-1 2 3 4 5 6 8}" ;;
+          esac >> "$GITHUB_STEP_SUMMARY"
       - name: Build the binaries (Dockerfile target ${{ matrix.target }})
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
         with:
@@ -163,14 +291,25 @@ jobs:
           build-args: |
             G6_WIDTHS=${{ steps.w.outputs.widths }}
           outputs: type=local,dest=dist
-          cache-from: type=gha,scope=gr8
-          cache-to: ${{ matrix.cache_to }}
+          cache-from: ${{ matrix.cache_from }}
+          cache-to: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && matrix.cache_to || '' }}   # only main writes, as in the rust job
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: engine-bin-arm64-${{ matrix.kv }}
+          name: engine-bin-arm64-${{ matrix.leg }}
           path: dist/
           retention-days: 7
           if-no-files-found: error
+
+  # make_zip.py's tree checks (every top-level entry shipped or skipped, no symlinks), which the zip job runs only on
+  # main and tags, so a PR that adds a top-level entry fails here instead of after it lands. A few seconds.
+  zip-check:
+    name: Tester zip (tree check)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - run: python3 scripts/make_zip.py --check
 
   zip:
     name: Tester zip
@@ -205,9 +344,15 @@ jobs:
     name: Container image (linux/arm64)
     # The runtime image around the engine job's binaries: the Dockerfile's dist stage is replaced by them (a named build
     # context), so nothing is compiled here. Pushed to ghcr.io from main and from tags, never from a pull request.
+    # A PR that changes only the Dockerfile runs no CPU tests, so a skipped cpu does not stop it.
     needs: [cpu, engine]
+    if: ${{ !cancelled() && needs.engine.result == 'success' && needs.cpu.result != 'failure' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
+    # main's runs overlap, so their pushes take turns, and latest and main move only to main's head (below)
+    concurrency:
+      group: image-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -235,14 +380,22 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Is this commit still main's head?
+        # a run that finishes after a newer commit's run pushes only its sha tag, so latest never moves back
+        id: head
+        run: |
+          head=false
+          if [ "$GITHUB_REF" = refs/heads/main ] && [ "$(git ls-remote origin refs/heads/main | cut -f1)" = "$GITHUB_SHA" ]; then head=true; fi
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "main's head: $head"
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
         with:
           images: ghcr.io/${{ github.repository }}
-          # latest and main follow main; a tag gets its own name; every image also gets sha-<commit>
+          # latest and main follow main's head; a tag gets its own name; every image also gets sha-<commit>
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=branch
+            type=raw,value=latest,enable=${{ steps.head.outputs.head }}
+            type=ref,event=branch,enable=${{ steps.head.outputs.head }}
             type=ref,event=tag
             type=sha
       - name: Build the runtime image
@@ -257,7 +410,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           load: true
           cache-from: type=gha,scope=runtime
-          cache-to: type=gha,scope=runtime,mode=max
+          cache-to: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'type=gha,scope=runtime,mode=max' || '' }}   # only main writes, as in the rust job
       - name: Smoke test (no GPU)
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
@@ -266,7 +419,7 @@ jobs:
           docker image ls "$img"
           docker run --rm --entrypoint bash "$img" -c '
             set -eu
-            for b in bin/g6m4 bin/g6m4-int4 bin/m4sim bin/gpuprobe bin/g6front-rs bin/g6load bin3/g6m4 bin3/g6m4-int4 bin6/g6m4 bin6/g6m4-int4 bin6/m4sim; do
+            for b in bin/g6m4 bin/g6m4-int4 bin/m4sim bin/gpuprobe bin/g6front-rs bin/g6load; do
               if ldd "$b" | grep "not found"; then echo "$b: missing libraries"; exit 1; fi
             done
             python3 -c "import g6s2shim"
@@ -276,8 +429,19 @@ jobs:
             python3 tools/steering/trace_audit.py --help > /dev/null
             bin/g6front-rs --help > /dev/null
             echo smoke OK'
-          docker run --rm "$img" show-config --peers 192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4 \
+          docker run --rm -e GR8_MODEL=glm53 "$img" show-config --peers 192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4 \
             --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --no-check > /dev/null
+          # TP=5: the entrypoint no longer picks a bin/ by width, so every width the launcher accepts gets through it
+          docker run --rm -e GR8_MODEL=glm53 "$img" show-config \
+            --peers 192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4,192.0.2.5 --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --no-check > /dev/null
+          # no model stops in the entrypoint, with exit 2 and the line to add: nothing picks one
+          rc=0; err=$(docker run --rm "$img" 2>&1 >/dev/null) || rc=$?
+          echo "$err"
+          [ "$rc" = 2 ] && echo "$err" | grep -q 'GR8_MODEL=glm53f' || { echo "model check: exit $rc"; exit 1; }
+          # up with a limited memlock stops in the entrypoint, with exit 2 and the setting to change
+          rc=0; err=$(docker run --rm -e GR8_MODEL=glm53 --ulimit memlock=65536:65536 "$img" 2>&1 >/dev/null) || rc=$?
+          echo "$err"
+          [ "$rc" = 2 ] && echo "$err" | grep -q 'memlock=-1' || { echo "memlock check: exit $rc"; exit 1; }
       - name: Push
         id: push
         if: env.PUSH == 'true'
@@ -293,3 +457,63 @@ jobs:
           subject-name: ghcr.io/${{ github.repository }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+
+  finalize:
+    name: Finalize
+    # The check a PR needs to land. It runs after a failure or a cancellation too, so it always reports. It passes when
+    # every job above succeeded or skipped, and a PR's run carries queue:ready (/ready), read live. A job skips by design
+    # (the tester zip on a PR, whatever the changes job left out) or because a job it needs failed, which fails here
+    # too. pr-ready.yml re-runs this job alone after /ready or /unready on a finished run.
+    # The label counts only if it was added after GitHub first saw the head commit. pr-ready.yml removes it on a push,
+    # but a run with only changes and zip-check can reach this step before that removal.
+    if: always()
+    needs: [changes, cpu, cpu-macos, rust, engine, zip-check, zip, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      checks: read
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b  # v7.1.0
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const needs = JSON.parse(process.env.NEEDS);
+            const bad = [];
+            for (const [name, j] of Object.entries(needs)) {
+              if (!["success", "skipped"].includes(j.result)) bad.push(`${name}: ${j.result}`);
+            }
+            // The PR: this run's, or for a run dispatched on a PR's branch the open PR whose head is this commit, whose
+            // checks this run's count for. A push to main or a tag has none.
+            let pr = context.eventName === "pull_request" ? context.payload.pull_request.number : null;
+            // a pull_request run's context.sha is the merge commit
+            const head = context.eventName === "pull_request" ? context.payload.pull_request.head.sha : context.sha;
+            if (context.eventName === "workflow_dispatch") {
+              const prs = (await github.rest.repos.listPullRequestsAssociatedWithCommit(
+                { ...context.repo, commit_sha: context.sha })).data;
+              const open = prs.find(p => p.state === "open" && p.head.sha === context.sha);
+              if (open) pr = open.number;
+            }
+            if (pr) {
+              const labels = (await github.rest.issues.listLabelsOnIssue(
+                { ...context.repo, issue_number: pr, per_page: 100 })).data.map(l => l.name);
+              if (!labels.includes("queue:ready")) bad.push(`#${pr} is not marked ready (/ready)`);
+              else {
+                // when the label was last added, and when GitHub first saw the head (its earliest check suite)
+                const events = await github.paginate(github.rest.issues.listEvents,
+                  { ...context.repo, issue_number: pr, per_page: 100 });
+                const added = events.filter(e => e.event === "labeled" && e.label && e.label.name === "queue:ready")
+                  .map(e => Date.parse(e.created_at));
+                const suites = (await github.rest.checks.listSuitesForRef(
+                  { ...context.repo, ref: head, per_page: 100 })).data.check_suites.map(s => Date.parse(s.created_at));
+                if (!added.length || !suites.length || Math.max(...added) <= Math.min(...suites))
+                  bad.push(`#${pr} was marked ready before ${head.slice(0, 7)} was pushed (/ready again)`);
+              }
+            }
+            const rows = Object.entries(needs).map(([name, j]) => [name, j.result]);
+            await core.summary.addTable([[{ data: "job", header: true }, { data: "result", header: true }], ...rows])
+              .addRaw(bad.length ? `Not ready to land: ${bad.join("; ")}` : "Ready to land").write();
+            if (bad.length) core.setFailed(`Not ready to land: ${bad.join("; ")}`);

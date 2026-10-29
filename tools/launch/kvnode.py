@@ -7,6 +7,8 @@
     down                          stop this box's KV node
     status [all]                  this box's node: its memory, leases and what is free; `all`: every KV node the
                                   mentat group announces
+    health                        this box's node, in one line: exit 0 when it serves, else 1. A readiness check for
+                                  a compose healthcheck or a Kubernetes exec probe, as ./gr8 <model> health
     logs [-f]                     the node's log
 
 OPTIONS are --key value (or KEY=value lines in a config file, or KEY in the environment), as for ./gr8 glm53: KEYS
@@ -39,8 +41,14 @@ KEYS = {
     'KV_GB': (None, 'GiB of this box\'s memory to lock and serve'),
     'KV_PORT': ('7350', 'the node\'s TCP port (RDMA connections are set up through it too)'),
     'KV_BIND': ('0.0.0.0', 'the address the node listens on'),
-    'KV_MIN_FREE_GB': ('10', 'refuse to start when locking KV_GB would leave less MemAvailable than this'),
+    'KV_MIN_FREE_GB': ('10', 'refuse to start when locking KV_GB would leave less MemAvailable than this; with '
+                             'KV_LAZY_LOCK=1, refuse each lease that would'),
     'KV_RDMA': ('1', '0 = serve over TCP only'),
+    'KV_LAZY_LOCK': ('0', '1 = lock each lease\'s memory when it is granted and give it back when the lease ends, and '
+                          'refuse leases while the box is under KV_MIN_FREE_GB (a node on a box that also serves)'),
+    'KV_LEDGER': (None, 'with KV_LAZY_LOCK=1: the host ledger file of a box shared with a Flash rank (kvman-ledger): '
+                        'the node never holds more than it credits to the node'),
+    'KV_GUARD_EVERY_S': ('1', 'with KV_LAZY_LOCK=1: how often the node reads MemAvailable (0 = at each lease only)'),
     'KV_BIN': (None, 'the kvman-remote binary (default bin/kvman-remote, else the crate\'s target/release)'),
     'MENTAT': ('localhost', 'the local mentat daemon to announce through; none = do not announce'),
     'GROUP': ('gr8-glm53', 'mentat group the node joins'),
@@ -48,7 +56,7 @@ KEYS = {
     'G6_HOME': (REPO, 'working directory: the node writes out/kv/'),
 }
 FLAGS = {'G6_HOME': '--g6-home', 'MENTAT': '--mentat', 'GROUP': '--group', 'NODE_IP': '--node-ip'}
-SWITCHES = {'--no-config', '--foreground', '--no-rdma'}
+SWITCHES = {'--no-config', '--foreground', '--no-rdma', '--lazy-lock'}
 
 
 def flag_of(key):
@@ -98,6 +106,8 @@ def parse(argv, environ=None):
         i += 1
     if '--no-rdma' in switches:
         cmd['KV_RDMA'] = '0'
+    if '--lazy-lock' in switches:
+        cmd['KV_LAZY_LOCK'] = '1'
     path = at or (None if '--no-config' in switches else opt.default_file(environ))
     filev = opt.parse_file(path) if path and os.path.isfile(path) else {}
     if at and not os.path.isfile(at):
@@ -121,11 +131,29 @@ def validate(o):
         gb = float('nan')
     if not gb > 0:
         raise opt.OptionError('name the memory to lock: ./gr8 kv up --gb N (GiB)')
-    for k in ('KV_PORT', 'KV_MIN_FREE_GB'):
+    for k in ('KV_PORT', 'KV_MIN_FREE_GB', 'KV_GUARD_EVERY_S'):
         try:
             float(o.get(k))
         except (TypeError, ValueError):
             raise opt.OptionError(f'{k}={o.get(k)!r}: want a number')
+    if o.get('KV_LAZY_LOCK') not in ('0', '1'):
+        raise opt.OptionError(f'KV_LAZY_LOCK={o.get("KV_LAZY_LOCK")!r}: want 0 or 1')
+    if o.get('KV_LEDGER') and o.get('KV_LAZY_LOCK') != '1':
+        raise opt.OptionError('KV_LEDGER needs KV_LAZY_LOCK=1 (--lazy-lock)')
+    if not 0 <= float(o.get('KV_GUARD_EVERY_S')) <= 3600:
+        raise opt.OptionError(f'KV_GUARD_EVERY_S={o.get("KV_GUARD_EVERY_S")!r}: want 0 to 3600 seconds')
+
+
+def node_argv(o, b, ready_path):
+    argv = [b, '--gb', o.get('KV_GB'), '--port', o.get('KV_PORT'), '--bind', o.get('KV_BIND'),
+            '--min-free-gb', o.get('KV_MIN_FREE_GB'), '--ready', ready_path]
+    if o.get('KV_RDMA') == '0':
+        argv.append('--no-rdma')
+    if o.get('KV_LAZY_LOCK') == '1':
+        argv += ['--lazy-lock', '--guard-every-s', o.get('KV_GUARD_EVERY_S')]
+        if o.get('KV_LEDGER'):
+            argv += ['--ledger', o.get('KV_LEDGER')]
+    return argv
 
 
 def out_dir(o):
@@ -252,10 +280,7 @@ class Supervisor:
             os.unlink(ready_path)
         except FileNotFoundError:
             pass
-        argv = [b, '--gb', o.get('KV_GB'), '--port', o.get('KV_PORT'), '--bind', o.get('KV_BIND'),
-                '--min-free-gb', o.get('KV_MIN_FREE_GB'), '--ready', ready_path]
-        if o.get('KV_RDMA') == '0':
-            argv.append('--no-rdma')
+        argv = node_argv(o, b, ready_path)
         log(f'starting {" ".join(argv)}')
         self.node = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=self.node_out, stderr=self.node_out,
                                      start_new_session=True)
@@ -428,6 +453,34 @@ def cmd_status(argv):
     return 0
 
 
+def health(out, proc='/proc'):
+    """(ok, line): whether this box's KV node serves, with ./gr8 <model> health's rules. Serving means out/kv/state.json
+    says `serving`, the KV supervisor that wrote it still runs, and so does its kvman-remote. It takes no lock (not
+    running()): a node that starts beside the probe must not think another one runs."""
+    import launch    # here, not at the top: launch imports supervisor, which imports this module
+    st = read_json(os.path.join(out, 'state.json'))
+    state, pid, node = st.get('state') or 'none', st.get('pid'), st.get('node_pid')
+    if not launch.is_supervisor(pid, proc, script='kvnode.py'):
+        return False, f'KV node: not serving, no supervisor runs (last state {state})'
+    if state != 'serving':
+        return False, f'KV node: {state}, supervisor pid {pid}'
+    if not launch.sv.alive(node):
+        return False, f'KV node: not serving, kvman-remote (pid {node}) is gone, supervisor pid {pid}'
+    return True, f'KV node: serving on port {st.get("port")}, supervisor pid {pid}, kvman-remote pid {node}'
+
+
+def cmd_health(argv):
+    """Exit 0 or 1 only: docker reserves a healthcheck's exit 2, which bad options would otherwise give."""
+    try:
+        o = parse(argv)
+    except opt.OptionError as e:
+        print(f'gr8 kv: {e}')    # stdout, not stderr: docker keeps a healthcheck's stdout in `docker inspect`
+        return 1
+    ok, line = health(out_dir(o))
+    print(line)
+    return 0 if ok else 1
+
+
 def status_all(o):
     if o.get('MENTAT') == 'none':
         print('status all asks mentat; --mentat none', file=sys.stderr)
@@ -480,7 +533,7 @@ def main(argv):
     cmd, rest = argv[0], argv[1:]
     if cmd == 'supervise':
         return supervise(parsed(rest, check=True))
-    f = {'up': cmd_up, 'down': cmd_down, 'status': cmd_status, 'logs': cmd_logs}.get(cmd)
+    f = {'up': cmd_up, 'down': cmd_down, 'status': cmd_status, 'health': cmd_health, 'logs': cmd_logs}.get(cmd)
     if not f:
         print(f'gr8 kv: unknown command {cmd}\n{__doc__}', file=sys.stderr)
         return 2

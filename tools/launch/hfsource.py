@@ -8,9 +8,12 @@ Each box fetches only its part of the exlr8 release into --model-cache, and noth
         tokenizer/                             config, generation config, tokenizer and chat template
         experts/                               this rank's expert halves at their file offsets (sparse files), and
                                                every layer's index file (fetch_ranks.py)
-        index-slices/tp<N>/k<K>/rank<r>.safetensors
+        index-slices/tp<N>/k<K>/rank<r>.safetensors   this rank's, or under --layout every rank's
         dense/                                 the dense and vocab files
-        complete/tp<N>.rank<r>.<variant>.json  written last, once everything above is verified
+        complete/tp<N>.rank<r>.<variant>[.layout-<sha256>].json   written last, once everything above is verified
+
+Under --layout (a layout file, bin/g6layout) a rank fetches the halves the layout gives it. The expert files are
+shared by every TP and layout, so the halves an earlier one fetched are not fetched again.
 
 Every whole file is checked before it is renamed into place: against the release's hashes/<path>.sha256 (for an
 experts/ file, hashes/<name>.sha256), else the tree's LFS sha256 or git blob id. Every expert half is checked against its xxhash64 in the index file. A
@@ -211,9 +214,11 @@ class Repo:
 class Release:
     """The exlr8 release at one commit, in this box's cache."""
 
-    def __init__(self, cache, repo, rev, refresh=False, log=print):
+    def __init__(self, cache, repo, rev, refresh=False, log=print, layout=None):
         self.repo = Repo(cache, repo, rev, refresh, log)
         self.log = log
+        self.layout = layout
+        self.layout_sha256 = modelset.sha256_file(layout) if layout else None
         self.dir = os.path.join(self.repo.root, self.repo.commit)
         self.v2 = os.path.join(self.dir, 'experts')
         self.slices = os.path.join(self.dir, 'index-slices')
@@ -224,6 +229,10 @@ class Release:
     @property
     def commit(self):
         return self.repo.commit
+
+    @property
+    def label(self):
+        return self.repo.repo
 
     def __str__(self):
         return f'{self.repo.repo}@{self.commit[:12]}'
@@ -259,10 +268,11 @@ class Release:
         os.replace(done + '.tmp', done)
 
     def whole_files(self, tp, rank):
-        """The release files this rank loads whole: its index slices, and the dense and vocab files. The vision tower
-        (dense/vision-*) stays on the hub: the engine serves text."""
+        """The release files this rank loads whole: its index slices (a layout's halves are listed in every rank's), and
+        the dense and vocab files. The vision tower (dense/vision-*) stays on the hub: the engine serves text."""
         t = self.repo.tree()
-        slices = sorted(p for p in t if re.fullmatch(rf'index-slices/tp{tp}/k\d/rank{rank}\.safetensors', p))
+        r = r'\d+' if self.layout else rank
+        slices = sorted(p for p in t if re.fullmatch(rf'index-slices/tp{tp}/k\d/rank{r}\.safetensors', p))
         if not slices:
             raise modelset.ModelError(f'{self} has no index slices for TP={tp}')
         # TODO: every rank fetches every dense and vocab file (about 11 GB). Once the dense loader says which
@@ -314,7 +324,8 @@ class Release:
             self.log(f'{self}: {n} files unchanged since an earlier commit, linked from the cache')
 
     def marker(self, tp, rank, variant):
-        return os.path.join(self.dir, 'complete', f'tp{tp}.rank{rank}.{variant.name}-{variant.sha256[:12]}.json')
+        lay = f'.layout-{self.layout_sha256[:12]}' if self.layout else ''
+        return os.path.join(self.dir, 'complete', f'tp{tp}.rank{rank}.{variant.name}-{variant.sha256[:12]}{lay}.json')
 
     def check(self, tp, rank, variant):
         """Problems with this rank's part for this variant, cheapest checks only. [] = ready."""
@@ -322,7 +333,8 @@ class Release:
             with open(self.marker(tp, rank, variant)) as f:
                 c = json.load(f)
         except (OSError, ValueError):
-            return [f'{self} rank {rank} of TP={tp}, variant {variant.name}, is not in the cache yet']
+            lay = f', layout {self.layout_sha256[:12]}' if self.layout else ''
+            return [f'{self} rank {rank} of TP={tp}, variant {variant.name}{lay}, is not in the cache yet']
         bad = [f'{p}: missing or not {n} bytes' for p, n in sorted(c['files'].items())
                if not os.path.isfile(os.path.join(self.dir, p)) or os.path.getsize(os.path.join(self.dir, p)) != n]
         return bad
@@ -344,7 +356,7 @@ class Release:
         os.makedirs(self.v2, exist_ok=True)
         try:
             experts_left = fr.fetch_layers(self.repo.hub, self.v2, tp, {rank}, self.slices, man=variant.path,
-                                           layers=layers, plan_only=True)
+                                           layers=layers, plan_only=True, layout=self.layout)
         except RuntimeError as e:
             raise modelset.ModelError(f'{self}: {e}')
         rest = [p for p in whole if p not in slices]
@@ -352,13 +364,14 @@ class Release:
                                  if os.path.exists(os.path.join(self.dir, p) + '.part') else 0)
                          for p in rest if not os.path.isfile(os.path.join(self.dir, p)))
         meter = Meter(experts_left + whole_left, self.log, f'fetching rank {rank} of {self}')
-        self.log(f'{self}: rank {rank} of TP={tp}, variant {variant.name}: {meter.total / 1e9:.1f} GB to fetch')
+        lay = f', layout {self.layout_sha256[:12]}' if self.layout else ''
+        self.log(f'{self}: rank {rank} of TP={tp}, variant {variant.name}{lay}: {meter.total / 1e9:.1f} GB to fetch')
         with ThreadPoolExecutor(4) as ex:
             for f in [ex.submit(self.repo.fetch, p, os.path.join(self.dir, p), meter) for p in rest]:
                 f.result()
         try:
             fr.fetch_layers(self.repo.hub, self.v2, tp, {rank}, self.slices, man=variant.path, layers=layers,
-                            workers=workers, verify=True, on_bytes=meter.add, log=self.log)
+                            workers=workers, verify=True, on_bytes=meter.add, log=self.log, layout=self.layout)
         except RuntimeError as e:
             raise modelset.ModelError(f'{self}: {e}')
         meter.line()
@@ -369,7 +382,8 @@ class Release:
         os.makedirs(os.path.dirname(m), exist_ok=True)
         with open(m + '.tmp', 'w') as f:
             json.dump({'release': f'{self.repo.repo}@{self.commit}', 'tp': tp, 'rank': rank, 'variant': variant.name,
-                       'variant_sha256': variant.sha256, 'files': files}, f, indent=1, sort_keys=True)
+                       'variant_sha256': variant.sha256, 'files': files,
+                       **({'layout_sha256': self.layout_sha256} if self.layout else {})}, f, indent=1, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
         os.replace(m + '.tmp', m)
@@ -399,6 +413,10 @@ class Drafter:
     def id(self):
         return f'{self.repo.repo}@{self.commit}'
 
+    @property
+    def label(self):
+        return self.repo.repo
+
     def __str__(self):
         return f'{self.repo.repo}@{self.commit[:12]}'
 
@@ -422,30 +440,37 @@ class Drafter:
             if n not in t:
                 raise modelset.ModelError(f'the drafter {self} has no {n}')
             self.repo.fetch(n, os.path.join(self.dir, n), meter)
-        tmp = os.path.join(self.dir, f'tmp.rank{rank}.{os.getpid()}')
+        convert_drafter(convert, self.dir, self.out, self.tp, rank, self.id, self.log, str(self), scratch=self.dir)
+
+
+def convert_drafter(convert, src, out, tp, rank, ident, log, label, scratch):
+    """Convert one rank of the drafter in src (config.json, model.safetensors) into out, through a temporary directory
+    in scratch (on out's filesystem), check the pack's size, then write rank<r>.COMPLETE. src is only read (it may be
+    read-only), and out is made only once the conversion succeeded."""
+    tmp = os.path.join(scratch, f'tmp.rank{rank}.{os.getpid()}')
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    log(f'converting the drafter {label} for rank {rank} of TP={tp}')
+    r = subprocess.run(convert + ['--src', src, '--out', tmp, '--nr', str(tp), '--ranks', str(rank)], cwd=REPO,
+                       capture_output=True, text=True)
+    names = [f'dflash.r{rank}.manifest.json', f'dflash.r{rank}.pack']
+    if r.returncode or not all(os.path.isfile(os.path.join(tmp, n)) for n in names):
         shutil.rmtree(tmp, ignore_errors=True)
-        os.makedirs(tmp)
-        self.log(f'converting the drafter {self} for rank {rank} of TP={self.tp}')
-        r = subprocess.run(convert + ['--src', self.dir, '--out', tmp, '--nr', str(self.tp), '--ranks', str(rank)], cwd=REPO,
-                           capture_output=True, text=True)
-        names = [f'dflash.r{rank}.manifest.json', f'dflash.r{rank}.pack']
-        if r.returncode or not all(os.path.isfile(os.path.join(tmp, n)) for n in names):
-            shutil.rmtree(tmp, ignore_errors=True)
-            raise modelset.ModelError(f'converting the drafter {self} for rank {rank} failed: '
-                                      + (r.stderr or r.stdout).strip()[-500:])
-        with open(os.path.join(tmp, names[0])) as f:
-            want = int(json.load(f)['pack_bytes'])
-        if os.path.getsize(os.path.join(tmp, names[1])) != want:
-            shutil.rmtree(tmp, ignore_errors=True)
-            raise modelset.ModelError(f'the converted drafter pack for rank {rank} is not the {want} bytes its manifest says')
-        os.makedirs(self.out, exist_ok=True)
-        files = {}
-        for n in names:
-            files[n] = os.path.getsize(os.path.join(tmp, n))
-            os.replace(os.path.join(tmp, n), os.path.join(self.out, n))
+        raise modelset.ModelError(f'converting the drafter {label} for rank {rank} failed: '
+                                  + (r.stderr or r.stdout).strip()[-500:])
+    with open(os.path.join(tmp, names[0])) as f:
+        want = int(json.load(f)['pack_bytes'])
+    if os.path.getsize(os.path.join(tmp, names[1])) != want:
         shutil.rmtree(tmp, ignore_errors=True)
-        m = os.path.join(self.out, f'rank{rank}.COMPLETE')
-        with open(m + '.tmp', 'w') as f:
-            json.dump({'drafter': self.id, 'rank': rank, 'files': files}, f, indent=1, sort_keys=True)
-        os.replace(m + '.tmp', m)
-        self.log(f'the drafter {self} is converted for rank {rank} in {self.out}')
+        raise modelset.ModelError(f'the converted drafter pack for rank {rank} is not the {want} bytes its manifest says')
+    os.makedirs(out, exist_ok=True)
+    files = {}
+    for n in names:
+        files[n] = os.path.getsize(os.path.join(tmp, n))
+        os.replace(os.path.join(tmp, n), os.path.join(out, n))
+    shutil.rmtree(tmp, ignore_errors=True)
+    m = os.path.join(out, f'rank{rank}.COMPLETE')
+    with open(m + '.tmp', 'w') as f:
+        json.dump({'drafter': ident, 'rank': rank, 'files': files}, f, indent=1, sort_keys=True)
+    os.replace(m + '.tmp', m)
+    log(f'the drafter {label} is converted for rank {rank} in {out}')
