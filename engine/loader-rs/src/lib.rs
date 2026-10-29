@@ -16,6 +16,7 @@
 //! no pack at all (src/release.rs): the image's other tensors are copied from the dense files or computed from them
 //! at load (Op::Gen). g6l_plan_load then loads either like a pack.
 
+pub mod codebook;
 pub mod dflash2;
 pub mod exlr8;
 pub mod fetch;

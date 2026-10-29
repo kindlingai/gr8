@@ -3,6 +3,8 @@
 //! (tools/convert/v2slices.py) and the raw width files, at the widths a manifest picks. The tensors, their order and
 //! their bytes are those tools/convert/v2pack.py writes (and tools/convert/v2.py convert_experts_v2 for one rank).
 
+use crate::codebook::{self, Codebook, TrellisRanges};
+use crate::exlr8::StFile;
 use crate::json::{self, Json};
 use crate::plan::{Gen, Op, Plan, Seg};
 use std::collections::HashMap;
@@ -11,7 +13,6 @@ use std::os::unix::fs::FileExt;
 
 const ALIGN: u64 = 4096;
 pub(crate) const NH: usize = 16;
-const XF_EXLR8: &str = "exlr8-e4m3";
 
 /// A manifest entry (tools/convert/pack.py): dtype is the manifest label (u8, f16, i64, ...).
 #[derive(Clone, Debug, PartialEq)]
@@ -202,8 +203,8 @@ impl Builder {
         }
         self.segs.push(Seg { pack_off, nbytes, op, file_off, file });
     }
-    fn mem(&mut self, name: String, dtype: &str, shape: Vec<i64>, bytes: Vec<u8>) {
-        let off = self.begin(name, dtype, shape, bytes.len() as u64, Some(XF_EXLR8));
+    fn mem(&mut self, name: String, dtype: &str, shape: Vec<i64>, bytes: Vec<u8>, xf: &str) {
+        let off = self.begin(name, dtype, shape, bytes.len() as u64, Some(xf));
         if !bytes.is_empty() {
             self.segs.push(Seg { pack_off: off, nbytes: bytes.len() as u64, op: Op::Mem, file_off: 0, file: self.mems.len() });
             self.mems.push(bytes);
@@ -332,7 +333,34 @@ fn base_tensor(t: &Json) -> Result<Tensor, String> {
     })
 }
 
+/// The codebook of layer l's width files at the widths `ks` (None when one of them is not there), and each file's
+/// trellis tensor ranges by width. Every width file of a layer must use the same codebook: the kernels take it per
+/// layer (bind::LayerTensors::cb).
+fn layer_codebook(l: usize, ks: &[u8], wfile: &dyn Fn(usize, u8) -> String)
+                  -> Result<(Option<Codebook>, HashMap<u8, TrellisRanges>), String> {
+    let mut cb: Option<(Codebook, u8)> = None;
+    let mut ranges = HashMap::new();
+    let mut missing = false;
+    for &k in ks {
+        let path = wfile(l, k);
+        if !std::path::Path::new(&path).exists() {
+            missing = true;
+            continue;
+        }
+        let f = StFile::open(&path).map_err(|e| format!("layer {l}: the K{k} width file's header: {e}"))?;
+        let (c, r) = codebook::width_file_codebook(&f).map_err(|e| format!("layer {l}: {e}"))?;
+        if let Some((c0, k0)) = cb.filter(|&(c0, _)| c0 != c) {
+            return Err(format!("layer {l}: the K{k0} width file is in codebook {} and the K{k} one in {}; gr8 takes one \
+                                codebook per layer", c0.name(), c.name()));
+        }
+        cb = Some((c, k));
+        ranges.insert(k, r);
+    }
+    Ok((if missing { None } else { Some(cb.map_or(Codebook::Mcg, |c| c.0)) }, ranges))
+}
+
 /// Layer l's v2 expert tensors for the halves `own` gives for each expert (256: the shared expert), in ascending order.
+/// Their expert_format names the layer's codebook (src/codebook.rs), read from its width files' headers.
 pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, wfile: &dyn Fn(usize, u8) -> String,
             own: &dyn Fn(usize) -> Result<Vec<usize>, String>) -> Result<(), String> {
     let p = format!("L{l:03}");
@@ -370,6 +398,23 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
     };
     let own: Vec<Vec<usize>> = experts.iter().map(|&e| own(e)).collect::<Result<_, _>>()?;
     let nblk: usize = own.iter().map(Vec::len).sum();
+    // the widths this rank reads, their files' codebook, and the trellis tensor each half must lie in
+    let mut ks: Vec<u8> = experts.iter().zip(&own)
+        .flat_map(|(&e, hs)| { let (g, u, d) = of(e); hs.iter().flat_map(move |&h| [g[h], u[h], d]).collect::<Vec<_>>() })
+        .collect();
+    ks.sort_unstable();
+    ks.dedup();
+    let (cb, tranges) = layer_codebook(l, &ks, wfile)?;
+    let xf = cb.map_or(codebook::UNCHECKED, Codebook::expert_format);
+    let inside = |k: u8, e: usize, proj: usize, off: u64| -> Result<(), String> {
+        match tranges.get(&k) {
+            None => return Ok(()),         // a missing file: the layer is UNCHECKED, and its bytes cannot load
+            Some(r) if r.holds(e == shared, proj, off, hidden as u64 * 16 * k as u64) => return Ok(()),
+            Some(_) => {}
+        }
+        Err(format!("layer {l}: expert {e} {} half at offset {off} of the K{k} width file is not inside its trellis \
+                     tensor (the index slices and the width file disagree)", ["gate", "up", "down"][proj]))
+    };
     let bs = w.sdown > 0;
     // the slice that holds unit (e, h) at width k
     let get = |k: u8, e: usize, h: usize| ls.get(&(k, (16 * e + h + l) % slices.nr)).ok_or(format!("layer {l}: no index slice at K{k}"));
@@ -398,7 +443,7 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
     };
     // pass 1: fc1 (gate, up halves), v1, v2[0:2]
     let fc1_bytes: u64 = experts.iter().zip(&own).map(|(&e, hs)| hs.iter().map(|&h| hb(of(e).0[h]) + hb(of(e).1[h])).sum::<u64>()).sum();
-    let fc1 = b.begin(format!("{p}.tr3.fc1"), "u8", vec![fc1_bytes as i64], fc1_bytes, Some(XF_EXLR8));
+    let fc1 = b.begin(format!("{p}.tr3.fc1"), "u8", vec![fc1_bytes as i64], fc1_bytes, Some(xf));
     let (mut off, mut row) = (0u64, 0usize);
     for (i, &e) in experts.iter().enumerate() {
         let (gw, uw, dk) = of(e);
@@ -409,6 +454,7 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
             for (proj, k) in [(0usize, gw[h]), (1, uw[h])] {
                 let s = get(k, e, h)?;
                 let j = row_of(s, e, h)?;
+                inside(k, e, proj, s.offset[j * 3 + proj] as u64)?;
                 let f = b.file(wfile(l, k));
                 b.seg(fc1 + off, hb(k), Op::Copy, f, s.offset[j * 3 + proj] as u64);
                 off += hb(k);
@@ -420,7 +466,7 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
     }
     // pass 2: fc2 (down halves, item128 -> gr8 order), v2[2], v3
     let fc2_bytes: u64 = experts.iter().zip(&own).map(|(&e, hs)| hs.len() as u64 * hb(of(e).2)).sum();
-    let fc2 = b.begin(format!("{p}.tr3.fc2"), "u8", vec![fc2_bytes as i64], fc2_bytes, Some(XF_EXLR8));
+    let fc2 = b.begin(format!("{p}.tr3.fc2"), "u8", vec![fc2_bytes as i64], fc2_bytes, Some(xf));
     let (mut off, mut row) = (0u64, 0usize);
     for (i, &e) in experts.iter().enumerate() {
         let dk = of(e).2;
@@ -428,6 +474,7 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
         for &h in &own[i] {
             let s = get(dk, e, h)?;
             let j = row_of(s, e, h)?;
+            inside(dk, e, 2, s.offset[j * 3 + 2] as u64)?;
             let f = b.file(wfile(l, dk));
             b.seg(fc2 + off, hb(dk), Op::Item128 { hidden }, f, s.offset[j * 3 + 2] as u64);
             off += hb(dk);
@@ -440,18 +487,175 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
     if bs {
         let s = ls.values().next().ok_or(format!("layer {l}: no index slice"))?;
         let sg: Vec<u8> = s.signs.iter().flat_map(|&x| if (x as i8) < 0 { [0x00, 0xBC] } else { [0x00, 0x3C] }).collect();
-        b.mem(format!("{p}.tr3.sg"), "f16", vec![2, hidden as i64], sg);
-        b.mem(format!("{p}.tr3.v1b"), "f16", vec![n, 2, blocks as i64], v1);
+        b.mem(format!("{p}.tr3.sg"), "f16", vec![2, hidden as i64], sg, xf);
+        b.mem(format!("{p}.tr3.v1b"), "f16", vec![n, 2, blocks as i64], v1, xf);
     } else {
-        b.mem(format!("{p}.tr3.v1"), "f16", vec![n, 2, hidden as i64], v1);
+        b.mem(format!("{p}.tr3.v1"), "f16", vec![n, 2, hidden as i64], v1, xf);
     }
-    b.mem(format!("{p}.tr3.v2"), "f16", vec![n, 3, 128], v2);
+    b.mem(format!("{p}.tr3.v2"), "f16", vec![n, 3, 128], v2, xf);
     if bs {
-        b.mem(format!("{p}.tr3.v3b"), "f16", vec![n, blocks as i64], v3);
+        b.mem(format!("{p}.tr3.v3b"), "f16", vec![n, blocks as i64], v3, xf);
     } else {
-        b.mem(format!("{p}.tr3.v3"), "f16", vec![n, hidden as i64], v3);
+        b.mem(format!("{p}.tr3.v3"), "f16", vec![n, hidden as i64], v3, xf);
     }
-    b.mem(format!("{p}.tr3.table"), "i64", vec![ne as i64, 6], table.iter().flatten().flat_map(|v| v.to_le_bytes()).collect());
-    b.mem(format!("{p}.tr3.kmix"), "i64", vec![ne as i64], kmix.iter().flat_map(|v| v.to_le_bytes()).collect());
+    b.mem(format!("{p}.tr3.table"), "i64", vec![ne as i64, 6], table.iter().flatten().flat_map(|v| v.to_le_bytes()).collect(), xf);
+    b.mem(format!("{p}.tr3.kmix"), "i64", vec![ne as i64], kmix.iter().flat_map(|v| v.to_le_bytes()).collect(), xf);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const D: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/v2fetch");
+    const NE: u64 = 2;     // the fixture's routed experts (tests/make_v2fetch_fixture.py)
+
+    /// A width file header of the fixture's layout (gate, up, down tensors of NE x 16 halves from file offset 65536):
+    /// trellis tensors named with `suffix`, metadata codebook `meta`, the tensors `short` bytes shorter than the halves.
+    fn width_file(dir: &std::path::Path, l: usize, k: u8, suffix: &str, meta: Option<&str>, short: u64) {
+        let hb = 98304 * k as u64;
+        let n = NE * 16 * hb;
+        let mut h = String::from("{");
+        let mut m = String::from("\"format\":\"exlr8-v2\",\"contents\":\"trellis\"");
+        if let Some(c) = meta {
+            m += &format!(",\"codebook\":\"{c}\"");
+        }
+        h += &format!("\"__metadata__\":{{{m}}}");
+        for (p, proj) in ["gate", "up", "down"].iter().enumerate() {
+            let a = p as u64 * n;
+            h += &format!(",\"trellis.{proj}{suffix}\":{{\"dtype\":\"U8\",\"shape\":[{}],\"data_offsets\":[{a},{}]}}", n - short, a + n - short);
+        }
+        h += "}";
+        let mut b = h.into_bytes();
+        b.resize(65536 - 8, b' ');
+        let mut out = (b.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(&b);
+        let path = dir.join(format!("exlr8-layer-{l:03}.k{k}.safetensors"));
+        std::fs::write(&path, &out).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(65536 + 3 * n).unwrap();
+    }
+
+    /// Plans the fixture's layers at TP4 rank 1 against width files in `dir`: each layer's expert_format.
+    fn plan_layers(dir: &std::path::Path) -> Result<Vec<String>, String> {
+        let man = width_manifest(&format!("{D}/manifest.json"))?;
+        let slices = Slices::open(&format!("{D}/slices"), 4, &[1])?;
+        let d = dir.to_str().unwrap().to_string();
+        let wfile = move |l: usize, k: u8| width_file_path(&d, l, k);
+        let mut b = Builder::new();
+        let mut out = Vec::new();
+        for l in [3, 4] {
+            let w = widths(&man, l)?.unwrap();
+            v2_layer(&mut b, l, &w, &slices, &wfile, &|e| Ok(formula_halves(e, l, 4, 1)))?;
+            let xf: Vec<&str> = b.tensors.iter().filter(|t| t.name.starts_with(&format!("L{l:03}.")))
+                .map(|t| t.expert_format.as_deref().unwrap_or("")).collect();
+            assert!(xf.iter().all(|x| *x == xf[0]), "layer {l}: tensors with different expert formats {xf:?}");
+            out.push(xf[0].to_string());
+        }
+        Ok(out)
+    }
+
+    fn width_file_path(dir: &str, l: usize, k: u8) -> String {
+        super::width_file(dir, l, k)
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("v2plan-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// (suffix, metadata) of each codebook as the exlr8 writer names them
+    fn named(cb: &str) -> (String, Option<String>) {
+        match cb {
+            "mcg" => (String::new(), None),
+            "mul1" => (".mul1".into(), Some("mul1 0x83DCD12D, every value rounded to E4M3".into())),
+            _ => (".pmcgx".into(), Some("pmcgx V2 L20 0xCBAC1FED/0xBCA14C51, every value rounded to E4M3".into())),
+        }
+    }
+
+    fn files(dir: &std::path::Path, l: usize, cb: &str) {
+        let (s, m) = named(cb);
+        for k in [2, 3, 4] {
+            width_file(dir, l, k, &s, m.as_deref(), 0);
+        }
+    }
+
+    #[test]
+    fn each_layer_takes_its_files_codebook() {
+        let d = tmp("cb");
+        // mcg as published (no metadata), and the mcg metadata string the index files carry
+        files(&d, 3, "mcg");
+        width_file(&d, 4, 2, "", Some("mcg 0xCBAC1FED, every value rounded to E4M3"), 0);
+        width_file(&d, 4, 3, "", None, 0);
+        width_file(&d, 4, 4, "", None, 0);
+        assert_eq!(plan_layers(&d).unwrap(), ["exlr8-e4m3", "exlr8-e4m3"]);
+        // a model whose layers differ: each layer's tensors carry its own codebook
+        files(&d, 3, "mul1");
+        files(&d, 4, "pmcgx");
+        assert_eq!(plan_layers(&d).unwrap(), ["exlr8-e4m3-mul1", "exlr8-e4m3-pmcgx"]);
+        files(&d, 3, "pmcgx");
+        files(&d, 4, "mcg");
+        assert_eq!(plan_layers(&d).unwrap(), ["exlr8-e4m3-pmcgx", "exlr8-e4m3"]);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_wrong_or_unknown_codebook_stops_the_plan() {
+        let d = tmp("bad");
+        files(&d, 4, "mcg");
+        let refused = |what: &str, want: &[&str]| {
+            let e = plan_layers(&d).err().unwrap_or_else(|| panic!("{what}: planned"));
+            for w in want {
+                assert!(e.contains(w), "{what}: {e}");
+            }
+        };
+        // one layer's widths in two codebooks
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 3, ".mul1", Some("mul1 0x83DCD12D, E4M3"), 0);
+        refused("mixed widths", &["layer 3", "mcg", "mul1"]);
+        // a codebook gr8 does not know, by name or by metadata
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 2, ".gauss", Some("gauss 0x12345678, E4M3"), 0);
+        refused("unknown suffix", &["layer 3", "gauss"]);
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 4, "", Some("gauss 0x12345678, E4M3"), 0);
+        refused("unknown metadata", &["layer 3", "gauss"]);
+        // name and metadata disagree, or a suffixed name has no metadata
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 4, "", Some("pmcgx V2 L20 0xCBAC1FED/0xBCA14C51, E4M3"), 0);
+        refused("pmcgx metadata on mcg names", &["layer 3", "pmcgx"]);
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 4, ".mul1", Some("mcg 0xCBAC1FED, E4M3"), 0);
+        refused("mcg metadata on mul1 names", &["layer 3", "mul1"]);
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 4, ".mul1", None, 0);
+        refused("mul1 names without metadata", &["layer 3", "mul1"]);
+        // a pair trellis of another shape, and a multiplier that contradicts the name
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 4, ".pmcgx", Some("pmcgx V2 L22 0xCBAC1FED/0xBCA14C51, E4M3"), 0);
+        refused("pmcgx L22", &["layer 3", "L20"]);
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 4, ".mul1", Some("mul1 0xCBAC1FED, E4M3"), 0);
+        refused("mul1 with mcg's multiplier", &["layer 3", "0x83DCD12D"]);
+        // halves the slices place outside the trellis tensors
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 4, "", None, 16 * 98304 * 4);       // expert 1 is past the end
+        refused("short tensors", &["layer 3", "not inside"]);
+        // no header at all (a sparse cache file without its header range)
+        files(&d, 3, "mcg");
+        std::fs::write(d.join("exlr8-layer-003.k2.safetensors"), [0u8; 16]).unwrap();
+        refused("no header", &["layer 3", "K2"]);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_layer_without_its_width_files_is_unchecked() {
+        let d = tmp("missing");
+        files(&d, 3, "pmcgx");
+        // layer 4's K3 file is not there (a partial copy of the release): its codebook is unknown, never mcg
+        files(&d, 4, "mul1");
+        std::fs::remove_file(d.join("exlr8-layer-004.k3.safetensors")).unwrap();
+        assert_eq!(plan_layers(&d).unwrap(), ["exlr8-e4m3-pmcgx", codebook::UNCHECKED]);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
 }

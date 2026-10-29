@@ -342,8 +342,12 @@ bool Pack::open_manifest(const std::string& path, std::string& err)
         if (lay) e.layout = lay->s;
         if (xf)
         {
+            // the codebook is part of the format: a codebook this engine does not know must not load as mcg
             if (xf->s == "tr3") e.expert_format = 0;
             else if (xf->s == "exlr8-e4m3") e.expert_format = 1;
+            else if (xf->s == "exlr8-e4m3-mul1") e.expert_format = 2;
+            else if (xf->s == "exlr8-e4m3-pmcgx") e.expert_format = 3;
+            else if (xf->s == "exlr8-e4m3-unchecked") e.expert_format = 4;   // the planner found no width file to read
             else { err = e.name + ": unknown expert_format " + xf->s; return false; }
         }
         if (!dtype_of(dt->s, e.dtype)) { err = e.name + ": unknown dtype " + dt->s; return false; }

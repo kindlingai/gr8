@@ -891,6 +891,13 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         }
         if (ne4) fprintf(stderr, "# rank %d: routed experts exlr8-e4m3 in %d of %d MoE layers\n", rank, ne4, nmoe);
         if (ne4 && rank == 0) fprintf(stderr, "# rank 0: exlr8-e4m3 layers:%s; TR3 layers:%s\n", e4.c_str(), tr3.empty() ? " none" : tr3.c_str());
+        // the codebook of each exlr8-e4m3 layer, when any is not mcg (a mixed model lists every codebook it uses)
+        std::string cbs[TR3_NCB];
+        for (const Layer& y : m.layers)
+            if (y.moe && y.T.e4m3) cbs[y.T.cb] += " " + std::to_string(y.l);
+        if (rank == 0 && (!cbs[TR3_MUL1].empty() || !cbs[TR3_PMCGX].empty()))
+            for (int c = 0; c < TR3_NCB; ++c)
+                if (!cbs[c].empty()) fprintf(stderr, "# rank 0: codebook %s layers:%s\n", bind::codebook_name(c), cbs[c].c_str());
     }
     {
         // the decode forms of q_b, o_proj and the dense MLP (bind::make_layer's choice; G6_DTR=0 turns trellis off)

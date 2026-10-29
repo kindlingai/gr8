@@ -112,6 +112,9 @@ int main(int argc, char** argv)
 #ifndef K1V2_MAIN
     A.t_kmix = static_cast<const long long*>(T.t[bindp::T_TR3_KMIX].p);
     A.k2 = D.k2;
+    A.cb = T.cb;                                    // the codebook (tr3.table's expert format); make_layer's checks:
+    if (A.cb != D.cb || !tr3_cb_built(A.cb) || (A.cb != TR3_MCG && !T.t[bindp::T_TR3_V1B].p))
+        die("the layer's codebook does not run here (mul1 and pmcgx need the trellis shared expert)");
     A.bs = T.t[bindp::T_TR3_V1B].p != nullptr;      // block-scale hidden-side vectors (v2 layers with the trellis shared expert)
     A.t_sg = static_cast<const __half*>(T.t[bindp::T_TR3_SG].p);
     A.t_v1b = static_cast<const __half*>(T.t[bindp::T_TR3_V1B].p);

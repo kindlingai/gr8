@@ -58,8 +58,17 @@
 namespace bind
 {
 
-// routed-expert format of a tr3.* tensor: the manifest entry's "expert_format" (absent = TR3, every pack before exlr8-e4m3)
-enum { FMT_TR3 = 0, FMT_EXLR8_E4M3 = 1 };
+// routed-expert format of a tr3.* tensor: the manifest entry's "expert_format" (absent = TR3, every pack before exlr8-e4m3;
+// engine/loader/g6pack.cpp). exlr8-e4m3 is the mcg codebook; mul1 and pmcgx name theirs (tr3.cuh TR3_*). UNCHECKED: the
+// release planner found the layer's width files missing, so nothing names its codebook (a partial copy of the release);
+// its codebook is TR3_NCB, which no build has, so binding it fails.
+enum { FMT_TR3 = 0, FMT_EXLR8_E4M3 = 1, FMT_EXLR8_MUL1 = 2, FMT_EXLR8_PMCGX = 3, FMT_EXLR8_UNCHECKED = 4, FMT_N };
+inline bool fmt_e4m3(int fmt) { return fmt >= FMT_EXLR8_E4M3 && fmt < FMT_N; }
+inline int fmt_codebook(int fmt)
+{
+    return fmt == FMT_EXLR8_MUL1 ? TR3_MUL1 : fmt == FMT_EXLR8_PMCGX ? TR3_PMCGX : fmt == FMT_EXLR8_UNCHECKED ? TR3_NCB : TR3_MCG;
+}
+inline const char* codebook_name(int cb) { return cb == TR3_MUL1 ? "mul1" : cb == TR3_PMCGX ? "pmcgx" : "mcg"; }
 
 struct Tensor
 {
@@ -93,6 +102,7 @@ struct LayerTensors
     int fc1_wide = 0;                 // tr3.fc1 is in the wide order (widen_fc1 ran)
     int fc2_wide = 0;                 // tr3.fc2 is in the wide order (widen_fc2 ran)
     int e4m3 = 0;                     // routed experts are exlr8-e4m3 (tr3.table's format): K1 decodes with E4M3 rounding
+    int cb = TR3_MCG;                 // their codebook (tr3.table's format; tr3.cuh TR3_*): the CB instantiations
     int k2 = 1;                       // some routed fc1 / fc2 unit has width 2 (exlr8 v2): the K2 instantiations.
                                       // 1 until scan_widths ran (correct for any pack); scan_widths sets the real value
     int k3 = 1;                       // some routed fc1 / fc2 unit has width 3 (scan_widths)
@@ -124,7 +134,8 @@ template <class F> inline LayerTensors layer_tensors(int layer, F find)
         snprintf(n, sizeof n, "L%03d.%s", layer, NAMES[i]);
         T.t[i] = find(n);
     }
-    T.e4m3 = T.t[T_TR3_TAB].fmt == FMT_EXLR8_E4M3;
+    T.e4m3 = fmt_e4m3(T.t[T_TR3_TAB].fmt);
+    T.cb = fmt_codebook(T.t[T_TR3_TAB].fmt);
     T.mats_err = dtr::layer_mats(layer, [&](const char* nm) { return find(nm); }, T.mats);
     return T;
 }
@@ -168,6 +179,12 @@ inline const char* scan_widths(LayerTensors& T, bool allow_empty = false)
     T.k3 = 0;
     T.sh_trellis = 0;
     if (!tab.p) return nullptr;
+    for (int i = T_TR3_FC1; i <= T_TR3_V3; ++i)     // the trellis bytes and their vectors (as make_k1 checks)
+        if (T.t[i].p && T.t[i].fmt != tab.fmt) return "tr3.* tensors of one layer carry different expert formats (codebooks)";
+    if (tab.fmt == FMT_EXLR8_UNCHECKED) return "the layer's width files were missing when the plan read their codebook";
+    if (!tr3_cb_built(T.cb))
+        return T.cb == TR3_MUL1 ? "routed experts in the mul1 codebook, which this build leaves out (G6_TR3_CBS)"
+                                : "routed experts in the pmcgx codebook, which this build leaves out (G6_TR3_CBS)";
     if (tab.nd != 2 || tab.shape[1] != 6 || (tab.shape[0] != geom::NEXP && tab.shape[0] != geom::NEXP + 1)) return "tr3.table is not [NEXP or NEXP + 1][6]";
     if (tab.shape[0] == geom::NEXP + 1 && !T.e4m3) return "a trellis shared expert (tr3.table row NEXP) needs an exlr8-e4m3 layer";
     T.sh_trellis = tab.shape[0] == geom::NEXP + 1;
@@ -212,7 +229,8 @@ inline const char* scan_widths(LayerTensors& T, bool allow_empty = false)
 // The trellis shared expert's tiles decoded once into E4M3 bytes in the MXFP8 GEMM layout, codes[n][k] with k the
 // input side, both sides still rotated (the prefill binder applies the rotations around the GEMMs). The codebook values
 // are E4M3 already, so the copy is exact. Reads tr3.fc1 / fc2 in pack order: run it before widen_fc1 / widen_fc2.
-// grid ceil(I * 6144 * 3 / 256), block 256: one thread per weight.
+// grid ceil(I * 6144 * 3 / 256), block 256: one thread per weight. CB = the layer's codebook.
+template <int CB>
 __global__ void __launch_bounds__(256) k_shared_fp8(const uint8_t* fc1, const uint8_t* fc2, long long o1, long long o2, int bits, int I,
                                                     uint8_t* cg, uint8_t* cu, uint8_t* cd)
 {
@@ -241,16 +259,8 @@ __global__ void __launch_bounds__(256) k_shared_fp8(const uint8_t* fc1, const ui
         k = b * 128 + kt * 16 + kk;
         n = nt * 16 + nn;
     }
-    // state of weight t: the 16 stream bits ending at bit (t + 1) bits, MSB first over LE u32 words, tail-biting
-    const int nb = 256 * bits;
-    u32 st = 0;
-    for (int q = 0; q < 16; ++q)
-    {
-        const int bit = (((t + 1) * bits - 16 + q) % nb + nb) % nb;
-        const u32 word = *reinterpret_cast<const u32*>(p + (bit >> 5) * 4);
-        st = (st << 1) | ((word >> (31 - (bit & 31))) & 1u);
-    }
-    const u32 h2 = tr3_cb2<true>(st, 0u);                         // low half = weight t, E4M3-rounded
+    // weight t from its state (the 16 stream bits ending at bit (t + 1) bits; pmcgx: the 20 ending at weight t | 1)
+    const u32 h2 = tr3_weight<CB, true>(p, t, bits);              // low half = weight t, E4M3-rounded
     unsigned short e;
     asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(e) : "r"(h2));
     const uint8_t q8 = static_cast<uint8_t>(e & 0xff);
@@ -275,9 +285,11 @@ inline const char* make_shared_fp8(LayerTensors& T, cudaStream_t st)
             return "make_shared_fp8: cudaMalloc failed";
         cudaMemsetAsync(F.scales[m], 127, nc / 32, st);
     }
-    k_shared_fp8<<<static_cast<unsigned>((3 * nc + 255) / 256), 256, 0, st>>>(
-        static_cast<const uint8_t*>(T.t[T_TR3_FC1].p), static_cast<const uint8_t*>(T.t[T_TR3_FC2].p), T.sh_tr[0], T.sh_tr[1],
-        static_cast<int>(T.sh_tr[4]), F.I, F.codes[0], F.codes[1], F.codes[2]);
+    tr3_cb_dispatch(T.cb, [&](auto CB) {
+        k_shared_fp8<decltype(CB)::value><<<static_cast<unsigned>((3 * nc + 255) / 256), 256, 0, st>>>(
+            static_cast<const uint8_t*>(T.t[T_TR3_FC1].p), static_cast<const uint8_t*>(T.t[T_TR3_FC2].p), T.sh_tr[0], T.sh_tr[1],
+            static_cast<int>(T.sh_tr[4]), F.I, F.codes[0], F.codes[1], F.codes[2]);
+    });
     return cudaStreamSynchronize(st) == cudaSuccess ? nullptr : "make_shared_fp8: decode failed";
 }
 
@@ -627,42 +639,65 @@ struct K1
     int fuse = 0, gf = 0;             // fuse (1 | 2): one persistent fc1+fc2 launch (k1_tr3_fused, gf CTAs of 512) instead of fc1, fc2
     size_t smf = 0;
     int e4 = 0;                       // exlr8-e4m3 layer: the E4 instantiations of fc1, fc2, fused (chosen once, in make_k1)
+    int cb = TR3_MCG;                 // its codebook (LayerTensors::cb): the CB instantiations (E4 only)
     int k2 = 0;                       // layer with 2-bit units (LayerTensors::k2): the K2 instantiations
     int sh = 0;                       // trellis shared expert (LayerTensors::sh_trellis): the SH instantiations (E4 only)
 };
 
-// the (E4, K2, SH) instantiations of a K1 kernel template; SH implies E4 (make_k1)
-#define K1_PICK(kern, k, ...) \
-    do { if ((k).sh) { if ((k).k2) kern<true, true, true>__VA_ARGS__; else kern<true, false, true>__VA_ARGS__; } \
-         else if ((k).e4) { if ((k).k2) kern<true, true>__VA_ARGS__; else kern<true, false>__VA_ARGS__; } \
-         else { if ((k).k2) kern<false, true>__VA_ARGS__; else kern<false, false>__VA_ARGS__; } } while (0)
-template <bool E4, bool K2, bool SH> inline const void* k1_fn_fc1() { return reinterpret_cast<const void*>(k1_tr3_fc1<E4, K2, SH>); }
-template <bool E4, bool K2, bool SH> inline const void* k1_fn_fc2() { return reinterpret_cast<const void*>(k1_tr3_fc2<E4, K2, SH>); }
-template <bool E4, bool K2, bool SH> inline const void* k1_fn_fused()
+// f(E4, K2, SH, CB) as std::integral_constant values for the layer's K1 instantiation. SH implies E4. A codebook other
+// than mcg comes with SH only: the new codebooks exist in exlr8 v2 releases, whose layers carry the trellis shared
+// expert, and the int4 / MXFP8 shared-expert path then stays out of their kernels (make_k1 refuses the rest).
+template <class F> inline void k1_pick(int e4, int k2, int sh, int cb, F&& f)
 {
-    if constexpr (SH) return reinterpret_cast<const void*>(k1_tr3_fused_sh<E4, K2>);
-    else return reinterpret_cast<const void*>(k1_tr3_fused<E4, K2, false>);
+    using std::integral_constant;
+    auto k2s = [&](auto E4, auto SH, auto CB) {
+        if (k2) f(E4, integral_constant<bool, true>(), SH, CB);
+        else f(E4, integral_constant<bool, false>(), SH, CB);
+    };
+    if (sh) tr3_cb_dispatch(cb, [&](auto CB) { k2s(integral_constant<bool, true>(), integral_constant<bool, true>(), CB); });
+    else if (e4) k2s(integral_constant<bool, true>(), integral_constant<bool, false>(), integral_constant<int, TR3_MCG>());
+    else k2s(integral_constant<bool, false>(), integral_constant<bool, false>(), integral_constant<int, TR3_MCG>());
+}
+template <class F> inline void k1_pick(const K1& k, F&& f) { k1_pick(k.e4, k.k2, k.sh, k.cb, f); }
+// every instantiation k1_pick can choose
+template <class F> inline void k1_each(F&& f)
+{
+    for (int e4 = 0; e4 < 2; ++e4)
+        for (int k2 = 0; k2 < 2; ++k2)
+            for (int sh = 0; sh <= e4; ++sh)
+                for (int cb = 0; cb < (sh ? TR3_NCB : 1); ++cb)
+                    if (tr3_cb_built(cb)) k1_pick(e4, k2, sh, cb, f);
+}
+#define K1_V(x) decltype(x)::value
+template <bool E4, bool K2, bool SH, int CB> inline const void* k1_fn_fc1() { return reinterpret_cast<const void*>(k1_tr3_fc1<E4, K2, SH, CB>); }
+template <bool E4, bool K2, bool SH, int CB> inline const void* k1_fn_fc2() { return reinterpret_cast<const void*>(k1_tr3_fc2<E4, K2, SH, CB>); }
+template <bool E4, bool K2, bool SH, int CB> inline const void* k1_fn_fused()
+{
+    if constexpr (SH) return reinterpret_cast<const void*>(k1_tr3_fused_sh<E4, K2, CB>);
+    else return reinterpret_cast<const void*>(k1_tr3_fused<E4, K2, false, CB>);
 }
 
 inline void launch_k1_fc1(const K1& k, cudaStream_t st)
 {
     if (!k.on) return;
-    K1_PICK(k1_tr3_fc1, k, <<<k.g1, k.b1, k.sm1, st>>>(k.a));
+    k1_pick(k, [&](auto E4, auto K2, auto SH, auto CB) {
+        k1_tr3_fc1<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)><<<k.g1, k.b1, k.sm1, st>>>(k.a);
+    });
 }
 inline void launch_k1_fc2(const K1& k, cudaStream_t st)
 {
     if (!k.on) return;
-    K1_PICK(k1_tr3_fc2, k, <<<k.g2, k.b2, k.sm2, st>>>(k.a));
+    k1_pick(k, [&](auto E4, auto K2, auto SH, auto CB) {
+        k1_tr3_fc2<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)><<<k.g2, k.b2, k.sm2, st>>>(k.a);
+    });
 }
 inline void launch_k1_fused(const K1& k, cudaStream_t st)
 {
     if (!k.on) return;
-    if (k.sh)
-    {
-        if (k.k2) k1_tr3_fused_sh<true, true><<<k.gf, 512, k.smf, st>>>(k.a);
-        else k1_tr3_fused_sh<true, false><<<k.gf, 512, k.smf, st>>>(k.a);
-    }
-    else K1_PICK(k1_tr3_fused, k, <<<k.gf, 512, k.smf, st>>>(k.a));
+    k1_pick(k, [&](auto E4, auto K2, auto SH, auto CB) {
+        if constexpr (K1_V(SH)) k1_tr3_fused_sh<true, K1_V(K2), K1_V(CB)><<<k.gf, 512, k.smf, st>>>(k.a);
+        else k1_tr3_fused<K1_V(E4), K1_V(K2), false, K1_V(CB)><<<k.gf, 512, k.smf, st>>>(k.a);
+    });
 }
 inline void launch_k1_fin(const K1& k, cudaStream_t st)
 {
@@ -698,27 +733,21 @@ inline void k1_ovl_fork(const K1& k, const K1Ovl& o, cudaStream_t st)
     const int nsh = g6mx::tiles(k.a.M), g1 = nsh * k.a.B * 2 * k.a.KS1, g2 = nsh * k.a.B * k.a.NS2;
     cudaEventRecord(o.fork, st);
     cudaStreamWaitEvent(o.side, o.fork, 0);
-    if (k.k2) k1_tr3_fc1_ovl<true, true, 1><<<g1, k.b1, k.sm1, o.side>>>(k.a);
-    else k1_tr3_fc1_ovl<true, false, 1><<<g1, k.b1, k.sm1, o.side>>>(k.a);
-    if (o.mode == 1)
-    {
-        if (k.k2) k1_tr3_fc2_ovl<true, true, 1><<<g2, k.b2, k.sm2, o.side>>>(k.a);
-        else k1_tr3_fc2_ovl<true, false, 1><<<g2, k.b2, k.sm2, o.side>>>(k.a);
-    }
+    k1_pick(k, [&](auto, auto K2, auto, auto CB) {
+        k1_tr3_fc1_ovl<true, K1_V(K2), 1, K1_V(CB)><<<g1, k.b1, k.sm1, o.side>>>(k.a);
+        if (o.mode == 1) k1_tr3_fc2_ovl<true, K1_V(K2), 1, K1_V(CB)><<<g2, k.b2, k.sm2, o.side>>>(k.a);
+    });
     cudaEventRecord(o.join, o.side);
 }
 // on st after the plan kernel, in place of launch_k1: the routed fc1 (and fc2), the join, the finalize
 inline void launch_k1_ovl(const K1& k, const K1Ovl& o, cudaStream_t st)
 {
     const int g1 = k.a.n_slots * k.a.B * 2 * k.a.KS1, g2 = k.a.n_slots * k.a.B * k.a.NS2;
-    if (k.k2) k1_tr3_fc1_ovl<true, true, 2><<<g1, k.b1, k.sm1, st>>>(k.a);
-    else k1_tr3_fc1_ovl<true, false, 2><<<g1, k.b1, k.sm1, st>>>(k.a);
-    if (o.mode == 1)
-    {
-        if (k.k2) k1_tr3_fc2_ovl<true, true, 2><<<g2, k.b2, k.sm2, st>>>(k.a);
-        else k1_tr3_fc2_ovl<true, false, 2><<<g2, k.b2, k.sm2, st>>>(k.a);
-        cudaStreamWaitEvent(st, o.join, 0);
-    }
+    k1_pick(k, [&](auto, auto K2, auto, auto CB) {
+        k1_tr3_fc1_ovl<true, K1_V(K2), 2, K1_V(CB)><<<g1, k.b1, k.sm1, st>>>(k.a);
+        if (o.mode == 1) k1_tr3_fc2_ovl<true, K1_V(K2), 2, K1_V(CB)><<<g2, k.b2, k.sm2, st>>>(k.a);
+    });
+    if (o.mode == 1) cudaStreamWaitEvent(st, o.join, 0);
     else
     {
         cudaStreamWaitEvent(st, o.join, 0);
@@ -727,16 +756,15 @@ inline void launch_k1_ovl(const K1& k, const K1Ovl& o, cudaStream_t st)
     launch_k1_fin(k, st);
 }
 // persistent grid of the fused launch: min(items, resident CTAs of the device at its smem size)
-inline int k1_fused_grid(int items, size_t smem, int e4 = 0, int k2 = 0, int sh = 0)
+inline int k1_fused_grid(int items, size_t smem, int e4 = 0, int k2 = 0, int sh = 0, int cb = TR3_MCG)
 {
     int dev = 0, nsm = 0, nb = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess) return 0;
     // the attribute is per function (process-wide): set the maximum as init() does, never a layer's own smem, or a later
     // make_layer with a smaller split lowers it below an earlier layer's launch size (invalid argument at launch)
     if (smem > static_cast<size_t>(KSH) * 256) return 0;
-    const void* fn = sh ? (k2 ? k1_fn_fused<true, true, true>() : k1_fn_fused<true, false, true>())
-                   : e4 ? (k2 ? k1_fn_fused<true, true, false>() : k1_fn_fused<true, false, false>())
-                        : (k2 ? k1_fn_fused<false, true, false>() : k1_fn_fused<false, false, false>());
+    const void* fn = nullptr;
+    k1_pick(e4, k2, sh, cb, [&](auto E4, auto K2, auto SH, auto CB) { fn = k1_fn_fused<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>(); });
     if (cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256) != cudaSuccess) return 0;
     if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, fn, 512, smem) != cudaSuccess || nb < 1) return 0;
     const int g = nsm * nb;
@@ -1005,6 +1033,9 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
         const Tensor& km = T.t[T_TR3_KMIX];
         if (km.p && (km.nd != 1 || km.shape[0] != tab.shape[0])) return "tr3.kmix is not one entry per tr3.table row";
         k.e4 = T.e4m3;
+        k.cb = T.cb;
+        if (!tr3_cb_built(k.cb)) return "the layer's codebook is not in this build (G6_TR3_CBS)";
+        if (k.cb != TR3_MCG && !sh) return "codebooks other than mcg run on exlr8 v2 layers with the trellis shared expert only";
         k.k2 = sh ? (T.k2 || T.k3) : T.k2;
         k.sh = sh;
         if (sh && !k.e4) return "trellis shared expert in a layer that is not exlr8-e4m3";
@@ -1053,7 +1084,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     {
         k.fuse = fuse;
         k.smf = k.sm1 > k.sm2 ? k.sm1 : k.sm2;
-        k.gf = k1_fused_grid(k.g1 + k.g2, k.smf, k.e4, k.k2, k.sh);
+        k.gf = k1_fused_grid(k.g1 + k.g2, k.smf, k.e4, k.k2, k.sh, k.cb);
         if (!k.gf) return "fused K1 launch: no resident CTA at its shared memory size";
     }
     k.on = 1;
@@ -1332,26 +1363,24 @@ template <class A> inline void head_args(const Head& H, A& a)
 inline cudaError_t init()
 {
     // fc2 too: above 8 rows the shared fc2's s_ntp B tables exceed 48 KB
-    const void* fn[18] = {k1_fn_fc1<false, false, false>(), k1_fn_fused<false, false, false>(), k1_fn_fc2<false, false, false>(),
-                          k1_fn_fc1<true, false, false>(), k1_fn_fused<true, false, false>(), k1_fn_fc2<true, false, false>(),
-                          k1_fn_fc1<false, true, false>(), k1_fn_fused<false, true, false>(), k1_fn_fc2<false, true, false>(),
-                          k1_fn_fc1<true, true, false>(), k1_fn_fused<true, true, false>(), k1_fn_fc2<true, true, false>(),
-                          k1_fn_fc1<true, false, true>(), k1_fn_fused<true, false, true>(), k1_fn_fc2<true, false, true>(),
-                          k1_fn_fc1<true, true, true>(), k1_fn_fused<true, true, true>(), k1_fn_fc2<true, true, true>()};
-    for (const void* f : fn)
-    {
+    cudaError_t err = cudaSuccess;
+    auto set = [&](const void* f) {
         const cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);
-        if (e != cudaSuccess) return e;
-    }
-    const void* fo[8] = {reinterpret_cast<const void*>(k1_tr3_fc1_ovl<true, false, 1>), reinterpret_cast<const void*>(k1_tr3_fc1_ovl<true, false, 2>),
-                         reinterpret_cast<const void*>(k1_tr3_fc1_ovl<true, true, 1>), reinterpret_cast<const void*>(k1_tr3_fc1_ovl<true, true, 2>),
-                         reinterpret_cast<const void*>(k1_tr3_fc2_ovl<true, false, 1>), reinterpret_cast<const void*>(k1_tr3_fc2_ovl<true, false, 2>),
-                         reinterpret_cast<const void*>(k1_tr3_fc2_ovl<true, true, 1>), reinterpret_cast<const void*>(k1_tr3_fc2_ovl<true, true, 2>)};
-    for (const void* f : fo)                                            // G6_ROUTE_OVL (k1_ovl_fork / launch_k1_ovl)
-    {
-        const cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);
-        if (e != cudaSuccess) return e;
-    }
+        if (err == cudaSuccess) err = e;
+    };
+    k1_each([&](auto E4, auto K2, auto SH, auto CB) {
+        set(k1_fn_fc1<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>());
+        set(k1_fn_fused<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>());
+        set(k1_fn_fc2<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>());
+        if constexpr (K1_V(SH))                                         // G6_ROUTE_OVL (k1_ovl_fork / launch_k1_ovl)
+        {
+            set(reinterpret_cast<const void*>(k1_tr3_fc1_ovl<true, K1_V(K2), 1, K1_V(CB)>));
+            set(reinterpret_cast<const void*>(k1_tr3_fc1_ovl<true, K1_V(K2), 2, K1_V(CB)>));
+            set(reinterpret_cast<const void*>(k1_tr3_fc2_ovl<true, K1_V(K2), 1, K1_V(CB)>));
+            set(reinterpret_cast<const void*>(k1_tr3_fc2_ovl<true, K1_V(K2), 2, K1_V(CB)>));
+        }
+    });
+    if (err != cudaSuccess) return err;
     return dtr::init();
 }
 

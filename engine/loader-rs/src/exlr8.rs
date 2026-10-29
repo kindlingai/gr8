@@ -15,6 +15,7 @@
 //! tests/exlr8_compare.py on the release's files). The trellis codebook, the bit packing, the tile order and the
 //! 128x128 Hadamard are exllamav3's primitives (MIT, Turboderp), as the card says.
 
+use crate::codebook::{self, Codebook};
 use crate::json::{self, Json};
 use std::fs::File;
 use std::ops::Range;
@@ -32,8 +33,6 @@ pub const FP32: i64 = 7;
 pub const SIDE_REPLICATED: i64 = 0;
 pub const SIDE_OUT: i64 = 1;
 pub const SIDE_IN: i64 = 2;
-
-const MCG: u32 = 0xCBAC1FED;
 
 /// The data tensors of each format, in the release's checksum order.
 pub fn data_tensors(fmt: i64) -> &'static [&'static str] {
@@ -169,7 +168,7 @@ fn round_to(x: f32, mant: i32, emin: i32) -> f32 {
 }
 
 /// f32 -> f16, round to nearest even, as f32. Finite values inside the f16 range only (the codebook sums).
-fn f32_to_f16_value(x: f32) -> f32 {
+pub(crate) fn f32_to_f16_value(x: f32) -> f32 {
     round_to(x, 10, -14)
 }
 
@@ -233,19 +232,6 @@ fn f32s(b: &[u8]) -> Vec<f32> {
 
 // ------------------------------------------------------------------------------------------------ trellis codec
 
-/// The mcg codebook for every 16-bit state, rounded to E4M3 (the rounding is part of the format).
-fn codebook() -> &'static [f32] {
-    static CB: OnceLock<Vec<f32>> = OnceLock::new();
-    CB.get_or_init(|| {
-        (0u32..65536).map(|s| {
-            let x = (s.wrapping_mul(MCG) & 0x8FFF_8FFF) ^ 0x3B60_3B60;
-            // two fp16 values in [0.125, 2): their f32 sum is exact, so rounding it to f16 is the fp16 add
-            let sum = f16_to_f32(x as u16) + f16_to_f32((x >> 16) as u16);
-            e4m3_round(f32_to_f16_value(sum))
-        }).collect()
-    })
-}
-
 /// perm[j] = row * 16 + col of the tile element at stream position j (exllamav3's tensor-core order); rows are the
 /// input side.
 fn tile_perm() -> &'static [usize; 256] {
@@ -264,10 +250,14 @@ fn tile_perm() -> &'static [usize; 256] {
     })
 }
 
-/// One packed 16x16 tile at width k (32k bytes) -> 256 values, row-major (input, output).
+/// One packed 16x16 tile at width k (32k bytes) -> 256 values, row-major (input, output). mcg: the dense matrices.
 pub fn decode_tile(raw: &[u8], k: usize, out: &mut [f32; 256]) {
+    decode_tile_cb(raw, k, Codebook::Mcg, out)
+}
+
+/// The same in any codebook (src/codebook.rs), the values rounded to E4M3 (the rounding is part of the format).
+pub fn decode_tile_cb(raw: &[u8], k: usize, cb: Codebook, out: &mut [f32; 256]) {
     debug_assert_eq!(raw.len(), 32 * k);
-    let cb = codebook();
     let perm = tile_perm();
     let nw = 16 * k;
     // the words in stream order: each adjacent pair swapped
@@ -289,13 +279,18 @@ pub fn decode_tile(raw: &[u8], k: usize, out: &mut [f32; 256]) {
         have -= k;
     }
     debug_assert_eq!(wi, nw);
-    let reach = 16usize.div_ceil(k);
+    // weight i's state: the 16 bits ending at weight i (pmcgx: the 20 ending at weight i | 1), tail-biting
+    let tab = codebook::table(cb);
+    let (sb, pair) = (cb.state_bits(), cb == Codebook::Pmcgx);
+    let reach = sb.div_ceil(k);
     for i in 0..256 {
+        let last = if pair { i | 1 } else { i };
         let mut s = 0u32;
         for j in 0..reach {
-            s |= vals[(i + 256 - j) % 256] << (j * k);
+            s |= vals[(last + 256 - j) % 256] << (j * k);
         }
-        out[perm[i]] = cb[(s & 0xffff) as usize];
+        let s = (s & ((1u32 << sb) - 1)) as usize;
+        out[perm[i]] = if pair { tab[2 * s + (i & 1)] } else { tab[s] };
     }
 }
 
@@ -422,6 +417,9 @@ impl<'a> Matrix<'a> {
                            unit: v[5] as usize, rotation: v[6], solve: v[7] };
         if !(TRELLIS..=FP32).contains(&rec.fmt) {
             return Err(format!("{}: {name}: unknown format {}", f.path, rec.fmt));
+        }
+        if rec.fmt == TRELLIS {
+            codebook::check_dense_mcg(f)?;
         }
         Ok(Matrix { f, name: name.to_string(), rec })
     }

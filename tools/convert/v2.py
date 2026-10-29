@@ -24,6 +24,12 @@ E is 256, or 257 when the shared expert is stored as trellis (row 256, always ro
 A rank's halves of one expert are not contiguous under the half rule (at TP4 they are h, h + 4, h + 8, h + 12). The
 kernels index blocks by row only, so they do not care; table[5] (the first half) is informational.
 
+The trellis codebook (engine/kernels/tr3.cuh: mcg, mul1, pmcgx) comes from the width files: their trellis tensors are
+`trellis.<proj>` for mcg and `trellis.<proj>.<codebook>` for the others, and their metadata `codebook` names it too
+(width_file_codebook). The layer's tensors carry it in their expert_format (exlr8-e4m3, exlr8-e4m3-mul1,
+exlr8-e4m3-pmcgx), and every half read is checked to lie inside its projection's trellis tensor, so a file in a codebook
+this converter does not know is refused instead of decoded with the wrong hash.
+
 python3 -m tools.convert.v2 --v2 DIR --layer 40 --nr 5 --out DIR [--widths home|down1|up1|k2|k3|k4|MANIFEST]
         [--v1 DIR] [--ranks 0,1] [--shared trellis|off] [--routed all|files|0-63]
     writes expert-only rank packs (rank<r>.pack + manifest: the layer's tr3.* tensors) for kernel and TP tests.
@@ -57,6 +63,58 @@ BLOCK = {'gate': 'gate.su_block', 'up': 'up.su_block', 'down': 'down.sv_block'} 
 CHAN = {'gate': 'gate.svh', 'up': 'up.svh', 'down': 'down.suh'}              # fp16 [E, 2048] per channel, sign included
 GATE_UP_ORDER = 'grouped'
 DOWN_ORDER = 'item128'
+# codebook -> the multipliers its metadata string must name, and the layer's expert_format (engine/loader/g6pack.cpp)
+CODEBOOKS = {'mcg': ('0xCBAC1FED',), 'mul1': ('0x83DCD12D',), 'pmcgx': ('0xCBAC1FED', '0xBCA14C51')}
+EXPERT_FORMAT = {'mcg': 'exlr8-e4m3', 'mul1': 'exlr8-e4m3-mul1', 'pmcgx': 'exlr8-e4m3-pmcgx'}
+
+
+def codebook_of_metadata(s):
+    """The codebook a metadata string names (first word, its multipliers, and for pmcgx the V2 L20 pair shape), or a
+    ValueError for one this converter does not decode."""
+    first = s.replace(',', ' ').split(' ')[0]
+    if first not in CODEBOOKS:
+        raise ValueError(f'codebook {s!r} is not one gr8 decodes ({", ".join(CODEBOOKS)})')
+    for m in CODEBOOKS[first]:
+        if m.lower() not in s.lower():
+            raise ValueError(f'codebook {s!r} names {first} without its multiplier {m}')
+    if first == 'pmcgx' and not ('v2' in s.lower() and 'l20' in s.lower()):
+        raise ValueError(f'codebook {s!r}: gr8 decodes the pmcgx pair trellis V2 L20 only')
+    return first
+
+
+def width_file_codebook(f):
+    """(codebook, {(shared, proj): (start, end)} absolute byte ranges of its trellis tensors) of a width file (an ST),
+    from its tensor names and metadata. Without a metadata codebook and without a name suffix it is mcg (every file
+    before the other codebooks). The engine's planner applies the same rule (engine/loader-rs/src/codebook.rs)."""
+    by_name, ranges = None, {}
+    for n, t in f.h.items():
+        sh, rest = (True, n[len('shared.'):]) if n.startswith('shared.') else (False, n)
+        if not rest.startswith('trellis.'):
+            continue
+        proj, _, suffix = rest[len('trellis.'):].partition('.')
+        if proj not in PROJ:
+            raise ValueError(f'{f.path}: unknown trellis tensor {n}')
+        cb = suffix or 'mcg'
+        if cb not in CODEBOOKS or suffix == 'mcg':
+            raise ValueError(f'{f.path}: trellis tensor {n} is in codebook {suffix!r}, which gr8 does not decode')
+        if by_name not in (None, cb):
+            raise ValueError(f'{f.path}: its trellis tensors name different codebooks')
+        by_name = cb
+        ranges[(sh, proj)] = (f.base + t['data_offsets'][0], f.base + t['data_offsets'][1])
+    if by_name is None:
+        raise ValueError(f'{f.path}: no trellis tensors')
+    meta = f.meta.get('codebook')
+    if meta is None:
+        if by_name != 'mcg':
+            raise ValueError(f'{f.path}: trellis tensors in {by_name} but no metadata codebook')
+    else:
+        try:
+            by_meta = codebook_of_metadata(meta)
+        except ValueError as e:
+            raise ValueError(f'{f.path}: {e}') from None
+        if by_meta != by_name:
+            raise ValueError(f'{f.path}: metadata codebook {meta!r} but trellis tensors in {by_name}')
+    return by_name, ranges
 
 
 def half_bytes(k):
@@ -107,7 +165,8 @@ class V2Layer:
 
     def __init__(self, d, l, verify=True):
         self.d, self.l, self.verify = d, l, verify
-        self.files, self.cache = {}, {}
+        self.files, self.cache, self.ranges = {}, {}, {}
+        self.codebook = None                  # set by the first width file read (file); every width must agree
         self.idx = ST(os.path.join(d, INDEX_FILE.format(l=l)))
         m = self.idx.meta
         if m.get('format') != 'exlr8-v2' or m.get('contents', 'index') != 'index':
@@ -128,8 +187,19 @@ class V2Layer:
             f = ST(os.path.join(self.d, WIDTH_FILE.format(l=self.l, k=k)))
             if f.meta.get('format') != 'exlr8-v2' or int(f.meta.get('k', k)) != k:
                 raise ValueError(f'{f.path}: format {f.meta.get("format")!r} k {f.meta.get("k")!r}')
+            cb, self.ranges[k] = width_file_codebook(f)
+            if self.codebook not in (None, cb):
+                raise ValueError(f'L{self.l}: the k{k} width file is in codebook {cb}, an earlier one in '
+                                 f'{self.codebook}: one codebook per layer')
+            self.codebook = cb
             self.files[k] = f
         return self.files[k]
+
+    def layer_codebook(self, ks):
+        """The codebook of the width files at widths ks (read their headers): one per layer."""
+        for k in sorted(ks):
+            self.file(k)
+        return self.codebook or 'mcg'
 
     def close(self):
         for f in list(self.files.values()) + [self.idx]:
@@ -179,7 +249,11 @@ class V2Layer:
         off, n = (int(x) for x in self._t(e, k, 'index')[PROJ.index(p), h])
         if n != half_bytes(k):
             raise ValueError(f'L{self.l} k{k} expert {e} {p} half {h}: length {n}, want {half_bytes(k)}')
-        return self.file(k).path, off, n
+        f = self.file(k)
+        a, b = self.ranges[k].get((e == SHARED, p), (0, 0))
+        if not (a <= off and off + n <= b):
+            raise ValueError(f'L{self.l} k{k} expert {e} {p} half {h}: offset {off} is not inside its trellis tensor')
+        return f.path, off, n
 
     def half(self, e, p, h, k):
         """Trellis bytes of half h of projection p of expert e at width k, in the stored order, checksum verified."""
@@ -221,6 +295,13 @@ class Widths:
     @property
     def shared(self):
         return self.sdown
+
+    def used(self, shared=True):
+        """The widths any unit takes (with the shared expert's when shared)."""
+        ks = set(self.down.tolist()) | set(self.gate.ravel().tolist()) | set(self.up.ravel().tolist())
+        if shared and self.sdown:
+            ks |= set(self.sgate.tolist()) | set(self.sup.tolist()) | {self.sdown}
+        return sorted(int(k) for k in ks)
 
     def of(self, e):
         """(gate[16], up[16], down) of expert e (256 = shared)."""
@@ -281,6 +362,10 @@ def convert_experts_v2(l, v2, widths, writers, nr, P=None, info=None, shared=Tru
     the kernels skip. Default: all 256, which the files must hold."""
     P = P or f'L{l:03d}'
     xf = dict(info or {})
+    # the codebook of the width files: a layer outside mcg always names it, so no reader can take it for mcg
+    cb = v2.layer_codebook(widths.used(shared))
+    if cb != 'mcg' or 'expert_format' in xf:
+        xf['expert_format'] = EXPERT_FORMAT[cb]
     routed = set(range(N_EXP) if routed is None else routed)
     if not routed <= set(v2.experts):
         raise ValueError(f'{P}: the v2 files hold experts {v2.experts[0]}..{v2.experts[-1]} ({len(v2.experts)}), '
@@ -419,12 +504,13 @@ def main(argv=None):
     wd, prov = load_widths(a.widths, a.layer, bits, a.shared_width if a.shared == 'trellis' else 0)
     ranks = list(range(a.nr)) if a.ranks == 'all' else [int(x) for x in a.ranks.split(',')]
     os.makedirs(a.out, exist_ok=True)
-    meta = dict(converter='g6convert-v2experts', layers=[a.layer], nr=a.nr, v2_widths=prov,
-                expert_formats={str(a.layer): 'exlr8-e4m3'})
-    writers = {r: PackWriter(os.path.join(a.out, f'rank{r}.pack'), r, False, meta) for r in ranks}
     v2 = V2Layer(a.v2, a.layer)
+    xf = EXPERT_FORMAT[v2.layer_codebook(wd.used(a.shared == 'trellis'))]
+    meta = dict(converter='g6convert-v2experts', layers=[a.layer], nr=a.nr, v2_widths=prov,
+                expert_formats={str(a.layer): xf})
+    writers = {r: PackWriter(os.path.join(a.out, f'rank{r}.pack'), r, False, meta) for r in ranks}
     routed = None if a.routed == 'all' else v2.experts if a.routed == 'files' else parse_experts(a.routed)
-    ex = convert_experts_v2(a.layer, v2, wd, writers, a.nr, info=dict(expert_format='exlr8-e4m3', expert_source='exlr8-v2'),
+    ex = convert_experts_v2(a.layer, v2, wd, writers, a.nr, info=dict(expert_format=xf, expert_source='exlr8-v2'),
                             shared=a.shared == 'trellis', routed=routed)
     v2.close()
     for r, w in writers.items():

@@ -228,6 +228,7 @@ path. The `#if` blocks and their comments in the source are the reference:
 | `DEC_IDX31=1` | decode index scorer reads each key once for all query rows and skips tiles another CP rank owns; select stops at the live end of the bucket (exact; needs `SEL32`) |
 | `G6_CP=1`, `G6_CP_PF_HASH2=1` | context-parallel KV, and its HASH2 staged-page check |
 | `PF_F12` (TP4 build only) | prefill expert fc1: one fat CTA runs `F12_NE` (default 2) adjacent expert blocks on one quantized A record (`kernels/bind_prefill.cuh`, `k_pf_fc1f`). `F12_NE` must divide the expert blocks per rank (4 at TP4, 3 at TP6). `G6_PF_F12=0` turns it off at run time. Effect not measured on its own |
+| `G6_TR3_CBS=7` (default; not in `K1H2_FLAGS`) | the trellis codebooks the build decodes, a bit mask over mcg (1), mul1 (2) and pmcgx (4) (`kernels/tr3.cuh`). A smaller mask leaves those codebooks' expert kernels out, which only shortens a development build: the binder then refuses a layer in a codebook the build lacks. mcg (bit 0) is always in |
 | `G6_KV4=1` (a build flag; experimental) | the MLA latent cached as INT4 after a Hadamard rotation, 416 B a row instead of 656 B (`attn/kvfmt.h`, [KV4.md](KV4.md)). Changes the outputs. The image ships it as `bin/g6m4-int4`, which `--kv-format int4` (`KV_FORMAT`) runs; `KV_FORMAT=int4 scripts/build.sh` builds it |
 
 ## Front end and shim

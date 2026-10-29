@@ -45,8 +45,8 @@ __device__ __forceinline__ void k1_shared_fc2(const K1Args& A, int os, u32* smem
 // ------------------------------------------------------------------ TR3 build
 // one fc1 unit of the slot's expert e at its width (tr3_unit). K2 = the layer has 2-bit units (bind::scan_widths):
 // only then is the K2 body compiled in. The K2 body makes K3 units about 3.5% slower at M = 5 (GB10). Layers
-// without 2-bit units therefore take the K3 / K4 kernels.
-template <bool E4, bool K2, bool BS = false>
+// without 2-bit units therefore take the K3 / K4 kernels. CB = the layer's codebook (tr3.cuh TR3_*).
+template <bool E4, bool K2, bool BS = false, int CB = TR3_MCG>
 __device__ __forceinline__ void tr3_fc1_any(const K1Args& A, int plan, int unit, int e, int mask, u32* smem)
 {
     const long long* tr = A.t_tab + 6 * e;
@@ -57,18 +57,18 @@ __device__ __forceinline__ void tr3_fc1_any(const K1Args& A, int plan, int unit,
     size_t off;
     const int k = tr3_unit(A.t_kmix, e, tr, b * 2 + mat, off);
     const uint8_t* mw = A.t_fc1 + off;
-    if ((!BS || K2) && k == 3) tr3_fc1_body<3, E4, BS>(A, plan, unit, tr, mw, mask, smem);
-    else if (!K2 || k == 4) tr3_fc1_body<4, E4, BS>(A, plan, unit, tr, mw, mask, smem);
-    else tr3_fc1_body<K2 ? 2 : 4, E4, BS>(A, plan, unit, tr, mw, mask, smem);
+    if ((!BS || K2) && k == 3) tr3_fc1_body<3, E4, BS, CB>(A, plan, unit, tr, mw, mask, smem);
+    else if (!K2 || k == 4) tr3_fc1_body<4, E4, BS, CB>(A, plan, unit, tr, mw, mask, smem);
+    else tr3_fc1_body<K2 ? 2 : 4, E4, BS, CB>(A, plan, unit, tr, mw, mask, smem);
 }
 
 // one fc2 unit. Down has one width per expert (tr[4]).
-template <bool E4, bool K2, bool BS = false>
+template <bool E4, bool K2, bool BS = false, int CB = TR3_MCG>
 __device__ __forceinline__ void tr3_fc2_any(const K1Args& A, int plan, int unit, const long long* tr, int mask, u32* smem)
 {
-    if ((!BS || K2) && tr[4] == 3) tr3_fc2_body<3, E4>(A, plan, unit, tr, mask, smem);
-    else if (!K2 || tr[4] == 4) tr3_fc2_body<4, E4>(A, plan, unit, tr, mask, smem);
-    else tr3_fc2_body<K2 ? 2 : 4, E4>(A, plan, unit, tr, mask, smem);
+    if ((!BS || K2) && tr[4] == 3) tr3_fc2_body<3, E4, CB>(A, plan, unit, tr, mask, smem);
+    else if (!K2 || tr[4] == 4) tr3_fc2_body<4, E4, CB>(A, plan, unit, tr, mask, smem);
+    else tr3_fc2_body<K2 ? 2 : 4, E4, CB>(A, plan, unit, tr, mask, smem);
 }
 
 // Trellis shared-expert slots of a step (SH): one per 8 rows (an n=8 tile each), so 1 at M <= 8; 0 without SH.
@@ -135,9 +135,9 @@ __device__ __forceinline__ void k1_tlbw(const K1Args& A, int plan, int s)
 
 // E4 = the layer's routed experts are exlr8-e4m3 (codebook rounded to E4M3, tr3.cuh tr3_cb2); K2 = it has 2-bit units;
 // SH = its shared expert is trellis row 256, run as one more slot, and its hidden-side vectors are in block-scale form
-// (tr3.sg, tr3.v1b, tr3.v3b; exlr8 v2). The binder picks the instantiation
-// per layer (bind::make_k1); E4 = K2 = SH = false is the TR3 kernel.
-template <bool E4 = false, bool K2 = false, bool SH = false>
+// (tr3.sg, tr3.v1b, tr3.v3b; exlr8 v2); CB = the codebook (tr3.cuh TR3_*, other than mcg on exlr8-e4m3 layers only).
+// The binder picks the instantiation per layer (bind::make_k1); E4 = K2 = SH = false, CB = mcg is the TR3 kernel.
+template <bool E4 = false, bool K2 = false, bool SH = false, int CB = TR3_MCG>
 __global__ __launch_bounds__(1024) void k1_tr3_fc1(K1Args A)
 {
     extern __shared__ __align__(16) u32 smem[];
@@ -148,13 +148,13 @@ __global__ __launch_bounds__(1024) void k1_tr3_fc1(K1Args A)
     {
         int e, mask, ss;
         const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (static_cast<int>(blockIdx.x) >> (__ffs(ups) - 1)) : (static_cast<int>(blockIdx.x) / ups);
-        if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, SH>(A, plan, blockIdx.x + (ss - slot) * ups, e, mask, smem);
+        if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, SH, CB>(A, plan, blockIdx.x + (ss - slot) * ups, e, mask, smem);
     }
     else if (!SH) k1_shared_fc1(A, blockIdx.x - nr, reinterpret_cast<float*>(smem));
     if (blockIdx.x == 0 && threadIdx.x == 0) A.ctl[1] = plan;
 }
 
-template <bool E4 = false, bool K2 = false, bool SH = false>
+template <bool E4 = false, bool K2 = false, bool SH = false, int CB = TR3_MCG>
 __global__ __launch_bounds__(512, 2) void k1_tr3_fc2(K1Args A)   // 68 -> 64 regs: 2 CTAs per SM (item 1h L1)
 {
     extern __shared__ __align__(16) u32 smem[];
@@ -164,7 +164,7 @@ __global__ __launch_bounds__(512, 2) void k1_tr3_fc2(K1Args A)   // 68 -> 64 reg
     {
         int e, mask, ss;
         const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (static_cast<int>(blockIdx.x) >> (__ffs(ups) - 1)) : (static_cast<int>(blockIdx.x) / ups);
-        if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc2_any<E4, K2, SH>(A, plan, blockIdx.x + (ss - slot) * ups, A.t_tab + 6 * e, mask, smem);
+        if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc2_any<E4, K2, SH, CB>(A, plan, blockIdx.x + (ss - slot) * ups, A.t_tab + 6 * e, mask, smem);
     }
     else if (!SH) k1_shared_fc2(A, blockIdx.x - nr, smem);
     if (blockIdx.x == 0 && threadIdx.x == 0) A.ctl[2] = plan;
@@ -192,7 +192,7 @@ __global__ __launch_bounds__(SH ? 288 : 256, 3) void k1_tr3_fin(K1Args A)
 // routed ones (the rest: blockIdx.x is offset by nsh * ups). Same units, same bodies, same scratch, so the same bytes.
 // PART 2 keeps the ctl bookkeeping (ctl[1], ctl[2]); PART 1 writes no ctl word and reads only ctl[0], which nothing
 // writes between the fork and the join (the finalize, after the join, advances it).
-template <bool E4, bool K2, int PART>
+template <bool E4, bool K2, int PART, int CB = TR3_MCG>
 __global__ __launch_bounds__(1024) void k1_tr3_fc1_ovl(K1Args A)
 {
     extern __shared__ __align__(16) u32 smem[];
@@ -202,11 +202,11 @@ __global__ __launch_bounds__(1024) void k1_tr3_fc1_ovl(K1Args A)
     if (PART == 2 && A.tlbw && static_cast<int>(blockIdx.x) < A.n_slots) k1_tlbw<true>(A, plan, blockIdx.x + k1_nsh<true>(A));
     int e, mask, ss;
     const int slot = cta / ups;
-    if (k1_slot<true>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, true>(A, plan, cta + (ss - slot) * ups, e, mask, smem);
+    if (k1_slot<true>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, true, CB>(A, plan, cta + (ss - slot) * ups, e, mask, smem);
     if (PART == 2 && blockIdx.x == 0 && threadIdx.x == 0) A.ctl[1] = plan;
 }
 
-template <bool E4, bool K2, int PART>
+template <bool E4, bool K2, int PART, int CB = TR3_MCG>
 __global__ __launch_bounds__(512, 2) void k1_tr3_fc2_ovl(K1Args A)
 {
     extern __shared__ __align__(16) u32 smem[];
@@ -215,7 +215,7 @@ __global__ __launch_bounds__(512, 2) void k1_tr3_fc2_ovl(K1Args A)
     const int cta = static_cast<int>(blockIdx.x) + (PART == 2 ? k1_nsh<true>(A) * ups : 0);
     int e, mask, ss;
     const int slot = cta / ups;
-    if (k1_slot<true>(A, plan, slot, e, mask, ss)) tr3_fc2_any<E4, K2>(A, plan, cta + (ss - slot) * ups, A.t_tab + 6 * e, mask, smem);
+    if (k1_slot<true>(A, plan, slot, e, mask, ss)) tr3_fc2_any<E4, K2, false, CB>(A, plan, cta + (ss - slot) * ups, A.t_tab + 6 * e, mask, smem);
     if (PART == 2 && blockIdx.x == 0 && threadIdx.x == 0) A.ctl[2] = plan;
 }
 
@@ -235,7 +235,7 @@ __device__ __forceinline__ int ld_acquire(const int* p)
     return v;
 }
 
-template <bool E4, bool K2, bool SH>
+template <bool E4, bool K2, bool SH, int CB>
 __device__ __forceinline__ void k1_fused_body(const K1Args& A)
 {
     extern __shared__ __align__(16) u32 smem[];
@@ -265,7 +265,7 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
             const int slot = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b >> (__ffs(g6nr::EB) - 1)) : (item / u1);
             const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
             int e, mask, ss = slot;
-            if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, SH>(A, plan, item + (ss - slot) * u1, e, mask, smem);
+            if (k1_slot<SH>(A, plan, slot, e, mask, ss)) tr3_fc1_any<E4, K2, SH, CB>(A, plan, item + (ss - slot) * u1, e, mask, smem);
             __threadfence();
             __syncthreads();
             if (t == 0) atomicAdd(done + ss * g6nr::EB + b, 1);
@@ -293,7 +293,7 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
                     {
                         if (t == 0) while (ld_acquire(done + ss * g6nr::EB + b) < 2 * A.KS1) {}
                         __syncthreads();
-                        tr3_fc2_any<E4, K2, SH>(A, plan, unit + (ss - slot) * u2, tr, mask, smem);
+                        tr3_fc2_any<E4, K2, SH, CB>(A, plan, unit + (ss - slot) * u2, tr, mask, smem);
                     }
                 }
             }
@@ -318,7 +318,7 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
                 {
                     if (t == 0) while (ld_acquire(done + ss * g6nr::EB + b) < 2 * A.KS1) {}
                     __syncthreads();
-                    tr3_fc2_any<E4, K2, SH>(A, plan, unit + (ss - slot) * u2, tr, mask, smem);
+                    tr3_fc2_any<E4, K2, SH, CB>(A, plan, unit + (ss - slot) * u2, tr, mask, smem);
                 }
             }
         }
@@ -341,17 +341,17 @@ __device__ __forceinline__ void k1_fused_body(const K1Args& A)
 #endif
 }
 
-template <bool E4 = false, bool K2 = false, bool SH = false>
+template <bool E4 = false, bool K2 = false, bool SH = false, int CB = TR3_MCG>
 __global__ __launch_bounds__(512) void k1_tr3_fused(K1Args A)
 {
-    k1_fused_body<E4, K2, SH>(A);
+    k1_fused_body<E4, K2, SH, CB>(A);
 }
 
 // The same with the trellis shared expert. 128 registers (1 CTA/SM of 512 threads) avoids 64-reg load-ahead throttling.
-template <bool E4 = true, bool K2 = false>
+template <bool E4 = true, bool K2 = false, int CB = TR3_MCG>
 __global__ __maxnreg__(128) void k1_tr3_fused_sh(K1Args A)
 {
-    k1_fused_body<E4, K2, true>(A);
+    k1_fused_body<E4, K2, true, CB>(A);
 }
 
 // ------------------------------------------------------------------ NVFP4 build

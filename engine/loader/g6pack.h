@@ -29,7 +29,9 @@ struct Entry
     std::vector<int64_t> shape;
     uint64_t offset = 0, nbytes = 0;
     uint8_t sha256[32];
-    int expert_format = 0;            // the entry's "expert_format": 0 = absent or "tr3", 1 = "exlr8-e4m3" (routed experts)
+    int expert_format = 0;            // the entry's "expert_format" (routed experts): 0 = absent or "tr3", 1 = "exlr8-e4m3"
+                                      // (codebook mcg), 2 = "exlr8-e4m3-mul1", 3 = "exlr8-e4m3-pmcgx", 4 =
+                                      // "exlr8-e4m3-unchecked" (no width file to name it: the binder refuses it) (bind::FMT_*)
 };
 
 struct LoadOpts

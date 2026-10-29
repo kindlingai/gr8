@@ -5,9 +5,13 @@ block scales, random per-channel vectors. 64 KiB layout: header padded with spac
 `__pad.N` tensors in the gaps.
 
 python3 -m tools.convert.v2synth OUT_DIR --layer 40 [--widths 2,3,4] [--experts 256] [--seed 1] [--no-shared]
-        [--pad-halves]
+        [--pad-halves] [--codebook mcg|mul1|pmcgx] [--tiles PREFIX]
 --experts N < 256 fills only the first N experts with random bytes (the rest are zero bytes, still checksummed):
 faster to write, same layout.
+--codebook names the trellis codebook as the exlr8 writer does: mcg keeps the bare tensor names and no trellis
+metadata codebook; any other suffixes the trellis tensor names (`trellis.gate.mul1`) and names itself in the metadata.
+--tiles PREFIX fills the trellis bytes from PREFIX-k<K>.tiles (packed tiles, 32 K bytes each, used in turn), for
+example tiles the encoder wrote in that codebook, instead of random bytes.
 """
 import argparse
 import json
@@ -65,9 +69,28 @@ def tensor_offsets(path):
     return {k: 8 + n + v['data_offsets'][0] for k, v in h.items()}
 
 
-def make_layer(out, l, widths=(2, 3, 4), n_fill=256, seed=1, shared=True, pad_halves=False, shared_widths=(3, 4)):
-    """Write the layer's index file and trellis files. Read them back with v2.V2Layer."""
+# the metadata string of each codebook, as the encoder writes it
+CODEBOOK_META = {'mcg': 'mcg 0xCBAC1FED, every value rounded to E4M3 inside the search',
+                 'mul1': 'mul1 0x83DCD12D, every value rounded to E4M3 inside the search',
+                 'pmcgx': 'pmcgx V2 L20 0xCBAC1FED/0xBCA14C51, every value rounded to E4M3 inside the search'}
+
+
+def make_layer(out, l, widths=(2, 3, 4), n_fill=256, seed=1, shared=True, pad_halves=False, shared_widths=(3, 4),
+               codebook='mcg', tiles=None):
+    """Write the layer's index file and trellis files. Read them back with v2.V2Layer. tiles: {K: packed tile bytes}
+    that fill the trellis bytes in turn (else random bytes)."""
     rng = np.random.default_rng(seed + 1000 * l)
+    suffix = '' if codebook == 'mcg' else '.' + codebook
+    pos = {}
+
+    def fill(k, n):
+        if not tiles:
+            return rng.integers(0, 256, n, dtype=np.uint8)
+        src = np.frombuffer(tiles[k], np.uint8)
+        i = pos.get(k, 0)
+        out_ = np.resize(np.roll(src, -i), n)
+        pos[k] = (i + n) % len(src)
+        return out_
     os.makedirs(out, exist_ok=True)
     signs = {'in': np.where(rng.random(v2.H) < 0.5, -1, 1).astype(np.int8),
              'out': np.where(rng.random(v2.H) < 0.5, -1, 1).astype(np.int8)}
@@ -89,22 +112,24 @@ def make_layer(out, l, widths=(2, 3, 4), n_fill=256, seed=1, shared=True, pad_ha
             for pi, p in enumerate(v2.PROJ):
                 t = np.zeros((ne, v2.NH, S), np.uint8)
                 nf = ne if s else min(ne, n_fill)
-                t[:nf, :, :hb] = rng.integers(0, 256, (nf, v2.NH, hb), dtype=np.uint8)
+                t[:nf, :, :hb] = fill(k, nf * v2.NH * hb).reshape(nf, v2.NH, hb)
                 for e in range(ne):
                     for h in range(v2.NH):
                         ck[e, pi, h] = xxh64(t[e, h, :hb], chan[p][e, h * 128:(h + 1) * 128], blk[p][e])
-                trel.append((f'{s}trellis.{p}', t))
+                trel.append((f'{s}trellis.{p}{suffix}', t))
             side.append((s, ne, ck, blk, chan))
         meta = {'format': 'exlr8-v2', 'contents': 'trellis', 'scheme': 'exlr8-e4m3-v2', 'layer': str(l), 'k': str(k),
                 'hessian': 'synthetic', 'gate_up_order': v2.GATE_UP_ORDER, 'down_order': v2.DOWN_ORDER,
                 'pad_halves': 'true' if pad_halves else 'false', 'index_file': v2.INDEX_FILE.format(l=l)}
+        if codebook != 'mcg':
+            meta['codebook'] = CODEBOOK_META[codebook]
         path = os.path.join(out, v2.WIDTH_FILE.format(l=l, k=k))
         write_st(path, trel, meta)
         offs = tensor_offsets(path)
         for s, ne, ck, blk, chan in side:
             idx = np.zeros((ne, 3, v2.NH, 2), np.int64)
             for pi, p in enumerate(v2.PROJ):
-                base = offs[f'{s}trellis.{p}']
+                base = offs[f'{s}trellis.{p}{suffix}']
                 for e in range(ne):
                     for h in range(v2.NH):
                         idx[e, pi, h] = (base + (e * v2.NH + h) * S, hb)
@@ -122,7 +147,7 @@ def make_layer(out, l, widths=(2, 3, 4), n_fill=256, seed=1, shared=True, pad_ha
              {'format': 'exlr8-v2', 'contents': 'index', 'scheme': 'exlr8-e4m3-v2', 'layer': str(l),
               'experts': f'0-{v2.N_EXP - 1}', 'widths': ','.join(map(str, widths)),
               'shared_widths': ','.join(map(str, shared_widths)) if shared else '', 'hessian': 'synthetic',
-              'gate_up_order': v2.GATE_UP_ORDER, 'down_order': v2.DOWN_ORDER,
+              'gate_up_order': v2.GATE_UP_ORDER, 'down_order': v2.DOWN_ORDER, 'codebook': CODEBOOK_META[codebook],
               'pad_halves': 'true' if pad_halves else 'false'})
 
 
@@ -135,9 +160,15 @@ def main(argv=None):
     ap.add_argument('--seed', type=int, default=1)
     ap.add_argument('--no-shared', action='store_true')
     ap.add_argument('--pad-halves', action='store_true')
+    ap.add_argument('--codebook', default='mcg', choices=tuple(CODEBOOK_META))
+    ap.add_argument('--tiles', help='PREFIX: fill the trellis bytes from PREFIX-k<K>.tiles')
     a = ap.parse_args(argv)
-    make_layer(a.out, a.layer, tuple(int(x) for x in a.widths.split(',')), a.experts, a.seed, not a.no_shared,
-               a.pad_halves)
+    widths = tuple(int(x) for x in a.widths.split(','))
+    tiles = None
+    if a.tiles:
+        tiles = {k: open(f'{a.tiles}-k{k}.tiles', 'rb').read() for k in sorted(set(widths) | ({3, 4} if not a.no_shared else set()))}
+    make_layer(a.out, a.layer, widths, a.experts, a.seed, not a.no_shared, a.pad_halves, codebook=a.codebook,
+               tiles=tiles)
 
 
 if __name__ == '__main__':
