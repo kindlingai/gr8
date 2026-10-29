@@ -18,6 +18,9 @@ has width K (L<LLL>. prefix):
 Metadata: format, version, tp, rank, k, layers, half_bytes, rule, files, source, and, with --set-id, set_id (the weight
 set these slices were cut from, see SET_ID_RULE) and index_sha256 (JSON: layer -> sha256 of its index file).
 
+The slices hold no codebook: the engine's planner reads it from each width file's header (engine/loader-rs/src/
+codebook.rs). An index file whose metadata names a codebook gr8 does not decode is refused here already.
+
 The offsets follow 65536 + ((p * 256 + e) * 16 + h) * half_bytes in every published file (p = 0 gate, 1 up, 2 down;
 the shared expert's halves follow the routed ones); they are copied from the index files, and the generator checks them
 against that rule.
@@ -115,6 +118,8 @@ def main(argv=None):
     have = {k: [] for k in widths}
     for L in layers:
         idx = ST(os.path.join(a.v2, v2.INDEX_FILE.format(l=L)))
+        if 'codebook' in idx.meta:          # slices carry offsets only: the engine reads the codebook from the width files
+            v2.codebook_of_metadata(idx.meta['codebook'])
         for k in widths:
             if f'k{k}.index' not in idx:
                 continue

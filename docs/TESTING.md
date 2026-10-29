@@ -25,7 +25,9 @@ What the two halves cover, and how to run one part alone:
 |---|---|---|
 | S2 batch planner (with insert rules), control barrier, pool reuse, runs that grow on demand, the Rust pool against the C++ one it replaced, the pool's block stores (`--kv-store`) in lock-step through memory, a file and a loopback KV node | engine | `scripts/host_tests.sh` |
 | the S2 page allocator's properties (no page lost or held twice, growth only from a safe state, no deadlock, ranks agree, across shrinks and grows of the pool), and the SSD and remote page stores (the remote one over loopback TCP; `kvman-remote-bench --isolation` checks RDMA on the hardware) | engine | `cargo test --manifest-path engine/kvman-rs/Cargo.toml` |
-| the exlr8 dense decoder against `loader/exlr8.py` (a synthetic fixture), and the layout planner (`engine/loader-rs/src/layout.rs`): the counts the engine reads, balance, the fewest pieces moved | engine | `cargo test --manifest-path engine/loader-rs/Cargo.toml` |
+| the exlr8 dense decoder against `loader/exlr8.py` (a synthetic fixture), the layout planner (`engine/loader-rs/src/layout.rs`): the counts the engine reads, balance, the fewest pieces moved, and the trellis codebooks (`src/codebook.rs`): every state against the GPU test's hashes, and each layer's codebook from its width files, with the refusals | engine | `cargo test --manifest-path engine/loader-rs/Cargo.toml` |
+| the Python reference's trellis codebooks (`engine/ref/g6ref.py`) against the same hashes | engine | `python3 -m unittest discover -s engine/ref -p 'test_*.py'` |
+| the v2 expert converter (`tools/convert/v2.py`), with each codebook and its refusals | engine | `python3 -m unittest tools.convert.test_v2` |
 | the gate harness | engine | `python3 -m unittest discover bench/gate/tests` |
 | the n-gram draft source replay and A/B tool (#56: table, chain and tree proposals, acceptance, held-out folds; `ab.py` against a stub server) | engine | `python3 -m unittest discover -s tools/ngram/tests` |
 | the rank health probe | engine | `python3 -m unittest discover tools/health` |
@@ -96,7 +98,10 @@ one GPU and makes its own synthetic weights.
 | `flash_dsa_f16_test` | `G6_PF_DSA_F16GEMM` against the full-GV kernel and fp64 |
 | `mhc_decode_stage_test` | the decode mHC pinned-partial stage: bytes and time |
 
-`scripts/build.sh` runs `tr3_e4m3_test` (the trellis codebook decode, when a GPU is visible), `l2pf_queue_test` and
+`scripts/build.sh` runs `tr3_e4m3_test` (the trellis codebook decode, when a GPU is visible: every state of the mcg,
+mul1 and pmcgx codebooks against a host reference and the hashes the Rust and Python references check, and every lane
+decode path of the kernels on random tiles; `--cb --k --tiles --values` also checks tiles the exlr8 encoder wrote
+against its own decoded values), `l2pf_queue_test` and
 `k1_split_test` (both host only), the four steering tests and `s2_steer_test`. It builds these without running them:
 
 | test | checks |
