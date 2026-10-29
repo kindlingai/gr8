@@ -2,8 +2,11 @@
 //!   ssd:PATH          a file of slots on this box (tier::SlotFile, O_DIRECT where the filesystem allows it)
 //!   remote:HOST:PORT  a lease on a KV node (remote::RemoteStore, RDMA where both ends can, else TCP)
 //!   mem:              this process's memory (tests)
+//!   ram:FLOOR+STORE   STORE behind a RAM cache the kernel may take back (ram::RamCache), filled while MemAvailable
+//!                     is above FLOOR bytes
 //! A block's bytes are rounded up to 4 KiB, the slot an SSD needs, so every store takes the same buffers.
 
+use crate::ram::RamCache;
 use crate::remote::{GroupOpts, Opts, RemoteStore};
 use crate::tier::{par_for, BlockStore, SlotFile, ALIGN};
 use std::cell::RefCell;
@@ -15,6 +18,7 @@ pub enum Blocks {
     Ssd(SlotFile),
     Remote(Box<RemoteStore>),
     Mem(Mutex<Vec<u8>>, usize, u64),
+    Ram(Box<RamCache>),
 }
 
 // KVMAN_TRANSPORT=tcp|rdma|auto (default auto) per box: a rank whose path to the node is routed through another box
@@ -29,6 +33,13 @@ fn transport() -> io::Result<crate::remote::Want> {
 impl Blocks {
     /// `spec` as above, `name` the lease name on a KV node, `block_bytes` before rounding.
     pub fn open(spec: &str, name: &str, block_bytes: usize, blocks: u64) -> io::Result<Blocks> {
+        if let Some(r) = spec.strip_prefix("ram:") {
+            let floor = r.split_once('+').and_then(|(f, inner)| Some((f.parse::<u64>().ok()?, inner)));
+            let (floor, inner) = floor.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("store {spec}: ram:FLOOR_BYTES+STORE"))
+            })?;
+            return Ok(Blocks::Ram(Box::new(RamCache::new(Blocks::open(inner, name, block_bytes, blocks)?, floor)?)));
+        }
         let slot = block_bytes.div_ceil(ALIGN) * ALIGN;
         let bad =
             || io::Error::new(io::ErrorKind::InvalidInput, format!("store {spec}: ssd:PATH, remote:HOST:PORT or mem:"));
@@ -68,6 +79,7 @@ impl Blocks {
     fn remote(&self) -> io::Result<&RemoteStore> {
         match self {
             Blocks::Remote(r) => Ok(r),
+            Blocks::Ram(c) => c.back.remote(),
             _ => Err(io::Error::new(io::ErrorKind::Unsupported, "not a KV node store")),
         }
     }
@@ -88,6 +100,7 @@ impl Blocks {
                 r.fallback.as_ref().map_or(String::new(), |f| format!(" (no RDMA: {f})"))
             ),
             Blocks::Mem(_, s, n) => format!("memory, {n} blocks of {s} B"),
+            Blocks::Ram(c) => c.describe(),
         }
     }
 }
@@ -98,6 +111,7 @@ impl BlockStore for Blocks {
             Blocks::Ssd(f) => f.slot_bytes(),
             Blocks::Remote(r) => r.block_bytes,
             Blocks::Mem(_, s, _) => *s,
+            Blocks::Ram(c) => c.block_bytes(),
         }
     }
     fn blocks(&self) -> u64 {
@@ -105,12 +119,14 @@ impl BlockStore for Blocks {
             Blocks::Ssd(f) => f.slots(),
             Blocks::Remote(r) => r.blocks(),
             Blocks::Mem(_, _, n) => *n,
+            Blocks::Ram(c) => c.blocks(),
         }
     }
     fn write_block(&self, block: u64, buf: &[u8]) -> io::Result<()> {
         match self {
             Blocks::Ssd(f) => f.write_block(block, buf),
             Blocks::Remote(r) => r.write_block(block, buf),
+            Blocks::Ram(c) => c.write_block(block, buf),
             Blocks::Mem(m, s, n) => {
                 if block >= *n || buf.len() > *s {
                     return Err(io::Error::new(io::ErrorKind::InvalidInput, "block out of range"));
@@ -125,6 +141,7 @@ impl BlockStore for Blocks {
         match self {
             Blocks::Ssd(f) => f.read_block(block, buf),
             Blocks::Remote(r) => r.read_block(block, buf),
+            Blocks::Ram(c) => c.read_block(block, buf),
             Blocks::Mem(m, s, n) => {
                 if block >= *n || buf.len() > *s {
                     return Err(io::Error::new(io::ErrorKind::InvalidInput, "block out of range"));
@@ -255,7 +272,11 @@ pub unsafe extern "C" fn g6kv_tier_read(t: *const Blocks, block: u64, buf: *mut 
 /// `t` must be a live store, and the memory must outlive it.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_tier_register(t: *const Blocks, buf: *mut c_void, len: usize) -> i32 {
-    match &*t {
+    let t = match &*t {
+        Blocks::Ram(c) => &c.back,
+        t => t,
+    };
+    match t {
         Blocks::Remote(r) => match r.register(buf as *mut u8, len) {
             Ok(()) => 0,
             Err(e) => fail(e),
@@ -478,5 +499,24 @@ pub unsafe extern "C" fn g6kv_store_shrink(t: *const Blocks, segs: u64, txn: u64
                 c
             }
         }
+    }
+}
+
+/// A RAM cache's counters (ram:FLOOR+STORE): reads served from RAM, reads that went to the store, and writes not
+/// cached for lack of free memory. 0, or -1 for a store without one.
+///
+/// # Safety
+/// `t` must be a live store and `out` valid for three writes.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_ram_stats(t: *const Blocks, out: *mut u64) -> i32 {
+    match &*t {
+        Blocks::Ram(c) if !out.is_null() => {
+            use std::sync::atomic::Ordering::Relaxed;
+            *out = c.hits.load(Relaxed);
+            *out.add(1) = c.misses.load(Relaxed);
+            *out.add(2) = c.skipped.load(Relaxed);
+            0
+        }
+        _ => -1,
     }
 }

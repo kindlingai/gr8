@@ -349,6 +349,8 @@ def cmd_show_config(argv):
     c, text, digest = opt.canonical(o, plan, members, variant)
     print(f'options ({o.file or "no config file"}; command line > file > environment > default):')
     print(opt.summary(o))
+    for line in opt.kv_describe(o):
+        print(line)
     for w in o.warnings:
         print(f'warning: {w}')
     print('\ncluster options (the handshake compares these):')

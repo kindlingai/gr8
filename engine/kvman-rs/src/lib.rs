@@ -52,6 +52,7 @@ pub mod canon;
 pub mod ledger;
 pub mod ffi;
 pub mod pool;
+pub mod ram;
 pub mod remote;
 pub mod reuse;
 pub mod rows;

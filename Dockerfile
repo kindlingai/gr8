@@ -157,11 +157,11 @@ COPY --from=dist-tests / /
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU} AS runtime
 # libibverbs1 + ibverbs-providers (mlx5) for the fabric, ibverbs-utils for ibv_devinfo, python3 for the shims and
-# the launcher, curl + jq for smoketest/run.sh (./gr8 glm53 smoke). Every engine here
+# the launcher (python3-yaml for KV_STORE=@FILE), curl + jq for smoketest/run.sh (./gr8 glm53 smoke). Every engine here
 # serves through S2, so nothing in the container uses ssh. The runtime base already has cuBLAS.
 # hadolint ignore=DL3008
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libibverbs1 ibverbs-providers ibverbs-utils python3 \
+ && apt-get install -y --no-install-recommends libibverbs1 ibverbs-providers ibverbs-utils python3 python3-yaml \
       curl jq \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/gr8

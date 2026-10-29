@@ -484,6 +484,10 @@ class KvStoreTests(unittest.TestCase):
         o, p = self.plan('--kv-store', a + ',persist=on,keep=system', '--kv-store', b + ',keep=all')
         self.assertEqual(self.stores(p), [a + ',persist=on,keep=system', b + ',keep=all'])
         self.assertEqual([x['keep'] for x in opt.kv_stores(o)], ['system', 'all'])
+        # a named cache reaches the engine as the store's spare_ram_cache=on
+        o, p = self.plan('--kv-store', 'cache:s,kind=spare_ram,floor=3G', '--kv-store', b + ',name=far,cache=s')
+        self.assertEqual(self.stores(p), [b + ',spare_ram_cache=on,spare_ram_floor=3G'])
+        self.assertEqual([(t['name'], t['cache']) for t in opt.kv_stores(o)], [('far', 's')])
         # the same from the environment, stores separated by ;
         self.assertEqual(self.stores(self.plan(env={'KV_STORE': f'{a};{b}'})[1]), [a, b])
 
@@ -512,11 +516,225 @@ class KvStoreTests(unittest.TestCase):
                            (['--kv-store', 'ssd:/x,size=8'], 'want size='), (['--kv-store', 'ssd:/x,size=8G,keep=most'], 'keep=system, sessions or all'),
                            (['--kv-store', 'remote:192.0.2.5:7350,size=8G,persist=on'], 'for ssd:'),
                            (['--kv-store', 'ssd:/x,size=8G,persist=yes'], 'persist=on|off'),
+                           (['--kv-store', 'ssd:/x,size=8G,spare_ram_cache=on'], "is the engine's"),
+                           (['--kv-store', 'cache:s,kind=spare_ram', '--kv-store',
+                             'remote:192.0.2.5:7350,size=8G,group=g,cache=s'], 'fixed lease'),
                            (['--kv-store', 'remote:auto,size=8G'], 'name it'), (['--kv-store', 'ssd:/x,size=8G', '--reuse', '0'], 'needs REUSE'),
                            (['--kv-store', 'ssd:/x,size=8G', '--kv-system-after', '0'], 'from 1'),
                            (['--kv-store', 'ssd:/x,size=8G', '--kv-keep', 'most'], 'system, sessions or all'),
                            (['--kv-store', 'ssd:/x,size=8G', '--kv-write-limit', 'lots'], 'per page computed')):
             v.check(['--peers', PEERS, *argv], want)
+
+
+class KvStoreFileTests(unittest.TestCase):
+    """KV_STORE=@FILE: tiers in a YAML file, lowered to the one-line form the engine and the logs take."""
+    FILE = """
+caches:
+  spare: {kind: spare_ram, floor: 2G}
+tiers:                       # tried in order
+  - keep: system
+    cache: spare
+    store:
+      ssd: {path: /nvme/gr8kv, size_per_rank: 4G, persist: true}
+  - keep: all
+    cache: spare
+    store:
+      remote: {address: auto, size_per_rank: 8G}
+"""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def lower(self, text):
+        return opt.kv_store_file(write(self.d, 'kv.yaml', text))
+
+    def test_lowers_in_cascade_order(self):
+        self.assertEqual(self.lower(self.FILE), 'cache:spare,kind=spare_ram,floor=2G;ssd:/nvme/gr8kv,size=4G,persist=on,'
+                                                'keep=system,cache=spare;remote:auto,size=8G,keep=all,cache=spare')
+        self.assertEqual(self.lower('tiers:\n- store:\n    remote: {address: "192.0.2.5:7350", size_per_rank: 8G, '
+                                    'group: g, cap_per_rank: 32G, weight: 2000}\n'),
+                         'remote:192.0.2.5:7350,size=8G,group=g,cap=32G,weight=2000')
+        # two tiers of one kind need names
+        two = 'tiers:\n- {name: a, store: {ssd: {path: /a, size_per_rank: 4G}}}\n' \
+              '- {name: b, store: {ssd: {path: /b, size_per_rank: 4G}}}\n'
+        self.assertEqual(self.lower(two), 'ssd:/a,size=4G,name=a;ssd:/b,size=4G,name=b')
+        # unnamed stores of one kind are named kind-N
+        self.assertEqual([t['name'] for t in opt.kv_parse('ssd:/a,size=4G;remote:auto,size=4G;ssd:/b,size=4G')[1]],
+                         ['ssd-1', 'remote', 'ssd-2'])
+
+    def test_at_file_beside_the_config_file(self):
+        write(self.d, 'kv.yaml', 'tiers:\n- store: {ssd: {path: /x, size_per_rank: 4G}}\n')
+        cfg = write(self.d, 'c.env', f'PEERS={PEERS}\nKV_STORE=@kv.yaml\n')
+        o = opt.parse(['@' + cfg], {})
+        self.assertEqual(o.get('KV_STORE'), 'ssd:/x,size=4G')
+        self.assertIn('via ' + os.path.join(self.d, 'kv.yaml'), opt.summary(o))
+        # an @FILE among one-line stores, from the command line: relative to the working directory
+        o = opt.parse(['--no-config', '--kv-store', 'remote:192.0.2.5:7350,size=8G', '--kv-store',
+                       '@' + os.path.join(self.d, 'kv.yaml')], {})
+        self.assertEqual(o.get('KV_STORE'), 'remote:192.0.2.5:7350,size=8G;ssd:/x,size=4G')
+
+    def test_the_log_shows_both_forms(self):
+        o = opt.parse(['--no-config', '--kv-store', '@' + write(self.d, 'kv.yaml', self.FILE)], {})
+        lines = opt.kv_describe(o)
+        self.assertEqual(lines[0], 'KV_STORE=' + self.lower(self.FILE))
+        self.assertEqual(lines[1], 'KV_STORE as YAML:')
+        self.assertEqual(opt.kv_store_text('\n'.join(x[2:] for x in lines[2:])), self.lower(self.FILE))
+        self.assertEqual(opt.kv_describe(opt.parse(['--no-config'], {})), [])
+
+    def test_refusals_name_the_key(self):
+        ssd = '{ssd: {path: /x, size_per_rank: 4G}}'
+        for text, want in [
+            ('', 'the file: want a mapping'),
+            ('caches: {}\n', 'tiers: no tiers'),
+            ('tiers: []\n', 'tiers: no tiers'),
+            ('runs: []\ntiers: []\n', 'the file.runs: not built yet'),
+            ('tier: []\n', 'the file.tier: want caches, tiers'),
+            (f'tiers:\n- {{keep: all}}\n', 'tiers[0]: no store'),
+            ('tiers:\n- store: {nvme: {path: /x}}\n', 'tiers[0].store: want one of ssd: or remote:'),
+            ('tiers:\n- store: {ssd: {size_per_rank: 4G}}\n', 'tiers[0].store.ssd: no path'),
+            ('tiers:\n- store: {ssd: {path: /x, size: 4G}}\n', 'tiers[0].store.ssd.size: want path, size_per_rank, persist'),
+            ('tiers:\n- store: {ssd: {path: /x, size_per_rank: 4G, persist: on}}\n', None),
+            ('tiers:\n- store: {ssd: {path: /x, size_per_rank: 4G, persist: maybe}}\n',
+             "tiers[0].store.ssd.persist: want true or false, got 'maybe'"),
+            ('tiers:\n- store: {ssd: {path: /x, size_per_rank: 4}}\n', 'tiers[0].store.ssd.size_per_rank: want a string'),
+            ('tiers:\n- store: {ssd: {path: /x}}\n', 'tiers[0]: --kv-store ssd:/x: size=N(G|T) is needed'),
+            (f'tiers:\n- {{name: ssd-2, store: {ssd}}}\n- store: {ssd}\n- store: {ssd}\n',
+             'tiers[2]: --kv-store ssd:/x,size=4G: the name ssd-2 is also store 1\'s'),
+            (f'tiers:\n- {{store: {ssd}, transforms: []}}\n', 'tiers[0].transforms: not built yet'),
+            (f'tiers:\n- {{store: {ssd}, cache: spar}}\n', 'tiers[0]: --kv-store ssd:/x,size=4G,cache=spar: no cache spar (caches: none)'),
+            (f'caches: {{spare: {{kind: fixed_ram}}}}\ntiers:\n- store: {ssd}\n', 'caches.spare: --kv-store cache:spare,kind=fixed_ram: kind=spare_ram'),
+            (f'caches: {{spare: {{kind: spare_ram, takes: [system]}}}}\ntiers:\n- store: {ssd}\n',
+             'caches.spare.takes: not built yet'),
+            (f'tiers:\n- {{keep: most, store: {ssd}}}\n', 'keep=system, sessions or all'),
+            ('caches: {s: {kind: spare_ram}}\ntiers:\n- cache: s\n  store: {remote: {address: "192.0.2.5:7350", '
+             'size_per_rank: 8G, group: g}}\n', 'fixed lease'),
+            ('tiers: [\n', 'KV_STORE=@'),
+            ('tiers:\n- store: {remote: {address: auto, size_per_rank: 8G, group: g, weight: 02000}}\n', 'plain decimal'),
+            ('tiers:\n- store: {remote: {address: 7350:1, size_per_rank: 8G}}\n', 'plain decimal'),
+            ('a: 1\na: 2\n', 'a given twice'),
+        ]:
+            with self.subTest(text=text):
+                if want is None:   # YAML 1.1: on is true
+                    self.assertEqual(self.lower(text), 'ssd:/x,size=4G,persist=on')
+                    continue
+                with self.assertRaises(opt.OptionError) as e:
+                    self.lower(text)
+                self.assertIn(want, str(e.exception))
+        with self.assertRaises(opt.OptionError) as e:
+            opt.kv_store_file(os.path.join(self.d, 'missing.yaml'))
+        self.assertIn('No such file', str(e.exception))
+
+
+class KvFuzzTests(unittest.TestCase):
+    """The one-line form and the YAML store file accept and refuse the same stores, and mean the same thing."""
+    N = 3000
+
+    @staticmethod
+    def setup(rng):
+        """Random caches and tiers, valid or not, as ([(name, kind, floor)], [(kind, address, {YAML key: value})])."""
+        pick = rng.choice
+        def some(good, bad):   # mostly good values, so both kinds of outcome get tested
+            return pick(good) if rng.random() < 0.93 else pick(bad)
+
+        caches = [(some(['spare', 's2'], ['bad name', 'a;b', 'a=b']), some(['spare_ram'], ['fixed_ram', None]),
+                   some([None, '2G', '512M', '1.5G'], ['0G', '4T', 'x'])) for _ in range(pick([0, 0, 1, 1, 2]))]
+        names = [c[0] for c in caches] + ['nope']
+        tiers = []
+        for _ in range(pick([0, 1, 1, 2, 3])):
+            kind = pick(['ssd', 'remote'])
+            address = some(['/nvme/a', '/b'], ['/x y', '/a,b', '']) if kind == 'ssd' else \
+                some(['auto', '192.0.2.5:7350', 'kv:7350'], ['auto:7350', '', 'a;b'])
+            t = {}
+            if rng.random() < 0.97:
+                t['size_per_rank'] = some(['4G', '1.5T', '512M'], ['4', '0G', 'x'])
+            for key, good, bad, p in (('persist', [True, False], [], 0.4 if kind == 'ssd' else 0.03),
+                                      ('keep', ['system', 'all', 'sessions'], ['most'], 0.5),
+                                      ('name', ['a', 'b', 'c', 'd'], ['ssd', 'remote', 'x y'], 0.4),
+                                      ('cache', names[:-1] or ['nope'], ['nope'], 0.4),
+                                      ('group', ['g', 'h'], ['g;h'], 0.15 if kind == 'remote' else 0.02),
+                                      ('cap_per_rank', ['32G'], ['x'], 0.1), ('weight', [2000, 1], [0, 'abc'], 0.1)):
+                if rng.random() < p:
+                    t[key] = some(good, bad or good)
+            tiers.append((kind, address, t))
+        return caches, tiers
+
+    @staticmethod
+    def line(caches, tiers, rng):
+        one = {'size_per_rank': 'size', 'cap_per_rank': 'cap'}
+        entries = [f'cache:{n}' + (f',kind={k}' if k else '') + (f',floor={f}' if f else '') for n, k, f in caches]
+        for kind, address, t in tiers:
+            settings = [f'{one.get(k, k)}={("on" if x else "off") if isinstance(x, bool) else x}' for k, x in t.items()]
+            rng.shuffle(settings)
+            entries.append(','.join([f'{kind}:{address}'] + settings))
+        stores = iter([e for e in entries if not e.startswith('cache:')])
+        rng.shuffle(entries)   # caches may come anywhere; the stores keep their order
+        return ';'.join(e if e.startswith('cache:') else next(stores) for e in entries)
+
+    @staticmethod
+    def yaml_text(caches, tiers):
+        import yaml
+        doc = {}
+        if caches:
+            doc['caches'] = {n: {k: x for k, x in (('kind', kind), ('floor', f)) if x} for n, kind, f in caches}
+        doc['tiers'] = []
+        for kind, address, t in tiers:
+            on_tier = {k: x for k, x in t.items() if k in ('keep', 'name', 'cache')}
+            store = {('path' if kind == 'ssd' else 'address'): address}
+            store.update({k: x for k, x in t.items() if k not in on_tier})
+            doc['tiers'].append({**on_tier, 'store': {kind: store}})
+        return yaml.safe_dump(doc, sort_keys=False)
+
+    @staticmethod
+    def outcome(f, *a):
+        try:
+            return f(*a)
+        except opt.OptionError as e:
+            return e
+
+    def test_both_forms_agree(self):
+        import random
+        rng, agreed = random.Random(239), {True: 0, False: 0}
+        for i in range(self.N):
+            caches, tiers = self.setup(rng)
+            if len({c[0] for c in caches}) < len(caches) or not (caches or tiers):
+                continue   # a YAML mapping has no second key of one name; an empty one-line form is off
+            line, text = self.line(caches, tiers, rng), self.yaml_text(caches, tiers)
+            a, b = self.outcome(opt.kv_parse, line), self.outcome(opt.kv_store_text, text)
+            if not isinstance(a, Exception) and not a[1]:
+                a = opt.OptionError('no stores')   # caches alone: kv_parse refuses an unused cache first
+            with self.subTest(i=i, line=line, yaml=text):
+                self.assertEqual(isinstance(a, Exception), isinstance(b, Exception), f'{a!r} / {b!r}')
+                agreed[not isinstance(a, Exception)] += 1
+                if isinstance(a, Exception):
+                    continue
+                self.assertEqual(opt.kv_line(*a), b)
+                self.assertEqual(opt.kv_engine(line), opt.kv_engine(b))
+                self.assertEqual(opt.kv_store_text(opt.kv_yaml(*a)), b, 'the logged YAML reads back')
+        self.assertGreater(min(agreed.values()), self.N // 10, f'too few of one kind: {agreed}')
+
+    def test_mutations_only_refuse(self):
+        import random
+        rng = random.Random(7)
+        line = ('cache:spare,kind=spare_ram,floor=2G;ssd:/nvme/gr8kv,size=4G,persist=on,keep=system,cache=spare;'
+                'remote:192.0.2.5:7350,size=8G,keep=all,name=far,group=g,cap=32G,weight=2000')
+        texts = [(opt.kv_parse, line), (opt.kv_store_text, opt.kv_yaml(*opt.kv_parse(line)))]
+        alphabet = ',;=:{}[]-#&*!|>\'"\n\t ' + 'abcz019GT._/'
+        for i in range(self.N):
+            f, text = texts[i % 2]
+            chars = list(text)
+            for _ in range(rng.randint(1, 4)):
+                at = rng.randrange(len(chars) + 1)
+                if chars and rng.random() < 0.5:
+                    del chars[min(at, len(chars) - 1)]
+                else:
+                    chars.insert(at, rng.choice(alphabet))
+            got = ''.join(chars)
+            with self.subTest(i=i, text=got):
+                r = self.outcome(f, got)   # anything but an OptionError fails the test
+                if isinstance(r, Exception):
+                    continue
+                caches, stores = opt.kv_parse(opt.kv_line(*r)) if f is opt.kv_parse else opt.kv_parse(r)
+                self.assertEqual(opt.kv_store_text(opt.kv_yaml(caches, stores)), opt.kv_line(caches, stores))
 
 
 class KvRowsTests(unittest.TestCase):

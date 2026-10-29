@@ -175,6 +175,12 @@ public:
                      (unsigned long long)x.wblocks, x.wblocks * pb_.slot_bytes() / 1e6, x.wms, (unsigned long long)x.rblocks,
                      x.rblocks * pb_.slot_bytes() / 1e6, x.rms, (unsigned long long)x.calls);
             out += b;
+            uint64_t ram[3];
+            if (g6kv_tier_ram_stats(t_[t], ram) == 0) {
+                snprintf(b, sizeof b, ", spare RAM %llu hits %llu misses %llu skipped", (unsigned long long)ram[0], (unsigned long long)ram[1],
+                         (unsigned long long)ram[2]);
+                out += b;
+            }
         }
         return out;
     }
@@ -265,10 +271,11 @@ public:
     }
 };
 
-// One --kv-store value: STORE,size=N(M|G|T)[,persist=on|off][,keep=system|sessions|all][,group=NAME[,cap=N(M|G|T)]
-// [,weight=N]]. STORE is ssd:PATH (a folder) or remote:HOST:PORT (remote:auto is the launcher's to resolve). Sizes are
-// binary: G = 2^30, T = 2^40. persist=on (SSD only) keeps the folder's system prefixes and counts across restarts; off
-// (the default) clears it at boot. keep= is this store's --kv-keep. group= (remote only): the lease joins that group on
+// One --kv-store value: STORE,size=N(M|G|T)[,persist=on|off][,keep=system|sessions|all]
+// [,spare_ram_cache=on|off[,spare_ram_floor=N(M|G)]][,group=NAME[,cap=N(M|G|T)][,weight=N]]. STORE is ssd:PATH (a
+// folder) or remote:HOST:PORT (remote:auto is the launcher's to resolve). Sizes are binary: G = 2^30, T = 2^40.
+// persist=on (SSD only) keeps the folder's system prefixes and counts across restarts; off (the default) clears it at
+// boot. keep= is this store's --kv-keep. group= (remote only): the lease joins that group on
 // the node and its size moves between size (the floor) and cap (0 or none: as far as the node gives) by whole segments;
 // weight (1000 = 1x, the default) is its share against the other groups (kvman-rs REMOTE-TIER.md "Sharing a node").
 // The deprecated --kv-tier (old) takes keep=evicted|shared|all instead, which g6m4 maps to --kv-keep.
@@ -278,6 +285,8 @@ struct TierSpec {
     int keep = 0;       // --kv-tier only: 0 evicted, 1 shared, 2 all
     std::string rule;   // --kv-store keep=: system, sessions or all; empty = --kv-keep
     bool persist = false;
+    bool spare_ram = false;                   // spare_ram_cache=on: a cache in spare RAM in front of the store (src/ram.rs)
+    uint64_t spare_ram_floor = 2ull << 30;    // spare_ram_floor=: cache only while MemAvailable stays above it
     std::string group;
     uint64_t cap = 0;
     uint32_t weight = 0;
@@ -310,6 +319,11 @@ struct TierSpec {
                 const long w = strtol(x.c_str(), &end, 10);
                 if (x.empty() || *end || w < 1 || w > 1000000) throw std::runtime_error("--kv-store " + v + ": weight=N, 1000 = 1x");
                 t.weight = uint32_t(w);
+            } else if (k == "spare_ram_cache") {
+                if (x != "on" && x != "off") throw std::runtime_error("--kv-store " + v + ": spare_ram_cache=on or off");
+                t.spare_ram = x == "on";
+            } else if (k == "spare_ram_floor") {
+                t.spare_ram_floor = bytes();
             } else if (k == "persist") {
                 if (x != "on" && x != "off") throw std::runtime_error("--kv-store " + v + ": persist=on or off");
                 t.persist = x == "on";
@@ -330,6 +344,8 @@ struct TierSpec {
         if (!t.bytes) throw std::runtime_error("--kv-store " + v + ": size=N(G|T) is needed");
         if (t.persist && !ssd) throw std::runtime_error("--kv-store " + v + ": persist=on is for ssd: stores");
         if (!t.group.empty() && !remote) throw std::runtime_error("--kv-store " + v + ": group= is for remote: stores");
+        if (t.spare_ram && !t.group.empty())
+            throw std::runtime_error("--kv-store " + v + ": spare_ram_cache=on needs a fixed lease (no group=)");
         if (t.group.empty() && (t.cap || t.weight)) throw std::runtime_error("--kv-store " + v + ": cap= and weight= need group=");
         if (t.cap && t.cap < t.bytes) throw std::runtime_error("--kv-store " + v + ": cap= is below size=");
         return t;
