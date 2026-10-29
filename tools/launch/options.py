@@ -477,8 +477,8 @@ RENAMED = {'G6_HOME': 'GR8_WORK_DIR', 'G6ENV_X': 'EXTRA_ENV', 'G6ARGS_X': 'EXTRA
 RENAMED_FLAGS = {'--g6-home': '--work-dir', '--g6env-x': '--extra-env',
                  '--g6args-x': '--extra-args'}
 # Read from old config files and ignored here, so they do not draw a warning.
-IGNORED = {'HOSTS', 'PACKS', 'PACK_DIR', 'BIN_DIR', 'GR8_CLUSTER', 'G6_NR', 'G6_WIDTHS', 'G6_TESTS', 'BUNDLE_LIBS', 'ARCH',
-           'EXTRA', 'SHARED', 'RANK_HEALTH', 'PROBE_ARGS', 'QP_PACK', 'PLAIN', 'FRONT'}
+IGNORED = {'HOSTS', 'PACKS', 'PACK_DIR', 'BIN_DIR', 'GR8_CLUSTER', 'G6_NR', 'G6_WIDTHS', 'G6_TESTS', 'GR8_NR', 'GR8_WIDTHS',
+           'GR8_TESTS', 'BUNDLE_LIBS', 'ARCH', 'EXTRA', 'SHARED', 'RANK_HEALTH', 'PROBE_ARGS', 'QP_PACK', 'PLAIN', 'FRONT'}
 SWITCHES = {'--no-config', '--no-check', '--foreground'}
 ENGINE_KNOBS = [k for k in list(KEYS)[list(KEYS).index('CAP'):]]
 FABRIC_PORT = 18600   # engine/comms/fabric.h: the fabric bootstrap and per-collective ports start here

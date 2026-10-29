@@ -555,11 +555,11 @@ int main(int argc, char** argv)
     const bool own4 = MP && knob::pf_own() == 4;
     const int qp_roll_s = (int)knob::pf_qp_roll();              // rolling pack: 0 or 2..4
     const bool qp_roll_ser = knob::pf_qp_roll_ser();
-    const int qp_wire_e = (int)knob::pf_qp_wire_e();            // wire ring entries (qp_wire.h)
+    const int qp_wire_e = (int)knob::pf_qp_wire_e().value_or(1);   // wire ring entries (qp_wire.h)
     {
-        // a wire ring other than the default one entry counts as set (the knob cannot tell 1 from unset)
         const std::string qp_ctx = knob::pf_qp_ctx() ? std::to_string(*knob::pf_qp_ctx()) : "";
-        const std::string why = qw::roll_env_refusal(own4, qp_roll_s, qp_wire_e != 1, qp_wire_e, qp_ctx.c_str(), !qp_file.empty());
+        const std::string why = qw::roll_env_refusal(own4, qp_roll_s, knob::pf_qp_wire_e().has_value(), qp_wire_e,
+                                                     qp_ctx.c_str(), !qp_file.empty());
         if (!why.empty()) die(why);
         if (own4 && g6nr::NR != 4) die("GR8_PF_OWN=4 is TP4 only (G6_NR=4)");
         if (own4 && !qp_roll_s && (qp_man.empty() || qp_file.empty())) die("GR8_PF_OWN=4 needs --qp-manifest and --qp-pack (or GR8_PF_QP_ROLL)");

@@ -86,8 +86,11 @@ fn signature() {
     let e = env(&[("GR8_ATTN_CTX3", "1"), ("G6_ATTN_CTX2", "2"), ("GR8_ATTN_FRONT", "0"), ("GR8_L2PF", "1")]);
     assert_eq!(TABLE[find("L2PF")].scope, Scope::Local);
     assert_eq!(e.signature(), " env ATTN_CTX2=2 ATTN_CTX3=1");
-    let e = env(&[("GR8_MTP_KSTOPB_TAU_S2", "0.50,0.9"), ("GR8_RT_STORE", "a\nb")]);
-    assert_eq!(e.signature(), " env MTP_KSTOPB_TAU_S2=0.5,0.9 RT_STORE=a\\nb");
+    let e = env(&[("GR8_MTP_KSTOPB_TAU_S2", "0.50,0.9"), ("GR8_S2_DSEL_TABLE", "a\nb")]);
+    assert_eq!(e.signature(), " env MTP_KSTOPB_TAU_S2=0.5,0.9 S2_DSEL_TABLE=a\\nb");
+    // the launcher resolves remote:auto per rank (odd ranks take the KV node's second rail): no part of the signature
+    let rank = |addr: &str| env(&[("GR8_RT_STORE", addr), ("GR8_RT_SIZE", "1024")]).signature();
+    assert_eq!(rank("remote:10.0.0.1:7350"), rank("remote:10.1.0.1:7350"));
 }
 
 #[test]
