@@ -1,0 +1,2691 @@
+[
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Add a unit test for the function median() in src/stats.py."
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "The build fails with 'undefined reference to compress_block'. Find out why."
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Bump the version in pyproject.toml to 2.1.0 and update the changelog."
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Remove the unused imports from every file under src/api/."
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Find where the HTTP timeout is configured and raise it to 30 seconds."
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Add a GitHub Actions badge to the README."
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Make the logger in src/app.py write JSON lines instead of plain text."
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Find all TODO comments in the repository and list them with their files."
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Write a script scripts/count_lines.sh that counts lines of Python code under src/."
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Rename the module src/helpers.py to src/util.py and fix all imports."
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Fix the failing test in tests/test_dates.py."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "run_command",
+       "arguments": "{\"command\": \"pytest -q tests/test_dates.py\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "F.\n___ test_parse_iso ___\n    def test_parse_iso():\n>       assert parse_iso('2024-02-30') is None\nE       ValueError: day is out of range for month\n\nsrc/dates.py:9: ValueError\n1 failed, 1 passed in 0.05s\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Fix the failing test in tests/test_dates.py."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "run_command",
+       "arguments": "{\"command\": \"pytest -q tests/test_dates.py\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "F.\n___ test_parse_iso ___\n    def test_parse_iso():\n>       assert parse_iso('2024-02-30') is None\nE       ValueError: day is out of range for month\n\nsrc/dates.py:9: ValueError\n1 failed, 1 passed in 0.05s\n"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c2",
+      "type": "function",
+      "function": {
+       "name": "read_file",
+       "arguments": "{\"path\": \"src/dates.py\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c2",
+    "content": "from datetime import date\n\n\ndef parse_iso(s):\n    \"\"\"Parse YYYY-MM-DD. Return a date, or None when s is not a valid date.\"\"\"\n    parts = s.split('-')\n    if len(parts) != 3:\n        return None\n    return date(int(parts[0]), int(parts[1]), int(parts[2]))\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Add input validation to create_user in src/users.py: the email must contain '@'."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "read_file",
+       "arguments": "{\"path\": \"src/users.py\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "from dataclasses import dataclass\n\n\n@dataclass\nclass User:\n    name: str\n    email: str\n\n\ndef create_user(name, email):\n    return User(name=name, email=email)\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Find every call to requests.get without a timeout and add timeout=10."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": "{\"pattern\": \"requests\\\\.get\\\\(\", \"glob\": \"**/*.py\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "src/fetch.py:14:    r = requests.get(url)\nsrc/fetch.py:31:    r = requests.get(url, params=q)\nsrc/health.py:8:    return requests.get(HEALTH_URL, timeout=5).ok\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Find every call to requests.get without a timeout and add timeout=10."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": "{\"pattern\": \"requests\\\\.get\\\\(\", \"glob\": \"**/*.py\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "src/fetch.py:14:    r = requests.get(url)\nsrc/fetch.py:31:    r = requests.get(url, params=q)\nsrc/health.py:8:    return requests.get(HEALTH_URL, timeout=5).ok\n"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c2",
+      "type": "function",
+      "function": {
+       "name": "read_file",
+       "arguments": "{\"path\": \"src/fetch.py\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c2",
+    "content": "import requests\n\nBASE = 'https://example.org/api'\n\n\ndef url_for(path):\n    return BASE + path\n\n\n\n\n\n\ndef get_json(path):\n    url = url_for(path)\n    r = requests.get(url)\n    r.raise_for_status()\n    return r.json()\n\n\n\n\n\n\n\n\n\n\n\n\n\ndef search(q):\n    url = url_for('/search')\n    r = requests.get(url, params=q)\n    r.raise_for_status()\n    return r.json()['items']\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "The linter reports E501 line too long in src/report.py. Fix it."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "run_command",
+       "arguments": "{\"command\": \"ruff check src/report.py\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "src/report.py:12:89: E501 Line too long (112 > 88)\nsrc/report.py:27:89: E501 Line too long (97 > 88)\nFound 2 errors.\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Add a 'make test' target to the Makefile."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "read_file",
+       "arguments": "{\"path\": \"Makefile\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": ".PHONY: build clean\n\nbuild:\n\tpython -m build\n\nclean:\n\trm -rf dist build *.egg-info\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Create a .gitignore suitable for this Python project."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "run_command",
+       "arguments": "{\"command\": \"ls -a\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": ".\n..\n.git\n.venv\n__pycache__\nREADME.md\ndist\npyproject.toml\nsrc\ntests\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Why does 'python -m app' fail? Fix it."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "run_command",
+       "arguments": "{\"command\": \"python -m app\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/repo/app/__main__.py\", line 3, in <module>\n    from app.config import load\n  File \"/repo/app/config.py\", line 2, in <module>\n    import tomllib\nModuleNotFoundError: No module named 'tomllib'\n"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c2",
+      "type": "function",
+      "function": {
+       "name": "run_command",
+       "arguments": "{\"command\": \"python --version\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c2",
+    "content": "Python 3.10.12\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Add type hints to every function in src/geometry.py."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "read_file",
+       "arguments": "{\"path\": \"src/geometry.py\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "import math\n\n\ndef distance(a, b):\n    return math.hypot(a[0] - b[0], a[1] - b[1])\n\n\ndef area(points):\n    s = 0.0\n    for (x1, y1), (x2, y2) in zip(points, points[1:] + points[:1]):\n        s += x1 * y2 - x2 * y1\n    return abs(s) / 2\n\n\ndef centroid(points):\n    n = len(points)\n    return sum(p[0] for p in points) / n, sum(p[1] for p in points) / n\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Run the type checker and fix the first error."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "run_command",
+       "arguments": "{\"command\": \"mypy src\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "src/cache.py:22: error: Incompatible return value type (got \"Optional[str]\", expected \"str\")  [return-value]\nFound 1 error in 1 file (checked 9 source files)\n"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c2",
+      "type": "function",
+      "function": {
+       "name": "read_file",
+       "arguments": "{\"path\": \"src/cache.py\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c2",
+    "content": "from typing import Optional\n\n\nclass Cache:\n    def __init__(self) -> None:\n        self._d: dict[str, str] = {}\n\n    def put(self, k: str, v: str) -> None:\n        self._d[k] = v\n\n    def peek(self, k: str) -> Optional[str]:\n        return self._d.get(k)\n\n\n\n\n\n\n\n\n    def get(self, k: str) -> str:\n        v = self._d.get(k)\n        return v\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Add a docstring to every public function in src/strings.py."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "read_file",
+       "arguments": "{\"path\": \"src/strings.py\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "def snake(s):\n    out = []\n    for i, c in enumerate(s):\n        if c.isupper() and i:\n            out.append('_')\n        out.append(c.lower())\n    return ''.join(out)\n\n\ndef camel(s):\n    head, *rest = s.split('_')\n    return head + ''.join(w.title() for w in rest)\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Add a --limit option to the export command in cli/export.py."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": "{\"pattern\": \"def export|add_argument\", \"glob\": \"cli/*.py\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "cli/export.py:9:def export(args):\ncli/export.py:21:    p.add_argument('--format', choices=['csv', 'json'], default='csv')\ncli/export.py:22:    p.add_argument('--out', required=True)\n"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c2",
+      "type": "function",
+      "function": {
+       "name": "read_file",
+       "arguments": "{\"path\": \"cli/export.py\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c2",
+    "content": "import csv\nimport json\n\nfrom store import rows\n\n\n\n\ndef export(args):\n    data = list(rows())\n    if args.format == 'json':\n        with open(args.out, 'w') as f:\n            json.dump(data, f)\n    else:\n        with open(args.out, 'w', newline='') as f:\n            csv.writer(f).writerows(data)\n\n\ndef register(sub):\n    p = sub.add_parser('export')\n    p.add_argument('--format', choices=['csv', 'json'], default='csv')\n    p.add_argument('--out', required=True)\n    p.set_defaults(fn=export)\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "The Docker image is 1.2 GB. Make it smaller."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "read_file",
+       "arguments": "{\"path\": \"Dockerfile\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "FROM python:3.12\nWORKDIR /app\nCOPY . .\nRUN pip install -r requirements.txt\nCMD [\"python\", \"-m\", \"server\"]\n"
+   }
+  ]
+ }
+]
