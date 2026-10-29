@@ -54,8 +54,8 @@ fn run() -> Result<i32, String> {
     let num = |k: &str| need(k)?.parse::<usize>().map_err(|_| format!("{k}: not a number"));
     if cmd == "dflash2" {
         let nr = opt.get("--nr").map_or(Ok(4), |_| num("--nr"))?;
-        dflash2::main(need("--src")?, need("--out")?, nr, opt.get("--ranks").copied(), opt.get("--bf16").copied().unwrap_or(""),
-                      &dflash2::GLM53)?;
+        dflash2::main(need("--src")?, need("--out")?, nr, opt.get("--ranks").copied(),
+                      opt.get("--bf16").copied().unwrap_or(""))?;
         return Ok(0);
     }
     let choice = match (opt.get("--manifest"), opt.get("--widths")) {
