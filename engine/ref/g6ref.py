@@ -1,7 +1,8 @@
 """gr8 M1 NumPy reference: codecs, kernel record layouts, reference forwards.
 
 Codecs
-  TR3   : EXL3 trellis (K bits/weight, 16x16 tiles, mcg 3INST codebook), Hadamard-128 rotations.
+  TR3   : EXL3 trellis (K bits/weight, 16x16 tiles), Hadamard-128 rotations. Codebooks (engine/kernels/tr3.cuh):
+          mcg (3INST), mul1 (byte sum + one fp16 fma) and pmcgx (pair trellis: a 20-bit state per two weights).
           Written from the format (exllamav3 read for understanding only).
   NVFP4 : FP4 E2M1 codes, FP8 E4M3 scale per 16 inputs, FP32 alpha per matrix.
   INT4  : GPTQ int4 symmetric (code - 8), FP16 scale per 32 inputs ("g32").
@@ -13,6 +14,8 @@ import numpy as np
 
 H = 6144
 MCG_MUL = 0xCBAC1FED
+CODEBOOKS = ('mcg', 'mul1', 'pmcgx')
+STATE_BITS = {'mcg': 16, 'mul1': 16, 'pmcgx': 20}
 SQ128 = np.float32(0.088388347648)  # 1/sqrt(128)
 
 
@@ -26,13 +29,56 @@ def silu(x):
 
 
 # ----------------------------------------------------------------------------- TR3
-def tr3_cb(state):
-    """16-bit trellis state -> fp16 weight (3INST, mcg multiplier)."""
-    x = (state.astype(np.uint64) * MCG_MUL) & 0xFFFFFFFF
-    x = (x & 0x8FFF8FFF) ^ 0x3B603B60
+def _mask3(x):
+    return (x & 0x8FFF8FFF) ^ 0x3B603B60
+
+
+def _f16_halves(x):
     lo = (x & 0xFFFF).astype(np.uint16).view(np.float16).astype(np.float32)
     hi = (x >> 16).astype(np.uint16).view(np.float16).astype(np.float32)
-    return (lo + hi).astype(np.float16)
+    return lo, hi
+
+
+def tr3_cb(state, cb='mcg'):
+    """trellis state -> fp16 value(s), before any E4M3 rounding.
+    mcg, mul1: 16-bit state -> one value. pmcgx: 20-bit pair state -> [..., 2] values (weight 2p, weight 2p + 1)."""
+    s = np.asarray(state).astype(np.uint64)
+    if cb == 'mcg':
+        lo, hi = _f16_halves(_mask3((s * MCG_MUL) & 0xFFFFFFFF))
+        return (lo + hi).astype(np.float16)          # the f32 sum of two fp16 values in [0.125, 2) is exact
+    if cb == 'mul1':
+        x = (s * 0x83DCD12D) & 0xFFFFFFFF
+        bs = sum((x >> sh) & 0xFF for sh in (0, 8, 16, 24)).astype(np.float64)
+        return ((1024.0 + bs) * 0.00676727294921875 - 10.3828125).astype(np.float16)   # exact in f64, one rounding
+    if cb == 'pmcgx':
+        l1, h1 = _f16_halves(_mask3((s * 0xCBAC1FED) & 0xFFFFFFFF))
+        l2, h2 = _f16_halves(_mask3((s * 0xBCA14C51) & 0xFFFFFFFF))
+        return np.stack([l1 + h2, h1 + l2], -1).astype(np.float16)
+    raise ValueError(f'unknown codebook {cb!r}')
+
+
+def e4m3_round(v):
+    """fp16 -> E4M3 (round to nearest even, saturating finite) -> fp16, vectorized."""
+    f = np.asarray(v).astype(np.float32)
+    a = np.abs(f)
+    e = np.floor(np.log2(np.maximum(a, 2.0 ** -9)))
+    e = np.maximum(e, -6.0)                       # subnormal step 2^-9 below 2^-6
+    q = 2.0 ** (e - 3)
+    r = np.minimum(np.round(a / q) * q, 448.0)    # np.round is round-half-even
+    return (np.sign(f) * r).astype(np.float16)
+
+
+def codebook_hashes(cb):
+    """FNV-1a 64 of every state's value(s) as LE u16 fp16 bits, before and after the E4M3 rounding (the constants
+    engine/kernels/tests/tr3_e4m3_test.cu and engine/loader-rs/src/codebook.rs check)."""
+    v = tr3_cb(np.arange(1 << STATE_BITS[cb], dtype=np.uint64), cb).reshape(-1)
+    out = []
+    for t in (v, e4m3_round(v)):
+        h = 0xCBF29CE484222325
+        for b in t.view(np.uint16).astype('<u2').tobytes():
+            h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+        out.append(h)
+    return tuple(out)
 
 
 def tr3_tile_pos():
@@ -44,20 +90,30 @@ def tr3_tile_pos():
     return k, n
 
 
-def tr3_states(tiles):
+def tr3_states(tiles, L=16, last=None):
     """tiles int16 [..., 16K] -> states uint32 [..., 256].
     The tile is a tail-biting bit stream, MSB-first over little-endian uint32 words;
-    weight t's state is the 16 bits ending at bit (t+1)*K."""
+    weight t's state is the 16 bits ending at bit (t+1)*K. L = 20, last = t | 1: the pmcgx pair state of weight t (the
+    20 bits ending at weight t | 1)."""
     K = tiles.shape[-1] // 16
     u32 = np.ascontiguousarray(tiles).view(np.uint16).astype(np.uint32)
     w = u32[..., 0::2] | (u32[..., 1::2] << 16)
     be = w.astype(">u4").view(np.uint8).reshape(*w.shape[:-1], -1)
     bits = np.unpackbits(be, axis=-1)  # [..., 256K]
     nb = 256 * K
-    t = np.arange(256)[:, None]
-    idx = ((t + 1) * K - 16 + np.arange(16)[None, :]) % nb  # [256,16]
-    sel = bits[..., idx].astype(np.uint32)  # [...,256,16]
-    return (sel << (15 - np.arange(16, dtype=np.uint32))).sum(-1).astype(np.uint32)
+    t = np.arange(256)[:, None] if last is None else np.asarray(last)[:, None]
+    idx = ((t + 1) * K - L + np.arange(L)[None, :]) % nb  # [256,L]
+    sel = bits[..., idx].astype(np.uint32)  # [...,256,L]
+    return (sel << (L - 1 - np.arange(L, dtype=np.uint32))).sum(-1).astype(np.uint32)
+
+
+def tr3_values(tiles, cb='mcg'):
+    """tiles int16 [..., 16K] -> fp16 values [..., 256] in stream order, before any E4M3 rounding."""
+    if cb != 'pmcgx':
+        return tr3_cb(tr3_states(tiles), cb)
+    t = np.arange(256)
+    v = tr3_cb(tr3_states(tiles, 20, t | 1), cb)   # [..., 256, 2]
+    return np.take_along_axis(v, np.broadcast_to((t & 1)[:, None], v.shape[:-1] + (1,)), -1)[..., 0]
 
 
 def tr3_states_lane(tiles):
@@ -79,10 +135,10 @@ def tr3_states_lane(tiles):
     return out
 
 
-def tr3_unpack(trellis):
-    """trellis int16 [kt, nt, 16K] -> W_hat fp16 [kt*16, nt*16]."""
+def tr3_unpack(trellis, cb='mcg'):
+    """trellis int16 [kt, nt, 16K] -> W_hat fp16 [kt*16, nt*16] (codebook cb, before any E4M3 rounding)."""
     kt, nt, _ = trellis.shape
-    vals = tr3_cb(tr3_states(trellis))  # [kt, nt, 256]
+    vals = tr3_values(trellis, cb)  # [kt, nt, 256]
     k, n = tr3_tile_pos()
     tile = np.zeros((kt, nt, 16, 16), np.float16)
     tile[:, :, k, n] = vals

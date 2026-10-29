@@ -1,14 +1,58 @@
 // TR3 (EXL3 trellis) decode-path expert kernels. Our own code, written from the format:
 //   tile = 16x16 weights, tail-biting bit stream of 256*K bits, MSB-first over LE uint32 words;
-//   weight t = lane*8+j has the 16-bit state ending at stream bit (t+1)*K; value = 3INST "mcg" hash.
+//   weight t = lane*8+j has the 16-bit state ending at stream bit (t+1)*K; value = the codebook's hash of it (below).
 //   lane l of a warp decodes 8 weights = the mma A fragment (rows = output cols l/4 and l/4+8) of the tile.
 //   linear: y = H128(f16(H128(x*suh)) @ What) * svh, H128 scaled 1/sqrt(128), per 128 block.
 #pragma once
+#include <type_traits>
 #include "k1args.cuh"
 #include "tr3_wide.cuh"
 
-// two 16-bit states -> half2. E4 (exlr8-e4m3 packs): each value rounded to FP8 E4M3 and back (RN-even, saturating to
-// finite), as the encoder rounded its codebook and as the prefill path rounds every tile (bind_prefill.cuh tr3_b8).
+// The codebook turns trellis states into fp16 values. It is chosen per layer (bind::LayerTensors::cb, from the
+// manifest's expert_format) and is a template parameter of every kernel that decodes routed experts:
+//   TR3_MCG    the 16-bit state of a weight times 0xCBAC1FED, lop3 mask 0x8fff8fff xor 0x3b603b60, the two fp16
+//              halves added. TR3 and every exlr8 release before the other codebooks.
+//   TR3_MUL1   the 16-bit state times 0x83DCD12D, the four bytes of the product summed (s = 0..1020), then one fp16
+//              fma: (1024 + s) * c1 + c0 rounded once, c1 = 0.00676727294921875, c0 = -10.3828125.
+//   TR3_PMCGX  pair trellis: weights 2p and 2p + 1 share one 20-bit state, the 20 stream bits ending where weight
+//              2p + 1's 16-bit state would end (each step brings 2K new bits, so bits per weight are unchanged).
+//              m1 = mask(w * 0xCBAC1FED), m2 = mask(w * 0xBCA14C51) with mcg's mask and xor; weight 2p is
+//              m1.lo + m2.hi and weight 2p + 1 is m1.hi + m2.lo, fp16 adds.
+// E4 (exlr8-e4m3 layers) rounds every value to FP8 E4M3 and back (RN-even, saturating to finite), as the encoder
+// rounded its codebook inside the search. The tile layout, the bit packing and the tail-biting rule are the same for
+// all three.
+enum { TR3_MCG = 0, TR3_MUL1 = 1, TR3_PMCGX = 2, TR3_NCB = 3 };
+
+// The codebooks a build decodes, as a bit mask over TR3_*: a codebook outside it has no kernels, and the binder
+// refuses a layer that uses it. All three by default; a shorter mask only shortens a development build.
+#ifndef G6_TR3_CBS
+#define G6_TR3_CBS 7
+#endif
+static_assert((G6_TR3_CBS & 1) != 0, "G6_TR3_CBS must keep mcg (bit 0)");
+__host__ __device__ constexpr bool tr3_cb_built(int cb) { return cb >= 0 && cb < TR3_NCB && ((G6_TR3_CBS >> cb) & 1); }
+
+// f(std::integral_constant<int, CB>) for the run-time codebook cb (TR3_MCG for anything not built: binders refuse
+// those first, tr3_cb_built)
+template <class F> inline void tr3_cb_dispatch(int cb, F&& f)
+{
+    if constexpr (tr3_cb_built(TR3_MUL1))
+        if (cb == TR3_MUL1) { f(std::integral_constant<int, TR3_MUL1>()); return; }
+    if constexpr (tr3_cb_built(TR3_PMCGX))
+        if (cb == TR3_PMCGX) { f(std::integral_constant<int, TR3_PMCGX>()); return; }
+    f(std::integral_constant<int, TR3_MCG>());
+}
+
+template <bool E4>
+__device__ __forceinline__ u32 tr3_e4(u32 r)
+{
+    if constexpr (E4)
+        asm("{ .reg .b16 t; cvt.rn.satfinite.e4m3x2.f16x2 t, %1; cvt.rn.f16x2.e4m3x2 %0, t; }" : "=r"(r) : "r"(r));
+    return r;
+}
+
+// two 16-bit states -> half2 (mcg). E4 (exlr8-e4m3 packs): each value rounded to FP8 E4M3 and back (RN-even,
+// saturating to finite), as the encoder rounded its codebook and as the prefill path rounds every tile (bind_prefill.cuh
+// tr3_b8).
 template <bool E4 = false>
 __device__ __forceinline__ u32 tr3_cb2(u32 w0, u32 w1)
 {
@@ -23,9 +67,53 @@ __device__ __forceinline__ u32 tr3_cb2(u32 w0, u32 w1)
     return r;
 }
 
-template <int BITS, bool E4 = false>
+// two 16-bit states -> half2 (mul1). The byte sum is __dp4a against 0x01010101 (one native instruction; vabsdiff4 gives
+// the same sums but is emulated on sm_121a). Its accumulator 0x6400 makes the low 16 bits the fp16 pattern of
+// 1024 + s, exact since s <= 1020, so the fma rounds once, as the encoder's codebook does.
+template <bool E4 = false>
+__device__ __forceinline__ u32 tr3_mul1x2(u32 w0, u32 w1)
+{
+    const u32 s0 = __dp4a(w0 * 0x83DCD12Du, 0x01010101u, 0x6400u), s1 = __dp4a(w1 * 0x83DCD12Du, 0x01010101u, 0x6400u);
+    const __half2 v = __hfma2(as_h2(__byte_perm(s0, s1, 0x5410)), as_h2(0x1eee1eeeu), as_h2(0xc931c931u));   // c1, c0
+    return tr3_e4<E4>(as_u32(v));
+}
+
+// one 20-bit pmcgx state -> half2 of its two weights (low half = weight 2p)
+template <bool E4 = false>
+__device__ __forceinline__ u32 tr3_pmcgx(u32 w)
+{
+    u32 x0 = w * 0xCBAC1FEDu, x1 = w * 0xBCA14C51u;
+    asm("lop3.b32 %0, %1, %2, 0x3b603b60, 0x6a;" : "=r"(x0) : "r"(x0), "r"(0x8fff8fffu));
+    asm("lop3.b32 %0, %1, %2, 0x3b603b60, 0x6a;" : "=r"(x1) : "r"(x1), "r"(0x8fff8fffu));
+    return tr3_e4<E4>(as_u32(__hadd2(as_h2(x0), as_h2(__byte_perm(x1, 0, 0x1032)))));
+}
+
+// Stream weight t of one tile at width bits (codebook CB, E4M3-rounded when E4) -> its fp16 bits in the low half (the
+// high half is another value), read bit by bit from the tile's words: the per-weight form of Tr3Lane, for one-off
+// decodes (bind.cuh k_shared_fp8, tests).
+template <int CB, bool E4>
+__device__ __forceinline__ u32 tr3_weight(const uint8_t* tile, int t, int bits)
+{
+    const int L = CB == TR3_PMCGX ? 20 : 16;
+    const int end = (CB == TR3_PMCGX ? (t | 1) + 1 : t + 1) * bits;     // the state's last stream bit + 1
+    const int nb = 256 * bits;
+    u32 st = 0;
+    for (int q = 0; q < L; ++q)
+    {
+        const int bit = ((end - L + q) % nb + nb) % nb;                  // tail-biting
+        const u32 word = *reinterpret_cast<const u32*>(tile + (bit >> 5) * 4);
+        st = (st << 1) | ((word >> (31 - (bit & 31))) & 1u);
+    }
+    if constexpr (CB == TR3_PMCGX) return tr3_pmcgx<E4>(st) >> (16 * (t & 1));
+    else if constexpr (CB == TR3_MUL1) return tr3_mul1x2<E4>(st, 0u);
+    else return tr3_cb2<E4>(st, 0u);
+}
+
+// BITS = width, E4 = E4M3 rounding, CB = codebook (TR3_*)
+template <int BITS, bool E4 = false, int CB = TR3_MCG>
 struct Tr3Lane
 {
+    static_assert(CB >= 0 && CB < TR3_NCB, "CB is a codebook (TR3_*)");
     int i0, i1, sh;   // word indices (bytes offsets /4) and base shift
     __device__ __forceinline__ void init(int lane)
     {
@@ -64,16 +152,42 @@ struct Tr3Lane
     {
         decode_m((static_cast<u64>(a) << 32) | b, BITS == 4 ? 28 : sh, f0, f1);
     }
-    // m = the lane's stream bits, state j = (m >> (s - BITS*j)) & 0xffff
+    // m = the lane's stream bits, state j = (m >> (s - BITS*j)) & 0xffff. pmcgx: the state of the pair of weights 2p,
+    // 2p + 1 ends where weight 2p + 1's would, (m >> (s - BITS*(2p+1))) & 0xfffff. Its first state starts 4 - BITS bits
+    // before weight 0's 16-bit state: every caller's m holds them (the top bit, s + 19 - BITS, is at most 63 for every
+    // lane of load / decode, and 6 BITS + 19 < 16 BITS in the wide order's (chunk[l-1] << 8 BITS) | chunk[l]).
     __device__ static __forceinline__ void decode_m(u64 m, int s, u32 (&f0)[2], u32 (&f1)[2])
     {
-        u32 w[8];
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) w[j] = static_cast<u32>(m >> (s - BITS * j)) & 0xffffu;
-        f0[0] = tr3_cb2<E4>(w[0], w[1]);
-        f0[1] = tr3_cb2<E4>(w[2], w[3]);
-        f1[0] = tr3_cb2<E4>(w[4], w[5]);
-        f1[1] = tr3_cb2<E4>(w[6], w[7]);
+        if constexpr (CB == TR3_PMCGX)
+        {
+            u32 w[4];
+            #pragma unroll
+            for (int p = 0; p < 4; ++p) w[p] = static_cast<u32>(m >> (s - BITS * (2 * p + 1))) & 0xfffffu;
+            f0[0] = tr3_pmcgx<E4>(w[0]);
+            f0[1] = tr3_pmcgx<E4>(w[1]);
+            f1[0] = tr3_pmcgx<E4>(w[2]);
+            f1[1] = tr3_pmcgx<E4>(w[3]);
+        }
+        else
+        {
+            u32 w[8];
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) w[j] = static_cast<u32>(m >> (s - BITS * j)) & 0xffffu;
+            if constexpr (CB == TR3_MUL1)
+            {
+                f0[0] = tr3_mul1x2<E4>(w[0], w[1]);
+                f0[1] = tr3_mul1x2<E4>(w[2], w[3]);
+                f1[0] = tr3_mul1x2<E4>(w[4], w[5]);
+                f1[1] = tr3_mul1x2<E4>(w[6], w[7]);
+            }
+            else
+            {
+                f0[0] = tr3_cb2<E4>(w[0], w[1]);
+                f0[1] = tr3_cb2<E4>(w[2], w[3]);
+                f1[0] = tr3_cb2<E4>(w[4], w[5]);
+                f1[1] = tr3_cb2<E4>(w[6], w[7]);
+            }
+        }
     }
 };
 
@@ -129,8 +243,9 @@ __device__ __forceinline__ uint2 tr3_hid4(const __half* vec, const __half* sg, c
     return r;
 }
 
-// mask = the slot's columns (A.slot_mask, or the rows of a trellis shared-expert tile, k1.cuh k1_slot)
-template <int BITS, bool E4 = false, bool BS = false>
+// mask = the slot's columns (A.slot_mask, or the rows of a trellis shared-expert tile, k1.cuh k1_slot). CB = the
+// layer's codebook (TR3_*).
+template <int BITS, bool E4 = false, bool BS = false, int CB = TR3_MCG>
 __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit, const long long* tr, const uint8_t* mw, int mask, u32* smem)
 {
     constexpr int TB = 32 * BITS;
@@ -156,7 +271,7 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
     const bool wide = trw_ok<BITS>() && A.t_wide;                 // K3, and K2
     const uint8_t* g0 = base - static_cast<size_t>(j) * TB + j * 256 + lane * 8;
     u64 nw[3] = {0, 0, 0};
-    Tr3Lane<BITS, E4> ld;
+    Tr3Lane<BITS, E4, CB> ld;
     ld.init(lane);
     u32 na[TR3_UNR];
     if constexpr (trw_ok<BITS>() && TR3_EARLY)
@@ -229,7 +344,7 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
 #define XA0(ks) xa[(ks) * xs]
 #define XA1(ks) xa[(ks) * xs + xo]
 #if defined(TR3_PROBE)
-    Tr3Lane<BITS, E4> ld;
+    Tr3Lane<BITS, E4, CB> ld;
     ld.init(lane);
 #endif
 
@@ -283,7 +398,7 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
                 const u32 c = trw_chunk<BITS>(w, p);
                 const u32 pc = __shfl_sync(0xffffffffu, c, (lane + 31) & 31);
                 u32 f0[2], f1[2];
-                Tr3Lane<BITS, E4>::decode_m((static_cast<u64>(pc) << (8 * BITS)) | c, 7 * BITS, f0, f1);
+                Tr3Lane<BITS, E4, CB>::decode_m((static_cast<u64>(pc) << (8 * BITS)) | c, 7 * BITS, f0, f1);
                 mma16816(acc, f0[0], f1[0], f0[1], f1[1], XA0(s + p), XA1(s + p));
             }
         }
@@ -344,7 +459,7 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
 // FC2 unit = (slot, block b, n-split). Prologue: g,u partial sums -> H*svh -> silu(g)*u -> H(act*suh_d)
 // for the block's 128 intermediate columns; then streams the block's down tiles for its n range.
 // Writes z[slot][b][m][n] fp16 (before the output Hadamard; finalize applies H*svh per block).
-template <int BITS, bool E4 = false>
+template <int BITS, bool E4 = false, int CB = TR3_MCG>
 __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit, const long long* tr, int mask, u32* smem)
 {
     constexpr int TB = 32 * BITS;
@@ -367,7 +482,7 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
     const bool wide = trw_ok<BITS>() && A.t_wide2;                // K3, and K2
     const uint8_t* wg = base + static_cast<size_t>(nt0) * 8 * TB + lane * 8;
     u64 nw[3] = {0, 0, 0};
-    Tr3Lane<BITS, E4> ld;
+    Tr3Lane<BITS, E4, CB> ld;
     ld.init(lane);
     auto tile_ptr = [&](int q) { return base + (static_cast<size_t>(nt0 + (q >> 3) * nwarps) * 8 + (q & 7)) * TB; };
     const int Q = ntiles * 8;
@@ -481,7 +596,7 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
                 const u32 ch = trw_chunk<BITS>(w, p);
                 const u32 pc = __shfl_sync(0xffffffffu, ch, (lane + 31) & 31);
                 u32 f0[2], f1[2];
-                Tr3Lane<BITS, E4>::decode_m((static_cast<u64>(pc) << (8 * BITS)) | ch, 7 * BITS, f0, f1);
+                Tr3Lane<BITS, E4, CB>::decode_m((static_cast<u64>(pc) << (8 * BITS)) | ch, 7 * BITS, f0, f1);
                 mma16816(acc, f0[0], f1[0], f0[1], f1[1], ha[p * 64], ha[p * 64 + 1]);
             }
             __half* zp = zb + (nt0 + i * nwarps) * 16;
