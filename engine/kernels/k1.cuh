@@ -54,9 +54,8 @@ __device__ __forceinline__ void tr3_fc1_any(const K1Args& A, int plan, int unit,
     const int u_ks1 = unit >> s_ks1, mat = u_ks1 & 1, u_b = u_ks1 >> 1;
     const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
     if (b >= static_cast<int>(tr[3])) return;
-    size_t off;
-    const int k = tr3_unit(A.t_kmix, e, tr, b * 2 + mat, off);
-    const uint8_t* mw = A.t_fc1 + off;
+    const uint8_t* mw;
+    const int k = tr3_fc1_unit(A.t_fc1, A.t_ptab, A.t_kmix, e, tr, b * 2 + mat, mw);
     if ((!BS || K2) && k == 3) tr3_fc1_body<3, E4, BS, CB>(A, plan, unit, tr, mw, mask, smem);
     else if (!K2 || k == 4) tr3_fc1_body<4, E4, BS, CB>(A, plan, unit, tr, mw, mask, smem);
     else tr3_fc1_body<K2 ? 2 : 4, E4, BS, CB>(A, plan, unit, tr, mw, mask, smem);
@@ -117,11 +116,6 @@ __device__ __forceinline__ void k1_tlbw(const K1Args& A, int plan, int s)
     const int nb = static_cast<int>(tr[3]);
     if (nb <= 0) return;                                           // an expert without blocks on this rank: no ranges
     constexpr size_t MB = static_cast<size_t>(KSH) * 8 * 32;      // bytes of one fc1 matrix or fc2 block per bit of width
-    size_t f1lo, f1hi;
-    tr3_unit(A.t_kmix, e, tr, 0, f1lo);                          // units are back to back in unit order
-    const int kl = tr3_unit(A.t_kmix, e, tr, 2 * nb - 1, f1hi);
-    f1hi += kl * MB;
-    const size_t f2lo = static_cast<size_t>(tr[1]), f2hi = f2lo + static_cast<size_t>(nb) * static_cast<size_t>(tr[4]) * MB;
     const uintptr_t g = uintptr_t(1) << A.tlbw;
     auto warm = [&](const uint8_t* base, size_t lo, size_t hi) {
         if (hi <= lo) return;
@@ -129,6 +123,21 @@ __device__ __forceinline__ void k1_tlbw(const K1Args& A, int plan, int s)
         for (uintptr_t a = (a0 & ~(g - 1)) + threadIdx.x * g; a < a1; a += 32 * g)
             asm volatile("prefetch.global.L2 [%0];" :: "l"(a < a0 ? a0 : a) : "memory");
     };
+    if (A.t_ptab)                                                  // the piece table: each piece's two slabs
+    {
+        const long long km = A.t_kmix ? A.t_kmix[e] : 0;
+        for (int b = 0; b < nb; ++b)
+        {
+            warm(A.t_ptab[tr3_ptab_slot(e, b)], 0, tr3_piece_fc1_bytes(km, tr, b));
+            warm(A.t_ptab[tr3_ptab_slot(e, b) + 1], 0, tr3_piece_fc2_bytes(tr));
+        }
+        return;
+    }
+    size_t f1lo, f1hi;
+    tr3_unit(A.t_kmix, e, tr, 0, f1lo);                          // units are back to back in unit order
+    const int kl = tr3_unit(A.t_kmix, e, tr, 2 * nb - 1, f1hi);
+    f1hi += kl * MB;
+    const size_t f2lo = static_cast<size_t>(tr[1]), f2hi = f2lo + static_cast<size_t>(nb) * static_cast<size_t>(tr[4]) * MB;
     warm(A.t_fc1, f1lo, f1hi);
     warm(A.t_fc2, f2lo, f2hi);
 }

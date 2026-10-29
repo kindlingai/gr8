@@ -150,6 +150,16 @@ build l2pf_bench $NVCC -O3 -std=c++17 $GEN $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} 
 # shellcheck disable=SC2086
 build k1_ovl_test $NVCC -O2 -std=c++17 $S2 -I "$REPO/engine/kernels" -o "$OUT/k1_ovl_test" \
   "$REPO/engine/kernels/tests/k1_ovl_test.cu"
+# EL3 (#151) piece tables: the routed experts through a per-layer device table (G6_PTAB) against the pack layout, decode
+# (K1, every row count, graphs with changing table contents) and prefill, byte for byte; + bench. Built at each width
+# with that width's engine flags; build only (needs an idle GPU and ~6 GB): $OUT/ptab_test_tp<N> (file header)
+for n in $WIDTHS; do
+  f="-DG6_NR=$n -DDEC_S2"
+  case " ${F12_WIDTHS:-4} " in *" $n "*) f="$f -DPF_F12" ;; esac
+  # shellcheck disable=SC2086
+  build ptab_test_tp$n $NVCC -O2 -std=c++17 $GEN $K1H2_FLAGS $f -I "$REPO/engine/kernels" -o "$OUT/ptab_test_tp$n" \
+    "$REPO/engine/kernels/tests/ptab_test.cu" -lcublas
+done
 # Steering projection/consume/finalizer fixtures (and S2 batched steering, s2_steer_test): compile in CI even without a
 # GPU. No model or fabric service needed.
 STEERING="s2_steer_test steering_consume_test steering_shared_test steering_boot_cuda_test steering_cuda_test"
@@ -212,7 +222,7 @@ if nvidia-smi -L > /dev/null 2>&1; then
 else
   echo "tr3_e4m3_test and the steering tests ($STEERING): compiled; no GPU visible, not run"
 fi
-echo "dtr_test_tp<N>, dtr_test_flash_tp<N>, l2pf_bench, k1_ovl_test: built (they need release files or an idle GPU)"
+echo "dtr_test_tp<N>, dtr_test_flash_tp<N>, l2pf_bench, k1_ovl_test, ptab_test_tp<N>: built (they need release files or an idle GPU)"
 echo "fabric_group_test: built (cluster test, not run here)"
 [ -f "$G6_NVCC_CACHE_LOG" ] && echo "nvcc cache (tests): $(grep -c '^hit' "$G6_NVCC_CACHE_LOG") hit, $(grep -c '^miss' "$G6_NVCC_CACHE_LOG") miss"
 exit 0

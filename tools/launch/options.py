@@ -188,6 +188,7 @@ KEYS = {
     'MTP_L2PF': ('cluster', None, 'MTP draft steps: the paced L2 prefetch, 1 draft step, 2 head waits, 3 both; needs L2PF (G6_MTP_L2PF)'),
     'MTP_KSTOPB_WIDTHS': ('cluster', None, 'MTP_KSTOPB: the shared-round widths with captured graphs, w1,w2,... (G6_MTP_KSTOPB_WIDTHS)'),
     'TR3_W2ALL': ('cluster', None, 'window-2 fc1 split on every MoE layer at M > 1 (G6_TR3_W2ALL)'),
+    'PTAB': ('cluster', None, 'routed experts through a per-layer piece table: 1 into the image, 2 scattered slabs (G6_PTAB)'),
     'QO_CACHE': ('cluster', None, 'PF_OWN=3: a directory for the full-head q_b / o_proj / UK / UV tensors, written at the first boot and read at the next (G6_QO_CACHE)'),
     'PF_ISGRT_RG': ('cluster', None, 'prefill index scores: rows per CTA, a multiple of 8 (G6_PF_ISGRT_RG)'),
     'PF_ATTN_ROWS': ('cluster', None, 'prefill attention chunk rows inside a sub-batch, default 1024 (G6_PF_ATTN_ROWS)'),
