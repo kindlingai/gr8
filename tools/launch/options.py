@@ -216,7 +216,8 @@ KEYS = {
     'DRAFTER': ('box', None, 'TP=4 or 6: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
                              'converted on this box'),
     'DFLASH_DIR': ('box', None, 'the directory holding dflash.r<r>.*, when it is not the model set\'s'),
-    'STEERING_PROFILE': ('box', None, 'verified schema-v1 profile directory, or hf:default / hf:NAME from the model release'),
+    'STEERING_PROFILE': ('box', None, 'verified schema-v1 profile directory (several: comma-separated, a request picks one by '
+                                      'name), or hf:default / hf:NAME from the model release'),
     'STEERING_CHAT_TEMPLATE': ('box', None, 'served chat template file; resolved from the model'),
     'STEERING_FORCE': ('cluster', None, 'force the loaded steering profile at this request scale'),
     'STEERING_MODEL_REVISION': ('cluster', None, 'exact model revision recorded by the steering profile'),
@@ -391,7 +392,9 @@ def parse(argv, environ=None):
                 (k == 'STEERING_PROFILE' and values[k].startswith('hf:')) or \
                 (k == 'VARIANT' and '/' not in values[k] and not values[k].endswith('.json')):
             continue
-        values[k] = os.path.abspath(values[k])   # the engine runs in G6_HOME
+        # the engine runs in G6_HOME. STEERING_PROFILE may list several directories
+        values[k] = ','.join(d if not d or d.startswith('hf:') else os.path.abspath(d) for d in values[k].split(',')) \
+            if k == 'STEERING_PROFILE' else os.path.abspath(values[k])
     return opts
 
 
@@ -474,7 +477,12 @@ def validate(o):
             raise OptionError('--steering-profile requires weight hash checks (unset NOHASH)')
         bundled = steering.startswith('hf:')
         if bundled and not re.fullmatch(r'hf:[A-Za-z0-9][A-Za-z0-9._-]{0,127}', steering):
-            raise OptionError('--steering-profile: want a profile directory, hf:default or hf:NAME')
+            raise OptionError('--steering-profile: want profile directories, hf:default or hf:NAME')
+        dirs = steering.split(',')
+        if len(dirs) > 1 and (any(d.startswith('hf:') or not d for d in dirs) or len(dirs) > 8):
+            raise OptionError('--steering-profile: a list holds up to 8 profile directories (hf: selects one profile)')
+        if len(dirs) > 1 and o.get('STEERING_FORCE'):
+            raise OptionError('--steering-force needs exactly one --steering-profile')
         missing = [flag_of(k) for k in ('STEERING_MODEL_REVISION', 'STEERING_TOKENIZER_REVISION',
                                         'STEERING_CHAT_TEMPLATE_SHA256') if not o.get(k)]
         if missing and not bundled:

@@ -153,6 +153,7 @@ struct StepIn
     glue::SampleRow srow[MX];
     int tgt[MX];                      // teacher forcing: the id each row should predict (< 0 = none)
     float steering_scale[MX];         // exact canonical FP32 request scale for each target row; padding is +0
+    int steering_slot[MX];            // the row's loaded profile (steering::Identity::slot)
 #ifdef DEC_S2
     int page_bound, pad_s2;           // S2 solo run: the pool's pages, the cells' page_count (0 = the context's pages, today)
 #endif
@@ -176,6 +177,7 @@ struct StepCtl
     u64* stepp;
     int *tok, *pos, *tgt;
     float* steering_scale;
+    int* steering_slot;
     glue::SampleRow* srow;
     G6AttnStepCell* cells;            // [nl] attention step cells (graph form)
     const int* shared;                // [nl] 1 = the layer reuses another layer's index list
@@ -193,7 +195,7 @@ __global__ void __launch_bounds__(128) k_step_in(StepCtl c)
     __syncthreads();
     if (t == 0) *c.stepp = sh.step;
     for (int i = t; i < MX; i += 128) { c.tok[i] = sh.tok[i]; c.pos[i] = sh.pos[i]; c.srow[i] = sh.srow[i]; c.tgt[i] = sh.tgt[i];
-                                         c.steering_scale[i] = sh.steering_scale[i]; }
+                                         c.steering_scale[i] = sh.steering_scale[i]; c.steering_slot[i] = sh.steering_slot[i]; }
 #if G6_MODEL_FLASH
     if (c.row_slot) for (int i = t; i < MX; i += 128) c.row_slot[i] = sh.kslot[i];
     if (c.kda_src) for (int i = t; i < MX; i += 128) c.kda_src[i] = i ? sh.krun[i] - 1 : sh.kda_src;
@@ -413,8 +415,12 @@ struct Model
     unsigned* tickets = nullptr;      // [2*nl+1] publish tickets, device, zero
     float* resid = nullptr;           // [MX][HID]; Flash: final stream mean for diagnostics
     float* steering_scale = nullptr;  // [MX], refreshed by the existing k_step_in launch
-    std::vector<const float*> steering_dir; // [nl], empty until verified boot activation
-    std::vector<float> steering_alpha;      // [nl], immutable profile alphas
+    int* steering_slot = nullptr;     // [MX] row profiles, refreshed with steering_scale
+    std::vector<const float*> steering_dir; // [nl], empty until verified boot activation; [profiles][HID] per layer
+    std::vector<float> steering_alpha;      // [nl], immutable alphas of profile 0
+    int steering_profiles = 0;
+    std::vector<float> steering_alphas;     // [nl][profiles], 0 where a profile leaves the layer out
+    std::vector<const float*> steering_slot_alpha; // [nl] device [profiles] alphas; empty with one profile
     steering::Scope steering_scope = steering::Scope::Full;
     float* steering_part = nullptr;         // [MX][48], deterministic shared-scope finalize reductions
     unsigned* steering_count = nullptr;     // [MX], shared across stream-ordered layer finalizers
@@ -660,6 +666,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     m.tickets = dmalloc<unsigned>(m.ncoll());
     m.resid = dmalloc<float>((size_t)MX * HID);
     m.steering_scale = dmalloc<float>(MX);
+    m.steering_slot = dmalloc<int>(MX);
     m.x = dmalloc<__half>((size_t)MX * HID);
     m.x2 = dmalloc<__half>((size_t)MX * HID);
     m.q_a = dmalloc<__half>((size_t)MX * QA);
@@ -961,6 +968,26 @@ inline void k1_steer(const Model& m, int i, bind::K1& k)
     if (!m.layers[i].moe || m.steering_scope != steering::Scope::Shared || i >= (int)m.steering_dir.size()) return;
     k.a.steer_dir = m.steering_dir[i]; k.a.steer_scale = m.steering_scale;
     k.a.steer_alpha = m.steering_alpha[i]; k.a.steer_part = m.steering_part; k.a.steer_count = m.steering_count;
+    if (!m.steering_slot_alpha.empty()) { k.a.steer_slot = m.steering_slot; k.a.steer_slot_alpha = m.steering_slot_alpha[i]; }
+}
+
+// Layer i's writer steering for decode rows: each row's scale, and with several profiles its slot into the layer's
+// direction and alpha tables.
+inline glue::SteerArgs decode_steer(const Model& m, int i)
+{
+    glue::SteerArgs a{m.steering_dir[i], m.steering_scale, 0.f, m.steering_alpha[i]};
+    if (!m.steering_slot_alpha.empty()) { a.row_slot = m.steering_slot; a.slot_alpha = m.steering_slot_alpha[i]; }
+    return a;
+}
+
+// One request's direction of layer i (nullptr: no profile steers the layer) and alpha (0: its profile leaves it out).
+inline const float* steer_dir_of(const Model& m, int i, int slot)
+{
+    return m.steering_dir[i] ? m.steering_dir[i] + (size_t)slot * HID : nullptr;
+}
+inline float steer_alpha_of(const Model& m, int i, int slot)
+{
+    return m.steering_alphas[(size_t)i * m.steering_profiles + slot];
 }
 
 // today's layer i after make_layer: K1 steering, the head-count check, G6_QA_SPLIT narrowing, DEC_SLOT slots
@@ -1513,7 +1540,7 @@ inline void launch_consume(Model& m, int c, int M, const __nv_bfloat16* w, __hal
     const int i = c / 2;
     if (i < (int)m.steering_dir.size() &&
         (c % 2 == 0 || m.steering_scope == steering::Scope::Full || !m.layers[i].moe))
-        a.steer = {m.steering_dir[i], m.steering_scale, 0.f, m.steering_alpha[i]};
+        a.steer = decode_steer(m, i);
 #ifdef DEC_SLOT
     // fold: the normed rows also go into the fragment tables the next kernel reads (xf_x2 of this layer, xf_x of the
     // next; after the last layer the head's xf_h still runs)
@@ -1831,10 +1858,10 @@ inline void launch_step_in(Model& m, cudaStream_t st)
 {
 #if G6_MODEL_FLASH
     k_step_in<<<1, 128, 0, st>>>(StepCtl{reinterpret_cast<const uint32_t*>(m.in), m.stepp, m.tok, m.pos, m.tgt,
-                                         m.steering_scale, m.srow, m.cells, m.shared, m.nl, m.row_slot, m.kda_src});
+                                         m.steering_scale, m.steering_slot, m.srow, m.cells, m.shared, m.nl, m.row_slot, m.kda_src});
 #else
     k_step_in<<<1, 128, 0, st>>>(StepCtl{reinterpret_cast<const uint32_t*>(m.in), m.stepp, m.tok, m.pos, m.tgt,
-                                         m.steering_scale, m.srow, m.cells, m.shared, m.nl});
+                                         m.steering_scale, m.steering_slot, m.srow, m.cells, m.shared, m.nl});
 #endif
 #ifdef DEC_S2
     if (m.s2on) s2_launch_cells(m, st);
@@ -2321,6 +2348,7 @@ struct Plan
                                       // the token's own logprob; -1 = off). Rows of a step with k > 0 carry SampleRow::topk.
     bool rs = false;                  // --spec-accept rejection: drafts are greedy, the target accepts them by rejection sampling
     float steering_scale = 0.f;       // target model only; exact canonical bits from the effective request identity
+    int steering_slot = 0;            // steering.slot
     steering::Identity steering{};    // full cache identity (profile/scope/schedule/exact scale)
 };
 inline int prompt_steps(const Plan& p) { return ((int)p.prompt.size() - p.first + p.chunk - 1) / p.chunk; }
@@ -2358,6 +2386,7 @@ inline StepIn step_inputs(const Plan& p, int s, int last_tok, u64 step0 = 0)
         in.tgt[r] = in.pos[r] + 1 < n ? p.prompt[in.pos[r] + 1] : -1;
         in.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, in.pos[r] + 1, 0, p.top_p, (in.tgt[r] >= 0 ? p.plp : p.lp) > 0 ? 1 : 0};
         in.steering_scale[r] = p.steering_scale;
+        in.steering_slot[r] = p.steering_slot;
     }
     in.context = in.pos[M - 1] + 1;
     return in;
@@ -2586,6 +2615,7 @@ inline std::vector<int> mtp_sequence(const Plan& p, int K, u64& main_step, u64& 
             si.srow[r] = glue::SampleRow{p.inv_temp, p.seed, 0u, base + r + 1, 0, p.top_p, p.lp > 0 ? 1 : 0};
             si.tgt[r] = -1;
             si.steering_scale[r] = p.steering_scale;
+            si.steering_slot[r] = p.steering_slot;
 #if G6_MODEL_FLASH
             si.kslot[r] = r;                     // slot r ends with the state after rows 0..r (Model::kda_ring > k)
 #endif

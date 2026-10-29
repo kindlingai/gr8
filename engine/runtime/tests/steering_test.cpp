@@ -173,6 +173,29 @@ int main(int argc, char** argv) {
     CHECK(forced.resolve({true, true, "fixture", 1}) == on);
     reject_request(forced, {true, true, "fixture", 0});
     reject_request(forced, {true, true, "fixture", 2});
+
+    // several loaded profiles: a request picks one by name, in load order
+    auto q = p; q.name = "second"; q.manifest_digest[0] ^= 1;
+    const auto both = BootConfig::from_profiles({p, q});
+    const auto picked = both.resolve({true, false, "second", 0});
+    CHECK(both.profiles.size() == 2 && picked.enabled && picked.slot == 1 && picked.profile_digest == q.manifest_digest);
+    CHECK(both.resolve({true, false, "fixture", 0}) == on);
+    CHECK(cache_namespace(picked) != cache_namespace(on));
+    reject_request(both, {true, false, "third", 0});
+    auto reject_boot = [&](const std::vector<Profile>& ps) {
+        bool rejected = false;
+        try { (void)BootConfig::from_profiles(ps); } catch (const std::runtime_error&) { rejected = true; }
+        CHECK(rejected);
+    };
+    reject_boot({p, p});                                    // two profiles of one name
+    auto other_scope = q; other_scope.scope = Scope::Shared;
+    reject_boot({p, other_scope});                               // the scopes differ
+    std::vector<Profile> many;
+    for (uint32_t i = 0; i <= PROFILES_MAX; ++i) { many.push_back(p); many.back().name = "p" + std::to_string(i); }
+    reject_boot(many);
+    uint64_t one = 14695981039346656037ull, two = one;
+    hash_boot(one, BootConfig::from_profile(p)); hash_boot(two, both);
+    CHECK(one != two);
     for (int field = 0; field < 4; ++field) {
         auto changed = on;
         if (field == 0) changed.profile_digest[0] ^= 1;

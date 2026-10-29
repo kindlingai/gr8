@@ -178,7 +178,30 @@ struct SteerArgs
     const float* row_scale = nullptr; // [M], decode/S2; nullptr for a uniform prefill request
     float scale = 0.f;                // uniform prefill scale
     float alpha = 0.f;                // immutable profile alpha for this layer
+    // several loaded profiles: dir is this layer's [profiles][HID] table, row_slot[m] picks row m's profile and
+    // slot_alpha[slot] its alpha (0 where that profile leaves the layer out). nullptr: dir and alpha as above
+    const int* row_slot = nullptr;    // [M], decode/S2
+    const float* slot_alpha = nullptr;
 };
+
+// row m's direction and scale * alpha; false: the stock path
+__device__ __forceinline__ bool steer_row(const SteerArgs& a, int row, const float*& dir, float& sa)
+{
+    const float scale = a.row_scale ? a.row_scale[row] : a.scale;
+    const int s = a.row_slot ? a.row_slot[row] : 0;
+    const float alpha = a.row_slot ? a.slot_alpha[s] : a.alpha;
+    if (!a.dir || scale == 0.f || alpha == 0.f) return false;
+    dir = a.dir + (size_t)s * HID;
+    sa = scale * alpha;
+    return true;
+}
+
+__device__ __forceinline__ bool steer_on(const SteerArgs& a, int row)
+{
+    const float* dir;
+    float sa;
+    return steer_row(a, row, dir, sa);
+}
 
 __device__ __forceinline__ void bf16x8_to_f(const uint4& v, float (&o)[8])
 {
@@ -192,12 +215,13 @@ __device__ __forceinline__ void bf16x8_to_f(const uint4& v, float (&o)[8])
 // unsteered writer bits exactly.
 __device__ __forceinline__ void cluster_project(float (&x)[8], const SteerArgs& a, int row, int col0)
 {
-    const float scale = a.row_scale ? a.row_scale[row] : a.scale;
-    if (!a.dir || scale == 0.f || a.alpha == 0.f) return;
+    const float* dir;
+    float sa;
+    if (!steer_row(a, row, dir, sa)) return;
     __shared__ float wsum[RN_T / 32];
     __shared__ float cta_dot;
-    const float4 r0 = *reinterpret_cast<const float4*>(a.dir + col0);
-    const float4 r1 = *reinterpret_cast<const float4*>(a.dir + col0 + 4);
+    const float4 r0 = *reinterpret_cast<const float4*>(dir + col0);
+    const float4 r1 = *reinterpret_cast<const float4*>(dir + col0 + 4);
     const float r[8] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w};
     float dot = 0.f;
     #pragma unroll
@@ -218,7 +242,7 @@ __device__ __forceinline__ void cluster_project(float (&x)[8], const SteerArgs& 
     float total = 0.f;
     #pragma unroll
     for (int i = 0; i < RN_CL; ++i) total += *cl.map_shared_rank(&cta_dot, i);
-    const float kappa = (scale * a.alpha) * total;
+    const float kappa = sa * total;
     #pragma unroll
     for (int k = 0; k < 8; ++k) x[k] -= kappa * r[k];
     cl.sync();
@@ -404,8 +428,7 @@ __global__ void __cluster_dims__(RN_CL, 1, 1) __launch_bounds__(RN_T) k_ar_add_n
             #pragma unroll
             for (int k = 0; k < 8; ++k) x[k] += b[k];
         }
-    const float steer_scale = a.steer.row_scale ? a.steer.row_scale[m] : a.steer.scale;
-    const bool steer = a.steer.dir && steer_scale != 0.f && a.steer.alpha != 0.f;
+    const bool steer = steer_on(a.steer, m);
 #ifdef DEC_SLOT
     uint4 o;
     if (steer)

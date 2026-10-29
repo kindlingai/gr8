@@ -263,11 +263,12 @@ __global__ void __launch_bounds__(glue::RN_CL * glue::RN_T) k_rs_add_norm_w(RsNo
             for (int k = 0; k < 8; ++k) x[k] += b[k];
         }
 #endif
-        const float scale = a.steer.row_scale ? a.steer.row_scale[m] : a.steer.scale;
-        if (a.steer.dir && scale != 0.f && a.steer.alpha != 0.f)
+        const float* sdir;
+        float sa;
+        if (glue::steer_row(a.steer, m, sdir, sa))
         {
-            const float4 r0 = *reinterpret_cast<const float4*>(a.steer.dir + col0);
-            const float4 r1 = *reinterpret_cast<const float4*>(a.steer.dir + col0 + 4);
+            const float4 r0 = *reinterpret_cast<const float4*>(sdir + col0);
+            const float4 r1 = *reinterpret_cast<const float4*>(sdir + col0 + 4);
             const float r[8] = {r0.x, r0.y, r0.z, r0.w, r1.x, r1.y, r1.z, r1.w};
             float dot = 0.f;
             #pragma unroll
@@ -287,7 +288,7 @@ __global__ void __launch_bounds__(glue::RN_CL * glue::RN_T) k_rs_add_norm_w(RsNo
                     for (int i = 0; i < WPC; ++i) t += wsum[c * WPC + i];
                     total += t;
                 }
-                s_kappa = (scale * a.steer.alpha) * total;
+                s_kappa = sa * total;
             }
             __syncthreads();
             #pragma unroll
@@ -437,6 +438,7 @@ template <bool QO = false> __global__ void __launch_bounds__(256) k_own_unpack(O
 struct Prefill
 {
     float steering_scale = 0.f; // One request per lane; transported before projection kernels are enabled.
+    int steering_slot = 0;      // the request's loaded profile
     int Mmax = 0;
     g6::FabricDev f{};                // ncoll = 2 (all-reduce) or 5 (RS form), stride >= pf_slot_bytes(Mmax, rs) + 8
     u64* stepp = nullptr;             // device layer-step cell
@@ -1065,7 +1067,7 @@ inline glue::SteerArgs pf_steer(const Model& m, const Prefill& P, int i, bool at
 {
     if (i < 0 || i >= (int)m.steering_dir.size() ||
         (!attention && m.steering_scope == steering::Scope::Shared && m.layers[i].moe)) return {};
-    return {m.steering_dir[i], nullptr, P.steering_scale, m.steering_alpha[i]};
+    return {steer_dir_of(m, i, P.steering_slot), nullptr, P.steering_scale, steer_alpha_of(m, i, P.steering_slot)};
 }
 #if G6_NR == 4
 #include "qp.cuh"
@@ -1489,7 +1491,8 @@ inline void pf_mlp_block(Model& m, Prefill& P, int i, int M, cudaStream_t st)
     bindp::Expert ex = b.ex;
     if (m.steering_scope == steering::Scope::Shared && i < (int)m.steering_dir.size() && m.layers[i].moe)
     {
-        ex.steer_dir = m.steering_dir[i]; ex.steer_scale = P.steering_scale; ex.steer_alpha = m.steering_alpha[i];
+        ex.steer_dir = steer_dir_of(m, i, P.steering_slot); ex.steer_scale = P.steering_scale;
+        ex.steer_alpha = steer_alpha_of(m, i, P.steering_slot);
     }
     bindp::launch_experts(ex, st);
     if (!P.rc_file.empty() && b.ex.on) pf_rcdump(m, P, i, M, b.ex.cnt, st);

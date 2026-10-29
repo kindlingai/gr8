@@ -126,7 +126,7 @@ static Env* env_make() {
     float* dd=v->mem.alloc<float>(HID); put(dd,direction());
     m.steering_dir={dd}; m.steering_alpha={3.f};          // ablit-behavior-v1 embeds alpha 3.0
     m.steering_scope=steering::Scope::Shared;
-    m.steering_scale=v->mem.alloc<float>(MX); m.steering_part=v->mem.alloc<float>(size_t(MX)*48); m.steering_count=v->mem.alloc<unsigned>(MX);
+    m.steering_scale=v->mem.alloc<float>(MX); m.steering_slot=v->mem.alloc<int>(MX); m.steering_part=v->mem.alloc<float>(size_t(MX)*48); m.steering_count=v->mem.alloc<unsigned>(MX);
     v->base=fresh_layer(); v->s2=fresh_layer(); v->old=fresh_layer();
     base_bind(m,0,*v->base); s2_bind(m,0,*v->base,*v->s2);
     v->in=v->mem.alloc<uint32_t>(sizeof(StepIn)/4+1); v->stepp=v->mem.alloc<u64>(1);
@@ -139,7 +139,7 @@ static void transport(Env& v,const std::vector<float>& scales) {
     si.step=1; si.M=int(scales.size()); si.context=1;
     for(size_t r=0;r<scales.size();++r) si.steering_scale[r]=scales[r];
     CK(cudaMemcpy(v.in,&si,sizeof si,cudaMemcpyHostToDevice));
-    k_step_in<<<1,128>>>(StepCtl{v.in,v.stepp,v.tok,v.pos,v.tgt,v.m.steering_scale,v.srow,nullptr,nullptr,0});
+    k_step_in<<<1,128>>>(StepCtl{v.in,v.stepp,v.tok,v.pos,v.tgt,v.m.steering_scale,v.m.steering_slot,v.srow,nullptr,nullptr,0});
     CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
     const auto got=get(v.m.steering_scale,MX);
     bool ok=true; for(int r=0;r<MX;++r) ok &= got[r]==(size_t(r)<scales.size() ? scales[r]:0.f);

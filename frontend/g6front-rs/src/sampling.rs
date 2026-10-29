@@ -71,11 +71,15 @@ pub fn steering(
         }
         return Ok((None, None));
     }
-    let loaded = capability.and_then(|c| c.get("profile")).and_then(Value::as_str);
-    if loaded.is_none() {
+    let Some(cap) = capability.filter(|c| c.get("profile").and_then(Value::as_str).is_some()) else {
         return Err(ApiError::bad("steering is not enabled on this server", Some("steering_profile")));
-    }
-    if loaded != profile.as_deref() {
+    };
+    // several loaded profiles (ready.s2 version 5) list every name; one profile has only "profile"
+    let loaded = match cap.get("profiles").and_then(Value::as_array) {
+        Some(ps) => ps.iter().any(|p| p.get("profile").and_then(Value::as_str) == profile.as_deref()),
+        None => cap.get("profile").and_then(Value::as_str) == profile.as_deref(),
+    };
+    if !loaded {
         return Err(ApiError::bad("unknown steering_profile", Some("steering_profile")));
     }
     if capability.and_then(|c| c.get("forced")).and_then(Value::as_bool) == Some(true)
@@ -447,6 +451,10 @@ mod tests {
         assert_eq!(disabled.message, "steering is not enabled on this server");
         let forced = serde_json::json!({"profile":"example","forced":true,"forced_scale":2.0});
         assert!(steering(body.as_object().unwrap(), Some(&forced)).is_err());
+        let two = serde_json::json!({"profile":"example","profiles":[{"profile":"example"},{"profile":"zh-en"}]});
+        let second = serde_json::json!({"steering_profile":"zh-en"});
+        assert_eq!(steering(second.as_object().unwrap(), Some(&two)).unwrap(), (Some("zh-en".into()), Some(1.0)));
+        assert!(steering(other.as_object().unwrap(), Some(&two)).is_err());
         let default = serde_json::json!({"steering_profile":"example"});
         assert_eq!(steering(default.as_object().unwrap(), Some(&cap)).unwrap(), (Some("example".into()), Some(1.0)));
         let nulls = serde_json::json!({"steering_profile":null,"steering_scale":null});

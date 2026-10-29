@@ -94,6 +94,17 @@ class UnitTests(unittest.TestCase):
             g6s2shim.parse_ready(v4.rsplit(' ', 1)[0] + ' 1\n')
         with self.assertRaises(ValueError):
             g6s2shim.parse_ready(v4.replace(' full 48 ', ' full 0 ') + '\n')
+        v5 = 'G6S2 5 7 4 20000 2 4 8 20 full 2 en-zh ' + 'a' * 64 + ' 78 zh-en ' + 'b' * 64 + ' 77'
+        c = g6s2shim.parse_ready(v5 + '\n')
+        self.assertEqual(c['steering']['profiles'], [{'profile': 'en-zh', 'digest': 'a' * 64, 'layers': 78},
+                                                     {'profile': 'zh-en', 'digest': 'b' * 64, 'layers': 77}])
+        self.assertEqual((c['steering']['profile'], c['steering']['scope'], c['steering']['forced']), ('en-zh', 'full', False))
+        self.assertEqual(g6s2shim._steering_header({'steering_profile': 'zh-en'}, c['steering']), (' steer zh-en 3f800000', None))
+        self.assertEqual(g6s2shim._steering_header({'steering_profile': 'other'}, c['steering'])[1], 'unknown steering_profile')
+        for bad in (v5.replace(' 2 en-zh ', ' 3 en-zh '), v5.replace('zh-en', 'en-zh'), v5.replace(' 77', ' 0'),
+                    v5.replace(' full ', ' part '), v5.rsplit(' ', 3)[0].replace(' 2 en-zh ', ' 1 en-zh ')):
+            with self.assertRaises(ValueError):
+                g6s2shim.parse_ready(bad + '\n')
         for bad in ('G6S2 2 7 6 20000 2 4 8\n', 'G6S2 1 7 6 20000 2 4 8 20\n',
                     'G6S2 4 7 6 20000 2 4 8 20\n',
                     'G6S2 1 7 6\n', 'ready\n', 'G6S2 1 7 6 20000 2 4 x\n'):

@@ -1376,15 +1376,32 @@ fn health(st: &State) -> Response<HttpBody> {
 }
 
 fn health_response(ready: bool, capability: Option<&Value>) -> Response<HttpBody> {
+    let digest = |c: &Value| c.get("digest").and_then(Value::as_str).unwrap_or("").chars().take(12).collect::<String>();
     let steering = match capability {
-        Some(c) => serde_json::json!({
-            "enabled": true,
-            "forced": c.get("forced").and_then(Value::as_bool).unwrap_or(false),
-            "profile": c.get("profile").and_then(Value::as_str).unwrap_or(""),
-            "digest": c.get("digest").and_then(Value::as_str).unwrap_or("").chars().take(12).collect::<String>(),
-            "scope": c.get("scope").and_then(Value::as_str).unwrap_or(""),
-            "layers": c.get("layers").and_then(Value::as_u64).unwrap_or(0),
-        }),
+        Some(c) => {
+            let mut s = serde_json::json!({
+                "enabled": true,
+                "forced": c.get("forced").and_then(Value::as_bool).unwrap_or(false),
+                "profile": c.get("profile").and_then(Value::as_str).unwrap_or(""),
+                "digest": digest(c),
+                "scope": c.get("scope").and_then(Value::as_str).unwrap_or(""),
+                "layers": c.get("layers").and_then(Value::as_u64).unwrap_or(0),
+            });
+            // several loaded profiles: the fields above are the first one's, and this lists all of them in load order
+            if let Some(ps) = c.get("profiles").and_then(Value::as_array) {
+                s["profiles"] = ps
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "profile": p.get("profile").and_then(Value::as_str).unwrap_or(""),
+                            "digest": digest(p),
+                            "layers": p.get("layers").and_then(Value::as_u64).unwrap_or(0),
+                        })
+                    })
+                    .collect();
+            }
+            s
+        }
         None => serde_json::json!({"enabled": false, "forced": false}),
     };
     let body = serde_json::to_vec(&serde_json::json!({"ready": ready, "steering": steering})).unwrap();
@@ -1502,5 +1519,16 @@ mod steering_health_tests {
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["steering"], serde_json::json!({"enabled":true,"forced":true,"profile":"example",
                                                    "digest":"a".repeat(12),"scope":"full","layers":2}));
+        let one = |name: &str, d: &str, layers: u64| serde_json::json!({"profile":name,"digest":d.repeat(64),"layers":layers});
+        let mut two = one("en-zh", "a", 78);
+        two["scope"] = "full".into();
+        two["forced"] = false.into();
+        two["profiles"] = serde_json::json!([one("en-zh", "a", 78), one("zh-en", "b", 77)]);
+        let r = health_response(true, Some(&two));
+        let body = r.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["steering"]["profile"], "en-zh");
+        assert_eq!(v["steering"]["profiles"], serde_json::json!([{"profile":"en-zh","digest":"a".repeat(12),"layers":78},
+                                                                 {"profile":"zh-en","digest":"b".repeat(12),"layers":77}]));
     }
 }

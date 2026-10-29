@@ -77,6 +77,8 @@ struct K1Args
     // every steering load/store. Storage is shared across layers because launches are stream-ordered.
     const float *steer_dir = nullptr, *steer_scale = nullptr;
     float steer_alpha = 0.f;
+    const int* steer_slot = nullptr;   // several profiles: [G6_MX] row profile; steer_dir is [profiles][HID]
+    const float* steer_slot_alpha = nullptr;
     float* steer_part = nullptr;       // [G6_MX][48]
     unsigned* steer_count = nullptr;   // [G6_MX], zero between finalize launches
 #ifdef DEC_SLOT

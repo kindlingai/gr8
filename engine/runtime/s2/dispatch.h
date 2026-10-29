@@ -20,6 +20,7 @@ struct Launch {
     int bucket = 0;                                  // the step's bucket: the largest of its sessions'
     std::vector<Sampling> samples;
     std::vector<float> steering_scales;                 // per row; exact request FP32, target MAIN rows only
+    std::vector<int> steering_slots;                    // per row; the request's loaded profile
     // the graph key: kind, M and the step's bucket. The sessions, source rows and steering scales are data (S2In)
     std::string graph_key;
 };
@@ -120,6 +121,7 @@ public:
                 l.samples.push_back(s.sampling);
                 l.steering_scales.push_back(sp.kind == s2::Step::MAIN && s.payload.steering.enabled
                     ? g6rt::steering::bits_float(s.payload.steering.scale_bits) : 0.f);
+                l.steering_slots.push_back(int(s.payload.steering.slot));
             }
             require(sp.r[next_row + sp.rows[j] - 1].pos + 1 == sp.ctx[j], "wrong session context");
             next_row += sp.rows[j]; l.context = std::max(l.context, sp.ctx[j]);
@@ -179,6 +181,7 @@ void native_inputs(const Launch& l, StepIn& si, S2In& h) {
         const auto& x = l.step.r[r]; const auto& sample = l.samples[r];
         si.tok[r] = x.tok; si.pos[r] = x.pos; si.tgt[r] = x.tgt;
         si.steering_scale[r] = l.steering_scales.at(r);
+        si.steering_slot[r] = l.steering_slots.at(r);
         // top list: main-step rows of a request with lp > 0 (sampled rows) or plp > 0 (prompt rows; rank.cuh step_inputs)
         const int topk = l.step.kind == s2::Step::MAIN && (x.tgt >= 0 ? sample.plp : sample.lp) > 0;
         si.srow[r] = {sample.inv_temp, sample.seed, 0u, x.spos, 0, sample.top_p, topk};

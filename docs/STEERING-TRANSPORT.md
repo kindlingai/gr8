@@ -27,6 +27,12 @@ The reserved loaded receipt is:
 G6S2 4 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows> <max_lp> <profile> <manifest-digest> <scope> <active-layers> <forced> <decimal-scale-bits>
 ```
 
+With several loaded profiles (never forced) it is version 5, the profiles in slot order:
+
+```text
+G6S2 5 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows> <max_lp> <scope> <n> (<profile> <manifest-digest> <active-layers>) x n
+```
+
 The shim validates its name, digest, scope, layer count and forced scale, then exposes `hello.steering`
 as documented in [PROTOCOL.md](../PROTOCOL.md). No-profile readiness stays version 3. `/health` keeps its
 readiness status and now returns JSON containing `ready` and `steering`; disabled capability has
@@ -34,7 +40,7 @@ readiness status and now returns JSON containing `ready` and `steering`; disable
 
 The internal replicated control codec changes from **G6S2E4 to G6S2E5**, including stock grants, because
 grants now carry identity. Encoder and decoder change together and reject old, truncated or malformed
-frames. Deploy the same engine build on every rank; do not mix E4 and E5. (G6S2E6 since the commit frame gained its hold field; the bootstrap agreement carries `ctl 6`, so mixed builds refuse at bootstrap.) Scheduler agreement hashes
+frames. Deploy the same engine build on every rank; do not mix E4 and E5. (G6S2E6 since the commit frame gained its hold field; the bootstrap agreement carries `ctl 6`, so mixed builds refuse at bootstrap. Control version 10 adds the profile slot to each identity.) Scheduler agreement hashes
 include boot and live-request identities. This is independent of the Unix JSON protocol's version 1.
 
 ## Cache and model inputs

@@ -60,12 +60,38 @@ class FixtureTestCase(unittest.TestCase):
 class LocalTests(FixtureTestCase):
     def test_actual_template_and_weight_identity_reach_engine(self):
         o = self.opts('--steering-force', '1.25')
-        self.assertEqual(steering_local.prepare(o, self.ms), self.manifest)
+        self.assertEqual(steering_local.prepare(o, self.ms), [self.manifest])
         self.assertEqual(o.get('STEERING_WEIGHT_SET'), self.weights)
         args = options.engine_plan(o, rank=1, set_id=self.ms.id)['args']
         for flag, value in (('--steering-profile', str(self.profile)), ('--steering-chat-template', str(self.template)),
                             ('--steering-weight-set', self.weights), ('--steering-force', '1.25')):
             self.assertEqual(args[args.index(flag) + 1], value)
+
+    def test_several_profiles(self):
+        other = self.root / 'other'
+        shutil.copytree(self.profile, other)
+        both = f'{self.profile},{other}'
+        with self.assertRaisesRegex(modelset.ModelError, 'one profile_name'):
+            steering_local.prepare(self.opts('--steering-profile', both), self.ms)
+        self.manifest['profile_name'] = 'second'
+        self.profile, saved = other, self.profile
+        self.save_manifest()
+        self.profile = saved
+        o = self.opts('--steering-profile', both)
+        self.assertEqual([m['profile_name'] for m in steering_local.prepare(o, self.ms)], ['example', 'second'])
+        args = options.engine_plan(o, rank=1, set_id=self.ms.id)['args']
+        self.assertEqual(args[args.index('--steering-profile') + 1], both)
+        for bad in (f'{both},hf:default', f'{self.profile},', ','.join([str(self.profile)] * 9)):
+            with self.assertRaises(options.OptionError, msg=bad):
+                self.opts('--steering-profile', bad)
+        with self.assertRaisesRegex(options.OptionError, 'exactly one'):
+            self.opts('--steering-profile', both, '--steering-force', '1')
+        self.manifest['scope'] = 'full'
+        self.profile = other
+        self.save_manifest()
+        self.profile = saved
+        with self.assertRaisesRegex(modelset.ModelError, 'differ in scope'):
+            steering_local.prepare(self.opts('--steering-profile', both), self.ms)
 
     def test_no_profile_does_no_profile_io(self):
         o = options.parse(['--no-config', '--peers', PEERS], GLM)

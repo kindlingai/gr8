@@ -1,8 +1,9 @@
 # Runtime steering
 
-GR8 can load one verified immutable rank-one profile at boot and select it independently for each request. Loading is
-explicit. Starting with no profile keeps steering disabled; an HF release's bundled profiles are ignored unless the
-operator selects one. Loading a profile leaves requests stock until they select it or explicit forced mode is enabled.
+GR8 can load up to eight verified immutable rank-one profiles at boot, and each request selects one of them or none.
+Loading is explicit. Starting with no profile keeps steering disabled; an HF release's bundled profiles are ignored
+unless the operator selects one. Loading a profile leaves requests stock until they select it or explicit forced mode
+is enabled.
 
 ## Load a profile
 
@@ -28,6 +29,15 @@ For a local schema-v1 profile directory, add:
 --steering-chat-template-sha256 TEMPLATE_SHA256
 ```
 
+Several local profiles load from a comma-separated list, and requests in one batched step can use different ones:
+
+```sh
+--steering-profile /profiles/en-zh,/profiles/zh-en
+```
+
+They must share the model identity and scope, and their profile names must differ. The list order is each profile's
+slot. `hf:` selects one profile.
+
 The launcher derives the actual weight-set identity and served template file. Supplied identities are constraints;
 wrong values fail. Available dimensions/revision metadata must agree, while unavailable revision history remains an
 operator/publisher assertion. The engine independently hashes the served template and validates the profile before
@@ -42,20 +52,23 @@ scheduled layers, identity/template mismatches and inconsistent rank receipts fa
 
 ## Select per request
 
-Both completion endpoints accept these optional fields after a profile named `example` has been loaded:
+Both completion endpoints accept these optional fields once a profile named `example` is loaded (with several loaded
+profiles, any of their names):
 
 ```json
 {"steering_profile":"example","steering_scale":1.0}
 ```
 
-A named profile without a scale uses 1. Omit both fields for stock behavior. A scale without a name is accepted only
-at zero and canonicalizes to stock. A named zero scale also runs stock, but the name must still be the loaded profile.
-Unknown profiles and nonzero selection on a server without a profile return a request error. Scale must be finite and
-in `[0,4]`; canonical FP32 bits identify the request and its cache namespace.
+A named profile without a scale uses 1. Omit both fields for stock behavior. A scale without a name is accepted only at
+zero and canonicalizes to stock. A named zero scale also runs stock, but the name must still be a loaded profile.
+Unknown profiles and nonzero selection on a server without a profile return a request error. With several profiles
+loaded, `GET /health` lists them under `steering.profiles`, and the top-level profile fields describe the first one.
+Scale must be finite and in `[0,4]`; canonical FP32 bits identify the request and its cache namespace.
 
-`--steering-force SCALE` explicitly selects the loaded profile for every request and offline `g6m4 --prompt` plan.
-It accepts positive representable FP32 scales up to 4 and rejects conflicting explicit requests. It is a qualification
-mode; without it, loading alone never selects requests. `m4sim` does not expose profile boot flags.
+`--steering-force SCALE` needs exactly one loaded profile. It explicitly selects that profile for every request and
+offline `g6m4 --prompt` plan. It accepts positive representable FP32 scales up to 4 and rejects conflicting explicit
+requests. It is a qualification mode; without it, loading alone never selects requests. `m4sim` does not expose profile
+boot flags.
 
 Stock and selected resident prefix caches are separated by exact manifest/scope/schedule/scale identity. Selected
 state is not persisted into stock SSD/remote tiers. Target decode, prefill, prompt tails, teacher-forced scoring and
@@ -77,18 +90,22 @@ It applies to attention writer output and the configured MLP writer output. `ful
 post-layer residual projection is a different operator and must be converted before use.
 
 Projection is fused into existing consumes/finalizers; directions are uploaded at boot and row scales travel in the
-existing control transfer. Inactive rows take the stock branch before direction loads/projection arithmetic. Actual
-results include each path's FP16/BF16 conversion boundaries: the shared decode finalizer corrects a previously rounded
-combined partial, while prefill projects before its final output conversion. See the
-[general kernel contract](STEERING-KERNELS.md) and [shared finalizer precision/publication contract](STEERING-SHARED-KERNELS.md).
-Those differences prevent treating every path as an exact FP32 projection of an unrounded row.
+existing control transfer. With several profiles, each steered layer holds a `[profiles][hidden]` direction table and a
+per-profile alpha table, and each decode row also carries its profile slot. A profile that leaves a layer out has a zero
+row and alpha 0 there, so its requests run that layer stock. Prefill runs one request per lane and takes the lane's
+direction and alpha directly. With one profile, rows carry no slot. Inactive rows
+take the stock branch before direction loads/projection arithmetic. Actual results include each path's FP16/BF16
+conversion boundaries: the shared decode finalizer corrects a previously rounded combined partial, while prefill
+projects before its final output conversion. See the [general kernel contract](STEERING-KERNELS.md) and [shared
+finalizer precision/publication contract](STEERING-SHARED-KERNELS.md). Those differences prevent treating every path as
+an exact FP32 projection of an unrounded row.
 
 ## Qualification and provenance
 
-[Artifact tools](../tools/steering/README.md) pack a publisher-provided finished profile deterministically and preserve
-its exact manifest bytes. Extraction stays with its publisher. The [offline report tools](../tools/steering/REPORTS.md)
-summarize frozen paired results and normalized CUDA operation counts. They do not collect measurements, validate
-external judges or establish end-to-end behavior/accuracy/performance.
+[Artifact tools](../tools/steering/README.md) pack a finished profile deterministically and preserve its exact manifest
+bytes. `contrast.py` there makes a profile from contrastive answer pairs. The [offline report
+tools](../tools/steering/REPORTS.md) summarize frozen paired results and normalized CUDA operation counts. They do not
+collect measurements, validate external judges or establish end-to-end behavior/accuracy/performance.
 
 The extracted contracts, request transport, kernels, local boot and HF loading have unit/compile/CI checks. Cluster
 and serving gates were waived for this split. That waiver supplies no new matched whole-boot numerical, throughput,
