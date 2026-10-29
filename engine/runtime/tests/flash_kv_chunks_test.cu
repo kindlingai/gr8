@@ -254,7 +254,7 @@ static Bk book(const std::string& path)
     CKI(g6kv_ledger_show(path.c_str(), b.v));
     return b;
 }
-static std::string ledger_bin() { return knob::kvman_ledger(); }
+static std::string ledger_bin() { return knob::test_kvman_ledger(); }
 static void ledger_init(const std::string& path, uint64_t total, uint64_t gpu, uint64_t node)
 {
     // the book file as kvman-ledger init writes it (src/ledger.rs Book::to_text)

@@ -6,7 +6,7 @@
 #   MODEL_ARGS="--packs DIR" [M4SIM=./m4sim] [OUT=dir] [QUICK=1] scripts/mtp_lastrow_check.sh
 #
 # MODEL_ARGS: as scripts/m4sim_split_check.sh (--packs DIR, or --tp 4 --v2 DIR --v2-slices DIR --v2-widths FILE --v2-dense DIR).
-# Runs, each with GR8_MTP_LASTROW=0 and =1 and GR8_MTP_LASTROW_CHECK=1 (a "check" line after every draft step, m4sim header):
+# Runs, each with GR8_MTP_LASTROW=0 and =1 and GR8_TEST_MTP_LASTROW_CHECK=1 (a "check" line after every draft step, m4sim header):
 #   mtp   --mtp K decode of two prompts (prompt steps of --chunk 8 rows, so first forms of 1..8 rows), plain and graph
 #   s2    --s2 --mtp 2, three sessions sharing steps (first forms of several sessions: each session's last row), plain
 #         and graph
@@ -29,7 +29,7 @@ TEMP=${TEMP:-0}
 MTP_K=${MTP_K:-3}
 GEN=${GEN:-48}
 CAP=${CAP:-256}
-COMMON_ENV="GR8_DEC_SHARED_SCRATCH=1 GR8_MTP_LASTROW_CHECK=1 ${BASE_ENV:-GR8_CP=0}"
+COMMON_ENV="GR8_DEC_SHARED_SCRATCH=1 GR8_TEST_MTP_LASTROW_CHECK=1 ${BASE_ENV:-GR8_CP=0}"
 COMMON_ARGS="--layers $LAYERS --cap $CAP --temp $TEMP --wide --pfv2"
 GRAPH_ENV="GR8_DEC_SPLIT=3"
 read -r P0 P1 P2 < <(python3 - <<'EOF'
@@ -65,7 +65,7 @@ pair() {  # pair NAME "ENV" ARGS...: flag off and on, compared
   if ! diff -q <(grep -Ev "$drop" "$a") <(grep -Ev "$drop" "$b") > /dev/null; then
     echo "FAIL $name: lines differ (diff <(grep -Ev '$drop' $a) <(grep -Ev '$drop' $b))"; fails=$((fails + 1))
   elif [ "$nchk" = 0 ]; then
-    echo "FAIL $name: no check lines (GR8_MTP_LASTROW_CHECK not in this m4sim?)"; fails=$((fails + 1))
+    echo "FAIL $name: no check lines (GR8_TEST_MTP_LASTROW_CHECK not in this m4sim?)"; fails=$((fails + 1))
   elif diff -q <(grep -E "$drop" "$a") <(grep -E "$drop" "$b") > /dev/null; then
     echo "FAIL $name: the draft lines did not change at all (the flag had no effect?)"; fails=$((fails + 1))
   else

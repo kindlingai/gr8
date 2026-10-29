@@ -36,6 +36,12 @@ pub extern "C" fn gr8_knobs_signature() -> *const c_char {
     S.get_or_init(|| CString::new(env().signature()).unwrap()).as_ptr()
 }
 
+#[no_mangle]
+pub extern "C" fn gr8_knobs_tests_set() -> *const c_char {
+    static S: OnceLock<CString> = OnceLock::new();
+    S.get_or_init(|| CString::new(env().tests_set().join(" ")).unwrap()).as_ptr()
+}
+
 /// # Safety
 /// `out` must be valid for one write.
 #[no_mangle]

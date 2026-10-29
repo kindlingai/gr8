@@ -5,13 +5,13 @@
 // heads (each partial into its own block), the same three k_vput. The fabric is device memory here (the recv slots hold
 // what the peers' k_vput packed, the send slots are what this rank publishes; doorbells / tickets / error word in device
 // memory), so the step is rank 0 of NR=4 at live context L in capture bucket T with the CP page map of R (pages < R/64
-// replicated, the rest every NR-th page), indices = 2048 distinct positions <= the row's position (uniform; GR8_CPG_LOCAL=n:
+// replicated, the rest every NR-th page), indices = 2048 distinct positions <= the row's position (uniform; GR8_TEST_CPG_LOCAL=n:
 // the n most recent positions first, as a local window), so about 1/NR of the slots are this rank's (printed).
 //   EXACT  bytes of the three published partials (send slots, poisoned before every step) ONE vs stock, x chk.
 //   TIME   one step's phase-1 body (the 7 / 9 launches above) inside a graph of K steps, median of TR alternating trials,
 //          hot (no flush) and cold (a 96 MB L2 flush before every step, subtracted: the served case, the experts stream
 //          between layers). Saved per layer, and per step x 78 layers (every layer takes the CP block past R).
-// Arms: env GR8_CPG_ARMS="arm arm ..." with an arm = comma-separated KEY=VALUE attention flags (SC2 TR CTX2 CTX3 HG) or
+// Arms: env GR8_TEST_CPG_ARMS="arm arm ..." with an arm = comma-separated KEY=VALUE attention flags (SC2 TR CTX2 CTX3 HG) or
 // "stock" (all 0); default "SC2=4,TR=2,CTX2=4,CTX3=2 stock" (the measured attention set of docs/SETTINGS.md, then the
 // kernels without it).
 // build (from engine/attn/tests), with the engine's flags (scripts/build.sh K1H2_FLAGS, -DG6_NR=4 -DDEC_S2 -DPF_F12):
@@ -83,10 +83,10 @@ int main(int argc,char** argv){
     if(L>T||L<ga::TOP||M<1||M>QT||M>L||CPR<0||CPR%PS||CPR>=L){fprintf(stderr,"bad sizes (M <= 32, 2048 <= L <= T, R < L, R %% 64 == 0)\n");return 2;}
     if(g6nr::HMIN!=H||!g6a_cp_groups_ok(H)){fprintf(stderr,"needs equal head groups of a multiple of 16 heads (G6_NR=4) and GR8_ATTN_FLIP off\n");return 2;}
     std::vector<Arm> arms;std::vector<std::string> specs={"SC2=4,TR=2,CTX2=4,CTX3=2","stock"};
-    if(const auto& e=knob::cpg_arms()){specs.clear();const std::string& s=*e;size_t i=0;
+    if(const auto& e=knob::test_cpg_arms()){specs.clear();const std::string& s=*e;size_t i=0;
         while(i<s.size()){while(i<s.size()&&s[i]==' ')i++;size_t e2=s.find(' ',i);if(e2==std::string::npos)e2=s.size();if(e2>i)specs.push_back(s.substr(i,e2-i));i=e2;}}
-    for(auto& sp:specs){Arm x;if(!parse_arm(sp,x)){fprintf(stderr,"GR8_CPG_ARMS: bad arm %s\n",sp.c_str());return 2;}arms.push_back(x);}
-    const int LOCAL=(int)knob::cpg_local();
+    for(auto& sp:specs){Arm x;if(!parse_arm(sp,x)){fprintf(stderr,"GR8_TEST_CPG_ARMS: bad arm %s\n",sp.c_str());return 2;}arms.push_back(x);}
+    const int LOCAL=(int)knob::test_cpg_local();
     cudaStream_t st;CK(cudaStreamCreate(&st));
     // CP page map of rank 0: pages < R/64 replicated, then every NR-th page (bind.cu create)
     const int tpages=(T+PS-1)/PS;std::vector<int> table(tpages);int phys=0;
@@ -94,7 +94,7 @@ int main(int argc,char** argv){
     uint8_t* mla=dalloc<uint8_t>((size_t)phys*PS*g6kv::ROW);fill_kv<<<1024,256,0,st>>>(mla,(size_t)phys*PS,100);
     int* dtab=dalloc<int>(tpages);CK(cudaMemcpy(dtab,table.data(),tpages*4,cudaMemcpyHostToDevice));
     // rows at L - M + i; per row 2048 distinct positions <= its position, in random order (the merged list's order is the
-    // score order, unrelated to the position); GR8_CPG_LOCAL=n: the n most recent first
+    // score order, unrelated to the position); GR8_TEST_CPG_LOCAL=n: the n most recent first
     std::vector<int> pos(M),ind((size_t)M*ga::TOP);std::mt19937_64 rng(12345);int mine=0;
     for(int r=0;r<M;r++){pos[r]=L-M+r;std::vector<int> pick;std::vector<char> used(pos[r]+1,0);
         for(int k=0;k<LOCAL&&k<=pos[r]&&(int)pick.size()<ga::TOP;k++){pick.push_back(pos[r]-k);used[pos[r]-k]=1;}

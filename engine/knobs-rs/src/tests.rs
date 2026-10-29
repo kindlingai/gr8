@@ -67,9 +67,11 @@ fn names() {
     assert_eq!(e.get(find("MTP_KSTOPB_TAU_S"), 4), None);
     assert_eq!(e.get(find("TMPDIR"), 0).map(Value::canon).as_deref(), Some("/x"));
     assert!(e.problems().iter().any(|p| p.text.starts_with("G6_TMPDIR is not")));
-    // a legacy name other than G6_NAME
-    let e = env(&[("ATTNK_SESS", "2")]);
-    assert_eq!(e.get(find("ATTNK_SESS"), 0), Some(&Value::Int(2)));
+    // a test knob's old names: its own, and the GR8_ one it had before GR8_TEST_
+    let e = env(&[("ATTNK_SESS", "2"), ("GR8_S2_RUNS", "0:4")]);
+    assert_eq!(e.get(find("TEST_ATTNK_SESS"), 0), Some(&Value::Int(2)));
+    assert_eq!(e.get(find("TEST_S2_RUNS"), 0).map(Value::canon).as_deref(), Some("0:4"));
+    assert_eq!(e.tests_set(), ["GR8_TEST_ATTNK_SESS", "GR8_TEST_S2_RUNS"]);
 }
 
 #[test]

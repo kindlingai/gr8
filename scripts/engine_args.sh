@@ -159,7 +159,7 @@ engine_defaults() {
 # The engine environment for every rank (docs/SETTINGS.md has each variable). Prefill: 64-row attention tiles, dense
 # attention up to 8192 tokens of context and the indexer's sparse attention past it, reduce-scatter in place of
 # all-reduce with o_proj writing into the send slot, two lanes on two streams, attention and cuBLAS in 1024-row chunks,
-# timing lines on rank 0, the residual hash on the GPU, and GR8_PF_OWN as the attention ownership. Decode: two step
+# the residual hash on the GPU, and GR8_PF_OWN as the attention ownership. Decode: two step
 # graphs split at layer 3, one scratch shared with prefill. KV: the first SHARE_LIMIT tokens replicated on every rank
 # and later pages spread across ranks (CP), every staged page checked against a HASH2 hash.
 # TP=4 defaults GR8_PF_OWN to 4. OWN=3 needs the 13 GB full-head QO pack on every rank, and that pack does not fit next to
@@ -172,7 +172,7 @@ flash_env() {
 GR8_FPF_ATTN_P1=0 GR8_PF_SPARSE_MLA=1 GR8_PF_SPARSE_MLA_512=1 \
 GR8_PF_SPARSE_MLA_V2=1 GR8_PF_SPARSE_MLA_H16C=1 GR8_PF_DTR8=1 GR8_PF_SHFP8=1 GR8_PF_FC2V2=1 GR8_PF_KDA_WS=1 \
 GR8_PF_DSA_FULL_GV=1 GR8_PF_ROUTER_SPLIT=1 GR8_PF_DSA_F16GEMM=1 GR8_PF_PREWARM=1 GR8_PF_MHC_STAGE=1 GR8_PF_MHC_FUSE=2 \
-GR8_PF_TIMES=1 GR8_PF_STAGE_ASYNC=1"
+GR8_PF_STAGE_ASYNC=1"
   # the peer-partial staging (GR8_PF_STAGE_ASYNC) runs at any rank count; the G9 KDA scan is a precision arm, not the
   # same bytes as the scan it replaces, so it stays where it was chosen: TP2 (it would change TP4's output)
   [ "$TP" = 4 ] || ENGINE_ENV="$ENGINE_ENV GR8_KDA_SCAN=1 GR8_KDA_VS=2"
@@ -198,7 +198,7 @@ engine_env() {
   [ "${GR8_MODEL:-glm53}" = pseudo ] && { ENGINE_BIN=g6pseudo; ENGINE_ENV=""; return 0; }
   ENGINE_BIN=g6m4; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=g6m4-int4
   ENGINE_ENV="GR8_PF_TILE=64 GR8_PF_DENSE=8192 GR8_PF_RS=1 GR8_PF_STREAMS=2 GR8_PF_ATTN_ROWS=${PF_ATTN_ROWS:-1024} GR8_PF_OWN=$PF_OWN \
-GR8_PF_BLAS_ROWS=1024 GR8_PF_TIMES=1 GR8_PF_HASH_GPU=1 GR8_PF_RSDIRECT=1 GR8_DEC_SPLIT=3 GR8_DEC_SHARED_SCRATCH=1 \
+GR8_PF_BLAS_ROWS=1024 GR8_PF_HASH_GPU=1 GR8_PF_RSDIRECT=1 GR8_DEC_SPLIT=3 GR8_DEC_SHARED_SCRATCH=1 \
 GR8_CP=1 GR8_CP_R=$SHARE_LIMIT GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   if [ "$TP" = 4 ] && [ "$PF_OWN" = 4 ]; then
     ENGINE_ENV="$ENGINE_ENV GR8_PF_QP_ROLL=${QP_ROLL:-2} GR8_PF_QP_CTX=${QP_CTX:-$CAP} GR8_PF_QP_EARLY=${QP_EARLY:-1}"

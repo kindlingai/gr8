@@ -74,6 +74,11 @@ class PrecedenceTests(unittest.TestCase):
         self.assertIn('GR8_QA_SPLIT=1', env)
         self.assertEqual([e for e in env if e.startswith(('G6_', 'G9_'))], [])
 
+    def test_test_knobs_are_refused(self):
+        with self.assertRaises(opt.OptionError) as e:
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--extra-env', 'GR8_TEST_S2_RUNS=0:4'], GLM))
+        self.assertIn('GR8_TEST_S2_RUNS: a test knob', str(e.exception))
+
     def test_default_file_and_no_config(self):
         o = opt.parse([], {'GR8_CLUSTER': self.f})
         self.assertEqual((o.file, o.get('CAP')), (self.f, '1000'))

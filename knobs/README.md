@@ -29,7 +29,9 @@ knobs:
   - `agree`: every rank of one engine runs the same value. A value that differs from the default joins the S2
     runtime signature, so a rank with another value refuses to start.
   - `local`: may differ between ranks (paths, per-box resources, logging).
-  - `test`: read by test programs, audits and benchmarks. A test knob lives only in a file whose `scope` is `test`.
+  - `test`: read by test programs, audits and benchmarks. A test knob lives only in a file whose `scope` is `test`,
+    which is `test.yaml` with the prefix `GR8_TEST_`. `g6m4 --serve` refuses to start while one is set, and so does
+    `./gr8 <model> up` when `EXTRA_ENV` names one.
   - `outside`: read by the build, the launcher or the image, never by the engine.
 - `kind`: `flag` (0 or 1), `int` (decimal or 0x hex), `float`, `text`, `path`, `ints` or `floats` (comma lists).
 - `default`, or `unset`: give one. `default` is the value an unset variable has, and the accessor returns it.

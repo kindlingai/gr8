@@ -10,7 +10,7 @@
 #           claim: the same bytes as the replicated GEMVs):
 #           minv  : --minv sweep (rows 0..B-1 in --chunk 4 steps, then one step of M = 1..32..1 rows from row B), row lines
 #           mtp   : --mtp K decode with row lines (prompt steps, first / chain drafts, verify steps of K + 1 rows)
-#           s2    : --s2 --mtp 2, three sessions sharing steps (GR8_S2_ROWHASH)
+#           s2    : --s2 --mtp 2, three sessions sharing steps (GR8_TEST_S2_ROWHASH)
 #           ROWCHECK=1: also, inside every minv run, row B + j must print the same row line at every M > j. That is
 #           row-count invariance, which the engine does not promise; it is a probe, not part of the split's check.
 #   chunk   (probe) the same prompts teacher-forced at --chunk C = 1..32 (+ generated rows): every row line (keyed by sequence and
@@ -143,16 +143,16 @@ ab_part() {   # $1 = tag prefix, $2 = extra env (cp)
     g=""; ge=""; [ $form = graph ] && { g=--graph; ge=$GRAPH_ENV; }
     for f in $QI; do
       tag=${pre}minv.$form.$(ftag "$f")
-      run "$tag" "$COMMON_ENV $xenv $ge GR8_ROW_LINES=1 $(fenv "$f")" $COMMON_ARGS $g $PROMPTS --chunk 4 --minv "$MINV_B"
+      run "$tag" "$COMMON_ENV $xenv $ge GR8_TEST_ROW_LINES=1 $(fenv "$f")" $COMMON_ARGS $g $PROMPTS --chunk 4 --minv "$MINV_B"
     done
     for f in $QIM; do
       tag=${pre}mtp.$form.$(ftag "$f")
-      run "$tag" "$COMMON_ENV $xenv $ge GR8_ROW_LINES=1 $(fenv "$f")" $COMMON_ARGS $g $PROMPTS --chunk 8 --gen "$GEN" --mtp "$MTP_K"
+      run "$tag" "$COMMON_ENV $xenv $ge GR8_TEST_ROW_LINES=1 $(fenv "$f")" $COMMON_ARGS $g $PROMPTS --chunk 8 --gen "$GEN" --mtp "$MTP_K"
     done
     [ -n "$xenv" ] && continue        # CP block: no --s2 (S2 runs below R)
     for f in $QIM; do
       tag=${pre}s2.$form.$(ftag "$f")
-      run "$tag" "$COMMON_ENV $ge GR8_S2_ROWHASH=1 $(fenv "$f")" $COMMON_ARGS $g $PROMPTS --prompt "$P2" --chunk 8 --gen 16 --mtp 2 --s2
+      run "$tag" "$COMMON_ENV $ge GR8_TEST_S2_ROWHASH=1 $(fenv "$f")" $COMMON_ARGS $g $PROMPTS --prompt "$P2" --chunk 8 --gen 16 --mtp 2 --s2
     done
   done
   for form in plain graph; do
@@ -180,7 +180,7 @@ chunk_part() {
     refs=()
     for c in $cs; do
       tag=chunk.$(ftag "$f").c$c
-      run "$tag" "$COMMON_ENV $GRAPH_ENV GR8_ROW_LINES=1 $(fenv "$f")" $COMMON_ARGS --graph $PROMPTS --chunk "$c" --gen "$GEN"
+      run "$tag" "$COMMON_ENV $GRAPH_ENV GR8_TEST_ROW_LINES=1 $(fenv "$f")" $COMMON_ARGS --graph $PROMPTS --chunk "$c" --gen "$GEN"
       refs+=("$tag")
     done
     rows "${refs[@]}"

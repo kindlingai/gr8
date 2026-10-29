@@ -195,7 +195,7 @@ How it differs inside (not in its output):
   backpressure.
 - **Long prompts are encoded in parallel.** The text is cut only where GLM's pre-tokenizer regex always ends a token:
   after `\n` + ASCII letter, or before a space that follows an ASCII letter. Concatenated ids are identical to one
-  encode; `src/tok.rs` gives the argument. A start-up self-check and a fuzz test (`GR8_TOKENIZER_DIR=<dir> cargo test
+  encode; `src/tok.rs` gives the argument. A start-up self-check and a fuzz test (`GR8_TEST_TOKENIZER_DIR=<dir> cargo test
   --release`) confirm it. The self-check turns the parallel path off for a tokenizer whose shape the argument does not
   cover.
 - **Memory goes back to the OS.** It uses mimalloc. Loading `tokenizer.json` peaks at ~280 MB, and it is collected

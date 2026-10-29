@@ -699,6 +699,9 @@ def validate(o):
     if o.g6env:
         raise OptionError(f'{", ".join(o.g6env)} set in the environment: the engine does not inherit G6_* variables. Pass '
                           'them as GR8_ names with --extra-env "NAME=value ..." so every box compares them')
+    tests = [w.partition('=')[0] for w in (o.get('EXTRA_ENV') or '').split() if w.startswith('GR8_TEST_')]
+    if tests:
+        raise OptionError(f'--extra-env {" ".join(tests)}: a test knob (knobs/test.yaml), which a serving engine refuses')
     if o.get('VARIANT') and o.get('V2_WIDTHS'):
         raise OptionError('--variant and --v2-widths both name the width manifest: give one')
     if o.get('DRAFTER') and not o.get('DRAFTER').startswith('https://'):

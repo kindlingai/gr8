@@ -5,7 +5,7 @@
 // A step carries the rows of up to S2N sessions, session-major, each session's rows contiguous in position order
 // (s2_batch.h Step). Everything but attention is row-invariant (Stage 0) and runs over all M rows as today, with the
 // MoE k1 split of the step's row class (A1: S2In::cls, bind::make_layer split_m). Attention runs once per layer over all
-// rows of the step (batched, below; GR8_S2_ATTN_PERSESSION=1: once per session over the session's rows of q_b / kv_a / index
+// rows of the step (batched, below; GR8_TEST_S2_ATTN_PERSESSION=1: once per session over the session's rows of q_b / kv_a / index
 // inputs, then a device copy of its output rows) into the concatenated attention rows (cat) that o_proj's fragment table reads.
 // KV: per layer the pool is the layer's OWN binding (y.ab, created by build at s2_pool_slots x the per-session
 // reservation, the --cap pages, identity block table). Session slot q owns a list of pool pages (S2Model::run[q], the
@@ -19,7 +19,7 @@
 // into the layers' tables and the driver sets StepIn::page_bound to the pool's pages.
 // Per-session cells [slot][layer] are written by k_s2_cells from the device S2In of the step (written by the driver before
 // the launch, like StepIn); the per-session calls run without graphs and without replay entries.
-// Batched attention (default; GR8_S2_ATTN_PERSESSION=1 keeps the per-session calls above): ONE attention call per layer for
+// Batched attention (default; GR8_TEST_S2_ATTN_PERSESSION=1 keeps the per-session calls above): ONE attention call per layer for
 // all rows of the step. Per layer one batch view (its own index list and error word, output = cat) and one replay entry keyed
 // (bucket of the longest session, layer, M): independent of which sessions and how many rows each has. The per-row bounds and
 // block table live in device data (G6AttnRow per row, s2_cells.cuh) that k_s2_cells writes from S2In before the launch, so one
@@ -48,7 +48,7 @@ namespace g6rt
 // The step's bucket (S2Model::bucket) is the largest bucket of its sessions' contexts.
 //
 // The attention reads its per-row contexts and tables from the per-row cells (s2_cells.cuh, one call per layer). The
-// promise holds in the batched form (default). The per-session form (GR8_S2_ATTN_PERSESSION=1) bakes the layout into its
+// promise holds in the batched form (default). The per-session form (GR8_TEST_S2_ATTN_PERSESSION=1) bakes the layout into its
 // replay entries: it is for runs without graphs only (s2_init refuses it with graphs).
 constexpr bool S2_ATTN_LAYOUT_FREE = true;
 // selected positions per row of a view's index list (Flash: the kpool selection, kvfmt.h)
@@ -256,10 +256,10 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
     s->nslots = nslots;
     s->cells = dmalloc<G6AttnStepCell>((size_t)S2N * m.nl);
     {
-        s->batch = !knob::s2_attn_persession();
-        if (!s->batch && s->graph) die("s2: GR8_S2_ATTN_PERSESSION=1 bakes the session layout into replay entries; use it without graphs");
+        s->batch = !knob::test_s2_attn_persession();
+        if (!s->batch && s->graph) die("s2: GR8_TEST_S2_ATTN_PERSESSION=1 bakes the session layout into replay entries; use it without graphs");
 #if G6_MODEL_FLASH
-        if (!s->batch) die("s2: Flash runs batched attention only (GR8_S2_ATTN_PERSESSION=1 is GLM's)");
+        if (!s->batch) die("s2: Flash runs batched attention only (GR8_TEST_S2_ATTN_PERSESSION=1 is GLM's)");
         if (m.s2_below) die("s2: Flash has no S2 below R");
 #endif
     }
@@ -571,7 +571,7 @@ inline void s2_reloc_copy(char* cache, size_t page_bytes, int B, int pages, cuda
                                 cudaMemcpyDeviceToDevice, st));
     }
 }
-// the 2->1 transition (m4sim GR8_S2_RELOC=1): the survivor in slot q (a run at base B != 0) moves to base 0, its first
+// the 2->1 transition (m4sim GR8_TEST_S2_RELOC=1): the survivor in slot q (a run at base B != 0) moves to base 0, its first
 // `pages` pages of every layer's MLA cache (g6kv::ROW B per row) and index cache (132 B per row, full-index layers), then
 // s2_set_base(q, 0). Host, at a round boundary, outside capture, before any new admission, for the main and the draft
 // model of every rank.

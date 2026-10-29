@@ -281,9 +281,9 @@ pub struct Ledger {
     path: PathBuf,
 }
 
-/// Tests only: GR8_LEDGER_CRASH_AT=write (before the rename) or written (after it) aborts the process there.
+/// Tests only: GR8_TEST_LEDGER_CRASH_AT=write (before the rename) or written (after it) aborts the process there.
 fn crash_at(point: &str) {
-    if cfg!(any(test, debug_assertions)) && gr8knobs::LEDGER_CRASH_AT.get() == Some(point) {
+    if cfg!(any(test, debug_assertions)) && gr8knobs::TEST_LEDGER_CRASH_AT.get() == Some(point) {
         std::process::abort();
     }
 }

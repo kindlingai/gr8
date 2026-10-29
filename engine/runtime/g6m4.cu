@@ -339,8 +339,10 @@ int main(int argc, char** argv)
 #endif
     if (s2mode && (!graph || !mtp || !MP || s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 8 || !s2epoch))
         die("serving (--serve) needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8 and --s2-epoch > 0");
+    if (s2mode && !knob::tests_set().empty())
+        die("serving (--serve) refuses test knobs (knobs/test.yaml): " + knob::tests_set());
     if (knob::rt_store() && !s2mode) die("GR8_RT_STORE needs --serve (S2 below R with GR8_CP on)");
-    if (knob::rt_poison()) die("GR8_RT_POISON is an m4sim test: g6m4 reads the local copy of a row without a slot");
+    if (knob::test_rt_poison()) die("GR8_TEST_RT_POISON is an m4sim test: g6m4 reads the local copy of a row without a slot");
     // GR8_RT_LOCAL (release): each split run's tail cycles through that many window pages per rank; the pool grants the
     // drafter's whole tail apart from them (kvman-rs Pool::window, s2_cp_map). GR8_RT_PLACE: the main model's physical
     // pages per rank (m.cp.phys), so --cap (the logical length) may pass what the local pages hold

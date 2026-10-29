@@ -306,6 +306,13 @@ impl Env {
         }
         out
     }
+
+    /// The test knobs that are set, under any of their names, as their GR8_TEST_ names. A serving engine refuses to
+    /// start with any of them set.
+    pub fn tests_set(&self) -> Vec<String> {
+        let tests = self.values.keys().filter(|&&(i, _)| TABLE[i].scope == Scope::Test);
+        tests.map(|&(i, n)| TABLE[i].var(TABLE[i].family.then_some(n))).collect()
+    }
 }
 
 /// This process's environment, read at the first call.
