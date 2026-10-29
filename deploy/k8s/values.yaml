@@ -11,7 +11,7 @@ size: 4
 # 0 stops every box, 1 boots them. One group per release: a second group is a second release, with its own GROUP.
 replicas: 1
 
-# The launcher's options (KNOBS.md), the same on every pod. Set only what this cluster needs: the launcher owns every
+# The launcher's options (./gr8 knobs), the same on every pod. Set only what this cluster needs: the launcher owns every
 # default. Not here: TP and HEAD (the chart sets them from the group), and PEERS (the first address would be the head,
 # and the leader need not be on it). GR8_MODEL and MODEL are required, with no default: the model, glm53 (GLM-5.3) or
 # glm53f (GLM-5.3-Flash), and a release of it. `./gr8 models` lists each model's release, TP sizes and variants.

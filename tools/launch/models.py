@@ -93,5 +93,5 @@ def describe(m):
 
 if __name__ == '__main__':
     print('\n\n'.join(describe(m) for m in SERVED))
-    print('\nKNOBS.md lists every option. The pseudo engine (./gr8 pseudo, no GPU) is for tests: '
+    print('\n./gr8 knobs lists every option. The pseudo engine (./gr8 pseudo, no GPU) is for tests: '
           'frontend/pseudo-engine.')

@@ -2,12 +2,14 @@
 """The option parser, the config file, precedence and the canonical option set. No network, no GPU.
     python3 -m unittest discover -s tools/launch"""
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import models  # noqa: E402
 import options as opt  # noqa: E402
 
 PEERS = '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'
@@ -181,6 +183,35 @@ class GetTests(unittest.TestCase):
         rc, _, err = self.get('TP', '--no-config')
         self.assertEqual(rc, 2)
         self.assertIn('--tp is needed', err)
+
+
+class KnobsTests(unittest.TestCase):
+    """launch.py knobs, which ./gr8 knobs and ./gr8 <model> knobs run."""
+    def knobs(self, model, *argv):
+        r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'launch.py'),
+                            'knobs', '--no-config', *argv], env={**os.environ, 'GR8_MODEL': model},
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def heads(self, text):
+        return [line.split()[0] for line in text.splitlines() if line and not line.startswith((' ', '-')) and
+                line.split()[0].isupper() and len(line.split()) > 1 and line.split()[1].startswith('--')]
+
+    def test_every_option_is_listed(self):
+        import kvnode
+        self.assertEqual(self.heads(self.knobs('')), list(opt.KEYS) + list(kvnode.KEYS))
+
+    def test_a_model_shows_each_tp(self):
+        out = self.knobs('glm53', 'CAP')
+        self.assertEqual(self.heads(out), [k for k in opt.KEYS if 'CAP' in k])
+        lines = out.splitlines()
+        values = lines[lines.index(next(x for x in lines if x.startswith('CAP '))) + 1]
+        self.assertEqual(re.findall(r'TP=(\d+) \d+', values), list(models.GLM53.tp))
+
+    def test_tp_and_options_shape_the_values(self):
+        out = self.knobs('glm53', '--tp', '6', '--cap', '1000', 'CAP')
+        self.assertIn('    TP=6 1000 (set by the command line)\n', out)
 
 
 class RestartTests(unittest.TestCase):

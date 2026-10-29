@@ -1,4 +1,4 @@
-# The engine command line. The per-box supervisor (tools/launch) sources this file. KNOBS.md lists
+# The engine command line. The per-box supervisor (tools/launch) sources this file. ./gr8 knobs lists
 # the knobs. docs/SETTINGS.md explains every engine variable and flag.
 #
 # GR8_MODEL picks the model: glm53 (unset), glm53f, GLM-5.3-Flash (bin/g6m4_flash, TP 4 or 2), or pseudo, the pseudo

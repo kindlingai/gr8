@@ -138,7 +138,7 @@ spec:
               - name: G6_HOME
                 value: /var/lib/gr8/home
               {{- if .Values.modelLoader.enabled }}
-              # The model-loader store (KNOBS.md, FETCH), and model-loader's local API in it.
+              # The model-loader store (./gr8 knobs FETCH), and model-loader's local API in it.
               - name: FETCH
                 value: model-loader
               - name: MODEL_CACHE

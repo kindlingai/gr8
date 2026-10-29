@@ -115,7 +115,7 @@ a local mentat daemon (`--mentat localhost`, the default).
 
 Options come from the command line, then a config file (`@FILE`, else `./cluster.env`; see
 [config/cluster.env.example](config/cluster.env.example)), then the environment. With the options in `cluster.env`,
-`./gr8 glm53 up` alone is enough. [KNOBS.md](KNOBS.md) lists every option.
+`./gr8 glm53 up` alone is enough. `./gr8 knobs` lists every option, and [KNOBS.md](KNOBS.md) says how they combine.
 
 When a rank's engine exits, the head stops every box: `status` names the rank and shows its last log line, and the
 supervisor log names the line that says why. Logs are in `out/` on each box (`supervisor.log`, `g6m4.r<r>.err`, and
@@ -220,7 +220,7 @@ The limits:
   context is still `--cap`.
 
 [engine/kvman-rs/REMOTE-TIER.md](engine/kvman-rs/REMOTE-TIER.md) covers the block stores, their transports and
-measurements. [KNOBS.md](KNOBS.md) lists every `KV_STORE` and `KV_ROWS` field, and
+measurements. `./gr8 knobs KV_STORE KV_ROWS` describes every `KV_STORE` and `KV_ROWS` field, and
 [docs/SETTINGS.md](docs/SETTINGS.md) the engine's `G6_RT_*` settings.
 
 ### Thinking
@@ -236,7 +236,7 @@ with these fields:
 | `response_format` | `{"type": "text"}`, `json_object`, `json_schema` (chat) | JSON modes are checked after generation, not constrained: the reply's first JSON value, and for `json_schema` the schema's XGrammar grammar ([frontend/README.md](frontend/README.md)) |
 
 `usage.completion_tokens_details.reasoning_tokens` counts the reply's tokens through its `</think>`.
-`--default-reasoning-effort` and `--default-thinking-budget` set the defaults for requests that name none (KNOBS.md).
+`--default-reasoning-effort` and `--default-thinking-budget` set the defaults for requests that name none (`./gr8 knobs DEFAULT_`).
 The engine puts the close in place of the token itself (an insert rule, PROTOCOL.md), so a cut costs one more main step.
 With an engine from before that, the front end ends the run and continues from the prompt, the reply and the close,
 which prefills the prompt's last partial 4,096-token cell and the reasoning again: 2.5 to 4.2 s at TP=4's cold prefill
@@ -291,7 +291,7 @@ rate (frontend/README.md). A request that uses `logprobs` cannot have a budget.
 | `tools/convert/` | the readers, writers and test fixtures behind the exlr8 release |
 | `smoketest/`, `bench/` | the smoke test, benchmarks and the quality gate |
 | `docs/` | engine settings, the prefill attention design, the model-specific parts |
-| [KNOBS.md](KNOBS.md), [KNOWN-ISSUES.md](KNOWN-ISSUES.md), [PROTOCOL.md](PROTOCOL.md), [AGENTS.md](AGENTS.md) | every option; open bugs; the front end to engine protocol; how to build, test and land a change |
+| [KNOBS.md](KNOBS.md), [KNOWN-ISSUES.md](KNOWN-ISSUES.md), [PROTOCOL.md](PROTOCOL.md), [AGENTS.md](AGENTS.md) | how the options combine (`./gr8 knobs` lists them); open bugs; the front end to engine protocol; how to build, test and land a change |
 
 gr8 is written for GLM 5.3's shapes, not as a general engine. [docs/MODEL-SPECIFIC.md](docs/MODEL-SPECIFIC.md) lists every
 place the model is built in, and what would carry over to another model.

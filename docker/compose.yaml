@@ -6,7 +6,7 @@
 #   docker compose -f docker/compose.yaml run --rm gr8 prepare     # optional, before up: fetch it ahead of time
 # docker/.env says which boxes and which model (.env.example lists the settings). Compose reads .env from this file's
 # directory, whatever the working directory, and passes every line of it into the container, where the launcher reads
-# its options (KNOBS.md). docs/DEPLOY.md has the steps, docker/README.md the rest.
+# its options (./gr8 knobs). docs/DEPLOY.md has the steps, docker/README.md the rest.
 #
 # RULE: no option default lives here. The launcher in the image owns every default, and a second copy here would be
 # a second place to change, with one of them silently winning. The only values set below are the container's own

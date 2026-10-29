@@ -2,7 +2,7 @@
 
 gr8 runs one rank on each GB10 box, with the same command on every box: on bare metal, in Docker Compose or on
 Kubernetes. Each surface takes the same two settings, the model and how the boxes find each other, and neither has a
-default. The launcher owns every other default: [KNOBS.md](../KNOBS.md) lists every option, and `show-config` prints
+default. The launcher owns every other default: `./gr8 knobs` lists every option, and `show-config` prints
 each value and where it came from. Each section below ends with `smoke`, which asks the API questions whose answers
 can be checked. The commands name `glm53`; for GLM-5.3-Flash, `glm53f`.
 
@@ -138,7 +138,7 @@ A values file, `my-values.yaml`:
 image:
   tag: sha-<commit>                 # the same build on every box: they refuse a mix
 size: 4                             # the TP: 3, 4, 5 or 6
-options:                            # the launcher's options (KNOBS.md)
+options:                            # the launcher's options (./gr8 knobs)
   GR8_MODEL: glm53
   MODEL: https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4
   DRAFTER: https://huggingface.co/incoai/GLM-5.3-DFlash2     # glm53 at TP=4 only

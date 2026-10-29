@@ -32,7 +32,7 @@ A values file for your cluster ([values.yaml](values.yaml) has every value and i
 image:
   tag: sha-<commit>                 # the same build on every box: they refuse a mix
 size: 4                             # TP: 3, 4, 5 or 6
-options:                            # the launcher's options (KNOBS.md)
+options:                            # the launcher's options (./gr8 knobs)
   GR8_MODEL: glm53                  # required: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash)
   MODEL: https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4    # required: a release of that model
   DRAFTER: https://huggingface.co/incoai/GLM-5.3-DFlash2     # glm53 at TP=4 only
@@ -80,7 +80,7 @@ first ran on, so each pod comes back to its box and its warm cache; when a box i
 claims (for `gr8-0-2`: `cache-gr8-0-2`, `home-gr8-0-2`) and the pod starts on another box, which downloads its part
 again. The claims outlive the release (`persistentVolumeClaimRetentionPolicy`): delete them by hand to free the disk.
 
-`MODEL` may also be a local copy of the release, used in place (KNOBS.md). Mount it with `extraVolumes` and
+`MODEL` may also be a local copy of the release, used in place (./gr8 knobs MODEL). Mount it with `extraVolumes` and
 `extraVolumeMounts`, read-only, at the same path on every box, and set `MODEL` to that path in `options`. The cache then
 holds no weights:
 

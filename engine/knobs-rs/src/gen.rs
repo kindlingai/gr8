@@ -142,7 +142,7 @@ pub fn env_md() -> String {
 
 Every setting the engine, its tests and its build read from the environment, from `engine/knobs-rs/src/table.rs`.
 `knobs gen` writes this page: change the table, not this page. [SETTINGS.md](SETTINGS.md) explains how the main ones
-work together, and [KNOBS.md](../KNOBS.md) lists the launcher options that set them.
+work together, and `./gr8 knobs` lists the launcher options that set them.
 
 The knob `NAME` is the variable `GR8_NAME`. Its old name `G6_NAME` still works and prints a warning at boot. A name
 ending in `<n>` stands for the name followed by any number. An empty value counts as unset. A value outside the

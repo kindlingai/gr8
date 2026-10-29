@@ -140,7 +140,7 @@ what it was. #37 shipped this as `--kv-tier STORE,size=N,keep=evicted|shared|all
     --kv-write-limit 0.25                      # optional cap, off by default
 
 The launcher's `KV_STORE` holds the stores separated by `;`, with `KV_KEEP`, `KV_SYSTEM_AFTER` and `KV_WRITE_LIMIT`
-(KNOBS.md). A store is `ssd:PATH` (a folder: rank r keeps `PATH/r<r>/blocks` and `PATH/r<r>/index`) or
+(`./gr8 knobs KV_`). A store is `ssd:PATH` (a folder: rank r keeps `PATH/r<r>/blocks` and `PATH/r<r>/index`) or
 `remote:HOST:PORT`. `remote:auto` is the launcher's: each box's supervisor names the KV node mentat announces, with an
 RDMA address on one of the box's rails first. `size` is per rank, binary (G = 2^30, T = 2^40). An SSD store is cleared
 at every boot unless it has `persist=on` (below, Persistence).
