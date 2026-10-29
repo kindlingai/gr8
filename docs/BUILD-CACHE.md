@@ -37,9 +37,9 @@ Limits:
 
 | variable | default | |
 |---|---|---|
-| `G6_NVCC_CACHE` | 1 | 0: plain `nvcc` / `g++`, the cache is neither read nor written |
-| `G6_NVCC_CACHE_DIR` | `~/.cache/gr8-nvcc` | where outputs are kept, one file per key; `rm -rf` it to empty it |
-| `G6_NVCC_CACHE_LOG` | set by `build_m4.sh` and `build.sh` | one `hit`/`miss`/`pass` line per call; the builds print the counts |
+| `GR8_NVCC_CACHE` | 1 | 0: plain `nvcc` / `g++`, the cache is neither read nor written |
+| `GR8_NVCC_CACHE_DIR` | `~/.cache/gr8-nvcc` | where outputs are kept, one file per key; `rm -rf` it to empty it |
+| `GR8_NVCC_CACHE_LOG` | set by `build_m4.sh` and `build.sh` | one `hit`/`miss`/`pass` line per call; the builds print the counts |
 
 The cache never evicts. One full build (every width) adds about the size of `bin/obj` plus the binaries, so delete the
 directory when it gets large.
@@ -57,4 +57,4 @@ directory when it gets large.
 - eight compiles of one key at once give one entry and the same bytes;
 - a failing compile returns its status and stores nothing;
 - `-x`, response files and calls with no `-o` pass through;
-- `G6_NVCC_CACHE=0` bypasses the cache.
+- `GR8_NVCC_CACHE=0` bypasses the cache.

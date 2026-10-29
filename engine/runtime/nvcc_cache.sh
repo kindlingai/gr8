@@ -19,6 +19,8 @@
 #   GR8_NVCC_CACHE_DIR=DIR    where outputs are kept (default ~/.cache/gr8-nvcc). Delete it to empty the cache.
 #   GR8_NVCC_CACHE_LOG=FILE   one line per call: hit|miss|pass <output>; build_m4.sh prints the counts
 set -o pipefail
+# the old G6_ names of these variables still work
+for v in NVCC_CACHE NVCC_CACHE_DIR; do o=G6_$v n=GR8_$v; if [ -n "${!o:-}" ] && [ -z "${!n:-}" ]; then export "$n=${!o}"; fi; done
 CC=$1; shift
 [ "${GR8_NVCC_CACHE:-1}" = 0 ] && exec "$CC" "$@"
 DIR=${GR8_NVCC_CACHE_DIR:-${HOME:-/tmp}/.cache/gr8-nvcc}

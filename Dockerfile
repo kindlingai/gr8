@@ -102,7 +102,7 @@ COPY --from=knobs /out/libgr8knobs.a engine/knobs-rs/target/release/libgr8knobs.
 FROM engine-src AS engine-src-glm
 COPY --from=xgrammar-src /out-xgrammar /opt/xgrammar
 COPY --from=xgrammar /out/libxgrammar.a /opt/xgrammar-lib/libxgrammar.a
-ENV G6_XGRAMMAR=/opt/xgrammar G6_XGRAMMAR_LIB=/opt/xgrammar-lib/libxgrammar.a
+ENV GR8_XGRAMMAR=/opt/xgrammar GR8_XGRAMMAR_LIB=/opt/xgrammar-lib/libxgrammar.a
 
 # one g6m4 and one m4sim for every TP width; every launcher runs this build.
 # Each engine stage keeps only the binaries its dist stage copies: a cached layer is reused whole or rebuilt whole, so
