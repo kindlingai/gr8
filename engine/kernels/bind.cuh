@@ -179,7 +179,7 @@ inline const char* scan_widths(LayerTensors& T, bool allow_empty = false)
     T.k3 = 0;
     T.sh_trellis = 0;
     if (!tab.p) return nullptr;
-    for (int i : {T_TR3_FC1, T_TR3_FC2, T_TR3_V1, T_TR3_V2, T_TR3_V3, T_TR3_KMIX, T_TR3_SG, T_TR3_V1B, T_TR3_V3B})
+    for (int i = T_TR3_FC1; i <= T_TR3_V3; ++i)     // the trellis bytes and their vectors (as make_k1 checks)
         if (T.t[i].p && T.t[i].fmt != tab.fmt) return "tr3.* tensors of one layer carry different expert formats (codebooks)";
     if (tab.fmt == FMT_EXLR8_UNCHECKED) return "the layer's width files were missing when the plan read their codebook";
     if (!tr3_cb_built(T.cb))
