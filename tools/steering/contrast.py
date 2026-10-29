@@ -117,8 +117,9 @@ DROP_VAL = {'--serve', '--s2-port', '--s2-sessions', '--s2-epoch', '--kv-store',
             '--steering-weight-set', '--steering-force'}
 DROP_SW = {'--reuse-prefix', '--spec-adaptive', '--pfv2', '--graph'}
 # the knobs of what the offline run leaves out (tensor prefill, MTP, the drafter, S2 serving, the rows tier, graphs):
-# g6m4 refuses most of them without their flag
-DROP_ENV = ('GR8_PF_', 'GR8_MTP_', 'GR8_DRAFT_', 'GR8_DFL_', 'GR8_S2_', 'GR8_RT_', 'GR8_DEC_SHARED_SCRATCH=', 'GR8_DEC_SPLIT=')
+# g6m4 refuses most of them without their flag. A log from before the GR8_ names has them under G6_.
+DROP_ENV = tuple(p + k for p in ('GR8_', 'G6_') for k in ('PF_', 'MTP_', 'DRAFT_', 'DFL_', 'S2_', 'RT_', 'DEC_SHARED_SCRATCH=',
+                                                         'DEC_SPLIT='))
 
 
 def offline_argv(line, prompts, cap):

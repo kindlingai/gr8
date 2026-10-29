@@ -45,8 +45,11 @@ pool_cap() {
 # EXTRA_ENV with each old G6_ name as its GR8_ name, so an override under the old name and a default here are one
 # variable to the engine (the knob table refuses both names with different values)
 read -ra _extra <<< "${EXTRA_ENV:-}"
-EXTRA_ENV=$(for w in ${_extra[@]+"${_extra[@]}"}; do case $w in G6_*) w=GR8_${w#G6_} ;; esac; printf '%s ' "$w"; done)
-EXTRA_ENV=${EXTRA_ENV% }
+EXTRA_ENV=""
+for _w in ${_extra[@]+"${_extra[@]}"}; do
+  [[ $_w == G6_* ]] && _w=GR8_${_w#G6_}
+  EXTRA_ENV="$EXTRA_ENV${EXTRA_ENV:+ }$_w"
+done
 
 # tp4_default KNOB VALUE: KNOB=VALUE unless KNOB is set or EXTRA_ENV already carries GR8_KNOB
 tp4_default() {
