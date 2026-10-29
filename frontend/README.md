@@ -63,6 +63,7 @@ On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 
 | `--max-connections` | 512 | Connections served at once; more wait in the listen backlog. Request headers must arrive within 30 s and a body within 120 s. |
 | `--default-reasoning-effort` | none | `reasoning_effort` for a chat request that names none: `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, heard as the nearest level the template names. `./gr8 glm53 up` passes `DEFAULT_REASONING_EFFORT` when it is set. |
 | `--default-thinking-budget` | 0 | `thinking_budget` for a chat request that names none, 0 or null (0 = no limit). A request with `logprobs` gets none. `./gr8 glm53 up` passes `DEFAULT_THINKING_BUDGET` when it is set. |
+| `--undeclared-tool-calls` | `text` | A call to a tool name the request did not declare. `text`: the call's text stays in `content` and the reply finishes `stop` (vLLM's glm47 parser). `emit`: it is a tool call like any other (`tool_calls`, `finish_reason: tool_calls`, streamed or not), so the client can answer it with its own unknown-tool error; the name must be 1-128 ASCII letters, digits, `_`, `-`, `.` or `:`, and the arguments are strings, having no schema. The rules that tell a call from prose about one are unchanged. `./gr8 glm53 up` passes `UNDECLARED_TOOL_CALLS` when it is `emit`. |
 | `--log-level` | `INFO` | |
 
 ## Thinking controls (Rust front end)
@@ -271,7 +272,7 @@ tools/s2_costfit.py --selftest
 
 `pseudo-engine/` (g6pseudo) speaks PROTOCOL.md with no model, from a TOML file of rules, so the front end runs end to
 end anywhere. `tests/api.sh TOKENIZER_DIR` boots it with `tests/api_responses.toml`, then runs `tests/test_api.py`
-against two front ends: one with the defaults, one with `--allow-thinking-off`. To run the tests against a front end
+against two front ends: one with the defaults, one with `--allow-thinking-off` and `--undeclared-tool-calls emit`. To run the tests against a front end
 you started yourself:
 
 ```bash
@@ -302,7 +303,7 @@ URL=http://127.0.0.1:8100 SUP_PORT=8198 python3 -m unittest tests.test_api   # f
   withholds its content until the end, so it has no incremental output. When the reply makes a tool call, the withheld
   text goes out with the call, unextracted, as the whole reply keeps it.
 - Tool-call tags are parsed only when the request has `tools` and `tool_choice` is not `none`.
-- `tool_choice: "required"` and `tool_choice: {"type": "function", "function": {"name": ...}}` force the reply to be a call: the engine's insert rule puts the thinking close and the tool-call opener in place of the reply's first token, and the name too for a named choice, so the model cannot answer in text. The close leads because the template leaves `<think>` open at the end of a chat prompt, so without it the forced call would be reasoning text and the parser would read the reply as prose. It is a strong nudge rather than a grammar (the engine samples, and the front end cannot mask logits): a call to a name the request did not offer comes back as text, and the arguments are the model's own, coerced by the tool's schema. A forced reply carries no reasoning (the inserted close ends the block before any reasoning is written), its inserted tokens count toward `completion_tokens`, and it needs an engine whose hello says `insert` — the same capability as `thinking_budget`. It is refused with `logprobs` (an inserted token has no logprob) and with an explicit `thinking_budget` (one insert rule per request).
+- `tool_choice: "required"` and `tool_choice: {"type": "function", "function": {"name": ...}}` force the reply to be a call: the engine's insert rule puts the thinking close and the tool-call opener in place of the reply's first token, and the name too for a named choice, so the model cannot answer in text. The close leads because the template leaves `<think>` open at the end of a chat prompt, so without it the forced call would be reasoning text and the parser would read the reply as prose. It is a strong nudge rather than a grammar (the engine samples, and the front end cannot mask logits): a call to a name the request did not offer comes back as text (as a call with `--undeclared-tool-calls emit`), and the arguments are the model's own, coerced by the tool's schema. A forced reply carries no reasoning (the inserted close ends the block before any reasoning is written), its inserted tokens count toward `completion_tokens`, and it needs an engine whose hello says `insert` — the same capability as `thinking_budget`. It is refused with `logprobs` (an inserted token has no logprob) and with an explicit `thinking_budget` (one insert rule per request).
 - `--reasoning-fields both` sends both `reasoning` and `reasoning_content` (the original brief). The harness `common.py` concatenates the two, so `text_head` would show the reasoning twice; the default is therefore `reasoning` (exact vLLM 0.30 parity).
 - The benchmark client is `../bench/pbench.py`.
 

@@ -927,6 +927,8 @@ class Supervisor:
             front += ['--default-thinking-budget', o.get('DEFAULT_THINKING_BUDGET')]
         if o.get('ALLOW_THINKING_OFF') == '1':
             front += ['--allow-thinking-off']
+        if o.get('UNDECLARED_TOOL_CALLS') != 'text':
+            front += ['--undeclared-tool-calls', o.get('UNDECLARED_TOOL_CALLS')]
         self.spawn('front', self.pin() + front + ['--model-dir', self.ms.tokenizer, '--engine-sock', sock,
                                                   '--port', o.get('PORT'), '--supervisor', f'{self.lan}:{self.port}'],
                    os.path.join(REPO, 'frontend'))

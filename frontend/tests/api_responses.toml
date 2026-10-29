@@ -45,6 +45,18 @@ tools = ["*"]
 specificity = 20
 content = "Call it like <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> in your code."
 
+# A call to a tool the request did not declare (an agent's deferred tool, called by name instead of through its
+# meta-tool): text by default, a tool call with --undeclared-tool-calls emit.
+[[rule]]
+name = "undeclared-call"
+match = 'call-an-undeclared-tool'
+tools = ["get_weather"]
+specificity = 30
+content = "Checking."
+[[rule.call]]
+name = "web_search"
+arguments = { query = "harbors", limit = 3 }
+
 # The front end asks for JSON in the user message when response_format is json_object or json_schema.
 [[rule]]
 name = "json-mode"

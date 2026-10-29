@@ -70,6 +70,9 @@ KEYS = {
                                             'the front end closes the think block; 0 = no limit'),
     'ALLOW_THINKING_OFF': ('box', '0', '1 = the front end takes enable_thinking false / reasoning_effort none: the prompt '
                                        'drops its effort header and closes the think block (GLM 5.3; experimental)'),
+    'UNDECLARED_TOOL_CALLS': ('box', 'text', "a call to a tool the request did not declare: text (the call's text stays "
+                                             'content) or emit (it comes back as a tool call, so the client can answer '
+                                             'it with an unknown-tool error)'),
     'RANK': ('run', None, 'prepare: the rank to fetch, when this box cannot tell'),
     'JOIN_TIMEOUT': ('run', '600', 'seconds to wait for the other boxes; on the head, from the first hello (0 = forever)'),
     'READY_TMO': ('run', None, 'seconds to wait for the engines to load'),
@@ -443,6 +446,8 @@ def validate(o):
         raise OptionError(f'--grammar {o.get("GRAMMAR")}: want 0 or 1')
     if o.get('ALLOW_THINKING_OFF') not in ('0', '1'):
         raise OptionError(f'--allow-thinking-off {o.get("ALLOW_THINKING_OFF")}: want 0 or 1')
+    if o.get('UNDECLARED_TOOL_CALLS') not in ('text', 'emit'):
+        raise OptionError(f'--undeclared-tool-calls {o.get("UNDECLARED_TOOL_CALLS")}: want text or emit')
     if not str(o.get('DEFAULT_THINKING_BUDGET')).isdigit():
         raise OptionError(f'--default-thinking-budget {o.get("DEFAULT_THINKING_BUDGET")}: want a whole number '
                           '(0 = no limit)')

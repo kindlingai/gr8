@@ -16,6 +16,8 @@ import urllib.request
 URL = os.environ.get('URL', 'http://127.0.0.1:8100')
 # the front end runs with --allow-thinking-off: the thinking-off tests run, and the refusals of thinking off skip
 THINKING_OFF = os.environ.get('ALLOW_THINKING_OFF') == '1'
+# the front end runs with --undeclared-tool-calls emit
+EMIT_UNDECLARED = os.environ.get('UNDECLARED_TOOL_CALLS') == 'emit'
 
 
 def post(path, body, raw=False):
@@ -104,6 +106,36 @@ class Chat(unittest.TestCase):
         self.assertIn('<tool_call>get_weather', msg['content'])
         self.assertIn('in your code.', msg['content'])
         self.assertEqual(r['choices'][0]['finish_reason'], 'stop')
+
+    def test_undeclared_tool_call(self):
+        # the reply calls web_search, which the request does not declare: text by default, a call with
+        # --undeclared-tool-calls emit (its arguments are strings: there is no schema to coerce them by)
+        body = {'model': 'glm-5.3', 'messages': [{'role': 'user', 'content': 'call-an-undeclared-tool'}],
+                'tools': TOOLS, 'max_tokens': 200}
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        chunks = sse('/v1/chat/completions', body)
+        deltas = [c['choices'][0]['delta'] for c in chunks if c['choices']]
+        content = ''.join(d.get('content') or '' for d in deltas)
+        calls = [tc for d in deltas for tc in d.get('tool_calls', [])]
+        if not EMIT_UNDECLARED:
+            self.assertNotIn('tool_calls', msg)
+            self.assertIn('<tool_call>web_search<arg_key>query</arg_key>', msg['content'])
+            self.assertEqual(r['choices'][0]['finish_reason'], 'stop')
+            self.assertEqual((content, calls), (msg['content'], []))
+            self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'stop')
+            return
+        self.assertEqual(msg['content'], 'Checking.')
+        self.assertEqual(len(msg['tool_calls']), 1)
+        call = msg['tool_calls'][0]['function']
+        self.assertEqual(call['name'], 'web_search')
+        self.assertEqual(json.loads(call['arguments']), {'query': 'harbors', 'limit': '3'})
+        self.assertEqual(r['choices'][0]['finish_reason'], 'tool_calls')
+        self.assertEqual(content, 'Checking.')
+        self.assertEqual([tc['function']['name'] for tc in calls if 'name' in tc['function']], ['web_search'])
+        self.assertEqual(''.join(tc['function'].get('arguments', '') for tc in calls), call['arguments'])
+        self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'tool_calls')
 
     def test_tool_choice_required_forces_a_call(self):
         # `required` and a named function force the opener with the engine's insert rule, so the reply is a call even
