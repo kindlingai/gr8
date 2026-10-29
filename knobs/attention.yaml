@@ -1,0 +1,193 @@
+# Decode attention and the indexer. knobs/README.md describes the fields.
+prefix: "GR8_"
+knobs:
+  GR8_ATTN_CTX2:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0..4"
+    doc: >-
+      Decode attention context kernel: 1 or 2 = the head-group kernel with 32 or 64 gathered pairs per batch, 3 or 4 = a
+      packed kernel with 16 or 32 and two batches in flight. Same bits, FP8 KV only.
+  GR8_ATTN_CTX3:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0..4"
+    doc: >-
+      Decode attention context with one test per batch of slots: 1 or 2 = 16 or 32 pairs per batch over 256 dims per
+      CTA, 3 or 4 = the same over 512. Overrides GR8_ATTN_CTX2. Same bits, FP8 KV only.
+  GR8_ATTN_CTX3_HG:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0|2|4|8"
+    doc: >-
+      With GR8_ATTN_CTX3, sets the heads per CTA of the context kernel. 0: 4 heads up to 4 rows, then 8.
+  GR8_ATTN_CTX3_SP:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0|64|128"
+    doc: >-
+      With GR8_ATTN_CTX3, splits the replicated decode context into partitions of 64 or 128 key slots instead of 256.
+      Deterministic but a different fp32 summation order, FP8 KV only. 0: 256 slots.
+  GR8_ATTN_CTX_TILE:
+    scope: agree
+    kind: text
+    unset: "unset (a per-shape tile table)"
+    values: "2x128|4x128|8x128|16x128|4x256|8x256|16x256|4x64|8x64"
+    doc: >-
+      With GR8_ATTN_P11, forces one decode context tile of HG heads by D dims for every shape, written as HGxD.
+  GR8_ATTN_D256:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      With GR8_ATTN_FLIP, runs the flip context kernel over 256 dims per CTA (4 heads at one row, 8 above) with a
+      dead-slot skip.
+  GR8_ATTN_FLIP:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      Decode attention takes the head-inner flip kernels (decode-flip.cuh) for eligible calls at a context of at least
+      GR8_ATTN_FLIP_MIN. Takes precedence over the head-batched kernels.
+  GR8_ATTN_FLIP_MIN:
+    scope: agree
+    kind: int
+    default: "2048"
+    doc: >-
+      With GR8_ATTN_FLIP, the smallest context in tokens at which a decode call takes the flip kernels.
+  GR8_ATTN_FRONT:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      Runs a decode step's first attention kernels (KV append, index append and index query prep, or index reuse) as one
+      launch when the step's rows fit one query tile. Same bits.
+  GR8_ATTN_HEADS:
+    scope: agree
+    kind: flag
+    default: "1"
+    doc: >-
+      Decode attention scores and context load each key once for a group of heads. 0 = the per-head kernels and turns
+      off GR8_ATTN_SC2, GR8_ATTN_CTX2 and GR8_ATTN_CTX3.
+  GR8_ATTN_P11:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      Decode attention uses the P11 tile retune (per-shape context tiles) on the head-batched path, ahead of
+      GR8_ATTN_SC2, GR8_ATTN_CTX2 and GR8_ATTN_CTX3.
+  GR8_ATTN_POSIDX:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      A full-index layer's decode attention in the buckets up to 2048 lists the keys in position order instead of
+      running the indexer, and skips that layer's idx_q GEMV. Deterministic, a different fp32 order.
+  GR8_ATTN_QT:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      Decode absorb stores q and rope lane-transposed and the scores kernel reads them with 16 B loads. Needs
+      GR8_ATTN_SC2 2 or 4, not with GR8_AVP1. Same bits, FP8 KV only.
+  GR8_ATTN_SC2:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0|1|2|4|8"
+    doc: >-
+      Decode attention scores in the head-group kernel take S = 1, 2, 4 or 8 key slots per warp with the query loaded
+      once for all S. Same bits, FP8 KV only.
+  GR8_ATTN_SC2_PART:
+    scope: agree
+    kind: flag
+    default: "1"
+    doc: >-
+      With GR8_ATTN_SC2, a head count that is not a multiple of 16 (TP=3, TP=6) also takes the scores kernel with a
+      partial last head group. 0 = those layers keep the 16-head kernel. Same bits.
+  GR8_ATTN_SC2_TR:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0|1|2"
+    doc: >-
+      With GR8_ATTN_SC2, 1 reduces the heads' sums by one transpose across the warp and 2 does the same reduction
+      eagerly. S = 8 ignores it. Same bits.
+  GR8_ATTN_SEL2:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0|8|16|32|64"
+    doc: >-
+      Decode index selection runs its final sort as a rank by count over 8, 16, 32 or 64 CTAs per row. Same bits.
+  GR8_ATTN_TILE_L:
+    scope: agree
+    kind: int
+    default: "0"
+    doc: >-
+      With GR8_ATTN_P11, the context length in tokens used to pick the decode context tile, in place of the captured
+      call's context. 0: the call's context window.
+  GR8_AVP1:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      Decode absorb and value projection run as one launch for any row count, weights in registers, rows staged 8 at a
+      time.
+  GR8_IDXQ_SPLIT:
+    scope: agree
+    kind: flag
+    unset: "g6m4: 1 when TP>1 on GLM, else 0; m4sim: 0"
+    values: "0|1"
+    doc: >-
+      Splits the indexer's replicated wq_b GEMV by output tiles across the ranks and all-gathers it on the split-GEMV
+      fabric, with the same bits as the full GEMV.
+  GR8_IDX_GRP:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0..64"
+    doc: >-
+      In S2 batched decode steps the per-row indexer reads each key tile once for up to this many rows of one session,
+      with the same bits. 0 is off.
+  GR8_IDX_VEC:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      The per-row decode index_scores loads its key tile with 16 B vector loads (page size 32 or more), with the same
+      bytes. Read once before graph capture.
+  GR8_QO_CACHE:
+    scope: local
+    kind: path
+    unset: "unset"
+    doc: >-
+      With GR8_PF_OWN=3, the first boot writes each layer's full-head q_b, o_proj, UK and UV tensors to
+      DIR/<layer>.qo.bin and later boots read them instead of decoding them. Same bits.
+  GR8_QO_DUMP:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      Prints an FNV-64 hash of the prefill attention q to stderr on every call (skipped inside a graph capture).
+  GR8_QO_NANINJ:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      Writes an FP16 NaN into q[0] of the prefill attention on every call, a fault injection for the error checks.
+  GR8_QO_ROPECHK:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      Checks the prefill rope table against the decode rope function once at bind and prints the mismatch count to
+      stderr.

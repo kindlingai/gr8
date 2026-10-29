@@ -1,0 +1,330 @@
+# Read by test programs, audits and benchmarks, never by a serving engine. knobs/README.md describes the fields.
+prefix: "GR8_TEST_"
+scope: test
+knobs:
+  GR8_TEST_ATTNK_ARMS:
+    kind: text
+    unset: "the built-in arms"
+    legacy: ["ATTNK_ARMS", "GR8_ATTNK_ARMS"]
+    doc: >-
+      attnk: the arms to run, as name or KEY=V,... specs joined by spaces.
+  GR8_TEST_ATTNK_BASE:
+    kind: text
+    unset: "the serving arm SC2=4,TR=2,CTX2=4,CTX3=2,SEL2=16,IDX=16"
+    legacy: ["ATTNK_BASE", "GR8_ATTNK_BASE"]
+    doc: >-
+      attnk: the base arm the others compare with, as KEY=V,... over the stock arm (every flag 0), or stock.
+  GR8_TEST_ATTNK_E1:
+    kind: flag
+    default: "0"
+    legacy: ["ATTNK_E1", "GR8_ATTNK_E1"]
+    doc: >-
+      attnk: 1 runs the round 10 arm set.
+  GR8_TEST_ATTNK_H:
+    kind: int
+    unset: "g6nr::HMAX, the larger head count of a rank in the build"
+    legacy: ["ATTNK_H", "GR8_ATTNK_H"]
+    doc: >-
+      attnk: the rank's head count, g6nr::HMIN or g6nr::HMAX of the build (a TP=6 build: 11 or 10).
+  GR8_TEST_ATTNK_NANKEY:
+    kind: int
+    default: "-1"
+    legacy: ["ATTNK_NANKEY", "GR8_ATTNK_NANKEY"]
+    doc: >-
+      attnk: the index key position (session 0) whose scale is NaN, -1 none.
+  GR8_TEST_ATTNK_QSCALE:
+    kind: float
+    default: "1"
+    legacy: ["ATTNK_QSCALE", "GR8_ATTNK_QSCALE"]
+    doc: >-
+      attnk: scales the test queries.
+  GR8_TEST_ATTNK_SESS:
+    kind: int
+    default: "1"
+    values: "1|2"
+    legacy: ["ATTNK_SESS", "GR8_ATTNK_SESS"]
+    doc: >-
+      attnk: 2 runs two S2 sessions when the build and shape allow it.
+  GR8_TEST_ATTNK_TIES:
+    kind: flag
+    default: "0"
+    legacy: ["ATTNK_TIES", "GR8_ATTNK_TIES"]
+    doc: >-
+      attnk: 1 makes the test scores tie.
+  GR8_TEST_CPG_ARMS:
+    kind: text
+    unset: "the built-in arms"
+    legacy: ["CPG_ARMS", "GR8_CPG_ARMS"]
+    doc: >-
+      cpgroups: the arms to run, as KEY=V,... specs (SC2 TR CTX2 CTX3 HG) or stock, joined by spaces.
+  GR8_TEST_CPG_LOCAL:
+    kind: int
+    default: "0"
+    legacy: ["CPG_LOCAL", "GR8_CPG_LOCAL"]
+    doc: >-
+      cpgroups: puts the N most recent positions first in each row's index list, as a local window. 0: uniform random
+      positions.
+  GR8_TEST_CP_PF_BREAK:
+    kind: text
+    unset: "unset"
+    values: "gather|back"
+    legacy: ["G6_CP_PF_BREAK", "GR8_CP_PF_BREAK"]
+    doc: >-
+      Negative control for the CP prefill staging gate in m4sim: skips the gather or the back half of the staging so the
+      gate must fail.
+  GR8_TEST_CP_PF_NET:
+    kind: flag
+    default: "0"
+    legacy: ["G6_CP_PF_NET", "GR8_CP_PF_NET"]
+    doc: >-
+      In m4sim, the CP prefill gather runs as g6m4's real fabric does it, each rank filling its own pool and sending
+      tail pages to the others, instead of the loopback gather.
+  GR8_TEST_FUZZ_ROUNDS:
+    kind: int
+    default: "40"
+    legacy: ["G6_FUZZ_ROUNDS", "GR8_FUZZ_ROUNDS"]
+    doc: >-
+      Rounds of the front end tokenizer fuzz test.
+  GR8_TEST_IDX_DUMP:
+    kind: path
+    unset: "unset"
+    legacy: ["G6_IDX_DUMP", "GR8_IDX_DUMP"]
+    doc: >-
+      m4sim writes rank 0's selected key ids of the first --layers layer to this file for each main step from
+      GR8_LOGIT_DUMP_FROM on.
+  GR8_TEST_KVMAN_LEDGER:
+    kind: path
+    default: "kvman-ledger"
+    legacy: ["KVMAN_LEDGER", "GR8_KVMAN_LEDGER"]
+    doc: >-
+      flash_kv_chunks_test: the kvman-ledger binary.
+  GR8_TEST_KVSIM_ENTRIES:
+    kind: flag
+    default: "0"
+    legacy: ["KVSIM_ENTRIES", "GR8_KVSIM_ENTRIES"]
+    doc: >-
+      kvman-sim: 1 prints the stash entries at the end.
+  GR8_TEST_KV_HASH:
+    kind: flag
+    default: "0"
+    legacy: ["G6_KV_HASH", "GR8_KV_HASH"]
+    doc: >-
+      m4sim prints per layer an FNV hash of the stored latent records of the prompt positions, read from every rank that
+      holds them, after the prefill.
+  GR8_TEST_KV_RANKS_CMP:
+    kind: flag
+    default: "0"
+    legacy: ["G6_KV_RANKS_CMP", "GR8_KV_RANKS_CMP"]
+    doc: >-
+      m4sim with --reuse-prefix prints whether every rank's KV page blocks match rank 0's byte for byte.
+  GR8_TEST_KV_TIER_CHECK:
+    kind: text
+    unset: "unset"
+    legacy: ["G6_KV_TIER_CHECK", "GR8_KV_TIER_CHECK"]
+    doc: >-
+      m4sim with --reuse-prefix sends every rank's reused pages to this block store (mem:, ssd:PATH, remote:HOST:PORT),
+      poisons them and reads them back.
+  GR8_TEST_KV_TIER_CHECK_DROP:
+    kind: int
+    unset: "none dropped"
+    values: "0|1|2"
+    legacy: ["G6_KV_TIER_CHECK_DROP", "GR8_KV_TIER_CHECK_DROP"]
+    doc: >-
+      With GR8_KV_TIER_CHECK past GR8_CP_R, the copies of this part do not come back, so the check must see the poison.
+  GR8_TEST_LEDGER_CRASH_AT:
+    kind: text
+    unset: "unset"
+    values: "write|written"
+    legacy: ["G6_LEDGER_CRASH_AT", "GR8_LEDGER_CRASH_AT"]
+    doc: >-
+      Aborts the process in the host ledger at that point, before or after the rename, so tests can check crash
+      recovery. Only test and debug builds read it.
+  GR8_TEST_MTP_LASTROW_CHECK:
+    kind: flag
+    default: "0"
+    legacy: ["G6_MTP_LASTROW_CHECK", "GR8_MTP_LASTROW_CHECK"]
+    doc: >-
+      m4sim prints a check line per draft step with the last row's token, log-probability and hashes of its hidden row,
+      residual and draft-layer caches.
+  GR8_TEST_PERTURB:
+    kind: float
+    default: "0"
+    legacy: ["G6_PERTURB", "GR8_PERTURB"]
+    doc: >-
+      m4sim multiplies every rank's residual after layer 0's attention by 1 + eps * u, with u from a hash of row and
+      element, to measure the noise floor.
+  GR8_TEST_PF_DRAFTDUMP:
+    kind: path
+    unset: "unset"
+    legacy: ["G6_PF_DRAFTDUMP", "GR8_PF_DRAFTDUMP"]
+    doc: >-
+      m4sim with --mtp writes the MTP layer's KV and indexer caches after the draft prefill to
+      DIR/r<rank>.s<seq>.{kv,idx}.
+  GR8_TEST_PF_HASH_POKE:
+    kind: ints
+    unset: "unset"
+    legacy: ["G6_PF_HASH_POKE", "GR8_PF_HASH_POKE"]
+    doc: >-
+      m4sim test hook `rank,row`: adds one ulp to the first word of that lane-0 row on that rank before the cross-rank
+      hash check, which must then report the rank differs.
+  GR8_TEST_PF_REPLAY_VERBOSE:
+    kind: flag
+    default: "0"
+    legacy: ["PF_REPLAY_VERBOSE", "GR8_PF_REPLAY_VERBOSE"]
+    doc: >-
+      pool_conc_replay_test: 1 logs every replayed call.
+  GR8_TEST_PF_RESDUMP:
+    kind: path
+    unset: "unset"
+    legacy: ["G6_PF_RESDUMP", "GR8_PF_RESDUMP"]
+    doc: >-
+      m4sim writes each prefill sub-batch's FP32 residual rows to `resid.s<seq>.p<pos>.f32` in this directory.
+  GR8_TEST_PF_TIMES:
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: ["G6_PF_TIMES", "GR8_PF_TIMES"]
+    doc: >-
+      m4sim --serve prints per-request wall-clock timing laps on stderr, from the request file's mtime to the first
+      token.
+  GR8_TEST_ROW_LINES:
+    kind: flag
+    default: "0"
+    legacy: ["G6_ROW_LINES", "GR8_ROW_LINES"]
+    doc: >-
+      m4sim: prints one line per target-step row (input, token, log-probabilities, residual and logit hashes) and flags
+      any rank whose residual row differs from rank 0's.
+  GR8_TEST_RT_ADOPT_SLOT:
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: ["G6_RT_ADOPT_SLOT", "GR8_RT_ADOPT_SLOT"]
+    doc: >-
+      m4sim with GR8_RT_LOCAL: 1 = the next sequence takes the released records over in another slot, as a g6m4 grant
+      does, instead of in place.
+  GR8_TEST_RT_POISON:
+    kind: flag
+    default: "0"
+    legacy: ["G6_RT_POISON", "GR8_RT_POISON"]
+    doc: >-
+      m4sim only: overwrites the local copy of every row sent to GR8_RT_STORE, so a read of the local copy shows in the
+      output.
+  GR8_TEST_S2_ATTN_PERSESSION:
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: ["G6_S2_ATTN_PERSESSION", "GR8_S2_ATTN_PERSESSION"]
+    doc: >-
+      S2: runs attention once per session instead of one batched launch over the sessions. Refused with graphs and on
+      Flash.
+  GR8_TEST_S2_CLS:
+    kind: int
+    default: "0"
+    legacy: ["G6_S2_CLS", "GR8_S2_CLS"]
+    doc: >-
+      m4sim --s2 probe: runs every step at this k1 row class.
+  GR8_TEST_S2_GEN:
+    kind: ints
+    unset: "--gen"
+    legacy: ["G6_S2_GEN", "GR8_S2_GEN"]
+    doc: >-
+      m4sim --s2: per-session generation lengths (comma-separated), so sessions finish at different rounds.
+  GR8_TEST_S2_GROW_POOL:
+    kind: int
+    unset: "fixed runs (GR8_S2_RUNS, GR8_S2_PAGES or the default layout)"
+    values: "1.."
+    legacy: ["G6_S2_GROW_POOL", "GR8_S2_GROW_POOL"]
+    doc: >-
+      m4sim --s2: the sessions' runs come from a pool of this many pages (s2/pool.h) and grow on demand: each starts
+      with its prompt + 1 + guard rows, grows before each round, sits a round out when the pool would be unsafe, and
+      gives its pages back when it finishes. At most the pool's pages. Not with GR8_S2_RUNS or GR8_S2_PAGES.
+  GR8_TEST_S2_INSERT:
+    kind: text
+    unset: "unset"
+    legacy: ["G6_S2_INSERT", "GR8_S2_INSERT"]
+    doc: >-
+      m4sim --s2: q:after:unless:id,id,.. gives session q an insert rule (s2_batch.h), several rules joined by
+      semicolons. unless -1 = none.
+  GR8_TEST_S2_PAGES:
+    kind: ints
+    unset: "unset"
+    legacy: ["G6_S2_PAGES", "GR8_S2_PAGES"]
+    doc: >-
+      m4sim --s2: seed[,pages] gives each slot a scattered run from a seeded shuffle of the pool. Output must equal the
+      default layout's.
+  GR8_TEST_S2_PFBASE:
+    kind: ints
+    unset: "unset"
+    legacy: ["G6_S2_PFBASE", "GR8_S2_PFBASE"]
+    doc: >-
+      m4sim gate: B[,pages] runs every sequence as one session at base page B below R. Stdout must equal the run at B =
+      0. Needs GR8_CP, --prefill and no --s2.
+  GR8_TEST_S2_PFNOFIX:
+    kind: flag
+    default: "0"
+    legacy: ["G6_S2_PFNOFIX", "GR8_S2_PFNOFIX"]
+    doc: >-
+      m4sim negative control for GR8_S2_PFBASE: stages prefill index keys at logical pages from page 0, so the output
+      must differ.
+  GR8_TEST_S2_PFPOISON:
+    kind: flag
+    default: "0"
+    legacy: ["G6_S2_PFPOISON", "GR8_S2_PFPOISON"]
+    doc: >-
+      m4sim gates GR8_S2_PFBASE and GR8_S2_XLIST: fills every cache with 0x3c bytes first, so a read outside the run
+      changes the output.
+  GR8_TEST_S2_POOL:
+    kind: int
+    unset: "unset"
+    legacy: ["G6_S2_POOL", "GR8_S2_POOL"]
+    doc: >-
+      m4sim --s2 without S2 below R: the pool's page count for variable runs.
+  GR8_TEST_S2_RELOC:
+    kind: flag
+    default: "0"
+    legacy: ["G6_S2_RELOC", "GR8_S2_RELOC"]
+    doc: >-
+      m4sim --s2: when one session is left, relocates its run to base page 0 instead of leaving it where it is.
+  GR8_TEST_S2_RELOC_PAGES:
+    kind: int
+    unset: "unset"
+    legacy: ["G6_S2_RELOC_PAGES", "GR8_S2_RELOC_PAGES"]
+    doc: >-
+      m4sim --s2 with GR8_S2_RELOC: copies at most this many pages, to time the stall.
+  GR8_TEST_S2_ROWHASH:
+    kind: flag
+    default: "0"
+    legacy: ["G6_S2_ROWHASH", "GR8_S2_ROWHASH"]
+    doc: >-
+      m4sim --s2 probe: prints one line per target row with an FNV hash of its residual and its log-probability bits
+      (rank 0).
+  GR8_TEST_S2_RUNS:
+    kind: text
+    unset: "unset"
+    legacy: ["G6_S2_RUNS", "GR8_S2_RUNS"]
+    doc: >-
+      m4sim --s2: b:p,b:p,.. sets each slot's run (base page, pages) on every model.
+  GR8_TEST_S2_SOLO1:
+    kind: flag
+    default: "1"
+    legacy: ["G6_S2_SOLO1", "GR8_S2_SOLO1"]
+    doc: >-
+      m4sim --s2: a session left alone runs the single-session path. 0 keeps it on the S2 path.
+  GR8_TEST_S2_XLIST:
+    kind: ints
+    unset: "unset"
+    legacy: ["G6_S2_XLIST", "GR8_S2_XLIST"]
+    doc: >-
+      m4sim gate: seed[,pages] runs every sequence as one session past R on a shuffled page list of the pool's two
+      classes. Stdout must equal the run without it.
+  GR8_TEST_SPARSE_MLA:
+    kind: flag
+    default: "0"
+    doc: >-
+      flash_dsa_pf_test: compares the fused MLA with the current GEMM prefill instead of the older P1 math.
+  GR8_TEST_TOKENIZER_DIR:
+    kind: path
+    unset: "unset"
+    legacy: ["G6_TOKENIZER_DIR", "GR8_TOKENIZER_DIR"]
+    doc: >-
+      The tokenizer directory the front end tests need, unset skips them.

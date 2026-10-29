@@ -61,7 +61,7 @@ On a GB10 with CUDA 13 (`ARCH=120a` for an RTX 50xx). `scripts/build.sh` also bu
 | test | command |
 |---|---|
 | row budget, S2 attention, decode heads, the KV pool shrunk and grown under live sessions, and the rest of `scripts/c1_tests.sh`'s header | `./gr8 test gpu bin`, and `GR8_NR=4 EXTRA=-DDEC_S2 ./gr8 test gpu bin_s2` for the S2 build |
-| Flash session checkpoints (`GR8_FLASH_CACHE`): poison and restore bit for bit, overwrite, least-recently-used drops, torn or changed blocks refused, through memory, a file and a loopback KV node | `nvcc -O2 -std=c++17 -gencode=arch=compute_120a,code=sm_120a -I engine/runtime engine/tests/test_flash_ckpt.cu engine/kvman-rs/target/release/libg6kvman.a -lpthread -ldl -lm -o test_flash_ckpt`, then `./test_flash_ckpt mem: ssd:FILE remote:HOST:PORT` (a loopback node: `kvman-remote --gb 0.5 --port 0 --bind 127.0.0.1 --min-free-gb 0 --no-lock --ready node.json`) |
+| Flash session checkpoints (`GR8_GLM53F_CACHE`): poison and restore bit for bit, overwrite, least-recently-used drops, torn or changed blocks refused, through memory, a file and a loopback KV node | `nvcc -O2 -std=c++17 -gencode=arch=compute_120a,code=sm_120a -I engine/runtime engine/tests/test_flash_ckpt.cu engine/kvman-rs/target/release/libg6kvman.a -lpthread -ldl -lm -o test_flash_ckpt`, then `./test_flash_ckpt mem: ssd:FILE remote:HOST:PORT` (a loopback node: `kvman-remote --gb 0.5 --port 0 --bind 127.0.0.1 --min-free-gb 0 --no-lock --ready node.json`) |
 | Flash checkpoints on a group lease (`--kv-store ...,group=`, D-331 M8 (c)): ask before a drop, grant and grow, give with ages, least-recently-used drop and packing, restore bit for bit after a move, back to the floor, a refused transaction, two ranks agreeing | `TEST=flash_ckpt_group_test ARCH=120a ./gr8 test gpu DIR` (starts a loopback node with 2 MiB segments) |
 | the replicated-GEMV split (`GR8_QA_SPLIT`, `GR8_IDXQ_SPLIT`, `GR8_MTP_SPLIT`) against the replicated path, m4sim stdout byte for byte (needs a model) | `MODEL_ARGS="--packs DIR" scripts/m4sim_split_check.sh` |
 | m4sim from the release against a PyTorch forward of the same weights (transformers with `glm_moe_dsa`) | `engine/ref/release_forward.py` |
@@ -83,7 +83,7 @@ one GPU and makes its own synthetic weights.
 | `kvb8_test` | `kv_b` in FP8 against its BF16 form (#50, skipped under `G6_KV4`) |
 | `canon_test` | a session's MLA and indexer rows are the same bytes whichever rank and layout wrote them (#152) |
 | `kv_resize_test` | the KV pool shrunk and grown under live sessions (#153) |
-| `flash_kv_chunks_test` | `GR8_FLASH_KV_CHUNKS`: Flash's caches in kvchunks regions under one chunk map |
+| `flash_kv_chunks_test` | `GR8_GLM53F_KV_CHUNKS`: Flash's caches in kvchunks regions under one chunk map |
 | `flash_ckpt_group_test` | Flash checkpoints on a group lease, against a loopback KV node |
 | `weight_check_test` | the weight check's sums, GPU against CPU |
 | `steering_boot_cuda_test`, `steering_consume_test`, `steering_cuda_test`, `steering_shared_test` | the steering kernels against the stock ones |
@@ -95,7 +95,7 @@ one GPU and makes its own synthetic weights.
 | `flash_sparse_mla_test` | fused sparse MLA prefill against QK, softmax and PV |
 | `flash_sparse_mla_v2_test` | `sparse_mla_pf_v2` against `sparse_mla_pf_512`, byte for byte (#10) |
 | `kda_g9_det` | the G9 ON kernels give the same bits run to run |
-| `flash_dsa_f16_test` | `GR8_PF_DSA_F16GEMM` against the full-GV kernel and fp64 |
+| `flash_dsa_f16_test` | `GR8_GLM53F_PF_DSA_F16GEMM` against the full-GV kernel and fp64 |
 | `mhc_decode_stage_test` | the decode mHC pinned-partial stage: bytes and time |
 
 `scripts/build.sh` runs `tr3_e4m3_test` (the trellis codebook decode, when a GPU is visible: every state of the mcg,

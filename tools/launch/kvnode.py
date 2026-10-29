@@ -29,6 +29,7 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import knobs  # noqa: E402
 import mentat  # noqa: E402
 import options as opt  # noqa: E402
 
@@ -36,30 +37,11 @@ HERE = os.path.abspath(__file__)
 REPO = opt.REPO
 SERVICE = mentat.KV_SERVICE
 
-# key: (default, meaning). The flag is --<key in lower case without KV_, _ as ->, except where FLAGS says otherwise.
-KEYS = {
-    'KV_GB': (None, "GiB of this box's memory to lock and serve. RLIMIT_MEMLOCK must allow it (ulimit -l; root, or "
-                    'systemd-run -p LimitMEMLOCK=infinity)'),
-    'KV_PORT': ('7350', "the node's TCP port; RDMA connections are set up through it"),
-    'KV_BIND': ('0.0.0.0', 'the address it listens on'),
-    'KV_MIN_FREE_GB': ('10', 'refuse to start when locking KV_GB would leave less MemAvailable than this; with '
-                             'KV_LAZY_LOCK=1, refuse each lease that would'),
-    'KV_RDMA': ('1', '0 = TCP only'),
-    'KV_LAZY_LOCK': ('0', "1 = lock a lease's memory only while the lease lives (given back to the box when it ends), "
-                          'and refuse leases while MemAvailable is under KV_MIN_FREE_GB: a node on a box that also '
-                          'serves. 0 = the whole KV_GB is locked at start. Measured effect: not measured'),
-    'KV_LEDGER': (None, 'with KV_LAZY_LOCK=1: the host ledger of a box shared with a Flash rank (kvman-ledger, '
-                        'engine/kvman-rs/src/ledger.rs). A lease is refused when the node would hold more than the '
-                        'ledger credits it. FLASH_KV_DONATE_GIB sets it'),
-    'KV_GUARD_EVERY_S': ('1', 'with KV_LAZY_LOCK=1: how often the node reads MemAvailable (0 = at each lease only). '
-                              'Measured effect: not measured'),
-    'KV_BIN': (None, 'the node binary (./gr8 glm53 build puts it in bin/). Default: bin/kvman-remote.'),
-    'MENTAT': ('localhost', 'the daemon to announce through; none = do not announce'),
-    'GROUP': ('gr8-glm53', 'the mentat group it joins'),
-    'NODE_IP': (None, "the LAN address to announce. Default: mentat's."),
-    'GR8_WORK_DIR': (REPO, 'the node keeps out/kv/ here: kv.log, state.json, ready.json'),
-}
-FLAGS = {'GR8_WORK_DIR': '--work-dir', 'MENTAT': '--mentat', 'GROUP': '--group', 'NODE_IP': '--node-ip'}
+# key: (default, meaning), from knobs/kv.yaml through the knob library (knobs.py). The flag is --<key in lower case
+# without KV_, _ as ->, except where the file names one.
+_OPTIONS = knobs.options('kv')
+KEYS = {k: (REPO if o['default'] == '{repo}' else o['default'], o['doc']) for k, o in _OPTIONS.items()}
+FLAGS = {k: o['flag'] for k, o in _OPTIONS.items() if o['flag']}
 SWITCHES = {'--no-config', '--foreground', '--no-rdma', '--lazy-lock'}
 
 

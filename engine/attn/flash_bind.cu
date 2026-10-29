@@ -72,7 +72,7 @@ int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int cap
     if (!b.scratch_bytes || (ext_scratch && ext_bytes < b.scratch_bytes)) return invalid;
     size_t used = 0;
     auto take = [&](size_t n) { size_t at = used; used = (used + n + 255) & ~size_t(255); return at; };
-    // GR8_FLASH_KV_CHUNKS: the caches are the regions' (kvchunks.h), not slices of storage
+    // GR8_GLM53F_KV_CHUNKS: the caches are the regions' (kvchunks.h), not slices of storage
     const size_t kv_bytes = (size_t)a.page_count * PAGE * g6kv::ROW, ix_bytes = (size_t)a.page_count * g6kv::IDX_PAGE;
     const bool chunked = mla && idx;
     if ((mla || idx) && !chunked) return invalid;
@@ -190,7 +190,7 @@ extern "C" int g6a_bind_reset(G6AttnBinding* b, void* s) {
 // [0, pages * PAGE)); the caller keeps every later page zero (Flash serve: the pages no step wrote since a clear)
 extern "C" int g6a_bind_reset_pages(G6AttnBinding* b, int pages, void* s) {
     if (!b || !b->storage || pages < 0) return invalid;
-    // chunked caches (GR8_FLASH_KV_CHUNKS): every backed granule, as g6a_bind_reset (a chunk that comes back reads as zero)
+    // chunked caches (GR8_GLM53F_KV_CHUNKS): every backed granule, as g6a_bind_reset (a chunk that comes back reads as zero)
     if (b->kv_chunks[0]) return g6a_bind_reset(b, s);
     const G6Attn& a = b->args;
     cudaStream_t stream = (cudaStream_t)s;

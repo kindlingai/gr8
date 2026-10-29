@@ -293,11 +293,11 @@ mod tests {
     use super::*;
 
     /// Parallel == sequential on random text built from every character class around the cut points.
-    /// Needs the real tokenizer: GR8_TOKENIZER_DIR=<dir with tokenizer.json ...> cargo test --release
+    /// Needs the real tokenizer: GR8_TEST_TOKENIZER_DIR=<dir with tokenizer.json ...> cargo test --release
     #[test]
     fn parallel_encode_matches_sequential() {
-        let Some(dir) = gr8knobs::TOKENIZER_DIR.get() else {
-            eprintln!("GR8_TOKENIZER_DIR not set; skipping");
+        let Some(dir) = gr8knobs::TEST_TOKENIZER_DIR.get() else {
+            eprintln!("GR8_TEST_TOKENIZER_DIR not set; skipping");
             return;
         };
         let t = Tok::load(Path::new(&dir)).unwrap();
@@ -362,7 +362,7 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let rounds = gr8knobs::FUZZ_ROUNDS.get() as usize;
+        let rounds = gr8knobs::TEST_FUZZ_ROUNDS.get() as usize;
         for round in 0..rounds {
             let mut s = String::new();
             while s.len() < 60_000 + (round % 40) * 3000 {

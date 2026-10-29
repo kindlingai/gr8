@@ -1,0 +1,46 @@
+# Read by the build scripts, never by the engine. knobs/README.md describes the fields.
+prefix: "GR8_"
+scope: outside
+knobs:
+  GR8_NR:
+    kind: text
+    unset: "unset"
+    doc: >-
+      The tensor-parallel widths scripts/build.sh builds, the same as GR8_WIDTHS.
+  GR8_NVCC_CACHE:
+    kind: flag
+    default: "1"
+    values: "0|1"
+    doc: >-
+      0 turns off the compile cache in front of nvcc and g++.
+  GR8_NVCC_CACHE_DIR:
+    kind: path
+    unset: "~/.cache/gr8-nvcc"
+    doc: >-
+      Where the compile cache keeps outputs.
+  GR8_NVCC_CACHE_LOG:
+    kind: path
+    unset: "unset"
+    doc: >-
+      A file that gets one hit, miss or pass line per compile.
+  GR8_TESTS:
+    kind: text
+    default: "1"
+    values: "0|1|only"
+    doc: >-
+      Whether scripts/build.sh builds the test binaries: 0 skips them, only builds them alone.
+  GR8_WIDTHS:
+    kind: text
+    unset: "unset"
+    doc: >-
+      The tensor-parallel widths scripts/build.sh builds, "3 4" for example.
+  GR8_XGRAMMAR:
+    kind: path
+    unset: "unset"
+    doc: >-
+      An XGrammar source tree to build request grammars into the engine.
+  GR8_XGRAMMAR_LIB:
+    kind: path
+    unset: "unset"
+    doc: >-
+      A prebuilt XGrammar library in place of building one from GR8_XGRAMMAR.

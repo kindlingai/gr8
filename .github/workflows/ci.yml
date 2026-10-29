@@ -66,6 +66,7 @@ jobs:
               - 'smoketest/**'
               - 'gr8'
               - 'engine/**'
+              - 'knobs/**'
               - 'scripts/engine_args.sh'
             # the host tests, the tools' and the bench gate's tests, the compose file, the Helm chart and the engine's
             # Rust crates; bash -n of the recipes' scripts
@@ -74,6 +75,7 @@ jobs:
               - '.github/workflows/ci.yml'
               - '.github/ci/**'
               - 'engine/**'
+              - 'knobs/**'
               - 'scripts/**'
               - 'tools/steering/**'
               - 'tools/convert/**'
@@ -101,6 +103,7 @@ jobs:
               - 'engine/loader-rs/**'
               - 'engine/kvman-rs/**'
               - 'engine/knobs-rs/**'
+              - 'knobs/**'
               - 'frontend/g6front-rs/**'
             # the engine builds and the image: what the Dockerfile's engine stages copy (the front end's Cargo files
             # pin the XGrammar sources the engine compiles), and the entrypoint the image's smoke test runs
@@ -110,6 +113,7 @@ jobs:
               - 'Dockerfile'
               - '.dockerignore'
               - 'engine/**'
+              - 'knobs/**'
               - 'scripts/build.sh'
               - 'tools/health/gpuprobe.cu'
               - 'frontend/g6front-rs/Cargo.toml'

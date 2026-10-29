@@ -132,7 +132,7 @@ inline void launch_embed_flash(Model& m,int M,cudaStream_t st) {
     flash_mhc::k_mhc_embed<<<M,flash_mhc::THREADS,0,st>>>(mhc_buffers(m),m.tok,m.emb,HID,geom::RMS_EPS_FLASH);
     launch_mhc_input(m,0,false,M,st);
 }
-// GR8_PF_XTRACE=1 (prefill measurement only): one record of PX_W u64 per (step % PX_STEPS, collective) in device memory.
+// GR8_GLM53F_PF_XTRACE=1 (prefill measurement only): one record of PX_W u64 per (step % PX_STEPS, collective) in device memory.
 // globaltimer ns: [PX_PROD] producer end (before the put), [PX_PUT] put + doorbell done, [PX_ENTRY] first consumer CTA
 // entry, [PX_WMIN]/[PX_WMAX] first/last consumer CTA past the wait, [PX_END] mHC end; [PX_M] rows, [PX_STEP] step + 1.
 namespace pxt {
@@ -153,7 +153,7 @@ struct MhcFabricBlock {
     int c;
     size_t wait_payload=0;
     const __nv_bfloat16* local_part=nullptr;
-    unsigned long long* pxt=nullptr;      // GR8_PF_XTRACE records (prefill), null = off
+    unsigned long long* pxt=nullptr;      // GR8_GLM53F_PF_XTRACE records (prefill), null = off
     const __nv_bfloat16* peer_part=nullptr; // NR == 2 prefill: the peer's partial already copied to device memory
     unsigned long long* xr=nullptr;
     const unsigned short* base[g6nr::NR]={};
@@ -254,8 +254,8 @@ inline void flash_mark(int fmk,void* p) {
     dmark(dp[fmk],(cudaStream_t)p);
 }
 inline void launch_consume_mhc(Model& m,int c,int M,cudaStream_t st) {
-    const int mhc_fuse = (int)(M == 1 ? knob::mhc_fuse_m1() : knob::mhc_fuse_m4()).value_or(knob::mhc_fuse());
-    const bool stage = knob::dec_mhc_stage() && (M == 1 || M == 4);
+    const int mhc_fuse = (int)(M == 1 ? knob::glm53f_mhc_fuse_m1() : knob::glm53f_mhc_fuse_m4()).value_or(knob::glm53f_mhc_fuse());
+    const bool stage = knob::glm53f_dec_mhc_stage() && (M == 1 || M == 4);
     const size_t payload = (size_t)M*HID*2;
     dmark(DP_OTHER,st);
     if (mhc_fuse == 0)

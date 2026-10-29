@@ -750,7 +750,7 @@ class Supervisor:
             # this box's host ledger (donate() creates it); the engine writes the bytes it may lend next to it (.gpu)
             out = kvnode.out_dir(kvnode.parse(['--work-dir', self.home], dict(os.environ)))
             os.makedirs(out, exist_ok=True)
-            env['GR8_FLASH_KV_LEDGER'] = os.path.join(out, 'ledger')
+            env['GR8_GLM53F_KV_LEDGER'] = os.path.join(out, 'ledger')
         return env
 
     def borrow_idle(self, knobs):

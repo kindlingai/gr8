@@ -1,0 +1,266 @@
+# Speculative decoding: MTP, the DFlash2 drafter and n-gram drafts. knobs/README.md describes the fields.
+prefix: "GR8_"
+knobs:
+  GR8_DFL_BODY_I4:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      The DFlash2 drafter's body GEMVs read INT4 g32 copies of their MXFP8 records, made at boot. Drafts only, +382 MB
+      per rank. Needs --dflash-manifest.
+  GR8_DFL_DUMP:
+    scope: local
+    kind: path
+    unset: "unset"
+    doc: >-
+      With --dflash, rank 0 writes every draft step's context features, drafts and committed tokens to this file, for
+      engine/ref/dflash2_replay.py.
+  GR8_DFL_HEAD_I4:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      The DFlash2 drafter's lm_head GEMV reads INT4 g32 records, the same ones as GR8_DRAFT_HEAD_I4. Drafts only. Needs
+      --dflash-manifest.
+  GR8_DFL_PFCTX:
+    scope: agree
+    kind: flag
+    default: "1"
+    doc: >-
+      With --dflash, 0 gives the drafter no prompt context from the prefill, so it starts from the last prompt token.
+      Flash --prefill with --dflash needs 0.
+  GR8_DFL_REUSE:
+    scope: agree
+    kind: int
+    unset: "2 when serving DFlash2 with MTP, else 0"
+    values: "0..2"
+    doc: >-
+      With DFlash2 under S2, 1 lets a request whose prefix-reuse hit landed in the drafter's window keep the drafter,
+      and 2 also gives the drafter to a request alone on MTP.
+  GR8_DFL_REUSE_MIN:
+    scope: agree
+    kind: int
+    default: "256"
+    values: "0..2048"
+    doc: >-
+      With GR8_DFL_REUSE, the context rows the drafter must hold before it drafts. Until then the request runs MTP
+      rounds that feed it.
+  GR8_DFL_SEL_ALPHA:
+    scope: agree
+    kind: float
+    default: "1"
+    doc: >-
+      The DFlash2 selector walk scores each candidate as logit + a * correction instead of logit + correction. Drafts
+      only. Needs --dflash-manifest and the selector.
+  GR8_DRAFT_HEAD2:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0..2"
+    doc: >-
+      Experimental: the MTP draft head runs in two stages, a 2-bit screen then the exact MXFP8 logits of its best 64
+      rows. 2 also runs the MXFP8 GEMV and counts misses. Needs --mtp.
+  GR8_DRAFT_HEAD_I4:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      The MTP draft's lm_head GEMV reads INT4 g32 records made at boot from the MXFP8 records, +134 MB per rank at TP4.
+      Drafts only. Needs --mtp.
+  GR8_DRAFT_HEAD_KS:
+    scope: agree
+    kind: int
+    default: "32"
+    values: "2|4|8|16|32"
+    doc: >-
+      With GR8_DRAFT_HEAD_I4 or GR8_DFL_HEAD_I4, the INT4 head GEMV's k parts per tile. Its product with
+      GR8_DRAFT_HEAD_TPC must be at most 32.
+  GR8_DRAFT_HEAD_TPC:
+    scope: agree
+    kind: int
+    default: "1"
+    values: "1|2|4|8|16|32"
+    doc: >-
+      With GR8_DRAFT_HEAD_I4 or GR8_DFL_HEAD_I4, the INT4 head GEMV's tiles per CTA. Its product with GR8_DRAFT_HEAD_KS
+      must be at most 32.
+  GR8_DRAFT_IN_DUMP:
+    scope: local
+    kind: path
+    unset: "unset"
+    doc: >-
+      Rank 0 writes the inputs of every MTP first draft pass to this file. Needs --mtp and no --serve.
+  GR8_DRAFT_LOGIT_DUMP:
+    scope: agree
+    kind: path
+    unset: "unset"
+    doc: >-
+      Every rank writes its vocab slice of the MTP first draft pass logits to this path plus .rank<R>. Needs --mtp and
+      no --serve.
+  GR8_DRAFT_PAR:
+    scope: agree
+    kind: int
+    unset: "2 when serving DFlash2 with MTP, else 0"
+    values: "0..2"
+    doc: >-
+      S2 with DFlash2, a solo round runs the drafter step on its own CUDA stream under MTP's first form. 2 also puts
+      drafting steps on a high-priority stream. Same bytes as serial.
+  GR8_MTP_KSTOP:
+    scope: agree
+    kind: int
+    unset: "2 with --serve, DFlash2 and --mtp 2+, else 0"
+    values: "0|1|2"
+    doc: >-
+      A solo session's MTP rounds verify only the drafts the MTP head is confident in: 1 by the GR8_MTP_KSTOP_TAU
+      thresholds, 2 by the drafter choice's MTP estimates.
+  GR8_MTP_KSTOPB:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      In shared S2 rounds each session verifies its own count of the --mtp drafts, from the MTP head's cumulative draft
+      probability against the GR8_MTP_KSTOPB_TAU thresholds.
+  GR8_MTP_KSTOPB_EXPLORE:
+    scope: agree
+    kind: int
+    default: "0"
+    doc: >-
+      Measurement: with GR8_MTP_KSTOPB, every Nth round's shared sessions verify a hashed draft count instead. 0 is off.
+  GR8_MTP_KSTOPB_KMIN:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0|1"
+    doc: >-
+      Sets the fewest drafts a session verifies under GR8_MTP_KSTOPB.
+  GR8_MTP_KSTOPB_TAU:
+    scope: agree
+    kind: floats
+    default: "0.6,0.88,0.95"
+    doc: >-
+      Sets the GR8_MTP_KSTOPB thresholds t1,t2,... (up to 7) on each session's cumulative draft probability, at every
+      session count. Past the last entry there is no stop.
+  GR8_MTP_KSTOPB_TAU_S<n>:
+    scope: agree
+    kind: floats
+    unset: "MTP_KSTOPB_TAU"
+    doc: >-
+      Sets the GR8_MTP_KSTOPB thresholds t1,t2,... (up to 7) for rounds of n sessions, n 1..8.
+  GR8_MTP_KSTOPB_WIDTHS:
+    scope: agree
+    kind: ints
+    unset: "every width the rule reaches"
+    doc: >-
+      Sets the shared-round main widths captured as graphs besides the multiples of --mtp + 1. A width outside them
+      takes the next most likely drafts.
+  GR8_MTP_KSTOP_KMAX:
+    scope: agree
+    kind: int
+    unset: "--mtp"
+    values: "1..3"
+    doc: >-
+      Sets the most drafts a solo MTP round chains under GR8_MTP_KSTOP. Without DFlash2 it must not exceed --mtp.
+  GR8_MTP_KSTOP_SEED3:
+    scope: agree
+    kind: float
+    default: "0.55"
+    values: "0..1"
+    doc: >-
+      With GR8_MTP_KSTOP=2, sets the prior acceptance of a third MTP draft in the drafter choice's estimates.
+  GR8_MTP_KSTOP_TAU:
+    scope: agree
+    kind: floats
+    default: "0,0.2,0.5"
+    doc: >-
+      With GR8_MTP_KSTOP=1, sets the thresholds t1,t2,t3: a solo round verifies draft j while the product of the draft
+      probabilities up to j is at least t_j.
+  GR8_MTP_L2PF:
+    scope: local
+    kind: int
+    default: "0"
+    values: "0..3"
+    doc: >-
+      With GR8_L2PF and --mtp, runs the paced L2 prefetch in MTP draft steps: 1 the draft step's windows, 2 the head
+      waits prefetch the next draft step's front, 3 both. Same output bytes.
+  GR8_MTP_L2PF_US:
+    scope: local
+    kind: float
+    default: "60"
+    values: "0..1000"
+    doc: >-
+      Sets the budget in us at the pace of each GR8_MTP_L2PF head-wait prefetch window.
+  GR8_MTP_LASTROW:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      A first-form MTP draft step routes only each session's last row through the MTP layer's routed experts. Caches,
+      drafts and log-probabilities keep their bytes.
+  GR8_MTP_LPLOG:
+    scope: local
+    kind: int
+    default: "0"
+    values: "0|1|2"
+    doc: >-
+      Prints one # kstop line per solo S2 round with the drafter, verified and accepted counts and the drafts' log-
+      probabilities: 1 on rank 0, 2 on every rank.
+  GR8_MTP_SPLIT:
+    scope: agree
+    kind: flag
+    unset: "g6m4: 1 when TP>1 on GLM with --mtp, else 0; m4sim: 0"
+    values: "0|1"
+    doc: >-
+      MTP draft steps split eh_proj and the draft layer's replicated input GEMVs by output tiles across the ranks,
+      gathered on a draft fabric (port + 72). Same bits.
+  GR8_NGRAM:
+    scope: agree
+    kind: path
+    unset: "unset"
+    doc: >-
+      A solo DFlash2 session also drafts from this n-gram table file and verifies its chain when it promises more tokens
+      per verify ms. Needs --serve.
+  GR8_NGRAM_KMAX:
+    scope: agree
+    kind: int
+    unset: "--dflash-k"
+    values: "1.."
+    doc: >-
+      Sets the longest GR8_NGRAM chain a round verifies.
+  GR8_NGRAM_KMIN:
+    scope: agree
+    kind: int
+    default: "2"
+    values: "1.."
+    doc: >-
+      Sets the shortest GR8_NGRAM chain worth a round.
+  GR8_NGRAM_LOG:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      Rank 0 prints one line per round that takes a GR8_NGRAM chain.
+  GR8_NGRAM_MARGIN:
+    scope: agree
+    kind: float
+    default: "0.1"
+    values: "0..10"
+    doc: >-
+      Sets how many more tokens per verify ms a GR8_NGRAM chain must promise than the drafter's drafts.
+  GR8_SPEC_DRAFT:
+    scope: agree
+    kind: floats
+    default: "8.1,5.5,2.1"
+    doc: >-
+      S2 with DFlash2: overrides the DFlash2 round, MTP round and each extra MTP chain step costs with three comma-
+      separated nonnegative times in ms.
+  GR8_SPEC_TABLE:
+    scope: agree
+    kind: floats
+    unset: "built-in measured table"
+    doc: >-
+      S2 with DFlash2: overrides the verify costs for 1..8 rows with eight comma-separated positive times in ms, for the
+      DFlash2 draft count and the drafter choice.

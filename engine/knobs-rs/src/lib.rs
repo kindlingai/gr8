@@ -1,4 +1,4 @@
-//! The engine's settings from the environment, all in one table (table.rs). Code reads a setting through its typed
+//! The engine's settings from the environment, all in one table (the knobs/ YAML files). Code reads a setting through its typed
 //! knob: `knobs::ATTN_CTX2.get()` in Rust, `knob::attn_ctx2()` in C++ (gr8_knobs.h, which `knobs gen` writes from the
 //! table). The knob NAME is the variable GR8_NAME. Its old name, G6_NAME, still works and prints a warning.
 //!
@@ -75,8 +75,8 @@ pub struct Spec {
     pub values: &'static str,
     /// The variable's exact name, in place of GR8_NAME (a system variable such as TMPDIR).
     pub env: Option<&'static str>,
-    /// The old name, in place of G6_NAME.
-    pub legacy: Option<&'static str>,
+    /// The old names the variable is still read under, with a warning: G6_NAME unless knobs/ says otherwise.
+    pub legacy: &'static [&'static str],
     pub doc: &'static str,
 }
 
@@ -88,10 +88,6 @@ impl Spec {
             Some(n) => format!("{base}{n}"),
             None => base,
         }
-    }
-
-    fn old(&self) -> Option<String> {
-        self.legacy.map(str::to_string).or_else(|| self.env.is_none().then(|| format!("G6_{}", self.name)))
     }
 }
 
@@ -211,8 +207,8 @@ type Set = (String, String);
 /// Which knob a variable sets: (table index, family number, whether it is the old name).
 fn resolve(var: &str) -> Option<(usize, Option<u32>, bool)> {
     for (i, s) in TABLE.iter().enumerate() {
-        for (name, old) in [(Some(s.var(None)), false), (s.old(), true)] {
-            let Some(name) = name else { continue };
+        let names = std::iter::once((s.var(None), false)).chain(s.legacy.iter().map(|l| (l.to_string(), true)));
+        for (name, old) in names {
             if !s.family {
                 if var == name {
                     return Some((i, None, old));
@@ -309,6 +305,13 @@ impl Env {
             out += &format!("{} {}{num}={}", if out.is_empty() { " env" } else { "" }, spec.name, v.canon());
         }
         out
+    }
+
+    /// The test knobs that are set, under any of their names, as their GR8_TEST_ names. A serving engine refuses to
+    /// start with any of them set.
+    pub fn tests_set(&self) -> Vec<String> {
+        let tests = self.values.keys().filter(|&&(i, _)| TABLE[i].scope == Scope::Test);
+        tests.map(|&(i, n)| TABLE[i].var(TABLE[i].family.then_some(n))).collect()
     }
 }
 

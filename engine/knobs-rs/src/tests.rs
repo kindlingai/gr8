@@ -67,9 +67,11 @@ fn names() {
     assert_eq!(e.get(find("MTP_KSTOPB_TAU_S"), 4), None);
     assert_eq!(e.get(find("TMPDIR"), 0).map(Value::canon).as_deref(), Some("/x"));
     assert!(e.problems().iter().any(|p| p.text.starts_with("G6_TMPDIR is not")));
-    // a legacy name other than G6_NAME
-    let e = env(&[("ATTNK_SESS", "2")]);
-    assert_eq!(e.get(find("ATTNK_SESS"), 0), Some(&Value::Int(2)));
+    // a test knob's old names: its own, and the GR8_ one it had before GR8_TEST_
+    let e = env(&[("ATTNK_SESS", "2"), ("GR8_S2_RUNS", "0:4")]);
+    assert_eq!(e.get(find("TEST_ATTNK_SESS"), 0), Some(&Value::Int(2)));
+    assert_eq!(e.get(find("TEST_S2_RUNS"), 0).map(Value::canon).as_deref(), Some("0:4"));
+    assert_eq!(e.tests_set(), ["GR8_TEST_ATTNK_SESS", "GR8_TEST_S2_RUNS"]);
 }
 
 #[test]
@@ -100,4 +102,32 @@ fn generated_files_are_current() {
         let on_disk = std::fs::read_to_string(repo.join(path)).unwrap_or_default();
         assert!(on_disk == text, "{path} is out of date: cargo run --bin knobs -- gen");
     }
+}
+
+#[allow(dead_code)] // the tests read only some fields
+#[path = "yaml.rs"]
+mod yaml;
+
+#[test]
+fn yaml_file_rules() {
+    let refused = |src: &str| {
+        let mut out = std::collections::BTreeMap::new();
+        yaml::add(&mut out, &mut vec![], "t.yaml", src).unwrap_err()
+    };
+    let one = "prefix: GR8_TEST_\nscope: test\nknobs:\n  GR8_TEST_X:\n    kind: flag\n    default: \"0\"\n";
+    let mut out = std::collections::BTreeMap::new();
+    yaml::add(&mut out, &mut vec![], "t.yaml", one).unwrap();
+    assert_eq!(out["TEST_X"].legacy, ["G6_TEST_X"]);
+    assert!(refused(&one.replace("  GR8_TEST_X:", "  GR8_X:")).contains("start with \"GR8_TEST_\""));
+    let local = "prefix: GR8_\nknobs:\n  GR8_X:\n    scope: test\n    kind: flag\n    default: \"0\"\n";
+    assert!(refused(local).contains("a test knob belongs in a file whose scope is test"));
+    assert!(refused(&one.replace("    default: \"0\"\n", "")).contains("exactly one of default and unset"));
+    assert!(refused(&format!("{one}    colour: red\n")).contains("unknown field"));
+    let err = yaml::add(&mut out, &mut vec![], "u.yaml", one).unwrap_err();
+    assert!(err.contains("also in t.yaml"), "{err}");
+    // an old name need not carry the file's prefix
+    let old = one.replace("    kind: flag", "    kind: flag\n    legacy: [\"G6_X\", \"ATTNK_X\"]");
+    let mut out = std::collections::BTreeMap::new();
+    yaml::add(&mut out, &mut vec![], "t.yaml", &old).unwrap();
+    assert_eq!(out["TEST_X"].legacy, ["G6_X", "ATTNK_X"]);
 }

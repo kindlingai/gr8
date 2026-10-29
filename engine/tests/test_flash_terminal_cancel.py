@@ -1,4 +1,4 @@
-"""GR8_FLASH_CACHE=terminal, a cancel at the boundary the prefill checkpoint waits for: compile
+"""GR8_GLM53F_CACHE=terminal, a cancel at the boundary the prefill checkpoint waits for: compile
 runtime/s2/tests/flash_terminal_cancel_test.cpp with flash_native.cuh's own checkpoint hooks pasted in (take_capture,
 h.pool.retain, the prefill's capture block, h.retire, h.before_work) and run it on two ranks through the real Service.
   usage: test_flash_terminal_cancel.py [flash_native.cuh]   (default: this tree's)"""

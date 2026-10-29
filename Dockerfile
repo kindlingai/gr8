@@ -30,6 +30,7 @@ WORKDIR /src
 # Each Rust build copies its output out and drops target/ in the same layer, so the cached layer holds one file.
 FROM rust AS loader
 COPY engine/knobs-rs engine/knobs-rs
+COPY knobs knobs
 COPY engine/loader-rs engine/loader-rs
 RUN mkdir -p /out \
  && cargo build --release --locked --manifest-path engine/loader-rs/Cargo.toml \
@@ -38,6 +39,7 @@ RUN mkdir -p /out \
 
 FROM rust AS kvman
 COPY engine/knobs-rs engine/knobs-rs
+COPY knobs knobs
 COPY engine/kvman-rs engine/kvman-rs
 RUN mkdir -p /out \
  && cargo build --release --locked --manifest-path engine/kvman-rs/Cargo.toml \
@@ -46,9 +48,10 @@ RUN mkdir -p /out \
 
 FROM rust AS knobs
 COPY engine/knobs-rs engine/knobs-rs
+COPY knobs knobs
 RUN mkdir -p /out \
  && cargo build --release --locked --features capi --manifest-path engine/knobs-rs/Cargo.toml \
- && cp engine/knobs-rs/target/release/libgr8knobs.a /out/ \
+ && cp engine/knobs-rs/target/release/libgr8knobs.a engine/knobs-rs/target/release/libgr8knobs.so /out/ \
  && rm -rf engine/knobs-rs/target
 
 # the slowest step (fat LTO); it runs beside the engine builds
@@ -59,6 +62,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends cmake clang libclang-dev \
  && rm -rf /var/lib/apt/lists/*
 COPY engine/knobs-rs engine/knobs-rs
+COPY knobs knobs
 COPY frontend/g6front-rs frontend/g6front-rs
 # from the crate's directory, so rustup reads its rust-toolchain.toml
 WORKDIR /src/frontend/g6front-rs
@@ -71,6 +75,7 @@ RUN mkdir -p /out \
 # from it (engine/runtime/grammar.h). cargo fetch only, so the engine stages need not wait for the front end's build
 FROM rust AS xgrammar-src
 COPY engine/knobs-rs engine/knobs-rs
+COPY knobs knobs
 COPY frontend/g6front-rs/Cargo.toml frontend/g6front-rs/Cargo.lock frontend/g6front-rs/rust-toolchain.toml frontend/g6front-rs/
 WORKDIR /src/frontend/g6front-rs
 RUN mkdir -p src && touch src/main.rs && cargo fetch --locked \
@@ -153,6 +158,8 @@ COPY --from=engine /out/bin/g6m4 /out/bin/m4sim /bin/
 COPY --from=front /out/g6front-rs /bin/
 COPY --from=loader /out/g6load /bin/
 COPY --from=kvman /out/kvman-remote /bin/
+# the knob table the launcher reads (tools/launch/knobs.py)
+COPY --from=knobs /out/libgr8knobs.so /bin/lib/
 
 FROM scratch AS dist-int4
 COPY --from=engine-int4 /out/bin/g6m4-int4 /bin/

@@ -463,6 +463,13 @@ def default_text(default, meaning, engine=False):
     return 'default: per model and TP (scripts/engine_args.sh)' if engine else 'default: unset'
 
 
+def engine_value(plan, key):
+    """KEY's value in a plan: the option's, else GR8_KEY's in the engine environment (EXTRA_ENV can set it)."""
+    if plan['knobs'].get(key):
+        return plan['knobs'][key]
+    return next((e.partition('=')[2] for e in reversed(plan['env']) if e.startswith(f'GR8_{key}=')), '')
+
+
 def cmd_knobs(argv):
     """Without GR8_MODEL: every option of ./gr8 <model> and ./gr8 kv with its default. With it: the value each of the
     model's TPs (or --tp's alone) runs with, from scripts/engine_args.sh and these options."""
@@ -476,7 +483,7 @@ def cmd_knobs(argv):
     plans = {}
     for tp in tps:
         try:
-            plans[tp] = opt.engine_plan(opt.parse(argv + ['--tp', tp]))['knobs']
+            plans[tp] = opt.engine_plan(opt.parse(argv + ['--tp', tp]))
         except opt.OptionError as e:
             print(f'gr8: TP={tp}: {e}', file=sys.stderr)
             return 2
@@ -493,7 +500,7 @@ def cmd_knobs(argv):
             lines += ['-- engine knobs: scripts/engine_args.sh turns these into the engine\'s environment and flags', '']
         set_by = '' if o.origin[k] == 'default' else f' (set by the {o.origin[k]})'
         if model and k in opt.ENGINE_KNOBS:
-            values = '  '.join(f'TP={tp} {plans[tp].get(k) or "-"}' for tp in tps) + set_by
+            values = '  '.join(f'TP={tp} {engine_value(plans[tp], k) or "-"}' for tp in tps) + set_by
         elif model:
             values = (o.get(k) or 'unset') + set_by
         else:

@@ -89,9 +89,9 @@ rounds share main and draft steps, and their KV runs share the `CAP` pool (`--s2
 The memory these take (slots and graphs), the speed of shared steps and the output of sessions sharing steps have not
 been measured on Flash yet.
 
-## Session checkpoints (`GR8_FLASH_CACHE=aligned`, experimental)
+## Session checkpoints (`GR8_GLM53F_CACHE=aligned`, experimental)
 
-Off by default. With `FLASH_CACHE=aligned` (`GR8_FLASH_CACHE=aligned`), a prompt's prefill keeps a checkpoint at its last
+Off by default. With `FLASH_CACHE=aligned` (`GR8_GLM53F_CACHE=aligned`), a prompt's prefill keeps a checkpoint at its last
 cold prefill grid point, and a later prompt that starts with the same tokens is prefilled from that point, not from 0.
 This is the Flash form of prefix reuse for an agent's next turn. The code is `engine/runtime/s2/flash_checkpoint.h` (the
 index, the aligned point, the manifest) and `flash_checkpoint.cuh` (the store), hooked into `s2/flash_native.cuh`.
@@ -114,7 +114,7 @@ Why a checkpoint is not taken at the end of the prompt: decode advances the KDA 
 fp32 arithmetic give different state, so a state taken after decode is not the state a cold prefill of the same tokens
 gives. A terminal checkpoint is not cold-exact by construction.
 
-`FLASH_CACHE=terminal` (`GR8_FLASH_CACHE=terminal`, experimental, **NOT cold-exact**) keeps aligned's checkpoints and
+`FLASH_CACHE=terminal` (`GR8_GLM53F_CACHE=terminal`, experimental, **NOT cold-exact**) keeps aligned's checkpoints and
 one more at the end of every request: `p` = the rows the request consumed (prompt and output; its last output token is
 still pending and becomes token `p`), with the KDA state the verify ring holds for `p` and the pages through `p`, the
 last one partial. A later prompt that starts with those `p + 1` tokens (an agent's next turn sent as raw tokens) is
@@ -163,12 +163,12 @@ Limits:
   resizes through its own index (above), with the same report rule.
 - Each capture writes the whole prefix `[0, p)`, not only the rows past the entry it started from.
 - `terminal` is not cold-exact (above).
-- One session: the engine refuses `GR8_FLASH_CACHE` and `GR8_FLASH_KV_CHUNKS` with `--s2-sessions` above 1 (the
+- One session: the engine refuses `GR8_GLM53F_CACHE` and `GR8_GLM53F_KV_CHUNKS` with `--s2-sessions` above 1 (the
   checkpoints keep session 0's KDA ring).
 
 ## Not yet
 
-- CP, prefix reuse and DFlash2: the engine refuses them under `--serve`. `GR8_FLASH_CACHE=aligned` (above) is the
+- CP, prefix reuse and DFlash2: the engine refuses them under `--serve`. `GR8_GLM53F_CACHE=aligned` (above) is the
   experimental Flash form of prefix reuse. DFlash2 runs offline (`g6m4_flash --dflash-manifest`, at a TP that splits
   its 8 KV heads), and with `--prefill` only without the drafter's prompt context (`GR8_DFL_PFCTX=0`). Its taps are the
   mean of the four mHC streams after each tapped layer.

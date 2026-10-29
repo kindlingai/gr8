@@ -251,8 +251,8 @@ inline void launch(const Block& b, cudaStream_t st)
 {
     if (b.w.moe)
     {
-        const int64_t r_nw = knob::router_nw();
-        const bool r_mf = knob::router_mf();
+        const int64_t r_nw = knob::glm53f_router_nw();
+        const bool r_mf = knob::glm53f_router_mf();
         __half* xh_out = b.xh ? nullptr : b.scratch.xhalf;
         auto dispatch_nw = [&](auto nw_tag) {
             constexpr int NW = decltype(nw_tag)::value;

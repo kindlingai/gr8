@@ -5,9 +5,9 @@
 #include "../knobs-rs/gr8_knobs.h"
 
 namespace g6rt {
-// GR8_PF_POOL_OWNER: unset = auto (2: on for TP2 Flash prefill, off elsewhere), 0 = off, 1 = on (dies if unsupported).
+// GR8_GLM53F_PF_POOL_OWNER: unset = auto (2: on for TP2 Flash prefill, off elsewhere), 0 = off, 1 = on (dies if unsupported).
 inline int flash_pool_owner_mode() {
-    return (int)knob::pf_pool_owner().value_or(2);
+    return (int)knob::glm53f_pf_pool_owner().value_or(2);
 }
 struct FlashPoolTransport {
     g6::Fabric* fabric = nullptr;

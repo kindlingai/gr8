@@ -122,7 +122,7 @@ costs 2.3 MB of int4 pool and 2.9 MB of them.
 `attn.o`, `attn_bind.o` and `m4sim` match section for section, except the hash in internal symbol names. m4sim printed
 the same stdout as main in three cases, all at TP=4 on the release's layers 0 and 3:
 
-- prefill of 1,500 tokens plus 16 decode steps, with `GR8_KV_HASH` (R = 2048, every page replicated);
+- prefill of 1,500 tokens plus 16 decode steps, with `GR8_TEST_KV_HASH` (R = 2048, every page replicated);
 - the same with R = 1024, so pages past 1,024 are spread across ranks;
 - three S2 sessions with MTP.
 

@@ -1,4 +1,4 @@
-// GR8_FLASH_CACHE's host half (s2/flash_checkpoint.h): the aligned point, the match rule (tokens through p, the limit,
+// GR8_GLM53F_CACHE's host half (s2/flash_checkpoint.h): the aligned point, the match rule (tokens through p, the limit,
 // the namespace, the longest and then the newest entry), first-fit placement with least-recently-used drops, the digest
 // two ranks compare, and the manifest checks that refuse a torn or reused range. No CUDA, no store.
 #include "../runtime/s2/flash_checkpoint.h"

@@ -3,7 +3,7 @@
 // model): steps with one live session take the solo graphs on that session's pages, steps shared by sessions the
 // batched graphs captured here, whose attention reads each row's own table (S2In, the batch views). KDA state is not
 // a paged cache: each session has its own kda_ring slots (FlashSlots), reset when it starts.
-// GR8_FLASH_CACHE=aligned (FlashContext::ckpt, flash_checkpoint.h, --s2-sessions 1 only): the pool's prefix-reuse hooks
+// GR8_GLM53F_CACHE=aligned (FlashContext::ckpt, flash_checkpoint.h, --s2-sessions 1 only): the pool's prefix-reuse hooks
 // serve Flash checkpoints. A prompt's prefill keeps one at its last cold-grid point; a later prompt that starts with its
 // tokens is granted the skip, restored at bind and prefilled from there.
 #pragma once
@@ -28,9 +28,9 @@ struct FlashContext {
     std::function<void(int, int)> main_graph;
     std::function<void(int, bool, int)> draft_graph;
     int split = 0;    // GR8_DEC_SPLIT: the batched main graphs in two parts, as the solo ones
-    FlashCheckpoints* ckpt = nullptr;   // GR8_FLASH_CACHE on: the checkpoint store, else none
-    bool terminal = false;              // GR8_FLASH_CACHE=terminal: also a checkpoint at the end of every request
-    // optional: the engine's own hooks (GR8_FLASH_KV_CHUNKS borrow-idle: resize on FLASH_KV_TIER, flash_room, flash),
+    FlashCheckpoints* ckpt = nullptr;   // GR8_GLM53F_CACHE on: the checkpoint store, else none
+    bool terminal = false;              // GR8_GLM53F_CACHE=terminal: also a checkpoint at the end of every request
+    // optional: the engine's own hooks (GR8_GLM53F_KV_CHUNKS borrow-idle: resize on FLASH_KV_TIER, flash_room, flash),
     // added after serve_flash's; a resize hook chains to the one already set for any other tier
     std::function<void(NativeHooks&)> install;
 };
@@ -48,9 +48,9 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     const unsigned pages = sc.pool_rows / PAGE;
     RunPool pool(pages, pages, sc.pool_rows);
     FlashSlots ks(int(sc.limit()), std::max(1, c.main.kda_ring));
-    // GR8_FLASH_CACHE keeps one live request's state: one session only (its ring is session 0's; g6m4 refuses it, and
-    // GR8_FLASH_KV_CHUNKS, with --s2-sessions > 1)
-    require(!multi || !c.ckpt, "GR8_FLASH_CACHE needs --s2-sessions 1");
+    // GR8_GLM53F_CACHE keeps one live request's state: one session only (its ring is session 0's; g6m4 refuses it, and
+    // GR8_GLM53F_KV_CHUNKS, with --s2-sessions > 1)
+    require(!multi || !c.ckpt, "GR8_GLM53F_CACHE needs --s2-sessions 1");
     FlashRing& ring = ks.rings[0];
     u64 pfseq = 1, pfseq2 = 1, dseq = 0;
     LpStep lp{};
@@ -94,9 +94,9 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     // Rows the steps wrote into the attention caches (main and draft) since the last clear: a request clears only the
     // pages that hold them, one page past the last, and every later page is still zero from that clear (the full reset
     // cleared 12 x 436 MB per request at the 262K cap, ~27 ms). -1 = not known (boot): every page.
-    // GR8_FLASH_RESET_ALL=1: every page per request, as before. GR8_FLASH_RESET_CHECK=1: dies unless the pages past the
+    // GR8_GLM53F_RESET_ALL=1: every page per request, as before. GR8_GLM53F_RESET_CHECK=1: dies unless the pages past the
     // cleared ones are all zero (a test arm: it reads every cache).
-    const bool reset_all = knob::flash_reset_all(), reset_check = knob::flash_reset_check();
+    const bool reset_all = knob::glm53f_reset_all(), reset_check = knob::glm53f_reset_check();
     int dirty = -1;
     unsigned* zflag = nullptr;
     if (reset_check) G6RT_CK(cudaMalloc(&zflag, 4));
@@ -177,7 +177,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             if (reset_check) {
                 const int lm = reset_dirty_layer(c.main, pg, zflag, c.stream), ld = reset_dirty_layer(c.draft.d, pg, zflag, c.stream);
                 if (lm >= 0 || ld >= 0) {
-                    fprintf(stderr, "# GR8_FLASH_RESET_CHECK: request %llu: nonzero cache past page %d (rows < %d written): main layer %d, draft layer %d\n",
+                    fprintf(stderr, "# GR8_GLM53F_RESET_CHECK: request %llu: nonzero cache past page %d (rows < %d written): main layer %d, draft layer %d\n",
                             (unsigned long long)g.req.id, pg, dirty, lm, ld);
                     require(false, "Flash partial reset: a cache page past the written rows is not zero");
                 }
@@ -321,11 +321,11 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         // word check() reads stays set until the next request's reset: one check after the last chunk sees what one per
         // chunk saw, without check()'s blocking copy per layer each MX rows. The fence per chunk stays (k_step_in reads
         // *c.draft_input, which the next chunk rewrites).
-        const bool cache = knob::flash_draft_kv();
+        const bool cache = knob::glm53f_draft_kv();
         fence();
         if (!cache) check();
         auto draft = [&](FlashPrefill& fp, int n, int base) {
-            if (cache && pf_draft_full() && pf_draft_full_ok(c.draft))   // GR8_PF_DRAFT_FULL (flash_prefill.cuh)
+            if (cache && pf_draft_full() && pf_draft_full_ok(c.draft))   // GR8_GLM53F_PF_DRAFT_FULL (flash_prefill.cuh)
             {
                 const bool chk = pf_draft_full() == 2;
                 DraftFull& F = pf_draft_cache_full(c.draft, fp, n, base, p.prompt.data() + base + 1, chk, c.stream);
@@ -345,7 +345,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                 });
                 unsigned dw = 0;
                 G6RT_CK(cudaMemcpy(&dw, F.diff, 4, cudaMemcpyDeviceToHost));
-                fprintf(stderr, "# GR8_PF_DRAFT_FULL check: rows %d at %d, differing kv_a/idx_k/idx_g words %u\n", n, base, dw);
+                fprintf(stderr, "# GR8_GLM53F_PF_DRAFT_FULL check: rows %d at %d, differing kv_a/idx_k/idx_g words %u\n", n, base, dw);
                 return;
             }
             pf_draft_flash(c.draft, fp, n, base, p.prompt.data() + base + 1, dseq, [&](const StepIn& di) {

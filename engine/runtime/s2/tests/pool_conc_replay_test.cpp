@@ -53,7 +53,7 @@ int main(int argc, char** argv) {
         {13,5},{8177,6},{8149,7},{43,8},{35,9},{13,5},{32504,10},{32547,11},{45,12},{36,13},{13,5},{129784,14},{129735,15},{45,12},{36,13}};
     S.log = 0;
     for (auto& e : pre) { S.retire_all(false); S.admit(P(e.n, e.k), "pre"); }
-    S.log = knob::pf_replay_verbose();
+    S.log = knob::test_pf_replay_verbose();
     auto seqrun = [&](const std::vector<int>& p, const char* tag) { S.retire_all(false); S.admit(p, tag); };
     // S1
     for (int L : {4096, 8192}) {

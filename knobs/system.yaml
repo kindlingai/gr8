@@ -1,0 +1,10 @@
+# Variables gr8 reads under their own names. knobs/README.md describes the fields.
+prefix: ""
+knobs:
+  TMPDIR:
+    scope: local
+    kind: path
+    default: "/tmp"
+    legacy: []
+    doc: >-
+      Where the loader writes its planned rank manifests.

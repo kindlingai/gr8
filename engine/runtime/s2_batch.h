@@ -185,9 +185,9 @@ struct S2Cost
     double draft0 = 2.1, draft_sess = 0.25;     // first-form draft step of S sessions' accepted rows
     double chain0 = 2.0, chain_sess = 0.15;     // chain step, one row per session
 #if G6_MODEL_FLASH
-    // A/B switch for Flash solo serving (GR8_FLASH_S2_COST=1): spec_len.h's Flash table for this build's width, a host
+    // A/B switch for Flash solo serving (GR8_GLM53F_S2_COST=1): spec_len.h's Flash table for this build's width, a host
     // build without one (the tests) TP2's. Never changes the full-GLM cost model.
-    bool flash = knob::flash_s2_cost();
+    bool flash = knob::glm53f_s2_cost();
 #ifdef G6_NR
     static constexpr int flash_tp = G6_NR;
 #else

@@ -1,0 +1,121 @@
+# The engine runtime: loading, checks, tracing and memory. knobs/README.md describes the fields.
+prefix: "GR8_"
+knobs:
+  GR8_FABRIC_CONNECT_TRIES:
+    scope: local
+    kind: int
+    default: "1200"
+    doc: >-
+      Fabric TCP connect attempts, 100 ms apart. Raise it when ranks load at different speeds.
+  GR8_IMG_VMM:
+    scope: local
+    kind: int
+    default: "0"
+    doc: >-
+      Builds the device weight image from cuMemCreate chunks mapped into one range, 1 = the recommended granularity, N =
+      N MB chunks. Same bytes. Falls back to cudaMalloc and says why.
+  GR8_LOADER:
+    scope: local
+    kind: text
+    unset: "the Rust loader"
+    values: "cpp"
+    doc: >-
+      cpp loads a pack through the C++ path instead of the Rust loader.
+  GR8_LOAD_CHUNK_MB:
+    scope: local
+    kind: int
+    default: "32"
+    values: "1.."
+    doc: >-
+      Sets the chunk size in MB that the Rust loader reads and the weight check sums.
+  GR8_LOAD_MODE:
+    scope: local
+    kind: text
+    default: "read"
+    values: "read|mmap"
+    doc: >-
+      Picks how the Rust loader reads weight files: read or mmap. Other values fail the load.
+  GR8_LOAD_THREADS:
+    scope: local
+    kind: int
+    default: "8"
+    values: "1.."
+    doc: >-
+      Sets the number of Rust loader worker threads.
+  GR8_MEM_MIN:
+    scope: local
+    kind: float
+    default: "8"
+    values: "0.."
+    doc: >-
+      GiB of MemAvailable the boot must keep after the weights and each layer of the KV pool. Below it the engine stops
+      with a message instead of meeting the OOM killer.
+  GR8_PROGRESS_ISOLATE:
+    scope: local
+    kind: flag
+    default: "1"
+    values: "0|1"
+    doc: >-
+      Moves every thread that is not a fabric proxy off this rank's proxy CPUs before the first fabric barrier, so no
+      worker thread preempts a progress thread. 0 turns it off.
+  GR8_RESID_DUMP:
+    scope: local
+    kind: path
+    unset: "unset"
+    doc: >-
+      Writes rank 0's residual stream after the embedding and after every attention and MLP sublayer of each offline
+      main step to this file, in the m4sim dump format.
+  GR8_TEST_ZERO_DELAY_MS:
+    scope: local
+    kind: int
+    default: "0"
+    doc: >-
+      A test of the zeroing order: every dmalloc zeroing waits behind an N ms kernel on the legacy stream, so a write to
+      new memory not ordered after it loses every time.
+  GR8_V2_SHARED:
+    scope: agree
+    kind: text
+    unset: "FP8 copy"
+    values: "trellis"
+    doc: >-
+      trellis: prefill runs an exlr8 v2 layer's shared expert as a trellis pass instead of from an FP8 copy made at
+      boot, which saves the copy (about 9.7 MB per layer at TP4).
+  GR8_WEIGHT_CHECK:
+    scope: local
+    kind: flag
+    default: "1"
+    doc: >-
+      Sums each loaded image on the CPU and the GPU and stops the boot with exit 3 if they differ, then seals the sums
+      for /health?deep (weight_check.cuh). 0 = off.
+  GR8_WEIGHT_CHECK_FLIP:
+    scope: local
+    kind: text
+    unset: "unset"
+    doc: >-
+      RANK:OFFSET flips one byte of rank RANK's first image after the load, a test of GR8_WEIGHT_CHECK that makes the
+      boot stop with exit 3.
+  GR8_XTRACE:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = transport trace: GPU timer stamps per collective, proxy tick stamps per rail and per-QP retry counters, dumped
+      at proxy stop or when GR8_XTRACE_QUIT appears. Measurement only.
+  GR8_XTRACE_OUT:
+    scope: local
+    kind: path
+    unset: "/tmp"
+    doc: >-
+      Directory for the GR8_XTRACE dumps, g6xtrace.r<rank>.f<n>.txt.
+  GR8_XTRACE_PF:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      With GR8_XTRACE=1, traces the two prefill fabrics instead of the decode fabric.
+  GR8_XTRACE_QUIT:
+    scope: local
+    kind: path
+    unset: "unset"
+    doc: >-
+      With GR8_XTRACE=1, each fabric dumps its trace once when this file appears.

@@ -704,7 +704,7 @@ __global__ void __launch_bounds__(128) kp_scores_tc(Input input,int start,int n,
 // Register-light exact alternative to kp_scores_tc: stream key fragments from shared memory and
 // finish each 16-head half before the next. Every dot keeps its MMA accumulation order, and
 // the head sum still visits heads 0..31. Half-sized output staging reduces shared memory too.
-// GR8_PF_KP_TC=3 selects this candidate; the default (=2) remains unchanged.
+// GR8_GLM53F_PF_KP_TC=3 selects this candidate; the default (=2) remains unchanged.
 template<int TC_TERMS,class Input>
 __global__ void __launch_bounds__(128) kp_scores_tc_stream(Input input,int start,int n,float* scores,int pstride){
     using namespace nvcuda;
@@ -1235,7 +1235,7 @@ __global__ void __launch_bounds__(128) value_project_tc(Input input,int start,in
     }
 }
 
-// GR8_PF_MLA_PROJ2 (default on; =0 off): absorb_tc / value_project_tc with a pipelined k loop. The same tiles (64 rows x 64 cols, warp
+// GR8_GLM53F_PF_MLA_PROJ2 (default on; =0 off): absorb_tc / value_project_tc with a pipelined k loop. The same tiles (64 rows x 64 cols, warp
 // w = rows w*16..+16), the same wmma m16n16k16 half -> float op per k16 step in order 0..K-16, the same bf16 -> fp16
 // weight conversion and the same __float2half_rn store: the same bits. 2-stage smem ring of BK = 32: the activation rows
 // by cp.async, the weights through registers one stage ahead; vectorized epilogue. Bench (n 256, 21 heads): absorb
@@ -1336,7 +1336,7 @@ __global__ void __launch_bounds__(128) mla_proj2(Input input,int start,int n,con
 constexpr int PF_MAX_ROWS_DEFAULT=4096;
 
 // ==== BEGIN #10 v2 (sparse_mla_pf_v2) ====
-// ---- #10 v2 of sparse_mla_pf_512 (GR8_PF_SPARSE_MLA_V2=1): byte-identical output, restructured data flow.
+// ---- #10 v2 of sparse_mla_pf_512 (GR8_GLM53F_PF_SPARSE_MLA_V2=1): byte-identical output, restructured data flow.
 // Same per-output math as sparse_mla_pf_512: QK k-chain of 32 HMMA.16816 (k ascending, zero start), N=32 key tiles in order,
 // same softmax code, same alpha multiply, same P_hi/P_lo PV chains (k 0..15 then 16..31), same epilogue ops.
 // Changes: indices -> KV row offsets once (smem table), all-pad tiles skipped without syncs, KV tile prefetched into registers
@@ -1645,14 +1645,14 @@ static int flash_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep*
     if(ce!=cudaSuccess)return (int)ce;
     fa::append(a,a,stream);
     const int pstride=fa::pool_stride(a.context);
-    const int kp_tc=int(knob::pf_kp_tc());
-    const bool fused_mla=knob::pf_sparse_mla()&&a.heads<=32;
-    const bool fused_mla512=fused_mla&&knob::pf_sparse_mla_512();
+    const int kp_tc=int(knob::glm53f_pf_kp_tc());
+    const bool fused_mla=knob::glm53f_pf_sparse_mla()&&a.heads<=32;
+    const bool fused_mla512=fused_mla&&knob::glm53f_pf_sparse_mla_512();
     // V2 defaults on only with sparse MLA + _512 and heads<=32. Explicit _V2=0 restores _512;
     // explicit _V2=1 retains the original opt-in outside _512 (still within sparse MLA).
-    const bool fused_mla_v2=fused_mla&&knob::pf_sparse_mla_v2().value_or(fused_mla512);
+    const bool fused_mla_v2=fused_mla&&knob::glm53f_pf_sparse_mla_v2().value_or(fused_mla512);
     // Separate exact H16c arm. Unset keeps the existing H32 V2 instruction path.
-    const bool fused_mla_h16c=fused_mla_v2&&a.heads<=16&&knob::pf_sparse_mla_h16c();
+    const bool fused_mla_h16c=fused_mla_v2&&a.heads<=16&&knob::glm53f_pf_sparse_mla_h16c();
     if(fused_mla){
         if(fused_mla_v2)
             ce=fused_mla_h16c
@@ -1664,7 +1664,7 @@ static int flash_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep*
             ce=cudaFuncSetAttribute(fa_pf::sparse_mla_pf<G6Attn>,cudaFuncAttributeMaxDynamicSharedMemorySize,fa_pf::MLA_SMEM);
         if(ce!=cudaSuccess)return (int)ce;
     }
-    const bool proj2=knob::pf_mla_proj2();   // fa_pf::mla_proj2 (=0: old kernels)
+    const bool proj2=knob::glm53f_pf_mla_proj2();   // fa_pf::mla_proj2 (=0: old kernels)
     auto select = [&](int start, int n) {
             if(kp_tc==3)fa_pf::kp_scores_tc_stream<2><<<dim3(pstride/32,(n+63)/64),128,0,stream>>>(a,start,n,w->ps,pstride);
             else if(kp_tc>=2)fa_pf::kp_scores_tc<2><<<dim3(pstride/32,(n+63)/64),128,0,stream>>>(a,start,n,w->ps,pstride);

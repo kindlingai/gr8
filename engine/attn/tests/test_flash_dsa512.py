@@ -15,8 +15,8 @@ START = "template<class Input>\n__global__ void __launch_bounds__(512) sparse_ml
 END = "// Tensor-Core value_project:"
 KNOBS_DIR = ROOT / "engine/knobs-rs"
 KNOBS_LIB = KNOBS_DIR / "target/release/libgr8knobs.a"
-DISPATCH = '    const bool fused_mla=knob::pf_sparse_mla()&&a.heads<=32;'
-REFUSED = ("2", "-1")   # GR8_PF_SPARSE_MLA* are flags: the first read of any other value exits 2
+DISPATCH = '    const bool fused_mla=knob::glm53f_pf_sparse_mla()&&a.heads<=32;'
+REFUSED = ("2", "-1")   # GR8_GLM53F_PF_SPARSE_MLA* are flags: the first read of any other value exits 2
 
 def kernel(source, start=START):
     return source[source.index(start):source.index(END, source.index(start))].rstrip()
@@ -24,7 +24,7 @@ def kernel(source, start=START):
 def strip_h16c(s):
     """Recover the pre-H16c V2 dispatcher before checking the pinned P1 source."""
     s = s.replace('    // Separate exact H16c arm. Unset keeps the existing H32 V2 instruction path.\n'
-                  '    const bool fused_mla_h16c=fused_mla_v2&&a.heads<=16&&knob::pf_sparse_mla_h16c();\n', '')
+                  '    const bool fused_mla_h16c=fused_mla_v2&&a.heads<=16&&knob::glm53f_pf_sparse_mla_h16c();\n', '')
     s = s.replace('''            ce=fused_mla_h16c
                 ?cudaFuncSetAttribute(fa_pf::sparse_mla_pf_v2<G6Attn,16>,cudaFuncAttributeMaxDynamicSharedMemorySize,fa_pf::MLA2_SMEM_H16)
                 :cudaFuncSetAttribute(fa_pf::sparse_mla_pf_v2<G6Attn>,cudaFuncAttributeMaxDynamicSharedMemorySize,fa_pf::MLA2_SMEM);''',
@@ -43,7 +43,7 @@ def strip_v2(s):
     s = s[:s.index("// ==== BEGIN #10 v2")] + s[s.index(end) + len(end):]
     s = s.replace('    // V2 defaults on only with sparse MLA + _512 and heads<=32. Explicit _V2=0 restores _512;\n'
                   '    // explicit _V2=1 retains the original opt-in outside _512 (still within sparse MLA).\n', '')
-    s = s.replace('    const bool fused_mla_v2=fused_mla&&knob::pf_sparse_mla_v2().value_or(fused_mla512);\n', '')
+    s = s.replace('    const bool fused_mla_v2=fused_mla&&knob::glm53f_pf_sparse_mla_v2().value_or(fused_mla512);\n', '')
     s = s.replace("        if(fused_mla_v2)\n"
                   "            ce=cudaFuncSetAttribute(fa_pf::sparse_mla_pf_v2<G6Attn>,cudaFuncAttributeMaxDynamicSharedMemorySize,fa_pf::MLA2_SMEM);\n"
                   "        else if(fused_mla512)", "        if(fused_mla512)")
@@ -105,7 +105,7 @@ class DSA512Tests(unittest.TestCase):
         s = strip_v2(self.s)
         a, z = s.index(MARK), s.index(END, s.index(MARK))
         s = s[:a]+s[z:]
-        s = s.replace('    const bool fused_mla512=fused_mla&&knob::pf_sparse_mla_512();\n', '')
+        s = s.replace('    const bool fused_mla512=fused_mla&&knob::glm53f_pf_sparse_mla_512();\n', '')
         s = s.replace('''        if(fused_mla512)
             ce=cudaFuncSetAttribute(fa_pf::sparse_mla_pf_512<G6Attn>,cudaFuncAttributeMaxDynamicSharedMemorySize,fa_pf::MLA_SMEM);
         else
@@ -150,12 +150,12 @@ class DSA512Tests(unittest.TestCase):
         s = strip_h16c(self.s)
         self.assertEqual(s.count("sparse_mla_pf_v2<<<"), 1)
         self.assertEqual(s.count("cudaFuncSetAttribute(fa_pf::sparse_mla_pf_v2"), 1)
-        self.assertIn("const bool fused_mla_v2=fused_mla&&knob::pf_sparse_mla_v2().value_or(fused_mla512);", s)
+        self.assertIn("const bool fused_mla_v2=fused_mla&&knob::glm53f_pf_sparse_mla_v2().value_or(fused_mla512);", s)
         self.assertIn("        if(fused_mla){\n            if(fused_mla_v2)fa_pf::sparse_mla_pf_v2<<<n,512,fa_pf::MLA2_SMEM", s)
 
     def test_h16c_is_separate_opt_in_on_v2_h16_only(self):
         s = self.s
-        self.assertIn('fused_mla_h16c=fused_mla_v2&&a.heads<=16&&knob::pf_sparse_mla_h16c();', s)
+        self.assertIn('fused_mla_h16c=fused_mla_v2&&a.heads<=16&&knob::glm53f_pf_sparse_mla_h16c();', s)
         self.assertIn('sparse_mla_pf_v2<G6Attn,16><<<n,512,fa_pf::MLA2_SMEM_H16', s)
         self.assertIn('sparse_mla_pf_v2<G6Attn,16>,cudaFuncAttributeMaxDynamicSharedMemorySize,fa_pf::MLA2_SMEM_H16', s)
         self.assertEqual(s.count('sparse_mla_pf_v2<G6Attn,16><<<'), 1)

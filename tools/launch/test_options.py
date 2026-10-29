@@ -74,6 +74,15 @@ class PrecedenceTests(unittest.TestCase):
         self.assertIn('GR8_QA_SPLIT=1', env)
         self.assertEqual([e for e in env if e.startswith(('G6_', 'G9_'))], [])
 
+    def test_test_knobs_are_refused(self):
+        with self.assertRaises(opt.OptionError) as e:
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--extra-env', 'GR8_TEST_S2_RUNS=0:4'], GLM))
+        self.assertIn('GR8_TEST_S2_RUNS: a test knob', str(e.exception))
+        for old, why in (('G6_S2_RUNS', 'a test knob'), ('GR8_NO_SUCH', 'not an engine variable')):
+            with self.assertRaises(opt.OptionError) as e:
+                opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--extra-env', f'{old}=1'], GLM))
+            self.assertIn(f'{old}: {why}', str(e.exception))
+
     def test_default_file_and_no_config(self):
         o = opt.parse([], {'GR8_CLUSTER': self.f})
         self.assertEqual((o.file, o.get('CAP')), (self.f, '1000'))
@@ -231,6 +240,8 @@ class KnobsTests(unittest.TestCase):
     def test_tp_and_options_shape_the_values(self):
         out = self.knobs('glm53', '--tp', '6', '--cap', '1000', 'CAP')
         self.assertIn('    TP=6 1000 (set by the command line)\n', out)
+        # an engine knob set through EXTRA_ENV, under its old name, shows the value the engine gets
+        self.assertIn('    TP=4 1\n', self.knobs('glm53', '--tp', '4', '--extra-env', 'G6_QA_SPLIT=1', 'QA_SPLIT'))
 
 
 class RestartTests(unittest.TestCase):
@@ -318,7 +329,7 @@ class CanonicalTests(unittest.TestCase):
         self.assertEqual(base, self.digest('--work-dir', '/elsewhere', '--proxy-cpu', '15', '--model', '/m',
                                            '--model-cache', '/c', '--join-timeout', '5', '--node-ip', '10.0.0.2')[2])
         self.assertNotEqual(base, self.digest('--nohash', '1')[2])    # it reaches every rank's engine
-        self.assertNotEqual(base, self.digest('--extra-env', 'G6_X=1')[2])
+        self.assertNotEqual(base, self.digest('--extra-env', 'GR8_DEC_BK=1024')[2])
         self.assertNotEqual(base, self.digest('--port', '8200')[2])
         # a knob set to its default, or one this TP does not read, changes nothing
         self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '485376', '--reuse', '1', '--extra-args', '--top 5')[2])

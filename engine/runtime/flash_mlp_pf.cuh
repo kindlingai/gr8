@@ -121,11 +121,11 @@ __global__ void __launch_bounds__(WR * WC * 32) k_router_tile(const float* __res
 }
 
 // Router logits y [M][N] = x [M][K] FP32 . w [N][K] BF16 (0-ULP vs flash_mlp::k_linear); k_linear_mr below 64 rows or
-// with GR8_PF_ROUTER1=1. 9216 rows x 288 x 4096 on one GB10: k_linear_mr 16.3 ms, k_router_tile<8,16,2,2,8> 2.5 ms.
+// with GR8_GLM53F_PF_ROUTER1=1. 9216 rows x 288 x 4096 on one GB10: k_linear_mr 16.3 ms, k_router_tile<8,16,2,2,8> 2.5 ms.
 template <int R = 8, int C = 16, int WR = 2, int WC = 2, int KC = 8>
 inline void launch_router(const float* x, const uint16_t* w, float* y, int K, int N, int M, cudaStream_t st)
 {
-    const bool old = knob::pf_router1();
+    const bool old = knob::glm53f_pf_router1();
     if (old || M < 64 || K % (32 * KC) || K % 8)   // small M: one CTA row tile per 16 rows idles most lanes
     {
         constexpr int MR = 4;
@@ -185,7 +185,7 @@ inline bind::Tensor as_bind_tensor(const TensorRef& r)
 
 // Populate bindp::Tensors for layer i from m.layers[i].flash_mlp_w (and optional Find).
 // Makes exact FP8 tile copies for dense gate/up/down
-// and optional shared-expert FP8 copies (GR8_PF_SHFP8=1; default 0 on the fp16 expert body, 1 with GR8_PF_MOE8=1).
+// and optional shared-expert FP8 copies (GR8_GLM53F_PF_SHFP8=1; default 0 on the fp16 expert body, 1 with GR8_PF_MOE8=1).
 inline void bind_layer_tensors(Model& m, int i, const Find* find, cudaStream_t st, bindp::Tensors& bt)
 {
     Layer& y = m.layers[i];
@@ -222,11 +222,11 @@ inline void bind_layer_tensors(Model& m, int i, const Find* find, cudaStream_t s
             bt.t[bindp::T_ROUTER_BIAS].shape[0] = geom::NEXP;
         }
         // default off: the FP8 copy quantizes the shared expert's activations, the fp16 trellis pass matches decode
-        const bool shfp8 = knob::pf_shfp8().value_or(knob::pf_moe8());
+        const bool shfp8 = knob::glm53f_pf_shfp8().value_or(knob::pf_moe8());
         if (shfp8 && !y.T.shfp8.codes[0] && !y.T.fc1_wide && !y.T.fc2_wide)
             if (const char* e = bind::make_shared_fp8(y.T, st))
                 die("layer " + std::to_string(y.l) + ": " + e);
-        const bool wide = !knob::pf_nowide();
+        const bool wide = !knob::glm53f_pf_nowide();
         if (wide && !y.T.fc1_wide)
         {
             bind::widen_fc1(y.T, st);
@@ -324,7 +324,7 @@ inline void bind_mlp_prefill(Model& m, Prefill& P, cudaStream_t st)
         }
 }
 
-// GR8_PF_SP_FIND (FlashPrefill only): the MoE final sum writes its rows straight into the reduce-scatter send slot
+// GR8_GLM53F_PF_SP_FIND (FlashPrefill only): the MoE final sum writes its rows straight into the reduce-scatter send slot
 template <class Pf> auto pf_fin_rs(Pf& p, int) -> decltype(p.fin_rs, (const bindp::RsOut*)nullptr) { return p.fin_rs.base ? &p.fin_rs : nullptr; }
 template <class Pf> const bindp::RsOut* pf_fin_rs(Pf&, long) { return nullptr; }
 template <class Prefill>
@@ -350,7 +350,7 @@ inline void pf_mlp_block_gemm(Model& m, Prefill& P, int i, int M, cudaStream_t s
             S.bf16_out = dmalloc<float>(static_cast<size_t>(P.MP) * HID);
             if (cublasCreate(&S.blas) != CUBLAS_STATUS_SUCCESS) die("flash_mlp_pf: cublasCreate failed");
         }
-        const bool exact = knob::pf_bf16_exact();
+        const bool exact = knob::glm53f_pf_bf16_exact();
         if (exact)
         {
             flash_mlp::k_dense_gate<<<dim3((w.I + 7) / 8, M), 256, 0, st>>>(P.xn2, w.gate, w.up, S.bf16_act, w.I);

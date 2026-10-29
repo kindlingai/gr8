@@ -1,4 +1,4 @@
-// GR8_FLASH_CACHE on a group lease (--kv-store ...,group=; s2/flash_checkpoint.cuh share_ask / share_report / apply, D-331
+// GR8_GLM53F_CACHE on a group lease (--kv-store ...,group=; s2/flash_checkpoint.cuh share_ask / share_report / apply, D-331
 // M8 (c)) against a loopback KV node with 2 MiB segments, one GPU, a small geometry (2 bindings, 16 pages, 2 KDA layers).
 //   usage: flash_ckpt_group_test remote:HOST:PORT
 //   (node: kvman-remote --gb 0.05 --seg-mb 2 --margin-s 0 --port 0 --bind 127.0.0.1 --min-free-gb 0 --no-lock --no-rdma)

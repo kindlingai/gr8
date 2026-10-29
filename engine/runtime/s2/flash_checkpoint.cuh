@@ -1,4 +1,4 @@
-// Flash session checkpoints (GR8_FLASH_CACHE), the device half: the copies between a Flash rank's state and one block
+// Flash session checkpoints (GR8_GLM53F_CACHE), the device half: the copies between a Flash rank's state and one block
 // store (g6kv_tier: mem:, an SSD file, or a lease on a KV node). flash_checkpoint.h has the index, the manifest and why
 // a checkpoint is exact.
 //

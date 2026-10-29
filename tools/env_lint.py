@@ -93,7 +93,7 @@ def bare_reads(paths, table):
         bad = [RS_READ if rust else C_READ] + ([] if TEST.search(f) else [RS_SET if rust else C_SET])
         for m in (m for b in bad for m in b.finditer(body)):
             errs.append(f'{f}:{line_of(body, m.start())}: `{m.group(0).strip()}` uses the environment around the knob '
-                        f'table: use the knob (engine/knobs-rs/src/table.rs)')
+                        f'table: use the knob (knobs/README.md)')
         if TEST.search(f):
             continue
         for s in strings:

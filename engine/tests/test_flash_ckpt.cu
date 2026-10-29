@@ -1,4 +1,4 @@
-// GR8_FLASH_CACHE's device half (s2/flash_checkpoint.cuh) on one GPU, Flash's TP=2 geometry: 12 bindings of 64 x 1024 B
+// GR8_GLM53F_CACHE's device half (s2/flash_checkpoint.cuh) on one GPU, Flash's TP=2 geometry: 12 bindings of 64 x 1024 B
 // latent rows and 40,960 B of indexer keys a page, and the KDA state of 34 layers x 2 slots x 32 heads.
 //   usage: test_flash_ckpt STORE...   (mem:, ssd:FILE, remote:HOST:PORT; the corruption cases need ssd:)
 // For each store: a checkpoint survives poisoning every device byte (pages and KDA state come back bit for bit, the rows

@@ -37,7 +37,7 @@ fn reader(k: Kind) -> &'static str {
 pub fn header() -> String {
     let mut h = format!(
         r#"#pragma once
-// Written by `cargo run --manifest-path engine/knobs-rs/Cargo.toml --bin knobs -- gen` from engine/knobs-rs/src/table.rs:
+// Written by `cargo run --manifest-path engine/knobs-rs/Cargo.toml --bin knobs -- gen` from the knobs/ YAML files:
 // change the table, not this file. docs/ENV.md describes every knob.
 //
 // knob::name() returns the value of GR8_NAME: its default when unset, or an optional for a knob without one. The value
@@ -52,6 +52,7 @@ pub fn header() -> String {
 extern "C" {{
 int gr8_knobs_init(uint64_t table_hash);
 const char* gr8_knobs_signature(void);
+const char* gr8_knobs_tests_set(void);
 int gr8_knob_flag(uint32_t id, uint32_t n, int* out);
 int gr8_knob_int(uint32_t id, uint32_t n, int64_t* out);
 int gr8_knob_float(uint32_t id, uint32_t n, double* out);
@@ -69,6 +70,9 @@ inline int init() {{ return gr8_knobs_init(0x{:016x}ull); }}
 
 /// The set agree-scope knobs that differ from their defaults, as " env NAME=value ...", or "".
 inline std::string signature() {{ return gr8_knobs_signature(); }}
+
+/// The test knobs that are set, as GR8_TEST_ names joined by spaces, or "". A serving engine refuses to start with any.
+inline std::string tests_set() {{ return gr8_knobs_tests_set(); }}
 
 namespace detail
 {{
@@ -140,7 +144,8 @@ pub fn env_md() -> String {
     let mut out = String::from(
         "# Engine environment
 
-Every setting the engine, its tests and its build read from the environment, from `engine/knobs-rs/src/table.rs`.
+Every setting the engine, its tests and its build read from the environment, from the YAML files in
+[knobs/](../knobs/README.md).
 `knobs gen` writes this page: change the table, not this page. [SETTINGS.md](SETTINGS.md) explains how the main ones
 work together, and `./gr8 knobs` lists the launcher options that set them.
 
@@ -163,7 +168,7 @@ Types: flag is 0 or 1, int is decimal or 0x hex, ints and floats are comma lists
         (
             Scope::Test,
             "Tests and benchmarks",
-            "Read by test programs, audits and benchmarks, never by a serving engine.",
+            "Read by test programs, audits and benchmarks. `g6m4 --serve` refuses to start while one is set.",
         ),
         (Scope::Outside, "Build and launcher", "Read by the build or the launcher, never by the engine."),
     ] {

@@ -448,7 +448,7 @@ inline cudaError_t init()
 inline void split_for(int K, int side, int epi, int rot, int M, int& ks, int& sub)
 {
     ks = 4; sub = 1;
-    // a k1,s1[,k4,s4] list (GR8_DSA_QB_SPLIT, GR8_DSA_OPROJ_SPLIT, GR8_KDA_OPROJ_SPLIT): at 1 row k1, s1; at more rows
+    // a k1,s1[,k4,s4] list (GR8_GLM53F_DSA_QB_SPLIT, GR8_GLM53F_DSA_OPROJ_SPLIT, GR8_GLM53F_KDA_OPROJ_SPLIT): at 1 row k1, s1; at more rows
     // k4 (else k4_unset) and s4 (else 1). A list of fewer than two numbers keeps the split.
     auto take = [&](const std::optional<std::vector<int64_t>>& l, int k4_unset) {
         if (!l || l->size() < 2) return;
@@ -460,19 +460,19 @@ inline void split_for(int K, int side, int epi, int rot, int M, int& ks, int& su
     else if (side == SIDE_OUT && K == geom::QA)
     {
         ks = geom::QA / 128;         // q_b (16 on GLM, 12 on Flash)
-        take(knob::dsa_qb_split(), ks);
+        take(knob::glm53f_dsa_qb_split(), ks);
     }
     else if (side == SIDE_IN && K == 8192 && geom::HID == 4096)
     {
         ks = 4;
-        take(knob::dsa_oproj_split(), 4);
+        take(knob::glm53f_dsa_oproj_split(), 4);
     }
     else if (!rot) { ks = M <= 3 ? K / 128 : K / 256; sub = M <= 3 ? 1 : 2; }
     else if (side == SIDE_OUT) ks = K % 3 == 0 ? 6 : 16;                     // gate/up alone (K 6144) or Flash KDA q/k/v (K 4096)
     else if (K >= 4096)
     {
         ks = M == 1 ? (K == 8192 ? 4 : (geom::HID == 4096 ? 8 : 32)) : 4;
-        if (K == 4096 && geom::HID == 4096) take(knob::kda_oproj_split(), 4);
+        if (K == 4096 && geom::HID == 4096) take(knob::glm53f_kda_oproj_split(), 4);
     }
     else ks = K % 3 == 0 ? (M <= 3 ? 24 : 3) : (M <= 3 ? 16 : 4);            // down with its own rotation or Flash TP4 KDA o_proj
 }

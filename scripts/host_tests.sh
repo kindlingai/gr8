@@ -186,7 +186,7 @@ g++ -std=c++17 -O2 -Wall -DG6_MODEL_FLASH=0 "$REPO/engine/tests/test_flash_s2_co
 python3 "$REPO/engine/tests/test_flash_serve_check.py"
 # Flash serve prefill: the draft cache fill checks the error words once, after its last chunk; every error still fails the request.
 python3 "$REPO/engine/tests/test_flash_serve_prefill_check.py"
-# Flash prefill non-kernel span (NK): GR8_PF_PREWARM source check, GR8_PF_STAGE_ASYNC source check + schedule hazard model.
+# Flash prefill non-kernel span (NK): GR8_GLM53F_PF_PREWARM source check, GR8_GLM53F_PF_STAGE_ASYNC source check + schedule hazard model.
 python3 -m unittest "$REPO/engine/runtime/tests/test_pf_prewarm.py" "$REPO/engine/runtime/tests/test_pf_stage_async.py"
 g++ -std=c++17 -O2 -Wall "$REPO/engine/runtime/tests/pf_peer_stage_test.cpp" -o "$T/pf_peer_stage_test" "${KNOBS[@]}"
 "$T/pf_peer_stage_test"
@@ -197,12 +197,12 @@ for t in test_flash_route_split test_flash_route_split_tp4 test_flash_route_spli
   "$T/$t"
 done
 python3 "$REPO/engine/tests/test_flash_route_split_source.py"
-# Flash session checkpoints (GR8_FLASH_CACHE): aligned points, the index's match/LRU/first-fit, the manifest seal.
+# Flash session checkpoints (GR8_GLM53F_CACHE): aligned points, the index's match/LRU/first-fit, the manifest seal.
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/tests/test_flash_ckpt_index.cpp" -o "$T/test_flash_ckpt_index" "${KNOBS[@]}"
 "$T/test_flash_ckpt_index"
-# GR8_FLASH_CACHE=terminal: the actual retain hook against CPU mocks (rows, ring slot, tokens, nothing kept).
+# GR8_GLM53F_CACHE=terminal: the actual retain hook against CPU mocks (rows, ring slot, tokens, nothing kept).
 python3 "$REPO/engine/tests/test_flash_terminal_retain.py"
-# GR8_FLASH_CACHE=terminal, a cancel at the boundary the aligned capture waits for: flash_native.cuh's own hooks through
+# GR8_GLM53F_CACHE=terminal, a cancel at the boundary the aligned capture waits for: flash_native.cuh's own hooks through
 # the real Service on two ranks; the entry stays aligned and a longer prompt keeps its own aligned checkpoint
 python3 "$REPO/engine/tests/test_flash_terminal_cancel.py"
 # the adaptive draft length decision, and the top-k selection

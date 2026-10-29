@@ -1,4 +1,4 @@
-"""CPU source check of GR8_PF_PREWARM: default ON at NR=2 (=0 kills it), call sites follow the lane builds, the helper makes only the lazy-state calls."""
+"""CPU source check of GR8_GLM53F_PF_PREWARM: default ON at NR=2 (=0 kills it), call sites follow the lane builds, the helper makes only the lazy-state calls."""
 from pathlib import Path
 import re
 import unittest
@@ -10,7 +10,7 @@ class PrewarmTest(unittest.TestCase):
     def test_helper_is_gated_and_minimal(self):
         src = (RT / 'flash_prefill.cuh').read_text()
         env = src.split('inline bool pf_prewarm_env()', 1)[1].split('\n}\n', 1)[0]
-        self.assertIn('return knob::pf_prewarm().value_or(g6nr::NR == 2);', env)   # set: its value; unset: on at TP2 only
+        self.assertIn('return knob::glm53f_pf_prewarm().value_or(g6nr::NR == 2);', env)   # set: its value; unset: on at TP2 only
         body = src.split('inline void pf_prewarm_flash', 1)[1].split('\n}\n', 1)[0]
         self.assertTrue(body.lstrip().startswith('(Model& m, FlashPrefill& P, cudaStream_t st)'))
         self.assertIn('if (!pf_prewarm_env() || !P.MP) return;', body)

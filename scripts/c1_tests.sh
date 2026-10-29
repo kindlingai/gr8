@@ -141,12 +141,12 @@ if [ "$TEST" = all ] || [ "$TEST" = kv_resize_test ]; then
   fi
 fi
 if [ "$TEST" = all ] || [ "$TEST" = flash_kv_chunks_test ]; then
-  # the Flash KV caches in chunks (GR8_FLASH_KV_CHUNKS, runtime/flash_kv.h): the Flash attention, the ledger's library
+  # the Flash KV caches in chunks (GR8_GLM53F_KV_CHUNKS, runtime/flash_kv.h): the Flash attention, the ledger's library
   [ "$TEST" = all ] && ARGS=()
   KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
   if why=$(kvlib_ready); then
     GLM_FLAGS="$FLAGS"; FLAGS="$FLAGS -DG6_MODEL_FLASH=1"
-    KVMAN_LEDGER="$REPO/engine/kvman-rs/target/release/kvman-ledger" build_run flash_kv_chunks_test "$REPO/engine/attn/flash_attn.cu" "$REPO/engine/attn/flash_bind.cu" "$REPO/engine/attn/ops_flash.cu" "$REPO/engine/attn/kvchunks.cu" "$KVLIB" -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    GR8_TEST_KVMAN_LEDGER="$REPO/engine/kvman-rs/target/release/kvman-ledger" build_run flash_kv_chunks_test "$REPO/engine/attn/flash_attn.cu" "$REPO/engine/attn/flash_bind.cu" "$REPO/engine/attn/ops_flash.cu" "$REPO/engine/attn/kvchunks.cu" "$KVLIB" -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
     FLAGS="$GLM_FLAGS"
   else
     echo "SKIP flash_kv_chunks_test: $why"

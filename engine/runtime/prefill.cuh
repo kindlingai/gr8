@@ -1742,17 +1742,17 @@ __global__ void __launch_bounds__(256) k_pf_hash(const uint32_t* w, size_t n, un
     if ((threadIdx.x & 31) == 0) atomicAdd(out, s);
 }
 
-// GR8_PF_RESDUMP=<dir> (measurement only; after the stream is synchronized and pf_finish): the sub-batch's FP32
+// GR8_TEST_PF_RESDUMP=<dir> (measurement only; after the stream is synchronized and pf_finish): the sub-batch's FP32
 // residual rows -> <dir>/resid.s<seq>.p<first position>.f32, [M][6144] (QO-INTEGRATION.md gate a)
 inline void pf_resdump(Prefill& P, int M, size_t seq, int first)
 {
-    const std::optional<std::string>& d = knob::pf_resdump();
+    const std::optional<std::string>& d = knob::test_pf_resdump();
     if (!d) return;
     std::vector<float> r((size_t)M * HID);
     G6RT_CK(cudaMemcpy(r.data(), P.resid, r.size() * 4, cudaMemcpyDeviceToHost));
     const std::string f = *d + "/resid.s" + std::to_string(seq) + ".p" + std::to_string(first) + ".f32";
     FILE* o = fopen(f.c_str(), "wb");
-    if (!o || fwrite(r.data(), 4, r.size(), o) != r.size()) die("GR8_PF_RESDUMP: cannot write " + f);
+    if (!o || fwrite(r.data(), 4, r.size(), o) != r.size()) die("GR8_TEST_PF_RESDUMP: cannot write " + f);
     fclose(o);
 }
 #if defined(G6_CP) && G6_CP
@@ -2064,7 +2064,7 @@ inline unsigned long long cp_pf_mismatches(Model& m)
     return c;
 }
 // the local half of begin(layer i): the pages below start this rank holds -> its pool k, the ones the rows tier released
-// from the store (CpState::rt_stage). m4sim's GR8_CP_PF_NET runs it too, then copies each rank's tail pages as the proxy
+// from the store (CpState::rt_stage). m4sim's GR8_TEST_CP_PF_NET runs it too, then copies each rank's tail pages as the proxy
 // would, so the staging code it tests is this one.
 inline void cp_pf_fill_local(Model& m, int i, int start, unsigned* err, cudaStream_t st)
 {
