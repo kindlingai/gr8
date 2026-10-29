@@ -45,8 +45,8 @@ if [ "$WHAT" = dfl ]; then
   nice -n 19 $NVCC -O3 -std=c++17 $GEN -c $ATTN_CU -o $O/attn.o
   nice -n 19 $NVCC -O3 -std=c++17 $GEN -c $ATTN_BIND_CU -o $O/attn_bind.o
   nice -n 19 $NVCC -O3 -std=c++17 $GEN -c $ATTN_OPS_CU -o $O/attn_ops.o
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dfltest dfltest.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dflreplay dflreplay.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $O/g6pack.o $O/devimage.o -lcublas -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dfltest dfltest.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $KVC $O/g6pack.o $O/devimage.o -lcublas -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/dflreplay dflreplay.cu $O/attn.o $O/attn_bind.o $O/attn_ops.o $KVC $O/g6pack.o $O/devimage.o -lcublas -lpthread
   ls -la $OUT/dfltest $OUT/dflreplay
   cache_counts
   exit 0
@@ -131,13 +131,13 @@ inst() {   # inst <bin> <width>: $O/<bin>.w<width>.i.o, the width's instance of 
 if [ "$WHAT" != g6 ]; then
   I=""
   for n in $WIDTHS; do inst m4sim $n; I="$I $O/m4sim.w$n.i.o"; done
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -DM4SIM -o $OUT/m4sim widths.cpp $I $O/g6pack.o $O/devimage.o $KVC $RSLINK $KVLIB -ldl -lm -lcublas -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -DM4SIM -o $OUT/m4sim widths.cpp $I $O/g6pack.o $O/devimage.o $KVC $RSLINK $KVLIB -ldl -lm -lcublas -lcublasLt -lpthread
   ls -la $OUT/m4sim
 fi
 if [ "$WHAT" != sim ]; then
   I=""
   for n in $WIDTHS; do inst g6m4 $n; I="$I $O/g6m4.w$n.i.o"; done
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN $GRDEF -o $OUT/g6m4 widths.cpp $I $O/fabric.o $O/g6pack.o $O/devimage.o $KVC $GRLINK $RSLINK $KVLIB -ldl -lm -lcublas -libverbs -lpthread
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN $GRDEF -o $OUT/g6m4 widths.cpp $I $O/fabric.o $O/g6pack.o $O/devimage.o $KVC $GRLINK $RSLINK $KVLIB -ldl -lm -lcublas -lcublasLt -libverbs -lpthread
   if [ -n "$GRDEF" ]; then echo "g6m4: request grammars (XGrammar) linked"; fi
   if [ -n "$RSDEF" ]; then echo "g6m4: Rust pack loader linked"; else echo "g6m4: no $RSLIB, C++ pack loader only"; fi
   ls -la $OUT/g6m4

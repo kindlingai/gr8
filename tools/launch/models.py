@@ -1,4 +1,5 @@
-"""The models ./gr8 serves, and what the launcher does differently for each. GR8_MODEL picks one; ./gr8 <name> sets it."""
+"""The models ./gr8 serves, and what the launcher does differently for each. GR8_MODEL picks one; ./gr8 <name> sets it.
+Nothing picks one for the runner. `./gr8 models` (this file run) lists each model and the values its options take."""
 import json
 import os
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ class ModelMismatch(Exception):
 @dataclass(frozen=True)
 class Model:
     name: str
+    title: str                  # the model's own name, for messages and ./gr8 models
+    release: str                # its published exlr8 release, for help text only: --model always names the release
     engine: str                 # bin/<engine>, built by `./gr8 <name> build` (scripts/build.sh MODEL=<build>)
     build: str
     tp: tuple                   # the TP sizes the engine is built for
@@ -34,26 +37,30 @@ class Model:
 # release from before it boots down1. home's experts take 99.8 GB of a rank at TP=3, which leaves no room for the KV
 # pool on a 128 GB box. At TP=4 home stays: bit325 lowers KL by 1.5-7% at home's size but decoded ~2.5% slower in
 # three boots each.
-GLM53 = Model('glm53', 'g6m4', 'glm', ('4', '6', '3', '5'),
+GLM53 = Model('glm53', 'GLM-5.3', 'https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4', 'g6m4', 'glm',
+              ('4', '6', '3', '5'),
               {'home': 3.25, 'down1': 2.25, 'up1': 4.0,
                'bit225': 2.25, 'bit243': 2.43, 'bit260': 2.60, 'bit325': 3.25, 'bit338': 3.38},
               {3: ('bit225', 'down1')}, 'gr8-glm53', 'GlmMoeDsaForCausalLM', True, True, False)
 # GLM-5.3-Flash: uniform-width releases, K4 by default.
-GLM53F = Model('glm53f', 'g6m4_flash', 'flash', ('4', '3', '2'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},
+GLM53F = Model('glm53f', 'GLM-5.3-Flash', 'https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4',
+               'g6m4_flash', 'flash', ('4', '3', '2'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},
                {2: ('k4',), 3: ('k4',), 4: ('k4',)}, 'gr8-glm53f', 'Glm5NextForConditionalGeneration', False, False, True)
 # The pseudo engine (frontend/pseudo-engine): GLM-5.3's tokens and chat template, answers from a TOML file of rules, on
 # a CPU. Its release is a directory with responses.toml and the tokenizer files.
-PSEUDO = Model('pseudo', 'g6pseudo', 'pseudo', ('1', '2', '3', '4'), {}, {}, 'gr8-pseudo', 'GlmMoeDsaForCausalLM',
-               False, False, False, fabric=False)
+PSEUDO = Model('pseudo', 'the pseudo engine', '', 'g6pseudo', 'pseudo', ('1', '2', '3', '4'), {}, {}, 'gr8-pseudo',
+               'GlmMoeDsaForCausalLM', False, False, False, fabric=False)
 MODELS = {m.name: m for m in (GLM53, GLM53F, PSEUDO)}
 
 
+# The models a runner names. pseudo, the test engine, is served when named but left out of the lists.
+SERVED = (GLM53, GLM53F)
+CHOICES = ' or '.join(f'{m.name} ({m.title})' for m in SERVED)
+
+
 def of(o):
-    """The Model the options select (GR8_MODEL, default glm53)."""
-    name = o.get('GR8_MODEL') or GLM53.name
-    if name not in MODELS:
-        raise KeyError(name)
-    return MODELS[name]
+    """The Model the options select: GR8_MODEL, which has no default (options.validate refuses a boot without it)."""
+    return MODELS[o.get('GR8_MODEL')]
 
 
 def check_config(model, directory):
@@ -68,3 +75,23 @@ def check_config(model, directory):
         want = next((m.name for m in MODELS.values() if m.architecture == arch), None)
         hint = f': ./gr8 {want} serves it' if want else ''
         raise ModelMismatch(f'{path} is {arch}, and ./gr8 {model.name} serves {model.architecture}{hint}')
+
+
+def describe(m):
+    """What `./gr8 models` prints for m: the name to give and the values the model's options take."""
+    defaults = ', '.join(f'TP={tp} ' + ' else '.join(m.default_variant.get(int(tp), ('home',))) for tp in m.tp)
+    extra = [o for o, on in (('--drafter URL (DFlash2)', m.drafter), ('--kv-format int4', m.int4_kv),
+                             ('--default-reasoning-effort none', m.thinking_off)) if on]
+    return '\n'.join([f'{m.name:7} {m.title}: ./gr8 {m.name} <command>, or GR8_MODEL={m.name}',
+                      f'        --model    an exlr8 release of {m.architecture} (config.json `architectures`), such as',
+                      f'                   {m.release}',
+                      f'        --tp       {m.tp_sizes}',
+                      f'        --variant  {", ".join(m.variants)}',
+                      f'                   by default {defaults}',
+                      *([f'        also       {", ".join(extra)}'] if extra else [])])
+
+
+if __name__ == '__main__':
+    print('\n\n'.join(describe(m) for m in SERVED))
+    print('\nKNOBS.md lists every option. The pseudo engine (./gr8 pseudo, no GPU) is for tests: '
+          'frontend/pseudo-engine.')

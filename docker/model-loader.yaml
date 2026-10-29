@@ -1,0 +1,47 @@
+# gr8 with the box's model-loader (github.com/kindlingai/model-loader) fetching the weights: add this file to
+# compose.yaml.
+#
+#   docker compose -f docker/compose.yaml -f docker/model-loader.yaml up -d
+#
+# model-loader runs next to gr8 on every box, from its own deploy tree: deploy/compose (docker-compose.yml, as a
+# container) or deploy/spark-os (model-loader.service, on kindling-spark-os). Either keeps its store in one host
+# directory, MODEL_LOADER_STORE (default /var/lib/model-loader), with its local request API as the socket
+# model-loader.sock in it. This file mounts that directory read-only, so gr8 reads its weights in place and cannot
+# write the store, points the launcher at the store and the socket, and starts gr8 once the socket answers.
+#
+# With model-loader's own deploy/compose instead: set MODEL_LOADER_STORE to the same host directory there, so both
+# containers see one store (its default is a named volume of that project).
+#
+# RULE (as compose.yaml's): no option default lives here, only the container's paths and the switch to model-loader.
+services:
+  gr8:
+    environment:
+      # The store, where the launcher reads the release in place (MODEL_CACHE is the store with FETCH=model-loader),
+      # and model-loader's local API in it.
+      - FETCH=model-loader
+      - MODEL_CACHE=/var/lib/model-loader
+      - MODEL_LOADER=unix:/var/lib/model-loader/model-loader.sock
+    volumes:
+      # Read-only: model-loader alone writes the store. gr8 still opens the socket in it, which a read-only mount
+      # allows. The socket is mode 0660 in model-loader's group: run model-loader in group 1000, gr8's (its
+      # deploy trees do).
+      - ${MODEL_LOADER_STORE:-/var/lib/model-loader}:/var/lib/model-loader:ro
+    depends_on:
+      model-loader-ready:
+        condition: service_completed_successfully
+
+  # Exits 0 once the box's model-loader answers on its socket. gr8 starts then. Compose cannot wait on a systemd unit
+  # or another project's service, so it waits on this.
+  model-loader-ready:
+    image: ${MODEL_LOADER_IMAGE:-ghcr.io/kindlingai/model-loader:latest}
+    user: "1000:1000"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - until model-loader -check unix:/var/lib/model-loader/model-loader.sock; do sleep 2; done
+    volumes:
+      - ${MODEL_LOADER_STORE:-/var/lib/model-loader}:/var/lib/model-loader:ro

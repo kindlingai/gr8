@@ -6,7 +6,7 @@ operator selects one. Loading a profile leaves requests stock until they select 
 
 ## Load a profile
 
-Keep the normal [Quick start](../README.md#quick-start) model, topology and server options. With a self-contained HF
+Keep the normal [deploy](DEPLOY.md) model, topology and server options. With a self-contained HF
 exlr8 release, add these options on every rank:
 
 ```sh

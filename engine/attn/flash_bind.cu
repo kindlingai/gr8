@@ -186,6 +186,46 @@ extern "C" int g6a_bind_reset(G6AttnBinding* b, void* s) {
     if (e == cudaSuccess) e = cudaMemsetAsync(a.error, 0, sizeof(unsigned), stream);
     return (int)e;
 }
+// g6a_bind_reset with the latent and index caches cleared on pages [0, pages) only (the identity table: rows
+// [0, pages * PAGE)); the caller keeps every later page zero (Flash serve: the pages no step wrote since a clear)
+extern "C" int g6a_bind_reset_pages(G6AttnBinding* b, int pages, void* s) {
+    if (!b || !b->storage || pages < 0) return invalid;
+    // chunked caches (G6_FLASH_KV_CHUNKS): every backed granule, as g6a_bind_reset (a chunk that comes back reads as zero)
+    if (b->kv_chunks[0]) return g6a_bind_reset(b, s);
+    const G6Attn& a = b->args;
+    cudaStream_t stream = (cudaStream_t)s;
+    const size_t n = (size_t)(pages < a.page_count ? pages : a.page_count);
+    cudaError_t e = cudaMemsetAsync(a.mla_cache, 0, n * PAGE * g6kv::ROW, stream);
+    if (e == cudaSuccess) e = cudaMemsetAsync(a.index_cache, 0, n * g6kv::IDX_PAGE, stream);
+    if (e == cudaSuccess) e = cudaMemsetAsync(a.indices, 0xff, (size_t)b->max_rows * SEL * 4, stream);
+    if (e == cudaSuccess) e = cudaMemsetAsync(a.output, 0, (size_t)b->max_rows * a.heads * geom::V_HEAD * 2, stream);
+    if (e == cudaSuccess) e = cudaMemsetAsync(a.error, 0, sizeof(unsigned), stream);
+    return (int)e;
+}
+namespace {
+__global__ void k_nonzero16(const uint4* p, size_t n, unsigned* flag) {
+    unsigned v = 0;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        const uint4 x = p[i];
+        v |= x.x | x.y | x.z | x.w;
+    }
+    if (__syncthreads_or(v != 0) && threadIdx.x == 0) atomicOr(flag, 1u);
+}
+}
+// *flag |= 1 if any byte of the latent or index cache on pages [from, page_count) is not zero (a check, not a hot path)
+extern "C" int g6a_bind_check_clear(G6AttnBinding* b, int from, unsigned* flag, void* s) {
+    if (!b || !b->storage || from < 0 || !flag) return invalid;
+    if (b->kv_chunks[0]) return 0;   // chunked: reset_pages cleared every backed granule, and offline pages are not readable
+    const G6Attn& a = b->args;
+    cudaStream_t stream = (cudaStream_t)s;
+    if (from >= a.page_count) return 0;
+    const size_t pages = (size_t)(a.page_count - from);
+    k_nonzero16<<<1024, 256, 0, stream>>>((const uint4*)((const char*)a.mla_cache + (size_t)from * PAGE * g6kv::ROW),
+                                          pages * PAGE * g6kv::ROW / 16, flag);
+    k_nonzero16<<<1024, 256, 0, stream>>>((const uint4*)((const char*)a.index_cache + (size_t)from * g6kv::IDX_PAGE),
+                                          pages * g6kv::IDX_PAGE / 16, flag);
+    return (int)cudaGetLastError();
+}
 extern "C" int g6a_bind_release(G6AttnBinding* b) {
     if (!b) return invalid;
     cudaError_t e = b->storage ? cudaFree(b->storage) : cudaSuccess;

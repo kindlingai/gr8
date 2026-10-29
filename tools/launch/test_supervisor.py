@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """The supervisor's control port, a head that fails before its checks finish, the engine's environment and build id.
     python3 -m unittest discover -s tools/launch"""
+import fcntl
+import http.server
+import io
+import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -16,8 +21,11 @@ import handshake as H  # noqa: E402
 import options as opt  # noqa: E402
 import supervisor as S  # noqa: E402
 from test_handshake import hello  # noqa: E402
+from test_mentat import FakeDaemon, flipped, ring, solved  # noqa: E402
+import mentat as M  # noqa: E402
 
 MEMBERS = ['192.0.2.1', '192.0.2.2', '192.0.2.3', '192.0.2.4']    # TEST-NET: never this box's address
+GLM = {'GR8_MODEL': 'glm53'}   # the model: a boot names it (no default)
 
 
 def free_port():
@@ -29,7 +37,7 @@ def free_port():
 def supervisor(*argv, rank=0, members=MEMBERS):
     home = tempfile.mkdtemp()
     o = opt.parse(['--no-config', '--peers', ','.join(members), '--g6-home', home, '--control-port', str(free_port()),
-                   *argv], {})
+                   *argv], GLM)
     opt.validate(o)
     s = S.Supervisor(o)
     s.rank, s.members, s.lan, s.rails = rank, members, members[rank], ('192.0.2.101', '192.0.2.201')
@@ -44,6 +52,145 @@ class RingTests(unittest.TestCase):
         with mock.patch.object(S.fabric, 'rails', side_effect=AssertionError('no fabric discovery on a ring')):
             s.rendezvous(4)
         self.assertEqual((s.rank, s.rails), (2, (MEMBERS[2], MEMBERS[2])))
+
+
+class MentatRingTests(unittest.TestCase):
+    """--shape ring with mentat: every box claims the ring, gets the one view the head solved, and derives the same
+    ring and its own --ring-devs from it, whatever the cabling."""
+
+    def boot(self, n, cables, broken=(), extra=()):
+        view, ids, roots, addr = solved(n, cables, broken=broken)
+        agents, lock, holders = {}, threading.Lock(), {}
+
+        def group(_):
+            with lock:
+                return {'node_id': 'n1', 'peers': {}, 'groups': {'gr8-glm53': {'agents': {
+                    k: {f: x for f, x in v.items() if f != 'link'} for k, v in agents.items()}}}}
+
+        def on_link(h, alive, link):
+            with lock:
+                if alive:
+                    agents[h['agent_id']] = {'node_ip': h['node_ip'], 'node_id': f'n{h["node_ip"].rsplit(".", 1)[1]}',
+                                             'alive': True, 'machine': h['machine'], 'meta': h['meta'], 'link': link}
+                elif agents[h['agent_id']]['link'] is link:
+                    agents[h['agent_id']]['alive'] = False
+
+        def claim(h, link):
+            # the head: a claim solves once, and every later holder gets that view
+            with lock:
+                if h['shape']['sets'][0]['layout'] == 'any':
+                    return {'t': 'claim_ok', 'view': {'sets': {'ring': []}, 'links': view['links']}}
+                if broken:
+                    return {'t': 'err', 'code': 'unsolvable_claim', 'error': 'set "ring" wants a ring of 3 nodes'}
+                holders.setdefault(h['name'], []).append(link)
+                return {'t': 'claim_ok', 'name': h['name'], 'generation': 1, 'head_node_id': 'n1', 'view': view}
+        daemons = [FakeDaemon(group=group, local=lambda i=i: {'node_ip': f'10.0.0.{i + 1}', 'addr_tags': {}},
+                              on_link=on_link, claim=claim) for i in range(n)]
+        # the devices: port p of box i at root k is f{p}r{k}
+        devs = [{a: (f'f{k[1]}r{k[2]}', k[2]) for k, a in addr.items() if k[0] == i} for i in range(n)]
+        sups, res = [], [None] * n
+        elect = M.elect
+        try:
+            with mock.patch.object(S, 'log'), \
+                    mock.patch.object(S.fabric, 'ring_ports', lambda: devs[int(threading.current_thread().name)]), \
+                    mock.patch.object(S.mentat, 'elect', lambda *a, **k: elect(*a, **{**k, 'hold_s': 0.2,
+                                                                                    'ring_settle': 1.0})):
+                for i in range(n):
+                    o = opt.parse(['--no-config', '--mentat', f'127.0.0.1:{daemons[i].port}', '--tp', str(n),
+                                   '--shape', 'ring', '--g6-home', tempfile.mkdtemp(), '--join-timeout', '30',
+                                   *extra], GLM)
+                    opt.validate(o)
+                    s = S.Supervisor(o)
+                    sups.append(s)
+
+                def run(i):
+                    try:
+                        sups[i].rendezvous(n)
+                        res[i] = 'ok'
+                    except S.Stop as e:
+                        res[i] = e
+                ts = [threading.Thread(target=run, args=(i,), name=str(i)) for i in range(n)]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join(60)
+                self.holding = [s.claim_link.sock is not None for s in sups]
+                for s in sups:
+                    s.release_claim()
+                self.released = [s.claim_link.sock is None for s in sups]
+        finally:
+            for s in sups:
+                if s.agent:
+                    s.agent.stop()
+            for d in daemons:
+                d.close()
+        return sups, res
+
+    def test_three_and_four_boxes_on_any_cabling(self):
+        for n, order in ((3, [0, 2, 1]), (4, [0, 2, 1, 3])):
+            for cables in (ring(order), flipped(order)):
+                with self.subTest(n=n, cables=cables):
+                    sups, res = self.boot(n, cables)
+                    self.assertEqual(res, ['ok'] * n)
+                    self.assertEqual(self.holding, [True] * n)      # each box holds the claim until the handshake
+                    self.assertEqual(self.released, [True] * n)
+                    self.assertEqual(len({tuple(s.members) for s in sups}), 1)
+                    self.assertEqual(len({s.ring for s in sups}), 1)     # the handshake compares it
+                    self.assertIn(f' claim=gr8-glm53-ring{n}@n1:1', sups[0].ring)
+                    self.assertEqual(sups[0].members[0], '10.0.0.1')
+                    by_rank = sorted(sups, key=lambda s: s.rank)
+                    for s in by_rank:
+                        mine = s.ring_devs.split(',')
+                        self.assertEqual(s.rails, (s.lan, s.lan))
+                        # direct-next and direct-prev are root 1 of two different ports; the relay (TP=4) root 0 of
+                        # the same ports, and at TP=3, which opens no relay, the direct devices again
+                        self.assertEqual((mine[1][-2:], mine[3][-2:]), ('r1', 'r1'))
+                        self.assertNotEqual(mine[1][:2], mine[3][:2])
+                        relay = ('r0', 'r0') if n == 4 else ('r1', 'r1')
+                        self.assertEqual((mine[0][-2:], mine[2][-2:]), relay)
+                        self.assertEqual((mine[0][:2], mine[2][:2]), (mine[1][:2], mine[3][:2]))
+                        c, _, _ = opt.canonical(s.o, opt.engine_plan(s.o), None, ring=s.ring)
+                        self.assertEqual(c['ring'], by_rank[0].ring)
+
+    def test_the_engine_gets_the_found_devices_and_an_explicit_list_wins(self):
+        sups, res = self.boot(3, flipped([0, 1, 2]))
+        self.assertEqual(res, ['ok'] * 3)
+        s = sups[0]
+        self.assertEqual(s.ring_devs, 'f1r1,f1r1,f0r1,f0r1')       # its next box is on its f1 cable; TP=3: no relay
+        self.assertEqual(s.ring_args(), ['--ring', '--ring-devs', 'f1r1,f1r1,f0r1,f0r1'])
+        sups, res = self.boot(4, flipped([0, 1, 2, 3]))
+        self.assertEqual(res, ['ok'] * 4)
+        self.assertEqual(sups[0].ring_devs, 'f1r0,f1r1,f0r0,f0r1')
+        sups, res = self.boot(3, flipped([0, 1, 2]), extra=('--ring-devs', 'a,b,c,d'))
+        self.assertEqual(res, ['ok'] * 3)
+        self.assertIsNone(sups[0].ring_devs)
+        self.assertEqual(sups[0].ring_args(), ['--ring', '--ring-devs', 'a,b,c,d'])
+        # --peers: the engine's default devices, as before
+        self.assertEqual(supervisor('--shape', 'ring').ring_args(), ['--ring'])
+        self.assertEqual(supervisor().ring_args(), [])
+
+    def test_the_handshake_lets_the_claim_go_whatever_its_verdict(self):
+        for verdict in ({'t': 'ok'}, RuntimeError('head gone')):
+            for rank in (0, 1):
+                with self.subTest(verdict=verdict, rank=rank):
+                    s = supervisor('--shape', 'ring', rank=rank)
+                    s.claim_link = mock.Mock()
+                    which = 'handshake_head' if rank == 0 else 'handshake_worker'
+                    effect = {'side_effect': verdict} if isinstance(verdict, Exception) else {'return_value': verdict}
+                    with mock.patch.object(s, which, **effect):
+                        if isinstance(verdict, Exception):
+                            with self.assertRaises(RuntimeError):
+                                s.handshake({})
+                        else:
+                            self.assertEqual(s.handshake({}), verdict)
+                    s.claim_link.close.assert_called_once_with()
+
+    def test_a_broken_cable_stops_every_box(self):
+        sups, res = self.boot(3, ring([0, 1, 2]), broken={2})
+        for e in res:
+            self.assertIsInstance(e, S.Stop)
+            self.assertEqual(e.code, 4)
+            self.assertIn('no cable works between 10.0.0.1 and 10.0.0.3', str(e))
 
 
 class ControlPortTests(unittest.TestCase):
@@ -165,7 +312,7 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(s.engine_env({'env': [], 'args': []})['LD_LIBRARY_PATH'], os.path.join(s.home, 'bin', 'lib'))
 
     def test_g6_variables_in_the_environment_are_refused_by_name(self):
-        o = opt.parse(['--no-config', '--peers', ','.join(MEMBERS)], {'G6_S2_TIMEOUT': '300', 'G6_HOME': '/h',
+        o = opt.parse(['--no-config', '--peers', ','.join(MEMBERS)], {**GLM, 'G6_S2_TIMEOUT': '300', 'G6_HOME': '/h',
                                                                       'G6_CLUSTER': '/c', 'G6_NR': '4'})
         with self.assertRaises(opt.OptionError) as e:
             opt.validate(o)
@@ -191,8 +338,8 @@ class EngineTests(unittest.TestCase):
         os.makedirs(os.path.join(home, 'bin'))
         with open(os.path.join(home, 'bin', 'g6m4'), 'w') as f:
             f.write('fp8')
-        o8 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'], {})
-        o4 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--kv-format', 'int4'], {})
+        o8 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'], GLM)
+        o4 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--kv-format', 'int4'], GLM)
         self.assertEqual((S.engine_bin(o8), S.engine_bin(o4)), ('g6m4', 'g6m4-int4'))
         self.assertEqual(S.engine_build(home, S.engine_bin(o4)), 'missing', 'an fp8-only bin/ cannot run int4')
         with open(os.path.join(home, 'bin', 'g6m4-int4'), 'w') as f:
@@ -511,6 +658,165 @@ class SelfCheckTests(unittest.TestCase):
         self.assertEqual([x.get('ok') for x in a['ranks']], [True, True, False, True])
         self.assertIn('error', supervisor(rank=1).check_all())  # only the head gathers
 
+
+class HealthTests(unittest.TestCase):
+    """./gr8 <model> health: this box alone, exit 0 only while its own supervisor reports serving (and on the head,
+    while the API's /health answers 200), so compose and a Kubernetes exec probe can run it on every rank."""
+    def setUp(self):
+        import launch
+        self.L = launch
+        self.home = tempfile.mkdtemp()
+        self.out = os.path.join(self.home, 'out')
+        os.makedirs(self.out)
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+
+    def fake_supervisor(self):
+        """A process whose command line is a supervisor's (`launch.py supervise`), as health() checks in /proc."""
+        p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)',
+                              os.path.join(self.home, 'launch.py'), 'supervise'])
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        return p.pid
+
+    def write(self, state, rank, pid=None, supervisor=True):
+        """gr8.state as set_state writes it, and supervisor.pid as run() does."""
+        if pid is None:
+            pid = self.sup = getattr(self, 'sup', None) or self.fake_supervisor()
+        with open(os.path.join(self.out, 'gr8.state'), 'w') as f:
+            json.dump({'state': state, 'rank': rank, 'pid': pid, 'time': time.time()}, f)
+        if supervisor:
+            with open(os.path.join(self.out, 'supervisor.pid'), 'w') as f:
+                f.write(f'{pid}\n')
+
+    def api(self, code):
+        """A front end whose /health answers `code`; returns its port."""
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if code is None:                       # an answer that is not HTTP
+                    self.wfile.write(b'garbage\r\n\r\n')
+                    return
+                self.send_response(code if self.path == '/health' else 404)
+                self.end_headers()
+
+            def log_message(self, *_):
+                pass
+        srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def run_health(self, *argv):
+        """cmd_health through launch.main, as ./gr8 runs it: (exit status, the one line it printed)."""
+        with mock.patch('sys.stdout', new_callable=io.StringIO) as so:
+            rc = self.L.main(['health', '--no-config', '--g6-home', self.home, *argv])
+        return rc, so.getvalue()
+
+    def test_every_state_before_serving_is_not_ready(self):
+        for state in ('starting', 'preparing', 'handshake', 'joining', 'loading', 'stopping'):
+            self.write(state, 1 if state != 'starting' else None)
+            rc, line = self.run_health()
+            self.assertEqual(rc, 1, (state, line))
+            self.assertIn(state, line)
+            self.assertEqual(line.count('\n'), 1, line)
+
+    def test_a_worker_that_serves_is_ready(self):
+        self.write('serving', 2)
+        rc, line = self.run_health('--port', str(free_port()))     # a worker does not ask any API
+        self.assertEqual((rc, line), (0, f'rank 2: serving, supervisor pid {self.sup}\n'))
+
+    def test_the_head_serves_only_while_its_api_answers(self):
+        self.write('serving', 0)
+        rc, line = self.run_health('--port', str(self.api(200)))
+        self.assertEqual(rc, 0, line)
+        self.assertIn('API /health 200', line)
+        rc, line = self.run_health('--port', str(self.api(503)))
+        self.assertEqual(rc, 1, line)
+        self.assertIn('answers 503', line)
+        port = free_port()
+        rc, line = self.run_health('--port', str(port))
+        self.assertEqual(rc, 1, line)
+        self.assertIn(f'on port {port} answers nothing', line)
+
+    def test_the_head_asks_the_port_the_boot_agreed(self):
+        self.write('serving', 0)
+        with open(os.path.join(self.out, 'handshake.json'), 'w') as f:
+            json.dump({'t': 'ok', 'port': str(self.api(200)), 'rank': 0}, f)
+        self.assertEqual(self.run_health('--port', str(free_port()))[0], 0)
+
+    def test_a_failed_or_stopped_boot_is_not_ready(self):
+        for state in ('failed: engine exited (-9)', 'stopped'):
+            self.write(state, 1)
+            rc, line = self.run_health()
+            self.assertEqual(rc, 1, line)
+            self.assertIn(state, line)
+
+    def test_serving_written_by_a_supervisor_that_is_gone_is_not_ready(self):
+        p = subprocess.Popen([sys.executable, '-c', 'pass'])
+        p.wait()
+        self.write('serving', 1, pid=p.pid)                           # kill -9: no shutdown() rewrote the state
+        rc, line = self.run_health()
+        self.assertEqual(rc, 1, line)
+        self.assertIn('no supervisor runs (last state serving)', line)
+        other = self.fake_supervisor()
+        self.write('serving', 1, pid=other, supervisor=False)
+        with open(os.path.join(self.out, 'supervisor.pid'), 'w') as f:
+            f.write(f'{self.fake_supervisor()}\n')                 # another supervisor than the one that wrote it
+        self.assertEqual(self.run_health()[0], 1)
+
+    def test_a_live_pid_that_is_not_a_supervisor_is_not_ready(self):
+        self.write('serving', 1, pid=os.getpid())                     # pid reuse: the number now runs something else
+        rc, line = self.run_health()
+        self.assertEqual(rc, 1, line)
+        self.assertIn('no supervisor runs', line)
+
+    def test_without_proc_ps_tells_a_supervisor_from_another_process(self):
+        """macOS has no /proc: the command line comes from ps."""
+        no_proc = os.path.join(self.home, 'no-proc')
+        self.assertTrue(self.L.is_supervisor(self.fake_supervisor(), no_proc))
+        self.assertFalse(self.L.is_supervisor(os.getpid(), no_proc))
+
+    def test_a_clock_step_after_the_boot_does_not_make_it_unready(self):
+        self.write('serving', 1)
+        p = os.path.join(self.out, 'supervisor.pid')
+        os.utime(p, (time.time() - 3600,) * 2)    # NTP stepped back an hour: the file looks older than the process
+        self.assertEqual(self.run_health()[0], 0)
+
+    def test_an_http_proxy_in_the_environment_is_not_used(self):
+        """As docker runs it: a new process, with an HTTP_PROXY (docker's daemon proxies) that answers nothing."""
+        self.write('serving', 0)
+        env = {**os.environ, 'http_proxy': 'http://127.0.0.1:9', 'HTTP_PROXY': 'http://127.0.0.1:9', 'no_proxy': '',
+               'NO_PROXY': ''}
+        r = subprocess.run([sys.executable, self.L.HERE, 'health', '--no-config', '--g6-home', self.home, '--port',
+                            str(self.api(200))], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_an_answer_that_is_not_http_or_a_bad_port_is_one_line_not_a_traceback(self):
+        self.write('serving', 0)
+        rc, line = self.run_health('--port', str(self.api(None)))
+        self.assertEqual((rc, line.count('\n')), (1, 1), line)
+        self.assertIn('failed: ', line)
+        rc, line = self.run_health('--port', 'eighty')
+        self.assertEqual((rc, line.count('\n')), (1, 1), line)
+
+    def test_no_state_is_not_ready(self):
+        rc, line = self.run_health()
+        self.assertEqual((rc, line), (1, 'this box: not serving, no supervisor runs (last state none)\n'))
+
+    def test_bad_options_exit_1_not_docker_reserved_2(self):
+        rc, line = self.run_health('--no-such-option', 'x')
+        self.assertEqual(rc, 1)
+        self.assertIn('unknown option --no-such-option', line)
+
+    def test_it_takes_no_supervisor_lock(self):
+        self.write('serving', 1)
+        with open(os.path.join(self.out, 'supervisor.lock'), 'w') as lk:   # the supervisor holds it while it runs
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch.object(fcntl, 'flock', side_effect=AssertionError('took the lock')):
+                self.assertEqual(self.run_health()[0], 0)
+        os.unlink(os.path.join(self.out, 'supervisor.lock'))
+        self.assertEqual(self.run_health()[0], 0)
+        self.assertFalse(os.path.exists(os.path.join(self.out, 'supervisor.lock')), 'health created the lock file')
 
 if __name__ == '__main__':
     unittest.main()

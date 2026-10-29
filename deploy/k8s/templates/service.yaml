@@ -1,0 +1,23 @@
+# The OpenAI API on the leader, which is the head (lws.yaml). Not named after the LeaderWorkerSet, which owns a headless
+# Service with its own name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-api
+  labels:
+    app.kubernetes.io/name: gr8
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app.kubernetes.io/name: gr8
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    leaderworkerset.sigs.k8s.io/worker-index: "0"
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: api

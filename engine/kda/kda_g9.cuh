@@ -120,13 +120,12 @@ inline void launch_conv16(const G9Args& g, cudaStream_t st)
 // CTA (8-row block, head), warp per row; lane holds 4 consecutive v. y = o * r * onorm * sigm(z), r = 1 / sqrt(mean o^2
 // + eps) (fp32 shuffle sum). Writes exactly what out_2 writes minus OG: OF frag table (f2bf_rn) when a.OF, OH (f2h_rn)
 // when a.OH. Rows >= M are not touched.
-__global__ void __launch_bounds__(OUT_ROWS * 32) k_out16(G9Args g)
+__device__ __forceinline__ void out16_row(const G9Args& g, int m, int h, int lane, uint2 zv)
 {
     const Args& a = g.a;
-    const int dl = a.dl(), M = a.M, h = blockIdx.y, lane = threadIdx.x % 32, m = blockIdx.x * OUT_ROWS + threadIdx.x / 32;
-    if (m >= M) return;
+    const int dl = a.dl();
     const size_t i0 = static_cast<size_t>(m) * dl + h * DK + lane * 4;
-    const uint2 ov = *reinterpret_cast<const uint2*>(g.pl.p[O16] + i0), zv = *reinterpret_cast<const uint2*>(g.pl.p[Z16] + i0);
+    const uint2 ov = *reinterpret_cast<const uint2*>(g.pl.p[O16] + i0);
     const float o[4] = {bf2f(static_cast<uint16_t>(ov.x)), bf2f(static_cast<uint16_t>(ov.x >> 16)),
                         bf2f(static_cast<uint16_t>(ov.y)), bf2f(static_cast<uint16_t>(ov.y >> 16))};
     const float z[4] = {bf2f(static_cast<uint16_t>(zv.x)), bf2f(static_cast<uint16_t>(zv.x >> 16)),
@@ -149,6 +148,13 @@ __global__ void __launch_bounds__(OUT_ROWS * 32) k_out16(G9Args g)
         hw.y = hv[2] | (static_cast<uint32_t>(hv[3]) << 16);
         *reinterpret_cast<uint2*>(a.OH + i0) = hw;
     }
+}
+__global__ void __launch_bounds__(OUT_ROWS * 32) k_out16(G9Args g)
+{
+    const int M = g.a.M, h = blockIdx.y, lane = threadIdx.x % 32, m = blockIdx.x * OUT_ROWS + threadIdx.x / 32;
+    if (m >= M) return;
+    const size_t i0 = static_cast<size_t>(m) * g.a.dl() + h * DK + lane * 4;
+    out16_row(g, m, h, lane, *reinterpret_cast<const uint2*>(g.pl.p[Z16] + i0));
 }
 
 inline void launch_out16(const G9Args& g, cudaStream_t st)
@@ -251,11 +257,71 @@ __global__ void __launch_bounds__(256) k_gz16(G9Args g)
     }
 }
 
+// ------------------------------------------------------------------------------------------------------ GZF
+// G6_PF_KDA_GZF: no gz16 pass and no G16 / Z16 planes. K1 builds its tile's G16 values and k_out16z its tile's Z16 values
+// with gz_tile: gz16's A conversion (P fp32 -> pack_bf16, rows >= M zero), gz16's B fragments (f_b / g_b [channel][k],
+// read straight from global), the same mma16816 calls in the same k order per output and the same pack_bf16: the bits
+// gz16 stores. Tile = rows m0 .. m0 + 15 x head h's 128 channels; NW warps split its 16 n8 tiles.
+template <int NW>
+__device__ __forceinline__ void gz_tile(const Args& a, int mat, int m0, int h, uint16_t (*As)[GZ_PAD], uint16_t (*dst)[GZ_PAD], int t)
+{
+    const int ld = a.pl().ld(), M = a.M, col = mat ? a.pl().ga() : a.pl().fa();
+    const uint16_t* wsrc = (mat ? a.gb : a.fb) + static_cast<size_t>(h) * DK * DK;
+    for (int q = t; q < 16 * 32; q += NW * 32)
+    {
+        const int r = q / 32, c4 = q % 32;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (m0 + r < M) v = *reinterpret_cast<const float4*>(a.P + static_cast<size_t>(m0 + r) * ld + col + 4 * c4);
+        uint2 w;
+        w.x = pack_bf16(v.x, v.y); w.y = pack_bf16(v.z, v.w);
+        *reinterpret_cast<uint2*>(&As[r][4 * c4]) = w;
+    }
+    __syncthreads();
+    constexpr int TPW = 16 / NW;
+    const int warp = t / 32, lane = t % 32, gi = lane >> 2, ti = lane & 3;
+    float acc[TPW][4] = {};
+    for (int ks = 0; ks < 8; ++ks)
+    {
+        uint32_t af[4];
+        const int k0 = 16 * ks + 2 * ti;
+        af[0] = *reinterpret_cast<const uint32_t*>(&As[gi][k0]);
+        af[1] = *reinterpret_cast<const uint32_t*>(&As[gi + 8][k0]);
+        af[2] = *reinterpret_cast<const uint32_t*>(&As[gi][k0 + 8]);
+        af[3] = *reinterpret_cast<const uint32_t*>(&As[gi + 8][k0 + 8]);
+#pragma unroll
+        for (int j = 0; j < TPW; ++j)
+        {
+            const uint16_t* wr = wsrc + static_cast<size_t>((warp * TPW + j) * 8 + gi) * DK + k0;
+            mma16816(acc[j], af, __ldg(reinterpret_cast<const unsigned*>(wr)), __ldg(reinterpret_cast<const unsigned*>(wr + 8)));
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < TPW; ++j)
+    {
+        const int c = (warp * TPW + j) * 8 + 2 * ti;
+        *reinterpret_cast<uint32_t*>(&dst[gi][c]) = pack_bf16(acc[j][0], acc[j][1]);
+        *reinterpret_cast<uint32_t*>(&dst[gi + 8][c]) = pack_bf16(acc[j][2], acc[j][3]);
+    }
+    __syncthreads();
+}
+// GZF out16: CTA (16-row tile, head), 8 warps: the Z16 tile (gz_tile), then rows i and i + 8 per warp through out16_row
+__global__ void __launch_bounds__(256) k_out16z(G9Args g)
+{
+    __shared__ __align__(16) uint16_t As[16][GZ_PAD], Zs[16][GZ_PAD];
+    const int m0 = blockIdx.x * 16, h = blockIdx.y, t = threadIdx.x, warp = t / 32, lane = t % 32;
+    gz_tile<8>(g.a, 1, m0, h, As, Zs, t);
+    for (int i = warp; i < 16; i += 8)
+        if (m0 + i < g.a.M) out16_row(g, m0 + i, h, lane, *reinterpret_cast<const uint2*>(&Zs[i][lane * 4]));
+}
+
 // ------------------------------------------------------------------------------------------------------ K1
 // CTA (16-row tile, head), thread = channel d. Gate, fp32 cumsum down the 16 rows, pivot p = gc[7], the decay factors
 // (__expf = ex2.approx.ftz), bf16 operands. Warps: w & 1 selects L (kdp kip^T) or Mqk (qdp kip^T), w >> 1 the n8 half.
 // Rows >= M: kn = qn = 0, beta = 0, g = 0 (loads predicated, never dereferenced). Writes kd, qd, kr rows < M and the
 // full U block (pad rows are zeros). The "gt" slot of the block holds e^gt, which is exp(gc[15]) already in a register.
+// GZF: the G16 tile first (gz_tile, A in kdp, the values in qdp; thread d reads only column d of qdp, all of it before
+// it writes qdp[.][d], so the second loop may overwrite it)
+template <bool GZF = false>
 __global__ void __launch_bounds__(128) k_k1(G9Args g, Tape tp)
 {
     __shared__ __align__(16) uint16_t kdp[16][GZ_PAD], qdp[16][GZ_PAD], kip[16][GZ_PAD];
@@ -265,6 +331,7 @@ __global__ void __launch_bounds__(128) k_k1(G9Args g, Tape tp)
     const Args& a = g.a;
     const int dl = a.dl(), ld = a.pl().ld(), M = a.M, h = blockIdx.y, tile = blockIdx.x, d = threadIdx.x, ch = h * DK + d, m0 = tile * 16;
     const int n = M - m0 < 16 ? M - m0 : 16;
+    if constexpr (GZF) gz_tile<4>(a, 0, m0, h, kdp, qdp, d);
     if (d < 16) beta_s[d] = d < n ? sigm(a.P[static_cast<size_t>(m0 + d) * ld + a.pl().b() + a.h0 + h]) : 0.f;
     const float ea = expf(a.A_log[h]), dtb = a.dt_bias[ch];
     float kn[16], qn[16], gc[16];
@@ -276,7 +343,7 @@ __global__ void __launch_bounds__(128) k_k1(G9Args g, Tape tp)
         const bool v = i < n;
         kn[i] = v ? bf2f(g.pl.p[KN][o]) : 0.f;
         qn[i] = v ? bf2f(g.pl.p[QN][o]) * QSCALE : 0.f;
-        acc += v ? GATE_LO * sigm(ea * (bf2f(g.pl.p[G16][o]) + dtb)) : 0.f;
+        acc += v ? GATE_LO * sigm(ea * (bf2f(GZF ? qdp[i][d] : g.pl.p[G16][o]) + dtb)) : 0.f;
         gc[i] = acc;
     }
     const float gt = gc[15], pv = gc[7];
@@ -520,8 +587,18 @@ template <int VS> inline void launch_k2(const G9Args& g, const Tape& tp, cudaStr
 // ------------------------------------------------------------------------------------------------------ ON path
 // conv16 -> gz16 -> K1 -> K2 -> out16 on projections already in a.P; scratch ps (rows = MP) holds the tape, a.C the six planes.
 // Returns an error string (nothing launched) or nullptr. VS in {1, 2, 4}.
-inline const char* launch(const Args& a, const KdaPrefillScratch& ps, int VS, cudaStream_t st)
+// G6_PF_KDA_GZF (default 1, read once; =0: the gz16 pass and the G16 / Z16 planes): K1 and k_out16z build the G16 / Z16
+// tiles (gz_tile): the same bits without the planes' DRAM round trip (gzf < 0: the env; 0 / 1: forced, the tests).
+// kda/tests/kda_g9_gzf_test.cu: byte-equal, 12 cases. TP3 8K A/B: prefill 2592 -> 2627 tok/s, rank-0 8K -39 ms, T=0
+// hashes unchanged.
+inline int gzf_env()
 {
+    static const int v = getenv("G6_PF_KDA_GZF") ? atoi(getenv("G6_PF_KDA_GZF")) : 1;
+    return v == 1;
+}
+inline const char* launch(const Args& a, const KdaPrefillScratch& ps, int VS, cudaStream_t st, int gzf = -1)
+{
+    if (gzf < 0) gzf = gzf_env();
     const int NT = (a.M + CH16 - 1) / CH16;
     if (a.M < 1 || a.M > ps.rows) return "kda::g9::launch: M out of range of the scratch";
     if (3 * NT > ps.rows) return "kda::g9::launch: 3 * ceil(M / 16) > MP (U block capacity)";
@@ -532,12 +609,17 @@ inline const char* launch(const Args& a, const KdaPrefillScratch& ps, int VS, cu
     tp.kd = reinterpret_cast<uint16_t*>(ps.QE); tp.qd = reinterpret_cast<uint16_t*>(ps.KD); tp.kr = reinterpret_cast<uint16_t*>(ps.W);
     tp.U = reinterpret_cast<uint8_t*>(ps.U); tp.NT = NT;
     launch_conv16(g, st);
-    k_gz16<<<dim3((a.M + 63) / 64, a.dl() / 64, 2), 256, 0, st>>>(g);
-    k_k1<<<dim3(NT, a.nh), 128, 0, st>>>(g, tp);
+    if (gzf) k_k1<true><<<dim3(NT, a.nh), 128, 0, st>>>(g, tp);
+    else
+    {
+        k_gz16<<<dim3((a.M + 63) / 64, a.dl() / 64, 2), 256, 0, st>>>(g);
+        k_k1<false><<<dim3(NT, a.nh), 128, 0, st>>>(g, tp);
+    }
     if (VS == 1) launch_k2<1>(g, tp, st);
     else if (VS == 2) launch_k2<2>(g, tp, st);
     else launch_k2<4>(g, tp, st);
-    launch_out16(g, st);
+    if (gzf) k_out16z<<<dim3(NT, a.nh), 256, 0, st>>>(g);
+    else launch_out16(g, st);
     return nullptr;
 }
 }   // namespace g9

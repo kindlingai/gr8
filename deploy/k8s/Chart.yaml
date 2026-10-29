@@ -1,0 +1,5 @@
+apiVersion: v2
+name: gr8
+description: GLM 5.3 on three, four or six GB10 boxes, as a LeaderWorkerSet of one pod per box
+type: application
+version: 0.1.0

@@ -1,8 +1,8 @@
 # Testing
 
 The tests come in five tiers, by what they need: a CPU, the pseudo engine, one GPU, the release's files, or a booted
-cluster. CI runs the first tier on every PR once a maintainer comments `/ci` or `/ready`. The rest run by hand, and a
-PR's gates table says which ones it ran ([AGENTS.md](../AGENTS.md), "How changes land" and "The gate").
+cluster. CI runs the first tier on every PR, the halves its files touch (.github/workflows/ci.yml, the changes job).
+The rest run by hand, and a PR's gates table says which ones it ran ([AGENTS.md](../AGENTS.md), "How changes land" and "The gate").
 
 ## CPU: `./gr8 test`
 

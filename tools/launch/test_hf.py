@@ -37,6 +37,7 @@ except ImportError:
     HAVE = False
 
 RELEASE = 'fakeorg/glm-exlr8'
+GLM = {'GR8_MODEL': 'glm53'}   # the model: a boot names it (no default)
 LAYERS = (3, 4)
 NE = 2                  # experts per layer in the synthetic files: small files, the same layout
 LFS_MIN = 4096          # files at least this big are served as LFS files: a redirect to the "CDN"
@@ -379,7 +380,7 @@ class HFTests(unittest.TestCase):
         import options as opt
         import supervisor as S
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--model',
-                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0'], {})
+                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0'], GLM)
         opt.validate(o)
         ms, v, err = S.resolve_model(o, log=self.logs.append)
         self.assertEqual(err, '')
@@ -395,7 +396,7 @@ class HFTests(unittest.TestCase):
         import options as opt
         import supervisor as S
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--model',
-                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0', '--kvb', 'fp8'], {})
+                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0', '--kvb', 'fp8'], GLM)
         opt.validate(o)                                          # V2_DENSE is set later, by resolve_model
         ms, v, err = S.resolve_model(o, log=self.logs.append)
         self.assertEqual(err, '')
@@ -732,7 +733,7 @@ class DrafterTests(unittest.TestCase):
         logs = []
 
         def boot(*argv):
-            o = opt.parse([*base, *argv], {})
+            o = opt.parse([*base, *argv], GLM)
             opt.validate(o)
             return o, S.resolve_model(o, log=logs.append)
         o, (ms, v, err) = boot()
@@ -749,7 +750,7 @@ class DrafterTests(unittest.TestCase):
         self.assertNotEqual(modelset.model_id(ms, v), ms.id)
         with self.assertRaises(opt.OptionError):
             opt.validate(opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3', '--drafter',
-                                    'https://huggingface.co/fakeorg/drafter'], {}))
+                                    'https://huggingface.co/fakeorg/drafter'], GLM))
 
     def test_the_tp6_boot(self):
         """TP=6: MTP only unless --dflash 1; with it, the drafter is converted in the replicated layout (--nr 6)."""
@@ -761,7 +762,7 @@ class DrafterTests(unittest.TestCase):
         logs = []
 
         def boot(*argv):
-            o = opt.parse([*base, *argv], {})
+            o = opt.parse([*base, *argv], GLM)
             opt.validate(o)
             return o, S.resolve_model(o, log=logs.append)
         o, (ms, v, err) = boot()

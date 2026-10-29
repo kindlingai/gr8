@@ -89,7 +89,28 @@ __global__ void kp_scores(Input input,int start,float* scores,int pstride){
 }
 // descending float order as unsigned (larger float -> larger key)
 __device__ __forceinline__ unsigned kp_key(float f){const unsigned u=__float_as_uint(f);return (u&0x80000000u)?~u:(u|0x80000000u);}
-constexpr int SELT=1024;
+#ifndef KP_SELT
+#define KP_SELT 512   // threads per row of kp_select (same selection at any value; 512 fastest 2K..131K on GB10)
+#endif
+constexpr int SELT=KP_SELT, SELR=8192/SELT;   // SELR keys per thread in registers: rows with <= 8192 visible pools
+static_assert(SELT>=256&&SELT<=1024&&8192%SELT==0,"kp_select geometry");
+// warp 0 of kp_select: b = the largest bin in 1..255 with sum(hist[b..255]) >= k, else 0; need = k - sum(hist[b+1..255]).
+// Equal to the serial descending scan; lane l holds bins 255-8l .. 248-8l.
+__device__ __forceinline__ void kp_pick(const int* hist,int k,unsigned prefix,int shift,unsigned* prefix_s,int* need_s){
+    const int lane=threadIdx.x&31;
+    int h[8],loc=0;
+    #pragma unroll
+    for(int j=0;j<8;j++){h[j]=hist[255-8*lane-j];loc+=h[j];}
+    int inc=loc;
+    #pragma unroll
+    for(int d=1;d<32;d<<=1){const int v=__shfl_up_sync(0xffffffffu,inc,d);if(lane>=d)inc+=v;}
+    int acc=inc-loc,jb=-1;   // acc: the bins above this lane's 8
+    #pragma unroll
+    for(int j=0;j<8;j++)if(jb<0&&255-8*lane-j>0){if(acc+h[j]>=k)jb=j;else acc+=h[j];}
+    const unsigned found=__ballot_sync(0xffffffffu,jb>=0);
+    const int src=found?__ffs(found)-1:31;
+    if(lane==src){*prefix_s=prefix|((unsigned)(found?255-8*lane-jb:0)<<shift);*need_s=k-acc;}
+}
 template<class Input>
 __global__ void __launch_bounds__(SELT) kp_select(Input input,int start,const float* scores,int pstride){
     auto a=resolve(input);if(!a.active)return;
@@ -109,16 +130,17 @@ __global__ void __launch_bounds__(SELT) kp_select(Input input,int start,const fl
     }
     __shared__ int hist[256],need_s,base_s,eqbase_s;__shared__ unsigned prefix_s;
     unsigned thr=0;int need=0;
-    if(nvis<=8*SELT){
-        unsigned rk[8];
+    if(nvis<=SELR*SELT){
+        unsigned rk[SELR];
         #pragma unroll
-        for(int j=0;j<8;j++){const int p=t+j*SELT;rk[j]=(p<nvis)?kp_key(__ldg(s+p)):0u;}
+        for(int j=0;j<SELR;j++){const int p=t+j*SELT;rk[j]=(p<nvis)?kp_key(__ldg(s+p)):0u;}
         unsigned prefix=0,mask=0;int k=g6kv::TOP_POOLS;
         for(int pass=0;pass<4;pass++){const int shift=24-8*pass;
             for(int i=t;i<256;i+=SELT)hist[i]=0;
             __syncthreads();
             #pragma unroll
-            for(int j=0;j<8;j++){
+            for(int j=0;j<SELR;j++){
+                if(j*SELT>=nvis)break;   // uniform over the CTA; no key past nvis is active
                 const int p=t+j*SELT;
                 const bool act=(p<nvis)&&((rk[j]&mask)==prefix);
                 const unsigned m=__ballot_sync(0xffffffff,act);
@@ -129,8 +151,7 @@ __global__ void __launch_bounds__(SELT) kp_select(Input input,int start,const fl
                 }
             }
             __syncthreads();
-            if(t==0){int acc=0,b=255;for(;b>0;b--){if(acc+hist[b]>=k)break;acc+=hist[b];}
-                prefix_s=prefix|((unsigned)b<<shift);need_s=k-acc;}
+            if(t<32)kp_pick(hist,k,prefix,shift,&prefix_s,&need_s);
             __syncthreads();
             prefix=prefix_s;k=need_s;mask|=255u<<shift;
             __syncthreads();
@@ -141,7 +162,7 @@ __global__ void __launch_bounds__(SELT) kp_select(Input input,int start,const fl
         if(t==0){base_s=0;eqbase_s=0;}
         __syncthreads();
         #pragma unroll
-        for(int j=0;j<8;j++){
+        for(int j=0;j<SELR;j++){
             if(j*SELT>=nvis)break;
             const int p=j*SELT+t;const bool in=p<nvis;const unsigned key=rk[j];
             const bool gt=in&&key>thr,eq=in&&key==thr;
@@ -163,8 +184,7 @@ __global__ void __launch_bounds__(SELT) kp_select(Input input,int start,const fl
             __syncthreads();
             for(int p=t;p<nvis;p+=SELT){const unsigned key=kp_key(s[p]);if((key&mask)==prefix)atomicAdd(&hist[(key>>shift)&255],1);}
             __syncthreads();
-            if(t==0){int acc=0,b=255;for(;b>0;b--){if(acc+hist[b]>=k)break;acc+=hist[b];}
-                prefix_s=prefix|((unsigned)b<<shift);need_s=k-acc;}
+            if(t<32)kp_pick(hist,k,prefix,shift,&prefix_s,&need_s);
             __syncthreads();
             prefix=prefix_s;k=need_s;mask|=255u<<shift;
             __syncthreads();
