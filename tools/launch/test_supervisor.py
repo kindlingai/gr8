@@ -402,20 +402,20 @@ class DonorTests(unittest.TestCase):
     def test_borrow_idle_puts_the_pool_in_chunks_and_lends_after_the_idle_time(self):
         give = ('--flash-kv-donate-gib', '20', '--flash-kv-growth-gib', '6', '--flash-kv-group', 'gr8-glm53')
         o = opt.parse(['--no-config', '--gr8-model', 'glm53f', '--tp', '2', *give], {})
-        self.assertNotIn('GR8_FLASH_KV_CHUNKS=1', opt.engine_plan(o)['env'])   # protected: the pool as before
+        self.assertNotIn('GR8_GLM53F_KV_CHUNKS=1', opt.engine_plan(o)['env'])   # protected: the pool as before
         for idle, ms in ((None, '60000'), ('5', '5000')):
             argv = ['--flash-cap-policy', 'borrow-idle'] + (['--flash-kv-idle-s', idle] if idle else [])
             o = opt.parse(['--no-config', '--gr8-model', 'glm53f', '--tp', '2', *give, *argv], {})
             env = opt.engine_plan(o)['env']
-            self.assertIn('GR8_FLASH_KV_CHUNKS=1', env)
-            self.assertIn('GR8_FLASH_KV_LEND_MS=' + ms, env)
+            self.assertIn('GR8_GLM53F_KV_CHUNKS=1', env)
+            self.assertIn('GR8_GLM53F_KV_LEND_MS=' + ms, env)
         with self.assertRaisesRegex(opt.OptionError, 'FLASH_KV_IDLE_S=0'):
             self.flash_plan(*give, '--flash-cap-policy', 'borrow-idle', '--flash-kv-idle-s', '0')
         # the engine gets this box's ledger
         s = supervisor('--gr8-model', 'glm53f', '--tp', '2', members=MEMBERS[:2])
         env = s.engine_env({'env': [], 'knobs': {'FLASH_CAP_POLICY': 'borrow-idle'}})
-        self.assertEqual(env['GR8_FLASH_KV_LEDGER'], os.path.join(s.home, 'out', 'kv', 'ledger'))
-        self.assertNotIn('GR8_FLASH_KV_LEDGER', s.engine_env({'env': [], 'knobs': {'FLASH_CAP_POLICY': 'protected'}}))
+        self.assertEqual(env['GR8_GLM53F_KV_LEDGER'], os.path.join(s.home, 'out', 'kv', 'ledger'))
+        self.assertNotIn('GR8_GLM53F_KV_LEDGER', s.engine_env({'env': [], 'knobs': {'FLASH_CAP_POLICY': 'protected'}}))
 
     def donor(self, knobs, model='glm53f', gpu=None):
         flash = model == 'glm53f'

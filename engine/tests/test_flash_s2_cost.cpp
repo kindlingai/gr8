@@ -8,11 +8,11 @@
 #include <cstdio>
 #include <cstdlib>
 #if G6_MODEL_FLASH
-// S2Cost::flash in a child process with GR8_FLASH_S2_COST=val (null: unset): knobs are read once per process
+// S2Cost::flash in a child process with GR8_GLM53F_S2_COST=val (null: unset): knobs are read once per process
 static bool flash_from_env(const char* val) {
     const pid_t p = fork();
     if (!p) {
-        if (val) setenv("GR8_FLASH_S2_COST", val, 1); else unsetenv("GR8_FLASH_S2_COST");
+        if (val) setenv("GR8_GLM53F_S2_COST", val, 1); else unsetenv("GR8_GLM53F_S2_COST");
         _exit(s2::S2Cost().flash ? 1 : 0);
     }
     int st = 0;
@@ -39,7 +39,7 @@ int main() {
     g6rt::SpecLen t4; t4.flash_cost(4);   // a width without its own table keeps TP2's
     for (int r = 1; r <= 8; ++r) assert(t4.verify_ms(r) == t2.verify_ms(r));
 #else
-    setenv("GR8_FLASH_S2_COST", "1", 1);   // the full-GLM cost model ignores it
+    setenv("GR8_GLM53F_S2_COST", "1", 1);   // the full-GLM cost model ignores it
     s2::S2Cost old, flash, disabled;
 #endif
     for (int k = 1; k <= 7; ++k) {

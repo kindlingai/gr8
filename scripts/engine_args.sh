@@ -83,7 +83,7 @@ flash_defaults() {
 # ./gr8 kv up --lazy-lock node once the serve has booted. FLASH_KV_GROWTH_GIB is what the serve may still allocate after
 # boot; it has no default because it is not measured yet. FLASH_KV_GROUP is the mentat group the node serves (the cluster
 # that borrows from it, not this serve's), also without a default. FLASH_CAP_POLICY=protected: the configured CAP's memory is
-# never lent. borrow-idle (needs a donation): the KV pool in chunks (GR8_FLASH_KV_CHUNKS=1), every chunk but one lent to
+# never lent. borrow-idle (needs a donation): the KV pool in chunks (GR8_GLM53F_KV_CHUNKS=1), every chunk but one lent to
 # the node once the serve has been idle FLASH_KV_IDLE_S (default 60), recalled before a request that needs it is
 # admitted (the request waits for the recall; s2/flash_lend.h).
 num_ok() { [[ $1 =~ ^[0-9]+([.][0-9]+)?$ ]]; }
@@ -175,15 +175,15 @@ GR8_PF_DSA_FULL_GV=1 GR8_PF_ROUTER_SPLIT=1 GR8_PF_DSA_F16GEMM=1 GR8_PF_PREWARM=1
 GR8_PF_STAGE_ASYNC=1"
   # the peer-partial staging (GR8_PF_STAGE_ASYNC) runs at any rank count; the G9 KDA scan is a precision arm, not the
   # same bytes as the scan it replaces, so it stays where it was chosen: TP2 (it would change TP4's output)
-  [ "$TP" = 4 ] || ENGINE_ENV="$ENGINE_ENV GR8_KDA_SCAN=1 GR8_KDA_VS=2"
-  # FLASH_CAP_POLICY=borrow-idle: the KV pool in chunks, lent once idle (the supervisor adds GR8_FLASH_KV_LEDGER, the box's)
+  [ "$TP" = 4 ] || ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_KDA_SCAN=1 GR8_GLM53F_KDA_VS=2"
+  # FLASH_CAP_POLICY=borrow-idle: the KV pool in chunks, lent once idle (the supervisor adds GR8_GLM53F_KV_LEDGER, the box's)
   if [ "${FLASH_CAP_POLICY:-protected}" = borrow-idle ]; then
-    ENGINE_ENV="$ENGINE_ENV GR8_FLASH_KV_CHUNKS=1 GR8_FLASH_KV_LEND_MS=$((${FLASH_KV_IDLE_S:-60} * 1000))"
+    ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_KV_CHUNKS=1 GR8_GLM53F_KV_LEND_MS=$((${FLASH_KV_IDLE_S:-60} * 1000))"
   fi
   # FLASH_CACHE: session checkpoints at prefill quantum boundaries (docs/FLASH.md), off unless set
   if [ -n "${FLASH_CACHE:-}" ] && [ "$FLASH_CACHE" != off ]; then
-    ENGINE_ENV="$ENGINE_ENV GR8_FLASH_CACHE=$FLASH_CACHE"
-    [ -n "${FLASH_STATE_BUDGET_MIB:-}" ] && ENGINE_ENV="$ENGINE_ENV GR8_FLASH_STATE_BUDGET_MIB=$FLASH_STATE_BUDGET_MIB"
+    ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_CACHE=$FLASH_CACHE"
+    [ -n "${FLASH_STATE_BUDGET_MIB:-}" ] && ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_STATE_BUDGET_MIB=$FLASH_STATE_BUDGET_MIB"
   fi
   # its KV_STORE on a group lease: when it gives segments to other groups (KV_SHARE_WHEN; docs/SETTINGS.md)
   ENGINE_ENV="$ENGINE_ENV${KV_SHARE_WHEN:+ GR8_KV_SHARE_WHEN=$KV_SHARE_WHEN}"

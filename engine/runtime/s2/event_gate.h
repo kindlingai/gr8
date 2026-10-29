@@ -18,7 +18,7 @@ struct Notice {
                request == n.request && payload_hash == n.payload_hash && kind == n.kind;
     }
 };
-// room: the rank's Flash KV chunks online (GR8_FLASH_KV_CHUNKS, runtime/flash_kv.h), UINT32_MAX without a chunk map.
+// room: the rank's Flash KV chunks online (GR8_GLM53F_KV_CHUNKS, runtime/flash_kv.h), UINT32_MAX without a chunk map.
 // Not replicated state: a recall the KV node did not release in time leaves one rank short (s2/flash_lend.h)
 struct Ack { Notice notice; unsigned rank = 0; uint64_t state_hash = 0; uint32_t room = UINT32_MAX; };
 class EventGate {

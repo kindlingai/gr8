@@ -622,11 +622,11 @@ inline PfArgs make_pf_args(const Args& a, const KdaPrefillScratch& ps)
 inline void launch_core_prefill(const PfArgs& p, cudaStream_t st)
 {
     const Args& a = p.a;
-    if (knob::kda_pf_p1()) k_kda_prep<<<a.nh * 2, PREP_T, 0, st>>>(a);
+    if (knob::glm53f_kda_pf_p1()) k_kda_prep<<<a.nh * 2, PREP_T, 0, st>>>(a);
     else launch_prep_pf(a, st);
-    if (knob::kda_pf_in1()) k_kda_intra<<<dim3(a.nh, p.nchunk()), INTRA_T, 0, st>>>(p);
+    if (knob::glm53f_kda_pf_in1()) k_kda_intra<<<dim3(a.nh, p.nchunk()), INTRA_T, 0, st>>>(p);
     else k_kda_intra3<<<dim3(a.nh, p.nchunk()), INTRA_T, 0, st>>>(p);
-    if (knob::kda_pf_st1()) k_kda_state<<<dim3(a.nh, DV / VB), ST_T, 0, st>>>(p);
+    if (knob::glm53f_kda_pf_st1()) k_kda_state<<<dim3(a.nh, DV / VB), ST_T, 0, st>>>(p);
     else k_kda_state2<<<dim3(a.nh, DV / VB), ST_T, 0, st>>>(p);
     k_kda_out<<<dim3(a.nh, a.M), OUT_T, 0, st>>>(a);
 }

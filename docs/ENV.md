@@ -62,26 +62,12 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_DRAFT_HEAD_TPC` | int | `1` | 1\|2\|4\|8\|16\|32 | With GR8_DRAFT_HEAD_I4 or GR8_DFL_HEAD_I4, the INT4 head GEMV's tiles per CTA. Its product with GR8_DRAFT_HEAD_KS must be at most 32. |
 | `GR8_DRAFT_LOGIT_DUMP` | path | unset |  | Every rank writes its vocab slice of the MTP first draft pass logits to this path plus .rank<R>. Needs --mtp and no --serve. |
 | `GR8_DRAFT_PAR` | int | 2 when serving DFlash2 with MTP, else 0 | 0..2 | S2 with DFlash2, a solo round runs the drafter step on its own CUDA stream under MTP's first form. 2 also puts drafting steps on a high-priority stream. Same bytes as serial. |
-| `GR8_DSA_IDXQ_TPC` | int | `1` |  | Flash decode: tiles per CTA of the indexer's wq_b GEMV. |
-| `GR8_DSA_OPROJ_ROT` | flag | 1 for steps of more than one row, else 0 | 0\|1 | Flash decode: 1 = the o_proj trellis GEMV reads the attention output as rotated fragment tables, 0 = it rotates the attention output itself. |
-| `GR8_DSA_OPROJ_SPLIT` | ints | 4 k parts, 1 sub-part |  | Dense trellis o_proj GEMV split as k1,s1[,k4,s4]: k parts and sub-parts at one row and at more rows. |
-| `GR8_DSA_QB_FUSE` | int | `1` | 0\|1\|2 | Flash decode: q_b and the indexer's wq_b GEMV run as one 640-CTA kernel (k_dsa_qb_idxq) when their shapes match. 2 = the same with the indexer's CTAs first, 0 = two launches. |
-| `GR8_DSA_QB_ROT` | flag | `1` |  | Flash decode: the q_a norm kernel writes q_a rotated as the fragment tables the q_b trellis GEMV reads. 0 = the q_b GEMV rotates the q_a rows itself. |
-| `GR8_DSA_QB_SPLIT` | ints | QA/128 k parts (16 GLM, 12 Flash), 1 sub-part |  | Dense trellis q_b GEMV split as k1,s1[,k4,s4]: k parts and sub-parts at one row and at more rows. |
-| `GR8_DSA_XIN_ORDER` | flag | `0` |  | Flash decode with GR8_GV_MULTI: a nonzero value launches the layer-input GEMVs in the order idx_k, q_a, idx_w, idx_g, kv_a instead of q_a, kv_a, idx_k, idx_w, idx_g. |
 | `GR8_DTR` | flag | `1` |  | Uses the exlr8 release's dense trellis matrices (q_b, o_proj, the dense MLP) where a layer has them. 0 = the int4 or MXFP8 records, which the layer must then have. |
 | `GR8_DTR_NBFAST` | flag | `1` |  | Single-matrix dense trellis GEMVs whose group stride exceeds their block stride assign CTAs output block first instead of k part first. CTA order only. |
 | `GR8_DTR_NBFAST_OUT` | flag | `1` |  | As GR8_DTR_NBFAST, for single-matrix dense trellis GEMVs whose block stride is at least their group stride. |
 | `GR8_DTR_PF_COPY` | flag | `0` |  | Prefill runs o_proj on an exact FP8 copy of its trellis tiles too, as q_b and the dense MLP do, about 25 MB more per layer at TP4. Same bits. |
 | `GR8_DTR_PF_KDA_COPY` | flag | `1` |  | Flash prefill makes exact FP8 copies of the KDA q, k and v trellis matrices for the prefill GEMMs. 0 = no copies. |
 | `GR8_DTR_PF_SHARE_SUH` | flag | `0` |  | Flash prefill dense MLP: up reuses gate's rotated input instead of rotating with its own suh vector. |
-| `GR8_FLASH_CACHE` | text | `off` | off\|0\|aligned\|terminal | GLM-5.3-Flash --serve with --prefill: aligned keeps session checkpoints so a later prompt with the same start is prefilled from there. terminal also checkpoints each request's end and is not cold-exact. |
-| `GR8_FLASH_DRAFT_KV` | flag | `1` |  | Flash prefill fills the MTP draft's caches only. 0 = runs the full draft step over the prompt rows, which uses the draft fabric. |
-| `GR8_FLASH_KV_CHUNKS` | flag | `0` | 0\|1 | Flash: the DSA MLA and index caches sit in kvchunks regions under one chunk map per model, so S2 Resize events can take chunks online or offline on every rank. |
-| `GR8_FLASH_KV_IDLE_CHUNKS` | int | `1` | 1.. | With GR8_FLASH_KV_LEND_MS, the chunks left online while the rest are lent. A request that fits them is admitted without a recall. |
-| `GR8_FLASH_KV_LEND_MS` | int | `0` | 0.. | With GR8_FLASH_KV_CHUNKS=1, once the serve is idle this many ms the head lends every chunk above GR8_FLASH_KV_IDLE_CHUNKS, and recalls them before a request that needs them. 0: never lend. |
-| `GR8_FLASH_S2_COST` | flag | `0` |  | Flash solo serving prices S2 rounds with spec_len.h's Flash cost table for this build's width instead of the GLM step costs. |
-| `GR8_FLASH_STATE_BUDGET_MIB` | int | `8192` |  | With GR8_FLASH_CACHE and no --kv-store, the size in MiB of each rank's in-memory checkpoint store. |
 | `GR8_FPF_ATTN_P1` | flag | `0` |  | Flash prefill attention runs the P1 bodies instead of the GEMM bodies. |
 | `GR8_FPF_DENSE_P1` | flag | `0` |  | Flash prefill dense MLP layers run the P1 bodies instead of the GEMM bodies. |
 | `GR8_FPF_DSA_P1` | flag | `0` |  | Flash prefill DSA layers run the P1 bodies instead of the GEMM bodies. |
@@ -89,6 +75,29 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_FPF_P1` | flag | `0` |  | Flash prefill runs the P1 bodies everywhere, the reference the GEMM bodies are checked against. |
 | `GR8_FUSE` | int | `1` | 0\|1\|2 | Decode MoE K1: 1 = one fused launch, 0 = separate launches, 2 = fused with a KS1=2 WG=2 split at 2 and 3 rows, which rounds differently. |
 | `GR8_GEMM` | int | `0` | 0..3 | Prefill MXFP8 GEMM kernel: 1 = k_gemm_mx8 (v1), 2 = v2 with 128-row CTAs, 3 = v2 with 64-row CTAs, 0 = v2 with row blocks by grid size. |
+| `GR8_GLM53F_CACHE` | text | `off` | off\|0\|aligned\|terminal | GLM-5.3-Flash --serve with --prefill: aligned keeps session checkpoints so a later prompt with the same start is prefilled from there. terminal also checkpoints each request's end and is not cold-exact. |
+| `GR8_GLM53F_DRAFT_KV` | flag | `1` |  | Flash prefill fills the MTP draft's caches only. 0 = runs the full draft step over the prompt rows, which uses the draft fabric. |
+| `GR8_GLM53F_DSA_IDXQ_TPC` | int | `1` |  | Flash decode: tiles per CTA of the indexer's wq_b GEMV. |
+| `GR8_GLM53F_DSA_OPROJ_ROT` | flag | 1 for steps of more than one row, else 0 | 0\|1 | Flash decode: 1 = the o_proj trellis GEMV reads the attention output as rotated fragment tables, 0 = it rotates the attention output itself. |
+| `GR8_GLM53F_DSA_OPROJ_SPLIT` | ints | 4 k parts, 1 sub-part |  | Dense trellis o_proj GEMV split as k1,s1[,k4,s4]: k parts and sub-parts at one row and at more rows. |
+| `GR8_GLM53F_DSA_QB_FUSE` | int | `1` | 0\|1\|2 | Flash decode: q_b and the indexer's wq_b GEMV run as one 640-CTA kernel (k_dsa_qb_idxq) when their shapes match. 2 = the same with the indexer's CTAs first, 0 = two launches. |
+| `GR8_GLM53F_DSA_QB_ROT` | flag | `1` |  | Flash decode: the q_a norm kernel writes q_a rotated as the fragment tables the q_b trellis GEMV reads. 0 = the q_b GEMV rotates the q_a rows itself. |
+| `GR8_GLM53F_DSA_QB_SPLIT` | ints | QA/128 k parts (16 GLM, 12 Flash), 1 sub-part |  | Dense trellis q_b GEMV split as k1,s1[,k4,s4]: k parts and sub-parts at one row and at more rows. |
+| `GR8_GLM53F_DSA_XIN_ORDER` | flag | `0` |  | Flash decode with GR8_GV_MULTI: a nonzero value launches the layer-input GEMVs in the order idx_k, q_a, idx_w, idx_g, kv_a instead of q_a, kv_a, idx_k, idx_w, idx_g. |
+| `GR8_GLM53F_KDA_MX` | flag | `1` | 0\|1 | KDA decode q / k / v read MXFP8 records built at bind with FP16 activations. 0 reads the BF16 weights. Not byte- exact, and the records are an extra copy outside the loader's accounting. |
+| `GR8_GLM53F_KDA_OPROJ_SPLIT` | ints | ks 8 at 1 row, 4 at 2+ rows, sub 1 |  | Sets the k-split and sub-split of the KDA o_proj trellis GEMV as k1,s1,k4,s4 (1 row, then 2+ rows), in `kernels/dtr.cuh`. |
+| `GR8_GLM53F_KDA_PF_IN1` | flag | `0` | 0\|1 | 1 runs the older v1 intra-chunk kernel in KDA prefill instead of k_kda_intra3. |
+| `GR8_GLM53F_KDA_PF_P1` | flag | `0` | 0\|1 | 1 runs the older row-loop prep kernel in KDA prefill instead of launch_prep_pf. |
+| `GR8_GLM53F_KDA_PF_ST1` | flag | `0` | 0\|1 | 1 runs the older v1 state kernel in KDA prefill instead of k_kda_state2. |
+| `GR8_GLM53F_KDA_PROJ_KS` | int | `16` | 8\|16\|32 | Sets the k-split of the KDA trellis q / k / v projection GEMV. |
+| `GR8_GLM53F_KDA_PROJ_MODE` | int | `0` | 0\|1\|2 | Picks how the KDA trellis q / k / v projection rotates its input: 0 inside the GEMV, 1 and 2 in a separate pre- rotate launch that also carries the f_a / g_a / b GEMVs (1) or not (2). |
+| `GR8_GLM53F_KDA_SCAN` | int | `0` | 0\|1 | 1 runs the Flash KDA prefill scan as the CH16 bf16-MMA scan (`kda/kda_g9.cuh`), a precision arm that is not byte-exact. 0 runs the base scan. |
+| `GR8_GLM53F_KDA_VS` | int | `2` | 1\|2\|4 | With GR8_KDA_SCAN=1, the v slices per head of the G9 KDA scan kernel: 1, 2 or 4. |
+| `GR8_GLM53F_KV_CHUNKS` | flag | `0` | 0\|1 | Flash: the DSA MLA and index caches sit in kvchunks regions under one chunk map per model, so S2 Resize events can take chunks online or offline on every rank. |
+| `GR8_GLM53F_KV_IDLE_CHUNKS` | int | `1` | 1.. | With GR8_FLASH_KV_LEND_MS, the chunks left online while the rest are lent. A request that fits them is admitted without a recall. |
+| `GR8_GLM53F_KV_LEND_MS` | int | `0` | 0.. | With GR8_FLASH_KV_CHUNKS=1, once the serve is idle this many ms the head lends every chunk above GR8_FLASH_KV_IDLE_CHUNKS, and recalls them before a request that needs them. 0: never lend. |
+| `GR8_GLM53F_S2_COST` | flag | `0` |  | Flash solo serving prices S2 rounds with spec_len.h's Flash cost table for this build's width instead of the GLM step costs. |
+| `GR8_GLM53F_STATE_BUDGET_MIB` | int | `8192` |  | With GR8_FLASH_CACHE and no --kv-store, the size in MiB of each rank's in-memory checkpoint store. |
 | `GR8_GV_MULTI` | flag | `1` |  | Steps of up to 8 rows run the GEMVs on the layer input (q_a, kv_a, the indexer's k and weights) as one launch. 0 = one launch each. Same bits. |
 | `GR8_IDXQ_SPLIT` | flag | g6m4: 1 when TP>1 on GLM, else 0; m4sim: 0 | 0\|1 | Splits the indexer's replicated wq_b GEMV by output tiles across the ranks and all-gathers it on the split-GEMV fabric, with the same bits as the full GEMV. |
 | `GR8_IDX_GRP` | int | `0` | 0..64 | In S2 batched decode steps the per-row indexer reads each key tile once for up to this many rows of one session, with the same bits. 0 is off. |
@@ -98,15 +107,6 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_K1_SPLIT_M1` | ints | GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (4,1,2) |  | Sets the decode MoE K1 split KS1,WG,NS2 for 1-row steps, over GR8_K1_SPLIT. Another fc1 partial count can change the sums. |
 | `GR8_K1_SPLIT_M2` | ints | GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (1,2,8) |  | Sets the decode MoE K1 split KS1,WG,NS2 for 2- and 3-row steps, over GR8_K1_SPLIT. Another fc1 partial count can change the sums. |
 | `GR8_K1_SPLIT_M4` | ints | GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (4,2,2) |  | Sets the decode MoE K1 split KS1,WG,NS2 for steps of 4 or more rows, over GR8_K1_SPLIT. Another fc1 partial count can change the sums. |
-| `GR8_KDA_MX` | flag | `1` | 0\|1 | KDA decode q / k / v read MXFP8 records built at bind with FP16 activations. 0 reads the BF16 weights. Not byte- exact, and the records are an extra copy outside the loader's accounting. |
-| `GR8_KDA_OPROJ_SPLIT` | ints | ks 8 at 1 row, 4 at 2+ rows, sub 1 |  | Sets the k-split and sub-split of the KDA o_proj trellis GEMV as k1,s1,k4,s4 (1 row, then 2+ rows), in `kernels/dtr.cuh`. |
-| `GR8_KDA_PF_IN1` | flag | `0` | 0\|1 | 1 runs the older v1 intra-chunk kernel in KDA prefill instead of k_kda_intra3. |
-| `GR8_KDA_PF_P1` | flag | `0` | 0\|1 | 1 runs the older row-loop prep kernel in KDA prefill instead of launch_prep_pf. |
-| `GR8_KDA_PF_ST1` | flag | `0` | 0\|1 | 1 runs the older v1 state kernel in KDA prefill instead of k_kda_state2. |
-| `GR8_KDA_PROJ_KS` | int | `16` | 8\|16\|32 | Sets the k-split of the KDA trellis q / k / v projection GEMV. |
-| `GR8_KDA_PROJ_MODE` | int | `0` | 0\|1\|2 | Picks how the KDA trellis q / k / v projection rotates its input: 0 inside the GEMV, 1 and 2 in a separate pre- rotate launch that also carries the f_a / g_a / b GEMVs (1) or not (2). |
-| `GR8_KDA_SCAN` | int | `0` | 0\|1 | 1 runs the Flash KDA prefill scan as the CH16 bf16-MMA scan (`kda/kda_g9.cuh`), a precision arm that is not byte-exact. 0 runs the base scan. |
-| `GR8_KDA_VS` | int | `2` | 1\|2\|4 | With GR8_KDA_SCAN=1, the v slices per head of the G9 KDA scan kernel: 1, 2 or 4. |
 | `GR8_KVB` | text | `bf16` | bf16\|fp8 | fp8 loads every layer's kv_b (UK / UV) as the release's block FP8 bytes and scales instead of BF16, with the same output bytes. Needs --v2-dense. |
 | `GR8_MHC_BF16` | int | `0` | 0\|1\|2 | Quality test: rounds mHC residual stream writes to BF16, 1 = after both blocks, 2 = only after the MLP block. |
 | `GR8_MHC_FUSE` | int | `2` | 0\|1\|2 | Sets the decode mHC consume form for every row count unless GR8_MHC_FUSE_M1 / _M4 set it: 0 a separate peer-wait kernel, 1 the consume waits itself, 2 the fused consume. |
@@ -249,14 +249,14 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_DFL_DUMP` | path | unset |  | With --dflash, rank 0 writes every draft step's context features, drafts and committed tokens to this file, for engine/ref/dflash2_replay.py. |
 | `GR8_DRAFT_IN_DUMP` | path | unset |  | Rank 0 writes the inputs of every MTP first draft pass to this file. Needs --mtp and no --serve. |
 | `GR8_FABRIC_CONNECT_TRIES` | int | `1200` |  | Fabric TCP connect attempts, 100 ms apart. Raise it when ranks load at different speeds. |
-| `GR8_FLASH_DRAFT_CACHE_DUMP` | path | unset |  | Flash with --mtp: each rank writes its draft cache pages before the first live draft to this path plus .s<seq>.r<rank>.bin. |
-| `GR8_FLASH_KV_CRASH_AT` | text | unset | begun\|synced\|released | Ends the process at that ledger point of a chunk resize (flash_kv.h). |
-| `GR8_FLASH_KV_LEDGER` | path | unset |  | With GR8_FLASH_KV_CHUNKS=1, the box's host ledger that chunk resizes move bytes through. With GR8_FLASH_KV_LEND_MS the rank writes its lendable bytes to this path plus .gpu. |
-| `GR8_FLASH_RESET_ALL` | flag | `0` |  | Flash serve clears every attention cache page per request instead of only the pages the last request wrote. |
-| `GR8_FLASH_RESET_CHECK` | flag | `0` |  | Flash serve stops if any cache page past the cleared ones is not zero. It reads every cache, so it is for tests. |
+| `GR8_GLM53F_DRAFT_CACHE_DUMP` | path | unset |  | Flash with --mtp: each rank writes its draft cache pages before the first live draft to this path plus .s<seq>.r<rank>.bin. |
+| `GR8_GLM53F_KDA_STATE_DUMP` | path | unset |  | After each offline sequence, each rank writes the KDA S state and conv state of every layer to PATH.rank<R>. |
+| `GR8_GLM53F_KV_CRASH_AT` | text | unset | begun\|synced\|released | Ends the process at that ledger point of a chunk resize (flash_kv.h). |
+| `GR8_GLM53F_KV_LEDGER` | path | unset |  | With GR8_FLASH_KV_CHUNKS=1, the box's host ledger that chunk resizes move bytes through. With GR8_FLASH_KV_LEND_MS the rank writes its lendable bytes to this path plus .gpu. |
+| `GR8_GLM53F_RESET_ALL` | flag | `0` |  | Flash serve clears every attention cache page per request instead of only the pages the last request wrote. |
+| `GR8_GLM53F_RESET_CHECK` | flag | `0` |  | Flash serve stops if any cache page past the cleared ones is not zero. It reads every cache, so it is for tests. |
 | `GR8_IMG_VMM` | int | `0` |  | Builds the device weight image from cuMemCreate chunks mapped into one range, 1 = the recommended granularity, N = N MB chunks. Same bytes. Falls back to cudaMalloc and says why. |
 | `GR8_K1_TLBW` | int | `0` | 0..1048576 | At the start of each decode MoE fc1 launch, prefetches the routed slots' fc1 and fc2 weight translations into L2 at this granule in KB. No output change. |
-| `GR8_KDA_STATE_DUMP` | path | unset |  | After each offline sequence, each rank writes the KDA S state and conv state of every layer to PATH.rank<R>. |
 | `GR8_KVMAN_TRANSPORT` | text | `auto` | tcp\|rdma\|auto | How this box reaches a KV node. A rank whose path to the node runs through another box sets up RDMA but cannot write, and auto does not fall back after setup. |
 | `GR8_KV_DRAIN_DELAY` | text | unset |  | For tests, rank R sleeps the given ms inside every Nth KV tier drain that copies anything, set as <rank>:<ms>[:<every>]. |
 | `GR8_KV_SHARE_WHEN` | text | `idle` | idle\|always | With a group KV lease, idle makes the head offer its blocks to other groups only while no session is resident or queued, always offers on every report. |

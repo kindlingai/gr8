@@ -42,7 +42,7 @@ struct G6AttnBinding {
     void *storage, *scratch;
     size_t storage_bytes, scratch_bytes;
     int rank, layer, head_begin, capacity, max_rows, full_index;
-    // Flash, GR8_FLASH_KV_CHUNKS: the MLA and index caches' regions (G6KvChunks*, kvchunks.h; caller-owned), else null
+    // Flash, GR8_GLM53F_KV_CHUNKS: the MLA and index caches' regions (G6KvChunks*, kvchunks.h; caller-owned), else null
     void* kv_chunks[2];
 };
 
@@ -58,7 +58,7 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding*, const G6AttnPack*, int rank,
     int layer, int capacity, int max_rows, int query_tile, void* stream, void* ext_scratch, size_t ext_bytes);
 #if G6_MODEL_FLASH
 struct G6KvChunks;
-// Flash (GR8_FLASH_KV_CHUNKS): the MLA and index caches are the two regions (kvchunks.h, each at least the capacity's
+// Flash (GR8_GLM53F_KV_CHUNKS): the MLA and index caches are the two regions (kvchunks.h, each at least the capacity's
 // pages; the caller frees them after release), the rest is storage as g6_attn_bind_create. Kernels see the same
 // pointers; no step may reach a page whose chunk is offline. Reset zeroes only what the regions back.
 extern "C" int g6_attn_bind_create_chunked(G6AttnBinding*, const G6AttnPack*, int rank, int layer, int capacity,

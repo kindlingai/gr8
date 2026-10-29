@@ -65,7 +65,7 @@ struct NativeHooks {
     // Resize commit (share_apply with the tier drain)
     std::function<std::optional<Resize>(bool idle)> share;
     std::function<void(const Resize&)> resize;
-    // optional, GR8_FLASH_KV_CHUNKS: flash_room = this rank's Flash KV chunks online (its ACKs carry it, Ack::room);
+    // optional, GR8_GLM53F_KV_CHUNKS: flash_room = this rank's Flash KV chunks online (its ACKs carry it, Ack::room);
     // flash = the head's borrow-idle rule (s2/flash_lend.h; chunk_rows 0 = no gate, idle_ms 0 = never lend). Its lends
     // and recalls are Resize events on FLASH_KV_TIER, so they need the resize hook
     std::function<uint32_t()> flash_room;

@@ -1,4 +1,4 @@
-// Flash session checkpoints (GR8_FLASH_CACHE), the host half: no CUDA. flash_checkpoint.cuh copies the bytes.
+// Flash session checkpoints (GR8_GLM53F_CACHE), the host half: no CUDA. flash_checkpoint.cuh copies the bytes.
 //
 // GLM-5.3-Flash keeps two kinds of state for a sequence: the paged KV of its 12 attention bindings (11 DSA layers and
 // the MTP layer, rows by position) and the KDA state of its 34 linear-attention layers (fp32 S and the conv history,
@@ -15,7 +15,7 @@
 // boundary; and the MTP layer's row p - 1 reads token p, so the prompt must match through token p (the MTP rule of
 // prefix_reuse.h), which is why an entry keeps p + 1 tokens.
 //
-// terminal (GR8_FLASH_CACHE=terminal, NOT cold-exact): aligned's checkpoints, and at the end of every request one more at
+// terminal (GR8_GLM53F_CACHE=terminal, NOT cold-exact): aligned's checkpoints, and at the end of every request one more at
 // p = the rows the request consumed (prompt + output, the last output token still pending), with that pending token as
 // token p. Its pages may end mid-page (the whole last page is kept). The KDA state is the one decode left: decode
 // advances it one row at a time (engine/kda/kda.cuh) and the prefill in chunks of 64 rows (engine/kda/kda_prefill.cuh),
@@ -54,7 +54,7 @@ inline FlashCache flash_cache_mode(const char* v) {
     if (s == "off" || s == "0") return FlashCache::Off;
     if (s == "aligned") return FlashCache::Aligned;
     if (s == "terminal") return FlashCache::Terminal;
-    throw std::runtime_error("GR8_FLASH_CACHE=" + s + ": off, aligned or terminal");
+    throw std::runtime_error("GR8_GLM53F_CACHE=" + s + ": off, aligned or terminal");
 }
 inline const char* flash_cache_name(FlashCache m) {
     return m == FlashCache::Terminal ? "terminal" : m == FlashCache::Aligned ? "aligned" : "off";
@@ -123,7 +123,7 @@ struct FlashEntry {
     uint64_t used_ms = 0;                // FlashIndex::now_ms at the same moment: the ages a head reports (not digested)
     uint64_t base = 0, blocks = 0;       // the store's blocks [base, base + blocks): manifest, pages, state
     uint32_t position = 0;
-    bool terminal = false;               // kept at the end of a request (GR8_FLASH_CACHE=terminal), not on the grid
+    bool terminal = false;               // kept at the end of a request (GR8_GLM53F_CACHE=terminal), not on the grid
     std::vector<int> tokens;             // position + 1
     g6rt::CacheNamespace ns{};
     FlashManifest manifest;              // what the entry's first block must hold (sealed)

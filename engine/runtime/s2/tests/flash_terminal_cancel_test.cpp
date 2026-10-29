@@ -1,4 +1,4 @@
-// GR8_FLASH_CACHE=terminal and a cancel at the boundary the prefill checkpoint waits for (#174 cd20a51 follow-up 1,
+// GR8_GLM53F_CACHE=terminal and a cancel at the boundary the prefill checkpoint waits for (#174 cd20a51 follow-up 1,
 // Assayer reports/assayer-pr174/cd20a51/report.md). The cancel commits at that boundary: the terminal retain keeps
 // rows [0, p) at the event (s2/service.h retire_run, flash_native.cuh h.pool.retain) and the native retire takes the
 // pending aligned capture (flash_native.cuh h.retire). For a cancel right at the grid point the two have the same
@@ -52,7 +52,7 @@ struct Ckpt {
     }
 };
 struct Rank {
-    struct { bool terminal = true; int stream = 0; } c;   // GR8_FLASH_CACHE=terminal
+    struct { bool terminal = true; int stream = 0; } c;   // GR8_GLM53F_CACHE=terminal
     Ckpt real; Ckpt* ck = &real;
     struct { void release(const Run&) {} } pool;
     FlashRing ring;

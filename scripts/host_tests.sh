@@ -197,12 +197,12 @@ for t in test_flash_route_split test_flash_route_split_tp4 test_flash_route_spli
   "$T/$t"
 done
 python3 "$REPO/engine/tests/test_flash_route_split_source.py"
-# Flash session checkpoints (GR8_FLASH_CACHE): aligned points, the index's match/LRU/first-fit, the manifest seal.
+# Flash session checkpoints (GR8_GLM53F_CACHE): aligned points, the index's match/LRU/first-fit, the manifest seal.
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/tests/test_flash_ckpt_index.cpp" -o "$T/test_flash_ckpt_index" "${KNOBS[@]}"
 "$T/test_flash_ckpt_index"
-# GR8_FLASH_CACHE=terminal: the actual retain hook against CPU mocks (rows, ring slot, tokens, nothing kept).
+# GR8_GLM53F_CACHE=terminal: the actual retain hook against CPU mocks (rows, ring slot, tokens, nothing kept).
 python3 "$REPO/engine/tests/test_flash_terminal_retain.py"
-# GR8_FLASH_CACHE=terminal, a cancel at the boundary the aligned capture waits for: flash_native.cuh's own hooks through
+# GR8_GLM53F_CACHE=terminal, a cancel at the boundary the aligned capture waits for: flash_native.cuh's own hooks through
 # the real Service on two ranks; the entry stays aligned and a longer prompt keeps its own aligned checkpoint
 python3 "$REPO/engine/tests/test_flash_terminal_cancel.py"
 # the adaptive draft length decision, and the top-k selection

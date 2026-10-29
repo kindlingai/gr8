@@ -50,20 +50,20 @@ inline void bind_dsa_layer(Model& m, int i, const Find& find, int capacity, cuda
     y.ap = G6AttnPack{at("kv_b.uk"), at("kv_b.uv"), at("kv_a_norm"), at("idx.k_norm.w"), at("idx.k_norm.b")};
     y.ap.index_ape = at("self_attn.indexer.index_kpool_compress_ape");
     // decode only (build_flash: max_rows <= MX); the GLM attention scratch sharing (GR8_DEC_SHARED_SCRATCH) is not wired here
-    // GR8_FLASH_KV_CHUNKS=1: the MLA and index caches in kvchunks regions under the model's chunk map (flash_kv.h), every
+    // GR8_GLM53F_KV_CHUNKS=1: the MLA and index caches in kvchunks regions under the model's chunk map (flash_kv.h), every
     // chunk online at boot (FLASH_CAP_POLICY=protected: the capacity is never lent); 0 (default): one cudaMalloc
     const int chunked = flashkv::env_mode();
-    if (chunked < 0) die("GR8_FLASH_KV_CHUNKS is 0 or 1");
+    if (chunked < 0) die("GR8_GLM53F_KV_CHUNKS is 0 or 1");
     int e = 0;
     if (chunked)
     {
         const uint32_t pages = (uint32_t)((capacity + g6kv::PAGE - 1) / g6kv::PAGE);
         int dev = 0;
         G6RT_CK(cudaGetDevice(&dev));
-        if (!m.fkv.pages && m.fkv.init(pages, UINT32_MAX, dev)) die("GR8_FLASH_KV_CHUNKS: " + m.fkv.err);
-        if (m.fkv.pages != pages) die("GR8_FLASH_KV_CHUNKS: the DSA layers' capacities differ");
+        if (!m.fkv.pages && m.fkv.init(pages, UINT32_MAX, dev)) die("GR8_GLM53F_KV_CHUNKS: " + m.fkv.err);
+        if (m.fkv.pages != pages) die("GR8_GLM53F_KV_CHUNKS: the DSA layers' capacities differ");
         G6KvChunks *mla = nullptr, *idx = nullptr;
-        if (m.fkv.add(&mla, &idx)) die("GR8_FLASH_KV_CHUNKS layer " + std::to_string(y.l) + ": " + m.fkv.err);
+        if (m.fkv.add(&mla, &idx)) die("GR8_GLM53F_KV_CHUNKS layer " + std::to_string(y.l) + ": " + m.fkv.err);
         e = g6_attn_bind_create_chunked(&y.ab, &y.ap, m.rank, y.l, capacity, MX, ATT_QT, st, mla, idx);
     }
     else e = g6_attn_bind_create_ext(&y.ab, &y.ap, m.rank, y.l, capacity, MX, ATT_QT, st, nullptr, 0);
@@ -99,10 +99,10 @@ inline const char* make_dsa(Model& m, int i, int M, const Find& find, bind::Laye
     if ((e = dtr::make_mat(T("o_proj.trellis"), T("o_proj.suh"), T("o_proj.svh"), dtr::SIDE_IN, opm))) return e;
     const bool qa_mx = T("q_a.mx.gv").p != nullptr, kva_mx = T("kv_a.mx.gv").p != nullptr;
     const bool wk_mx = T("idx.wk.mx.gv").p != nullptr, wqb_mx = T("idx.wq_b.mx.gv").p != nullptr;
-    const bool xin_ord = knob::dsa_xin_order();
-    const bool qb_rot  = knob::dsa_qb_rot();
-    const bool op_rot  = knob::dsa_oproj_rot().value_or(M > 1);
-    const int iq_tpc   = (int)knob::dsa_idxq_tpc();
+    const bool xin_ord = knob::glm53f_dsa_xin_order();
+    const bool qb_rot  = knob::glm53f_dsa_qb_rot();
+    const bool op_rot  = knob::glm53f_dsa_oproj_rot().value_or(M > 1);
+    const int iq_tpc   = (int)knob::glm53f_dsa_idxq_tpc();
     //                       tensor                                                 codec  tpc ks  M  fragments  output          dtype
     if ((e = bind::make_gv(T(qa_mx ? "q_a.mx.gv" : "q_a.gv"),                       qa_mx ? MXFP8 : BF16W,  2, 16, M, qa_mx ? sc.xf_x : sc.xb_x,  m.q_a,   gv::O_F16, L.q_a))) return e;
     if ((e = bind::make_gv(T(kva_mx ? "kv_a.mx.gv" : "kv_a.gv"),                    kva_mx ? MXFP8 : BF16W, 1, 32, M, kva_mx ? sc.xf_x : sc.xb_x, m.kv_a,  gv::O_F16, L.kv_a))) return e;
@@ -267,7 +267,7 @@ inline void launch_dsa_block(Model& m, int i, int M, int context, cudaStream_t s
     Layer& y = m.layers[i];
     if (!y.built[M]) die("launch_dsa_block: bind_dsa_layer did not run for layer " + std::to_string(y.l));
     const bind::Layer& b = y.L[M];
-    const int qb_fuse = (int)knob::dsa_qb_fuse();
+    const int qb_fuse = (int)knob::glm53f_dsa_qb_fuse();
     const bool use_qb_rot = b.q_b_t.on && !b.q_b_t.rot;
     dmark(DP_OTHER, st);
     if (b.x_in.n) bind::launch(b.x_in, st);
@@ -301,10 +301,10 @@ inline void launch_dsa_block(Model& m, int i, int M, int context, cudaStream_t s
     }
     else
     {
-        // GR8_FLASH_KV_CHUNKS: no step reaches a page whose chunk is offline (admission keeps contexts inside)
+        // GR8_GLM53F_KV_CHUNKS: no step reaches a page whose chunk is offline (admission keeps contexts inside)
         if (m.fkv.pages && (uint64_t)context > m.fkv.tokens())
             die("Flash DSA: context " + std::to_string(context) + " passes the " + std::to_string(m.fkv.tokens()) +
-                " tokens online (GR8_FLASH_KV_CHUNKS)");
+                " tokens online (GR8_GLM53F_KV_CHUNKS)");
         const G6AttnStep s = dsa_step(m, M, context);
         G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
     }

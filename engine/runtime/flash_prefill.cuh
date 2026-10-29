@@ -672,15 +672,15 @@ inline void pf_kda_oproj_gemm(Model& m, FlashPrefill& P, const kda::KdaLayer& w,
     bindp::launch(g, st, rs);
 }
 
-// GR8_KDA_SCAN (old name G9_KDA_SCAN; default 0 = the base KDA scan, untouched): 1 = the CH16 bf16-MMA scan
-// kda::g9::launch, a precision arm (not byte-exact). GR8_KDA_VS in {1, 2, 4} (default 2) is used only when the scan is on.
+// GR8_GLM53F_KDA_SCAN (old name G9_KDA_SCAN; default 0 = the base KDA scan, untouched): 1 = the CH16 bf16-MMA scan
+// kda::g9::launch, a precision arm (not byte-exact). GR8_GLM53F_KDA_VS in {1, 2, 4} (default 2) is used only when the scan is on.
 inline int pf_g9_scan()
 {
-    return (int)knob::kda_scan();   // 0 or 1: 2..4 = fused F1..F3 are not built
+    return (int)knob::glm53f_kda_scan();   // 0 or 1: 2..4 = fused F1..F3 are not built
 }
 inline int pf_g9_vs()
 {
-    return (int)knob::kda_vs();
+    return (int)knob::glm53f_kda_vs();
 }
 
 // KDA: projections (GEMMs for trellis q/k/v, else the decode GEMVs per MX chunk on the chunk's fragment tables), the
@@ -706,7 +706,7 @@ inline void pf_kda_block(Model& m, FlashPrefill& P, int i, int M, cudaStream_t s
     if (pf_g9_scan())
     {
         static bool said = false;   // once per process: lets the A/B harness check the ON arm really ran the G9 scan
-        if (!said) { said = true; fprintf(stderr, "# rank %d: GR8_KDA_SCAN on (VS %d)\n", P.f.rank, pf_g9_vs()); }
+        if (!said) { said = true; fprintf(stderr, "# rank %d: GR8_GLM53F_KDA_SCAN on (VS %d)\n", P.f.rank, pf_g9_vs()); }
         if (const char* e = kda::g9::launch(a, P.kps, pf_g9_vs(), st)) die(e);
     }
     else kda::launch_core_prefill(kda::make_pf_args(a, P.kps), st);

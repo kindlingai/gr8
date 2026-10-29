@@ -1,210 +1,237 @@
-# GLM-5.3-Flash: its KV, KDA and DSA layers. knobs/README.md describes the fields.
-prefix: "GR8_"
+# GLM-5.3-Flash only: its KV, KDA and DSA layers. knobs/README.md describes the fields.
+prefix: "GR8_GLM53F_"
 knobs:
-  GR8_DSA_IDXQ_TPC:
+  GR8_GLM53F_DSA_IDXQ_TPC:
     scope: agree
     kind: int
     default: "1"
+    legacy: ["G6_DSA_IDXQ_TPC", "GR8_DSA_IDXQ_TPC"]
     doc: >-
       Flash decode: tiles per CTA of the indexer's wq_b GEMV.
-  GR8_DSA_OPROJ_ROT:
+  GR8_GLM53F_DSA_OPROJ_ROT:
     scope: agree
     kind: flag
     unset: "1 for steps of more than one row, else 0"
     values: "0|1"
+    legacy: ["G6_DSA_OPROJ_ROT", "GR8_DSA_OPROJ_ROT"]
     doc: >-
       Flash decode: 1 = the o_proj trellis GEMV reads the attention output as rotated fragment tables, 0 = it rotates
       the attention output itself.
-  GR8_DSA_OPROJ_SPLIT:
+  GR8_GLM53F_DSA_OPROJ_SPLIT:
     scope: agree
     kind: ints
     unset: "4 k parts, 1 sub-part"
+    legacy: ["G6_DSA_OPROJ_SPLIT", "GR8_DSA_OPROJ_SPLIT"]
     doc: >-
       Dense trellis o_proj GEMV split as k1,s1[,k4,s4]: k parts and sub-parts at one row and at more rows.
-  GR8_DSA_QB_FUSE:
+  GR8_GLM53F_DSA_QB_FUSE:
     scope: agree
     kind: int
     default: "1"
     values: "0|1|2"
+    legacy: ["G6_DSA_QB_FUSE", "GR8_DSA_QB_FUSE"]
     doc: >-
       Flash decode: q_b and the indexer's wq_b GEMV run as one 640-CTA kernel (k_dsa_qb_idxq) when their shapes match. 2
       = the same with the indexer's CTAs first, 0 = two launches.
-  GR8_DSA_QB_ROT:
+  GR8_GLM53F_DSA_QB_ROT:
     scope: agree
     kind: flag
     default: "1"
+    legacy: ["G6_DSA_QB_ROT", "GR8_DSA_QB_ROT"]
     doc: >-
       Flash decode: the q_a norm kernel writes q_a rotated as the fragment tables the q_b trellis GEMV reads. 0 = the
       q_b GEMV rotates the q_a rows itself.
-  GR8_DSA_QB_SPLIT:
+  GR8_GLM53F_DSA_QB_SPLIT:
     scope: agree
     kind: ints
     unset: "QA/128 k parts (16 GLM, 12 Flash), 1 sub-part"
+    legacy: ["G6_DSA_QB_SPLIT", "GR8_DSA_QB_SPLIT"]
     doc: >-
       Dense trellis q_b GEMV split as k1,s1[,k4,s4]: k parts and sub-parts at one row and at more rows.
-  GR8_DSA_XIN_ORDER:
+  GR8_GLM53F_DSA_XIN_ORDER:
     scope: agree
     kind: flag
     default: "0"
+    legacy: ["G6_DSA_XIN_ORDER", "GR8_DSA_XIN_ORDER"]
     doc: >-
       Flash decode with GR8_GV_MULTI: a nonzero value launches the layer-input GEMVs in the order idx_k, q_a, idx_w,
       idx_g, kv_a instead of q_a, kv_a, idx_k, idx_w, idx_g.
-  GR8_FLASH_CACHE:
+  GR8_GLM53F_CACHE:
     scope: agree
     kind: text
     default: "off"
     values: "off|0|aligned|terminal"
+    legacy: ["G6_FLASH_CACHE", "GR8_FLASH_CACHE"]
     doc: >-
       GLM-5.3-Flash --serve with --prefill: aligned keeps session checkpoints so a later prompt with the same start is
       prefilled from there. terminal also checkpoints each request's end and is not cold-exact.
-  GR8_FLASH_DRAFT_CACHE_DUMP:
+  GR8_GLM53F_DRAFT_CACHE_DUMP:
     scope: local
     kind: path
     unset: "unset"
+    legacy: ["G6_FLASH_DRAFT_CACHE_DUMP", "GR8_FLASH_DRAFT_CACHE_DUMP"]
     doc: >-
       Flash with --mtp: each rank writes its draft cache pages before the first live draft to this path plus
       .s<seq>.r<rank>.bin.
-  GR8_FLASH_DRAFT_KV:
+  GR8_GLM53F_DRAFT_KV:
     scope: agree
     kind: flag
     default: "1"
+    legacy: ["G6_FLASH_DRAFT_KV", "GR8_FLASH_DRAFT_KV"]
     doc: >-
       Flash prefill fills the MTP draft's caches only. 0 = runs the full draft step over the prompt rows, which uses the
       draft fabric.
-  GR8_FLASH_KV_CHUNKS:
+  GR8_GLM53F_KV_CHUNKS:
     scope: agree
     kind: flag
     default: "0"
     values: "0|1"
+    legacy: ["G6_FLASH_KV_CHUNKS", "GR8_FLASH_KV_CHUNKS"]
     doc: >-
       Flash: the DSA MLA and index caches sit in kvchunks regions under one chunk map per model, so S2 Resize events can
       take chunks online or offline on every rank.
-  GR8_FLASH_KV_CRASH_AT:
+  GR8_GLM53F_KV_CRASH_AT:
     scope: local
     kind: text
     unset: "unset"
     values: "begun|synced|released"
+    legacy: ["G6_FLASH_KV_CRASH_AT", "GR8_FLASH_KV_CRASH_AT"]
     doc: >-
       Ends the process at that ledger point of a chunk resize (flash_kv.h).
-  GR8_FLASH_KV_IDLE_CHUNKS:
+  GR8_GLM53F_KV_IDLE_CHUNKS:
     scope: agree
     kind: int
     default: "1"
     values: "1.."
+    legacy: ["G6_FLASH_KV_IDLE_CHUNKS", "GR8_FLASH_KV_IDLE_CHUNKS"]
     doc: >-
       With GR8_FLASH_KV_LEND_MS, the chunks left online while the rest are lent. A request that fits them is admitted
       without a recall.
-  GR8_FLASH_KV_LEDGER:
+  GR8_GLM53F_KV_LEDGER:
     scope: local
     kind: path
     unset: "unset"
+    legacy: ["G6_FLASH_KV_LEDGER", "GR8_FLASH_KV_LEDGER"]
     doc: >-
       With GR8_FLASH_KV_CHUNKS=1, the box's host ledger that chunk resizes move bytes through. With GR8_FLASH_KV_LEND_MS
       the rank writes its lendable bytes to this path plus .gpu.
-  GR8_FLASH_KV_LEND_MS:
+  GR8_GLM53F_KV_LEND_MS:
     scope: agree
     kind: int
     default: "0"
     values: "0.."
+    legacy: ["G6_FLASH_KV_LEND_MS", "GR8_FLASH_KV_LEND_MS"]
     doc: >-
       With GR8_FLASH_KV_CHUNKS=1, once the serve is idle this many ms the head lends every chunk above
       GR8_FLASH_KV_IDLE_CHUNKS, and recalls them before a request that needs them. 0: never lend.
-  GR8_FLASH_RESET_ALL:
+  GR8_GLM53F_RESET_ALL:
     scope: local
     kind: flag
     default: "0"
+    legacy: ["G6_FLASH_RESET_ALL", "GR8_FLASH_RESET_ALL"]
     doc: >-
       Flash serve clears every attention cache page per request instead of only the pages the last request wrote.
-  GR8_FLASH_RESET_CHECK:
+  GR8_GLM53F_RESET_CHECK:
     scope: local
     kind: flag
     default: "0"
+    legacy: ["G6_FLASH_RESET_CHECK", "GR8_FLASH_RESET_CHECK"]
     doc: >-
       Flash serve stops if any cache page past the cleared ones is not zero. It reads every cache, so it is for tests.
-  GR8_FLASH_S2_COST:
+  GR8_GLM53F_S2_COST:
     scope: agree
     kind: flag
     default: "0"
+    legacy: ["G6_FLASH_S2_COST", "GR8_FLASH_S2_COST"]
     doc: >-
       Flash solo serving prices S2 rounds with spec_len.h's Flash cost table for this build's width instead of the GLM
       step costs.
-  GR8_FLASH_STATE_BUDGET_MIB:
+  GR8_GLM53F_STATE_BUDGET_MIB:
     scope: agree
     kind: int
     default: "8192"
+    legacy: ["G6_FLASH_STATE_BUDGET_MIB", "GR8_FLASH_STATE_BUDGET_MIB"]
     doc: >-
       With GR8_FLASH_CACHE and no --kv-store, the size in MiB of each rank's in-memory checkpoint store.
-  GR8_KDA_MX:
+  GR8_GLM53F_KDA_MX:
     scope: agree
     kind: flag
     default: "1"
     values: "0|1"
+    legacy: ["G6_KDA_MX", "GR8_KDA_MX"]
     doc: >-
       KDA decode q / k / v read MXFP8 records built at bind with FP16 activations. 0 reads the BF16 weights. Not byte-
       exact, and the records are an extra copy outside the loader's accounting.
-  GR8_KDA_OPROJ_SPLIT:
+  GR8_GLM53F_KDA_OPROJ_SPLIT:
     scope: agree
     kind: ints
     unset: "ks 8 at 1 row, 4 at 2+ rows, sub 1"
+    legacy: ["G6_KDA_OPROJ_SPLIT", "GR8_KDA_OPROJ_SPLIT"]
     doc: >-
       Sets the k-split and sub-split of the KDA o_proj trellis GEMV as k1,s1,k4,s4 (1 row, then 2+ rows), in
       `kernels/dtr.cuh`.
-  GR8_KDA_PF_IN1:
+  GR8_GLM53F_KDA_PF_IN1:
     scope: agree
     kind: flag
     default: "0"
     values: "0|1"
+    legacy: ["G6_KDA_PF_IN1", "GR8_KDA_PF_IN1"]
     doc: >-
       1 runs the older v1 intra-chunk kernel in KDA prefill instead of k_kda_intra3.
-  GR8_KDA_PF_P1:
+  GR8_GLM53F_KDA_PF_P1:
     scope: agree
     kind: flag
     default: "0"
     values: "0|1"
+    legacy: ["G6_KDA_PF_P1", "GR8_KDA_PF_P1"]
     doc: >-
       1 runs the older row-loop prep kernel in KDA prefill instead of launch_prep_pf.
-  GR8_KDA_PF_ST1:
+  GR8_GLM53F_KDA_PF_ST1:
     scope: agree
     kind: flag
     default: "0"
     values: "0|1"
+    legacy: ["G6_KDA_PF_ST1", "GR8_KDA_PF_ST1"]
     doc: >-
       1 runs the older v1 state kernel in KDA prefill instead of k_kda_state2.
-  GR8_KDA_PROJ_KS:
+  GR8_GLM53F_KDA_PROJ_KS:
     scope: agree
     kind: int
     default: "16"
     values: "8|16|32"
+    legacy: ["G6_KDA_PROJ_KS", "GR8_KDA_PROJ_KS"]
     doc: >-
       Sets the k-split of the KDA trellis q / k / v projection GEMV.
-  GR8_KDA_PROJ_MODE:
+  GR8_GLM53F_KDA_PROJ_MODE:
     scope: agree
     kind: int
     default: "0"
     values: "0|1|2"
+    legacy: ["G6_KDA_PROJ_MODE", "GR8_KDA_PROJ_MODE"]
     doc: >-
       Picks how the KDA trellis q / k / v projection rotates its input: 0 inside the GEMV, 1 and 2 in a separate pre-
       rotate launch that also carries the f_a / g_a / b GEMVs (1) or not (2).
-  GR8_KDA_SCAN:
+  GR8_GLM53F_KDA_SCAN:
     scope: agree
     kind: int
     default: "0"
     values: "0|1"
-    legacy: ["G9_KDA_SCAN"]
+    legacy: ["G9_KDA_SCAN", "GR8_KDA_SCAN"]
     doc: >-
       1 runs the Flash KDA prefill scan as the CH16 bf16-MMA scan (`kda/kda_g9.cuh`), a precision arm that is not
       byte-exact. 0 runs the base scan.
-  GR8_KDA_STATE_DUMP:
+  GR8_GLM53F_KDA_STATE_DUMP:
     scope: local
     kind: path
     unset: "unset"
+    legacy: ["G6_KDA_STATE_DUMP", "GR8_KDA_STATE_DUMP"]
     doc: >-
       After each offline sequence, each rank writes the KDA S state and conv state of every layer to PATH.rank<R>.
-  GR8_KDA_VS:
+  GR8_GLM53F_KDA_VS:
     scope: agree
     kind: int
     default: "2"
     values: "1|2|4"
-    legacy: ["G9_KDA_VS"]
+    legacy: ["G9_KDA_VS", "GR8_KDA_VS"]
     doc: >-
       With GR8_KDA_SCAN=1, the v slices per head of the G9 KDA scan kernel: 1, 2 or 4.

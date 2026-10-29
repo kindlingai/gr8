@@ -28,7 +28,7 @@ namespace knob
 
 /// Prints the environment's problems (bad values, unknown GR8_ names, old G6_ names) to stderr and returns the number
 /// of errors. The engine stops when it is not 0.
-inline int init() { return gr8_knobs_init(0x997b179e91d88be8ull); }
+inline int init() { return gr8_knobs_init(0x01788a50fbb54ebbull); }
 
 /// The set agree-scope knobs that differ from their defaults, as " env NAME=value ...", or "".
 inline std::string signature() { return gr8_knobs_signature(); }
@@ -435,414 +435,414 @@ inline std::optional<int64_t> draft_par()
     return v;
 }
 
-/// GR8_DSA_IDXQ_TPC
-inline int64_t dsa_idxq_tpc()
-{
-    static const int64_t v = *detail::int_(51, 0);
-    return v;
-}
-
-/// GR8_DSA_OPROJ_ROT
-inline std::optional<bool> dsa_oproj_rot()
-{
-    static const std::optional<bool> v = detail::flag(52, 0);
-    return v;
-}
-
-/// GR8_DSA_OPROJ_SPLIT
-inline const std::optional<std::vector<int64_t>>& dsa_oproj_split()
-{
-    static const std::optional<std::vector<int64_t>> v = detail::ints(53, 0);
-    return v;
-}
-
-/// GR8_DSA_QB_FUSE
-inline int64_t dsa_qb_fuse()
-{
-    static const int64_t v = *detail::int_(54, 0);
-    return v;
-}
-
-/// GR8_DSA_QB_ROT
-inline bool dsa_qb_rot()
-{
-    static const bool v = *detail::flag(55, 0);
-    return v;
-}
-
-/// GR8_DSA_QB_SPLIT
-inline const std::optional<std::vector<int64_t>>& dsa_qb_split()
-{
-    static const std::optional<std::vector<int64_t>> v = detail::ints(56, 0);
-    return v;
-}
-
-/// GR8_DSA_XIN_ORDER
-inline bool dsa_xin_order()
-{
-    static const bool v = *detail::flag(57, 0);
-    return v;
-}
-
 /// GR8_DTR
 inline bool dtr()
 {
-    static const bool v = *detail::flag(58, 0);
+    static const bool v = *detail::flag(51, 0);
     return v;
 }
 
 /// GR8_DTR_NBFAST
 inline bool dtr_nbfast()
 {
-    static const bool v = *detail::flag(59, 0);
+    static const bool v = *detail::flag(52, 0);
     return v;
 }
 
 /// GR8_DTR_NBFAST_OUT
 inline bool dtr_nbfast_out()
 {
-    static const bool v = *detail::flag(60, 0);
+    static const bool v = *detail::flag(53, 0);
     return v;
 }
 
 /// GR8_DTR_PF_COPY
 inline bool dtr_pf_copy()
 {
-    static const bool v = *detail::flag(61, 0);
+    static const bool v = *detail::flag(54, 0);
     return v;
 }
 
 /// GR8_DTR_PF_KDA_COPY
 inline bool dtr_pf_kda_copy()
 {
-    static const bool v = *detail::flag(62, 0);
+    static const bool v = *detail::flag(55, 0);
     return v;
 }
 
 /// GR8_DTR_PF_SHARE_SUH
 inline bool dtr_pf_share_suh()
 {
-    static const bool v = *detail::flag(63, 0);
+    static const bool v = *detail::flag(56, 0);
     return v;
 }
 
 /// GR8_ENV
 inline const std::optional<std::string>& env()
 {
-    static const std::optional<std::string> v = detail::text(64, 0);
+    static const std::optional<std::string> v = detail::text(57, 0);
     return v;
 }
 
 /// GR8_FABRIC_CONNECT_TRIES
 inline int64_t fabric_connect_tries()
 {
-    static const int64_t v = *detail::int_(65, 0);
+    static const int64_t v = *detail::int_(58, 0);
     return v;
 }
 
 /// GR8_FETCH_WORKERS
 inline std::optional<int64_t> fetch_workers()
 {
-    static const std::optional<int64_t> v = detail::int_(66, 0);
-    return v;
-}
-
-/// GR8_FLASH_CACHE
-inline const std::string& flash_cache()
-{
-    static const std::string v = *detail::text(67, 0);
-    return v;
-}
-
-/// GR8_FLASH_DRAFT_CACHE_DUMP
-inline const std::optional<std::string>& flash_draft_cache_dump()
-{
-    static const std::optional<std::string> v = detail::text(68, 0);
-    return v;
-}
-
-/// GR8_FLASH_DRAFT_KV
-inline bool flash_draft_kv()
-{
-    static const bool v = *detail::flag(69, 0);
-    return v;
-}
-
-/// GR8_FLASH_KV_CHUNKS
-inline bool flash_kv_chunks()
-{
-    static const bool v = *detail::flag(70, 0);
-    return v;
-}
-
-/// GR8_FLASH_KV_CRASH_AT
-inline const std::optional<std::string>& flash_kv_crash_at()
-{
-    static const std::optional<std::string> v = detail::text(71, 0);
-    return v;
-}
-
-/// GR8_FLASH_KV_IDLE_CHUNKS
-inline int64_t flash_kv_idle_chunks()
-{
-    static const int64_t v = *detail::int_(72, 0);
-    return v;
-}
-
-/// GR8_FLASH_KV_LEDGER
-inline const std::optional<std::string>& flash_kv_ledger()
-{
-    static const std::optional<std::string> v = detail::text(73, 0);
-    return v;
-}
-
-/// GR8_FLASH_KV_LEND_MS
-inline int64_t flash_kv_lend_ms()
-{
-    static const int64_t v = *detail::int_(74, 0);
-    return v;
-}
-
-/// GR8_FLASH_RESET_ALL
-inline bool flash_reset_all()
-{
-    static const bool v = *detail::flag(75, 0);
-    return v;
-}
-
-/// GR8_FLASH_RESET_CHECK
-inline bool flash_reset_check()
-{
-    static const bool v = *detail::flag(76, 0);
-    return v;
-}
-
-/// GR8_FLASH_S2_COST
-inline bool flash_s2_cost()
-{
-    static const bool v = *detail::flag(77, 0);
-    return v;
-}
-
-/// GR8_FLASH_STATE_BUDGET_MIB
-inline int64_t flash_state_budget_mib()
-{
-    static const int64_t v = *detail::int_(78, 0);
+    static const std::optional<int64_t> v = detail::int_(59, 0);
     return v;
 }
 
 /// GR8_FPF_ATTN_P1
 inline bool fpf_attn_p1()
 {
-    static const bool v = *detail::flag(79, 0);
+    static const bool v = *detail::flag(60, 0);
     return v;
 }
 
 /// GR8_FPF_DENSE_P1
 inline bool fpf_dense_p1()
 {
-    static const bool v = *detail::flag(80, 0);
+    static const bool v = *detail::flag(61, 0);
     return v;
 }
 
 /// GR8_FPF_DSA_P1
 inline bool fpf_dsa_p1()
 {
-    static const bool v = *detail::flag(81, 0);
+    static const bool v = *detail::flag(62, 0);
     return v;
 }
 
 /// GR8_FPF_KDA_P1
 inline bool fpf_kda_p1()
 {
-    static const bool v = *detail::flag(82, 0);
+    static const bool v = *detail::flag(63, 0);
     return v;
 }
 
 /// GR8_FPF_P1
 inline bool fpf_p1()
 {
-    static const bool v = *detail::flag(83, 0);
+    static const bool v = *detail::flag(64, 0);
     return v;
 }
 
 /// GR8_FUSE
 inline int64_t fuse()
 {
-    static const int64_t v = *detail::int_(84, 0);
+    static const int64_t v = *detail::int_(65, 0);
     return v;
 }
 
 /// GR8_GEMM
 inline int64_t gemm()
 {
-    static const int64_t v = *detail::int_(85, 0);
+    static const int64_t v = *detail::int_(66, 0);
+    return v;
+}
+
+/// GR8_GLM53F_CACHE
+inline const std::string& glm53f_cache()
+{
+    static const std::string v = *detail::text(67, 0);
+    return v;
+}
+
+/// GR8_GLM53F_DRAFT_CACHE_DUMP
+inline const std::optional<std::string>& glm53f_draft_cache_dump()
+{
+    static const std::optional<std::string> v = detail::text(68, 0);
+    return v;
+}
+
+/// GR8_GLM53F_DRAFT_KV
+inline bool glm53f_draft_kv()
+{
+    static const bool v = *detail::flag(69, 0);
+    return v;
+}
+
+/// GR8_GLM53F_DSA_IDXQ_TPC
+inline int64_t glm53f_dsa_idxq_tpc()
+{
+    static const int64_t v = *detail::int_(70, 0);
+    return v;
+}
+
+/// GR8_GLM53F_DSA_OPROJ_ROT
+inline std::optional<bool> glm53f_dsa_oproj_rot()
+{
+    static const std::optional<bool> v = detail::flag(71, 0);
+    return v;
+}
+
+/// GR8_GLM53F_DSA_OPROJ_SPLIT
+inline const std::optional<std::vector<int64_t>>& glm53f_dsa_oproj_split()
+{
+    static const std::optional<std::vector<int64_t>> v = detail::ints(72, 0);
+    return v;
+}
+
+/// GR8_GLM53F_DSA_QB_FUSE
+inline int64_t glm53f_dsa_qb_fuse()
+{
+    static const int64_t v = *detail::int_(73, 0);
+    return v;
+}
+
+/// GR8_GLM53F_DSA_QB_ROT
+inline bool glm53f_dsa_qb_rot()
+{
+    static const bool v = *detail::flag(74, 0);
+    return v;
+}
+
+/// GR8_GLM53F_DSA_QB_SPLIT
+inline const std::optional<std::vector<int64_t>>& glm53f_dsa_qb_split()
+{
+    static const std::optional<std::vector<int64_t>> v = detail::ints(75, 0);
+    return v;
+}
+
+/// GR8_GLM53F_DSA_XIN_ORDER
+inline bool glm53f_dsa_xin_order()
+{
+    static const bool v = *detail::flag(76, 0);
+    return v;
+}
+
+/// GR8_GLM53F_KDA_MX
+inline bool glm53f_kda_mx()
+{
+    static const bool v = *detail::flag(77, 0);
+    return v;
+}
+
+/// GR8_GLM53F_KDA_OPROJ_SPLIT
+inline const std::optional<std::vector<int64_t>>& glm53f_kda_oproj_split()
+{
+    static const std::optional<std::vector<int64_t>> v = detail::ints(78, 0);
+    return v;
+}
+
+/// GR8_GLM53F_KDA_PF_IN1
+inline bool glm53f_kda_pf_in1()
+{
+    static const bool v = *detail::flag(79, 0);
+    return v;
+}
+
+/// GR8_GLM53F_KDA_PF_P1
+inline bool glm53f_kda_pf_p1()
+{
+    static const bool v = *detail::flag(80, 0);
+    return v;
+}
+
+/// GR8_GLM53F_KDA_PF_ST1
+inline bool glm53f_kda_pf_st1()
+{
+    static const bool v = *detail::flag(81, 0);
+    return v;
+}
+
+/// GR8_GLM53F_KDA_PROJ_KS
+inline int64_t glm53f_kda_proj_ks()
+{
+    static const int64_t v = *detail::int_(82, 0);
+    return v;
+}
+
+/// GR8_GLM53F_KDA_PROJ_MODE
+inline int64_t glm53f_kda_proj_mode()
+{
+    static const int64_t v = *detail::int_(83, 0);
+    return v;
+}
+
+/// GR8_GLM53F_KDA_SCAN
+inline int64_t glm53f_kda_scan()
+{
+    static const int64_t v = *detail::int_(84, 0);
+    return v;
+}
+
+/// GR8_GLM53F_KDA_STATE_DUMP
+inline const std::optional<std::string>& glm53f_kda_state_dump()
+{
+    static const std::optional<std::string> v = detail::text(85, 0);
+    return v;
+}
+
+/// GR8_GLM53F_KDA_VS
+inline int64_t glm53f_kda_vs()
+{
+    static const int64_t v = *detail::int_(86, 0);
+    return v;
+}
+
+/// GR8_GLM53F_KV_CHUNKS
+inline bool glm53f_kv_chunks()
+{
+    static const bool v = *detail::flag(87, 0);
+    return v;
+}
+
+/// GR8_GLM53F_KV_CRASH_AT
+inline const std::optional<std::string>& glm53f_kv_crash_at()
+{
+    static const std::optional<std::string> v = detail::text(88, 0);
+    return v;
+}
+
+/// GR8_GLM53F_KV_IDLE_CHUNKS
+inline int64_t glm53f_kv_idle_chunks()
+{
+    static const int64_t v = *detail::int_(89, 0);
+    return v;
+}
+
+/// GR8_GLM53F_KV_LEDGER
+inline const std::optional<std::string>& glm53f_kv_ledger()
+{
+    static const std::optional<std::string> v = detail::text(90, 0);
+    return v;
+}
+
+/// GR8_GLM53F_KV_LEND_MS
+inline int64_t glm53f_kv_lend_ms()
+{
+    static const int64_t v = *detail::int_(91, 0);
+    return v;
+}
+
+/// GR8_GLM53F_RESET_ALL
+inline bool glm53f_reset_all()
+{
+    static const bool v = *detail::flag(92, 0);
+    return v;
+}
+
+/// GR8_GLM53F_RESET_CHECK
+inline bool glm53f_reset_check()
+{
+    static const bool v = *detail::flag(93, 0);
+    return v;
+}
+
+/// GR8_GLM53F_S2_COST
+inline bool glm53f_s2_cost()
+{
+    static const bool v = *detail::flag(94, 0);
+    return v;
+}
+
+/// GR8_GLM53F_STATE_BUDGET_MIB
+inline int64_t glm53f_state_budget_mib()
+{
+    static const int64_t v = *detail::int_(95, 0);
     return v;
 }
 
 /// GR8_GV_MULTI
 inline bool gv_multi()
 {
-    static const bool v = *detail::flag(86, 0);
+    static const bool v = *detail::flag(96, 0);
     return v;
 }
 
 /// GR8_HF_ENDPOINT
 inline const std::optional<std::string>& hf_endpoint()
 {
-    static const std::optional<std::string> v = detail::text(87, 0);
+    static const std::optional<std::string> v = detail::text(97, 0);
     return v;
 }
 
 /// GR8_HOME
 inline const std::optional<std::string>& home()
 {
-    static const std::optional<std::string> v = detail::text(88, 0);
+    static const std::optional<std::string> v = detail::text(98, 0);
     return v;
 }
 
 /// GR8_IDXQ_SPLIT
 inline std::optional<bool> idxq_split()
 {
-    static const std::optional<bool> v = detail::flag(89, 0);
+    static const std::optional<bool> v = detail::flag(99, 0);
     return v;
 }
 
 /// GR8_IDX_GRP
 inline int64_t idx_grp()
 {
-    static const int64_t v = *detail::int_(90, 0);
+    static const int64_t v = *detail::int_(100, 0);
     return v;
 }
 
 /// GR8_IDX_VEC
 inline bool idx_vec()
 {
-    static const bool v = *detail::flag(91, 0);
+    static const bool v = *detail::flag(101, 0);
     return v;
 }
 
 /// GR8_IMAGE
 inline const std::optional<std::string>& image()
 {
-    static const std::optional<std::string> v = detail::text(92, 0);
+    static const std::optional<std::string> v = detail::text(102, 0);
     return v;
 }
 
 /// GR8_IMG_VMM
 inline int64_t img_vmm()
 {
-    static const int64_t v = *detail::int_(93, 0);
+    static const int64_t v = *detail::int_(103, 0);
     return v;
 }
 
 /// GR8_K1_FUSE_POLICY
 inline bool k1_fuse_policy()
 {
-    static const bool v = *detail::flag(94, 0);
+    static const bool v = *detail::flag(104, 0);
     return v;
 }
 
 /// GR8_K1_SPLIT
 inline const std::optional<std::string>& k1_split()
 {
-    static const std::optional<std::string> v = detail::text(95, 0);
+    static const std::optional<std::string> v = detail::text(105, 0);
     return v;
 }
 
 /// GR8_K1_SPLIT_M1
 inline const std::optional<std::vector<int64_t>>& k1_split_m1()
 {
-    static const std::optional<std::vector<int64_t>> v = detail::ints(96, 0);
+    static const std::optional<std::vector<int64_t>> v = detail::ints(106, 0);
     return v;
 }
 
 /// GR8_K1_SPLIT_M2
 inline const std::optional<std::vector<int64_t>>& k1_split_m2()
 {
-    static const std::optional<std::vector<int64_t>> v = detail::ints(97, 0);
+    static const std::optional<std::vector<int64_t>> v = detail::ints(107, 0);
     return v;
 }
 
 /// GR8_K1_SPLIT_M4
 inline const std::optional<std::vector<int64_t>>& k1_split_m4()
 {
-    static const std::optional<std::vector<int64_t>> v = detail::ints(98, 0);
+    static const std::optional<std::vector<int64_t>> v = detail::ints(108, 0);
     return v;
 }
 
 /// GR8_K1_TLBW
 inline int64_t k1_tlbw()
-{
-    static const int64_t v = *detail::int_(99, 0);
-    return v;
-}
-
-/// GR8_KDA_MX
-inline bool kda_mx()
-{
-    static const bool v = *detail::flag(100, 0);
-    return v;
-}
-
-/// GR8_KDA_OPROJ_SPLIT
-inline const std::optional<std::vector<int64_t>>& kda_oproj_split()
-{
-    static const std::optional<std::vector<int64_t>> v = detail::ints(101, 0);
-    return v;
-}
-
-/// GR8_KDA_PF_IN1
-inline bool kda_pf_in1()
-{
-    static const bool v = *detail::flag(102, 0);
-    return v;
-}
-
-/// GR8_KDA_PF_P1
-inline bool kda_pf_p1()
-{
-    static const bool v = *detail::flag(103, 0);
-    return v;
-}
-
-/// GR8_KDA_PF_ST1
-inline bool kda_pf_st1()
-{
-    static const bool v = *detail::flag(104, 0);
-    return v;
-}
-
-/// GR8_KDA_PROJ_KS
-inline int64_t kda_proj_ks()
-{
-    static const int64_t v = *detail::int_(105, 0);
-    return v;
-}
-
-/// GR8_KDA_PROJ_MODE
-inline int64_t kda_proj_mode()
-{
-    static const int64_t v = *detail::int_(106, 0);
-    return v;
-}
-
-/// GR8_KDA_SCAN
-inline int64_t kda_scan()
-{
-    static const int64_t v = *detail::int_(107, 0);
-    return v;
-}
-
-/// GR8_KDA_STATE_DUMP
-inline const std::optional<std::string>& kda_state_dump()
-{
-    static const std::optional<std::string> v = detail::text(108, 0);
-    return v;
-}
-
-/// GR8_KDA_VS
-inline int64_t kda_vs()
 {
     static const int64_t v = *detail::int_(109, 0);
     return v;

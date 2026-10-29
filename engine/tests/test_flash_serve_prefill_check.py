@@ -1,6 +1,6 @@
 """Compile the actual serve prefill lambda against CPU mocks: where its fences and error checks fall.
 
-The draft's cache fill (default) checks once after the last chunk; the GR8_FLASH_DRAFT_KV=0 draft step checks after the
+The draft's cache fill (default) checks once after the last chunk; the GR8_GLM53F_DRAFT_KV=0 draft step checks after the
 main prefill and after every chunk, as before. Every case: an error word set by the main prefill or by any draft chunk
 still fails the request before the lambda returns, the fences are the same in both modes (one after the main prefill,
 one per chunk), and the request's work is the same calls in the same order. The words check() reads stay set until the
@@ -68,9 +68,9 @@ void pf_step2_flash(Main&, FlashPrefill&, FlashPrefill&, int, int, int, int, u64
 void draft_chunk() { events += 'D'; if (chunk++ == inject) word = 1; }
 void pf_draft_cache_flash(Draft&, int, int, int) { draft_chunk(); }
 void launch_draft_step(Draft&, int, int, bool, int) { draft_chunk(); }
-// the knobs the lambda reads, set per case (the engine reads each once per process): GR8_FLASH_DRAFT_KV, and
+// the knobs the lambda reads, set per case (the engine reads each once per process): GR8_GLM53F_DRAFT_KV, and
 // GR8_PF_DRAFT_FULL, the lane's whole draft cache fill in one call (=2, the engine's compare arm, is not run here)
-namespace knob { bool draft_kv = true; inline bool flash_draft_kv() { return draft_kv; } }
+namespace knob { bool draft_kv = true; inline bool glm53f_draft_kv() { return draft_kv; } }
 int draft_full_knob = 1;
 int pf_draft_full() { return draft_full_knob; }
 bool pf_draft_full_ok(Draft&) { return true; }
@@ -96,7 +96,7 @@ int main() {
     u64 pfseq = 1, pfseq2 = 1, dseq = 0;
     auto fence = [&] { events += 'F'; };
     auto check = [&] { events += 'C'; assert(!c.main.s2on && !c.draft.d.s2on); require(!word, "Flash serve fabric/attention error"); };
-    uint32_t capture_at = 0;          // GR8_FLASH_CACHE: the live request's checkpoint point (0: none)
+    uint32_t capture_at = 0;          // GR8_GLM53F_CACHE: the live request's checkpoint point (0: none)
     std::vector<int> capture_tokens;
     u64 capture_req = 0;
     int dirty = 0;                    // the partial reset's bound: the end of the rows written since the last reset
@@ -165,7 +165,7 @@ int main() {
                 }
         }
     knob::draft_kv = true; draft_full_knob = 1;
-    // GR8_FLASH_CACHE: the quantum that ends at the checkpoint point notes its tokens [0, p] and the request; another
+    // GR8_GLM53F_CACHE: the quantum that ends at the checkpoint point notes its tokens [0, p] and the request; another
     // quantum leaves it pending
     word = 0; inject = -1; sc.prefill_rows = 8; sc.two_lanes = false;
     for (int i = 0; i < 64; ++i) p.prompt[i] = 100 + i;

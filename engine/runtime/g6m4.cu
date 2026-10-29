@@ -118,7 +118,7 @@
 #include "../comms/progress_cpus.h"
 #include "s2/native.cuh"
 #include "s2/flash_native.cuh"
-#include "s2/flash_checkpoint.h"   // GR8_FLASH_CACHE parsed in every build, refused outside Flash
+#include "s2/flash_checkpoint.h"   // GR8_GLM53F_CACHE parsed in every build, refused outside Flash
 #include "s2/cp_rows.h"
 #include "s2/pool.h"
 #include "s2/kv_tier.cuh"
@@ -424,11 +424,11 @@ int main(int argc, char** argv)
             die("GR8_MTP_KSTOPB needs --serve; GR8_MTP_KSTOPB_EXPLORE >= 0");
         if (!kstop.b.mode) kstop.b = s2::KStopB();
     }
-    // GR8_FLASH_CACHE (s2/flash_checkpoint.h): Flash session checkpoints under --serve, in place of prefix reuse. Its
-    // store is the one --kv-store (a lease of its own), else this process's memory, GR8_FLASH_STATE_BUDGET_MIB a rank
+    // GR8_GLM53F_CACHE (s2/flash_checkpoint.h): Flash session checkpoints under --serve, in place of prefix reuse. Its
+    // store is the one --kv-store (a lease of its own), else this process's memory, GR8_GLM53F_STATE_BUDGET_MIB a rank
     g6s2::FlashCache flash_cache = g6s2::FlashCache::Off;
-    try { flash_cache = g6s2::flash_cache_mode(knob::flash_cache().c_str()); } catch (const std::exception& e) { die(e.what()); }
-    const long long flash_budget_mib = knob::flash_state_budget_mib();
+    try { flash_cache = g6s2::flash_cache_mode(knob::glm53f_cache().c_str()); } catch (const std::exception& e) { die(e.what()); }
+    const long long flash_budget_mib = knob::glm53f_state_budget_mib();
 #if G6_MODEL_FLASH
     // Flash: --s2-sessions 1 (the default) is the solo path; 2..8 share the --cap pool (s2/flash_native.cuh)
     if (s2mode && (reuse_prefix || dfl || plan.rs))
@@ -436,17 +436,17 @@ int main(int argc, char** argv)
     if (s2mode && s2sess > 1 && s2sess * (mtp + 1) > MX)
         die("Flash serve: --s2-sessions x (--mtp + 1) rows exceed G6_MX (every session's round is one step)");
     if (flash_cache != g6s2::FlashCache::Off) {
-        if (!s2mode || !MP) die("GR8_FLASH_CACHE needs --serve and tensor prefill (--prefill N)");
-        if (kv_tiers.size() > 1) die("GR8_FLASH_CACHE: one --kv-store at most (its checkpoint store)");
-        if (kv_tiers.empty() && flash_budget_mib < 1) die("GR8_FLASH_STATE_BUDGET_MIB: >= 1");
+        if (!s2mode || !MP) die("GR8_GLM53F_CACHE needs --serve and tensor prefill (--prefill N)");
+        if (kv_tiers.size() > 1) die("GR8_GLM53F_CACHE: one --kv-store at most (its checkpoint store)");
+        if (kv_tiers.empty() && flash_budget_mib < 1) die("GR8_GLM53F_STATE_BUDGET_MIB: >= 1");
         // the checkpoints keep one live request's state (session 0's KDA ring): one session only
-        if (s2sess != 1) die("GR8_FLASH_CACHE needs --s2-sessions 1");
+        if (s2sess != 1) die("GR8_GLM53F_CACHE needs --s2-sessions 1");
     }
-    if (!kv_tiers.empty() && flash_cache == g6s2::FlashCache::Off) die("--kv-store on Flash needs GR8_FLASH_CACHE (its checkpoint store)");
+    if (!kv_tiers.empty() && flash_cache == g6s2::FlashCache::Off) die("--kv-store on Flash needs GR8_GLM53F_CACHE (its checkpoint store)");
     if (s2mode && s2sess != 1 && flashkv::env_mode() == 1)
-        die("GR8_FLASH_KV_CHUNKS needs --s2-sessions 1");
+        die("GR8_GLM53F_KV_CHUNKS needs --s2-sessions 1");
 #else
-    if (flash_cache != g6s2::FlashCache::Off) die("GR8_FLASH_CACHE is GLM-5.3-Flash only (bin/g6m4_flash)");
+    if (flash_cache != g6s2::FlashCache::Off) die("GR8_GLM53F_CACHE is GLM-5.3-Flash only (bin/g6m4_flash)");
     // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under S2 every retired session's run (s2/pool.h).
     // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
     if (!kv_tiers.empty() && !(s2mode && reuse_prefix)) die("--kv-store needs --serve and --reuse-prefix (it keeps the runs prefix reuse retains)");
@@ -1492,7 +1492,7 @@ int main(int argc, char** argv)
             " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id +
             (s2sess > 1 ? " sessions " + std::to_string(s2sess) + " split " + std::to_string(gsplit) : std::string()) +
             knob::signature();
-        // GR8_FLASH_CACHE: the checkpoint store of this rank. Every rank must keep the same entries, so the mode, the
+        // GR8_GLM53F_CACHE: the checkpoint store of this rank. Every rank must keep the same entries, so the mode, the
         // store's blocks and the grid join the signature
         std::unique_ptr<g6s2::FlashCheckpoints> ckpt;
         if (flash_cache != g6s2::FlashCache::Off)
@@ -1511,8 +1511,8 @@ int main(int argc, char** argv)
             if (!kv_tiers.empty())
             {
                 g6s2::TierSpec t;
-                try { t = g6s2::TierSpec::parse(kv_tiers[0], false); } catch (const std::exception& e) { die(std::string("GR8_FLASH_CACHE: ") + e.what()); }
-                if (t.persist) die("GR8_FLASH_CACHE: persist=on is not supported (checkpoints live for one boot)");
+                try { t = g6s2::TierSpec::parse(kv_tiers[0], false); } catch (const std::exception& e) { die(std::string("GR8_GLM53F_CACHE: ") + e.what()); }
+                if (t.persist) die("GR8_GLM53F_CACHE: persist=on is not supported (checkpoints live for one boot)");
                 spec = t.store; bytes = t.bytes;
                 // group=: the lease shares its KV node with other clusters (s2/flash_checkpoint.h); it starts at size=
                 if (!t.group.empty()) group = g6s2::FlashGroup{t.group, (uint32_t)g6nr::NR, (uint32_t)R, t.cap, t.weight};
@@ -1534,24 +1534,24 @@ int main(int argc, char** argv)
                 std::to_string(v.bindings.size()) + " state " + std::to_string(v.state_bytes()) + " format " +
                 std::to_string(g6s2::FlashManifest::FORMAT) + " engine " + exe;
             try { ckpt.reset(new g6s2::FlashCheckpoints(v, spec, name, bytes, compat, group ? &*group : nullptr)); }
-            catch (const std::exception& e) { die(std::string("GR8_FLASH_CACHE: ") + e.what()); }
+            catch (const std::exception& e) { die(std::string("GR8_GLM53F_CACHE: ") + e.what()); }
             fprintf(stderr, "# rank %d: flash ckpt %s: %s, %llu blocks of %zu B (%zu bindings, KDA state %.1f MB = %llu blocks), grid %d rows%s\n",
                     R, g6s2::flash_cache_name(flash_cache), ckpt->describe().c_str(), (unsigned long long)ckpt->blocks(), ckpt->slot_bytes(),
                     v.bindings.size(), v.state_bytes() / 1e6, (unsigned long long)(ckpt->entry_blocks(0) - 1), MP * (two ? 2 : 1),
                     group ? (", group " + group->group + " lease, " + std::to_string(ckpt->segments()) + " segments to start").c_str() : "");
             bc.runtime_signature += std::string(" ckpt ") + g6s2::flash_cache_name(flash_cache) + " blocks " + std::to_string(ckpt->blocks());
         }
-        // GR8_FLASH_KV_CHUNKS=1 (borrow-idle): hooks serve_flash adds to its own before the service starts
+        // GR8_GLM53F_KV_CHUNKS=1 (borrow-idle): hooks serve_flash adds to its own before the service starts
         auto flash_install = [&](g6s2::NativeHooks& h) {
-            // GR8_FLASH_KV_CHUNKS=1: a Resize event on tier FLASH_KV_TIER takes every model's chunk map to r.segs chunks
-            // online, on every rank at the commit (flash_kv.h; with GR8_FLASH_KV_LEDGER the bytes move through the box's
-            // host ledger). The head announces them under FLASH_CAP_POLICY=borrow-idle (GR8_FLASH_KV_LEND_MS > 0, s2/flash_lend.h):
-            // a lend down to GR8_FLASH_KV_IDLE_CHUNKS once idle that long, a recall before a request that needs more. Every
+            // GR8_GLM53F_KV_CHUNKS=1: a Resize event on tier FLASH_KV_TIER takes every model's chunk map to r.segs chunks
+            // online, on every rank at the commit (flash_kv.h; with GR8_GLM53F_KV_LEDGER the bytes move through the box's
+            // host ledger). The head announces them under FLASH_CAP_POLICY=borrow-idle (GR8_GLM53F_KV_LEND_MS > 0, s2/flash_lend.h):
+            // a lend down to GR8_GLM53F_KV_IDLE_CHUNKS once idle that long, a recall before a request that needs more. Every
             // rank's ACK carries its chunks online, and the head admits only within the least of them
             if (m.fkv.pages)
             {
-                if (const auto& l = knob::flash_kv_ledger()) for (g6rt::Model* x : {&m, &D.d}) x->fkv.ledger = *l;
-                const long lend_ms = (long)knob::flash_kv_lend_ms(), keep = (long)knob::flash_kv_idle_chunks();   // >= 0, >= 1 (table)
+                if (const auto& l = knob::glm53f_kv_ledger()) for (g6rt::Model* x : {&m, &D.d}) x->fkv.ledger = *l;
+                const long lend_ms = (long)knob::glm53f_kv_lend_ms(), keep = (long)knob::glm53f_kv_idle_chunks();   // >= 0, >= 1 (table)
                 h.flash_room = [&] {
                     uint32_t n = UINT32_MAX;
                     for (g6rt::Model* x : {&m, &D.d}) if (x->fkv.pages) n = std::min(n, x->fkv.online);
@@ -1562,7 +1562,7 @@ int main(int argc, char** argv)
                 h.flash.chunk_rows = (uint64_t)m.fkv.chunk_pages * g6kv::PAGE;
                 h.flash.chunks = m.fkv.chunks;
                 // the bytes this rank may lend (every chunk above keep, all models): the launcher books them as the GPU's
-                // in the host ledger (GR8_FLASH_KV_LEDGER.gpu, one line), so a lend has them to give
+                // in the host ledger (GR8_GLM53F_KV_LEDGER.gpu, one line), so a lend has them to give
                 if (lend_ms && !m.fkv.ledger.empty())
                 {
                     uint64_t lendable = 0;
@@ -2639,7 +2639,7 @@ int main(int argc, char** argv)
                     pf_draft_flash(D, FP, M, a, p.prompt.data() + a + 1, dstep, [&](const StepIn& di) {
                         *in_d = di;
                         // A draft-logit dump explicitly requests the otherwise unused prompt outputs.
-                        const bool cache_only = !dldump && knob::flash_draft_kv();
+                        const bool cache_only = !dldump && knob::glm53f_draft_kv();
                         if (cache_only)
                         {
                             pf_draft_cache_flash(D, di.M, di.context, st);
@@ -2702,14 +2702,14 @@ int main(int argc, char** argv)
         }
 #if G6_MODEL_FLASH
         // Test-only: draft cache pages before the first live draft. Includes latent, raw key/gate and pooled keys.
-        if (const auto& path = knob::flash_draft_cache_dump(); path && mtp)
+        if (const auto& path = knob::glm53f_draft_cache_dump(); path && mtp)
         {
             G6RT_CK(cudaStreamSynchronize(st));
             const std::string name = *path + ".s" + std::to_string(q) + ".r" + std::to_string(R) + ".bin";
             FILE* f = fopen(name.c_str(), "wb");
-            if (!f) die("GR8_FLASH_DRAFT_CACHE_DUMP: cannot open " + name);
+            if (!f) die("GR8_GLM53F_DRAFT_CACHE_DUMP: cannot open " + name);
             const size_t bytes = hdump_model(f, D.d, 'd', p.first);
-            if (fclose(f)) die("GR8_FLASH_DRAFT_CACHE_DUMP: close failed " + name);
+            if (fclose(f)) die("GR8_GLM53F_DRAFT_CACHE_DUMP: close failed " + name);
             fprintf(stderr, "# draft cache dump seq %zu rank %d rows %d bytes %zu file %s\n", q, R, p.first, bytes, name.c_str());
         }
 #endif
@@ -2882,11 +2882,11 @@ int main(int argc, char** argv)
         }
         step0 += NS;
 #if G6_MODEL_FLASH
-        if (const auto& kd = knob::kda_state_dump(); kd && m.kda_st.S)   // gates: KDA S + conv of every layer after the sequence
+        if (const auto& kd = knob::glm53f_kda_state_dump(); kd && m.kda_st.S)   // gates: KDA S + conv of every layer after the sequence
         {
             const std::string name = *kd + ".rank" + std::to_string(R);
             FILE* kf = fopen(name.c_str(), "wb");
-            if (!kf) die("GR8_KDA_STATE_DUMP: cannot open " + name);
+            if (!kf) die("GR8_GLM53F_KDA_STATE_DUMP: cannot open " + name);
             std::vector<float> h(kda::N_KDA * m.kda_st.s_layer());
             G6RT_CK(cudaMemcpy(h.data(), m.kda_st.S, h.size() * 4, cudaMemcpyDeviceToHost));
             dump_write(kf, h.data(), h.size() * 4);

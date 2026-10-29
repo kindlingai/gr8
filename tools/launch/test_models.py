@@ -54,7 +54,7 @@ class OptionTests(unittest.TestCase):
             self.assertIn('GR8_CP=0', plan['env'])
             self.assertIn('GR8_PF_RS=0', plan['env'])
             self.assertIn('GR8_PF_STAGE_ASYNC=1', plan['env'])
-            (self.assertNotIn if tp == '4' else self.assertIn)('GR8_KDA_SCAN=1', plan['env'])
+            (self.assertNotIn if tp == '4' else self.assertIn)('GR8_GLM53F_KDA_SCAN=1', plan['env'])
             for a in ('--reuse-prefix', '--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):
                 self.assertNotIn(a, plan['args'])
             self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '1')
@@ -63,16 +63,16 @@ class OptionTests(unittest.TestCase):
 
     def test_flash_cache(self):
         plan = opt.engine_plan(flash())
-        self.assertFalse([e for e in plan['env'] if e.startswith(('GR8_FLASH_', 'G6_FLASH_'))])
+        self.assertFalse([e for e in plan['env'] if e.startswith(('GR8_GLM53F_', 'GR8_FLASH_', 'G6_FLASH_'))])
         self.assertNotIn('--kv-store', plan['args'])
         plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--flash-state-budget-mib', '4096'))
-        self.assertIn('GR8_FLASH_CACHE=aligned', plan['env'])
-        self.assertIn('GR8_FLASH_STATE_BUDGET_MIB=4096', plan['env'])
+        self.assertIn('GR8_GLM53F_CACHE=aligned', plan['env'])
+        self.assertIn('GR8_GLM53F_STATE_BUDGET_MIB=4096', plan['env'])
         self.assertNotIn('--kv-store', plan['args'])
         plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/fc,size=64G'))
         self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], 'ssd:/tmp/fc,size=64G')
         plan = opt.engine_plan(flash('--flash-cache', 'terminal'))
-        self.assertIn('GR8_FLASH_CACHE=terminal', plan['env'])
+        self.assertIn('GR8_GLM53F_CACHE=terminal', plan['env'])
         # the checkpoint store on a group lease (D-331 M8 (c)): the store as given, KV_SHARE_WHEN reaches the engine
         g = 'remote:192.0.2.5:7350,size=1G,group=flash'
         plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', g, '--kv-share-when', 'always'))

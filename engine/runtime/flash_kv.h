@@ -1,4 +1,4 @@
-// GR8_FLASH_KV_CHUNKS=1 (D-331 M7 part B; 0, the default, keeps one cudaMalloc per binding as before): a Flash rank's
+// GR8_GLM53F_KV_CHUNKS=1 (D-331 M7 part B; 0, the default, keeps one cudaMalloc per binding as before): a Flash rank's
 // MLA and index caches, every DSA binding's, in kvchunks regions (attn/kvchunks.h) under one chunk map. Chunk k is
 // pages [k * chunk_pages, (k + 1) * chunk_pages) of every binding (the last may be shorter), online in all of them or
 // in none. The Flash session's block table is the identity (flash_bind.cu), so its context fills pages from 0 up and
@@ -28,8 +28,8 @@
 
 namespace flashkv {
 
-// GR8_FLASH_KV_CHUNKS: 0 (default) or 1
-inline int env_mode() { return knob::flash_kv_chunks() ? 1 : 0; }
+// GR8_GLM53F_KV_CHUNKS: 0 (default) or 1
+inline int env_mode() { return knob::glm53f_kv_chunks() ? 1 : 0; }
 
 constexpr size_t MLA_PAGE = (size_t)g6kv::PAGE * g6kv::ROW, IDX_PAGE = g6kv::IDX_PAGE;
 
@@ -41,8 +41,8 @@ struct Map {
     std::string ledger;                  // the host ledger's path, or empty: no ledger
     int wait_ms = 10000;                 // grow: how long the node may take to release
     // tests only: a resize ends the process at this ledger point (begun, synced or released; empty: none).
-    // GR8_FLASH_KV_CRASH_AT sets it
-    std::string crash = knob::flash_kv_crash_at().value_or("");
+    // GR8_GLM53F_KV_CRASH_AT sets it
+    std::string crash = knob::glm53f_kv_crash_at().value_or("");
     std::string err;                     // the last failure
 
     // pages: the bindings' capacity in pages; online: chunks online at boot (clamped to all)

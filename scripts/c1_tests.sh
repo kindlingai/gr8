@@ -141,7 +141,7 @@ if [ "$TEST" = all ] || [ "$TEST" = kv_resize_test ]; then
   fi
 fi
 if [ "$TEST" = all ] || [ "$TEST" = flash_kv_chunks_test ]; then
-  # the Flash KV caches in chunks (GR8_FLASH_KV_CHUNKS, runtime/flash_kv.h): the Flash attention, the ledger's library
+  # the Flash KV caches in chunks (GR8_GLM53F_KV_CHUNKS, runtime/flash_kv.h): the Flash attention, the ledger's library
   [ "$TEST" = all ] && ARGS=()
   KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
   if why=$(kvlib_ready); then
