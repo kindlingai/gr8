@@ -18,4 +18,16 @@ Then join the ranks, and optionally a client's request times (one JSON object pe
 
     tools/trace/merge.py /tmp/s2.r*.json --requests requests.jsonl -o trace.json
 
+Each machine stamps with its own wall clock, so two machines differ by whatever NTP left. When that is not small
+next to the steps being lined up, measure each rank's machine from the client's machine before and after the run and
+pass the probes to merge.py:
+
+    tools/trace/clock_probe.py HOST1 r1-before.json      # ... the run ...
+    tools/trace/clock_probe.py HOST1 r1-after.json
+    tools/trace/merge.py /tmp/s2.r*.json --requests requests.jsonl --clock 1=r1-before.json,r1-after.json -o trace.json
+
+merge.py takes each probe's lowest-round-trip sample (offset good to half that round trip), subtracts the mean of the
+two offsets from that rank's timestamps, and refuses a probe with a round trip or a before/after drift over 50 ms
+(`--max-rtt-ms`, `--max-drift-ms`). Without `--clock` the timestamps are joined as written.
+
 The trace reads the host clock only: no device syncs and no change to what the engine does.
