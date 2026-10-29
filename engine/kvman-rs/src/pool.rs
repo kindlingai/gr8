@@ -973,6 +973,14 @@ impl Pool {
         Ok(())
     }
 
+    /// The age of the most recent retained run of `namespace` whose whole history `prompt` continues, as the next turn
+    /// of the same conversation does, or None. The head lets such a prompt in ahead of the queue (it brings its own
+    /// pages) and keeps a finished run for it a while (GR8_S2_KEEP_MS).
+    pub fn continued_by(&self, prompt: &[i32], namespace: Namespace) -> Option<u64> {
+        let mut kept = self.kept.iter().rev().filter(|k| k.namespace == namespace);
+        kept.find(|k| continues(prompt, &k.st.history, k.st.pf_end.max(0) as usize)).map(|k| k.age)
+    }
+
     /// The retained run with the longest reusable prefix for `prompt` (limit: rows the prefill may skip) that a
     /// reservation of `rows` now and `worst` at most can grow from. Ties go to the most recent.
     pub fn match_prefix(&self, prompt: &[i32], rows: u64, worst: u64, limit: i32) -> Hit {

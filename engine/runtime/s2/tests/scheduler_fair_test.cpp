@@ -6,6 +6,8 @@
 // Host only (scheduler.h is plain C++): no GPU, no CUDA, no pool. Build and run: see scripts/host_tests.sh.
 #include "s2/scheduler.h"
 #include <cstdio>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -195,8 +197,22 @@ static void decode_still_alternates()
     std::printf("alternation: %u prefill quanta, %u decode rounds in 80 boundaries\n", prefills, rounds);
 }
 
+// The head may admit a queued request ahead of earlier ones (GR8_S2_KEEP_MS: a conversation's next turn on its own
+// retained run), so ids need not increase; a request is still admitted at most once.
+static void admitted_out_of_order_once()
+{
+    Scheduler s(cfg());
+    admit(s, 5, 1000, 100);
+    admit(s, 4, 1000, 100);
+    CHECK(phase_of(s, 5) != Phase::Free && phase_of(s, 4) != Phase::Free);
+    bool refused = false;
+    try { admit(s, 5, 1000, 100); } catch (const std::runtime_error& e) { refused = std::string(e.what()) == "native request admitted twice"; }
+    CHECK(refused);
+}
+
 int main()
 {
+    admitted_out_of_order_once();
     short_behind_long();
     long_never_starved();
     single_session_unchanged();

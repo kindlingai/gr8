@@ -51,6 +51,11 @@ int main()
         q.admitted(1);
         const auto s2 = q.check(2, true, p.fits(30 * 64, 30 * 64), p.room());
         CHECK(s2 && s2->why == Stall::Capacity);
+        // a later request can be checked and admitted by id, ahead of the front
+        q.push(Request{3, 64, 10});
+        CHECK(q.find(3) && !q.find(1) && q.check(3, 2, true, true, p.room()) && q.queued().size() == 2);
+        q.admitted(3);
+        CHECK(q.front() && q.front()->id == 2 && !q.find(3) && q.size() == 1);
     }
 
     // a hit adopts the first ceil(skip / 64) pages of the retained list and lets the rest go. The new pages are the lowest free.

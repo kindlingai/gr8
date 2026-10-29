@@ -40,6 +40,8 @@ struct PoolHooks {
     std::function<PoolHit(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit,
                           const g6rt::CacheNamespace&)> match;
     std::function<Run(const PoolHit&, uint64_t rows, uint64_t worst)> take;
+    // optional, head: the retained run a prompt continues (RunPool::continues; 0 = none), for GR8_S2_KEEP_MS
+    std::function<uint64_t(const std::vector<int>& prompt, const g6rt::CacheNamespace&)> continues;
     // optional, block stores (pool.h add_tier): counting toward shared prefixes at admission (head and workers, before
     // the grant, including nonstock calls that clear pending stock metadata; span: the request's system span, -1 = none), and each tier's counters for status.s2
     std::function<uint32_t(const std::vector<int>& prompt, int64_t span, const g6rt::CacheNamespace&)> count;
@@ -147,6 +149,45 @@ class Service {
     // burst of queued requests is granted in milliseconds rather than one per NOTICE_MIN boundaries (~15 s each behind
     // 8,192-row prefill quanta). Default off: one admission per notice, as before.
     const bool admit_hold_ = knob::s2_admit_hold();
+    // GR8_S2_KEEP_MS (head): conversation turns keep their run. A queued request that continues a retained run (the next
+    // turn of the same conversation) is tried ahead of the queue, since that run brings its own pages. For KEEP_MS after a
+    // session finishes, when nothing queued continues a retained run, nothing else is tried, so the conversation's next
+    // turn finds its run instead of the front of the queue taking it. A front that was passed over once is tried first,
+    // with no wait, so no request waits behind more than one pass.
+    const uint64_t keep_ms_ = uint64_t(knob::s2_keep_ms());
+    std::atomic<uint64_t> finished_ms_{0};   // when a session last finished (compute thread, read by the controller)
+    uint64_t passed_ = UINT64_MAX;           // the front a continuing request was tried ahead of
+    uint64_t continues_revision_ = UINT64_MAX;
+    std::map<uint64_t, bool> continues_;     // per queued request at continues_revision_: does it continue a retained run
+    static uint64_t now_ms() {
+        using namespace std::chrono;
+        return uint64_t(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+    }
+    bool continues(const Request& r) {
+        const auto rev = progress_.revision.load();
+        if (rev != continues_revision_) { continues_.clear(); continues_revision_ = rev; }
+        const auto [it, fresh] = continues_.try_emplace(r.id, false);
+        if (fresh) {
+            const auto p = prompts_.find(r.id);
+            it->second = p != prompts_.end() && native_.pool.continues(p->second, g6rt::steering::cache_namespace(r.steering)) != 0;
+        }
+        return it->second;
+    }
+    // the queued request the controller tries next, or none while a finished run waits for its conversation's next turn
+    const Request* next_admission() {
+        const Request* front = queue_.front();
+        if (!front || !keep_ms_ || !native_.pool.continues || passed_ == front->id) return front;
+        for (const auto& r : queue_.queued())
+            if (continues(r)) {
+                if (r.id != front->id) {
+                    if (trace_ && passed_ != front->id)
+                        trace_.instant("bypass", Trace::CONTROL, targ("request", r.id) + "," + targ("front", front->id));
+                    passed_ = front->id;
+                }
+                return &r;
+            }
+        return now_ms() - finished_ms_.load() < keep_ms_ ? nullptr : front;
+    }
     uint64_t refused_ = UINT64_MAX;   // the last request the refusal line named (head)
     void fail(std::exception_ptr error) {
         { std::lock_guard<std::mutex> lock(failure_mu_); if (!failure_) failure_ = error; }
@@ -238,7 +279,7 @@ class Service {
             for (const auto& sl : s.slots())
                 if (cm.cancel && sl.phase != Phase::Free && sl.phase != Phase::Retiring && sl.key == *cm.cancel) retire_run(sl);
             if (command.admit) {
-                const auto* request = queue_.front(); require(request && request->id == command.request, "admission FIFO changed during event");
+                const auto* request = queue_.find(command.request); require(request, "admission of a request no longer queued");
                 unsigned live = s.resident();
                 const auto worst = reserve_rows(c_.scheduler, *request), rows = admit_rows(*request);
                 // a prompt that continues a retained run fits when the hit does (match checks the room the hit needs, with
@@ -249,7 +290,7 @@ class Service {
                     pre = native_.pool.match(pr0->second, rows, worst, int(request->prompt_tokens) - 1,
                                              g6rt::steering::cache_namespace(request->steering));
                 const bool fits = pre.skip > 0 || native_.pool.fits(rows, worst);
-                const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), fits, native_.pool.room());
+                const auto fit = queue_.check(request->id, s.revision(), live < c_.scheduler.limit(), fits, native_.pool.room());
                 require(fit.has_value(), "duplicate admission attempt without revision");
                 if (trace_ && fit->why != Stall::None && waited_ != request->id) {
                     waited_ = request->id;
@@ -393,10 +434,10 @@ class Service {
                 } else event(*command); // resident/retiring lookup only at the fence
                 if (stopping_.load()) return;
             }
-            if (const auto* front = queue_.front()) {
-                if (front->id != attempted_head_ || progress_.revision.load() != attempted_revision_) {
+            if (const auto* next = next_admission()) {
+                if (next->id != attempted_head_ || progress_.revision.load() != attempted_revision_) {
                     // Copy: event() may erase the map entry after all ACKs.
-                    auto command = commands_.at(front->id); event(command); changed = true;
+                    auto command = commands_.at(next->id); event(command); changed = true;
                 }
             }
             const auto rev = progress_.revision.load();
@@ -538,6 +579,7 @@ public:
         };
         h.prompt = [&](Key k,int M,int pos0) { sessions_.prompt_rows(k,M,pos0,native_.dispatch.logprob); };
         h.finished = [&](const Slot& s) {
+            finished_ms_.store(now_ms());
             if (trace_) {
                 trace_.instant("finish", Trace::STEPS, targ("request", s.req.id) + "," + targ("tokens", s.emitted));
                 first_.erase(s.req.id);
