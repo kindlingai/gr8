@@ -53,9 +53,9 @@ an MMA on the latent, and prefill turns it into an FP16 table first, so FP4 tens
 **Kernels.**
 - Writes: `append_kv` (`engine/attn/attn.cu`).
 - Decode reads: `kv4::scores_heads` and `kv4::context_parts_heads` (`engine/attn/kv4.cuh`, the default head-batched
-  path), and the generic `mla_scores` / `context_parts` (`G6_ATTN_HEADS=0`).
+  path), and the generic `mla_scores` / `context_parts` (`GR8_ATTN_HEADS=0`).
 - Prefill reads: `expand` (`engine/attn/prefill.cuh`) and `gqkv4::prepass` (`engine/attn/prefill-qo-bind.cuh`).
-- In a KV4 build, `G6_ATTN_FLIP`, `G6_ATTN_P11` and the per-head fixed-K kernels are ignored, and `G6_PF_QO=v1|r1` is
+- In a KV4 build, `GR8_ATTN_FLIP`, `GR8_ATTN_P11` and the per-head fixed-K kernels are ignored, and `GR8_PF_QO=v1|r1` is
   refused. They read the FP8 row directly.
 
 **Stores.** Page blocks shrink from 3,502,592 B to 2,289,152 B (79 x 64 x 416 + 22 x 64 x 132; 559 x 4 KiB slots).
@@ -66,10 +66,10 @@ block, and the lease name ends in `-int4`. `kvman-sim --mla-row 416` models the 
 ## Build and test
 
 ```bash
-KV_FORMAT=int4 G6_NR=4 scripts/build.sh bin                        # bin/g6m4-int4: the TP4 engine with the INT4 row
-EXTRA=-DG6_KV4=1 G6_NR=4 scripts/build.sh bin4-kv4                 # the same as a full build (g6m4, m4sim) in its own dir
-TEST=kv4_test G6_NR=4 scripts/c1_tests.sh bin4                     # the FP8 row
-TEST=kv4_test G6_NR=4 EXTRA=-DG6_KV4=1 scripts/c1_tests.sh bin4-kv4 # the INT4 row
+KV_FORMAT=int4 GR8_NR=4 scripts/build.sh bin                        # bin/g6m4-int4: the TP4 engine with the INT4 row
+EXTRA=-DG6_KV4=1 GR8_NR=4 scripts/build.sh bin4-kv4                 # the same as a full build (g6m4, m4sim) in its own dir
+TEST=kv4_test GR8_NR=4 scripts/c1_tests.sh bin4                     # the FP8 row
+TEST=kv4_test GR8_NR=4 EXTRA=-DG6_KV4=1 scripts/c1_tests.sh bin4-kv4 # the INT4 row
 ```
 
 `kv4_test` checks two things on one GPU with synthetic weights:
@@ -111,7 +111,7 @@ costs 2.3 MB of int4 pool and 2.9 MB of them.
   equal-memory figure against the replicated index keys before #44), and int4 kept 2,390, so at TP=4 int4 now
   leaves about 0.3 GiB more free than fp8.
 - **TP=3 and TP=6 are the model's figures, rounded down by the 0.8% it overshoots at TP=4.** They reuse TP=4's
-  per-token buffer sizes, and the QO tables differ with `G6_PF_OWN`, so they are not measured.
+  per-token buffer sizes, and the QO tables differ with `GR8_PF_OWN`, so they are not measured.
 - `scripts/engine_args.sh` (`int4_pages`) holds these page counts. A `CAP` given by hand wins, as for fp8.
 - An earlier version of this table (1.42-1.63x) counted only the pool, the staging pools and one prefill table, and
   allowed 2,876 pages a rank at TP=4. That boot ran with 4.7-5.4 GiB free against fp8's 7.2-8.0.
@@ -122,7 +122,7 @@ costs 2.3 MB of int4 pool and 2.9 MB of them.
 `attn.o`, `attn_bind.o` and `m4sim` match section for section, except the hash in internal symbol names. m4sim printed
 the same stdout as main in three cases, all at TP=4 on the release's layers 0 and 3:
 
-- prefill of 1,500 tokens plus 16 decode steps, with `G6_KV_HASH` (R = 2048, every page replicated);
+- prefill of 1,500 tokens plus 16 decode steps, with `GR8_KV_HASH` (R = 2048, every page replicated);
 - the same with R = 1024, so pages past 1,024 are spread across ranks;
 - three S2 sessions with MTP.
 

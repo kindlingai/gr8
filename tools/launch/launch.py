@@ -57,7 +57,7 @@ def parse(argv, check=True):
 
 
 def out_dir(o):
-    return os.path.join(os.path.abspath(o.get('G6_HOME')), 'out')
+    return os.path.join(os.path.abspath(o.get('GR8_WORK_DIR')), 'out')
 
 
 def supervisor_running(out):
@@ -143,7 +143,7 @@ def rpc(m, addr, msg, timeout=5):
 
 def cmd_down(argv):
     o = parse(argv, check=False)
-    out, home = out_dir(o), os.path.abspath(o.get('G6_HOME'))
+    out, home = out_dir(o), os.path.abspath(o.get('GR8_WORK_DIR'))
     m = members_of(o)
     if m:
         members, _, me = m
@@ -376,7 +376,7 @@ def cmd_show_config(argv):
             print(f'          about {modelset.expert_gb(variant.path, int(o.get("TP"))):.1f} GB of experts on the busiest '
                   f'rank at TP={o.get("TP")}')
         print(f'model id  {modelset.model_id(ms, variant)} (the handshake and the engine compare this)')
-    print(f'engine    {sv.engine_build(os.path.abspath(o.get("G6_HOME")), sv.engine_bin(o))} (bin/{sv.engine_bin(o)} and bin/lib)')
+    print(f'engine    {sv.engine_build(os.path.abspath(o.get("GR8_WORK_DIR")), sv.engine_bin(o))} (bin/{sv.engine_bin(o)} and bin/lib)')
     if members:
         try:
             r = local_rank(o)
@@ -506,7 +506,7 @@ def cmd_knobs(argv):
         for k in kv:
             default, meaning = kvnode.KEYS[k]
             lines += knob_lines(k, kvnode.flag_of(k), '', default_text(default, meaning), meaning)
-    lines.append('docs/ENV.md lists the engine\'s own GR8_ variables. Pass one with --g6env-x "NAME=value ...".')
+    lines.append('docs/ENV.md lists the engine\'s own GR8_ variables. Pass one with --extra-env "NAME=value ...".')
     print('\n'.join(lines))
     return 0
 

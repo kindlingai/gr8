@@ -32,7 +32,7 @@ def free_port():
 
 def argv(home, *more, port=None):
     return ['--no-config', '--gb', '0.5', '--port', str(port or free_port()), '--bind', '127.0.0.1', '--bin', STUB,
-            '--g6-home', home, *more]
+            '--work-dir', home, *more]
 
 
 class OptionTests(unittest.TestCase):
@@ -135,7 +135,7 @@ class SupervisorTests(unittest.TestCase):
         home = tempfile.mkdtemp()
         port = free_port()
         cli = [sys.executable, K.HERE]
-        health = [*cli, 'health', '--no-config', '--g6-home', home]
+        health = [*cli, 'health', '--no-config', '--work-dir', home]
         r = subprocess.run(health, capture_output=True, text=True, timeout=30)
         self.assertEqual((r.returncode, r.stdout), (1, 'KV node: not serving, no supervisor runs (last state none)\n'))
         self.assertFalse(os.path.exists(os.path.join(home, 'out/kv/kv.lock')), 'health takes no lock')
@@ -150,17 +150,17 @@ class SupervisorTests(unittest.TestCase):
                             timeout=30)
         self.assertEqual(r2.returncode, 1)
         self.assertIn('already runs', r2.stderr)
-        r = subprocess.run([*cli, 'status', '--no-config', '--g6-home', home], capture_output=True, text=True, timeout=30)
+        r = subprocess.run([*cli, 'status', '--no-config', '--work-dir', home], capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn('0.50 GiB locked, 0.50 GiB free', r.stdout)
         node = K.read_json(os.path.join(home, 'out/kv/state.json'))['node_pid']
-        r = subprocess.run([*cli, 'down', '--no-config', '--g6-home', home], capture_output=True, text=True, timeout=30)
+        r = subprocess.run([*cli, 'down', '--no-config', '--work-dir', home], capture_output=True, text=True, timeout=30)
         self.assertIn('KV node stopped', r.stdout)
         with self.assertRaises(ProcessLookupError):
             for _ in range(50):
                 os.kill(node, 0)
                 time.sleep(0.1)
-        r = subprocess.run([*cli, 'status', '--no-config', '--g6-home', home], capture_output=True, text=True, timeout=30)
+        r = subprocess.run([*cli, 'status', '--no-config', '--work-dir', home], capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 3)
         self.assertIn('last state: stopped', r.stdout)
         r = subprocess.run(health, capture_output=True, text=True, timeout=30)
@@ -187,7 +187,7 @@ class HealthTests(unittest.TestCase):
 
     def health(self, *more):
         with mock.patch('sys.stdout', new_callable=io.StringIO) as so:
-            rc = K.main(['health', '--no-config', '--g6-home', self.home, *more])
+            rc = K.main(['health', '--no-config', '--work-dir', self.home, *more])
         return rc, so.getvalue()
 
     def test_states(self):

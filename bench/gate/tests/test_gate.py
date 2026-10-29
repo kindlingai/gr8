@@ -317,17 +317,17 @@ class Records(unittest.TestCase):
 
     def test_baseline_refuses_mixed_engine_env_and_stores_it(self):
         with self.assertRaisesRegex(ValueError, 'engine environment'):
-            baseline([rec('b1', {'m': 100.0}, env='G6_CP=0'), rec('b2', {'m': 50.0}, env='G6_CP=1')])
-        b = baseline([rec('b1', {'m': 1.0}, env='G6_CP=1  G6_PF_OWN=3'), rec('b2', {'m': 1.0}, env='G6_PF_OWN=3 G6_CP=1')])
-        self.assertEqual(b['engine_env'], 'G6_CP=1 G6_PF_OWN=3')  # order and spacing do not matter
+            baseline([rec('b1', {'m': 100.0}, env='GR8_CP=0'), rec('b2', {'m': 50.0}, env='GR8_CP=1')])
+        b = baseline([rec('b1', {'m': 1.0}, env='GR8_CP=1  GR8_PF_OWN=3'), rec('b2', {'m': 1.0}, env='GR8_PF_OWN=3 GR8_CP=1')])
+        self.assertEqual(b['engine_env'], 'GR8_CP=1 GR8_PF_OWN=3')  # order and spacing do not matter
 
     def test_check_refuses_other_engine_env(self):
-        base = baseline([rec('b1', {'m': 1.0}, env='G6_CP=1')])
+        base = baseline([rec('b1', {'m': 1.0}, env='GR8_CP=1')])
         with self.assertRaisesRegex(ValueError, 'engine environment'):
-            record.check([rec('n', {'m': 1.0}, env='G6_CP=0')], base, required=None)
+            record.check([rec('n', {'m': 1.0}, env='GR8_CP=0')], base, required=None)
         with self.assertRaisesRegex(ValueError, 'engine environment'):
             record.check([rec('n', {'m': 1.0})], base, required=None)
-        record.check([rec('n', {'m': 1.0}, env='G6_CP=1')], base, required=None)
+        record.check([rec('n', {'m': 1.0}, env='GR8_CP=1')], base, required=None)
 
     def test_check_refuses_runs_that_do_not_belong(self):
         base = baseline([rec('b1', {'m': 1.0}, kl_ref=('r1', 'tp6'))])

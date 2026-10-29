@@ -49,9 +49,9 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 "$T/batch_dflash_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dsel_test.cpp" -o "$T/batch_dsel_test" "${KNOBS[@]}"
 "$T/batch_dsel_test"
-# the n-gram table as a draft source (G6_NGRAM, #56): the table file, chains, the round choice, exact output
+# the n-gram table as a draft source (GR8_NGRAM, #56): the table file, chains, the round choice, exact output
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_ngram_test.cpp" -o "$T/batch_ngram_test" "${KNOBS[@]}"
-"$T/batch_ngram_test" 2>/dev/null    # the G6_MTP_LPLOG case prints its round lines
+"$T/batch_ngram_test" 2>/dev/null    # the GR8_MTP_LPLOG case prints its round lines
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/ngram_lookup_check.cpp" -o "$T/ngram_lookup_check" "${KNOBS[@]}"
 (cd "$REPO/tools/ngram/tests" && NGRAM_LOOKUP_CHECK="$T/ngram_lookup_check" python3 -m unittest -q test_ngram.ExportTest)
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dflreuse_test.cpp" -o "$T/batch_dflreuse_test" "${KNOBS[@]}"
@@ -87,16 +87,16 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 # the notice target's sizing (the work in flight, not a constant): no pool, no CUDA
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_horizon_test.cpp" -o "$T/scheduler_horizon_test" "${KNOBS[@]}"
 "$T/scheduler_horizon_test"
-# Config::decode_rounds (G6_S2_DECODE_ROUNDS): K decode rounds per prefill quantum, its notice target, default off
+# Config::decode_rounds (GR8_S2_DECODE_ROUNDS): K decode rounds per prefill quantum, its notice target, default off
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rounds_test.cpp" -o "$T/scheduler_rounds_test" "${KNOBS[@]}"
 "$T/scheduler_rounds_test"
 # KvTiers::run's copy batches (s2/kv_plan.h): a batch of 1 advances, a slot spilled twice ends with the second page,
 # batched copies = one at a time: no pool, no CUDA
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/kv_plan_test.cpp" -o "$T/kv_plan_test" "${KNOBS[@]}"
 "$T/kv_plan_test"
-# G6_CP_STEP_ROWS / G6_CP_STEP_SEG (s2/cp_rows.h, Driver::step): steps past R capped at n rows, solo-exact tokens, fair cycles
+# GR8_CP_STEP_ROWS / GR8_CP_STEP_SEG (s2/cp_rows.h, Driver::step): steps past R capped at n rows, solo-exact tokens, fair cycles
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/cp_rows_test.cpp" -o "$T/cp_rows_test" "${KNOBS[@]}"
-"$T/cp_rows_test" 2> >(grep -v '^# s2 G6_CP_STEP_ROWS=' >&2)   # the driver's cap transition lines, thousands here
+"$T/cp_rows_test" 2> >(grep -v '^# s2 GR8_CP_STEP_ROWS=' >&2)   # the driver's cap transition lines, thousands here
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_stash_test.cpp" "${KVLIB[@]}" -o "$T/pool_stash_test"
 STORES=("mem:" "ssd:$T/store")
 NODE=$REPO/engine/kvman-rs/target/release/kvman-remote
@@ -186,23 +186,23 @@ g++ -std=c++17 -O2 -Wall -DG6_MODEL_FLASH=0 "$REPO/engine/tests/test_flash_s2_co
 python3 "$REPO/engine/tests/test_flash_serve_check.py"
 # Flash serve prefill: the draft cache fill checks the error words once, after its last chunk; every error still fails the request.
 python3 "$REPO/engine/tests/test_flash_serve_prefill_check.py"
-# Flash prefill non-kernel span (NK): G6_PF_PREWARM source check, G6_PF_STAGE_ASYNC source check + schedule hazard model.
+# Flash prefill non-kernel span (NK): GR8_PF_PREWARM source check, GR8_PF_STAGE_ASYNC source check + schedule hazard model.
 python3 -m unittest "$REPO/engine/runtime/tests/test_pf_prewarm.py" "$REPO/engine/runtime/tests/test_pf_stage_async.py"
 g++ -std=c++17 -O2 -Wall "$REPO/engine/runtime/tests/pf_peer_stage_test.cpp" -o "$T/pf_peer_stage_test" "${KNOBS[@]}"
 "$T/pf_peer_stage_test"
-# Flash prefill router row split (G6_PF_ROUTER_SPLIT): every rank count 2..8 ends with byte-equal route tables, the kernels'
+# Flash prefill router row split (GR8_PF_ROUTER_SPLIT): every rank count 2..8 ends with byte-equal route tables, the kernels'
 # word maps included; the strict env parse; the source checks of its boot and order.
 for t in test_flash_route_split test_flash_route_split_tp4 test_flash_route_split_env; do
   g++ -std=c++17 -O1 -Wall "$REPO/engine/tests/$t.cpp" -o "$T/$t" "${KNOBS[@]}"
   "$T/$t"
 done
 python3 "$REPO/engine/tests/test_flash_route_split_source.py"
-# Flash session checkpoints (G6_FLASH_CACHE): aligned points, the index's match/LRU/first-fit, the manifest seal.
+# Flash session checkpoints (GR8_FLASH_CACHE): aligned points, the index's match/LRU/first-fit, the manifest seal.
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/tests/test_flash_ckpt_index.cpp" -o "$T/test_flash_ckpt_index" "${KNOBS[@]}"
 "$T/test_flash_ckpt_index"
-# G6_FLASH_CACHE=terminal: the actual retain hook against CPU mocks (rows, ring slot, tokens, nothing kept).
+# GR8_FLASH_CACHE=terminal: the actual retain hook against CPU mocks (rows, ring slot, tokens, nothing kept).
 python3 "$REPO/engine/tests/test_flash_terminal_retain.py"
-# G6_FLASH_CACHE=terminal, a cancel at the boundary the aligned capture waits for: flash_native.cuh's own hooks through
+# GR8_FLASH_CACHE=terminal, a cancel at the boundary the aligned capture waits for: flash_native.cuh's own hooks through
 # the real Service on two ranks; the entry stays aligned and a longer prompt keeps its own aligned checkpoint
 python3 "$REPO/engine/tests/test_flash_terminal_cancel.py"
 # the adaptive draft length decision, and the top-k selection

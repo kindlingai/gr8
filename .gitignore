@@ -4,7 +4,7 @@ __pycache__/
 /config/cluster.env
 bench/results.jsonl
 /cluster.env
-# ./gr8 glm53 up with G6_HOME left at the checkout
+# ./gr8 glm53 up with GR8_WORK_DIR left at the checkout
 /out/
 /run/
 /s2/

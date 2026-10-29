@@ -139,7 +139,7 @@ def resolve_model(o, refresh=False, log=log):
     copy used in place. The release is the whole model (V2_DENSE: the engine plans every weight from its files).
     refresh: ask the hub what the revision is now (prepare), instead of the commit recorded at the last resolve."""
     ms = variant = release = None
-    g6load = os.path.join(os.path.abspath(o.get('G6_HOME')), 'bin', 'g6load')   # plans and checks a Hugging Face fetch
+    g6load = os.path.join(os.path.abspath(o.get('GR8_WORK_DIR')), 'bin', 'g6load')   # plans and checks a Hugging Face fetch
     if os.access(g6load, os.X_OK):
         os.environ.setdefault('G6LOAD', g6load)
     try:
@@ -269,7 +269,7 @@ class Handler(socketserver.StreamRequestHandler):
 class Supervisor:
     def __init__(self, o):
         self.o = o
-        self.home = os.path.abspath(o.get('G6_HOME'))
+        self.home = os.path.abspath(o.get('GR8_WORK_DIR'))
         self.out = os.path.join(self.home, 'out')
         self.port = o.int('CONTROL_PORT')
         self.stop_ev = threading.Event()
@@ -748,9 +748,9 @@ class Supervisor:
             env['LD_LIBRARY_PATH'] = lib
         if self.borrow_idle(plan.get('knobs') or {}):
             # this box's host ledger (donate() creates it); the engine writes the bytes it may lend next to it (.gpu)
-            out = kvnode.out_dir(kvnode.parse(['--g6-home', self.home], dict(os.environ)))
+            out = kvnode.out_dir(kvnode.parse(['--work-dir', self.home], dict(os.environ)))
             os.makedirs(out, exist_ok=True)
-            env['G6_FLASH_KV_LEDGER'] = os.path.join(out, 'ledger')
+            env['GR8_FLASH_KV_LEDGER'] = os.path.join(out, 'ledger')
         return env
 
     def borrow_idle(self, knobs):
@@ -864,7 +864,7 @@ class Supervisor:
         serve as it is."""
         if models.of(self.o).name != 'glm53f' or float(knobs.get('FLASH_KV_DONATE_GIB') or 0) <= 0:
             return
-        ko = kvnode.parse(['--g6-home', self.home], dict(os.environ))
+        ko = kvnode.parse(['--work-dir', self.home], dict(os.environ))
         env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'KV_MIN_FREE_GB': ko.get('KV_MIN_FREE_GB'),
                **{k: knobs.get(k) or '' for k in ('FLASH_KV_DONATE_GIB', 'FLASH_KV_GROWTH_GIB')}}
         script = os.path.join(opt.REPO, 'scripts', 'engine_args.sh')
@@ -891,7 +891,7 @@ class Supervisor:
             subprocess.run([lb, ledger, 'recover', '--stale-s', '0'], capture_output=True, text=True)
             n = str(gib << 30)
             for argv in ([lb, ledger, 'init', '--total', str((gib << 30) + gpu), '--node', n, '--gpu', str(gpu)],
-                         [sys.executable, kvnode.HERE, 'up', '--g6-home', self.home, '--gb', str(gib + (gpu >> 30)),
+                         [sys.executable, kvnode.HERE, 'up', '--work-dir', self.home, '--gb', str(gib + (gpu >> 30)),
                           '--lazy-lock',
                           '--ledger', ledger, '--group', knobs['FLASH_KV_GROUP'],
                           # this serve's mentat, or none when it finds its boxes by PEERS (kv up announces through
@@ -1056,7 +1056,7 @@ class Supervisor:
         elif self.hs and self.rank and code and not self.stop_failed:
             self.tell_head({'t': 'abort', 'rank': self.rank, 'why': first})
         if self.donor:
-            subprocess.run([sys.executable, kvnode.HERE, 'down', '--g6-home', self.home], capture_output=True,
+            subprocess.run([sys.executable, kvnode.HERE, 'down', '--work-dir', self.home], capture_output=True,
                            timeout=60, stdin=subprocess.DEVNULL)
             self.donor = False
         if self.started:

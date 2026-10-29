@@ -36,7 +36,7 @@ def free_port():
 
 def supervisor(*argv, rank=0, members=MEMBERS):
     home = tempfile.mkdtemp()
-    o = opt.parse(['--no-config', '--peers', ','.join(members), '--g6-home', home, '--control-port', str(free_port()),
+    o = opt.parse(['--no-config', '--peers', ','.join(members), '--work-dir', home, '--control-port', str(free_port()),
                    *argv], GLM)
     opt.validate(o)
     s = S.Supervisor(o)
@@ -97,7 +97,7 @@ class MentatRingTests(unittest.TestCase):
                                                                                     'ring_settle': 1.0})):
                 for i in range(n):
                     o = opt.parse(['--no-config', '--mentat', f'127.0.0.1:{daemons[i].port}', '--tp', str(n),
-                                   '--shape', 'ring', '--g6-home', tempfile.mkdtemp(), '--join-timeout', '30',
+                                   '--shape', 'ring', '--work-dir', tempfile.mkdtemp(), '--join-timeout', '30',
                                    *extra], GLM)
                     opt.validate(o)
                     s = S.Supervisor(o)
@@ -301,11 +301,11 @@ class FrontTests(unittest.TestCase):
 class EngineTests(unittest.TestCase):
     def test_the_engine_gets_the_plan_and_an_allowlist(self):
         s = supervisor()
-        plan = {'env': ['G6_PF_TILE=64', 'G6_X=a=b'], 'args': []}
+        plan = {'env': ['GR8_PF_TILE=64', 'G6_X=a=b'], 'args': []}
         with mock.patch.dict(os.environ, {'CUDA_VISIBLE_DEVICES': '0', 'NVIDIA_TF32_OVERRIDE': '0', 'SECRET_TOKEN': 'x',
                                           'PYTHONPATH': '/p', 'LD_LIBRARY_PATH': '/usr/lib'}):
             env = s.engine_env(plan)
-        self.assertEqual((env['G6_PF_TILE'], env['G6_X'], env['CUDA_VISIBLE_DEVICES']), ('64', 'a=b', '0'))
+        self.assertEqual((env['GR8_PF_TILE'], env['G6_X'], env['CUDA_VISIBLE_DEVICES']), ('64', 'a=b', '0'))
         self.assertEqual(env['LD_LIBRARY_PATH'], '/usr/lib')                               # no bin/lib: the box's own
         self.assertNotIn('SECRET_TOKEN', env)
         self.assertNotIn('PYTHONPATH', env)
@@ -323,7 +323,7 @@ class EngineTests(unittest.TestCase):
         with self.assertRaises(opt.OptionError) as e:
             opt.validate(o)
         self.assertIn('G6_S2_TIMEOUT set in the environment', str(e.exception))
-        self.assertNotIn('G6_HOME', str(e.exception))
+        self.assertNotIn('G6_HOME', str(e.exception))   # the old name of GR8_WORK_DIR, an option
 
     def test_the_build_id_covers_bin_lib(self):
         home = tempfile.mkdtemp()
@@ -402,20 +402,20 @@ class DonorTests(unittest.TestCase):
     def test_borrow_idle_puts_the_pool_in_chunks_and_lends_after_the_idle_time(self):
         give = ('--flash-kv-donate-gib', '20', '--flash-kv-growth-gib', '6', '--flash-kv-group', 'gr8-glm53')
         o = opt.parse(['--no-config', '--gr8-model', 'glm53f', '--tp', '2', *give], {})
-        self.assertNotIn('G6_FLASH_KV_CHUNKS=1', opt.engine_plan(o)['env'])   # protected: the pool as before
+        self.assertNotIn('GR8_FLASH_KV_CHUNKS=1', opt.engine_plan(o)['env'])   # protected: the pool as before
         for idle, ms in ((None, '60000'), ('5', '5000')):
             argv = ['--flash-cap-policy', 'borrow-idle'] + (['--flash-kv-idle-s', idle] if idle else [])
             o = opt.parse(['--no-config', '--gr8-model', 'glm53f', '--tp', '2', *give, *argv], {})
             env = opt.engine_plan(o)['env']
-            self.assertIn('G6_FLASH_KV_CHUNKS=1', env)
-            self.assertIn('G6_FLASH_KV_LEND_MS=' + ms, env)
+            self.assertIn('GR8_FLASH_KV_CHUNKS=1', env)
+            self.assertIn('GR8_FLASH_KV_LEND_MS=' + ms, env)
         with self.assertRaisesRegex(opt.OptionError, 'FLASH_KV_IDLE_S=0'):
             self.flash_plan(*give, '--flash-cap-policy', 'borrow-idle', '--flash-kv-idle-s', '0')
         # the engine gets this box's ledger
         s = supervisor('--gr8-model', 'glm53f', '--tp', '2', members=MEMBERS[:2])
         env = s.engine_env({'env': [], 'knobs': {'FLASH_CAP_POLICY': 'borrow-idle'}})
-        self.assertEqual(env['G6_FLASH_KV_LEDGER'], os.path.join(s.home, 'out', 'kv', 'ledger'))
-        self.assertNotIn('G6_FLASH_KV_LEDGER', s.engine_env({'env': [], 'knobs': {'FLASH_CAP_POLICY': 'protected'}}))
+        self.assertEqual(env['GR8_FLASH_KV_LEDGER'], os.path.join(s.home, 'out', 'kv', 'ledger'))
+        self.assertNotIn('GR8_FLASH_KV_LEDGER', s.engine_env({'env': [], 'knobs': {'FLASH_CAP_POLICY': 'protected'}}))
 
     def donor(self, knobs, model='glm53f', gpu=None):
         flash = model == 'glm53f'
@@ -423,7 +423,7 @@ class DonorTests(unittest.TestCase):
         cfg = os.path.join(s.home, 'empty.env')
         open(cfg, 'w').close()
         # no MENTAT here: a PEERS serve's donor must not need a mentat daemon
-        env = {'G6_CLUSTER': cfg, 'KV_BIN': STUB_KV, 'KV_PORT': str(free_port()),
+        env = {'GR8_CLUSTER': cfg, 'KV_BIN': STUB_KV, 'KV_PORT': str(free_port()),
                'KV_BIND': '127.0.0.1', 'KV_MIN_FREE_GB': '0'}
         s.kv_port = int(env['KV_PORT'])
         if gpu is not None:   # what the engine wrote at boot under borrow-idle
@@ -586,9 +586,9 @@ class EngineLogTests(unittest.TestCase):
     def test_the_reason_is_found_behind_later_lines(self):
         d = tempfile.mkdtemp()
         self.write(d, 'e', '# rank 1: exlr8 release 78.49 GB -> device image\n'
-                   'g6: G6_PF_OWN needs the reduce-scatter form (G6_PF_RS=1)\n' + '# loader thread done\n' * 30)
+                   'g6: GR8_PF_OWN needs the reduce-scatter form (GR8_PF_RS=1)\n' + '# loader thread done\n' * 30)
         reason = S.exit_reason([os.path.join(d, 'e')])
-        self.assertEqual(reason, 'g6: G6_PF_OWN needs the reduce-scatter form (G6_PF_RS=1)')
+        self.assertEqual(reason, 'g6: GR8_PF_OWN needs the reduce-scatter form (GR8_PF_RS=1)')
         self.assertNotIn(reason, S.tail(os.path.join(d, 'e'), 20))
 
     def test_stdout_is_read_when_stderr_has_no_reason(self):
@@ -608,7 +608,7 @@ class EngineLogTests(unittest.TestCase):
             s.watch()
         self.assertEqual(e.exception.code, 3)
         with open(os.path.join(s.out, 'g6m4.r0.err'), 'w') as f:
-            f.write('g6: G6_PF_OWN needs the reduce-scatter form (G6_PF_RS=1)\n')
+            f.write('g6: GR8_PF_OWN needs the reduce-scatter form (GR8_PF_RS=1)\n')
         with self.assertRaises(S.Stop) as e:
             s.watch()
         self.assertEqual(e.exception.code, 1)
@@ -715,7 +715,7 @@ class HealthTests(unittest.TestCase):
     def run_health(self, *argv):
         """cmd_health through launch.main, as ./gr8 runs it: (exit status, the one line it printed)."""
         with mock.patch('sys.stdout', new_callable=io.StringIO) as so:
-            rc = self.L.main(['health', '--no-config', '--g6-home', self.home, *argv])
+            rc = self.L.main(['health', '--no-config', '--work-dir', self.home, *argv])
         return rc, so.getvalue()
 
     def test_every_state_before_serving_is_not_ready(self):
@@ -793,7 +793,7 @@ class HealthTests(unittest.TestCase):
         self.write('serving', 0)
         env = {**os.environ, 'http_proxy': 'http://127.0.0.1:9', 'HTTP_PROXY': 'http://127.0.0.1:9', 'no_proxy': '',
                'NO_PROXY': ''}
-        r = subprocess.run([sys.executable, self.L.HERE, 'health', '--no-config', '--g6-home', self.home, '--port',
+        r = subprocess.run([sys.executable, self.L.HERE, 'health', '--no-config', '--work-dir', self.home, '--port',
                             str(self.api(200))], env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 

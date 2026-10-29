@@ -8,7 +8,7 @@ only; it talks to the front end over HTTP (`/tokenize`, `/v1/completions`, `/v1/
 python3 bench/gate/gate.py kl-ref --url http://HEAD:8100 --topology tp6 --commit <sha> --out bench/gate/refs/tp6.json
 # 2. per boot: all measurements, twice (the spread between the two is printed); one JSON line per run
 python3 bench/gate/gate.py run --url http://HEAD:8100 --topology tp6 --commit <sha> --boot b1 \
-    --kl-ref bench/gate/refs/tp6.json --build-flags "G6_NR=6 ..." --engine-env "G6_CP=1 ..."
+    --kl-ref bench/gate/refs/tp6.json --build-flags "GR8_NR=6 ..." --engine-env "GR8_CP=1 ..."
 # 3. after 3 boots of main: the baseline file for the topology
 python3 bench/gate/gate.py baseline --topology tp6 --commit <main sha> --out bench/gate/baselines/tp6.json
 # 4. a PR build: gates table (markdown), exit 1 on any FAIL
@@ -16,7 +16,7 @@ python3 bench/gate/gate.py check --baseline bench/gate/baselines/tp6.json
 ```
 
 `run` needs `--health FILE`, the rank health probe result of the boot (`scripts/rank_health.sh`, run it on the head before
-`./gr8 glm53 up`; it writes `$G6_HOME/out/rank_health.json`). It is stored in every record of the run as `rank_health`. A result older than
+`./gr8 glm53 up`; it writes `$GR8_WORK_DIR/out/rank_health.json`). It is stored in every record of the run as `rank_health`. A result older than
 `--health-max-age-min` (default 360) is refused, so a result from an earlier boot is not reused. A boot the probe refused is not measured unless `--allow-unhealthy`. `--no-health` measures
 without a result. `baseline` and `check` refuse any record that has no admitted probe result (`--no-health`,
 `--allow-unhealthy` records, or records without the field). See `tools/health/README.md`.

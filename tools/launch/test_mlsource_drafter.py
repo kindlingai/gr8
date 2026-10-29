@@ -74,7 +74,7 @@ class DrafterTests(unittest.TestCase):
 
     def boot(self, *argv, peers=PEERS4):
         o = opt.parse(['--no-config', '--peers', peers, '--model', self.rel, '--fetch', 'model-loader',
-                       '--model-cache', self.store, '--g6-home', self.home, '--drafter', DRAFTER, *argv], T.GLM)
+                       '--model-cache', self.store, '--work-dir', self.home, '--drafter', DRAFTER, *argv], T.GLM)
         opt.validate(o)
         ms, v, err = S.resolve_model(o, log=self.logs.append)
         self.assertEqual(err, '')
@@ -88,7 +88,7 @@ class DrafterTests(unittest.TestCase):
         self.assertEqual(o.get('DFLASH_DIR'), d.out)
         self.assertTrue(d.out.startswith(os.path.join(self.home, 'run', 'model-loader')))
         self.assertTrue(d.check(2))
-        undo = ro(self.store)               # the store is read-only to gr8: the conversion writes under G6_HOME
+        undo = ro(self.store)               # the store is read-only to gr8: the conversion writes under GR8_WORK_DIR
         self.addCleanup(undo)
         d.fetch_rank(2)
         self.assertEqual(d.check(2), [])
@@ -163,7 +163,7 @@ class DrafterTests(unittest.TestCase):
     def test_missing_drafter_files_are_named(self):
         os.unlink(os.path.join(self.src, 'model.safetensors'))
         o = opt.parse(['--no-config', '--peers', PEERS4, '--model', self.rel, '--fetch', 'model-loader',
-                       '--model-cache', self.store, '--g6-home', self.home, '--drafter', DRAFTER], T.GLM)
+                       '--model-cache', self.store, '--work-dir', self.home, '--drafter', DRAFTER], T.GLM)
         opt.validate(o)
         ms, v, err = S.resolve_model(o, log=self.logs.append)
         self.assertIn('the drafter fakeorg/drafter@', err)
@@ -173,7 +173,7 @@ class DrafterTests(unittest.TestCase):
 @unittest.skipUnless(T.HAVE, 'needs numpy to write the synthetic release')
 class SteeringTests(unittest.TestCase):
     """--steering-profile hf:NAME with --fetch model-loader: the index and the artifact come through the release's
-    request, are checked as the legacy fetch checks them, and are unpacked under G6_HOME."""
+    request, are checked as the legacy fetch checks them, and are unpacked under GR8_WORK_DIR."""
 
     @classmethod
     def setUpClass(cls):
@@ -229,7 +229,7 @@ class SteeringTests(unittest.TestCase):
 
     def opts(self, selector='hf:default', *extra):
         o = opt.parse(['--no-config', '--peers', PEERS4, '--model', f'https://huggingface.co/{T.RELEASE}',
-                       '--model-cache', self.store, '--fetch', 'model-loader', '--g6-home', self.home,
+                       '--model-cache', self.store, '--fetch', 'model-loader', '--work-dir', self.home,
                        '--variant', 'home', '--dflash', '0', '--steering-profile', selector, *extra], T.GLM)
         opt.validate(o)
         return o
@@ -280,11 +280,11 @@ class SteeringTests(unittest.TestCase):
         with open(p, 'wb') as f:                  # the same length, so it parses and the sizes agree
             f.write(new + b' ' * (len(raw) - len(new)))
         ms, v, err = S.resolve_model(self.opts(), log=lambda _: None)
-        self.assertIn('digest mismatch', err)                          # the receipt under G6_HOME catches it
+        self.assertIn('digest mismatch', err)                          # the receipt under GR8_WORK_DIR catches it
 
     def test_no_steering_files_without_a_selection(self):
         o = opt.parse(['--no-config', '--peers', PEERS4, '--model', f'https://huggingface.co/{T.RELEASE}',
-                       '--model-cache', self.store, '--fetch', 'model-loader', '--g6-home', self.home,
+                       '--model-cache', self.store, '--fetch', 'model-loader', '--work-dir', self.home,
                        '--dflash', '0'], T.GLM)
         opt.validate(o)
         ms, v, err = S.resolve_model(o, log=lambda _: None)

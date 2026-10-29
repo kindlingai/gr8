@@ -62,7 +62,7 @@ def _save(path, value):
 
 def _work(source):
     """Where gr8 writes the receipt, the lock and the unpacked profiles: the release's own cache directory for the
-    legacy fetch, a directory under G6_HOME for model-loader (whose store gr8 never writes)."""
+    legacy fetch, a directory under GR8_WORK_DIR for model-loader (whose store gr8 never writes)."""
     return getattr(source, 'steering_work', None) or os.path.join(source.dir, 'steering')
 
 

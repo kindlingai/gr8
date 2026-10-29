@@ -2,7 +2,7 @@
 
 The options of `./gr8 glm53`, the launchers in `scripts/` and the build. Each knob has a name
 (`CAP`) and a flag (`--cap`): the flag is the name in lower case with `-` for `_`, except `--s2-port` for `S2PORT` and
-`--g6-home` for `G6_HOME`. The engine's own environment and flags are in [docs/SETTINGS.md](docs/SETTINGS.md), and
+`--work-dir` for `GR8_WORK_DIR`. The engine's own environment and flags are in [docs/SETTINGS.md](docs/SETTINGS.md), and
 [docs/ENV.md](docs/ENV.md) lists every `GR8_*` engine variable.
 
 The launcher prints its options:
@@ -16,7 +16,7 @@ The launcher prints its options:
 Where a value comes from, strongest first:
 
 1. the command line: `./gr8 glm53 up --cap 262144`;
-2. one config file: `@FILE` on the command line, else `$G6_CLUSTER`, else `./cluster.env`, else `config/cluster.env`
+2. one config file: `@FILE` on the command line, else `$GR8_CLUSTER`, else `./cluster.env`, else `config/cluster.env`
    (`--no-config` reads none). `./gr8 glm53` parses the file and does not source it: `KEY=value` lines, `#` comments, optional `export`, quotes
    stripped, and no `$` expansion;
 3. the environment: `CAP=262144 ./gr8 glm53 up`;
@@ -30,7 +30,7 @@ arguments they produce. Per-box values, such as paths and the proxy CPU, do not 
 box, with the option and each box's value.
 
 The engine does not inherit `G6_*` variables from the environment, and `./gr8 glm53 up` refuses to start while one is
-set. Pass engine variables with `--g6env-x "NAME=value ..."` so that every box compares them.
+set. Pass engine variables with `--extra-env "NAME=value ..."` so that every box compares them.
 
 The defaults come from `scripts/engine_args.sh`, which the supervisor reads. Every TP runs the multi-session engine
 (`--serve`). `V2`, `V2_SLICES`, `V2_DENSE` and `V2_WIDTHS` are paths, so each box may have its own. The handshake
@@ -66,8 +66,8 @@ after the model's options.
 
 | variable | script | meaning |
 |---|---|---|
-| `G6_WIDTHS` | `build.sh` | the TP widths g6m4 and m4sim run, default `1 2 3 4 6 8`; fewer is a shorter build |
-| `G6_NR` | `build.sh`, `c1_tests.sh` | `build.sh`: one width, as `G6_WIDTHS=N`. `c1_tests.sh`: rank count of the tests, 4, 3, or unset for 6 |
+| `GR8_WIDTHS` | `build.sh` | the TP widths g6m4 and m4sim run, default `1 2 3 4 6 8`; fewer is a shorter build |
+| `GR8_NR` | `build.sh`, `c1_tests.sh` | `build.sh`: one width, as `GR8_WIDTHS=N`. `c1_tests.sh`: rank count of the tests, 4, 3, or unset for 6 |
 | `JOBS` | `build.sh` | compiles at once, default the CPU count |
 | `BUNDLE_LIBS` | `build.sh` | 1 = copy cuBLAS into `bin/lib` for boxes without the CUDA toolkit |
 | `ARCH` | `build.sh`, `c1_tests.sh` | GPU architecture, default `121a` (GB10) |

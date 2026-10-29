@@ -33,7 +33,7 @@ def free_port():
 @unittest.skipUnless(all(os.path.isfile(os.path.join(TOK, f)) for f in TOKENIZER), 'needs GR8_PSEUDO_TOKENIZER')
 class PseudoEndToEnd(unittest.TestCase):
     def setUp(self):
-        # a short path: the engine socket lives under G6_HOME, and macOS caps a socket path at 104 bytes
+        # a short path: the engine socket lives under GR8_WORK_DIR, and macOS caps a socket path at 104 bytes
         self.t = tempfile.mkdtemp(prefix='gr8p-', dir='/tmp')
         self.rel = os.path.join(self.t, 'rel')
         os.makedirs(self.rel)
@@ -45,7 +45,7 @@ class PseudoEndToEnd(unittest.TestCase):
         os.makedirs(os.path.join(self.home, 'bin'))
         os.symlink(ENGINE, os.path.join(self.home, 'bin', 'g6pseudo'))
         self.api = free_port()
-        self.env = {k: v for k, v in os.environ.items() if k not in ('CAP', 'SESS', 'PEERS', 'G6_CLUSTER')}
+        self.env = {k: v for k, v in os.environ.items() if k not in ('CAP', 'SESS', 'PEERS', 'GR8_CLUSTER')}
         self.env['GR8_MODEL'] = 'pseudo'
 
     def tearDown(self):
@@ -53,7 +53,7 @@ class PseudoEndToEnd(unittest.TestCase):
         shutil.rmtree(self.t, ignore_errors=True)
 
     def gr8(self, cmd, *argv):
-        return subprocess.run([sys.executable, os.path.join(HERE, 'launch.py'), cmd, '--no-config', '--g6-home', self.home,
+        return subprocess.run([sys.executable, os.path.join(HERE, 'launch.py'), cmd, '--no-config', '--work-dir', self.home,
                                *argv], env=self.env, capture_output=True, text=True, timeout=120)
 
     def chat(self, text):

@@ -10,7 +10,7 @@
 //      FP8, at M rows with a cold L2 (a 96 MB write between calls, as the experts' stream between two layers' attention
 //      when serving): us per call. Also absorb_m2<1, true> (GR8_ATTN_QT), BF16 against FP8.
 //   kvb8_test [--bench] [--layer L] [--seed S]
-// Build and run: TEST=kvb8_test G6_NR=4 scripts/c1_tests.sh <bin_dir> [args]  (the K1H2 flags; attn.cu included, bind.cu)
+// Build and run: TEST=kvb8_test GR8_NR=4 scripts/c1_tests.sh <bin_dir> [args]  (the K1H2 flags; attn.cu included, bind.cu)
 // Exit code: 0 PASS, 1 FAIL, 2 CUDA error.
 #include <algorithm>
 #include <cmath>

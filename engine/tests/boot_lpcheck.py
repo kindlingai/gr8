@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Booted-cluster check of logprobs / prompt_logprobs against the engine's own float64 reference.
 
-Needs a TP6 serve build started with `--top 20` (G6ARGS_X="--top 20"): then every rank prints,
+Needs a TP6 serve build started with `--top 20` (EXTRA_ARGS="--top 20"): then every rank prints,
 for each row of every request that asks for logprobs, `top <step> <row> rank <R> lse <slice lse> id:logit ...` (the K largest
 raw logits of its vocab slice and the slice's log-sum-exp, float64 on the host). Merging the six ranks' lines gives the
 reference top-20 and logsumexp of the full vocab for that position, to compare with what the device path returned.

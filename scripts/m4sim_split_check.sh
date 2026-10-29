@@ -1,5 +1,5 @@
 #!/bin/bash
-# m4sim checks of the split replicated GEMVs (G6_QA_SPLIT / G6_IDXQ_SPLIT / G6_MTP_SPLIT, rank.cuh QSplit) on ONE GPU
+# m4sim checks of the split replicated GEMVs (GR8_QA_SPLIT / GR8_IDXQ_SPLIT / GR8_MTP_SPLIT, rank.cuh QSplit) on ONE GPU
 # (m4sim simulates every rank; the gathers go over its loopback in gather phases), and optional row-count probes.
 #
 #   MODEL_ARGS="--packs DIR" [M4SIM=./m4sim] [OUT=dir] [QUICK=1] [PARTS="ab cp"] [ROWCHECK=1] scripts/m4sim_split_check.sh
@@ -10,14 +10,14 @@
 #           claim: the same bytes as the replicated GEMVs):
 #           minv  : --minv sweep (rows 0..B-1 in --chunk 4 steps, then one step of M = 1..32..1 rows from row B), row lines
 #           mtp   : --mtp K decode with row lines (prompt steps, first / chain drafts, verify steps of K + 1 rows)
-#           s2    : --s2 --mtp 2, three sessions sharing steps (G6_S2_ROWHASH)
+#           s2    : --s2 --mtp 2, three sessions sharing steps (GR8_S2_ROWHASH)
 #           ROWCHECK=1: also, inside every minv run, row B + j must print the same row line at every M > j. That is
 #           row-count invariance, which the engine does not promise; it is a probe, not part of the split's check.
 #   chunk   (probe) the same prompts teacher-forced at --chunk C = 1..32 (+ generated rows): every row line (keyed by sequence and
 #           position) must equal the --chunk 1 run's: the row's logits / residual do not depend on the step's row count or
 #           on the rows beside it. Flags off, and (not QUICK) all flags on.
 #   ksweep  (probe) --mtp K = 1..7: the generated tokens equal the plain decode's (same prompts, --gen), flags off and on
-#   cp      the minv / mtp A/B again with the CP block active (G6_CP=1, G6_CP_R=0: every step context-parallel)
+#   cp      the minv / mtp A/B again with the CP block active (GR8_CP=1, GR8_CP_R=0: every step context-parallel)
 # Exit 0 = every check PASS. Every run's stdout / stderr stays in OUT (out.<name>.txt / err.<name>.txt).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -28,7 +28,7 @@ M4SIM=${M4SIM:-$HERE/m4sim}
 OUT=${OUT:-$PWD/m4sim-split-$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$OUT"
 LAYERS=${LAYERS:-0,1,2,3,4,6}       # l % NR = every rotation up to NR 5 (the gather geometry rotates by layer); dense 0-2,
-                                    # MoE 3, 4 and 6; indexer layers 0, 1, 2, 6 and a shared-index one (3). G6_DEC_SPLIT=3 needs more than 3
+                                    # MoE 3, 4 and 6; indexer layers 0, 1, 2, 6 and a shared-index one (3). GR8_DEC_SPLIT=3 needs more than 3
 QUICK=${QUICK:-0}
 PARTS=${PARTS:-ab cp}
 TMO=${TMO:-1800}                    # seconds per run (a lost gather fails by its own timeout, error word 66xxxxxx)
@@ -37,10 +37,10 @@ MINV_B=${MINV_B:-8}
 MTP_K=${MTP_K:-3}
 GEN=${GEN:-24}
 CAP=${CAP:-256}
-# the decode settings the TP4 engine serves with (scripts/engine_args.sh) that m4sim takes; G6_DEC_SPLIT needs --graph
-COMMON_ENV="G6_DEC_SHARED_SCRATCH=1 ${BASE_ENV:-G6_CP=0}"
+# the decode settings the TP4 engine serves with (scripts/engine_args.sh) that m4sim takes; GR8_DEC_SPLIT needs --graph
+COMMON_ENV="GR8_DEC_SHARED_SCRATCH=1 ${BASE_ENV:-GR8_CP=0}"
 COMMON_ARGS="--layers $LAYERS --cap $CAP --temp $TEMP --wide --pfv2"
-GRAPH_ENV="G6_DEC_SPLIT=3"
+GRAPH_ENV="GR8_DEC_SPLIT=3"
 
 # three fixed prompts of 72, 48 and 24 ids (an LCG over 1000..149999: arbitrary text, the same on every run)
 read -r P0 P1 P2 < <(python3 - <<'EOF'
@@ -134,7 +134,7 @@ gen() {
 # the flag combinations: QA_SPLIT x IDXQ_SPLIT (x MTP_SPLIT with --mtp); QUICK: off, all on (1 and 2)
 if [ "$QUICK" = 1 ]; then QI="0:0 1:1 2:1"; QIM="0:0:0 1:1:1 2:1:1 0:0:1"
 else QI="0:0 1:0 2:0 0:1 1:1 2:1"; QIM=""; for a in 0 1 2; do for b in 0 1; do for c in 0 1; do QIM="$QIM $a:$b:$c"; done; done; done; fi
-fenv() { local IFS=:; set -- $1; echo "G6_QA_SPLIT=$1 G6_IDXQ_SPLIT=$2${3:+ G6_MTP_SPLIT=$3}"; }
+fenv() { local IFS=:; set -- $1; echo "GR8_QA_SPLIT=$1 GR8_IDXQ_SPLIT=$2${3:+ GR8_MTP_SPLIT=$3}"; }
 ftag() { echo "$1" | tr -d :; }
 
 ab_part() {   # $1 = tag prefix, $2 = extra env (cp)
@@ -143,16 +143,16 @@ ab_part() {   # $1 = tag prefix, $2 = extra env (cp)
     g=""; ge=""; [ $form = graph ] && { g=--graph; ge=$GRAPH_ENV; }
     for f in $QI; do
       tag=${pre}minv.$form.$(ftag "$f")
-      run "$tag" "$COMMON_ENV $xenv $ge G6_ROW_LINES=1 $(fenv "$f")" $COMMON_ARGS $g $PROMPTS --chunk 4 --minv "$MINV_B"
+      run "$tag" "$COMMON_ENV $xenv $ge GR8_ROW_LINES=1 $(fenv "$f")" $COMMON_ARGS $g $PROMPTS --chunk 4 --minv "$MINV_B"
     done
     for f in $QIM; do
       tag=${pre}mtp.$form.$(ftag "$f")
-      run "$tag" "$COMMON_ENV $xenv $ge G6_ROW_LINES=1 $(fenv "$f")" $COMMON_ARGS $g $PROMPTS --chunk 8 --gen "$GEN" --mtp "$MTP_K"
+      run "$tag" "$COMMON_ENV $xenv $ge GR8_ROW_LINES=1 $(fenv "$f")" $COMMON_ARGS $g $PROMPTS --chunk 8 --gen "$GEN" --mtp "$MTP_K"
     done
     [ -n "$xenv" ] && continue        # CP block: no --s2 (S2 runs below R)
     for f in $QIM; do
       tag=${pre}s2.$form.$(ftag "$f")
-      run "$tag" "$COMMON_ENV $ge G6_S2_ROWHASH=1 $(fenv "$f")" $COMMON_ARGS $g $PROMPTS --prompt "$P2" --chunk 8 --gen 16 --mtp 2 --s2
+      run "$tag" "$COMMON_ENV $ge GR8_S2_ROWHASH=1 $(fenv "$f")" $COMMON_ARGS $g $PROMPTS --prompt "$P2" --chunk 8 --gen 16 --mtp 2 --s2
     done
   done
   for form in plain graph; do
@@ -180,7 +180,7 @@ chunk_part() {
     refs=()
     for c in $cs; do
       tag=chunk.$(ftag "$f").c$c
-      run "$tag" "$COMMON_ENV $GRAPH_ENV G6_ROW_LINES=1 $(fenv "$f")" $COMMON_ARGS --graph $PROMPTS --chunk "$c" --gen "$GEN"
+      run "$tag" "$COMMON_ENV $GRAPH_ENV GR8_ROW_LINES=1 $(fenv "$f")" $COMMON_ARGS --graph $PROMPTS --chunk "$c" --gen "$GEN"
       refs+=("$tag")
     done
     rows "${refs[@]}"
@@ -193,7 +193,7 @@ ksweep_part() {
   local fl f k tag
   if [ "$QUICK" = 1 ]; then fl="0:0:0"; else fl="0:0:0 1:1:1"; fi
   for f in $fl; do
-    run "ks.$(ftag "$f").plain" "$COMMON_ENV $GRAPH_ENV $(fenv "$f" | sed 's/ G6_MTP_SPLIT=[01]//')" $COMMON_ARGS --graph $PROMPTS --chunk 8 --gen "$GEN"
+    run "ks.$(ftag "$f").plain" "$COMMON_ENV $GRAPH_ENV $(fenv "$f" | sed 's/ GR8_MTP_SPLIT=[01]//')" $COMMON_ARGS --graph $PROMPTS --chunk 8 --gen "$GEN"
     local ks=()
     for k in 1 2 3 4 5 6 7; do
       tag=ks.$(ftag "$f").k$k
@@ -210,7 +210,7 @@ for part in $PARTS; do
     ab) ab_part "" "" ;;
     chunk) chunk_part ;;
     ksweep) ksweep_part ;;
-    cp) ab_part "cp." "G6_CP=1 G6_CP_R=0" ;;
+    cp) ab_part "cp." "GR8_CP=1 GR8_CP_R=0" ;;
     *) echo "unknown part $part"; exit 2 ;;
   esac
 done

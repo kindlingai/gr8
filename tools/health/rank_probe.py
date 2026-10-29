@@ -629,7 +629,7 @@ def main():
     p.add_argument('--hosts', required=True, help='ssh names in rank order, comma separated')
     p.add_argument('--ips', required=True, help='rail 1 address of each rank')
     p.add_argument('--ips2', default='', help='rail 2 address of each rank')
-    p.add_argument('--home', required=True, help='G6_HOME on the nodes (bin/gpuprobe lives there)')
+    p.add_argument('--home', required=True, help='GR8_WORK_DIR on the nodes (bin/gpuprobe lives there)')
     p.add_argument('--proxy-cpu', type=int, required=True)
     p.add_argument('--out')
     for k, v in asdict(Thresholds()).items():

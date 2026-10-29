@@ -57,9 +57,9 @@ KEYS = {
     'MENTAT': ('localhost', 'the daemon to announce through; none = do not announce'),
     'GROUP': ('gr8-glm53', 'the mentat group it joins'),
     'NODE_IP': (None, "the LAN address to announce. Default: mentat's."),
-    'G6_HOME': (REPO, 'the node keeps out/kv/ here: kv.log, state.json, ready.json'),
+    'GR8_WORK_DIR': (REPO, 'the node keeps out/kv/ here: kv.log, state.json, ready.json'),
 }
-FLAGS = {'G6_HOME': '--g6-home', 'MENTAT': '--mentat', 'GROUP': '--group', 'NODE_IP': '--node-ip'}
+FLAGS = {'GR8_WORK_DIR': '--work-dir', 'MENTAT': '--mentat', 'GROUP': '--group', 'NODE_IP': '--node-ip'}
 SWITCHES = {'--no-config', '--foreground', '--no-rdma', '--lazy-lock'}
 
 
@@ -83,6 +83,8 @@ def parse(argv, environ=None):
     """Command line > one config file (@FILE, else the one ./gr8 glm53 reads) > environment > default. A shared config
     file holds the model's keys too: this reads only its own."""
     environ = os.environ if environ is None else environ
+    warnings = []
+    argv = opt.renamed_argv(argv, warnings)
     cmd, at, args, switches = {}, None, [], set()
     i = 0
     while i < len(argv):
@@ -113,7 +115,10 @@ def parse(argv, environ=None):
     if '--lazy-lock' in switches:
         cmd['KV_LAZY_LOCK'] = '1'
     path = at or (None if '--no-config' in switches else opt.default_file(environ))
-    filev = opt.parse_file(path) if path and os.path.isfile(path) else {}
+    filev = opt.renamed_keys(opt.parse_file(path), path, warnings) if path and os.path.isfile(path) else {}
+    environ = opt.renamed_keys(environ, 'the environment', warnings)
+    for w in warnings:
+        print(f'gr8 kv: warning: {w}', file=sys.stderr)
     if at and not os.path.isfile(at):
         raise opt.OptionError(f'no config file {at}')
     values, origin = {}, {}
@@ -124,7 +129,7 @@ def parse(argv, environ=None):
                 break
         else:
             values[k], origin[k] = dflt, 'default'
-    values['G6_HOME'] = os.path.abspath(values['G6_HOME'])
+    values['GR8_WORK_DIR'] = os.path.abspath(values['GR8_WORK_DIR'])
     return Options(values, origin, path, args, switches)
 
 
@@ -161,7 +166,7 @@ def node_argv(o, b, ready_path):
 
 
 def out_dir(o):
-    return os.path.join(o.get('G6_HOME'), 'out', 'kv')
+    return os.path.join(o.get('GR8_WORK_DIR'), 'out', 'kv')
 
 
 def log(msg):
@@ -178,7 +183,7 @@ def read_json(path):
 
 
 def node_bin(o):
-    for p in (o.get('KV_BIN'), os.path.join(o.get('G6_HOME'), 'bin', 'kvman-remote'),
+    for p in (o.get('KV_BIN'), os.path.join(o.get('GR8_WORK_DIR'), 'bin', 'kvman-remote'),
               os.path.join(REPO, 'engine', 'kvman-rs', 'target', 'release', 'kvman-remote')):
         if p and os.access(p, os.X_OK):
             return p
@@ -532,7 +537,7 @@ def main(argv):
         print(__doc__)
         print('KEYS:')
         for k, (d, m) in KEYS.items():
-            print(f'  {flag_of(k):<16} {k:<16} {m}' + (f' (default {d})' if d and k != 'G6_HOME' else ''))
+            print(f'  {flag_of(k):<16} {k:<16} {m}' + (f' (default {d})' if d and k != 'GR8_WORK_DIR' else ''))
         return 0
     cmd, rest = argv[0], argv[1:]
     if cmd == 'supervise':

@@ -31,13 +31,13 @@ the full-index layers; vocab 154,880.
 
 ## Topology-specific (TP6, TP4, TP3)
 
-- `engine/g6nr.h`: the rank count `G6_NR`. Default 6; `-DG6_NR=4` builds TP4. `scripts/build.sh` compiles the engine
+- `engine/g6nr.h`: the rank count `GR8_NR`. Default 6; `-DG6_NR=4` builds TP4. `scripts/build.sh` compiles the engine
   once per width into one binary (`engine/runtime/build_m4.sh`). Every
   per-rank width the engine uses (heads, expert blocks, dense channels, vocab slice, scratch sizes) comes from it;
   the NR=6 values equal the old TP6 literals, so the TP6 build is SASS-identical. The engine also compiles for other
   divisors of 64; 6, 4 and 3 have been run.
 - `tools/convert/plan.py`: `set_nr(n)` picks the widths; they split n units the way `g6nr.h` does (larger chunks first).
-- `G6_PF_OWN=4` (`engine/runtime/qp.cuh`, `qp_wire.h`, the pair code in `qo_weights.cuh`):
+- `GR8_PF_OWN=4` (`engine/runtime/qp.cuh`, `qp_wire.h`, the pair code in `qo_weights.cuh`):
   TP4 only. It assumes four ranks in two head pairs of 16 heads each (64 heads, head group of rank m in layer l =
   (m - l) mod 4) and the q_b / o_proj / kv_b shapes of GLM 5.3.
 - `tools/launch/options.py` and `scripts/engine_args.sh`: the per-TP defaults (the KV pool, the prefill attention

@@ -351,7 +351,7 @@ run on the cluster: it needs four boxes.
 
 ### On the cluster (TP=4, 2026-10-12)
 
-The four GLM boxes, TP=4 home, the release from Hugging Face with the DFlash2 drafter, `--g6env-x GR8_POOL_LOG=1`.
+The four GLM boxes, TP=4 home, the release from Hugging Face with the DFlash2 drafter, `--extra-env GR8_POOL_LOG=1`.
 Requests went one at a time at temperature 0 with logprobs, unless stated. The replays are the opencode captures in the
 agent capture set. Boot-to-boot byte equality is not a check under the default config (the DFlash2 verify shape varies),
 so the check of output identity is the first token and its logprob: prefill is deterministic for the same reused rows.

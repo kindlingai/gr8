@@ -15,16 +15,16 @@ that shape, and both are now fixed:
   (8)` (`s2/scheduler.h`, `Scheduler::horizon`; `s2/service.h`, `event`). During a prefill that is the floor; in pure
   decode it is the cap, which is exactly the old constant's behaviour.
 
-This run attributes what is left, and verifies the sizing on the hardware. It needs `G6_S2_EVENTLOG=1`, because nothing
+This run attributes what is left, and verifies the sizing on the hardware. It needs `GR8_S2_EVENTLOG=1`, because nothing
 else prints the boundary a notice was anchored to.
 
 ## What gets logged
 
 Start the cluster with the diagnostic in the engine environment:
 
-    G6ENV_X="G6_S2_EVENTLOG=1" ./gr8 glm53 up
+    EXTRA_ENV="GR8_S2_EVENTLOG=1" ./gr8 glm53 up
 
-`G6ENV_X` is the launch knob for extra engine environment on every rank. Do **not** export `G6_S2_EVENTLOG` directly:
+`EXTRA_ENV` is the launch knob for extra engine environment on every rank. Do **not** export `GR8_S2_EVENTLOG` directly:
 the engine does not inherit `G6_*` from the environment, and `./gr8 glm53 up` refuses to start while one is set
 ([KNOBS.md](../KNOBS.md)). As a cluster-scope knob it goes into the pre-boot handshake, so either every box runs with it
 or none does.

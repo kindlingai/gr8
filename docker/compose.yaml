@@ -24,9 +24,9 @@ services:
         required: false
     environment:
       # The container's own paths (the volumes below, the image's python and front end). Set here so a MODEL_CACHE,
-      # G6_HOME, PY or FRONT_BIN line in .env, meant for a bare-metal box, cannot point the launcher at a path that does
+      # GR8_WORK_DIR, PY or FRONT_BIN line in .env, meant for a bare-metal box, cannot point the launcher at a path that does
       # not exist in the container.
-      - G6_HOME=/var/lib/gr8/home
+      - GR8_WORK_DIR=/var/lib/gr8/home
       - MODEL_CACHE=/var/lib/gr8/cache
       - PY=/usr/bin/python3
       - FRONT_BIN=/opt/gr8/bin/g6front-rs

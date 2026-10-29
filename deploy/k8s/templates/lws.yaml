@@ -135,7 +135,7 @@ spec:
               - name: HEAD
                 value: $(LWS_LEADER_ADDRESS)
               # The container's own paths, so an option meant for a bare-metal box cannot point the launcher elsewhere.
-              - name: G6_HOME
+              - name: GR8_WORK_DIR
                 value: /var/lib/gr8/home
               {{- if .Values.modelLoader.enabled }}
               # The model-loader store (./gr8 knobs FETCH), and model-loader's local API in it.

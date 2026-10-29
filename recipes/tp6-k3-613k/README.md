@@ -8,8 +8,8 @@ engine was built from (the recipe's `scripts/apply.sh` checks the same id). None
 
 ## What "K3" is
 K3 = the recipe's TP6 settings, plus two engine-setting changes we screened:
-- K2: `G6_PF_GEMMF32=1` (byte-exact QO o_proj prefill kernel).
-- K3: `G6_K1_SPLIT=1:/4,2-3:2x1,4-32:8x1/4` (the window-2 fc1 split at all multirow counts; recipe fc2 split kept).
+- K2: `GR8_PF_GEMMF32=1` (byte-exact QO o_proj prefill kernel).
+- K3: `GR8_K1_SPLIT=1:/4,2-3:2x1,4-32:8x1/4` (the window-2 fc1 split at all multirow counts; recipe fc2 split kept).
 
 The context comes from `CAP=612992` (9578 pages of 64 tokens, max_model_len 612986) with `SHARE_LIMIT=131072`.
 At TP=6 these are close to the launcher's defaults (614400 / 131072); the earlier 131072-token serve had lowered CAP.
@@ -55,7 +55,7 @@ tp4 slices only stops at boot with `no index slices for TP 6`.
 ## KV memory: the S2 pool
 The boot log line `# s2: ... pool of N pages ... GB pool storage` gives the real KV pool per rank:
 
-    pages per rank = R/64 + (CAP - R)/(64 x TP)        R = SHARE_LIMIT (G6_CP_R), TP = 6
+    pages per rank = R/64 + (CAP - R)/(64 x TP)        R = SHARE_LIMIT (GR8_CP_R), TP = 6
 
 The first R tokens of each session are replicated on every rank; the rest is spread over the six ranks. One page
 costs about 3.83-3.93 MB per rank. A session of S tokens (prompt + max_tokens) holds R/64 + (S - R)/384 pages per

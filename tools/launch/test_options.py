@@ -28,9 +28,9 @@ class FileTests(unittest.TestCase):
         self.d = tempfile.mkdtemp()
 
     def test_parse(self):
-        p = write(self.d, 'c.env', '# comment\n\nexport CAP=262144\nG6ENV_X="A=1 B=2"\nSESS=4   # sessions\n'
+        p = write(self.d, 'c.env', '# comment\n\nexport CAP=262144\nEXTRA_ENV="A=1 B=2"\nSESS=4   # sessions\n'
                                     "MODEL='/data/x y'\nHOSTS=\"n1 n2\"\n")
-        self.assertEqual(opt.parse_file(p), {'CAP': '262144', 'G6ENV_X': 'A=1 B=2', 'SESS': '4', 'MODEL': '/data/x y',
+        self.assertEqual(opt.parse_file(p), {'CAP': '262144', 'EXTRA_ENV': 'A=1 B=2', 'SESS': '4', 'MODEL': '/data/x y',
                                              'HOSTS': 'n1 n2'})
 
     def test_refusals_name_the_line(self):
@@ -45,7 +45,7 @@ class FileTests(unittest.TestCase):
 class PrecedenceTests(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()
-        self.f = write(self.d, 'c.env', f'PEERS={PEERS}\nCAP=1000\nSESS=4\nMTP=3\nG6_HOME=/from/file\nFOO=1\n')
+        self.f = write(self.d, 'c.env', f'PEERS={PEERS}\nCAP=1000\nSESS=4\nMTP=3\nGR8_WORK_DIR=/from/file\nFOO=1\n')
 
     def test_command_line_then_file_then_environment_then_default(self):
         env = {'CAP': '9', 'SESS': '9', 'MTP': '9', 'REUSE': '1'}
@@ -57,10 +57,27 @@ class PrecedenceTests(unittest.TestCase):
         self.assertEqual((o.get('PORT'), o.origin['PORT']), ('8100', 'default'))
         self.assertIn('unknown key FOO', o.warnings[0])
 
+    def test_old_names_still_work_with_a_warning(self):
+        f = write(self.d, 'old.env', f'PEERS={PEERS}\nG6_HOME=/from/file\nG6ENV_X="G6_QA_SPLIT=1"\n')
+        o = opt.parse(['@' + f], {})
+        self.assertEqual((o.get('GR8_WORK_DIR'), o.get('EXTRA_ENV')), ('/from/file', 'G6_QA_SPLIT=1'))
+        self.assertEqual(len([w for w in o.warnings if 'is the old name of' in w]), 2)
+        o = opt.parse(['--no-config', '--g6-home', '/a', 'G6ENV_X=X=1'], {'G6_CLUSTER': f})
+        self.assertEqual((o.get('GR8_WORK_DIR'), o.get('EXTRA_ENV')), ('/a', 'X=1'))
+        o = opt.parse(['--no-config'], {'G6_HOME': '/env', 'GR8_WORK_DIR': '/new'})
+        self.assertEqual(o.get('GR8_WORK_DIR'), '/new')     # the new name wins
+        self.assertEqual(opt.parse([], {'G6_CLUSTER': f}).file, f)
+
+    def test_old_engine_names_in_extra_env_become_one_variable(self):
+        o = opt.parse(['--no-config', '--peers', PEERS, '--tp', '4', '--extra-env', 'G6_QA_SPLIT=1 GR8_IDXQ_SPLIT=0'], GLM)
+        env = opt.engine_plan(o)['env']
+        self.assertIn('GR8_QA_SPLIT=1', env)
+        self.assertEqual([e for e in env if e.startswith(('G6_', 'G9_'))], [])
+
     def test_default_file_and_no_config(self):
-        o = opt.parse([], {'G6_CLUSTER': self.f})
+        o = opt.parse([], {'GR8_CLUSTER': self.f})
         self.assertEqual((o.file, o.get('CAP')), (self.f, '1000'))
-        o = opt.parse(['--no-config'], {'G6_CLUSTER': self.f})
+        o = opt.parse(['--no-config'], {'GR8_CLUSTER': self.f})
         self.assertEqual((o.file, o.get('CAP')), (None, None))
         here = os.getcwd()
         try:
@@ -102,8 +119,8 @@ class PrecedenceTests(unittest.TestCase):
             opt.parse(['--cap'], {})
         with self.assertRaises(opt.OptionError):
             opt.parse(['@a', '@b'], {})
-        o = opt.parse(['--no-config', '--no-check', '--g6-home', '/h', '--s2-port', '9'], {})
-        self.assertEqual((o.get('CHECK'), o.get('G6_HOME'), o.get('S2PORT')), ('0', '/h', '9'))
+        o = opt.parse(['--no-config', '--no-check', '--work-dir', '/h', '--s2-port', '9'], {})
+        self.assertEqual((o.get('CHECK'), o.get('GR8_WORK_DIR'), o.get('S2PORT')), ('0', '/h', '9'))
 
 
 class ValidateTests(unittest.TestCase):
@@ -233,10 +250,10 @@ class PathTests(unittest.TestCase):
         here = os.getcwd()
         try:
             os.chdir(d)
-            o = opt.parse(['--no-config', '--model', 'glm/packs', '--model-cache', 'cache', '--g6-home', '.'], {})
+            o = opt.parse(['--no-config', '--model', 'glm/packs', '--model-cache', 'cache', '--work-dir', '.'], {})
             self.assertEqual(o.get('MODEL'), os.path.join(os.path.realpath(d), 'glm', 'packs'))
             self.assertEqual(o.get('MODEL_CACHE'), os.path.join(os.path.realpath(d), 'cache'))
-            self.assertEqual(o.get('G6_HOME'), os.path.realpath(d))
+            self.assertEqual(o.get('GR8_WORK_DIR'), os.path.realpath(d))
             remote = 'https://huggingface.co/org/repo@main'
             self.assertEqual(opt.parse(['--no-config', '--model', remote], {}).get('MODEL'), remote)
             # a bare org/repo is a local path, and only an https:// URL names a hub repo
@@ -268,52 +285,52 @@ class CanonicalTests(unittest.TestCase):
 
     def test_l2pf_reaches_every_rank(self):
         _, text, _ = self.digest()
-        self.assertNotIn('G6_L2PF', text)
+        self.assertNotIn('GR8_L2PF', text)
         _, text, _ = self.digest('--l2pf', '15')
-        self.assertIn(' G6_L2PF=15', text)
+        self.assertIn(' GR8_L2PF=15', text)
 
     def test_cp_step_rows_reaches_every_rank(self):
         _, text, d0 = self.digest()
         self.assertNotIn('G6_CP_STEP_', text)
         _, text, d8 = self.digest('--cp-step-rows', '8')
-        self.assertIn(' G6_CP_STEP_ROWS=8', text)
-        self.assertNotIn('G6_CP_STEP_SEG', text)
+        self.assertIn(' GR8_CP_STEP_ROWS=8', text)
+        self.assertNotIn('GR8_CP_STEP_SEG', text)
         self.assertNotEqual(d0, d8)
         _, text, _ = self.digest('--cp-step-rows', '8', '--cp-step-seg', '1')
-        self.assertIn(' G6_CP_STEP_ROWS=8', text)
-        self.assertIn(' G6_CP_STEP_SEG=1', text)
+        self.assertIn(' GR8_CP_STEP_ROWS=8', text)
+        self.assertIn(' GR8_CP_STEP_SEG=1', text)
 
     def test_the_share_limit_sets_r_and_an_unset_cap_follows_it(self):
         _, text, _ = self.digest('--share-limit', '32768')
         self.assertIn('CAP=485376\n', text)              # 2,280 physical pages per rank at TP=4, as at 65536
-        self.assertIn('G6_CP_R=32768 ', text)
+        self.assertIn('GR8_CP_R=32768 ', text)
         _, text, _ = self.digest('--share-limit', '32768', '--cap', '200000')
         self.assertIn('CAP=200000\n', text)
         _, text, _ = self.digest('--share-limit', '98304')
         self.assertIn('CAP=288768\n', text)              # 98304 + (2280 - 1536) x 64 x 4
-        self.assertIn('G6_CP_R=98304 ', text)
+        self.assertIn('GR8_CP_R=98304 ', text)
         for bad in ('3000', '4095', '4100', '0', 'x'):
             with self.assertRaises(opt.OptionError):
                 self.digest('--share-limit', bad)
 
     def test_per_box_options_do_not_count(self):
         base = self.digest()[2]
-        self.assertEqual(base, self.digest('--g6-home', '/elsewhere', '--proxy-cpu', '15', '--model', '/m',
+        self.assertEqual(base, self.digest('--work-dir', '/elsewhere', '--proxy-cpu', '15', '--model', '/m',
                                            '--model-cache', '/c', '--join-timeout', '5', '--node-ip', '10.0.0.2')[2])
         self.assertNotEqual(base, self.digest('--nohash', '1')[2])    # it reaches every rank's engine
-        self.assertNotEqual(base, self.digest('--g6env-x', 'G6_X=1')[2])
+        self.assertNotEqual(base, self.digest('--extra-env', 'G6_X=1')[2])
         self.assertNotEqual(base, self.digest('--port', '8200')[2])
         # a knob set to its default, or one this TP does not read, changes nothing
-        self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '485376', '--reuse', '1', '--g6args-x', '--top 5')[2])
+        self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '485376', '--reuse', '1', '--extra-args', '--top 5')[2])
 
     def test_cp_onechain_reaches_every_rank(self):
         _, text, _ = self.digest()
-        self.assertNotIn('G6_CP_ONECHAIN', text)
+        self.assertNotIn('GR8_CP_ONECHAIN', text)
         _, text, _ = self.digest('--cp-onechain', '1')
-        self.assertIn(' G6_CP_ONECHAIN=1', text)
+        self.assertIn(' GR8_CP_ONECHAIN=1', text)
 
     def test_template_has_no_paths(self):
-        _, text, _ = self.digest('--g6-home', '/very/own/home', '--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json')
+        _, text, _ = self.digest('--work-dir', '/very/own/home', '--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json')
         self.assertNotIn('/very/own/home', text)
         self.assertIn('--serve @HOME/s2', text)
         self.assertIn('--manifest @RANKDIR/rank@R.manifest.json', text)
@@ -322,17 +339,17 @@ class CanonicalTests(unittest.TestCase):
 
     def test_dsel_model_reaches_every_rank(self):
         _, text, _ = self.digest()
-        self.assertNotIn('G6_S2_DSEL_MODEL', text)
+        self.assertNotIn('GR8_S2_DSEL_MODEL', text)
         tab = 'v2:46.63,v3:54.71,v8:96.82,d:7.285,m:2.039,e:1.155,p:5.026,w:1,r:0.95'
         _, text, _ = self.digest('--dsel-model', '1', '--dsel-table', tab)
-        self.assertIn(' G6_S2_DSEL_MODEL=1 G6_S2_DSEL_TABLE=' + tab, text)
+        self.assertIn(' GR8_S2_DSEL_MODEL=1 GR8_S2_DSEL_TABLE=' + tab, text)
 
     def test_ngram_reaches_every_rank(self):
         _, text, _ = self.digest()
-        self.assertNotIn('G6_NGRAM', text)
+        self.assertNotIn('GR8_NGRAM', text)
         _, text, _ = self.digest('--ngram', '/tables/ngram.tab', '--ngram-kmax', '5', '--ngram-kmin', '3',
                                  '--ngram-margin', '0.2')
-        self.assertIn(' G6_NGRAM=/tables/ngram.tab G6_NGRAM_KMAX=5 G6_NGRAM_KMIN=3 G6_NGRAM_MARGIN=0.2', text)
+        self.assertIn(' GR8_NGRAM=/tables/ngram.tab GR8_NGRAM_KMAX=5 GR8_NGRAM_KMIN=3 GR8_NGRAM_MARGIN=0.2', text)
 
     def test_release_alone_has_no_rank_pack(self):
         _, text, _ = self.digest('--v2', '/v2', '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel')
@@ -346,18 +363,18 @@ class CanonicalTests(unittest.TestCase):
                        '--v2-slices', '/s', '--v2-widths', '/w.json', '--v2-dense', '/rel'], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')
-        self.assertIn('G6_PF_OWN=3', p['env'])
+        self.assertIn('GR8_PF_OWN=3', p['env'])
         self.assertNotIn('--qo-manifest', p['args'])          # PF_OWN=3's full-head weights come from the release
         with self.assertRaises(opt.OptionError):
             self.digest('--v2-dense-form', 'exact')
 
     def test_mtp_kstopb_reaches_every_rank(self):
         _, text, _ = self.digest()
-        self.assertNotIn('G6_MTP_KSTOPB', text)
+        self.assertNotIn('GR8_MTP_KSTOPB', text)
         _, text, _ = self.digest('--mtp-kstopb', '1', '--mtp-kstopb-tau', '0.6,0.88',
                                  '--mtp-kstopb-tau-s', '1:0.7,0.7/2:0.7,0.8/4:0.7,0.75')
-        self.assertIn(' G6_MTP_KSTOPB=1 G6_MTP_KSTOPB_TAU=0.6,0.88 G6_MTP_KSTOPB_TAU_S1=0.7,0.7 G6_MTP_KSTOPB_TAU_S2=0.7,0.8'
-                      ' G6_MTP_KSTOPB_TAU_S4=0.7,0.75', text)
+        self.assertIn(' GR8_MTP_KSTOPB=1 GR8_MTP_KSTOPB_TAU=0.6,0.88 GR8_MTP_KSTOPB_TAU_S1=0.7,0.7 GR8_MTP_KSTOPB_TAU_S2=0.7,0.8'
+                      ' GR8_MTP_KSTOPB_TAU_S4=0.7,0.75', text)
         for bad in ('0.7,0.7', '9:0.7', '1:', '1:0.7/x'):
             with self.assertRaises(opt.OptionError):
                 self.digest('--mtp-kstopb', '1', '--mtp-kstopb-tau-s', bad)
@@ -366,11 +383,11 @@ class CanonicalTests(unittest.TestCase):
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'] + rel + ['--kvb', 'fp8'], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')
-        self.assertIn('G6_KVB=fp8', p['env'])
+        self.assertIn('GR8_KVB=fp8', p['env'])
         self.assertNotEqual(self.digest(*rel)[2], self.digest(*rel, '--kvb', 'fp8')[2])   # a cluster option
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'] + rel, GLM)
         opt.validate(o)
-        self.assertNotIn('G6_KVB', opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')['env'])
+        self.assertNotIn('GR8_KVB', opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')['env'])
         with self.assertRaises(opt.OptionError):
             self.digest('--kvb', 'fp8')                        # no model at all: rank packs hold kv_b in BF16
         self.digest('--model', '/some/model', '--kvb', 'fp8')   # a --model may be a release (the engine checks)
@@ -399,7 +416,7 @@ class CanonicalTests(unittest.TestCase):
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3'], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
-        self.assertIn('G6_PF_OWN=1', p['env'])
+        self.assertIn('GR8_PF_OWN=1', p['env'])
         self.assertEqual(p['args'][:2], ['--manifest', '/r/rank2.manifest.json'])
         self.assertEqual(p['args'][-2:], ['--set-id', 'ab'])
         self.assertIn('/h/s2', p['args'])
@@ -407,9 +424,9 @@ class CanonicalTests(unittest.TestCase):
         self.assertFalse(any(a.startswith('--dflash') for a in p['args']))
 
     def test_tp4_serve_options_default_on_and_override(self):
-        on = ['G6_ROUTE_OVL=1', 'G6_DRAFT_HEAD_I4=1', 'G6_ATTN_SC2=4', 'G6_ATTN_SC2_TR=2', 'G6_ATTN_CTX2=4', 'G6_ATTN_CTX3=2',
-              'G6_ATTN_SEL2=16', 'G6_IDX_GRP=16', 'G6_ATTN_QT=1', 'G6_ATTN_FRONT=1', 'G6_IDX_VEC=1', 'G6_DEC_BK=512',
-              'G6_S2_ADAPT=1', 'G6_S2_DECODE_PF=4096', 'G6_S2_ADMIT_HOLD=1', 'G6_PF_SELX_CTX=53248']
+        on = ['GR8_ROUTE_OVL=1', 'GR8_DRAFT_HEAD_I4=1', 'GR8_ATTN_SC2=4', 'GR8_ATTN_SC2_TR=2', 'GR8_ATTN_CTX2=4', 'GR8_ATTN_CTX3=2',
+              'GR8_ATTN_SEL2=16', 'GR8_IDX_GRP=16', 'GR8_ATTN_QT=1', 'GR8_ATTN_FRONT=1', 'GR8_IDX_VEC=1', 'GR8_DEC_BK=512',
+              'GR8_S2_ADAPT=1', 'GR8_S2_DECODE_PF=4096', 'GR8_S2_ADMIT_HOLD=1', 'GR8_PF_SELX_CTX=53248']
         def env(peers, *argv):
             o = opt.parse(['--no-config', '--peers', peers, *argv], GLM)
             opt.validate(o)
@@ -418,14 +435,14 @@ class CanonicalTests(unittest.TestCase):
         for v in on:
             self.assertIn(v, e)
         e = env(PEERS, '--route-ovl', '0', '--attn-sc2', '0', '--draft-head-i4', '0')
-        self.assertIn('G6_ROUTE_OVL=0', e)
-        self.assertIn('G6_ATTN_SC2=0', e)
-        self.assertIn('G6_DRAFT_HEAD_I4=0', e)
-        self.assertFalse(any(a.startswith('G6_DRAFT_HEAD_I4') for a in env(PEERS, '--mtp', '0', '--dflash', '0')))
+        self.assertIn('GR8_ROUTE_OVL=0', e)
+        self.assertIn('GR8_ATTN_SC2=0', e)
+        self.assertIn('GR8_DRAFT_HEAD_I4=0', e)
+        self.assertFalse(any(a.startswith('GR8_DRAFT_HEAD_I4') for a in env(PEERS, '--mtp', '0', '--dflash', '0')))
         e = env(PEERS, '--dec-bk', '0', '--pf-selx-ctx', '0')   # 0 = the engine default: not passed
-        self.assertFalse(any(a.startswith(('G6_DEC_BK=', 'G6_PF_SELX_CTX=')) for a in e))
-        e = env(PEERS, '--g6env-x', 'G6_ROUTE_OVL=0 G6_DEC_BK=2048')   # G6ENV_X keeps its own value, no second copy
-        self.assertEqual([a for a in e if a.startswith(('G6_ROUTE_OVL=', 'G6_DEC_BK='))], ['G6_ROUTE_OVL=0', 'G6_DEC_BK=2048'])
+        self.assertFalse(any(a.startswith(('GR8_DEC_BK=', 'GR8_PF_SELX_CTX=')) for a in e))
+        e = env(PEERS, '--extra-env', 'GR8_ROUTE_OVL=0 GR8_DEC_BK=2048')   # EXTRA_ENV keeps its own value, no second copy
+        self.assertEqual([a for a in e if a.startswith(('GR8_ROUTE_OVL=', 'GR8_DEC_BK='))], ['GR8_ROUTE_OVL=0', 'GR8_DEC_BK=2048'])
         e = env('10.0.0.1,10.0.0.2,10.0.0.3')   # TP=3 unchanged
         self.assertFalse(any(a.split('=')[0] in [v.split('=')[0] for v in on] for a in e))
     def test_tp5_prefills_with_pf_own_3(self):
@@ -433,17 +450,17 @@ class CanonicalTests(unittest.TestCase):
             o = opt.parse(['--no-config', '--peers', ','.join(f'10.0.0.{i}' for i in range(1, 6)), *argv], GLM)
             opt.validate(o)
             return opt.engine_plan(o, rank=4, rank_dir='/r', aux_dir='/a', home='/h')['env']
-        self.assertIn('G6_PF_OWN=3', env())
-        self.assertIn('G6_PF_OWN=1', env('--pf-own', '1'))
+        self.assertIn('GR8_PF_OWN=3', env())
+        self.assertIn('GR8_PF_OWN=1', env('--pf-own', '1'))
 
     def test_tp4_tr3_w2all_default_on_and_override(self):
         def env(peers, *argv):
             o = opt.parse(['--no-config', '--peers', peers, *argv], GLM)
             opt.validate(o)
-            return [a for a in opt.engine_plan(o, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env'] if a.startswith('G6_TR3_W2ALL=')]
-        self.assertEqual(env(PEERS), ['G6_TR3_W2ALL=1'])
-        self.assertEqual(env(PEERS, '--tr3-w2all', '0'), ['G6_TR3_W2ALL=0'])
-        self.assertEqual(env(PEERS, '--g6env-x', 'G6_TR3_W2ALL=0'), ['G6_TR3_W2ALL=0'])   # G6ENV_X keeps its value, no second copy
+            return [a for a in opt.engine_plan(o, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env'] if a.startswith('GR8_TR3_W2ALL=')]
+        self.assertEqual(env(PEERS), ['GR8_TR3_W2ALL=1'])
+        self.assertEqual(env(PEERS, '--tr3-w2all', '0'), ['GR8_TR3_W2ALL=0'])
+        self.assertEqual(env(PEERS, '--extra-env', 'GR8_TR3_W2ALL=0'), ['GR8_TR3_W2ALL=0'])   # EXTRA_ENV keeps its value, no second copy
         self.assertEqual(env('10.0.0.1,10.0.0.2,10.0.0.3'), [])   # TP=3 unchanged
 
     def test_tp6_is_s2_without_drafter(self):
@@ -451,7 +468,7 @@ class CanonicalTests(unittest.TestCase):
         o = opt.parse(['--no-config', '--peers', peers], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
-        self.assertIn('G6_PF_OWN=3', p['env'])
+        self.assertIn('GR8_PF_OWN=3', p['env'])
         self.assertIn('/a/qo.pack', p['args'])
         self.assertIn('/h/s2', p['args'])
         self.assertIn('--reuse-prefix', p['args'])
@@ -469,7 +486,7 @@ class CanonicalTests(unittest.TestCase):
         o = opt.parse(['--no-config', '--peers', peers, '--pf-own', '1'], GLM)
         opt.validate(o)
         p = opt.engine_plan(o, rank=2, rank_dir='/r', aux_dir='/a', home='/h', epoch=5, set_id='ab')
-        self.assertIn('G6_PF_OWN=1', p['env'])
+        self.assertIn('GR8_PF_OWN=1', p['env'])
         self.assertNotIn('/a/qo.pack', p['args'])
 
 
@@ -496,8 +513,8 @@ class KvStoreTests(unittest.TestCase):
         b = 'remote:192.0.2.5:7350,size=8G,group=glm,cap=32G,weight=2000'
         o, p = self.plan('--kv-store', b, '--kv-share-when', 'always')
         self.assertEqual(self.stores(p), [b])
-        self.assertIn('G6_KV_SHARE_WHEN=always', p['env'])
-        self.assertNotIn('G6_KV_SHARE_WHEN', ' '.join(self.plan('--kv-store', b)[1]['env']))
+        self.assertIn('GR8_KV_SHARE_WHEN=always', p['env'])
+        self.assertNotIn('GR8_KV_SHARE_WHEN', ' '.join(self.plan('--kv-store', b)[1]['env']))
         with self.assertRaises(opt.OptionError):
             self.plan('--kv-store', b, '--kv-share-when', 'busy')
 
@@ -777,7 +794,7 @@ class KvRowsTests(unittest.TestCase):
         return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_rows=kv_rows)
 
     def rt(self, p):
-        return {k: v for k, _, v in (e.partition('=') for e in p['env']) if k.startswith('G6_RT_')}
+        return {k: v for k, _, v in (e.partition('=') for e in p['env']) if k.startswith('GR8_RT_')}
 
     def test_off_by_default(self):
         o, p = self.plan()
@@ -787,15 +804,15 @@ class KvRowsTests(unittest.TestCase):
 
     def test_every_part_reaches_the_engine(self):
         o, p = self.plan('--kv-rows', 'remote:192.0.2.5:7350,size=12G,local=40,pool=49152,place=900,fmt=int4')
-        self.assertEqual(self.rt(p), {'G6_RT_STORE': 'remote:192.0.2.5:7350', 'G6_RT_SIZE': str(12 << 30), 'G6_RT_LOCAL': '40',
-                                      'G6_RT_POOL': '49152', 'G6_RT_PLACE': '900', 'G6_RT_FMT': 'int4'})
+        self.assertEqual(self.rt(p), {'GR8_RT_STORE': 'remote:192.0.2.5:7350', 'GR8_RT_SIZE': str(12 << 30), 'GR8_RT_LOCAL': '40',
+                                      'GR8_RT_POOL': '49152', 'GR8_RT_PLACE': '900', 'GR8_RT_FMT': 'int4'})
         t = opt.kv_rows(o)
         self.assertEqual((t['kind'], t['host'], t['port'], t['size'], t['local']), ('remote', '192.0.2.5', '7350', '12G', 40))
         # mem: (one box's memory, a test) and a fractional size
-        self.assertEqual(self.rt(self.plan('--kv-rows', 'mem:,size=1.5M')[1]), {'G6_RT_STORE': 'mem:', 'G6_RT_SIZE': str(3 << 19)})
+        self.assertEqual(self.rt(self.plan('--kv-rows', 'mem:,size=1.5M')[1]), {'GR8_RT_STORE': 'mem:', 'GR8_RT_SIZE': str(3 << 19)})
         # the environment form
         self.assertEqual(self.rt(self.plan(env={'KV_ROWS': 'mem:,size=1G,local=8'})[1]),
-                         {'G6_RT_STORE': 'mem:', 'G6_RT_SIZE': str(1 << 30), 'G6_RT_LOCAL': '8'})
+                         {'GR8_RT_STORE': 'mem:', 'GR8_RT_SIZE': str(1 << 30), 'GR8_RT_LOCAL': '8'})
 
     def test_remote_auto_is_resolved_per_box(self):
         o = opt.parse(['--no-config', '--mentat', 'localhost', '--tp', '4', '--kv-rows', 'remote:auto,size=8G,local=40'], GLM)
@@ -804,8 +821,8 @@ class KvRowsTests(unittest.TestCase):
         rows = opt.kv_rows_with(o, '10.1.0.20:7351')
         self.assertEqual(rows, 'remote:10.1.0.20:7351,size=8G,local=40')
         p = opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h', kv_rows=rows)
-        self.assertEqual(self.rt(p)['G6_RT_STORE'], 'remote:10.1.0.20:7351')
-        self.assertIn('G6_RT_STORE=remote:auto', opt.canonical(o, opt.engine_plan(o), None)[1])
+        self.assertEqual(self.rt(p)['GR8_RT_STORE'], 'remote:10.1.0.20:7351')
+        self.assertIn('GR8_RT_STORE=remote:auto', opt.canonical(o, opt.engine_plan(o), None)[1])
 
     def test_refusals(self):
         v = ValidateTests()

@@ -2,7 +2,7 @@
 
 ## tp6.json — `main` at afca111, TP6, GPU clock cap 2200 MHz
 
-- Build: `main` at afca111, `scripts/build.sh` (K1H2 flags, `G6_NR=6`), the same binary on all six nodes.
+- Build: `main` at afca111, `scripts/build.sh` (K1H2 flags, `GR8_NR=6`), the same binary on all six nodes.
 - Launch: `scripts/launch_tp6.sh` defaults (`CAP=614400`, `MTP=2`, `NOHASH=1`, K1H2 engine env), rank health probe admitted
   on every boot. The rank ssh line was wrapped in `{ ...; }` so the launcher returns; nothing else changed.
 - **GPU clock cap 2200 MHz on all six nodes** (`nvidia-smi -lgc 0,2200`), recorded in every run record. Compare only
@@ -18,7 +18,7 @@
 
 ## tp4.json — `main` at 34d0d05, TP4, GPU clock cap 2200 MHz
 
-- Build: `main` at 34d0d05, `G6_NR=4 BUNDLE_LIBS=1 scripts/build.sh`, the same binary on all four nodes.
+- Build: `main` at 34d0d05, `GR8_NR=4 BUNDLE_LIBS=1 scripts/build.sh`, the same binary on all four nodes.
 - Launch: `scripts/launch_tp4.sh` defaults (`CAP=393216`, `PF_OWN=4`, DFlash2 drafter with adaptive draft count,
   `NOHASH=1`). Drafter packs from `tools/convert/dflash2.py --nr 4` (0.86 GB per rank).
 - `launch_tp4.sh` does not run the rank health probe (`launch_tp6.sh` does), so `scripts/rank_health.sh` was run before
