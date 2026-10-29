@@ -126,9 +126,9 @@ pub struct GlmParser {
     deferred_reasoning: String,
     deferred_content: String,
     content_has_nonws: bool,
-    fresh: bool,  // only whitespace since the reply start, a think tag or a live call
-    fence: bool,  // the answer is inside a ``` fence
-    ticks: usize, // backticks in a row
+    fresh: bool,      // only whitespace since the reply start, a think tag or a live call
+    fence: bool,      // the answer is inside a ``` fence
+    ticks: usize,     // backticks in a row
     undeclared: bool, // a call may name a tool the request did not declare (`emit_undeclared`)
 }
 
@@ -1291,7 +1291,8 @@ mod tests {
     /// The flag off is today's behaviour: the undeclared call is prose, whole and streamed.
     #[test]
     fn undeclared_name_is_text_by_default() {
-        let text = "</think><tool_call>tool_describe<arg_key>names</arg_key><arg_value>web_search</arg_value></tool_call>";
+        let text =
+            "</think><tool_call>tool_describe<arg_key>names</arg_key><arg_value>web_search</arg_value></tool_call>";
         let r = full(text);
         assert!(r.calls.is_empty());
         assert_eq!(r.content.as_deref(), Some(&text["</think>".len()..]));
