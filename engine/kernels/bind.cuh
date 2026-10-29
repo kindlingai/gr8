@@ -101,6 +101,8 @@ struct LayerTensors
     Tensor t[NT];
     int fc1_wide = 0;                 // tr3.fc1 is in the wide order (widen_fc1 ran)
     int fc2_wide = 0;                 // tr3.fc2 is in the wide order (widen_fc2 ran)
+    const uint8_t* const* ptab = nullptr;   // EL3 (#151): the layer's piece table (ptab.cuh), a fixed device address; nullptr = the
+                                      // pack layout. make_k1 hands it to the kernels (K1Args::t_ptab)
     int e4m3 = 0;                     // routed experts are exlr8-e4m3 (tr3.table's format): K1 decodes with E4M3 rounding
     int cb = TR3_MCG;                 // their codebook (tr3.table's format; tr3.cuh TR3_*): the CB instantiations
     int k2 = 1;                       // some routed fc1 / fc2 unit has width 2 (exlr8 v2): the K2 instantiations.
@@ -1053,6 +1055,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
         a.t_sg = static_cast<const __half*>(sg.p); a.t_v1b = static_cast<const __half*>(v1b.p); a.t_v3b = static_cast<const __half*>(v3b.p);
         a.t_fc1 = static_cast<const uint8_t*>(T.t[T_TR3_FC1].p); a.t_fc2 = static_cast<const uint8_t*>(T.t[T_TR3_FC2].p);
         a.t_wide = T.fc1_wide; a.t_wide2 = T.fc2_wide;
+        a.t_ptab = T.ptab;
         a.t_v1 = static_cast<const __half*>(v1.p); a.t_v2 = static_cast<const __half*>(v2.p); a.t_v3 = static_cast<const __half*>(v3.p);
     }
     else
@@ -1141,6 +1144,9 @@ struct Layer
     Tensor sh[3];                     // the K1's shared / dense MLP records (fc1 or gate, up, fc2 or down), for warm_mlp
     const void* shw = nullptr;        // trellis shared expert: its fc1 tiles (tr3.table row 256) and their bytes,
     size_t shw_bytes = 0;             // for warm_mlp in place of sh[]
+    const uint8_t* shw_piece[g6nr::EB] = {};   // the same through a piece table (LayerTensors::ptab): row 256's fc1 slabs,
+    size_t shw_piece_bytes[g6nr::EB] = {};     // one per block (shw is null then)
+    int shw_pieces = 0;
     // dense trellis matrices (dtr.cuh). make_layer binds them where the layer has them, and leaves q_b, o_proj and the
     // dense MLP's K1 off there. launch_q_b / launch_o_proj / launch_mlp run whichever is on.
     dtr::Gemv q_b_t, o_proj_t, glu_t, down_t;
@@ -1194,6 +1200,7 @@ inline void warm_mlp(const Layer& L, cudaStream_t st)
     launch_warm(L.sh[0].p, rec_bytes(L.sh[0]), st);
     launch_warm(L.sh[1].p, rec_bytes(L.sh[1]), st);
     launch_warm(L.shw, L.shw_bytes, st);
+    for (int b = 0; b < L.shw_pieces; ++b) launch_warm(L.shw_piece[b], L.shw_piece_bytes[b], st);
 }
 // before the wait for the MLP partials (collective 2i+1): the NEXT layer's q_a (7.1 MB). kv_a and q_b (9.6 MB more)
 // only on a side stream or after the GB10 numbers say the wait is long enough.
@@ -1282,11 +1289,28 @@ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, c
     L.w8 = (qmx ? 1 : 0) | (omx ? 2 : 0) | (L.k1.a.s_mx ? 4 : 0);
     if (L.k1.sh)                      // row 256's fc1 bytes: 2 matrices per block at each unit's width
     {
-        size_t o0 = 0, o1 = 0;
-        sh_unit_off(T, 0, o0);
-        sh_unit_off(T, 2 * static_cast<int>(T.sh_tr[3]), o1);
-        L.shw = static_cast<const uint8_t*>(T.t[T_TR3_FC1].p) + o0;
-        L.shw_bytes = o1 - o0;
+        if (T.ptab)                   // through the piece table: the row's fc1 slabs, read back from the host-visible table
+        {
+            // the table lives in device memory; its row-256 entries are read once here (make_layer is synchronous)
+            const int nb = static_cast<int>(T.sh_tr[3]);
+            const uint8_t* ent[2 * g6nr::EB];
+            if (cudaMemcpy(ent, T.ptab + static_cast<size_t>(geom::NEXP) * g6nr::EB * 2, sizeof(void*) * 2 * nb, cudaMemcpyDeviceToHost) != cudaSuccess)
+                return "make_layer: cannot read the piece table";
+            L.shw_pieces = nb;
+            for (int b = 0; b < nb; ++b)
+            {
+                L.shw_piece[b] = ent[2 * b];
+                L.shw_piece_bytes[b] = tr3_piece_fc1_bytes(T.sh_kmix, T.sh_tr, b);
+            }
+        }
+        else
+        {
+            size_t o0 = 0, o1 = 0;
+            sh_unit_off(T, 0, o0);
+            sh_unit_off(T, 2 * static_cast<int>(T.sh_tr[3]), o1);
+            L.shw = static_cast<const uint8_t*>(T.t[T_TR3_FC1].p) + o0;
+            L.shw_bytes = o1 - o0;
+        }
     }
     return nullptr;
 }

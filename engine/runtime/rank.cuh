@@ -38,6 +38,7 @@
 #include "host_reclaim.h"
 #include "../kernels/glue.cuh"
 #include "../kernels/bind.cuh"
+#include "../kernels/ptab.cuh"
 #include "../kernels/l2pf.cuh"
 #include "../kernels/head_i4.cuh"
 #include "../kernels/head2.cuh"
@@ -248,6 +249,7 @@ struct Layer
     flash_mlp::Block flash_mlp[MX + 1];
 #endif
     bind::LayerTensors T;
+    ptab::Table ptab;                 // EL3 (#151): the layer's piece table (G6_PTAB); T.ptab points at it when built
     bind::Layer L[MX + 1];
     bool built[MX + 1] = {};
     G6AttnPack ap{};
@@ -398,6 +400,7 @@ struct Model
 #endif
     bool graph = false;               // attention through the replay entry (set before prepare)
     bool wide = false;                // set before build: tr3.fc1 K3 records into the wide order, in place (bind::widen_fc1)
+    ptab::Pool ppool;                 // EL3 (#151): the slab pool of the piece tables (G6_PTAB=2 copies pieces into it)
     // graph form: captured attention capacities, ascending, the last = the binding's capacity. G6_DEC_BK=B (read at
     // build, default 2048): B, 2B, 4B, ... (7 at most) below the capacity, then the capacity, and CP's R when it is not one
     // of them; 0 = one bucket (the capacity). A step runs the graph of the smallest bucket >= its context (bucket_of);
@@ -733,6 +736,24 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
             bind::widen_fc1(y.T, st);
             if (!getenv("G6_NOWIDE2")) bind::widen_fc2(y.T, st);
             G6RT_CK(cudaStreamSynchronize(st));
+        }
+        // G6_PTAB (EL3, #151): the routed experts read through a per-layer piece table (ptab.cuh); 1 = entries into the
+        // image, 2 = pieces copied into scattered slabs from the pool. Off: the pack layout, as before. After the wide
+        // reorder, so a slab holds the order the kernels read.
+        {
+            ptab::Mode pm;
+            if (const char* e = ptab::mode_env(pm)) die(e);
+            if (pm != ptab::OFF && y.T.t[bind::T_TR3_TAB].p)
+            {
+                const bind::Tensor& tab = y.T.t[bind::T_TR3_TAB];
+                if (const char* e = ptab::build(y.ptab, tab.p, y.T.t[bind::T_TR3_KMIX].p, static_cast<const uint8_t*>(y.T.t[bind::T_TR3_FC1].p),
+                                                static_cast<const uint8_t*>(y.T.t[bind::T_TR3_FC2].p), static_cast<int>(tab.shape[0]), g6nr::EB, pm, m.ppool, st))
+                    die("layer " + std::to_string(y.l) + ": " + e);
+                y.T.ptab = y.ptab.dev;
+                if (i == 0 || i == m.nl - 1)
+                    fprintf(stderr, "# rank %d: G6_PTAB=%d: layer %d routed experts through a piece table (%d x %d x 2 entries%s)\n", rank, (int)pm, y.l,
+                            y.ptab.rows, y.ptab.eb, pm == ptab::SCATTER ? (", " + std::to_string(y.ptab.slab_bytes >> 20) + " MB of slabs").c_str() : "");
+            }
         }
 #if DEC_I4PAIR
         bind::i4pair(y.T, st);

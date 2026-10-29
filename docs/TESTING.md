@@ -108,6 +108,7 @@ against its own decoded values), `l2pf_queue_test` and
 |---|---|
 | `l2pf_bench` | `G6_L2PF` prefetch: speed, and exactness against no prefetch |
 | `k1_ovl_test` | `G6_ROUTE_OVL` against the default MoE layer |
+| `ptab_test_tp<N>` | `G6_PTAB` (#151): the routed experts through a per-layer piece table, entries into the image and pieces scattered into slabs, against the pack layout: decode at every row count (plain and graph), a graph replayed after the table's contents changed, prefill at 1,024 and 4,096 rows, byte for byte; `--sabotage` proves the check bites; bench of decode and prefill per layer |
 | `gpuprobe` | the GPU half of the rank health probe (`tools/health/rank_probe.py` runs it) |
 | `dtr_test_tp<N>`, `dtr_test_flash_tp<N>` | dense trellis matrices, at each width: dumps for `engine/ref/dtr_ref.py`, and decode timing (needs release entries) |
 

@@ -257,6 +257,7 @@ inline Plan plan_layer(const bind::Layer& b, const void* uk, const void* uv, con
     else if (b.o_proj.on) P.add(T_OPROJ, b.o_proj.w, opcap && opcap < bind::gv_bytes(b.o_proj) ? opcap : bind::gv_bytes(b.o_proj));
     if (b.router.on) P.add(T_ROUTER, b.router.w, bind::gv_bytes(b.router));
     if (b.shw) P.add(T_SHARED, b.shw, b.shw_bytes);
+    else if (b.shw_pieces) { for (int k = 0; k < b.shw_pieces && k < 4; ++k) P.add(T_SHARED, b.shw_piece[k], b.shw_piece_bytes[k]); }   // piece table (#151): up to 4 slabs
     else if (b.glu_t.on) { for (int k = 0; k < 2; ++k) P.add(T_SHARED, b.glu_t.a.w[k], static_cast<size_t>(b.glu_t.a.K) * b.glu_t.a.N * dtr::BITS / 8); }
     else { for (int k = 0; k < 2; ++k) P.add(T_SHARED, b.sh[k].p, bind::rec_bytes(b.sh[k])); }
     return P;
