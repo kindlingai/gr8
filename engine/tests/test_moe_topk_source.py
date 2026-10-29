@@ -53,7 +53,7 @@ class OffSurface(unittest.TestCase):
         self.assertIn('int topk = geom::TOPK;', src('engine/kernels/flash_mlp.cuh'))
         self.assertIn('A.topk = static_cast<int>(knob::moe_topk());', src('engine/kernels/bind_prefill.cuh'))
         # the table: an int of 1..8 (the model's top-k), and unset keeps the model's top-k
-        self.assertRegex(src('engine/knobs-rs/src/table.rs'), r'\n    MOE_TOPK: agree int (= "8"|\? "[^"]*"), "1\.\.8";')
+        self.assertRegex(src('knobs/decode.yaml'), r'\n  GR8_MOE_TOPK:\n    scope: agree\n    kind: int\n    default: "8"\n    values: "1\.\.8"\n')
         # the GLM decode call site passes no K (default TOPK)
         self.assertIn('glue::k_router_plan<<<1, glue::NEXP, 0, st>>>(m.logits, y.router_bias, M, m.plan);',
                       src('engine/runtime/rank.cuh'))

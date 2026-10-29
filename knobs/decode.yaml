@@ -1,0 +1,315 @@
+# Decode MoE, dense layers and their kernels. knobs/README.md describes the fields.
+prefix: "GR8_"
+knobs:
+  GR8_DEC_BK:
+    scope: agree
+    kind: int
+    default: "2048"
+    doc: >-
+      The first decode context bucket boundary in tokens. Decode graphs are captured per bucket and GR8_RT_L must be a
+      bucket boundary.
+  GR8_DEC_EVPROF:
+    scope: local
+    kind: int
+    default: "0"
+    doc: >-
+      Prints per-stage decode step times from event nodes in the captured main-step graphs every N main steps, in the
+      rank logs. 0: off.
+  GR8_DEC_MHC_STAGE:
+    scope: agree
+    kind: flag
+    default: "1"
+    doc: >-
+      Flash decode: the fused mHC consume stages the peers' partials in shared memory before summing, at 1 or 4 rows.
+      Same rank-order summation.
+  GR8_DEC_PROF:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      Measures decode stages with a synchronize at every mark and prints them per rank. Plain launches only, the engine
+      stops with --graph.
+  GR8_DEC_SHARED_SCRATCH:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      One decode attention scratch serves every layer of the main model, which frees memory for the KV pool. Needs
+      --pfv2.
+  GR8_DEC_SPLIT:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0.."
+    doc: >-
+      Captures the decode step as two graphs split at this layer, so the second submission overlaps the first one's GPU
+      time. Needs --graph. 0: one graph.
+  GR8_DTR:
+    scope: agree
+    kind: flag
+    default: "1"
+    doc: >-
+      Uses the exlr8 release's dense trellis matrices (q_b, o_proj, the dense MLP) where a layer has them. 0 = the int4
+      or MXFP8 records, which the layer must then have.
+  GR8_DTR_NBFAST:
+    scope: agree
+    kind: flag
+    default: "1"
+    doc: >-
+      Single-matrix dense trellis GEMVs whose group stride exceeds their block stride assign CTAs output block first
+      instead of k part first. CTA order only.
+  GR8_DTR_NBFAST_OUT:
+    scope: agree
+    kind: flag
+    default: "1"
+    doc: >-
+      As GR8_DTR_NBFAST, for single-matrix dense trellis GEMVs whose block stride is at least their group stride.
+  GR8_DTR_PF_COPY:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      Prefill runs o_proj on an exact FP8 copy of its trellis tiles too, as q_b and the dense MLP do, about 25 MB more
+      per layer at TP4. Same bits.
+  GR8_DTR_PF_KDA_COPY:
+    scope: agree
+    kind: flag
+    default: "1"
+    doc: >-
+      Flash prefill makes exact FP8 copies of the KDA q, k and v trellis matrices for the prefill GEMMs. 0 = no copies.
+  GR8_DTR_PF_SHARE_SUH:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      Flash prefill dense MLP: up reuses gate's rotated input instead of rotating with its own suh vector.
+  GR8_FUSE:
+    scope: agree
+    kind: int
+    default: "1"
+    values: "0|1|2"
+    doc: >-
+      Decode MoE K1: 1 = one fused launch, 0 = separate launches, 2 = fused with a KS1=2 WG=2 split at 2 and 3 rows,
+      which rounds differently.
+  GR8_GEMM:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0..3"
+    doc: >-
+      Prefill MXFP8 GEMM kernel: 1 = k_gemm_mx8 (v1), 2 = v2 with 128-row CTAs, 3 = v2 with 64-row CTAs, 0 = v2 with row
+      blocks by grid size.
+  GR8_GV_MULTI:
+    scope: agree
+    kind: flag
+    default: "1"
+    doc: >-
+      Steps of up to 8 rows run the GEMVs on the layer input (q_a, kv_a, the indexer's k and weights) as one launch. 0 =
+      one launch each. Same bits.
+  GR8_K1_FUSE_POLICY:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    doc: >-
+      0 turns off the timed table that makes exlr8 v2 MoE layers pick fused or separate fc1 / fc2 launches by row count,
+      so GR8_FUSE applies as given.
+  GR8_K1_SPLIT:
+    scope: agree
+    kind: text
+    unset: "the release split per row count"
+    doc: >-
+      Sets the decode MoE K1 split: a KS1,WG,NS2 triple for every row count, or a table of M:KS1xWG/NS2 entries that
+      keeps the bytes. A bad split stops the bind.
+  GR8_K1_SPLIT_M1:
+    scope: agree
+    kind: ints
+    unset: "GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (4,1,2)"
+    doc: >-
+      Sets the decode MoE K1 split KS1,WG,NS2 for 1-row steps, over GR8_K1_SPLIT. Another fc1 partial count can change
+      the sums.
+  GR8_K1_SPLIT_M2:
+    scope: agree
+    kind: ints
+    unset: "GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (1,2,8)"
+    doc: >-
+      Sets the decode MoE K1 split KS1,WG,NS2 for 2- and 3-row steps, over GR8_K1_SPLIT. Another fc1 partial count can
+      change the sums.
+  GR8_K1_SPLIT_M4:
+    scope: agree
+    kind: ints
+    unset: "GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (4,2,2)"
+    doc: >-
+      Sets the decode MoE K1 split KS1,WG,NS2 for steps of 4 or more rows, over GR8_K1_SPLIT. Another fc1 partial count
+      can change the sums.
+  GR8_K1_TLBW:
+    scope: local
+    kind: int
+    default: "0"
+    values: "0..1048576"
+    doc: >-
+      At the start of each decode MoE fc1 launch, prefetches the routed slots' fc1 and fc2 weight translations into L2
+      at this granule in KB. No output change.
+  GR8_L2PF:
+    scope: local
+    kind: int
+    default: "0"
+    values: "0..31"
+    doc: >-
+      Window mask for a paced L2 prefetch of the weights the decode step reads next, on a side stream while DRAM is idle
+      (`kernels/l2pf.cuh`). Writes nothing, so output bytes are unchanged.
+  GR8_L2PF_GBPS:
+    scope: local
+    kind: float
+    default: "175"
+    doc: >-
+      Sets the pace of the GR8_L2PF prefetch in GB/s.
+  GR8_L2PF_MB:
+    scope: local
+    kind: float
+    default: "10"
+    doc: >-
+      Sets the most MiB the GR8_L2PF prefetch issues in one window.
+  GR8_L2PF_OPMB:
+    scope: local
+    kind: float
+    default: "8"
+    doc: >-
+      Sets how many MB of o_proj entries the GR8_L2PF prefetch takes per layer. 0 takes all.
+  GR8_L2PF_T:
+    scope: local
+    kind: int
+    default: "0x3ff"
+    doc: >-
+      Bit mask of the GR8_L2PF prefetch targets: 1 x_in, 2 idx_q, 4 q_b, 8 UK, 16 UV, 32 o_proj, 64 router, 128 shared
+      or dense fc1, 256 eh_proj, 512 head records.
+  GR8_L2PF_US:
+    scope: local
+    kind: floats
+    default: "30,30,100,30"
+    doc: >-
+      Sets the GR8_L2PF budget per window in us at the pace, as four numbers: MLP all-reduce wait, gather waits,
+      attention, attention all-reduce wait.
+  GR8_L2PF_WAVE:
+    scope: local
+    kind: int
+    default: "8"
+    values: "1..32"
+    doc: >-
+      Sets the most 8 KiB GR8_L2PF prefetch chunks issued per poll.
+  GR8_MHC_BF16:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0|1|2"
+    doc: >-
+      Quality test: rounds mHC residual stream writes to BF16, 1 = after both blocks, 2 = only after the MLP block.
+  GR8_MHC_FUSE:
+    scope: agree
+    kind: int
+    default: "2"
+    values: "0|1|2"
+    doc: >-
+      Sets the decode mHC consume form for every row count unless GR8_MHC_FUSE_M1 / _M4 set it: 0 a separate peer-wait
+      kernel, 1 the consume waits itself, 2 the fused consume.
+  GR8_MHC_FUSE_M1:
+    scope: agree
+    kind: int
+    unset: "MHC_FUSE, else 2"
+    values: "0|1|2"
+    doc: >-
+      Sets the decode mHC consume form for 1-row steps, as GR8_MHC_FUSE.
+  GR8_MHC_FUSE_M4:
+    scope: agree
+    kind: int
+    unset: "MHC_FUSE, else 2"
+    values: "0|1|2"
+    doc: >-
+      Sets the decode mHC consume form for every step of 2 or more rows, as GR8_MHC_FUSE.
+  GR8_MOE_TOPK:
+    scope: agree
+    kind: int
+    default: "8"
+    values: "1..8"
+    doc: >-
+      Keeps only this many routed experts per token and renormalizes their weights. A model change for screens.
+  GR8_NOWIDE2:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      Keeps the MoE fc2 weights in the old order instead of the wide order. Outputs are bit-identical.
+  GR8_QA_SPLIT:
+    scope: agree
+    kind: int
+    unset: "g6m4: 2 when TP>1 on GLM, else 0; m4sim: 0"
+    values: "0|1|2"
+    doc: >-
+      Splits the decode layer-input GEMVs across the ranks by 16-output tiles and all-gathers them on their own fabric.
+      1 = q_a, kv_a and the indexer's k and weights, 2 = q_a only. Same bits.
+  GR8_QA_SPLIT_CPU:
+    scope: local
+    kind: int
+    unset: "--proxy-cpu minus 9, or -1 when --proxy-cpu is 8 or less"
+    doc: >-
+      Sets the CPU core of the replicated-GEMV gather fabric's proxy thread (GR8_QA_SPLIT, GR8_IDXQ_SPLIT,
+      GR8_MTP_SPLIT). -1 leaves it unpinned.
+  GR8_QA_SPLIT_TPC:
+    scope: agree
+    kind: int
+    default: "1"
+    doc: >-
+      Sets the output tiles per CTA of the GEMVs that GR8_QA_SPLIT, GR8_IDXQ_SPLIT and GR8_MTP_SPLIT narrow. It only
+      lowers a GEMV's own count and keeps the output bits (rank.cuh qs_narrow).
+  GR8_ROUTER_MF:
+    scope: agree
+    kind: flag
+    default: "1"
+    doc: >-
+      Flash MoE router: 1 runs a 4-row step with the 4-row router kernel, 0 with the per-row kernel. Each warp sums its
+      output in the same order either way.
+  GR8_ROUTER_NW:
+    scope: agree
+    kind: int
+    default: "2"
+    values: "2|4|8"
+    doc: >-
+      Flash MoE router: warps per CTA of the router GEMV (one output channel per warp). Each warp sums in the same order
+      at any width.
+  GR8_ROUTER_TPC:
+    scope: agree
+    kind: int
+    default: "2"
+    values: "1|2"
+    doc: >-
+      Sets the router GEMV's output tiles per CTA: 1 = 16 CTAs of 512 threads instead of 8 of 1024. Same tiles, k parts
+      and reduction order, so the same bits (bind.cuh).
+  GR8_ROUTE_LOG:
+    scope: local
+    kind: path
+    unset: "unset"
+    doc: >-
+      Writes one JSON line per MTP main step to this file with each MoE layer's distinct routed expert ids, from rank 0.
+  GR8_ROUTE_OVL:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0|1|2"
+    doc: >-
+      Decode MoE layers with a trellis shared expert and 2+ rows: runs the shared expert on a forked stream during the
+      router GEMV and plan kernel. 1 = its fc1 and fc2, 2 = fc1 only. Same bytes out.
+  GR8_TR3_W2ALL:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      Uses the window-2 fc1 split (256-thread CTAs, KS1 x2, WG 1) at M > 1 on every MoE layer, not only layers with
+      2-bit units. Same k ranges and order, so the same bits (bind.cuh k1_split).
+  GR8_WARM:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0|1|2"
+    doc: >-
+      Warms the L2 with the next weights while a decode collective waits: 1 = this layer's router and shared fc1 and the
+      next layer's q_a, 2 also kv_a and q_b. Loads only, no output change.

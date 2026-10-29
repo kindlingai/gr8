@@ -153,7 +153,7 @@ int main(int argc, char** argv)
     setvbuf(stdout, nullptr, _IOLBF, 0);
     pf_env_check();                    // strict GR8_PF_* choices: a bad value exits before any work
     // GR8_MOE_TOPK (model change, screen arm): unset = the model's top-k (8, the table's default)
-    static_assert(geom::TOPK == 8, "GR8_MOE_TOPK's default and range (knobs-rs table.rs) are the model's top-k");
+    static_assert(geom::TOPK == 8, "GR8_MOE_TOPK's default and range (knobs/decode.yaml) are the model's top-k");
 #if G6_MODEL_FLASH
     if (const int tk = (int)knob::moe_topk(); tk < geom::TOPK)
         fprintf(stderr, "# GR8_MOE_TOPK=%d: routed experts per token cut %d -> %d, weights renormalized (screen arm)\n",
@@ -1633,7 +1633,7 @@ int main(int argc, char** argv)
         }
         // GR8_S2_DECODE_ROUNDS=<K>: while a prefill waits and sessions decode, K decode rounds per prefill quantum
         // (scheduler.h Config::decode_rounds); unset, 0 or 1 = off
-        static_assert(g6s2::MAX_DECODE_ROUNDS == 64, "GR8_S2_DECODE_ROUNDS takes 0..64 (knobs-rs table.rs)");
+        static_assert(g6s2::MAX_DECODE_ROUNDS == 64, "GR8_S2_DECODE_ROUNDS takes 0..64 (knobs/serving.yaml)");
         sc.decode_rounds = (uint32_t)knob::s2_decode_rounds();
         sc.steering = steering_boot;
         if (rtt && rtt->local) sc.window_pages = (uint32_t)rtt->local;   // a window run lists its worst case and the window

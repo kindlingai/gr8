@@ -1,4 +1,4 @@
-// GR8_MOE_TOPK through the knob table (engine/knobs-rs/src/table.rs MOE_TOPK: int 1..8, unset = 8, the model's top-k).
+// GR8_MOE_TOPK through the knob table (knobs/decode.yaml GR8_MOE_TOPK: int 1..8, unset = 8, the model's top-k).
 // A cut of 0, values above 8, words, suffixes, spaces and negative numbers must stop the process (exit 2) at the first
 // read, not fall back to a default. A knob is read once per process and a refused value ends it, so each case runs in
 // its own child.

@@ -1,0 +1,75 @@
+# Read by the launcher, the image and the deploy trees, never by the engine. knobs/README.md describes the fields.
+prefix: "GR8_"
+scope: outside
+knobs:
+  GR8_CACHE:
+    kind: path
+    unset: "unset"
+    legacy: []
+    doc: >-
+      docker/compose.yaml: a host directory for the cache volume, this box's part of the model.
+  GR8_CLUSTER:
+    kind: path
+    unset: "unset"
+    doc: >-
+      The cluster.env file the launcher reads when the command line names none.
+  GR8_CONTAINER:
+    kind: flag
+    unset: "unset"
+    legacy: []
+    doc: >-
+      The image sets 1, so the launcher knows it runs in a container.
+  GR8_ENV:
+    kind: path
+    unset: "unset"
+    legacy: []
+    doc: >-
+      model-loader's compose project: the .env file of gr8's settings.
+  GR8_FETCH_WORKERS:
+    kind: int
+    unset: "unset"
+    legacy: []
+    doc: >-
+      The launcher's Hugging Face fetch: parallel downloads, 64 when unset.
+  GR8_HF_ENDPOINT:
+    kind: text
+    unset: "unset"
+    legacy: []
+    doc: >-
+      The hub the launcher fetches from, https://huggingface.co when unset. The tests point it at a fake one.
+  GR8_HOME:
+    kind: path
+    unset: "unset"
+    legacy: []
+    doc: >-
+      docker/compose.yaml: a host directory for the home volume (logs and state). Not the bare-metal GR8_WORK_DIR.
+  GR8_IMAGE:
+    kind: text
+    unset: "unset"
+    legacy: []
+    doc: >-
+      docker/compose.yaml: the gr8 image to run.
+  GR8_MODEL:
+    kind: text
+    unset: "unset"
+    legacy: []
+    doc: >-
+      The model the launcher and the Helm chart serve: glm53 or glm53f.
+  GR8_PSEUDO_TOKENIZER:
+    kind: path
+    unset: "unset"
+    legacy: []
+    doc: >-
+      CI: a tokenizer directory that turns on the pseudo engine's smoke and API tests.
+  GR8_REFUSAL_LINGER:
+    kind: float
+    unset: "unset"
+    legacy: []
+    doc: >-
+      Seconds the supervisor keeps a refused boot's status up, 15 when unset.
+  GR8_WORK_DIR:
+    kind: path
+    unset: "the repository"
+    legacy: ["G6_HOME"]
+    doc: >-
+      The working directory of a bare-metal install: bin/, out/, s2/, run/.

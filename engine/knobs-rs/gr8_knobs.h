@@ -1,5 +1,5 @@
 #pragma once
-// Written by `cargo run --manifest-path engine/knobs-rs/Cargo.toml --bin knobs -- gen` from engine/knobs-rs/src/table.rs:
+// Written by `cargo run --manifest-path engine/knobs-rs/Cargo.toml --bin knobs -- gen` from the knobs/ YAML files:
 // change the table, not this file. docs/ENV.md describes every knob.
 //
 // knob::name() returns the value of GR8_NAME: its default when unset, or an optional for a knob without one. The value

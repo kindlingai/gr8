@@ -1,0 +1,379 @@
+# S2 multi-session serving, context parallelism, the KV pool, its stores and prefix reuse. knobs/README.md describes the fields.
+prefix: "GR8_"
+knobs:
+  GR8_CP:
+    scope: agree
+    kind: flag
+    unset: "1 in a CP build"
+    doc: >-
+      Context-parallel KV: the first GR8_CP_R tokens are replicated and later pages are spread across ranks on a CP
+      fabric of their own. Read only in builds with -DG6_CP=1.
+  GR8_CP_MMAX:
+    scope: agree
+    kind: int
+    unset: "the most rows of any step"
+    doc: >-
+      Raises the row count the CP fabric is sized for. A value below the computed rows has no effect.
+  GR8_CP_ONECHAIN:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      Past R, the other ranks' head groups run as one attention call instead of one call per group, with partials
+      published in the GR8_CP_S3=0 order. Byte-exact, TP=4 only, not with GR8_ATTN_FLIP.
+  GR8_CP_PF_HASH2:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    doc: >-
+      The CP prefill page check uses the block-reduced HASH2 page hash. 0 = the older k_cp_pf_hash. Read only in builds
+      with -DG6_CP_PF_HASH2=1.
+  GR8_CP_PF_VERIFY:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      Every KV page a rank stages to another rank in CP prefill is checked against the hash the sender computed. A
+      mismatch sets the fabric error word.
+  GR8_CP_R:
+    scope: agree
+    kind: int
+    default: "0"
+    doc: >-
+      The first R tokens of KV are replicated on every rank and pages past R are spread across ranks. Under S2 it is
+      also the largest request that shares decode steps. A multiple of 64.
+  GR8_CP_S3:
+    scope: agree
+    kind: flag
+    default: "1"
+    doc: >-
+      CP combine order: 1 = the head-group overlap order, 0 = the plain order. Same arithmetic.
+  GR8_CP_STEP_ROWS:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0..4096"
+    doc: >-
+      S2 only: a decode step past R carries at most this many rows and the CP fabric is sized for it instead of the
+      widest S2 step. Sessions past R give the same tokens.
+  GR8_CP_STEP_SEG:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_CP_STEP_ROWS, a round past R takes only sessions past R, so a short session never runs the CP path
+      because a long one is resident.
+  GR8_KVB:
+    scope: agree
+    kind: text
+    default: "bf16"
+    values: "bf16|fp8"
+    doc: >-
+      fp8 loads every layer's kv_b (UK / UV) as the release's block FP8 bytes and scales instead of BF16, with the same
+      output bytes. Needs --v2-dense.
+  GR8_KVMAN_TRANSPORT:
+    scope: local
+    kind: text
+    default: "auto"
+    values: "tcp|rdma|auto"
+    legacy: ["KVMAN_TRANSPORT"]
+    doc: >-
+      How this box reaches a KV node. A rank whose path to the node runs through another box sets up RDMA but cannot
+      write, and auto does not fall back after setup.
+  GR8_KV_DRAIN_DELAY:
+    scope: local
+    kind: text
+    unset: "unset"
+    doc: >-
+      For tests, rank R sleeps the given ms inside every Nth KV tier drain that copies anything, set as
+      <rank>:<ms>[:<every>].
+  GR8_KV_SHARE_WHEN:
+    scope: local
+    kind: text
+    default: "idle"
+    values: "idle|always"
+    doc: >-
+      With a group KV lease, idle makes the head offer its blocks to other groups only while no session is resident or
+      queued, always offers on every report.
+  GR8_LOGIT_DUMP:
+    scope: local
+    kind: path
+    unset: "unset"
+    doc: >-
+      Offline runs write each main step's head logits (each rank's vocab slice) to PATH.rank<R>, with a header. Not with
+      --serve.
+  GR8_LOGIT_DUMP_FROM:
+    scope: local
+    kind: int
+    default: "0"
+    doc: >-
+      Main-step dumps (GR8_LOGIT_DUMP, GR8_RESID_DUMP) start at this step.
+  GR8_POOL_LOG:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      Prints one stderr line per S2 pool claim with its first page, page count and the retained runs it evicted.
+  GR8_REUSE_ALIGN:
+    scope: agree
+    kind: flag
+    unset: "1 with --serve, 0 offline"
+    values: "0|1"
+    doc: >-
+      With --reuse-prefix, a hit keeps only whole cold-prefill grid cells (--prefill rows), so the result equals a cold
+      prefill bit for bit. 0 keeps the whole matched prefix. 1 needs --prefill.
+  GR8_REUSE_HDUMP:
+    scope: local
+    kind: path
+    unset: "unset"
+    doc: >-
+      Writes every layer's KV cache bytes for the prefilled rows of each sequence GR8_REUSE_HDUMP_SEQ lists to
+      DIR/hd.<q>.r<rank>.bin, a prefix-reuse diagnostic (reuse_hdump.cuh).
+  GR8_REUSE_HDUMP_SEQ:
+    scope: local
+    kind: ints
+    unset: "unset"
+    values: "0.."
+    doc: >-
+      Lists the sequence numbers (comma-separated, 0 and up) whose cache rows GR8_REUSE_HDUMP dumps.
+  GR8_REUSE_NOEND:
+    scope: agree
+    kind: flag
+    unset: "1 with --serve, 0 offline"
+    values: "0|1"
+    doc: >-
+      With --reuse-prefix, a hit no longer needs the new prompt to reach the end of what the last sequence wrote, so a
+      prompt can be replayed as it is. 0 restores that rule (prefix_reuse.h).
+  GR8_REUSE_POISON:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With --reuse-prefix, sets every stale cache row past the reused prefix to NaN on a hit, so a read of a stale row
+      shows in the output. A test gate.
+  GR8_REUSE_STRICT:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With --reuse-prefix, a hit needs the new prompt to extend the previous sequence exactly, the strict append rule
+      (prefix_reuse.h).
+  GR8_REUSE_ZSCRATCH:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With --reuse-prefix, clears every layer's per-sequence attention scratch before the suffix prefill on a hit
+      (indices to -1, output to 0), a prefix-reuse diagnostic.
+  GR8_RT_CHECK:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      With GR8_RT_FMT=int4, prints the latent SQNR and rope check of the FP8 to INT4 round trip. With GR8_RT_LOCAL also
+      checks the record bookkeeping after every change and stops on an error.
+  GR8_RT_FMT:
+    scope: agree
+    kind: text
+    default: "fp8"
+    values: "fp8|int4"
+    doc: >-
+      Sets the row format of the GR8_RT_STORE records: fp8 = the cache's own 656 B row, int4 = the 416 B INT4 row of
+      --kv-format int4.
+  GR8_RT_L:
+    scope: agree
+    kind: int
+    unset: "CP_R"
+    doc: >-
+      Sets the first position GR8_RT_STORE holds: a multiple of 64, at least GR8_CP_R, and a context bucket boundary.
+      With GR8_RT_LOCAL it must equal GR8_CP_R.
+  GR8_RT_LOCAL:
+    scope: agree
+    kind: int
+    default: "0"
+    doc: >-
+      Releases each session's tail pages past GR8_RT_L to the store: they cycle through this many window pages per rank
+      and are read back from slots or the store. Needs GR8_RT_STORE.
+  GR8_RT_PF_SLICE:
+    scope: local
+    kind: flag
+    default: "1"
+    doc: >-
+      With GR8_RT_LOCAL, a prefill stages each released page with one read of each row's slice for the layer. 0 reads
+      the page's whole block for every layer of its group, about 3.9x the bytes.
+  GR8_RT_PLACE:
+    scope: agree
+    kind: int
+    unset: "every tail page of --cap"
+    doc: >-
+      With GR8_RT_LOCAL, sets the main model's physical pages per rank, so --cap becomes the logical length only. Must
+      hold the GR8_CP_R prefix and one window.
+  GR8_RT_POOL:
+    scope: agree
+    kind: int
+    unset: "4096, or with RT_LOCAL 2048 x rows a step x sessions past R"
+    doc: >-
+      Sets GR8_RT_STORE's resident slots per indexer group, at least 2048. With GR8_RT_LOCAL a smaller pool lets fewer
+      sessions past R in at once.
+  GR8_RT_SELSTAT:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_RT_LOCAL, counts what a prefill reading only the selected rows of released pages would read, at each
+      full-index layer. Measurement only, it synchronizes the stream.
+  GR8_RT_SIZE:
+    scope: agree
+    kind: int
+    unset: "unset"
+    doc: >-
+      Sets each rank's GR8_RT_STORE lease budget in bytes (the launcher's KV_ROWS size=). With GR8_RT_LOCAL it sizes the
+      records, and the pool admits a tail past R only when its records fit.
+  GR8_RT_STORE:
+    scope: local
+    kind: text
+    unset: "unset"
+    doc: >-
+      Sends a session's whole pages past GR8_RT_L to a per-rank lease, and CP decode reads them back. mem: or
+      remote:HOST:PORT (a KV node). Needs --serve, GR8_CP and GR8_S2_BELOW = GR8_CP_R. Local: with remote:auto the
+      launcher gives odd ranks the KV node's second rail.
+  GR8_S2_ADAPT:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      S2: chooses each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs. Adds about
+      1 GiB of main-step graphs.
+  GR8_S2_ADMIT_HOLD:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      S2: an admission with another request queued behind it and a slot left holds its boundary, so a burst of queued
+      requests is admitted at one boundary instead of one per notice.
+  GR8_S2_BELOW:
+    scope: agree
+    kind: int
+    unset: "CP_R"
+    doc: >-
+      S2: the context below which sessions share the pool's pages: 64..GR8_CP_R, a multiple of 64.
+  GR8_S2_BIND_DELAY:
+    scope: local
+    kind: text
+    unset: "unset"
+    doc: >-
+      S2 test: RANK:MS makes that rank sleep MS ms after each request's bind, to show what a bind skew does to the next
+      quantum on the other ranks.
+  GR8_S2_DECODE_PF:
+    scope: agree
+    kind: int
+    default: "0"
+    doc: >-
+      S2: while any session decodes, a prefill quantum takes at most this many rows on one lane, so decode rounds come
+      round sooner. A multiple of 64, at most --prefill. 0 = the full quantum.
+  GR8_S2_DECODE_ROUNDS:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0..64"
+    doc: >-
+      S2: while a prefill waits and sessions decode, runs this many decode rounds per prefill quantum instead of one. 0
+      or 1 = off.
+  GR8_S2_DSEL:
+    scope: agree
+    kind: flag
+    default: "1"
+    doc: >-
+      S2 with DFlash2: a session that decodes alone drafts each round with DFlash2 or MTP, whichever is expected to
+      commit more tokens per ms. 0 = DFlash2 every round.
+  GR8_S2_DSEL_DWELL:
+    scope: agree
+    kind: int
+    default: "8"
+    doc: >-
+      S2 drafter choice: rounds a session stays on one drafter before it may switch.
+  GR8_S2_DSEL_MARGIN:
+    scope: agree
+    kind: float
+    default: "0.15"
+    doc: >-
+      S2 drafter choice: switches when the other drafter's expected tokens per ms is higher by this fraction.
+  GR8_S2_DSEL_MODEL:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      S2 drafter choice: 1 prices both drafters from the frozen cost table in GR8_S2_DSEL_TABLE. Needs --serve and
+      --dflash-manifest.
+  GR8_S2_DSEL_PROBE:
+    scope: agree
+    kind: int
+    default: "4"
+    doc: >-
+      S2 drafter choice: every this-many MTP rounds the DFlash2 drafter also drafts, and its drafts are scored against
+      the next tokens.
+  GR8_S2_DSEL_TABLE:
+    scope: agree
+    kind: text
+    unset: "unset"
+    doc: >-
+      With GR8_S2_DSEL_MODEL=1, the drafter choice's cost table: a key:value list (v1..v8, d, m, e, p and optional keys)
+      or the path of a file holding one.
+  GR8_S2_EVENTLOG:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      S2: logs one line when the head anchors a notice, one when each rank applies the commit, and one per prefill
+      quantum. Logs only.
+  GR8_S2_GROW:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    doc: >-
+      S2: a session holds the KV pages it needs now and takes more as its output grows, while every live session can
+      still reach its worst case. 0 = every run holds its worst case from admission.
+  GR8_S2_ROUNDLOG:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      S2: rank 0 prints one '# s2_round' line per decode step, with the step's routed experts.
+  GR8_S2_SHARE_MS:
+    scope: local
+    kind: int
+    default: "1000"
+    doc: >-
+      S2 with a KV node lease: how often in ms the head reports to the node and asks for segments.
+  GR8_S2_TIMELINE:
+    scope: local
+    kind: int
+    default: "0"
+    doc: >-
+      S2: every N main steps each rank prints, per decode step kind, the mean GPU span, host input prep, launch call and
+      fence wait. Measurement only.
+  GR8_S2_TIMEOUT:
+    scope: local
+    kind: int
+    default: "120"
+    values: "1..86400"
+    doc: >-
+      S2: seconds the bootstrap waits on the control links before a rank gives up.
+  GR8_STEP_TMR:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      S2: prints a '# step_tmr' line per decode step with its launch and fence time in us, its graph key, rows and
+      context.

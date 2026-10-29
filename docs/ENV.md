@@ -1,6 +1,7 @@
 # Engine environment
 
-Every setting the engine, its tests and its build read from the environment, from `engine/knobs-rs/src/table.rs`.
+Every setting the engine, its tests and its build read from the environment, from the YAML files in
+[knobs/](../knobs/README.md).
 `knobs gen` writes this page: change the table, not this page. [SETTINGS.md](SETTINGS.md) explains how the main ones
 work together, and `./gr8 knobs` lists the launcher options that set them.
 

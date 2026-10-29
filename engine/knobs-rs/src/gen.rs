@@ -37,7 +37,7 @@ fn reader(k: Kind) -> &'static str {
 pub fn header() -> String {
     let mut h = format!(
         r#"#pragma once
-// Written by `cargo run --manifest-path engine/knobs-rs/Cargo.toml --bin knobs -- gen` from engine/knobs-rs/src/table.rs:
+// Written by `cargo run --manifest-path engine/knobs-rs/Cargo.toml --bin knobs -- gen` from the knobs/ YAML files:
 // change the table, not this file. docs/ENV.md describes every knob.
 //
 // knob::name() returns the value of GR8_NAME: its default when unset, or an optional for a knob without one. The value
@@ -140,7 +140,8 @@ pub fn env_md() -> String {
     let mut out = String::from(
         "# Engine environment
 
-Every setting the engine, its tests and its build read from the environment, from `engine/knobs-rs/src/table.rs`.
+Every setting the engine, its tests and its build read from the environment, from the YAML files in
+[knobs/](../knobs/README.md).
 `knobs gen` writes this page: change the table, not this page. [SETTINGS.md](SETTINGS.md) explains how the main ones
 work together, and `./gr8 knobs` lists the launcher options that set them.
 

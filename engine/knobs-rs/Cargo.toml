@@ -15,3 +15,9 @@ capi = []
 [profile.release]
 opt-level = 3
 panic = "abort"        # a panic must not unwind into the C++ engine
+
+[build-dependencies]
+yaml-rust2 = "0.13.0"
+
+[dev-dependencies]
+yaml-rust2 = "0.13.0"

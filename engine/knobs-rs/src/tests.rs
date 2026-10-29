@@ -101,3 +101,31 @@ fn generated_files_are_current() {
         assert!(on_disk == text, "{path} is out of date: cargo run --bin knobs -- gen");
     }
 }
+
+#[allow(dead_code)] // the tests read only some fields
+#[path = "yaml.rs"]
+mod yaml;
+
+#[test]
+fn yaml_file_rules() {
+    let refused = |src: &str| {
+        let mut out = std::collections::BTreeMap::new();
+        yaml::add(&mut out, "t.yaml", src).unwrap_err()
+    };
+    let one = "prefix: GR8_TEST_\nscope: test\nknobs:\n  GR8_TEST_X:\n    kind: flag\n    default: \"0\"\n";
+    let mut out = std::collections::BTreeMap::new();
+    yaml::add(&mut out, "t.yaml", one).unwrap();
+    assert_eq!(out["TEST_X"].legacy, ["G6_TEST_X"]);
+    assert!(refused(&one.replace("  GR8_TEST_X:", "  GR8_X:")).contains("start with \"GR8_TEST_\""));
+    let local = "prefix: GR8_\nknobs:\n  GR8_X:\n    scope: test\n    kind: flag\n    default: \"0\"\n";
+    assert!(refused(local).contains("a test knob belongs in a file whose scope is test"));
+    assert!(refused(&one.replace("    default: \"0\"\n", "")).contains("exactly one of default and unset"));
+    assert!(refused(&format!("{one}    colour: red\n")).contains("unknown field"));
+    let err = yaml::add(&mut out, "u.yaml", one).unwrap_err();
+    assert!(err.contains("also in t.yaml"), "{err}");
+    // an old name need not carry the file's prefix
+    let old = one.replace("    kind: flag", "    kind: flag\n    legacy: [\"G6_X\", \"ATTNK_X\"]");
+    let mut out = std::collections::BTreeMap::new();
+    yaml::add(&mut out, "t.yaml", &old).unwrap();
+    assert_eq!(out["TEST_X"].legacy, ["G6_X", "ATTNK_X"]);
+}
