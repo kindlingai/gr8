@@ -121,7 +121,8 @@ class Chat(unittest.TestCase):
         calls = [tc for d in deltas for tc in d.get('tool_calls', [])]
         if not EMIT_UNDECLARED:
             self.assertNotIn('tool_calls', msg)
-            self.assertIn('<tool_call>web_search<arg_key>query</arg_key>', msg['content'])
+            self.assertTrue(msg['content'].startswith('Checking.<tool_call>web_search<arg_key>'), msg['content'])
+            self.assertTrue(msg['content'].endswith('</tool_call>'), msg['content'])
             self.assertEqual(r['choices'][0]['finish_reason'], 'stop')
             self.assertEqual((content, calls), (msg['content'], []))
             self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'stop')
