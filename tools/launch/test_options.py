@@ -240,6 +240,8 @@ class KnobsTests(unittest.TestCase):
     def test_tp_and_options_shape_the_values(self):
         out = self.knobs('glm53', '--tp', '6', '--cap', '1000', 'CAP')
         self.assertIn('    TP=6 1000 (set by the command line)\n', out)
+        # an engine knob set through EXTRA_ENV, under its old name, shows the value the engine gets
+        self.assertIn('    TP=4 1\n', self.knobs('glm53', '--tp', '4', '--extra-env', 'G6_QA_SPLIT=1', 'QA_SPLIT'))
 
 
 class RestartTests(unittest.TestCase):
