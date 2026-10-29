@@ -239,6 +239,7 @@ inline void bind_layer_tensors(Model& m, int i, const Find* find, cudaStream_t s
         bt.k2 = y.T.k2;
         bt.k3 = y.T.k3;
         bt.sh_trellis = y.T.sh_trellis;
+        bt.cb = y.T.cb;
         if (shfp8 && y.T.shfp8.codes[0])
         {
             const bind::LayerTensors::ShFp8& F = y.T.shfp8;
