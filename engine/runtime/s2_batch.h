@@ -184,14 +184,20 @@ struct S2Cost
     double draft0 = 2.1, draft_sess = 0.25;     // first-form draft step of S sessions' accepted rows
     double chain0 = 2.0, chain_sess = 0.15;     // chain step, one row per session
 #if G6_MODEL_FLASH
-    // A/B switch for Flash solo serving; never changes the full-GLM cost model.
-    bool flash_tp2 = [] { const char* e = getenv("G6_FLASH_S2_COST"); return e && atoi(e) == 1; }();
+    // A/B switch for Flash solo serving (G6_FLASH_S2_COST=1): spec_len.h's Flash table for this build's width, a host
+    // build without one (the tests) TP2's. Never changes the full-GLM cost model.
+    bool flash = [] { const char* e = getenv("G6_FLASH_S2_COST"); return e && atoi(e) == 1; }();
+#ifdef G6_NR
+    static constexpr int flash_tp = G6_NR;
+#else
+    static constexpr int flash_tp = 2;
+#endif
 #endif
     double round(int S, int k) const
     {
 #if G6_MODEL_FLASH
-        if (flash_tp2 && S == 1) {
-            static const g6rt::SpecLen cost = [] { g6rt::SpecLen x; x.flash_tp2(); return x; }();
+        if (flash && S == 1) {
+            static const g6rt::SpecLen cost = [] { g6rt::SpecLen x; x.flash_cost(flash_tp); return x; }();
             return cost.verify_ms(k + 1) + cost.draft_ms(k);
         }
 #endif
