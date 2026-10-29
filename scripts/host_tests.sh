@@ -143,6 +143,11 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime
 "$T/steering_state_test"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/steering_transport_test.cpp" -o "$T/steering_transport_test" "${KNOBS[@]}"
 "$T/steering_transport_test"
+# the S2 trace (GR8_S2_TRACE): written by s2/trace.h, closed and joined by tools/trace/merge.py
+g++ -std=c++17 -O2 -Wall -Wextra "$REPO/engine/runtime/s2/tests/trace_test.cpp" -o "$T/trace_test"
+"$T/trace_test" "$T/trace"
+python3 "$REPO/tools/trace/merge.py" "$T/trace.r3.json" -o "$T/trace.json" > /dev/null
+python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$T/trace.json"
 g++ -std=c++20 -O2 -Wall -pthread -I "$REPO/engine/loader" "$REPO/engine/loader/tests/manifest_test.cpp" \
   "$REPO/engine/loader/g6pack.cpp" -o "$T/manifest_test"
 "$T/manifest_test"

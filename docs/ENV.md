@@ -320,6 +320,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_S2_SHARE_MS` | int | `1000` |  | S2 with a KV node lease: how often in ms the head reports to the node and asks for segments. |
 | `GR8_S2_TIMELINE` | int | `0` |  | S2: every N main steps each rank prints, per decode step kind, the mean GPU span, host input prep, launch call and fence wait. Measurement only. |
 | `GR8_S2_TIMEOUT` | int | `120` | 1..86400 | S2: seconds the bootstrap waits on the control links before a rank gives up. |
+| `GR8_S2_TRACE` | path | off |  | S2: writes a Chrome trace (chrome://tracing, ui.perfetto.dev) of this rank to PATH.r<rank>.json: a span per prefill quantum, prompt tail and decode step, and on the head each request's arrival, wait, admission, first token and finish, in wall-clock microseconds. tools/trace/merge.py joins the ranks and a client's request times. Host clock only. |
 | `GR8_STEP_TMR` | flag | `0` |  | S2: prints a '# step_tmr' line per decode step with its launch and fence time in us, its graph key, rows and context. |
 | `GR8_TEST_ZERO_DELAY_MS` | int | `0` |  | A test of the zeroing order: every dmalloc zeroing waits behind an N ms kernel on the legacy stream, so a write to new memory not ordered after it loses every time. |
 | `TMPDIR` | path | `/tmp` |  | Where the loader writes its planned rank manifests. |

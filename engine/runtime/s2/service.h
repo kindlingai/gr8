@@ -6,11 +6,14 @@
 #include "dispatch.h"
 #include "flash_lend.h"
 #include "pool.h"
+#include "trace.h"
 #include "../../knobs-rs/gr8_knobs.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <map>
+#include <set>
+#include <string>
 #include <thread>
 
 namespace g6s2 {
@@ -128,6 +131,17 @@ class Service {
     // running -- the lookahead binding -- or merely waited for it, which is the scheduler's admission. Logs only: no
     // state, no digest and no behaviour change, so it can run on a serving build.
     const bool elog_ = knob::s2_eventlog();
+    // GR8_S2_TRACE=PATH: this rank's steps, and on the head the arrivals, waits and admissions, as a Chrome trace
+    // (trace.h). A step's span runs from its launch to the next boundary.
+    Trace trace_;
+    struct { bool open = false; const char* kind = ""; uint64_t t0 = 0; std::string args; } step_;
+    std::set<uint64_t> first_;    // requests whose first token the trace has
+    uint64_t waited_ = 0;         // the request whose wait the trace has
+    void end_step() {
+        if (!step_.open) return;
+        trace_.span(step_.kind, Trace::STEPS, step_.t0, Trace::now(), step_.args);
+        step_.open = false;
+    }
     // GR8_S2_ADMIT_HOLD=1 (head only; the workers follow Commit::hold): an admission with another request queued behind it
     // and a slot left holds its boundary, and the next admission is announced at that same boundary (event below), so a
     // burst of queued requests is granted in milliseconds rather than one per NOTICE_MIN boundaries (~15 s each behind
@@ -202,6 +216,10 @@ class Service {
         // remain fatal. Clamped, so a torn read of the pair can only widen the target, never narrow it past the floor.
         // A held boundary has no work in flight: every rank is stopped at it (event_gate.h before_work returns true).
         const auto target = held ? *held : std::clamp(horizon, boundary + NOTICE_MIN, boundary + NOTICE_MAX);
+        if (trace_)
+            trace_.instant("notice", Trace::CONTROL, targ("request", command.request) + "," +
+                           targ("kind", command.resize ? "resize" : command.admit ? "admit" : "cancel") + "," +
+                           targ("anchored", boundary) + "," + targ("boundary", target));
         if (elog_)
             fprintf(stderr, "# s2_event notice rank %u event %llu %s request %llu anchored %llu -> boundary %llu (lookahead %llu)\n",
                     c_.rank, (unsigned long long)event_, command.resize ? "resize" : command.admit ? "admit" : "cancel",
@@ -233,6 +251,13 @@ class Service {
                 const bool fits = pre.skip > 0 || native_.pool.fits(rows, worst);
                 const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), fits, native_.pool.room());
                 require(fit.has_value(), "duplicate admission attempt without revision");
+                if (trace_ && fit->why != Stall::None && waited_ != request->id) {
+                    waited_ = request->id;
+                    trace_.instant("wait", Trace::CONTROL, targ("request", request->id) + "," +
+                                   targ("why", fit->why == Stall::Slots ? "slots" : "capacity") + "," +
+                                   targ("requested", fit->requested) + "," + targ("room", fit->room) + "," +
+                                   targ("live", live));
+                }
                 if (fit->why == Stall::Capacity && refused_ != request->id) {
                     refused_ = request->id;   // once per request
                     if (reuse() && pr0 != prompts_.end())
@@ -286,6 +311,9 @@ class Service {
                 }
                 attempted_head_ = request->id; attempted_revision_ = s.revision() + 1;
                 if (cm.admit) {
+                    if (trace_)
+                        trace_.instant("admit", Trace::CONTROL, targ("request", request->id) + "," +
+                                       targ("reused", cm.admit->reuse) + "," + targ("rows", worst) + "," + targ("live", live));
                     queue_.admitted(request->id); commands_.erase(command.request); prompts_.erase(command.request);
                     spans_.erase(command.request); payloads_.erase(command.request);
                     // another request queued and a slot left after this one: keep the ranks at this boundary for it
@@ -347,7 +375,12 @@ class Service {
                     auto bytes = ingress_.request(*command);
                     auto request = parse_request(bytes, c_.scheduler.steering);
                     if (!grammar_ok(command->request, request)) continue;
-                    queue_.push(Sessions::request(command->request, request)); commands_.emplace(command->request, *command);
+                    const auto queued = Sessions::request(command->request, request);
+                    if (trace_)
+                        trace_.instant("arrive", Trace::CONTROL, targ("request", queued.id) + "," +
+                                       targ("prompt_tokens", queued.prompt_tokens) + "," + targ("max_tokens", queued.max_tokens) +
+                                       "," + targ("queued", queue_.size()));
+                    queue_.push(queued); commands_.emplace(command->request, *command);
                     payloads_.emplace(command->request, std::move(bytes));
                     if (reuse() && request.plp < 0) {
                         spans_.emplace(command->request, request.sys);
@@ -393,6 +426,7 @@ class Service {
     }
     void compute() {
         while (!stopping_.load()) {
+            end_step();
             Notice noticed{};
             if (!driver_->state().resident()) {
                 const auto n = endpoint_->wait_notice(); driver_->idle_boundary(n.boundary);
@@ -418,6 +452,11 @@ class Service {
                 std::optional<Payload> payload;
                 if (cm->admit) { require(staged_.has_value(), "commit without verified request"); payload = sessions_.payload(*staged_); }
                 driver_->apply(*cm, payload ? &*payload : nullptr);
+                if (trace_)
+                    trace_.instant("commit", Trace::STEPS, targ("request", noticed.request) + "," +
+                                   targ("kind", noticed.kind == EventKind::Resize ? "resize"
+                                                : noticed.kind == EventKind::Cancel ? "cancel" : "admit") + "," +
+                                   targ("boundary", cm->boundary));
                 if (elog_)
                     fprintf(stderr, "# s2_event commit rank %u event %llu %s request %llu boundary %llu\n", c_.rank,
                             (unsigned long long)noticed.event,
@@ -429,7 +468,16 @@ class Service {
                 staged_.reset(); endpoint_->applied(); continue;
             }
             if (native_.before_work) native_.before_work();
+            const auto t0 = trace_ ? Trace::now() : 0;
             const auto work = driver_->step(); require(work.kind != Kind::Idle, "departed idle boundary");
+            if (trace_) {
+                std::string ids;
+                for (unsigned i = 0; i < work.count; ++i)
+                    ids += (i ? "," : "") + std::to_string(driver_->state().slots()[work.keys[i].slot].req.id);
+                step_ = {true, work.kind == Kind::Prefill ? "prefill" : work.kind == Kind::PromptTail ? "prompt tail" : "decode",
+                         t0, targ("boundary", work.boundary) + "," + targ("first", work.first) + "," + targ("rows", work.rows) +
+                                 ",\"requests\":[" + ids + "]"};
+            }
             if (elog_ && work.kind != Kind::Decode)
                 fprintf(stderr, "# s2_event step rank %u boundary %llu request %llu %s first %u rows %u\n", c_.rank,
                         (unsigned long long)work.boundary, (unsigned long long)driver_->state().slots()[work.keys[0].slot].req.id,
@@ -443,6 +491,7 @@ public:
         : c_(std::move(c)), links_(links), native_(std::move(hooks)), sessions_(c_.scheduler,c_.directory,c_.rank == 0,chunk),
           dispatch_(sessions_,c_.scheduler.max_rows,native_.dispatch), ingress_(c_.directory,c_.scheduler.epoch), queue_(c_.scheduler) {
         c_.validate();
+        trace_.open(knob::s2_trace().value_or(""), c_.rank);
         require(bool(native_.pool.free_pages) && bool(native_.pool.room) && bool(native_.pool.reserve) && bool(native_.pool.fits) &&
                 bool(native_.pool.release) && bool(native_.bind) && bool(native_.retire) && bool(native_.fence), "incomplete native service hooks");
         require(!native_.pool.grow || bool(native_.grown), "pool growth needs the native table hook");
@@ -480,9 +529,21 @@ public:
             sessions_.progress(s.key,first + rows);   // rank 0: a long prefill tells the front end it is alive
         };
         h.run = [&](const s2::Step& step) { return dispatch_.run(step); };
-        h.emit = [&](Key k,const int* ids,int n,int row) { return sessions_.emit(k,ids,n,row,native_.dispatch.logprob); };
+        h.emit = [&](Key k,const int* ids,int n,int row) {
+            if (trace_ && n > 0) {
+                const auto id = driver_->state().slots()[k.slot].req.id;
+                if (first_.insert(id).second) trace_.instant("first token", Trace::STEPS, targ("request", id));
+            }
+            return sessions_.emit(k,ids,n,row,native_.dispatch.logprob);
+        };
         h.prompt = [&](Key k,int M,int pos0) { sessions_.prompt_rows(k,M,pos0,native_.dispatch.logprob); };
-        h.finished = [&](const Slot& s) { retire_run(s); };
+        h.finished = [&](const Slot& s) {
+            if (trace_) {
+                trace_.instant("finish", Trace::STEPS, targ("request", s.req.id) + "," + targ("tokens", s.emitted));
+                first_.erase(s.req.id);
+            }
+            retire_run(s);
+        };
         if (native_.drained)   // the copies run at a bind, a growth or a retire: all before the next step's round
             h.settle = [&] {
                 if (!native_.drained()) return;
