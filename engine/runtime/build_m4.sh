@@ -19,6 +19,8 @@ CPU=""
 OUT=${OUT:-../../bin}
 O=$OUT/obj                 # one object dir per variant (OUT): concurrent flag / NR builds never share objects
 mkdir -p $OUT $O
+# the old G6_ names of these variables still work
+for v in XGRAMMAR XGRAMMAR_LIB NVCC_CACHE NVCC_CACHE_DIR; do o=G6_$v n=GR8_$v; if [ -n "${!o:-}" ] && [ -z "${!n:-}" ]; then export "$n=${!o}"; fi; done
 # every compile goes through nvcc_cache.sh (#32): a rebuild compiles only what an edit reaches. GR8_NVCC_CACHE=0: plain nvcc
 if [ "${GR8_NVCC_CACHE:-1}" = 0 ]; then NVCC=nvcc; GXX=g++; else NVCC="./nvcc_cache.sh nvcc"; GXX="./nvcc_cache.sh g++"; fi
 export GR8_NVCC_CACHE_LOG=$O/nvcc_cache.calls

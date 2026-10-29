@@ -37,27 +37,29 @@ if command -v cargo > /dev/null 2>&1; then
   cargo build --release --quiet --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
 fi
 KNOBS=("$REPO/engine/knobs-rs/target/release/libgr8knobs.a" -lpthread -ldl -lm)
+# the old G6_ names of these variables still work
+for v in XGRAMMAR XGRAMMAR_LIB NVCC_CACHE NVCC_CACHE_DIR; do o=G6_$v n=GR8_$v; if [ -n "${!o:-}" ] && [ -z "${!n:-}" ]; then export "$n=${!o}"; fi; done
 # request grammars (engine/runtime/grammar.h): XGrammar's C++, the copy the front end's xgrammar crate pins
 # (frontend/g6front-rs/Cargo.lock), so the engine's masks and the front end's checks run one grammar library.
-# G6_XGRAMMAR=DIR names a source tree instead (the image's engine stages), G6_XGRAMMAR=0 builds without grammars.
+# GR8_XGRAMMAR=DIR names a source tree instead (the image's engine stages), GR8_XGRAMMAR=0 builds without grammars.
 # Needs cmake; GLM-5.3 only
 GR_OFF=""
 if [ "${MODEL:-glm}" = flash ]; then GR_OFF="MODEL=flash"
 elif [ "${G6_TESTS:-1}" = only ]; then GR_OFF="G6_TESTS=only builds no engine"
-elif [ "${G6_XGRAMMAR:-}" = 0 ]; then GR_OFF="G6_XGRAMMAR=0"
+elif [ "${GR8_XGRAMMAR:-}" = 0 ]; then GR_OFF="GR8_XGRAMMAR=0"
 fi
 if [ -n "$GR_OFF" ]; then
-  unset G6_XGRAMMAR
-elif [ -z "${G6_XGRAMMAR:-}" ] && command -v cargo > /dev/null 2>&1 && command -v cmake > /dev/null 2>&1; then
+  unset GR8_XGRAMMAR
+elif [ -z "${GR8_XGRAMMAR:-}" ] && command -v cargo > /dev/null 2>&1 && command -v cmake > /dev/null 2>&1; then
   F=$REPO/frontend/g6front-rs/Cargo.toml
   cargo fetch --quiet --manifest-path "$F" 2> /dev/null || true
   M=$(cargo metadata --quiet --format-version 1 --manifest-path "$F" 2> /dev/null |
       grep -o '"manifest_path":"[^"]*/xgrammar-[0-9][^"/]*/Cargo.toml"' | head -1 | sed 's/.*:"//; s/"$//')
-  [ -n "$M" ] && [ -d "$(dirname "$M")/thirdparty/xgrammar" ] && G6_XGRAMMAR=$(dirname "$M")/thirdparty/xgrammar
+  [ -n "$M" ] && [ -d "$(dirname "$M")/thirdparty/xgrammar" ] && GR8_XGRAMMAR=$(dirname "$M")/thirdparty/xgrammar
 fi
-if [ -n "${G6_XGRAMMAR:-}" ]; then export G6_XGRAMMAR; echo "request grammars: XGrammar from $G6_XGRAMMAR"
+if [ -n "${GR8_XGRAMMAR:-}" ]; then export GR8_XGRAMMAR; echo "request grammars: XGrammar from $GR8_XGRAMMAR"
 elif [ -n "$GR_OFF" ]; then echo "request grammars: off ($GR_OFF)"
-else echo "request grammars: off (no XGrammar source; it needs cargo and cmake, or G6_XGRAMMAR=DIR)"; fi
+else echo "request grammars: off (no XGrammar source; it needs cargo and cmake, or GR8_XGRAMMAR=DIR)"; fi
 G6LOAD_BIN=$REPO/engine/loader-rs/target/release/g6load
 if [ -x "$G6LOAD_BIN" ]; then cp "$G6LOAD_BIN" "$OUT/"; fi
 # the KV node ./gr8 kv up runs
@@ -125,12 +127,12 @@ if [ "${G6_TESTS:-1}" != only ]; then
 fi
 [ "${G6_TESTS:-1}" = 0 ] && exit 0
 export PATH=/usr/local/cuda/bin:$PATH
-# the compiles below go through the same object cache as build_m4.sh (#32); G6_NVCC_CACHE=0 runs plain nvcc / g++
+# the compiles below go through the same object cache as build_m4.sh (#32); GR8_NVCC_CACHE=0 runs plain nvcc / g++
 CACHE="$REPO/engine/runtime/nvcc_cache.sh"
-if [ "${G6_NVCC_CACHE:-1}" = 0 ]; then NVCC=nvcc; GXX=g++; else NVCC="$CACHE nvcc"; GXX="$CACHE g++"; fi
+if [ "${GR8_NVCC_CACHE:-1}" = 0 ]; then NVCC=nvcc; GXX=g++; else NVCC="$CACHE nvcc"; GXX="$CACHE g++"; fi
 mkdir -p "$OUT/obj"
-export G6_NVCC_CACHE_LOG="$OUT/obj/nvcc_cache.tests.calls"
-rm -f "$G6_NVCC_CACHE_LOG"
+export GR8_NVCC_CACHE_LOG="$OUT/obj/nvcc_cache.tests.calls"
+rm -f "$GR8_NVCC_CACHE_LOG"
 GEN="-gencode=arch=compute_${ARCH:-121a},code=sm_${ARCH:-121a}"
 S2="$GEN $K1H2_FLAGS -DG6_NR=4 -DDEC_S2"
 TL="$OUT/obj/tests"
@@ -217,5 +219,5 @@ else
 fi
 echo "dtr_test_tp<N>, dtr_test_flash_tp<N>, l2pf_bench, k1_ovl_test: built (they need release files or an idle GPU)"
 echo "fabric_group_test: built (cluster test, not run here)"
-[ -f "$G6_NVCC_CACHE_LOG" ] && echo "nvcc cache (tests): $(grep -c '^hit' "$G6_NVCC_CACHE_LOG") hit, $(grep -c '^miss' "$G6_NVCC_CACHE_LOG") miss"
+[ -f "$GR8_NVCC_CACHE_LOG" ] && echo "nvcc cache (tests): $(grep -c '^hit' "$GR8_NVCC_CACHE_LOG") hit, $(grep -c '^miss' "$GR8_NVCC_CACHE_LOG") miss"
 exit 0
