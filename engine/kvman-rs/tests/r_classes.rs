@@ -146,3 +146,50 @@ fn an_r_the_pool_cannot_lay_out_is_refused() {
     assert_eq!(q.reserve_r(WORST, WORST, SMALL), Err(Error::BadArgument));
     assert!(q.reserve_r(WORST, WORST, BIG).is_ok());
 }
+
+#[test]
+fn a_shrunk_run_takes_the_smaller_r() {
+    let mut p = pool(0);
+    let a = p.reserve(WORST, WORST).unwrap();
+    let old = p.list(&a).unwrap().to_vec();
+    assert!(!p.shrinkable(&a, 0) && !p.shrinkable(&a, BIG) && p.shrinkable(&a, SMALL));
+    let b = p.shrink_run(&a, SMALL).unwrap();
+    assert_eq!((b.table_version, b.pages), (a.table_version, a.pages));
+    let l = p.list(&b).unwrap().to_vec();
+    assert_eq!(&l[..4], &old[..4], "the small prefix stays");
+    assert_eq!(&l[4..8], &old[8..12], "the window stays");
+    assert!(
+        l[8..12].iter().all(|q| *q >= 40 && !old.contains(q)),
+        "fresh drafter pages for the pages between the Rs: {l:?}"
+    );
+    assert_eq!(&l[12..], &old[12..], "the old drafter tail follows");
+    assert!(old[4..8].iter().all(|&q| !p.used(q)), "the prefix pages it gave up are free");
+    assert!(!p.shrinkable(&b, SMALL));
+    // two pools that shrink alike agree, and the run now retains and continues at the small R
+    let mut q = pool(0);
+    let qa = q.reserve(WORST, WORST).unwrap();
+    q.shrink_run(&qa, SMALL).unwrap();
+    assert_eq!(p.digest(), q.digest());
+    p.retain(&b, done(20, 1)).unwrap();
+    assert_eq!(next_turn(&p, SMALL).why, Why::Hit);
+    assert_eq!(next_turn(&p, 0).why, Why::Room);
+}
+
+#[test]
+fn a_shrink_makes_a_seat() {
+    let mut p = pool(0);
+    let runs: Vec<_> = (0..3).map(|_| p.reserve(WORST, WORST).unwrap()).collect();
+    assert!(!p.fits_r(WORST, WORST, SMALL), "3 x 12 of 40 pages leave no small seat");
+    p.shrink_run(&runs[0], SMALL).unwrap();
+    assert!(p.fits_r(WORST, WORST, SMALL), "8 + 12 + 12 leave 8");
+    assert_eq!((p.window_runs_r(0), p.window_runs_r(SMALL)), (2, 1));
+    // a run below R, or a pool without room above place, does not shrink
+    let small = p.reserve(4 * PAGE, 4 * PAGE).unwrap();
+    assert!(!p.shrinkable(&small, SMALL));
+    let mut full = Pool::new(40 + 3 * 12 + 2, 40, BIG).unwrap();
+    full.tail(4, 0);
+    full.window(4, 0, 0).unwrap();
+    let f: Vec<_> = (0..3).map(|_| full.reserve(WORST, WORST).unwrap()).collect();
+    assert!(!full.shrinkable(&f[0], SMALL), "2 pages free above place, the shrink needs 4");
+    assert_eq!(full.shrink_run(&f[0], SMALL), Err(Error::NoRoom));
+}

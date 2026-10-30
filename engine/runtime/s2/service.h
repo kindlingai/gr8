@@ -33,6 +33,11 @@ struct PoolHooks {
     // optional, head only: the R a request's run takes (Request::r_rows: 0 or Config::r2_rows). prompt: null without
     // prefix reuse. Unset = 0
     std::function<uint32_t(const Request&, uint64_t rows, uint64_t worst, const std::vector<int>* prompt)> r_rows;
+    // optional (with r_rows): a request that does not fit. make_room, head only: a decoding session to take the smaller R,
+    // its run shrunk on the head's pool (nothing = none to shrink). shrink: the same change on a worker's pool
+    std::function<std::optional<Shrink>(const std::array<Slot, MAX_SESSIONS>& slots, const Request&, uint64_t rows,
+                                        uint64_t worst)> make_room;
+    std::function<Run(const Run&, uint32_t r2)> shrink;
     // optional (growth on demand, pool.h grow): before a round, every rank; nothing = the session sits the round out
     std::function<std::optional<Run>(const Run&, uint64_t rows)> grow;
     // optional, status.s2: each live run's pages now and at worst, granted growth and stalled rounds
@@ -72,6 +77,9 @@ struct NativeHooks {
     // Resize commit (share_apply with the tier drain)
     std::function<std::optional<Resize>(bool idle)> share;
     std::function<void(const Resize&)> resize;
+    // with pool.make_room: a session takes the smaller R, every rank at the commit (its run as it was): the main and
+    // draft tables, and the pages between the two Rs that leave its prefix
+    std::function<void(const Shrink&, const Run& was, uint64_t length)> shrink;
     // optional, GR8_GLM53F_KV_CHUNKS: flash_room = this rank's Flash KV chunks online (its ACKs carry it, Ack::room);
     // flash = the head's borrow-idle rule (s2/flash_lend.h; chunk_rows 0 = no gate, idle_ms 0 = never lend). Its lends
     // and recalls are Resize events on FLASH_KV_TIER, so they need the resize hook
@@ -250,14 +258,26 @@ class Service {
                 // a prompt that continues a retained run fits when the hit does (match checks the room the hit needs, with
                 // the run's own pages and records counted as its own), even when a fresh run of it would not
                 const auto pr0 = prompts_.find(request->id);
-                if (native_.pool.r_rows)
-                    req.r_rows = native_.pool.r_rows(req, rows, worst, reuse() && pr0 != prompts_.end() ? &pr0->second : nullptr);
-                const uint32_t r = req.r_rows;
+                const std::vector<int>* prompt = reuse() && pr0 != prompts_.end() ? &pr0->second : nullptr;
+                uint32_t r = 0;
                 PoolHit pre{};
-                if (reuse() && pr0 != prompts_.end())
-                    pre = native_.pool.match(pr0->second, rows, worst, int(request->prompt_tokens) - 1,
-                                             g6rt::steering::cache_namespace(request->steering), r);
-                const bool fits = pre.skip > 0 || native_.pool.fits(rows, worst, r);
+                bool fits = false;
+                auto try_fit = [&] {
+                    if (native_.pool.r_rows) req.r_rows = native_.pool.r_rows(req, rows, worst, prompt);
+                    r = req.r_rows;
+                    pre = prompt ? native_.pool.match(*prompt, rows, worst, int(request->prompt_tokens) - 1,
+                                                      g6rt::steering::cache_namespace(request->steering), r) : PoolHit{};
+                    fits = pre.skip > 0 || native_.pool.fits(rows, worst, r);
+                };
+                try_fit();
+                // no room: a decoding session may take the smaller R, and this request then tries the room it gave up
+                if (!fits && native_.pool.make_room && live < c_.scheduler.limit())
+                    if ((cm.shrink = native_.pool.make_room(s.slots(), req, rows, worst))) {
+                        if (trace_)
+                            trace_.instant("shrink", Trace::CONTROL, targ("request", request->id) + "," +
+                                           targ("slot", cm.shrink->key.slot) + "," + targ("r", cm.shrink->r_rows));
+                        try_fit();
+                    }
                 const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), fits, native_.pool.room());
                 require(fit.has_value(), "duplicate admission attempt without revision");
                 if (trace_ && fit->why != Stall::None && waited_ != request->id) {
@@ -504,10 +524,19 @@ public:
         require(bool(native_.pool.free_pages) && bool(native_.pool.room) && bool(native_.pool.reserve) && bool(native_.pool.fits) &&
                 bool(native_.pool.release) && bool(native_.bind) && bool(native_.retire) && bool(native_.fence), "incomplete native service hooks");
         require(!native_.pool.grow || bool(native_.grown), "pool growth needs the native table hook");
+        require(!native_.pool.make_room || (bool(native_.pool.shrink) && bool(native_.shrink)), "a shrink needs the pool's and the native hook");
         require(!native_.share || bool(native_.resize), "a share report needs the resize hook");
         require(!native_.flash.chunk_rows || bool(native_.resize), "borrow-idle needs the resize hook");
         DriverHooks h;
         h.resize = native_.resize;
+        h.shrink = [&](const Shrink& k, const Run& was, uint64_t length) {
+            if (c_.rank) {   // the head's change, on the same pool state
+                require(bool(native_.pool.shrink), "a shrink commit without the pool's shrink");
+                require(native_.pool.shrink(was, k.r_rows) == k.run, "worker shrink differs from the head's");
+            }
+            require(bool(native_.shrink), "a shrink commit without the native shrink hook");
+            native_.shrink(k, was, length);
+        };
         h.bind = [&](const Grant& g) {
             require(staged_.has_value(), "binding without verified payload");
             require(!g.reuse || reuse(), "reused rows without prefix reuse");

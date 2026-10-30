@@ -19,8 +19,8 @@ constexpr unsigned MAX_SESSIONS = 8, PAGE = 64;
 // The control link's version: the frame magic is "G6S2E" + this digit (control_protocol.h) and the bootstrap agreement
 // carries it (bootstrap.h), so ranks built with different commit frames refuse at bootstrap, not at the first event.
 // 6 adds Commit::hold. 7 adds the Resize event (Commit::resize). 9 adds Ack::room (8 is the fail-soft store's, #159).
-// 10 adds the steering profile slot. 11 adds Request::r_rows.
-constexpr unsigned CONTROL_VERSION = 11;
+// 10 adds the steering profile slot. 11 adds Request::r_rows. 12 adds Commit::shrink.
+constexpr unsigned CONTROL_VERSION = 12;
 constexpr uint32_t MAX_DECODE_ROUNDS = 64;   // Config::decode_rounds bound
 // Prefill choice (Scheduler::next): of the sessions with prompt rows left, the one with the fewest runs next, so a short
 // request admitted behind a long prefill is served instead of waiting out every quantum of it (#61). Shortest-first
@@ -177,6 +177,12 @@ struct Resize {
     uint64_t segs = 0, slots = 0, txn = 0;
     bool operator==(const Resize& r) const { return tier == r.tier && segs == r.segs && slots == r.slots && txn == r.txn; }
 };
+// a live session's run takes the smaller R: its slot, that R, and its run after the change (same table version and
+// length, pool.h shrink)
+struct Shrink {
+    Key key; uint32_t r_rows = 0; Run run;
+    bool operator==(const Shrink& b) const { return key == b.key && r_rows == b.r_rows && run == b.run; }
+};
 struct Commit {
     uint64_t epoch = 0, event = 0, boundary = 0, before_hash = 0;
     std::optional<Key> cancel;
@@ -187,6 +193,9 @@ struct Commit {
     bool hold = false;
     // a Resize event's change (no cancel, grant or hold); Driver::apply passes it to DriverHooks::resize
     std::optional<Resize> resize;
+    // an admission's room: a decoding session takes the smaller R (Config::r2_rows) before the grant, which may then
+    // use the pages it gave up (Driver::apply: DriverHooks::shrink before bind)
+    std::optional<Shrink> shrink;
 };
 struct Changes {
     std::vector<Run> freed;
@@ -301,6 +310,14 @@ public:
             d.freed.push_back(s.run); s.phase = Phase::Free;
         }
         if (e.cancel) require(e.cancel->epoch == c_.epoch, "cancel epoch mismatch");
+        if (e.shrink) {
+            const Shrink& k = *e.shrink;
+            require(k.key.epoch == c_.epoch && k.key.slot < MAX_SESSIONS, "bad shrink key");
+            Slot& t = after[k.key.slot];
+            require(t.phase == Phase::Decode && t.key == k.key && c_.r2_rows && k.r_rows == c_.r2_rows && !t.req.r_rows &&
+                    k.run.table_version == t.run.table_version && k.run.pages == t.run.pages, "bad shrink");
+            t.req.r_rows = k.r_rows; t.run = k.run;
+        }
         if (e.admit) {
             const auto& g = *e.admit;
             require(!have_id_ || g.req.id > last_id_, "native request ordinals must increase");

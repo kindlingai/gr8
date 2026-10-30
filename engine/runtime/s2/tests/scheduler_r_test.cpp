@@ -38,6 +38,31 @@ int main()
     CHECK(big.digest() != small.digest());
     CHECK(big.slots()[0].req.r_rows == 0 && small.slots()[0].req.r_rows == 16384);
 
+    // a decoding session takes the smaller R: its slot's R and run change, and the digest with them
+    {
+        Scheduler a(cfg());
+        CHECK(admit(a, 0));
+        a.skip_prefill(a.slots()[0].key);
+        const Quantum q = a.next();   // its prompt tail: then it decodes
+        CHECK(q.kind == Kind::PromptTail);
+        a.complete_tail(Completion{q.keys[0], 1, false, 0});
+        CHECK(a.slots()[0].phase == Phase::Decode);
+        const Slot was = a.slots()[0];
+        auto shrink = [&](uint32_t r, uint32_t version) {
+            Commit cm;
+            cm.epoch = a.config().epoch; cm.event = a.next_event(); cm.boundary = a.boundary(); cm.before_hash = a.digest();
+            Run run = was.run; run.list_hash ^= 1; run.table_version = version;
+            cm.shrink = Shrink{was.key, r, run};
+            try { a.apply(cm); } catch (const std::exception&) { return false; }
+            return true;
+        };
+        const uint64_t before = a.digest();
+        CHECK(!shrink(8192, was.run.table_version) && !shrink(16384, was.run.table_version + 1));
+        CHECK(shrink(16384, was.run.table_version));
+        CHECK(a.slots()[0].req.r_rows == 16384 && a.slots()[0].run.list_hash == (was.run.list_hash ^ 1) && a.digest() != before);
+        CHECK(!shrink(16384, was.run.table_version));   // once only
+    }
+
     // without r2_rows only the engine's R is granted, and r2_rows needs the window
     Config plain = cfg(); plain.r2_rows = 0;
     Scheduler p(plain), q(plain);

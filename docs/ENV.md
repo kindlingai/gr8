@@ -384,6 +384,7 @@ Read by test programs, audits and benchmarks. `g6m4 --serve` refuses to start wh
 | `GR8_TEST_S2_RELOC_PAGES` | int | unset |  | m4sim --s2 with GR8_S2_RELOC: copies at most this many pages, to time the stall. |
 | `GR8_TEST_S2_ROWHASH` | flag | `0` |  | m4sim --s2 probe: prints one line per target row with an FNV hash of its residual and its log-probability bits (rank 0). |
 | `GR8_TEST_S2_RUNS` | text | unset |  | m4sim --s2: b:p,b:p,.. sets each slot's run (base page, pages) on every model. |
+| `GR8_TEST_S2_SHRINK_AT` | int | unset |  | m4sim gate, with GR8_TEST_S2_XLIST, GR8_CP_R2 and GR8_RT_LOCAL: each sequence starts at GR8_CP_R and takes GR8_CP_R2 once its rows reach this position (past GR8_CP_R), as a session g6m4 shrinks. Stdout must equal the run at GR8_CP_R2 from the start. |
 | `GR8_TEST_S2_SOLO1` | flag | `1` |  | m4sim --s2: a session left alone runs the single-session path. 0 keeps it on the S2 path. |
 | `GR8_TEST_S2_XLIST` | ints | unset |  | m4sim gate: seed[,pages] runs every sequence as one session past R on a shuffled page list of the pool's two classes. Stdout must equal the run without it. |
 | `GR8_TEST_SPARSE_MLA` | flag | `0` |  | flash_dsa_pf_test: compares the fused MLA with the current GEMM prefill instead of the older P1 math. |

@@ -28,6 +28,12 @@ int main()
     bool off_grid = false;
     try { (void)decode_commit(encode(o)); } catch (const std::exception&) { off_grid = true; }
     CHECK(off_grid);
+    // a shrink rides an admission's commit, before its grant
+    EventCommit k = e;
+    k.commit.cancel.reset();
+    k.commit.shrink = Shrink{Key{7, 1, 4}, 16384, Run{3, 300, 9, 0x77}};
+    const EventCommit kd = decode_commit(encode(k));
+    CHECK(kd.commit.shrink && *kd.commit.shrink == *k.commit.shrink && kd.commit.admit);
     // a Resize event: its commit carries the change and nothing else, and needs a RESIZE notice
     EventCommit r;
     r.notice = Notice{7, 13, 3500, 0, 0, EventKind::Resize};

@@ -519,6 +519,25 @@ inline void s2_zero_pages(Model& m, const std::vector<int>& list, cudaStream_t s
         G6RT_CK(cudaGetLastError());
     }
 }
+// page a -> page b of every layer's latent and index caches, for each (a, b) of moves (a shrunk run's drafter rows,
+// s2/pool.h shrink). Host, at an event fence, on the stream; no step in flight
+inline void s2_copy_pages(Model& m, const std::vector<std::pair<int, int>>& moves, int most, cudaStream_t st)
+{
+    for (const auto& [a, b] : moves)
+        if (a < 0 || b < 0 || a >= most || b >= most || a == b) die("s2_copy_pages: page outside the pool or onto itself");
+    for (const G6AttnBinding* p : m.s2->pool)
+    {
+        const G6Attn& g = p->args;
+        for (const auto& [a, b] : moves)
+        {
+            if (b >= g.page_count || a >= g.page_count) die("s2_copy_pages: page past this model's pool");
+            const size_t kv = 64 * g6kv::ROW, ix = 64 * g6kv::IDX_ROW;
+            G6RT_CK(cudaMemcpyAsync((char*)g.mla_cache + (size_t)b * kv, (const char*)g.mla_cache + (size_t)a * kv, kv, cudaMemcpyDeviceToDevice, st));
+            if (g.index_cache)
+                G6RT_CK(cudaMemcpyAsync((char*)g.index_cache + (size_t)b * ix, (const char*)g.index_cache + (size_t)a * ix, ix, cudaMemcpyDeviceToDevice, st));
+        }
+    }
+}
 // re-base slot q's run, keeping its pages (s2_relocate)
 inline void s2_set_base(Model& m, int q, int base_page)
 {

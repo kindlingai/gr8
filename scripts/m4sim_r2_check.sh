@@ -10,6 +10,8 @@
 #          SMALL, and the bindings' larger layout changes no byte
 #          (control: the GR8_CP_R=BIG run without GR8_CP_R2 must differ)
 #   r2rt   the same with the rows tier releasing the tail (GR8_RT_STORE=mem:, GR8_RT_LOCAL)
+#   shrink a session that starts at BIG and takes SMALL mid-decode (GR8_TEST_S2_SHRINK_AT, as g6m4 shrinks one) ==
+#          the session at SMALL from the start, past BIG (shrink) and below it (shrink2: a page partly written)
 #   main   (M4SIM_MAIN set) without GR8_CP_R2, M4SIM == M4SIM_MAIN on the xlist gate, with and without the rows tier
 # Exit 0 = every check PASS. Every run's stdout / stderr stays in OUT.
 set -u
@@ -72,6 +74,16 @@ differ r2.big r2
 run r2rt.ref "$M4SIM" "$COMMON_ENV GR8_CP_R=$SMALL $XLIST $RT" $COMMON_ARGS $PROMPTS
 run r2rt "$M4SIM" "$COMMON_ENV GR8_CP_R=$BIG GR8_CP_R2=$SMALL $XLIST $RT" $COMMON_ARGS $PROMPTS
 same r2rt.ref r2rt
+SHRINK=${SHRINK:-608}               # a row of the 600-id prompt's decode, past BIG
+run shrink.ref "$M4SIM" "$COMMON_ENV GR8_CP_R=$SMALL $XLIST $RT" $COMMON_ARGS --prompt "$P0"
+run shrink "$M4SIM" "$COMMON_ENV GR8_CP_R=$BIG GR8_CP_R2=$SMALL GR8_TEST_S2_SHRINK_AT=$SHRINK $XLIST $RT" $COMMON_ARGS --prompt "$P0"
+same shrink.ref shrink
+grep -q "takes R $SMALL at row" "$OUT/err.shrink.txt" || { note "FAIL shrink: the run never shrank"; fails=$((fails + 1)); }
+# the same below BIG (the 200-id prompt's decode): its page between the Rs is partly written and moves to the window
+run shrink2.ref "$M4SIM" "$COMMON_ENV GR8_CP_R=$SMALL $XLIST $RT" $COMMON_ARGS --prompt "$P1"
+run shrink2 "$M4SIM" "$COMMON_ENV GR8_CP_R=$BIG GR8_CP_R2=$SMALL GR8_TEST_S2_SHRINK_AT=${SHRINK2:-208} $XLIST $RT" $COMMON_ARGS --prompt "$P1"
+same shrink2.ref shrink2
+grep -q "takes R $SMALL at row" "$OUT/err.shrink2.txt" || { note "FAIL shrink2: the run never shrank"; fails=$((fails + 1)); }
 if [ -n "${M4SIM_MAIN:-}" ]; then
   for b in new main; do
     bin=$M4SIM; [ $b = main ] && bin=$M4SIM_MAIN

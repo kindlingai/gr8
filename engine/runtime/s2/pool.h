@@ -137,6 +137,9 @@ public:
     void window(uint32_t pages, uint32_t ids, uint32_t runs) { Lock l(mu_); check(g6kv_window(p_, pages, ids, runs)); }
     uint32_t window_runs() const { Lock l(mu_); return g6kv_window_runs(p_); }
     uint32_t window_runs(uint32_t r) const { Lock l(mu_); return g6kv_window_runs_r(p_, r); }
+    // a live window run takes the smaller R = r2 rows (kvman-rs Pool::shrink_run): same table version and length, a new list
+    bool shrinkable(const Run& r, uint32_t r2) const { Lock l(mu_); const g6kv_run x = c(r); return g6kv_shrinkable(p_, &x, r2) != 0; }
+    Run shrink(const Run& r, uint32_t r2) { Lock l(mu_); const g6kv_run x = c(r); g6kv_run out; check(g6kv_shrink_run(p_, &x, r2, &out)); return run(out); }
     // whether a retained run holds exactly this list (a window run's records stay while it does)
     bool is_kept(const std::vector<int>& list) const {
         Lock l(mu_); std::vector<uint32_t> v(list.begin(), list.end()); return g6kv_is_kept(p_, v.data(), v.size()) != 0;

@@ -46,6 +46,10 @@ struct DriverHooks {
     // optional: a Resize event's change (Commit::resize), every rank at the commit: the tier and its group lease change
     // size (s2/kv_share.h share_apply). Required when a resize commit arrives
     std::function<void(const Resize&)> resize;
+    // optional: a session takes the smaller R (Commit::shrink), every rank at the commit before any bind, with its run as
+    // it was and its length (tokens; rows below length - 1 are written): the pool's change (workers) and the engine's
+    // tables and pages. Required when a shrink commit arrives
+    std::function<void(const Shrink&, const Run& was, uint64_t length)> shrink;
     // optional: after the growth and before the round, every rank (the host work since the last round may have taken a
     // different time on each rank: the round's fabric waits time out)
     std::function<void()> settle;
@@ -148,6 +152,10 @@ public:
                 if (initialized_[old.key.slot]) batch_.release(int(old.key.slot));
                 initialized_[old.key.slot] = false;
                 payload_[old.key.slot] = Payload{}; emitted_[old.key.slot] = 0;
+            }
+            if (c.shrink) {
+                require(bool(hooks_.shrink), "a shrink commit without the shrink hook");
+                hooks_.shrink(*c.shrink, before[c.shrink->key.slot].run, uint64_t(batch_.length(int(c.shrink->key.slot))));
             }
             if (c.admit) {
                 payload_[c.admit->key.slot] = *p;
