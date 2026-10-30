@@ -20,6 +20,7 @@ import os
 import select
 import socket
 import struct
+import subprocess
 import threading
 import time
 import urllib.request
@@ -142,16 +143,28 @@ def kv_nodes(snap, group):
     return sorted(out, key=lambda x: ipaddress.ip_address(x[0]))
 
 
-def kv_target(nodes, rails, rank=0):
+def local_nets():
+    """{address: its IPv4 network} for every address on this box, from `ip -j -4 addr`. Empty where ip is missing."""
+    try:
+        out = subprocess.run(['ip', '-j', '-4', 'addr', 'show'], capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    return {i['local']: ipaddress.ip_interface(f"{i['local']}/{i['prefixlen']}").network
+            for link in json.loads(out) for i in link.get('addr_info', [])}
+
+
+def kv_target(nodes, rails, rank=0, nets=None):
     """host:port of the KV node a box with these fabric addresses should use: the first node with an RDMA address on
-    one of the rails' /24 subnets, else the first node's LAN address (TCP). Rank r tries rail r % 2 first, so the ranks
-    split their traffic over both of the node's PCIe roots."""
-    nets = [a.rsplit('.', 1)[0] for a in rails if a]
-    nets = nets[rank % len(nets):] + nets[:rank % len(nets)] if nets else nets
-    for net in nets:
+    one of the rails' subnets, else the first node's LAN address (TCP). nets: {rail: its network}, as local_nets()
+    reads them; a rail without one is taken as a /24. Rank r tries rail r % 2 first, so the ranks split their
+    traffic over both of the node's PCIe roots."""
+    nets = nets or {}
+    subnets = [nets.get(a) or ipaddress.ip_interface(f'{a}/24').network for a in rails if a]
+    subnets = subnets[rank % len(subnets):] + subnets[:rank % len(subnets)] if subnets else subnets
+    for net in subnets:
         for _, port, meta in nodes:
             for a in filter(None, (meta.get('gr8.kv.rdma') or '').split(',')):
-                if a.rsplit('.', 1)[0] == net:
+                if ipaddress.ip_address(a) in net:
                     return f'{a}:{port}'
     return f'{nodes[0][0]}:{nodes[0][1]}' if nodes else None
 
@@ -349,6 +362,42 @@ def rails_of(snap, node_id):
         return rdma_addrs(snap.get('addr_tags') or {})
     peer = (snap.get('peers') or {}).get(node_id) or {}
     return rdma_addrs(peer.get('addr_tags') or {})
+
+
+def member_rails(snap, node_ids, names=None):
+    """{node_id: (rail 0, rail 1)}: one rdma address per PCIe root for each member. A member with more than two (a
+    direct cable to another box beside its switch port) uses the pair on the fabric every member shares: the local
+    box's two addresses whose mentat probes reach exactly one address of every other member, and the addresses they
+    reach. None until the probes settle that. Raises RuntimeError for a member with fewer than two, named by names
+    ({node_id: LAN address}) where given."""
+    rails = {n: rails_of(snap, n) for n in node_ids}
+    for n, r in rails.items():
+        if len(r) < 2:
+            raise RuntimeError(f'{(names or {}).get(n, n)} has {len(r)} rdma-tagged addresses '
+                               f'({", ".join(r) or "none"}), want two. Tag both ConnectX roots in mentat: '
+                               'MENTAT_ANNOUNCE_IFACES=en*f*np*=connectx+rdma,en*=lan (or pass --ips and --ips2)')
+    if all(len(r) == 2 for r in rails.values()):
+        return {n: tuple(r) for n, r in rails.items()}
+    me = snap.get('node_id')
+    others = [n for n in node_ids if n != me]
+    if me not in rails or not others:
+        return {n: tuple(r[:2]) for n, r in rails.items()}      # nobody to probe: the lowest two
+    peers = snap.get('peers') or {}
+    reach = {}
+    for a in rails[me]:
+        hit = {}
+        for n in others:
+            probes = ((peers.get(n) or {}).get('probes') or {}).get(a) or {}
+            ok = [p for p in rails[n] if (probes.get(p) or {}).get('ok')]
+            if len(ok) != 1:
+                break
+            hit[n] = ok[0]
+        else:
+            reach[a] = hit
+    if len(reach) != 2:
+        return None
+    mine = sorted(reach, key=ipaddress.ip_address)
+    return {me: tuple(mine), **{n: tuple(reach[a][n] for a in mine) for n in others}}
 
 
 def probe_problems(local, ranks, me, my_rails):
@@ -628,15 +677,12 @@ def elect(daemon, group, tp, head=None, timeout=600, hold_s=5.0, log=print, slee
             if key == last:
                 ips = assign_ranks([ip for ip, _, _ in ms], {ip: parse_offers(o) for ip, _, o in ms}, tp, lan_head)
                 ids = {ip: n for ip, n, _ in ms}
-                ranks = []
-                for ip in ips:
-                    rails = rails_of(snap, ids[ip])
-                    if len(rails) != 2:
-                        raise RuntimeError(f'{ip} has {len(rails)} rdma-tagged addresses ({", ".join(rails) or "none"}), '
-                                           'want two. Tag both ConnectX roots in mentat: MENTAT_ANNOUNCE_IFACES='
-                                           'en*f*np*=connectx+rdma,en*=lan (or pass --ips and --ips2)')
-                    ranks.append((ip, ids[ip], tuple(rails)))
-                return ranks, snap
+                rails = member_rails(snap, [ids[ip] for ip in ips], {n: ip for ip, n in ids.items()})
+                if rails is not None:
+                    return [(ip, ids[ip], rails[ids[ip]]) for ip in ips], snap
+                if waited - said >= 60:
+                    log('waiting for mentat to probe which rdma addresses every member shares')
+                    said = waited
             last = key
             sleep(hold_s)
             continue

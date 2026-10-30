@@ -2,6 +2,7 @@
 """The mentat side, against a fake daemon that speaks the framing of mentat's PROTOCOL.md: membership, the election,
 the rails, and the agent link with meta updates. No mentatd needed.
     python3 -m unittest discover -s tools/launch"""
+import ipaddress
 import http.server
 import json
 import os
@@ -142,6 +143,26 @@ class MembershipTests(unittest.TestCase):
         self.assertEqual(M.rails_of(snap, 'n1'), ['10.1.0.1', '10.2.0.1'])     # own row, IPv6 left out
         self.assertEqual(M.rails_of(snap, 'n3'), ['10.1.0.3', '10.2.0.3'])
         self.assertEqual(M.node_view(snap), ('10.0.0.1', '10.0.0.1', ['10.1.0.1', '10.2.0.1']))
+
+    def test_member_rails_take_the_fabric_every_member_shares(self):
+        snap = snapshot({})
+        # n1 and n3 share a direct cable (10.110/10.111) beside their switch ports (10.1/10.2)
+        snap['addr_tags'].update({'10.110.0.0': ['rdma'], '10.111.0.0': ['rdma']})
+        snap['peers']['n3']['addr_tags'].update({'10.110.0.1': ['rdma'], '10.111.0.1': ['rdma']})
+        ok = {'ok': True}
+        snap['peers']['n2']['probes'] = {'10.1.0.1': {'10.1.0.2': ok}, '10.2.0.1': {'10.2.0.2': ok}}
+        snap['peers']['n3']['probes'] = {'10.1.0.1': {'10.1.0.3': ok}, '10.2.0.1': {'10.2.0.3': ok},
+                                         '10.110.0.0': {'10.110.0.1': ok}, '10.111.0.0': {'10.111.0.1': ok}}
+        self.assertEqual(M.member_rails(snap, ['n1', 'n2', 'n3']),
+                         {'n1': ('10.1.0.1', '10.2.0.1'), 'n2': ('10.1.0.2', '10.2.0.2'), 'n3': ('10.1.0.3', '10.2.0.3')})
+        del snap['peers']['n2']['probes']['10.2.0.1']       # not probed yet: wait
+        self.assertIsNone(M.member_rails(snap, ['n1', 'n2', 'n3']))
+        # every member with two: those two, probes or not
+        self.assertEqual(M.member_rails(snapshot({}), ['n1', 'n2'])['n2'], ('10.1.0.2', '10.2.0.2'))
+        snap['peers']['n2']['addr_tags'] = {'10.0.0.2': ['lan'], '10.1.0.2': ['rdma']}
+        with self.assertRaises(RuntimeError) as e:
+            M.member_rails(snap, ['n1', 'n2'], {'n2': '10.0.0.2'})
+        self.assertIn('10.0.0.2 has 1 rdma-tagged addresses', str(e.exception))
 
     def test_probe_problems(self):
         local = {'peers': {'n2': {'probes': {'10.1.0.1': {'10.1.0.2': {'ok': False}, '10.2.0.2': {'ok': True}},
@@ -372,6 +393,12 @@ class KvTargetTests(unittest.TestCase):
         self.assertEqual(M.kv_target(nodes, ('10.5.0.3', '10.6.0.3')), '192.0.2.10:7350')
         self.assertEqual(M.kv_target([('192.0.2.10', 7350, {})], ('', '')), '192.0.2.10:7350')
         self.assertIsNone(M.kv_target([], ('10.1.0.3', '10.2.0.3')))
+        # rails on /16 subnets: the KV node is on the rail's subnet, though not on its /24
+        wide = [('192.0.2.10', 7350, {'gr8.kv.rdma': '10.101.200.3,10.100.200.3'})]
+        nets = {'10.100.1.2': ipaddress.ip_network('10.100.0.0/16'),
+                '10.101.1.2': ipaddress.ip_network('10.101.0.0/16')}
+        self.assertEqual(M.kv_target(wide, ('10.100.1.2', '10.101.1.2'), 1, nets), '10.101.200.3:7350')
+        self.assertEqual(M.kv_target(wide, ('10.100.1.2', '10.101.1.2')), '192.0.2.10:7350')
 
 
 class DaemonTests(unittest.TestCase):
