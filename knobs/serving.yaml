@@ -53,6 +53,13 @@ knobs:
       pages past them are spread across ranks, so a run past it holds fewer pages below place and more sessions past R
       fit. Every step past GR8_CP_R2 runs the CP block. A multiple of 64 below GR8_CP_R and a context bucket boundary;
       needs GR8_RT_LOCAL.
+  GR8_CP_R2_BIG:
+    scope: agree
+    kind: int
+    default: "1"
+    doc: >-
+      With GR8_CP_R2: how many sessions past GR8_CP_R2 may run at GR8_CP_R at once. Later ones take GR8_CP_R2, and so
+      does one the pool has no room for at GR8_CP_R. A turn that continues a retained run keeps that run's R.
   GR8_CP_S3:
     scope: agree
     kind: flag

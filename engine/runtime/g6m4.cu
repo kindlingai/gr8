@@ -2062,6 +2062,26 @@ int main(int argc, char** argv)
                 };
                 h.pool.take = [&](const g6s2::PoolHit& x, uint64_t rows, uint64_t worst, uint32_t r) { return pool.take(x, rows, worst, r); };
             }
+            // GR8_CP_R2: up to GR8_CP_R2_BIG sessions past it run at GR8_CP_R (their decode reads no released rows below
+            // it); the others, and one the pool has no room for at GR8_CP_R, take GR8_CP_R2. A turn that continues a
+            // retained run keeps that run's R, since a hit never crosses Rs (kvman-rs Pool::match_prefix_r)
+            if (cp_R2)
+            {
+                const uint32_t big = (uint32_t)knob::cp_r2_big();
+                h.pool.r_rows = [&, big](const g6s2::Request& r, uint64_t rows, uint64_t worst, const std::vector<int>* prompt) -> uint32_t {
+                    if (worst <= (uint64_t)cp_R2) return 0;   // below both Rs: one layout
+                    if (prompt)
+                    {
+                        const CacheNamespace ns = g6rt::steering::cache_namespace(r.steering);
+                        const int limit = int(r.prompt_tokens) - 1;
+                        const bool at_big = pool.match(*prompt, rows, worst, limit, ns, 0).skip > 0;
+                        const bool at_small = pool.match(*prompt, rows, worst, limit, ns, (uint32_t)cp_R2).skip > 0;
+                        if (at_big != at_small) return at_big ? 0 : (uint32_t)cp_R2;
+                    }
+                    return pool.window_runs(0) < big && pool.fits(rows, worst, 0) ? 0 : (uint32_t)cp_R2;
+                };
+                if (R == 0) fprintf(stderr, "# rank 0: GR8_CP_R2 %d: up to %u sessions past it run at GR8_CP_R %d, the rest at %d\n", cp_R2, big, cp_R, cp_R2);
+            }
             if (kvt)
             {
                 h.pool.tiers = [&] { return pool.tiers(); };

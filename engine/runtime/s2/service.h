@@ -30,8 +30,9 @@ struct PoolHooks {
     std::function<bool(uint64_t rows, uint64_t worst, uint32_t r)> fits;
     // optional (remote rows release): why a stalled request past R does not fit its page classes; empty = no reason
     std::function<std::string(uint64_t worst, uint32_t r)> refusal;
-    // optional, head only: the R a request's run takes (Request::r_rows: 0 or Config::r2_rows). Unset = 0
-    std::function<uint32_t(const Request&)> r_rows;
+    // optional, head only: the R a request's run takes (Request::r_rows: 0 or Config::r2_rows). prompt: null without
+    // prefix reuse. Unset = 0
+    std::function<uint32_t(const Request&, uint64_t rows, uint64_t worst, const std::vector<int>* prompt)> r_rows;
     // optional (growth on demand, pool.h grow): before a round, every rank; nothing = the session sits the round out
     std::function<std::optional<Run>(const Run&, uint64_t rows)> grow;
     // optional, status.s2: each live run's pages now and at worst, granted growth and stalled rounds
@@ -243,14 +244,15 @@ class Service {
             if (command.admit) {
                 const auto* queued = queue_.front(); require(queued && queued->id == command.request, "admission FIFO changed during event");
                 Request req = *queued;
-                req.r_rows = native_.pool.r_rows ? native_.pool.r_rows(req) : 0;
                 const Request* request = &req;
-                const uint32_t r = req.r_rows;
                 unsigned live = s.resident();
                 const auto worst = reserve_rows(c_.scheduler, *request), rows = admit_rows(*request);
                 // a prompt that continues a retained run fits when the hit does (match checks the room the hit needs, with
                 // the run's own pages and records counted as its own), even when a fresh run of it would not
                 const auto pr0 = prompts_.find(request->id);
+                if (native_.pool.r_rows)
+                    req.r_rows = native_.pool.r_rows(req, rows, worst, reuse() && pr0 != prompts_.end() ? &pr0->second : nullptr);
+                const uint32_t r = req.r_rows;
                 PoolHit pre{};
                 if (reuse() && pr0 != prompts_.end())
                     pre = native_.pool.match(pr0->second, rows, worst, int(request->prompt_tokens) - 1,

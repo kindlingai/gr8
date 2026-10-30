@@ -290,6 +290,15 @@ def validate(o):
     if share is not None and not (str(share).isdigit() and int(share) >= 4096 and int(share) % 64 == 0):
         # the engine takes any multiple of a KV page (64 tokens) and makes it a decode bucket boundary (context_buckets.h)
         raise OptionError(f'--share-limit {share}: want a multiple of 64 from 4096')
+    busy = o.get('SHARE_LIMIT_BUSY')
+    if busy is not None:
+        if not (str(busy).isdigit() and int(busy) >= 4096 and int(busy) % 64 == 0 and int(busy) < int(share or 32768)):
+            raise OptionError(f'--share-limit-busy {busy}: want a multiple of 64 from 4096, below SHARE_LIMIT')
+        if 'local=' not in str(o.get('KV_ROWS') or ''):
+            raise OptionError('--share-limit-busy needs KV_ROWS with local= (the rows past it come from the rows store)')
+    big = o.get('SHARE_BIG')
+    if big is not None and not (str(big).isdigit() and busy is not None):
+        raise OptionError(f'--share-big {big}: want a whole number, with SHARE_LIMIT_BUSY')
     if o.get('V2') and not o.get('V2_SLICES'):
         raise OptionError('--v2 needs --v2-slices')
     if o.get('V2_DENSE_FORM') not in (None, 'trellis', 'rounded'):

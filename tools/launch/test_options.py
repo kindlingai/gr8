@@ -324,6 +324,21 @@ class CanonicalTests(unittest.TestCase):
             with self.assertRaises(opt.OptionError):
                 self.digest('--share-limit', bad)
 
+    def test_a_busy_share_limit_sets_r2_with_the_rows_window(self):
+        rows = ('--kv-rows', 'mem:,size=1G,local=40')
+        _, text, d0 = self.digest(*rows)
+        self.assertNotIn('GR8_CP_R2', text)
+        _, text, d1 = self.digest(*rows, '--share-limit-busy', '16384')
+        self.assertIn(' GR8_CP_R2=16384 ', text)
+        self.assertIn(' GR8_CP_R=32768 ', text)
+        self.assertNotEqual(d0, d1)
+        _, text, _ = self.digest(*rows, '--share-limit-busy', '16384', '--share-big', '2')
+        self.assertIn(' GR8_CP_R2_BIG=2 ', text)
+        for bad in (('--share-limit-busy', '16384'), (*rows, '--share-limit-busy', '32768'),
+                    (*rows, '--share-limit-busy', '16100'), ('--share-big', '2')):
+            with self.assertRaises(opt.OptionError):
+                self.digest(*bad)
+
     def test_per_box_options_do_not_count(self):
         base = self.digest()[2]
         self.assertEqual(base, self.digest('--work-dir', '/elsewhere', '--proxy-cpu', '15', '--model', '/m',
