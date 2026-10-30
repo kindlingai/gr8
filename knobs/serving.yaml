@@ -44,6 +44,15 @@ knobs:
     doc: >-
       The first R tokens of KV are replicated on every rank and pages past R are spread across ranks. Under S2 it is
       also the largest request that shares decode steps. A multiple of 64.
+  GR8_CP_R2:
+    scope: agree
+    kind: int
+    unset: "none: every session takes GR8_CP_R"
+    doc: >-
+      A smaller R a session may take (the head's policy names which): its first GR8_CP_R2 tokens are replicated and its
+      pages past them are spread across ranks, so a run past it holds fewer pages below place and more sessions past R
+      fit. Every step past GR8_CP_R2 runs the CP block. A multiple of 64 below GR8_CP_R and a context bucket boundary;
+      needs GR8_RT_LOCAL.
   GR8_CP_S3:
     scope: agree
     kind: flag

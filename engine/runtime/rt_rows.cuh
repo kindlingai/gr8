@@ -76,6 +76,7 @@ struct RtTier
     {
         bool on = false;
         std::vector<int> list, tail, pfree, win;   // win: its window pages, in order
+        int L = 0;                    // its first released position: its run's R (GR8_CP_R2), L without one
         int window = 0, in_use = 0, peak = 0;
         uint64_t released = 0;
     };
@@ -220,6 +221,8 @@ struct RtSpillSeen
 };
 // release: a logical page past L that this rank holds (the CP map's rule)
 inline bool rt_mine(const RtTier& t, int lp) { return lp >= t.L / 64 && lp < t.tsize && lp % t.nr == t.rank; }
+// release: the same past session s's own L
+inline bool rt_mine(const RtTier& t, const RtTier::Seq& s, int lp) { return lp >= s.L / 64 && lp < t.tsize && lp % t.nr == t.rank; }
 // release, GR8_RT_CHECK=1: every record has exactly one holder (its slot's tail entry for its logical page), every tail
 // entry past the physical pages names a record its slot holds, and the free ids are the rest, each once
 inline void rt_check(const RtTier& t, const char* where)
@@ -260,15 +263,18 @@ inline void rt_end(RtTier& t, int q, cudaStream_t st)
     s = RtTier::Seq{};
     rt_check(t, "end");
 }
-// release: slot q starts a run (list: its pages, to find it by; window: the local pages its tail cycles through), its
-// tail pages past L unmapped (-1). The caller then writes its tables. Between steps.
-inline void rt_begin(RtTier& t, int q, const std::vector<int>& window, const std::vector<int>& list, cudaStream_t st)
+// release: slot q starts a run (list: its pages, to find it by; window: the local pages its tail cycles through; L: its
+// first released position, the R it was granted at), its tail pages past L unmapped (-1). The caller then writes its
+// tables. Between steps.
+inline void rt_begin(RtTier& t, int q, const std::vector<int>& window, const std::vector<int>& list, int L, cudaStream_t st)
 {
     rt_end(t, q, st);
     if ((int)window.size() < t.local) die("GR8_RT_LOCAL: slot " + std::to_string(q) + " has " + std::to_string(window.size()) + " window pages, wants " + std::to_string(t.local));
     RtTier::Seq& s = t.seq[q];
+    if (L < 64 || L > t.L || L % 64) die("GR8_RT_LOCAL: slot " + std::to_string(q) + " at L " + std::to_string(L) + ", want 64..GR8_RT_L");
     s.on = true;
     s.list = list;
+    s.L = L;
     s.window = (int)window.size();
     s.win = window;
     s.tail.assign(t.tsize, -1);
@@ -350,9 +356,9 @@ inline void rt_trim(Model& m, RtTier& t, int q, int skip, cudaStream_t st)
     G6RT_CK(cudaStreamSynchronize(st));
     const int first = skip / 64;
     std::vector<int> drop;
-    for (int lp = std::max(first, t.L / 64); lp < t.tsize; ++lp)
+    for (int lp = std::max(first, s.L / 64); lp < t.tsize; ++lp)
     {
-        if (!rt_mine(t, lp)) continue;
+        if (!rt_mine(t, s, lp)) continue;
         const int e = s.tail[lp];
         const bool keep = lp == first && skip % 64;   // rows below skip on this page stay
         if (e >= t.pages)
@@ -407,9 +413,9 @@ inline void rt_ensure(Model& m, RtTier& t, int q, int end, cudaStream_t st)
     RtTier::Seq& s = t.seq[q];
     if (!s.on) return;
     bool any = false;
-    for (int lp = t.L / 64; lp < std::min((end + 63) / 64, t.tsize); ++lp)
+    for (int lp = s.L / 64; lp < std::min((end + 63) / 64, t.tsize); ++lp)
     {
-        if (!rt_mine(t, lp) || s.tail[lp] != -1) continue;
+        if (!rt_mine(t, s, lp) || s.tail[lp] != -1) continue;
         if (s.pfree.empty())
             die("GR8_RT_LOCAL: rank " + std::to_string(t.rank) + " slot " + std::to_string(q) + " needs a page for logical page " + std::to_string(lp) +
                 " and all " + std::to_string(s.window) + " window pages hold rows not yet whole (raise GR8_RT_LOCAL)");
@@ -559,9 +565,9 @@ inline RtSpillSeen rt_release(Model& m, RtTier& t, int q, int committed, cudaStr
     const int end = std::min(committed / 64, t.tsize);
     std::vector<uint8_t> buf;
     std::vector<int> freed;
-    for (int lp = t.L / 64; lp < end; ++lp)
+    for (int lp = s.L / 64; lp < end; ++lp)
     {
-        if (!rt_mine(t, lp)) continue;
+        if (!rt_mine(t, s, lp)) continue;
         ++seen.pages;
         const int p = s.tail[lp];
         if (p >= t.pages) { ++seen.owned; continue; }
@@ -723,8 +729,8 @@ inline std::unique_ptr<RtTier> rt_build(Model& m, const std::string& spec, const
     t->pages = m.layers[0].ab.args.page_count;
     t->tsize = m.layers[0].ab.args.table_size;
     if (local && ids > 0) t->V = ids;
-    else if (local)
-        for (int lp = L / 64; lp < t->tsize; ++lp) t->V += lp % t->nr == m.rank;
+    else if (local)   // from the smallest L a session may take (GR8_CP_R2)
+        for (int lp = (m.cp.R2 ? m.cp.R2 : L) / 64; lp < t->tsize; ++lp) t->V += lp % t->nr == m.rank;
     for (int i = 0; i < m.nl; ++i)
     {
         const G6Attn& a = m.layers[i].ab.args;

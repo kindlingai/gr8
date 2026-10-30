@@ -1814,6 +1814,8 @@ __global__ void __launch_bounds__(CP_BACK_THREADS) k_cp_pf_back(const char* pool
     if (t == 8) reinterpret_cast<float*>(dp + ps * 128)[off] = reinterpret_cast<const float*>(sp + ps * 128)[off];
 }
 static_assert(CP_KVB / 16 + 9 <= CP_BACK_THREADS, "k_cp_pf_back: one thread per 16 B of a row and its index key");
+// the R of the session whose prefill runs: its pages below it are replicated, the rest staged by owner
+inline int cp_pf_R(const Model& m) { return m.cp.pf_R ? m.cp.pf_R : m.cp.R; }
 inline size_t cp_pf_mla_bytes(const Model& m)
 {
     const G6Attn& a = m.layers[0].ab.args;
@@ -1906,7 +1908,7 @@ inline void cp_pf_gather(Model& m, const CpPfSrc& s, int i, int start, cudaStrea
 {
     const G6Attn& a = m.cp.pf_saved[i];
     const int np = (start + a.page_size - 1) / a.page_size;
-    if (np) k_cp_pf_gather<<<np, 256, 0, st>>>(s, m.cp.pf_pool[cp_pf_k(m, i)], g6nr::NR, m.rank, m.cp.R / a.page_size, a.page_size, m.f.error, cp_pf_ixoff(m, i));
+    if (np) k_cp_pf_gather<<<np, 256, 0, st>>>(s, m.cp.pf_pool[cp_pf_k(m, i)], g6nr::NR, m.rank, cp_pf_R(m) / a.page_size, a.page_size, m.f.error, cp_pf_ixoff(m, i));
 }
 // rows a0 .. a0 + n - 1 of layer i: pool -> this rank's store (pages it stores)
 inline void cp_pf_back(Model& m, int i, int a0, int n, cudaStream_t st)
@@ -2069,7 +2071,7 @@ inline unsigned long long cp_pf_mismatches(Model& m)
 inline void cp_pf_fill_local(Model& m, int i, int start, unsigned* err, cudaStream_t st)
 {
     const G6Attn& a = m.cp.pf_saved[i];
-    const int k = cp_pf_k(m, i), ps = a.page_size, Rp = m.cp.R / ps, np = (start + ps - 1) / ps, nr = g6nr::NR;
+    const int k = cp_pf_k(m, i), ps = a.page_size, Rp = cp_pf_R(m) / ps, np = (start + ps - 1) / ps, nr = g6nr::NR;
     const size_t ixoff = cp_pf_ixoff(m, i);
     if (np) k_cp_pf_fill<<<np, 256, 0, st>>>((const char*)a.mla_cache, a.block_table, m.cp.pf_pool[k], nr, m.rank, Rp, ps, err,
                                              (const char*)a.index_cache, ixoff, a.page_count);
@@ -2080,7 +2082,7 @@ inline void cp_pf_begin(Model& m, int i, int start, cudaStream_t st)
 {
     CpPfNet& n = cp_pf_net(m);
     const G6Attn& a = m.cp.pf_saved[i];
-    const int k = cp_pf_k(m, i), ps = a.page_size, Rp = m.cp.R / ps, np = (start + ps - 1) / ps, nr = g6nr::NR;
+    const int k = cp_pf_k(m, i), ps = a.page_size, Rp = cp_pf_R(m) / ps, np = (start + ps - 1) / ps, nr = g6nr::NR;
     const unsigned long long g = m.cp.pf_g0 + i;
     G6RT_CK(cudaStreamWaitEvent(st, n.done[k], 0));    // my previous use of pool k (g - 2) is over (both lanes)
     const size_t ixoff = cp_pf_ixoff(m, i);
@@ -2134,7 +2136,7 @@ inline void cp_pf_wait(Model& m, int i, int start, cudaStream_t st)
     if (n.verify)
     {
         const G6Attn& a = m.cp.pf_saved[i];
-        const int ps = a.page_size, Rp = m.cp.R / ps, np = (start + ps - 1) / ps;
+        const int ps = a.page_size, Rp = cp_pf_R(m) / ps, np = (start + ps - 1) / ps;
         const size_t ixoff = cp_pf_ixoff(m, i);
         unsigned long long* h = n.vcount + 1 + k * CP_PF_MAXNR;
         k_cp_pf_zero<<<1, 32, 0, st>>>(h, CP_PF_MAXNR);

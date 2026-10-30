@@ -257,6 +257,11 @@ struct CpState
 {
     bool on = false;
     int R = 0, s3 = 1;                // s3: GR8_CP_S3 (1 = head-group overlap order, 0 = S1 order; same arithmetic)
+    // GR8_CP_R2: the smaller R a session may take (0 = none). R stays the bindings' layout; a session at R2 has R2 / 64
+    // prefix pages in its own table. Steps switch to the CP block past step_R() for every session
+    int R2 = 0;
+    int step_R() const { return R2 ? R2 : R; }
+    int pf_R = 0;                     // the R of the session whose prefill quantum runs (0 = R): which pages it stages
     g6::CpColls colls;                // numbering + capacities (colls.mmax >= any M of a CP step)
     std::vector<g6::VSlotDev> vs;     // [colls.ncoll()]
     unsigned* tickets = nullptr;      // [colls.ncoll()] publish tickets, device, zero
@@ -644,7 +649,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         const int b = (int)knob::dec_bk();
         int cp_r = 0;
 #if defined(G6_CP) && G6_CP
-        if (m.cp.on) cp_r = m.cp.R;
+        if (m.cp.on) cp_r = m.cp.step_R();
 #endif
         m.nbk = context_buckets(m.bk, b, capacity, cp_r, NBK - 2);   // a power-of-two R: the 8-slot list of before
     }
@@ -847,6 +852,8 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         }
         fprintf(stderr, "# rank %d: GR8_CP on, R %d, %s order, %d CP collectives (mmax %d)%s\n", rank, m.cp.R, m.cp.s3 ? "S3" : "S1",
                 m.cp.colls.ncoll(), m.cp.colls.mmax, m.cp.one ? ", one chain over the remote head groups (GR8_CP_ONECHAIN)" : "");
+        if (m.cp.R2 && rank == 0)
+            fprintf(stderr, "# rank 0: GR8_CP_R2 %d: a session may take R %d, and every step past it runs the CP block\n", m.cp.R2, m.cp.R2);
         if (m.cp.one && rank == 0)
             fprintf(stderr, "# rank 0: GR8_CP_ONECHAIN: %d rows, %.1f MB (gathered q + scratch)\n", m.cp.one_rows,
                     ((double)m.cp.one_rows * (NR - 1) * H * 576 * 4 + m.cp.one_bytes) / 1e6);
@@ -1304,7 +1311,7 @@ inline void launch_layer_in(Model& m, int i, const Layer& y, const bind::Layer& 
 }
 
 #if defined(G6_CP) && G6_CP
-inline bool cp_active(const Model& m, int context) { return m.cp.on && (m.graph ? m.bk[m.cur] : context) > m.cp.R; }
+inline bool cp_active(const Model& m, int context) { return m.cp.on && (m.graph ? m.bk[m.cur] : context) > m.cp.step_R(); }
 // the step takes the CP block. S2 below R: when its bucket is past R (a split run past R among its sessions,
 // s2_cp_step), on the CP batch views; m.cur is not the S2 step's bucket (S2Model::bucket), so cp_active does not apply
 inline bool cp_block(const Model& m, int context)
