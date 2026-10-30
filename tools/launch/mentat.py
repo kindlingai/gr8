@@ -394,10 +394,12 @@ def member_rails(snap, node_ids, names=None):
     direct cable to another box beside its switch port) takes the local box's pair on one physical port whose two
     addresses each reach exactly one address of every other member in the local mentat's probe table, and the
     addresses that pair reaches. When more than one port qualifies (two boxes sharing both the switch and a direct
-    cable), the pair with the lowest address, counting both ends, wins; every member sees the same addresses, so every
-    member picks the same pair. None until the probes settle that. A box that is not a member, or a snapshot without
-    interface names, gives each member its two lowest addresses. Raises RuntimeError for a member with fewer than two,
-    named by names ({node_id: LAN address}) where given."""
+    cable), the pair with the lowest address, counting both ends, wins. Each box decides from its own probe table, and
+    two tables can disagree during a boot, so the supervisor uses the head's answer for every rank. None until the
+    probes settle that. Where the interface names carry no PCI domain, the two lowest addresses that qualify are the
+    pair. A box that is not a member, or a snapshot without interface names, gives each member its two lowest
+    addresses. Raises RuntimeError for a member with fewer than two, named by names ({node_id: LAN address}) where
+    given."""
     rails = {n: rails_of(snap, n) for n in node_ids}
     for n, r in rails.items():
         if len(r) < 2:
@@ -418,7 +420,11 @@ def member_rails(snap, node_ids, names=None):
     ip = ipaddress.ip_address
     pairs = [sorted(v, key=ip) for v in ports.values() if len(v) == 2]
     if not pairs:
-        return None
+        found = sorted((a for v in ports.values() for a in v), key=ip)
+        # names without a PCI domain (not enP<n>...) cannot show a port's two roots: the two lowest that qualify
+        if len(found) < 2 or any(re.match(r'en(P\d+)', ifaces[a]) for a in found):
+            return None
+        pairs = [found[:2]]
     mine = min(pairs, key=lambda v: min(ip(x) for a in v for x in [a] + [table[a][n][0] for n in others]))
     return {me: tuple(mine), **{n: tuple(table[a][n][0] for a in mine) for n in others}}
 

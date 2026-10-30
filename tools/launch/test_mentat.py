@@ -2,6 +2,7 @@
 """The mentat side, against a fake daemon that speaks the framing of mentat's PROTOCOL.md: membership, the election,
 the rails, and the agent link with meta updates. No mentatd needed.
     python3 -m unittest discover -s tools/launch"""
+import copy
 import ipaddress
 import http.server
 import json
@@ -157,6 +158,10 @@ class MembershipTests(unittest.TestCase):
                                          '10.110.0.0': {'10.110.0.1': ok}, '10.111.0.0': {'10.111.0.1': ok}}
         self.assertEqual(M.member_rails(snap, ['n1', 'n2', 'n3']),
                          {'n1': ('10.1.0.1', '10.2.0.1'), 'n2': ('10.1.0.2', '10.2.0.2'), 'n3': ('10.1.0.3', '10.2.0.3')})
+        # interface names without a PCI domain: the two lowest addresses that reach every member
+        other = dict(copy.deepcopy(snap), addr_ifaces={'10.1.0.1': 'ens1f1np1', '10.2.0.1': 'ens2f1np1',
+                                                       '10.110.0.0': 'ens1f0np0', '10.111.0.0': 'ens2f0np0'})
+        self.assertEqual(M.member_rails(other, ['n1', 'n3'])['n1'], ('10.1.0.1', '10.2.0.1'))
         # two boxes that share the switch and a direct cable: both ports qualify, the lowest address wins
         self.assertEqual(M.member_rails(snap, ['n1', 'n3']),
                          {'n1': ('10.1.0.1', '10.2.0.1'), 'n3': ('10.1.0.3', '10.2.0.3')})
