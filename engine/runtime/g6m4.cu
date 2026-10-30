@@ -2081,6 +2081,16 @@ int main(int argc, char** argv)
                     return pool.window_runs(0) < big && pool.fits(rows, worst, 0) ? 0 : (uint32_t)cp_R2;
                 };
                 if (R == 0) fprintf(stderr, "# rank 0: GR8_CP_R2 %d: up to %u sessions past it run at GR8_CP_R %d, the rest at %d\n", cp_R2, big, cp_R, cp_R2);
+                // a request that does not fit: a decoding session at GR8_CP_R takes GR8_CP_R2, and its pages between the two Rs
+                // below place go back to the pool (s2/pool.h shrink, the engine's half below)
+                h.pool.make_room = [&](const std::array<g6s2::Slot, g6s2::MAX_SESSIONS>& slots, const g6s2::Request&, uint64_t, uint64_t)
+                    -> std::optional<g6s2::Shrink> {
+                    for (const g6s2::Slot& sl : slots)
+                        if (sl.phase == g6s2::Phase::Decode && !sl.req.r_rows && pool.shrinkable(sl.run, (uint32_t)cp_R2))
+                            return g6s2::Shrink{sl.key, (uint32_t)cp_R2, pool.shrink(sl.run, (uint32_t)cp_R2)};
+                    return std::nullopt;
+                };
+                h.pool.shrink = [&](const g6s2::Run& r, uint32_t r2) { return pool.shrink(r, r2); };
             }
             if (kvt)
             {
@@ -2111,7 +2121,10 @@ int main(int argc, char** argv)
                     const bool ex = pool.exclusive_run(g.run);
                     const std::vector<int> l = ex ? pool.list(g.run) : std::vector<int>{};
                     const std::vector<int> win = ex ? std::vector<int>(l.begin() + rp, l.begin() + rp + rtt->local) : std::vector<int>{};
-                    const int pk = ex && g.reuse ? rt_parked(*rtt, win) : -1;
+                    // only a hit on a run the pool retained brings records, at the grant's own R: a stored hit restores a
+                    // prefix, and a fresh grant can land on the window pages of a parked run the pool already let go
+                    int pk = ex && g.reuse && !g.restored ? rt_parked(*rtt, win) : -1;
+                    if (pk >= 0 && rtt->seq[pk].L != rp * 64) pk = -1;
                     if (pk != q) rt_end(*rtt, q, st);
                     // the runs the pool let go (evicted, or adopted only in part below R) free their records first. The
                     // head's take already moved this grant's run out of the kept list, so its entry stays.
@@ -2166,6 +2179,29 @@ int main(int argc, char** argv)
             };
             // a run grew between rounds (every rank, same order): the new pages, cleared as a new run's are, into slot q's
             // table, and into the layers' own tables when q runs alone on today's path
+            // a session takes GR8_CP_R2 (every rank at the commit, before the bind that may take its pages): the drafter's
+            // rows of the pages between the two Rs into its fresh pages above place, this rank's main pages of them into the
+            // rows store, then the tables
+            h.shrink = [&](const g6s2::Shrink& k, const g6s2::Run&, uint64_t length) {
+                kv_drain();   // retained runs the shrink evicted, out first
+                if (!rtt || !rtt->local) die("a shrink without GR8_RT_LOCAL");
+                rt_gc(*rtt, [&](const std::vector<int>& l) { return pool.is_kept(l); }, st);
+                const int q = (int)k.key.slot, rp = (int)k.r_rows / 64, was_rp = m.s2->rp[q], win = rtt->local;
+                const std::vector<int> was = m.s2->run[q], list = pool.list(k.run);
+                const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
+                std::vector<std::pair<int, int>> moves;
+                for (int lp = rp; lp < was_rp; ++lp) moves.push_back({was[lp], list[rp + win + (lp - rp)]});
+                s2_copy_pages(D.d, moves, most, st);
+                rt_shrink(m, *rtt, q, was, list, (int)k.r_rows, (int)length - 1, st);
+                for (Model* x : {&m, &D.d}) s2_set_exclusive(*x, q, list, most, rp);
+                if (rt_layers == q)   // it runs alone: the layers' tables hold its run
+                {
+                    s2_solo_cp_pages(m, list, most, rp);
+                    s2_solo_cp_pages(D.d, list, most, rp);
+                }
+                G6RT_CK(cudaStreamSynchronize(st));
+                if (R == 0) fprintf(stderr, "# rank 0: GR8_CP_R2: slot %d takes R %u, %d prefix pages back below place\n", q, k.r_rows, was_rp - rp);
+            };
             h.grown = [&](unsigned q, const g6s2::Run& r) {
                 kv_drain();   // runs the growth evicted, out before the zeroing below
                 if (rtt && rtt->local) rt_gc(*rtt, [&](const std::vector<int>& l) { return pool.is_kept(l); }, st);

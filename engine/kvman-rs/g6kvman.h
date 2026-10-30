@@ -227,6 +227,10 @@ int g6kv_window(g6kv_pool* p, uint32_t pages, uint32_t ids, uint32_t runs);
 uint32_t g6kv_window_runs(const g6kv_pool* p);
 // (pool) the window runs live now at R = r rows (0 = the pool's R)
 uint32_t g6kv_window_runs_r(const g6kv_pool* p, uint32_t r);
+// (pool) a live window run takes the smaller R = r2 rows: its pages between the Rs leave its prefix and join its tail
+// (fresh pages above place hold the drafter's copy of them). shrinkable: whether it can (a larger R now, and room)
+int g6kv_shrinkable(const g6kv_pool* p, const g6kv_run* r, uint32_t r2);
+int g6kv_shrink_run(g6kv_pool* p, const g6kv_run* r, uint32_t r2, g6kv_run* out);
 // (pool) whether a retained run holds exactly these pages (a window run's records live while it does)
 int g6kv_is_kept(const g6kv_pool* p, const uint32_t* pages, size_t n);
 // (pool) a window request of `worst` rows with a record limit: 1 and {records per rank it needs, free, in all} in out

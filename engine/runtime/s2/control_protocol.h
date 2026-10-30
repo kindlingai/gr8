@@ -45,7 +45,8 @@ inline void match(const EventCommit& e){
     if(e.commit.admit) require(e.notice.kind==EventKind::Admit && e.commit.admit->req.id==e.notice.request,"grant does not match announced request");
     require(!e.commit.hold || e.commit.admit,"a held boundary needs a grant");
     require((e.notice.kind==EventKind::Resize)==e.commit.resize.has_value(),"a resize commit needs a RESIZE notice and back");
-    if(e.commit.resize) require(!e.commit.admit && !e.commit.cancel && !e.commit.hold,"a resize commit changes nothing else");
+    if(e.commit.resize) require(!e.commit.admit && !e.commit.cancel && !e.commit.hold && !e.commit.shrink,"a resize commit changes nothing else");
+    if(e.commit.shrink) require(e.notice.kind==EventKind::Admit,"a shrink comes with an admission");
 }
 inline std::vector<uint8_t> encode(const EventCommit& x){
     match(x);Encoder e(Tag::Commit);e.notice(x.notice);const auto& c=x.commit;
@@ -53,6 +54,7 @@ inline std::vector<uint8_t> encode(const EventCommit& x){
     e.u64(c.admit.has_value());if(c.admit){const auto&g=*c.admit;e.key(g.key);e.u64(g.req.id);e.u64(g.req.prompt_tokens);e.u64(g.req.max_tokens);e.steering(g.req.steering);e.u64(g.run.first_page);e.u64(g.run.pages);e.u64(g.run.table_version);e.u64(g.run.list_hash);e.u64(g.reuse);e.u64(g.restored);e.u64(g.counted);e.u64(g.req.r_rows);}
     e.u64(c.hold);
     e.u64(c.resize.has_value());if(c.resize){e.u64(c.resize->tier);e.u64(c.resize->segs);e.u64(c.resize->slots);e.u64(c.resize->txn);}
+    e.u64(c.shrink.has_value());if(c.shrink){const auto&k=*c.shrink;e.key(k.key);e.u64(k.r_rows);e.u64(k.run.first_page);e.u64(k.run.pages);e.u64(k.run.table_version);e.u64(k.run.list_hash);}
     return e.b;
 }
 inline Notice decode_notice(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Notice,"expected notice");auto n=d.notice();d.end();return n;}
@@ -64,6 +66,7 @@ inline EventCommit decode_commit(const std::vector<uint8_t>& b){
     has=d.u64();require(has<=1,"invalid optional grant");if(has){Grant g;g.key=d.key();g.req.id=d.u64();g.req.prompt_tokens=d.u32();g.req.max_tokens=d.u32();g.req.steering=d.steering();g.run.first_page=d.u32();g.run.pages=d.u32();g.run.table_version=d.u32();g.run.list_hash=d.u64();g.reuse=d.u32();g.restored=d.u32();g.counted=d.u32();g.req.r_rows=d.u32();require(!g.restored||g.reuse,"invalid restored grant");require(g.req.r_rows%PAGE==0,"invalid grant R");c.admit=g;}
     has=d.u64();require(has<=1,"invalid hold flag");c.hold=has!=0;
     has=d.u64();require(has<=1,"invalid optional resize");if(has){Resize r;r.tier=d.u32();r.segs=d.u64();r.slots=d.u64();r.txn=d.u64();c.resize=r;}
+    has=d.u64();require(has<=1,"invalid optional shrink");if(has){Shrink k;k.key=d.key();k.r_rows=d.u32();k.run.first_page=d.u32();k.run.pages=d.u32();k.run.table_version=d.u32();k.run.list_hash=d.u64();require(k.r_rows&&k.r_rows%PAGE==0,"invalid shrink R");c.shrink=k;}
     match(e);
     d.end();return e;
 }

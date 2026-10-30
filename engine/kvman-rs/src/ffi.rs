@@ -697,6 +697,33 @@ pub unsafe extern "C" fn g6kv_window_runs_r(p: *const Pool, r: u32) -> u32 {
     (*p).window_runs_r(r)
 }
 
+/// Whether live window run `*r` can shrink to R = r2 rows (Pool::shrinkable).
+///
+/// # Safety
+/// As g6kv_exclusive, and `r` must be valid for a read.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_shrinkable(p: *const Pool, r: *const Run, r2: u32) -> i32 {
+    (!r.is_null() && (*p).shrinkable(&*r, r2)) as i32
+}
+
+/// Live window run `*r` takes R = r2 rows (Pool::shrink_run); the run it becomes in `*out`.
+///
+/// # Safety
+/// As g6kv_exclusive. `r` must be valid for a read, `out` for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_shrink_run(p: *mut Pool, r: *const Run, r2: u32, out: *mut Run) -> i32 {
+    if r.is_null() || out.is_null() {
+        return Error::BadArgument.code();
+    }
+    match (*p).shrink_run(&*r, r2) {
+        Ok(x) => {
+            *out = x;
+            0
+        }
+        Err(e) => e.code(),
+    }
+}
+
 /// For a window request of `worst` rows past R with a lease limit: 1 and {records its tail needs per rank, records
 /// free, records in all} in out[0..3]; 0 otherwise.
 ///

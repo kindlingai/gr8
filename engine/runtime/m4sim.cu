@@ -624,7 +624,8 @@ int main(int argc, char** argv)
         R[r].wide = wide;
 #if defined(G6_CP) && G6_CP
         R[r].cp.on = cp_on; R[r].cp.R = cp_R; R[r].cp.R2 = cp_R2; R[r].cp.s3 = cp_s3; R[r].cp.colls = cp_colls;
-        R[r].cp.pf_R = cp_R2;   // only GR8_TEST_S2_XLIST's sequences take GR8_CP_R2, and they are every prefill
+        // only GR8_TEST_S2_XLIST's sequences take GR8_CP_R2, and they are every prefill (GR8_TEST_S2_SHRINK_AT: after it)
+        R[r].cp.pf_R = knob::test_s2_shrink_at() ? 0 : cp_R2;
 #endif
 #ifdef DEC_S2
         if (s2mode && s2_below) R[r].s2_below = s2_below;       // CP: S2 below R on the CP binding as built
@@ -706,8 +707,10 @@ int main(int argc, char** argv)
     int rt_q = 0;                       // release: the slot the sequence's records are in (GR8_TEST_RT_ADOPT_SLOT moves them)
     // one sequence on the layers' own tables (the CP map as built, or GR8_TEST_S2_XLIST's): read them before each spill.
     // Rows below `committed` are written; the next step or chunk writes rows below `end` (release: their local pages)
+    std::function<void(int committed)> rt_shrink_at;   // GR8_TEST_S2_SHRINK_AT (set with the xlist gate below)
     auto rt_spill_all = [&](int committed, int end) {
         if (!rt[0]) return;
+        if (rt_shrink_at) rt_shrink_at(committed);
         for (Model& m : R)
         {
             std::vector<int> map(m.layers[0].ab.args.table_size);
@@ -812,6 +815,11 @@ int main(int argc, char** argv)
     int pf_base = 0;
     int pf_xlist = 0;            // GR8_TEST_S2_XLIST: the shuffled two-class list every sequence runs on (past R)
     std::vector<int> pf_xlist_pages;
+    // GR8_TEST_S2_SHRINK_AT: the run's list and R now, whether it shrank this sequence, and the drafter's pages it takes
+    const int shrink_at = (int)knob::test_s2_shrink_at().value_or(0);
+    std::vector<int> xl_now, xl_spare;
+    int xl_rp = 0;
+    bool xl_shrunk = false;
 #if defined(DEC_S2) && defined(G6_CP) && G6_CP
     int pf_pages = 0;
     if (const auto& e = knob::test_s2_pfbase())
@@ -864,7 +872,7 @@ int main(int argc, char** argv)
         int place = R[0].s2->pool_pages, most = DR[0].d.s2->pool_pages;
         for (const Model& m : R) place = std::min(place, m.s2->pool_pages);
         for (const Draft& D : DR) most = std::max(most, D.d.s2->pool_pages);
-        const int rp = (cp_R2 ? cp_R2 : cp_R) / 64;   // the run's R
+        const int rp = (cp_R2 && !shrink_at ? cp_R2 : cp_R) / 64;   // the run's R (with GR8_TEST_S2_SHRINK_AT, until the shrink)
         const int n = v.size() > 1 ? v[1] : std::min(most, rp + (place - rp) * g6nr::NR);
         // GR8_RT_LOCAL: the release layout (s2.cuh S2Model::rt_window): the prefix, the window, then the drafter's whole tail
         const int win = rt[0] ? rt[0]->local : 0;
@@ -890,6 +898,7 @@ int main(int argc, char** argv)
                           hi = shuffle(s2_run_list(place, most - place), (uint64_t)pf_xlist * 0x9E3779B97F4A7C15ull + 0x517CC1B727220A95ull);
         pf_xlist_pages.insert(pf_xlist_pages.end(), low.begin(), low.begin() + (rp + shard));
         pf_xlist_pages.insert(pf_xlist_pages.end(), hi.begin(), hi.begin() + high);
+        xl_spare.assign(hi.begin() + high, hi.end());   // the drafter's pages a shrink takes
         if (knob::test_s2_pfpoison())
         {
             auto poison = [&](Model& m) {
@@ -915,6 +924,33 @@ int main(int argc, char** argv)
         }
         for (Model& m : R) s2_solo_cp_pages(m, pf_xlist_pages, most, rp);
         for (Draft& D : DR) s2_solo_cp_pages(D.d, pf_xlist_pages, most, rp);
+        xl_now = pf_xlist_pages; xl_rp = rp;
+        // GR8_TEST_S2_SHRINK_AT: the run takes GR8_CP_R2 as g6m4's shrink hook does it (the drafter's rows of the pages
+        // between the Rs into spare pages above place, each rank's main pages of them into the rows store, the tables)
+        if (shrink_at)
+        {
+            const int rp2 = cp_R2 / 64;
+            if (!cp_R2 || !win || shrink_at <= cp_R2) die("GR8_TEST_S2_SHRINK_AT: needs GR8_CP_R2, GR8_RT_LOCAL and a position past GR8_CP_R2");
+            if ((int)xl_spare.size() < rp - rp2) die("GR8_TEST_S2_SHRINK_AT: no room above place for the drafter's pages");
+            rt_shrink_at = [&, rp2, win, most](int committed) {
+                if (xl_shrunk || committed < shrink_at) return;
+                const std::vector<int> was = xl_now;
+                std::vector<int> list(was.begin(), was.begin() + rp2);
+                list.insert(list.end(), was.begin() + xl_rp, was.begin() + xl_rp + win);
+                list.insert(list.end(), xl_spare.begin(), xl_spare.begin() + (xl_rp - rp2));
+                list.insert(list.end(), was.begin() + xl_rp + win, was.end());
+                std::vector<std::pair<int, int>> moves;
+                for (int lp = rp2; lp < xl_rp; ++lp) moves.push_back({was[lp], list[rp2 + win + (lp - rp2)]});
+                G6RT_CK(cudaStreamSynchronize(st));
+                for (Draft& D : DR) s2_copy_pages(D.d, moves, most, st);
+                xl_now = list; xl_rp = rp2; xl_shrunk = true;
+                for (Model& m : R) rt_shrink(m, *rt[m.rank], rt_q, was, list, cp_R2, committed, st);
+                for (Model& m : R) s2_solo_cp_pages(m, list, most, rp2);
+                for (Draft& D : DR) s2_solo_cp_pages(D.d, list, most, rp2);
+                G6RT_CK(cudaStreamSynchronize(st));
+                fprintf(stderr, "# s2 xlist gate: the run takes R %d at row %d\n", cp_R2, committed);
+            };
+        }
         G6RT_CK(cudaStreamSynchronize(st));
         fprintf(stderr, "# s2 xlist gate: every sequence past R on %zu shuffled pages (prefix %d + %s %d below place %d, %d above)%s\n",
                 pf_xlist_pages.size(), rp, win ? "window" : "shard", shard, place, high, knob::test_s2_pfpoison() ? ", caches poisoned 0x3c" : "");
@@ -940,10 +976,12 @@ int main(int argc, char** argv)
 #ifdef DEC_S2
             if (pf_xlist)
             {
-                const int rp = (cp_R2 ? cp_R2 : cp_R) / 64, most = std::max(R[0].s2->pool_pages, DR.empty() ? 0 : DR[0].d.s2->pool_pages);
+                const int rp = (cp_R2 && !shrink_at ? cp_R2 : cp_R) / 64, most = std::max(R[0].s2->pool_pages, DR.empty() ? 0 : DR[0].d.s2->pool_pages);
                 rt_begin(t, 0, std::vector<int>(pf_xlist_pages.begin() + rp, pf_xlist_pages.begin() + rp + t.local), pf_xlist_pages, rp * 64, st);
+                xl_now = pf_xlist_pages; xl_rp = rp; xl_shrunk = false;
                 Model* mm = &m;
-                t.write = [this_list = &pf_xlist_pages, mm, most, rp](int) { s2_solo_cp_pages(*mm, *this_list, most, rp); };
+                t.write = [&xl_now, &xl_rp, mm, most](int) { s2_solo_cp_pages(*mm, xl_now, most, xl_rp); };
+                if (m.rank == 0) for (Draft& D : DR) s2_solo_cp_pages(D.d, pf_xlist_pages, most, rp);   // a shrink's drafter map goes
                 t.write(0);
                 continue;
             }

@@ -1007,6 +1007,55 @@ impl Pool {
         Ok(Some(g))
     }
 
+    /// Whether live window run r can shrink to R = r2 rows (shrink_run): it holds a larger R, and the drafter's class
+    /// and every rank's records have room for the tail it gains.
+    pub fn shrinkable(&self, r: &Run, r2: u32) -> bool {
+        let Ok(h) = self.held(r) else { return false };
+        let Some(rp) = self.rp_of(r2) else { return false };
+        if !h.exclusive || self.window == 0 || rp >= h.rp as u64 || self.exclusive {
+            return false;
+        }
+        let d = h.rp as u64 - rp;
+        let tail = h.list.len() as u64 - h.rp as u64 - self.window as u64;
+        let gained = (tail + d).div_ceil(self.nr as u64) - self.ids_of(h);
+        d <= self.hi_free() as u64 && self.ids_room().is_none_or(|f| gained <= f)
+    }
+
+    /// Live window run r takes R = r2 rows: its logical pages between the two Rs leave its prefix and join its tail.
+    /// Its list becomes its first r2 / 64 pages, its window, fresh pages above place for the drafter's copy of those
+    /// pages (lowest first, evicting retained runs as reserve() does), then its old drafter tail. The pages below place
+    /// it no longer lists are free. The run keeps its table version and its worst case. Err(NoRoom) when shrinkable()
+    /// is false for it, Err(BadArgument) for an R the pool refuses.
+    pub fn shrink_run(&mut self, r: &Run, r2: u32) -> Result<Run, Error> {
+        self.pending()?;
+        let rp = self.rp_of(r2).ok_or(Error::BadArgument)?;
+        if !self.shrinkable(r, r2) {
+            return Err(Error::NoRoom);
+        }
+        let mut h = self.held.remove(&r.table_version).expect("shrinkable() found it");
+        let (old, w) = (h.rp as usize, self.window as usize);
+        let freed: Vec<u32> = h.list[rp as usize..old].to_vec();
+        self.mark(&freed, false);
+        let mut list: Vec<u32> = h.list[..rp as usize].iter().chain(&h.list[old..old + w]).copied().collect();
+        let mut gone = self.fill_range(&mut list, old - rp as usize, self.place, self.pages);
+        let fresh = list[rp as usize + w..].to_vec();
+        list.extend_from_slice(&h.list[old + w..]);
+        gone.extend(self.evict_for_ids(((list.len() - rp as usize - w) as u64).div_ceil(self.nr as u64)));
+        self.spill(&gone);
+        self.mark(&fresh, true);
+        h.list = list;
+        h.rp = rp as u32;
+        let g = Run {
+            first_page: h.list[0],
+            pages: h.list.len() as u32,
+            table_version: r.table_version,
+            list_hash: hash(&h.list, true),
+        };
+        self.log_claim("shrink", &g, rp * PAGE, &gone);
+        self.held.insert(r.table_version, h);
+        Ok(g)
+    }
+
     pub fn release(&mut self, r: &Run) -> Result<(), Error> {
         self.remove(r).map(|_| ())
     }

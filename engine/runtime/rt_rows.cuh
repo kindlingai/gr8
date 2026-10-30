@@ -596,6 +596,57 @@ inline RtSpillSeen rt_release(Model& m, RtTier& t, int q, int committed, cudaStr
     rt_check(t, "release");
     return seen;
 }
+// release, a session that takes a smaller R (s2/pool.h shrink): slot q's logical pages from L (its new first released
+// position) up to its old L leave its prefix. Of the ones this rank holds, from page was[lp] of its old list: a whole
+// page below `committed` (the rows written) goes to the store under a free id, as a release would; the page committed
+// falls inside moves to a window page; a later one stays unmapped until rt_ensure maps it. The slot's run is `list`
+// from now on. Between steps, before its tables change.
+inline void rt_shrink(Model& m, RtTier& t, int q, const std::vector<int>& was, const std::vector<int>& list, int L, int committed,
+                      cudaStream_t st)
+{
+    RtTier::Seq& s = t.seq[q];
+    if (!t.local || !s.on || L < 64 || L % 64 || L >= s.L) die("GR8_RT_LOCAL: slot " + std::to_string(q) + " cannot shrink to L " + std::to_string(L));
+    G6RT_CK(cudaStreamSynchronize(st));
+    std::vector<uint8_t> buf;
+    const int old = s.L;
+    s.L = L;
+    for (int lp = L / 64; lp < old / 64; ++lp)
+    {
+        if (!rt_mine(t, s, lp) || lp * 64 >= committed) continue;
+        if ((lp + 1) * 64 > committed)   // its rows are not all written: a window page holds it, as rt_ensure would
+        {
+            if (s.pfree.empty()) die("GR8_RT_LOCAL: slot " + std::to_string(q) + " has no window page for logical page " + std::to_string(lp));
+            const int p = s.pfree.back();
+            s.pfree.pop_back();
+            for (const Layer& y : m.layers)
+            {
+                const G6Attn& a = y.ab.args;
+                const size_t kv = 64 * g6kv::ROW, ix = 64 * g6kv::IDX_ROW;
+                G6RT_CK(cudaMemcpyAsync((uint8_t*)a.mla_cache + (size_t)p * kv, (const uint8_t*)a.mla_cache + (size_t)was[lp] * kv, kv,
+                                        cudaMemcpyDeviceToDevice, st));
+                if (a.index_cache)
+                    G6RT_CK(cudaMemcpyAsync((uint8_t*)a.index_cache + (size_t)p * ix, (const uint8_t*)a.index_cache + (size_t)was[lp] * ix, ix,
+                                            cudaMemcpyDeviceToDevice, st));
+            }
+            s.tail[lp] = p;
+            s.peak = std::max(s.peak, ++s.in_use);
+            t.peak = std::max(t.peak, s.peak);
+            continue;
+        }
+        if (t.vfree.empty()) die("GR8_RT_LOCAL: rank " + std::to_string(t.rank) + ": every id of the rows store is in use");
+        const int v = t.vfree.back();
+        t.vfree.pop_back();
+        rt_write_page(m, t, was[lp], v, buf, st);
+        G6RT_CK(cudaMemset(t.d_flag + t.pages + v, 1, 1));
+        t.owner[t.pages + v] = q;
+        t.vlp[v] = lp; t.vslot[v] = q;
+        s.tail[lp] = t.pages + v;
+        ++s.released; ++t.released;
+        t.spilled += 64;
+    }
+    s.list = list;
+    rt_check(t, "shrink");
+}
 __global__ void k_rt_selmark(const int* ids, size_t n, int lo, int hi, uint8_t* flag)
 {
     for (size_t k = (size_t)blockIdx.x * blockDim.x + threadIdx.x; k < n; k += (size_t)gridDim.x * blockDim.x)

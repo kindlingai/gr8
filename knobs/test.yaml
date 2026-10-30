@@ -317,6 +317,13 @@ knobs:
     doc: >-
       m4sim gate: seed[,pages] runs every sequence as one session past R on a shuffled page list of the pool's two
       classes. Stdout must equal the run without it.
+  GR8_TEST_S2_SHRINK_AT:
+    kind: int
+    unset: "unset"
+    doc: >-
+      m4sim gate, with GR8_TEST_S2_XLIST, GR8_CP_R2 and GR8_RT_LOCAL: each sequence starts at GR8_CP_R and takes
+      GR8_CP_R2 once its rows reach this position (past GR8_CP_R), as a session g6m4 shrinks. Stdout must equal the run
+      at GR8_CP_R2 from the start.
   GR8_TEST_SPARSE_MLA:
     kind: flag
     default: "0"
