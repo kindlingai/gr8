@@ -157,7 +157,7 @@ def local_nets():
 def kv_target(nodes, rails, rank=0, nets=None):
     """host:port of the KV node a box with these fabric addresses should use: the first node with an RDMA address on
     one of the rails' subnets, else the first node's LAN address (TCP). nets: {rail: its network}, as local_nets()
-    reads them; a rail without one is taken as a /24. Rank r tries rail r % 2 first, so the ranks split their
+    reads them. A rail without one is taken as a /24. Rank r tries rail r % 2 first, so the ranks split their
     traffic over both of the node's PCIe roots."""
     nets = nets or {}
     subnets = [nets.get(a) or ipaddress.ip_interface(f'{a}/24').network for a in rails if a]
