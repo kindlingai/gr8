@@ -148,6 +148,8 @@ class MembershipTests(unittest.TestCase):
         snap = snapshot({})
         # n1 and n3 share a direct cable (10.110/10.111) beside their switch ports (10.1/10.2)
         snap['addr_tags'].update({'10.110.0.0': ['rdma'], '10.111.0.0': ['rdma']})
+        snap['addr_ifaces'] = {'10.1.0.1': 'enp1s0f1np1', '10.2.0.1': 'enP2p1s0f1np1',
+                               '10.110.0.0': 'enp1s0f0np0', '10.111.0.0': 'enP2p1s0f0np0'}
         snap['peers']['n3']['addr_tags'].update({'10.110.0.1': ['rdma'], '10.111.0.1': ['rdma']})
         ok = {'ok': True}
         snap['peers']['n2']['probes'] = {'10.1.0.1': {'10.1.0.2': ok}, '10.2.0.1': {'10.2.0.2': ok}}
@@ -155,8 +157,17 @@ class MembershipTests(unittest.TestCase):
                                          '10.110.0.0': {'10.110.0.1': ok}, '10.111.0.0': {'10.111.0.1': ok}}
         self.assertEqual(M.member_rails(snap, ['n1', 'n2', 'n3']),
                          {'n1': ('10.1.0.1', '10.2.0.1'), 'n2': ('10.1.0.2', '10.2.0.2'), 'n3': ('10.1.0.3', '10.2.0.3')})
+        # two boxes that share the switch and a direct cable: both ports qualify, the lowest address wins
+        self.assertEqual(M.member_rails(snap, ['n1', 'n3']),
+                         {'n1': ('10.1.0.1', '10.2.0.1'), 'n3': ('10.1.0.3', '10.2.0.3')})
         del snap['peers']['n2']['probes']['10.2.0.1']       # not probed yet: wait
         self.assertIsNone(M.member_rails(snap, ['n1', 'n2', 'n3']))
+        self.assertEqual(M.reach_text(snap, ['n1', 'n2', 'n3']),
+                         '10.1.0.1 reaches 2 of 2 members; 10.2.0.1 reaches 1 of 2 members; '
+                         '10.110.0.0 reaches 1 of 2 members; 10.111.0.0 reaches 1 of 2 members')
+        # a pair is one physical port: half-probed, the switch port is out and the cable is the only pair
+        del snap['peers']['n3']['probes']['10.2.0.1']
+        self.assertEqual(M.member_rails(snap, ['n1', 'n3'])['n3'], ('10.110.0.1', '10.111.0.1'))
         # every member with two: those two, probes or not
         self.assertEqual(M.member_rails(snapshot({}), ['n1', 'n2'])['n2'], ('10.1.0.2', '10.2.0.2'))
         snap['peers']['n2']['addr_tags'] = {'10.0.0.2': ['lan'], '10.1.0.2': ['rdma']}
@@ -399,6 +410,9 @@ class KvTargetTests(unittest.TestCase):
                 '10.101.1.2': ipaddress.ip_network('10.101.0.0/16')}
         self.assertEqual(M.kv_target(wide, ('10.100.1.2', '10.101.1.2'), 1, nets), '10.101.200.3:7350')
         self.assertEqual(M.kv_target(wide, ('10.100.1.2', '10.101.1.2')), '192.0.2.10:7350')
+        # a malformed announcement is skipped, as the string compare did
+        bad = [('192.0.2.10', 7350, {'gr8.kv.rdma': 'not-an-address,10.100.200.3'})]
+        self.assertEqual(M.kv_target(bad, ('10.100.1.2', '10.101.1.2'), 0, nets), '10.100.200.3:7350')
 
 
 class DaemonTests(unittest.TestCase):

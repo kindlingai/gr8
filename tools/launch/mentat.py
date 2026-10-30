@@ -17,6 +17,7 @@ import ipaddress
 import itertools
 import json
 import os
+import re
 import select
 import socket
 import struct
@@ -164,8 +165,11 @@ def kv_target(nodes, rails, rank=0, nets=None):
     for net in subnets:
         for _, port, meta in nodes:
             for a in filter(None, (meta.get('gr8.kv.rdma') or '').split(',')):
-                if ipaddress.ip_address(a) in net:
-                    return f'{a}:{port}'
+                try:
+                    if ipaddress.ip_address(a) in net:
+                        return f'{a}:{port}'
+                except ValueError:
+                    continue    # a malformed announcement: not this node's RDMA address
     return f'{nodes[0][0]}:{nodes[0][1]}' if nodes else None
 
 
@@ -364,12 +368,36 @@ def rails_of(snap, node_id):
     return rdma_addrs(peer.get('addr_tags') or {})
 
 
+def reach(snap, node_ids):
+    """For each of the local box's rdma addresses, {node_id: [member addresses it reaches]} for every other member, from
+    the local mentat's probe table. Returns (table, others)."""
+    rails = {n: rails_of(snap, n) for n in node_ids}
+    others = [n for n in node_ids if n != snap.get('node_id')]
+    peers = snap.get('peers') or {}
+    table = {}
+    for a in rdma_addrs(snap.get('addr_tags') or {}):
+        table[a] = {}
+        for n in others:
+            probes = ((peers.get(n) or {}).get('probes') or {}).get(a) or {}
+            table[a][n] = [p for p in rails.get(n, []) if (probes.get(p) or {}).get('ok')]
+    return table, others
+
+
+def port_of(iface):
+    """One physical ConnectX port's netdevs share this: the name without its PCI domain (enp1s0f1np1 and
+    enP2p1s0f1np1 are one port seen from both roots). None for no name."""
+    return re.sub(r'^en(P\d+)?', 'en', iface) if iface else None
+
+
 def member_rails(snap, node_ids, names=None):
     """{node_id: (rail 0, rail 1)}: one rdma address per PCIe root for each member. A member with more than two (a
-    direct cable to another box beside its switch port) uses the pair on the fabric every member shares: the local
-    box's two addresses whose mentat probes reach exactly one address of every other member, and the addresses they
-    reach. None until the probes settle that. Raises RuntimeError for a member with fewer than two, named by names
-    ({node_id: LAN address}) where given."""
+    direct cable to another box beside its switch port) takes the local box's pair on one physical port whose two
+    addresses each reach exactly one address of every other member in the local mentat's probe table, and the
+    addresses that pair reaches. When more than one port qualifies (two boxes sharing both the switch and a direct
+    cable), the pair with the lowest address, counting both ends, wins; every member sees the same addresses, so every
+    member picks the same pair. None until the probes settle that. A box that is not a member, or a snapshot without
+    interface names, gives each member its two lowest addresses. Raises RuntimeError for a member with fewer than two,
+    named by names ({node_id: LAN address}) where given."""
     rails = {n: rails_of(snap, n) for n in node_ids}
     for n, r in rails.items():
         if len(r) < 2:
@@ -379,25 +407,27 @@ def member_rails(snap, node_ids, names=None):
     if all(len(r) == 2 for r in rails.values()):
         return {n: tuple(r) for n, r in rails.items()}
     me = snap.get('node_id')
-    others = [n for n in node_ids if n != me]
-    if me not in rails or not others:
-        return {n: tuple(r[:2]) for n, r in rails.items()}      # nobody to probe: the lowest two
-    peers = snap.get('peers') or {}
-    reach = {}
-    for a in rails[me]:
-        hit = {}
-        for n in others:
-            probes = ((peers.get(n) or {}).get('probes') or {}).get(a) or {}
-            ok = [p for p in rails[n] if (probes.get(p) or {}).get('ok')]
-            if len(ok) != 1:
-                break
-            hit[n] = ok[0]
-        else:
-            reach[a] = hit
-    if len(reach) != 2:
+    table, others = reach(snap, node_ids)
+    ifaces = snap.get('addr_ifaces') or {}
+    if me not in rails or not others or not any(ifaces.get(a) for a in table):
+        return {n: tuple(r[:2]) for n, r in rails.items()}
+    ports = {}
+    for a, hits in table.items():
+        if ifaces.get(a) and all(len(hits[n]) == 1 for n in others):
+            ports.setdefault(port_of(ifaces[a]), []).append(a)
+    ip = ipaddress.ip_address
+    pairs = [sorted(v, key=ip) for v in ports.values() if len(v) == 2]
+    if not pairs:
         return None
-    mine = sorted(reach, key=ipaddress.ip_address)
-    return {me: tuple(mine), **{n: tuple(reach[a][n] for a in mine) for n in others}}
+    mine = min(pairs, key=lambda v: min(ip(x) for a in v for x in [a] + [table[a][n][0] for n in others]))
+    return {me: tuple(mine), **{n: tuple(table[a][n][0] for a in mine) for n in others}}
+
+
+def reach_text(snap, node_ids):
+    """What the local probe table says each local rdma address reaches, for a log line."""
+    table, others = reach(snap, node_ids)
+    return '; '.join(f'{a} reaches {sum(1 for n in others if table[a][n])} of {len(others)} members'
+                     for a in sorted(table, key=ipaddress.ip_address))
 
 
 def probe_problems(local, ranks, me, my_rails):
@@ -681,7 +711,8 @@ def elect(daemon, group, tp, head=None, timeout=600, hold_s=5.0, log=print, slee
                 if rails is not None:
                     return [(ip, ids[ip], rails[ids[ip]]) for ip in ips], snap
                 if waited - said >= 60:
-                    log('waiting for mentat to probe which rdma addresses every member shares')
+                    log('waiting for a pair of rdma addresses that reaches every member: '
+                        + reach_text(snap, [ids[ip] for ip in ips]))
                     said = waited
             last = key
             sleep(hold_s)
