@@ -233,6 +233,33 @@ class ControlPortTests(unittest.TestCase):
         self.assertTrue(s.allowed('127.0.0.1'))       # this box: the command line on the same box
         self.assertFalse(s.allowed('192.0.2.77'))
 
+    def test_the_heads_election_decides_every_ranks_rails(self):
+        s = supervisor()
+        s.elected = [(f'10.1.0.{r}', f'10.2.0.{r}') for r in range(1, 5)]
+        s.rails, s.tmpl, s.digest, s.model_id, s.variant = s.elected[0], {'knobs': {}}, 'd', 'm', mock.Mock()
+        head = mock.Mock(verdict=None)
+        # rank 3's own table was half-probed during its boot, and it proposes the direct cable
+        head.have = {r: hello(r, lan=MEMBERS[r], rails=list(s.elected[r])) for r in range(4)}
+        head.have[3]['rails'] = ['10.110.0.1', '10.111.0.1']
+        head.wait_all.return_value = True
+        head.decide.side_effect = lambda v: setattr(head, 'verdict', v)
+        with mock.patch.object(S.handshake, 'Head', return_value=head), \
+                mock.patch.object(s, 'rail_check', return_value='') as checked, mock.patch.object(S, 'log') as logged:
+            v = s.handshake_head(hello(0, lan=MEMBERS[0]))
+        self.assertEqual((v['ips'], v['ips2']), ([r[0] for r in s.elected], [r[1] for r in s.elected]))
+        checked.assert_called_once_with(s.elected)
+        self.assertIn('head: rank 3 proposed rails 10.110.0.1 10.111.0.1; using 10.1.0.4 10.2.0.4',
+                      [c[0][0] for c in logged.call_args_list])
+        # a failed rail check names the rails the head chose, as its detail does
+        head.verdict = None
+        with mock.patch.object(S.handshake, 'Head', return_value=head), \
+                mock.patch.object(s, 'rail_check', return_value='rank 3 does not answer'), \
+                mock.patch.object(S, 'log'), mock.patch.object(s, 'linger'):
+            v = s.handshake_head(hello(0, lan=MEMBERS[0]))
+        self.assertEqual(v['field'], 'fabric')
+        self.assertIn('10.1.0.4,10.2.0.4', v['values'].values())
+        self.assertNotIn('10.110.0.1,10.111.0.1', v['values'].values())
+
     def test_hello_before_the_head_is_ready(self):
         s = supervisor()
         s.state = 'preparing'

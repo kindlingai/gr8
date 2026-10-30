@@ -287,6 +287,9 @@ class Supervisor:
         self.servers = []
         self.locked = self.started = False
         self.ms, self.model_error, self.rails, self.fabric_error = None, '', ('', ''), ''
+        # with mentat: every rank's rails as this box's election chose them (the head's choice is the one used), and
+        # this box's rdma addresses, any of which the head may choose for it
+        self.elected, self.rdma = None, []
         # --shape ring with mentat: the plan, this box's devices, and the client link that holds the ring claim
         self.ring, self.ring_devs, self.ring_ports, self.claim_link = '', None, {}, None
         self.offers = self.variant = self.model_id = None
@@ -320,6 +323,7 @@ class Supervisor:
     def allowed(self, peer):
         """The members' LAN and fabric addresses, and this box's own. Known once the members are."""
         known = set(self.members) | set(self.rails) | set(self.hs.get('ips', [])) | set(self.hs.get('ips2', []))
+        known |= {a for r in self.elected or [] for a in r}
         if self.head:
             known |= {a for h in self.head.have.values() for a in h['rails']}
         return peer in known or fabric.is_local(peer)
@@ -492,7 +496,7 @@ class Supervisor:
             self.agent.set_meta(**{'gr8.set': self.model_id or 'none', 'gr8.variant': str(self.variant or ''),
                                    'gr8.opts': digest,
                                    'gr8.ips': ','.join(self.rails)})
-        self.serve([a for a in (self.lan, *self.rails) if a])
+        self.serve([a for a in (self.lan, *self.rails, *self.rdma) if a])
         self.set_state('preparing')
         fails = self.checks()
         for f in fails:
@@ -513,6 +517,10 @@ class Supervisor:
             e.logged = True
             raise e
         self.hs = verdict
+        if verdict.get('ips'):     # the head's rails for this box, which may differ from its own election's
+            self.rails = (verdict['ips'][self.rank], verdict['ips2'][self.rank])
+            if self.agent:
+                self.agent.set_meta(**{'gr8.ips': ','.join(self.rails)})
         with open(os.path.join(self.out, 'handshake.json'), 'w') as f:
             json.dump({**verdict, 'rank': self.rank, 'control_port': self.port}, f, indent=1)
         self.boot()
@@ -559,6 +567,8 @@ class Supervisor:
                 self.ring_from(ranks)
             if not o.get('IPS') and o.get('SHAPE') != 'ring':
                 self.rails = ranks[self.rank][2]
+                self.elected = [r[2] for r in ranks]
+                self.rdma = mentat.node_view(local)[2]
                 for p in mentat.probe_problems(local, ranks, node_ip, self.rails):
                     log(f'warning: {p}')
         if o.get('SHAPE') == 'ring' or not models.of(o).fabric:   # no switch: the engine bootstraps over the LAN
@@ -696,14 +706,20 @@ class Supervisor:
         tp = len(self.members)
         log(f'head: waiting for {tp - 1} hellos on {self.lan}:{self.port}')
         if self.head.wait_all(opt_timeout(self.o), self.stop_ev):
-            bad = self.rail_check()
+            have = self.head.have
+            # with mentat the head's election decides every rank's rails: each box chose from its own probe table,
+            # and two tables can disagree during a boot
+            rails = self.elected or [tuple(have[r]['rails']) for r in range(tp)]
+            for r in range(1, tp):
+                if tuple(have[r]['rails']) != tuple(rails[r]):
+                    log(f'head: rank {r} proposed rails {" ".join(have[r]["rails"])}; using {" ".join(rails[r])}')
+            bad = self.rail_check(rails)
             if bad:
-                self.head.decide(handshake.refusal('fabric', self.head.have, lambda x: ','.join(x['rails']), bad))
+                self.head.decide(handshake.refusal('fabric', have, lambda x: ','.join(rails[x['rank']]), bad))
             else:
-                have = self.head.have
                 self.head.decide({'t': 'ok', 'epoch': int(time.time()), 'members': self.members,
-                                  'ips': [have[r]['rails'][0] for r in range(tp)],
-                                  'ips2': [have[r]['rails'][1] for r in range(tp)],
+                                  'ips': [rails[r][0] for r in range(tp)],
+                                  'ips2': [rails[r][1] for r in range(tp)],
                                   'homes': {str(r): have[r]['home'] for r in range(tp)}, 'set_id': self.model_id,
                                   'variant': self.variant.name,
                                   'opts_digest': self.digest, 's2port': self.tmpl['knobs'].get('S2PORT'),
@@ -721,18 +737,19 @@ class Supervisor:
             self.lingered = True
             self.stop_ev.wait(float(os.environ.get('GR8_REFUSAL_LINGER', '15')))
 
-    def rail_check(self):
-        """From each of the head's rails to the same rail of every worker: the control port must answer."""
+    def rail_check(self, rails):
+        """From each of the head's rails to the same rail of every worker (rails: every rank's pair): the control port
+        must answer."""
         bad = []
         for r, h in sorted(self.head.have.items()):
             if r == 0:
                 continue
             for k in range(2):
                 try:
-                    handshake.call(h['rails'][k], self.port, {'t': 'ping'}, timeout=3, bind=self.rails[k])
+                    handshake.call(rails[r][k], self.port, {'t': 'ping'}, timeout=3, bind=rails[0][k])
                 except OSError as e:
-                    bad.append(f'rank {r} ({h["lan"]}) does not answer on rail {k} at {h["rails"][k]} from '
-                               f'{self.rails[k]} ({e})')
+                    bad.append(f'rank {r} ({h["lan"]}) does not answer on rail {k} at {rails[r][k]} from '
+                               f'{rails[0][k]} ({e})')
         return '; '.join(bad)
 
     def handshake_worker(self, hello):
@@ -780,7 +797,7 @@ class Supervisor:
             nodes = mentat.kv_nodes(self.daemon.group_status(g), g)
         except (OSError, RuntimeError, ValueError) as e:
             raise Stop(1, f'{flag} remote:auto: mentat: {e}')
-        target = mentat.kv_target(nodes, self.rails, self.rank)
+        target = mentat.kv_target(nodes, self.rails, self.rank, mentat.local_nets())
         if not target:
             raise Stop(1, f'{flag} remote:auto: no KV node in group {g} (./gr8 kv up on a box with spare memory)')
         return target
