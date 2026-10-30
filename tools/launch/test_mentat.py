@@ -162,6 +162,11 @@ class MembershipTests(unittest.TestCase):
         other = dict(copy.deepcopy(snap), addr_ifaces={'10.1.0.1': 'ens1f1np1', '10.2.0.1': 'ens2f1np1',
                                                        '10.110.0.0': 'ens1f0np0', '10.111.0.0': 'ens2f0np0'})
         self.assertEqual(M.member_rails(other, ['n1', 'n3'])['n1'], ('10.1.0.1', '10.2.0.1'))
+        # a DGX box whose root-1 (enP2) probes are pending: root 0's ports never pair across its two cables
+        pending = copy.deepcopy(snap)
+        for a in ('10.2.0.1', '10.111.0.0'):
+            del pending['peers']['n3']['probes'][a]
+        self.assertIsNone(M.member_rails(pending, ['n1', 'n3']))
         # two boxes that share the switch and a direct cable: both ports qualify, the lowest address wins
         self.assertEqual(M.member_rails(snap, ['n1', 'n3']),
                          {'n1': ('10.1.0.1', '10.2.0.1'), 'n3': ('10.1.0.3', '10.2.0.3')})

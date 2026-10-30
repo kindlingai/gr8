@@ -250,6 +250,15 @@ class ControlPortTests(unittest.TestCase):
         checked.assert_called_once_with(s.elected)
         self.assertIn('head: rank 3 proposed rails 10.110.0.1 10.111.0.1; using 10.1.0.4 10.2.0.4',
                       [c[0][0] for c in logged.call_args_list])
+        # a failed rail check names the rails the head chose, as its detail does
+        head.verdict = None
+        with mock.patch.object(S.handshake, 'Head', return_value=head), \
+                mock.patch.object(s, 'rail_check', return_value='rank 3 does not answer'), \
+                mock.patch.object(S, 'log'), mock.patch.object(s, 'linger'):
+            v = s.handshake_head(hello(0, lan=MEMBERS[0]))
+        self.assertEqual(v['field'], 'fabric')
+        self.assertIn('10.1.0.4,10.2.0.4', v['values'].values())
+        self.assertNotIn('10.110.0.1,10.111.0.1', v['values'].values())
 
     def test_hello_before_the_head_is_ready(self):
         s = supervisor()

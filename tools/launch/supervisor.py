@@ -715,7 +715,7 @@ class Supervisor:
                     log(f'head: rank {r} proposed rails {" ".join(have[r]["rails"])}; using {" ".join(rails[r])}')
             bad = self.rail_check(rails)
             if bad:
-                self.head.decide(handshake.refusal('fabric', have, lambda x: ','.join(x['rails']), bad))
+                self.head.decide(handshake.refusal('fabric', have, lambda x: ','.join(rails[x['rank']]), bad))
             else:
                 self.head.decide({'t': 'ok', 'epoch': int(time.time()), 'members': self.members,
                                   'ips': [rails[r][0] for r in range(tp)],

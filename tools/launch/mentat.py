@@ -421,8 +421,9 @@ def member_rails(snap, node_ids, names=None):
     pairs = [sorted(v, key=ip) for v in ports.values() if len(v) == 2]
     if not pairs:
         found = sorted((a for v in ports.values() for a in v), key=ip)
-        # names without a PCI domain (not enP<n>...) cannot show a port's two roots: the two lowest that qualify
-        if len(found) < 2 or any(re.match(r'en(P\d+)', ifaces[a]) for a in found):
+        # names without a PCI domain cannot show a port's two roots: the two lowest that qualify. A box with any enP<n>
+        # name has them (root 0's names carry no domain), so there an unpaired port means probes still pending.
+        if len(found) < 2 or any(re.match(r'enP\d', ifaces.get(a) or '') for a in table):
             return None
         pairs = [found[:2]]
     mine = min(pairs, key=lambda v: min(ip(x) for a in v for x in [a] + [table[a][n][0] for n in others]))
