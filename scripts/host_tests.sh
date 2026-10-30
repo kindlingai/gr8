@@ -148,6 +148,8 @@ g++ -std=c++17 -O2 -Wall -Wextra "$REPO/engine/runtime/s2/tests/trace_test.cpp" 
 "$T/trace_test" "$T/trace"
 python3 "$REPO/tools/trace/merge.py" "$T/trace.r3.json" -o "$T/trace.json" > /dev/null
 python3 -c 'import json, sys; json.load(open(sys.argv[1]))' "$T/trace.json"
+# merge.py --clock: a rank on another machine's clock moved onto the client's (tools/trace/clock_probe.py samples)
+(cd "$REPO" && python3 -m unittest -q tools.trace.test_merge)
 g++ -std=c++20 -O2 -Wall -pthread -I "$REPO/engine/loader" "$REPO/engine/loader/tests/manifest_test.cpp" \
   "$REPO/engine/loader/g6pack.cpp" -o "$T/manifest_test"
 "$T/manifest_test"
