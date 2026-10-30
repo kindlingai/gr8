@@ -86,6 +86,15 @@ pub unsafe extern "C" fn g6kv_exclusive(p: *const Pool, rows: u64) -> i32 {
     (*p).exclusive(rows) as i32
 }
 
+/// g6kv_exclusive at R = r rows (0 = the pool's R): -1 for an R the pool refuses.
+///
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_exclusive_r(p: *const Pool, rows: u64, r: u32) -> i32 {
+    (*p).exclusive_r(rows, r).map_or(-1, |x| x as i32)
+}
+
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
@@ -104,24 +113,45 @@ pub unsafe extern "C" fn g6kv_room(p: *const Pool) -> u32 {
 /// As g6kv_exclusive.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_admissible(p: *const Pool, worst: u64) -> i32 {
-    (*p).admissible(worst) as i32
+    g6kv_admissible_r(p, worst, 0)
+}
+
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_admissible_r(p: *const Pool, worst: u64, r: u32) -> i32 {
+    (*p).admissible_r(worst, r) as i32
 }
 
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_fits(p: *const Pool, rows: u64, worst: u64) -> i32 {
-    (*p).fits(rows, worst) as i32
+    g6kv_fits_r(p, rows, worst, 0)
+}
+
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_fits_r(p: *const Pool, rows: u64, worst: u64, r: u32) -> i32 {
+    (*p).fits_r(rows, worst, r) as i32
 }
 
 /// # Safety
 /// As g6kv_exclusive, and `out` must be valid for a write.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_reserve(p: *mut Pool, rows: u64, worst: u64, out: *mut Run) -> i32 {
+    g6kv_reserve_r(p, rows, worst, 0, out)
+}
+
+/// # Safety
+/// As g6kv_reserve.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_reserve_r(p: *mut Pool, rows: u64, worst: u64, r: u32, out: *mut Run) -> i32 {
     if out.is_null() {
         return Error::BadArgument.code();
     }
-    match (*p).reserve(rows, worst) {
+    match (*p).reserve_r(rows, worst, r) {
         Ok(r) => {
             *out = r;
             0
@@ -256,12 +286,32 @@ pub unsafe extern "C" fn g6kv_match_namespaced(
     namespace_bytes: usize,
     out: *mut G6kvHit,
 ) -> i32 {
+    g6kv_match_r(p, prompt, n, rows, worst, limit, namespace_, namespace_bytes, 0, out)
+}
+
+/// g6kv_match_namespaced for a grant at R = r rows (0 = the pool's R). BadArgument for an R the pool refuses.
+///
+/// # Safety
+/// As g6kv_match_namespaced.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_match_r(
+    p: *const Pool,
+    prompt: *const i32,
+    n: usize,
+    rows: u64,
+    worst: u64,
+    limit: i32,
+    namespace_: *const u8,
+    namespace_bytes: usize,
+    r: u32,
+    out: *mut G6kvHit,
+) -> i32 {
     let Some(namespace) = namespace(namespace_, namespace_bytes) else { return Error::BadArgument.code() };
     let Some(prompt) = slice(prompt, n) else { return Error::BadArgument.code() };
-    if p.is_null() || out.is_null() {
+    if p.is_null() || out.is_null() || (*p).exclusive_r(0, r).is_err() {
         return Error::BadArgument.code();
     }
-    let h = (*p).match_prefix_namespaced(prompt, rows, worst, limit, namespace);
+    let h = (*p).match_prefix_r(prompt, rows, worst, limit, namespace, r);
     *out = G6kvHit {
         skip: h.skip,
         lcp: h.lcp,
@@ -287,10 +337,29 @@ pub unsafe extern "C" fn g6kv_take(
     worst: u64,
     out: *mut Run,
 ) -> i32 {
+    g6kv_take_r(p, skip, age, from, rows, worst, 0, out)
+}
+
+/// g6kv_take for a g6kv_match_r hit at R = r rows (0 = the pool's R).
+///
+/// # Safety
+/// As g6kv_take.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn g6kv_take_r(
+    p: *mut Pool,
+    skip: i32,
+    age: u64,
+    from: i32,
+    rows: u64,
+    worst: u64,
+    r: u32,
+    out: *mut Run,
+) -> i32 {
     if out.is_null() {
         return Error::BadArgument.code();
     }
-    match (*p).take_hit(skip, age, (from >= 0).then_some(from as u32), rows, worst) {
+    match (*p).take_hit_r(skip, age, (from >= 0).then_some(from as u32), rows, worst, r) {
         Ok(r) => {
             *out = r;
             0
@@ -628,7 +697,16 @@ pub unsafe extern "C" fn g6kv_window_runs(p: *const Pool) -> u32 {
 /// `p` must be live, `out` valid for 3 writes.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_ids_view(p: *const Pool, worst: u64, out: *mut u64) -> i32 {
-    match (*p).ids_view(worst) {
+    g6kv_ids_view_r(p, worst, 0, out)
+}
+
+/// g6kv_ids_view for a grant at R = r rows (0 = the pool's R): 0 for an R the pool refuses.
+///
+/// # Safety
+/// As g6kv_ids_view.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_ids_view_r(p: *const Pool, worst: u64, r: u32, out: *mut u64) -> i32 {
+    match (*p).ids_view_r(worst, r) {
         Some((a, b, c)) => {
             for (k, v) in [a, b, c].into_iter().enumerate() {
                 *out.add(k) = v;
@@ -646,7 +724,16 @@ pub unsafe extern "C" fn g6kv_ids_view(p: *const Pool, worst: u64, out: *mut u64
 /// `p` must be live, `out` valid for 4 writes.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_split_view(p: *const Pool, worst: u64, out: *mut u64) -> i32 {
-    match (*p).split_view(worst) {
+    g6kv_split_view_r(p, worst, 0, out)
+}
+
+/// g6kv_split_view for a grant at R = r rows (0 = the pool's R): 0 for an R the pool refuses.
+///
+/// # Safety
+/// As g6kv_split_view.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_split_view_r(p: *const Pool, worst: u64, r: u32, out: *mut u64) -> i32 {
+    match (*p).split_view_r(worst, r) {
         Some((a, b, c, d)) => {
             for (k, v) in [a, b, c as u64, d as u64].into_iter().enumerate() {
                 *out.add(k) = v;

@@ -82,6 +82,16 @@ int g6kv_match_namespaced(const g6kv_pool* p, const int32_t* prompt, size_t n, u
                           int32_t limit, const uint8_t* namespace_, size_t namespace_bytes, g6kv_hit* out);
 // from: -1 for a pool hit, else the tier of a stored one
 int g6kv_take(g6kv_pool* p, int32_t skip, uint64_t age, int32_t from, uint64_t rows, uint64_t worst, g6kv_run* out);
+// R per grant: the calls above at R = r rows (0 = the pool's R). With g6kv_window on, r may be a smaller multiple of 64.
+// Any other r gives -1 (exclusive_r), 0 (admissible_r, fits_r) or BadArgument
+int g6kv_exclusive_r(const g6kv_pool* p, uint64_t rows, uint32_t r);
+int g6kv_admissible_r(const g6kv_pool* p, uint64_t worst, uint32_t r);
+int g6kv_fits_r(const g6kv_pool* p, uint64_t rows, uint64_t worst, uint32_t r);
+int g6kv_reserve_r(g6kv_pool* p, uint64_t rows, uint64_t worst, uint32_t r, g6kv_run* out);
+int g6kv_match_r(const g6kv_pool* p, const int32_t* prompt, size_t n, uint64_t rows, uint64_t worst, int32_t limit,
+                 const uint8_t* namespace_, size_t namespace_bytes, uint32_t r, g6kv_hit* out);
+int g6kv_take_r(g6kv_pool* p, int32_t skip, uint64_t age, int32_t from, uint64_t rows, uint64_t worst, uint32_t r,
+                g6kv_run* out);
 
 uint64_t g6kv_digest(const g6kv_pool* p);
 // one stderr line per claim (g6m4: GR8_POOL_LOG=1)
@@ -221,6 +231,9 @@ int g6kv_is_kept(const g6kv_pool* p, const uint32_t* pages, size_t n);
 int g6kv_ids_view(const g6kv_pool* p, uint64_t worst, uint64_t* out);
 // (pool) a request of `worst` rows past R: 1 and {pages below place, pages above, free below, free above} in out
 int g6kv_split_view(const g6kv_pool* p, uint64_t worst, uint64_t* out);
+// (pool) the two views for a grant at R = r rows (0 = the pool's R): 0 for an R the pool refuses
+int g6kv_ids_view_r(const g6kv_pool* p, uint64_t worst, uint32_t r, uint64_t* out);
+int g6kv_split_view_r(const g6kv_pool* p, uint64_t worst, uint32_t r, uint64_t* out);
 int g6kv_rows_open(const char* spec, const char* name, const char* layout, uint64_t bytes, g6kv_rows** out);
 void g6kv_rows_free(g6kv_rows* r);
 int g6kv_rows_write(const g6kv_rows* r, uint64_t off, const void* buf, size_t len);

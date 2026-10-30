@@ -2018,13 +2018,13 @@ int main(int argc, char** argv)
             g6s2::NativeHooks h;
             h.pool.free_pages = [&] { return pool.free_pages(); };
             h.pool.room = [&] { return pool.room(); };
-            h.pool.reserve = [&](uint64_t rows, uint64_t worst) { return pool.reserve(rows, worst); };
+            h.pool.reserve = [&](uint64_t rows, uint64_t worst, uint32_t r) { return pool.reserve(rows, worst, r); };
             h.pool.digest = [&] { return pool.digest(); };
             h.pool.release = [&](const g6s2::Run& r) { pool.release(r); };
-            h.pool.fits = [&](uint64_t rows, uint64_t worst) { return pool.fits(rows, worst); };
+            h.pool.fits = [&](uint64_t rows, uint64_t worst, uint32_t r) { return pool.fits(rows, worst, r); };
             if (rtt && rtt->local)
-                h.pool.refusal = [&](uint64_t worst) -> std::string {
-                    const auto v = pool.split_view(worst);
+                h.pool.refusal = [&](uint64_t worst, uint32_t r) -> std::string {
+                    const auto v = pool.split_view(worst, r);
                     if (!v) return "";
                     const auto [lo, hi, lofree, hifree] = *v;
                     std::string why = "it takes " + std::to_string(lo) + " pages below place (" + std::to_string(lofree) + " free) and its tail of " +
@@ -2032,7 +2032,7 @@ int main(int argc, char** argv)
                     if (hi > (uint64_t)(cap / 64 - std::min(m.s2->pool_pages, D.d.s2->pool_pages))) why += ": the tail is longer than the drafter class, it never fits";
                     if ((int)pool.window_runs() >= rt_runs)
                         why += "; the slot pool covers " + std::to_string(rt_runs) + " session(s) past R at once (GR8_RT_POOL), all in use";
-                    if (const auto iv = pool.ids_view(worst))
+                    if (const auto iv = pool.ids_view(worst, r))
                     {
                         why += "; its tail needs " + std::to_string((*iv)[0]) + " records a rank, " + std::to_string((*iv)[1]) + " of the lease's " +
                                std::to_string((*iv)[2]) + " are free";
@@ -2049,8 +2049,10 @@ int main(int argc, char** argv)
             if (pool.keeping())
             {
                 h.pool.retain = [&](const g6s2::Run& r, const PrefixReuse& s, const CacheNamespace& ns) { pool.retain(r, s, ns); };
-                h.pool.match = [&](const std::vector<int>& p, uint64_t rows, uint64_t worst, int limit, const CacheNamespace& ns) { return pool.match(p, rows, worst, limit, ns); };
-                h.pool.take = [&](const g6s2::PoolHit& x, uint64_t rows, uint64_t worst) { return pool.take(x, rows, worst); };
+                h.pool.match = [&](const std::vector<int>& p, uint64_t rows, uint64_t worst, int limit, const CacheNamespace& ns, uint32_t r) {
+                    return pool.match(p, rows, worst, limit, ns, r);
+                };
+                h.pool.take = [&](const g6s2::PoolHit& x, uint64_t rows, uint64_t worst, uint32_t r) { return pool.take(x, rows, worst, r); };
             }
             if (kvt)
             {
