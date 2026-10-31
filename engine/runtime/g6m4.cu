@@ -764,6 +764,8 @@ int main(int argc, char** argv)
             cfg.stripe_min = (size_t)knob::ds_stripe_min();
         }
     }
+    // no recv slot for a rank's own contribution: DS41 reads it from the send slot, and a W-row prefill fabric's slots are large
+    cfg.compact = true;
 #endif
     cfg.ncoll = NC;
     cfg.relay_cpu = cfg.proxy_cpu > 7 ? cfg.proxy_cpu - 8 : -1;   // --ring: the relay thread's own core (N-1..N-7 are proxies)
