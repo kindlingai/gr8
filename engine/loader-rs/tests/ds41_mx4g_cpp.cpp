@@ -1,4 +1,4 @@
-// Cross-check driver for tests/ds41.rs: runs builder B6's host packer (engine/kernels/mxfp4_pack.h) on a file of
+// Cross-check driver for tests/ds41.rs: runs the host packer (engine/kernels/mxfp4_pack.h) on a file of
 // matrices and writes its records, so the Rust port (src/ds41.rs mx4g_fc1 / mx4g_fc2) can be compared byte for byte.
 //   usage: ds41_mx4g_cpp IN OUT
 //   IN : i32 R, i32 K, i32 KFULL, i32 C0, then gp[R*K/2] ge[R*K/32] up[R*K/2] ue[R*K/32]   (fc1 inputs, R rows of K)
