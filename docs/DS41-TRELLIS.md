@@ -40,11 +40,17 @@ TP4, four GB10 boxes, the launcher defaults plus GR8_DS_MANIFEST=pmcgx-k4, RigMa
 boxes' GPU clocks follow a thermal cap (1500-2400 MHz by temperature; tools/trace/nicprof.py records them): these
 runs sat at 2050-2120 MHz mean per box with the GPUs at 68-83 C.
 
-| | native | pmcgx-k4 (layers 0-7) |
-|---|---|---|
-| decode, code / prose | 77.8 / 49.7 tok/s | 78.7 / 50.2 tok/s |
-| 8K prefill, cold | 2,023 tok/s | 2,148 tok/s |
-| aggregate, 1 / 2 / 4 streams | 64.8 / 52.8 / 75.0 tok/s | 64.7 / 51.4 / 72.1 tok/s |
+| | native | pmcgx-k4 (layers 0-7) | pmcgx-k4 + GR8_DS_ATTN_TC=1 |
+|---|---|---|---|
+| decode, code / prose | 77.8 / 49.7 tok/s | 78.7 / 50.2 tok/s | 74.6 / 47.5 tok/s |
+| 8K prefill, cold | 2,023 tok/s | 2,148 tok/s | 3,257 tok/s |
+| 32K / 128K prefill, cold | | 2,022 / 1,851 tok/s | 3,348 / 3,121 tok/s |
+| aggregate, 1 / 2 / 4 streams | 64.8 / 52.8 / 75.0 tok/s | 64.7 / 51.4 / 72.1 tok/s | 63.4 / 80.8 / 108.9 tok/s |
+
+The last column is the launcher defaults (two lanes, W 1024) with the attention projections on the tensor cores, no
+profiling, the last run of the evening with the boxes at their warmest (its decode is 5% under the morning's, inside
+what the clock cap moves between runs; the 32K / 128K column without TC is from a profiled run). The sections below say
+where the time goes and what each knob did.
 
 ## Where a decode step goes
 
