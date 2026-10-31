@@ -325,7 +325,15 @@ inline int k1_rows(Model& m, const LayerState& s, const void* x, int n, void* ou
         fprintf(stderr, "DS41 MoE layer %d, %d rows: %s\n", s.layer, n, e);
         return ds41::NOTSUP;
     }
-    ::bind::launch_k1(k, st);
+    if (k.fuse) ::bind::launch_k1_fused(k, st);
+    else
+    {
+        ::bind::launch_k1_fc1(k, st);
+        ds41_span_mark("k1_fc1", st);
+        ::bind::launch_k1_fc2(k, st);
+        ds41_span_mark("k1_fc2", st);
+    }
+    ::bind::launch_k1_fin(k, st);
     return (int)cudaGetLastError();
 }
 
@@ -374,7 +382,16 @@ inline int trellis_prefill(Model& m, const LayerState& s, int rows, cudaStream_t
     S.rr_row = q.sh_rr_row; S.rr_e = q.sh_rr_e; S.rr_sp = q.sh_rr_sp; S.rr_w = q.sh_rr_w;
     S.segs = q.sh_segs; S.n_seg = q.sh_n_seg; S.pos = nullptr; S.yw = q.ysh;
     ::bindp::launch_shared<g6nr::EB>(S, st);
-    ::bindp::launch_experts<g6nr::EB>(A, st);
+    ds41_span_mark("tr_shared", st);
+    ::bindp::launch_route(A, st);
+    ds41_span_mark("tr_route", st);
+    ::bindp::launch_fc1<g6nr::EB>(A, st);
+    ds41_span_mark("tr_fc1", st);
+    ::bindp::launch_mid<g6nr::EB>(A, st);
+    ds41_span_mark("tr_mid", st);
+    ::bindp::launch_fc2<g6nr::EB>(A, st);
+    ds41_span_mark("tr_fc2", st);
+    ::bindp::launch_fin(A, st);
     return (int)cudaGetLastError();
 }
 
@@ -585,7 +602,9 @@ inline int experts(Model& m, const LayerState& s, int M, cudaStream_t st)
                  (const int*)(p + offsetof(P, n_slots)), M * TK /* grid bound: CTAs of slots >= n_slots exit */, geom::SWIGLU_LIMIT,
                  s.sc->act, s.sc->ypart};
     launch(PD, mx4::k_fc1<HID, IW, 8, 1, 2, false, PD>, dim3(M * TK * (IW / 16)), dim3(8 * 32), st, RA);
+    ds41_span_mark("fc1", st);
     launch(PD, mx4::k_fc2<IW, HID, 8, 2, false, PD>, dim3(M * TK * (HID / 16 / 8)), dim3(8 * 32), st, RA);
+    ds41_span_mark("fc2", st);
     dsh::CombineArgsT<TK> CA{(const P*)p, s.sc->ypart, s.sc->sh_out, (void*)m.sc.part[1], M};
     launch(PD, dsh::k_combine<HID, 128, gv::O_BF16, TK>, dim3(M * HID / (8 * 128)), dim3(128), st, CA);
     return (int)cudaGetLastError();
@@ -626,7 +645,9 @@ inline int experts_mt_nt(Model& m, const LayerState& s, int M, cudaStream_t st)
                    (const int*)(p + offsetof(P, n_slots)), M * TK /* grid bound: CTAs of slots >= n_slots exit */, geom::SWIGLU_LIMIT,
                    s.sc->act, s.sc->ypart};
     launch(PD, mx4::k_fc1_mt<HID, IW, 8, 1, mx4::FC1_MT_DEPTH<NT>, NT, 0, PD>, dim3(M * TK * (IW / 16)), dim3(8 * 32), st, RA);
+    ds41_span_mark("fc1_mt", st);
     launch(PD, mx4::k_fc2_mt<IW, HID, 8, 2, NT, PD>, dim3(M * TK * (HID / 16 / 8)), dim3(8 * 32), st, RA);
+    ds41_span_mark("fc2_mt", st);
     dsh::CombineArgsMT<TK, MTMAX> CA{(const P*)p, s.sc->ypart, s.sc->sh_out, (void*)m.sc.part[1], M};
     launch(PD, dsh::k_combine_mt<HID, 128, gv::O_BF16, TK, MTMAX>, dim3(M * HID / (8 * 128)), dim3(128), st, CA);
     return (int)cudaGetLastError();
@@ -728,6 +749,7 @@ inline int router_ro(Model& m, const LayerState& s, int M, cudaStream_t st)
         cudaLaunchKernelEx(&cfg, dsr::k_gate_logits_ro<dsr::NEXP>, (const __nv_bfloat16*)s.gate, (const __nv_bfloat16*)m.hc_y, M, q.logits);
     }
     else launch(false, dsr::k_gate_logits_mt<NE, 0>, dim3(NE / 8), dim3(256), st, (const __nv_bfloat16*)s.gate, (const __nv_bfloat16*)m.hc_y, M, q.logits);
+    ds41_span_mark("ro_gate", st);
     cudaMemsetAsync(q.emask, 0, (size_t)NE * MW * sizeof(unsigned), st);
     launch(false, dsr::k_route_ro<NE, TK, ROMAX, KC>, dim3((M + 7) / 8), dim3(256), st, (const float*)q.logits, s.bias, M, (P*)q.plan, q.emask);
     launch(false, dsr::k_scan_ro<NE, TK, ROMAX>, dim3(1), dim3(NE), st, (P*)q.plan, (const unsigned*)q.emask, q.tile0_of);
@@ -797,11 +819,13 @@ inline void fc_ro_run(const mx4::ArgsMT& RA, int sb, int bstg, cudaStream_t st)
         if (ce != cudaSuccess) die(std::string("GR8_DS_MOE_FC1BSTG launch: ") + cudaGetErrorString(ce));
     }
     else launch(false, mx4::k_fc1_ro<HID, IW, KS, CW, 1, NTG1, 0, ORD, LA, (HV >= 1)>, dim3(sb * (IW / 16 / CW)), dim3(KS * CW * 32), st, RA);
+    ds41_span_mark("ro_fc1", st);
     mx4::ArgsMT R2 = RA;
     R2.la = RA.la * 2;                                                              // fc2 runs 2 CTAs per SM
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(sb * (HID / 16 / W2)); cfg.blockDim = dim3(W2 * 32); cfg.dynamicSmemBytes = SMEM2; cfg.stream = st;
     cudaLaunchKernelEx(&cfg, k2, R2);
+    ds41_span_mark("ro_fc2", st);
 }
 template <bool ORD, bool LA, int KS, int CW, int NTG1, int W2, int D2, int NTG2>
 inline void fc_ro_hint(const mx4::ArgsMT& RA, int sb, int hv, int stg, int bstg, cudaStream_t st)

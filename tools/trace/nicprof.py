@@ -9,6 +9,11 @@ counter tracks: send and receive rate per port in Gb/s, and the per-interval inc
 (retransmits, sequence errors, congestion notifications, ECN marks, transmit waits). tools/trace/merge.py joins them
 with the ranks' S2 traces (same pid, same --clock offsets). The summary prints, per rank and port, the mean and peak
 rates while the port moved data and the totals of the trouble counters over the window.
+
+Once a second the sampler also reads the GPU through nvidia-smi: its graphics clock, temperature and active throttle
+reasons. The boxes' clocks are not fixed (a thermal governor moves the cap between 1500 and 2400 MHz), so the "gpu"
+track and the summary's clock line (mean, min, max MHz; temperature range; the throttle reasons seen) belong next to
+every number measured in the window.
 """
 
 import argparse
@@ -28,7 +33,7 @@ COUNTERS = RATE + TROUBLE
 # Runs on the machine: one JSON line per sample, {"ts": us, "ports": {dev: [counter values in COUNTERS order]}}, until
 # stdin closes or the deadline passes. Missing counters read as -1.
 SAMPLER = r'''
-import json, os, select, sys, time
+import json, os, select, subprocess, sys, time
 C = %s
 root = "/sys/class/infiniband"
 devs = sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d, "ports", "1")))
@@ -37,9 +42,19 @@ def read(d, sub, n):
         with open(os.path.join(root, d, "ports", "1", sub, n)) as f: return int(f.read())
     except (OSError, ValueError): return -1
 end, step = time.time() + %f, %f
+gpu_t = 0.0
 while time.time() < end:
     t = time.time()
-    print(json.dumps({"ts": int(t * 1e6), "ports": {d: [read(d, s, n) for s, n in C] for d in devs}}), flush=True)
+    rec = {"ts": int(t * 1e6), "ports": {d: [read(d, s, n) for s, n in C] for d in devs}}
+    if t - gpu_t >= 1.0:
+        gpu_t = t
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=clocks.gr,temperature.gpu,clocks_throttle_reasons.active",
+                                  "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=2).stdout.split(",")
+            rec["gpu"] = [int(out[0]), int(out[1]), out[2].strip()]
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            pass
+    print(json.dumps(rec), flush=True)
     if select.select([sys.stdin], [], [], max(0.0, step - (time.time() - t)))[0] and not sys.stdin.read(1): break
 '''
 
@@ -72,6 +87,11 @@ def tracks(rank, samples):
             bad = {n: d[len(RATE) + i] for i, (_, n) in enumerate(TROUBLE) if d[len(RATE) + i]}
             if bad:
                 events.append({'name': f'{dev} trouble', 'ph': 'C', 'pid': rank, 'ts': b['ts'], 'args': bad})
+    for a in samples:
+        if 'gpu' in a:
+            events.append({'name': 'gpu', 'ph': 'C', 'pid': rank, 'ts': a['ts'], 'args': {'MHz': a['gpu'][0], 'C': a['gpu'][1]}})
+            if int(a['gpu'][2], 16):
+                events.append({'name': 'throttle ' + a['gpu'][2], 'ph': 'i', 's': 'p', 'pid': rank, 'ts': a['ts'], 'args': {}})
     return events
 
 
@@ -99,6 +119,13 @@ def summary(rank, samples):
         bad = ' '.join(f'{n} {v}' for n, v in tot.items() if v)
         lines.append(f'rank {rank} {dev}: tx mean {mean[0]:.1f} peak {peak[0]:.1f} Gb/s, rx mean {mean[1]:.1f} peak {peak[1]:.1f} Gb/s '
                      f'over {len(busy)} busy of {len(rates)} intervals' + (f'; {bad}' if bad else ''))
+    gpu = [a['gpu'] for a in samples if 'gpu' in a]
+    if gpu:
+        mhz = [g[0] for g in gpu]
+        temp = [g[1] for g in gpu]
+        reasons = sorted({g[2] for g in gpu if int(g[2], 16)})
+        lines.append(f'rank {rank} gpu: {sum(mhz) / len(mhz):.0f} MHz mean, {min(mhz)}-{max(mhz)} MHz, {min(temp)}-{max(temp)} C over '
+                     f'{len(gpu)} samples' + (f'; throttle reasons {" ".join(reasons)}' if reasons else '; no throttle reason'))
     return lines or [f'rank {rank}: no port moved data']
 
 

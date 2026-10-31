@@ -46,12 +46,25 @@ wall clock, so merge.py joins them with that rank's S2 trace and applies the sam
 It also prints a summary per rank and port: mean and peak rates over the intervals the port moved data, and the
 trouble counters' totals.
 
+Once a second it also reads each machine's GPU through nvidia-smi (graphics clock, temperature, active throttle
+reasons) into a `gpu` counter track, and the summary ends with the clock line per rank: mean, min and max MHz, the
+temperature range and the throttle reasons seen. The boxes' clocks are not fixed (a thermal governor moves the cap
+between 1500 and 2400 MHz by temperature), so a measurement is only comparable with its clock line next to it.
+
 `GR8_DS_SPAN=1` adds the DS41 GPU side: the time of each plan unit (attention, consume, MoE, head, ...) summed over the
 layers, per eager step and, for each captured step graph, as the mean over 16 sampled replays (every 16th). A captured
 step cannot be timed with events (an event recorded as a graph node cannot be read back), so the capture stamps
 `%globaltimer` around each unit with a one-thread kernel node; the stamps make the profiled step a little slower.
-`GR8_DS_SPAN=2` adds one line per unit kind with the time of each layer, in layer order. The lines go to the engine's
-stderr (`./gr8 ds41 logs`):
+`GR8_DS_SPAN=2` adds one line per unit kind with the time of each layer, in layer order. A served prefill chunk runs
+its ops outside the units, so it is one pass per chunk and lane with a mark after every op (and inside the MoE ops,
+after each kernel group): an `ops:` line with the marks summed over the layers, and with `GR8_DS_SPAN=2` a `layer L
+ops:` line per layer. `GR8_DS_SPAN=3` marks the ops of the decode units the same way. The lines go to the engine's
+stderr (the launcher's `g6m4.r<rank>.err`; `./gr8 ds41 logs` shows only its tail):
 
     # span M=6 per step over 16 sampled replays, rank 0: step_in 0.012 ms embed 0.031 ms attn 9.8 ms ...
     # span M=6 per step over 16 sampled replays, rank 0 per layer mlp: 0.201 0.198 ...
+    # span prefill pass 12 rank 0: prefill 481.2 ms (1024 rows)
+    # span prefill pass 12 rank 0 ops: hc_attn 3.1 attn_proj 41.0 ... router 6.2 shared 24.0 ro_gate 1.1 ro_fc1 160.3 ro_fc2 110.2 experts 9.8 ...
+
+`tools/trace/ds_span.py LOG... [--layers A-B]` sums the lines per print kind and rank, and splits the per-layer and
+per-op times into the layers A..B and the rest (a release's trellis layers against its native ones).
