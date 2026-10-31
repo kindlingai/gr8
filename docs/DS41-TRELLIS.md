@@ -140,9 +140,24 @@ answers vary within a run either way). The knob stays off in the engine; the con
 
 ### The fabric
 
-The raw links, measured with ib_write_bw between every pair of boxes (64 KiB writes, 8 s, RoCE v2) with the engines
-idle: 108.7-109.2 Gb/s on either PCIe root of every pair, 98.0 x 2 = 196 Gb/s with both roots of a pair at once, the
-numbers a healthy ConnectX-7 pair gives on these boxes. The engine's prefill collectives are far from that: a layer's two
-consumes take 2.2 ms each for a 1024 x 5120 BF16 partial (about 8 MB a rank each way), about 30 Gb/s effective, and the
-rails average 3.6 and 1.8 Gb/s over a run. The wait is in the collective's shape and the proxy, not the wire.
+Measured with the engines down, both PCIe roots (rocep1s0f1 and roceP2p1s0f1), every pair of the four boxes:
 
+| test | result |
+|---|---|
+| ib_write_bw, 64 KiB, 8 s, one root | 108.7-109.2 Gb/s on every pair and root |
+| the same, both roots of a pair at once | 98.0 x 2 = 196 Gb/s |
+| ib_write_lat, 8 B | 2.4-2.5 us typical, 2.4 us minimum |
+| ib_write_bw, one outstanding 4 KiB write (-t 1 -s 4096) | 5.7-5.9 Gb/s (one 4 KiB write per 5.6 us round trip) |
+| ib_write_bw, bidirectional 64 KiB (-b) | 206-208 Gb/s a pair |
+| NCCL 2.28 all-reduce across the four boxes, both HCAs, 128 MiB | Ring 144 Gb/s bus bandwidth, Tree 38 |
+| the same, 16 MiB / 1 MiB / 64 KiB | Ring 119 / 15 / 11 Gb/s |
+| the same, 8 B | 29-34 us |
+
+These are the numbers a healthy ConnectX-7 fabric gives on these boxes. A point-to-point ib_write_bw alone does not
+show the slow state the cards once latched into (it read 109 Gb/s while collectives crawled at 12-17 Gb/s, Ring slower
+than Tree); the collective probe does, and it is clean: Ring is 3.7 times Tree at 128 MiB.
+
+The engine's prefill collectives are far from the wire's numbers: a layer's two consumes take 2.2 ms each for a 1024 x
+5120 BF16 partial (about 8 MB a rank each way, around 30 Gb/s effective), and the rails average 3.6 and 1.8 Gb/s over a
+run. NCCL moves 16 MiB at 119 Gb/s on the same links, so the wait is in the collective's shape and the proxy, not the
+fabric.
