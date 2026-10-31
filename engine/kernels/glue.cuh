@@ -15,6 +15,7 @@
 #include "common.cuh"
 #include "k1args.cuh"
 #include "topk.cuh"
+#include "relax_accept.h"
 #include "../comms/fabric.h"
 #include "../comms/xtrace.h"
 
@@ -1221,58 +1222,61 @@ template <bool RS> __device__ __forceinline__ void head_merge(const HeadArgs& a,
     const u64 step = *a.stepp;
     const u64 seq = g6::coll_seq(step, a.c, a.f.ncoll);
     wait_peers(a.f, step, a.c, seq, head_wait_bytes(a), ERR_HEAD);
-    const int m = threadIdx.x;
-    float bs = -INFINITY, blg = 0.f, mx = -INFINITY, sm = 0.f, tl = -INFINITY;
-    int bid = 0x7fffffff;
-    if (m < a.M)
+    bool any = false;                       // a.tk: any row asks for its top list
+    if (a.tk) for (int i = 0; i < a.M; ++i) any |= a.rows[i].topk > 0;
+    for (int b = 0; b < a.M; b += 32)       // one row per lane, rows in chunks of 32 (M <= 32: one chunk)
     {
-        for (int p = 0; p < a.f.nr; ++p)
+        const int m = b + threadIdx.x;
+        float bs = -INFINITY, blg = 0.f, mx = -INFINITY, sm = 0.f, tl = -INFINITY;
+        int bid = 0x7fffffff;
+        if (m < a.M)
         {
-            const float4* q = reinterpret_cast<const float4*>(peer_slot(a.f, step, a.c, p) + (size_t)m * sizeof(HeadRec));
-            const float4 v = __ldcv(q);
-            const float4 u = __ldcv(q + 1);
-            HeadRec r;
-            r.score = v.x; r.id = __float_as_int(v.y); r.logit = v.z; r.lmax = v.w; r.lsum = u.x;
-            tl = fmaxf(tl, u.y);
-            if (r.score > bs || (r.score == bs && r.id < bid)) { bs = r.score; bid = r.id; blg = r.logit; }
-            const float nmx = fmaxf(mx, r.lmax);
-            sm = (mx == -INFINITY ? 0.f : sm * expf(mx - nmx)) + (r.lmax == -INFINITY ? 0.f : r.lsum * expf(r.lmax - nmx));
-            mx = nmx;
-        }
-        if constexpr (RS)
-            if (const int d = rs_draft<RS>(a, tok, m); d >= 0)
+            for (int p = 0; p < a.f.nr; ++p)
             {
-                const SampleRow sr = a.rows[m];
-                float z = 0.f;
-                for (int p = 0; p < a.f.nr; ++p)
-                {
-                    const float4* q = reinterpret_cast<const float4*>(peer_slot(a.f, step, a.c, p) + (size_t)m * sizeof(HeadRec));
-                    z += __ldcv(q + 1).z * expf((__ldcv(q).w - mx) * sr.inv_temp);
-                }
-                rs_accept(sr, d, expf((tl - mx) * sr.inv_temp) / z, bid, blg, tl);
+                const float4* q = reinterpret_cast<const float4*>(peer_slot(a.f, step, a.c, p) + (size_t)m * sizeof(HeadRec));
+                const float4 v = __ldcv(q);
+                const float4 u = __ldcv(q + 1);
+                HeadRec r;
+                r.score = v.x; r.id = __float_as_int(v.y); r.logit = v.z; r.lmax = v.w; r.lsum = u.x;
+                tl = fmaxf(tl, u.y);
+                if (r.score > bs || (r.score == bs && r.id < bid)) { bs = r.score; bid = r.id; blg = r.logit; }
+                const float nmx = fmaxf(mx, r.lmax);
+                sm = (mx == -INFINITY ? 0.f : sm * expf(mx - nmx)) + (r.lmax == -INFINITY ? 0.f : r.lsum * expf(r.lmax - nmx));
+                mx = nmx;
             }
-        a.tok_out[m] = bid;
-        a.lp_out[m] = blg - mx - logf(sm);
-        if (a.lpt_out) a.lpt_out[m] = tl - mx - logf(sm);
-    }
-    if (a.tk)
-    {
-        bool any = false;
-        for (int i = 0; i < a.M; ++i) any |= a.rows[i].topk > 0;
-        if (!any) return;
-        __shared__ TkEnt s_te[TK_ROWS][8 * LP_K];
-        const int nl = a.f.nr * LP_K;
-        for (int x = m; x < a.M * nl; x += 32)       // the lists of every asking row, loaded by the whole warp
-        {
-            const int r = x / nl, p = (x - r * nl) / LP_K;
-            if (a.rows[r].topk > 0) s_te[r][x - r * nl] = head_tk_peer(a, step, p, r, x - r * nl - p * LP_K);
+            if constexpr (RS)
+                if (const int d = rs_draft<RS>(a, tok, m); d >= 0)
+                {
+                    const SampleRow sr = a.rows[m];
+                    float z = 0.f;
+                    for (int p = 0; p < a.f.nr; ++p)
+                    {
+                        const float4* q = reinterpret_cast<const float4*>(peer_slot(a.f, step, a.c, p) + (size_t)m * sizeof(HeadRec));
+                        z += __ldcv(q + 1).z * expf((__ldcv(q).w - mx) * sr.inv_temp);
+                    }
+                    rs_accept(sr, d, expf((tl - mx) * sr.inv_temp) / z, bid, blg, tl);
+                }
+            a.tok_out[m] = bid;
+            a.lp_out[m] = blg - mx - logf(sm);
+            if (a.lpt_out) a.lpt_out[m] = tl - mx - logf(sm);
         }
-        __syncwarp();
-        if (m < a.M && a.rows[m].topk > 0)
+        if (a.tk && any)
         {
-            TkEnt top[LP_K];
-            tk_merge(a.f.nr, [&](int p, int i) { return s_te[m][p * LP_K + i]; }, top);
-            tk_result(a.tk, m, top, mx, sm, blg, tl);
+            __shared__ TkEnt s_te[32][8 * LP_K];   // one warp's rows (the chunk)
+            const int nl = a.f.nr * LP_K, nrow = a.M - b < 32 ? a.M - b : 32;
+            for (int x = threadIdx.x; x < nrow * nl; x += 32)       // the lists of every asking row of the chunk, loaded by the whole warp
+            {
+                const int r = x / nl, p = (x - r * nl) / LP_K;
+                if (a.rows[b + r].topk > 0) s_te[r][x - r * nl] = head_tk_peer(a, step, p, b + r, x - r * nl - p * LP_K);
+            }
+            __syncwarp();
+            if (m < a.M && a.rows[m].topk > 0)
+            {
+                TkEnt top[LP_K];
+                tk_merge(a.f.nr, [&](int p, int i) { return s_te[threadIdx.x][p * LP_K + i]; }, top);
+                tk_result(a.tk, m, top, mx, sm, blg, tl);
+            }
+            __syncwarp();                           // the next chunk reuses s_te
         }
     }
 }
@@ -1461,6 +1465,131 @@ template <bool RS> __device__ __forceinline__ void head_merge_tp(const HeadArgs&
 
 __global__ void __launch_bounds__(1024) k_head_merge_tp(HeadArgs a) { head_merge_tp<false>(a, nullptr); }
 __global__ void __launch_bounds__(1024) k_head_merge_tp_rs(HeadArgs a, const int* tok) { head_merge_tp<true>(a, tok); }
+
+// Relaxed greedy acceptance (GR8_DS_RELAXED_ACCEPT, DS41 DSpark verify steps; rule in relax_accept.h). Not exact when on.
+// Off (Model::rx.on == 0): neither kernel below launches and the head runs its usual kernels.
+// Row m's draft is the step's input token of row m + 1, for greedy rows only (sampled rows keep the exact match), and never
+// for a session's last row (nodraft) or the step's last row.
+__device__ __forceinline__ int rx_draft(const HeadArgs& a, const int* tok, int m)
+{
+    return m + 1 < a.M && !a.rows[m].nodraft && a.rows[m].inv_temp == 0.f ? tok[m + 1] : -1;
+}
+
+// k_head_local with the relaxed payload (launch_head_local with Model::rx.on). A row with a draft d: pad_[0] = d's raw logit
+// (-inf off this slice; d wins over a target id, as k_head_local_rs). With the top-p rule (rx.topp > 0, HeadArgs::nc > 0):
+// also the slice's highest raw logits as candidates, pad_[1] = slice z, pad_[2] = largest unsent logit (head_local_topp at
+// T = 1). The record's argmax is k_head_local's, so k_head_merge / k_head_merge_tp give the exact token before k_head_relax.
+__global__ void __launch_bounds__(1024) k_head_local_rx(HeadArgs a, const int* tok, relax::Rule rx)
+{
+    __shared__ float s_sc[32], s_lg[32], s_mx[32], s_sm[32];
+    __shared__ int s_id[32];
+    const int m = blockIdx.x, t = threadIdx.x, w = t >> 5, l = t & 31;
+    const SampleRow sr = a.rows[m];
+    const float* row = a.logits + (size_t)m * a.ldl;
+    const int d = rx_draft(a, tok, m);
+    float bs = -INFINITY, blg = 0.f, mx = -INFINITY, sm = 0.f;
+    int bid = 0x7fffffff;
+    for (int i = t; i < a.vn; i += 1024)
+    {
+        const float lg = row[i];
+        const int v = a.vlo + i;
+        const float sc = sample_score(sr, lg, v);
+        if (sc > bs) { bs = sc; bid = v; blg = lg; }   // i ascending per thread -> lowest id on ties
+        if (lg > mx) { sm = sm * expf(mx - lg) + 1.f; mx = lg; }
+        else sm += expf(lg - mx);
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+    {
+        const float os = __shfl_xor_sync(0xffffffffu, bs, o), ol = __shfl_xor_sync(0xffffffffu, blg, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bid, o);
+        if (os > bs || (os == bs && oi < bid)) { bs = os; bid = oi; blg = ol; }
+        const float omx = __shfl_xor_sync(0xffffffffu, mx, o), osm = __shfl_xor_sync(0xffffffffu, sm, o);
+        const float nmx = fmaxf(mx, omx);
+        sm = (mx == -INFINITY ? 0.f : sm * expf(mx - nmx)) + (omx == -INFINITY ? 0.f : osm * expf(omx - nmx));
+        mx = nmx;
+    }
+    if (l == 0) { s_sc[w] = bs; s_id[w] = bid; s_lg[w] = blg; s_mx[w] = mx; s_sm[w] = sm; }
+    __syncthreads();
+    if (t == 0)
+    {
+        HeadRec r;
+        r.score = s_sc[0]; r.id = s_id[0]; r.logit = s_lg[0]; r.lmax = s_mx[0]; r.lsum = s_sm[0];
+        for (int i = 1; i < 32; ++i)
+        {
+            if (s_sc[i] > r.score || (s_sc[i] == r.score && s_id[i] < r.id)) { r.score = s_sc[i]; r.id = s_id[i]; r.logit = s_lg[i]; }
+            const float nmx = fmaxf(r.lmax, s_mx[i]);
+            r.lsum = (r.lmax == -INFINITY ? 0.f : r.lsum * expf(r.lmax - nmx)) +
+                     (s_mx[i] == -INFINITY ? 0.f : s_sm[i] * expf(s_mx[i] - nmx));
+            r.lmax = nmx;
+        }
+        r.pad_[0] = r.pad_[1] = r.pad_[2] = 0.f;
+        if (a.tgt || d >= 0)
+        {
+            const int i = (d >= 0 ? d : a.tgt[m]) - a.vlo;
+            r.pad_[0] = i >= 0 && i < a.vn ? row[i] : -INFINITY;
+        }
+        reinterpret_cast<HeadRec*>(send_slot(a.f, *a.stepp, a.c))[m] = r;
+    }
+    const bool rxc = a.nc > 0 && rx.topp > 0.f && d >= 0;   // greedy row: never topp_on
+    if (a.nc > 0 && (topp_on(sr) || rxc))
+    {
+        SampleRow s1 = sr;
+        if (rxc) s1.inv_temp = 1.f;
+        head_local_topp(a, m, row, s1, s_mx);
+    }
+    if (a.tk && sr.topk > 0) head_local_topk(a, m, row);
+    const u64 step = *a.stepp;
+    publish(a.f, a.c, g6::coll_seq(step, a.c, a.f.ncoll), a.ticket);
+}
+
+// grid M, block 256, after the merge kernel on the same stream (it waited for the peers; the slots of this step stay until
+// step + 2). Row m with a draft d that passes relax::ok: tok_out = d, lp_out = d's logprob. Other rows: untouched.
+// mx / sm are merged in the merge kernels' rank order (same floats). Top-p: the mass above l_d is exact when l_d >= the
+// largest unsent logit over the ranks (every token above l_d was sent); else the rule refuses.
+__global__ void __launch_bounds__(256) k_head_relax(HeadArgs a, const int* tok, relax::Rule rx)
+{
+    __shared__ float s_w[8];
+    const int m = blockIdx.x, t = threadIdx.x;
+    const int d = rx_draft(a, tok, m);
+    if (d < 0) return;
+    const u64 step = *a.stepp;
+    float mx = -INFINITY, sm = 0.f, tl = -INFINITY, cut = -INFINITY;
+    for (int p = 0; p < a.f.nr; ++p)
+    {
+        const float4* q = reinterpret_cast<const float4*>(peer_slot(a.f, step, a.c, p) + (size_t)m * sizeof(HeadRec));
+        const float4 v = __ldcv(q), u = __ldcv(q + 1);
+        tl = fmaxf(tl, u.y);
+        cut = fmaxf(cut, u.w);
+        const float nmx = fmaxf(mx, v.w);
+        sm = (mx == -INFINITY ? 0.f : sm * expf(mx - nmx)) + (v.w == -INFINITY ? 0.f : u.x * expf(v.w - nmx));
+        mx = nmx;
+    }
+    const bool cand = rx.topp > 0.f && a.nc > 0;
+    const bool complete = cand && tl >= cut;
+    float above = 0.f;
+    if (complete)
+        for (int i = t; i < a.f.nr * a.nc; i += 256)
+        {
+            const int p = i / a.nc, k = i - p * a.nc;
+            const HeadCand c = reinterpret_cast<const HeadCand*>(peer_slot(a.f, step, a.c, p) + (size_t)a.M * sizeof(HeadRec))[(size_t)m * a.nc + k];
+            if (c.id >= 0 && c.logit > tl) above += expf(c.logit - mx);
+        }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) above += __shfl_xor_sync(0xffffffffu, above, o);
+    if ((t & 31) == 0) s_w[t >> 5] = above;
+    __syncthreads();
+    if (t == 0)
+    {
+        above = 0.f;
+        for (int i = 0; i < 8; ++i) above += s_w[i];
+        if (a.tok_out[m] != d && relax::ok(rx, tl, mx, above, sm, complete))
+        {
+            a.tok_out[m] = d;
+            a.lp_out[m] = tl - mx - logf(sm);
+        }
+    }
+}
 
 // ---------------------------------------------------------------- RoPE (interleaved pairs, FACTS-M0 2(c))
 

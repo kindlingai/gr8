@@ -221,6 +221,7 @@ g++ -std=c++17 -O2 -Wall -DG6_MODEL_FLASH=0 "$REPO/engine/tests/test_flash_s2_co
 g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/ds41_geom_dump.cpp" -o "$T/ds41_geom_dump"
 (cd "$REPO/engine/tests" && DS41_GEOM_DUMP="$T/ds41_geom_dump" python3 -m unittest -q test_ds41_geom)
 <<<<<<< HEAD
+<<<<<<< HEAD
 # k_comp_commit (engine/attn/ds41_attn.cuh: the compressor's pending half after a partly rejected verify chunk) against
 # token-at-a-time truth, with a negative control
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/tests/test_ds41_comp_commit.cpp" -o "$T/test_ds41_comp_commit"
@@ -284,6 +285,29 @@ if [ -f /usr/local/cuda/include/cuda_fp8.h ]; then
     "$REPO/engine/engram/tests/test_act_quant.cpp" -o "$T/engram_act_quant_test"
   "$T/engram_act_quant_test"
 >>>>>>> origin/ds41-engram
+=======
+# DS41 MoE plans: the multi-tile plan (ds_plan_mt.h), the read-once planner and work model (ds_ro.h), and the fc1 B-ring
+# addresses (ds_fc1_bstg.h). The real-route cases need reference route dumps, so they skip here. The multi-tile test compares
+# double sums bit for bit, so it is built without FMA contraction (g++ contracts by default on aarch64).
+g++ -std=c++17 -O2 -Wall -ffp-contract=off "$REPO/engine/kernels/tests/ds_multitile_host_test.cpp" -o "$T/ds_multitile_host_test"
+"$T/ds_multitile_host_test"
+g++ -std=c++17 -O2 -Wall "$REPO/engine/kernels/tests/ds_ro_host_test.cpp" -o "$T/ds_ro_host_test"
+"$T/ds_ro_host_test"
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/kernels" "$REPO/engine/kernels/tests/ds_fc1_bstg_host_test.cpp" -o "$T/ds_fc1_bstg_host_test"
+"$T/ds_fc1_bstg_host_test" 8
+"$T/ds_fc1_bstg_host_test" 32
+# DS41 W4096: RO_MAX 4096 is the largest prefill width, and the RoScratch tile capacity holds the 4096-row plan
+g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" -I "$REPO/engine/kernels" "$REPO/engine/tests/test_ds41_w4096.cpp" -o "$T/test_ds41_w4096"
+"$T/test_ds41_w4096"
+# DS41 tensor-core shared expert: the repack round trip (records -> plain W13 / padded W2p) and GR8_DS_SH_TC through the knob table
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/tests/test_ds41_sh_tc.cpp" -o "$T/test_ds41_sh_tc" "${KNOBS[@]}"
+"$T/test_ds41_sh_tc"
+# DS41 shifted-mHC trunk (engine/mhc/ds_cpu.h) against the torch reference; it needs torch, so it skips without it
+if python3 -c "import torch, numpy" 2>/dev/null; then
+  bash "$REPO/engine/runtime/tests/ds_mhc_cpu_test.sh" "$T/ds_mhc_cpu_test"
+else
+  echo "SKIP ds_mhc_cpu_test: no torch/numpy"
+>>>>>>> origin/ds41-moe
 fi
 python3 "$REPO/engine/tests/test_flash_serve_check.py"
 # Flash serve prefill: the draft cache fill checks the error words once, after its last chunk; every error still fails the request.
