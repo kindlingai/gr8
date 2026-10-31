@@ -786,7 +786,9 @@ int main(int argc, char** argv)
     {
         g6::FabricConfig mc = cfg;
         if (cm.run1) { mc.slot_bytes = cm.slot_bytes; mc.run1 = cm.run1; mc.run2 = cm.run2; mc.slot_bytes1 = cm.slot_bytes1; mc.slot_bytes2 = cm.slot_bytes2; mc.pool = cm.pool; }
+#if G6_MODEL_DS41
         if (rs_k) { mc.run3 = cm.run3; mc.slot_bytes3 = cm.slot_bytes3; mc.ncoll = ds41::rs::main_ncoll(NC, rs_k, rowshard); }   // the RS AG collectives plus the row-shard state collective
+#endif
         mc.sge2 = pf_direct;                                                                     // GR8_DS_PF_DIRECT: flat RS slices = 2 SGEs
         fab.init(mc);
     }
