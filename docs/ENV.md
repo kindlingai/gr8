@@ -63,6 +63,30 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_DRAFT_HEAD_TPC` | int | `1` | 1\|2\|4\|8\|16\|32 | With GR8_DRAFT_HEAD_I4 or GR8_DFL_HEAD_I4, the INT4 head GEMV's tiles per CTA. Its product with GR8_DRAFT_HEAD_KS must be at most 32. |
 | `GR8_DRAFT_LOGIT_DUMP` | path | unset |  | Every rank writes its vocab slice of the MTP first draft pass logits to this path plus .rank<R>. Needs --mtp and no --serve. |
 | `GR8_DRAFT_PAR` | int | 2 when serving DFlash2 with MTP, else 0 | 0..2 | S2 with DFlash2, a solo round runs the drafter step on its own CUDA stream under MTP's first form. 2 also puts drafting steps on a high-priority stream. Same bytes as serial. |
+| `GR8_DS41_BORROW_TOPK` | path | unset: a reuse layer whose index source is outside the layer subset reads the last list written |  | A file of raw int32 [rows][512] top-k lists. A run over a layer subset reads it in place of an index source that the subset leaves out. |
+| `GR8_DS41_IDX_DENSE_MAXK` | int | `0` | 0.. | Layers 24 to 36 run the dense index stage in place of the candidate-block path while a chunk's key bound is at most this many keys. 0 = always the candidate path. |
+| `GR8_DS41_IDX_LOGITS` | text | `mma` | mma\|dp4a\|mmafast | Kernel of the dense index logits: mma = tensor cores, bit-identical to dp4a; dp4a = the reference kernel; mmafast = tensor cores with their own fp32 rounding. |
+| `GR8_DS41_IDX_MAXK` | int | `0` | 0.. | Upper bound on the keys of the dense index grid, below the pool capacity. For bring-up. 0 = no bound. |
+| `GR8_DS41_IDX_PIPE_B` | flag | `0` |  | 1 = the dense index logits of the source layers 2, 8, 14 and 20 run on the pipelined kernel (launch_logits_pipe). The candidate layers keep their path. |
+| `GR8_DS41_IDX_PIPE_QR` | flag | `0` |  | 1 = the dense index logits run on the query-stationary cp.async kernel (launch_logits_pipe_qr). |
+| `GR8_DS41_IDX_PW` | int | MX, the decode width | 0..65536 | Prefill chunk width of the indexer: every per-row buffer of the indexer holds max(MX, PW) rows. The step driver's per-row arrays must hold the same number of rows. |
+| `GR8_DS41_IDX_PWK` | int | `0` | 0.. | Ratio-1 key rows the indexer scratch holds logits for, when that is below capacity plus rows. It bounds the largest position the indexer serves. 0 = capacity plus rows. |
+| `GR8_DS41_IDX_Q_TRIG` | flag | `0` |  | 1 = the index query's rope sin and cos are computed once per row and cached. |
+| `GR8_DS41_IDX_REUSE` | flag | `0` |  | 1 = layers 24 to 36 keep layer 20's top-512 list and run no wq_b, logits or top-k of their own; layer 20 then skips its candidate blocks. |
+| `GR8_DS41_IDX_TOPK` | text | `mc` | mc\|1cta | Top-k kernel of the dense index stage: mc = several CTAs per long row, 1cta = the single-CTA reference kernel. Both give the same lists. |
+| `GR8_DS41_IDX_WQB_TC` | int | `0` | 0.. | The indexer's wq_b runs on the attention block's tensor-core GEMM at this many rows or more. Not bit-exact against the scalar GEMM. 0 = off. |
+| `GR8_DS_ATTN_CPA` | flag | `0` |  | 1 = the attention core gathers its K rows with cp.async (k_attn_cpa). The output is bit-identical to k_attn. |
+| `GR8_DS_ATTN_GV` | flag | `1` |  | Decode projections of up to 8 rows run on the MXFP8 GEMV where the weight has .mx.gv records. 0 = the generic MXFP8 GEMM for every projection. |
+| `GR8_DS_ATTN_GV_KS` | int | `0` | 0.. | k-parts per output tile of the attention GEMV. 0 = the built-in pick per shape (gv_pick_ks). |
+| `GR8_DS_ATTN_GV_TPC` | int | `0` | 0.. | Output tiles per CTA of the attention GEMV. 0 keeps the built-in 1. |
+| `GR8_DS_ATTN_PW` | int | `0` | 0.. | Prefill row capacity of the attention ops, apart from the decode width MX. A value above MX gives every layer a window ring of 128 + PW - 1 slots and one scratch that all layers share, and lets one op take PW rows. 0, or a value up to MX, keeps the per-layer scratch and the MX row limit. |
+| `GR8_DS_ATTN_SPLIT` | flag | `0` |  | 1 = two CTAs per row and head group in the attention core, joined by an online-softmax merge. Needs GR8_DS_ATTN_CPA=1. |
+| `GR8_DS_ATTN_TC` | flag | `0` |  | 1 = the five attention projections at 9 or more rows run on the block-scaled tensor-core GEMM (k_gemm_mx8t) where the shape allows it. |
+| `GR8_DS_ATTN_TC_MF` | int | `0` | 0\|1\|2 | Grid order of the tensor-core GEMM: 0 = the N tile is the fastest grid dimension, 1 = the M tile is, 2 = the M tile only for a weight of 100 MiB or more (the Engram wkv). |
+| `GR8_DS_COMP_FP8` | flag | `0` |  | 1 = the ratio-2 compressor weights are packed to E4M3 with UE8M0 scales at bind time and prefill steps of 9 or more rows use them. Lossy, and its effect on quality has not been measured. |
+| `GR8_DS_DSP_GV` | flag | `0` |  | 1 = the DSpark drafter's projections run on the MXFP8 GEMV for 1 to 8 rows. A projection that cannot take the GEMV then stops the process. 0 = the generic MXFP8 GEMM. |
+| `GR8_DS_DSP_TC` | flag | `0` |  | 1 = a DSpark prefill projection of more than 8 rows in one group runs on the attention block's tensor-core MXFP8 GEMM (ds41_gemm_mx_tc) when that entry takes the shape, else on the generic GEMM. |
+| `GR8_DS_ENGRAM` | flag | `0` | 0\|1 | 1 runs Engram at layers 1 and 14: every step hashes the last four tokens of each row, reads this rank's table rows from NVMe and adds the gated result to the trunk. It needs GR8_DS_ENGRAM_PREFIX. 0 skips Engram, and the other GR8_DS_ENGRAM_ knobs are not read. |
 | `GR8_DS_GATE_RO` | flag | `0` |  | 1: the read-once prefill path computes the main layers' gate logits with k_gate_logits_ro (8 experts x 8 tokens per warp) instead of k_gate_logits_mt. Same fma chain per token and expert, so the logits are the same bytes. The 128-expert draft layers keep k_gate_logits_mt. |
 | `GR8_DS_MOE_FC1BSTG` | flag | `0` |  | 1: the read-once fc1 expert loop copies its FP16 B fragments to a two-record cp.async shared ring before the same MMA. Every value is the same. |
 | `GR8_DS_MOE_FC2STG` | flag | `0` |  | 1: the read-once fc2 expert loop loads a group's act tile into registers in one batch and then stores it to shared memory, instead of one load and one store per trip. Every address and value is the same. Decode, k_fc1_ro and the shared expert are not touched. |
@@ -74,6 +98,8 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_DS_RO_L2LA` | int | `0` | 0..1048576 | L2 lookahead of the read-once expert loop, in CTAs. While CTA b of k_fc1_ro runs, its warp 0 prefetches into L2 the weights of CTA b + n; k_fc2_ro (2 CTAs per SM) looks 2n ahead. A hint only: every value, order and write is the same. 0: off. |
 | `GR8_DS_RO_ORDER` | flag | `0` |  | 1: the read-once expert loop starts its CTA groups in the order k_order_ro computes (heavy and light experts merged in proportion to their work, heaviest first) instead of expert-id order. Only the start order changes, so every output byte is the same. |
 | `GR8_DS_SH_TC` | flag | `0` |  | 1: the shared expert of the read-once prefill path runs on the tensor-core MXFP8 GEMM (x and act quantized to E4M3 per 32 with E8M0 scales), and the combine reads its bf16 output. Not bit-identical to 0. Decode and the chunked path keep the GEMV. Costs a plain copy of the shared weights per MoE layer (9,461,760 bytes) plus scratch, and needs the attention object's ds41_gemm_mx_tc and ds41_sh_* entries linked. |
+| `GR8_DS_SRC_FAST` | int | `0` | 0..3 | Bits of the source-layer fast paths: 1 = the ratio-2 compressor projections of up to 8 rows use k_f32gemv2 (bit-identical to k_f32gemm2), 2 = the indexer's wq_b runs on the MXFP8 GEMV (a different summation order). |
+| `GR8_DS_WOB_PERSIST` | flag | `0` |  | 1 = the coalesced-epilogue wo_b GEMM of a direct-send prefill chunk runs as a persistent kernel (k_gemm_mx8t_c2_persist). |
 | `GR8_DTR` | flag | `1` |  | Uses the exlr8 release's dense trellis matrices (q_b, o_proj, the dense MLP) where a layer has them. 0 = the int4 or MXFP8 records, which the layer must then have. |
 | `GR8_DTR_NBFAST` | flag | `1` |  | Single-matrix dense trellis GEMVs whose group stride exceeds their block stride assign CTAs output block first instead of k part first. CTA order only. |
 | `GR8_DTR_NBFAST_OUT` | flag | `1` |  | As GR8_DTR_NBFAST, for single-matrix dense trellis GEMVs whose block stride is at least their group stride. |
@@ -245,6 +271,8 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_S2_DSEL_PROBE` | int | `4` |  | S2 drafter choice: every this-many MTP rounds the DFlash2 drafter also drafts, and its drafts are scored against the next tokens. |
 | `GR8_S2_DSEL_TABLE` | text | unset |  | With GR8_S2_DSEL_MODEL=1, the drafter choice's cost table: a key:value list (v1..v8, d, m, e, p and optional keys) or the path of a file holding one. |
 | `GR8_S2_GROW` | flag | `1` | 0\|1 | S2: a session holds the KV pages it needs now and takes more as its output grows, while every live session can still reach its worst case. 0 = every run holds its worst case from admission. |
+| `GR8_S2_NOTICE_MAX` | int | `8` | 2..8 | S2: the latest boundary a notice may target, in boundaries after the one it was anchored at. Lower only from a measured margin: a notice that lands after its boundary stops the engine. |
+| `GR8_S2_TAIL_FIRST` | flag | `0` | 0\|1 | S2: a session with only its prompt tail left is served before any prefill, and its one-row tail does not ask for a decode round, so a burst of short prompts reaches its first tokens one tail a step. |
 | `GR8_SPEC_DRAFT` | floats | `8.1,5.5,2.1` |  | S2 with DFlash2: overrides the DFlash2 round, MTP round and each extra MTP chain step costs with three comma- separated nonnegative times in ms. |
 | `GR8_SPEC_TABLE` | floats | built-in measured table |  | S2 with DFlash2: overrides the verify costs for 1..8 rows with eight comma-separated positive times in ms, for the DFlash2 draft count and the drafter choice. |
 | `GR8_TR3_W2ALL` | flag | `0` |  | Uses the window-2 fc1 split (256-thread CTAs, KS1 x2, WG 1) at M > 1 on every MoE layer, not only layers with 2-bit units. Same k ranges and order, so the same bits (bind.cuh k1_split). |
@@ -261,6 +289,13 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_DEC_PROF` | flag | `0` |  | Measures decode stages with a synchronize at every mark and prints them per rank. Plain launches only, the engine stops with --graph. |
 | `GR8_DFL_DUMP` | path | unset |  | With --dflash, rank 0 writes every draft step's context features, drafts and committed tokens to this file, for engine/ref/dflash2_replay.py. |
 | `GR8_DRAFT_IN_DUMP` | path | unset |  | Rank 0 writes the inputs of every MTP first draft pass to this file. Needs --mtp and no --serve. |
+| `GR8_DS_C2_TRACE` | flag | `0` |  | 1 = count every launch of the coalesced-epilogue wo_b GEMM (k_gemm_mx8t_c2), so a run can print ds41a::c2_dispatch_count() at stop. |
+| `GR8_DS_ENGRAM_CACHE_MIB` | int | `4096` | 1..1048576 | Size in MiB of the host cache of Engram table rows, shared by both layers. It holds 256-byte rows, so 4096 MiB holds 16 M rows. |
+| `GR8_DS_ENGRAM_IO_THREADS` | int | `32` | 1..1024 | Threads that read Engram table rows from NVMe. A decode step needs about 20 reads and a prefill chunk thousands; 64 reads a prefill chunk fastest. |
+| `GR8_DS_ENGRAM_LOOKAHEAD` | flag | `0` | 0\|1 | 1 starts a host thread that, during a solo prefill, reads the next chunk's layer 1 rows into the row cache while the current chunk runs the later layers. It only warms the cache: the results do not change. |
+| `GR8_DS_ENGRAM_PREFIX` | path | no Engram tables; GR8_DS_ENGRAM=1 then stops the boot |  | The path prefix of this rank's Engram files: PREFIX.engram.json (the manifest), PREFIX.engram.cmap (the token map), and PREFIX.engram.L001.w8 / .s8 and PREFIX.engram.L014.w8 / .s8 (the rows and scales of this rank's slice of each table). |
+| `GR8_DS_ENGRAM_VERBOSE` | flag | `0` | 0\|1 | 1 prints one line of row store numbers per layer and step on stderr: requests, cache hits, reads, bytes and time. |
+| `GR8_DS_ENGRAM_WAYS` | int | `16` | 1..16 | Ways of the set-associative Engram row cache. |
 | `GR8_DS_MOE_ELOG` | flag | `1` |  | 1: every prefill router call (more than 32 rows) writes the distinct experts of each layer to a device ring that the host reads after the chunk. 0: no record is written. |
 | `GR8_FABRIC_CONNECT_TRIES` | int | `1200` |  | Fabric TCP connect attempts, 100 ms apart. Raise it when ranks load at different speeds. |
 | `GR8_GLM53F_DRAFT_CACHE_DUMP` | path | unset |  | Flash with --mtp: each rank writes its draft cache pages before the first live draft to this path plus .s<seq>.r<rank>.bin. |
@@ -363,7 +398,10 @@ Read by test programs, audits and benchmarks. `g6m4 --serve` refuses to start wh
 | `GR8_TEST_CPG_LOCAL` | int | `0` |  | cpgroups: puts the N most recent positions first in each row's index list, as a local window. 0: uniform random positions. |
 | `GR8_TEST_CP_PF_BREAK` | text | unset | gather\|back | Negative control for the CP prefill staging gate in m4sim: skips the gather or the back half of the staging so the gate must fail. |
 | `GR8_TEST_CP_PF_NET` | flag | `0` |  | In m4sim, the CP prefill gather runs as g6m4's real fabric does it, each rank filling its own pool and sending tail pages to the others, instead of the loopback gather. |
+| `GR8_TEST_DS41_KERNELS_DIR` | path | unset |  | engine/kernels, for the loader test that checks the Rust mx4g packer against the C++ one (mxfp4_pack.h); unset skips it. |
+| `GR8_TEST_DS41_MGATE_DIAG` | flag | `0` |  | ds41_attn_test --mgate: 1 prints, for a kv compare that differs, up to 8 differing elements of the chunk and of the single-row calls, before and after kv prep. |
 | `GR8_TEST_DS41_RO_CAP_MB` | float | `400` | 0.. | ds_ro_flags_test: the memory cap in MB on the test's device and host allocations. A mode that would allocate more stops before it runs. |
+| `GR8_TEST_DS41_TOKENIZER_DIR` | path | unset |  | The DeepSeek-V4.1-Flash tokenizer directory (tokenizer.json, tokenizer_config.json) the front end's ds41 dialect test reads; unset skips it. |
 | `GR8_TEST_FUZZ_ROUNDS` | int | `40` |  | Rounds of the front end tokenizer fuzz test. |
 | `GR8_TEST_IDX_DUMP` | path | unset |  | m4sim writes rank 0's selected key ids of the first --layers layer to this file for each main step from GR8_LOGIT_DUMP_FROM on. |
 | `GR8_TEST_KVMAN_LEDGER` | path | `kvman-ledger` |  | flash_kv_chunks_test: the kvman-ledger binary. |

@@ -220,8 +220,6 @@ g++ -std=c++17 -O2 -Wall -DG6_MODEL_FLASH=0 "$REPO/engine/tests/test_flash_s2_co
 # DeepSeek-V4.1-Flash-1017 geometry (engine/model_geom_ds41.h) against the release's config.json
 g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/ds41_geom_dump.cpp" -o "$T/ds41_geom_dump"
 (cd "$REPO/engine/tests" && DS41_GEOM_DUMP="$T/ds41_geom_dump" python3 -m unittest -q test_ds41_geom)
-<<<<<<< HEAD
-<<<<<<< HEAD
 # k_comp_commit (engine/attn/ds41_attn.cuh: the compressor's pending half after a partly rejected verify chunk) against
 # token-at-a-time truth, with a negative control
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/tests/test_ds41_comp_commit.cpp" -o "$T/test_ds41_comp_commit"
@@ -265,7 +263,6 @@ if python3 -c "import torch, numpy" 2>/dev/null; then
   python3 "$REPO/engine/attn/tests/ds41_comp_fp8_cpu.py"
 else
   echo "SKIP test_ds41_idx_ref, ds41_kernels_selftest, ds41_comp_fp8_cpu: no torch/numpy"
-=======
 # DeepSeek-V4.1 Engram (engine/engram): the token ring against the reference's positional cache, the W-row prefill path
 # against 32-row slabs (window, hash, fetch on real files, dequant, 4-rank sum, gate, lookahead), the row store on real
 # files, and the boot knobs. The hash and dequant tests against the official reference need its files: run_hash_test.sh
@@ -284,8 +281,6 @@ if [ -f /usr/local/cuda/include/cuda_fp8.h ]; then
   g++ -std=c++17 -O2 -ffp-contract=off -Wall -Wextra -I "$REPO/engine/engram" -I /usr/local/cuda/include \
     "$REPO/engine/engram/tests/test_act_quant.cpp" -o "$T/engram_act_quant_test"
   "$T/engram_act_quant_test"
->>>>>>> origin/ds41-engram
-=======
 # DS41 MoE plans: the multi-tile plan (ds_plan_mt.h), the read-once planner and work model (ds_ro.h), and the fc1 B-ring
 # addresses (ds_fc1_bstg.h). The real-route cases need reference route dumps, so they skip here. The multi-tile test compares
 # double sums bit for bit, so it is built without FMA contraction (g++ contracts by default on aarch64).
@@ -307,7 +302,6 @@ if python3 -c "import torch, numpy" 2>/dev/null; then
   bash "$REPO/engine/runtime/tests/ds_mhc_cpu_test.sh" "$T/ds_mhc_cpu_test"
 else
   echo "SKIP ds_mhc_cpu_test: no torch/numpy"
->>>>>>> origin/ds41-moe
 fi
 python3 "$REPO/engine/tests/test_flash_serve_check.py"
 # Flash serve prefill: the draft cache fill checks the error words once, after its last chunk; every error still fails the request.
