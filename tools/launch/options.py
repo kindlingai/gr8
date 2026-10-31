@@ -272,24 +272,11 @@ def validate(o):
     if not str(o.get('DEFAULT_MAX_TOKENS')).isdigit():
         raise OptionError(f'--default-max-tokens {o.get("DEFAULT_MAX_TOKENS")}: want a whole number (0 = fit SHARE_LIMIT)')
     effort = o.get('DEFAULT_REASONING_EFFORT')
-    if model.dialect == 'ds41':
-        # the release's encoder takes an integer 1..100 (what the effort prefix prints); the names are the front end's map
-        if effort is not None and effort not in ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') and \
-                not (effort.isdigit() and 1 <= int(effort) <= 100):
-            raise OptionError(f'--default-reasoning-effort {effort}: want a whole number 1 to 100, or none, minimal, low, '
-                              'medium, high, xhigh or max')
-    elif effort == 'none' and not model.thinking_off:
+    if effort == 'none' and not model.thinking_off:
         raise OptionError('--default-reasoning-effort none: GLM 5.3 cannot turn thinking off (use low, or '
                           '--default-thinking-budget)')
-    elif effort not in (None, 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
+    if effort not in (None, 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
         raise OptionError(f'--default-reasoning-effort {effort}: want minimal, low, medium, high, xhigh or max')
-    if o.get('CHUNK') is not None and model.name != 'ds41':
-        raise OptionError(f'--chunk: ds41 only (the prompt rows a step of the DeepSeek serve path); ./gr8 {model.name} sets its own')
-    if o.get('EAGER') is not None and model.name != 'ds41':
-        raise OptionError(f'--eager: ds41 only (the DeepSeek serve path runs eagerly without --graph); ./gr8 {model.name} always captures')
-    if any(w.startswith('G6_DS_') for w in (o.get('G6ENV_X') or '').split()) and model.name != 'ds41':
-        raise OptionError(f'--g6env-x names a G6_DS_* variable: those are DeepSeek-V4.1 engine variables, and '
-                          f'./gr8 {model.name} serves another model')
     if o.get('GRAMMAR') not in ('0', '1'):
         raise OptionError(f'--grammar {o.get("GRAMMAR")}: want 0 or 1')
     if o.get('ALLOW_THINKING_OFF') not in ('0', '1'):

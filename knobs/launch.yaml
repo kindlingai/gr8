@@ -7,7 +7,7 @@ options:
   GR8_MODEL:
     scope: cluster
     doc: >-
-      the model: glm53 (GLM-5.3), glm53f (GLM-5.3-Flash) or ds41 (DeepSeek-V4.1-Flash). ./gr8 <model> sets it; the image reads it from docker/.env.
+      the model: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash). ./gr8 <model> sets it; the image reads it from docker/.env.
       up, check, prepare and show-config refuse to run without it, and MODEL must be a release of it. ./gr8 models lists
       each model's release, TP sizes and variants
   TP:
@@ -271,14 +271,6 @@ options:
     scope: cluster
     doc: >-
       rejection = rejection sampling of drafts at temperature > 0
-  CHUNK:
-    scope: cluster
-    doc: >-
-      ds41: prompt rows a step when the prompt runs as decode steps (the engine's --chunk), 1 to 8; default 8
-  EAGER:
-    scope: cluster
-    doc: >-
-      ds41: 1 = every step runs eagerly, without captured graphs (the engine without --graph); default 0
   REUSE:
     scope: cluster
     doc: >-

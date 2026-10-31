@@ -10,7 +10,6 @@ import fcntl
 import hashlib
 import json
 import os
-import re
 import shutil
 import signal
 import socket
@@ -154,13 +153,6 @@ def resolve_model(o, refresh=False, log=log):
                 raise modelset.ModelError(f'--model {model}: want a pseudo engine release, a directory with '
                                           'responses.toml and the tokenizer files')
             ms = modelset.pseudo_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
-        elif models.of(o) is models.DS41:   # the published checkpoint, read in place: no exlr8 files, no variants
-            if not modelset.is_ds_checkpoint(model):
-                raise modelset.ModelError(f'--model {model}: want the DeepSeek-V4.1-Flash-1017 checkpoint directory '
-                                          '(config.json, model.safetensors.index.json, the shards, tokenizer.json and '
-                                          'tokenizer_config.json)' if model else
-                                          'no model: pass --model <DeepSeek-V4.1-Flash-1017 checkpoint directory>')
-            ms = modelset.ds_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
         elif hf:
             if not o.get('MODEL_CACHE'):
                 raise modelset.ModelError(f'--model {model} needs --model-cache <local dir>: each box fetches its part '
@@ -697,10 +689,7 @@ class Supervisor:
                              f'{self.home}/venv/bin/pip install -r frontend/requirements.txt')
         m = mem_available_gib()
         log(f'MemAvailable {m} GiB' if m is not None else 'MemAvailable unknown')
-        if m is not None and m < 8 and models.of(o).dialect == 'ds41':
-            fails.append(f'MemAvailable is {m} GiB: the engine stops a boot under G6_MEM_MIN (8 GiB), so something else '
-                         'holds this box\'s memory; free it first')
-        elif m is not None and m < 8:
+        if m is not None and m < 8:
             need = (f'about {modelset.expert_gb(self.variant.path, int(o.get("TP"))):.0f} GB of experts'
                     if self.variant and self.variant.path else 'most of the box')
             log(f'warning: MemAvailable is {m} GiB before boot: something else holds memory (a rank at '
@@ -843,7 +832,7 @@ class Supervisor:
         self.check_n = 0
         env = self.engine_env(plan)
         # Flash takes the second rail for prefill only
-        ips2 = '--ips2' if models.of(o).name in ('glm53', 'ds41') else '--pf-ips2'
+        ips2 = '--ips2' if models.of(o).name == 'glm53' else '--pf-ips2'
         argv = ['./bin/' + engine_bin(o), '--rank', str(r), '--ips', ','.join(hs['ips']), ips2, ','.join(hs['ips2']),
                 '--proxy-cpu', o.get('PROXY_CPU'), *plan['args']]
         argv[1:1] = self.ring_args()
@@ -863,11 +852,8 @@ class Supervisor:
         tmo = float(plan['knobs'].get('READY_TMO') or 1800)
         t0, ask_at = time.monotonic(), tmo
         log(f'engine started (epoch {hs["epoch"]}); waiting for it to load (up to {tmo:.0f}s)')
-        relay = StageRelay(os.path.join(self.out, f'g6m4.r{r}.err')) if models.of(o).dialect == 'ds41' else None
         while True:
             self.watch()
-            for line in relay.new() if relay else ():
-                log(f'{time.monotonic() - t0:6.0f}s {line}')
             if r == 0:
                 if os.path.exists(ready):
                     break
@@ -882,8 +868,6 @@ class Supervisor:
             elif time.monotonic() - t0 > tmo + 600:
                 raise Stop(1, 'the head did not report serving')
             time.sleep(1)
-        for line in relay.new() if relay else ():
-            log(f'{time.monotonic() - t0:6.0f}s {line}')
         if r == 0:
             log(f'engines ready after {time.monotonic() - t0:.0f}s')
             self.start_shim(work)
@@ -949,14 +933,7 @@ class Supervisor:
             os.unlink(sock)
         except FileNotFoundError:
             pass
-        model = models.of(o)
         front = [self.front_bin()]
-        if model.dialect != 'glm':
-            front += ['--dialect', model.dialect]
-        if model.served:
-            front += ['--served-model-name', model.served]
-        if model is models.DS41 and plan['knobs'].get('REUSE') == '1':
-            front += ['--enable-prompt-tokens-details']
         if o.get('DEFAULT_MAX_TOKENS') != '0':
             front += ['--default-max-tokens', o.get('DEFAULT_MAX_TOKENS')]
         else:   # a request within the limit, guard rows included, shares decode steps: keep a page in hand for the guard
@@ -965,7 +942,7 @@ class Supervisor:
             front += ['--default-reasoning-effort', o.get('DEFAULT_REASONING_EFFORT')]
         if o.get('DEFAULT_THINKING_BUDGET') != '0':
             front += ['--default-thinking-budget', o.get('DEFAULT_THINKING_BUDGET')]
-        if o.get('ALLOW_THINKING_OFF') == '1' and model.dialect == 'glm':   # ds41 turns thinking off by itself
+        if o.get('ALLOW_THINKING_OFF') == '1':
             front += ['--allow-thinking-off']
         if o.get('UNDECLARED_TOOL_CALLS') != 'text':
             front += ['--undeclared-tool-calls', o.get('UNDECLARED_TOOL_CALLS')]
@@ -986,12 +963,6 @@ class Supervisor:
         sock = os.path.join(self.home, 'run', 'engine.sock')
         argv = [self.py(), os.path.join(REPO, 'frontend', 'g6s2shim.py'), '--dir', work, '--sock', sock,
                 '--sessions', self.o.get('SESS') or '8']
-        model = models.of(self.o)
-        if model is models.DS41:  # DS41 pool_rows = SESS * per-session CAP, unlike the shared GLM pool
-            argv += ['--capacity-slots', self.o.get('SESS') or '8']
-        if model.vocab:     # the shim's hello and id bound default to GLM-5.3's: a DeepSeek engine takes ids 0..129279 only
-            argv += ['--model-name', model.served or model.name, '--vocab-size', str(model.vocab),
-                     '--eos-ids', ','.join(map(str, model.eos_ids))]
         if self.o.get('TP') == '6':
             argv += ['--stall-timeout', '2400']
         self.spawn('shim', self.pin() + argv, REPO, env={**os.environ, 'PYTHONPATH': os.path.join(REPO, 'frontend')})
@@ -1160,30 +1131,6 @@ def engine_build(home, name='g6m4'):
 
 def opt_timeout(o):
     return float(o.int('JOIN_TIMEOUT'))
-
-
-# The engine's boot-stage lines on stderr: "# rank R: boot 41.3 s <phase>" at each phase of the boot (connect, weights, graph
-# capture), and the loader's "# rank R: pack 72.1 GB loaded + sha256-checked in 190.2 s (0.38 GB/s)" / "... -> device image".
-BOOT_STAGE = re.compile(r'^# rank (\d+): (boot \d+(?:\.\d+)? s .*|pack \d.*|.* -> device image .*)$')
-
-
-class StageRelay:
-    """Reads a rank's engine stderr as it grows and returns the boot-stage lines, so the supervisor log shows each rank's
-    breakdown while the engine loads (startup first: where the minutes go, per rank)."""
-
-    def __init__(self, path):
-        self.path, self.pos, self.partial = path, 0, b''
-
-    def new(self):
-        try:
-            with open(self.path, 'rb') as f:
-                f.seek(self.pos)
-                data = f.read()
-        except OSError:
-            return []
-        self.pos += len(data)
-        *whole, self.partial = (self.partial + data).split(b'\n')
-        return [m.group(0)[2:] for m in (BOOT_STAGE.match(ln.decode(errors='replace')) for ln in whole) if m]
 
 
 def tail(path, n, nbytes=65536):
