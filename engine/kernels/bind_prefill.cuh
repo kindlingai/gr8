@@ -108,6 +108,7 @@ struct Tensors
     Tensor s[NMX];                    //                the .scales tensor [N][K/32]
     int fc1_wide = 0;                 // set if bind::widen_fc1 ran on this tr3.fc1 (K3 experts in the wide order, tr3_wide.cuh)
     int fc2_wide = 0;                 // set if bind::widen_fc2 ran on this tr3.fc2
+    const uint8_t* const* ptab = nullptr;   // EL3 (#151): the layer's piece table (bind::LayerTensors::ptab); nullptr = the pack layout
     int k2 = 1;                       // 2-bit units in the layer (bind::LayerTensors::k2 after bind::scan_widths)
     int k3 = 1;                       // 3-bit units in the layer (bind::LayerTensors::k3 after bind::scan_widths)
     int sh_trellis = 0;               // shared expert as trellis row 256 (bind::LayerTensors::sh_trellis)
@@ -2010,6 +2011,7 @@ struct Expert
     int t_wide = 0;                   // K3 experts of t_fc1 are in the wide order
     const uint8_t* t_fc2 = nullptr;
     int t_wide2 = 0;                  // K3 experts of t_fc2 are in the wide order
+    const uint8_t* const* t_ptab = nullptr;   // EL3 (#151): the layer's piece table (ptab.cuh), nullptr = t_fc1 / t_fc2 at the table offsets
     const __half* t_v1 = nullptr;
     const __half* t_v2 = nullptr;
     const __half* t_v3 = nullptr;
@@ -2517,8 +2519,10 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
         sW += grp * TR3W_GROUP;
     }
     const __half* suh = A.t_v1 + (brow * 2 + mat) * HID;
-    const uint8_t* wb = (NBL == 1 ? mw : A.t_fc1 + tr[0] + static_cast<size_t>(b * 2 + mat) * (static_cast<size_t>(KSH) * 8 * TB))
-                        + static_cast<size_t>(warp) * TB;
+    const uint8_t* wb;
+    if (NBL == 1) wb = mw;
+    else { const uint8_t* m2; tr3_fc1_unit(A.t_fc1, A.t_ptab, nullptr, static_cast<int>((tr - A.t_tab) / 6), tr, b * 2 + mat, m2); wb = m2; }
+    wb += static_cast<size_t>(warp) * TB;
     Tr3Lane<BITS, false, CB> ld;
     ld.init(lane);
     constexpr int NB = HID / 128;
@@ -3020,9 +3024,8 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc1(Expert A)
 #ifdef PF_SKIPPRO
     const bool pro = b == 0 || (static_cast<int>(tr[5]) + b) % 4 == 0;
 #endif
-    size_t off;
-    const int k = tr3_unit(A.t_kmix, sg[0], tr, b * 2 + mat, off);
-    const uint8_t* mw = A.t_fc1 + off;
+    const uint8_t* mw;
+    const int k = tr3_fc1_unit(A.t_fc1, A.t_ptab, A.t_kmix, sg[0], tr, b * 2 + mat, mw);
 #ifdef PF_AOP
     if (AOPK && A.aop)      // AOPK = false: the stock instantiation (same code as a build without PF_AOP)
     {
@@ -3326,7 +3329,7 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc1f(Expert A)
     for (int e = 0; e < NE; ++e)
     {
         kk[e] = 0; mw[e] = nullptr;
-        if (e < nblk) { size_t off; kk[e] = tr3_unit(A.t_kmix, sg[0], tr, (e0 + e) * 2 + mat, off); mw[e] = A.t_fc1 + off; }
+        if (e < nblk) kk[e] = tr3_fc1_unit(A.t_fc1, A.t_ptab, A.t_kmix, sg[0], tr, (e0 + e) * 2 + mat, mw[e]);
     }
     bool fat = nblk == NE;
     fat = fat && (kk[0] == 3 || (K2 && kk[0] == 2));        // wide-order groups only (see f12_run)
@@ -3694,9 +3697,8 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc1q(Expert A)
     if (b >= static_cast<int>(tr[3])) return;
     if (threadIdx.x < rows) sRow[threadIdx.x] = A.rr_row[r0 + threadIdx.x];
     __syncthreads();
-    size_t off;
-    const int k = tr3_unit(A.t_kmix, sg[0], tr, b * 2 + mat, off);
-    const uint8_t* mw = A.t_fc1 + off;
+    const uint8_t* mw;
+    const int k = tr3_fc1_unit(A.t_fc1, A.t_ptab, A.t_kmix, sg[0], tr, b * 2 + mat, mw);
     if (k == 3) fc1q_body<3, EB, CB>(A, tr, b, mat, r0, rows, sX, sS, sRow, mw);
     else if (!K2 || k == 4) fc1q_body<4, EB, CB>(A, tr, b, mat, r0, rows, sX, sS, sRow, mw);
     else fc1q_body<K2 ? 2 : 4, EB, CB>(A, tr, b, mat, r0, rows, sX, sS, sRow, mw);
@@ -3848,11 +3850,11 @@ __global__ void __launch_bounds__(512, 1) k_pf_fc1w(Expert A)
     int* sRow = reinterpret_cast<int*>(wm_sm + WM_ST * (WM_SA + WM_SW) + 2 * WM_SB);
     if (threadIdx.x < WM_R) sRow[threadIdx.x] = threadIdx.x < rows ? A.rr_row[r0 + threadIdx.x] : 0;
     __syncthreads();
-    size_t off;
-    const int k = tr3_unit(A.t_kmix, w[0], tr, b * 2 + mat, off);
-    if (k == 4) fc1w_body<4, EB, CB>(A, tr, b, mat, r0, rows, A.t_fc1 + off, wm_sm);
-    else if (k == 3) fc1w_body<3, EB, CB>(A, tr, b, mat, r0, rows, A.t_fc1 + off, wm_sm);
-    else fc1w_body<2, EB, CB>(A, tr, b, mat, r0, rows, A.t_fc1 + off, wm_sm);
+    const uint8_t* mw;
+    const int k = tr3_fc1_unit(A.t_fc1, A.t_ptab, A.t_kmix, w[0], tr, b * 2 + mat, mw);
+    if (k == 4) fc1w_body<4, EB, CB>(A, tr, b, mat, r0, rows, mw, wm_sm);
+    else if (k == 3) fc1w_body<3, EB, CB>(A, tr, b, mat, r0, rows, mw, wm_sm);
+    else fc1w_body<2, EB, CB>(A, tr, b, mat, r0, rows, mw, wm_sm);
 }
 // Warp-specialized weight-major fc1 (PF_WM_WS, default on): the same wtile CTA and the same z1 bytes as k_pf_fc1w, but
 // warps 0-3 (producers) only copy (cp.async), scale and decode, and warps 4-11 (consumers) only run ldmatrix + mma: the
@@ -4067,11 +4069,11 @@ __global__ void __launch_bounds__(384, 1) k_pf_fc1ws(Expert A)
     int* sRow = reinterpret_cast<int*>(wm_sm + WS_NA * WM_SA + WS_NW * WM_SW + WS_NB * WM_SB);
     if (threadIdx.x < WM_R) sRow[threadIdx.x] = threadIdx.x < rows ? A.rr_row[r0 + threadIdx.x] : 0;
     __syncthreads();
-    size_t off;
-    const int k = tr3_unit(A.t_kmix, w[0], tr, b * 2 + mat, off);
-    if (k == 4) fc1ws_body<4, EB, CB>(A, tr, b, mat, r0, rows, A.t_fc1 + off, wm_sm);
-    else if (k == 3) fc1ws_body<3, EB, CB>(A, tr, b, mat, r0, rows, A.t_fc1 + off, wm_sm);
-    else fc1ws_body<2, EB, CB>(A, tr, b, mat, r0, rows, A.t_fc1 + off, wm_sm);
+    const uint8_t* mw;
+    const int k = tr3_fc1_unit(A.t_fc1, A.t_ptab, A.t_kmix, w[0], tr, b * 2 + mat, mw);
+    if (k == 4) fc1ws_body<4, EB, CB>(A, tr, b, mat, r0, rows, mw, wm_sm);
+    else if (k == 3) fc1ws_body<3, EB, CB>(A, tr, b, mat, r0, rows, mw, wm_sm);
+    else fc1ws_body<2, EB, CB>(A, tr, b, mat, r0, rows, mw, wm_sm);
 }
 template <int EB = g6nr::EB, int CB = TR3_MCG> inline void launch_fc1w(const Expert& A, cudaStream_t st)
 {
@@ -4161,8 +4163,9 @@ __device__ __forceinline__ void fc2_body(const Expert& A, const long long* tr, i
     for (int p = 0; p < 2; ++p)
         #pragma unroll
         for (int j = 0; j < 16; ++j) ys[p][j] = 0.f;
+    const int pe = static_cast<int>((tr - A.t_tab) / 6);          // the row's index, for the piece table (#151)
     auto wptr = [&](int b) {
-        return A.t_fc2 + tr[1] + static_cast<size_t>(b) * (static_cast<size_t>(KSH) * 8 * TB) + static_cast<size_t>(G * 8 + warp) * 8 * TB;
+        return tr3_fc2_block(A.t_fc2, A.t_ptab, pe, tr, b, BITS) + static_cast<size_t>(G * 8 + warp) * 8 * TB;
     };
     // X2 records and the svh slice of block b -> stage b & 1
     auto stage = [&](int b) {
@@ -4358,8 +4361,9 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
         for (int h = 0; h < 2; ++h)
             #pragma unroll
             for (int i = 0; i < 4; ++i) tot[mb][h][i] = 0.f;
+    const int pe = static_cast<int>((tr - A.t_tab) / 6);          // the row's index, for the piece table (#151)
     auto wptr = [&](int G, int b) {
-        return A.t_fc2 + tr[1] + static_cast<size_t>(b) * (static_cast<size_t>(KSH) * 8 * TB) + static_cast<size_t>(G * 8 + warp) * 8 * TB;
+        return tr3_fc2_block(A.t_fc2, A.t_ptab, pe, tr, b, BITS) + static_cast<size_t>(G * 8 + warp) * 8 * TB;
     };
     // X2 records of block b and the svh slice of (block b, group G) -> stage it & 1
     auto stage = [&](int it, int G, int b) {
@@ -4686,7 +4690,7 @@ __device__ __forceinline__ void fc2_body_v2(const Expert& A, const long long* tr
     auto stage = [&](int it, int G, int b) {
         #pragma unroll
         for (int mb = 0; mb < NM; ++mb) pf::cp16(sA + (it & 1) * F2V_SA + mb * 4096 + t * 16, xb + (static_cast<size_t>(mb) * EB + b) * 4096 + t * 16);
-        const uint8_t* ws = A.t_fc2 + tr[1] + static_cast<size_t>(b) * (static_cast<size_t>(KSH) * 8 * TB) + static_cast<size_t>(G * 8) * 8 * TB;
+        const uint8_t* ws = tr3_fc2_block(A.t_fc2, A.t_ptab, static_cast<int>((tr - A.t_tab) / 6), tr, b, BITS) + static_cast<size_t>(G * 8) * 8 * TB;
         #pragma unroll
         for (int ch = t; ch < 4 * TB; ch += 256) pf::cp16(sW + (it & 1) * F2V_SW + ch * 16, ws + ch * 16);
         if (t < 16) pf::cp16(sV + (it & 1) * 256 + t * 16, A.t_sg + HID + G * 128 + t * 8);
@@ -5060,7 +5064,7 @@ __device__ __forceinline__ void fc2ws_body(const Expert& A, const long long* tr,
     {
         const int nmb = (rows + 15) / 16;
         const unsigned char* xb = A.x2 + static_cast<size_t>(seg) * MB * EB * 4096;
-        const uint8_t* wbase = A.t_fc2 + tr[1];
+        const int pe = static_cast<int>((tr - A.t_tab) / 6);      // the row's index, for the piece table (#151)
         // step j -> (group G, block b, k32 slice s)
         auto stage_a = [&](int j) {
             const int it = j >> 2, s = j & 3, gi = it / nb, b = it - gi * nb;
@@ -5078,7 +5082,7 @@ __device__ __forceinline__ void fc2ws_body(const Expert& A, const long long* tr,
             if (lane < TB / 4)
             {
                 const int pc = lane / (TB / 8), off = (lane - pc * (TB / 8)) * 16, cb = warp * 2 + pc;
-                const uint8_t* ws = wbase + static_cast<size_t>(b) * (static_cast<size_t>(KSH) * 8 * TB) + static_cast<size_t>((G0 + gi) * 8) * 8 * TB;
+                const uint8_t* ws = tr3_fc2_block(A.t_fc2, A.t_ptab, pe, tr, b, BITS) + static_cast<size_t>((G0 + gi) * 8) * 8 * TB;
                 pf::cp16(sW + (j % F2S_NW) * F2S_SW + warp * 4 * TB + pc * 2 * TB + off, ws + (cb * 8 + 2 * s) * TB + off);
             }
         };
@@ -6056,6 +6060,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         A.k2 = T.k2;
         A.cb = T.cb;
         A.t_fc1 = static_cast<const uint8_t*>(T.t[T_TR3_FC1].p); A.t_wide = T.fc1_wide; A.t_fc2 = static_cast<const uint8_t*>(T.t[T_TR3_FC2].p); A.t_wide2 = T.fc2_wide;
+        A.t_ptab = T.ptab;
         A.t_v1 = static_cast<const __half*>(v1.p); A.t_v2 = static_cast<const __half*>(v2.p); A.t_v3 = static_cast<const __half*>(v3.p);
         A.bs = bsf;
         A.t_sg = static_cast<const __half*>(sgn.p); A.t_v1b = static_cast<const __half*>(v1b.p); A.t_v3b = static_cast<const __half*>(v3b.p);

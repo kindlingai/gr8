@@ -395,6 +395,8 @@ GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   ENGINE_ENV="$ENGINE_ENV${MTP_KSTOPB_WIDTHS:+ GR8_MTP_KSTOPB_WIDTHS=$MTP_KSTOPB_WIDTHS}"
   # the window-2 fc1 split on every MoE layer at M > 1 (TR3_W2ALL; docs/SETTINGS.md): off unless set; on at TP=4
   ENGINE_ENV="$ENGINE_ENV${TR3_W2ALL:+ GR8_TR3_W2ALL=$TR3_W2ALL}"
+  # routed experts through a per-layer piece table (PTAB, EL3 #151; docs/SETTINGS.md): off unless set (the pack layout)
+  ENGINE_ENV="$ENGINE_ENV${PTAB:+ GR8_PTAB=$PTAB}"
   # QO cache, prefill index-score rows, fc1 kernels, P11 attention, dense trellis (QO_CACHE, PF_ISGRT_RG, PF_F12,
   # ATTN_P11, DTR, PF_AOP; docs/SETTINGS.md): the engine default unless set
   ENGINE_ENV="$ENGINE_ENV${QO_CACHE:+ GR8_QO_CACHE=$QO_CACHE}"

@@ -46,15 +46,34 @@ enum { W_M, W_Q, W_T, W_A, NW, W_H = NW };
 enum { T_XIN, T_IDXQ, T_QB, T_UK, T_UV, T_OPROJ, T_ROUTER, T_SHARED, T_EH, T_HEAD, NTG };
 constexpr int READ_ORDER[NTG] = {T_EH, T_XIN, T_IDXQ, T_QB, T_UK, T_UV, T_OPROJ, T_ROUTER, T_SHARED, T_HEAD};
 
-// a layer's targets: up to 4 byte ranges each, in read order
+// a layer's targets: byte ranges per target, in read order. Ranges per target: 4, or EB for the shared expert's fc1 slabs
+// through a piece table (#151; one slab per block when they are scattered). MAXR bounds the queue, so a target cannot
+// exceed it
+constexpr int PLAN_K = g6nr::EB > 4 ? g6nr::EB : 4;
+static_assert(PLAN_K <= MAXR, "l2pf: a target's ranges must fit the queue");
 struct Plan
 {
-    const void* p[NTG][4] = {};
-    size_t n[NTG][4] = {};
+    const void* p[NTG][PLAN_K] = {};
+    size_t n[NTG][PLAN_K] = {};
     void add(int t, const void* q, size_t b)
     {
-        for (int k = 0; k < 4; ++k)
+        if (!b) return;
+        for (int k = 0; k < PLAN_K; ++k)
             if (!n[t][k]) { p[t][k] = q; n[t][k] = b; return; }
+        fprintf(stderr, "l2pf: target %d has more than %d ranges, %zu bytes dropped from the prefetch\n", t, PLAN_K, b);
+    }
+    // add, but a range that starts where the target's last range ends extends it (the shared expert's slabs through a
+    // piece table whose entries point into the image, #151: one range, as the knob-off path has)
+    void add_merge(int t, const void* q, size_t b)
+    {
+        if (!b) return;
+        for (int k = PLAN_K - 1; k >= 0; --k)
+            if (n[t][k])
+            {
+                if (static_cast<const uint8_t*>(p[t][k]) + n[t][k] == static_cast<const uint8_t*>(q)) { n[t][k] += b; return; }
+                break;
+            }
+        add(t, q, b);
     }
 };
 struct Queue
@@ -258,6 +277,9 @@ inline Plan plan_layer(const bind::Layer& b, const void* uk, const void* uv, con
     else if (b.o_proj.on) P.add(T_OPROJ, b.o_proj.w, opcap && opcap < bind::gv_bytes(b.o_proj) ? opcap : bind::gv_bytes(b.o_proj));
     if (b.router.on) P.add(T_ROUTER, b.router.w, bind::gv_bytes(b.router));
     if (b.shw) P.add(T_SHARED, b.shw, b.shw_bytes);
+    // piece table (#151): row 256's fc1 slabs, one per block; adjacent slabs (entries into the image) merge into one
+    // range (add_merge: the knob-off path's single range), scattered ones take a slot each (PLAN_K >= EB: none is dropped)
+    else if (b.shw_pieces) { for (int k = 0; k < b.shw_pieces; ++k) P.add_merge(T_SHARED, b.shw_piece[k], b.shw_piece_bytes[k]); }
     else if (b.glu_t.on) { for (int k = 0; k < 2; ++k) P.add(T_SHARED, b.glu_t.a.w[k], static_cast<size_t>(b.glu_t.a.K) * b.glu_t.a.N * dtr::BITS / 8); }
     else { for (int k = 0; k < 2; ++k) P.add(T_SHARED, b.sh[k].p, bind::rec_bytes(b.sh[k])); }
     return P;
@@ -272,7 +294,7 @@ inline Queue queue(const Plan& P, unsigned tmask)
         const int t = READ_ORDER[r];
         q.from[t] = c;
         if (!(tmask >> t & 1)) continue;
-        for (int k = 0; k < 4 && P.n[t][k]; ++k)
+        for (int k = 0; k < PLAN_K && P.n[t][k]; ++k)
         {
             if (q.count == MAXR) { fprintf(stderr, "l2pf: queue full (%d ranges), target %d range %d dropped\n", MAXR, t, k); break; }
             const uintptr_t b = reinterpret_cast<uintptr_t>(P.p[t][k]), lo = (b + 15) & ~static_cast<uintptr_t>(15),

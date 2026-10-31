@@ -567,6 +567,17 @@ class CanonicalTests(unittest.TestCase):
         self.assertEqual(env(PEERS, '--extra-env', 'GR8_TR3_W2ALL=0'), ['GR8_TR3_W2ALL=0'])   # EXTRA_ENV keeps its value, no second copy
         self.assertEqual(env('10.0.0.1,10.0.0.2,10.0.0.3'), [])   # TP=3 unchanged
 
+    def test_ptab_off_unless_set(self):
+        # PTAB (EL3 #151): unset = no GR8_PTAB in the engine environment (the pack layout); set = passed through, as a
+        # cluster option (the handshake compares it)
+        def env(*argv):
+            o = opt.parse(['--no-config', '--peers', PEERS, *argv], GLM)
+            opt.validate(o)
+            return [a for a in opt.engine_plan(o, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env'] if a.startswith('GR8_PTAB=')]
+        self.assertEqual(env(), [])
+        self.assertEqual(env('--ptab', '2'), ['GR8_PTAB=2'])
+        self.assertEqual(opt.KEYS['PTAB'][0], 'cluster')
+
     def test_tp6_is_s2_without_drafter(self):
         peers = ','.join(f'10.0.0.{i}' for i in range(1, 7))
         o = opt.parse(['--no-config', '--peers', peers], GLM)
