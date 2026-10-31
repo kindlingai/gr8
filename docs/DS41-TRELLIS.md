@@ -70,3 +70,53 @@ against 0.23 ms a layer), equal at 24 rows (1.3 against 1.3 ms) and 12-17% faste
 The K1 split knobs at 6 rows (GR8_K1_SPLIT 8x1, 2x4, /1, /4, /8 against the release 4x2/2) and GR8_K1_TLBW (64 and
 2048 KB) all measured within 2% of the release shape, with the run-to-run spread of the same size.
 
+## Where a prefill chunk goes
+
+The same configuration, RigMark's prefill prompts (8K, 32K and 128K), `GR8_DS_SPAN=2` on the served engine: one pass per
+W-row chunk with a mark after every op. With the two prefill lanes on (the launcher default, GR8_DS_PF_LANES=2) the lanes
+serialize their attention stages through stream waits and their marks interleave, so the per-op times of a two-lane run
+are not the kernels' times; the table is the single-lane run (GR8_DS_PF_LANES=1, W = 1024 rows), rank 0, the mean of 495
+passes of 1024 rows, 553 ms a pass. A chunk that is not a prompt's last runs layers 0-20 only (the bounded replay of
+ds41_pf_split.h: layers 21-39 write no cache, so they run over the tail rows of the last chunk), 8 trellis and 13 native
+layers, and the op costs are the same on both kinds:
+
+| op | ms a pass | share | ms a layer |
+|---|---|---|---|
+| attn_proj (q_a, q_b, kv projections) | 119.5 | 22% | 5.7 |
+| attn_out (o_proj) | 115.0 | 21% | 5.5 |
+| consume_attn + consume_ffn (the peers' partials) | 93.8 | 17% | 2.2 + 2.2 |
+| read-once MoE, native layers (gate, fc1, fc2, shared, combine) | 105.1 | 19% | 8.1 |
+| trellis MoE, layers 0-7 (shared pass, route, fc1, mid, fc2, finalize) | 29.5 | 5% | 3.7 |
+| index_topk (layers 2, 8, 14, 20) + ca_row + cand_blocks | 39.6 | 7% | 7 at a source layer |
+| engram (layers 1, 14) | 26.5 | 5% | 13 |
+| attn_core | 20.2 | 4% | 1.0 |
+
+Two things set this profile. First, RigMark's prefill text routes a 1024-row chunk to only 58-115 of the 384 experts a
+layer (the engine's `distinct` lines), so the expert reads that dominate a varied prompt (384 experts x 4.7 MB a rank a
+layer = 1.8 GB, 7.7 ms at the memory bandwidth) are a third of that here, and the read-once kernels run at about 14
+TFLOPS on 109 GFLOP a layer rather than at the bandwidth. Second, the attention projections run on the CUDA-core MXFP8
+GEMM (k_gemm_mxfp8): about 32 GFLOP each for attn_proj and attn_out at 1024 rows, 5.7 and 5.5 ms a layer, under 6
+TFLOPS. The block-scaled tensor-core GEMM exists behind GR8_DS_ATTN_TC=1 (default off); its effect is measured below.
+The trellis layers' MoE (3.7 ms a layer) costs less than the native read-once path (8.1 ms) at these routes.
+
+The context hardly matters: in a 128K prompt the 2048-row quantum of the two-lane run grows from 1020 ms at the start to
+1171 ms at the end (+15%), so the prefill rate is set per row, and RigMark's 8K / 32K / 128K rates differ by that slope
+(2,102 / 2,022 / 1,851 tok/s with two lanes; 1,946 / 1,940 / 1,806 with one: the second lane buys 8% at 8K and 2.5% at
+128K). The fabric is lightly used throughout: 3.6 Gb/s mean on one rail and 1.8 on the other (12 Gb/s peaks), no
+congestion marks, a few retransmits in a 25-minute run.
+
+### Chunk width and lanes
+
+RigMark cold prefill, tok/s, the same runs (`GR8_DS_SPAN=2` on in all of them; the box clocks at 1990-2200 MHz mean):
+
+| | 8K | 32K | 128K | MemAvailable a box |
+|---|---|---|---|---|
+| W 1024, two lanes (the launcher default) | 2,102 | 2,022 | 1,851 | 9.3 GiB |
+| W 1024, one lane | 1,946 | 1,940 | 1,806 | 12 GiB |
+| W 4096, one lane | 1,978 | 1,890 | 1,725 | 0.3-1.1 GiB |
+
+A 4096-row pass costs, per 1024 rows, the same as a 1024-row pass in every compute op (attn_proj 118 against 119.5 ms,
+attn_out 116 against 115, read-once fc1 55 against 51: the chunk routes to 129-137 distinct experts instead of 58-115, so
+the expert bytes a row fall by a third but the kernels are not bound by them), and more in the consumes (118 against 94
+ms), with the memory gone. The width stays at 1024.
+
