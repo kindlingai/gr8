@@ -1,7 +1,7 @@
-// F12 stack: ranks that disagree on GR8_DS_SH_TC or GR8_DS_MOE_L2HINT refuse each other at bootstrap. The DS41 runtime_signature (g6m4.cu,
+// Ranks that disagree on GR8_DS_SH_TC or GR8_DS_MOE_L2HINT refuse each other at bootstrap. The DS41 runtime_signature (g6m4.cu,
 // bc.runtime_signature) ends "... set <id> shtc <0|1>" + optional l2h/stg and, when set, tkmain/tkdecode; BootstrapConfig::agreement (s2/bootstrap.h)
 // carries it, so a mixed boot fails with "bootstrap config mismatch". The suffix below is the g6m4.cu expression with the flag readers
-// stubbed (host only); argv[1] = g6m4.cu, whose signature expression must equal SIG_LINES byte for byte (drift = FAIL).
+// stubbed (host only); argv[1] = g6m4.cu, whose signature expression must equal SIG_LINES byte for byte (drift fails the test).
 // Three ranks on loopback (as control_version_test). Build: g++ -std=c++17 -O2 -pthread -I engine/runtime <this> -o /tmp/ds41_sig_flags_test
 #include "s2/bootstrap.h"
 #include <cstdio>
@@ -21,10 +21,10 @@ namespace ds41moe { static int tc_v = 0, h_v = 0, g_v = 0, b_v = 0; inline bool 
                     inline bool ro_fc2stg() { return g_v != 0; } inline bool ro_fc1bstg() { return b_v != 0; } }
 
 static const char* SIG_LINES =
-"            \" shtc \" + std::to_string(ds41moe::sh_tc_on() ? 1 : 0) +   // F12 GR8_DS_SH_TC: ranks must agree (W8A8 shared expert, not bit-identical to 0)\n"
-"            (ds41moe::ro_l2hint() ? \" l2h \" + std::to_string(ds41moe::ro_l2hint()) : std::string()) +   // F12 GR8_DS_MOE_L2HINT: value 0 = today's string byte for byte; ranks that disagree on 1 / 2 refuse to join\n"
-"            (ds41moe::ro_fc2stg() ? std::string(\" stg 1\") : std::string()) +   // GR8_DS_MOE_FC2STG: value 0 = today's string byte for byte; ranks that disagree refuse to join\n"
-"            (ds41moe::ro_fc1bstg() ? std::string(\" fc1bstg 1\") : std::string()); // default off preserves the old signature; ranks with the staged B arm must agree\n";
+"            \" shtc \" + std::to_string(ds41moe::sh_tc_on() ? 1 : 0) +   // GR8_DS_SH_TC: ranks must agree (W8A8 shared expert, not bit-identical to 0)\n"
+"            (ds41moe::ro_l2hint() ? \" l2h \" + std::to_string(ds41moe::ro_l2hint()) : std::string()) +   // GR8_DS_MOE_L2HINT: 0 adds nothing; ranks that disagree on 1 / 2 refuse to join\n"
+"            (ds41moe::ro_fc2stg() ? std::string(\" stg 1\") : std::string()) +   // GR8_DS_MOE_FC2STG: 0 adds nothing; ranks that disagree refuse to join\n"
+"            (ds41moe::ro_fc1bstg() ? std::string(\" fc1bstg 1\") : std::string()); // off adds nothing; ranks with the staged B arm must agree\n";
 
 static std::string sig(int tc, int h, int g = 0, int b = 0) {   // the g6m4.cu tail, from " set " + set_id on
     ds41moe::tc_v = tc; ds41moe::h_v = h; ds41moe::g_v = g; ds41moe::b_v = b;

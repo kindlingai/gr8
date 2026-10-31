@@ -1,11 +1,11 @@
-// F7 bit-equality gate of the DS41 prefill gather (GR8_DS_PF_GATHER=1, runtime/ds41_gather.cuh). For each rank r and row count M: the same fabric
+// Bit-equality gate of the DS41 prefill gather (GR8_DS_PF_GATHER=1, runtime/ds41_gather.cuh). For each rank r and row count M: the same fabric
 // slots (pinned host memory, the real layout: own partial in the send slot, peer p's in recv slot (c, p)) are consumed twice from the same state:
 //   ref:    the consume kernels with RefBlock = the Ds41Block slot reads (ds41_step.cuh: 4 x 2-byte __ldcv, FP32 sum in rank order from 0.f)
 //   gather: k_ds41_gather -> device BF16 sum -> the consume kernels with Ds41DevBlock
 // and every output buffer must match byte for byte: the trunk, y, pre, post, comb, mix (k_step FUSE = consume_prepare), and the trunk (consume).
 // Partials: random BF16 incl. +-0, subnormals, large magnitudes, and rows where the 4 partials cancel. Exit 0 = every line identical=yes.
-// Build (dev 5090): nvcc -O2 -std=c++17 -DG6_MODEL_DS41=1 -DDS_MHC_TRUNK_BF16 -arch=sm_120 -I engine -o ds41_gather_test engine/runtime/tests/ds41_gather_test.cu
-// RefBlock copies Ds41Block::init / operator() (ds41_step.cuh:16-39); keep the two in step.
+// Build (sm_120): nvcc -O2 -std=c++17 -DG6_MODEL_DS41=1 -DDS_MHC_TRUNK_BF16 -arch=sm_120 -I engine -o ds41_gather_test engine/runtime/tests/ds41_gather_test.cu
+// RefBlock copies Ds41Block::init / operator() (ds41_step.cuh); keep the two in step.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

@@ -1,13 +1,13 @@
-// F7 k16 bit-equality gate of the staged slot reads (GR8_DS_DEC_STAGE=1; runtime/ds41_stage.cuh + the has_stage_v branches of ds_mhc.cuh k_step / k_consume / k_finish).
-//   (no argument)  HOST mode. Runs on any machine, makes NO CUDA call. It executes the kernels' staging code on the CPU thread by thread: the same tile maps
+// Bit-equality gate of the staged slot reads (GR8_DS_DEC_STAGE=1; runtime/ds41_stage.cuh + the has_stage_v branches of ds_mhc.cuh k_step / k_consume / k_finish).
+//   (no argument)  host mode. Runs on any machine, makes no CUDA call. It executes the kernels' staging code on the CPU thread by thread: the same tile maps
 //                  (ds_mhc::stage_kstep / stage_consume / stage_finish, which the kernels call), each 16-byte load (alignment, bounds, each needed element
 //                  loaded and no other row), the rank-order FP32 sum from smem, and the finish loop's per-thread column order; every (row, column) of every shape must
 //                  equal the Ds41Block reference (4 x 2-byte loads, FP32 sum in rank order from 0.f) bit for bit.
-//   gpu            GPU mode (a spark; refuses anything but sm_121). For each rank r and row count M the same fabric slots (pinned host memory, the real layout)
+//   gpu            GPU mode (a GB10; refuses anything but sm_121). For each rank r and row count M the same fabric slots (pinned host memory, the real layout)
 //                  are consumed twice from the same state: ref = RefBlock (a copy of Ds41Block's slot reads), staged = Ds41Staged<RefBlock>. Every output must match byte
 //                  for byte: k_step FUSE (trunk, y, pre, post, comb, mix), k_consume (trunk), k_finish (trunk, out, xpre; also grid 1 with row0 = M-1).
 //                  Exit 0 = every line identical=yes.
-// Build (compile-only on the dev box): nvcc -O2 -std=c++17 -DG6_MODEL_DS41=1 -DDS_MHC_TRUNK_BF16 -gencode=arch=compute_121a,code=sm_121a -Xcompiler -Wall -I engine -o ds41_stage_test engine/runtime/tests/ds41_stage_test.cu
+// Build: nvcc -O2 -std=c++17 -DG6_MODEL_DS41=1 -DDS_MHC_TRUNK_BF16 -gencode=arch=compute_121a,code=sm_121a -Xcompiler -Wall -I engine -o ds41_stage_test engine/runtime/tests/ds41_stage_test.cu
 // RefBlock copies Ds41Block::init / operator() (ds41_step.cuh); keep the two in step.
 #include <cstdio>
 #include <cstdlib>
@@ -54,7 +54,7 @@ static unsigned short bf(float v) { unsigned u; memcpy(&u, &v, 4); return (unsig
 static float fl(unsigned short b) { unsigned u = (unsigned)b << 16; float v; memcpy(&v, &u, 4); return v; }
 static unsigned bits(float v) { unsigned u; memcpy(&u, &v, 4); return u; }
 
-// ---------------------------------------------------------------------------------------------------------------------------------- HOST mode
+// ---------------------------------------------------------------------------------------------------------------------------------- host mode
 // random BF16 slot partials incl. +-0, subnormals, large magnitudes, cancelling rows; part[p][k], k = row * H + h
 static std::vector<std::vector<unsigned short>> make_parts(int M, std::mt19937& rng) {
     std::uniform_real_distribution<float> u(-1.f, 1.f);

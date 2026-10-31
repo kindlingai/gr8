@@ -1,5 +1,5 @@
-// DEV-only test of the actual ds41_step.cuh dispatch wrappers, not a serving or quality test.
-// Build with the DS41 TP4/BF16-trunk flags; run only on an authorized DEV GPU.
+// Development test of the ds41_step.cuh dispatch wrappers, not a serving or quality test.
+// Build with the DS41 TP4/BF16-trunk flags; run it on a development GPU, not on a serving node.
 #include <cmath>
 #include <cstdio>
 #include <cstring>

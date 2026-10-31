@@ -1,5 +1,5 @@
 // DSpark drafter: the small pure rules the device kernels (ds41_dspark.cuh, attn/ds41_attn_dsp.cuh) share with the host test.
-// Plain C++ with DSP_HD (= __host__ __device__ under nvcc, empty under g++), so engine/tests/test_ds41_dspark.cpp runs the SAME code
+// Plain C++ with DSP_HD (= __host__ __device__ under nvcc, empty under g++), so engine/tests/test_ds41_dspark.cpp runs the same code
 // the kernels run and checks it against the host model in ds41_dspark.h. No includes beyond <cstdint>; no CUDA types.
 #pragma once
 #include <cstdint>
@@ -53,7 +53,7 @@ DSP_HD inline int key_pos(int q, int blk, int i)
     return i < w ? q - w + 1 + i : q + 1 + (i - w);
 }
 
-// Confidence: official = the raw FP32 dot (model.py:1098-1103). DeepInfer's probability = sigmoid(clamp(dot / T, -60, 60)), T = GR8_DS_CONF_TEMP.
+// Confidence: official = the raw FP32 dot (the confidence head of the reference model.py). DeepInfer's probability = sigmoid(clamp(dot / T, -60, 60)), T = GR8_DS_CONF_TEMP.
 DSP_HD inline float conf_clamped(float dot, float temperature)
 {
     const float z = dot / temperature;

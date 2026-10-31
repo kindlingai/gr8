@@ -1,4 +1,4 @@
-// DS41 F12: host description of one ragged short-prompt W pass. This is never a decode
+// DS41: host description of one ragged short-prompt W pass. This is never a decode
 // graph shape; decode keeps its existing uniform ds_ns/rps representation.
 #pragma once
 #include <array>

@@ -47,21 +47,21 @@
 #include "../attn/ops.h"
 #if G6_MODEL_DS41
 #include "ds41_ops.h"          // host-only (the step plan and op table); must stay outside namespace g6rt
-#include "ds41_pack_layout.h"   // F12 ragged W segment table, host-only; decode keeps uniform ds_ns
+#include "ds41_pack_layout.h"   // the ragged W segment table (C8 pack), host-only; decode keeps uniform ds_ns
 #include "ds41_coll_order.h"   // host-only: the order the step rings its collectives in (the fabric proxy order vector)
-#include "ds41_wait.h"         // host-only: F1, who waits for the peers before a consume kernel (GR8_DS_WAIT_K); outside namespace g6rt
-#include "ds41_rs.h"           // F10: host + device rules of the prefill RS+AG (GR8_DS_PF_RS); outside namespace g6rt (ds41_rs.cuh uses ::ds41::rs)
-#include "ds41_rowshard.h"     // B12: default-off row-sharded mHC host geometry and boundary-state size
-#include "ds41_b12_dispatch.h" // B12: main-model W-row-only mHC decomposition switch, outside namespace g6rt
-#include "../kernels/ds41_moe_kernels.h"   // B6: global-scope kernels of the MoE op adapters (ds41_moe_ops.cuh, included by ds41_step.cuh)
+#include "ds41_wait.h"         // host-only: who waits for the peers before a consume kernel (GR8_DS_WAIT_K); outside namespace g6rt
+#include "ds41_rs.h"           // host + device rules of the prefill RS+AG (GR8_DS_PF_RS); outside namespace g6rt (ds41_rs.cuh uses ::ds41::rs)
+#include "ds41_rowshard.h"     // default-off row-sharded mHC host geometry and boundary-state size
+#include "ds41_b12_dispatch.h" // main-model W-row-only mHC decomposition switch, outside namespace g6rt
+#include "../kernels/ds41_moe_kernels.h"   // global-scope kernels of the MoE op adapters (ds41_moe_ops.cuh, included by ds41_step.cuh)
 #include "../mhc/ds_mhc.cuh"
-#include "../mhc/ds_mhc_decomp.cuh" // B12: two-stage k_step candidate; old ds_mhc wrappers remain the BASE
-#include "ds41_dspark.h"        // B12: host rules of DSpark (ds41::dsp); like ds41_ops.h it must stay outside namespace g6rt
-#include "ds41_dspark_api.h"    // B12: ds41dsp::Dsp and the DSpark device API (declarations only; the kernels are compiled in the attention TU, never here)
-#include "../attn/ds41_attn_plan.h"     // B4's types and decode-GEMV kernels at GLOBAL scope, after ds41_attn_types.h (pulled in by the api header above):
+#include "../mhc/ds_mhc_decomp.cuh" // the two-stage mHC k_step; the ds_mhc wrappers stay the base path
+#include "ds41_dspark.h"        // host rules of DSpark (ds41::dsp); like ds41_ops.h it must stay outside namespace g6rt
+#include "ds41_dspark_api.h"    // ds41dsp::Dsp and the DSpark device API (declarations only; the kernels are compiled in the attention TU, never here)
+#include "../attn/ds41_attn_plan.h"     // the attention types and decode-GEMV kernels at global scope, after ds41_attn_types.h (pulled in by the api header above):
 #include "../attn/ds41_attn_gv.cuh"      // ds41_attn_ops.cuh is included inside namespace g6rt, and its own includes are then no-ops, so every ds41a name must already be in ::ds41a
-#include "../engram/engram_dev.cuh"   // B11: the Engram engine (host store + side-stream kernels); global scope, like ds41_ops.h
-#include "../engram/engram_ring.h"    // B11: the token ring (host and device code path; tests/test_ring.cpp)
+#include "../engram/engram_dev.cuh"   // the Engram engine (host store + side-stream kernels); global scope, like ds41_ops.h
+#include "../engram/engram_ring.h"    // the token ring (host and device code path; tests/test_ring.cpp)
 #endif
 #if G6_MODEL_FLASH
 #include "flash_kv.h"
@@ -271,7 +271,7 @@ struct Layer
     struct Hc { const void* fn = nullptr; bool fn_f32 = true; const float *base = nullptr, *scale = nullptr; const __nv_bfloat16* norm = nullptr; };
     Hc hc[2];                         // hc_attn, hc_ffn: mHC fn [24][4*HID] (F32 or BF16), base [24], scale [3], and the sub-layer's norm
     bool hc_in_fused = false;         // hc_attn of this layer runs inside the previous layer's consume_ffn (ds41_step.cuh)
-    void *ds41_attn = nullptr, *ds41_moe = nullptr;   // opaque per-layer state of B4/B5 (attention) and B6 (MoE); set by Table::bind_attn / bind_moe
+    void *ds41_attn = nullptr, *ds41_moe = nullptr;   // opaque per-layer state of the attention / index ops and the MoE ops; set by Table::bind_attn / bind_moe
 #endif
     bind::LayerTensors T;
     bind::Layer L[MX + 1];
@@ -486,12 +486,12 @@ struct Model
     std::vector<ds41::Op> ds41_plan;      // plan() of this model's layers
     ds41::Index ds41_idx;
     bool ds41_fuse = false;               // consume(s-1)+prepare(s) in one launch (GR8_DS_MHC_FUSE, default on)
-    bool ds41_b12_mhc = false;            // GR8_DS_MHC_DECOMP=1: main-model prefill rows > MX use B12; decode/draft stay old
+    bool ds41_b12_mhc = false;            // GR8_DS_MHC_DECOMP=1: main-model prefill rows > MX use the two-stage decomposition (ds_mhc_decomp.cuh); decode and the draft use ds_mhc.cuh
     unsigned long long ds41_b12_kernel_launches = 0; // host count: actual stage-1/stage-2 CUDA launch statements reached
-    bool ds41_waitk = false;              // F1: wait for the peers in k_wait_peers (1 CTA) before each consume kernel (GR8_DS_WAIT_K, default off)
-    u64* ds41_relay = nullptr;            // K=2: the relay word (device, 1 x u64, zeroed): CTA (0,0) of each consume kernel stores coll_seq here once the peers' tails are in; null = off
-    __nv_bfloat16* ds41_gsum = nullptr;   // F7 GR8_DS_PF_GATHER=1: [hc_rows][HID] the reduced BF16 block output of a W-row consume (k_ds41_gather); null = off
-    // F10 GR8_DS_PF_RS=1 (ds41_rs.h): prefill layer exchanges c < ds41_rs_k run as reduce-scatter + all-gather; c_ag = ds41_rs_nc + c.
+    bool ds41_waitk = false;              // wait for the peers in k_wait_peers (1 CTA) before each consume kernel (GR8_DS_WAIT_K, default off)
+    u64* ds41_relay = nullptr;            // GR8_DS_WAIT_K=2: the relay word (device, 1 x u64, zeroed): CTA (0,0) of each consume kernel stores coll_seq here once the peers' tails are in; null = off
+    __nv_bfloat16* ds41_gsum = nullptr;   // GR8_DS_PF_GATHER=1: [hc_rows][HID] the reduced BF16 block output of a W-row consume (k_ds41_gather); null = off
+    // GR8_DS_PF_RS=1 (ds41_rs.h): prefill layer exchanges c < ds41_rs_k run as reduce-scatter + all-gather; c_ag = ds41_rs_nc + c.
     // ds41_rs_tickets [ds41_rs_k]: the publish tickets of the AG collectives (device, zero). ds41_rs_k = 0 = off (default)
     int ds41_rs_k = 0, ds41_rs_nc = 0;
     unsigned* ds41_rs_tickets = nullptr;
@@ -501,19 +501,19 @@ struct Model
     int ds41_state_c = -1;
     int ds41_rowshard_pending_c = -1;     // non-fused Engram boundary: publish y after local prepare
     unsigned* ds41_state_ticket = nullptr;
-    // F10 #8 GR8_DS_PF_DIRECT=1 (ds41_step.cuh ds41_op_direct): on an eager W-row prefill chunk (ds41_dchunk, host; ds41_dseq = its step)
+    // GR8_DS_PF_DIRECT=1 (ds41_step.cuh ds41_op_direct): on an eager W-row prefill chunk (ds41_dchunk, host; ds41_dseq = its step)
     // the attention output and the MoE combine write this rank's partial straight into the pinned send slot of c, flat [rows][HID],
     // and the publish only rings. ds41_dir_used[k] (host; 0 attention, 1 MoE): set by the producer wrapper, cleared by the publish.
     // The RS collectives of such a chunk are flat (Fabric::Rs::flat). ds41_direct = false = off (default)
     bool ds41_direct = false, ds41_dchunk = false;
     u64 ds41_dseq = 0;
     bool ds41_dir_used[2] = {false, false};
-    bool ds41_stage = false;              // F7 k16 GR8_DS_DEC_STAGE=1: main-Model decode consumes (1..MX rows) read the slots with 16-byte loads through smem (Ds41Staged); false = off
+    bool ds41_stage = false;              // GR8_DS_DEC_STAGE=1: main-Model decode consumes (1..MX rows) read the slots with 16-byte loads through smem (Ds41Staged); false = off
     int ds41_pf_late = 0;                 // bounded replay (ds41_pf_split.h): rows of range B of the prefill chunk being run, set by the hook around ds41::run; 0 = none
-    bool ds41_reset_seen = false;         // reset() has run once: from the second call on it clears the attention / index caches (B4 / B5 clear)
-    Find ds41_find;                       // the tensor finder build_ds41 got: B4/B5/B6 read their weights through it in bind_attn / bind_moe
-    ds41dsp::Dsp dsp;                     // B12 (DSpark): tap/draft/markov pointers; filled by ds41dsp_ops::build
-    std::shared_ptr<ds41::engram::Engram> engram;   // B11: GR8_DS_ENGRAM=1 only (ds41_engram_ops.cuh)
+    bool ds41_reset_seen = false;         // reset() has run once: from the second call on it clears the attention / index caches (ds41_attn_clear / ds41_idx_clear)
+    Find ds41_find;                       // the tensor finder build_ds41 got: the attention, index and MoE ops read their weights through it in bind_attn / bind_moe
+    ds41dsp::Dsp dsp;                     // DSpark: tap/draft/markov pointers; filled by ds41dsp_ops::build
+    std::shared_ptr<ds41::engram::Engram> engram;   // GR8_DS_ENGRAM=1 only (ds41_engram_ops.cuh)
     int32_t* win = nullptr;               // Engram: [MX][4] token window of the step's rows (tokens at pos, pos-1, pos-2, pos-3; -1 before the start)
     int32_t* ehist = nullptr;             // Engram: [ds_slots][ENG_RING = 64] token rings by absolute position, one per S2 slot (k_engram_win)
     int ds_slots = 1;                     // set before build_ds41: S2 sessions (--s2-sessions); the attention / index / Engram state has one slab per slot
@@ -522,8 +522,8 @@ struct Model
     int ds_ns = 1;                        // sessions of the step being launched or captured: rows r = j * (M / ds_ns) .. are session j's (uniform rows per session)
     bool ds_moe_decode_step = false;      // scheduler Kind::Decode, set before eager launch or graph capture
     bool ds41_idx_pipe_b = false;         // boot-bound GR8_DS41_IDX_PIPE_B=1; the four dense index-source logits only
-    bool ds41_pack_enabled = false;        // F12 boot-bound: carve 64-row per-session index scratch only for ON
-    const ds41::pack::Layout* ds41_pack = nullptr; // F12 eager ragged W only; null for every existing decode graph/solo W path
+    bool ds41_pack_enabled = false;        // GR8_DS_C8PACK=1, boot-bound: carve the 64-row per-session index scratch only when on
+    const ds41::pack::Layout* ds41_pack = nullptr; // the eager ragged W pack only; null for every decode graph and single-session W chunk
 #endif
     __half *x = nullptr, *x2 = nullptr, *q_a = nullptr, *q_a_n = nullptr, *kv_a = nullptr, *q_b = nullptr;
     __half *idx_q = nullptr, *idx_k = nullptr, *idx_w = nullptr;
@@ -575,7 +575,7 @@ struct Model
     int ecoll = 0;                    // DS41 Engram (GR8_DS_ENGRAM=1): 2 extra collectives after the head slot, c = 2*nl+1+e; else 0
     int ncoll() const {
 #if G6_MODEL_DS41
-        if (ds41_draft) return ds41::dsp::DRAFT_NCOLL;   // B12: the DSpark draft block has its own fabric (docs/DEEPSEEK-DSPARK.md F1.1)
+        if (ds41_draft) return ds41::dsp::DRAFT_NCOLL;   // the DSpark draft block has its own fabric
 #endif
         return 2 * nl + 1 + ecoll;
     }
@@ -1863,7 +1863,7 @@ inline const bind::Head& head_for(Model& m, int M)
             H.M=M; H.vlo=m.vlo; H.vn=m.vn;
             const int codec = m.head_t.lm_head_scale.p ? bind::FP8R : (m.head_t.lm_head.shape[2] == 528 ? bind::MXFP8 : bind::BF16W);
             const float* rscale = static_cast<const float*>(m.head_t.lm_head_scale.p);
-            const bool wide = codec == bind::BF16W && M > 8;     // measured by B7: (2,16) is 1.35 ms vs 1.52 ms at M=32
+            const bool wide = codec == bind::BF16W && M > 8;     // measured: (2,16) is 1.35 ms vs 1.52 ms at M=32
             if(const char* e=bind::make_gv(m.head_t.lm_head,codec,wide?2:1,wide?16:32,M,m.sc.xf_head,m.hlog,gv::O_F32,H.lm_head,rscale)) die(e);
             if(!H.lm_head.on || H.lm_head.K!=HID || H.lm_head.O!=m.vn) die("DS41 head: bad G.lm_head shape");
         }
@@ -1944,15 +1944,15 @@ inline unsigned attn_errors_at(Model& m, int* layer)
 }
 inline unsigned attn_errors(Model& m) { return attn_errors_at(m, nullptr); }
 #if G6_MODEL_DS41
-inline int ds41_attn_clear(void* model, void* stream, int slot = -1);   // B4, attn/ds41_attn_ops.cuh (included by ds41_step.cuh, after reset())
-inline int ds41_idx_clear(void* model, void* stream, int slot = -1);    // B5, attn/ds41_idx_ops.cuh. slot: SESS > 1, one S2 slot (-1 = all)
+inline int ds41_attn_clear(void* model, void* stream, int slot = -1);   // attn/ds41_attn_ops.cuh (included by ds41_step.cuh, after reset())
+inline int ds41_idx_clear(void* model, void* stream, int slot = -1);    // attn/ds41_idx_ops.cuh. slot: SESS > 1, one S2 slot (-1 = all)
 #endif
 // new sequence: clear every layer's attention caches (load time / between requests, not inside a capture)
 inline void reset(Model& m, cudaStream_t st)
 {
     // DS41 has no G6AttnBinding (ops_ds41.cu: bind_reset is nullptr, so the call below aborts in g6_attn_missing); its caches are
-    // B4's/B5's own dmalloc'd (zeroed) buffers, so the FIRST call needs no clear. Every later call (a new sequence, not a prefix
-    // reuse) zeroes them with B4's ds41_attn_clear (ring, compressor state, compressed rows) and B5's ds41_idx_clear (index caches,
+    // the attention and index ops' own dmalloc'd (zeroed) buffers, so the first call needs no clear. Every later call (a new sequence,
+    // not a prefix reuse) zeroes them with ds41_attn_clear (ring, compressor state, compressed rows) and ds41_idx_clear (index caches,
     // layer-20 shadow, scratch, top-k list): cudaMemsetAsync only, so no step may be in flight and no graph capture may be open.
 #if G6_MODEL_DS41
     if (m.ds41)
@@ -2592,7 +2592,7 @@ inline uint64_t fnv(uint64_t h, const void* p, size_t n)
 inline int step_line(Model& m, const StepOut& o, int s, int M, std::string& line)
 {
 #if G6_MODEL_DS41
-    // B11: the Engram engine fails closed -- a failed NVMe read (errno) or a window token outside the vocabulary (-1) stops the run here
+    // the Engram engine fails closed: a failed NVMe read (errno) or a window token outside the vocabulary (-1) stops the run here
     if (m.engram)
         if (const int es = m.engram->status())
             die("DS41 Engram: step " + std::to_string(s) + ": " + ds41::engram::Engram::status_text(es));

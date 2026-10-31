@@ -1,4 +1,4 @@
-// DeepSeek-V4.1-Flash-1017 prefix state snapshot cache (B4 / B5 / B11 / B12).
+// DeepSeek-V4.1-Flash-1017 prefix state snapshot cache (attention, indexer, Engram and DSpark state).
 // Stores prefix snapshots [0, p) (any p >= 1, even or odd) in lazily allocated device slabs
 // bounded by GR8_DS_CACHE_MIB (default 4096 MiB per rank) with LRU eviction.
 // A snapshot at position p consists of:
@@ -55,7 +55,7 @@ public:
         : main_(main), dsp_(dsp), budget_bytes_(budget_mib << 20) { live() = this; }
 
     // The engine builds one cache per rank, inside serve_ds41's scope, and the stop-time report lives in main's scope.
-    // A single self-registered pointer carries it there (PRL dev-proof condition 2: the hit counter must be readable).
+    // A single self-registered pointer carries it there (the hit counter must be readable at stop time).
     static Ds41PrefixCache*& live() { static Ds41PrefixCache* p = nullptr; return p; }
     // One line, the same fields every time: what a gate reads back after the prefix-cache requests.
     std::string stats_line() const {

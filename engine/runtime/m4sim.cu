@@ -94,7 +94,7 @@ using namespace g6rt;
 
 constexpr int NR = g6nr::NR;           // simulated ranks: six, or four in a -DG6_NR=4 build
 #if G6_NR == 4
-#define M4_RIT "four ranks in turn"     // the step-time log text names the configured rank count (R4: the DS41 TP4 sim printed "six")
+#define M4_RIT "four ranks in turn"     // the step-time log text names the configured rank count
 #else
 #define M4_RIT "six ranks in turn"
 #endif
@@ -272,7 +272,7 @@ __global__ void __launch_bounds__(128) k_vdeliver(VLoop a)
 
 #if G6_MODEL_DS41
 // GR8_RESID_DUMP + a DS41 stop (ds41_step.cuh g_ds41_stop_hook): write the residual slots the step reached, as one record
-// {s, M, reached, hid} + reached x M x hid float32 (the same layout as logit_dump; ds41_resid_convert.py takes fewer slots).
+// {s, M, reached, hid} + reached x M x hid float32 (the layout of logit_dump's records, with only the slots reached).
 struct RdStop { FILE* f = nullptr; const float* dump = nullptr; int hid = 0, mx = 0, slots = 0, reached = 0, step = 0, from = 0; };
 static RdStop g_rd_stop;
 static void rd_stop_hook(int M, cudaStream_t st)
@@ -363,8 +363,8 @@ int main(int argc, char** argv)
     if (pfw && (pfw <= MX || pfw != ds41_prefill_rowcap(DS41_TEXT(knob::ds_prefill_w()), MX))) die("GR8_TEST_DS41_M4_PFW=W needs MX < W = GR8_DS_PREFILL_W");
     const int pf_tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
     if (pfw && pf_tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
-    if (pfw && (graph || mtp || MP)) die("GR8_DS_M4_PFW=1: eager only (no --graph, --mtp, --prefill)");
-    if (pfw) fprintf(stderr, "# GR8_DS_M4_PFW: W-row non-final prefill chunks of %d rows, bounded replay tail %d\n", pfw, pf_tail);
+    if (pfw && (graph || mtp || MP)) die("GR8_TEST_DS41_M4_PFW: eager only (no --graph, --mtp, --prefill)");
+    if (pfw) fprintf(stderr, "# GR8_TEST_DS41_M4_PFW: W-row non-final prefill chunks of %d rows, bounded replay tail %d\n", pfw, pf_tail);
 #endif
     bool adapt = co.adapt;              // Flash: --mtp turns it on unless --spec-fixed (below)
     const std::string &layers_s = co.layers_s, &levels_s = co.levels_s, &qo_man = co.qo_man, &qo_file = co.qo_file;
@@ -532,7 +532,7 @@ int main(int argc, char** argv)
 
     // ---- loopback fabric
 #if G6_MODEL_DS41
-    const size_t stride = ((size_t)std::max(MX, pfw) * HID * 2 + 8 + 255) / 256 * 256;   // GR8_DS_M4_PFW: a W-row chunk's layer exchange
+    const size_t stride = ((size_t)std::max(MX, pfw) * HID * 2 + 8 + 255) / 256 * 256;   // GR8_TEST_DS41_M4_PFW: a W-row chunk's layer exchange
 #else
     const size_t stride = ((size_t)MX * HID * 2 + 8 + 255) / 256 * 256;
 #endif
@@ -761,7 +761,7 @@ int main(int argc, char** argv)
     }
     for (Model& m : R) { m.nc = nc; m.rs = plan.rs; }   // before any capture: the head kernels take them by value
 #if G6_MODEL_DS41
-    // GR8_DS_RELAXED_ACCEPT (GPU check of the relaxed head kernels; unset = today's head): m4sim runs no DSpark round, so a greedy
+    // GR8_DS_RELAXED_ACCEPT (GPU check of the relaxed head kernels; unset = the exact head): m4sim runs no DSpark round, so a greedy
     // row m of a multi-row step takes row m + 1's input token as its draft (k_head_local_rx / k_head_relax, rank.cuh)
     if (const char* v = DS41_TEXT(knob::ds_relaxed_accept()); v && *v)
     {
@@ -775,7 +775,7 @@ int main(int argc, char** argv)
                 m.rx.log_ratio = k.relax_ratio > 0 ? (float)std::log(k.relax_ratio) : -INFINITY;
                 m.rx.topp = (float)k.relax_topp;
             }
-        if (k.relaxed) fprintf(stderr, "# GR8_DS_RELAXED_ACCEPT ON ratio %g topp %g (NOT EXACT)\n", k.relax_ratio, k.relax_topp);
+        if (k.relaxed) fprintf(stderr, "# GR8_DS_RELAXED_ACCEPT on ratio %g topp %g (not exact)\n", k.relax_ratio, k.relax_topp);
     }
 #endif
     for (Draft& D : DR) D.d.nc = nc;
@@ -2304,7 +2304,7 @@ int main(int argc, char** argv)
         const int PS = prompt_steps(p), NS = total_steps(p);
         int last_tok = 0, ns_run = NS;
         std::vector<int> gen;
-        int pfw_skip = 0;   // GR8_DS_M4_PFW: prompt steps the W-row chunks replaced
+        int pfw_skip = 0;   // GR8_TEST_DS41_M4_PFW: prompt steps the W-row chunks replaced
         (void)pfw_skip;
         for (int s = 0; s < NS; ++s)
         {
@@ -2312,15 +2312,15 @@ int main(int argc, char** argv)
             const StepIn si = step_inputs(p, s, last_tok, step0);
             rt_spill_all(si.pos[0], si.context);
 #if G6_MODEL_DS41
-            // GR8_DS_M4_PFW=W (test only, bounded replay step 2, gr8-bounded-replay-plan.md section 5): at step 0 the prompt's first
+            // GR8_TEST_DS41_M4_PFW=W (test only, the bounded replay check): at step 0 the prompt's first
             // floor((n-1)/W)*W tokens run as W-row non-final prefill chunks the way g6m4's prefill hook runs them (tok / pos / tgt / step /
             // cells set from the host, nonfinal_plan() split by GR8_DS_PF_TAIL, no head; 0 = unsplit); the prompt steps they cover are skipped
-            // and the rest of the sequence runs as before. Prints "pfw" lines: per chunk, rank and layer, fnv of the attention / MoE partial,
+            // and the remaining steps run normally. Prints "pfw" lines: per chunk, rank and layer, fnv of the attention / MoE partial,
             // and of the trunk after the chunk. GR8_DS_PF_TAIL = 0 and = W must print the same lines (and the same logits after).
             if (pfw && s == 0)
             {
                 const int n = (int)p.prompt.size(), npf = (n - 1) / pfw * pfw;
-                if (p.first || p.chunk <= 0 || pfw % p.chunk || npf < pfw) die("GR8_DS_M4_PFW: needs first 0, W a multiple of --chunk and a prompt of more than W tokens");
+                if (p.first || p.chunk <= 0 || pfw % p.chunk || npf < pfw) die("GR8_TEST_DS41_M4_PFW: needs first 0, W a multiple of --chunk and a prompt of more than W tokens");
                 for (int k = 0; k * pfw < npf; ++k)
                 {
                     const int first = k * pfw, Mw = pfw, ctx = first + Mw;
@@ -2339,12 +2339,12 @@ int main(int argc, char** argv)
                         G6RT_CK(cudaMemcpyAsync(m.tgt, tgt.data(), Mw * sizeof(int), cudaMemcpyHostToDevice, st));
                         G6RT_CK(cudaMemcpyAsync(m.stepp, &seq, sizeof seq, cudaMemcpyHostToDevice, st));
                         G6RT_CK(cudaMemcpyAsync(m.cells, cells.data(), cells.size() * sizeof(cells[0]), cudaMemcpyHostToDevice, st));
-                        if (ds41_idx_set_chunk(&m, ctx) != 0) die("GR8_DS_M4_PFW: index chunk bound refused");
+                        if (ds41_idx_set_chunk(&m, ctx) != 0) die("GR8_TEST_DS41_M4_PFW: index chunk bound refused");
                         const auto nf = ds41::dsp::pf::nonfinal_plan(m.ds41_plan, false);
                         const std::string ck = ds41::dsp::pf::check_nonfinal_plan(m.ds41_plan, nf, false);
-                        if (!ck.empty()) die("GR8_DS_M4_PFW: " + ck);
+                        if (!ck.empty()) die("GR8_TEST_DS41_M4_PFW: " + ck);
                         split = pf_tail ? ds41::br::split_plan(nf, layers) : ds41::br::Split{nf, nf.size(), -1};
-                        if (pf_tail) { const std::string c2 = ds41::br::check_split(nf, split, layers); if (!c2.empty()) die("GR8_DS_M4_PFW: " + c2); }
+                        if (pf_tail) { const std::string c2 = ds41::br::check_split(nf, split, layers); if (!c2.empty()) die("GR8_TEST_DS41_M4_PFW: " + c2); }
                         keep_plan[m.rank] = m.ds41_plan; keep_idx[m.rank] = m.ds41_idx;
                         m.ds41_plan = split.ops; m.ds41_idx = ds41::index(split.ops);
                     }
@@ -2386,7 +2386,7 @@ int main(int argc, char** argv)
                         printf("pfw seq %zu chunk %d first %d rank %d trunk rows %d %016llx\n", q, k, first, m.rank, late,
                                h(m.resid4, (size_t)late * geom::HC * HID * sizeof(ds_mhc::trunk_t)));
                         m.ds41_pf_late = 0;
-                        if (ds41_idx_set_chunk(&m, 0) != 0) die("GR8_DS_M4_PFW: index chunk reset refused");
+                        if (ds41_idx_set_chunk(&m, 0) != 0) die("GR8_TEST_DS41_M4_PFW: index chunk reset refused");
                         m.ds41_plan = keep_plan[m.rank]; m.ds41_idx = keep_idx[m.rank];
                     }
                 }

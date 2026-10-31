@@ -118,6 +118,7 @@
 #include "../comms/progress_cpus.h"
 #include "s2/native.cuh"
 #include "s2/flash_native.cuh"
+#if G6_MODEL_DS41
 #include "s2/ds41_native.cuh"
 // the C2 dispatch trace counter lives in attn/ds41_attn.cu: ds41_attn.cuh defines device kernels, so this second
 // translation unit of the binary declares the two plain functions instead of including it
@@ -128,6 +129,7 @@ bool ds41_c2_trace_on();
 #include "ds41_rs.h"
 #include "ds41_prefill_fabric.h"
 #include "ds41_knobs.h"
+#endif
 #include "s2/flash_checkpoint.h"   // GR8_GLM53F_CACHE parsed in every build, refused outside Flash
 #include "s2/cp_rows.h"
 #include "s2/pool.h"
@@ -367,7 +369,7 @@ int main(int argc, char** argv)
     const SpecLen spec_initial = spec;  // fully configured, before any observations; includes Flash costs and levels
 #endif
 #if G6_MODEL_DS41
-    // DS41 v1 serve (reports/ds-in-gr8-build/b9-serve-path.md): one session, the prompt runs as decode steps (no tensor prefill), no draft (--mtp 0)
+    // DS41 serve (s2/ds41_native.cuh): no --prefill tensor prefill and no --mtp draft (the draft is DSpark, GR8_DS_MTP); --graph is optional
     if (s2mode && (s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 32 || !s2epoch))
         die("DS41 serving (--serve) needs --s2-port 1..65535, --s2-sessions 1..32 and --s2-epoch > 0 (no --prefill, --mtp 0; GR8_DS_MTP 1..5 is the DSpark draft); --graph is optional (without it each step runs eagerly)");
 #else
@@ -527,10 +529,10 @@ int main(int argc, char** argv)
     // Prefix reuse is served by the DS41 snapshot cache; the separate --kv-store tier is not implemented for DS41.
     if (reuse_prefix && !s2mode) die("DS41: --reuse-prefix needs --serve");
     if (!kv_tiers.empty()) die("DS41: --kv-store is not supported");
-    // what DS41 cannot do yet dies here, at parse time, not mid-boot (b9-serve-path.md row 1): prefill.cuh has no DS41 branch, --mtp N > 0 would run GLM's build_draft
+    // what DS41 cannot do dies here, at parse time, not mid-boot: prefill.cuh has no DS41 branch, --mtp N > 0 would run GLM's build_draft
     if (MP > 0) die("DS41: --prefill is not supported (there is no DS41 tensor prefill; the prompt runs as decode steps)");
     if (mtp > 0) die("DS41: --mtp N > 0 is not supported (the draft is DSpark: GR8_DS_MTP=1..5 with --mtp 0)");
-    // B12 DSpark (OFF unless GR8_DS_MTP = 1..5): served only, the round runner is the S2 DRAFT / CHAIN path (s2/ds41_dspark_round.cuh)
+    // DSpark (off unless GR8_DS_MTP = 1..5): served only, the round runner is the S2 DRAFT / CHAIN path (s2/ds41_dspark_round.cuh)
     const ds41::dsp::Knobs dsk = ds41::dsp::parse_knobs([](const char* n) -> const char* {
         if (!strcmp(n, "GR8_DS_MTP")) return DS41_TEXT(knob::ds_mtp());
         if (!strcmp(n, "GR8_DS_BLOCK")) return DS41_TEXT(knob::ds_block());
@@ -545,16 +547,15 @@ int main(int argc, char** argv)
     if (dsk.relax_topp > 0 && nc == 0) die("DS41: GR8_DS_RELAXED_ACCEPT topp:P needs --top-p-cands > 0 (the candidates carry the mass above the draft)");
     if (dfl) die("DS41: --dflash-manifest is not supported");
     if (!grammar_dir.empty()) die("DS41: --grammar-dir is not supported");
-    // v1 serve runs the whole step as one graph (GR8_DEC_SPLIT=0); the split3 graphs are the GLM production path (L1487 asks for them from every non-Flash serve)
+    // the DS41 serve runs the whole step as one graph (GR8_DEC_SPLIT=0); the split3 graphs are the GLM serve path (the GR8_DEC_SPLIT check below asks for them from every GLM serve)
     if (s2mode && knob::dec_split() != 0) die("DS41: serving runs GR8_DEC_SPLIT=0 (a split serve graph is not built for DS41 yet)");
-    // Engram (GR8_DS_ENGRAM=1) under --serve: the token ring of ds41_engram_ops.cuh holds the n-gram window of ONE session whose rows are consecutive
-    // positions from 0 (serve v1: one session, no prefix reuse, the host builds every row), so it needs no per-row StepIn. Refused until the ring is
-    // checked against more than that: a draft-and-verify round (GR8_DS_MTP). ds41_engram_colls is host-only: it reads the GR8_DS_ENGRAM knobs and dies on a
-    // bad config exactly as the boot does (layers 1 and 14 needed, PREFIX set), so --check-args reports it.
-    // GR8_DS_ENGRAM_MTP=1 lifts the refusal for the first Engram-ON + DSpark light: the default stays refused with this message
+    // Engram (GR8_DS_ENGRAM=1) under --serve: the token ring of ds41_engram_ops.cuh holds the n-gram window of each session, whose rows are
+    // consecutive positions. A draft-and-verify round (GR8_DS_MTP) is not checked against the ring, so Engram with DSpark is refused unless
+    // GR8_DS_ENGRAM_MTP=1. ds41_engram_colls is host-only: it reads the GR8_DS_ENGRAM knobs and dies on a bad config exactly as the boot
+    // does (layers 1 and 14 needed, PREFIX set), so --check-args reports it.
     if (ds41_engram_colls(layers) && dsk.on() && !knob::ds_engram_mtp())
-        die("DS41: GR8_DS_ENGRAM=1 with GR8_DS_MTP is not validated yet (Engram ON serves at MTP 0)");
-    // F12: a pack needs 2+ real S2 slots and the W-prefill buffers. Check before
+        die("DS41: GR8_DS_ENGRAM=1 with GR8_DS_MTP is not validated yet (Engram on serves at MTP 0)");
+    // GR8_DS_C8PACK=1: a pack needs 2+ real S2 slots and the W-prefill buffers. Check before
     // --check-args and before loading weights: no zero-sized pf_pos/pf_tgt/pf_sess.
     if (c8_pack_env && (!s2mode || s2sess < 2 || knob::ds_prefill_min() < 2))
         die("GR8_DS_C8PACK=1 needs --serve, --s2-sessions >= 2 and GR8_DS_PREFILL_MIN >= 2");
@@ -673,22 +674,22 @@ int main(int argc, char** argv)
     G6RT_CK(cudaSetDeviceFlags(cudaDeviceMapHost));
     cfg.slot_bytes = NX ? (size_t)MX * 6144 * 2 : (size_t)MX * HID * 2;   // Engram: [rows][6144] BF16 slots (ds41_engram_ops.cuh)
     const size_t dec_slot_bytes = cfg.slot_bytes;   // the decode slot: every decode collective (layer, head, Engram) of MX rows fits it
-    g6::FabricConfig cm;                            // the main fabric's own runs (F6, DS41 serve), set below; run1 = 0 = uniform
-    bool pf_direct = false;                         // F10 #8 GR8_DS_PF_DIRECT=1: prefill producers write the pinned send slots (ds41_step.cuh ds41_op_direct)
-    int rs_k = 0;                                   // F10 GR8_DS_PF_RS=1 (ds41_rs.h): the RS layer exchanges 0..rs_k-1, AG collectives NC..NC+rs_k-1; 0 = off
-    bool rowshard = false;                          // B12 default-off local-Q mHC + AG(y) + one boundary-state collective
+    g6::FabricConfig cm;                            // the main fabric's own runs (DS41 serve), set below; run1 = 0 = uniform
+    bool pf_direct = false;                         // GR8_DS_PF_DIRECT=1: prefill producers write the pinned send slots (ds41_step.cuh ds41_op_direct)
+    int rs_k = 0;                                   // GR8_DS_PF_RS=1 (ds41_rs.h): the RS layer exchanges 0..rs_k-1, AG collectives NC..NC+rs_k-1; 0 = off
+    bool rowshard = false;                          // GR8_DS_MHC_ROW_SHARD=1 (default off): local-Q mHC + AG(y) + one boundary-state collective
     bool y_mxfp8 = false;                           // default-off lossy MXFP8 AG(y), requires rowshard
 #if G6_MODEL_DS41
     g6::FabricConfig cmB;                           // GR8_DS_PF_LANES=2: lane B's fabric runs (ds41::lanes::fabric_runs_b), set below
     int pf_lanes_fab = 1;                           // GR8_DS_PF_LANES, read here for the lane-B fabric (the serve setup reads it again)
-    // A W-row headless prefill chunk uses the same fabric as decode. Keep the
-    // unset path byte-for-byte at MX; Fabric::init adds the 8-byte tail and
-    // alignment to this payload capacity (fabric.cpp:482).
+    // A W-row headless prefill chunk uses the same fabric as decode. Unset, the
+    // slot holds MX rows; Fabric::init adds the 8-byte tail and alignment to
+    // this payload capacity.
     if (s2mode) {
         const int pf_rows = ds41_prefill_rowcap(DS41_TEXT(knob::ds_prefill_w()), MX);
         if (!pf_rows) die("DS41 serve: GR8_DS_PREFILL_W must be MX..4096");
         cfg.slot_bytes = ds41_prefill_fabric_payload(pf_rows, HID, NX ? 6144 : 0);
-        // F6: the main fabric's slots sized per collective (FabricConfig::run1) as a W chunk sends them (s2/ds41_prefill.h
+        // the main fabric's slots sized per collective (FabricConfig::run1) as a W chunk sends them (s2/ds41_prefill.h
         // ds41_chunk_collectives): [0, c1) layer exchanges of W rows; [c1, 2 NL + 1) the bounded-replay layers (late rows,
         // GR8_DS_PF_TAIL) and the head (0 B in prefill); [2 NL + 1, NC) the Engram reduces of W rows. Every run also holds the
         // decode slot. Fabric::enqueue_step still checks each collective against its own slot.
@@ -696,7 +697,7 @@ int main(int argc, char** argv)
         if (tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
         const int i_late = tail ? ds41::br::late_start(layers) : -1;
         bool pf_rs_on = false;
-        // F10 GR8_DS_PF_RS=1: layer exchanges c < 2 i_late of a prefill chunk run as reduce-scatter + all-gather (ds41_rs.h). Run 0 holds NR
+        // GR8_DS_PF_RS=1: layer exchanges c < 2 i_late of a prefill chunk run as reduce-scatter + all-gather (ds41_rs.h). Run 0 holds NR
         // slices of ss each (+256 B a slot at W2048), and a 4th run [NC, NC + rs_k) holds the AG collectives (one slice payload each).
         // Mesh and ring take the same proxy path (send / recv by offset; the ring relays the diagonal by that offset).
         if (knob::ds_pf_rs()) {
@@ -724,7 +725,7 @@ int main(int argc, char** argv)
                                                 glue::head_bytes_tk(MX, nc, true), pf_rs_on, c8_pack_env == 1, rowshard);
         cm = runs.cfg;
         rs_k = runs.rs_k;
-        // F14 P-A GR8_DS_PF_POOL=P: run 0 (the layer exchanges before the late split) and run 3 (the AG collectives) keep P slots each,
+        // GR8_DS_PF_POOL=P: run 0 (the layer exchanges before the late split) and run 3 (the AG collectives) keep P slots each,
         // collective c in slot c mod P (comms/fabric.h FabricConfig::pool; the proxy posts a reused slot after the peer's credit tail).
         if (const char* pv = DS41_TEXT(knob::ds_pf_pool()); pv && *pv && strcmp(pv, "0") != 0) {
             char* end = nullptr;
@@ -741,7 +742,7 @@ int main(int argc, char** argv)
         if (pf_lanes_fab == 2) {
             const auto rb = ds41::lanes::fabric_runs_b(pf_rows, tail, i_late, NL, NX, MX, HID, g6nr::NR, glue::head_bytes_tk(MX, nc, true), pf_rs_on, rowshard);
             if (rb.rs_k != rs_k || rb.cfg.run1 != cm.run1 || rb.cfg.ncoll != cm.ncoll)
-                die("DS41 lane B fabric: its runs or B12 state collective differ from the main fabric's");
+                die("DS41 lane B fabric: its runs or row-shard state collective differ from the main fabric's");
             cmB = rb.cfg;
             cmB.pool = cm.pool;
         }
@@ -749,9 +750,9 @@ int main(int argc, char** argv)
             fprintf(stderr, "# rank %d DS41 prefill RS+AG: GR8_DS_PF_RS=1 (c < %d; Q %d rows, slice stride %zu B; AG collectives %d..%d, %zu B each)\n",
                     cfg.rank, rs_k, runs.quarter, runs.slice_stride, NC, NC + rs_k - 1, cm.slot_bytes3);
         }
-        // F10 #8 GR8_DS_PF_DIRECT=1: on an eager W-row prefill chunk the attention output and the MoE combine write the pinned send slot of
+        // GR8_DS_PF_DIRECT=1: on an eager W-row prefill chunk the attention output and the MoE combine write the pinned send slot of
         // their collective (flat [rows][HID]); the publish only rings. RS collectives of such a chunk go as flat slices (payload + tail-word
-        // SGEs, Fabric::Rs::flat), so the fabric QPs take 2 send SGEs (FabricConfig::sge2). Decode (graphs) is unchanged.
+        // SGEs, Fabric::Rs::flat), so the fabric QPs take 2 send SGEs (FabricConfig::sge2). Decode graphs do not use it.
         if (knob::ds_pf_direct()) {
             if (pf_rows <= MX) die("GR8_DS_PF_DIRECT=1 needs GR8_DS_PREFILL_W > MX");
             if (knob::ds_subdump()) die("GR8_DS_PF_DIRECT=1: GR8_DS_SUBDUMP reads Model::sc.part after the publish (not supported)");
@@ -785,8 +786,8 @@ int main(int argc, char** argv)
     {
         g6::FabricConfig mc = cfg;
         if (cm.run1) { mc.slot_bytes = cm.slot_bytes; mc.run1 = cm.run1; mc.run2 = cm.run2; mc.slot_bytes1 = cm.slot_bytes1; mc.slot_bytes2 = cm.slot_bytes2; mc.pool = cm.pool; }
-        if (rs_k) { mc.run3 = cm.run3; mc.slot_bytes3 = cm.slot_bytes3; mc.ncoll = ds41::rs::main_ncoll(NC, rs_k, rowshard); }   // F10 AGs plus B12 state collective
-        mc.sge2 = pf_direct;                                                                     // F10 #8: flat RS slices = 2 SGEs
+        if (rs_k) { mc.run3 = cm.run3; mc.slot_bytes3 = cm.slot_bytes3; mc.ncoll = ds41::rs::main_ncoll(NC, rs_k, rowshard); }   // the RS AG collectives plus the row-shard state collective
+        mc.sge2 = pf_direct;                                                                     // GR8_DS_PF_DIRECT: flat RS slices = 2 SGEs
         fab.init(mc);
     }
     cfg.xtrace = 0;
@@ -814,7 +815,7 @@ int main(int argc, char** argv)
 #endif
     // DS41 with Engram: the step rings each Engram reduce (c = 2*nl+1+e) mid-step, not after the head, so the proxy must wait for the collectives in
     // the step's own order (ds41_coll_order.h, Fabric::Rs::order). Every rank builds the same vector. Empty (Engram off, every other model): the
-    // plain enqueue_step(step, sizes) call, the proxy's numeric order, byte-for-byte what ran before.
+    // plain enqueue_step(step, sizes) call in the proxy's numeric order.
     auto fab_enqueue = [&](unsigned long long step, const std::vector<uint32_t>& sizes) {
         if (fab_order.empty()) { fab.enqueue_step(step, sizes); return; }
         g6::Fabric::Rs rs;
@@ -937,7 +938,7 @@ int main(int argc, char** argv)
     {
         g6::FabricConfig cd = cfg;
         cd.ncoll = ds41::dsp::DRAFT_NCOLL;
-        // F6: the draft block sends 5 rows a session, never W rows: decode-sized slots (the W-sized cfg.slot_bytes is the main fabric's)
+        // the draft block sends 5 rows a session, never W rows: decode-sized slots (the W-sized cfg.slot_bytes is the main fabric's)
         cd.slot_bytes = dec_slot_bytes;
         for (int c = 0; c < cd.ncoll; ++c)
             if (ds41::dsp::coll_bytes(c, HID, std::min(s2sess, ::ds41dsp::MARKOV_MAXS)) > cd.slot_bytes) die("DSpark draft fabric: a collective is larger than the decode slot");
@@ -1286,8 +1287,8 @@ int main(int argc, char** argv)
     m.ds41_idx_pipe_b = ds_idx_pipe_b == 1;
     build_ds41(m, R, layers, find, cap, f, stepp, st, pf_attn_rows(MP), dsk.on() ? 1 : 0, rs_k, rowshard);
     if (rs_k) ds41_rs_setup(m, R, NC, rs_k, rowshard, y_mxfp8);
-    m.ds41_direct = pf_direct;                 // F10 #8 GR8_DS_PF_DIRECT=1
-    if (ds41moe::ro_order_on())                // F10: GR8_DS_RO_ORDER liveness, read through the same parser the expert loop launch uses (ds41_moe_ops.cuh)
+    m.ds41_direct = pf_direct;                 // GR8_DS_PF_DIRECT=1
+    if (ds41moe::ro_order_on())                // GR8_DS_RO_ORDER liveness, read through the same parser the expert loop launch uses (ds41_moe_ops.cuh)
         fprintf(stderr, "# rank %d DS41 read-once expert order: GR8_DS_RO_ORDER=1 (k_order_ro; L2 lookahead %d)\n", R, ds41moe::ro_l2la());
 #else
     build(m, R, layers, find, cap, f, stepp, st, pf_attn_rows(MP));   // bindings sized for the attention chunk
@@ -1564,7 +1565,7 @@ int main(int argc, char** argv)
         m.rx.on = 1;
         m.rx.log_ratio = dsk.relax_ratio > 0 ? (float)std::log(dsk.relax_ratio) : -INFINITY;
         m.rx.topp = (float)dsk.relax_topp;
-        if (cfg.rank == 0) fprintf(stderr, "# rank 0: GR8_DS_RELAXED_ACCEPT ON ratio %g topp %g (NOT EXACT)\n", dsk.relax_ratio, dsk.relax_topp);
+        if (cfg.rank == 0) fprintf(stderr, "# rank 0: GR8_DS_RELAXED_ACCEPT on ratio %g topp %g (not exact)\n", dsk.relax_ratio, dsk.relax_topp);
     }
 #endif
     if (grammar_ready())                // before any capture: the main head's grammar mask (rank.cuh k_grammar_mask)
@@ -1802,7 +1803,7 @@ int main(int argc, char** argv)
 #endif
         }
 #if G6_MODEL_DS41
-        if (dsk.on())                   // ONE draft graph per session count: the DS41 layers read the context from their step cells, not from a bucket
+        if (dsk.on())                   // one draft graph per session count: the DS41 layers read the context from their step cells, not from a bucket
         {
             DS.cur = 0;
             for (int S = 1; S <= DS.dsp.nsess; ++S)
@@ -2002,8 +2003,8 @@ int main(int argc, char** argv)
 #elif G6_MODEL_DS41
     if (s2mode)
     {
-        // serve v1 (s2/ds41_native.cuh): one session at position 0, optional headless W-row prefill, no reuse. The graphs above
-        // (exec[k][M], M = 1..chunk) are the ones it launches; parse time refused every setting it cannot serve
+        // the DS41 serve (s2/ds41_native.cuh), with optional headless W-row prefill. The graphs above (exec[k][M], M = 1..chunk,
+        // and the ns-session graphs) are the ones it launches; parse time refused every setting it cannot serve
         g6s2::BootstrapConfig bc;
         auto& sc = bc.scheduler;
         sc.epoch = s2epoch; sc.pool_rows = s2sess * (cap / 64 * 64);   // SESS: cap rows per session slot (ds41_native.cuh caps one run at cap)
@@ -2011,22 +2012,21 @@ int main(int argc, char** argv)
         sc.max_sessions = s2sess; sc.mtp = dsk.mtp;
         // drafting stops past the sessions whose verify and 5 draft rows fit one step (at most 8)
         sc.mtp_sessions = (uint32_t)std::min(sc.max_rows / 5, 8u);
-        // Boot evidence for Gate 1 (Legate ruling 2): the DS41 branch never printed its pool, so a gate had nothing real
-        // to read. This line names the logical page count, the page size, the session count and the row caps; the plan's
-        // /status free_pages == sessions*cap/64 and resident == 0 are checked separately against the head's status.
+        // Boot evidence: this line names the logical page count, the page size, the session count and the row caps, so a check
+        // can compare them with the head's /status (free_pages == sessions*cap/64, resident == 0).
         fprintf(stderr, "# rank %d: s2 pool %u logical pages of %d rows, %d sessions, cap %d, max_rows %d\n", R,
                 sc.pool_rows / 64, 64, s2sess, cap, sc.max_rows);
-        sc.c8_pack = c8_pack_env == 1; // F12 opt-in short-prompt pack; parsed before weight load
+        sc.c8_pack = c8_pack_env == 1; // GR8_DS_C8PACK opt-in short-prompt pack; parsed before weight load
         sc.tail_first = knob::s2_tail_first();
         sc.notice_max = (uint32_t)knob::s2_notice_max();
         fprintf(stderr, "# rank %d ds41 s2 scheduler tail_first %d notice_max %u\n", R, sc.tail_first ? 1 : 0, sc.notice_max);
         const int pf_min = (int)knob::ds_prefill_min();
-        // Engram ON is allowed (B11 W-row prefill: engine max_rows = W, one chunk in flight -- ds41_prefill_single_lane keeps the engine's one slot safe)
+        // Engram on is allowed with W-row prefill (engine max_rows = W, one chunk in flight -- ds41_prefill_single_lane keeps the engine's one slot safe)
         if (pf_min && (pf_min < 2 || m.hc_rows <= MX || m.hc_rows > ds41moe::ROMAX || m.qs.on()))
-            die("DS41 prefill first light needs GR8_DS_PREFILL_MIN>=2, MX<W<=" + std::to_string(ds41moe::ROMAX) + ", and QA/QS split off");
+            die("DS41 W-row prefill needs GR8_DS_PREFILL_MIN>=2, MX<W<=" + std::to_string(ds41moe::ROMAX) + ", and QA/QS split off");
         if (pf_min && dsk.prefill_keep != 0)
-            die("DS41 prefill first light needs GR8_DS_PREFILL_KEEP=0");
-        // GR8_DS_PF_LANES=2 (ds41_lanes.h): two-lane W prefill, quanta of up to 2W rows of one session; unset / 1 = one lane, today's path
+            die("DS41 W-row prefill needs GR8_DS_PREFILL_KEEP=0");
+        // GR8_DS_PF_LANES=2 (ds41_lanes.h): two-lane W prefill, quanta of up to 2W rows of one session; unset / 1 = one lane
         const int pf_lanes = ds41::lanes::parse(DS41_TEXT(knob::ds_pf_lanes()));
         if (!pf_lanes) die(ds41::lanes::kParseError);
         if (pf_lanes == 2 && !pf_min) die("GR8_DS_PF_LANES=2 needs W-row prefill (GR8_DS_PREFILL_MIN)");
@@ -2037,12 +2037,12 @@ int main(int argc, char** argv)
         bc.timeout = (unsigned)knob::s2_timeout();
         bc.runtime_signature = std::string(s2sess > 1 ? "ds41 sessions " + std::to_string(s2sess) : std::string("ds41 solo")) + " cap " + std::to_string(cap) + " layers " + layers_s + " mtp " + std::to_string(dsk.mtp) +
             " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id +
-            " shtc " + std::to_string(ds41moe::sh_tc_on() ? 1 : 0) +   // F12 GR8_DS_SH_TC: ranks must agree (W8A8 shared expert, not bit-identical to 0)
-            (ds41moe::ro_l2hint() ? " l2h " + std::to_string(ds41moe::ro_l2hint()) : std::string()) +   // F12 GR8_DS_MOE_L2HINT: value 0 = today's string byte for byte; ranks that disagree on 1 / 2 refuse to join
-            (ds41moe::ro_fc2stg() ? std::string(" stg 1") : std::string()) +   // GR8_DS_MOE_FC2STG: value 0 = today's string byte for byte; ranks that disagree refuse to join
-            (ds41moe::ro_fc1bstg() ? std::string(" fc1bstg 1") : std::string()); // default off preserves the old signature; ranks with the staged B arm must agree
+            " shtc " + std::to_string(ds41moe::sh_tc_on() ? 1 : 0) +   // GR8_DS_SH_TC: ranks must agree (W8A8 shared expert, not bit-identical to 0)
+            (ds41moe::ro_l2hint() ? " l2h " + std::to_string(ds41moe::ro_l2hint()) : std::string()) +   // GR8_DS_MOE_L2HINT: 0 adds nothing; ranks that disagree on 1 / 2 refuse to join
+            (ds41moe::ro_fc2stg() ? std::string(" stg 1") : std::string()) +   // GR8_DS_MOE_FC2STG: 0 adds nothing; ranks that disagree refuse to join
+            (ds41moe::ro_fc1bstg() ? std::string(" fc1bstg 1") : std::string()); // off adds nothing; ranks with the staged B arm must agree
         if (sc.c8_pack) bc.runtime_signature += " c8pack 1";
-        if (pf_lanes == 2) bc.runtime_signature += " pflanes 2";   // unset / 1 = today's string byte for byte; ranks that disagree refuse to join
+        if (pf_lanes == 2) bc.runtime_signature += " pflanes 2";   // unset / 1 adds nothing; ranks that disagree refuse to join
         if (ds_moe_decode_topk != ds_moe_main_topk)
             bc.runtime_signature += " tkmain " + std::to_string(ds_moe_main_topk) +
                                     " tkdecode " + std::to_string(ds_moe_decode_topk);
@@ -2099,13 +2099,13 @@ int main(int argc, char** argv)
         // Pageable H2D sources must outlive the async copies on the non-blocking compute stream.
         // The native prefill hook fences that stream before the next chunk can mutate them.
         std::vector<int> pf_pos(pf_min ? m.hc_rows : 0), pf_tgt(pf_min ? m.hc_rows : 0, -1), pf_sess(pf_min && m.ds_slots > 1 ? m.hc_rows : 0);
-        std::vector<int> pf_tok(c8_pack_env ? 512 : 0); // ON only; pageable source lives through native's post-launch fence
+        std::vector<int> pf_tok(c8_pack_env ? 512 : 0); // GR8_DS_C8PACK=1 only; pageable source lives through native's post-launch fence
         std::vector<G6AttnStepCell> pf_cells(pf_min ? m.nl : 0);
         // bounded replay (ds41_pf_split.h): GR8_DS_PF_TAIL, read once; 0 = off (the unsplit non-final plan)
         const int pf_tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
         if (pf_tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
         if (pf_min) fprintf(stderr, "# rank %d DS41 prefill bounded replay tail %d (layers >= %d)\n", R, pf_tail, geom::LATE_LAYER_START);
-        // F8 #1 (ds41_pf_split.h late_skip): GR8_DS_PF_LATE_FINAL=1 = a chunk with (N-1) - context >= tail + WINDOW rows after it skips range B. Default off.
+        // ds41_pf_split.h late_skip: GR8_DS_PF_LATE_FINAL=1 = a chunk with (N-1) - context >= tail + WINDOW rows after it skips range B. Default off.
         bool pf_late_final = false;
         if (knob::ds_pf_late_final()) {
             if (pf_min && !ds41::br::late_final_valid(pf_tail, m.hc_rows))
@@ -2132,7 +2132,7 @@ int main(int argc, char** argv)
                 const int late = split.on() ? ds41::br::late_rows((int)c.rows, pf_tail) : (int)c.rows;
                 g6s2::require(c.prompt_rows > (uint32_t)c.context, "DS41 prefill chunk past the prompt");
                 const int rows_after = int(c.prompt_rows - 1 - (uint32_t)c.context);
-                const bool skip_late = pf_late_final && split.on() && ds41::br::late_skip(rows_after, pf_tail);   // F8 #1: no range B in this chunk
+                const bool skip_late = pf_late_final && split.on() && ds41::br::late_skip(rows_after, pf_tail);   // GR8_DS_PF_LATE_FINAL: no range B in this chunk
                 const auto coll = g6s2::ds41_chunk_collectives(layers, m.ecoll, c.rows, (size_t)HID * 2, (size_t)6144 * 2,
                                                                split.on() ? split.i_late : -1, (uint32_t)late, skip_late);
                 for (size_t q = 0; q < coll.sizes.size(); ++q)
@@ -2143,7 +2143,7 @@ int main(int argc, char** argv)
                     pf_cells[i] = G6AttnStepCell{v.context, v.page_count, v.table_size, v.reuse_rows};
                 }
                 ds41moe::elog_begin(&m, (int)c.first);
-                G6RT_CK(cudaStreamSynchronize(0)); // B6's elog_begin uses a synchronous legacy-stream copy; order it before router work on st.
+                G6RT_CK(cudaStreamSynchronize(0)); // elog_begin uses a synchronous legacy-stream copy; order it before router work on st.
                 G6RT_CK(cudaMemcpyAsync(m.tok, c.tok, c.rows * sizeof(int), cudaMemcpyHostToDevice, st));
                 G6RT_CK(cudaMemcpyAsync(m.pos, pf_pos.data(), c.rows * sizeof(int), cudaMemcpyHostToDevice, st));
                 G6RT_CK(cudaMemcpyAsync(m.tgt, pf_tgt.data(), c.rows * sizeof(int), cudaMemcpyHostToDevice, st));
@@ -2162,7 +2162,7 @@ int main(int argc, char** argv)
                 else prepare_ds41_prefill(m, (int)c.rows, st);
                 if (dsk.on()) { m.dsp.main_lo = 0; m.dsp.main_hi = late; }
                 g6::Fabric::Rs rs; rs.order = coll.order;
-                if (ds41::rs::on(rs_k > 0, 0, rs_k, (int)c.rows, MX, g6nr::NR)) {   // F10 GR8_DS_PF_RS=1: the same rule as the ops' ds41_rs_on
+                if (ds41::rs::on(rs_k > 0, 0, rs_k, (int)c.rows, MX, g6nr::NR)) {   // GR8_DS_PF_RS=1: the same rule as the ops' ds41_rs_on
                     const size_t rb = (size_t)HID * 2;
                     if (const char* e = ds41::rs::job_error(coll.sizes, NC, rs_k, (int)c.rows, g6nr::NR, rb)) g6s2::require(false, e);
                     const bool shard_chunk=ds41::rowshard::chunk_on(rowshard,(int)c.rows,late,g6nr::NR);
@@ -2179,7 +2179,7 @@ int main(int argc, char** argv)
                         g6s2::require(j.sizes[(size_t)(NC + q)] + (size_t)8 <= g6::fab_slot_stride(f, NC + q), "DS41 RS: the AG payload + tail does not fit its slot");
                     if (shard_state) g6s2::require((size_t)state_bytes + 8 <= g6::fab_slot_stride(f, NC + rs_k), "DS41 row-shard: state payload does not fit its slot");
                     rs.ss = j.ss; rs.bytes = j.bytes; rs.order = j.order;
-                    if (pf_direct) {   // F10 #8: the producers wrote flat [rows][HID]; slice p = Q rows at p Q HID 2, tail words after the NR slices
+                    if (pf_direct) {   // GR8_DS_PF_DIRECT: the producers wrote flat [rows][HID]; slice p = Q rows at p Q HID 2, tail words after the NR slices
                         rs.ss = (size_t)ds41::rs::quarter((int)c.rows, g6nr::NR) * HID * 2;
                         rs.flat = rs.mask;
                         for (int q : j.rs) g6s2::require(rs.ss * g6nr::NR + 8 * (size_t)g6nr::NR <= g6::fab_slot_stride(f, q), "DS41 direct: NR flat slices + tail words do not fit an RS slot");
@@ -2200,7 +2200,7 @@ int main(int argc, char** argv)
                     fprintf(stderr, "# rank %d request %llu ds41 engram prefill begin chunk %u rows %u\n", R, (unsigned long long)c.request, c.first, c.rows);
                 }
                 m.ds41_pf_late = late;
-                m.ds41_dchunk = pf_direct; m.ds41_dseq = c.sequence;   // F10 #8: this enqueue's producers write the send slots of step c.sequence
+                m.ds41_dchunk = pf_direct; m.ds41_dseq = c.sequence;   // GR8_DS_PF_DIRECT: this enqueue's producers write the send slots of step c.sequence
                 if (skip_late)
                     fprintf(stderr, "# rank %d request %llu chunk %u rows %u late tail skipped (rows after %d)\n", R, (unsigned long long)c.request, c.first, c.rows, rows_after);
                 // skip_late: range A without its last op ST_PF_COMPACT (split.b - 1, check_split), no range B
@@ -2231,7 +2231,7 @@ int main(int argc, char** argv)
             // lane B (chunk b, the rest of the same session: mB, sb, fabB, lane B's own id). Both walk the same non-final plan; the serial stages
             // (ds41::lanes::serial: attention, indexer, Engram, DSpark main) run as one token chain A(s) < B(s) < A(s') through events, the rest
             // overlaps. Each lane's prologue and runs are dc.prefill's, per Model; lane A joins lane B at the end, so the serve fence on st
-            // covers both. dc.prefill (one lane, up to W rows) is unchanged and still runs every quantum of W rows or fewer.
+            // covers both. dc.prefill (one lane, up to W rows) runs every quantum of W rows or fewer.
             if (pf_lanes == 2) {
                 if (pf_lanes_fab != 2) die("GR8_DS_PF_LANES changed between the fabric setup and the serve setup");
                 mBp = std::make_unique<Model>();
@@ -2279,7 +2279,7 @@ int main(int argc, char** argv)
                         G6RT_CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
                         lane_ev.push_back(e);
                     }
-                    // B6's elog_begin is a synchronous legacy-stream copy: both lanes' before any router work (lane B has its own counter)
+                    // ds41moe::elog_begin is a synchronous legacy-stream copy: both lanes' before any router work (lane B has its own counter)
                     for (int L = 0; L < 2; ++L) ds41moe::elog_begin(mm[L], (int)ch[L]->first);
                     G6RT_CK(cudaStreamSynchronize(0));
                     // lane L's prologue: dc.prefill's, on its Model, stream and fabric (K_PRO, the first link of the token chain)
@@ -2312,7 +2312,7 @@ int main(int argc, char** argv)
                         else if (split.on()) { prepare_ds41_prefill(M, (int)c.rows, s, 0, split.i_late); prepare_ds41_prefill(M, late[L], s, split.i_late, m.nl); }
                         else prepare_ds41_prefill(M, (int)c.rows, s);
                         if (dsk.on()) { M.dsp.main_lo = 0; M.dsp.main_hi = late[L]; }
-                        g6s2::require(M.ds41_rowshard_pending_c < 0, "DS41 two-lane B12: prior y all-gather was not published");
+                        g6s2::require(M.ds41_rowshard_pending_c < 0, "DS41 two-lane row shard: prior y all-gather was not published");
                         g6::Fabric::Rs rs; rs.order = coll.order;
                         if (ds41::rs::on(rs_k > 0, 0, rs_k, (int)c.rows, MX, g6nr::NR)) {
                             const size_t rb = (size_t)HID * 2;
@@ -2374,7 +2374,7 @@ int main(int argc, char** argv)
                         M.ds41_pf_late = 0;
                         M.ds_pf_slot = 0;
                         M.ds41_dchunk = false; M.ds41_dir_used[0] = M.ds41_dir_used[1] = false;
-                        g6s2::require(M.ds41_rowshard_pending_c < 0, "DS41 two-lane B12: missing y all-gather");
+                        g6s2::require(M.ds41_rowshard_pending_c < 0, "DS41 two-lane row shard: missing y all-gather");
                         M.ds41_rowshard_chunk = false; M.ds41_rowshard_state = false; M.ds41_y_quant_ready = false;
                     }
                     if (stop.stopped) die(ds41::stop_message(stop));
@@ -2395,8 +2395,8 @@ int main(int argc, char** argv)
                                 R, (unsigned long long)c.request, c.first, c.rows, x.layer, x.distinct, x.routes);
                 };
             }
-            // F12: one native W launch over the validated, per-slot ragged table. The old solo
-            // callback above is untouched and remains the sole flag-OFF path.
+            // GR8_DS_C8PACK=1: one native W launch over the validated, per-slot ragged table. With the
+            // flag off only the single-session callback above runs.
             dc.prefill_pack = [&](const g6s2::Ds41PrefillPack& p) {
                 m.ds41_rowshard_chunk=false; m.ds41_rowshard_state=false; m.ds41_y_quant_ready=false; // pack <=512 is never the 4096/1024 row-shard geometry
                 const auto& shape = p.layout;
@@ -2408,7 +2408,7 @@ int main(int argc, char** argv)
                 g6s2::require(check.empty(), check.c_str());
                 const ds41::br::Split split = pf_tail ? ds41::br::split_plan(nonfinal, layers) : ds41::br::Split{nonfinal, nonfinal.size(), -1};
                 if (pf_tail) { const std::string sc2 = ds41::br::check_split(nonfinal, split, layers); g6s2::require(sc2.empty(), sc2.c_str()); }
-                // Every segment is its complete <=64-row nonfinal prefix. PF_TAIL=128 keeps
+                // Every segment is its complete <=64-row nonfinal prefix. GR8_DS_PF_TAIL=128 keeps
                 // every row, so no late skip, no compact, and every segment's window floor is 0.
                 g6s2::require(!split.on() || pf_tail >= ds41::pack::MAX_SEGMENT_ROWS,
                               "DS41 ragged prefill requires a per-segment late tail of at least 64 rows");
@@ -3943,18 +3943,18 @@ int main(int argc, char** argv)
     fab.wait_proxy_idle();
     fab.barrier();
     fab.stop_proxy();
-    // C2 dispatch trace (SESS8): one stop-time line per rank. The counter is host-side in
-    // attn/ds41_attn.cuh (B2, 2464687) and stays 0 unless GR8_DS_C2_TRACE=1 is in the env.
+#if G6_MODEL_DS41
+    // C2 dispatch trace: one stop-time line per rank. The counter is host-side in
+    // attn/ds41_attn.cuh and stays 0 unless GR8_DS_C2_TRACE=1 is in the env.
     fprintf(stderr, "# rank %d: ds41 C2 trace count=%llu trace=%d\n", R,
             ds41_c2_dispatch_count(), ds41_c2_trace_on() ? 1 : 0);
-    // Prefix cache counters (PRL dev-proof condition 2): the cache object lives in serve_ds41's scope; it self-registers
-    // (Ds41PrefixCache::live) so this stop-time line can report the counters a gate reads instead of deriving them from
-    // the HTTP usage field. Absent when REUSE=0 (no cache was built).
+    // Prefix cache counters: the cache object lives in serve_ds41's scope; it self-registers (Ds41PrefixCache::live) so
+    // this stop-time line can report the counters directly instead of deriving them from the HTTP usage field. Absent
+    // without --reuse-prefix (no cache was built).
     if (auto* pc = g6s2::Ds41PrefixCache::live())
         fprintf(stderr, "# rank %d: ds41 prefix cache %s\n", R, pc->stats_line().c_str());
-#if G6_MODEL_DS41
-    // Count kernel enqueue statements actually reached on the B12 path, not the option value.
-    // P2 W-row prefill is eager; CUDA graph replays, if any, are not counted here.
+    // Count kernel enqueue statements actually reached on the two-stage mHC path, not the option value.
+    // The W-row prefill is eager; CUDA graph replays, if any, are not counted here.
     fprintf(stderr, "# rank %d: B12_MHC_KERNEL_LAUNCHES=%llu\n", R, m.ds41_b12_kernel_launches);
 #endif
     return 0;

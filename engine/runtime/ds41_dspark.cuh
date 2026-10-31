@@ -1,4 +1,4 @@
-// DSpark drafter of DeepSeek-V4.1-Flash-1017: the device kernels and launchers (B12). docs/DEEPSEEK-DSPARK.md is the frozen card;
+// DSpark drafter of DeepSeek-V4.1-Flash-1017: the device kernels and launchers. docs/DEEPSEEK-DSPARK.md describes the design;
 // ds41_dspark.h has the host rules and ds41_dspark_dev.h the pure functions both sides share. Raw pointers only (no Model, no fabric):
 // ds41_dspark_ops.cuh binds these to the step driver's op slots.
 //
@@ -77,9 +77,9 @@ void ds_main(const MainW& W, const MainS& S, const bf16* tap, int M, int rows_pe
     }
 }
 
-// PREFILL (card section 9): `rows` consecutive rows of ONE session (tap [rows][3][5120], pos [rows]) in launches of at most `cap` rows, ascending.
+// Prefill: `rows` consecutive rows of one session (tap [rows][3][5120], pos [rows]) in launches of at most `cap` rows, ascending.
 // cap <= min(MainS rows, ring_rows): one launch must not hold two rows of the same ring slot (k_kv_prep_pos blocks run in any order); launches
-// on one stream give "newest position wins". Every launch is the unchanged ds_main with rows_per_sess = its own row count (session 0).
+// on one stream give "newest position wins". Every launch is the plain ds_main with rows_per_sess = its own row count (session 0).
 // wide = true: a launch of more than 8 rows takes the GEMM even with GR8_DS_DSP_GV=1 (the GEMV is the decode route, 1..8 rows).
 void ds_main_rows(const MainW& W, const MainS& S, const bf16* tap, int rows, const int* pos, int cap, cudaStream_t st, const int* dsess)
 {
@@ -167,7 +167,7 @@ void markov_add(const bf16* membed, const bf16* mhead, const int* golden, const 
 }
 
 // Confidence score and the draft id vector. One block per draft row (s*5 + i): score = dot(concat(x_row [5120], w1 [256]), proj [5376]),
-// FP32 (the release returns this raw dot, model.py:1098-1103; sigmoid and the temperature are DeepInfer's and apply on use). Also moves
+// FP32 (the release returns this raw dot, the confidence head of the reference model.py; sigmoid and the temperature are DeepInfer's and apply on use). Also moves
 // the i-major merge output into the session-major draft vector the next verify step reads: draft[s*5 + i] = dtok[i*nsess + s].
 __global__ void __launch_bounds__(256) k_conf(const bf16* __restrict__ x, const bf16* __restrict__ membed, const bf16* __restrict__ proj,
                                               const int* __restrict__ golden, const int* __restrict__ dtok, int nsess, float* __restrict__ conf,
@@ -212,7 +212,7 @@ void ds_verify_in(const int* golden, const int* draft, const int* q, int k, int 
 }
 
 // ---------------------------------------------------------------------------------------------------------------- the per-Model bundle
-// Everything the DSpark ops of one rank touch, as raw device pointers (no Model, no fabric, no rank.cuh). ONE instance lives in each
-// g6rt::Model (`ds41dsp::Dsp dsp;`, B9): the main Model and the draft Model carry copies filled from the same allocations, so an op reads
-// m.dsp whichever Model it runs on. ds41_dspark_ops.cuh binds these to the stage slots and has the allocator. nsess = 1 at the milestone.
+// Everything the DSpark ops of one rank touch, as raw device pointers (no Model, no fabric, no rank.cuh). One instance lives in each
+// g6rt::Model (`ds41dsp::Dsp dsp;`): the main Model and the draft Model carry copies filled from the same allocations, so an op reads
+// m.dsp whichever Model it runs on. ds41_dspark_ops.cuh binds these to the stage slots and has the allocator.
 }   // namespace ds41dsp

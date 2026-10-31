@@ -1,8 +1,7 @@
-// The text of the DS41 serve step's fabric error word (host-only, no CUDA). The serve step used to say only "DS41 serve fabric error"
-// (first Engram light, 10-25: HTTP 500 after 13.8 s, no word in any log). This names the code, the collective and the peer.
+// The text of the DS41 serve step's fabric error word (host-only, no CUDA): it names the code, the collective and the peer.
 // Layouts: kernels/glue.cuh wait_peers sets code << 24 | c << 8 | peer (0x61 layer exchange or Engram sum, 0x62 head merge; peer = the rank
 // whose tail never arrived, after ~10 s); comms/fabric.cpp's proxy sets 0x70 << 24 | c (30 s without the doorbell of collective c),
-// 0x71 << 24 (work completion error), 0x72 << 24 (stripe or bulk wait), 0x76 << 24 | c << 8 | peer (F14 slot pool credit, 30 s). rank.cuh ERR_QS 0x66 (gather wait). Bit 31 alone, 0x80000000,
+// 0x71 << 24 (work completion error), 0x72 << 24 (stripe or bulk wait), 0x76 << 24 | c << 8 | peer (slot pool credit, 30 s). rank.cuh ERR_QS 0x66 (gather wait). Bit 31 alone, 0x80000000,
 // is ds41_engram_error (the Engram engine failed closed: a failed NVMe read or a window token outside the vocabulary).
 // c is named from the served layers: c < 2*nl is layer ids[c/2], attention (even c) or MLP (odd c) exchange; c == 2*nl is the head merge;
 // c > 2*nl is Engram collective e = c - 2*nl - 1 (its layer is engram_layers[e]). The word is the OR of several sources

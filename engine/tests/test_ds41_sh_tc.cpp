@@ -31,7 +31,7 @@ static void ck(bool ok, const std::string& what)
     else printf("ok   %s\n", what.c_str());
 }
 
-// host copy of k_kda_mx_record (engine/kda/kda.cuh:84-97): codes [16T][K] + scales [16T][K/32] -> [T][K/32][528]
+// host copy of k_kda_mx_record (engine/kda/kda.cuh): codes [16T][K] + scales [16T][K/32] -> [T][K/32][528]
 static void fwd_record(const uint8_t* codes, const uint8_t* scales, int T, int K, uint8_t* out)
 {
     const int ng = K / 32;

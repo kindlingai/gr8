@@ -4,7 +4,7 @@
 #include <climits>
 #include <cstdlib>
 
-// Caller-side row budget for the future DS41 prefill hook. Zero means a bad
+// Caller-side row budget for the DS41 prefill hook. Zero means a bad
 // explicit value; an unset value leaves the decode allocation unchanged.
 inline int ds41_prefill_rowcap(const char* value, int decode_rows) {
     if (!value) return decode_rows;

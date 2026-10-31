@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Source contract: the S2 scheduler knobs reach the DS41 serve Config. g6m4.cu builds the DS41 scheduler Config in its own
-'#elif G6_MODEL_DS41' block (auto& sc = bc.scheduler); the '#else' block is GLM's. 7bc8c51 parsed GR8_S2_TAIL_FIRST only in
-the GLM block, so on g6m4_ds41 the knob did nothing (PRL review 2:58 PM PT). Each knob must be parsed inside the DS41 block.
+'#elif G6_MODEL_DS41' block (auto& sc = bc.scheduler); the '#else' block is GLM's. A knob parsed only in
+the GLM block does nothing on g6m4_ds41, so each knob must be parsed inside the DS41 block.
 """
 
 from pathlib import Path
@@ -28,7 +28,7 @@ class Ds41S2Knobs(unittest.TestCase):
             self.assertRegex(block, field, "%s does not set the DS41 Config field" % env)
 
     def test_boot_echo(self):
-        # the F4 boot checker greps '# rank <R> ds41 s2 scheduler tail_first 1 notice_max <k>' on every rank
+        # a boot checker greps '# rank <R> ds41 s2 scheduler tail_first 1 notice_max <k>' on every rank
         block = ds41_block((ROOT / "runtime" / "g6m4.cu").read_text())
         self.assertRegex(block, r'"# rank %d ds41 s2 scheduler tail_first %d notice_max %u\\n", R, sc\.tail_first \? 1 : 0, sc\.notice_max\)')
 

@@ -8,7 +8,7 @@ int main() {
     for (const auto& c : parse_cases) {
         if (ds41::b12::parse(c.text) != c.want) return 1;
     }
-    // Ship decode budget MX=48, W=4096; all rows at/below MX or beyond W stay old.
+    // Decode budget MX=48, W=4096: row counts at or below MX or above W keep the default path.
     struct RouteCase { bool enabled, draft; int rows, cap; bool want; } route_cases[] = {
         {false,false,4096,4096,false}, {true,true,4096,4096,false},
         {true,false,1,4096,false}, {true,false,48,4096,false},

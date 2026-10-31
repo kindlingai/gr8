@@ -1,4 +1,4 @@
-// Host rules of the DSpark round (B12), the part of s2/ds41_dspark_round.cuh that needs no CUDA: what the DRAFT step feeds the draft block
+// Host rules of the DSpark round, the part of s2/ds41_dspark_round.cuh that needs no CUDA: what the DRAFT step feeds the draft block
 // (q, golden, acc), which prompt drafts are skipped, what the DRAFT / CHAIN steps hand back to s2::Batch, and the fail-closed checks.
 // engine/runtime/s2/tests/batch_ds41_dspark_test.cpp runs it against the real s2::Batch with a fake engine.
 //   DRAFT  rows are the accepted rows of the verify (or a prompt / forced chunk): Row{tok = next token, pos}, positions consecutive. The last

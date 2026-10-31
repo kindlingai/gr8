@@ -1,6 +1,6 @@
 // Host test of the SESS slot checks (engine/runtime/ds41_slots.h) that build_ds41 and ds41dsp_ops::build call: no CUDA. Build:
 //   g++ -std=c++17 -O2 -Wall -I engine engine/tests/test_ds41_slots.cpp
-// F3 set B boot 1 (--sess 8 + DSpark) died on every rank: build_ds41 refused ds_slots > 1 for the draft Model.
+// Regression: --sess 8 with DSpark must boot; build_ds41 must accept ds_slots > 1 for the draft Model.
 #include <cstdio>
 #include "runtime/ds41_slots.h"
 
@@ -16,7 +16,7 @@ int main()
     const int MAXS = 8, BLOCK = 5;
     expect(dsp_nsess_error(8, 8, 8, 5, 48, MAXS, BLOCK) == nullptr, "SESS 8 + MTP5 at MX 48 (48 verify rows, 40 draft rows)");
     expect(dsp_nsess_error(8, 32, 32, 5, 48, MAXS, BLOCK) == nullptr, "SESS 32 + MTP5 (capped at 8 in DSpark) at MX 48");
-    expect(dsp_nsess_error(1, 1, 1, 5, 32, MAXS, BLOCK) == nullptr, "SESS 1 + MTP5 at MX 32 (F2)");
+    expect(dsp_nsess_error(1, 1, 1, 5, 32, MAXS, BLOCK) == nullptr, "SESS 1 + MTP5 at MX 32");
     expect(dsp_nsess_error(8, 8, 8, 5, 32, MAXS, BLOCK) != nullptr, "SESS 8 + MTP5 at MX 32 refused");
     expect(dsp_nsess_error(8, 8, 1, 5, 48, MAXS, BLOCK) != nullptr, "draft slots != main slots refused");
     expect(dsp_nsess_error(4, 8, 8, 5, 48, MAXS, BLOCK) != nullptr, "nsess != slots refused");

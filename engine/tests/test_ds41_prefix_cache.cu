@@ -1,5 +1,5 @@
-// DEV RTX 5090 (sm_120a) / Spark (sm_121a) synthetic exactness test for Ds41PrefixCache (engine/runtime/s2/ds41_prefix_cache.cuh).
-// Build & run on DEV RTX 5090:
+// RTX 5090 (sm_120a) / Spark (sm_121a) synthetic exactness test for Ds41PrefixCache (engine/runtime/s2/ds41_prefix_cache.cuh).
+// Build & run on an RTX 5090:
 //   /usr/local/cuda/bin/nvcc -std=c++17 -O3 -gencode=arch=compute_120a,code=sm_120a -DG6_MODEL_DS41=1 -I. -Iengine \
 //     engine/tests/test_ds41_prefix_cache.cu engine/attn/ds41_bind.cu -Lengine/kvman-rs/target/release -lg6kvman -lpthread -ldl \
 //     -o /tmp/test_ds41_prefix_cache && /tmp/test_ds41_prefix_cache
@@ -7,17 +7,17 @@
 // Proves:
 //   (1) Ds41PrefixCache snapshot store, entry_bytes sizing, LRU eviction, tier_stat() (slots, free_slots, entries, hits, dropped,
 //       spilled_pages, restored_pages), digest(), and longest-exact-prefix match() (mismatch anywhere -> cold, namespace isolation).
-//   (2) Real GPU execution across ALL DS41 prefix state components:
+//   (2) Real GPU execution across all DS41 prefix state components:
 //       - Window attention layers (C.ring)
 //       - Ratio-2 KV source layers 2, 8, 14 (comp_row -> C.comp + pending half-pair C.kvs/C.scs + cnorm -> ds41_idx_ica_row(ratio=2) -> S.ica[0..2])
 //       - Ratio-1 KV source layer 20 (ds41_idx_ca_row_r1 -> S.ca[3] + S.shadow + pre -> ds41_idx_ica_row(ratio=1) -> S.ica[3] -> topk + cand_blocks)
 //       - Candidate-consumer sparse attention layers 24, 28, 32, 36 (ds41_idx_topk(use_cand=1) over S.ica[0..2] + cand_blocks)
 //       - Engram token ring (ehist[64] + win_wide_row)
 //       - DSpark draft model attention rings (3 layers x 136 rows)
-//   (3) Cold prefill vs Restored prefix exactness at BOTH even and odd capture positions:
-//       - Prompt-end capture at p = P - 1 for EVEN P (odd p = 63) and ODD P (even p = 64)
+//   (3) Cold prefill vs Restored prefix exactness at both even and odd capture positions:
+//       - Prompt-end capture at p = P - 1 for even P (odd p = 63) and odd P (even p = 64)
 //       - Multi-turn retire capture at odd p = 47 and even p = 48 followed by chunk continuation to P = 64 and 8 greedy decode steps
-//       - Every restored run after 0xFF/NaN poisoning produces BIT-IDENTICAL (0 bit differences, max_abs_diff = 0.0, identical top-1)
+//       - Every restored run after 0xFF/NaN poisoning produces bit-identical (0 bit differences, max_abs_diff = 0.0, identical top-1)
 //         ICA planar codes+SF (layers 2, 8, 14, 20), CA rows, shadow KV, C.comp, C.kvs/C.scs, C.ring, hidden states, and next-token logits.
 //   (4) Negative controls: corrupting restored ICA or omitting C.kvs/C.scs at odd p = P - 1 causes immediate state/logit divergence.
 
@@ -321,7 +321,7 @@ static int run_test() {
     // Part 2: End-to-End GPU Kernel Forward Exactness (Cold Prefill vs Restored Prefix)
     // Exercises real ds41a::attn_proj / comp_row / attn_core / attn_out (window, ratio-2 KV
     // source L2/8/14, ratio-1 L20, candidate consumer L24) + real ds41_idx_* (CA row, ICA row
-    // ratio 2 & 1, topk, cand_blocks) + Engram ring + vocab logit projection at both ODD and EVEN capture positions.
+    // ratio 2 & 1, topk, cand_blocks) + Engram ring + vocab logit projection at both odd and even capture positions.
     // -------------------------------------------------------------------------
     {
         constexpr int NL = 6;

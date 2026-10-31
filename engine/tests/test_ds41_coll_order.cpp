@@ -1,6 +1,6 @@
 // Host test of the DS41 decode step's collective order (engine/runtime/ds41_coll_order.h): no CUDA. Build:
 //   g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I engine -I engine/runtime -I engine/comms engine/tests/test_ds41_coll_order.cpp -o /tmp/test_ds41_coll_order && /tmp/test_ds41_coll_order
-// The reference order is derived from the REAL plan() (runtime/ds41_ops.h, the list ds41_step.cuh walks): ST_PUBLISH_ATTN is c = 2i,
+// The reference order is derived from the real plan() (runtime/ds41_ops.h, the list ds41_step.cuh walks): ST_PUBLISH_ATTN is c = 2i,
 // ST_PUBLISH_FFN c = 2i+1, ST_ENGRAM c = 2*nl+1+e (ds41_engram_ops.cuh), ST_HEAD_LOCAL c = 2*nl (rank.cuh head_args).
 #include <algorithm>
 #include <cstdio>
@@ -47,7 +47,7 @@ static void check(const char* name, const std::vector<int>& ids)
 int main()
 {
     std::vector<int> all(40); std::iota(all.begin(), all.end(), 0);
-    // the full model: the order the legate and B9 gave
+    // the full model: the reference order
     std::vector<int> want = {0, 1, 81};
     for (int c = 2; c <= 27; ++c) want.push_back(c);
     want.push_back(82);

@@ -1,4 +1,4 @@
-// B12 mHC decomposition: a main-model W-row prefill switch. Host-only so the
+// mHC decomposition: a main-model W-row prefill switch. Host-only so the
 // dispatch boundary can be tested without compiling or launching CUDA.
 #pragma once
 #include <cstring>

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""DSpark canary comparator (docs/DEEPSEEK-DSPARK.md section 7): the output tokens of GR8_DS_MTP=0 against MTP=1 and MTP=5 at temp 0,
-plus the acceptance per class. It compares run files; whatever drives the booked box writes them (one JSONL per run):
+"""DSpark canary comparator: the output tokens of GR8_DS_MTP=0 against MTP=1 and MTP=5 at temp 0,
+plus the acceptance per class. It compares run files; whatever drives the engine writes them (one JSONL per run):
 
   {"type":"hdr","mtp":5,"engram":1,"temp":0,"label":"real"}       label "diag" when engram=0
   {"type":"gen","id":"prose-1","class":"prose","tokens":[...]}    all emitted token ids, in order, cut at max_tokens
@@ -8,7 +8,7 @@ plus the acceptance per class. It compares run files; whatever drives the booked
   {"type":"top2","id":"prose-1","i":17,"gap":0.31}                optional: top-2 logprob gap at token index i, for tie triage
 
 Gates (a failure at a lower gate makes the higher ones meaningless):
-  G0 MTP=0 vs MTP=0 (run-to-run determinism), G1 MTP=0 vs MTP=1, G2 MTP=0 vs MTP=5 (the done criterion).
+  G0 MTP=0 vs MTP=0 (run-to-run determinism), G1 MTP=0 vs MTP=1, G2 MTP=0 vs MTP=5 (the pass criterion).
 Equality is the md5 of the token list as compact JSON. The comparator does not guess whether a divergence is a tie flip: it prints the
 first divergent index, both tokens and the top2 gap when known. Any input run with engram=0 makes the whole report "diag".
 

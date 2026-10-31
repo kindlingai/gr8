@@ -1,4 +1,4 @@
-// Exact prompt token IDs from f12c/setb/c8e2e/off-reference.json (F12C OFF-k6 E2E).
+// Exact prompt token IDs of the eight-prompt E2E reference run (c8 pack off).
 // Native ordinals in a new boot are 0..7. Their scheduler pack is sorted by ordinal.
 #pragma once
 #include <vector>

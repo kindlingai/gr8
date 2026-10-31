@@ -1,19 +1,18 @@
-// Device self-check of the DSpark kernels (B12): every kernel in engine/runtime/ds41_dspark.cuh and engine/attn/ds41_attn_dsp.cuh is launched
-// directly (no fabric, no Model, no weights file) on fixed-seed synthetic inputs and compared with a host reference. Run it FIRST on the
-// booked box, before any canary; a failure here means the kernel is wrong, not the engine around it.
+// Device self-check of the DSpark kernels: every kernel in engine/runtime/ds41_dspark.cuh and engine/attn/ds41_attn_dsp.cuh is launched
+// directly (no fabric, no Model, no weights file) on fixed-seed synthetic inputs and compared with a host reference. Run it first on a new
+// box, before any canary; a failure here means the kernel is wrong, not the engine around it.
 //
 //   build: /usr/local/cuda/bin/nvcc -std=c++17 -gencode=arch=compute_121a,code=sm_121a -DG6_MODEL_DS41=1 -I. -Iengine -Xcompiler -Wall
 //              engine/tests/ds41_dspark_selfcheck.cu -o ds41_dspark_selfcheck
 //   run:   ./ds41_dspark_selfcheck [name]        name = one test (tap, accept, markov, conf, rope, kvprep, attn, main); default = all in order,
 //                                                the first failure stops the run. Exit 0 = all pass, 1 = a check failed, 2 = a CUDA error.
 //
-// Status: COMPILED, NEVER RUN (no box was booked when this was written). The tolerances below are proposals taken from the numerics of each
-// kernel, not measured values; the first run on the box may need one of them loosened, and that is a note for the report, not a bug.
-// Host references reuse the SAME rule headers the kernels use (ds41_dspark.h, ds41_dspark_dev.h) for the integer logic, and double-precision
+// The tolerances below are taken from the numerics of each kernel, not from measured values; a run may need one of them loosened,
+// which is not a kernel bug. Host references reuse the same rule headers the kernels use (ds41_dspark.h, ds41_dspark_dev.h) for the integer logic, and double-precision
 // maths for the float logic.
 //
-// NOT covered here (needs the Model / fabric, so it runs in the step driver): the local argmax + head merge (tie rule: lowest index), the
-// attn_proj_blk / attn_out_blk composites (they chain B4's gemm + act-quant kernels, which have their own checks), the draft layers' MoE.
+// Not covered here (needs the Model / fabric, so it runs in the step driver): the local argmax + head merge (tie rule: lowest index), the
+// attn_proj_blk / attn_out_blk composites (they chain the attention gemm + act-quant kernels, which have their own checks), the draft layers' MoE.
 #include <cuda_fp8.h>
 #include <algorithm>
 #include <cmath>
@@ -574,7 +573,7 @@ bool t_attn()
 }
 
 // ---------------------------------------------------------------------------------------------------------------- 8. ds_main (tap -> main_proj -> norm -> wkv x3 -> kv prep -> rings)
-// Staged: each stage's host reference takes the DEVICE output of the stage before it, so one wrong kernel does not hide behind another.
+// Staged: each stage's host reference takes the device output of the stage before it, so one wrong kernel does not hide behind another.
 bool t_main()
 {
     const int M = 6, rps = 6, N1 = HID, K1 = 3 * HID;
@@ -662,7 +661,7 @@ bool t_main()
             nb++;
             if (!close_bf16(got, (float)ref, 1.0, 1e-4)) return fail("main", "stage B (main_proj) row %d col %d: got %.6g ref %.6g", m, n, got, ref);
         }
-    // C. main_norm (rms-norm of the DEVICE main_proj output): within 2 BF16 ulps
+    // C. main_norm (rms-norm of the device main_proj output): within 2 BF16 ulps
     std::vector<bf16> mh((size_t)M * N1);
     CK(cudaMemcpy(mh.data(), S.mh, mh.size() * sizeof(bf16), cudaMemcpyDeviceToHost));
     for (int m = 0; m < M; m++)
@@ -676,7 +675,7 @@ bool t_main()
             if (!close_bf16(hf(mh[(size_t)m * N1 + c]), (float)ref, 2.0, 1e-6)) return fail("main", "stage C (main_norm) row %d col %d: got %.6g ref %.6g", m, c, hf(mh[(size_t)m * N1 + c]), ref);
         }
     }
-    // D. act-quant of main_x (the DEVICE norm output): bit exact
+    // D. act-quant of main_x (the device norm output): bit exact
     std::vector<uint8_t> hq((size_t)M * HID), hs((size_t)M * HID / 32);
     CK(cudaMemcpy(hq.data(), S.hq, hq.size(), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(hs.data(), S.hs, hs.size(), cudaMemcpyDeviceToHost));
@@ -714,8 +713,8 @@ bool t_main()
     return pass("main", b);
 }
 
-// ---------------------------------------------------------------------------------------------------------------- 9. ds_main_rows (prefill hook, card section 9)
-// M = 40 prompt rows from position 120 (the ring wraps at slot 136) through ds_main_rows with cap 8 / 16 / 32, against the DECODE route: ds_main on
+// ---------------------------------------------------------------------------------------------------------------- 9. ds_main_rows (prefill hook)
+// M = 40 prompt rows from position 120 (the ring wraps at slot 136) through ds_main_rows with cap 8 / 16 / 32, against the decode route: ds_main on
 // the same taps, 8 rows per call. Ring bytes of the 3 layers. cap 8 repeats the decode launches, so it must be byte equal; cap 16 / 32 change the GEMM
 // tile only (diagnostic: the number of differing elements is printed, the quality bar for the hook is teacher-forced top-1 >= 90 %, not this).
 bool t_main_rows()

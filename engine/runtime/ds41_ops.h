@@ -1,11 +1,10 @@
 // DeepSeek-V4.1-Flash-1017 decode step: the order of its stages and the table of ops that fill them (host-only, no CUDA).
 // runtime/ds41_step.cuh walks plan() and calls the table; engine/tests/test_ds41_step_order.cpp does the same on a recording
 // table. A null slot is an op the build lacks (NOTSUP, as attn/ops.h): the walk stops there and names the stage and layer,
-// it does not skip. Stage owners are the DS-gr8 builders (docs/DEEPSEEK.md, file checklist); a builder points a slot at
-// its function in runtime/ds41_step.cuh (ds41_fill_slots), one line per slot.
+// it does not skip. runtime/ds41_step.cuh (ds41_table) points each slot at its function, one line per slot.
 //
 // One layer is two sub-layers; each is prepare -> block -> publish partial -> consume (the Flash shape, engine/mhc). The
-// plan is cut into UNITS, the pieces m4sim's per-rank wrappers (rank.cuh launch_embed / launch_attn_block / launch_consume /
+// plan is cut into units, the pieces m4sim's per-rank wrappers (rank.cuh launch_embed / launch_attn_block / launch_consume /
 // launch_mlp_block / launch_head_local / launch_head_merge / launch_step_out) launch. The mHC prepare of a sub-layer runs inside
 // the consume unit before it, as in Flash (the consume and the next prepare are one launch group):
 //   U_STEP_IN    step_in
@@ -30,37 +29,37 @@ constexpr int NOTSUP = 801;   // cudaErrorNotSupported, the value of G6_ATTN_NOT
 enum Stage : int
 {
     ST_STEP_IN,        // driver: StepIn -> tok/pos/cells (k_step_in)
-    ST_EMBED,          // B7: ds_mhc::embed (4 copies of the embedding row, pre = [1,0,0,0])
-    ST_ENGRAM,         // second wave, off by default (plan(engram=false)); layers 1, 14: n-gram rows added to the trunk
-    ST_HC_ATTN,        // B7: ds_mhc::prepare with hc_attn.*: sub-layer input y = BF16 [rows,5120] (norm folded in)
-    ST_ATTN_PROJ,      // B4: q_a, q_a norm, q_b (+rope), kv (+norm, rope), window-KV write
-    ST_CA_ROW,         // B5: compressed-KV row (and index-K row) of this token; only at the kv sources 2, 8, 14, 20
-    ST_INDEX_TOPK,     // B5: top-512 keys, computed at an index source (2, 8, 14, 20, 24, 28, 32, 36)
-    ST_INDEX_BORROW,   // B5/B2: a reuse layer whose index source is not in the layer subset (--layers 0,2,20,39: layer 39, source 36).
+    ST_EMBED,          // mHC: ds_mhc::embed (4 copies of the embedding row, pre = [1,0,0,0])
+    ST_ENGRAM,         // Engram, off by default (plan(engram=false)); layers 1, 14: n-gram rows added to the trunk
+    ST_HC_ATTN,        // mHC: ds_mhc::prepare with hc_attn.*: sub-layer input y = BF16 [rows,5120] (norm folded in)
+    ST_ATTN_PROJ,      // attention: q_a, q_a norm, q_b (+rope), kv (+norm, rope), window-KV write
+    ST_CA_ROW,         // indexer: compressed-KV row (and index-K row) of this token; only at the kv sources 2, 8, 14, 20
+    ST_INDEX_TOPK,     // indexer: top-512 keys, computed at an index source (2, 8, 14, 20, 24, 28, 32, 36)
+    ST_INDEX_BORROW,   // indexer: a reuse layer whose index source is not in the layer subset (--layers 0,2,20,39: layer 39, source 36).
                        //        The list of that source is not computed. Without a fixture the op leaves the last list an index source
-                       //        published in place (the official model.py:724-727 reuse: layer 20's in that subset); with B2's dump of the
-                       //        source's top-512 it loads it. Either way the run is SYNTHETIC against the full model (synthetic(plan)).
-    ST_CAND_BLOCKS,    // B5: candidate blocks (top 2048 blocks of 8 tokens); only at the candidate source, layer 20
-    ST_ATTN_CORE,      // B4: window 128 + sink (layers 0, 1), + compressed rows via top-512 (2..39)
-    ST_ATTN_OUT,       // B4: inverse rope, grouped o_a (8 groups) / o_b -> this rank's partial
+                       //        published in place (the reuse rule of the official model.py: layer 20's in that subset); with a dump of the
+                       //        source's top-512 it loads it. Either way the run is synthetic against the full model (synthetic(plan)).
+    ST_CAND_BLOCKS,    // indexer: candidate blocks (top 2048 blocks of 8 tokens); only at the candidate source, layer 20
+    ST_ATTN_CORE,      // attention: window 128 + sink (layers 0, 1), + compressed rows via top-512 (2..39)
+    ST_ATTN_OUT,       // attention: inverse rope, grouped o_a (8 groups) / o_b -> this rank's partial
     ST_PUBLISH_ATTN,   // driver: put_publish / slot_publish of collective c = 2i
-    ST_CONSUME_ATTN,   // B7: ds_mhc::consume (waits the peers' partials of c = 2i)
-    ST_HC_FFN,         // B7: ds_mhc::prepare with hc_ffn.*
-    ST_ROUTER,         // B6: sqrtsoftplus + bias, noaux_tc top-6, route weights, plan
-    ST_SHARED,         // B6: shared expert (MXFP8, 2304 wide)
-    ST_EXPERTS,        // B6: routed experts (MXFP4), swiglu limit 10, route scale 1.5
+    ST_CONSUME_ATTN,   // mHC: ds_mhc::consume (waits the peers' partials of c = 2i)
+    ST_HC_FFN,         // mHC: ds_mhc::prepare with hc_ffn.*
+    ST_ROUTER,         // MoE: sqrtsoftplus + bias, noaux_tc top-6, route weights, plan
+    ST_SHARED,         // MoE: shared expert (MXFP8, 2304 wide)
+    ST_EXPERTS,        // MoE: routed experts (MXFP4), swiglu limit 10, route scale 1.5
     ST_PUBLISH_FFN,    // driver: publish of collective c = 2i+1
-    ST_CONSUME_FFN,    // B7: ds_mhc::consume (not on the last layer)
-    ST_FINISH,         // B7: ds_mhc::finish = last consume + final norm -> lm_head input fragments (last layer only)
+    ST_CONSUME_FFN,    // mHC: ds_mhc::consume (not on the last layer)
+    ST_FINISH,         // mHC: ds_mhc::finish = last consume + final norm -> lm_head input fragments (last layer only)
     ST_HEAD_LOCAL,     // driver: lm_head GEMV over this rank's vocab slice, local argmax / lse
     ST_HEAD_MERGE,     // driver: head all-gather and merge
     ST_STEP_OUT,       // driver: k_step_out
-    // DSpark (second wave, off by default: plan(dspark=false), GR8_DS_MTP=0). Frozen with B12: docs/DEEPSEEK-DSPARK.md section 3
-    ST_DS_TAP,         // B12: first op of U_ATTN(i) for l in 37..39 (after hc_attn(i)): dsp_tap[:, l-37] = bf16(mean of the 4 streams)
-    ST_DS_MAIN,        // B12: after ST_FINISH in U_CONS_F(last): main_proj, main_norm, 3 wkv, ring write (every verify row)
-    ST_DS_DRAFT_IN,    // B12 + B7, DRAFT plan only: replaces step_in + embed (dsp_q / dsp_golden -> dsp_tok / dsp_pos, embed on MB rows)
-    ST_DS_HEAD_LOCAL,  // B12, DRAFT plan only: lm_head GEMV over the shard for all draft rows
-    ST_DS_MARKOV,      // B12, DRAFT plan only: 5 sequential markov add + confidence + head merge
+    // DSpark (off by default: plan(dspark=false), GR8_DS_MTP=0): docs/DEEPSEEK-DSPARK.md section 3
+    ST_DS_TAP,         // DSpark: first op of U_ATTN(i) for l in 37..39 (after hc_attn(i)): dsp_tap[:, l-37] = bf16(mean of the 4 streams)
+    ST_DS_MAIN,        // DSpark: after ST_FINISH in U_CONS_F(last): main_proj, main_norm, 3 wkv, ring write (every verify row)
+    ST_DS_DRAFT_IN,    // DSpark + mHC, draft plan only: replaces step_in + embed (dsp_q / dsp_golden -> dsp_tok / dsp_pos, embed on MB rows)
+    ST_DS_HEAD_LOCAL,  // DSpark, draft plan only: lm_head GEMV over the shard for all draft rows
+    ST_DS_MARKOV,      // DSpark, draft plan only: 5 sequential markov add + confidence + head merge
     // Bounded replay (prefill chunk only, never in plan()): ds41_pf_split.h puts it last in U_CONS_F of the last layer before
     // geom::LATE_LAYER_START. Moves the last `tail` rows of the per-row state (trunk, mHC coefficients, hc_y, pos/tok/tgt, the
     // layer-20 top-k and candidate lists) to rows 0..tail-1; the layers after it run tail rows.
@@ -75,18 +74,18 @@ inline const char* stage_name(Stage s)
         "ds_head_local", "ds_markov", "pf_compact"};
     return s >= 0 && s < ST_COUNT ? n[s] : "?";
 }
-// who writes the op ("B9 driver" stages are filled by ds41_step.cuh itself)
+// the component that writes the op ("driver" stages are filled by ds41_step.cuh itself)
 inline const char* stage_owner(Stage s)
 {
     switch (s)
     {
-    case ST_EMBED: case ST_HC_ATTN: case ST_CONSUME_ATTN: case ST_HC_FFN: case ST_CONSUME_FFN: case ST_FINISH: return "B7";
-    case ST_ATTN_PROJ: case ST_ATTN_CORE: case ST_ATTN_OUT: return "B4";
-    case ST_CA_ROW: case ST_INDEX_TOPK: case ST_INDEX_BORROW: case ST_CAND_BLOCKS: return "B5";
-    case ST_ROUTER: case ST_SHARED: case ST_EXPERTS: return "B6";
-    case ST_ENGRAM: return "Engram (second wave)";
-    case ST_DS_TAP: case ST_DS_MAIN: case ST_DS_DRAFT_IN: case ST_DS_HEAD_LOCAL: case ST_DS_MARKOV: return "B12 (DSpark, second wave)";
-    default: return "B9 driver";
+    case ST_EMBED: case ST_HC_ATTN: case ST_CONSUME_ATTN: case ST_HC_FFN: case ST_CONSUME_FFN: case ST_FINISH: return "mHC";
+    case ST_ATTN_PROJ: case ST_ATTN_CORE: case ST_ATTN_OUT: return "attention";
+    case ST_CA_ROW: case ST_INDEX_TOPK: case ST_INDEX_BORROW: case ST_CAND_BLOCKS: return "indexer";
+    case ST_ROUTER: case ST_SHARED: case ST_EXPERTS: return "MoE";
+    case ST_ENGRAM: return "Engram";
+    case ST_DS_TAP: case ST_DS_MAIN: case ST_DS_DRAFT_IN: case ST_DS_HEAD_LOCAL: case ST_DS_MARKOV: return "DSpark";
+    default: return "driver";
     }
 }
 
@@ -190,7 +189,7 @@ inline std::vector<Op> plan(const std::vector<int>& ids, int first, int last, bo
 }
 
 // The DSpark draft block (a second Model, ids {40,41,42}): ST_DS_DRAFT_IN replaces step_in + embed, then the layer ops (no ca / index
-// stages: compress_ratio is 0), ST_FINISH, ST_DS_HEAD_LOCAL, ST_DS_MARKOV. B12 owns the five-stage contract (DEEPSEEK-DSPARK.md section 3).
+// stages: compress_ratio is 0), ST_FINISH, ST_DS_HEAD_LOCAL, ST_DS_MARKOV. The five-stage contract: docs/DEEPSEEK-DSPARK.md section 3.
 inline std::vector<Op> plan_draft(const std::vector<int>& ids)
 {
     std::vector<Op> src = plan(ids, 0, (int)ids.size(), true, false), p;
@@ -206,9 +205,9 @@ inline std::vector<Op> plan_draft(const std::vector<int>& ids)
     return p;
 }
 
-// A plan with a borrowed index list is a SYNTHETIC subset run: the reuse layer's list is not what the full model gives, so the
-// run is not an oracle gate for that layer unless the source's top-512 is injected (B2's dump) -- and then only for the layers
-// whose every input is in the subset. The honest gate is the all-40-layer prefix.
+// A plan with a borrowed index list is a synthetic subset run: the reuse layer's list is not what the full model gives, so the
+// run is not an oracle gate for that layer unless the source's top-512 is injected (a dump) -- and then only for the layers
+// whose every input is in the subset. The full gate is the all-40-layer prefix.
 inline bool synthetic(const std::vector<Op>& p)
 {
     for (const Op& o : p) if (o.stage == ST_INDEX_BORROW) return true;
@@ -220,7 +219,7 @@ inline std::string synthetic_note(const std::vector<Op>& p)
     for (const Op& o : p)
         if (o.stage == ST_INDEX_BORROW)
             s += (s.empty() ? "" : ", ") + std::string("layer ") + std::to_string(o.l) + " (index source " + std::to_string(o.src) + ")";
-    return s.empty() ? s : "SYNTHETIC subset run, not an oracle gate: the index list of " + s + " is borrowed (source layer not in --layers)";
+    return s.empty() ? s : "synthetic subset run, not an oracle gate: the index list of " + s + " is borrowed (source layer not in --layers)";
 }
 
 // Where each unit's ops sit in a plan (each unit instance is contiguous): get(unit, ui) = [b, e) in the plan, empty if the
@@ -254,10 +253,10 @@ struct Table
     Fn fn[ST_COUNT] = {};
     // build-time hooks, one per layer, called once from build / prepare; a null slot is skipped (the layer then stops
     // at its first stage that needs the binding, with the NOTSUP message of that stage)
-    Fn bind_attn = nullptr;    // B4/B5: bind the layer's attention, ca/ica and window caches (build, rows = capacity)
-    Fn bind_moe = nullptr;     // B6: load the layer's router, shared and routed experts (build, rows = 0)
-    Fn prepare_attn = nullptr; // B4/B5: per row count M: cells, scratch (prepare, rows = M)
-    Fn prepare_moe = nullptr;  // B6: per row count M: kernel arguments (prepare, rows = M)
+    Fn bind_attn = nullptr;    // attention / indexer: bind the layer's attention, ca/ica and window caches (build, rows = capacity)
+    Fn bind_moe = nullptr;     // MoE: load the layer's router, shared and routed experts (build, rows = 0)
+    Fn prepare_attn = nullptr; // attention / indexer: per row count M: cells, scratch (prepare, rows = M)
+    Fn prepare_moe = nullptr;  // MoE: per row count M: kernel arguments (prepare, rows = M)
 };
 
 struct Stop

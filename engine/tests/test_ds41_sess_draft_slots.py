@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Source contract: SESS > 1 with DSpark. g6m4 gives the draft Model the S2 slots (DS.ds_slots = m.ds_slots) and
 ds41dsp_ops::build requires draft.ds_slots == main.ds_slots, so build_ds41 must accept ds_slots 1..8 for the draft Model too.
-F3 set B boot 1 (--sess 8 + MTP) died on every rank in build_ds41 on a phase-1 guard `draft && m.ds_slots != 1`.
+A guard `draft && m.ds_slots != 1` in build_ds41 makes every rank die at boot with --sess 8 and MTP.
 """
 
 from pathlib import Path

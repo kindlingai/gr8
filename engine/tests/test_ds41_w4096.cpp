@@ -3,7 +3,7 @@
 //   The RoScratch tile capacity of ds41_moe_ops.cuh ro_alloc, (ROMAX * TOPK + 7 * NEXP) / 8 = 3408, holds the host plan (dsr::plan_ref, the
 //   specification of the device planner) of 4096 rows at the worst case (every expert ends on a 1-token tile) and at uniform and skewed routes;
 //   every route in exactly one live column.
-//   The Engram fabric payload at W4096 (ds41_step.cuh:142 check) = 4096 x 6144 x 2.
+//   The Engram fabric payload at W4096 (the build_ds41 check in ds41_step.cuh) = 4096 x 6144 x 2.
 // g++ -std=c++17 -O2 -Wall -Wextra -I engine -I engine/kernels engine/tests/test_ds41_w4096.cpp -o /tmp/test_ds41_w4096 && /tmp/test_ds41_w4096
 #include <cassert>
 #include <cstdio>

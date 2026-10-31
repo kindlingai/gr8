@@ -1,14 +1,13 @@
 // DS41 two-lane W prefill (GR8_DS_PF_LANES=2, ds41_lanes.h): lane B's Model view. Included by rank.cuh after ds41_step.cuh, inside namespace
 // g6rt. Built once at boot and only with the flag (g6m4.cu); nothing here runs on the default path, and it adds no kernel.
 //
-// mB is a copy of the main Model m. It SHARES what ds41::lanes::table() calls SERIAL or CAUSAL (the weights, the window KV / compressed caches
+// mB is a copy of the main Model m. It shares what ds41::lanes::table() calls SERIAL or CAUSAL (the weights, the window KV / compressed caches
 // and rings, the attention scratch / split / prefill ring, the indexer stage buffers q_b / wproj / y512 / pre / klen, the Engram engine and its
-// token rings, the DSpark main scratch and key rings), the per-layer error words (ORed) and the plan. It OWNS every LANE buffer: the step io
+// token rings, the DSpark main scratch and key rings), the per-layer error words (ORed) and the plan. It owns every LANE buffer: the step io
 // (tok / pos / tgt / tok_out / sess / cells / stepp), the mHC trunk and hc_y, sc.part, its fabric (f, tickets, relay word, RS tickets, gather
 // sum), the MoE scratch (scratch_of(&mB)), the indexer top-512 list and scratch (candidate blocks), the Engram window rows and per-step set
 // (Engram::add_lane / use_lane), the DSpark tap rows, and the host per-chunk fields. Layer::ds41_attn / ds41_moe are pointers to per-layer
 // state, so a plain copy would share them: each layer gets its own copy of both (the copies keep the shared pointers inside them).
-// Report dir ds41-two-lane-20261029: AUDIT-shared-state.md is the source list for this file.
 #pragma once
 #if G6_MODEL_DS41
 
@@ -16,7 +15,7 @@
 inline size_t build_ds41_lane_b(Model& mB, Model& m, const g6::FabricDev& fB, cudaStream_t st)
 {
     if (!m.ds41 || m.ds41_draft || m.hc_rows <= MX || m.layers.empty()) die("DS41 lane B: needs the main DS41 Model with W-row prefill (W > MX)");
-    if (fB.nr != g6nr::NR || fB.ncoll != m.f.ncoll) die("DS41 lane B: bad lane-B fabric or missing B12 state collective");
+    if (fB.nr != g6nr::NR || fB.ncoll != m.f.ncoll) die("DS41 lane B: bad lane-B fabric or missing row-shard state collective");
     size_t free0 = 0, total = 0;
     G6RT_CK(cudaDeviceSynchronize());
     G6RT_CK(cudaMemGetInfo(&free0, &total));
@@ -29,7 +28,7 @@ inline size_t build_ds41_lane_b(Model& mB, Model& m, const g6::FabricDev& fB, cu
     mB.ds41_relay = m.ds41_relay ? dmalloc<u64>(1) : nullptr;
     mB.ds41_gsum = m.ds41_gsum ? dmalloc<__nv_bfloat16>(HR * HID) : nullptr;
     mB.ds41_rs_tickets = m.ds41_rs_k ? dmalloc<unsigned>((size_t)m.ds41_rs_k) : nullptr;
-    // B12's owner-quantized y and bounded-replay state publish are live across
+    // The row shard's owner-quantized y and bounded-replay state publish are live across
     // the two lanes' independent streams/fabrics; never alias lane A's storage.
     mB.ds41_y_codes = m.ds41_y_mxfp8 ? dmalloc<uint8_t>(HR * HID) : nullptr;
     mB.ds41_y_scales = m.ds41_y_mxfp8 ? dmalloc<uint8_t>(HR * HID / 32) : nullptr;

@@ -1,6 +1,6 @@
-// Compile-only gate for the DSpark device code (B12): instantiates every kernel and launcher of engine/attn/ds41_attn_dsp.cuh and
-// engine/runtime/ds41_dspark.cuh so a plain nvcc run proves they build for sm_121a. It is not run (no main); the on-box device
-// check comes with the booked box.
+// Compile-only gate for the DSpark device code: instantiates every kernel and launcher of engine/attn/ds41_attn_dsp.cuh and
+// engine/runtime/ds41_dspark.cuh so a plain nvcc run proves they build for sm_121a. It is not run (no main); the device check
+// on a GPU is ds41_dspark_selfcheck.cu.
 //   /usr/local/cuda/bin/nvcc -std=c++17 -gencode=arch=compute_121a,code=sm_121a -DG6_MODEL_DS41=1 -I. -Iengine -Xcompiler -Wall
 //       -c engine/tests/ds41_dspark_compile.cu -o /tmp/ds41_dspark_compile.o
 #include "attn/ds41_attn_dsp.cuh"
@@ -21,5 +21,5 @@ void ds41_dspark_compile_all(const ds41a::Weights& W, const ds41dsp::Ring& R, co
     ds41dsp::conf_head(tap, membed, mhead, o2, o4, 1, conf, o5, st);
     ds41dsp::ds_verify_in(o2, o5, o1, 5, 1, o3, o4, st);
 }
-// the per-Model bundle is plain data: it must stay constructible without rank.cuh (B9 includes the header at global scope)
+// the per-Model bundle is plain data: it must stay constructible without rank.cuh (rank.cuh includes the header at global scope)
 ds41dsp::Dsp ds41_dspark_compile_dsp() { ds41dsp::Dsp d; d.nsess = 1; return d; }

@@ -1,6 +1,6 @@
-// F8 #1 GR8_DS_PF_LATE_FINAL (ds41_pf_split.h late_skip / late_final_valid, s2/ds41_prefill.h ds41_chunk_collectives late_skip). Host only.
+// GR8_DS_PF_LATE_FINAL (ds41_pf_split.h late_skip / late_final_valid, s2/ds41_prefill.h ds41_chunk_collectives late_skip). Host only.
 // 1. The rule: for prompts N and chunks of W rows, every position a later reader needs (MAIN step N-WINDOW..N-2, a later chunk's range B down to
-//    its floor, or WINDOW-1 rows before its first row when it is not compacted) is written by a chunk that does NOT skip range B.
+//    its floor, or WINDOW-1 rows before its first row when it is not compacted) is written by a chunk that does not skip range B.
 // 2. The collectives of a skipping chunk: no layer exchange c >= 2*i_late in sizes (Engram off) or in the order (Engram on); the rest unchanged.
 #include "runtime/s2/ds41_prefill.h"
 #include "runtime/ds41_pf_split.h"

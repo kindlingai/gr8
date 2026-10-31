@@ -38,7 +38,7 @@ static void config() {
     CHECK(what([&] { ds41_prefill_lanes(c, W, 0); }) == ds41::lanes::kParseError);
     CHECK(what([&] { ds41_prefill_lanes(c, W, 3); }) == ds41::lanes::kParseError);
     CHECK(!what([&] { ds41_prefill_lanes(c, 4000, 2); }).empty());   // not whole pages: the decode cap would fail validate
-    CHECK(what([&] { ds41_prefill_lanes(c, 4000, 1); }).empty());     // one lane: today's rule (any positive W)
+    CHECK(what([&] { ds41_prefill_lanes(c, 4000, 1); }).empty());     // one lane: the single-lane rule (any positive W)
     CHECK(!what([&] { ds41_prefill_lanes(c, 0, 1); }).empty());
     CHECK(ds41::lanes::parse(nullptr) == 1 && ds41::lanes::parse("") == 1 && ds41::lanes::parse("1") == 1 &&
           ds41::lanes::parse("2") == 2 && ds41::lanes::parse("0") == 0 && ds41::lanes::parse("2 ") == 0);

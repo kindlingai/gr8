@@ -1,4 +1,4 @@
-// F1 (GR8_DS_WAIT_K): who waits for the peers' payload before a DS41 consume kernel. Host-only, no CUDA; ds41_step.cuh's ds41_consume_wait calls it,
+// GR8_DS_WAIT_K: who waits for the peers' payload before a DS41 consume kernel. Host-only, no CUDA; ds41_step.cuh's ds41_consume_wait calls it,
 // engine/tests/test_ds41_wait.cpp checks it. Must stay outside namespace g6rt (like ds41_ops.h).
 //   off (default): the consume kernel waits itself (Ds41Block::wait, wait_payload = bytes of the slot payload; the tail sits right behind them)
 //   on:            one CTA waits first (glue::k_wait_peers(c, payload)), the consume kernel gets wait_payload = 0 and skips its own wait
@@ -23,9 +23,9 @@ inline ConsumeWait consume_wait(bool waitk, int rows, int hid)
     return waitk ? ConsumeWait{true, payload, 0, false} : ConsumeWait{false, 0, payload, false};
 }
 
-// GR8_DS_WAIT_K value -> the mode that runs: 0 off, 1 F1 wait kernel, 2 relay. 2 needs the main Model (the draft Model has its own small fabric and
+// GR8_DS_WAIT_K value -> the mode that runs: 0 off, 1 wait kernel, 2 relay. 2 needs the main Model (the draft Model has its own small fabric and
 // keeps K=1) and no GR8_DRAFT_PAR (a second stream's kernels may take the SMs: CTAs that wait on CTA (0,0) need it resident); otherwise it falls back to 1.
-// Any other non-zero value is 1, as before K=2 existed (atoi(...) != 0).
+// Any other non-zero value is 1 (atoi(...) != 0).
 inline int wait_mode(int env_k, bool draft_model, bool draft_par)
 {
     if (env_k == 0) return 0;

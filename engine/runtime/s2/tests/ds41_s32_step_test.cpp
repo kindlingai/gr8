@@ -1,6 +1,6 @@
 // SESS=32 MAIN steps of more than 8 sessions: the host S2In (s2_in.h) holds them, native_inputs fills it, the DS41 layout
 // check (ds41_step_layout.h, the code ds41_native.cuh runs) gives each row its slot, and the strided S2In copy of the S2
-// kernels covers every word at 128 and 256 threads. r2-d5 window: S2N 8 refused a 9-session step. No CUDA.
+// kernels covers every word at 128 and 256 threads. An S2N of 8 refuses a 9-session step. No CUDA.
 #include "s2_in.h"
 #include "s2/dispatch.h"
 #include "s2/ds41_step_layout.h"
@@ -15,11 +15,11 @@ template<class F> static bool throws(F f) { try { f(); } catch (const std::excep
 constexpr int MXT = 48;   // the DS41 build's G6_MX
 // the fields native_inputs and ds41_session_rows use
 struct Input {
-    uint64_t step; int M,context,tok[MXT],pos[MXT],tgt[MXT]; float steering_scale[MXT];
+    uint64_t step; int M,context,tok[MXT],pos[MXT],tgt[MXT]; float steering_scale[MXT]; int steering_slot[MXT];
     struct Sample { float inv_temp; uint32_t seed, unused; int pos,nodraft; float top_p; int topk; } srow[MXT];
     int sess[MXT];
 };
-struct Layout8 { int ns,cls,sess[8],row0[8],rows[8],ctx[8],src0[8]; };   // the old S2N = 8 layout
+struct Layout8 { int ns,cls,sess[8],row0[8],rows[8],ctx[8],src0[8]; };   // an S2N = 8 layout, for contrast
 
 // ns sessions of rps rows each, on slots base, base + stride, ...
 static Launch step(int ns, int rps, int base = 0, int stride = 1) {
@@ -43,7 +43,7 @@ static void sessions(int ns, int rps, int base, int stride) {
     for (int j = 0; j < ns; ++j) CHECK(h.sess[j] == base + j * stride && h.row0[j] == j * rps && h.rows[j] == rps && h.ctx[j] == 100 + j);
     CHECK(ds41_session_rows(h, 32, 5, rps > 1, in) == nullptr);
     for (int r = 0; r < ns * rps; ++r) CHECK(in.sess[r] == base + (r / rps) * stride);
-    // the old 8-session layout refuses it (the r2-d5 crash: "native S2In session capacity too small")
+    // an 8-session layout refuses it ("native S2In session capacity too small")
     Input in8{}; Layout8 h8{};
     CHECK(ns <= 8 || throws([&] { native_inputs(l, in8, h8); }));
 }
@@ -53,7 +53,7 @@ static void copy_cover(int nthreads) {
     for (int i = 0; i < g6rt::S2IN_WORDS; ++i) src[size_t(i)] = 0x1000u + uint32_t(i);
     for (int t = 0; t < nthreads; ++t) {
         g6rt::s2in_copy(dst.data(), src.data(), t, nthreads);
-        if (t < g6rt::S2IN_WORDS) old[size_t(t)] = src[size_t(t)];   // the old copy: one word per thread
+        if (t < g6rt::S2IN_WORDS) old[size_t(t)] = src[size_t(t)];   // a plain copy: one word per thread
     }
     int miss = 0, old_miss = 0;
     for (int i = 0; i < g6rt::S2IN_WORDS; ++i) { miss += dst[size_t(i)] != src[size_t(i)]; old_miss += old[size_t(i)] != src[size_t(i)]; }
@@ -64,7 +64,7 @@ static void copy_cover(int nthreads) {
 
 int main() {
     CHECK(g6rt::S2N == 32 && g6rt::S2N == int(MAX_SESSIONS) && g6rt::S2IN_WORDS == 162);
-    sessions(9, 1, 0, 1);      // the r2-d5 Gate 3 wave3c peak: 9 resident sessions
+    sessions(9, 1, 0, 1);      // 9 resident sessions, the smallest count past 8
     sessions(9, 1, 3, 3);      // 9 sessions on scattered slots 3..27
     sessions(32, 1, 0, 1);     // every SESS=32 slot in one MAIN step (rps 1: MTP is off past 8)
     sessions(8, 6, 0, 1);      // the MTP verify of 8 sessions x (5 + 1) rows still fits

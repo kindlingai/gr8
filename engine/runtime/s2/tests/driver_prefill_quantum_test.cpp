@@ -1,7 +1,7 @@
-// The prefill quantum through Driver::step (driver.h) and the scheduler (scheduler.h): what the DS41 first-light prefill
+// The prefill quantum through Driver::step (driver.h) and the scheduler (scheduler.h): what the basic DS41 prefill
 // config (prefill_rows = W = 1024, one session at a time) asks of the host side, with no engine and no pool. Host only.
 //  1. a prompt's prefill hook calls are contiguous from row 0, none above the quantum cap, they sum to prompt - 1, the
-//     prompt tail is ONE row at position prompt - 1 and is the session's first MAIN row (no prefill chunk needs the
+//     prompt tail is one row at position prompt - 1 and is the session's first MAIN row (no prefill chunk needs the
 //     head: the last token runs as a MAIN step), and the tokens are the solo run's, and the decode_prompt run's
 //  2. a decoding session beside a prefilling one: Prefill quanta take at most decode_prefill_rows, and decode_rounds
 //     rounds run per quantum (D P D P ..., D D D P ...), every output the solo run's
@@ -192,7 +192,7 @@ static void check_alone(uint32_t mtp, uint32_t N, uint32_t W, bool two, long& ca
         next += x.rows;
     }
     CHECK(next == N - 1);
-    // quanta: the prefill ones, ONE tail row at N - 1, then decode rounds only
+    // quanta: the prefill ones, one tail row at N - 1, then decode rounds only
     CHECK(a.q.size() > want.size() + 1);
     size_t tails = 0;
     for (size_t i = 0; i < a.q.size(); ++i) {

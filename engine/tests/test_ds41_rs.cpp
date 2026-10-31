@@ -1,4 +1,4 @@
-// F10 DS41 RS+AG (GR8_DS_PF_RS=1, runtime/ds41_rs.h): host test, no GPU.
+// DS41 RS+AG (GR8_DS_PF_RS=1, runtime/ds41_rs.h): host test, no GPU.
 // 1. rules: the owned rows tile [0, M) for every M and NR; every row's publish offset lies inside its owner's slice, no overlap, and
 //    the slice + tail fits the slice stride.
 // 2. job(): for the DS41 chunk shapes (40 layers, Engram on / off, bounded replay, late skip) the RS set is 0..K-1, c_ag = NC + c sits
@@ -11,7 +11,7 @@
 #include "runtime/ds41_pf_split.h"
 #include "runtime/ds41_prefill_fabric.h"
 #include "fabric_order.h"
-#include "fabric.h"            // F10 #8: fab_rs_slice_off / fab_rs_tail_off (the proxy's RS offsets)
+#include "fabric.h"            // fab_rs_slice_off / fab_rs_tail_off (the proxy's RS offsets)
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -44,7 +44,7 @@ static void rules() {
                 if (m) CHECK(off >= R::pub_off(m - 1, q, ss, rb) + rb);
             }
         }
-    CHECK(R::slice_stride(512, 5120 * 2) == 5243136);   // W2048 HID 5120: F7-SCOPE item 4
+    CHECK(R::slice_stride(512, 5120 * 2) == 5243136);   // W2048 HID 5120
     CHECK(R::on(true, 0, 42, 2048, 48, 4) && R::on(true, 41, 42, 49, 48, 4) && !R::on(true, 42, 42, 2048, 48, 4));
     CHECK(!R::on(true, 0, 42, 48, 48, 4) && !R::on(false, 0, 42, 2048, 48, 4) && !R::on(true, -1, 42, 2048, 48, 4));
 }
@@ -88,7 +88,7 @@ static void jobs() {
 }
 
 // 3. the data path, NR ranks, one RS collective
-// flat (F10 #8 GR8_DS_PF_DIRECT): the producer writes [rows][H] at 0 of the send slot; the proxy sends slice p from fab_rs_slice_off(Q rb, p)
+// flat (GR8_DS_PF_DIRECT): the producer writes [rows][H] at 0 of the send slot; the proxy sends slice p from fab_rs_slice_off(Q rb, p)
 // and its tail word from fab_rs_tail_off (after the NR slices), written into the send slot first (a misplaced tail overwrites a row);
 // k_rs_reduce reads its own slice at me Q rb. Not flat: the RS publish layout, tail word at sp + nb (the slice gap).
 static void bitequal() {
@@ -192,8 +192,8 @@ static void nodeadlock() {
     }
 }
 
-// 5. ncoll accounting (F10 run 3 boot RED: build_ds41 checked the fabric against Model::ncoll() alone): for RS off / on x Engram off / on
-//    x main / draft, the count g6m4.cu gives the main fabric passes build_ds41's check (fabric_ncoll_error), the old check (ag = 0)
+// 5. ncoll accounting (build_ds41 must count the AG collectives, not only Model::ncoll()): for RS off / on x Engram off / on
+//    x main / draft, the count g6m4.cu gives the main fabric passes build_ds41's check (fabric_ncoll_error), a check that counts no AG collectives (ag = 0)
 //    refuses every RS-on main fabric, a draft never takes AG collectives, and the fabric slot layout g6m4.cu builds (run1 2 i_late,
 //    run2 2 NL + 1, run3 NC under RS) is valid for that count (fab_slot_layout, as Fabric::init checks it) with the AG slots holding Q rows.
 static void ncoll() {
@@ -221,9 +221,9 @@ static void ncoll() {
             }
 }
 
-// All-levers boot contract: the F6 fabric sizer and the exact build_ds41
-// validator must agree with Engram ON, PF_RS ON and the B12 flag matrix.
-// The old fabric count (without the state collective) is a RED mutant.
+// All-levers boot contract: the fabric sizer (ds41::pf::fabric_runs) and the exact build_ds41
+// validator must agree with Engram on, PF_RS on and the row-shard / MXFP8 flag matrix.
+// A fabric count without the state collective is a mutant the check must refuse.
 static void boot_all_levers() {
     const int nc=83, k=42, il=21;
     int valid=0, invalid=0, mutant_red=0;

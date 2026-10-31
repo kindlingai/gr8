@@ -1,12 +1,12 @@
 // Host test of the DS41 decode-step order (engine/runtime/ds41_ops.h): no CUDA. Build:
 //   g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I engine engine/tests/test_ds41_step_order.cpp
 // Checks (a) the stage order of one layer and of the whole step, (b) that the optional stages follow geom::kv_source /
-// index_source / compress_ratio for the milestone subset {0, 2, 20, 39} and for all 40 layers, (c) that the walk over a table
+// index_source / compress_ratio for the subset {0, 2, 20, 39} and for all 40 layers, (c) that the walk over a table
 // with every slot null stops at the first stage that needs an op (and names it), and with the slots filled one by one it
 // moves on to the next one in plan order, (d) the residual-copy points, (e) the part split of the graph form, (f) the units
 // (the groups the rank.cuh wrappers launch): contiguous, in the wrapper order, their sizes and their index.
 //
-// What this test is NOT: an oracle gate. In the subset {0, 2, 20, 39} the list of layer 39 comes from index source 36, which
+// What this test is not: an oracle gate. In the subset {0, 2, 20, 39} the list of layer 39 comes from index source 36, which
 // does not run there; the plan marks that stage ST_INDEX_BORROW (a fixture injected from the oracle's dump, a diag run). A
 // true 4-layer oracle gate needs that injection; the all-40-layer plan has no borrowed stage.
 #include <cassert>
@@ -121,7 +121,7 @@ int main()
         g_log.clear();
         const Stop s2 = run(ps, t, nullptr, 1, nullptr, [&](const Op&) { ++calls; });
         EXPECT(s2.stopped && s2.op.stage == ST_EMBED && s2.done == 1 && calls == 1 && g_log.size() == 1);
-        EXPECT(std::strstr(stop_message(s2).c_str(), "stage embed (owner B7)") != nullptr);
+        EXPECT(std::strstr(stop_message(s2).c_str(), "stage embed (owner mHC)") != nullptr);
     }
     // fill the slots one stage at a time in plan order: each run stops exactly at the next unfilled stage, layer by layer
     {
@@ -163,7 +163,7 @@ int main()
         t.fn[ST_STEP_IN] = &rec<ST_STEP_IN>; t.fn[ST_EMBED] = &rec<ST_EMBED>; t.fn[ST_HC_ATTN] = &rec<ST_HC_ATTN>;
         const Stop s = run(ps, t, nullptr, 1, nullptr, [](const Op&) {});
         EXPECT(s.op.stage == ST_ATTN_PROJ && s.op.l == 0 && s.op.i == 0);
-        EXPECT(stop_message(s).find("stage attn_proj (owner B4), layer 0 (position 0)") != std::string::npos);
+        EXPECT(stop_message(s).find("stage attn_proj (owner attention), layer 0 (position 0)") != std::string::npos);
         // the same table over the 4-layer subset reaches layer 2 only if the layer-0 stages are all filled
         t.fn[ST_ATTN_PROJ] = &rec<ST_ATTN_PROJ>; t.fn[ST_ATTN_CORE] = &rec<ST_ATTN_CORE>; t.fn[ST_ATTN_OUT] = &rec<ST_ATTN_OUT>;
         t.fn[ST_PUBLISH_ATTN] = &rec<ST_PUBLISH_ATTN>; t.fn[ST_CONSUME_ATTN] = &rec<ST_CONSUME_ATTN>;
@@ -222,7 +222,7 @@ int main()
         const auto a = plan(sub, 0, 2, true, false);
         EXPECT(a.back().stage == ST_HC_ATTN && a.back().i == 2 && a.back().rc == 4);
     }
-    // DSpark (second wave): ST_DS_TAP opens U_ATTN of layers 37..39, ST_DS_MAIN follows finish and takes the last rc point; off = unchanged
+    // DSpark: ST_DS_TAP opens U_ATTN of layers 37..39, ST_DS_MAIN follows finish and takes the last rc point; off = unchanged
     {
         const auto off = plan(iota(40), 0, 40, true, true), on = plan(iota(40), 0, 40, true, true, false, true);
         EXPECT(count(off, ST_DS_TAP) == 0 && count(off, ST_DS_MAIN) == 0);
@@ -239,7 +239,7 @@ int main()
         EXPECT(count(d, ST_EMBED) == 0 && count(d, ST_CA_ROW) == 0 && count(d, ST_INDEX_TOPK) == 0 && count(d, ST_FINISH) == 1);
         EXPECT(!synthetic(d));
     }
-    // Bounded replay (ds41_pf_split.h): the non-final chunk plan split at the first REAL layer id >= 21. Range A runs `rows` rows and ends with
+    // Bounded replay (ds41_pf_split.h): the non-final chunk plan split at the first real layer id >= 21. Range A runs `rows` rows and ends with
     // ST_PF_COMPACT; range B runs late_rows. Without the compaction op the split plan is the non-final plan op for op (plan section 5 step 1).
     {
         EXPECT(geom::LATE_LAYER_START == 21 && geom::TAIL_ROWS == 128 && geom::is_kv_source(20) && !geom::is_kv_source(21));

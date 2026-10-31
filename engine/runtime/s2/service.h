@@ -374,7 +374,7 @@ class Service {
                     // another request queued and a slot left after this one: keep the ranks at this boundary for it.
                     // first queue the ADMIT files that landed while this thread was inside the event chain (each
                     // event waits for every rank's ACK, ~8 ms); the loop reads cmd files only between events, so without
-                    // this a burst written within 1 ms lost the hold after its 2nd grant and waited NOTICE_MAX boundaries
+                    // this a burst written within 1 ms loses the hold after its 2nd grant and waits NOTICE_MAX boundaries
                     if (admit_hold_ && live + 1 < c_.scheduler.limit()) drain_admits();
                     hold = cm.hold = admit_hold_ && queue_.front() && live + 1 < c_.scheduler.limit();
                 }

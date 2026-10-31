@@ -166,7 +166,7 @@ class Boot(unittest.TestCase):
         # DS41's fabds is compiled only under its model guard. The legacy
         # fabd is also compiled there, but DS41 refuses --mtp > 0 before
         # either fabric is initialized; fabds requires GR8_DS_MTP instead.
-        # Check BOTH effective fabric sets. Ignoring fabds outright would
+        # Check both effective fabric sets. Ignoring fabds outright would
         # miss a collision added inside the DS41 branch.
         m = re.search(
             r'(?P<legacy>    g6::Fabric fabd;.*?        fabd\.start_proxy\(\);\n    \})\n'
@@ -201,7 +201,7 @@ class Boot(unittest.TestCase):
         ds41_common = common.replace(prefill['block'], '', 1).replace(flash_only['block'], '', 1)
         # the replicated-GEMV gather fabric (gc, offset 9) is GLM-5.3 only: a Flash build dies on GR8_QA_SPLIT and friends,
         # and the pool-ID fabric takes offset 9 there
-        self.assertIn('if ((G6_MODEL_FLASH || G6_MODEL_DS41) && (qs_mode || iq_split || mtp_split)) die(', common)   # widened by d751d3d
+        self.assertIn('if ((G6_MODEL_FLASH || G6_MODEL_DS41) && (qs_mode || iq_split || mtp_split)) die(', common)
         for name, active in (('legacy', common + m['legacy']),
                              ('DS41', ds41_common + lane_b['block'] + m['ds41'])):
             with self.subTest(model=name):

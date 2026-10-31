@@ -29,7 +29,7 @@ inline FabricRuns fabric_runs(int pf_rows, int tail, int i_late, int nl, int nx,
     o.cfg.slot_bytes = std::max(dec, w_hid);
     // A ragged pack keeps every segment's <=64 rows through the late layers,
     // so the flattened late collective can carry all MAX_ROWS, not PF_TAIL.
-    // OFF preserves the original solo table byte for byte.
+    // Off: pack_late is 0 and the table has no extra late room.
     const size_t pack_late = c8_pack && i_late >= 0 ? size_t(ds41::pack::MAX_ROWS) * hid * 2 : 0;
     o.cfg.slot_bytes1 = std::max({dec, i_late >= 0 ? late_hid : size_t(0), head_payload, pack_late});
     o.cfg.slot_bytes2 = nx ? std::max(dec, size_t(pf_rows) * 6144 * 2) : 0;

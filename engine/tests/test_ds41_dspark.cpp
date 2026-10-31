@@ -1,8 +1,8 @@
-// Host test of the DSpark rules (engine/runtime/ds41_dspark.h, docs/DEEPSEEK-DSPARK.md F1): no CUDA. Build:
+// Host test of the DSpark rules (engine/runtime/ds41_dspark.h): no CUDA. Build:
 //   g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I engine engine/tests/test_ds41_dspark.cpp -o /tmp/test_ds41_dspark
 // Checks (a) the knobs and what they refuse, (b) the tap value and its BF16 rounding, (c) the ring: 136 rows are enough for the 133
 // keys of a draft row and 128 are not, (d) the key window at the start of a sequence, (e) the draft block layout, (f) greedy accept
-// and the verify rows, (g) the confidence head, (h) B9's plans against the card's placement rules, (i) the collective numbers,
+// and the verify rows, (g) the confidence head, (h) the step plans against the DSpark placement rules (dsp::check_plans), (i) the collective numbers,
 // (j) the relaxed-accept rule (kernels/relax_accept.h) on a 4-rank split record against the full-vocabulary reference.
 #include <cassert>
 #include <cmath>
@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 #include "runtime/ds41_dspark.h"
-#include "runtime/ds41_dspark_dev.h"   // the SAME functions the device kernels call (DSP_HD), checked against the host model above
+#include "runtime/ds41_dspark_dev.h"   // the same functions the device kernels call (DSP_HD), checked against the host model above
 #include "kernels/relax_accept.h"     // the relaxed-accept rule k_head_relax calls (RELAX_HD)
 #include <algorithm>
 #include <random>
@@ -74,7 +74,7 @@ int main()
             EXPECT((int)s128.size() < dsp::KEYS);            // 128 slots collide: why the ring is 136
         }
         EXPECT(dsp::RING >= dsp::KEYS && dsp::RING == 136);
-        // a verify chunk of 6 rows writes slots P .. P+5 before acceptance; the NEXT draft needs q-127 .. q with q >= P
+        // a verify chunk of 6 rows writes slots P .. P+5 before acceptance; the next draft needs q-127 .. q with q >= P
         for (int P : {200, 777})
             for (int a = 0; a <= 5; ++a)
             {
@@ -126,7 +126,7 @@ int main()
         EXPECT(std::fabs(dsp::confidence(2.0, 0.5) - 1.0 / (1.0 + std::exp(-4.0))) < 1e-12);   // temperature divides the logit
         EXPECT(dsp::confidence(1e6, 1.0) == 1.0 / (1.0 + std::exp(-60.0)) && dsp::confidence(-1e6, 1.0) == 1.0 / (1.0 + std::exp(60.0)));   // clamp +-60
     }
-    // (h) B9's plans against the card: whole model (40 layers), and the milestone subset 0,2,20,39 has no tap except layer 39
+    // (h) the step plans against the placement rules: whole model (40 layers), and the subset 0,2,20,39 has no tap except layer 39
     {
         std::vector<int> ids(40); for (int i = 0; i < 40; ++i) ids[i] = i;
         const std::vector<int> dids = {40, 41, 42};
@@ -136,7 +136,7 @@ int main()
         EXPECT(e.empty());
         int taps = 0; for (const Op& o : verify) taps += o.stage == ST_DS_TAP;
         EXPECT(taps == 3);
-        // dspark off: no DSpark stage anywhere (the wave-1 plan is unchanged)
+        // dspark off: no DSpark stage anywhere (the plain plan)
         for (const Op& o : plan(ids, 0, 40, true, true)) EXPECT(o.stage != ST_DS_TAP && o.stage != ST_DS_MAIN);
         // the draft plan covers exactly the three DSpark layers once each
         for (int l : {40, 41, 42}) { int n = 0; for (const Op& o : draft) n += o.stage == ST_ATTN_CORE && o.l == l; EXPECT(n == 1); }
@@ -198,7 +198,7 @@ int main()
         // SESS > 1: a draft step of n sessions moves n x 5 rows per layer exchange and n head records per merge (8 sessions: 40 rows <= G6_MX 48)
         EXPECT(dsp::coll_bytes(0, geom::HID, 1) == 51200 && dsp::coll_bytes(5, geom::HID, 8) == 8 * 51200 && dsp::coll_bytes(6, geom::HID, 8) == 8 * 32 &&
                dsp::coll_bytes(10, geom::HID, 2) == 64);
-        // teeth: the enqueue rule of the first light (head_bytes(1, nc) with --top-p-cands 256) is caught, and so is a head size that follows nc
+        // teeth: a wrong enqueue rule (head_bytes(1, nc) with --top-p-cands 256) is caught, and so is a head size that follows nc
         const std::string old_rule = walk([](int c) { return c < 2 * geom::N_NEXTN ? size_t(dsp::B) * geom::HID * 2 : dsp::head_bytes(1, 256); });
         EXPECT(old_rule == "collective 6: enqueue 2080 B, publish 32 B, wait 32 B");
         EXPECT(dsp::head_bytes(1, 256) == 2080 && dsp::head_bytes(1, 0) == 32);

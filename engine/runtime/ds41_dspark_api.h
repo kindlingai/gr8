@@ -1,7 +1,7 @@
-// DSpark device API of DeepSeek-V4.1-Flash-1017 (B12): plain types + declarations, NO kernels. The step-driver TU (rank.cuh -> ds41_dspark_ops.cuh)
-// includes only this header; the kernels and the definitions live in ds41_dspark.cuh / ds41_attn_dsp.cuh, compiled ONCE inside the attention TU
-// (engine/attn/ds41_attn_dspark.cu = ds41_attn.cu + the DSpark code), because they reuse B4's ds41_attn.cuh kernels and a second copy would be a
-// duplicate-symbol link error (R3, whole-engine MODEL=ds41 build). Never include ds41_attn.cuh / ds41_dspark.cuh from rank.cuh or the ops header.
+// DSpark device API of DeepSeek-V4.1-Flash-1017 : plain types + declarations, no kernels. The step-driver TU (rank.cuh -> ds41_dspark_ops.cuh)
+// includes only this header; the kernels and the definitions live in ds41_dspark.cuh / ds41_attn_dsp.cuh, compiled once inside the attention TU
+// (engine/attn/ds41_attn_dspark.cu = ds41_attn.cu + the DSpark code), because they reuse the ds41_attn.cuh kernels and a second copy would be a
+// duplicate-symbol link error (whole-engine MODEL=ds41 build). Never include ds41_attn.cuh / ds41_dspark.cuh from rank.cuh or the ops header.
 #pragma once
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -62,14 +62,14 @@ struct MainS                                      // scratch for M rows
 
 struct Dsp
 {
-    int nsess = 0;                                // sessions the arrays below are sized for (the S2 slots; 1 = one session). The sessions OF A STEP are
+    int nsess = 0;                                // sessions the arrays below are sized for (the S2 slots; 1 = one session). The sessions of a step are
                                                   // Model::ds_ns of the Model the op runs on (set before the launch or capture; 1 with one session)
     int k = 5;                                    // drafts per round; the verify step has k + 1 rows per session
-    bool draft_model = false;                     // true in the DRAFT Model's copy (ds41dsp_ops::build): its ST_FINISH writes xpre and stores nothing
+    bool draft_model = false;                     // true in the draft Model's copy (ds41dsp_ops::build): its ST_FINISH writes xpre and stores nothing
     bool host_accept = false;                     // draft Model: q / golden / acc are written by the host (s2/ds41_dspark_round.cuh) before the step; ST_DS_DRAFT_IN skips the device accept
     // main Model: ST_DS_TAP, ST_DS_MAIN
     bf16* tap = nullptr;                          // [rows][3][5120] BF16, written at the entry of main layers 37 / 38 / 39
-    // PREFILL (card section 9; ds41_dspark_prefill.h): a non-final chunk of W rows > MX. tap_rows = capacity of `tap` in rows (0 = MX, the decode
+    // Prefill (ds41_dspark_prefill.h): a non-final chunk of W rows > MX. tap_rows = capacity of `tap` in rows (0 = MX, the decode
     // step); main_lo / main_hi = the chunk rows [lo, hi) that go through ST_DS_TAP / ST_DS_MAIN (hi = -1: all rows; the default). The prefill
     // driver sets them per chunk (pf::main_rows) before the plan runs. Host state: a captured graph bakes them in (eager or per-shape graphs only).
     int tap_rows = 0;
@@ -86,7 +86,7 @@ struct Dsp
     // draft Model: ST_DS_DRAFT_IN .. ST_DS_MARKOV
     bf16* x = nullptr;                            // [nsess * 5][5120] pre-norm head input of the last draft layer (ds_mhc::finish xpre)
     const bf16* membed = nullptr;                 // markov_head.embed [VOCAB][256] (replicated)
-    const bf16* mhead = nullptr;                  // markov_head.head, THIS rank's vocab shard [vn][256]
+    const bf16* mhead = nullptr;                  // markov_head.head, this rank's vocab shard [vn][256]
     const bf16* conf_proj = nullptr;              // confidence_head.proj [5376]
     int* dtok = nullptr;                          // [5][nsess] merge output, i-major
     int* draft = nullptr;                         // [nsess][5] the drafts, session-major (the next verify step's rows 1..k)

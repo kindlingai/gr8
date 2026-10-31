@@ -54,8 +54,8 @@ static bool run_chain(const Case& c, const std::vector<std::vector<WT>>& fn_host
     }
     bool ok = true;
     printf("[%s%s] M=%d H=%d sublayers=%d\n", tag, fused ? " fused consume+prepare" : "", M, H, c.NS);
-    // one-STEP gate. A BF16 trunk makes any two implementations drift apart over many sub-layers (one rounding flip stays in
-    // the trunk and the mismatch count grows), so each stage is checked from the DEVICE's own state: the host oracle starts
+    // one-step gate. A BF16 trunk makes any two implementations drift apart over many sub-layers (one rounding flip stays in
+    // the trunk and the mismatch count grows), so each stage is checked from the device's own state: the host oracle starts
     // from the trunk/pre the device holds before the stage and must produce what the device produced. The chain against the
     // torch reference is printed as info only (sub-layer 0 is gated: it has no history).
     const size_t NT = (size_t)M * 4 * H;

@@ -53,7 +53,7 @@ class Ds41PrefillSingleLane(unittest.TestCase):
 
     def test_one_lane_prefill_seq_is_kept_and_two_lane_is_opt_in(self):
         native = (ROOT / "runtime/s2/ds41_native.cuh").read_text()
-        self.assertIn("if (c.prefill && !c.prefill2)   // one chunk: ONE id of the main fabric sequence", native)
+        self.assertIn("if (c.prefill && !c.prefill2)   // one chunk: one id of the main fabric sequence", native)
         self.assertIn("if (c.prefill2)   // a quantum of W + 1 .. 2W rows", native)
         one = native.split("if (c.prefill && !c.prefill2)", 1)[1].split("ds41::lanes::Counter lane_b;", 1)[0]
         self.assertIn("ds41_make_chunk(p.prompt, first, rows, sc.prefill_rows, sequence, s.req.id, s.key.slot, s.run);", one)

@@ -1,4 +1,4 @@
-// B11: the DS41 step's Engram wiring (ST_ENGRAM, layers 1 and 14). Included by ds41_step.cuh inside g6rt, before the op table.
+// The DS41 step's Engram wiring (ST_ENGRAM, layers 1 and 14). Included by ds41_step.cuh inside g6rt, before the op table.
 // Contract: docs/DEEPSEEK-ENGRAM.md. The engine is ds41::engram::Engram (engine/engram/engram_dev.cuh); this file adds what needs the
 // step driver: the token window of the step's rows, the reduce collective (EngramHooks::reduce) and the op.
 // Everything here is enqueue-only on the step stream (capturable) and is reached only when GR8_DS_ENGRAM=1 (Model::engram set).
@@ -6,12 +6,12 @@
 #if G6_MODEL_DS41
 
 // Token window. win[r][k] = the token at position pos[r]-k (k = 0..3), or -1 before the start of the sequence. The rows of one step are
-// consecutive positions of ONE sequence (offline loop, and serve v1: one session, no prefix reuse, the host builds every row, a DSpark
-// verify round is the same shape: B12), so a ring of tokens by absolute position holds what is needed: this step's rows are written first,
+// consecutive positions of one sequence (the offline loop; the basic serve: one session, no prefix reuse, the host builds every row; a DSpark
+// verify round has the same shape), so a ring of tokens by absolute position holds what is needed: this step's rows are written first,
 // then every row reads its three predecessors, which are either rows of this step or rows written by an earlier step. A verify step that is
 // rolled back rewrites the same positions before it reads them (a rejected draft's entry sits above the accepted position and the next step,
-// which starts there, overwrites it; the official reference's positional cache does the same, engram.py:167).
-// ASSUMES each session starts at position 0 (no prefix reuse): the ring needs no reset because a row at position p reads
+// which starts there, overwrites it; the positional cache of the official reference engram.py does the same).
+// Assumes each session starts at position 0 (no prefix reuse): the ring needs no reset because a row at position p reads
 // p-1..p-3 only after this request wrote them, and a position below 0 gives -1. Several sessions per step (SESS > 1): one ring per S2 slot,
 // row r uses the ring of its slot sess[r] (sess = nullptr: slot 0 for every row, the one-session form).
 constexpr int ENG_RING = ds41::engram::kRing;   // MX = 32 rows + 3 earlier positions = 35; a power of two (engram_ring.h)
@@ -52,7 +52,7 @@ __global__ void __launch_bounds__(256) k_engram_sum(g6::FabricDev f, const u64* 
 }
 
 // EngramHooks::reduce. Collective c = 2*nl+1+e of the fabric (ncoll = 2*nl+3, payload rows*6144*2 B): slots of MX rows in the decode build,
-// of the W rows of GR8_DS_PREFILL_W in a prefill build (B1 sizes the slots: stride >= W*12288 + 8). A chunk of more than 32 rows publishes with
+// of the W rows of GR8_DS_PREFILL_W in a prefill build (the boot sizes the slots: stride >= W*12288 + 8). A chunk of more than 32 rows publishes with
 // kEngramPutCta CTAs (k_put_publish is grid-stride; the doorbell comes from the last CTA to arrive, whatever the grid), up to 4096 rows.
 constexpr int kEngramPutCta = 64;   // CTAs of the W-row publish copy: 12.6 MB at W = 1024 (decode: 1 or 16 CTAs for 32 rows or fewer)
 inline int ds41_engram_reduce(void* model, int e, int rows, void* stream, __nv_bfloat16* emb)
@@ -79,8 +79,8 @@ inline void ds41_engram_begin(Model& m, int M, cudaStream_t st, int slot = 0)
     G6RT_CK(cudaGetLastError());
     if (const int x = m.engram->begin_step(M, m.win, st)) die("DS41 Engram begin_step: code " + std::to_string(x));
 }
-// F12 ragged W: build each slot's own consecutive token window before hashing the
-// concatenated [rows][4] windows once. The decode and solo-W branches above are unchanged.
+// Ragged W pack: build each slot's own consecutive token window before hashing the
+// concatenated [rows][4] windows once.
 inline void ds41_engram_begin_pack(Model& m, const ds41::pack::Layout& p, cudaStream_t st)
 {
     if (const char* e = ds41::pack::error(p, m.hc_rows, m.ds_slots)) die(std::string("DS41 Engram pack: ") + e);

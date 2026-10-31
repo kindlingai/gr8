@@ -3,7 +3,7 @@
 // 2. The schedule of every chunk shape the callee makes (Engram, DSpark, bounded replay, late-final skip, rows 1..2W) passes the
 //    happens-before / data-flow checker, and lane B skipping range B implies lane A skips it.
 // 3. Lane B's fabric (the main table without the C8-pack late slots) carries every lane-B chunk collective (rows 1..W, skip on / off, RS +
-//    AG + direct) and does NOT carry a 512-row pack's late collective, which the main table does.
+//    AG + direct) and does not carry a 512-row pack's late collective, which the main table does.
 // 4. Per fabric the step ids are consecutive with lane B on its own counter.
 // 5. The real scheduler with decode_prefill_rows(2, W): no quantum above W while a session decodes; 2W when none does.
 // Mutants (each must be refused): drop lane B's waits (ea) / lane A's waits (eb) / the fork / the join, share the index list / trunk /
@@ -292,10 +292,10 @@ static void b12_fabric_both_lanes()
             for (int q = 0; q < k; ++q) CHECK(g6::fab_slot_fits(t.d, nc + q, p.job.sizes[size_t(nc + q)]));
         }
         const auto old = L::fabric_runs_b(int(W), tail, il, NL, nx, mx, HID, NR, 0, true, false);
-        mutant(lane ? "lane B missing B12 state slot" : "lane A missing B12 state slot",
+        mutant(lane ? "lane B missing row-shard state slot" : "lane A missing row-shard state slot",
                old.cfg.ncoll == t.d.ncoll ? "" : "state collective absent");
     }
-    std::printf("B12 lane A/B: row-shard state and MXFP8 AG geometry checked\n");
+    std::printf("lane A/B: row-shard state and MXFP8 AG geometry checked\n");
 }
 
 // the real scheduler: one decoder, then a long prompt; every Prefill quantum while a session decodes is at most W rows

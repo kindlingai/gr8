@@ -1,5 +1,5 @@
-// F12C2 run-2 regression: the production DS41 serve fabric run table versus
-// the exact eight E2E prompts. Host-only; no CUDA or box required.
+// Regression: the production DS41 serve fabric run table versus the exact
+// eight E2E prompts. Host-only; no CUDA or GPU required.
 #include "ds41_prefill_fabric.h"
 #include "s2/ds41_prefill.h"
 #include "s2/tests/e2e_c8_prompt_fixture.h"
@@ -11,7 +11,7 @@
 static int fails = 0;
 #define CHECK(x) do { if (!(x)) { ++fails; fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #x); } } while (0)
 int main() {
-    // Actual F12C2 boot-rank.sh X + supervisor command: W2048, PF_TAIL128,
+    // The production serve config: W2048, PF_TAIL128,
     // Engram1, RS1, MX48, HID5120, --top-p-cands 256, four ranks.
     constexpr int W=2048, TAIL=128, NL=40, NX=2, MX=48, HID=5120, NR=4, NC=83;
     constexpr size_t HEAD = size_t(MX) * (32 + 256 * 8 + 20 * 8); // glue::head_bytes_tk(MX,256,true)
@@ -23,7 +23,7 @@ int main() {
     g6::FabricDev fo{}, f{}; fo.nr=f.nr=NR; fo.compact=f.compact=1;
     CHECK(g6::fab_slot_layout(off.cfg,off.cfg.ncoll,&fo));
     CHECK(g6::fab_slot_layout(on.cfg,on.cfg.ncoll,&f));
-    // Explicit byte-equality contract for C8PACK=0 against a736234's table.
+    // Explicit byte-equality contract for the C8PACK=0 table.
     CHECK(off.cfg.run1==42 && off.cfg.run2==81 && off.cfg.run3==83 && off.cfg.ncoll==125);
     CHECK(fo.stride==20972544 && fo.stride1==1310976 && fo.stride2==25166080 && fo.stride3==5243136);
     CHECK(off.cfg.slot_bytes==20972536 && off.cfg.slot_bytes1==1310720 && off.cfg.slot_bytes2==25165824 && off.cfg.slot_bytes3==5242880);
@@ -45,7 +45,7 @@ int main() {
             printf("ROWS=%d q=%zu size_plus_8=%zu off_stride=%zu on_stride=%zu %s\n",R,q,need,old,now,fits?"OK":"TOO_SMALL");
             bad_off += need>old; bad_on += !fits;
         }
-        CHECK(bad_off==38); // q42..79 under-sized in the old 128-row late run.
+        CHECK(bad_off==38); // q42..79 are under-sized in the C8PACK=0 table (128-row late run).
         CHECK(bad_on==0);
         CHECK(ds41::rs::job_error(coll.sizes,NC,on.rs_k,R,NR,size_t(HID)*2)==nullptr);
         const auto j=ds41::rs::job(coll.sizes,coll.order,NC,on.rs_k,R,NR,size_t(HID)*2);

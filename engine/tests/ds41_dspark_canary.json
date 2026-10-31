@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "doc": "DSpark canary fixture (docs/DEEPSEEK-DSPARK.md section 7). 4 classes x 3 prompts. Every run (MTP=0 twice, MTP=1, MTP=5) uses the same chat template, temperature 0, thinking off, and cuts the output at max_tokens (a speculative round may not emit past it). Compare with engine/tests/ds41_dspark_canary.py.",
+  "doc": "DSpark canary fixture. 4 classes x 3 prompts. Every run (MTP=0 twice, MTP=1, MTP=5) uses the same chat template, temperature 0, thinking off, and cuts the output at max_tokens (a speculative round may not emit past it). Compare with engine/tests/ds41_dspark_canary.py.",
   "settings": {
     "max_tokens": 256,
     "temperature": 0,

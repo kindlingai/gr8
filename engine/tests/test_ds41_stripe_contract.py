@@ -44,7 +44,7 @@ class StripeContract(unittest.TestCase):
             contract(self.g6, bad)
 
     def test_every_ds41_fabric_layout(self):
-        # Mirrors the gate at fabric.cpp:669. The main/pre-fill and DSpark draft
+        # Mirrors the stripe gate in Fabric::init (fabric.cpp). The main/pre-fill and DSpark draft
         # fabrics inherit cfg (uniform, non-bulk). Variable/bulk layouts cannot
         # stripe even if they inherit stripe_min; one-rail fallback also stays off.
         cases = (

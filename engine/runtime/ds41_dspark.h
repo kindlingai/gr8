@@ -1,6 +1,6 @@
-// DSpark drafter of DeepSeek-V4.1-Flash-1017: the host-side rules (no CUDA). docs/DEEPSEEK-DSPARK.md is the frozen card (F1);
+// DSpark drafter of DeepSeek-V4.1-Flash-1017: the host-side rules (no CUDA). docs/DEEPSEEK-DSPARK.md describes it;
 // engine/tests/test_ds41_dspark.cpp checks every rule below. The device kernels (tap, main-cache, markov, confidence) and
-// the stage slots follow the card; the five Stage values and plan(..., dspark) / plan_draft are B9's (ds41_ops.h).
+// the stage slots follow that document; the five Stage values and plan(..., dspark) / plan_draft live in ds41_ops.h.
 //
 // One round (k = GR8_DS_MTP drafts, verify rows = k + 1):
 //   verify forward  rows at positions P .. P+k (row 0 = golden), taps at the entry of layers 37/38/39, main-cache update after finish
@@ -38,14 +38,14 @@ static_assert(RING >= KEYS && TAP_ROW == geom::DS_MAIN_PROJ_IN && geom::DS_TARGE
 struct Knobs
 {
     int mtp = 0;                    // GR8_DS_MTP: 0 off, 1..5 drafts per round
-    int block = B;                  // GR8_DS_BLOCK: 5 only in F1
+    int block = B;                  // GR8_DS_BLOCK: 5 only
     double verify_cap = 0;          // GR8_DS_VERIFY_CAP: 0 off, else the confidence threshold in (0, 1]
     bool relaxed = false;           // GR8_DS_RELAXED_ACCEPT: "" / 0 / off = exact (default); else "ratio:R", "topp:P" or both,
-    double relax_ratio = 0;         //   comma separated (kernels/relax_accept.h; NOT EXACT). 0 = that rule is not given
+    double relax_ratio = 0;         //   comma separated (kernels/relax_accept.h; not exact). 0 = that rule is not given
     double relax_topp = 0;
     int prefill_keep = 0;           // GR8_DS_PREFILL_KEEP: 0 = every prompt row writes its main key (default), else the last `keep` >= 128 positions only (ds41_dspark_prefill.h)
     std::vector<double> conf_temp = {1.0};   // GR8_DS_CONF_TEMP: one value or one per draft row (DeepInfer default 1.0)
-    bool engram = true;             // GR8_DS_ENGRAM (owned by B11): false = every row is "diag"
+    bool engram = true;             // GR8_DS_ENGRAM: false = every row is "diag"
     std::string err;                // non-empty = refuse to start
     bool on() const { return mtp > 0; }
     bool diag() const { return !engram; }
@@ -67,7 +67,7 @@ template <class Get> inline Knobs parse_knobs(Get get)
     k.mtp = geti("GR8_DS_MTP", 0, bad); if (bad) fail("GR8_DS_MTP is not an integer");
     if (k.mtp < 0 || k.mtp > MAX_K) fail("GR8_DS_MTP must be 0..5 (0 = off)");
     bad = false; k.block = geti("GR8_DS_BLOCK", B, bad);
-    if (bad || k.block != B) fail("GR8_DS_BLOCK must be 5 (the trained block; F1 supports no other)");
+    if (bad || k.block != B) fail("GR8_DS_BLOCK must be 5 (the trained block; no other size is supported)");
     if (const char* v = get("GR8_DS_RELAXED_ACCEPT"); v && *v && std::strcmp(v, "0") && std::strcmp(v, "off") && std::strcmp(v, "false"))
     {
         const std::string s = v, bad_rx = "GR8_DS_RELAXED_ACCEPT must be 0 / off, or ratio:R (R in (0, 1]) and/or topp:P (P in (0, 1)), comma separated";
@@ -177,8 +177,8 @@ inline double confidence(double dot, double temperature)
 }
 
 // ---- stages ---------------------------------------------------------------------------------------------------------
-// The stage values and the plans live in ds41_ops.h (B9): plan(..., dspark = true) for the verify step, plan_draft({40,41,42}) for
-// the draft block. check_plans() states the card's placement rules (DEEPSEEK-DSPARK.md section 3) over those plans; "" = ok.
+// The stage values and the plans live in ds41_ops.h: plan(..., dspark = true) for the verify step, plan_draft({40,41,42}) for
+// the draft block. check_plans() states the placement rules (docs/DEEPSEEK-DSPARK.md section 3) over those plans; "" = ok.
 inline std::string check_plans(const std::vector<Op>& verify, const std::vector<Op>& draft)
 {
     auto at = [](const std::vector<Op>& p, Stage s, int l) {
@@ -210,16 +210,16 @@ inline std::string check_plans(const std::vector<Op>& verify, const std::vector<
     if (fin != 1 || draft[n - 3].stage != ST_FINISH) return "the draft plan needs exactly one ST_FINISH, right before the head";
     return "";
 }
-// collectives of the DRAFT fabric (B9's pick; the main fabric's c = 80 is its own head merge): layer j sub-layer 2j (attn) / 2j + 1 (ffn),
+// collectives of the draft fabric (the main fabric's c = 80 is its own head merge): layer j sub-layer 2j (attn) / 2j + 1 (ffn),
 // markov step i's head merge at 2 * N_NEXTN + i (6..10), ticket index = collective index
 inline int draft_collective(int j, bool ffn) { return 2 * j + (ffn ? 1 : 0); }
 inline int markov_collective(int i) { return 2 * geom::N_NEXTN + i; }
-// Wire bytes of each draft collective: ONE rule for the three parties of a collective -- the proxy's enqueue (g6m4.cu), the kernels' publish
+// Wire bytes of each draft collective: one rule for the three parties of a collective -- the proxy's enqueue (g6m4.cu), the kernels' publish
 // and wait (op_markov's HeadArgs, put_publish / Ds41Block with BLOCK rows) -- and the CPU gate (test_ds41_dspark.cpp). The proxy writes the tail
 // word at byte `size` of the slot and the kernels read it at their own `size`: a different size means the tail is never seen (10 s spin timeout).
 // c < 6: a layer exchange of the B block rows, BF16 [B][HID]. c >= 6: one head merge of one row (one session) with HEAD_NC candidates.
-// HEAD_NC is 0 whatever --top-p-cands says: the draft head is a greedy argmax and sends the 32 B record only. (First light 10-25: the engine
-// enqueued head_bytes(1, 256) = 2080 B for c = 6..10 while the kernels waited for the tail at 32 B.)
+// HEAD_NC is 0 whatever --top-p-cands says: the draft head is a greedy argmax and sends the 32 B record only. (A proxy that sized
+// c = 6..10 from --top-p-cands, e.g. head_bytes(1, 256) = 2080 B, would leave the kernels waiting for a tail at 32 B.)
 constexpr int HEAD_NC = 0;
 constexpr size_t HEAD_REC_BYTES = 32;     // sizeof(glue::HeadRec) (static_assert in ds41_dspark_ops.cuh)
 constexpr size_t HEAD_CAND_BYTES = 8;     // sizeof(glue::HeadCand) (same)

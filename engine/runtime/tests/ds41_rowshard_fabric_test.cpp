@@ -31,7 +31,7 @@ int main() {
     }
     assert(engram_order0 && engram_order1);
     // Boot contract: the real fabric sizer/layout and build_ds41's validator
-    // must agree before weights/graphs. Engram ON (NX=2), PF_RS ON (K=42),
+    // must agree before weights/graphs. Engram on (NX=2), PF_RS on (K=42),
     // ROW_SHARD 0/1; lossy MXFP8 is legal only with ROW_SHARD and adds no c.
     int valid=0, invalid=0, old_count_red=0;
     for (int rowshard : {0,1}) for (int y_mxfp8 : {0,1}) {
@@ -42,7 +42,7 @@ int main() {
         assert(g6::fab_slot_layout(boot,boot.ncoll,&dev));
         assert(ds41::rs::fabric_ncoll_error(dev.ncoll,NC,K,false,rowshard)==nullptr);
         assert(dev.ncoll==NC+K+rowshard);
-        const int old_count=ds41::rs::main_ncoll(NC,K); // old g6m4 fabric sizer omitted state
+        const int old_count=ds41::rs::main_ncoll(NC,K); // a count without the state collective: refused with ROW_SHARD on
         const bool old_rejected=ds41::rs::fabric_ncoll_error(old_count,NC,K,false,rowshard)!=nullptr;
         assert(old_rejected==bool(rowshard));
         old_count_red+=old_rejected;
@@ -50,7 +50,7 @@ int main() {
     }
     assert(valid==3 && invalid==1 && old_count_red==2);
     std::printf("ROW_SHARD_BOOT_CONTRACT_PASS engram=1 pf_rs=1 valid=3 invalid_y_without_row=1 old_count_RED=2\n");
-    // F14 pooled run 3 has K AGs plus this one state collective. Check the
+    // The pooled run 3 has K AGs plus this one state collective. Check the
     // actual RS/AG/state proxy walk, not only the configuration parser.
     for (int nx : {0, NX}) for (int pool : {0, 2, 3, 4, 8, K}) {
         const int nc = 2*NL+1+nx, state_c = nc+K;

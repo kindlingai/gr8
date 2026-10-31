@@ -1,22 +1,22 @@
-// DSpark during PREFILL: the host-side contract of ST_DS_TAP / ST_DS_MAIN for a non-final prompt chunk of W rows (no CUDA).
-// docs/DEEPSEEK-DSPARK.md section 9 is the card text; engine/tests/test_ds41_dspark_prefill.cpp checks every rule below.
+// DSpark during prefill: the host-side contract of ST_DS_TAP / ST_DS_MAIN for a non-final prompt chunk of W rows (no CUDA).
+// docs/DEEPSEEK-DSPARK.md section 9 describes it; engine/tests/test_ds41_dspark_prefill.cpp checks every rule below.
 //
 // What the draft block reads of the main model: the key ring of each of its 3 layers, positions q-127 .. q (main keys, written by ST_DS_MAIN
 // from the taps of the verify rows) and q+1 .. q+5 (its own block keys). After a prompt of N tokens the first round has q = N-1, so the
-// rings must hold the main keys of positions N-128 .. N-1 and nothing older is ever read (the window is 128, q only grows: there is no
-// prefix reuse or rewind in serve v1; OQ1 of the card says what a reuse hit must redo).
+// rings must hold the main keys of positions N-128 .. N-1 and nothing older is ever read (the window is 128 and q only grows: the basic
+// serve has no prefix reuse or rewind).
 //
-// Prefill quanta (B9 memo b9-prefill-admission.md (a)): the hook runs positions 0 .. N-2 in chunks of W rows (the last one partial) and the
-// prompt's LAST token N-1 is a normal MAIN step (PromptTail, with its own head). So EVERY hook chunk is "non-final": no ST_FINISH, no head
+// Prefill quanta: the hook runs positions 0 .. N-2 in chunks of W rows (the last one partial) and the
+// prompt's last token N-1 is a normal MAIN step (PromptTail, with its own head). So every hook chunk is "non-final": no ST_FINISH, no head
 // stage, no step_out, collectives 0..79 only (c = 80 is the head merge, never enqueued); ST_DS_TAP and ST_DS_MAIN stay.
 //
 // Three rules, each with a falsifier in the test:
 //   1. nonfinal_plan(): the decode plan minus step_in / finish / head / step_out (and minus the DSpark taps and ST_DS_MAIN when no row of the chunk
 //      is kept). Every other op, and every publish (c = 0..79), is untouched.
-//   2. main_rows() / keep policy: rows of the chunk that go through ST_DS_MAIN. GR8_DS_PREFILL_KEEP = 0 (default) keeps EVERY row (no pruning,
+//   2. main_rows() / keep policy: rows of the chunk that go through ST_DS_MAIN. GR8_DS_PREFILL_KEEP = 0 (default) keeps every row (no pruning,
 //      the ring is the same as a decode-step prompt gives). keep >= 128 keeps the last `keep` prompt positions only; below 128 is refused
 //      at boot (the first round's window would read slots nobody wrote).
-//   3. subchunks(): ST_DS_MAIN runs at most `cap` rows per launch, cap <= min(scratch rows, RING). ONE launch must not hold two rows whose
+//   3. subchunks(): ST_DS_MAIN runs at most `cap` rows per launch, cap <= min(scratch rows, RING). One launch must not hold two rows whose
 //      positions differ by a multiple of RING (136): k_kv_prep_pos blocks run in any order, so the surviving key would be a race. Launches
 //      in stream order, positions ascending, give "newest position wins" per slot.
 #pragma once
@@ -49,7 +49,7 @@ inline std::vector<Chunk> chunks(int first, int rows, int W)
 }
 
 // Rows [lo, hi) of a chunk (first, rows) that go through ST_DS_TAP / ST_DS_MAIN: the suffix whose positions are >= keep_first_pos. Empty
-// (lo == hi) when the whole chunk is older than the kept window; such a chunk runs the plan WITHOUT the DSpark stages.
+// (lo == hi) when the whole chunk is older than the kept window; such a chunk runs the plan without the DSpark stages.
 struct Range { int lo, hi; bool empty() const { return lo >= hi; } };
 inline Range main_rows(int first, int rows, int N, int keep)
 {
@@ -72,9 +72,9 @@ inline int cap_for(int scratch_rows) { return std::min(scratch_rows, RING); }
 
 // ---- the plan of a non-final chunk ----------------------------------------------------------------------------------
 inline bool is_head_stage(Stage s) { return s == ST_FINISH || s == ST_HEAD_LOCAL || s == ST_HEAD_MERGE || s == ST_STEP_OUT; }
-// ST_STEP_IN is dropped too (B1, 8:1x AM PT): launch_step_in = k_step_in(StepCtl{m.in, m.stepp, m.tok, m.pos, m.tgt, .., m.cells, ..}) + s2_launch_cells
+// ST_STEP_IN is dropped too: launch_step_in = k_step_in(StepCtl{m.in, m.stepp, m.tok, m.pos, m.tgt, .., m.cells, ..}) + s2_launch_cells
 // (rank.cuh launch_step_in) writes the first MX rows of tok / pos / tgt, which the W-row prefill callee H2D-copies directly (rank.cuh StepIn tok/pos/tgt are [MX]).
-// ST_EMBED (the prologue) stays. Whoever drops the StepIn owns what it did besides the rows (the fabric step word and the S2 cells): B9's s2/ds41_prefill.h.
+// ST_EMBED (the prologue) stays. The caller that drops the StepIn does what it did besides the rows (the fabric step word and the S2 cells): s2/ds41_prefill.h.
 inline bool is_dropped_stage(Stage s) { return is_head_stage(s) || s == ST_STEP_IN; }
 // verify = ds41::plan(ids, 0, nl, true, true, engram, /*dspark=*/true). dsp_rows = false: the chunk has no kept row (no tap, no main-cache update).
 inline std::vector<Op> nonfinal_plan(const std::vector<Op>& verify, bool dsp_rows)
@@ -129,7 +129,7 @@ inline std::string check_nonfinal_plan(const std::vector<Op>& verify, const std:
         if (o.stage == ST_PUBLISH_FFN) last_pub = (int)x;
     }
     if (taps != TAPS) return "a non-final chunk plan does not tap layers 37, 38 and 39 exactly once each";
-    // ST_DS_MAIN reads the three taps, so it follows the last of them; it sits where finish was: after the last layer's publish_ffn, last op
+    // ST_DS_MAIN reads the three taps, so it follows the last of them; it takes the place of finish: after the last layer's publish_ffn, last op
     if (main_at < 0 || main_at < last_tap || main_at < last_pub || main_at != (int)nf.size() - 1) return "ST_DS_MAIN is not the last op, after the last tap and publish_ffn";
     return "";
 }

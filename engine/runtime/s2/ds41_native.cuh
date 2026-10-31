@@ -1,11 +1,11 @@
-// DeepSeek-V4.1-Flash on the S2 host service, serve v1: ONE session at position 0, no prefix reuse, MTP 0 (or DSpark MTP 1..5 with a draft Model), Engram on or off (the token ring of ds41_engram_ops.cuh), split 0.
+// DeepSeek-V4.1-Flash on the S2 host service. The basic serve: one session at position 0, no prefix reuse, MTP 0 (or DSpark MTP 1..5 with a draft Model), Engram on or off (the token ring of ds41_engram_ops.cuh), split 0.
 // This is serve_flash's solo path (flash_native.cuh) cut to what DS41 has. The prompt runs as MAIN decode steps (every DS41 prompt is
 // decode_prompt, so the Driver never calls the prefill hook) unless BootstrapConfig::prefill_min admits it: then its first n - 1 rows go
 // to Ds41Context::prefill in chunks of at most Config::prefill_rows (ds41_prefill.h) and its last token is a MAIN row. A step is one captured graph (or, without --graph, one eager step) the caller launches (g6m4.cu),
-// and the attention / index caches are B4's / B5's own buffers that reset() clears between requests (rank.cuh). A Step::DRAFT or
+// and the attention / index caches are the attention and index ops' own buffers that reset() clears between requests (rank.cuh). A Step::DRAFT or
 // Step::CHAIN never reaches this hook at K = 0 (s2_batch.h); if one did, it launches nothing and returns zeros. With DSpark (Ds41Context::dsp,
 // GR8_DS_MTP) they go to the round runner (ds41_dspark_round.cuh).
-// S2 prefix snapshots are opt-in; without --reuse-prefix the old bind/reset path is unchanged.
+// S2 prefix snapshots are opt-in; without --reuse-prefix a bind resets the slot's state.
 // SESS > 1 (Model::ds_slots = --s2-sessions 2..32, GR8_DS_PREFILL_MIN >= 2): S2 slot q owns slab q of every attention / index / Engram
 // state (ds41_attn_ops.cuh, ds41_idx_ops.cuh, ds41_engram_ops.cuh) and, with DSpark, of the draft layers' key rings. A bind clears only that
 // slot's slabs (and its cached drafts); a step's rows carry their slot in StepIn::sess; a MAIN step of ns > 1 sessions has the same rows per
@@ -26,7 +26,7 @@
 #include <memory>
 #include <mutex>
 namespace g6s2 {
-// native_inputs fills the host S2In of a MAIN step: it must hold every S2 session (SESS=32; r2-d5 window crashed at 9 with S2N 8)
+// native_inputs fills the host S2In of a MAIN step: it must hold every S2 session (SESS=32; a 9-session step does not fit an S2N of 8)
 static_assert(g6rt::S2N >= int(MAX_SESSIONS), "S2In holds fewer sessions than the S2 scheduler admits");
 struct Ds41Context {
     g6rt::Model& main;
@@ -51,7 +51,7 @@ struct Ds41Context {
     std::function<void(const Ds41PrefillChunk&, const Ds41PrefillChunk&)> prefill2;
     std::function<unsigned()> errors2;
     std::function<void(const Ds41PrefillChunk&)> after_prefill2;
-    // F12: one ragged W pass over 2..8 bounded segments, one main fabric sequence; null until stage 2 wires the device path.
+    // one ragged W pass over 2..8 bounded segments, one main fabric sequence; null when the caller does not wire the device path.
     Ds41PrefillPackFn prefill_pack;
     std::function<void(const Ds41PrefillPack&)> after_prefill_pack;
     Ds41PrefixCache* ckpt = nullptr; // optional, owned by the caller
@@ -231,7 +231,7 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
                          c.main.rank, (unsigned long long)gen, unsigned(s.key.slot), end,
                          ck->last.bytes, ck->used_bytes(), ck->budget_bytes());
     };
-    if (c.prefill && !c.prefill2)   // one chunk: ONE id of the main fabric sequence (Dispatch::prefill), fenced like a step; no head, so no output to read
+    if (c.prefill && !c.prefill2)   // one chunk: one id of the main fabric sequence (Dispatch::prefill), fenced like a step; no head, so no output to read
         h.dispatch.prefill_seq = [&](const Slot& s, const Payload& p, uint32_t first, uint32_t rows, uint64_t sequence) {
             c.main.ds_moe_decode_step = false;
             require(!p.decode_prompt, "DS41 prefill of a decode_prompt session");
@@ -250,7 +250,7 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
             capture_prompt_end(s, p, first + rows);
         };
     ds41::lanes::Counter lane_b;   // lane B's fabric sequence: one id per lane-B chunk
-    if (c.prefill2)   // a quantum of W + 1 .. 2W rows: lane A + lane B, ONE fence; up to W rows: the one-lane callee, as above
+    if (c.prefill2)   // a quantum of W + 1 .. 2W rows: lane A + lane B, one fence; up to W rows: the one-lane callee, as above
         h.dispatch.prefill_seq = [&](const Slot& s, const Payload& p, uint32_t first, uint32_t rows, uint64_t sequence) {
             c.main.ds_moe_decode_step = false;
             require(!p.decode_prompt, "DS41 prefill of a decode_prompt session");

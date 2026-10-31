@@ -1,4 +1,4 @@
-// F12 stage 1, host only: DS41 c8 W-pack planning, held-tail membership, fairness, horizon and
+// Host only: DS41 c8 W-pack planning, held-tail membership, fairness, horizon and
 // one host/fabric sequence. No CUDA path is exercised. Build with -DG6_MODEL_DS41=1.
 #include "s2/bootstrap.h"
 #include "s2/dispatch.h"
@@ -96,10 +96,10 @@ static void code_pack_and_off() {
     a.complete_tail_pack(result);
     CHECK(step(b).kind == Kind::PromptTailPack && a.digest() == b.digest());
     CHECK(step(a).kind == Kind::Decode);
-    CHECK(CONTROL_VERSION == 10);
+    CHECK(CONTROL_VERSION == 13);
     BootstrapConfig ba, bo; ba.scheduler = cfg(); bo.scheduler = cfg(false);
     ba.runtime_signature = bo.runtime_signature = "c8";
-    CHECK(ba.agreement().find(" c8pack ctl 10") != std::string::npos);
+    CHECK(ba.agreement().find(" c8pack ctl 13") != std::string::npos);
     CHECK(bo.agreement().find(" c8pack") == std::string::npos);
     CHECK(ba.agreement() != bo.agreement());
     std::printf("scheduler_c8_pack_test: code 471 rows -> one W pack, one 8-tail pack; OFF solo; agreement differs\n");
@@ -239,7 +239,7 @@ static void driver_and_dispatch() {
     std::printf("scheduler_c8_pack_test: driver one W callback, one 8-row MAIN/DRAFT, four shared CHAINs; dispatch one sequence and negative slot/id/row guards\n");
 }
 static void e2e_request_zero_replay() {
-    // F12C OFF-k6 E2E reference, eight exact prompt-token vectors (56..65 IDs).
+    // The E2E reference (c8 pack off), eight exact prompt-token vectors (56..65 IDs).
     // A fresh native boot grants ordinals 0..7; all eight land at boundary 2.
     auto prompts = e2e_c8_prompts();
     Config c = cfg(); c.prefill_rows = 2048;
@@ -314,9 +314,9 @@ static void mixed_flag_boot_refuses() {
     CHECK(why.find("bootstrap config mismatch") != std::string::npos);
     std::printf("scheduler_c8_pack_test: mixed-flag boot refused: %s\n", why.c_str());
 }
-// r2-d4 ring crash (SESS=32): every W pack must have at most 8 members, and the second wave packs too.
+// Ring regression (SESS=32): every W pack must have at most 8 members, and the second wave packs too.
 static void s32_member_cap() {
-    Config c = cfg(); c.max_sessions = 32; c.dynamic_mtp_off = true;
+    Config c = cfg(); c.max_sessions = 32; c.mtp_sessions = 8;
     Scheduler s(c);
     for (unsigned i = 0; i < 13; ++i) admit(s, i + 9, 39);
     const Quantum q = s.next();

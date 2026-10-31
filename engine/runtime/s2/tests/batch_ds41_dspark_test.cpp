@@ -1,8 +1,8 @@
-// DSpark round (B12) on the REAL s2::Batch with a fake engine: the host side of the served MTP=1..5 flow for DeepSeek-V4.1-Flash.
-// The fake engine is a recurrent model: the state of position p is H(state of p - 1, input token), written by EVERY main row (like the KV
+// DSpark round on the real s2::Batch with a fake engine: the host side of the served MTP=1..5 flow for DeepSeek-V4.1-Flash.
+// The fake engine is a recurrent model: the state of position p is H(state of p - 1, input token), written by every main row (like the KV
 // cache: rejected draft rows leave wrong state above the accepted prefix, which the next step must rewrite), and the token after p is
 // sample(state of p). The DRAFT hook is the round runner's host logic (s2/ds41_dspark_round_logic.h, the same class
-// ds41_dspark_round.cuh uses) around a fake draft device that reads ONLY what the real device reads: the taps (the states of the latest main
+// ds41_dspark_round.cuh uses) around a fake draft device that reads only what the real device reads: the taps (the states of the latest main
 // step's rows), q, golden and acc. Error injection (all right / first wrong / last wrong / mixed) decides which drafts the fake device gets
 // right, so every accept count 0..K occurs.
 // Checks (each also run as a mutation that must fail, so the test has teeth):
@@ -10,11 +10,11 @@
 //   (b) every executed DRAFT: acc == q - (pos of row 0 of the latest MAIN step), acc + 1 rows, golden == the true token at q + 1, the state
 //       at q is the true one (accepted rows only)
 //   (c) every CHAIN step continues the cached draft (pos = q + j, tok = draft[j - 1]), no step throws, K - 1 chain steps per round
-//   (d) every verify step is K + 1 consecutive positions of one session starting at q + 1 (B5's rule: the first rejected position), the
+//   (d) every verify step is K + 1 consecutive positions of one session starting at q + 1 (the verify rule: the first rejected position), the
 //       state below its row 0 is the true one
 //   (e) a prompt draft before the tail is skipped and nothing changes when it is not (the fake device depends on main-step state only)
 //   (f) back-to-back requests (reset in between, stale state left above the new prompt); the insert rule's forced chunks (draft with M > 6)
-//   (g) the Engram token ring (engine/engram/engram_ring.h, the code k_engram_win runs) fed with the (pos, tok) rows of EVERY main step the
+//   (g) the Engram token ring (engine/engram/engram_ring.h, the code k_engram_win runs) fed with the (pos, tok) rows of every main step the
 //       real Batch emits (prompt chunks, tail, DECODE1, verify rounds at K 1..5, accepts and rejects, the ring never cleared between
 //       requests): per step all rows are put, then every row reads pos-0..3, and each window equals the true sequence's (positions below the
 //       step's row 0: the committed token; rows of the step: the fed token; before position 0: -1). A rejected draft's entry sits in the
@@ -130,7 +130,7 @@ struct Fake
         if (s.round >= 0 && !insert_mode)
         {
             CHECK(s.M() == K + 1);
-            CHECK(drafted && p0 == last_q + 1);                                     // the first rejected position (B5)
+            CHECK(drafted && p0 == last_q + 1);                                     // the first rejected position
             CHECK(chains_since == K - 1);
         }
         std::vector<int> out;
@@ -147,8 +147,8 @@ struct Fake
         return out;
     }
 
-    // (g) one main step through the ring, in the order of k_engram_win. The engine runs at most MX = G6_MX = 32 rows a step (engine/g6mx.h,
-    // s2/native.cuh:418 rejects more): a longer step of this test (chunk 64, a forced insert chunk) is fed as consecutive sub-steps of <= 32 rows.
+    // (g) one main step through the ring, in the order of k_engram_win. The engine runs at most MX = G6_MX = 32 rows a step (engine/g6mx.h;
+    // capture_all in s2/native.cuh rejects more): a longer step of this test (chunk 64, a forced insert chunk) is fed as consecutive sub-steps of <= 32 rows.
     void ring_step(const Step& s)
     {
         constexpr int MXR = 32;

@@ -1,6 +1,6 @@
-// F10 DS41 prefill big combine as reduce-scatter + all-gather (GR8_DS_PF_RS=1, default off). Host rules and the slot index math,
+// DS41 prefill big combine as reduce-scatter + all-gather (GR8_DS_PF_RS=1, default off). Host rules and the slot index math,
 // shared by the kernels (ds41_rs.cuh), the host wiring (g6m4.cu, ds41_step.cuh) and the host test (engine/tests/test_ds41_rs.cpp).
-// No CUDA, no fabric types. Design: reports/ds-in-gr8-build/f7/F7-SCOPE.md (SESS8), with one change: every rank owns Q = ceil(M / NR)
+// No CUDA, no fabric types. Every rank owns Q = ceil(M / NR)
 // rows (rank q: rows [q Q, min(M, (q + 1) Q)), the last ranks may own fewer or none), so every RS slice and every AG payload is Q rows
 // (Q x H x 2 bytes; a peer's tail sits at the same offset for every peer and glue::wait_peers works unchanged). The rows past M in a
 // slice are stale bytes that no rank reads.
@@ -37,7 +37,7 @@ DS41_RS_HD inline int owned(int rows, int nr, int p) { const int q = quarter(row
 DS41_RS_HD inline size_t pub_off(int m, int q, size_t ss, size_t row_bytes) { return (size_t)(m / q) * ss + (size_t)(m % q) * row_bytes; }
 // the AG collective of big collective c
 DS41_RS_HD inline int c_ag(int nc, int c) { return nc + c; }
-// Main fabric: decode collectives + k prefill AG collectives + the optional B12 row-shard
+// Main fabric: decode collectives + k prefill AG collectives + the optional row-shard
 // tail-state collective. The lossy MXFP8 y wire form changes payload bytes, not this count.
 inline int main_ncoll(int nc, int k, bool rowshard = false) { return nc + k + (rowshard ? 1 : 0); }
 // build_ds41's fabric check: f_ncoll = the fabric's count, model_ncoll = Model::ncoll() (2 nl + 1 + Engram 2, or the draft's DRAFT_NCOLL),
@@ -53,7 +53,7 @@ inline const char* fabric_ncoll_error(int f_ncoll, int model_ncoll, int ag, bool
 }
 
 // Is collective c of a `rows`-row step an RS one? enabled = GR8_DS_PF_RS=1 on this Model; k = the RS collectives 0..k-1 (2 i_late).
-// rows > mx: a prefill chunk, never a decode step (the decode graphs are untouched); rows >= nr: every rank owns a row of a full slice.
+// rows > mx: a prefill chunk, never a decode step (decode graphs never take the RS form); rows >= nr: every rank owns a row of a full slice.
 DS41_RS_HD inline bool on(bool enabled, int c, int k, int rows, int mx, int nr) { return enabled && c >= 0 && c < k && rows > mx && rows >= nr; }
 
 // The proxy job of one RS chunk. In: the chunk's sizes / order (s2/ds41_prefill.h ds41_chunk_collectives; empty order = 0..n-1),

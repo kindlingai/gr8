@@ -4,8 +4,8 @@
 //  b. one W-row chunk: its fields, and every refusal (rows 0 / > W / reaches the tail, run too small, sequence 0, slot 8)
 //  c. the attention cell of a chunk against a host copy of k_step_in's formula (rank.cuh)
 //  d. the chunk's fabric step, Engram off and on: sizes, order, min_stride, order_error
-//  e. the real proxy loop (g6::walk_step) against a GPU that rings the REAL non-final plan's collectives: {sizes, order} from the builder
-//     pass, the decode-step sizes (c = 80 with no ringer) and the numeric Engram-on order stall where the first-light proxy stalled
+//  e. the real proxy loop (g6::walk_step) against a GPU that rings the real non-final plan's collectives: {sizes, order} from the builder
+//     pass, the decode-step sizes (c = 80 with no ringer) and the Engram-on numeric order, which stalls the proxy
 //  f. the non-final plan: no STEP_IN / FINISH / head / STEP_OUT, c = 79 still published, check_nonfinal_plan agrees
 //  g. Dispatch + Sessions + Driver: one main sequence id per chunk, the next MAIN step has sequence + 1, draft sequence separate, the
 //     chunks cover rows 0 .. n - 2, the last token is the first MAIN row; prefill_min 0 and plp / steering requests never prefill
@@ -72,7 +72,7 @@ static void check_chunk()
     CHECK(throws([&] { ds41_make_chunk(prompt, 0, 1024, 1024, 1, 9, MAX_SESSIONS, run); })); // slot MAX_SESSIONS of MAX_SESSIONS
 }
 
-// r2-d4 ring crash: CAND serves SESS=32, so the native passes slots=32 and slot ids reach 31.
+// Ring regression: a serve with SESS=32 passes slots=32 to the native, so slot ids reach 31.
 static void check_ragged_pack_s32()
 {
     std::vector<std::vector<int>> prompts; std::vector<Ds41PrefillChunk> chunks;
@@ -233,7 +233,7 @@ static void check_collectives()
     for (uint32_t rows : {1u, 32u, 33u, 1024u, 2048u})
     {
         const Ds41ChunkColl off = ds41_chunk_collectives(ids, 0, rows, HID, EMB);
-        CHECK(off.sizes.size() == 80 && off.order.empty());                      // c = 0..79; the head c = 80 is NOT sized; the plain enqueue_step
+        CHECK(off.sizes.size() == 80 && off.order.empty());                      // c = 0..79; the head c = 80 is not sized; the plain enqueue_step
         for (uint32_t s : off.sizes) CHECK(s == rows * HID);
         CHECK(off.min_stride() == uint64_t(rows) * HID + 8);
         CHECK(g6::order_error(off.order, off.sizes.size()) == nullptr);
@@ -257,7 +257,7 @@ static void check_collectives()
         CHECK(on.order != numeric);
         CHECK(std::find(on.order.begin(), on.order.end(), 80) == on.order.end());
     }
-    CHECK(ds41_chunk_collectives(ids, 2, 1024, HID, EMB).min_stride() == 12582920);   // B11: W1024 slot, 12,582,920 B
+    CHECK(ds41_chunk_collectives(ids, 2, 1024, HID, EMB).min_stride() == 12582920);   // W1024 slot, 12,582,920 B
     CHECK(ds41_chunk_collectives(ids, 2, 2048, HID, EMB).min_stride() == 25165832);   //      W2048
     CHECK(ds41_chunk_collectives(ids, 0, 1024, HID, EMB).min_stride() == 10485768);   // Engram off, W1024
     // the fabric accepts sizes.size() <= ncoll (81 decode / 83 Engram) and sizes[c] + 8 <= stride
@@ -407,7 +407,7 @@ static void check_payload()
     const Sessions none(c, "", false, 4), pf(c, "", false, 4, 64);
     for (size_t n : {size_t(1), size_t(63), size_t(64), size_t(3000)})
     {
-        CHECK(none.payload(serve_req(n)).decode_prompt);                          // prefill_min 0: every prompt decodes, as before
+        CHECK(none.payload(serve_req(n)).decode_prompt);                          // prefill_min 0: every prompt decodes
         CHECK(pf.payload(serve_req(n)).decode_prompt == (n < 64));
         CHECK(pf.payload(serve_req(n)).prompt == serve_req(n).prompt && pf.payload(serve_req(n)).chunk == 4);
     }
@@ -480,7 +480,7 @@ static void check_dispatch()
         CHECK(throws([&] { d.prefill(small, p, 960, 128); }));                    // outside the run
         CHECK(f.ev.size() == 6);
     }
-    {   // no seq hook: the old prefill hook runs, no main id is taken (the default build)
+    {   // no seq hook: the plain prefill hook runs, no main id is taken (the default build)
         Fab f;
         Dispatch d = make_dispatch(sessions, f, false, 1024);
         d.begin(0, 0);
@@ -610,7 +610,7 @@ static void check_agreement()
     a.scheduler = b.scheduler = c.scheduler = w_cfg();
     a.runtime_signature = b.runtime_signature = c.runtime_signature = "sig";
     b.prefill_min = 64; c.prefill_min = 128;
-    CHECK(a.agreement().find("pfmin") == std::string::npos);                      // default: the string is what it was
+    CHECK(a.agreement().find("pfmin") == std::string::npos);                      // default: no pfmin field in the string
     CHECK(b.agreement().find(" pfmin 64 ctl ") != std::string::npos && c.agreement().find(" pfmin 128 ctl ") != std::string::npos);
     CHECK(a.agreement() != b.agreement() && b.agreement() != c.agreement() && a.agreement() != c.agreement());
     BootstrapConfig b2 = b;

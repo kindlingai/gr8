@@ -1,4 +1,4 @@
-// Host test of the DSpark prefill contract (engine/runtime/ds41_dspark_prefill.h, docs/DEEPSEEK-DSPARK.md section 9): no CUDA. Build:
+// Host test of the DSpark prefill contract (engine/runtime/ds41_dspark_prefill.h): no CUDA. Build:
 //   g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I engine engine/tests/test_ds41_dspark_prefill.cpp -o /tmp/test_ds41_dspark_prefill
 // Checks (a) the GR8_DS_PREFILL_KEEP knob, (b) the non-final chunk plan: DS_MAIN present, finish / head / step_out gone, publishes c = 0..79 kept,
 // (c) the chunk -> row range -> subchunk arithmetic at W = 8 / 32 / 128 / 256 / 1024 and the tap / DS_MAIN positions across every chunk boundary,
@@ -114,7 +114,7 @@ int main()
         EXPECT(nf[0].stage == ST_EMBED && nf0[0].stage == ST_EMBED && dsp::pf::count_stage(nf, ST_EMBED) == 1);                          // the prologue embed stays, first
         EXPECT(dsp::pf::publishes(verify) == 81 && dsp::pf::publishes(nf) == 80 && dsp::pf::publishes(nf0) == 80);   // c = 0..79 stay, c = 80 is the head merge
         EXPECT(dsp::pf::count_stage(nf, ST_ENGRAM) == (engram ? 2 : 0));
-        // B9's collective order of a step that skips the head leaves out c = 2*nl and nothing else (Engram on: 81, 82 stay)
+        // The collective order of a step that skips the head leaves out c = 2*nl and nothing else (Engram on: 81, 82 stay)
         const auto ord = coll_exec_order(ids, engram ? 2 : 0, false);
         if (engram)
         {
@@ -144,7 +144,7 @@ int main()
         EXPECT(bad([&](std::vector<Op>& p) { Op s; s.stage = ST_STEP_IN; s.unit = U_STEP_IN; p.insert(p.begin(), s); }));   // ST_STEP_IN restored at the front: it would overwrite the first MX rows of tok / pos / tgt
         EXPECT(bad([&](std::vector<Op>& p) { Op s; s.stage = ST_STEP_IN; s.unit = U_STEP_IN; p.insert(p.begin() + 1, s); }));   // ... or anywhere else
         EXPECT(bad([&](std::vector<Op>& p) { erase_stage(p, ST_EMBED); }));                                                 // the prologue embed lost
-        EXPECT(bad([&](std::vector<Op>& p) { (void)p; }, false));                                                            // a chunk with no kept row must NOT carry DSpark stages
+        EXPECT(bad([&](std::vector<Op>& p) { (void)p; }, false));                                                            // a chunk with no kept row must not carry DSpark stages
         EXPECT(!dsp::pf::nonfinal_plan(verify, false).empty() && dsp::pf::check_nonfinal_plan(verify, dsp::pf::nonfinal_plan(verify, false), true) != "");
     }
     // (c) arithmetic at every chunk width: the rows of a chunk, the launches, and the positions across each boundary
@@ -212,7 +212,7 @@ int main()
         EXPECT(r.lo == 104 && r.hi == 231 && r.hi - r.lo == 127);
         const auto s = dsp::pf::subchunks(r, 32);
         EXPECT(s.size() == 4 && s[0].row0 == 104 && s[0].rows == 32 && s[3].row0 == 200 && s[3].rows == 31);
-        EXPECT(dsp::pf::subchunks(r, dsp::pf::cap_for(1024)).size() == 1);   // the pruned window fits ONE launch of <= 136 rows
+        EXPECT(dsp::pf::subchunks(r, dsp::pf::cap_for(1024)).size() == 1);   // the pruned window fits one launch of <= 136 rows
         EXPECT(dsp::pf::tap_bytes(1024) == 31457280 && dsp::pf::tap_bytes(8) == 245760);
     }
     // (d) the ring: every combination of width, prompt length, keep, cap leaves a complete first-round window, and stays complete over decode rounds
@@ -243,16 +243,16 @@ int main()
         EXPECT(run_prompt(W, N, 128, 32).ring.window_ok(N - 1));
         // e2 drop one position inside the window, in the middle of a chunk, and the first (tail) position
         for (const int d : {N - 128, N - 100, 900, N - 2, N - 1}) EXPECT(!run_prompt(W, N, 128, 32, false, d).ring.window_ok(N - 1));
-        // e3 a position OUTSIDE the window may be dropped (that is the whole saving): the full run without position 5 still has a complete window
+        // e3 a position outside the window may be dropped (that is the whole saving): the full run without position 5 still has a complete window
         EXPECT(run_prompt(W, N, 0, 32, false, 5).ring.window_ok(N - 1) && !run_prompt(W, 100, 0, 32, false, 5).ring.window_ok(99));
-        // e4 launches in descending order: the OLDEST position wins each slot, the window is wrong (slot = pos % 136 needs ascending launches)
+        // e4 launches in descending order: the oldest position wins each slot, the window is wrong (slot = pos % 136 needs ascending launches)
         EXPECT(!run_prompt(W, N, 0, 32, true).ring.window_ok(N - 1));
-        // e5 a launch wider than the ring: two rows share a slot in ONE launch (a race on the device), caught by the simulator
+        // e5 a launch wider than the ring: two rows share a slot in one launch (a race on the device), caught by the simulator
         EXPECT(run_prompt(W, 5000, 0, 137).race && !run_prompt(W, 5000, 0, 136).race && dsp::pf::cap_for(1024) == 136 && dsp::pf::cap_for(32) == 32);
         // e6 wider keep never shrinks the window; prompts shorter than the window have nothing to prune
         EXPECT(dsp::pf::keep_first_pos(100, 128) == 0 && dsp::pf::keep_first_pos(129, 128) == 1 && dsp::pf::keep_first_pos(5000, 0) == 0);
     }
-    // (f) MainS of 128 rows (B1 GO 8:0x AM PT): cap = min(128, RING) = 128. Launch counts, the GEMM weight-tile model (k_gemm_mxfp8 GBM = 64: a launch reads
+    // (f) MainS of 128 rows: cap = min(128, RING) = 128. Launch counts, the GEMM weight-tile model (k_gemm_mxfp8 GBM = 64: a launch reads
     // the weights once per 64 rows), the ring over every width / length / keep at cap 128, and the falsifier that cap 136 would overrun the 128-row scratch.
     {
         EXPECT(dsp::pf::MS_ROWS == 128 && dsp::pf::cap_for(dsp::pf::MS_ROWS) == 128 && dsp::pf::cap_for(256) == dsp::RING);
@@ -262,7 +262,7 @@ int main()
         EXPECT(launches(1024, 8) == 128 && launches(1024, 32) == 32 && launches(1024, cap) == 8);        // MX 8 / MX 32 / 128-row scratch, unpruned W = 1024
         EXPECT(tiles(1024, 8) == 128 && tiles(1024, 32) == 32 && tiles(1024, cap) == 16 && tiles(1024, cap) == 1024 / 64);   // 16 = the floor: one weight read per 64 rows
         EXPECT(launches(127, cap) == 1 && launches(128, cap) == 1 && launches(129, cap) == 2 && launches(1, cap) == 1);
-        // keep = 128, every width: the kept rows are ONE launch per chunk they touch (at most two chunks), each <= 128 rows = the scratch
+        // keep = 128, every width: the kept rows are one launch per chunk they touch (at most two chunks), each <= 128 rows = the scratch
         for (const int W : {8, 32, 128, 256, 1024})
             for (const int N : {129, 200, 1000, 1025, 4097, 8192})
             {

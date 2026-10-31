@@ -12,8 +12,8 @@
 // any wrong row or wrong pairing shows). Truth = feeding the accepted tokens one at a time (the n == 1 decode form of k_comp_pool: token at
 // position t fills slot t & 1, an odd t completes row t >> 1 from slots 0 and 1). The test:
 //   (1) with the commit, every compressed row 0 .. (Pa + 1) / 2 - 1 (those with 2g + 1 <= Pa) equals the truth after every round;
-//   (2) with the commit, the row (Pa + 1) / 2 that the NEXT step completes equals the truth, for every start parity and every a in 0 .. k;
-//   (3) negative control: WITHOUT the commit, (2) fails exactly in the rounds with Pa even and a < n - 1 (and only there), so the test sees the bug;
+//   (2) with the commit, the row (Pa + 1) / 2 that the next step completes equals the truth, for every start parity and every a in 0 .. k;
+//   (3) negative control: without the commit, (2) fails exactly in the rounds with Pa even and a < n - 1 (and only there), so the test sees the bug;
 //   (4) rows written past Pa by the rejected tail never survive into a visible row (they are rewritten by the next step before any
 //       query position can see them: row g is visible to a query at position t iff 2g + 1 <= t, the rule the verify chunk itself needs).
 #include <cstdint>
@@ -144,7 +144,7 @@ int main()
             with.step(p, chunk);
             without.step(p, chunk);
 
-            // (2) the pair completed by THIS round's first row, when the previous round left Pa_prev even (this round starts odd)
+            // (2) the pair completed by this round's first row, when the previous round left Pa_prev even (this round starts odd)
             if (pending_check >= 0)
             {
                 const size_t g = (size_t)(p >> 1);              // p = Pa_prev + 1 is odd: row 0 of this chunk completes row p >> 1
@@ -164,7 +164,7 @@ int main()
             for (int g = 0; g < visible; ++g)
             {
                 EXPECT((size_t)g < with.ck.size() && (size_t)g < truth.ck.size());
-                // rows completed by an earlier round's REJECTED tail were rewritten by the later step: the with-commit engine must be exact
+                // rows completed by an earlier round's rejected tail were rewritten by the later step: the with-commit engine must be exact
                 if (!(with.ck[g] == truth.ck[g]))
                 {
                     // the only row that may still hold a rejected-tail value is the one the next step will rewrite: g == visible is excluded by the bound,
@@ -184,7 +184,7 @@ int main()
     // (3) the negative control saw every predicted fault and nothing else, and the faulty case does occur
     EXPECT(risky > 1000);
     EXPECT(neg_pred > 0);
-    EXPECT(neg_wrong == neg_pred);   // without the commit, a round with Pa even and a < n - 1 ALWAYS breaks the next step's row
+    EXPECT(neg_wrong == neg_pred);   // without the commit, a round with Pa even and a < n - 1 always breaks the next step's row
     // (4) rejected tails existed in the run and none leaked (the (1) loop would have failed)
     EXPECT(tail_rows > 10000);
     EXPECT(by_parity[0][0] > 0 && by_parity[1][0] > 0 && by_parity[0][5] > 0 && by_parity[1][5] > 0);   // a = 0 and a = 5 at both parities

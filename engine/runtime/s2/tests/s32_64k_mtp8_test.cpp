@@ -1,4 +1,4 @@
-// Host-side scheduler, batch, dispatch & prefix-reuse verification for Plan A:
+// Host-side scheduler, batch, dispatch & prefix-reuse verification for the 32-session 64K config:
 //   SESS = 32, CAP = 65536 (32,768 pages / 2,097,152 pool rows), MX = 48,
 //   dynamic MTP=5 for S <= 8 and MTP=0 (rps=1) for S in 9..32,
 //   including S = 1, 8, 9, 16, 32 waves and live S: 8 -> 16 -> 8 crossing + PrefixReuse.
@@ -122,7 +122,7 @@ struct FakeS32 {
             }
             src[size_t(q)] = r0;
             pos0[size_t(q)] = p0;
-            // Mirror Dispatch::run (engine/runtime/s2/dispatch.h:145):
+            // Mirror Dispatch::run (engine/runtime/s2/dispatch.h):
             slot_state[size_t(q)].main_rows(p0, n);
             if (s.round < 0 || n == 1) slot_state[size_t(q)].draft_rows(p0, n, false);
         }
@@ -200,10 +200,10 @@ static void test_scheduler_s32_64k() {
     sc.max_sessions = 32;
     sc.mtp = 5;
     sc.prefill_rows = 4096;
-    sc.dynamic_mtp_off = false;
-    CHECK(sc.limit() == 8u); // legacy static limit when dynamic_mtp_off == false
-    sc.dynamic_mtp_off = true;
-    CHECK(sc.limit() == 32u); // Plan A dynamic limit
+    sc.mtp_sessions = 0;
+    CHECK(sc.limit() == 8u); // every session drafts: 48 / 6 rows
+    sc.mtp_sessions = 8;
+    CHECK(sc.limit() == 32u); // drafting stops past 8 sessions, one row each
 
     g6s2::Scheduler sched(sc);
     uint64_t next_id = 1;
@@ -265,6 +265,7 @@ static void test_batch_wave(int S) {
     FakeS32 f(5);
     Hooks hk = f.hooks();
     Batch b(5, 48, hk);
+    b.set_mtp_sessions(8);   // the DS41 engine's Config::mtp_sessions
     std::vector<Ref> refs(static_cast<size_t>(S));
     std::vector<Session> sess(static_cast<size_t>(S));
     std::vector<int> order;
@@ -312,6 +313,7 @@ static void test_crossing_8_16_8_and_reuse() {
     FakeS32 f(5);
     Hooks hk = f.hooks();
     Batch b(5, 48, hk);
+    b.set_mtp_sessions(8);   // the DS41 engine's Config::mtp_sessions
     std::vector<Ref> refs(32);
     std::vector<Session> sess(16);
     std::vector<int> order;
@@ -391,7 +393,7 @@ static void test_crossing_8_16_8_and_reuse() {
         b.release(q);
     }
 
-    // 4. Gate 4 REUSE=1 check: re-send 4 repeat prompts (slots 8, 9 from MTP=0 wave and slots 0, 1 from crossed wave) with new suffix
+    // 4. REUSE=1 check: re-send 4 repeat prompts (slots 8, 9 from MTP=0 wave and slots 0, 1 from crossed wave) with new suffix
     ctx = "crossing_reuse_4_repeats";
     const int rep_slots[4] = {8, 9, 0, 1};
     for (int i = 0; i < 4; ++i) {

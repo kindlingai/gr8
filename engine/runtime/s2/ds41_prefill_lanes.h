@@ -1,10 +1,10 @@
 // DeepSeek-V4.1-Flash two-lane W prefill admission (GR8_DS_PF_LANES=2, ../ds41_lanes.h), host-only. Included by ds41_native.cuh only, so
 // the S2 headers every model includes (sessions.h -> ds41_prefill.h) do not pull the lane contract in.
 //
-// Lanes 1 (unset, the default): ds41_prefill_single_lane, today's Config byte for byte. Lanes 2: the scheduler plans quanta of up to 2W
-// rows of ONE session (Config::two_lanes, scheduler.h) and, while a session decodes, one lane (decode_prefill_rows = W). serve_ds41
-// cuts each quantum into lane A (the first min(rows, W) rows, ONE id of Dispatch's main sequence, the main fabric) and lane B (the rest,
-// positions A.context.., ONE id of lane B's own counter, lane B's fabric). Every rank runs the same Driver, so both ids agree.
+// Lanes 1 (unset, the default): ds41_prefill_single_lane, the Config unchanged. Lanes 2: the scheduler plans quanta of up to 2W
+// rows of one session (Config::two_lanes, scheduler.h) and, while a session decodes, one lane (decode_prefill_rows = W). serve_ds41
+// cuts each quantum into lane A (the first min(rows, W) rows, one id of Dispatch's main sequence, the main fabric) and lane B (the rest,
+// positions A.context.., one id of lane B's own counter, lane B's fabric). Every rank runs the same Driver, so both ids agree.
 #pragma once
 #include "ds41_prefill.h"
 #include "../ds41_lanes.h"

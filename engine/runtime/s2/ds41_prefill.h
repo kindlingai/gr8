@@ -2,12 +2,12 @@
 // fabric collectives a chunk without a head rings. The W-row device work is the callee's (g6m4.cu, Ds41Context::prefill); this file is
 // the contract it is built and tested against.
 //
-// Admission: serve v1 ran every prompt as MAIN decode steps (Payload::decode_prompt = true). With GR8_DS_PREFILL_W set, a prompt of
+// Admission: by default every prompt runs as MAIN decode steps (Payload::decode_prompt = true). With GR8_DS_PREFILL_W set, a prompt of
 // at least prefill_min rows prefills its first n - 1 rows in chunks of at most W rows; its last token is a MAIN row (PromptTail), so
 // no chunk needs the head. prefill_min = 0 (the default) keeps decode_prompt true for every prompt.
 //
 // One fabric counter: prefill and decode rings share the main fabric, whose slot is step & 1 and whose doorbell is
-// coll_seq(step, c, ncoll). A chunk takes ONE id from Dispatch's main sequence (Dispatch::prefill, prefill_seq); the next MAIN step has
+// coll_seq(step, c, ncoll). A chunk takes one id from Dispatch's main sequence (Dispatch::prefill, prefill_seq); the next MAIN step has
 // sequence + 1. Every rank runs the same Driver, so the ids agree.
 #pragma once
 #include "scheduler.h"
@@ -38,9 +38,9 @@ struct Ds41PrefillChunk {
     int context = 0;               // first + rows: the last row's position + 1 (k_step_in's StepIn::context)
     uint64_t sequence = 0;         // the fabric step id = the m.stepp value; from Dispatch's main sequence, never 0
     uint64_t request = 0;          // Slot::req.id
-    unsigned slot = 0;             // Slot::key.slot (serve v1: 0)
+    unsigned slot = 0;             // Slot::key.slot (0 with one session)
     uint32_t first_page = 0, pages = 0;   // Slot::run
-    uint32_t prompt_rows = 0;      // the prompt size N (F8 GR8_DS_PF_LATE_FINAL: rows after this chunk = N - 1 - context)
+    uint32_t prompt_rows = 0;      // the prompt size N (GR8_DS_PF_LATE_FINAL: rows after this chunk = N - 1 - context)
 };
 using Ds41PrefillFn = std::function<void(const Ds41PrefillChunk&)>;
 // One indivisible ragged W launch. Host token spans remain separately owned by the
@@ -91,7 +91,7 @@ inline Ds41PrefillCell ds41_chunk_cell(const Ds41PrefillChunk& c, bool shared_in
     return {c.context, pages, pages, shared_index_layer ? int(c.rows) : 0};
 }
 // the fabric step of a chunk that has no head: `sizes` for Fabric::enqueue_step and `order` for Fabric::Rs::order.
-//   Engram off: sizes 2*nl entries (c = 0..2nl-1; the head c = 2nl is NOT sized, or the proxy waits for a doorbell nobody rings), order
+//   Engram off: sizes 2*nl entries (c = 0..2nl-1; the head c = 2nl is not sized, or the proxy waits for a doorbell nobody rings), order
 //               empty (the plain enqueue_step(step, sizes) call).
 //   Engram on : sizes 2*nl + 3 entries, sizes[2nl] = 0 (the head, not in the order), sizes[2nl+1+e] = rows * engram_row_bytes;
 //               order = ds41::coll_exec_order(ids, 2, false): the Engram reduces run mid-layers, so the proxy must wait for them there.
@@ -121,7 +121,7 @@ inline Ds41ChunkColl ds41_chunk_collectives(const std::vector<int>& ids, int eco
     for (size_t c = 0; c < 2 * nl; ++c) o.sizes[c] = uint32_t(c < c_late ? layer : uint64_t(late_rows) * row_bytes);
     for (int e = 0; e < ecoll; ++e) o.sizes[2 * nl + 1 + size_t(e)] = uint32_t(engram);
     o.order = ds41::coll_exec_order(ids, ecoll, false);
-    // F8 GR8_DS_PF_LATE_FINAL: a chunk that skips range B rings no layer exchange c >= c_late. Engram off: the proxy handles 0..sizes.size()-1,
+    // GR8_DS_PF_LATE_FINAL: a chunk that skips range B rings no layer exchange c >= c_late. Engram off: the proxy handles 0..sizes.size()-1,
     // so sizes stops at c_late. Engram on: those sizes are 0 and the order leaves them out (as it leaves out the head).
     if (late_skip) {
         require(i_late >= 1, "DS41 chunk collectives: late skip without a bounded-replay split");

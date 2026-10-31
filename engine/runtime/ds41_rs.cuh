@@ -1,4 +1,4 @@
-// F10 DS41 prefill RS+AG kernels (GR8_DS_PF_RS=1, default off). Rules and slot math: ds41_rs.h (the host test runs the same math).
+// DS41 prefill RS+AG kernels (GR8_DS_PF_RS=1, default off). Rules and slot math: ds41_rs.h (the host test runs the same math).
 // Needs kernels/glue.cuh, g6nr.h, ds41_gather.cuh (DS41_GATHER_T, Ds41DevBlock) and ds41_rs.h (at global scope) before it; no includes,
 // because ds41_step.cuh includes it inside namespace g6rt.
 #pragma once
@@ -56,8 +56,8 @@ __global__ void __launch_bounds__(DS41_GATHER_T) k_rs_gather(g6::FabricDev f,con
     *reinterpret_cast<uint4*>(out+(size_t)m*H+col0)=__ldcv(reinterpret_cast<const uint4*>(glue::peer_slot(f,step,cag,p)+((size_t)l*H+col0)*2));
 }
 
-// B12 row-shard: keep the old k_rs_reduce unchanged for OFF. This variant stops after the
-// rank-owned BF16 sum; the AG slot is published only AFTER local consume_prepare writes y.
+// Row-shard variant of k_rs_reduce (k_rs_reduce serves the row shard off): it stops after the
+// rank-owned BF16 sum; the AG slot is published only after the local consume_prepare writes y.
 __global__ void __launch_bounds__(DS41_GATHER_T) k_rs_reduce_local(g6::FabricDev f,const u64* stepp,int c,int H,int rows,int q,size_t ss,
                                                                    __nv_bfloat16* out) {
     const u64 step=*stepp;

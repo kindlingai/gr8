@@ -12,7 +12,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BEGIN = re.compile(r"ds41_engram_begin\s*\(\s*m\s*,\s*\(int\)\s*c\.rows\s*,\s*st\s*(?:,\s*\(int\)\s*c\.slot\s*)?\)")   # SESS8: optional slot
+BEGIN = re.compile(r"ds41_engram_begin\s*\(\s*m\s*,\s*\(int\)\s*c\.rows\s*,\s*st\s*(?:,\s*\(int\)\s*c\.slot\s*)?\)")   # multi-session: optional slot
 
 
 def prefill_block(rank_src: str) -> str:

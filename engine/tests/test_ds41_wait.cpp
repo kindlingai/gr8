@@ -1,10 +1,10 @@
-// Host test of F1 (GR8_DS_WAIT_K), engine/runtime/ds41_wait.h: no CUDA. Build:
+// Host test of the consume wait (GR8_DS_WAIT_K), engine/runtime/ds41_wait.h: no CUDA. Build:
 //   g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I engine engine/tests/test_ds41_wait.cpp -o /tmp/test_ds41_wait && /tmp/test_ds41_wait
-// What it pins: (1) off = the exact argument the consume kernel had before F1 (rows * HID * 2, no wait kernel); (2) on = one wait kernel with that
-// same payload and wait_payload 0 in the block; (3) in both modes exactly ONE party waits, for exactly the bytes put_publish writes
+// What it pins: (1) off = the plain consume argument (rows * HID * 2, no wait kernel); (2) on = one wait kernel with that
+// same payload and wait_payload 0 in the block; (3) in both modes exactly one party waits, for exactly the bytes put_publish writes
 // (rows * (HID * 2 / 16) uint4); (4) a stream model of the 80 consumes of a step: every consume(c) has its wait for c ahead of it (own or
 // the kernel's), in both modes; (5) K=2 (relay): wait_mode() truth table (2 only on the main Model without GR8_DRAFT_PAR, else 1), consume_wait_mode()
-// (no wait kernel, the block's payload is the published bytes, relay set; modes 0 / 1 equal the old bool overload, relay clear); (6) a std::thread model of the
+// (no wait kernel, the block's payload is the published bytes, relay set; modes 0 / 1 equal the bool overload, relay clear); (6) a std::thread model of the
 // relay protocol (NIC thread writes payload then the tail with release, CTA (0,0) acquires the tails and release-stores the relay word, the other CTAs acquire the
 // relay word and then read the payload; 400 collectives, one "kernel" each): every reader sees the payload of its collective. Build with -pthread
 // (and -fsanitize=thread to let TSAN judge the happens-before chain). It checks the logic of the chain under the C++ memory model, not the PTX one.
@@ -30,7 +30,7 @@ int main()
     for (int rows = 1; rows <= 32; ++rows)
     {
         const ds41::ConsumeWait off = ds41::consume_wait(false, rows, HID), on = ds41::consume_wait(true, rows, HID);
-        // (1) off: the pre-F1 argument, no wait kernel
+        // (1) off: the plain argument, no wait kernel
         CHECK(!off.kernel && off.kernel_payload == 0 && off.block_payload == (size_t)rows * HID * 2);
         // (2) on: one wait kernel with the same payload, the block skips
         CHECK(on.kernel && on.kernel_payload == (size_t)rows * HID * 2 && on.block_payload == 0);

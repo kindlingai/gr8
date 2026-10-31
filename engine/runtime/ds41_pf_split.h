@@ -1,4 +1,4 @@
-// DS41 bounded replay of a non-final prefill chunk (host-only, no CUDA). reports/ds-in-gr8-build/gr8-bounded-replay-plan.md sections 2, 3.
+// DS41 bounded replay of a non-final prefill chunk (host-only, no CUDA).
 // engine/tests/test_ds41_pf_split.cpp checks every rule below; runtime/s2/ds41_prefill.h sizes the collectives from late_rows().
 //
 // The layers past the last kv source (geom ids >= geom::LATE_LAYER_START = 21) owe a later row only their window KV, and a decode step reaches
@@ -6,11 +6,11 @@
 //   range A = ops [0, b):  embed .. layer 20 full-row, then ST_PF_COMPACT (the last op of U_CONS_F of the last layer before 21: the fused
 //                          consume_ffn + hc_attn(21) has already made layer 21's input for every row)
 //   range B = ops [b, e):  layers >= 21 over late_rows(rows, tail) rows = the last `tail` rows of the chunk, moved to rows 0 .. tail-1
-// The split keys on the REAL layer id (Op::l), not the position in a --layers subset.
+// The split keys on the real layer id (Op::l), not the position in a --layers subset.
 //
 // The dial: GR8_DS_PF_TAIL (read once at boot, ds41_pf_tail()). Unset = geom::TAIL_ROWS (128). 0 = off: the chunk runs the unsplit plan at
-// `rows` rows (the code path before this file). tail >= rows (e.g. tail = W) runs the split plan with no compaction and no window floor:
-// byte-identical to off (plan section 5 step 2). 1 .. WINDOW-1 is refused (the first decode step reads the last 128 positions' window KV).
+// `rows` rows. tail >= rows (e.g. tail = W) runs the split plan with no compaction and no window floor:
+// byte-identical to off. 1 .. WINDOW-1 is refused (the first decode step reads the last 128 positions' window KV).
 // DSpark: ST_DS_TAP (layers 37..39) and ST_DS_MAIN sit in range B, so main_rows() is [0, late_rows): the draft rings get the tail positions,
 // which hold the window the first draft round reads (q = N-1 needs N-128 .. N-1; the last chunk ends at N-2).
 #pragma once
@@ -130,11 +130,11 @@ inline std::string check_split(const std::vector<Op>& nf, const Split& s, const 
     if (s.b < 2 || s.ops[s.b - 2].unit != U_CONS_F || s.ops[s.b - 2].ui != s.i_late - 1) return "ST_PF_COMPACT does not follow that layer's consume_ffn unit";
     return "";
 }
-// F8 #1 late tail on the final chunk only (GR8_DS_PF_LATE_FINAL=1, default off). After a chunk ends at `context`, the readers of the layers
+// Late tail on the final chunk only (GR8_DS_PF_LATE_FINAL=1, default off). After a chunk ends at `context`, the readers of the layers
 // >= 21 window state are: the MAIN step at N-1 (reads N-WINDOW .. N-2), and a later chunk's range B, which reads down to its window floor, or
 // WINDOW-1 rows before its first row when it is not compacted (rows <= tail: only the last chunk, since full chunks of W > tail rows compact).
 // So no reader goes below N-1-tail-WINDOW+1, and a chunk with rows_after = (N-1) - context >= tail + WINDOW may skip range B
-// (ST_PF_COMPACT, the layers >= 21, their collectives): nothing reads its late positions. Every other chunk runs today's split unchanged.
+// (ST_PF_COMPACT, the layers >= 21, their collectives): nothing reads its late positions. Every other chunk runs the split above.
 // late_final_valid: the flag needs bounded replay on with full chunks compacted (WINDOW <= tail < W).
 inline bool late_final_valid(int tail, int width) { return tail != TAIL_OFF && tail >= geom::WINDOW && tail < width; }
 inline bool late_skip(int rows_after, int tail) { return tail != TAIL_OFF && rows_after >= tail + geom::WINDOW; }

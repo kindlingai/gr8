@@ -1,7 +1,7 @@
 // DeepSeek-V4.1-Flash-1017 main-model decode step. Included by rank.cuh inside g6rt, after its helpers (the flash_step.cuh analog).
 // The step is a plan (ds41_ops.h: plan() = every stage of every layer, in order, grouped into the units the m4sim wrappers
-// launch) and an op table. This file fills the table's driver and mHC slots and leaves the attention, indexer, MoE and Engram slots
-// to their owners (null = the step stops there with a NOTSUP message that names the stage and its owner). docs/DEEPSEEK-STEP.md.
+// launch) and an op table. This file fills the driver and mHC slots itself and the attention, indexer, MoE, Engram and DSpark slots
+// from their ops headers (null = the step stops there with a NOTSUP message that names the stage and its owner). docs/DEEPSEEK-STEP.md.
 #pragma once
 #if G6_MODEL_DS41
 #include "ds41_prefill_rows.h"
@@ -9,7 +9,7 @@
 #include "ds41_slots.h"
 #include "ds41_knobs.h"
 extern "C" int ds41_sh_act_quant(const void*,int,uint8_t*,int,uint8_t*,int,int,int,void*);
-// B4's Engram projection hook (ds41_attn_ops.cuh, included below); the Engram wiring (reduce collective, token window, op, knobs) is B11's
+// The attention's Engram projection hook (ds41_attn_ops.cuh, included below); the Engram wiring (reduce collective, token window, op, knobs) is ds41_engram_ops.cuh
 inline int ds41_engram_project(void* model, int e, int rows, void* stream, const __nv_bfloat16* emb, __nv_bfloat16* kv);
 #include "ds41_engram_ops.cuh"
 #include <map>
@@ -44,7 +44,7 @@ struct Ds41Block {
 // K=2 (GR8_DS_WAIT_K=2): the relay wait. The consume kernel starts right behind the publish kernel like with K=0, but only CTA (0,0) polls the peers'
 // tails (glue::wait_peers: 3 threads on 3 host-memory lines); when they are in, it stores coll_seq into the device word `relay` (release, gpu scope).
 // Every other CTA polls that word (acquire, gpu scope; one thread, then __syncthreads) instead of the three host-memory lines. The payload reads that
-// follow are the unchanged __ldcv loads. No arithmetic changes. The test is `!= seq`, as the tails' own (a unique coll_seq per collective; the next consume
+// follow are the plain __ldcv loads; the arithmetic is that of K=0. The test is `!= seq`, as the tails' own (a unique coll_seq per collective; the next consume
 // kernel starts only after this one has ended, so the word cannot move on while a CTA of this kernel still reads it). Progress: CTA (0,0) is the first block of the grid, so it is resident before any CTA that waits for it; the host
 // turns K=2 off (back to K=1) for GR8_DRAFT_PAR and for the draft Model (ds41::wait_mode).
 __device__ __forceinline__ u64 ds41_ld_acquire_gpu(const u64* p) {
@@ -79,9 +79,9 @@ struct Ds41RelayBlock : Ds41Block {
     }
 };
 
-#include "ds41_stage.cuh"      // F7 k16 GR8_DS_DEC_STAGE: Ds41Staged<Block> (no includes of its own; the test includes it at global scope)
-#include "ds41_gather.cuh"     // F7 GR8_DS_PF_GATHER: k_ds41_gather + Ds41DevBlock (no includes of its own; the test includes it at global scope)
-#include "ds41_rs.cuh"         // F10 GR8_DS_PF_RS: k_put_publish_rs, k_rs_reduce, k_rs_gather (rank.cuh includes ds41_rs.h at global scope)
+#include "ds41_stage.cuh"      // GR8_DS_DEC_STAGE: Ds41Staged<Block> (no includes of its own; the test includes it at global scope)
+#include "ds41_gather.cuh"     // GR8_DS_PF_GATHER: k_ds41_gather + Ds41DevBlock (no includes of its own; the test includes it at global scope)
+#include "ds41_rs.cuh"         // GR8_DS_PF_RS: k_put_publish_rs, k_rs_reduce, k_rs_gather (rank.cuh includes ds41_rs.h at global scope)
 
 inline ds_mhc::Buffers ds41_buffers(Model& m) {
     ds_mhc::Buffers b{};
@@ -114,24 +114,22 @@ inline Layer::Hc ds41_hc_weights(const Find& find,int layer,const char* block) {
     return h;
 }
 
-// The model, outside graph capture. Refused for now: the DSpark layers 40..42, S2, CP, Engram, GR8_DRAFT_HEAD2, prefix reuse.
+// The model, outside graph capture. Refused here: CP, GR8_DRAFT_HEAD2.
 inline void build_ds41(Model& m,int rank,const std::vector<int>& ids,const Find& find,int capacity,
-                       const g6::FabricDev& f,u64* stepp,cudaStream_t st,int max_rows,int dspark,int ag,bool rowshard) {   // ag: F10 AGs; rowshard: B12 state collective
+                       const g6::FabricDev& f,u64* stepp,cudaStream_t st,int max_rows,int dspark,int ag,bool rowshard) {   // ag: the RS+AG collectives; rowshard: the row-shard state collective
     if(ids.empty() || capacity<1 || rank<0 || rank>=g6nr::NR || f.nr!=g6nr::NR) die("DS41 build: invalid layers/capacity/rank/fabric");
-    const bool draft=dspark==2;   // B12: the DSpark draft Model holds exactly the layers 40..42 (docs/DEEPSEEK-DSPARK.md section 3)
+    const bool draft=dspark==2;   // the DSpark draft Model holds exactly the layers 40..42 (docs/DEEPSEEK-DSPARK.md section 3)
     if(draft) {
         if(ids!=std::vector<int>{geom::L_MAIN,geom::L_MAIN+1,geom::L_MAIN+2}) die("DS41 build: the DSpark draft Model holds the layers 40, 41, 42");
     }
     else for(int l:ids) if(l<0 || l>=geom::L_MAIN) die("DS41 build: layer "+std::to_string(l)+" is outside the main model 0.."+std::to_string(geom::L_MAIN-1)+
-                                                  " (DSpark layers 40..42 are the second wave: GR8_DS_MTP=0)");
+                                                  " (DSpark layers 40..42 belong to the draft Model)");
 #if defined(G6_CP) && G6_CP
     if(m.cp.on) die("DS41 build: CP is not implemented");
 #endif
     if(max_rows>MX) die("DS41 build: decode rows only (no prefill) -- max_rows above MX");
-    // W is a separate future prefill row budget. Decode/verify graphs stay MX.
-    // Until the prefill hook is wired, this only widens caller-owned buffers;
-    // prepare_ds41 still refuses M>MX. The attention and indexer row budgets
-    // must match before a W-row hook can use any of them.
+    // W is the prefill row budget; decode and verify graphs stay at MX (prepare_ds41 refuses M > MX,
+    // W-row chunks use prepare_ds41_prefill). The attention and indexer row budgets must equal W.
     const int prefill_rows=ds41_prefill_rowcap(DS41_TEXT(knob::ds_prefill_w()),MX);
     if(!prefill_rows) die("DS41 build: GR8_DS_PREFILL_W must be MX..4096");
     if(prefill_rows>MX) {
@@ -146,7 +144,7 @@ inline void build_ds41(Model& m,int rank,const std::vector<int>& ids,const Find&
     m.rank=rank; m.nl=(int)ids.size(); m.f=f; m.stepp=stepp;
     m.ecoll=draft?0:ds41_engram_colls(ids);             // 0 off; 2 on (also checks that layers 1 and 14 are served)
     if(const char* e=::ds41::rs::fabric_ncoll_error(f.ncoll,m.ncoll(),ag,draft,rowshard)) die(e);
-    // slots of prefill_rows * 6144 * 2 B + the doorbell word: MX rows in the decode build, W rows with GR8_DS_PREFILL_W (B1's slot_bytes; the engram
+    // slots of prefill_rows * 6144 * 2 B + the doorbell word: MX rows in the decode build, W rows with GR8_DS_PREFILL_W (the boot's slot_bytes; the engram
     // collective is wider than the hidden one: 12,288 B per row against 10,240)
     if(engram_on && g6::fab_slot_stride(f,2*m.nl+1)<(size_t)prefill_rows*ds41::engram::kEmbDim*2+8) die("DS41 Engram: the fabric slots are smaller than prefill rows (MX or GR8_DS_PREFILL_W) * 6144 * 2 bytes + 8");
     m.nbk=context_buckets(m.bk,(int)knob::dec_bk(),capacity,0);
@@ -237,17 +235,17 @@ inline void build_ds41(Model& m,int rank,const std::vector<int>& ids,const Find&
             fprintf(stderr,"# rank %d: DS41 staged slot reads: GR8_DS_DEC_STAGE=1 (main-Model consumes of 1..%d rows read the %d slots with 16-byte loads through smem)\n",rank,MX,g6nr::NR);
         }
     }
-    // hc_attn(i) runs inside consume_ffn(i-1) -- except at an Engram layer: Engram edits the trunk between consume and prepare (B11 contract)
+    // hc_attn(i) runs inside consume_ffn(i-1) -- except at an Engram layer: Engram edits the trunk between consume and prepare (the Engram contract)
     for(int i=0;i<m.nl;++i) m.layers[i].hc_in_fused=m.ds41_fuse && i>0 && !(engram_on && geom::is_engram(ids[i]));
     const std::string note=ds41::synthetic_note(m.ds41_plan);
     if(!note.empty()) fprintf(stderr,"# rank %d: %s\n",rank,note.c_str());
-    // PLAN step 9: with Engram off the layers that carry it (1, 14) serve wrong logits -- every row from such a run is "diag", never a quality gate
+    // With Engram off the layers that carry it (1, 14) serve wrong logits -- every row from such a run is "diag", never a quality gate
     if(!engram_on) for(int l:ids) if(geom::is_engram(l)) {
         fprintf(stderr,"# rank %d: DIAG: Engram is off (layer %d carries it) -- logits are wrong by design; label every row from this run \"diag\"\n",rank,l);
         break;
     }
     if(engram_on) {
-        // B11: the Engram engine. Fail closed on a missing or corrupt sidecar, a wrong rank/tp or a wrong cmap sha (docs/DEEPSEEK-ENGRAM.md)
+        // The Engram engine. Fail closed on a missing or corrupt sidecar, a wrong rank/tp or a wrong cmap sha (docs/DEEPSEEK-ENGRAM.md)
         m.win=dmalloc<int32_t>((size_t)prefill_rows*4); m.ehist=dmalloc<int32_t>((size_t)m.ds_slots*ENG_RING);
         ds41::engram::Config ec; std::string eerr;
         ec.prefix=ek.prefix; ec.rank=rank; ec.nr=g6nr::NR; ec.max_rows=prefill_rows; ec.knobs=ek;
@@ -257,7 +255,7 @@ inline void build_ds41(Model& m,int rank,const std::vector<int>& ids,const Find&
             if(!q.p||!q.bf16||q.nd!=2||q.shape[0]!=4||q.shape[1]!=HID||!k.p||!k.bf16||k.nd!=2||k.shape[0]!=4||k.shape[1]!=HID)
                 die("DS41 Engram: bad engram.q_weight / engram.k_weight (bf16 [4][5120]) of layer "+std::to_string(l));
             ec.q_w[e]=(const __nv_bfloat16*)q.p; ec.k_w[e]=(const __nv_bfloat16*)k.p;
-            if(prefill_rows>MX) {   // the wkv of W-row chunks goes through B4's tensor-core GEMM: the pack's MXFP8 pair [25600][6144] + [25600][192] (B3's form)
+            if(prefill_rows>MX) {   // the wkv of W-row chunks goes through the attention's tensor-core GEMM: the pack's MXFP8 pair [25600][6144] + [25600][192]
                 const TensorRef wc=find(lname(l,"engram.wkv.mx.codes")),ws=find(lname(l,"engram.wkv.mx.scales"));
                 if(wc.p&&ws.p) {
                     if(wc.nd!=2||wc.shape[0]!=ds41::engram::kKvDim||wc.shape[1]!=ds41::engram::kEmbDim||ws.nd!=2||ws.shape[0]!=ds41::engram::kKvDim||ws.shape[1]!=ds41::engram::kEmbDim/32)
@@ -277,7 +275,7 @@ inline void build_ds41(Model& m,int rank,const std::vector<int>& ids,const Find&
 inline void prepare_ds41(Model& m,int M,cudaStream_t st) {
     if(!ds41_prepare_rows_supported(M)) die("DS41 prepare: M outside 1..MX");
     const ds41::Table& table=ds41_table();
-    // B6's multi-tile MoE path covers M=9..32. Each op retains its own range check.
+    // The multi-tile MoE path covers M=9..32. Each op retains its own range check.
     head_for(m,M);
     for(int i=0;i<m.nl;++i) {
         if(table.prepare_attn) if(int e=table.prepare_attn(&m,i,M,(void*)st)) die("DS41 prepare_attn layer "+std::to_string(m.layers[i].l)+": code "+std::to_string(e));
@@ -296,7 +294,7 @@ inline void prepare_ds41_prefill(Model& m,int M,cudaStream_t st,int i0=0,int i1=
     }
 }
 
-// ---- the driver's own ops (Fn = int(void* model, int i, int rows, void* stream)) and the mHC ops (B7's ds_mhc kernels)
+// ---- the driver's own ops (Fn = int(void* model, int i, int rows, void* stream)) and the mHC ops (the ds_mhc kernels)
 inline bool ds41_b12_on(const Model& m,int rows) {
     return ::ds41::b12::on(m.ds41_b12_mhc,m.ds41_draft,rows,MX,m.hc_rows);
 }
@@ -336,10 +334,10 @@ inline void ds41_hc_prepare(Model& m,int i,bool ffn,int M,cudaStream_t st) {
         else ds_mhc::prepare<__nv_bfloat16>(ds41_buffers(m),w,M,HID,geom::RMS_EPS,m.hc_y,st);
     }
 }
-// F1 (GR8_DS_WAIT_K=1): the peers' tails are awaited by ONE CTA (k_wait_peers, the GLM / Flash pattern) ahead of the consume kernel, so the 80..160
-// CTAs of that kernel do not spin on the same three host-memory lines (B1 XTRACE: publish -> tails seen 86 us on the fused consume kernels vs 13 us on
-// the finish kernel, same payload). Returns the payload the Ds41Block must still wait for inside the kernel: 0 = already here (Ds41Block::wait skips).
-// Off (default): the block waits itself, as before. Call it right before the consume launch, in stream order.
+// GR8_DS_WAIT_K=1: the peers' tails are awaited by one CTA (k_wait_peers, the GLM / Flash pattern) ahead of the consume kernel, so the 80..160
+// CTAs of that kernel do not spin on the same three host-memory lines (with all of them spinning, publish -> tails seen took 86 us on the fused
+// consume kernels against 13 us on the finish kernel, same payload). Returns the payload the Ds41Block must still wait for inside the kernel: 0 = already here (Ds41Block::wait skips).
+// Off (default): the block waits itself. Call it right before the consume launch, in stream order.
 inline size_t ds41_consume_wait(Model& m,int c,int rows,cudaStream_t st) {
     const ds41::ConsumeWait w=ds41::consume_wait_mode(m.ds41_relay?2:m.ds41_waitk?1:0,rows,HID);   // host rule + test: ds41_wait.h
     if(w.kernel) glue::k_wait_peers<<<1,32,0,st>>>(m.f,m.stepp,c,w.kernel_payload,glue::ERR_AR);
@@ -376,16 +374,16 @@ inline void ds41_hc_consume_prepare_b_slice(Model& m,const Blk& blk,int next,boo
         else ds_mhc::consume_prepare<__nv_bfloat16>(b,blk,w,n,HID,geom::RMS_EPS,y,st);
     }
 }
-// F7: a consume of collective c through the gather (GR8_DS_PF_GATHER=1 and more than MX rows: a prefill chunk, never a decode step)
+// A consume of collective c through the gather (GR8_DS_PF_GATHER=1 and more than MX rows: a prefill chunk, never a decode step)
 inline bool ds41_gather_on(const Model& m,int rows) { return m.ds41_gsum && rows>MX; }
-// F7 k16: a decode consume (1..MX rows) of the main Model with GR8_DS_DEC_STAGE=1 reads the slots through the staged kernels (Ds41Staged)
+// A decode consume (1..MX rows) of the main Model with GR8_DS_DEC_STAGE=1 reads the slots through the staged kernels (Ds41Staged)
 inline bool ds41_stage_on(const Model& m,int rows) { return m.ds41_stage && rows<=MX; }
 inline Ds41DevBlock ds41_gather(Model& m,int c,int rows,cudaStream_t st) {
     glue::k_wait_peers<<<1,32,0,st>>>(m.f,m.stepp,c,(size_t)rows*HID*2,glue::ERR_AR);
     k_ds41_gather<<<dim3(HID/8/DS41_GATHER_T,rows),DS41_GATHER_T,0,st>>>(m.f,m.stepp,c,HID,m.ds41_gsum);
     return Ds41DevBlock{m.ds41_gsum,m.stepp};
 }
-// F10 GR8_DS_PF_RS=1: collective c of a `rows`-row step runs as RS+AG (ds41_rs.h rule; the host enqueue uses the same rule)
+// GR8_DS_PF_RS=1: collective c of a `rows`-row step runs as RS+AG (ds41_rs.h rule; the host enqueue uses the same rule)
 inline bool ds41_rs_on(const Model& m,int c,int rows) { return ::ds41::rs::on(m.ds41_rs_k>0,c,m.ds41_rs_k,rows,MX,g6nr::NR); }
 // the payload whose tail says collective c has arrived (Ds41Block's wait, the L2PF stop): Q rows under RS (each slice), else all rows
 inline size_t ds41_coll_payload(const Model& m,int c,int rows) {
@@ -395,7 +393,7 @@ inline void put_publish_rs(Model& m,const uint16_t* staging,int c,int rows,cudaS
     const int q=::ds41::rs::quarter(rows,g6nr::NR);
     k_put_publish_rs<<<16,128,0,st>>>(reinterpret_cast<const uint4*>(staging),m.f,m.stepp,c,rows,HID,q,::ds41::rs::slice_stride(q,(size_t)HID*2),m.tickets+c);
 }
-// F10 #8 GR8_DS_PF_DIRECT=1: this enqueue is an eager W-row prefill chunk whose send slots are flat [rows][HID] (ds41_dir_dst)
+// GR8_DS_PF_DIRECT=1: this enqueue is an eager W-row prefill chunk whose send slots are flat [rows][HID] (ds41_dir_dst)
 inline bool ds41_direct_chunk(const Model& m) { return m.ds41_direct && m.ds41_dchunk; }
 inline uint16_t* ds41_dir_dst(const Model& m,int c) { return reinterpret_cast<uint16_t*>(m.f.send+g6::fab_send_off(m.f,(int)(m.ds41_dseq&1),c)); }
 // the publish of layer exchange c (k: 0 attention, 1 MoE): RS layout (one slice per owner) or the plain copy. Direct chunk: the
@@ -410,19 +408,19 @@ inline void ds41_put_publish(Model& m,const uint16_t* staging,int c,int rows,cud
     else put_publish(m,staging,c,rows,st);
 }
 // RS+AG consume of c: wait the peers' slices, reduce my Q rows (-> device sum + the AG send slot, ring c_ag), wait the peers' AG payloads,
-// gather their rows into the device sum. The consumer reads the device sum (Ds41DevBlock), as the F7 gather.
+// gather their rows into the device sum. The consumer reads the device sum (Ds41DevBlock), as with the gather.
 inline Ds41DevBlock ds41_rs_consume(Model& m,int c,int rows,cudaStream_t st) {
     const int q=::ds41::rs::quarter(rows,g6nr::NR),cag=::ds41::rs::c_ag(m.ds41_rs_nc,c);
     const size_t pay=(size_t)q*HID*2;
     glue::k_wait_peers<<<1,32,0,st>>>(m.f,m.stepp,c,pay,glue::ERR_AR);
-    const size_t own_ss=ds41_direct_chunk(m) ? pay : ::ds41::rs::slice_stride(q,(size_t)HID*2);   // F10 #8: a flat slot's slices are Q rows apart
+    const size_t own_ss=ds41_direct_chunk(m) ? pay : ::ds41::rs::slice_stride(q,(size_t)HID*2);   // direct chunk: a flat slot's slices are Q rows apart
     k_rs_reduce<<<dim3(HID/8/DS41_GATHER_T,q),DS41_GATHER_T,0,st>>>(m.f,m.stepp,c,cag,HID,rows,q,own_ss,m.ds41_gsum,m.ds41_rs_tickets+c);
     glue::k_wait_peers<<<1,32,0,st>>>(m.f,m.stepp,cag,pay,glue::ERR_AR);
     k_rs_gather<<<dim3(HID/8/DS41_GATHER_T,q,g6nr::NR-1),DS41_GATHER_T,0,st>>>(m.f,m.stepp,cag,HID,rows,q,m.ds41_gsum);
     return Ds41DevBlock{m.ds41_gsum,m.stepp};
 }
-// F10: GR8_DS_PF_RS=1 on the main Model (g6m4.cu, after build_ds41): RS collectives 0..k-1, their AG collectives nc..nc+k-1 on the main
-// fabric (ncoll = nc + k), the AG publish tickets, the device sum (shared with the F7 gather; the consumes run one after another)
+// GR8_DS_PF_RS=1 on the main Model (g6m4.cu, after build_ds41): RS collectives 0..k-1, their AG collectives nc..nc+k-1 on the main
+// fabric (ncoll = nc + k), the AG publish tickets, the device sum (shared with the gather; the consumes run one after another)
 inline void ds41_rs_setup(Model& m,int rank,int nc,int k,bool rowshard=false,bool y_mxfp8=false) {
     if(HID%(8*DS41_GATHER_T)!=0) die("GR8_DS_PF_RS: HID must be a multiple of 1024");
     if(m.hc_rows<=MX) die("GR8_DS_PF_RS=1 needs GR8_DS_PREFILL_W > MX");
@@ -546,14 +544,14 @@ inline int ds41_op_publish_ffn(void* model,int i,int rows,void* stream) {
     dmark(DP_PUT_M,st);
     return 0;
 }
-// G6_L2PF (kernels/l2pf.cuh; defined after the MoE include below): window w of layer i's gate + shared-expert prefetch, ended when
-// collective c has arrived. A no-op unless launch_step_ds41 armed the prefetch (G6_L2PF set); never launches a kernel of the step.
+// GR8_L2PF (kernels/l2pf.cuh; defined after the MoE include below): window w of layer i's gate + shared-expert prefetch, ended when
+// collective c has arrived. A no-op unless launch_step_ds41 armed the prefetch (GR8_L2PF set); never launches a kernel of the step.
 inline void ds41_l2pf_window(Model& m,int w,int i,int c,int rows,cudaStream_t st);
 inline int ds41_op_consume_attn(void* model,int i,int rows,void* stream) {
     Model& m=*(Model*)model; cudaStream_t st=(cudaStream_t)stream;
     if(!ds41_hc_fits(m,rows)) return 1;
     dmark(DP_OTHER,st);
-    ds41_l2pf_window(m,l2pf::W_A,i,2*i,rows,st);          // G6_L2PF bit 8: this layer's gate + shared expert while the attention partials are awaited
+    ds41_l2pf_window(m,l2pf::W_A,i,2*i,rows,st);          // GR8_L2PF bit 8: this layer's gate + shared expert while the attention partials are awaited
     if(m.ds41_fuse) ds41_hc_consume_prepare(m,2*i,i,true,rows,st);
     else ds41_consume_plain(m,2*i,rows,st);
     dmark(DP_NORM_A,st);
@@ -563,7 +561,7 @@ inline int ds41_op_consume_ffn(void* model,int i,int rows,void* stream) {
     Model& m=*(Model*)model; cudaStream_t st=(cudaStream_t)stream;
     if(!ds41_hc_fits(m,rows)) return 1;
     dmark(DP_OTHER,st);
-    if(i+1<m.nl) ds41_l2pf_window(m,l2pf::W_M,i+1,2*i+1,rows,st);   // G6_L2PF bit 1: the next layer's gate + shared expert while the MLP partials are awaited
+    if(i+1<m.nl) ds41_l2pf_window(m,l2pf::W_M,i+1,2*i+1,rows,st);   // GR8_L2PF bit 1: the next layer's gate + shared expert while the MLP partials are awaited
     if(i+1<m.nl && m.layers[i+1].hc_in_fused) ds41_hc_consume_prepare(m,2*i+1,i+1,false,rows,st);
     else ds41_consume_plain(m,2*i+1,rows,st);
     dmark(DP_NORM_M,st);
@@ -588,10 +586,10 @@ inline int ds41_op_finish(void* model,int i,int rows,void* stream) {
 inline int ds41_op_head_local(void* model,int,int rows,void* stream) { launch_head_local(*(Model*)model,rows,(cudaStream_t)stream); return 0; }
 inline int ds41_op_head_merge(void* model,int,int rows,void* stream) { launch_head_merge(*(Model*)model,rows,(cudaStream_t)stream); return 0; }
 inline int ds41_op_step_out(void* model,int,int rows,void* stream) { launch_step_out(*(Model*)model,rows,(cudaStream_t)stream); return 0; }
-#include "../attn/ds41_attn_ops.cuh"   // B4: ST_ATTN_PROJ / ST_ATTN_CORE / ST_ATTN_OUT, bind_attn, prepare_attn
-#include "../attn/ds41_idx_ops.cuh"     // B5: ST_CA_ROW / ST_INDEX_TOPK / ST_INDEX_BORROW / ST_CAND_BLOCKS; ds41_idx_bind / _prepare are called by B4's bind/prepare
-#include "../kernels/ds41_moe_ops.cuh"   // B6: ST_ROUTER / ST_SHARED / ST_EXPERTS, bind_moe, prepare_moe
-#include "ds41_dspark_ops.cuh"   // B12: ST_DS_*, draft-layer attention dispatch (overrides B4's ATTN slots for layers >= 40)
+#include "../attn/ds41_attn_ops.cuh"   // attention: ST_ATTN_PROJ / ST_ATTN_CORE / ST_ATTN_OUT, bind_attn, prepare_attn
+#include "../attn/ds41_idx_ops.cuh"     // indexer: ST_CA_ROW / ST_INDEX_TOPK / ST_INDEX_BORROW / ST_CAND_BLOCKS; ds41_idx_bind / _prepare are called by the attention bind/prepare
+#include "../kernels/ds41_moe_ops.cuh"   // MoE: ST_ROUTER / ST_SHARED / ST_EXPERTS, bind_moe, prepare_moe
+#include "ds41_dspark_ops.cuh"   // DSpark: ST_DS_*, draft-layer attention dispatch (overrides the attention slots for layers >= 40)
 
 // ---- bounded replay (runtime/ds41_pf_split.h): ST_PF_COMPACT, the last op of range A of a prefill chunk
 // rows [rows - late, rows) of a [rows][row_bytes] device array -> rows [0, late). Copies of at most rows - late rows, ascending, never overlap
@@ -606,7 +604,7 @@ inline void ds41_rows_shift(void* base,size_t row_bytes,int rows,int late,cudaSt
     }
 }
 // Moves the per-row state range B reads and range A made: the trunk, the mHC coefficients and hc_y of layer 21's prepare (fused into
-// consume_ffn(20)), pos / tok / tgt, and B5's layer-20 top-k and candidate lists. late = Model::ds41_pf_late (the hook sets it); late == rows
+// consume_ffn(20)), pos / tok / tgt, and the indexer's layer-20 top-k and candidate lists. late = Model::ds41_pf_late (the hook sets it); late == rows
 // (tail >= rows) moves nothing. Engram's token window (layers 1, 14) and the MoE / attention scratch are not read across the boundary.
 inline int ds41_op_pf_compact(void* model,int,int rows,void* stream) {
     Model& m=*(Model*)model; cudaStream_t st=(cudaStream_t)stream;
@@ -634,12 +632,12 @@ inline int ds41_op_pf_compact(void* model,int,int rows,void* stream) {
     return 0;
 }
 
-// G6_L2PF for the DS41 main-model step (the GLM step's l2pf_window, rank.cuh): layer i's queue holds, in the order the step reads them,
+// GR8_L2PF for the DS41 main-model step (the GLM step's l2pf_window, rank.cuh): layer i's queue holds, in the order the step reads them,
 // q_a + kv (T_XIN), q_b (T_QB), the gate (T_ROUTER) and the shared expert (T_SHARED). The MLP window (W_M, issued in layer i-1's MLP wait)
 // starts at T_XIN: the attention projections; the attention window (W_A, layer i's own attention wait) starts at T_ROUTER: gate + shared
-// expert. Each window continues where the layer's earlier one stopped (state keyed by the layer index). G6_L2PF_T picks the targets (bit =
-// l2pf::T_*: 0x05 attention only, 0xc0 gate + shared only = the first version of this patch). It forks a side stream (l2pf::window), issues paced
-// cp.async.bulk.prefetch.L2 until collective c's peer tails arrive or the window's budget (G6_L2PF_US[w], G6_L2PF_MB) is spent,
+// expert. Each window continues where the layer's earlier one stopped (state keyed by the layer index). GR8_L2PF_T picks the targets (bit =
+// l2pf::T_*: 0x05 attention only, 0xc0 gate + shared only). It forks a side stream (l2pf::window), issues paced
+// cp.async.bulk.prefetch.L2 until collective c's peer tails arrive or the window's budget (GR8_L2PF_US[w], GR8_L2PF_MB) is spent,
 // and is joined once at the end of launch_step_ds41. Only between l2pf::arm and l2pf::join (launch_step_ds41).
 inline void ds41_l2pf_window(Model& m,int w,int i,int c,int rows,cudaStream_t st) {
     const l2pf::Cfg& g=l2pf::cfg();
@@ -650,17 +648,17 @@ inline void ds41_l2pf_window(Model& m,int w,int i,int c,int rows,cudaStream_t st
         ds41l2pf::add_attn(P,W.wq_a.gv,W.wq_a.N,W.wq_a.K,W.wkv.gv,W.wkv.N,W.wkv.K,W.wq_b.gv,W.wq_b.N,W.wq_b.K);
     }
     ds41moe::l2pf_add(m,i,P);
-    l2pf::Stop s; s.f=m.f; s.c=c; s.payload=ds41_coll_payload(m,c,rows); s.stepp=m.stepp;   // as Ds41Block's wait: the tail sits after rows*HID*2 bytes (F10 RS: Q*HID*2)
+    l2pf::Stop s; s.f=m.f; s.c=c; s.payload=ds41_coll_payload(m,c,rows); s.stepp=m.stepp;   // as Ds41Block's wait: the tail sits after rows*HID*2 bytes (RS: Q*HID*2)
     l2pf::window(w,w==l2pf::W_M ? l2pf::T_XIN : l2pf::T_ROUTER,i,P,s,st);
 }
 
-// The op table. A null slot is a stage nobody has written yet: the step stops there (NOTSUP) and says whose it is
+// The op table. A null slot is a stage this build lacks: the step stops there (NOTSUP) and names its owner
 // (ds41::stage_owner). To fill a slot: include the owner's ops header at the marked line below and set the slot. Every op reads
 // its input from Model::hc_y (the sub-layer input row, BF16 [rows][HID]) and writes its output to Model::sc.part[0] (attention)
-// or Model::sc.part[1] (MoE), a BF16 [rows][HID] partial of this rank; the publish and consume ops are the driver's and B7's.
-// F10 #8 GR8_DS_PF_DIRECT=1: the two producers of a layer's partials (K 0: ST_ATTN_OUT -> sc.part[0], c = 2i; K 1: ST_EXPERTS -> the MoE
+// or Model::sc.part[1] (MoE), a BF16 [rows][HID] partial of this rank; the publish and consume ops are the driver's and the mHC's.
+// GR8_DS_PF_DIRECT=1: the two producers of a layer's partials (K 0: ST_ATTN_OUT -> sc.part[0], c = 2i; K 1: ST_EXPERTS -> the MoE
 // combine into sc.part[1], c = 2i+1), wrapped. On a direct chunk, sc.part[K] points at the pinned send slot of c while the op runs,
-// then back; the publish then only rings. The ops write sc.part[K] once, as their output (B4 / B6; no op reads it before).
+// then back; the publish then only rings. The ops write sc.part[K] once, as their output (attention / MoE; no op reads it before).
 inline ds41::Fn g_ds41_dir_inner[2]={};
 template<int K> inline int ds41_op_direct(void* model,int i,int rows,void* stream) {
     Model& m=*(Model*)model;
@@ -687,24 +685,24 @@ inline const ds41::Table& ds41_table() {
         t.fn[ds41::ST_HEAD_LOCAL]=&ds41_op_head_local;
         t.fn[ds41::ST_HEAD_MERGE]=&ds41_op_head_merge;
         t.fn[ds41::ST_STEP_OUT]=&ds41_op_step_out;
-        // B4 (attention A, engine/attn/ds41_attn_ops.cuh): layers 0..19; ST_CA_ROW at 2/8/14 is B5's fn, which calls ds41_attn_op_comp_row
+        // attention (engine/attn/ds41_attn_ops.cuh): layers 0..19; ST_CA_ROW at 2/8/14 is the indexer's fn, which calls ds41_attn_op_comp_row
         t.fn[ds41::ST_ATTN_PROJ]=&ds41_attn_op_proj;
         t.fn[ds41::ST_ATTN_CORE]=&ds41_attn_op_core;
         t.fn[ds41::ST_ATTN_OUT]=&ds41_attn_op_out;
-        t.bind_attn=&ds41_attn_bind;          // the ONE writer of both slots; it calls B5's ds41_idx_bind / ds41_idx_prepare at its end
+        t.bind_attn=&ds41_attn_bind;          // the one writer of both slots; it calls the indexer's ds41_idx_bind / ds41_idx_prepare at its end
         t.prepare_attn=&ds41_attn_prepare;
-        // B5 (attention B, engine/attn/ds41_idx_ops.cuh)
+        // indexer (engine/attn/ds41_idx_ops.cuh)
         t.fn[ds41::ST_CA_ROW]=&ds41_idx_op_ca_row;
         t.fn[ds41::ST_INDEX_TOPK]=&ds41_idx_op_index_topk;
         t.fn[ds41::ST_INDEX_BORROW]=&ds41_idx_op_index_borrow;
         t.fn[ds41::ST_CAND_BLOCKS]=&ds41_idx_op_cand_blocks;
-        // B6 (MoE, engine/kernels/ds41_moe_ops.cuh): ST_ROUTER, ST_SHARED, ST_EXPERTS; per-layer state behind Layer::ds41_moe via bind_moe / prepare_moe
+        // MoE (engine/kernels/ds41_moe_ops.cuh): ST_ROUTER, ST_SHARED, ST_EXPERTS; per-layer state behind Layer::ds41_moe via bind_moe / prepare_moe
         ds41moe::fill(t);
-        // B11 (Engram, engine/runtime/ds41_engram_ops.cuh): the op answers NOTSUP when GR8_DS_ENGRAM=0 (plan(engram=false) never reaches it)
+        // Engram (engine/runtime/ds41_engram_ops.cuh): the op answers NOTSUP when GR8_DS_ENGRAM=0 (plan(engram=false) never reaches it)
         t.fn[ds41::ST_ENGRAM]=&ds41_op_engram;
-        // B12 (DSpark): ST_DS_TAP, ST_DS_MAIN (main model); ST_DS_DRAFT_IN, ST_DS_HEAD_LOCAL, ST_DS_MARKOV (draft model); also wraps ST_ATTN_* (after B4/B6)
+        // DSpark: ST_DS_TAP, ST_DS_MAIN (main model); ST_DS_DRAFT_IN, ST_DS_HEAD_LOCAL, ST_DS_MARKOV (draft model); also wraps ST_ATTN_* (after the attention / MoE fills)
         ds41dsp_ops::fill(t);
-        // F10 #8: wrap whatever B4 / B6 / B12 put in the two producer stages (ds41_op_direct passes through off a direct chunk)
+        // GR8_DS_PF_DIRECT: wrap whatever the attention / MoE / DSpark fills put in the two producer stages (ds41_op_direct passes through off a direct chunk)
         if((g_ds41_dir_inner[0]=t.fn[ds41::ST_ATTN_OUT])) t.fn[ds41::ST_ATTN_OUT]=&ds41_op_direct<0>;
         if((g_ds41_dir_inner[1]=t.fn[ds41::ST_EXPERTS])) t.fn[ds41::ST_EXPERTS]=&ds41_op_direct<1>;
         t.fn[ds41::ST_PF_COMPACT]=&ds41_op_pf_compact;   // bounded replay: only in a split prefill plan (ds41_pf_split.h)
@@ -713,8 +711,8 @@ inline const ds41::Table& ds41_table() {
     return table;
 }
 
-// ---- first-light diagnostics (both off unless their env var is set; M must be 6 = the oracle's p6 rows; eager steps only)
-// GR8_DS_FEED_DIR=<B2 oracle dir, p6-faithful>: TEACHER FORCING. Before the attention stage of every layer the trunk and the mHC state are
+// ---- oracle diagnostics (both off unless their env var is set; M must be 6 = the oracle's p6 rows; eager steps only)
+// GR8_DS_FEED_DIR=<oracle dir, p6-faithful>: teacher forcing. Before the attention stage of every layer the trunk and the mHC state are
 // overwritten with the oracle's (x_in -> resid4, attn_in -> hc_y, attn_pre/post/comb -> hc_pre/post/comb); before the MLP stage the same
 // with resid_attn / ffn_in / ffn_* . Each stage then runs on the oracle's input, so its output (residual slots 2i+1, 2i+2) is that stage's own
 // error, not chain drift. Compare resid_attn with the faithful arm, resid with the w4a16 arm (the engine MoE is W4A16).
@@ -819,7 +817,7 @@ inline void ds41_unit_run(Model& m,ds41::Unit u,int ui,int M,cudaStream_t st) {
 }
 // Every caller of a unit goes through here: launch_step_ds41 (the g6m4 decode) and the per-unit wrappers in rank.cuh that m4sim drives
 // (launch_attention / launch_consume / launch_mlp_block). The three diagnostics hook at unit boundaries, so they see both paths, and the
-// feed of a stage sits at the START of the stage's first unit (after the residual-slot copy that follows the previous consume).
+// feed of a stage sits at the start of the stage's first unit (after the residual-slot copy that follows the previous consume).
 // Off (no env var): one predictable branch, nothing else.
 inline bool ds41_diag_any() { return ds41_feed_dir() || ds41_subdump_dir() || ds41_span_on(); }
 inline void ds41_unit(Model& m,ds41::Unit u,int ui,int M,cudaStream_t st) {
@@ -844,7 +842,7 @@ inline void launch_step_ds41(Model& m,int M,int context,cudaStream_t st,int part
     if(part!=1) ep.n=0;
     ep.rec=ep.every>0;
     if(ep.rec || knob::dec_prof()) g6_attn_mark=attn_mark;
-    l2pf::arm();                      // G6_L2PF: the consume ops' windows may fork; joined at the end of this part (a no-op when G6_L2PF is unset)
+    l2pf::arm();                      // GR8_L2PF: the consume ops' windows may fork; joined at the end of this part (a no-op when GR8_L2PF is unset)
     if(part!=1) {
         dmark(DP_OTHER,st);
         ds41_unit(m,ds41::U_STEP_IN,0,M,st);

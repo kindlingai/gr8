@@ -1,13 +1,13 @@
 // DS41 two-lane W prefill (GR8_DS_PF_LANES=2, the GLM pf_step2s port), host-only (no CUDA): the contract the callee (g6m4.cu) is built
-// from and engine/tests/test_ds41_lanes.cpp checks. Unset / "1" = today's single lane, byte for byte (nothing here runs).
+// from and engine/tests/test_ds41_lanes.cpp checks. Unset / "1" = one lane (nothing here runs).
 //
-// A quantum of up to 2W rows of ONE session (scheduler.h two_lanes) is two chunks: lane A = the first min(rows, W) rows on the Model m,
-// stream st and the MAIN fabric (one id of Dispatch's main sequence); lane B = the rest on a second Model view mB, its own stream and its
-// own fabric (its own sequence counter). Both lanes walk the SAME op list (split.ops of one non-final plan).
+// A quantum of up to 2W rows of one session (scheduler.h two_lanes) is two chunks: lane A = the first min(rows, W) rows on the Model m,
+// stream st and the main fabric (one id of Dispatch's main sequence); lane B = the rest on a second Model view mB, its own stream and its
+// own fabric (its own sequence counter). Both lanes walk the same op list (split.ops of one non-final plan).
 //
 // Shared state: the attention scratch / split / prefill ring are process-wide singletons (attn/ds41_attn_ops.cuh), the Engram engine's
 // scratch is one engine, the DSpark main scratch + key rings are one, and the KV / compressed caches are the same session's. So the
-// stages that touch them (serial()) run as SECTIONS in one token chain: A(s) before B(s) before A(s') for every later section s'. The
+// stages that touch them (serial()) run as sections in one token chain: A(s) before B(s) before A(s') for every later section s'. The
 // prologue (h2d copies + the Engram token ring update) is the first link. Everything else of the two lanes may overlap.
 // schedule() turns the two lanes' op runs into the host enqueue order with one event per chain link; check() is the happens-before /
 // data-flow checker over that order and the per-stage access table below (the buffer class table, as data).
@@ -82,7 +82,7 @@ inline std::vector<Run> lane_runs(const br::Split& sp, int rows, int late, bool 
 enum Kind : int { K_PRO, K_OPS, K_SEC, K_JOIN };
 // One enqueue of the host order. lane 0 = A (stream st), 1 = B. K_PRO = the lane's prologue (h2d copies, prepare, fabric enqueue_step,
 // Engram begin); K_OPS / K_SEC = ds41::run(ops, b, e, rows) (K_SEC: only serial() stages); K_JOIN = lane A waits lane B's end.
-// wait: cudaStreamWaitEvent(lane's stream, event[wait]) BEFORE the enqueue; record: cudaEventRecord(event[record], lane's stream) AFTER.
+// wait: cudaStreamWaitEvent(lane's stream, event[wait]) before the enqueue; record: cudaEventRecord(event[record], lane's stream) after.
 // key: the chain position of a K_PRO (-1) / K_SEC (its first op index); -2 otherwise.
 struct Seg { int lane = 0; Kind kind = K_OPS; size_t b = 0, e = 0; int rows = 0, win_floor = 0; long key = -2; int wait = -1, record = -1; };
 struct Schedule { std::vector<Seg> seg; int events = 0; };
@@ -150,7 +150,7 @@ enum Buf : int
     BF_HCY,       // hc_y: the sub-layer input
     BF_PART,      // sc.part[0..1]: this rank's partial before the publish
     BF_MOE,       // MoE RoScratch / PwScratch (per Model: scratch_of)
-    BF_FAB,       // fabric send / recv slots, tickets, relay word (per FABRIC)
+    BF_FAB,       // fabric send / recv slots, tickets, relay word (per fabric)
     BF_IDX_LIST,  // the indexer top-512 list (Ds41IdxModel::topk), read by later layers
     BF_IDX_CAND,  // the layer-20 candidate blocks (Ds41IdxModel scratch), read by the index sources 24..36
     BF_ENG_STEP,  // Engram per-step ids / stage / fork / done / jobs (begin_step -> op)
@@ -397,7 +397,7 @@ inline std::string check(const std::vector<Op>& ops, const Schedule& s, const La
 }
 
 // ---------------------------------------------------------------- lane B's fabric and sequence
-// Lane B's slot table: the main table without the C8-pack late slots (Legate ruling b, 29 Oct): a ragged pack is never a lane-B chunk.
+// Lane B's slot table: the main table without the C8-pack late slots: a ragged pack is never a lane-B chunk.
 inline pf::FabricRuns fabric_runs_b(int pf_rows, int tail, int i_late, int nl, int nx, int mx, int hid, int nr, size_t head_payload, bool rs_on, bool rowshard = false)
 {
     return pf::fabric_runs(pf_rows, tail, i_late, nl, nx, mx, hid, nr, head_payload, rs_on, false, rowshard);
@@ -407,7 +407,7 @@ struct B12Job {
     uint32_t state_bytes = 0;
     rs::Job job;
 };
-// The same per-chunk B12 fabric contract on lane A and lane B. Ragged/short chunks stay unsharded.
+// The same per-chunk row-shard fabric contract on lane A and lane B. Ragged/short chunks stay unsharded.
 inline B12Job b12_job(const std::vector<uint32_t>& sizes, const std::vector<int>& order,
                      int nc, int rs_k, int rows, int late, int nr, size_t row_bytes,
                      int hid, size_t trunk_bytes, bool rowshard_on, bool y_mxfp8, bool skip_late)

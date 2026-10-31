@@ -1,4 +1,4 @@
-// F10 GPU gate of the DS41 prefill RS+AG kernels (GR8_DS_PF_RS=1, runtime/ds41_rs.cuh). One GPU plays all NR ranks: each rank has its own
+// GPU gate of the DS41 prefill RS+AG kernels (GR8_DS_PF_RS=1, runtime/ds41_rs.cuh). One GPU plays all NR ranks: each rank has its own
 // pinned fabric region (the real slot layout, fab_slot_layout; send, recv, doorbell, error word) and its own device sum. The host plays the
 // proxies exactly as fabric.cpp does: after doorbell c, peer p gets slice p (send + p ss, Q H 2 bytes) + the seq tail written right after
 // it, into its recv slot (c, me) at offset 0; after doorbell c_ag, every peer gets the AG payload + tail. Then:

@@ -1,5 +1,5 @@
-// DSpark round runner for the DS41 serve (B12): the Step::DRAFT / Step::CHAIN branch of serve_ds41's launch hook (s2/ds41_native.cuh).
-// No s2_batch.h change: Batch's MTP flow (sc.mtp = k) already runs MAIN verify (k + 1 rows) -> ONE DRAFT step -> CHAIN steps j = 1..k-1.
+// DSpark round runner for the DS41 serve: the Step::DRAFT / Step::CHAIN branch of serve_ds41's launch hook (s2/ds41_native.cuh).
+// No s2_batch.h change: Batch's MTP flow (sc.mtp = k) already runs MAIN verify (k + 1 rows) -> one DRAFT step -> CHAIN steps j = 1..k-1.
 // DSpark drafts all 5 tokens in one block pass, so the DRAFT step runs the block and the CHAIN steps only hand out the cached drafts:
 //   DRAFT  rows are the accepted rows of the verify (or a prompt chunk): Row{tok = next token, pos}. The last row is the round's end: q = its pos
 //          (last accepted position), golden = its tok (the token at q + 1), accepted = M - 1 (the row index of the verify chunk). The host
@@ -8,7 +8,7 @@
 //   CHAIN  one row, pos = q + j, tok = d[j] = draft[j - 1]; returns d[j + 1] = draft[j]. Nothing is launched.
 //   A prompt chunk's first-form draft (Batch::prompt: round id -1, event ROUND) is skipped: the main steps fill the draft layers' key rings
 //   (ST_DS_MAIN), the block only runs for the last chunk (event TAIL) and for rounds / forced chunks (round id >= 0).
-// After the accept and before the next main step the main Model's compressor state needs ds41_attn_comp_commit_all (B12-comp-commit.patch):
+// After the accept and before the next main step the main Model's compressor state needs ds41_attn_comp_commit_all (ds41_attn_ops.cuh):
 // the round calls it through Ds41Dspark::comp_commit.
 // The host rules (q / golden / acc, the prompt-draft skip, what DRAFT and CHAIN return, the fail-closed checks) are in ds41_dspark_round_logic.h,
 // which a CPU test runs against the real s2::Batch (tests/batch_ds41_dspark_test.cpp); this file adds the CUDA parts.
@@ -70,7 +70,7 @@ public:
     Ds41Round& operator=(const Ds41Round&) = delete;
     ~Ds41Round() { cudaFreeHost(hin_); cudaFreeHost(hout_); }
 
-    // a new request at position 0: the cached drafts are stale and the draft layers' key rings start empty (the draft step counter is NOT reset:
+    // a new request at position 0: the cached drafts are stale and the draft layers' key rings start empty (the draft step counter is not reset:
     // the draft fabric's steps stay consecutive)
     void reset() {
         logic_[0].reset();

@@ -1,9 +1,9 @@
-// B12 row-sharded mHC prefill host rules. No CUDA: the CPU reference test uses these exact guards/offsets.
+// Row-sharded mHC prefill host rules. No CUDA: the CPU reference test uses these exact guards/offsets.
 #pragma once
 #include "ds41_rs.h"
 #include <cstddef>
 namespace ds41::rowshard {
-// First source cut is deliberately limited to the ruled 4096/1024-row geometry and 128-row replay tail.
+// Supported only for the 4096-row width (1024 rows per rank at NR 4) and the 128-row replay tail.
 inline bool boot_ok(int width, int tail, int nr, bool rs, bool fuse) {
     return width == 4096 && tail == 128 && nr == 4 && rs && fuse;
 }

@@ -15,7 +15,7 @@
 //   BF16-trunk run bit for bit: the trunk widened to FP32 (exact), mix / pre / post / comb, y, out, xpre, and the head fragment table words. The
 //   claim under test is "the BF16 trunk is bit-identical" (the trunk only ever holds BF16-valued numbers); the gate is every trunkcmp line yes.
 //   A line "trunkcmp chain M=<m> us_row_f32=<> us_row_bf16=<> speedup=<>" sums the six chain ops (embed .. finish): the BF16 trunk's measured gain.
-//   finish_row0 (nothing in the engine calls it yet): finish with grid 1 and row0 = M-1 equals row M-1 of the full finish: out, xpre and
+//   finish_row0 (the engine passes only row0 = 0): finish with grid 1 and row0 = M-1 equals row M-1 of the full finish: out, xpre and
 //   the fragment row 0 of tile 0 against fragment row (M-1)%8 of tile (M-1)/8; pad rows 1..7 are zero; tile 1 is untouched.
 //   finish_frag: the head fragment table holds the BF16 pairs of out at the Xfrag index, pad rows to a multiple of 8 are zero, the tiles
 //   past ceil(M/8) are untouched.
@@ -264,7 +264,7 @@ int main(int argc, char** argv) {
             for (int m = 0; m < M; ++m) ds_mhc::consume(B.row(m), flash_mhc::Fp32Block{dblk[0] + (size_t)m * H}, 1, H, 0);
             return [&] { ds_mhc::consume(A.b, flash_mhc::Fp32Block{dblk[0]}, M, H, 0); };
         });
-        // ---- prepare sub-layer 1, then the fused consume(block 1) + prepare sub-layer 2 (the prepare itself is not reported, as before; its
+        // ---- prepare sub-layer 1, then the fused consume(block 1) + prepare sub-layer 2 (the prepare itself is not reported; its
         // result is checked through consume_prepare, which reads what it wrote)
         run("consume_prepare", T_STREAMS | T_STATE | T_Y, false, true, [&](auto& A, auto& B) -> std::function<void()> {
             ds_mhc::prepare<float>(A.b, W[1], M, H, eps, A.y, 0);
@@ -280,7 +280,7 @@ int main(int argc, char** argv) {
             for (int m = 0; m < M; ++m) ds_mhc::prepare<__nv_bfloat16>(B.row(m), WB[0], 1, H, eps, B.y + (size_t)m * H, 0);
             return [&] { ds_mhc::prepare<__nv_bfloat16>(A.b, WB[0], M, H, eps, A.y, 0); };
         });
-        // ---- finish_row0 (prefill stage C): grid 1, row0 = M-1, store=false so the state stays for the full finish. One-row outputs.
+        // ---- finish_row0: grid 1, row0 = M-1, store=false so the state stays for the full finish. One-row outputs.
         const size_t tile_words = (size_t)(H / 16) * 64;
         __nv_bfloat16 *out1F = dev<__nv_bfloat16>(H), *xpre1F = dev<__nv_bfloat16>(H), *out1B = dev<__nv_bfloat16>(H), *xpre1B = dev<__nv_bfloat16>(H);
         unsigned *frag1F = dev<unsigned>(2 * tile_words), *frag1B = dev<unsigned>(2 * tile_words);   // tile 1 = untouched check
