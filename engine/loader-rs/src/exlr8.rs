@@ -29,6 +29,8 @@ pub const FP8_BLOCK: i64 = 4;
 pub const FP8_ROW: i64 = 5;
 pub const BF16: i64 = 6;
 pub const FP32: i64 = 7;
+/// FP8 E4M3 with one E8M0 scale per 32 x 32 block (DeepSeek-V4.1's dense matrices, stored as the source has them)
+pub const FP8_B32: i64 = 8;
 /// record field 4: the sharded side
 pub const SIDE_REPLICATED: i64 = 0;
 pub const SIDE_OUT: i64 = 1;
@@ -39,7 +41,7 @@ pub fn data_tensors(fmt: i64) -> &'static [&'static str] {
     match fmt {
         TRELLIS => &["trellis", "suh", "svh"],
         INT4 => &["q4", "s4"],
-        MXFP8 => &["fp8", "e8m0"],
+        MXFP8 | FP8_B32 => &["fp8", "e8m0"],
         FP8_BLOCK | FP8_ROW => &["fp8", "scale"],
         BF16 => &["bf16"],
         FP32 => &["fp32"],
@@ -123,6 +125,13 @@ impl StFile {
         }
         let mut v = vec![0u8; len as usize];
         self.f.read_exact_at(&mut v, i.start + off).map_err(|e| format!("{}: {name}: {e}", self.path))?;
+        Ok(v)
+    }
+
+    /// `len` bytes from the absolute file offset `at`.
+    pub fn read_at(&self, at: u64, len: u64) -> Result<Vec<u8>, String> {
+        let mut v = vec![0u8; len as usize];
+        self.f.read_exact_at(&mut v, at).map_err(|e| format!("{}: at {at}: {e}", self.path))?;
         Ok(v)
     }
 
