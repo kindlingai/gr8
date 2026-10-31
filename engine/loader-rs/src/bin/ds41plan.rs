@@ -88,6 +88,8 @@ fn run() -> Result<(), String> {
     if ejson {
         print!("{}", ds41::engram_json(eg, nr, rank));
     }
+    // the engine's load path (posix_fadvise) is Linux-only
+    #[cfg(target_os = "linux")]
     if load {
         use std::os::raw::c_void;
         use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -137,7 +139,11 @@ fn run() -> Result<(), String> {
         let (b, nz) = (cnt.bytes.load(Ordering::Relaxed), cnt.nonzero.load(Ordering::Relaxed));
         println!("load rank {rank} of {nr}: image {} bytes, sink got {b} bytes ({nz} nonzero), release read {} bytes, {} threads, {:.1} s (plan + load {:.1} s, {:.2} GB/s into the sink)",
                  st.image_bytes, st.read_bytes, st.threads, st.seconds, t1.elapsed().as_secs_f64(), b as f64 / 1e9 / st.seconds.max(1e-9));
+    }    #[cfg(not(target_os = "linux"))]
+    if load {
+        return Err("--load runs the engine's load path, which needs Linux".into());
     }
+
     if hash {
         let t1 = Instant::now();
         match &tensors {
