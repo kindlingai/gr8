@@ -104,7 +104,7 @@ static uint64_t run(Fabric& f, const std::vector<int>& members, int steps, int b
     for (int c = 0; c < nc; c++)
       for (int p = 0; p < nr; p++) {
         if (p == me) continue;
-        volatile uint64_t* slot = (volatile uint64_t*)(d.recv + (((size_t)par * nc + c) * nr + p) * d.stride);
+        volatile uint64_t* slot = (volatile uint64_t*)(d.recv + fab_recv_off(d, par, c, p));
         const unsigned long long want = coll_seq(s, c, nc);
         const auto t0 = std::chrono::steady_clock::now();
         for (long spin = 0; slot[bytes / 8] != want; spin++) {

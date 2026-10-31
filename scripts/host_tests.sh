@@ -18,6 +18,15 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engin
 "$T/steering_test" "$REPO/engine/runtime/tests/fixtures/steering_contract.json"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/fabric_mtu_test.cpp" -o "$T/fabric_mtu_test"
 "$T/fabric_mtu_test"
+# the proxy's collective order (engine/comms/fabric_order.h): a plan that publishes out of numeric order stalls without
+# Rs::order and passes with it; no order is the numeric loop
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_order_test.cpp" -o "$T/fabric_order_test"
+"$T/fabric_order_test"
+# slot runs and the compact recv area (fabric.h fab_slot_layout): one run is the old offsets, runs tile the region
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_runs_test.cpp" -o "$T/fabric_runs_test"
+"$T/fabric_runs_test"
+g++ -std=c++17 -O2 -Wall -Wextra -fsanitize=address,undefined -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_ring_runs_test.cpp" -o "$T/fabric_ring_runs_test"
+"$T/fabric_ring_runs_test"
 g++ -std=c++17 -O2 -Wall -fsanitize=address,undefined -I "$REPO/engine/comms" "$REPO/engine/comms/tests/relay_test.cpp" \
   -o "$T/relay_test"
 "$T/relay_test"

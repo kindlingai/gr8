@@ -51,13 +51,13 @@ __device__ __forceinline__ void st_release_sys(u64* p, u64 v)
 
 __device__ __forceinline__ char* send_slot(const g6::FabricDev& f, u64 step, int c)
 {
-    return f.send + ((size_t)(step & 1) * f.ncoll + c) * f.stride;
+    return f.send + g6::fab_send_off(f, (int)(step & 1), c);
 }
 // rank p's contribution to collective c: our own send slot for p == rank, else the recv slot p wrote into
 __device__ __forceinline__ const char* peer_slot(const g6::FabricDev& f, u64 step, int c, int p)
 {
     return p == f.rank ? send_slot(f, step, c)
-                       : f.recv + (((size_t)(step & 1) * f.ncoll + c) * f.nr + p) * f.stride;
+                       : f.recv + g6::fab_recv_off(f, (int)(step & 1), c, p);
 }
 
 // GR8_XTRACE (xtrace.h): globaltimer stamps into f.xt (device memory). f.xt == null (default) = no stamp.
