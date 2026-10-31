@@ -54,6 +54,10 @@ import wire  # noqa: E402
 
 log = logging.getLogger('g6s2shim')
 
+# The served model's identity. The defaults are GLM-5.3's; main() replaces them from --model-name, --vocab-size and --eos-ids
+# (the launcher passes DeepSeek-V4.1-Flash-1017's: 129280 ids, eos 1). VOCAB bounds every token id the shim passes on (the
+# engine indexes its embedding table with a prompt id and does not bound-check it); the hello reports all three.
+MODEL_NAME = 'glm-5.3-g6'
 EOS_IDS = [154820, 154827, 154829]
 VOCAB = 154880
 FLOOR = -9999.0   # logprob sent for -inf / nan (the front end clamps at the same value)
@@ -449,7 +453,7 @@ class Shim:
     # ---- socket side --------------------------------------------------------------------------------------------
     async def serve(self, reader, writer):
         await self.ready.wait()
-        hello = {'type': 'hello', 'version': 1, 'model': 'glm-5.3-g6',
+        hello = {'type': 'hello', 'version': 1, 'model': MODEL_NAME,
                  'max_model_len': self.max_model_len(), 'vocab_size': VOCAB,
                  'eos_ids': EOS_IDS, 'max_logprobs': self.max_logprobs()}
         if self.cfg['insert']:
@@ -484,7 +488,9 @@ class Shim:
         return min(self.a.max_logprobs, self.cfg['max_lp'])
 
     def max_model_len(self):
-        room = self.cfg['pool_rows'] - self.cfg['guard']
+        # DS41 reserves one fixed CAP slab per session; ready.s2 reports their
+        # aggregate pool. Other models share one pool, so capacity_slots=1.
+        room = self.cfg['pool_rows'] // self.a.capacity_slots - self.cfg['guard']
         return min(self.a.max_model_len, room) if self.a.max_model_len else room
 
     def submit(self, f, writer, mine):
@@ -728,6 +734,8 @@ class Shim:
                         text = fh.read()
                     if text.endswith('\n'):
                         self.cfg = parse_ready(text)
+                        if self.cfg['pool_rows'] % self.a.capacity_slots:
+                            raise ValueError('ready.s2 pool rows not divisible by --capacity-slots')
                         # g6m4 --grammar-dir: the head writes grammar.s2 before ready.s2
                         self.cfg['grammar'] = os.path.exists(f'{self.a.dir}/grammar.s2')
                         break
@@ -765,12 +773,32 @@ def write_atomic(path: str, body: bytes):
     os.rename(path + '.tmp', path)
 
 
+def set_model(name, vocab, eos_ids):
+    """-> error message or None. Sets the model identity the hello reports and the token id bound."""
+    global MODEL_NAME, VOCAB, EOS_IDS
+    if not name or not isinstance(vocab, int) or isinstance(vocab, bool) or vocab < 2:
+        return f'bad model identity: name {name!r}, vocab size {vocab!r}'
+    if not eos_ids or any(not isinstance(i, int) or isinstance(i, bool) or not 0 <= i < vocab for i in eos_ids):
+        return f'eos ids must be 1 or more token ids in 0..{vocab - 1}: {eos_ids!r}'
+    MODEL_NAME, VOCAB, EOS_IDS = name, vocab, list(eos_ids)
+    return None
+
+
+def id_list(text):
+    try:
+        return [int(x) for x in text.split(',') if x.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'want comma-separated token ids: {text!r}')
+
+
 async def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--dir', required=True, help="the head rank's engine --serve DIR (local)")
     ap.add_argument('--sock', default='/run/g6/engine.sock')
     ap.add_argument('--max-model-len', type=int, default=0,
-                    help='cap on prompt + max_tokens (0 = what the KV pool allows: pool_rows - guard, from ready.s2)')
+                    help='cap on prompt + max_tokens (0 = pool_rows / capacity_slots - guard, from ready.s2)')
+    ap.add_argument('--capacity-slots', type=int, default=1,
+                    help='number of fixed per-session capacity slabs in ready.s2 pool_rows (DS41 only; default 1 shared pool)')
     ap.add_argument('--sessions', type=int, default=8,
                     help='requests the engine decodes at once (its --s2-sessions, SESS; 1..8): metrics report it as the '
                          'concurrency of the KV cache')
@@ -782,7 +810,16 @@ async def main(argv=None):
     ap.add_argument('--ready-timeout', type=float, default=3600.0, help='wait this long for DIR/ready.s2')
     ap.add_argument('--cancel-timeout', type=float, default=60.0, help='answer abort if the engine sends no end line this long after CANCEL')
     ap.add_argument('--stall-timeout', type=float, default=900.0, help='error an admitted request after this long with no resp')
+    ap.add_argument('--model-name', default=MODEL_NAME, help="the hello's model (default GLM-5.3's)")
+    ap.add_argument('--vocab-size', type=int, default=VOCAB,
+                    help='token ids the engine takes (0..N-1): the hello vocab_size and the bound on prompt, insert and grammar ids')
+    ap.add_argument('--eos-ids', type=id_list, default=EOS_IDS, help="the hello's eos_ids, comma-separated")
     a = ap.parse_args(argv)
+    if a.capacity_slots < 1:
+        ap.error('--capacity-slots must be positive')
+    err = set_model(a.model_name, a.vocab_size, a.eos_ids)
+    if err:
+        ap.error(err)
     logging.basicConfig(level='INFO', format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     if ':' in a.dir:
         ap.error('--dir is the head rank\'s local directory')
