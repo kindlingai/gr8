@@ -1,0 +1,60 @@
+# DeepSeek-V4.1-Flash only: Engram, the n-gram table lookup of layers 1 and 14 (engine/engram). knobs/README.md
+# describes the fields.
+prefix: "GR8_DS"
+knobs:
+  GR8_DS_ENGRAM:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      1 runs Engram at layers 1 and 14: every step hashes the last four tokens of each row, reads this rank's table
+      rows from NVMe and adds the gated result to the trunk. It needs GR8_DS_ENGRAM_PREFIX. 0 skips Engram, and the
+      other GR8_DS_ENGRAM_ knobs are not read.
+  GR8_DS_ENGRAM_CACHE_MIB:
+    scope: local
+    kind: int
+    default: "4096"
+    values: "1..1048576"
+    doc: >-
+      Size in MiB of the host cache of Engram table rows, shared by both layers. It holds 256-byte rows, so 4096 MiB
+      holds 16 M rows.
+  GR8_DS_ENGRAM_IO_THREADS:
+    scope: local
+    kind: int
+    default: "32"
+    values: "1..1024"
+    doc: >-
+      Threads that read Engram table rows from NVMe. A decode step needs about 20 reads and a prefill chunk thousands;
+      64 reads a prefill chunk fastest.
+  GR8_DS_ENGRAM_LOOKAHEAD:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      1 starts a host thread that, during a solo prefill, reads the next chunk's layer 1 rows into the row cache
+      while the current chunk runs the later layers. It only warms the cache: the results do not change.
+  GR8_DS_ENGRAM_PREFIX:
+    scope: local
+    kind: path
+    unset: "no Engram tables; GR8_DS_ENGRAM=1 then stops the boot"
+    doc: >-
+      The path prefix of this rank's Engram files: PREFIX.engram.json (the manifest), PREFIX.engram.cmap (the token
+      map), and PREFIX.engram.L001.w8 / .s8 and PREFIX.engram.L014.w8 / .s8 (the rows and scales of this rank's
+      slice of each table).
+  GR8_DS_ENGRAM_VERBOSE:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      1 prints one line of row store numbers per layer and step on stderr: requests, cache hits, reads, bytes and
+      time.
+  GR8_DS_ENGRAM_WAYS:
+    scope: local
+    kind: int
+    default: "16"
+    values: "1..16"
+    doc: >-
+      Ways of the set-associative Engram row cache.

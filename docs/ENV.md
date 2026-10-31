@@ -63,6 +63,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_DRAFT_HEAD_TPC` | int | `1` | 1\|2\|4\|8\|16\|32 | With GR8_DRAFT_HEAD_I4 or GR8_DFL_HEAD_I4, the INT4 head GEMV's tiles per CTA. Its product with GR8_DRAFT_HEAD_KS must be at most 32. |
 | `GR8_DRAFT_LOGIT_DUMP` | path | unset |  | Every rank writes its vocab slice of the MTP first draft pass logits to this path plus .rank<R>. Needs --mtp and no --serve. |
 | `GR8_DRAFT_PAR` | int | 2 when serving DFlash2 with MTP, else 0 | 0..2 | S2 with DFlash2, a solo round runs the drafter step on its own CUDA stream under MTP's first form. 2 also puts drafting steps on a high-priority stream. Same bytes as serial. |
+| `GR8_DS_ENGRAM` | flag | `0` | 0\|1 | 1 runs Engram at layers 1 and 14: every step hashes the last four tokens of each row, reads this rank's table rows from NVMe and adds the gated result to the trunk. It needs GR8_DS_ENGRAM_PREFIX. 0 skips Engram, and the other GR8_DS_ENGRAM_ knobs are not read. |
 | `GR8_DTR` | flag | `1` |  | Uses the exlr8 release's dense trellis matrices (q_b, o_proj, the dense MLP) where a layer has them. 0 = the int4 or MXFP8 records, which the layer must then have. |
 | `GR8_DTR_NBFAST` | flag | `1` |  | Single-matrix dense trellis GEMVs whose group stride exceeds their block stride assign CTAs output block first instead of k part first. CTA order only. |
 | `GR8_DTR_NBFAST_OUT` | flag | `1` |  | As GR8_DTR_NBFAST, for single-matrix dense trellis GEMVs whose block stride is at least their group stride. |
@@ -250,6 +251,12 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_DEC_PROF` | flag | `0` |  | Measures decode stages with a synchronize at every mark and prints them per rank. Plain launches only, the engine stops with --graph. |
 | `GR8_DFL_DUMP` | path | unset |  | With --dflash, rank 0 writes every draft step's context features, drafts and committed tokens to this file, for engine/ref/dflash2_replay.py. |
 | `GR8_DRAFT_IN_DUMP` | path | unset |  | Rank 0 writes the inputs of every MTP first draft pass to this file. Needs --mtp and no --serve. |
+| `GR8_DS_ENGRAM_CACHE_MIB` | int | `4096` | 1..1048576 | Size in MiB of the host cache of Engram table rows, shared by both layers. It holds 256-byte rows, so 4096 MiB holds 16 M rows. |
+| `GR8_DS_ENGRAM_IO_THREADS` | int | `32` | 1..1024 | Threads that read Engram table rows from NVMe. A decode step needs about 20 reads and a prefill chunk thousands; 64 reads a prefill chunk fastest. |
+| `GR8_DS_ENGRAM_LOOKAHEAD` | flag | `0` | 0\|1 | 1 starts a host thread that, during a solo prefill, reads the next chunk's layer 1 rows into the row cache while the current chunk runs the later layers. It only warms the cache: the results do not change. |
+| `GR8_DS_ENGRAM_PREFIX` | path | no Engram tables; GR8_DS_ENGRAM=1 then stops the boot |  | The path prefix of this rank's Engram files: PREFIX.engram.json (the manifest), PREFIX.engram.cmap (the token map), and PREFIX.engram.L001.w8 / .s8 and PREFIX.engram.L014.w8 / .s8 (the rows and scales of this rank's slice of each table). |
+| `GR8_DS_ENGRAM_VERBOSE` | flag | `0` | 0\|1 | 1 prints one line of row store numbers per layer and step on stderr: requests, cache hits, reads, bytes and time. |
+| `GR8_DS_ENGRAM_WAYS` | int | `16` | 1..16 | Ways of the set-associative Engram row cache. |
 | `GR8_FABRIC_CONNECT_TRIES` | int | `1200` |  | Fabric TCP connect attempts, 100 ms apart. Raise it when ranks load at different speeds. |
 | `GR8_GLM53F_DRAFT_CACHE_DUMP` | path | unset |  | Flash with --mtp: each rank writes its draft cache pages before the first live draft to this path plus .s<seq>.r<rank>.bin. |
 | `GR8_GLM53F_KDA_STATE_DUMP` | path | unset |  | After each offline sequence, each rank writes the KDA S state and conv state of every layer to PATH.rank<R>. |
