@@ -14,6 +14,31 @@ constexpr unsigned kRelayCreditSignal = 32;    // one credit CQE retires this ba
 
 inline uint64_t relay_pad(uint64_t len) { return (len + 63) & ~63ull; }
 
+// One diagonal write as the origin posts it (fabric.cpp Impl::post) and the relay forwards it: a list of segments, in post order.
+// inl: the bytes ride inside the notice SEND (at most inline_max); else a ring chunk (RDMA write into the relay ring + a notice).
+// Every segment lands at its off, in this order (the relay forwards notices in arrival order on one QP). The last segment takes
+// the write's wr_id and signaled flag.
+// nsge 1: the payload [src, len) (len includes the tail when the tail follows the payload): inline if len <= inline_max, else
+//   chunks of kRelayChunk. nsge 2 (a flat reduce-scatter slice, Fabric::Rs::flat): payload sge 0 as nsge 1 does it but never last, then
+//   the 8-byte tail word sge 1 as one inline segment at off + len0, last.
+struct RelaySeg { uint64_t src; uint32_t len; uint64_t off; bool inl; bool last; };
+constexpr int kRelayPlanMax = 4097;   // a 32-bit payload in 1 MiB chunks (<= 4096) + the tail: every valid write fits
+inline int relay_plan(uint64_t off, const uint64_t* src, const uint32_t* len, int nsge, uint32_t inline_max, RelaySeg* out, int max) {
+  if (nsge < 1 || nsge > 2 || (nsge == 2 && len[1] > inline_max)) return -1;
+  int n = 0;
+  if (len[0] <= inline_max) { if (n >= max) return -1; out[n++] = RelaySeg{src[0], len[0], off, true, false}; }
+  else
+    for (uint32_t at = 0; at < len[0]; at += kRelayChunk) {
+      if (n >= max) return -1;
+      out[n++] = RelaySeg{src[0] + at, len[0] - at < kRelayChunk ? len[0] - at : kRelayChunk, off + at, false, false};
+    }
+  if (nsge == 2) { if (n >= max) return -1; out[n++] = RelaySeg{src[1], len[1], off + len[0], true, false}; }
+  out[n - 1].last = true;
+  return n;
+}
+// the send WRs a plan puts on the queue: a ring chunk is a write + a notice, an inline segment one notice
+inline int relay_plan_wrs(const RelaySeg* s, int n) { int w = 0; for (int i = 0; i < n; ++i) w += s[i].inl ? 1 : 2; return w; }
+
 // Positions are monotonic byte counts, and position % ring is the offset in the ring. done is the relay's credit: every
 // byte below it has been forwarded, so it may be overwritten.
 struct RelayOut {
