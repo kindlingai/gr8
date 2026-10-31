@@ -17,7 +17,9 @@
 // --tlbw KB runs every arm with G6_K1_TLBW's translation warm at that granule.
 //
 //   ptab_cold [--layers 20] [--M 1,2,4,8,20] [--pf-M 1024,4096] [--sets 24] [--passes 4] [--rounds 7] [--tlbw KB]
-//             [--no-prefill] [--no-decode] [--no-switch] [--first-block 4]
+//             [--no-prefill] [--no-decode] [--no-switch] [--first-block 4] [--arms pack,img-tab,...]
+// Memory: one pack image per layer (~952 MB at TP4), plus a scatter copy when a scatter arm runs and a block-major copy
+// when a bm arm runs. --arms picks which copies exist, so 30+ layers fit beside the other copies on a 128 GB box.
 // Exit: 0 all checks passed, 1 a check failed, 2 CUDA error / usage.
 #include <algorithm>
 #include <chrono>
@@ -344,6 +346,7 @@ int main(int argc, char** argv)
 {
     std::vector<int> Ms = {1, 2, 4, 8, 20}, PMs = {1024, 4096};
     int sets = 24, nlay = 20, passes = 4, rounds = 7, k4mod = 4, tlbw = 0, prefill = 1, decode = 1, dosw = 1, first_block = 4;
+    std::vector<int> arms;                       // --arms: the arms to build and run (default all); pack is always in
     for (int i = 1; i < argc; ++i)
     {
         const std::string a = argv[i];
@@ -356,6 +359,20 @@ int main(int argc, char** argv)
         else if (a == "--rounds") rounds = atoi(nx());
         else if (a == "--tlbw") tlbw = atoi(nx());
         else if (a == "--first-block") first_block = atoi(nx());
+        else if (a == "--arms")
+        {
+            for (const char* s = nx(); *s;)
+            {
+                const char* e = s;
+                while (*e && *e != ',') ++e;
+                const std::string nm(s, e);
+                int v = -1;
+                for (int k = 0; k < NARMS; ++k) if (nm == arm_name[k]) v = k;
+                if (v < 0) { printf("--arms: unknown arm %s\n", nm.c_str()); return 2; }
+                arms.push_back(v);
+                s = *e ? e + 1 : e;
+            }
+        }
         else if (a == "--no-prefill") prefill = 0;
         else if (a == "--no-decode") decode = 0;
         else if (a == "--no-switch") dosw = 0;
@@ -364,6 +381,11 @@ int main(int argc, char** argv)
     for (int M : Ms) if (M < 1 || M > G6_MX) { printf("M=%d outside 1..%d\n", M, G6_MX); return 2; }
     if (first_block < 0 || first_block + g6nr::EB > geom::EXP_BLOCKS) { printf("--first-block outside 0..%d\n", geom::EXP_BLOCKS - g6nr::EB); return 2; }
     if (tlbw && (tlbw & (tlbw - 1))) { printf("--tlbw must be a power of two (KB)\n"); return 2; }
+    if (arms.empty()) for (int v = 0; v < NARMS; ++v) arms.push_back(v);
+    if (std::find(arms.begin(), arms.end(), A_PACK) == arms.end()) arms.insert(arms.begin(), A_PACK);
+    auto has = [&](int v) { return std::find(arms.begin(), arms.end(), v) != arms.end(); };
+    const bool need_sct = has(A_SCT) || has(A_SCTPF), need_bm = has(A_BMT) || has(A_BML);
+    if (!need_bm) dosw = 0;
     CK(cudaSetDevice(0));
     CK(bind::init());
     CU(cuInit(0));
@@ -399,8 +421,8 @@ int main(int argc, char** argv)
             { printf("ptab::build: %s\n", e); exit(2); }
         };
         bld(L.img, ptab::IMAGE);
-        bld(L.sct, ptab::SCATTER);
-        build_bm(L, first_block, st, mem);
+        if (need_sct) bld(L.sct, ptab::SCATTER);
+        if (need_bm) build_bm(L, first_block, st, mem);
     }
     const double t_build = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_build0).count();
     // every layer's image table in ONE buffer (arm img-tab+L2: one persisting access-policy window over them)
@@ -411,10 +433,14 @@ int main(int argc, char** argv)
     for (int l = 0; l < nlay; ++l) CK(cudaMemcpy(tabs_l2 + tab_bytes * l, Ls[l].img.host.data(), tab_bytes, cudaMemcpyHostToDevice));
     {
         const SynLayer& L = Ls[0];
-        printf("layer: pack fc1 %.1f MB + fc2 %.1f MB = %.1f MB; block-major group fc1 %.2f MB (padded %.1f MB, waste %.2f MB) x %d, fc2 %.2f MB (padded %.1f MB, waste %.2f MB) x %d; table %zu entries = %zu KB; scatter slabs %.1f MB\n",
-               L.fc1_bytes / 1e6, L.fc2_bytes / 1e6, (L.fc1_bytes + L.fc2_bytes) / 1e6, L.grp1 / 1e6, L.bm1.gs / 1e6, (L.bm1.gs - L.grp1) / 1e6, g6nr::EB,
-               L.grp2 / 1e6, L.bm2.gs / 1e6, (L.bm2.gs - L.grp2) / 1e6, g6nr::EB, L.img.n(), tab_bytes >> 10, L.sct.slab_bytes / 1e6);
-        printf("pool: %.1f MB held in %zu chunks; build %.1f s\n", pool.held / 1e6, pool.chunks.size(), t_build);
+        printf("layer: pack fc1 %.1f MB + fc2 %.1f MB = %.1f MB; table %zu entries = %zu KB\n", L.fc1_bytes / 1e6, L.fc2_bytes / 1e6,
+               (L.fc1_bytes + L.fc2_bytes) / 1e6, L.img.n(), tab_bytes >> 10);
+        if (need_bm)
+            printf("block-major: group fc1 %.2f MB (padded %.1f MB, waste %.2f MB) x %d, fc2 %.2f MB (padded %.1f MB, waste %.2f MB) x %d\n",
+                   L.grp1 / 1e6, L.bm1.gs / 1e6, (L.bm1.gs - L.grp1) / 1e6, g6nr::EB, L.grp2 / 1e6, L.bm2.gs / 1e6, (L.bm2.gs - L.grp2) / 1e6, g6nr::EB);
+        if (need_sct) printf("scatter: %.1f MB of slabs per layer; pool %.1f MB held in %zu chunks\n", L.sct.slab_bytes / 1e6, pool.held / 1e6, pool.chunks.size());
+        printf("arms:"); for (int v : arms) printf(" %s", arm_name[v]);
+        printf("; build %.1f s; working set per arm %.1f GB (L2 %d MB)\n", t_build, (L.fc1_bytes + L.fc2_bytes) * nlay / 1e9, pr.l2CacheSize >> 20);
     }
     auto alloc = [&](size_t n) { void* p; CK(cudaMalloc(&p, n)); mem.push_back(p); return p; };
     const size_t xb = static_cast<size_t>(G6_MX) * HID * 2;
@@ -436,7 +462,7 @@ int main(int argc, char** argv)
     {
         size_t fr = 0, to = 0;
         CK(cudaMemGetInfo(&fr, &to));
-        printf("device memory in use %.2f GB of %.2f GB (%d layers x [pack + scatter + block-major] + scratch %.0f MB)\n", (to - fr) / 1e9, to / 1e9, nlay, sb / 1e6);
+        printf("device memory: %.2f GB free of %.2f GB (%d layers; scratch %.0f MB)\n", fr / 1e9, to / 1e9, nlay, sb / 1e6);
     }
 
     // the layer's tensors through arm v
@@ -536,7 +562,7 @@ int main(int argc, char** argv)
         const int M = Ms[0];
         std::vector<Bound> bs[NARMS];
         std::vector<uint8_t> ref, got;
-        for (int v = 0; v < NARMS; ++v) if (const char* e = make(M, v, bs[v])) { printf("make %s: %s\n", arm_name[v], e); return 2; }
+        for (int v : arms) if (const char* e = make(M, v, bs[v])) { printf("make %s: %s\n", arm_name[v], e); return 2; }
         plain(bs[A_PACK], M, A_PACK, ref);
         {
             size_t nz = 0;
@@ -544,8 +570,9 @@ int main(int argc, char** argv)
             printf("%s pack output nonzero %.1f%%\n", nz > ref.size() / 4 ? "PASS" : "FAIL", 200.0 * nz / ref.size());
             (nz > ref.size() / 4 ? g_pass : g_fail)++;
         }
-        for (int v = 1; v < NARMS; ++v)
+        for (int v : arms)
         {
+            if (v == A_PACK) continue;
             plain(bs[v], M, v, got);
             cmp_bytes((std::string("decode M=") + std::to_string(M) + " " + arm_name[v] + " == pack (plain, all layers)").c_str(), ref, got);
         }
@@ -609,8 +636,8 @@ int main(int argc, char** argv)
         {
             std::vector<Bound> bs[NARMS];
             bool ok = true;
-            for (int v = 0; v < NARMS && ok; ++v)
-                if (const char* e = make(M, v, bs[v])) { printf("M=%d make %s: %s\n", M, arm_name[v], e); ok = false; }
+            for (int v : arms)
+                if (ok) if (const char* e = make(M, v, bs[v])) { printf("M=%d make %s: %s\n", M, arm_name[v], e); ok = false; }
             if (!ok) continue;
             // the bytes a layer call reads (the routed experts of the set plus the shared row), averaged over the sets of layer 0
             double nex = 0, bytes = 0;
@@ -650,19 +677,24 @@ int main(int argc, char** argv)
                 CK(cudaEventElapsedTime(&ms, e0, e1));
                 return 1000.0 * ms / reps;
             };
-            cudaGraphExec_t g[NARMS];
-            for (int v = 0; v < NARMS; ++v) g[v] = cap(v);
+            cudaGraphExec_t g[NARMS] = {};
+            for (int v : arms) g[v] = cap(v);
             std::vector<double> t[NARMS];
-            for (int r = 0; r < rounds; ++r)
-                for (int v = 0; v < NARMS; ++v) t[v].push_back(time(g[v]));
-            double med[NARMS];
-            for (int v = 0; v < NARMS; ++v)
+            for (int v : arms) time(g[v]);                              // one warm round, untimed
+            for (int r = 0; r < rounds; ++r)                            // arms in turn, the order reversed every other round
+                for (size_t i = 0; i < arms.size(); ++i)
+                {
+                    const int v = arms[(r & 1) ? arms.size() - 1 - i : i];
+                    t[v].push_back(time(g[v]));
+                }
+            double med[NARMS] = {};
+            for (int v : arms)
             {
                 med[v] = median(t[v]);
                 CK(cudaGraphExecDestroy(g[v]));
             }
             CK(cudaGetLastError());
-            for (int v = 0; v < NARMS; ++v)
+            for (int v : arms)
             {
                 std::vector<double> s = t[v];
                 std::sort(s.begin(), s.end());
@@ -737,24 +769,26 @@ int main(int argc, char** argv)
                 }
             };
             // check: every arm == pack on layers 0 and nlay - 1 (the +pf / +L2 arms are the decode plan kernel's: not prefill arms)
-            const int parms[5] = {A_PACK, A_IMG, A_SCT, A_BMT, A_BML};
+            std::vector<int> parms;
+            for (int v : {A_PACK, A_IMG, A_SCT, A_BMT, A_BML}) if (has(v)) parms.push_back(v);
+            const int np = static_cast<int>(parms.size());
             for (int l : {0, nlay - 1})
             {
                 std::vector<uint8_t> ref, got;
                 pf_run(l, A_PACK, &ref);
-                for (int i = 1; i < 5; ++i)
+                for (int i = 1; i < np; ++i)
                 {
                     pf_run(l, parms[i], &got);
                     cmp_bytes((std::string("prefill M=") + std::to_string(M) + " layer " + std::to_string(l) + " " + arm_name[parms[i]] + " == pack").c_str(), ref, got);
                 }
             }
-            // bench: plain launches, layers in turn (cold), interleaved rounds
+            // bench: plain launches, layers in turn (cold), interleaved rounds (the order reversed every other round)
             std::vector<double> t[5];
             const int preps = nlay * std::max(1, passes / 2);
             for (int r = 0; r < std::max(5, rounds); ++r)
-                for (int i = 0; i < 5; ++i)
+                for (int j = 0; j < np; ++j)
                 {
-                    const int v = parms[i];
+                    const int i = (r & 1) ? np - 1 - j : j, v = parms[i];
                     for (int l = 0; l < nlay; ++l) pf_run(l, v, nullptr);
                     CK(cudaStreamSynchronize(st));
                     CK(cudaEventRecord(e0, st));
@@ -766,9 +800,9 @@ int main(int argc, char** argv)
                     t[i].push_back(1000.0 * ms / preps);
                 }
             CK(cudaGetLastError());
-            double med[5];
-            for (int i = 0; i < 5; ++i) med[i] = median(t[i]);
-            for (int i = 0; i < 5; ++i)
+            double med[5] = {};
+            for (int i = 0; i < np; ++i) med[i] = median(t[i]);
+            for (int i = 0; i < np; ++i)
             {
                 std::vector<double> s = t[i];
                 std::sort(s.begin(), s.end());
@@ -824,6 +858,7 @@ int main(int argc, char** argv)
                    gsz / 1e6, n, median(tc), median(tm), median(ta), median(tcp), gsz / median(tcp) / 1e3, median(tu), median(tr));
         }
         // the table design's primitives: ptab::set (16 B H2D) and slab copies at piece size
+        if (need_sct)
         {
             std::vector<double> ts, tc1, tc2;
             SynLayer& L = Ls[0];
