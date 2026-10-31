@@ -103,6 +103,7 @@ struct LayerTensors
     int fc2_wide = 0;                 // tr3.fc2 is in the wide order (widen_fc2 ran)
     const uint8_t* const* ptab = nullptr;   // EL3 (#151): the layer's piece table (ptab.cuh), a fixed device address; nullptr = the
                                       // pack layout. make_k1 hands it to the kernels (K1Args::t_ptab)
+    size_t bm1 = 0, bm2 = 0;          // study/151-table-vs-vmm: block-major layout, the group stride of tr3.fc1 / tr3.fc2 (tr3_bm_piece); 0 = pack layout
     int e4m3 = 0;                     // routed experts are exlr8-e4m3 (tr3.table's format): K1 decodes with E4M3 rounding
     int cb = TR3_MCG;                 // their codebook (tr3.table's format; tr3.cuh TR3_*): the CB instantiations
     int k2 = 1;                       // some routed fc1 / fc2 unit has width 2 (exlr8 v2): the K2 instantiations.
@@ -1055,7 +1056,7 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
         a.t_sg = static_cast<const __half*>(sg.p); a.t_v1b = static_cast<const __half*>(v1b.p); a.t_v3b = static_cast<const __half*>(v3b.p);
         a.t_fc1 = static_cast<const uint8_t*>(T.t[T_TR3_FC1].p); a.t_fc2 = static_cast<const uint8_t*>(T.t[T_TR3_FC2].p);
         a.t_wide = T.fc1_wide; a.t_wide2 = T.fc2_wide;
-        a.t_ptab = T.ptab;
+        a.t_ptab = T.ptab; a.t_bm1 = T.bm1; a.t_bm2 = T.bm2;
         a.t_v1 = static_cast<const __half*>(v1.p); a.t_v2 = static_cast<const __half*>(v2.p); a.t_v3 = static_cast<const __half*>(v3.p);
     }
     else

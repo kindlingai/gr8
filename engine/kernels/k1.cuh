@@ -55,7 +55,7 @@ __device__ __forceinline__ void tr3_fc1_any(const K1Args& A, int plan, int unit,
     const int b = ((g6nr::EB & (g6nr::EB - 1)) == 0) ? (u_b & (g6nr::EB - 1)) : (u_b % g6nr::EB);
     if (b >= static_cast<int>(tr[3])) return;
     const uint8_t* mw;
-    const int k = tr3_fc1_unit(A.t_fc1, A.t_ptab, A.t_kmix, e, tr, b * 2 + mat, mw);
+    const int k = tr3_fc1_unit(A.t_fc1, A.t_ptab, A.t_bm1, A.t_kmix, e, tr, b * 2 + mat, mw);
     if ((!BS || K2) && k == 3) tr3_fc1_body<3, E4, BS, CB>(A, plan, unit, tr, mw, mask, smem);
     else if (!K2 || k == 4) tr3_fc1_body<4, E4, BS, CB>(A, plan, unit, tr, mw, mask, smem);
     else tr3_fc1_body<K2 ? 2 : 4, E4, BS, CB>(A, plan, unit, tr, mw, mask, smem);
@@ -123,13 +123,13 @@ __device__ __forceinline__ void k1_tlbw(const K1Args& A, int plan, int s)
         for (uintptr_t a = (a0 & ~(g - 1)) + threadIdx.x * g; a < a1; a += 32 * g)
             asm volatile("prefetch.global.L2 [%0];" :: "l"(a < a0 ? a0 : a) : "memory");
     };
-    if (A.t_ptab)                                                  // the piece table: each piece's two slabs
+    if (A.t_ptab || A.t_bm1)                                       // the piece table / block-major: each piece's two slabs
     {
         const long long km = A.t_kmix ? A.t_kmix[e] : 0;
         for (int b = 0; b < nb; ++b)
         {
-            warm(A.t_ptab[tr3_ptab_slot(e, b)], 0, tr3_piece_fc1_bytes(km, tr, b));
-            warm(A.t_ptab[tr3_ptab_slot(e, b) + 1], 0, tr3_piece_fc2_bytes(tr));
+            warm(A.t_ptab ? A.t_ptab[tr3_ptab_slot(e, b)] : tr3_bm_piece(A.t_fc1, A.t_bm1, tr, b, 0), 0, tr3_piece_fc1_bytes(km, tr, b));
+            warm(A.t_ptab ? A.t_ptab[tr3_ptab_slot(e, b) + 1] : tr3_bm_piece(A.t_fc2, A.t_bm2, tr, b, 1), 0, tr3_piece_fc2_bytes(tr));
         }
         return;
     }

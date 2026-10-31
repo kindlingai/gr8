@@ -583,9 +583,15 @@ struct RoutePlan
 constexpr int RW = NEXP / 32;   // k_router_plan warps; each lane holds RW experts in the top-k
 static_assert(NEXP % 32 == 0 && RW <= 32, "k_router_plan: one thread per expert, one taken bit per lane expert");
 template <int K = TOPK> __global__ void __launch_bounds__(NEXP) k_router_plan(const float* logits, const float* bias, int M, RoutePlan* P,
-                                                                                   unsigned keep = 0u, const unsigned* keep_dev = nullptr)
+                                                                                   unsigned keep = 0u, const unsigned* keep_dev = nullptr,
+                                                                                   const void* warm = nullptr, int warm_lines = 0)
 {
     static_assert(K >= 1 && K <= TOPK, "k_router_plan: K outside 1..TOPK");
+    // study/151-table-vs-vmm: warm_lines 128 B lines at warm (a layer's piece table) are prefetched into L2 here, so the
+    // K1 launch that follows finds its table entries hot (the plan kernel's own work covers the DRAM latency)
+    if (warm)
+        for (int i = threadIdx.x; i < warm_lines; i += NEXP)
+            asm volatile("prefetch.global.L2 [%0];" :: "l"(static_cast<const char*>(warm) + static_cast<size_t>(i) * 128) : "memory");
     __shared__ unsigned emask[NEXP];              // bit m = token m selected the expert
     __shared__ int sel_e[MMAX][TOPK];
     __shared__ float sel_w[MMAX][TOPK];
