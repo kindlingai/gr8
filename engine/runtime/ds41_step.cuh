@@ -926,11 +926,8 @@ inline void ds41_span_flush() {
         if(pass) { if(cudaEventQuery(v[e].b)!=cudaSuccess) break; ++e; }
         std::vector<Ds41Span> part(v.begin()+b,v.begin()+e);
         std::vector<double> ms(part.size());
-        for(size_t i=0;i<part.size();++i) {
-            float t=0; cudaEventSynchronize(part[i].b); cudaEventElapsedTime(&t,part[i].a,part[i].b); ms[i]=t;
-            if(!part[i].label) cudaEventDestroy(part[i].a);       // a mark's a is the record before it's b
-            cudaEventDestroy(part[i].b);
-        }
+        for(size_t i=0;i<part.size();++i) { float t=0; cudaEventSynchronize(part[i].b); cudaEventElapsedTime(&t,part[i].a,part[i].b); ms[i]=t; }
+        for(const Ds41Span& r:part) { if(!r.label) cudaEventDestroy(r.a); cudaEventDestroy(r.b); }   // after every read: a mark's a is the record before it's b
         ds41_span_print(part,ms,1,"# span "+std::string(pass ? "prefill pass " : "step ")+std::to_string(step++));
         b=e;
     }

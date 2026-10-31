@@ -36,11 +36,37 @@ its own pass first, and the routed pass's finalize adds it into the BF16 partial
 
 ## Measured
 
-TP4, four GB10 boxes at 2200 MHz, the launcher defaults plus GR8_DS_MANIFEST=pmcgx-k4, RigMark 1.0.0 at reasoning
-effort low:
+TP4, four GB10 boxes, the launcher defaults plus GR8_DS_MANIFEST=pmcgx-k4, RigMark 1.0.0 at reasoning effort low. The
+boxes' GPU clocks follow a thermal cap (1500-2400 MHz by temperature; tools/trace/nicprof.py records them): these
+runs sat at 2050-2120 MHz mean per box with the GPUs at 68-83 C.
 
 | | native | pmcgx-k4 (layers 0-7) |
 |---|---|---|
 | decode, code / prose | 77.8 / 49.7 tok/s | 78.7 / 50.2 tok/s |
 | 8K prefill, cold | 2,023 tok/s | 2,148 tok/s |
 | aggregate, 1 / 2 / 4 streams | 64.8 / 52.8 / 75.0 tok/s | 64.7 / 51.4 / 72.1 tok/s |
+
+## Where a decode step goes
+
+`GR8_DS_SPAN=2` on the served engine (tools/trace/README.md), the same configuration, the step of one session with
+its 5 DSpark drafts (M = 6 rows), rank 0, the mean of 39 prints of 16 sampled replays each (a profiled step runs
+about 1.5% slower than an unprofiled one: RigMark code 77.6 against 78.7 tok/s):
+
+| unit | per step | layers 0-7 (trellis) | layers 8-39 (native) |
+|---|---|---|---|
+| attention | 13.2 ms | 0.33 ms a layer | 0.33 ms a layer |
+| consume (attention) | 1.6 ms | 0.04 ms a layer | 0.04 ms a layer |
+| MoE | 22.0 ms | 0.55 ms a layer | 0.55 ms a layer |
+| consume (MoE) | 4.2 ms | 0.20 ms a layer | 0.08 ms a layer |
+| head | 1.4 ms | | |
+| step | 42.5 ms | | |
+
+The trellis layers' MoE costs the same as the native layers' at 6 rows (0.547 against 0.552 ms), and the consume
+after a trellis layer waits 2.5 times longer for the other ranks (0.20 against 0.08 ms: about 1 ms a step). That is
+the rank imbalance of the 5 / 4 block split described above, which the plan's slot order does not even out at 6 rows.
+
+On one GPU (m4sim, layers 0-2, real text, eager) the trellis MoE is 16% faster than the native one at 1 row (0.19
+against 0.23 ms a layer), equal at 24 rows (1.3 against 1.3 ms) and 12-17% faster at 512 rows (5.4 against 6.4 ms).
+The K1 split knobs at 6 rows (GR8_K1_SPLIT 8x1, 2x4, /1, /4, /8 against the release 4x2/2) and GR8_K1_TLBW (64 and
+2048 KB) all measured within 2% of the release shape, with the run-to-run spread of the same size.
+
