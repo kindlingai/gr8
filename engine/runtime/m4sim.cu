@@ -83,11 +83,21 @@
 #include "s2_batch.h"
 #include "s2/pool.h"
 #include "s2/cp_rows.h"
+#if G6_MODEL_DS41
+#include "ds41_dspark_prefill.h"
+#include "ds41_pf_split.h"
+#include "ds41_knobs.h"
+#endif
 #endif
 
 using namespace g6rt;
 
 constexpr int NR = g6nr::NR;           // simulated ranks: six, or four in a -DG6_NR=4 build
+#if G6_NR == 4
+#define M4_RIT "four ranks in turn"     // the step-time log text names the configured rank count (R4: the DS41 TP4 sim printed "six")
+#else
+#define M4_RIT "six ranks in turn"
+#endif
 
 // GR8_TEST_KV_TIER_CHECK / GR8_TEST_KV_RANKS_CMP (the header): logical pages 0..n-1 of every rank, main model then draft
 static void kv_tier_check(std::vector<Model>& R, std::vector<Draft>& DR, int n, int cap, cudaStream_t st)
@@ -260,6 +270,31 @@ __global__ void __launch_bounds__(128) k_vdeliver(VLoop a)
 }
 #endif
 
+#if G6_MODEL_DS41
+// GR8_RESID_DUMP + a DS41 stop (ds41_step.cuh g_ds41_stop_hook): write the residual slots the step reached, as one record
+// {s, M, reached, hid} + reached x M x hid float32 (the same layout as logit_dump; ds41_resid_convert.py takes fewer slots).
+struct RdStop { FILE* f = nullptr; const float* dump = nullptr; int hid = 0, mx = 0, slots = 0, reached = 0, step = 0, from = 0; };
+static RdStop g_rd_stop;
+static void rd_stop_hook(int M, cudaStream_t st)
+{
+    const RdStop& r = g_rd_stop;
+    if (!r.f || r.step < r.from) return;
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(st, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusNone)
+    { fprintf(stderr, "g6: stop hook: the stream is capturing, no partial residual dump\n"); return; }
+    if (r.reached <= 0) { fprintf(stderr, "g6: stop hook: no residual slot was reached, GR8_RESID_DUMP stays empty\n"); return; }
+    if (cudaStreamSynchronize(st) != cudaSuccess)
+    { fprintf(stderr, "g6: stop hook: the stream failed, no partial residual dump\n"); return; }
+    std::vector<float> h((size_t)r.reached * M * r.hid);
+    for (int k = 0; k < r.reached; ++k)
+        if (cudaMemcpy(h.data() + (size_t)k * M * r.hid, r.dump + (size_t)k * r.mx * r.hid, (size_t)M * r.hid * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
+        { fprintf(stderr, "g6: stop hook: slot %d copy failed, no partial residual dump\n", k); return; }
+    const int hdr[4] = {r.step, M, r.reached, r.hid};
+    fwrite(hdr, 4, 4, r.f); fwrite(h.data(), 4, h.size(), r.f); fflush(r.f);
+    fprintf(stderr, "g6: stop hook: wrote %d of %d residual slots (step %d, M=%d) to GR8_RESID_DUMP\n", r.reached, r.slots, r.step, M);
+}
+#endif
+
 int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -300,7 +335,13 @@ int main(int argc, char** argv)
         std::string oerr;
         if (g6rt::common_arg(a, next, co, oerr)) { if (!oerr.empty()) die(oerr); continue; }
         if (a == "--packs") packs = next();
-        else if (a == "--reuse-prefix") reuse = true;
+        else if (a == "--reuse-prefix")
+        {
+#if G6_MODEL_DS41
+            die("--reuse-prefix: not supported for DS41 (the attention and index state is only valid for a request that starts at position 0)");
+#endif
+            reuse = true;
+        }
         else if (a == "--mtp-dump") mtp_dump = next();
         else if (a == "--serve") serve = next();
         else if (a == "--s2") s2mode = true;
@@ -315,6 +356,14 @@ int main(int argc, char** argv)
     const int cap = co.cap, top = co.top, pfrows = co.pfrows, lanes = co.lanes, nc = co.nc, mtp = co.mtp, MP = co.MP;
     const float temp = co.temp;
     const bool graph = co.graph, wide = co.wide, pfv2 = co.pfv2;
+#if G6_MODEL_DS41
+    const int pfw = (int)knob::test_ds41_m4_pfw();   // W-row chunk mode of the prompt loop below; W = GR8_DS_PREFILL_W
+    if (pfw && (pfw <= MX || pfw != ds41_prefill_rowcap(DS41_TEXT(knob::ds_prefill_w()), MX))) die("GR8_TEST_DS41_M4_PFW=W needs MX < W = GR8_DS_PREFILL_W");
+    const int pf_tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
+    if (pfw && pf_tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
+    if (pfw && (graph || mtp || MP)) die("GR8_DS_M4_PFW=1: eager only (no --graph, --mtp, --prefill)");
+    if (pfw) fprintf(stderr, "# GR8_DS_M4_PFW: W-row non-final prefill chunks of %d rows, bounded replay tail %d\n", pfw, pf_tail);
+#endif
     bool adapt = co.adapt;              // Flash: --mtp turns it on unless --spec-fixed (below)
     const std::string &layers_s = co.layers_s, &levels_s = co.levels_s, &qo_man = co.qo_man, &qo_file = co.qo_file;
     std::vector<std::string>& prompts = co.prompts;
@@ -327,7 +376,11 @@ int main(int argc, char** argv)
     if (co.rs) plan.rs = *co.rs;
     const bool release = !v2src.dense.empty();
     if (knob::kvb() == "fp8" && !release) die("GR8_KVB=fp8 needs --v2-dense: packs hold kv_b in BF16");   // #50: read by the release planner only
+#if G6_MODEL_DS41
+    if (packs.empty() == !release)      // DS41: --v2-dense RELEASE_DIR alone
+#else
     if (packs.empty() == !release || (release && (v2src.dir.empty() || v2src.slices.empty() || v2src.widths.empty())))
+#endif
         die("usage: m4sim --packs DIR | --v2 DIR --v2-slices DIR --v2-widths FILE --v2-dense DIR [--layers 0,3,40,77] [--prompt ids] [--gen 16] [--temp 0] [--seed 1234] [--cap 64]");
     if (!release && !v2src.layout.empty()) die("--layout needs --v2-dense (it places the release's pieces)");
 #ifndef G6_RS_LOADER
@@ -383,7 +436,7 @@ int main(int argc, char** argv)
     }
     if (nc < 0 || nc * NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / NR));
 #ifdef DEC_S2
-    if (s2mode && (!mtp || MP || !serve.empty() || prompts.size() > (size_t)S2N)) die("--s2 needs --mtp, no --prefill / --serve, at most 8 --prompt");
+    if (s2mode && (!mtp || MP || !serve.empty() || prompts.size() > (size_t)S2N)) die("--s2 needs --mtp, no --prefill / --serve, at most 32 (S2N) --prompt");
 #if G6_MODEL_FLASH
     // Flash sessions share steps only in g6m4 --serve (s2/flash_native.cuh: each its own KDA slots and ring)
     if (s2mode) die("--s2: the Flash model batches sessions in g6m4 --serve only");
@@ -476,7 +529,11 @@ int main(int argc, char** argv)
     pf_prof().on = knob::pf_prof();
 
     // ---- loopback fabric
+#if G6_MODEL_DS41
+    const size_t stride = ((size_t)std::max(MX, pfw) * HID * 2 + 8 + 255) / 256 * 256;   // GR8_DS_M4_PFW: a W-row chunk's layer exchange
+#else
     const size_t stride = ((size_t)MX * HID * 2 + 8 + 255) / 256 * 256;
+#endif
     char* recv = dmalloc<char>(2 * (size_t)NC * NR * stride);
     u64* stepp = dmalloc<u64>(1);
     unsigned* err = dmalloc<unsigned>(1);
@@ -701,6 +758,24 @@ int main(int argc, char** argv)
         G6RT_CK(cudaStreamSynchronize(st));
     }
     for (Model& m : R) { m.nc = nc; m.rs = plan.rs; }   // before any capture: the head kernels take them by value
+#if G6_MODEL_DS41
+    // GR8_DS_RELAXED_ACCEPT (GPU check of the relaxed head kernels; unset = today's head): m4sim runs no DSpark round, so a greedy
+    // row m of a multi-row step takes row m + 1's input token as its draft (k_head_local_rx / k_head_relax, rank.cuh)
+    if (const char* v = DS41_TEXT(knob::ds_relaxed_accept()); v && *v)
+    {
+        const ds41::dsp::Knobs k = ds41::dsp::parse_knobs([](const char* n) { return strcmp(n, "GR8_DS_RELAXED_ACCEPT") ? nullptr : DS41_TEXT(knob::ds_relaxed_accept()); });
+        if (!k.err.empty()) die(k.err);
+        if (k.relax_topp > 0 && nc == 0) die("GR8_DS_RELAXED_ACCEPT topp:P needs --top-p-cands > 0");
+        if (k.relaxed)
+            for (Model& m : R)
+            {
+                m.rx.on = 1;
+                m.rx.log_ratio = k.relax_ratio > 0 ? (float)std::log(k.relax_ratio) : -INFINITY;
+                m.rx.topp = (float)k.relax_topp;
+            }
+        if (k.relaxed) fprintf(stderr, "# GR8_DS_RELAXED_ACCEPT ON ratio %g topp %g (NOT EXACT)\n", k.relax_ratio, k.relax_topp);
+    }
+#endif
     for (Draft& D : DR) D.d.nc = nc;
     // GR8_RT_STORE (header): before any prepare, which copies the bindings' arguments into the replay entries
     std::vector<std::unique_ptr<RtTier>> rt(NR);
@@ -1085,7 +1160,7 @@ int main(int argc, char** argv)
     // tools/cp/gateB_layers.py compares two dumps per sublayer.
     const bool rd_on = knob::resid_dump().has_value();
     const int rd_slots = 2 * NL + 1;
-#if G6_MODEL_FLASH
+#if G6_MODEL_FLASH || G6_MODEL_DS41
     const int rd_hid = R[0].resid4 ? geom::HC * HID : HID; // main-model streams; MTP stays single-stream
 #else
     const int rd_hid = HID;
@@ -1097,13 +1172,20 @@ int main(int argc, char** argv)
 #else
         const float* source = R[0].resid;
 #endif
+#if G6_MODEL_DS41
+        if (rdump && R[0].resid4) ds_mhc::trunk_to_f32(R[0].resid4, rdump + (size_t)slot * MX * rd_hid, (size_t)M * rd_hid, st);   // trunk_t -> FP32 (a plain copy unless -DDS_MHC_TRUNK_BF16)
+        else
+#endif
         if (rdump) G6RT_CK(cudaMemcpyAsync(rdump + (size_t)slot * MX * rd_hid, source, (size_t)M * rd_hid * 4, cudaMemcpyDeviceToDevice, st));
+#if G6_MODEL_DS41
+        if (rdump && slot + 1 > g_rd_stop.reached) g_rd_stop.reached = slot + 1;
+#endif
     };
     // noise floor: GR8_TEST_PERTURB=eps (replicated runs): after layer 0's attention consume, every rank's residual
     // x *= 1 + eps * u, u in [-1, 1) from a hash of (position row, element) — the same on every rank, deterministic.
     const float perturb = (float)knob::test_perturb();
-#if G6_MODEL_FLASH
-    if(R[0].resid4 && perturb!=0.f) die("GR8_TEST_PERTURB does not support the four-stream Flash residual");
+#if G6_MODEL_FLASH || G6_MODEL_DS41
+    if(R[0].resid4 && perturb!=0.f) die("GR8_TEST_PERTURB does not support the four-stream residual");
 #endif
     // one step of the six ranks, M rows, in stream order
     // DEC_GSPLIT (GR8_DEC_SPLIT=ls): pc 0 = step_in, embed, layers [0, ls); pc 1 = layers [ls, NL), head, step_out (-1 = all)
@@ -1444,6 +1526,9 @@ int main(int argc, char** argv)
     const int ldump_from = (int)knob::logit_dump_from();
     FILE* rdf = rd_on ? fopen(knob::resid_dump()->c_str(), "wb") : nullptr;
     if (rd_on && !rdf) die("GR8_RESID_DUMP: cannot open the file");
+#if G6_MODEL_DS41
+    if (rdf) { g_rd_stop = RdStop{rdf, rdump, rd_hid, MX, rd_slots, 0, 0, ldump_from}; g_ds41_stop_hook = rd_stop_hook; }
+#endif
     FILE* idf = knob::test_idx_dump() ? fopen(knob::test_idx_dump()->c_str(), "wb") : nullptr;
     auto logit_dump = [&](int s, int M) {
         if (rdf && s >= ldump_from)
@@ -1454,6 +1539,9 @@ int main(int argc, char** argv)
             const int hdr[4] = {s, M, rd_slots, rd_hid};
             fwrite(hdr, 4, 4, rdf); fwrite(h.data(), 4, h.size(), rdf);
         }
+#if G6_MODEL_DS41
+        g_rd_stop.step = s + 1; g_rd_stop.reached = 0;   // the next step's stop record starts at its own slot 0
+#endif
         if (idf && s >= ldump_from)   // GR8_TEST_IDX_DUMP: rank 0's selected ids of the first --layers layer, int32 s, M, M x 2048
         {
             std::vector<int> h((size_t)M * 2048);
@@ -1870,7 +1958,7 @@ int main(int argc, char** argv)
         {
             std::vector<double> v = kv.second;
             std::sort(v.begin(), v.end());
-            fprintf(stderr, "# s2 %s steps M=%d: %zu, p50 %.3f ms min %.3f ms (six ranks in turn)\n", kn[kv.first.first], kv.first.second, v.size(),
+            fprintf(stderr, "# s2 %s steps M=%d: %zu, p50 %.3f ms min %.3f ms (" M4_RIT ")\n", kn[kv.first.first], kv.first.second, v.size(),
                     v[v.size() / 2], v[0]);
         }
         printf("# m4sim: %d steps, %d rank lines differ from rank 0\n", steps, bad);
@@ -2087,7 +2175,7 @@ int main(int argc, char** argv)
                     printf("prefill rows %d..%d resid %016llx\n", a0, a0 + M - 1, (unsigned long long)h0);
                     pf_resdump(L[0], M, q, a0);
                 }
-                fprintf(stderr, "# seq %zu prefill %d + %d rows (two lanes): %.3f ms for the six ranks in turn\n", q, MA, MB, ms);
+                fprintf(stderr, "# seq %zu prefill %d + %d rows (two lanes): %.3f ms for the " M4_RIT "\n", q, MA, MB, ms);
                 fprintf(stderr, "# seq %zu pf_hash rank 0 both lanes (what one g6m4 rank does): %.3f ms\n", q, hash_ms);
                 pt.lap("checks_hash_x6");
                 a += MP;
@@ -2121,7 +2209,7 @@ int main(int argc, char** argv)
             }
             printf("prefill rows %d..%d resid %016llx\n", a, a + M - 1, (unsigned long long)h0);
             pf_resdump(PF[0], M, q, a);
-            fprintf(stderr, "# seq %zu prefill %d rows: %.3f ms for the six ranks in turn\n", q, M, ms);
+            fprintf(stderr, "# seq %zu prefill %d rows: %.3f ms for the " M4_RIT "\n", q, M, ms);
         }
         // GR8_TEST_KV_HASH=1 (measurement, after the prefill): per layer, FNV of the stored latent record of
         // every prompt position < npf in logical order, read from every rank that stores it (all ranks in a replicated
@@ -2214,11 +2302,98 @@ int main(int argc, char** argv)
         const int PS = prompt_steps(p), NS = total_steps(p);
         int last_tok = 0, ns_run = NS;
         std::vector<int> gen;
+        int pfw_skip = 0;   // GR8_DS_M4_PFW: prompt steps the W-row chunks replaced
+        (void)pfw_skip;
         for (int s = 0; s < NS; ++s)
         {
             const int M = step_rows(p, s);
             const StepIn si = step_inputs(p, s, last_tok, step0);
             rt_spill_all(si.pos[0], si.context);
+#if G6_MODEL_DS41
+            // GR8_DS_M4_PFW=W (test only, bounded replay step 2, gr8-bounded-replay-plan.md section 5): at step 0 the prompt's first
+            // floor((n-1)/W)*W tokens run as W-row non-final prefill chunks the way g6m4's prefill hook runs them (tok / pos / tgt / step /
+            // cells set from the host, nonfinal_plan() split by GR8_DS_PF_TAIL, no head; 0 = unsplit); the prompt steps they cover are skipped
+            // and the rest of the sequence runs as before. Prints "pfw" lines: per chunk, rank and layer, fnv of the attention / MoE partial,
+            // and of the trunk after the chunk. GR8_DS_PF_TAIL = 0 and = W must print the same lines (and the same logits after).
+            if (pfw && s == 0)
+            {
+                const int n = (int)p.prompt.size(), npf = (n - 1) / pfw * pfw;
+                if (p.first || p.chunk <= 0 || pfw % p.chunk || npf < pfw) die("GR8_DS_M4_PFW: needs first 0, W a multiple of --chunk and a prompt of more than W tokens");
+                for (int k = 0; k * pfw < npf; ++k)
+                {
+                    const int first = k * pfw, Mw = pfw, ctx = first + Mw;
+                    const u64 seq = step_inputs(p, first / p.chunk, 0, step0).step;   // the id of a prompt step this chunk replaces: never reused
+                    std::vector<int> pos(Mw), tgt(Mw, -1);
+                    for (int r = 0; r < Mw; ++r) pos[r] = first + r;
+                    const int pages = (ctx + 63) / 64;
+                    std::vector<G6AttnStepCell> cells(R[0].nl, G6AttnStepCell{ctx, pages, pages, 0});
+                    std::vector<std::vector<ds41::Op>> keep_plan(NR);
+                    std::vector<ds41::Index> keep_idx(NR);
+                    ds41::br::Split split;
+                    for (Model& m : R)
+                    {
+                        G6RT_CK(cudaMemcpyAsync(m.tok, p.prompt.data() + first, Mw * sizeof(int), cudaMemcpyHostToDevice, st));
+                        G6RT_CK(cudaMemcpyAsync(m.pos, pos.data(), Mw * sizeof(int), cudaMemcpyHostToDevice, st));
+                        G6RT_CK(cudaMemcpyAsync(m.tgt, tgt.data(), Mw * sizeof(int), cudaMemcpyHostToDevice, st));
+                        G6RT_CK(cudaMemcpyAsync(m.stepp, &seq, sizeof seq, cudaMemcpyHostToDevice, st));
+                        G6RT_CK(cudaMemcpyAsync(m.cells, cells.data(), cells.size() * sizeof(cells[0]), cudaMemcpyHostToDevice, st));
+                        if (ds41_idx_set_chunk(&m, ctx) != 0) die("GR8_DS_M4_PFW: index chunk bound refused");
+                        const auto nf = ds41::dsp::pf::nonfinal_plan(m.ds41_plan, false);
+                        const std::string ck = ds41::dsp::pf::check_nonfinal_plan(m.ds41_plan, nf, false);
+                        if (!ck.empty()) die("GR8_DS_M4_PFW: " + ck);
+                        split = pf_tail ? ds41::br::split_plan(nf, layers) : ds41::br::Split{nf, nf.size(), -1};
+                        if (pf_tail) { const std::string c2 = ds41::br::check_split(nf, split, layers); if (!c2.empty()) die("GR8_DS_M4_PFW: " + c2); }
+                        keep_plan[m.rank] = m.ds41_plan; keep_idx[m.rank] = m.ds41_idx;
+                        m.ds41_plan = split.ops; m.ds41_idx = ds41::index(split.ops);
+                    }
+                    const int late = split.on() ? ds41::br::late_rows(Mw, pf_tail) : Mw;
+                    for (Model& m : R)
+                    {
+                        if (split.on()) { prepare_ds41_prefill(m, Mw, st, 0, split.i_late); prepare_ds41_prefill(m, late, st, split.i_late, m.nl); }
+                        else prepare_ds41_prefill(m, Mw, st);
+                        m.ds41_pf_late = late;
+                    }
+                    auto h = [&](const void* d, size_t nb) {
+                        std::vector<uint8_t> b(nb);
+                        G6RT_CK(cudaMemcpy(b.data(), d, nb, cudaMemcpyDeviceToHost));
+                        return (unsigned long long)fnv(0xcbf29ce484222325ull, b.data(), nb);
+                    };
+                    for (Model& m : R) ds41_unit(m, ds41::U_EMBED, 0, Mw, st);
+                    for (int i = 0; i < NL; ++i)
+                    {
+                        const int Mi = split.on() && i >= split.i_late ? late : Mw;
+                        if (split.on() && i == split.i_late) ds41_attn_set_win_floor(ds41::br::win_floor(ctx, Mw, pf_tail));
+                        const size_t part = (size_t)Mi * HID * 2;
+                        for (Model& m : R) ds41_unit(m, ds41::U_ATTN, i, Mi, st);
+                        deliver(2 * i, part);
+                        for (Model& m : R) ds41_unit(m, ds41::U_CONS_A, i, Mi, st);
+                        for (Model& m : R) ds41_unit(m, ds41::U_MLP, i, Mi, st);
+                        deliver(2 * i + 1, part);
+                        G6RT_CK(cudaStreamSynchronize(st));
+                        for (Model& m : R)
+                            printf("pfw seq %zu chunk %d first %d rank %d L %d rows %d attn %016llx ffn %016llx\n", q, k, first, m.rank, R[0].layers[i].l, Mi,
+                                   h(m.sc.part[0], part), h(m.sc.part[1], part));
+                        // U_CONS_F(i_late - 1) ends with ST_PF_COMPACT (W rows); the last layer has none (nonfinal_plan drops ST_FINISH)
+                        if (!R[0].ds41_idx.get(ds41::U_CONS_F, i).empty()) for (Model& m : R) ds41_unit(m, ds41::U_CONS_F, i, Mi, st);
+                    }
+                    ds41_attn_set_win_floor(0);
+                    G6RT_CK(cudaStreamSynchronize(st));
+                    check_fabric("pfw");
+                    for (Model& m : R)
+                    {
+                        printf("pfw seq %zu chunk %d first %d rank %d trunk rows %d %016llx\n", q, k, first, m.rank, late,
+                               h(m.resid4, (size_t)late * geom::HC * HID * sizeof(ds_mhc::trunk_t)));
+                        m.ds41_pf_late = 0;
+                        if (ds41_idx_set_chunk(&m, 0) != 0) die("GR8_DS_M4_PFW: index chunk reset refused");
+                        m.ds41_plan = keep_plan[m.rank]; m.ds41_idx = keep_idx[m.rank];
+                    }
+                }
+                pfw_skip = npf / p.chunk;
+                for (Model& m : R) prepare(m, M, st);   // back to the decode shapes (ready[][] stays as it was)
+                G6RT_CK(cudaStreamSynchronize(st));
+            }
+            if (pfw && s < pfw_skip) continue;
+#endif
             const int k = bucket(si.context, false);
             if (!ready[k][M])
             {
@@ -2266,7 +2441,7 @@ int main(int argc, char** argv)
             if (top > 0) for (Model& m : R) { std::string tl; top_lines(m, s, M, top, tl); fputs(tl.c_str(), stdout); }
             logit_dump(s, M);
             if (s >= PS - 1) gen.push_back(last_tok);
-            fprintf(stderr, "# seq %zu step %d M %d: %.3f ms for the six ranks in turn\n", q, s, M, ms);
+            fprintf(stderr, "# seq %zu step %d M %d: %.3f ms for the " M4_RIT "\n", q, s, M, ms);
             if (s >= PS + 2) t1.push_back(ms);
             if (s >= PS - 1 && em.on) pt.first_token(q);
             if (s >= PS - 1 && em.on && em.push(&last_tok, 1)) { ns_run = s + 1; break; }
@@ -2279,14 +2454,17 @@ int main(int argc, char** argv)
         for (int t : gen) printf(" %d", t);
         printf("\n");
     }
-    if (pf_prof().on) { pf_prof().print("six ranks in turn,"); qo_prof().print(); }
+#if G6_MODEL_DS41
+    ds41_span_flush();   // GR8_DS_SPAN: the last step's spans (no-op when off)
+#endif
+    if (pf_prof().on) { pf_prof().print(M4_RIT ","); qo_prof().print(); }
     if (!t1.empty())
     {
         std::sort(t1.begin(), t1.end());
-        fprintf(stderr, "# single-row step, six ranks in turn, %s: p50 %.3f ms min %.3f ms (%.1f us per rank per layer at p50), %d layers\n",
+        fprintf(stderr, "# single-row step, " M4_RIT ", %s: p50 %.3f ms min %.3f ms (%.1f us per rank per layer at p50), %d layers\n",
                 graph ? "one graph" : "plain launches", t1[t1.size() / 2], t1[0], t1[t1.size() / 2] * 1000 / NR / NL, NL);
     }
-    if (mtp) mtp_stats.print(mtp, "six ranks in turn");
+    if (mtp) mtp_stats.print(mtp, M4_RIT);
     for (int r = 0; r < NR && rt[0]; ++r)
         fprintf(stderr, "# GR8_RT_STORE rank %d: %llu rows spilled, %llu fetched, %llu read locally (no slot); %llu pages released, "
                         "%d of %d local pages at most\n", r, (unsigned long long)rt[r]->spilled, (unsigned long long)rt_fetched(*rt[r]),

@@ -6,12 +6,12 @@
 static int fails = 0;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #x); ++fails; } } while (0)
 static int parse(const char* value, int main_cut, bool good) {
-    if (value) setenv("G6_DS_MOE_TOPK_DECODE", value, 1);
-    else unsetenv("G6_DS_MOE_TOPK_DECODE");
+    if (value) setenv("GR8_DS_MOE_TOPK_DECODE", value, 1);
+    else unsetenv("GR8_DS_MOE_TOPK_DECODE");
     std::string err;
     const int got = ds41_moe_topk::decode_env(main_cut, 6, &err);
     CHECK((got > 0) == good);
-    if (!good) CHECK(err.find("G6_DS_MOE_TOPK_DECODE") != std::string::npos);
+    if (!good) CHECK(err.find("GR8_DS_MOE_TOPK_DECODE") != std::string::npos);
     return got;
 }
 int main() {
@@ -27,7 +27,7 @@ int main() {
     }
     for (const char* bad : {"0", "7", "", "01", "-1", "1x", " 1", "1 "})
         CHECK(parse(bad, 4, false) == -1);
-    unsetenv("G6_DS_MOE_TOPK_DECODE");
+    unsetenv("GR8_DS_MOE_TOPK_DECODE");
     if (fails) return 1;
     std::puts("DS41_MOE_TOPK_DECODE_HOST_PASS");
 }

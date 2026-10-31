@@ -1,0 +1,210 @@
+# DeepSeek-V4.1-Flash (MODEL=ds41) step driver, prefill and serving. Read only by a DS41 build.
+prefix: "GR8_DS"
+knobs:
+  GR8_DS_BLOCK:
+    scope: agree
+    kind: text
+    unset: "the checkpoint's DSpark block, 5"
+    doc: >-
+      DSpark draft block size; the draft step always holds 5 rows a session, so only 5 is served.
+  GR8_DS_C8PACK:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      Short fresh prompts (up to 64 rows each, up to 8 of them, 512 rows in all) prefill together in one ragged pass and
+      share one prompt-tail step. Needs --serve, --s2-sessions >= 2 and GR8_DS_PREFILL_MIN >= 2.
+  GR8_DS_CACHE_MIB:
+    scope: local
+    kind: int
+    unset: "the prefix cache's own size"
+    values: "1.."
+    legacy: ["G6_DS41_CACHE_MIB"]
+    doc: >-
+      Size in MiB of the host prefix cache of DS41 session snapshots (--reuse-prefix).
+  GR8_DS_DEC_STAGE:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      Decode consumes of the main model (1..MX rows) read the peers' slots with 16-byte loads through shared memory.
+  GR8_DS_ENGRAM_MTP:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      Allows GR8_DS_ENGRAM=1 together with GR8_DS_MTP. The verify rows' n-gram window comes from the host-built step input
+      and a rejected draft's ring tokens are rewritten before they are read. Not yet compared against Engram at MTP 0.
+  GR8_DS_FEED_DIR:
+    scope: local
+    kind: path
+    unset: "off"
+    doc: >-
+      Debug: a directory of reference activations the step driver feeds in place of its own, layer by layer.
+  GR8_DS_MHC_DECOMP:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: ["G6_DS_B12_MHC"]
+    doc: >-
+      Prefill chunks above MX rows run the mHC consume and prepare as separate decomposed kernels (ds_mhc_decomp.cuh).
+  GR8_DS_MHC_FUSE:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    doc: >-
+      The mHC consume of one sub-layer and the prepare of the next run as one trunk pass, except where Engram sits
+      between them. 0 runs them apart.
+  GR8_DS_MHC_ROW_SHARD:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      W-row prefill: each rank runs the late layers' mHC for a quarter of the rows and all-gathers the trunk state.
+      Needs W 4096, GR8_DS_PF_TAIL 128, TP4, GR8_DS_PF_RS=1 and GR8_DS_MHC_FUSE=1.
+  GR8_DS_MHC_Y_MXFP8:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_MHC_ROW_SHARD=1, the y all-gather carries MXFP8 instead of BF16. Lossy.
+  GR8_DS_MOE_TOPK_DECODE:
+    scope: agree
+    kind: int
+    unset: "the main step's routed experts"
+    values: "1..6"
+    doc: >-
+      Routed experts a decode step takes, below the prefill's (GR8_DS_MOE_TOPK). A screen arm, not the model.
+  GR8_DS_MTP:
+    scope: agree
+    kind: text
+    unset: "0, no drafts"
+    doc: >-
+      DSpark drafts verified a round, 1..5 (the checkpoint's three draft layers, block of 5). Served only.
+  GR8_DS_PF_DIRECT:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      On a W-row prefill chunk the attention output and the MoE combine write their collective's send slot in place;
+      reduce-scatter slices go as flat slices. Needs GR8_DS_PREFILL_W above MX.
+  GR8_DS_PF_GATHER:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      Prefill consumes above MX rows read one device BF16 sum of the peers' partials instead of the peers' slots.
+  GR8_DS_PF_LANES:
+    scope: agree
+    kind: text
+    unset: "1, one lane"
+    doc: >-
+      1 or 2. 2 runs W-row prefill quanta of up to 2W rows of one session on two lanes with their own streams and fabric.
+  GR8_DS_PF_LATE_FINAL:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_PF_TAIL, a chunk with at least tail + window rows after it skips the late layers' rows that no later
+      reader needs.
+  GR8_DS_PF_POOL:
+    scope: agree
+    kind: text
+    unset: "off"
+    doc: >-
+      0, or 2..the run-0 collectives: the prefill fabric's layer exchanges and all-gathers reuse this many slots each
+      (FabricConfig::pool).
+  GR8_DS_PF_RS:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      W-row prefill: the layer exchanges before the late split run as reduce-scatter plus all-gather. Needs
+      GR8_DS_PF_TAIL and GR8_DS_PREFILL_W above MX.
+  GR8_DS_PF_TAIL:
+    scope: agree
+    kind: text
+    unset: "the model's tail rows"
+    doc: >-
+      Rows of each prefill chunk that run the late layers (bounded replay): 0 (off) or the attention window..4096.
+  GR8_DS_PREFILL_KEEP:
+    scope: agree
+    kind: text
+    unset: "0, every prompt row"
+    doc: >-
+      0, or 128 and more: only the last N prompt positions enter the DSpark draft's key rings.
+  GR8_DS_PREFILL_MIN:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0.."
+    doc: >-
+      Prompts of at least this many tokens prefill in W-row chunks (GR8_DS_PREFILL_W); shorter ones, and every prompt at
+      0, run as decode steps. Several sessions (--s2-sessions > 1) need 2 or more.
+  GR8_DS_PREFILL_W:
+    scope: agree
+    kind: text
+    unset: "MX: no W-row prefill"
+    doc: >-
+      Rows of one prefill chunk, MX..4096. GR8_DS_ATTN_PW and GR8_DS41_IDX_PW must name the same width.
+  GR8_DS_RELAXED_ACCEPT:
+    scope: agree
+    kind: text
+    unset: "off: exact acceptance"
+    doc: >-
+      DSpark verify accepts a greedy row's draft by a relaxed rule: ratio:R (0 < R <= 1) and / or topp:P (0 < P < 1),
+      comma separated. Not exact.
+  GR8_DS_SPAN:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      Prints the host time of each step's spans.
+  GR8_DS_STRIPE:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      The main fabric stripes writes of at least GR8_DS_STRIPE_MIN bytes over both rails (needs --ips2).
+  GR8_DS_STRIPE_MIN:
+    scope: agree
+    kind: int
+    default: "1048576"
+    values: "8192.."
+    doc: >-
+      With GR8_DS_STRIPE=1, the smallest write the fabric stripes, in bytes.
+  GR8_DS_SUBDUMP:
+    scope: local
+    kind: path
+    unset: "off"
+    doc: >-
+      Debug: a directory where each step's sub-layer partials are written.
+  GR8_DS_WAIT_K:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0..2"
+    doc: >-
+      Who waits for the peers' tails before a consume kernel: 0 every CTA, 1 one wait kernel ahead of it, 2 one CTA that
+      then releases the others through a device word (main model only; others fall back to 1).
+  GR8_DS_XTRACE:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: ["G6_XTRACE_DS"]
+    doc: >-
+      With GR8_XTRACE=1 and DSpark, also trace the DSpark draft fabric.

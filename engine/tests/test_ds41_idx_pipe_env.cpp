@@ -22,7 +22,7 @@ static int pipe_b(const char* val)
     if (!p)
     {
         if (val) setenv("GR8_DS41_IDX_PIPE_B", val, 1); else unsetenv("GR8_DS41_IDX_PIPE_B");
-        unsetenv("G6_DS41_IDX_PIPE_B");
+        unsetenv("GR8_DS41_IDX_PIPE_B");
         const int null = open("/dev/null", O_WRONLY);
         if (null >= 0) dup2(null, 2);        // the refusal's message
         _exit(10 + (knob::ds41_idx_pipe_b() ? 1 : 0));

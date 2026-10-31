@@ -89,6 +89,9 @@ struct V2Src
 #ifdef G6_RS_LOADER
 #include <mutex>
 #include "../loader-rs/g6load.h"
+#if G6_MODEL_DS41
+#include "../loader-rs/ds41.h"
+#endif
 
 // The Rust loader's sink: pinned staging buffers and one stream per worker into the device image. Each chunk is summed
 // in staging for the weight check (weight_check.cuh).
@@ -219,8 +222,13 @@ inline void* rs_plan_release(g6::Pack& pack, int rank, const V2Src& v2)
 {
     const std::string planned = planned_manifest(rank, "release");
     char err[1024] = "";
+#if G6_MODEL_DS41
+    // DeepSeek-V4.1-Flash-1017: the "release" is the published checkpoint directory (--v2-dense DIR); B3's planner reads it directly
+    void* h = g6l_ds41_plan(v2.dense.c_str(), g6nr::NR, rank, planned.c_str(), err, sizeof err);
+#else
     void* h = g6l_release_plan(v2.dense.c_str(), v2.dir.c_str(), v2.slices.c_str(), v2.widths.c_str(), g6nr::NR, rank,
                                v2.qo, v2.trellis, v2.layout.c_str(), planned.c_str(), err, sizeof err);
+#endif
     if (!h) { unlink(planned.c_str()); die(std::string("release plan: ") + err); }
     std::string e;
     const bool opened = pack.open_manifest(planned, e);
@@ -293,7 +301,11 @@ inline Find plan_find(const g6::Pack& pack, PlanStore& store, int r)
 inline void load_image(g6::Pack& pack, g6::DevImage& img, const std::string& manifest, const std::string& file, int rank,
                        bool hash = true, const V2Src& v2 = {})
 {
+#if G6_MODEL_DS41
+    if (!v2.dir.empty() || !v2.dense.empty())   // DS41: --v2-dense CHECKPOINT_DIR alone (rs_plan_release -> g6l_ds41_plan)
+#else
     if (!v2.dir.empty())
+#endif
     {
 #ifdef G6_RS_LOADER
         if (!v2.dense.empty()) return rs_load_release(pack, img, rank, v2);

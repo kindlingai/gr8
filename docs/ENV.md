@@ -83,11 +83,19 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_DS_ATTN_SPLIT` | flag | `0` |  | 1 = two CTAs per row and head group in the attention core, joined by an online-softmax merge. Needs GR8_DS_ATTN_CPA=1. |
 | `GR8_DS_ATTN_TC` | flag | `0` |  | 1 = the five attention projections at 9 or more rows run on the block-scaled tensor-core GEMM (k_gemm_mx8t) where the shape allows it. |
 | `GR8_DS_ATTN_TC_MF` | int | `0` | 0\|1\|2 | Grid order of the tensor-core GEMM: 0 = the N tile is the fastest grid dimension, 1 = the M tile is, 2 = the M tile only for a weight of 100 MiB or more (the Engram wkv). |
+| `GR8_DS_BLOCK` | text | the checkpoint's DSpark block, 5 |  | DSpark draft block size; the draft step always holds 5 rows a session, so only 5 is served. |
+| `GR8_DS_C8PACK` | flag | `0` | 0\|1 | Short fresh prompts (up to 64 rows each, up to 8 of them, 512 rows in all) prefill together in one ragged pass and share one prompt-tail step. Needs --serve, --s2-sessions >= 2 and GR8_DS_PREFILL_MIN >= 2. |
 | `GR8_DS_COMP_FP8` | flag | `0` |  | 1 = the ratio-2 compressor weights are packed to E4M3 with UE8M0 scales at bind time and prefill steps of 9 or more rows use them. Lossy, and its effect on quality has not been measured. |
+| `GR8_DS_DEC_STAGE` | flag | `0` | 0\|1 | Decode consumes of the main model (1..MX rows) read the peers' slots with 16-byte loads through shared memory. |
 | `GR8_DS_DSP_GV` | flag | `0` |  | 1 = the DSpark drafter's projections run on the MXFP8 GEMV for 1 to 8 rows. A projection that cannot take the GEMV then stops the process. 0 = the generic MXFP8 GEMM. |
 | `GR8_DS_DSP_TC` | flag | `0` |  | 1 = a DSpark prefill projection of more than 8 rows in one group runs on the attention block's tensor-core MXFP8 GEMM (ds41_gemm_mx_tc) when that entry takes the shape, else on the generic GEMM. |
 | `GR8_DS_ENGRAM` | flag | `0` | 0\|1 | 1 runs Engram at layers 1 and 14: every step hashes the last four tokens of each row, reads this rank's table rows from NVMe and adds the gated result to the trunk. It needs GR8_DS_ENGRAM_PREFIX. 0 skips Engram, and the other GR8_DS_ENGRAM_ knobs are not read. |
+| `GR8_DS_ENGRAM_MTP` | flag | `0` | 0\|1 | Allows GR8_DS_ENGRAM=1 together with GR8_DS_MTP. The verify rows' n-gram window comes from the host-built step input and a rejected draft's ring tokens are rewritten before they are read. Not yet compared against Engram at MTP 0. |
 | `GR8_DS_GATE_RO` | flag | `0` |  | 1: the read-once prefill path computes the main layers' gate logits with k_gate_logits_ro (8 experts x 8 tokens per warp) instead of k_gate_logits_mt. Same fma chain per token and expert, so the logits are the same bytes. The 128-expert draft layers keep k_gate_logits_mt. |
+| `GR8_DS_MHC_DECOMP` | flag | `0` | 0\|1 | Prefill chunks above MX rows run the mHC consume and prepare as separate decomposed kernels (ds_mhc_decomp.cuh). |
+| `GR8_DS_MHC_FUSE` | flag | `1` | 0\|1 | The mHC consume of one sub-layer and the prepare of the next run as one trunk pass, except where Engram sits between them. 0 runs them apart. |
+| `GR8_DS_MHC_ROW_SHARD` | flag | `0` | 0\|1 | W-row prefill: each rank runs the late layers' mHC for a quarter of the rows and all-gathers the trunk state. Needs W 4096, GR8_DS_PF_TAIL 128, TP4, GR8_DS_PF_RS=1 and GR8_DS_MHC_FUSE=1. |
+| `GR8_DS_MHC_Y_MXFP8` | flag | `0` | 0\|1 | With GR8_DS_MHC_ROW_SHARD=1, the y all-gather carries MXFP8 instead of BF16. Lossy. |
 | `GR8_DS_MOE_FC1BSTG` | flag | `0` |  | 1: the read-once fc1 expert loop copies its FP16 B fragments to a two-record cp.async shared ring before the same MMA. Every value is the same. |
 | `GR8_DS_MOE_FC2STG` | flag | `0` |  | 1: the read-once fc2 expert loop loads a group's act tile into registers in one batch and then stores it to shared memory, instead of one load and one store per trip. Every address and value is the same. Decode, k_fc1_ro and the shared expert are not touched. |
 | `GR8_DS_MOE_L2HINT` | int | `0` | 0..2 | An L2 evict_last hint on the routed expert weight loads of the read-once expert loop. 0: off. 1: k_fc1_ro only. 2: k_fc1_ro and k_fc2_ro. No activation load or store carries a hint, and decode and the shared expert are not touched. Every value is the same. |
@@ -95,10 +103,26 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_DS_MOE_PW_BOUND` | flag | `0` |  | 1: the chunked prefill path (33 to 256 rows) sizes its expert-slot grid from the routes the top-k cut keeps (rows x GR8_DS_MOE_TOPK) instead of rows x 6. The grid only shrinks when GR8_DS_MOE_TOPK is below 6. CTAs past the plan's slot count exit before any work, so the output is the same. |
 | `GR8_DS_MOE_SH_1PASS` | flag | `0` |  | 1: the shared expert at 33 to 48 rows runs in one pass of 6 tiles, so it reads its weights once, instead of a loop over 32-row chunks. |
 | `GR8_DS_MOE_TOPK` | int | `6` | 1..6 | Routed experts kept per token on the main layers (384 experts). The kept routes are the planner's first picks (best biased key first) and their weights renormalize over the kept. The 128-expert draft layers keep their top-3. 6 is the model's top-k. Quality below 6 is not measured. |
+| `GR8_DS_MOE_TOPK_DECODE` | int | the main step's routed experts | 1..6 | Routed experts a decode step takes, below the prefill's (GR8_DS_MOE_TOPK). A screen arm, not the model. |
+| `GR8_DS_MTP` | text | 0, no drafts |  | DSpark drafts verified a round, 1..5 (the checkpoint's three draft layers, block of 5). Served only. |
+| `GR8_DS_PF_DIRECT` | flag | `0` | 0\|1 | On a W-row prefill chunk the attention output and the MoE combine write their collective's send slot in place; reduce-scatter slices go as flat slices. Needs GR8_DS_PREFILL_W above MX. |
+| `GR8_DS_PF_GATHER` | flag | `0` | 0\|1 | Prefill consumes above MX rows read one device BF16 sum of the peers' partials instead of the peers' slots. |
+| `GR8_DS_PF_LANES` | text | 1, one lane |  | 1 or 2. 2 runs W-row prefill quanta of up to 2W rows of one session on two lanes with their own streams and fabric. |
+| `GR8_DS_PF_LATE_FINAL` | flag | `0` | 0\|1 | With GR8_DS_PF_TAIL, a chunk with at least tail + window rows after it skips the late layers' rows that no later reader needs. |
+| `GR8_DS_PF_POOL` | text | off |  | 0, or 2..the run-0 collectives: the prefill fabric's layer exchanges and all-gathers reuse this many slots each (FabricConfig::pool). |
+| `GR8_DS_PF_RS` | flag | `0` | 0\|1 | W-row prefill: the layer exchanges before the late split run as reduce-scatter plus all-gather. Needs GR8_DS_PF_TAIL and GR8_DS_PREFILL_W above MX. |
+| `GR8_DS_PF_TAIL` | text | the model's tail rows |  | Rows of each prefill chunk that run the late layers (bounded replay): 0 (off) or the attention window..4096. |
+| `GR8_DS_PREFILL_KEEP` | text | 0, every prompt row |  | 0, or 128 and more: only the last N prompt positions enter the DSpark draft's key rings. |
+| `GR8_DS_PREFILL_MIN` | int | `0` | 0.. | Prompts of at least this many tokens prefill in W-row chunks (GR8_DS_PREFILL_W); shorter ones, and every prompt at 0, run as decode steps. Several sessions (--s2-sessions > 1) need 2 or more. |
+| `GR8_DS_PREFILL_W` | text | MX: no W-row prefill |  | Rows of one prefill chunk, MX..4096. GR8_DS_ATTN_PW and GR8_DS41_IDX_PW must name the same width. |
+| `GR8_DS_RELAXED_ACCEPT` | text | off: exact acceptance |  | DSpark verify accepts a greedy row's draft by a relaxed rule: ratio:R (0 < R <= 1) and / or topp:P (0 < P < 1), comma separated. Not exact. |
 | `GR8_DS_RO_L2LA` | int | `0` | 0..1048576 | L2 lookahead of the read-once expert loop, in CTAs. While CTA b of k_fc1_ro runs, its warp 0 prefetches into L2 the weights of CTA b + n; k_fc2_ro (2 CTAs per SM) looks 2n ahead. A hint only: every value, order and write is the same. 0: off. |
 | `GR8_DS_RO_ORDER` | flag | `0` |  | 1: the read-once expert loop starts its CTA groups in the order k_order_ro computes (heavy and light experts merged in proportion to their work, heaviest first) instead of expert-id order. Only the start order changes, so every output byte is the same. |
 | `GR8_DS_SH_TC` | flag | `0` |  | 1: the shared expert of the read-once prefill path runs on the tensor-core MXFP8 GEMM (x and act quantized to E4M3 per 32 with E8M0 scales), and the combine reads its bf16 output. Not bit-identical to 0. Decode and the chunked path keep the GEMV. Costs a plain copy of the shared weights per MoE layer (9,461,760 bytes) plus scratch, and needs the attention object's ds41_gemm_mx_tc and ds41_sh_* entries linked. |
 | `GR8_DS_SRC_FAST` | int | `0` | 0..3 | Bits of the source-layer fast paths: 1 = the ratio-2 compressor projections of up to 8 rows use k_f32gemv2 (bit-identical to k_f32gemm2), 2 = the indexer's wq_b runs on the MXFP8 GEMV (a different summation order). |
+| `GR8_DS_STRIPE` | flag | `0` | 0\|1 | The main fabric stripes writes of at least GR8_DS_STRIPE_MIN bytes over both rails (needs --ips2). |
+| `GR8_DS_STRIPE_MIN` | int | `1048576` | 8192.. | With GR8_DS_STRIPE=1, the smallest write the fabric stripes, in bytes. |
+| `GR8_DS_WAIT_K` | int | `0` | 0..2 | Who waits for the peers' tails before a consume kernel: 0 every CTA, 1 one wait kernel ahead of it, 2 one CTA that then releases the others through a device word (main model only; others fall back to 1). |
 | `GR8_DS_WOB_PERSIST` | flag | `0` |  | 1 = the coalesced-epilogue wo_b GEMM of a direct-send prefill chunk runs as a persistent kernel (k_gemm_mx8t_c2_persist). |
 | `GR8_DTR` | flag | `1` |  | Uses the exlr8 release's dense trellis matrices (q_b, o_proj, the dense MLP) where a layer has them. 0 = the int4 or MXFP8 records, which the layer must then have. |
 | `GR8_DTR_NBFAST` | flag | `1` |  | Single-matrix dense trellis GEMVs whose group stride exceeds their block stride assign CTAs output block first instead of k part first. CTA order only. |
@@ -290,13 +314,18 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_DFL_DUMP` | path | unset |  | With --dflash, rank 0 writes every draft step's context features, drafts and committed tokens to this file, for engine/ref/dflash2_replay.py. |
 | `GR8_DRAFT_IN_DUMP` | path | unset |  | Rank 0 writes the inputs of every MTP first draft pass to this file. Needs --mtp and no --serve. |
 | `GR8_DS_C2_TRACE` | flag | `0` |  | 1 = count every launch of the coalesced-epilogue wo_b GEMM (k_gemm_mx8t_c2), so a run can print ds41a::c2_dispatch_count() at stop. |
+| `GR8_DS_CACHE_MIB` | int | the prefix cache's own size | 1.. | Size in MiB of the host prefix cache of DS41 session snapshots (--reuse-prefix). |
 | `GR8_DS_ENGRAM_CACHE_MIB` | int | `4096` | 1..1048576 | Size in MiB of the host cache of Engram table rows, shared by both layers. It holds 256-byte rows, so 4096 MiB holds 16 M rows. |
 | `GR8_DS_ENGRAM_IO_THREADS` | int | `32` | 1..1024 | Threads that read Engram table rows from NVMe. A decode step needs about 20 reads and a prefill chunk thousands; 64 reads a prefill chunk fastest. |
 | `GR8_DS_ENGRAM_LOOKAHEAD` | flag | `0` | 0\|1 | 1 starts a host thread that, during a solo prefill, reads the next chunk's layer 1 rows into the row cache while the current chunk runs the later layers. It only warms the cache: the results do not change. |
 | `GR8_DS_ENGRAM_PREFIX` | path | no Engram tables; GR8_DS_ENGRAM=1 then stops the boot |  | The path prefix of this rank's Engram files: PREFIX.engram.json (the manifest), PREFIX.engram.cmap (the token map), and PREFIX.engram.L001.w8 / .s8 and PREFIX.engram.L014.w8 / .s8 (the rows and scales of this rank's slice of each table). |
 | `GR8_DS_ENGRAM_VERBOSE` | flag | `0` | 0\|1 | 1 prints one line of row store numbers per layer and step on stderr: requests, cache hits, reads, bytes and time. |
 | `GR8_DS_ENGRAM_WAYS` | int | `16` | 1..16 | Ways of the set-associative Engram row cache. |
+| `GR8_DS_FEED_DIR` | path | off |  | Debug: a directory of reference activations the step driver feeds in place of its own, layer by layer. |
 | `GR8_DS_MOE_ELOG` | flag | `1` |  | 1: every prefill router call (more than 32 rows) writes the distinct experts of each layer to a device ring that the host reads after the chunk. 0: no record is written. |
+| `GR8_DS_SPAN` | flag | `0` | 0\|1 | Prints the host time of each step's spans. |
+| `GR8_DS_SUBDUMP` | path | off |  | Debug: a directory where each step's sub-layer partials are written. |
+| `GR8_DS_XTRACE` | flag | `0` | 0\|1 | With GR8_XTRACE=1 and DSpark, also trace the DSpark draft fabric. |
 | `GR8_FABRIC_CONNECT_TRIES` | int | `1200` |  | Fabric TCP connect attempts, 100 ms apart. Raise it when ranks load at different speeds. |
 | `GR8_GLM53F_DRAFT_CACHE_DUMP` | path | unset |  | Flash with --mtp: each rank writes its draft cache pages before the first live draft to this path plus .s<seq>.r<rank>.bin. |
 | `GR8_GLM53F_KDA_STATE_DUMP` | path | unset |  | After each offline sequence, each rank writes the KDA S state and conv state of every layer to PATH.rank<R>. |
@@ -399,6 +428,7 @@ Read by test programs, audits and benchmarks. `g6m4 --serve` refuses to start wh
 | `GR8_TEST_CP_PF_BREAK` | text | unset | gather\|back | Negative control for the CP prefill staging gate in m4sim: skips the gather or the back half of the staging so the gate must fail. |
 | `GR8_TEST_CP_PF_NET` | flag | `0` |  | In m4sim, the CP prefill gather runs as g6m4's real fabric does it, each rank filling its own pool and sending tail pages to the others, instead of the loopback gather. |
 | `GR8_TEST_DS41_KERNELS_DIR` | path | unset |  | engine/kernels, for the loader test that checks the Rust mx4g packer against the C++ one (mxfp4_pack.h); unset skips it. |
+| `GR8_TEST_DS41_M4_PFW` | int | `0` | 0.. | m4sim: the prompt runs in W-row chunks of this many rows (it must equal GR8_DS_PREFILL_W and exceed MX); 0 runs it as decode steps. |
 | `GR8_TEST_DS41_MGATE_DIAG` | flag | `0` |  | ds41_attn_test --mgate: 1 prints, for a kv compare that differs, up to 8 differing elements of the chunk and of the single-row calls, before and after kv prep. |
 | `GR8_TEST_DS41_RO_CAP_MB` | float | `400` | 0.. | ds_ro_flags_test: the memory cap in MB on the test's device and host allocations. A mode that would allocate more stops before it runs. |
 | `GR8_TEST_DS41_TOKENIZER_DIR` | path | unset |  | The DeepSeek-V4.1-Flash tokenizer directory (tokenizer.json, tokenizer_config.json) the front end's ds41 dialect test reads; unset skips it. |

@@ -35,7 +35,7 @@
 // A launch between the ops from another source only delays a PDL launch (it then waits for full completion), it never breaks one.
 #pragma once
 #if G6_MODEL_DS41
-#ifndef G6_DS41_MOE_KERNELS
+#ifndef GR8_DS41_MOE_KERNELS
 #error "ds41_moe_ops.cuh: include ../kernels/ds41_moe_kernels.h at global scope (rank.cuh, next to ds41_ops.h) first"
 #endif
 #include <cstddef>

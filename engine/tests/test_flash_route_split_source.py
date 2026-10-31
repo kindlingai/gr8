@@ -163,23 +163,101 @@ class Boot(unittest.TestCase):
 
     def test_ports_and_cpus_disjoint(self):
         g = src('engine/runtime/g6m4.cu')
-        ports = [int(x) for x in re.findall(r'cfg\.port \+ (\d+)', g)] + [int(x) for x in re.findall(r'init_(?:ids|rs)\(\w+, (\d+), \d+\)', g)]
-        self.assertEqual(sorted(ports).count(80), 1)
-        self.assertEqual(sorted(ports).count(88), 1)
-        self.assertEqual(len(ports), len(set(ports)), sorted(ports))
+        # DS41's fabds is compiled only under its model guard. The legacy
+        # fabd is also compiled there, but DS41 refuses --mtp > 0 before
+        # either fabric is initialized; fabds requires GR8_DS_MTP instead.
+        # Check BOTH effective fabric sets. Ignoring fabds outright would
+        # miss a collision added inside the DS41 branch.
+        m = re.search(
+            r'(?P<legacy>    g6::Fabric fabd;.*?        fabd\.start_proxy\(\);\n    \})\n'
+            r'(?P<ds41>#if G6_MODEL_DS41\n    g6::Fabric fabds;.*?\n#endif)',
+            g, re.S)
+        self.assertIsNotNone(m, 'legacy and DS41 draft fabric blocks must be recognizable')
+        self.assertIn('if (mtp > 0) die("DS41:', g)
+        self.assertIn('if (MP > 0) die("DS41: --prefill is not supported', g)
+        self.assertIn('if (dsk.on())', m['ds41'])
+        common = g[:m.start()] + g[m.end():]
+        # DS41's opt-in W lane has a separate fabric at offset 2. It is
+        # mutually exclusive with the legacy tensor-prefill lane 2: DS41
+        # refuses --prefill, so MP is zero and both fabp/fabp2 stay idle.
+        # Split those source blocks before counting, rather than suppressing
+        # offset 2 (which would hide a real collision within either model).
+        lane_b = re.search(r'(?P<block>#if G6_MODEL_DS41\n    // GR8_DS_PF_LANES=2:.*?\n#endif)\n    // DS41 with Engram', common, re.S)
+        self.assertIsNotNone(lane_b, 'DS41 lane-B fabric block must be recognizable')
+        self.assertIn('if (pf_lanes_fab == 2)', lane_b['block'])
+        self.assertIn('fabB.start_proxy();', lane_b['block'])
+        self.assertIn('mc.port = cfg.port + 96;', lane_b['block'])
+        self.assertIn('mc.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;', lane_b['block'])
+        common = common[:lane_b.start()] + common[lane_b.end():]
+        prefill = re.search(r'(?P<block>    g6::Fabric fabp;.*?\n    \})\n(?=#if G6_MODEL_FLASH\n    // Independent pool-ID exchange:)', common, re.S)
+        self.assertIsNotNone(prefill, 'legacy tensor-prefill fabrics must be recognizable')
+        self.assertIn('if (MP)\n', prefill['block'])
+        self.assertIn('const bool two = MP && lanes == 2;', prefill['block'])
+        self.assertIn('fabp2.start_proxy();', prefill['block'])
+        flash_only = re.search(r'(?P<block>#if G6_MODEL_FLASH\n    // Independent pool-ID exchange:.*?\n#endif)', common, re.S)
+        self.assertIsNotNone(flash_only, 'Flash-only pool and route fabrics must be recognizable')
+        self.assertIn('init_rs(fabrs, 80, 11);', flash_only['block'])
+        self.assertIn('init_rs(fabrs2, 88, 12);', flash_only['block'])
+        ds41_common = common.replace(prefill['block'], '', 1).replace(flash_only['block'], '', 1)
         # the replicated-GEMV gather fabric (gc, offset 9) is GLM-5.3 only: a Flash build dies on GR8_QA_SPLIT and friends,
         # and the pool-ID fabric takes offset 9 there
-        self.assertIn('if (G6_MODEL_FLASH && (qs_mode || iq_split || mtp_split)) die(', g)
-        flash = '\n'.join(l for l in g.split('\n') if 'gc.proxy_cpu' not in l)
-        cpus = [int(x) for x in re.findall(r'proxy_cpu - (\d+)', flash)] + [int(x) for x in re.findall(r'init_(?:ids|rs)\(\w+, \d+, (\d+)\)', flash)]
-        self.assertEqual(len(cpus), len(set(cpus)), sorted(cpus))
-        self.assertTrue({11, 12} <= set(cpus))
+        self.assertIn('if ((G6_MODEL_FLASH || G6_MODEL_DS41) && (qs_mode || iq_split || mtp_split)) die(', common)   # widened by d751d3d
+        for name, active in (('legacy', common + m['legacy']),
+                             ('DS41', ds41_common + lane_b['block'] + m['ds41'])):
+            with self.subTest(model=name):
+                ports = [int(x) for x in re.findall(r'cfg\.port \+ (\d+)', active)]
+                ports += [int(x) for x in re.findall(r'init_(?:ids|rs)\(\w+, (\d+), \d+\)', active)]
+                if name == 'legacy':
+                    self.assertEqual(sorted(ports).count(80), 1)
+                    self.assertEqual(sorted(ports).count(88), 1)
+                    self.assertNotIn(96, ports)
+                else:
+                    self.assertEqual(sorted(ports).count(96), 1)
+                    self.assertNotIn(80, ports)
+                    self.assertNotIn(88, ports)
+                self.assertEqual(len(ports), len(set(ports)), sorted(ports))
+                flash = '\n'.join(l for l in active.split('\n') if 'gc.proxy_cpu' not in l)
+                cpus = [int(x) for x in re.findall(r'proxy_cpu - (\d+)', flash)]
+                cpus += [int(x) for x in re.findall(r'init_(?:ids|rs)\(\w+, \d+, (\d+)\)', flash)]
+                self.assertEqual(len(cpus), len(set(cpus)), sorted(cpus))
+                if name == 'legacy':
+                    self.assertTrue({11, 12} <= set(cpus))
+                else:
+                    self.assertEqual(cpus.count(2), 1)
+                    self.assertFalse({11, 12} & set(cpus))
 
     def test_teardown_and_error_word(self):
         g = src('engine/runtime/g6m4.cu')
         self.assertIn('release_flash_route_split(FP.route_split);', g)
         self.assertIn('route-table fabric error', g)
         self.assertIn('init_flash_route_split(FP.route_split, fabrs, MP);', g)
+
+
+class Ds41LaneB12(unittest.TestCase):
+    def test_lane_b_fabric_includes_state_collective(self):
+        g = src('engine/runtime/g6m4.cu')
+        self.assertIn('glue::head_bytes_tk(MX, nc, true), pf_rs_on, rowshard);', g)
+        self.assertEqual(g.count('mc.ncoll = ds41::rs::main_ncoll(NC, rs_k, rowshard);'), 2)
+        lanes = src('engine/runtime/ds41_lanes.h')
+        self.assertIn('head_payload, rs_on, false, rowshard);', lanes)
+
+    def test_lane_b_b12_storage_is_private(self):
+        view = src('engine/runtime/ds41_lane_view.cuh')
+        for name, allocation in (
+            ('ds41_y_codes', 'dmalloc<uint8_t>(HR * HID)'),
+            ('ds41_y_scales', 'dmalloc<uint8_t>(HR * HID / 32)'),
+            ('ds41_state_ticket', 'dmalloc<unsigned>(1)'),
+        ):
+            self.assertRegex(view, re.compile(r'mB\.' + name + r'\s*=.*' + re.escape(allocation)))
+        self.assertIn('mB.ds41_rowshard_pending_c = -1;', view)
+
+    def test_two_lane_prologue_uses_b12_contract_and_resets(self):
+        g = src('engine/runtime/g6m4.cu')
+        two = between(g, 'dc.prefill2 = [&]', 'dc.errors2 = [&]')
+        for required in ('ds41::lanes::b12_job(', 'rowshard, y_mxfp8, skip_late[L]', 'p.state_bytes',
+                         'M.ds41_rowshard_chunk = p.shard_chunk;', 'M.ds41_rowshard_state = p.shard_state;',
+                         'M.ds41_y_quant_ready = false;', 'M.ds41_rowshard_pending_c < 0'):
+            self.assertIn(required, two)
 
 
 if __name__ == '__main__':
