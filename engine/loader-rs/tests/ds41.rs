@@ -253,7 +253,7 @@ impl Mini {
                             s.extend_from_slice(&sc[br * (k / 32) + u * 4..br * (k / 32) + u * 4 + 4]);
                         }
                     }
-                    v.push(item(&format!("{base}.record"), "I64", vec![8], rec(8, n, k, 2, 128)));
+                    v.push(item(&format!("{base}.record"), "I64", vec![8], rec(8, n, k, 2, 256)));
                     v.push(item(&format!("{base}.fp8"), "U8", vec![k / 128, n, 128], c));
                     v.push(item(&format!("{base}.e8m0"), "U8", vec![k / 128, n / 32, 4], s));
                 } else {
@@ -818,3 +818,33 @@ fn mx4g_matches_the_b6_cpp_packer() {
     eprintln!("mx4g: fc1 {} B and fc2 {} B identical to mxfp4_pack.h", fc1.len(), fc2.len());
 }
 
+
+/// The fetch list is complete: a release holding only the ranges `reads` names (every other byte zero) plans the same
+/// image, byte for byte.
+#[test]
+fn reads_cover_the_load() {
+    let m = mini("reads");
+    m.write();
+    for (nr, rank) in [(4usize, 1usize), (2, 0)] {
+        let p = ds41::plan(&m.dir, nr, rank, &Opts::default()).unwrap();
+        let sparse = format!("{}/sparse-{nr}-{rank}", m.dir);
+        for sub in ["dense", "experts"] {
+            for e in std::fs::read_dir(format!("{}/{sub}", m.dir)).unwrap() {
+                let path = e.unwrap().path();
+                let rel = format!("{sub}/{}", path.file_name().unwrap().to_string_lossy());
+                let full = std::fs::read(&path).unwrap();
+                let mut out = vec![0u8; full.len()];
+                // index files are read whole when the release opens
+                let whole = rel.ends_with(".index.safetensors");
+                for &(a, n) in p.reads.get(&rel).map(Vec::as_slice).unwrap_or(&[]) {
+                    out[a as usize..(a + n) as usize].copy_from_slice(&full[a as usize..(a + n) as usize]);
+                }
+                std::fs::create_dir_all(format!("{sparse}/{sub}")).unwrap();
+                std::fs::write(format!("{sparse}/{rel}"), if whole { &full } else { &out }).unwrap();
+            }
+        }
+        let q = ds41::plan(&sparse, nr, rank, &Opts::default()).unwrap();
+        assert_eq!(ds41::hash_image(&q.img, 2).unwrap(), ds41::hash_image(&p.img, 2).unwrap(), "nr {nr} rank {rank}");
+        assert_eq!(q.reads, p.reads);
+    }
+}

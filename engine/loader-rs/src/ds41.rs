@@ -401,11 +401,15 @@ impl Release {
         if r[0] != exlr8::FP8_B32 {
             return Err(format!("{native}: record format {}, gr8 reads FP8 with E8M0 per 32 x 32 (format 8) here", r[0]));
         }
-        let (out, inp, unit) = (r[1] as usize, r[2] as usize, r[5] as usize);
-        let (c, s) = (f.info(&format!("{x}.fp8"))?.start, f.info(&format!("{x}.e8m0"))?.start);
+        let (out, inp) = (r[1] as usize, r[2] as usize);
+        let (ci, si) = (f.info(&format!("{x}.fp8"))?, f.info(&format!("{x}.e8m0"))?);
+        let (c, s) = (ci.start, si.start);
         let place = if r[4] == exlr8::SIDE_IN {
-            if unit == 0 || inp % unit != 0 || unit % BLK != 0 {
-                return Err(format!("{native}: input-side unit {unit} of {inp}"));
+            // input side: [in / b][out][b] codes and [in / b][out / 32][b / 32] scales, b from the tensor's shape (the
+            // record's unit field is the sharding unit, a multiple of b)
+            let unit = match ci.shape[..] { [nb, o, b] if o == out && nb * b == inp && b % BLK == 0 => b, _ => 0 };
+            if unit == 0 || si.shape != [inp / unit, out / BLK, unit / BLK] {
+                return Err(format!("{native}: input-side codes {:?} / scales {:?} for [{out},{inp}]", ci.shape, si.shape));
             }
             let offs = (0..inp / unit).map(|u| (c + (u * out * unit) as u64, s + (u * (out / BLK) * (unit / BLK)) as u64)).collect();
             Place::InUnits { unit, offs }
@@ -911,6 +915,13 @@ pub fn plan_from(rel: &Release, nr: usize, rank: usize, opts: &Opts) -> Result<D
             missing.sort();
             return Err(format!("{} release tensors are neither planned nor skipped, e.g. {:?}", missing.len(), &missing[..missing.len().min(8)]));
         }
+    }
+    // the records the planner reads to plan, in every layer, vocabulary and Engram file
+    let files: Vec<Arc<StFile>> = rel.dense.values().chain([&rel.vocab]).chain(rel.engram.values().flatten()).cloned().collect();
+    for f in files {
+        let runs: Vec<(u64, u64)> = f.names().iter().filter(|n| n.ends_with(".record")).filter_map(|n| f.info(n).ok())
+            .map(|i| (i.start, i.end - i.start)).collect();
+        p.note(&f, runs);
     }
     // every file the plan opens: its header too (the reads above are tensor data)
     let headers: Vec<(String, u64)> = p.reads.keys().map(|k| {
