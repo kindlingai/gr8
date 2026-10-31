@@ -132,8 +132,10 @@ k_gemm_mx8t, the same MXFP8 operands) against the same single-lane W 1024 run wi
 
 The projections fall from 42% of the pass to 10%, the prefill rate rises 54-58% at every length, and the multi-agent
 aggregates (short prompts, 256-token answers) go from 47 / 70 to 84.5 / 111.7 tok/s at 2 / 4 streams; decode is
-unchanged (74.5 / 47.3 against 74.5 / 48.5 tok/s, within the spread). The two runs' prefill answers agree token for
-token (RigMark samples, so the decode answers vary within a run either way). The remaining pass is the read-once MoE
+unchanged (74.5 / 47.3 against 74.5 / 48.5 tok/s, within the spread). It is not bit-exact: the tensor cores sum in another order, so a layer's attention and MoE partials
+differ in their low bits (m4sim, a 512-row chunk, every layer's hash differs), while the tokens were the same in that
+check (temperature 0, 5 steps) and the two runs' prefill answers agree token for token (RigMark samples, so the decode
+answers vary within a run either way). The knob stays off in the engine; the configuration decides. The remaining pass is the read-once MoE
 (96 ms), the two consumes (90 ms), the indexer (32 ms), Engram (26 ms) and the attention core (20 ms).
 
 ### The fabric
