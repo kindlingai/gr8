@@ -29,6 +29,18 @@ through v2plan.rs, and drops that layer's x.fc1 / x.fc2 / sh.* records.
 
 ## Not yet
 
-A prefill chunk above 32 rows runs on a trellis layer as 32-row K1 passes, which reads the routed experts once per pass.
-A prefill kernel that reads each expert once (GLM's tr3_gemm.cuh route) comes after the decode path is measured. The
-DSpark draft layers stay MXFP4.
+Above 32 rows (prefill) the MoE op hands DS41's routes to the GLM prefill MoE (bindp::Expert with pre_routed): DS41's
+plan of that size supplies each token's experts and weights, GLM's count and fill group the routes into segments of up
+to 64 rows per expert, and fc1, mid and fc2 read each expert's units once per segment. The trellis shared expert runs as
+its own pass first, and the routed pass's finalize adds it into the BF16 partial. The DSpark draft layers stay MXFP4.
+
+## Measured
+
+TP4, four GB10 boxes at 2200 MHz, the launcher defaults plus GR8_DS_MANIFEST=pmcgx-k4, RigMark 1.0.0 at reasoning
+effort low:
+
+| | native | pmcgx-k4 (layers 0-7) |
+|---|---|---|
+| decode, code / prose | 77.8 / 49.7 tok/s | 78.7 / 50.2 tok/s |
+| 8K prefill, cold | 2,023 tok/s | 2,148 tok/s |
+| aggregate, 1 / 2 / 4 streams | 64.8 / 52.8 / 75.0 tok/s | 64.7 / 51.4 / 72.1 tok/s |

@@ -31,3 +31,20 @@ two offsets from that rank's timestamps, and refuses a probe with a round trip o
 (`--max-rtt-ms`, `--max-drift-ms`). Without `--clock` the timestamps are joined as written.
 
 The trace reads the host clock only: no device syncs and no change to what the engine does.
+
+# ConnectX counters
+
+`tools/trace/nicprof.py` samples every RDMA port of each rank's machine over ssh during a run and writes
+`PATH.nic.r<rank>.json`: per port, the send and receive rate in Gb/s, and the increase per interval of the counters that
+show transport trouble (retransmits, sequence errors, CNPs, ECN marks, transmit waits). The samples carry each machine's
+wall clock, so merge.py joins them with that rank's S2 trace and applies the same `--clock` offsets:
+
+    tools/trace/nicprof.py --out /tmp/nic 0=HOST0 1=HOST1 2=HOST2 3=HOST3 --seconds 120 &
+    # ... the run ...
+    tools/trace/merge.py /tmp/s2.r*.json /tmp/nic.nic.r*.json -o trace.json
+
+It also prints a summary per rank and port: mean and peak rates over the intervals the port moved data, and the
+trouble counters' totals.
+
+`GR8_DS_SPAN=1` adds the DS41 GPU side: the time of each plan unit (attention, consume, MoE, head, ...) summed over the
+layers, per eager step and, for each captured step graph, as the mean over 64 sampled replays.
