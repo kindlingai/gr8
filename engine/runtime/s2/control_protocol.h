@@ -7,7 +7,7 @@ enum class Tag : uint64_t { Notice=1, Ack=2, Commit=3, Request=4, Quit=5, Sync=6
 struct Encoder {
     std::vector<uint8_t> b;
     void u64(uint64_t x){for(int i=7;i>=0;--i)b.push_back(uint8_t(x>>(i*8)));}
-    explicit Encoder(Tag t){u64(0x473653324530ull+CONTROL_VERSION);u64(uint64_t(t));} // G6S2E<CONTROL_VERSION>
+    explicit Encoder(Tag t){u64(0x473653324530ull+CONTROL_VERSION);u64(uint64_t(t));} // numeric base G6S2E0 + CONTROL_VERSION (10 ends in 0x3A)
     void notice(const Notice& n){u64(n.epoch);u64(n.event);u64(n.boundary);u64(n.request);u64(n.payload_hash);u64(uint64_t(n.kind));}
     void key(Key k){u64(k.epoch);u64(k.slot);u64(k.generation);}
     void steering(const g6rt::steering::Identity& s){

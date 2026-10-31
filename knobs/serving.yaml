@@ -304,6 +304,14 @@ knobs:
     doc: >-
       S2: while a prefill waits and sessions decode, runs this many decode rounds per prefill quantum instead of one. 0
       or 1 = off.
+  GR8_S2_NOTICE_MAX:
+    scope: agree
+    kind: int
+    default: "8"
+    values: "2..8"
+    doc: >-
+      S2: the latest boundary a notice may target, in boundaries after the one it was anchored at. Lower only from a
+      measured margin: a notice that lands after its boundary stops the engine.
   GR8_S2_DSEL:
     scope: agree
     kind: flag
@@ -372,6 +380,14 @@ knobs:
     default: "1000"
     doc: >-
       S2 with a KV node lease: how often in ms the head reports to the node and asks for segments.
+  GR8_S2_TAIL_FIRST:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      S2: a session with only its prompt tail left is served before any prefill, and its one-row tail does not ask for a
+      decode round, so a burst of short prompts reaches its first tokens one tail a step.
   GR8_S2_TIMELINE:
     scope: local
     kind: int

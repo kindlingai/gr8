@@ -198,6 +198,9 @@ build k1_split_test nvcc -O2 -std=c++17 $S2 -I "$REPO/engine/kernels" -o "$OUT/k
 # fabric groups over real verbs (#154): built here, run by hand on the cluster (one process per box; see its header)
 build fabric_group_test $NVCC -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_group_test" \
   "$REPO/engine/comms/tests/fabric_group_test.cpp" "$REPO/engine/comms/fabric.cpp" -libverbs "${KNOBS[@]}"
+# flat reduce-scatter slices (Fabric::Rs::flat) over real verbs, mesh or ring: built here, run on the cluster (see its header)
+build fabric_rs_flat_test $NVCC -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_rs_flat_test" \
+  "$REPO/engine/comms/tests/fabric_rs_flat_test.cpp" "$REPO/engine/comms/fabric.cpp" -libverbs "${KNOBS[@]}"
 # the adaptive draft length decision, CPU
 build test_spec_len $GXX -O2 -std=c++17 -o "$OUT/test_spec_len" "$REPO/engine/tests/test_spec_len.cpp"
 # the prefix-reuse state machine (--reuse-prefix and its grid rules), CPU
@@ -223,6 +226,6 @@ else
   echo "tr3_e4m3_test and the steering tests ($STEERING): compiled; no GPU visible, not run"
 fi
 echo "dtr_test_tp<N>, dtr_test_flash_tp<N>, l2pf_bench, k1_ovl_test: built (they need release files or an idle GPU)"
-echo "fabric_group_test: built (cluster test, not run here)"
+echo "fabric_group_test, fabric_rs_flat_test: built (cluster tests, not run here)"
 [ -f "$GR8_NVCC_CACHE_LOG" ] && echo "nvcc cache (tests): $(grep -c '^hit' "$GR8_NVCC_CACHE_LOG") hit, $(grep -c '^miss' "$GR8_NVCC_CACHE_LOG") miss"
 exit 0

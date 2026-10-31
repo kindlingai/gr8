@@ -14,20 +14,10 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include "../attn/replay.h"
+#include "s2_in.h"                    // S2N, S2In, s2in_copy
 
 namespace g6rt
 {
-
-constexpr int S2N = 8;                // session slots
-
-// per-step session layout. ns sessions in the step; j-th: slot sess[j], rows row0[j]..row0[j]+rows[j]-1, context ctx[j]
-// (sessions in ascending slot order, rows contiguous, row0[0] = 0)
-struct S2In
-{
-    int ns, cls;                      // cls: the step's k1 row class (1 / 3 / 5)
-    int sess[S2N], row0[S2N], rows[S2N], ctx[S2N];
-    int src0[S2N];                    // draft model, first form: the j-th session's first row in the main model's x
-};
 
 struct S2Cells
 {
@@ -47,7 +37,7 @@ __global__ void __launch_bounds__(128) k_s2_cells(S2Cells c)
 {
     __shared__ S2In sh;
     const int t = threadIdx.x;
-    if (t < (int)(sizeof(S2In) / 4)) reinterpret_cast<uint32_t*>(&sh)[t] = __ldcv(c.in + t);
+    s2in_copy(reinterpret_cast<uint32_t*>(&sh), c.in, t, 128);
     __syncthreads();
     for (int k = t; k < sh.ns * c.nl; k += 128)
     {

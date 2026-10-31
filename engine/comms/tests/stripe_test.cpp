@@ -58,7 +58,7 @@ int main(int argc, char** argv)
         f.barrier();                                         // both ranks ring at about the same time
         const auto t0 = std::chrono::steady_clock::now();
         __atomic_store_n(d.doorbell, seq, __ATOMIC_RELEASE);
-        const char* rs = d.recv + (static_cast<size_t>(par) * d.nr + peer) * d.stride;
+        const char* rs = d.recv + g6::fab_recv_off(d, par, 0, peer);
         volatile const unsigned long long* tail = reinterpret_cast<volatile const unsigned long long*>(rs + bytes);
         while (*tail != seq)
             if (*d.error) { fprintf(stderr, "rank %d: fabric error 0x%x at step %d\n", me, *d.error, s); return 1; }

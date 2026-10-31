@@ -18,6 +18,15 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engin
 "$T/steering_test" "$REPO/engine/runtime/tests/fixtures/steering_contract.json"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/fabric_mtu_test.cpp" -o "$T/fabric_mtu_test"
 "$T/fabric_mtu_test"
+# the proxy's collective order (engine/comms/fabric_order.h): a plan that publishes out of numeric order stalls without
+# Rs::order and passes with it; no order is the numeric loop
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_order_test.cpp" -o "$T/fabric_order_test"
+"$T/fabric_order_test"
+# slot runs and the compact recv area (fabric.h fab_slot_layout): one run is the old offsets, runs tile the region
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_runs_test.cpp" -o "$T/fabric_runs_test"
+"$T/fabric_runs_test"
+g++ -std=c++17 -O2 -Wall -Wextra -fsanitize=address,undefined -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_ring_runs_test.cpp" -o "$T/fabric_ring_runs_test"
+"$T/fabric_ring_runs_test"
 g++ -std=c++17 -O2 -Wall -fsanitize=address,undefined -I "$REPO/engine/comms" "$REPO/engine/comms/tests/relay_test.cpp" \
   -o "$T/relay_test"
 "$T/relay_test"
@@ -45,6 +54,13 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 "$T/grammar_request_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_round_test.cpp" -o "$T/batch_round_test" "${KNOBS[@]}"
 "$T/batch_round_test"
+# K = 0 (no draft head): a Batch runs no DRAFT or CHAIN step and never writes past St::d, and a Driver serves requests
+# at mtp 0 with every prompt as decode steps; the K >= 1 digests stay what they were
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -D_GLIBCXX_ASSERTIONS -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_k0_test.cpp" -o "$T/batch_k0_test" "${KNOBS[@]}"
+"$T/batch_k0_test" > /dev/null
+# a packed prompt tail: one MAIN step for several sessions' tails, each emitting and inserting on its own
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_c8_tail_test.cpp" -o "$T/batch_c8_tail_test" "${KNOBS[@]}"
+"$T/batch_c8_tail_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dflash_test.cpp" -o "$T/batch_dflash_test" "${KNOBS[@]}"
 "$T/batch_dflash_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dsel_test.cpp" -o "$T/batch_dsel_test" "${KNOBS[@]}"
@@ -92,6 +108,12 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 # Config::decode_rounds (GR8_S2_DECODE_ROUNDS): K decode rounds per prefill quantum, its notice target, default off
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rounds_test.cpp" -o "$T/scheduler_rounds_test" "${KNOBS[@]}"
 "$T/scheduler_rounds_test"
+# Config::tail_first (GR8_S2_TAIL_FIRST): a ready prompt tail before any prefill, no decode round forced after it
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_tail_first_test.cpp" -o "$T/scheduler_tail_first_test" "${KNOBS[@]}"
+"$T/scheduler_tail_first_test"
+# the Driver's prefill quanta: the shortest prompt first, owed quanta, decode rounds between them
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/driver_prefill_quantum_test.cpp" -o "$T/driver_prefill_quantum_test" "${KNOBS[@]}"
+"$T/driver_prefill_quantum_test" > /dev/null
 # KvTiers::run's copy batches (s2/kv_plan.h): a batch of 1 advances, a slot spilled twice ends with the second page,
 # batched copies = one at a time: no pool, no CUDA
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/kv_plan_test.cpp" -o "$T/kv_plan_test" "${KNOBS[@]}"
@@ -186,6 +208,9 @@ g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/run
 # during the prefill lands before the capture, on two ranks through the real Service loop
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/flash_capture_order_test.cpp" "${KVLIB[@]}" -o "$T/flash_capture_order_test"
 (cd "$T" && "$T/flash_capture_order_test" 2>/dev/null)
+# GR8_S2_ADMIT_HOLD=1: ADMIT files that land inside a held admission join the held boundary
+g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/admit_hold_drain_test.cpp" "${KVLIB[@]}" -o "$T/admit_hold_drain_test"
+(cd "$T" && "$T/admit_hold_drain_test" 2>/dev/null)
 g++ -std=c++17 -O2 -Wall "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_flash_s2_cost" "${KNOBS[@]}"
 "$T/test_flash_s2_cost"
 g++ -std=c++17 -O2 -Wall -DG6_NR=3 "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_flash_s2_cost_tp3" "${KNOBS[@]}"

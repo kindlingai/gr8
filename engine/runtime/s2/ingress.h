@@ -55,11 +55,16 @@ class Ingress {
 public:
     Ingress(std::string dir, uint64_t epoch):dir_(std::move(dir)),epoch_(epoch){require(epoch,"invalid epoch");}
     std::optional<Command> next() {
+        auto c=peek();
+        if (c) { require(next_!=UINT64_MAX,"command sequence exhausted"); ++next_; }
+        return c;
+    }
+    // the next command without consuming it (the head's ADMIT_HOLD drain stops at the first one that is not an ADMIT)
+    std::optional<Command> peek() const {
         require(!exists(dir_+"/abort.s2"), "shim aborted epoch");
         auto p=dir_+"/cmd."+std::to_string(next_);
         if (!exists(p)) return {};
-        auto c=parse_command(read_file(p),epoch_);
-        require(next_!=UINT64_MAX,"command sequence exhausted");++next_;return c;
+        return parse_command(read_file(p),epoch_);
     }
     std::string request(const Command& c) const {
         require(c.admit && c.epoch==epoch_,"not this epoch's admission");
