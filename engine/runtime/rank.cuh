@@ -54,6 +54,7 @@
 #include "ds41_rowshard.h"     // default-off row-sharded mHC host geometry and boundary-state size
 #include "ds41_b12_dispatch.h" // main-model W-row-only mHC decomposition switch, outside namespace g6rt
 #include "../kernels/ds41_moe_kernels.h"   // global-scope kernels of the MoE op adapters (ds41_moe_ops.cuh, included by ds41_step.cuh)
+#include "../kernels/bind_prefill.cuh"   // bindp::Expert: the trellis layers' prefill MoE (ds41_moe_ops.cuh trellis_prefill)
 #include "../mhc/ds_mhc.cuh"
 #include "../mhc/ds_mhc_decomp.cuh" // the two-stage mHC k_step; the ds_mhc wrappers stay the base path
 #include "ds41_dspark.h"        // host rules of DSpark (ds41::dsp); like ds41_ops.h it must stay outside namespace g6rt
