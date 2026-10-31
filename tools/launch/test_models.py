@@ -127,6 +127,122 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(c['model'], 'glm53f')
 
 
+def ds41(*argv, peers=PEERS):
+    o = opt.parse(['--no-config', '--peers', peers, *argv], {'GR8_MODEL': 'ds41'})
+    opt.validate(o)
+    return o
+
+
+class Ds41Tests(unittest.TestCase):
+    """DeepSeek-V4.1-Flash-1017 scaffold (docs/DEEPSEEK.md): TP=4, the engine bin, the refusals."""
+    def test_defaults(self):
+        o = ds41()
+        self.assertEqual((models.of(o), o.get('GROUP'), S.engine_bin(o)), (models.DS41, 'gr8-ds41', 'g6m4_ds41'))
+        self.assertEqual(models.DS41.architecture, 'DeepseekV41ForCausalLM')
+
+    def test_refusals(self):
+        for argv, want in ((['--tp', '3'], 'want 4 (ds41)'), (['--dflash', '1'], 'no DFlash2 drafter'),
+                           (['--kv-format', 'int4'], 'fp8 KV build only')):
+            with self.assertRaises(opt.OptionError) as e:
+                ds41(*argv)
+            self.assertIn(want, str(e.exception))
+        # DS41 prefix snapshots are now opt-in via REUSE=1; the other refusals remain.
+        opt.engine_plan(ds41('--reuse', '1'))
+        for argv, want in ((['--sess', '9'], 'serves several sessions only with GR8_DS_PREFILL_MIN>=2'),
+                           (['--mtp', '6'], 'drafts 0 to 5'), (['--sess', '8', '--mtp', '4'], 'a round of 40 rows')):
+            with self.assertRaises(opt.OptionError) as e:
+                opt.engine_plan(ds41(*argv))
+            self.assertIn(want, str(e.exception))
+
+    def test_front_end_defaults_are_the_models_and_a_setting_wins(self):
+        o = ds41()
+        self.assertEqual((o.get('DEFAULT_MAX_TOKENS'), o.get('DEFAULT_REASONING_EFFORT')), ('32768', 'low'))
+        self.assertEqual((o.origin['DEFAULT_MAX_TOKENS'], o.origin['DEFAULT_REASONING_EFFORT']),
+                         ('ds41 default', 'ds41 default'))
+        o = ds41('--default-max-tokens', '0', '--default-reasoning-effort', 'max')
+        self.assertEqual((o.get('DEFAULT_MAX_TOKENS'), o.get('DEFAULT_REASONING_EFFORT')), ('0', 'max'))
+        self.assertEqual(o.origin['DEFAULT_MAX_TOKENS'], 'command line')
+        glm = opt.parse(['--no-config', '--peers', PEERS], {})     # the GLM table defaults stay
+        self.assertEqual((glm.get('DEFAULT_MAX_TOKENS'), glm.get('DEFAULT_REASONING_EFFORT')), ('0', None))
+
+    def test_the_reasoning_effort_is_a_name_or_a_whole_number_to_100(self):
+        for e in ('none', 'minimal', 'high', 'xhigh', 'max', '1', '50', '75', '100'):
+            self.assertEqual(ds41('--default-reasoning-effort', e).get('DEFAULT_REASONING_EFFORT'), e)
+        for e in ('0', '101', '-5', '7.5', 'auto', 'default'):
+            with self.assertRaises(opt.OptionError) as err:
+                ds41('--default-reasoning-effort', e)
+            self.assertIn('want a whole number 1 to 100', str(err.exception))
+        # GLM keeps its list: no number, no none
+        for e in ('50', 'none'):
+            with self.assertRaises(opt.OptionError):
+                opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-reasoning-effort', e], {}))
+
+    def test_ds_variables_belong_to_ds41(self):
+        ds41('--extra-env', 'GR8_DS_ENGRAM=0 GR8_DS41_IDX_REUSE=1')
+        with self.assertRaises(opt.OptionError) as e:
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--extra-env', 'GR8_DS_ENGRAM=0'], GLM))
+        self.assertIn('DeepSeek-V4.1 engine variables', str(e.exception))
+
+    def test_engine_plan(self):
+        plan = opt.engine_plan(ds41())
+        self.assertEqual((plan['knobs']['MTP'], plan['knobs']['SESS'], plan['knobs']['CAP']), ('0', '1', '1048576'))
+        self.assertIn('GR8_CP=0', plan['env'])
+        self.assertIn('GR8_DEC_BK=16384', plan['env'])
+        self.assertFalse([e for e in plan['env'] if 'PF_STAGE_ASYNC' in e])   # none of the GLM or Flash prefill stack
+        self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '1')
+        self.assertEqual(plan['args'][plan['args'].index('--mtp') + 1], '0')
+        for a in ('--reuse-prefix', '--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):
+            self.assertNotIn(a, plan['args'])
+        plan = opt.engine_plan(ds41('--extra-env', 'GR8_DS_ENGRAM=0 GR8_DEC_SPLIT=0'))
+        self.assertIn('GR8_DS_ENGRAM=0', plan['env'])
+
+
+class Ds41ReleaseTests(unittest.TestCase):
+    """--model is a local copy of the exlr8 native release: dense/, manifests/ with a set id, two tokenizer files."""
+
+    def setUp(self):
+        self.t = tempfile.mkdtemp()
+        self.addCleanup(__import__('shutil').rmtree, self.t)
+        os.makedirs(os.path.join(self.t, 'dense'))
+        os.makedirs(os.path.join(self.t, 'manifests'))
+        for n in ('config.json', 'dense/exlr8-vocab.safetensors', *models.TOKENIZER_DS):
+            with open(os.path.join(self.t, n), 'w') as f:
+                f.write('{}')       # config.json as DeepSeek's: no `architectures`
+        self.set_id('a' * 64)
+
+    def set_id(self, sid):
+        with open(os.path.join(self.t, 'manifests', 'exlr8-manifest-native.json'), 'w') as f:
+            json.dump({'set_id': sid}, f)
+
+    def ds41(self, *argv):
+        return ds41('--model', self.t, *argv)
+
+    def test_the_set_needs_no_chat_template_or_generation_config(self):
+        ms, variant, err = S.resolve_model(self.ds41())
+        self.assertEqual((err, variant.name, ms.set['source']['kind'], ms.tokenizer), ('', 'home', 'exlr8-release', self.t))
+        self.assertEqual(sorted(ms.set['tokenizer']), sorted(models.TOKENIZER_DS))
+        self.assertEqual(M.check_tokenizer(ms), [])
+        o = self.ds41()
+        S.resolve_model(o)
+        self.assertEqual(o.get('V2_DENSE'), self.t)                   # the engine reads the release in place
+        self.assertFalse(o.get('V2'))
+
+    def test_the_weights_are_named_by_the_release_set_id(self):
+        first = M.ds_set(self.t, 4).id
+        self.assertEqual(M.ds_set(self.t, 4).id, first)
+        self.set_id('b' * 64)
+        self.assertNotEqual(M.ds_set(self.t, 4).id, first)
+
+    def test_the_other_directories_are_refused_with_what_is_wanted(self):
+        os.unlink(os.path.join(self.t, 'dense', 'exlr8-vocab.safetensors'))
+        self.assertIn('want a local copy of the DeepSeek-V4.1-Flash exlr8 native release', S.resolve_model(self.ds41())[2])
+        self.assertIn('no model: pass --model', S.resolve_model(ds41())[2])
+        with open(os.path.join(self.t, 'dense', 'exlr8-vocab.safetensors'), 'w') as f:
+            f.write('{}')
+        os.unlink(os.path.join(self.t, 'tokenizer.json'))
+        self.assertIn('no tokenizer files (tokenizer.json, tokenizer_config.json)', S.resolve_model(self.ds41())[2])
+
+
 class ReleaseTests(unittest.TestCase):
     def setUp(self):
         self.t = tempfile.mkdtemp()

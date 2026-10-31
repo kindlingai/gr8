@@ -543,7 +543,11 @@ def main(argv):
     if not f:
         print(f'gr8: unknown command {cmd}\n{__doc__}', file=sys.stderr)
         return 2
-    return f(rest)
+    try:
+        return f(rest)
+    except opt.OptionError as e:    # show-config and check plan the engine line outside parse(): a refusal is a message, not a traceback
+        print(f'gr8: {e}', file=sys.stderr)
+        return 2
 
 
 if __name__ == '__main__':

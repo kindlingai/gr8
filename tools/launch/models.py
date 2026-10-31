@@ -5,6 +5,12 @@ import os
 from dataclasses import dataclass
 
 
+# The files the front end and the boxes' set id read from the tokenizer directory. GLM's release also carries the chat template
+# and generation config; DeepSeek's does not (its prompt comes from encoding.py, ported in frontend/g6front-rs/src/dschat.rs).
+TOKENIZER_GLM = ('chat_template.jinja', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json')
+TOKENIZER_DS = ('tokenizer.json', 'tokenizer_config.json')
+
+
 class ModelMismatch(Exception):
     pass
 
@@ -25,10 +31,15 @@ class Model:
     int4_kv: bool               # KV_FORMAT=int4 (bin/<engine>-int4)
     thinking_off: bool          # the chat template can turn thinking off (reasoning_effort none)
     fabric: bool = True         # the ranks talk over RDMA: rails and /dev/infiniband
+    dialect: str = 'glm'        # the front end's --dialect: glm (GLM chat template and <tool_call>) or ds41 (DeepSeek DSML)
+    served: str = ''            # the front end's --served-model-name (empty: the dialect's own default)
+    defaults: tuple = ()        # (KEY, value) option defaults for this model, over the table's: origin '<name> default'
+    vocab: int = 0              # the shim's --vocab-size: the ids the engine's embedding table takes (0: the shim's own, GLM-5.3's)
+    eos_ids: tuple = ()         # the shim's --eos-ids (empty: the shim's own, GLM-5.3's)
 
     @property
     def tp_sizes(self):
-        return ', '.join(self.tp[:-1]) + ' or ' + self.tp[-1]
+        return ', '.join(self.tp[:-1]) + ' or ' + self.tp[-1] if len(self.tp) > 1 else self.tp[0]
 
 
 # GLM-5.3 variants: home, down1 and up1 follow the TR3 checkpoint's per-expert widths. The bitNNN profiles spend their
@@ -46,11 +57,19 @@ GLM53 = Model('glm53', 'GLM-5.3', 'https://huggingface.co/kindlingai/glm-5.3-exl
 GLM53F = Model('glm53f', 'GLM-5.3-Flash', 'https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4',
                'g6m4_flash', 'flash', ('4', '3', '2'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},
                {2: ('k4',), 3: ('k4',), 4: ('k4',)}, 'gr8-glm53f', 'Glm5NextForConditionalGeneration', False, False, True)
+# DeepSeek-V4.1-Flash-1017 (docs/DEEPSEEK.md): the official weights in the exlr8 native layout (FP8 trunk, MXFP4 routed
+# experts), no width variants, TP=4. Its drafter is DSpark, the checkpoint's MTP layers (GR8_DS_MTP), not DFlash2. The front
+# end speaks the ds41 dialect (DSML tool calls, numeric reasoning effort). A request that names no reasoning effort gets
+# low (50), which kept the release's answers at about a quarter of high's thinking tokens.
+DS41 = Model('ds41', 'DeepSeek-V4.1-Flash', 'https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native',
+             'g6m4_ds41', 'ds41', ('4',), {}, {}, 'gr8-ds41', 'DeepseekV41ForCausalLM', False, False, True,
+             dialect='ds41', served='deepseek-v4.1-flash', vocab=129280, eos_ids=(1,),   # engine/model_geom_ds41.h VOCAB, TOK_EOS
+             defaults=(('DEFAULT_MAX_TOKENS', '32768'), ('DEFAULT_REASONING_EFFORT', 'low')))
 # The pseudo engine (frontend/pseudo-engine): GLM-5.3's tokens and chat template, answers from a TOML file of rules, on
 # a CPU. Its release is a directory with responses.toml and the tokenizer files.
 PSEUDO = Model('pseudo', 'the pseudo engine', '', 'g6pseudo', 'pseudo', ('1', '2', '3', '4'), {}, {}, 'gr8-pseudo',
                'GlmMoeDsaForCausalLM', False, False, False, fabric=False)
-MODELS = {m.name: m for m in (GLM53, GLM53F, PSEUDO)}
+MODELS = {m.name: m for m in (GLM53, GLM53F, DS41, PSEUDO)}
 
 
 # The models a runner names. pseudo, the test engine, is served when named but left out of the lists.
