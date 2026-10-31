@@ -4,8 +4,12 @@
 //! g6front-rs --model-dir DIR [--engine-sock /run/g6/engine.sock] [--port 8100]
 
 mod api;
+mod dialect;
+mod dschat;
+mod dsparser;
 mod engine;
 mod gen;
+mod grammar;
 mod jsonmode;
 mod logprobs;
 mod metrics;
@@ -14,7 +18,6 @@ mod pyjson;
 mod sampling;
 mod template;
 mod thinking;
-mod grammar;
 mod tok;
 mod tool_choice;
 mod util;
@@ -35,7 +38,11 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub struct State {
     pub tok: tok::Tok,
-    pub template: template::ChatTemplate,
+    /// the jinja chat template; None for the ds41 dialect, whose prompt `dschat.rs` renders
+    pub template: Option<template::ChatTemplate>,
+    pub dialect: dialect::Dialect,
+    /// ds41: the reasoning effort (1..=100) for a request that names none
+    pub ds_effort: u32,
     pub engine: Arc<engine::Engine>,
     pub served: Vec<String>,
     pub model_name: String,
@@ -63,7 +70,8 @@ struct Args {
     engine_sock: String,
     host: String,
     port: u16,
-    served: Vec<String>,
+    served: Option<Vec<String>>,
+    dialect: Option<dialect::Dialect>,
     max_model_len: u64,
     reasoning_fields: String,
     prompt_tokens_details: bool,
@@ -73,7 +81,7 @@ struct Args {
     default_max_tokens: u64,
     share_tokens: u64,
     max_connections: usize,
-    default_effort: Option<&'static str>,
+    default_effort: Option<String>,
     default_budget: u64,
     allow_thinking_off: bool,
     emit_undeclared: bool,
@@ -81,12 +89,12 @@ struct Args {
 }
 
 const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--host H] [--port N]
-                  [--served-model-name NAME ...] [--max-model-len N]
+                  [--dialect glm|ds41|auto] [--served-model-name NAME ...] [--max-model-len N]
                   [--reasoning-fields both|reasoning|reasoning_content]
                   [--enable-prompt-tokens-details] [--log-level LEVEL]
                   [--workers N] [--encode-threads N] [--default-max-tokens N]
                   [--share-tokens N] [--max-connections N]
-                  [--default-reasoning-effort minimal|low|medium|high|xhigh|max]
+                  [--default-reasoning-effort minimal|low|medium|high|xhigh|max (ds41: or an integer 1-100)]
                   [--default-thinking-budget N] [--allow-thinking-off]
                   [--undeclared-tool-calls text|emit] [--supervisor HOST:PORT]";
 
@@ -96,7 +104,8 @@ fn parse_args() -> Result<Args, String> {
         engine_sock: "/run/g6/engine.sock".into(),
         host: "0.0.0.0".into(),
         port: 8100,
-        served: vec!["glm-5.3".into(), "glm53".into()],
+        served: None,
+        dialect: None,
         max_model_len: 0,
         reasoning_fields: "reasoning".into(),
         prompt_tokens_details: false,
@@ -147,11 +156,13 @@ fn parse_args() -> Result<Args, String> {
                 a.share_tokens = next(&mut i, &flag, inline)?.parse().map_err(|_| "--share-tokens: not a number")?
             }
             "--max-connections" => {
-                a.max_connections = next(&mut i, &flag, inline)?.parse().map_err(|_| "--max-connections: not a number")?
+                a.max_connections =
+                    next(&mut i, &flag, inline)?.parse().map_err(|_| "--max-connections: not a number")?
             }
             "--default-reasoning-effort" => {
-                a.default_effort = Some(thinking::parse_default_effort(&next(&mut i, &flag, inline)?)?)
+                a.default_effort = Some(next(&mut i, &flag, inline)?) // checked once the dialect is known
             }
+            "--dialect" => a.dialect = dialect::Dialect::parse_flag(&next(&mut i, &flag, inline)?)?,
             "--default-thinking-budget" => {
                 a.default_budget =
                     next(&mut i, &flag, inline)?.parse().map_err(|_| "--default-thinking-budget: not a number")?
@@ -169,7 +180,7 @@ fn parse_args() -> Result<Args, String> {
                 a.encode_threads = next(&mut i, &flag, inline)?.parse().map_err(|_| "--encode-threads: not a number")?
             }
             "--served-model-name" => {
-                a.served = match inline {
+                let served = match inline {
                     Some(v) => vec![v],
                     None => {
                         let mut v = Vec::new();
@@ -180,9 +191,10 @@ fn parse_args() -> Result<Args, String> {
                         v
                     }
                 };
-                if a.served.is_empty() {
+                if served.is_empty() {
                     return Err("--served-model-name needs at least one name".into());
                 }
+                a.served = Some(served);
             }
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -239,23 +251,61 @@ async fn serve(args: Args) -> Result<(), String> {
     };
     let dir = PathBuf::from(&args.model_dir);
     let t0 = std::time::Instant::now();
-    let tok = tokio::task::spawn_blocking(move || {
+    let mut tok = tokio::task::spawn_blocking(move || {
         let t = tok::Tok::load(&dir);
         util::release_memory(true); // tokenizer.json parsing peaks far above what the loaded tokenizer keeps
         t
     })
     .await
     .map_err(|e| e.to_string())??;
-    let template =
-        template::ChatTemplate::load(&PathBuf::from(&args.model_dir), tok.eos_token.clone(), tok.pad_token.clone())?;
-    log::info!("tokenizer + template loaded in {:.0} ms (vocab {})", t0.elapsed().as_secs_f64() * 1e3, tok.vocab_size);
-    log::info!(
-        "reasoning efforts the template names: {:?}; default effort {:?}, default thinking budget {}, thinking off {}",
-        template.levels,
-        args.default_effort,
-        args.default_budget,
-        if args.allow_thinking_off { "allowed" } else { "refused" }
-    );
+    let dialect = args.dialect.unwrap_or_else(|| {
+        dialect::Dialect::detect(&PathBuf::from(&args.model_dir), tok.tk.token_to_id("｜DSML｜").is_some())
+    });
+    let (template, thinking_defaults, ds_effort) = match dialect {
+        dialect::Dialect::Glm => {
+            let template = template::ChatTemplate::load(
+                &PathBuf::from(&args.model_dir),
+                tok.eos_token.clone(),
+                tok.pad_token.clone(),
+            )?;
+            let effort = args.default_effort.as_deref().map(thinking::parse_default_effort).transpose()?;
+            log::info!(
+                "dialect glm: tokenizer + template loaded in {:.0} ms (vocab {}); reasoning efforts the template names: \
+                 {:?}; default effort {:?}, default thinking budget {}, thinking off {}",
+                t0.elapsed().as_secs_f64() * 1e3,
+                tok.vocab_size,
+                template.levels,
+                effort,
+                args.default_budget,
+                if args.allow_thinking_off { "allowed" } else { "refused" }
+            );
+            let d = thinking::Defaults { effort, budget: args.default_budget, allow_off: args.allow_thinking_off };
+            (Some(template), d, dialect::DS_DEFAULT_EFFORT)
+        }
+        dialect::Dialect::Ds41 => {
+            // the prompt comes from dschat.rs (the release's encoding.py ported); thinking closes with the one
+            // `</think>` token; thinking off is native, so it needs no flag
+            tok.use_single_think_close();
+            let effort = match args.default_effort.as_deref() {
+                Some(e) => dialect::parse_ds_default_effort(e)?,
+                None => dialect::DS_DEFAULT_EFFORT,
+            };
+            log::info!(
+                "dialect ds41: tokenizer loaded in {:.0} ms (vocab {}, eos {:?}); default reasoning effort {effort}, \
+                 default thinking budget {}, thinking off allowed",
+                t0.elapsed().as_secs_f64() * 1e3,
+                tok.vocab_size,
+                tok.eos_ids,
+                args.default_budget
+            );
+            let d = thinking::Defaults { effort: None, budget: args.default_budget, allow_off: true };
+            (None, d, effort)
+        }
+    };
+    let served = args.served.unwrap_or_else(|| match dialect {
+        dialect::Dialect::Glm => vec!["glm-5.3".into(), "glm53".into()],
+        dialect::Dialect::Ds41 => vec!["deepseek-v4.1-flash".into()],
+    });
     if args.emit_undeclared {
         log::info!("calls to tools a request did not declare come back as tool calls (--undeclared-tool-calls emit)");
     }
@@ -264,20 +314,18 @@ async fn serve(args: Args) -> Result<(), String> {
     let st: &'static State = Box::leak(Box::new(State {
         tok,
         template,
+        dialect,
+        ds_effort,
         engine: engine.clone(),
-        model_name: args.served[0].clone(),
-        served: args.served,
+        model_name: served[0].clone(),
+        served,
         model_dir: args.model_dir,
         reasoning_fields,
         prompt_tokens_details: args.prompt_tokens_details,
         max_model_len_override: args.max_model_len,
         default_max_tokens: args.default_max_tokens,
         share_tokens: args.share_tokens,
-        thinking: thinking::Defaults {
-            effort: args.default_effort,
-            budget: args.default_budget,
-            allow_off: args.allow_thinking_off,
-        },
+        thinking: thinking_defaults,
         grammars,
         emit_undeclared: args.emit_undeclared,
         started: util::now_secs(),

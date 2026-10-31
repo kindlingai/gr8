@@ -345,6 +345,29 @@ impl Generation {
         }
     }
 
+    /// End the reply now: the caller's parser has seen a complete tool-call block, and anything the model writes after
+    /// it is a runaway. The step carries the text still held back and `finish_reason: stop`; dropping the stream
+    /// cancels the engine request (with step stats it is cancelled and kept for `finish_stats`, as a stop string's is).
+    pub fn end_now(&mut self) -> Step {
+        self.done = true;
+        self.cut = false;
+        let s = self.stream.take();
+        if self.stats.is_some() {
+            if let Some(s) = s {
+                s.cancel();
+                self.ended = Some(s);
+            }
+        }
+        self.res.finish_reason = Some("stop");
+        self.res.stop_reason = Some(StopReason::None);
+        Step {
+            text: self.release(true),
+            finish_reason: Some("stop"),
+            stop_reason: Some(StopReason::None),
+            ..Default::default()
+        }
+    }
+
     fn stop_id_reason(&self, sid: i64) -> StopReason {
         if Some(sid) == self.tok.eos_token_id.map(i64::from) {
             StopReason::None

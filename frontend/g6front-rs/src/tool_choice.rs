@@ -74,11 +74,8 @@ impl ToolChoice {
                         Some("tool_choice"),
                     ));
                 }
-                let name = o
-                    .get("function")
-                    .and_then(Value::as_object)
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str);
+                let name =
+                    o.get("function").and_then(Value::as_object).and_then(|f| f.get("name")).and_then(Value::as_str);
                 let Some(name) = name.filter(|n| !n.is_empty()) else {
                     return Err(ApiError::bad("a forced tool_choice needs function.name", Some("tool_choice")));
                 };
@@ -120,7 +117,21 @@ impl ToolChoice {
     /// (`gen::think_open`) and empty otherwise, so the opener always starts the reply's content rather than its
     /// reasoning. Empty when the choice forces nothing.
     pub fn forced_ids(&self, tok: &Tok, think_close: &[u32]) -> Result<Vec<u32>, ApiError> {
-        let Some(text) = self.forced_text() else { return Ok(Vec::new()) };
+        self.forced_ids_for(self.forced_text(), tok, think_close)
+    }
+
+    /// DeepSeek's forced reply: the start of a DSML call block (`dialect::ds_forced_text`), behind `think_close`.
+    pub fn forced_ids_ds(&self, tok: &Tok, think_close: &[u32]) -> Result<Vec<u32>, ApiError> {
+        let text = match self {
+            ToolChoice::Required => Some(crate::dialect::ds_forced_text(None)),
+            ToolChoice::Named(name) => Some(crate::dialect::ds_forced_text(Some(name))),
+            ToolChoice::None | ToolChoice::Auto => None,
+        };
+        self.forced_ids_for(text, tok, think_close)
+    }
+
+    fn forced_ids_for(&self, text: Option<String>, tok: &Tok, think_close: &[u32]) -> Result<Vec<u32>, ApiError> {
+        let Some(text) = text else { return Ok(Vec::new()) };
         let opener = tok.encode(&text, false).map_err(|e| ApiError::new(500, &e, None))?;
         if opener.is_empty() {
             return Err(ApiError::bad(format!("'{text}' does not tokenize"), Some("tool_choice")));

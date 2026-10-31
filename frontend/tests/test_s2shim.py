@@ -193,6 +193,31 @@ class UnitTests(unittest.TestCase):
             self.assertEqual(g6s2shim.scan_numbers(d, 'req'), 10)
             self.assertEqual(g6s2shim.scan_numbers(d + '/none', 'req'), 0)
 
+    def test_set_model_replaces_the_identity_and_the_id_bound(self):
+        before = (g6s2shim.MODEL_NAME, g6s2shim.VOCAB, g6s2shim.EOS_IDS)
+        self.addCleanup(g6s2shim.set_model, *before)
+        self.assertEqual(before, ('glm-5.3-g6', 154880, [154820, 154827, 154829]))
+        self.assertIsNone(g6s2shim.set_model('deepseek-v4.1-flash', 129280, [1]))
+        V = g6s2shim.VOCAB
+        self.assertEqual((g6s2shim.MODEL_NAME, V, g6s2shim.EOS_IDS), ('deepseek-v4.1-flash', 129280, [1]))
+        self.assertIsNone(g6s2shim.build_request({'prompt': [0, V - 1], 'max_tokens': 4}, 0)[1])
+        for bad_id in (V, 154879, 2**31 - 1):                       # 154879 is a GLM id the DeepSeek table does not have
+            self.assertIn('prompt token id', g6s2shim.build_request({'prompt': [1, bad_id], 'max_tokens': 4}, 0)[1])
+        ins = lambda t, u=None: g6s2shim.insert_field([{'after_tokens': 1, 'unless_emitted': u, 'tokens': [t]}])[1]
+        self.assertIsNone(ins(V - 1, V - 1))
+        self.assertIn('0..129279', ins(V) or '')
+        self.assertIn('0..129279', ins(5, V) or '')
+        self.assertIsNone(g6s2shim.grammar_field({'kind': 'json', 'after_token': V - 1})[1])
+        self.assertIn('0..129279', g6s2shim.grammar_field({'kind': 'json', 'after_token': V})[1] or '')
+
+    def test_set_model_refuses_a_nonsense_identity(self):
+        before = (g6s2shim.MODEL_NAME, g6s2shim.VOCAB, g6s2shim.EOS_IDS)
+        self.addCleanup(g6s2shim.set_model, *before)
+        for args in (('', 10, [1]), ('m', 1, [0]), ('m', 0, [0]), ('m', 10, []), ('m', 10, [10]), ('m', 10, [-1]),
+                     ('m', 10, [True]), ('m', True, [0])):
+            self.assertIsNotNone(g6s2shim.set_model(*args), args)
+            self.assertEqual((g6s2shim.MODEL_NAME, g6s2shim.VOCAB, g6s2shim.EOS_IDS), before, args)    # a refusal changes nothing
+
 
 class S2Base(unittest.IsolatedAsyncioTestCase):
     RANKS = 1
@@ -578,6 +603,42 @@ class NoInsertEngine(S2Base):
         self.assertEqual(ids, self.expect([1, 2], 3))
 
 
+class GlmIdentity(S2Base):
+    async def test_the_default_hello_is_glm(self):
+        c = await self.client()
+        self.assertEqual((c.hello['model'], c.hello['vocab_size'], c.hello['eos_ids']),
+                         ('glm-5.3-g6', 154880, [154820, 154827, 154829]))
+
+
+class DeepSeekIdentity(S2Base):
+    """The launcher starts the shim for DeepSeek-V4.1-Flash-1017 with its own identity (models.DS41): the hello says so, and
+    an id past the engine's 129280-row embedding table is refused here, not indexed by the engine."""
+    SHIM = ('--model-name', 'deepseek-v4.1-flash', '--vocab-size', '129280', '--eos-ids', '1')
+
+    async def test_the_hello_names_the_deepseek_model(self):
+        c = await self.client()
+        self.assertEqual((c.hello['model'], c.hello['vocab_size'], c.hello['eos_ids']), ('deepseek-v4.1-flash', 129280, [1]))
+
+    async def test_prompt_ids_stop_at_the_deepseek_vocab(self):
+        c = await self.client()
+        c.send(gen('edge', [1, 129279], max_tokens=3))
+        ids, fin, _ = await c.wait('edge')
+        self.assertEqual((fin['reason'], ids), ('length', self.expect([1, 129279], 3)))
+        for rid, bad in (('first', 129280), ('glm', 154879)):
+            c.send(gen(rid, [1, bad], max_tokens=3))
+            _, fin, _ = await c.wait(rid)
+            self.assertEqual(fin['reason'], 'error', rid)
+            self.assertIn('0..129279', fin['message'], rid)
+        self.assertNotIn('129280', self.fake_log())          # the refused ids never reached the engine
+
+    async def test_a_bad_identity_stops_the_shim_at_start(self):
+        self.shim.kill()
+        self.shim.wait()
+        p = self.start_shim('--eos-ids', '129280')           # eos past the vocab: argparse error, exit 2, no socket
+        self.assertEqual(p.wait(20), 2)
+        self.assertFalse(os.path.exists(self.sock))
+
+
 class QueueTests(S2Base):
     FAKE = ('--sessions', '2')
 
@@ -635,6 +696,20 @@ class MaxLenTests(S2Base):
         self.assertIn('too long', fin['message'])
         c.send(gen('fit', prompt=list(range(100)), max_tokens=100))
         self.assertEqual((await c.wait('fit'))[1]['reason'], 'length')
+
+
+class PerSlotCapTests(S2Base):
+    FAKE = ('--sessions', '2')
+    SHIM = ('--sessions', '2', '--capacity-slots', '2')
+
+    async def test_aggregate_pool_is_not_one_requests_context(self):
+        c = await self.client()
+        self.assertEqual(c.hello['max_model_len'], 10000 - 4)
+        c.send(gen('too-long', prompt=list(range(9997)), max_tokens=1))
+        _, fin, _ = await c.wait('too-long')
+        self.assertEqual(fin['reason'], 'error')
+        self.assertIn('too long', fin['message'])
+        self.assertNotIn('9996', self.fake_log())  # refused before engine request file
 
 
 class OneDir(S2Base):

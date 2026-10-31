@@ -415,7 +415,8 @@ mod tests {
         assert_eq!(max_tokens("{}", 100, 393202, None), 393102); // no default: all the room
         assert_eq!(max_tokens("{}", 100, 393202, Some(16384)), 16384);
         assert_eq!(max_tokens("{}", 393000, 393202, Some(16384)), 202); // less room than the default
-        assert_eq!(max_tokens(r#"{"max_tokens": 200000}"#, 100, 393202, Some(16384)), 200000); // named: kept
+        assert_eq!(max_tokens(r#"{"max_tokens": 200000}"#, 100, 393202, Some(16384)), 200000);
+        // named: kept
     }
 
     #[test]
