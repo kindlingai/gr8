@@ -81,8 +81,8 @@ static int sh_tc(const char* val)
     const pid_t p = fork();
     if (!p)
     {
+        unsetenv("G6_DS_SH_TC");   // the old name, still read
         if (val) setenv("GR8_DS_SH_TC", val, 1); else unsetenv("GR8_DS_SH_TC");
-        unsetenv("GR8_DS_SH_TC");
         const int null = open("/dev/null", O_WRONLY);
         if (null >= 0) dup2(null, 2);        // the refusal's message
         _exit(10 + (knob::ds_sh_tc() ? 1 : 0));

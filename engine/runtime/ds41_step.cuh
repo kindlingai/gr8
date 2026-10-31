@@ -172,6 +172,7 @@ inline void build_ds41(Model& m,int rank,const std::vector<int>& ids,const Find&
     m.sess=dmalloc<int>(prefill_rows);
     G6RT_CK(cudaMemsetAsync(m.sess,0,(size_t)prefill_rows*sizeof(int),st));   // slot 0 until k_step_in / a prefill chunk writes it
     m.steering_scale=dmalloc<float>(MX);   // k_step_in copies StepIn::steering_scale here every step
+    m.steering_slot=dmalloc<int>(MX);      // and StepIn::steering_slot
     m.lp=dmalloc<float>(MX); m.lpt=dmalloc<float>(MX);
     m.scratch=dmalloc<char>(bind::scratch_bytes()); m.sc=bind::scratch_at(m.scratch);
     if(prefill_rows>MX) { // bind::scratch_layout intentionally remains MX; only the two fabric partials need W rows.
