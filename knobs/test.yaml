@@ -2,68 +2,6 @@
 prefix: "GR8_TEST_"
 scope: test
 knobs:
-  GR8_TEST_ATTNK_ARMS:
-    kind: text
-    unset: "the built-in arms"
-    legacy: ["ATTNK_ARMS", "GR8_ATTNK_ARMS"]
-    doc: >-
-      attnk: the arms to run, as name or KEY=V,... specs joined by spaces.
-  GR8_TEST_ATTNK_BASE:
-    kind: text
-    unset: "the serving arm SC2=4,TR=2,CTX2=4,CTX3=2,SEL2=16,IDX=16"
-    legacy: ["ATTNK_BASE", "GR8_ATTNK_BASE"]
-    doc: >-
-      attnk: the base arm the others compare with, as KEY=V,... over the stock arm (every flag 0), or stock.
-  GR8_TEST_ATTNK_E1:
-    kind: flag
-    default: "0"
-    legacy: ["ATTNK_E1", "GR8_ATTNK_E1"]
-    doc: >-
-      attnk: 1 runs the round 10 arm set.
-  GR8_TEST_ATTNK_H:
-    kind: int
-    unset: "g6nr::HMAX, the larger head count of a rank in the build"
-    legacy: ["ATTNK_H", "GR8_ATTNK_H"]
-    doc: >-
-      attnk: the rank's head count, g6nr::HMIN or g6nr::HMAX of the build (a TP=6 build: 11 or 10).
-  GR8_TEST_ATTNK_NANKEY:
-    kind: int
-    default: "-1"
-    legacy: ["ATTNK_NANKEY", "GR8_ATTNK_NANKEY"]
-    doc: >-
-      attnk: the index key position (session 0) whose scale is NaN, -1 none.
-  GR8_TEST_ATTNK_QSCALE:
-    kind: float
-    default: "1"
-    legacy: ["ATTNK_QSCALE", "GR8_ATTNK_QSCALE"]
-    doc: >-
-      attnk: scales the test queries.
-  GR8_TEST_ATTNK_SESS:
-    kind: int
-    default: "1"
-    values: "1|2"
-    legacy: ["ATTNK_SESS", "GR8_ATTNK_SESS"]
-    doc: >-
-      attnk: 2 runs two S2 sessions when the build and shape allow it.
-  GR8_TEST_ATTNK_TIES:
-    kind: flag
-    default: "0"
-    legacy: ["ATTNK_TIES", "GR8_ATTNK_TIES"]
-    doc: >-
-      attnk: 1 makes the test scores tie.
-  GR8_TEST_CPG_ARMS:
-    kind: text
-    unset: "the built-in arms"
-    legacy: ["CPG_ARMS", "GR8_CPG_ARMS"]
-    doc: >-
-      cpgroups: the arms to run, as KEY=V,... specs (SC2 TR CTX2 CTX3 HG) or stock, joined by spaces.
-  GR8_TEST_CPG_LOCAL:
-    kind: int
-    default: "0"
-    legacy: ["CPG_LOCAL", "GR8_CPG_LOCAL"]
-    doc: >-
-      cpgroups: puts the N most recent positions first in each row's index list, as a local window. 0: uniform random
-      positions.
   GR8_TEST_CP_PF_BREAK:
     kind: text
     unset: "unset"
@@ -338,11 +276,6 @@ knobs:
       m4sim gate, with GR8_TEST_S2_XLIST, GR8_CP_R2 and GR8_RT_LOCAL: each sequence starts at GR8_CP_R and takes
       GR8_CP_R2 once its rows reach this position (past GR8_CP_R), as a session g6m4 shrinks. Stdout must equal the run
       at GR8_CP_R2 from the start.
-  GR8_TEST_SPARSE_MLA:
-    kind: flag
-    default: "0"
-    doc: >-
-      flash_dsa_pf_test: compares the fused MLA with the current GEMM prefill instead of the older P1 math.
   GR8_TEST_TOKENIZER_DIR:
     kind: path
     unset: "unset"

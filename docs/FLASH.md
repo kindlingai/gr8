@@ -153,7 +153,7 @@ the floor, as far as the node has room.
 The boot log prints `# rank R: flash ckpt aligned: ...`, and each request prints `flash ckpt request ... kept ...` or
 `... restored ...` with the time.
 
-Measured on one RTX 5090 (`engine/tests/test_flash_ckpt.cu`, Flash's TP=2 geometry, 100 pages, 161 blocks): a capture
+Measured on one RTX 5090 (Flash's TP=2 geometry, 100 pages, 161 blocks): a capture
 (161 blocks) takes 26-50 ms and a restore 21-25 ms through memory, an SSD file and a loopback KV node. Not measured on GB10, and the
 end-to-end bit-exact check against no cache on a cluster has not run yet.
 

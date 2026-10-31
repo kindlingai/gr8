@@ -779,8 +779,8 @@ inline int k1_fused_grid(int items, size_t smem, int e4 = 0, int k2 = 0, int sh 
 #define TR3_W2SPLIT 0
 #endif
 struct K1Split { int KS1, WG, NS2, s_ks, s_ns2; };
-// The settings make_k1 binds the K1 split and launch form with. k1_vars() holds the environment's; k1_split_test and
-// k1_audit pass their own.
+// The settings make_k1 binds the K1 split and launch form with. k1_vars() holds the environment's; k1_split_test
+// passes its own.
 struct K1Vars
 {
     std::optional<std::string> split;                 // GR8_K1_SPLIT: a KS1,WG,NS2 triple or a table (k1_split_env)
@@ -831,7 +831,7 @@ constexpr K1Split K1_DENSE_SPLIT = {4, 2, 1, 8, 24};   // dense layers 0..2: onl
 
 // GR8_K1_SPLIT (A/B, exact): per step row count M, the fc1 CTA shape KS1 x WG and / or the routed fc2 n-split NS2 of
 // the trellis-shared MoE layers, "M:KS1xWG/NS2" entries, M a row count or a range a-b, either part optional:
-// "3:2x1,1:/4,4-32:/4" = k1_audit's "fc1 2x1" arm at 3 rows and "ns2=4" at 1 and 4+ rows. Same bytes at any entry:
+// "3:2x1,1:/4,4-32:/4" = fc1 2x1 at 3 rows and ns2=4 at 1 and 4+ rows. Same bytes at any entry:
 // an fc1 shape is taken only where KS1 * WG equals the split's (partial p = h * WG + q covers the same k range and fc2
 // sums the same partials in the same order, tr3.cuh); a z tile is one warp's sum over its block's 8 k-tiles at any NS2
 // (tr3_fc2_body). KS1, WG and NS2 are powers of two: the K1 kernels split a unit index with shifts by __ffs(KS1),
@@ -840,7 +840,7 @@ constexpr K1Split K1_DENSE_SPLIT = {4, 2, 1, 8, 24};   // dense layers 0..2: onl
 // only (with ':' or '='); k1_split reads the "KS1,WG,NS2" triple form of the same variable and skips a table (#155).
 // A table and a GR8_K1_SPLIT_M1 / _M2 / _M4 triple together are refused: the table's fc1 entries are checked against
 // the split k1_split returns, which those triples change. Read once per process from vars (the first call's), or from
-// set at each call that passes it (k1_audit and k1_split_test pass their own tables).
+// set at each call that passes it (k1_split_test passes its own tables).
 struct K1SplitEnv
 {
     signed char ks1[G6_MX + 1] = {}, wg[G6_MX + 1] = {}, ns2[G6_MX + 1] = {};

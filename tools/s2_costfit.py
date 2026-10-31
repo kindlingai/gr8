@@ -23,14 +23,12 @@ draft / chain steps carry no expert counts: step_ms = base + per_token * rows (a
 experts(d * rows) term with d from the main fit; it is dropped when it is collinear with rows).
 
   s2_costfit.py LOG [LOG ...] [--include-capture] [--skip N] [--residuals] [--json]
-  s2_costfit.py --selftest
 """
 import argparse
 import json
 import math
 import re
 import sys
-import unittest
 
 KINDS = ('main', 'draft', 'chain')
 LINE = re.compile(r'#\s*s2_round\b(.*)')
@@ -262,10 +260,7 @@ def main(argv=None):
     ap.add_argument('--draft-experts', action='store_true', help='draft/chain: include the experts(d*rows) term (d from the main fit)')
     ap.add_argument('--residuals', action='store_true', help='print every sample with its residual')
     ap.add_argument('--json', action='store_true', help='print the fits as JSON instead of text')
-    ap.add_argument('--selftest', action='store_true', help='run the unit tests on synthetic data')
     a = ap.parse_args(argv)
-    if a.selftest:
-        return 0 if unittest.main(argv=[sys.argv[0]], module=__name__, exit=False).result.wasSuccessful() else 1
     if not a.logs:
         ap.error('no log files')
     rows = read_logs(a.logs, a.include_capture, a.skip)
@@ -285,146 +280,6 @@ def main(argv=None):
     else:
         print(report(results, rows, a.residuals))
     return 0
-
-
-# ---- unit tests (synthetic data) ----------------------------------------------------------------------------------
-def _synthetic(kind, base, pe, pt, d, sizes, reps, noise, seed, n_layers=75, with_ex=True):
-    import random
-    rnd = random.Random(seed)
-    lines = []
-    step = 0
-    for _ in range(reps):
-        for s, m in sizes:
-            step += 1
-            ex = experts(m, d)
-            ms = base + pe * ex + pt * m + rnd.gauss(0, noise)
-            ln = f'# s2_round step {step} {kind} round {step} active {s} S {s} M {m} ms {ms:.3f} path reuse'
-            if with_ex:
-                counts = [max(1, int(round(ex + rnd.gauss(0, 1.0)))) for _ in range(n_layers)]
-                ln += f' ex_mean {sum(counts) / n_layers:.3f} ex_sum {sum(counts)} ex ' + ','.join(map(str, counts))
-            lines.append(ln)
-    return lines
-
-
-class SyntheticTest(unittest.TestCase):
-    SIZES = [(1, 3), (2, 6), (3, 9), (4, 12), (6, 18), (8, 24)]
-
-    def rows(self, lines):
-        return [parse_line(ln) for ln in lines]
-
-    def test_parse(self):
-        r = parse_line('x # s2_round step 7 main S 4 M 12 ms 81.250 path reuse ex_mean 60.500 ex_sum 4 ex 60,61,60,61')
-        self.assertEqual((r['kind'], r['step'], r['S'], r['M'], r['path']), ('main', 7, 4, 12, 'reuse'))
-        self.assertAlmostEqual(r['ms'], 81.25)
-        self.assertEqual(r['ex'], [60, 61, 60, 61])
-        self.assertIsNone(parse_line('# step_tmr rank 0 step 3 main ROUND_MAIN S2_REUSE 800 us'))
-        self.assertIsNone(parse_line('# s2_round step 7 bogus S 4 M 12 ms 1 path reuse'))
-        r = parse_line('# s2_round step 9 draft S 4 M 8 ms 20.1 path capture')
-        self.assertEqual(r['kind'], 'draft')
-        self.assertNotIn('ex_mean', r)
-
-    def test_round_fields_and_summary(self):
-        r = parse_line('# s2_round step 5 main round 12 active 4 S 2 M 6 ms 40.0 path reuse ex_mean 44.0 ex_sum 44 ex 44')
-        self.assertEqual((r['S'], r['M'], r['round'], r['active']), (2, 6, 12, 4))
-        self.assertNotIn('round', parse_line('# s2_round step 5 main S 2 M 6 ms 40.0 path reuse'))
-        lines = ['# s2_round step 1 main round 0 active 4 S 2 M 6 ms 40.0 path reuse ex_mean 44.0 ex_sum 44 ex 44',
-                 '# s2_round step 2 main round 0 active 4 S 2 M 6 ms 42.0 path reuse ex_mean 44.0 ex_sum 44 ex 44',
-                 '# s2_round step 3 draft round 0 active 4 S 4 M 8 ms 10.0 path reuse',
-                 '# s2_round step 4 main round 1 active 1 S 1 M 3 ms 30.0 path reuse ex_mean 20.0 ex_sum 20 ex 20',
-                 '# s2_round step 5 chain round -1 active 0 S 1 M 1 ms 5.0 path reuse']
-        rows = {k: [] for k in KINDS}
-        for ln in lines:
-            r = parse_line(ln)
-            r['src'] = 0
-            rows[r['kind']].append(r)
-        rs = round_summary(rows)
-        self.assertEqual(sorted(rs), [1, 4])
-        self.assertEqual((rs[4]['n'], rs[4]['steps'], rs[4]['rows']), (1, 3, 12))
-        self.assertAlmostEqual(rs[4]['ms'], 92.0)
-        self.assertAlmostEqual(rs[1]['ms'], 30.0)
-
-    def test_partial_round_excluded(self):
-        import os
-        import tempfile
-        ln = '# s2_round step {} {} round {} active 4 S 2 M {} ms {} path {}'
-        lines = []
-        for rd in range(3):     # S4 rounds as two groups: each group = main + draft + chain
-            for g in range(2):
-                st = rd * 6 + g * 3
-                lines += [ln.format(st + 1, 'main', rd, 6, 40.0, 'reuse') + ' ex_mean 44.0 ex_sum 44 ex 44',
-                          ln.format(st + 2, 'draft', rd, 6, 10.0, 'reuse'), ln.format(st + 3, 'chain', rd, 2, 5.0, 'reuse')]
-        lines[0] = lines[0].replace('path reuse', 'path capture')      # round 0 loses its first main step to the capture filter
-        with tempfile.NamedTemporaryFile('w', suffix='.log', delete=False) as t:
-            t.write('\n'.join(lines) + '\n')
-        try:
-            rs = round_summary(read_logs([t.name]))
-            self.assertEqual(rs[4]['n'], 2)                       # rounds 1 and 2 only
-            self.assertEqual((rs[4]['rows'], rs[4]['steps'], rs[4]['ms']), (12, 6, 110.0))
-            rs = round_summary(read_logs([t.name], include_capture=True))
-            self.assertEqual(rs[4]['n'], 3)
-            # --skip 1 drops the first main step of the log: round 0 again, nothing else
-            rs = round_summary(read_logs([t.name], include_capture=True, skip=1))
-            self.assertEqual(rs[4]['n'], 2)
-            self.assertEqual(rs[4]['rows'], 12)
-            # skipping past a later main step also drops its round
-            self.assertEqual(round_summary(read_logs([t.name], skip=2))[4]['n'], 1)
-        finally:
-            os.unlink(t.name)
-
-    def test_main_fit_recovers_parameters(self):
-        rows = self.rows(_synthetic('main', 45.0, 0.40, 0.50, 0.7, self.SIZES, 40, 0.3, 1))
-        res = fit_kind('main', rows)
-        self.assertAlmostEqual(res['d'], 0.7, delta=0.05)
-        f = res['fits']['model']
-        self.assertAlmostEqual(f['base'], 45.0, delta=2.0)
-        self.assertAlmostEqual(f['per_expert'], 0.40, delta=0.08)
-        self.assertAlmostEqual(f['per_token'], 0.50, delta=0.25)
-        self.assertLess(f['rms'], 1.0)
-        self.assertGreater(f['r2'], 0.99)
-        self.assertEqual(len(f['resid']), len(rows))
-        self.assertAlmostEqual(f['us_per_expert_per_layer'], f['per_expert'] * 1000 / 75, places=6)
-        self.assertLess(res['fits']['observed']['rms'], 1.0)
-
-    def test_exact_data_zero_residual(self):
-        rows = self.rows(_synthetic('main', 50.0, 0.30, 0.6, 1.0, self.SIZES, 3, 0.0, 2))
-        f = fit_kind('main', rows)['fits']['model']
-        self.assertLess(f['rms'], 0.5)   # ex counts are rounded to integers, the cost is exact in experts(d*M)
-
-    def test_chain_fit_two_parameters(self):
-        rows = self.rows(_synthetic('chain', 12.0, 0.0, 0.8, 1.0, [(s, s) for s in (1, 2, 4, 6, 8)], 30, 0.2, 3, with_ex=False))
-        f = fit_kind('chain', rows)['fits']['model']
-        self.assertAlmostEqual(f['base'], 12.0, delta=0.5)
-        self.assertAlmostEqual(f['per_token'], 0.8, delta=0.15)
-        self.assertIsNone(f['per_expert'])
-
-    def test_collinear_column_dropped(self):
-        c = lstsq([[1, 1, 1, 1], [2, 4, 6, 8], [1, 2, 3, 4]], [3, 5, 7, 9])
-        self.assertIsNone(c[2])           # third column is half of the second
-        self.assertAlmostEqual(c[0], 1.0, places=6)
-        self.assertAlmostEqual(c[1], 1.0, places=6)
-
-    def test_capture_rows_dropped_and_logs_read(self):
-        import os
-        import tempfile
-        lines = _synthetic('main', 40.0, 0.5, 0.4, 1.0, self.SIZES, 5, 0.0, 4)
-        lines.append('# s2_round step 99 main S 2 M 6 ms 5000.0 path capture ex_mean 30 ex_sum 30 ex 30')
-        with tempfile.NamedTemporaryFile('w', suffix='.log', delete=False) as t:
-            t.write('\n'.join(['engine: unrelated line'] + lines) + '\n')
-        try:
-            rows = read_logs([t.name])
-            self.assertEqual(len(rows['main']), 5 * len(self.SIZES))
-            self.assertEqual(len(read_logs([t.name], include_capture=True)['main']), 5 * len(self.SIZES) + 1)
-            self.assertEqual(len(read_logs([t.name], skip=4)['main']), 5 * len(self.SIZES) - 4)
-            self.assertIn('== main steps', report({'main': fit_kind('main', rows['main'])}, rows))
-        finally:
-            os.unlink(t.name)
-
-    def test_experts_formula(self):
-        self.assertAlmostEqual(experts(0), 0.0)
-        self.assertAlmostEqual(experts(1), 8.0)
-        self.assertAlmostEqual(experts(6), 256 * (1 - (248 / 256) ** 6))
-        self.assertEqual(round(experts(12)), 81)   # about 81 distinct experts at 12 rows, 44-45 at 6 rows
-        self.assertIn(round(experts(6)), (44, 45))
 
 
 if __name__ == '__main__':

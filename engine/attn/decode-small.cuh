@@ -669,7 +669,7 @@ static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,i
   return;}
  if(attn_heads()&&attn_p11()){launch_context_tile(a,input,w,start,n,st);return;}
  if(attn_heads()){
-  // head group by rows (dec_heads_test --bench on GB10, contexts 500 and 2048): 4 heads per block up to 4 rows, then 8
+  // head group by rows (measured on GB10, contexts 500 and 2048): 4 heads per block up to 4 rows, then 8
   if(use_ctx3(a)){launch_ctx3(a,input,w,start,n,st,sp);return;}
   if(attn_ctx2()){if(n>=5)launch_ctx2<8>(a,input,w,start,n,st);else launch_ctx2<4>(a,input,w,start,n,st);return;}
   if(n>=5){constexpr int HG=8;small_decode::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}

@@ -37,8 +37,8 @@ On a GB10 with CUDA 13:
     GR8_NR=4 scripts/build.sh bin4   # TP=4 only, a shorter build (GR8_WIDTHS="3 4" for several)
 
 g6m4 takes its width from `--ips`, m4sim from `--tp N` or the rank packs in `--packs DIR`. Each width is compiled as
-its own build was (`engine/runtime/build_m4.sh`), so one build covers every topology. `scripts/build.sh` also builds
-and runs `test_spec_len` and `test_prefix_reuse`, and `tr3_e4m3_test` when a GPU is visible. g6m4 links the S2 page allocator from
+its own build was (`engine/runtime/build_m4.sh`), so one build covers every topology. `scripts/build.sh` also runs
+`tr3_e4m3_test` when a GPU is visible. g6m4 links the S2 page allocator from
 `engine/kvman-rs`, which build.sh builds with cargo. Where cargo is missing, build that crate (and `engine/loader-rs`)
 first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
 

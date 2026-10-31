@@ -4,7 +4,7 @@
 //   nvcc -O2 -std=c++17 -I engine/comms engine/comms/tests/fabric_rs_flat_test.cpp engine/comms/fabric.cpp -libverbs -lpthread -o fabric_rs_flat_test
 //   fabric_rs_flat_test --index I --ips A0,A1,.. [--ips2 B0,..] [--stripe-min N] [--ring] [--ring-devs d0,d1,d2,d3]
 //                       [--steps 48] [--rows-max 2048] [--row 14336] [--port 18760]
-// Same command on every box. Host-driven, as fabric_group_test: the host writes the payload and rings the doorbell. Two
+// Same command on every box. Host-driven: the host writes the payload and rings the doorbell. Two
 // collectives a step: c0 reduce-scatter (Q = ceil(rows / NR) rows a slice, the last slices short or empty), c1 a plain
 // all-peer collective. Steps alternate in pairs (both parities) between flat and not flat; rows cycle through sizes that give
 // empty, short and full slices, up to rows-max (rows-max x row = the DS41 W 2048 prefill chunk: slices over the 1 MiB stripe).

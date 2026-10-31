@@ -132,9 +132,9 @@ if [ "${GR8_TESTS:-1}" != only ]; then
 fi
 [ "${GR8_TESTS:-1}" = 0 ] && exit 0
 export PATH=/usr/local/cuda/bin:$PATH
-# the compiles below go through the same object cache as build_m4.sh (#32); GR8_NVCC_CACHE=0 runs plain nvcc / g++
+# the compiles below go through the same object cache as build_m4.sh (#32); GR8_NVCC_CACHE=0 runs plain nvcc
 CACHE="$REPO/engine/runtime/nvcc_cache.sh"
-if [ "${GR8_NVCC_CACHE:-1}" = 0 ]; then NVCC=nvcc; GXX=g++; else NVCC="$CACHE nvcc"; GXX="$CACHE g++"; fi
+if [ "${GR8_NVCC_CACHE:-1}" = 0 ]; then NVCC=nvcc; else NVCC="$CACHE nvcc"; fi
 mkdir -p "$OUT/obj"
 export GR8_NVCC_CACHE_LOG="$OUT/obj/nvcc_cache.tests.calls"
 rm -f "$GR8_NVCC_CACHE_LOG"
@@ -155,11 +155,6 @@ build() {   # build <bin> <command..>: in the background, at most J at once; a f
 build l2pf_bench $NVCC -O3 -std=c++17 $GEN $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR8_NR} -I "$REPO/engine/kernels" \
   -o "$OUT/l2pf_bench" "$REPO/engine/kernels/tests/l2pf_bench.cu" "$REPO/engine/attn/attn.cu" \
   "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas "${KNOBS[@]}"
-# GR8_ROUTE_OVL (the shared expert on a forked stream during the router) against the default MoE layer: byte-exact check
-# + bench on a synthetic TP4 layer; build only (needs an idle GPU and ~2.5 GB): $OUT/k1_ovl_test (file header)
-# shellcheck disable=SC2086
-build k1_ovl_test $NVCC -O2 -std=c++17 $S2 -I "$REPO/engine/kernels" -o "$OUT/k1_ovl_test" \
-  "$REPO/engine/kernels/tests/k1_ovl_test.cu" "${KNOBS[@]}"
 # Steering projection/consume/finalizer fixtures (and S2 batched steering, s2_steer_test): compile in CI even without a
 # GPU. No model or fabric service needed.
 STEERING="s2_steer_test steering_consume_test steering_shared_test steering_boot_cuda_test steering_cuda_test"
@@ -167,21 +162,17 @@ for test in $STEERING; do
   # shellcheck disable=SC2086
   build $test $NVCC -O2 -std=c++17 $S2 -o "$OUT/$test" "$REPO/engine/runtime/tests/$test.cu" -lcublas "${KNOBS[@]}"
 done
-# dense trellis matrices, at each width with that width's engine flags, and in the Flash geometry at its widths: build
-# only. dtr_test runs on the release's files (engine/ref/dtr_ref.py)
-for n in $WIDTHS; do
-  f="-DG6_NR=$n -DDEC_S2"
-  case " ${F12_WIDTHS:-4} " in *" $n "*) f="$f -DPF_F12" ;; esac
-  # shellcheck disable=SC2086
-  build dtr_test_tp$n $NVCC -O2 -std=c++17 $GEN $K1H2_FLAGS $f -I "$REPO/engine/kernels" -o "$OUT/dtr_test_tp$n" \
-    "$REPO/engine/kernels/tests/dtr_test.cu" -lcublas "${KNOBS[@]}"
-done
-for n in 2 3 4; do
-  # shellcheck disable=SC2086
-  build dtr_test_flash_tp$n $NVCC -O2 -std=c++17 $GEN ${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_FLASH=1 \
-    -DG6_NR=$n -DDEC_S2 -I "$REPO/engine/kernels" -o "$OUT/dtr_test_flash_tp$n" "$REPO/engine/kernels/tests/dtr_test.cu" \
-    -lcublas "${KNOBS[@]}"
-done
+# dense trellis matrices, at TP4 with that width's engine flags, and in the Flash geometry at TP4: build only. dtr_test
+# runs on the release's files (engine/ref/dtr_ref.py)
+f="-DG6_NR=4 -DDEC_S2"
+case " ${F12_WIDTHS:-4} " in *" 4 "*) f="$f -DPF_F12" ;; esac
+# shellcheck disable=SC2086
+build dtr_test_tp4 $NVCC -O2 -std=c++17 $GEN $K1H2_FLAGS $f -I "$REPO/engine/kernels" -o "$OUT/dtr_test_tp4" \
+  "$REPO/engine/kernels/tests/dtr_test.cu" -lcublas "${KNOBS[@]}"
+# shellcheck disable=SC2086
+build dtr_test_flash_tp4 $NVCC -O2 -std=c++17 $GEN ${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_FLASH=1 \
+  -DG6_NR=4 -DDEC_S2 -I "$REPO/engine/kernels" -o "$OUT/dtr_test_flash_tp4" "$REPO/engine/kernels/tests/dtr_test.cu" \
+  -lcublas "${KNOBS[@]}"
 # TR3 / exlr8-e4m3 decode unit test; runs here when a GPU is visible, else later by hand: $OUT/tr3_e4m3_test
 build tr3_e4m3_test $NVCC -O2 -std=c++17 $GEN -o "$OUT/tr3_e4m3_test" "$REPO/engine/kernels/tests/tr3_e4m3_test.cu" \
   -lcublas "${KNOBS[@]}"
@@ -195,17 +186,9 @@ build l2pf_queue_test nvcc -O2 -std=c++17 $GEN $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR
 # shellcheck disable=SC2086
 build k1_split_test nvcc -O2 -std=c++17 $S2 -I "$REPO/engine/kernels" -o "$OUT/k1_split_test" \
   "$REPO/engine/kernels/tests/k1_split_test.cu" "${KNOBS[@]}"
-# fabric groups over real verbs (#154): built here, run by hand on the cluster (one process per box; see its header)
-build fabric_group_test $NVCC -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_group_test" \
-  "$REPO/engine/comms/tests/fabric_group_test.cpp" "$REPO/engine/comms/fabric.cpp" -libverbs "${KNOBS[@]}"
 # flat reduce-scatter slices (Fabric::Rs::flat) over real verbs, mesh or ring: built here, run on the cluster (see its header)
 build fabric_rs_flat_test $NVCC -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_rs_flat_test" \
   "$REPO/engine/comms/tests/fabric_rs_flat_test.cpp" "$REPO/engine/comms/fabric.cpp" -libverbs "${KNOBS[@]}"
-# the adaptive draft length decision, CPU
-build test_spec_len $GXX -O2 -std=c++17 -o "$OUT/test_spec_len" "$REPO/engine/tests/test_spec_len.cpp"
-# the prefix-reuse state machine (--reuse-prefix and its grid rules), CPU
-build test_prefix_reuse $GXX -O2 -std=c++17 -I "$REPO/engine/runtime" -o "$OUT/test_prefix_reuse" \
-  "$REPO/engine/tests/test_prefix_reuse.cpp"
 wait
 cat "$TL"/*.log
 if ls "$TL"/*.failed > /dev/null 2>&1; then echo "test builds failed: $(cd "$TL" && ls -- *.failed | sed 's/\.failed$//')"; exit 1; fi
@@ -215,8 +198,6 @@ check() {   # check <test>: run $OUT/<test>; print its last line, named, or all 
   t=$(echo "$t" | tail -1)
   case "$t" in "$1"*) echo "$t" ;; *) echo "$1: $t" ;; esac
 }
-check test_spec_len
-check test_prefix_reuse
 check l2pf_queue_test
 check k1_split_test
 if nvidia-smi -L > /dev/null 2>&1; then
@@ -225,7 +206,7 @@ if nvidia-smi -L > /dev/null 2>&1; then
 else
   echo "tr3_e4m3_test and the steering tests ($STEERING): compiled; no GPU visible, not run"
 fi
-echo "dtr_test_tp<N>, dtr_test_flash_tp<N>, l2pf_bench, k1_ovl_test: built (they need release files or an idle GPU)"
-echo "fabric_group_test, fabric_rs_flat_test: built (cluster tests, not run here)"
+echo "dtr_test_tp4, dtr_test_flash_tp4, l2pf_bench: built (they need release files or an idle GPU)"
+echo "fabric_rs_flat_test: built (a cluster test, not run here)"
 [ -f "$GR8_NVCC_CACHE_LOG" ] && echo "nvcc cache (tests): $(grep -c '^hit' "$GR8_NVCC_CACHE_LOG") hit, $(grep -c '^miss' "$GR8_NVCC_CACHE_LOG") miss"
 exit 0

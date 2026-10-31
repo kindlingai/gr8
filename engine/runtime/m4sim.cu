@@ -59,12 +59,12 @@
 // GR8_TEST_ROW_LINES=1: after each target step, one line per row (rank 0; the ranks' residual rows are compared):
 //        "row q<seq> pos <p> M <M> s <step> | in <token fed> tok <sampled> lp <bits> lpt <bits> resid <fnv of the row's
 //        residual> logits <fnv of the row's logits, the ranks' slices in rank order>". The part after "|" must not depend
-//        on the step's row count or on the other rows of the step (scripts/m4sim_split_check.sh compares it).
+//        on the step's row count or on the other rows of the step.
 // GR8_MTP_LASTROW=1 (needs --mtp): as g6m4, a draft step routes only each session's last row (rank.cuh launch_mlp_block).
 // GR8_DRAFT_HEAD2=1|2 (needs --mtp): as g6m4, the MTP draft's two-stage head (2: with the MXFP8 check lines).
 // GR8_TEST_MTP_LASTROW_CHECK=1: after each draft step one "check" line per session: its last row's token, log-probability,
 //        head-input and residual rows, and a hash of every rank's whole layer-78 caches. With and without GR8_MTP_LASTROW
-//        every line but the first-form "draft" lines (their other rows) must be the same (scripts/mtp_lastrow_check.sh).
+//        every line but the first-form "draft" lines (their other rows) must be the same.
 // [--minv B] [--minv-rows 1,2,..]: per --prompt, rows 0..B-1 in --chunk steps, then for every row count M of the list
 //        (default 1..MX then MX-1..1, each <= prompt - B) one step over prompt rows B..B+M-1 (teacher-forced) from that same
 //        state, with its row lines. Row B + j must print the same line at every M > j. No --mtp / --s2 / --serve / --prefill.
@@ -1489,7 +1489,7 @@ int main(int argc, char** argv)
     // and the layer-78 caches: "<prefix> check <s> | rows <n> last <row> tok <t> lp <bits> x <fnv> resid <fnv> kv <fnv>":
     // the last row's token and log-probability (rank 0), its head-input row (x, the shared_head_norm output) and residual
     // over every rank, and every rank's whole draft-layer KV latent and indexer key caches. GR8_MTP_LASTROW on and off must
-    // print the same lines (scripts/mtp_lastrow_check.sh)
+    // print the same lines
     const bool dcheck_on = knob::test_mtp_lastrow_check();
     auto dcheck = [&](const std::string& prefix, int s, int r0, int n, const StepOut* so) {
         if (!dcheck_on) return;

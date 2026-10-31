@@ -3,7 +3,7 @@
 // flag means, because m4sim's output is the oracle g6m4 is held to (g6m4.cu: "all six (NR) must equal m4sim's on the
 // same packs"), and until now they agreed by holding the same 29 parse lines twice.
 //
-// Host only, no CUDA, so tests/engine_opts_test.cpp builds it with g++ (scripts/host_tests.sh). Two consequences:
+// Host only, no CUDA. Two consequences:
 // the flags that land in rank.cuh's Plan are optionals here, so Plan keeps its own defaults and a caller applies only
 // what the command line set; and a bad value comes back as a message instead of calling die(), which lives in rank.cuh.
 #include <algorithm>
