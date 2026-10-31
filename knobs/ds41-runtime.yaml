@@ -174,12 +174,13 @@ knobs:
       comma separated. Not exact.
   GR8_DS_SPAN:
     scope: local
-    kind: flag
+    kind: int
     default: "0"
-    values: "0|1"
+    values: "0..2"
     doc: >-
       Prints the GPU time of each plan unit (attention, consume, MoE, head, ...) summed over the layers: every eager step,
-      and for a captured step graph the mean per step over 64 sampled replays (every 64th replay is read).
+      and for a captured step graph the mean per step over 16 sampled replays (every 16th replay is read, through
+      globaltimer stamps the capture adds around each unit). 2: also one line per unit kind with the time of each layer.
   GR8_DS_STRIPE:
     scope: agree
     kind: flag

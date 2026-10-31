@@ -47,4 +47,11 @@ It also prints a summary per rank and port: mean and peak rates over the interva
 trouble counters' totals.
 
 `GR8_DS_SPAN=1` adds the DS41 GPU side: the time of each plan unit (attention, consume, MoE, head, ...) summed over the
-layers, per eager step and, for each captured step graph, as the mean over 64 sampled replays.
+layers, per eager step and, for each captured step graph, as the mean over 16 sampled replays (every 16th). A captured
+step cannot be timed with events (an event recorded as a graph node cannot be read back), so the capture stamps
+`%globaltimer` around each unit with a one-thread kernel node; the stamps make the profiled step a little slower.
+`GR8_DS_SPAN=2` adds one line per unit kind with the time of each layer, in layer order. The lines go to the engine's
+stderr (`./gr8 ds41 logs`):
+
+    # span M=6 per step over 16 sampled replays, rank 0: step_in 0.012 ms embed 0.031 ms attn 9.8 ms ...
+    # span M=6 per step over 16 sampled replays, rank 0 per layer mlp: 0.201 0.198 ...

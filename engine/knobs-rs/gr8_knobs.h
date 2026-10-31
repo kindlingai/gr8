@@ -28,7 +28,7 @@ namespace knob
 
 /// Prints the environment's problems (bad values, unknown GR8_ names, old G6_ names) to stderr and returns the number
 /// of errors. The engine stops when it is not 0.
-inline int init() { return gr8_knobs_init(0xed3c767e6f98aea5ull); }
+inline int init() { return gr8_knobs_init(0x00132b9fa0b8335cull); }
 
 /// The set agree-scope knobs that differ from their defaults, as " env NAME=value ...", or "".
 inline std::string signature() { return gr8_knobs_signature(); }
@@ -912,9 +912,9 @@ inline bool ds_sh_tc()
 }
 
 /// GR8_DS_SPAN
-inline bool ds_span()
+inline int64_t ds_span()
 {
-    static const bool v = *detail::flag(119, 0);
+    static const int64_t v = *detail::int_(119, 0);
     return v;
 }
 

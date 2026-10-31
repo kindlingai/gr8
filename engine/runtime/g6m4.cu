@@ -1738,7 +1738,7 @@ int main(int argc, char** argv)
     auto replayed = [&](const cudaGraphExec_t* ex, int M) {
         if (!ds41_span_on()) return;
         const auto it = span_sets.find(ex);
-        if (it != span_sets.end()) ds41_span_replayed(it->second, m.ds_ns > 1 ? "sessions " : "", M);
+        if (it != span_sets.end()) ds41_span_replayed(it->second, m.ds_ns > 1 ? "sessions " : "", M, st);
     };
 #endif
     auto launch_main = [&](int k, int M) {
@@ -1769,13 +1769,13 @@ int main(int argc, char** argv)
     };
     auto capture = [&](const std::function<void()>& body, cudaGraphExec_t* ex, const char* what, int M) {
         cudaGraph_t g;
-        G6RT_CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
 #if G6_MODEL_DS41
-        if (ds41_span_on()) ds41_span_sink = &span_sets[ex];
+        if (ds41_span_on()) ds41_span_begin(span_sets[ex]);
 #endif
+        G6RT_CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
         body();
 #if G6_MODEL_DS41
-        ds41_span_sink = nullptr;
+        ds41_span_end(st);
 #endif
         G6RT_CK(cudaStreamEndCapture(st, &g));
         size_t nodes = 0;

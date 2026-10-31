@@ -13,6 +13,7 @@ extern "C" int ds41_sh_act_quant(const void*,int,uint8_t*,int,uint8_t*,int,int,i
 inline int ds41_engram_project(void* model, int e, int rows, void* stream, const __nv_bfloat16* emb, __nv_bfloat16* kv);
 #include "ds41_engram_ops.cuh"
 #include <map>
+#include <algorithm>
 // BF16 partials of the NR ranks, summed in rank order as FP32. The ds_mhc kernels call init(), wait(step) and operator()(k)
 // with k = row * H + h. A DS-local copy of the part of flash's MhcFabricBlock that the decode step uses (no prefill hooks).
 struct Ds41Block {
@@ -784,43 +785,86 @@ inline void ds41_subdump(Model& m,int i,const char* what,const void* dev,int M,c
     FILE* f=fopen(p.c_str(),"wb"); if(!f) die("GR8_DS_SUBDUMP: cannot open "+p);
     fwrite(h.data(),1,h.size(),f); fclose(f);
 }
-// GR8_DS_SPAN=1: per-unit GPU time spans (cudaEvent pair around each plan unit on the rank's stream), summed over the layers and printed once
-// per step on stderr: "# span step S rank R: attn x ms cons_a y ms mlp z ms cons_f w ms ..." (head_local + head_merge = head, step_out = deliver).
-// A span is the stream time between its two events: a consume unit includes the wait for the other ranks' partials (the simulated ranks share
-// one GPU). Eager: the events of step S are read at the start of step S+1 and by ds41_span_flush() at the end of the run.
-// A captured step (served decode): the event pairs are nodes of that graph, kept in the Ds41SpanSet its capture names in ds41_span_sink;
-// ds41_span_replayed reads them after every 64th replay of the graph and prints the mean per step of the last 64.
+// GR8_DS_SPAN: per-unit GPU time spans, summed over the layers and printed per step on stderr: "# span step S rank R: attn x ms
+// consume_attn y ms mlp z ms ..." (head_local + head_merge = head, step_out = deliver). A span is the stream time from the unit's
+// first launch to its last; a consume unit includes the wait for the other ranks' partials (in m4sim the ranks share one GPU).
+// GR8_DS_SPAN=2 adds one line per unit kind with the layers' times in layer order ("# span ... rank R per layer mlp: 0.123 0.118 ...").
+// Eager (m4sim, the served prefill passes): a cudaEvent pair around each unit on the rank's stream. A pass's spans are read when the
+// rank that opened it starts its next pass (U_EMBED, or layer 0's attention), and by ds41_span_flush() at the end of a run.
+// A captured step graph (served decode, m4sim --graph): an event recorded as a graph node cannot be read back (cudaEventSynchronize
+// and cudaEventElapsedTime return invalid argument for it, and the ignored error surfaces at the next cudaGetLastError), so the
+// capture stamps %globaltimer around each unit with a one-thread kernel node into the set's device buffer, and ds41_span_end adds
+// the copy of the stamps to pinned host memory as the graph's last node. ds41_span_replayed records an event after every 16th
+// replay, waits for it, adds that replay's spans, and after 16 samples prints their mean per step. The stamp nodes make a
+// profiled step a little slower than an unprofiled one (two one-thread kernels per unit: 332 in a 40-layer step).
 struct Ds41Span { int rank,layer,unit; cudaEvent_t a,b; };
 inline std::vector<Ds41Span>& ds41_spans() { static std::vector<Ds41Span> v; return v; }
-struct Ds41SpanSet { std::vector<Ds41Span> v; double tot[ds41::U_COUNT]={}; int reads=0, launches=0; };
+constexpr int DS41_SPAN_CAP=1024;          // unit spans per captured step graph (a 40-layer step has 166; m4sim captures its ranks in turn)
+struct Ds41SpanSet {
+    std::vector<Ds41Span> v;               // the captured units in stamp order (a, b unused)
+    unsigned long long *d=nullptr,*h=nullptr;   // [2 * DS41_SPAN_CAP] globaltimer stamps on the device, and their pinned host copy
+    cudaEvent_t done=nullptr;              // recorded after a sampled replay
+    std::vector<double> ms;                // per unit: the sampled replays' time, summed
+    int reads=0, launches=0;
+};
 inline thread_local Ds41SpanSet* ds41_span_sink=nullptr;
-inline void ds41_span_replayed(Ds41SpanSet& g,const char* what,int M) {
-    if(g.v.empty() || ++g.launches%64) return;
-    cudaEventSynchronize(g.v.back().b);
-    for(const Ds41Span& s:g.v) { float ms=0; cudaEventElapsedTime(&ms,s.a,s.b); g.tot[s.unit]+=ms; }
-    if(++g.reads<64) return;
-    fprintf(stderr,"# span %sM=%d rank %d, per step over %d sampled replays:",what,M,g.v[0].rank,g.reads);
-    for(int u=0;u<ds41::U_COUNT;++u) if(g.tot[u]>0) fprintf(stderr," %s %.3f ms",ds41::unit_name((ds41::Unit)u),g.tot[u]/g.reads);
-    fprintf(stderr,"\n");
-    for(double& t:g.tot) t=0;
+__global__ void k_ds41_span_stamp(unsigned long long* p) { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); *p=t; }
+inline bool ds41_span_on() { return knob::ds_span()>0; }
+inline bool ds41_span_layers() { return knob::ds_span()>=2; }
+// The units of v with their times ms (divided by div), one line per rank: prefix + " rank R: unit t ms ...", and with GR8_DS_SPAN=2 the per-layer lines.
+inline void ds41_span_print(const std::vector<Ds41Span>& v,const std::vector<double>& ms,double div,const std::string& prefix) {
+    std::vector<int> ranks;
+    for(const Ds41Span& s:v) if(std::find(ranks.begin(),ranks.end(),s.rank)==ranks.end()) ranks.push_back(s.rank);
+    for(int r:ranks) {
+        double tot[ds41::U_COUNT]={}; int n[ds41::U_COUNT]={};
+        for(size_t i=0;i<v.size();++i) if(v[i].rank==r) { tot[v[i].unit]+=ms[i]; ++n[v[i].unit]; }
+        fprintf(stderr,"%s rank %d:",prefix.c_str(),r);
+        for(int u=0;u<ds41::U_COUNT;++u) if(n[u]) fprintf(stderr," %s %.3f ms",ds41::unit_name((ds41::Unit)u),tot[u]/div);
+        fprintf(stderr,"\n");
+        if(!ds41_span_layers()) continue;
+        for(int u=0;u<ds41::U_COUNT;++u) {
+            if(n[u]<2) continue;
+            fprintf(stderr,"%s rank %d per layer %s:",prefix.c_str(),r,ds41::unit_name((ds41::Unit)u));
+            for(size_t i=0;i<v.size();++i) if(v[i].rank==r && v[i].unit==u) fprintf(stderr," %.3f",ms[i]/div);
+            fprintf(stderr,"\n");
+        }
+    }
+}
+// Before the capture that fills g (its buffers are never allocated inside a capture); the units then stamp into g until ds41_span_end.
+inline void ds41_span_begin(Ds41SpanSet& g) {
+    if(!g.d && (cudaMalloc(&g.d,2*DS41_SPAN_CAP*sizeof(unsigned long long))!=cudaSuccess ||
+                cudaMallocHost(&g.h,2*DS41_SPAN_CAP*sizeof(unsigned long long))!=cudaSuccess ||
+                cudaEventCreateWithFlags(&g.done,cudaEventDisableTiming)!=cudaSuccess)) die("GR8_DS_SPAN: cannot allocate the stamp buffers");
+    g.v.clear(); g.ms.clear(); g.reads=g.launches=0;
+    ds41_span_sink=&g;
+}
+// After the capture body, before cudaStreamEndCapture: the stamps' copy to the host as the graph's last node.
+inline void ds41_span_end(cudaStream_t st) {
+    Ds41SpanSet* g=ds41_span_sink; ds41_span_sink=nullptr;
+    if(!g || g->v.empty()) return;
+    if(cudaMemcpyAsync(g->h,g->d,2*g->v.size()*sizeof(unsigned long long),cudaMemcpyDeviceToHost,st)!=cudaSuccess) die("GR8_DS_SPAN: cannot capture the stamp copy");
+    g->ms.assign(g->v.size(),0);
+}
+// After a replay of g's graph on st (the launch is enqueued, not complete).
+inline void ds41_span_replayed(Ds41SpanSet& g,const char* what,int M,cudaStream_t st) {
+    if(g.v.empty() || ++g.launches%16) return;
+    if(cudaEventRecord(g.done,st)!=cudaSuccess || cudaEventSynchronize(g.done)!=cudaSuccess) die("GR8_DS_SPAN: cannot wait for the sampled replay");
+    for(size_t i=0;i<g.v.size();++i) g.ms[i]+=(double)(g.h[2*i+1]-g.h[2*i])*1e-6;
+    if(++g.reads<16) return;
+    ds41_span_print(g.v,g.ms,g.reads,"# span "+std::string(what)+"M="+std::to_string(M)+" per step over "+std::to_string(g.reads)+" sampled replays,");
+    std::fill(g.ms.begin(),g.ms.end(),0.0);
     g.reads=0;
 }
-inline bool ds41_span_on() { return knob::ds_span(); }
 inline void ds41_span_flush() {
     std::vector<Ds41Span>& v=ds41_spans(); if(v.empty()) return;
-    static int step=0; double tot[16][ds41::U_COUNT]={}; int maxr=0;
-    for(const Ds41Span& s:v) {
-        float ms=0; cudaEventSynchronize(s.b); cudaEventElapsedTime(&ms,s.a,s.b);
-        if(s.rank<16) { tot[s.rank][s.unit]+=ms; if(s.rank>maxr) maxr=s.rank; }
-        cudaEventDestroy(s.a); cudaEventDestroy(s.b);
+    static int step=0;
+    std::vector<double> ms(v.size());
+    for(size_t i=0;i<v.size();++i) {
+        float t=0; cudaEventSynchronize(v[i].b); cudaEventElapsedTime(&t,v[i].a,v[i].b); ms[i]=t;
+        cudaEventDestroy(v[i].a); cudaEventDestroy(v[i].b);
     }
+    ds41_span_print(v,ms,1,"# span step "+std::to_string(step++));
     v.clear();
-    for(int r=0;r<=maxr;++r) {
-        fprintf(stderr,"# span step %d rank %d:",step,r);
-        for(int u=0;u<ds41::U_COUNT;++u) if(tot[r][u]>0) fprintf(stderr," %s %.3f ms",ds41::unit_name((ds41::Unit)u),tot[r][u]);
-        fprintf(stderr,"\n");
-    }
-    ++step;
 }
 // Run the ops of one unit (the plan span of (u, ui)). A stop (null slot or a refusing op) ends the process with the plan's own message.
 // Stop hook (m4sim sets it when GR8_RESID_DUMP is on): runs just before a stop dies, so the residual slots reached are written.
@@ -838,7 +882,9 @@ inline void ds41_unit_run(Model& m,ds41::Unit u,int ui,int M,cudaStream_t st) {
 inline bool ds41_diag_any() { return ds41_feed_dir() || ds41_subdump_dir() || ds41_span_on(); }
 inline void ds41_unit(Model& m,ds41::Unit u,int ui,int M,cudaStream_t st) {
     if(!ds41_diag_any()) { ds41_unit_run(m,u,ui,M,st); return; }
-    if(u==ds41::U_EMBED && m.rank==0 && ds41_span_on() && !ds41_span_sink) ds41_span_flush();   // the previous eager step is complete (m4sim syncs after every step)
+    if(ds41_span_on() && !ds41_span_sink && !ds41_spans().empty() && ds41_spans()[0].rank==m.rank &&
+       (u==ds41::U_EMBED || (u==ds41::U_ATTN && ui==0 && ds41_spans().back().unit!=ds41::U_EMBED)))
+        ds41_span_flush();   // the rank that opened the previous eager pass starts a new one (its embed, or layer 0 of a pass without one): that pass is complete
     if(u==ds41::U_ATTN) ds41_feed_stage(m,ui,false,M,st);
     if(u==ds41::U_MLP) {
         if(m.rank==0) ds41_subdump(m,ui,"ffn_in",m.hc_y,M,st);   // the engine's own, before a feed replaces it
@@ -846,10 +892,17 @@ inline void ds41_unit(Model& m,ds41::Unit u,int ui,int M,cudaStream_t st) {
     }
     Ds41Span sp{m.rank,ui,(int)u,nullptr,nullptr};
     cudaStreamCaptureStatus cs=cudaStreamCaptureStatusNone;
-    const bool span=ds41_span_on() && (cudaStreamIsCapturing(st,&cs)!=cudaSuccess || cs==cudaStreamCaptureStatusNone || ds41_span_sink);
-    if(span) { cudaEventCreate(&sp.a); cudaEventCreate(&sp.b); cudaEventRecord(sp.a,st); }
+    if(ds41_span_on() && cudaStreamIsCapturing(st,&cs)!=cudaSuccess) cs=cudaStreamCaptureStatusNone;
+    const bool eager=ds41_span_on() && cs==cudaStreamCaptureStatusNone;
+    Ds41SpanSet* cap=ds41_span_on() && cs!=cudaStreamCaptureStatusNone ? ds41_span_sink : nullptr;   // a capture nobody hooked: no stamps
+    if(eager) { cudaEventCreate(&sp.a); cudaEventCreate(&sp.b); cudaEventRecord(sp.a,st); }
+    if(cap) {
+        if(cap->v.size()>=DS41_SPAN_CAP) die("GR8_DS_SPAN: more than "+std::to_string(DS41_SPAN_CAP)+" units in one captured step");
+        k_ds41_span_stamp<<<1,1,0,st>>>(cap->d+2*cap->v.size());
+    }
     ds41_unit_run(m,u,ui,M,st);
-    if(span) { cudaEventRecord(sp.b,st); (cs==cudaStreamCaptureStatusNone ? ds41_spans() : ds41_span_sink->v).push_back(sp); }
+    if(eager) { cudaEventRecord(sp.b,st); ds41_spans().push_back(sp); }
+    if(cap) { k_ds41_span_stamp<<<1,1,0,st>>>(cap->d+2*cap->v.size()+1); cap->v.push_back(sp); }
     if(u==ds41::U_ATTN) ds41_subdump(m,ui,"attn_part",m.sc.part[0],M,st);
     if(u==ds41::U_MLP) ds41_subdump(m,ui,"ffn_part",m.sc.part[1],M,st);
 }
