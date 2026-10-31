@@ -36,11 +36,20 @@
 
 namespace ds41 { namespace engram {
 
+// Rows [row0, row0 + rows) of a table at byte `off` of the file `path`: one run of the release's split files.
+struct TableRun
+{
+    std::string path;
+    int64_t row0 = 0, rows = 0;
+    uint64_t off = 0;
+};
+
 struct TableFile
 {
-    std::string path;       // PREFIX.engram.L###.w8
+    std::string path;       // a file of rows [first, first + valid) from byte 0, when `runs` is empty
     int64_t first = 0;      // first global row this rank serves
     int64_t valid = 0;      // rows it serves (the file may hold more: pad rows up to `part`)
+    std::vector<TableRun> runs;   // the rows in several files (ascending, consecutive from `first`)
 };
 
 struct StoreOpts
@@ -208,7 +217,7 @@ public:
     ~RowStore()
     {
         pool_.reset();   // join the workers before the descriptors go
-        for (auto& t : tab_) if (t.fd >= 0) close(t.fd);
+        for (auto& t : tab_) for (auto& r : t.runs) if (r.fd >= 0) close(r.fd);
     }
 
     bool open(const std::vector<TableFile>& files, const StoreOpts& o, std::string* err)
@@ -221,31 +230,42 @@ public:
             Tab t;
             t.first = f.first;
             t.valid = f.valid;
-            t.path = f.path;
             if (f.first < 0 || f.valid < 0 || f.first + f.valid >= (1ll << 30) - 1) { *err = f.path + ": row range outside the 30-bit tag space"; return false; }
-            t.fd = ::open(f.path.c_str(), O_RDONLY | O_CLOEXEC | (o.direct ? O_DIRECT : 0));
-            if (t.fd < 0 && o.direct && errno == EINVAL)
+            std::vector<TableRun> runs = f.runs;
+            if (runs.empty()) runs.push_back({f.path, f.first, f.valid, 0});
+            int64_t next = f.first;
+            for (const TableRun& tr : runs)
             {
-                t.fd = ::open(f.path.c_str(), O_RDONLY | O_CLOEXEC);   // the filesystem refuses O_DIRECT: buffered, said in the stats
-                t.direct = false;
-            }
-            else t.direct = o.direct;
-            if (t.fd < 0) { *err = f.path + ": open: " + strerror(errno); return false; }
-            struct stat st;
-            if (fstat(t.fd, &st) != 0) { *err = f.path + ": fstat: " + strerror(errno); return false; }
-            t.bytes = (uint64_t)st.st_size;
-            if (t.bytes < (uint64_t)f.valid * kRowBytes) { *err = f.path + ": file holds fewer bytes than valid rows * 256"; return false; }
-            if (t.direct)
-            {
-#ifdef STATX_DIOALIGN
-                struct statx sx;
-                if (statx(t.fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &sx) == 0 && (sx.stx_mask & STATX_DIOALIGN) && sx.stx_dio_offset_align)
+                if (tr.row0 != next || tr.rows < 0) { *err = tr.path + ": runs are not consecutive from the first row"; return false; }
+                next += tr.rows;
+                Run r;
+                r.row0 = tr.row0; r.rows = tr.rows; r.off = tr.off;
+                r.fd = ::open(tr.path.c_str(), O_RDONLY | O_CLOEXEC | (o.direct ? O_DIRECT : 0));
+                if (r.fd < 0 && o.direct && errno == EINVAL)
                 {
-                    block_ = std::max<size_t>(block_, sx.stx_dio_offset_align);
-                    align = std::max<size_t>(align, std::max<size_t>(sx.stx_dio_mem_align, sx.stx_dio_offset_align));
+                    r.fd = ::open(tr.path.c_str(), O_RDONLY | O_CLOEXEC);   // the filesystem refuses O_DIRECT: buffered, said in the stats
+                    t.direct = false;
                 }
+                else t.direct = t.direct && o.direct;
+                if (r.fd < 0) { *err = tr.path + ": open: " + strerror(errno); return false; }
+                struct stat st;
+                if (fstat(r.fd, &st) != 0) { *err = tr.path + ": fstat: " + strerror(errno); return false; }
+                if ((uint64_t)st.st_size < tr.off + (uint64_t)tr.rows * kRowBytes) { *err = tr.path + ": file holds fewer bytes than its rows * 256"; return false; }
+                if (tr.off % kRowBytes) { *err = tr.path + ": a run's offset is not a multiple of 256"; return false; }
+                if (t.direct)
+                {
+#ifdef STATX_DIOALIGN
+                    struct statx sx;
+                    if (statx(r.fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &sx) == 0 && (sx.stx_mask & STATX_DIOALIGN) && sx.stx_dio_offset_align)
+                    {
+                        block_ = std::max<size_t>(block_, sx.stx_dio_offset_align);
+                        align = std::max<size_t>(align, std::max<size_t>(sx.stx_dio_mem_align, sx.stx_dio_offset_align));
+                    }
 #endif
+                }
+                t.runs.push_back(r);
             }
+            if (next != f.first + f.valid) { *err = f.path + ": runs do not cover the valid rows"; return false; }
             tab_.push_back(t);
         }
         size_t b = 256;
@@ -301,14 +321,18 @@ public:
             const size_t nu = uid.size();
             st.miss_uniq = (uint32_t)nu;
             std::vector<uint8_t> urow(nu * kRowBytes);
-            // reads: consecutive distinct rows in the same block share one
-            struct Task { uint64_t off; uint32_t u0, u1; };
+            // reads: consecutive distinct rows in the same block of the same run share one
+            struct Task { uint64_t off; uint32_t u0, u1; int run; };
             std::vector<Task> tasks;
+            std::vector<uint64_t> uoff(nu);   // each row's byte offset in its run's file
+            int ri = 0;
             for (size_t u = 0; u < nu; ++u)
             {
-                const uint64_t boff = (uint64_t)(uid[u] - T.first) * kRowBytes;
-                const uint64_t blk = boff & ~(uint64_t)(block_ - 1);
-                if (tasks.empty() || tasks.back().off != blk) tasks.push_back({blk, (uint32_t)u, (uint32_t)u + 1});
+                while (uid[u] >= T.runs[ri].row0 + T.runs[ri].rows) ++ri;   // ids ascend; every id is in [first, first + valid)
+                const Run& R = T.runs[ri];
+                uoff[u] = R.off + (uint64_t)(uid[u] - R.row0) * kRowBytes;
+                const uint64_t blk = uoff[u] & ~(uint64_t)(block_ - 1);
+                if (tasks.empty() || tasks.back().off != blk || tasks.back().run != ri) tasks.push_back({blk, (uint32_t)u, (uint32_t)u + 1, ri});
                 else tasks.back().u1 = (uint32_t)u + 1;
             }
             st.blocks = (uint32_t)tasks.size();
@@ -319,12 +343,12 @@ public:
             {
                 const Task& k = tasks[ti];
                 ssize_t r;
-                do r = pread(T.fd, buf, blk_sz, (off_t)k.off); while (r < 0 && errno == EINTR);
+                do r = pread(T.runs[k.run].fd, buf, blk_sz, (off_t)k.off); while (r < 0 && errno == EINTR);
                 if (r < 0) { int z = 0; err.compare_exchange_strong(z, errno); return; }
                 bytes += (uint64_t)r;
                 for (uint32_t u = k.u0; u < k.u1; ++u)
                 {
-                    const uint64_t in = (uint64_t)(uid[u] - T.first) * kRowBytes - k.off;
+                    const uint64_t in = uoff[u] - k.off;
                     if ((uint64_t)r < in + kRowBytes) { int z = 0; err.compare_exchange_strong(z, EIO); return; }   // short read inside the row
                     memcpy(&urow[(size_t)u * kRowBytes], buf + in, kRowBytes);
                 }
@@ -360,12 +384,16 @@ public:
 private:
     using Clock = std::chrono::steady_clock;
     static double us(Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::micro>(b - a).count(); }
+    struct Run
+    {
+        int fd = -1;
+        int64_t row0 = 0, rows = 0;
+        uint64_t off = 0;
+    };
     struct Tab
     {
-        std::string path;
-        int fd = -1;
+        std::vector<Run> runs;
         int64_t first = 0, valid = 0;
-        uint64_t bytes = 0;
         bool direct = true;
     };
     StoreOpts opts_;

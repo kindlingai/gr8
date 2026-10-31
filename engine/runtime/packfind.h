@@ -223,8 +223,12 @@ inline void* rs_plan_release(g6::Pack& pack, int rank, const V2Src& v2)
     const std::string planned = planned_manifest(rank, "release");
     char err[1024] = "";
 #if G6_MODEL_DS41
-    // DeepSeek-V4.1-Flash-1017: the "release" is the published checkpoint directory (--v2-dense DIR); B3's planner reads it directly
-    void* h = g6l_ds41_plan(v2.dense.c_str(), g6nr::NR, rank, planned.c_str(), err, sizeof err);
+    // DeepSeek-V4.1-Flash-1017: --v2-dense names the exlr8 native release; the planner also writes the Engram tables'
+    // runs, to GR8_DS_ENGRAM_PREFIX.engram.json for the Engram boot, or to a file it removes again
+    const auto eprefix = knob::ds_engram_prefix();
+    const std::string engram = eprefix ? *eprefix + ".engram.json" : planned_manifest(rank, "engram");
+    void* h = g6l_ds41_plan(v2.dense.c_str(), g6nr::NR, rank, planned.c_str(), engram.c_str(), err, sizeof err);
+    if (!eprefix) unlink(engram.c_str());
 #else
     void* h = g6l_release_plan(v2.dense.c_str(), v2.dir.c_str(), v2.slices.c_str(), v2.widths.c_str(), g6nr::NR, rank,
                                v2.qo, v2.trellis, v2.layout.c_str(), planned.c_str(), err, sizeof err);
@@ -302,7 +306,7 @@ inline void load_image(g6::Pack& pack, g6::DevImage& img, const std::string& man
                        bool hash = true, const V2Src& v2 = {})
 {
 #if G6_MODEL_DS41
-    if (!v2.dir.empty() || !v2.dense.empty())   // DS41: --v2-dense CHECKPOINT_DIR alone (rs_plan_release -> g6l_ds41_plan)
+    if (!v2.dir.empty() || !v2.dense.empty())   // DS41: --v2-dense RELEASE_DIR alone (rs_plan_release -> g6l_ds41_plan)
 #else
     if (!v2.dir.empty())
 #endif

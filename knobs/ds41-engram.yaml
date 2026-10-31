@@ -40,9 +40,9 @@ knobs:
     kind: path
     unset: "no Engram tables; GR8_DS_ENGRAM=1 then stops the boot"
     doc: >-
-      The path prefix of this rank's Engram files: PREFIX.engram.json (the manifest), PREFIX.engram.cmap (the token
-      map), and PREFIX.engram.L001.w8 / .s8 and PREFIX.engram.L014.w8 / .s8 (the rows and scales of this rank's
-      slice of each table).
+      The path prefix of this rank's Engram files. The loader writes PREFIX.engram.json at boot (g6engram-v2: the rank's
+      runs of the release's split table files); PREFIX.engram.cmap is the token map (engine/engram/gen_engram.py
+      --out-cmap, from the release's tokenizer). A g6engram-v1 sidecar (PREFIX.engram.L001.w8 / .s8, L014) also loads.
   GR8_DS_ENGRAM_VERBOSE:
     scope: local
     kind: flag

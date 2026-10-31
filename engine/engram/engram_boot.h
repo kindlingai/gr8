@@ -1,5 +1,7 @@
 // Engram boot checks (host only, no CUDA): the GR8_DS_ENGRAM knobs, and the sidecar of one rank loaded fail-closed.
-//   PREFIX.engram.json        the manifest (g6engram-v1): format, rank, tp, per table layer/rows/part/first/valid/dim/sdim/w_bytes/s_bytes
+//   PREFIX.engram.json        the manifest: g6engram-v2 (the release's split files, written by the loader at boot: per table
+//                             layer/rows/part/first/valid/dim/sdim and its runs path/row0/rows/w_off/s_off), or g6engram-v1 (a
+//                             sidecar: per table layer/rows/part/first/valid/dim/sdim/w_bytes/s_bytes and the two files below)
 //   PREFIX.engram.L###.w8     E4M3 rows [part][256]   (size only: `ds41plan --verify PREFIX` checks its sha256, 47 GiB per rank)
 //   PREFIX.engram.L###.s8     E8M0 scales [part][8]   (size only here; the whole file is read to the device at boot)
 //   PREFIX.engram.cmap        "G6ECMAP1" token map written by gen_engram.py; sha256 of the file must equal kCmapSha256 (hash_consts.h)
@@ -45,7 +47,8 @@ inline bool read_knobs(Knobs* k, std::string* err)
 struct TableInfo
 {
     int64_t rows = 0, part = 0, first = 0, valid = 0;
-    std::string w8, s8;       // paths
+    std::string w8, s8;       // v1: the sidecar files
+    std::vector<TableRun> runs, sruns;   // v2: the rows' and the scales' runs in the release's files (TableRun::off: their first byte)
 };
 
 struct Sidecar
@@ -92,7 +95,9 @@ inline bool load_sidecar(const std::string& prefix, int rank, int nr, Sidecar* s
     try
     {
         const g6v::Json man = g6v::Json::parse(text);
-        if (man.at("format").str() != "g6engram-v1") { *err = mp + ": format is not g6engram-v1"; return false; }
+        const std::string format = man.at("format").str();
+        if (format != "g6engram-v1" && format != "g6engram-v2") { *err = mp + ": format is not g6engram-v1 or v2"; return false; }
+        const bool v2 = format == "g6engram-v2";
         if (man.at("rank").i64() != rank || man.at("tp").i64() != nr)
         {
             *err = mp + ": planned for rank " + std::to_string(man.at("rank").i64()) + " of " + std::to_string(man.at("tp").i64()) +
@@ -109,7 +114,7 @@ inline bool load_sidecar(const std::string& prefix, int rank, int nr, Sidecar* s
             TableInfo& t = sc->t[e];
             t.rows = mine->at("rows").i64(); t.part = mine->at("part").i64(); t.first = mine->at("first").i64(); t.valid = mine->at("valid").i64();
             const int64_t dim = mine->at("dim").i64(), sdim = mine->at("sdim").i64();
-            const int64_t wb = mine->at("w_bytes").i64(), sb = mine->at("s_bytes").i64();
+            const int64_t wb = v2 ? t.part * kRowBytes : mine->at("w_bytes").i64(), sb = v2 ? t.part * kScaleBytes : mine->at("s_bytes").i64();
             const int64_t part = (kRows[e] + nr - 1) / nr, first = std::min<int64_t>(rank * part, kRows[e]);
             const int64_t valid = std::min<int64_t>(part, kRows[e] - first);
             const std::string tag = mp + " layer " + std::to_string(kLayerIds[e]) + ": ";
@@ -121,6 +126,22 @@ inline bool load_sidecar(const std::string& prefix, int rank, int nr, Sidecar* s
                 return false;
             }
             if (dim != kRowBytes || sdim != kScaleBytes || wb != part * kRowBytes || sb != part * kScaleBytes) { *err = tag + "row shape or byte counts are not [part][256] / [part][8]"; return false; }
+            if (v2)
+            {
+                const g6v::Json& segs = mine->at("segs");
+                int64_t next = first;
+                for (size_t i = 0; i < segs.size(); ++i)
+                {
+                    const g6v::Json& g = segs.at(i);
+                    const TableRun r{g.at("path").str(), g.at("row0").i64(), g.at("rows").i64(), (uint64_t)g.at("w_off").i64()};
+                    if (r.row0 != next || r.rows <= 0) { *err = tag + "the runs are not consecutive from the first row"; return false; }
+                    next += r.rows;
+                    t.runs.push_back(r);
+                    t.sruns.push_back({r.path, r.row0, r.rows, (uint64_t)g.at("s_off").i64()});
+                }
+                if (next != first + valid) { *err = tag + "the runs do not cover the rank's rows"; return false; }
+                continue;
+            }
             t.w8 = table_path(prefix, kLayerIds[e], "w8");
             t.s8 = table_path(prefix, kLayerIds[e], "s8");
             uint64_t n;

@@ -121,7 +121,7 @@ inline ds41::engram::Knobs ds41_engram_knobs()
     std::string err;
     if (!knob::ds_engram()) return k;
     if (!ds41::engram::read_knobs(&k, &err)) die(err);
-    if (k.prefix.empty()) die("GR8_DS_ENGRAM=1 needs GR8_DS_ENGRAM_PREFIX (the sidecar PREFIX: PREFIX.engram.json / .cmap / .L001.w8 ...)");
+    if (k.prefix.empty()) die("GR8_DS_ENGRAM=1 needs GR8_DS_ENGRAM_PREFIX (PREFIX.engram.json, written at boot, and PREFIX.engram.cmap)");
     return k;
 }
 // Extra collectives of the decode fabric (g6m4.cu, before the Model exists): 0 off, else kNE = 2 after the head slot. Both Engram layers must be served.

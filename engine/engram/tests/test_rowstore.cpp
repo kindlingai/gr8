@@ -79,7 +79,7 @@ int main(int argc, char** argv)
     s0.part = std::max<int64_t>(s0.part, s0.valid + 5);
     Spec s1{1, 0, 100005, 100005, dir + "/t1.w8"};   // no pad rows; 100005 % 16 = 5, so the file ends inside a block of owned rows
     if (!make_file(s0) || !make_file(s1)) { fprintf(stderr, "cannot write test files in %s\n", dir.c_str()); return 2; }
-    std::vector<TableFile> files = {{s0.path, s0.first, s0.valid}, {s1.path, s1.first, s1.valid}};
+    std::vector<TableFile> files = {{s0.path, s0.first, s0.valid, {}}, {s1.path, s1.first, s1.valid, {}}};
     printf("files: t0 %lld valid rows (%lld in file, %llu B, size%%4096=%llu), t1 %lld rows\n", (long long)s0.valid, (long long)s0.part,
            (unsigned long long)(s0.part * 256), (unsigned long long)((s0.part * 256) % 4096), (long long)s1.valid);
 
@@ -87,10 +87,10 @@ int main(int argc, char** argv)
     // ---- open errors
     {
         RowStore bad;
-        std::vector<TableFile> f2 = {{s1.path, 0, 1000000}};   // asks for more rows than the file has
+        std::vector<TableFile> f2 = {{s1.path, 0, 1000000, {}}};   // asks for more rows than the file has
         CHECK(!bad.open(f2, StoreOpts{}, &err) && err.find("fewer") != std::string::npos, "short file must fail open: %s", err.c_str());
         RowStore nofile;
-        std::vector<TableFile> f3 = {{dir + "/missing.w8", 0, 1}};
+        std::vector<TableFile> f3 = {{dir + "/missing.w8", 0, 1, {}}};
         CHECK(!nofile.open(f3, StoreOpts{}, &err), "missing file must fail open");
     }
 
@@ -241,6 +241,39 @@ int main(int argc, char** argv)
         for (size_t i = 0; i < ids.size(); i += 97) CHECK(same(0, ids[i], &dst[i * 256]), "sweep row wrong");
         printf("  threads %3d: %u reads in %.0f us = %.0f reads/s (%.1f us per read at the pool)\n", th, st.blocks, st.io_us, st.blocks / (st.io_us * 1e-6), st.io_us / st.blocks);
     }
+    // ---- one table in two files (the release's split files): t1's rows 0..49999 at byte 65536 of one file, the rest
+    // from byte 0 of another; every row reads the same bytes as through t1.w8
+    {
+        std::vector<uint8_t> all((size_t)s1.valid * 256);
+        FILE* f = fopen(s1.path.c_str(), "rb");
+        CHECK(f && fread(all.data(), 1, all.size(), f) == all.size(), "read t1.w8 back");
+        if (f) fclose(f);
+        const int64_t cut = 50000;
+        const std::string pa = dir + "/split.a", pb = dir + "/split.b";
+        FILE* a = fopen(pa.c_str(), "wb");
+        std::vector<uint8_t> pad(65536, 0);
+        fwrite(pad.data(), 1, pad.size(), a);
+        fwrite(all.data(), 256, cut, a);
+        fclose(a);
+        FILE* b = fopen(pb.c_str(), "wb");
+        fwrite(all.data() + (size_t)cut * 256, 256, s1.valid - cut, b);
+        fclose(b);
+        std::vector<TableFile> runs = {{"", 0, s1.valid, {{pa, 0, cut, 65536}, {pb, cut, s1.valid - cut, 0}}}};
+        RowStore rr;
+        CHECK(rr.open(runs, o, &err), "open runs: %s", err.c_str());
+        std::vector<uint32_t> ids;
+        for (int64_t i = 0; i < 4096; ++i) ids.push_back((uint32_t)((i * 7919) % s1.valid));
+        ids.push_back((uint32_t)(cut - 1)); ids.push_back((uint32_t)cut);
+        std::vector<uint8_t> got(ids.size() * 256);
+        CHECK(rr.fetch(0, ids.data(), ids.size(), got.data()) == 0, "fetch runs");
+        bool same = true;
+        for (size_t i = 0; i < ids.size(); ++i) same &= !memcmp(&got[i * 256], &all[(size_t)ids[i] * 256], 256);
+        CHECK(same, "rows read through two runs differ from the single file");
+        std::vector<TableFile> gap = {{"", 0, s1.valid, {{pa, 0, cut, 65536}, {pb, cut + 1, s1.valid - cut - 1, 0}}}};
+        RowStore rg;
+        CHECK(!rg.open(gap, o, &err) && err.find("consecutive") != std::string::npos, "a gap between runs must fail open: %s", err.c_str());
+    }
+
     if (g_fail) { fprintf(stderr, "FAILED %d checks\n", g_fail); return 1; }
     printf("PASS rowstore\n");
     return 0;

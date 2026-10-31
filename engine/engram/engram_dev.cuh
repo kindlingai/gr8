@@ -263,18 +263,19 @@ public:
             EG_CK(cudaHostGetDevicePointer(&stage_d_[e], stage_h_[e], 0), err);
             const TableInfo& t = sc_.t[e];
             EG_CK(cudaMalloc(&s8_d_[e], (size_t)t.part * kScaleBytes), err);
-            if (!load_file_to_device(t.s8, (uint64_t)t.part * kScaleBytes, s8_d_[e], err)) return false;
+            if (t.sruns.empty() ? !load_file_to_device(t.s8, (uint64_t)t.part * kScaleBytes, s8_d_[e], err)
+                                : !load_runs_to_device(t, s8_d_[e], err)) return false;
             k_wprod<<<(kStreams * kHid + 255) / 256, 256>>>(c.q_w[e], c.k_w[e], wgt_d_[e], kStreams * kHid);
         }
         EG_CK(cudaGetLastError(), err);
         EG_CK(cudaDeviceSynchronize(), err);
 
         std::vector<TableFile> files;
-        for (int e = 0; e < kNE; ++e) files.push_back({sc_.t[e].w8, sc_.t[e].first, sc_.t[e].valid});
+        for (int e = 0; e < kNE; ++e) files.push_back({sc_.t[e].w8, sc_.t[e].first, sc_.t[e].valid, sc_.t[e].runs});
         if (!store_.open(files, c.knobs.store, err)) return false;
         for (int e = 0; e < kNE; ++e)
             fprintf(stderr, "# rank %d: engram rowstore layer %03d file %s %s block %zu\n",
-                    c.rank, kLayerIds[e], sc_.t[e].w8.c_str(),
+                    c.rank, kLayerIds[e], sc_.t[e].runs.empty() ? sc_.t[e].w8.c_str() : (std::to_string(sc_.t[e].runs.size()) + " release runs").c_str(),
                     store_.direct(e) ? "direct=1" : "fallback=buffered", store_.block());
         hooks_ = c.hooks;
         for (int e = 0; e < kNE; ++e) { wkv_codes_[e] = c.wkv_codes[e]; wkv_scales_[e] = c.wkv_scales[e]; }
@@ -524,6 +525,27 @@ private:
         return &jobs_.back();
     }
 
+    // a table's scales from its release runs, the rows past `valid` padded with scale 1.0 (127)
+    bool load_runs_to_device(const TableInfo& t, void* dev, std::string* err)
+    {
+        std::vector<uint8_t> h((size_t)t.part * kScaleBytes, 127);
+        for (const TableRun& r : t.sruns)
+        {
+            const int fd = ::open(r.path.c_str(), O_RDONLY | O_CLOEXEC);
+            if (fd < 0) { *err = r.path + ": open: " + strerror(errno); return false; }
+            const size_t n = (size_t)r.rows * kScaleBytes, at = (size_t)(r.row0 - t.first) * kScaleBytes;
+            size_t got = 0;
+            while (got < n)
+            {
+                const ssize_t k = pread(fd, h.data() + at + got, n - got, (off_t)(r.off + got));
+                if (k <= 0) { ::close(fd); *err = r.path + ": short read of the scales"; return false; }
+                got += (size_t)k;
+            }
+            ::close(fd);
+        }
+        EG_CK(cudaMemcpy(dev, h.data(), h.size(), cudaMemcpyHostToDevice), err);
+        return true;
+    }
     bool load_file_to_device(const std::string& path, uint64_t bytes, void* dev, std::string* err)
     {
         const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
