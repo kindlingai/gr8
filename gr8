@@ -40,6 +40,9 @@
 #   ./gr8 query [OPTIONS] PROMPT      one chat prompt streamed to the terminal, thinking dim (tools/query/query.py):
 #                                     --api URL, --steer PROFILE[:SCALE], --effort, --record/--replay FILE, --window 40x10
 #
+#   ./gr8 perftest --peers A,B,C,D    the fabric's collective health: NCCL all-reduce, Ring then Tree, run on every box at
+#                                     once (tools/perftest/perftest.py; tools/perftest/build.sh builds bin/nccl_probe)
+#
 #   ./gr8 test [frontend|engine|all]  the CPU tests CI runs (.github/ci/cpu-tests.sh), all by default; docs/TESTING.md
 #   ./gr8 test pseudo TOKENIZER_DIR   the smoke test and the front end's API tests against the pseudo engine, no GPU
 #   ./gr8 test gpu [BIN_DIR]          the one-GPU unit tests (scripts/c1_tests.sh)
@@ -80,6 +83,7 @@ case $model in
   knobs) shift; GR8_MODEL='' exec python3 "$REPO/tools/launch/launch.py" knobs "$@" ;;
   kv) shift; exec python3 "$REPO/tools/launch/kvnode.py" "$@" ;;
   query) shift; exec python3 "$REPO/tools/query/query.py" "$@" ;;
+  perftest) shift; exec python3 "$REPO/tools/perftest/perftest.py" "$@" ;;
   test)
     shift
     case ${1:-all} in
@@ -89,7 +93,7 @@ case $model in
       *) echo "gr8: ./gr8 test [frontend|engine|all], ./gr8 test pseudo TOKENIZER_DIR or ./gr8 test gpu [BIN_DIR]" >&2; exit 2 ;;
     esac ;;
   *) echo "gr8: the first argument names the model, glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash): ./gr8 glm53 <command>" \
-          "(./gr8 models lists them; or ./gr8 knobs, ./gr8 kv, ./gr8 query, ./gr8 test)" >&2; exit 2 ;;
+          "(./gr8 models lists them; or ./gr8 knobs, ./gr8 kv, ./gr8 query, ./gr8 perftest, ./gr8 test)" >&2; exit 2 ;;
 esac
 shift
 # The name is the model. The launcher takes it as --named-model and refuses a GR8_MODEL in the config file or the
