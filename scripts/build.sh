@@ -13,6 +13,9 @@
 #   MODEL=flash scripts/build.sh bin      only OUT_DIR/g6m4_flash and OUT_DIR/m4sim_flash: GLM 5.3 Flash
 #                                         (-DG6_MODEL_FLASH=1, engine/model_geom.h), fp8 KV only; TP = 2 and 4 unless
 #                                         GR8_WIDTHS or GR8_NR says otherwise
+#   MODEL=ds41 scripts/build.sh bin       only OUT_DIR/g6m4_ds41 and OUT_DIR/m4sim_ds41: DeepSeek-V4.1-Flash-1017
+#                                         (-DG6_MODEL_DS41=1, engine/model_geom_ds41.h, docs/DEEPSEEK.md), fp8 KV only; TP = 4
+#                                         unless GR8_WIDTHS or GR8_NR says otherwise
 #   GR8_TESTS=0 / GR8_TESTS=only        the GLM engine without the test binaries below it, or the tests alone (CI
 #                                         builds them on separate runners)
 #   BUNDLE_LIBS=1                         also copy cuBLAS (libcublas, libcublasLt) into OUT_DIR/lib, for nodes
@@ -47,6 +50,7 @@ done
 # Needs cmake; GLM-5.3 only
 GR_OFF=""
 if [ "${MODEL:-glm}" = flash ]; then GR_OFF="MODEL=flash"
+elif [ "${MODEL:-glm}" = ds41 ]; then GR_OFF="MODEL=ds41"
 elif [ "${GR8_TESTS:-1}" = only ]; then GR_OFF="GR8_TESTS=only builds no engine"
 elif [ "${GR8_XGRAMMAR:-}" = 0 ]; then GR_OFF="GR8_XGRAMMAR=0"
 fi
@@ -117,7 +121,23 @@ case "${MODEL:-glm}" in
     done
     echo "g6m4_flash has its serve hooks"
     exit 0 ;;
-  *) echo "MODEL=$MODEL: glm or flash"; exit 2 ;;
+  ds41)    # g6m4 and m4sim in their own object dir, installed as g6m4_ds41 / m4sim_ds41 next to the GLM build
+    [ "${KV_FORMAT:-fp8}" = fp8 ] || { echo "MODEL=ds41: KV_FORMAT=fp8 only"; exit 2; }
+    WIDTHS=${GR8_WIDTHS:-${GR8_NR:-4}}
+    # PF_FC2GL must divide HID / 128 = 40 (GLM 48: 6; Flash 32: 4; 4 divides 40); build_m4.sh leaves out PF_F12 for every non-GLM model
+    # DS41_WHAT=sim: m4sim only (no g6m4, so no libibverbs and no fabric objects)
+    WIDTHS="$WIDTHS" EXTRA="${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_DS41=1 ${EXTRA:-}" OUT="$OUT/ds41" \
+      bash build_m4.sh "${ARCH:-121a}" "${DS41_WHAT:-all}"
+    if [ "${DS41_WHAT:-all}" = sim ]; then
+      mv "$OUT/ds41/m4sim" "$OUT/m4sim_ds41" && rm -rf "$OUT/ds41"
+      md5sum "$OUT/m4sim_ds41"
+      exit 0
+    fi
+    mv "$OUT/ds41/m4sim" "$OUT/m4sim_ds41" && mv "$OUT/ds41/g6m4" "$OUT/g6m4_ds41" && rm -rf "$OUT/ds41"
+    md5sum "$OUT/m4sim_ds41" "$OUT/g6m4_ds41"
+    widths_ok "$OUT/g6m4_ds41" "$OUT/m4sim_ds41"
+    exit 0 ;;
+  *) echo "MODEL=$MODEL: glm, flash or ds41"; exit 2 ;;
 esac
 case "${GR8_TESTS:-1}" in 0|1|only) ;; *) echo "GR8_TESTS=$GR8_TESTS: 0, 1 or only"; exit 2 ;; esac
 if [ "${GR8_TESTS:-1}" != only ]; then

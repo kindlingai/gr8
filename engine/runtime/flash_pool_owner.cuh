@@ -69,7 +69,7 @@ inline int flash_pool_receive(void* opaque, int* indices, const int* positions, 
     const auto st = static_cast<cudaStream_t>(stream);
     const size_t bytes = flash_pool_owner::payload(rows);
     glue::k_wait_peers<<<1, 32, 0, st>>>(p.f, p.step, 0, bytes, glue::ERR_AR);
-    const char* src = p.f.recv + (((p.flow.current & 1) * p.f.ncoll) * p.f.nr + (1 - p.f.rank)) * p.f.stride;
+    const char* src = p.f.recv + g6::fab_recv_off(p.f, (int)(p.flow.current & 1), 0, 1 - p.f.rank);
     const auto e = cudaMemcpyAsync(p.received, src, bytes, cudaMemcpyDefault, st);
     if (e != cudaSuccess) return int(e);
     k_pool_unpack<<<96, 256, 0, st>>>(p.received, indices, positions, rows, p.f.rank, p.f.error);

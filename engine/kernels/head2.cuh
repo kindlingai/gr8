@@ -35,7 +35,9 @@ constexpr int SL = 64;                                   // candidates per row (
 constexpr int MXM = 8;                                   // rows per call at most (k_screen keeps x of every row in smem)
 constexpr int BINS = 2048;                               // k_screen_top: histogram of (max - logit) over RANGE logit units
 constexpr float RANGE = 32.f;
+#if !G6_MODEL_DS41   // HID 5120 is not a multiple of 2048; the screen is the MTP draft head, which DS41 does not use
 static_assert(K % 2048 == 0, "k_screen: three 2048-input sweeps of 32 lanes x 64");
+#endif
 
 inline size_t code_bytes(int vn) { return (size_t)vn * NCH * 16; }
 inline size_t scale_bytes(int vn) { return (size_t)vn * NG * 2; }

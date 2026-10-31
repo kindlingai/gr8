@@ -700,7 +700,7 @@ static int bind_check(const std::string& dir, std::vector<HostMat>& mats)
     unsigned* ticket = dzero<unsigned>(2);
     auto slot = [&](int c) {
         dslot::Slot q;
-        q.send = send; q.bell = bell; q.stepp = stepp; q.stride = stride; q.ncoll = 2; q.c = c; q.ticket = ticket + c;
+        q.send = send; q.bell = bell; q.stepp = stepp; q.half = 2 * stride; q.off = (size_t)c * stride; q.ncoll = 2; q.c = c; q.ticket = ticket + c;
         return q;
     };
 #endif

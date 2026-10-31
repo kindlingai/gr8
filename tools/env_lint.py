@@ -128,7 +128,7 @@ def assignments(paths):
         for line in open(os.path.join(REPO, f)):
             line = line.split('#', 1)[0]
             for name, value in re.findall(r'\b((?:G6|GR8)_[A-Z0-9_]*[A-Z0-9])=([^\s"\';)]*)', line):
-                if '$' not in value:
+                if '$' not in value and not re.search(r'[*?[]', value):   # a case pattern is not an assignment
                     out.append((f, f'{name}={value}'))
     return out
 

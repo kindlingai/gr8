@@ -32,9 +32,11 @@ KNOBLIB=../knobs-rs/target/release/libgr8knobs.a
 [ -f "$KNOBLIB" ] || { echo "need $KNOBLIB: cargo build --release --features capi --manifest-path engine/knobs-rs/Cargo.toml"; exit 1; }
 KNOBS="$KNOBLIB -lpthread -ldl -lm"
 # the attention TU, its binder and its op table (attn/ops.h): attn.cu + bind.cu + ops_glm.cu (GLM), flash_attn.cu +
-# flash_bind.cu + ops_flash.cu (Flash: NoPE MLA + kpool indexer)
+# flash_bind.cu + ops_flash.cu (Flash: NoPE MLA + kpool indexer), ds41_attn_dspark.cu + ds41_bind.cu + ops_ds41.cu (DeepSeek-V4.1-Flash-1017:
+# ops_ds41.cu is the table that names the ops that exist)
 ATTN_CU=../attn/attn.cu; ATTN_BIND_CU=../attn/bind.cu; ATTN_OPS_CU=../attn/ops_glm.cu
 case " $EXTRA " in *" -DG6_MODEL_FLASH=1 "*) ATTN_CU=../attn/flash_attn.cu; ATTN_BIND_CU=../attn/flash_bind.cu; ATTN_OPS_CU=../attn/ops_flash.cu ;; esac
+case " $EXTRA " in *" -DG6_MODEL_DS41=1 "*) ATTN_CU=../attn/ds41_attn_dspark.cu; ATTN_BIND_CU=../attn/ds41_bind.cu; ATTN_OPS_CU=../attn/ops_ds41.cu ;; esac
 if [ "$WHAT" = rs ]; then
   nice -n 19 $NVCC -O2 -std=c++17 $GEN -o $OUT/rstest rstest.cu $KNOBS
   ls -la $OUT/rstest
@@ -97,8 +99,10 @@ KVLIB=../kvman-rs/target/release/libg6kvman.a
 WIDTHS=${WIDTHS:-6}
 # the flags of width N: the multi-session path (DEC_S2, which g6m4 needs) at every width, and PF_F12 (F12_NE=2 must
 # divide the expert blocks per rank: 4 at TP4, 3 at TP6) at 4, except in the Flash build, whose fp16 MoE refuses it
+# DS41_MX=48 (DeepSeek build only, opt-in): 48 rows a step (g6mx.h), so 8 sessions x DSpark (GR8_DS_MTP=5 + 1) verify rows are one step; unset = 32
 wflags() {
   local f="-DG6_NR=$1 -DDEC_S2"
+  case ${DS41_MX:-} in '') ;; 32|40|48) [ "$ATTN_CU" = ../attn/ds41_attn_dspark.cu ] && f="$f -DG6_MX=$DS41_MX" ;; *) echo "DS41_MX=$DS41_MX: 32, 40 or 48" >&2 ;; esac
   case " ${F12_WIDTHS:-4} " in *" $1 "*) [ "$ATTN_CU" = ../attn/attn.cu ] && f="$f -DPF_F12" ;; esac   # PF_F12 (fat-CTA prefill fc1): TP4 by default; F12_WIDTHS="4 5" adds TP5; never in the Flash build
   echo "$f"
 }

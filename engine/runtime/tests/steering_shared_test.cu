@@ -95,7 +95,7 @@ static void decode_case(bool sh,bool bf,int M,bool slot,int mode,int repeats,FIL
     auto* bell=mem.alloc<unsigned long long>(2); auto* ticket=mem.alloc<unsigned>(1); auto* step=mem.alloc<u64>(1);
     auto* snapshot=mem.alloc<unsigned short>(N); auto* timeout=mem.alloc<int>(1);
     cudaStream_t producer, watcher; CK(cudaStreamCreateWithFlags(&producer,cudaStreamNonBlocking)); CK(cudaStreamCreateWithFlags(&watcher,cudaStreamNonBlocking));
-    if(slot) { a.slot={send,bell,step,stride,2,1,ticket,nullptr}; }
+    if(slot) { a.slot={send,bell,step,2*stride,stride,2,1,ticket,nullptr}; }
 #else
     (void)slot;
     cudaStream_t producer; CK(cudaStreamCreateWithFlags(&producer,cudaStreamNonBlocking));

@@ -1,11 +1,11 @@
-// GR8_S2_ADMIT_HOLD=1 and a burst whose ADMIT files land while the head is inside its hold chain. Measured: the shim wrote
-// all 8 cmd files within 1 ms, but the ranks committed 2 at one boundary and 6 at a boundary 4 later, ~290 ms on.
-// The head's control loop reads cmd.<k> only between events (service.h loop), so a held commit that looked only at the
-// in-memory queue missed a file that landed during the chain and released the boundary after the 2nd grant.
-// Here: cmd.0 and cmd.1 are written before the run; cmd.2 .. cmd.7 are written from the head rank's bind of the FIRST grant,
-// i.e. while the head is still inside that event (it waits for every rank's ACK). Asserted: all 8 grants apply at ONE boundary on
-// both ranks (the same step count at every bind) and the hold chain ends with the 8th (live + 1 == limit). Before the drain fix
-// the 3rd .. 8th grants apply after the 2nd grant's release, at a later step count.
+// GR8_S2_ADMIT_HOLD=1 and a burst whose ADMIT files land while the head is inside its hold chain: a shim can write
+// all 8 cmd files within 1 ms. The head's control loop reads cmd.<k> only between events (service.h loop), so a held
+// commit that looks only at the in-memory queue misses a file that lands during the chain and releases the boundary
+// after the 2nd grant (2 commits at one boundary, 6 at a boundary 4 later).
+// Here: cmd.0 and cmd.1 are written before the run; cmd.2 .. cmd.7 are written from the head rank's bind of the first grant,
+// i.e. while the head is still inside that event (it waits for every rank's ACK). Asserted: all 8 grants apply at one boundary on
+// both ranks (the same step count at every bind) and the hold chain ends with the 8th (live + 1 == limit). Without the drain
+// (Service::drain_admits) the 3rd .. 8th grants apply after the 2nd grant's release, at a later step count.
 // Real Service, Driver, scheduler and event gate on two ranks over socket pairs; the native layer is a stand-in with no GPU
 // (a prefill quantum and a step each sleep 20 ms so boundaries pass while a notice waits). Build and run: see scripts/host_tests.sh.
 #include "s2/service.h"

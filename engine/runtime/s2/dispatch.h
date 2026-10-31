@@ -44,7 +44,7 @@ struct DispatchHooks {
     std::function<float(int row)> draft_lp;
     // optional, grammars (Dispatch::set_grammar): the host side of the mask arena the main head reads
     int* gm_on = nullptr; uint32_t* gm_bits = nullptr; int gm_words = 0;
-    // optional, DS41 (ds41_prefill.h): in place of `prefill`, with the chunk's fabric step id: ONE id from the main sequence, the one
+    // optional, DS41 (ds41_prefill.h): in place of `prefill`, with the chunk's fabric step id: one id from the main sequence, the one
     // counter prefill and decode share on the fabric. The next MAIN step has sequence + 1.
     // LAST: native.cuh builds this struct positionally, so a new member goes at the end.
     std::function<void(const Slot&, const Payload&, uint32_t, uint32_t, uint64_t)> prefill_seq;
