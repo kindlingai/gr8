@@ -1,4 +1,4 @@
-// SHA-256 (FIPS 180-4), host only, header only. For the boot check of small Engram files (the cmap); ds41plan --verify checks the 47 GiB tables.
+// SHA-256 (FIPS 180-4), host only, header only. For the boot check of the Engram cmap.
 #pragma once
 #include <cstdint>
 #include <cstring>

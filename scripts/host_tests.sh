@@ -228,7 +228,7 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/tests/test_ds41
 # TP4 ranks 0 and 3; it needs the CUDA headers, not a GPU
 if [ -f /usr/local/cuda/include/cuda_runtime.h ]; then
   g++ -std=c++17 -O1 -I /usr/local/cuda/include -I "$REPO/engine" "$REPO/engine/attn/tests/ds41_attn_bind_test.cpp" -o "$T/ds41_attn_bind_test"
-  "$T/ds41_attn_bind_test" "$REPO"/engine/attn/tests/data/ds41plan_tp*_attn.txt
+  "$T/ds41_attn_bind_test" "$REPO"/engine/attn/tests/data/attn_plan_tp*.txt
 else
   echo "SKIP ds41_attn_bind_test: no CUDA headers"
 fi

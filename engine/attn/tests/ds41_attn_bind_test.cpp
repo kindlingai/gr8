@@ -1,10 +1,10 @@
-// Host test (no GPU, no CUDA calls) for the attention weight binding of ds41_attn_plan.h: it runs plan_attn on the real planner
-// lists (`ds41plan SPARSE TP RANK --layers ... --list`, filtered to the attention tensors, tests/data/ds41plan_tp*_attn.txt) for every
+// Host test (no GPU, no CUDA calls) for the attention weight binding of ds41_attn_plan.h: it runs plan_attn on the loader's tensor
+// lists for one rank of the release (loader-rs ds41.rs, attention tensors only, tests/data/attn_plan_tp*.txt) for every
 // layer in the list, plus mutated lists that must be refused. This is the check that would have caught o_a being asked for [1024][4096]
 // when the pack has [G*1024][4096], without a Spark.
 //
 //   g++ -std=c++17 -O1 -I /usr/local/cuda/include -I engine -o /tmp/ds41_attn_bind_test engine/attn/tests/ds41_attn_bind_test.cpp
-//   /tmp/ds41_attn_bind_test engine/attn/tests/data/ds41plan_tp*_attn.txt
+//   /tmp/ds41_attn_bind_test engine/attn/tests/data/attn_plan_tp*.txt
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

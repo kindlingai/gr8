@@ -2,7 +2,7 @@
 //   PREFIX.engram.json        the manifest: g6engram-v2 (the release's split files, written by the loader at boot: per table
 //                             layer/rows/part/first/valid/dim/sdim and its runs path/row0/rows/w_off/s_off), or g6engram-v1 (a
 //                             sidecar: per table layer/rows/part/first/valid/dim/sdim/w_bytes/s_bytes and the two files below)
-//   PREFIX.engram.L###.w8     E4M3 rows [part][256]   (size only: `ds41plan --verify PREFIX` checks its sha256, 47 GiB per rank)
+//   PREFIX.engram.L###.w8     E4M3 rows [part][256]   (size only)
 //   PREFIX.engram.L###.s8     E8M0 scales [part][8]   (size only here; the whole file is read to the device at boot)
 //   PREFIX.engram.cmap        "G6ECMAP1" token map written by gen_engram.py; sha256 of the file must equal kCmapSha256 (hash_consts.h)
 // Anything missing, the wrong size, from another rank / tp / table shape, or a cmap that is not the one the constants were generated

@@ -1,6 +1,6 @@
 // DeepSeek-V4.1-Flash-1017 attention A: the shape checks and the pointer binding of one layer's attention weights, with no CUDA
 // calls. ds41_attn_ops.cuh's ds41_attn_bind runs it through the Model's tensor finder and then allocates the device state; the host
-// test tests/ds41_attn_bind_test.cpp runs the same code on the planner's list (`ds41plan ... --list`), so a shape rule that does not
+// test tests/ds41_attn_bind_test.cpp runs the same code on the loader's tensor list, so a shape rule that does not
 // match the pack is caught without a GPU.
 #pragma once
 #include <cstdio>
