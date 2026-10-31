@@ -1,5 +1,5 @@
-// spec_len.h: the draft length of each speculative round (--spec-adaptive). Host code only: g++ builds its
-// test, engine/tests/test_spec_len.cpp. It makes one decision per round; s2_batch.h's drafter choice builds on it.
+// spec_len.h: the draft length of each speculative round (--spec-adaptive). Host code only. It makes one decision per
+// round; s2_batch.h's drafter choice builds on it.
 //
 // A round with k drafts costs verify(k + 1 rows) plus the drafting, and is expected to commit
 //   E(k) = 1 + sum over j = 1..k of c_1 * ... * c_j

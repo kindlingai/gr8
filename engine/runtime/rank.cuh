@@ -2316,7 +2316,7 @@ inline void build_draft_head_i4(Draft& D, const DraftHeadI4& c, cudaStream_t st)
 // MXFP8 logits of the screen's best head2::SL rows (read out of the target's records), and the head record over those
 // candidates (the log-sum-exp over the whole row, screen logits outside them). Drafts only: the target's head and the
 // verify steps are unchanged. A draft is the MXFP8 head's argmax whenever that token is among its slice's SL screen best
-// (dhead2_test; an offline replay of 24k recorded draft-head inputs: no miss). Draft steps of more than
+// (an offline replay of 24k recorded draft-head inputs: no miss). Draft steps of more than
 // head2::MXM rows keep the head GEMV (INT4 with GR8_DRAFT_HEAD_I4, else MXFP8). 2 = also the MXFP8 GEMV of the slice per
 // draft step and a count of the rows whose MXFP8 argmax is not a candidate (a line every 4096 rows; measurement only).
 // T > 0: a draft is sampled among the candidates (top_p and top-k lists over the whole row, as today). In the S2 runtime

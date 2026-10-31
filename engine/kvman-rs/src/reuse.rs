@@ -1,6 +1,6 @@
 //! The part of g6rt::PrefixReuse (engine/runtime/prefix_reuse.h) that match() runs on a retained run: begin()'s
 //! decision. A session's row tracking stays in C++, and retain() takes its finished state. Both copies of the rule must
-//! agree: the differential test (engine/runtime/s2/tests/pool_diff_test.cpp) runs the C++ begin() beside this one.
+//! agree.
 
 use std::ffi::CStr;
 

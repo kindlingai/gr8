@@ -1,5 +1,5 @@
 // The DEC_IDX31 decode indexer, exact variants. Included inside ga after select.cuh. Build flag DEC_IDX31=1 routes decode
-// make_index through them; tests and tools/idxbench call them regardless of the flag.
+// make_index through them; tests call them regardless of the flag.
 // - index_scores_m: one CTA per 32-key tile scores ALL n rows of the query tile, so each key is read and converted once
 //   per step instead of once per row. Per row the arithmetic is index_scores' (same fp16 key values, same wmma tiles,
 //   same head-order ReLU-weighted sum, same scale), so every score is bit-identical. A tile no row can see (t0 > every

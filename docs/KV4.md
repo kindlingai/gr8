@@ -80,8 +80,6 @@ TEST=kv4_test GR8_NR=4 EXTRA=-DG6_KV4=1 scripts/c1_tests.sh bin4-kv4 # the INT4 
   double-precision host reference. The kernel error is measured against the cache's own decoded latent, and must be
   below 1e-2. The cost of the row format is measured against the exact latent.
 
-`dec_heads_test` is skipped in a KV4 build, because it checks the FP8-row kernels.
-
 ## Capacity
 
 Every rank holds the first `SHARE_LIMIT` tokens and 1/TP of the rest: `CAP = SHARE_LIMIT + (P - SHARE_LIMIT/64) x 64 x TP`.

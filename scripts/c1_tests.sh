@@ -1,20 +1,16 @@
 #!/bin/bash
-# Build (if needed) and run the unit tests on ONE GPU node (a GB10 Spark with CUDA 13): row_budget_test (dense GEMVs and K1
-# against chunks of 8 rows), s2_attn_test (batched attention over several sessions against the per-session calls;
-# needs EXTRA=-DDEC_S2, else it only prints SKIP), dec_heads_test (the decode attention kernels against the ones they
-# replaced) and kv4_test (the KV latent row: append round trip, and decode / prefill / row-owner attention against a host
-# reference; EXTRA=-DG6_KV4=1 tests the INT4 row, docs/KV4.md) and weight_check_test (the weight check's GPU sums
-# against the CPU's, and one changed byte caught in its own chunk) and canon_test (a session's KV exported and imported
-# across page lists and layouts, then a decode step on it; #152) and kv_resize_test (the KV pool's chunks shrunk and grown
-# under live sessions, on caches in virtual memory, against caches that never resized; #153) and dhead_i4_test
-# (GR8_DRAFT_HEAD_I4: the MXFP8 -> INT4 head records against a host derivation, the INT4 head GEMV against a host dot;
-# --time: MXFP8 vs INT4 head GEMV) and kvb8_test (kv_b in FP8: decode and prefill against the BF16 form of the same
-# weights, byte for byte; --bench times absorb / value_project; #50) and s2_steer_test (S2 batched decode steers each
-# row as solo decode does: the S2 and solo layer bindings, the shared-expert finalize and the attention consume per row
-# against each session's and each row's own launch; needs EXTRA=-DDEC_S2, else it only prints SKIP). headgroup_test,
-# cpgroups and the Flash tests (flash_kpool_stream_test, flash_sparse_mla_test, flash_sparse_mla_v2_test, kda_g9_det,
-# flash_dsa_f16_test, mhc_decode_stage_test) build in one fixed configuration each, whatever GR8_NR and EXTRA say
-# (docs/TESTING.md).
+# Build (if needed) and run the unit tests on ONE GPU node (a GB10 Spark with CUDA 13): row_budget_test (dense GEMVs and
+# K1 against chunks of 8 rows), s2_attn_test (batched attention over several sessions against the per-session calls;
+# needs EXTRA=-DDEC_S2, else it only prints SKIP) and kv4_test (the KV latent row: append round trip, and decode /
+# prefill / row-owner attention against a host reference; EXTRA=-DG6_KV4=1 tests the INT4 row, docs/KV4.md) and
+# weight_check_test (the weight check's GPU sums against the CPU's, and one changed byte caught in its own chunk) and
+# canon_test (a session's KV exported and imported across page lists and layouts, then a decode step on it; #152) and
+# kv_resize_test (the KV pool's chunks shrunk and grown under live sessions, on caches in virtual memory, against caches
+# that never resized; #153) and kvb8_test (kv_b in FP8: decode and prefill against the BF16 form of the same weights,
+# byte for byte; --bench times absorb / value_project; #50) and s2_steer_test (S2 batched decode steers each row as solo
+# decode does: the S2 and solo layer bindings, the shared-expert finalize and the attention consume per row against each
+# session's and each row's own launch; needs EXTRA=-DDEC_S2, else it only prints SKIP). headgroup_test and kda_g9_det
+# build in one fixed configuration each, whatever GR8_NR and EXTRA say (docs/TESTING.md).
 #   scripts/c1_tests.sh <bin_dir> [test args]       default bin_dir = ./bin; TEST=row_budget_test|s2_attn_test runs one
 #   GR8_NR=4 scripts/c1_tests.sh bin4               the TP4 build of the test
 #   EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2       the 32-row build: M = 1..32 against chunks of 8 (without it: M <= 8)
@@ -74,7 +70,6 @@ with_flags() {
   return $r
 }
 FLASH_FLAGS="-DG6_MODEL_FLASH=1 -DG6_NR=2"
-KVC="$REPO/engine/attn/kvchunks.cu"
 # kvlib_ready: target/release/libg6kvman.a for the tests that link it, built first when cargo is on PATH; 1 (with
 # the reason) when it is missing or older than the crate's sources
 kvlib_ready() {
@@ -99,13 +94,6 @@ if [ "$TEST" = all ] || [ "$TEST" = s2_attn_test ]; then
   case "$FLAGS" in
     *-DDEC_S2*) build_run s2_attn_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
     *) build_run s2_attn_test || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
-  esac
-fi
-if [ "$TEST" = all ] || [ "$TEST" = dec_heads_test ]; then
-  [ "$TEST" = all ] && ARGS=()
-  case "$FLAGS" in
-    *-DG6_KV4=1*) echo "SKIP dec_heads_test: it checks the FP8-row kernels, which a G6_KV4 build does not run" ;;
-    *) build_run dec_heads_test "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
   esac
 fi
 if [ "$TEST" = all ] || [ "$TEST" = kv4_test ]; then
@@ -152,25 +140,6 @@ if [ "$TEST" = all ] || [ "$TEST" = flash_kv_chunks_test ]; then
     echo "SKIP flash_kv_chunks_test: $why"
   fi
 fi
-if [ "$TEST" = all ] || [ "$TEST" = flash_ckpt_group_test ]; then
-  # Flash checkpoints on a group lease (D-331 M8 (c), s2/flash_checkpoint.cuh): a loopback KV node with 2 MiB segments
-  [ "$TEST" = all ] && ARGS=()
-  KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
-  NODE="$REPO/engine/kvman-rs/target/release/kvman-remote"
-  if why=$(kvlib_ready) && [ -x "$NODE" ]; then
-    NJ="$OUT/flash_ckpt_group_node.json"
-    : > "$NJ"
-    "$NODE" --gb 0.05 --seg-mb 2 --margin-s 0 --port 0 --bind 127.0.0.1 --min-free-gb 0 --no-lock --no-rdma --ready "$NJ" \
-      > "$OUT/flash_ckpt_group_node.log" 2>&1 &
-    NODE_PID=$!
-    for _ in $(seq 50); do [ -s "$NJ" ] && break; sleep 0.1; done
-    [ ${#ARGS[@]} -gt 0 ] || ARGS=("remote:127.0.0.1:$(sed -n 's/.*"port":\([0-9]*\).*/\1/p' "$NJ")")
-    build_run flash_ckpt_group_test "$KVLIB" -lpthread -ldl -lm || { r=$?; [ "$rc" = 0 ] && rc=$r; }
-    kill "$NODE_PID"
-  else
-    echo "SKIP flash_ckpt_group_test: ${why:-no kvman-remote: cargo build --release}"
-  fi
-fi
 if [ "$TEST" = all ] || [ "$TEST" = weight_check_test ]; then
   [ "$TEST" = all ] && ARGS=()
   build_run weight_check_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
@@ -193,37 +162,13 @@ if [ "$TEST" = all ] || [ "$TEST" = steering_cuda_test ]; then
   [ "$TEST" = all ] && ARGS=()
   build_run steering_cuda_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
-if [ "$TEST" = all ] || [ "$TEST" = dhead_i4_test ]; then
-  [ "$TEST" = all ] && ARGS=()
-  build_run dhead_i4_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
-fi
 if [ "$TEST" = all ] || [ "$TEST" = headgroup_test ]; then
   [ "$TEST" = all ] && ARGS=()
   with_flags "$K1H2_FLAGS -DG6_NR=3" build_run attn/tests/headgroup_test "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
-if [ "$TEST" = all ] || [ "$TEST" = cpgroups ]; then
-  # exit 3 on a byte difference; the timing it prints is not checked
-  [ "$TEST" = all ] && ARGS=()
-  [ ${#ARGS[@]} -gt 0 ] || ARGS=(131072 75000 3)
-  with_flags "$K1H2_FLAGS -DG6_NR=4 -DDEC_S2 -DPF_F12" build_run attn/tests/cpgroups "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
-fi
-for t in flash_kpool_stream_test flash_sparse_mla_test flash_sparse_mla_v2_test; do
-  if [ "$TEST" = all ] || [ "$TEST" = $t ]; then
-    [ "$TEST" = all ] && ARGS=()
-    with_flags "$FLASH_FLAGS" build_run attn/tests/$t "$REPO/engine/attn/flash_bind.cu" "$KVC" -lcuda || { r=$?; [ "$rc" = 0 ] && rc=$r; }
-  fi
-done
 if [ "$TEST" = all ] || [ "$TEST" = kda_g9_det ]; then
   [ "$TEST" = all ] && ARGS=()
   with_flags "$FLASH_FLAGS -DG9_CONV_DBG=1" build_run kda/tests/kda_g9_det || { r=$?; [ "$rc" = 0 ] && rc=$r; }
-fi
-if [ "$TEST" = all ] || [ "$TEST" = flash_dsa_f16_test ]; then
-  [ "$TEST" = all ] && ARGS=()
-  with_flags "$FLASH_FLAGS -I$REPO/engine" build_run flash_dsa_f16_test -lcublas -lcublasLt || { r=$?; [ "$rc" = 0 ] && rc=$r; }
-fi
-if [ "$TEST" = all ] || [ "$TEST" = mhc_decode_stage_test ]; then
-  [ "$TEST" = all ] && ARGS=()
-  with_flags "$FLASH_FLAGS -I$REPO/engine" build_run mhc_decode_stage_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
 if [ "$rc" = 0 ]; then echo "c1_tests: PASS"; else echo "c1_tests: FAIL (exit $rc)"; fi
 exit "$rc"

@@ -135,7 +135,7 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
     RsSink sink;
     void* dev = nullptr;
     // GR8_IMG_VMM=1 (A/B): the image as cuMemCreate chunks of the recommended granularity mapped into one range
-    // (engine/vmm.h; k1_audit --alloc vmm), =N: chunks of N MB. Same bytes at the same offsets; only the physical
+    // (engine/vmm.h), =N: chunks of N MB. Same bytes at the same offsets; only the physical
     // backing (the GPU's page size) can differ. Falls back to cudaMalloc, with a line saying why.
     static const long vmm = (long)knob::img_vmm();
     void (*release)(void*) = nullptr;

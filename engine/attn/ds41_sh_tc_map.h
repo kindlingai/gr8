@@ -1,5 +1,5 @@
 // Shared expert on tensor cores: the MXFP8 decode record's index map (k_kda_mx_record, engine/kda/kda.cuh = loader-rs records::mxfp8_record) as one host-and-device
-// function, so k_mx_unrecord (ds41_sh_tc.cuh) and the host test engine/tests/test_ds41_sh_tc.cpp run the same lines.
+// function, used by k_mx_unrecord (ds41_sh_tc.cuh).
 // Record = 16 rows x 32 k = 528 B: byte h * 256 + i (h = 0, 1; i = 0..255) holds code (row, 16 h + col) of the record, with lane l = i / 8, e = i % 8,
 // r = l / 4, c = l % 4, row = r + 8 (e & 2), col = 2 c + (e & 1) + 8 (e & 4); then 8 scale pairs: byte 512 + 2 j = row j, 513 + 2 j = row j + 8 (j = 0..7).
 #pragma once

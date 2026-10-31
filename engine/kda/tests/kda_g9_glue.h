@@ -1,5 +1,5 @@
 // The glue between the GPU test (kda_g9_test.cu) and the CPU ON-emulation (kda_g9_cpu.h): the multi-head slicing of the engine layouts into
-// the emulation's one-head inputs. Shared by the GPU test and by the GPU-free kda_g9_glue_test.cpp, so the CPU test exercises the same code.
+// the emulation's one-head inputs. Shared by the GPU tests (kda_g9_test.cu, kda_g9_det.cu).
 //   Cm   [M][3][dl]      fp32 conv+silu output (Args::C layout of the OFF path)
 //   pG, pZ  [m * dl + h * DK + d]  bf16 G16 / Z16 planes (row stride dl)
 //   P    [M][ld]         projections; b_proj of head h at column bcol + h

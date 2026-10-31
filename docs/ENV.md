@@ -415,22 +415,11 @@ Read by test programs, audits and benchmarks. `g6m4 --serve` refuses to start wh
 
 | variable | type | unset | values | what it does |
 |---|---|---|---|---|
-| `GR8_TEST_ATTNK_ARMS` | text | the built-in arms |  | attnk: the arms to run, as name or KEY=V,... specs joined by spaces. |
-| `GR8_TEST_ATTNK_BASE` | text | the serving arm SC2=4,TR=2,CTX2=4,CTX3=2,SEL2=16,IDX=16 |  | attnk: the base arm the others compare with, as KEY=V,... over the stock arm (every flag 0), or stock. |
-| `GR8_TEST_ATTNK_E1` | flag | `0` |  | attnk: 1 runs the round 10 arm set. |
-| `GR8_TEST_ATTNK_H` | int | g6nr::HMAX, the larger head count of a rank in the build |  | attnk: the rank's head count, g6nr::HMIN or g6nr::HMAX of the build (a TP=6 build: 11 or 10). |
-| `GR8_TEST_ATTNK_NANKEY` | int | `-1` |  | attnk: the index key position (session 0) whose scale is NaN, -1 none. |
-| `GR8_TEST_ATTNK_QSCALE` | float | `1` |  | attnk: scales the test queries. |
-| `GR8_TEST_ATTNK_SESS` | int | `1` | 1\|2 | attnk: 2 runs two S2 sessions when the build and shape allow it. |
-| `GR8_TEST_ATTNK_TIES` | flag | `0` |  | attnk: 1 makes the test scores tie. |
-| `GR8_TEST_CPG_ARMS` | text | the built-in arms |  | cpgroups: the arms to run, as KEY=V,... specs (SC2 TR CTX2 CTX3 HG) or stock, joined by spaces. |
-| `GR8_TEST_CPG_LOCAL` | int | `0` |  | cpgroups: puts the N most recent positions first in each row's index list, as a local window. 0: uniform random positions. |
 | `GR8_TEST_CP_PF_BREAK` | text | unset | gather\|back | Negative control for the CP prefill staging gate in m4sim: skips the gather or the back half of the staging so the gate must fail. |
 | `GR8_TEST_CP_PF_NET` | flag | `0` |  | In m4sim, the CP prefill gather runs as g6m4's real fabric does it, each rank filling its own pool and sending tail pages to the others, instead of the loopback gather. |
 | `GR8_TEST_DS41_KERNELS_DIR` | path | unset |  | engine/kernels, for the loader test that checks the Rust mx4g packer against the C++ one (mxfp4_pack.h); unset skips it. |
 | `GR8_TEST_DS41_M4_PFW` | int | `0` | 0.. | m4sim: the prompt runs in W-row chunks of this many rows (it must equal GR8_DS_PREFILL_W and exceed MX); 0 runs it as decode steps. |
 | `GR8_TEST_DS41_MGATE_DIAG` | flag | `0` |  | ds41_attn_test --mgate: 1 prints, for a kv compare that differs, up to 8 differing elements of the chunk and of the single-row calls, before and after kv prep. |
-| `GR8_TEST_DS41_RO_CAP_MB` | float | `400` | 0.. | ds_ro_flags_test: the memory cap in MB on the test's device and host allocations. A mode that would allocate more stops before it runs. |
 | `GR8_TEST_DS41_TOKENIZER_DIR` | path | unset |  | The DeepSeek-V4.1-Flash tokenizer directory (tokenizer.json, tokenizer_config.json) the front end's ds41 dialect test reads; unset skips it. |
 | `GR8_TEST_FUZZ_ROUNDS` | int | `40` |  | Rounds of the front end tokenizer fuzz test. |
 | `GR8_TEST_IDX_DUMP` | path | unset |  | m4sim writes rank 0's selected key ids of the first --layers layer to this file for each main step from GR8_LOGIT_DUMP_FROM on. |
@@ -468,7 +457,6 @@ Read by test programs, audits and benchmarks. `g6m4 --serve` refuses to start wh
 | `GR8_TEST_S2_SHRINK_AT` | int | unset |  | m4sim gate, with GR8_TEST_S2_XLIST, GR8_CP_R2 and GR8_RT_LOCAL: each sequence starts at GR8_CP_R and takes GR8_CP_R2 once its rows reach this position (past GR8_CP_R), as a session g6m4 shrinks. Stdout must equal the run at GR8_CP_R2 from the start. |
 | `GR8_TEST_S2_SOLO1` | flag | `1` |  | m4sim --s2: a session left alone runs the single-session path. 0 keeps it on the S2 path. |
 | `GR8_TEST_S2_XLIST` | ints | unset |  | m4sim gate: seed[,pages] runs every sequence as one session past R on a shuffled page list of the pool's two classes. Stdout must equal the run without it. |
-| `GR8_TEST_SPARSE_MLA` | flag | `0` |  | flash_dsa_pf_test: compares the fused MLA with the current GEMM prefill instead of the older P1 math. |
 | `GR8_TEST_TOKENIZER_DIR` | path | unset |  | The tokenizer directory the front end tests need, unset skips them. |
 
 ## Build and launcher

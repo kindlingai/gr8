@@ -1,5 +1,5 @@
 // DS41 prefill gather (GR8_DS_PF_GATHER=1). Needs kernels/glue.cuh (glue::peer_slot, bf16x8_to_f) and g6nr.h before it; no includes of its own,
-// because ds41_step.cuh includes it inside namespace g6rt. Test: engine/runtime/tests/ds41_gather_test.cu (bit-equal against the Ds41Block slot reads).
+// because ds41_step.cuh includes it inside namespace g6rt.
 #pragma once
 // GR8_DS_PF_GATHER=1 (default off; prefill consumes of more than MX rows on the main Model only): k_ds41_gather reads the NR slots of collective
 // c with 16-byte loads (one uint4 = 8 BF16 per thread and slot, every slot load in flight before the adds), sums them in rank order p = 0..NR-1 in

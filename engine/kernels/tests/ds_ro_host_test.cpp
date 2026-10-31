@@ -17,7 +17,6 @@
 //   T7c  toy pipeline: ypart[tile][col][ot] = H(expert, token, ot) written through the fc2 loops, read through the combine's tok_slot / tok_col: equals
 //        H(expert, token, ot) for every route.
 //   T7d  modeled bytes (printed): DRAM-once and L2 -> SM weight bytes per layer and NTG (D, from the loops; formula cross-checked).
-// Mutants: scripts in tests/ds_ro_mutants.sh sed the headers and must make this test FAIL.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

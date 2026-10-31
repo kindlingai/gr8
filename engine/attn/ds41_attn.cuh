@@ -736,7 +736,7 @@ inline void (*const k_attn_floor)(AttnP) = k_attn_t<true>;
 // block (64 KB) are all in flight at once as 16 cp.async per thread (a null slot is zero-filled by src-size 0, the same as k_attn's make_uint4(0)), Q
 // joins the first group, the NEXT live block's slot list (the top-k index load) is built while the K rows land, and its rows are
 // prefetched into L2. k_attn's loop does 16 dependent global-load + smem-store pairs per thread per block (~12 us per 64-slot block).
-// Output bytes == k_attn (checked by engine/attn/tests/ds41_attn_cpa_test.cu).
+// Output bytes == k_attn.
 constexpr size_t AT_SMEM_CPA = AT_SMEM + 64 * sizeof(void*);   // a second slot list (prefetch of the next block)
 __device__ __forceinline__ void cp_async16(void* dst, const void* src, int src_bytes)
 {

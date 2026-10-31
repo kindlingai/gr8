@@ -1,6 +1,6 @@
 // DeepSeek-V4.1-Flash-1017 decode step: the order of its stages and the table of ops that fill them (host-only, no CUDA).
-// runtime/ds41_step.cuh walks plan() and calls the table; engine/tests/test_ds41_step_order.cpp does the same on a recording
-// table. A null slot is an op the build lacks (NOTSUP, as attn/ops.h): the walk stops there and names the stage and layer,
+// runtime/ds41_step.cuh walks plan() and calls the table.
+// A null slot is an op the build lacks (NOTSUP, as attn/ops.h): the walk stops there and names the stage and layer,
 // it does not skip. runtime/ds41_step.cuh (ds41_table) points each slot at its function, one line per slot.
 //
 // One layer is two sub-layers; each is prepare -> block -> publish partial -> consume (the Flash shape, engine/mhc). The

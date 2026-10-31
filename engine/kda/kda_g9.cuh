@@ -590,7 +590,7 @@ template <int VS> inline void launch_k2(const G9Args& g, const Tape& tp, cudaStr
 // Returns an error string (nothing launched) or nullptr. VS in {1, 2, 4}.
 // GR8_GLM53F_PF_KDA_GZF (default 1, read once; =0: the gz16 pass and the G16 / Z16 planes): K1 and k_out16z build the G16 / Z16
 // tiles (gz_tile): the same bits without the planes' DRAM round trip (gzf < 0: the env; 0 / 1: forced, the tests).
-// kda/tests/kda_g9_gzf_test.cu: byte-equal, 12 cases. TP3 8K A/B: prefill 2592 -> 2627 tok/s, rank-0 8K -39 ms, T=0
+// Byte-equal, 12 cases. TP3 8K A/B: prefill 2592 -> 2627 tok/s, rank-0 8K -39 ms, T=0
 // hashes unchanged.
 inline int gzf_env() { return knob::glm53f_pf_kda_gzf(); }
 inline const char* launch(const Args& a, const KdaPrefillScratch& ps, int VS, cudaStream_t st, int gzf = -1)

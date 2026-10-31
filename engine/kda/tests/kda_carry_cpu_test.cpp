@@ -1,5 +1,5 @@
 // CPU check of the KDA carry mode (Args::src per row) on the CPU model of k_kda_core (kda_cpu.h: the same phase
-// functions as the kernel, run thread by thread), the GPU-free half of kda_ring_test.cu:
+// functions as the kernel, run thread by thread):
 //   ring: from state X in slot src, a verify step of M = k + 1 rows with row_slot[r] = r; for every accepted count
 //         a in 0..k, slot a equals (bit for bit) the state after an M = a + 1 run of rows 0..a from X in the stock mode
 //         (src = nullptr, one slot), and the gated outputs of rows 0..a are the same bits.

@@ -1,8 +1,7 @@
 //! Properties of random traces: no page is held twice, no page is lost (live + retained + free = the pool), a live
 //! run's list never changes until it leaves, runs below R stay below place, an exclusive run is pages 0.. (or, with
 //! the page classes on, holds its prefix and shard below place and the drafter's tail above it), and two ranks given
-//! the same calls grant the same runs and agree on the digest. The bit-for-bit match with the C++ pool is
-//! engine/runtime/s2/tests/pool_diff_test.cpp.
+//! the same calls grant the same runs and agree on the digest.
 
 use g6kvman::stash::{Io, Keep, Part};
 use g6kvman::{Finished, Pool, Rules, Run, PAGE};

@@ -7,9 +7,6 @@
 // by that lane in 16-byte loads (64-k tiles, next tile prefetched into registers), x (M rows, <= 80 KB bf16) is staged in shared memory once. The
 // R = 3 rows per warp split keeps the per-warp instruction count at 3 rows (M = 6 -> 2 warps, M = 8 -> 3 warps); every (row, n) chain is still
 // one thread's sequential FMA chain, so the order of additions does not depend on M, R or the schedule.
-//
-// src_gemv2_lane is __host__ __device__ so engine/attn/tests/ds41_src_fast_test.cpp runs the very same loop on the CPU against a transcription of
-// k_f32gemm2 and compares the fp32 bit patterns.
 #pragma once
 #include <cstdint>
 #include <cstddef>

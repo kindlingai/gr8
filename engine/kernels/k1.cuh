@@ -107,7 +107,7 @@ __device__ __forceinline__ bool k1_slot(const K1Args& A, int plan, int slot, int
 // GR8_K1_TLBW (A/B, bind.cuh make_k1): warp 0 of fc1 CTA s, s < the step's item slots, prefetches one L2 line per
 // 2^tlbw-byte granule of item slot s's fc1 and fc2 ranges at the start of the launch. The GPU's address translations
 // of every routed slot (fc1 units of the later CTA waves, all fc2 units) are then walked while fc1 runs, not when
-// those CTAs start (k1_audit --arms tlbw). prefetch.global.L2 has no result: no output changes.
+// those CTAs start. prefetch.global.L2 has no result: no output changes.
 template <bool SH>
 __device__ __forceinline__ void k1_tlbw(const K1Args& A, int plan, int s)
 {
