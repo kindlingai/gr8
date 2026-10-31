@@ -67,8 +67,8 @@ the rank imbalance of the 5 / 4 block split described above, which the plan's sl
 
 On one GPU (m4sim, layers 0-2, real text, eager) the trellis MoE is 16% faster than the native one at 1 row (0.19
 against 0.23 ms a layer), equal at 24 rows (1.3 against 1.3 ms) and 12-17% faster at 512 rows (5.4 against 6.4 ms).
-The K1 split knobs at 6 rows (GR8_K1_SPLIT 8x1, 2x4, /1, /4, /8 against the release 4x2/2) and GR8_K1_TLBW (64 and
-2048 KB) all measured within 2% of the release shape, with the run-to-run spread of the same size.
+The K1 split knobs at 6, 12 and 24 rows (GR8_K1_SPLIT 8x1, 2x4, /1, /4, /8 against the release 4x2/2) and GR8_K1_TLBW
+(64 and 2048 KB) all measured within the run-to-run spread of the release shape (1-3%).
 
 ## Where a prefill chunk goes
 
@@ -119,4 +119,12 @@ A 4096-row pass costs, per 1024 rows, the same as a 1024-row pass in every compu
 attn_out 116 against 115, read-once fc1 55 against 51: the chunk routes to 129-137 distinct experts instead of 58-115, so
 the expert bytes a row fall by a third but the kernels are not bound by them), and more in the consumes (118 against 94
 ms), with the memory gone. The width stays at 1024.
+
+### The fabric
+
+The raw links, measured with ib_write_bw between every pair of boxes (64 KiB writes, 8 s, RoCE v2) with the engines
+idle: 108.7-109.2 Gb/s on either PCIe root of every pair, 98.0 x 2 = 196 Gb/s with both roots of a pair at once, the
+numbers a healthy ConnectX-7 pair gives on these boxes. The engine's prefill collectives are far from that: a layer's two
+consumes take 2.2 ms each for a 1024 x 5120 BF16 partial (about 8 MB a rank each way), about 30 Gb/s effective, and the
+rails average 3.6 and 1.8 Gb/s over a run. The wait is in the collective's shape and the proxy, not the wire.
 
