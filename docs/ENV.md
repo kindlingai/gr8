@@ -354,6 +354,7 @@ Read by test programs, audits and benchmarks. `g6m4 --serve` refuses to start wh
 | `GR8_TEST_CP_PF_BREAK` | text | unset | gather\|back | Negative control for the CP prefill staging gate in m4sim: skips the gather or the back half of the staging so the gate must fail. |
 | `GR8_TEST_CP_PF_NET` | flag | `0` |  | In m4sim, the CP prefill gather runs as g6m4's real fabric does it, each rank filling its own pool and sending tail pages to the others, instead of the loopback gather. |
 | `GR8_TEST_DS41_KERNELS_DIR` | path | unset |  | engine/kernels, for the loader test that checks the Rust mx4g packer against the C++ one (mxfp4_pack.h); unset skips it. |
+| `GR8_TEST_DS41_TOKENIZER_DIR` | path | unset |  | The DeepSeek-V4.1-Flash tokenizer directory (tokenizer.json, tokenizer_config.json) the front end's ds41 dialect test reads; unset skips it. |
 | `GR8_TEST_FUZZ_ROUNDS` | int | `40` |  | Rounds of the front end tokenizer fuzz test. |
 | `GR8_TEST_IDX_DUMP` | path | unset |  | m4sim writes rank 0's selected key ids of the first --layers layer to this file for each main step from GR8_LOGIT_DUMP_FROM on. |
 | `GR8_TEST_KVMAN_LEDGER` | path | `kvman-ledger` |  | flash_kv_chunks_test: the kvman-ledger binary. |

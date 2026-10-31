@@ -86,6 +86,13 @@ knobs:
     doc: >-
       engine/kernels, for the loader test that checks the Rust mx4g packer against the C++ one (mxfp4_pack.h); unset
       skips it.
+  GR8_TEST_DS41_TOKENIZER_DIR:
+    kind: path
+    unset: "unset"
+    legacy: ["G6_DS_TOKENIZER_DIR"]
+    doc: >-
+      The DeepSeek-V4.1-Flash tokenizer directory (tokenizer.json, tokenizer_config.json) the front end's ds41 dialect
+      test reads; unset skips it.
   GR8_TEST_FUZZ_ROUNDS:
     kind: int
     default: "40"

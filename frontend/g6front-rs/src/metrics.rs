@@ -86,7 +86,11 @@ pub fn render(m: &Value, model_name: &str) -> String {
         for (key, name, help) in [
             ("size_tokens", "vllm:kv_cache_size_tokens", "KV cache pool capacity, in tokens."),
             ("active_tokens", "vllm:kv_active_tokens", "KV cache tokens held by running requests (page-rounded)."),
-            ("reserved_tokens", "g6:s2_reserved_tokens", "KV cache tokens reserved for running requests, including unfilled room."),
+            (
+                "reserved_tokens",
+                "g6:s2_reserved_tokens",
+                "KV cache tokens reserved for running requests, including unfilled room.",
+            ),
         ] {
             if let Some(value) = kv.get(key).and_then(Value::as_f64) {
                 metric(name, "gauge", help, &[(String::new(), value)]);
@@ -205,7 +209,12 @@ pub fn render(m: &Value, model_name: &str) -> String {
         let has = |key: &str| stores.first().is_some_and(|t| t.get(key).is_some());
         for key in KV_STORE_GAUGES {
             if has(key) {
-                metric(&format!("g6:kv_store_{key}"), "gauge", &format!("KV store {}.", key.replace('_', " ")), &per(key));
+                metric(
+                    &format!("g6:kv_store_{key}"),
+                    "gauge",
+                    &format!("KV store {}.", key.replace('_', " ")),
+                    &per(key),
+                );
             }
         }
         for key in KV_STORE_COUNTERS {
