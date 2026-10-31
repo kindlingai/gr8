@@ -192,6 +192,9 @@ g++ -std=c++17 -O2 -Wall -DG6_NR=3 "$REPO/engine/tests/test_flash_s2_cost.cpp" -
 "$T/test_flash_s2_cost_tp3"
 g++ -std=c++17 -O2 -Wall -DG6_MODEL_FLASH=0 "$REPO/engine/tests/test_flash_s2_cost.cpp" -o "$T/test_full_s2_cost" "${KNOBS[@]}"
 "$T/test_full_s2_cost"
+# DeepSeek-V4.1-Flash-1017 geometry (engine/model_geom_ds41.h) against the release's config.json
+g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/ds41_geom_dump.cpp" -o "$T/ds41_geom_dump"
+(cd "$REPO/engine/tests" && DS41_GEOM_DUMP="$T/ds41_geom_dump" python3 -m unittest -q test_ds41_geom)
 python3 "$REPO/engine/tests/test_flash_serve_check.py"
 # Flash serve prefill: the draft cache fill checks the error words once, after its last chunk; every error still fails the request.
 python3 "$REPO/engine/tests/test_flash_serve_prefill_check.py"
