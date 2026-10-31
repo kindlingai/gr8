@@ -6,6 +6,9 @@
 #include "../serve.h"
 #include <cmath>
 #include <functional>
+#if G6_MODEL_DS41
+#include "ds41_prefill.h"
+#endif
 
 namespace g6s2 {
 inline std::vector<int> request_ids(const std::string& s) {
@@ -97,7 +100,7 @@ struct Session {
     bool bound = false, ended = false;
 };
 class Sessions {
-    Config config_; std::string directory_; bool head_; int chunk_;
+    Config config_; std::string directory_; bool head_; int chunk_; [[maybe_unused]] uint32_t prefill_min_;
     std::array<Session, MAX_SESSIONS> sessions_{};
     Session& get(Key k) {
         require(k.slot < MAX_SESSIONS && sessions_[k.slot].bound && sessions_[k.slot].key == k, "stale emitter session");
@@ -107,7 +110,9 @@ class Sessions {
         require(!e.f || !ferror(e.f), "S2 response output failed");
     }
 public:
-    Sessions(Config c, std::string directory, bool head, int chunk) : config_(c), directory_(std::move(directory)), head_(head), chunk_(chunk) {
+    // prefill_min: DS41 only (ds41_prefill.h); 0 = every prompt runs as decode steps
+    Sessions(Config c, std::string directory, bool head, int chunk, uint32_t prefill_min = 0)
+        : config_(c), directory_(std::move(directory)), head_(head), chunk_(chunk), prefill_min_(prefill_min) {
         c.validate(); require(chunk > 0 && unsigned(chunk) <= c.max_rows, "invalid session chunk");
     }
     ~Sessions() { for (auto& s : sessions_) if (s.emitter.f) fclose(s.emitter.f); }
@@ -115,7 +120,13 @@ public:
     static Request request(uint64_t id, const g6rt::ServeReq& r) {
         return {id, uint32_t(r.prompt.size()), uint32_t(r.n_gen), r.steering};
     }
+#if G6_MODEL_DS41   // DS41 serve v1 has no tensor prefill: every prompt runs as decode steps from position 0 (Driver decode_prompt), unless prefill_min admits it (ds41_prefill.h)
+    Payload payload(const g6rt::ServeReq& r) const {
+        return {r.prompt, chunk_, ds41_decode_prompt(prefill_min_, r.prompt.size(), r.plp, r.steering.enabled), r.ins, r.steering, r.gram};
+    }
+#else
     Payload payload(const g6rt::ServeReq& r) const { return {r.prompt, chunk_, r.plp >= 0, r.ins, r.steering, r.gram}; }
+#endif
     // (row, target, k) -> a row's logprob entry in the last main step (DispatchHooks::logprob)
     using Logprob = std::function<g6rt::LpRow(int, bool, int)>;
     void bind(const Grant& g, const g6rt::ServeReq& r) {
