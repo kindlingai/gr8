@@ -15,12 +15,19 @@
 
 namespace g6s2 {
 inline void require(bool ok, const char* what) { if (!ok) throw std::runtime_error(what); }
+#if defined(G6_MODEL_DS41) && G6_MODEL_DS41
+constexpr unsigned MAX_SESSIONS = 32, PAGE = 64;
+#else
 constexpr unsigned MAX_SESSIONS = 8, PAGE = 64;
-// The control link's version: the frame magic is "G6S2E" + this digit (control_protocol.h) and the bootstrap agreement
+#endif
+// DS41: members of one ragged prefill pack (ds41::pack::MAX_SEGMENTS); the slots they name range over MAX_SESSIONS
+constexpr unsigned PACK_MAX_MEMBERS = 8;
+// The control link's version: the frame magic is the numeric base "G6S2E0" + this version (control_protocol.h), and the bootstrap agreement
 // carries it (bootstrap.h), so ranks built with different commit frames refuse at bootstrap, not at the first event.
 // 6 adds Commit::hold. 7 adds the Resize event (Commit::resize). 9 adds Ack::room (8 is the fail-soft store's, #159).
-// 10 adds the steering profile slot. 11 adds Request::r_rows. 12 adds Commit::shrink.
-constexpr unsigned CONTROL_VERSION = 12;
+// 10 adds the steering profile slot. 11 adds Request::r_rows. 12 adds Commit::shrink. 13 adds 32 session slots and the
+// DS41 prefill packs.
+constexpr unsigned CONTROL_VERSION = 13;
 constexpr uint32_t MAX_DECODE_ROUNDS = 64;   // Config::decode_rounds bound
 // Prefill choice (Scheduler::next): of the sessions with prompt rows left, the one with the fewest runs next, so a short
 // request admitted behind a long prefill is served instead of waiting out every quantum of it (#61). Shortest-first
@@ -68,16 +75,37 @@ struct Config {
     // R per grant: the smaller R a run may take (Request::r_rows; 0 = none). Steps switch to the CP block at one context
     // for every session (cp_after), whichever R it takes
     uint32_t r2_rows = 0;
+    // GR8_S2_TAIL_FIRST=1: a session whose prompt is prefilled (only its tail left) is served before any prefill, owed or
+    // not, and its tail does not ask for a decode round (Scheduler::alternate), so a burst of short prompts reaches its
+    // first tokens one tail per step instead of after every prefill and a decode round per tail. false = as before.
+    bool tail_first = false;            // after cp_seg, for the same reason
+    // GR8_S2_NOTICE_MAX=<k>: the notice target's cap, NOTICE_MIN..NOTICE_MAX boundaries (horizon(), service.h event).
+    // NOTICE_MAX (8) = as before. Lower only from a measured margin: a notice that lands after its boundary is fatal
+    uint32_t notice_max = uint32_t(NOTICE_MAX);   // after tail_first, for the same reason
+    // DS41 only: short fresh prompts prefill together in one ragged pass, then share one prompt-tail step
+    bool c8_pack = false;
+    // 0: every session drafts mtp tokens a round. n: drafting stops while more than n sessions are active (one row each),
+    // so up to max_rows sessions decode. Batch::set_mtp_sessions.
+    uint32_t mtp_sessions = 0;
     // max_rows bounds ONE step: a round is one main step of every session's mtp + 1 rows (s2_batch.h Batch::round)
     uint32_t guard() const { return guard_tokens == UINT32_MAX ? 2 * mtp : guard_tokens; }
-    unsigned limit() const { return std::min(max_sessions, max_rows / (mtp + 1)); }
+    unsigned limit() const {
+        const unsigned step = mtp_sessions ? 1u : (mtp + 1);
+        return std::min(max_sessions, max_rows / step);
+    }
     void validate() const {
         require(epoch && pool_rows >= PAGE && pool_rows % PAGE == 0, "bad epoch/pool");
+#if G6_MODEL_DS41
+        require(mtp <= 7 && max_sessions && max_sessions <= MAX_SESSIONS && limit(), "bad session/row limit");   // DS41 allows MTP 0 (no draft head)
+#else
         require(mtp > 0 && mtp <= 7 && max_sessions && max_sessions <= MAX_SESSIONS && limit(), "bad session/row limit");
+        require(!c8_pack, "c8 prefill pack is DS41 only");
+#endif
         require(guard() >= 2 * mtp && prefill_rows, "insufficient guard/prefill rows");
         require(!decode_prefill_rows || (decode_prefill_rows % PAGE == 0 && decode_prefill_rows <= prefill_rows),
                 "decode_prefill_rows must be 0 or a multiple of 64 no larger than prefill_rows");
         require(decode_rounds <= MAX_DECODE_ROUNDS, "decode_rounds must be at most 64");
+        require(notice_max >= NOTICE_MIN && notice_max <= NOTICE_MAX, "notice_max must be 2..8");
         require(!cp_step_rows || cp_step_rows >= mtp + 1, "cp_step_rows must be 0 or at least one session's verify (mtp + 1)");
         require(!cp_seg || cp_step_rows, "cp_seg needs cp_step_rows");
         require(r2_rows % PAGE == 0 && (!r2_rows || window_pages), "r2_rows must be 0, or a multiple of 64 with window_pages");
@@ -146,6 +174,8 @@ struct Slot {
     uint32_t inserted = 0;   // tokens the request's insert rule put in (s2_batch.h): in the digest, so the ranks agree it fired
     uint32_t deferred = 0;   // prefill quanta this session was passed over since it was last served (Scheduler::next): in the
                              // digest too, so a rank that counts differently fails at the grant rather than a step later
+    bool packable = false;    // fresh, ordinary DS41 request (never a restored/reused/steered prompt)
+    bool pack_tail = false;   // selected by one packed W pass; only these keys may join its tail
 };
 // prompt rows a session still has to prefill; 0 means only its prompt tail is left
 inline uint32_t prefill_left(const Slot& s) { return s.req.prompt_tokens - 1 - s.prefilled; }
@@ -201,13 +231,14 @@ struct Changes {
     std::vector<Run> freed;
     std::optional<Grant> admitted;
 };
-enum class Kind { Idle, Prefill, PromptTail, Decode };
+enum class Kind { Idle, Prefill, PromptTail, Decode, PrefillPack, PromptTailPack };
 struct Quantum {
     Kind kind = Kind::Idle;
     uint64_t boundary = 0;
     std::array<Key, MAX_SESSIONS> keys{};
     unsigned count = 0;
     uint32_t first = 0, rows = 0;
+    std::array<uint32_t, MAX_SESSIONS> firsts{}, row_counts{}; // pack: per key; scalar first/rows stay the solo contract
     bool solo() const { return count == 1; }
 };
 struct Completion { Key key; uint32_t emitted = 0; bool finished = false; uint32_t inserted = 0; };   // inserted: in total
@@ -237,8 +268,14 @@ class Scheduler {
         // The prefill choice below reads these counters, so they advance here on replicated state alone: the session this
         // quantum served has had its turn, every other prefilling session was passed over once. A PromptTail leaves
         // Phase::Prefill as it completes, so it is never reset here and its rivals are still counted as passed over.
-        if (work_.kind == Kind::Prefill || work_.kind == Kind::PromptTail)
+        if (!c_.c8_pack && (work_.kind == Kind::Prefill || work_.kind == Kind::PromptTail)) {
             for (auto& s : s_) if (s.phase == Phase::Prefill) s.deferred = s.key == work_.keys[0] ? 0 : s.deferred + 1;
+        } else if (work_.kind == Kind::Prefill || work_.kind == Kind::PromptTail || work_.kind == Kind::PrefillPack || work_.kind == Kind::PromptTailPack)
+            for (auto& s : s_) if (s.phase == Phase::Prefill) {
+                bool served = false;
+                for (unsigned i = 0; i < work_.count; ++i) served |= s.key == work_.keys[i];
+                s.deferred = served ? 0 : s.deferred + 1;
+            }
     }
 public:
     explicit Scheduler(Config c) : c_(c) {
@@ -287,6 +324,9 @@ public:
         add(c_.prefill_rows); add(c_.two_lanes); if (c_.decode_prefill_rows) add(c_.decode_prefill_rows); add(have_id_); add(last_id_); add(boundary_); add(event_); add(want_decode_); add(busy_); add(failed_);
         if (c_.decode_rounds > 1) { add(c_.decode_rounds); add(decode_run_); }
         if (c_.window_pages) add(c_.window_pages);
+        if (c_.tail_first) add(0x7A11F1257ull);
+        if (c_.c8_pack) add(0xC8A11F1257ull);
+        if (c_.notice_max != NOTICE_MAX) add(c_.notice_max);
         if (c_.cp_step_rows) { add(c_.cp_step_rows); add(c_.cp_after); add(c_.cp_seg); }
         if (c_.r2_rows) add(c_.r2_rows);
         add(pool_); g6rt::steering::hash_boot(h, c_.steering);
@@ -298,6 +338,7 @@ public:
             if (s.req.r_rows) add(s.req.r_rows);
             add(s.run.first_page); add(s.run.pages); add(s.run.table_version); add(s.run.list_hash); add(s.prefilled); add(s.emitted);
             add(s.inserted); add(s.deferred);
+            if (c_.c8_pack) { add(s.packable); add(s.pack_tail); }
         }
         return h;
     }
@@ -335,7 +376,9 @@ public:
             require(live < c_.limit(), "active session/row limit");
             require(g.reuse < g.req.prompt_tokens, "reused rows past the prompt");
             require(!g.req.r_rows || g.req.r_rows == c_.r2_rows, "grant at an R the engine does not have");
-            target = Slot{g.key, g.req, g.run, Phase::Prefill, g.reuse, 0}; d.admitted = g;
+            target = Slot{g.key, g.req, g.run, Phase::Prefill, g.reuse, 0};
+            target.packable = c_.c8_pack && !g.reuse && !g.restored && !g.req.steering.enabled;
+            d.admitted = g;
         }
         if (e.admit) { last_id_ = e.admit->req.id; have_id_ = true; }
         s_ = after; event_ = e.event; ++revision_;
@@ -362,6 +405,7 @@ public:
     // decode_rounds <= 1 this is exactly `want = k != Decode`. Replicated state only (the kinds every rank completed), and
     // horizon() runs the same function forward, so the notice target agrees with the steps the ranks will take.
     static void alternate(const Config& c, Kind k, bool& want, uint32_t& run) {
+        if (c.tail_first && k == Kind::PromptTail) return;   // a solo tail is one row: the decoders lose no round to it
         if (k != Kind::Decode) { want = true; run = 0; return; }
         if (run < MAX_DECODE_ROUNDS) ++run;
         want = c.decode_rounds > 1 && run < c.decode_rounds;
@@ -393,10 +437,55 @@ public:
         for (unsigned i = 0; i < MAX_SESSIONS; ++i) decoding |= s[i].phase == Phase::Decode;
         for (unsigned i = 0; i < n; ++i) {
             if (ordered[i]->phase == Phase::Decode) q.keys[q.count++] = ordered[i]->key;
-            else if (!pf || prefill_first(*ordered[i], *pf)) pf = ordered[i];
+            else if (!pf) pf = ordered[i];
+            else if (c.tail_first && (prefill_left(*ordered[i]) == 0) != (prefill_left(*pf) == 0)) {
+                if (prefill_left(*ordered[i]) == 0) pf = ordered[i];   // a ready tail outranks every prefill
+            } else if (prefill_first(*ordered[i], *pf)) pf = ordered[i];
+        }
+        // A held W pack owns its exact surviving membership until its tail. Cancellation may remove a key;
+        // a later admission never joins it. Serve the tail immediately, before the next decoder round.
+        if (c.c8_pack) {
+            unsigned held = 0;
+            for (unsigned i = 0; i < n; ++i) if (ordered[i]->phase == Phase::Prefill && ordered[i]->pack_tail) {
+                q.keys[held] = ordered[i]->key;
+                q.firsts[held] = ordered[i]->prefilled;
+                q.row_counts[held] = 1;
+                ++held;
+            }
+            if (held) {
+                q.count = held; q.kind = held > 1 ? Kind::PromptTailPack : Kind::PromptTail;
+                q.first = q.firsts[0]; q.rows = held;
+                return q;
+            }
         }
         if (q.count && (want_decode || !pf)) q.kind = Kind::Decode;
         else if (pf) {
+            if (c.c8_pack && pf->packable && !pf->prefilled && prefill_left(*pf) >= 1 && prefill_left(*pf) <= 64) {
+                const uint32_t cap = decoding && c.decode_prefill_rows ? std::min({512u, c.prefill_rows, c.decode_prefill_rows})
+                    : std::min(512u, c.prefill_rows);
+                std::array<const Slot*, MAX_SESSIONS> take{};
+                unsigned m = 1; uint32_t total = prefill_left(*pf); take[0] = pf;
+                for (unsigned i = 0; i < n && m < PACK_MAX_MEMBERS; ++i) {
+                    const Slot* x = ordered[i];
+                    if (x == pf || x->phase != Phase::Prefill || !x->packable || x->prefilled) continue;
+                    const uint32_t left = prefill_left(*x);
+                    if (!left || left > 64 || total + left > cap) continue;
+                    take[m++] = x; total += left;
+                }
+                if (m > 1 && total <= cap) {
+                    // The first choice honors prefill_first/owed priority; execution order is native request id.
+                    for (unsigned i = 1; i < m; ++i) {
+                        const Slot* x = take[i]; unsigned j = i;
+                        while (j && take[j-1]->req.id > x->req.id) { take[j] = take[j-1]; --j; }
+                        take[j] = x;
+                    }
+                    q.kind = Kind::PrefillPack; q.count = m; q.rows = total;
+                    for (unsigned i = 0; i < m; ++i) {
+                        q.keys[i] = take[i]->key; q.firsts[i] = take[i]->prefilled; q.row_counts[i] = prefill_left(*take[i]);
+                    }
+                    return q;
+                }
+            }
             q.count = 1; q.keys[0] = pf->key; q.first = pf->prefilled;
             const uint32_t left = pf->req.prompt_tokens - 1 - pf->prefilled;
             q.kind = left ? Kind::Prefill : Kind::PromptTail;
@@ -419,9 +508,18 @@ public:
     static void advance(std::array<Slot, MAX_SESSIONS>& sim, const Quantum& q) {
         if (q.kind == Kind::Prefill) sim[q.keys[0].slot].prefilled += q.rows;
         else if (q.kind == Kind::PromptTail) sim[q.keys[0].slot].phase = Phase::Decode;
-        if (q.kind == Kind::Prefill || q.kind == Kind::PromptTail)
-            for (auto& t : sim)
-                if (t.phase == Phase::Prefill) t.deferred = t.key == q.keys[0] ? 0 : t.deferred + 1;
+        else if (q.kind == Kind::PrefillPack) for (unsigned i = 0; i < q.count; ++i) {
+            auto& t = sim[q.keys[i].slot]; t.prefilled += q.row_counts[i]; t.pack_tail = true;
+        }
+        else if (q.kind == Kind::PromptTailPack) for (unsigned i = 0; i < q.count; ++i) {
+            auto& t = sim[q.keys[i].slot]; t.phase = Phase::Decode; t.pack_tail = false;
+        }
+        if (q.kind == Kind::Prefill || q.kind == Kind::PromptTail || q.kind == Kind::PrefillPack || q.kind == Kind::PromptTailPack)
+            for (auto& t : sim) if (t.phase == Phase::Prefill) {
+                bool served = false;
+                for (unsigned i = 0; i < q.count; ++i) served |= t.key == q.keys[i];
+                t.deferred = served ? 0 : t.deferred + 1;
+            }
     }
     // The boundary a notice anchored now should target (service.h event): the first boundary whose work after the one
     // in flight covers NOTICE_ROWS prefill rows, within [boundary + NOTICE_MIN, boundary + NOTICE_MAX]. The boundary in
@@ -438,15 +536,16 @@ public:
         advance(sim, inflight);
         alternate(c_, inflight.kind, want, run);
         uint32_t covered = 0;
-        for (uint64_t k = NOTICE_MIN; k < NOTICE_MAX; ++k) {
+        for (uint64_t k = NOTICE_MIN; k < c_.notice_max; ++k) {
             const Quantum q = plan(c_, sim, want);
             if (q.kind == Kind::Idle) return boundary_ + k;   // no work left: the engine blocks before this boundary
             advance(sim, q);
             alternate(c_, q.kind, want, run);
-            covered += q.kind == Kind::Prefill ? q.rows : q.kind == Kind::PromptTail ? 1 : 0;
+            covered += q.kind == Kind::Prefill || q.kind == Kind::PrefillPack ? q.rows
+                : q.kind == Kind::PromptTail || q.kind == Kind::PromptTailPack ? q.rows : 0;
             if (covered >= NOTICE_ROWS) return boundary_ + k;
         }
-        return boundary_ + NOTICE_MAX;
+        return boundary_ + c_.notice_max;
     }
     // a just-admitted session that runs its whole prompt as decode steps (prompt logprobs): straight to PromptTail
     void skip_prefill(const Key& k) {
@@ -457,9 +556,34 @@ public:
         require(busy_ && work_.kind == Kind::Prefill, "not a prefill quantum");
         slot(work_.keys[0]).prefilled += work_.rows; completed();
     }
+    void complete_prefill_pack() { // one synchronized W pass, all selected sessions advance together
+        require(busy_ && work_.kind == Kind::PrefillPack && work_.count >= 2, "not a prefill pack quantum");
+        for (unsigned i = 0; i < work_.count; ++i) {
+            auto& s = slot(work_.keys[i]);
+            require(s.phase == Phase::Prefill && !s.pack_tail && s.prefilled == work_.firsts[i] &&
+                    work_.row_counts[i] && work_.row_counts[i] == prefill_left(s), "prefill pack membership changed");
+        }
+        for (unsigned i = 0; i < work_.count; ++i) {
+            auto& s = slot(work_.keys[i]); s.prefilled += work_.row_counts[i]; s.pack_tail = true;
+        }
+        completed();
+    }
     void complete_tail(const Completion& r) {
         require(busy_ && work_.kind == Kind::PromptTail && work_.keys[0] == r.key, "not this prompt tail");
-        auto copy = slot(r.key); finish_slot(copy, r); slot(r.key) = copy; completed();
+        auto copy = slot(r.key); finish_slot(copy, r); copy.pack_tail = false; slot(r.key) = copy; completed();
+    }
+    void complete_tail_pack(const std::vector<Completion>& r) {
+        require(busy_ && work_.kind == Kind::PromptTailPack && r.size() == work_.count, "not this prompt tail pack");
+        auto copy = s_; // reject the entire pack before publishing any session completion
+        for (unsigned i = 0; i < r.size(); ++i) {
+            require(work_.keys[i] == r[i].key && copy[r[i].key.slot].pack_tail &&
+                    r[i].emitted <= copy[r[i].key.slot].req.max_tokens - copy[r[i].key.slot].emitted &&
+                    r[i].inserted >= copy[r[i].key.slot].inserted, "tail pack completion invalid");
+        }
+        for (unsigned i = 0; i < r.size(); ++i) {
+            finish_slot(copy[r[i].key.slot], r[i]); copy[r[i].key.slot].pack_tail = false;
+        }
+        s_ = copy; completed();
     }
     void complete_decode(const std::vector<Completion>& r) {
         require(busy_ && work_.kind == Kind::Decode && r.size() == work_.count, "not this decode round");

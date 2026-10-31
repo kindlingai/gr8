@@ -44,6 +44,12 @@ struct DispatchHooks {
     std::function<float(int row)> draft_lp;
     // optional, grammars (Dispatch::set_grammar): the host side of the mask arena the main head reads
     int* gm_on = nullptr; uint32_t* gm_bits = nullptr; int gm_words = 0;
+    // optional, DS41 (ds41_prefill.h): in place of `prefill`, with the chunk's fabric step id: ONE id from the main sequence, the one
+    // counter prefill and decode share on the fabric. The next MAIN step has sequence + 1.
+    // LAST: native.cuh builds this struct positionally, so a new member goes at the end.
+    std::function<void(const Slot&, const Payload&, uint32_t, uint32_t, uint64_t)> prefill_seq;
+    // DS41 prefill pack: one main fabric sequence for a bounded ordered pack (append: native hooks use positional initialization).
+    std::function<void(const std::vector<PrefillPart>&, uint64_t)> prefill_pack_seq;
 };
 // The row of the step's j-th session that samples its next reply token: the one whose input is the last committed token,
 // at position `last` (the prompt's length + the tokens emitted - 1). -1 when the step holds none (a prompt step before
@@ -67,7 +73,7 @@ class Dispatch {
     int* gm_on_ = nullptr; uint32_t* gm_bits_ = nullptr; int gm_words_ = 0;   // the grammar masks (set_grammar)
 public:
     Dispatch(const Sessions& sessions, uint32_t rows, DispatchHooks h) : sessions_(sessions), hooks_(std::move(h)), max_rows_(rows) {
-        require(rows && bool(hooks_.bucket) && bool(hooks_.mode) && bool(hooks_.launch) && bool(hooks_.prefill), "incomplete dispatch hooks");
+        require(rows && bool(hooks_.bucket) && bool(hooks_.mode) && bool(hooks_.launch) && (bool(hooks_.prefill) || bool(hooks_.prefill_seq)), "incomplete dispatch hooks");
         if (hooks_.gm_on) set_grammar(hooks_.gm_on, hooks_.gm_bits, hooks_.gm_words);
     }
     // Call at every safe boundary after local EOS/commit, not inside a Step.
@@ -138,8 +144,12 @@ public:
         for (size_t j = 0; track_ && j < sp.sess.size(); ++j) {
             auto& w = rows_[sp.sess[j]];
             const int first = sp.r[sp.row0[j]].pos, n = sp.rows[j];
-            if (!draft) w.main_rows(first, n);
-            else w.draft_rows(first, n, sp.kind == s2::Step::CHAIN);
+            if (!draft) {
+                w.main_rows(first, n);
+#if G6_MODEL_DS41
+                if (sp.round < 0 || n == 1) w.draft_rows(first, n, false);   // DSpark keys come from the main step's rows
+#endif
+            } else w.draft_rows(first, n, sp.kind == s2::Step::CHAIN);
         }
         return ids;
     }
@@ -165,8 +175,33 @@ public:
     void prefill(const Slot& s, const Payload& p, uint32_t first, uint32_t rows) {
         require(rows && first <= p.prompt.size() && uint64_t(first) + rows < p.prompt.size() &&
                 uint64_t(first) + rows <= uint64_t(s.run.pages) * PAGE, "invalid prefill quantum");
-        hooks_.prefill(s, p, first, rows);
+        if (hooks_.prefill_seq) {
+            require(main_sequence_ != UINT64_MAX, "fabric sequence exhausted");
+            hooks_.prefill_seq(s, p, first, rows, ++main_sequence_);
+        } else hooks_.prefill(s, p, first, rows);
         if (track_) rows_[s.key.slot].prefill_rows(int(first), int(rows), true);
+    }
+    void prefill_pack(const std::vector<PrefillPart>& parts) {
+        require(parts.size() >= 2 && parts.size() <= MAX_SESSIONS && bool(hooks_.prefill_pack_seq), "invalid/unwired prefill pack");
+        require(main_sequence_ != UINT64_MAX, "fabric sequence exhausted");
+        uint32_t total = 0;
+        uint64_t last_id = 0;
+        bool have_last = false; // native request ordinal zero is valid for the first member
+        std::array<bool, MAX_SESSIONS> seen{};
+        for (const auto& p : parts) {
+            require(p.slot && p.payload, "null prefill pack member");
+            require(p.slot->key.slot < MAX_SESSIONS && !seen[p.slot->key.slot] && (!have_last || p.slot->req.id > last_id) && p.slot->packable &&
+                    p.slot->phase == Phase::Prefill && !p.slot->pack_tail && !p.payload->decode_prompt &&
+                    p.payload->prompt.size() == p.slot->req.prompt_tokens && p.first == 0 && p.rows >= 1 && p.rows <= 64 &&
+                    uint64_t(p.first) + p.rows + 1 == p.payload->prompt.size() &&
+                    uint64_t(p.first) + p.rows <= uint64_t(p.slot->run.pages) * PAGE,
+                    "invalid prefill pack segment");
+            seen[p.slot->key.slot] = true; last_id = p.slot->req.id; have_last = true;
+            total += p.rows;
+        }
+        require(total <= 512, "prefill pack exceeds 512 rows");
+        hooks_.prefill_pack_seq(parts, ++main_sequence_);
+        if (track_) for (const auto& p : parts) rows_[p.slot->key.slot].prefill_rows(int(p.first), int(p.rows), true);
     }
 };
 // Direct mapping to fc2's native structs. Instantiate ONLY in DEC_S2 builds.

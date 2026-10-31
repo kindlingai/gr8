@@ -160,6 +160,32 @@ class Service {
     // 8,192-row prefill quanta). Default off: one admission per notice, as before.
     const bool admit_hold_ = knob::s2_admit_hold();
     uint64_t refused_ = UINT64_MAX;   // the last request the refusal line named (head)
+    // head: an ADMIT command into the FIFO (its req file read and checked); a grammar refusal answers it and queues nothing
+    void intake(const Command& command) {
+        auto bytes = ingress_.request(command);
+        auto request = parse_request(bytes, c_.scheduler.steering);
+        if (!grammar_ok(command.request, request)) return;
+        const auto queued = Sessions::request(command.request, request);
+        if (trace_)
+            trace_.instant("arrive", Trace::CONTROL, targ("request", queued.id) + "," +
+                           targ("prompt_tokens", queued.prompt_tokens) + "," + targ("max_tokens", queued.max_tokens) +
+                           "," + targ("queued", queue_.size()));
+        queue_.push(queued); commands_.emplace(command.request, command);
+        payloads_.emplace(command.request, std::move(bytes));
+        if (reuse() && request.plp < 0) {
+            spans_.emplace(command.request, request.sys);
+            prompts_.emplace(command.request, std::move(request.prompt));
+        }
+    }
+    // head, inside an admission's commit: queue the ADMITs already written, in cmd order; stop at the first other
+    // command (a CANCEL may need its own event, which only the loop may start), so the order of commands is unchanged
+    void drain_admits() {
+        while (const auto command = ingress_.peek()) {
+            if (!command->admit) return;
+            ingress_.next();
+            intake(*command);
+        }
+    }
     void fail(std::exception_ptr error) {
         { std::lock_guard<std::mutex> lock(failure_mu_); if (!failure_) failure_ = error; }
         stopping_.store(true); endpoint_->fail();
@@ -227,16 +253,16 @@ class Service {
         // prefill no longer waits out eight ~6 s quanta for a propagation that takes milliseconds (#61); late notices
         // remain fatal. Clamped, so a torn read of the pair can only widen the target, never narrow it past the floor.
         // A held boundary has no work in flight: every rank is stopped at it (event_gate.h before_work returns true).
-        const auto target = held ? *held : std::clamp(horizon, boundary + NOTICE_MIN, boundary + NOTICE_MAX);
+        const auto target = held ? *held : std::clamp(horizon, boundary + NOTICE_MIN, boundary + c_.scheduler.notice_max);
         if (trace_)
             trace_.instant("notice", Trace::CONTROL, targ("request", command.request) + "," +
                            targ("kind", command.resize ? "resize" : command.admit ? "admit" : "cancel") + "," +
                            targ("anchored", boundary) + "," + targ("boundary", target));
         if (elog_)
-            fprintf(stderr, "# s2_event notice rank %u event %llu %s request %llu anchored %llu -> boundary %llu (lookahead %llu)\n",
+            fprintf(stderr, "# s2_event notice rank %u event %llu %s request %llu anchored %llu -> boundary %llu (lookahead %llu) t_us %lld\n",
                     c_.rank, (unsigned long long)event_, command.resize ? "resize" : command.admit ? "admit" : "cancel",
                     (unsigned long long)command.request,
-                    (unsigned long long)boundary, (unsigned long long)target, (unsigned long long)(target - boundary));
+                    (unsigned long long)boundary, (unsigned long long)target, (unsigned long long)(target - boundary), wall_us());
         Notice n{c_.scheduler.epoch, event_, target, command.request, command.hash,
                  command.resize ? EventKind::Resize : command.admit ? EventKind::Admit : EventKind::Cancel};
         bool hold = false;
@@ -345,7 +371,11 @@ class Service {
                                        targ("reused", cm.admit->reuse) + "," + targ("rows", worst) + "," + targ("live", live));
                     queue_.admitted(request->id); commands_.erase(command.request); prompts_.erase(command.request);
                     spans_.erase(command.request); payloads_.erase(command.request);
-                    // another request queued and a slot left after this one: keep the ranks at this boundary for it
+                    // another request queued and a slot left after this one: keep the ranks at this boundary for it.
+                    // first queue the ADMIT files that landed while this thread was inside the event chain (each
+                    // event waits for every rank's ACK, ~8 ms); the loop reads cmd files only between events, so without
+                    // this a burst written within 1 ms lost the hold after its 2nd grant and waited NOTICE_MAX boundaries
+                    if (admit_hold_ && live + 1 < c_.scheduler.limit()) drain_admits();
                     hold = cm.hold = admit_hold_ && queue_.front() && live + 1 < c_.scheduler.limit();
                 }
             }
@@ -401,20 +431,7 @@ class Service {
             while (auto command = ingress_.next()) {
                 changed = true;
                 if (command->admit) {
-                    auto bytes = ingress_.request(*command);
-                    auto request = parse_request(bytes, c_.scheduler.steering);
-                    if (!grammar_ok(command->request, request)) continue;
-                    const auto queued = Sessions::request(command->request, request);
-                    if (trace_)
-                        trace_.instant("arrive", Trace::CONTROL, targ("request", queued.id) + "," +
-                                       targ("prompt_tokens", queued.prompt_tokens) + "," + targ("max_tokens", queued.max_tokens) +
-                                       "," + targ("queued", queue_.size()));
-                    queue_.push(queued); commands_.emplace(command->request, *command);
-                    payloads_.emplace(command->request, std::move(bytes));
-                    if (reuse() && request.plp < 0) {
-                        spans_.emplace(command->request, request.sys);
-                        prompts_.emplace(command->request, std::move(request.prompt));
-                    }
+                    intake(*command);
                 } else if (queue_.cancel(command->request)) {
                     commands_.erase(command->request); prompts_.erase(command->request); spans_.erase(command->request);
                     payloads_.erase(command->request);
@@ -486,11 +503,15 @@ class Service {
                                    targ("kind", noticed.kind == EventKind::Resize ? "resize"
                                                 : noticed.kind == EventKind::Cancel ? "cancel" : "admit") + "," +
                                    targ("boundary", cm->boundary));
-                if (elog_)
-                    fprintf(stderr, "# s2_event commit rank %u event %llu %s request %llu boundary %llu\n", c_.rank,
+                if (elog_) {
+                    // t_us: now (applied); installed_us / arrived_us: this rank's notice install and boundary arrival
+                    // (control_channel.h stamps), so arrived - installed is the notice's margin on this rank
+                    const auto st = endpoint_->stamps();
+                    fprintf(stderr, "# s2_event commit rank %u event %llu %s request %llu boundary %llu t_us %lld installed_us %lld arrived_us %lld\n", c_.rank,
                             (unsigned long long)noticed.event,
                             noticed.kind == EventKind::Resize ? "resize" : noticed.kind == EventKind::Cancel ? "cancel" : "admit",
-                            (unsigned long long)noticed.request, (unsigned long long)cm->boundary);
+                            (unsigned long long)noticed.request, (unsigned long long)cm->boundary, wall_us(), st.first, st.second);
+                }
                 if (worker_ && cm->admit) worker_->admitted(cm->admit->req.id);
                 if (cm->resize) resizing_.store(false);
                 dispatch_.synchronize_mode(driver_->state()); progress_.publish(driver_->state());
@@ -510,14 +531,15 @@ class Service {
             if (elog_ && work.kind != Kind::Decode)
                 fprintf(stderr, "# s2_event step rank %u boundary %llu request %llu %s first %u rows %u\n", c_.rank,
                         (unsigned long long)work.boundary, (unsigned long long)driver_->state().slots()[work.keys[0].slot].req.id,
-                        work.kind == Kind::Prefill ? "prefill" : "tail", work.first, work.rows);
+                        work.kind == Kind::Prefill ? "prefill" : work.kind == Kind::PrefillPack ? "prefill_pack" :
+                        work.kind == Kind::PromptTailPack ? "tail_pack" : "tail", work.first, work.rows);
             dispatch_.synchronize_mode(driver_->state()); progress_.publish(driver_->state());
         }
     }
 public:
     unsigned quit_linger_ms = 15000; // orderly-quit linger (monitor); > the time the workers take to see the head's quit
     Service(BootstrapConfig c, ControlLinks& links, NativeHooks hooks, int chunk)
-        : c_(std::move(c)), links_(links), native_(std::move(hooks)), sessions_(c_.scheduler,c_.directory,c_.rank == 0,chunk),
+        : c_(std::move(c)), links_(links), native_(std::move(hooks)), sessions_(c_.scheduler,c_.directory,c_.rank == 0,chunk,c_.prefill_min),
           dispatch_(sessions_,c_.scheduler.max_rows,native_.dispatch), ingress_(c_.directory,c_.scheduler.epoch), queue_(c_.scheduler) {
         c_.validate();
         trace_.open(knob::s2_trace().value_or(""), c_.rank);
@@ -565,6 +587,10 @@ public:
         h.prefill = [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows) {
             dispatch_.prefill(s,p,first,rows);
             sessions_.progress(s.key,first + rows);   // rank 0: a long prefill tells the front end it is alive
+        };
+        h.prefill_pack = [&](const std::vector<PrefillPart>& parts) {
+            dispatch_.prefill_pack(parts);
+            for (const auto& p : parts) sessions_.progress(p.slot->key, p.first + p.rows);
         };
         h.run = [&](const s2::Step& step) { return dispatch_.run(step); };
         h.emit = [&](Key k,const int* ids,int n,int row) {
