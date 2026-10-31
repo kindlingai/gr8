@@ -263,6 +263,7 @@ if python3 -c "import torch, numpy" 2>/dev/null; then
   python3 "$REPO/engine/attn/tests/ds41_comp_fp8_cpu.py"
 else
   echo "SKIP test_ds41_idx_ref, ds41_kernels_selftest, ds41_comp_fp8_cpu: no torch/numpy"
+fi
 # DeepSeek-V4.1 Engram (engine/engram): the token ring against the reference's positional cache, the W-row prefill path
 # against 32-row slabs (window, hash, fetch on real files, dequant, 4-rank sum, gate, lookahead), the row store on real
 # files, and the boot knobs. The hash and dequant tests against the official reference need its files: run_hash_test.sh
@@ -281,6 +282,7 @@ if [ -f /usr/local/cuda/include/cuda_fp8.h ]; then
   g++ -std=c++17 -O2 -ffp-contract=off -Wall -Wextra -I "$REPO/engine/engram" -I /usr/local/cuda/include \
     "$REPO/engine/engram/tests/test_act_quant.cpp" -o "$T/engram_act_quant_test"
   "$T/engram_act_quant_test"
+fi
 # DS41 MoE plans: the multi-tile plan (ds_plan_mt.h), the read-once planner and work model (ds_ro.h), and the fc1 B-ring
 # addresses (ds_fc1_bstg.h). The real-route cases need reference route dumps, so they skip here. The multi-tile test compares
 # double sums bit for bit, so it is built without FMA contraction (g++ contracts by default on aarch64).
