@@ -86,12 +86,12 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
     NativeHooks h;
     h.pool.free_pages = [&] { return pool.free_pages(); };
     h.pool.room = [&] { return std::min(pool.room(), slot_pages); };
-    h.pool.reserve = [&](uint64_t n, uint64_t worst) {
+    h.pool.reserve = [&](uint64_t n, uint64_t worst, uint32_t r) {
         require(worst <= uint64_t(slot_pages) * PAGE, "DS41 run larger than one session's slab");
-        return pool.reserve(n, worst);
+        return pool.reserve(n, worst, r);
     };
     h.pool.release = [&](const Run& r) { pool.release(r); };
-    h.pool.fits = [&](uint64_t n, uint64_t worst) { return worst <= uint64_t(slot_pages) * PAGE && pool.fits(n, worst); };
+    h.pool.fits = [&](uint64_t n, uint64_t worst, uint32_t r) { return worst <= uint64_t(slot_pages) * PAGE && pool.fits(n, worst, r); };
     h.pool.digest = [&]() -> uint64_t {
         if (!ck) return pool.digest();
         std::lock_guard<std::mutex> l(ck_mu);
@@ -117,17 +117,17 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
             bound_live[size_t(q)] = false;
             pool.release(r); // the snapshot owns separate device storage, not the run's pages
         };
-        h.pool.match = [&](const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit, const CacheNamespace& ns) {
+        h.pool.match = [&](const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit, const CacheNamespace& ns, uint32_t r) {
             std::lock_guard<std::mutex> l(ck_mu);
             const Ds41PrefixHit f = ck->match(prompt, limit, ns);
             PoolHit hit; hit.lcp = f.lcp; hit.why = f.why;
-            if (f.hit && pool.fits(rows, worst)) { hit.skip = int(f.position); hit.age = f.generation; }
+            if (f.hit && pool.fits(rows, worst, r)) { hit.skip = int(f.position); hit.age = f.generation; }
             else if (f.hit) hit.why = "room";
             return hit;
         };
-        h.pool.take = [&](const PoolHit& hit, uint64_t rows, uint64_t worst) {
+        h.pool.take = [&](const PoolHit& hit, uint64_t rows, uint64_t worst, uint32_t r) {
             claimed.store(hit.age);
-            return pool.reserve(rows, worst);
+            return pool.reserve(rows, worst, r);
         };
         h.pool.tiers = [&] {
             std::lock_guard<std::mutex> l(ck_mu);

@@ -6,7 +6,11 @@ import http.server
 import io
 import json
 import os
+<<<<<<< ours
 import shutil
+=======
+import re
+>>>>>>> theirs
 import socket
 import subprocess
 import sys
@@ -18,6 +22,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import handshake as H  # noqa: E402
+import models  # noqa: E402
 import options as opt  # noqa: E402
 import supervisor as S  # noqa: E402
 from test_handshake import hello  # noqa: E402
@@ -288,6 +293,36 @@ class ControlPortTests(unittest.TestCase):
         self.assertEqual(got['v']['detail'], 'the head stopped: model: /m: no such directory')
 
 
+class ShimTests(unittest.TestCase):
+    class Spawned(Exception):
+        pass
+
+    def shim_argv(self, *argv):
+        s = supervisor(*argv)
+        with mock.patch.object(s, 'spawn', side_effect=self.Spawned) as spawn:
+            with self.assertRaises(self.Spawned):         # the argv is all this tests: stop before the shim's socket wait
+                s.start_shim('/work')
+        return spawn.call_args[0][1]
+
+    def test_ds41_starts_the_shim_with_its_own_identity(self):
+        a = self.shim_argv('--gr8-model', 'ds41')
+        self.assertEqual((a[a.index('--model-name') + 1], a[a.index('--vocab-size') + 1], a[a.index('--eos-ids') + 1]),
+                         ('deepseek-v4.1-flash', '129280', '1'))
+        self.assertEqual(a[a.index('--capacity-slots') + 1], a[a.index('--sessions') + 1])
+
+    def test_the_ds41_identity_is_the_engines_own(self):
+        geom = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'engine', 'model_geom_ds41.h')).read()
+        vocab = int(re.search(r'constexpr int VOCAB = (\d+);', geom).group(1))
+        eos = int(re.search(r'TOK_EOS = (\d+)', geom).group(1))
+        self.assertEqual((models.DS41.vocab, models.DS41.eos_ids), (vocab, (eos,)))
+
+    def test_glm_starts_the_shim_on_its_own_defaults(self):
+        a = self.shim_argv()
+        for k in ('--model-name', '--vocab-size', '--eos-ids'):
+            self.assertNotIn(k, a)
+        self.assertNotIn('--capacity-slots', a)
+
+
 class FrontTests(unittest.TestCase):
     def front_argv(self, *argv):
         s = supervisor(*argv)
@@ -312,17 +347,71 @@ class FrontTests(unittest.TestCase):
         self.assertEqual(a[a.index('--default-reasoning-effort') + 1], 'low')
         self.assertEqual(a[a.index('--default-thinking-budget') + 1], '2048')
 
+<<<<<<< ours
     def test_undeclared_tool_calls_reach_the_front_end_only_when_emitted(self):
         self.assertNotIn('--undeclared-tool-calls', self.front_argv())
         self.assertNotIn('--undeclared-tool-calls', self.front_argv('--undeclared-tool-calls', 'text'))
         a = self.front_argv('--undeclared-tool-calls', 'emit')
         self.assertEqual(a[a.index('--undeclared-tool-calls') + 1], 'emit')
+=======
+    def test_ds41_runs_the_front_end_in_its_dialect(self):
+        a = self.front_argv('--gr8-model', 'ds41', '--allow-thinking-off', '1')
+        self.assertEqual(a[a.index('--dialect') + 1], 'ds41')
+        self.assertEqual(a[a.index('--served-model-name') + 1], 'deepseek-v4.1-flash')
+        self.assertEqual(a[a.index('--default-max-tokens') + 1], '32768')
+        self.assertEqual(a[a.index('--default-reasoning-effort') + 1], 'low')
+        self.assertNotIn('--allow-thinking-off', a)                  # thinking off is native in the ds41 dialect
+        a = self.front_argv('--gr8-model', 'ds41', '--default-reasoning-effort', '100', '--default-max-tokens', '0')
+        self.assertEqual(a[a.index('--default-reasoning-effort') + 1], '100')
+        self.assertIn('--share-tokens', a)
+        a = self.front_argv('--allow-thinking-off', '1')              # GLM: no dialect or name flags, the switch passes
+        self.assertNotIn('--dialect', a)
+        self.assertNotIn('--served-model-name', a)
+        self.assertIn('--allow-thinking-off', a)
+>>>>>>> theirs
 
     def test_the_front_end_finds_the_supervisor_for_deep_health(self):
         a = self.front_argv()
         host, port = a[a.index('--supervisor') + 1].rsplit(':', 1)
         self.assertEqual(host, MEMBERS[0])                      # the head's LAN address, where its supervisor listens
         self.assertTrue(port.isdigit())
+
+
+class MemoryCheckTests(unittest.TestCase):
+    def checks(self, mem, *argv):
+        s = supervisor(*argv)
+        s.model_error = s.fabric_error = None
+        s.build = 'x'
+        with mock.patch.object(S, 'mem_available_gib', return_value=mem), mock.patch.object(S, 'log'), \
+                mock.patch.object(S, 'running_engines', return_value=[]), mock.patch.object(S.os, 'access', return_value=True), \
+                mock.patch.object(S.os.path, 'isdir', return_value=True):
+            return s.checks()
+
+    def test_ds41_refuses_a_box_under_the_engines_memory_floor(self):
+        fails = self.checks(5.0, '--gr8-model', 'ds41')
+        self.assertTrue(any('MemAvailable is 5.0 GiB' in f and 'G6_MEM_MIN' in f for f in fails), fails)
+        self.assertEqual([f for f in self.checks(40.0, '--gr8-model', 'ds41') if 'MemAvailable' in f], [])
+        self.assertEqual([f for f in self.checks(5.0) if 'MemAvailable' in f], [])    # GLM: a warning, as before
+
+
+class StageRelayTests(unittest.TestCase):
+    def test_boot_stage_lines_are_picked_out_of_the_engine_stderr_as_they_arrive(self):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, 'g6m4.r2.err')
+        r = S.StageRelay(path)
+        self.assertEqual(r.new(), [])                               # no file yet
+        with open(path, 'w') as f:
+            f.write('# rank 2: host before the weights: MemAvailable 100.0 GiB\n'
+                    '# rank 2: boot 3.2 s fabric up\n'
+                    '# rank 2: pack 72.10 GB loaded + sha256-checked in 190.2 s (0.38 GB/s)\n'
+                    'noise\n# rank 2: boot 200')
+        self.assertEqual(r.new(), ['rank 2: boot 3.2 s fabric up',
+                                   'rank 2: pack 72.10 GB loaded + sha256-checked in 190.2 s (0.38 GB/s)'])
+        with open(path, 'a') as f:
+            f.write('.5 s graphs captured\n# rank 2: 1.00 GB -> device image (Rust loader, 8 threads)\n')
+        self.assertEqual(r.new(), ['rank 2: boot 200.5 s graphs captured',
+                                   'rank 2: 1.00 GB -> device image (Rust loader, 8 threads)'])
+        self.assertEqual(r.new(), [])
 
 
 class EngineTests(unittest.TestCase):

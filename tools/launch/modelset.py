@@ -14,7 +14,7 @@ import os
 import models
 
 FORMAT = 'gr8-set-1'
-TOKENIZER = ('chat_template.jinja', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json')
+TOKENIZER = models.TOKENIZER_GLM
 
 
 class ModelError(Exception):
@@ -34,12 +34,12 @@ def compute_id(setj):
     return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
-def tokenizer_dir(model, model_dir):
-    """Where the four tokenizer files are: <model>/tokenizer, <model>, or MODEL_DIR."""
+def tokenizer_dir(model, model_dir, files=TOKENIZER):
+    """Where the tokenizer files are (the four of GLM's, or files): <model>/tokenizer, <model>, or MODEL_DIR."""
     for d in (os.path.join(model, 'tokenizer'), model, model_dir):
-        if d and all(os.path.isfile(os.path.join(d, f)) for f in TOKENIZER):
+        if d and all(os.path.isfile(os.path.join(d, f)) for f in files):
             return d
-    raise ModelError(f'no tokenizer files ({", ".join(TOKENIZER)}) in {model}/tokenizer, {model}'
+    raise ModelError(f'no tokenizer files ({", ".join(files)}) in {model}/tokenizer, {model}'
                      + (f' or {model_dir}' if model_dir else ' (MODEL_DIR names a directory that has them)'))
 
 
@@ -83,6 +83,25 @@ def pseudo_set(d, tp, model_dir=None):
          'source': {'kind': 'pseudo', 'weights': sha256_file(os.path.join(d, 'responses.toml'))}}
     s['set_id'] = compute_id(s)
     return ModelSet(s, f'{d} (pseudo engine rules)', tok, d)
+
+
+def is_ds_checkpoint(d):
+    """DeepSeek-V4.1-Flash-1017 as published: config.json and model.safetensors.index.json, the shards beside them."""
+    return bool(d) and all(os.path.isfile(os.path.join(d, f)) for f in ('config.json', 'model.safetensors.index.json'))
+
+
+def ds_set(d, tp, model_dir=None):
+    """The model set of the DeepSeek checkpoint directory, used in place: no rank packs, no width variants. Its weights
+    are named by the sha256 of config.json and the shard index (the shards are 160 GB: the engine checks what it reads)."""
+    tok = tokenizer_dir(d, model_dir, models.TOKENIZER_DS)
+    w = hashlib.sha256()
+    for f in ('config.json', 'model.safetensors.index.json'):
+        w.update(sha256_file(os.path.join(d, f)).encode())
+    s = {'format': FORMAT, 'tp': tp, 'ranks': [], 'dflash': [], 'qo': None,
+         'tokenizer': {f: sha256_file(os.path.join(tok, f)) for f in models.TOKENIZER_DS},
+         'source': {'kind': 'ds-checkpoint', 'weights': w.hexdigest()}}
+    s['set_id'] = compute_id(s)
+    return ModelSet(s, f'{d} (DeepSeek checkpoint)', tok, d)
 
 
 def release_set(d, tp, model_dir=None, label=None):

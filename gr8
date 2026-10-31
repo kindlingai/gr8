@@ -1,5 +1,5 @@
 #!/bin/bash
-# The one entry point: ./gr8 <model> <command>, the model glm53 (GLM-5.3), glm53f (GLM-5.3-Flash) or pseudo (the
+# The one entry point: ./gr8 <model> <command>, the model glm53 (GLM-5.3), glm53f (GLM-5.3-Flash), ds41 (DeepSeek-V4.1-Flash-1017) or pseudo (the
 # pseudo engine, frontend/pseudo-engine: the launcher commands, smoke, bench and build); ./gr8 kv runs a KV node. Run the same command on every box, from the repo checkout
 # on that box. The model is always named: nothing picks one (GR8_MODEL, for the image, has no default). Each box's
 # supervisor (tools/launch) finds the others, checks that every box has the same options, model set and engine, and
@@ -22,9 +22,13 @@
 #   ./gr8 glm53 check [OPTIONS]       what would stop this box's boot
 #   ./gr8 glm53 show-config [OPTIONS] the effective options, the cluster options the boxes compare, the model set id
 #   ./gr8 glm53 prepare [--rank R] [OPTIONS]   fill --model-cache with this box's part without booting
+<<<<<<< ours
 #   ./gr8 glm53 knobs [WORD..] [OPTIONS]   every option, and the value each TP runs with these options; WORDs keep
 #                                     the options whose name holds one
 #   ./gr8 glm53 smoke [URL]           smoketest/run.sh, by default against this head's API
+=======
+#   ./gr8 glm53 smoke [URL]           smoketest/run.sh, by default against this head's API (./gr8 ds41 smoke: smoketest/ds41.sh)
+>>>>>>> theirs
 #   ./gr8 glm53 bench [ARGS]          bench/pbench.py against this head's API
 #   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh (one engine for every TP width) and scripts/build_front.sh; with
 #                                     KV_FORMAT=int4 (or --kv-format int4 in the options) also bin/g6m4-int4
@@ -72,6 +76,7 @@ model=$1
 case $model in
   glm53) build_model=glm ;;
   glm53f) build_model=flash ;;
+  ds41) build_model=ds41 ;;
   pseudo) build_model=pseudo ;;
   models) exec python3 "$REPO/tools/launch/models.py" ;;
   knobs) shift; GR8_MODEL='' exec python3 "$REPO/tools/launch/launch.py" knobs "$@" ;;
@@ -85,8 +90,12 @@ case $model in
       gpu) shift; exec bash "$SCRIPTS/c1_tests.sh" "$@" ;;
       *) echo "gr8: ./gr8 test [frontend|engine|all], ./gr8 test pseudo TOKENIZER_DIR or ./gr8 test gpu [BIN_DIR]" >&2; exit 2 ;;
     esac ;;
+<<<<<<< ours
   *) echo "gr8: the first argument names the model, glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash): ./gr8 glm53 <command>" \
           "(./gr8 models lists them; or ./gr8 knobs, ./gr8 kv, ./gr8 query, ./gr8 test)" >&2; exit 2 ;;
+=======
+  *) echo "gr8: the first argument names the model, glm53, glm53f, ds41 or pseudo: ./gr8 glm53 <command> (or ./gr8 kv, ./gr8 query, ./gr8 test)" >&2; exit 2 ;;
+>>>>>>> theirs
 esac
 shift
 export GR8_MODEL=$model   # tools/launch/options.py
@@ -109,6 +118,7 @@ case $cmd in
   smoke)
     PORT=$(python3 "$REPO/tools/launch/launch.py" get PORT) || exit 2   # the port as up reads it, from the same file
     url=${1:-$(api)}; [ $# -gt 0 ] && shift
+    [ "$model" = ds41 ] && exec bash "$REPO/smoketest/ds41.sh" "$url" "$@"   # DeepSeek's cases: its dialect, its served name
     exec bash "$REPO/smoketest/run.sh" "$url" "$@" ;;
   bench)
     PORT=$(python3 "$REPO/tools/launch/launch.py" get PORT) || exit 2

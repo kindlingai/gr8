@@ -1,8 +1,8 @@
 # The engine command line. The per-box supervisor (tools/launch) sources this file. ./gr8 knobs lists
 # the knobs. docs/SETTINGS.md explains every engine variable and flag.
 #
-# GR8_MODEL picks the model: glm53 (unset), glm53f, GLM-5.3-Flash (bin/g6m4_flash, TP 4 or 2), or pseudo, the pseudo
-# engine (bin/g6pseudo, frontend/pseudo-engine).
+# GR8_MODEL picks the model: glm53 (unset), glm53f, GLM-5.3-Flash (bin/g6m4_flash, TP 4 or 2), ds41, DeepSeek-V4.1-Flash-1017
+# (bin/g6m4_ds41, TP 4; docs/DEEPSEEK.md), or pseudo, the pseudo engine (bin/g6pseudo, frontend/pseudo-engine).
 #
 #   engine_defaults          needs TP (4, 6, 3 or 5); sets every knob that is unset to its default for this TP. An unset CAP
 #                            follows SHARE_LIMIT, so the KV pool keeps the same physical pages per rank (share_cap below)
@@ -114,6 +114,69 @@ flash_donor_budget() {
     'BEGIN { b = kib / 1048576 - g - r; if (b > w) b = w; if (b < 0) b = 0; printf "%d\n", b }'
 }
 
+# DeepSeek-V4.1-Flash-1017 (docs/DEEPSEEK.md): TP 4 only; CP, DFlash2 and PF_OWN remain off.
+# Prefix reuse is opt-in via REUSE=1 and the DS41 snapshot cache. MTP is the DSpark draft length k (0..5: the checkpoint's block is 5);
+# 0 until the DSpark layers run, then 5 (PLAN step 10). SESS 1..8 sessions; a round of SESS x (MTP + 1) rows must fit the
+# engine's 32. CAP: the full 1,048,576-token context (MAX_POS); the engine's admit gate already holds 2 x MTP draft rows inside
+# CAP. The KV row is 890 B a token a rank (CA 288 B + ICA 68 B at 2.5 rows a token, B5), so the pool is 16,384 pages x 56,960 B = 0.933 GB
+# (reports/ds-in-gr8-build/B10-defaults.md, B1.md U8). READY_TMO: the 289 GB of routed experts load from disk; the worst boot
+# seen was 807 s, so 1800. Each DeepSeek-only variable is a G6_DS_* engine variable in G6ENV_X (G6_DS_ENGRAM=0
+# turns Engram off: wrong logits, every row measured with it is "diag").
+ds41_defaults() {
+  case $TP in 4) ;; *) echo "engine_defaults: TP=$TP; DeepSeek-V4.1-Flash-1017 wants 4" >&2; return 2 ;; esac
+  local k
+  for k in DFLASH PF_OWN SPEC_ADAPT; do
+    [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: DeepSeek-V4.1-Flash-1017 has no $k" >&2; return 2; }
+  done
+  case ${REUSE:-0} in 0|1) ;; *) echo "engine_defaults: REUSE=${REUSE}: DeepSeek-V4.1-Flash-1017 needs REUSE=0 or 1" >&2; return 2 ;; esac
+  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-1048576}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-0}; SESS=${SESS:-1}
+  # CHUNK: the prompt rows a main step takes (serve v1 runs the prompt as decode steps). 8 is the served-v3 ring-verified rate
+  # (140-145 prompt tok/s against about 37 at 1); the engine takes 1..8 and dies at parse time on more (the MoE slots, B6)
+  CHUNK=${CHUNK:-8}
+  case $CHUNK in [1-8]) ;; *) echo "engine_defaults: CHUNK=$CHUNK: DeepSeek-V4.1-Flash-1017 takes 1 to 8 prompt rows a step" >&2; return 2 ;; esac
+  # EAGER=1 drops --graph (the engine runs each step eagerly): the first light of an op that has never been captured on a GPU
+  EAGER=${EAGER:-0}
+  case $EAGER in 0|1) ;; *) echo "engine_defaults: EAGER=$EAGER: 0 (one captured graph a step) or 1 (eager, no --graph)" >&2; return 2 ;; esac
+  case $MTP in [0-5]) ;; *) echo "engine_defaults: MTP=$MTP: DeepSeek-V4.1-Flash-1017 drafts 0 to 5 (the DSpark block)" >&2; return 2 ;; esac
+  case $SESS in [1-9]|[12][0-9]|3[0-2]) ;; *) echo "engine_defaults: SESS=$SESS: DeepSeek-V4.1-Flash-1017 serves 1 to 32 sessions" >&2; return 2 ;; esac
+  [ $((SESS * (MTP + 1))) -le 32 ] ||
+    { echo "engine_defaults: SESS=$SESS MTP=$MTP: a round of $((SESS * (MTP + 1))) rows; DeepSeek-V4.1-Flash-1017 steps hold 32" >&2; return 2; }
+  # Serve v1 (reports/ds-in-gr8-build/b9-serve-path.md, items 1 and 2; the legate's order of 10-25 6:55 PM PT): one session at
+  # position 0, MTP 0, split 0, no KV store, no prefill (engine_args() passes none). Engram is off unless the box sets
+  # G6ENV_X='G6_DS_ENGRAM=1 G6_DS_ENGRAM_PREFIX=/path/PREFIX' (the token ring of ds41_engram_ops.cuh covers one session from position 0,
+  # MTP 0; the sidecar PREFIX.engram.* must be on every rank, same path; with G6_DS_MTP=k also in G6ENV_X the engine refuses unless
+  # G6_DS_ENGRAM_MTP=1 is there too, g6m4.cu). g6m4_ds41 dies at parse time on the rest; refusing here
+  # saves a boot. Each line below goes when the engine takes the setting (DSpark serve, per-session attention buffers);
+  # test_ds41_serve_args.py holds them.
+  [ "$MTP" = 0 ] || { echo "engine_defaults: MTP=$MTP: DeepSeek-V4.1-Flash-1017 serves with MTP=0 (DSpark serve is not built)" >&2; return 2; }
+  case ${KV_STORE:-} in ''|off) ;; *) echo "engine_defaults: KV_STORE=$KV_STORE: DeepSeek-V4.1-Flash-1017 has no KV store" >&2; return 2 ;; esac
+  local kv kvs engram=0 prefix=0 pmin=0 dsmtp=0
+  read -ra kvs <<<"${G6ENV_X:-}"
+  for kv in ${kvs[@]+"${kvs[@]}"}; do
+    case $kv in
+      G6_DS_PREFILL_MIN=[0-9]*) pmin=${kv#*=} ;;
+      G6_DS_MTP=[0-5]) dsmtp=${kv#*=} ;;
+      G6_DEC_SPLIT=0) ;;
+      G6_DEC_SPLIT=*) echo "engine_defaults: $kv: DeepSeek-V4.1-Flash-1017 serves at G6_DEC_SPLIT=0" >&2; return 2 ;;
+      G6_DS_ENGRAM=1) engram=1 ;;
+      G6_DS_ENGRAM_PREFIX=?*) prefix=1 ;;
+    esac
+  done
+  # Engram ON needs the sidecar PREFIX (the engine dies at parse time without it)
+  [ "$engram" = 0 ] || [ "$prefix" = 1 ] ||
+    { echo "engine_defaults: G6_DS_ENGRAM=1 needs G6_DS_ENGRAM_PREFIX=/path/PREFIX in G6ENV_X (the Engram sidecar, PREFIX.engram.*)" >&2; return 2; }
+  # SESS 2..32: one attention / index / Engram slab per session (CAP rows each), and every prompt of 2+ tokens on the W-row prefill, so a
+  # step of several sessions has the same rows per session (g6m4.cu refuses the same at parse time). With the DSpark draft
+  # (G6_DS_MTP=k) a round of up to 8 sessions is one step: min(SESS, 8) x (k + 1) verify rows and min(SESS, 8) x 5 draft rows within the engine's 48 (G6_MX);
+  # above 8 active sessions S2 dynamically switches to MTP=0 (1 row per session).
+  [ "$SESS" = 1 ] || [ "$pmin" -ge 2 ] ||
+    { echo "engine_defaults: SESS=$SESS: DeepSeek-V4.1-Flash-1017 serves several sessions only with G6_DS_PREFILL_MIN>=2 (and G6_DS_PREFILL_W) in G6ENV_X" >&2; return 2; }
+  local dsmtp_sess=$(( SESS < 8 ? SESS : 8 ))
+  [ "$SESS" = 1 ] || [ "$dsmtp" = 0 ] || { [ $((dsmtp_sess * (dsmtp + 1))) -le 48 ] && [ $((dsmtp_sess * 5)) -le 48 ]; } ||
+    { echo "engine_defaults: SESS=$SESS G6_DS_MTP=$dsmtp: a round of $((dsmtp_sess * (dsmtp + 1))) verify rows; DeepSeek-V4.1-Flash-1017 steps hold 48" >&2; return 2; }
+  S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=${REUSE:-0}
+}
+
 # The pseudo engine: no KV pool to size, MTP, drafter or fabric. CAP bounds a request's prompt plus max_tokens.
 pseudo_defaults() {
   SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-202752}; READY_TMO=${READY_TMO:-60}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
@@ -122,6 +185,7 @@ pseudo_defaults() {
 
 engine_defaults() {
   [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_defaults; return; }
+  [ "${GR8_MODEL:-glm53}" = ds41 ] && { ds41_defaults; return; }
   [ "${GR8_MODEL:-glm53}" = pseudo ] && { pseudo_defaults; return; }
   case $TP in
     4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
@@ -193,8 +257,18 @@ GR8_GLM53F_PF_STAGE_ASYNC=1"
   ENGINE_ENV="$ENGINE_ENV ${EXTRA_ENV:-}"
 }
 
+# DeepSeek-V4.1-Flash-1017: no GLM prefill stack (G6_PF_*), no CP; the DeepSeek-only G6_DS_* variables come in G6ENV_X.
+ds41_env() {
+  ENGINE_BIN=g6m4_ds41
+  # g6m4 turns the GLM-5.3 replicated-GEMV splits on at NR > 1 for any build that is not Flash (g6m4.cu:887-889: G6_QA_SPLIT 2, G6_IDXQ_SPLIT 1,
+  # G6_MTP_SPLIT 1 with --mtp); on DeepSeek TP 4 that asserts in Fabric::init (fabric.cpp:464) after "layers bound" (legate, first light, 10-25
+  # 8:53 PM PT). So all three are 0 unless QA_SPLIT, IDXQ_SPLIT, MTP_SPLIT say otherwise; the plan's env is the same on every rank.
+  ENGINE_ENV="G6_CP=0 G6_PF_RS=0 G6_PF_OWN=0 G6_PF_POOL_OWNER=0 G6_DEC_BK=${DEC_BK:-16384} G6_QA_SPLIT=${QA_SPLIT:-0} G6_IDXQ_SPLIT=${IDXQ_SPLIT:-0} G6_MTP_SPLIT=${MTP_SPLIT:-0} ${KV_SHARE_WHEN:+G6_KV_SHARE_WHEN=$KV_SHARE_WHEN }${G6ENV_X:-}"
+}
+
 engine_env() {
   [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_env; return 0; }
+  [ "${GR8_MODEL:-glm53}" = ds41 ] && { ds41_env; return 0; }
   [ "${GR8_MODEL:-glm53}" = pseudo ] && { ENGINE_BIN=g6pseudo; ENGINE_ENV=""; return 0; }
   ENGINE_BIN=g6m4; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=g6m4-int4
   ENGINE_ENV="GR8_PF_TILE=64 GR8_PF_DENSE=8192 GR8_PF_RS=1 GR8_PF_STREAMS=2 GR8_PF_ATTN_ROWS=${PF_ATTN_ROWS:-1024} GR8_PF_OWN=$PF_OWN \
@@ -352,6 +426,19 @@ engine_args() {
       for t in $KV_STORE; do [ -n "$t" ] && a="$a --kv-store $t"; done
       unset IFS
     fi
+    (set -f; echo $a)
+    return
+  fi
+  # DeepSeek-V4.1-Flash-1017: a release only, CHUNK rows a step for a prompt tail (8 unless set). No --prefill or --pf-lanes: serve
+  # v1 runs the prompt as decode steps and g6m4_ds41 refuses a prefill at parse time (reports/ds-in-gr8-build/b9-serve-path.md,
+  # item 1). tools/launch/test_ds41_serve_args.py holds this line to the set the engine takes.
+  if [ "${GR8_MODEL:-glm53}" = ds41 ]; then
+    a="--image --layers all $src --top-p-cands 256 --chunk $CHUNK --temp 0.7 --cap $CAP --graph \
+--mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
+    [ "${EAGER:-0}" = 1 ] && a=${a/ --graph / }
+    [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
+    [ "${REUSE:-0}" = 1 ] && a="$a --reuse-prefix"
+    [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
     (set -f; echo $a)
     return
   fi

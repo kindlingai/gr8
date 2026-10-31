@@ -163,7 +163,9 @@ int main(int argc, char** argv)
     setvbuf(stdout, nullptr, _IOLBF, 0);
     pf_env_check();                    // strict GR8_PF_* choices: a bad value exits before any work
     // GR8_MOE_TOPK (model change, screen arm): unset = the model's top-k (8, the table's default)
+#if !G6_MODEL_DS41
     static_assert(geom::TOPK == 8, "GR8_MOE_TOPK's default and range (knobs/decode.yaml) are the model's top-k");
+#endif
 #if G6_MODEL_DS41
     const int c8_pack_env = knob::ds_c8pack() ? 1 : 0;
 #endif
@@ -2003,7 +2005,9 @@ int main(int argc, char** argv)
         auto& sc = bc.scheduler;
         sc.epoch = s2epoch; sc.pool_rows = s2sess * (cap / 64 * 64);   // SESS: cap rows per session slot (ds41_native.cuh caps one run at cap)
         sc.max_rows = std::min(MX, std::max({s2sess, std::min(s2sess, 8) * (dsk.mtp + 1), plan.chunk}));
-        sc.max_sessions = s2sess; sc.mtp = dsk.mtp; sc.dynamic_mtp_off = true;
+        sc.max_sessions = s2sess; sc.mtp = dsk.mtp;
+        // drafting stops past the sessions whose verify and 5 draft rows fit one step (at most 8)
+        sc.mtp_sessions = (uint32_t)std::min(sc.max_rows / 5, 8u);
         // Boot evidence for Gate 1 (Legate ruling 2): the DS41 branch never printed its pool, so a gate had nothing real
         // to read. This line names the logical page count, the page size, the session count and the row caps; the plan's
         // /status free_pages == sessions*cap/64 and resident == 0 are checked separately against the head's status.
@@ -2017,7 +2021,7 @@ int main(int argc, char** argv)
         // Engram ON is allowed (B11 W-row prefill: engine max_rows = W, one chunk in flight -- ds41_prefill_single_lane keeps the engine's one slot safe)
         if (pf_min && (pf_min < 2 || m.hc_rows <= MX || m.hc_rows > ds41moe::ROMAX || m.qs.on()))
             die("DS41 prefill first light needs GR8_DS_PREFILL_MIN>=2, MX<W<=" + std::to_string(ds41moe::ROMAX) + ", and QA/QS split off");
-        if (pmin && dsk.prefill_keep != 0)
+        if (pf_min && dsk.prefill_keep != 0)
             die("DS41 prefill first light needs GR8_DS_PREFILL_KEEP=0");
         // GR8_DS_PF_LANES=2 (ds41_lanes.h): two-lane W prefill, quanta of up to 2W rows of one session; unset / 1 = one lane, today's path
         const int pf_lanes = ds41::lanes::parse(DS41_TEXT(knob::ds_pf_lanes()));

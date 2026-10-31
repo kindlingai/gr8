@@ -7,6 +7,7 @@
 #include "ds41_prefill_rows.h"
 #include "ds41_prefill_capacity.h"
 #include "ds41_slots.h"
+#include "ds41_knobs.h"
 extern "C" int ds41_sh_act_quant(const void*,int,uint8_t*,int,uint8_t*,int,int,int,void*);
 // B4's Engram projection hook (ds41_attn_ops.cuh, included below); the Engram wiring (reduce collective, token window, op, knobs) is B11's
 inline int ds41_engram_project(void* model, int e, int rows, void* stream, const __nv_bfloat16* emb, __nv_bfloat16* kv);
