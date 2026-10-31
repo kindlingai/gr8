@@ -169,7 +169,7 @@ int main()
     CHECK(!fab_slot_layout(cfg_of(2048, 4, true, 2 * IL + 1), n, &d));              // P > run 0
     CHECK(fab_slot_layout(cfg_of(2048, 4, true, 2 * IL), n, &d));                   // P = run 0: no reuse
     CHECK(!fab_slot_layout(cfg_of(2048, 4, true, 4), n - 1, &d));                   // run 3 != run 0
-    CHECK(fab_slot_layout(cfg_of(2048, 4, true, 4), n + 1, &d));                    // B12 state collective after AGs
+    CHECK(fab_slot_layout(cfg_of(2048, 4, true, 4), n + 1, &d));                    // the row-shard state collective after the AGs
     CHECK(!fab_slot_layout(cfg_of(2048, 4, true, 4), n + 2, &d));                   // only one extra supported
     FabricConfig u; u.slot_bytes = 4096; u.pool = 2; CHECK(!fab_slot_layout(u, 8, &d));   // no runs
     u.pool = 0; CHECK(fab_slot_layout(u, 8, &d) && d.pool == 0); }

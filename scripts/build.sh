@@ -125,7 +125,7 @@ case "${MODEL:-glm}" in
     [ "${KV_FORMAT:-fp8}" = fp8 ] || { echo "MODEL=ds41: KV_FORMAT=fp8 only"; exit 2; }
     WIDTHS=${GR8_WIDTHS:-${GR8_NR:-4}}
     # PF_FC2GL must divide HID / 128 = 40 (GLM 48: 6; Flash 32: 4; 4 divides 40); build_m4.sh leaves out PF_F12 for every non-GLM model
-    # DS41_WHAT=sim: m4sim only (first light: no g6m4, so no libibverbs and no fabric objects)
+    # DS41_WHAT=sim: m4sim only (no g6m4, so no libibverbs and no fabric objects)
     WIDTHS="$WIDTHS" EXTRA="${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_DS41=1 ${EXTRA:-}" OUT="$OUT/ds41" \
       bash build_m4.sh "${ARCH:-121a}" "${DS41_WHAT:-all}"
     if [ "${DS41_WHAT:-all}" = sim ]; then

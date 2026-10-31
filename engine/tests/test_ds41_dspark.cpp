@@ -158,7 +158,7 @@ int main()
         EXPECT((int)used.size() == dsp::DRAFT_NCOLL && *used.begin() == 0 && *used.rbegin() == dsp::DRAFT_NCOLL - 1);   // 11 distinct, dense
     }
     // (i2) sizes: for every collective of the draft fabric, the bytes the proxy enqueues = the bytes its producer publishes = the bytes its consumer
-    //      waits for, and every collective has exactly one producer and one consumer in the draft plan. First light 10-25 died on c = 6..10: the engine
+    //      waits for, and every collective has exactly one producer and one consumer in the draft plan. An earlier draft plan died on c = 6..10: the engine
     //      enqueued head_bytes(1, 256) = 2080 B, the head merge waited for its tail at 32 B (10 s spin timeout). Roles come from plan_draft, the c of an
     //      op from ds41_step.cuh (publish_attn 2i, publish_ffn 2i+1, consume_attn 2i, consume_ffn 2i+1, finish 2i+1) and ds41_dspark_ops.cuh (markov
     //      step i -> 6 + i), the bytes of the kernels from put_publish (M * (HID * 2 / 16) uint4), Ds41Block (rows * HID * 2) and head_wait_bytes of
