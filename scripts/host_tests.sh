@@ -220,6 +220,7 @@ g++ -std=c++17 -O2 -Wall -DG6_MODEL_FLASH=0 "$REPO/engine/tests/test_flash_s2_co
 # DeepSeek-V4.1-Flash-1017 geometry (engine/model_geom_ds41.h) against the release's config.json
 g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/ds41_geom_dump.cpp" -o "$T/ds41_geom_dump"
 (cd "$REPO/engine/tests" && DS41_GEOM_DUMP="$T/ds41_geom_dump" python3 -m unittest -q test_ds41_geom)
+<<<<<<< HEAD
 # k_comp_commit (engine/attn/ds41_attn.cuh: the compressor's pending half after a partly rejected verify chunk) against
 # token-at-a-time truth, with a negative control
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/tests/test_ds41_comp_commit.cpp" -o "$T/test_ds41_comp_commit"
@@ -263,6 +264,26 @@ if python3 -c "import torch, numpy" 2>/dev/null; then
   python3 "$REPO/engine/attn/tests/ds41_comp_fp8_cpu.py"
 else
   echo "SKIP test_ds41_idx_ref, ds41_kernels_selftest, ds41_comp_fp8_cpu: no torch/numpy"
+=======
+# DeepSeek-V4.1 Engram (engine/engram): the token ring against the reference's positional cache, the W-row prefill path
+# against 32-row slabs (window, hash, fetch on real files, dequant, 4-rank sum, gate, lookahead), the row store on real
+# files, and the boot knobs. The hash and dequant tests against the official reference need its files: run_hash_test.sh
+# and run_math_test.sh.
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/engram" "$REPO/engine/engram/tests/test_ring.cpp" -o "$T/engram_ring_test"
+"$T/engram_ring_test"
+g++ -std=c++17 -O2 -ffp-contract=off -Wall -Wextra -pthread -I "$REPO/engine/engram" "$REPO/engine/engram/tests/test_engram_wide.cpp" \
+  -o "$T/engram_wide_test"
+"$T/engram_wide_test" "$T/engram_wide"
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/engram" "$REPO/engine/engram/tests/test_rowstore.cpp" -o "$T/engram_rowstore_test"
+"$T/engram_rowstore_test" "$T/engram_rowstore" 262144
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/engram/tests/test_boot.cpp" -o "$T/engram_boot_test" "${KNOBS[@]}"
+"$T/engram_boot_test"
+# the W-row wkv's activation quantizer needs cuda_fp8.h, so it runs where the CUDA headers are
+if [ -f /usr/local/cuda/include/cuda_fp8.h ]; then
+  g++ -std=c++17 -O2 -ffp-contract=off -Wall -Wextra -I "$REPO/engine/engram" -I /usr/local/cuda/include \
+    "$REPO/engine/engram/tests/test_act_quant.cpp" -o "$T/engram_act_quant_test"
+  "$T/engram_act_quant_test"
+>>>>>>> origin/ds41-engram
 fi
 python3 "$REPO/engine/tests/test_flash_serve_check.py"
 # Flash serve prefill: the draft cache fill checks the error words once, after its last chunk; every error still fails the request.
