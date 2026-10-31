@@ -8,7 +8,8 @@ options:
     scope: cluster
     doc: >-
       the model: glm53 (GLM-5.3), glm53f (GLM-5.3-Flash) or ds41 (DeepSeek-V4.1-Flash). ./gr8 <model> sets it; the image reads it from docker/.env.
-      up, check, prepare and show-config refuse to run without it, and MODEL must be a release of it. ./gr8 models lists
+      A GR8_MODEL in the config file or the environment that names another model than ./gr8 <model> stops up, check,
+      prepare and show-config. up, check, prepare and show-config refuse to run without it, and MODEL must be a release of it. ./gr8 models lists
       each model's release, TP sizes and variants
   TP:
     scope: cluster
