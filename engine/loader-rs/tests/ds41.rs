@@ -784,7 +784,7 @@ fn engine_load_path_fills_the_image() {
 }
 
 /// The Rust mx4g packer against the C++ one (engine/kernels/mxfp4_pack.h), byte for byte, on random data
-/// with a column slice. Runs when DS41_B6_KERNELS is set.
+/// with a column slice. Runs when GR8_TEST_DS41_KERNELS_DIR is set.
 #[test]
 fn mx4g_matches_the_b6_cpp_packer() {
     let Some(kdir) = gr8knobs::TEST_DS41_KERNELS_DIR.get() else {

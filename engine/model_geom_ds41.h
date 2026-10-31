@@ -80,7 +80,7 @@ constexpr int CAND_TOPK_BLOCKS = 2048;   // [cfg] candidate_topk_blocks
 constexpr int CAND_BLOCK = 8;        // [cfg] candidate_block_size
 constexpr int N_PREFILL_LAYER = 20;  // [der] DeepInfer n_prefill_layer = index of the first ratio-1 layer: layers >= 20 are consumers
 // Bounded replay (YOCO prefill truncation): past the last kv source no layer makes state
-// a later row reads for every position, so a prefill chunk runs layers >= LATE_LAYER_START over its last TAIL_ROWS rows only (G6_DS_PF_TAIL).
+// a later row reads for every position, so a prefill chunk runs layers >= LATE_LAYER_START over its last TAIL_ROWS rows only (GR8_DS_PF_TAIL).
 constexpr int LATE_LAYER_START = 20 + 1;   // [der] max(kv_source_layer_ids) + 1 (SGLang late_layer_start)
 constexpr int TAIL_ROWS = WINDOW;          // [der] default tail: the window a decode step reaches back
 
