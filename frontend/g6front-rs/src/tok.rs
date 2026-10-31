@@ -51,7 +51,18 @@ fn read_json(p: &Path) -> Result<Value, String> {
     serde_json::from_slice(&s).map_err(|e| format!("{}: {e}", p.display()))
 }
 
+/// The text of a `tokenizer_config.json` special-token entry: a string (GLM), or an AddedToken object whose `content` is
+/// the text (DeepSeek: `{"__type": "AddedToken", "content": "<｜end▁of▁sentence｜>", ...}`).
+pub fn token_text(v: &Value) -> Option<&str> {
+    v.as_str().or_else(|| v.get("content")?.as_str())
+}
+
 impl Tok {
+    /// DeepSeek closes the think block with the single `</think>` token, not GLM's "\n" + `</think>` + "\n\n".
+    pub fn use_single_think_close(&mut self) {
+        self.think_close = self.think_end.into_iter().collect();
+    }
+
     pub fn load(dir: &Path) -> Result<Tok, String> {
         let tk = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| format!("tokenizer.json: {e}"))?;
         let tk: &'static Tokenizer = Box::leak(Box::new(tk));
@@ -59,7 +70,7 @@ impl Tok {
         let gp = dir.join("generation_config.json");
         let gen = if gp.exists() { read_json(&gp)? } else { Value::Object(Default::default()) };
         let eos_token = cfg.get("eos_token").cloned().unwrap_or_else(|| Value::from("<|endoftext|>"));
-        let eos_token_id = eos_token.as_str().and_then(|t| tk.token_to_id(t));
+        let eos_token_id = token_text(&eos_token).and_then(|t| tk.token_to_id(t));
         let eos = gen.get("eos_token_id").cloned().unwrap_or_else(|| eos_token_id.map_or(Value::Null, Value::from));
         let eos_ids = match &eos {
             Value::Array(a) => a.iter().filter_map(Value::as_i64).collect(),
@@ -291,6 +302,56 @@ impl Detok {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tokenizer directory like DeepSeek's: the special tokens in tokenizer_config.json are AddedToken objects and
+    /// there is no generation_config.json.
+    fn dict_form_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("g6front-tok-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let added = |id: u32, c: &str, special: bool| {
+            serde_json::json!({"id": id, "content": c, "single_word": false, "lstrip": false, "rstrip": false,
+                               "normalized": false, "special": special})
+        };
+        let tk = serde_json::json!({
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [added(10, "<think>", false), added(11, "</think>", false), added(12, "<|eos|>", true)],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
+            "post_processor": null,
+            "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true},
+            "model": {"type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": null,
+                      "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+                      "vocab": {"a": 0, "b": 1, "c": 2, "Ġ": 3, "Ċ": 4, "ĊĊ": 5, "x": 6, "y": 7, "z": 8, "!": 9},
+                      "merges": ["Ċ Ċ"]}
+        });
+        std::fs::write(dir.join("tokenizer.json"), tk.to_string()).unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"eos_token": {"__type": "AddedToken", "content": "<|eos|>", "lstrip": false, "normalized": true,
+                              "rstrip": false, "single_word": false},
+                "pad_token": {"__type": "AddedToken", "content": "<|eos|>"}}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_added_token_object_names_the_eos_token() {
+        let t = Tok::load(&dict_form_dir("eos")).unwrap();
+        assert_eq!(t.eos_token_id, Some(12));
+        assert_eq!(t.eos_ids, vec![12]);
+        assert_eq!(token_text(&t.eos_token), Some("<|eos|>"));
+        assert_eq!(token_text(&Value::from("x")), Some("x"));
+        assert_eq!(token_text(&Value::Null), None);
+    }
+
+    #[test]
+    fn deepseek_closes_thinking_with_the_one_token() {
+        let mut t = Tok::load(&dict_form_dir("close")).unwrap();
+        assert_eq!(t.think_close, vec![4, 11, 5]); // GLM's close: "\n" + </think> + "\n\n"
+        t.use_single_think_close();
+        assert_eq!(t.think_close, vec![11]);
+    }
 
     /// Parallel == sequential on random text built from every character class around the cut points.
     /// Needs the real tokenizer: GR8_TEST_TOKENIZER_DIR=<dir with tokenizer.json ...> cargo test --release

@@ -49,10 +49,10 @@ impl ChatTemplate {
         let p = dir.join("chat_template.jinja");
         let source = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
         let mut template = Self::from_source(source, eos_token, pad_token)?;
-        let config = std::fs::read_to_string(dir.join("config.json")).ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
-        template.flash_thinking_off = config.as_ref().and_then(|c| c.get("model_type"))
-            .and_then(Value::as_str) == Some("glm5_next");
+        let config =
+            std::fs::read_to_string(dir.join("config.json")).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        template.flash_thinking_off =
+            config.as_ref().and_then(|c| c.get("model_type")).and_then(Value::as_str) == Some("glm5_next");
         Ok(template)
     }
 
@@ -81,15 +81,16 @@ impl ChatTemplate {
         })
     }
 
-    pub fn resolve_thinking(&self, body: &Map<String, Value>, defaults: crate::thinking::Defaults)
-        -> Result<crate::thinking::Thinking, crate::api::ApiError>
-    {
-        if self.flash_thinking_off && body.get("chat_template_kwargs")
-            .and_then(|k| k.get("enable_thinking")) == Some(&Value::Bool(false))
+    pub fn resolve_thinking(
+        &self,
+        body: &Map<String, Value>,
+        defaults: crate::thinking::Defaults,
+    ) -> Result<crate::thinking::Thinking, crate::api::ApiError> {
+        if self.flash_thinking_off
+            && body.get("chat_template_kwargs").and_then(|k| k.get("enable_thinking")) == Some(&Value::Bool(false))
         {
             let mut checked = body.clone();
-            checked.get_mut("chat_template_kwargs").and_then(Value::as_object_mut)
-                .unwrap().remove("enable_thinking");
+            checked.get_mut("chat_template_kwargs").and_then(Value::as_object_mut).unwrap().remove("enable_thinking");
             crate::thinking::resolve(&checked, &self.levels, defaults)
         } else {
             crate::thinking::resolve(body, &self.levels, defaults)
@@ -126,8 +127,8 @@ impl ChatTemplate {
         if continue_final_message && add_generation_prompt {
             return Err("Cannot set both `continue_final_message` and `add_generation_prompt` to True.".into());
         }
-        let close_think = self.flash_thinking_off && add_generation_prompt
-            && kw.get("enable_thinking") == Some(&Value::Bool(false));
+        let close_think =
+            self.flash_thinking_off && add_generation_prompt && kw.get("enable_thinking") == Some(&Value::Bool(false));
         let conv = normalize_messages(messages, self.supports_developer)?;
         // render(messages=, tools=, documents=, add_generation_prompt=, continue_final_message=, **special, **kw)
         let mut ctx = Map::new();

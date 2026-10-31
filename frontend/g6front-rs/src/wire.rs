@@ -284,7 +284,11 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
             b.extend_from_slice(b",\"schema\":");
             pyjson::string(b, s);
         }
-        b.extend_from_slice(if g.strict { b",\"strict\":true,\"after_token\":" } else { b",\"strict\":false,\"after_token\":" });
+        b.extend_from_slice(if g.strict {
+            b",\"strict\":true,\"after_token\":"
+        } else {
+            b",\"strict\":false,\"after_token\":"
+        });
         opt_int(b, g.after_token.map(i64::from));
         b.push(b'}');
     }
