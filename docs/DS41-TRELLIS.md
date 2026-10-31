@@ -120,6 +120,22 @@ attn_out 116 against 115, read-once fc1 55 against 51: the chunk routes to 129-1
 the expert bytes a row fall by a third but the kernels are not bound by them), and more in the consumes (118 against 94
 ms), with the memory gone. The width stays at 1024.
 
+### The projections on the tensor cores
+
+`GR8_DS_ATTN_TC=1` (default off: the five attention projections at 9 or more rows on the block-scaled tensor-core GEMM
+k_gemm_mx8t, the same MXFP8 operands) against the same single-lane W 1024 run without it, `GR8_DS_SPAN=2` on in both:
+
+| | 8K | 32K | 128K | a 1024-row pass | attn_proj | attn_out |
+|---|---|---|---|---|---|---|
+| CUDA-core GEMM (the default) | 1,946 | 1,940 | 1,806 tok/s | 553 ms | 119.5 ms | 115.0 ms |
+| GR8_DS_ATTN_TC=1 | 2,998 | 3,057 | 2,828 tok/s | 351 ms | 15.5 ms | 19.1 ms |
+
+The projections fall from 42% of the pass to 10%, the prefill rate rises 54-58% at every length, and the multi-agent
+aggregates (short prompts, 256-token answers) go from 47 / 70 to 84.5 / 111.7 tok/s at 2 / 4 streams; decode is
+unchanged (74.5 / 47.3 against 74.5 / 48.5 tok/s, within the spread). The two runs' prefill answers agree token for
+token (RigMark samples, so the decode answers vary within a run either way). The remaining pass is the read-once MoE
+(96 ms), the two consumes (90 ms), the indexer (32 ms), Engram (26 ms) and the attention core (20 ms).
+
 ### The fabric
 
 The raw links, measured with ib_write_bw between every pair of boxes (64 KiB writes, 8 s, RoCE v2) with the engines
