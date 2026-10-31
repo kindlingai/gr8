@@ -16,7 +16,19 @@
 
 namespace g6kv
 {
-#if G6_MODEL_FLASH
+#if G6_MODEL_DS41
+// DeepSeek-V4.1-Flash-1017 (docs/DEEPSEEK.md, docs/DEEPSEEK-ATTN-B.md; the rows are the release's own, engine/attn/ds41_idx.cuh):
+//   ca row (compressed KV, 512 wide, rope tail included) 288 B = [256 B FP4 e2m1 codes, element 2i in the LOW nibble][32 B E4M3 scales, one per 16 dims]
+//   ica row (index key, 128 wide)                         68 B = [64 B FP4 codes][4 B E8M0 scales, one per 32 dims], stored PLANAR per page
+//                                                              (all the page's codes, then all its scale words) so both planes stay aligned
+// Only the four KV-source layers 2, 8, 14, 20 own rows (ratio 2: 32 rows per 64-token page; ratio 1: 64 rows). Per 64-token page:
+// L2/8/14 each 32 x 288 = 9,216 B ca + 32 x 68 = 2,176 B ica; L20 64 x 288 = 18,432 B + 64 x 68 = 4,352 B; 56,960 B in all = 890 B/token.
+// Every layer also keeps a WINDOW = 128 token ring of its own wkv rows (fp8-valued rows), outside this pool.
+constexpr int ROW = 288, IDX_ROW = 68, PAGE = 64;   // bytes of one ca row / one ica row; the kvman page is 64 tokens
+constexpr int CA_CODES = 256, CA_SF_OFF = 256, ICA_CODES = 64, ICA_SF = 4;
+constexpr int CA_PAGE_R2 = 32 * ROW, ICA_PAGE_R2 = 32 * IDX_ROW, CA_PAGE_R1 = 64 * ROW, ICA_PAGE_R1 = 64 * IDX_ROW;   // 9216, 2176, 18432, 4352
+constexpr const char* NAME = "ds41-fp4";
+#elif G6_MODEL_FLASH
 // GLM 5.3 Flash (attn/flash_attn.cu): NoPE MLA, the 512-d latent only (kv_a_layernorm applied), selected by
 // G6_FLASH_KV_FP8 (default 0):
 //   0  1024 B: [512 BF16]
@@ -51,7 +63,7 @@ constexpr const char* NAME = "int4g32h";
 constexpr int ROW = 528 + 2 * geom::QK_ROPE, SCALE_OFF = 512, ROPE_OFF = 528;
 constexpr const char* NAME = "fp8";
 #endif
-#if !G6_MODEL_FLASH
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41
 constexpr int IDX_ROW = 132;
 #endif
 // both latent rows by name, whatever the build's row is, for code that converts one to the other (the remote rows

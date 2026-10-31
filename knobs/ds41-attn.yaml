@@ -1,0 +1,193 @@
+# DeepSeek-V4.1-Flash only: its attention block, its indexer and the DSpark drafter's attention. knobs/README.md
+# describes the fields.
+prefix: "GR8_DS"
+knobs:
+  GR8_DS_ATTN_CPA:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = the attention core gathers its K rows with cp.async (k_attn_cpa). The output is bit-identical to k_attn.
+  GR8_DS_ATTN_GV:
+    scope: agree
+    kind: flag
+    default: "1"
+    doc: >-
+      Decode projections of up to 8 rows run on the MXFP8 GEMV where the weight has .mx.gv records. 0 = the
+      generic MXFP8 GEMM for every projection.
+  GR8_DS_ATTN_GV_KS:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0.."
+    doc: >-
+      k-parts per output tile of the attention GEMV. 0 = the built-in pick per shape (gv_pick_ks).
+  GR8_DS_ATTN_GV_TPC:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0.."
+    doc: >-
+      Output tiles per CTA of the attention GEMV. 0 keeps the built-in 1.
+  GR8_DS_ATTN_PW:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0.."
+    doc: >-
+      Prefill row capacity of the attention ops, apart from the decode width MX. A value above MX gives every layer
+      a window ring of 128 + PW - 1 slots and one scratch that all layers share, and lets one op take PW rows. 0, or
+      a value up to MX, keeps the per-layer scratch and the MX row limit.
+  GR8_DS_ATTN_SPLIT:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = two CTAs per row and head group in the attention core, joined by an online-softmax merge. Needs
+      GR8_DS_ATTN_CPA=1.
+  GR8_DS_ATTN_TC:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = the five attention projections at 9 or more rows run on the block-scaled tensor-core GEMM (k_gemm_mx8t)
+      where the shape allows it.
+  GR8_DS_ATTN_TC_MF:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0|1|2"
+    doc: >-
+      Grid order of the tensor-core GEMM: 0 = the N tile is the fastest grid dimension, 1 = the M tile is, 2 = the M
+      tile only for a weight of 100 MiB or more (the Engram wkv).
+  GR8_DS_C2_TRACE:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = count every launch of the coalesced-epilogue wo_b GEMM (k_gemm_mx8t_c2), so a run can print
+      ds41a::c2_dispatch_count() at stop.
+  GR8_DS_COMP_FP8:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = the ratio-2 compressor weights are packed to E4M3 with UE8M0 scales at bind time and prefill steps of 9
+      or more rows use them. Lossy, and its effect on quality has not been measured.
+  GR8_DS_DSP_GV:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = the DSpark drafter's projections run on the MXFP8 GEMV for 1 to 8 rows. A projection that cannot take the
+      GEMV then stops the process. 0 = the generic MXFP8 GEMM.
+  GR8_DS_DSP_TC:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = a DSpark prefill projection of more than 8 rows in one group runs on the attention block's tensor-core
+      MXFP8 GEMM (ds41_gemm_mx_tc) when that entry takes the shape, else on the generic GEMM.
+  GR8_DS_SRC_FAST:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0..3"
+    doc: >-
+      Bits of the source-layer fast paths: 1 = the ratio-2 compressor projections of up to 8 rows use k_f32gemv2
+      (bit-identical to k_f32gemm2), 2 = the indexer's wq_b runs on the MXFP8 GEMV (a different summation order).
+  GR8_DS_WOB_PERSIST:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = the coalesced-epilogue wo_b GEMM of a direct-send prefill chunk runs as a persistent kernel
+      (k_gemm_mx8t_c2_persist).
+  GR8_DS41_BORROW_TOPK:
+    scope: agree
+    kind: path
+    unset: "unset: a reuse layer whose index source is outside the layer subset reads the last list written"
+    doc: >-
+      A file of raw int32 [rows][512] top-k lists. A run over a layer subset reads it in place of an index source
+      that the subset leaves out.
+  GR8_DS41_IDX_DENSE_MAXK:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0.."
+    doc: >-
+      Layers 24 to 36 run the dense index stage in place of the candidate-block path while a chunk's key bound is
+      at most this many keys. 0 = always the candidate path.
+  GR8_DS41_IDX_LOGITS:
+    scope: agree
+    kind: text
+    default: "mma"
+    values: "mma|dp4a|mmafast"
+    doc: >-
+      Kernel of the dense index logits: mma = tensor cores, bit-identical to dp4a; dp4a = the reference kernel;
+      mmafast = tensor cores with their own fp32 rounding.
+  GR8_DS41_IDX_MAXK:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0.."
+    doc: >-
+      Upper bound on the keys of the dense index grid, below the pool capacity. For bring-up. 0 = no bound.
+  GR8_DS41_IDX_PIPE_B:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = the dense index logits of the source layers 2, 8, 14 and 20 run on the pipelined kernel
+      (launch_logits_pipe). The candidate layers keep their path.
+  GR8_DS41_IDX_PIPE_QR:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = the dense index logits run on the query-stationary cp.async kernel (launch_logits_pipe_qr).
+  GR8_DS41_IDX_PW:
+    scope: agree
+    kind: int
+    unset: "MX, the decode width"
+    values: "0..65536"
+    doc: >-
+      Prefill chunk width of the indexer: every per-row buffer of the indexer holds max(MX, PW) rows. The step
+      driver's per-row arrays must hold the same number of rows.
+  GR8_DS41_IDX_PWK:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0.."
+    doc: >-
+      Ratio-1 key rows the indexer scratch holds logits for, when that is below capacity plus rows. It bounds the
+      largest position the indexer serves. 0 = capacity plus rows.
+  GR8_DS41_IDX_Q_TRIG:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = the index query's rope sin and cos are computed once per row and cached.
+  GR8_DS41_IDX_REUSE:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = layers 24 to 36 keep layer 20's top-512 list and run no wq_b, logits or top-k of their own; layer 20 then
+      skips its candidate blocks.
+  GR8_DS41_IDX_TOPK:
+    scope: agree
+    kind: text
+    default: "mc"
+    values: "mc|1cta"
+    doc: >-
+      Top-k kernel of the dense index stage: mc = several CTAs per long row, 1cta = the single-CTA reference kernel.
+      Both give the same lists.
+  GR8_DS41_IDX_WQB_TC:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0.."
+    doc: >-
+      The indexer's wq_b runs on the attention block's tensor-core GEMM at this many rows or more. Not bit-exact
+      against the scalar GEMM. 0 = off.

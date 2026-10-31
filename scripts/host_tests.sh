@@ -220,6 +220,50 @@ g++ -std=c++17 -O2 -Wall -DG6_MODEL_FLASH=0 "$REPO/engine/tests/test_flash_s2_co
 # DeepSeek-V4.1-Flash-1017 geometry (engine/model_geom_ds41.h) against the release's config.json
 g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/ds41_geom_dump.cpp" -o "$T/ds41_geom_dump"
 (cd "$REPO/engine/tests" && DS41_GEOM_DUMP="$T/ds41_geom_dump" python3 -m unittest -q test_ds41_geom)
+# k_comp_commit (engine/attn/ds41_attn.cuh: the compressor's pending half after a partly rejected verify chunk) against
+# token-at-a-time truth, with a negative control
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/tests/test_ds41_comp_commit.cpp" -o "$T/test_ds41_comp_commit"
+"$T/test_ds41_comp_commit"
+# the DS41 attention weight binding (engine/attn/ds41_attn_plan.h) against the planner's lists for TP1 rank 0, TP2 rank 1 and
+# TP4 ranks 0 and 3; it needs the CUDA headers, not a GPU
+if [ -f /usr/local/cuda/include/cuda_runtime.h ]; then
+  g++ -std=c++17 -O1 -I /usr/local/cuda/include -I "$REPO/engine" "$REPO/engine/attn/tests/ds41_attn_bind_test.cpp" -o "$T/ds41_attn_bind_test"
+  "$T/ds41_attn_bind_test" "$REPO"/engine/attn/tests/data/ds41plan_tp*_attn.txt
+else
+  echo "SKIP ds41_attn_bind_test: no CUDA headers"
+fi
+# k_kv_prep's window-ring retention (engine/attn/ds41_ring_keep.h): per slot run at SESS > 1, the DS41 ragged pack at ring 175
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/attn" "$REPO/engine/attn/tests/ds41_ring_keep_test.cpp" -o "$T/ds41_ring_keep_test"
+"$T/ds41_ring_keep_test"
+# CPU models of DS41 attention kernels: the two-CTA attention merge (GR8_DS_ATTN_SPLIT), the source-layer fast paths
+# (GR8_DS_SRC_FAST) and the indexer's query-stationary logits (GR8_DS41_IDX_PIPE_QR)
+g++ -std=c++17 -O2 -Wall -Wextra "$REPO/engine/attn/tests/ds41_attn_split_ref_test.cpp" -o "$T/ds41_attn_split_ref_test"
+"$T/ds41_attn_split_ref_test"
+g++ -std=c++17 -O2 -ffp-contract=off -Wall -Wextra -I "$REPO/engine" "$REPO/engine/attn/tests/ds41_src_fast_test.cpp" -o "$T/ds41_src_fast_test"
+"$T/ds41_src_fast_test"
+g++ -std=c++17 -O2 -Wall -Wextra "$REPO/engine/attn/tests/ds41_indexer_qr_ref_test.cpp" -o "$T/ds41_indexer_qr_ref_test"
+"$T/ds41_indexer_qr_ref_test"
+# source rules of the DS41 attention ops: the prefill row capacity (GR8_DS_ATTN_PW) and its window ring, the persistent wo_b
+# and compressor FP8 arms (both default off)
+(cd "$REPO/engine/tests" && python3 -B -m unittest -q test_ds41_attn_pw)
+python3 -B "$REPO/engine/attn/tests/ds41_dense_early_cpu.py"
+# GR8_DS41_IDX_PIPE_B through the knob table; the indexer's ica page stride keeps every 16-byte code load of the pipelined
+# logits aligned
+g++ -std=c++17 -O2 -Wall -Wextra "$REPO/engine/tests/test_ds41_idx_pipe_env.cpp" -o "$T/test_ds41_idx_pipe_env" "${KNOBS[@]}"
+"$T/test_ds41_idx_pipe_env"
+g++ -std=c++17 -O2 -Wall -Wextra "$REPO/engine/tests/test_ds41_idx_ica_alignment.cpp" -o "$T/test_ds41_idx_ica_alignment"
+"$T/test_ds41_idx_ica_alignment"
+# the indexer's pipe wiring and its dispatch with both pipe knobs off (reads engine/runtime/g6m4.cu)
+(cd "$REPO/engine/tests" && python3 -B -m unittest -q test_ds41_idx_pipe_dispatch)
+# the DS41 torch-CPU references (the indexer and row producers, the CPU oracle's leaf kernels, the compressor FP8 prepack);
+# the rest of this file needs no torch, so these skip without it
+if python3 -c "import torch, numpy" 2>/dev/null; then
+  (cd "$REPO/engine/tests" && python3 -m unittest -q test_ds41_idx_ref)
+  python3 "$REPO/engine/ref/ds41/ds41_kernels_selftest.py"
+  python3 "$REPO/engine/attn/tests/ds41_comp_fp8_cpu.py"
+else
+  echo "SKIP test_ds41_idx_ref, ds41_kernels_selftest, ds41_comp_fp8_cpu: no torch/numpy"
+fi
 python3 "$REPO/engine/tests/test_flash_serve_check.py"
 # Flash serve prefill: the draft cache fill checks the error words once, after its last chunk; every error still fails the request.
 python3 "$REPO/engine/tests/test_flash_serve_prefill_check.py"
