@@ -53,7 +53,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_DEC_SPLIT` | int | `0` | 0.. | Captures the decode step as two graphs split at this layer, so the second submission overlaps the first one's GPU time. Needs --graph. 0: one graph. |
 | `GR8_DFL_BODY_I4` | flag | `0` | 0\|1 | The DFlash2 drafter's body GEMVs read INT4 g32 copies of their MXFP8 records, made at boot. Drafts only, +382 MB per rank. Needs --dflash-manifest. |
 | `GR8_DFL_HEAD_I4` | flag | `0` | 0\|1 | The DFlash2 drafter's lm_head GEMV reads INT4 g32 records, the same ones as GR8_DRAFT_HEAD_I4. Drafts only. Needs --dflash-manifest. |
-| `GR8_DFL_PFCTX` | flag | `1` |  | With --dflash, 0 gives the drafter no prompt context from the prefill, so it starts from the last prompt token. Flash --prefill with --dflash needs 0. |
+| `GR8_DFL_PFCTX` | flag | `1` |  | With --dflash, 0 gives the drafter no prompt context from the prefill, so it starts from the last prompt token. |
 | `GR8_DFL_REUSE` | int | 2 when serving DFlash2 with MTP, else 0 | 0..2 | With DFlash2 under S2, 1 lets a request whose prefix-reuse hit landed in the drafter's window keep the drafter, and 2 also gives the drafter to a request alone on MTP. |
 | `GR8_DFL_REUSE_MIN` | int | `256` | 0..2048 | With GR8_DFL_REUSE, the context rows the drafter must hold before it drafts. Until then the request runs MTP rounds that feed it. |
 | `GR8_DFL_SEL_ALPHA` | float | `1` |  | The DFlash2 selector walk scores each candidate as logit + a * correction instead of logit + correction. Drafts only. Needs --dflash-manifest and the selector. |

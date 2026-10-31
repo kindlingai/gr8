@@ -33,8 +33,9 @@
 // The target step writes its residual rows after the tapped layers into Dfl::feat (Model::dfl_tap, inside its graph;
 // Flash: the mean of the four mHC streams).
 // Prompt context: the prefill sub-batches write the owner rows of the last WIN prompt positions into Dfl::pf_feat
-// (Prefill::dfl_tap); after the prefill, fill steps gather them 8 rows at a time (collectives 0..NT-1: every rank's rows,
-// zero where it is not the owner, summed: exact) and run the context part on them (fc slices on collective NT).
+// (Prefill::dfl_tap, FlashPrefill::dfl_tap); after the prefill, fill steps gather them 8 rows at a time (collectives
+// 0..NT-1: every rank's rows, zero where it is not the owner, summed: exact) and run the context part on them (fc
+// slices on collective NT).
 #pragma once
 #include "prefill.cuh"
 
@@ -532,6 +533,16 @@ __global__ void __launch_bounds__(256) k_pf_tap(const float* resid, const int* p
     if (p < lo || p >= hi) return;
     pf[((size_t)(p - lo) * NT + s) * HID + c] = __float2half_rn(resid[(size_t)j * HID + c] * FEAT_SCALE);
 }
+#if G6_MODEL_FLASH
+// the same from the mHC streams [rows][4][HID]: their mean, as k_tap_mhc
+__global__ void __launch_bounds__(256) k_pf_tap_mhc(const float* streams, const int* pos, int r0, int lo, int hi, __half* pf, int s)
+{
+    const int j = r0 + blockIdx.y, c = blockIdx.x * 256 + threadIdx.x, p = pos[j];
+    if (p < lo || p >= hi) return;
+    const float* x = streams + (size_t)j * 4 * HID + c;
+    pf[((size_t)(p - lo) * NT + s) * HID + c] = __float2half_rn((x[0] + x[HID] + x[2 * HID] + x[3 * HID]) * .25f * FEAT_SCALE);
+}
+#endif
 // fill: pf_feat rows ctx_pos0 - lo .. (+ B, zero past ctx_rows) of tap s -> send slot of collective s, then publish.
 // grid 1, block 128
 __global__ void __launch_bounds__(128) k_fill_put(const __half* pf, const int* cell, int s, g6::FabricDev f, const u64* stepp, unsigned* ticket)
@@ -1086,6 +1097,24 @@ inline void dfl_pf_tap_launch(Model& m, Prefill& P, int i, int M, cudaStream_t s
         if (rows > 0) dflk::k_pf_tap<<<dim3(HID / 256, rows), 256, 0, st>>>(P.resid, P.pos, r0, D->pf_lo, D->pf_hi, D->pf_feat, s);
     }
 }
+#if G6_MODEL_FLASH
+// FlashPrefill::dfl_tap hook, after layer i's second consume: the streams' owner rows under GR8_GLM53F_PF_SP (the other
+// rows' streams are stale here), else rank 0's (every rank updates every row). A template: dfltest calls it without
+// flash_prefill.cuh
+template <class Pf>
+inline void dfl_pf_tap_flash(Model& m, Pf& P, int i, int M, cudaStream_t st)
+{
+    Dfl* D = dfl_of(m);
+    if (!D->pf_feat || D->pf_hi <= D->pf_lo) return;
+    for (int s = 0; s < dfl::NT; ++s)
+    {
+        if (D->tlayer[s] != m.layers[i].l) continue;
+        const bool sp = knob::glm53f_pf_sp();
+        const int r0 = sp ? pf_r0(M, P.f.rank, P.f.nr) : 0, rows = sp ? pf_rows(M, P.f.rank, P.f.nr) : P.f.rank == 0 ? M : 0;
+        if (rows > 0) dflk::k_pf_tap_mhc<<<dim3(HID / 256, rows), 256, 0, st>>>(P.resid4, P.pos, r0, D->pf_lo, D->pf_hi, D->pf_feat, s);
+    }
+}
+#endif
 inline void dfl_attach(Model& m, Dfl& D)
 {
     for (int s = 0; s < dfl::NT; ++s)

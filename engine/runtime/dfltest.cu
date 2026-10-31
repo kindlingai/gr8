@@ -13,6 +13,8 @@
 // rows but the last chunk's go through fill steps instead (dfl_fill_phase, the served prompt-context path): each row
 // in Dfl::pf_feat of one rank (row i on rank i % NR, zeros elsewhere, as the prefill's owner rows), gathered over the
 // loopback, with collective NT (the fc slices; under REP the 0-byte barrier). Every output must equal the run without.
+// Flash: pf_feat is written by the prefill's hook, dfl_pf_tap_flash, from streams with their mean on the rows a rank
+// keeps and NaN on the others. With GR8_GLM53F_PF_SP=1 those are its owner rows, else every rank holds every row.
 #include <cstdio>
 #include <vector>
 #include "packfind.h"
@@ -113,6 +115,37 @@ int main(int argc, char** argv)
     if (fill)                         // the prompt-context taps: row i (position p0 + i) on rank i % NR
     {
         if (n > dfl::WIN) die("--fill: at most WIN context rows");
+#if G6_MODEL_FLASH
+        struct { float* resid4; int* pos; g6::FabricDev f; } P{dmalloc<float>((size_t)n * 4 * HID), dmalloc<int>(n), {}};
+        std::vector<int> pos(n);
+        for (int i = 0; i < n; ++i) pos[i] = p0 + i;
+        G6RT_CK(cudaMemcpy(P.pos, pos.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+        const bool sp = knob::glm53f_pf_sp();
+        for (int r = 0; r < NR; ++r)
+        {
+            D[r].pf_lo = p0; D[r].pf_hi = p0 + n;
+            G6RT_CK(cudaMemsetAsync(D[r].pf_feat, 0, (size_t)n * dfl::NT * HID * 2, st));
+            dfl_of(M[r]) = &D[r];
+            M[r].layers.resize(1);
+            P.f.rank = r; P.f.nr = NR;
+            const int j0 = sp ? pf_r0(n, r, NR) : 0, j1 = sp ? j0 + pf_rows(n, r, NR) : n;
+            for (int s = 0; s < dfl::NT; ++s)
+            {
+                std::vector<float> v((size_t)n * 4 * HID, NAN);
+                for (int j = j0; j < j1; ++j)
+                    for (int c = 0; c < HID; ++c)   // streams x, x, 2x, 0: an exact mean, and a wrong stream shows
+                    {
+                        const float x = feat[((size_t)j * dfl::NT + s) * HID + c];
+                        float* w = v.data() + (size_t)j * 4 * HID + c;
+                        w[0] = w[HID] = x; w[2 * HID] = 2 * x; w[3 * HID] = 0.f;
+                    }
+                G6RT_CK(cudaMemcpy(P.resid4, v.data(), v.size() * 4, cudaMemcpyHostToDevice));
+                M[r].layers[0].l = D[r].tlayer[s];
+                dfl_pf_tap_flash(M[r], P, 0, n, st);
+                G6RT_CK(cudaStreamSynchronize(st));
+            }
+        }
+#else
         for (int r = 0; r < NR; ++r)
         {
             std::vector<__half> pf((size_t)n * dfl::NT * HID, __float2half(0.f));
@@ -121,6 +154,7 @@ int main(int argc, char** argv)
             G6RT_CK(cudaMemcpy(D[r].pf_feat, pf.data(), pf.size() * 2, cudaMemcpyHostToDevice));
             D[r].pf_lo = p0; D[r].pf_hi = p0 + n;
         }
+#endif
     }
     for (int c = 0; c < nch; ++c)
     {
