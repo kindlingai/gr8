@@ -178,7 +178,8 @@ knobs:
     default: "0"
     values: "0|1"
     doc: >-
-      Prints the host time of each step's spans.
+      Prints the GPU time of each plan unit (attention, consume, MoE, head, ...) summed over the layers: every eager step,
+      and for a captured step graph the mean per step over 64 sampled replays (every 64th replay is read).
   GR8_DS_STRIPE:
     scope: agree
     kind: flag

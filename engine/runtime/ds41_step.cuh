@@ -787,9 +787,24 @@ inline void ds41_subdump(Model& m,int i,const char* what,const void* dev,int M,c
 // GR8_DS_SPAN=1: per-unit GPU time spans (cudaEvent pair around each plan unit on the rank's stream), summed over the layers and printed once
 // per step on stderr: "# span step S rank R: attn x ms cons_a y ms mlp z ms cons_f w ms ..." (head_local + head_merge = head, step_out = deliver).
 // A span is the stream time between its two events: a consume unit includes the wait for the other ranks' partials (the simulated ranks share
-// one GPU). Eager steps only; the events of step S are read at the start of step S+1 and by ds41_span_flush() at the end of the run.
+// one GPU). Eager: the events of step S are read at the start of step S+1 and by ds41_span_flush() at the end of the run.
+// A captured step (served decode): the event pairs are nodes of that graph, kept in the Ds41SpanSet its capture names in ds41_span_sink;
+// ds41_span_replayed reads them after every 64th replay of the graph and prints the mean per step of the last 64.
 struct Ds41Span { int rank,layer,unit; cudaEvent_t a,b; };
 inline std::vector<Ds41Span>& ds41_spans() { static std::vector<Ds41Span> v; return v; }
+struct Ds41SpanSet { std::vector<Ds41Span> v; double tot[ds41::U_COUNT]={}; int reads=0, launches=0; };
+inline thread_local Ds41SpanSet* ds41_span_sink=nullptr;
+inline void ds41_span_replayed(Ds41SpanSet& g,const char* what,int M) {
+    if(g.v.empty() || ++g.launches%64) return;
+    cudaEventSynchronize(g.v.back().b);
+    for(const Ds41Span& s:g.v) { float ms=0; cudaEventElapsedTime(&ms,s.a,s.b); g.tot[s.unit]+=ms; }
+    if(++g.reads<64) return;
+    fprintf(stderr,"# span %sM=%d rank %d, per step over %d sampled replays:",what,M,g.v[0].rank,g.reads);
+    for(int u=0;u<ds41::U_COUNT;++u) if(g.tot[u]>0) fprintf(stderr," %s %.3f ms",ds41::unit_name((ds41::Unit)u),g.tot[u]/g.reads);
+    fprintf(stderr,"\n");
+    for(double& t:g.tot) t=0;
+    g.reads=0;
+}
 inline bool ds41_span_on() { return knob::ds_span(); }
 inline void ds41_span_flush() {
     std::vector<Ds41Span>& v=ds41_spans(); if(v.empty()) return;
@@ -823,17 +838,18 @@ inline void ds41_unit_run(Model& m,ds41::Unit u,int ui,int M,cudaStream_t st) {
 inline bool ds41_diag_any() { return ds41_feed_dir() || ds41_subdump_dir() || ds41_span_on(); }
 inline void ds41_unit(Model& m,ds41::Unit u,int ui,int M,cudaStream_t st) {
     if(!ds41_diag_any()) { ds41_unit_run(m,u,ui,M,st); return; }
-    if(u==ds41::U_EMBED && m.rank==0 && ds41_span_on()) ds41_span_flush();   // the previous step is complete (m4sim syncs after every step)
+    if(u==ds41::U_EMBED && m.rank==0 && ds41_span_on() && !ds41_span_sink) ds41_span_flush();   // the previous eager step is complete (m4sim syncs after every step)
     if(u==ds41::U_ATTN) ds41_feed_stage(m,ui,false,M,st);
     if(u==ds41::U_MLP) {
         if(m.rank==0) ds41_subdump(m,ui,"ffn_in",m.hc_y,M,st);   // the engine's own, before a feed replaces it
         ds41_feed_stage(m,ui,true,M,st);
     }
     Ds41Span sp{m.rank,ui,(int)u,nullptr,nullptr};
-    const bool span=ds41_span_on();
-    if(span) { ds41_diag_eager(st,"GR8_DS_SPAN"); cudaEventCreate(&sp.a); cudaEventCreate(&sp.b); cudaEventRecord(sp.a,st); }
+    cudaStreamCaptureStatus cs=cudaStreamCaptureStatusNone;
+    const bool span=ds41_span_on() && (cudaStreamIsCapturing(st,&cs)!=cudaSuccess || cs==cudaStreamCaptureStatusNone || ds41_span_sink);
+    if(span) { cudaEventCreate(&sp.a); cudaEventCreate(&sp.b); cudaEventRecord(sp.a,st); }
     ds41_unit_run(m,u,ui,M,st);
-    if(span) { cudaEventRecord(sp.b,st); ds41_spans().push_back(sp); }
+    if(span) { cudaEventRecord(sp.b,st); (cs==cudaStreamCaptureStatusNone ? ds41_spans() : ds41_span_sink->v).push_back(sp); }
     if(u==ds41::U_ATTN) ds41_subdump(m,ui,"attn_part",m.sc.part[0],M,st);
     if(u==ds41::U_MLP) ds41_subdump(m,ui,"ffn_part",m.sc.part[1],M,st);
 }

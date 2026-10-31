@@ -1733,6 +1733,14 @@ int main(int argc, char** argv)
     cudaGraphExec_t exec_ms[NBK][33][7] = {}, exec2_ms[NBK][33][7] = {};
     cudaGraphExec_t exec_ms_dec[NBK][33][7] = {};
 #endif
+#if G6_MODEL_DS41
+    std::map<const cudaGraphExec_t*, Ds41SpanSet> span_sets;   // GR8_DS_SPAN: the spans of each captured step graph
+    auto replayed = [&](const cudaGraphExec_t* ex, int M) {
+        if (!ds41_span_on()) return;
+        const auto it = span_sets.find(ex);
+        if (it != span_sets.end()) ds41_span_replayed(it->second, m.ds_ns > 1 ? "sessions " : "", M);
+    };
+#endif
     auto launch_main = [&](int k, int M) {
 #if G6_MODEL_DS41
         const bool decode_graph = ds41_moe_topk::graph_kind(m.ds_moe_decode_step, ds_moe_main_topk, ds_moe_decode_topk);
@@ -1743,21 +1751,32 @@ int main(int argc, char** argv)
                           (decode_graph ? exec_ms_dec[k][ns][rps] : exec_ms[k][ns][rps]), "DS41 SESS graph not captured");
             G6RT_CK(cudaGraphLaunch(decode_graph ? exec_ms_dec[k][ns][rps] : exec_ms[k][ns][rps], st));
             if (gsplit) G6RT_CK(cudaGraphLaunch(exec2_ms[k][ns][rps], st));
+            replayed(decode_graph ? &exec_ms_dec[k][ns][rps] : &exec_ms[k][ns][rps], M);
             return;
         }
         if (decode_graph) {
             g6s2::require(exec_dec[k][M], "DS41 decode graph not captured");
             G6RT_CK(cudaGraphLaunch(exec_dec[k][M], st));
+            replayed(&exec_dec[k][M], M);
             return;
         }
 #endif
         G6RT_CK(cudaGraphLaunch(exec[k][M], st));
         if (gsplit) G6RT_CK(cudaGraphLaunch(exec2[k][M], st));
+#if G6_MODEL_DS41
+        replayed(&exec[k][M], M);
+#endif
     };
     auto capture = [&](const std::function<void()>& body, cudaGraphExec_t* ex, const char* what, int M) {
         cudaGraph_t g;
         G6RT_CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+#if G6_MODEL_DS41
+        if (ds41_span_on()) ds41_span_sink = &span_sets[ex];
+#endif
         body();
+#if G6_MODEL_DS41
+        ds41_span_sink = nullptr;
+#endif
         G6RT_CK(cudaStreamEndCapture(st, &g));
         size_t nodes = 0;
         G6RT_CK(cudaGraphGetNodes(g, nullptr, &nodes));

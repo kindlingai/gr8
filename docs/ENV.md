@@ -324,7 +324,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_DS_ENGRAM_WAYS` | int | `16` | 1..16 | Ways of the set-associative Engram row cache. |
 | `GR8_DS_FEED_DIR` | path | off |  | Debug: a directory of reference activations the step driver feeds in place of its own, layer by layer. |
 | `GR8_DS_MOE_ELOG` | flag | `1` |  | 1: every prefill router call (more than 32 rows) writes the distinct experts of each layer to a device ring that the host reads after the chunk. 0: no record is written. |
-| `GR8_DS_SPAN` | flag | `0` | 0\|1 | Prints the host time of each step's spans. |
+| `GR8_DS_SPAN` | flag | `0` | 0\|1 | Prints the GPU time of each plan unit (attention, consume, MoE, head, ...) summed over the layers: every eager step, and for a captured step graph the mean per step over 64 sampled replays (every 64th replay is read). |
 | `GR8_DS_SUBDUMP` | path | off |  | Debug: a directory where each step's sub-layer partials are written. |
 | `GR8_DS_XTRACE` | flag | `0` | 0\|1 | With GR8_XTRACE=1 and DSpark, also trace the DSpark draft fabric. |
 | `GR8_FABRIC_CONNECT_TRIES` | int | `1200` |  | Fabric TCP connect attempts, 100 ms apart. Raise it when ranks load at different speeds. |
