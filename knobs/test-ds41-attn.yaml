@@ -1,0 +1,11 @@
+# DeepSeek-V4.1-Flash attention tests only, never read by a serving engine. knobs/README.md describes the fields.
+prefix: "GR8_TEST_"
+scope: test
+knobs:
+  GR8_TEST_DS41_MGATE_DIAG:
+    kind: flag
+    default: "0"
+    legacy: ["MGATE_DIAG"]
+    doc: >-
+      ds41_attn_test --mgate: 1 prints, for a kv compare that differs, up to 8 differing elements of the chunk and of
+      the single-row calls, before and after kv prep.

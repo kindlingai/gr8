@@ -26,6 +26,7 @@ constexpr float RMS_EPS = 1e-20f;    // [cfg] rms_norm_eps (not 1e-5)
 constexpr float RMS_EPS_FLASH = RMS_EPS;    // the name engine/mhc uses for the mHC flat norm
 constexpr int DENSE_I = 0;           // [shape] no dense MLP layer: all 40 layers are MoE
 constexpr bool is_moe(int l) { return l >= 0 && l < NLAYERS; }
+constexpr int DFL_L = 5, DFL_NT = 5, DFL_NH = 32;   // runtime/dflash.cuh compiles in every build; DS41 has no DFlash2 drafter
 
 // --- attention: one shared KV head of 512 (K == V), 64 query heads, grouped low-rank output ---
 constexpr int HEADS = 64;            // [cfg] num_attention_heads

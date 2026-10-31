@@ -25,7 +25,7 @@
 inline dslot::Slot make_flash_slot(const Model& m, int c)
 {
     dslot::Slot q;
-    q.send = m.f.send; q.bell = m.f.doorbell; q.stepp = m.stepp; q.stride = m.f.stride;
+    q.send = m.f.send; q.bell = m.f.doorbell; q.stepp = m.stepp; q.half = g6::fab_slot_base(m.f, m.f.ncoll); q.off = g6::fab_slot_base(m.f, c);
     q.ncoll = m.f.ncoll; q.c = c; q.ticket = m.tickets + c; q.xt = m.f.xt;
     return q;
 }

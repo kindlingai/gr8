@@ -235,7 +235,7 @@ static std::vector<unsigned short> run_fin(const FinStep& s,bool sh,bool bf,bool
         char* send=mem.alloc<char>(4*stride); CK(cudaMemset(send,0x5a,4*stride));
         auto* bell=mem.alloc<unsigned long long>(2); auto* ticket=mem.alloc<unsigned>(1); auto* step=mem.alloc<u64>(1);
         const u64 one=1; CK(cudaMemcpy(step,&one,sizeof one,cudaMemcpyHostToDevice));
-        a.slot={send,bell,step,stride,2,1,ticket,nullptr};
+        a.slot={send,bell,step,2*stride,stride,2,1,ticket,nullptr};
         target=reinterpret_cast<const unsigned short*>(send+((1&1)*2+1)*stride);
     }
 #else

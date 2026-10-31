@@ -1,8 +1,7 @@
-// K = 0: a Batch without a draft head (DS41 with no drafter, --mtp 0). One round = ONE main step, one row per session; no DRAFT
+// K = 0: a Batch without a draft head (DS41 with no drafter, --mtp 0). One round = one main step, one row per session; no DRAFT
 // step and no CHAIN step is ever run (the DS41 build has no MTP layer, so a draft step would run GLM's), and St::d is never
-// written past its end. Also pins the K >= 1 behaviour: the digest lines (DIGEST K=...) of this test are the same before
-// and after the K = 0 edit of s2_batch.h / scheduler.h / sessions.h (compare the stdout of this file built against the
-// two trees: step counts by kind, row count, St::d / St::dlm sizes, an order-sensitive hash of every step, the tokens).
+// written past its end. Also pins the K >= 1 behaviour: the digest lines (DIGEST K=...) of this test let two trees of
+// s2_batch.h / scheduler.h / sessions.h be compared (build this file against each and compare the stdout: step counts by kind, row count, St::d / St::dlm sizes, an order-sensitive hash of every step, the tokens).
 // Host only. Build (ASAN + UBSAN + container checks catch a write past St::d):
 //   g++ -std=c++17 -O1 -g -fsanitize=address,undefined -D_GLIBCXX_ASSERTIONS
 //       -I engine/runtime engine/runtime/s2/tests/batch_k0_test.cpp -o /tmp/batch_k0_test
@@ -352,7 +351,7 @@ static void config_payload()
 #if G6_MODEL_DS41
     CHECK(!threw);
 #else
-    CHECK(threw);                                         // GLM / Flash: mtp must be 1..7, as before
+    CHECK(threw);                                         // GLM / Flash: mtp must be 1..7
 #endif
     Config c = z;
     c.mtp = 2;

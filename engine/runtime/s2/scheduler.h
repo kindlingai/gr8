@@ -77,10 +77,11 @@ struct Config {
     uint32_t r2_rows = 0;
     // GR8_S2_TAIL_FIRST=1: a session whose prompt is prefilled (only its tail left) is served before any prefill, owed or
     // not, and its tail does not ask for a decode round (Scheduler::alternate), so a burst of short prompts reaches its
-    // first tokens one tail per step instead of after every prefill and a decode round per tail. false = as before.
+    // first tokens one tail per step instead of after every prefill and a decode round per tail. false = off: a tail
+    // takes its turn like a prefill and asks for a decode round.
     bool tail_first = false;            // after cp_seg, for the same reason
     // GR8_S2_NOTICE_MAX=<k>: the notice target's cap, NOTICE_MIN..NOTICE_MAX boundaries (horizon(), service.h event).
-    // NOTICE_MAX (8) = as before. Lower only from a measured margin: a notice that lands after its boundary is fatal
+    // NOTICE_MAX (8) is the default. Lower only from a measured margin: a notice that lands after its boundary is fatal
     uint32_t notice_max = uint32_t(NOTICE_MAX);   // after tail_first, for the same reason
     // DS41 only: short fresh prompts prefill together in one ragged pass, then share one prompt-tail step
     bool c8_pack = false;

@@ -82,7 +82,7 @@ static uint64_t expected_horizon(const Scheduler& s, Alt a)
     return s.boundary() + NOTICE_MAX;
 }
 
-// The F3H c8 shape: session 1 (39 tokens) decoding, then 7 prompts of 39 tokens admitted at one held boundary.
+// The measured c8 shape: session 1 (39 tokens) decoding, then 7 prompts of 39 tokens admitted at one held boundary.
 // Returns the step pattern until every session decodes and fills `first` with each new session's first-token step.
 static std::string burst(bool tf, std::vector<unsigned>& first)
 {
@@ -163,12 +163,12 @@ static void f3h_replay()
     };
     const auto r_off = replay(false), r_on = replay(true);
     auto show = [](const char* n, const std::vector<Ev>& v) {
-        std::printf("scheduler_tail_first_test: F3H replay %s:", n);
+        std::printf("scheduler_tail_first_test: measured replay %s:", n);
         for (const auto& e : v) std::printf(" %llu%c@%u", (unsigned long long)e.req, letter(e.kind), 1183 + e.rel);
         std::printf("\n");
     };
     show("off", r_off); show("on ", r_on);
-    CHECK(same(r_off, off));                                   // the logged F3H order, boundary for boundary
+    CHECK(same(r_off, off));                                   // the logged order, boundary for boundary
     CHECK(same(r_on, on));
 }
 

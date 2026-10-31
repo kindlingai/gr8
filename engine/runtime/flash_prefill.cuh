@@ -844,7 +844,7 @@ inline void pf_stage_issue(FlashPrefill& P, int c, int M, cudaStream_t st)
     for (int p = 0; p < g6nr::NR; ++p)
     {
         if (p == P.f.rank) continue;
-        const char* src = P.f.recv + (((size_t)(P.cur_step & 1) * P.f.ncoll + c) * P.f.nr + p) * P.f.stride;
+        const char* src = P.f.recv + g6::fab_recv_off(P.f, (int)(P.cur_step & 1), c, p);
         G6RT_CK(cudaMemcpyAsync(S.peer[p], src, payload, cudaMemcpyDefault, S.stream));
     }
     G6RT_CK(cudaEventRecord(S.ready, S.stream));
@@ -930,7 +930,7 @@ inline bool pf_consume_launch(Model& m, FlashPrefill& P, const PfView& V, int i,
 // recv slot of collective c from rank p, this lane's current layer-step parity (host address of the pinned region)
 inline const char* pf_sp_slot(const FlashPrefill& P, int c, int p)
 {
-    return P.f.recv + (((size_t)(P.cur_step & 1) * P.f.ncoll + c) * P.f.nr + p) * P.f.stride;
+    return P.f.recv + g6::fab_recv_off(P.f, (int)(P.cur_step & 1), c, p);
 }
 // on the lane's copy stream, ordered after what st has queued: wait for collective c's peer data, copy it to device
 // memory (RS: this rank's slices -> sp_peer; AG: peer rows -> xn2 / xn at their row offsets), then sp_ready[c].
@@ -1141,7 +1141,7 @@ inline void pf_consume_flash(Model& m, FlashPrefill& P, int i, int c, int M, cud
     if (stage)   // the peer's partial: pinned fabric slot -> device memory by the copy engine (GPU loads of pinned are slow)
     {
         const int p = 1 - P.f.rank;
-        const char* src = P.f.recv + (((size_t)(P.cur_step & 1) * P.f.ncoll + c) * P.f.nr + p) * P.f.stride;
+        const char* src = P.f.recv + g6::fab_recv_off(P.f, (int)(P.cur_step & 1), c, p);
         G6RT_CK(cudaMemcpyAsync(P.peer_dev, src, payload, cudaMemcpyDefault, st));
     }
     if (pf_fuse < 2 || stage) pf_comm_xt(P, c, 2, st);

@@ -120,7 +120,7 @@ public:
     static Request request(uint64_t id, const g6rt::ServeReq& r) {
         return {id, uint32_t(r.prompt.size()), uint32_t(r.n_gen), r.steering};
     }
-#if G6_MODEL_DS41   // DS41 serve v1 has no tensor prefill: every prompt runs as decode steps from position 0 (Driver decode_prompt), unless prefill_min admits it (ds41_prefill.h)
+#if G6_MODEL_DS41   // DS41 by default has no tensor prefill: every prompt runs as decode steps from position 0 (Driver decode_prompt), unless prefill_min admits it (ds41_prefill.h)
     Payload payload(const g6rt::ServeReq& r) const {
         return {r.prompt, chunk_, ds41_decode_prompt(prefill_min_, r.prompt.size(), r.plp, r.steering.enabled), r.ins, r.steering, r.gram};
     }

@@ -41,7 +41,7 @@ constexpr size_t QC = (size_t)4096 * geom::QA, QS = (size_t)4096 * (geom::QA / 3
                  UK = (size_t)16 * 192 * 512 * 2, UV = (size_t)16 * 256 * 512 * 2, QV = (size_t)4096 * 2, OV = (size_t)4096 * 2;
 constexpr size_t OFF_QC = 0, OFF_QS = OFF_QC + QC, OFF_OC = OFF_QS + QS, OFF_OS = OFF_OC + OC, OFF_UK = OFF_OS + OS,
                  OFF_UV = OFF_UK + UK, OFF_QV = OFF_UV + UV, OFF_OV = OFF_QV + QV, HALF = OFF_OV + OV;
-#if !G6_MODEL_FLASH   // the QO pair still carries the GLM MLA UK [16][192][512] (rope part); Flash NoPE is ENGINE-PLAN W5/W9
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41   // DS41: the half image of its QP wire is not sized yet (prefill, second wave); the QO pair still carries the GLM MLA UK [16][192][512] (rope part); Flash NoPE is ENGINE-PLAN W5/W9
 static_assert(HALF == 41943040 + 16384, "half image: 40 MiB + 16 KiB per pair member and layer");
 #endif
 constexpr size_t OT = (size_t)32 * 128 * geom::HID / 2;   // a dense trellis o_proj half: 32 K4 entries of 128 input rows x HID

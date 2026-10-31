@@ -1,0 +1,12 @@
+# DeepSeek-V4.1-Flash MoE test programs, never read by a serving engine. knobs/README.md describes the fields.
+prefix: "GR8_TEST_"
+scope: test
+knobs:
+  GR8_TEST_DS41_RO_CAP_MB:
+    kind: float
+    default: "400"
+    values: "0.."
+    legacy: []
+    doc: >-
+      ds_ro_flags_test: the memory cap in MB on the test's device and host allocations. A mode that would allocate more
+      stops before it runs.

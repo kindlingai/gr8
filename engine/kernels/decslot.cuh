@@ -14,7 +14,7 @@ struct Slot
     char* send = nullptr;                 // FabricDev::send; nullptr = slot mode off (the producer writes its staging)
     unsigned long long* bell = nullptr;   // FabricDev::doorbell
     const u64* stepp = nullptr;           // device step cell
-    size_t stride = 0;
+    size_t half = 0, off = 0;             // one parity of the send area, collective c's slot in it (g6::fab_slot_base)
     int ncoll = 0, c = 0;
     unsigned* ticket = nullptr;           // device, zero; one per collective
     unsigned long long* xt = nullptr;     // FabricDev::xt (GR8_XTRACE records, xtrace.h); nullptr = off (default)
@@ -22,7 +22,7 @@ struct Slot
 
 __device__ __forceinline__ char* ptr(const Slot& s)
 {
-    return s.send + ((size_t)(*s.stepp & 1) * s.ncoll + s.c) * s.stride;
+    return s.send + (size_t)(*s.stepp & 1) * s.half + s.off;
 }
 
 // All threads of every CTA, after the CTA's last store into the slot (stored = this thread stored into it).

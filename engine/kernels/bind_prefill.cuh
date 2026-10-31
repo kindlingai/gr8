@@ -5304,7 +5304,9 @@ inline void launch_route_rows(const Expert& A, cudaStream_t st)     // logits ->
         case 4: k_pf_route<4><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
         case 5: k_pf_route<5><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
         case 6: k_pf_route<6><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
+#if !G6_MODEL_DS41   // TOPK 6 (docs/DEEPSEEK.md): the instance would fail k_pf_route's K <= TOPK assert
         case 7: k_pf_route<7><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
+#endif
         default: k_pf_route<TOPK><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
     }
 }
