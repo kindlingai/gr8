@@ -1244,7 +1244,8 @@ fn manifest_json(img: &V2Image, shas: &[String], nr: usize) -> String {
     let mut out = format!("{{\n \"align\": 4096,\n \"format\": \"g6pack-v1\",\n \"model\": \"deepseek-v4.1-flash-1017\",\n \"pack_bytes\": {},\n \"rank\": {},\n \"tp\": {},\n \"tensors\": [", img.bytes, img.rank, nr);
     for (i, t) in img.tensors.iter().enumerate() {
         let shape: Vec<String> = t.shape.iter().map(i64::to_string).collect();
-        out += &format!("{}\n  {{\"dtype\": {}, \"name\": {}, \"nbytes\": {}, \"offset\": {}, \"sha256\": \"{}\", \"shape\": [{}]}}",
+        let xf = t.expert_format.as_deref().map_or(String::new(), |x| format!(", \"expert_format\": {}", q(x)));
+        out += &format!("{}\n  {{\"dtype\": {}, \"name\": {}, \"nbytes\": {}, \"offset\": {}, \"sha256\": \"{}\", \"shape\": [{}]{xf}}}",
                         if i > 0 { "," } else { "" }, q(&t.dtype), q(&t.name), t.nbytes, t.offset, shas[i], shape.join(", "));
     }
     out + "\n ]\n}\n"
