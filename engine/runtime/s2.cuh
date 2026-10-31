@@ -253,7 +253,7 @@ inline void s2_set_exclusive(Model& m, int q)
 // stay allocated but unused while s2on.
 inline void s2_init(Model& m, int nslots, cudaStream_t st)
 {
-    if (nslots < 1 || nslots > S2N) die("s2: 1..8 session slots");
+    if (nslots < 1 || nslots > S2N) die("s2: 1..S2N session slots");
     S2Model* s = new S2Model();
     s->graph = m.graph;
     s->nslots = nslots;
@@ -876,7 +876,7 @@ __global__ void __launch_bounds__(256) k_s2_draft_hid(S2Hid<T> a)
 {
     __shared__ S2In sh;
     const int t = threadIdx.x;
-    if (t < (int)(sizeof(S2In) / 4)) reinterpret_cast<uint32_t*>(&sh)[t] = __ldcv(a.in + t);
+    s2in_copy(reinterpret_cast<uint32_t*>(&sh), a.in, t, 256);
     __syncthreads();
     const int b = blockIdx.x;
     int j = 0;
@@ -915,7 +915,7 @@ __global__ void __launch_bounds__(256) k_s2_draft_keep(S2Keep<T> a)
 {
     __shared__ S2In sh;
     const int t = threadIdx.x;
-    if (t < (int)(sizeof(S2In) / 4)) reinterpret_cast<uint32_t*>(&sh)[t] = __ldcv(a.in + t);
+    s2in_copy(reinterpret_cast<uint32_t*>(&sh), a.in, t, 256);
     __syncthreads();
     const int j = blockIdx.x;
     if (j >= sh.ns) return;

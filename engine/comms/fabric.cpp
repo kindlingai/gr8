@@ -1,6 +1,7 @@
 // gr8 fabric implementation (fabric.h).
 #include "fabric.h"
 #include "bulk_proxy.h"
+#include "fabric_order.h"
 #include "fabric_mtu.h"
 #include "progress_cpus.h"
 #include "relay.h"
@@ -42,9 +43,6 @@ namespace g6 {
 static int g_rank = -1;
 
 namespace {
-// bit c of a 32-bit collective mask; c >= 32 is never set (a plain `m >> c` is undefined there: ncoll = 2 NL + 1)
-inline bool bit(unsigned m, size_t c) { return c < 32 && (m >> c & 1u); }
-
 std::string slurp(const std::string& p) { std::ifstream f(p); std::string s; std::getline(f, s); return s; }
 
 struct DevInfo { std::string dev, netdev; int gid_index = -1; };
@@ -291,8 +289,9 @@ void relay_loop(int cpu) {
     }
   }
 }
-struct Job { unsigned long long step; std::vector<uint32_t> sizes; unsigned rs_mask = 0; size_t rs_ss = 0; std::vector<uint32_t> rs_bytes; unsigned skip = 0;
-             unsigned p2p = 0; int peer = -1; bool bulk = false; Fabric::BulkJob b; };
+struct Job { unsigned long long step; std::vector<uint32_t> sizes; CollMask rs_mask; size_t rs_ss = 0; std::vector<uint32_t> rs_bytes; CollMask skip;
+             CollMask rs_flat; CollMask p2p; int peer = -1; std::vector<int> order; bool bulk = false; Fabric::BulkJob b;
+             std::vector<int> credit; };   // fab_pool_credits of this step (empty = pool off)
 }  // namespace
 
 struct Fabric::Impl {
@@ -328,9 +327,19 @@ struct Fabric::Impl {
   uint64_t ring_addr = 0; uint32_t ring_rkey = 0;
   volatile unsigned* err = nullptr;
   // the number of WRs post(p, wr) puts on the send queue
-  int wrs(int p, const ibv_send_wr& wr) const {
-    const uint32_t len = wr.sg_list[0].length;
-    return ring && p == dia && len > (uint32_t)kRelayInline ? 2 * (int)((len + kRelayChunk - 1) / kRelayChunk) : 1;
+  int wrs(int p, const ibv_send_wr& wr) {
+    if (!ring || p != dia) return 1;
+    return relay_plan_wrs(segs.data(), plan(wr));
+  }
+  // the relay plan of a diagonal write (relay.h relay_plan) into segs; returns the segment count
+  std::vector<RelaySeg> segs = std::vector<RelaySeg>(kRelayPlanMax);
+  int plan(const ibv_send_wr& wr) {
+    FCHECK(wr.opcode == IBV_WR_RDMA_WRITE && wr.num_sge >= 1 && wr.num_sge <= 2);
+    uint64_t src[2]; uint32_t len[2];
+    for (int k = 0; k < wr.num_sge; ++k) { src[k] = wr.sg_list[k].addr; len[k] = wr.sg_list[k].length; }
+    const int n = relay_plan(wr.wr.rdma.remote_addr - peer[dia].addr, src, len, wr.num_sge, (uint32_t)kRelayInline, segs.data(), kRelayPlanMax);
+    FCHECK(n > 0);
+    return n;
   }
   // post one write to peer p. The diagonal peer: each chunk of the payload goes into the relay ring, then a SEND gives
   // its position and destination offset (or the SEND carries a short payload itself). The last SEND takes the write's
@@ -339,19 +348,22 @@ struct Fabric::Impl {
   void post(int p, ibv_send_wr& wr) {
     ibv_send_wr* bad = nullptr;
     if (!ring || p != dia) { FCHECK(ibv_post_send(qp[p], &wr, &bad) == 0); return; }
-    FCHECK(wr.num_sge == 1 && wr.opcode == IBV_WR_RDMA_WRITE);
-    const uint64_t off = wr.wr.rdma.remote_addr - peer[p].addr, src = wr.sg_list[0].addr;
-    const uint32_t len = wr.sg_list[0].length, lkey = wr.sg_list[0].lkey;
-    RelayHdr h{off, 0, len, 1};
+    const int ns = plan(wr);                         // relay.h relay_plan: payload chunks / inline, then the tail word of a 2-sge write
+    const uint32_t lkey = wr.sg_list[0].lkey;
+    RelayHdr h{};
     ibv_sge hs[2]; hs[0] = ibv_sge{(uint64_t)&h, (uint32_t)sizeof h, 0};
     ibv_send_wr s{}; s.opcode = IBV_WR_SEND; s.sg_list = hs; s.num_sge = 1;
-    if (len <= (uint32_t)kRelayInline) {
-      hs[1] = ibv_sge{src, len, 0}; s.num_sge = 2;
-      s.wr_id = wr.wr_id; s.send_flags = IBV_SEND_INLINE | (wr.send_flags & IBV_SEND_SIGNALED);
-      FCHECK(ibv_post_send(qp[p], &s, &bad) == 0); return;
-    }
-    for (uint32_t at = 0; at < len; at += kRelayChunk) {
-      const uint32_t n = len - at < kRelayChunk ? len - at : kRelayChunk;
+    for (int k = 0; k < ns; ++k) {
+      const RelaySeg& g = segs[k];
+      const uint32_t n = g.len;
+      if (g.inl) {
+        h = RelayHdr{g.off, 0, n, 1};
+        hs[1] = ibv_sge{g.src, n, 0}; s.num_sge = 2;
+        s.wr_id = g.last ? wr.wr_id : 0; s.send_flags = IBV_SEND_INLINE | (g.last ? (wr.send_flags & IBV_SEND_SIGNALED) : 0);
+        FCHECK(ibv_post_send(qp[p], &s, &bad) == 0);
+        continue;
+      }
+      s.num_sge = 1;
       uint64_t pos;
       const auto t0 = std::chrono::steady_clock::now();
       while (!rout.reserve(n, kRelayRing, __atomic_load_n(credit, __ATOMIC_ACQUIRE), &pos)) {
@@ -363,12 +375,11 @@ struct Fabric::Impl {
           return;
         }
       }
-      ibv_sge ds{src + at, n, lkey};
+      ibv_sge ds{g.src, n, lkey};
       ibv_send_wr w{}; w.opcode = IBV_WR_RDMA_WRITE; w.sg_list = &ds; w.num_sge = 1; w.next = &s;
       w.wr.rdma.remote_addr = ring_addr + pos % kRelayRing; w.wr.rdma.rkey = ring_rkey;
-      h = RelayHdr{off + at, pos, n, 0};
-      const bool last = at + n == len;
-      s.wr_id = last ? wr.wr_id : 0; s.send_flags = IBV_SEND_INLINE | (last ? (wr.send_flags & IBV_SEND_SIGNALED) : 0);
+      h = RelayHdr{g.off, pos, n, 0};
+      s.wr_id = g.last ? wr.wr_id : 0; s.send_flags = IBV_SEND_INLINE | (g.last ? (wr.send_flags & IBV_SEND_SIGNALED) : 0);
       FCHECK(ibv_post_send(qp[p], &w, &bad) == 0);
     }
   }
@@ -484,8 +495,13 @@ void Fabric::init(const FabricConfig& cfg) {
     I.batches.assign(nr, {}); I.inflight.assign(nr, 0);
   } else {
   const size_t stride = I.var ? 0 : (cfg.slot_bytes + 8 + 255) & ~size_t(255);
-  const size_t send_bytes = I.var ? I.L.send_bytes() : 2 * (size_t)cfg.ncoll * stride;
-  const size_t recv_bytes = I.var ? I.L.recv_bytes() : 2 * (size_t)cfg.ncoll * nr * stride;
+  FabricDev rl{};                                                      // slot runs (FabricConfig::run1); off = one run
+  FCHECK(fab_runs_allowed(cfg, I.var) && (!cfg.compact || !I.var));
+  if (!I.var) FCHECK(fab_slot_layout(cfg, cfg_.ncoll, &rl) && rl.stride == stride);
+  const size_t half = fab_slot_base(rl, cfg_.ncoll);                   // one parity of the send area (= ncoll * stride, one run)
+  const size_t send_bytes = I.var ? I.L.send_bytes() : 2 * half;
+  rl.nr = nr; rl.compact = cfg.compact ? 1 : 0;
+  const size_t recv_bytes = I.var ? I.L.recv_bytes() : fab_recv_bytes(rl);
   const size_t db_bytes = (size_t)cfg_.ncoll * 8;
   I.region_bytes = ((send_bytes + recv_bytes + db_bytes + 64) + 4095) & ~size_t(4095);
   CUCHECK(cudaHostAlloc((void**)&I.region, I.region_bytes, cudaHostAllocMapped | cudaHostAllocPortable));
@@ -498,6 +514,10 @@ void Fabric::init(const FabricConfig& cfg) {
   dev_.doorbell = (unsigned long long*)(I.region + send_bytes + recv_bytes);
   dev_.error = (unsigned int*)(I.region + send_bytes + recv_bytes + db_bytes);
   dev_.rank = cfg.rank; dev_.nr = nr; dev_.ncoll = cfg_.ncoll; dev_.stride = stride;
+  dev_.c1 = rl.c1; dev_.c2 = rl.c2; dev_.stride1 = rl.stride1; dev_.stride2 = rl.stride2; dev_.c3 = rl.c3; dev_.stride3 = rl.stride3;
+  dev_.compact = rl.compact;
+  dev_.pool = I.var ? 0 : rl.pool;
+  if (dev_.pool) fprintf(stderr, "[fabric r%d] slot pool: run 0 and run 3 hold %d slots each (%zu B a rank)\n", cfg.rank, dev_.pool, send_bytes + recv_bytes);
   if (cfg.xtrace && !I.var && xtrace_env()) {        // stage-0 trace (default off)
     I.xgpu = xt_alloc(cfg_.ncoll); dev_.xt = I.xgpu;
     I.xt = I.xgpu != nullptr;
@@ -569,14 +589,15 @@ void Fabric::init(const FabricConfig& cfg) {
     const int inl = I.bulk ? 64 : 0;
     I.qp.assign(nr, nullptr); I.unsignaled.assign(nr, 0); I.peer.resize(nr);
     RingInfo mi{};
-    ibv_qp* qdn = mkqp(I.rails[0], nullptr, 2048, 1, 1, inl, nullptr);
-    ibv_qp* qdp = mkqp(I.rails[1], nullptr, 2048, 1, 1, inl, nullptr);
+    const int dsge = cfg.sge2 ? 2 : 1;                 // a flat RS slice is payload + tail word (2 SGEs)
+    ibv_qp* qdn = mkqp(I.rails[0], nullptr, 2048, 1, dsge, inl, nullptr);
+    ibv_qp* qdp = mkqp(I.rails[1], nullptr, 2048, 1, dsge, inl, nullptr);
     mi.dn = info(qdn, I.rails[0], I.rails[0].mr->rkey, recv, 1);
     mi.dp = info(qdp, I.rails[1], I.rails[1].mr->rkey, recv, 2);
     ibv_qp *qdn2 = nullptr, *qdp2 = nullptr;
     if (rstripe) {
-      qdn2 = mkqp(I.rails[2], nullptr, 2048, 1, 1, inl, nullptr);
-      qdp2 = mkqp(I.rails[3], nullptr, 2048, 1, 1, inl, nullptr);
+      qdn2 = mkqp(I.rails[2], nullptr, 2048, 1, dsge, inl, nullptr);
+      qdp2 = mkqp(I.rails[3], nullptr, 2048, 1, dsge, inl, nullptr);
       mi.dn2 = info(qdn2, I.rails[2], I.rails[2].mr->rkey, recv, 7);
       mi.dp2 = info(qdp2, I.rails[3], I.rails[3].mr->rkey, recv, 8);
       mi.stripe = 1;
@@ -681,7 +702,7 @@ void Fabric::init(const FabricConfig& cfg) {
     Rail& R = rail_q(p, k);
     ibv_qp*& q = k == 0 ? I.qp[p] : I.qp2[p];
     ibv_qp_init_attr ia{}; ia.send_cq = R.cq; ia.recv_cq = R.cq; ia.qp_type = IBV_QPT_RC;
-    ia.cap.max_send_wr = 2048; ia.cap.max_recv_wr = 1; ia.cap.max_send_sge = 1; ia.cap.max_recv_sge = 1;
+    ia.cap.max_send_wr = 2048; ia.cap.max_recv_wr = 1; ia.cap.max_send_sge = cfg.sge2 ? 2 : 1; ia.cap.max_recv_sge = 1;
     if (I.bulk) ia.cap.max_inline_data = 64;            // bulk: 8-B flag writes go inline
     q = ibv_create_qp(R.pd, &ia); FCHECK(q); live(kLiveQp, 1);
     ibv_qp_attr at{}; at.qp_state = IBV_QPS_INIT; at.port_num = 1; at.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
@@ -731,13 +752,27 @@ void Fabric::enqueue_step(unsigned long long step, const std::vector<uint32_t>& 
     FCHECK(!rs.mask && !rs.skip);
     for (size_t c = 0; c < sizes.size(); c++) FCHECK(sizes[c] <= impl_->L.cap[c] && sizes[c] % 8 == 0);
   } else
-  for (size_t c = 0; c < sizes.size(); c++) if (!bit(rs.mask, c)) FCHECK(sizes[c] + 8 <= dev_.stride && sizes[c] % 8 == 0);
+  for (size_t c = 0; c < sizes.size(); c++) if (!mask_bit(rs.mask, c)) FCHECK(fab_slot_fits(dev_, (int)c, sizes[c]));
+  FCHECK(!(rs.mask.any() || rs.skip.any()) || (size_t)cfg_.ncoll <= CollMask::kBits);   // every masked c is addressable
+  FCHECK(!(rs.flat & ~rs.mask) && (!rs.flat || cfg_.sge2));   // flat slices are RS slices, and need the 2-SGE QPs
   if (rs.mask) {
     FCHECK((int)rs.bytes.size() == nranks() && rs.ss % 8 == 0);
-    for (uint32_t b : rs.bytes) FCHECK(b % 8 == 0 && b + 8 <= rs.ss && rs.ss * nranks() <= dev_.stride);
+    for (uint32_t b : rs.bytes) FCHECK(b % 8 == 0 && (rs.flat ? b <= rs.ss : b + 8 <= rs.ss) && rs.ss * nranks() <= dev_.stride);
+    // flat: NR slices of ss, then NR tail words
+    for (size_t c = 0; c < sizes.size(); c++) if (mask_bit(rs.flat, c)) FCHECK(rs.ss * nranks() + 8 * (size_t)nranks() <= fab_slot_stride(dev_, (int)c));
+    for (size_t c = 0; c < sizes.size(); c++) if (mask_bit(rs.mask, c) && !mask_bit(rs.flat, c)) FCHECK(rs.ss * nranks() <= fab_slot_stride(dev_, (int)c));
   }
-  FCHECK((rs.p2p & ~rs.mask) == 0 && (!rs.p2p || (rs.peer >= 0 && rs.peer < nranks() && rs.peer != cfg_.rank)));
-  { std::lock_guard<std::mutex> lk(impl_->mu); impl_->q.push_back(Job{step, sizes, rs.mask, rs.ss, rs.bytes, rs.skip, rs.p2p, rs.peer}); impl_->pending++; }
+  FCHECK(!(rs.p2p & ~rs.mask) && (!rs.p2p || (rs.peer >= 0 && rs.peer < nranks() && rs.peer != cfg_.rank)));
+  if (const char* e = order_error(rs.order, sizes.size())) { fprintf(stderr, "[fabric r%d] enqueue_step %llu: %s\n", cfg_.rank, step, e); FCHECK(!e); }
+  std::vector<int> credit;                            // the credit collective of each pooled c (fab_pool_credits)
+  if (dev_.pool) {
+    FCHECK(!rs.p2p);                                  // a p2p collective reaches one peer: no credit tail from the others
+    std::vector<int> walk;
+    const size_t n = rs.order.empty() ? sizes.size() : rs.order.size();
+    for (size_t k = 0; k < n; k++) { const int c = rs.order.empty() ? (int)k : rs.order[k]; if (!mask_bit(rs.skip, (size_t)c)) walk.push_back(c); }
+    if (!fab_pool_credits(dev_, walk, &credit)) { fprintf(stderr, "[fabric r%d] enqueue_step %llu: slot pool %d has no credit collective (two users of one slot back to back)\n", cfg_.rank, step, dev_.pool); FCHECK(false); }
+  }
+  { std::lock_guard<std::mutex> lk(impl_->mu); { Job j{step, sizes, rs.mask, rs.ss, rs.bytes, rs.skip}; j.rs_flat = rs.flat; j.p2p = rs.p2p; j.peer = rs.peer; j.order = rs.order; j.credit = std::move(credit); impl_->q.push_back(std::move(j)); } impl_->pending++; }
   impl_->cv.notify_one();
 }
 
@@ -865,7 +900,7 @@ void Fabric::start_proxy() {
     // striped write to peer p (FabricConfig::stripe_min): [0, h) on qp2 (other rail, signaled), [h, nb) on qp. Every
     // striped peer's halves are posted first (stripe_post), then stripe_finish waits for all the qp2 completions and posts
     // each peer's 8-B tail [nb, nb + 8) on qp (ordered after [h, nb) on that QP), so both peers' writes are in flight at once.
-    struct StripeW { int p; char* sp; uint32_t nb; size_t roff; };
+    struct StripeW { int p; char* sp; uint32_t nb; size_t roff; char* tw; };   // tw: the 8-B tail word (sp + nb, or a flat slice's tail word)
     auto stripe_post = [&](int p, char* sp, uint32_t nb, size_t roff, uint64_t* xr) {
       const uint32_t h = (nb / 2) & ~4095u;
       Rail& R = I.rails[I.rail_of(p, me)];
@@ -908,7 +943,7 @@ void Fabric::start_proxy() {
         const int p = sw[i].p;
         Rail& R = I.rails[I.rail_of(p, me)];
         ibv_send_wr* bad = nullptr;
-        ibv_sge s3{(uint64_t)sw[i].sp + sw[i].nb, 8, R.mr->lkey};
+        ibv_sge s3{(uint64_t)sw[i].tw, 8, R.mr->lkey};
         ibv_send_wr w3{}; w3.sg_list = &s3; w3.num_sge = 1; w3.opcode = IBV_WR_RDMA_WRITE; w3.wr_id = (uint64_t)p;
         w3.wr.rdma.remote_addr = I.peer[p].addr + sw[i].roff + sw[i].nb; w3.wr.rdma.rkey = I.peer[p].rkey;
         bool sig = (I.unsignaled[p] += 1) >= 256; if (sig) I.unsignaled[p] = 0;
@@ -929,20 +964,8 @@ void Fabric::start_proxy() {
       }
       if (job.bulk) { if (!bulk_job(job.b)) return; I.pending.fetch_sub(1, std::memory_order_release); continue; }
       const int par = (int)(job.step & 1);
-      for (int c = 0; c < (int)job.sizes.size(); c++) {
-        if (bit(job.skip, c)) continue;
-        const unsigned long long seq = coll_seq(job.step, c, cfg_.ncoll);
-        volatile unsigned long long* db = dev_.doorbell + c;
-        auto t0 = std::chrono::steady_clock::now();
-        while (*db != seq) {
-          if (I.stop.load(std::memory_order_relaxed)) return;
-          if (*dev_.error) return;
-          if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) {
-            fprintf(stderr, "[fabric r%d] proxy TIMEOUT waiting doorbell step %llu coll %d (have %llu)\n", me, job.step, c, (unsigned long long)*db);
-            *dev_.error = 0x70000000u | c; return;
-          }
-        }
-        std::atomic_thread_fence(std::memory_order_acquire);
+      // send collective c once its doorbell shows seq; false = error word set, the proxy stops
+      auto post = [&](int c, unsigned long long seq) -> bool {
         uint64_t* xr = nullptr;                         // GR8_XTRACE proxy record of (step, c): [rail][4]
         if (I.xt) {
           const size_t k = (size_t)(job.step % XT_STEPS) * cfg_.ncoll + c;
@@ -967,26 +990,51 @@ void Fabric::start_proxy() {
             (void)bad; I.post(p, wr);
           }
         } else {
-        const bool rs = bit(job.rs_mask, c);
+        const bool rs = mask_bit(job.rs_mask, c), flat = rs && mask_bit(job.rs_flat, c);
         const uint32_t bytes = job.sizes[c];
-        char* src = dev_.send + ((size_t)par * cfg_.ncoll + c) * dev_.stride;
+        // slot pool credit: c shares its pool slot with an earlier collective of this step. Every peer must have sent me the credit
+        // collective (it does so only after it read that earlier collective's slot), so its tail is in my recv area. In a healthy step
+        // it is already there (the GPU chain implies it); 30 s without it -> error 0x76 << 24 | c << 8 | peer, the proxy stops.
+        if (!job.credit.empty() && job.credit[c] >= 0) {
+          const int k = job.credit[c];
+          const unsigned long long want = coll_seq(job.step, k, cfg_.ncoll);
+          const size_t nbk = mask_bit(job.rs_mask, k) ? job.rs_bytes[me] : job.sizes[k];   // the peer's tail sits after the payload it sent me
+          for (int p = 0; p < nr; p++) {
+            if (p == me) continue;
+            const volatile unsigned long long* t = (const volatile unsigned long long*)(dev_.recv + fab_recv_off(dev_, par, k, p) + nbk);
+            const auto t0 = std::chrono::steady_clock::now();
+            while (*t != want) {
+              if (I.stop.load(std::memory_order_relaxed) || *dev_.error != 0) return false;
+              if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) {
+                fprintf(stderr, "[fabric r%d] slot pool: no credit from rank %d for step %llu coll %d (credit coll %d, have %llu)\n", me, p, job.step, c, k, (unsigned long long)*t);
+                *dev_.error = 0x76000000u | ((unsigned)c << 8) | (unsigned)p;
+                return false;
+              }
+            }
+          }
+          std::atomic_thread_fence(std::memory_order_acquire);
+        }
+        char* src = dev_.send + fab_send_off(dev_, par, (int)c);
         if (!rs) *(volatile unsigned long long*)(src + bytes) = seq;  // tail travels with the payload in one write
         if (xr) xr[1] = xr[5] = xt_tick();
         StripeW sw[8]; int ns = 0;
         for (int p = 0; p < nr; p++) {
-          if (p == me || (rs && bit(job.p2p, c) && p != job.peer)) continue;   // p2p: one peer only
+          if (p == me || (rs && mask_bit(job.p2p, c) && p != job.peer)) continue;   // p2p: one peer only
           Rail& R = I.rails[I.rail_of(p, me)];
-          char* sp = rs ? src + p * job.rs_ss : src;             // reduce-scatter: peer p gets slice p only
+          char* sp = rs ? src + fab_rs_slice_off(job.rs_ss, p) : src;   // reduce-scatter: peer p gets slice p only
           const uint32_t nb = rs ? job.rs_bytes[p] : bytes;
-          if (rs) *(volatile unsigned long long*)(sp + nb) = seq;
-          const size_t roff = (((size_t)par * cfg_.ncoll + c) * nr + me) * dev_.stride;
+          // flat slice: sp + nb is the next slice's first row, so the tail word sits after the NR slices (Fabric::Rs::flat)
+          char* tw = rs ? src + fab_rs_tail_off(job.rs_ss, p, nb, flat, nr) : sp + nb;
+          if (rs) *(volatile unsigned long long*)tw = seq;
+          const size_t roff = fab_recv_off_at(dev_, par, (int)c, p, me);   // my slot in peer p's recv area (compact: no slot p)
           if (I.stripe && nb >= cfg_.stripe_min && nb >= 8192) {
             stripe_post(p, sp, nb, roff, xr);
-            sw[ns++] = StripeW{p, sp, nb, roff};
+            sw[ns++] = StripeW{p, sp, nb, roff, tw};
             continue;
           }
-          ibv_sge sge{(uint64_t)sp, nb + 8, R.mr->lkey};
-          ibv_send_wr wr{}, *bad; wr.sg_list = &sge; wr.num_sge = 1; wr.opcode = IBV_WR_RDMA_WRITE;
+          ibv_sge sge[2] = {{(uint64_t)sp, nb + 8, R.mr->lkey}, {(uint64_t)tw, 8, R.mr->lkey}};
+          if (flat) sge[0].length = nb;                 // payload, then the tail word as SGE 2 (lands at roff + nb)
+          ibv_send_wr wr{}, *bad; wr.sg_list = sge; wr.num_sge = flat ? 2 : 1; wr.opcode = IBV_WR_RDMA_WRITE;
           wr.wr.rdma.remote_addr = I.peer[p].addr + roff;
           wr.wr.rdma.rkey = I.peer[p].rkey;
           bool sig = (I.unsignaled[p] += I.wrs(p, wr)) >= 256; if (sig) I.unsignaled[p] = 0;
@@ -997,15 +1045,25 @@ void Fabric::start_proxy() {
           (void)bad; I.post(p, wr);
           if (xr) xr[xrl * 4 + 3] = xt_tick();
         }
-        if (ns && !stripe_finish(sw, ns, xr)) return;
+        if (ns && !stripe_finish(sw, ns, xr)) return false;
         }
         for (int r = 0; r < I.nrails; r++) {
           ibv_wc wc[32]; int n;
           while ((n = ibv_poll_cq(I.rails[r].cq, 32, wc)) > 0)
-            for (int i = 0; i < n; i++) if (wc[i].status != IBV_WC_SUCCESS) { I.wc_count(r, (int)wc[i].wr_id, wc[i].status); fprintf(stderr, "[fabric r%d] WC error %s\n", me, ibv_wc_status_str(wc[i].status)); *dev_.error = 0x71000000u; return; }
-          if (n < 0) { fprintf(stderr, "[fabric r%d] ibv_poll_cq failed (%d)\n", me, n); *dev_.error = kBulkCqError; return; }   // fail closed, as the bulk path
+            for (int i = 0; i < n; i++) if (wc[i].status != IBV_WC_SUCCESS) { I.wc_count(r, (int)wc[i].wr_id, wc[i].status); fprintf(stderr, "[fabric r%d] WC error %s\n", me, ibv_wc_status_str(wc[i].status)); *dev_.error = 0x71000000u; return false; }
+          if (n < 0) { fprintf(stderr, "[fabric r%d] ibv_poll_cq failed (%d)\n", me, n); *dev_.error = kBulkCqError; return false; }   // fail closed, as the bulk path
         }
+        return true;
+      };
+      const StepWalk w = walk_step(job.step, cfg_.ncoll, job.sizes.size(), job.order, job.skip,
+        [&](int c) { return *(volatile unsigned long long*)(dev_.doorbell + c); },
+        [&] { return I.stop.load(std::memory_order_relaxed) || *dev_.error != 0; },
+        [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }, 30.0, post);
+      if (w.rc == kWalkTimeout) {
+        fprintf(stderr, "[fabric r%d] proxy TIMEOUT waiting doorbell step %llu coll %d (have %llu)\n", me, job.step, w.c, w.have);
+        *dev_.error = 0x70000000u | (unsigned)w.c;
       }
+      if (w.rc != kWalkOk) return;
       I.pending.fetch_sub(1, std::memory_order_release);
     }
   });

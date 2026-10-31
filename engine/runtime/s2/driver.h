@@ -15,6 +15,8 @@ struct Payload {
     g6rt::steering::Identity steering{};
     g6rt::GrammarSpec gram;
 };
+// One member of a single bounded W pass. Pointers remain valid for Driver::step's synchronous callback.
+struct PrefillPart { const Slot* slot = nullptr; const Payload* payload = nullptr; uint32_t first = 0, rows = 0; };
 struct Emission { uint32_t count = 0; bool finished = false; };
 struct DriverHooks {
     // Real TP4 pool/binding adapter: canonical base, never a per-rank first-fit.
@@ -53,6 +55,8 @@ struct DriverHooks {
     // optional: after the growth and before the round, every rank (the host work since the last round may have taken a
     // different time on each rank: the round's fabric waits time out)
     std::function<void()> settle;
+    // DS41 prefill pack: one native pass for the ordered segments, never N solo hooks.
+    std::function<void(const std::vector<PrefillPart>&)> prefill_pack;
 };
 class Driver {
     Scheduler scheduler_;
@@ -63,11 +67,14 @@ class Driver {
     s2::Batch batch_;
     CpRound cp_round_;   // GR8_CP_STEP_ROWS: the current cycle of capped rounds (cp_rows.h)
     bool cp_capped_ = false;
+    bool active_decode_ = false; // scheduler quantum owning the synchronous Batch callbacks
     uint64_t cp_rounds_ = 0;   // capped rounds so far
     s2::Hooks batch_hooks() {
         return {
             [this](const s2::Step& s) {
-                auto ids = hooks_.run(s);
+                s2::Step work = s;
+                work.scheduler_decode = active_decode_;
+                auto ids = hooks_.run(work);
                 require(ids.size() == s.r.size(), "engine returned wrong row count");
                 return ids;
             },
@@ -106,6 +113,7 @@ public:
     Driver(Config c, DriverHooks h) : scheduler_(c), hooks_(std::move(h)),
         batch_(int(c.mtp), int(c.max_rows), batch_hooks()) {
         batch_.adapt(s2::adapt_env());
+        batch_.set_mtp_sessions(int(c.mtp_sessions));
         require(bool(hooks_.bind) && bool(hooks_.retire) && bool(hooks_.prefill) && bool(hooks_.run) && bool(hooks_.emit), "missing driver callback");
     }
     const Scheduler& state() const { return scheduler_; }
@@ -211,10 +219,21 @@ public:
             cp_rounds_ += pick.capped;
         }
         try {
+            active_decode_ = q.kind == Kind::Decode;
             if (q.kind == Kind::Prefill) {
                 auto k = q.keys[0];
                 hooks_.prefill(scheduler_.slots()[k.slot], payload_[k.slot], q.first, q.rows);
                 scheduler_.complete_prefill();
+            } else if (q.kind == Kind::PrefillPack) {
+                require(bool(hooks_.prefill_pack), "prefill pack native hook not wired");
+                std::vector<PrefillPart> parts;
+                parts.reserve(q.count);
+                for (unsigned i = 0; i < q.count; ++i) {
+                    const auto k = q.keys[i];
+                    parts.push_back({&scheduler_.slots()[k.slot], &payload_[k.slot], q.firsts[i], q.row_counts[i]});
+                }
+                hooks_.prefill_pack(parts);
+                scheduler_.complete_prefill_pack();
             } else if (q.kind == Kind::PromptTail) {
                 auto k = q.keys[0]; const auto& s = scheduler_.slots()[k.slot];
                 const auto& p = payload_[k.slot];
@@ -223,6 +242,22 @@ public:
                 batch_.admit({int(k.slot)}, {{p.prompt, p.decode_prompt ? 0 : int(q.first), p.chunk, int(s.req.max_tokens), dfl, p.ins}});
                 initialized_[k.slot] = true;
                 scheduler_.complete_tail(completion(k));
+            } else if (q.kind == Kind::PromptTailPack) {
+                std::vector<int> ids; std::vector<s2::Session> sessions;
+                ids.reserve(q.count); sessions.reserve(q.count);
+                for (unsigned i = 0; i < q.count; ++i) {
+                    const auto k = q.keys[i]; const auto& s = scheduler_.slots()[k.slot]; const auto& p = payload_[k.slot];
+                    require(!initialized_[k.slot] && s.pack_tail && !p.decode_prompt && p.prompt.size() >= 2 && q.row_counts[i] == 1 &&
+                            q.firsts[i] == p.prompt.size() - 1, "packed prompt tail membership invalid");
+                    ids.push_back(int(k.slot));
+                    sessions.push_back({p.prompt, int(q.firsts[i]), p.chunk, int(s.req.max_tokens), false, p.ins});
+                }
+                batch_.admit_packed_tail(ids, sessions); // one MAIN, one existing DSpark DRAFT if K>0, then batched CHAIN
+                std::vector<Completion> results; results.reserve(q.count);
+                for (unsigned i = 0; i < q.count; ++i) {
+                    const auto k = q.keys[i]; initialized_[k.slot] = true; results.push_back(completion(k));
+                }
+                scheduler_.complete_tail_pack(results);
             } else if (q.kind == Kind::Decode) {
                 std::vector<int> order;
                 for (unsigned i = 0; i < q.count; ++i) {
@@ -236,7 +271,7 @@ public:
                 for (unsigned i = 0; i < q.count; ++i) results.push_back(completion(q.keys[i]));
                 scheduler_.complete_decode(results);
             }
-            if (q.kind == Kind::PromptTail || q.kind == Kind::Decode)
+            if (q.kind == Kind::PromptTail || q.kind == Kind::PromptTailPack || q.kind == Kind::Decode)
                 for (unsigned i = 0; i < q.count; ++i) {
                     auto k = q.keys[i];
                     if (scheduler_.slots()[k.slot].phase != Phase::Retiring) continue;
