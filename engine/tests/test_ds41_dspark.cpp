@@ -43,11 +43,23 @@ int main()
         { const auto r = knobs({{"GR8_DS_RELAXED_ACCEPT", "topp:0.9,ratio:0.1"}}); EXPECT(r.err.empty() && r.relaxed && r.relax_ratio == 0.1 && r.relax_topp == 0.9); }
         { const auto r = knobs({{"GR8_DS_RELAXED_ACCEPT", "ratio:1"}}); EXPECT(r.err.empty() && r.relaxed && r.relax_ratio == 1.0); }
         EXPECT(!knobs({{"GR8_DS_BLOCK", "4"}}).err.empty() && knobs({{"GR8_DS_BLOCK", "5"}}).err.empty());   // D1: block is always 5
+        // verify cap: 0 / "" = off, the closed range [0, 1] is accepted (1 verifies no draft below certainty, 1e-3 is a cap), the rest refused
         EXPECT(!knobs({{"GR8_DS_VERIFY_CAP", "1.5"}}).err.empty() && !knobs({{"GR8_DS_VERIFY_CAP", "-0.1"}}).err.empty());
+        for (const char* v : {"x", "0.5x", "nan", "inf"}) EXPECT(!knobs({{"GR8_DS_VERIFY_CAP", v}}).err.empty());
         EXPECT(knobs({{"GR8_DS_VERIFY_CAP", "0.1"}}).verify_cap == 0.1);
+        for (const char* v : {"0", "", "0.0"}) { const auto c = knobs({{"GR8_DS_VERIFY_CAP", v}}); EXPECT(c.err.empty() && c.verify_cap == 0); }
+        { const auto c = knobs({{"GR8_DS_VERIFY_CAP", "1"}}); EXPECT(c.err.empty() && c.verify_cap == 1.0); }
+        { const auto c = knobs({{"GR8_DS_VERIFY_CAP", "1e-3"}}); EXPECT(c.err.empty() && c.verify_cap == 1e-3); }
+        // confidence temperature: one value for every row, or exactly 5 (one a row); every value positive; "" = the default
         const auto t5 = knobs({{"GR8_DS_CONF_TEMP", "0.8,0.9,1,1.1,1.2"}});
         EXPECT(t5.err.empty() && t5.conf_temp.size() == 5 && t5.temp_for(0) == 0.8 && t5.temp_for(4) == 1.2);
+        { const auto t1 = knobs({{"GR8_DS_CONF_TEMP", "0.5"}}); EXPECT(t1.err.empty() && t1.conf_temp.size() == 1); for (int r = 0; r < 5; ++r) EXPECT(t1.temp_for(r) == 0.5); }
+        { const auto t0 = knobs({{"GR8_DS_CONF_TEMP", ""}}); EXPECT(t0.err.empty() && t0.conf_temp.size() == 1 && t0.temp_for(2) == 1.0); }
         EXPECT(!knobs({{"GR8_DS_CONF_TEMP", "0.8,0.9"}}).err.empty() && !knobs({{"GR8_DS_CONF_TEMP", "0"}}).err.empty() && !knobs({{"GR8_DS_CONF_TEMP", "a"}}).err.empty());
+        for (const char* v : {"1,1,1,1,1,1", "0.8,", ",0.8", "1,,1,1,1", "-1", "1,0,1,1,1", "1 2"}) EXPECT(!knobs({{"GR8_DS_CONF_TEMP", v}}).err.empty());
+        { const auto t = knobs({{"GR8_DS_CONF_TEMP", "x"}}); EXPECT(!t.err.empty() && t.conf_temp.size() == 1 && t.temp_for(4) == 1.0); }   // a refused list still leaves temp_for callable
+        // the two together: the cap refuses first, and its message names the cap
+        { const auto b = knobs({{"GR8_DS_VERIFY_CAP", "2"}, {"GR8_DS_CONF_TEMP", "0"}}); EXPECT(!b.err.empty() && b.err.find("GR8_DS_VERIFY_CAP") != std::string::npos); }
         const auto g = knobs({{"GR8_DS_ENGRAM", "0"}, {"GR8_DS_MTP", "5"}});
         EXPECT(g.err.empty() && g.diag());   // Engram off = every row is diag
     }
