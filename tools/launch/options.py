@@ -22,7 +22,6 @@ import models
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-<<<<<<< ours
 # key: (scope, default, meaning), from knobs/launch.yaml through the knob library (knobs.py). A default of None means
 # unset, or the engine's default for the TP (scripts/engine_args.sh). The flag is --<key in lower case, _ as ->, except
 # where the file names one.
@@ -33,203 +32,6 @@ FLAGS = {k: o['flag'] for k, o in _OPTIONS.items() if o['flag']}
 RENAMED = {'G6_HOME': 'GR8_WORK_DIR', 'G6ENV_X': 'EXTRA_ENV', 'G6ARGS_X': 'EXTRA_ARGS', 'G6_CLUSTER': 'GR8_CLUSTER'}
 RENAMED_FLAGS = {'--g6-home': '--work-dir', '--g6env-x': '--extra-env',
                  '--g6args-x': '--extra-args'}
-=======
-# key: (scope, default, meaning). A default of None means unset, or the engine's default for the TP
-# (scripts/engine_args.sh). The flag is --<key in lower case, _ as ->, except where FLAGS says otherwise.
-KEYS = {
-    'GR8_MODEL': ('cluster', 'glm53', 'the model the engine serves: glm53 (GLM-5.3), glm53f (GLM-5.3-Flash) or ds41 '
-                                      '(DeepSeek-V4.1-Flash-1017); ./gr8 <model> sets it'),
-    'TP': ('cluster', None, 'tensor-parallel size: 4, 6, 3 or 5 (glm53f: 4, 3 or 2; ds41: 4)'),
-    'SHAPE': ('cluster', 'mesh', "fabric shape: mesh (a switch), or ring (TP=3 or 4, no switch: each box's f0 port "
-                                 "cabled to the f1 port of the next box in --peers order, the last to the first)"),
-    'PEERS': ('cluster', None, 'LAN addresses of every box in rank order; the first is the head'),
-    'MENTAT': ('box', None, "the local mentat daemon (localhost) to find the other boxes through"),
-    'GROUP': ('cluster', None, "mentat group the boxes join (default gr8-<model>: gr8-glm53, gr8-glm53f)"),
-    'HEAD': ('cluster', None, 'mentat mode: the head LAN address, instead of the lowest one'),
-    'IPS': ('cluster', None, 'rail-0 fabric address of every rank (skips fabric discovery)'),
-    'IPS2': ('cluster', None, 'rail-1 fabric address of every rank'),
-    'CONTROL_PORT': ('cluster', '7340', 'the supervisors\' TCP port on the LAN'),
-    'PORT': ('cluster', '8100', 'the OpenAI API port on the head'),
-    'S2PORT': ('cluster', None, 'the S2 control port on the head (7341)'),
-    'MODEL': ('box', None, 'the exlr8 release: https://huggingface.co/<org>/<repo>[@rev], or a local copy (an NFS '
-                           'mount works) used in place'),
-    'MODEL_CACHE': ('box', None, "with an https:// --model: this box's local directory for its part of the release"),
-    'MODEL_DIR': ('box', None, 'tokenizer directory, when the model directory has none'),
-    'G6_HOME': ('box', REPO, 'working directory: bin/, out/, s2/, run/'),
-    'PROXY_CPU': ('box', '19', "CPU core for this rank's fabric proxy thread"),
-    'RING_DEVS': ('box', None, "--shape ring: this box's RDMA devices as relay-out,next,relay-in,prev (default "
-                               'rocep1s0f0,roceP2p1s0f0,rocep1s0f1,roceP2p1s0f1)'),
-    'NODE_IP': ('box', None, "this box's LAN address, when the peer list cannot tell"),
-    'PY': ('box', None, 'python for the shim (default $G6_HOME/venv/bin/python)'),
-    'FRONT_BIN': ('box', None, 'the Rust front end binary (default bin/g6front-rs)'),
-    'DEFAULT_MAX_TOKENS': ('box', '0', 'max_tokens for a chat request that names none; 0 = what keeps the request '
-                                       'within SHARE_LIMIT, but at least 8192 (ds41: 32768)'),
-    'DEFAULT_REASONING_EFFORT': ('box', None, 'reasoning_effort for a chat request that names none: minimal, low, '
-                                              'medium, high, xhigh or max (the template hears the nearest level it '
-                                              'names); unset = the template\'s own default. ds41: also none (thinking '
-                                              'off) or a whole number 1 to 100; its default is low (50)'),
-    'DEFAULT_THINKING_BUDGET': ('box', '0', 'thinking_budget for a chat request that names none: reply tokens before '
-                                            'the front end closes the think block; 0 = no limit'),
-    'ALLOW_THINKING_OFF': ('box', '0', '1 = the front end takes enable_thinking false / reasoning_effort none: the prompt '
-                                       'drops its effort header and closes the think block (GLM 5.3; experimental; '
-                                       'ds41 turns thinking off without it)'),
-    'RANK': ('run', None, 'prepare: the rank to fetch, when this box cannot tell'),
-    'JOIN_TIMEOUT': ('run', '600', 'seconds to wait for the other boxes; on the head, from the first hello (0 = forever)'),
-    'READY_TMO': ('run', None, 'seconds to wait for the engines to load'),
-    'CHECK': ('run', '1', '0 = skip the local checks'),
-    'CAP': ('cluster', None, 'KV pool in tokens (default: what SHARE_LIMIT leaves of the default pool memory)'),
-    'CHUNK': ('cluster', None, 'ds41 only: prompt rows a step, the engine --chunk, 1 to 8 (default 8). Serve v1 runs the '
-                               'prompt as decode steps, so this is the prompt speed'),
-    'EAGER': ('cluster', None, 'ds41 only: 1 = every step runs eagerly, without --graph (default 0, one captured graph a step). '
-                               'The first light of a new op (Engram ON) runs eager before it is captured'),
-    'KV_FORMAT': ('cluster', None, 'the KV latent row: fp8 (default, 656 B) or int4 (416 B, a Hadamard-rotated INT4 row, '
-                                   'experimental): bin/g6m4 or bin/g6m4-int4. int4 holds about 1.34x the tokens at TP=4 '
-                                   '(its own CAP default) for about 3% slower decode (docs/KV4.md)'),
-    'SHARE_LIMIT': ('cluster', None, 'requests up to this many tokens (prompt + max_tokens) share decode steps; a '
-                                     'longer one runs alone. Each rank holds the first SHARE_LIMIT tokens of a session'),
-    'SESS': ('cluster', None, 'S2 sessions'),
-    'MTP': ('cluster', None, 'MTP draft count'),
-    'DFLASH': ('cluster', None, 'DFlash2 drafter'),
-    'DFLASH_SEL': ('cluster', None, 'DFlash2 selector walk'),
-    'DFLASH_K': ('cluster', None, 'DFlash2 drafts verified'),
-    'SPEC_ADAPT': ('cluster', None, 'adaptive draft count'),
-    'SPEC_LEVELS': ('cluster', None, 'draft counts SPEC_ADAPT may choose'),
-    'SPEC_ACCEPT': ('cluster', None, 'draft acceptance'),
-    'REUSE': ('cluster', None, 'prefix reuse'),
-    'FLASH_CACHE': ('cluster', None, 'glm53f, experimental: Flash session checkpoints, off (default), aligned or terminal. '
-                                     'aligned: a prompt keeps its pages and KDA state at its last cold prefill grid point, '
-                                     'and a later prompt that starts with those tokens is prefilled from there, bit-exact. '
-                                     'terminal: aligned, and also a checkpoint at the end of every request; NOT cold-exact '
-                                     '(docs/FLASH.md)'),
-    'FLASH_STATE_BUDGET_MIB': ('cluster', None, 'glm53f, FLASH_CACHE: the checkpoint store in MiB a rank, in memory, '
-                                                'when no KV_STORE names one (8192)'),
-    'KV_STORE': ('cluster', None, 'experimental: block stores below the KV pool, tried in order: STORE,size=N(M|G|T) each, '
-                                  'separated by ; (or --kv-store given again). STORE: ssd:PATH (a folder on each box\'s own SSD), '
-                                  'remote:HOST:PORT or remote:auto (a KV node on another machine; auto = the one the mentat '
-                                  'group announces). Sizes per rank. An SSD store starts empty at every boot; '
-                                  ',persist=on keeps it across restarts'),
-    'KV_KEEP': ('cluster', None, 'what the stores keep: system (system prompts and tools that KV_SYSTEM_AFTER conversations '
-                                 'started with), sessions (those, and evicted runs that continued their conversation) or all '
-                                 '(every eviction). Default system'),
-    'KV_SYSTEM_AFTER': ('cluster', None, 'conversations a system prefix must start before the stores keep it (2)'),
-    'KV_SHARE_WHEN': ('cluster', None, 'a KV_STORE group= lease gives segments to other groups only while the engine is '
-                                       'idle (idle, default) or whenever the node asks (always) (G6_KV_SHARE_WHEN)'),
-    'KV_WRITE_LIMIT': ('cluster', None, 'the stores write at most this many page blocks per page of KV computed (off)'),
-    'KV_ROWS': ('cluster', None, 'experimental: remote attention rows: the rows past SHARE_LIMIT in a rows store, read back '
-                                 'as decode selects them. STORE,size=N(M|G|T)[,local=PAGES][,pool=SLOTS][,place=PAGES]'
-                                 '[,fmt=fp8|int4]. STORE: remote:auto (the KV node from the mentat group), remote:HOST:PORT '
-                                 'or mem:. size: each rank\'s lease. local: release, a session\'s tail cycles through that '
-                                 'many local pages a rank (G6_RT_*, docs/SETTINGS.md)'),
-    'KV_TIER': ('cluster', None, 'deprecated: KV_STORE with keep=evicted|shared|all per tier (any evicted or all maps to '
-                                 'KV_KEEP=all, else system)'),
-    'KV_SHARED_AFTER': ('cluster', None, 'deprecated: KV_SYSTEM_AFTER'),
-    'FLASH_KV_DONATE_GIB': ('box', None, 'GLM-5.3-Flash: once the serve booted, lend at most this many GiB of this '
-                                        'box to a KV node beside it (./gr8 kv up --lazy-lock --ledger), less when '
-                                        'MemAvailable - FLASH_KV_GROWTH_GIB - KV_MIN_FREE_GB is less. 0 (default) = '
-                                        'none'),
-    'FLASH_KV_GROWTH_GIB': ('box', None, 'with FLASH_KV_DONATE_GIB: the GiB the Flash serve may still allocate after '
-                                        'boot (no default: not measured yet)'),
-    'FLASH_KV_GROUP': ('box', None, 'with FLASH_KV_DONATE_GIB: the mentat group the KV node joins, the cluster that '
-                                   'borrows from it (e.g. the GLM-5.3 serve\'s), not this serve\'s. No default'),
-    'FLASH_CAP_POLICY': ('cluster', None, "protected (default): the configured CAP's memory is never lent. "
-                                         'borrow-idle: with FLASH_KV_DONATE_GIB, the Flash KV pool in chunks '
-                                         '(G6_FLASH_KV_CHUNKS=1) lends all but one chunk to the KV node once idle '
-                                         'FLASH_KV_IDLE_S, and a request that needs them waits for their recall'),
-    'FLASH_KV_IDLE_S': ('cluster', None, 'with FLASH_CAP_POLICY=borrow-idle: idle seconds before a lend (default 60, '
-                                        'not measured)'),
-    'PF_OWN': ('cluster', None, 'prefill attention ownership'),
-    'QP_ROLL': ('cluster', None, 'PF_OWN=4 rolling pair slots'),
-    'QP_CTX': ('cluster', None, 'PF_OWN=4 QO key table size'),
-    'QP_EARLY': ('cluster', None, 'PF_OWN=4 early counterpart partial'),
-    'DFL_REUSE': ('cluster', None, 'DFlash2 after a prefix-reuse hit: 1, or 2 = also a request alone on MTP (G6_DFL_REUSE)'),
-    'DFL_REUSE_MIN': ('cluster', None, 'DFL_REUSE warm-up: context rows before the drafter drafts (G6_DFL_REUSE_MIN)'),
-    'MTP_KSTOP': ('cluster', None, 'MTP confidence stop for solo MTP rounds: 1 thresholds, 2 estimates (G6_MTP_KSTOP)'),
-    'MTP_KSTOP_KMAX': ('cluster', None, 'MTP_KSTOP: most drafts per solo MTP round, 1..3 (G6_MTP_KSTOP_KMAX)'),
-    'MTP_KSTOP_TAU': ('cluster', None, 'MTP_KSTOP=1 thresholds t1,t2,t3 (G6_MTP_KSTOP_TAU)'),
-    'DRAFT_PAR': ('cluster', None, 'DFlash2 drafter step on its own stream (G6_DRAFT_PAR)'),
-    'QA_SPLIT': ('cluster', None, 'split the layer-input GEMVs across the ranks (G6_QA_SPLIT)'),
-    'IDXQ_SPLIT': ('cluster', None, "split the indexer's wq_b across the ranks (G6_IDXQ_SPLIT)"),
-    'MTP_SPLIT': ('cluster', None, "split the MTP draft's replicated GEMVs (G6_MTP_SPLIT)"),
-    'DRAFT_HEAD_I4': ('cluster', None, 'MTP draft head on INT4 g32 records (G6_DRAFT_HEAD_I4)'),
-    'DFL_HEAD_I4': ('cluster', None, 'DFlash2 drafter head on INT4 g32 records (G6_DFL_HEAD_I4)'),
-    'DFL_BODY_I4': ('cluster', None, 'DFlash2 drafter body on INT4 g32 records (G6_DFL_BODY_I4)'),
-    'ROUTE_OVL': ('cluster', None, 'shared expert on a forked stream during the router (G6_ROUTE_OVL)'),
-    'ATTN_SC2': ('cluster', None, 'decode attention scores, slots per warp (G6_ATTN_SC2)'),
-    'ATTN_SC2_TR': ('cluster', None, 'ATTN_SC2 transpose reduction (G6_ATTN_SC2_TR)'),
-    'ATTN_CTX2': ('cluster', None, 'decode attention context variant (G6_ATTN_CTX2)'),
-    'ATTN_CTX3': ('cluster', None, 'decode attention context, per-batch states (G6_ATTN_CTX3)'),
-    'ATTN_CTX3_SP': ('cluster', None, 'ATTN_CTX3 slots per context partition, 64 or 128 (G6_ATTN_CTX3_SP; E1)'),
-    'ATTN_POSIDX': ('cluster', None, 'positional index at decode buckets <= 2048 (G6_ATTN_POSIDX; E1)'),
-    'ATTN_SEL2': ('cluster', None, 'decode index selection by rank (G6_ATTN_SEL2)'),
-    'IDX_GRP': ('cluster', None, 'decode indexer row grouping (G6_IDX_GRP)'),
-    'ATTN_QT': ('cluster', None, 'decode attention transposed query (G6_ATTN_QT)'),
-    'ATTN_FRONT': ('cluster', None, 'decode attention front kernels in one launch (G6_ATTN_FRONT)'),
-    'IDX_VEC': ('cluster', None, 'decode indexer vector loads (G6_IDX_VEC)'),
-    'DEC_BK': ('cluster', None, 'decode context bucket in tokens; 0 = engine default 2048 (G6_DEC_BK)'),
-    'S2_ADAPT': ('cluster', None, 'S2 MTP draft count from accept rates and step costs (G6_S2_ADAPT)'),
-    'S2_DECODE_PF': ('cluster', None, 'S2 prefill quantum rows while sessions decode (G6_S2_DECODE_PF)'),
-    'S2_ADMIT_HOLD': ('cluster', None, 'S2 burst admissions at one boundary (G6_S2_ADMIT_HOLD)'),
-    'PF_SELX_CTX': ('cluster', None, 'prefill selx at context >= this; 0 = SEL32 (G6_PF_SELX_CTX)'),
-    'DSEL_MODEL': ('cluster', None, 'drafter choice priced from a frozen cost table, MTP rounds as the confidence stop runs them (G6_S2_DSEL_MODEL)'),
-    'DSEL_TABLE': ('cluster', None, 'DSEL_MODEL: the cost table, key:value list or a file (G6_S2_DSEL_TABLE; tools/s2_dsel_table.py)'),
-    'NGRAM': ('cluster', None, 'a solo DFlash2 request also drafts from this n-gram table file (G6_NGRAM; tools/ngram/ngram.py export)'),
-    'NGRAM_KMAX': ('cluster', None, 'NGRAM: the longest table chain a round verifies, 1..dflash-k (G6_NGRAM_KMAX)'),
-    'NGRAM_KMIN': ('cluster', None, 'NGRAM: the shortest table chain worth a round (G6_NGRAM_KMIN)'),
-    'NGRAM_MARGIN': ('cluster', None, 'NGRAM: how much more tokens per verify ms a chain must promise than the drafter (G6_NGRAM_MARGIN)'),
-    'MTP_KSTOPB': ('cluster', None, 'shared rounds: each session verifies its own count of the MTP drafts (G6_MTP_KSTOPB)'),
-    'MTP_KSTOPB_KMIN': ('cluster', None, 'MTP_KSTOPB: the least drafts a session verifies, 0 or 1 (G6_MTP_KSTOPB_KMIN)'),
-    'MTP_KSTOPB_TAU': ('cluster', None, 'MTP_KSTOPB thresholds t1,t2,... at every session count (G6_MTP_KSTOPB_TAU)'),
-    'MTP_KSTOPB_TAU_S': ('cluster', None, 'MTP_KSTOPB thresholds per session count, n:t1,t2/n:t1,t2... (G6_MTP_KSTOPB_TAU_S<n>)'),
-    'L2PF': ('cluster', None, "decode: paced L2 prefetch of the next weights in the step's idle-DRAM windows, window mask (G6_L2PF)"),
-    'CP_STEP_ROWS': ('cluster', None, 'S2: a step past SHARE_LIMIT carries at most this many rows; the CP fabric is sized for it (G6_CP_STEP_ROWS)'),
-    'CP_STEP_SEG': ('cluster', None, 'S2 with CP_STEP_ROWS: a round past SHARE_LIMIT takes only sessions past it (G6_CP_STEP_SEG)'),
-    'CP_ONECHAIN': ('cluster', None, 'CP decode past R: the remote head groups as one attention call, TP=4 (G6_CP_ONECHAIN)'),
-    'KVB': ('cluster', None, 'kv_b (UK / UV) form: bf16 (the default) or fp8, the release\'s block FP8 (G6_KVB; '
-                             'needs V2_DENSE)'),
-    'PF_GEMMF32': ('cluster', None, 'prefill: the row-owner QO o_proj with an FP32 epilogue, PF_OWN=3 (G6_PF_GEMMF32)'),
-    'MTP_LASTROW': ('cluster', None, "MTP draft steps: only each session's last row through layer 78's routed experts (G6_MTP_LASTROW)"),
-    'DRAFT_HEAD2': ('cluster', None, "MTP draft head in two stages, 1, or 2 = with a check, experimental (G6_DRAFT_HEAD2)"),
-    'MTP_L2PF': ('cluster', None, 'MTP draft steps: the paced L2 prefetch, 1 draft step, 2 head waits, 3 both; needs L2PF (G6_MTP_L2PF)'),
-    'MTP_KSTOPB_WIDTHS': ('cluster', None, 'MTP_KSTOPB: the shared-round widths with captured graphs, w1,w2,... (G6_MTP_KSTOPB_WIDTHS)'),
-    'TR3_W2ALL': ('cluster', None, 'window-2 fc1 split on every MoE layer at M > 1 (G6_TR3_W2ALL)'),
-    'QO_CACHE': ('cluster', None, 'PF_OWN=3: a directory for the full-head q_b / o_proj / UK / UV tensors, written at the first boot and read at the next (G6_QO_CACHE)'),
-    'PF_ISGRT_RG': ('cluster', None, 'prefill index scores: rows per CTA, a multiple of 8 (G6_PF_ISGRT_RG)'),
-    'PF_ATTN_ROWS': ('cluster', None, 'prefill attention chunk rows inside a sub-batch, default 1024 (G6_PF_ATTN_ROWS)'),
-    'PF_F12': ('cluster', None, 'prefill fc1 on the fat-CTA kernel when built with PF_F12, 0 = the stock fc1 (G6_PF_F12)'),
-    'ATTN_P11': ('cluster', None, 'decode attention: the P11 tile retune, takes precedence over ATTN_SC2 / CTX2 / CTX3 (G6_ATTN_P11)'),
-    'DTR': ('cluster', None, 'the dense trellis matrices of the exlr8 release, 0 = the int4 / MXFP8 records (G6_DTR)'),
-    'PF_AOP': ('cluster', None, 'prefill fc1 A-operand share when built with PF_AOP, 0 = off (G6_PF_AOP)'),
-    'NOHASH': ('cluster', None, 'skip the pack tensor hashes at load'),
-    'G6ENV_X': ('cluster', None, 'more engine environment for every rank'),
-    'G6ARGS_X': ('cluster', None, 'more engine arguments for every rank'),
-    'V2': ('box', None, 'exlr8 v2 width files directory'),
-    'V2_SLICES': ('box', None, 'exlr8 v2 index slices'),
-    'V2_WIDTHS': ('box', None, 'exlr8 v2 width manifest; --variant names one instead'),
-    'VARIANT': ('cluster', None, 'exlr8 v2 variant: home (the default; bit225 at TP=3, or down1 without it), down1, '
-                                  'up1, bit225, bit243, bit260, bit325, bit338, or a width manifest path'),
-    'V2_DENSE': ('box', None, 'the exlr8 release directory whose dense/ files give every non-expert weight (no rank packs)'),
-    'V2_DENSE_FORM': ('cluster', None, 'with V2_DENSE: trellis (the release\'s entries, the default) or rounded (MXFP8 / '
-                                       'int4, the fallback)'),
-    'LAYOUT': ('box', None, 'with V2_DENSE: a layout file (bin/g6layout) that says which pieces each rank holds, instead '
-                            'of the formulas. The handshake compares its sha256'),
-    'GRAMMAR': ('cluster', '1', '1 = the engine masks response_format JSON replies with their grammar (XGrammar; '
-                                'GLM-5.3 only, and an engine built without it serves without); the front end checks '
-                                'them either way'),
-    'GRAMMAR_DIR': ('box', None, 'GRAMMAR=1: the directory with the tokenizer.json and generation_config.json the grammars '
-                                 'compile against (default: the model set\'s tokenizer)'),
-    'DRAFTER': ('box', None, 'TP=4 or 6: the DFlash2 drafter, https://huggingface.co/<org>/<repo>[@rev], fetched and '
-                             'converted on this box'),
-    'DFLASH_DIR': ('box', None, 'the directory holding dflash.r<r>.*, when it is not the model set\'s'),
-    'STEERING_PROFILE': ('box', None, 'verified schema-v1 profile directory, or hf:default / hf:NAME from the model release'),
-    'STEERING_CHAT_TEMPLATE': ('box', None, 'served chat template file; resolved from the model'),
-    'STEERING_FORCE': ('cluster', None, 'force the loaded steering profile at this request scale'),
-    'STEERING_MODEL_REVISION': ('cluster', None, 'exact model revision recorded by the steering profile'),
-    'STEERING_TOKENIZER_REVISION': ('cluster', None, 'exact tokenizer revision recorded by the steering profile'),
-    'STEERING_CHAT_TEMPLATE_SHA256': ('cluster', None, 'sha256 of the served chat template recorded by the profile'),
-    'STEERING_WEIGHT_SET': ('cluster', None, 'stable exlr8 weight-set identity recorded by the steering profile'),
-}
-FLAGS = {'S2PORT': '--s2-port', 'G6_HOME': '--g6-home'}
->>>>>>> theirs
 # Read from old config files and ignored here, so they do not draw a warning.
 IGNORED = {'HOSTS', 'PACKS', 'PACK_DIR', 'BIN_DIR', 'GR8_CLUSTER', 'G6_NR', 'G6_WIDTHS', 'G6_TESTS', 'GR8_NR', 'GR8_WIDTHS',
            'GR8_TESTS', 'BUNDLE_LIBS', 'ARCH', 'EXTRA', 'SHARED', 'RANK_HEALTH', 'PROBE_ARGS', 'QP_PACK', 'PLAIN', 'FRONT'}
@@ -406,7 +208,6 @@ def parse(argv, environ=None):
     if origin['FETCH'] == 'default' and values['MODEL_LOADER']:
         values['FETCH'], origin['FETCH'] = 'model-loader', f'MODEL_LOADER, from the {origin["MODEL_LOADER"]}'
     deprecated_kv(values, origin, warnings)
-<<<<<<< ours
     kv_store_files(values, origin, path)
     model = values['GR8_MODEL']
     if model and model not in models.MODELS:
@@ -414,15 +215,6 @@ def parse(argv, environ=None):
                           f'{models.CHOICES} (./gr8 models lists them)')
     if model and not values['GROUP']:
         values['GROUP'] = models.MODELS[model].group
-=======
-    if values['GR8_MODEL'] not in models.MODELS:
-        raise OptionError(f'--gr8-model {values["GR8_MODEL"]}: want {", ".join(models.MODELS)}')
-    if not values['GROUP']:
-        values['GROUP'] = models.MODELS[values['GR8_MODEL']].group
-    for k, v in models.MODELS[values['GR8_MODEL']].defaults:   # the model's own default over the table's, never over a setting
-        if origin.get(k) == 'default':
-            values[k], origin[k] = v, f'{values["GR8_MODEL"]} default'
->>>>>>> theirs
     opts = Options(values, origin, path, args, switches, warnings)
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)

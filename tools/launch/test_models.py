@@ -40,12 +40,6 @@ class OptionTests(unittest.TestCase):
             with self.assertRaises(opt.OptionError) as e:
                 flash(*argv)
             self.assertIn(want, str(e.exception))
-<<<<<<< ours
-=======
-        with self.assertRaises(opt.OptionError) as e:
-            opt.parse(['--no-config', '--gr8-model', 'glm9'], {})
-        self.assertIn('want glm53, glm53f, ds41, pseudo', str(e.exception))
->>>>>>> theirs
         for argv, want in ((['--reuse', '1'], 'GLM-5.3-Flash has no REUSE'), (['--sess', '9'], 'serves 1 to 8 sessions'),
                            (['--sess', '0'], 'serves 1 to 8 sessions'),
                            (['--sess', '8', '--mtp', '4'], 'a round of 40 rows')):

@@ -57,26 +57,19 @@ GLM53 = Model('glm53', 'GLM-5.3', 'https://huggingface.co/kindlingai/glm-5.3-exl
 GLM53F = Model('glm53f', 'GLM-5.3-Flash', 'https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4',
                'g6m4_flash', 'flash', ('4', '3', '2'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},
                {2: ('k4',), 3: ('k4',), 4: ('k4',)}, 'gr8-glm53f', 'Glm5NextForConditionalGeneration', False, False, True)
-# DeepSeek-V4.1-Flash-1017 (docs/DEEPSEEK.md): the release as published (fp8 trunk, MXFP4 routed experts), no exlr8 variants,
-# TP=4 first. The DSpark drafter is in the checkpoint (MTP layers), not a DFlash2 drafter. thinking_off: the chat
-# template turns thinking off. Owner of the entry: B8 (front end + launcher); B1 made the scaffold.
-# Front end: the ds41 dialect (frontend/g6front-rs/src/dialect.rs), served as deepseek-v4.1-flash. max_tokens for a request
-# that names none is the lane's 32768; the reasoning effort for one that names none is low (50: 18/18 at 27% of the
-# think tokens of high, reports/l3-ds-think-less.md). The binary's own fallback stays 75, the release's default.
-DS41 = Model('ds41', 'g6m4_ds41', 'ds41', ('4',), {}, {}, 'gr8-ds41', 'DeepseekV41ForCausalLM', False, False, True,
+# DeepSeek-V4.1-Flash-1017 (docs/DEEPSEEK.md): the official weights in the exlr8 native layout (FP8 trunk, MXFP4 routed
+# experts), no width variants, TP=4. Its drafter is DSpark, the checkpoint's MTP layers (GR8_DS_MTP), not DFlash2. The front
+# end speaks the ds41 dialect (DSML tool calls, numeric reasoning effort). A request that names no reasoning effort gets
+# low (50), which kept the release's answers at about a quarter of high's thinking tokens.
+DS41 = Model('ds41', 'DeepSeek-V4.1-Flash', 'https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native',
+             'g6m4_ds41', 'ds41', ('4',), {}, {}, 'gr8-ds41', 'DeepseekV41ForCausalLM', False, False, True,
              dialect='ds41', served='deepseek-v4.1-flash', vocab=129280, eos_ids=(1,),   # engine/model_geom_ds41.h VOCAB, TOK_EOS
              defaults=(('DEFAULT_MAX_TOKENS', '32768'), ('DEFAULT_REASONING_EFFORT', 'low')))
 # The pseudo engine (frontend/pseudo-engine): GLM-5.3's tokens and chat template, answers from a TOML file of rules, on
 # a CPU. Its release is a directory with responses.toml and the tokenizer files.
-<<<<<<< ours
 PSEUDO = Model('pseudo', 'the pseudo engine', '', 'g6pseudo', 'pseudo', ('1', '2', '3', '4'), {}, {}, 'gr8-pseudo',
                'GlmMoeDsaForCausalLM', False, False, False, fabric=False)
-MODELS = {m.name: m for m in (GLM53, GLM53F, PSEUDO)}
-=======
-PSEUDO = Model('pseudo', 'g6pseudo', 'pseudo', ('1', '2', '3', '4'), {}, {}, 'gr8-pseudo', 'GlmMoeDsaForCausalLM',
-               False, False, False, fabric=False)
 MODELS = {m.name: m for m in (GLM53, GLM53F, DS41, PSEUDO)}
->>>>>>> theirs
 
 
 # The models a runner names. pseudo, the test engine, is served when named but left out of the lists.

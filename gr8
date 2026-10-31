@@ -22,13 +22,9 @@
 #   ./gr8 glm53 check [OPTIONS]       what would stop this box's boot
 #   ./gr8 glm53 show-config [OPTIONS] the effective options, the cluster options the boxes compare, the model set id
 #   ./gr8 glm53 prepare [--rank R] [OPTIONS]   fill --model-cache with this box's part without booting
-<<<<<<< ours
 #   ./gr8 glm53 knobs [WORD..] [OPTIONS]   every option, and the value each TP runs with these options; WORDs keep
 #                                     the options whose name holds one
-#   ./gr8 glm53 smoke [URL]           smoketest/run.sh, by default against this head's API
-=======
 #   ./gr8 glm53 smoke [URL]           smoketest/run.sh, by default against this head's API (./gr8 ds41 smoke: smoketest/ds41.sh)
->>>>>>> theirs
 #   ./gr8 glm53 bench [ARGS]          bench/pbench.py against this head's API
 #   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh (one engine for every TP width) and scripts/build_front.sh; with
 #                                     KV_FORMAT=int4 (or --kv-format int4 in the options) also bin/g6m4-int4
@@ -90,12 +86,8 @@ case $model in
       gpu) shift; exec bash "$SCRIPTS/c1_tests.sh" "$@" ;;
       *) echo "gr8: ./gr8 test [frontend|engine|all], ./gr8 test pseudo TOKENIZER_DIR or ./gr8 test gpu [BIN_DIR]" >&2; exit 2 ;;
     esac ;;
-<<<<<<< ours
   *) echo "gr8: the first argument names the model, glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash): ./gr8 glm53 <command>" \
           "(./gr8 models lists them; or ./gr8 knobs, ./gr8 kv, ./gr8 query, ./gr8 test)" >&2; exit 2 ;;
-=======
-  *) echo "gr8: the first argument names the model, glm53, glm53f, ds41 or pseudo: ./gr8 glm53 <command> (or ./gr8 kv, ./gr8 query, ./gr8 test)" >&2; exit 2 ;;
->>>>>>> theirs
 esac
 shift
 export GR8_MODEL=$model   # tools/launch/options.py

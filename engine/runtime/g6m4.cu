@@ -173,6 +173,9 @@ int main(int argc, char** argv)
     if (const int tk = (int)knob::moe_topk(); tk < geom::TOPK)
         fprintf(stderr, "# GR8_MOE_TOPK=%d: routed experts per token cut %d -> %d, weights renormalized (screen arm)\n",
                 tk, geom::TOPK, tk);
+#elif G6_MODEL_DS41
+    if (knob::moe_topk() != 8) die("GR8_MOE_TOPK is a Flash-model option: DeepSeek-V4.1 reads GR8_DS_MOE_TOPK");
+    if (knob::pf_router_split()) die("GR8_PF_ROUTER_SPLIT is a Flash-model option");
 #else
     if (knob::moe_topk() != geom::TOPK) die("GR8_MOE_TOPK is a Flash-model option (this build is the GLM model)");
     if (knob::pf_router_split()) die("GR8_PF_ROUTER_SPLIT is a Flash-model option (this build is the GLM model)");

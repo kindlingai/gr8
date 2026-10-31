@@ -6,11 +6,8 @@ import http.server
 import io
 import json
 import os
-<<<<<<< ours
 import shutil
-=======
 import re
->>>>>>> theirs
 import socket
 import subprocess
 import sys
@@ -347,13 +344,12 @@ class FrontTests(unittest.TestCase):
         self.assertEqual(a[a.index('--default-reasoning-effort') + 1], 'low')
         self.assertEqual(a[a.index('--default-thinking-budget') + 1], '2048')
 
-<<<<<<< ours
     def test_undeclared_tool_calls_reach_the_front_end_only_when_emitted(self):
         self.assertNotIn('--undeclared-tool-calls', self.front_argv())
         self.assertNotIn('--undeclared-tool-calls', self.front_argv('--undeclared-tool-calls', 'text'))
         a = self.front_argv('--undeclared-tool-calls', 'emit')
         self.assertEqual(a[a.index('--undeclared-tool-calls') + 1], 'emit')
-=======
+
     def test_ds41_runs_the_front_end_in_its_dialect(self):
         a = self.front_argv('--gr8-model', 'ds41', '--allow-thinking-off', '1')
         self.assertEqual(a[a.index('--dialect') + 1], 'ds41')
@@ -368,7 +364,6 @@ class FrontTests(unittest.TestCase):
         self.assertNotIn('--dialect', a)
         self.assertNotIn('--served-model-name', a)
         self.assertIn('--allow-thinking-off', a)
->>>>>>> theirs
 
     def test_the_front_end_finds_the_supervisor_for_deep_health(self):
         a = self.front_argv()

@@ -307,6 +307,8 @@ int main(int argc, char** argv)
             fprintf(stderr, "# GR8_MOE_TOPK=%d: routed experts per token cut %d -> %d, weights renormalized (screen arm)\n",
                     tk, geom::TOPK, tk);
     }
+#elif G6_MODEL_DS41
+    if (knob::moe_topk() != 8) die("GR8_MOE_TOPK is a Flash-model option: DeepSeek-V4.1 reads GR8_DS_MOE_TOPK");
 #else
     if ((int)knob::moe_topk() != geom::TOPK) die("GR8_MOE_TOPK is a Flash-model option (this build is the GLM model)");
 #endif
