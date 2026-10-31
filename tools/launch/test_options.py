@@ -191,6 +191,84 @@ class ValidateTests(unittest.TestCase):
         self.assertIn('not ssh aliases', str(e.exception))
 
 
+class NamedModelTests(unittest.TestCase):
+    """./gr8 <model> names the model (--named-model): a GR8_MODEL in the config file or the environment that names
+    another stops up, check, prepare and show-config before anything runs, in one line (#244)."""
+    GR8 = os.path.join(opt.REPO, 'gr8')
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def refused(self, argv, env, where):
+        o = opt.parse(['--named-model', 'glm53f', '--peers', PEERS, *argv], env)
+        self.assertEqual(o.get('GR8_MODEL'), 'glm53f')
+        with self.assertRaises(opt.OptionError) as e:
+            opt.validate(o)
+        msg = str(e.exception)
+        self.assertEqual(len(msg.splitlines()), 1)
+        self.assertIn(f'./gr8 glm53f names the model, and GR8_MODEL=glm53 {where} names another', msg)
+        return msg
+
+    def test_a_file_that_disagrees(self):
+        f = write(self.d, 'c.env', 'GR8_MODEL=glm53\n')
+        self.refused(['@' + f], {}, f'in the config file {f}')
+        self.refused([], {'GR8_CLUSTER': f}, f'in the config file {f}')       # the default file too
+        self.refused(['@' + f], {'GR8_MODEL': 'glm53f'}, f'in the config file {f}')   # the environment agreeing
+
+    def test_an_environment_that_disagrees(self):
+        self.refused(['--no-config'], {'GR8_MODEL': 'glm53'}, 'in the environment')
+
+    def test_the_command_line_that_disagrees(self):
+        self.refused(['--no-config', '--gr8-model', 'glm53'], {}, 'on the command line')
+
+    def test_one_that_agrees_or_none(self):
+        f = write(self.d, 'c.env', 'GR8_MODEL=glm53f\n')
+        for argv, env in ((['@' + f], {}), (['--no-config'], {'GR8_MODEL': 'glm53f'}), (['--no-config'], {}),
+                          (['--no-config'], {'GR8_MODEL': ''})):
+            o = opt.parse(['--named-model', 'glm53f', '--peers', PEERS, *argv], env)
+            opt.validate(o)
+            self.assertEqual((o.get('GR8_MODEL'), o.get('GROUP'), o.origin['GR8_MODEL']),
+                             ('glm53f', 'gr8-glm53f', './gr8 glm53f'))
+
+    def test_without_a_name_the_old_precedence_holds(self):
+        f = write(self.d, 'c.env', 'GR8_MODEL=glm53\n')
+        o = opt.parse(['@' + f, '--peers', PEERS], {'GR8_MODEL': 'glm53f'})    # the image's GR8_MODEL, no ./gr8
+        opt.validate(o)
+        self.assertEqual((o.get('GR8_MODEL'), o.origin['GR8_MODEL']), ('glm53', '@file'))
+
+    def run_gr8(self, *argv, env=None):
+        e = {k: v for k, v in os.environ.items() if k not in ('GR8_MODEL', 'GR8_CLUSTER', 'G6_CLUSTER')}
+        return subprocess.run([self.GR8, *argv], env={**e, **(env or {})}, capture_output=True, text=True,
+                              timeout=60, cwd=self.d)
+
+    def test_through_gr8(self):
+        f = write(self.d, 'c.env', 'GR8_MODEL=glm53\n')
+        peers = ['--peers', '192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4', '--work-dir', self.d, '--no-check']
+        for cmd in ('up', 'check', 'prepare', 'show-config'):
+            for argv, env, where in ((['@' + f], {}, f'in the config file {f}'),
+                                     (['--no-config'], {'GR8_MODEL': 'glm53'}, 'in the environment')):
+                r = self.run_gr8('glm53f', cmd, *argv, *peers, env=env)
+                self.assertEqual(r.returncode, 2, (cmd, r.stdout, r.stderr))
+                self.assertEqual(r.stderr, f'gr8: ./gr8 glm53f names the model, and GR8_MODEL=glm53 {where} names '
+                                           'another: remove that GR8_MODEL, or run ./gr8 glm53\n')
+                self.assertEqual(r.stdout, '')
+        self.assertFalse(os.path.exists(os.path.join(self.d, 'out', 'supervisor.log')))    # up started nothing
+        r = self.run_gr8('glm53f', 'show-config', '@' + write(self.d, 'ok.env', 'GR8_MODEL=glm53f\n'), *peers)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertRegex(r.stdout, r'GR8_MODEL +glm53f +cluster +\(\./gr8 glm53f\)')
+        self.assertRegex(r.stdout, r'GROUP +gr8-glm53f ')
+        r = self.run_gr8('glm53f', 'show-config', '--no-config', *peers, env={'GR8_MODEL': 'glm53f'})
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_the_last_boot_commands_do_not_check(self):
+        f = write(self.d, 'c.env', 'GR8_MODEL=glm53\n')
+        r = self.run_gr8('glm53f', 'status', '@' + f, '--work-dir', self.d)
+        self.assertNotIn('names the model', r.stdout + r.stderr)
+        r = self.run_gr8('glm53f', 'health', '@' + f, '--work-dir', self.d)
+        self.assertEqual(r.returncode, 1)                               # not serving, and not bad options
+        self.assertNotIn('names the model', r.stdout + r.stderr)
+
+
 class GetTests(unittest.TestCase):
     """launch.py get: TP for ./gr8 glm53 build, PORT for smoke and bench, on a box whose options need not boot."""
     def get(self, *argv):
