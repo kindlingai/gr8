@@ -533,14 +533,7 @@ int main(int argc, char** argv)
     if (MP > 0) die("DS41: --prefill is not supported (there is no DS41 tensor prefill; the prompt runs as decode steps)");
     if (mtp > 0) die("DS41: --mtp N > 0 is not supported (the draft is DSpark: GR8_DS_MTP=1..5 with --mtp 0)");
     // DSpark (off unless GR8_DS_MTP = 1..5): served only, the round runner is the S2 DRAFT / CHAIN path (s2/ds41_dspark_round.cuh)
-    const ds41::dsp::Knobs dsk = ds41::dsp::parse_knobs([](const char* n) -> const char* {
-        if (!strcmp(n, "GR8_DS_MTP")) return DS41_TEXT(knob::ds_mtp());
-        if (!strcmp(n, "GR8_DS_BLOCK")) return DS41_TEXT(knob::ds_block());
-        if (!strcmp(n, "GR8_DS_RELAXED_ACCEPT")) return DS41_TEXT(knob::ds_relaxed_accept());
-        if (!strcmp(n, "GR8_DS_PREFILL_KEEP")) return DS41_TEXT(knob::ds_prefill_keep());
-        if (!strcmp(n, "GR8_DS_ENGRAM")) return knob::ds_engram() ? "1" : "0";
-        return nullptr;
-    });
+    const ds41::dsp::Knobs dsk = ds41::dsp::parse_knobs(ds41_dspark_knob);   // every DSpark knob, GR8_DS_VERIFY_CAP / GR8_DS_CONF_TEMP included
     if (!dsk.err.empty()) die(dsk.err);
     if (dsk.on() && !s2mode) die("DS41: GR8_DS_MTP is served only (it needs --serve)");
     if (dsk.relaxed && !dsk.on()) die("DS41: GR8_DS_RELAXED_ACCEPT needs GR8_DS_MTP = 1..5 (there are no drafts to accept)");
@@ -1733,6 +1726,14 @@ int main(int argc, char** argv)
     cudaGraphExec_t exec_ms[NBK][33][7] = {}, exec2_ms[NBK][33][7] = {};
     cudaGraphExec_t exec_ms_dec[NBK][33][7] = {};
 #endif
+#if G6_MODEL_DS41
+    std::map<const cudaGraphExec_t*, Ds41SpanSet> span_sets;   // GR8_DS_SPAN: the spans of each captured step graph
+    auto replayed = [&](const cudaGraphExec_t* ex, int M) {
+        if (!ds41_span_on()) return;
+        const auto it = span_sets.find(ex);
+        if (it != span_sets.end()) ds41_span_replayed(it->second, m.ds_ns > 1 ? "sessions " : "", M, st);
+    };
+#endif
     auto launch_main = [&](int k, int M) {
 #if G6_MODEL_DS41
         const bool decode_graph = ds41_moe_topk::graph_kind(m.ds_moe_decode_step, ds_moe_main_topk, ds_moe_decode_topk);
@@ -1743,21 +1744,32 @@ int main(int argc, char** argv)
                           (decode_graph ? exec_ms_dec[k][ns][rps] : exec_ms[k][ns][rps]), "DS41 SESS graph not captured");
             G6RT_CK(cudaGraphLaunch(decode_graph ? exec_ms_dec[k][ns][rps] : exec_ms[k][ns][rps], st));
             if (gsplit) G6RT_CK(cudaGraphLaunch(exec2_ms[k][ns][rps], st));
+            replayed(decode_graph ? &exec_ms_dec[k][ns][rps] : &exec_ms[k][ns][rps], M);
             return;
         }
         if (decode_graph) {
             g6s2::require(exec_dec[k][M], "DS41 decode graph not captured");
             G6RT_CK(cudaGraphLaunch(exec_dec[k][M], st));
+            replayed(&exec_dec[k][M], M);
             return;
         }
 #endif
         G6RT_CK(cudaGraphLaunch(exec[k][M], st));
         if (gsplit) G6RT_CK(cudaGraphLaunch(exec2[k][M], st));
+#if G6_MODEL_DS41
+        replayed(&exec[k][M], M);
+#endif
     };
     auto capture = [&](const std::function<void()>& body, cudaGraphExec_t* ex, const char* what, int M) {
         cudaGraph_t g;
+#if G6_MODEL_DS41
+        if (ds41_span_on()) ds41_span_begin(span_sets[ex]);
+#endif
         G6RT_CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
         body();
+#if G6_MODEL_DS41
+        ds41_span_end(st);
+#endif
         G6RT_CK(cudaStreamEndCapture(st, &g));
         size_t nodes = 0;
         G6RT_CK(cudaGraphGetNodes(g, nullptr, &nodes));
@@ -2206,12 +2218,14 @@ int main(int argc, char** argv)
                 if (skip_late)
                     fprintf(stderr, "# rank %d request %llu chunk %u rows %u late tail skipped (rows after %d)\n", R, (unsigned long long)c.request, c.first, c.rows, rows_after);
                 // skip_late: range A without its last op ST_PF_COMPACT (split.b - 1, check_split), no range B
-                ds41::Stop stop = ds41::run(split.ops, 0, skip_late ? split.b - 1 : split.b, ds41_table(), &m, (int)c.rows, (void*)st, [](const ds41::Op&){});
+                Ds41SpanPass span_pass(R, (int)c.rows, st, 0);   // GR8_DS_SPAN: the chunk's ops, a mark each
+                ds41::Stop stop = ds41_run_pass(split.ops, 0, skip_late ? split.b - 1 : split.b, &m, (int)c.rows, st, span_pass);
                 if (!stop.stopped && split.on() && !skip_late) {   // range B: the layers >= 21 over the chunk's last `late` rows (now rows 0 .. late-1)
                     ds41_attn_set_win_floor(ds41::br::win_floor((int)c.context, (int)c.rows, pf_tail));
-                    stop = ds41::run(split.ops, split.b, split.ops.size(), ds41_table(), &m, late, (void*)st, [](const ds41::Op&){});
+                    stop = ds41_run_pass(split.ops, split.b, split.ops.size(), &m, late, st, span_pass);
                     ds41_attn_set_win_floor(0);
                 }
+                span_pass.close();
                 m.ds41_pf_late = 0;
                 m.ds_pf_slot = 0;
                 m.ds41_dchunk = false; m.ds41_dir_used[0] = m.ds41_dir_used[1] = false;
@@ -2357,6 +2371,7 @@ int main(int argc, char** argv)
                     };
                     if (m.engram) m.engram->plan_next_warm(ca.tok - ca.first, (int)ca.prompt_rows, (int)cb.first + (int)cb.rows, 2);
                     ds41::Stop stop{};
+                    Ds41SpanPass span_pass[2] = {Ds41SpanPass(R, (int)ca.rows, ss[0], 0), Ds41SpanPass(R, (int)cb.rows, ss[1], 1)};   // GR8_DS_SPAN: each lane's ops
                     for (const ds41::lanes::Seg& g : sched.seg) {
                         const int L = g.lane;
                         if (g.wait >= 0) G6RT_CK(cudaStreamWaitEvent(ss[L], lane_ev[(size_t)g.wait], 0));
@@ -2364,11 +2379,12 @@ int main(int argc, char** argv)
                         if (g.kind == ds41::lanes::K_PRO) prologue(L);
                         else if (g.kind == ds41::lanes::K_OPS || g.kind == ds41::lanes::K_SEC) {
                             ds41_attn_set_win_floor(g.win_floor);   // a host global read at launch: this segment's lane and range
-                            stop = ds41::run(split.ops, g.b, g.e, ds41_table(), mm[L], g.rows, (void*)ss[L], [](const ds41::Op&){});
+                            stop = ds41_run_pass(split.ops, g.b, g.e, mm[L], g.rows, ss[L], span_pass[L]);
                         }
                         if (stop.stopped) break;
                         if (g.record >= 0) G6RT_CK(cudaEventRecord(lane_ev[(size_t)g.record], ss[L]));
                     }
+                    span_pass[0].close(); span_pass[1].close();
                     ds41_attn_set_win_floor(0);
                     if (m.engram) g6s2::require(m.engram->use_lane(0) == 0, "DS41 two-lane prefill: Engram lane reset refused");
                     for (int L = 0; L < 2; ++L) {
@@ -2467,11 +2483,13 @@ int main(int argc, char** argv)
                 if (m.engram) ds41_engram_begin_pack(m, shape, st);
                 m.ds41_pf_late = rows;
                 m.ds41_dchunk = pf_direct; m.ds41_dseq = p.sequence;
-                ds41::Stop stop = ds41::run(split.ops, 0, split.b, ds41_table(), &m, rows, (void*)st, [](const ds41::Op&){});
+                Ds41SpanPass span_pass(R, rows, st, 0);   // GR8_DS_SPAN: the pack's ops, a mark each
+                ds41::Stop stop = ds41_run_pass(split.ops, 0, split.b, &m, rows, st, span_pass);
                 if (!stop.stopped && split.on()) {
                     ds41_attn_set_win_floor(0);
-                    stop = ds41::run(split.ops, split.b, split.ops.size(), ds41_table(), &m, rows, (void*)st, [](const ds41::Op&){});
+                    stop = ds41_run_pass(split.ops, split.b, split.ops.size(), &m, rows, st, span_pass);
                 }
+                span_pass.close();
                 m.ds41_pack = nullptr; m.ds41_pf_late = 0;
                 m.ds41_dchunk = false; m.ds41_dir_used[0] = m.ds41_dir_used[1] = false;
                 if (stop.stopped) die(ds41::stop_message(stop));
