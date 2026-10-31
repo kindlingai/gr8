@@ -89,6 +89,7 @@ struct BootstrapConfig {
     unsigned rank = 0, ranks = 6, timeout = 120;
     std::string head_ip, directory, runtime_signature;
     unsigned control_version = CONTROL_VERSION;   // scheduler.h; tests set another to act as a rank of another build
+    uint32_t prefill_min = 0;                     // DS41: prompts of at least this many rows prefill in W-row chunks (ds41_prefill.h); 0 = every prompt runs as decode steps
     uint16_t port = 0;
     void validate() const {
         scheduler.validate();
@@ -104,6 +105,10 @@ struct BootstrapConfig {
             (scheduler.cp_step_rows ? " cpsr " + std::to_string(scheduler.cp_step_rows) + (scheduler.cp_seg ? " seg" : "") +
                                       " after " + std::to_string(scheduler.cp_after) : std::string()) +
             (scheduler.r2_rows ? " r2 " + std::to_string(scheduler.r2_rows) : std::string()) +
+            (scheduler.tail_first ? " tf" : std::string()) +
+            (scheduler.c8_pack ? " c8pack" : std::string()) +
+            (scheduler.notice_max != NOTICE_MAX ? " nmax " + std::to_string(scheduler.notice_max) : std::string()) +
+            (prefill_min ? " pfmin " + std::to_string(prefill_min) : std::string()) +
             " ctl " + std::to_string(control_version) + "\n" + runtime_signature;
     }
 };

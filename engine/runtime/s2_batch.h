@@ -57,6 +57,7 @@
 // No CUDA types: the engine adapter (m4sim / g6m4) turns a Step into its StepIn and per-session layout.
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -86,6 +87,9 @@ struct Row
 struct Step
 {
     enum Kind { MAIN, DRAFT, CHAIN } kind = MAIN;
+    // Set by Driver from Scheduler::Kind, not inferred from Event or row shape.
+    // Every MAIN step under Kind::Decode uses the decode MoE cut; prompt tails do not.
+    bool scheduler_decode = false;
     // first-step timer: what this step is, for E1/E2 grouping.
     // TAIL = the final PromptTail prompt MAIN; DECODE1 = the first Decode-kind round MAIN
     // after the tail; ROUND = every steady decode-round MAIN. DRAFT/CHAIN steps carry
@@ -173,7 +177,11 @@ struct Hooks
 //   active(q) / finished(q) / result(q) / stats(q)
 // Acceptance and draft state stay here; the scheduler keeps generations and pages. mtp_batch below = admit(all) and
 // rounds in slot order until none is active.
+#if defined(G6_MODEL_DS41) && G6_MODEL_DS41
+constexpr int S2N_SLOTS = 32;   // g6s2::MAX_SESSIONS
+#else
 constexpr int S2N_SLOTS = 8;
+#endif
 // GR8_S2_ADAPT=1 (every rank, read at boot): choose each round's draft count. Off by default: on code and prose at 1-8
 // sessions it measured within 0-3% of K drafts every round (the K-th draft is still accepted ~60% of the time), and
 // its extra main-step graphs take ~1 GiB
@@ -441,23 +449,92 @@ class Batch
 public:
     Batch(int K, int max_rows, Hooks h) : K_(K), max_rows_(max_rows), h_(std::move(h)), st_(S2N_SLOTS), stats_(S2N_SLOTS) {}
 
+    // Config::mtp_sessions: n > 0 = no drafting while more than n sessions are active. The cap keeps K_ + 1 in its
+    // divisor, so a drafting round of mtp_max_sess() sessions always fits max_rows_ (round()'s guard counts sessions).
+    void set_mtp_sessions(int n) { mtp_sessions_ = n; }
+    int mtp_max_sess() const {
+        if (K_ <= 0) return 0;
+        return mtp_sessions_ > 0 ? std::min(max_rows_ / (K_ + 1), mtp_sessions_) : max_rows_ / (K_ + 1);
+    }
+
     void admit(const std::vector<int>& qs, const std::vector<Session>& ss)
     {
         if (qs.size() != ss.size()) throw std::runtime_error("s2: admit: slots and sessions differ in count");
+        int existing_active = 0;
+        for (int q = 0; q < S2N_SLOTS; ++q) if (active(q)) ++existing_active;
+        const bool allow_mtp = K_ > 0 && existing_active + (int)qs.size() <= mtp_max_sess();
         std::vector<int> live;
         for (size_t k = 0; k < qs.size(); ++k)
         {
             const int q = qs[k];
             if (q < 0 || q >= S2N_SLOTS || st_[q].on) throw std::runtime_error("s2: admit: slot " + std::to_string(q) + " is out of range or in use");
-            if (!prompt(q, ss[k]) || st_[q].force >= 0) continue;
+            if (!prompt(q, ss[k], allow_mtp) || st_[q].force >= 0) continue;
             if (!st_[q].dfl) live.push_back(q);
             else if (st_[q].mtp) kchain(q, Step::TAIL);   // GR8_DFL_REUSE warm-up: d[2..K] (KStop: d[2..k]) for its first round
         }
         std::vector<int> all;
         for (int q = 0; q < S2N_SLOTS; ++q) if (active(q)) all.push_back(q);
-        if (ksolo(all.size()) && live.size() == 1) kchain(live[0], Step::TAIL);   // KStop::solo: the only session's chain stops early
+        if (!allow_mtp || (int)all.size() > mtp_max_sess()) {
+            for (int q : live) st_[q].k = 0;
+        } else if (ksolo(all.size()) && live.size() == 1) kchain(live[0], Step::TAIL);   // KStop::solo: the only session's chain stops early
         else { std::vector<int> evs; for (size_t k = 0; k < live.size(); ++k) evs.push_back(Step::TAIL);
           chain(live, evs, choose(all)); } // first-step timer: post-admit chains follow the tail steps
+    }
+    // DS41 prefill pack (Config::c8_pack): every session of the pack owes exactly one prompt row. One MAIN step takes
+    // all their tails, then one first DRAFT and the post-admit CHAIN. admit() stays the solo route; the driver owns the
+    // pack's membership.
+    void admit_packed_tail(const std::vector<int>& qs, const std::vector<Session>& ss)
+    {
+        if (qs.size() < 2 || qs.size() > S2N_SLOTS || qs.size() != ss.size() || int(qs.size()) > max_rows_)
+            throw std::runtime_error("s2: packed tail count/width invalid");
+        std::array<bool, S2N_SLOTS> seen{};
+        for (size_t i = 0; i < qs.size(); ++i) {
+            const int q = qs[i]; const Session& p = ss[i];
+            if (q < 0 || q >= S2N_SLOTS || seen[q] || st_[q].on || p.prompt.size() < 2 ||
+                p.first != int(p.prompt.size()) - 1 || p.chunk < 1 || p.n_gen < 1 || p.dflash)
+                throw std::runtime_error("s2: packed tail slot or prompt invalid");
+            seen[q] = true;
+        }
+        Step m; m.kind = Step::MAIN; m.event = Step::TAIL;
+        for (size_t i = 0; i < qs.size(); ++i) {
+            const int q = qs[i]; const Session& p = ss[i];
+            start_prompt(q, p);
+            const int pos = int(p.prompt.size()) - 1;
+            add_rows(m, q, {Row{q, p.prompt[size_t(pos)], pos, pos + 1, -1}}, Step::TAIL);
+        }
+        m.cls = row_class(m.M()); check(m);
+        const std::vector<int> t = h_.run(m);
+        std::vector<int> drafted;
+        for (size_t i = 0; i < qs.size(); ++i) {
+            const int q = qs[i], row = m.row0[i]; St& x = st_[q];
+            if (h_.prompt) h_.prompt(q, 1, x.n - 1);
+            int kept;
+            const int c = commit(q, &t[size_t(row)], 1, &kept);
+            if (h_.emit && h_.emit(q, &x.tokens[size_t(x.n)], c, row)) { x.done = true; continue; }
+            drafted.push_back(q);
+        }
+        std::vector<int> all;
+        for (int q = 0; q < S2N_SLOTS; ++q) if (active(q)) all.push_back(q);
+        const bool allow_mtp = K_ > 0 && !drafted.empty() && (int)all.size() <= mtp_max_sess();
+        if (allow_mtp) {
+            Step d; d.kind = Step::DRAFT; d.event = Step::TAIL;
+            for (int q : drafted) {
+                St& x = st_[q];
+                add_rows(d, q, draft_rows(q, 1, x.n - 1, &x.tokens[size_t(x.n)]), Step::TAIL);
+            }
+            d.cls = row_class(d.M()); check(d);
+            const std::vector<int> u = h_.run(d);
+            for (size_t i = 0; i < drafted.size(); ++i) {
+                St& x = st_[drafted[i]]; const int row = d.row0[i];
+                x.d[1] = u[size_t(row)]; x.dlm[1] = dlp(row);
+            }
+        }
+        std::vector<int> live;
+        for (int q : drafted) if (st_[q].force < 0) live.push_back(q); // solo admit() excludes insert-forced sessions after first DRAFT
+        if (!allow_mtp) {
+            for (int q : live) st_[q].k = 0;
+        } else if (ksolo(all.size()) && live.size() == 1) kchain(live[0], Step::TAIL);
+        else { std::vector<int> evs(live.size(), Step::TAIL); chain(live, evs, choose(all)); }
     }
     bool active(int q) const { const St& x = st_[q]; return x.on && !x.done && (int)x.tokens.size() - x.n < x.s.n_gen; }
     // the session's tokens so far, prompt included: its next round writes rows from length - 1 on
@@ -550,8 +627,10 @@ public:
         std::vector<int> act;
         for (int q : order) if (active(q)) act.push_back(q);
         if (act.empty()) return false;
-        if (act.size() * (K_ + 1) > (size_t)max_rows_)
-            throw std::runtime_error("s2: " + std::to_string(act.size()) + " sessions x " + std::to_string(K_ + 1) + " rows > max rows " + std::to_string(max_rows_));
+        // With a session cap a round past mtp_max_sess() drafts nothing, so it needs one row a session
+        const size_t rows = mtp_sessions_ > 0 ? act.size() : act.size() * (K_ + 1);
+        if (rows > (size_t)max_rows_)
+            throw std::runtime_error("s2: " + std::to_string(act.size()) + " sessions need " + std::to_string(rows) + " rows > max rows " + std::to_string(max_rows_));
         cur_round_ = round_no_++; cur_active_ = (int)act.size();
         for (int q : act) if (st_[q].force >= 0) forced(q);
         act.erase(std::remove_if(act.begin(), act.end(), [&](int q) { return !active(q); }), act.end());
@@ -574,14 +653,15 @@ private:
         v.event = Step::ROUND;
         for (int q : act) if (st_[q].rounds == 0) { v.event = Step::DECODE1; break; } // strongest class in the step
         std::vector<int> base(S2N_SLOTS, 0);
-        int k = K_;                                               // drafts verified: the fewest any session holds
-        for (int q : act) k = std::min(k, st_[q].k);
+        const bool mtp_on = K_ > 0 && (int)act.size() <= mtp_max_sess();
+        int k = mtp_on ? K_ : 0;                                  // drafts verified: the fewest any session holds (0 when S > mtp_max_sess())
+        if (mtp_on) for (int q : act) k = std::min(k, st_[q].k);
         std::vector<int> kq(S2N_SLOTS, k), aq(S2N_SLOTS, -1), nd(S2N_SLOTS, 0);   // KStopB: per session; log: accepted, drafts held
-        const bool xr = ks_.b.mode && ks_.b.explore && cur_round_ % ks_.b.explore == 0;
-        const bool solo = ksolo(act.size());       // KStop::solo: the session alone verifies kverify of its drafts
+        const bool xr = mtp_on && ks_.b.mode && ks_.b.explore && cur_round_ % ks_.b.explore == 0;
+        const bool solo = mtp_on && ksolo(act.size());       // KStop::solo: the session alone verifies kverify of its drafts
         double pe = 0;
         if (solo) kq[act[0]] = kverify(st_[act[0]], &pe);
-        else if (ks_.b.mode) kshared(act, k, xr, kq);
+        else if (mtp_on && ks_.b.mode) kshared(act, k, xr, kq);
         using clk = std::chrono::steady_clock;                    // GR8_MTP_LPLOG: the round's host ms per step kind
         const clk::time_point t0 = ks_.log ? clk::now() : clk::time_point{};
         double ms[3] = {};
@@ -595,7 +675,7 @@ private:
                 rows.push_back(Row{q, r ? x.d[r] : x.tokens[base[q]], base[q] + r, base[q] + r + 1, -1});
             add_rows(v, q, rows, x.rounds == 0 ? Step::DECODE1 : Step::ROUND); // first-step timer: per-session E2
         }
-        v.cls = row_class(solo ? kq[act[0]] + 1 : K_ + 1);    // a session's own rows (K+1), as its solo step: the k1 split, so a row's bits do not depend on the batch (KStop::solo: k+1, as round_dfl's MTP rounds)
+        v.cls = row_class(solo ? kq[act[0]] + 1 : (mtp_on ? K_ : 0) + 1);    // a session's own rows (K+1), as its solo step: the k1 split, so a row's bits do not depend on the batch (KStop::solo: k+1, as round_dfl's MTP rounds)
         check(v);
         const std::vector<int> t = h_.run(v);
         if (ks_.log) ms[0] = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
@@ -622,6 +702,10 @@ private:
         if (ks_.log) klog(v, act, k, xr, kq, aq, nd, base);   // the drafts' lp before the draft step replaces them
         const clk::time_point t1 = ks_.log ? clk::now() : clk::time_point{};
         int dm = 0;
+        int ndraft = 0;
+        for (int q : v.sess) if (!st_[q].done) ++ndraft;
+        const bool draft_on = K_ > 0 && ndraft > 0 && ndraft <= mtp_max_sess() && (int)on.size() <= mtp_max_sess();
+        if (draft_on)                                             // K = 0 or S > mtp_max_sess(): no draft step
         {                                                         // first-form draft: one step, rows a+1 of each survivor
             Step d;
             d.kind = Step::DRAFT; d.event = v.event;
@@ -645,6 +729,7 @@ private:
                 }
             }
         }
+        if (draft_on)
         { // first-step timer: chain carries each survivor's own round class
             std::vector<int> evs;
             for (int q : on) { size_t i = 0; while (i < v.sess.size() && v.sess[i] != q) ++i;
@@ -661,6 +746,10 @@ private:
                 fprintf(stderr, "# kstopb_ms round %ld main %.3f draft %.3f dM %d chain %.3f nch %d cM %d round %.3f\n", cur_round_, ms[0], ms[1], dm,
                         ms[2], on.empty() ? 0 : (solo && on.size() == 1 ? st_[on[0]].k : kc) - 1, (int)on.size(), std::chrono::duration<double, std::milli>(t3 - t0).count());
             }
+        }
+        else
+        {
+            for (int q : on) st_[q].k = 0;
         }
     }
     // KStopB: each session's verified drafts kq[q] <= k in a shared round of the sessions act (rank-invariant: the drafts'
@@ -1108,6 +1197,7 @@ private:
         return best;
     }
     int K_, max_rows_;
+    int mtp_sessions_ = 0;            // Config::mtp_sessions
     bool adapt_ = false;
     int dkv_ = DFL_B - 1;
     bool par_ = knob::draft_par().value_or(0) != 0;
@@ -1170,8 +1260,8 @@ private:
             for (size_t i = 0; i < s.sess.size(); ++i) { st_[s.sess[i]].d[j + 1] = t[s.row0[i]]; st_[s.sess[i]].dlm[j + 1] = dlp(s.row0[i]); }
         }
     }
-    // the prompt steps of session q as its own steps (rank.cuh mtp_sequence, prompt loop); false = finished by emit
-    bool prompt(int q, const Session& p)
+    // The state setup shared by solo prompt() and the opt-in packed final row.
+    void start_prompt(int q, const Session& p)
     {
         St& x = st_[q];
         if (ring_.q == q)                 // the slot's last session wrote the drafter's ring: keep its tokens
@@ -1183,7 +1273,7 @@ private:
         x.s = p; x.on = true;
         x.tokens = p.prompt;
         x.n = (int)p.prompt.size();
-        x.d.assign(std::max(K_, kmax()) + 1, 0);
+        x.d.assign(std::max({K_, kmax(), 1}) + 1, 0);   // K = 0 (DS41, no draft head): d[1] still exists, never written
         x.dlm.assign(x.d.size(), NAN);
         sl_[q] = g6rt::SpecLen();
         stats_[q] = Stats();
@@ -1199,6 +1289,12 @@ private:
         for (float& v : x.dl) v = NAN;
         x.lo = x.dfl ? h_.dfl_start(q) : 0;
         if (x.dfl && reuse_.mode) reuse_start(q);
+    }
+    // the prompt steps of session q as its own steps (rank.cuh mtp_sequence, prompt loop); false = finished by emit
+    bool prompt(int q, const Session& p, bool allow_mtp = true)
+    {
+        start_prompt(q, p);
+        St& x = st_[q];
         const int n = x.n, PS = (n - p.first + p.chunk - 1) / p.chunk;
         for (int s = 0; s < PS; ++s)
         {
@@ -1221,15 +1317,18 @@ private:
                 const int c = commit(q, &t[M - 1], 1, &kept);
                 if (h_.emit && h_.emit(q, &x.tokens[n], c, M - 1)) { x.done = true; return false; }
             }
-            std::vector<int> next(M);
-            for (int r = 0; r < M; ++r) next[r] = x.tokens[rows[r].pos + 1];
-            Step d;
-            d.kind = Step::DRAFT; d.cls = row_class(M); d.event = m.event;
-            add_rows(d, q, draft_rows(q, M, rows[0].pos, next.data()), m.ev.back());
-            check(d);
-            const std::vector<int> u = h_.run(d);
-            x.d[1] = u[M - 1];
-            x.dlm[1] = dlp(M - 1);
+            if (allow_mtp && K_ > 0)      // K = 0 or S > mtp_max_sess(): no draft step
+            {
+                std::vector<int> next(M);
+                for (int r = 0; r < M; ++r) next[r] = x.tokens[rows[r].pos + 1];
+                Step d;
+                d.kind = Step::DRAFT; d.cls = row_class(M); d.event = m.event;
+                add_rows(d, q, draft_rows(q, M, rows[0].pos, next.data()), m.ev.back());
+                check(d);
+                const std::vector<int> u = h_.run(d);
+                x.d[1] = u[M - 1];
+                x.dlm[1] = dlp(M - 1);
+            }
             const bool query = s == PS - 1 && x.force < 0 && !x.warm;
             if (x.dfl) drafts(q, DflReq{q, M, rows[0].pos, query ? t[M - 1] : 0, x.lo, query});
         }
@@ -1283,13 +1382,16 @@ private:
                 x.tokens.push_back(t[M - 1]);
                 if (h_.emit && h_.emit(q, &t[M - 1], 1, M - 1)) { x.done = true; return; }
             }
-            Step d;
-            d.kind = Step::DRAFT; d.cls = row_class(M); d.event = m.event;
-            d.round = cur_round_; d.round_active = cur_active_;
-            add_rows(d, q, draft_rows(q, M, p0, &x.tokens[p0 + 1]), ev);
-            check(d);
-            x.d[1] = h_.run(d)[M - 1];
-            x.dlm[1] = dlp(M - 1);
+            if (K_ > 0)                   // K = 0 (DS41): no draft head, no draft step
+            {
+                Step d;
+                d.kind = Step::DRAFT; d.cls = row_class(M); d.event = m.event;
+                d.round = cur_round_; d.round_active = cur_active_;
+                add_rows(d, q, draft_rows(q, M, p0, &x.tokens[p0 + 1]), ev);
+                check(d);
+                x.d[1] = h_.run(d)[M - 1];
+                x.dlm[1] = dlp(M - 1);
+            }
             if (x.dfl) drafts(q, DflReq{q, M, p0, last ? t[M - 1] : 0, x.lo, last});
         }
         if (!x.dfl) chain({q}, {ev}, K_);

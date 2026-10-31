@@ -3,10 +3,16 @@
 #pragma once
 #include "control_io.h"
 #include "control_protocol.h"
+#include <chrono>
 #include <functional>
 #include <map>
+#include <utility>
 
 namespace g6s2 {
+// wall clock in microseconds, for GR8_S2_EVENTLOG lines only (comparable across ranks up to their clock skew)
+inline long long wall_us() {
+    return (long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
 // Shared event latch: computation only takes a mutex after before_work says due.
 // A caller MUST apply the returned commit, then applied(); exceptions fail epoch.
 class EventEndpoint {
@@ -17,11 +23,14 @@ protected:
     std::optional<Commit> commit_;
     std::optional<Ack> ack_;
     bool failed_=false;
+    // wall_us() when the current notice was installed and when this rank arrived at its boundary: the notice's real
+    // margin on this rank is arrived - installed (one host, no skew). Read only by the GR8_S2_EVENTLOG commit line.
+    long long installed_us_=0, arrived_us_=0;
     void install(const Notice& n) {
         std::unique_lock<std::mutex> l(mu_);
         cv_.wait(l,[&]{return !notice_ || failed_;});
         require(!failed_,"control epoch failed");
-        gate_.announce(n);notice_=n;commit_.reset();ack_.reset();cv_.notify_all();
+        gate_.announce(n);notice_=n;commit_.reset();ack_.reset();installed_us_=wall_us();arrived_us_=0;cv_.notify_all();
     }
     void deliver(const EventCommit& e) {
         std::lock_guard<std::mutex> l(mu_);
@@ -44,7 +53,9 @@ public:
     template<class Digest> std::optional<Commit> boundary(uint64_t b,Digest&& digest) {
         try {
             if(!gate_.before_work(b))return {};
-            auto a=gate_.arrive(b,digest(),room?room():UINT32_MAX);send_ack(a);gate_.wait_commit();
+            auto a=gate_.arrive(b,digest(),room?room():UINT32_MAX);
+            {std::lock_guard<std::mutex> l(mu_);arrived_us_=wall_us();}
+            send_ack(a);gate_.wait_commit();
             std::lock_guard<std::mutex> l(mu_);require(commit_.has_value(),"missing commit payload");return commit_;
         }catch(...){fail();throw;}
     }
@@ -52,6 +63,8 @@ public:
         std::unique_lock<std::mutex> l(mu_);cv_.wait(l,[&]{return notice_.has_value() || failed_;});
         require(!failed_,"control epoch failed");return *notice_;
     }
+    // the current event's installed/arrived stamps (wall_us); call between boundary() and applied()
+    std::pair<long long,long long> stamps() {std::lock_guard<std::mutex> l(mu_);return {installed_us_,arrived_us_};}
     void applied() {
         std::lock_guard<std::mutex> l(mu_);require(notice_ && commit_ && !failed_,"apply without event commit");
         gate_.applied(*notice_,commit_->hold);notice_.reset();commit_.reset();ack_.reset();cv_.notify_all();

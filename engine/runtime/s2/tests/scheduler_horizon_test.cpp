@@ -275,8 +275,48 @@ static void randomized_agrees()
     }
 }
 
+// Config::notice_max (GR8_S2_NOTICE_MAX): the cap only. At every step of a randomized run a capped scheduler's horizon is
+// min(the default's horizon, boundary + k), its steps are the default's, pure decode targets exactly boundary + k, the
+// default (8) keeps the digest, and 1 or 9 are refused.
+static void notice_max_cap()
+{
+    for (uint32_t k = uint32_t(NOTICE_MIN); k <= uint32_t(NOTICE_MAX); ++k)
+        for (uint64_t seed = 1; seed <= 30; ++seed) {
+            Rng rng{seed * 0x9E3779B97F4A7C15ull + k};
+            Config c = cfg();
+            c.prefill_rows = rng.range(1, 64) * PAGE;
+            c.two_lanes = (rng.next() & 1) != 0;
+            Config ck = c; ck.notice_max = k;
+            Scheduler a(c), b(ck);
+            uint64_t id = 1;
+            for (unsigned i = 0; i < 300; ++i) {
+                if (a.resident() < 8 && rng.range(0, 6) == 0) {
+                    const uint32_t prompt = rng.range(1, 6000), tokens = rng.range(4, 96);
+                    admit(a, id, prompt, tokens); admit(b, id, prompt, tokens); ++id;
+                }
+                if (!a.resident()) continue;
+                CHECK(b.horizon() == std::min(a.horizon(), b.boundary() + k));
+                CHECK(step(a) == step(b));
+            }
+        }
+    for (uint32_t k = uint32_t(NOTICE_MIN); k <= uint32_t(NOTICE_MAX); ++k) {   // pure decode: exactly the cap
+        Config c = cfg(); c.notice_max = k;
+        Scheduler s(c);
+        admit(s, 1, 64, 100000);
+        for (unsigned i = 0; i < 6; ++i) (void)step(s);
+        CHECK(s.horizon() == s.boundary() + k);
+    }
+    for (uint32_t k : {0u, 1u, 9u, 100u}) { bool threw = false; Config c = cfg(); c.notice_max = k; try { c.validate(); } catch (...) { threw = true; } CHECK(threw); }
+    Config c4 = cfg(); c4.notice_max = 4;
+    CHECK(Scheduler(cfg()).digest() != Scheduler(c4).digest());
+    Config c8 = cfg(); c8.notice_max = uint32_t(NOTICE_MAX);
+    CHECK(Scheduler(cfg()).digest() == Scheduler(c8).digest());
+    std::printf("scheduler_horizon_test: notice_max 2..8: horizon == min(default, boundary + k), steps unchanged\n");
+}
+
 int main()
 {
+    notice_max_cap();
     idle_targets_the_floor();
     decode_keeps_the_constant();
     long_prefill_targets_the_floor();

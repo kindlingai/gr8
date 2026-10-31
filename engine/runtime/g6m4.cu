@@ -1643,6 +1643,8 @@ int main(int argc, char** argv)
         // (scheduler.h Config::decode_rounds); unset, 0 or 1 = off
         static_assert(g6s2::MAX_DECODE_ROUNDS == 64, "GR8_S2_DECODE_ROUNDS takes 0..64 (knobs/serving.yaml)");
         sc.decode_rounds = (uint32_t)knob::s2_decode_rounds();
+        sc.tail_first = knob::s2_tail_first();
+        sc.notice_max = (uint32_t)knob::s2_notice_max();
         sc.steering = steering_boot;
         if (rtt && rtt->local) sc.window_pages = (uint32_t)rtt->local;   // a window run lists its worst case and the window
         sc.r2_rows = (uint32_t)cp_R2;
