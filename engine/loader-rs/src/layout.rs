@@ -134,7 +134,7 @@ impl Model {
                 continue;
             }
             let w = v2plan::widths(man, l)?.ok_or(format!("the width manifest has no widths for MoE layer {l}"))?;
-            let half = |g: &[u8; NH], u: &[u8; NH], d: u8| -> Vec<u64> {
+            let half = |g: &[u8; v2plan::NH_MAX], u: &[u8; v2plan::NH_MAX], d: u8| -> Vec<u64> {
                 (0..NH).map(|h| hidden * 16 * (g[h] as u64 + u[h] as u64 + d as u64)).collect()
             };
             for e in 0..w.down.len() {

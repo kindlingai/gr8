@@ -44,6 +44,13 @@ knobs:
     unset: "off"
     doc: >-
       Debug: a directory of reference activations the step driver feeds in place of its own, layer by layer.
+  GR8_DS_MANIFEST:
+    scope: agree
+    kind: text
+    unset: "native"
+    doc: >-
+      The release manifest the loader plans from, manifests/exlr8-manifest-NAME.json. A layer whose widths are numbers
+      loads its experts as exlr8 trellis (pmcgx-k4: layers 0-7 at K4); the other layers keep the native experts.
   GR8_DS_MHC_DECOMP:
     scope: agree
     kind: flag

@@ -20,7 +20,7 @@ use crate::json::Json;
 use crate::plan::{Gen, Op, Plan};
 use crate::records;
 use crate::sha256::Sha256;
-use crate::v2plan::{Builder, Tensor, V2Image};
+use crate::v2plan::{self, Builder, Tensor, V2Image};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_char, c_void};
 use std::ops::Range;
@@ -513,6 +513,28 @@ pub struct Opts {
     pub experts: Option<usize>,
     /// leave out the G.* tensors
     pub no_globals: bool,
+    /// plan from manifests/exlr8-manifest-NAME.json: its layers with numeric widths load exlr8 trellis experts
+    /// (GR8_DS_MANIFEST); None = every layer native
+    pub manifest: Option<String>,
+}
+
+/// Blocks of 128 in an expert (2304 wide): the exlr8 v2 halves of a DS41 layer.
+const NH_DS41: usize = 18;
+
+/// The trellis layers of a release manifest: those whose first gate entry is a width (a number), with their widths.
+fn trellis_layers(dir: &str, name: &str) -> Result<BTreeMap<usize, v2plan::Widths>, String> {
+    let path = format!("{dir}/manifests/exlr8-manifest-{name}.json");
+    let man = v2plan::width_manifest(&path)?;
+    let mut out = BTreeMap::new();
+    for (k, e) in man.get("layers").and_then(Json::obj).ok_or(format!("{path}: no layers"))? {
+        let l: usize = k.parse().map_err(|_| format!("{path}: layer {k}"))?;
+        let first = e.get("gate").and_then(Json::arr).and_then(|g| g.first()).and_then(Json::arr).and_then(|r| r.first());
+        if first.and_then(Json::int).is_none() {
+            continue;
+        }
+        out.insert(l, v2plan::widths_nh(&man, l, NH_DS41)?.ok_or(format!("{path}: layer {l}"))?);
+    }
+    Ok(out)
 }
 
 /// The byte ranges of the release a rank reads: (path relative to the release, offset, bytes).
@@ -526,6 +548,8 @@ struct Planner<'a> {
     nr: usize,
     rank: usize,
     opts: Opts,
+    trellis: BTreeMap<usize, v2plan::Widths>,
+    slices: Option<v2plan::Slices>,
 }
 
 impl Planner<'_> {
@@ -787,6 +811,10 @@ impl Planner<'_> {
         self.bf16_mat(&format!("{p}.router.w"), &t("ffn.gate"), None, true)?;
         self.vector(format!("{p}.router.bias"), &t("ffn.gate.bias"))?;
         let n_exp = self.rel.dims(&t("ffn.gate"))?[0];
+        if self.trellis.contains_key(&l) {
+            self.trellis_experts(l)?;
+            return self.layer_tail(pre, &p);
+        }
         let i_sh = self.rel.dims(&t("ffn.shared_experts.w1"))?[0];
         let sl = inter_slice(i_sh, self.nr, self.rank)?;
         if sl.len() % BLK != 0 {
@@ -797,6 +825,30 @@ impl Planner<'_> {
         self.mx(&format!("{p}.sh.w2"), &t("ffn.shared_experts.w2"), None, Some(sl))?;
         let n_exp = self.opts.experts.map_or(n_exp, |m| m.min(n_exp));
         self.routed(&p, pre, n_exp)?;
+        self.layer_tail(pre, &p)
+    }
+
+    /// Layer l's experts as exlr8 trellis (the manifest gave it numeric widths): the tr3.* tensors of the 128-blocks
+    /// this rank owns, routed and shared, built from the width files and the index slices (src/v2plan.rs).
+    fn trellis_experts(&mut self, l: usize) -> Result<(), String> {
+        let (nr, rank, dir) = (self.nr, self.rank, self.rel.dir.clone());
+        let slices = self.slices.as_ref().ok_or("trellis layers without index slices")?;
+        let first = self.b.segs.len();
+        v2plan::v2_layer(&mut self.b, l, &self.trellis[&l], slices, &|l, k| v2plan::width_file(&dir, l, k),
+                         &|e| Ok(v2plan::formula_halves_nh(e, l, nr, rank, NH_DS41)))?;
+        // the fetch list: the width-file ranges those tensors copy
+        let runs: Vec<(String, u64, u64)> = self.b.segs[first..].iter().filter(|g| g.op == Op::Copy)
+            .map(|g| (self.b.files[g.file].clone(), g.file_off, g.nbytes)).collect();
+        for (path, off, n) in runs {
+            let rel = path.strip_prefix(&format!("{dir}/")).unwrap_or(&path).to_string();
+            self.reads.entry(rel).or_default().push((off, n));
+        }
+        Ok(())
+    }
+
+    /// The rest of a layer after its experts: the DSpark heads and the Engram weights a layer has.
+    fn layer_tail(&mut self, pre: &str, p: &str) -> Result<(), String> {
+        let t = |s: &str| format!("{pre}{s}");
         // DSpark layers: the first one joins the trunk, the last one carries the output heads
         if self.rel.has(&t("main_norm.weight")) {
             self.vector(format!("{p}.main_norm"), &t("main_norm.weight"))?;
@@ -893,7 +945,13 @@ pub fn plan_from(rel: &Release, nr: usize, rank: usize, opts: &Opts) -> Result<D
     if nr == 0 || nr > O_GROUPS || rank >= nr {
         return Err(format!("rank {rank} of {nr}: attention splits {O_GROUPS} O-groups, so 1 <= nr <= {O_GROUPS}"));
     }
-    let mut p = Planner { b: Builder::new(), rel, used: BTreeSet::new(), reads: BTreeMap::new(), nr, rank, opts: opts.clone() };
+    let trellis = match &opts.manifest {
+        Some(m) if m != "native" => trellis_layers(&rel.dir, m)?,
+        _ => BTreeMap::new(),
+    };
+    let slices = if trellis.is_empty() { None } else { Some(v2plan::Slices::open(&rel.dir, nr, &[rank])?) };
+    let mut p = Planner { b: Builder::new(), rel, used: BTreeSet::new(), reads: BTreeMap::new(), nr, rank, opts: opts.clone(),
+                          trellis, slices };
     let n_main = rel.dense.keys().filter(|&&l| l < MTP0).count();
     if rel.dense.keys().copied().take(n_main).ne(0..n_main) {
         return Err(format!("{}: the main layers are not 0..{n_main}", rel.dir));
@@ -1241,7 +1299,8 @@ pub unsafe extern "C" fn g6l_ds41_plan(release_dir: *const c_char, nr: u32, rank
     let t0 = Instant::now();
     let arg = |p, what| crate::cstr(p).ok_or(format!("g6l_ds41_plan: no {what}"));
     let r = (|| {
-        let p = plan(&arg(release_dir, "release dir")?, nr as usize, rank as usize, &Opts::default())?;
+        let opts = Opts { manifest: gr8knobs::DS_MANIFEST.get().map(str::to_string), ..Opts::default() };
+        let p = plan(&arg(release_dir, "release dir")?, nr as usize, rank as usize, &opts)?;
         let out = arg(out_manifest, "output manifest")?;
         let zeros = vec!["0".repeat(64); p.img.tensors.len()];
         std::fs::write(&out, manifest_json(&p.img, &zeros, nr as usize)).map_err(|e| format!("{out}: {e}"))?;
