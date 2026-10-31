@@ -18,6 +18,7 @@
 
 pub mod codebook;
 pub mod dflash2;
+pub mod ds41;
 pub mod exlr8;
 pub mod fetch;
 pub mod json;
