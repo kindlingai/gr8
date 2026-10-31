@@ -919,12 +919,14 @@ int main(int argc, char** argv)
             pf_run(p, lk, 1, 1, &got); cmp_bytes((std::string(tag) + " wm image table == pack layout").c_str(), ref, got, ob);
             pf_run(p, lk, 2, 0, &got); cmp_bytes((std::string(tag) + " scattered slabs == pack layout").c_str(), ref, got, ob);
             pf_run(p, lk, 2, 1, &got); cmp_bytes((std::string(tag) + " wm scattered slabs == pack layout").c_str(), ref, got, ob);
-            // q8: k_pf_fc1q on MXFP8 rows
+            // q8: k_pf_fc1q on MXFP8 rows (hq / hs: the scratch holds them only under GR8_PF_Q8, so the test allocates its own)
             {
                 bindp::Expert A, S;
+                uint8_t* hq = static_cast<uint8_t*>(alloc(static_cast<size_t>(M) * HID));
+                uint8_t* hs = static_cast<uint8_t*>(alloc(static_cast<size_t>(M) * (HID / 32)));
                 auto q8run = [&](int v, std::vector<uint8_t>& h) {
                     pf_make(p, lk, v, 0, A, S);
-                    A.q8 = 1; A.hq = p.sc.hq; A.hs = p.sc.hs;
+                    A.q8 = 1; A.hq = hq; A.hs = hs;
                     CK(cudaMemsetAsync(p.out, 0xff, ob, st));
                     bindp::launch_hx(A, st);
                     bindp::launch_shared(S, st);
@@ -938,6 +940,39 @@ int main(int argc, char** argv)
                 q8run(0, q0); sane((std::string(tag) + " q8 (k_pf_fc1q)").c_str(), q0);
                 q8run(1, q1); cmp_bytes((std::string(tag) + " q8 image table == q8 pack layout").c_str(), q0, q1, ob);
                 q8run(2, q2); cmp_bytes((std::string(tag) + " q8 scattered slabs == q8 pack layout").c_str(), q0, q2, ob);
+            }
+            // the parked weight-major forms (PF_WM_WS=0: k_pf_fc1w; PF_F2WS=1: k_pf_fc2ws), launched here as their
+            // launchers would, in the wm pass: byte-equal to the plain pass through every layout
+            {
+                constexpr int EB = g6nr::EB;
+                static bool attr = false;
+                if (!attr)
+                {
+                    CK(cudaFuncSetAttribute(bindp::k_pf_fc1w<EB, TR3_MCG>, cudaFuncAttributeMaxDynamicSharedMemorySize, bindp::WM_SMEM));
+                    CK(cudaFuncSetAttribute(bindp::k_pf_fc2ws<EB, false, TR3_MCG>, cudaFuncAttributeMaxDynamicSharedMemorySize, bindp::F2S_SMEM));
+                    CK(cudaFuncSetAttribute(bindp::k_pf_fc2ws<EB, false, TR3_MCG>, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+                    attr = true;
+                }
+                auto parked = [&](int v, std::vector<uint8_t>& h) {
+                    bindp::Expert A, S;
+                    pf_make(p, lk, v, 1, A, S);
+                    CK(cudaMemsetAsync(p.out, 0xff, ob, st));
+                    bindp::launch_hx(A, st);
+                    bindp::launch_shared(S, st);
+                    bindp::launch_route(A, st);
+                    bindp::k_pf_fc1w<EB, TR3_MCG><<<dim3(2 * EB, bindp::pass_wtiles(A)), 512, bindp::WM_SMEM, st>>>(A);
+                    bindp::launch_mid(A, st);
+                    bindp::k_pf_fc2ws<EB, false, TR3_MCG><<<dim3(HID / 128 / bindp::F2S_GL, 2 * bindp::pass_wtiles(A)), 384, bindp::F2S_SMEM, st>>>(A);
+                    bindp::launch_fin(A, st);
+                    h.assign(ob, 0);
+                    CK(cudaMemcpyAsync(h.data(), p.out, ob, cudaMemcpyDeviceToHost, st));
+                    CK(cudaStreamSynchronize(st));
+                    CK(cudaGetLastError());
+                };
+                std::vector<uint8_t> w0, w1, w2;
+                parked(0, w0); cmp_bytes((std::string(tag) + " k_pf_fc1w + k_pf_fc2ws == plain, pack layout").c_str(), ref, w0, ob);
+                parked(1, w1); cmp_bytes((std::string(tag) + " k_pf_fc1w + k_pf_fc2ws image table == pack layout").c_str(), ref, w1, ob);
+                parked(2, w2); cmp_bytes((std::string(tag) + " k_pf_fc1w + k_pf_fc2ws scattered slabs == pack layout").c_str(), ref, w2, ob);
             }
             CK(cudaFree(p.blk));
         }

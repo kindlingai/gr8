@@ -86,13 +86,14 @@ struct Pool
         if (!oversize) cur = i;
         return i;
     }
-    // a slab of n bytes (rounded up to SLAB_ALIGN); nullptr + err on failure
-    uint8_t* take(size_t n, const char*& err)
+    // a slab of n bytes (rounded up to SLAB_ALIGN); nullptr + err on failure. fresh: never a free-list slab (one carved
+    // at the bump pointer)
+    uint8_t* take(size_t n, const char*& err, bool fresh = false)
     {
         err = nullptr;
         n = round(n);
         auto it = free_by_size.find(n);
-        if (it != free_by_size.end() && !it->second.empty())
+        if (!fresh && it != free_by_size.end() && !it->second.empty())
         {
             uint8_t* p = it->second.back();
             it->second.pop_back();
@@ -141,7 +142,8 @@ struct Table
     int rows = 0, eb = 0;
     Mode mode = OFF;
     size_t slab_bytes = 0;                // SCATTER: bytes taken from the pool
-    int reshuffles = 0;                   // SCATTER: shuffles it took until no image-adjacent pair stayed adjacent
+    int reshuffles = 0;                   // SCATTER: shuffles redrawn because an image-adjacent pair would have stayed adjacent
+    int relocated = 0;                    // SCATTER: pieces moved after the copy because a pair still was (chunk boundaries)
 
     Table() = default;
     Table(const Table&) = delete;
@@ -153,8 +155,8 @@ struct Table
         if (dev) cudaFree(dev);
         dev = o.dev; o.dev = nullptr;
         host = std::move(o.host); bytes = std::move(o.bytes);
-        rows = o.rows; eb = o.eb; mode = o.mode; slab_bytes = o.slab_bytes; reshuffles = o.reshuffles;
-        o.rows = o.eb = 0; o.mode = OFF; o.slab_bytes = 0; o.reshuffles = 0;
+        rows = o.rows; eb = o.eb; mode = o.mode; slab_bytes = o.slab_bytes; reshuffles = o.reshuffles; relocated = o.relocated;
+        o.rows = o.eb = 0; o.mode = OFF; o.slab_bytes = 0; o.reshuffles = o.relocated = 0;
         return *this;
     }
     ~Table() { if (dev) cudaFree(dev); }
@@ -225,8 +227,9 @@ inline size_t adjacent_pairs(const Table& t, const std::vector<const uint8_t*>& 
 // device tensors, rows = tr3.table's rows (NEXP, or NEXP + 1 with the trellis shared expert). Call after
 // bind::widen_fc1 / widen_fc2 (SCATTER copies the bytes as they are). Synchronous. SCATTER: the pieces are shuffled
 // (Fisher-Yates from a seed of the layer's rows and fc1 address) and bump-allocated from the pool in that order; a
-// shuffle that leaves an image-adjacent pair adjacent is redrawn (up to 64 times) before any slab is taken, so the
-// built table has none (Table::reshuffles counts the redraws).
+// shuffle that would leave an image-adjacent pair adjacent is redrawn before any slab is taken, and a pair that still
+// is afterwards (a chunk boundary the dry run could not place) has its second piece moved to a fresh slab, so the built
+// table has none, or build fails (Table::reshuffles / relocated count both).
 inline const char* build(Table& t, const void* tab, const void* kmix, const uint8_t* fc1, const uint8_t* fc2, int rows, int eb,
                          Mode mode, Pool& pool, cudaStream_t st)
 {
@@ -282,18 +285,35 @@ inline const char* build(Table& t, const void* tab, const void* kmix, const uint
             if (!adj) break;
             ++t.reshuffles;
         }
-        if (adj) return "ptab: no shuffle without an adjacent pair in 256 tries";
         std::vector<const uint8_t*> src = t.host;
-        for (size_t i : order)
-        {
+        auto place = [&](size_t i, bool fresh) -> const char* {
             const char* err;
-            uint8_t* p = pool.take(t.bytes[i], err);
+            uint8_t* p = pool.take(t.bytes[i], err, fresh);
             if (!p) return err;
             if (cudaMemcpyAsync(p, src[i], t.bytes[i], cudaMemcpyDeviceToDevice, st) != cudaSuccess) return "ptab: piece copy failed";
             t.host[i] = p;
             t.slab_bytes += Pool::round(t.bytes[i]);
+            return nullptr;
+        };
+        for (size_t i : order)
+            if (const char* e = place(i, false)) return e;
+        // The dry run cannot see where a chunk the pool had not allocated yet lands (or which free-list slab a take
+        // returns), so a pair can still come out adjacent across a chunk boundary. Each such pair's second piece moves
+        // to a fresh slab at the pool's bump pointer, which follows every slab taken so far and so is adjacent to none
+        // of their image neighbours; the old slab goes to the free list (a later layer's build may take it).
+        for (int pass = 0; pass < 1024; ++pass)
+        {
+            size_t bad = t.n();
+            for (size_t i = 2; i < t.n(); ++i)
+                if (t.bytes[i] && t.bytes[i - 2] && t.host[i] == t.host[i - 2] + Pool::round(t.bytes[i - 2])) { bad = i; break; }
+            if (bad == t.n()) break;
+            uint8_t* old = const_cast<uint8_t*>(t.host[bad]);
+            t.slab_bytes -= Pool::round(t.bytes[bad]);
+            if (const char* e = place(bad, true)) return e;
+            pool.give(old, t.bytes[bad]);
+            ++t.relocated;
         }
-        if (adjacent_pairs(t, t.host)) return "ptab: an image-adjacent pair of pieces got adjacent slabs (the pool placed a slab the dry run did not predict)";
+        if (adjacent_pairs(t, t.host)) return "ptab: an image-adjacent pair of pieces is adjacent in memory after the relocations";
     }
     return upload(t, st);
 }
