@@ -10,8 +10,8 @@
 //   C  the 4096-row call run twice: identical (determinism);
 //   D  no output word is the 0xFFFF poison (every row x column written; outputs are poisoned before every call);
 //   CONTROL  one input row (3000) changed: that row must differ and every other row must stay identical (the compare can fail; row independence).
-// Exit 0 = "W4096_RO_ALL_PASS". Weights: random records, a pool of 4 routed experts (expert id % 4, test-only remap of slot_expert as
-// ds_ro_flags_test.cu), random shared-expert MXFP8 records; the values are not a model, the test compares kernel against kernel.
+// Exit 0 = "W4096_RO_ALL_PASS". Weights: random records, a pool of 4 routed experts (expert id % 4, test-only remap of slot_expert),
+// random shared-expert MXFP8 records; the values are not a model, the test compares kernel against kernel.
 //   (no argument)  usage + memory need; no CUDA call.    gpu   run (refuses unless aarch64 and an sm_121 device).
 // Build (compiles on any CUDA host; the bin runs on a spark only):
 //   nvcc -O2 -std=c++17 -gencode=arch=compute_121a,code=sm_121a -Xcompiler -Wall -I engine/kernels -o ds_ro_w4096_test engine/kernels/tests/ds_ro_w4096_test.cu
@@ -46,7 +46,7 @@ __device__ __forceinline__ uint32_t hash32(uint32_t i, uint32_t seed)
     h ^= h >> 15; h *= 2246822519u; h ^= h >> 13; h *= 3266489917u; h ^= h >> 16;
     return h;
 }
-__global__ void k_fill_mx4(uint8_t* p, size_t nrec, uint32_t seed)                // ds_ro_flags_test.cu: 512 random fp4 bytes + 32 scales 2^-10..2^-3
+__global__ void k_fill_mx4(uint8_t* p, size_t nrec, uint32_t seed)                // 512 random fp4 bytes + 32 scales 2^-10..2^-3
 {
     const size_t tot = nrec * mx4::GR;
     for (size_t i = blockIdx.x * 256ull + threadIdx.x; i < tot; i += 256ull * gridDim.x)
@@ -74,7 +74,7 @@ __global__ void k_fill_f32(float* p, size_t n, uint32_t seed)                   
     for (size_t i = blockIdx.x * 256ull + threadIdx.x; i < n; i += 256ull * gridDim.x)
         p[i] = (static_cast<float>(hash32(static_cast<uint32_t>(i), seed) & 0xffffffu) / 16777215.f - 0.5f) * 16.f;
 }
-__global__ void k_pool_remap(int* slot_expert, const int* n_slots, int pool)       // test-only (ds_ro_flags_test.cu): slot -> weight pool expert
+__global__ void k_pool_remap(int* slot_expert, const int* n_slots, int pool)       // test-only: slot -> weight pool expert
 {
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s < *n_slots) slot_expert[s] = slot_expert[s] % pool;

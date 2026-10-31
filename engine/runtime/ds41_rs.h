@@ -1,5 +1,5 @@
 // DS41 prefill big combine as reduce-scatter + all-gather (GR8_DS_PF_RS=1, default off). Host rules and the slot index math,
-// shared by the kernels (ds41_rs.cuh), the host wiring (g6m4.cu, ds41_step.cuh) and the host test (engine/tests/test_ds41_rs.cpp).
+// shared by the kernels (ds41_rs.cuh) and the host wiring (g6m4.cu, ds41_step.cuh).
 // No CUDA, no fabric types. Every rank owns Q = ceil(M / NR)
 // rows (rank q: rows [q Q, min(M, (q + 1) Q)), the last ranks may own fewer or none), so every RS slice and every AG payload is Q rows
 // (Q x H x 2 bytes; a peer's tail sits at the same offset for every peer and glue::wait_peers works unchanged). The rows past M in a

@@ -1,7 +1,7 @@
 // GR8_L2PF targets of a DS41 layer. MoE: the gate (l2pf::T_ROUTER) and the shared expert's three records (l2pf::T_SHARED),
 // in the order ST_ROUTER and ST_SHARED read them (gate, fc1 = sh_w1 + sh_w3, fc2 = sh_w2). Attention (add_attn): the projection records
 // the attention decode GEMV reads first, q_a + kv (l2pf::T_XIN) and q_b (l2pf::T_QB), for the MLP-collective window of the layer before. Global scope, host only: the
-// sizes are the shapes bind_moe checks, so tests/ds41_l2pf_queue_test.cu can run them without a Model. The queue, the pacing,
+// sizes are the shapes bind_moe checks. The queue, the pacing,
 // the windows and the env (GR8_L2PF*) are kernels/l2pf.cuh's; ds41_step.cuh places the windows (ds41_l2pf_window).
 // Nothing here launches a kernel or reads a weight.
 #pragma once

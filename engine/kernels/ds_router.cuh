@@ -343,7 +343,6 @@ __global__ void __launch_bounds__(256) k_gate_logits_mt(const __nv_bfloat16* __r
 // per K piece (lane + 32 i) it loads the 8 tokens' x pieces once, converts them once, and runs all 8 experts on them (64 independent chains).
 // The bits are k_gate_logits_mt's: per (token, expert, lane) the chain is acc = 0.f, then for i = 0..19, j = 0..7: acc = fmaf(w[8 (lane + 32 i) + j], x[same], acc)
 // (a loop order change between independent chains does not change any chain), then the same xor butterfly 16, 8, 4, 2, 1 and lane 0's store.
-// gro_group() is the one body the kernel and the host test (tests/ds_gate_ro_test.cu) both run, lane by lane on the CPU.
 constexpr int GRO_EXP = 8;                                              // experts per CTA (grid.x = NE / 8, as k_gate_logits_mt)
 constexpr int GRO_TOK = 8;                                              // tokens per warp tile
 constexpr int GRO_PIECES = HIDDEN / 8;                                  // 16-byte pieces per row

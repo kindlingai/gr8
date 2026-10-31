@@ -1,5 +1,5 @@
-// GR8_DS_WAIT_K: who waits for the peers' payload before a DS41 consume kernel. Host-only, no CUDA; ds41_step.cuh's ds41_consume_wait calls it,
-// engine/tests/test_ds41_wait.cpp checks it. Must stay outside namespace g6rt (like ds41_ops.h).
+// GR8_DS_WAIT_K: who waits for the peers' payload before a DS41 consume kernel. Host-only, no CUDA; ds41_step.cuh's ds41_consume_wait calls it.
+// Must stay outside namespace g6rt (like ds41_ops.h).
 //   off (default): the consume kernel waits itself (Ds41Block::wait, wait_payload = bytes of the slot payload; the tail sits right behind them)
 //   on:            one CTA waits first (glue::k_wait_peers(c, payload)), the consume kernel gets wait_payload = 0 and skips its own wait
 //   relay (K=2):   no wait kernel; the consume kernel starts at once, CTA (0,0) waits for the peers (glue::wait_peers) and releases a device word, every

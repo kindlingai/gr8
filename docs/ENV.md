@@ -420,7 +420,6 @@ Read by test programs, audits and benchmarks. `g6m4 --serve` refuses to start wh
 | `GR8_TEST_DS41_KERNELS_DIR` | path | unset |  | engine/kernels, for the loader test that checks the Rust mx4g packer against the C++ one (mxfp4_pack.h); unset skips it. |
 | `GR8_TEST_DS41_M4_PFW` | int | `0` | 0.. | m4sim: the prompt runs in W-row chunks of this many rows (it must equal GR8_DS_PREFILL_W and exceed MX); 0 runs it as decode steps. |
 | `GR8_TEST_DS41_MGATE_DIAG` | flag | `0` |  | ds41_attn_test --mgate: 1 prints, for a kv compare that differs, up to 8 differing elements of the chunk and of the single-row calls, before and after kv prep. |
-| `GR8_TEST_DS41_RO_CAP_MB` | float | `400` | 0.. | ds_ro_flags_test: the memory cap in MB on the test's device and host allocations. A mode that would allocate more stops before it runs. |
 | `GR8_TEST_DS41_TOKENIZER_DIR` | path | unset |  | The DeepSeek-V4.1-Flash tokenizer directory (tokenizer.json, tokenizer_config.json) the front end's ds41 dialect test reads; unset skips it. |
 | `GR8_TEST_FUZZ_ROUNDS` | int | `40` |  | Rounds of the front end tokenizer fuzz test. |
 | `GR8_TEST_IDX_DUMP` | path | unset |  | m4sim writes rank 0's selected key ids of the first --layers layer to this file for each main step from GR8_LOGIT_DUMP_FROM on. |

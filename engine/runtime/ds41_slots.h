@@ -1,5 +1,5 @@
 #pragma once
-// SESS (S2 session slots) range checks of build_ds41 and ds41dsp_ops::build, host-only (no CUDA) so engine/tests/test_ds41_slots.cpp runs them.
+// SESS (S2 session slots) range checks of build_ds41 and ds41dsp_ops::build, host-only (no CUDA).
 // nullptr = ok, else the reason. The draft Model has one ring slab per S2 slot like the main Model: same range for both.
 namespace ds41slots {
 constexpr int MAX_SLOTS = 32;
