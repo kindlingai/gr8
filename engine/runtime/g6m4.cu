@@ -337,8 +337,9 @@ int main(int argc, char** argv)
     // S2 keeps --mtp next to the drafter: a session alone at its prompt tail runs DFlash2, the others MTP (s2_batch.h)
     if (dfl && (dfl_file.empty() || (mtp && !s2mode) || dfl_sel < -1 || dfl_sel > 1 || dfl_k < 1 || dfl_k > dfl::K))
         die("--dflash-manifest needs --dflash-pack, and replaces --mtp (7 drafts per round) except under S2; --dflash-sel 0|1; --dflash-k 1..7");
-    // TP=6 runs the drafter body replicated (dflash.cuh dfl::REP); TP=3 would too, but is not built or measured for it
-    if (dfl && dfl::REP && g6nr::NR != 6) die("--dflash: TP=" + std::to_string(g6nr::NR) + " has no DFlash2 drafter (TP=4 splits it, TP=6 replicates it)");
+    // TP=6 runs the drafter body replicated (dflash.cuh dfl::REP), and so does Flash at TP=3; GLM-5.3's TP=3 would too, but is not measured
+    if (dfl && dfl::REP && g6nr::NR != 6 && !(G6_MODEL_FLASH && g6nr::NR == 3))
+        die("--dflash: TP=" + std::to_string(g6nr::NR) + " has no DFlash2 drafter (TP=4 splits it, TP=6 and Flash's TP=3 replicate it)");
     if (plan.rs && !mtp && !dfl) die("--spec-accept rejection needs --mtp or --dflash-manifest");
     const int K = dfl ? dfl::K : mtp;   // drafts per round
 #if G6_MODEL_FLASH

@@ -21,7 +21,7 @@
 // so a step reads at most 2055 positions; DflIn::lo is the lowest position written for this sequence.
 // The draft step has its own fabric region (NC collectives, decode-sized slots), step counter and DflIn / DflOut, and
 // runs as one captured graph (dfl_step), or phase by phase with a loopback driver delivering between phases (dfl_phase).
-// Replicated body (dfl::REP: a width whose ranks cannot split the 8 KV heads, TP=6): every rank runs the whole body on
+// Replicated body (dfl::REP: a width whose ranks cannot split the 8 KV heads, TP=6 and Flash's TP=3): every rank runs the whole body on
 // the target residual taps, which are already the same on every rank, so the body has no collective. fc, q, kv and gu
 // are full-width; o_proj and down_proj stay TP4's four K-slices (D<j>.o<v>.gv, D<j>.down<v>.gv), each into its own BF16
 // partial, summed p = 0..3 by the same consume kernel through a local fabric view (rank -1, ncoll 0: peer p's slot is
@@ -46,7 +46,7 @@ constexpr int B = 8, K = B - 1;               // block rows (bonus + drafts) = v
 constexpr int L = geom::DFL_L, NT = geom::DFL_NT;   // drafter layers, tapped target layers (6, 6; Flash 5, 5)
 constexpr int HD = 128, NH = geom::DFL_NH, NKV = 8, INTER = 12288;   // q heads: 64, Flash 32
 constexpr bool OK_NR = NKV % g6nr::NR == 0;   // TP4 (and TP1/2/8): the body split across the ranks
-constexpr bool REP = !OK_NR;                  // TP6 (TP3 builds, g6m4 refuses it): the replicated body (header)
+constexpr bool REP = !OK_NR;                  // TP6 and Flash's TP3 (GLM's builds, g6m4 refuses it): the replicated body (header)
 constexpr int DNR = REP ? 1 : g6nr::NR;       // the body's split
 constexpr int NHR = NH / DNR, NKR = NKV / DNR;
 constexpr int NIR = INTER / DNR, NFR = HID / DNR;
