@@ -14,11 +14,13 @@
 //   fc1         k_fc1_tc: CTA = (expert slot, CW chunks of 16 intermediate rows), a warp per chunk = gate + up (two A tiles) x NTG token tiles;
 //               the expert's tiles are walked in groups of NTG as k_fc1_ro does; K streams through an ST-deep cp.async ring of 128-k stages of the
 //               group's rows (gathered by tile_tok). fp32 accumulate over all of K in one warp (no k split), swiglu_lim, fp16 act as k_fc1_ro.
-//   fc2         k_fc2_tc: CTA = (expert slot, WARPS x WT output tiles of 16 rows), the group's act records (all 576 k) staged in smem once per
-//               group; a warp runs its WT tiles x NTG token tiles. Epilogue = k_fc2_ro's (tile_w, tile_mask, fp16 ypart).
+//   fc2         k_fc2_tc: CTA = (expert slot, gy), a warp per TW token tiles with their act records in registers; the expert's fc2 records stream
+//               through a cp.async ring once per group of WARPS x TW tiles, every warp reading every A fragment. Epilogue = k_fc2_ro's (tile_w, tile_mask,
+//               fp16 ypart).
 // Not bit-equal to the fp16 path (the activations are rounded to E4M3 and the tensor cores sum in their own order); accepted as a configuration,
 // like GR8_DS_ATTN_TC. Plain launches only. Microbench + accuracy gate: tests/ds_moe_tc_bench.cu.
 #pragma once
+#include <type_traits>
 #include "mxfp4.cuh"
 #include "ds_ro.h"
 
@@ -46,6 +48,7 @@ struct Args
     const int* n_tiles_dev;       // the plan's tile count: k_aq quantizes rows < 8 * *n_tiles_dev (nullptr = every row of its grid)
     int n_slots;
     int gy1, gy2;                 // token-group split of k_fc1_tc / k_fc2_tc: CTA (x, gy) walks groups gy, gy + GY, ..; gy is the fastest index of blockIdx.x
+    int os2;                      // k_fc2_tc: the expert's output tiles split over os2 CTAs (the next index after gy); grid = n_slots * os2 * gy2
     float limit;
     __half* act;                  // [tile][8][I] fp16 (fc1 out)
     uint8_t* aq;                  // [tile * 8][I / 64][XREC]  act quantized (k_aq)
@@ -71,8 +74,8 @@ __device__ __forceinline__ void mma_mx(float (&d)[4], u32 a0, u32 a1, u32 a2, u3
 }
 // A record word w = {row r byte c, row r+8 byte c, row r byte c+4, row r+8 byte c+4} (mxfp4.cuh) -> the four containers of row r (x4lo) and
 // row r+8 (x4hi): nibbles (byte c low, byte c high, byte c+4 low, byte c+4 high) at bits 5..2 of containers 0..3.
-__device__ __forceinline__ u32 x4lo(u32 w) { return ((w << 2) & 0x003C003Cu) | ((w << 6) & 0x3C003C00u); }
-__device__ __forceinline__ u32 x4hi(u32 w) { return ((w >> 6) & 0x003C003Cu) | ((w >> 2) & 0x3C003C00u); }
+__device__ __forceinline__ u32 x4lo(u32 w) { if constexpr (MXTC_ABL == 6) return w; return ((w << 2) & 0x003C003Cu) | ((w << 6) & 0x3C003C00u); }
+__device__ __forceinline__ u32 x4hi(u32 w) { if constexpr (MXTC_ABL == 6) return w ^ 0x5a5a5a5au; return ((w >> 6) & 0x003C003Cu) | ((w >> 2) & 0x3C003C00u); }
 // One lane's share of a record in smem: the 4 k16 words and its scale word, pre-shifted so byte 2 h is the lane's row scale of k32 group h
 // (the record word is {g0 row r, g0 row r+8, g1 row r, g1 row r+8}: an even lane scales row r, an odd lane row r + 8).
 struct Rec
@@ -304,23 +307,43 @@ __global__ void __launch_bounds__(CW * 32) k_fc1_tc(Args A)
 }
 
 // ---------------------------------------------------------------------------------------------------- fc2
-// CTA = (slot, TPC = WARPS * WT output tiles, gy), warp w = tiles ot0 + w WT .. + WT - 1. grid = n_slots * (NOUT / 16 / TPC) * GY (gy fastest, as k_fc1_tc),
-// block WARPS * 32, dynamic smem fc2_smem<I, WARPS, WT, NTG, ST>(): the group's rows of aq [NTOK][I] and as [NTOK][ASP] (staged once per group) and an
-// ST-deep ring of A stages, a stage = one record of each of the CTA's TPC tiles (cp.async, as k_fc1_tc). The record loop is unrolled (NG = 9), so the
-// ring slot and the scale byte are constants.
-template <int I, int WARPS, int WT, int NTG, int ST> constexpr size_t fc2_smem() { return static_cast<size_t>(NTG) * 8 * (I + ASP) + static_cast<size_t>(ST) * WARPS * WT * GR; }
-template <int I, int NOUT, int WARPS, int WT, int NTG, int ST>
-__global__ void __launch_bounds__(WARPS * 32) k_fc2_tc(Args A)
+// CTA = (slot, os, gy), WARPS warps, warp w owns token tiles w TW .. w TW + TW - 1 of the group (NTOK = WARPS * TW * 8 rows), CTA os walks output tile
+// blocks os NB / OS .. (os + 1) NB / OS - 1; grid = n_slots * OS * GY (gy fastest, then os, as k_fc1_tc), block WARPS * 32, dynamic smem
+// fc2_smem<WARPS, TPC, ST>(). OS > 1 makes more and shorter CTAs for the same weight bytes (145 groups of 360 stages were 1.5 waves of 96 CTAs). The warp's rows of aq (9 records x 16 B per lane and tile) and their scale words sit in
+// REGISTERS for the whole group, and the CTA streams the expert's fc2 records once per group, tile-major, through an ST-deep cp.async ring (a stage = one
+// record of TPC output tiles, 272 16-B pieces), every warp reading every A fragment from smem. So the expert's 1.57 MB of fc2 weights move L2 -> SM once per
+// 64 tokens instead of once per 32 for each of 20 CTAs (the earlier loop, bound by that copy traffic at 2 x its DRAM floor). After a block's 9 records the warp
+// writes ypart for its TPC x TW tiles and goes on; the ring runs on across blocks and restarts per group. The record loop is unrolled, so the scale byte
+// (2 r + h) and the register index are constants. The epilogue stages a tile's 8 rows x TPC 16 columns in smem and stores whole 16-B pieces: the
+// fragment-order 2-byte stores (four half-sectors in four rows per warp store) were 35-40% of the kernel.
+constexpr int YP = 136;           // fc2 output staging: halves per row (128 columns + 8 of pad: the four token rows a lane writes land in different banks)
+template <int WARPS, int TPC, int ST> constexpr size_t fc2_smem() { return static_cast<size_t>(ST) * TPC * GR + static_cast<size_t>(WARPS) * 8 * YP * 2; }
+// f(integral_constant<int, 0>) .. f(integral_constant<int, N - 1>): a loop whose index is a constant (the mma's scale byte and the register index need one)
+template <int N, class F>
+__device__ __forceinline__ void static_for(F&& f)
 {
-    constexpr int NG = I / KG, OT = NOUT / 16, TPC = WARPS * WT, UPS = OT / TPC, NTOK = NTG * 8, SA_B = NTOK * I, BREG = NTOK * (I + ASP), AST = TPC * GR, NTH = WARPS * 32;
-    constexpr int ACH = GR / 16, NA = (TPC * ACH + NTH - 1) / NTH;
-    static_assert(I % KG == 0 && OT % TPC == 0 && I % 16 == 0 && ST >= 2 && ST - 1 <= NG && NG % 2 == 1, "fc2 tc tiling");
+    if constexpr (N > 0)
+    {
+        static_for<N - 1>(f);
+        f(std::integral_constant<int, N - 1>{});
+    }
+}
+template <int I, int NOUT, int WARPS, int TW, int TPC, int ST>
+__global__ void __launch_bounds__(WARPS * 32, 2) k_fc2_tc(Args A)
+{
+    constexpr int NG = I / KG, OT = NOUT / 16, NB = OT / TPC, NTG = WARPS * TW, NTH = WARPS * 32, AST = TPC * GR, ACH = GR / 16, NA = (TPC * ACH + NTH - 1) / NTH;
+    constexpr int NSW = (NG + 1) / 2;                                        // scale words per row (2 records each)
+    static_assert(I % KG == 0 && OT % TPC == 0 && I % 16 == 0 && ST >= 2 && ST - 1 <= NG && NSW * 4 <= ASP, "fc2 tc tiling");
+    static_assert(TPC * 16 <= 128 && (TPC * 16) % 8 == 0 && YP % 8 == 0, "fc2 tc output staging: a row of 16-B pieces");
     extern __shared__ __align__(16) uint8_t sm[];
+    __half* ys = reinterpret_cast<__half*>(sm + ST * AST) + (threadIdx.x >> 5) * 8 * YP;   // the warp's output stage [8 rows][YP]
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, c = lane & 3, tid = threadIdx.x;
-    const int GY = A.gy2, gy = blockIdx.x % GY, slot = blockIdx.x / (UPS * GY), ot0 = ((blockIdx.x / GY) % UPS) * TPC;
+    const int GY = A.gy2, OS = A.os2, gy = blockIdx.x % GY, os = (blockIdx.x / GY) % OS, slot = blockIdx.x / (GY * OS);
     if (A.n_slots_dev && slot >= *A.n_slots_dev) return;
     const int nt = A.slot_nt[slot], tile0 = A.slot_tile0[slot], ng = dsr::ro_ngroups(nt, NTG);
-    const uint8_t* s = A.fc2 + dsr::ro_fc2_rec(A.slot_expert[slot], ot0, 0, OT, NG) * GR;   // tile ot0 + j record r at s + (j NG + r) GR
+    if (gy >= ng) return;
+    const int b0 = os * NB / OS, nb = (os + 1) * NB / OS - b0, nstg = nb * NG;   // this CTA's output tile blocks and stages per group
+    const uint8_t* s = A.fc2 + dsr::ro_fc2_rec(A.slot_expert[slot], 0, 0, OT, NG) * GR;   // tile ot record r at s + (ot NG + r) GR
     const uint8_t* srca[NA];
     u32 dsta[NA];
     #pragma unroll
@@ -328,92 +351,109 @@ __global__ void __launch_bounds__(WARPS * 32) k_fc2_tc(Args A)
     {
         const int i = tid + k * NTH, j = i / ACH, q = i % ACH;
         srca[k] = s + static_cast<size_t>(j) * NG * GR + q * 16;
-        dsta[k] = BREG + j * GR + q * 16;
+        dsta[k] = j * GR + q * 16;
     }
-    auto issue = [&](int st, int r)
+    auto issue = [&](int st, int gs)                                         // stage gs = record gs % NG of tiles (b0 + gs / NG) TPC .. + TPC - 1
     {
+        const size_t off = (static_cast<size_t>(b0 + gs / NG) * TPC * NG + gs % NG) * GR;
         #pragma unroll
         for (int k = 0; k < NA; ++k)
-            if (tid + k * NTH < TPC * ACH) cp16(sm + st * AST + dsta[k], srca[k] + r * GR);
+            if (tid + k * NTH < TPC * ACH) cp16(sm + st * AST + dsta[k], srca[k] + off);
     };
     #pragma unroll 1
     for (int grp = gy; grp < ng; grp += GY)
     {
-        const int ntg = dsr::ro_group_nt(nt, NTG, grp), t0 = dsr::ro_tile(tile0, grp, NTG, 0), nrow = ntg * 8;
-        const size_t row0 = static_cast<size_t>(t0) * 8;
-        for (int i = tid; i < nrow * (I / 16); i += NTH) cp16(sm + i * 16, A.aq + row0 * I + static_cast<size_t>(i) * 16);
-        for (int i = tid; i < nrow * (ASP / 16); i += NTH) cp16(sm + SA_B + i * 16, A.as + row0 * ASP + static_cast<size_t>(i) * 16);
-        cp_commit();
+        const int ntg = dsr::ro_group_nt(nt, NTG, grp), t0 = dsr::ro_tile(tile0, grp, NTG, 0);
         #pragma unroll
         for (int st = 0; st < ST - 1; ++st) { issue(st, st); cp_commit(); }
-        float acc[WT][NTG][4];
+        // the warp's rows: records and scale words, routing weights and the live mask of its tiles
+        uint4 bq[TW][NG];
+        u32 sw[TW][NSW];
+        float w0[TW], w1[TW];
+        int mask[TW];
+        const int nlive = min(max(ntg - warp * TW, 0), TW);                  // the warp's live tiles (the first nlive): a dead tile runs no mma
         #pragma unroll
-        for (int j = 0; j < WT; ++j)
-            #pragma unroll
-            for (int t = 0; t < NTG; ++t) acc[j][t][0] = acc[j][t][1] = acc[j][t][2] = acc[j][t][3] = 0.f;
-        u32 sb[NTG];
-        #pragma unroll
-        for (int r = 0; r < NG; ++r)
+        for (int tw = 0; tw < TW; ++tw)
         {
-            cp_wait<ST - 2>();
-            __syncthreads();
-            if (r + ST - 1 < NG) issue((r + ST - 1) % ST, r + ST - 1);
-            cp_commit();
-            if ((r & 1) == 0)                                                // the scale word of records r, r + 1: bytes 2 (r & 1) + h
-                #pragma unroll
-                for (int t = 0; t < NTG; ++t) sb[t] = *reinterpret_cast<const u32*>(sm + SA_B + (t * 8 + g) * ASP + (r >> 1) * 4);
-            const uint8_t* wa = sm + BREG + (r % ST) * AST + warp * WT * GR;
-            const uint8_t* bb = sm + r * XREC;                                // row q's record r at bb + q I: mma_row's XREC pitch is I here
+            const int t = warp * TW + tw;
+            const bool live = t < ntg;
+            const size_t row = (static_cast<size_t>(t0) + t) * 8 + g;
             #pragma unroll
-            for (int j = 0; j < WT; ++j)
-            {
-                Rec R;
-                R.load(wa + j * GR, lane);
-                const u32 a0 = x4lo(R.c[0]), a1 = x4hi(R.c[0]), a2 = x4lo(R.c[1]), a3 = x4hi(R.c[1]);
-                const u32 b4 = x4lo(R.c[2]), b5 = x4hi(R.c[2]), b6 = x4lo(R.c[3]), b7 = x4hi(R.c[3]);
+            for (int r = 0; r < NG; ++r) bq[tw][r] = live ? __ldg(reinterpret_cast<const uint4*>(A.aq + row * I + r * XREC + c * 16)) : make_uint4(0, 0, 0, 0);
+            #pragma unroll
+            for (int k = 0; k < NSW; ++k) sw[tw][k] = live ? __ldg(reinterpret_cast<const u32*>(A.as + row * ASP + k * 4)) : 0u;
+            mask[tw] = live ? A.tile_mask[t0 + t] : 0;
+            w0[tw] = live ? A.tile_w[(t0 + t) * 8 + 2 * c] : 0.f;
+            w1[tw] = live ? A.tile_w[(t0 + t) * 8 + 2 * c + 1] : 0.f;
+        }
+        int base = 0;                                                        // ring slot of the block's record 0
+        #pragma unroll 1
+        for (int bb = 0; bb < nb; ++bb)
+        {
+            const int b = b0 + bb;
+            float acc[TPC][TW][4];
+            #pragma unroll
+            for (int j = 0; j < TPC; ++j)
                 #pragma unroll
-                for (int t = 0; t < NTG; ++t)
-                    if (t < ntg)
+                for (int tw = 0; tw < TW; ++tw) acc[j][tw][0] = acc[j][tw][1] = acc[j][tw][2] = acc[j][tw][3] = 0.f;
+            static_for<NG>([&](auto rc)
+            {
+                constexpr int r = decltype(rc)::value;
+                cp_wait<ST - 2>();
+                __syncthreads();
+                const int gs = bb * NG + r;
+                if (gs + ST - 1 < nstg) issue((base + r + ST - 1) % ST, gs + ST - 1);
+                cp_commit();
+                const uint8_t* wa = sm + ((base + r) % ST) * AST;
+                #pragma unroll
+                for (int j = 0; j < TPC; ++j)
+                {
+                    Rec R;
+                    R.load(wa + j * GR, lane);
+                    const u32 a0 = x4lo(R.c[0]), a1 = x4hi(R.c[0]), a2 = x4lo(R.c[1]), a3 = x4hi(R.c[1]);
+                    const u32 a4 = x4lo(R.c[2]), a5 = x4hi(R.c[2]), a6 = x4lo(R.c[3]), a7 = x4hi(R.c[3]);
+                    #pragma unroll
+                    for (int tw = 0; tw < TW; ++tw)
+                        if (tw < nlive)
+                        {
+                            mma_mx<0, (2 * r) & 3>(acc[j][tw], a0, a1, a2, a3, bq[tw][r].x, bq[tw][r].y, R.s, sw[tw][r / 2]);
+                            mma_mx<2, (2 * r + 1) & 3>(acc[j][tw], a4, a5, a6, a7, bq[tw][r].z, bq[tw][r].w, R.s, sw[tw][r / 2]);
+                        }
+                }
+            });
+            base = (base + NG) % ST;
+            #pragma unroll
+            for (int tw = 0; tw < TW; ++tw)
+            {
+                if (tw >= nlive) break;
+                #pragma unroll
+                for (int j = 0; j < TPC; ++j)                                // fragment order into the stage: (row 2c | 2c+1, column j 16 + g | + 8)
+                {
+                    __half* r0 = ys + (2 * c) * YP + j * 16 + g;
+                    r0[0] = __float2half_rn(w0[tw] * acc[j][tw][0]);
+                    r0[8] = __float2half_rn(w0[tw] * acc[j][tw][2]);
+                    r0[YP] = __float2half_rn(w1[tw] * acc[j][tw][1]);
+                    r0[YP + 8] = __float2half_rn(w1[tw] * acc[j][tw][3]);
+                }
+                __syncwarp();
+                __half* y = A.ypart + (static_cast<size_t>(t0) + warp * TW + tw) * 8 * NOUT + b * (TPC * 16);
+                constexpr int PR = TPC * 2;                                  // 16-B pieces per row
+                #pragma unroll
+                for (int i = lane; i < 8 * PR; i += 32)
+                {
+                    const int row = i / PR, pc = i % PR;
+                    if ((mask[tw] >> row) & 1)
                     {
-                        const uint4 bv = *reinterpret_cast<const uint4*>(bb + (t * 8 + g) * I + c * 16);
-                        if ((r & 1) == 0)
-                        {
-                            mma_mx<0, 0>(acc[j][t], a0, a1, a2, a3, bv.x, bv.y, R.s, sb[t]);
-                            mma_mx<2, 1>(acc[j][t], b4, b5, b6, b7, bv.z, bv.w, R.s, sb[t]);
-                        }
-                        else
-                        {
-                            mma_mx<0, 2>(acc[j][t], a0, a1, a2, a3, bv.x, bv.y, R.s, sb[t]);
-                            mma_mx<2, 3>(acc[j][t], b4, b5, b6, b7, bv.z, bv.w, R.s, sb[t]);
-                        }
+                        const uint4 v = *reinterpret_cast<const uint4*>(ys + row * YP + pc * 8);
+                        if constexpr (MXTC_ABL == 7) { if (v.x == 0x12345678u) y[row * NOUT] = __float2half_rn(1.f); }
+                        else *reinterpret_cast<uint4*>(y + static_cast<size_t>(row) * NOUT + pc * 8) = v;
                     }
+                }
+                __syncwarp();                                               // the stage is rewritten by the next tile / block
             }
         }
         cp_wait<0>();
-        #pragma unroll
-        for (int j = 0; j < WT; ++j)
-        {
-            const int o = (ot0 + warp * WT + j) * 16 + g;
-            #pragma unroll
-            for (int t = 0; t < NTG; ++t)
-                if (t < ntg)
-                {
-                    const int mask = A.tile_mask[t0 + t];
-                    const float* w = A.tile_w + (t0 + t) * 8;
-                    __half* y = A.ypart + static_cast<size_t>(t0 + t) * 8 * NOUT;
-                    if ((mask >> (2 * c)) & 1)
-                    {
-                        y[(2 * c) * NOUT + o] = __float2half_rn(w[2 * c] * acc[j][t][0]);
-                        y[(2 * c) * NOUT + o + 8] = __float2half_rn(w[2 * c] * acc[j][t][2]);
-                    }
-                    if ((mask >> (2 * c + 1)) & 1)
-                    {
-                        y[(2 * c + 1) * NOUT + o] = __float2half_rn(w[2 * c + 1] * acc[j][t][1]);
-                        y[(2 * c + 1) * NOUT + o + 8] = __float2half_rn(w[2 * c + 1] * acc[j][t][3]);
-                    }
-                }
-        }
-        __syncthreads();                                                    // sm is restaged by the next group
+        __syncthreads();                                                    // the ring restarts for the next group
     }
 }
 
@@ -421,12 +461,12 @@ __global__ void __launch_bounds__(WARPS * 32) k_fc2_tc(Args A)
 // The four launches of one layer's routed experts on st: k_xq (x -> xq / xs), k_fc1_tc, k_aq (act -> aq / as), k_fc2_tc. sb = the slot bound the
 // grids are sized for (CTAs of slots >= *n_slots_dev exit), tiles_bound = rows of act / aq to quantize (the plan's tile bound x 8).
 // cudaFuncSetAttribute is a host call without stream work (the first call per instantiation).
-template <int K1, int I, int NOUT, int CW, int NTG1, int ST1, int W2, int WT, int NTG2, int ST2>
+template <int K1, int I, int NOUT, int CW, int NTG1, int ST1, int W2, int TW, int TPC, int ST2>
 inline cudaError_t launch_layer(const Args& A, const __nv_bfloat16* x, int M, int sb, int tiles_bound, uint8_t* xq, uint8_t* xs, cudaStream_t st)
 {
-    constexpr size_t S1 = fc1_smem<K1, CW, NTG1, ST1>(), S2 = fc2_smem<I, W2, WT, NTG2, ST2>();
+    constexpr size_t S1 = fc1_smem<K1, CW, NTG1, ST1>(), S2 = fc2_smem<W2, TPC, ST2>();
     auto* k1 = k_fc1_tc<K1, I, CW, NTG1, ST1>;
-    auto* k2 = k_fc2_tc<I, NOUT, W2, WT, NTG2, ST2>;
+    auto* k2 = k_fc2_tc<I, NOUT, W2, TW, TPC, ST2>;
     static const cudaError_t attr = [&] {
         cudaError_t e = cudaFuncSetAttribute(k1, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(S1));
         const cudaError_t e2 = cudaFuncSetAttribute(k2, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(S2));
@@ -437,7 +477,7 @@ inline cudaError_t launch_layer(const Args& A, const __nv_bfloat16* x, int M, in
     k1<<<sb * (I / 16 / CW) * A.gy1, CW * 32, S1, st>>>(A);
     const long arows = static_cast<long>(tiles_bound) * 8;
     k_aq<<<(unsigned)((arows * (I / 32) + 255) / 256), 256, 0, st>>>(A.act, static_cast<int>(arows), A.n_tiles_dev, I, A.aq, A.as);
-    k2<<<sb * (NOUT / 16 / (W2 * WT)) * A.gy2, W2 * 32, S2, st>>>(A);
+    k2<<<sb * A.os2 * A.gy2, W2 * 32, S2, st>>>(A);
     return cudaGetLastError();
 }
 }   // namespace mxtc

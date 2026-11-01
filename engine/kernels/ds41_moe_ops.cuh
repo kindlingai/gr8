@@ -461,8 +461,8 @@ inline int bind_moe(void* model, int i, int, void*)
         bool first = true;
         for (int j = 0; j < i; ++j) if (m.layers[j].moe) first = false;
         if (first)
-            fprintf(stderr, "# rank %d DS41 GR8_DS_MOE_TC=%d fc1 cw%d ntg%d st%d gy%d fc2 w%d wt%d ntg%d st%d gy%d\n", m.rank, g, DS41_TC_CW, DS41_TC_NTG1, DS41_TC_ST1, DS41_TC_GY1,
-                    DS41_TC_W2, DS41_TC_WT, DS41_TC_NTG2, DS41_TC_ST2, DS41_TC_GY2);
+            fprintf(stderr, "# rank %d DS41 GR8_DS_MOE_TC=%d fc1 cw%d ntg%d st%d gy%d fc2 w%d wt%d tpc%d st%d gy%d os%d\n", m.rank, g, DS41_TC_CW, DS41_TC_NTG1, DS41_TC_ST1, DS41_TC_GY1,
+                    DS41_TC_W2, DS41_TC_WT, DS41_TC_TPC, DS41_TC_ST2, DS41_TC_GY2, DS41_TC_OS2);
     }
     LayerState* s = new LayerState();
     s->ne = ne; s->tk = ne == dsr::NEXP ? dsr::TOPK : geom::DS_TOPK; s->layer = y.l;
@@ -884,8 +884,8 @@ inline int experts_ro(Model& m, const LayerState& s, int M, cudaStream_t st)
     {
         constexpr int TILES = (ROMAX * dsr::TOPK + 7 * dsr::NEXP) / 8;   // ro_alloc's act / mt_aq rows / 8
         const mxtc::Args TA{s.fc1, s.fc2, q.mt_xq, q.mt_xs, RA.slot_expert, RA.slot_tile0, RA.slot_nt, RA.tile_mask, RA.tile_w, RA.tile_tok, RA.n_slots_dev,
-                            (const int*)(p + offsetof(P, n_tiles)), sb, DS41_TC_GY1, DS41_TC_GY2, geom::SWIGLU_LIMIT, q.act, q.mt_aq, q.mt_as, q.ypart};
-        const cudaError_t e = mxtc::launch_layer<HID, IW, HID, DS41_TC_CW, DS41_TC_NTG1, DS41_TC_ST1, DS41_TC_W2, DS41_TC_WT, DS41_TC_NTG2, DS41_TC_ST2>(
+                            (const int*)(p + offsetof(P, n_tiles)), sb, DS41_TC_GY1, DS41_TC_GY2, DS41_TC_OS2, geom::SWIGLU_LIMIT, q.act, q.mt_aq, q.mt_as, q.ypart};
+        const cudaError_t e = mxtc::launch_layer<HID, IW, HID, DS41_TC_CW, DS41_TC_NTG1, DS41_TC_ST1, DS41_TC_W2, DS41_TC_WT, DS41_TC_TPC, DS41_TC_ST2>(
             TA, (const __nv_bfloat16*)m.hc_y, M, sb, TILES, q.mt_xq, q.mt_xs, st);
         if (e != cudaSuccess) return (int)e;
         ds41_span_mark("ro_fc2", st);
