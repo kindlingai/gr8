@@ -13,15 +13,15 @@
 // Without a pack (a -DG6_RS_LOADER build): the rank's image planned from the exlr8 release, as m4sim --v2-dense plans it,
 // reading only the layer's tensors:
 //   pf_v2_test --release DENSE_DIR --v2 EXPERTS_DIR --v2-slices SLICES_DIR --v2-widths MANIFEST [--rank 0] --layer 3 ...
-// Routing from a production route-count dump instead of random logits: --rcdump FILE [--rcline N] takes line N (default
-// 0) of a GR8_PF_RCDUMP routes.r<rank>.jsonl, scales its per-expert counts to M x 8 routes and hands the routes to the
-// pass pre-routed (tok_e / tok_w), so the segment and tile fill are production's.
+// Routing from a production route-count dump: --rcdump FILE [--rcline N] takes line N (default 0) of a GR8_PF_RCDUMP
+// routes.r<rank>.jsonl, scales its per-expert counts to M x 8 routes and hands the routes to the pass pre-routed (tok_e /
+// tok_w), so the segment and tile fill are production's.
 // --ab [--bench ITERS] [--repeat N]: the segment kernels (GR8_PF_WT=0) against the expert-tile kernels (GR8_PF_WT=1) on
-// the same inputs: per-kernel median times, the relative RMS of z1 / yw / out between them (and of yw with the segment fc1
-// feeding the tile fc2, which isolates fc2), and N repeat-run hashes of each. --wt 0|1 picks the path of the run (and of
-// --dump) regardless of the knob.
+// the same inputs: per-kernel median times, the relative RMS of z1 / yw / out between them, the RMS of yw with the segment
+// fc1 feeding the tile fc2 (fc2's own deviation), and N repeat-run hashes of each. --wt 0|1 picks the path of the run (and
+// of --dump) regardless of the knob.
 // --writepack BASE (with --release): writes the layer's tr3.* tensors of the planned image as BASE.manifest.json + BASE.pack
-// in pack order, which engine/ref/k1_v2_ref.py reads, so a --dump of this rank can be checked against the NumPy reference.
+// in pack order. engine/ref/k1_v2_ref.py reads that pack, so a --dump of this rank can be checked against the NumPy reference.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -237,7 +237,7 @@ int main(int argc, char** argv)
     uint16_t* out;
     CK(cudaMalloc(&out, static_cast<size_t>(M) * HID * 2));
     // --rcdump: the dump's per-expert counts scaled to M x 8 routes, dealt to the tokens (8 distinct experts each) in a
-    // shuffled order, random weights summing to the route scale; the pass takes them pre-routed
+    // shuffled order, with random weights summing to the route scale. The pass takes them pre-routed.
     std::vector<int> pre_e;
     std::vector<float> pre_w;
     if (!rcdump.empty())

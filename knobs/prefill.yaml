@@ -417,29 +417,29 @@ knobs:
     default: "1"
     values: "0|1"
     doc: >-
-      0 runs the GLM routed prefill experts on the 64-row segment kernels (`k_pf_fc1f`, `k_pf_fc2g`) instead of the
-      expert-tile kernels (`k_pf_fc1t`, `k_pf_fc2t`, `bind_prefill_wt.cuh`), which decode each weight tile once per
-      256 routes and quantize the fc1 input once per token. Block-scale layers only; not byte-equal (the fc1 input is
-      quantized on a different grid), deterministic.
+      1 runs the GLM routed prefill experts on the expert-tile kernels (`k_pf_fc1t`, `k_pf_fc2t`,
+      `bind_prefill_wt.cuh`), which decode each weight tile once per 128 routes and quantize the fc1 input once per
+      token; 0 runs the 64-row segment kernels (`k_pf_fc1f`, `k_pf_fc2g`). Block-scale layers only. Not byte-equal
+      (the fc1 input is quantized on a different grid), deterministic.
   GR8_PF_WT_FUSE:
     scope: agree
     kind: flag
     default: "1"
     values: "0|1"
     doc: >-
-      0 makes the expert-tile fc2 (`k_pf_fc2t`) write every route's partial and `k_pf_fin` sum them, instead of the fused
-      combine in which the warp that completes a token's routes sums them in route order and writes the token's output
-      slice itself (the partials never reach DRAM). Deterministic either way; GR8_PF_WT=1 only.
+      1 makes the warp of the expert-tile fc2 (`k_pf_fc2t`) that completes a token's routes sum them in route order and
+      write the token's output slice itself, so the partials stay in the L2; 0 writes every route's partial and sums
+      them in `k_pf_fin`. Deterministic either way; GR8_PF_WT=1 only.
   GR8_PF_WT_GMAJOR:
     scope: agree
     kind: flag
     default: "1"
     values: "0|1"
     doc: >-
-      0 runs the expert-tile fc2 CTAs tile-major (every column group of one expert tile, then the next tile) instead of
-      group-major (every tile of one group pair, then the next pair). Group-major writes a token's partials of a group
-      close together in time, so the fused combine finds them in the L2 (0.6 ms more fc2 input re-reads, 1.7 ms less
-      partial traffic at 4096 rows). Launch order only, same bits.
+      1 runs the expert-tile fc2 CTAs group-major (every tile of one group pair, then the next pair), which writes a
+      token's partials of a group close together in time, so the fused combine finds them in the L2 (0.6 ms more fc2
+      input re-reads, 1.7 ms less partial traffic at 4096 rows); 0 runs them tile-major (every column group of one
+      tile, then the next tile). Launch order only, same bits.
   GR8_PF_WM:
     scope: agree
     kind: flag

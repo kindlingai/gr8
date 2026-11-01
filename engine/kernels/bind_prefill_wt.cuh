@@ -4,7 +4,7 @@
 // the fc1 input once per (segment, matrix, block pair). At 4096-row lanes that is ~40 instructions per QMMA and half the
 // launched segment work is padding, so the tensor pipe idles. Here a CTA takes a tile of up to WT_R = 128 routes of one
 // expert (k_pf_fill's wtiles) and one 128-column weight block, so every decoded weight tile feeds up to 16 QMMAs, and the
-// fc1 input is quantized once per token (k_pf_hq8) instead of once per route and block:
+// fc1 input is quantized once per token (k_pf_hq8):
 //   hq8 / hs8  mx8(f16(H128(x * sg))) per token row, E4M3 bytes [M][HID] in the TR3 k order + one E8M0 byte per 32 k
 //   k_pf_fc1t  CTA = (tile, matrix, block): z1 = sum over the 128-k blocks kb of  v1b[kb] * (hq8_kb @ e4m3(W_kb)), so
 //              the block scale of the input rotation (sign x scale) multiplies the block's fp32 partial product instead
@@ -19,11 +19,11 @@
 //              adds in selection order, then the shared expert's slice), writes the token's bf16 slice of out (or the RS
 //              send slot) and drops the partial lines from the L2 unwritten (discard.global.L2). Integer counters only, a
 //              fixed summation order: deterministic. Steering needs a whole-row dot product, so a steered pass keeps fin.
-// 128-row tiles, not 256: 8 row blocks of accumulators keep a warp under 128 registers, so 16 warps (four per scheduler)
-// fit an SM, which the trellis decode's dependent integer chains need; with 16 row blocks (250 registers, 8 warps per SM)
-// fc2 ran no faster than the segment kernel. A CTA is 16 warps = two 8-warp halves that share one A stage and compute two
-// weight units from it (fc1: the gate and up matrices of a block; fc2: two 128-column groups), because the staged A bytes,
-// not the weights, were the kernels' largest traffic (cp.async from L2 at ~0.6 TB/s chip-wide).
+// The tile is 128 rows: 8 row blocks of accumulators keep a warp under 128 registers, so 16 warps (four per scheduler)
+// fit an SM. The trellis decode's dependent integer chains need that many warps: with 16 row blocks (250 registers, 8
+// warps per SM) fc2 ran as slowly as the segment kernel. A CTA is 16 warps = two 8-warp halves that share one A stage and
+// compute two weight units from it (fc1: the gate and up matrices of a block, fc2: two 128-column groups). The staged A
+// bytes were the kernels' largest traffic (cp.async from L2 at ~0.6 TB/s chip-wide).
 // Not byte-equal to the segment kernels (the fc1 input is quantized on a different grid); deterministic: every sum has a
 // fixed order and no atomics. Block-scale layers only (Expert::bs). The segment kernels stay as GR8_PF_WT=0.
 #pragma once
@@ -53,8 +53,8 @@ __device__ __forceinline__ void wt_ldsm4(u32 (&r)[4], const void* p)
 
 // The fc1 input records: grid ceil(M / 8) * (HID / 128) warps in blocks of 8, warp = (8 rows, 128-k block), lane = (row,
 // k32 step). The values are x * sg rotated (had128_l32) and rounded to fp16, as the segment prologue computes them before
-// its block scale; the E4M3 bytes of a k32 step land in the TR3 k order (word c: k 2c, 2c+1, 2c+16, 2c+17; word 4 + c:
-// + 8), which is the order the decoded B fragments use, so ldmatrix of a row's 16-B chunks gives the A fragment.
+// its block scale. The E4M3 bytes of a k32 step land in the TR3 k order (word c: k 2c, 2c+1, 2c+16, 2c+17; word 4 + c:
+// + 8). The decoded B fragments use that order, so ldmatrix of a row's 16-B chunks gives the A fragment.
 __global__ void __launch_bounds__(256) k_pf_hq8(Expert A)
 {
     constexpr int NB = HID / 128;
@@ -114,9 +114,9 @@ template <int NM> __device__ __forceinline__ void wt_scale(float (&acc)[NM][2][4
             for (int i = 0; i < 4; ++i) acc[mb][h][i] *= f;
 }
 
-// The decoded B fragments of k32 step s (two TR3 tiles) of the warp's 16-col tile: cw = the lane's wide-order words of
-// the 128-k group, cv = word `lane` of each of its 8 tiles (Tr3Lane::loadw: one coalesced load per tile, the two words a
-// lane decodes handed over by shuffles).
+// The decoded B fragments of k32 step s (two TR3 tiles) of the warp's 16-col tile. cw = the lane's wide-order words of
+// the 128-k group. cv = word `lane` of each of its 8 tiles (Tr3Lane::loadw: one coalesced load per tile, and shuffles hand
+// each lane the two words it decodes).
 template <int BITS, bool WIDE, int CB>
 __device__ __forceinline__ void wt_bfrag(const Tr3Lane<BITS, false, CB>& ld, const u64 (&cw)[3], const u32 (&cv)[8], int s, int lane, u32 (&bf)[4])
 {
@@ -139,10 +139,10 @@ __device__ __forceinline__ void wt_bfrag(const Tr3Lane<BITS, false, CB>& ld, con
 }
 
 // fc1 of one (tile, matrix, block) over NM row blocks (NM >= the tile's). The stage of 128-k block kb + 1 is copied
-// while block kb runs; the weight words of kb + 1 are loaded into registers at the top of block kb (one barrier per
+// while block kb runs, and the weight words of kb + 1 are loaded into registers at the top of block kb (one barrier per
 // block). A row past the tile's rows stages row 0 and stores nothing.
-// Both halves of the CTA run this (their own matrix, weights and scales; the same NM): the barriers inside line up because
-// both loop over the same 128-k blocks with one barrier each, and the stage copy is split over all WT_NTH threads.
+// Both halves of the CTA run this with their own matrix, weights and scales and the same NM. The barriers inside line up
+// because both loop over the same 128-k blocks with one barrier each. The stage copy is split over all WT_NTH threads.
 template <int BITS, bool WIDE, int NM, int CB, int EB>
 __device__ __forceinline__ void fc1t_body(const Expert& A, const uint8_t* mw, const __half* v1b, int r0, int rows, int b, int mat,
                                           const int* sRow, unsigned char* sA, unsigned char* sS)
@@ -190,7 +190,7 @@ __device__ __forceinline__ void fc1t_body(const Expert& A, const uint8_t* mw, co
     for (int kb = 0; kb < NB; ++kb)
     {
         pf::cp_wait<0>();
-        __syncthreads();                                     // block kb landed; the other stage is free (block kb - 1 is done)
+        __syncthreads();                                     // block kb landed, and block kb - 1 is done with the other stage
         if (kb + 1 < NB) stage(kb + 1);
         u32 cv[8];
         u64 cw[3];
@@ -215,7 +215,7 @@ __device__ __forceinline__ void fc1t_body(const Expert& A, const uint8_t* mw, co
             }
         }
         const float c = __half2float(v1b[kb]);
-        if (c == 0.f) continue;                              // a zero block scale: the block adds nothing (never seen in a pack; the scales carry signs)
+        if (c == 0.f) continue;                              // a zero block scale adds nothing (never seen in a pack). The scales carry signs.
         if (c != cprev) wt_scale(acc, cprev / c);            // the running sum into units of this block's scale
         cprev = c;
         const unsigned char* xs = sA + (kb & 1) * WT_SA;
@@ -251,8 +251,8 @@ __device__ __forceinline__ void fc1t_body(const Expert& A, const uint8_t* mw, co
         }
 }
 
-// the body for the tile's row-block count, rounded up to an even NM (one body per even count: the row-block loop has no
-// branch between the mma, which the Flash kernels found necessary)
+// the body for the tile's row-block count, rounded up to an even NM. One body per even count keeps the row-block loop
+// free of branches between the mma (a branch between them cost the Flash kernels ~30 dead cycles per 4 mma).
 template <int BITS, bool WIDE, int CB, int EB>
 __device__ __forceinline__ void fc1t_nm(const Expert& A, const uint8_t* mw, const __half* v1b, int r0, int rows, int b, int mat,
                                         const int* sRow, unsigned char* sA, unsigned char* sS)
@@ -271,9 +271,8 @@ __device__ __forceinline__ void fc1t_nm(const Expert& A, const uint8_t* mw, cons
 }
 
 // grid (EB blocks, tiles), block WT_NTH (warps 0-7 the gate matrix, 8-15 up; WT_R = 256: grid (2 EB, tiles), x = mat EB +
-// block), FC1T_SMEM dynamic smem. K2 and K3 units
-// in the wide order (the loader's order on the runtime path), K4 in the tile order; make_layer keeps the segment kernels
-// for anything else.
+// block), FC1T_SMEM dynamic smem. K2 and K3 units come in the wide order (the loader's order on the runtime path), K4 in
+// the tile order. make_layer keeps the segment kernels for anything else.
 template <int EB = g6nr::EB, bool K2 = false, int CB = TR3_MCG>
 __global__ void __launch_bounds__(WT_NTH, 1) k_pf_fc1t(Expert A)
 {
@@ -462,7 +461,7 @@ __device__ __forceinline__ void fc2t_body(const Expert& A, const long long* tr, 
 }
 
 __device__ __forceinline__ void wt_discard(const void* p) { asm volatile("discard.global.L2 [%0], 128;" :: "l"(p) : "memory"); }
-__device__ __forceinline__ uint4 wt_ldcg(const void* p) { return __ldcg(reinterpret_cast<const uint4*>(p)); }   // L2, never this SM's L1
+__device__ __forceinline__ uint4 wt_ldcg(const void* p) { return __ldcg(reinterpret_cast<const uint4*>(p)); }   // from the L2: other SMs wrote the line
 
 // The fused combine of one 32-row epilogue pass: lanes 8 i .. 8 i + 7 hold row i (token tok, live when act); after their yw
 // slice is written (and fenced), the row's leader counts the route in cnt_tg[tok][G]; a row whose count reaches topk sums the
@@ -576,7 +575,7 @@ __device__ __forceinline__ void fc2t_nm(const Expert& A, const long long* tr, in
 
 // grid (HID / 256 group pairs, tiles), or (tiles, HID / 256) when A.wt_gmajor (WT_R = 256: single groups, HID / 128) (the groups of a token's partials written close
 // in time, at the price of re-reading x2 once per group pair): block WT_NTH (warps 0-7 the pair's first group, 8-15 the
-// second), FC2T_SMEM dynamic smem; the expert's fc2 width is tr[4]
+// second), FC2T_SMEM dynamic smem. The expert's fc2 width is tr[4].
 template <int EB = g6nr::EB, bool K2 = false, int CB = TR3_MCG>
 __global__ void __launch_bounds__(WT_NTH, 1) k_pf_fc2t(Expert A)
 {

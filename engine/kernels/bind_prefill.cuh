@@ -5724,7 +5724,7 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)  
     t.sh_segs = reinterpret_cast<int*>(take((m + RS - 1) / RS * 3 * 4));
     t.sh_n_seg = reinterpret_cast<int*>(take(4));
     t.z1 = reinterpret_cast<__half*>(take(R * 2 * eb * 128 * 2));
-    // x2 row blocks: the segment layout (ms segments x MB) or the tile layout (max_wtiles tiles x WM_R / 16), whichever is larger
+    // x2 row blocks: the larger of the segment layout (ms segments x MB) and the tile layout (max_wtiles_t tiles x WT_R / 16)
     const size_t x2rb_t = static_cast<size_t>(max_wtiles_t(M)) * (WT_R / 16), x2rb = ms * MB > x2rb_t ? ms * MB : x2rb_t;
 #if G6_MODEL_FLASH
     t.x2 = reinterpret_cast<uint8_t*>(take(x2rb * eb * 4096));       // >= 4 * REC: also the fp16 A fragments (Expert::h16)
