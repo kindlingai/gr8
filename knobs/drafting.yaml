@@ -30,7 +30,6 @@ knobs:
     default: "1"
     doc: >-
       With --dflash, 0 gives the drafter no prompt context from the prefill, so it starts from the last prompt token.
-      Flash --prefill with --dflash needs 0.
   GR8_DFL_REUSE:
     scope: agree
     kind: int

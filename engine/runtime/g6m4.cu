@@ -1262,16 +1262,13 @@ int main(int argc, char** argv)
 #endif
 #if G6_MODEL_FLASH
     // Flash prefill (flash_prefill.cuh): the P1 bodies run the decode blocks in MX-row chunks, so the decode bindings
-    // stay decode-sized. Combinations the Flash prefill does not support yet stop here. --dflash: offline, and without
-    // the drafter's prompt context (GR8_DFL_PFCTX=0), until the prefill has taps
-    const bool dfl_pfctx = knob::dfl_pfctx();
-    if (MP && (pf_rs || pf_own || !qp_man.empty() || !qo_man.empty() || (dfl && (s2mode || dfl_pfctx)) || reuse_prefix
+    // stay decode-sized. Combinations the Flash prefill does not support yet stop here.
+    if (MP && (pf_rs || pf_own || !qp_man.empty() || !qo_man.empty() || reuse_prefix
 #if defined(G6_CP) && G6_CP
                || cp_on
 #endif
                ))
-        die("Flash --prefill: not with GR8_PF_RS, GR8_PF_OWN, --qo-/--qp- packs, --dflash (offline with GR8_DFL_PFCTX=0 only), "
-            "--reuse-prefix or CP (P1)");
+        die("Flash --prefill: not with GR8_PF_RS, GR8_PF_OWN, --qo-/--qp- packs, --reuse-prefix or CP (P1)");
     if (two && knob::pf_streams() == 2)
         die("Flash --pf-lanes 2 uses one compute stream; GR8_PF_STREAMS=2 is not supported");
     if (two && knob::resid_dump())
@@ -1466,6 +1463,9 @@ int main(int argc, char** argv)
         DF.sel_alpha = dfl_alpha;
         dfl_attach(m, DF);              // before the target graphs are captured: they carry the residual taps
         if (pfctx) { P.dfl_tap = dfl_pf_tap_launch; P2.dfl_tap = dfl_pf_tap_launch; }
+#if G6_MODEL_FLASH
+        if (pfctx) { FP.dfl_tap = dfl_pf_tap_flash; FP2.dfl_tap = dfl_pf_tap_flash; }
+#endif
     }
     // S2: below R on the CP binding. Session views on the pool, main and draft; today's graphs below
     // are captured with s2on off (the S = 1 path), the S2 graphs later by s2/native.cuh with s2on on.

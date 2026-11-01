@@ -113,6 +113,8 @@ struct FlashPrefill
     const char* fin_own = nullptr;               // GR8_GLM53F_PF_SP_FIND: this rank's own rows of that slot (set = layer used it)
     const char* att_own = nullptr;               // GR8_GLM53F_PF_SP_ATTD: this rank's own o_proj rows in the collective-0 slot
     u64 cur_step = 0;                            // host copy of the layer step pf_step_flash set (for the staging copy)
+    void (*dfl_tap)(Model&, FlashPrefill&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, keep the prompt rows the
+                                                                                 //   drafter reads (dflash.cuh dfl_pf_tap_flash)
 };
 inline bool pf_mhc_stage()
 {
@@ -1186,6 +1188,7 @@ inline void pf_step_flash(Model& m, FlashPrefill& P, int M, int context, u64 ls0
         pf_xt(P, 1, pxt::PX_PUT, M, st);
         pr.mark(8, st);
         pf_consume_flash(m, P, i, 1, M, st);
+        if (P.dfl_tap) P.dfl_tap(m, P, i, M, st);
         pf_xt(P, 1, pxt::PX_END, M, st);
         if (residual_copy) residual_copy(2 * i + 2, M);
         pr.mark(9, st);
@@ -1217,6 +1220,7 @@ inline void pf_step2_flash(Model& m, FlashPrefill& A, FlashPrefill& B, int MA, i
     };
     auto consume = [&](FlashPrefill& P, int i, int c, int M) {
         pf_consume_flash(m, P, i, c, M, st);
+        if (c == 1 && P.dfl_tap) P.dfl_tap(m, P, i, M, st);
         pf_xt(P, c, pxt::PX_END, M, st);
         pr.mark(9, st);
     };
@@ -1240,7 +1244,11 @@ inline void pf_step2_flash(Model& m, FlashPrefill& A, FlashPrefill& B, int MA, i
     {
         // each lane: attn -RS-> own0 -AG-> gather0, mlp -RS-> own1 -AG-> gather1, attn ... Every wire hop of one lane
         // is covered by a block of the other: RS by an owner pass, AG by an attention or MLP block.
-        auto own = [&](FlashPrefill& P, int i, int c, int M) { pf_sp_own(m, P, i, c, M, st); pr.mark(9, st); };
+        auto own = [&](FlashPrefill& P, int i, int c, int M) {
+            pf_sp_own(m, P, i, c, M, st);
+            if (c == 1 && P.dfl_tap) P.dfl_tap(m, P, i, M, st);
+            pr.mark(9, st);
+        };
         auto gather = [&](FlashPrefill& P, int c, int M, int i = -1) { pf_sp_gather(P, c, M, st, i >= 0 && pf_sp_x16_layer(m, P, i, c, M)); pr.mark(9, st); };
         for (int i = 0; i < m.nl; ++i)
         {

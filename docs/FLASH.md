@@ -170,9 +170,9 @@ Limits:
 
 - CP, prefix reuse and DFlash2: the engine refuses them under `--serve`. `GR8_GLM53F_CACHE=aligned` (above) is the
   experimental Flash form of prefix reuse. DFlash2 runs offline (`g6m4_flash --dflash-manifest`: TP=2 and 4 split
-  its 8 KV heads, and TP=3 runs its body whole on every rank), and with `--prefill` only without the drafter's prompt
-  context (`GR8_DFL_PFCTX=0`). Its taps are the
-  mean of the four mHC streams after each tapped layer.
+  its 8 KV heads, and TP=3 runs its body whole on every rank). Its taps are the mean of the four mHC streams after each
+  tapped layer, in decode steps and in the prefill, which keeps the last 2,048 prompt positions for the drafter's
+  prompt context.
 - MTP drafts beyond the first: the KDA state does not roll back a rejected draft yet, so the launcher runs MTP=1.
 - The int4 KV build.
 - The vision tower: the engine serves text, and the fetch skips `dense/vision-*`.
