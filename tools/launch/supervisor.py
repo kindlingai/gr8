@@ -956,6 +956,9 @@ class Supervisor:
             front += ['--served-model-name', model.served]
         if model is models.DS41 and plan['knobs'].get('REUSE') == '1':
             front += ['--enable-prompt-tokens-details']
+        elif model.dialect == 'glm':
+            # glm keeps prefix reuse on and the engine reports reused rows in the a line, so report them
+            front += ['--enable-prompt-tokens-details']
         if o.get('DEFAULT_MAX_TOKENS') != '0':
             front += ['--default-max-tokens', o.get('DEFAULT_MAX_TOKENS')]
         else:   # a request within the limit, guard rows included, shares decode steps: keep a page in hand for the guard

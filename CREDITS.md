@@ -58,6 +58,10 @@ Thanks to:
     profiles through the schema-v1 validation path ([GLP spec](https://github.com/msuiche/weightless/blob/main/docs/spec/GLP.md)).
 - [@alexellis](https://github.com/alexellis)
   - [RigMark](https://github.com/alexellis/rigmark), used for decode and concurrency benchmarking.
+- [@0xr3ngar](https://github.com/0xr3ngar)
+  - Usage cache reporting for the glm dialect: the launcher now passes
+    `--enable-prompt-tokens-details` to the front end, so
+    `usage.prompt_tokens_details.cached_tokens` reaches clients on glm clusters.
 
 ## Upstream projects and research
 
