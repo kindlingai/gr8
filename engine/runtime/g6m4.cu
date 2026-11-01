@@ -1168,7 +1168,13 @@ int main(int argc, char** argv)
         if (v && R == 0) fprintf(stderr, "# rank 0: GR8_MTP_L2PF=%d: %s%s\n", v, v & 1 ? "draft-step windows" : "",
                                  v & 2 ? (v & 1 ? ", head-merge tails" : "head-merge tails") : "");
     }
-    pf_prof().on = knob::pf_prof();
+    pf_prof().on = knob::pf_prof() != 0;
+    pf_prof().ev = knob::pf_prof() == 2;
+    pf_prof().rank = R;
+    pf_prof().tl_left = R == 0 ? (int)knob::pf_prof_timeline() : 0;
+#if G6_MODEL_FLASH
+    if (pf_prof().ev) die("GR8_PF_PROF=2 is GLM-5.3 only: the Flash prefill profile synchronizes (GR8_PF_PROF=1)");
+#endif
     if (knob::dec_prof() && graph) die("GR8_DEC_PROF needs plain launches (no --graph)");
     cudaStream_t st;
     G6RT_CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
@@ -1858,7 +1864,7 @@ int main(int argc, char** argv)
     }
     fprintf(stderr, "# rank %d: device tensors %.2f GB\n", R, (image ? img.bytes() : store.bytes) / 1e9);
     const bool pf_streams = two && knob::pf_streams() == 2;   // pf_step2s
-    if (pf_streams && pf_prof().on) die("GR8_PF_STREAMS=2 cannot run with GR8_PF_PROF (the marks synchronize one stream)");
+    if (pf_streams && pf_prof().on && !pf_prof().ev) die("GR8_PF_STREAMS=2 cannot run with GR8_PF_PROF (the marks synchronize one stream)");
     PfLanes lanes2;
     if (pf_streams)
     {

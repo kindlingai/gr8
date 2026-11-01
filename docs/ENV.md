@@ -372,7 +372,8 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_PF_PDUMP` | path | unset |  | Each rank writes the IDs, attention probabilities and index scores of selected prefill rows and layers to this directory (`pf_pdump`). |
 | `GR8_PF_PDUMP_EVERY` | int | `32` |  | With GR8_PF_PDUMP, dumps the rows whose position is a multiple of this number. |
 | `GR8_PF_PDUMP_LAYERS` | ints | `0,3,20,34,55,74` |  | With GR8_PF_PDUMP, the comma list of model layers to dump, plus their index-score source layers. |
-| `GR8_PF_PROF` | flag | `0` |  | Prefill synchronizes after each stage and rank 0 prints a per-stage time profile (ms) to stderr. |
+| `GR8_PF_PROF` | int | `0` | 0..2 | 1: prefill synchronizes after each stage and every rank prints a per-stage time profile (ms) to stderr when the engine exits; needs GR8_PF_STREAMS=1. 2 (GLM-5.3): a CUDA event per stage on each lane's stream instead, so it runs at production settings, GR8_PF_STREAMS=2 included; each rank also prints a "# pfx" line per prefill chunk and lane. The exit totals print only when main returns: stop the engine through the serve directory's quit file, which every rank honours within about 20 s. |
+| `GR8_PF_PROF_TIMELINE` | int | `0` | 0.. | With GR8_PF_PROF=2, rank 0 prints every stage mark of the first this many two-lane chunks as "# pfxtl chunk lane stage ms", the ms counted from the chunk's start on one clock for both lanes, for a timeline of the lanes. |
 | `GR8_PF_QP_ROLL_SER` | flag | `0` | 0\|1 | Measurement: 1 builds the rolling pair-weight slots on the prefill lane stream instead of the stage stream, so the build time is fully exposed. |
 | `GR8_PF_QP_WARM` | flag | `0` | 0\|1 | With GR8_PF_OWN=4, warms the pair cuBLAS and MXFP8 GEMM shapes at load so the first request does not pay for them. |
 | `GR8_PF_RCDUMP` | path | unset |  | Each rank appends per-expert prefill route counts per MoE layer and sub-batch to `routes.r<rank>.jsonl` in this directory. |

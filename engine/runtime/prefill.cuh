@@ -847,14 +847,92 @@ inline void pf_blas_x2(Model& m, Prefill& P, int i, int M, cudaStream_t st)
 struct PfProf
 {
     bool on = false;
+    bool ev = false;              // GR8_PF_PROF=2: a CUDA event per mark on the lane's stream, read when the chunk ends (flush)
     double t[9] = {}, last = 0;   // [1] attention on reuse layers, [8] attention on full-index layers
+    static constexpr const char* n[9] = {"projections", "attention", "o_proj", "put+publish", "wait+reduce+norm", "shared/dense MLP",
+                                         "router+experts", "other", ""};
+    int rank = 0, chunks = 0;
+    struct Lane { cudaStream_t st; std::vector<cudaEvent_t> pool; std::vector<std::pair<int, cudaEvent_t>> marks; double t[9] = {}; };
+    std::vector<Lane> lanes;
     static double now() { timespec s; clock_gettime(CLOCK_MONOTONIC, &s); return s.tv_sec * 1e3 + s.tv_nsec * 1e-6; }
+    Lane& lane(cudaStream_t st)
+    {
+        for (Lane& l : lanes) if (l.st == st) return l;
+        lanes.push_back(Lane{st, {}, {}, {}});
+        return lanes.back();
+    }
+    void mark_ev(int k, cudaStream_t st)
+    {
+        Lane& l = lane(st);
+        cudaEvent_t e;
+        if (!l.pool.empty()) { e = l.pool.back(); l.pool.pop_back(); }
+        else G6RT_CK(cudaEventCreateWithFlags(&e, cudaEventDefault));
+        G6RT_CK(cudaEventRecord(e, st));
+        l.marks.push_back({k, e});
+    }
+    static void line(const char* tag, const double* v, int rank, int rows)
+    {
+        double tot = 0;
+        for (int i = 0; i < 9; ++i) tot += v[i];
+        fprintf(stderr, "# pfx r%d %s rows %d:", rank, tag, rows);
+        for (int i = 0; i < 8; ++i)
+        {
+            const double x = i == 1 ? v[1] + v[8] : v[i];
+            fprintf(stderr, " %s %.1f (%.0f%%),", n[i], x, 100 * x / (tot > 0 ? tot : 1));
+        }
+        fprintf(stderr, " [attn full-index %.1f reuse %.1f], total %.1f\n", v[8], v[1], tot);
+    }
+    // The chunk's marks, read once every lane stream is idle (the drivers synchronize after a chunk). tl_left
+    // (GR8_PF_PROF_TIMELINE, rank 0): two-lane chunks still to print mark by mark, from tbase, lane A's chunk start.
+    int tl_left = 0;
+    cudaEvent_t tbase = nullptr;
+    void base_record(cudaStream_t st)
+    {
+        if (!ev) return;
+        if (!tbase) G6RT_CK(cudaEventCreateWithFlags(&tbase, cudaEventDefault));
+        G6RT_CK(cudaEventRecord(tbase, st));
+    }
+    void flush(int rows, bool two = false)
+    {
+        if (!ev) return;
+        cudaEvent_t base = two ? tbase : nullptr;
+        const bool tl = tl_left > 0 && base;
+        if (tl) --tl_left;
+        double ct[9] = {};
+        bool any = false;
+        for (size_t li = 0; li < lanes.size(); ++li)
+        {
+            Lane& l = lanes[li];
+            if (l.marks.empty()) continue;
+            any = true;
+            G6RT_CK(cudaEventSynchronize(l.marks.back().second));
+            double lt[9] = {};
+            for (size_t i = 1; i < l.marks.size(); ++i)
+            {
+                float ms = 0;
+                G6RT_CK(cudaEventElapsedTime(&ms, l.marks[i - 1].second, l.marks[i].second));
+                const int k = l.marks[i].first;
+                lt[k] += ms; l.t[k] += ms; ct[k] += ms; t[k] += ms;
+            }
+            if (tl)
+                for (size_t i = 0; i < l.marks.size(); ++i)
+                {
+                    float ms = 0;
+                    G6RT_CK(cudaEventElapsedTime(&ms, base, l.marks[i].second));
+                    fprintf(stderr, "# pfxtl %d %zu %d %.3f\n", chunks, li, l.marks[i].first, ms);
+                }
+            char tag[32]; snprintf(tag, sizeof tag, "chunk %d lane %zu", chunks, li);
+            line(tag, lt, rank, rows);
+            for (auto& m : l.marks) l.pool.push_back(m.second);
+            l.marks.clear();
+        }
+        if (any) { char tag[32]; snprintf(tag, sizeof tag, "chunk %d both", chunks); line(tag, ct, rank, rows); ++chunks; }
+    }
     void print(const char* tag) const
     {
-        static const char* n[9] = {"projections", "attention", "o_proj", "put+publish", "wait+reduce+norm", "shared/dense MLP", "router+experts", "other", ""};
         double tot = 0;
         for (double v : t) tot += v;
-        fprintf(stderr, "# %s prefill stage profile (ms, synchronized):", tag);
+        fprintf(stderr, "# %s prefill stage profile (ms, %s):", tag, ev ? "events" : "synchronized");
         for (int i = 0; i < 8; ++i)
         {
             const double v = i == 1 ? t[1] + t[8] : t[i];
@@ -862,6 +940,7 @@ struct PfProf
             if (i == 1) fprintf(stderr, " [attention full-index %.1f, reuse %.1f],", t[8], t[1]);
         }
         fprintf(stderr, " total %.1f\n", tot);
+        for (size_t li = 0; li < lanes.size(); ++li) { char lt[32]; snprintf(lt, sizeof lt, "all chunks lane %zu", li); line(lt, lanes[li].t, rank, 0); }
     }
 };
 inline PfProf& pf_prof() { static PfProf p; return p; }
@@ -902,6 +981,7 @@ inline void pf_mark(int k, cudaStream_t st)
 {
     PfProf& p = pf_prof();
     if (!p.on) return;
+    if (p.ev) { p.mark_ev(k, st); return; }
     G6RT_CK(cudaStreamSynchronize(st));
     const double n = PfProf::now();
     if (p.last > 0) p.t[k] += n - p.last;
@@ -1075,7 +1155,7 @@ inline void pf_attn_block_qo(Model& m, Prefill& P, int i, int M, int context, cu
     const int r0 = pf_r0(M, P.f.rank, P.f.nr), r1 = pf_r0(M, P.f.rank + 1, P.f.nr), a0 = r0 & ~15, Ro = r1 - r0;
     const int ctx_own = P.perm ? context : context - (M - r1);   // last owner position + 1 (perm: rows span the sub-batch)
     pf_mark(7, st);
-    const bool qp = pf_prof().on && P.f.rank == 0;
+    const bool qp = pf_prof().on && !pf_prof().ev && P.f.rank == 0;
     QoProf& Q = qo_prof();
     if (qp) { Q.tick(st, i, -1); Q.calls[i]++; }
     if (i == 0)                  // later layers: q_a_n / kv_a / idx_k / idx_w of the owner rows from the c2 owner pass,
@@ -1515,6 +1595,7 @@ inline void pf_step(Model& m, Prefill& P, int M, int context, u64 ls0, cudaStrea
         pf_ix(m, P, i, M, context, st);
     }
     pf_finish(P, M, st);
+    pf_prof().flush(M);
 }
 // Two sub-batches (A = the earlier rows, B = the next ones) as two lanes, each with its own Prefill (scratch, fabric
 // region, step cell), interleaved so that every partial travels while the other lane computes: a consume comes one
@@ -1550,6 +1631,7 @@ inline void pf_step2(Model& m, Prefill& A, Prefill& B, int MA, int MB, int ctxA,
     if (B.dfl_tap) B.dfl_tap(m, B, m.nl - 1, MB, st);
     pf_finish(B, MB, st);
     pf_finish_gather(A, MA, st);
+    pf_prof().flush(MA + MB);
 }
 // Two sub-batches as two lanes on two streams (GR8_PF_STREAMS=2 in g6m4): each lane runs pf_step's order on its own
 // stream, so a lane waiting on the fabric does not hold up the other lane. The only state the lanes share is each
@@ -1593,6 +1675,7 @@ inline void pf_step2s(Model& m, Prefill& A, Prefill& B, int MA, int MB, int ctxA
                       PfLanes& L)
 {
     pf_prof().last = 0;
+    pf_prof().base_record(sa);
     cudaStream_t sb = L.sb;
     G6RT_CK(cudaEventRecord(L.fork, sa));
     G6RT_CK(cudaStreamWaitEvent(sb, L.fork, 0));
@@ -1625,6 +1708,7 @@ inline void pf_step2s(Model& m, Prefill& A, Prefill& B, int MA, int MB, int ctxA
     pf_finish(B, MB, sb);
     G6RT_CK(cudaEventRecord(L.join, sb));
     G6RT_CK(cudaStreamWaitEvent(sa, L.join, 0));
+    pf_prof().flush(MA + MB, true);
 }
 // ---------------------------------------------------------------- MTP layer (78) over prefilled rows
 // Layer 78 must see every row the target processed (rank.cuh "MTP draft pass"). For prefilled rows only its attention
