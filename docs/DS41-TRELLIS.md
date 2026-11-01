@@ -102,7 +102,7 @@ layer (the engine's `distinct` lines), so the expert reads that dominate a varie
 layer = 1.8 GB, 7.7 ms at the memory bandwidth) are a third of that here, and the read-once kernels run at about 14
 TFLOPS on 109 GFLOP a layer rather than at the bandwidth. Second, the attention projections run on the CUDA-core MXFP8
 GEMM (k_gemm_mxfp8): about 32 GFLOP each for attn_proj and attn_out at 1024 rows, 5.7 and 5.5 ms a layer, under 6
-TFLOPS. The block-scaled tensor-core GEMM exists behind GR8_DS_ATTN_TC=1 (default off); its effect is measured below.
+TFLOPS. The block-scaled tensor-core GEMM runs them with GR8_DS_ATTN_TC=1; its effect is measured below.
 The trellis layers' MoE (3.7 ms a layer) costs less than the native read-once path (8.1 ms) at these routes.
 
 The context hardly matters: in a 128K prompt the 2048-row quantum of the two-lane run grows from 1020 ms at the start to
@@ -128,7 +128,7 @@ ms), with the memory gone. The width stays at 1024.
 
 ### The projections on the tensor cores
 
-`GR8_DS_ATTN_TC=1` (default off: the five attention projections at 9 or more rows on the block-scaled tensor-core GEMM
+`GR8_DS_ATTN_TC=1` (on in the launcher defaults, off in the engine: the five attention projections at 9 or more rows on the block-scaled tensor-core GEMM
 k_gemm_mx8t, the same MXFP8 operands) against the same single-lane W 1024 run without it, `GR8_DS_SPAN=2` on in both:
 
 | | 8K | 32K | 128K | a 1024-row pass | attn_proj | attn_out |
@@ -143,6 +143,37 @@ differ in their low bits (m4sim, a 512-row chunk, every layer's hash differs), w
 check (temperature 0, 5 steps) and the two runs' prefill answers agree token for token (RigMark samples, so the decode
 answers vary within a run either way). The knob stays off in the engine; the configuration decides. The remaining pass is the read-once MoE
 (96 ms), the two consumes (90 ms), the indexer (32 ms), Engram (26 ms) and the attention core (20 ms).
+
+### The routed experts on the tensor cores
+
+`GR8_DS_MOE_TC=1` (on in the launcher defaults, off in the engine) runs the read-once routed experts of a prefill chunk on
+`mma.sync.kind::mxf8f6f4.block_scale` with e2m1 weights and E4M3 activations (engine/kernels/ds_moe_tc.cuh). The MXFP4
+expert records are read as stored and expanded in registers: under this instruction the E2M1 code sits in bits 5..2 of
+the 8-bit container. The activations are rounded to MXFP8 first (k_xq for fc1, k_aq for fc2). An expert's token groups
+run on neighbouring CTAs, so the second group finds the expert's weights in L2; with one CTA walking every group, the
+weights came from DRAM twice.
+
+One GB10, a 1024-row chunk, the production plan with synthetic routes (engine/kernels/tests/ds_moe_tc_bench.cu):
+
+| distinct experts | fc1, fp16 kernel | fc1, TC | fc2, fp16 kernel | fc2, TC |
+|---|---|---|---|---|
+| 60 | 3,259 us | 997 us | 1,678 us | 861 us |
+| 83 | 3,740 us | 1,241 us | 1,806 us | 1,024 us |
+| 95 | 3,931 us | 1,404 us | 1,878 us | 1,107 us |
+
+The quantization passes add 44 + 31 us a layer. fc1 is within 20% of the expert bytes at the memory bandwidth; fc2 is
+about twice its floor because it reads an expert's fc2 weights again for each 32-token group.
+
+TP4, the launcher defaults with the pmcgx-k4 manifest, two boots each way, alternating, three cold runs each (tok/s):
+
+| | 8K prefill | 32K prefill | decode, code / prose |
+|---|---|---|---|
+| GR8_DS_MOE_TC=0 | 3,211-3,323 | 3,313-3,406 | 75.7-76.3 / 48.3-48.5 |
+| GR8_DS_MOE_TC=1 | 3,800-3,861 | 3,824-3,997 | 75.4-75.7 / 48.2-48.4 |
+
+The multi-agent aggregates did not move. Against the fp16 kernels the activations differ by 4.1% relative RMS and the
+expert outputs by 5.3%, which is the E4M3 rounding of two quantizations. In m4sim (layers 0-2, a 512-row chunk,
+temperature 0) the first tokens agree and later ones diverge, as they did for GR8_DS_ATTN_TC.
 
 ### The fabric
 

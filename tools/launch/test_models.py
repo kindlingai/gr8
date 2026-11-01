@@ -186,7 +186,7 @@ class Ds41Tests(unittest.TestCase):
     def test_engine_plan(self):
         plan = opt.engine_plan(ds41())
         self.assertEqual((plan['knobs']['MTP'], plan['knobs']['SESS'], plan['knobs']['CAP']), ('0', '5', '262144'))
-        for e in ('GR8_CP=0', 'GR8_DEC_BK=16384', 'GR8_DS_MTP=5', 'GR8_DS_PREFILL_W=1024', 'GR8_DS_ATTN_PW=1024', 'GR8_DS_PF_LANES=2', 'GR8_DS_ATTN_TC=1'):
+        for e in ('GR8_CP=0', 'GR8_DEC_BK=16384', 'GR8_DS_MTP=5', 'GR8_DS_PREFILL_W=1024', 'GR8_DS_ATTN_PW=1024', 'GR8_DS_PF_LANES=2', 'GR8_DS_ATTN_TC=1', 'GR8_DS_MOE_TC=1'):
             self.assertIn(e, plan['env'])
         self.assertFalse([e for e in plan['env'] if 'PF_STAGE_ASYNC' in e])   # none of the GLM or Flash prefill stack
         self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '5')

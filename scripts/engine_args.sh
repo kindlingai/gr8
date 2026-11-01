@@ -181,12 +181,15 @@ ds41_defaults() {
   # effort low, thermal-capped clocks): decode code 33.8 -> 77.8 tok/s, prose 33.7 -> 49.7, 8K prefill 149 -> 2,023 tok/s against
   # SESS=1 and none of these. GR8_DS_ATTN_TC=1 puts the attention projections of a prefill chunk on the tensor-core MXFP8 GEMM: 8K
   # prefill 2,102 -> 3,288 tok/s, 2 / 4 stream aggregates 51 / 72 -> 87 / 113 tok/s; same operands, another summation order, so
-  # the partials' bytes change (the tokens at temperature 0 did not). A variable EXTRA_ENV names keeps its value; GR8_DS_ATTN_PW and
+  # the partials' bytes change (the tokens at temperature 0 did not). GR8_DS_MOE_TC=1 runs the routed experts of a prefill chunk on
+  # the block-scaled tensor cores with MXFP8 activations: 8K prefill 3,265 -> 3,820 tok/s, 32K 3,375 -> 3,920, decode unchanged;
+  # the expert outputs move by about 5% RMS (E4M3 rounding). A variable EXTRA_ENV names keeps its value; GR8_DS_ATTN_PW and
   # GR8_DS41_IDX_PW follow GR8_DS_PREFILL_W.
   DS41_TUNED=
   for kv in GR8_DS_MTP=5 GR8_DS_ENGRAM_MTP=1 GR8_DS_PREFILL_MIN=2 GR8_DS_PREFILL_W=$pw GR8_DS_ATTN_PW=$pw GR8_DS41_IDX_PW=$pw \
       GR8_DS_PF_LANES=2 GR8_DS_PF_RS=1 GR8_DS_PF_DIRECT=1 GR8_DS_PF_GATHER=1 GR8_DS_PF_LATE_FINAL=1 GR8_DS_WAIT_K=2 GR8_DS_DEC_STAGE=1 \
-      GR8_DS_ATTN_CPA=1 GR8_DS_DSP_GV=1 GR8_DS_RO_ORDER=1 GR8_DS_GATE_RO=1 GR8_DS_ENGRAM_LOOKAHEAD=1 GR8_DS_ATTN_TC=1; do
+      GR8_DS_ATTN_CPA=1 GR8_DS_DSP_GV=1 GR8_DS_RO_ORDER=1 GR8_DS_GATE_RO=1 GR8_DS_ENGRAM_LOOKAHEAD=1 GR8_DS_ATTN_TC=1 \
+      GR8_DS_MOE_TC=1; do
     case " ${EXTRA_ENV:-} " in *" ${kv%%=*}="*) ;; *) DS41_TUNED="$DS41_TUNED$kv " ;; esac
   done
   S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=${REUSE:-1}

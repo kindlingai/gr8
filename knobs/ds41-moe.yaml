@@ -42,6 +42,15 @@ knobs:
       An L2 evict_last hint on the routed expert weight loads of the read-once expert loop. 0: off. 1: k_fc1_ro only. 2:
       k_fc1_ro and k_fc2_ro. No activation load or store carries a hint, and decode and the shared expert are not
       touched. Every value is the same.
+  GR8_DS_MOE_TC:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1: the routed experts of a prefill chunk (more than 256 rows) run on the block-scaled tensor cores: the MXFP4 expert
+      records as stored are the e2m1 operand, the activations are rounded to MXFP8 (E4M3 per 32 with an E8M0 scale, as
+      GR8_DS_ATTN_TC rounds the attention inputs), fp32 accumulate. Not bit-equal to 0, which keeps the fp16 kernels.
+      Decode and the shared expert are not touched. DS41's launcher defaults set 1.
   GR8_DS_MOE_PDL:
     scope: agree
     kind: flag
