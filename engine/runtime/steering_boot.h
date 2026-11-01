@@ -1,6 +1,7 @@
 // Host-only verified local-profile boot preparation; no device state changes on failure.
 #pragma once
 #include "steering_profile.h"
+#include "steering_glp.h"
 #include <algorithm>
 #include <cstdlib>
 
@@ -15,7 +16,8 @@ inline void check_layers(const Profile& p, const std::vector<int>& layers) {
     for (uint32_t l : p.layers)
         if (!unique.count(int(l))) throw std::runtime_error("steering: profile layer " + std::to_string(l) + " is absent from --layers");
 }
-// `directories`: one profile directory, or several separated by commas.
+// `directories`: one profile directory or GLP GGUF vector, or several
+// separated by commas (each entry's container is detected by magic bytes).
 inline PreparedBoot prepare_boot(const std::string& directories, const ExpectedModel& expected,
                                   const std::string& served_template, const std::vector<int>& layers,
                                   const std::string& force = {}) {
@@ -32,7 +34,7 @@ inline PreparedBoot prepare_boot(const std::string& directories, const ExpectedM
         const size_t comma = directories.find(',', at);
         const std::string dir = directories.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
         if (dir.empty()) throw std::runtime_error("--steering-profile: empty directory in the list");
-        out.profiles.push_back(load_profile(dir, expected));
+        out.profiles.push_back(load_profile_any(dir, expected));
         check_layers(out.profiles.back(), layers);
         if (comma == std::string::npos) break;
         at = comma + 1;

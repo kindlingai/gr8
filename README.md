@@ -350,6 +350,9 @@ Thanks to:
     ([#60](https://github.com/kindlingai/gr8/pull/60), [#65](https://github.com/kindlingai/gr8/pull/65)).
 - [@unsaltedbutter-ai](https://github.com/unsaltedbutter-ai)
   - API compatibility and structured-output proposals ([#71](https://github.com/kindlingai/gr8/pull/71)).
+- [@msuiche](https://github.com/msuiche)
+  - Native GLP (GGUF) steering input: [weightless](https://weightle.ss/) GLP vectors load as steering
+    profiles through the schema-v1 validation path ([GLP spec](https://github.com/msuiche/weightless/blob/main/docs/spec/GLP.md)).
 - [@alexellis](https://github.com/alexellis)
   - [RigMark](https://github.com/alexellis/rigmark), used for decode and concurrency benchmarking.
 
@@ -362,6 +365,9 @@ Thanks to:
 - [davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw](https://huggingface.co/davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw), whose
   per-expert bit distribution `home` keeps expert for expert.
 - [RigMark](https://github.com/alexellis/rigmark) by [@alexellis](https://github.com/alexellis), for decode and concurrency benchmarking.
+- [weightless](https://github.com/msuiche/weightless) by [@msuiche](https://github.com/msuiche): the GLP
+  vector format ([spec](https://github.com/msuiche/weightless/blob/main/docs/spec/GLP.md)) and its
+  reader-conformance contract, which the native steering input implements.
 - The tool-call cases in `frontend/g6front-rs/src/parser.rs` are ported from vLLM's GLM tool-parser tests (Apache-2.0).
 
 Credits are also maintained in [CREDITS.md](CREDITS.md).
