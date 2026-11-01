@@ -136,11 +136,16 @@ def parse(argv, environ=None):
     environ = os.environ if environ is None else environ
     warnings = []
     argv = renamed_argv(argv, warnings)
-    cmd, at, args, switches = {}, None, [], set()
+    cmd, at, args, switches, named = {}, None, [], set(), None
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a.startswith('@'):
+        if a == '--named-model':    # ./gr8 <model> passes the name it was given: that is the model (#244)
+            i += 1
+            if i >= len(argv):
+                raise OptionError('--named-model needs a value')
+            named = argv[i]
+        elif a.startswith('@'):
             if at:
                 raise OptionError('one @FILE only')
             at = a[1:]
@@ -188,6 +193,14 @@ def parse(argv, environ=None):
                 break
         else:
             values[k], origin[k] = dflt, 'default'
+    # The name ./gr8 was given is the model. A GR8_MODEL elsewhere that names another one is kept for validate() to
+    # refuse: up, check, prepare and show-config stop on it, and down, status, logs and health read the last boot.
+    conflict = None
+    if named:
+        conflict = next(((where, d['GR8_MODEL']) for where, d in (
+            ('on the command line', cmd), (f'in the config file {path}', filev), ('in the environment', environ))
+            if d.get('GR8_MODEL') and d['GR8_MODEL'] != named), None)
+        values['GR8_MODEL'], origin['GR8_MODEL'] = named, f'./gr8 {named}'
     # The mode comes from the strongest source that names one.
     for src, d in (('command line', cmd), ('file', filev), ('environment', environ)):
         has_p, has_m = bool(d.get('PEERS')), bool(d.get('MENTAT'))
@@ -219,6 +232,7 @@ def parse(argv, environ=None):
         if origin[k] == 'default':
             values[k], origin[k] = v, f'{model} default'
     opts = Options(values, origin, path, args, switches, warnings)
+    opts.named, opts.model_conflict = named, conflict
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
     for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'GR8_WORK_DIR', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT',
@@ -247,6 +261,10 @@ def validate(o):
     if not o.get('GR8_MODEL'):
         raise OptionError(f'no model: set GR8_MODEL to {models.CHOICES}, in the config file or the environment, or '
                           'run ./gr8 <model> (./gr8 models lists them)')
+    if getattr(o, 'model_conflict', None):
+        where, other = o.model_conflict
+        raise OptionError(f'./gr8 {o.named} names the model, and GR8_MODEL={other} {where} names another: remove that '
+                          f'GR8_MODEL, or run ./gr8 {other}')
     model = models.of(o)
     tp = o.get('TP')
     if tp is None:

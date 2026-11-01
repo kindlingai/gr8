@@ -86,12 +86,14 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_DS_BLOCK` | text | the checkpoint's DSpark block, 5 |  | DSpark draft block size; the draft step always holds 5 rows a session, so only 5 is served. |
 | `GR8_DS_C8PACK` | flag | `0` | 0\|1 | Short fresh prompts (up to 64 rows each, up to 8 of them, 512 rows in all) prefill together in one ragged pass and share one prompt-tail step. Needs --serve, --s2-sessions >= 2 and GR8_DS_PREFILL_MIN >= 2. |
 | `GR8_DS_COMP_FP8` | flag | `0` |  | 1 = the ratio-2 compressor weights are packed to E4M3 with UE8M0 scales at bind time and prefill steps of 9 or more rows use them. Lossy, and its effect on quality has not been measured. |
+| `GR8_DS_CONF_TEMP` | text | 1.0 |  | Temperature of the DSpark confidence head: one positive number for every draft row, or five comma separated, one a row. A draft's confidence is the sigmoid of its head score over the temperature. Only GR8_DS_VERIFY_CAP reads the confidence; at 1.0 the scores keep their order. |
 | `GR8_DS_DEC_STAGE` | flag | `0` | 0\|1 | Decode consumes of the main model (1..MX rows) read the peers' slots with 16-byte loads through shared memory. |
 | `GR8_DS_DSP_GV` | flag | `0` |  | 1 = the DSpark drafter's projections run on the MXFP8 GEMV for 1 to 8 rows. A projection that cannot take the GEMV then stops the process. 0 = the generic MXFP8 GEMM. |
 | `GR8_DS_DSP_TC` | flag | `0` |  | 1 = a DSpark prefill projection of more than 8 rows in one group runs on the attention block's tensor-core MXFP8 GEMM (ds41_gemm_mx_tc) when that entry takes the shape, else on the generic GEMM. |
 | `GR8_DS_ENGRAM` | flag | `0` | 0\|1 | 1 runs Engram at layers 1 and 14: every step hashes the last four tokens of each row, reads this rank's table rows from NVMe and adds the gated result to the trunk. It needs GR8_DS_ENGRAM_PREFIX. 0 skips Engram, and the other GR8_DS_ENGRAM_ knobs are not read. |
 | `GR8_DS_ENGRAM_MTP` | flag | `0` | 0\|1 | Allows GR8_DS_ENGRAM=1 together with GR8_DS_MTP. The verify rows' n-gram window comes from the host-built step input and a rejected draft's ring tokens are rewritten before they are read. Not yet compared against Engram at MTP 0. |
 | `GR8_DS_GATE_RO` | flag | `0` |  | 1: the read-once prefill path computes the main layers' gate logits with k_gate_logits_ro (8 experts x 8 tokens per warp) instead of k_gate_logits_mt. Same fma chain per token and expert, so the logits are the same bytes. The 128-expert draft layers keep k_gate_logits_mt. |
+| `GR8_DS_MANIFEST` | text | native |  | The release manifest the loader plans from, manifests/exlr8-manifest-NAME.json. A layer whose widths are numbers loads its experts as exlr8 trellis (pmcgx-k4: layers 0-7 at K4); the other layers keep the native experts. |
 | `GR8_DS_MHC_DECOMP` | flag | `0` | 0\|1 | Prefill chunks above MX rows run the mHC consume and prepare as separate decomposed kernels (ds_mhc_decomp.cuh). |
 | `GR8_DS_MHC_FUSE` | flag | `1` | 0\|1 | The mHC consume of one sub-layer and the prepare of the next run as one trunk pass, except where Engram sits between them. 0 runs them apart. |
 | `GR8_DS_MHC_ROW_SHARD` | flag | `0` | 0\|1 | W-row prefill: each rank runs the late layers' mHC for a quarter of the rows and all-gathers the trunk state. Needs W 4096, GR8_DS_PF_TAIL 128, TP4, GR8_DS_PF_RS=1 and GR8_DS_MHC_FUSE=1. |
@@ -122,6 +124,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_DS_SRC_FAST` | int | `0` | 0..3 | Bits of the source-layer fast paths: 1 = the ratio-2 compressor projections of up to 8 rows use k_f32gemv2 (bit-identical to k_f32gemm2), 2 = the indexer's wq_b runs on the MXFP8 GEMV (a different summation order). |
 | `GR8_DS_STRIPE` | flag | `0` | 0\|1 | The main fabric stripes writes of at least GR8_DS_STRIPE_MIN bytes over both rails (needs --ips2). |
 | `GR8_DS_STRIPE_MIN` | int | `1048576` | 8192.. | With GR8_DS_STRIPE=1, the smallest write the fabric stripes, in bytes. |
+| `GR8_DS_VERIFY_CAP` | text | 0, every draft is verified |  | 0, or a confidence threshold in (0, 1]: a DSpark draft whose confidence (GR8_DS_CONF_TEMP) is below it is not verified, so a round's verify step holds fewer rows. Exact: the emitted tokens do not change. Checked at boot; the verify step does not apply it yet. |
 | `GR8_DS_WAIT_K` | int | `0` | 0..2 | Who waits for the peers' tails before a consume kernel: 0 every CTA, 1 one wait kernel ahead of it, 2 one CTA that then releases the others through a device word (main model only; others fall back to 1). |
 | `GR8_DS_WOB_PERSIST` | flag | `0` |  | 1 = the coalesced-epilogue wo_b GEMM of a direct-send prefill chunk runs as a persistent kernel (k_gemm_mx8t_c2_persist). |
 | `GR8_DTR` | flag | `1` |  | Uses the exlr8 release's dense trellis matrices (q_b, o_proj, the dense MLP) where a layer has them. 0 = the int4 or MXFP8 records, which the layer must then have. |
@@ -323,7 +326,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_DS_ENGRAM_WAYS` | int | `16` | 1..16 | Ways of the set-associative Engram row cache. |
 | `GR8_DS_FEED_DIR` | path | off |  | Debug: a directory of reference activations the step driver feeds in place of its own, layer by layer. |
 | `GR8_DS_MOE_ELOG` | flag | `1` |  | 1: every prefill router call (more than 32 rows) writes the distinct experts of each layer to a device ring that the host reads after the chunk. 0: no record is written. |
-| `GR8_DS_SPAN` | flag | `0` | 0\|1 | Prints the host time of each step's spans. |
+| `GR8_DS_SPAN` | int | `0` | 0..2 | Prints the GPU time of each plan unit (attention, consume, MoE, head, ...) summed over the layers: every eager step, and for a captured step graph the mean per step over 16 sampled replays (every 16th replay is read, through globaltimer stamps the capture adds around each unit). 2: also one line per unit kind with the time of each layer. |
 | `GR8_DS_SUBDUMP` | path | off |  | Debug: a directory where each step's sub-layer partials are written. |
 | `GR8_DS_XTRACE` | flag | `0` | 0\|1 | With GR8_XTRACE=1 and DSpark, also trace the DSpark draft fabric. |
 | `GR8_FABRIC_CONNECT_TRIES` | int | `1200` |  | Fabric TCP connect attempts, 100 ms apart. Raise it when ranks load at different speeds. |

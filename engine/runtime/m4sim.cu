@@ -1382,9 +1382,15 @@ int main(int argc, char** argv)
     const int gsplit = (int)knob::dec_split();
     if (gsplit >= NL || (gsplit && !graph)) die("GR8_DEC_SPLIT must be 0..layers-1 and needs --graph");
     cudaGraphExec_t exec2[NBK][MX + 1] = {};
+#if G6_MODEL_DS41
+    std::map<const cudaGraphExec_t*, Ds41SpanSet> span_sets;   // GR8_DS_SPAN: the spans of each captured step graph (the ranks in turn)
+#endif
     auto launch_main = [&](int k, int M) {
         G6RT_CK(cudaGraphLaunch(exec[k][M], st));
         if (gsplit) G6RT_CK(cudaGraphLaunch(exec2[k][M], st));
+#if G6_MODEL_DS41
+        if (ds41_span_on()) ds41_span_replayed(span_sets[&exec[k][M]], "", M, st);
+#endif
     };
     // the context bucket of a step; set as the capturing bucket of every rank (and draft) model
     auto bucket = [&](int context, bool draft) {
@@ -2405,8 +2411,14 @@ int main(int argc, char** argv)
                     for (int pc = gsplit ? 0 : -1; pc < (gsplit ? 2 : 0); ++pc)       // DEC_GSPLIT: parts A, B
                     {
                         cudaGraph_t g;
+#if G6_MODEL_DS41
+                        if (ds41_span_on() && pc != 1) ds41_span_begin(span_sets[&exec[k][M]]);   // part B's units are not stamped
+#endif
                         G6RT_CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
                         enqueue(M, si.context, pc, gsplit);
+#if G6_MODEL_DS41
+                        ds41_span_end(st);
+#endif
                         G6RT_CK(cudaStreamEndCapture(st, &g));
                         size_t nodes = 0;
                         G6RT_CK(cudaGraphGetNodes(g, nullptr, &nodes));

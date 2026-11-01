@@ -148,7 +148,7 @@ class Ds41Tests(unittest.TestCase):
             self.assertIn(want, str(e.exception))
         # DS41 prefix snapshots are now opt-in via REUSE=1; the other refusals remain.
         opt.engine_plan(ds41('--reuse', '1'))
-        for argv, want in ((['--sess', '9'], 'serves several sessions only with GR8_DS_PREFILL_MIN>=2'),
+        for argv, want in ((['--sess', '2', '--extra-env', 'GR8_DS_PREFILL_MIN=0'], 'serves several sessions only with GR8_DS_PREFILL_MIN>=2'),
                            (['--mtp', '6'], 'drafts 0 to 5'), (['--sess', '8', '--mtp', '4'], 'a round of 40 rows')):
             with self.assertRaises(opt.OptionError) as e:
                 opt.engine_plan(ds41(*argv))
@@ -185,15 +185,19 @@ class Ds41Tests(unittest.TestCase):
 
     def test_engine_plan(self):
         plan = opt.engine_plan(ds41())
-        self.assertEqual((plan['knobs']['MTP'], plan['knobs']['SESS'], plan['knobs']['CAP']), ('0', '1', '1048576'))
-        self.assertIn('GR8_CP=0', plan['env'])
-        self.assertIn('GR8_DEC_BK=16384', plan['env'])
+        self.assertEqual((plan['knobs']['MTP'], plan['knobs']['SESS'], plan['knobs']['CAP']), ('0', '5', '262144'))
+        for e in ('GR8_CP=0', 'GR8_DEC_BK=16384', 'GR8_DS_MTP=5', 'GR8_DS_PREFILL_W=1024', 'GR8_DS_ATTN_PW=1024', 'GR8_DS_PF_LANES=2', 'GR8_DS_ATTN_TC=1'):
+            self.assertIn(e, plan['env'])
         self.assertFalse([e for e in plan['env'] if 'PF_STAGE_ASYNC' in e])   # none of the GLM or Flash prefill stack
-        self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '1')
+        self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '5')
         self.assertEqual(plan['args'][plan['args'].index('--mtp') + 1], '0')
-        for a in ('--reuse-prefix', '--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):
+        self.assertIn('--reuse-prefix', plan['args'])
+        for a in ('--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):
             self.assertNotIn(a, plan['args'])
-        plan = opt.engine_plan(ds41('--extra-env', 'GR8_DS_ENGRAM=0 GR8_DEC_SPLIT=0'))
+        # a variable EXTRA_ENV names replaces the tuned one, and the attention and indexer widths follow the prefill width
+        plan = opt.engine_plan(ds41('--extra-env', 'GR8_DS_ENGRAM=0 GR8_DEC_SPLIT=0 GR8_DS_MTP=0 GR8_DS_PREFILL_W=4096'))
+        self.assertEqual(sorted(e for e in plan['env'] if e.startswith(('GR8_DS_MTP=', 'GR8_DS_ATTN_PW=', 'GR8_DS41_IDX_PW='))),
+                         ['GR8_DS41_IDX_PW=4096', 'GR8_DS_ATTN_PW=4096', 'GR8_DS_MTP=0'])
         self.assertIn('GR8_DS_ENGRAM=0', plan['env'])
 
 

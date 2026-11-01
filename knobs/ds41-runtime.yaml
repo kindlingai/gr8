@@ -23,6 +23,14 @@ knobs:
     legacy: ["G6_DS41_CACHE_MIB"]
     doc: >-
       Size in MiB of the host prefix cache of DS41 session snapshots (--reuse-prefix).
+  GR8_DS_CONF_TEMP:
+    scope: agree
+    kind: text
+    unset: "1.0"
+    doc: >-
+      Temperature of the DSpark confidence head: one positive number for every draft row, or five comma separated, one
+      a row. A draft's confidence is the sigmoid of its head score over the temperature. Only GR8_DS_VERIFY_CAP reads
+      the confidence; at 1.0 the scores keep their order.
   GR8_DS_DEC_STAGE:
     scope: agree
     kind: flag
@@ -44,6 +52,13 @@ knobs:
     unset: "off"
     doc: >-
       Debug: a directory of reference activations the step driver feeds in place of its own, layer by layer.
+  GR8_DS_MANIFEST:
+    scope: agree
+    kind: text
+    unset: "native"
+    doc: >-
+      The release manifest the loader plans from, manifests/exlr8-manifest-NAME.json. A layer whose widths are numbers
+      loads its experts as exlr8 trellis (pmcgx-k4: layers 0-7 at K4); the other layers keep the native experts.
   GR8_DS_MHC_DECOMP:
     scope: agree
     kind: flag
@@ -167,11 +182,13 @@ knobs:
       comma separated. Not exact.
   GR8_DS_SPAN:
     scope: local
-    kind: flag
+    kind: int
     default: "0"
-    values: "0|1"
+    values: "0..2"
     doc: >-
-      Prints the host time of each step's spans.
+      Prints the GPU time of each plan unit (attention, consume, MoE, head, ...) summed over the layers: every eager step,
+      and for a captured step graph the mean per step over 16 sampled replays (every 16th replay is read, through
+      globaltimer stamps the capture adds around each unit). 2: also one line per unit kind with the time of each layer.
   GR8_DS_STRIPE:
     scope: agree
     kind: flag
@@ -192,6 +209,14 @@ knobs:
     unset: "off"
     doc: >-
       Debug: a directory where each step's sub-layer partials are written.
+  GR8_DS_VERIFY_CAP:
+    scope: agree
+    kind: text
+    unset: "0, every draft is verified"
+    doc: >-
+      0, or a confidence threshold in (0, 1]: a DSpark draft whose confidence (GR8_DS_CONF_TEMP) is below it is not
+      verified, so a round's verify step holds fewer rows. Exact: the emitted tokens do not change. Checked at boot;
+      the verify step does not apply it yet.
   GR8_DS_WAIT_K:
     scope: agree
     kind: int

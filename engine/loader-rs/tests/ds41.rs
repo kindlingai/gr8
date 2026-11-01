@@ -506,7 +506,7 @@ fn coverage_and_errors() {
     let e = plan_err(&m.dir, 2, 0);
     assert!(e.contains("layers.1.surprise.weight"), "{e}");
     // a sample plan skips the coverage check
-    let o = Opts { layers: Some(vec![0]), experts: Some(4), no_globals: true };
+    let o = Opts { layers: Some(vec![0]), experts: Some(4), no_globals: true, ..Opts::default() };
     let img = ds41::plan(&m.dir, 2, 0, &o).unwrap().img;
     assert!(img.tensors.iter().all(|t| t.name.starts_with("L000.")));
     assert_eq!(img.tensors.iter().find(|t| t.name == "L000.x.fc1").unwrap().shape[0], 4);

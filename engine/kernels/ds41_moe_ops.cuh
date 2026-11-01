@@ -117,6 +117,14 @@ struct Scratch
     __half* ypart;          // [SMAX][8][HID] routed fc2 -> combine
     __half* sh_act;         // [32][IW]
     float* sh_out;          // [32][HID] shared expert out, kept ST_SHARED -> ST_EXPERTS
+    // trellis layers (docs/DS41-TRELLIS.md)
+    __half* x16 = nullptr;  // [MTMAX][HID] the K1 input: hc_y rows in fp16
+    int* tile_ex = nullptr; // [SMAX] expert of each tile of the M 9..32 plan, then [SMAX] its tile count
+    // prefill above MTMAX rows: the GLM prefill MoE scratch for pf_rows rows and their fp16 input (prepare_moe)
+    ::bindp::Scratch pf{};
+    char* pf_blk = nullptr;
+    __half* pf_x16 = nullptr;
+    int pf_rows = 0;
 };
 struct LayerState
 {
@@ -130,6 +138,9 @@ struct LayerState
     // GR8_DS_SH_TC=1 only (else null): plain copies of the shared expert for ds41_gemm_mx_tc, made once at bind from the records (which decode keeps)
     const uint8_t *tc_w13 = nullptr, *tc_sw13 = nullptr;   // [2 IW][HID] codes (rows 0..IW-1 gate, IW..2IW-1 up) + [2 IW][HID/32] E8M0
     const uint8_t *tc_w2 = nullptr, *tc_sw2 = nullptr;     // [HID][SH_KP] codes (k >= IW: 0) + [HID][SH_KP/32] E8M0 (k blocks >= IW/32: 0)
+    // exlr8 trellis experts (the layer has tr3.table): the K1 kernels run its routed and shared experts, and the MXFP4 / FP8
+    // records above stay null
+    ::bind::LayerTensors* tr = nullptr;
 };
 
 inline bool elog_on() { return knob::ds_moe_elog(); }   // the distinct-expert counter (GR8_DS_MOE_ELOG, default on)
@@ -242,10 +253,146 @@ inline Scratch* scratch_of(const Model* m)
         s->ypart = dmalloc<__half>((size_t)SMAX * 8 * HID);
         s->sh_act = dmalloc<__half>((size_t)MTMAX * IW);
         s->sh_out = dmalloc<float>((size_t)MTMAX * HID);
+        s->x16 = dmalloc<__half>((size_t)MTMAX * HID);
+        s->tile_ex = dmalloc<int>(2 * (size_t)SMAX);
         s->elog = dmalloc<dsr::ExpertLog>(1);
         cudaMemset(s->elog, 0, sizeof(dsr::ExpertLog));
     }
     return s;
+}
+
+// ---------------------------------------------------------------------------------------- trellis layers
+// docs/DS41-TRELLIS.md. The K1 kernels (k1.cuh) run the routed experts and the trellis shared expert (tr3.table row 384) of
+// the 128-blocks this rank owns, and their finalize writes the BF16 partial to part[1] with the plan's weights.
+__global__ void k_tr_x16(const __nv_bfloat16* x, __half* y, int n)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = __float2half_rn(__bfloat162float(x[i]));
+}
+// M 9..32: a K1 slot is a tile of the plan, so each tile needs its expert, and the slot count is the tile count
+__global__ void k_tr_tiles(const dsr::PlanMT<dsr::TOPK, MTMAX>* P, int* tile_ex, int* n_tiles)
+{
+    for (int s = threadIdx.x; s < P->n_slots; s += blockDim.x)
+        for (int j = 0; j < P->slot_nt[s]; ++j) tile_ex[P->slot_tile0[s] + j] = P->slot_expert[s];
+    if (threadIdx.x == 0) *n_tiles = P->n_tiles;
+}
+
+inline const char* bind_trellis(LayerState& s, const Find& find, int l)
+{
+    s.tr = new ::bind::LayerTensors(::bind::layer_tensors(l, [&](const char* n) {
+        const TensorRef r = find(n);
+        ::bind::Tensor t;
+        t.p = r.p; t.nd = r.nd; t.fmt = r.fmt;
+        for (int k = 0; k < 4; ++k) t.shape[k] = r.shape[k];
+        return t;
+    }));
+    if (const char* e = ::bind::scan_widths(*s.tr)) return e;
+    if (!s.tr->sh_trellis) return "trellis layer without the trellis shared expert (tr3.table row 384)";
+    static const cudaError_t attr = [] {
+        cudaError_t err = cudaSuccess;
+        ::bind::k1_each([&](auto E4, auto K2, auto SH, auto CB) {
+            for (const void* f : {::bind::k1_fn_fc1<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>(), ::bind::k1_fn_fc2<K1_V(E4), K1_V(K2), K1_V(SH), K1_V(CB)>()})
+            {
+                const cudaError_t e = cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, KSH * 256);
+                if (err == cudaSuccess) err = e;
+            }
+        });
+        return err;
+    }();
+    return attr == cudaSuccess ? nullptr : "cannot set the K1 kernels' shared memory size";
+}
+
+// n <= MTMAX rows of x (bf16, routed by the plan in sc->plan) through K1, the partial to out (BF16 [n][HID])
+inline int k1_rows(Model& m, const LayerState& s, const void* x, int n, void* out, cudaStream_t st)
+{
+    Scratch& sc = *s.sc;
+    k_tr_x16<<<(n * HID + 255) / 256, 256, 0, st>>>((const __nv_bfloat16*)x, sc.x16, n * HID);
+    ::bind::PlanPtrs pp;
+    if (n <= MMAX) pp = ::bind::plan_ptrs((const dsr::PlanT<dsr::TOPK>*)sc.plan);
+    else
+    {
+        using P = dsr::PlanMT<dsr::TOPK, MTMAX>;
+        const P* p = (const P*)sc.plan;
+        k_tr_tiles<<<1, 256, 0, st>>>(p, sc.tile_ex, sc.tile_ex + SMAX);
+        pp.n_slots = sc.tile_ex + SMAX; pp.slot_expert = sc.tile_ex; pp.slot_mask = p->tile_mask;
+        pp.slot_w = &p->tile_w[0][0]; pp.slot_tok = &p->tile_tok[0][0];
+        pp.tok_slot = &p->tok_slot[0][0]; pp.tok_col = &p->tok_col[0][0]; pp.tok_w = &p->tok_w[0][0];
+    }
+    ::bind::K1 k;
+    ::bind::Tensor sh_out[3];
+    if (const char* e = ::bind::make_k1(*s.tr, n, m.sc, sc.x16, sc.xfrag, pp, out, 1, k, sh_out))
+    {
+        fprintf(stderr, "DS41 MoE layer %d, %d rows: %s\n", s.layer, n, e);
+        return ds41::NOTSUP;
+    }
+    if (k.fuse) ::bind::launch_k1_fused(k, st);
+    else
+    {
+        ::bind::launch_k1_fc1(k, st);
+        ds41_span_mark("k1_fc1", st);
+        ::bind::launch_k1_fc2(k, st);
+        ds41_span_mark("k1_fc2", st);
+    }
+    ::bind::launch_k1_fin(k, st);
+    return (int)cudaGetLastError();
+}
+
+// M 33..256 and the read-once rows come with DS41's plan of that size (op_router); its tokens' experts and weights (the 1.5
+// route scale included) become the GLM prefill MoE's routes (bindp::Expert, pre_routed), which reads each expert's units once
+// per segment of up to RS rows. The trellis shared expert runs as its own pass first (bindp::launch_shared, weight 1), and the
+// routed pass's finalize adds it, writing the BF16 partial to part[1].
+template <int MM>
+__global__ void k_tr_routes(const dsr::PlanMT<dsr::TOPK, MM>* P, int M, int* tok_e, float* tok_w)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= M * dsr::TOPK) return;
+    const int m = i / dsr::TOPK, k = i % dsr::TOPK;
+    const bool live = P->tok_slot[m][k] >= 0;
+    tok_e[i] = live ? P->tok_expert[m][k] : -1;
+    tok_w[i] = live ? P->tok_w[m][k] : 0.f;
+}
+
+inline int trellis_prefill(Model& m, const LayerState& s, int rows, cudaStream_t st)
+{
+    static_assert(dsr::TOPK == geom::TOPK && dsr::NEXP == geom::NEXP, "bindp routes are [M][geom::TOPK] over geom::NEXP experts");
+    Scratch& sc = *s.sc;
+    if (rows > sc.pf_rows) return ds41::NOTSUP;
+    const ::bindp::Scratch& q = sc.pf;
+    k_tr_x16<<<(rows * HID + 255) / 256, 256, 0, st>>>((const __nv_bfloat16*)m.hc_y, sc.pf_x16, rows * HID);
+    const int g = (rows * dsr::TOPK + 255) / 256;
+    if (rows >= RO_FROM) k_tr_routes<ROMAX><<<g, 256, 0, st>>>((const dsr::PlanMT<dsr::TOPK, ROMAX>*)sc.ro->plan, rows, q.tok_e, q.tok_w);
+    else if (rows <= 128) k_tr_routes<128><<<g, 256, 0, st>>>((const dsr::PlanMT<dsr::TOPK, 128>*)sc.pw->plan, rows, q.tok_e, q.tok_w);
+    else k_tr_routes<256><<<g, 256, 0, st>>>((const dsr::PlanMT<dsr::TOPK, 256>*)sc.pw->plan, rows, q.tok_e, q.tok_w);
+    const ::bind::LayerTensors& T = *s.tr;
+    using namespace ::bind;
+    ::bindp::Expert A;
+    A.on = 1; A.M = rows; A.maxseg = ::bindp::max_segments(rows);
+    A.topk = topk_for_step(m); A.nroutes = rows * A.topk; A.pre_routed = 1;
+    A.tok_e = q.tok_e; A.tok_w = q.tok_w; A.cnt = q.cnt;
+    A.rr_row = q.rr_row; A.rr_e = q.rr_e; A.rr_sp = q.rr_sp; A.rr_w = q.rr_w; A.pos = q.pos; A.segs = q.segs; A.n_seg = q.n_seg;
+    A.t_tab = (const long long*)T.t[T_TR3_TAB].p; A.t_kmix = (const long long*)T.t[T_TR3_KMIX].p;
+    A.k2 = T.k2; A.cb = T.cb; A.bs = 1;
+    A.t_fc1 = (const uint8_t*)T.t[T_TR3_FC1].p; A.t_wide = T.fc1_wide; A.t_fc2 = (const uint8_t*)T.t[T_TR3_FC2].p; A.t_wide2 = T.fc2_wide;
+    A.t_v2 = (const __half*)T.t[T_TR3_V2].p;
+    A.t_sg = (const __half*)T.t[T_TR3_SG].p; A.t_v1b = (const __half*)T.t[T_TR3_V1B].p; A.t_v3b = (const __half*)T.t[T_TR3_V3B].p;
+    A.x = sc.pf_x16; A.ldx = HID;
+    A.z1 = q.z1; A.x2 = q.x2; A.yw = q.yw; A.ysh = q.ysh; A.out = (uint16_t*)m.sc.part[1];
+    ::bindp::Expert S = A;
+    S.nroutes = rows; S.maxseg = (rows + ::bindp::RS - 1) / ::bindp::RS;
+    S.rr_row = q.sh_rr_row; S.rr_e = q.sh_rr_e; S.rr_sp = q.sh_rr_sp; S.rr_w = q.sh_rr_w;
+    S.segs = q.sh_segs; S.n_seg = q.sh_n_seg; S.pos = nullptr; S.yw = q.ysh;
+    ::bindp::launch_shared<g6nr::EB>(S, st);
+    ds41_span_mark("tr_shared", st);
+    ::bindp::launch_route(A, st);
+    ds41_span_mark("tr_route", st);
+    ::bindp::launch_fc1<g6nr::EB>(A, st);
+    ds41_span_mark("tr_fc1", st);
+    ::bindp::launch_mid<g6nr::EB>(A, st);
+    ds41_span_mark("tr_mid", st);
+    ::bindp::launch_fc2<g6nr::EB>(A, st);
+    ds41_span_mark("tr_fc2", st);
+    ::bindp::launch_fin(A, st);
+    return (int)cudaGetLastError();
 }
 
 // bind_moe(model, i, 0, stream): resolve and shape-check the layer's tensors, once, at build.
@@ -303,6 +450,14 @@ inline int bind_moe(void* model, int i, int, void*)
     s->ne = ne; s->tk = ne == dsr::NEXP ? dsr::TOPK : geom::DS_TOPK; s->layer = y.l;
     s->gate = (const __nv_bfloat16*)get("router.w", 2, {ne, HID}, 1).p;
     s->bias = (const float*)get("router.bias", 1, {ne}, 2).p;
+    s->sc = scratch_of(&m);
+    if (find(lname(y.l, "tr3.table")).p)
+    {
+        if (ne != dsr::NEXP) die(who + "trellis experts on a DSpark layer");
+        if (const char* e = bind_trellis(*s, find, y.l)) die(who + e);
+        y.ds41_moe = s;
+        return 0;
+    }
     s->sh_w1 = (const uint8_t*)get("sh.w1.mx.gv", 3, {IW / 16, HID / 32, 528}, 0).p;
     s->sh_w3 = (const uint8_t*)get("sh.w3.mx.gv", 3, {IW / 16, HID / 32, 528}, 0).p;
     s->sh_w2 = (const uint8_t*)get("sh.w2.mx.gv", 3, {HID / 16, IW / 32, 528}, 0).p;
@@ -334,7 +489,6 @@ inline int bind_moe(void* model, int i, int, void*)
             }
         }
     }
-    s->sc = scratch_of(&m);
     y.ds41_moe = s;
     return 0;
 }
@@ -390,6 +544,20 @@ inline int prepare_moe(void* model, int i, int M, void*)
         if (M >= RO_FROM) { if (!s->sc->ro) s->sc->ro = ro_alloc(); }
         else if (!s->sc->pw) s->sc->pw = pw_alloc();
     }
+    if (s->tr && M > MTMAX && M > s->sc->pf_rows)                         // the trellis prefill scratch for M rows (host init)
+    {
+        static std::mutex mu;
+        std::lock_guard<std::mutex> lk(mu);
+        Scratch& sc = *s->sc;
+        if (M > sc.pf_rows)
+        {
+            if (sc.pf_blk) { cudaFree(sc.pf_blk); cudaFree(sc.pf_x16); }
+            sc.pf_blk = dmalloc<char>(::bindp::scratch_bytes(M));
+            sc.pf = ::bindp::scratch_at(sc.pf_blk, M);
+            sc.pf_x16 = dmalloc<__half>((size_t)M * HID);
+            sc.pf_rows = M;
+        }
+    }
     if (M >= RO_FROM && gate_ro_on())                                    // the smem attribute of k_gate_logits_ro is set here (host init), never inside a capture
     {
         const cudaError_t a = gro_attr();
@@ -434,7 +602,9 @@ inline int experts(Model& m, const LayerState& s, int M, cudaStream_t st)
                  (const int*)(p + offsetof(P, n_slots)), M * TK /* grid bound: CTAs of slots >= n_slots exit */, geom::SWIGLU_LIMIT,
                  s.sc->act, s.sc->ypart};
     launch(PD, mx4::k_fc1<HID, IW, 8, 1, 2, false, PD>, dim3(M * TK * (IW / 16)), dim3(8 * 32), st, RA);
+    ds41_span_mark("fc1", st);
     launch(PD, mx4::k_fc2<IW, HID, 8, 2, false, PD>, dim3(M * TK * (HID / 16 / 8)), dim3(8 * 32), st, RA);
+    ds41_span_mark("fc2", st);
     dsh::CombineArgsT<TK> CA{(const P*)p, s.sc->ypart, s.sc->sh_out, (void*)m.sc.part[1], M};
     launch(PD, dsh::k_combine<HID, 128, gv::O_BF16, TK>, dim3(M * HID / (8 * 128)), dim3(128), st, CA);
     return (int)cudaGetLastError();
@@ -475,7 +645,9 @@ inline int experts_mt_nt(Model& m, const LayerState& s, int M, cudaStream_t st)
                    (const int*)(p + offsetof(P, n_slots)), M * TK /* grid bound: CTAs of slots >= n_slots exit */, geom::SWIGLU_LIMIT,
                    s.sc->act, s.sc->ypart};
     launch(PD, mx4::k_fc1_mt<HID, IW, 8, 1, mx4::FC1_MT_DEPTH<NT>, NT, 0, PD>, dim3(M * TK * (IW / 16)), dim3(8 * 32), st, RA);
+    ds41_span_mark("fc1_mt", st);
     launch(PD, mx4::k_fc2_mt<IW, HID, 8, 2, NT, PD>, dim3(M * TK * (HID / 16 / 8)), dim3(8 * 32), st, RA);
+    ds41_span_mark("fc2_mt", st);
     dsh::CombineArgsMT<TK, MTMAX> CA{(const P*)p, s.sc->ypart, s.sc->sh_out, (void*)m.sc.part[1], M};
     launch(PD, dsh::k_combine_mt<HID, 128, gv::O_BF16, TK, MTMAX>, dim3(M * HID / (8 * 128)), dim3(128), st, CA);
     return (int)cudaGetLastError();
@@ -577,6 +749,7 @@ inline int router_ro(Model& m, const LayerState& s, int M, cudaStream_t st)
         cudaLaunchKernelEx(&cfg, dsr::k_gate_logits_ro<dsr::NEXP>, (const __nv_bfloat16*)s.gate, (const __nv_bfloat16*)m.hc_y, M, q.logits);
     }
     else launch(false, dsr::k_gate_logits_mt<NE, 0>, dim3(NE / 8), dim3(256), st, (const __nv_bfloat16*)s.gate, (const __nv_bfloat16*)m.hc_y, M, q.logits);
+    ds41_span_mark("ro_gate", st);
     cudaMemsetAsync(q.emask, 0, (size_t)NE * MW * sizeof(unsigned), st);
     launch(false, dsr::k_route_ro<NE, TK, ROMAX, KC>, dim3((M + 7) / 8), dim3(256), st, (const float*)q.logits, s.bias, M, (P*)q.plan, q.emask);
     launch(false, dsr::k_scan_ro<NE, TK, ROMAX>, dim3(1), dim3(NE), st, (P*)q.plan, (const unsigned*)q.emask, q.tile0_of);
@@ -646,11 +819,13 @@ inline void fc_ro_run(const mx4::ArgsMT& RA, int sb, int bstg, cudaStream_t st)
         if (ce != cudaSuccess) die(std::string("GR8_DS_MOE_FC1BSTG launch: ") + cudaGetErrorString(ce));
     }
     else launch(false, mx4::k_fc1_ro<HID, IW, KS, CW, 1, NTG1, 0, ORD, LA, (HV >= 1)>, dim3(sb * (IW / 16 / CW)), dim3(KS * CW * 32), st, RA);
+    ds41_span_mark("ro_fc1", st);
     mx4::ArgsMT R2 = RA;
     R2.la = RA.la * 2;                                                              // fc2 runs 2 CTAs per SM
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(sb * (HID / 16 / W2)); cfg.blockDim = dim3(W2 * 32); cfg.dynamicSmemBytes = SMEM2; cfg.stream = st;
     cudaLaunchKernelEx(&cfg, k2, R2);
+    ds41_span_mark("ro_fc2", st);
 }
 template <bool ORD, bool LA, int KS, int CW, int NTG1, int W2, int D2, int NTG2>
 inline void fc_ro_hint(const mx4::ArgsMT& RA, int sb, int hv, int stg, int bstg, cudaStream_t st)
@@ -698,7 +873,7 @@ inline const LayerState* state_of(void* model, int i, int rows)
 inline void l2pf_add(const Model& m, int i, l2pf::Plan& P)
 {
     const LayerState* s = (const LayerState*)m.layers[i].ds41_moe;
-    if (s) ds41l2pf::add_moe(P, s->ne, HID, IW, s->gate, s->sh_w1, s->sh_w3, s->sh_w2);
+    if (s && !s->tr) ds41l2pf::add_moe(P, s->ne, HID, IW, s->gate, s->sh_w1, s->sh_w3, s->sh_w2);
 }
 inline int op_router(void* model, int i, int rows, void* stream)
 {
@@ -729,6 +904,7 @@ inline int op_shared(void* model, int i, int rows, void* stream)
     const LayerState* s = state_of(model, i, rows);
     if (!s) return ds41::NOTSUP;
     cudaStream_t st = (cudaStream_t)stream;
+    if (s->tr) return 0;                                                // the trellis shared expert runs inside K1
     if (rows >= RO_FROM) {
         Model& m=*(Model*)model;
         const bool direct=m.ds41_y_quant_ready && m.ds41_rowshard_chunk && rows==4096;
@@ -744,6 +920,7 @@ inline int op_experts(void* model, int i, int rows, void* stream)
     if (!s) return ds41::NOTSUP;
     Model& m = *(Model*)model;
     cudaStream_t st = (cudaStream_t)stream;
+    if (s->tr) return rows > MTMAX ? trellis_prefill(m, *s, rows, st) : k1_rows(m, *s, m.hc_y, rows, m.sc.part[1], st);
     const bool big = s->tk == dsr::TOPK, pd = pdl_on();
     if (rows >= RO_FROM)
         return big ? experts_ro<dsr::NEXP, dsr::TOPK>(m, *s, rows, st) : experts_ro<geom::DS_NEXP, geom::DS_TOPK>(m, *s, rows, st);
