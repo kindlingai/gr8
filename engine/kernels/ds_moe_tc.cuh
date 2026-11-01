@@ -48,7 +48,16 @@ struct Args
     const int* n_tiles_dev;       // the plan's tile count: k_aq quantizes rows < 8 * *n_tiles_dev (nullptr = every row of its grid)
     int n_slots;
     int gy1, gy2;                 // token-group split of k_fc1_tc / k_fc2_tc: CTA (x, gy) walks groups gy, gy + GY, ..; gy is the fastest index of blockIdx.x
-    int os2;                      // k_fc2_tc: the expert's output tiles split over os2 CTAs (the next index after gy); grid = n_slots * os2 * gy2
+    int os2;                      // k_fc2_tc: the expert's output tiles split over os2 CTAs; grid = os2 * n_slots * gy2, os the slowest index (a slice at a time)
+    // the fused combine (cnt != nullptr): the CTA that writes a token's last route of a slice sums the token's routes in route order + the shared term and
+    // writes out (bf16 [M][NOUT]); the ypart slots are then dropped from L2 unwritten. cnt [M][os2] ints, zeroed before the launch.
+    int* cnt;
+    int kc;                       // routes per token (the top-k cut; tok_slot < 0 past it)
+    const int* tok_slot;          // plan: [M][8] the global tile of route k, -1 none
+    const int* tok_col;           // plan: [M][8] its column
+    const void* shared;           // [M][NOUT] fp32, or bf16 when shared_bf16 (GR8_DS_SH_TC); nullptr = none
+    int shared_bf16;
+    void* out;                    // bf16 [M][NOUT]
     float limit;
     __half* act;                  // [tile][8][I] fp16 (fc1 out)
     uint8_t* aq;                  // [tile * 8][I / 64][XREC]  act quantized (k_aq)
@@ -357,9 +366,13 @@ __global__ void __launch_bounds__(CW * 32) k_fc1_tc(Args A)
 }
 
 // ---------------------------------------------------------------------------------------------------- fc2
-// CTA = (slot, os, gy), WARPS warps, warp w owns token tiles w TW .. w TW + TW - 1 of the group (NTOK = WARPS * TW * 8 rows), CTA os walks output tile
-// blocks os NB / OS .. (os + 1) NB / OS - 1; grid = n_slots * OS * GY (gy fastest, then os, as k_fc1_tc), block WARPS * 32, dynamic smem
-// fc2_smem<WARPS, TPC, ST>(). OS > 1 makes more and shorter CTAs for the same weight bytes (145 groups of 360 stages were 1.5 waves of 96 CTAs). The warp's rows of aq (9 records x 16 B per lane and tile) and their scale words sit in
+// CTA = (os, slot, gy), WARPS warps, warp w owns token tiles w TW .. w TW + TW - 1 of the group (NTOK = WARPS * TW * 8 rows), CTA os walks output tile
+// blocks os NB / OS .. (os + 1) NB / OS - 1; grid = OS * n_slots * GY (gy fastest, then the slot, os slowest: the whole grid works one output slice at a
+// time, so with the fused combine a slice's live partials (routes x M x SL halves, 7.7 MB at 1024 rows and OS 8) stay in L2 until they are summed), block
+// WARPS * 32, dynamic smem fc2_smem<WARPS, TPC, ST>(). OS > 1 also makes more and shorter CTAs for the same weight bytes.
+// Fused combine (A.cnt): after its group's slice is written, the CTA fences and counts each live token's route in cnt[m][os]; the CTA whose count
+// completes the token's kc routes sums them over the slice = the CTA's own tile blocks (every CTA of index os owns the same columns, whatever expert) (combine_token: fixed route order, so the result does not depend on which CTA was last or when) and
+// writes out[m][slice]. The counts are integer atomics; no float atomic, and every output element has one writer. The warp's rows of aq (9 records x 16 B per lane and tile) and their scale words sit in
 // REGISTERS for the whole group, and the CTA streams the expert's fc2 records once per group, tile-major, through an ST-deep cp.async ring (a stage = one
 // record of TPC output tiles, 272 16-B pieces), every warp reading every A fragment from smem. So the expert's 1.57 MB of fc2 weights move L2 -> SM once per
 // 64 tokens instead of once per 32 for each of 20 CTAs (the earlier loop, bound by that copy traffic at 2 x its DRAM floor). After a block's 9 records the warp
@@ -367,6 +380,65 @@ __global__ void __launch_bounds__(CW * 32) k_fc1_tc(Args A)
 // (2 r + h) and the register index are constants. The epilogue stages a tile's 8 rows x TPC 16 columns in smem and stores whole 16-B pieces: the
 // fragment-order 2-byte stores (four half-sectors in four rows per warp store) were 35-40% of the kernel.
 constexpr int YP = 136;           // fc2 output staging: halves per row (128 columns + 8 of pad: the four token rows a lane writes land in different banks)
+// discard.global.L2: drop a 128-B line from the L2 without writing it back (the slot lines of a summed token: dead, and 66 MB a layer at 1024 rows otherwise)
+#ifndef DS41_TC_DISCARD
+#define DS41_TC_DISCARD 1         // 0: keep the summed slot lines (a diagnostic build)
+#endif
+__device__ __forceinline__ void l2_discard(const void* p)
+{
+    if constexpr (DS41_TC_DISCARD) asm volatile("discard.global.L2 [%0], 128;" :: "l"(p) : "memory");
+}
+// The combine of one token's slice [n0s, n0s + SL) by one warp: out = bf16(sum over routes k in order of ypart[slot k] + shared), the sum and the order of
+// dsh::k_combine_mt (fp32 adds, one rounding). Then the routes' slice lines are discarded from L2.
+template <int NOUT>
+__device__ __forceinline__ void combine_token(const Args& A, int m, int n0s, int SL, int lane)   // SL % 64 == 0 (16-B pieces, 128-B lines)
+{
+    int sl[8], co[8];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) { sl[k] = k < A.kc ? A.tok_slot[m * 8 + k] : -1; co[k] = k < A.kc ? A.tok_col[m * 8 + k] : 0; }
+    for (int n0 = n0s + lane * 8; n0 < n0s + SL; n0 += 256)
+    {
+        float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        uint4 v[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k)
+            if (k < A.kc && sl[k] >= 0) v[k] = __ldcg(reinterpret_cast<const uint4*>(A.ypart + (static_cast<size_t>(sl[k]) * 8 + co[k]) * NOUT + n0));
+        float4 sh0 = make_float4(0.f, 0.f, 0.f, 0.f), sh1 = sh0;
+        if (A.shared && !A.shared_bf16)
+        {
+            sh0 = __ldcg(reinterpret_cast<const float4*>(static_cast<const float*>(A.shared) + static_cast<size_t>(m) * NOUT + n0));
+            sh1 = __ldcg(reinterpret_cast<const float4*>(static_cast<const float*>(A.shared) + static_cast<size_t>(m) * NOUT + n0) + 1);
+        }
+        else if (A.shared)
+        {
+            const uint4 b = __ldcg(reinterpret_cast<const uint4*>(static_cast<const uint16_t*>(A.shared) + static_cast<size_t>(m) * NOUT + n0));
+            sh0 = make_float4(__uint_as_float(b.x << 16), __uint_as_float(b.x & 0xffff0000u), __uint_as_float(b.y << 16), __uint_as_float(b.y & 0xffff0000u));
+            sh1 = make_float4(__uint_as_float(b.z << 16), __uint_as_float(b.z & 0xffff0000u), __uint_as_float(b.w << 16), __uint_as_float(b.w & 0xffff0000u));
+        }
+        #pragma unroll
+        for (int k = 0; k < 8; ++k)
+        {
+            if (k >= A.kc || sl[k] < 0) continue;
+            const u32 w[4] = {v[k].x, v[k].y, v[k].z, v[k].w};
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
+            {
+                const float2 f = __half22float2(as_h2(w[i]));
+                acc[2 * i] += f.x; acc[2 * i + 1] += f.y;
+            }
+        }
+        acc[0] += sh0.x; acc[1] += sh0.y; acc[2] += sh0.z; acc[3] += sh0.w;
+        acc[4] += sh1.x; acc[5] += sh1.y; acc[6] += sh1.z; acc[7] += sh1.w;
+        uint4 o;
+        o.x = pack_bf2(acc[0], acc[1]); o.y = pack_bf2(acc[2], acc[3]); o.z = pack_bf2(acc[4], acc[5]); o.w = pack_bf2(acc[6], acc[7]);
+        *reinterpret_cast<uint4*>(static_cast<uint16_t*>(A.out) + static_cast<size_t>(m) * NOUT + n0) = o;
+    }
+    const int lines = SL * 2 / 128;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k)
+        if (k < A.kc && sl[k] >= 0)
+            for (int l = lane; l < lines; l += 32) l2_discard(A.ypart + (static_cast<size_t>(sl[k]) * 8 + co[k]) * NOUT + n0s + l * 64);
+}
 template <int WARPS, int TPC, int ST> constexpr size_t fc2_smem() { return static_cast<size_t>(ST) * TPC * GR + static_cast<size_t>(WARPS) * 8 * YP * 2; }
 // f(integral_constant<int, 0>) .. f(integral_constant<int, N - 1>): a loop whose index is a constant (the mma's scale byte and the register index need one)
 template <int N, class F>
@@ -384,11 +456,11 @@ __global__ void __launch_bounds__(WARPS * 32, 2) k_fc2_tc(Args A)
     constexpr int NG = I / KG, OT = NOUT / 16, NB = OT / TPC, NTG = WARPS * TW, NTH = WARPS * 32, AST = TPC * GR, ACH = GR / 16, NA = (TPC * ACH + NTH - 1) / NTH;
     constexpr int NSW = (NG + 1) / 2;                                        // scale words per row (2 records each)
     static_assert(I % KG == 0 && OT % TPC == 0 && I % 16 == 0 && ST >= 2 && ST - 1 <= NG && NSW * 4 <= ASP, "fc2 tc tiling");
-    static_assert(TPC * 16 <= 128 && (TPC * 16) % 8 == 0 && YP % 8 == 0, "fc2 tc output staging: a row of 16-B pieces");
+    static_assert(TPC * 16 <= 128 && (TPC * 16) % 64 == 0 && YP % 8 == 0, "fc2 tc output staging: a row of 16-B pieces; a block = whole 128-B slot lines");
     extern __shared__ __align__(16) uint8_t sm[];
     __half* ys = reinterpret_cast<__half*>(sm + ST * AST) + (threadIdx.x >> 5) * 8 * YP;   // the warp's output stage [8 rows][YP]
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, c = lane & 3, tid = threadIdx.x;
-    const int GY = A.gy2, OS = A.os2, gy = blockIdx.x % GY, os = (blockIdx.x / GY) % OS, slot = blockIdx.x / (GY * OS);
+    const int GY = A.gy2, OS = A.os2, gy = blockIdx.x % GY, slot = (blockIdx.x / GY) % A.n_slots, os = blockIdx.x / (GY * A.n_slots);
     if (A.n_slots_dev && slot >= *A.n_slots_dev) return;
     const int nt = A.slot_nt[slot], tile0 = A.slot_tile0[slot], ng = dsr::ro_ngroups(nt, NTG);
     if (gy >= ng) return;
@@ -503,6 +575,28 @@ __global__ void __launch_bounds__(WARPS * 32, 2) k_fc2_tc(Args A)
             }
         }
         cp_wait<0>();
+        if (A.cnt)
+        {
+            __threadfence();                                                // the slice's ypart stores are visible before the counts
+            __syncwarp();                                                   // every lane's fence before the quad leader's count
+            #pragma unroll
+            for (int tw = 0; tw < TW; ++tw)
+            {
+                if (tw >= nlive) break;
+                const int t = warp * TW + tw;
+                const int tok = A.tile_tok[(t0 + t) * 8 + g];
+                int last = 0;
+                if (c == 0 && ((mask[tw] >> g) & 1))
+                    last = atomicAdd(A.cnt + static_cast<size_t>(tok) * OS + os, 1) + 1 == A.kc;
+                const unsigned lastg = __ballot_sync(0xffffffffu, last);   // bit 4 g: the warp completes token g's slice
+                if (lastg) __threadfence();                                 // the other routes' stores happened before their counts
+                for (unsigned bits = lastg; bits; bits &= bits - 1)
+                {
+                    const int gg = __ffs(bits) - 1;
+                    combine_token<NOUT>(A, A.tile_tok[(t0 + t) * 8 + (gg >> 2)], b0 * (TPC * 16), nb * (TPC * 16), lane);   // the CTA's own columns
+                }
+            }
+        }
         __syncthreads();                                                    // the ring restarts for the next group
     }
 }
@@ -525,6 +619,7 @@ inline cudaError_t launch_layer(const Args& A, const __nv_bfloat16* x, int M, in
     if (attr != cudaSuccess) return attr;
     k_xq<<<(unsigned)((static_cast<long>(M) * (K1 / 32) + 255) / 256), 256, 0, st>>>(x, M, K1, xq, xs);
     k1<<<sb * (I / 16 / CW) * A.gy1, CW * 32, S1, st>>>(A);
+    if (A.cnt) cudaMemsetAsync(A.cnt, 0, static_cast<size_t>(M) * A.os2 * sizeof(int), st);
     k2<<<sb * A.os2 * A.gy2, W2 * 32, S2, st>>>(A);
     return cudaGetLastError();
 }

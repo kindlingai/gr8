@@ -109,6 +109,7 @@ struct RoScratch                                      // read-once path, M RO_FR
     uint8_t* mt_xs = nullptr;     // [ROMAX][HID/32] its E8M0 bytes
     uint8_t* mt_aq = nullptr;     // [tiles*8][IW/64][64] fc1's act quantized
     uint8_t* mt_as = nullptr;     // [tiles*8][mxtc::ASP]
+    int* mt_cnt = nullptr;        // [ROMAX][DS41_TC_OS2] the fused combine's route counts (DS41_TC_COMBINE); null = k_combine_mt runs after fc2
 };
 struct Scratch
 {
@@ -553,6 +554,7 @@ inline RoScratch* ro_alloc()
         p->mt_xs = dmalloc<uint8_t>((size_t)ROMAX * (HID / 32));
         p->mt_aq = dmalloc<uint8_t>((size_t)TILES * 8 * IW);
         p->mt_as = dmalloc<uint8_t>((size_t)TILES * 8 * mxtc::ASP);
+        if (DS41_TC_COMBINE) p->mt_cnt = dmalloc<int>((size_t)ROMAX * DS41_TC_OS2);
     }
     return p;
 }
@@ -882,12 +884,16 @@ inline int experts_ro(Model& m, const LayerState& s, int M, cudaStream_t st)
                    (const int*)(p + offsetof(P, n_slots)), sb, geom::SWIGLU_LIMIT, q.act, q.ypart, ord ? (const int*)q.order : nullptr, la};
     if (q.mt_xq)                                       // GR8_DS_MOE_TC=1: the tensor-core expert loop (ds_moe_tc.cuh), the same plan, act, ypart and combine
     {
+        const int kc = NE == dsr::NEXP ? topk_for_step(m) : TK;              // the routes the planner kept per token (op_router's cut)
         const mxtc::Args TA{s.fc1, s.fc2, q.mt_xq, q.mt_xs, RA.slot_expert, RA.slot_tile0, RA.slot_nt, RA.tile_mask, RA.tile_w, RA.tile_tok, RA.n_slots_dev,
-                            (const int*)(p + offsetof(P, n_tiles)), sb, DS41_TC_GY1, DS41_TC_GY2, DS41_TC_OS2, geom::SWIGLU_LIMIT, q.act, q.mt_aq, q.mt_as, q.ypart};
+                            (const int*)(p + offsetof(P, n_tiles)), sb, DS41_TC_GY1, DS41_TC_GY2, DS41_TC_OS2,
+                            q.mt_cnt, kc, (const int*)(p + offsetof(P, tok_slot)), (const int*)(p + offsetof(P, tok_col)), q.sh_out, s.tc_w13 ? 1 : 0, (void*)m.sc.part[1],
+                            geom::SWIGLU_LIMIT, q.act, q.mt_aq, q.mt_as, q.ypart};
         const cudaError_t e = mxtc::launch_layer<HID, IW, HID, DS41_TC_CW, DS41_TC_NTG1, DS41_TC_ST1, DS41_TC_W2, DS41_TC_WT, DS41_TC_TPC, DS41_TC_ST2>(
             TA, (const __nv_bfloat16*)m.hc_y, M, sb, q.mt_xq, q.mt_xs, st);
         if (e != cudaSuccess) return (int)e;
         ds41_span_mark("ro_fc2", st);
+        if (q.mt_cnt) return (int)cudaGetLastError();                        // the combine ran inside fc2 (part[1] is written)
     }
     else if (ord) { if (la) fc_ro_hint<true, true, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); else fc_ro_hint<true, false, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); }
     else { if (la) fc_ro_hint<false, true, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); else fc_ro_hint<false, false, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); }

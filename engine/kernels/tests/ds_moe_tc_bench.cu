@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 #include "../ds_ro_cfg.h"
 #include "../ds_prefill_ro.cuh"
+#include "../ds_shared.cuh"
 #include "../ds_moe_tc.cuh"
 
 // the TC kernels' shape: the production values (ds_ro_cfg.h DS41_TC_*), override with -DMXTC_*
@@ -172,6 +173,39 @@ __global__ void k_pool_remap(int* slot_expert, const int* n_slots, int pool)    
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s < *n_slots) slot_expert[s] = slot_expert[s] % pool;
 }
+__global__ void k_fill_sh(float* p, size_t n, uint32_t seed)                // a shared-expert term in [-1, 1)
+{
+    for (size_t i = blockIdx.x * 256ull + threadIdx.x; i < n; i += 256ull * gridDim.x)
+        p[i] = (static_cast<float>(hash32(static_cast<uint32_t>(i), seed) & 0xffffu) / 65535.f - 0.5f) * 2.f;
+}
+__global__ void k_hash(const uint32_t* p, size_t n, unsigned long long* h)   // order-independent 64-bit hash of a buffer (sum of mixed words)
+{
+    unsigned long long a = 0;
+    for (size_t i = blockIdx.x * 256ull + threadIdx.x; i < n; i += 256ull * gridDim.x) a += static_cast<unsigned long long>(hash32(p[i], static_cast<uint32_t>(i))) * 0x9e3779b97f4a7c15ull;
+    for (int o = 16; o; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+    if ((threadIdx.x & 31) == 0) atomicAdd(h, a);
+}
+// bf16 [M][N] compare: sums of (a - b)^2, b^2, max |a - b|, max |b|
+__global__ void k_cmp_bf(const uint16_t* a, const uint16_t* b, size_t n, double* out)
+{
+    double d2 = 0, r2 = 0, md = 0, mr = 0;
+    for (size_t i = blockIdx.x * 256ull + threadIdx.x; i < n; i += 256ull * gridDim.x)
+    {
+        const double x = __uint_as_float(static_cast<uint32_t>(a[i]) << 16), y = __uint_as_float(static_cast<uint32_t>(b[i]) << 16);
+        d2 += (x - y) * (x - y); r2 += y * y; md = fmax(md, fabs(x - y)); mr = fmax(mr, fabs(y));
+    }
+    for (int o = 16; o; o >>= 1) { d2 += __shfl_xor_sync(0xffffffffu, d2, o); r2 += __shfl_xor_sync(0xffffffffu, r2, o); md = fmax(md, __shfl_xor_sync(0xffffffffu, md, o)); mr = fmax(mr, __shfl_xor_sync(0xffffffffu, mr, o)); }
+    if ((threadIdx.x & 31) == 0)
+    {
+        atomicAdd(out, d2); atomicAdd(out + 1, r2);
+        unsigned long long* pm = reinterpret_cast<unsigned long long*>(out + 2);
+        unsigned long long old = *pm;
+        while (__longlong_as_double(old) < md) { const unsigned long long p = atomicCAS(pm, old, __double_as_longlong(md)); if (p == old) break; old = p; }
+        pm = reinterpret_cast<unsigned long long*>(out + 3);
+        old = *pm;
+        while (__longlong_as_double(old) < mr) { const unsigned long long p = atomicCAS(pm, old, __double_as_longlong(mr)); if (p == old) break; old = p; }
+    }
+}
 template <class T> static void dal(T*& p, size_t n) { CK(cudaMalloc(reinterpret_cast<void**>(&p), n * sizeof(T))); }
 
 struct Timer
@@ -221,6 +255,12 @@ int main(int argc, char** argv)
     dal(xq, static_cast<size_t>(MM) * K1); dal(xs, static_cast<size_t>(MM) * (K1 / 32));
     dal(aq, static_cast<size_t>(TILES) * 8 * I); dal(as, static_cast<size_t>(TILES) * 8 * mxtc::ASP);
     double* dcmp; dal(dcmp, 8);
+    float* sh; dal(sh, static_cast<size_t>(MM) * NOUT);
+    k_fill_sh<<<4096, 256>>>(sh, static_cast<size_t>(MM) * NOUT, 23u);
+    uint16_t *out_a, *out_b, *out_c;
+    dal(out_a, static_cast<size_t>(MM) * NOUT); dal(out_b, static_cast<size_t>(MM) * NOUT); dal(out_c, static_cast<size_t>(MM) * NOUT);
+    int* cnt; dal(cnt, static_cast<size_t>(MM) * 64);
+    unsigned long long* dh; dal(dh, 8);
     CK(cudaDeviceSynchronize());
     Timer T;
     if (stream)
@@ -240,8 +280,9 @@ int main(int argc, char** argv)
     const char* p = plan;
     const int* n_slots_dev = reinterpret_cast<const int*>(p + offsetof(P, n_slots));
     const int* n_tiles_dev = reinterpret_cast<const int*>(p + offsetof(P, n_tiles));
-    printf("%5s %4s %5s %5s %5s %4s | %8s %8s %8s %8s | %8s %8s %8s %8s %8s %8s | %10s %10s %10s %10s\n", "M", "D", "dist", "maxn", "tiles", "pass",
-           "fc1_us", "TF/s", "fc2_us", "TF/s", "xq_us", "fc1tc", "TF/s", "aq_us", "fc2tc", "TF/s", "act_rms", "act_max", "y_rms", "y_max");
+    printf("%5s %4s %5s %5s %5s %4s | %8s %8s %8s %8s | %8s %8s %8s %8s %8s %8s | %10s %10s %10s %10s | %9s %9s %9s %9s %10s %10s %5s %5s\n", "M", "D", "dist", "maxn", "tiles", "pass",
+           "fc1_us", "TF/s", "fc2_us", "TF/s", "xq_us", "fc1tc", "TF/s", "aq_us", "fc2tc", "TF/s", "act_rms", "act_max", "y_rms", "y_max",
+           "f2+cmb", "tc+cmb", "fused", "cmb_us", "out_rms", "out_max", "bitEq", "det");
     for (const Case& cs : cases)
     {
         const int M = cs.M, D = cs.D;
@@ -285,7 +326,8 @@ int main(int argc, char** argv)
         const float t2 = T.us([&] { kf2<<<sb * (NOUT / 16 / W2), W2 * 32, SMEM2>>>(RA); });
         // ---- tensor-core path
         mxtc::Args TA{w1, w2, xq, xs,
-                      RA.slot_expert, RA.slot_tile0, RA.slot_nt, RA.tile_mask, RA.tile_w, RA.tile_tok, n_slots_dev, n_tiles_dev, sb, MXTC_GY1, MXTC_GY2, MXTC_OS2, 10.f, act_b, aq, as, y_b};
+                      RA.slot_expert, RA.slot_tile0, RA.slot_nt, RA.tile_mask, RA.tile_w, RA.tile_tok, n_slots_dev, n_tiles_dev, sb, MXTC_GY1, MXTC_GY2, MXTC_OS2,
+                      nullptr, TK, nullptr, nullptr, nullptr, 0, nullptr, 10.f, act_b, aq, as, y_b};
         CK(cudaMemset(aq, 0xee, static_cast<size_t>(TILES) * 8 * I)); CK(cudaMemset(as, 0xee, static_cast<size_t>(TILES) * 8 * mxtc::ASP));   // poison: every live byte must be written
         constexpr int CW1 = MXTC_CW, NT1 = MXTC_NTG1, ST1 = MXTC_ST, WW2 = MXTC_W2, WT2 = MXTC_WT, TPC2 = MXTC_TPC, ST2 = MXTC_ST2;
         constexpr size_t S1 = mxtc::fc1_smem<K1, CW1, NT1, ST1>(), S2 = mxtc::fc2_smem<WW2, TPC2, ST2>();
@@ -320,9 +362,44 @@ int main(int argc, char** argv)
         k_cmp<<<n_tiles, 256>>>(y_b, y_a, RA.tile_mask, n_tiles_dev, NOUT, dcmp + 4);
         CK(cudaDeviceSynchronize());
         CK(cudaMemcpy(ca, dcmp, 32, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(cy, dcmp + 4, 32, cudaMemcpyDeviceToHost));
-        printf("%5d %4d %5d %5d %5d %4d | %8.1f %8.1f %8.1f %8.1f | %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f | %10.3e %10.3e %10.3e %10.3e\n", M, D, n_slots, maxnt * 8, n_tiles, passes,
+        // ---- the combine: fp16 path fc2 + k_combine_mt (out_a), TC fc2 + k_combine_mt (out_b), TC fc2 with the fused combine (out_c)
+        const dsh::CombineArgsMT<TK, MM> CA_a{reinterpret_cast<const P*>(plan), y_a, sh, out_a, M}, CA_b{reinterpret_cast<const P*>(plan), y_b, sh, out_b, M};
+        auto* kcmb = dsh::k_combine_mt<NOUT, 128, gv::O_BF16, TK, MM>;
+        const float tc_a = T.us([&] { kf2<<<sb * (NOUT / 16 / W2), W2 * 32, SMEM2>>>(RA); kcmb<<<M * NOUT / (8 * 128), 128>>>(CA_a); });
+        const float tc_b = T.us([&] { kt2<<<sb * MXTC_OS2 * MXTC_GY2, WW2 * 32, S2>>>(TA); kcmb<<<M * NOUT / (8 * 128), 128>>>(CA_b); });
+        const float tcmb = T.us([&] { kcmb<<<M * NOUT / (8 * 128), 128>>>(CA_b); });
+        mxtc::Args TF = TA;
+        TF.cnt = cnt; TF.kc = TK; TF.tok_slot = reinterpret_cast<const int*>(p + offsetof(P, tok_slot)); TF.tok_col = reinterpret_cast<const int*>(p + offsetof(P, tok_col));
+        TF.shared = sh; TF.shared_bf16 = 0; TF.out = out_c;
+        auto fused = [&] { CK(cudaMemsetAsync(cnt, 0, static_cast<size_t>(M) * MXTC_OS2 * sizeof(int))); kt2<<<sb * MXTC_OS2 * MXTC_GY2, WW2 * 32, S2>>>(TF); };
+        const float tc_c = T.us(fused);
+        // the slots are poisoned (NaN halves) before each checked run: a route's slot that was not written, or was dropped before its sum, shows as NaN in out
+        auto fused_poisoned = [&] { CK(cudaMemsetAsync(y_b, 0xff, static_cast<size_t>(TILES) * 8 * NOUT * 2)); fused(); };
+        // determinism: 5 more runs, the hash of out_c each time; bit-equality with the unfused combine
+        unsigned long long hs[6];
+        for (int rr = 0; rr < 6; ++rr)
+        {
+            CK(cudaMemset(out_c, 0, static_cast<size_t>(M) * NOUT * 2));
+            fused_poisoned(); CK(cudaDeviceSynchronize());
+            CK(cudaMemset(dh, 0, 8));
+            k_hash<<<256, 256>>>(reinterpret_cast<const uint32_t*>(out_c), static_cast<size_t>(M) * NOUT / 2, dh);
+            CK(cudaMemcpy(&hs[rr], dh, 8, cudaMemcpyDeviceToHost));
+        }
+        bool det = true;
+        for (int rr = 1; rr < 6; ++rr) det = det && hs[rr] == hs[0];
+        std::vector<uint16_t> hb_(static_cast<size_t>(M) * NOUT), hc_(static_cast<size_t>(M) * NOUT);
+        CK(cudaMemcpy(hb_.data(), out_b, hb_.size() * 2, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(hc_.data(), out_c, hc_.size() * 2, cudaMemcpyDeviceToHost));
+        const bool biteq = memcmp(hb_.data(), hc_.data(), hb_.size() * 2) == 0;
+        double co[4];
+        CK(cudaMemset(dcmp, 0, 32));
+        k_cmp_bf<<<256, 256>>>(out_c, out_a, static_cast<size_t>(M) * NOUT, dcmp);
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(co, dcmp, 32, cudaMemcpyDeviceToHost));
+        printf("%5d %4d %5d %5d %5d %4d | %8.1f %8.1f %8.1f %8.1f | %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f | %10.3e %10.3e %10.3e %10.3e | %9.1f %9.1f %9.1f %9.1f %10.3e %10.3e %5s %5s\n",
+               M, D, n_slots, maxnt * 8, n_tiles, passes,
                t1, f1 / t1 / 1e6, t2, f2 / t2 / 1e6, tq, t1t, f1 / t1t / 1e6, ta, t2t, f2 / t2t / 1e6,
-               MXTC_FUSEQ ? 0. : sqrt(ca[0] / ca[1]), MXTC_FUSEQ ? 0. : ca[2] / ca[3], sqrt(cy[0] / cy[1]), cy[2] / cy[3]);
+               MXTC_FUSEQ ? 0. : sqrt(ca[0] / ca[1]), MXTC_FUSEQ ? 0. : ca[2] / ca[3], sqrt(cy[0] / cy[1]), cy[2] / cy[3],
+               tc_a, tc_b, tc_c, tcmb, sqrt(co[0] / co[1]), co[2] / co[3], biteq ? "yes" : "NO", det ? "yes" : "NO");
     }
     printf("config: fuseq %d fc1 CW %d NTG %d ST %d GY %d | fc2 W %d TW %d TPC %d ST %d GY %d OS %d ; fp16 path fc1 KS%d CW%d NTG%d fc2 W%d D%d NTG%d\n", MXTC_FUSEQ, MXTC_CW, MXTC_NTG1, MXTC_ST, MXTC_GY1, MXTC_W2, MXTC_WT, MXTC_TPC, MXTC_ST2, MXTC_GY2, MXTC_OS2,
            DS41_RO_KS, DS41_RO_CW, DS41_RO_NTG1, DS41_RO_W2, DS41_RO_D2, DS41_RO_NTG2);
