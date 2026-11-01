@@ -528,7 +528,7 @@ int main(int argc, char** argv)
     }
 #endif
     G6RT_CK(bind::init());
-    pf_prof().on = knob::pf_prof();
+    pf_prof().on = knob::pf_prof() == 1;   // the event form (2) is g6m4's
 
     // ---- loopback fabric
 #if G6_MODEL_DS41
