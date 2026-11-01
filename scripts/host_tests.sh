@@ -15,6 +15,10 @@ bash "$REPO/engine/runtime/tests/nvcc_cache_test.sh"
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/steering_test.cpp" \
   "$REPO/engine/loader/g6pack.cpp" -o "$T/steering_test"
 "$T/steering_test" "$REPO/engine/runtime/tests/fixtures/steering_contract.json"
+# Native GLP (GGUF) steering input: conformance gates, manifest synthesis, directory parity.
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/steering_glp_test.cpp" \
+  "$REPO/engine/loader/g6pack.cpp" -o "$T/steering_glp_test"
+"$T/steering_glp_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/fabric_mtu_test.cpp" -o "$T/fabric_mtu_test"
 "$T/fabric_mtu_test"
 # the proxy's collective order (engine/comms/fabric_order.h): a plan that publishes out of numeric order stalls without
