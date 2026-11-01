@@ -104,6 +104,11 @@ struct RoScratch                                      // read-once path, M RO_FR
     __nv_bfloat16* tc_y13 = nullptr;   // [ROMAX][2 IW] fc1 out (gate | up), bf16
     uint8_t* tc_ac = nullptr;     //   [ROMAX][SH_KP] act codes (k >= IW: 0)
     uint8_t* tc_as = nullptr;     //   [ROMAX][SH_KP/32] their E8M0 bytes
+    // GR8_DS_MOE_TC=1 only (else null): the routed experts' MXFP8 activations (ds_moe_tc.cuh layouts)
+    uint8_t* mt_xq = nullptr;     // [ROMAX][HID/64][64] hc_y quantized
+    uint8_t* mt_xs = nullptr;     // [ROMAX][HID/32] its E8M0 bytes
+    uint8_t* mt_aq = nullptr;     // [tiles*8][IW/64][64] fc1's act quantized
+    uint8_t* mt_as = nullptr;     // [tiles*8][mxtc::ASP]
 };
 struct Scratch
 {
@@ -189,6 +194,11 @@ inline int ro_fc2stg() { return knob::ds_moe_fc2stg() ? 1 : 0; }
 // GR8_DS_MOE_FC1BSTG=0|1 (default off): the read-once fc1 kernel copies its
 // FP16 B fragments to a two-record cp.async shared ring before the same MMA.
 inline int ro_fc1bstg() { return knob::ds_moe_fc1bstg() ? 1 : 0; }
+// GR8_DS_MOE_TC=1 (default off): the read-once routed experts (rows >= RO_FROM) run mxtc::k_fc1_tc / k_fc2_tc (ds_moe_tc.cuh) on the block-scaled tensor
+// cores: the MXFP4 records as stored x MXFP8 activations (k_xq rounds hc_y, k_aq rounds fc1's act), fp32 accumulate. The planner, the fp16 act / ypart
+// layouts and the combine are the fp16 loop's. Not bit-equal to the fp16 loop (the activation rounding and the tensor cores' sum order); a configuration
+// choice, as GR8_DS_ATTN_TC. The shape is DS41_TC_* (ds_ro_cfg.h). Decode, the M <= 256 paths and the shared expert are not touched.
+inline bool moe_tc_on() { return knob::ds_moe_tc(); }
 // The top-k cut GR8_DS_MOE_TOPK (quality not measured): routed experts kept per token on the main layers (384 experts). Default dsr::TOPK.
 // The kept routes are the planner's first KC picks (best biased key first); the weights renormalize over
 // them (sum of the kept scores, x ROUTE_SCALE). The DSpark draft layers (128 experts, top-3) keep their k. GR8_MOE_TOPK is the Flash model's knob, so it is not
@@ -446,6 +456,14 @@ inline int bind_moe(void* model, int i, int, void*)
         if (first)
             fprintf(stderr, "# rank %d DS41 GR8_DS_MOE_FC1BSTG=%d k_fc1_ro_bstg=%d\n", m.rank, g, g);
     }
+    {   // GR8_DS_MOE_TC: same rule, its own boot line (the shape, for boot checks)
+        const int g = moe_tc_on() ? 1 : 0;
+        bool first = true;
+        for (int j = 0; j < i; ++j) if (m.layers[j].moe) first = false;
+        if (first)
+            fprintf(stderr, "# rank %d DS41 GR8_DS_MOE_TC=%d fc1 cw%d ntg%d st%d gy%d fc2 w%d wt%d ntg%d st%d gy%d\n", m.rank, g, DS41_TC_CW, DS41_TC_NTG1, DS41_TC_ST1, DS41_TC_GY1,
+                    DS41_TC_W2, DS41_TC_WT, DS41_TC_NTG2, DS41_TC_ST2, DS41_TC_GY2);
+    }
     LayerState* s = new LayerState();
     s->ne = ne; s->tk = ne == dsr::NEXP ? dsr::TOPK : geom::DS_TOPK; s->layer = y.l;
     s->gate = (const __nv_bfloat16*)get("router.w", 2, {ne, HID}, 1).p;
@@ -528,6 +546,13 @@ inline RoScratch* ro_alloc()
         p->tc_y13 = dmalloc<__nv_bfloat16>((size_t)ROMAX * 2 * IW);
         p->tc_ac = dmalloc<uint8_t>((size_t)ROMAX * SH_KP);
         p->tc_as = dmalloc<uint8_t>((size_t)ROMAX * (SH_KP / 32));
+    }
+    if (moe_tc_on())                                                      // the tensor-core routed experts' MXFP8 activations
+    {
+        p->mt_xq = dmalloc<uint8_t>((size_t)ROMAX * HID);
+        p->mt_xs = dmalloc<uint8_t>((size_t)ROMAX * (HID / 32));
+        p->mt_aq = dmalloc<uint8_t>((size_t)TILES * 8 * IW);
+        p->mt_as = dmalloc<uint8_t>((size_t)TILES * 8 * mxtc::ASP);
     }
     return p;
 }
@@ -855,7 +880,17 @@ inline int experts_ro(Model& m, const LayerState& s, int M, cudaStream_t st)
                    (const int*)(p + offsetof(P, slot_expert)), (const int*)(p + offsetof(P, slot_tile0)), (const int*)(p + offsetof(P, slot_nt)),
                    (const int*)(p + offsetof(P, tile_mask)), (const float*)(p + offsetof(P, tile_w)), (const int*)(p + offsetof(P, tile_tok)),
                    (const int*)(p + offsetof(P, n_slots)), sb, geom::SWIGLU_LIMIT, q.act, q.ypart, ord ? (const int*)q.order : nullptr, la};
-    if (ord) { if (la) fc_ro_hint<true, true, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); else fc_ro_hint<true, false, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); }
+    if (q.mt_xq)                                       // GR8_DS_MOE_TC=1: the tensor-core expert loop (ds_moe_tc.cuh), the same plan, act, ypart and combine
+    {
+        constexpr int TILES = (ROMAX * dsr::TOPK + 7 * dsr::NEXP) / 8;   // ro_alloc's act / mt_aq rows / 8
+        const mxtc::Args TA{s.fc1, s.fc2, q.mt_xq, q.mt_xs, RA.slot_expert, RA.slot_tile0, RA.slot_nt, RA.tile_mask, RA.tile_w, RA.tile_tok, RA.n_slots_dev,
+                            (const int*)(p + offsetof(P, n_tiles)), sb, DS41_TC_GY1, DS41_TC_GY2, geom::SWIGLU_LIMIT, q.act, q.mt_aq, q.mt_as, q.ypart};
+        const cudaError_t e = mxtc::launch_layer<HID, IW, HID, DS41_TC_CW, DS41_TC_NTG1, DS41_TC_ST1, DS41_TC_W2, DS41_TC_WT, DS41_TC_NTG2, DS41_TC_ST2>(
+            TA, (const __nv_bfloat16*)m.hc_y, M, sb, TILES, q.mt_xq, q.mt_xs, st);
+        if (e != cudaSuccess) return (int)e;
+        ds41_span_mark("ro_fc2", st);
+    }
+    else if (ord) { if (la) fc_ro_hint<true, true, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); else fc_ro_hint<true, false, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); }
     else { if (la) fc_ro_hint<false, true, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); else fc_ro_hint<false, false, KS, CW, NTG1, W2, D2, NTG2>(RA, sb, hv, stg, bstg, st); }
     dsh::CombineArgsMT<TK, ROMAX> CA{(const P*)p, q.ypart, q.sh_out, (void*)m.sc.part[1], M};
     if (s.tc_w13) launch(false, dsh::k_combine_mt_shb<HID, 128, gv::O_BF16, TK, ROMAX>, dim3(M * HID / (8 * 128)), dim3(128), st, CA);   // GR8_DS_SH_TC=1: sh_out holds bf16 Y

@@ -26,6 +26,38 @@
 #ifndef DS41_RO_NTG2
 #define DS41_RO_NTG2 4                                // fc2: tiles per group (dynamic smem NTG2 * 9216 B)
 #endif
+// GR8_DS_MOE_TC=1 (ds_moe_tc.cuh): the tensor-core expert loop's shape, measured in tests/ds_moe_tc_bench.cu on one GB10 at 1024 rows x 60..140 distinct
+// experts: fc1 CW 4 (9 CTAs of 4 warps per expert, 2 CTAs per SM at 44 KB smem), NTG 8 (64-token groups), a 4-deep record ring, GY 4 (an expert's token
+// groups on 4 neighbouring CTAs: with GY 1 the second group of an expert read its weights from DRAM again, 1.8 x the unique bytes); fc2 8 warps x 2 tiles,
+// 32-token groups, a 3-deep ring (2 CTAs per SM), GY 4. fc1 990..1380 us (59..73 TFLOP/s) and fc2 860..1090 us against 3.1..4.1 and 1.7..2.0 ms for the
+// fp16 loop; the fc1 time is within 20% of the expert bytes at the DRAM rate.
+#ifndef DS41_TC_CW
+#define DS41_TC_CW 4
+#endif
+#ifndef DS41_TC_NTG1
+#define DS41_TC_NTG1 8
+#endif
+#ifndef DS41_TC_ST1
+#define DS41_TC_ST1 4
+#endif
+#ifndef DS41_TC_GY1
+#define DS41_TC_GY1 4
+#endif
+#ifndef DS41_TC_W2
+#define DS41_TC_W2 8
+#endif
+#ifndef DS41_TC_WT
+#define DS41_TC_WT 2
+#endif
+#ifndef DS41_TC_NTG2
+#define DS41_TC_NTG2 4
+#endif
+#ifndef DS41_TC_ST2
+#define DS41_TC_ST2 3
+#endif
+#ifndef DS41_TC_GY2
+#define DS41_TC_GY2 4
+#endif
 // Shared expert (ds_shared_gl.cuh): DS41_SH_GL = 1 runs it as two launches per layer (k_sh_fc1_gl / k_sh_fc2_gl, grid.y = row groups) instead of 2 x W/32 launches of the
 // 32-row chunk kernels. Bit-identical by construction (same per-chunk bodies); the gate is `ds_prefill_ro_test check`, which matches bitwise in the final output and in the
 // shared fp32 sout / fp16 sact. -DDS41_SH_GL=0 is the chunk loop.

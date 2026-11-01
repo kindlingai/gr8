@@ -3,6 +3,7 @@
 #pragma once
 #include "ds_shared.cuh"      // mx4:: (routed MXFP4 GEMV), dsr:: (router, plan), dsh:: (shared MXFP8 expert, combine)
 #include "ds_prefill_ro.cuh"   // read-once expert loop + multi-CTA planner
+#include "ds_moe_tc.cuh"       // the read-once expert loop on the block-scaled tensor cores (GR8_DS_MOE_TC=1)
 #include "ds_shared_gl.cuh"    // shared expert group loop (2 launches per layer; the adapter uses it only with DS41_SH_GL = 1)
 #define GR8_DS41_MOE_KERNELS 1
 #include "ds41_l2pf.h"        // GR8_L2PF targets of a MoE layer (the gate, the shared expert); host only
