@@ -205,10 +205,20 @@ __global__ void __launch_bounds__(256) k_aq(const __half* __restrict__ act, int 
 // ([NTOK][XREC], gathered by tile_tok), by cp.async in an ST-deep ring with per-thread pointers fixed per group (one add per copy per stage), so the
 // bytes in flight per SM are (ST - 1) stages whatever the warp count. The rows' E8M0 bytes ([NTOK][K1 / 32]) are staged once per group; the mma's
 // byte selector picks the record's two k32 bytes from a 16-bit word. fp32 accumulate over all of K in one warp, swiglu_lim, fp16 act as k_fc1_ro.
-template <int K1, int CW, int NTG, int ST> constexpr size_t fc1_smem() { return static_cast<size_t>(ST) * (CW * 2 * GR + NTG * 8 * XREC) + NTG * 8 * (K1 / 32) + NTG * 8 * 4; }
-template <int K1, int I, int CW, int NTG, int ST>
+template <int K1, int CW, int NTG, int ST> constexpr size_t fc1_smem() { return static_cast<size_t>(ST) * (CW * 2 * GR + NTG * 8 * XREC) + NTG * 8 * (K1 / 32) + NTG * 8 * 4 + CW * NTG * 8 * 4; }
+// The byte of intermediate index i inside its row's record layout (XREC records; k_xq / k_aq store_block order): record i / 64, k32 group h, lane c', b0 / b1, index.
+__device__ __forceinline__ int aq_byte_off(int i)
+{
+    const int p = i & 63, h = p >> 5, kk = p & 31, k16 = kk & 15;
+    return (i >> 6) * XREC + ((k16 & 7) >> 1) * 16 + h * 8 + (kk >= 16 ? 4 : 0) + (k16 & 1) + 2 * (k16 >> 3);
+}
+// FQ = true: the epilogue quantizes act to MXFP8 in place of k_aq (GR8_DS_MOE_TC's fc2 reads only aq / as): a 32-block of i is the chunk pair (2 k, 2 k + 1) =
+// two neighbouring warps of the CTA (CW even), so the block's amax is a shuffle over the lane group plus one smem exchange with the partner warp; the values
+// are rounded to fp16 first, so the bytes are the ones k_aq made from the fp16 act. The fp16 act is not written. FQ = false: the fp16 act, as k_fc1_ro.
+template <int K1, int I, int CW, int NTG, int ST, bool FQ = true>
 __global__ void __launch_bounds__(CW * 32) k_fc1_tc(Args A)
 {
+    static_assert(!FQ || (CW % 2 == 0 && I % 32 == 0), "fc1 tc fused quantization: chunk pairs inside the CTA");
     constexpr int NCH = I / 16, NG = K1 / KG, UPS = NCH / CW, NTOK = NTG * 8, NTH = CW * 32;
     constexpr int AREC = 2 * GR, AST = CW * AREC, STAGE = AST + NTOK * XREC, ACH = AREC / 16;
     constexpr int NA = (CW * ACH + NTH - 1) / NTH, NB = (NTOK * 4 + NTH - 1) / NTH;   // copies per thread per stage
@@ -218,6 +228,7 @@ __global__ void __launch_bounds__(CW * 32) k_fc1_tc(Args A)
     extern __shared__ __align__(16) uint8_t sm[];
     uint8_t* sxs = sm + ST * STAGE;
     int* stok = reinterpret_cast<int*>(sxs + XS_B);                          // the group's row -> token
+    float* pmax = reinterpret_cast<float*>(stok + NTOK);                      // FQ: [CW][NTOK] a warp's 16-row amax per row, for its partner
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, c = lane & 3, tid = threadIdx.x;
     const int GY = A.gy1, gy = blockIdx.x % GY, slot = blockIdx.x / (UPS * GY), chunk0 = ((blockIdx.x / GY) % UPS) * CW;
     if (A.n_slots_dev && slot >= *A.n_slots_dev) return;
@@ -292,16 +303,55 @@ __global__ void __launch_bounds__(CW * 32) k_fc1_tc(Args A)
             mma_row<1, 1, NTG>(wu, bb, g, c, sb, ntg, au);
         }
         cp_wait<0>();
-        #pragma unroll
-        for (int t = 0; t < NTG; ++t)
-            if (t < ntg)
+        if constexpr (!FQ)
+        {
+            #pragma unroll
+            for (int t = 0; t < NTG; ++t)
+                if (t < ntg)
+                {
+                    __half* a0 = A.act + (static_cast<size_t>(t0 + t) * 8 + 2 * c) * I + (chunk0 + warp) * 16 + g;
+                    a0[0] = __float2half_rn(mx4::swiglu_lim(ag[t][0], au[t][0], A.limit));
+                    a0[I] = __float2half_rn(mx4::swiglu_lim(ag[t][1], au[t][1], A.limit));
+                    a0[8] = __float2half_rn(mx4::swiglu_lim(ag[t][2], au[t][2], A.limit));
+                    a0[I + 8] = __float2half_rn(mx4::swiglu_lim(ag[t][3], au[t][3], A.limit));
+                }
+        }
+        else
+        {
+            float v[NTG][4];                                                 // the fp16-rounded act of (row g | g + 8, column 2 c | 2 c + 1)
+            #pragma unroll
+            for (int t = 0; t < NTG; ++t)
             {
-                __half* a0 = A.act + (static_cast<size_t>(t0 + t) * 8 + 2 * c) * I + (chunk0 + warp) * 16 + g;
-                a0[0] = __float2half_rn(mx4::swiglu_lim(ag[t][0], au[t][0], A.limit));
-                a0[I] = __float2half_rn(mx4::swiglu_lim(ag[t][1], au[t][1], A.limit));
-                a0[8] = __float2half_rn(mx4::swiglu_lim(ag[t][2], au[t][2], A.limit));
-                a0[I + 8] = __float2half_rn(mx4::swiglu_lim(ag[t][3], au[t][3], A.limit));
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) v[t][k] = t < ntg ? __half2float(__float2half_rn(mx4::swiglu_lim(ag[t][k], au[t][k], A.limit))) : 0.f;
+                float m0 = fmaxf(fabsf(v[t][0]), fabsf(v[t][2])), m1 = fmaxf(fabsf(v[t][1]), fabsf(v[t][3]));
+                #pragma unroll
+                for (int o = 4; o < 32; o <<= 1) { m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, o)); m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, o)); }
+                if (g == 0) { pmax[(warp * NTOK) + t * 8 + 2 * c] = m0; pmax[(warp * NTOK) + t * 8 + 2 * c + 1] = m1; }
             }
+            __syncthreads();
+            const int chunk = chunk0 + warp, j = chunk >> 1;                 // the 32-block of this chunk pair
+            const int off_g = aq_byte_off(chunk * 16 + g), off_g8 = aq_byte_off(chunk * 16 + g + 8);
+            #pragma unroll
+            for (int t = 0; t < NTG; ++t)
+                if (t < ntg)
+                {
+                    #pragma unroll
+                    for (int k = 0; k < 2; ++k)                              // column 2 c + k
+                    {
+                        const int col = 2 * c + k;
+                        const float am = fmaxf(pmax[(warp * NTOK) + t * 8 + col], pmax[((warp ^ 1) * NTOK) + t * 8 + col]);
+                        float inv;
+                        const u32 code = mx_scale(am, inv);
+                        const size_t row = static_cast<size_t>(t0 + t) * 8 + col;
+                        uint8_t* rec = A.aq + row * I;
+                        const u32 b = e4m3x4(v[t][k] * inv, v[t][2 + k] * inv, 0.f, 0.f);
+                        rec[off_g] = static_cast<uint8_t>(b);
+                        rec[off_g8] = static_cast<uint8_t>(b >> 8);
+                        if ((warp & 1) == 0 && g == 0) A.as[row * ASP + j] = static_cast<uint8_t>(code);
+                    }
+                }
+        }
         __syncthreads();                                                    // the ring and stok are rewritten by the next group
     }
 }
@@ -458,14 +508,14 @@ __global__ void __launch_bounds__(WARPS * 32, 2) k_fc2_tc(Args A)
 }
 
 // ---------------------------------------------------------------------------------------------------- host launch
-// The four launches of one layer's routed experts on st: k_xq (x -> xq / xs), k_fc1_tc, k_aq (act -> aq / as), k_fc2_tc. sb = the slot bound the
-// grids are sized for (CTAs of slots >= *n_slots_dev exit), tiles_bound = rows of act / aq to quantize (the plan's tile bound x 8).
+// The three launches of one layer's routed experts on st: k_xq (x -> xq / xs), k_fc1_tc (its epilogue quantizes act into aq / as), k_fc2_tc. sb = the
+// slot bound the grids are sized for (CTAs of slots >= *n_slots_dev exit).
 // cudaFuncSetAttribute is a host call without stream work (the first call per instantiation).
 template <int K1, int I, int NOUT, int CW, int NTG1, int ST1, int W2, int TW, int TPC, int ST2>
-inline cudaError_t launch_layer(const Args& A, const __nv_bfloat16* x, int M, int sb, int tiles_bound, uint8_t* xq, uint8_t* xs, cudaStream_t st)
+inline cudaError_t launch_layer(const Args& A, const __nv_bfloat16* x, int M, int sb, uint8_t* xq, uint8_t* xs, cudaStream_t st)
 {
     constexpr size_t S1 = fc1_smem<K1, CW, NTG1, ST1>(), S2 = fc2_smem<W2, TPC, ST2>();
-    auto* k1 = k_fc1_tc<K1, I, CW, NTG1, ST1>;
+    auto* k1 = k_fc1_tc<K1, I, CW, NTG1, ST1, true>;
     auto* k2 = k_fc2_tc<I, NOUT, W2, TW, TPC, ST2>;
     static const cudaError_t attr = [&] {
         cudaError_t e = cudaFuncSetAttribute(k1, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(S1));
@@ -475,8 +525,6 @@ inline cudaError_t launch_layer(const Args& A, const __nv_bfloat16* x, int M, in
     if (attr != cudaSuccess) return attr;
     k_xq<<<(unsigned)((static_cast<long>(M) * (K1 / 32) + 255) / 256), 256, 0, st>>>(x, M, K1, xq, xs);
     k1<<<sb * (I / 16 / CW) * A.gy1, CW * 32, S1, st>>>(A);
-    const long arows = static_cast<long>(tiles_bound) * 8;
-    k_aq<<<(unsigned)((arows * (I / 32) + 255) / 256), 256, 0, st>>>(A.act, static_cast<int>(arows), A.n_tiles_dev, I, A.aq, A.as);
     k2<<<sb * A.os2 * A.gy2, W2 * 32, S2, st>>>(A);
     return cudaGetLastError();
 }
