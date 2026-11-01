@@ -39,14 +39,20 @@
 #ifndef MXTC_WT
 #define MXTC_WT DS41_TC_WT
 #endif
-#ifndef MXTC_NTG2
-#define MXTC_NTG2 DS41_TC_NTG2
+#ifndef MXTC_TPC
+#define MXTC_TPC DS41_TC_TPC
 #endif
 #ifndef MXTC_ST2
 #define MXTC_ST2 DS41_TC_ST2
 #endif
 #ifndef MXTC_GY2
 #define MXTC_GY2 DS41_TC_GY2
+#endif
+#ifndef MXTC_OS2
+#define MXTC_OS2 DS41_TC_OS2
+#endif
+#ifndef MXTC_FUSEQ
+#define MXTC_FUSEQ 1              // 1: fc1's epilogue quantizes act (the production path; no fp16 act, so no act compare); 0: fp16 act + k_aq
 #endif
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { printf("CUDA error %s at %s:%d: %s\n", #x, __FILE__, __LINE__, cudaGetErrorString(e_)); exit(2); } } while (0)
 
@@ -279,11 +285,12 @@ int main(int argc, char** argv)
         const float t2 = T.us([&] { kf2<<<sb * (NOUT / 16 / W2), W2 * 32, SMEM2>>>(RA); });
         // ---- tensor-core path
         mxtc::Args TA{w1, w2, xq, xs,
-                      RA.slot_expert, RA.slot_tile0, RA.slot_nt, RA.tile_mask, RA.tile_w, RA.tile_tok, n_slots_dev, n_tiles_dev, sb, MXTC_GY1, MXTC_GY2, 10.f, act_b, aq, as, y_b};
-        constexpr int CW1 = MXTC_CW, NT1 = MXTC_NTG1, ST1 = MXTC_ST, WW2 = MXTC_W2, WT2 = MXTC_WT, NT2 = MXTC_NTG2, ST2 = MXTC_ST2;
-        constexpr size_t S1 = mxtc::fc1_smem<K1, CW1, NT1, ST1>(), S2 = mxtc::fc2_smem<I, WW2, WT2, NT2, ST2>();
-        auto* kt1 = mxtc::k_fc1_tc<K1, I, CW1, NT1, ST1>;
-        auto* kt2 = mxtc::k_fc2_tc<I, NOUT, WW2, WT2, NT2, ST2>;
+                      RA.slot_expert, RA.slot_tile0, RA.slot_nt, RA.tile_mask, RA.tile_w, RA.tile_tok, n_slots_dev, n_tiles_dev, sb, MXTC_GY1, MXTC_GY2, MXTC_OS2, 10.f, act_b, aq, as, y_b};
+        CK(cudaMemset(aq, 0xee, static_cast<size_t>(TILES) * 8 * I)); CK(cudaMemset(as, 0xee, static_cast<size_t>(TILES) * 8 * mxtc::ASP));   // poison: every live byte must be written
+        constexpr int CW1 = MXTC_CW, NT1 = MXTC_NTG1, ST1 = MXTC_ST, WW2 = MXTC_W2, WT2 = MXTC_WT, TPC2 = MXTC_TPC, ST2 = MXTC_ST2;
+        constexpr size_t S1 = mxtc::fc1_smem<K1, CW1, NT1, ST1>(), S2 = mxtc::fc2_smem<WW2, TPC2, ST2>();
+        auto* kt1 = mxtc::k_fc1_tc<K1, I, CW1, NT1, ST1, MXTC_FUSEQ != 0>;
+        auto* kt2 = mxtc::k_fc2_tc<I, NOUT, WW2, WT2, TPC2, ST2>;
         CK(cudaFuncSetAttribute(kt1, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(S1)));
         CK(cudaFuncSetAttribute(kt2, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(S2)));
         {
@@ -304,20 +311,20 @@ int main(int argc, char** argv)
         const float tq = T.us([&] { mxtc::k_xq<<<(unsigned)((static_cast<long>(M) * (K1 / 32) + 255) / 256), 256>>>(x, M, K1, xq, xs); });
         const float t1t = T.us([&] { kt1<<<sb * (I / 16 / CW1) * MXTC_GY1, CW1 * 32, S1>>>(TA); });
         const long arows = static_cast<long>(TILES) * 8;
-        const float ta = T.us([&] { mxtc::k_aq<<<(unsigned)((arows * (I / 32) + 255) / 256), 256>>>(act_b, static_cast<int>(arows), n_tiles_dev, I, aq, as); });
-        const float t2t = T.us([&] { kt2<<<sb * (NOUT / 16 / (WW2 * WT2)) * MXTC_GY2, WW2 * 32, S2>>>(TA); });
+        const float ta = MXTC_FUSEQ ? 0.f : T.us([&] { mxtc::k_aq<<<(unsigned)((arows * (I / 32) + 255) / 256), 256>>>(act_b, static_cast<int>(arows), n_tiles_dev, I, aq, as); });
+        const float t2t = T.us([&] { kt2<<<sb * MXTC_OS2 * MXTC_GY2, WW2 * 32, S2>>>(TA); });
         // ---- accuracy
         double ca[4], cy[4];
         CK(cudaMemset(dcmp, 0, 64));
-        k_cmp<<<n_tiles, 256>>>(act_b, act_a, RA.tile_mask, n_tiles_dev, I, dcmp);
+        if (!MXTC_FUSEQ) k_cmp<<<n_tiles, 256>>>(act_b, act_a, RA.tile_mask, n_tiles_dev, I, dcmp);
         k_cmp<<<n_tiles, 256>>>(y_b, y_a, RA.tile_mask, n_tiles_dev, NOUT, dcmp + 4);
         CK(cudaDeviceSynchronize());
         CK(cudaMemcpy(ca, dcmp, 32, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(cy, dcmp + 4, 32, cudaMemcpyDeviceToHost));
         printf("%5d %4d %5d %5d %5d %4d | %8.1f %8.1f %8.1f %8.1f | %8.1f %8.1f %8.1f %8.1f %8.1f %8.1f | %10.3e %10.3e %10.3e %10.3e\n", M, D, n_slots, maxnt * 8, n_tiles, passes,
                t1, f1 / t1 / 1e6, t2, f2 / t2 / 1e6, tq, t1t, f1 / t1t / 1e6, ta, t2t, f2 / t2t / 1e6,
-               sqrt(ca[0] / ca[1]), ca[2] / ca[3], sqrt(cy[0] / cy[1]), cy[2] / cy[3]);
+               MXTC_FUSEQ ? 0. : sqrt(ca[0] / ca[1]), MXTC_FUSEQ ? 0. : ca[2] / ca[3], sqrt(cy[0] / cy[1]), cy[2] / cy[3]);
     }
-    printf("config: fc1 CW %d NTG %d ST %d GY %d | fc2 W %d WT %d NTG %d ST %d GY %d ; fp16 path fc1 KS%d CW%d NTG%d fc2 W%d D%d NTG%d\n", MXTC_CW, MXTC_NTG1, MXTC_ST, MXTC_GY1, MXTC_W2, MXTC_WT, MXTC_NTG2, MXTC_ST2, MXTC_GY2,
+    printf("config: fuseq %d fc1 CW %d NTG %d ST %d GY %d | fc2 W %d TW %d TPC %d ST %d GY %d OS %d ; fp16 path fc1 KS%d CW%d NTG%d fc2 W%d D%d NTG%d\n", MXTC_FUSEQ, MXTC_CW, MXTC_NTG1, MXTC_ST, MXTC_GY1, MXTC_W2, MXTC_WT, MXTC_TPC, MXTC_ST2, MXTC_GY2, MXTC_OS2,
            DS41_RO_KS, DS41_RO_CW, DS41_RO_NTG1, DS41_RO_W2, DS41_RO_D2, DS41_RO_NTG2);
     return 0;
 }
