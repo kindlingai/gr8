@@ -34,11 +34,11 @@ constexpr int WT_SS = WT_R * 4;                       // fc1 scale stage: the ro
 constexpr int FC1T_SMEM = 2 * (WT_SA + WT_SS) + WT_R * 4;
 constexpr int F2T_SA = WT_NM * 4 * REC;               // fc2 A stage: the tile's x2 records of one expert block
 constexpr int F2T_SZ = WT_R * 256;                    // fc2 output tile of one group: WT_R rows x 128 fp16
-constexpr int FC2T_SMEM = 2 * F2T_SA > 2 * F2T_SZ ? 2 * F2T_SA : 2 * F2T_SZ;   // the two groups' output tiles alias the A stages
 // WT_R = 128 (the default): 16-warp CTAs = two 8-warp halves sharing one A stage (NM <= 8 row blocks of accumulators, 128
 // registers a thread). WT_R = 256 (-DPF_WT_R=256): 8-warp CTAs, one unit each, NM <= 16 (the registers of one CTA per SM).
 constexpr int WT_HALVES = WT_R == 128 ? 2 : 1;
 constexpr int WT_NTH = 256 * WT_HALVES;               // threads
+constexpr int FC2T_SMEM = 2 * F2T_SA > WT_HALVES * F2T_SZ ? 2 * F2T_SA : WT_HALVES * F2T_SZ;   // the halves' output tiles alias the A stages
 static_assert(WT_R == 128 || WT_R == 256, "PF_WT_R is 128 or 256");
 
 __device__ __forceinline__ void wt_cp4(void* s, const void* g)
