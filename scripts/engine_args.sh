@@ -58,8 +58,8 @@ tp4_default() {
   printf -v "$1" %s "$2"
 }
 
-# GLM-5.3-Flash under --serve takes no CP, prefix reuse or PF_OWN (engine/runtime/g6m4.cu refuses them). DFLASH=1 (TP=4):
-# a session alone drafts with the DFlash2 drafter, SPEC_ADAPT on with it. MTP=1 for the sessions that share steps.
+# GLM-5.3-Flash under --serve takes no CP, prefix reuse or PF_OWN (engine/runtime/g6m4.cu refuses them). DFLASH=1 (TP=4,
+# the default): a session alone drafts with the DFlash2 drafter, SPEC_ADAPT on with it. MTP=1 for sessions sharing steps.
 # SESS: 2..8 share decode steps and the CAP pool, each with its own KDA state slots (docs/FLASH.md, Several sessions);
 # 8 at TP=4, 4 at TP=3, 1 (one request at a time) at TP=2. A round of every session, SESS x (MTP + 1) rows, must fit
 # the engine's 32. CAP is a 262,144-token request plus a page for the guard rows (2 at MTP=1). Only the 11 DSA layers and
@@ -77,7 +77,9 @@ flash_defaults() {
   case $SESS in [1-8]) ;; *) echo "engine_defaults: SESS=$SESS: GLM-5.3-Flash serves 1 to 8 sessions" >&2; return 2 ;; esac
   [ "$SESS" = 1 ] || [ $((SESS * (MTP + 1))) -le 32 ] ||
     { echo "engine_defaults: SESS=$SESS MTP=$MTP: a round of $((SESS * (MTP + 1))) rows; GLM-5.3-Flash steps hold 32" >&2; return 2; }
-  S2PORT=${S2PORT:-7341}; DFLASH=${DFLASH:-0}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=0; REUSE=0
+  # DFLASH: on at TP=4 as on GLM-5.3 (the supervisor turns it off, with a notice, when no drafter is given)
+  [ "$TP" = 4 ] && DFLASH=${DFLASH:-1} || DFLASH=${DFLASH:-0}
+  S2PORT=${S2PORT:-7341}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=0; REUSE=0
   flash_donor_defaults
 }
 

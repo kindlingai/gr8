@@ -33,7 +33,7 @@ own metadata (`hidden_size` 4096) and maps Flash's tensors with `engine/loader-r
 - `./gr8 glm53f up` boots in about 16 s from a local cache and passes `./gr8 glm53f smoke`.
 - TP=4 prefill of an 8K prompt: about 3.55 s at 2200 MHz.
 - 8 sessions at TP=4 and 4 at TP=3 share decode steps (below), with MTP=1 (`flash_defaults` in `scripts/engine_args.sh`).
-- At TP=4, `--drafter URL` (or `--dflash 1` with `DFLASH_DIR`) lets a session that runs alone draft with the DFlash2 drafter (below).
+- At TP=4 a session that runs alone drafts with the DFlash2 drafter when the boot has one: `--drafter https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2` (below).
 
 ## Context
 

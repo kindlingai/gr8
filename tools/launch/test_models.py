@@ -57,8 +57,9 @@ class OptionTests(unittest.TestCase):
             self.assertIn('GR8_PF_RS=0', plan['env'])
             self.assertIn('GR8_GLM53F_PF_STAGE_ASYNC=1', plan['env'])
             (self.assertNotIn if tp == '4' else self.assertIn)('GR8_GLM53F_KDA_SCAN=1', plan['env'])
-            for a in ('--reuse-prefix', '--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):
+            for a in ('--reuse-prefix', '--wide', '--pfv2', '--qo-manifest'):
                 self.assertNotIn(a, plan['args'])
+            (self.assertIn if tp == '4' else self.assertNotIn)('--dflash-manifest', plan['args'])
             self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], sess)
             self.assertEqual(plan['args'][plan['args'].index('--chunk') + 1], '1')
             self.assertIn('GR8_GLM53F_PF_DSA_F16GEMM=1', plan['env'])
@@ -111,8 +112,10 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(plan['args'][plan['args'].index('--cap') + 1], '131072')
 
     def test_dflash(self):
-        # DFLASH=1 (TP=4): the drafter packs and the adaptive draft count; off by default
-        self.assertEqual(opt.engine_plan(flash())['knobs']['DFLASH'], '0')
+        # DFLASH=1 (TP=4, the default; the supervisor turns it off with no drafter): the drafter packs and the adaptive
+        # draft count; off at TP=2
+        self.assertEqual(opt.engine_plan(flash())['knobs']['DFLASH'], '1')
+        self.assertEqual(opt.engine_plan(flash(peers='10.0.0.1,10.0.0.2'))['knobs']['DFLASH'], '0')
         plan = opt.engine_plan(flash('--dflash', '1', '--dflash-dir', '/d'))
         a = ' '.join(plan['args'])
         self.assertIn('--dflash-manifest @DFLASH_DIR/dflash.r@R.manifest.json --dflash-pack @DFLASH_DIR/dflash.r@R.pack', a)
