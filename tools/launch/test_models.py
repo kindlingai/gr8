@@ -48,16 +48,17 @@ class OptionTests(unittest.TestCase):
             self.assertIn(want, str(e.exception))
 
     def test_engine_plan(self):
-        for tp, peers in (('4', PEERS), ('2', '10.0.0.1,10.0.0.2')):
+        for tp, peers in (('4', PEERS), ('3', '10.0.0.1,10.0.0.2,10.0.0.3'), ('2', '10.0.0.1,10.0.0.2')):
             plan = opt.engine_plan(flash(peers=peers))
-            self.assertEqual(plan['knobs']['SESS'], '1')
+            sess = {'4': '8', '3': '4', '2': '1'}[tp]
+            self.assertEqual(plan['knobs']['SESS'], sess)
             self.assertIn('GR8_CP=0', plan['env'])
             self.assertIn('GR8_PF_RS=0', plan['env'])
             self.assertIn('GR8_GLM53F_PF_STAGE_ASYNC=1', plan['env'])
             (self.assertNotIn if tp == '4' else self.assertIn)('GR8_GLM53F_KDA_SCAN=1', plan['env'])
             for a in ('--reuse-prefix', '--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):
                 self.assertNotIn(a, plan['args'])
-            self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '1')
+            self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], sess)
             self.assertEqual(plan['args'][plan['args'].index('--chunk') + 1], '1')
             self.assertIn('GR8_GLM53F_PF_DSA_F16GEMM=1', plan['env'])
 

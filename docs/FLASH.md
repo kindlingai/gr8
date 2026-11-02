@@ -72,7 +72,7 @@ prefill sends none, so a prefill longer than that fails.
 
 ## Several sessions
 
-`--sess N` (`SESS`, 2 to 8; the default stays 1) serves up to N requests at once on S2, as GLM-5.3 does: their decode
+`--sess N` (`SESS`, 1 to 8; 8 at TP=4, 4 at TP=3, 1 at TP=2) serves up to N requests at once on S2, as GLM-5.3 does: their decode
 rounds share main and draft steps, and their KV runs share the `CAP` pool (`--s2-sessions N` to `g6m4_flash`).
 
 - KDA state: session q owns slots `q x (MTP + 1)` up to `(q + 1) x (MTP + 1)` (`FlashSlots` in
