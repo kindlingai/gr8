@@ -279,9 +279,9 @@ GR8_GLM53F_PF_STAGE_ASYNC=$stage GR8_GLM53F_PF_SP=$sp GR8_GLM53F_PF_SP_X16=$sp"
   fi
   # its KV_STORE on a group lease: when it gives segments to other groups (KV_SHARE_WHEN; docs/SETTINGS.md)
   ENGINE_ENV="$ENGINE_ENV${KV_SHARE_WHEN:+ GR8_KV_SHARE_WHEN=$KV_SHARE_WHEN}"
-  # TP=3 ring: leave GR8_PF_STRIPE to the engine default (on for a three-rank ring: large prefill writes also use the
-  # devices on the other PCIe root); other TPs keep it off as before
-  [ "$TP" = 3 ] || ENGINE_ENV="$ENGINE_ENV GR8_PF_STRIPE=0"
+  # GR8_PF_STRIPE at the engine default at TP=3 and TP=4 (on: large prefill writes use both rails, or at TP=3 the devices
+  # on the other PCIe root); TP=4 8K prefill 2,965 -> 3,067 tok/s. TP=2 keeps it off
+  [ "$TP" = 2 ] && ENGINE_ENV="$ENGINE_ENV GR8_PF_STRIPE=0"
   ENGINE_ENV="$ENGINE_ENV ${EXTRA_ENV:-}"
 }
 
