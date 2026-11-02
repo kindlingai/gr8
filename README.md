@@ -83,6 +83,8 @@ are estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [doc
 
 ## Quick start
 
+An agent that starts gr8 for someone asks them the questions in [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md) first.
+
 [docs/DEPLOY.md](docs/DEPLOY.md) is the guide to starting gr8. Two settings are required: the model (`glm53` or
 `glm53f`, and a release of it) and how the boxes find each other (a peer list, or mentat). Then one short section for
 each way to run it, each ending with a passing `smoke`: [bare metal](docs/DEPLOY.md#bare-metal),
