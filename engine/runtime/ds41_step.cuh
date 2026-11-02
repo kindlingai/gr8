@@ -213,6 +213,8 @@ inline void build_ds41(Model& m,int rank,const std::vector<int>& ids,const Find&
     m.ds41_plan=draft?ds41::plan_draft(ids):ds41::plan(ids,0,m.nl,true,true,engram_on,/*dspark=*/dspark==1);
     m.ds41_idx=ds41::index(m.ds41_plan);
     m.ds41_fuse=knob::ds_mhc_fuse();
+    m.ds41_pub16=knob::ds41_pub16();
+    if(m.ds41_pub16) fprintf(stderr,"# rank %d: DS41 publish copy: GR8_DS41_PUB16=1 (publishes of 8 rows or fewer copy with 16 CTAs, not 1)%s\n",rank,draft?" (draft Model)":"");
     const int b12_mode=knob::ds_mhc_decomp()?1:0;
     m.ds41_b12_mhc=b12_mode==1 && !draft;
     if(!draft) fprintf(stderr,"# rank %d: B12_MHC_BOOT GR8_DS_MHC_DECOMP=%d candidate_rows=%d..%d\n",
@@ -400,7 +402,8 @@ inline void put_publish_rs(Model& m,const uint16_t* staging,int c,int rows,cudaS
 inline bool ds41_direct_chunk(const Model& m) { return m.ds41_direct && m.ds41_dchunk; }
 inline uint16_t* ds41_dir_dst(const Model& m,int c) { return reinterpret_cast<uint16_t*>(m.f.send+g6::fab_send_off(m.f,(int)(m.ds41_dseq&1),c)); }
 // the publish of layer exchange c (k: 0 attention, 1 MoE): RS layout (one slice per owner) or the plain copy. Direct chunk: the
-// producer wrote the slot (ring only), else the plain copy, flat as well (never the RS layout: the proxy sends flat slices)
+// producer wrote the slot (ring only), else the plain copy, flat as well (never the RS layout: the proxy sends flat slices).
+// GR8_DS41_PUB16=1: the plain copy runs 16 CTAs at any row count (put_publish runs 1 CTA up to 8 rows); same bytes, same doorbell
 inline void ds41_put_publish(Model& m,const uint16_t* staging,int c,int rows,cudaStream_t st,int k) {
     if(ds41_direct_chunk(m)) {
         if(m.ds41_dir_used[k]) { m.ds41_dir_used[k]=false; k_put_publish<<<1,128,0,st>>>(nullptr,m.f,m.stepp,c,0,m.tickets+c); }
@@ -408,6 +411,7 @@ inline void ds41_put_publish(Model& m,const uint16_t* staging,int c,int rows,cud
         return;
     }
     if(ds41_rs_on(m,c,rows)) put_publish_rs(m,staging,c,rows,st);
+    else if(m.ds41_pub16) k_put_publish<<<16,128,0,st>>>(reinterpret_cast<const uint4*>(staging),m.f,m.stepp,c,rows*(HID*2/16),m.tickets+c);
     else put_publish(m,staging,c,rows,st);
 }
 // RS+AG consume of c: wait the peers' slices, reduce my Q rows (-> device sum + the AG send slot, ring c_ag), wait the peers' AG payloads,

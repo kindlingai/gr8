@@ -76,6 +76,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_DS41_IDX_REUSE` | flag | `0` |  | 1 = layers 24 to 36 keep layer 20's top-512 list and run no wq_b, logits or top-k of their own; layer 20 then skips its candidate blocks. |
 | `GR8_DS41_IDX_TOPK` | text | `mc` | mc\|1cta | Top-k kernel of the dense index stage: mc = several CTAs per long row, 1cta = the single-CTA reference kernel. Both give the same lists. |
 | `GR8_DS41_IDX_WQB_TC` | int | `0` | 0.. | The indexer's wq_b runs on the attention block's tensor-core GEMM at this many rows or more. Not bit-exact against the scalar GEMM. 0 = off. |
+| `GR8_DS41_PUB16` | flag | `0` |  | 1 = a publish of 8 rows or fewer (the layer exchanges and the Engram reduce) copies into the send slot with 16 CTAs instead of 1, the grid a publish of more rows already runs. The same bytes and the same doorbell, so the outputs do not change. |
 | `GR8_DS_ATTN_CPA` | flag | `0` |  | 1 = the attention core gathers its K rows with cp.async (k_attn_cpa). The output is bit-identical to k_attn. |
 | `GR8_DS_ATTN_GV` | flag | `1` |  | Decode projections of up to 8 rows run on the MXFP8 GEMV where the weight has .mx.gv records. 0 = the generic MXFP8 GEMM for every projection. |
 | `GR8_DS_ATTN_GV_KS` | int | `0` | 0.. | k-parts per output tile of the attention GEMV. 0 = the built-in pick per shape (gv_pick_ks). |

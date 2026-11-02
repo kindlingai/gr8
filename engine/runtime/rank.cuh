@@ -509,6 +509,7 @@ struct Model
     bool ds41_direct = false, ds41_dchunk = false;
     u64 ds41_dseq = 0;
     bool ds41_dir_used[2] = {false, false};
+    bool ds41_pub16 = false;              // boot-bound GR8_DS41_PUB16=1: publishes of 8 rows or fewer copy with 16 CTAs, not 1 (same bytes, same doorbell); false = off
     bool ds41_stage = false;              // GR8_DS_DEC_STAGE=1: main-Model decode consumes (1..MX rows) read the slots with 16-byte loads through smem (Ds41Staged); false = off
     int ds41_pf_late = 0;                 // bounded replay (ds41_pf_split.h): rows of range B of the prefill chunk being run, set by the hook around ds41::run; 0 = none
     bool ds41_reset_seen = false;         // reset() has run once: from the second call on it clears the attention / index caches (ds41_attn_clear / ds41_idx_clear)

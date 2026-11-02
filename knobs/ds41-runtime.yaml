@@ -233,3 +233,11 @@ knobs:
     legacy: ["G6_XTRACE_DS"]
     doc: >-
       With GR8_XTRACE=1 and DSpark, also trace the DSpark draft fabric.
+  GR8_DS41_PUB16:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = a publish of 8 rows or fewer (the layer exchanges and the Engram reduce) copies into the send slot with 16
+      CTAs instead of 1, the grid a publish of more rows already runs. The same bytes and the same doorbell, so the
+      outputs do not change.

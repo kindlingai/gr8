@@ -54,7 +54,7 @@ __global__ void __launch_bounds__(256) k_engram_sum(g6::FabricDev f, const u64* 
 // EngramHooks::reduce. Collective c = 2*nl+1+e of the fabric (ncoll = 2*nl+3, payload rows*6144*2 B): slots of MX rows in the decode build,
 // of the W rows of GR8_DS_PREFILL_W in a prefill build (the boot sizes the slots: stride >= W*12288 + 8). A chunk of more than 32 rows publishes with
 // kEngramPutCta CTAs (k_put_publish is grid-stride; the doorbell comes from the last CTA to arrive, whatever the grid), up to 4096 rows.
-constexpr int kEngramPutCta = 64;   // CTAs of the W-row publish copy: 12.6 MB at W = 1024 (decode: 1 or 16 CTAs for 32 rows or fewer)
+constexpr int kEngramPutCta = 64;   // CTAs of the W-row publish copy: 12.6 MB at W = 1024 (decode: 1 or 16 CTAs for 32 rows or fewer; 16 with GR8_DS41_PUB16=1)
 inline int ds41_engram_reduce(void* model, int e, int rows, void* stream, __nv_bfloat16* emb)
 {
     Model& m = *(Model*)model;
@@ -62,7 +62,7 @@ inline int ds41_engram_reduce(void* model, int e, int rows, void* stream, __nv_b
     const int c = 2 * m.nl + 1 + e;
     if ((size_t)rows * ds41::engram::kEmbDim * 2 + 8 > g6::fab_slot_stride(m.f, c)) return (int)cudaErrorInvalidValue;   // the slot holds the payload and the doorbell word
     cudaStream_t st = (cudaStream_t)stream;
-    k_put_publish<<<rows > MX ? kEngramPutCta : rows <= 8 ? 1 : 16, 128, 0, st>>>(reinterpret_cast<const uint4*>(emb), m.f, m.stepp, c,
+    k_put_publish<<<rows > MX ? kEngramPutCta : rows <= 8 && !m.ds41_pub16 ? 1 : 16, 128, 0, st>>>(reinterpret_cast<const uint4*>(emb), m.f, m.stepp, c,
                                                        rows * (ds41::engram::kEmbDim * 2 / 16), m.tickets + c);
     k_engram_sum<<<dim3(rows, 6), 256, 0, st>>>(m.f, m.stepp, c, rows, emb);
     return (int)cudaGetLastError();
