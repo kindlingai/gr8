@@ -262,6 +262,9 @@ GR8_GLM53F_PF_STAGE_ASYNC=1"
   # the peer-partial staging (GR8_GLM53F_PF_STAGE_ASYNC) runs at any rank count; the G9 KDA scan is a precision arm, not the
   # same bytes as the scan it replaces, so it stays where it was chosen: TP2 (it would change TP4's output)
   [ "$TP" = 4 ] || ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_KDA_SCAN=1 GR8_GLM53F_KDA_VS=2"
+  # TP=4: mHC sequence-parallel (partials reduce-scatter, each owner runs mHC on its rows, the rows all-gather), which
+  # sends a quarter of the bytes; it replaces the peer-partial staging. 8K prefill 2,151 -> 2,487 tok/s
+  [ "$TP" = 4 ] && ENGINE_ENV="${ENGINE_ENV/GR8_GLM53F_PF_STAGE_ASYNC=1/GR8_GLM53F_PF_STAGE_ASYNC=0} GR8_GLM53F_PF_SP=1"
   # FLASH_CAP_POLICY=borrow-idle: the KV pool in chunks, lent once idle (the supervisor adds GR8_GLM53F_KV_LEDGER, the box's)
   if [ "${FLASH_CAP_POLICY:-protected}" = borrow-idle ]; then
     ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_KV_CHUNKS=1 GR8_GLM53F_KV_LEND_MS=$((${FLASH_KV_IDLE_S:-60} * 1000))"

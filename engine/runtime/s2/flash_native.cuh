@@ -379,6 +379,11 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         fprintf(stderr, "# flash serve request %llu prefill %u rows at %u (main + draft): %.3f ms\n",
                 (unsigned long long)slot.req.id, rows, first,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        if (pf_prof().on) {   // GR8_PF_PROF=1: this quantum's stage profile
+            const std::string tag = "rank " + std::to_string(c.main.rank) + " request " + std::to_string(slot.req.id) + ",";
+            flash_pf_prof().print(tag.c_str());
+            flash_pf_prof() = FlashPfProf{};
+        }
     };
     // several sessions: every batched shape at every context bucket, captured after the bootstrap (its timeout does not
     // cover the capture) and before the weights are sealed, as the full model's capture_all; then serving starts in S2
