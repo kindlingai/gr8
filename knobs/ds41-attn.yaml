@@ -118,6 +118,15 @@ knobs:
     doc: >-
       A file of raw int32 [rows][512] top-k lists. A run over a layer subset reads it in place of an index source
       that the subset leaves out.
+  GR8_DS41_GV_QUAD:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = the attention's q_b, o_a and o_b decode GEMV records are repacked in place at bind, four 528-byte groups of
+      a tile to one 2112-byte quad that fills whole 64-byte bursts, and read by k_gv_mx_q. Each MMA gets the same words
+      in the same order, so the outputs are bit-identical to k_gv_mx. A weight whose GEMV launch does not take whole
+      quads (GR8_DS_ATTN_GV_TPC above 1) keeps its records and k_gv_mx.
   GR8_DS41_IDX_DENSE_MAXK:
     scope: agree
     kind: int
