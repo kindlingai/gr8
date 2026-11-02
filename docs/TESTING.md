@@ -88,8 +88,8 @@ one GPU and makes its own synthetic weights.
 `scripts/build.sh` runs `tr3_e4m3_test` (the trellis codebook decode, when a GPU is visible: every state of the mcg,
 mul1 and pmcgx codebooks against a host reference and the hashes the Rust and Python references check, and every lane
 decode path of the kernels on random tiles; `--cb --k --tiles --values` also checks tiles the exlr8 encoder wrote
-against its own decoded values), `l2pf_queue_test` and
-`k1_split_test` (both host only), the four steering tests and `s2_steer_test`. It builds these without running them:
+against its own decoded values), `l2pf_queue_test`, `k1_split_test` and
+`sampler_u01_test` (all three host only; the last checks the sampler's uniform draw for every 24-bit value), the four steering tests and `s2_steer_test`. It builds these without running them:
 
 | test | checks |
 |---|---|

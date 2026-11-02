@@ -206,6 +206,9 @@ build l2pf_queue_test nvcc -O2 -std=c++17 $GEN $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR
 # shellcheck disable=SC2086
 build k1_split_test nvcc -O2 -std=c++17 $S2 -I "$REPO/engine/kernels" -o "$OUT/k1_split_test" \
   "$REPO/engine/kernels/tests/k1_split_test.cu" "${KNOBS[@]}"
+# the sampler's uniform draw (u01_top24: 0 < u < 1, a finite Gumbel noise, the old value below 1): host only, runs everywhere
+build sampler_u01_test nvcc -O2 -std=c++17 $GEN -I "$REPO/engine/kernels" -o "$OUT/sampler_u01_test" \
+  "$REPO/engine/kernels/tests/sampler_u01_test.cu"
 # flat reduce-scatter slices (Fabric::Rs::flat) over real verbs, mesh or ring: built here, run on the cluster (see its header)
 build fabric_rs_flat_test $NVCC -O2 -std=c++17 -I "$REPO/engine/comms" -o "$OUT/fabric_rs_flat_test" \
   "$REPO/engine/comms/tests/fabric_rs_flat_test.cpp" "$REPO/engine/comms/fabric.cpp" -libverbs "${KNOBS[@]}"
@@ -220,6 +223,7 @@ check() {   # check <test>: run $OUT/<test>; print its last line, named, or all 
 }
 check l2pf_queue_test
 check k1_split_test
+check sampler_u01_test
 if nvidia-smi -L > /dev/null 2>&1; then
   check tr3_e4m3_test
   for test in $STEERING; do "$OUT/$test"; done

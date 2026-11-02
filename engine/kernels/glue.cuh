@@ -861,12 +861,20 @@ struct SampleRow
 };
 __host__ __device__ __forceinline__ bool topp_on(const SampleRow& s) { return s.inv_temp > 0.f && s.top_p > 0.f && s.top_p < 1.f; }
 
-// Gumbel noise for vocab id v: u in (0,1) from the top 24 bits; g = -log(-log(u)).
+// u in (0,1) from the top 24 bits of a Philox word: (k + 0.5) / 2^24. k + 0.5 is not exact in a float for k >= 2^23, and
+// k = 0xFFFFFF rounds up to 2^24, u = 1.0: gumbel() would return +inf and a uniform random token win the row (1 in 2^24
+// per vocab id). That one value is held to the largest float below 1; every other k gives the same u as before.
+// engine/kernels/tests/sampler_u01_test.cu checks every k.
+__host__ __device__ __forceinline__ float u01_top24(uint32_t x)
+{
+    return fminf(((float)(x >> 8) + 0.5f) * (1.f / 16777216.f), 0x1.fffffep-1f);
+}
+
+// Gumbel noise for vocab id v: u = u01_top24(x); g = -log(-log(u)).
 __host__ __device__ __forceinline__ float gumbel(const SampleRow& s, int v)
 {
     const uint32_t x = philox_x((uint32_t)v, (uint32_t)s.pos, (uint32_t)s.draw, 0x67364c75u, s.seed_lo, s.seed_hi);
-    const float u = ((float)(x >> 8) + 0.5f) * (1.f / 16777216.f);
-    return -logf(-logf(u));
+    return -logf(-logf(u01_top24(x)));
 }
 __host__ __device__ __forceinline__ float sample_score(const SampleRow& s, float logit, int v)
 {
@@ -877,7 +885,7 @@ __host__ __device__ __forceinline__ float sample_score(const SampleRow& s, float
 __host__ __device__ __forceinline__ float uniform01(const SampleRow& s)
 {
     const uint32_t x = philox_x(0u, (uint32_t)s.pos, (uint32_t)s.draw, 0x3c6ef372u, s.seed_lo, s.seed_hi);
-    return ((float)(x >> 8) + 0.5f) * (1.f / 16777216.f);
+    return u01_top24(x);
 }
 
 // Per-row record each rank contributes to the head all-gather (32 bytes).
