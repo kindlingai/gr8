@@ -88,7 +88,7 @@ inline void gv_gemv_launch(const uint32_t* xf, const Fp8Mat& W, bf16* Y, int ldy
 }
 
 // ------------------------------------------------------------------------------------------------ quad records (GR8_DS41_GV_QUAD=1)
-// GR8_DS41_GV_QUAD=1 (default off). The pack's MXFP8 group is 528 B (tile0 256 B, tile1 256 B, 16 x u16 scales); 528 mod 64 = 16, so
+// GR8_DS41_GV_QUAD=1 (default off). The pack's MXFP8 group is 528 B (tile0 256 B, tile1 256 B, 8 x u16 scales = 16 B); 528 mod 64 = 16, so
 // the groups sit off the 64 B bursts. A QUAD = 4 groups of one tile = 2112 B = 33 bursts, repacked in place at bind:
 //   [j = 0..3: 512 B, lane l's 16 B = group j {tile0 bytes 8l..8l+7, tile1 bytes 8l..8l+7}] [64 B: row r = 0..7: {g0..g3 scale u16 of row r}]
 // k_gv_mx_q reads a quad with 4 x ld.v4 + 1 x ld.v2 a lane. Each lane gets the same c[4] words and scale as GvGroup<Mxfp8>::load, the same mma
