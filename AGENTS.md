@@ -76,22 +76,16 @@ The light gates, on the target topology:
 
 1. both builds compile, and the change's own test passes;
 2. one boot serves: `./gr8 glm53 smoke` passes every case;
-3. KL against main's reference on fixed sequences is within the boot-to-boot range, an 87K-token needle is found, and
-   pbench 8K/32K prefill and prose decode are within noise of `main` or better.
+3. `./gr8 glm53 bench --baseline <main's report>` passes: the smoke test, the correctness checks, and decode and
+   prefill no slower than `main` beyond noise ([bench/README.md](bench/README.md)).
 
-`bench/gate/gate.py` runs all of 3 the same way on every build ([bench/gate/README.md](bench/gate/README.md)):
+Run `main` once on the same boxes with the same options and keep its JSON report as the baseline:
 
-    python3 bench/gate/gate.py run --url http://127.0.0.1:8100 --topology tp4 --commit <sha> --boot b1 \
-        --kl-ref bench/gate/refs/tp4.json --health $GR8_WORK_DIR/out/rank_health.json
-    python3 bench/gate/gate.py check --baseline bench/gate/baselines/tp4.json
+    ./gr8 glm53 bench --json main.json                   # on main
+    ./gr8 glm53 bench --baseline main.json --json pr.json  # on the change
 
-`--health` wants the rank health probe's result for this boot: run `scripts/rank_health.sh` with `./gr8`'s options
-before `./gr8 glm53 up` (the probe refuses a box with a model booted). It needs `PEERS`, `IPS` and `IPS2` set, and
-passwordless ssh from the head to every box. Without them, `gate.py run --no-health` runs, but its
-records do not count for `baseline` or `check`.
-
-`./gr8 glm53 bench --tag <name>` runs pbench alone. Numbers for the README come from RigMark 1.0.0 at `reasoning_effort`
-low, GPU clocks capped at 2200 MHz.
+`--health` keeps the rank health probe's result for this boot in the report: run `scripts/rank_health.sh` with
+`./gr8`'s options before `./gr8 glm53 up` (the probe refuses a box with a model booted).
 
 ## kindling.json
 

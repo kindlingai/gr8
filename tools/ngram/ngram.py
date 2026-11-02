@@ -2,7 +2,7 @@
 """S5 (#56) step 2-4: a GLM-distilled n-gram table as a draft source, tested offline by replay. Stdlib only, CPU only.
 
 A trace is one GLM-5.3 generation with the model's top-k log-probabilities at every generated position (capture.py
-records them through the front end; `import-kl-ref` turns a bench/gate KL reference into traces). One JSON line each:
+records them through the front end; `import-kl-ref` turns a KL reference (bench/bench.py kl-ref) into traces). One JSON line each:
     {"workload": "code", "prompt": [ids], "gen": [ids], "top": [[[id, logprob], ...] for each gen position]}
 
 The table maps the last n tokens (several n, longest first, with backoff) to the top 2-4 next tokens, each with the
@@ -16,7 +16,7 @@ A round with d draft tokens costs d + 1 verify rows (engine/runtime/spec_len.h).
 verify times by row count (2200 MHz, DFlash2 verify steps); a lookup costs no GPU time. Trees need tree verification
 (#57); chains run on today's verify path.
 
-    python3 tools/ngram/ngram.py import-kl-ref bench/gate/refs/tp4.json --out traces.jsonl
+    python3 tools/ngram/ngram.py import-kl-ref REF.json --out traces.jsonl
     python3 tools/ngram/ngram.py replay traces.jsonl --folds 5 [--json out.json]
     python3 tools/ngram/ngram.py sizes traces.jsonl --floors 0.3,0.5,0.7,0.9
     python3 tools/ngram/ngram.py export traces.jsonl --out ngram.tab     # the engine's table (GR8_NGRAM)
@@ -69,13 +69,13 @@ def save_traces(path, traces):
             f.write(json.dumps(t, separators=(',', ':')) + '\n')
 
 
-# bench/gate/data/kl_prompts.json, by index: what kind of answer each prompt asks for
+# bench/data/kl_prompts.json, by index: what kind of answer each prompt asks for
 KL_WORKLOAD = {0: 'code', 1: 'prose', 2: 'code', 3: 'prose', 4: 'json', 5: 'code', 6: 'prose', 7: 'code', 8: 'prose',
                9: 'prose', 10: 'code', 11: 'prose', 12: 'json', 13: 'prose', 14: 'code', 15: 'json'}
 
 
 def from_kl_ref(ref):
-    """A gate.py kl-ref file (greedy continuations with top-k at each position, taken on one build) -> traces."""
+    """A bench.py kl-ref file (greedy continuations with top-k at each position, taken on one build) -> traces."""
     out = []
     for i, s in enumerate(ref['sequences']):
         L = s['prompt_len']
@@ -465,7 +465,7 @@ def table_md(res, budgets=BUDGETS, sources=SOURCES):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     sub = ap.add_subparsers(dest='cmd', required=True)
-    p = sub.add_parser('import-kl-ref', help='a bench/gate kl-ref file -> traces')
+    p = sub.add_parser('import-kl-ref', help='a bench.py kl-ref file -> traces')
     p.add_argument('ref')
     p.add_argument('--out', required=True)
     for name in ('replay', 'sizes', 'export'):

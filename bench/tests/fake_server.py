@@ -1,5 +1,5 @@
-"""A small stand-in for the front end (stdlib only): enough of /tokenize, /v1/completions, /v1/chat/completions
-(streamed) and /metrics for the harness tests. Not a model: logprobs are a fixed function of the token ids."""
+"""A small stand-in for the front end: enough of /v1/models, /tokenize, /v1/completions, /v1/chat/completions
+(streamed) and /metrics for the bench tests. Not a model: logprobs are a fixed function of the token ids."""
 import hashlib
 import json
 import math
@@ -57,6 +57,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         st = self.server.st
+        if self.path == '/v1/models':
+            return self._json({'data': [{'id': 'fake-model', 'max_model_len': 200000}]})
         c = st.counters
         lines = [f'vllm:spec_decode_num_drafts_total{{engine="0"}} {c["drafts"]}',
                  f'vllm:spec_decode_num_draft_tokens_total{{engine="0"}} {c["draft"]}',
@@ -64,7 +66,8 @@ class Handler(BaseHTTPRequestHandler):
                  f'vllm:spec_decode_num_accepted_tokens_per_pos_total{{engine="0",position="0"}} {c["acc"] * 0.6}',
                  f'vllm:spec_decode_num_accepted_tokens_per_pos_total{{engine="0",position="1"}} {c["acc"] * 0.4}',
                  f'vllm:prefix_cache_queries_total{{engine="0"}} {c["queries"]}',
-                 f'vllm:prefix_cache_hits_total{{engine="0"}} {c["hits"]}']
+                 f'vllm:prefix_cache_hits_total{{engine="0"}} {c["hits"]}',
+                 f'vllm:num_requests_running{{engine="0"}} 0']
         data = '\n'.join(lines).encode()
         self.send_response(200)
         self.send_header('Content-Length', str(len(data)))

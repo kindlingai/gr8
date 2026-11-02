@@ -96,7 +96,7 @@ the kind of work in each. If TTFT instead tracks `L`, the abort is waiting for t
 
 ## What this run does not settle
 
-- It says nothing about the **3% no-lost-wins rule**. That is the usual gate (`bench/gate/gate.py`), run alongside.
+- It says nothing about the **3% no-lost-wins rule**. That is the usual gate (`./gr8 glm53 bench --baseline`), run alongside.
 - `SESS` at 2 and 4 changes who competes for prefill quanta; if the two disagree about the lookahead, say so rather
   than picking one — that means a third term is in play.
 - The 1.5 ms disconnect is a reproduction of the report, not a specification. The mechanism is the same for any cancel

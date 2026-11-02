@@ -25,7 +25,8 @@
 #   ./gr8 glm53 knobs [WORD..] [OPTIONS]   every option, and the value each TP runs with these options; WORDs keep
 #                                     the options whose name holds one
 #   ./gr8 glm53 smoke [URL]           smoketest/run.sh, by default against this head's API (./gr8 ds41 smoke: smoketest/ds41.sh)
-#   ./gr8 glm53 bench [ARGS]          bench/pbench.py against this head's API
+#   ./gr8 glm53 bench [ARGS]          bench/bench.py against this head's API, cooling and sampling the PEERS boxes
+#                                     between stages; --quick, --full, --json FILE (bench/README.md)
 #   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh (one engine for every TP width) and scripts/build_front.sh; with
 #                                     KV_FORMAT=int4 (or --kv-format int4 in the options) also bin/g6m4-int4
 #
@@ -126,7 +127,8 @@ case $cmd in
     exec bash "$REPO/smoketest/run.sh" "$url" "$@" ;;
   bench)
     PORT=$(python3 "$REPO/tools/launch/launch.py" get PORT "${named[@]}") || exit 2
-    exec python3 "$REPO/bench/pbench.py" --url "$(api)" "$@" ;;
+    peers=$(python3 "$REPO/tools/launch/launch.py" get PEERS "${named[@]}" 2> /dev/null) || peers=""
+    exec python3 "$REPO/bench/bench.py" --url "$(api)" ${peers:+--hosts "$peers"} "$@" ;;
   build)
     out=${1:-$REPO/bin}
     if [ "$build_model" = pseudo ]; then

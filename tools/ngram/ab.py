@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import capture  # noqa: E402
 from capture import Client, post  # noqa: E402
 
-MIN_TIMED = 50      # bench/gate measure.rate(): shorter replies are not timed
+MIN_TIMED = 50      # shorter replies are not timed
 
 
 def complete(c, ids, max_tokens):

@@ -8,7 +8,7 @@ recovery is out of scope: the probe says what is wrong, a person fixes it.
 ```bash
 scripts/rank_health.sh [OUT_JSON] [OPTIONS]   # on the head, no model booted; ./gr8's options; exit 0 admitted, 3 refused
 ./gr8 glm53 up                         # after the probe
-python3 bench/gate/gate.py run ... --health $GR8_WORK_DIR/out/rank_health.json     # stores the result in the run records
+./gr8 glm53 bench --health $GR8_WORK_DIR/out/rank_health.json     # keeps the result in the report
 python3 tools/health/rank_probe.py local --proxy-cpu 19 --rail-ips 10.0.1.1,10.0.2.1    # one node, JSON
 ```
 
@@ -66,7 +66,7 @@ tolerances could be tighter (the healthy spread is under 2%) but that is left un
 ## Result file
 
 `--out` writes `format`, `ts`, `admitted`, `elapsed_s`, `thresholds`, per-rank measurements (`ranks`) and `refusals`
-(`rank`, `host`, `code`, `detail`). `gate.py run --health` copies it into each run record under `rank_health`.
+(`rank`, `host`, `code`, `detail`). `bench.py --health` copies it into the report under `meta.rank_health`.
 
 ## Progress-thread isolation
 
