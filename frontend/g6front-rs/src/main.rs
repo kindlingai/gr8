@@ -284,19 +284,21 @@ async fn serve(args: Args) -> Result<(), String> {
         }
         dialect::Dialect::Ds41 => {
             // the prompt comes from dschat.rs (the release's encoding.py ported); thinking closes with the one
-            // `</think>` token; thinking off is native, so it needs no flag
+            // `</think>` token; thinking off is native, so it needs no flag; a request with no top_p samples at 0.95 (Tok::use_ds41_sampling_defaults)
             tok.use_single_think_close();
+            tok.use_ds41_sampling_defaults();
             let effort = match args.default_effort.as_deref() {
                 Some(e) => dialect::parse_ds_default_effort(e)?,
                 None => dialect::DS_DEFAULT_EFFORT,
             };
             log::info!(
                 "dialect ds41: tokenizer loaded in {:.0} ms (vocab {}, eos {:?}); default reasoning effort {effort}, \
-                 default thinking budget {}, thinking off allowed",
+                 default thinking budget {}, thinking off allowed, default top_p {}",
                 t0.elapsed().as_secs_f64() * 1e3,
                 tok.vocab_size,
                 tok.eos_ids,
-                args.default_budget
+                args.default_budget,
+                tok.gen_defaults.get("top_p").map_or("1.0".to_string(), |v| v.to_string())
             );
             let d = thinking::Defaults { effort: None, budget: args.default_budget, allow_off: true };
             (None, d, effort)

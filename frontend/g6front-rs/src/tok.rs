@@ -63,6 +63,15 @@ impl Tok {
         self.think_close = self.think_end.into_iter().collect();
     }
 
+    /// A DeepSeek-V4.1-Flash request that names no top_p samples with top_p 0.95 (the exlr8 release carries no
+    /// generation_config.json, so it was 1.0). DeepSeek's V4.1-Flash README recommends top_p 0.95 or 1.0 and evaluates at
+    /// 0.95; the 1017 README recommends 1.0. At temperature 1.0, 0.95 decoded 12.9% (code) and 6.6% (prose) faster on
+    /// 4 Sparks, as more drafts are accepted, with the same sampled quality.
+    /// A request's own top_p, or one in the directory's generation_config.json, still wins.
+    pub fn use_ds41_sampling_defaults(&mut self) {
+        self.gen_defaults.entry("top_p".to_string()).or_insert(Value::from(0.95));
+    }
+
     pub fn load(dir: &Path) -> Result<Tok, String> {
         let tk = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| format!("tokenizer.json: {e}"))?;
         let tk: &'static Tokenizer = Box::leak(Box::new(tk));
@@ -351,6 +360,20 @@ mod tests {
         assert_eq!(t.think_close, vec![4, 11, 5]); // GLM's close: "\n" + </think> + "\n\n"
         t.use_single_think_close();
         assert_eq!(t.think_close, vec![11]);
+    }
+
+    #[test]
+    fn deepseek_samples_with_top_p_095_unless_the_directory_says_otherwise() {
+        let mut t = Tok::load(&dict_form_dir("topp")).unwrap();
+        assert_eq!(t.gen_defaults.get("top_p"), None); // no generation_config.json: the request default would be 1.0
+        t.use_ds41_sampling_defaults();
+        assert_eq!(t.gen_defaults.get("top_p"), Some(&Value::from(0.95)));
+        let dir = dict_form_dir("topp-gen");
+        std::fs::write(dir.join("generation_config.json"), r#"{"top_p": 0.8, "temperature": 0.6}"#).unwrap();
+        let mut t = Tok::load(&dir).unwrap();
+        t.use_ds41_sampling_defaults();
+        assert_eq!(t.gen_defaults.get("top_p"), Some(&Value::from(0.8)));
+        assert_eq!(t.gen_defaults.get("temperature"), Some(&Value::from(0.6)));
     }
 
     /// Parallel == sequential on random text built from every character class around the cut points.
