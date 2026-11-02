@@ -58,8 +58,8 @@ tp4_default() {
   printf -v "$1" %s "$2"
 }
 
-# GLM-5.3-Flash under --serve takes no CP, prefix reuse, DFlash or PF_OWN (engine/runtime/g6m4.cu refuses them).
-# MTP=1: --serve needs a draft, and the KDA state does not roll back a rejected draft yet (docs/FLASH.md).
+# GLM-5.3-Flash under --serve takes no CP, prefix reuse or PF_OWN (engine/runtime/g6m4.cu refuses them). DFLASH=1 (TP=4,
+# the default): a session alone drafts with the DFlash2 drafter, SPEC_ADAPT on with it. MTP=1 for sessions sharing steps.
 # SESS: 2..8 share decode steps and the CAP pool, each with its own KDA state slots (docs/FLASH.md, Several sessions);
 # 8 at TP=4, 4 at TP=3, 1 (one request at a time) at TP=2. A round of every session, SESS x (MTP + 1) rows, must fit
 # the engine's 32. CAP is a 262,144-token request plus a page for the guard rows (2 at MTP=1). Only the 11 DSA layers and
@@ -68,15 +68,18 @@ tp4_default() {
 flash_defaults() {
   case $TP in 4|3|2) ;; *) echo "engine_defaults: TP=$TP; GLM-5.3-Flash wants 4, 3 or 2" >&2; return 2 ;; esac
   local k
-  for k in DFLASH REUSE PF_OWN SPEC_ADAPT; do
+  for k in REUSE PF_OWN; do
     [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: GLM-5.3-Flash has no $k" >&2; return 2; }
   done
+  [ "${DFLASH:-0}" = 0 ] || [ "$TP" = 4 ] || { echo "engine_defaults: DFLASH=1: GLM-5.3-Flash runs its DFlash2 drafter at TP=4" >&2; return 2; }
   SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-262208}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}
   case $TP in 4) SESS=${SESS:-8} ;; 3) SESS=${SESS:-4} ;; *) SESS=${SESS:-1} ;; esac
   case $SESS in [1-8]) ;; *) echo "engine_defaults: SESS=$SESS: GLM-5.3-Flash serves 1 to 8 sessions" >&2; return 2 ;; esac
   [ "$SESS" = 1 ] || [ $((SESS * (MTP + 1))) -le 32 ] ||
     { echo "engine_defaults: SESS=$SESS MTP=$MTP: a round of $((SESS * (MTP + 1))) rows; GLM-5.3-Flash steps hold 32" >&2; return 2; }
-  S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=0
+  # DFLASH: on at TP=4 as on GLM-5.3 (the supervisor turns it off, with a notice, when no drafter is given)
+  [ "$TP" = 4 ] && DFLASH=${DFLASH:-1} || DFLASH=${DFLASH:-0}
+  S2PORT=${S2PORT:-7341}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=0; REUSE=0
   flash_donor_defaults
 }
 
@@ -438,6 +441,9 @@ engine_args() {
 --pf-lanes 2 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
     [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
     [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
+    # DFLASH=1: a session alone drafts with the DFlash2 drafter (SPEC_ADAPT: its draft count each round)
+    [ "$SPEC_ADAPT" = 1 ] && a="$a --spec-adaptive ${SPEC_LEVELS:+--spec-levels $SPEC_LEVELS}"
+    a="$a $df"
     # FLASH_CACHE keeps its checkpoints in the KV_STORE store (one at most), else in memory
     if [ -n "${FLASH_CACHE:-}" ] && [ "$FLASH_CACHE" != off ] && [ -n "${KV_STORE:-}" ] && [ "$KV_STORE" != off ]; then
       local t IFS=';'

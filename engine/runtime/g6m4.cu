@@ -363,7 +363,8 @@ int main(int argc, char** argv)
         spec.draft_round = dfl ? 5.6 : 2.5;      // ms at 2200 MHz: the DFlash2 step, the MTP first-form pass
         spec.draft_each = dfl ? 0 : 2.1;         // an MTP chain step
 #if G6_MODEL_FLASH
-        if (!dfl) spec.flash_cost(g6nr::NR);
+        spec.flash_cost(g6nr::NR);
+        if (dfl) { spec.draft_round = 5.6; spec.draft_each = 0; }   // the verify table is Flash's, the drafting the drafter step's
 #endif
     }
 #if G6_MODEL_FLASH
@@ -469,8 +470,10 @@ int main(int argc, char** argv)
     const long long flash_budget_mib = knob::glm53f_state_budget_mib();
 #if G6_MODEL_FLASH
     // Flash: --s2-sessions 1 (the default) is the solo path; 2..8 share the --cap pool (s2/flash_native.cuh)
-    if (s2mode && (reuse_prefix || dfl || plan.rs))
-        die("Flash serve supports no prefix reuse, DFlash or rejection sampling");
+    if (s2mode && (reuse_prefix || plan.rs))
+        die("Flash serve supports no prefix reuse or rejection sampling");
+    if (s2mode && dfl && (!mtp || flash_cache != g6s2::FlashCache::Off))
+        die("Flash serve with DFlash2 needs --mtp (a second session moves the DFlash2 one to MTP) and no GR8_GLM53F_CACHE");
     if (s2mode && s2sess > 1 && s2sess * (mtp + 1) > MX)
         die("Flash serve: --s2-sessions x (--mtp + 1) rows exceed G6_MX (every session's round is one step)");
     if (flash_cache != g6s2::FlashCache::Off) {
@@ -1894,14 +1897,16 @@ int main(int argc, char** argv)
         g6s2::BootstrapConfig bc;
         auto& sc = bc.scheduler;
         sc.epoch = s2epoch; sc.pool_rows = cap / 64 * 64;
-        sc.max_rows = std::min(MX, std::max(s2sess * (mtp + 1), plan.chunk));   // a round of every session, a prompt chunk
+        sc.max_rows = std::min(MX, std::max({s2sess * (mtp + 1), plan.chunk, dfl ? dfl_k + 1 : 0}));   // a round of every session, a prompt chunk, a DFlash2 round
         sc.max_sessions = s2sess; sc.mtp = mtp; sc.prefill_rows = MP; sc.two_lanes = two;
+        if (dfl) sc.guard_tokens = 2 * dfl::K;     // a DFlash2 verify writes up to 7 rows past the last token
         bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = cfg.ips[0];
         bc.directory = s2dir; bc.port = s2port;
         bc.timeout = (unsigned)knob::s2_timeout();
         bc.runtime_signature = "flash solo cap " + std::to_string(cap) + " layers " + layers_s +
             " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " mtp " + std::to_string(mtp) +
             " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id +
+            (dfl ? " dflash k " + std::to_string(dfl_k) : std::string()) +
             (s2sess > 1 ? " sessions " + std::to_string(s2sess) + " split " + std::to_string(gsplit) : std::string()) +
             knob::signature();
         // GR8_GLM53F_CACHE: the checkpoint store of this rank. Every rank must keep the same entries, so the mode, the
@@ -1953,8 +1958,87 @@ int main(int argc, char** argv)
                     group ? (", group " + group->group + " lease, " + std::to_string(ckpt->segments()) + " segments to start").c_str() : "");
             bc.runtime_signature += std::string(" ckpt ") + g6s2::flash_cache_name(flash_cache) + " blocks " + std::to_string(ckpt->blocks());
         }
+        // DFlash2 (--dflash-manifest): a session alone drafts with the drafter, as on GLM-5.3 (s2_batch.h Batch::dflash);
+        // Dfl::pf_feat holds the prefill taps of the session whose prefill started last (dfl_owner, -1 = none)
+        int dfl_owner = -1, dfl_from = 0;
+        uint64_t dfl_req = UINT64_MAX;
+        std::array<uint32_t, g6s2::MAX_SESSIONS> slot_prompt{};
+        u64 s2_dstep = 0;
+        cudaStream_t dfl_ds = st;        // GR8_DRAFT_PAR: the stream of the drafter step in flight
+        auto dfl_install = [&](g6s2::NativeHooks& h) {
+            h.dfl_kv = dfl_k; h.dfl_spec = spec;
+            h.dsel.on = s2::dsel_env();
+            h.dsel.margin = knob::s2_dsel_margin();
+            h.dsel.dwell = (int)std::max<int64_t>(1, knob::s2_dsel_dwell());
+            h.dsel.probe = (int)std::max<int64_t>(1, knob::s2_dsel_probe());
+            h.dsel.d.draft_round = 5.6 + 2.6;   // DFlash2: the drafter step and the MTP first form
+            h.dsel.m.draft_round = 2.6 + 3.0;   // MTP: the first form and the drafter's context-only step
+            h.dsel.m.draft_each = 1.25;
+            for (int r = 1; r <= SpecLen::KX + 1; ++r) h.dsel.d.table[r] = h.dsel.m.table[r] = spec.table[r];
+            h.kstop = kstop;
+            auto bind = h.bind;
+            h.bind = [&, bind](const g6s2::Grant& g) {
+                if (bind) bind(g);
+                const int q = (int)g.key.slot;
+                slot_prompt[q] = g.req.prompt_tokens;
+                if (dfl_owner == q) dfl_owner = -1;     // the slot's previous session owned the taps
+            };
+            auto prefill = h.dispatch.prefill;
+            h.dispatch.prefill = [&, prefill](const g6s2::Slot& sl, const g6s2::Payload& p, uint32_t first, uint32_t rows) {
+                if (DF.pf_feat && sl.req.id != dfl_req)   // a request's first prefill quantum: the window its taps fill
+                {
+                    dfl_req = sl.req.id;
+                    DF.pf_hi = (int)sl.req.prompt_tokens - 1; DF.pf_lo = std::max(0, DF.pf_hi - dfl::WIN);
+                    if (DF.pf_hi > DF.pf_lo) G6RT_CK(cudaMemsetAsync(DF.pf_feat, 0, (size_t)(DF.pf_hi - DF.pf_lo) * dfl::NT * HID * 2, st));
+                    dfl_owner = (int)sl.prefilled <= DF.pf_lo ? (int)sl.key.slot : -1;
+                    dfl_from = std::max(DF.pf_lo, (int)sl.prefilled);
+                }
+                prefill(sl, p, first, rows);
+            };
+            h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1; };
+            h.dispatch.dfl_start = [&](int q) {     // the prefill's taps -> the drafter's context ring, 8 rows a fill step
+                if (dfl_owner != q || DF.pf_hi <= DF.pf_lo) return (int)slot_prompt[q] - 1;
+                for (int c0 = dfl_from; c0 < DF.pf_hi; c0 += dfl::B)
+                {
+                    DflIn di;
+                    memset(&di, 0, sizeof di);
+                    di.step = ++s2_dstep;
+                    di.ctx_rows = std::min(dfl::B, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
+                    *in_f = di;
+                    dfl_enqueue(fabf, di.step, dfl_fill_sizes(), true);
+                    G6RT_CK(cudaGraphLaunch(exec_f[2], st));
+                    G6RT_CK(cudaStreamSynchronize(st));
+                    g6s2::require(!*fabf.dev().error, "Flash DFlash2 fabric error (prompt context)");
+                }
+                return dfl_from;
+            };
+            h.dispatch.dfl = [&](const s2::DflReq& r, const g6s2::Sampling& smp) {
+                // GR8_DRAFT_PAR: phase 1 launches on the drafter's stream and returns, phase 2 waits for it (s2::DflReq)
+                if (r.phase != 2)
+                {
+                    DflIn di;
+                    memset(&di, 0, sizeof di);
+                    di.step = ++s2_dstep;
+                    di.ctx_rows = r.rows; di.ctx_pos0 = r.pos0; di.q0 = r.pos0 + r.rows; di.lo = r.lo; di.tok0 = r.tok0; di.query = r.query;
+                    for (int i = 0; i < dfl::B; ++i) di.srow[i] = glue::SampleRow{smp.inv_temp, smp.seed, 0u, di.q0 + i, 0, smp.top_p};
+                    *in_f = di;
+                    dfl_enqueue(fabf, di.step, dfl_sizes(DF, di.query), false);
+                    dfl_ds = r.phase ? st_par[di.query ? 1 : 0] : st;
+                    G6RT_CK(cudaGraphLaunch(exec_f[di.query ? 1 : 0], dfl_ds));
+                    if (r.phase == 1) return s2::DflDrafts{};
+                }
+                G6RT_CK(cudaStreamSynchronize(dfl_ds));
+                g6s2::require(!*fabf.dev().error, "Flash DFlash2 fabric error");
+                s2::DflDrafts o;
+                for (int i = 0; i < dfl::B; ++i) { o.tok[i] = out_f->tok[i]; o.lp[i] = out_f->lp[i]; }
+                return o;
+            };
+            if (R == 0) fprintf(stderr, "# flash serve: DFlash2 for a session alone (k <= %d)%s\n", dfl_k,
+                                h.dsel.on ? ", drafter choice on" : "");
+        };
         // GR8_GLM53F_KV_CHUNKS=1 (borrow-idle): hooks serve_flash adds to its own before the service starts
         auto flash_install = [&](g6s2::NativeHooks& h) {
+            if (dfl) dfl_install(h);
             // GR8_GLM53F_KV_CHUNKS=1: a Resize event on tier FLASH_KV_TIER takes every model's chunk map to r.segs chunks
             // online, on every rank at the commit (flash_kv.h; with GR8_GLM53F_KV_LEDGER the bytes move through the box's
             // host ledger). The head announces them under FLASH_CAP_POLICY=borrow-idle (GR8_GLM53F_KV_LEND_MS > 0, s2/flash_lend.h):
@@ -2058,6 +2142,7 @@ int main(int argc, char** argv)
         bc.timeout = (unsigned)knob::s2_timeout();
         bc.runtime_signature = std::string(s2sess > 1 ? "ds41 sessions " + std::to_string(s2sess) : std::string("ds41 solo")) + " cap " + std::to_string(cap) + " layers " + layers_s + " mtp " + std::to_string(dsk.mtp) +
             " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id +
+            (dfl ? " dflash k " + std::to_string(dfl_k) : std::string()) +
             " shtc " + std::to_string(ds41moe::sh_tc_on() ? 1 : 0) +   // GR8_DS_SH_TC: ranks must agree (W8A8 shared expert, not bit-identical to 0)
             (ds41moe::ro_l2hint() ? " l2h " + std::to_string(ds41moe::ro_l2hint()) : std::string()) +   // GR8_DS_MOE_L2HINT: 0 adds nothing; ranks that disagree on 1 / 2 refuse to join
             (ds41moe::ro_fc2stg() ? std::string(" stg 1") : std::string()) +   // GR8_DS_MOE_FC2STG: 0 adds nothing; ranks that disagree refuse to join
