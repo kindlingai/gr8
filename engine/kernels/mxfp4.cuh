@@ -184,26 +184,64 @@ __global__ void build_xfrag(const __nv_bfloat16* x, int M, int K1, u32* xfrag) {
 __global__ void build_xfrag_p(const __nv_bfloat16* x, int M, int K1, u32* xfrag) { build_xfrag_body<1>(x, M, K1, xfrag); }
 
 // ---------------------------------------------------------------------------------------------------- fc1
+// Burst-exact loads (tuning-toolkit Phase 2). A gate/up record pair is 1088 B = 17 DRAM bursts of 64 B, 64 B aligned (the image aligns
+// each tensor to 4096). Two Grp::load calls ask for burst 8 (gate scales + up codes 0..31) and burst 16 (up codes 480..511 + up scales)
+// with two load instructions each, and each of those half-burst requests costs a whole burst (1-GPU probe: fc1 at ~86% of the plain
+// stream rate). Pair::load asks for every burst once (A = [0,512), B = [512,1024), C = [1024,1088)), and frag() rebuilds, with warp
+// shuffles, exactly the two Grp that Grp::load gives this lane, so the mma inputs and the summation order are unchanged (bit-identical).
+struct Pair
+{
+    u32 A[4], B[4], C[4];
+    __device__ __forceinline__ void load(const uint8_t* p, int lane)
+    {
+        ld4(p + lane * 16, A);
+        ld4(p + 512 + lane * 16, B);
+        ld4(p + 1024 + ((lane + 2) & 3) * 16, C);   // lanes 30, 31 get up codes 480..511, lanes 0 and 1 the 32 B of up scales
+    }
+    __device__ __forceinline__ void frag(int lane, Grp& g, Grp& u) const
+    {
+        const int src = lane >> 4, w = (lane >> 2) & 3;   // scale word of rows r, r + 8: 16 B unit src of the scale block, word w
+        u32 b[4], c[4];
+        #pragma unroll
+        for (int k = 0; k < 4; ++k)
+        {
+            g.c[k] = A[k];
+            b[k] = __shfl_sync(~0u, B[k], src);
+            c[k] = __shfl_sync(~0u, C[k], src);
+            const u32 d = __shfl_down_sync(~0u, B[k], 2);
+            u.c[k] = lane < 30 ? d : C[k];
+        }
+        g.s = w == 0 ? b[0] : w == 1 ? b[1] : w == 2 ? b[2] : b[3];
+        u.s = w == 0 ? c[0] : w == 1 ? c[1] : w == 2 ? c[2] : c[3];
+    }
+};
+
 // One warp part: gate and up rows of one 16-row chunk over NGP records starting at record g0 (k16 step ks0).
-// s = the chunk's stream at record g0, records 2 GR apart. DEPTH records of gate and of up are in flight per lane.
+// s = the chunk's stream at record g0, records 2 GR apart. DEPTH gate/up pairs are in flight per lane.
 template <int NGP, int DEPTH, bool PROBE>
 __device__ __forceinline__ void fc1_part(const uint8_t* s, const u32* bf, int lane, int ks0, float (&ag)[4], float (&au)[4])
 {
-    Grp ng[DEPTH], nu[DEPTH];
+    Pair nx[DEPTH];
     #pragma unroll
     for (int p = 0; p < DEPTH; ++p)
-        if (p < NGP) { ng[p].load(s + p * 2 * GR, lane); nu[p].load(s + p * 2 * GR + GR, lane); }
+        if (p < NGP) nx[p].load(s + p * 2 * GR, lane);
     for (int g = 0; g < NGP; g += DEPTH)
     {
-        Grp cg[DEPTH], cu[DEPTH];
+        Pair cur[DEPTH];
         #pragma unroll
-        for (int p = 0; p < DEPTH; ++p) { cg[p] = ng[p]; cu[p] = nu[p]; }
-        #pragma unroll
-        for (int p = 0; p < DEPTH; ++p)
-            if (g + DEPTH + p < NGP) { ng[p].load(s + (g + DEPTH + p) * 2 * GR, lane); nu[p].load(s + (g + DEPTH + p) * 2 * GR + GR, lane); }
+        for (int p = 0; p < DEPTH; ++p) cur[p] = nx[p];
         #pragma unroll
         for (int p = 0; p < DEPTH; ++p)
-            if (g + p < NGP) { cg[p].template run<PROBE>(bf, ks0 + (g + p) * 4, ag); cu[p].template run<PROBE>(bf, ks0 + (g + p) * 4, au); }
+            if (g + DEPTH + p < NGP) nx[p].load(s + (g + DEPTH + p) * 2 * GR, lane);
+        #pragma unroll
+        for (int p = 0; p < DEPTH; ++p)
+            if (g + p < NGP)
+            {
+                Grp cg, cu;
+                cur[p].frag(lane, cg, cu);
+                cg.template run<PROBE>(bf, ks0 + (g + p) * 4, ag);
+                cu.template run<PROBE>(bf, ks0 + (g + p) * 4, au);
+            }
     }
 }
 
@@ -255,6 +293,51 @@ __global__ void __launch_bounds__(KS * CW * 32) k_fc1(Args A)
     a0[I + 8] = __float2half_rn(swiglu_lim(ag[3], au[3], A.limit));
 }
 
+// fc2 burst-exact span (tuning-toolkit Phase 2). A tile's NG records (NG x 544 B) start 0 or 32 B into a burst (32 when ot * NG is
+// odd). The warp reads the burst-aligned span from the tile start (minus 32 B when odd), rounded up to whole bursts, as aligned 512 B
+// loads, one instruction a burst; the one burst two tiles share is read by both warps. Record j = 34 16 B units from unit 34 j + O:
+// its codes come from loads qa, qa + 1 and its scales from load qa + 1, rebuilt with warp shuffles into exactly the Grp a Grp::load
+// of the record gives this lane (bit-identical). Steps [T0, T1): step t issues load t (t < NL), then hands f every record whose
+// last load is t - PD (PD loads ahead).
+template <int NREC, int O> struct SpanBx
+{
+    static constexpr int NU = (NREC * (GR / 16) + O + 3) / 4 * 4, NL = (NU + 31) / 32, TL = NU - 32 * (NL - 1);
+};
+template <int NREC, int O, int PD, int T0, int T1, int NL, class F>
+__device__ __forceinline__ void span_bx(const uint8_t* a, int lane, u32 (&R)[NL][4], F&& f)
+{
+    static_assert(GR == 544 && SOFF == 512 && NL == SpanBx<NREC, O>::NL, "span_bx: 34-unit records");
+    constexpr int TL = SpanBx<NREC, O>::TL;
+    #pragma unroll
+    for (int t = T0; t < T1; ++t)
+    {
+        if (t < NL)
+        {
+            if (t < NL - 1 || lane < TL) ld4(a + t * 512 + lane * 16, R[t]);
+            else R[t][0] = R[t][1] = R[t][2] = R[t][3] = 0u;
+        }
+        #pragma unroll
+        for (int j = 0; j < NREC; ++j)
+        {
+            const int u0 = 34 * j + O, qa = u0 >> 5, sh = u0 & 31;
+            if (qa + 1 + PD != t) continue;
+            const int src = (sh + lane) & 31, ss = sh + (lane >> 4), w = (lane >> 2) & 3;
+            Grp r;
+            u32 q[4];
+            #pragma unroll
+            for (int k = 0; k < 4; ++k)
+            {
+                const u32 v0 = __shfl_sync(~0u, R[qa][k], src);
+                const u32 v1 = sh ? __shfl_sync(~0u, R[qa + 1][k], src) : v0;
+                r.c[k] = lane < 32 - sh ? v0 : v1;
+                q[k] = __shfl_sync(~0u, R[qa + 1][k], ss);
+            }
+            r.s = w == 0 ? q[0] : w == 1 ? q[1] : w == 2 ? q[2] : q[3];
+            f(j, r);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------- fc2
 // CTA = one slot x WARPS output tiles (a warp each, all k). The slot's activations become a B fragment table in smem.
 // grid = n_slots * (NOUT / 16 / WARPS).
@@ -275,11 +358,18 @@ __global__ void __launch_bounds__(WARPS * 32) k_fc2(Args A)
     const int ot = (blockIdx.x % UPS) * WARPS + warp;
     const size_t eb = static_cast<size_t>(A.slot_expert[slot]) * OT * NG * GR;
     const uint8_t* s = A.fc2 + eb + static_cast<size_t>(ot) * NG * GR;
-    // issue the first records before the table build so their latency overlaps it
-    Grp nx[DEPTH];
-    #pragma unroll
-    for (int p = 0; p < DEPTH; ++p)
-        if (p < NG) nx[p].load(s + p * GR, lane);
+    // burst-exact span walk (span_bx); the first DEPTH 512 B loads go out before the table build so their latency overlaps it
+    using S0 = SpanBx<NG, 0>;
+    using S1 = SpanBx<NG, 2>;
+    static_assert(S0::NL == S1::NL, "fc2 span: odd and even tiles take the same loads");
+    constexpr int NL = S0::NL;
+    const bool odd = (ot * NG) & 1;
+    u32 R[NL][4];
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    const u32* bf = sb + lane * 2;
+    auto f = [&](int j, const Grp& r) { r.template run<PROBE>(bf, j * 4, acc); };
+    if (odd) span_bx<NG, 2, DEPTH, 0, DEPTH>(s - 32, lane, R, f);
+    else span_bx<NG, 0, DEPTH, 0, DEPTH>(s, lane, R, f);
     pdl_wait();
     for (int i = threadIdx.x; i < KSI * 64; i += WARPS * 32)
     {
@@ -287,20 +377,8 @@ __global__ void __launch_bounds__(WARPS * 32) k_fc2(Args A)
         sb[i] = __ldcg(reinterpret_cast<const u32*>(A.act + (static_cast<size_t>(slot) * 8 + (l >> 2)) * I + ks * 16 + reg * 8 + 2 * (l & 3)));
     }
     __syncthreads();
-    const u32* bf = sb + lane * 2;
-    float acc[4] = {0.f, 0.f, 0.f, 0.f};
-    for (int g = 0; g < NG; g += DEPTH)
-    {
-        Grp cur[DEPTH];
-        #pragma unroll
-        for (int p = 0; p < DEPTH; ++p) cur[p] = nx[p];
-        #pragma unroll
-        for (int p = 0; p < DEPTH; ++p)
-            if (g + DEPTH + p < NG) nx[p].load(s + (g + DEPTH + p) * GR, lane);
-        #pragma unroll
-        for (int p = 0; p < DEPTH; ++p)
-            if (g + p < NG) cur[p].template run<PROBE>(bf, (g + p) * 4, acc);
-    }
+    if (odd) span_bx<NG, 2, DEPTH, DEPTH, NL + DEPTH>(s - 32, lane, R, f);
+    else span_bx<NG, 0, DEPTH, DEPTH, NL + DEPTH>(s, lane, R, f);
     const int r = lane >> 2, c = lane & 3, o = ot * 16 + r, mask = A.slot_mask[slot];
     const float* w = A.slot_w + slot * 8;
     __half* y = A.ypart + static_cast<size_t>(slot) * 8 * NOUT;
