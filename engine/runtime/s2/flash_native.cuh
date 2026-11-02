@@ -281,6 +281,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         const auto& out = *(d ? c.draft_output : c.output);
         require(!out.attn_err, "Flash step attention error");
         if (!d) {
+            g6rt::evprof_read(si.M, c.stream, c.main.rank);
             lp_rows = 0;
             if (std::any_of(l.samples.begin(), l.samples.end(), [](const Sampling& s) { return s.lp >= 0 || s.plp >= 0; })) {
                 lp_fetch(c.main, out, si, lp); lp_rows = si.M;
