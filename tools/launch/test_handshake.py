@@ -166,6 +166,23 @@ class HandshakeTests(unittest.TestCase):
         finally:
             f.close()
 
+    def test_wait_told_ends_when_every_worker_has_the_refusal(self):
+        f = Fixture()
+        try:
+            ts, _ = f.send_all([hello(1, opts={'CAP': '4'}), hello(2)])
+            for t in ts:
+                t.join(20)
+            self.assertFalse(f.head.wait_told(0.2))
+            ts2, _ = f.send_all([hello(3)])
+            for t in ts2:
+                t.join(20)
+            self.assertTrue(f.head.wait_told(5))
+        finally:
+            f.close()
+
+    def test_wait_told_with_no_ranks_returns_at_once(self):
+        self.assertTrue(H.Head.refusing({'t': 'refused', 'field': 'head', 'values': {}}).wait_told(60))
+
     def test_hello_after_the_boot_is_refused(self):
         f = Fixture()
         try:

@@ -742,10 +742,14 @@ class Supervisor:
         return v
 
     def linger(self):
-        """Answer late hellos and polls with the head's refusal for a while before leaving."""
+        """Answer late hellos and polls with the head's refusal for GR8_REFUSAL_LINGER seconds, then on until every
+        worker has it (a box still fetching says hello late), at most JOIN_TIMEOUT more, before leaving."""
         if not self.lingered:
             self.lingered = True
-            self.stop_ev.wait(float(os.environ.get('GR8_REFUSAL_LINGER', '15')))
+            if self.stop_ev.wait(float(os.environ.get('GR8_REFUSAL_LINGER', '15'))):
+                return
+            if self.head is not None:
+                self.head.wait_told(opt_timeout(self.o), self.stop_ev)
 
     def rail_check(self, rails):
         """From each of the head's rails to the same rail of every worker (rails: every rank's pair): the control port
