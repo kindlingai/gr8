@@ -28,34 +28,38 @@ words to `EXTRA_ENV` (`"A=1 B=2"`, every rank).
 
 ### Q1. Faster writing for a small quality loss?
 
-> "Do you want DeepSeek to write about 40-50% faster on prose and code? The cost: its output is no longer the exact
-> model's, and our 75-item check went from 73 to 71 right."
+> "Do you want DeepSeek to write faster: about 40-50% on long replies, 20% (code) to 50% (prose) on short ones? The
+> cost: its output is no longer the exact model's, and our 75-item check went from 73 to 71 right."
 
 - Default: no.
 - Yes: `GR8_DS_RELAXED_ACCEPT=topp:0.9,ratio:0.1 GR8_DS_MOE_TOPK_DECODE=4`.
-- Measured against `main` at ca24fdd0, two boots: code +41%, prose +50%, structured output +23% (long replies);
-  on short 256-token replies code +21%, prose +51%. Prompt reading (prefill) does not change. Quality 73 -> 71 of 75.
-- Half-way: `GR8_DS_RELAXED_ACCEPT=topp:0.9,ratio:0.1` alone gave code +28%, prose +29%, 72 of 75.
-  `GR8_DS_MOE_TOPK_DECODE=4` alone gave prose +17%, structured +16%, code within noise, 72 of 75.
+- Measured against `main` at ca24fdd0, two boots. Long replies: code +41%, prose +50%, structured output +23%.
+  Short 256-token replies: code +21%, prose +51%. Prompt reading (prefill) does not change. Quality 73 -> 71 of 75.
+- Half-way, one switch alone (one boot each, 72 of 75 for both):
+  - `GR8_DS_RELAXED_ACCEPT=topp:0.9,ratio:0.1`: long replies code +28%, prose +29%; short replies prose +20%, code
+    within noise.
+  - `GR8_DS_MOE_TOPK_DECODE=4`: short replies code +15%, prose +13%, structured +13%; long replies prose +17%,
+    structured +16%, code within noise.
 
 ### Q2. A smaller output head?
 
-> "Do you want about 2-4% faster writing? The answers change a little in wording; quality stayed the same."
+> "Do you want about 2-4% faster writing? Some answers change (13 of 75 in our check); quality did not drop."
 
 - Default: no.
 - Yes: `GR8_DS41_HEAD_MX=1` (the decode head in MXFP8, a little over half the bytes).
-- Measured: a decode round 3.7% shorter (4 boots), new-text decode +2.4%. Quality 72 of 75 both ways; 13 of 75
-  answers changed wording (one more passed, one failed both ways).
+- Measured: a decode round 3.7% shorter (4 boots), new-text decode +2.4%. Quality 71 -> 72 of 75; 13 of 75 answers
+  changed.
 
 ### Q3. Several chats at once: first word sooner, or each chat faster?
 
-> "When several chats start together, do you want each to show its first word sooner (about 3-5x), if each chat then
-> writes about 9% slower?"
+> "When several chats start together, do you want each to show its first word sooner (about 3x with 4 chats, 5x with
+> 8), if with 4 chats each one then writes about 9% slower?"
 
 - Default: no (each chat faster).
 - Yes: `GR8_S2_ADMIT_HOLD=1 GR8_S2_TAIL_FIRST=1`.
-- Measured with 4 chats: median first word 648 -> 209 ms, each chat 75.7 -> 68.6 tokens/s. With 8 chats: 1,656 ->
-  310 ms. The answers did not change. (Measured with Q1's switches on.)
+- Measured with 4 chats: median first word 648 -> 209 ms; each chat's median rate 75.7 -> 68.6 tokens/s; all 4 chats
+  together +15%. With 8 chats: first word 1,656 -> 310 ms; all 8 together +5.5%. The answers did not change.
+  (Measured with Q1's switches on.)
 
 ### Q4. A long prompt arrives while other chats write: keep them smooth, or answer it sooner?
 
@@ -76,8 +80,7 @@ words to `EXTRA_ENV` (`"A=1 B=2"`, every rank).
 
 - A `ds41` request holds at most 163,830 tokens (prompt and reply). A 34K-token prompt shows its first word in about
   9 s, a 139K-token prompt in about 37 s; writing then runs at the same speed as after a short prompt.
-- Quality and speed depend on what is asked: prose decodes slower than code, because the drafts are accepted less
-  often.
+- Speed depends on what is asked: prose decodes slower than code.
 
 ## 4. After the answers
 
