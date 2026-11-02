@@ -254,11 +254,15 @@ engine_defaults() {
 # GLM-5.3-Flash: the prefill speed stack at top-k 8 (docs/FLASH.md). GR8_PF_RS, GR8_PF_OWN and CP stay off.
 flash_env() {
   ENGINE_BIN=g6m4_flash
+  # TP=4: mHC sequence-parallel (partials reduce-scatter, each owner runs mHC on its rows, the rows all-gather), which
+  # sends a quarter of the bytes and replaces the peer-partial staging: 8K prefill 2,151 -> 2,533 tok/s
+  local sp=0 stage=1
+  [ "$TP" = 4 ] && sp=1 stage=0
   ENGINE_ENV="GR8_CP=0 GR8_PF_RS=0 GR8_PF_OWN=0 GR8_GLM53F_PF_POOL_OWNER=0 GR8_FPF_P1=0 GR8_FPF_DSA_P1=0 \
 GR8_FPF_ATTN_P1=0 GR8_GLM53F_PF_SPARSE_MLA=1 GR8_GLM53F_PF_SPARSE_MLA_512=1 \
 GR8_GLM53F_PF_SPARSE_MLA_V2=1 GR8_GLM53F_PF_SPARSE_MLA_H16C=1 GR8_PF_DTR8=1 GR8_GLM53F_PF_SHFP8=1 GR8_PF_FC2V2=1 GR8_GLM53F_PF_KDA_WS=1 \
 GR8_GLM53F_PF_DSA_FULL_GV=1 GR8_PF_ROUTER_SPLIT=1 GR8_GLM53F_PF_DSA_F16GEMM=1 GR8_GLM53F_PF_PREWARM=1 GR8_GLM53F_PF_MHC_STAGE=1 GR8_GLM53F_PF_MHC_FUSE=2 \
-GR8_GLM53F_PF_STAGE_ASYNC=1"
+GR8_GLM53F_PF_STAGE_ASYNC=$stage GR8_GLM53F_PF_SP=$sp"
   # the peer-partial staging (GR8_GLM53F_PF_STAGE_ASYNC) runs at any rank count; the G9 KDA scan is a precision arm, not the
   # same bytes as the scan it replaces, so it stays where it was chosen: TP2 (it would change TP4's output)
   [ "$TP" = 4 ] || ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_KDA_SCAN=1 GR8_GLM53F_KDA_VS=2"

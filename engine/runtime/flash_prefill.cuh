@@ -1065,7 +1065,9 @@ inline void pf_sp_own(Model& m, FlashPrefill& P, int i, int c, int M, cudaStream
         __nv_bfloat16* own = slot_own ? reinterpret_cast<__nv_bfloat16*>(const_cast<char*>(slot_own)) : P.part[c] + r * HID;
         MhcFabricPeerBlock blk{MhcFabricBlock{P.f, P.stepp, crs, 0, own}};
         for (int p = 0; p < nr; ++p) blk.peers[p] = P.sp_peer[p];
-        if (pf_sp_agd())   // GR8_GLM53F_PF_SP_AGD: this lane's AG send slot of the current step (glue::send_slot)
+        // GR8_GLM53F_PF_SP_AGD: this lane's AG send slot of the current step (glue::send_slot). Not after the last layer:
+        // the final norm rows must land in xn, which the MTP draft prefill and the head read
+        if (pf_sp_agd() && !(c == 1 && i + 1 >= m.nl))
         {
             char* slot = P.f.send + ((size_t)(P.cur_step & 1) * P.f.ncoll + cag) * P.f.stride;
             if (pf_sp_x16_layer(m, P, i, c, M)) V.agd_x = reinterpret_cast<__half*>(slot);
