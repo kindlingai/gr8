@@ -772,7 +772,8 @@ __global__ void __launch_bounds__(THREADS, 2) k_mhc_consume_fused(
     __half* out, float* normalized=nullptr, unsigned* f16=nullptr, unsigned* bf16=nullptr) {
     __shared__ float sh_pre[4];
     __shared__ int sh_last;
-    const int o=blockIdx.x, m=blockIdx.y, M=gridDim.y;
+    // grid (rows, 24): every row's CTA 0 (the one the other 23 of its row wait for) is in the first wave
+    const int m=blockIdx.x, o=blockIdx.y, M=gridDim.x;
     const unsigned long long step = block.init();
     const unsigned seq32 = block.seq32(step);
     float* __restrict__ s = b.streams + (size_t)m*4*H;

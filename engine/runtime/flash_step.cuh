@@ -224,7 +224,7 @@ struct MhcFabricStagedBlock : MhcFabricBlock {
     __device__ __forceinline__ void wait(u64 step) {
         MhcFabricBlock::wait(step);
         __shared__ uint4 slots[g6nr::NR][512];
-        const int m=blockIdx.y;
+        const int m=blockIdx.x;
         #pragma unroll
         for(int p=0;p<g6nr::NR;++p) {
             const uint4* src=reinterpret_cast<const uint4*>(base[p]+(size_t)m*4096);
@@ -267,11 +267,11 @@ inline void launch_consume_mhc(Model& m,int c,int M,cudaStream_t st) {
         if (mhc_fuse == 2 && HID == 4096) {
             dmark(DP_MHC_OI,st);
             if(stage) {
-            flash_mhc::k_mhc_consume_fused<<<dim3(geom::HC_MIX,M),flash_mhc::THREADS,0,st>>>(
+            flash_mhc::k_mhc_consume_fused<<<dim3(M,geom::HC_MIX),flash_mhc::THREADS,0,st>>>(
                 flash_mhc::side(mhc_buffers(m),c&1),MhcFabricStagedBlock{MhcFabricBlock{m.f,m.stepp,c,wp}},m.layers[i].hc[1],HID,geom::RMS_EPS_FLASH,
                 m.x2,m.xn2,m.sc.xf_x2,m.sc.xb_x2);
             } else {
-            flash_mhc::k_mhc_consume_fused<<<dim3(geom::HC_MIX,M),flash_mhc::THREADS,0,st>>>(
+            flash_mhc::k_mhc_consume_fused<<<dim3(M,geom::HC_MIX),flash_mhc::THREADS,0,st>>>(
                 flash_mhc::side(mhc_buffers(m),c&1),MhcFabricBlock{m.f,m.stepp,c,wp},m.layers[i].hc[1],HID,geom::RMS_EPS_FLASH,
                 m.x2,m.xn2,m.sc.xf_x2,m.sc.xb_x2);
             }
@@ -284,11 +284,11 @@ inline void launch_consume_mhc(Model& m,int c,int M,cudaStream_t st) {
         if (mhc_fuse == 2 && HID == 4096) {
             dmark(DP_MHC_OI,st);
             if(stage) {
-            flash_mhc::k_mhc_consume_fused<<<dim3(geom::HC_MIX,M),flash_mhc::THREADS,0,st>>>(
+            flash_mhc::k_mhc_consume_fused<<<dim3(M,geom::HC_MIX),flash_mhc::THREADS,0,st>>>(
                 flash_mhc::side(mhc_buffers(m),c&1),MhcFabricStagedBlock{MhcFabricBlock{m.f,m.stepp,c,wp}},m.layers[i+1].hc[0],HID,geom::RMS_EPS_FLASH,
                 m.x,m.xn,m.sc.xf_x,m.sc.xb_x);
             } else {
-            flash_mhc::k_mhc_consume_fused<<<dim3(geom::HC_MIX,M),flash_mhc::THREADS,0,st>>>(
+            flash_mhc::k_mhc_consume_fused<<<dim3(M,geom::HC_MIX),flash_mhc::THREADS,0,st>>>(
                 flash_mhc::side(mhc_buffers(m),c&1),MhcFabricBlock{m.f,m.stepp,c,wp},m.layers[i+1].hc[0],HID,geom::RMS_EPS_FLASH,
                 m.x,m.xn,m.sc.xf_x,m.sc.xb_x);
             }
