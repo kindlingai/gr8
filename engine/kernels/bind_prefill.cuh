@@ -5433,7 +5433,7 @@ template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_
 template <int EB = g6nr::EB> inline void launch_mid(const Expert& A, cudaStream_t st)
 {
 #if G6_MODEL_FLASH
-    if (A.on && A.h16) { k_pf_mid<EB, true><<<((A.nroutes ? A.nroutes : A.M * TOPK) * EB + 7) / 8, 256, 0, st>>>(A); return; }
+    if (A.on && A.h16 && !A.wtk) { k_pf_mid<EB, true><<<((A.nroutes ? A.nroutes : A.M * TOPK) * EB + 7) / 8, 256, 0, st>>>(A); return; }
 #endif
     if (A.on) k_pf_mid<EB><<<((A.nroutes ? A.nroutes : A.M * TOPK) * EB + 7) / 8, 256, 0, st>>>(A);
 }
@@ -6125,16 +6125,14 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
 #ifdef PF_F12
         A.f12 = knob::pf_f12().value_or(true) ? 1 : 0;   // compiled in: on unless GR8_PF_F12=0
 #endif
-#if !G6_MODEL_FLASH
         // GR8_PF_WT: the expert-tile kernels take block-scale layers whose K2 / K3 units are in the wide order (or K4-only
-        // layers); the Flash fp16 passes keep their own kernels
-        if (bsf && knob::pf_wt() && ((!T.k2 && !T.k3) || (T.fc1_wide && T.fc2_wide)))
+        // layers). Flash: not with GR8_PF_ROUTER_SPLIT, whose route tables never fill the tile list
+        if (bsf && knob::pf_wt() && ((!T.k2 && !T.k3) || (T.fc1_wide && T.fc2_wide)) && !(G6_MODEL_FLASH && knob::pf_router_split()))
         {
             A.wtk = 1;
             A.wtiles = sc.wtiles; A.n_wtiles = sc.n_wtiles; A.rr_wp = sc.rr_wp; A.hq8 = sc.hq8; A.hs8 = sc.hs8;
             A.wtc = knob::pf_wt_fuse() ? 1 : 0; A.wt_gmajor = knob::pf_wt_gmajor() ? 1 : 0; A.cnt_tg = sc.cnt_tg;
         }
-#endif
         if (T.sh_trellis && T.sh_fp8)
         {
             if (tab.shape[0] != NEXP + 1) return "trellis shared expert without tr3.table row NEXP";
