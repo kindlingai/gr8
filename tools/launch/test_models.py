@@ -35,12 +35,13 @@ class OptionTests(unittest.TestCase):
 
     def test_refusals(self):
         for argv, want in ((['--tp', '6'], 'want 4, 3 or 2 (glm53f)'), (['--kv-format', 'int4'], 'fp8 KV build only'),
-                           (['--dflash', '1'], 'no DFlash2 drafter'),
-                           (['--drafter', 'https://huggingface.co/a/b'], 'no DFlash2 drafter')):
+                           (['--tp', '3', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3', '--drafter', 'https://huggingface.co/a/b'],
+                            'runs at TP=4 (split) and TP=6')):
             with self.assertRaises(opt.OptionError) as e:
                 flash(*argv)
             self.assertIn(want, str(e.exception))
         for argv, want in ((['--reuse', '1'], 'GLM-5.3-Flash has no REUSE'), (['--sess', '9'], 'serves 1 to 8 sessions'),
+                           (['--tp', '2', '--peers', '10.0.0.1,10.0.0.2', '--dflash', '1'], 'drafter at TP=4'),
                            (['--sess', '0'], 'serves 1 to 8 sessions'),
                            (['--sess', '8', '--mtp', '4'], 'a round of 40 rows')):
             with self.assertRaises(opt.OptionError) as e:
@@ -108,6 +109,14 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(plan['knobs']['SHARE_LIMIT'], '32768')
             plan = opt.engine_plan(flash('--cap', '131072', peers=peers))
             self.assertEqual(plan['args'][plan['args'].index('--cap') + 1], '131072')
+
+    def test_dflash(self):
+        # DFLASH=1 (TP=4): the drafter packs and the adaptive draft count; off by default
+        self.assertEqual(opt.engine_plan(flash())['knobs']['DFLASH'], '0')
+        plan = opt.engine_plan(flash('--dflash', '1', '--dflash-dir', '/d'))
+        a = ' '.join(plan['args'])
+        self.assertIn('--dflash-manifest @DFLASH_DIR/dflash.r@R.manifest.json --dflash-pack @DFLASH_DIR/dflash.r@R.pack', a)
+        self.assertIn('--spec-adaptive', a)
 
     def test_sessions(self):
         # SESS 2..8 share decode steps (each session its own KDA slots); a round of every session fits 32 rows
@@ -317,7 +326,7 @@ class RequiredTests(unittest.TestCase):
         self.assertIn('TP=3 bit225 else down1', glm)
         self.assertIn(models.GLM53.release, glm)
         self.assertIn('--tp       4, 3 or 2', flash)
-        self.assertNotIn('--drafter', flash)
+        self.assertIn('--drafter URL (DFlash2)', flash)
         self.assertEqual(models.SERVED, (models.GLM53, models.GLM53F))
 
 

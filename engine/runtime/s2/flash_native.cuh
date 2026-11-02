@@ -394,6 +394,9 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         const int nbk = c.main.nbk;
         require(nbk >= 1 && nbk == c.draft.d.nbk && nbk <= NBK, "Flash main/draft context buckets differ");
         const FlashShapes f = flash_shapes(int(sc.limit()), int(sc.mtp), chunk, knob::s2_adapt(), MX);
+        // the batched graphs carry no DFlash2 taps (their rows outnumber Dfl::feat's 8); the solo graphs keep them
+        auto* const tap = c.main.dfl_tap;
+        c.main.dfl_tap = nullptr;
         const auto t0 = std::chrono::steady_clock::now();
         size_t free0 = 0, total = 0, free1 = 0; G6RT_CK(cudaMemGetInfo(&free0, &total));
         c.main.s2on = c.draft.d.s2on = true; fence();
@@ -421,6 +424,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             for (int M : f.chains) one(true, true, M, k);
         }
         fence();
+        c.main.dfl_tap = tap;
         G6RT_CK(cudaMemGetInfo(&free1, &total));
         if (c.main.rank == 0)
             fprintf(stderr, "# flash serve capture: %zu shapes x %d buckets (main %zu draft %zu chain %zu; %u sessions, mtp %u, chunk %d) "
