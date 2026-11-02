@@ -155,7 +155,7 @@ ds41_defaults() {
   # test_models.py holds the refusals.
   [ "$MTP" = 0 ] || { echo "engine_defaults: MTP=$MTP: DeepSeek-V4.1-Flash-1017 serves with MTP=0 (DSpark serve is not built)" >&2; return 2; }
   case ${KV_STORE:-} in ''|off) ;; *) echo "engine_defaults: KV_STORE=$KV_STORE: DeepSeek-V4.1-Flash-1017 has no KV store" >&2; return 2 ;; esac
-  local kv kvs engram=0 prefix=0 pmin=2 dsmtp=5 pw=1024
+  local kv kvs engram=0 prefix=0 pmin=2 dsmtp=5 pw=4096
   read -ra kvs <<<"${EXTRA_ENV:-}"
   for kv in ${kvs[@]+"${kvs[@]}"}; do
     case $kv in
@@ -187,13 +187,17 @@ ds41_defaults() {
   # prefill 2,102 -> 3,288 tok/s, 2 / 4 stream aggregates 51 / 72 -> 87 / 113 tok/s; same operands, another summation order, so
   # the partials' bytes change (the tokens at temperature 0 did not). GR8_DS_MOE_TC=1 runs the routed experts of a prefill chunk on
   # the block-scaled tensor cores with MXFP8 activations: 8K prefill 3,265 -> 3,820 tok/s, 32K 3,375 -> 3,920, decode unchanged;
-  # the expert outputs move by about 5% RMS (E4M3 rounding). A variable EXTRA_ENV names keeps its value; GR8_DS_ATTN_PW and
-  # GR8_DS41_IDX_PW follow GR8_DS_PREFILL_W.
+  # the expert outputs move by about 5% RMS (E4M3 rounding). W = 4096 with GR8_DS_PF_POOL=4: 32K prefill +4.6% over W = 1024, 8K
+  # within the boot spread. GR8_DS_SRC_FAST=3: decode +3.4 to +3.8% (bit 1 gives the same bytes; bit 2 sums in another order, the
+  # qeval answers did not change). GR8_DS_MOE_PDL=1: decode +0.6 to +1.4%. GR8_DS41_ADMIT_KEEP_SCRATCH=1: a request starts 12-17 ms
+  # sooner. GR8_DS41_PUB16=1 and GR8_DS41_GV_QUAD=1: a decode round -0.9 to -1.3% and -1.6 to -1.8%, the same bytes. A variable
+  # EXTRA_ENV names keeps its value; GR8_DS_ATTN_PW and GR8_DS41_IDX_PW follow GR8_DS_PREFILL_W.
   DS41_TUNED=
   for kv in GR8_DS_MTP=5 GR8_DS_ENGRAM_MTP=1 GR8_DS_PREFILL_MIN=2 GR8_DS_PREFILL_W=$pw GR8_DS_ATTN_PW=$pw GR8_DS41_IDX_PW=$pw \
       GR8_DS_PF_LANES=2 GR8_DS_PF_RS=1 GR8_DS_PF_DIRECT=1 GR8_DS_PF_GATHER=1 GR8_DS_PF_LATE_FINAL=1 GR8_DS_WAIT_K=2 GR8_DS_DEC_STAGE=1 \
       GR8_DS_ATTN_CPA=1 GR8_DS_DSP_GV=1 GR8_DS_RO_ORDER=1 GR8_DS_GATE_RO=1 GR8_DS_ENGRAM_LOOKAHEAD=1 GR8_DS_ATTN_TC=1 \
-      GR8_DS_MOE_TC=1; do
+      GR8_DS_MOE_TC=1 GR8_DS_PF_POOL=4 GR8_DS_SRC_FAST=3 GR8_DS_MOE_PDL=1 GR8_DS41_ADMIT_KEEP_SCRATCH=1 GR8_DS41_PUB16=1 \
+      GR8_DS41_GV_QUAD=1; do
     case " ${EXTRA_ENV:-} " in *" ${kv%%=*}="*) ;; *) DS41_TUNED="$DS41_TUNED$kv " ;; esac
   done
   S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=${REUSE:-1}
