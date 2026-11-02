@@ -41,6 +41,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # fetches the drafter from its own repo and converts its rank with bin/g6load dflash2
 # (engine/loader-rs/src/dflash2.rs).
 DRAFTER_URL = 'https://huggingface.co/incoai/GLM-5.3-DFlash2'
+FLASH_DRAFTER_URL = 'https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2'
 META_FILES = ('config.json', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja')
 CHUNK = 64 << 20
 

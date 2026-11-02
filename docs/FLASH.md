@@ -32,7 +32,8 @@ own metadata (`hidden_size` 4096) and maps Flash's tensors with `engine/loader-r
 
 - `./gr8 glm53f up` boots in about 16 s from a local cache and passes `./gr8 glm53f smoke`.
 - TP=4 prefill of an 8K prompt: about 3.55 s at 2200 MHz.
-- One session at a time, with MTP=1 (`flash_defaults` in `scripts/engine_args.sh`).
+- 8 sessions at TP=4 and 4 at TP=3 share decode steps (below), with MTP=1 (`flash_defaults` in `scripts/engine_args.sh`).
+- At TP=4 a session that runs alone drafts with the DFlash2 drafter when the boot has one: `--drafter https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2` (below).
 
 ## Context
 
@@ -88,6 +89,18 @@ rounds share main and draft steps, and their KV runs share the `CAP` pool (`--s2
 
 The memory these take (slots and graphs), the speed of shared steps and the output of sessions sharing steps have not
 been measured on Flash yet.
+
+## DFlash2
+
+At TP=4 a session that runs alone drafts with the DFlash2 block drafter, as on GLM-5.3 (`s2_batch.h`, `Batch::dflash`).
+When a second session arrives it moves to MTP, and the sessions share steps. `--spec-adaptive` (on with the drafter) picks
+each round's draft count from the verify table in `spec_len.h` (`flash_cost`), and the drafter choice (`GR8_S2_DSEL`) runs
+MTP rounds when they commit more tokens a millisecond, which they do on prose. A DFlash2 round writes up to 8 rows, so
+the KDA ring holds 8 slots a session (`Model::kda_ring`) and the scheduler keeps 14 guard rows (`Config::guard_tokens`).
+The prefill fills the drafter's prompt context; the batched graphs of several sessions carry no drafter taps.
+
+speedbench `run` at TP=4, 2200 MHz, one stream (tok/s): code 70.2 -> 88.9, structured 72.1 -> 97.2, agentic 67.5 -> 84.7;
+prose 65.0 -> 59.0 before the drafter choice settles on MTP.
 
 ## Session checkpoints (`GR8_GLM53F_CACHE=aligned`, experimental)
 
@@ -168,12 +181,10 @@ Limits:
 
 ## Not yet
 
-- CP, prefix reuse and DFlash2: the engine refuses them under `--serve`. `GR8_GLM53F_CACHE=aligned` (above) is the
-  experimental Flash form of prefix reuse. DFlash2 runs offline (`g6m4_flash --dflash-manifest`: TP=2 and 4 split
-  its 8 KV heads, and TP=3 runs its body whole on every rank). Its taps are the mean of the four mHC streams after each
-  tapped layer, in decode steps and in the prefill, which keeps the last 2,048 prompt positions for the drafter's
-  prompt context.
-- MTP drafts beyond the first: the KDA state does not roll back a rejected draft yet, so the launcher runs MTP=1.
+- CP and prefix reuse: the engine refuses them under `--serve`. `GR8_GLM53F_CACHE=aligned` (above) is the
+  experimental Flash form of prefix reuse, and it refuses DFlash2. The DFlash2 drafter's taps are the mean of the four
+  mHC streams after each tapped layer, in decode steps and in the prefill, which keeps the last 2,048 prompt positions
+  for the drafter's prompt context. DFlash2 at TP=2 and TP=3 runs offline only.
 - The int4 KV build.
 - The vision tower: the engine serves text, and the fetch skips `dense/vision-*`.
 - A 262K prefill's time and memory headroom on a GB10: the `CAP` above is computed, not measured.

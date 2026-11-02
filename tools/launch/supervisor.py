@@ -227,7 +227,8 @@ def drafter_of(o, ms, refresh, log):
         return d
     if o.get('DFLASH') == '0' or o.get('DFLASH_DIR'):
         return None
-    hint = f'--drafter {hfsource.DRAFTER_URL} (CC BY-NC-ND 4.0: each box fetches and converts it)'
+    url = hfsource.FLASH_DRAFTER_URL if models.of(o) is models.GLM53F else hfsource.DRAFTER_URL
+    hint = f'--drafter {url} (CC BY-NC-ND 4.0: each box fetches and converts it)'
     if o.get('DFLASH') == '1':
         raise modelset.ModelError(f'--dflash 1, but there is no DFlash2 drafter: add {hint}')
     log(f'no DFlash2 drafter: MTP only. For DFlash2, add {hint}')

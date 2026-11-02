@@ -35,12 +35,13 @@ class OptionTests(unittest.TestCase):
 
     def test_refusals(self):
         for argv, want in ((['--tp', '6'], 'want 4, 3 or 2 (glm53f)'), (['--kv-format', 'int4'], 'fp8 KV build only'),
-                           (['--dflash', '1'], 'no DFlash2 drafter'),
-                           (['--drafter', 'https://huggingface.co/a/b'], 'no DFlash2 drafter')):
+                           (['--tp', '3', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3', '--drafter', 'https://huggingface.co/a/b'],
+                            'runs at TP=4 (split) and TP=6')):
             with self.assertRaises(opt.OptionError) as e:
                 flash(*argv)
             self.assertIn(want, str(e.exception))
         for argv, want in ((['--reuse', '1'], 'GLM-5.3-Flash has no REUSE'), (['--sess', '9'], 'serves 1 to 8 sessions'),
+                           (['--tp', '2', '--peers', '10.0.0.1,10.0.0.2', '--dflash', '1'], 'drafter at TP=4'),
                            (['--sess', '0'], 'serves 1 to 8 sessions'),
                            (['--sess', '8', '--mtp', '4'], 'a round of 40 rows')):
             with self.assertRaises(opt.OptionError) as e:
@@ -56,8 +57,9 @@ class OptionTests(unittest.TestCase):
             self.assertIn('GR8_PF_RS=0', plan['env'])
             self.assertIn('GR8_GLM53F_PF_STAGE_ASYNC=1', plan['env'])
             (self.assertNotIn if tp == '4' else self.assertIn)('GR8_GLM53F_KDA_SCAN=1', plan['env'])
-            for a in ('--reuse-prefix', '--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):
+            for a in ('--reuse-prefix', '--wide', '--pfv2', '--qo-manifest'):
                 self.assertNotIn(a, plan['args'])
+            (self.assertIn if tp == '4' else self.assertNotIn)('--dflash-manifest', plan['args'])
             self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], sess)
             self.assertEqual(plan['args'][plan['args'].index('--chunk') + 1], '1')
             self.assertIn('GR8_GLM53F_PF_DSA_F16GEMM=1', plan['env'])
@@ -108,6 +110,16 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(plan['knobs']['SHARE_LIMIT'], '32768')
             plan = opt.engine_plan(flash('--cap', '131072', peers=peers))
             self.assertEqual(plan['args'][plan['args'].index('--cap') + 1], '131072')
+
+    def test_dflash(self):
+        # DFLASH=1 (TP=4, the default; the supervisor turns it off with no drafter): the drafter packs and the adaptive
+        # draft count; off at TP=2
+        self.assertEqual(opt.engine_plan(flash())['knobs']['DFLASH'], '1')
+        self.assertEqual(opt.engine_plan(flash(peers='10.0.0.1,10.0.0.2'))['knobs']['DFLASH'], '0')
+        plan = opt.engine_plan(flash('--dflash', '1', '--dflash-dir', '/d'))
+        a = ' '.join(plan['args'])
+        self.assertIn('--dflash-manifest @DFLASH_DIR/dflash.r@R.manifest.json --dflash-pack @DFLASH_DIR/dflash.r@R.pack', a)
+        self.assertIn('--spec-adaptive', a)
 
     def test_sessions(self):
         # SESS 2..8 share decode steps (each session its own KDA slots); a round of every session fits 32 rows
@@ -317,7 +329,7 @@ class RequiredTests(unittest.TestCase):
         self.assertIn('TP=3 bit225 else down1', glm)
         self.assertIn(models.GLM53.release, glm)
         self.assertIn('--tp       4, 3 or 2', flash)
-        self.assertNotIn('--drafter', flash)
+        self.assertIn('--drafter URL (DFlash2)', flash)
         self.assertEqual(models.SERVED, (models.GLM53, models.GLM53F))
 
 
