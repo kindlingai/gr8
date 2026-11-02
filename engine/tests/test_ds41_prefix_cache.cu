@@ -284,6 +284,10 @@ static int run_test() {
         const uint64_t g63 = cache.capture(0, 63, p1, ns_a, st);
         const uint64_t g128 = cache.capture(0, 128, p2, ns_a, st);
         EXPECT(g63 > 0 && g128 > g63 && cache.size() == 2);
+        // The default removes only the one-token-later duplicate, not a new short chat turn.
+        EXPECT(knob::ds_cache_dedup() == 1);
+        EXPECT(cache.capture(0, 129, p2, ns_a, st) == 0);
+        EXPECT(cache.size() == 2 && cache.captures() == 2 && cache.deduped() == 1);
 
         // Exact prefix match selects longest stored prefix <= limit
         auto h_full = cache.match(p2, 159, ns_a);
@@ -314,6 +318,11 @@ static int run_test() {
         EXPECT(cache.find(g63) != nullptr && cache.find(g128) == nullptr && cache.find(g95) != nullptr);
         const g6kv_tier_totals ts = cache.tier_stat();
         EXPECT(ts.entries == 2 && ts.hits == 1 && ts.dropped == 1 && ts.spilled_pages > 0 && ts.restored_pages > 0);
+        // Two newly added tokens are a genuine new turn at K=1; a different namespace is never deduplicated.
+        const uint64_t g97 = cache.capture(0, 97, p1, ns_a, st);
+        EXPECT(g97 > g95 && cache.deduped() == 1);
+        const uint64_t g98_other = cache.capture(0, 98, p1, ns_b, st);
+        EXPECT(g98_other > g97 && cache.deduped() == 1);
         printf("Part 1 (40L+Idx+DSpark geometry, odd/even capture, match, LRU, tier_stat): PASS\n");
     }
 
@@ -715,5 +724,6 @@ static int run_test() {
 } // namespace ds41a
 
 int main() {
+    if (knob::init()) return 2;
     return ds41a::run_test();
 }

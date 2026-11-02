@@ -23,6 +23,15 @@ knobs:
     legacy: ["G6_DS41_CACHE_MIB"]
     doc: >-
       Size in MiB of the host prefix cache of DS41 session snapshots (--reuse-prefix).
+  GR8_DS_CACHE_DEDUP:
+    scope: agree
+    kind: int
+    default: "1"
+    values: "0..64"
+    doc: >-
+      Skip a new DS41 prefix snapshot when a stored same-namespace prefix is at most this many tokens shorter.
+      The default 1 removes the near-identical request-end copy while preserving new snapshots for short chat turns.
+      Set 0 to keep every snapshot. Larger values may cause short follow-ups to re-prefill on the next turn.
   GR8_DS_CONF_TEMP:
     scope: agree
     kind: text
