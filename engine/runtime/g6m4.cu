@@ -480,8 +480,6 @@ int main(int argc, char** argv)
         if (!s2mode || !MP) die("GR8_GLM53F_CACHE needs --serve and tensor prefill (--prefill N)");
         if (kv_tiers.size() > 1) die("GR8_GLM53F_CACHE: one --kv-store at most (its checkpoint store)");
         if (kv_tiers.empty() && flash_budget_mib < 1) die("GR8_GLM53F_STATE_BUDGET_MIB: >= 1");
-        // the checkpoints keep one live request's state (session 0's KDA ring): one session only
-        if (s2sess != 1) die("GR8_GLM53F_CACHE needs --s2-sessions 1");
     }
     if (!kv_tiers.empty() && flash_cache == g6s2::FlashCache::Off) die("--kv-store on Flash needs GR8_GLM53F_CACHE (its checkpoint store)");
     if (s2mode && s2sess != 1 && flashkv::env_mode() == 1)
@@ -1923,7 +1921,7 @@ int main(int argc, char** argv)
                     if (!y.kda && y.ab.storage)
                         v.bindings.push_back({static_cast<uint4*>(y.ab.args.mla_cache), static_cast<uint4*>(y.ab.args.index_cache),
                                               (unsigned long long)(64 * g6kv::ROW / 16), (unsigned long long)(g6kv::IDX_PAGE / 16)});
-            v.S = m.kda_st.S; v.conv = m.kda_st.conv; v.layers = kda::N_KDA; v.slots = m.kda_st.slots;
+            v.S = m.kda_st.S; v.conv = m.kda_st.conv; v.layers = kda::N_KDA; v.slots = m.kda_st.slots; v.pool_pages = int(sc.pool_rows / 64);
             v.s_slot = m.kda_st.s_layer() / std::max(1, m.kda_st.slots); v.c_slot = m.kda_st.c_layer() / std::max(1, m.kda_st.slots);
             std::string spec = "mem:";
             uint64_t bytes = (uint64_t)flash_budget_mib << 20;

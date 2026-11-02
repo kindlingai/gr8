@@ -36,7 +36,7 @@ constexpr int HID = 8, MX = 4;
 struct StepIn { u64 step; int M, context; int pos[MX]; };
 struct FlashPrefill { int lane; };
 struct Fabric { void enqueue_step(u64, const std::vector<uint32_t>&) {} };
-struct S2 { std::vector<std::vector<int>> run{{0, 1}}; } s2m;
+struct S2 { std::vector<std::vector<int>> run{{0, 1}, {2, 3}}; } s2m;
 namespace bind { struct Launch {}; struct Layer { Launch kv_a, idx_k, idx_g; }; inline void launch(const Launch&, int) {} }
 struct DLayer { std::vector<bind::Layer> L = std::vector<bind::Layer>(MX + 1); };
 struct DModel { int nc = 1, cur = 0; bool s2on = false; S2* s2 = &s2m; std::vector<DLayer> layers = std::vector<DLayer>(1); };
@@ -96,9 +96,9 @@ int main() {
     u64 pfseq = 1, pfseq2 = 1, dseq = 0;
     auto fence = [&] { events += 'F'; };
     auto check = [&] { events += 'C'; assert(!c.main.s2on && !c.draft.d.s2on); require(!word, "Flash serve fabric/attention error"); };
-    uint32_t capture_at = 0;          // GR8_GLM53F_CACHE: the live request's checkpoint point (0: none)
-    std::vector<int> capture_tokens;
-    u64 capture_req = 0;
+    std::vector<uint32_t> capture_at(2);   // GR8_GLM53F_CACHE: each session's checkpoint point (0: none)
+    struct Pending { int q; std::vector<int> tokens; u64 req; };
+    std::vector<Pending> pending;
     int dirty = 0;                    // the partial reset's bound: the end of the rows written since the last reset
     auto wrote = [&](int end) { if (dirty >= 0) dirty = std::max(dirty, end); };
     auto wrote_step = [&](const StepIn& si) {
@@ -165,16 +165,27 @@ int main() {
                 }
         }
     knob::draft_kv = true; draft_full_knob = 1;
-    // GR8_GLM53F_CACHE: the quantum that ends at the checkpoint point notes its tokens [0, p] and the request; another
-    // quantum leaves it pending
+    // GR8_GLM53F_CACHE: the quantum that ends at its session's checkpoint point notes the session, its tokens [0, p] and
+    // the request; another quantum, or another session's quantum ending at the same row, leaves it pending
     word = 0; inject = -1; sc.prefill_rows = 8; sc.two_lanes = false;
     for (int i = 0; i < 64; ++i) p.prompt[i] = 100 + i;
-    capture_at = 12;
-    prefill(slot, p, 0, 4);
-    assert(capture_at == 12 && capture_tokens.empty());
-    prefill(slot, p, 8, 4);
-    assert(capture_at == 0 && capture_req == 7 && capture_tokens.size() == 13 && capture_tokens.back() == 112);
-    ++cases;
+    for (const bool several : {false, true}) {
+        multi = c.main.s2on = c.draft.d.s2on = several;
+        const unsigned q = several ? 1 : 0;
+        const Slot mine{{7}, {q}}, other{{8}, {1 - q}};
+        pending.clear();
+        capture_at[q] = 12;
+        prefill(mine, p, 0, 4);
+        assert(capture_at[q] == 12 && pending.empty());
+        if (several) {
+            prefill(other, p, 8, 4);
+            assert(capture_at[q] == 12 && pending.empty());
+        }
+        prefill(mine, p, 8, 4);
+        assert(capture_at[q] == 0 && pending.size() == 1 && pending[0].q == int(q) && pending[0].req == 7 &&
+               pending[0].tokens.size() == 13 && pending[0].tokens.back() == 112);
+        ++cases;
+    }
     std::printf("flash_serve_prefill_check: PASS %d CPU mock cases (actual serve prefill lambda)\n", cases);
 }
 '''

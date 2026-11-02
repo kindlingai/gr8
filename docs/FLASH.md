@@ -111,10 +111,14 @@ index, the aligned point, the manifest) and `flash_checkpoint.cuh` (the store), 
 
 - The grid is the prefill quantum: `--prefill` rows times the lanes, 4,096 x 2 = 8,192 rows. A prompt of N tokens keeps
   a checkpoint at `p = floor((N - 1) / 8192) * 8192`, so prompts of 8,192 tokens or fewer keep none.
-- A checkpoint holds rows `[0, p)` of the 12 attention bindings (the latent rows and the indexer keys), KDA slot 0's
-  state and conv history, and the prompt's tokens `[0, p]`. A later prompt hits it when it starts with those `p + 1`
-  tokens under the same cache namespace (the steering profile); the longest entry wins, then the newest.
+- A checkpoint holds rows `[0, p)` of the 12 attention bindings (the latent rows and the indexer keys), the session's
+  first KDA slot's state and conv history, and the prompt's tokens `[0, p]`. A later prompt hits it when it starts with
+  those `p + 1` tokens under the same cache namespace (the steering profile); the longest entry wins, then the newest.
 - A hit restores the checkpoint at bind, after the cold reset, and prefills from `p`.
+- With several sessions (`SESS` 2 to 8) each session keeps and restores its own: the rows are the session's run's
+  pages in order (its logical pages, wherever the pool put them), and the KDA state is its first slot (`FlashSlots`).
+  An entry is the same bytes whichever session or pages took it, so any session may restore it. Captures wait for the
+  next boundary as with one session; no other session's work touches the run or the slot until then.
 
 Why the output is bit-exact against no cache: a cold prefill runs its quanta as `[kG, (k+1)G)`, and the KDA prefill is
 chunked by quantum, so a warm prefill from `p = kG` runs the same quanta on the same KDA state and the same pages. The
@@ -176,8 +180,9 @@ Limits:
   resizes through its own index (above), with the same report rule.
 - Each capture writes the whole prefix `[0, p)`, not only the rows past the entry it started from.
 - `terminal` is not cold-exact (above).
-- One session: the engine refuses `GR8_GLM53F_CACHE` and `GR8_GLM53F_KV_CHUNKS` with `--s2-sessions` above 1 (the
-  checkpoints keep session 0's KDA ring).
+- `GR8_GLM53F_KV_CHUNKS` (borrow-idle) still needs `--s2-sessions 1`.
+- Several sessions with checkpoints: not measured on a cluster yet (the capture and restore are the one-session copies
+  through the run's page list).
 
 ## Not yet
 
