@@ -80,6 +80,7 @@ public:
     size_t size() const { return entries_.size(); }
     uint64_t hits() const { return hits_; }
     uint64_t captures() const { return captures_; }
+    uint64_t deduped() const { return deduped_; }
     uint64_t evictions() const { return evictions_; }
 
     uint64_t digest() const {
@@ -170,6 +171,23 @@ public:
                 return gen;
             }
         }
+        // With DSpark, the request-end snapshot sits one token after the prompt-end snapshot.
+        // Reuse a same-namespace prefix within K tokens instead of copying essentially the same GPU state twice.
+        // K=1 by default; a larger value also skips short-turn snapshots. K=0 keeps every snapshot.
+        // Return 0 when no new generation was captured.
+        if (const int K = dedup_k()) {
+            for (size_t i = 0; i < entries_.size(); ++i) {
+                const auto& e = entries_[i];
+                if (e.ns == ns && e.position < pos && e.position + uint32_t(K) >= pos &&
+                    std::equal(e.tokens.begin(), e.tokens.end(), tokens.begin())) {
+                    Ds41PrefixEntry keep = std::move(entries_[i]);
+                    entries_.erase(entries_.begin() + long(i));
+                    ++deduped_;
+                    entries_.push_back(std::move(keep));
+                    return 0;
+                }
+            }
+        }
         const size_t need = entry_bytes(pos);
         if (need == 0 || need > budget_bytes_) return 0;
         while (used_bytes_ + need > budget_bytes_ && !entries_.empty()) {
@@ -249,6 +267,10 @@ public:
     }
 
 private:
+    static int dedup_k() {
+        static const int k = int(knob::ds_cache_dedup());
+        return k;
+    }
     void evict_oldest() {
         if (entries_.empty()) return;
         if (entries_.front().dev_buf) cudaFree(entries_.front().dev_buf);
@@ -319,6 +341,7 @@ private:
     uint64_t hits_ = 0;
     uint64_t captures_ = 0;
     uint64_t evictions_ = 0;
+    uint64_t deduped_ = 0;
     std::vector<Ds41PrefixEntry> entries_;
 };
 
