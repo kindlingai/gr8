@@ -29,7 +29,7 @@ if [ "$PART" != frontend ]; then
   python3 -m unittest tools.convert.test_v2
   python3 -m unittest discover -s engine/ref -p 'test_*.py'
   python3 -m unittest discover -s tools/health
-  python3 -m unittest discover -s bench/gate/tests
+  python3 -m unittest discover -s bench/tests
   python3 -m unittest discover -s tools/ngram/tests
   python3 -m unittest discover -s tools/query
   (cd engine/tests && python3 -m unittest test_prefix_reuse)

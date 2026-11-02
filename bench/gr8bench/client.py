@@ -1,14 +1,20 @@
-"""HTTP client for the front end (OpenAI/vLLM shapes). Stdlib only."""
+"""HTTP client for the front end (OpenAI/vLLM shapes)."""
 import json
 import time
 import urllib.request
 
-MODEL = 'glm-5.3'
-
-
 class Client:
-    def __init__(self, url, model=MODEL, timeout=3600):
-        self.url, self.model, self.timeout = url.rstrip('/'), model, timeout
+    def __init__(self, url, model=None, timeout=3600):
+        """model None: the first model /v1/models lists."""
+        self.url, self.timeout = url.rstrip('/'), timeout
+        self.model = model or self.models()[0]['id']
+
+    def get(self, path, timeout=60):
+        with urllib.request.urlopen(self.url + path, timeout=timeout) as r:
+            return json.load(r)
+
+    def models(self):
+        return self.get('/v1/models')['data']
 
     def _post(self, path, body):
         r = urllib.request.Request(self.url + path, json.dumps(body).encode(), {'Content-Type': 'application/json'})
@@ -39,16 +45,21 @@ class Client:
         with urllib.request.urlopen(self.url + '/metrics', timeout=60) as r:
             return parse_metrics(r.read().decode())
 
-    def chat(self, messages, max_tokens, temperature=0.7, effort='nothink', min_p=0.0):
+    def running(self):
+        """Requests the server is working on (vllm:num_requests_running), or None when it does not report it."""
+        m = self.metrics()
+        return msum(m, 'vllm:num_requests_running') if any(k.startswith('vllm:num_requests_running') for k in m) else None
+
+    def chat(self, messages, max_tokens, temperature=0.0, effort='low', min_p=0.0, extra=None):
         """Streamed /v1/chat/completions. Times the first generated token (reasoning or content).
         -> dict: ttft, decode_s, tokens (completion_tokens from usage), prompt_tokens, cached_tokens, content,
         reasoning, finish_reason.
         effort 'nothink' sends no thinking controls: GLM 5.3 cannot turn thinking off (the front end refuses
-        enable_thinking false), so it renders the template's default effort, Max, as it always did."""
+        enable_thinking false), so it renders the template's default effort, Max."""
         kwargs = {} if effort == 'nothink' else {'reasoning_effort': effort}
         body = {'model': self.model, 'messages': messages, 'max_tokens': max_tokens, 'stream': True,
                 'temperature': temperature, 'min_p': min_p, 'stream_options': {'include_usage': True},
-                'chat_template_kwargs': kwargs}
+                'chat_template_kwargs': kwargs, **(extra or {})}
         return self._stream('/v1/chat/completions', body)
 
     def complete_stream(self, prompt_ids, max_tokens, temperature=0.0):

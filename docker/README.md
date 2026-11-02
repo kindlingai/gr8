@@ -84,7 +84,8 @@ update, on every box (with the files fetched by URL, fetch `compose.yaml` again 
 Every box must run the same image: the boxes compare their engine builds before loading, and refuse to boot with a mix.
 To stay on one build, set `GR8_IMAGE=ghcr.io/kindlingai/gr8:sha-<commit>` in `docker/.env` on every box.
 
-`bench` (bench/pbench.py) appends its results to `out/pbench-results.jsonl` in the home volume.
+`bench` (bench/bench.py) writes its JSON report to `/tmp` in the container; `--json /var/lib/gr8/home/out/NAME.json`
+keeps it in the home volume.
 
 ## Settings
 

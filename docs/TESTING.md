@@ -28,7 +28,7 @@ What the two halves cover, and how to run one part alone:
 | the exlr8 dense decoder against `loader/exlr8.py` (a synthetic fixture), the layout planner (`engine/loader-rs/src/layout.rs`): the counts the engine reads, balance, the fewest pieces moved, and the trellis codebooks (`src/codebook.rs`): every state against the GPU test's hashes, and each layer's codebook from its width files, with the refusals | engine | `cargo test --manifest-path engine/loader-rs/Cargo.toml` |
 | the Python reference's trellis codebooks (`engine/ref/g6ref.py`) against the same hashes | engine | `python3 -m unittest discover -s engine/ref -p 'test_*.py'` |
 | the v2 expert converter (`tools/convert/v2.py`), with each codebook and its refusals | engine | `python3 -m unittest tools.convert.test_v2` |
-| the gate harness | engine | `python3 -m unittest discover bench/gate/tests` |
+| the benchmark | engine | `python3 -m unittest discover -s bench/tests` |
 | the n-gram draft source replay and A/B tool (#56: table, chain and tree proposals, acceptance, held-out folds; `ab.py` against a stub server) | engine | `python3 -m unittest discover -s tools/ngram/tests` |
 | the rank health probe | engine | `python3 -m unittest discover tools/health` |
 | the S2 shim | front end | `cd frontend && python3 -m unittest tests.test_s2shim -v` |
@@ -129,6 +129,5 @@ On a CPU with torch and NumPy:
 On a booted cluster, from the head:
 
 - `./gr8 glm53 smoke` passes every case.
-- `bench/gate/gate.py` checks KL, the needle, and prefill and decode against `main` ([AGENTS.md](../AGENTS.md), "The
-  gate").
-- `./gr8 glm53 bench` runs pbench alone. The README's numbers come from RigMark.
+- `./gr8 glm53 bench` checks correctness and measures decode, concurrency and prefill; with `--baseline` it gates them
+  against `main` ([bench/README.md](../bench/README.md), [AGENTS.md](../AGENTS.md), "The gate").

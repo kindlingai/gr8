@@ -41,7 +41,7 @@ the first cluster traces does not reach its choice. With `NGRAM` set, a request 
 table's chain instead of the drafter's drafts in rounds where the chain promises more tokens per verify ms
 (`docs/SETTINGS.md`, `GR8_NGRAM`).
 
-`import-kl-ref` turns a `bench/gate` KL reference (16 greedy continuations of 256 tokens, top 20) into traces, which
+`import-kl-ref` turns a KL reference (`bench/bench.py kl-ref`) (16 greedy continuations of 256 tokens, top 20) into traces, which
 checks the tools but is too little and too varied to judge the table. Its top lists come from a separate scoring pass:
 in `refs/tp4.json` 108 of 4,096 positions have the generated token outside first place.
 

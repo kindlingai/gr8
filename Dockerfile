@@ -189,10 +189,9 @@ COPY . .
 COPY --from=dist / .
 # The container runs as uid 1000 (the base image's ubuntu account) on a read-only image. Its writable state is two
 # volumes (docker/compose.yaml): the model cache and GR8_WORK_DIR, which docker fills from these empty, uid-1000 directories
-# on first use. bench/pbench.py appends results.jsonl next to itself, so that file links into GR8_WORK_DIR/out.
+# on first use.
 RUN mkdir -p /var/lib/gr8/home /var/lib/gr8/cache \
- && chown 1000:1000 /var/lib/gr8/home /var/lib/gr8/cache \
- && ln -s /var/lib/gr8/home/out/pbench-results.jsonl bench/results.jsonl
+ && chown 1000:1000 /var/lib/gr8/home /var/lib/gr8/cache
 ENV PATH=/opt/gr8/bin:$PATH PYTHONPATH=/opt/gr8/frontend HOME=/tmp GR8_CONTAINER=1 \
     GR8_WORK_DIR=/var/lib/gr8/home MODEL_CACHE=/var/lib/gr8/cache PY=/usr/bin/python3
 USER 1000:1000

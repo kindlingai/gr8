@@ -68,7 +68,7 @@ jobs:
               - 'engine/**'
               - 'knobs/**'
               - 'scripts/engine_args.sh'
-            # the host tests, the tools' and the bench gate's tests, the compose file, the Helm chart and the engine's
+            # the host tests, the tools' and the bench's tests, the compose file, the Helm chart and the engine's
             # Rust crates; bash -n of the recipes' scripts
             engine:
               - '!**/*.md'
