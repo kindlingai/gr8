@@ -204,7 +204,7 @@ class Ds41Tests(unittest.TestCase):
         self.assertEqual((plan['knobs']['MTP'], plan['knobs']['SESS'], plan['knobs']['CAP']), ('0', '5', '262144'))
         for e in ('GR8_CP=0', 'GR8_DEC_BK=16384', 'GR8_DS_MTP=5', 'GR8_DS_PREFILL_W=4096', 'GR8_DS_ATTN_PW=4096', 'GR8_DS_PF_LANES=2', 'GR8_DS_ATTN_TC=1', 'GR8_DS_MOE_TC=1',
                   'GR8_DS_PF_POOL=4', 'GR8_DS_SRC_FAST=3', 'GR8_DS_MOE_PDL=1', 'GR8_DS41_ADMIT_KEEP_SCRATCH=1', 'GR8_DS41_PUB16=1',
-                  'GR8_DS41_GV_QUAD=1'):
+                  'GR8_DS41_GV_QUAD=1', 'GR8_S2_DECODE_PF=1024'):
             self.assertIn(e, plan['env'])
         self.assertFalse([e for e in plan['env'] if 'PF_STAGE_ASYNC' in e])   # none of the GLM or Flash prefill stack
         self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '5')
@@ -217,6 +217,15 @@ class Ds41Tests(unittest.TestCase):
         self.assertEqual(sorted(e for e in plan['env'] if e.startswith(('GR8_DS_MTP=', 'GR8_DS_ATTN_PW=', 'GR8_DS41_IDX_PW='))),
                          ['GR8_DS41_IDX_PW=1024', 'GR8_DS_ATTN_PW=1024', 'GR8_DS_MTP=0'])
         self.assertIn('GR8_DS_ENGRAM=0', plan['env'])
+        self.assertEqual([e for e in plan['env'] if e.startswith('GR8_S2_DECODE_PF=')], ['GR8_S2_DECODE_PF=1024'])
+        plan = opt.engine_plan(ds41('--extra-env', 'GR8_DS_PREFILL_W=512'))
+        self.assertIn('GR8_S2_DECODE_PF=512', plan['env'])
+        plan = opt.engine_plan(ds41('--extra-env', 'GR8_S2_DECODE_PF=0'))
+        self.assertEqual([e for e in plan['env'] if e.startswith('GR8_S2_DECODE_PF=')], ['GR8_S2_DECODE_PF=0'])
+        plan = opt.engine_plan(ds41('--s2-decode-pf', '512'))
+        self.assertIn('GR8_S2_DECODE_PF=512', plan['env'])
+        plan = opt.engine_plan(ds41('--sess', '1', '--extra-env', 'GR8_DS_PREFILL_MIN=0'))
+        self.assertIn('GR8_S2_DECODE_PF=0', plan['env'])
 
 
 class Ds41ReleaseTests(unittest.TestCase):

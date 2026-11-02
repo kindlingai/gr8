@@ -295,7 +295,8 @@ knobs:
     default: "0"
     doc: >-
       S2: while any session decodes, a prefill quantum takes at most this many rows on one lane, so decode rounds come
-      round sooner. A multiple of 64, at most --prefill. 0 = the full quantum.
+      round sooner. A multiple of 64, at most --prefill (or the DS41 W-row prefill width). 0 = the full quantum.
+      The DS41 launcher uses the smaller of 1024 and W by default; set 0 to favor the new long prompt's first word.
   GR8_S2_DECODE_ROUNDS:
     scope: agree
     kind: int

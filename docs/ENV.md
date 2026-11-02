@@ -297,7 +297,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_S2_ADAPT` | flag | `0` |  | S2: chooses each round's MTP draft count (1..k) from the sessions' accept rates and the S2 step costs. Adds about 1 GiB of main-step graphs. |
 | `GR8_S2_ADMIT_HOLD` | flag | `0` | 0\|1 | S2: an admission with another request queued behind it and a slot left holds its boundary, so a burst of queued requests is admitted at one boundary instead of one per notice. |
 | `GR8_S2_BELOW` | int | CP_R |  | S2: the context below which sessions share the pool's pages: 64..GR8_CP_R, a multiple of 64. |
-| `GR8_S2_DECODE_PF` | int | `0` |  | S2: while any session decodes, a prefill quantum takes at most this many rows on one lane, so decode rounds come round sooner. A multiple of 64, at most --prefill. 0 = the full quantum. |
+| `GR8_S2_DECODE_PF` | int | `0` |  | S2: while any session decodes, a prefill quantum takes at most this many rows on one lane, so decode rounds come round sooner. A multiple of 64, at most --prefill (or the DS41 W-row prefill width). 0 = the full quantum. The DS41 launcher uses the smaller of 1024 and W by default; set 0 to favor the new long prompt's first word. |
 | `GR8_S2_DECODE_ROUNDS` | int | `0` | 0..64 | S2: while a prefill waits and sessions decode, runs this many decode rounds per prefill quantum instead of one. 0 or 1 = off. |
 | `GR8_S2_DSEL` | flag | `1` |  | S2 with DFlash2: a session that decodes alone drafts each round with DFlash2 or MTP, whichever is expected to commit more tokens per ms. 0 = DFlash2 every round. |
 | `GR8_S2_DSEL_DWELL` | int | `8` |  | S2 drafter choice: rounds a session stays on one drafter before it may switch. |
