@@ -47,10 +47,9 @@ done
 # request grammars (engine/runtime/grammar.h): XGrammar's C++, the copy the front end's xgrammar crate pins
 # (frontend/g6front-rs/Cargo.lock), so the engine's masks and the front end's checks run one grammar library.
 # GR8_XGRAMMAR=DIR names a source tree instead (the image's engine stages), GR8_XGRAMMAR=0 builds without grammars.
-# Needs cmake; GLM-5.3 only
+# Needs cmake; GLM-5.3 and Flash
 GR_OFF=""
-if [ "${MODEL:-glm}" = flash ]; then GR_OFF="MODEL=flash"
-elif [ "${MODEL:-glm}" = ds41 ]; then GR_OFF="MODEL=ds41"
+if [ "${MODEL:-glm}" = ds41 ]; then GR_OFF="MODEL=ds41"
 elif [ "${GR8_TESTS:-1}" = only ]; then GR_OFF="GR8_TESTS=only builds no engine"
 elif [ "${GR8_XGRAMMAR:-}" = 0 ]; then GR_OFF="GR8_XGRAMMAR=0"
 fi

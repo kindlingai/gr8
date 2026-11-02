@@ -81,7 +81,8 @@ WORKDIR /src/frontend/g6front-rs
 RUN mkdir -p src && touch src/main.rs && cargo fetch --locked \
  && cp -a "$(ls -d /opt/cargo/registry/src/*/xgrammar-*/thirdparty/xgrammar | head -1)" /out-xgrammar
 
-# XGrammar's library, built once for both GLM engine stages; it changes only with the pin, so engine edits keep it cached
+# XGrammar's library, built once for the GLM and Flash engine stages; it changes only with the pin, so engine edits keep it
+# cached
 FROM toolchain AS xgrammar
 # hadolint ignore=DL3008
 RUN apt-get update \
@@ -103,7 +104,7 @@ COPY --from=loader /out/libg6load.a engine/loader-rs/target/release/libg6load.a
 COPY --from=kvman /out/libg6kvman.a engine/kvman-rs/target/release/libg6kvman.a
 COPY --from=knobs /out/libgr8knobs.a engine/knobs-rs/target/release/libgr8knobs.a
 
-# the two GLM engine stages add XGrammar; Flash and the tests build without it, so they do not wait for its stage
+# the GLM and Flash engine stages add XGrammar; the tests build without it, so they do not wait for its stage
 FROM engine-src AS engine-src-glm
 COPY --from=xgrammar-src /out-xgrammar /opt/xgrammar
 COPY --from=xgrammar /out/libxgrammar.a /opt/xgrammar-lib/libxgrammar.a
@@ -126,7 +127,7 @@ RUN GR8_WIDTHS="$GR8_WIDTHS" GR8_TESTS=only scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name gpuprobe ! -name tr3_e4m3_test -exec rm -rf {} +
 
 # GLM-5.3-Flash: g6m4_flash and m4sim_flash (MODEL=flash), TP 2, 3 and 4
-FROM engine-src AS engine-flash
+FROM engine-src-glm AS engine-flash
 RUN MODEL=flash scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4_flash ! -name m4sim_flash -exec rm -rf {} +
 
