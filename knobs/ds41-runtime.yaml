@@ -241,3 +241,11 @@ knobs:
       1 = a publish of 8 rows or fewer (the layer exchanges and the Engram reduce) copies into the send slot with 16
       CTAs instead of 1, the grid a publish of more rows already runs. The same bytes and the same doorbell, so the
       outputs do not change.
+  GR8_DS41_HEAD_MX:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = the loader builds the decode head from the release's BF16 rows as MXFP8 records (G.lm_head.mx.gv, rounded to
+      nearest) in place of the BF16 GEMV records, so the head GEMV of a decode step reads a little over half the
+      bytes. Not exact: the logits round differently, and outputs can change.
