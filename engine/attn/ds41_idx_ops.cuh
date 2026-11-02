@@ -49,6 +49,7 @@ struct Ds41IdxModel
     bool pipe_b = false;                             // GR8_DS41_IDX_PIPE_B=1: the pipelined dense logits on index-source layers 2/8/14/20 only
     bool q_trig = false;                             // GR8_DS41_IDX_Q_TRIG=1: once-per-row query rope sincos
     bool pipe_qr = false;                            // GR8_DS41_IDX_PIPE_QR=1: Q-stationary cp.async dense logits
+    bool keep_scratch = false;                       // GR8_DS41_ADMIT_KEEP_SCRATCH=1: a slot clear (slot >= 0) leaves scratch / sscr as they are
     bool wqb_tc_warned = false;
     bool reuse = false;                             // GR8_DS41_IDX_REUSE=1 / ds41_idx_set_reuse: layers 24..36 keep the layer-20 top-512 list (no wq_b, logits, top-k there; layer 20 skips cand_blocks)
     // SESS > 1 (Model::ds_slots S2 slots): ca / ica / shadow hold one slab ("page") of rows_kv rows per slot; a call's page table is Model::sess
@@ -185,6 +186,7 @@ inline int ds41_idx_bind(void* model, int i, int capacity, void* stream)
         S.dense_maxk = (int)knob::ds41_idx_dense_maxk();
         S.wqb_tc = (int)knob::ds41_idx_wqb_tc();
         S.pipe_b = m.ds41_idx_pipe_b;
+        S.keep_scratch = m.ds41_admit_keep_scratch;
         S.q_trig = knob::ds41_idx_q_trig();
         S.pipe_qr = knob::ds41_idx_pipe_qr();
         if (S.pipe_qr) {
@@ -422,7 +424,8 @@ inline int ds41_idx_pf_compact(void* model, Shift&& shift)
 // A model that never ran ds41_idx_bind has nothing to clear (returns 0). The attention block's own caches (window ring, compressed rows, compressor state)
 // are cleared by its own function. Called by rank.cuh reset() for DS41 (forward declare it there like ds41_attn_ops.cuh does for ds41_idx_bind).
 // slot (SESS > 1): clear only that S2 slot's ca / ica / shadow slab (the other sessions keep theirs); -1 = every slot. The step buffers below
-// (scratch, klen, q_b, ..., the shared list) are rewritten by every step before they are read, so they are cleared whole either way.
+// (scratch, klen, q_b, ..., the shared list) are rewritten by every step before they are read, so they are cleared whole either way;
+// GR8_DS41_ADMIT_KEEP_SCRATCH=1 leaves the scratch and the per-session sscr out of a slot clear (they are most of its bytes).
 inline int ds41_idx_clear(void* model, void* stream, int slot)   // slot default -1: rank.cuh's declaration
 {
     using namespace ds41_idx_detail;
@@ -439,8 +442,11 @@ inline int ds41_idx_clear(void* model, void* stream, int slot)   // slot default
         if (S->ca[k]) clr(S->ca[k] + k0 * S->rows_kv[k] * DS41_CA_ROW, nk * S->rows_kv[k] * DS41_CA_ROW);
     }
     if (S->shadow) clr(S->shadow + k0 * (S->cap + S->rcap) * 512, nk * (S->cap + S->rcap) * 512 * 2);
-    clr(S->scratch, ds41_idx_scratch_bytes(S->rcap, S->lim1));
-    for (int j = 0; j < S->slots; ++j) clr(S->sscr[j], ds41_idx_scratch_bytes(S->sess_cap, S->lim1));
+    if (slot < 0 || !S->keep_scratch)   // a full reset (slot -1) always clears them
+    {
+        clr(S->scratch, ds41_idx_scratch_bytes(S->rcap, S->lim1));
+        for (int j = 0; j < S->slots; ++j) clr(S->sscr[j], ds41_idx_scratch_bytes(S->sess_cap, S->lim1));
+    }
     clr(S->klen, (size_t)S->rcap * sizeof(int));
     clr(S->q_b, (size_t)S->rcap * geom::IDX_WQB_OUT * 2);
     clr(S->wproj, (size_t)S->rcap * geom::IDX_HEADS * 2);

@@ -527,6 +527,8 @@ int main(int argc, char** argv)
     const int ds_idx_q_trig = knob::ds41_idx_q_trig() ? 1 : 0;
     const int ds_idx_pipe_qr = knob::ds41_idx_pipe_qr() ? 1 : 0;
     fprintf(stderr, "# rank %d ds41 idx q trig %d pipe QR %d\n", cfg.rank, ds_idx_q_trig, ds_idx_pipe_qr);
+    const int ds_admit_keep_scratch = knob::ds41_admit_keep_scratch() ? 1 : 0;
+    fprintf(stderr, "# rank %d ds41 idx admit keep scratch %d\n", cfg.rank, ds_admit_keep_scratch);
     // Prefix reuse is served by the DS41 snapshot cache; the separate --kv-store tier is not implemented for DS41.
     if (reuse_prefix && !s2mode) die("DS41: --reuse-prefix needs --serve");
     if (!kv_tiers.empty()) die("DS41: --kv-store is not supported");
@@ -1284,6 +1286,7 @@ int main(int argc, char** argv)
 #if G6_MODEL_DS41
     m.ds_slots = s2mode ? s2sess : 1;   // SESS: one attention / index / Engram slab per S2 session slot (cap rows each)
     m.ds41_idx_pipe_b = ds_idx_pipe_b == 1;
+    m.ds41_admit_keep_scratch = ds_admit_keep_scratch == 1;
     build_ds41(m, R, layers, find, cap, f, stepp, st, pf_attn_rows(MP), dsk.on() ? 1 : 0, rs_k, rowshard);
     if (rs_k) ds41_rs_setup(m, R, NC, rs_k, rowshard, y_mxfp8);
     m.ds41_direct = pf_direct;                 // GR8_DS_PF_DIRECT=1
