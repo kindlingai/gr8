@@ -192,8 +192,11 @@ ds41_defaults() {
   # qeval answers did not change). GR8_DS_MOE_PDL=1: decode +0.6 to +1.4%. GR8_DS41_ADMIT_KEEP_SCRATCH=1: a request starts 12-17 ms
   # sooner. GR8_DS41_PUB16=1 and GR8_DS41_GV_QUAD=1: a decode round -0.9 to -1.3% and -1.6 to -1.8%, the same bytes. A variable
   # EXTRA_ENV names keeps its value; GR8_DS_ATTN_PW and GR8_DS41_IDX_PW follow GR8_DS_PREFILL_W.
+  # A 1024-row prefill quantum while another chat decodes keeps those chats writing during a long new prompt.
+  # The caller may override it in EXTRA_ENV or with S2_DECODE_PF; do not exceed a smaller requested W.
+  local dpf=${S2_DECODE_PF:-$((pmin == 0 ? 0 : (pw < 1024 ? pw : 1024)))}
   DS41_TUNED=
-  for kv in GR8_DS_MTP=5 GR8_DS_ENGRAM_MTP=1 GR8_DS_PREFILL_MIN=2 GR8_DS_PREFILL_W=$pw GR8_DS_ATTN_PW=$pw GR8_DS41_IDX_PW=$pw \
+  for kv in GR8_DS_MTP=5 GR8_DS_ENGRAM_MTP=1 GR8_DS_PREFILL_MIN=2 GR8_DS_PREFILL_W=$pw GR8_DS_ATTN_PW=$pw GR8_DS41_IDX_PW=$pw GR8_S2_DECODE_PF=$dpf \
       GR8_DS_PF_LANES=2 GR8_DS_PF_RS=1 GR8_DS_PF_DIRECT=1 GR8_DS_PF_GATHER=1 GR8_DS_PF_LATE_FINAL=1 GR8_DS_WAIT_K=2 GR8_DS_DEC_STAGE=1 \
       GR8_DS_ATTN_CPA=1 GR8_DS_DSP_GV=1 GR8_DS_RO_ORDER=1 GR8_DS_GATE_RO=1 GR8_DS_ENGRAM_LOOKAHEAD=1 GR8_DS_ATTN_TC=1 \
       GR8_DS_MOE_TC=1 GR8_DS_PF_POOL=4 GR8_DS_SRC_FAST=3 GR8_DS_MOE_PDL=1 GR8_DS41_ADMIT_KEEP_SCRATCH=1 GR8_DS41_PUB16=1 \

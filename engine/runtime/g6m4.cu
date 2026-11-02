@@ -2140,6 +2140,14 @@ int main(int argc, char** argv)
         if (pf_lanes == 2 && !pf_min) die("GR8_DS_PF_LANES=2 needs W-row prefill (GR8_DS_PREFILL_MIN)");
         bc.prefill_min = (uint32_t)pf_min;
         if (pf_min) g6s2::ds41_prefill_lanes(sc, (uint32_t)m.hc_rows, pf_lanes);
+        // Bound each prefill quantum while another session decodes. The default quantum remains
+        // unchanged when this knob is zero; the launcher chooses 1024 for DS41 daily serving.
+        const int64_t decode_pf = knob::s2_decode_pf();
+        if (decode_pf) {
+            if (decode_pf < 0 || decode_pf % 64 || uint64_t(decode_pf) > sc.prefill_rows)
+                die("DS41: GR8_S2_DECODE_PF must be a multiple of 64 no larger than the prefill width");
+            sc.decode_prefill_rows = (uint32_t)decode_pf;
+        }
         bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = cfg.ips[0];
         bc.directory = s2dir; bc.port = s2port;
         bc.timeout = (unsigned)knob::s2_timeout();
