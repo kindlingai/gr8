@@ -1529,7 +1529,12 @@ inline void pf_rcdump(Model& m, Prefill& P, int i, int M, const int* cnt, cudaSt
     G6RT_CK(cudaMemcpy(&first, P.pos, 4, cudaMemcpyDeviceToHost));
     FILE* f = fopen(P.rc_file.c_str(), "a");
     if (!f) die("GR8_PF_RCDUMP: cannot write " + P.rc_file);
-    fprintf(f, "{\"layer\": %d, \"first\": %d, \"rows\": %d, \"rank\": %d, \"cnt\": [", m.layers[i].l, first, M, m.rank);
+    // the fill of the expert kernels' row groups: routes over the rows the launched 64-row segments (k_pf_fc1f / fc2g),
+    // 256-row tiles (k_pf_fc1t / fc2t) and 16-row mma blocks cover
+    long long routes = 0, seg = 0, tile = 0, rb = 0;
+    for (int e = 0; e < glue::NEXP; ++e) { routes += c[e]; seg += (c[e] + 63) / 64; tile += (c[e] + 255) / 256; rb += (c[e] + 15) / 16; }
+    fprintf(f, "{\"layer\": %d, \"first\": %d, \"rows\": %d, \"rank\": %d, \"fill_seg64\": %.4f, \"fill_tile256\": %.4f, \"fill_rb16\": %.4f, \"cnt\": [",
+            m.layers[i].l, first, M, m.rank, routes / std::max(1.0, 64.0 * seg), routes / std::max(1.0, 256.0 * tile), routes / std::max(1.0, 16.0 * rb));
     for (int e = 0; e < glue::NEXP; ++e) fprintf(f, e ? ",%d" : "%d", c[e]);
     fprintf(f, "]}\n");
     fclose(f);
