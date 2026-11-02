@@ -202,7 +202,9 @@ class Ds41Tests(unittest.TestCase):
     def test_engine_plan(self):
         plan = opt.engine_plan(ds41())
         self.assertEqual((plan['knobs']['MTP'], plan['knobs']['SESS'], plan['knobs']['CAP']), ('0', '5', '262144'))
-        for e in ('GR8_CP=0', 'GR8_DEC_BK=16384', 'GR8_DS_MTP=5', 'GR8_DS_PREFILL_W=1024', 'GR8_DS_ATTN_PW=1024', 'GR8_DS_PF_LANES=2', 'GR8_DS_ATTN_TC=1', 'GR8_DS_MOE_TC=1'):
+        for e in ('GR8_CP=0', 'GR8_DEC_BK=16384', 'GR8_DS_MTP=5', 'GR8_DS_PREFILL_W=4096', 'GR8_DS_ATTN_PW=4096', 'GR8_DS_PF_LANES=2', 'GR8_DS_ATTN_TC=1', 'GR8_DS_MOE_TC=1',
+                  'GR8_DS_PF_POOL=4', 'GR8_DS_SRC_FAST=3', 'GR8_DS_MOE_PDL=1', 'GR8_DS41_ADMIT_KEEP_SCRATCH=1', 'GR8_DS41_PUB16=1',
+                  'GR8_DS41_GV_QUAD=1'):
             self.assertIn(e, plan['env'])
         self.assertFalse([e for e in plan['env'] if 'PF_STAGE_ASYNC' in e])   # none of the GLM or Flash prefill stack
         self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '5')
@@ -211,9 +213,9 @@ class Ds41Tests(unittest.TestCase):
         for a in ('--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):
             self.assertNotIn(a, plan['args'])
         # a variable EXTRA_ENV names replaces the tuned one, and the attention and indexer widths follow the prefill width
-        plan = opt.engine_plan(ds41('--extra-env', 'GR8_DS_ENGRAM=0 GR8_DEC_SPLIT=0 GR8_DS_MTP=0 GR8_DS_PREFILL_W=4096'))
+        plan = opt.engine_plan(ds41('--extra-env', 'GR8_DS_ENGRAM=0 GR8_DEC_SPLIT=0 GR8_DS_MTP=0 GR8_DS_PREFILL_W=1024'))
         self.assertEqual(sorted(e for e in plan['env'] if e.startswith(('GR8_DS_MTP=', 'GR8_DS_ATTN_PW=', 'GR8_DS41_IDX_PW='))),
-                         ['GR8_DS41_IDX_PW=4096', 'GR8_DS_ATTN_PW=4096', 'GR8_DS_MTP=0'])
+                         ['GR8_DS41_IDX_PW=1024', 'GR8_DS_ATTN_PW=1024', 'GR8_DS_MTP=0'])
         self.assertIn('GR8_DS_ENGRAM=0', plan['env'])
 
 
