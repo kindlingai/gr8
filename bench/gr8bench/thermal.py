@@ -8,9 +8,8 @@ reasons), so every stage reports the clocks it actually ran at.
 A host is an ssh destination (the head's own address works too), or "local" for the box this runs on. Clock control
 needs passwordless sudo for nvidia-smi on every box. Without it the clocks are left alone and the report says so.
 
-A timed stage runs with no limit, so a guard stands in for the stopped limiter: a box that reaches guard_temp (88 C;
-GB10s have powered off near there) is locked at the cool clock for the rest of the stage, and the stage's numbers are
-marked as affected.
+A timed stage runs with no limit, so a guard stands in for the stopped limiter: a box that reaches guard_temp (90 C)
+is locked at the cool clock for the rest of the stage, and the stage's numbers are marked as affected.
 
 A service that sets clocks itself (sparkos-thermal moves a cap every 15 s) would undo these locks, so it is stopped
 for the run and started again at the end. A systemd timer on each box starts it again after `restore_after` seconds
@@ -52,7 +51,7 @@ class Host:
 
 
 class Thermal:
-    def __init__(self, hosts, caps=None, cool_mhz=1800, cool_temp=55, guard_temp=88, rate=1.0, window=60, min_wait=30,
+    def __init__(self, hosts, caps=None, cool_mhz=1800, cool_temp=55, guard_temp=90, rate=1.0, window=60, min_wait=30,
                  max_wait=300, idle_util=10, log=print):
         self.hosts = [Host(h) for h in hosts]
         self.caps = dict(caps or {})

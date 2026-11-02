@@ -180,7 +180,7 @@ def main():
                     help='a box that stays capped during stages (repeat for more boxes)')
     ap.add_argument('--cool-mhz', type=int, default=1800)
     ap.add_argument('--cool-temp', type=float, default=55, help='a stage may start once every box is at or under this (C)')
-    ap.add_argument('--guard-temp', type=float, default=88,
+    ap.add_argument('--guard-temp', type=float, default=90,
                     help='a box this hot in a timed stage is held at --cool-mhz for the rest of it (C)')
     ap.add_argument('--settle-max', type=int, default=300, help='longest cooldown before a stage starts anyway (s)')
     ap.add_argument('--thermal-service', default='sparkos-thermal',

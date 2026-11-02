@@ -145,11 +145,11 @@ class Heat(unittest.TestCase):
         th.guarding = True
 
         class Proc:
-            stdout = iter(['80, 2400, 60, 99, 0x0', '88, 2400, 60, 99, 0x0', '89, 2400, 60, 99, 0x0'])
+            stdout = iter(['88, 2400, 60, 99, 0x0', '90, 2400, 60, 99, 0x0', '91, 2400, 60, 99, 0x0'])
         th.hosts[0].proc = Proc()
         th._read(th.hosts[0])
         time.sleep(0.1)
-        self.assertEqual([t['temp'] for t in th.trips], [88])
+        self.assertEqual([t['temp'] for t in th.trips], [90])
         self.assertEqual(held, [('local', 1800)])
 
     def test_settle_gives_up_on_a_busy_server(self):

@@ -58,9 +58,9 @@ the timed stages (decode, concurrency, prefill) run first, and each starts from 
 4. the stage runs with no clock limit, and its clocks are kept: each box's start and peak temperature, mean and
    lowest SM clock, the share of time under 2,000 MHz, power, and any throttle reason.
 
-With the limiter stopped, uncapped GB10s reach 85-89 C in these stages, and GB10s have powered off near 88 C. So a
-box that reaches `--guard-temp` (88 C) is locked at `--cool-mhz` for the rest of the stage, and the checks carry a
-WARN naming the stage and the box: its numbers ran partly capped.
+With the limiter stopped, uncapped GB10s reach 85-89 C in these stages. A box that reaches `--guard-temp` (90 C) is
+locked at `--cool-mhz` for the rest of the stage, and the checks carry a WARN naming the stage and the box: its
+numbers ran partly capped.
 
 The other stages (smoke, correctness, the agentic checks, GSM8K and HumanEval) measure no time, so they run locked at
 `--cool-mhz` with no wait before them.
