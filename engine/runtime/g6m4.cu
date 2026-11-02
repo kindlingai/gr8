@@ -364,7 +364,7 @@ int main(int argc, char** argv)
         spec.draft_each = dfl ? 0 : 2.1;         // an MTP chain step
 #if G6_MODEL_FLASH
         spec.flash_cost(g6nr::NR);
-        if (dfl) { spec.draft_round = 5.6; spec.draft_each = 0; }   // the verify table is Flash's, the drafting the drafter step's
+        if (dfl) { spec.draft_round = 5.3; spec.draft_each = 0; }   // Flash's verify table; a DFlash2 round's drafting (the gap between main steps)
 #endif
     }
 #if G6_MODEL_FLASH
@@ -1971,8 +1971,8 @@ int main(int argc, char** argv)
             h.dsel.margin = knob::s2_dsel_margin();
             h.dsel.dwell = (int)std::max<int64_t>(1, knob::s2_dsel_dwell());
             h.dsel.probe = (int)std::max<int64_t>(1, knob::s2_dsel_probe());
-            h.dsel.d.draft_round = 5.6 + 2.6;   // DFlash2: the drafter step and the MTP first form
-            h.dsel.m.draft_round = 2.6 + 3.0;   // MTP: the first form and the drafter's context-only step
+            h.dsel.d.draft_round = 5.3;         // DFlash2: the drafter step and the MTP first form (the measured gap)
+            h.dsel.m.draft_round = 2.6 + 1.0;   // MTP: the first form and the drafter's context-only step
             h.dsel.m.draft_each = 1.25;
             for (int r = 1; r <= SpecLen::KX + 1; ++r) h.dsel.d.table[r] = h.dsel.m.table[r] = spec.table[r];
             h.kstop = kstop;
