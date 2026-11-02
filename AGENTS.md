@@ -4,6 +4,7 @@ gr8 serves the full GLM 5.3 on three, four or six GB10 boxes, and every change h
 about proving a change does, before it lands.
 
 If you're an agent working here, read this whole file first. If you're a person, the same rules apply to you.
+If you're an agent starting gr8 for someone, read [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md) and ask them its questions first.
 
 ## How changes land
 
