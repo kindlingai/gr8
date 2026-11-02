@@ -262,7 +262,8 @@ inline int ds41_attn_bind(void* model, int i, int capacity, void* stream)
         if (!gv_set)
         {
             gv_set = true;
-            ds41_attn_set_gv(knob::ds_attn_gv(), (int)knob::ds_attn_gv_tpc(), (int)knob::ds_attn_gv_ks(), ds41a::gv_xfrag_launch, ds41a::gv_gemv_launch);
+            ds41_attn_set_gv(knob::ds_attn_gv(), (int)knob::ds_attn_gv_tpc(), (int)knob::ds_attn_gv_ks(), ds41a::gv_xfrag_launch,
+                             knob::ds41_gv_quad() ? ds41a::gv_gemv_launch_q : ds41a::gv_gemv_launch);   // GR8_DS41_GV_QUAD=1: q_b / o_a / o_b in quad records (default off)
             const bool tc = knob::ds_attn_tc();   // 1 = the five projections at M >= 9 run on the block-scaled tensor-core GEMM (default 0)
             ds41_attn_set_tc(tc);
             if (tc) fprintf(stderr, "DS41 attention tensor-core GEMM: GR8_DS_ATTN_TC=1 (M >= 9)\n");
@@ -292,6 +293,19 @@ inline int ds41_attn_bind(void* model, int i, int capacity, void* stream)
     }
     a->heads = plan.heads;
     W = plan.W;
+    if (knob::ds41_gv_quad())   // GR8_DS41_GV_QUAD=1: repack this layer's q_b / o_a / o_b GEMV records to quads, in place, before any capture
+    {
+        const int G = a->heads / ds41a::HPG, tpc = (int)knob::ds_attn_gv_tpc(), ks = (int)knob::ds_attn_gv_ks();
+        const int n = ds41a::gv_quad_bind(W.wq_b, 1, tpc, ks, (cudaStream_t)stream) + ds41a::gv_quad_bind(W.wo_a, G, tpc, ks, (cudaStream_t)stream) +
+                      ds41a::gv_quad_bind(W.wo_b, 1, tpc, ks, (cudaStream_t)stream);
+        G6RT_CK(cudaStreamSynchronize((cudaStream_t)stream));
+        static bool told = false;
+        if (!told)
+        {
+            told = true;
+            fprintf(stderr, "DS41 attention GEMV: GR8_DS41_GV_QUAD=1 (layer %d: %d of 3 weights, q_b / o_a / o_b, repacked to quad records, k_gv_mx_q)\n", l, n);
+        }
+    }
     if (geom::has_compressor_gate(l))
     {
         if (knob::ds_comp_fp8())
