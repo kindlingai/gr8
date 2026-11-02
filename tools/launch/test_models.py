@@ -57,7 +57,7 @@ class OptionTests(unittest.TestCase):
             self.assertIn('GR8_PF_RS=0', plan['env'])
             # TP=4: sequence-parallel mHC in place of the peer-partial staging
             self.assertIn('GR8_GLM53F_PF_STAGE_ASYNC=' + ('0' if tp == '4' else '1'), plan['env'])
-            (self.assertIn if tp == '4' else self.assertNotIn)('GR8_GLM53F_PF_SP=1', plan['env'])
+            self.assertIn('GR8_GLM53F_PF_SP=' + ('1' if tp == '4' else '0'), plan['env'])
             (self.assertNotIn if tp == '4' else self.assertIn)('GR8_GLM53F_KDA_SCAN=1', plan['env'])
             for a in ('--reuse-prefix', '--wide', '--pfv2', '--qo-manifest'):
                 self.assertNotIn(a, plan['args'])
