@@ -516,6 +516,8 @@ pub struct Opts {
     /// plan from manifests/exlr8-manifest-NAME.json: its layers with numeric widths load exlr8 trellis experts
     /// (GR8_DS_MANIFEST); None = every layer native
     pub manifest: Option<String>,
+    /// the decode head as MXFP8 records, G.lm_head.mx.gv, in place of the BF16 ones (GR8_DS41_HEAD_MX); false = BF16
+    pub head_mx: bool,
 }
 
 /// Blocks of 128 in an expert (2304 wide): the exlr8 v2 halves of a DS41 layer.
@@ -884,7 +886,42 @@ impl Planner<'_> {
             return Err(format!("head has {} rows, not a multiple of {VTILE}", dims[0]));
         }
         let tiles = vocab_tiles(dims[0] / VTILE, self.nr, self.rank);
-        self.bf16_mat("G.lm_head", "head", Some(tiles.start * VTILE..tiles.end * VTILE), true)
+        let rows = tiles.start * VTILE..tiles.end * VTILE;
+        // GR8_DS41_HEAD_MX=1: the decode head as MXFP8 records, G.lm_head.mx.gv, which build_ds41 binds ahead of the BF16
+        // records. Rounded (records::mxfp8_quantize, round to nearest): the logits change.
+        let mx = self.opts.head_mx;
+        self.bf16_mat("G.lm_head", "head", Some(rows.clone()), !mx)?;
+        if mx {
+            self.head_mx(rows)?;
+        }
+        Ok(())
+    }
+
+    /// G.lm_head.mx.gv [n/16][k/32][528] of the release's BF16 head rows `rows`, in stripes of whole 16-row tiles.
+    fn head_mx(&mut self, rows: Range<usize>) -> Result<(), String> {
+        let (s, _, k) = self.rel.bf16("head")?;
+        let n = rows.len();
+        if n % 16 != 0 || k % 32 != 0 {
+            return Err(format!("head: {n} rows x {k} inputs do not make MXFP8 records"));
+        }
+        let per = ((16usize << 20) / (k * 2) / 16).max(1) * 16;
+        let mut stripes: Vec<(u64, Box<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>)> = Vec::new();
+        let mut a = 0;
+        while a < n {
+            let b = (a + per).min(n);
+            let (s2, r0, m) = (s.clone(), rows.start + a, b - a);
+            stripes.push(((m / 16 * (k / 32) * 528) as u64, Box::new(move || {
+                let raw = s2.read((r0 * k * 2) as u64, (m * k * 2) as u64)?;
+                let w: Vec<f32> =
+                    raw.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect();
+                let (codes, scales) = records::mxfp8_quantize(&w, k);
+                Ok(records::mxfp8_record(&codes, &scales, k))
+            })));
+            a = b;
+        }
+        eprintln!("GR8_DS41_HEAD_MX=1: G.lm_head.mx.gv = {n} head rows x {k} as MXFP8 records ({} bytes)", n / 16 * (k / 32) * 528);
+        self.gen_striped("G.lm_head", "G.lm_head.mx.gv".into(), "u8", vec![(n / 16) as i64, (k / 32) as i64, 528], stripes);
+        Ok(())
     }
 
     /// Engram tables a rank serves: global rows [rank * part, ...) of every table, with part = ceil(n / nr) (the
@@ -1300,7 +1337,11 @@ pub unsafe extern "C" fn g6l_ds41_plan(release_dir: *const c_char, nr: u32, rank
     let t0 = Instant::now();
     let arg = |p, what| crate::cstr(p).ok_or(format!("g6l_ds41_plan: no {what}"));
     let r = (|| {
-        let opts = Opts { manifest: gr8knobs::DS_MANIFEST.get().map(str::to_string), ..Opts::default() };
+        let opts = Opts {
+            manifest: gr8knobs::DS_MANIFEST.get().map(str::to_string),
+            head_mx: gr8knobs::DS41_HEAD_MX.get(),
+            ..Opts::default()
+        };
         let p = plan(&arg(release_dir, "release dir")?, nr as usize, rank as usize, &opts)?;
         let out = arg(out_manifest, "output manifest")?;
         let zeros = vec!["0".repeat(64); p.img.tensors.len()];
