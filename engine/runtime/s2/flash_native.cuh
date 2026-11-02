@@ -3,9 +3,10 @@
 // model): steps with one live session take the solo graphs on that session's pages, steps shared by sessions the
 // batched graphs captured here, whose attention reads each row's own table (S2In, the batch views). KDA state is not
 // a paged cache: each session has its own kda_ring slots (FlashSlots), reset when it starts.
-// GR8_GLM53F_CACHE=aligned (FlashContext::ckpt, flash_checkpoint.h, --s2-sessions 1 only): the pool's prefix-reuse hooks
-// serve Flash checkpoints. A prompt's prefill keeps one at its last cold-grid point; a later prompt that starts with its
-// tokens is granted the skip, restored at bind and prefilled from there.
+// GR8_GLM53F_CACHE=aligned (FlashContext::ckpt, flash_checkpoint.h): the pool's prefix-reuse hooks serve Flash
+// checkpoints. A prompt's prefill keeps one at its last cold-grid point (its run's pages and its session's first KDA
+// slot); a later prompt that starts with its tokens is granted the skip, restored at bind into its own run and session
+// slot and prefilled from there.
 #pragma once
 #if G6_MODEL_FLASH
 #include "service.h"
@@ -48,10 +49,6 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     const unsigned pages = sc.pool_rows / PAGE;
     RunPool pool(pages, pages, sc.pool_rows);
     FlashSlots ks(int(sc.limit()), std::max(1, c.main.kda_ring));
-    // GR8_GLM53F_CACHE keeps one live request's state: one session only (its ring is session 0's; g6m4 refuses it, and
-    // GR8_GLM53F_KV_CHUNKS, with --s2-sessions > 1)
-    require(!multi || !c.ckpt, "GR8_GLM53F_CACHE needs --s2-sessions 1");
-    FlashRing& ring = ks.rings[0];
     u64 pfseq = 1, pfseq2 = 1, dseq = 0;
     LpStep lp{};
     int lp_rows = 0;
@@ -71,24 +68,31 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     const uint32_t grid = sc.prefill_rows * (sc.two_lanes ? 2 : 1);
     std::mutex ck_mu;
     std::atomic<uint64_t> claimed{0};   // the entry take() granted, restored by the bind that follows
-    uint32_t capture_at = 0;            // the live request's checkpoint point (0: none)
-    g6rt::CacheNamespace capture_ns{};
-    // the quantum that ends at capture_at has run: the capture waits for the next boundary's commits (h.before_work),
-    // so a Resize announced during the prefill and landing at that boundary sizes the store first. Until then no step
-    // runs: rows [0, capture_at) and KDA slot 0 are the ones the quantum left
-    std::vector<int> capture_tokens;
-    uint64_t capture_req = 0;
+    // each session's bound run (the retain hook finds the session of a run by it), its checkpoint point (0: none) and
+    // cache namespace
+    std::vector<Run> bound(size_t(ks.sessions()));
+    std::vector<bool> live(size_t(ks.sessions()));
+    std::vector<uint32_t> capture_at(size_t(ks.sessions()));
+    std::vector<g6rt::CacheNamespace> capture_ns(size_t(ks.sessions()));
+    // a quantum that ends at its session's capture_at has run: the capture waits for the next boundary's commits
+    // (h.before_work), so a Resize announced during the prefill and landing at that boundary sizes the store first.
+    // Until then no step runs, and no other session's work touches the session's run or KDA slots: rows [0, capture_at)
+    // and its first KDA slot are the ones the quantum left
+    struct Pending { int q; std::vector<int> tokens; uint64_t req; };
+    std::vector<Pending> pending;
     auto take_capture = [&] {
-        if (capture_tokens.empty()) return;
+        if (pending.empty()) return;
         std::lock_guard<std::mutex> l(ck_mu);
-        const uint32_t at = uint32_t(capture_tokens.size() - 1);
-        const uint64_t gen = ck->capture(at, 0, capture_tokens, capture_ns, c.stream);
-        if (gen) fprintf(stderr, "# flash ckpt request %llu kept %u rows as entry %llu (%llu blocks) in %.1f ms; %zu entries\n",
-                         (unsigned long long)capture_req, at, (unsigned long long)gen,
-                         (unsigned long long)ck->last.blocks, ck->last.ms, ck->index().size());
-        else fprintf(stderr, "# flash ckpt request %llu: %u rows do not fit the store (%llu blocks)\n",
-                     (unsigned long long)capture_req, at, (unsigned long long)ck->blocks());
-        capture_tokens.clear();
+        for (const Pending& x : pending) {
+            const uint32_t at = uint32_t(x.tokens.size() - 1);
+            const uint64_t gen = ck->capture(at, ks.base(x.q), pool.list(bound[size_t(x.q)]), x.tokens, capture_ns[size_t(x.q)], c.stream);
+            if (gen) fprintf(stderr, "# flash ckpt request %llu kept %u rows (session %d) as entry %llu (%llu blocks) in %.1f ms; %zu entries\n",
+                             (unsigned long long)x.req, at, x.q, (unsigned long long)gen,
+                             (unsigned long long)ck->last.blocks, ck->last.ms, ck->index().size());
+            else fprintf(stderr, "# flash ckpt request %llu: %u rows do not fit the store (%llu blocks)\n",
+                         (unsigned long long)x.req, at, (unsigned long long)ck->blocks());
+        }
+        pending.clear();
     };
     NativeHooks h;
     // Rows the steps wrote into the attention caches (main and draft) since the last clear: a request clears only the
@@ -119,23 +123,29 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     if (ck) {
         // a retiring run goes back to the pool: its aligned checkpoint, if any, was taken during its prefill. terminal:
         // first keep rows [0, p), p = the rows it consumed (its last output token is pending: token p), with the KDA
-        // state the ring holds for p (flash_checkpoint.h: not cold-exact). Every rank retires at the same step. A session
-        // cancelled at the boundary its aligned capture waits for: that capture first, so the entry for those tokens is
-        // the aligned one (a terminal capture of the same tokens then only touches it)
+        // state its session's ring holds for p (flash_checkpoint.h: not cold-exact). Every rank retires at the same step.
+        // A session cancelled at the boundary its aligned capture waits for: that capture first, so the entry for those
+        // tokens is the aligned one (a terminal capture of the same tokens then only touches it)
         h.pool.retain = [&](const Run& r, const g6rt::PrefixReuse& st, const g6rt::CacheNamespace& ns) {
             take_capture();
+            int q = -1;
+            for (int i = 0; i < ks.sessions(); ++i)
+                if (live[size_t(i)] && bound[size_t(i)] == r) { q = i; break; }
+            require(q >= 0, "Flash checkpoint retain: the run has no bound session");
+            live[size_t(q)] = false;
             if (c.terminal && st.history.size() > 1) {
                 const uint32_t p = uint32_t(std::min<int>(st.main_end, int(st.history.size()) - 1));
+                const FlashRing& ring = ks.rings[size_t(q)];
                 int slot = -1;
-                try { slot = ring.source(int(p)); } catch (const std::exception&) {}
+                try { slot = ks.base(q) + ring.source(int(p)); } catch (const std::exception&) {}
                 if (p > 0 && slot >= 0) {
                     const std::vector<int> tokens(st.history.begin(), st.history.begin() + p + 1);
                     std::lock_guard<std::mutex> l(ck_mu);
-                    const uint64_t gen = ck->capture(p, slot, tokens, ns, c.stream, true);
-                    if (gen) fprintf(stderr, "# flash ckpt terminal kept %u rows (KDA slot %d) as entry %llu (%llu blocks) in %.1f ms; %zu entries\n",
-                                     p, slot, (unsigned long long)gen, (unsigned long long)ck->last.blocks, ck->last.ms, ck->index().size());
+                    const uint64_t gen = ck->capture(p, slot, pool.list(r), tokens, ns, c.stream, true);
+                    if (gen) fprintf(stderr, "# flash ckpt terminal kept %u rows (session %d, KDA slot %d) as entry %llu (%llu blocks) in %.1f ms; %zu entries\n",
+                                     p, q, slot, (unsigned long long)gen, (unsigned long long)ck->last.blocks, ck->last.ms, ck->index().size());
                     else fprintf(stderr, "# flash ckpt terminal: %u rows do not fit the store (%llu blocks)\n", p, (unsigned long long)ck->blocks());
-                } else fprintf(stderr, "# flash ckpt terminal: no state for %u rows (ring %d+%d)\n", p, ring.first, ring.rows);
+                } else fprintf(stderr, "# flash ckpt terminal: no state for %u rows (session %d, ring %d+%d)\n", p, q, ring.first, ring.rows);
             }
             pool.release(r);
         };
@@ -153,10 +163,36 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             return pool.reserve(rows, worst, r);
         };
     }
+    // GR8_GLM53F_CACHE at bind, after the session's cold reset: a hit's entry into the run's rows [0, reuse) and the
+    // session's first KDA slot, then the prompt's checkpoint point
+    auto bind_ckpt = [&](const Grant& g, int q, const std::vector<int>& list) {
+        capture_at[size_t(q)] = 0;
+        if (!ck) return;
+        capture_ns[size_t(q)] = g6rt::steering::cache_namespace(g.req.steering);
+        bool exact = true;   // the rows this request starts from are cold rows (no hit, or an aligned entry)
+        if (g.reuse) {
+            const uint64_t gen = claimed.exchange(0);
+            require(gen != 0, "Flash checkpoint hit without a claimed entry");
+            std::lock_guard<std::mutex> l(ck_mu);
+            const FlashEntry* x = ck->index().find(gen);
+            require(x && x->position == g.reuse, "Flash checkpoint hit differs from its entry");
+            exact = !x->terminal;
+            ck->restore(gen, ks.base(q), list, c.stream);
+            wrote((int(g.reuse) + PAGE - 1) / PAGE * PAGE);   // whole pages of both models' caches (one session)
+            fprintf(stderr, "# flash ckpt request %llu restored %u rows (session %d, %s entry %llu, %llu blocks) in %.1f ms\n",
+                    (unsigned long long)g.req.id, g.reuse, q, exact ? "aligned" : "terminal", (unsigned long long)gen,
+                    (unsigned long long)ck->last.blocks, ck->last.ms);
+        }
+        // at == reuse: the entry that was hit holds these tokens. After a terminal hit no aligned entry is kept: its
+        // rows would not be cold rows
+        const uint32_t at = aligned_point(g.req.prompt_tokens, grid);
+        if (exact && at > g.reuse) capture_at[size_t(q)] = at;
+    };
     h.bind = [&](const Grant& g) {
         const int q = int(g.key.slot);
-        require((!g.reuse || (ck && !multi)) && q < ks.sessions(), "Flash serve requires a fresh run on a session slot");
+        require((!g.reuse || ck) && q < ks.sessions(), "Flash serve requires a fresh run on a session slot");
         const auto list = pool.list(g.run);
+        bound[size_t(q)] = g.run; live[size_t(q)] = true;
         if (multi) {
             // the run's pages into slot q's tables, cleared (not reset(), which clears the whole pool and KDA slot 0);
             // the session's first KDA slot from zero (its other slots are written before they are read)
@@ -167,6 +203,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             }
             if (c.main.kda_st.S) kda::reset(c.main.kda_st, ks.base(q), c.stream);
             ks.reset(q); lp_rows = 0; fence();
+            bind_ckpt(g, q, list);
             return;
         }
         require(g.key.slot == 0 && (!g.reuse || ck) && g.run.first_page == 0,
@@ -187,27 +224,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         }
         dirty = 0;
         ks.reset(0); lp_rows = 0; fence();
-        capture_at = 0; capture_tokens.clear();
-        if (!ck) return;
-        capture_ns = g6rt::steering::cache_namespace(g.req.steering);
-        bool exact = true;   // the rows this request starts from are cold rows (no hit, or an aligned entry)
-        if (g.reuse) {   // the cold bind's state, then rows [0, reuse) and KDA slot 0 from the entry
-            const uint64_t gen = claimed.exchange(0);
-            require(gen != 0, "Flash checkpoint hit without a claimed entry");
-            std::lock_guard<std::mutex> l(ck_mu);
-            const FlashEntry* x = ck->index().find(gen);
-            require(x && x->position == g.reuse, "Flash checkpoint hit differs from its entry");
-            exact = !x->terminal;
-            ck->restore(gen, 0, c.stream);
-            wrote((int(g.reuse) + PAGE - 1) / PAGE * PAGE);   // whole pages of both models' caches
-            fprintf(stderr, "# flash ckpt request %llu restored %u rows (%s entry %llu, %llu blocks) in %.1f ms\n",
-                    (unsigned long long)g.req.id, g.reuse, exact ? "aligned" : "terminal", (unsigned long long)gen,
-                    (unsigned long long)ck->last.blocks, ck->last.ms);
-        }
-        // at == reuse: the entry that was hit holds these tokens. After a terminal hit no aligned entry is kept: its
-        // rows would not be cold rows
-        const uint32_t at = aligned_point(g.req.prompt_tokens, grid);
-        if (exact && at > g.reuse) capture_at = at;
+        bind_ckpt(g, 0, list);
     };
     // a session cancelled at the boundary its capture waits for: its rows are still in place (the next bind resets them)
     h.retire = [&](const Slot&) { fence(); if (ck) take_capture(); };
@@ -370,10 +387,11 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         draft(c.prefill, ma, a);
         if (mb) draft(c.prefill2, mb, a + ma);
         if (cache) check();
-        if (capture_at && first + rows == capture_at) {   // the quantum that ends at the prompt's last grid point
-            require(p.prompt.size() > capture_at, "Flash checkpoint past the prompt");
-            capture_tokens.assign(p.prompt.begin(), p.prompt.begin() + capture_at + 1);
-            capture_req = slot.req.id; capture_at = 0;
+        uint32_t& at = capture_at[size_t(q)];
+        if (at && first + rows == at) {   // the quantum that ends at the prompt's last grid point
+            require(p.prompt.size() > at, "Flash checkpoint past the prompt");
+            pending.push_back(Pending{q, std::vector<int>(p.prompt.begin(), p.prompt.begin() + at + 1), slot.req.id});
+            at = 0;
         }
         if (on) c.main.s2on = c.draft.d.s2on = true;
         fprintf(stderr, "# flash serve request %llu prefill %u rows at %u (main + draft): %.3f ms\n",
