@@ -103,6 +103,14 @@ knobs:
     doc: >-
       1 = the coalesced-epilogue wo_b GEMM of a direct-send prefill chunk runs as a persistent kernel
       (k_gemm_mx8t_c2_persist).
+  GR8_DS41_ADMIT_KEEP_SCRATCH:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = with --s2-sessions 2 or more, binding a request to a session slot leaves the indexer's step scratch (the
+      shared one and each session's) as it is instead of clearing it. Every step rewrites that scratch before it reads
+      it, so the outputs do not change. A full reset still clears it.
   GR8_DS41_BORROW_TOPK:
     scope: agree
     kind: path
