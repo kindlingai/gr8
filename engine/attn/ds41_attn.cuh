@@ -544,6 +544,7 @@ struct AttnP
     int floor = 0;       // decode: window positions below this are masked (bounded replay: ring slots the chunk's tail layers never wrote); 0 = none
     const int* dsess = nullptr;   // SESS > 1 (decode): device [n] S2 slot of each row; row t at position dstart[t], its ring = kvw + slot * ring_rows * 512,
     size_t ck_ss = 0;             // its compressed rows = ck + slot * ck_ss. nullptr: one session (row t at start + t)
+    int ckq = 0;                  // 1 (GR8_DS_COMP_FP4): ck holds packed fp4 rows of CQ_ROW bytes (the ca layout), ck_ss is in bytes
     float* split = nullptr;       // optional [n][heads][2][max,sum,HD accum], shared prefill scratch
 };
 constexpr int AT_THREADS = 256, AT_QLD = HD + 8, AT_KLD = HD + 8, AT_SLD = 64 + 4, AT_PLD = 64 + 8;
@@ -566,8 +567,75 @@ __device__ __forceinline__ void mma16816(float (&c)[4], const uint32_t (&a)[4], 
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+// ------------------------------------------------------------------------------------------------ packed fp4 compressed rows (GR8_DS_COMP_FP4)
+// A packed row = 256 B of e2m1 codes (element 2k in the low nibble of byte k, sign bit 3) + 32 B of E4M3 scales (one per 16 elements): the
+// ca row layout (ds41i::CA_ROW). Its bf16 value bf16(e2m1 * scale) is what the bf16 rows hold (the product is exact in bf16, -0 keeps its sign).
+// In a slot list a packed row is its address + 1 (rows are 16 B aligned, so bit 0 is free). The 64 rows of a block split by warp: warp w
+// dequantizes rows w, w + 8, .., w + 56 into the shared K tile, lane g the 16 elements of scale g; the other rows load as before.
+// CQ_ROW / CQ_CODES: ds41_attn_types.h.
+__device__ __forceinline__ bool cq_tag(const void* rp) { return ((uintptr_t)rp & 1) != 0; }
+__device__ __forceinline__ const uint8_t* cq_row(const void* rp) { return (const uint8_t*)((uintptr_t)rp & ~(uintptr_t)1); }
+// value of an e2m1 code: magnitude index m = 2e + mantissa -> fp32 bits (m = 1 is the subnormal 0.5), sign bit 3 (code 8 = -0)
+__device__ __forceinline__ float cq_e2m1(uint32_t c)
+{
+    const uint32_t m = c & 7;
+    const uint32_t b = m >= 2 ? ((((m >> 1) + 126u) << 23) | ((m & 1) << 22)) : (m ? 0x3F000000u : 0u);
+    return __uint_as_float(b | ((c & 8) << 28));
+}
+// this lane's 8 code bytes and scale byte of the packed rows among the warp's 8 rows of slot list cl (rows that are not packed: untouched)
+__device__ __forceinline__ void cq_load(const bf16* const* cl, int w, int lane, uint2 (&cd)[8], uint32_t (&sb)[8])
+{
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+    {
+        const bf16* rp = cl[w + 8 * k];
+        if (cq_tag(rp))
+        {
+            const uint8_t* r = cq_row(rp);
+            cd[k] = __ldg((const uint2*)r + lane);
+            sb[k] = __ldg(r + CQ_CODES + lane);
+        }
+    }
+}
+// the bf16 values of those rows into the K tile (row stride AT_KLD): lane g writes elements 16g .. 16g + 15
+__device__ __forceinline__ void cq_store(bf16* Ks, int ld, const bf16* const* cl, int w, int lane, const uint2 (&cd)[8], const uint32_t (&sb)[8])
+{
+#pragma unroll
+    for (int k = 0; k < 8; k++)
+    {
+        if (!cq_tag(cl[w + 8 * k])) continue;
+        const float sc = f_e4m3((uint8_t)sb[k]);
+        uint32_t o[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++)
+        {
+            const uint32_t byte = ((j < 4 ? cd[k].x : cd[k].y) >> (8 * (j & 3))) & 0xFFu;
+            const __nv_bfloat162 v = __floats2bfloat162_rn(cq_e2m1(byte & 15) * sc, cq_e2m1(byte >> 4) * sc);
+            o[j] = *(const uint32_t*)&v;
+        }
+        uint4* dst = (uint4*)(Ks + (size_t)(w + 8 * k) * ld + lane * 16);
+        dst[0] = make_uint4(o[0], o[1], o[2], o[3]);
+        dst[1] = make_uint4(o[4], o[5], o[6], o[7]);
+    }
+}
+// slot list entry of compressed row j: bf16 row, or the tagged packed row (CQ)
+template <bool CQ>
+__device__ __forceinline__ const bf16* cq_slot(const bf16* ckr, int j)
+{
+    if (CQ) return (const bf16*)((const uint8_t*)ckr + (size_t)j * CQ_ROW + 1);
+    return ckr + (size_t)j * HD;
+}
+// this row's compressed rows: + slot * ck_ss (elements, or bytes for packed rows)
+template <bool CQ>
+__device__ __forceinline__ const bf16* cq_slab(const bf16* ck, size_t ss, int k)
+{
+    if (CQ) return (const bf16*)((const uint8_t*)ck + (size_t)k * ss);
+    return ck + (size_t)k * ss;
+}
+
 // FL = false: the plain kernel (pos >= 0). FL = true: also masks window positions below p.floor (bounded replay, k_attn_floor).
-template <bool FL>
+// CQ = true: the compressed rows are packed fp4 (p.ckq), dequantized into the K tile (output bytes == the bf16 rows).
+template <bool FL, bool CQ = false>
 __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_t(AttnP p)
 {
     extern __shared__ __align__(16) uint8_t smem[];
@@ -603,7 +671,7 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_t(AttnP p)
     {
         const int k = p.dsess[t];
         kvr += (size_t)k * R * HD;
-        if (ckr) ckr += (size_t)k * p.ck_ss;
+        if (ckr) ckr = cq_slab<CQ>(ckr, p.ck_ss, k);
     }
     for (int blk = 0; blk < nblk; blk++)
     {
@@ -628,7 +696,7 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_t(AttnP p)
             else if (i < L)
             {
                 const int j = p.topk[(size_t)t * p.ldtk + (i - p.WL)];
-                if (j >= 0) rp = ckr + (size_t)j * HD;
+                if (j >= 0) rp = cq_slot<CQ>(ckr, j);
             }
             rowp[tid] = rp;
             has = rp != nullptr;
@@ -639,9 +707,17 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_t(AttnP p)
         for (int c = tid; c < 64 * 64; c += AT_THREADS)
         {
             const bf16* rp = rowp[c >> 6];
+            if (CQ && cq_tag(rp)) continue;   // cq_store below
             uint4 v = make_uint4(0, 0, 0, 0);
             if (rp) v = ((const uint4*)rp)[c & 63];
             *(uint4*)(Ks + (c >> 6) * AT_KLD + (c & 63) * 8) = v;
+        }
+        if (CQ && (blk + 1) * 64 > p.WL)
+        {
+            uint2 cd[8];
+            uint32_t sb[8];
+            cq_load(rowp, w, lane, cd, sb);
+            cq_store(Ks, AT_KLD, rowp, w, lane, cd, sb);
         }
         __syncthreads();
         {   // S[16 heads][8 slots of this warp] = Q . K^T over 512
@@ -730,6 +806,8 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_t(AttnP p)
 // the plain kernel and the bounded replay one under plain names (tests and launch_attn take their address / launch them)
 inline void (*const k_attn)(AttnP) = k_attn_t<false>;
 inline void (*const k_attn_floor)(AttnP) = k_attn_t<true>;
+inline void (*const k_attn_q)(AttnP) = k_attn_t<false, true>;         // packed fp4 compressed rows (p.ckq)
+inline void (*const k_attn_floor_q)(AttnP) = k_attn_t<true, true>;
 
 // ------------------------------------------------------------------------------------------------ sparse attention core, cp.async gather
 // k_attn_cpa (GR8_DS_ATTN_CPA=1) = k_attn with the same arithmetic in the same order and a different way to fill smem: the 64 K rows of a
@@ -747,7 +825,8 @@ __device__ __forceinline__ void cp_async_wait0() { asm volatile("cp.async.wait_g
 __device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];\n" ::"l"(p)); }
 
 // FL = false: the plain kernel (pos >= 0). FL = true: also masks window positions below p.floor (bounded replay, k_attn_cpa_floor).
-template <bool FL>
+// CQ = true: packed fp4 compressed rows (p.ckq): plain loads issued with the cp.async group, dequantized into Ks before the block's barrier.
+template <bool FL, bool CQ = false>
 __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_t(AttnP p)
 {
     extern __shared__ __align__(16) uint8_t smem[];
@@ -783,7 +862,7 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_t(AttnP p)
     {
         const int k = p.dsess[t];
         kvr += (size_t)k * R * HD;
-        if (ckr) ckr += (size_t)k * p.ck_ss;
+        if (ckr) ckr = cq_slab<CQ>(ckr, p.ck_ss, k);
     }
     // slot list of block blk into lst; the return value (uniform) says whether any slot is live. A block with no live slot (the -1 tail
     // of a short top-k list, the masked front of a young window) changes nothing: P = 0, scale = exp(0) = 1 -> skipped
@@ -810,7 +889,7 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_t(AttnP p)
             else if (i < L)
             {
                 const int j = p.topk[(size_t)t * p.ldtk + (i - p.WL)];
-                if (j >= 0) rp = ckr + (size_t)j * HD;
+                if (j >= 0) rp = cq_slot<CQ>(ckr, j);
             }
             lst[tid] = rp;
             has = rp != nullptr;
@@ -827,22 +906,29 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_t(AttnP p)
         {
             const int c = tid + i * AT_THREADS;
             const bf16* rp = cl[c >> 6];
+            if (CQ && cq_tag(rp)) continue;   // cq_store below
             cp_async16(Ks + (c >> 6) * AT_KLD + (c & 63) * 8, rp ? (const void*)((const uint4*)rp + (c & 63)) : (const void*)p.q, rp ? 16 : 0);
         }
         cp_async_commit();
+        uint2 cd[8];
+        uint32_t sb[8];
+        const bool cqb = CQ && (cblk + 1) * 64 > p.WL;   // the block holds compressed slots (uniform)
+        if (cqb) cq_load(cl, w, lane, cd, sb);
         int nb = cblk + 1;
         const int nx = cur ^ 1;
         while (nb < nblk && !build(nb, rowp + 64 * nx)) nb++;
         if (nb < nblk)
         {
             const bf16* rp = rowp[64 * nx + (tid >> 2)];
-            if (rp)
+            if (CQ && cq_tag(rp)) prefetch_l2(cq_row(rp) + ((tid & 3) == 3 ? CQ_ROW - 1 : (tid & 3) * 128));   // the 288 B row's lines
+            else if (rp)
             {
                 prefetch_l2((const char*)rp + (tid & 3) * 256);
                 prefetch_l2((const char*)rp + (tid & 3) * 256 + 128);
             }
         }
         cp_async_wait0();
+        if (cqb) cq_store(Ks, AT_KLD, cl, w, lane, cd, sb);
         __syncthreads();
         {   // S[16 heads][8 slots of this warp] = Q . K^T over 512
             float cc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -931,8 +1017,8 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_t(AttnP p)
         }
     }
 }
-// Split-key-block variant of the existing cp.async + mma.sync core; default-off.
-template <bool FL>
+// Split-key-block variant of the existing cp.async + mma.sync core; default-off. CQ as k_attn_cpa_t.
+template <bool FL, bool CQ = false>
 __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_split_t(AttnP p)
 {
     extern __shared__ __align__(16) uint8_t smem[];
@@ -970,7 +1056,7 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_split_t(AttnP p)
     {
         const int k = p.dsess[t];
         kvr += (size_t)k * R * HD;
-        if (ckr) ckr += (size_t)k * p.ck_ss;
+        if (ckr) ckr = cq_slab<CQ>(ckr, p.ck_ss, k);
     }
     // slot list of block blk into lst; the return value (uniform) says whether any slot is live. A block with no live slot (the -1 tail
     // of a short top-k list, the masked front of a young window) changes nothing: P = 0, scale = exp(0) = 1 -> skipped
@@ -997,7 +1083,7 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_split_t(AttnP p)
             else if (i < L)
             {
                 const int j = p.topk[(size_t)t * p.ldtk + (i - p.WL)];
-                if (j >= 0) rp = ckr + (size_t)j * HD;
+                if (j >= 0) rp = cq_slot<CQ>(ckr, j);
             }
             lst[tid] = rp;
             has = rp != nullptr;
@@ -1014,22 +1100,29 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_split_t(AttnP p)
         {
             const int c = tid + i * AT_THREADS;
             const bf16* rp = cl[c >> 6];
+            if (CQ && cq_tag(rp)) continue;   // cq_store below
             cp_async16(Ks + (c >> 6) * AT_KLD + (c & 63) * 8, rp ? (const void*)((const uint4*)rp + (c & 63)) : (const void*)p.q, rp ? 16 : 0);
         }
         cp_async_commit();
+        uint2 cd[8];
+        uint32_t sb[8];
+        const bool cqb = CQ && (cblk + 1) * 64 > p.WL;   // the block holds compressed slots (uniform)
+        if (cqb) cq_load(cl, w, lane, cd, sb);
         int nb = cblk + 1;
         const int nx = cur ^ 1;
         while (nb < blk_hi && !build(nb, rowp + 64 * nx)) nb++;
         if (nb < blk_hi)
         {
             const bf16* rp = rowp[64 * nx + (tid >> 2)];
-            if (rp)
+            if (CQ && cq_tag(rp)) prefetch_l2(cq_row(rp) + ((tid & 3) == 3 ? CQ_ROW - 1 : (tid & 3) * 128));   // the 288 B row's lines
+            else if (rp)
             {
                 prefetch_l2((const char*)rp + (tid & 3) * 256);
                 prefetch_l2((const char*)rp + (tid & 3) * 256 + 128);
             }
         }
         cp_async_wait0();
+        if (cqb) cq_store(Ks, AT_KLD, cl, w, lane, cd, sb);
         __syncthreads();
         {   // S[16 heads][8 slots of this warp] = Q . K^T over 512
             float cc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -1140,6 +1233,8 @@ __global__ void __launch_bounds__(AT_THREADS) k_attn_cpa_split_merge(AttnP p)
 // the plain kernel and the bounded replay one under plain names (tests and launch_attn take their address / launch them)
 inline void (*const k_attn_cpa)(AttnP) = k_attn_cpa_t<false>;
 inline void (*const k_attn_cpa_floor)(AttnP) = k_attn_cpa_t<true>;
+inline void (*const k_attn_cpa_q)(AttnP) = k_attn_cpa_t<false, true>;   // packed fp4 compressed rows (p.ckq)
+inline void (*const k_attn_cpa_floor_q)(AttnP) = k_attn_cpa_t<true, true>;
 
 // ------------------------------------------------------------------------------------------------ ratio-2 compressor
 // x bf16 [M][K=5120] . W bf16 [N=512][K]^T for two weight matrices (wkv, wgate) -> fp32 [M][512] each. fp32 math; the weights are
@@ -1183,6 +1278,27 @@ __global__ void __launch_bounds__(256) k_f32gemm2(const bf16* __restrict__ x, co
             if (m0 + ty * 2 + i < M && n0 + tx * 4 + j < N) Y[(size_t)(m0 + ty * 2 + i) * N + n0 + tx * 4 + j] = acc[i][j];
 }
 
+// Store compressed row grp, element c (a = the 16-group's |max|, x = the roped value): fp4 quantize with an E4M3 scale per 16. ck: the bf16
+// row bf16(e2m1 * scale). ckq != null (GR8_DS_COMP_FP4): the packed CQ_ROW row instead, the same code (sign kept, so -0 stays -0) and scale.
+__device__ __forceinline__ void comp_store(bf16* ck, uint8_t* ckq, int grp, int c, float a, float x)
+{
+    const uint8_t sc8 = (uint8_t)__nv_cvt_float_to_fp8(a / 6.0f, __NV_SATFINITE, __NV_E4M3);
+    const float sc = f_e4m3(sc8);
+    const float q = e2m1_rne(fminf(fmaxf(x / sc, -6.0f), 6.0f));
+    if (!ckq)
+    {
+        ck[(size_t)grp * HD + c] = __float2bfloat16_rn(q * sc);
+        return;
+    }
+    const float aq = fabsf(q);   // q is e2m1-valued: its magnitude index, the cq_e2m1 inverse
+    const uint32_t code = (uint32_t)((aq > 0.25f) + (aq >= 0.75f) + (aq > 1.25f) + (aq >= 1.75f) + (aq > 2.5f) + (aq >= 3.5f) + (aq > 5.0f)) |
+                          (signbit(q) ? 8u : 0u);
+    const uint32_t nb = __shfl_xor_sync(0xFFFFFFFFu, code, 1);
+    uint8_t* row = ckq + (size_t)grp * CQ_ROW;
+    if ((c & 1) == 0) row[c >> 1] = (uint8_t)(code | (nb << 4));
+    if ((c & 15) == 0) row[CQ_CODES + (c >> 4)] = sc8;
+}
+
 // Pool pairs of tokens into compressed rows. Prefill (start == 0): block j pools tokens 2j, 2j+1 -> row j; with n odd, block n/2
 // parks the last token in the state slot 0. Decode (n == 1, start > 0): the token fills state slot start % 2 and, when it
 // completes a pair, row start / 2 is produced from the two slots. Row = softmax pool -> bf16 -> RMSNorm -> rope at position 2j
@@ -1190,7 +1306,7 @@ __global__ void __launch_bounds__(256) k_f32gemm2(const bf16* __restrict__ x, co
 // pre-rope row at index grp - first group of this call (the indexer's K input).
 __global__ void __launch_bounds__(512) k_comp_pool(const float* __restrict__ kvf, const float* __restrict__ scf, int n, int start,
                                                    const bf16* __restrict__ nw, const float* __restrict__ inv, bf16* ck, float* kvs,
-                                                   float* scs, bf16* lat_dbg, bf16* nrm)
+                                                   float* scs, bf16* lat_dbg, bf16* nrm, uint8_t* ckq = nullptr)
 {
     __shared__ float sh[32];
     const int c = threadIdx.x;
@@ -1244,9 +1360,7 @@ __global__ void __launch_bounds__(512) k_comp_pool(const float* __restrict__ kvf
     float a = fabsf(x);
     for (int o = 8; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFFu, a, o));
     a = fmaxf(a, 6.0f * 0.001953125f);   // 6 * 2^-9
-    const float sc = f_e4m3((uint8_t)__nv_cvt_float_to_fp8(a / 6.0f, __NV_SATFINITE, __NV_E4M3));
-    const float q = e2m1_rne(fminf(fmaxf(x / sc, -6.0f), 6.0f));
-    ck[(size_t)grp * HD + c] = __float2bfloat16_rn(q * sc);
+    comp_store(ck, ckq, grp, c, a, x);
 }
 
 // Device-start form (the engine step): rows are positions start .. start+n-1 with start read from the device. Block k pools the k-th
@@ -1258,7 +1372,7 @@ __global__ void __launch_bounds__(512) k_comp_pool(const float* __restrict__ kvf
 __global__ void __launch_bounds__(512) k_comp_pool_dev(const float* __restrict__ kvf, const float* __restrict__ scf, int n, const int* dstart,
                                                        const bf16* __restrict__ nw, const float* __restrict__ inv, bf16* ck,
                                                        const float* __restrict__ kvs, const float* __restrict__ scs, bf16* nrm,
-                                                       const int* dsess = nullptr, size_t ck_ss = 0)
+                                                       const int* dsess = nullptr, size_t ck_ss = 0, uint8_t* ckq = nullptr)
 {
     __shared__ float sh[32];
     const int c = threadIdx.x, k = blockIdx.x;
@@ -1272,7 +1386,8 @@ __global__ void __launch_bounds__(512) k_comp_pool_dev(const float* __restrict__
     if (dsess)
     {
         const int s = dsess[row0];
-        ck += (size_t)s * ck_ss;
+        if (ckq) ckq += (size_t)s * ck_ss;   // packed rows: ck_ss in bytes
+        else ck += (size_t)s * ck_ss;
         kvs += (size_t)s * 2 * HD;
         scs += (size_t)s * 2 * HD;
     }
@@ -1301,9 +1416,7 @@ __global__ void __launch_bounds__(512) k_comp_pool_dev(const float* __restrict__
     float a = fabsf(x);
     for (int o = 8; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFFu, a, o));
     a = fmaxf(a, 6.0f * 0.001953125f);
-    const float sc = f_e4m3((uint8_t)__nv_cvt_float_to_fp8(a / 6.0f, __NV_SATFINITE, __NV_E4M3));
-    const float q = e2m1_rne(fminf(fmaxf(x / sc, -6.0f), 6.0f));
-    ck[(size_t)grp * HD + c] = __float2bfloat16_rn(q * sc);
+    comp_store(ck, ckq, grp, c, a, x);
 }
 // After the call: when its last position is even, that token is the pending half of the next pair -> state slot 0.
 // SESS > 1: one block per session (grid = sessions, rows as k_comp_pool_dev), each parks into its slot's kvs / scs.
@@ -1495,20 +1608,27 @@ inline void launch_attn(const AttnP& p, cudaStream_t st)
         cudaFuncSetAttribute(k_attn_floor, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM);
         cudaFuncSetAttribute(k_attn_cpa_floor, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_CPA);
         cudaFuncSetAttribute(k_attn_cpa_split_t<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_CPA);
+        cudaFuncSetAttribute(k_attn_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM);
+        cudaFuncSetAttribute(k_attn_cpa_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_CPA);
+        cudaFuncSetAttribute(k_attn_floor_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM);
+        cudaFuncSetAttribute(k_attn_cpa_floor_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_CPA);
+        cudaFuncSetAttribute(k_attn_cpa_split_t<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_CPA);
         init = true;
     }
+    const bool q = p.ckq != 0 && p.TK > 0;   // packed fp4 compressed rows: the _q kernels (same arithmetic, the rows dequantized in the gather)
+    const dim3 g(p.n, p.heads / 16);
     if (p.floor > 0) {   // bounded replay range B (ds41_attn_set_win_floor): the _floor kernels; floor 0 runs the plain kernels
-        if (g_attn_cpa) k_attn_cpa_floor<<<dim3(p.n, p.heads / 16), AT_THREADS, AT_SMEM_CPA, st>>>(p);
-        else k_attn_floor<<<dim3(p.n, p.heads / 16), AT_THREADS, AT_SMEM, st>>>(p);
+        if (g_attn_cpa) (q ? k_attn_cpa_floor_q : k_attn_cpa_floor)<<<g, AT_THREADS, AT_SMEM_CPA, st>>>(p);
+        else (q ? k_attn_floor_q : k_attn_floor)<<<g, AT_THREADS, AT_SMEM, st>>>(p);
         return;
     }
     // W-prefill passes a device dstart and therefore uses the decode-form ring path even at 4096 rows.
     // A width threshold, not p.decode, separates wide prefill from 8/32-session decode batches.
     if (g_attn_split && g_attn_cpa && p.split && split_eligible(p.n, p.WL, p.TK)) {
-        k_attn_cpa_split_t<false><<<dim3(p.n, p.heads / 16, 2), AT_THREADS, AT_SMEM_CPA, st>>>(p);
-        k_attn_cpa_split_merge<<<dim3(p.n, p.heads / 16), AT_THREADS, 0, st>>>(p);
-    } else if (g_attn_cpa) k_attn_cpa<<<dim3(p.n, p.heads / 16), AT_THREADS, AT_SMEM_CPA, st>>>(p);
-    else k_attn<<<dim3(p.n, p.heads / 16), AT_THREADS, AT_SMEM, st>>>(p);
+        (q ? k_attn_cpa_split_t<false, true> : k_attn_cpa_split_t<false>)<<<dim3(p.n, p.heads / 16, 2), AT_THREADS, AT_SMEM_CPA, st>>>(p);
+        k_attn_cpa_split_merge<<<g, AT_THREADS, 0, st>>>(p);
+    } else if (g_attn_cpa) (q ? k_attn_cpa_q : k_attn_cpa)<<<g, AT_THREADS, AT_SMEM_CPA, st>>>(p);
+    else (q ? k_attn_q : k_attn)<<<g, AT_THREADS, AT_SMEM, st>>>(p);
 }
 
 // ---- the four stages of the step plan (runtime/ds41_ops.h): each is async on `st` and reads/writes only what its comment lists.
@@ -1554,13 +1674,13 @@ inline void comp_row(const Weights& W, Cache& C, const Scratch& S, const bf16* y
     {
         const int ns = S.sess ? S.ns : 1;   // sessions of n / ns rows each (the op checks n % ns == 0)
         k_comp_pool_dev<<<dim3((n / ns + 1) / 2, ns), 512, 0, st>>>(S.ckv, S.csc, n, dstart, W.c_norm, W.inv, C.comp, C.kvs, C.scs, S.cnorm,
-                                                                  S.sess, C.comp_ss);
+                                                                  S.sess, C.comp_ss, C.compq);
         k_comp_state<<<ns, 512, 0, st>>>(S.ckv, S.csc, n, dstart, C.kvs, C.scs, S.sess);
         return;
     }
     if (start == 0)
     {
-        k_comp_pool<<<(n + 1) / 2, 512, 0, st>>>(S.ckv, S.csc, n, 0, W.c_norm, W.inv, C.comp, C.kvs, C.scs, nullptr, S.cnorm);
+        k_comp_pool<<<(n + 1) / 2, 512, 0, st>>>(S.ckv, S.csc, n, 0, W.c_norm, W.inv, C.comp, C.kvs, C.scs, nullptr, S.cnorm, C.compq);
         return;
     }
     int done = 0;
@@ -1568,7 +1688,7 @@ inline void comp_row(const Weights& W, Cache& C, const Scratch& S, const bf16* y
     {
         const int pos = start + r;
         k_comp_pool<<<1, 512, 0, st>>>(S.ckv + (size_t)r * HD, S.csc + (size_t)r * HD, 1, pos, W.c_norm, W.inv, C.comp, C.kvs, C.scs, nullptr,
-                                       S.cnorm + (size_t)done * HD);
+                                       S.cnorm + (size_t)done * HD, C.compq);
         if (pos & 1) done++;
     }
 }
@@ -1590,7 +1710,7 @@ inline void attn_core(const Weights& W, const Cache& C, const bf16* comp_src, co
     a.ldtk = ldtk; a.n = n; a.heads = heads; a.start = start; a.dstart = dstart;
     a.decode = decode; a.WL = decode ? WIN : (n < WIN ? n : WIN); a.ring_rows = C.ring_rows; a.TK = TK; a.scale = SOFTMAX_SCALE;
     a.floor = decode ? g_win_floor : 0;
-    a.dsess = decode && dstart ? S.sess : nullptr; a.ck_ss = C.src_ss;
+    a.dsess = decode && dstart ? S.sess : nullptr; a.ck_ss = C.src_ss; a.ckq = C.src_q;
     a.split = S.attn_split;
     launch_attn(a, st);
 }

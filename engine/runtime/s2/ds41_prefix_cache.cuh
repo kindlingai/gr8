@@ -2,9 +2,9 @@
 // Stores prefix snapshots [0, p) (any p >= 1, even or odd) in lazily allocated device slabs
 // bounded by GR8_DS_CACHE_MIB (default 4096 MiB per rank) with LRU eviction.
 // A snapshot at position p consists of:
-//   - Main model attention (40 layers): C.ring (ring_rows x 512 bf16) + C.comp + C.kvs/C.scs at ratio-2 sources 2,8,14
+//   - Main model attention (40 layers): C.ring (ring_rows x 512 bf16) + C.comp (or C.compq, 288 B rows: GR8_DS_COMP_FP4) + C.kvs/C.scs at ratio-2 sources 2,8,14
 //   - Indexer / ratio-1 KV (Ds41IdxModel): ica[0..2] planar codes+sf for p/2 rows, ica[3] planar codes+sf for p rows,
-//     ca[3] (p x 288 B), shadow (p x 512 bf16)
+//     ca[3] (p x 288 B), shadow (p x 512 bf16; none with GR8_DS_COMP_FP4)
 //   - Engram token ring (ehist): 64 int32 entries reconstructed from tokens[0..p)
 //   - DSpark draft model (3 layers, when enabled): C.ring (ring_rows x 512 bf16)
 // No device kernels are added or modified here; all transfers use cudaMemcpyAsync on the session stream.
@@ -100,8 +100,8 @@ public:
             const Ds41AttnLayer* a = ds41_attn_state(main_, i);
             if (!a) continue;
             total += size_t(a->C.ring_rows) * ds41a::HD * sizeof(__nv_bfloat16);
-            if (a->C.comp) {
-                total += p2 * ds41a::HD * sizeof(__nv_bfloat16);
+            if (a->C.comp || a->C.compq) {   // GR8_DS_COMP_FP4: packed 288 B rows
+                total += p2 * (a->C.compq ? size_t(ds41a::CQ_ROW) : ds41a::HD * sizeof(__nv_bfloat16));
                 if (a->C.kvs) total += 2 * ds41a::HD * sizeof(float);
                 if (a->C.scs) total += 2 * ds41a::HD * sizeof(float);
             }
@@ -294,8 +294,9 @@ private:
             if (!a) continue;
             const size_t ring_elems = size_t(a->C.ring_rows) * ds41a::HD;
             xfer(a->C.ring + q * ring_elems, ring_elems * sizeof(__nv_bfloat16));
-            if (a->C.comp) {
-                xfer(a->C.comp + q * a->C.comp_ss, p2 * ds41a::HD * sizeof(__nv_bfloat16));
+            if (a->C.comp || a->C.compq) {
+                if (a->C.compq) xfer(a->C.compq + q * a->C.comp_ss, p2 * size_t(ds41a::CQ_ROW));   // GR8_DS_COMP_FP4
+                else xfer(a->C.comp + q * a->C.comp_ss, p2 * ds41a::HD * sizeof(__nv_bfloat16));
                 if (a->C.kvs) xfer(a->C.kvs + q * 2 * ds41a::HD, 2 * ds41a::HD * sizeof(float));
                 if (a->C.scs) xfer(a->C.scs + q * 2 * ds41a::HD, 2 * ds41a::HD * sizeof(float));
             }

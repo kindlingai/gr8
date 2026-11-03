@@ -12,6 +12,7 @@ typedef __nv_bfloat16 bf16;
 
 constexpr int HID = 5120, QA = 1280, HD = 512, ROPE = 64, NOPE = 448, WIN = 128, OLORA = 1024, HPG = 8;   // HPG: heads per o group
 constexpr int GROUP_IN = HPG * HD;                      // 4096, one o group's input width
+constexpr int CQ_ROW = 288, CQ_CODES = 256;              // a packed fp4 compressed row (GR8_DS_COMP_FP4): e2m1 codes, then E4M3 scales / 16
 constexpr float EPS = 1e-20f;
 constexpr float INV448 = 0.002232142857142857f;         // fp32(1/448), the activation scale's constant
 constexpr float SOFTMAX_SCALE = 0.04419417382415922f;   // 512^-0.5 (fp32 below)
@@ -39,8 +40,12 @@ struct Cache
     bf16* comp;        // [R][512] compressed rows: written by a source layer, read (source layer's cache) by every compressed layer
     float *kvs, *scs;  // [2][512] compressor state, source layers only
     // SESS > 1 (Scratch::sess set): one slab per S2 slot. ring: slot k at ring + k * ring_rows * 512; kvs / scs: + k * 2 * 512;
-    size_t comp_ss = 0;   // comp: + k * comp_ss elements (this layer's own rows, comp_rows * 512)
+    size_t comp_ss = 0;   // comp: + k * comp_ss elements (this layer's own rows, comp_rows * 512); compq: + k * comp_ss bytes (comp_rows * 288)
     size_t src_ss = 0;    // the comp_src this layer's attention core reads: + k * src_ss (its source's comp_ss, or the indexer's shadow stride)
+    // GR8_DS_COMP_FP4: compq replaces comp (null then): [R][288] packed fp4 rows (256 B e2m1 codes, 32 B E4M3 scales: the ca layout),
+    // the same values. src_q = 1: the comp_src is packed rows (a source's compq, or the indexer's layer-20 ca rows) and src_ss is in bytes.
+    uint8_t* compq = nullptr;
+    int src_q = 0;
 };
 // Scratch for M rows (carve one allocation of Scratch::bytes(M, heads)).
 struct Scratch

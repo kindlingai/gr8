@@ -246,10 +246,16 @@ inline int ds41_idx_bind(void* model, int i, int capacity, void* stream)
         w.wqb_codes = q.w; w.wqb_scales = q.s; w.wqb_gv = q.gv;
         w.wproj = bf16_mat(m, l, "idx.weights_proj", geom::IDX_HEADS, HID);
     }
-    if (l >= 20 && !S.shadow) S.shadow = (__nv_bfloat16*)zalloc((size_t)S.slots * (capacity + S.rcap) * 512 * 2);
+    const bool fp4 = knob::ds_comp_fp4();   // GR8_DS_COMP_FP4: layers 20..39 read the layer-20 ca rows themselves (no bf16 shadow)
+    if (l >= 20 && !fp4 && !S.shadow) S.shadow = (__nv_bfloat16*)zalloc((size_t)S.slots * (capacity + S.rcap) * 512 * 2);
     a->topk = S.topk;
     a->ldtk = geom::IDX_TOPK;
-    if (l >= 20) { a->comp_src = S.shadow; a->C.src_ss = (size_t)(capacity + S.rcap) * 512; }   // the shadow's slot stride = the layer-20 ca slab (rows_kv)
+    if (l >= 20 && fp4)
+    {
+        if (!S.ca[3]) die("DS41 indexer bind: GR8_DS_COMP_FP4=1 needs layer 20 bound before layer " + std::to_string(l));
+        a->comp_src = (const __nv_bfloat16*)S.ca[3]; a->C.src_ss = (size_t)S.rows_kv[3] * DS41_CA_ROW; a->C.src_q = 1;   // row = position, slab = slot (as the shadow)
+    }
+    else if (l >= 20) { a->comp_src = S.shadow; a->C.src_ss = (size_t)(capacity + S.rcap) * 512; }   // the shadow's slot stride = the layer-20 ca slab (rows_kv)
     w.bound = true;
     (void)stream;
     return 0;
