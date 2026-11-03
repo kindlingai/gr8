@@ -199,8 +199,10 @@ knobs:
       keep every session's verify rows within the step's row cap (min(GR8_DS_MTP, max_rows / sessions - 1)), and a draft
       step of more than 6 sessions runs as launches of at most 6. At GR8_DS_MTP=5 and 32 rows: 1-5 active: 5 drafts (6
       rows a session, the same as with the knob off); 6: 4; 7-8: 3; 9-10: 2; 11-16: 1; above 16: none. Lower GR8_DS_MTP
-      values use the same row-budget rule, so they can change drafting below six active sessions too. 0: today's drafting
-      limits (at GR8_DS_MTP=5, no drafts above 5 active sessions). Needs --serve and GR8_DS_MTP 1..5; --s2-sessions 1..32.
+      values use the same row-budget rule: 1-5 active sessions draft as with the knob off, drafts are first cut at 7
+      (GR8_DS_MTP=4), 9 (3), 11 (2) or 17 (1) active, and drafting goes on up to 16 active sessions. 0: today's drafting
+      limits (no drafts above 6 active sessions, above 5 at GR8_DS_MTP=5). Needs --serve and GR8_DS_MTP 1..5;
+      --s2-sessions 1..32.
   GR8_DS_SPAN:
     scope: local
     kind: int
