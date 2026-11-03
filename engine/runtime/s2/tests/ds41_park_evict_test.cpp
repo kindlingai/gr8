@@ -51,6 +51,7 @@ namespace g6s2 { struct Ds41Dspark { g6rt::Model draft; }; }
 #define GR8_DS41_PREFIX_CACHE_STANDALONE 1
 #include "s2/ds41_prefix_cache.cuh"
 #include "s2/driver.h"
+#include <algorithm>
 #include <array>
 #include <map>
 #include <memory>
@@ -74,7 +75,7 @@ struct Fixture {
 
 // the bind's eviction of a parked slot, as ds41_native.cuh runs it (keep = the grant's claimed generation)
 static uint64_t evict_parked(Ds41PrefixCache* ck, int q, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& n, uint64_t keep) {
-    const uint64_t gen = ck->capture(q, pos, tokens, n, 0, keep);
+    const uint64_t gen = ck->capture(q, pos, tokens, n, 0, g6s2::Ds41Snap::RequestEnd, 0, false, keep);
     g6s2::require(!keep || ck->find(keep), "DS41 park: the evicted chat's capture evicted the grant's own snapshot");
     return gen;
 }
@@ -217,6 +218,167 @@ static void admission(bool fp4, bool pressure)
            fp4 ? "FP4" : "BF16", pressure ? " alloc-pressure" : "", slot);
 }
 
+
+// GR8_DS_PARK with GR8_DS_CACHE_REPLACE (Ds41SnapSlots park / evict_parked / resume): the same request sequence, served once
+// as ds41_native.cuh does with PARK=0 (retain captures the request end at the finish) and once with PARK=1 (the finished chat
+// parks: a follow-up that extends it resumes the slot, a new chat with no free slot evicts the oldest parked one), frees the
+// same snapshots (replaced, siblings) and ends with the same prompt-end entries; the request-end entries differ only by
+// capture timing: a resumed chat's request end is never captured (the follow-up continues in the slot). Three chat shapes,
+// interleaved on 2 slots: tools (the next prompt keeps the reply), thinking without tools (it drops the reply: only the
+// prompt-end snapshot matches, the PE path, not a resume), retry (the same prompt again).
+struct Native {
+    bool park;
+    Fixture f{false};
+    Ds41PrefixCache ck{f.m, nullptr, 64};
+    g6s2::Ds41SnapSlots snaps{2};
+    struct Parked { bool on = false; uint32_t pos = 0; std::vector<int> tokens; uint64_t order = 0; };
+    std::array<Parked, 2> parked{};
+    uint64_t parks = 0;
+    long resumes = 0, evictions = 0;
+    std::vector<std::vector<int>> resumed;   // the request ends a resume continued from (never captured with park)
+    explicit Native(bool p) : park(p) {}
+    // one request: admission (the head's match and take), bind, prompt-end capture, finish (retain or park)
+    void serve(const std::vector<int>& prompt, const std::vector<int>& reply) {
+        const auto n = ns(1);
+        const int limit = int(prompt.size()) - 1;
+        const g6s2::Ds41PrefixHit hit = ck.match(prompt, limit, n);
+        int q = -1;
+        bool resume = false;
+        if (park) {
+            for (int i = 0; i < 2; ++i) {   // the parked slot the prompt extends, as far as the cache's hit at least
+                const Parked& k = parked[size_t(i)];
+                if (k.on && k.pos && int(k.pos) <= limit && g6rt::PrefixReuse::common_prefix(k.tokens, prompt) >= int(k.pos) &&
+                    (!hit.hit || k.pos >= hit.position) && (q < 0 || k.pos > parked[size_t(q)].pos)) q = i;
+            }
+            resume = q >= 0;
+            if (!resume) {   // a free slot, else the oldest parked one
+                for (int i = 0; i < 2 && q < 0; ++i) if (!parked[size_t(i)].on) q = i;
+                if (q < 0) q = parked[0].order < parked[1].order ? 0 : 1;
+            }
+        } else q = 0;
+        const uint64_t keep = !resume && hit.hit ? hit.generation : 0;
+        if (park) {   // the bind's parked part
+            Parked& k = parked[size_t(q)];
+            if (resume) { snaps.resume(ck, q, k.pos, k.tokens, n); resumed.push_back(k.tokens); ++resumes; }
+            else if (k.on) {
+                snaps.evict_parked(ck, q, k.pos, k.tokens, n, 0, keep);
+                CHECK(!keep || ck.find(keep));
+                ++evictions;
+            }
+            k = Parked{};
+        }
+        if (!resume) {
+            snaps.reset(q);
+            if (keep) snaps.restore(ck, keep, q, 0);
+        }
+        snaps.capture_prompt_end(ck, q, uint32_t(limit), prompt, n, 0);
+        std::vector<int> hist = prompt;
+        hist.insert(hist.end(), reply.begin(), reply.end());
+        const uint32_t p = uint32_t(hist.size()) - 1;
+        if (park) {
+            Parked& k = parked[size_t(q)];
+            k.on = true; k.pos = p; k.tokens.assign(hist.begin(), hist.begin() + p); k.order = ++parks;
+            snaps.park(ck, q, p, k.tokens, n);
+        } else {
+            snaps.capture_request_end(ck, q, p, hist, n, 0);
+            snaps.reset(q);
+        }
+    }
+    void flush() {   // evict every parked chat, oldest first (a later new chat would)
+        for (int r = 0; r < 2; ++r) {
+            int q = -1;
+            for (int i = 0; i < 2; ++i) if (parked[size_t(i)].on && (q < 0 || parked[size_t(i)].order < parked[size_t(q)].order)) q = i;
+            if (q < 0) break;
+            Parked& k = parked[size_t(q)];
+            snaps.evict_parked(ck, q, k.pos, k.tokens, ns(1), 0, 0);
+            k = Parked{};
+        }
+    }
+};
+static std::vector<std::pair<int, std::vector<int>>> stored(const Ds41PrefixCache& ck, g6s2::Ds41Snap kind) {
+    std::vector<std::pair<int, std::vector<int>>> v;
+    for (const auto& e : ck.entries()) if (e.kind == kind) v.push_back({int(e.position), e.tokens});
+    std::sort(v.begin(), v.end());
+    return v;
+}
+static void combined() {
+    using g6s2::Ds41Snap;
+    // chat 1 tools, chat 2 thinking without tools, chat 3 retry; 3 turns each in the order 1a 2a 1b 3a 1c 2b 3b 2c 3c (chat 1's
+    // follow-ups come while it is parked: resumes; the others evict); replies of 6..9 tokens
+    auto gen = [](int chat, int turn, int n, int salt) { std::vector<int> v; for (int i = 0; i < n; ++i) v.push_back(1 + (chat * 131 + turn * 17 + i * 7 + salt) % 997); return v; };
+    std::array<std::vector<int>, 4> prompt, last_reply;
+    std::array<int, 4> turns{};
+    std::vector<std::pair<std::vector<int>, std::vector<int>>> seq;
+    for (int chat : {1, 2, 1, 3, 1, 2, 3, 2, 3}) {
+        const int turn = turns[size_t(chat)]++;
+        std::vector<int> pr = prompt[size_t(chat)];
+        const std::vector<int> reply = gen(chat, turn, 6 + (chat + turn) % 4, 500);
+        if (turn == 0) pr = gen(chat, 0, 40 + 10 * chat, 0);
+        else if (chat == 1) { pr.insert(pr.end(), last_reply[1].begin(), last_reply[1].end()); auto x = gen(chat, turn, 12, 9); pr.insert(pr.end(), x.begin(), x.end()); }
+        else if (chat == 2) { auto x = gen(chat, turn, 12, 9); pr.insert(pr.end(), x.begin(), x.end()); }
+        // chat 3: a retry, the same prompt
+        prompt[size_t(chat)] = pr; last_reply[size_t(chat)] = reply;
+        seq.push_back({pr, reply});
+    }
+    Native off(false), on(true);
+    for (const auto& [pr, re] : seq) { off.serve(pr, re); on.serve(pr, re); }
+    on.flush();
+    CHECK(on.resumes == 2 && on.evictions >= 2);   // chat 1's turns 2 and 3 resume; the rest evict
+    CHECK(on.ck.replaced() == off.ck.replaced() && on.ck.siblings() == off.ck.siblings());
+    CHECK(stored(on.ck, Ds41Snap::PromptEnd) == stored(off.ck, Ds41Snap::PromptEnd));
+    // request ends: PARK=1's are PARK=0's less the ones a resume continued from
+    auto re_on = stored(on.ck, Ds41Snap::RequestEnd), re_off = stored(off.ck, Ds41Snap::RequestEnd);
+    for (const auto& t : on.resumed) {
+        auto it = std::find(re_off.begin(), re_off.end(), std::make_pair(int(t.size()), t));
+        CHECK(it != re_off.end());
+        if (it != re_off.end()) re_off.erase(it);
+    }
+    CHECK(re_on == re_off);
+    for (const auto& e : on.ck.entries()) CHECK(!(e.sibling >> 63));   // no placeholder left after the flush
+    printf("ds41_park_evict_test combined (GR8_DS_CACHE_REPLACE=%d): %zu requests, %ld resumes, %ld evictions; replaced %llu siblings %llu "
+           "(PARK=0 %llu %llu), prompt-end entries %zu (PARK=0 %zu), request-end %zu (PARK=0 %zu, %zu resumed)\n", int(knob::ds_cache_replace()),
+           seq.size(), on.resumes, on.evictions, (unsigned long long)on.ck.replaced(), (unsigned long long)on.ck.siblings(),
+           (unsigned long long)off.ck.replaced(), (unsigned long long)off.ck.siblings(), stored(on.ck, Ds41Snap::PromptEnd).size(),
+           stored(off.ck, Ds41Snap::PromptEnd).size(), re_on.size(), stored(off.ck, Ds41Snap::RequestEnd).size(), on.resumed.size());
+}
+
+// (a) the eviction capture of a parked chat is a request-end entry linked to its prompt-end one, as retain's; (c) a thinking
+// follow-up (only the prompt-end entry matches) takes the PE path, not a resume, and frees the parked request end as the
+// restore of its sibling would
+static void lifecycle() {
+    using g6s2::Ds41Snap;
+    std::vector<int> a(60); for (int i = 0; i < 60; ++i) a[size_t(i)] = 3 + i;
+    const std::vector<int> reply{901, 902, 903, 904, 905, 906, 907};
+    {   // (a)
+        Native on(true);
+        on.serve(a, reply);
+        std::vector<int> b(50, 77);
+        on.serve(b, reply);
+        std::vector<int> c(45, 55);
+        on.serve(c, reply);   // no free slot: evicts chat a
+        const g6s2::Ds41PrefixEntry *pe = nullptr, *re = nullptr;
+        for (const auto& e : on.ck.entries()) {
+            if (e.position == 59 && e.kind == Ds41Snap::PromptEnd) pe = &e;
+            if (e.position == 66 && e.kind == Ds41Snap::RequestEnd) re = &e;
+        }
+        const bool rp = knob::ds_cache_replace();   // GR8_DS_CACHE_REPLACE=0: no links, as retain's
+        CHECK(pe && re && on.evictions == 1 && pe->sibling == (rp ? re->generation : 0) && re->sibling == (rp ? pe->generation : 0));
+    }
+    {   // (c)
+        Native on(true), off(false);
+        std::vector<int> think = a;
+        for (int i = 0; i < 10; ++i) think.push_back(400 + i);   // drops the reply
+        for (Native* n : {&on, &off}) { n->serve(a, reply); n->serve(think, reply); }
+        CHECK(on.resumes == 0 && on.ck.hits() == 1 && off.ck.hits() == 1);   // the PE path on both
+        on.flush();
+        CHECK(on.ck.siblings() == off.ck.siblings() && on.ck.siblings() == (knob::ds_cache_replace() ? 1u : 0u));
+        CHECK(stored(on.ck, Ds41Snap::RequestEnd).size() == stored(off.ck, Ds41Snap::RequestEnd).size());
+        CHECK(stored(on.ck, Ds41Snap::PromptEnd) == stored(off.ck, Ds41Snap::PromptEnd));
+    }
+    printf("ds41_park_evict_test lifecycle (GR8_DS_CACHE_REPLACE=%d): eviction capture is RequestEnd (linked to its PE with replace); "
+           "a thinking follow-up takes the PE path\n", int(knob::ds_cache_replace()));
+}
+
 int main() {
     for (bool fp4 : {false, true}) {
         tight_budget(fp4, false);
@@ -225,8 +387,10 @@ int main() {
         admission(fp4, false);
         admission(fp4, true);
     }
+    combined();
+    lifecycle();
     CHECK(mem.empty());
     if (fails) { fprintf(stderr, "ds41_park_evict_test: %d FAIL\n", fails); return 1; }
-    puts("ds41_park_evict_test: ok (10 cases)");
+    puts("ds41_park_evict_test: ok (12 cases)");
     return 0;
 }

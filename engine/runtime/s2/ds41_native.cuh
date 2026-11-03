@@ -172,6 +172,8 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
                     Parked& k = parked[size_t(q)];
                     k.on = p > 0; k.pos = p; k.ns = ns;
                     k.tokens.assign(st.history.begin(), st.history.begin() + std::min<size_t>(p, st.history.size()));
+                    if (k.on) snaps.park(*ck, q, p, k.tokens, ns);   // GR8_DS_CACHE_REPLACE bookkeeping of the request end, now
+                    else snaps.reset(q);
                 }
                 fprintf(stderr, "# rank %d ds41 park slot %d pos %u\n", c.main.rank, q, p);
                 bound_live[size_t(q)] = false;
@@ -199,11 +201,14 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
                 Parked& k = parked[size_t(q)];
                 if (resume) {
                     require(cs == q && k.on && k.pos == g.reuse, "DS41 park: the claimed parked slot differs from the grant");
+                    snaps.resume(*ck, q, k.pos, k.tokens, k.ns);   // the slot's snapshot state as a restore of its request end
                     last = std::move(k.tokens);
                 } else if (k.on) {
-                    // this grant's own cache hit, restored below: the capture never evicts it (skipped when only it is in the way)
+                    // the request-end capture retain would have made at the finish (GR8_DS_CACHE_REPLACE kind and sibling link,
+                    // from the slot's snapshot state, kept since the park). This grant's own cache hit, restored below, is never
+                    // evicted or replaced by it (the capture is skipped when only that entry is in the way)
                     const uint64_t keep = claimed.load();
-                    const uint64_t gen = ck->capture(q, k.pos, k.tokens, k.ns, c.stream, keep);
+                    const uint64_t gen = snaps.evict_parked(*ck, q, k.pos, k.tokens, k.ns, c.stream, keep);
                     fprintf(stderr, "# rank %d ds41 park evict slot %d pos %u capture gen %llu used %zu/%zu\n", c.main.rank, q, k.pos,
                             (unsigned long long)gen, ck->used_bytes(), ck->budget_bytes());
                     require(!keep || ck->find(keep), "DS41 park: the evicted chat's capture evicted the grant's own snapshot");
