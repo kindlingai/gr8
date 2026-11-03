@@ -111,6 +111,10 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engin
 # Config::tail_first (GR8_S2_TAIL_FIRST): a ready prompt tail before any prefill, no decode round forced after it
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_tail_first_test.cpp" -o "$T/scheduler_tail_first_test" "${KNOBS[@]}"
 "$T/scheduler_tail_first_test"
+# Config::park (GR8_DS_PARK=1): a finished DS41 session parks its slot, a follow-up that extends it resumes that slot and
+# prefills only the delta, a new chat with no free slot evicts the oldest parked slot; knob off traces as before (TRACE_OFF)
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_park_test.cpp" -o "$T/scheduler_park_test" "${KNOBS[@]}"
+"$T/scheduler_park_test"
 # the Driver's prefill quanta: the shortest prompt first, owed quanta, decode rounds between them
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/driver_prefill_quantum_test.cpp" -o "$T/driver_prefill_quantum_test" "${KNOBS[@]}"
 "$T/driver_prefill_quantum_test" > /dev/null

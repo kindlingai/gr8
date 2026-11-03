@@ -91,6 +91,10 @@ struct Config {
     // DS41 only, GR8_DS_SESS_DRAFTS=1: a shared round's drafts a session go by its active count (s2/ds41_sess_drafts.h,
     // Batch::set_sess_drafts) instead of the mtp_sessions cut; needs mtp_sessions > 0 (one row a session at most bounds limit())
     bool sess_drafts = false;
+    // DS41 only, GR8_DS_PARK=1: a finished session's slot is parked (Phase::Parked) instead of freed: its KV stays in the
+    // slot's slabs, so a follow-up whose prompt extends it is granted that slot and prefills only the new rows. A new chat
+    // takes a free slot below limit() first, else the oldest parked slot (Scheduler::next_key). false = off: as before
+    bool park = false;
     // max_rows bounds ONE step: a round is one main step of every session's mtp + 1 rows (s2_batch.h Batch::round)
     uint32_t guard() const { return guard_tokens == UINT32_MAX ? 2 * mtp : guard_tokens; }
     unsigned limit() const {
@@ -104,6 +108,7 @@ struct Config {
 #else
         require(mtp > 0 && mtp <= 7 && max_sessions && max_sessions <= MAX_SESSIONS && limit(), "bad session/row limit");
         require(!c8_pack, "c8 prefill pack is DS41 only");
+        require(!park, "parked slots are DS41 only");
 #endif
         require(guard() >= 2 * mtp && prefill_rows, "insufficient guard/prefill rows");
         require(!decode_prefill_rows || (decode_prefill_rows % PAGE == 0 && decode_prefill_rows <= prefill_rows),
@@ -170,7 +175,9 @@ struct Run {
     }
     bool operator!=(const Run& b) const { return !(*this == b); }
 };
-enum class Phase { Free, Prefill, Decode, Retiring };
+// Parked (Config::park): a finished session whose slot keeps its KV for a follow-up. Not resident: it takes no step,
+// does not count toward limit(), and leaves only by a grant (the follow-up's, or a new chat's that evicts it)
+enum class Phase { Free, Prefill, Decode, Retiring, Parked };
 struct Slot {
     Key key; Request req; Run run;
     Phase phase = Phase::Free;
@@ -180,6 +187,7 @@ struct Slot {
                              // digest too, so a rank that counts differently fails at the grant rather than a step later
     bool packable = false;    // fresh, ordinary DS41 request (never a restored/reused/steered prompt)
     bool pack_tail = false;   // selected by one packed W pass; only these keys may join its tail
+    uint64_t parked = 0;      // Config::park: the order it was parked in (1, 2, ..), so the oldest is evicted first
 };
 // prompt rows a session still has to prefill; 0 means only its prompt tail is left
 inline uint32_t prefill_left(const Slot& s) { return s.req.prompt_tokens - 1 - s.prefilled; }
@@ -253,6 +261,7 @@ class Scheduler {
     uint64_t boundary_ = 0, event_ = 0, revision_ = 0, last_id_ = 0, pool_ = 0;
     bool have_id_ = false;
     bool want_decode_ = true, busy_ = false, failed_ = false;
+    uint64_t park_seq_ = 0;     // Config::park: slots parked so far (Slot::parked)
     uint32_t decode_run_ = 0;   // decode rounds completed since the last prefill quantum (alternate; read only when decode_rounds > 1)
     Quantum work_;
     Slot& slot(const Key& k) {
@@ -300,25 +309,50 @@ public:
     // the pool's digest (pool.h RunPool::digest) at this event boundary, so the ranks also agree on their pages
     void pool_digest(uint64_t d) { pool_ = d; }
     unsigned resident() const {
-        unsigned n = 0; for (const auto& s : s_) n += s.phase != Phase::Free && s.phase != Phase::Retiring; return n;
+        unsigned n = 0; for (const auto& s : s_) n += s.phase != Phase::Free && s.phase != Phase::Retiring && s.phase != Phase::Parked; return n;
     }
     unsigned retiring() const {
         unsigned n = 0; for (const auto& s : s_) n += s.phase == Phase::Retiring; return n;
     }
+    unsigned parked() const {
+        unsigned n = 0; for (const auto& s : s_) n += s.phase == Phase::Parked; return n;
+    }
     std::optional<Key> find(uint64_t id) const {
-        for (const auto& s : s_) if (s.phase != Phase::Free && s.req.id == id) return s.key;
+        for (const auto& s : s_) if (s.phase != Phase::Free && s.phase != Phase::Parked && s.req.id == id) return s.key;
         return {};
     }
-    Key next_key(std::optional<Key> cancel = {}) const {
-        for (const auto& s : s_) if (s.phase == Phase::Free || s.phase == Phase::Retiring || (cancel && s.key == *cancel)) {
+    // park: a parked slot (or a Retiring one, which the commit parks) the grant takes for a follow-up that extends it
+    Key next_key(std::optional<Key> cancel = {}, std::optional<unsigned> park = {}) const {
+        auto key = [&](const Slot& s) {
             require(s.key.generation != UINT32_MAX, "session generation exhausted");
             return Key{c_.epoch, s.key.slot, s.key.generation + 1};
+        };
+        if (park) {
+            require(c_.park && *park < MAX_SESSIONS && (s_[*park].phase == Phase::Parked || s_[*park].phase == Phase::Retiring),
+                    "no parked session on that slot");
+            return key(s_[*park]);
         }
+        if (!c_.park) {
+            for (const auto& s : s_) if (s.phase == Phase::Free || s.phase == Phase::Retiring || (cancel && s.key == *cancel)) return key(s);
+            throw std::runtime_error("no session slot");
+        }
+        // park: a free slot of the first limit(), else the oldest parked one (a Retiring slot parks at this commit, so
+        // it is younger than every parked slot; among those the lowest slot). Replicated state only: every rank names it
+        for (unsigned i = 0; i < c_.limit(); ++i)
+            if (s_[i].phase == Phase::Free || (cancel && s_[i].key == *cancel && s_[i].phase != Phase::Parked)) return key(s_[i]);
+        const Slot* old = nullptr;
+        auto order = [](const Slot& s) { return s.phase == Phase::Parked ? s.parked : UINT64_MAX; };
+        for (unsigned i = 0; i < c_.limit(); ++i)
+            if ((s_[i].phase == Phase::Parked || s_[i].phase == Phase::Retiring) && (!old || order(s_[i]) < order(*old))) old = &s_[i];
+        if (old) return key(*old);
         throw std::runtime_error("no session slot");
     }
     std::vector<Run> reclaimable(std::optional<Key> cancel = {}) const {
         std::vector<Run> out;
-        for (const auto& s : s_) if (s.phase == Phase::Retiring || (cancel && s.phase != Phase::Free && s.key == *cancel)) out.push_back(s.run);
+        for (const auto& s : s_)   // park: a Retiring slot parks instead, and a parked one is never cancelled
+            if (c_.park ? s.phase != Phase::Retiring && s.phase != Phase::Parked && cancel && s.phase != Phase::Free && s.key == *cancel
+                        : s.phase == Phase::Retiring || (cancel && s.phase != Phase::Free && s.key == *cancel))
+                out.push_back(s.run);
         return out;
     }
     uint64_t digest() const { // event diagnostics only; NEVER called by next()/complete()
@@ -333,6 +367,7 @@ public:
         if (c_.notice_max != NOTICE_MAX) add(c_.notice_max);
         if (c_.cp_step_rows) { add(c_.cp_step_rows); add(c_.cp_after); add(c_.cp_seg); }
         if (c_.r2_rows) add(c_.r2_rows);
+        if (c_.park) { add(0x9A12CEDull); add(park_seq_); }
         add(pool_); g6rt::steering::hash_boot(h, c_.steering);
         for (const auto& s : s_) {
             add(s.key.slot); add(s.key.generation); add(uint64_t(s.phase));
@@ -343,6 +378,7 @@ public:
             add(s.run.first_page); add(s.run.pages); add(s.run.table_version); add(s.run.list_hash); add(s.prefilled); add(s.emitted);
             add(s.inserted); add(s.deferred);
             if (c_.c8_pack) { add(s.packable); add(s.pack_tail); }
+            if (c_.park) add(s.parked);
         }
         return h;
     }
@@ -351,8 +387,14 @@ public:
         require(e.epoch == c_.epoch && e.event == event_ + 1 && e.boundary == boundary_ && e.before_hash == digest(), "event/state mismatch");
         auto after = s_; // validate whole transaction before mutating scheduler state
         Changes d;
-        for (auto& s : after) if (s.phase == Phase::Retiring || (e.cancel && s.phase != Phase::Free && s.key == *e.cancel)) {
-            d.freed.push_back(s.run); s.phase = Phase::Free;
+        uint64_t park_seq = park_seq_;
+        for (auto& s : after) {
+            // park: a finished session parks (its pages went back to the pool when it finished, as before), and a cancel
+            // never names a parked or finished one (find)
+            if (c_.park && s.phase == Phase::Retiring) { s.phase = Phase::Parked; s.parked = ++park_seq; continue; }
+            if (s.phase == Phase::Retiring || (e.cancel && s.phase != Phase::Free && s.phase != Phase::Parked && s.key == *e.cancel)) {
+                d.freed.push_back(s.run); s.phase = Phase::Free;
+            }
         }
         if (e.cancel) require(e.cancel->epoch == c_.epoch, "cancel epoch mismatch");
         if (e.shrink) {
@@ -368,12 +410,12 @@ public:
             require(!have_id_ || g.req.id > last_id_, "native request ordinals must increase");
             require(g.key.slot < MAX_SESSIONS && g.key.epoch == c_.epoch, "bad grant key");
             auto& target = after[g.key.slot];
-            require(target.phase == Phase::Free && target.key.generation != UINT32_MAX && g.key.generation == target.key.generation + 1, "grant slot generation mismatch");
+            require((target.phase == Phase::Free || (c_.park && target.phase == Phase::Parked)) && target.key.generation != UINT32_MAX && g.key.generation == target.key.generation + 1, "grant slot generation mismatch");
             // the pool rejects a page two runs hold. A run past R holds its worst case (reserve_pages) from the start
             require(grant_pages_ok(c_, g.req, g.run.pages) &&
                     g.run.first_page < c_.pool_rows/PAGE && g.run.table_version, "bad reservation");
             unsigned live = 0;
-            for (const auto& s : after) if (s.phase != Phase::Free) {
+            for (const auto& s : after) if (s.phase != Phase::Free && s.phase != Phase::Parked) {
                 ++live;
                 require(s.req.id != g.req.id, "duplicate native request id");
             }
@@ -385,7 +427,7 @@ public:
             d.admitted = g;
         }
         if (e.admit) { last_id_ = e.admit->req.id; have_id_ = true; }
-        s_ = after; event_ = e.event; ++revision_;
+        s_ = after; event_ = e.event; ++revision_; park_seq_ = park_seq;
         return d; // allocator adapter now applies these canonical changes; no local allocation choice here
     }
     // a decoding session's run grew (Driver::step, every rank alike, between events)

@@ -156,7 +156,10 @@ public:
         try {
             for (const auto& old : before) {
                 const auto& now = scheduler_.slots()[old.key.slot];
-                if (old.phase == Phase::Free || (now.phase != Phase::Free && old.key == now.key)) continue;
+                // park (Config::park): a finished session that parks leaves like a freed one (its request is over; the
+                // slot keeps only its KV), and a parked slot's session already left when it parked
+                if (old.phase == Phase::Free || old.phase == Phase::Parked ||
+                    (now.phase != Phase::Free && now.phase != Phase::Parked && old.key == now.key)) continue;
                 hooks_.retire(old); // individual run only; NEVER reset the whole cache. Reads the session's tokens (prefix reuse)
                 if (initialized_[old.key.slot]) batch_.release(int(old.key.slot));
                 initialized_[old.key.slot] = false;
