@@ -2,13 +2,15 @@
 // drafts, G6_MX = 32 rows a step, 32 slots):
 //   (a) the rule: kv(n) for n = 1..32 active sessions, and one table line per n = 1, 5, 6, 8, 9, 10, 11, 16: rows a session, main rows, draft
 //       launches of at most 6 sessions (sess_drafts_chunk), and the same n with the knob off (today)
-//   (b) every decode-round MAIN step of n sessions gives each session kv(n) + 1 rows and fits 32 rows; every DRAFT step's sessions split
-//       into launches of at most 6 that cover them once, in order (draft_chunks)
+//   (b) every decode-round MAIN step of n sessions gives each session kv(n) + 1 rows and fits 32 rows; every DRAFT step goes through
+//       g6s2::draft_launches (the host part of Ds41Round::draft_step_sessions, per-slot Ds41RoundLogic) with the engine's cap 6: launches
+//       of at most 6 sessions (5 draft rows each, <= 32), covering the drafted sessions once, in step order, each input from its own rows
 //   (c) knob on at 1..5 sessions: the same steps (kind, rows, every row's session / token / position) and the same tokens as knob off
 //   (d) every committed token is the target's, knob on, at every n
 // Host only, a fake engine.
 // Build: g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I engine/runtime engine/runtime/s2/tests/batch_ds41_sessdrafts_test.cpp <knobs lib>
 #include "s2_batch.h"
+#include "s2/ds41_dspark_round_logic.h"
 #include <cstdio>
 #include <string>
 #include <tuple>
@@ -106,12 +108,29 @@ int main()
         ctx = "on n " + std::to_string(n);
         CHECK(full_rounds > 0);
         CHECK(full_rps == want[n] + 1);
+        size_t full_launches = 0;
+        std::vector<g6s2::Ds41RoundLogic> logic(32, g6s2::Ds41RoundLogic(K));
         for (const Step& d : on.f.drafts)
         {
             CHECK(d.M() <= MXR);
-            const auto c = draft_chunks((int)d.sess.size(), 6);
-            CHECK((int)c.size() == ((int)d.sess.size() + 5) / 6);
+            const auto ls = g6s2::draft_launches(d, logic, sess_drafts_chunk(MXR, BLOCK, MAXS));
+            std::vector<size_t> seen;
+            for (const auto& L : ls)
+            {
+                CHECK(!L.js.empty() && L.js.size() <= 6 && L.js.size() == L.ins.size() && (int)L.js.size() * BLOCK <= MXR);
+                for (size_t i = 0; i < L.js.size(); ++i)
+                {
+                    const size_t j = L.js[i];
+                    seen.push_back(j);
+                    const Row& last = d.r[size_t(d.row0[j] + d.rows[j] - 1)];
+                    CHECK(L.ins[i].q == last.pos && L.ins[i].golden == last.tok && L.ins[i].acc == d.rows[j] - 1);
+                }
+            }
+            if (d.round >= 0) { CHECK(seen.size() == d.sess.size()); for (size_t j = 0; j < seen.size(); ++j) CHECK(seen[j] == j); }
+            CHECK(ls.size() == (seen.size() + 5) / 6);
+            if ((int)d.sess.size() == n && d.round >= 0) full_launches = std::max(full_launches, ls.size());
         }
+        CHECK(full_launches == size_t((n + 5) / 6));
         // (c) 1..5: the same steps and tokens as knob off
         if (n <= 5) { ctx = "same n " + std::to_string(n); CHECK(on.f.trace == off.f.trace); CHECK(on.out == off.out); CHECK(full_off == full_rps); }
         // (d) every committed token is the target's
@@ -123,7 +142,7 @@ int main()
             for (size_t i = 0; i < on.out[size_t(q)].size(); ++i) CHECK(on.out[size_t(q)][i] == target(q, plen - 1 + int(i)));
             CHECK(on.out[size_t(q)] == off.out[size_t(q)]);
         }
-        std::printf("%6d  %12d  %9d  %14zu | %d\n", n, full_rps, n * full_rps, draft_chunks(n, 6).size(), full_off);
+        std::printf("%6d  %12d  %9d  %14zu | %d\n", n, full_rps, n * full_rps, full_launches, full_off);
     }
     if (fails) { std::printf("batch_ds41_sessdrafts_test: %d FAILED\n", fails); return 1; }
     std::printf("batch_ds41_sessdrafts_test: OK\n");

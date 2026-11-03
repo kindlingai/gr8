@@ -141,18 +141,8 @@ private:
         const s2::Step& s = l.step;
         require(l.source_rows.size() == s.sess.size(), "DSpark draft step: no source rows");
         std::vector<int> u(size_t(s.M()), 0);
-        std::vector<size_t> js;
-        std::vector<Ds41RoundLogic::DraftIn> ins;
-        for (size_t j = 0; j < s.sess.size(); ++j) {
-            const int q = s.sess[j];
-            require(q >= 0 && q < slots_, "DSpark draft step session outside the S2 slots");
-            Ds41RoundLogic::DraftIn in;
-            if (logic_[size_t(q)].draft_in_sess(s, j, in)) { js.push_back(j); ins.push_back(in); }
-        }
-        if (js.empty()) return u;                  // prompt chunks before the last: nothing to draft from yet
-        for (const auto& c : s2::draft_chunks(int(js.size()), d_.draft.dsp.nsess))   // one launch unless GR8_DS_SESS_DRAFTS and > nsess sessions
-            draft_launch(l, std::vector<size_t>(js.begin() + c.first, js.begin() + c.first + c.second),
-                         std::vector<Ds41RoundLogic::DraftIn>(ins.begin() + c.first, ins.begin() + c.first + c.second), u);
+        // prompt chunks before the last: no launch; more drafted sessions than nsess (GR8_DS_SESS_DRAFTS): launches of at most nsess
+        for (const DraftLaunch& d : draft_launches(s, logic_, d_.draft.dsp.nsess)) draft_launch(l, d.js, d.ins, u);
         return u;
     }
     // one draft launch: the sessions js of the DRAFT step (indexes into s.sess), their inputs ins; writes their draft[0] into u
