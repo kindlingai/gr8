@@ -9,7 +9,9 @@
 //   rows    positions Model::pos[0] .. pos[0]+rows-1, read on the device (graph-safe); decode form only (window ring + top-k list)
 //   state   Layer::ds41_attn -> Ds41AttnLayer, made by ds41_attn_bind (Table::bind_attn, once, rows = capacity)
 // All 40 layers bind. Compressed rows: layers 2..19 read the C.comp of their source (2, 8, 14: bf16, fp4-valued, written by comp_row);
-// layers 20..39 (ratio 1) read LayerState::comp_src, which the indexer sets to its bf16 shadow of the packed fp4 rows (there is no paged 288 B reader yet).
+// layers 20..39 (ratio 1) read LayerState::comp_src, which the indexer sets to its bf16 shadow of the packed fp4 rows.
+// GR8_DS_COMP_FP4=1: the sources keep packed 288 B rows (C.compq, no C.comp) and layers 20..39 read the indexer's layer-20 ca rows (no shadow);
+// the attention gather dequantizes them to the same bf16 values (C.src_q).
 //
 // For the indexer (ds41_idx_ops.cuh, ST_CA_ROW): Ds41AttnLayer::S.qr = q_a-normed bf16 [rows][1280] (written by ST_ATTN_PROJ); S.cnorm = post-norm
 // pre-rope compressed rows completed by the last comp_row, bf16 [(rows+1)/2][512]; W.inv = the layer's rope table. The indexer sets
@@ -356,8 +358,16 @@ inline int ds41_attn_bind(void* model, int i, int capacity, void* stream)
     if (geom::has_compressor_gate(l))
     {
         a->comp_rows = (size_t)(capacity / 2 + 2);
-        a->C.comp_ss = a->comp_rows * ds41a::HD;
-        a->C.comp = dmalloc<__nv_bfloat16>(ns * a->C.comp_ss);             // bf16, fp4-valued; the packed 288 B form is a follow-up
+        if (knob::ds_comp_fp4())   // GR8_DS_COMP_FP4: packed 288 B rows (comp_ss in bytes), the same values
+        {
+            a->C.comp_ss = a->comp_rows * ds41a::CQ_ROW;
+            a->C.compq = dmalloc<uint8_t>(ns * a->C.comp_ss);
+        }
+        else
+        {
+            a->C.comp_ss = a->comp_rows * ds41a::HD;
+            a->C.comp = dmalloc<__nv_bfloat16>(ns * a->C.comp_ss);         // bf16, fp4-valued
+        }
         a->C.kvs = dmalloc<float>(ns * 2 * ds41a::HD);
         a->C.scs = dmalloc<float>(ns * 2 * ds41a::HD);
     }
@@ -449,9 +459,10 @@ inline int ds41_attn_op_core(void* model, int i, int rows, void* stream)
                 if (a->src_pos < 0) return ds41::NOTSUP;  // the subset has no layer that owns these compressed rows
             }
             const Ds41AttnLayer* s = ds41_attn_state(m, a->src_pos);
-            if (!s || !s->C.comp) return ds41::NOTSUP;
-            comp = s->C.comp;
+            if (!s || !(s->C.comp || s->C.compq)) return ds41::NOTSUP;
+            comp = s->C.compq ? (const __nv_bfloat16*)s->C.compq : s->C.comp;
             a->C.src_ss = s->C.comp_ss;                   // SESS > 1: the source's slot stride (the indexer sets src_ss with comp_src)
+            a->C.src_q = s->C.compq != nullptr;           // packed rows: src_ss in bytes
         }
         TK = geom::IDX_TOPK;                              // the list is -1 padded past the visible rows
     }
@@ -461,7 +472,10 @@ inline int ds41_attn_op_core(void* model, int i, int rows, void* stream)
     {
         ds41a::Cache C_pf = a->C; C_pf.ring = a->ring_pf; C_pf.ring_rows = a->ring_pf_rows;
         ds41a::Scratch S_pf = a->S; S_pf.sess = nullptr; S_pf.ns = 1;
-        const __nv_bfloat16* comp_pf = (comp && a->S.sess) ? comp + (size_t)m.ds_pf_slot * a->C.src_ss : comp;
+        const __nv_bfloat16* comp_pf = comp;
+        if (comp && a->S.sess)
+            comp_pf = a->C.src_q ? (const __nv_bfloat16*)((const uint8_t*)comp + (size_t)m.ds_pf_slot * a->C.src_ss)
+                                 : comp + (size_t)m.ds_pf_slot * a->C.src_ss;
         ds41_attn_core(&a->W, &C_pf, comp_pf, &S_pf, rows, 0, a->heads, a->topk, a->ldtk, TK, stream, m.pos);
         return 0;
     }
@@ -495,9 +509,10 @@ inline int ds41_attn_clear_layer(Model& m, int i, void* stream, int slot = -1)
     const size_t k0 = slot < 0 ? 0 : (size_t)slot, nk = slot < 0 ? (size_t)m.ds_slots : 1;
     const size_t ring = (size_t)a->C.ring_rows * ds41a::HD;
     G6RT_CK(cudaMemsetAsync(a->C.ring + k0 * ring, 0, nk * ring * sizeof(__nv_bfloat16), st));
-    if (a->C.comp)
+    if (a->C.comp || a->C.compq)
     {
-        G6RT_CK(cudaMemsetAsync(a->C.comp + k0 * a->C.comp_ss, 0, nk * a->C.comp_ss * sizeof(__nv_bfloat16), st));
+        if (a->C.comp) G6RT_CK(cudaMemsetAsync(a->C.comp + k0 * a->C.comp_ss, 0, nk * a->C.comp_ss * sizeof(__nv_bfloat16), st));
+        else G6RT_CK(cudaMemsetAsync(a->C.compq + k0 * a->C.comp_ss, 0, nk * a->C.comp_ss, st));
         G6RT_CK(cudaMemsetAsync(a->C.kvs + k0 * 2 * ds41a::HD, 0, nk * 2 * ds41a::HD * sizeof(float), st));
         G6RT_CK(cudaMemsetAsync(a->C.scs + k0 * 2 * ds41a::HD, 0, nk * 2 * ds41a::HD * sizeof(float), st));
     }

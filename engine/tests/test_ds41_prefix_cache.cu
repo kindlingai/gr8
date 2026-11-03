@@ -1,8 +1,11 @@
 // RTX 5090 (sm_120a) / Spark (sm_121a) synthetic exactness test for Ds41PrefixCache (engine/runtime/s2/ds41_prefix_cache.cuh).
 // Build & run on an RTX 5090:
 //   /usr/local/cuda/bin/nvcc -std=c++17 -O3 -gencode=arch=compute_120a,code=sm_120a -DG6_MODEL_DS41=1 -I. -Iengine \
-//     engine/tests/test_ds41_prefix_cache.cu engine/attn/ds41_bind.cu -Lengine/kvman-rs/target/release -lg6kvman -lpthread -ldl \
+//     engine/tests/test_ds41_prefix_cache.cu engine/attn/ds41_bind.cu -Lengine/kvman-rs/target/release -lg6kvman engine/knobs-rs/target/release/libgr8knobs.a -lpthread -ldl \
 //     -o /tmp/test_ds41_prefix_cache && /tmp/test_ds41_prefix_cache
+// On a Spark: -gencode=arch=compute_121a,code=sm_121a (not -arch=sm_121a: that emits generic compute_121 PTX, which has no
+// block_scale), and name both archives so libgr8knobs.a cannot be skipped:
+//   -Lengine/kvman-rs/target/release -Lengine/knobs-rs/target/release -l:libg6kvman.a -l:libgr8knobs.a -lpthread -ldl -lm
 //
 // Proves:
 //   (1) Ds41PrefixCache snapshot store, entry_bytes sizing, LRU eviction, tier_stat() (slots, free_slots, entries, hits, dropped,
@@ -20,6 +23,8 @@
 //       - Every restored run after 0xFF/NaN poisoning produces bit-identical (0 bit differences, max_abs_diff = 0.0, identical top-1)
 //         ICA planar codes+SF (layers 2, 8, 14, 20), CA rows, shadow KV, C.comp, C.kvs/C.scs, C.ring, hidden states, and next-token logits.
 //   (4) Negative controls: corrupting restored ICA or omitting C.kvs/C.scs at odd p = P - 1 causes immediate state/logit divergence.
+//   (5) --fp4: the same with the GR8_DS_COMP_FP4 layout (C.compq packed rows, ratio-1 layers read S.ca[3], no shadow). Each Part 2 case
+//       prints a DIGEST line (last hidden row hash, greedy tokens); the default run and the --fp4 run must print identical DIGEST lines.
 
 #define GR8_DS41_PREFIX_CACHE_STANDALONE 1
 #include "../attn/ds41_attn.cuh"
@@ -210,6 +215,15 @@ static int argmax(const std::vector<float>& v) {
     return best;
 }
 
+// --fp4: the GR8_DS_COMP_FP4 layout (packed 288 B compressed rows C.compq at the ratio-2 sources, ratio-1 consumers read the ca rows, no
+// shadow). Part 2 prints one DIGEST line per case (last hidden row hash + greedy tokens): the BF16 run and the --fp4 run must print the same.
+static bool g_fp4 = false;
+static uint64_t fnv(const std::vector<uint16_t>& v) {
+    uint64_t h = 1469598103934665603ull;
+    for (uint16_t x : v) { h ^= x; h *= 1099511628211ull; }
+    return h;
+}
+
 static int run_test() {
     constexpr int HEADS = 16;
     constexpr int G = HEADS / HPG;
@@ -236,9 +250,14 @@ static int run_test() {
             a_layers[size_t(i)].C.ring_rows = RR_MAIN;
             a_layers[size_t(i)].C.ring = dalloc<bf16>(size_t(SLOTS) * RR_MAIN * HD, 0x11);
             bool is_r2 = (i == r2_sources[0] || i == r2_sources[1] || i == r2_sources[2]);
-            if (is_r2) {
+            if (is_r2 && g_fp4) {
+                a_layers[size_t(i)].C.comp_ss = size_t(CAP / 2) * CQ_ROW;
+                a_layers[size_t(i)].C.compq = dalloc<uint8_t>(size_t(SLOTS) * (CAP / 2) * CQ_ROW, 0x22);
+            } else if (is_r2) {
                 a_layers[size_t(i)].C.comp_ss = size_t(CAP / 2) * HD;
                 a_layers[size_t(i)].C.comp = dalloc<bf16>(size_t(SLOTS) * (CAP / 2) * HD, 0x22);
+            }
+            if (is_r2) {
                 a_layers[size_t(i)].C.kvs = dalloc<float>(size_t(SLOTS) * 2 * HD, 0x33);
                 a_layers[size_t(i)].C.scs = dalloc<float>(size_t(SLOTS) * 2 * HD, 0x44);
             }
@@ -253,7 +272,7 @@ static int run_test() {
             idx_m.ica[k] = dalloc<uint8_t>(size_t(SLOTS) * size_t(idx_m.rows_kv[k]) * g6rt::DS41_ICA_ROW, 0x55 + k);
         }
         idx_m.ca[3] = dalloc<uint8_t>(size_t(SLOTS) * size_t(idx_m.rows_kv[3]) * g6rt::DS41_CA_ROW, 0x66);
-        idx_m.shadow = dalloc<bf16>(size_t(SLOTS) * size_t(CAP + RCAP) * 512, 0x77);
+        if (!g_fp4) idx_m.shadow = dalloc<bf16>(size_t(SLOTS) * size_t(CAP + RCAP) * 512, 0x77);
         main_m.idx_model = &idx_m;
         main_m.ehist = dalloc<int>(size_t(SLOTS) * g6rt::ENG_RING, 0);
 
@@ -268,7 +287,8 @@ static int run_test() {
         const size_t fixed_b = 40ull * RR_MAIN * 1024 + 3ull * RR_DRAFT * 1024 + 3ull * 2 * 2 * 512 * 4;
         for (uint32_t p : {63u, 64u, 4095u, 4096u, 8192u, 32768u, 131072u}) {
             const size_t p2 = p / 2;
-            const size_t want = fixed_b + 3ull * p2 * 1024 + 3ull * p2 * 68 + size_t(p) * (68 + 288 + 1024);
+            const size_t want = g_fp4 ? fixed_b + 3ull * p2 * 288 + 3ull * p2 * 68 + size_t(p) * (68 + 288)
+                                      : fixed_b + 3ull * p2 * 1024 + 3ull * p2 * 68 + size_t(p) * (68 + 288 + 1024);
             EXPECT(cache.entry_bytes(p) == want);
         }
 
@@ -375,10 +395,16 @@ static int run_test() {
             a_layers[size_t(l)].W = W[l];
             a_layers[size_t(l)].C.ring_rows = RR_MAIN;
             a_layers[size_t(l)].C.ring = dalloc<bf16>(size_t(SLOTS) * RR_MAIN * HD, 0);
-            if (l >= 1 && l <= 3) {
+            if (l >= 1 && l <= 3 && g_fp4) {
+                a_layers[size_t(l)].C.comp_ss = size_t(CAP / 2) * CQ_ROW;
+                a_layers[size_t(l)].C.src_ss = size_t(CAP / 2) * CQ_ROW;
+                a_layers[size_t(l)].C.compq = dalloc<uint8_t>(size_t(SLOTS) * (CAP / 2) * CQ_ROW, 0);
+            } else if (l >= 1 && l <= 3) {
                 a_layers[size_t(l)].C.comp_ss = size_t(CAP / 2) * HD;
                 a_layers[size_t(l)].C.src_ss = size_t(CAP / 2) * HD;
                 a_layers[size_t(l)].C.comp = dalloc<bf16>(size_t(SLOTS) * (CAP / 2) * HD, 0);
+            }
+            if (l >= 1 && l <= 3) {
                 a_layers[size_t(l)].C.kvs = dalloc<float>(size_t(SLOTS) * 2 * HD, 0);
                 a_layers[size_t(l)].C.scs = dalloc<float>(size_t(SLOTS) * 2 * HD, 0);
             }
@@ -393,7 +419,7 @@ static int run_test() {
             idx_m.ica[k] = dalloc<uint8_t>(size_t(SLOTS) * size_t(idx_m.rows_kv[k]) * g6rt::DS41_ICA_ROW, 0);
         }
         idx_m.ca[3] = dalloc<uint8_t>(size_t(SLOTS) * size_t(idx_m.rows_kv[3]) * g6rt::DS41_CA_ROW, 0);
-        idx_m.shadow = dalloc<bf16>(size_t(SLOTS) * size_t(CAP + RCAP) * 512, 0);
+        if (!g_fp4) idx_m.shadow = dalloc<bf16>(size_t(SLOTS) * size_t(CAP + RCAP) * 512, 0);
         main_m.idx_model = &idx_m;
         main_m.ehist = dalloc<int>(size_t(SLOTS) * g6rt::ENG_RING, -1);
 
@@ -422,10 +448,12 @@ static int run_test() {
         const std::vector<uint16_t> emb_table = make_bf16_u16_vec(2048ull * HID, 777, -0.5f, 0.5f);
 
         std::vector<bf16*> ring_base(NL), comp_base(NL);
+        std::vector<uint8_t*> compq_base(NL);
         std::vector<float*> kvs_base(NL), scs_base(NL);
         for (int l = 0; l < NL; ++l) {
             ring_base[size_t(l)] = a_layers[size_t(l)].C.ring;
             comp_base[size_t(l)] = a_layers[size_t(l)].C.comp;
+            compq_base[size_t(l)] = a_layers[size_t(l)].C.compq;
             kvs_base[size_t(l)] = a_layers[size_t(l)].C.kvs;
             scs_base[size_t(l)] = a_layers[size_t(l)].C.scs;
         }
@@ -435,8 +463,11 @@ static int run_test() {
         auto reset_or_poison_slot = [&](int q, int fill_byte) {
             for (int l = 0; l < NL; ++l) {
                 G6RT_CK(cudaMemsetAsync(ring_base[size_t(l)] + size_t(q) * RR_MAIN * HD, fill_byte, size_t(RR_MAIN) * HD * sizeof(bf16), st));
-                if (comp_base[size_t(l)]) {
-                    G6RT_CK(cudaMemsetAsync(comp_base[size_t(l)] + size_t(q) * (CAP / 2) * HD, fill_byte, size_t(CAP / 2) * HD * sizeof(bf16), st));
+                if (compq_base[size_t(l)])
+                    G6RT_CK(cudaMemsetAsync(compq_base[size_t(l)] + size_t(q) * (CAP / 2) * CQ_ROW, fill_byte, size_t(CAP / 2) * CQ_ROW, st));
+                if (comp_base[size_t(l)] || compq_base[size_t(l)]) {
+                    if (comp_base[size_t(l)])
+                        G6RT_CK(cudaMemsetAsync(comp_base[size_t(l)] + size_t(q) * (CAP / 2) * HD, fill_byte, size_t(CAP / 2) * HD * sizeof(bf16), st));
                     G6RT_CK(cudaMemsetAsync(kvs_base[size_t(l)] + size_t(q) * 2 * HD, fill_byte, 2 * HD * sizeof(float), st));
                     G6RT_CK(cudaMemsetAsync(scs_base[size_t(l)] + size_t(q) * 2 * HD, fill_byte, 2 * HD * sizeof(float), st));
                 }
@@ -447,8 +478,9 @@ static int run_test() {
             }
             G6RT_CK(cudaMemsetAsync(idx_m.ca[3] + size_t(q) * size_t(idx_m.rows_kv[3]) * g6rt::DS41_CA_ROW,
                                     fill_byte, size_t(idx_m.rows_kv[3]) * g6rt::DS41_CA_ROW, st));
-            G6RT_CK(cudaMemsetAsync(idx_m.shadow + size_t(q) * size_t(CAP + RCAP) * 512,
-                                    fill_byte, size_t(CAP + RCAP) * 512 * sizeof(bf16), st));
+            if (idx_m.shadow)
+                G6RT_CK(cudaMemsetAsync(idx_m.shadow + size_t(q) * size_t(CAP + RCAP) * 512,
+                                        fill_byte, size_t(CAP + RCAP) * 512 * sizeof(bf16), st));
             for (int j = 0; j < 3; ++j) {
                 G6RT_CK(cudaMemsetAsync(dring_base[size_t(j)] + size_t(q) * RR_DRAFT * HD,
                                         fill_byte, size_t(RR_DRAFT) * HD * sizeof(bf16), st));
@@ -478,8 +510,10 @@ static int run_test() {
             for (int l = 0; l < NL; ++l) {
                 Cache C_slot = a_layers[size_t(l)].C;
                 C_slot.ring = ring_base[size_t(l)] + size_t(q) * RR_MAIN * HD;
-                if (comp_base[size_t(l)]) {
-                    C_slot.comp = comp_base[size_t(l)] + size_t(q) * (CAP / 2) * HD;
+                if (compq_base[size_t(l)]) C_slot.compq = compq_base[size_t(l)] + size_t(q) * (CAP / 2) * CQ_ROW;
+                C_slot.src_q = g_fp4 && l >= 1 && l <= 5;   // the comp_src set below is packed rows
+                if (comp_base[size_t(l)] || compq_base[size_t(l)]) {
+                    if (comp_base[size_t(l)]) C_slot.comp = comp_base[size_t(l)] + size_t(q) * (CAP / 2) * HD;
                     C_slot.kvs = kvs_base[size_t(l)] + size_t(q) * 2 * HD;
                     C_slot.scs = scs_base[size_t(l)] + size_t(q) * 2 * HD;
                 }
@@ -514,11 +548,11 @@ static int run_test() {
                     stg.out = d_list;
                     stg.ldo = 512;
                     ds41_idx_topk(&stg, st);
-                    comp_src = C_slot.comp;
+                    comp_src = g_fp4 ? (const bf16*)C_slot.compq : C_slot.comp;
                     list_ptr = d_list;
                     tk_arg = 512;
                 } else if (l == 4) {
-                    bf16* sh_slot = idx_m.shadow + size_t(q) * size_t(CAP + RCAP) * 512;
+                    bf16* sh_slot = idx_m.shadow ? idx_m.shadow + size_t(q) * size_t(CAP + RCAP) * 512 : nullptr;
                     ds41_idx_ca_row_r1(S.kv0, ca_norm_w, d_pos,
                                        idx_m.ca[3] + size_t(q) * size_t(idx_m.rows_kv[3]) * g6rt::DS41_CA_ROW,
                                        d_pages, idx_m.rows_kv[3], idx_pre, sh_slot, M, st);
@@ -546,7 +580,7 @@ static int run_test() {
                     stg.ldo = 512;
                     ds41_idx_topk(&stg, st);
                     ds41_idx_cand_blocks(&stg, st);
-                    comp_src = sh_slot;
+                    comp_src = g_fp4 ? (const bf16*)(idx_m.ca[3] + size_t(q) * size_t(idx_m.rows_kv[3]) * g6rt::DS41_CA_ROW) : sh_slot;
                     list_ptr = d_list;
                     tk_arg = 512;
                 } else if (l == 5) {
@@ -570,7 +604,7 @@ static int run_test() {
                     stg.out = d_list;
                     stg.ldo = 512;
                     ds41_idx_topk(&stg, st);
-                    comp_src = comp_base[1] + size_t(q) * (CAP / 2) * HD;
+                    comp_src = g_fp4 ? (const bf16*)(compq_base[1] + size_t(q) * (CAP / 2) * CQ_ROW) : comp_base[1] + size_t(q) * (CAP / 2) * HD;
                     list_ptr = d_list;
                     tk_arg = 512;
                 }
@@ -678,14 +712,22 @@ static int run_test() {
             }
             EXPECT(ddown(idx_m.ca[3] + 0 * size_t(idx_m.rows_kv[3]) * g6rt::DS41_CA_ROW, size_t(final_pos) * g6rt::DS41_CA_ROW) ==
                    ddown(idx_m.ca[3] + 1 * size_t(idx_m.rows_kv[3]) * g6rt::DS41_CA_ROW, size_t(final_pos) * g6rt::DS41_CA_ROW));
-            EXPECT(ddown(reinterpret_cast<const uint16_t*>(idx_m.shadow + 0 * size_t(CAP + RCAP) * 512), size_t(final_pos) * 512) ==
-                   ddown(reinterpret_cast<const uint16_t*>(idx_m.shadow + 1 * size_t(CAP + RCAP) * 512), size_t(final_pos) * 512));
-            for (int l = 1; l <= 3; ++l) {
+            if (idx_m.shadow)
+                EXPECT(ddown(reinterpret_cast<const uint16_t*>(idx_m.shadow + 0 * size_t(CAP + RCAP) * 512), size_t(final_pos) * 512) ==
+                       ddown(reinterpret_cast<const uint16_t*>(idx_m.shadow + 1 * size_t(CAP + RCAP) * 512), size_t(final_pos) * 512));
+            for (int l = 1; l <= 3 && g_fp4; ++l) {
+                EXPECT(ddown(compq_base[size_t(l)] + 0 * (CAP / 2) * CQ_ROW, size_t(final_p2) * CQ_ROW) ==
+                       ddown(compq_base[size_t(l)] + 1 * (CAP / 2) * CQ_ROW, size_t(final_p2) * CQ_ROW));
+            }
+            for (int l = 1; l <= 3 && !g_fp4; ++l) {
                 EXPECT(ddown(reinterpret_cast<const uint16_t*>(comp_base[size_t(l)] + 0 * (CAP / 2) * HD), size_t(final_p2) * HD) ==
                        ddown(reinterpret_cast<const uint16_t*>(comp_base[size_t(l)] + 1 * (CAP / 2) * HD), size_t(final_p2) * HD));
             }
             printf("Part 2 [%-34s]: PASS (max_logit_diff=%.1e, 9/9 greedy tokens identical, ICA[0..3]+CA+shadow+comp bit-exact)\n",
                    tc.name, max_diff);
+            printf("DIGEST case %d: last_h %016llx tokens", ci, (unsigned long long)fnv(cold_last_h));
+            for (int t : cold_tokens) printf(" %d", t);
+            printf("\n");
 
             if (ci == 0) {
                 reset_or_poison_slot(1, 0xFF);
@@ -723,7 +765,9 @@ static int run_test() {
 
 } // namespace ds41a
 
-int main() {
+int main(int argc, char** argv) {
     if (knob::init()) return 2;
+    ds41a::g_fp4 = argc > 1 && std::strcmp(argv[1], "--fp4") == 0;
+    if (ds41a::g_fp4) printf("mode: GR8_DS_COMP_FP4 layout (packed compressed rows, no shadow)\n");
     return ds41a::run_test();
 }
