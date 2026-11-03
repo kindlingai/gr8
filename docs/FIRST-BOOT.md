@@ -11,7 +11,9 @@ exact model.
 These have no default ([DEPLOY.md](DEPLOY.md), "The two settings"):
 
 1. **Which model?** `glm53` (GLM-5.3), `glm53f` (GLM-5.3-Flash) or `ds41` (DeepSeek-V4.1-Flash-1017). `./gr8 models`
-   lists each model's release and the TP values it takes.
+   lists each GLM model's release and the TP values it takes. It does not list `ds41`: its release is
+   `https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native`, with `TP=4`. For `ds41`, remove the example's
+   `DRAFTER=` line (GLM's DFlash2 drafter): `ds41` drafts with its own MTP layers, and the check refuses a drafter.
 2. **Which boxes?** Their addresses in the same order on every box (`PEERS`; the first one is the head and serves the
    API on port 8100), or mentat with `TP`.
 3. **Where do the weights come from?** A Hugging Face release into `MODEL_CACHE`, a local copy of the release, or
@@ -71,19 +73,21 @@ otherwise. "Free memory" is `MemAvailable` a box; a range is the lowest and high
 > takes about 7 minutes before the first word, and several very long chats at once use most of the memory."
 
 - Default: 262,144 (`CAP=262144`). A request then holds at most 262,134 tokens (prompt and reply).
-- Long: `CAP=1048576` (a request holds at most 1,048,566 tokens).
+- Long: `CAP=1048576` (a request holds at most 1,048,566 tokens). The numbers below were measured with
+  `GR8_DS_CACHE_MIB=2048` in `EXTRA_ENV`; add it to match them.
 - Measured with 16 slots x 1,048,576 and the prefix cache at 2,048 MiB a box (`GR8_DS_CACHE_MIB=2048`):
   - Every slot gets its full length at boot: 9.8-10.0 GiB free a box at ready.
   - A 1,031,542-token prompt reads in about 417 s. Two or three such prompts at once share the reading: three at once
     all finish after about 1,250 s, as three one after another would.
   - Free memory: 3.2-3.4 GiB a box after one full 1M chat; at least 2.69 GiB a box while three ran at once. More than
     three at once was not tested.
-  - Recall at 1M is the model's limit, not the engine's: 2 of 7 different 1M prompts found all 3 facts hidden in them
-    (one at 10%, 50% and 90% of the prompt). Other hosted DeepSeek-V4.1-Flash servers miss facts at 1M too. Up to
-    262,144 tokens, every run that completed found all 3.
-  - A follow-up to a long chat reads only its new tokens when the chat's snapshot is still in the prefix cache
-    (`GR8_DS_CACHE_MIB`, 4096 MiB a box by default). A 1M chat's snapshot is 882 MiB a box, so about 2 such chats
-    fit; other follow-ups read the whole prompt again.
+  - Recall at 1M was unreliable in these tests: 2 of 7 different 1M prompts found all 3 facts hidden in them (one at
+    10%, 50% and 90% of the prompt). Other hosted DeepSeek-V4.1-Flash servers also missed facts at 1M. Up to 262,144
+    tokens, every run that completed found all 3.
+  - A follow-up reads only its new tokens when a snapshot in the prefix cache matches the start of its prompt;
+    otherwise it reads the whole prompt again. A 1M snapshot is 882 MiB a box: about 2 fit in 2,048 MiB, about 4 in
+    the 4,096 MiB default (`GR8_DS_CACHE_MIB` unset). A chat's first turn can keep 2 snapshots (prompt end and reply
+    end), so this is not a fixed number of cached chats: at 2,048 MiB, only the last 1M chat stayed cached.
 
 ## 3. DeepSeek-V4.1-Flash (`ds41`): speed against exactness
 
