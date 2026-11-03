@@ -11,7 +11,7 @@ extern "C"
 // bytes of the shared stage scratch (logits, block scores, candidate lists, ...) for Rcap query rows over max_rows compressed rows. Past
 // TOPK + IDX_TILE rows (ds41_idx.cuh) the logits / block scores are carved for one key tile and long calls run tile by tile (same lists).
 size_t ds41_idx_scratch_bytes(int Rcap, int max_rows);
-// the same scratch carved for one pass only (no key tiles; the per-session decode scratch): the old size, Ds41IdxStage::flat = 1
+// the same scratch carved for one pass only (no key tiles; the per-session decode scratch): the one-pass (full-logit) size, Ds41IdxStage::flat = 1
 size_t ds41_idx_scratch_bytes_flat(int Rcap, int max_rows);
 // Called once at indexer bind when PIPE_QR=1. Checks the actual device's opt-in
 // shared-memory ceiling and configures the QR kernel before any on launch.
