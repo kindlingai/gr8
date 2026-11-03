@@ -131,6 +131,18 @@ public:
         return total;
     }
 
+    // GR8_DS_PARK: an entry a grant claimed becomes the most recent, so the capture of an evicted parked slot before the
+    // restore evicts it last
+    void touch(uint64_t gen) {
+        for (size_t i = 0; i + 1 < entries_.size(); ++i)
+            if (entries_[i].generation == gen) {
+                Ds41PrefixEntry moved = std::move(entries_[i]);
+                entries_.erase(entries_.begin() + long(i));
+                entries_.push_back(std::move(moved));
+                return;
+            }
+    }
+
     const Ds41PrefixEntry* find(uint64_t gen) const {
         for (const auto& e : entries_) {
             if (e.generation == gen) return &e;

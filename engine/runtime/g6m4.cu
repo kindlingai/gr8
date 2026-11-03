@@ -2124,6 +2124,10 @@ int main(int argc, char** argv)
         // drafting stops past the sessions whose verify and 5 draft rows fit one step (at most 8)
         sc.mtp_sessions = (uint32_t)std::min(sc.max_rows / 5, 8u);
         sc.sess_drafts = ds_sess_drafts;    // GR8_DS_SESS_DRAFTS: drafts a session by active sessions (Batch), mtp_sessions bounds limit() only
+        // GR8_DS_PARK=1 (s2/scheduler.h Phase::Parked, ds41_native.cuh): a finished chat keeps its slot for a follow-up
+        sc.park = knob::ds_park();
+        if (sc.park && (s2sess < 2 || !reuse_prefix)) die("DS41: GR8_DS_PARK=1 needs --s2-sessions >= 2 and --reuse-prefix");
+        if (sc.park) fprintf(stderr, "# rank %d ds41 GR8_DS_PARK=1: a finished chat parks its slot (%d slots)\n", R, s2sess);
         if (ds_sess_drafts)
             fprintf(stderr, "# rank %d ds41 GR8_DS_SESS_DRAFTS=1: %d sessions, drafts while at most %d are active, draft launches of at most %d sessions\n", R,
                     s2sess, s2::sess_drafts_max(dsk.mtp, (int)sc.max_rows, s2sess), std::min(m.ds_slots, ds_draft_cap));

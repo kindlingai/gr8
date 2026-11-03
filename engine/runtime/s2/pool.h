@@ -20,8 +20,9 @@
 
 namespace g6s2 {
 // match()'s result: skip = the retained rows a prompt can reuse (0 = none), age = the retained run, for take().
-// stored: the run is in tier `tier`, and take() queues the copies that restore its pages.
-struct PoolHit { int skip = 0, lcp = 0; const char* why = "none"; uint64_t age = 0; bool stored = false; uint32_t tier = 0; };
+// stored: the run is in tier `tier`, and take() queues the copies that restore its pages. slot (Config::park): the parked
+// session slot whose KV the prompt extends (skip = its position), granted that slot; -1 = none
+struct PoolHit { int skip = 0, lcp = 0; const char* why = "none"; uint64_t age = 0; bool stored = false; uint32_t tier = 0; int slot = -1; };
 // status.s2: one live run's pages now and at worst
 struct PoolUse { uint32_t table_version = 0, held = 0, worst = 0; };
 class RunPool {

@@ -49,6 +49,9 @@ struct PoolHooks {
     std::function<PoolHit(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit,
                           const g6rt::CacheNamespace&, uint32_t r)> match;
     std::function<Run(const PoolHit&, uint64_t rows, uint64_t worst, uint32_t r)> take;
+    // optional, Config::park (DS41): every rank, a finished session's slot parks with its reuse state instead of retain;
+    // match may then name the parked slot (PoolHit::slot) and the grant takes it
+    std::function<void(unsigned slot, const Run&, const g6rt::PrefixReuse&, const g6rt::CacheNamespace&)> park;
     // optional, block stores (pool.h add_tier): counting toward shared prefixes at admission (head and workers, before
     // the grant, including nonstock calls that clear pending stock metadata; span: the request's system span, -1 = none), and each tier's counters for status.s2
     std::function<uint32_t(const std::vector<int>& prompt, int64_t span, const g6rt::CacheNamespace&)> count;
@@ -199,6 +202,11 @@ class Service {
         g6rt::PrefixReuse st = dispatch_.rows(s.key.slot);
         const auto gen = driver_->emitted(s.key.slot);
         st.finish(driver_->prompt(s.key.slot), gen, int(gen.size()), true);
+        // park: a finished session (not a cancelled one) keeps its slot; the scheduler parks it at the next commit
+        if (c_.scheduler.park && s.phase == Phase::Retiring) {
+            native_.pool.park(s.key.slot, s.run, st, g6rt::steering::cache_namespace(s.req.steering));
+            return;
+        }
         native_.pool.retain(s.run, st, g6rt::steering::cache_namespace(s.req.steering));
     }
     void publish_status() { // head CONTROL thread only, on queue/lifecycle revisions
@@ -341,6 +349,7 @@ class Service {
                 }
                 if (fit->why == Stall::None && !short_of) {
                     Run run{}; uint32_t skip = 0, restored = 0, counted = 0;
+                    int parked = -1;   // park: the parked slot the prompt extends, which the grant takes
                     const auto pr = prompts_.find(request->id);
                     if (reuse() && pr != prompts_.end()) {
                         if (native_.pool.count)
@@ -348,7 +357,10 @@ class Service {
                                 g6rt::steering::cache_namespace(request->steering));
                         const PoolHit h = native_.pool.match(pr->second, rows, worst, int(request->prompt_tokens) - 1,
                                                             g6rt::steering::cache_namespace(request->steering), r);
-                        if (h.skip > 0) { run = native_.pool.take(h, rows, worst, r); skip = uint32_t(h.skip); restored = h.stored ? h.tier + 1 : 0; }
+                        if (h.skip > 0) {
+                            run = native_.pool.take(h, rows, worst, r); skip = uint32_t(h.skip); restored = h.stored ? h.tier + 1 : 0;
+                            parked = h.slot;
+                        }
                         fprintf(stderr, "# s2 reuse request %llu %s retained %d lcp %d prompt %u first page %u\n", (unsigned long long)request->id,
                                 h.why, h.skip, h.lcp, request->prompt_tokens, skip ? run.first_page : 0u);
                     }
@@ -362,7 +374,7 @@ class Service {
                                     (unsigned long long)request->id, (unsigned long long)worst, e.what());
                         }
                     }
-                    if (got) cm.admit = Grant{s.next_key(), *request, run, skip, restored, counted};
+                    if (got) cm.admit = Grant{parked >= 0 ? s.next_key({}, unsigned(parked)) : s.next_key(), *request, run, skip, restored, counted};
                 }
                 attempted_head_ = request->id; attempted_revision_ = s.revision() + 1;
                 if (cm.admit) {
@@ -573,6 +585,7 @@ public:
                     const PoolHit h = native_.pool.match(staged_->prompt, rows, worst, int(g.req.prompt_tokens) - 1,
                                                          g6rt::steering::cache_namespace(g.req.steering), g.req.r_rows);
                     require(h.skip == int(g.reuse) && (h.stored ? h.tier + 1 : 0) == g.restored, "worker prefix reuse differs from the head");
+                    require(h.slot < 0 || h.slot == int(g.key.slot), "worker parked slot differs from the head's grant");
                     mine = native_.pool.take(h, rows, worst, g.req.r_rows);
                 } else mine = native_.pool.reserve(rows, worst, g.req.r_rows);
                 require(mine == g.run, "worker page list differs from the head's grant");
@@ -654,6 +667,7 @@ public:
             driver_->ngram(native_.ngram);
         }
         else if (kstop_mtp) driver_->kstop(native_.kstop);
+        require(!c_.scheduler.park || (reuse() && bool(native_.pool.park)), "parked slots need prefix reuse and the park hook");
         if (reuse()) {
             require(bool(native_.pool.retain) && bool(native_.pool.take), "prefix reuse needs retain, match and take");
             dispatch_.track_rows();

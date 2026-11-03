@@ -86,6 +86,12 @@ public:
         logic_[size_t(q)].reset();
         require(g6rt::ds41_attn_clear(&d_.draft, st_, q) == 0, "DSpark round: draft ring slot clear failed");
     }
+    // GR8_DS_PARK: a follow-up resumes parked slot q: its cached drafts are stale, its draft key ring is the parked chat's
+    // (what reset(q) and a prefix restore of that chat leave there)
+    void reset_drafts(int q) {
+        require(slots_ > 1 && q >= 0 && q < slots_, "DSpark round: slot reset outside the S2 slots");
+        logic_[size_t(q)].reset();
+    }
 
     // Step::DRAFT
     std::vector<int> draft_step(const Launch& l) {

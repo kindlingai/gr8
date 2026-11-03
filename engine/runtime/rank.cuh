@@ -1949,6 +1949,7 @@ inline unsigned attn_errors(Model& m) { return attn_errors_at(m, nullptr); }
 #if G6_MODEL_DS41
 inline int ds41_attn_clear(void* model, void* stream, int slot = -1);   // attn/ds41_attn_ops.cuh (included by ds41_step.cuh, after reset())
 inline int ds41_idx_clear(void* model, void* stream, int slot = -1);    // attn/ds41_idx_ops.cuh. slot: SESS > 1, one S2 slot (-1 = all)
+inline int ds41_idx_clear_shared(void* model, void* stream);             // attn/ds41_idx_ops.cuh: what a slot clear clears outside the slot's slabs
 #endif
 // new sequence: clear every layer's attention caches (load time / between requests, not inside a capture)
 inline void reset(Model& m, cudaStream_t st)
