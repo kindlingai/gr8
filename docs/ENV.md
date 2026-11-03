@@ -224,6 +224,8 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_K1_SPLIT_M2` | ints | GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (1,2,8) |  | Sets the decode MoE K1 split KS1,WG,NS2 for 2- and 3-row steps, over GR8_K1_SPLIT. Another fc1 partial count can change the sums. |
 | `GR8_K1_SPLIT_M4` | ints | GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (4,2,2) |  | Sets the decode MoE K1 split KS1,WG,NS2 for steps of 4 or more rows, over GR8_K1_SPLIT. Another fc1 partial count can change the sums. |
 | `GR8_KVB` | text | `bf16` | bf16\|fp8 | fp8 loads every layer's kv_b (UK / UV) as the release's block FP8 bytes and scales instead of BF16, with the same output bytes. Needs --v2-dense. |
+| `GR8_LOOKUP` | flag | `0` |  | 1: a solo DFlash2 session also drafts from its own tokens (the continuation of the longest earlier match of its last tokens) and verifies that chain when it promises more tokens per verify ms. Needs --serve. |
+| `GR8_LOOKUP_KMAX` | int | --dflash-k | 1.. | Sets the longest GR8_LOOKUP chain a round verifies. |
 | `GR8_MHC_BF16` | int | `0` | 0\|1\|2 | Quality test: rounds mHC residual stream writes to BF16, 1 = after both blocks, 2 = only after the MLP block. |
 | `GR8_MOE_TOPK` | int | `8` | 1..8 | Keeps only this many routed experts per token and renormalizes their weights. A model change for screens. |
 | `GR8_MTP_KSTOP` | int | 2 with --serve, DFlash2 and --mtp 2+, else 0 | 0\|1\|2 | A solo session's MTP rounds verify only the drafts the MTP head is confident in: 1 by the GR8_MTP_KSTOP_TAU thresholds, 2 by the drafter choice's MTP estimates. |
@@ -372,6 +374,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_LOAD_THREADS` | int | `8` | 1.. | Sets the number of Rust loader worker threads. |
 | `GR8_LOGIT_DUMP` | path | unset |  | Offline runs write each main step's head logits (each rank's vocab slice) to PATH.rank<R>, with a header. Not with --serve. |
 | `GR8_LOGIT_DUMP_FROM` | int | `0` |  | Main-step dumps (GR8_LOGIT_DUMP, GR8_RESID_DUMP) start at this step. |
+| `GR8_LOOKUP_LOG` | flag | `0` |  | Rank 0 prints one line per round that takes a GR8_LOOKUP chain. |
 | `GR8_MEM_MIN` | float | `8` | 0.. | GiB of MemAvailable the boot must keep after the weights and each layer of the KV pool. Below it the engine stops with a message instead of meeting the OOM killer. |
 | `GR8_MTP_L2PF` | int | `0` | 0..3 | With GR8_L2PF and --mtp, runs the paced L2 prefetch in MTP draft steps: 1 the draft step's windows, 2 the head waits prefetch the next draft step's front, 3 both. Same output bytes. |
 | `GR8_MTP_L2PF_US` | float | `60` | 0..1000 | Sets the budget in us at the pace of each GR8_MTP_L2PF head-wait prefetch window. |

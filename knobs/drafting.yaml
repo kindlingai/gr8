@@ -106,6 +106,26 @@ knobs:
     doc: >-
       S2 with DFlash2, a solo round runs the drafter step on its own CUDA stream under MTP's first form. 2 also puts
       drafting steps on a high-priority stream. Same bytes as serial.
+  GR8_LOOKUP:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1: a solo DFlash2 session also drafts from its own tokens (the continuation of the longest earlier match of its
+      last tokens) and verifies that chain when it promises more tokens per verify ms. Needs --serve.
+  GR8_LOOKUP_KMAX:
+    scope: agree
+    kind: int
+    unset: "--dflash-k"
+    values: "1.."
+    doc: >-
+      Sets the longest GR8_LOOKUP chain a round verifies.
+  GR8_LOOKUP_LOG:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      Rank 0 prints one line per round that takes a GR8_LOOKUP chain.
   GR8_MTP_KSTOP:
     scope: agree
     kind: int

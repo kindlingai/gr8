@@ -93,3 +93,6 @@ files or models, and prints, by workload, the median decode tok/s and the decode
 It cannot tell whether the table served: on the `on` boot, check rank 0's `# s2 ngram slot` lines for nonzero table
 rounds (the table serves only a request decoding alone with DFlash2, so a TP3 or MTP-only boot gives ratio 1).
 With `EXTRA_ENV="GR8_NGRAM_LOG=1"` rank 0 also logs each table round.
+Under `--spec-adaptive` the verify-width estimates learn across requests, and the verify's tokens are not bit-identical
+across widths. Once one request drafts differently (a table or lookup round), later requests choose other widths and a
+near-tie can flip, so an id difference proves a bug only for a prompt run first on a fresh boot on both sides.

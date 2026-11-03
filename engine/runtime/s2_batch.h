@@ -53,6 +53,11 @@
 // committed tokens. The drafter's drafts are still scored against the tokens the verify produced, so its estimates keep
 // learning while the table serves. Drafting costs are left out on both sides: the drafter runs every round either way.
 // Every input is the same on every rank.
+// Context lookup (Batch::lookup, GR8_LOOKUP): the same place and choice, with the chain taken from the session's own
+// tokens (ctx_lookup.h): what followed the longest earlier match of the last tokens. Its per-token chance is learned
+// over the request's rounds by match length: a round that verifies another source's drafts still scores the lookup's
+// chain against the tokens the verify produced. When the table is also on, the source promising more tokens per verify
+// ms proposes.
 // Within a step the sessions are in ascending index and each session's rows are contiguous, in position order.
 // No CUDA types: the engine adapter (m4sim / g6m4) turns a Step into its StepIn and per-session layout.
 #pragma once
@@ -71,6 +76,7 @@
 #include <vector>
 #include "../knobs-rs/gr8_knobs.h"
 #include "insert_rule.h"
+#include "ctx_lookup.h"
 #include "ngram_lookup.h"
 #include "spec_len.h"
 
@@ -131,6 +137,7 @@ struct Stats
     long mtp_rounds = 0, switches = 0;    // drafter choice: a DFlash2 session's rounds on MTP, drafter switches
     long inserted = 0;                // tokens the insert rule put in
     long ngram_rounds = 0, ngram_drafted = 0, ngram_acc = 0;   // GR8_NGRAM: rounds that verified a table chain, its tokens, accepted
+    long lookup_rounds = 0, lookup_drafted = 0, lookup_acc = 0;   // GR8_LOOKUP: the same for context lookup chains
     std::vector<long> acc;            // [K+1] rounds by accepted drafts (K = 7 for a DFlash2 session)
     long dfl_rounds = 0;              // rounds that verified DFlash2 drafts
     // GR8_DFL_REUSE (Batch::dfl_reuse, -1 = not set): where dfl_start filled the drafter from, the lowest position it held
@@ -437,6 +444,14 @@ struct NgramSrc
     double margin = 0.1;
     bool log = false;
 };
+// GR8_LOOKUP=1 (Batch::lookup): on = context lookup as a draft source. kmax, kmin, margin, log as NgramSrc's
+struct LookupSrc
+{
+    bool on = false;
+    int kmax = 7, kmin = 2;
+    double margin = 0.1;
+    bool log = false;
+};
 // the src's part of the S2 runtime signature (every rank must take the same rounds); empty when off
 inline std::string ngram_sig(const NgramSrc& s)
 {
@@ -587,6 +602,12 @@ public:
         ng_ = n;
         ng_fresh();
     }
+    void lookup(const LookupSrc& l)
+    {
+        if (l.on && (l.kmin < 1 || l.kmax < l.kmin || l.kmax > DFL_B - 1)) throw std::runtime_error("s2: lookup: 1 <= kmin <= kmax <= 7");
+        lk_ = l;
+        ng_fresh();
+    }
     // GR8_DFL_REUSE=2: session q, the only active one and drafting with MTP (it was not alone at its prompt tail, or was
     // demoted), takes the drafter before the next round: MTP rounds feed it the accepted rows as context from the
     // session's last token on, and once it holds reuse_.min rows the session drafts with DFlash2, as a new request starts.
@@ -602,7 +623,7 @@ public:
         x.warm = x.lo + std::max(1, reuse_.min);
         x.pb = -1; x.since = 0; x.mn = 0;
         if (sel_.on) restart();
-        if (ng_.t) ng_fresh();
+        if (chains()) ng_fresh();
         Stats& s = stats_[q];
         if ((int)s.acc.size() < DFL_B) s.acc.resize(DFL_B, 0);
         s.promoted = s.dfl_lo = x.lo; s.dfl_warm = x.warm;
@@ -815,9 +836,21 @@ private:
         double pe = 0;
         int k = m ? (ks_.mode ? kverify(x, &pe) : x.k) : dsl_.on ? dsl_.choose(x.dl, dkv_, dkv_, &pe) : dkv_;
         const int* dr = m ? x.d.data() : x.dd;
-        int nd[DFL_B];                    // GR8_NGRAM: the table's chain nd[1..nk], verified in place of the drafter's
+        int nd[DFL_B];                    // GR8_NGRAM / GR8_LOOKUP: the chain nd[1..nk], verified in place of the drafter's
         double ne = 0, de = 0;
-        const int nk = ng_.t ? ngram_pick(x, base, m, k, pe, nd, &ne, &de) : 0;
+        int nk = ng_.t ? ngram_pick(x, base, m, k, pe, nd, &ne, &de) : 0;
+        int ml = 0;                       // the lookup's match length when the chain is the lookup's
+        int ld[DFL_B], ln = 0, lml = 0;   // the lookup's whole chain ld[1..ln] and match length, scored after the verify
+        if (lk_.on)
+        {
+            double le = 0, lde = 0;
+            const int lk = lookup_pick(x, base, m, k, ld, &ln, &le, &lde, &lml);
+            if (lk && (!nk || le / dsl_.verify_ms(lk + 1) > ne / dsl_.verify_ms(nk + 1)))
+            {
+                std::copy(ld + 1, ld + lk + 1, nd + 1);
+                nk = lk; ne = le; de = lde; ml = lml;
+            }
+        }
         const int kd = k;
         if (nk) { dr = nd; k = nk; }
         Step v;
@@ -836,8 +869,24 @@ private:
         const int c = commit(q, t.data(), a + 1, &kept);
         if (!nk && !m && dsl_.on) dsl_.observe(k, a, x.dl, pe);
         if (!nk && sel_.on) score(x, k, a, t.data(), pe);
-        if (!nk && ng_.t) (m ? ngm_ : ngd_).observe(k, a, ng_lp(x, m), 0);
-        if (nk)
+        if (!nk && chains()) (m ? ngm_ : ngd_).observe(k, a, ng_lp(x, m), 0);
+        if (ln && !ml)
+        {   // another source's round: the lookup's chain against the a + 1 tokens the verify produced, so its estimate
+            // learns while it is not chosen. When all a + 1 match, the rest is unknown and only those positions count
+            int b = 0;
+            while (b < ln && b < a + 1 && ld[b + 1] == t[b]) ++b;
+            x.lk.observe(lml, b == a + 1 || b == ln ? b : b + 1, b);
+        }
+        if (ml)
+        {
+            ngram_score(x, m, kd, a, t.data(), de);
+            x.lk.observe(ml, k, a);
+            ++stats_[q].lookup_rounds; stats_[q].lookup_drafted += k; stats_[q].lookup_acc += a;
+            if (lk_.log)
+                fprintf(stderr, "# lookup round %ld slot %d base %d match %d k %d a %d expected %.3f drafter %s k %d expected %.3f\n",
+                        cur_round_, q, base, ml, k, a, ne, m ? "mtp" : "dfl", kd, de);
+        }
+        else if (nk)
         {
             ngram_score(x, m, kd, a, t.data(), de);
             ++stats_[q].ngram_rounds; stats_[q].ngram_drafted += k; stats_[q].ngram_acc += a;
@@ -959,6 +1008,7 @@ private:
         int force = -1;                   // inserted tokens from this position on wait for their steps (forced); -1: none
         int dd[DFL_B] = {};               // DFlash2 drafts d1..d7 and their log-probabilities under the drafter
         float dl[DFL_B] = {};
+        g6rt::CtxLookup lk;               // GR8_LOOKUP: the session's tokens indexed
     };
     // GR8_NGRAM: the table's chain after tokens[0..base] when it promises more tokens per verify ms than the drafter's k
     // drafts (their expected tokens from ngd_ / ngm_, which learn every round of the request): its length (0: the
@@ -968,19 +1018,33 @@ private:
     {
         double c[DFL_B];
         const int n = ng_.t->chain(x.tokens.data(), base + 1, ng_.kmax, nd, c);
-        if (n < ng_.kmin) return 0;
+        return chain_cut(x, m, k, c, n, ng_.kmin, ng_.margin, ne, de);
+    }
+    // GR8_LOOKUP: the context lookup's chain after tokens[0..base], as ngram_pick; *n = the whole chain's length (nd[1..n]),
+    // *ml = its match length
+    int lookup_pick(St& x, int base, bool m, int k, int* nd, int* n, double* ne, double* de, int* ml)
+    {
+        double c[DFL_B];
+        *n = x.lk.chain(x.tokens.data(), base + 1, lk_.kmax, nd, c, ml);
+        return chain_cut(x, m, k, c, *n, lk_.kmin, lk_.margin, ne, de);
+    }
+    // a chain with per-token chances c[1..n]: the prefix (at least kmin) with the most expected tokens per verify ms, when
+    // that beats the drafter's k drafts by margin; else 0. *ne, *de: the expected tokens of the prefix and of the drafts
+    int chain_cut(const St& x, bool m, int k, const double* c, int n, int kmin, double margin, double* ne, double* de) const
+    {
+        if (n < kmin) return 0;
         int bk = 0;
         double e = 1, s = 1, br = -1;
         for (int j = 1; j <= n; ++j)
         {
             s *= c[j]; e += s;
             const double r = e / dsl_.verify_ms(j + 1);
-            if (j >= ng_.kmin && r > br * (1 + 1e-9)) { br = r; bk = j; *ne = e; }
+            if (j >= kmin && r > br * (1 + 1e-9)) { br = r; bk = j; *ne = e; }
         }
         double ed = 0;
         (m ? ngm_ : ngd_).ratio(k, ng_lp(x, m), k, &ed);
         *de = ed;
-        return br > ed / dsl_.verify_ms(k + 1) * (1 + ng_.margin) ? bk : 0;
+        return br > ed / dsl_.verify_ms(k + 1) * (1 + margin) ? bk : 0;
     }
     // GR8_NGRAM: a round that verified the table's chain still teaches the drafter's estimates (else a drafter that the
     // table once beat could never win the choice back): its kd drafts against the a + 1 target tokens the verify
@@ -1213,7 +1277,9 @@ private:
     KStop ks_;
     DflReuse reuse_;
     NgramSrc ng_;
-    g6rt::SpecLen ngd_, ngm_;         // GR8_NGRAM: the drafters' acceptance in this request (DFlash2, MTP), for the choice
+    LookupSrc lk_;
+    bool chains() const { return ng_.t || lk_.on; }
+    g6rt::SpecLen ngd_, ngm_;         // GR8_NGRAM / GR8_LOOKUP: the drafters' acceptance in this request (DFlash2, MTP), for the choice
     // the verify table is dsl_'s (spec_len.h's, or GR8_SPEC_TABLE); every request starts from the seeds
     void ng_fresh() { ngd_ = fresh(dsl_); ngm_ = fresh(dsl_); ngd_.on = ngm_.on = false; }
     Ring ring_;
@@ -1290,7 +1356,7 @@ private:
         {
             restart();
         }
-        if (x.dfl && ng_.t) ng_fresh();
+        if (x.dfl && chains()) ng_fresh();
         if (x.dfl && !(h_.dfl && h_.dfl_start)) throw std::runtime_error("s2: DFlash2 session without drafter hooks");
         stats_[q].acc.assign(std::max(K_, x.dfl ? DFL_B - 1 : 0) + 1, 0);
         for (float& v : x.dl) v = NAN;
