@@ -55,6 +55,7 @@ namespace g6s2 { struct Ds41Dspark { g6rt::Model draft; }; }
 #include <array>
 #include <map>
 #include <memory>
+#include <tuple>
 
 using g6s2::Ds41PrefixCache;
 static g6rt::CacheNamespace ns(int n) { g6rt::CacheNamespace s{}; s[0] = n; return s; }
@@ -379,6 +380,79 @@ static void lifecycle() {
            "a thinking follow-up takes the PE path\n", int(knob::ds_cache_replace()));
 }
 
+
+// Astra's review of a2d4ace (GR8_DS_CACHE_REPLACE=1 only; the knob off links nothing):
+// P2 #1: chats A and A' with the same prompt share A's prompt-end entry PE. A' parks on q1, A on q0 (PE links to A's park);
+// A' is evicted (RE), then A resumes RE or is evicted into that exact entry. A's park must leave no placeholder behind: an
+// unrelated chat B parked later on q0 is not freed by a restore of A's PE, and B's eviction captures B's request end.
+static std::vector<int> seq_toks(int k) { std::vector<int> t(2048); for (int i = 0; i < 2048; ++i) t[size_t(i)] = i + 1 + k * 10000; return t; }
+static bool placeholder(const Ds41PrefixCache& c) { for (const auto& e : c.entries()) if (e.sibling >> 63) return true; return false; }
+static void stale_placeholder(bool fp4, bool use_resume) {
+    Fixture f(fp4);
+    Ds41PrefixCache c(f.m, nullptr, 64);
+    g6s2::Ds41SnapSlots s(3);
+    const auto a = seq_toks(0), b = seq_toks(1);
+    const uint64_t pe = s.capture_prompt_end(c, 0, 100, a, ns(1), 0);
+    CHECK(s.capture_prompt_end(c, 1, 100, a, ns(1), 0) == pe);   // A' refreshes A's entry
+    s.park(c, 1, 200, a, ns(1));
+    s.park(c, 0, 200, a, ns(1));
+    CHECK(c.find(pe) && (c.find(pe)->sibling >> 63));            // linked to A's park
+    const uint64_t re = s.evict_parked(c, 1, 200, a, ns(1), 0, 0);
+    CHECK(re != 0);
+    if (use_resume) s.resume(c, 0, 200, a, ns(1));
+    else CHECK(s.evict_parked(c, 0, 200, a, ns(1), 0, 0) == re);   // the exact entry
+    CHECK(!placeholder(c));                                      // A's park detached on the exact/resume path
+    s.reset(0);
+    const uint64_t bpe = s.capture_prompt_end(c, 0, 100, b, ns(2), 0);
+    s.park(c, 0, 200, b, ns(2));
+    const uint64_t sib_before = c.siblings();
+    c.restore(pe, 1, 0);                                         // a retry of A
+    CHECK(c.siblings() == sib_before);                           // frees nothing of B's
+    const uint64_t bre = s.evict_parked(c, 0, 200, b, ns(2), 0, 0);
+    CHECK(bre != 0 && c.find(bpe) && c.find(bpe)->sibling == bre && c.find(bre) && c.find(bre)->sibling == bpe);
+    CHECK(!placeholder(c));
+    printf("ds41_park_evict_test stale placeholder %s %s: A's park detached, B's request end captured (gen %llu) and linked to its PE\n",
+           fp4 ? "FP4" : "BF16", use_resume ? "resume" : "exact-eviction", (unsigned long long)bre);
+}
+// P2 #2: a request restores RE50 (request end), captures its PE150; another request stores the equal RE300 first. At the
+// finish PARK=0 frees PE150 (capture's equal-entry path, replace); PARK=1's park must free it too.
+static void exact_park_replace(bool fp4) {
+    Fixture f(fp4), g(fp4);
+    Ds41PrefixCache on(f.m, nullptr, 64), off(g.m, nullptr, 64);
+    g6s2::Ds41SnapSlots so(3), sf(3);
+    const auto t = seq_toks(0);
+    uint64_t pe_on = 0, pe_off = 0;
+    for (auto [c, s, pe] : {std::make_tuple(&on, &so, &pe_on), std::make_tuple(&off, &sf, &pe_off)}) {
+        const uint64_t old = c->capture(0, 50, t, ns(1), 0, g6s2::Ds41Snap::RequestEnd);
+        s->restore(*c, old, 0, 0);
+        *pe = s->capture_prompt_end(*c, 0, 150, t, ns(1), 0);
+        c->capture(1, 300, t, ns(1), 0, g6s2::Ds41Snap::RequestEnd);   // the other request's equal request end
+    }
+    so.park(on, 0, 300, t, ns(1));
+    sf.capture_request_end(off, 0, 300, t, ns(1), 0);
+    sf.reset(0);
+    CHECK(off.replaced() == 1 && !off.find(pe_off));
+    CHECK(on.replaced() == off.replaced() && !on.find(pe_on));
+    so.evict_parked(on, 0, 300, t, ns(1), 0, 0);
+    CHECK(!on.find(pe_on) && on.size() == off.size());
+    printf("ds41_park_evict_test exact park replace %s: PARK=1 frees its PE as PARK=0 does (replaced %llu = %llu)\n", fp4 ? "FP4" : "BF16",
+           (unsigned long long)on.replaced(), (unsigned long long)off.replaced());
+}
+// the digest gap: a park's placeholder link changes park_digest (the park-on pool digest), digest() (off mode) does not change
+static void park_digest_link() {
+#ifndef PARK_BEFORE
+    Fixture f(false), g(false);
+    Ds41PrefixCache a(f.m, nullptr, 64), b(g.m, nullptr, 64);
+    const auto t = seq_toks(0);
+    const uint64_t pa = a.capture(0, 100, t, ns(1), 0, g6s2::Ds41Snap::PromptEnd), pb = b.capture(0, 100, t, ns(1), 0, g6s2::Ds41Snap::PromptEnd);
+    CHECK(pa == pb && a.park_digest() == b.park_digest());
+    const uint64_t d0 = a.digest();
+    a.park_end(pa, 200, t, ns(1), false);
+    CHECK(a.find(pa)->sibling != b.find(pb)->sibling && a.digest() == d0 && a.park_digest() != b.park_digest());
+    printf("ds41_park_evict_test park digest: a placeholder link changes park_digest, digest() unchanged\n");
+#endif
+}
+
 int main() {
     for (bool fp4 : {false, true}) {
         tight_budget(fp4, false);
@@ -389,8 +463,16 @@ int main() {
     }
     combined();
     lifecycle();
+    if (knob::ds_cache_replace()) {
+        for (bool fp4 : {false, true}) {
+            stale_placeholder(fp4, false);
+            stale_placeholder(fp4, true);
+            exact_park_replace(fp4);
+        }
+        park_digest_link();
+    }
     CHECK(mem.empty());
     if (fails) { fprintf(stderr, "ds41_park_evict_test: %d FAIL\n", fails); return 1; }
-    puts("ds41_park_evict_test: ok (12 cases)");
+    printf("ds41_park_evict_test: ok (%d cases)\n", knob::ds_cache_replace() ? 19 : 12);
     return 0;
 }
