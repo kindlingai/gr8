@@ -307,6 +307,20 @@ class ShimTests(unittest.TestCase):
                          ('deepseek-v4.1-flash', '129280', '1'))
         self.assertEqual(a[a.index('--capacity-slots') + 1], a[a.index('--sessions') + 1])
 
+    def test_the_shim_divides_the_ds41_pool_by_the_engines_sessions(self):
+        # the engine's default is 5 sessions (scripts/engine_args.sh); a shim told 8 capped a request at 5 x 262144 // 8 - 10
+        for argv, want in ((('--gr8-model', 'ds41'), '5'), (('--gr8-model', 'ds41', '--sess', '3'), '3')):
+            a = self.shim_argv(*argv)
+            self.assertEqual((a[a.index('--sessions') + 1], a[a.index('--capacity-slots') + 1]), (want, want))
+
+    def test_the_glm_shim_reports_the_engines_sessions(self):
+        s = supervisor()
+        with mock.patch.object(s, 'spawn', side_effect=self.Spawned) as spawn:
+            with self.assertRaises(self.Spawned):
+                s.start_shim('/work')
+        a = spawn.call_args[0][1]
+        self.assertEqual(a[a.index('--sessions') + 1], opt.engine_plan(s.o)['knobs']['SESS'])
+
     def test_the_ds41_identity_is_the_engines_own(self):
         geom = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'engine', 'model_geom_ds41.h')).read()
         vocab = int(re.search(r'constexpr int VOCAB = (\d+);', geom).group(1))

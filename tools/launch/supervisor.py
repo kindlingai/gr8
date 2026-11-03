@@ -987,11 +987,14 @@ class Supervisor:
         """The shim drives the head's engine directory. The head engine passes requests to the other ranks itself, over
         its control links."""
         sock = os.path.join(self.home, 'run', 'engine.sock')
+        # the sessions the engine runs: --sess, else the model's default from scripts/engine_args.sh (DS41 5; GLM 8, 4 or
+        # 1 by TP), never a fixed 8 (a DS41 shim that divided the 5 slabs by 8 capped a request at 163,830 tokens)
+        sess = opt.engine_plan(self.o)['knobs'].get('SESS') or self.o.get('SESS') or '8'
         argv = [self.py(), os.path.join(REPO, 'frontend', 'g6s2shim.py'), '--dir', work, '--sock', sock,
-                '--sessions', self.o.get('SESS') or '8']
+                '--sessions', sess]
         model = models.of(self.o)
         if model is models.DS41:  # DS41 pool_rows = SESS * per-session CAP, unlike the shared GLM pool
-            argv += ['--capacity-slots', self.o.get('SESS') or '8']
+            argv += ['--capacity-slots', sess]
         if model.vocab:     # the shim's hello and id bound default to GLM-5.3's: a DeepSeek engine takes ids 0..129279 only
             argv += ['--model-name', model.served or model.name, '--vocab-size', str(model.vocab),
                      '--eos-ids', ','.join(map(str, model.eos_ids))]
