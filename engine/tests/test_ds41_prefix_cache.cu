@@ -27,6 +27,7 @@
 //       request's prefix entry, other namespace or longer entry; dedup K, exact-position hits and budget eviction stay correct.
 //   (5) --fp4: the same with the GR8_DS_COMP_FP4 layout (C.compq packed rows, ratio-1 layers read S.ca[3], no shadow). Each Part 2 case
 //       prints a DIGEST line (last hidden row hash, greedy tokens); the default run and the --fp4 run must print identical DIGEST lines.
+// --part1 runs (1) and (1b) only (bookkeeping on small slabs, no kernels); it combines with --fp4.
 
 #define GR8_DS41_PREFIX_CACHE_STANDALONE 1
 #include "../attn/ds41_attn.cuh"
@@ -220,6 +221,7 @@ static int argmax(const std::vector<float>& v) {
 // --fp4: the GR8_DS_COMP_FP4 layout (packed 288 B compressed rows C.compq at the ratio-2 sources, ratio-1 consumers read the ca rows, no
 // shadow). Part 2 prints one DIGEST line per case (last hidden row hash + greedy tokens): the BF16 run and the --fp4 run must print the same.
 static bool g_fp4 = false;
+static bool g_part1 = false;   // --part1: the cache bookkeeping (Part 1, 1b) only, small device slabs, no kernels
 static uint64_t fnv(const std::vector<uint16_t>& v) {
     uint64_t h = 1469598103934665603ull;
     for (uint16_t x : v) { h ^= x; h *= 1099511628211ull; }
@@ -424,6 +426,10 @@ static int run_test() {
         EXPECT(e_3 > e_re && ec.size() == 2 && ec.evictions() == 1 && ec.find(e_old) == nullptr && ec.find(e_re) != nullptr);
         EXPECT(ec.used_bytes() == ec.entry_bytes(130) + ec.entry_bytes(125));
         printf("Part 1b (GR8_DS_CACHE_REPLACE: one entry a request, prefix of another request kept, dedup, budget): PASS\n");
+    }
+    if (g_part1) {
+        printf("PART 1 ONLY (--part1): PASSED\n");
+        return 0;
     }
 
     // -------------------------------------------------------------------------
@@ -847,7 +853,10 @@ static int run_test() {
 
 int main(int argc, char** argv) {
     if (knob::init()) return 2;
-    ds41a::g_fp4 = argc > 1 && std::strcmp(argv[1], "--fp4") == 0;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--fp4") == 0) ds41a::g_fp4 = true;
+        else if (std::strcmp(argv[i], "--part1") == 0) ds41a::g_part1 = true;
+    }
     if (ds41a::g_fp4) printf("mode: GR8_DS_COMP_FP4 layout (packed compressed rows, no shadow)\n");
     return ds41a::run_test();
 }
