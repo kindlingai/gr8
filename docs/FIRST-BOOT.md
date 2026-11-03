@@ -87,7 +87,8 @@ words to `EXTRA_ENV` (`"A=1 B=2"`, every rank).
 - Yes: `GR8_DS_RELAXED_ACCEPT=topp:0.9,ratio:0.1 GR8_DS_MOE_TOPK_DECODE=4`.
 - Measured against `main` at ca24fdd0 (two boots), and again on `main` at b10aae4 (one boot each way). Long replies:
   code +41-42%, prose +50-52%, structured output +23-25%. Short 256-token replies: code +21-23%, prose +51%,
-  structured +14% (b10aae4). Prompt reading (prefill) does not change. Quality 73 -> 71 of 75 both times.
+  structured +14% (b10aae4). Prompt reading (prefill) stays inside the run-to-run spread (b10aae4: one benchmark
+  +1-2%, another 3% lower). Quality 73 -> 71 of 75 both times.
 - Half-way, one switch alone (one boot each, 72 of 75 for both):
   - `GR8_DS_RELAXED_ACCEPT=topp:0.9,ratio:0.1`: long replies code +28%, prose +29%; short replies prose +20%, code
     within noise.
