@@ -44,8 +44,8 @@ otherwise. "Free memory" is the lowest `MemAvailable` of the four boxes.
 - 10: `SESS=10`, and `GR8_DS_SESS_DRAFTS=1` in `EXTRA_ENV`. 16: `SESS=16`, and the same word.
   `GR8_DS_SESS_DRAFTS=1` lets every chat keep drafting when more than 5 write at once; it drafts fewer tokens a
   chat as more chats write (5 at 1-5 chats, 2 at 9-10, 1 at 11-16; [ENV.md](ENV.md)).
-- Measured on `main` at b10aae4 with Q3's switches on, one boot each, two runs each (the range; the first run after a
-  boot is a little slower). Short code prompts. "Each" is the median chat's writing speed once it has a slot;
+- Measured on `main` at b10aae4 with Q3's switches on, one boot each, two runs each (the range; the first of the two
+  runs is a little slower). Short code prompts. "Each" is the median chat's writing speed once it has a slot;
   "together" is all chats; "first word" is the median wait for the first word, slot wait included.
 
   | chat slots | 1 chat, tokens/s | 8 chats: each / together | 16 chats: each / together | 16 chats: first word | free memory at ready |
@@ -54,9 +54,10 @@ otherwise. "Free memory" is the lowest `MemAvailable` of the four boxes.
   | 10 | 157-163 | 51-56 / 245-260 | 35-38 / 251-275 (6 wait) | 4.2-4.4 s | 22.5-22.8 GiB |
   | 16 | 155-163 | 51-54 / 243-260 | 34-36 / 251-272 | 4.2-4.4 s | 20.4-20.8 GiB |
 
-  - The total stays at about 240-275 tokens/s from 8 chats up, whatever the slot count. More slots do not make the
+  - The total stays at about 235-275 tokens/s from 8 chats up, whatever the slot count. More slots do not make the
     boxes write more; they share the same speed among more chats, so no chat sits idle waiting for a slot.
-  - With 1 to 4 chats, the slot count changes the speed less than the run-to-run spread.
+  - With 1 to 4 chats, the second runs differ by 1-2% between slot counts; the first runs were 5-8% slower with 10
+    and 16 slots than with 5.
   - Answers: with one chat at a time, 10 and 16 slots give the same 75 answers as 5 slots (71 of 75 right); with every slot busy, 73 of
     75 are right (10 at once and 16 at once).
   - Memory: each extra 262,144-token slot costs about 0.35 GiB a box at ready (the 5-slot reading is an earlier
