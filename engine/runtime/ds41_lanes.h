@@ -201,6 +201,7 @@ inline std::vector<Acc> access(const Op& o)
     {
         std::vector<Acc> a = {{BF_CKV, false, ks}, {BF_IDX_SCR, true}, {BF_IDX_SCR, false}};
         if (l > 20) a.push_back({BF_IDX_CAND, false});
+        if (l == 20) a.push_back({BF_IDX_CAND, true});   // a tiled indexer scratch: layer 20's dense stage makes the candidate blocks
         a.push_back({BF_IDX_LIST, true});
         return a;
     }

@@ -151,6 +151,7 @@ inline Ds41IdxStage stage(Model& m, Ds41IdxModel& S, int kix, const Sess& q, int
     t.klen = S.klen + row0; t.max_klen = max_klen(S, kix); t.R = q.len[j];
     t.ica = S.ica[kix]; t.pages = pages_of(m, S, row0); t.rpp = S.rows_kv[kix];
     t.scratch = q.ns > 1 ? S.sscr[j] : S.scratch; t.Rcap = q.ns > 1 ? S.sess_cap : S.rcap; t.max_rows = carve_rows(S); t.use_cand = 0;
+    t.flat = q.ns > 1;   // sscr[j] is carved one pass only
     t.pipe_b = 0;  // set by index_topk only for source layers; candidate layers keep the plain logits even when GR8_DS41_IDX_DENSE_MAXK makes them dense
     t.q_trig = S.q_trig;
     t.pipe_qr = 0;
@@ -198,7 +199,7 @@ inline int ds41_idx_bind(void* model, int i, int capacity, void* stream)
         S.sess_cap = m.ds41_pack_enabled ? ds41::pack::MAX_SEGMENT_ROWS : MX;
         if (S.slots < 1 || S.slots > 32) die("DS41 indexer bind: ds_slots " + std::to_string(S.slots) + " outside 1..32");
         S.scratch = zalloc(ds41_idx_scratch_bytes(S.rcap, S.lim1));
-        if (S.slots > 1) for (int j = 0; j < S.slots; ++j) S.sscr[j] = zalloc(ds41_idx_scratch_bytes(S.sess_cap, S.lim1));
+        if (S.slots > 1) for (int j = 0; j < S.slots; ++j) S.sscr[j] = zalloc(ds41_idx_scratch_bytes_flat(S.sess_cap, S.lim1));   // decode graphs: one pass
         S.klen = (int*)zalloc((size_t)S.rcap * sizeof(int));
         S.zero = (int*)zalloc(sizeof(int));
         S.q_b = (__nv_bfloat16*)zalloc((size_t)S.rcap * geom::IDX_WQB_OUT * 2);
@@ -379,6 +380,7 @@ inline int ds41_idx_op_index_topk(void* model, int i, int rows, void* stream)
         t.use_cand = use_cand;
         t.pipe_b = S->pipe_b && !cand;  // exactly the four native dense index sources (2/8/14/20)
         t.pipe_qr = S->pipe_qr && !cand && S->chunk_end > 0 && q.len[j] >= 16;
+        t.cand_src = l == geom::CAND_SOURCE && !cand_skipped(*S, kix);   // ds41_idx_op_cand_blocks follows in plan order
         ds41_idx_topk(&t, stream);
     }
     return 0;
@@ -397,7 +399,8 @@ inline int ds41_idx_op_cand_blocks(void* model, int i, int rows, void* stream)
     if (!sessions(m, *S, rows, q)) return 1;
     for (int j = 0; j < q.ns; ++j)
     {
-        const Ds41IdxStage t = stage(m, *S, kix, q, j);
+        Ds41IdxStage t = stage(m, *S, kix, q, j);
+        t.cand_src = 1;   // layer 20's index_topk ran first with cand_src = 1 (tiled: it made the blocks)
         ds41_idx_cand_blocks(&t, stream);
     }
     S->cand_ready = true;
@@ -445,7 +448,7 @@ inline int ds41_idx_clear(void* model, void* stream, int slot)   // slot default
     if (slot < 0 || !S->keep_scratch)   // a full reset (slot -1) always clears them
     {
         clr(S->scratch, ds41_idx_scratch_bytes(S->rcap, S->lim1));
-        for (int j = 0; j < S->slots; ++j) clr(S->sscr[j], ds41_idx_scratch_bytes(S->sess_cap, S->lim1));
+        for (int j = 0; j < S->slots; ++j) clr(S->sscr[j], ds41_idx_scratch_bytes_flat(S->sess_cap, S->lim1));
     }
     clr(S->klen, (size_t)S->rcap * sizeof(int));
     clr(S->q_b, (size_t)S->rcap * geom::IDX_WQB_OUT * 2);

@@ -8,8 +8,11 @@
 
 extern "C"
 {
-// bytes of the shared stage scratch (logits, block scores, candidate lists, ...) for Rcap query rows over max_rows compressed rows
+// bytes of the shared stage scratch (logits, block scores, candidate lists, ...) for Rcap query rows over max_rows compressed rows. Past
+// TOPK + IDX_TILE rows (ds41_idx.cuh) the logits / block scores are carved for one key tile and long calls run tile by tile (same lists).
 size_t ds41_idx_scratch_bytes(int Rcap, int max_rows);
+// the same scratch carved for one pass only (no key tiles; the per-session decode scratch): the old size, Ds41IdxStage::flat = 1
+size_t ds41_idx_scratch_bytes_flat(int Rcap, int max_rows);
 // Called once at indexer bind when PIPE_QR=1. Checks the actual device's opt-in
 // shared-memory ceiling and configures the QR kernel before any on launch.
 int ds41_idx_pipe_qr_prepare();
@@ -54,9 +57,12 @@ struct Ds41IdxStage
     int pipe_qr;           // default-off Q-stationary 16-row cp.async dense logits
     int* out;              // int32 [R][ldo] top-512, ascending, -1 tail
     int ldo;
+    int flat;              // 1: the scratch is ds41_idx_scratch_bytes_flat (never tiled)
+    int cand_src;          // 1: layer 20 with its candidate blocks read later; a tiled dense stage makes them, ds41_idx_cand_blocks then does nothing
 };
 void ds41_idx_topk(const Ds41IdxStage* s, void* stream);
 // layer 20 only, after its dense ds41_idx_topk: block scores of the logits it left in the scratch, top-2048 blocks -> the scratch's candidates
+// (a tiled call: nothing if that ds41_idx_topk had cand_src = 1, else the tiled logits again for the blocks)
 void ds41_idx_cand_blocks(const Ds41IdxStage* s, void* stream);
 // the candidate block list ([Rcap][2048] int32, one row per query row) inside a scratch carved for (Rcap, max_rows); bounded replay moves its rows
 void* ds41_idx_cand_list(void* scratch, int Rcap, int max_rows);
