@@ -1,7 +1,7 @@
 // DS41 ranks that disagree on an agree-scope knob refuse at bootstrap: the DS41 runtime signature in g6m4.cu ends with
 // knob::signature() (as Flash and GLM do), and four ranks on loopback with GR8_DS_COMP_FP4 [1,1,0,1] refuse with
 // "bootstrap config mismatch" while [1,1,1,1] and [0,0,0,0] boot. Each rank is its own process (the knob table reads
-// the environment once). Host only.
+// the environment once) with the caller's environment cleared. Host only.
 // Build: g++ -std=c++17 -O2 -pthread -I engine/runtime engine/runtime/s2/tests/ds41_agree_knobs_test.cpp
 //          engine/knobs-rs/target/release/libgr8knobs.a -ldl -lm -o /tmp/ds41_agree_knobs_test
 // Run:   /tmp/ds41_agree_knobs_test engine/runtime/g6m4.cu
@@ -21,18 +21,28 @@ using namespace g6s2;
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
 
-// the DS41 signature block of g6m4.cu, from its first line to the bootstrap call that sends it
+// the DS41 signature block of g6m4.cu, from its first line to the serve_ds41 call that sends it, without comments
 static std::string ds41_block(const char* path) {
     std::ifstream f(path); std::stringstream ss; ss << f.rdbuf(); const std::string s = ss.str();
     const size_t a = s.find("bc.runtime_signature = std::string(s2sess > 1 ? \"ds41 sessions ");
     if (a == std::string::npos) return "";
-    const size_t b = s.find("g6s2::bootstrap(bc)", a);
-    return b == std::string::npos ? "" : s.substr(a, b - a);
+    const size_t b = s.find("g6s2::serve_ds41(dc, bc", a);
+    if (b == std::string::npos) return "";
+    std::string out, in = s.substr(a, b - a);
+    for (size_t i = 0; i < in.size();) {
+        if (in.compare(i, 2, "//") == 0) { i = in.find('\n', i); if (i == std::string::npos) break; }
+        else if (in.compare(i, 2, "/*") == 0) { i = in.find("*/", i); if (i == std::string::npos) break; i += 2; }
+        else out += in[i++];
+    }
+    return out;
 }
 
 // rank `r` of 4 with GR8_DS_COMP_FP4=fp4; exits 0 when it boots, 3 when it refuses (the head writes its error to `why`)
 [[noreturn]] static void rank(unsigned r, int fp4, uint16_t port, const std::string& dir, const std::string& why) {
     if (r) (void)!std::freopen("/dev/null", "w", stderr);   // a refused worker reports its closed control link
+    // only GR8_DS_COMP_FP4 is set: an agree-scope knob inherited from the caller (GR8_DEC_BK=262144) would change the
+    // first word that differs
+    ::clearenv();
     ::setenv("GR8_DS_COMP_FP4", fp4 ? "1" : "0", 1);
     if (knob::init()) std::_Exit(2);
     BootstrapConfig c; c.rank = r; c.ranks = 4; c.timeout = 3; c.head_ip = "127.0.0.1"; c.port = port;
