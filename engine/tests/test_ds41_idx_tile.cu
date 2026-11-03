@@ -193,13 +193,13 @@ int main(int argc, char** argv)
     const int T = 16384, T2 = 32768;
     // keys below a tile (one tile, still the tiled carve: carry-less first tile only), at a tile, one key over, several tiles
     std::vector<Case> cs = {
-        {"r1 below tile", 96, 1, T - 1000 + TOPK + 600, T, 0, 1, 1},   // ld > TOPK + T, N < T: two tiles, the second short
+        {"r1 below tile", 96, 1, T - 1000, T, 0, 1, 1},   // the carve basis is past TOPK + T (tiled scratch); keys fit one tile
         {"r1 = tile", 96, 1, T, T, 0, 1, 1},
-        {"r1 tile+1", 96, 1, T + TOPK + 129, T, 0, 1, 1},
+        {"r1 tile+1", 96, 1, T + 1, T, 0, 1, 1},
         {"r1 3.4 tiles", 64, 1, 3 * T + 7000, T, 0, 1, 1},
         {"r2 below tile", 96, 2, 2 * (T - 3000), T, 0, 1, 1},
-        {"r2 = tile", 96, 2, 2 * T + 2, T, 0, 1, 1},
-        {"r2 tile+1", 96, 2, 2 * (T + 1), T, 0, 1, 1},
+        {"r2 = tile", 96, 2, 2 * T, T, 0, 1, 1},
+        {"r2 tile+1", 96, 2, 2 * (T + 1) + 1, T, 0, 1, 1},
         {"r2 2.6 tiles", 64, 2, 2 * (2 * T + 10000), T, 0, 1, 1},
         {"r1 ties", 64, 1, 2 * T + 5000, T, 1, 1, 1},
         {"r2 ties", 64, 2, 2 * (2 * T + 5000), T, 1, 1, 1},
