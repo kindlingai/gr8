@@ -210,6 +210,7 @@ class Ds41Tests(unittest.TestCase):
         self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '5')
         # one decode graph bucket: DEC_BK follows CAP unless set
         self.assertIn('GR8_DEC_BK=1048576', opt.engine_plan(ds41('--cap', '1048576'))['env'])
+        self.assertIn('GR8_DEC_BK=16384', opt.engine_plan(ds41('--dec-bk', '16384'))['env'])   # an explicit value still wins
         self.assertEqual(plan['args'][plan['args'].index('--mtp') + 1], '0')
         self.assertIn('--reuse-prefix', plan['args'])
         for a in ('--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):

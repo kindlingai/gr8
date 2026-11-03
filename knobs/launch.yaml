@@ -533,7 +533,8 @@ options:
     scope: cluster
     doc: >-
       decode context bucket in tokens: the step graphs are captured per bucket (GR8_DEC_BK; 0 = the engine default 2048).
-      DeepSeek-V4.1: default CAP, one bucket (the DS41 step reads the context at run time, so the buckets held the same graphs)
+      DeepSeek-V4.1: default CAP, one bucket (the DS41 step reads the context at run time, so the buckets held the same graphs);
+      the old DS41 behaviour is DEC_BK=16384; there 0 also gives one bucket, not 2048
   S2_ADAPT:
     scope: cluster
     doc: >-
