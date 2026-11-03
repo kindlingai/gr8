@@ -23,8 +23,9 @@
 //       - Every restored run after 0xFF/NaN poisoning produces bit-identical (0 bit differences, max_abs_diff = 0.0, identical top-1)
 //         ICA planar codes+SF (layers 2, 8, 14, 20), CA rows, shadow KV, C.comp, C.kvs/C.scs, C.ring, hidden states, and next-token logits.
 //   (4) Negative controls: corrupting restored ICA or omitting C.kvs/C.scs at odd p = P - 1 causes immediate state/logit divergence.
-//   (1b) GR8_DS_CACHE_REPLACE: a request's request-end capture frees its own prompt-end entry (one entry a chat), never another
-//       request's prefix entry, other namespace or longer entry; dedup K, exact-position hits and budget eviction stay correct.
+//   (1b) GR8_DS_CACHE_REPLACE (run with it unset and with =0): a request's two entries are siblings and a restore of one frees the
+//       other; a request that restored a request-end entry frees its own prompt-end entry at its end, never another request's
+//       prefix entry, other namespace or longer entry; dedup K, budget eviction and an already-evicted sibling stay correct.
 //   (5) --fp4: the same with the GR8_DS_COMP_FP4 layout (C.compq packed rows, ratio-1 layers read S.ca[3], no shadow). Each Part 2 case
 //       prints a DIGEST line (last hidden row hash, greedy tokens); the default run and the --fp4 run must print identical DIGEST lines.
 // --part1 runs (1) and (1b) only (bookkeeping on small slabs, no kernels); it combines with --fp4.
@@ -349,83 +350,112 @@ static int run_test() {
         EXPECT(g98_other > g97 && cache.deduped() == 1);
         printf("Part 1 (40L+Idx+DSpark geometry, odd/even capture, match, LRU, tier_stat): PASS\n");
 
-        // Part 1b: GR8_DS_CACHE_REPLACE. One request = prompt-end capture, then the request-end capture with the prompt-end
-        // generation: one entry stays and the used bytes are that entry's bytes.
-        EXPECT(knob::ds_cache_replace());
-        g6s2::Ds41PrefixCache rc(main_m, &dsp, /*budget_mib=*/64);
+        // Part 1b: GR8_DS_CACHE_REPLACE. Run once as is and once with GR8_DS_CACHE_REPLACE=0 (today's behaviour: nothing freed).
+        using g6s2::Ds41Snap;
+        const bool on = knob::ds_cache_replace();
+        // every listed entry stored or not as expected, and the used bytes exactly the stored entries' bytes
+        auto holds = [](const g6s2::Ds41PrefixCache& c, std::initializer_list<std::pair<uint64_t, bool>> want) {
+            size_t n = 0, sum = 0;
+            for (const auto& w : want) {
+                const auto* e = c.find(w.first);
+                if ((e != nullptr) != w.second) return false;
+                if (e) { ++n; sum += e->bytes; }
+            }
+            return c.size() == n && c.used_bytes() == sum && c.used_bytes() <= c.budget_bytes();
+        };
+        g6s2::Ds41PrefixCache rc(main_m, &dsp, /*budget_mib=*/128);
         std::vector<int> chat(400);
         for (int i = 0; i < 400; ++i) chat[size_t(i)] = 5000 + i * 7;
-        const std::vector<int> prompt_a(chat.begin(), chat.begin() + 101);   // prompt of 101 tokens: prompt end at 100
-        const uint64_t a_pe = rc.capture(0, 100, prompt_a, ns_a, st);
-        EXPECT(a_pe > 0 && rc.size() == 1 && rc.used_bytes() == rc.entry_bytes(100));
-        const uint64_t a_re = rc.capture(0, 140, chat, ns_a, st, a_pe);   // reply of 39 tokens: request end at 140
-        EXPECT(a_re > a_pe && rc.size() == 1 && rc.replaced() == 1 && rc.find(a_pe) == nullptr && rc.find(a_re) != nullptr);
-        EXPECT(rc.used_bytes() == rc.entry_bytes(140) && rc.captures() == 2 && rc.evictions() == 0);
-        EXPECT(rc.tier_stat().entries == 1);
-        // the next turn (prompt = chat so far + more) restores from the request-end entry
-        auto h_next = rc.match(chat, 300, ns_a);
-        EXPECT(h_next.hit && h_next.generation == a_re && h_next.position == 140);
-        rc.restore(a_re, 1, st);
-        EXPECT(rc.hits() == 1);
-
-        // Another request's entry whose tokens are a prefix is NOT removed: request B (a sub-chat of A's turn) captures at
-        // its prompt end and request end; only B's own prompt-end entry goes, a_re stays.
-        const std::vector<int> prompt_b(chat.begin(), chat.begin() + 201);
-        const uint64_t b_pe = rc.capture(0, 200, prompt_b, ns_a, st);
-        EXPECT(b_pe > a_re && rc.size() == 2);
-        const uint64_t b_re = rc.capture(0, 260, chat, ns_a, st, b_pe);
-        EXPECT(b_re > b_pe && rc.size() == 2 && rc.replaced() == 2 && rc.find(a_re) != nullptr && rc.find(b_pe) == nullptr);
-        EXPECT(rc.used_bytes() == rc.entry_bytes(140) + rc.entry_bytes(260));
-        // a generation whose tokens are not a prefix of the new entry stays
+        const std::vector<int> prompt1(chat.begin(), chat.begin() + 101);   // turn 1: prompt end at 100
+        // (a) first turn, no restore: the prompt-end (PE) and request-end (RE) entries are both kept
+        const uint64_t pe1 = rc.capture(0, 100, prompt1, ns_a, st, Ds41Snap::PromptEnd);
+        const uint64_t re1 = rc.capture(0, 140, chat, ns_a, st, Ds41Snap::RequestEnd, pe1, /*replace=*/false);
+        EXPECT(pe1 > 0 && re1 > pe1 && holds(rc, {{pe1, true}, {re1, true}}) && rc.replaced() == 0 && rc.siblings() == 0);
+        // (b) the follow-up keeps turn 1's reply: it restores RE1, which frees the sibling PE1 at the restore; turn 2's own PE is
+        // freed at turn 2's request end. Two entries in all: RE1, RE2.
+        const std::vector<int> prompt2(chat.begin(), chat.begin() + 201);
+        auto h2 = rc.match(prompt2, 200, ns_a);
+        EXPECT(h2.hit && h2.generation == re1 && h2.position == 140);
+        EXPECT(rc.restore(re1, 1, st) == Ds41Snap::RequestEnd);
+        EXPECT(holds(rc, {{pe1, !on}, {re1, true}}) && rc.siblings() == (on ? 1u : 0u));
+        const uint64_t pe2 = rc.capture(0, 200, prompt2, ns_a, st, Ds41Snap::PromptEnd);
+        const uint64_t re2 = rc.capture(0, 260, chat, ns_a, st, Ds41Snap::RequestEnd, pe2, /*replace=*/true);
+        EXPECT(re2 > pe2 && holds(rc, {{pe1, !on}, {re1, true}, {pe2, !on}, {re2, true}}) && rc.replaced() == (on ? 1u : 0u));
+        EXPECT(!on || rc.used_bytes() == rc.entry_bytes(140) + rc.entry_bytes(260));
+        // (c) a thinking chat without tools: the follow-up drops turn 1's reasoning, so it matches PE3 only (RE3 holds the
+        // reasoning). Restoring PE3 frees the sibling RE3; turn 2's own PE is kept (and linked to its RE).
+        std::vector<int> think(300), next(300);
+        for (int i = 0; i < 300; ++i) {
+            think[size_t(i)] = 90000 + i * 5;
+            next[size_t(i)] = i <= 100 ? think[size_t(i)] : 70000 + i * 3;   // same through the prompt end, then no reasoning
+        }
+        const std::vector<int> prompt3(think.begin(), think.begin() + 101), prompt4(next.begin(), next.begin() + 201);
+        const uint64_t pe3 = rc.capture(0, 100, prompt3, ns_a, st, Ds41Snap::PromptEnd);
+        const uint64_t re3 = rc.capture(0, 150, think, ns_a, st, Ds41Snap::RequestEnd, pe3, false);
+        auto h4 = rc.match(prompt4, 200, ns_a);
+        EXPECT(h4.hit && h4.generation == pe3 && h4.position == 100);
+        EXPECT(rc.restore(pe3, 1, st) == Ds41Snap::PromptEnd);
+        EXPECT(rc.find(pe3) && (rc.find(re3) != nullptr) == !on && rc.siblings() == (on ? 2u : 0u));
+        const uint64_t pe4 = rc.capture(0, 200, prompt4, ns_a, st, Ds41Snap::PromptEnd);
+        const uint64_t re4 = rc.capture(0, 240, next, ns_a, st, Ds41Snap::RequestEnd, pe4, /*replace=*/false);
+        EXPECT(holds(rc, {{pe1, !on}, {re1, true}, {pe2, !on}, {re2, true}, {pe3, true}, {re3, !on}, {pe4, true}, {re4, true}}));
+        EXPECT(rc.replaced() == (on ? 1u : 0u) && rc.siblings() == (on ? 2u : 0u));
+        // a later restore of RE4 frees PE4 (its sibling); restoring RE4 again frees nothing more
+        EXPECT(rc.restore(re4, 1, st) == Ds41Snap::RequestEnd);
+        EXPECT((rc.find(pe4) != nullptr) == !on && rc.siblings() == (on ? 3u : 0u));
+        EXPECT(rc.restore(re4, 1, st) == Ds41Snap::RequestEnd && rc.siblings() == (on ? 3u : 0u));
+        // replace = true never frees an entry that is not a strict same-namespace token prefix: another token sequence, another
+        // namespace, a longer stored entry, a stale generation
         std::vector<int> other = chat;
         other[10] = 777777;
-        const uint64_t o_re = rc.capture(0, 150, other, ns_a, st, a_re);
-        EXPECT(o_re > b_re && rc.find(a_re) != nullptr && rc.replaced() == 2);
-        // a different namespace is never replaced
-        const uint64_t n_re = rc.capture(0, 280, chat, ns_b, st, b_re);
-        EXPECT(n_re > o_re && rc.find(b_re) != nullptr && rc.replaced() == 2);
-        // a longer-or-equal stored gen is never replaced (position < pos)
-        const uint64_t s_re = rc.capture(0, 120, chat, ns_a, st, b_re);
-        EXPECT(s_re > n_re && rc.find(b_re) != nullptr && rc.replaced() == 2);
-        // a stale generation (already evicted or replaced) is a no-op
-        const uint64_t z_re = rc.capture(0, 290, chat, ns_a, st, a_pe);
-        EXPECT(z_re > s_re && rc.replaced() == 2);
-        size_t sum = 0;
-        for (uint64_t g : {a_re, b_re, o_re, n_re, s_re, z_re})
-            if (const auto* e = rc.find(g)) sum += e->bytes;
-        EXPECT(rc.used_bytes() == sum && rc.used_bytes() <= rc.budget_bytes());
+        const size_t n0 = rc.size();
+        EXPECT(rc.capture(0, 150, other, ns_a, st, Ds41Snap::RequestEnd, re1, true) > 0 && rc.find(re1));
+        EXPECT(rc.capture(0, 280, chat, ns_b, st, Ds41Snap::RequestEnd, re2, true) > 0 && rc.find(re2));
+        EXPECT(rc.capture(0, 120, chat, ns_a, st, Ds41Snap::RequestEnd, re2, true) > 0 && rc.find(re2));
+        EXPECT(rc.capture(0, 290, chat, ns_a, st, Ds41Snap::RequestEnd, pe1, true) > 0);
+        EXPECT(rc.size() == n0 + 4 && rc.replaced() == (on ? 1u : 0u) && rc.evictions() == 0);
 
-        // The dedup K path still works with a replace gen: a 1-token reply (request end = prompt end + 1) folds into the
-        // prompt-end entry itself, which stays (it is the one entry of that chat).
+        // (e) dedup K: a 1-token reply (request end = prompt end + 1) folds into the prompt-end entry itself, which stays, with
+        // or without replace. An exact-position hit on another stored entry still frees the request's own PE when replacing.
         g6s2::Ds41PrefixCache dc(main_m, &dsp, /*budget_mib=*/64);
-        const uint64_t d_pe = dc.capture(0, 100, prompt_a, ns_a, st);
-        EXPECT(dc.capture(0, 101, chat, ns_a, st, d_pe) == 0);
-        EXPECT(dc.size() == 1 && dc.deduped() == 1 && dc.replaced() == 0 && dc.find(d_pe) != nullptr);
-        EXPECT(dc.used_bytes() == dc.entry_bytes(100));
-        // An exact-position hit on another stored entry still frees this request's prompt-end entry.
+        const uint64_t d_pe = dc.capture(0, 100, prompt1, ns_a, st, Ds41Snap::PromptEnd);
+        EXPECT(dc.capture(0, 101, chat, ns_a, st, Ds41Snap::RequestEnd, d_pe, false) == 0);
+        EXPECT(dc.capture(0, 101, chat, ns_a, st, Ds41Snap::RequestEnd, d_pe, true) == 0);
+        EXPECT(dc.deduped() == 2 && dc.replaced() == 0 && holds(dc, {{d_pe, true}}));
         const uint64_t d_x = dc.capture(0, 180, chat, ns_a, st);
         const std::vector<int> prompt_c(chat.begin(), chat.begin() + 151);
-        const uint64_t c_pe = dc.capture(0, 150, prompt_c, ns_a, st);
-        EXPECT(dc.size() == 3);
-        EXPECT(dc.capture(0, 180, chat, ns_a, st, c_pe) == d_x);
-        EXPECT(dc.size() == 2 && dc.replaced() == 1 && dc.find(c_pe) == nullptr && dc.find(d_x) != nullptr && dc.find(d_pe));
-        EXPECT(dc.used_bytes() == dc.entry_bytes(100) + dc.entry_bytes(180));
+        const uint64_t c_pe = dc.capture(0, 150, prompt_c, ns_a, st, Ds41Snap::PromptEnd);
+        EXPECT(dc.capture(0, 180, chat, ns_a, st, Ds41Snap::RequestEnd, c_pe, true) == d_x);
+        EXPECT(holds(dc, {{d_pe, true}, {d_x, true}, {c_pe, !on}}) && dc.replaced() == (on ? 1u : 0u));
 
-        // Budget and eviction: at 16 MiB two entries fit. The request-end capture frees its prompt-end entry before it
-        // allocates, so the older entry of another chat is not evicted to make room for the second snapshot of one chat.
+        // (e) budget: at 16 MiB two entries fit. A replacing request-end capture frees its PE before it allocates, so another
+        // chat's older entry is not evicted for it; a third chat then evicts the oldest, as before.
         g6s2::Ds41PrefixCache ec(main_m, &dsp, /*budget_mib=*/16);
         EXPECT(ec.entry_bytes(130) * 2 <= ec.budget_bytes() && ec.entry_bytes(100) * 3 > ec.budget_bytes());
         const uint64_t e_old = ec.capture(0, 130, chat, ns_b, st);
-        const uint64_t e_pe = ec.capture(0, 100, prompt_a, ns_a, st);
-        EXPECT(ec.size() == 2 && ec.evictions() == 0);
-        const uint64_t e_re = ec.capture(0, 130, chat, ns_a, st, e_pe);
-        EXPECT(e_re > e_pe && ec.size() == 2 && ec.evictions() == 0 && ec.replaced() == 1 && ec.find(e_old) != nullptr);
-        EXPECT(ec.used_bytes() == 2 * ec.entry_bytes(130));
-        // a third chat now evicts the oldest (e_old), as before
+        const uint64_t e_pe = ec.capture(0, 100, prompt1, ns_a, st, Ds41Snap::PromptEnd);
+        const uint64_t e_re = ec.capture(0, 130, chat, ns_a, st, Ds41Snap::RequestEnd, e_pe, true);
+        EXPECT(e_re > e_pe && ec.evictions() == (on ? 0u : 1u) && ec.replaced() == (on ? 1u : 0u));
+        EXPECT(holds(ec, {{e_old, on}, {e_pe, !on}, {e_re, true}}));
         const uint64_t e_3 = ec.capture(0, 125, other, ns_a, st);
-        EXPECT(e_3 > e_re && ec.size() == 2 && ec.evictions() == 1 && ec.find(e_old) == nullptr && ec.find(e_re) != nullptr);
-        EXPECT(ec.used_bytes() == ec.entry_bytes(130) + ec.entry_bytes(125));
-        printf("Part 1b (GR8_DS_CACHE_REPLACE: one entry a request, prefix of another request kept, dedup, budget): PASS\n");
+        EXPECT(e_3 > e_re && ec.evictions() == (on ? 1u : 2u) && holds(ec, {{e_old, false}, {e_pe, false}, {e_re, true}, {e_3, true}}));
+
+        // (f) a sibling already evicted by LRU: restoring the survivor frees nothing (no double free), bytes stay exact
+        g6s2::Ds41PrefixCache fc(main_m, &dsp, /*budget_mib=*/16);
+        const uint64_t f_pe = fc.capture(0, 100, prompt1, ns_a, st, Ds41Snap::PromptEnd);
+        const uint64_t f_re = fc.capture(0, 130, chat, ns_a, st, Ds41Snap::RequestEnd, f_pe, false);
+        const uint64_t f_x = fc.capture(0, 125, other, ns_a, st);   // evicts f_pe, the oldest
+        EXPECT(fc.evictions() == 1 && holds(fc, {{f_pe, false}, {f_re, true}, {f_x, true}}));
+        EXPECT(fc.restore(f_re, 1, st) == Ds41Snap::RequestEnd && fc.siblings() == 0 && holds(fc, {{f_re, true}, {f_x, true}}));
+        // a second pair: its PE evicted first (LRU order after the restore above: f_x, f_re)
+        const uint64_t f_pe2 = fc.capture(0, 100, think, ns_a, st, Ds41Snap::PromptEnd);                  // evicts f_x
+        const uint64_t f_re2 = fc.capture(0, 128, think, ns_a, st, Ds41Snap::RequestEnd, f_pe2, false);   // evicts f_re
+        const uint64_t f_y = fc.capture(0, 126, next, ns_b, st);                                          // evicts f_pe2
+        EXPECT(fc.evictions() == 4 && fc.find(f_pe2) == nullptr && fc.find(f_re2) != nullptr);
+        EXPECT(fc.restore(f_re2, 1, st) == Ds41Snap::RequestEnd && fc.siblings() == 0);
+        EXPECT(fc.used_bytes() == fc.find(f_re2)->bytes + fc.find(f_y)->bytes && fc.size() == 2);
+        printf("Part 1b (GR8_DS_CACHE_REPLACE=%d: siblings, replace after a request-end restore, dedup, budget, evicted sibling): PASS\n",
+               int(on));
     }
     if (g_part1) {
         printf("PART 1 ONLY (--part1): PASSED\n");

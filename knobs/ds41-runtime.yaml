@@ -40,9 +40,12 @@ knobs:
     default: "1"
     values: "0|1"
     doc: >-
-      A request's request-end DS41 prefix snapshot frees the snapshot the same request took at its prompt end, so a chat
-      holds one snapshot, not two. Set 0 to keep both: a resent identical prompt (a retry) then still restores from the
-      prompt-end snapshot instead of prefilling again.
+      A request's two DS41 prefix snapshots (prompt end, request end) are linked. A first turn keeps both until its
+      follow-up. The follow-up's restore of one frees the other, the unused sibling: a chat that sends the reply back
+      (tools, or thinking off) continues from the request-end snapshot, a thinking chat without tools (its next prompt drops
+      the reasoning) from the prompt-end one. A request that restored a request-end snapshot frees its own prompt-end one
+      when it captures its request end. A freed snapshot is lost only to prompts that share its prefix and leave the reply
+      (a retry, regenerate or edit), which prefill again. Set 0 to keep every snapshot until LRU eviction.
   GR8_DS_CONF_TEMP:
     scope: agree
     kind: text
