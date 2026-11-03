@@ -84,8 +84,8 @@ otherwise. "Free memory" is `MemAvailable` a box; a range is the lowest and high
   - Recall at 1M was unreliable in these tests: 2 of 7 different 1M prompts found all 3 facts hidden in them (one at
     10%, 50% and 90% of the prompt). Other hosted DeepSeek-V4.1-Flash servers also missed facts at 1M. Up to 262,144
     tokens, every run that completed found all 3.
-  - A follow-up reads only its new tokens when a snapshot in the prefix cache matches the start of its prompt;
-    otherwise it reads the whole prompt again. A 1M snapshot is 882 MiB a box: about 2 fit in 2,048 MiB, about 4 in
+  - When a snapshot in the prefix cache matches the start of a follow-up's prompt, the follow-up reads only the tokens
+    after that cached part; otherwise it reads the whole prompt again. A 1M snapshot is 882 MiB a box: about 2 fit in 2,048 MiB, about 4 in
     the 4,096 MiB default (`GR8_DS_CACHE_MIB` unset). A chat's first turn can keep 2 snapshots (prompt end and reply
     end), so this is not a fixed number of cached chats: at 2,048 MiB, only the last 1M chat stayed cached.
 
