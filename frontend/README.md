@@ -51,7 +51,7 @@ On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 
 
 | flag | default | meaning |
 |---|---|---|
-| `--model-dir` | required | Directory holding `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json`. |
+| `--model-dir` | required | Directory holding `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json`. Its `temperature` and `top_p` are the defaults for a request that names none. DeepSeek-V4.1-Flash: with no `top_p` there, a request without one samples at 0.95. DeepSeek's V4.1-Flash README recommends 0.95 or 1.0 and evaluates at 0.95; the 1017 README recommends 1.0 (send `top_p: 1.0` for it). At temperature 1.0 on 4 Sparks, 0.95 decoded 7-13% faster with the same sampled quality. |
 | `--engine-sock` | `/run/g6/engine.sock` | Engine Unix socket. |
 | `--host` / `--port` | `0.0.0.0` / `8100` | Listen address. |
 | `--served-model-name` | `glm-5.3 glm53` | Accepted `model` values. The first one is reported in responses. |
