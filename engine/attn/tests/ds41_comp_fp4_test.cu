@@ -95,6 +95,26 @@ static void h_decode(const uint8_t* row, uint16_t* out)
         out[c] = b;
     }
 }
+// fills every SM's shared memory with 0xFF (bf16 NaN) before a packed launch: without it, a slot the packed path fails to
+// write still holds the key the bf16 launch just before left there (same CTAs on the same SMs), and the outputs agree
+__global__ void k_smem_poison(int words)
+{
+    extern __shared__ uint32_t sm[];
+    for (int i = threadIdx.x; i < words; i += blockDim.x) sm[i] = 0xFFFFFFFFu;
+    __syncthreads();
+}
+static void poison_smem()
+{
+    static int sms = 0;
+    const int bytes = (int)ds41a::AT_SMEM_CPA;
+    if (!sms)
+    {
+        CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
+        CK(cudaFuncSetAttribute(k_smem_poison, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+    }
+    k_smem_poison<<<sms * 2, 256, bytes>>>(bytes / 4);
+    CK(cudaGetLastError());
+}
 static void report(const char* what, long diff, long total, long negzero = -1)
 {
     printf("  %-64s %s  (%ld of %ld differ", what, diff ? "DIFF " : "EXACT", diff, total);
@@ -255,6 +275,7 @@ struct Case
     int ns;         // sessions (decode form with dsess when > 1)
     int pos;        // first position (decode form); -1 = prefill from 0
     int floor;      // window floor (bounded replay), 0 = none
+    int wl = 0;     // window list length override (decode form only; 0 = the engine's: WIN, or min(n, WIN) for prefill)
 };
 
 // top-k list of a row at position p: up to 512 random visible rows ((p + 1) / ratio), ascending, -1 tail
@@ -316,6 +337,7 @@ static Built build(const Case& c, int heads, const Keys& K)
     p.dstart = decode ? b.d_pos : nullptr;
     p.decode = decode;
     p.WL = decode ? ds41a::WIN : std::min(n, ds41a::WIN);
+    if (c.wl) p.WL = c.wl;
     p.ring_rows = ring_rows;
     p.TK = 512;
     p.scale = 0.04419417382415922f;   // 512^-0.5
@@ -360,6 +382,17 @@ static void test_attention(int heads, int long_keys)
         {"prefill chunk from 0, 1024 rows", 1, 1024, 1, -1, 0},
         {"4096-row chunk at a long position", 2, 4096, 1, long_keys - 4096, 0},
         {"4096-row chunk at a long position", 1, 4096, 1, long_keys - 4096, 0},
+        // WL not a multiple of 64: one 64-row block holds window rows and packed compressed rows
+        {"prefill chunk from 0, 37 rows (WL 37)", 2, 37, 1, -1, 0},
+        {"prefill chunk from 0, 37 rows (WL 37)", 1, 37, 1, -1, 0},
+        {"prefill chunk from 0, 100 rows (WL 100)", 2, 100, 1, -1, 0},
+        {"prefill chunk from 0, 100 rows (WL 100)", 1, 100, 1, -1, 0},
+        {"decode 1 row, 8K keys, WL 37 (override)", 2, 1, 1, 8191, 0, 37},
+        {"decode 1 row, 8K keys, WL 37 (override)", 1, 1, 1, 8191, 0, 37},
+        {"decode 1 row, 8K keys, WL 100 (override)", 2, 1, 1, 8191, 0, 100},
+        {"decode 1 row, 8K keys, WL 100 (override)", 1, 1, 1, 8191, 0, 100},
+        {"decode 5 sessions on slabs, WL 100 (override)", 2, 5, 5, 65000, 0, 100},
+        {"decode 5 sessions on slabs, WL 100 (override)", 1, 5, 5, 65000, 0, 100},
     };
     for (const Case& c : cases)
     {
@@ -373,6 +406,7 @@ static void test_attention(int heads, int long_keys)
             set_rows(b.p, K, false, b.out_a);
             ds41a::launch_attn(b.p, 0);
             set_rows(b.p, K, true, b.out_b);
+            poison_smem();
             ds41a::launch_attn(b.p, 0);
             CK(cudaDeviceSynchronize());
             const auto oa = back((const uint16_t*)b.out_a, b.out_n), ob = back((const uint16_t*)b.out_b, b.out_n);
@@ -405,6 +439,7 @@ static void test_attention(int heads, int long_keys)
             set_rows(b.p, K, false, b.out_a);
             ds41a::launch_attn(b.p, 0);
             set_rows(b.p, K, true, b.out_b);
+            poison_smem();
             ds41a::launch_attn(b.p, 0);
             CK(cudaDeviceSynchronize());
             const auto oa = back((const uint16_t*)b.out_a, b.out_n), ob = back((const uint16_t*)b.out_b, b.out_n);
