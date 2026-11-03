@@ -59,11 +59,15 @@ otherwise. "Free memory" is the lowest `MemAvailable` of the four boxes.
 
 - Default: 262,144 (`CAP=262144`). A request then holds at most 262,134 tokens (prompt and reply).
 - Long: `CAP=1048576` (a request holds at most 1,048,566 tokens).
-- Measured (TBD M1MX):
-  - Every slot gets its full length at boot: 16 slots x 1,048,576 boot with 9.84-9.98 GiB free a box.
-  - A 1,031,542-token prompt: first word after TBD s; TBD of 3 facts found in it (one fact at 10%, 50% and 90% of the
-    prompt).
-  - Free memory with 1 / 2 / 3 full 1M chats at once: TBD.
+- Measured with 16 slots x 1,048,576 and the prefix cache at 2,048 MiB a box (`GR8_DS_CACHE_MIB=2048`):
+  - Every slot gets its full length at boot: 9.8-10.0 GiB free a box at ready.
+  - A 1,031,542-token prompt reads in about 417 s. Two or three such prompts at once share the reading: three at once
+    all finish after about 1,250 s, as three one after another would.
+  - Free memory: 3.2-3.4 GiB a box after one full 1M chat, 2.95-3.22 GiB with three at once. More than three at once
+    was not tested.
+  - Recall at 1M is the model's limit, not the engine's: 2 of 7 different 1M prompts found all 3 facts hidden in them
+    (one at 10%, 50% and 90% of the prompt). Other hosted DeepSeek-V4.1-Flash servers miss facts at 1M too. Up to
+    262,144 tokens, every run that completed found all 3.
   - A follow-up to a long chat reads only its new tokens when the chat's snapshot is still in the prefix cache
     (`GR8_DS_CACHE_MIB`, 4096 MiB a box by default). A 1M chat's snapshot is 882 MiB a box, so about 2 such chats
     fit; other follow-ups read the whole prompt again.
