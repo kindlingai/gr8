@@ -129,6 +129,13 @@ static int run(const Case& c, bool timing = false, float* ms_flat = nullptr, flo
     if (timing) { tf = tm(flat); CK(cudaFree(s_flat)); s_flat = nullptr; }
     void* s_tile = dalloc<uint8_t>(b_tile);
     const Scratch B = Scratch::carve(s_tile, R, max_rows, R, c.tile);
+    // reused scratch: the logits and block-score rows hold an earlier call's values (huge ones here), so a select that reads a carry pad
+    // slot (-1 index, value never written) would pick it over a real key
+    if (!timing)
+    {
+        CK(cudaMemset(B.p, 0x7F, (size_t)R * B.ldp * 2));
+        if (cand) CK(cudaMemset(B.sc, 0x7F, (size_t)R * B.ldsc * 2));
+    }
     auto tiled = [&] { stage_index_dense(in, B, ob, TOPK, 0, cand); if (cand) stage_cand_blocks(in, B, 0, true); };
     tiled();
     CK(cudaDeviceSynchronize());

@@ -907,13 +907,17 @@ inline void launch_logits_pipe(const LogitsP& p, cudaStream_t s, bool exact)
 // sc[r][b] = max of p over block b's visible tokens (-inf past the last visible block); the last visible block is +inf so it is
 // always chosen. nvalid[r] = number of visible blocks. Requires ldp % 8 == 0 and p 16 B aligned.
 // Tiled (key tile of the prefill indexer): p and sc hold the nbt blocks b0 .. b0 + nbt - 1 of the row (p from token 8 b0); nb, klen and the
-// last-visible rule stay those of the whole row; nvalid[r] = the tile's visible blocks + nv_add. b0 = 0, nbt = nb, nv_add = 0: the whole row.
+// last-visible rule stay those of the whole row; nvalid[r] = the tile's visible blocks + nv_add (the carry's real count when the tile has none). b0 = 0, nbt = nb, nv_add = 0: the whole row.
 __global__ void k_block_scores(const bf16* __restrict__ p, long ldp, const int32_t* __restrict__ klen, int nb, bf16* __restrict__ sc,
                                long ldsc, int32_t* __restrict__ nvalid, int b0, int nbt, int nv_add)
 {
     const int r = blockIdx.y, b = blockIdx.x * blockDim.x + threadIdx.x;
     const int kl = klen[r], vb = min((kl + CAND_BS - 1) / CAND_BS, nb);
-    if (blockIdx.x == 0 && threadIdx.x == 0) nvalid[r] = max(0, min(vb - b0, nbt)) + nv_add;
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        const int nt = max(0, min(vb - b0, nbt));
+        nvalid[r] = nt > 0 ? nt + nv_add : min(nv_add, max(0, min(vb, b0)));   // no block in the tile: the carry count (see k_tile_len)
+    }
     if (b >= nbt) return;
     const int gb = b0 + b;
     float m = -INFINITY;
@@ -1582,15 +1586,17 @@ inline void launch_ca_dequant(const PagedRows& ca, int row0, int n, bf16* out, c
 // top-K of the keys before the tile (their bf16 values, ascending key index, beside the int32 index list), the tile its logits. All carry
 // indices are below the tile's, both parts ascending, so the plain top-K of the buffer under the select's order (larger key first, ties to
 // the lower column) is the top-K of all keys so far under the same order on key ids: the result after the last tile is the one-pass result.
-// klen_t[r] = the row's visible keys in the tile [c0, c0 + T) (bound N = the one-pass ncap), end_t[r] = K + klen_t[r].
+// klen_t[r] = the row's visible keys in the tile [c0, c0 + T) (bound N = the one-pass ncap), end_t[r] = K + klen_t[r]. A row with no key in
+// the tile has end_t = its carry count, so the select keeps the carry and never reads a -1 pad slot (its value is stale scratch). A row
+// with keys in a later tile (c0 >= T >= K) always has a full carry, so the valid columns stay one run [0, end_t).
 __global__ void k_tile_len(const int32_t* __restrict__ klen, int c0, int T, int N, int K, int32_t* __restrict__ klen_t,
                            int32_t* __restrict__ end_t, int R)
 {
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     if (r >= R) return;
-    const int n = max(0, min(min(klen[r], N) - c0, T));
+    const int kv = min(klen[r], N), n = max(0, min(kv - c0, T));
     klen_t[r] = n;
-    end_t[r] = K + n;
+    end_t[r] = n > 0 ? K + n : min(K, max(0, min(kv, c0)));
 }
 // After the select over a row buffer: pos[r][j] = selected columns (ascending, -1 pad). Column c < K (has_carry) is carry slot c, else key
 // base + (c - K); no carry (first tile): the select ran over v + K, column c is key base + c. Writes the new carry: idx[r][j] (-1 pad kept) and v[r][j] = the selected bf16 bits. One CTA per row.
