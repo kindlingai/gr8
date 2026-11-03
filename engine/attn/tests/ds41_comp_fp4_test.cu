@@ -6,7 +6,7 @@
 //      long position; ratio 2 (layers 2..19) and ratio 1 (layers 20..39) key counts.
 //   3. --time ITERS: kernel time of the served cp.async kernel, bf16 vs packed rows (decode at 8K and 128K keys, a 4096-row chunk).
 //
-//   build: nvcc -std=c++17 -O3 -arch=sm_121a -DG6_MODEL_DS41=1 -I engine -o ds41_comp_fp4_test engine/attn/tests/ds41_comp_fp4_test.cu engine/knobs-rs/target/release/libgr8knobs.a -lpthread -ldl -lm
+//   build: nvcc -std=c++17 -O3 -gencode=arch=compute_121a,code=sm_121a -DG6_MODEL_DS41=1 -I engine -o ds41_comp_fp4_test engine/attn/tests/ds41_comp_fp4_test.cu engine/knobs-rs/target/release/libgr8knobs.a -lpthread -ldl -lm
 //   run:   ds41_comp_fp4_test [--heads 16] [--time 50] [--long 131072]
 // Exit code 1 if any comparison differs.
 #include "../ds41_attn.cuh"
