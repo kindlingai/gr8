@@ -321,6 +321,17 @@ class ShimTests(unittest.TestCase):
         a = spawn.call_args[0][1]
         self.assertEqual(a[a.index('--sessions') + 1], opt.engine_plan(s.o)['knobs']['SESS'])
 
+    def test_the_flash_shim_reports_its_sessions_by_tp(self):
+        # GLM-5.3-Flash runs 8, 4 or 1 sessions at TP 4, 3 or 2 (scripts/engine_args.sh); its pool is shared, so no slots
+        for tp, want in ((4, '8'), (3, '4'), (2, '1')):
+            s = supervisor('--gr8-model', 'glm53f', '--tp', str(tp), members=MEMBERS[:tp])
+            with mock.patch.object(s, 'spawn', side_effect=self.Spawned) as spawn:
+                with self.assertRaises(self.Spawned):
+                    s.start_shim('/work')
+            a = spawn.call_args[0][1]
+            self.assertEqual(a[a.index('--sessions') + 1], want)
+            self.assertNotIn('--capacity-slots', a)
+
     def test_the_ds41_identity_is_the_engines_own(self):
         geom = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'engine', 'model_geom_ds41.h')).read()
         vocab = int(re.search(r'constexpr int VOCAB = (\d+);', geom).group(1))
