@@ -114,6 +114,7 @@ public:
         batch_(int(c.mtp), int(c.max_rows), batch_hooks()) {
         batch_.adapt(s2::adapt_env());
         batch_.set_mtp_sessions(int(c.mtp_sessions));
+        batch_.set_sess_drafts(c.sess_drafts);
         require(bool(hooks_.bind) && bool(hooks_.retire) && bool(hooks_.prefill) && bool(hooks_.run) && bool(hooks_.emit), "missing driver callback");
     }
     const Scheduler& state() const { return scheduler_; }
