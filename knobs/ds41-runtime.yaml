@@ -30,9 +30,9 @@ knobs:
     values: "0..64"
     doc: >-
       Skip a new DS41 prefix snapshot when a stored same-namespace prefix is at most this many tokens shorter.
-      The default 1 folds a request-end snapshot only when the reply is at most one token (it sits at most the reply
-      length after the prompt-end one; GR8_DS_CACHE_REPLACE handles longer replies) and keeps new snapshots for short
-      chat turns. Set 0, with GR8_DS_CACHE_REPLACE=0, to keep every snapshot. Larger values may cause short follow-ups
+      The default 1 reuses a stored same-namespace prefix at most one token behind the requested snapshot position. This
+      includes short replies; GR8_DS_CACHE_REPLACE removes the same request's prompt-end entry when a later snapshot is
+      actually captured. Set 0, with GR8_DS_CACHE_REPLACE=0, to keep every snapshot. Larger values may cause short follow-ups
       to re-prefill on the next turn.
   GR8_DS_CACHE_REPLACE:
     scope: agree
