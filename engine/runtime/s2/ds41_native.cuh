@@ -71,7 +71,7 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
                             sc.decode_prefill_rows >= 1 && sc.decode_prefill_rows <= sc.prefill_rows),
             "DS41 two-lane prefill needs the one-lane callee, lane B's error word, two_lanes at W rows and the decode cap");
     std::unique_ptr<Ds41Round> round;
-    if (c.dsp) round = std::make_unique<Ds41Round>(c.main, *c.dsp, c.stream, int(sc.mtp));
+    if (c.dsp) round = std::make_unique<Ds41Round>(c.main, *c.dsp, c.stream, int(sc.mtp), sc.sess_drafts);
     const unsigned pages = sc.pool_rows / PAGE;
     const unsigned slot_pages = pages / unsigned(slots);   // SESS > 1: one run fits one slot's slabs (cap rows); slots == 1: the pool
     RunPool pool(pages, pages, sc.pool_rows);

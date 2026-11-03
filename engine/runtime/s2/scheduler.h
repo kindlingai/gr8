@@ -88,6 +88,9 @@ struct Config {
     // 0: every session drafts mtp tokens a round. n: drafting stops while more than n sessions are active (one row each),
     // so up to max_rows sessions decode. Batch::set_mtp_sessions.
     uint32_t mtp_sessions = 0;
+    // DS41 only, GR8_DS_SESS_DRAFTS=1: a shared round's drafts a session go by its active count (s2/ds41_sess_drafts.h,
+    // Batch::set_sess_drafts) instead of the mtp_sessions cut; needs mtp_sessions > 0 (one row a session at most bounds limit())
+    bool sess_drafts = false;
     // max_rows bounds ONE step: a round is one main step of every session's mtp + 1 rows (s2_batch.h Batch::round)
     uint32_t guard() const { return guard_tokens == UINT32_MAX ? 2 * mtp : guard_tokens; }
     unsigned limit() const {

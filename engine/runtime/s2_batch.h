@@ -66,6 +66,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include "s2/ds41_sess_drafts.h"
 #include <utility>
 #include <vector>
 #include "../knobs-rs/gr8_knobs.h"
@@ -452,8 +453,12 @@ public:
     // Config::mtp_sessions: n > 0 = no drafting while more than n sessions are active. The cap keeps K_ + 1 in its
     // divisor, so a drafting round of mtp_max_sess() sessions always fits max_rows_ (round()'s guard counts sessions).
     void set_mtp_sessions(int n) { mtp_sessions_ = n; }
+    // GR8_DS_SESS_DRAFTS=1 (s2/ds41_sess_drafts.h): a shared round of n sessions verifies at most sess_drafts_kv(K, max_rows, n)
+    // drafts a session, and sessions draft while that is >= 1 (mtp_sessions_ is not read). Off: unchanged
+    void set_sess_drafts(bool on) { sess_drafts_ = on; }
     int mtp_max_sess() const {
         if (K_ <= 0) return 0;
+        if (sess_drafts_) return sess_drafts_max(K_, max_rows_, S2N_SLOTS);
         return mtp_sessions_ > 0 ? std::min(max_rows_ / (K_ + 1), mtp_sessions_) : max_rows_ / (K_ + 1);
     }
 
@@ -655,6 +660,7 @@ private:
         std::vector<int> base(S2N_SLOTS, 0);
         const bool mtp_on = K_ > 0 && (int)act.size() <= mtp_max_sess();
         int k = mtp_on ? K_ : 0;                                  // drafts verified: the fewest any session holds (0 when S > mtp_max_sess())
+        if (mtp_on && sess_drafts_) k = std::min(k, sess_drafts_kv(K_, max_rows_, (int)act.size()));   // GR8_DS_SESS_DRAFTS: by active count
         if (mtp_on) for (int q : act) k = std::min(k, st_[q].k);
         std::vector<int> kq(S2N_SLOTS, k), aq(S2N_SLOTS, -1), nd(S2N_SLOTS, 0);   // KStopB: per session; log: accepted, drafts held
         const bool xr = mtp_on && ks_.b.mode && ks_.b.explore && cur_round_ % ks_.b.explore == 0;
@@ -1198,6 +1204,7 @@ private:
     }
     int K_, max_rows_;
     int mtp_sessions_ = 0;            // Config::mtp_sessions
+    bool sess_drafts_ = false;        // Config::sess_drafts (GR8_DS_SESS_DRAFTS)
     bool adapt_ = false;
     int dkv_ = DFL_B - 1;
     bool par_ = knob::draft_par().value_or(0) != 0;

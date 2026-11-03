@@ -93,6 +93,26 @@ private:
     bool valid_ = false;
 };
 
+// SESS > 1: the draft launches of one DRAFT step (Ds41Round::draft_step_sessions runs them in this order). The drafted sessions (those
+// whose draft_in_sess runs, in step order) split into launches of at most cap (Dsp::nsess) by s2::draft_chunks: one launch when they fit
+// (always without GR8_DS_SESS_DRAFTS), else consecutive launches of cap and the rest. js: indexes into s.sess; ins: their draft inputs.
+struct DraftLaunch { std::vector<size_t> js; std::vector<Ds41RoundLogic::DraftIn> ins; };
+inline std::vector<DraftLaunch> draft_launches(const s2::Step& s, const std::vector<Ds41RoundLogic>& logic, int cap) {
+    std::vector<size_t> js;
+    std::vector<Ds41RoundLogic::DraftIn> ins;
+    for (size_t j = 0; j < s.sess.size(); ++j) {
+        const int q = s.sess[j];
+        if (q < 0 || size_t(q) >= logic.size()) throw std::runtime_error("DSpark draft step session outside the S2 slots");
+        Ds41RoundLogic::DraftIn in;
+        if (logic[size_t(q)].draft_in_sess(s, j, in)) { js.push_back(j); ins.push_back(in); }
+    }
+    std::vector<DraftLaunch> v;
+    for (const auto& c : s2::draft_chunks(int(js.size()), cap))
+        v.push_back({std::vector<size_t>(js.begin() + c.first, js.begin() + c.first + c.second),
+                     std::vector<Ds41RoundLogic::DraftIn>(ins.begin() + c.first, ins.begin() + c.first + c.second)});
+    return v;
+}
+
 // The text of the draft fabric's error word (the message of "DSpark draft fabric error"). Layouts: kernels/glue.cuh wait_peers sets
 // code << 24 | c << 8 | peer (0x61 all-reduce wait, 0x62 head-merge wait; peer = the rank whose tail never arrived); comms/fabric.cpp's proxy
 // sets 0x70 << 24 | c (doorbell wait of 30 s ran out) or 0x71 << 24 (work completion error). The prefix stays "DSpark draft fabric error".
