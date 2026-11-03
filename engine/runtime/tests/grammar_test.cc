@@ -99,6 +99,19 @@ int main() {
     grammar_masks(*h, nullptr, 0, on.data(), bits.data());
     CHECK(on[0] == 0);
 
+    // keys in the schema's order: a strict object's key cannot repeat, so a reply cannot write two values under one key
+    // that a JSON parser would collapse to the last
+    GrammarSpec k;
+    k.kind = GrammarSpec::SCHEMA;
+    k.strict = true;
+    k.schema = R"({"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]})";
+    Grammar dup = grammar_open(k);
+    ids.clear();
+    for (char c : std::string("{\n  \"a\": 1")) ids.push_back(id(c));
+    grammar_commit(*dup, ids.data(), int(ids.size()));
+    grammar_masks(*dup, nullptr, 0, on.data(), bits.data());
+    CHECK(on[0] == 1 && allows(&bits[0], id('2')) && allows(&bits[0], id('\n')) && !allows(&bits[0], id(',')));
+
     std::printf(fails ? "grammar_test: %d FAIL\n" : "grammar_test: PASS\n", fails);
     return fails != 0;
 }
