@@ -414,5 +414,35 @@ private:
     std::vector<Ds41PrefixEntry> entries_;
 };
 
+// GR8_DS_CACHE_REPLACE state of each session slot from a request's bind to its retain: the entry the request captured at
+// its prompt end, and whether it restored a request-end entry. serve_ds41 (ds41_native.cuh) calls these in this order:
+// bind, restore (a prefix hit), capture_prompt_end, capture_request_end (retain, when there is a position), reset (retain).
+class Ds41SnapSlots {
+public:
+    explicit Ds41SnapSlots(int slots) : prompt_gen_(size_t(slots), 0), restored_end_(size_t(slots), false) {}
+    void reset(int q) { prompt_gen_[size_t(q)] = 0; restored_end_[size_t(q)] = false; }
+    Ds41Snap restore(Ds41PrefixCache& ck, uint64_t gen, int q, cudaStream_t st) {
+        const Ds41Snap kind = ck.restore(gen, q, st);
+        restored_end_[size_t(q)] = kind == Ds41Snap::RequestEnd;
+        return kind;
+    }
+    uint64_t capture_prompt_end(Ds41PrefixCache& ck, int q, uint32_t pos, const std::vector<int>& prompt,
+                                const g6rt::CacheNamespace& ns, cudaStream_t st) {
+        const uint64_t before = ck.captures();
+        const uint64_t gen = ck.capture(q, pos, prompt, ns, st, Ds41Snap::PromptEnd);
+        // only a new entry is this request's own: a refreshed one may belong to another request that still needs it
+        if (ck.captures() != before) prompt_gen_[size_t(q)] = gen;
+        return gen;
+    }
+    uint64_t capture_request_end(Ds41PrefixCache& ck, int q, uint32_t pos, const std::vector<int>& history,
+                                 const g6rt::CacheNamespace& ns, cudaStream_t st) {
+        return ck.capture(q, pos, history, ns, st, Ds41Snap::RequestEnd, prompt_gen_[size_t(q)], restored_end_[size_t(q)]);
+    }
+
+private:
+    std::vector<uint64_t> prompt_gen_;
+    std::vector<bool> restored_end_;
+};
+
 } // namespace g6s2
 #endif

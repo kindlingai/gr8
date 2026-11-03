@@ -449,11 +449,91 @@ static int run_test() {
         EXPECT(fc.restore(f_re, 1, st) == Ds41Snap::RequestEnd && fc.siblings() == 0 && holds(fc, {{f_re, true}, {f_x, true}}));
         // a second pair: its PE evicted first (LRU order after the restore above: f_x, f_re)
         const uint64_t f_pe2 = fc.capture(0, 100, think, ns_a, st, Ds41Snap::PromptEnd);                  // evicts f_x
+        EXPECT(fc.evictions() == 2 && holds(fc, {{f_x, false}, {f_re, true}, {f_pe2, true}}));
         const uint64_t f_re2 = fc.capture(0, 128, think, ns_a, st, Ds41Snap::RequestEnd, f_pe2, false);   // evicts f_re
+        EXPECT(fc.evictions() == 3 && holds(fc, {{f_re, false}, {f_pe2, true}, {f_re2, true}}));
         const uint64_t f_y = fc.capture(0, 126, next, ns_b, st);                                          // evicts f_pe2
-        EXPECT(fc.evictions() == 4 && fc.find(f_pe2) == nullptr && fc.find(f_re2) != nullptr);
+        EXPECT(fc.evictions() == 4 && holds(fc, {{f_pe2, false}, {f_re2, true}, {f_y, true}}));
         EXPECT(fc.restore(f_re2, 1, st) == Ds41Snap::RequestEnd && fc.siblings() == 0);
         EXPECT(fc.used_bytes() == fc.find(f_re2)->bytes + fc.find(f_y)->bytes && fc.size() == 2);
+        // (g) the serve sequence through Ds41SnapSlots (what serve_ds41 calls): bind, restore of the hit, prompt-end capture,
+        // request-end capture, reset, for the three chat shapes CKSHAPE measured on a live serve, three turns each, two slots
+        // interleaved step by step. off: thinking off, the reply comes back; think: thinking on without tools, the next prompt
+        // drops the reasoning; tools: thinking on with a tool, the reasoning comes back. Each turn's hit is the same entry
+        // position with the knob on and off (reuse unchanged); on, the chat holds fewer entries.
+        {
+            g6s2::Ds41PrefixCache sc(main_m, &dsp, /*budget_mib=*/256);
+            g6s2::Ds41SnapSlots slots(SLOTS);
+            struct Chat {
+                const char* name;
+                bool drops_reasoning;
+                int q;
+                std::vector<int> prompt, history;   // this turn's prompt, and the prompt + generated tokens
+                std::vector<int> hit_pos;           // per turn: the restored position, -1 none
+                std::vector<uint64_t> gens;         // every entry this chat captured
+                Ds41Snap kind = Ds41Snap::Other;
+            };
+            std::vector<Chat> chats = {{"off", false, 0, {}, {}, {}, {}}, {"think", true, 1, {}, {}, {}, {}},
+                                       {"tools", false, 0, {}, {}, {}, {}}};
+            int tok = 200000;
+            auto fresh = [&](size_t n) { std::vector<int> v(n); for (auto& t : v) t = tok++; return v; };
+            for (int turn = 0; turn < 3; ++turn) {
+                for (size_t c = 0; c < chats.size(); c += 2) {   // two sessions at once: chats c (slot 0) and c + 1 (slot 1)
+                    const size_t n = std::min(chats.size(), c + 2);
+                    for (size_t i = c; i < n; ++i) {   // the prompt: the doc, or the last turn as the client sends it back
+                        Chat& ch = chats[i];
+                        if (turn == 0) ch.prompt = fresh(101);
+                        else {
+                            std::vector<int> p = ch.drops_reasoning ? ch.prompt : ch.history;
+                            if (ch.drops_reasoning)   // the answer (the last 8 generated tokens) without the reasoning before it
+                                p.insert(p.end(), ch.history.end() - 8, ch.history.end());
+                            const auto user = fresh(12);
+                            p.insert(p.end(), user.begin(), user.end());
+                            ch.prompt = p;
+                        }
+                        slots.reset(ch.q);   // bind
+                    }
+                    for (size_t i = c; i < n; ++i) {   // a prefix hit restores
+                        Chat& ch = chats[i];
+                        const auto h = sc.match(ch.prompt, int(ch.prompt.size()) - 1, ns_a);
+                        ch.hit_pos.push_back(h.hit ? int(h.position) : -1);
+                        ch.kind = h.hit ? slots.restore(sc, h.generation, ch.q, st) : Ds41Snap::Other;
+                    }
+                    for (size_t i = c; i < n; ++i) {   // prefill ends: the prompt-end capture
+                        Chat& ch = chats[i];
+                        if (const uint64_t g = slots.capture_prompt_end(sc, ch.q, uint32_t(ch.prompt.size() - 1), ch.prompt, ns_a, st))
+                            ch.gens.push_back(g);
+                    }
+                    for (size_t i = c; i < n; ++i) {   // the request ends: 30 generated tokens (reasoning + answer), retain
+                        Chat& ch = chats[i];
+                        ch.history = ch.prompt;
+                        const auto gen = fresh(30);
+                        ch.history.insert(ch.history.end(), gen.begin(), gen.end());
+                        if (const uint64_t g = slots.capture_request_end(sc, ch.q, uint32_t(ch.history.size() - 1), ch.history, ns_a, st))
+                            ch.gens.push_back(g);
+                        slots.reset(ch.q);
+                    }
+                }
+            }
+            size_t total = 0;
+            for (const Chat& ch : chats) {
+                size_t live = 0;
+                for (uint64_t g : ch.gens) live += sc.find(g) != nullptr;
+                total += live;
+                printf("  shape %-5s: hits at", ch.name);
+                for (int p : ch.hit_pos) printf(" %d", p);
+                printf("; %zu captured, %zu stored\n", ch.gens.size(), live);
+                // turn 1 misses; later turns hit the previous request end (off, tools) or the previous prompt end (think)
+                EXPECT(ch.hit_pos.size() == 3 && ch.hit_pos[0] == -1 && ch.gens.size() == 6);
+                for (int t = 1; t < 3; ++t) EXPECT(ch.hit_pos[size_t(t)] > 0);
+                if (ch.drops_reasoning) EXPECT(ch.hit_pos[1] == 100 && ch.hit_pos[2] == 100 + 8 + 12);
+                else EXPECT(ch.hit_pos[1] == 100 + 30 && ch.hit_pos[2] == 100 + 30 + 12 + 30);
+                // on: off/tools keep each turn's request end (3), think each turn's prompt end + the last request end (4)
+                EXPECT(live == (on ? (ch.drops_reasoning ? 4u : 3u) : 6u));
+            }
+            EXPECT(sc.size() == total && sc.evictions() == 0);
+            EXPECT(sc.replaced() == (on ? 4u : 0u) && sc.siblings() == (on ? 4u : 0u));   // off, tools: 2 + 2 replaced, 1 + 1 siblings; think: 2 siblings
+        }
         printf("Part 1b (GR8_DS_CACHE_REPLACE=%d: siblings, replace after a request-end restore, dedup, budget, evicted sibling): PASS\n",
                int(on));
     }
