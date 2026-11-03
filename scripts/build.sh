@@ -16,6 +16,8 @@
 #   MODEL=ds41 scripts/build.sh bin       only OUT_DIR/g6m4_ds41 and OUT_DIR/m4sim_ds41: DeepSeek-V4.1-Flash-1017
 #                                         (-DG6_MODEL_DS41=1, engine/model_geom_ds41.h, docs/DEEPSEEK.md), fp8 KV only; TP = 4
 #                                         unless GR8_WIDTHS or GR8_NR says otherwise
+#   GR8_DS_TRUNK_BF16=1 MODEL=ds41      the DS41 engine with the BF16 mHC trunk (-DDS_MHC_TRUNK_BF16, the same bits, half the
+#                                         trunk traffic and memory; scripts/ds41_build_flags.sh). Unset or 0: the FP32 trunk
 #   GR8_TESTS=0 / GR8_TESTS=only        the GLM engine without the test binaries below it, or the tests alone (CI
 #                                         builds them on separate runners)
 #   BUNDLE_LIBS=1                         also copy cuBLAS (libcublas, libcublasLt) into OUT_DIR/lib, for nodes
@@ -125,7 +127,8 @@ case "${MODEL:-glm}" in
     WIDTHS=${GR8_WIDTHS:-${GR8_NR:-4}}
     # PF_FC2GL must divide HID / 128 = 40 (GLM 48: 6; Flash 32: 4; 4 divides 40); build_m4.sh leaves out PF_F12 for every non-GLM model
     # DS41_WHAT=sim: m4sim only (no g6m4, so no libibverbs and no fabric objects)
-    WIDTHS="$WIDTHS" EXTRA="${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_DS41=1 ${EXTRA:-}" OUT="$OUT/ds41" \
+    DS41_X=$(bash "$REPO/scripts/ds41_build_flags.sh")   # the DS41 build knobs (GR8_DS_TRUNK_BF16)
+    WIDTHS="$WIDTHS" EXTRA="${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_DS41=1 $DS41_X ${EXTRA:-}" OUT="$OUT/ds41" \
       bash build_m4.sh "${ARCH:-121a}" "${DS41_WHAT:-all}"
     if [ "${DS41_WHAT:-all}" = sim ]; then
       mv "$OUT/ds41/m4sim" "$OUT/m4sim_ds41" && rm -rf "$OUT/ds41"

@@ -485,6 +485,7 @@ Read by the build or the launcher, never by the engine.
 | `GR8_CACHE` | path | unset |  | docker/compose.yaml: a host directory for the cache volume, this box's part of the model. |
 | `GR8_CLUSTER` | path | unset |  | The cluster.env file the launcher reads when the command line names none. |
 | `GR8_CONTAINER` | flag | unset |  | The image sets 1, so the launcher knows it runs in a container. |
+| `GR8_DS_TRUNK_BF16` | flag | `0` | 0\|1 | 1 builds the DS41 engine (MODEL=ds41 scripts/build.sh) with the mHC trunk stored as BF16 (-DDS_MHC_TRUNK_BF16). The trunk only holds BF16-valued numbers, so no result changes; it halves the trunk's DRAM traffic and memory. |
 | `GR8_ENV` | path | unset |  | model-loader's compose project: the .env file of gr8's settings. |
 | `GR8_FETCH_WORKERS` | int | unset |  | The launcher's Hugging Face fetch: parallel downloads, 64 when unset. |
 | `GR8_HF_ENDPOINT` | text | unset |  | The hub the launcher fetches from, https://huggingface.co when unset. The tests point it at a fake one. |
