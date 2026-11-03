@@ -23,6 +23,8 @@
 //       - Every restored run after 0xFF/NaN poisoning produces bit-identical (0 bit differences, max_abs_diff = 0.0, identical top-1)
 //         ICA planar codes+SF (layers 2, 8, 14, 20), CA rows, shadow KV, C.comp, C.kvs/C.scs, C.ring, hidden states, and next-token logits.
 //   (4) Negative controls: corrupting restored ICA or omitting C.kvs/C.scs at odd p = P - 1 causes immediate state/logit divergence.
+//   (1b) GR8_DS_CACHE_REPLACE: a request's request-end capture frees its own prompt-end entry (one entry a chat), never another
+//       request's prefix entry, other namespace or longer entry; dedup K, exact-position hits and budget eviction stay correct.
 //   (5) --fp4: the same with the GR8_DS_COMP_FP4 layout (C.compq packed rows, ratio-1 layers read S.ca[3], no shadow). Each Part 2 case
 //       prints a DIGEST line (last hidden row hash, greedy tokens); the default run and the --fp4 run must print identical DIGEST lines.
 
@@ -344,6 +346,84 @@ static int run_test() {
         const uint64_t g98_other = cache.capture(0, 98, p1, ns_b, st);
         EXPECT(g98_other > g97 && cache.deduped() == 1);
         printf("Part 1 (40L+Idx+DSpark geometry, odd/even capture, match, LRU, tier_stat): PASS\n");
+
+        // Part 1b: GR8_DS_CACHE_REPLACE. One request = prompt-end capture, then the request-end capture with the prompt-end
+        // generation: one entry stays and the used bytes are that entry's bytes.
+        EXPECT(knob::ds_cache_replace());
+        g6s2::Ds41PrefixCache rc(main_m, &dsp, /*budget_mib=*/64);
+        std::vector<int> chat(400);
+        for (int i = 0; i < 400; ++i) chat[size_t(i)] = 5000 + i * 7;
+        const std::vector<int> prompt_a(chat.begin(), chat.begin() + 101);   // prompt of 101 tokens: prompt end at 100
+        const uint64_t a_pe = rc.capture(0, 100, prompt_a, ns_a, st);
+        EXPECT(a_pe > 0 && rc.size() == 1 && rc.used_bytes() == rc.entry_bytes(100));
+        const uint64_t a_re = rc.capture(0, 140, chat, ns_a, st, a_pe);   // reply of 39 tokens: request end at 140
+        EXPECT(a_re > a_pe && rc.size() == 1 && rc.replaced() == 1 && rc.find(a_pe) == nullptr && rc.find(a_re) != nullptr);
+        EXPECT(rc.used_bytes() == rc.entry_bytes(140) && rc.captures() == 2 && rc.evictions() == 0);
+        EXPECT(rc.tier_stat().entries == 1);
+        // the next turn (prompt = chat so far + more) restores from the request-end entry
+        auto h_next = rc.match(chat, 300, ns_a);
+        EXPECT(h_next.hit && h_next.generation == a_re && h_next.position == 140);
+        rc.restore(a_re, 1, st);
+        EXPECT(rc.hits() == 1);
+
+        // Another request's entry whose tokens are a prefix is NOT removed: request B (a sub-chat of A's turn) captures at
+        // its prompt end and request end; only B's own prompt-end entry goes, a_re stays.
+        const std::vector<int> prompt_b(chat.begin(), chat.begin() + 201);
+        const uint64_t b_pe = rc.capture(0, 200, prompt_b, ns_a, st);
+        EXPECT(b_pe > a_re && rc.size() == 2);
+        const uint64_t b_re = rc.capture(0, 260, chat, ns_a, st, b_pe);
+        EXPECT(b_re > b_pe && rc.size() == 2 && rc.replaced() == 2 && rc.find(a_re) != nullptr && rc.find(b_pe) == nullptr);
+        EXPECT(rc.used_bytes() == rc.entry_bytes(140) + rc.entry_bytes(260));
+        // a generation whose tokens are not a prefix of the new entry stays
+        std::vector<int> other = chat;
+        other[10] = 777777;
+        const uint64_t o_re = rc.capture(0, 150, other, ns_a, st, a_re);
+        EXPECT(o_re > b_re && rc.find(a_re) != nullptr && rc.replaced() == 2);
+        // a different namespace is never replaced
+        const uint64_t n_re = rc.capture(0, 280, chat, ns_b, st, b_re);
+        EXPECT(n_re > o_re && rc.find(b_re) != nullptr && rc.replaced() == 2);
+        // a longer-or-equal stored gen is never replaced (position < pos)
+        const uint64_t s_re = rc.capture(0, 120, chat, ns_a, st, b_re);
+        EXPECT(s_re > n_re && rc.find(b_re) != nullptr && rc.replaced() == 2);
+        // a stale generation (already evicted or replaced) is a no-op
+        const uint64_t z_re = rc.capture(0, 290, chat, ns_a, st, a_pe);
+        EXPECT(z_re > s_re && rc.replaced() == 2);
+        size_t sum = 0;
+        for (uint64_t g : {a_re, b_re, o_re, n_re, s_re, z_re})
+            if (const auto* e = rc.find(g)) sum += e->bytes;
+        EXPECT(rc.used_bytes() == sum && rc.used_bytes() <= rc.budget_bytes());
+
+        // The dedup K path still works with a replace gen: a 0-token reply (request end = prompt end + 1) folds into the
+        // prompt-end entry itself, which stays (it is the one entry of that chat).
+        g6s2::Ds41PrefixCache dc(main_m, &dsp, /*budget_mib=*/64);
+        const uint64_t d_pe = dc.capture(0, 100, prompt_a, ns_a, st);
+        EXPECT(dc.capture(0, 101, chat, ns_a, st, d_pe) == 0);
+        EXPECT(dc.size() == 1 && dc.deduped() == 1 && dc.replaced() == 0 && dc.find(d_pe) != nullptr);
+        EXPECT(dc.used_bytes() == dc.entry_bytes(100));
+        // An exact-position hit on another stored entry still frees this request's prompt-end entry.
+        const uint64_t d_x = dc.capture(0, 180, chat, ns_a, st);
+        const std::vector<int> prompt_c(chat.begin(), chat.begin() + 151);
+        const uint64_t c_pe = dc.capture(0, 150, prompt_c, ns_a, st);
+        EXPECT(dc.size() == 3);
+        EXPECT(dc.capture(0, 180, chat, ns_a, st, c_pe) == d_x);
+        EXPECT(dc.size() == 2 && dc.replaced() == 1 && dc.find(c_pe) == nullptr && dc.find(d_x) != nullptr && dc.find(d_pe));
+        EXPECT(dc.used_bytes() == dc.entry_bytes(100) + dc.entry_bytes(180));
+
+        // Budget and eviction: at 16 MiB two entries fit. The request-end capture frees its prompt-end entry before it
+        // allocates, so the older entry of another chat is not evicted to make room for the second snapshot of one chat.
+        g6s2::Ds41PrefixCache ec(main_m, &dsp, /*budget_mib=*/16);
+        EXPECT(ec.entry_bytes(130) * 2 <= ec.budget_bytes() && ec.entry_bytes(100) * 3 > ec.budget_bytes());
+        const uint64_t e_old = ec.capture(0, 130, chat, ns_b, st);
+        const uint64_t e_pe = ec.capture(0, 100, prompt_a, ns_a, st);
+        EXPECT(ec.size() == 2 && ec.evictions() == 0);
+        const uint64_t e_re = ec.capture(0, 130, chat, ns_a, st, e_pe);
+        EXPECT(e_re > e_pe && ec.size() == 2 && ec.evictions() == 0 && ec.replaced() == 1 && ec.find(e_old) != nullptr);
+        EXPECT(ec.used_bytes() == 2 * ec.entry_bytes(130));
+        // a third chat now evicts the oldest (e_old), as before
+        const uint64_t e_3 = ec.capture(0, 125, other, ns_a, st);
+        EXPECT(e_3 > e_re && ec.size() == 2 && ec.evictions() == 1 && ec.find(e_old) == nullptr && ec.find(e_re) != nullptr);
+        EXPECT(ec.used_bytes() == ec.entry_bytes(130) + ec.entry_bytes(125));
+        printf("Part 1b (GR8_DS_CACHE_REPLACE: one entry a request, prefix of another request kept, dedup, budget): PASS\n");
     }
 
     // -------------------------------------------------------------------------

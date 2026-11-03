@@ -60,9 +60,9 @@ public:
     // One line, the same fields every time: what a gate reads back after the prefix-cache requests.
     std::string stats_line() const {
         char b[256];
-        snprintf(b, sizeof b, "entries %zu used_mib %zu captures %llu hits %llu evictions %llu restored_bytes %zu",
+        snprintf(b, sizeof b, "entries %zu used_mib %zu captures %llu hits %llu evictions %llu restored_bytes %zu replaced %llu",
                  entries_.size(), used_bytes_ >> 20, (unsigned long long)captures_, (unsigned long long)hits_,
-                 (unsigned long long)evictions_, restored_bytes_);
+                 (unsigned long long)evictions_, restored_bytes_, (unsigned long long)replaced_);
         return std::string(b);
     }
 
@@ -81,6 +81,7 @@ public:
     uint64_t hits() const { return hits_; }
     uint64_t captures() const { return captures_; }
     uint64_t deduped() const { return deduped_; }
+    uint64_t replaced() const { return replaced_; }
     uint64_t evictions() const { return evictions_; }
 
     uint64_t digest() const {
@@ -158,11 +159,17 @@ public:
         return Ds41PrefixHit{false, 0, 0, max_lcp, !saw_ns ? "namespace" : (max_lcp > 0 ? "short" : "no-lcp")};
     }
 
-    uint64_t capture(int slot, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns, cudaStream_t st) {
+    // `replace`: the generation this same request captured at its prompt end (0: none). A request-end capture frees that entry
+    // when it is a strict prefix of the new one (GR8_DS_CACHE_REPLACE): every row it holds is final, so the new entry's rows
+    // are a superset and a chat keeps one snapshot, not two. Freed before the new buffer is allocated, so the peak is one entry.
+    uint64_t capture(int slot, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns, cudaStream_t st,
+                     uint64_t replace = 0) {
         if (pos == 0 || tokens.size() < size_t(pos)) return 0;
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].position == pos && entries_[i].ns == ns &&
                 std::equal(entries_[i].tokens.begin(), entries_[i].tokens.end(), tokens.begin())) {
+                const long gone = drop_replaced(replace, pos, tokens, ns);   // index erased, or -1
+                if (gone >= 0 && gone < long(i)) --i;
                 Ds41PrefixEntry hit = std::move(entries_[i]);
                 entries_.erase(entries_.begin() + long(i));
                 const uint64_t gen = hit.generation;
@@ -171,10 +178,10 @@ public:
                 return gen;
             }
         }
-        // With DSpark, the request-end snapshot sits one token after the prompt-end snapshot.
-        // Reuse a same-namespace prefix within K tokens instead of copying essentially the same GPU state twice.
-        // K=1 by default; a larger value also skips short-turn snapshots. K=0 keeps every snapshot.
-        // Return 0 when no new generation was captured.
+        // A same-namespace prefix within K tokens is reused instead of copying essentially the same GPU state twice
+        // (a request-end snapshot sits 1 + the reply length after its prompt-end one, so this folds only a 0-token reply;
+        // `replace` above handles the rest). K=1 by default; a larger value also skips short-turn snapshots. K=0 keeps every
+        // snapshot. Return 0 when no new generation was captured.
         if (const int K = dedup_k()) {
             for (size_t i = 0; i < entries_.size(); ++i) {
                 const auto& e = entries_[i];
@@ -190,6 +197,7 @@ public:
         }
         const size_t need = entry_bytes(pos);
         if (need == 0 || need > budget_bytes_) return 0;
+        drop_replaced(replace, pos, tokens, ns);
         while (used_bytes_ + need > budget_bytes_ && !entries_.empty()) {
             evict_oldest();
         }
@@ -271,6 +279,25 @@ private:
         static const int k = int(knob::ds_cache_dedup());
         return k;
     }
+    // Frees entry `gen` (returns its old index, or -1) if it is still stored, same namespace, shorter than `pos` and its tokens start `tokens`.
+    // Only the generation a request captured itself is passed in, so another request's prefix entry is never dropped.
+    long drop_replaced(uint64_t gen, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns) {
+        static const bool on = knob::ds_cache_replace();
+        if (!gen || !on) return -1;
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            const auto& e = entries_[i];
+            if (e.generation != gen) continue;
+            if (e.ns == ns && e.position < pos && std::equal(e.tokens.begin(), e.tokens.end(), tokens.begin())) {
+                if (e.dev_buf) cudaFree(e.dev_buf);
+                used_bytes_ -= e.bytes;
+                entries_.erase(entries_.begin() + long(i));
+                ++replaced_;
+                return long(i);
+            }
+            return -1;
+        }
+        return -1;
+    }
     void evict_oldest() {
         if (entries_.empty()) return;
         if (entries_.front().dev_buf) cudaFree(entries_.front().dev_buf);
@@ -343,6 +370,7 @@ private:
     uint64_t captures_ = 0;
     uint64_t evictions_ = 0;
     uint64_t deduped_ = 0;
+    uint64_t replaced_ = 0;
     std::vector<Ds41PrefixEntry> entries_;
 };
 
