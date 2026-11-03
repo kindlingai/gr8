@@ -526,6 +526,7 @@ struct Model
     bool ds41_idx_pipe_b = false;         // boot-bound GR8_DS41_IDX_PIPE_B=1; the four dense index-source logits only
     bool ds41_admit_keep_scratch = false; // boot-bound GR8_DS41_ADMIT_KEEP_SCRATCH=1; a slot clear (ds41_idx_clear, slot >= 0) skips the indexer step scratch
     bool ds41_pack_enabled = false;        // GR8_DS_C8PACK=1, boot-bound: carve the 64-row per-session index scratch only when on
+    int ds41_sess_rows = MX;               // the most rows one session has in a step of several sessions (ds_ns > 1): the per-session index scratch carve
     const ds41::pack::Layout* ds41_pack = nullptr; // the eager ragged W pack only; null for every decode graph and single-session W chunk
 #endif
     __half *x = nullptr, *x2 = nullptr, *q_a = nullptr, *q_a_n = nullptr, *kv_a = nullptr, *q_b = nullptr;

@@ -80,6 +80,18 @@ int main()
     for (int n = 17; n <= 32; ++n) { ctx = "kv n " + std::to_string(n); CHECK(sess_drafts_kv(K, MXR, n) == 0); }
     ctx = "max"; CHECK(sess_drafts_max(K, MXR, 32) == 16); CHECK(sess_drafts_max(K, MXR, 8) == 8);
     ctx = "chunk"; CHECK(sess_drafts_chunk(MXR, BLOCK, MAXS) == 6);
+    // the per-session index scratch (Model::ds41_sess_rows = index_sess_rows) holds every captured ns-session main width, at every K and MX
+    for (int k = 0; k <= 5; ++k)
+        for (int mx : {32, 40, 48})
+            for (int ns = 2; ns <= 32; ++ns)
+                for (bool sd : {false, true})
+                {
+                    ctx = "sess rows k " + std::to_string(k) + " mx " + std::to_string(mx) + " ns " + std::to_string(ns) + (sd ? " sd" : "");
+                    const bool on = k > 0;
+                    CHECK(ms_rps(on, sd, k, mx, ns) >= 1);
+                    CHECK(ms_rps(on, sd, k, mx, ns) <= index_sess_rows(on, k));
+                }
+    ctx = "sess rows"; CHECK(index_sess_rows(true, K) == 6); CHECK(index_sess_rows(false, 0) == 1);
     for (int S = 1; S <= 16; ++S)
     {
         ctx = "chunks S " + std::to_string(S);
@@ -102,9 +114,12 @@ int main()
             ctx = "on n " + std::to_string(n) + " ns " + std::to_string(ns);
             CHECK(s.M() <= MXR);
             for (size_t j = 0; j < s.sess.size(); ++j) CHECK(s.rows[j] == kv + 1);
+            if (ns > 1) for (size_t j = 0; j < s.sess.size(); ++j) CHECK(s.rows[j] <= index_sess_rows(true, K));
             if (ns == n) { ++full_rounds; if (full_rps < 0) full_rps = s.rows[0]; CHECK(s.rows[0] == full_rps); }
         }
         for (const Step& s : off.f.mains) if ((int)s.sess.size() == n) { full_off = s.rows[0]; break; }
+        for (const Step& s : off.f.mains)
+            if (s.sess.size() > 1) for (size_t j = 0; j < s.sess.size(); ++j) { ctx = "off n " + std::to_string(n); CHECK(s.rows[j] <= index_sess_rows(true, K)); }
         ctx = "on n " + std::to_string(n);
         CHECK(full_rounds > 0);
         CHECK(full_rps == want[n] + 1);
