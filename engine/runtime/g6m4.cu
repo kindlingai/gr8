@@ -546,7 +546,7 @@ int main(int argc, char** argv)
     const bool ds_sess_drafts = knob::ds_sess_drafts();
     if (ds_sess_drafts && !dsk.on()) die("DS41: GR8_DS_SESS_DRAFTS=1 needs --serve and GR8_DS_MTP = 1..5");
     const int ds_draft_cap = ds_sess_drafts ? s2::sess_drafts_chunk(MX, g6s2::Ds41Round::BLOCK, ::ds41dsp::MARKOV_MAXS) : ::ds41dsp::MARKOV_MAXS;
-    auto ds_ms_rps = [&](int ns) { return !dsk.on() ? 1 : ds_sess_drafts ? s2::sess_drafts_kv(dsk.mtp, MX, ns) + 1 : ns <= 8 ? dsk.mtp + 1 : 1; };
+    auto ds_ms_rps = [&](int ns) { return s2::ms_rps(dsk.on(), ds_sess_drafts, dsk.mtp, MX, ns); };
     if (dsk.relaxed && !dsk.on()) die("DS41: GR8_DS_RELAXED_ACCEPT needs GR8_DS_MTP = 1..5 (there are no drafts to accept)");
     if (dsk.relax_topp > 0 && nc == 0) die("DS41: GR8_DS_RELAXED_ACCEPT topp:P needs --top-p-cands > 0 (the candidates carry the mass above the draft)");
     if (dfl) die("DS41: --dflash-manifest is not supported");
@@ -1294,6 +1294,12 @@ int main(int argc, char** argv)
     m.ds_slots = s2mode ? s2sess : 1;   // SESS: one attention / index / Engram slab per S2 session slot (cap rows each)
     m.ds41_idx_pipe_b = ds_idx_pipe_b == 1;
     m.ds41_admit_keep_scratch = ds_admit_keep_scratch == 1;
+    // a step of several sessions gives each session 1 row, or k + 1 verify rows with DSpark (ds41_session_rows, the captured ns x rps graphs below)
+    m.ds41_sess_rows = s2::index_sess_rows(dsk.on(), dsk.mtp);
+    for (int ns = 2; ns <= m.ds_slots && ns <= MX; ++ns)
+        if (ds_ms_rps(ns) > m.ds41_sess_rows)
+            die("DS41: a " + std::to_string(ns) + "-session step has " + std::to_string(ds_ms_rps(ns)) + " rows a session, above the per-session index scratch (" +
+                std::to_string(m.ds41_sess_rows) + " rows)");
     build_ds41(m, R, layers, find, cap, f, stepp, st, pf_attn_rows(MP), dsk.on() ? 1 : 0, rs_k, rowshard);
     if (rs_k) ds41_rs_setup(m, R, NC, rs_k, rowshard, y_mxfp8);
     m.ds41_direct = pf_direct;                 // GR8_DS_PF_DIRECT=1

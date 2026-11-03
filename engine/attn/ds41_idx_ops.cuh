@@ -54,9 +54,9 @@ struct Ds41IdxModel
     bool reuse = false;                             // GR8_DS41_IDX_REUSE=1 / ds41_idx_set_reuse: layers 24..36 keep the layer-20 top-512 list (no wq_b, logits, top-k there; layer 20 skips cand_blocks)
     // SESS > 1 (Model::ds_slots S2 slots): ca / ica / shadow hold one slab ("page") of rows_kv rows per slot; a call's page table is Model::sess
     // + row0 (the slot of the session's first row), so pages[0] = the slot. A step of ns > 1 sessions runs each index op once per session
-    // (rows j*rps .. of Model::ds_ns sessions), session j on its own scratch sscr[j] (MX rows) so layer 20's candidate blocks stay until 24..36.
+    // (rows j*rps .. of Model::ds_ns sessions), session j on its own scratch sscr[j] (sess_cap rows) so layer 20's candidate blocks stay until 24..36.
     int slots = 1;
-    int sess_cap = MX;                             // Model::ds41_pack_enabled: 64 rows per segment; else MX, the decode allocation
+    int sess_cap = MX;                             // Model::ds41_pack_enabled: 64 rows per segment; else Model::ds41_sess_rows (1, or k + 1 with DSpark)
     void* sscr[32] = {};
 };
 
@@ -135,6 +135,10 @@ inline bool sessions(const Model& m, const Ds41IdxModel& S, int rows, Sess& q)
     q.ns = S.slots > 1 ? m.ds_ns : 1;
     if (q.ns < 1 || q.ns > S.slots || rows % q.ns) return false;
     const int rps = rows / q.ns;
+    if (q.ns > 1 && rps > S.sess_cap) {   // sscr[j] holds sess_cap rows (Model::ds41_sess_rows)
+        fprintf(stderr, "DS41 indexer: %d sessions of %d rows each, above the per-session index scratch of %d rows\n", q.ns, rps, S.sess_cap);
+        return false;
+    }
     for (int j = 0; j < q.ns; ++j) {
         q.row0[j] = j * rps; q.len[j] = rps; q.cnorm0[j] = j * ((rps + 1) / 2);
     }
@@ -196,7 +200,7 @@ inline int ds41_idx_bind(void* model, int i, int capacity, void* stream)
         }
         S.lay.resize(m.nl);
         S.slots = m.ds_slots;
-        S.sess_cap = m.ds41_pack_enabled ? ds41::pack::MAX_SEGMENT_ROWS : MX;
+        S.sess_cap = m.ds41_pack_enabled ? ds41::pack::MAX_SEGMENT_ROWS : std::min(std::max(m.ds41_sess_rows, 1), MX);
         if (S.slots < 1 || S.slots > 32) die("DS41 indexer bind: ds_slots " + std::to_string(S.slots) + " outside 1..32");
         S.scratch = zalloc(ds41_idx_scratch_bytes(S.rcap, S.lim1));
         if (S.slots > 1) for (int j = 0; j < S.slots; ++j) S.sscr[j] = zalloc(ds41_idx_scratch_bytes_flat(S.sess_cap, S.lim1));   // decode graphs: one pass
