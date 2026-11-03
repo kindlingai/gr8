@@ -570,6 +570,8 @@ int main(int argc, char** argv)
         die("DS41: --s2-sessions > 1 needs GR8_DS_PREFILL_MIN >= 2 (with GR8_DS_PREFILL_W)");
     if (s2mode && s2sess != 1 && dsk.on() && !ds_sess_drafts && (std::min(s2sess, 8) * (dsk.mtp + 1) > MX || std::min(s2sess, 8) * g6s2::Ds41Round::BLOCK > MX))
         die("DS41: --s2-sessions x (GR8_DS_MTP + 1) verify rows and --s2-sessions x 5 draft rows must fit G6_MX " + std::to_string(MX));
+    // GR8_DS_PARK=1: a parked slot is evicted through the prefix cache (--reuse-prefix); one slot has nothing to park beside
+    if (knob::ds_park() && (!s2mode || s2sess < 2 || !reuse_prefix)) die("DS41: GR8_DS_PARK=1 needs --serve, --s2-sessions >= 2 and --reuse-prefix");
     // --check-args: every parse-time check above passed; stop before any CUDA, fabric or weight work (the launcher smoke test runs the engine arg list through this)
     if (check_args) { fprintf(stderr, "g6m4: --check-args: the arguments pass the parse-time checks (no CUDA, no weights)\n"); return 0; }
 #endif
@@ -2126,7 +2128,6 @@ int main(int argc, char** argv)
         sc.sess_drafts = ds_sess_drafts;    // GR8_DS_SESS_DRAFTS: drafts a session by active sessions (Batch), mtp_sessions bounds limit() only
         // GR8_DS_PARK=1 (s2/scheduler.h Phase::Parked, ds41_native.cuh): a finished chat keeps its slot for a follow-up
         sc.park = knob::ds_park();
-        if (sc.park && (s2sess < 2 || !reuse_prefix)) die("DS41: GR8_DS_PARK=1 needs --s2-sessions >= 2 and --reuse-prefix");
         if (sc.park) fprintf(stderr, "# rank %d ds41 GR8_DS_PARK=1: a finished chat parks its slot (%d slots)\n", R, s2sess);
         if (ds_sess_drafts)
             fprintf(stderr, "# rank %d ds41 GR8_DS_SESS_DRAFTS=1: %d sessions, drafts while at most %d are active, draft launches of at most %d sessions\n", R,
