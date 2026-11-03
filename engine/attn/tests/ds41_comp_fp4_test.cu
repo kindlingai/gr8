@@ -378,9 +378,41 @@ static void test_attention(int heads, int long_keys)
             const auto oa = back((const uint16_t*)b.out_a, b.out_n), ob = back((const uint16_t*)b.out_b, b.out_n);
             long diff = 0;
             for (size_t i = 0; i < b.out_n; i++) diff += oa[i] != ob[i];
+            long bad = 0, nonzero = 0;   // the output is finite and not trivially zero
+            for (size_t i = 0; i < b.out_n; i++)
+            {
+                bad += ((oa[i] >> 7) & 0xFF) == 0xFF;
+                nonzero += (oa[i] & 0x7FFF) != 0;
+            }
             char what[160];
             snprintf(what, sizeof what, "%s ratio %d %s: packed == bf16", c.name, c.ratio, kname[kind]);
             report(what, diff, (long)b.out_n);
+            if (bad || nonzero < (long)b.out_n / 2)
+            {
+                printf("  ^ output check: %ld inf/nan, %ld of %zu nonzero\n", bad, nonzero, b.out_n);
+                g_fail = 1;
+            }
+        }
+        if (&c == &cases[0])   // negative control: one scale byte of the first row's first listed key changed -> the packed output must differ
+        {
+            int32_t j0;
+            CK(cudaMemcpy(&j0, b.d_topk, 4, cudaMemcpyDeviceToHost));
+            uint8_t sb;
+            CK(cudaMemcpy(&sb, K.pk + (size_t)j0 * CQ_ROW + CQ_CODES, 1, cudaMemcpyDeviceToHost));
+            sb ^= 0x08;
+            CK(cudaMemcpy(K.pk + (size_t)j0 * CQ_ROW + CQ_CODES, &sb, 1, cudaMemcpyHostToDevice));
+            set_kernel(1);
+            set_rows(b.p, K, false, b.out_a);
+            ds41a::launch_attn(b.p, 0);
+            set_rows(b.p, K, true, b.out_b);
+            ds41a::launch_attn(b.p, 0);
+            CK(cudaDeviceSynchronize());
+            const auto oa = back((const uint16_t*)b.out_a, b.out_n), ob = back((const uint16_t*)b.out_b, b.out_n);
+            long diff = 0;
+            for (size_t i = 0; i < b.out_n; i++) diff += oa[i] != ob[i];
+            printf("  %-64s %s  (%ld of %zu differ)\n", "negative control: one packed scale byte changed (must differ)", diff ? "DIFF ok" : "NO DIFF", diff,
+                   b.out_n);
+            if (!diff) g_fail = 1;
         }
         free_built(b);
         free_keys(K);
