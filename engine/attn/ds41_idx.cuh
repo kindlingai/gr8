@@ -1511,10 +1511,11 @@ inline int sm_count()
     return cache[dev] > 0 ? cache[dev] : 48;
 }
 // exact = true: bit-identical to launch_logits_dense on every input; false: the faster variant with its own fp32 rounding (see k_logits_mma)
-inline void launch_logits_dense_mma(const LogitsP& p, cudaStream_t s, bool exact = true)
+// min_iter: at least that many 4-unit strides per CTA (fewer CTAs, each loads its 8 query rows once for more keys; the key tiles use 8)
+inline void launch_logits_dense_mma(const LogitsP& p, cudaStream_t s, bool exact = true, int min_iter = 1)
 {
     const int units = (p.ncols + 31) / 32;
-    const int gx = max(1, min((units + 3) / 4, sm_count() * 6));
+    const int gx = max(1, min((units + 4 * min_iter - 1) / (4 * min_iter), sm_count() * 6));
     const dim3 grid(gx, (p.R + MMA_RB - 1) / MMA_RB);
     if (exact) k_logits_mma<true><<<grid, 128, 0, s>>>(p);
     else k_logits_mma<false><<<grid, 128, 0, s>>>(p);
@@ -1643,6 +1644,9 @@ inline void launch_tile_carry(const int32_t* pos, int ldpos, bf16* v, long ldv, 
 // block scores when the one-pass row (max_rows) is longer; a call whose R rows of the one-pass row fit in that space runs the one-pass path.
 // Must be a multiple of MC_TILE and >= CAND_BLOCKS * CAND_BS (so a row with keys in a later tile has a full candidate carry).
 constexpr int IDX_TILE = 32768;
+// Tiled mma logits: >= 8 key strides per CTA. One CTA a stride per tile (the one-pass grid formula) was 21% slower than one pass over
+// the same keys on an RTX 5090 (4096 rows, 262,144 keys); 8 strides: 6% faster. The grid does not change any logit.
+constexpr int TILE_MMA_ITERS = 8;
 static_assert(IDX_TILE % MC_TILE == 0 && IDX_TILE >= CAND_BLOCKS * CAND_BS && IDX_TILE >= TOPK, "IDX_TILE");
 // Scratch for R query rows over at most max_rows compressed rows (decode: R <= 8; the step driver carves it once per session).
 // Fixed part (address independent of the call's R): q prep, candidates, the consumers' compact buffers, tile lengths. Then the logits,
@@ -1738,11 +1742,11 @@ inline void index_q(const IndexIn& in, const Scratch& sc, cudaStream_t s)
     if (in.q_trig) launch_index_q_cached(q, in.R, s);
     else launch_index_q(q, in.R, s);
 }
-inline void launch_dense_logits(const IndexIn& in, const LogitsP& l, cudaStream_t s)
+inline void launch_dense_logits(const IndexIn& in, const LogitsP& l, cudaStream_t s, int min_iter = 1)
 {
     if (in.pipe_qr) launch_logits_pipe_qr(l, s);
     else if (in.pipe_b) launch_logits_pipe(l, s, false);
-    else if (in.logits_mma) launch_logits_dense_mma(l, s, in.logits_mma == 1);
+    else if (in.logits_mma) launch_logits_dense_mma(l, s, in.logits_mma == 1, min_iter);
     else launch_logits_dense(l, s);
 }
 template <int K>
@@ -1771,7 +1775,7 @@ inline void stage_index_tiled(const IndexIn& in, const Scratch& sc, int32_t* out
         l.k.codes.base += (size_t)c0 * l.k.codes.row_stride;
         l.k.sf.base += (size_t)c0 * l.k.sf.row_stride;
         l.p = sc.p + TOPK; l.ldp = sc.ldp; l.ncols = nc; l.R = in.R;
-        launch_dense_logits(in, l, s);
+        launch_dense_logits(in, l, s, TILE_MMA_ITERS);
         if (topk)
         {
             if (first) select<TOPK>(in, sc.p + TOPK, sc.ldp, sc.klen_t, nc, sc.ci, TOPK, sc, s);

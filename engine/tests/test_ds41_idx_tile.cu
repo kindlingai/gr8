@@ -34,6 +34,7 @@ struct Case
     int ties;               // 1: few distinct key rows (many equal logits)
     int logits;             // 0 dp4a, 1 mma exact, 2 mma fast, 3 pipe_b, 4 pipe_qr
     int mc;                 // multi-CTA top-k
+    int nocand = 0;         // 1: top-512 only (layers 2/8/14); else ratio 1 = layer 20 (top-512 + candidate blocks)
 };
 
 static uint16_t f2bf(float f) { uint32_t u; memcpy(&u, &f, 4); return (uint16_t)((u + 0x7FFFu + ((u >> 16) & 1)) >> 16); }
@@ -94,19 +95,44 @@ static int run(const Case& c, bool timing = false, float* ms_flat = nullptr, flo
     // one even when this call's keys fit in one tile (the decode-graph basis is the capacity, longer than the keys). Timing: the chunk's own.
     const int max_rows = timing ? c.maxpos : std::max(c.maxpos, TOPK + c.tile + 1);
     const size_t b_flat = Scratch::bytes(R, max_rows, 0), b_tile = Scratch::bytes(R, max_rows, c.tile);
-    void* s_flat = dalloc<uint8_t>(b_flat);
-    void* s_tile = dalloc<uint8_t>(b_tile);
-    const Scratch A = Scratch::carve(s_flat, R, max_rows, R, 0);
-    const Scratch B = Scratch::carve(s_tile, R, max_rows, R, c.tile);
     int32_t* oa = dalloc<int32_t>((size_t)R * TOPK);
     int32_t* ob = dalloc<int32_t>((size_t)R * TOPK);
     int32_t* ob2 = dalloc<int32_t>((size_t)R * CAND_BLOCKS);
-    const bool cand = c.ratio == 1;   // layer 20 (ratio 1) also makes the candidate blocks
+    int32_t* oa2 = dalloc<int32_t>((size_t)R * CAND_BLOCKS);
+    const bool cand = c.ratio == 1 && !c.nocand;   // layer 20 (ratio 1) also makes the candidate blocks
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+    auto tm = [&](auto&& f) {
+        f(); CK(cudaDeviceSynchronize());
+        const int it = 3;
+        CK(cudaEventRecord(e0));
+        for (int i = 0; i < it; i++) f();
+        CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1));
+        float ms = 0; CK(cudaEventElapsedTime(&ms, e0, e1));
+        return ms / it;
+    };
+    float tf = 0, tt = 0;
+    // one pass first (timing: then freed, so the two scratches are never resident together)
+    void* s_flat = dalloc<uint8_t>(b_flat);
+    const Scratch A = Scratch::carve(s_flat, R, max_rows, R, 0);
     auto flat = [&] { stage_index_dense(in, A, oa, TOPK, 0); if (cand) stage_cand_blocks(in, A, 0); };
-    auto tiled = [&] { stage_index_dense(in, B, ob, TOPK, 0, cand); if (cand) stage_cand_blocks(in, B, 0, true); };
     flat();
+    CK(cudaDeviceSynchronize());
+    if (cand) CK(cudaMemcpy(oa2, A.cand, (size_t)R * CAND_BLOCKS * 4, cudaMemcpyDeviceToDevice));
+    std::vector<uint16_t> pl;
+    if (!timing)
+    {
+        pl.resize((size_t)R * A.ldp);
+        CK(cudaMemcpy(pl.data(), A.p, pl.size() * 2, cudaMemcpyDeviceToHost));   // the flat path's logits (cand_blocks leaves p as is)
+    }
+    const long a_ldp = A.ldp;
+    if (timing) { tf = tm(flat); CK(cudaFree(s_flat)); s_flat = nullptr; }
+    void* s_tile = dalloc<uint8_t>(b_tile);
+    const Scratch B = Scratch::carve(s_tile, R, max_rows, R, c.tile);
+    auto tiled = [&] { stage_index_dense(in, B, ob, TOPK, 0, cand); if (cand) stage_cand_blocks(in, B, 0, true); };
     tiled();
     CK(cudaDeviceSynchronize());
+    if (timing) tt = tm(tiled);
     // the recompute path: cand_blocks without cand_src (its own tiled pass), into a copy of the list
     if (cand)
     {
@@ -122,15 +148,14 @@ static int run(const Case& c, bool timing = false, float* ms_flat = nullptr, flo
     for (size_t i = 0; i < ha.size(); i++) bad += ha[i] != hb[i];
     if (cand)
     {
-        CK(cudaMemcpy(ca.data(), A.cand, ca.size() * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(ca.data(), oa2, ca.size() * 4, cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(cb.data(), B.cand, cb.size() * 4, cudaMemcpyDeviceToHost));
         CK(cudaMemcpy(cb2.data(), ob2, cb2.size() * 4, cudaMemcpyDeviceToHost));
         for (size_t i = 0; i < ca.size(); i++) { bad_c += ca[i] != cb2[i]; bad_c2 += ca[i] != cb[i]; }
     }
     // sanity of the reference: sorted ascending, -1 tail, rows with fewer than 512 keys present; ties at the cut (equal logits) present
+    if (!timing)
     {
-        std::vector<uint16_t> pl((size_t)R * A.ldp);
-        CK(cudaMemcpy(pl.data(), A.p, pl.size() * 2, cudaMemcpyDeviceToHost));   // the flat path's logits (cand_blocks leaves p as is)
         for (int r = 0; r < R; r++)
         {
             const int kl = (hpos[r] + 1) / c.ratio;
@@ -144,29 +169,13 @@ static int run(const Case& c, bool timing = false, float* ms_flat = nullptr, flo
                 uint16_t cut = 0; uint32_t cutk = 0xFFFFFFFFu;
                 auto okh = [](uint16_t b) -> uint32_t { if ((b & 0x7FFFu) > 0x7F80u) return 0xFFFFu; return (b & 0x8000u) ? (~b & 0xFFFFu) : (b | 0x8000u); };
                 std::vector<char> sel(kl, 0);
-                for (int j = 0; j < TOPK; j++) { const uint16_t b = pl[(size_t)r * A.ldp + o[j]]; sel[o[j]] = 1; if (okh(b) < cutk) { cutk = okh(b); cut = b; } }
-                for (int t = 0; t < kl; t++) if (!sel[t] && pl[(size_t)r * A.ldp + t] == cut) { ties_cut++; break; }
+                for (int j = 0; j < TOPK; j++) { const uint16_t b = pl[(size_t)r * a_ldp + o[j]]; sel[o[j]] = 1; if (okh(b) < cutk) { cutk = okh(b); cut = b; } }
+                for (int t = 0; t < kl; t++) if (!sel[t] && pl[(size_t)r * a_ldp + t] == cut) { ties_cut++; break; }
             }
         }
     }
-    float tf = 0, tt = 0;
-    if (timing)
-    {
-        cudaEvent_t e0, e1;
-        CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
-        auto tm = [&](auto&& f) {
-            f(); CK(cudaDeviceSynchronize());
-            const int it = 3;
-            CK(cudaEventRecord(e0));
-            for (int i = 0; i < it; i++) f();
-            CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1));
-            float ms = 0; CK(cudaEventElapsedTime(&ms, e0, e1));
-            return ms / it;
-        };
-        tf = tm(flat); tt = tm(tiled);
-        if (ms_flat) *ms_flat = tf;
-        if (ms_tiled) *ms_tiled = tt;
-    }
+    if (ms_flat) *ms_flat = tf;
+    if (ms_tiled) *ms_tiled = tt;
     const bool ok = bad == 0 && bad_c == 0 && bad_c2 == 0;
     printf("%-28s R %4d ratio %d keys %7d tile %5d (%d tiles, mode %s) logits %d mc %d: top512 diff %d, cand diff %d / fused %d; "
            "rows<512 keys %d, rows with a tie at the cut %d; scratch %.1f -> %.1f MiB%s%s\n",
@@ -175,15 +184,21 @@ static int run(const Case& c, bool timing = false, float* ms_flat = nullptr, flo
            timing ? (" | time one pass " + std::to_string(tf) + " ms, tiled " + std::to_string(tt) + " ms").c_str() : "");
     if (!ok) g_fail++;
     if (!timing && !B.tile && c.tile) { fprintf(stderr, "  case %s did not tile\n", c.name); g_fail++; }
-    cudaFree(q_b); cudaFree(wp); cudaFree(dpos); cudaFree(klen); cudaFree(ica); cudaFree(pages); cudaFree(s_flat); cudaFree(s_tile);
+    cudaFree(q_b); cudaFree(wp); cudaFree(dpos); cudaFree(klen); cudaFree(ica); cudaFree(pages); if (s_flat) cudaFree(s_flat); cudaFree(s_tile); cudaFree(oa2);
     cudaFree(oa); cudaFree(ob); cudaFree(ob2);
     return ok ? 0 : 1;
 }
 
 int main(int argc, char** argv)
 {
-    bool lng = false, tim = false;
-    for (int i = 1; i < argc; i++) { lng |= !strcmp(argv[i], "--long"); tim |= !strcmp(argv[i], "--time"); }
+    bool lng = false, tim = false, eq = true;
+    int only_k = 0, only_t = 0;   // --time-one KEYS TILE: only that timing case (for a profiler), no equality cases
+    for (int i = 1; i < argc; i++)
+    {
+        lng |= !strcmp(argv[i], "--long");
+        tim |= !strcmp(argv[i], "--time");
+        if (!strcmp(argv[i], "--time-one") && i + 2 < argc) { tim = true; eq = false; only_k = atoi(argv[i + 1]); only_t = atoi(argv[i + 2]); i += 2; }
+    }
     {
         int limit = 0, dev = 0;
         CK(cudaGetDevice(&dev));
@@ -219,14 +234,18 @@ int main(int argc, char** argv)
         cs.push_back({"r1 long 262144 ties", 32, 1, 262144 + 77, T2, 1, 1, 1});
         cs.push_back({"r1 long 524288", 32, 1, 524288, T2, 0, 1, 1});
     }
-    for (const Case& c : cs) run(c);
+    if (eq) for (const Case& c : cs) run(c);
     if (tim)
     {
         for (int keys : {32768, 262144})
             for (int t : {16384, 32768, 65536})
             {
-                Case c{"time 4096 rows", 4096, 1, keys, t, 0, 1, 1};
-                run(c, true);
+                if (only_k && (keys != only_k || t != only_t)) continue;
+                for (int nc : {1, 0})
+                {
+                    Case c{nc ? "time 4096 rows top512" : "time 4096 rows +cand", 4096, 1, keys, t, 0, 1, 1, nc};
+                    run(c, true);
+                }
             }
     }
     printf(g_fail ? "FAIL (%d)\n" : "ALL OK\n", g_fail);
