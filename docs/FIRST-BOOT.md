@@ -56,7 +56,7 @@ otherwise. "Free memory" is the lowest `MemAvailable` of the four boxes.
 
   - The total stays at about 235-275 tokens/s from 8 chats up, whatever the slot count. More slots do not make the
     boxes write more; they share the same speed among more chats, so no chat sits idle waiting for a slot.
-  - With 1 to 4 chats, the second runs differ by 1-2% between slot counts; the first runs were 5-8% slower with 10
+  - With 1 to 4 chats, the second runs differ by 0-2% between slot counts; the first runs were 3-8% slower with 10
     and 16 slots than with 5.
   - Answers: with one chat at a time, 10 and 16 slots give the same 75 answers as 5 slots (71 of 75 right); with every slot busy, 73 of
     75 are right (10 at once and 16 at once).
