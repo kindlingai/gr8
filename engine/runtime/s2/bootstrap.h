@@ -107,6 +107,7 @@ struct BootstrapConfig {
             (scheduler.r2_rows ? " r2 " + std::to_string(scheduler.r2_rows) : std::string()) +
             (scheduler.tail_first ? " tf" : std::string()) +
             (scheduler.c8_pack ? " c8pack" : std::string()) +
+            (scheduler.park ? " park" : std::string()) +
             (scheduler.notice_max != NOTICE_MAX ? " nmax " + std::to_string(scheduler.notice_max) : std::string()) +
             (prefill_min ? " pfmin " + std::to_string(prefill_min) : std::string()) +
             " ctl " + std::to_string(control_version) + "\n" + runtime_signature;

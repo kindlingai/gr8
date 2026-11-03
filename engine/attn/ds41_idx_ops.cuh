@@ -435,6 +435,26 @@ inline int ds41_idx_pf_compact(void* model, Shift&& shift)
 // slot (SESS > 1): clear only that S2 slot's ca / ica / shadow slab (the other sessions keep theirs); -1 = every slot. The step buffers below
 // (scratch, klen, q_b, ..., the shared list) are rewritten by every step before they are read, so they are cleared whole either way;
 // GR8_DS41_ADMIT_KEEP_SCRATCH=1 leaves the scratch and the per-session sscr out of a slot clear (they are most of its bytes).
+// the shared step buffers a clear also clears (all: a full reset; else unless GR8_DS41_ADMIT_KEEP_SCRATCH=1 keeps the scratch)
+inline int ds41_idx_clear_shared_(Ds41IdxModel* S, cudaStream_t st, bool all)
+{
+    using namespace ds41_idx_detail;
+    auto clr = [&](void* p, size_t bytes) { if (p && bytes) G6RT_CK(cudaMemsetAsync(p, 0, bytes, st)); };
+    if (all || !S->keep_scratch)   // a full reset (slot -1) always clears them
+    {
+        clr(S->scratch, ds41_idx_scratch_bytes(S->rcap, S->lim1));
+        for (int j = 0; j < S->slots; ++j) clr(S->sscr[j], ds41_idx_scratch_bytes_flat(S->sess_cap, S->lim1));
+    }
+    clr(S->klen, (size_t)S->rcap * sizeof(int));
+    clr(S->q_b, (size_t)S->rcap * geom::IDX_WQB_OUT * 2);
+    clr(S->wproj, (size_t)S->rcap * geom::IDX_HEADS * 2);
+    clr(S->y512, (size_t)S->rcap * 512 * 2);
+    clr(S->pre, (size_t)S->rcap * 512 * 2);
+    if (S->topk) G6RT_CK(cudaMemsetAsync(S->topk, 0xFF, (size_t)S->rcap * geom::IDX_TOPK * sizeof(int32_t), st));   // 0xFFFFFFFF = int32 -1
+    S->chunk_end = 0;
+    S->cand_ready = false;
+    return 0;
+}
 inline int ds41_idx_clear(void* model, void* stream, int slot)   // slot default -1: rank.cuh's declaration
 {
     using namespace ds41_idx_detail;
@@ -451,20 +471,16 @@ inline int ds41_idx_clear(void* model, void* stream, int slot)   // slot default
         if (S->ca[k]) clr(S->ca[k] + k0 * S->rows_kv[k] * DS41_CA_ROW, nk * S->rows_kv[k] * DS41_CA_ROW);
     }
     if (S->shadow) clr(S->shadow + k0 * (S->cap + S->rcap) * 512, nk * (S->cap + S->rcap) * 512 * 2);
-    if (slot < 0 || !S->keep_scratch)   // a full reset (slot -1) always clears them
-    {
-        clr(S->scratch, ds41_idx_scratch_bytes(S->rcap, S->lim1));
-        for (int j = 0; j < S->slots; ++j) clr(S->sscr[j], ds41_idx_scratch_bytes_flat(S->sess_cap, S->lim1));
-    }
-    clr(S->klen, (size_t)S->rcap * sizeof(int));
-    clr(S->q_b, (size_t)S->rcap * geom::IDX_WQB_OUT * 2);
-    clr(S->wproj, (size_t)S->rcap * geom::IDX_HEADS * 2);
-    clr(S->y512, (size_t)S->rcap * 512 * 2);
-    clr(S->pre, (size_t)S->rcap * 512 * 2);
-    if (S->topk) G6RT_CK(cudaMemsetAsync(S->topk, 0xFF, (size_t)S->rcap * geom::IDX_TOPK * sizeof(int32_t), st));   // 0xFFFFFFFF = int32 -1
-    S->chunk_end = 0;
-    S->cand_ready = false;
-    return 0;
+    return ds41_idx_clear_shared_(S, st, slot < 0);
+}
+// the shared step buffers ds41_idx_clear(slot) also clears, without the slot's slabs: GR8_DS_PARK's resume of a parked slot
+// (ds41_native.cuh bind), so the next step sees what it sees after a clear and a restore
+inline int ds41_idx_clear_shared(void* model, void* stream)
+{
+    using namespace ds41_idx_detail;
+    Ds41IdxModel* S = find(*(Model*)model, false);
+    if (!S || S->lay.empty()) return 0;
+    return ds41_idx_clear_shared_(S, (cudaStream_t)stream, false);
 }
 // ST_INDEX_BORROW: a reuse layer whose index source is outside the layer subset. GR8_DS41_BORROW_TOPK=<raw int32 [rows][512]> (the CPU reference's dump of
 // that source's list) is copied into the shared list; without it the list stays what the last index source left (a one-time warning).

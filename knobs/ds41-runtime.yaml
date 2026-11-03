@@ -48,6 +48,18 @@ knobs:
       the reply (a retry, regenerate or edit); a freed request-end snapshot (its prompt-end sibling was restored) is lost to
       a later prompt that keeps that reply after all, e.g. a turn with tools after a thinking turn without them. Those
       prompts prefill again. Set 0 (and GR8_DS_CACHE_DEDUP=0) to keep every snapshot until LRU eviction.
+  GR8_DS_PARK:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      A finished chat keeps its slot (parked) instead of being copied into the prefix cache: a follow-up whose prompt
+      extends it is admitted into that slot with no restore and prefills only the new tokens. A new chat with no free
+      slot evicts the oldest parked slot, captured into the prefix cache first. The prompt-end snapshot is captured as
+      before. With GR8_DS_CACHE_REPLACE the eviction capture is the request-end snapshot, linked to the prompt-end one as
+      at request end, and a resume frees the unused prompt-end snapshot as a request-end restore does. Needs --serve,
+      --s2-sessions >= 2 and --reuse-prefix.
   GR8_DS_CONF_TEMP:
     scope: agree
     kind: text

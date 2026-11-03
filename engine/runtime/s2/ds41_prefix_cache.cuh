@@ -84,6 +84,7 @@ public:
     size_t budget_bytes() const { return budget_bytes_; }
     size_t used_bytes() const { return used_bytes_; }
     size_t size() const { return entries_.size(); }
+    const std::vector<Ds41PrefixEntry>& entries() const { return entries_; }
     uint64_t hits() const { return hits_; }
     uint64_t captures() const { return captures_; }
     uint64_t deduped() const { return deduped_; }
@@ -172,9 +173,11 @@ public:
     //     freed before the new buffer is allocated. match() needs an entry's tokens to be a prefix of the new prompt, so it
     //     is lost only to prompts that share its prefix and leave the reply (a retry, regenerate or edit: a re-prefill).
     //   replace = false: a new entry is linked to it as its sibling; the first restore of either frees the other (restore()).
+    // keep (GR8_DS_PARK: a grant's own hit, restored after this capture) is never freed or evicted here: when only it stands
+    // in the way the capture is skipped (returns 0)
     uint64_t capture(int slot, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns, cudaStream_t st,
-                     Ds41Snap kind = Ds41Snap::Other, uint64_t prompt_gen = 0, bool replace = false) {
-        const uint64_t replace_gen = replace ? prompt_gen : 0;
+                     Ds41Snap kind = Ds41Snap::Other, uint64_t prompt_gen = 0, bool replace = false, uint64_t keep = 0) {
+        const uint64_t replace_gen = replace && prompt_gen != keep ? prompt_gen : 0;
         if (pos == 0 || tokens.size() < size_t(pos)) return 0;
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].position == pos && entries_[i].ns == ns &&
@@ -209,13 +212,12 @@ public:
         if (need == 0 || need > budget_bytes_) return 0;
         drop_replaced(replace_gen, pos, tokens, ns);
         while (used_bytes_ + need > budget_bytes_ && !entries_.empty()) {
-            evict_oldest();
+            if (!evict_oldest(keep)) return 0;
         }
         void* dev_buf = nullptr;
         while (cudaMalloc(&dev_buf, need) != cudaSuccess) {
             cudaGetLastError();
-            if (entries_.empty()) return 0;
-            evict_oldest();
+            if (!evict_oldest(keep)) return 0;
         }
         const auto t0 = std::chrono::steady_clock::now();
         copy_state(slot, pos, dev_buf, true, st);
@@ -280,16 +282,80 @@ public:
             entries_.erase(entries_.begin() + idx);
             entries_.push_back(std::move(moved));
         }
-        if (sib && replace_on())
-            for (size_t i = 0; i < entries_.size(); ++i)
-                if (entries_[i].generation == sib) {
-                    if (entries_[i].sibling == gen) {
-                        free_at(i);
-                        ++siblings_;
-                    }
-                    break;
-                }
+        free_sibling(gen, sib);
         return kind;
+    }
+
+    // GR8_DS_PARK: a chat parked at [0, pos) keeps its request end in its slot; the capture waits for the bind that evicts
+    // it. park_end does now the bookkeeping capture(RequestEnd, prompt_gen, replace) does before its copy, so the other
+    // entries change when they would without park:
+    //   an equal entry stored: with replace, the request's own prompt-end entry is freed; the equal entry is refreshed
+    //   the dedup, pos 0 or over the budget: nothing
+    //   else: with replace, the prompt-end entry is freed; without, it is linked to a placeholder for this park
+    //     (park_mark(id)). A restore of the prompt-end entry then frees the placeholder, as it frees a captured request end
+    //     (the eviction captures nothing)
+    // Returns the park's id, unique (never a slot number: a later chat on the slot cannot alias it). Every park ends in
+    // evict_done or resume_parked, which detach it.
+    uint64_t park_end(uint64_t prompt_gen, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns,
+                      bool replace) {
+        const uint64_t id = ++next_park_;
+        live_parks_.push_back(id);
+        if (pos == 0 || tokens.size() < size_t(pos)) return id;
+        for (size_t i = 0; i < entries_.size(); ++i)
+            if (entries_[i].position == pos && entries_[i].ns == ns &&
+                std::equal(entries_[i].tokens.begin(), entries_[i].tokens.end(), tokens.begin())) {   // capture's equal-entry path
+                const long gone = drop_replaced(replace ? prompt_gen : 0, pos, tokens, ns);
+                if (gone >= 0 && gone < long(i)) --i;
+                Ds41PrefixEntry hit = std::move(entries_[i]);
+                entries_.erase(entries_.begin() + long(i));
+                entries_.push_back(std::move(hit));
+                return id;
+            }
+        if (!new_entry(pos, tokens, ns)) return id;
+        if (replace) drop_replaced(prompt_gen, pos, tokens, ns);
+        else if (replace_on())
+            if (Ds41PrefixEntry* pe = prompt_entry(prompt_gen, pos, tokens, ns); pe && !pe->sibling) pe->sibling = park_mark(id);
+        return id;
+    }
+    // GR8_DS_PARK eviction of park id, before its capture: true when its request end was freed as a restored entry's sibling,
+    // or will be now (keep, the entry the evicting grant restores next, is its linked prompt-end entry): nothing to capture.
+    // Either way the park is detached (no entry links to it), so the capture links the prompt-end entry as retain's does
+    bool evict_parked_freed(uint64_t id, uint64_t keep) {
+        bool f = std::find(freed_parks_.begin(), freed_parks_.end(), id) != freed_parks_.end();
+        if (!f && keep && replace_on())
+            if (const Ds41PrefixEntry* e = find(keep); e && e->sibling == park_mark(id)) { ++siblings_; f = true; }
+        detach(id);
+        return f;
+    }
+    // GR8_DS_PARK resume of park id: the follow-up continues from the parked request end, as from a restore of it: its
+    // sibling (the request's prompt-end entry, linked by park_end) is freed. A request end that would have been an equal
+    // stored entry or folded into one by the dedup is that entry, restored. The park is detached on every path. Returns
+    // the kind that restore would have returned.
+    Ds41Snap resume_parked(uint64_t id, uint64_t prompt_gen, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns) {
+        Ds41Snap kind = Ds41Snap::RequestEnd;
+        if (Ds41PrefixEntry* e = stored_as(pos, tokens, ns)) {
+            const uint64_t gen = e->generation, sib = e->sibling;
+            kind = e->kind;
+            e->sibling = 0;
+            free_sibling(gen, sib);
+        } else if (Ds41PrefixEntry* pe = prompt_entry(prompt_gen, pos, tokens, ns); pe && pe->sibling == park_mark(id)) {
+            free_at(size_t(pe - entries_.data()));
+            ++siblings_;
+        }
+        detach(id);
+        return kind;
+    }
+    // GR8_DS_PARK only (the pool digest folds it in with park on): the state the next eviction or resume reads, beyond
+    // digest(): each entry's kind and sibling, the live and freed parks
+    uint64_t park_digest() const {
+        uint64_t h = 0x84222325CBF29CE4ull ^ next_park_;
+        auto mix = [&](uint64_t v) { h = (h ^ v) * 0x100000001B3ull; h ^= h >> 29; };
+        for (const auto& e : entries_) { mix(e.generation); mix(uint64_t(e.kind)); mix(e.sibling); }
+        mix(0xA11CEull);
+        for (uint64_t id : live_parks_) mix(id);
+        mix(0xF4EEDull);
+        for (uint64_t id : freed_parks_) mix(id);
+        return h;
     }
 
     g6kv_tier_totals tier_stat() const {
@@ -325,6 +391,52 @@ private:
                                                                                                                           : nullptr;
         return nullptr;
     }
+    // GR8_DS_PARK: the sibling of a prompt-end entry whose request end is parked under park id (not a generation: next_gen_
+    // is far below bit 63)
+    static uint64_t park_mark(uint64_t id) { return (1ull << 63) | id; }
+    // the end of park id (evicted or resumed): no entry links to it, it is neither live nor freed
+    void detach(uint64_t id) {
+        for (auto& e : entries_) if (e.sibling == park_mark(id)) e.sibling = 0;
+        live_parks_.erase(std::remove(live_parks_.begin(), live_parks_.end(), id), live_parks_.end());
+        freed_parks_.erase(std::remove(freed_parks_.begin(), freed_parks_.end(), id), freed_parks_.end());
+    }
+    // the entry a capture at [0, pos) would return instead of a new one: an equal stored entry, or (the dedup) a stored
+    // same-namespace prefix at most K tokens behind
+    Ds41PrefixEntry* stored_as(uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns) {
+        for (auto& e : entries_)
+            if (e.position == pos && e.ns == ns && std::equal(e.tokens.begin(), e.tokens.end(), tokens.begin())) return &e;
+        if (const int K = dedup_k())
+            for (auto& e : entries_)
+                if (e.ns == ns && e.position < pos && e.position + uint32_t(K) >= pos &&
+                    std::equal(e.tokens.begin(), e.tokens.end(), tokens.begin()))
+                    return &e;
+        return nullptr;
+    }
+    bool new_entry(uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns) {
+        const size_t need = entry_bytes(pos);
+        return !stored_as(pos, tokens, ns) && need && need <= budget_bytes_;
+    }
+    // restore of entry gen whose sibling was sib: the sibling is freed if it is still linked back (GR8_DS_CACHE_REPLACE)
+    void free_sibling(uint64_t gen, uint64_t sib) {
+        if (!sib || !replace_on()) return;
+        if (sib >> 63) {   // a parked request end: nothing stored yet; only a live park (its owner still parked) is freed
+            const uint64_t id = sib & ~(1ull << 63);
+            if (std::find(live_parks_.begin(), live_parks_.end(), id) != live_parks_.end() &&
+                std::find(freed_parks_.begin(), freed_parks_.end(), id) == freed_parks_.end()) {
+                freed_parks_.push_back(id);   // its eviction captures nothing
+                ++siblings_;
+            }
+            return;
+        }
+        for (size_t i = 0; i < entries_.size(); ++i)
+            if (entries_[i].generation == sib) {
+                if (entries_[i].sibling == gen) {
+                    free_at(i);
+                    ++siblings_;
+                }
+                break;
+            }
+    }
     // Frees prompt_entry(gen, ...) and returns its old index, or -1 when there is none.
     long drop_replaced(uint64_t gen, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns) {
         if (!replace_on()) return -1;
@@ -340,10 +452,14 @@ private:
         used_bytes_ -= entries_[i].bytes;
         entries_.erase(entries_.begin() + long(i));
     }
-    void evict_oldest() {
-        if (entries_.empty()) return;
-        free_at(0);
+    // the oldest entry other than keep; false when there is none
+    bool evict_oldest(uint64_t keep = 0) {
+        size_t i = 0;
+        while (i < entries_.size() && keep && entries_[i].generation == keep) ++i;
+        if (i == entries_.size()) return false;
+        free_at(i);
         ++evictions_;
+        return true;
     }
 
     void copy_state(int slot, uint32_t pos, void* buf, bool to_cache, cudaStream_t st) {
@@ -412,16 +528,20 @@ private:
     uint64_t deduped_ = 0;
     uint64_t replaced_ = 0;
     uint64_t siblings_ = 0;
+    uint64_t next_park_ = 0;                // GR8_DS_PARK: the last park id (park_end)
+    std::vector<uint64_t> live_parks_;      // parks not yet evicted or resumed
+    std::vector<uint64_t> freed_parks_;     // live parks whose request end was freed as a sibling (nothing to capture)
     std::vector<Ds41PrefixEntry> entries_;
 };
 
 // GR8_DS_CACHE_REPLACE state of each session slot from a request's bind to its retain: the entry the request captured at
 // its prompt end, and whether it restored a request-end entry. serve_ds41 (ds41_native.cuh) calls these in this order:
 // bind, restore (a prefix hit), capture_prompt_end, capture_request_end (retain, when there is a position), reset (retain).
+// GR8_DS_PARK: a park keeps the slot's state; the next bind either resumes it (resume) or evicts it (capture_request_end, reset).
 class Ds41SnapSlots {
 public:
-    explicit Ds41SnapSlots(int slots) : prompt_gen_(size_t(slots), 0), restored_end_(size_t(slots), false) {}
-    void reset(int q) { prompt_gen_[size_t(q)] = 0; restored_end_[size_t(q)] = false; }
+    explicit Ds41SnapSlots(int slots) : prompt_gen_(size_t(slots), 0), restored_end_(size_t(slots), false), park_id_(size_t(slots), 0) {}
+    void reset(int q) { prompt_gen_[size_t(q)] = 0; restored_end_[size_t(q)] = false; park_id_[size_t(q)] = 0; }
     Ds41Snap restore(Ds41PrefixCache& ck, uint64_t gen, int q, cudaStream_t st) {
         const Ds41Snap kind = ck.restore(gen, q, st);
         restored_end_[size_t(q)] = kind == Ds41Snap::RequestEnd;
@@ -439,10 +559,41 @@ public:
                                  const g6rt::CacheNamespace& ns, cudaStream_t st) {
         return ck.capture(q, pos, history, ns, st, Ds41Snap::RequestEnd, prompt_gen_[size_t(q)], restored_end_[size_t(q)]);
     }
+    // GR8_DS_PARK: a park keeps q's state for the bind that resumes or evicts it; the request-end bookkeeping happens now
+    void park(Ds41PrefixCache& ck, int q, uint32_t pos, const std::vector<int>& history, const g6rt::CacheNamespace& ns) {
+        park_id_[size_t(q)] = ck.park_end(prompt_gen_[size_t(q)], pos, history, ns, restored_end_[size_t(q)]);
+        if (restored_end_[size_t(q)]) prompt_gen_[size_t(q)] = 0;   // replaced (freed) or not this request's to link
+    }
+    // GR8_DS_PARK eviction of the chat parked on q: its request-end capture, with the kind and sibling link of retain's
+    // (keep = the new grant's claimed entry, never freed here; the capture is skipped when only it is in the way). Nothing
+    // when a restore already freed it as a sibling. The park is detached and q's state reset on every path
+    uint64_t evict_parked(Ds41PrefixCache& ck, int q, uint32_t pos, const std::vector<int>& history, const g6rt::CacheNamespace& ns,
+                          cudaStream_t st, uint64_t keep) {
+        const bool freed = ck.evict_parked_freed(park_id_[size_t(q)], keep);
+        const uint64_t gen = freed ? 0 : ck.capture(q, pos, history, ns, st, Ds41Snap::RequestEnd, prompt_gen_[size_t(q)], false, keep);
+        reset(q);
+        return gen;
+    }
+    // GR8_DS_PARK: a follow-up resumes the chat parked on q, as if its request end had been captured and then restored on q
+    void resume(Ds41PrefixCache& ck, int q, uint32_t pos, const std::vector<int>& history, const g6rt::CacheNamespace& ns) {
+        const Ds41Snap kind = ck.resume_parked(park_id_[size_t(q)], prompt_gen_[size_t(q)], pos, history, ns);
+        reset(q);
+        restored_end_[size_t(q)] = kind == Ds41Snap::RequestEnd;
+    }
+    // GR8_DS_PARK only (folded into the pool digest with park on): every slot's prompt-end entry, restored kind, park id
+    uint64_t digest() const {
+        uint64_t h = 0xCBF29CE484222325ull;
+        for (size_t q = 0; q < prompt_gen_.size(); ++q) {
+            h = (h ^ prompt_gen_[q]) * 0x100000001B3ull;
+            h = (h ^ (uint64_t(restored_end_[q]) + (park_id_[q] << 1))) * 0x100000001B3ull;
+        }
+        return h;
+    }
 
 private:
     std::vector<uint64_t> prompt_gen_;
     std::vector<bool> restored_end_;
+    std::vector<uint64_t> park_id_;   // GR8_DS_PARK: the park of the chat parked on the slot (0: none)
 };
 
 } // namespace g6s2
