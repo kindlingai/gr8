@@ -31,9 +31,9 @@ knobs:
     doc: >-
       Skip a new DS41 prefix snapshot when a stored same-namespace prefix is at most this many tokens shorter.
       The default 1 reuses a stored same-namespace prefix at most one token behind the requested snapshot position. This
-      includes short replies; GR8_DS_CACHE_REPLACE removes the same request's prompt-end entry when a later snapshot is
-      actually captured. Set 0, with GR8_DS_CACHE_REPLACE=0, to keep every snapshot. Larger values may cause short follow-ups
-      to re-prefill on the next turn.
+      includes short replies: their request end then adds no snapshot. Longer replies' snapshots follow
+      GR8_DS_CACHE_REPLACE. Set 0, with GR8_DS_CACHE_REPLACE=0, to keep every snapshot. Larger values may cause short
+      follow-ups to re-prefill on the next turn.
   GR8_DS_CACHE_REPLACE:
     scope: agree
     kind: flag
@@ -44,8 +44,10 @@ knobs:
       follow-up. The follow-up's restore of one frees the other, the unused sibling: a chat that sends the reply back
       (tools, or thinking off) continues from the request-end snapshot, a thinking chat without tools (its next prompt drops
       the reasoning) from the prompt-end one. A request that restored a request-end snapshot frees its own prompt-end one
-      when it captures its request end. A freed snapshot is lost only to prompts that share its prefix and leave the reply
-      (a retry, regenerate or edit), which prefill again. Set 0 to keep every snapshot until LRU eviction.
+      when it captures its request end. A freed prompt-end snapshot is lost only to prompts that share its prefix and leave
+      the reply (a retry, regenerate or edit); a freed request-end snapshot (its prompt-end sibling was restored) is lost to
+      a later prompt that keeps that reply after all, e.g. a turn with tools after a thinking turn without them. Those
+      prompts prefill again. Set 0 (and GR8_DS_CACHE_DEDUP=0) to keep every snapshot until LRU eviction.
   GR8_DS_CONF_TEMP:
     scope: agree
     kind: text

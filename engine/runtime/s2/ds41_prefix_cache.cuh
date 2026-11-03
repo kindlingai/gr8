@@ -249,7 +249,8 @@ public:
     }
 
     // Returns the restored entry's kind. GR8_DS_CACHE_REPLACE: the follow-up shows which of a request's two entries its chat
-    // continues from, so the other one (its sibling) is freed now, if it is still stored.
+    // continues from, so the other one (its sibling) is freed now, if it is still stored. A freed request-end sibling is lost
+    // to a later prompt that keeps that reply after all (a tools turn after a thinking turn without them): a re-prefill.
     Ds41Snap restore(uint64_t gen, int slot, cudaStream_t st) {
         int idx = -1;
         for (size_t i = 0; i < entries_.size(); ++i) {
