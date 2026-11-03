@@ -297,7 +297,11 @@ ds41_env() {
   ENGINE_BIN=g6m4_ds41
   # g6m4 turns the GLM-5.3 replicated-GEMV splits on at NR > 1 for any build that is not Flash (g6m4.cu: GR8_QA_SPLIT 2, GR8_IDXQ_SPLIT 1,
   # GR8_MTP_SPLIT 1 with --mtp); on DeepSeek TP 4 that asserts in Fabric::init (fabric.cpp) after "layers bound". So all three are 0 unless QA_SPLIT, IDXQ_SPLIT, MTP_SPLIT say otherwise; the plan's env is the same on every rank.
-  ENGINE_ENV="GR8_CP=0 GR8_PF_RS=0 GR8_PF_OWN=0 GR8_PF_POOL_OWNER=0 GR8_DEC_BK=${DEC_BK:-16384} GR8_QA_SPLIT=${QA_SPLIT:-0} GR8_IDXQ_SPLIT=${IDXQ_SPLIT:-0} GR8_MTP_SPLIT=${MTP_SPLIT:-0} ${KV_SHARE_WHEN:+GR8_KV_SHARE_WHEN=$KV_SHARE_WHEN }${DS41_TUNED:-}${EXTRA_ENV:-}"
+  # DEC_BK defaults to CAP: one decode graph bucket. The DS41 step reads the live context from its step cell at run time and never the
+  # bucket (ds41_step.cuh; the bucket only picks the graph), so the 16384..CAP buckets held identical graphs: 425 a rank at the
+  # default 5 sessions and 262,144, 832 at 8 sessions and 1,048,576. One bucket keeps 89 and 124, the same answers and speed, and
+  # 3.6-3.8 GiB (262,144) and 8.1-8.7 GiB (8 x 1,048,576) a box more free memory at ready (GBK, 11-03).
+  ENGINE_ENV="GR8_CP=0 GR8_PF_RS=0 GR8_PF_OWN=0 GR8_PF_POOL_OWNER=0 GR8_DEC_BK=${DEC_BK:-$CAP} GR8_QA_SPLIT=${QA_SPLIT:-0} GR8_IDXQ_SPLIT=${IDXQ_SPLIT:-0} GR8_MTP_SPLIT=${MTP_SPLIT:-0} ${KV_SHARE_WHEN:+GR8_KV_SHARE_WHEN=$KV_SHARE_WHEN }${DS41_TUNED:-}${EXTRA_ENV:-}"
 }
 
 engine_env() {
