@@ -103,12 +103,16 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
         if (!ck) return pool.digest();
         std::lock_guard<std::mutex> l(ck_mu);
         uint64_t d = pool.digest() ^ (ck->digest() * 0x9E3779B97F4A7C15ull);
-        if (sc.park)   // the parked table too, so a rank whose parked chats differ fails at the next event
+        if (sc.park) {   // the parked table and the snapshot ownership too, so a rank whose park state differs fails at the next event
             for (int q = 0; q < slots; ++q) {
                 const Parked& k = parked[size_t(q)];
                 d = (d ^ (uint64_t(k.on) + (uint64_t(k.pos) << 1) + (uint64_t(q) << 40))) * 0x100000001B3ull;
                 for (int t : k.tokens) d = (d ^ uint32_t(t)) * 0x100000001B3ull;
+                for (auto b : k.ns) d = (d ^ uint64_t(b)) * 0x100000001B3ull;
             }
+            d ^= ck->park_digest() * 0xBF58476D1CE4E5B9ull;
+            d ^= snaps.digest() * 0x94D049BB133111EBull;
+        }
         return d;
     };
     if (ck) {
