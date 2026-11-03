@@ -195,10 +195,12 @@ knobs:
     default: "0"
     values: "0|1"
     doc: >-
-      DS41 DSpark serve with --s2-sessions above 5: the drafts a session verifies in a decode round go by the sessions
-      active in it (1-5: 5 drafts, 6 rows a session as without the knob; 6: 4; 7-8: 3; 9-10: 2; 11-16: 1; above 16:
-      none), so the main step stays within 32 rows, and a draft step of more than 6 sessions runs as launches of at most 6. 0: drafting
-      stops above 5 active sessions, as before. Needs --serve and GR8_DS_MTP 1..5; any --s2-sessions 1..32 (it changes nothing while at most 5 are active).
+      DS41 DSpark serve: the drafts a session verifies in a decode round go by the sessions active in it, the most that
+      keep every session's verify rows within the step's row cap (min(GR8_DS_MTP, max_rows / sessions - 1)), and a draft
+      step of more than 6 sessions runs as launches of at most 6. At GR8_DS_MTP=5 and 32 rows: 1-5 active: 5 drafts (6
+      rows a session, the same as with the knob off); 6: 4; 7-8: 3; 9-10: 2; 11-16: 1; above 16: none. Lower GR8_DS_MTP
+      values use the same row-budget rule, so they can change drafting below six active sessions too. 0: today's drafting
+      limits (at GR8_DS_MTP=5, no drafts above 5 active sessions). Needs --serve and GR8_DS_MTP 1..5; --s2-sessions 1..32.
   GR8_DS_SPAN:
     scope: local
     kind: int
