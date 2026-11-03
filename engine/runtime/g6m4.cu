@@ -1025,6 +1025,21 @@ int main(int argc, char** argv)
         for (int M = 2; M <= ngram.kmax + 1; ++M)   // a chain's solo verify of k + 1 rows, class row_class(k + 1)
             if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
     }
+    // GR8_LOOKUP=1 (s2_batch.h LookupSrc, ctx_lookup.h; default off): the session's own tokens as a draft source for a
+    // solo DFlash2 session, chosen as GR8_NGRAM's chain is. GR8_LOOKUP_KMAX (1..dflash-k, default dflash-k);
+    // GR8_LOOKUP_LOG=1: one line per round it takes (rank 0). Drafts only. In the S2 runtime signature
+    s2::LookupSrc lookup;
+    if (knob::lookup())
+    {
+        if (!(dfl && s2mode)) die("GR8_LOOKUP needs --dflash-manifest and --serve");
+        lookup.on = true;
+        lookup.kmax = (int)knob::lookup_kmax().value_or(dfl_k);
+        lookup.log = knob::lookup_log() && cfg.rank == 0;
+        if (lookup.kmax < lookup.kmin || lookup.kmax > dfl_k) die("GR8_LOOKUP_KMAX: 2..--dflash-k");
+        fprintf(stderr, "# rank %d: context lookup: chains %d..%d, margin %.3f\n", cfg.rank, lookup.kmin, lookup.kmax, lookup.margin);
+        for (int M = 2; M <= lookup.kmax + 1; ++M)
+            if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
+    }
     // GR8_DRAFT_PAR=1|2 (s2_batch.h Batch::par_; default 0): a solo DFlash2 round's drafter step runs on its own stream
     // under the MTP first form (and the chain on MTP rounds). 2: a drafting step goes on a high-priority stream (its CTAs
     // are dispatched first while both wait), a context-only step stays at the default priority. Each graph's bytes are as
@@ -3391,6 +3406,7 @@ int main(int argc, char** argv)
                 h.dfl_reuse.mode = dfl_reuse;
                 h.dfl_reuse.min = dfl_reuse_min;
                 h.ngram = ngram;
+                h.lookup = lookup;
                 if (R == 0 && dfl_reuse) fprintf(stderr, "# s2 dflash reuse %d: reuse hits keep the drafter%s, warm-up %d context rows\n", dfl_reuse,
                                                  dfl_reuse > 1 ? ", a session alone on MTP takes it" : "", dfl_reuse_min);
                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
@@ -3486,6 +3502,7 @@ int main(int argc, char** argv)
                 " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0) + " qpmin " + std::to_string(pf_qp ? pf_qp_min() : 0) +
                 (set_id.empty() ? "" : " set " + set_id) + (g6rt::grammar_ready() ? " grammar" : "") +
                 (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : "") + s2::ngram_sig(ngram) +
+                (lookup.on ? " lookup " + std::to_string(lookup.kmax) : "") +
                 (kstop.mode ? " kstop " + std::to_string(kstop.mode) + " kmax " + std::to_string(kstop.kmax) + " tau " + std::to_string(kstop.tau[1]) + "," +
                               std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "") +
                 (draft_par ? " draftpar " + std::to_string(draft_par) : "") +

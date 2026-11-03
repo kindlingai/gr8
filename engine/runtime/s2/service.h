@@ -96,6 +96,7 @@ struct NativeHooks {
     s2::KStop kstop;                  // solo MTP rounds' draft count (GR8_MTP_KSTOP, GR8_MTP_LPLOG)
     s2::DflReuse dfl_reuse;           // GR8_DFL_REUSE
     s2::NgramSrc ngram;               // GR8_NGRAM: the n-gram table as a draft source (S5, #56)
+    s2::LookupSrc lookup;             // GR8_LOOKUP: the session's own tokens as a draft source
 };
 // Only atomic scalar stores/loads on the compute hot path. No request-file
 // checks, digest, allocation, or lock in an event-free boundary. horizon() is
@@ -648,6 +649,9 @@ public:
             if (native_.ngram.t && !c_.rank)
                 fprintf(stderr,"# s2 ngram slot %u: %ld of %ld rounds verified a table chain, %ld of %ld of its tokens accepted, %ld tokens\n",
                         unsigned(k.slot),stats.ngram_rounds,stats.rounds,stats.ngram_acc,stats.ngram_drafted,stats.tokens);
+            if (native_.lookup.on && !c_.rank)
+                fprintf(stderr,"# s2 lookup slot %u: %ld of %ld rounds verified a lookup chain, %ld of %ld of its tokens accepted, %ld tokens\n",
+                        unsigned(k.slot),stats.lookup_rounds,stats.rounds,stats.lookup_acc,stats.lookup_drafted,stats.tokens);
             sessions_.terminal(k,stats);
         };
         if (native_.dispatch.dfl) {
@@ -665,6 +669,7 @@ public:
             driver_->dflash(native_.dfl_kv, native_.dfl_spec); driver_->dsel(native_.dsel); driver_->kstop(native_.kstop);
             driver_->dfl_reuse(native_.dfl_reuse);
             driver_->ngram(native_.ngram);
+            driver_->lookup(native_.lookup);
         }
         else if (kstop_mtp) driver_->kstop(native_.kstop);
         require(!c_.scheduler.park || (reuse() && bool(native_.pool.park)), "parked slots need prefix reuse and the park hook");
