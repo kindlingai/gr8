@@ -576,13 +576,16 @@ inline int prepare_moe(void* model, int i, int M, void*)
         static std::mutex mu;
         std::lock_guard<std::mutex> lk(mu);
         Scratch& sc = *s->sc;
-        if (M > sc.pf_rows)
+        // a decode width above 32 rows (G6_MX 40 / 48) is captured in a graph: carve for the W prefill rows too, so a later prefill prepare
+        // never frees the block that graph holds. MX <= 32: M > MTMAX is a prefill call only, sized as before
+        const int rows = M <= MX ? std::max(M, m.hc_rows) : M;
+        if (rows > sc.pf_rows)
         {
             if (sc.pf_blk) { cudaFree(sc.pf_blk); cudaFree(sc.pf_x16); }
-            sc.pf_blk = dmalloc<char>(::bindp::scratch_bytes(M));
-            sc.pf = ::bindp::scratch_at(sc.pf_blk, M);
-            sc.pf_x16 = dmalloc<__half>((size_t)M * HID);
-            sc.pf_rows = M;
+            sc.pf_blk = dmalloc<char>(::bindp::scratch_bytes(rows));
+            sc.pf = ::bindp::scratch_at(sc.pf_blk, rows);
+            sc.pf_x16 = dmalloc<__half>((size_t)rows * HID);
+            sc.pf_rows = rows;
         }
     }
     if (M >= RO_FROM && gate_ro_on())                                    // the smem attribute of k_gate_logits_ro is set here (host init), never inside a capture

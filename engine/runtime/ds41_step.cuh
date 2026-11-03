@@ -280,7 +280,7 @@ inline void build_ds41(Model& m,int rank,const std::vector<int>& ids,const Find&
 inline void prepare_ds41(Model& m,int M,cudaStream_t st) {
     if(!ds41_prepare_rows_supported(M)) die("DS41 prepare: M outside 1..MX");
     const ds41::Table& table=ds41_table();
-    // The multi-tile MoE path covers M=9..32. Each op retains its own range check.
+    // The multi-tile MoE path covers M=9..32; M 33..MX (DS41_MX 40 / 48) runs the chunked path (ds41_moe_ops.cuh). Each op retains its own range check.
     head_for(m,M);
     for(int i=0;i<m.nl;++i) {
         if(table.prepare_attn) if(int e=table.prepare_attn(&m,i,M,(void*)st)) die("DS41 prepare_attn layer "+std::to_string(m.layers[i].l)+": code "+std::to_string(e));
