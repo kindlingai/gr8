@@ -33,7 +33,7 @@ person will use it for, then give the numbers for the questions that matter to t
 - Very long inputs: Q2.
 
 Measured on four GB10 boxes (TP=4, a switch), the exlr8 release, Engram on, Q3's switches on, unless a line says
-otherwise. "Free memory" is the lowest `MemAvailable` of the four boxes.
+otherwise. "Free memory" is `MemAvailable` a box; a range is the lowest and highest of the four boxes.
 
 ### Q1. How many chats at once?
 
@@ -58,11 +58,11 @@ otherwise. "Free memory" is the lowest `MemAvailable` of the four boxes.
     boxes write more; they share the same speed among more chats, so no chat sits idle waiting for a slot.
   - With 1 to 4 chats, the second runs differ by 0-2% between slot counts; the first runs were 3-8% slower with 10
     and 16 slots than with 5.
-  - Answers: with one chat at a time, 10 and 16 slots give the same 75 answers as 5 slots (71 of 75 right); with every slot busy, 73 of
-    75 are right (10 at once and 16 at once).
+  - Answers: with one chat at a time, 10 and 16 slots give the same 75 answers as 5 slots (71 of 75 right); with
+    every slot busy, 73 of 75 are right (10 at once and 16 at once).
   - Memory: each extra 262,144-token slot costs about 0.35 GiB a box at ready (the 5-slot reading is an earlier
-    boot of the same build). The prefix cache then grows to
-    `GR8_DS_CACHE_MIB` (4,096 MiB a box by default) as chats run.
+    boot of the same build). The prefix cache then grows to `GR8_DS_CACHE_MIB` (4,096 MiB a box by default) as
+    chats run.
   - Suggest 5 for one person or one agent at a time, 10 or 16 when several agents must all make progress at once.
 
 ### Q2. How long can one chat be?
