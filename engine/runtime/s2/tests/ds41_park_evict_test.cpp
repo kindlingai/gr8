@@ -50,6 +50,10 @@ static Ds41IdxModel* find(Model& m, bool) { return m.idx; }
 namespace g6s2 { struct Ds41Dspark { g6rt::Model draft; }; }
 #define GR8_DS41_PREFIX_CACHE_STANDALONE 1
 #include "s2/ds41_prefix_cache.cuh"
+#include "s2/driver.h"
+#include <array>
+#include <map>
+#include <memory>
 
 using g6s2::Ds41PrefixCache;
 static g6rt::CacheNamespace ns(int n) { g6rt::CacheNamespace s{}; s[0] = n; return s; }
@@ -124,14 +128,105 @@ static void others_evicted(bool fp4) {
     printf("ds41_park_evict_test %s: keep spares only the claimed entry (evictions %llu)\n", fp4 ? "FP4" : "BF16", (unsigned long long)cache.evictions());
 }
 
+
+// The same through admission (Astra's regression): Driver + Scheduler with GR8_DS_PARK on and 2 slots, a test native layer
+// that plays ds41_native.cuh (prompt-end capture, park at finish, the bind's eviction of a parked slot and the restore of
+// the grant's hit). Chats A and B finish and park, so both slots are occupied; chat C's prompt matches A's prompt-end
+// snapshot PE but not A's parked tokens (thinking on, no tools); the grant lands on A's parked slot (the oldest), whose
+// eviction capture of A's request end RE does not fit beside PE.
+static int tok(uint32_t chat, uint32_t i) { return int((chat * 2654435761u ^ i * 40503u) % 5); }
+static void admission(bool fp4, bool pressure)
+{
+    using namespace g6s2;
+    Fixture f(fp4);
+    Ds41PrefixCache cache(f.m, nullptr, 1), *ck = &cache;
+    const uint32_t len = fp4 ? 1901 : 520;   // PE + RE over 1 MiB, each under it
+    Config c;
+    c.epoch = 1; c.mtp = 1; c.max_rows = 8; c.max_sessions = 2; c.prefill_rows = 64; c.two_lanes = false; c.park = true;
+    struct Parked { bool on = false; std::vector<int> tokens; uint32_t pos = 0; };
+    std::array<Parked, 2> parked{};
+    std::map<uint64_t, std::vector<int>> prompt, out;
+    std::map<uint64_t, uint32_t> maxt;
+    uint64_t claimed = 0, pe = 0, re_gen = 1;
+    bool threw = false;
+    std::unique_ptr<Driver> d;
+    DriverHooks h;
+    h.bind = [&](const Grant& g) {   // ds41_native.cuh h.bind with park, then the restore of the grant's hit
+        const int q = int(g.key.slot);
+        Parked& k = parked[size_t(q)];
+        try {
+            if (k.on) re_gen = evict_parked(ck, q, k.pos, k.tokens, ns(1), claimed);
+            k = Parked{};
+            if (g.reuse) cache.restore(claimed, q, 0);
+        } catch (const std::runtime_error& e) { threw = true; fprintf(stderr, "abort: %s\n", e.what()); }
+        claimed = 0;
+    };
+    h.retire = [](const Slot&) {};
+    h.prefill = [&](const Slot& sl, const Payload&, uint32_t first, uint32_t rows) {   // prompt end: the PE capture of chat A
+        if (sl.req.id == 1 && first + rows == sl.req.prompt_tokens - 1) pe = cache.capture(int(sl.key.slot), first + rows, prompt.at(1), ns(1), 0);
+    };
+    h.run = [&](const s2::Step& st) { std::vector<int> ids; for (const auto& r : st.r) ids.push_back(tok(r.pos, uint32_t(r.tok))); return ids; };
+    h.emit = [&](Key k, const int* ids, int n, int) {
+        const Slot& sl = d->state().slots()[k.slot];
+        auto& o = out[sl.req.id];
+        const int cnt = std::min<int>(n, int(sl.req.max_tokens - o.size()));
+        o.insert(o.end(), ids, ids + cnt);
+        return Emission{uint32_t(cnt), o.size() == sl.req.max_tokens};
+    };
+    h.finished = [&](const Slot& sl) {   // the park hook: the slot keeps tokens [0, pos)
+        Parked& k = parked[sl.key.slot];
+        k.on = true; k.tokens = prompt.at(sl.req.id);
+        k.tokens.insert(k.tokens.end(), out.at(sl.req.id).begin(), out.at(sl.req.id).end());
+        k.pos = uint32_t(k.tokens.size()) - 1;
+    };
+    d = std::make_unique<Driver>(c, h);
+    auto admit = [&](uint64_t id, std::vector<int> pr, uint32_t mt, uint32_t reuse) {
+        const Scheduler& sc = d->state();
+        if (!sc.resident()) d->idle_boundary(sc.boundary() + NOTICE_MIN);
+        prompt[id] = pr; maxt[id] = mt;
+        const Request rq{id, uint32_t(pr.size()), mt};
+        Commit cm; cm.epoch = 1; cm.event = sc.next_event(); cm.boundary = sc.boundary(); cm.before_hash = sc.digest();
+        cm.admit = Grant{sc.next_key(), rq, Run{0, reserve_pages(c, rq), 1, id * 77}, reuse};
+        Payload p; p.prompt = pr; p.chunk = 4;
+        d->apply(cm, &p);
+        return cm.admit->key.slot;
+    };
+    auto drain = [&] { for (int g = 0; d->state().resident() && g < 100000; ++g) d->step(); };
+    std::vector<int> a(len), b(len / 2);
+    for (uint32_t i = 0; i < len; ++i) a[i] = tok(1, i);
+    for (uint32_t i = 0; i < len / 2; ++i) b[i] = tok(2, i);
+    admit(1, a, 3, 0); drain();
+    admit(2, b, 3, 0); drain();
+    CHECK(pe != 0 && parked[0].on && parked[1].on);
+    const uint32_t pe_pos = len - 1;
+    std::vector<int> cp(a.begin(), a.begin() + pe_pos);   // A's prompt, then a new turn that drops A's reply (thinking)
+    for (int i = 0; i < 40; ++i) cp.push_back((tok(3, uint32_t(i)) + 1) % 5);
+    const auto hit = cache.match(cp, int(cp.size()) - 1, ns(1));
+    CHECK(hit.hit && hit.generation == pe && hit.position == pe_pos);
+    CHECK(g6rt::PrefixReuse::common_prefix(parked[0].tokens, cp) < int(parked[0].pos));   // not a resume of A
+    CHECK(cache.entry_bytes(pe_pos) + cache.entry_bytes(parked[0].pos) > cache.budget_bytes());
+    claimed = pe;
+    if (pressure) alloc_limit = live_bytes + cache.entry_bytes(parked[0].pos) - 1;
+    const unsigned slot = admit(3, cp, 4, pe_pos);
+    alloc_limit = SIZE_MAX;
+    CHECK(slot == 0);   // the occupied slot: A's, parked first
+    CHECK(!threw && re_gen == 0 && cache.find(pe) && cache.evictions() == 0 && cache.hits() == 1);
+    drain();
+    CHECK(out.at(3).size() == 4 && d->state().slots()[0].req.id == 3);
+    printf("ds41_park_evict_test admission %s%s: chat C on A's parked slot %u, A's capture skipped, PE restored, C served\n",
+           fp4 ? "FP4" : "BF16", pressure ? " alloc-pressure" : "", slot);
+}
+
 int main() {
     for (bool fp4 : {false, true}) {
         tight_budget(fp4, false);
         tight_budget(fp4, true);
         others_evicted(fp4);
+        admission(fp4, false);
+        admission(fp4, true);
     }
     CHECK(mem.empty());
     if (fails) { fprintf(stderr, "ds41_park_evict_test: %d FAIL\n", fails); return 1; }
-    puts("ds41_park_evict_test: ok (6 cases)");
+    puts("ds41_park_evict_test: ok (10 cases)");
     return 0;
 }
