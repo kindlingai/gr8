@@ -192,6 +192,10 @@ ds41_defaults() {
   # qeval answers did not change). GR8_DS_MOE_PDL=1: decode +0.6 to +1.4%. GR8_DS41_ADMIT_KEEP_SCRATCH=1: a request starts 12-17 ms
   # sooner. GR8_DS41_PUB16=1 and GR8_DS41_GV_QUAD=1: a decode round -0.9 to -1.3% and -1.6 to -1.8%, the same bytes. A variable
   # EXTRA_ENV names keeps its value; GR8_DS_ATTN_PW and GR8_DS41_IDX_PW follow GR8_DS_PREFILL_W.
+  # GR8_DS_COMP_FP4=1: the compressed KV rows are kept as packed FP4 (288 B, not 1,024 B BF16) and layer 20's BF16 copy is gone,
+  # the same values, so the same bytes out: 0 of 75 qeval outputs differ on 2 boot pairs, 2.1-2.9 GiB a box more free at ready
+  # (5 x 262,144), a prefix snapshot at about 1M 882 MiB a rank instead of 3,134 (measured), one-chat decode within the
+  # boot spread. EXTRA_ENV GR8_DS_COMP_FP4=0 keeps the BF16 rows.
   # A 1024-row prefill quantum while another chat decodes keeps those chats writing during a long new prompt.
   # The caller may override it in EXTRA_ENV or with S2_DECODE_PF; do not exceed a smaller requested W.
   local dpf=${S2_DECODE_PF:-$((pmin == 0 ? 0 : (pw < 1024 ? pw : 1024)))}
@@ -200,7 +204,7 @@ ds41_defaults() {
       GR8_DS_PF_LANES=2 GR8_DS_PF_RS=1 GR8_DS_PF_DIRECT=1 GR8_DS_PF_GATHER=1 GR8_DS_PF_LATE_FINAL=1 GR8_DS_WAIT_K=2 GR8_DS_DEC_STAGE=1 \
       GR8_DS_ATTN_CPA=1 GR8_DS_DSP_GV=1 GR8_DS_RO_ORDER=1 GR8_DS_GATE_RO=1 GR8_DS_ENGRAM_LOOKAHEAD=1 GR8_DS_ATTN_TC=1 \
       GR8_DS_MOE_TC=1 GR8_DS_PF_POOL=4 GR8_DS_SRC_FAST=3 GR8_DS_MOE_PDL=1 GR8_DS41_ADMIT_KEEP_SCRATCH=1 GR8_DS41_PUB16=1 \
-      GR8_DS41_GV_QUAD=1; do
+      GR8_DS41_GV_QUAD=1 GR8_DS_COMP_FP4=1; do
     case " ${EXTRA_ENV:-} " in *" ${kv%%=*}="*) ;; *) DS41_TUNED="$DS41_TUNED$kv " ;; esac
   done
   S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=${REUSE:-1}
