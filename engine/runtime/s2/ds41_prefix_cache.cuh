@@ -131,18 +131,6 @@ public:
         return total;
     }
 
-    // GR8_DS_PARK: an entry a grant claimed becomes the most recent, so the capture of an evicted parked slot before the
-    // restore evicts it last
-    void touch(uint64_t gen) {
-        for (size_t i = 0; i + 1 < entries_.size(); ++i)
-            if (entries_[i].generation == gen) {
-                Ds41PrefixEntry moved = std::move(entries_[i]);
-                entries_.erase(entries_.begin() + long(i));
-                entries_.push_back(std::move(moved));
-                return;
-            }
-    }
-
     const Ds41PrefixEntry* find(uint64_t gen) const {
         for (const auto& e : entries_) {
             if (e.generation == gen) return &e;
@@ -184,9 +172,11 @@ public:
     //     freed before the new buffer is allocated. match() needs an entry's tokens to be a prefix of the new prompt, so it
     //     is lost only to prompts that share its prefix and leave the reply (a retry, regenerate or edit: a re-prefill).
     //   replace = false: a new entry is linked to it as its sibling; the first restore of either frees the other (restore()).
+    // keep (GR8_DS_PARK: a grant's own hit, restored after this capture) is never freed or evicted here: when only it stands
+    // in the way the capture is skipped (returns 0)
     uint64_t capture(int slot, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns, cudaStream_t st,
-                     Ds41Snap kind = Ds41Snap::Other, uint64_t prompt_gen = 0, bool replace = false) {
-        const uint64_t replace_gen = replace ? prompt_gen : 0;
+                     Ds41Snap kind = Ds41Snap::Other, uint64_t prompt_gen = 0, bool replace = false, uint64_t keep = 0) {
+        const uint64_t replace_gen = replace && prompt_gen != keep ? prompt_gen : 0;
         if (pos == 0 || tokens.size() < size_t(pos)) return 0;
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].position == pos && entries_[i].ns == ns &&
@@ -221,13 +211,12 @@ public:
         if (need == 0 || need > budget_bytes_) return 0;
         drop_replaced(replace_gen, pos, tokens, ns);
         while (used_bytes_ + need > budget_bytes_ && !entries_.empty()) {
-            evict_oldest();
+            if (!evict_oldest(keep)) return 0;
         }
         void* dev_buf = nullptr;
         while (cudaMalloc(&dev_buf, need) != cudaSuccess) {
             cudaGetLastError();
-            if (entries_.empty()) return 0;
-            evict_oldest();
+            if (!evict_oldest(keep)) return 0;
         }
         const auto t0 = std::chrono::steady_clock::now();
         copy_state(slot, pos, dev_buf, true, st);
@@ -352,10 +341,14 @@ private:
         used_bytes_ -= entries_[i].bytes;
         entries_.erase(entries_.begin() + long(i));
     }
-    void evict_oldest() {
-        if (entries_.empty()) return;
-        free_at(0);
+    // the oldest entry other than keep; false when there is none
+    bool evict_oldest(uint64_t keep = 0) {
+        size_t i = 0;
+        while (i < entries_.size() && keep && entries_[i].generation == keep) ++i;
+        if (i == entries_.size()) return false;
+        free_at(i);
         ++evictions_;
+        return true;
     }
 
     void copy_state(int slot, uint32_t pos, void* buf, bool to_cache, cudaStream_t st) {

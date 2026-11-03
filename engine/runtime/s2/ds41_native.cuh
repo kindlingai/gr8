@@ -201,9 +201,9 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
                     require(cs == q && k.on && k.pos == g.reuse, "DS41 park: the claimed parked slot differs from the grant");
                     last = std::move(k.tokens);
                 } else if (k.on) {
-                    const uint64_t keep = claimed.load();   // this grant's own cache hit, restored below: evicted last
-                    if (keep) ck->touch(keep);
-                    const uint64_t gen = ck->capture(q, k.pos, k.tokens, k.ns, c.stream);
+                    // this grant's own cache hit, restored below: the capture never evicts it (skipped when only it is in the way)
+                    const uint64_t keep = claimed.load();
+                    const uint64_t gen = ck->capture(q, k.pos, k.tokens, k.ns, c.stream, keep);
                     fprintf(stderr, "# rank %d ds41 park evict slot %d pos %u capture gen %llu used %zu/%zu\n", c.main.rank, q, k.pos,
                             (unsigned long long)gen, ck->used_bytes(), ck->budget_bytes());
                     require(!keep || ck->find(keep), "DS41 park: the evicted chat's capture evicted the grant's own snapshot");

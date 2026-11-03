@@ -115,6 +115,9 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engin
 # prefills only the delta, a new chat with no free slot evicts the oldest parked slot; knob off traces as before (TRACE_OFF)
 g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_park_test.cpp" -o "$T/scheduler_park_test" "${KNOBS[@]}"
 "$T/scheduler_park_test"
+# GR8_DS_PARK: evicting a parked slot never evicts the grant's own cache snapshot (Ds41PrefixCache::capture keep), BF16 and FP4
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/ds41_park_evict_test.cpp" -o "$T/ds41_park_evict_test" "${KNOBS[@]}"
+"$T/ds41_park_evict_test"
 # the Driver's prefill quanta: the shortest prompt first, owed quanta, decode rounds between them
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/driver_prefill_quantum_test.cpp" -o "$T/driver_prefill_quantum_test" "${KNOBS[@]}"
 "$T/driver_prefill_quantum_test" > /dev/null
