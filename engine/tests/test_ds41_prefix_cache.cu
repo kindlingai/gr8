@@ -3,6 +3,9 @@
 //   /usr/local/cuda/bin/nvcc -std=c++17 -O3 -gencode=arch=compute_120a,code=sm_120a -DG6_MODEL_DS41=1 -I. -Iengine \
 //     engine/tests/test_ds41_prefix_cache.cu engine/attn/ds41_bind.cu -Lengine/kvman-rs/target/release -lg6kvman engine/knobs-rs/target/release/libgr8knobs.a -lpthread -ldl \
 //     -o /tmp/test_ds41_prefix_cache && /tmp/test_ds41_prefix_cache
+// On a Spark: -gencode=arch=compute_121a,code=sm_121a (not -arch=sm_121a: that emits generic compute_121 PTX, which has no
+// block_scale), and name both archives so libgr8knobs.a cannot be skipped:
+//   -Lengine/kvman-rs/target/release -Lengine/knobs-rs/target/release -l:libg6kvman.a -l:libgr8knobs.a -lpthread -ldl -lm
 //
 // Proves:
 //   (1) Ds41PrefixCache snapshot store, entry_bytes sizing, LRU eviction, tier_stat() (slots, free_slots, entries, hits, dropped,
