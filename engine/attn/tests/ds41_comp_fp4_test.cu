@@ -1,4 +1,5 @@
 // GR8_DS_COMP_FP4 exactness test: packed fp4 compressed rows (288 B) against the bf16 rows (1024 B) they replace. No fixture, random data.
+//   0. the gather's dequant (cq_dq4), exhaustive over code words and scale bytes.
 //   1. writers: k_comp_pool / k_comp_pool_dev (ratio-2 sources 2, 8, 14) with ckq vs ck, and k_ca_row_r1 (layer 20) ca vs its bf16 shadow:
 //      every packed row, decoded on the host, is bit-equal to the bf16 row.
 //   2. attention core: launch_attn on bf16 rows vs the same rows packed (p.ckq = 1), output bytes compared, for the plain, cp.async and split
@@ -154,6 +155,39 @@ static std::vector<uint16_t> randbf(size_t n, float sd)
 }
 
 // ------------------------------------------------------------------------------------------------ 1. writers
+// 0. the gather's dequant (cq_dq4) against bf16(float(e2m1) * float(E4M3)) for every 16-bit code word (4 codes) and scale byte
+__global__ void k_dq_all(unsigned long long* bad)
+{
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;   // 0 .. 65535
+    unsigned long long nb = 0;
+    for (int sb = 0; sb < 256; sb++)
+    {
+        const float sc = ds41a::f_e4m3((uint8_t)sb);
+        if (sc != sc) continue;   // NaN scales (0x7F, 0xFF): a writer never stores one
+        uint32_t o[2];
+        ds41a::cq_dq4(c, __float2bfloat162_rn(sc), o[0], o[1]);
+        for (int e = 0; e < 4; e++)
+        {
+            const float r = ds41a::cq_e2m1((c >> (4 * e)) & 15) * sc;
+            const uint16_t want = __bfloat16_as_ushort(__float2bfloat16_rn(r));
+            nb += (uint16_t)(o[e >> 1] >> (16 * (e & 1))) != want;
+        }
+    }
+    if (nb) atomicAdd(bad, nb);
+}
+static void test_dequant()
+{
+    printf("gather dequant\n");
+    unsigned long long* d = dalloc<unsigned long long>(1);
+    CK(cudaMemset(d, 0, 8));
+    k_dq_all<<<256, 256>>>(d);
+    CK(cudaGetLastError());
+    unsigned long long h = 0;
+    CK(cudaMemcpy(&h, d, 8, cudaMemcpyDeviceToHost));
+    CK(cudaFree(d));
+    report("cq_dq4, all 65536 code words x 254 scales == bf16(e2m1 * scale)", (long)h, 65536L * 254 * 4);
+}
+
 static void test_writers()
 {
     printf("writers\n");
@@ -514,6 +548,7 @@ int main(int argc, char** argv)
         else { fprintf(stderr, "usage: %s [--heads 16] [--time ITERS] [--long KEYS]\n", argv[0]); return 2; }
     }
     if (heads % 16) { fprintf(stderr, "--heads must be a multiple of 16\n"); return 2; }
+    test_dequant();
     test_writers();
     test_attention(heads, long_keys);
     if (iters > 0) time_attention(heads, iters);

@@ -573,6 +573,7 @@ __device__ __forceinline__ void mma16816(float (&c)[4], const uint32_t (&a)[4], 
 // In a slot list a packed row is its address + 1 (rows are 16 B aligned, so bit 0 is free). The 64 rows of a block split by warp: warp w
 // dequantizes rows w, w + 8, .., w + 56 into the shared K tile, lane g the 16 elements of scale g; the other rows load as before.
 // CQ_ROW / CQ_CODES: ds41_attn_types.h.
+__device__ __forceinline__ __nv_bfloat162 u32_bf2(uint32_t v) { return *(const __nv_bfloat162*)&v; }
 __device__ __forceinline__ bool cq_tag(const void* rp) { return ((uintptr_t)rp & 1) != 0; }
 __device__ __forceinline__ const uint8_t* cq_row(const void* rp) { return (const uint8_t*)((uintptr_t)rp & ~(uintptr_t)1); }
 // value of an e2m1 code: magnitude index m = 2e + mantissa -> fp32 bits (m = 1 is the subnormal 0.5), sign bit 3 (code 8 = -0)
@@ -597,6 +598,21 @@ __device__ __forceinline__ void cq_load(const bf16* const* cl, int w, int lane, 
         }
     }
 }
+// 4 e2m1 codes (c, bits 0..15: elements e0..e3) times the bf16x2 scale s2 -> o0 = (e0, e1), o1 = (e2, e3), each bf16x2.
+// The bf16 bit patterns of the 8 magnitudes come from two byte tables (prmt), the sign bits move from bit 4i + 3 to the high
+// byte's bit 7, and one bf16x2 multiply applies the scale. Exact: an e2m1 magnitude has <= 2 significant bits and an E4M3 scale
+// <= 4, so the product fits bf16's 8 and the rounding never acts; the bytes equal bf16(float(e2m1) * float(scale)), -0 included.
+__device__ __forceinline__ void cq_dq4(uint32_t c, __nv_bfloat162 s2, uint32_t& o0, uint32_t& o1)
+{
+    const uint32_t m = c & 0x7777u;                                   // magnitude index of each code (prmt selector 0..7)
+    const uint32_t lo = __byte_perm(0xC0800000u, 0xC0804000u, m);     // low bytes of 0, .5, 1, 1.5 | 2, 3, 4, 6
+    uint32_t hi = __byte_perm(0x3F3F3F00u, 0x40404040u, m);           // high bytes
+    hi |= __byte_perm(c << 4, c, 0x5140) & 0x80808080u;               // sign of e0, e1, e2, e3 -> bit 7 of high byte 0..3
+    const __nv_bfloat162 a = __hmul2(u32_bf2(__byte_perm(lo, hi, 0x5140)), s2);
+    const __nv_bfloat162 b = __hmul2(u32_bf2(__byte_perm(lo, hi, 0x7362)), s2);
+    o0 = *(const uint32_t*)&a;
+    o1 = *(const uint32_t*)&b;
+}
 // the bf16 values of those rows into the K tile (row stride AT_KLD): lane g writes elements 16g .. 16g + 15
 __device__ __forceinline__ void cq_store(bf16* Ks, int ld, const bf16* const* cl, int w, int lane, const uint2 (&cd)[8], const uint32_t (&sb)[8])
 {
@@ -604,15 +620,12 @@ __device__ __forceinline__ void cq_store(bf16* Ks, int ld, const bf16* const* cl
     for (int k = 0; k < 8; k++)
     {
         if (!cq_tag(cl[w + 8 * k])) continue;
-        const float sc = f_e4m3((uint8_t)sb[k]);
+        const __nv_bfloat162 s2 = __float2bfloat162_rn(f_e4m3((uint8_t)sb[k]));   // an E4M3 value is exact in bf16
         uint32_t o[8];
-#pragma unroll
-        for (int j = 0; j < 8; j++)
-        {
-            const uint32_t byte = ((j < 4 ? cd[k].x : cd[k].y) >> (8 * (j & 3))) & 0xFFu;
-            const __nv_bfloat162 v = __floats2bfloat162_rn(cq_e2m1(byte & 15) * sc, cq_e2m1(byte >> 4) * sc);
-            o[j] = *(const uint32_t*)&v;
-        }
+        cq_dq4(cd[k].x, s2, o[0], o[1]);
+        cq_dq4(cd[k].x >> 16, s2, o[2], o[3]);
+        cq_dq4(cd[k].y, s2, o[4], o[5]);
+        cq_dq4(cd[k].y >> 16, s2, o[6], o[7]);
         uint4* dst = (uint4*)(Ks + (size_t)(w + 8 * k) * ld + lane * 16);
         dst[0] = make_uint4(o[0], o[1], o[2], o[3]);
         dst[1] = make_uint4(o[4], o[5], o[6], o[7]);
