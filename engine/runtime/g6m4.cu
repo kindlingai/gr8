@@ -2180,6 +2180,9 @@ int main(int argc, char** argv)
         if (ds_idx_q_trig) bc.runtime_signature += " idxqtrig 1";
         if (ds_idx_pipe_qr) bc.runtime_signature += " idxpipeqr 1";
         if (reuse_prefix) bc.runtime_signature += " reuse 1";
+        // the agree-scope knobs that are not at their default (knob::signature(), as Flash and GLM add): a rank whose value
+        // differs (GR8_DS_COMP_FP4 on three ranks and off on one) refuses at bootstrap instead of diverging later
+        bc.runtime_signature += knob::signature();
         // DSpark (GR8_DS_MTP): the draft Model, its fabric, the 5-row draft graph (or the eager step) and the compressor commit of the main Model
         g6s2::Ds41Dspark ds{DS, in_ds, out_ds,
             [&](const StepIn& si) {     // 11 collectives: 6 layer exchanges of the 5 block rows, then the 5 markov merges of one row each (x DS.ds_ns sessions)

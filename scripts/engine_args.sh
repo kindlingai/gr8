@@ -194,8 +194,8 @@ ds41_defaults() {
   # EXTRA_ENV names keeps its value; GR8_DS_ATTN_PW and GR8_DS41_IDX_PW follow GR8_DS_PREFILL_W.
   # GR8_DS_COMP_FP4=1: the compressed KV rows are kept as packed FP4 (288 B, not 1,024 B BF16) and layer 20's BF16 copy is gone,
   # the same values, so the same bytes out: 0 of 75 qeval outputs differ on 2 boot pairs, 2.1-2.9 GiB a box more free at ready
-  # (5 x 262,144), a 1M prefix snapshot 897 MiB a rank instead of 3,025, one-chat decode within the boot spread. EXTRA_ENV
-  # GR8_DS_COMP_FP4=0 keeps the BF16 rows.
+  # (5 x 262,144), a prefix snapshot at about 1M 882 MiB a rank instead of 3,134 (measured), one-chat decode within the
+  # boot spread. EXTRA_ENV GR8_DS_COMP_FP4=0 keeps the BF16 rows.
   # A 1024-row prefill quantum while another chat decodes keeps those chats writing during a long new prompt.
   # The caller may override it in EXTRA_ENV or with S2_DECODE_PF; do not exceed a smaller requested W.
   local dpf=${S2_DECODE_PF:-$((pmin == 0 ? 0 : (pw < 1024 ? pw : 1024)))}
