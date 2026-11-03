@@ -26,8 +26,13 @@
 
 namespace g6s2 {
 
+// What a request captured an entry at (GR8_DS_CACHE_REPLACE): its prompt end or its request end.
+enum class Ds41Snap : uint8_t { Other = 0, PromptEnd = 1, RequestEnd = 2 };
+
 struct Ds41PrefixEntry {
     uint64_t generation = 0;
+    Ds41Snap kind = Ds41Snap::Other;
+    uint64_t sibling = 0;   // the other entry the same request captured (0: none); it may have been freed since
     uint32_t position = 0;
     size_t bytes = 0;
     std::vector<int> tokens;
@@ -60,9 +65,10 @@ public:
     // One line, the same fields every time: what a gate reads back after the prefix-cache requests.
     std::string stats_line() const {
         char b[256];
-        snprintf(b, sizeof b, "entries %zu used_mib %zu captures %llu hits %llu evictions %llu restored_bytes %zu",
+        snprintf(b, sizeof b, "entries %zu used_mib %zu captures %llu hits %llu evictions %llu restored_bytes %zu replaced %llu siblings %llu",
                  entries_.size(), used_bytes_ >> 20, (unsigned long long)captures_, (unsigned long long)hits_,
-                 (unsigned long long)evictions_, restored_bytes_);
+                 (unsigned long long)evictions_, restored_bytes_, (unsigned long long)replaced_,
+                 (unsigned long long)siblings_);
         return std::string(b);
     }
 
@@ -81,6 +87,8 @@ public:
     uint64_t hits() const { return hits_; }
     uint64_t captures() const { return captures_; }
     uint64_t deduped() const { return deduped_; }
+    uint64_t replaced() const { return replaced_; }
+    uint64_t siblings() const { return siblings_; }
     uint64_t evictions() const { return evictions_; }
 
     uint64_t digest() const {
@@ -158,11 +166,21 @@ public:
         return Ds41PrefixHit{false, 0, 0, max_lcp, !saw_ns ? "namespace" : (max_lcp > 0 ? "short" : "no-lcp")};
     }
 
-    uint64_t capture(int slot, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns, cudaStream_t st) {
+    // GR8_DS_CACHE_REPLACE: `kind` is recorded on a new entry. `prompt_gen` is the entry this same request captured at its
+    // prompt end (0: none), used when it is still stored, same namespace, shorter and a token prefix of the new entry:
+    //   replace = true (the request restored a request-end entry, so its client sends replies back as generated): it is
+    //     freed before the new buffer is allocated. match() needs an entry's tokens to be a prefix of the new prompt, so it
+    //     is lost only to prompts that share its prefix and leave the reply (a retry, regenerate or edit: a re-prefill).
+    //   replace = false: a new entry is linked to it as its sibling; the first restore of either frees the other (restore()).
+    uint64_t capture(int slot, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns, cudaStream_t st,
+                     Ds41Snap kind = Ds41Snap::Other, uint64_t prompt_gen = 0, bool replace = false) {
+        const uint64_t replace_gen = replace ? prompt_gen : 0;
         if (pos == 0 || tokens.size() < size_t(pos)) return 0;
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].position == pos && entries_[i].ns == ns &&
                 std::equal(entries_[i].tokens.begin(), entries_[i].tokens.end(), tokens.begin())) {
+                const long gone = drop_replaced(replace_gen, pos, tokens, ns);   // index erased, or -1
+                if (gone >= 0 && gone < long(i)) --i;
                 Ds41PrefixEntry hit = std::move(entries_[i]);
                 entries_.erase(entries_.begin() + long(i));
                 const uint64_t gen = hit.generation;
@@ -171,10 +189,9 @@ public:
                 return gen;
             }
         }
-        // With DSpark, the request-end snapshot sits one token after the prompt-end snapshot.
-        // Reuse a same-namespace prefix within K tokens instead of copying essentially the same GPU state twice.
-        // K=1 by default; a larger value also skips short-turn snapshots. K=0 keeps every snapshot.
-        // Return 0 when no new generation was captured.
+        // Any stored same-namespace token prefix at most K tokens behind `pos` is reused instead of copying essentially the
+        // same GPU state twice. K=1 by default; a larger value also skips short-turn snapshots.
+        // K=0 with GR8_DS_CACHE_REPLACE=0 keeps every snapshot. Return 0 when no new generation was captured.
         if (const int K = dedup_k()) {
             for (size_t i = 0; i < entries_.size(); ++i) {
                 const auto& e = entries_[i];
@@ -190,6 +207,7 @@ public:
         }
         const size_t need = entry_bytes(pos);
         if (need == 0 || need > budget_bytes_) return 0;
+        drop_replaced(replace_gen, pos, tokens, ns);
         while (used_bytes_ + need > budget_bytes_ && !entries_.empty()) {
             evict_oldest();
         }
@@ -206,6 +224,12 @@ public:
 
         Ds41PrefixEntry e;
         e.generation = next_gen_++;
+        e.kind = kind;
+        if (!replace && replace_on())
+            if (Ds41PrefixEntry* pe = prompt_entry(prompt_gen, pos, tokens, ns); pe && !pe->sibling) {
+                pe->sibling = e.generation;
+                e.sibling = prompt_gen;
+            }
         e.position = pos;
         e.bytes = need;
         e.tokens.assign(tokens.begin(), tokens.begin() + pos);
@@ -224,7 +248,10 @@ public:
         return gen;
     }
 
-    void restore(uint64_t gen, int slot, cudaStream_t st) {
+    // Returns the restored entry's kind. GR8_DS_CACHE_REPLACE: the follow-up shows which of a request's two entries its chat
+    // continues from, so the other one (its sibling) is freed now, if it is still stored. A freed request-end sibling is lost
+    // to a later prompt that keeps that reply after all (a tools turn after a thinking turn without them): a re-prefill.
+    Ds41Snap restore(uint64_t gen, int slot, cudaStream_t st) {
         int idx = -1;
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].generation == gen) { idx = int(i); break; }
@@ -245,11 +272,24 @@ public:
         // one line per hit: a gate reads the increment itself, not a value derived from the HTTP usage field
         fprintf(stderr, "# ds41 prefix cache hit gen %llu slot %d pos %u bytes %zu ms %.2f hits %llu restored_bytes %zu\n",
                 (unsigned long long)gen, slot, e.position, e.bytes, ms, (unsigned long long)hits_, restored_bytes_);
+        const Ds41Snap kind = e.kind;
+        const uint64_t sib = e.sibling;
+        e.sibling = 0;
         if (size_t(idx) + 1 < entries_.size()) {
             Ds41PrefixEntry moved = std::move(entries_[size_t(idx)]);
             entries_.erase(entries_.begin() + idx);
             entries_.push_back(std::move(moved));
         }
+        if (sib && replace_on())
+            for (size_t i = 0; i < entries_.size(); ++i)
+                if (entries_[i].generation == sib) {
+                    if (entries_[i].sibling == gen) {
+                        free_at(i);
+                        ++siblings_;
+                    }
+                    break;
+                }
+        return kind;
     }
 
     g6kv_tier_totals tier_stat() const {
@@ -271,11 +311,38 @@ private:
         static const int k = int(knob::ds_cache_dedup());
         return k;
     }
+    static bool replace_on() {
+        static const bool on = knob::ds_cache_replace();
+        return on;
+    }
+    // Entry `gen` if it is still stored, same namespace, shorter than `pos` and its tokens start `tokens`; else null.
+    // Only the generation a request captured itself is passed in, so another request's prefix entry is never touched.
+    Ds41PrefixEntry* prompt_entry(uint64_t gen, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns) {
+        if (!gen) return nullptr;
+        for (auto& e : entries_)
+            if (e.generation == gen)
+                return (e.ns == ns && e.position < pos && std::equal(e.tokens.begin(), e.tokens.end(), tokens.begin())) ? &e
+                                                                                                                          : nullptr;
+        return nullptr;
+    }
+    // Frees prompt_entry(gen, ...) and returns its old index, or -1 when there is none.
+    long drop_replaced(uint64_t gen, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns) {
+        if (!replace_on()) return -1;
+        const Ds41PrefixEntry* e = prompt_entry(gen, pos, tokens, ns);
+        if (!e) return -1;
+        const long i = long(e - entries_.data());
+        free_at(size_t(i));
+        ++replaced_;
+        return i;
+    }
+    void free_at(size_t i) {
+        if (entries_[i].dev_buf) cudaFree(entries_[i].dev_buf);
+        used_bytes_ -= entries_[i].bytes;
+        entries_.erase(entries_.begin() + long(i));
+    }
     void evict_oldest() {
         if (entries_.empty()) return;
-        if (entries_.front().dev_buf) cudaFree(entries_.front().dev_buf);
-        used_bytes_ -= entries_.front().bytes;
-        entries_.erase(entries_.begin());
+        free_at(0);
         ++evictions_;
     }
 
@@ -343,7 +410,39 @@ private:
     uint64_t captures_ = 0;
     uint64_t evictions_ = 0;
     uint64_t deduped_ = 0;
+    uint64_t replaced_ = 0;
+    uint64_t siblings_ = 0;
     std::vector<Ds41PrefixEntry> entries_;
+};
+
+// GR8_DS_CACHE_REPLACE state of each session slot from a request's bind to its retain: the entry the request captured at
+// its prompt end, and whether it restored a request-end entry. serve_ds41 (ds41_native.cuh) calls these in this order:
+// bind, restore (a prefix hit), capture_prompt_end, capture_request_end (retain, when there is a position), reset (retain).
+class Ds41SnapSlots {
+public:
+    explicit Ds41SnapSlots(int slots) : prompt_gen_(size_t(slots), 0), restored_end_(size_t(slots), false) {}
+    void reset(int q) { prompt_gen_[size_t(q)] = 0; restored_end_[size_t(q)] = false; }
+    Ds41Snap restore(Ds41PrefixCache& ck, uint64_t gen, int q, cudaStream_t st) {
+        const Ds41Snap kind = ck.restore(gen, q, st);
+        restored_end_[size_t(q)] = kind == Ds41Snap::RequestEnd;
+        return kind;
+    }
+    uint64_t capture_prompt_end(Ds41PrefixCache& ck, int q, uint32_t pos, const std::vector<int>& prompt,
+                                const g6rt::CacheNamespace& ns, cudaStream_t st) {
+        const uint64_t before = ck.captures();
+        const uint64_t gen = ck.capture(q, pos, prompt, ns, st, Ds41Snap::PromptEnd);
+        // only a new entry is this request's own: a refreshed one may belong to another request that still needs it
+        if (ck.captures() != before) prompt_gen_[size_t(q)] = gen;
+        return gen;
+    }
+    uint64_t capture_request_end(Ds41PrefixCache& ck, int q, uint32_t pos, const std::vector<int>& history,
+                                 const g6rt::CacheNamespace& ns, cudaStream_t st) {
+        return ck.capture(q, pos, history, ns, st, Ds41Snap::RequestEnd, prompt_gen_[size_t(q)], restored_end_[size_t(q)]);
+    }
+
+private:
+    std::vector<uint64_t> prompt_gen_;
+    std::vector<bool> restored_end_;
 };
 
 } // namespace g6s2

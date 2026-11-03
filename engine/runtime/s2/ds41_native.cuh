@@ -80,6 +80,7 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
     std::atomic<uint64_t> claimed{0};
     std::array<Run, MAX_SESSIONS> bound{};
     std::array<bool, MAX_SESSIONS> bound_live{};
+    Ds41SnapSlots snaps(slots);   // GR8_DS_CACHE_REPLACE: each slot's prompt-end entry and the kind it restored
     LpStep lp{};
     int lp_rows = 0;
     auto fence = [&] { G6RT_CK(cudaStreamSynchronize(c.stream)); };
@@ -109,12 +110,13 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
                 ? st.valid : std::min<int>(st.main_end, int(st.history.size()) - 1));
             if (p) {
                 std::lock_guard<std::mutex> l(ck_mu);
-                const uint64_t gen = ck->capture(q, p, st.history, ns, c.stream);
+                const uint64_t gen = snaps.capture_request_end(*ck, q, p, st.history, ns, c.stream);
                 if (gen) fprintf(stderr, "# rank %d ds41 ckpt capture gen %llu slot %d pos %u bytes %zu used %zu/%zu\n",
                                  c.main.rank, (unsigned long long)gen, q, p, ck->last.bytes,
                                  ck->used_bytes(), ck->budget_bytes());
             }
             bound_live[size_t(q)] = false;
+            snaps.reset(q);
             pool.release(r); // the snapshot owns separate device storage, not the run's pages
         };
         h.pool.match = [&](const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit, const CacheNamespace& ns, uint32_t r) {
@@ -146,14 +148,14 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
             if (round) round->reset(q);           // DSpark: that slot's cached drafts and its draft key-ring slab
             fence();
             lp_rows = 0;
-            bound[size_t(q)] = g.run; bound_live[size_t(q)] = true;
+            bound[size_t(q)] = g.run; bound_live[size_t(q)] = true; snaps.reset(q);
             if (g.reuse) {
                 const uint64_t gen = claimed.exchange(0);
                 require(gen != 0, "DS41 prefix hit without a claimed entry");
                 std::lock_guard<std::mutex> l(ck_mu);
                 const Ds41PrefixEntry* e = ck->find(gen);
                 require(e && e->position == g.reuse, "DS41 prefix claim differs from granted skip");
-                ck->restore(gen, q, c.stream);
+                snaps.restore(*ck, gen, q, c.stream);
                 fprintf(stderr, "# rank %d ds41 ckpt restore gen %llu slot %d pos %u bytes %zu hits %llu\n",
                         c.main.rank, (unsigned long long)gen, q, g.reuse, ck->last.bytes,
                         (unsigned long long)ck->hits());
@@ -169,14 +171,14 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
         if (round) round->reset();
         fence();
         lp_rows = 0;
-        bound[0] = g.run; bound_live[0] = true;
+        bound[0] = g.run; bound_live[0] = true; snaps.reset(0);
         if (g.reuse) {
             const uint64_t gen = claimed.exchange(0);
             require(gen != 0, "DS41 prefix hit without a claimed entry");
             std::lock_guard<std::mutex> l(ck_mu);
             const Ds41PrefixEntry* e = ck->find(gen);
             require(e && e->position == g.reuse, "DS41 prefix claim differs from granted skip");
-            ck->restore(gen, 0, c.stream);
+            snaps.restore(*ck, gen, 0, c.stream);
             fprintf(stderr, "# rank %d ds41 ckpt restore gen %llu slot 0 pos %u bytes %zu hits %llu\n",
                     c.main.rank, (unsigned long long)gen, g.reuse, ck->last.bytes,
                     (unsigned long long)ck->hits());
@@ -226,7 +228,7 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
         if (!ck || p.prompt.empty() || end != p.prompt.size() - 1) return;
         const CacheNamespace ns = steering::cache_namespace(s.req.steering);
         std::lock_guard<std::mutex> l(ck_mu);
-        const uint64_t gen = ck->capture(int(s.key.slot), end, p.prompt, ns, c.stream);
+        const uint64_t gen = snaps.capture_prompt_end(*ck, int(s.key.slot), end, p.prompt, ns, c.stream);
         if (gen) fprintf(stderr, "# rank %d ds41 ckpt capture gen %llu slot %u pos %u bytes %zu used %zu/%zu\n",
                          c.main.rank, (unsigned long long)gen, unsigned(s.key.slot), end,
                          ck->last.bytes, ck->used_bytes(), ck->budget_bytes());
