@@ -16,6 +16,10 @@
 // session i of the block (the drafted ones, in step order) gets q / golden / acc [i], crow0[i] = its first row in the last MAIN step
 // (Launch::source_rows), cslot[i] = its slot; the draft StepIn has 5 rows per session with si.sess = slot, the draft Model's ds_ns = sessions.
 // The compressor commit is ds41_attn_comp_commit_sessions; a CHAIN step is one row per session, each from its slot's cached drafts.
+// GR8_DS_SESS_DRAFTS=1 (sess_drafts): Dsp::nsess is the draft launch's cap min(slots, 6) (5 rows a session within MX), and a DRAFT step of more
+// drafted sessions runs as launches of at most nsess of them, in step order (s2::draft_chunks). Each launch is a whole draft step: its own
+// fabric step, the compressor commit of its sessions (per session: its slot's kvs / scs from the verify rows in S.ckv / S.csc, which no
+// draft launch writes), the draft graph of its session count, then its drafts. A step of at most nsess sessions is one launch, as before.
 #pragma once
 #if G6_MODEL_DS41
 #include "service.h"
@@ -55,10 +59,10 @@ struct Ds41Dspark {
 class Ds41Round {
 public:
     static constexpr int BLOCK = Ds41RoundLogic::BLOCK;
-    Ds41Round(g6rt::Model& main, Ds41Dspark& d, cudaStream_t st, int k)
+    Ds41Round(g6rt::Model& main, Ds41Dspark& d, cudaStream_t st, int k, bool sess_drafts = false)
         : main_(main), d_(d), st_(st), slots_(main.ds_slots), logic_(size_t(std::max(1, main.ds_slots)), Ds41RoundLogic(k)), conf_(size_t(std::max(1, main.ds_slots)) * BLOCK) {
         const auto& D = d.draft.dsp;
-        const int dsp_nsess = std::min(slots_, ::ds41dsp::MARKOV_MAXS);
+        const int dsp_nsess = std::min(slots_, sess_drafts ? s2::sess_drafts_chunk(g6mx::MX, BLOCK, ::ds41dsp::MARKOV_MAXS) : ::ds41dsp::MARKOV_MAXS);
         require(k >= 1 && k <= BLOCK && main.dsp.k == k && slots_ >= 1 && main.dsp.nsess == dsp_nsess && D.nsess == dsp_nsess && d.draft.ds_slots == slots_ &&
                 D.draft_model && D.host_accept && D.q && D.golden && D.acc && (slots_ == 1 || (D.crow0 && D.cslot && dsp_nsess * BLOCK <= g6mx::MX)) &&
                 D.draft && D.conf && d.input && d.output && d.enqueue && d.launch && d.errors && d.comp_commit,
@@ -145,8 +149,16 @@ private:
             Ds41RoundLogic::DraftIn in;
             if (logic_[size_t(q)].draft_in_sess(s, j, in)) { js.push_back(j); ins.push_back(in); }
         }
+        if (js.empty()) return u;                  // prompt chunks before the last: nothing to draft from yet
+        for (const auto& c : s2::draft_chunks(int(js.size()), d_.draft.dsp.nsess))   // one launch unless GR8_DS_SESS_DRAFTS and > nsess sessions
+            draft_launch(l, std::vector<size_t>(js.begin() + c.first, js.begin() + c.first + c.second),
+                         std::vector<Ds41RoundLogic::DraftIn>(ins.begin() + c.first, ins.begin() + c.first + c.second), u);
+        return u;
+    }
+    // one draft launch: the sessions js of the DRAFT step (indexes into s.sess), their inputs ins; writes their draft[0] into u
+    void draft_launch(const Launch& l, const std::vector<size_t>& js, const std::vector<Ds41RoundLogic::DraftIn>& ins, std::vector<int>& u) {
+        const s2::Step& s = l.step;
         const int S = int(js.size());
-        if (!S) return u;                          // prompt chunks before the last: nothing to draft from yet
         const auto& D = d_.draft.dsp;
         require(S <= D.nsess, "DSpark draft step sessions exceed DSpark nsess");
         g6rt::StepIn si{};
@@ -178,7 +190,6 @@ private:
             std::memcpy(&conf_[size_t(q) * BLOCK], hout_ + size_t(slots_) * BLOCK + size_t(i) * BLOCK, BLOCK * sizeof(float));
             u[size_t(s.row0[j] + s.rows[j] - 1)] = logic_[size_t(q)].draft_set(ins[size_t(i)].q, hout_ + size_t(i) * BLOCK);
         }
-        return u;
     }
 
     g6rt::Model& main_;

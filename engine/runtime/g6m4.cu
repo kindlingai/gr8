@@ -540,6 +540,13 @@ int main(int argc, char** argv)
     const ds41::dsp::Knobs dsk = ds41::dsp::parse_knobs(ds41_dspark_knob);   // every DSpark knob, GR8_DS_VERIFY_CAP / GR8_DS_CONF_TEMP included
     if (!dsk.err.empty()) die(dsk.err);
     if (dsk.on() && !s2mode) die("DS41: GR8_DS_MTP is served only (it needs --serve)");
+    // GR8_DS_SESS_DRAFTS=1 (s2/ds41_sess_drafts.h): a round's drafts a session go by its active sessions (Batch), the DSpark draft step runs
+    // launches of at most ds_draft_cap sessions (5 rows each within MX), and ds_ms_rps(ns) is the most rows a session of an ns-session main step
+    // has (its captured graphs). Off: the cap is MARKOV_MAXS and k + 1 rows up to 8 sessions, as before
+    const bool ds_sess_drafts = knob::ds_sess_drafts();
+    if (ds_sess_drafts && !dsk.on()) die("DS41: GR8_DS_SESS_DRAFTS=1 needs --serve and GR8_DS_MTP = 1..5");
+    const int ds_draft_cap = ds_sess_drafts ? s2::sess_drafts_chunk(MX, g6s2::Ds41Round::BLOCK, ::ds41dsp::MARKOV_MAXS) : ::ds41dsp::MARKOV_MAXS;
+    auto ds_ms_rps = [&](int ns) { return !dsk.on() ? 1 : ds_sess_drafts ? s2::sess_drafts_kv(dsk.mtp, MX, ns) + 1 : ns <= 8 ? dsk.mtp + 1 : 1; };
     if (dsk.relaxed && !dsk.on()) die("DS41: GR8_DS_RELAXED_ACCEPT needs GR8_DS_MTP = 1..5 (there are no drafts to accept)");
     if (dsk.relax_topp > 0 && nc == 0) die("DS41: GR8_DS_RELAXED_ACCEPT topp:P needs --top-p-cands > 0 (the candidates carry the mass above the draft)");
     if (dfl) die("DS41: --dflash-manifest is not supported");
@@ -561,7 +568,7 @@ int main(int argc, char** argv)
     // 1 row at MTP 0, k + 1 verify rows with DSpark up to 8 sessions; above 8 sessions MTP is dynamically off).
     if (s2mode && s2sess != 1 && (knob::ds_prefill_min() < 2))
         die("DS41: --s2-sessions > 1 needs GR8_DS_PREFILL_MIN >= 2 (with GR8_DS_PREFILL_W)");
-    if (s2mode && s2sess != 1 && dsk.on() && (std::min(s2sess, 8) * (dsk.mtp + 1) > MX || std::min(s2sess, 8) * g6s2::Ds41Round::BLOCK > MX))
+    if (s2mode && s2sess != 1 && dsk.on() && !ds_sess_drafts && (std::min(s2sess, 8) * (dsk.mtp + 1) > MX || std::min(s2sess, 8) * g6s2::Ds41Round::BLOCK > MX))
         die("DS41: --s2-sessions x (GR8_DS_MTP + 1) verify rows and --s2-sessions x 5 draft rows must fit G6_MX " + std::to_string(MX));
     // --check-args: every parse-time check above passed; stop before any CUDA, fabric or weight work (the launcher smoke test runs the engine arg list through this)
     if (check_args) { fprintf(stderr, "g6m4: --check-args: the arguments pass the parse-time checks (no CUDA, no weights)\n"); return 0; }
@@ -625,8 +632,8 @@ int main(int argc, char** argv)
     const int NL = (int)layers.size(), NX = ds41_engram_colls(layers), NC = 2 * NL + 1 + NX, R = cfg.rank;   // NX: 2 Engram collectives after the head slot (GR8_DS_ENGRAM=1), else 0
     const std::vector<int> fab_order = ds41::coll_exec_order(layers, NX);   // the step's collective order with Engram on, else empty (identity)
     if (dsk.on())                       // DSpark verify steps of 2..k + 1 rows (the prompt chunk covers 1..chunk); SESS > 1: ns x (k + 1) for ns <= 8
-        for (int ns = 1; ns <= std::min(s2mode ? s2sess : 1, 8); ++ns)
-            for (int M = ns; M <= ns * (dsk.mtp + 1) && M <= MX; M += ns)
+        for (int ns = 1; ns <= std::min(s2mode ? s2sess : 1, ds_sess_drafts ? 32 : 8); ++ns)
+            for (int M = ns; M <= ns * ds_ms_rps(ns) && M <= MX; M += ns)
                 if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
 #else
     const int NL = (int)layers.size(), NX = 0, NC = 2 * NL + 1, R = cfg.rank;
@@ -937,7 +944,7 @@ int main(int argc, char** argv)
         // the draft block sends 5 rows a session, never W rows: decode-sized slots (the W-sized cfg.slot_bytes is the main fabric's)
         cd.slot_bytes = dec_slot_bytes;
         for (int c = 0; c < cd.ncoll; ++c)
-            if (ds41::dsp::coll_bytes(c, HID, std::min(s2sess, ::ds41dsp::MARKOV_MAXS)) > cd.slot_bytes) die("DSpark draft fabric: a collective is larger than the decode slot");
+            if (ds41::dsp::coll_bytes(c, HID, std::min(s2sess, ds_draft_cap)) > cd.slot_bytes) die("DSpark draft fabric: a collective is larger than the decode slot");
         cd.port = cfg.port + 16;        // the MTP draft region's port (--mtp is refused with DSpark)
         cd.proxy_cpu = cfg.proxy_cpu > 5 ? cfg.proxy_cpu - 6 : -1;
         // GR8_XTRACE=1 with GR8_DS_XTRACE=1: stage-0 trace (xtrace.h) on this draft fabric too; default off
@@ -1316,8 +1323,9 @@ int main(int argc, char** argv)
         DS.ds41_draft = true;           // build_ds41 sets it too; ncoll() must be DRAFT_NCOLL before the fabric check
         DS.ds_slots = m.ds_slots;       // SESS > 1: one slab of the draft layers' key rings per S2 slot
         build_ds41(DS, R, std::vector<int>{geom::L_MAIN, geom::L_MAIN + 1, geom::L_MAIN + 2}, find, cap, fabds.dev(), dmalloc<u64>(1), st, MX, 2);
-        ds41dsp_ops::build(m, DS, /*nsess=*/std::min(m.ds_slots, ::ds41dsp::MARKOV_MAXS), dsk.mtp, /*host_accept=*/true,
-                          s2mode && knob::ds_prefill_min() ? m.hc_rows : 0);   // W-row tap/MainS when prefill is admitted
+        ds41dsp_ops::build(m, DS, /*nsess=*/std::min(m.ds_slots, ds_draft_cap), dsk.mtp, /*host_accept=*/true,
+                          s2mode && knob::ds_prefill_min() ? m.hc_rows : 0,   // W-row tap/MainS when prefill is admitted
+                          ds_draft_cap, /*verify_all=*/!ds_sess_drafts);
         DS.graph = graph; DS.in = in_ds; DS.out = out_ds;
     }
 #endif
@@ -1748,7 +1756,7 @@ int main(int argc, char** argv)
         if (m.ds_ns > 1)
         {
             const int ns = m.ds_ns, rps = M / std::max(1, ns);
-            g6s2::require(ns <= m.ds_slots && ns <= 32 && rps >= 1 && rps <= 6 && (rps == 1 || ns <= 8) && rps * ns == M &&
+            g6s2::require(ns <= m.ds_slots && ns <= 32 && rps >= 1 && rps <= 6 && (rps == 1 || ns <= (ds_sess_drafts ? 32 : 8)) && rps * ns == M &&
                           (decode_graph ? exec_ms_dec[k][ns][rps] : exec_ms[k][ns][rps]), "DS41 SESS graph not captured");
             G6RT_CK(cudaGraphLaunch(decode_graph ? exec_ms_dec[k][ns][rps] : exec_ms[k][ns][rps], st));
             if (gsplit) G6RT_CK(cudaGraphLaunch(exec2_ms[k][ns][rps], st));
@@ -1805,7 +1813,7 @@ int main(int argc, char** argv)
                 m.ds_moe_decode_step = false;
             }
             for (int ns = 2; ns <= m.ds_slots && ns <= MX; ++ns)
-                for (int rps = 1; rps <= (dsk.on() && ns <= 8 ? dsk.mtp + 1 : 1) && ns * rps <= MX; ++rps)
+                for (int rps = 1; rps <= ds_ms_rps(ns) && ns * rps <= MX; ++rps)
                 {
                     const int M = ns * rps;
                     m.ds_ns = ns;
@@ -2115,6 +2123,10 @@ int main(int argc, char** argv)
         sc.max_sessions = s2sess; sc.mtp = dsk.mtp;
         // drafting stops past the sessions whose verify and 5 draft rows fit one step (at most 8)
         sc.mtp_sessions = (uint32_t)std::min(sc.max_rows / 5, 8u);
+        sc.sess_drafts = ds_sess_drafts;    // GR8_DS_SESS_DRAFTS: drafts a session by active sessions (Batch), mtp_sessions bounds limit() only
+        if (ds_sess_drafts)
+            fprintf(stderr, "# rank %d ds41 GR8_DS_SESS_DRAFTS=1: %d sessions, drafts while at most %d are active, draft launches of at most %d sessions\n", R,
+                    s2sess, s2::sess_drafts_max(dsk.mtp, (int)sc.max_rows, s2sess), std::min(m.ds_slots, ds_draft_cap));
         // Boot evidence: this line names the logical page count, the page size, the session count and the row caps, so a check
         // can compare them with the head's /status (free_pages == sessions*cap/64, resident == 0).
         fprintf(stderr, "# rank %d: s2 pool %u logical pages of %d rows, %d sessions, cap %d, max_rows %d\n", R,
@@ -2154,6 +2166,7 @@ int main(int argc, char** argv)
             (ds41moe::ro_fc2stg() ? std::string(" stg 1") : std::string()) +   // GR8_DS_MOE_FC2STG: 0 adds nothing; ranks that disagree refuse to join
             (ds41moe::ro_fc1bstg() ? std::string(" fc1bstg 1") : std::string()); // off adds nothing; ranks with the staged B arm must agree
         if (sc.c8_pack) bc.runtime_signature += " c8pack 1";
+        if (ds_sess_drafts) bc.runtime_signature += " sessdrafts 1";   // off adds nothing; ranks that disagree refuse to join
         if (pf_lanes == 2) bc.runtime_signature += " pflanes 2";   // unset / 1 adds nothing; ranks that disagree refuse to join
         if (ds_moe_decode_topk != ds_moe_main_topk)
             bc.runtime_signature += " tkmain " + std::to_string(ds_moe_main_topk) +
