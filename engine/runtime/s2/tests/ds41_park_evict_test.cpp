@@ -111,12 +111,12 @@ static void tight_budget(bool fp4, bool pressure) {
 // keep only protects one entry: an older entry is still evicted for the capture, and keep = 0 is the knob-off eviction
 static void others_evicted(bool fp4) {
     Fixture f(fp4);
-    // PE + another entry fit, PE + RE fit, all three do not: BF16 2 MiB with 774144 + 774144 + 876544 B, FP4 1 MiB with
-    // 400096 + 400096 + 406144 B
+    // PE + another entry fit, PE + RE fit, all three do not: BF16 2 MiB, FP4 1 MiB. RE is more than 64 tokens past PE (the
+    // largest GR8_DS_CACHE_DEDUP), so its capture is a new entry at every dedup
     Ds41PrefixCache cache(f.m, nullptr, fp4 ? 1 : 2);
     std::vector<int> t(2048); for (int i = 0; i < 2048; ++i) t[size_t(i)] = i + 1;
     std::vector<int> u = t; u[0] = 99999;
-    const uint32_t pe_pos = fp4 ? 958u : 1000u, re_pos = fp4 ? 1000u : 1200u;
+    const uint32_t pe_pos = fp4 ? 958u : 1000u, re_pos = fp4 ? 1030u : 1200u;
     CHECK(2 * cache.entry_bytes(pe_pos) <= cache.budget_bytes() && cache.entry_bytes(pe_pos) + cache.entry_bytes(re_pos) <= cache.budget_bytes() &&
           2 * cache.entry_bytes(pe_pos) + cache.entry_bytes(re_pos) > cache.budget_bytes());
     const uint64_t pe = cache.capture(0, pe_pos, t, ns(1), 0);
@@ -305,7 +305,8 @@ static std::vector<std::pair<int, std::vector<int>>> stored(const Ds41PrefixCach
 static void combined() {
     using g6s2::Ds41Snap;
     // chat 1 tools, chat 2 thinking without tools, chat 3 retry; 3 turns each in the order 1a 2a 1b 3a 1c 2b 3b 2c 3c (chat 1's
-    // follow-ups come while it is parked: resumes; the others evict); replies of 6..9 tokens
+    // follow-ups come while it is parked: resumes; the others evict); replies of 70..73 tokens and follow-ups that add 70,
+    // past the largest GR8_DS_CACHE_DEDUP (64): a shorter one folds into the stored entry it extends and adds none
     auto gen = [](int chat, int turn, int n, int salt) { std::vector<int> v; for (int i = 0; i < n; ++i) v.push_back(1 + (chat * 131 + turn * 17 + i * 7 + salt) % 997); return v; };
     std::array<std::vector<int>, 4> prompt, last_reply;
     std::array<int, 4> turns{};
@@ -313,10 +314,10 @@ static void combined() {
     for (int chat : {1, 2, 1, 3, 1, 2, 3, 2, 3}) {
         const int turn = turns[size_t(chat)]++;
         std::vector<int> pr = prompt[size_t(chat)];
-        const std::vector<int> reply = gen(chat, turn, 6 + (chat + turn) % 4, 500);
+        const std::vector<int> reply = gen(chat, turn, 70 + (chat + turn) % 4, 500);
         if (turn == 0) pr = gen(chat, 0, 40 + 10 * chat, 0);
-        else if (chat == 1) { pr.insert(pr.end(), last_reply[1].begin(), last_reply[1].end()); auto x = gen(chat, turn, 12, 9); pr.insert(pr.end(), x.begin(), x.end()); }
-        else if (chat == 2) { auto x = gen(chat, turn, 12, 9); pr.insert(pr.end(), x.begin(), x.end()); }
+        else if (chat == 1) { pr.insert(pr.end(), last_reply[1].begin(), last_reply[1].end()); auto x = gen(chat, turn, 70, 9); pr.insert(pr.end(), x.begin(), x.end()); }
+        else if (chat == 2) { auto x = gen(chat, turn, 70, 9); pr.insert(pr.end(), x.begin(), x.end()); }
         // chat 3: a retry, the same prompt
         prompt[size_t(chat)] = pr; last_reply[size_t(chat)] = reply;
         seq.push_back({pr, reply});
@@ -349,7 +350,8 @@ static void combined() {
 static void lifecycle() {
     using g6s2::Ds41Snap;
     std::vector<int> a(60); for (int i = 0; i < 60; ++i) a[size_t(i)] = 3 + i;
-    const std::vector<int> reply{901, 902, 903, 904, 905, 906, 907};
+    std::vector<int> reply(70);   // past the largest GR8_DS_CACHE_DEDUP (64): the request end is its own entry
+    for (int i = 0; i < 70; ++i) reply[size_t(i)] = 901 + i;
     {   // (a)
         Native on(true);
         on.serve(a, reply);
@@ -360,7 +362,7 @@ static void lifecycle() {
         const g6s2::Ds41PrefixEntry *pe = nullptr, *re = nullptr;
         for (const auto& e : on.ck.entries()) {
             if (e.position == 59 && e.kind == Ds41Snap::PromptEnd) pe = &e;
-            if (e.position == 66 && e.kind == Ds41Snap::RequestEnd) re = &e;
+            if (e.position == 59 + reply.size() && e.kind == Ds41Snap::RequestEnd) re = &e;
         }
         const bool rp = knob::ds_cache_replace();   // GR8_DS_CACHE_REPLACE=0: no links, as retain's
         CHECK(pe && re && on.evictions == 1 && pe->sibling == (rp ? re->generation : 0) && re->sibling == (rp ? pe->generation : 0));
@@ -368,7 +370,7 @@ static void lifecycle() {
     {   // (c)
         Native on(true), off(false);
         std::vector<int> think = a;
-        for (int i = 0; i < 10; ++i) think.push_back(400 + i);   // drops the reply
+        for (int i = 0; i < 70; ++i) think.push_back(400 + i);   // drops the reply; 70 new tokens, past the dedup window
         for (Native* n : {&on, &off}) { n->serve(a, reply); n->serve(think, reply); }
         CHECK(on.resumes == 0 && on.ck.hits() == 1 && off.ck.hits() == 1);   // the PE path on both
         on.flush();
