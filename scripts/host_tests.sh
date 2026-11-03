@@ -83,8 +83,8 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 python3 "$REPO/tools/s2_dsel_table.py" --selftest
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_kstopb_test.cpp" -o "$T/batch_kstopb_test" "${KNOBS[@]}"
 "$T/batch_kstopb_test" 2>/dev/null
-# GR8_DS_SESS_DRAFTS (s2/ds41_sess_drafts.h): a DS41 shared round's drafts a session by its active count (rows a session at 1, 5, 6, 8,
-# 9, 16 sessions), draft launches of at most 6 sessions, and 1..5 sessions plan the same steps and tokens as the knob off
+# GR8_DS_SESS_DRAFTS (s2/ds41_sess_drafts.h): a DS41 shared round's drafts a session by its active count (rows a session at 1, 5, 6, 8, 9, 10, 11, 16
+# sessions), draft launches of at most 6 sessions, and 1..5 sessions plan the same steps and tokens as the knob off
 g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_ds41_sessdrafts_test.cpp" -o "$T/batch_ds41_sessdrafts_test" "${KNOBS[@]}"
 "$T/batch_ds41_sessdrafts_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_kstop_mtp_test.cpp" -o "$T/batch_kstop_mtp_test" "${KNOBS[@]}"

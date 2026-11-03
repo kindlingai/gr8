@@ -1,6 +1,6 @@
 // GR8_DS_SESS_DRAFTS (s2/ds41_sess_drafts.h, Batch::set_sess_drafts) on the real s2::Batch with a fake engine, DS41 shape (K = 5 DSpark
 // drafts, G6_MX = 32 rows a step, 32 slots):
-//   (a) the rule: kv(n) for n = 1..32 active sessions, and one table line per n = 1, 5, 6, 8, 9, 16: rows a session, main rows, draft
+//   (a) the rule: kv(n) for n = 1..32 active sessions, and one table line per n = 1, 5, 6, 8, 9, 10, 11, 16: rows a session, main rows, draft
 //       launches of at most 6 sessions (sess_drafts_chunk), and the same n with the knob off (today)
 //   (b) every decode-round MAIN step of n sessions gives each session kv(n) + 1 rows and fits 32 rows; every DRAFT step's sessions split
 //       into launches of at most 6 that cover them once, in order (draft_chunks)
@@ -73,7 +73,7 @@ static Run run(int n, bool on)
 int main()
 {
     // (a) the rule
-    const int want[17] = {0, 5, 5, 5, 5, 5, 4, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1};
+    const int want[17] = {0, 5, 5, 5, 5, 5, 4, 3, 3, 2, 2, 1, 1, 1, 1, 1, 1};
     for (int n = 1; n <= 16; ++n) { ctx = "kv n " + std::to_string(n); CHECK(sess_drafts_kv(K, MXR, n) == want[n]); CHECK(n * (want[n] + 1) <= MXR); }
     for (int n = 17; n <= 32; ++n) { ctx = "kv n " + std::to_string(n); CHECK(sess_drafts_kv(K, MXR, n) == 0); }
     ctx = "max"; CHECK(sess_drafts_max(K, MXR, 32) == 16); CHECK(sess_drafts_max(K, MXR, 8) == 8);
@@ -89,7 +89,7 @@ int main()
     }
 
     std::printf("active  rows/session  main rows  draft launches | knob off (today): rows/session\n");
-    for (int n : {1, 5, 6, 8, 9, 16})
+    for (int n : {1, 5, 6, 8, 9, 10, 11, 16})
     {
         const Run on = run(n, true), off = run(n, false);
         // (b) every decode-round main step: kv(its sessions) + 1 rows a session, at most 32 rows; the full-n rounds for the table
