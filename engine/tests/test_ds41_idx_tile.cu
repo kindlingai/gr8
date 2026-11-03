@@ -188,7 +188,8 @@ static int run(const Case& c, bool timing = false, float* ms_flat = nullptr, flo
            "rows<512 keys %d, rows with a tie at the cut %d; scratch %.1f -> %.1f MiB%s%s\n",
            c.name, R, c.ratio, N, c.tile, B.tile ? (N + B.tile - 1) / B.tile : 1, B.tile ? "tiled" : "ONE PASS", c.logits, c.mc, bad,
            bad_c, bad_c2, rows_short, ties_cut, b_flat / 1048576.0, b_tile / 1048576.0, ok ? " OK" : " FAIL",
-           timing ? (" | time one pass " + std::to_string(tf) + " ms, tiled " + std::to_string(tt) + " ms").c_str() : "");
+           timing ? (" | time one pass " + std::to_string(tf) + " ms, " + (B.tile ? "tiled " : "second scratch (carved one pass, not tiled) ") +
+                     std::to_string(tt) + " ms").c_str() : "");
     if (!ok) g_fail++;
     if (!timing && !B.tile && c.tile) { fprintf(stderr, "  case %s did not tile\n", c.name); g_fail++; }
     cudaFree(q_b); cudaFree(wp); cudaFree(dpos); cudaFree(klen); cudaFree(ica); cudaFree(pages); if (s_flat) cudaFree(s_flat); cudaFree(s_tile); cudaFree(oa2);
