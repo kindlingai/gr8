@@ -202,12 +202,14 @@ class Ds41Tests(unittest.TestCase):
     def test_engine_plan(self):
         plan = opt.engine_plan(ds41())
         self.assertEqual((plan['knobs']['MTP'], plan['knobs']['SESS'], plan['knobs']['CAP']), ('0', '5', '262144'))
-        for e in ('GR8_CP=0', 'GR8_DEC_BK=16384', 'GR8_DS_MTP=5', 'GR8_DS_PREFILL_W=4096', 'GR8_DS_ATTN_PW=4096', 'GR8_DS_PF_LANES=2', 'GR8_DS_ATTN_TC=1', 'GR8_DS_MOE_TC=1',
+        for e in ('GR8_CP=0', 'GR8_DEC_BK=262144', 'GR8_DS_MTP=5', 'GR8_DS_PREFILL_W=4096', 'GR8_DS_ATTN_PW=4096', 'GR8_DS_PF_LANES=2', 'GR8_DS_ATTN_TC=1', 'GR8_DS_MOE_TC=1',
                   'GR8_DS_PF_POOL=4', 'GR8_DS_SRC_FAST=3', 'GR8_DS_MOE_PDL=1', 'GR8_DS41_ADMIT_KEEP_SCRATCH=1', 'GR8_DS41_PUB16=1',
                   'GR8_DS41_GV_QUAD=1', 'GR8_S2_DECODE_PF=1024'):
             self.assertIn(e, plan['env'])
         self.assertFalse([e for e in plan['env'] if 'PF_STAGE_ASYNC' in e])   # none of the GLM or Flash prefill stack
         self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '5')
+        # one decode graph bucket: DEC_BK follows CAP unless set
+        self.assertIn('GR8_DEC_BK=1048576', opt.engine_plan(ds41('--cap', '1048576'))['env'])
         self.assertEqual(plan['args'][plan['args'].index('--mtp') + 1], '0')
         self.assertIn('--reuse-prefix', plan['args'])
         for a in ('--wide', '--pfv2', '--dflash-manifest', '--qo-manifest'):
