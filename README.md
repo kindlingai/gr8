@@ -235,7 +235,7 @@ with these fields:
 | `reasoning_effort` (top level, or in `chat_template_kwargs`) | `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | The template names `low`, `high` and `max`. Another value becomes the nearest of those, ties going higher: `minimal` is `low`, `medium` is `high`, `xhigh` is `max`. Unset is `max`. `none` and any other value are a 400 |
 | `thinking_budget` | an integer, or null | While the think block is open, the front end puts `\n</think>\n\n` in place of the reply's Nth token (so N-1 reasoning tokens come first), and the answer follows. 0, null or unset takes the server default, as in TensorFold. A negative number is no limit |
 | `chat_template_kwargs.enable_thinking` | `true`; `false` with `--allow-thinking-off 1` | `false` is a 400 that names `reasoning_effort` `low`, `thinking_budget` and `--allow-thinking-off` instead |
-| `response_format` | `{"type": "text"}`, `json_object`, `json_schema` (chat) | JSON modes are checked after generation, not constrained: the reply's first JSON value, and for `json_schema` the schema's XGrammar grammar ([frontend/README.md](frontend/README.md)) |
+| `response_format` | `{"type": "text"}`, `json_object`, `json_schema` (chat) | Without tools the engine masks the reply to the schema's XGrammar grammar (`GRAMMAR=1`), and the front end checks it after generation: the reply's first JSON value, and for `json_schema` the schema ([frontend/README.md](frontend/README.md)) |
 
 `usage.completion_tokens_details.reasoning_tokens` counts the reply's tokens through its `</think>`.
 `--default-reasoning-effort` and `--default-thinking-budget` set the defaults for requests that name none (`./gr8 knobs DEFAULT_`).

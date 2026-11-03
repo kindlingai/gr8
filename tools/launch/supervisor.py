@@ -193,7 +193,7 @@ def resolve_model(o, refresh=False, log=log):
             o.values['V2_WIDTHS'] = variant.path
         if o.get('GRAMMAR') == '1' and not o.get('GRAMMAR_DIR'):
             o.values['GRAMMAR_DIR'] = ms.tokenizer
-        if o.get('GRAMMAR') != '1' or models.of(o) is not models.GLM53:   # Flash serves outside the S2 dispatch
+        if o.get('GRAMMAR') != '1' or models.of(o) not in (models.GLM53, models.GLM53F):   # g6m4_ds41 takes no grammars
             o.values['GRAMMAR_DIR'] = None
         steering_hf.bind(o, release)
         steering_local.prepare(o, ms)

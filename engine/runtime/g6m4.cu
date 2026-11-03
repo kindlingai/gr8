@@ -635,9 +635,6 @@ int main(int argc, char** argv)
     if (!grammar_dir.empty())
     {
         if (!s2mode) die("--grammar-dir needs --serve");
-#if G6_MODEL_FLASH
-        die("--grammar-dir: request grammars are GLM-5.3 only for now (Flash serves outside the S2 dispatch)");
-#endif
 #if !G6_GRAMMAR
         // GRAMMAR defaults to 1, so a build without XGrammar serves without grammars: its hello leaves out
         // `grammar`, and the front end sends none
