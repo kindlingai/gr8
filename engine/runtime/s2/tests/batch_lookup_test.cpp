@@ -110,6 +110,12 @@ int main()
     const auto ab = [](int p) { return p % 3 == 0 ? 3000 : p % 3 == 1 ? 3001 : 4000 + p; };
     const Run a0 = run(ab, nullptr, nullptr, 3), a1 = run(ab, &lk, nullptr, 3);
     CHECK(a1.got == a0.got && a1.st.lookup_rounds == 0);
+    // a strong drafter (6 of 7 right) against a lookup that is always right: the lookup's estimate starts below the
+    // drafter's, learns from the rounds the drafter verifies, and then takes the rounds
+    {
+        const Run d6 = run(cyc, nullptr, nullptr, 6), l6 = run(cyc, &lk, nullptr, 6);
+        CHECK(l6.got == d6.got && l6.st.lookup_rounds > l6.st.rounds / 2 && l6.st.rounds < d6.st.rounds);
+    }
     // the drafter right on all 7: the lookup's 7 can only tie it, so the drafter keeps the rounds it wins on cost
     const Run d7 = run(cyc, &lk, nullptr, 7);
     CHECK(d7.got == base.got);

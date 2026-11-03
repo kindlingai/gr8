@@ -7,7 +7,8 @@
 // lookup can change speed only, never output.
 //
 // A proposed token is taken as right with chance p(b) given its prefix was, b the bucket of the match length. p(b) is
-// the bucket's rate over the request's lookup rounds, starting from seed[b] weighted as `prior` positions.
+// the bucket's rate over the chains of the request's rounds (verified or only scored), starting from seed[b] weighted as
+// `prior` positions.
 #pragma once
 #include <algorithm>
 #include <cstdint>
@@ -59,7 +60,7 @@ struct CtxLookup
         *mlen = bl;
         return m;
     }
-    // a lookup round with match length mlen verified `offered` tokens and accepted the first `accepted`
+    // a chain with match length mlen had `offered` positions checked, of which the first `accepted` were right
     void observe(int mlen, int offered, int accepted)
     {
         const int b = bucket(mlen);

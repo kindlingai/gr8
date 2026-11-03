@@ -55,8 +55,9 @@
 // Every input is the same on every rank.
 // Context lookup (Batch::lookup, GR8_LOOKUP): the same place and choice, with the chain taken from the session's own
 // tokens (ctx_lookup.h): what followed the longest earlier match of the last tokens. Its per-token chance is learned
-// over the request's lookup rounds by match length. When the table is also on, the source promising more tokens per
-// verify ms proposes.
+// over the request's rounds by match length: a round that verifies another source's drafts still scores the lookup's
+// chain against the tokens the verify produced. When the table is also on, the source promising more tokens per verify
+// ms proposes.
 // Within a step the sessions are in ascending index and each session's rows are contiguous, in position order.
 // No CUDA types: the engine adapter (m4sim / g6m4) turns a Step into its StepIn and per-session layout.
 #pragma once
@@ -839,11 +840,11 @@ private:
         double ne = 0, de = 0;
         int nk = ng_.t ? ngram_pick(x, base, m, k, pe, nd, &ne, &de) : 0;
         int ml = 0;                       // the lookup's match length when the chain is the lookup's
+        int ld[DFL_B], ln = 0, lml = 0;   // the lookup's whole chain ld[1..ln] and match length, scored after the verify
         if (lk_.on)
         {
-            int ld[DFL_B], lml = 0;
             double le = 0, lde = 0;
-            const int lk = lookup_pick(x, base, m, k, ld, &le, &lde, &lml);
+            const int lk = lookup_pick(x, base, m, k, ld, &ln, &le, &lde, &lml);
             if (lk && (!nk || le / dsl_.verify_ms(lk + 1) > ne / dsl_.verify_ms(nk + 1)))
             {
                 std::copy(ld + 1, ld + lk + 1, nd + 1);
@@ -869,6 +870,13 @@ private:
         if (!nk && !m && dsl_.on) dsl_.observe(k, a, x.dl, pe);
         if (!nk && sel_.on) score(x, k, a, t.data(), pe);
         if (!nk && chains()) (m ? ngm_ : ngd_).observe(k, a, ng_lp(x, m), 0);
+        if (ln && !ml)
+        {   // another source's round: the lookup's chain against the a + 1 tokens the verify produced, so its estimate
+            // learns while it is not chosen. When all a + 1 match, the rest is unknown and only those positions count
+            int b = 0;
+            while (b < ln && b < a + 1 && ld[b + 1] == t[b]) ++b;
+            x.lk.observe(lml, b == a + 1 || b == ln ? b : b + 1, b);
+        }
         if (ml)
         {
             ngram_score(x, m, kd, a, t.data(), de);
@@ -1012,12 +1020,13 @@ private:
         const int n = ng_.t->chain(x.tokens.data(), base + 1, ng_.kmax, nd, c);
         return chain_cut(x, m, k, c, n, ng_.kmin, ng_.margin, ne, de);
     }
-    // GR8_LOOKUP: the context lookup's chain after tokens[0..base], as ngram_pick; *ml = its match length
-    int lookup_pick(St& x, int base, bool m, int k, int* nd, double* ne, double* de, int* ml)
+    // GR8_LOOKUP: the context lookup's chain after tokens[0..base], as ngram_pick; *n = the whole chain's length (nd[1..n]),
+    // *ml = its match length
+    int lookup_pick(St& x, int base, bool m, int k, int* nd, int* n, double* ne, double* de, int* ml)
     {
         double c[DFL_B];
-        const int n = x.lk.chain(x.tokens.data(), base + 1, lk_.kmax, nd, c, ml);
-        return chain_cut(x, m, k, c, n, lk_.kmin, lk_.margin, ne, de);
+        *n = x.lk.chain(x.tokens.data(), base + 1, lk_.kmax, nd, c, ml);
+        return chain_cut(x, m, k, c, *n, lk_.kmin, lk_.margin, ne, de);
     }
     // a chain with per-token chances c[1..n]: the prefix (at least kmin) with the most expected tokens per verify ms, when
     // that beats the drafter's k drafts by margin; else 0. *ne, *de: the expected tokens of the prefix and of the drafts
