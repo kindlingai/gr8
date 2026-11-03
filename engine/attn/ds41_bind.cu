@@ -28,6 +28,7 @@ static inline IcaMap ica_of(void* ica, const int* pages, int rpp) { return ica_m
 extern "C"
 {
 size_t ds41_idx_scratch_bytes(int Rcap, int max_rows) { return Scratch::bytes(Rcap, max_rows); }
+size_t ds41_idx_scratch_bytes_flat(int Rcap, int max_rows) { return Scratch::bytes(Rcap, max_rows, 0); }
 int ds41_idx_pipe_qr_prepare()
 {
     int dev = -1, limit = 0;
@@ -102,19 +103,19 @@ static inline IndexIn in_of(const Ds41IdxStage* s)
 }
 void ds41_idx_topk(const Ds41IdxStage* s, void* stream)
 {
-    const Scratch sc = Scratch::carve(s->scratch, s->Rcap, s->max_rows);
+    const Scratch sc = Scratch::carve(s->scratch, s->Rcap, s->max_rows, s->R, s->flat ? 0 : IDX_TILE);
     const IndexIn in = in_of(s);
     if (s->use_cand) stage_index_cand(in, sc, sc.cand, s->out, s->ldo, S_(stream));
-    else stage_index_dense(in, sc, s->out, s->ldo, S_(stream));
+    else stage_index_dense(in, sc, s->out, s->ldo, S_(stream), s->cand_src != 0);
 }
 void ds41_idx_cand_blocks(const Ds41IdxStage* s, void* stream)
 {
-    const Scratch sc = Scratch::carve(s->scratch, s->Rcap, s->max_rows);
-    stage_cand_blocks(in_of(s), sc, S_(stream));
+    const Scratch sc = Scratch::carve(s->scratch, s->Rcap, s->max_rows, s->R, s->flat ? 0 : IDX_TILE);
+    stage_cand_blocks(in_of(s), sc, S_(stream), s->cand_src != 0);
 }
 // the candidate block list [Rcap][CAND_BLOCKS] int32 inside a scratch carved for (Rcap, max_rows): where ds41_idx_cand_blocks leaves it
 void* ds41_idx_cand_list(void* scratch, int Rcap, int max_rows)
 {
-    return Scratch::carve(scratch, Rcap, max_rows).cand;
+    return Scratch::carve(scratch, Rcap, max_rows, Rcap).cand;   // the fixed part: the same address for every R
 }
 }
