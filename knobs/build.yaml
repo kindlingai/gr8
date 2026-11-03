@@ -30,6 +30,7 @@ knobs:
     doc: >-
       1 builds the DS41 engine (MODEL=ds41 scripts/build.sh) with the mHC trunk stored as BF16 (-DDS_MHC_TRUNK_BF16).
       The trunk only holds BF16-valued numbers, so no result changes; it halves the trunk's DRAM traffic and memory.
+      Unset, empty or 0 = the FP32 trunk. Read at build time only: setting it when the engine starts changes nothing.
   GR8_TESTS:
     kind: text
     default: "1"

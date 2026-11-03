@@ -3,7 +3,7 @@
 #   GR8_DS_TRUNK_BF16=1   -DDS_MHC_TRUNK_BF16: the mHC trunk (Model::resid4, ds_mhc::Buffers::streams) is stored as BF16, not FP32.
 #                         The trunk only holds BF16-valued numbers, so no bit of any result changes (engine/mhc/ds_mhc.cuh); it halves
 #                         the trunk's DRAM traffic in the prefill mHC kernels and the trunk's memory.
-# Unset or 0 prints nothing (the FP32 trunk). Any other value: a message on stderr, exit 2.
+# Unset, empty or 0 prints nothing (the FP32 trunk). Any other value: a message on stderr, exit 2.
 set -eu
 case "${GR8_DS_TRUNK_BF16:-0}" in
   0) ;;
