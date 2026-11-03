@@ -395,7 +395,7 @@ static int run_test() {
             if (const auto* e = rc.find(g)) sum += e->bytes;
         EXPECT(rc.used_bytes() == sum && rc.used_bytes() <= rc.budget_bytes());
 
-        // The dedup K path still works with a replace gen: a 0-token reply (request end = prompt end + 1) folds into the
+        // The dedup K path still works with a replace gen: a 1-token reply (request end = prompt end + 1) folds into the
         // prompt-end entry itself, which stays (it is the one entry of that chat).
         g6s2::Ds41PrefixCache dc(main_m, &dsp, /*budget_mib=*/64);
         const uint64_t d_pe = dc.capture(0, 100, prompt_a, ns_a, st);

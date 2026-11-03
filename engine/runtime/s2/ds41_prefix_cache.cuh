@@ -179,9 +179,9 @@ public:
             }
         }
         // A same-namespace prefix within K tokens is reused instead of copying essentially the same GPU state twice
-        // (a request-end snapshot sits 1 + the reply length after its prompt-end one, so this folds only a 0-token reply;
-        // `replace` above handles the rest). K=1 by default; a larger value also skips short-turn snapshots. K=0 keeps every
-        // snapshot. Return 0 when no new generation was captured.
+        // (a request-end snapshot sits at most the reply length after its prompt-end one, so this folds only a reply of at
+        // most K tokens; `replace` above handles the rest). K=1 by default; a larger value also skips short-turn snapshots.
+        // K=0 with GR8_DS_CACHE_REPLACE=0 keeps every snapshot. Return 0 when no new generation was captured.
         if (const int K = dedup_k()) {
             for (size_t i = 0; i < entries_.size(); ++i) {
                 const auto& e = entries_[i];
