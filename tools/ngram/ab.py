@@ -18,11 +18,13 @@ the run, before any generation, when a prompt's ids are in a trace file: a table
 overstate the gain. The ids depend on `--effort`, so give `run` the effort the traces were captured with. A failed
 request is kept as an error row and the run goes on.
 
-`compare` checks that every prompt produced the same ids on both runs (the table drafts only, so any difference is a
-bug), then prints, by workload, decode tok/s (median of the timed prompts, with their count) and decode tokens per
+`compare` checks that every prompt produced the same ids on both runs (the table drafts only), then prints, by workload, decode tok/s (median of the timed prompts, with their count) and decode tokens per
 verify step on each side. It exits 1 on any output difference, any error row, or runs made with different settings,
 prompt files or models. It cannot see whether the table served: check rank 0's `# s2 ngram slot` lines on the `on`
-boot for nonzero table rounds (the table only serves a request decoding alone with DFlash2).
+boot for nonzero table rounds (the table only serves a request decoding alone with DFlash2). Under --spec-adaptive the
+planner's verify-width estimates learn across requests, and the verify's tokens are not bit-identical across widths:
+once one request's drafting differs, a later request's widths differ too, and a near-tie can flip. An id difference
+then means a bug only for a prompt that is the first request of its boot on both sides.
 """
 import argparse
 import hashlib
