@@ -288,6 +288,9 @@ GR8_GLM53F_PF_STAGE_ASYNC=$stage GR8_GLM53F_PF_SP=$sp GR8_GLM53F_PF_SP_X16=$sp"
     ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_CACHE=$FLASH_CACHE"
     [ -n "${FLASH_STATE_BUDGET_MIB:-}" ] && ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_STATE_BUDGET_MIB=$FLASH_STATE_BUDGET_MIB"
   fi
+  # with DFLASH=1, a checkpoint hit inside the drafter's window keeps the drafter (DFL_REUSE, on with FLASH_CACHE; the
+  # engine's default) after DFL_REUSE_MIN warm-up rows (docs/FLASH.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${DFL_REUSE:+ GR8_DFL_REUSE=$DFL_REUSE}${DFL_REUSE_MIN:+ GR8_DFL_REUSE_MIN=$DFL_REUSE_MIN}"
   # its KV_STORE on a group lease: when it gives segments to other groups (KV_SHARE_WHEN; docs/SETTINGS.md)
   ENGINE_ENV="$ENGINE_ENV${KV_SHARE_WHEN:+ GR8_KV_SHARE_WHEN=$KV_SHARE_WHEN}"
   # GR8_PF_STRIPE at the engine default at TP=3 and TP=4 (on: large prefill writes use both rails, or at TP=3 the devices

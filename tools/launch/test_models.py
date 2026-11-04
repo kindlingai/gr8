@@ -124,6 +124,21 @@ class OptionTests(unittest.TestCase):
         self.assertIn('--dflash-manifest @DFLASH_DIR/dflash.r@R.manifest.json --dflash-pack @DFLASH_DIR/dflash.r@R.pack', a)
         self.assertIn('--spec-adaptive', a)
 
+    def test_flash_cache_with_the_drafter(self):
+        # FLASH_CACHE and DFLASH=1 together (#340): both reach the engine; DFL_REUSE (0 or 1 on glm53f) and
+        # DFL_REUSE_MIN pass through when set, else the engine's default (1 with the cache) holds
+        plan = opt.engine_plan(flash('--dflash', '1', '--dflash-dir', '/d', '--flash-cache', 'aligned'))
+        self.assertIn('GR8_GLM53F_CACHE=aligned', plan['env'])
+        self.assertIn('--dflash-manifest', ' '.join(plan['args']))
+        self.assertFalse([e for e in plan['env'] if e.startswith('GR8_DFL_REUSE')])
+        plan = opt.engine_plan(flash('--dflash', '1', '--dflash-dir', '/d', '--flash-cache', 'aligned',
+                                     '--dfl-reuse', '0', '--dfl-reuse-min', '64'))
+        self.assertIn('GR8_DFL_REUSE=0', plan['env'])
+        self.assertIn('GR8_DFL_REUSE_MIN=64', plan['env'])
+        with self.assertRaises(opt.OptionError) as e:
+            flash('--flash-cache', 'aligned', '--dfl-reuse', '2')
+        self.assertIn('glm53f takes 0 or 1', str(e.exception))
+
     def test_sessions(self):
         # SESS 2..8 share decode steps (each session its own KDA slots); a round of every session fits 32 rows
         for argv, sess in ((['--sess', '4'], '4'), (['--sess', '8'], '8'), (['--sess', '8', '--mtp', '3'], '8'),
