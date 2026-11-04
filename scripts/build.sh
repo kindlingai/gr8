@@ -16,8 +16,9 @@
 #   MODEL=ds41 scripts/build.sh bin       only OUT_DIR/g6m4_ds41 and OUT_DIR/m4sim_ds41: DeepSeek-V4.1-Flash-1017
 #                                         (-DG6_MODEL_DS41=1, engine/model_geom_ds41.h, docs/DEEPSEEK.md), fp8 KV only; TP = 4
 #                                         unless GR8_WIDTHS or GR8_NR says otherwise
-#   GR8_DS_TRUNK_BF16=1 MODEL=ds41      the DS41 engine with the BF16 mHC trunk (-DDS_MHC_TRUNK_BF16, the same bits, half the
-#                                         trunk traffic and memory; scripts/ds41_build_flags.sh). Unset or 0: the FP32 trunk
+#   GR8_DS_TRUNK_BF16=0 MODEL=ds41      the DS41 engine with the FP32 mHC trunk. Unset or 1 (the default): the BF16 trunk
+#                                         (-DDS_MHC_TRUNK_BF16, the same bits, half the trunk traffic and memory;
+#                                         scripts/ds41_build_flags.sh)
 #   GR8_TESTS=0 / GR8_TESTS=only        the GLM engine without the test binaries below it, or the tests alone (CI
 #                                         builds them on separate runners)
 #   BUNDLE_LIBS=1                         also copy cuBLAS (libcublas, libcublasLt) into OUT_DIR/lib, for nodes
