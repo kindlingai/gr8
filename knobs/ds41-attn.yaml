@@ -60,6 +60,15 @@ knobs:
     doc: >-
       Grid order of the tensor-core GEMM: 0 = the N tile is the fastest grid dimension, 1 = the M tile is, 2 = the M
       tile only for a weight of 100 MiB or more (the Engram wkv).
+  GR8_DS_ATTN_TC_TILE:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0|1"
+    doc: >-
+      The 128 x 128 tile of the tensor-core GEMM (GR8_DS_ATTN_TC=1, 128 rows or more). 0 = a 2-deep ring of 144-byte
+      rows. 1 = a 3-deep ring of swizzled 128-byte rows (99 KB of shared memory a block; falls back to 0 where the
+      device has less). Only shared-memory addresses change, so every value gives the same output bits.
   GR8_DS_C2_TRACE:
     scope: local
     kind: flag

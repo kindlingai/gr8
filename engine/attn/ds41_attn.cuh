@@ -332,6 +332,105 @@ template <int BM, int BN, int ST> __global__ void __launch_bounds__(256) k_gemm_
         }
 }
 
+// GR8_DS_ATTN_TC_TILE=1: k_gemm_mx8t with 128-B smem rows and a 16-B chunk xor swizzle (chunk q of row r sits at chunk q ^ (r & 7)) in place of
+// the 144-B padded rows, so a 128 x 128 tile fits a 3-deep ring in 99 KB (3 x 33792 B; the padded rows need 3 x 37888 B). Only the smem
+// addresses change: the same cp.async sources, the same fragments, the same mma sequence in the same K order, so Y is k_gemm_mx8t's bit for bit
+// (tests/ds41_gemm_tc_bench.cu compares them). Reads stay conflict-free: the 8 rows g of a fragment read chunk q ^ g, 8 distinct bank quads.
+template <int BM, int BN, int ST> struct TcCfgSw
+{
+    static constexpr int WM = BM / 2, WN = BN / 4, MB = WM / 16, NT = WN / 8, PITCH = 128;
+    static constexpr int A_B = BM * PITCH, W_B = BN * PITCH, SA_B = BM * 4, SW_B = BN * 4, STAGE = A_B + W_B + SA_B + SW_B;
+    static constexpr size_t SMEM = (size_t)STAGE * ST;
+};
+__device__ __forceinline__ int tc_swz(int r, int q) { return r * 128 + ((q ^ (r & 7)) << 4); }
+template <int BM, int BN, int ST> __global__ void __launch_bounds__(256) k_gemm_mx8t_sw(GemmP p)
+{
+    using C = TcCfgSw<BM, BN, ST>;
+    extern __shared__ __align__(16) uint8_t tsm[];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, wm = warp >> 2, wn = warp & 3, g = lane >> 2, t = lane & 3;
+    const uint8_t* A = p.A + blockIdx.z * p.a_gs;
+    const uint8_t* SA = p.SA + blockIdx.z * p.sa_gs;
+    const uint8_t* W = p.W + blockIdx.z * p.w_gs;
+    const uint8_t* SW = p.SW + blockIdx.z * p.sw_gs;
+    const int m0 = (p.mfast ? blockIdx.x : blockIdx.y) * BM, n0 = (p.mfast ? blockIdx.y : blockIdx.x) * BN, NK = p.K >> 7, KB = p.K >> 5;
+    auto issue = [&](int s, int kt)
+    {
+        uint8_t* b = tsm + (size_t)s * C::STAGE;
+        for (int c = tid; c < BM * 8; c += 256)
+            tc_cp16(b + tc_swz(c >> 3, c & 7), A + (size_t)min(m0 + (c >> 3), p.M - 1) * p.lda + kt * 128 + (c & 7) * 16);
+        for (int c = tid; c < BN * 8; c += 256)
+            tc_cp16(b + C::A_B + tc_swz(c >> 3, c & 7), W + (size_t)(n0 + (c >> 3)) * p.K + kt * 128 + (c & 7) * 16);
+        for (int c = tid; c < BM; c += 256) tc_cp4(b + C::A_B + C::W_B + c * 4, SA + (size_t)min(m0 + c, p.M - 1) * p.lsa + kt * 4);
+        for (int c = tid; c < BN; c += 256) tc_cp4(b + C::A_B + C::W_B + C::SA_B + c * 4, SW + (size_t)(n0 + c) * KB + kt * 4);
+    };
+    float acc[C::MB][C::NT][4];
+#pragma unroll
+    for (int i = 0; i < C::MB; i++)
+#pragma unroll
+        for (int j = 0; j < C::NT; j++)
+#pragma unroll
+            for (int k = 0; k < 4; k++) acc[i][j][k] = 0.0f;
+#pragma unroll
+    for (int s = 0; s < ST - 1; s++)
+    {
+        if (s < NK) issue(s, s);
+        tc_commit();
+    }
+    for (int kt = 0; kt < NK; kt++)
+    {
+        tc_wait<ST - 2>();
+        __syncthreads();
+        if (kt + ST - 1 < NK) issue((kt + ST - 1) % ST, kt + ST - 1);
+        tc_commit();
+        const uint8_t* b = tsm + (size_t)(kt % ST) * C::STAGE;
+        const uint8_t* sA = b;
+        const uint8_t* sW = b + C::A_B;
+        const uint8_t* sSA = sW + C::W_B;
+        const uint8_t* sSW = sSA + C::SA_B;
+        uint32_t wsa[C::MB], wsw[C::NT];
+#pragma unroll
+        for (int mb = 0; mb < C::MB; mb++) wsa[mb] = *(const uint32_t*)(sSA + (wm * C::WM + mb * 16 + g + ((lane & 1) ? 8 : 0)) * 4);
+#pragma unroll
+        for (int nt = 0; nt < C::NT; nt++) wsw[nt] = *(const uint32_t*)(sSW + (wn * C::WN + nt * 8 + g) * 4);
+#pragma unroll
+        for (int ks = 0; ks < 4; ks++)
+        {
+            uint32_t a[C::MB][4], bb[C::NT][2];
+#pragma unroll
+            for (int mb = 0; mb < C::MB; mb++)
+            {
+                const int r = wm * C::WM + mb * 16 + g;   // r and r + 8 share r & 7
+                a[mb][0] = *(const uint32_t*)(sA + tc_swz(r, 2 * ks) + 4 * t);
+                a[mb][1] = *(const uint32_t*)(sA + tc_swz(r + 8, 2 * ks) + 4 * t);
+                a[mb][2] = *(const uint32_t*)(sA + tc_swz(r, 2 * ks + 1) + 4 * t);
+                a[mb][3] = *(const uint32_t*)(sA + tc_swz(r + 8, 2 * ks + 1) + 4 * t);
+            }
+#pragma unroll
+            for (int nt = 0; nt < C::NT; nt++)
+            {
+                const int r = wn * C::WN + nt * 8 + g;
+                bb[nt][0] = *(const uint32_t*)(sW + tc_swz(r, 2 * ks) + 4 * t);
+                bb[nt][1] = *(const uint32_t*)(sW + tc_swz(r, 2 * ks + 1) + 4 * t);
+            }
+#pragma unroll
+            for (int mb = 0; mb < C::MB; mb++)
+#pragma unroll
+                for (int nt = 0; nt < C::NT; nt++) tc_mma(acc[mb][nt], a[mb], bb[nt][0], bb[nt][1], (wsa[mb] >> (8 * ks)) & 0xFFu, (wsw[nt] >> (8 * ks)) & 0xFFu);
+        }
+    }
+    tc_wait<0>();
+    bf16* Y = p.Y + blockIdx.z * p.y_gs;
+#pragma unroll
+    for (int mb = 0; mb < C::MB; mb++)
+#pragma unroll
+        for (int nt = 0; nt < C::NT; nt++)
+        {
+            const int col = n0 + wn * C::WN + nt * 8 + 2 * t, row = m0 + wm * C::WM + mb * 16 + g;
+            if (row < p.M) *(__nv_bfloat162*)(Y + (size_t)row * p.ldy + col) = __floats2bfloat162_rn(acc[mb][nt][0], acc[mb][nt][1]);
+            if (row + 8 < p.M) *(__nv_bfloat162*)(Y + (size_t)(row + 8) * p.ldy + col) = __floats2bfloat162_rn(acc[mb][nt][2], acc[mb][nt][3]);
+        }
+}
+
 // Compressor FP8 arm: same block-scaled E4M3/UE8M0 MMA and K order as k_gemm_mx8t, but preserves the compressor's FP32 output contract.
 template <int BM, int BN, int ST> __global__ void __launch_bounds__(256) k_gemm_mx8t_f32(GemmP p, float* Y32)
 {
@@ -1501,6 +1600,19 @@ inline int g_tc_mfast = 0;   // launch order (GR8_DS_ATTN_TC_MF, default 0 = N t
 constexpr size_t TC_MF_AUTO_BYTES = (size_t)100 << 20;   // fp8 weight bytes N * K * groups; between the largest attention weight (10.5 MB) and the Engram wkv (157 MB), clear of the 78.6 MB DSpark main_proj that nobody has timed at M > 128
 inline bool tc_mfast_pick(int mode, int N, int K, int groups, unsigned mt) { return mode == 1 || (mode == 2 && mt >= 2 && (size_t)N * K * groups >= TC_MF_AUTO_BYTES); }
 inline bool tc_ok(const GemmP& p) { return p.K % 128 == 0 && p.N % 64 == 0 && p.lda % 16 == 0 && p.lsa % 4 == 0 && p.M >= 1; }
+inline int g_tc_tile = 0;   // GR8_DS_ATTN_TC_TILE (default 0): 1 = launch_gemm_tc's 128 x 128 tile runs as k_gemm_mx8t_sw <128,128,3> (swizzled 128-B rows, a 3-deep ring)
+                            // in place of k_gemm_mx8t <128,128,2>. The same Y bits (same mma, same K order per output; tests/ds41_gemm_tc_bench.cu). Falls back to 0 when
+                            // the device cannot give a block 3 x 33792 B of smem.
+template <int BM, int BN, int ST> inline bool launch_tc_sw(const GemmP& p, int groups, cudaStream_t st)
+{
+    static const bool ok = cudaFuncSetAttribute(k_gemm_mx8t_sw<BM, BN, ST>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TcCfgSw<BM, BN, ST>::SMEM) == cudaSuccess;
+    if (!ok) { (void)cudaGetLastError(); return false; }
+    GemmP q = p;
+    const unsigned nt = p.N / BN, mt = (p.M + BM - 1) / BM;
+    q.mfast = tc_mfast_pick(g_tc_mfast, p.N, p.K, groups, mt) ? 1 : 0;
+    k_gemm_mx8t_sw<BM, BN, ST><<<q.mfast ? dim3(mt, nt, groups) : dim3(nt, mt, groups), 256, TcCfgSw<BM, BN, ST>::SMEM, st>>>(q);
+    return true;
+}
 template <int BM, int BN, int ST> inline void launch_tc_t(const GemmP& p, int groups, cudaStream_t st)
 {
     static bool init = false;
@@ -1520,7 +1632,11 @@ inline void launch_gemm_tc(const GemmP& p, int groups, cudaStream_t st)
     const int BM = p.M >= 128 ? 128 : (p.M >= 64 ? 64 : 32);
     const long ctas128 = (long)(p.N / 128) * ((p.M + BM - 1) / BM) * groups;
     const bool wide = p.N % 128 == 0 && ctas128 >= 96;
-    if (BM == 128) { if (wide) launch_tc_t<128, 128, 2>(p, groups, st); else launch_tc_t<128, 64, 3>(p, groups, st); }
+    if (BM == 128)
+    {
+        if (!wide) launch_tc_t<128, 64, 3>(p, groups, st);
+        else if (!(g_tc_tile == 1 && launch_tc_sw<128, 128, 3>(p, groups, st))) launch_tc_t<128, 128, 2>(p, groups, st);
+    }
     else if (BM == 64) { if (wide) launch_tc_t<64, 128, 3>(p, groups, st); else launch_tc_t<64, 64, 3>(p, groups, st); }
     else launch_tc_t<32, 64, 3>(p, groups, st);
 }
