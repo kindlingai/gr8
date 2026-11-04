@@ -206,7 +206,12 @@ inline bool moe_tc_on() { return knob::ds_moe_tc(); }
 constexpr int MOE_TC_OS2_MAX = 40;
 inline int moe_tc_os2()
 {
-    static const int v = [] { const int k = (int)knob::ds_moe_tc_os2(); return k >= 1 && k <= MOE_TC_OS2_MAX ? k : DS41_TC_OS2; }();
+    static const int v = []
+    {
+        const int k = (int)knob::ds_moe_tc_os2(), n = k >= 1 && k <= MOE_TC_OS2_MAX ? k : DS41_TC_OS2;
+        if (k != 0) fprintf(stderr, "# DS41 GR8_DS_MOE_TC_OS2=%d: fc2 output slices %d\n", k, n);   // first use, a line a rank (nothing when 0)
+        return n;
+    }();
     return v;
 }
 // The top-k cut GR8_DS_MOE_TOPK (quality not measured): routed experts kept per token on the main layers (384 experts). Default dsr::TOPK.

@@ -1605,8 +1605,18 @@ inline int g_tc_tile = 0;   // GR8_DS_ATTN_TC_TILE (default 0): 1 = launch_gemm_
                             // the device cannot give a block 3 x 33792 B of smem.
 template <int BM, int BN, int ST> inline bool launch_tc_sw(const GemmP& p, int groups, cudaStream_t st)
 {
-    static const bool ok = cudaFuncSetAttribute(k_gemm_mx8t_sw<BM, BN, ST>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TcCfgSw<BM, BN, ST>::SMEM) == cudaSuccess;
-    if (!ok) { (void)cudaGetLastError(); return false; }
+    static const bool ok = []
+    {   // first use, host only (no sync): one line a rank so a boot check can see the tile ran or fell back
+        const cudaError_t e = cudaFuncSetAttribute(k_gemm_mx8t_sw<BM, BN, ST>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TcCfgSw<BM, BN, ST>::SMEM);
+        if (e == cudaSuccess) fprintf(stderr, "# DS41 GR8_DS_ATTN_TC_TILE=1: 3-stage swizzled tile active\n");
+        else
+        {
+            (void)cudaGetLastError();
+            fprintf(stderr, "# DS41 GR8_DS_ATTN_TC_TILE=1: FELL BACK to tile 0 (cudaFuncSetAttribute %zu B smem: rc %d %s)\n", TcCfgSw<BM, BN, ST>::SMEM, (int)e, cudaGetErrorString(e));
+        }
+        return e == cudaSuccess;
+    }();
+    if (!ok) return false;
     GemmP q = p;
     const unsigned nt = p.N / BN, mt = (p.M + BM - 1) / BM;
     q.mfast = tc_mfast_pick(g_tc_mfast, p.N, p.K, groups, mt) ? 1 : 0;
