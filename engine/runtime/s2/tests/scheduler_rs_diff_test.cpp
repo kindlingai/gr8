@@ -5,11 +5,13 @@
 #include "../flash_ring.h"
 #include "../cp_rows.h"
 #include "../scheduler.h"
+#include "../kv_share.h"
 #include "ref/kv_plan_ref.h"
 #include "ref/flash_lend_ref.h"
 #include "ref/flash_ring_ref.h"
 #include "ref/cp_rows_ref.h"
 #include "ref/scheduler_ref.h"
+#include "ref/kv_share_ref.h"
 #include <cstdio>
 #include <random>
 #include <string>
@@ -282,6 +284,79 @@ static void scheduler_diff(std::mt19937_64& rng)
     }
 }
 
+
+// share_want over random counter pairs, and both admission queues through one random stream
+static void share_queue_diff(std::mt19937_64& rng)
+{
+    auto U = [&](int lo, int hi) { return int(std::uniform_int_distribution<int>(lo, hi)(rng)); };
+    auto W = [&] { return U(0, 9) ? uint64_t(U(0, 200)) : U(0, 1) ? UINT64_MAX - uint64_t(U(0, 3)) : uint64_t(rng()); };
+    for (int t = 0; t < 200000; ++t)
+    {
+        g6kv_tier_totals a{}, b{};
+        for (auto* x : {&a, &b})
+        {
+            x->slots = W(); x->free_slots = W(); x->entries = uint32_t(U(0, 9) ? U(0, 20) : int(rng() & 0x7fffffff));
+            x->spilled_pages = W(); x->dropped_pages = W(); x->moved_out_pages = W(); x->full = W();
+            x->oversize = W(); x->oversize_last = W();
+        }
+        if (U(0, 1)) b = a, b.full += uint64_t(U(0, 1)), b.spilled_pages += uint64_t(U(0, 1)), b.oversize += uint64_t(U(0, 1));
+        const uint64_t per = U(0, 9) ? uint64_t(U(0, 16)) : W();
+        const bool busy = U(0, 1);
+        CHECK(g6s2::share_want(a, b, per, busy) == g6s2ref::share_want(a, b, per, busy));
+    }
+    using namespace g6s2;
+    for (int t = 0; t < 400; ++t)
+    {
+        Config c;
+        c.pool_rows = PAGE * uint32_t(U(1, 64));
+        c.mtp = uint32_t(U(1, 3));
+        AdmissionQueue a(c);
+        g6s2ref::AdmissionQueue r(c);
+        uint64_t id = 0, rev = 0;
+        for (int k = 0; k < 400; ++k)
+        {
+            const int op = U(0, 5);
+            std::string oa, orf;
+            if (op <= 1)
+            {
+                Request q;
+                q.id = U(0, 15) ? (id += uint64_t(U(1, 3))) : id - uint64_t(U(0, 1));
+                q.prompt_tokens = uint32_t(U(0, 30) ? U(1, 3000) : 0);
+                q.max_tokens = uint32_t(U(0, 30) ? U(1, 900) : 0);
+                oa = outcome([&] { a.push(q); return std::string(); });
+                orf = outcome([&] { r.push(q); return std::string(); });
+            }
+            else if (op == 2)
+            {
+                const uint64_t x = uint64_t(U(0, int(id) + 2));
+                oa = std::to_string(a.cancel(x));
+                orf = std::to_string(r.cancel(x));
+            }
+            else if (op == 3)
+            {
+                const uint64_t x = r.front() && U(0, 9) ? r.front()->id : uint64_t(U(0, int(id) + 2));
+                oa = outcome([&] { a.admitted(x); return std::string(); });
+                orf = outcome([&] { r.admitted(x); return std::string(); });
+            }
+            else
+            {
+                if (U(0, 2)) rev += uint64_t(U(0, 1));
+                const bool slot = U(0, 3), fits = U(0, 3);
+                const uint32_t room = uint32_t(U(0, 9) ? U(0, int(c.pool_rows / PAGE)) : U(0, 200));
+                auto st = [](const std::optional<AdmissionStatus>& x) {
+                    return x ? std::to_string(int(x->why)) + "/" + std::to_string(x->requested) + "/" + std::to_string(x->room) : std::string("-");
+                };
+                oa = outcome([&] { return st(a.check(rev, slot, fits, room)); });
+                orf = outcome([&] { return st(r.check(rev, slot, fits, room)); });
+            }
+            CHECK(oa == orf);
+            CHECK(a.size() == r.size() && a.stalls() == r.stalls);
+            CHECK(bool(a.front()) == bool(r.front()) && (!a.front() || (a.front()->id == r.front()->id &&
+                  a.front()->prompt_tokens == r.front()->prompt_tokens && a.front()->max_tokens == r.front()->max_tokens)));
+        }
+    }
+}
+
 int main()
 {
     std::mt19937_64 rng(20261105);
@@ -393,6 +468,7 @@ int main()
         }
     }
     scheduler_diff(rng);
+    share_queue_diff(rng);
     std::printf("scheduler_rs_diff_test: %s (%ld comparisons)\n", fails ? "FAIL" : "PASS", cases);
     return fails ? 1 : 0;
 }

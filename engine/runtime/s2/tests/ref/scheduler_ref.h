@@ -1,4 +1,4 @@
-// The C++ implementation of scheduler.h's Scheduler, its free functions and Config::validate before they moved to
+// The C++ implementation of scheduler.h's Scheduler, AdmissionQueue, its free functions and Config::validate before they moved to
 // engine/scheduler-rs, kept only for the differential test (tests/scheduler_rs_diff_test.cpp). It uses g6s2's types.
 // Namespace g6s2ref. Delete with R2's last step.
 #pragma once
@@ -455,6 +455,40 @@ public:
         }
         for (const auto& x : r) finish_slot(slot(x.key), x);
         completed();
+    }
+};
+using g6s2::AdmissionStatus; using g6s2::Stall;
+// Rank0 ingress FIFO. Page choice stays in the pool (pool.h).
+class AdmissionQueue {
+    Config c_; std::deque<Request> q_;
+    uint64_t last_revision_ = UINT64_MAX, last_head_ = UINT64_MAX, last_id_ = 0;
+    bool have_id_ = false;
+public:
+    uint64_t stalls = 0;
+    explicit AdmissionQueue(Config c) : c_(c) { validate(c_); }
+    void push(Request r) {
+        (void)g6s2ref::reserve_pages(c_, r);
+        require(!have_id_ || r.id > last_id_, "native request ordinals must increase");
+        for (auto x : q_) require(x.id != r.id, "duplicate queued id");
+        q_.push_back(r); last_id_ = r.id; have_id_ = true;
+    }
+    bool cancel(uint64_t id) {
+        auto it = std::find_if(q_.begin(), q_.end(), [&](const Request& r) { return r.id == id; });
+        if (it == q_.end()) return false;
+        q_.erase(it); return true;
+    }
+    const Request* front() const { return q_.empty() ? nullptr : &q_.front(); }
+    size_t size() const { return q_.size(); }
+    void admitted(uint64_t id) { require(!q_.empty() && q_.front().id == id, "FIFO admission violated"); q_.pop_front(); }
+    // fits: the pool can admit the head (RunPool::fits); room: the pages one reservation can take now (RunPool::room)
+    std::optional<AdmissionStatus> check(uint64_t revision, bool slot, bool fits, uint32_t room) {
+        if (q_.empty() || (last_head_ == q_.front().id && last_revision_ == revision)) return {};
+        require(room <= c_.pool_rows/PAGE, "invalid allocator view");
+        last_head_ = q_.front().id; last_revision_ = revision;
+        AdmissionStatus s; s.requested = g6s2ref::grant_pages(c_, q_.front()); s.room = room;
+        s.why = !slot ? Stall::Slots : !fits ? Stall::Capacity : Stall::None;
+        if (s.why != Stall::None) ++stalls;
+        return s;
     }
 };
 } // namespace g6s2ref

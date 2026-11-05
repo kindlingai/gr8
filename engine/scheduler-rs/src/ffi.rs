@@ -257,6 +257,9 @@ fn msg(m: &'static str) -> *const c_char {
         "not this decode round",
         "decode completion order differs",
         "too many output tokens",
+        "duplicate queued id",
+        "FIFO admission violated",
+        "invalid allocator view",
     )
 }
 
@@ -546,6 +549,99 @@ pub extern "C" fn g6sch_abi(what: u32) -> u64 {
         sch::MAX_DECODE_ROUNDS as usize,
         sch::PACK_MAX_MEMBERS,
         sch::QMAX,
+        size_of::<crate::kv_share::Totals>(),
+        size_of::<crate::kv_share::Resize>(),
     ];
     v.get(what as usize).map_or(0, |&x| x as u64)
+}
+
+// ---- kv_share.rs ---------------------------------------------------------------------------------------------------
+
+use crate::kv_share::{self as share, Resize, Totals};
+
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_share_want(last: *const Totals, now: *const Totals, per: u64, busy: bool) -> u64 {
+    share::want(&*last, &*now, per, busy)
+}
+/// true and *out written when the answer is a resize.
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_share_resize(
+    tier: u32,
+    segs: u64,
+    per: u64,
+    grant: u64,
+    give: u64,
+    txn: u64,
+    out: *mut Resize,
+) -> bool {
+    match share::resize(tier, segs, per, grant, give, txn) {
+        Some(r) => {
+            *out = r;
+            true
+        }
+        None => false,
+    }
+}
+
+// ---- admission.rs: the queue is Rust-owned, behind an opaque pointer ---------------------------------------------
+
+use crate::admission::{Queue, Status};
+
+/// A new empty queue for the (validated) config; free it with g6sch_queue_free.
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_new(c: *const Config) -> *mut Queue {
+    Box::into_raw(Box::new(Queue::new(*c)))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_free(q: *mut Queue) {
+    if !q.is_null() {
+        drop(Box::from_raw(q));
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_push(q: *mut Queue, r: *const Request) -> *const c_char {
+    err((*q).push(*r))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_cancel(q: *mut Queue, id: u64) -> bool {
+    (*q).cancel(id)
+}
+/// The front request, or null when the queue is empty; valid until the next call that changes the queue.
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_front(q: *const Queue) -> *const Request {
+    (*q).front().map_or(std::ptr::null(), |r| r as *const Request)
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_size(q: *const Queue) -> usize {
+    (*q).len()
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_stalls(q: *const Queue) -> u64 {
+    (*q).stalls
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_admitted(q: *mut Queue, id: u64) -> *const c_char {
+    err((*q).admitted(id))
+}
+/// *has: whether *out holds a status.
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_check(
+    q: *mut Queue,
+    revision: u64,
+    slot: bool,
+    fits: bool,
+    room: u32,
+    has: *mut bool,
+    out: *mut Status,
+) -> *const c_char {
+    match (*q).check(revision, slot, fits, room) {
+        Ok(s) => {
+            *has = s.is_some();
+            if let Some(s) = s {
+                *out = s;
+            }
+            std::ptr::null()
+        }
+        Err(m) => msg(m),
+    }
 }

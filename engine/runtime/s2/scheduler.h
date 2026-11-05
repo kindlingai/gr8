@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -444,37 +445,29 @@ public:
 
 enum class Stall { None, Slots, Capacity };
 struct AdmissionStatus { Stall why = Stall::None; uint32_t requested = 0, room = 0; };
-// Rank0 ingress FIFO. Page choice stays in the pool (pool.h).
+// Rank0 ingress FIFO, a Rust-owned queue (engine/scheduler-rs/src/admission.rs). Page choice stays in the pool (pool.h).
 class AdmissionQueue {
-    Config c_; std::deque<Request> q_;
-    uint64_t last_revision_ = UINT64_MAX, last_head_ = UINT64_MAX, last_id_ = 0;
-    bool have_id_ = false;
+    std::unique_ptr<g6sch_queue, void (*)(g6sch_queue*)> q_;
 public:
-    uint64_t stalls = 0;
-    explicit AdmissionQueue(Config c) : c_(c) { c_.validate(); }
-    void push(Request r) {
-        (void)reserve_pages(c_, r);
-        require(!have_id_ || r.id > last_id_, "native request ordinals must increase");
-        for (auto x : q_) require(x.id != r.id, "duplicate queued id");
-        q_.push_back(r); last_id_ = r.id; have_id_ = true;
+    explicit AdmissionQueue(Config c) : q_(nullptr, g6sch_queue_free) {
+        sch::check_abi();
+        c.validate();
+        const g6sch_config x = c.scalars();
+        q_.reset(g6sch_queue_new(&x));
     }
-    bool cancel(uint64_t id) {
-        auto it = std::find_if(q_.begin(), q_.end(), [&](const Request& r) { return r.id == id; });
-        if (it == q_.end()) return false;
-        q_.erase(it); return true;
-    }
-    const Request* front() const { return q_.empty() ? nullptr : &q_.front(); }
-    size_t size() const { return q_.size(); }
-    void admitted(uint64_t id) { require(!q_.empty() && q_.front().id == id, "FIFO admission violated"); q_.pop_front(); }
+    void push(Request r) { g6s2::check(g6sch_queue_push(q_.get(), sch::c<g6sch_request>(&r))); }
+    bool cancel(uint64_t id) { return g6sch_queue_cancel(q_.get(), id); }
+    // valid until the queue changes
+    const Request* front() const { return sch::c<Request>(g6sch_queue_front(q_.get())); }
+    size_t size() const { return g6sch_queue_size(q_.get()); }
+    uint64_t stalls() const { return g6sch_queue_stalls(q_.get()); }
+    void admitted(uint64_t id) { g6s2::check(g6sch_queue_admitted(q_.get(), id)); }
     // fits: the pool can admit the head (RunPool::fits); room: the pages one reservation can take now (RunPool::room)
     std::optional<AdmissionStatus> check(uint64_t revision, bool slot, bool fits, uint32_t room) {
-        if (q_.empty() || (last_head_ == q_.front().id && last_revision_ == revision)) return {};
-        require(room <= c_.pool_rows/PAGE, "invalid allocator view");
-        last_head_ = q_.front().id; last_revision_ = revision;
-        AdmissionStatus s; s.requested = grant_pages(c_, q_.front()); s.room = room;
-        s.why = !slot ? Stall::Slots : !fits ? Stall::Capacity : Stall::None;
-        if (s.why != Stall::None) ++stalls;
-        return s;
+        bool has = false; g6sch_status st{};
+        g6s2::check(g6sch_queue_check(q_.get(), revision, slot, fits, room, &has, &st));
+        if (!has) return {};
+        return AdmissionStatus{Stall(st.why), st.requested, st.room};
     }
 };
 } // namespace g6s2
