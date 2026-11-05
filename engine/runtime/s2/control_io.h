@@ -13,7 +13,7 @@
 namespace g6s2 {
 class ControlIO {
     int fd_;
-    static constexpr uint32_t MAX_BYTES = 16u << 20; // event metadata and request payloads (a 393K-token prompt), never model tensors
+    static constexpr uint32_t MAX_BYTES = 64u << 20; // event metadata and request payloads (a 393K-token prompt; DS41 images, up to 48 MiB of base64 a request), never model tensors
     // disconnect logging (root-cause follow-up: r1 died with only 'control disconnected/truncated' across 5 crashes):
     // before the epoch-fatal require, print ONE greppable reason line to stderr (rN.err) so the
     // next FABRIC capture shows WHY the control link dropped: recv/send return code, errno text,
