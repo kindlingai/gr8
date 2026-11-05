@@ -204,8 +204,9 @@ first request of the boot only (later requests can differ under `--spec-adaptive
    planner changes after the first round, which a first-request T=0 check cannot.
 4. A floating-point check: `scripts/host_tests.sh` replays a log with `round_replay` built with `-ffp-contract=off` and
    with `-ffp-contract=fast`. Since R3a's learn records (below) the `off` build must keep every learned estimate bit
-   for bit and the `fast` build only every step (`--steps-only`): contracted multiply-adds change the estimates' bits
-   from the first round on, without changing a step in the logs so far.
+   for bit and the `fast` build only every step (`--steps-only`): on the test's workload (the drafter choice and the
+   confidence stop on) contracted multiply-adds change the estimates' bits from the first round on, without changing
+   a step. On the GLM cluster's serving log both builds keep every bit (R3a's boot).
 5. The in-tree tests nothing built (`s2/tests/ds41_prefill_test.cpp`, `ds41_prefill_lanes_test.cpp`,
    `ds41_s32_step_test.cpp`, `s32_64k_mtp8_test.cpp`, `batch_ds41_dspark_test.cpp`) are built; two needed fixes for
    fields added since they were written (steering slots, a loaded steering profile). The dead `s2/v1_state.h` is gone.
@@ -268,13 +269,19 @@ Moves `s2_batch.h` (about 1,500 lines), `spec_len.h`, `insert_rule.h`, `ngram_lo
    after each state record hashes everything else the planner keeps between calls (the per-session and shared
    `SpecLen` estimates, the drafter choice, the confidence stop, the drafter's ring, the per-slot state and counters);
    the `round` and `prompt` hooks are logged; the header carries the step costs (`S2Cost`), which the replay checks
-   against its build, and the C library. `ModuleInfo` gains the drafter's block rows and the pack size, which the host
-   headers now read. Confirmed on the cluster: each rank's log, less the version 3 records, is the earlier boots' log,
-   and replays with its learn records.
+   against its build, the C library and the model. `round_replay --dump-learn LINE` writes the learned state out at a
+   learn record, to find the field a mismatch is in. `ModuleInfo` gains the drafter's block rows and the pack size,
+   which the host headers now read. Confirmed on the cluster: each rank's log, less the version 3 records, is the
+   earlier boots' log, and replays with its learn records.
 2. R3b, the port, behind a thin C++ `s2::Batch` over the Rust, so `round_replay`, `batch_replay_test` and the version 3
    format run unchanged against it. The replay must reproduce every step and every learn record across whole sessions.
-   The planner's `exp` and the Rust's both come from the platform libm (the header names it); Rust does not contract
-   multiply-adds, which matches the `-std=c++17` g6m4 build (the learn records confirm it on a serving log).
+   Before it, g6m4 and m4sim build their host code with `-Xcompiler -ffp-contract=off`: g++ contracts C++ under every
+   `-std`, so the planner on the GB10 fuses multiply-adds today, and Rust never does. That step can change the
+   estimates' bits, so it lands alone with its own confirmation (T=0 and the replay of a serving log with
+   `round_replay_off`). In the port: the Rust exports its state through C getters and the C++ facade hashes it with
+   `s2log::Hash`, so the learn record has one implementation; `exp` (`kprob`) is `f64::exp` from the same libm (the header
+   names it); `DSelTable::parse`'s `strtod` and `str`'s `%.10g` (it feeds the runtime signature) stay C++ or are tested
+   against it.
 
 ### R3c. DS41's KV on the shared paged pool (with Chuck)
 

@@ -22,6 +22,7 @@ struct ReplayResult
     size_t line = 0;                  // the log line where the replay stopped (1-based; 0: none)
     int version = 0;                  // the log's format
     std::string libc;                 // version 3: the C library the logging planner ran on (libc_version())
+    std::string learn_text;           // dump_learn: the replaying planner's learned state at that log line (Batch::learn_text)
     std::string error;
 };
 
@@ -36,7 +37,9 @@ inline std::string tag(const std::string& l) { return l.substr(0, l.find(' ')); 
 // replays the log's lines. table: the n-gram table when the log's planner had one (its digest must match)
 // learn = false (round_replay --steps-only): skip the learn records, so a build that rounds the estimates differently
 // (contracted multiply-adds) still shows whether any step, hook or driver state changes
-inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::NgramTable* table = nullptr, bool learn = true)
+// dump_learn: the 1-based log line of a learn record whose state to write out (learn_text), 0 = none
+inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::NgramTable* table = nullptr, bool learn = true,
+                           size_t dump_learn = 0)
 {
     using namespace replay_detail;
     ReplayResult res;
@@ -60,7 +63,11 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
         if (v3)
         {
             S2Cost cost;
-            h(has_round)(has_prompt)(cost)(res.libc);
+            uint32_t model = 0;
+            h(has_round)(has_prompt)(cost)(res.libc)(model);
+            if (model != g6mod::INFO.model)
+                fail("the log is model " + std::to_string(model) + "'s, this build model " + std::to_string(g6mod::INFO.model) +
+                     "'s (module_info.h): replay with the same model's build");
             if (s2log::line("", cost) != s2log::line("", S2Cost{}))
                 fail("the log's step costs (S2Cost) differ from this build's: replay with the build that logged it");
         }
@@ -175,6 +182,7 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
                      (i < lines.size() ? lines[i].substr(0, 400) : std::string("(end of log)")));
             ++i;
             if (!v3) continue;
+            if (dump_learn == i + 1) res.learn_text = b.learn_text();
             if (!learn) { if (i < lines.size() && starts(lines[i], "learn")) ++i; continue; }
             const std::string lr = s2log::line("learn", b.learn());
             if (i >= lines.size() || lines[i] != lr)

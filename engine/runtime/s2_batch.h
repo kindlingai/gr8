@@ -525,7 +525,7 @@ public:
         const int flash_tp = 0;
 #endif
         rec("g6s2log", 3, K_, max_rows_, S2N_SLOTS, par_, fresh_spec_, flash_cost, flash_tp, bool(h_.dfl), bool(h_.dfl_start),
-            bool(h_.lp), bool(h_.round), bool(h_.prompt), cost_, libc_version());
+            bool(h_.lp), bool(h_.round), bool(h_.prompt), cost_, libc_version(), g6mod::INFO.model);
         if (wrapped_) return;
         wrapped_ = true;
         if (h_.run) h_.run = [this, run = h_.run](const Step& s) { std::vector<int> t = run(s); rec("run", s, t); return t; };
@@ -657,9 +657,21 @@ public:
     uint64_t learn() const
     {
         s2log::Hash h;
-        h(K_)(max_rows_)(mtp_sessions_)(sess_drafts_)(adapt_)(dkv_)(par_)(fresh_spec_)(dsl_)(sel_)(ks_)(reuse_)(ng_)(ngd_)(ngm_)
+        learn_fields(h);
+        return h.value();
+    }
+    // the same state written out (round_replay --dump-learn), to find which field two learn records differ in
+    std::string learn_text() const
+    {
+        s2log::Out o;
+        o.line = "learn_text";
+        learn_fields(o);
+        return o.line;
+    }
+    template <class V> void learn_fields(V& v) const
+    {
+        v(K_)(max_rows_)(mtp_sessions_)(sess_drafts_)(adapt_)(dkv_)(par_)(fresh_spec_)(dsl_)(sel_)(ks_)(reuse_)(ng_)(ngd_)(ngm_)
          (ring_)(cost_)(sl_)(round_no_)(cur_round_)(cur_active_)(st_)(stats_);
-        return h.h;
     }
     // the session's tokens so far, prompt included: its next round writes rows from length - 1 on
     int length(int q) const { return (int)st_[q].tokens.size(); }
@@ -1084,9 +1096,10 @@ private:
         int force = -1;                   // inserted tokens from this position on wait for their steps (forced); -1: none
         int dd[DFL_B] = {};               // DFlash2 drafts d1..d7 and their log-probabilities under the drafter
         float dl[DFL_B] = {};
+        // the session's prompt is tokens[0..n): only its other fields
         template <class V> friend void fields(V& v, St& x)
         {
-            v(x.s)(x.tokens)(x.d)(x.dlm)(x.n)(x.on)(x.done)(x.rounds)(x.k)(x.dfl)(x.mtp)(x.pb)(x.pd)(x.pl)(x.since)(x.mn)(x.lo)
+            v(x.s.first)(x.s.chunk)(x.s.n_gen)(x.s.dflash)(x.s.ins)(x.tokens)(x.d)(x.dlm)(x.n)(x.on)(x.done)(x.rounds)(x.k)(x.dfl)(x.mtp)(x.pb)(x.pd)(x.pl)(x.since)(x.mn)(x.lo)
              (x.warm)(x.armed)(x.force)(x.dd)(x.dl);
         }
     };
@@ -1359,7 +1372,7 @@ private:
     {
         std::fputs(l.c_str(), log_);
         std::fputc('\n', log_);
-        if (l.compare(0, 6, "state ") == 0 && depth_ == 0) std::fflush(log_);   // a crash leaves the log whole to the last call
+        if (l.compare(0, 6, "learn ") == 0 && depth_ == 0) std::fflush(log_);   // a crash leaves the log whole to the last call
     }
     g6rt::SpecLen dsl_;
     DSel sel_;

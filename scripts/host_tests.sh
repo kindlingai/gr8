@@ -87,13 +87,15 @@ for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 
   "$T/scheduler_rs_vectors_test"
 done
 # the planner's round log and its replay (GR8_S2_REPLAY_LOG, s2/round_replay.h); GR8_S2_FRESH_SPEC
-g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_replay_test.cpp" -o "$T/batch_replay_test" "${KNOBS[@]}"
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -ffp-contract=off -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_replay_test.cpp" -o "$T/batch_replay_test" "${KNOBS[@]}"
 "$T/batch_replay_test" "$T/replay.log"
 GR8_S2_REPLAY_LOG="$T/env.log" "$T/batch_replay_test"   # the knob set as well: record() moves the log, wraps once
-# the planner's floating-point state with and without contracted multiply-adds: without (as -std=c++17 builds g6m4, and as
-# Rust computes) the replay keeps every learned estimate bit for bit; with, it must still ask for every step the log has
+# the planner's floating-point state with and without contracted multiply-adds (g++ contracts C++ under every -std; x86
+# needs -mfma to have them): batch_replay_test writes the log uncontracted (-ffp-contract=off above), so
+# the off replay keeps every learned estimate bit for bit and the fast one must still ask for every step the log has
+FMA=""; [ "$(uname -m)" = x86_64 ] && FMA="-mfma"
 for c in off fast; do
-  g++ -std=c++17 -O2 -Wall -ffp-contract=$c -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/round_replay.cpp" -o "$T/round_replay_$c" "${KNOBS[@]}"
+  g++ -std=c++17 -O2 -Wall -ffp-contract=$c $([ $c = fast ] && echo $FMA) -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/round_replay.cpp" -o "$T/round_replay_$c" "${KNOBS[@]}"
 done
 "$T/round_replay_off" "$T/replay.log"
 "$T/round_replay_fast" --steps-only "$T/replay.log"

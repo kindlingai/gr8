@@ -90,21 +90,40 @@ struct In
     }
 };
 
-// an FNV-1a hash of the values passed to it, field by field as Out lists them: integers as 64 bits, floating point as
-// its own bits (so NaN payloads count), a vector as its length and elements. The round log's "learn" record carries
-// it for state too large to write out.
+// a hash of the values passed to it, field by field as Out lists them: integers as 64 bits, floating point as its own
+// bits, a vector as its length and elements. A NaN hashes as the one In reads back from Out's "nan" (its sign kept),
+// so a logged state and its replay agree whatever payload the GPU gave it. One multiply and shift a word, mixed again
+// at the end (value()): the round log's "learn" record carries it for state too large to write out.
 struct Hash
 {
     uint64_t h = 14695981039346656037ull;
     void mix(uint64_t v)
     {
-        for (int i = 0; i < 8; ++i) h = (h ^ ((v >> (8 * i)) & 0xff)) * 1099511628211ull;
+        h = (h ^ v) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+    }
+    uint64_t value() const
+    {
+        uint64_t z = h + 0x9E3779B97F4A7C15ull;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
     }
     template <class T> Hash& operator()(const T& x)
     {
         using U = std::remove_cv_t<T>;
-        if constexpr (std::is_same_v<U, float>) { uint32_t b; std::memcpy(&b, &x, 4); mix(b); }
-        else if constexpr (std::is_same_v<U, double>) { uint64_t b; std::memcpy(&b, &x, 8); mix(b); }
+        if constexpr (std::is_same_v<U, float>)
+        {
+            uint32_t b;
+            std::memcpy(&b, &x, 4);
+            mix(std::isnan(x) ? (std::signbit(x) ? 0xffc00000u : 0x7fc00000u) : b);
+        }
+        else if constexpr (std::is_same_v<U, double>)
+        {
+            uint64_t b;
+            std::memcpy(&b, &x, 8);
+            mix(std::isnan(x) ? (std::signbit(x) ? 0xfff8000000000000ull : 0x7ff8000000000000ull) : b);
+        }
         else if constexpr (std::is_integral_v<U> || std::is_enum_v<U>) mix((uint64_t)(long long)x);
         else if constexpr (std::is_same_v<U, std::string>) { mix(x.size()); for (unsigned char c : x) mix(c); }
         else if constexpr (std::is_array_v<U>) { for (const auto& e : x) (*this)(e); }
