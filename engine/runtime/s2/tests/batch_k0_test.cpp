@@ -37,7 +37,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-#define private public   // the test reads Batch::st_ (the size of St::d); every standard header it needs is included above
+#define private public   // the test reads the planner's slot state (the size of St::d) through Batch::b(). The standard headers it needs come above
 #include "s2_batch.h"
 #undef private
 #include "s2/sessions.h"
@@ -125,7 +125,9 @@ static RunOut run(const std::vector<s2::Session>& S, const std::vector<uint32_t>
     for (int q = 0; q < NS; ++q)
     {
         r.out[q] = b.result(q); r.st[q] = b.stats(q);
-        r.dsize.push_back(b.st_[q].d.size()); r.dlmsize.push_back(b.st_[q].dlm.size());
+        g6s2_slot x;
+        g6s2_batch_slot(b.b(), q, &x);
+        r.dsize.push_back(x.n_d); r.dlmsize.push_back(x.n_dlm);
     }
     return r;
 }
