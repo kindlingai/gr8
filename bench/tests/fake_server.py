@@ -38,6 +38,7 @@ class State:
         self.chat_prompts = []
         self.completion_prompts = []
         self.fail_nth = 0         # the Nth chat request from now (1-based) ends with finish_reason 'error'
+        self.needle_cutoff = False  # a needle reply thinks up to max_tokens, the secret only in its reasoning
         self.chat_calls = 0
 
 
@@ -170,10 +171,16 @@ class Handler(BaseHTTPRequestHandler):
         ans = (f'You asked about the passphrase. It is {m.group(1)}.' if m and st.retrieve
                else 'I could not find it.')
         n = body['max_tokens']
+        field, finish = 'content', 'length'
         words = (ans + ' ' + 'word ' * n).split()[:n]
+        if m and st.needle_cutoff:     # still thinking at the limit
+            field, words = 'reasoning_content', (f'The line says {m.group(1)}. ' + 'hmm ' * n).split()[:n]
+        elif m:                        # a needle answer stops on its own
+            finish, words = 'stop', ans.split()
+            n = len(words)
         with st.lock:
             st.chat_calls += 1
-            reason = 'error' if st.fail_nth and st.chat_calls == st.fail_nth else 'length'
+            reason = 'error' if st.fail_nth and st.chat_calls == st.fail_nth else finish
             c = st.counters
             c['drafts'] += n // 3
             c['draft'] += n
@@ -184,7 +191,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'text/event-stream')
         self.end_headers()
         for i in range(0, len(words), 4):
-            chunk = {'choices': [{'index': 0, 'delta': {'content': ' '.join(words[i:i + 4]) + ' '}}]}
+            chunk = {'choices': [{'index': 0, 'delta': {field: ' '.join(words[i:i + 4]) + ' '}}]}
             self.wfile.write(b'data: ' + json.dumps(chunk).encode() + b'\n\n')
             time.sleep(0.002)
         end = {'choices': [{'index': 0, 'delta': {}, 'finish_reason': reason}]}

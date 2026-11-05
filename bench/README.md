@@ -84,6 +84,11 @@ by Ctrl-C or SIGTERM too, every box is unlocked, the service starts again, and t
 - against `--baseline`: each decode workload, paired run by run, is not slower by more than 3% with a Holm-corrected
   Wilcoxon p under 0.05, and each prefill size is not slower by more than 3%.
 
+A needle passes when the secret is in the answer. A reply that runs out of its 1,024 tokens while the secret is only
+in its reasoning shows as "found in the reasoning, answer cut off" and still fails. The report keeps each needle's
+seed, secret, finish reason, token count and the reply (the first and last 2 KB of its content and reasoning), and
+`--needle-seed N` sends the same document and secret again.
+
 Shown and not gated: the T=0 hash (equal or not to the baseline's), concurrency against the baseline (8 streams
 spread 6-15% run to run), the tool call at 42K (gr8's batch numerics differ from one stream's), GSM8K and HumanEval.
 

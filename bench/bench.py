@@ -201,6 +201,8 @@ def main():
     ap.add_argument('--label', default='')
     ap.add_argument('--series', default='gr8bench-1', help='runs pair only within one series')
     ap.add_argument('--effort', default='low', help='reasoning_effort: low, high, max, or nothink')
+    ap.add_argument('--needle-seed', type=int,
+                    help="the needle stage's seed (the document and the secret; a failed needle's report has it)")
     ap.add_argument('--kl-ref', help='a KL reference (bench.py kl-ref) of this model and topology')
     ap.add_argument('--kl-max', type=float, help='largest mean KL that passes (shown, not gated, without it)')
     ap.add_argument('--record', metavar='DIR',

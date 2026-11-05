@@ -60,8 +60,10 @@ def fields(rep):
     if needle:
         keys = sorted(needle, key=_size)
         found = [k for k in keys if needle[k]['passed']]
-        missed = [k for k in keys if not needle[k]['passed']]
+        cut = [k for k in keys if not needle[k]['passed'] and needle[k].get('cut_off')]
+        missed = [k for k in keys if not needle[k]['passed'] and not needle[k].get('cut_off')]
         out['quality'] = '; '.join(x for x in (found and 'found at ' + ', '.join(found),
+                                               cut and 'found at ' + ', '.join(cut) + ' (answer cut off)',
                                                missed and 'missed at ' + ', '.join(missed)) if x)
     else:
         skipped.append('quality (needle)')
