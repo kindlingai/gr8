@@ -5,7 +5,7 @@ plan_image_grid, ImageOps.pad with grey 127).
 
     python3 frontend/tests/vision_pil_cases.py --small --out frontend/g6front-rs/src/vision_cases
     python3 frontend/tests/vision_pil_cases.py --n 30 --out DIR      # a larger random set, not committed
-    GR8_VISION_CASES=DIR cargo test --release vision::tests::pad_matches_pil
+    GR8_TEST_VISION_CASES=DIR cargo test --release vision::tests::pad_matches_pil
 
 --small writes the committed set (under 200 KB): every PNG colour type PIL and the decoder read differently, a
 transparent GIF, and sizes that upscale (min_pixels), downscale (the token cap) and pad either way. Each case is listed

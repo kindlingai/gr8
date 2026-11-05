@@ -643,13 +643,13 @@ mod tests {
     }
 
     /// Random images against PIL (frontend/tests/vision_pil_cases.py wrote them): sizes that upscale and downscale,
-    /// both aspects, random content, the PNG colour types, GIF and lossless WebP. GR8_VISION_CASES=DIR runs a set made
+    /// both aspects, random content, the PNG colour types, GIF and lossless WebP. GR8_TEST_VISION_CASES=DIR runs a set made
     /// with `--n`; its lossy cases (JPEG, lossy WebP) only report how far they are off.
     #[test]
     fn pad_matches_pil_on_random_images() {
-        let dir = match std::env::var("GR8_VISION_CASES") {
-            Ok(d) => PathBuf::from(d),
-            Err(_) => Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vision_cases"),
+        let dir = match gr8knobs::TEST_VISION_CASES.get() {
+            Some(d) => PathBuf::from(d),
+            None => Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vision_cases"),
         };
         let idx: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("index.json")).unwrap()).unwrap();
         let cases = idx.as_array().unwrap();
