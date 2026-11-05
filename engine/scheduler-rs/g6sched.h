@@ -41,4 +41,106 @@ struct g6sch_cand { uint64_t id; bool past; };
 void g6sch_cp_pick(const g6sch_cand* cand, size_t n, const uint64_t* served, size_t n_served, uint32_t rows, uint32_t per,
                    bool seg, bool* in_round, bool* capped, bool* fresh);
 
+// scheduler.h: the Scheduler's types (the same layout as g6s2's; Quantum holds SCHED_QMAX entries whatever MAX_SESSIONS
+// is). The Scheduler calls return null or the refusal's message (a static string), and refuse before changing state,
+// except where the C++ they replaced changed some first (complete_decode, complete_tail_pack's revision).
+#define G6SCH_QMAX 32
+struct g6sch_key { uint64_t epoch; uint32_t slot, generation; };
+struct g6sch_identity { bool enabled; uint8_t profile_digest[32]; uint8_t scope; uint8_t schedule_digest[32]; uint32_t scale_bits, slot; };
+struct g6sch_request { uint64_t id; uint32_t prompt_tokens, max_tokens; g6sch_identity steering; uint32_t r_rows; };
+struct g6sch_run { uint32_t first_page, pages, table_version; uint64_t list_hash; };
+struct g6sch_slot {
+    g6sch_key key; g6sch_request req; g6sch_run run;
+    uint32_t phase, prefilled, emitted, inserted, deferred;
+    bool packable, pack_tail;
+    uint64_t parked;
+};
+// Config without the steering receipt
+struct g6sch_config {
+    uint64_t epoch;
+    uint32_t pool_rows, max_rows, max_sessions, mtp, guard_tokens, prefill_rows;
+    bool two_lanes;
+    uint32_t decode_prefill_rows, decode_rounds, window_pages, cp_step_rows;
+    uint64_t cp_after;
+    bool cp_seg;
+    uint32_t r2_rows;
+    bool tail_first;
+    uint32_t notice_max;
+    bool c8_pack;
+    uint32_t mtp_sessions;
+    bool sess_drafts, park;
+};
+struct g6sch_quantum {
+    uint32_t kind; uint64_t boundary; g6sch_key keys[G6SCH_QMAX]; uint32_t count, first, rows;
+    uint32_t firsts[G6SCH_QMAX], row_counts[G6SCH_QMAX];
+};
+// the Scheduler's counters and the quantum in flight
+struct g6sch_state {
+    uint64_t boundary, event, revision, last_id, pool;
+    bool have_id, want_decode, busy, failed;
+    uint64_t park_seq; uint32_t decode_run;
+    g6sch_quantum work;
+};
+struct g6sch_grant { g6sch_key key; g6sch_request req; g6sch_run run; uint32_t reuse, restored, counted; };
+struct g6sch_shrink { g6sch_key key; uint32_t r_rows; g6sch_run run; };
+struct g6sch_commit {
+    uint64_t epoch, event, boundary, before_hash;
+    bool has_cancel; g6sch_key cancel;
+    bool has_admit; g6sch_grant admit;
+    bool has_shrink; g6sch_shrink shrink;
+};
+struct g6sch_completion { g6sch_key key; uint32_t emitted; bool finished; uint32_t inserted; };
+// the Rust side's struct sizes and constants, which the C++ wrapper checks once (scheduler.h check_abi)
+enum {
+    G6SCH_ABI_SLOT, G6SCH_ABI_CONFIG, G6SCH_ABI_QUANTUM, G6SCH_ABI_STATE, G6SCH_ABI_COMMIT, G6SCH_ABI_COMPLETION,
+    G6SCH_ABI_GRANT, G6SCH_ABI_PAGE, G6SCH_ABI_PREFILL_DEFER_MAX, G6SCH_ABI_NOTICE_MIN, G6SCH_ABI_NOTICE_MAX,
+    G6SCH_ABI_NOTICE_ROWS, G6SCH_ABI_MAX_DECODE_ROUNDS, G6SCH_ABI_PACK_MAX_MEMBERS, G6SCH_ABI_QMAX,
+};
+uint64_t g6sch_abi(uint32_t what);
+
+// Config::validate's scalar rules; mtp0, pack, park: the module's capabilities
+const char* g6sch_validate(const g6sch_config* c, uint32_t max_sessions, bool mtp0, bool pack, bool park);
+const char* g6sch_reserve_rows(const g6sch_config* c, const g6sch_request* r, uint64_t* out);
+const char* g6sch_reserve_pages(const g6sch_config* c, const g6sch_request* r, uint32_t* out);
+const char* g6sch_grant_rows(const g6sch_config* c, const g6sch_request* r, uint64_t* out);
+const char* g6sch_grant_pages(const g6sch_config* c, const g6sch_request* r, uint32_t* out);
+uint64_t g6sch_round_rows(const g6sch_config* c, uint64_t length);
+const char* g6sch_grant_pages_ok(const g6sch_config* c, const g6sch_request* r, uint32_t pages, bool* out);
+uint32_t g6sch_prefill_left(const g6sch_slot* s);
+bool g6sch_prefill_first(const g6sch_slot* a, const g6sch_slot* b);
+
+// every call below takes the slots as (s, n)
+void g6sch_init(const g6sch_config* c, g6sch_slot* s, size_t n);
+const char* g6sch_idle_boundary(const g6sch_slot* s, size_t n, g6sch_state* st, uint64_t target);
+uint32_t g6sch_resident(const g6sch_slot* s, size_t n);
+uint32_t g6sch_retiring(const g6sch_slot* s, size_t n);
+uint32_t g6sch_parked(const g6sch_slot* s, size_t n);
+bool g6sch_find(const g6sch_slot* s, size_t n, uint64_t id, g6sch_key* out);
+// cancel: null for none
+const char* g6sch_next_key(const g6sch_config* c, const g6sch_slot* s, size_t n, const g6sch_key* cancel, bool has_park,
+                           uint32_t park, g6sch_key* out);
+size_t g6sch_reclaimable(const g6sch_config* c, const g6sch_slot* s, size_t n, const g6sch_key* cancel, g6sch_run* out);   // out: n runs
+// the digest is digest_head, then steering.h hash_boot, then digest_slots
+uint64_t g6sch_digest_head(const g6sch_config* c, const g6sch_state* st);
+uint64_t g6sch_digest_slots(const g6sch_config* c, const g6sch_slot* s, size_t n, uint64_t h);
+// digest: the state's digest before the commit. freed: n runs
+const char* g6sch_apply(const g6sch_config* c, g6sch_slot* s, size_t n, g6sch_state* st, const g6sch_commit* e,
+                        uint64_t digest, g6sch_run* freed, size_t* n_freed, bool* admitted);
+// k and r must not point into s
+const char* g6sch_grow(const g6sch_config* c, g6sch_slot* s, size_t n, const g6sch_state* st, const g6sch_key* k, const g6sch_run* r);
+size_t g6sch_decoding(const g6sch_slot* s, size_t n, g6sch_key* out);   // out: n keys
+void g6sch_alternate(const g6sch_config* c, uint32_t kind, bool* want, uint32_t* run);
+// stalled: n flags, or null
+void g6sch_plan(const g6sch_config* c, const g6sch_slot* s, size_t n, bool want, const bool* stalled, g6sch_quantum* out);
+const char* g6sch_next(const g6sch_config* c, const g6sch_slot* s, size_t n, g6sch_state* st, const bool* stalled, g6sch_quantum* out);
+void g6sch_advance(g6sch_slot* s, size_t n, const g6sch_quantum* q);
+uint64_t g6sch_horizon(const g6sch_config* c, const g6sch_slot* s, size_t n, const g6sch_state* st);
+// k must not point into s
+const char* g6sch_skip_prefill(g6sch_slot* s, size_t n, const g6sch_state* st, const g6sch_key* k);
+const char* g6sch_complete_prefill(const g6sch_config* c, g6sch_slot* s, size_t n, g6sch_state* st);
+const char* g6sch_complete_prefill_pack(const g6sch_config* c, g6sch_slot* s, size_t n, g6sch_state* st);
+const char* g6sch_complete_tail(const g6sch_config* c, g6sch_slot* s, size_t n, g6sch_state* st, const g6sch_completion* r);
+const char* g6sch_complete_tail_pack(const g6sch_config* c, g6sch_slot* s, size_t n, g6sch_state* st, const g6sch_completion* r, size_t nr);
+const char* g6sch_complete_decode(const g6sch_config* c, g6sch_slot* s, size_t n, g6sch_state* st, const g6sch_completion* r, size_t nr);
+
 }

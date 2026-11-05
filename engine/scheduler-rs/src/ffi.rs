@@ -11,6 +11,7 @@ use crate::flash_ring::{self, Ring};
 use crate::kv_plan::{self, Io, Item};
 
 unsafe fn slice<'a, T>(p: *const T, n: usize) -> &'a [T] {
+    debug_assert!(n == 0 || !p.is_null());
     if n == 0 || p.is_null() {
         &[]
     } else {
@@ -19,6 +20,7 @@ unsafe fn slice<'a, T>(p: *const T, n: usize) -> &'a [T] {
 }
 
 unsafe fn slice_mut<'a, T>(p: *mut T, n: usize) -> &'a mut [T] {
+    debug_assert!(n == 0 || !p.is_null());
     if n == 0 || p.is_null() {
         &mut []
     } else {
@@ -185,4 +187,365 @@ pub unsafe extern "C" fn g6sch_cp_pick(
     slice_mut(in_round, n).copy_from_slice(&p.in_round);
     *capped = p.capped;
     *fresh = p.fresh;
+}
+
+// ---- the scheduler (scheduler.rs) --------------------------------------------------------------------------------
+// Every call takes the slots as (pointer, count) and returns null or the C++ message of its refusal (a static string).
+
+use crate::scheduler::{self as sch, Commit, Completion, Config, Key, Quantum, Request, Run, Slot, State};
+use std::ffi::c_char;
+
+fn err(r: Result<(), sch::Err>) -> *const c_char {
+    match r {
+        Ok(()) => std::ptr::null(),
+        Err(m) => msg(m),
+    }
+}
+// each refusal message as a NUL-terminated static string
+fn msg(m: &'static str) -> *const c_char {
+    macro_rules! table {
+        ($($s:literal),* $(,)?) => {
+            match m {
+                $($s => concat!($s, "\0").as_ptr() as *const c_char,)*
+                _ => "scheduler-rs: unknown refusal\0".as_ptr() as *const c_char,
+            }
+        };
+    }
+    table!(
+        "empty request",
+        "request exceeds pool including guard",
+        "bad epoch/pool",
+        "bad session/row limit",
+        "c8 prefill pack is DS41 only",
+        "parked slots are DS41 only",
+        "insufficient guard/prefill rows",
+        "decode_prefill_rows must be 0 or a multiple of 64 no larger than prefill_rows",
+        "decode_rounds must be at most 64",
+        "notice_max must be 2..8",
+        "cp_step_rows must be 0 or at least one session's verify (mtp + 1)",
+        "cp_seg needs cp_step_rows",
+        "r2_rows must be 0, or a multiple of 64 with window_pages",
+        "stale session key",
+        "invalid completion",
+        "insert count went back",
+        "cannot advance a live boundary",
+        "session generation exhausted",
+        "no parked session on that slot",
+        "no session slot",
+        "commit requires quiescent live engine",
+        "event/state mismatch",
+        "cancel epoch mismatch",
+        "bad shrink key",
+        "bad shrink",
+        "native request ordinals must increase",
+        "bad grant key",
+        "grant slot generation mismatch",
+        "bad reservation",
+        "duplicate native request id",
+        "active session/row limit",
+        "reused rows past the prompt",
+        "grant at an R the engine does not have",
+        "bad run growth",
+        "scheduler failed or work in flight",
+        "skip_prefill outside admission",
+        "not a prefill quantum",
+        "not a prefill pack quantum",
+        "prefill pack membership changed",
+        "not this prompt tail",
+        "not this prompt tail pack",
+        "tail pack completion invalid",
+        "not this decode round",
+        "decode completion order differs",
+        "too many output tokens",
+    )
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_validate(
+    c: *const Config,
+    max_sessions: u32,
+    mtp0: bool,
+    pack: bool,
+    park: bool,
+) -> *const c_char {
+    err(sch::validate(&*c, max_sessions, mtp0, pack, park))
+}
+
+macro_rules! out_fn {
+    ($name:ident, $f:path, $t:ty) => {
+        #[no_mangle]
+        pub unsafe extern "C" fn $name(c: *const Config, r: *const Request, out: *mut $t) -> *const c_char {
+            match $f(&*c, &*r) {
+                Ok(v) => {
+                    *out = v;
+                    std::ptr::null()
+                }
+                Err(m) => msg(m),
+            }
+        }
+    };
+}
+out_fn!(g6sch_reserve_rows, sch::reserve_rows, u64);
+out_fn!(g6sch_reserve_pages, sch::reserve_pages, u32);
+out_fn!(g6sch_grant_rows, sch::grant_rows, u64);
+out_fn!(g6sch_grant_pages, sch::grant_pages, u32);
+
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_round_rows(c: *const Config, length: u64) -> u64 {
+    sch::round_rows(&*c, length)
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_grant_pages_ok(
+    c: *const Config,
+    r: *const Request,
+    pages: u32,
+    out: *mut bool,
+) -> *const c_char {
+    match sch::grant_pages_ok(&*c, &*r, pages) {
+        Ok(v) => {
+            *out = v;
+            std::ptr::null()
+        }
+        Err(m) => msg(m),
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_prefill_left(s: *const Slot) -> u32 {
+    sch::prefill_left(&*s)
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_prefill_first(a: *const Slot, b: *const Slot) -> bool {
+    sch::prefill_first(&*a, &*b)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_init(c: *const Config, s: *mut Slot, n: usize) {
+    sch::init(&*c, slice_mut(s, n))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_idle_boundary(s: *const Slot, n: usize, st: *mut State, target: u64) -> *const c_char {
+    err(sch::idle_boundary(slice(s, n), &mut *st, target))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_resident(s: *const Slot, n: usize) -> u32 {
+    sch::resident(slice(s, n))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_retiring(s: *const Slot, n: usize) -> u32 {
+    sch::retiring(slice(s, n))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_parked(s: *const Slot, n: usize) -> u32 {
+    sch::parked(slice(s, n))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_find(s: *const Slot, n: usize, id: u64, out: *mut Key) -> bool {
+    match sch::find(slice(s, n), id) {
+        Some(k) => {
+            *out = k;
+            true
+        }
+        None => false,
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_next_key(
+    c: *const Config,
+    s: *const Slot,
+    n: usize,
+    cancel: *const Key,
+    has_park: bool,
+    park: u32,
+    out: *mut Key,
+) -> *const c_char {
+    let cancel = if cancel.is_null() { None } else { Some(*cancel) };
+    match sch::next_key(&*c, slice(s, n), cancel, has_park.then_some(park)) {
+        Ok(k) => {
+            *out = k;
+            std::ptr::null()
+        }
+        Err(m) => msg(m),
+    }
+}
+/// out holds n runs; the count written is returned.
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_reclaimable(
+    c: *const Config,
+    s: *const Slot,
+    n: usize,
+    cancel: *const Key,
+    out: *mut Run,
+) -> usize {
+    let cancel = if cancel.is_null() { None } else { Some(*cancel) };
+    let v = sch::reclaimable(&*c, slice(s, n), cancel);
+    slice_mut(out, v.len()).copy_from_slice(&v);
+    v.len()
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_digest_head(c: *const Config, st: *const State) -> u64 {
+    sch::digest_head(&*c, &*st)
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_digest_slots(c: *const Config, s: *const Slot, n: usize, h: u64) -> u64 {
+    sch::digest_slots(&*c, slice(s, n), h)
+}
+/// freed holds n runs; *n_freed and *admitted are written on success.
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_apply(
+    c: *const Config,
+    s: *mut Slot,
+    n: usize,
+    st: *mut State,
+    e: *const Commit,
+    digest: u64,
+    freed: *mut Run,
+    n_freed: *mut usize,
+    admitted: *mut bool,
+) -> *const c_char {
+    match sch::apply(&*c, slice_mut(s, n), &mut *st, &*e, digest) {
+        Ok(d) => {
+            slice_mut(freed, d.freed.len()).copy_from_slice(&d.freed);
+            *n_freed = d.freed.len();
+            *admitted = d.admitted;
+            std::ptr::null()
+        }
+        Err(m) => msg(m),
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_grow(
+    c: *const Config,
+    s: *mut Slot,
+    n: usize,
+    st: *const State,
+    k: *const Key,
+    r: *const Run,
+) -> *const c_char {
+    err(sch::grow(&*c, slice_mut(s, n), &*st, &*k, &*r))
+}
+/// out holds n keys; the count written is returned.
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_decoding(s: *const Slot, n: usize, out: *mut Key) -> usize {
+    let v = sch::decoding(slice(s, n));
+    slice_mut(out, v.len()).copy_from_slice(&v);
+    v.len()
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_alternate(c: *const Config, kind: u32, want: *mut bool, run: *mut u32) {
+    sch::alternate(&*c, kind, &mut *want, &mut *run)
+}
+/// stalled holds n flags (null: none stalled).
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_plan(
+    c: *const Config,
+    s: *const Slot,
+    n: usize,
+    want: bool,
+    stalled: *const bool,
+    out: *mut Quantum,
+) {
+    *out = sch::plan(&*c, slice(s, n), want, slice(stalled, if stalled.is_null() { 0 } else { n }))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_next(
+    c: *const Config,
+    s: *const Slot,
+    n: usize,
+    st: *mut State,
+    stalled: *const bool,
+    out: *mut Quantum,
+) -> *const c_char {
+    match sch::next(&*c, slice(s, n), &mut *st, slice(stalled, if stalled.is_null() { 0 } else { n })) {
+        Ok(q) => {
+            *out = q;
+            std::ptr::null()
+        }
+        Err(m) => msg(m),
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_advance(s: *mut Slot, n: usize, q: *const Quantum) {
+    sch::advance(slice_mut(s, n), &*q)
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_horizon(c: *const Config, s: *const Slot, n: usize, st: *const State) -> u64 {
+    sch::horizon(&*c, slice(s, n), &*st)
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_skip_prefill(s: *mut Slot, n: usize, st: *const State, k: *const Key) -> *const c_char {
+    err(sch::skip_prefill(slice_mut(s, n), &*st, &*k))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_complete_prefill(
+    c: *const Config,
+    s: *mut Slot,
+    n: usize,
+    st: *mut State,
+) -> *const c_char {
+    err(sch::complete_prefill(&*c, slice_mut(s, n), &mut *st))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_complete_prefill_pack(
+    c: *const Config,
+    s: *mut Slot,
+    n: usize,
+    st: *mut State,
+) -> *const c_char {
+    err(sch::complete_prefill_pack(&*c, slice_mut(s, n), &mut *st))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_complete_tail(
+    c: *const Config,
+    s: *mut Slot,
+    n: usize,
+    st: *mut State,
+    r: *const Completion,
+) -> *const c_char {
+    err(sch::complete_tail(&*c, slice_mut(s, n), &mut *st, &*r))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_complete_tail_pack(
+    c: *const Config,
+    s: *mut Slot,
+    n: usize,
+    st: *mut State,
+    r: *const Completion,
+    nr: usize,
+) -> *const c_char {
+    err(sch::complete_tail_pack(&*c, slice_mut(s, n), &mut *st, slice(r, nr)))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_complete_decode(
+    c: *const Config,
+    s: *mut Slot,
+    n: usize,
+    st: *mut State,
+    r: *const Completion,
+    nr: usize,
+) -> *const c_char {
+    err(sch::complete_decode(&*c, slice_mut(s, n), &mut *st, slice(r, nr)))
+}
+
+/// The struct sizes and constants the C++ side duplicates, by index (g6sched.h G6SCH_ABI_*); 0 past the end.
+#[no_mangle]
+pub extern "C" fn g6sch_abi(what: u32) -> u64 {
+    use std::mem::size_of;
+    let v = [
+        size_of::<Slot>(),
+        size_of::<Config>(),
+        size_of::<Quantum>(),
+        size_of::<State>(),
+        size_of::<Commit>(),
+        size_of::<Completion>(),
+        size_of::<sch::Grant>(),
+        sch::PAGE as usize,
+        sch::PREFILL_DEFER_MAX as usize,
+        sch::NOTICE_MIN as usize,
+        sch::NOTICE_MAX as usize,
+        sch::NOTICE_ROWS as usize,
+        sch::MAX_DECODE_ROUNDS as usize,
+        sch::PACK_MAX_MEMBERS,
+        sch::QMAX,
+    ];
+    v.get(what as usize).map_or(0, |&x| x as u64)
 }

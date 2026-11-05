@@ -10,3 +10,4 @@ pub mod ffi;
 pub mod flash_lend;
 pub mod flash_ring;
 pub mod kv_plan;
+pub mod scheduler;

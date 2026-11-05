@@ -4,6 +4,9 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <cstddef>
+#include <cstring>
+#include <utility>
 #include <cstdint>
 #include <deque>
 #include <limits>
@@ -13,9 +16,12 @@
 #include <vector>
 #include "../steering.h"
 #include "../../module_info.h"
+#include "../../scheduler-rs/g6sched.h"
 
 namespace g6s2 {
 inline void require(bool ok, const char* what) { if (!ok) throw std::runtime_error(what); }
+// a scheduler-rs refusal: null, or the message the C++ it replaced threw
+inline void check(const char* refused) { if (refused) throw std::runtime_error(refused); }
 constexpr unsigned MAX_SESSIONS = unsigned(g6mod::INFO.max_sessions), PAGE = unsigned(g6mod::INFO.kv_page);
 // DS41: members of one ragged prefill pack (ds41::pack::MAX_SEGMENTS); the slots they name range over MAX_SESSIONS
 constexpr unsigned PACK_MAX_MEMBERS = 8;
@@ -98,20 +104,20 @@ struct Config {
         const unsigned step = mtp_sessions ? 1u : (mtp + 1);
         return std::min(max_sessions, max_rows / step);
     }
+    // the settings scheduler-rs reads: every field but the steering receipt
+    g6sch_config scalars() const {
+        g6sch_config x{};
+        x.epoch = epoch; x.pool_rows = pool_rows; x.max_rows = max_rows; x.max_sessions = max_sessions; x.mtp = mtp;
+        x.guard_tokens = guard_tokens; x.prefill_rows = prefill_rows; x.two_lanes = two_lanes;
+        x.decode_prefill_rows = decode_prefill_rows; x.decode_rounds = decode_rounds; x.window_pages = window_pages;
+        x.cp_step_rows = cp_step_rows; x.cp_after = cp_after; x.cp_seg = cp_seg; x.r2_rows = r2_rows;
+        x.tail_first = tail_first; x.notice_max = notice_max; x.c8_pack = c8_pack; x.mtp_sessions = mtp_sessions;
+        x.sess_drafts = sess_drafts; x.park = park;
+        return x;
+    }
     void validate() const {
-        require(epoch && pool_rows >= PAGE && pool_rows % PAGE == 0, "bad epoch/pool");
-        require((mtp > 0 || g6mod::has(G6_CAP_MTP0)) && mtp <= 7 && max_sessions && max_sessions <= MAX_SESSIONS && limit(),
-                "bad session/row limit");
-        require(!c8_pack || g6mod::has(G6_CAP_PACK), "c8 prefill pack is DS41 only");
-        require(!park || g6mod::has(G6_CAP_PARK), "parked slots are DS41 only");
-        require(guard() >= 2 * mtp && prefill_rows, "insufficient guard/prefill rows");
-        require(!decode_prefill_rows || (decode_prefill_rows % PAGE == 0 && decode_prefill_rows <= prefill_rows),
-                "decode_prefill_rows must be 0 or a multiple of 64 no larger than prefill_rows");
-        require(decode_rounds <= MAX_DECODE_ROUNDS, "decode_rounds must be at most 64");
-        require(notice_max >= NOTICE_MIN && notice_max <= NOTICE_MAX, "notice_max must be 2..8");
-        require(!cp_step_rows || cp_step_rows >= mtp + 1, "cp_step_rows must be 0 or at least one session's verify (mtp + 1)");
-        require(!cp_seg || cp_step_rows, "cp_seg needs cp_step_rows");
-        require(r2_rows % PAGE == 0 && (!r2_rows || window_pages), "r2_rows must be 0, or a multiple of 64 with window_pages");
+        const g6sch_config c = scalars();
+        check(g6sch_validate(&c, MAX_SESSIONS, g6mod::has(G6_CAP_MTP0), g6mod::has(G6_CAP_PACK), g6mod::has(G6_CAP_PARK)));
         require(steering.loaded == !steering.profiles.empty() && steering.profiles.size() <= g6rt::steering::PROFILES_MAX &&
                 (steering.scope == g6rt::steering::Scope::Shared || steering.scope == g6rt::steering::Scope::Full),
                 "invalid loaded steering receipt");
@@ -136,28 +142,18 @@ struct Request {
     g6rt::steering::Identity steering{};
     uint32_t r_rows = 0;   // the R its run takes (pool.h), the head's choice at admission: 0 = the pool's, else Config::r2_rows
 };
-inline uint64_t reserve_rows(const Config& c, const Request& r) {
-    require(r.prompt_tokens && r.max_tokens, "empty request");
-    return uint64_t(r.prompt_tokens) + r.max_tokens + c.guard();
-}
-inline uint32_t reserve_pages(const Config& c, const Request& r) {
-    const auto rows = reserve_rows(c, r);
-    require(rows <= c.pool_rows, "request exceeds pool including guard");
-    return uint32_t((rows + PAGE - 1) / PAGE);
-}
+template <class T, class F> inline T sch_out(F f) { T v{}; check(f(&v)); return v; }
+inline uint64_t reserve_rows(const Config& c, const Request& r);
+inline uint32_t reserve_pages(const Config& c, const Request& r);
 // rows a session holds from its admission: its prompt, the token the tail samples and the guard, which covers the prompt
 // tail, its chain steps and the first round. A round at `length` tokens (prompt + output) writes rows below
 // length + 2 * mtp - 1 (verify, first-form draft, chain), DFlash2 below length + 7, so round_rows = length + guard covers
 // it (Config::validate keeps guard >= 2 * mtp, and DFlash2 builds set 14). Later rows come by growth (Driver::step).
-inline uint64_t round_rows(const Config& c, uint64_t length) { return length + c.guard(); }
-inline uint64_t grant_rows(const Config& c, const Request& r) {
-    return std::min(reserve_rows(c, r), round_rows(c, uint64_t(r.prompt_tokens) + 1));
-}
-inline uint32_t grant_pages(const Config& c, const Request& r) { return uint32_t((grant_rows(c, r) + PAGE - 1) / PAGE); }
+inline uint64_t round_rows(const Config& c, uint64_t length);
+inline uint64_t grant_rows(const Config& c, const Request& r);
+inline uint32_t grant_pages(const Config& c, const Request& r);
 // the pages a grant may list: what it needs now, its worst case, or (window runs past R) its worst case and the window
-inline bool grant_pages_ok(const Config& c, const Request& r, uint32_t pages) {
-    return pages == grant_pages(c, r) || pages == reserve_pages(c, r) || (c.window_pages && pages == reserve_pages(c, r) + c.window_pages);
-}
+inline bool grant_pages_ok(const Config& c, const Request& r, uint32_t pages);
 // a session's pages, as the control link carries them. Each rank's pool (pool.h) holds the list and fills it the same
 // way. list_hash names the list, so a rank whose list differs fails at its grant. A run grows (Scheduler::grow) between
 // events on every rank alike: same table version, more pages, a new hash.
@@ -184,18 +180,11 @@ struct Slot {
     uint64_t parked = 0;      // Config::park: the order it was parked in (1, 2, ..), so the oldest is evicted first
 };
 // prompt rows a session still has to prefill; 0 means only its prompt tail is left
-inline uint32_t prefill_left(const Slot& s) { return s.req.prompt_tokens - 1 - s.prefilled; }
+inline uint32_t prefill_left(const Slot& s);
 // the order this quantum's prefill candidates are served in. Owed (passed over PREFILL_DEFER_MAX times) outranks not
 // owed; among the owed the largest count wins, and among equals the shortest prompt. Replicated state only: every rank
 // holds the same slots and counters, so every rank names the same session, which the event digest then confirms.
-inline bool prefill_first(const Slot& a, const Slot& b) {
-    const bool owed_a = a.deferred >= PREFILL_DEFER_MAX, owed_b = b.deferred >= PREFILL_DEFER_MAX;
-    if (owed_a != owed_b) return owed_a;                 // a session that has waited its turn goes first
-    if (owed_a && a.deferred != b.deferred) return a.deferred > b.deferred;  // both owed: the one that waited longest
-    const uint32_t left_a = prefill_left(a), left_b = prefill_left(b);
-    if (left_a != left_b) return left_a < left_b;        // fewest remaining prompt rows
-    return a.req.id < b.req.id;                          // immutable native ordinal, so the choice is total
-}
+inline bool prefill_first(const Slot& a, const Slot& b);
 // reuse: prompt rows the run already holds from a retained session (pool.h match), so prefill starts there
 // reuse: rows the prefill skips. restored: 0, or 1 + the tier those rows come from (pool.h add_tier). counted: the
 // prefixes the request counted toward (pool.h count)
@@ -249,390 +238,207 @@ struct Quantum {
 };
 struct Completion { Key key; uint32_t emitted = 0; bool finished = false; uint32_t inserted = 0; };   // inserted: in total
 
+// scheduler-rs mirrors these types: the same layout, checked here
+#define G6S2_SAME(T, C) static_assert(sizeof(T) == sizeof(C) && alignof(T) == alignof(C), #T " layout");
+#define G6S2_AT(T, C, f) static_assert(offsetof(T, f) == offsetof(C, f), #T "::" #f " offset");
+G6S2_SAME(Key, g6sch_key) G6S2_AT(Key, g6sch_key, slot) G6S2_AT(Key, g6sch_key, generation)
+G6S2_SAME(g6rt::steering::Identity, g6sch_identity) G6S2_AT(g6rt::steering::Identity, g6sch_identity, scope)
+G6S2_AT(g6rt::steering::Identity, g6sch_identity, schedule_digest) G6S2_AT(g6rt::steering::Identity, g6sch_identity, scale_bits)
+G6S2_AT(g6rt::steering::Identity, g6sch_identity, slot)
+G6S2_SAME(Request, g6sch_request) G6S2_AT(Request, g6sch_request, steering) G6S2_AT(Request, g6sch_request, r_rows)
+G6S2_SAME(Run, g6sch_run) G6S2_AT(Run, g6sch_run, table_version) G6S2_AT(Run, g6sch_run, list_hash)
+G6S2_SAME(Phase, uint32_t)
+G6S2_SAME(Slot, g6sch_slot) G6S2_AT(Slot, g6sch_slot, req) G6S2_AT(Slot, g6sch_slot, run) G6S2_AT(Slot, g6sch_slot, phase)
+G6S2_AT(Slot, g6sch_slot, deferred) G6S2_AT(Slot, g6sch_slot, packable) G6S2_AT(Slot, g6sch_slot, pack_tail)
+G6S2_AT(Slot, g6sch_slot, parked)
+G6S2_SAME(Grant, g6sch_grant) G6S2_AT(Grant, g6sch_grant, run) G6S2_AT(Grant, g6sch_grant, reuse)
+G6S2_AT(Grant, g6sch_grant, counted)
+G6S2_SAME(Shrink, g6sch_shrink) G6S2_AT(Shrink, g6sch_shrink, r_rows) G6S2_AT(Shrink, g6sch_shrink, run)
+G6S2_SAME(Completion, g6sch_completion) G6S2_AT(Completion, g6sch_completion, finished)
+G6S2_AT(Completion, g6sch_completion, inserted)
+#undef G6S2_SAME
+#undef G6S2_AT
+static_assert(MAX_SESSIONS <= G6SCH_QMAX, "scheduler-rs quantum size");
+namespace sch {
+template <class C, class T> inline const C* c(const T* p) { return reinterpret_cast<const C*>(p); }
+template <class C, class T> inline C* m(T* p) { return reinterpret_cast<C*>(p); }
+inline g6sch_quantum to_rs(const Quantum& q) {
+    g6sch_quantum o{};
+    o.kind = uint32_t(q.kind); o.boundary = q.boundary; o.count = q.count; o.first = q.first; o.rows = q.rows;
+    for (unsigned i = 0; i < MAX_SESSIONS; ++i) {
+        o.keys[i] = {q.keys[i].epoch, q.keys[i].slot, q.keys[i].generation};
+        o.firsts[i] = q.firsts[i]; o.row_counts[i] = q.row_counts[i];
+    }
+    return o;
+}
+inline Quantum from_rs(const g6sch_quantum& o) {
+    Quantum q;
+    q.kind = Kind(o.kind); q.boundary = o.boundary; q.count = o.count; q.first = o.first; q.rows = o.rows;
+    for (unsigned i = 0; i < MAX_SESSIONS; ++i) {
+        q.keys[i] = {o.keys[i].epoch, o.keys[i].slot, o.keys[i].generation};
+        q.firsts[i] = o.firsts[i]; q.row_counts[i] = o.row_counts[i];
+    }
+    return q;
+}
+// the Rust side agrees on every size and constant both sides define
+inline void check_abi() {
+    static const bool ok = [] {
+        const std::pair<uint32_t, uint64_t> want[] = {
+            {G6SCH_ABI_SLOT, sizeof(g6sch_slot)}, {G6SCH_ABI_CONFIG, sizeof(g6sch_config)},
+            {G6SCH_ABI_QUANTUM, sizeof(g6sch_quantum)}, {G6SCH_ABI_STATE, sizeof(g6sch_state)},
+            {G6SCH_ABI_COMMIT, sizeof(g6sch_commit)}, {G6SCH_ABI_COMPLETION, sizeof(g6sch_completion)},
+            {G6SCH_ABI_GRANT, sizeof(g6sch_grant)}, {G6SCH_ABI_PAGE, PAGE},
+            {G6SCH_ABI_PREFILL_DEFER_MAX, PREFILL_DEFER_MAX}, {G6SCH_ABI_NOTICE_MIN, NOTICE_MIN},
+            {G6SCH_ABI_NOTICE_MAX, NOTICE_MAX}, {G6SCH_ABI_NOTICE_ROWS, NOTICE_ROWS},
+            {G6SCH_ABI_MAX_DECODE_ROUNDS, MAX_DECODE_ROUNDS}, {G6SCH_ABI_PACK_MAX_MEMBERS, PACK_MAX_MEMBERS},
+            {G6SCH_ABI_QMAX, G6SCH_QMAX}};
+        for (const auto& [what, v] : want) if (g6sch_abi(what) != v) return false;
+        return true;
+    }();
+    require(ok, "scheduler-rs: struct sizes or constants differ from scheduler.h");
+}
+} // namespace sch
+inline uint64_t reserve_rows(const Config& c, const Request& r) {
+    const auto x = c.scalars();
+    return sch_out<uint64_t>([&](uint64_t* v) { return g6sch_reserve_rows(&x, sch::c<g6sch_request>(&r), v); });
+}
+inline uint32_t reserve_pages(const Config& c, const Request& r) {
+    const auto x = c.scalars();
+    return sch_out<uint32_t>([&](uint32_t* v) { return g6sch_reserve_pages(&x, sch::c<g6sch_request>(&r), v); });
+}
+inline uint64_t round_rows(const Config& c, uint64_t length) { const auto x = c.scalars(); return g6sch_round_rows(&x, length); }
+inline uint64_t grant_rows(const Config& c, const Request& r) {
+    const auto x = c.scalars();
+    return sch_out<uint64_t>([&](uint64_t* v) { return g6sch_grant_rows(&x, sch::c<g6sch_request>(&r), v); });
+}
+inline uint32_t grant_pages(const Config& c, const Request& r) {
+    const auto x = c.scalars();
+    return sch_out<uint32_t>([&](uint32_t* v) { return g6sch_grant_pages(&x, sch::c<g6sch_request>(&r), v); });
+}
+inline bool grant_pages_ok(const Config& c, const Request& r, uint32_t pages) {
+    const auto x = c.scalars();
+    return sch_out<bool>([&](bool* v) { return g6sch_grant_pages_ok(&x, sch::c<g6sch_request>(&r), pages, v); });
+}
+inline uint32_t prefill_left(const Slot& s) { return g6sch_prefill_left(sch::c<g6sch_slot>(&s)); }
+inline bool prefill_first(const Slot& a, const Slot& b) { return g6sch_prefill_first(sch::c<g6sch_slot>(&a), sch::c<g6sch_slot>(&b)); }
+
+// The scheduler's rules are engine/scheduler-rs/src/scheduler.rs; this class owns the state they act on.
 class Scheduler {
     Config c_;
+    g6sch_config x_;
     std::array<Slot, MAX_SESSIONS> s_{};
-    uint64_t boundary_ = 0, event_ = 0, revision_ = 0, last_id_ = 0, pool_ = 0;
-    bool have_id_ = false;
-    bool want_decode_ = true, busy_ = false, failed_ = false;
-    uint64_t park_seq_ = 0;     // Config::park: slots parked so far (Slot::parked)
-    uint32_t decode_run_ = 0;   // decode rounds completed since the last prefill quantum (alternate; read only when decode_rounds > 1)
-    Quantum work_;
-    Slot& slot(const Key& k) {
-        require(k.slot < MAX_SESSIONS && s_[k.slot].key == k && s_[k.slot].phase != Phase::Free, "stale session key");
-        return s_[k.slot];
-    }
-    void finish_slot(Slot& s, const Completion& r) {
-        require(s.key == r.key && r.emitted <= s.req.max_tokens - s.emitted, "invalid completion");
-        s.emitted += r.emitted;
-        require(r.inserted >= s.inserted, "insert count went back");
-        s.inserted = r.inserted;
-        if (r.finished || s.emitted == s.req.max_tokens) { s.phase = Phase::Retiring; ++revision_; }
-        else s.phase = Phase::Decode;
-    }
-    void completed() {
-        boundary_ = work_.boundary; busy_ = false; alternate(c_, work_.kind, want_decode_, decode_run_);
-        // The prefill choice below reads these counters, so they advance here on replicated state alone: the session this
-        // quantum served has had its turn, every other prefilling session was passed over once. A PromptTail leaves
-        // Phase::Prefill as it completes, so it is never reset here and its rivals are still counted as passed over.
-        if (!c_.c8_pack && (work_.kind == Kind::Prefill || work_.kind == Kind::PromptTail)) {
-            for (auto& s : s_) if (s.phase == Phase::Prefill) s.deferred = s.key == work_.keys[0] ? 0 : s.deferred + 1;
-        } else if (work_.kind == Kind::Prefill || work_.kind == Kind::PromptTail || work_.kind == Kind::PrefillPack || work_.kind == Kind::PromptTailPack)
-            for (auto& s : s_) if (s.phase == Phase::Prefill) {
-                bool served = false;
-                for (unsigned i = 0; i < work_.count; ++i) served |= s.key == work_.keys[i];
-                s.deferred = served ? 0 : s.deferred + 1;
-            }
-    }
+    g6sch_state st_{};
+    const g6sch_slot* rs() const { return sch::c<g6sch_slot>(s_.data()); }
+    g6sch_slot* rs() { return sch::m<g6sch_slot>(s_.data()); }
 public:
-    explicit Scheduler(Config c) : c_(c) {
+    explicit Scheduler(Config c) : c_(c), x_(c.scalars()) {
+        sch::check_abi();
         c_.validate();
-        for (unsigned i = 0; i < MAX_SESSIONS; ++i) s_[i].key = Key{c_.epoch, i, 0};
+        st_.want_decode = true;
+        g6sch_init(&x_, rs(), MAX_SESSIONS);
     }
     const Config& config() const { return c_; }
     const auto& slots() const { return s_; }
-    uint64_t boundary() const { return boundary_; }
-    uint64_t next_event() const { return event_ + 1; }
-    uint64_t revision() const { return revision_; }
-    bool busy() const { return busy_; }
-    void idle_boundary(uint64_t target) { // event-only: no model work, all sessions already quiescent
-        require(!failed_ && !busy_ && !resident() && target >= boundary_, "cannot advance a live boundary");
-        boundary_ = target;
-    }
-    void fail() { failed_ = true; }
+    uint64_t boundary() const { return st_.boundary; }
+    uint64_t next_event() const { return st_.event + 1; }
+    uint64_t revision() const { return st_.revision; }
+    bool busy() const { return st_.busy; }
+    void idle_boundary(uint64_t target) { check(g6sch_idle_boundary(rs(), MAX_SESSIONS, &st_, target)); }   // event-only: no model work
+    void fail() { st_.failed = true; }
     // the pool's digest (pool.h RunPool::digest) at this event boundary, so the ranks also agree on their pages
-    void pool_digest(uint64_t d) { pool_ = d; }
-    unsigned resident() const {
-        unsigned n = 0; for (const auto& s : s_) n += s.phase != Phase::Free && s.phase != Phase::Retiring && s.phase != Phase::Parked; return n;
-    }
-    unsigned retiring() const {
-        unsigned n = 0; for (const auto& s : s_) n += s.phase == Phase::Retiring; return n;
-    }
-    unsigned parked() const {
-        unsigned n = 0; for (const auto& s : s_) n += s.phase == Phase::Parked; return n;
-    }
+    void pool_digest(uint64_t d) { st_.pool = d; }
+    unsigned resident() const { return g6sch_resident(rs(), MAX_SESSIONS); }
+    unsigned retiring() const { return g6sch_retiring(rs(), MAX_SESSIONS); }
+    unsigned parked() const { return g6sch_parked(rs(), MAX_SESSIONS); }
     std::optional<Key> find(uint64_t id) const {
-        for (const auto& s : s_) if (s.phase != Phase::Free && s.phase != Phase::Parked && s.req.id == id) return s.key;
-        return {};
+        g6sch_key k;
+        if (!g6sch_find(rs(), MAX_SESSIONS, id, &k)) return {};
+        return Key{k.epoch, k.slot, k.generation};
     }
     // park: a parked slot (or a Retiring one, which the commit parks) the grant takes for a follow-up that extends it
     Key next_key(std::optional<Key> cancel = {}, std::optional<unsigned> park = {}) const {
-        auto key = [&](const Slot& s) {
-            require(s.key.generation != UINT32_MAX, "session generation exhausted");
-            return Key{c_.epoch, s.key.slot, s.key.generation + 1};
-        };
-        if (park) {
-            require(c_.park && *park < MAX_SESSIONS && (s_[*park].phase == Phase::Parked || s_[*park].phase == Phase::Retiring),
-                    "no parked session on that slot");
-            return key(s_[*park]);
-        }
-        if (!c_.park) {
-            for (const auto& s : s_) if (s.phase == Phase::Free || s.phase == Phase::Retiring || (cancel && s.key == *cancel)) return key(s);
-            throw std::runtime_error("no session slot");
-        }
-        // park: a free slot of the first limit(), else the oldest parked one (a Retiring slot parks at this commit, so
-        // it is younger than every parked slot; among those the lowest slot). Replicated state only: every rank names it
-        for (unsigned i = 0; i < c_.limit(); ++i)
-            if (s_[i].phase == Phase::Free || (cancel && s_[i].key == *cancel && s_[i].phase != Phase::Parked)) return key(s_[i]);
-        const Slot* old = nullptr;
-        auto order = [](const Slot& s) { return s.phase == Phase::Parked ? s.parked : UINT64_MAX; };
-        for (unsigned i = 0; i < c_.limit(); ++i)
-            if ((s_[i].phase == Phase::Parked || s_[i].phase == Phase::Retiring) && (!old || order(s_[i]) < order(*old))) old = &s_[i];
-        if (old) return key(*old);
-        throw std::runtime_error("no session slot");
+        g6sch_key k;
+        check(g6sch_next_key(&x_, rs(), MAX_SESSIONS, cancel ? sch::c<g6sch_key>(&*cancel) : nullptr, bool(park),
+                             park.value_or(0), &k));
+        return Key{k.epoch, k.slot, k.generation};
     }
     std::vector<Run> reclaimable(std::optional<Key> cancel = {}) const {
-        std::vector<Run> out;
-        for (const auto& s : s_)   // park: a Retiring slot parks instead, and a parked one is never cancelled
-            if (c_.park ? s.phase != Phase::Retiring && s.phase != Phase::Parked && cancel && s.phase != Phase::Free && s.key == *cancel
-                        : s.phase == Phase::Retiring || (cancel && s.phase != Phase::Free && s.key == *cancel))
-                out.push_back(s.run);
+        std::vector<Run> out(MAX_SESSIONS);
+        out.resize(g6sch_reclaimable(&x_, rs(), MAX_SESSIONS, cancel ? sch::c<g6sch_key>(&*cancel) : nullptr, sch::m<g6sch_run>(out.data())));
         return out;
     }
     uint64_t digest() const { // event diagnostics only; NEVER called by next()/complete()
-        uint64_t h = 14695981039346656037ull;
-        auto add = [&](uint64_t v) { for (unsigned i = 0; i < 8; ++i) { h ^= uint8_t(v >> (8*i)); h *= 1099511628211ull; } };
-        add(c_.epoch); add(c_.pool_rows); add(c_.max_rows); add(c_.max_sessions); add(c_.mtp); add(c_.guard());
-        add(c_.prefill_rows); add(c_.two_lanes); if (c_.decode_prefill_rows) add(c_.decode_prefill_rows); add(have_id_); add(last_id_); add(boundary_); add(event_); add(want_decode_); add(busy_); add(failed_);
-        if (c_.decode_rounds > 1) { add(c_.decode_rounds); add(decode_run_); }
-        if (c_.window_pages) add(c_.window_pages);
-        if (c_.tail_first) add(0x7A11F1257ull);
-        if (c_.c8_pack) add(0xC8A11F1257ull);
-        if (c_.notice_max != NOTICE_MAX) add(c_.notice_max);
-        if (c_.cp_step_rows) { add(c_.cp_step_rows); add(c_.cp_after); add(c_.cp_seg); }
-        if (c_.r2_rows) add(c_.r2_rows);
-        if (c_.park) { add(0x9A12CEDull); add(park_seq_); }
-        add(pool_); g6rt::steering::hash_boot(h, c_.steering);
-        for (const auto& s : s_) {
-            add(s.key.slot); add(s.key.generation); add(uint64_t(s.phase));
-            if (s.phase == Phase::Free) continue;
-            add(s.req.id); add(s.req.prompt_tokens); add(s.req.max_tokens);
-            g6rt::steering::hash_identity(h, s.req.steering);
-            if (s.req.r_rows) add(s.req.r_rows);
-            add(s.run.first_page); add(s.run.pages); add(s.run.table_version); add(s.run.list_hash); add(s.prefilled); add(s.emitted);
-            add(s.inserted); add(s.deferred);
-            if (c_.c8_pack) { add(s.packable); add(s.pack_tail); }
-            if (c_.park) add(s.parked);
-        }
-        return h;
+        uint64_t h = g6sch_digest_head(&x_, &st_);
+        g6rt::steering::hash_boot(h, c_.steering);
+        return g6sch_digest_slots(&x_, rs(), MAX_SESSIONS, h);
     }
     Changes apply(const Commit& e) {
-        require(!failed_ && !busy_, "commit requires quiescent live engine");
-        require(e.epoch == c_.epoch && e.event == event_ + 1 && e.boundary == boundary_ && e.before_hash == digest(), "event/state mismatch");
-        auto after = s_; // validate whole transaction before mutating scheduler state
+        g6sch_commit x{};
+        x.epoch = e.epoch; x.event = e.event; x.boundary = e.boundary; x.before_hash = e.before_hash;
+        if ((x.has_cancel = bool(e.cancel))) std::memcpy(&x.cancel, &*e.cancel, sizeof x.cancel);
+        if ((x.has_admit = bool(e.admit))) std::memcpy(&x.admit, &*e.admit, sizeof x.admit);
+        if ((x.has_shrink = bool(e.shrink))) std::memcpy(&x.shrink, &*e.shrink, sizeof x.shrink);
         Changes d;
-        uint64_t park_seq = park_seq_;
-        for (auto& s : after) {
-            // park: a finished session parks (its pages went back to the pool when it finished, as before), and a cancel
-            // never names a parked or finished one (find)
-            if (c_.park && s.phase == Phase::Retiring) { s.phase = Phase::Parked; s.parked = ++park_seq; continue; }
-            if (s.phase == Phase::Retiring || (e.cancel && s.phase != Phase::Free && s.phase != Phase::Parked && s.key == *e.cancel)) {
-                d.freed.push_back(s.run); s.phase = Phase::Free;
-            }
-        }
-        if (e.cancel) require(e.cancel->epoch == c_.epoch, "cancel epoch mismatch");
-        if (e.shrink) {
-            const Shrink& k = *e.shrink;
-            require(k.key.epoch == c_.epoch && k.key.slot < MAX_SESSIONS, "bad shrink key");
-            Slot& t = after[k.key.slot];
-            require(t.phase == Phase::Decode && t.key == k.key && c_.r2_rows && k.r_rows == c_.r2_rows && !t.req.r_rows &&
-                    k.run.table_version == t.run.table_version && k.run.pages == t.run.pages, "bad shrink");
-            t.req.r_rows = k.r_rows; t.run = k.run;
-        }
-        if (e.admit) {
-            const auto& g = *e.admit;
-            require(!have_id_ || g.req.id > last_id_, "native request ordinals must increase");
-            require(g.key.slot < MAX_SESSIONS && g.key.epoch == c_.epoch, "bad grant key");
-            auto& target = after[g.key.slot];
-            require((target.phase == Phase::Free || (c_.park && target.phase == Phase::Parked)) && target.key.generation != UINT32_MAX && g.key.generation == target.key.generation + 1, "grant slot generation mismatch");
-            // the pool rejects a page two runs hold. A run past R holds its worst case (reserve_pages) from the start
-            require(grant_pages_ok(c_, g.req, g.run.pages) &&
-                    g.run.first_page < c_.pool_rows/PAGE && g.run.table_version, "bad reservation");
-            unsigned live = 0;
-            for (const auto& s : after) if (s.phase != Phase::Free && s.phase != Phase::Parked) {
-                ++live;
-                require(s.req.id != g.req.id, "duplicate native request id");
-            }
-            require(live < c_.limit(), "active session/row limit");
-            require(g.reuse < g.req.prompt_tokens, "reused rows past the prompt");
-            require(!g.req.r_rows || g.req.r_rows == c_.r2_rows, "grant at an R the engine does not have");
-            target = Slot{g.key, g.req, g.run, Phase::Prefill, g.reuse, 0};
-            target.packable = c_.c8_pack && !g.reuse && !g.restored && !g.req.steering.enabled;
-            d.admitted = g;
-        }
-        if (e.admit) { last_id_ = e.admit->req.id; have_id_ = true; }
-        s_ = after; event_ = e.event; ++revision_; park_seq_ = park_seq;
+        d.freed.resize(MAX_SESSIONS);
+        size_t n = 0; bool admitted = false;
+        check(g6sch_apply(&x_, rs(), MAX_SESSIONS, &st_, &x, digest(), sch::m<g6sch_run>(d.freed.data()), &n, &admitted));
+        d.freed.resize(n);
+        if (admitted) d.admitted = e.admit;
         return d; // allocator adapter now applies these canonical changes; no local allocation choice here
     }
     // a decoding session's run grew (Driver::step, every rank alike, between events)
     void grow(const Key& k, const Run& r) {
-        auto& s = slot(k);
-        require(!busy_ && s.phase == Phase::Decode && r.table_version == s.run.table_version && r.first_page == s.run.first_page &&
-                r.pages > s.run.pages && r.pages <= reserve_pages(c_, s.req), "bad run growth");
-        s.run = r;
+        check(g6sch_grow(&x_, rs(), MAX_SESSIONS, &st_, sch::c<g6sch_key>(&k), sch::c<g6sch_run>(&r)));
     }
     // the decoding sessions in ascending request id, as next() orders them
     std::vector<Key> decoding() const {
-        std::vector<const Slot*> v;
-        for (const auto& s : s_) if (s.phase == Phase::Decode) v.push_back(&s);
-        std::sort(v.begin(), v.end(), [](const Slot* a, const Slot* b) { return a->req.id < b->req.id; });
-        std::vector<Key> out;
-        for (const Slot* s : v) out.push_back(s->key);
+        std::vector<Key> out(MAX_SESSIONS);
+        out.resize(g6sch_decoding(rs(), MAX_SESSIONS, sch::m<g6sch_key>(out.data())));
         return out;
     }
     // The alternation flag after a completed quantum of kind k: a prefill (or tail) asks for a decode round next; a decode
-    // round asks for the prefill unless fewer than decode_rounds rounds have run since the last prefill. With
-    // decode_rounds <= 1 this is exactly `want = k != Decode`. Replicated state only (the kinds every rank completed), and
-    // horizon() runs the same function forward, so the notice target agrees with the steps the ranks will take.
+    // round asks for the prefill unless fewer than decode_rounds rounds have run since the last prefill. horizon() runs
+    // the same function forward, so the notice target agrees with the steps the ranks will take.
     static void alternate(const Config& c, Kind k, bool& want, uint32_t& run) {
-        if (c.tail_first && k == Kind::PromptTail) return;   // a solo tail is one row: the decoders lose no round to it
-        if (k != Kind::Decode) { want = true; run = 0; return; }
-        if (run < MAX_DECODE_ROUNDS) ++run;
-        want = c.decode_rounds > 1 && run < c.decode_rounds;
+        const auto x = c.scalars();
+        g6sch_alternate(&x, uint32_t(k), &want, &run);
     }
-    // The next quantum's shape from slot state `s` and the alternation flag `want_decode`, without touching the
-    // scheduler: next() runs it on the live state to do the work, horizon() runs it forward on a copy to size a notice.
-    // `stalled` (decoding sessions left out of this round; the driver's) is passed as none by the projection, which can
-    // only make its decode rounds bigger, never its prefill quanta: the safe direction for a coverage estimate.
+    // The next quantum's shape from slot state `s` and the alternation flag, without touching the scheduler. `stalled`:
+    // decoding sessions left out of this round (the driver's); horizon() passes none.
     static Quantum plan(const Config& c, const std::array<Slot, MAX_SESSIONS>& s, bool want_decode,
                         const std::array<bool, MAX_SESSIONS>& stalled = {}) {
-        Quantum q;
-        std::array<const Slot*, MAX_SESSIONS> ordered{}; unsigned n = 0;
-        for (unsigned i = 0; i < MAX_SESSIONS; ++i)
-            if (s[i].phase == Phase::Prefill || (s[i].phase == Phase::Decode && !stalled[i])) ordered[n++] = &s[i];
-        // At most eight entries; avoid STL's 16-entry insertion-sort threshold
-        // (and GCC's array-bounds diagnostic on a partially filled std::array).
-        for (unsigned i = 1; i < n; ++i) {
-            const Slot* x = ordered[i]; unsigned j = i;
-            while (j && ordered[j-1]->req.id > x->req.id) { ordered[j] = ordered[j-1]; --j; }
-            ordered[j] = x;
-        }
-        // One prefill quantum serves one session: every decoding session joins the round, and of the prefilling ones
-        // prefill_first picks the shortest prompt that is not still owed a turn. Before, this was the lowest request id,
-        // which let one long prompt hold every prefill quantum against a short request admitted behind it (#61).
-        const Slot* pf = nullptr;
-        // any decoding session, stalled or not: the projection (horizon) passes none stalled, so the cap must not
-        // depend on `stalled`, or a projected quantum could be larger than the real one (the unsafe direction)
-        bool decoding = false;
-        for (unsigned i = 0; i < MAX_SESSIONS; ++i) decoding |= s[i].phase == Phase::Decode;
-        for (unsigned i = 0; i < n; ++i) {
-            if (ordered[i]->phase == Phase::Decode) q.keys[q.count++] = ordered[i]->key;
-            else if (!pf) pf = ordered[i];
-            else if (c.tail_first && (prefill_left(*ordered[i]) == 0) != (prefill_left(*pf) == 0)) {
-                if (prefill_left(*ordered[i]) == 0) pf = ordered[i];   // a ready tail outranks every prefill
-            } else if (prefill_first(*ordered[i], *pf)) pf = ordered[i];
-        }
-        // A held W pack owns its exact surviving membership until its tail. Cancellation may remove a key;
-        // a later admission never joins it. Serve the tail immediately, before the next decoder round.
-        if (c.c8_pack) {
-            unsigned held = 0;
-            for (unsigned i = 0; i < n; ++i) if (ordered[i]->phase == Phase::Prefill && ordered[i]->pack_tail) {
-                q.keys[held] = ordered[i]->key;
-                q.firsts[held] = ordered[i]->prefilled;
-                q.row_counts[held] = 1;
-                ++held;
-            }
-            if (held) {
-                q.count = held; q.kind = held > 1 ? Kind::PromptTailPack : Kind::PromptTail;
-                q.first = q.firsts[0]; q.rows = held;
-                return q;
-            }
-        }
-        if (q.count && (want_decode || !pf)) q.kind = Kind::Decode;
-        else if (pf) {
-            if (c.c8_pack && pf->packable && !pf->prefilled && prefill_left(*pf) >= 1 && prefill_left(*pf) <= 64) {
-                const uint32_t cap = decoding && c.decode_prefill_rows ? std::min({512u, c.prefill_rows, c.decode_prefill_rows})
-                    : std::min(512u, c.prefill_rows);
-                std::array<const Slot*, MAX_SESSIONS> take{};
-                unsigned m = 1; uint32_t total = prefill_left(*pf); take[0] = pf;
-                for (unsigned i = 0; i < n && m < PACK_MAX_MEMBERS; ++i) {
-                    const Slot* x = ordered[i];
-                    if (x == pf || x->phase != Phase::Prefill || !x->packable || x->prefilled) continue;
-                    const uint32_t left = prefill_left(*x);
-                    if (!left || left > 64 || total + left > cap) continue;
-                    take[m++] = x; total += left;
-                }
-                if (m > 1 && total <= cap) {
-                    // The first choice honors prefill_first/owed priority; execution order is native request id.
-                    for (unsigned i = 1; i < m; ++i) {
-                        const Slot* x = take[i]; unsigned j = i;
-                        while (j && take[j-1]->req.id > x->req.id) { take[j] = take[j-1]; --j; }
-                        take[j] = x;
-                    }
-                    q.kind = Kind::PrefillPack; q.count = m; q.rows = total;
-                    for (unsigned i = 0; i < m; ++i) {
-                        q.keys[i] = take[i]->key; q.firsts[i] = take[i]->prefilled; q.row_counts[i] = prefill_left(*take[i]);
-                    }
-                    return q;
-                }
-            }
-            q.count = 1; q.keys[0] = pf->key; q.first = pf->prefilled;
-            const uint32_t left = pf->req.prompt_tokens - 1 - pf->prefilled;
-            q.kind = left ? Kind::Prefill : Kind::PromptTail;
-            const uint64_t cap = decoding && c.decode_prefill_rows ? uint64_t(c.decode_prefill_rows)
-                : uint64_t(c.prefill_rows) * (c.two_lanes && left > c.prefill_rows ? 2 : 1);
-            q.rows = left ? uint32_t(std::min(uint64_t(left), cap)) : 1;
-        }
-        return q;
+        const auto x = c.scalars();
+        g6sch_quantum q;
+        g6sch_plan(&x, sch::c<g6sch_slot>(s.data()), MAX_SESSIONS, want_decode, stalled.data(), &q);
+        return sch::from_rs(q);
     }
     // stalled[slot]: a decoding session left out of this round (its run could not grow); it keeps its place
     Quantum next(const std::array<bool, MAX_SESSIONS>& stalled = {}) {
-        require(!failed_ && !busy_, "scheduler failed or work in flight");
-        Quantum q = plan(c_, s_, want_decode_, stalled);
-        q.boundary = boundary_ + 1;
-        if (q.kind != Kind::Idle) { work_ = q; busy_ = true; }
-        return q;
+        g6sch_quantum q;
+        check(g6sch_next(&x_, rs(), MAX_SESSIONS, &st_, stalled.data(), &q));
+        return sch::from_rs(q);
     }
-    // Advance a slot copy the way the completions do (prefilled, phase, the deferral counters): the projection in
-    // horizon() drives the same state machine next()/completed() drive, on a copy.
+    // Advance a slot copy the way the completions do (prefilled, phase, the deferral counters), for horizon()'s projection
     static void advance(std::array<Slot, MAX_SESSIONS>& sim, const Quantum& q) {
-        if (q.kind == Kind::Prefill) sim[q.keys[0].slot].prefilled += q.rows;
-        else if (q.kind == Kind::PromptTail) sim[q.keys[0].slot].phase = Phase::Decode;
-        else if (q.kind == Kind::PrefillPack) for (unsigned i = 0; i < q.count; ++i) {
-            auto& t = sim[q.keys[i].slot]; t.prefilled += q.row_counts[i]; t.pack_tail = true;
-        }
-        else if (q.kind == Kind::PromptTailPack) for (unsigned i = 0; i < q.count; ++i) {
-            auto& t = sim[q.keys[i].slot]; t.phase = Phase::Decode; t.pack_tail = false;
-        }
-        if (q.kind == Kind::Prefill || q.kind == Kind::PromptTail || q.kind == Kind::PrefillPack || q.kind == Kind::PromptTailPack)
-            for (auto& t : sim) if (t.phase == Phase::Prefill) {
-                bool served = false;
-                for (unsigned i = 0; i < q.count; ++i) served |= t.key == q.keys[i];
-                t.deferred = served ? 0 : t.deferred + 1;
-            }
+        const g6sch_quantum x = sch::to_rs(q);
+        g6sch_advance(sch::m<g6sch_slot>(sim.data()), MAX_SESSIONS, &x);
     }
     // The boundary a notice anchored now should target (service.h event): the first boundary whose work after the one
-    // in flight covers NOTICE_ROWS prefill rows, within [boundary + NOTICE_MIN, boundary + NOTICE_MAX]. The boundary in
-    // flight may be nearly done, so its remaining time is unknowable and the projection advances past it before
-    // counting; a tail's session is assumed to keep decoding, which if wrong only loses a decoder and so adds
-    // coverage, never removes it. A pure function of the slots and the alternation flag, so every rank names the same
-    // boundary; the head's compute thread publishes it for the control thread, which may not read the scheduler.
-    uint64_t horizon() const {
-        auto sim = s_;
-        bool want = want_decode_;
-        uint32_t run = decode_run_;
-        const Quantum inflight = plan(c_, sim, want);
-        if (inflight.kind == Kind::Idle) return boundary_ + NOTICE_MIN;   // the engine blocks: no boundary departs
-        advance(sim, inflight);
-        alternate(c_, inflight.kind, want, run);
-        uint32_t covered = 0;
-        for (uint64_t k = NOTICE_MIN; k < c_.notice_max; ++k) {
-            const Quantum q = plan(c_, sim, want);
-            if (q.kind == Kind::Idle) return boundary_ + k;   // no work left: the engine blocks before this boundary
-            advance(sim, q);
-            alternate(c_, q.kind, want, run);
-            covered += q.kind == Kind::Prefill || q.kind == Kind::PrefillPack ? q.rows
-                : q.kind == Kind::PromptTail || q.kind == Kind::PromptTailPack ? q.rows : 0;
-            if (covered >= NOTICE_ROWS) return boundary_ + k;
-        }
-        return boundary_ + c_.notice_max;
-    }
+    // in flight covers NOTICE_ROWS prefill rows, within [boundary + NOTICE_MIN, boundary + notice_max]. A pure function
+    // of the slots and the alternation flag, so every rank names the same boundary.
+    uint64_t horizon() const { return g6sch_horizon(&x_, rs(), MAX_SESSIONS, &st_); }
     // a just-admitted session that runs its whole prompt as decode steps (prompt logprobs): straight to PromptTail
-    void skip_prefill(const Key& k) {
-        auto& s = slot(k); require(!busy_ && s.phase == Phase::Prefill && !s.prefilled, "skip_prefill outside admission");
-        s.prefilled = s.req.prompt_tokens - 1;
-    }
-    void complete_prefill() { // full quantum incl. both lanes and draft prefill; caller already synchronized
-        require(busy_ && work_.kind == Kind::Prefill, "not a prefill quantum");
-        slot(work_.keys[0]).prefilled += work_.rows; completed();
-    }
-    void complete_prefill_pack() { // one synchronized W pass, all selected sessions advance together
-        require(busy_ && work_.kind == Kind::PrefillPack && work_.count >= 2, "not a prefill pack quantum");
-        for (unsigned i = 0; i < work_.count; ++i) {
-            auto& s = slot(work_.keys[i]);
-            require(s.phase == Phase::Prefill && !s.pack_tail && s.prefilled == work_.firsts[i] &&
-                    work_.row_counts[i] && work_.row_counts[i] == prefill_left(s), "prefill pack membership changed");
-        }
-        for (unsigned i = 0; i < work_.count; ++i) {
-            auto& s = slot(work_.keys[i]); s.prefilled += work_.row_counts[i]; s.pack_tail = true;
-        }
-        completed();
-    }
+    void skip_prefill(const Key& k) { check(g6sch_skip_prefill(rs(), MAX_SESSIONS, &st_, sch::c<g6sch_key>(&k))); }
+    void complete_prefill() { check(g6sch_complete_prefill(&x_, rs(), MAX_SESSIONS, &st_)); }   // both lanes and draft prefill
+    void complete_prefill_pack() { check(g6sch_complete_prefill_pack(&x_, rs(), MAX_SESSIONS, &st_)); }
     void complete_tail(const Completion& r) {
-        require(busy_ && work_.kind == Kind::PromptTail && work_.keys[0] == r.key, "not this prompt tail");
-        auto copy = slot(r.key); finish_slot(copy, r); copy.pack_tail = false; slot(r.key) = copy; completed();
+        check(g6sch_complete_tail(&x_, rs(), MAX_SESSIONS, &st_, sch::c<g6sch_completion>(&r)));
     }
     void complete_tail_pack(const std::vector<Completion>& r) {
-        require(busy_ && work_.kind == Kind::PromptTailPack && r.size() == work_.count, "not this prompt tail pack");
-        auto copy = s_; // reject the entire pack before publishing any session completion
-        for (unsigned i = 0; i < r.size(); ++i) {
-            require(work_.keys[i] == r[i].key && copy[r[i].key.slot].pack_tail &&
-                    r[i].emitted <= copy[r[i].key.slot].req.max_tokens - copy[r[i].key.slot].emitted &&
-                    r[i].inserted >= copy[r[i].key.slot].inserted, "tail pack completion invalid");
-        }
-        for (unsigned i = 0; i < r.size(); ++i) {
-            finish_slot(copy[r[i].key.slot], r[i]); copy[r[i].key.slot].pack_tail = false;
-        }
-        s_ = copy; completed();
+        check(g6sch_complete_tail_pack(&x_, rs(), MAX_SESSIONS, &st_, sch::c<g6sch_completion>(r.data()), r.size()));
     }
     void complete_decode(const std::vector<Completion>& r) {
-        require(busy_ && work_.kind == Kind::Decode && r.size() == work_.count, "not this decode round");
-        for (unsigned i = 0; i < r.size(); ++i) {
-            require(r[i].key == work_.keys[i], "decode completion order differs");
-            const auto& s = slot(r[i].key); require(r[i].emitted <= s.req.max_tokens - s.emitted, "too many output tokens");
-        }
-        for (const auto& x : r) finish_slot(slot(x.key), x);
-        completed();
+        check(g6sch_complete_decode(&x_, rs(), MAX_SESSIONS, &st_, sch::c<g6sch_completion>(r.data()), r.size()));
     }
 };
 

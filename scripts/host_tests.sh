@@ -81,8 +81,11 @@ for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_M
   "$T/module_info_test"
 done
 # engine/scheduler-rs against the C++ it replaced (tests/ref/*_ref.h)
-g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rs_diff_test.cpp" -o "$T/scheduler_rs_diff_test" "${KNOBS[@]}"
-"$T/scheduler_rs_diff_test"
+# in each model's shape: the module's caps and MAX_SESSIONS decide which configs the scheduler takes
+for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rs_diff_test.cpp" -o "$T/scheduler_rs_diff_test" "${KNOBS[@]}"
+  "$T/scheduler_rs_diff_test"
+done
 # the planner's round log and its replay (GR8_S2_REPLAY_LOG, s2/round_replay.h); GR8_S2_FRESH_SPEC
 g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_replay_test.cpp" -o "$T/batch_replay_test" "${KNOBS[@]}"
 "$T/batch_replay_test" "$T/replay.log"
