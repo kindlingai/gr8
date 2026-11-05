@@ -37,6 +37,8 @@ FLAGS="-gencode=arch=compute_$A,code=sm_$A $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR8_NR
 # every test links the knob table (engine/knobs-rs): the engine headers read their settings through it
 KNOBLIB="$REPO/engine/knobs-rs/target/release/libgr8knobs.a"
 [ -f "$KNOBLIB" ] || cargo build --quiet --release --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
+SCHEDLIB="$REPO/engine/scheduler-rs/target/release/libg6sched.a"   # the S2 scheduling logic (engine/scheduler-rs)
+[ -f "$SCHEDLIB" ] || cargo build --quiet --release --manifest-path "$REPO/engine/scheduler-rs/Cargo.toml"
 build_run() {   # build_run <test> <extra sources...>  (test args in ARGS); a test outside runtime/tests is a path under engine/
   local src=$1; shift
   case "$src" in */*) ;; *) src=runtime/tests/$src ;; esac
@@ -46,12 +48,12 @@ build_run() {   # build_run <test> <extra sources...>  (test args in ARGS); a te
   [ -x "$BIN" ] || stale=1
   [ "$(cat "$BIN.flags" 2>/dev/null)" = "$FLAGS" ] || stale=1
   if [ "$stale" = 0 ] && [ -n "$(find "$REPO/engine" -type f \( -name '*.cu' -o -name '*.cuh' -o -name '*.h' \) -newer "$BIN" -print -quit)" ]; then stale=1; fi
-  local a; for a in "$@" "$KNOBLIB"; do [ -f "$a" ] && [ "$a" -nt "$BIN" ] && stale=1; done   # e.g. a rebuilt libg6kvman.a
+  local a; for a in "$@" "$KNOBLIB" "$SCHEDLIB"; do [ -f "$a" ] && [ "$a" -nt "$BIN" ] && stale=1; done   # e.g. a rebuilt libg6kvman.a
   if [ "$stale" = 1 ]; then
     echo "building $BIN ($FLAGS)"
     rm -f "$BIN" "$BIN.flags"
     # shellcheck disable=SC2086
-    nvcc -O2 -std=c++17 $FLAGS -o "$BIN" "$SRC" "$@" "$KNOBLIB" -lpthread -ldl -lm
+    nvcc -O2 -std=c++17 $FLAGS -o "$BIN" "$SRC" "$@" "$KNOBLIB" "$SCHEDLIB" -lpthread -ldl -lm
     echo "$FLAGS" > "$BIN.flags"
   else
     echo "up to date: $BIN"

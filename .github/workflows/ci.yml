@@ -103,6 +103,7 @@ jobs:
               - 'engine/loader-rs/**'
               - 'engine/kvman-rs/**'
               - 'engine/knobs-rs/**'
+              - 'engine/scheduler-rs/**'
               - 'knobs/**'
               - 'frontend/g6front-rs/**'
             # the engine builds and the image: what the Dockerfile's engine stages copy (the front end's Cargo files
@@ -148,6 +149,7 @@ jobs:
             engine/loader-rs/target
             engine/kvman-rs/target
             engine/knobs-rs/target
+            engine/scheduler-rs/target
             frontend/g6front-rs/target
             frontend/pseudo-engine/target
           key: cargo-${{ matrix.part }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', '**/rust-toolchain.toml') }}

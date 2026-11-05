@@ -232,6 +232,18 @@ also want `PACK_MAX_MEMBERS` and the drafters' block sizes in `ModuleInfo`. The 
 scheduler, driver and pool host tests ported, and a differential run of the C++ and Rust versions on the command log
 (same `Quantum` sequence and pool digest, which ranks compare at `service.h:499`). One C call per round.
 
+R2 lands in four parts:
+
+1. R2a: the crate (`engine/scheduler-rs`, `libg6sched.a`, `g6sched.h`) and the small policies first: KV copy batches
+   (`kv_plan.h`), Flash chunk lending (`flash_lend.h`), Flash KDA rings and capture sets (`flash_ring.h`), rounds past R
+   (`cp_rows.h`). The C++ headers keep their types and call Rust; the state stays in C++ structs with the same layout,
+   so C++ copies and owns it as before. The C++ they replaced stays in `s2/tests/ref/` for `scheduler_rs_diff_test`,
+   which runs seeded random inputs through both and requires the same results and refusals. Every build, test and image
+   links the library (`scripts/build.sh`, `build_m4.sh`, `host_tests.sh`, `c1_tests.sh`, the Dockerfile, CI).
+2. R2b: the `Scheduler` itself, against the retained C++ on random command streams.
+3. R2c: the session logic and `kv_share.h`.
+4. R2d: `s2/pool.h` goes, the pool called Rust to Rust; the reference copies go with it.
+
 ### R3. The planner to Rust
 
 Moves `s2_batch.h` (about 1,500 lines), `spec_len.h`, `insert_rule.h`, `ngram_lookup.h` and `ctx_lookup.h`. The boundary is
