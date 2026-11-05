@@ -50,11 +50,12 @@ one to choose its settings.
   own. Fetching whole files for one rank's run plus the other files saves far less than it looks: 360.95 GB for
   rank 0, and more for ranks 1 and 2.
 
-  Our own boxes measure 133.69 GiB (143.55 GB) each — 77.00 GiB routed experts, 56.66 GiB dense, and 50.74 GB of
-  Engram rows. That is a **measurement of a sparse-staged copy**, not what downloading gives you: every one of the 46
-  part files is there with its real header and logical size, and only the byte ranges that rank reads were ever
-  written, so `du` reads 143 GB where `du --apparent-size` reads 510 GB. We have no public tool that stages a copy
-  that way, so treat 143 GB as our number and 510.6 GB as yours.
+  Our own boxes measure 133.69 GiB (143.55 GB) each — 77.00 GiB routed experts and 56.66 GiB dense; the dense total
+  already holds the 50.74 GB of Engram rows, which are not a third category. That is a **measurement of a
+  sparse-staged copy**, not what downloading gives you: every one of the 46 part files is there with its real header
+  and logical size, and only the byte ranges that rank reads were ever written, so `du` reads 143 GB where
+  `du --apparent-size` reads 510 GB. We have no public tool that stages a copy that way, so treat 143 GB as our
+  number and 510.6 GB as yours.
 - **No drafter.** `ds41` drafts with the checkpoint's own MTP layers (DSpark), so leave `DRAFTER` out of the config.
   The check refuses a boot that names one.
 - **The DeepSeek binary, built on every box.** `up` does not build it for you:
