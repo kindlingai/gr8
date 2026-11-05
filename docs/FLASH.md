@@ -147,10 +147,15 @@ The store: the one `KV_STORE` (`--kv-store`; `mem:`, `ssd:PATH` or `remote:HOST:
 `FLASH_STATE_BUDGET_MIB` (8,192) a rank. An SSD folder starts empty at every boot unless `persist=on` (aligned only):
 then the index is written beside the blocks after every capture and resize (`flash-ckpt.index`, a temporary file
 renamed over it), and a boot with the same compat line (model set, TP, rank, CAP, layout, engine build) and store size
-takes back every entry whose manifest block is still its own. A spare RAM cache on the store
-(`cache:NAME,kind=spare_ram`) keeps a copy of the blocks in memory the kernel may take back, as on GLM-5.3's stores. On a KV node
-the lease is `g6m4f-ckpt-<host>-<epoch>-r<rank>`, never the pool stash's. Each checkpoint is one contiguous range of
-blocks with a manifest and GPU checksums of every extent; a restore that does not match its checksums stops the engine.
+takes back every entry whose manifest block is still its own. Persistence is for fixed-size `ssd:` stores: after a
+group lease resizes, the next boot finds another store size and starts empty. Entries a capture drops leave the index
+before their blocks are overwritten, and an index that cannot be written turns persistence off for that boot. A spare
+RAM cache on the store (the launcher's `cache:NAME,kind=spare_ram` in `KV_STORE`, which it passes to the engine as
+`spare_ram_cache=on`; not with `group=`) keeps a copy of the blocks in memory the kernel may take back, as on GLM-5.3's
+stores. On a KV node the lease is `g6m4f-ckpt-<host>-<epoch>-r<rank>`, never the pool stash's. Each checkpoint is one
+contiguous range of blocks with a manifest and GPU checksums of every extent; a restore that does not match its
+checksums takes the entry out of the persisted index and stops the engine. The index digest joins the runtime
+signature, so ranks that took back different entries are refused at the bootstrap.
 A full store drops the least recently used checkpoints. Every rank keeps the same index, and its digest joins the pool
 digest the ranks compare.
 
