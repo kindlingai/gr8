@@ -1,5 +1,5 @@
 // persist=on for Flash checkpoints: ranks that took back different persisted entries agree at the bootstrap
-// (s2/flash_ckpt_index.h flash_agree_summary / flash_keep_agreed over bootstrap.h agree_lines) instead of being refused:
+// (s2/flash_ckpt_index.h flash_agree_summary / flash_keep_agreed over bootstrap.h agree_lines), and the boot goes on:
 // every rank keeps the entries every rank has, with the same clocks, so the index digests match. TP=1 agrees with
 // itself; TP=2 and TP=4 over loopback. The index rewritten after the agreement loads back to the same digest.
 // Build: g++ -std=c++17 -O2 -pthread -I engine/runtime engine/runtime/s2/tests/flash_ckpt_agree_test.cpp <knobs libs> -o /tmp/flash_ckpt_agree_test
@@ -62,7 +62,7 @@ static std::vector<std::vector<uint64_t>> agree(std::vector<FlashIndex>& ix, uin
         try {
             auto c = config(r, nr, port, dir);
             auto links = bootstrap(c);
-            // the last rank checks its entries for longer than the 1 s socket timeout: the others wait for it
+            // the last rank checks its entries for longer than the 1 s socket timeout, and the other ranks wait
             if (r == nr - 1) std::this_thread::sleep_for(std::chrono::milliseconds(1500));
             gone[r] = flash_keep_agreed(ix[r], agree_lines(c, links, flash_agree_summary(ix[r]), true));
             links.shutdown();
@@ -110,7 +110,7 @@ int main() {
         for (const auto& x : ix) CHECK(x.size() == 0 && x.next_generation() == 1);
         CHECK(same_digest(ix));
     }
-    // TP=4: rank 3 kept one more capture (the others' index writes failed after it) and touched entry 1 since; the
+    // TP=4: rank 3 kept one more capture (the others' index writes failed after it) and touched entry 1 since. The
     // clocks differ, so every rank continues one past the newest entry kept, and entry 1 (another use) goes
     {
         std::vector<FlashIndex> ix{captures(4), captures(4), captures(4), captures(5)};

@@ -212,8 +212,8 @@ inline const char* flash_index_decode(const std::string& b, FlashIndexImage& out
 // The bootstrap's agreement (bootstrap.h agree_lines, after FlashCheckpoints::settle): ranks can hold different
 // persisted entries (a failed index write, a torn or lost index after a power loss, an entry one rank's check dropped),
 // and every rank must keep the same index. Each rank sends the index clocks and one line per entry with what every
-// rank holds alike; the head keeps the lines every rank sent. Not the page and state sums: each rank holds its own
-// shard, so they differ by rank (each rank checked its own at load).
+// rank holds alike. The head keeps the lines every rank sent. Not the page and state sums: each rank holds its own
+// shard, so they differ by rank. Each rank checked its own at load.
 inline std::string flash_agree_line(const FlashEntry& x) {
     char b[256];
     snprintf(b, sizeof b, "flash entry %llu used %llu base %llu blocks %llu position %u terminal %d tokens %llu %016llx ns %016llx",
@@ -256,7 +256,7 @@ inline std::vector<uint64_t> flash_keep_agreed(FlashIndex& ix, const std::string
 // The index file and the token files of one store (persist=on). Not thread safe: FlashCheckpoints calls it under the
 // lock that guards its index.
 class FlashIndexFiles {
-    std::string path_, dir_;      // the index; the token folder
+    std::string path_, dir_;      // the index file and the token folder
     std::set<uint64_t> written_;  // generations whose token file is on disk
     void clean(const std::set<uint64_t>& keep) {   // token files of no kept entry (best effort: the next load retries)
         std::error_code ec;
@@ -274,7 +274,7 @@ public:
     bool on() const { return !path_.empty(); }
     const std::string& path() const { return path_; }
     std::string tokens_path(uint64_t generation) const { return dir_ + "/" + std::to_string(generation); }
-    // the files for `ix`: each new entry's tokens, then the index, then the token files of entries it no longer holds.
+    // the files for `ix`: each new entry's tokens, then the index, then removes the token files of entries `ix` lacks.
     // Throws std::system_error (the caller turns persistence off).
     void save(uint64_t compat, const FlashIndex& ix) {
         if (!std::filesystem::exists(dir_)) {
@@ -328,7 +328,7 @@ public:
         return nullptr;
     }
     // the index goes (a restore found an entry that is not its own): the next boot starts with no index, and the
-    // bootstrap's agreement drops on every rank what this rank no longer has
+    // bootstrap's agreement drops on every rank the entries this rank lacks
     void remove() {
         std::error_code ec;
         std::filesystem::remove(path_, ec);

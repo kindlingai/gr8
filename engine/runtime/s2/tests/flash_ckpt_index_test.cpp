@@ -1,7 +1,7 @@
 // persist=on for Flash checkpoints (s2/flash_ckpt_index.h, s2/flash_checkpoint.h): the index bytes and files round
-// trip; a cut, a flipped byte, another compat or store size, two entries of one generation start empty;
-// flash_entry_check refuses stored bytes that are not the entry's; FlashIndex::adopt keeps base order and the LRU order
-// and refuses what does not fit; an entry a capture's reserve dropped does not come back after a crash. `bench`: the cost of one capture's save at 64 entries of 262,145 tokens.
+// trip. A cut, a flipped byte, another compat or store size, or two entries of one generation start empty.
+// flash_entry_check refuses stored bytes that are not the entry's. FlashIndex::adopt keeps base order and the LRU order
+// and refuses entries that do not fit. After a crash, the index lacks the entry a capture's reserve dropped. `bench`: the cost of one capture's save at 64 entries of 262,145 tokens.
 // Build: g++ -std=c++17 -O2 -I engine/runtime engine/runtime/s2/tests/flash_ckpt_index_test.cpp -o /tmp/flash_ckpt_index_test
 #include "s2/flash_ckpt_index.h"
 #include <chrono>
@@ -160,7 +160,7 @@ static void adopt_rules() {
     CHECK(ix.reserve(65, at, &gone) && gone.size() == 1 && gone[0] == 3 && at == 30);
     gone.clear();
     CHECK(ix.reserve(85, at, &gone) && gone.size() == 1 && gone[0] == 2 && at == 10);
-    // a capture after adopt continues the generations; a touch continues the clock
+    // a capture after adopt continues the generations, and a touch continues the clock
     FlashIndex iy(100);
     iy.adopt(10, 20, {entry(1, 0, 10, 9)});
     iy.touch(1);
@@ -206,7 +206,7 @@ static void crash_after_reserve(const std::string& dir) {
     CHECK(!g.load(COMPAT, ix.blocks(), img, stale));
     CHECK(img.entries.size() == 1 && img.entries[0].generation == b);
     CHECK(access((dir + "/flash-ckpt.tokens/" + std::to_string(a)).c_str(), F_OK) != 0);
-    // after the reload the next capture is a new generation, never a's again
+    // after the reload the next capture takes the next generation (b + 1)
     FlashIndex back(ix.blocks());
     back.adopt(img.next, img.clock, img.entries);
     CHECK(capture(back, 640, 3) == b + 1);
@@ -214,7 +214,7 @@ static void crash_after_reserve(const std::string& dir) {
 
 // A store of blocks in memory, written as FlashCheckpoints::capture writes (flash_checkpoint.cuh): the manifest last,
 // page i of every binding (latent rows, then indexer rows) in block base + 1 + i, then the KDA state stream. The
-// manifest sums are computed as the device computes them, each cache's pages end to end, not from the blocks.
+// test computes the manifest sums as the device does, from each cache's pages end to end.
 struct FakeStore {
     FlashLayout L;
     std::vector<std::vector<uint8_t>> b;

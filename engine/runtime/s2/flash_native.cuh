@@ -509,9 +509,9 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     ControlLinks links = bootstrap(bc);
     try {
         if (multi) capture_all();
-        // persist=on: the entries this rank's checks passed (settle waits for them; they ran during the capture), then
-        // only those every rank kept, the same index everywhere (agree_lines waits with no timeout: ranks check at
-        // different speeds). At TP=1 the agreement is with this rank alone
+        // persist=on: settle waits for this rank's load checks, which ran during the capture. agree keeps the entries
+        // every rank passed, so every rank has the same index. agree_lines waits with no timeout because ranks check at
+        // different speeds. At TP=1 the agreement is with this rank alone
         if (ck && ck->persisted()) {
             const std::string checked = ck->settle();
             const std::string agreed = ck->agree(agree_lines(bc, links, ck->agree_summary(), true));

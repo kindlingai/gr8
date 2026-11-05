@@ -195,8 +195,8 @@ class FlashCheckpoints {
             block += n;
         }
     }
-    // persist=on: the index and token files (flash_ckpt_index.h). A full or read-only disk costs the persistence, not
-    // the serve: the index goes, and this boot keeps its entries in the store without one
+    // persist=on: the index and token files (flash_ckpt_index.h). A full or read-only disk turns persistence off and
+    // the serve goes on: the index goes, and this boot keeps its entries in the store without one
     void save() {
         if (!files_.on()) return;
         try { files_.save(compat_, index_); }
@@ -209,7 +209,7 @@ class FlashCheckpoints {
     // persist=on at boot: the index on disk (read in the constructor), its entries checked on the verify_ thread
     // (flash_entry_check: manifest block, page and KDA state checksums of the stored bytes), published by settle()
     FlashLayout layout_;
-    FlashIndexImage found_;               // the index read at boot; its entries that passed, once verify_ is done
+    FlashIndexImage found_;               // the index read at boot, then the entries that passed verify_
     std::string checked_;                 // what verify_ dropped and how long it took (the boot log)
     std::thread verify_;
     void verify() {
@@ -293,7 +293,7 @@ public:
     std::string loaded;   // persist=on: what the boot found in the index file (the boot log)
     // persist=on at boot (true even after a failed write turned it off): this rank joins the bootstrap's agreement
     bool persisted() const { return persist_; }
-    // persist=on: waits for the verification and publishes the entries that passed; what it did, for the boot log.
+    // persist=on: waits for the verification and publishes the entries that passed. Returns the boot log text.
     // Call before anything reads the index (the bootstrap's agreement, the serve): until then it is empty.
     std::string settle() {
         if (!verify_.joinable()) return loaded;
@@ -304,8 +304,8 @@ public:
         found_ = FlashIndexImage{};
         return checked_;
     }
-    // the bootstrap's agreement (flash_ckpt_index.h): this rank's lines, then the entries every rank kept. Rewrites the
-    // index; returns what it dropped, for the boot log
+    // the bootstrap's agreement (flash_ckpt_index.h): this rank's lines, then the entries every rank kept. agree()
+    // rewrites the index and returns the boot log text
     std::string agree_summary() const { return flash_agree_summary(index_); }
     std::string agree(const std::string& agreed) {
         const size_t n = index_.size();
@@ -423,8 +423,8 @@ public:
         return g;
     }
     // a restore of `generation` read bytes that are not the entry's: the whole index file goes, so this rank's next boot
-    // starts with no index and the bootstrap's agreement drops the other ranks' entries too (they may hold the entry
-    // this rank lost; one shard of an entry is no use)
+    // starts with no index and the bootstrap's agreement drops the other ranks' entries too. They may hold the entry
+    // this rank lost, and one shard of an entry is no use.
     [[noreturn]] void fail(uint64_t generation, const char* why) {
         index_.drop(generation);
         if (files_.on()) { files_.remove(); files_ = FlashIndexFiles(); }
