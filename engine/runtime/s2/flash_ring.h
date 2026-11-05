@@ -21,18 +21,23 @@ struct FlashRing {
     void record(int pos, int n, bool verify) { first = pos; rows = n; ring = verify; }
 };
 static_assert(sizeof(FlashRing) == sizeof(g6sch_ring), "scheduler-rs layout");
-// Every S2 session's KDA state slots (Model::kda_sessions x kda_ring of them): session q owns slots
-// [q * per, (q + 1) * per), per = the ring (K + 1, or 1 without MTP), with a FlashRing of its own. In a main step a
-// verify session's row r goes to slot base + r, other rows to base; the session's first row loads base + its ring's
-// source, so sessions sharing a step never touch each other's state.
+// Every S2 session's KDA state slots (Model::kda_ring + (kda_sessions - 1) x kda_ring_rest of them): session 0 owns
+// slots [0, first), session q > 0 owns [first + (q - 1) x per, first + q x per), each with a FlashRing of its own. per is
+// the MTP ring (K + 1, or 1 without MTP); first is wider when session 0 is the one that may draft with DFlash2 (8 rows a
+// round, Model::kda_ring), so only that session pays for the wide ring. In a main step a verify session's row r goes to
+// slot base + r, other rows to base; the session's first row loads base + its ring's source, so sessions sharing a step
+// never touch each other's state.
 struct FlashSlots {
-    int per = 1;
+    int per = 1, first = 1;
     std::vector<FlashRing> rings;
-    FlashSlots(int sessions, int per_session) : per(per_session), rings(size_t(sessions)) {
-        if (sessions < 1 || per_session < 1) throw std::runtime_error("Flash KDA slots: no sessions or slots");
+    FlashSlots(int sessions, int per_session, int first_session = 0)
+        : per(per_session), first(first_session ? first_session : per_session), rings(size_t(sessions)) {
+        if (sessions < 1 || per_session < 1 || first < per) throw std::runtime_error("Flash KDA slots: no sessions or slots");
     }
     int sessions() const { return int(rings.size()); }
-    int base(int q) const { check(q); return q * per; }
+    int base(int q) const { check(q); return q ? first + (q - 1) * per : 0; }
+    int width(int q) const { check(q); return q ? per : first; }
+    int total() const { return first + (sessions() - 1) * per; }
     // a new session on q (its slots are reset on the device at the same time)
     void reset(int q) { at(q).reset(); }
     // session q's n rows from position pos in a main step: each row's slot into kslot[0..n), the slot the first row
@@ -40,10 +45,12 @@ struct FlashSlots {
     int rows(int q, int pos, int n, bool verify, int* kslot) {
         FlashRing& r = at(q);
         int src = 0;
-        const int rc = g6sch_ring_rows(reinterpret_cast<g6sch_ring*>(&r), per, q, pos, n, verify, kslot, &src);
+        // the ring rule on the session's own slots (session 0 of a ring its width), then moved to its base
+        const int rc = g6sch_ring_rows(reinterpret_cast<g6sch_ring*>(&r), width(q), 0, pos, n, verify, kslot, &src);
         if (rc == 2) throw std::runtime_error("Flash verify exceeds KDA ring");
         if (rc) throw std::runtime_error("Flash next main position outside previous step");
-        return src;
+        for (int i = 0; i < n; ++i) kslot[i] += base(q);
+        return src + base(q);
     }
     // the KDA inputs of a main step whose session j holds rows [row0[j], row0[j] + n[j]) (StepIn: kslot, kda_src for
     // row 0, krun for a later session's first row)
