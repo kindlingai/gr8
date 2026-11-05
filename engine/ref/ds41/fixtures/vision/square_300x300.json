@@ -1,0 +1,33 @@
+{
+ "image": "square_300x300.png",
+ "n_vit_h": 39,
+ "n_vit_w": 39,
+ "n_llm_h": 13,
+ "n_llm_w": 13,
+ "n_span_tokens": 184,
+ "dim": 5120,
+ "nproj": 64,
+ "rows": [
+  0,
+  1,
+  12,
+  13,
+  84,
+  156,
+  167,
+  168
+ ],
+ "patches_sha256": "60d8d03a032e4c019ab6e78d68ac32eaf0507d5ef84e7f05d59fbd822c6c29a8",
+ "patches_shape": [
+  1521,
+  3,
+  14,
+  14
+ ],
+ "bf16_vs_f32": {
+  "rel_fro": 0.02459714189171791,
+  "row_rel_max": 0.0888756662607193,
+  "row_rel_mean": 0.022786246612668037
+ },
+ "rms": 0.04410369041999506
+}
