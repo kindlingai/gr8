@@ -3,8 +3,10 @@
 //
 // The log holds the planner's settings, each driver call, and each hook's request and answer. The replay builds a Batch
 // from the settings and makes the driver calls in order. Each hook call takes the next hook record: the request the
-// planner makes now must equal the logged one, and the logged answer is returned. So a replay passes when this build of
-// the planner makes every decision the logged one made, over every round of every request in the log.
+// planner makes now must equal the logged one, and the logged answer is returned. After each call the state the driver
+// reads back (Batch::state: which sessions are active or finished, their lengths and committed tokens) must equal the
+// logged state. So a replay passes when this build of the planner makes every decision the logged one made, over every
+// round of every request in the log.
 #pragma once
 #include <cstdio>
 #include <string>
@@ -41,15 +43,18 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
         if (lines.empty()) fail("empty log");
         s2log::In h(lines[0].c_str());
         if (h.word() != "g6s2log") fail("not a round log");
-        int ver = 0, K = 0, max_rows = 0, slots = 0;
+        int ver = 0, K = 0, max_rows = 0, slots = 0, flash_tp = 0;
         bool par = false, fresh = false, flash_cost = false, has_dfl = false, has_dfl_start = false, has_lp = false;
-        h(ver)(K)(max_rows)(slots)(par)(fresh)(flash_cost)(has_dfl)(has_dfl_start)(has_lp);
-        if (ver != 1) fail("log version " + std::to_string(ver) + ", want 1");
+        h(ver);
+        if (ver != 2) fail("log version " + std::to_string(ver) + ", want 2");
+        h(K)(max_rows)(slots)(par)(fresh)(flash_cost)(flash_tp)(has_dfl)(has_dfl_start)(has_lp);
         if (slots != S2N_SLOTS)
             fail("the log's planner has " + std::to_string(slots) + " slots, this build " + std::to_string(S2N_SLOTS) +
                  ": replay with the same model's build");
 #if G6_MODEL_FLASH
         if (flash_cost != knob::glm53f_s2_cost()) fail("GR8_GLM53F_S2_COST differs from the log's: set it as the log has it");
+        if (flash_cost && flash_tp != S2Cost::flash_tp)
+            fail("the log's Flash cost table is TP" + std::to_string(flash_tp) + "'s: build with -DG6_NR=" + std::to_string(flash_tp));
 #else
         if (flash_cost) fail("the log is a Flash planner's: replay with the Flash build");
 #endif
@@ -145,6 +150,11 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
                 b.ngram(n);
             }
             else fail("a hook record the planner did not ask for, or an unknown call: " + l.substr(0, 200));
+            const std::string st = b.state();
+            if (i >= lines.size() || lines[i] != st)
+                fail("after " + t + " the planner's state is\n  " + st.substr(0, 400) + "\nthe log has\n  " +
+                     (i < lines.size() ? lines[i].substr(0, 400) : std::string("(end of log)")));
+            ++i;
         }
         res.line = 0;
         res.ok = true;

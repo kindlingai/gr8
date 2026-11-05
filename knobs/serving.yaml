@@ -384,7 +384,8 @@ knobs:
     unset: "no log"
     doc: >-
       S2: every rank writes its planner's round log to PATH.<pid>: its settings, each call the driver makes and each
-      step's tokens, enough for engine/runtime/s2/tests/round_replay to rerun the planner and check every step.
+      step's tokens, enough for engine/runtime/s2/tests/round_replay to rerun the planner and check every step. Each
+      call also hashes every slot's tokens and writes on the compute thread, so take no timing from a logging boot.
   GR8_S2_ROUNDLOG:
     scope: local
     kind: flag

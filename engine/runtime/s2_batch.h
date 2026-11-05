@@ -64,6 +64,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <atomic>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -448,7 +449,8 @@ inline std::string ngram_sig(const NgramSrc& s)
     snprintf(b, sizeof b, " ngram %016llx kmax %d kmin %d margin %.17g", (unsigned long long)s.t->digest, s.kmax, s.kmin, s.margin);
     return b;
 }
-// the round log's field lists (s2_log.h); a size check names a new field that is not in its list
+// the round log's field lists (s2_log.h). The size check catches most new fields; one that fits in existing padding
+// (a bool after Step::scheduler_decode) does not, so a new field also goes in its list by hand
 template <class V> void fields(V& v, Row& r) { v(r.sess)(r.tok)(r.pos)(r.spos)(r.tgt); }
 template <class V> void fields(V& v, Step& s)
 {
@@ -479,26 +481,33 @@ public:
     {
         if (const auto& path = knob::s2_replay_log())
         {
-            const std::string name = *path + "." + std::to_string((long)getpid());
+            static std::atomic<int> made{0};   // m4sim builds a Batch per run: PATH.<pid>, then PATH.<pid>.1, ..
+            const int n = made++;
+            const std::string name = *path + "." + std::to_string((long)getpid()) + (n ? "." + std::to_string(n) : "");
             std::FILE* f = std::fopen(name.c_str(), "w");
             if (!f) throw std::runtime_error("s2: GR8_S2_REPLAY_LOG: cannot write " + name);
-            logf_ = std::shared_ptr<std::FILE>(f, std::fclose);
+            logf_ = std::shared_ptr<std::FILE>(f, [](std::FILE* x) { std::fclose(x); });
             record(f);
         }
     }
 
     // GR8_S2_REPLAY_LOG (s2_log.h): from now on, write every setting, driver call and hook result to f, which round_replay
-    // reads back. The hooks are wrapped here, so call it after the constructor and before any other call. f stays the
-    // caller's to close
+    // reads back; after each outermost call, the state the driver reads back (state()). Call it before any other call. A
+    // second call moves the log to f. f stays the caller's to close
     void record(std::FILE* f)
     {
         log_ = f;
 #if G6_MODEL_FLASH
         const bool flash_cost = cost_.flash;
+        const int flash_tp = S2Cost::flash_tp;
 #else
         const bool flash_cost = false;
+        const int flash_tp = 0;
 #endif
-        rec("g6s2log", 1, K_, max_rows_, S2N_SLOTS, par_, fresh_spec_, flash_cost, bool(h_.dfl), bool(h_.dfl_start), bool(h_.lp));
+        rec("g6s2log", 2, K_, max_rows_, S2N_SLOTS, par_, fresh_spec_, flash_cost, flash_tp, bool(h_.dfl), bool(h_.dfl_start),
+            bool(h_.lp));
+        if (wrapped_) return;
+        wrapped_ = true;
         if (h_.run) h_.run = [this, run = h_.run](const Step& s) { std::vector<int> t = run(s); rec("run", s, t); return t; };
         if (h_.dfl) h_.dfl = [this, dfl = h_.dfl](const DflReq& r) { const DflDrafts o = dfl(r); rec("dfl", r, o); return o; };
         if (h_.dfl_start) h_.dfl_start = [this, f0 = h_.dfl_start](int q) { const int lo = f0(q); rec("dfl_start", q, lo); return lo; };
@@ -605,6 +614,21 @@ public:
         else { std::vector<int> evs(live.size(), Step::TAIL); chain(live, evs, choose(all)); }
     }
     bool active(int q) const { const St& x = st_[q]; return x.on && !x.done && (int)x.tokens.size() - x.n < x.s.n_gen; }
+    // the round log's state record: per slot what the driver reads back (on, active, finished, length, the committed
+    // tokens' FNV-1a, inserted tokens)
+    std::string state() const
+    {
+        std::vector<unsigned long long> v;
+        for (int q = 0; q < S2N_SLOTS; ++q)
+        {
+            const St& x = st_[q];
+            unsigned long long h = 1469598103934665603ull;
+            for (int t : x.tokens) { h ^= (unsigned)t; h *= 1099511628211ull; }
+            v.insert(v.end(), {(unsigned long long)x.on, (unsigned long long)active(q), (unsigned long long)finished(q),
+                               (unsigned long long)x.tokens.size(), h, (unsigned long long)stats_[q].inserted});
+        }
+        return s2log::line("state", v);
+    }
     // the session's tokens so far, prompt included: its next round writes rows from length - 1 on
     int length(int q) const { return (int)st_[q].tokens.size(); }
     bool finished(int q) const { return st_[q].on && !active(q); }
@@ -1285,15 +1309,15 @@ private:
     {
         Batch* b;
         template <class... T> Api(Batch* b, const char* tag, const T&... x) : b(b) { if (b->depth_++ == 0) b->rec(tag, x...); }
-        ~Api() { --b->depth_; }
+        ~Api() { if (--b->depth_ == 0 && b->log_) b->line(b->state()); }
     };
-    template <class... T> void rec(const char* tag, const T&... x)
+    bool wrapped_ = false;            // record() has wrapped the hooks
+    template <class... T> void rec(const char* tag, const T&... x) { if (log_) line(s2log::line(tag, x...)); }
+    void line(const std::string& l)
     {
-        if (!log_) return;
-        const std::string l = s2log::line(tag, x...);
         std::fputs(l.c_str(), log_);
         std::fputc('\n', log_);
-        if (tag[0] == 'r' && tag[1] == 'o') std::fflush(log_);   // "round": a crash leaves the log whole up to the round
+        if (l.compare(0, 6, "state ") == 0 && depth_ == 0) std::fflush(log_);   // a crash leaves the log whole to the last call
     }
     g6rt::SpecLen dsl_;
     DSel sel_;

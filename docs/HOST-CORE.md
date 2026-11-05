@@ -58,7 +58,7 @@ What the core needs to know about a module, filled from the module's constants:
 
 One C table per module, null for unsupported, as `G6AttnOps` (`attn/ops.h:15-39`) does today. There are four hook
 layers now: `NativeHooks` (`s2/service.h:62-99`), `DispatchHooks` (`s2/dispatch.h:28-52`), `DriverHooks`
-(`s2/driver.h:21-60`) and `s2::Hooks` (`s2_batch.h:154-166`). Only `DispatchHooks` and `bind`, `grown`, `retire`,
+(`s2/driver.h:21-60`) and `s2::Hooks` (`s2_batch.h`). Only `DispatchHooks` and `bind`, `grown`, `retire`,
 `fence`, `shrink`, `resize`, `before_work`, `drained` and `flash_room` are module calls. `emit`, `prompt`, `round`,
 `terminal` and `settle` are callbacks between host layers and stay out of the table.
 
@@ -188,15 +188,17 @@ first request of the boot only (later requests can differ under `--spec-adaptive
 
 ### R0. Guard rails
 
-1. Whole-session T=0 comparisons: `GR8_S2_FRESH_SPEC=1` restarts the adaptive verify-width estimates with every request,
-   so with `GR8_DFL_REUSE=0` as well every request's T=0 reply is independent of the ones before it, and one boot per
-   side compares a whole prompt set (`docs/TESTING.md`, "A cluster"). The reference replies per model are recorded on a
-   cluster boot.
+1. Whole-session T=0 comparisons: `GR8_S2_FRESH_SPEC=1` restarts the adaptive verify-width estimates with every request.
+   With `GR8_DFL_REUSE=0`, prompts that share no prefix (a prefix hit gives the drafter only the suffix), the drafter
+   choice on, and DS41's park and prefix snapshots off, every request's T=0 reply is independent of the ones before it,
+   and one boot per side compares a whole prompt set (`docs/TESTING.md`, "A cluster"). The reference replies per model
+   are recorded on a cluster boot.
 2. The model-generic S2 host tests also built with `-DG6_MODEL_FLASH=1` (`scripts/host_tests.sh`).
 3. A round-replay log: `GR8_S2_REPLAY_LOG=PATH` makes each rank's planner write its settings, every driver call and
-   every hook's request and answer to `PATH.<pid>` (`s2_log.h`; the field lists sit beside each struct in `s2_batch.h`,
-   with a size check that names a field left out). `engine/runtime/s2/tests/round_replay` reruns the planner from a log
-   and checks that it asks for every step the logged one did (`s2/round_replay.h`). This is the guard that sees
+   every hook's request and answer (the `round` and `prompt` hooks return nothing and are not logged), and after each
+   outermost call the per-slot state the driver reads back, to `PATH.<pid>` (`s2_log.h`; the field lists sit beside
+   each struct in `s2_batch.h`, with a size check for most fields left out). `engine/runtime/s2/tests/round_replay`
+   reruns the planner from a log and checks every step it asks for and every state it leaves (`s2/round_replay.h`). This is the guard that sees
    planner changes after the first round, which a first-request T=0 check cannot.
 4. A floating-point check: `scripts/host_tests.sh` replays a log with `round_replay` built with `-ffp-contract=off` and
    with `-ffp-contract=fast`. A log from a serving boot gets the same check before R3.
@@ -223,7 +225,7 @@ scheduler, driver and pool host tests ported, and a differential run of the C++ 
 
 ### R3. The planner to Rust
 
-Moves `s2_batch.h` (1,425 lines), `spec_len.h`, `insert_rule.h`, `ngram_lookup.h` and `ctx_lookup.h`. The boundary is
+Moves `s2_batch.h` (about 1,500 lines), `spec_len.h`, `insert_rule.h`, `ngram_lookup.h` and `ctx_lookup.h`. The boundary is
 `g6s2_batch_round(order)` with the module's `run`, `lp` and `dfl` as C callbacks. It removes `S2N_SLOTS`
 (`s2_batch.h:181-185`), the Flash `S2Cost` and `SpecLen::flash_cost` `#if`s and the static `SpecLen`. This is the one
 step that can change T=0 output: the replay must reproduce every `Step` bit for bit across whole sessions, the R0

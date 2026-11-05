@@ -135,10 +135,14 @@ On a booted cluster, from the head:
   requests, and the verify's tokens are not bit-identical across widths, so a request's T=0 reply can depend on the
   requests before it. Compare replies of the first request of a fresh boot only, or boot both sides with
   `GR8_S2_FRESH_SPEC=1` (the estimates restart with every request) and `GR8_DFL_REUSE=0` (no drafter context carried
-  from the request before) and compare every request.
+  from the request before), use prompts that share no prefix (or `--reuse-prefix` off: a prefix hit gives the drafter
+  only the suffix's context), keep the drafter choice on (`GR8_S2_DSEL`; with it off and `GR8_MTP_KSTOP=2` its MTP
+  estimates are not restarted), and on DS41 leave `GR8_DS_PARK` and the prefix snapshot cache off. Then every request
+  can be compared.
 - The planner's decisions over a whole session: boot with `GR8_S2_REPLAY_LOG=PATH` in `EXTRA_ENV`, serve the requests,
   and replay each rank's `PATH.<pid>` on a build of the change:
   `g++ -std=c++17 -O2 [-DG6_MODEL_DS41=1 | -DG6_MODEL_FLASH=1] -I engine/runtime engine/runtime/s2/tests/round_replay.cpp
   engine/knobs-rs/target/release/libgr8knobs.a -lpthread -ldl -lm -o round_replay && ./round_replay PATH.<pid>`.
-  It passes when the change's planner asks for every step the logged one did, round after round; it names the first
-  step that differs.
+  It passes when the change's planner asks for every step the logged one did and leaves the same sessions active, as
+  long and with the same committed tokens after every call; it names the first difference. A Flash log also needs
+  `GR8_GLM53F_S2_COST` set as the engine had it and, when that is 1, `-DG6_NR=` the engine's width.

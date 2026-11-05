@@ -73,6 +73,7 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime
 # the planner's round log and its replay (GR8_S2_REPLAY_LOG, s2/round_replay.h); GR8_S2_FRESH_SPEC
 g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_replay_test.cpp" -o "$T/batch_replay_test" "${KNOBS[@]}"
 "$T/batch_replay_test" "$T/replay.log"
+GR8_S2_REPLAY_LOG="$T/env.log" "$T/batch_replay_test"   # the knob set as well: record() moves the log, wraps once
 # the planner's floating-point decisions with and without contracted multiply-adds: both builds must replay the log
 for c in off fast; do
   g++ -std=c++17 -O2 -Wall -ffp-contract=$c -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/round_replay.cpp" -o "$T/round_replay_$c" "${KNOBS[@]}"
@@ -293,7 +294,7 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -DG6_MODEL_DS41=1 -I "$REPO/engine/run
 "$T/ds41_prefill_test"
 for t in ds41_prefill_lanes_test ds41_s32_step_test s32_64k_mtp8_test batch_ds41_dspark_test; do
   g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" -I "$REPO/engine/runtime/s2" -I "$REPO/engine" "$REPO/engine/runtime/s2/tests/$t.cpp" -o "$T/$t" "${KVLIB[@]}"
-  "$T/$t" > /dev/null
+  "$T/$t" > "$T/$t.out" 2>&1 || { cat "$T/$t.out"; exit 1; }
 done
 # the S2 layer in the Flash build's shape (s2_batch.h's Flash cost model, its slot count): the model-generic tests again
 for t in batch_dflash_test batch_dflreuse_test batch_draftpar_test batch_dsel_test batch_dselmodel_test batch_insert_test \
@@ -301,7 +302,7 @@ for t in batch_dflash_test batch_dflreuse_test batch_draftpar_test batch_dsel_te
          driver_grow_test driver_prefill_quantum_test scheduler_fair_test scheduler_rounds_test scheduler_r_test \
          scheduler_tail_first_test cp_rows_test grammar_request_test kv_plan_test; do
   g++ -std=c++17 -O1 -Wall -pthread -DG6_MODEL_FLASH=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/$t.cpp" -o "$T/flash_$t" "${KVLIB[@]}"
-  (cd "$T" && "$T/flash_$t" > /dev/null 2>&1) || { echo "flash build: $t failed"; exit 1; }
+  (cd "$T" && "$T/flash_$t" > "$T/flash_$t.out" 2>&1) || { cat "$T/flash_$t.out"; echo "flash build: $t failed"; exit 1; }
 done
 # the control channel: sync and idle peers (the socketpair cases; the silent-peer case needs a network
 # namespace)

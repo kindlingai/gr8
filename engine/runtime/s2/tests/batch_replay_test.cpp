@@ -120,6 +120,43 @@ int main(int argc, char** argv)
         // a missing record
         std::vector<std::string> cut(l.begin(), l.end() - 3);
         CHECK(!replay(cut).ok);
+        // a state the driver would read back differently (one session's length): caught although every step matches
+        std::vector<std::string> st = l;
+        size_t s0 = 0;
+        for (size_t i = st.size() / 2; i < st.size() && !s0; ++i) if (st[i].rfind("state ", 0) == 0) s0 = i;
+        CHECK(s0 > 0);
+        {
+            s2log::In in(st[s0].c_str());
+            in.word();
+            std::vector<unsigned long long> v;
+            in(v);
+            v[3] += 1;                    // slot 0's length
+            st[s0] = s2log::line("state", v);
+        }
+        const ReplayResult rs = replay(st);
+        CHECK(!rs.ok && rs.line == s0 + 1 && rs.error.find("state") != std::string::npos);
+    }
+    // record() twice: the second moves the log, the hooks are wrapped once
+    {
+        std::FILE* f1 = std::tmpfile();
+        std::FILE* f2 = std::tmpfile();
+        Hooks h;
+        h.run = [](const Step& s) { return std::vector<int>(s.M(), 3); };
+        h.emit = [](int, const int*, int, int) { return false; };
+        Batch b(3, 32, h);
+        b.record(f1);
+        b.record(f2);
+        Session ss;
+        ss.prompt.assign(12, 3); ss.first = 11; ss.chunk = 4; ss.n_gen = 6;
+        b.admit({0}, {ss});
+        while (b.round({0})) {}
+        std::rewind(f2);
+        const std::vector<std::string> l2 = read_lines(f2);
+        const ReplayResult r = replay(l2);
+        CHECK(r.ok && r.steps > 0);
+        if (!r.ok) std::printf("  %s\n", r.error.c_str());
+        std::fclose(f1);
+        std::fclose(f2);
     }
     // three sessions in shared MTP rounds (round_all, no drafter)
     {

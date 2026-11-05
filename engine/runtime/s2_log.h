@@ -65,7 +65,13 @@ struct In
         else if constexpr (std::is_enum_v<U>) x = (U)std::stoll(word());
         else if constexpr (std::is_unsigned_v<U>) x = (U)std::stoull(word());
         else if constexpr (std::is_integral_v<U>) x = (U)std::stoll(word());
-        else if constexpr (std::is_floating_point_v<U>) x = (U)std::strtod(word().c_str(), nullptr);
+        else if constexpr (std::is_floating_point_v<U>)
+        {
+            const std::string w = word();
+            char* end = nullptr;
+            x = (U)std::strtod(w.c_str(), &end);
+            if (*end) throw std::runtime_error("s2log: not a number: " + w);
+        }
         else if constexpr (std::is_array_v<U>) { for (auto& e : x) (*this)(e); }
         else fields(*this, x);
         return *this;
