@@ -3,8 +3,8 @@
 // and Scheduler::digest (g6sch_digest_head + g6sch_digest_slots, src/scheduler.rs hash_identity) changes with the flag
 // and with every digest byte, steering on or off. src/scheduler.rs hashes images before its `!enabled` return, so the
 // steering-off case is the one a reorder or a dropped block would lose without another test noticing. Scheduler::digest is
-// an event diagnostic (never called by next()/complete()), so no serving path would notice a hole in it either; the vector
-// transcripts (scheduler_rs_vectors.h) never set images. Each case is a FRESH scheduler with the same config, key, request
+// checked at event boundaries (service.h, the commit's before_hash in src/scheduler.rs), not per round, and image-free
+// vectors (scheduler_rs_vectors.h never sets images) miss this contribution. Each case is a FRESH scheduler with the same config, key, request
 // and run, so only the identity differs between the two digests compared. Host only.
 #include "s2/scheduler.h"
 #include <cstdio>
