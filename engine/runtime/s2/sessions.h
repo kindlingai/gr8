@@ -104,7 +104,8 @@ public:
     Payload payload(const g6rt::ServeReq& r) const {
         const bool decode = g6mod::has(G6_CAP_PROMPT_DECODE) ? ds41_decode_prompt(prefill_min_, r.prompt.size(), r.plp, r.steering.enabled)
                                                              : r.plp >= 0;
-        return {r.prompt, chunk_, decode, r.ins, r.steering, r.gram};
+        // r.images is empty outside DS41: Service::images_ok refuses an image request there before it is queued
+        return {r.prompt, chunk_, decode, r.ins, r.steering, r.gram, r.images};
     }
     // (row, target, k) -> a row's logprob entry in the last main step (DispatchHooks::logprob)
     using Logprob = std::function<g6rt::LpRow(int, bool, int)>;
