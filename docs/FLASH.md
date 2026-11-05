@@ -41,6 +41,12 @@ own metadata (`hidden_size` 4096) and maps Flash's tensors with `engine/loader-r
 `CAP` defaults to 262208: a request of 262,144 tokens (prompt + `max_tokens`) plus a page for the guard rows the
 scheduler keeps past it (2 at MTP=1), so the front end's `max_model_len` is 262,206 (`pool_rows - guard`).
 
+`CAP` is the pool the sessions share, and `MAX_MODEL_LEN` (`--max-model-len`) is the longest single request: the
+shim takes the smaller of it and `pool_rows - guard`, and the front end reports that. Unset, it is the model's
+1,048,576 positions, so a `CAP` past 1,048,640 means more room for sessions at once, never a longer context. Admission
+reserves each request's `prompt + max_tokens` pages from the pool, so with several sessions, for example,
+`CAP=1048640 MAX_MODEL_LEN=262144` holds four full-length requests at once, or more shorter ones.
+
 Only the attention layers keep KV: the 11 DSA layers and the MTP layer, 12 bindings a rank. KDA's state is the same size
 at any context. A token costs each of them a 1,024 B bf16 latent row and 640 B of indexer keys (`engine/attn/kvfmt.h`;
 a build with `-DG6_FLASH_KV_FP8=1` makes the row 528 B), 19,968 B in all. Flash has no CP, so every rank holds the whole context and
