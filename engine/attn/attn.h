@@ -51,6 +51,10 @@ struct G6Attn {
     // kpool indexer (attn/flash_attn.cu): the pool gate projection of the rows, FP16 [rows,128] = x @ compress_gate^T,
     // and the pool position bias, BF16 [4,128] (index_kpool_compress_ape). indices is [rows,g6kv::SEL] (kvfmt.h).
     const void *index_gate, *index_ape;
+    // the raw index rows' ring (kvfmt.h), [g6kv::RAW_SESS][g6kv::RAW_RING][g6kv::IDX_RAW], owned by the binding; raw_sess:
+    // device [rows], the S2 session of each row (its ring), nullptr = session 0
+    void* index_raw;
+    const int* raw_sess;
 #endif
 #if defined(G6_CP) && G6_CP
     // context-parallel KV. cp_nr = 0: replicated (today's semantics). cp_nr > 0: this rank SCORES only

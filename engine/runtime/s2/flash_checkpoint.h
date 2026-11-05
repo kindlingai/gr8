@@ -94,7 +94,8 @@ inline uint64_t fnv64(const void* p, size_t n, uint64_t h = 14695981039346656037
 // complete is not a checkpoint (a torn write, a reused range).
 struct FlashManifest {
     static constexpr uint64_t MAGIC = 0x31544b4348534c46ull;   // "FLSHCKT1"
-    static constexpr uint32_t FORMAT = 1;                     // FLASH_RUN_FORMAT: bump when what an entry holds changes
+    static constexpr uint32_t FORMAT = 2;                     // FLASH_RUN_FORMAT: bump when what an entry holds changes
+                                                              // (2: pooled index keys only, the raw rings in the state)
     uint64_t magic = 0;
     uint32_t format = 0, complete = 0;
     uint64_t generation = 0;         // the entry's id, the same on every rank
@@ -102,7 +103,7 @@ struct FlashManifest {
     uint64_t position = 0;           // p: rows [0, p) are in the pages and the KDA state is after them
     uint64_t tokens = 0, token_hash = 0, ns_hash = 0;   // the p + 1 tokens and their namespace
     uint64_t pages = 0, page_bytes = 0, page_sum = 0;   // pages [0, pages) of every binding, their checksum
-    uint64_t state_bytes = 0, state_sum = 0;            // the KDA state after rows [0, p), its checksum
+    uint64_t state_bytes = 0, state_sum = 0;            // the KDA state after rows [0, p) and the raw rings, the checksum
     uint64_t self_sum = 0;           // fnv64 of every field above
     uint64_t own_sum() const { return fnv64(this, offsetof(FlashManifest, self_sum)); }
     void seal() { magic = MAGIC; format = FORMAT; complete = 1; self_sum = own_sum(); }

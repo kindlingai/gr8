@@ -174,6 +174,7 @@ struct StepIn
     int kslot[MX];                    // KDA slot of each row (the verify step: row r -> slot r; else kda_src). Zeros = slot 0
     int krun[MX];                     // KDA ring, several sessions in one step: at a session's first row m > 0, 1 + the
                                       // slot its state loads from (kda_src is row 0's); 0 = the row carries (Args::src)
+    int sess[MX];                     // the S2 session of each row: its DSA layers' raw index ring (attn/kvfmt.h); zeros = 0
 #endif
 #if G6_MODEL_DS41
     int sess[MX];                     // DS41 SESS > 1: the S2 slot of each row (its attention / index / Engram slab); zeros = slot 0
@@ -199,6 +200,7 @@ struct StepCtl
     int nl;
 #if G6_MODEL_FLASH
     int *row_slot, *kda_src;          // Flash KDA: StepIn::kslot -> row_slot, kda_src (nullptr = none)
+    int* rsess;                       // Flash: StepIn::sess -> Model::rsess (nullptr = none)
 #endif
 #if G6_MODEL_DS41
     int* sess;                        // DS41: StepIn::sess -> Model::sess (nullptr = none)
@@ -217,6 +219,7 @@ __global__ void __launch_bounds__(128) k_step_in(StepCtl c)
 #if G6_MODEL_FLASH
     if (c.row_slot) for (int i = t; i < MX; i += 128) c.row_slot[i] = sh.kslot[i];
     if (c.kda_src) for (int i = t; i < MX; i += 128) c.kda_src[i] = i ? sh.krun[i] - 1 : sh.kda_src;
+    if (c.rsess) for (int i = t; i < MX; i += 128) c.rsess[i] = sh.sess[i];
 #endif
 #if G6_MODEL_DS41
     if (c.sess) for (int i = t; i < MX; i += 128) c.sess[i] = sh.sess[i];
@@ -468,6 +471,7 @@ struct Model
     u32* mtp_cat_f = nullptr;
     int* row_slot = nullptr;          // [MX], single-session decode uses slot zero (MTP ring: StepIn::kslot)
     int* kda_src = nullptr;           // device [MX], Args::src: StepIn::kda_src at row 0, StepIn::krun - 1 after it
+    int* rsess = nullptr;             // device [MX]: StepIn::sess, the session of each row (G6AttnStep::raw_sess)
     int kda_ring = 0;                 // set before build: > 1 = KDA state slots for the MTP verify ring (--mtp K: K + 1)
     int kda_sessions = 1;             // set before build: S2 sessions: the first with kda_ring slots, the rest kda_ring_rest
     int kda_ring_rest = 0;            // set before build: the other sessions' slots (0 = kda_ring; FlashSlots)
@@ -2010,7 +2014,8 @@ inline void launch_step_in(Model& m, cudaStream_t st)
 {
 #if G6_MODEL_FLASH
     k_step_in<<<1, 128, 0, st>>>(StepCtl{reinterpret_cast<const uint32_t*>(m.in), m.stepp, m.tok, m.pos, m.tgt,
-                                         m.steering_scale, m.steering_slot, m.srow, m.cells, m.shared, m.nl, m.row_slot, m.kda_src});
+                                         m.steering_scale, m.steering_slot, m.srow, m.cells, m.shared, m.nl, m.row_slot, m.kda_src,
+                                         m.rsess});
 #elif G6_MODEL_DS41
     k_step_in<<<1, 128, 0, st>>>(StepCtl{reinterpret_cast<const uint32_t*>(m.in), m.stepp, m.tok, m.pos, m.tgt,
                                          m.steering_scale, m.steering_slot, m.srow, m.cells, m.shared, m.nl, m.ds_slots > 1 ? m.sess : nullptr});

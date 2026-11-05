@@ -1,7 +1,9 @@
 // kpool indexer of GLM 5.3 Flash (included by flash_attn.cu, inside namespace fa, after the cache helpers).
 // Cache layout: attn/kvfmt.h (g6kv IDX_*).
-//   append  kp_append   every row writes its raw key (wk x, FP16, before k_norm) and pool gate (FP16) to its slot
-//           kp_pool     the row that completes pool p (pos % 4 == 3) forms pooled_key[p] in FP32
+//   append  kp_pool     the row that completes pool p (pos % 4 == 3) forms pooled_key[p] in FP32 from the raw rows of
+//                       its pool (its call's own, or the session's raw ring)
+//           kp_ring     the call's last RAW_RING rows write their raw key (wk x, FP16, before k_norm) and pool gate
+//                       (FP16) to the session's raw ring
 //   select  kp_scores   score[p] = 1/64 * sum_h w_h * relu(q_h . pooled_key[p]) for the pools visible to the row
 //                       (complete, last token <= the row's position); 1/64 = 128^-0.5 * 32^-0.5
 //           kp_select   the top min(512, visible) pools, ties to the lower pool index, written as their 4 positions in
@@ -14,26 +16,32 @@
 __device__ __forceinline__ uint8_t* ix_page(const DeviceAttn& a,int pos){
     const int p=page(a,pos);return p<0?nullptr:(uint8_t*)a.index_cache+(int64_t)p*g6kv::IDX_PAGE;
 }
-template<class Input>
-__global__ void kp_append(Input input){
-    auto a=resolve(input);if(!a.active)return;
-    const int row=blockIdx.x,t=threadIdx.x,pos=a.positions[row];FOR_ROW(a,input,row);
-    uint8_t* base=ix_page(a,pos);if(!base)return;
-    half* raw=(half*)(base+(pos%g6kv::PAGE)*g6kv::IDX_RAW);
-    raw[t]=t<IDIM?((const half*)a.index_k)[(int64_t)row*IDIM+t]:((const half*)a.index_gate)[(int64_t)row*IDIM+t-IDIM];
+// the S2 session of row r (its raw ring); a session outside the ring is error 64
+__device__ __forceinline__ int raw_sess(const DeviceAttn& a,int r){
+    const int q=a.raw_sess?a.raw_sess[r]:0;
+    if(q<0||q>=g6kv::RAW_SESS){error(a,64);return -1;}
+    return q;
 }
-// 128 threads, thread t = channel t
+// 128 threads, thread t = channel t. The row that completes pool p (pos % 4 == 3) forms pooled_key[p] in FP32 from the
+// raw rows of positions pos - 3 .. pos: row - d of this call when it holds position pos - d of the same session, else
+// the session's raw ring (kp_ring wrote it in an earlier call)
 template<class Input>
 __global__ void kp_pool(Input input){
     auto a=resolve(input);if(!a.active)return;
     const int row=blockIdx.x,t=threadIdx.x,pos=a.positions[row],w=t>>5,lane=t&31;FOR_ROW(a,input,row);
     if(pos%KP!=KP-1)return;
     uint8_t* base=ix_page(a,pos);if(!base)return;
-    const half* raw=(const half*)(base+((pos-(KP-1))%g6kv::PAGE)*g6kv::IDX_RAW);   // the pool's 4 slots, same page
+    const int sess=raw_sess(a,row);if(sess<0)return;
     __shared__ float red[KP][4];
     float k[KP],g[KP],mean[KP];
     #pragma unroll
-    for(int j=0;j<KP;j++){k[j]=__half2float(raw[j*2*IDIM+t]);g[j]=__half2float(raw[j*2*IDIM+IDIM+t])+bfloat(a.index_ape,j*IDIM+t);}
+    for(int j=0;j<KP;j++){
+        const int d=KP-1-j,q=pos-d,r2=row-d;
+        const half *kr,*gr;
+        if(r2>=0&&a.positions[r2]==q&&raw_sess(a,r2)==sess){kr=(const half*)a.index_k+(int64_t)r2*IDIM;gr=(const half*)a.index_gate+(int64_t)r2*IDIM;}
+        else{kr=(const half*)((const uint8_t*)a.index_raw+((int64_t)sess*g6kv::RAW_RING+q%g6kv::RAW_RING)*g6kv::IDX_RAW);gr=kr+IDIM;}
+        k[j]=__half2float(kr[t]);g[j]=__half2float(gr[t])+bfloat(a.index_ape,j*IDIM+t);
+    }
     #pragma unroll
     for(int j=0;j<KP;j++){const float s=warp_sum(k[j]);if(lane==0)red[j][w]=s;}
     __syncthreads();
@@ -52,7 +60,19 @@ __global__ void kp_pool(Input input){
     #pragma unroll
     for(int j=0;j<KP;j++){const float e=expf(g[j]-m);den+=e;acc=fmaf(e,k[j],acc);}
     const float v=acc/den;if(!isfinite(v))error(a,4);
-    ((float*)(base+g6kv::IDX_POOL_OFF))[((pos/KP)%g6kv::PAGE_POOLS)*IDIM+t]=v;
+    ((float*)base)[((pos/KP)%g6kv::PAGE_POOLS)*IDIM+t]=v;
+}
+// grid min(rows, RAW_RING), 256 threads: row rows - gridDim.x + blockIdx.x writes its raw key (wk x, FP16, before
+// k_norm) and pool gate (FP16) to its session's ring slot pos % RAW_RING, after kp_pool read the ring. Only the last
+// RAW_RING rows of a call write, so no two rows of one session share a slot
+template<class Input>
+__global__ void kp_ring(Input input){
+    auto a=resolve(input);if(!a.active)return;
+    const int row=a.rows-(int)gridDim.x+blockIdx.x,t=threadIdx.x,pos=a.positions[row];FOR_ROW(a,input,row);
+    if(page(a,pos)<0)return;
+    const int sess=raw_sess(a,row);if(sess<0)return;
+    half* raw=(half*)((uint8_t*)a.index_raw+((int64_t)sess*g6kv::RAW_RING+pos%g6kv::RAW_RING)*g6kv::IDX_RAW);
+    raw[t]=t<IDIM?((const half*)a.index_k)[(int64_t)row*IDIM+t]:((const half*)a.index_gate)[(int64_t)row*IDIM+t-IDIM];
 }
 // pools a row may select: complete and ending at or before its position
 __device__ __forceinline__ int kp_visible(const DeviceAttn& a,int r){
@@ -71,7 +91,7 @@ __global__ void kp_scores(Input input,int start,float* scores,int pstride,int p_
     for(int i=t;i<IHEADS*IDIM;i+=256)qs[i/IDIM][i%IDIM]=hfloat(a.index_q,(int64_t)r*IHEADS*IDIM+i);
     if(t<IHEADS)ws[t]=hfloat(a.index_weight,(int64_t)r*IHEADS+t);
     for(int i=t;i<npools*IDIM;i+=256){const int pp=i/IDIM,d=i%IDIM,p=p0+pp;float v=0;
-        const uint8_t* b=ix_page(a,p*KP);if(b)v=__ldg(((const float*)(b+g6kv::IDX_POOL_OFF))+((p%g6kv::PAGE_POOLS)*IDIM+d));
+        const uint8_t* b=ix_page(a,p*KP);if(b)v=__ldg(((const float*)b)+((p%g6kv::PAGE_POOLS)*IDIM+d));
         ks[pp][d]=v;}
     __syncthreads();
     const int pp=t>>3,hl=t&7;

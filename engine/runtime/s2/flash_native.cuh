@@ -4,9 +4,9 @@
 // batched graphs captured here, whose attention reads each row's own table (S2In, the batch views). KDA state is not
 // a paged cache: each session has its own kda_ring slots (FlashSlots), reset when it starts.
 // GR8_GLM53F_CACHE=aligned (FlashContext::ckpt, flash_checkpoint.h): the pool's prefix-reuse hooks serve Flash
-// checkpoints. A prompt's prefill keeps one at its last cold-grid point (its run's pages and its session's first KDA
-// slot); a later prompt that starts with its tokens is granted the skip, restored at bind into its own run and session
-// slot and prefilled from there.
+// checkpoints. A prompt's prefill keeps one at its last cold-grid point (its run's pages, its session's first KDA slot
+// and raw index rings); a later prompt that starts with its tokens is granted the skip, restored at bind into its own
+// run and session slot and prefilled from there.
 #pragma once
 #if G6_MODEL_FLASH
 #include "service.h"
@@ -87,7 +87,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         std::lock_guard<std::mutex> l(ck_mu);
         for (const Pending& x : pending) {
             const uint32_t at = uint32_t(x.tokens.size() - 1);
-            const uint64_t gen = ck->capture(at, ks.base(x.q), pool.list(bound[size_t(x.q)]), x.tokens, capture_ns[size_t(x.q)], c.stream);
+            const uint64_t gen = ck->capture(at, ks.base(x.q), x.q, pool.list(bound[size_t(x.q)]), x.tokens, capture_ns[size_t(x.q)], c.stream);
             if (gen) fprintf(stderr, "# flash ckpt request %llu kept %u rows (session %d) as entry %llu (%llu blocks) in %.1f ms; %zu entries\n",
                              (unsigned long long)x.req, at, x.q, (unsigned long long)gen,
                              (unsigned long long)ck->last.blocks, ck->last.ms, ck->index().size());
@@ -143,7 +143,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                 if (p > 0 && slot >= 0) {
                     const std::vector<int> tokens(st.history.begin(), st.history.begin() + p + 1);
                     std::lock_guard<std::mutex> l(ck_mu);
-                    const uint64_t gen = ck->capture(p, slot, pool.list(r), tokens, ns, c.stream, true);
+                    const uint64_t gen = ck->capture(p, slot, q, pool.list(r), tokens, ns, c.stream, true);
                     if (gen) fprintf(stderr, "# flash ckpt terminal kept %u rows (session %d, KDA slot %d) as entry %llu (%llu blocks) in %.1f ms; %zu entries\n",
                                      p, q, slot, (unsigned long long)gen, (unsigned long long)ck->last.blocks, ck->last.ms, ck->index().size());
                     else fprintf(stderr, "# flash ckpt terminal: %u rows do not fit the store (%llu blocks)\n", p, (unsigned long long)ck->blocks());
@@ -179,7 +179,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             const FlashEntry* x = ck->index().find(gen);
             require(x && x->position == g.reuse, "Flash checkpoint hit differs from its entry");
             exact = !x->terminal;
-            ck->restore(gen, ks.base(q), list, c.stream);
+            ck->restore(gen, ks.base(q), q, list, c.stream);
             wrote((int(g.reuse) + PAGE - 1) / PAGE * PAGE);   // whole pages of both models' caches (one session)
             fprintf(stderr, "# flash ckpt request %llu restored %u rows (session %d, %s entry %llu, %llu blocks) in %.1f ms\n",
                     (unsigned long long)g.req.id, g.reuse, q, exact ? "aligned" : "terminal", (unsigned long long)gen,
@@ -202,6 +202,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             for (Model* x : {&c.main, &c.draft.d}) {
                 s2_set_pages(*x, q, list);
                 s2_reset_pages(*x, x->s2->run[q], c.stream, most);
+                for (Layer& y : x->layers) if (!y.kda && y.ab.storage) G6RT_CK(g6_attn_bind_raw_reset(&y.ab, q, c.stream));
             }
             if (c.main.kda_st.S) kda::reset(c.main.kda_st, ks.base(q), c.stream);
             ks.reset(q); lp_rows = 0; fence();
@@ -263,6 +264,9 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         Model& model = d ? c.draft.d : c.main;
         StepIn si{}; S2In h2{};
         native_inputs(l, si, h2);
+        // each row's session: its DSA layers' raw index ring (attn/kvfmt.h)
+        for (size_t j = 0; j < l.step.sess.size(); ++j)
+            for (int r = l.step.row0[j]; r < l.step.row0[j] + l.step.rows[j]; ++r) si.sess[r] = l.step.sess[j];
         Graphs* g = nullptr;
         if (multi) {
             require(model.s2on == (l.solo < 0), "Flash solo mode differs from host");
@@ -331,10 +335,10 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             s2_solo_pages(c.main, run); s2_solo_pages(c.draft.d, run);
             c.main.s2on = c.draft.d.s2on = false;
         }
-        pf_inputs_flash(c.prefill, ma, p.prompt.data() + a, pos.data(), kslot);
+        pf_inputs_flash(c.prefill, ma, p.prompt.data() + a, pos.data(), kslot, multi ? q : 0);
         pf_enqueue_flash(c.prefill_fabric, c.main, c.prefill, pfseq, c.main.nl, ma);
         if (mb) {
-            pf_inputs_flash(c.prefill2, mb, p.prompt.data() + a + ma, pos.data() + ma, kslot);
+            pf_inputs_flash(c.prefill2, mb, p.prompt.data() + a + ma, pos.data() + ma, kslot, multi ? q : 0);
             pf_enqueue_flash(c.prefill_fabric2, c.main, c.prefill2, pfseq2, c.main.nl, mb);
             pf_step2_flash(c.main, c.prefill, c.prefill2, ma, mb, a + ma, a + ma + mb, pfseq, pfseq2, c.stream);
             pfseq2 += c.main.nl;
@@ -365,7 +369,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                     bind::launch(b.idx_g, c.stream);
                     pf_draft_full_cmp(c.draft, F, di.pos[0] - base, di.M, c.stream);
                     fence();
-                });
+                }, multi ? q : 0);
                 unsigned dw = 0;
                 G6RT_CK(cudaMemcpy(&dw, F.diff, 4, cudaMemcpyDeviceToHost));
                 fprintf(stderr, "# GR8_GLM53F_PF_DRAFT_FULL check: rows %d at %d, differing kv_a/idx_k/idx_g words %u\n", n, base, dw);
@@ -386,7 +390,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                 }
                 fence();
                 if (!cache) check();
-            });
+            }, multi ? q : 0);
         };
         draft(c.prefill, ma, a);
         if (mb) draft(c.prefill2, mb, a + ma);

@@ -60,7 +60,7 @@ unsigned word = 0;                 // every error word check() reads: set by a k
 int inject = -1, chunk = 0;        // inject: -2 = the main prefill sets a word, k >= 0 = draft chunk k does
 std::string events;                // M main prefill, D draft chunk, F fence, C check
 int bucket_of(DModel&, int) { return 0; }
-void pf_inputs_flash(FlashPrefill&, int, const int*, const int*, int) {}
+void pf_inputs_flash(FlashPrefill&, int, const int*, const int*, int, int) {}
 void pf_enqueue_flash(Fabric&, const Main&, const FlashPrefill&, u64, int, int) {}
 void main_prefill() { events += 'M'; if (inject == -2) word = 1; }
 void pf_step_flash(Main&, FlashPrefill&, int, int, u64, int) { main_prefill(); }
@@ -83,7 +83,7 @@ void pf_draft_full_cmp(Draft&, DraftFull&, int, int, int) {}
 enum cudaMemcpyKind { cudaMemcpyDeviceToHost };
 int cudaMemcpy(void* d, const void* s, size_t n, cudaMemcpyKind) { std::memcpy(d, s, n); return 0; }
 #define G6RT_CK(x) (void)(x)
-void pf_draft_flash(Draft&, FlashPrefill&, int M, int pos0, const int*, u64& dstep, const std::function<void(const StepIn&)>& run)
+void pf_draft_flash(Draft&, FlashPrefill&, int M, int pos0, const int*, u64& dstep, const std::function<void(const StepIn&)>& run, int)
 {
     for (int m0 = 0; m0 < M; m0 += MX) {
         const int r = std::min(MX, M - m0);

@@ -54,7 +54,7 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
     G6RT_CK(cudaMemsetAsync(m.hc_done,0,64*sizeof(unsigned),st));
     m.x=dmalloc<__half>((size_t)MX*HID); m.x2=dmalloc<__half>((size_t)MX*HID);
     m.xn=dmalloc<float>((size_t)MX*HID); m.xn2=dmalloc<float>((size_t)MX*HID);
-    m.row_slot=dmalloc<int>(MX); m.kda_src=dmalloc<int>(MX);
+    m.row_slot=dmalloc<int>(MX); m.kda_src=dmalloc<int>(MX); m.rsess=dmalloc<int>(MX);
     m.q_a=dmalloc<__half>((size_t)MX*QA); m.q_a_n=dmalloc<__half>((size_t)MX*QA);
     m.kv_a=dmalloc<__half>((size_t)MX*KVA); m.q_b=dmalloc<__half>((size_t)MX*g6nr::QBW);
     m.idx_q=dmalloc<__half>((size_t)MX*IDXQ); m.idx_k=dmalloc<__half>((size_t)MX*IDXK);

@@ -1,7 +1,8 @@
 // The attention binder (bind.h) for the G6_MODEL_FLASH build: flash_attn.cu's caches and scratch. Same contract as
 // bind.cu; the differences: every DSA layer has its own kpool indexer (geom::full_index), UK is bound as stored
-// [H,256,512] (no transpose), the pack adds index_ape, a step adds index_gate, the index cache uses the kvfmt.h kpool
-// page (IDX_PAGE per 64 rows) and indices are [max_rows][g6kv::SEL]. No context-parallel binding.
+// [H,256,512] (no transpose), the pack adds index_ape, a step adds index_gate and raw_sess, the index cache uses the
+// kvfmt.h kpool page (IDX_PAGE per 64 rows), the binding owns the raw index ring (g6kv::RAW_BYTES) and indices are
+// [max_rows][g6kv::SEL]. No context-parallel binding.
 #include "bind.h"
 #include "../g6nr.h"
 #include "../model_geom.h"
@@ -78,6 +79,7 @@ int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int cap
     if ((mla || idx) && !chunked) return invalid;
     const size_t kv = take(chunked ? 0 : kv_bytes);
     const size_t ix = take(chunked ? 0 : ix_bytes);
+    const size_t raw = take(g6kv::RAW_BYTES);
     const size_t table = take((size_t)a.table_size * sizeof(int));
     const size_t ids = take((size_t)max_rows * SEL * sizeof(int));
     const size_t output = take((size_t)max_rows * h * geom::V_HEAD * 2);
@@ -88,6 +90,7 @@ int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int cap
     if (e != cudaSuccess) return (int)e;
     char* base = (char*)b.storage;
     a.mla_cache = chunked ? g6_kvc_ptr(mla) : base + kv; a.index_cache = chunked ? g6_kvc_ptr(idx) : base + ix;
+    a.index_raw = base + raw;
     b.kv_chunks[0] = mla; b.kv_chunks[1] = idx;
     a.block_table = (int*)(base + table); a.indices = (int*)(base + ids);
     a.output = base + output; a.error = (unsigned*)(base + error);
@@ -138,7 +141,7 @@ extern "C" int g6a_bind_prepare(G6AttnBinding* b, const G6AttnStep* step, void* 
     a.rows = step->rows; a.context = step->context;
     a.q_b = step->q_b; a.kv_a = step->kv_a; a.positions = step->positions;
     a.index_q = step->index_q; a.index_k = step->index_k; a.index_weight = step->index_weight;
-    a.index_gate = step->index_gate;
+    a.index_gate = step->index_gate; a.raw_sess = step->raw_sess;
     a.reuse_indices = step->reuse_indices; a.reuse_row_map = step->reuse_row_map;
     a.reuse_rows = step->reuse_rows;
 #ifdef DEC_S2
@@ -181,13 +184,15 @@ extern "C" int g6a_bind_reset(G6AttnBinding* b, void* s) {
         e = cudaMemsetAsync(a.mla_cache, 0, (size_t)a.page_count * PAGE * g6kv::ROW, stream);
         if (e == cudaSuccess) e = cudaMemsetAsync(a.index_cache, 0, (size_t)a.page_count * g6kv::IDX_PAGE, stream);
     }
+    if (e == cudaSuccess) e = cudaMemsetAsync(a.index_raw, 0, g6kv::RAW_BYTES, stream);
     if (e == cudaSuccess) e = cudaMemsetAsync(a.indices, 0xff, (size_t)b->max_rows * SEL * 4, stream);
     if (e == cudaSuccess) e = cudaMemsetAsync(a.output, 0, (size_t)b->max_rows * a.heads * geom::V_HEAD * 2, stream);
     if (e == cudaSuccess) e = cudaMemsetAsync(a.error, 0, sizeof(unsigned), stream);
     return (int)e;
 }
 // g6a_bind_reset with the latent and index caches cleared on pages [0, pages) only (the identity table: rows
-// [0, pages * PAGE)); the caller keeps every later page zero (Flash serve: the pages no step wrote since a clear)
+// [0, pages * PAGE)) and the raw ring cleared; the caller keeps every later page zero (Flash serve: the pages no step
+// wrote since a clear)
 extern "C" int g6a_bind_reset_pages(G6AttnBinding* b, int pages, void* s) {
     if (!b || !b->storage || pages < 0) return invalid;
     // chunked caches (GR8_GLM53F_KV_CHUNKS): every backed granule, as g6a_bind_reset (a chunk that comes back reads as zero)
@@ -197,10 +202,16 @@ extern "C" int g6a_bind_reset_pages(G6AttnBinding* b, int pages, void* s) {
     const size_t n = (size_t)(pages < a.page_count ? pages : a.page_count);
     cudaError_t e = cudaMemsetAsync(a.mla_cache, 0, n * PAGE * g6kv::ROW, stream);
     if (e == cudaSuccess) e = cudaMemsetAsync(a.index_cache, 0, n * g6kv::IDX_PAGE, stream);
+    if (e == cudaSuccess) e = cudaMemsetAsync(a.index_raw, 0, g6kv::RAW_BYTES, stream);
     if (e == cudaSuccess) e = cudaMemsetAsync(a.indices, 0xff, (size_t)b->max_rows * SEL * 4, stream);
     if (e == cudaSuccess) e = cudaMemsetAsync(a.output, 0, (size_t)b->max_rows * a.heads * geom::V_HEAD * 2, stream);
     if (e == cudaSuccess) e = cudaMemsetAsync(a.error, 0, sizeof(unsigned), stream);
     return (int)e;
+}
+extern "C" int g6_attn_bind_raw_reset(G6AttnBinding* b, int sess, void* s) {
+    if (!b || !b->storage || sess < 0 || sess >= g6kv::RAW_SESS) return invalid;
+    const size_t per = (size_t)g6kv::RAW_RING * g6kv::IDX_RAW;
+    return (int)cudaMemsetAsync((char*)b->args.index_raw + (size_t)sess * per, 0, per, (cudaStream_t)s);
 }
 namespace {
 __global__ void k_nonzero16(const uint4* p, size_t n, unsigned* flag) {
