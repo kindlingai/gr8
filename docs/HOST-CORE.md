@@ -226,7 +226,11 @@ checks it against the constants in each model's shape.
 
 Moves `s2/scheduler.h`, `sessions.h`, `kv_plan.h`, `kv_share.h`, `cp_rows.h`, `flash_lend.h` and `flash_ring.h` (about
 1,300 lines, integer logic). The boundary is `#[repr(C)]` `Key`, `Slot`, `Run`, `Grant`, `Shrink`, `Resize`, `Quantum`,
-`Config` and `g6sch_*` calls (`g6sched.h`). The Rust takes the slot count at run time; the C++ around it keeps
+`Config` and `g6sch_*` calls (`g6sched.h`). C++ `Config` is the shared `g6sch_config` plus the steering receipt, so its
+settings are listed once. At startup the C++ compares a digest of every shared struct's layout (each field's offset,
+size and kind) from `g6sched.h` with the same digest from the Rust types (`src/layout.rs`); it covers the copy of
+kvman-rs's tier counters too, while kvman-rs's own header stays hand-kept until the crates link as one library (R10).
+The Rust takes the slot count at run time; the C++ around it keeps
 `MAX_SESSIONS` arrays until R3 removes `S2N_SLOTS`, since 85 sites in the driver and planner size by it. Proof: the
 scheduler, driver and pool host tests, the seeded command-stream transcripts recorded from the C++ (below), and
 confirmation boots whose round logs (R0) match byte for byte.

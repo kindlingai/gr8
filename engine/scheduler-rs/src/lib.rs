@@ -12,5 +12,6 @@ pub mod flash_lend;
 pub mod flash_ring;
 pub mod kv_plan;
 pub mod kv_share;
+pub mod layout;
 pub mod request;
 pub mod scheduler;

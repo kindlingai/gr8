@@ -212,6 +212,14 @@ fn msg(m: &'static str) -> *const c_char {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn g6sch_guard(c: *const Config) -> u32 {
+    (*c).guard()
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_limit(c: *const Config) -> u32 {
+    (*c).limit()
+}
+#[no_mangle]
 pub unsafe extern "C" fn g6sch_validate(
     c: *const Config,
     max_sessions: u32,
@@ -477,32 +485,21 @@ pub unsafe extern "C" fn g6sch_complete_decode(
     err(sch::complete_decode(&*c, slice_mut(s, n), &mut *st, slice(r, nr)))
 }
 
-/// The struct sizes and constants the C++ side duplicates, by index (g6sched.h G6SCH_ABI_*); 0 past the end.
+/// The constants the C++ side duplicates, by index (g6sched.h G6SCH_ABI_*); 0 past the end. The struct layouts are
+/// checked by g6sch_layout.
 #[no_mangle]
 pub extern "C" fn g6sch_abi(what: u32) -> u64 {
-    use std::mem::size_of;
     let v = [
-        size_of::<Slot>(),
-        size_of::<Config>(),
-        size_of::<Quantum>(),
-        size_of::<State>(),
-        size_of::<Commit>(),
-        size_of::<Completion>(),
-        size_of::<sch::Grant>(),
-        sch::PAGE as usize,
-        sch::PREFILL_DEFER_MAX as usize,
-        sch::NOTICE_MIN as usize,
-        sch::NOTICE_MAX as usize,
-        sch::NOTICE_ROWS as usize,
-        sch::MAX_DECODE_ROUNDS as usize,
-        sch::PACK_MAX_MEMBERS,
-        sch::QMAX,
-        size_of::<crate::kv_share::Totals>(),
-        size_of::<crate::kv_share::Resize>(),
-        size_of::<ParsedReq>(),
-        size_of::<crate::admission::Status>(),
+        u64::from(sch::PAGE),
+        u64::from(sch::PREFILL_DEFER_MAX),
+        sch::NOTICE_MIN,
+        sch::NOTICE_MAX,
+        u64::from(sch::NOTICE_ROWS),
+        u64::from(sch::MAX_DECODE_ROUNDS),
+        sch::PACK_MAX_MEMBERS as u64,
+        sch::QMAX as u64,
     ];
-    v.get(what as usize).map_or(0, |&x| x as u64)
+    v.get(what as usize).copied().unwrap_or(0)
 }
 
 // ---- kv_share.rs ---------------------------------------------------------------------------------------------------

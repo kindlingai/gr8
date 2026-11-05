@@ -17,8 +17,7 @@ namespace g6s2 {
 // or queued), room for one more average entry before the tier fills. An idle tier that took no spill asks for
 // nothing, so an idle group never takes room from a busy one. The rule is engine/scheduler-rs/src/kv_share.rs.
 inline uint64_t share_want(const g6kv_tier_totals& last, const g6kv_tier_totals& now, uint64_t per, bool busy = false) {
-    static const bool ok = g6sch_abi(G6SCH_ABI_TOTALS) == sizeof(g6kv_tier_totals) && g6sch_abi(G6SCH_ABI_RESIZE) == sizeof(g6sch_resize);
-    require(ok, "scheduler-rs: tier counters or Resize differ from kv_share.h");
+    sch::check_abi();
     return g6sch_share_want(&last, &now, per, busy);
 }
 
