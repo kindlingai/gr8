@@ -3,7 +3,7 @@
 // state to a transcript; the test compares each transcript's hash with the one recorded from the C++ the Rust replaced.
 // Included inside a namespace with an `impl` namespace that holds the implementation; shared types are g6s2's.
 // The generator is mt19937_64 with modulo ranges, never <random>'s distributions, so a seed gives the same streams
-// with every standard library.
+// with every standard library. A call never takes two draws as arguments, since compilers order arguments differently.
 
 struct Rng
 {
@@ -541,7 +541,12 @@ inline uint64_t request(uint64_t seed, std::vector<std::string>* lines = nullptr
         std::string bytes = head;
         if (U(0, 30)) bytes += "\n" + pick({"1,2,3", "1", "", "1 2", "1,2\n", " 7 ", "2147483648", "1,,2", "1\n\n"});
         if (!U(0, 4)) bytes += "\n";
-        if (!U(0, 40)) bytes.insert(size_t(U(0, int(bytes.size()))), 1, pick({std::string(1, '\0'), "\xff", "\xa0", "\x85"})[0]);
+        if (!U(0, 40))
+        {
+            // one draw per statement: the order of a call's arguments is the compiler's choice
+            const size_t at = size_t(U(0, int(bytes.size())));
+            bytes.insert(at, 1, pick({std::string(1, '\0'), "\xff", "\xa0", "\x85"})[0]);
+        }
         const st::BootConfig& b = *boots[U(0, 2)];
         tx(outcome([&] { return str(impl::parse_request(bytes, b)); }));
     }
