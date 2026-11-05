@@ -32,6 +32,7 @@ struct G6AttnStep {
     int reuse_rows;
 #if G6_MODEL_FLASH
     const void* index_gate;   // FP16 [rows,128] x @ index_kpool_compress_gate^T, full-index steps only
+    const int* raw_sess;      // device [rows]: the S2 session of each row, its raw index ring (kvfmt.h); nullptr = 0
 #endif
 #ifdef DEC_S2
     int s2_batched;           // the step is replayed with a batched cell (G6AttnStepCell::rows): rows of several sessions
@@ -65,6 +66,8 @@ extern "C" int g6_attn_bind_create_chunked(G6AttnBinding*, const G6AttnPack*, in
     int max_rows, int query_tile, void* stream, G6KvChunks* mla, G6KvChunks* idx);
 // Pages of the smallest chunk that gives back all its bytes: its MLA and index bytes are whole granules (0: none).
 extern "C" uint32_t g6_flash_kv_chunk_pages(size_t granule);
+// Clears session sess's raw index ring (kvfmt.h) of the binding: a new sequence on that session (S2, several sessions)
+extern "C" int g6_attn_bind_raw_reset(G6AttnBinding*, int sess, void* stream);
 #endif
 // Decode scratch bytes a binding with these heads / capacity / max_rows / query_tile needs (0: invalid).
 extern "C" size_t g6a_bind_scratch_need(int heads, int capacity, int max_rows, int query_tile);

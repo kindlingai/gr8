@@ -472,6 +472,7 @@ inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
             s.index_k = S.idx_k + static_cast<size_t>(m0) * IDXK;
             s.index_weight = S.idx_w + static_cast<size_t>(m0) * IDXW;
             s.index_gate = S.idx_g + static_cast<size_t>(m0) * geom::IDX_DIM;
+            s.raw_sess = P.rsess + m0;
             G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
             G6RT_CK(cudaMemcpyAsync(S.attn_p1 + static_cast<size_t>(m0) * (h * 256), y.ab.args.output,
                                     static_cast<size_t>(r) * h * 256 * sizeof(__half), cudaMemcpyDeviceToDevice, st));
@@ -484,6 +485,7 @@ inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
         s.rows = M; s.context = context;
         s.q_b = S.q_b; s.kv_a = S.kv_a; s.positions = P.pos;
         s.index_q = S.idx_q; s.index_k = S.idx_k; s.index_weight = S.idx_w; s.index_gate = S.idx_g;
+        s.raw_sess = P.rsess;
         if (transport) {
             G6FlashPoolOwner owner{m.rank, transport, flash_pool_publish, flash_pool_receive};
             G6RT_CK(g6_attn_bind_prefill_run_owned(S.pf[i], &y.ab, &s, st, &owner));

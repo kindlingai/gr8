@@ -36,11 +36,16 @@ constexpr const char* NAME = "ds41-fp4";
 //   G6_FLASH_KV_FP8=0  1024 B: [512 BF16]
 //   G6_FLASH_KV_FP8=1   528 B: [512 E4M3 codes][4 FP32 scales, one per 128 dims, amax / 448]
 // Index cache (kpool indexer, every DSA layer), per 64-row page (16 pools of KPOOL = 4 consecutive tokens):
-//   [64 tokens][IDX_DIM FP16 raw key = wk(x), before k_norm][IDX_DIM FP16 raw pool gate = x @ compress_gate^T]  32 KB
-//   [16 pools][IDX_DIM FP32 pooled key]                                                                         8 KB
-// A row writes only its own raw slot; the row that completes a pool (pos % 4 == 3) then forms the pool's key from the
-// 4 raw slots: k_j = LayerNorm(raw_k_j) * w + b (eps 1e-6), p_j = softmax_j(gate_j + ape_j) per channel,
-// pooled = sum_j p_j k_j. A re-appended row (speculation rollback) rewrites its slot and, at pos % 4 == 3, the pool.
+//   [16 pools][IDX_DIM FP32 pooled key]  8 KB
+// A row's raw index row, [IDX_DIM FP16 raw key = wk(x), before k_norm][IDX_DIM FP16 raw pool gate = x @ compress_gate^T]
+// (512 B), feeds only the pool of 4 it belongs to, so it stays out of the pages. The row that completes a pool
+// (pos % 4 == 3) forms the pool's key from the 4 raw rows: k_j = LayerNorm(raw_k_j) * w + b (eps 1e-6),
+// p_j = softmax_j(gate_j + ape_j) per channel, pooled = sum_j p_j k_j. It reads a raw row from its own call when the
+// row is there (the rows of one session in a call are consecutive positions), else from the binding's raw ring:
+// RAW_SESS sessions x RAW_RING positions, slot pos % RAW_RING, to which every call writes its last RAW_RING rows.
+// A ring holds the incomplete pool and what a rollback re-reads: a call has at most G6_MX rows (attn/flash_attn.cu
+// checks RAW_RING > G6_MX + KPOOL). A re-appended row (speculation rollback) rewrites its ring slot and, at
+// pos % 4 == 3, the pool.
 #ifndef G6_FLASH_KV_FP8
 #define G6_FLASH_KV_FP8 0
 #endif
@@ -60,9 +65,10 @@ constexpr const char* NAME = "bf16nope";
 constexpr int IDX_HEADS = 32, IDX_DIM = 128, KPOOL = 4, IDX_TOPK = 2048, TOP_POOLS = IDX_TOPK / KPOOL;
 constexpr int PAGE = 64, PAGE_POOLS = PAGE / KPOOL;
 constexpr int IDX_RAW = 2 * IDX_DIM * 2;                    // bytes of one token's raw key + gate
-constexpr int IDX_POOL_OFF = PAGE * IDX_RAW;                // pooled keys after the 64 raw slots
-constexpr int IDX_PAGE = IDX_POOL_OFF + PAGE_POOLS * IDX_DIM * 4;   // 40960
-constexpr int IDX_ROW = IDX_PAGE / PAGE;                    // 640 per token (sizing)
+constexpr int IDX_PAGE = PAGE_POOLS * IDX_DIM * 4;          // 8192: the pooled keys only
+constexpr int IDX_ROW = IDX_PAGE / PAGE;                    // 128 per token (sizing)
+constexpr int RAW_RING = 64, RAW_SESS = 8;                  // the raw ring: positions a session, sessions (S2N)
+constexpr int RAW_BYTES = RAW_SESS * RAW_RING * IDX_RAW;    // 256 KB a binding
 constexpr int SEL = 2304;   // selected positions per row: TOP_POOLS * KPOOL + the tail (<= 3), padded to 9 x 256
 #elif G6_KV4
 constexpr int ROW = 288 + 2 * geom::QK_ROPE, SCALE_OFF = 256, ROPE_OFF = 288;

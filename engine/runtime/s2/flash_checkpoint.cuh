@@ -5,16 +5,18 @@
 // An entry is blocks [base, base + 1 + pages + state_blocks) of the store:
 //   base             the manifest (FlashManifest), written last
 //   base + 1 + i     logical page i of the run (the run's i-th pool page) of every binding, main model then draft: per
-//                    binding 64 rows of its latent cache, then its 64 rows of indexer keys and pools (g6kv::ROW,
-//                    g6kv::IDX_PAGE), the pool's page block layout
-//   then             the KDA state of one slot, layer by layer: S [nhmax][128][128] fp32, then the conv history, cut
-//                    into blocks (the last one padded with zeros)
+//                    binding 64 rows of its latent cache, then its 16 pooled index keys (g6kv::ROW, g6kv::IDX_PAGE),
+//                    the pool's page block layout
+//   then             the KDA state of one slot, layer by layer: S [nhmax][128][128] fp32, then the conv history; then
+//                    the session's raw index ring of every binding (g6kv::RAW_RING x IDX_RAW, attn/kvfmt.h: the raw
+//                    rows of the pool the position may end inside); all cut into blocks (the last one padded with zeros)
 // Capture computes a checksum of the device bytes before they leave; restore computes it again on the device bytes it
 // wrote and refuses the entry when they differ (a torn, reused or corrupted range), as it does when the manifest is not
 // the entry's. Both run on the serve stream, synchronously: the copies sit between prefill quanta or before a bind.
 #pragma once
 #include "flash_checkpoint.h"
 #include "flash_ckpt_index.h"
+#include "../../attn/kvfmt.h"
 #include "kv_share.h"
 #include "../../kvman-rs/g6kvman.h"
 #include <cuda_runtime.h>
@@ -78,19 +80,22 @@ __global__ void k_sum_pages(const uint64_t* base, const int* pages, size_t n, si
 // [N_KDA][slots][nhmax][128][128], conv [N_KDA][slots][NHIST][3][nhmax*128], fp32).
 struct FlashStateView {
     std::vector<fck::Binding> bindings;   // mla / idx device pointers; page sizes in 16-byte units
+    std::vector<uint8_t*> rings;          // each binding's raw index ring (G6Attn::index_raw), in the bindings' order
+    size_t ring_bytes = 0;                // bytes of one session's ring in one binding
     float *S = nullptr, *conv = nullptr;
     int layers = 0, slots = 0, pool_pages = 0;   // pool_pages: the pages every binding holds (a run's pages are below it)
     size_t s_slot = 0, c_slot = 0;        // floats of one slot's S / conv history in one layer
-    // slot k of every layer, in the entry's order
-    std::vector<fck::Extent> state(int k) const {
+    // KDA slot k of every layer, then session q's ring of every binding, in the entry's order
+    std::vector<fck::Extent> state(int k, int q) const {
         std::vector<fck::Extent> v;
         for (int l = 0; l < layers; ++l) {
             v.push_back({S + (size_t)l * slots * s_slot + (size_t)k * s_slot, s_slot * 4});
             v.push_back({conv + (size_t)l * slots * c_slot + (size_t)k * c_slot, c_slot * 4});
         }
+        for (uint8_t* r : rings) v.push_back({r + (size_t)q * ring_bytes, ring_bytes});
         return v;
     }
-    size_t state_bytes() const { return (size_t)layers * (s_slot + c_slot) * 4; }
+    size_t state_bytes() const { return (size_t)layers * (s_slot + c_slot) * 4 + rings.size() * ring_bytes; }
     size_t page_bytes() const {
         size_t n = 0;
         for (const auto& b : bindings) n += (b.mla_page16 + (b.idx ? b.idx_page16 : 0)) * 16;
@@ -383,13 +388,14 @@ public:
         save();
         return true;
     }
-    // keep the run's logical rows [0, position) (run: its pool pages in order) and KDA slot `slot` (the state after them)
-    // as an entry for `tokens` (position + 1 of them). Returns the entry's generation, or 0: the store cannot hold it.
-    // The same tokens already kept: that entry is marked used and nothing is written. terminal: position may end
-    // mid-page (the whole last page is kept); otherwise it must be on the page grid.
-    uint64_t capture(uint32_t position, int slot, const std::vector<int>& run, const std::vector<int>& tokens,
+    // keep the run's logical rows [0, position) (run: its pool pages in order), KDA slot `slot` (the state after them)
+    // and session sess's raw index rings as an entry for `tokens` (position + 1 of them). Returns the entry's generation,
+    // or 0: the store cannot hold it. The same tokens already kept: that entry is marked used and nothing is written.
+    // terminal: position may end mid-page (the whole last page is kept); otherwise it must be on the page grid.
+    uint64_t capture(uint32_t position, int slot, int sess, const std::vector<int>& run, const std::vector<int>& tokens,
                      const g6rt::CacheNamespace& ns, cudaStream_t st, bool terminal = false) {
-        if (!position || (!terminal && position % 64) || tokens.size() != size_t(position) + 1 || slot < 0 || slot >= v_.slots)
+        if (!position || (!terminal && position % 64) || tokens.size() != size_t(position) + 1 || slot < 0 || slot >= v_.slots ||
+            sess < 0 || sess >= g6kv::RAW_SESS)
             throw std::runtime_error("Flash checkpoint: capture at " + std::to_string(position) + " with " + std::to_string(tokens.size()) + " tokens");
         if (const FlashEntry* x = index_.same(tokens, ns)) { index_.touch(x->generation); return x->generation; }
         const auto t0 = std::chrono::steady_clock::now();
@@ -404,7 +410,7 @@ public:
         x.generation = index_.next_generation(); x.base = base; x.blocks = need; x.position = position; x.terminal = terminal;
         x.tokens = tokens; x.ns = ns;
         x.manifest = flash_manifest(x.generation, compat_, position, tokens, ns, np, block_, v_.state_bytes());
-        const auto sx = v_.state(slot);
+        const auto sx = v_.state(slot, sess);
         set_pages(run, np, st);
         x.manifest.page_sum = page_sum(np, st);
         x.manifest.state_sum = sum(sx, st);
@@ -432,12 +438,14 @@ public:
         if (files_.on()) { files_.remove(); files_ = FlashIndexFiles(); }
         throw std::runtime_error("Flash checkpoint " + std::to_string(generation) + ": " + why);
     }
-    // entry `generation` back into the run's logical rows [0, position) and KDA slot `slot`; throws when the stored bytes
-    // are not the entry's (the serve fails: the other ranks restore too, so one rank cannot fall back to a cold prefill alone)
-    void restore(uint64_t generation, int slot, const std::vector<int>& run, cudaStream_t st) {
+    // entry `generation` back into the run's logical rows [0, position), KDA slot `slot` and session sess's raw index
+    // rings; throws when the stored bytes are not the entry's (the serve fails: the other ranks restore too, so one rank
+    // cannot fall back to a cold prefill alone)
+    void restore(uint64_t generation, int slot, int sess, const std::vector<int>& run, cudaStream_t st) {
         const FlashEntry* x = index_.find(generation);
         if (!x) throw std::runtime_error("Flash checkpoint: no entry " + std::to_string(generation));
         if (slot < 0 || slot >= v_.slots) throw std::runtime_error("Flash checkpoint: no KDA slot " + std::to_string(slot));
+        if (sess < 0 || sess >= g6kv::RAW_SESS) throw std::runtime_error("Flash checkpoint: no session " + std::to_string(sess));
         const auto t0 = std::chrono::steady_clock::now();
         io(x->base, 1, false);
         FlashManifest m;
@@ -450,10 +458,10 @@ public:
             io(x->base + 1 + p, n, false);
             pages(p, n, false, st);
         }
-        const auto sx = v_.state(slot);
+        const auto sx = v_.state(slot, sess);
         state(sx, x->base + 1 + np, false, st);
         if (page_sum(np, st) != m.page_sum) fail(generation, "page checksum");
-        if (sum(sx, st) != m.state_sum) fail(generation, "KDA state checksum");
+        if (sum(sx, st) != m.state_sum) fail(generation, "KDA state / raw ring checksum");
         last = Last{x->blocks, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()};
         index_.touch(generation);
     }

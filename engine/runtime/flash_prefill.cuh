@@ -89,6 +89,7 @@ struct FlashPrefill
     u64* stepp = nullptr;
     unsigned* tickets = nullptr;                 // [2]
     int *tok = nullptr, *pos = nullptr, *row_slot = nullptr;   // [MP]
+    int* rsess = nullptr;                        // [MP]: the S2 session of every row (G6AttnStep::raw_sess)
     float* resid4 = nullptr;                     // [MP][HC][HID]
     float *hc_inv = nullptr, *hc_mix = nullptr, *hc_pre = nullptr, *hc_post = nullptr, *hc_comb = nullptr;
     unsigned* hc_done = nullptr;
@@ -335,7 +336,7 @@ inline void build_flash_prefill(Model& m, FlashPrefill& P, int MP, const g6::Fab
     P.MP = MP; P.f = f; P.stepp = stepp;
     P.tickets = dmalloc<unsigned>(4);
     G6RT_CK(cudaMemset(P.tickets, 0, 4 * sizeof(unsigned)));
-    P.tok = dmalloc<int>(MP); P.pos = dmalloc<int>(MP); P.row_slot = dmalloc<int>(MP);
+    P.tok = dmalloc<int>(MP); P.pos = dmalloc<int>(MP); P.row_slot = dmalloc<int>(MP); P.rsess = dmalloc<int>(MP);
     P.resid4 = dmalloc<float>((size_t)MP * geom::HC * HID);
     P.hc_inv = dmalloc<float>(MP); P.hc_mix = dmalloc<float>((size_t)MP * geom::HC_MIX);
     P.hc_pre = dmalloc<float>((size_t)MP * geom::HC); P.hc_post = dmalloc<float>((size_t)MP * geom::HC);
@@ -434,15 +435,16 @@ inline void pf_prewarm_flash(Model& m, FlashPrefill& P, cudaStream_t st)
 }
 
 // host: tokens and positions of one sub-batch; every row in KDA state slot `slot` (0: one offline session; S2: the
-// session's first slot, FlashSlots::base)
-inline void pf_inputs_flash(FlashPrefill& P, int M, const int* tok, const int* pos, int slot_id = 0)
+// session's first slot, FlashSlots::base) and of S2 session `sess` (its raw index ring)
+inline void pf_inputs_flash(FlashPrefill& P, int M, const int* tok, const int* pos, int slot_id = 0, int sess = 0)
 {
     if (M < 1 || M > P.MP) die("Flash prefill: M outside 1..MP");
     for (int r = 1; r < M; ++r) if (pos[r] != pos[0] + r) die("Flash prefill: rows must be consecutive positions");
     G6RT_CK(g6h2d::copy(P.tok, tok, M * sizeof(int)));
     G6RT_CK(g6h2d::copy(P.pos, pos, M * sizeof(int)));
-    const std::vector<int> slot(M, slot_id);
+    const std::vector<int> slot(M, slot_id), rs(M, sess);
     G6RT_CK(g6h2d::copy(P.row_slot, slot.data(), M * sizeof(int)));
+    G6RT_CK(g6h2d::copy(P.rsess, rs.data(), M * sizeof(int)));
 }
 
 inline bool pf_sp_x16_layer(const Model& m, const FlashPrefill& P, int i, int c, int M);
@@ -745,6 +747,7 @@ inline void pf_dsa_block_p1(Model& m, FlashPrefill& P, int i, int M, int context
 #endif
         flash_mhc::fragments(P.xn + (size_t)m0 * HID, r, HID, m.sc.xf_x, m.sc.xb_x, st);
         G6RT_CK(cudaMemcpyAsync(m.pos, P.pos + m0, r * sizeof(int), cudaMemcpyDeviceToDevice, st));
+        G6RT_CK(cudaMemcpyAsync(m.rsess, P.rsess + m0, r * sizeof(int), cudaMemcpyDeviceToDevice, st));
         if (b.x_in.n) bind::launch(b.x_in, st);
         else { bind::launch(b.q_a, st); bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); bind::launch(b.idx_g, st); }
         glue::k_rmsnorm_rows<__half><<<r, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, geom::RMS_EPS_FLASH, m.q_a_n, QA,
@@ -1304,7 +1307,7 @@ inline void pf_draft_cache_flash(Draft& D, int M, int context, cudaStream_t st)
     bind::launch(b.idx_k, st);
     bind::launch(b.idx_g, st);
     G6Attn a = y.ab.args;
-    a.rows = M; a.context = context; a.positions = d.pos;
+    a.rows = M; a.context = context; a.positions = d.pos; a.raw_sess = d.rsess;
     a.kv_a = d.kv_a; a.index_k = d.idx_k; a.index_gate = d.idx_g;
     a.reuse_indices = nullptr;
     G6RT_CK(g6_attn_append(&a, st));
@@ -1433,7 +1436,7 @@ inline DraftFull& pf_draft_cache_full(Draft& D, FlashPrefill& P, int M, int pos0
             pf_gv_rg(*gs[k], gs[k]->xfrag == d.sc.xf_x ? F.xf : F.xb, r, o[k], st);
         }
         G6Attn a = y.ab.args;
-        a.rows = r; a.context = pos0 + m0 + r; a.positions = P.pos + m0;
+        a.rows = r; a.context = pos0 + m0 + r; a.positions = P.pos + m0; a.raw_sess = P.rsess + m0;
         a.kv_a = o[0]; a.index_k = o[1]; a.index_gate = o[2];
         a.reuse_indices = nullptr;
         G6RT_CK(g6_attn_append(&a, st));
@@ -1460,17 +1463,19 @@ inline void pf_draft_full_cmp(Draft& D, DraftFull& F, int m0, int r, cudaStream_
 
 // MTP draft prefill (P1): the decode draft step (layer 45: eh_proj, DSA, MoE, single residual) over the sub-batch's
 // rows in MX-row chunks, without graphs. Row r: hidden = main final-norm row r (P.xn), token = the prompt token after
-// it (next[r]), position pos0 + r; it writes the MTP layer's KV rows of the prompt. run(di) enqueues the draft fabric
-// step and launches it with D.main_xn pointing at the chunk's rows (the step's head output is not used).
+// it (next[r]), position pos0 + r, S2 session sess; it writes the MTP layer's KV rows of the prompt. run(di) enqueues
+// the draft fabric step and launches it with D.main_xn pointing at the chunk's rows (the step's head output is not used).
 inline void pf_draft_flash(Draft& D, FlashPrefill& P, int M, int pos0, const int* next, u64& dstep,
-                           const std::function<void(const StepIn&)>& run)
+                           const std::function<void(const StepIn&)>& run, int sess = 0)
 {
     const float* main_xn = D.main_xn;
     for (int m0 = 0; m0 < M; m0 += MX)
     {
         const int r = std::min(MX, M - m0);
         D.main_xn = P.xn + (size_t)m0 * HID;
-        run(draft_inputs(++dstep, r, pos0 + m0, next + m0, 0.f, 0u));
+        StepIn di = draft_inputs(++dstep, r, pos0 + m0, next + m0, 0.f, 0u);
+        for (int i = 0; i < r; ++i) di.sess[i] = sess;
+        run(di);
     }
     D.main_xn = main_xn;
 }

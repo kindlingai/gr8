@@ -257,8 +257,8 @@ static void crash_after_reserve(const std::string& dir) {
 struct FakeStore {
     FlashLayout L;
     std::vector<std::vector<uint8_t>> b;
-    FakeStore(uint64_t n) {
-        L.slot = 4096; L.parts = {{1024, 512}, {2048, 0}}; L.state_bytes = 3 * 4096 + 1000;
+    FakeStore(uint64_t n, size_t state_bytes = 3 * 4096 + 1000) {
+        L.slot = 4096; L.parts = {{1024, 512}, {2048, 0}}; L.state_bytes = state_bytes;
         b.assign(n, std::vector<uint8_t>(L.slot, 0xEE));
     }
     FlashRead read() {
@@ -334,8 +334,8 @@ static void entry_checks() {
     CHECK(flipped(a.base + 1, 0) == "page checksum");
     CHECK(flipped(a.base + 1 + 9, 1024 + 511) == "page checksum");      // the last page's indexer rows
     CHECK(flipped(a.base + 1 + 3, 1536 + 2047) == "page checksum");     // the second binding
-    CHECK(flipped(a.base + 1 + 10, 7) == "KDA state checksum");
-    CHECK(flipped(a.base + 1 + 10 + 3, 999) == "KDA state checksum");   // the last state block's last byte
+    CHECK(flipped(a.base + 1 + 10, 7) == "KDA state / raw ring checksum");
+    CHECK(flipped(a.base + 1 + 10 + 3, 999) == "KDA state / raw ring checksum");   // the last state block's last byte
     CHECK(flipped(a.base + 1 + 2, 4000) == "ok");                       // a page block's padding is not summed
     CHECK(flipped(a.base, 8) != "ok");
     // two pages swapped: the sum numbers every word by its place
@@ -347,6 +347,32 @@ static void entry_checks() {
     const FlashRead bad = [](uint64_t, int, uint8_t*) { throw std::runtime_error("read"); };
     try { flash_entry_check(a, COMPAT, st.b.size(), st.L, bad); } catch (const std::exception&) { threw = true; }
     CHECK(threw);
+}
+
+// The state stream of a FORMAT 2 entry: the KDA state, then the session's raw index ring of every binding (here 2 x
+// 32 KiB after 13,288 B of KDA state, as FlashStateView::state lays them out). The state checksum covers the rings, so
+// a changed ring byte drops the entry; and an entry sealed by the old format (1: raw rows in the pages, no rings) is
+// not a manifest of this build, so a persisted index of that store keeps none of it.
+static void ring_checks() {
+    const size_t kda = 3 * 4096 + 1000, ring = 32768;
+    FakeStore st(200, kda + 2 * ring);
+    FlashIndex ix(200);
+    const FlashEntry a = st.write(ix, 640, 5);
+    const uint64_t s0 = a.base + 1 + 10;   // the first state block
+    CHECK(check(a, st) == "ok");
+    auto flipped = [&](size_t at) {        // byte `at` of the state stream
+        auto& blk = st.b[s0 + at / st.L.slot];
+        blk[at % st.L.slot] ^= 0x40; const std::string r = check(a, st); blk[at % st.L.slot] ^= 0x40; return r;
+    };
+    CHECK(flipped(kda - 1) == "KDA state / raw ring checksum");             // the KDA state's last byte
+    CHECK(flipped(kda) == "KDA state / raw ring checksum");                 // the first ring's first byte
+    CHECK(flipped(kda + 2 * ring - 1) == "KDA state / raw ring checksum");  // the last ring's last byte
+    FlashEntry old = a;
+    old.manifest.format = 1; old.manifest.self_sum = old.manifest.own_sum();
+    std::fill(st.b[a.base].begin(), st.b[a.base].end(), 0);
+    std::memcpy(st.b[a.base].data(), &old.manifest, sizeof old.manifest);
+    CHECK(check(old, st) == "no manifest");
+    CHECK(FlashManifest::FORMAT == 2);
 }
 
 // The crash case again, with an index that still names the dropped entry (as the first version wrote it, before a
@@ -417,6 +443,7 @@ int main(int argc, char** argv) {
     read_only_save(sub("readonly"));
     crash_after_reserve(sub("crash"));
     entry_checks();
+    ring_checks();
     crash_with_stale_index(sub("crash2"));
     std::filesystem::remove_all(dir);
     if (!fails) std::printf("flash_ckpt_index_test: PASS\n");

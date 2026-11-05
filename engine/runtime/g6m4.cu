@@ -1992,8 +1992,12 @@ int main(int argc, char** argv)
             for (g6rt::Model* x : {&m, &D.d})
                 for (g6rt::Layer& y : x->layers)
                     if (!y.kda && y.ab.storage)
+                    {
                         v.bindings.push_back({static_cast<uint4*>(y.ab.args.mla_cache), static_cast<uint4*>(y.ab.args.index_cache),
                                               (unsigned long long)(64 * g6kv::ROW / 16), (unsigned long long)(g6kv::IDX_PAGE / 16)});
+                        v.rings.push_back(static_cast<uint8_t*>(y.ab.args.index_raw));
+                    }
+            v.ring_bytes = (size_t)g6kv::RAW_RING * g6kv::IDX_RAW;
             v.S = m.kda_st.S; v.conv = m.kda_st.conv; v.layers = kda::N_KDA; v.slots = m.kda_st.slots; v.pool_pages = int(sc.pool_rows / 64);
             v.s_slot = m.kda_st.s_layer() / std::max(1, m.kda_st.slots); v.c_slot = m.kda_st.c_layer() / std::max(1, m.kda_st.slots);
             std::string spec = "mem:";
@@ -2034,7 +2038,7 @@ int main(int argc, char** argv)
             catch (const std::exception& e) { die(std::string("GR8_GLM53F_CACHE: ") + e.what()); }
             // persist=on: the entries are checked on a helper thread and agreed by every rank in serve_flash
             if (!index_path.empty()) fprintf(stderr, "# rank %d: flash ckpt persist: %s: %s\n", R, index_path.c_str(), ckpt->loaded.c_str());
-            fprintf(stderr, "# rank %d: flash ckpt %s: %s, %llu blocks of %zu B (%zu bindings, KDA state %.1f MB = %llu blocks), grid %d rows%s\n",
+            fprintf(stderr, "# rank %d: flash ckpt %s: %s, %llu blocks of %zu B (%zu bindings, KDA state + raw rings %.1f MB = %llu blocks), grid %d rows%s\n",
                     R, g6s2::flash_cache_name(flash_cache), ckpt->describe().c_str(), (unsigned long long)ckpt->blocks(), ckpt->slot_bytes(),
                     v.bindings.size(), v.state_bytes() / 1e6, (unsigned long long)(ckpt->entry_blocks(0) - 1), MP * (two ? 2 : 1),
                     group ? (", group " + group->group + " lease, " + std::to_string(ckpt->segments()) + " segments to start").c_str() : "");
