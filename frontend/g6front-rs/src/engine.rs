@@ -65,6 +65,10 @@ impl Engine {
     pub fn grammars(&self) -> bool {
         self.hello().is_some_and(|h| h.get("grammar") == Some(&Value::Bool(true)))
     }
+    /// The engine takes `generate`'s images (its hello says `"vision": true`).
+    pub fn vision(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("vision") == Some(&Value::Bool(true)))
+    }
     /// The engine applies `generate`'s insert rule (its hello says `"insert": true`).
     pub fn inserts(&self) -> bool {
         self.hello().is_some_and(|h| h.get("insert") == Some(&Value::Bool(true)))

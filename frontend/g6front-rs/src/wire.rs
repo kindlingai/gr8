@@ -207,6 +207,8 @@ pub struct GenParams {
     pub steering_profile: Option<String>,
     /// Canonical FP32 widened to f64 for lossless JSON serialization.
     pub steering_scale: Option<f64>,
+    /// the prompt's image spans (PROTOCOL.md `images`); empty: the field is not sent
+    pub images: std::sync::Arc<Vec<crate::vision::Span>>,
 }
 
 /// Once the reply holds `after_tokens` tokens and none of them is `unless_emitted`, the engine puts `tokens` in place of
@@ -237,7 +239,8 @@ fn opt_int(b: &mut Vec<u8>, v: Option<i64>) {
 }
 
 pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
-    let mut w = FrameWriter::with_capacity(256 + prompt.len() * 7 + p.stop_ids.len() * 8);
+    let img: usize = p.images.iter().map(|i| i.rgb_b64.len() + 96).sum();
+    let mut w = FrameWriter::with_capacity(256 + prompt.len() * 7 + p.stop_ids.len() * 8 + img);
     let b = &mut w.b;
     b.extend_from_slice(b"{\"id\":");
     pyjson::string(b, id);
@@ -312,6 +315,26 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
         b.extend_from_slice(b",\"steering_scale\":");
         pyjson::float(b, p.steering_scale.unwrap_or(1.0));
     }
+    if !p.images.is_empty() {
+        b.extend_from_slice(b",\"images\":[");
+        for (i, im) in p.images.iter().enumerate() {
+            if i > 0 {
+                b.push(b',');
+            }
+            b.extend_from_slice(b"{\"pos\":");
+            pyjson::int(b, im.pos as u64);
+            b.extend_from_slice(b",\"vit_h\":");
+            pyjson::int(b, im.vit_h as u64);
+            b.extend_from_slice(b",\"vit_w\":");
+            pyjson::int(b, im.vit_w as u64);
+            b.extend_from_slice(b",\"key\":");
+            pyjson::string(b, &im.key);
+            b.extend_from_slice(b",\"rgb\":\"");
+            b.extend_from_slice(im.rgb_b64.as_bytes()); // the base64 alphabet needs no JSON escape
+            b.extend_from_slice(b"\"}");
+        }
+        b.push(b']');
+    }
     b.extend_from_slice(b",\"type\":\"generate\"}");
     w.finish()
 }
@@ -354,6 +377,7 @@ mod tests {
             grammar: None,
             steering_profile: None,
             steering_scale: None,
+            images: Default::default(),
         };
         let mut all = Vec::new();
         all.extend_from_slice(&generate("cmpl-1", &[10, 20, 30], &p));
@@ -377,6 +401,12 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &selected)[4..]).unwrap();
         assert_eq!(v["steering_profile"], "example");
         assert_eq!((v["steering_scale"].as_f64().unwrap() as f32).to_bits(), 0x3f8ccccd);
+        assert!(!v.as_object().unwrap().contains_key("images"));
+        let span = crate::vision::Span { pos: 1, vit_h: 2, vit_w: 3, key: "00ff".into(), rgb_b64: "QUJD".into() };
+        let withimg = GenParams { images: std::sync::Arc::new(vec![span]), ..p.clone() };
+        let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1, 129264], &withimg)[4..]).unwrap();
+        assert_eq!(v["images"], serde_json::json!([{"pos": 1, "vit_h": 2, "vit_w": 3, "key": "00ff", "rgb": "QUJD"}]));
+        assert_eq!(v["type"], "generate");
         let p = GenParams {
             logprobs: None,
             insert: Some(InsertRule { after_tokens: 31, unless_emitted: Some(154842), tokens: vec![198, 154842, 271] }),

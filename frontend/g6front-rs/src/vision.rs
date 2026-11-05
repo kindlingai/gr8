@@ -444,6 +444,47 @@ pub fn b64_encode(b: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(b)
 }
 
+/// An image block's base64 data. Inline data only: a data URL (`image_url.url`, `image_url` as a string, `url`), an
+/// Anthropic `source` of type base64, or `data`. A URL the server would have to fetch is refused.
+pub fn block_b64(b: &serde_json::Value) -> Result<&str, VisionError> {
+    use serde_json::Value;
+    fn data_url(u: &str) -> Result<&str, VisionError> {
+        let Some(rest) = u.strip_prefix("data:") else {
+            return verr("image URLs are not fetched; send the image inline as a data: URL or base64");
+        };
+        match rest.split_once(',') {
+            Some((meta, data)) if meta.ends_with(";base64") => Ok(data),
+            _ => verr("an image data: URL must be base64 (data:<type>;base64,<data>)"),
+        }
+    }
+    match b.get("image_url") {
+        Some(Value::String(u)) => return data_url(u),
+        Some(Value::Object(o)) => {
+            return data_url(o.get("url").and_then(Value::as_str).unwrap_or(""));
+        }
+        _ => {}
+    }
+    if let Some(src) = b.get("source").filter(|v| !v.is_null()) {
+        return match src {
+            Value::String(u) => data_url(u),
+            Value::Object(o) if o.get("type").and_then(Value::as_str) == Some("base64") => {
+                o.get("data").and_then(Value::as_str).ok_or_else(|| VisionError("image source has no data".into()))
+            }
+            Value::Object(o) if o.get("type").and_then(Value::as_str) == Some("url") => {
+                data_url(o.get("url").and_then(Value::as_str).unwrap_or(""))
+            }
+            _ => verr("image source must be {\"type\": \"base64\", \"data\": ...}"),
+        };
+    }
+    if let Some(Value::String(u)) = b.get("url") {
+        return data_url(u);
+    }
+    match b.get("data") {
+        Some(Value::String(d)) => Ok(d),
+        _ => verr("image block does not contain a valid source"),
+    }
+}
+
 /// Base64 image data -> what the engine gets.
 pub fn prepare_b64(b64: &str) -> Result<Prepared, VisionError> {
     let bytes = b64_decode(b64)?;
@@ -664,5 +705,28 @@ mod tests {
         assert!(b64_decode("a*Gk").is_err());
         assert!(prepare_b64("aGk=").is_err());
         assert_eq!(content_key(1, 2, b"x").len(), 16);
+    }
+
+    #[test]
+    fn image_sources() {
+        use serde_json::json;
+        let ok = [
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}),
+            json!({"type": "input_image", "image_url": "data:image/png;base64,QUJD"}),
+            json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}}),
+            json!({"type": "image", "url": "data:image/jpeg;base64,QUJD"}),
+            json!({"type": "image", "data": "QUJD"}),
+        ];
+        for b in ok {
+            assert_eq!(block_b64(&b).unwrap(), "QUJD", "{b}");
+        }
+        for b in [
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}),
+            json!({"type": "image", "source": {"type": "url", "url": "file:///etc/passwd"}}),
+            json!({"type": "image_url", "image_url": {"url": "data:image/png,raw"}}),
+            json!({"type": "image"}),
+        ] {
+            assert!(block_b64(&b).is_err(), "{b}");
+        }
     }
 }
