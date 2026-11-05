@@ -5,6 +5,7 @@
 // every rank applies it at that one point of the call sequence (share_apply), so every rank's pool queues the same
 // copies. Host only: the engine passes its KvTiers::run + io_done as run_io.
 #include "pool.h"
+#include "../../scheduler-rs/g6sched.h"
 #include <algorithm>
 #include <functional>
 #include <optional>
@@ -12,28 +13,12 @@
 namespace g6s2 {
 
 // Segments more a rank the head asks for in this report, from the tier's counters at the last report and now (per =
-// blocks a segment). Enough for what pushed it, not a fixed count:
-// - an entry too big for the whole tier was offered since (oversize): room for it beside what the tier holds;
-// - the tier filled since (it evicted to make room): the pages it pushed out (dropped, or moved to the next tier);
-// - it took a spill since and the blocks left free are fewer than its entries hold on average, so the next spill of
-//   that size would evict: ask BEFORE the tier is full, so the grant lands before an entry drops. busy (the engine
-//   has a request resident or queued; the Flash checkpoint store passes it): the same with no spill since, so a store
-//   a give left full (a shrink drops entries until the rest fit) asks before its next capture drops one, not after.
-// At least one segment when any of these holds. An idle tier that took no spill asks for nothing, so an idle group
-// never takes room from a busy one. The node grants up to the group's cap.
+// blocks a segment): room for what pushed it since, or, after a spill or while busy (the engine has a request resident
+// or queued), room for one more average entry before the tier fills. An idle tier that took no spill asks for
+// nothing, so an idle group never takes room from a busy one. The rule is engine/scheduler-rs/src/kv_share.rs.
 inline uint64_t share_want(const g6kv_tier_totals& last, const g6kv_tier_totals& now, uint64_t per, bool busy = false) {
-    if (per == 0) return 0;
-    const auto segs = [per](uint64_t blocks) { return std::max<uint64_t>(1, (blocks + per - 1) / per); };
-    uint64_t want = 0;
-    if (now.oversize > last.oversize && now.oversize_last > now.free_slots)
-        want = std::max(want, segs(now.oversize_last - now.free_slots));
-    if (now.full > last.full)
-        want = std::max(want, segs(now.dropped_pages - last.dropped_pages + now.moved_out_pages - last.moved_out_pages));
-    else if ((now.spilled_pages > last.spilled_pages || busy) && now.entries > 0) {
-        const uint64_t avg = (now.slots - now.free_slots) / now.entries;
-        if (now.free_slots < avg) want = std::max(want, segs(avg - now.free_slots));
-    }
-    return want;
+    sch::check_abi();
+    return g6sch_share_want(&last, &now, per, busy);
 }
 
 // The head's report: `want` segments more per rank (0 = none; share_want) and the ages of the tier's coldest blocks.
@@ -47,9 +32,9 @@ inline std::optional<Resize> share_poll(RunPool& pool, uint32_t tier, const g6kv
     const std::vector<uint64_t> ages = offer ? pool.coldest(tier, per, most) : std::vector<uint64_t>{};
     g6kv_report r{};
     require(g6kv_store_report(store, want, ages.data(), ages.size(), &r) == 0, g6kv_tier_error());
-    if (r.grant) return Resize{tier, segs + r.grant, (segs + r.grant) * per, r.txn};
-    if (r.give && r.give < segs) return Resize{tier, segs - r.give, (segs - r.give) * per, r.txn};
-    return std::nullopt;
+    g6sch_resize x;
+    if (!g6sch_share_resize(tier, segs, per, r.grant, r.give, r.txn, &x)) return std::nullopt;
+    return Resize{x.tier, x.segs, x.slots, x.txn};
 }
 
 // Every rank, at the event, with no copies pending. Grow: the lease first, then the tier, then the copies the pool

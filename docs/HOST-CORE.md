@@ -226,23 +226,33 @@ checks it against the constants in each model's shape.
 
 Moves `s2/scheduler.h`, `sessions.h`, `kv_plan.h`, `kv_share.h`, `cp_rows.h`, `flash_lend.h` and `flash_ring.h` (about
 1,300 lines, integer logic). The boundary is `#[repr(C)]` `Key`, `Slot`, `Run`, `Grant`, `Shrink`, `Resize`, `Quantum`,
-`Config` and `g6sch_*` calls (`g6sched.h`). It turns the compile-time slot capacity (`MAX_SESSIONS`,
-`S2N_SLOTS`) into the runtime `ModuleInfo::max_sessions`; the model rules already read `ModuleInfo` since R1. It will
-also want `PACK_MAX_MEMBERS` and the drafters' block sizes in `ModuleInfo`. The pool becomes Rust to Rust, so `s2/pool.h` (218 lines of FFI) goes away. Proof: the
-scheduler, driver and pool host tests ported, and a differential run of the C++ and Rust versions on the command log
-(same `Quantum` sequence and pool digest, which ranks compare at `service.h:499`). One C call per round.
+`Config` and `g6sch_*` calls (`g6sched.h`). C++ `Config` is the shared `g6sch_config` plus the steering receipt, so its
+settings are listed once. At startup the C++ compares a digest of every shared struct's layout (each field's offset,
+size and kind) from `g6sched.h` with the same digest from the Rust types (`src/layout.rs`); it covers the copy of
+kvman-rs's tier counters too, while kvman-rs's own header stays hand-kept until the crates link as one library (R10).
+The Rust takes the slot count at run time; the C++ around it keeps
+`MAX_SESSIONS` arrays until R3 removes `S2N_SLOTS`, since 85 sites in the driver and planner size by it. Proof: the
+scheduler, driver and pool host tests, the seeded command-stream transcripts recorded from the C++ (below), and
+confirmation boots whose round logs (R0) match byte for byte.
 
 R2 lands in four parts:
 
 1. R2a: the crate (`engine/scheduler-rs`, `libg6sched.a`, `g6sched.h`) and the small policies first: KV copy batches
    (`kv_plan.h`), Flash chunk lending (`flash_lend.h`), Flash KDA rings and capture sets (`flash_ring.h`), rounds past R
    (`cp_rows.h`). The C++ headers keep their types and call Rust; the state stays in C++ structs with the same layout,
-   so C++ copies and owns it as before. The C++ they replaced stays in `s2/tests/ref/` for `scheduler_rs_diff_test`,
-   which runs seeded random inputs through both and requires the same results and refusals. Every build, test and image
+   so C++ copies and owns it as before. Until R2d the C++ they replaced stayed in `s2/tests/ref/` for a differential
+   test that ran seeded random inputs through both and required the same results and refusals. Every build, test and image
    links the library (`scripts/build.sh`, `build_m4.sh`, `host_tests.sh`, `c1_tests.sh`, the Dockerfile, CI).
 2. R2b: the `Scheduler` itself, against the retained C++ on random command streams.
-3. R2c: the session logic and `kv_share.h`.
-4. R2d: `s2/pool.h` goes, the pool called Rust to Rust; the reference copies go with it.
+3. R2c: the request file's parser (`sessions.h` `parse_request`, read the way libstdc++'s `istringstream` read it, so
+   the same requests pass and fail), `kv_share.h`'s `share_want` and grant/give rule, and the admission FIFO, now a
+   Rust-owned queue. `Sessions` itself stays C++ glue over the `Emitter` (`serve.h`) and the grammar state, which the
+   non-S2 path shares.
+4. R2d: the reference copies go. The differential test became `scheduler_rs_vectors_test`: the same seeded streams
+   (a portable generator, `s2/tests/scheduler_rs_vectors.h`) write every result, refusal and state to a transcript,
+   and each transcript's hash was recorded from the C++ (with libstdc++) after the two matched in every model shape.
+   `s2/pool.h` stays: it is the FFI its C++ callers (the service, the driver, `g6m4`) use, and it goes when they move
+   (R4, R5). `share_apply` goes with it, since its tier resize must hold `RunPool`'s lock.
 
 ### R3. The planner to Rust
 
@@ -255,7 +265,8 @@ floating-point check must have passed, and `exp` comes from the platform libm. G
 ### R4. The driver to Rust
 
 `s2/driver.h` is glue between R2, R3 and the hooks; after them it is Rust to Rust plus the module callbacks (`grow`,
-`prefill`, `prefill_pack`, `dfl_*`). Small.
+`prefill`, `prefill_pack`, `dfl_*`). With the driver and then the service in Rust, the pool is called Rust to Rust and
+`s2/pool.h` (218 lines of FFI) and `kv_share.h`'s `share_apply` go.
 
 ### R5. Service, control, bootstrap and ingress to Rust; ModuleOps
 

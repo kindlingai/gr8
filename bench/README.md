@@ -84,6 +84,11 @@ by Ctrl-C or SIGTERM too, every box is unlocked, the service starts again, and t
 - against `--baseline`: each decode workload, paired run by run, is not slower by more than 3% with a Holm-corrected
   Wilcoxon p under 0.05, and each prefill size is not slower by more than 3%.
 
+A needle passes when the secret is in the answer. A reply that runs out of its 1,024 tokens while the secret is only
+in its reasoning shows as "found in the reasoning, answer cut off" and still fails. The report keeps each needle's
+seed, secret, finish reason, token count and the reply (the first and last 2 KB of its content and reasoning), and
+`--needle-seed N` sends the same document and secret again.
+
 Shown and not gated: the T=0 hash (equal or not to the baseline's), concurrency against the baseline (8 streams
 spread 6-15% run to run), the tool call at 42K (gr8's batch numerics differ from one stream's), GSM8K and HumanEval.
 
@@ -100,6 +105,74 @@ python3 bench/bench.py --kl-ref bench/refs/glm53-tp4.json --kl-max 1e-6         
 The reference holds 16 greedy continuations of 256 tokens with the top 20 logprobs at each position. A build is
 re-scored on the same token ids, and the report gives KL(reference, build) per position (mean, p95, max) and top-1
 agreement. A reference is for one model: a run against another model skips it.
+
+## Recording streams
+
+`--record DIR` saves the raw streamed output of the concurrency stage and of the agent tasks, every delta with its
+arrival time. In `agentic` it covers the streamed runs of the agent tasks. The tool call at 42K and the long reply
+do not stream. The files:
+
+- `DIR/concurrency-cN.json`, one per stream count: each batch's start time and its streams, each with its index,
+  `t0` (seconds from the batch start to its request), its messages and its events;
+- `DIR/agentic-TASK.json`, one per task: every request of the streamed run in order, each with its `t0` from the
+  task start, the messages it sent and its events.
+
+Each file also holds `meta`: the model, the model ids from `/v1/models`, the label, the hosts, the time, and the
+answer of `/health` (and of `/version`, if the server has it). An event is `[t, kind, value]`, with `t` in seconds
+since its request was sent:
+
+- `think` and `answer`: text, as in `./gr8 query --record`;
+- `tool`: `{"index", "id", "name", "arguments"}`, whichever the delta has, with the arguments as text;
+- `finish`: the finish reason;
+- `usage`: the usage object, last.
+
+Without `--record` nothing is kept and the requests are the same.
+
+`gif.py` draws a recording as an animated GIF for a README: one pane per stream at their real relative timing, each
+with a title row (the stream, its tok/s as it runs, then its final tok/s) above the tail of its text (thinking dim,
+the answer bright, tool calls tagged), and a header with a caption and the running total tok/s. `gif.py` reads a
+concurrency file, an agentic file or a `./gr8 query --record` file. It needs Pillow (`pip install pillow`), and the
+bench does not.
+
+```bash
+python3 bench/bench.py --stages info,concurrency --record rec/
+python3 bench/gif.py rec/concurrency-c4.json --title "gr8 · GLM-5.3-Flash · 1x GB10 · 4 streams" --out c4.gif
+python3 bench/gif.py rec/concurrency-c8.json --speed 2 --fps 8 --cols 36 --rows 10 --max-seconds 40 --hold 4
+```
+
+`--grid CxR` sets the panes (default 1, 2x1, 2x2, 4x2 by the stream count), `--cols`/`--rows` or `--size WxH` the
+pane, `--font` and `--font-size` the font (a path, default JetBrains Mono if installed, else another monospace font,
+else Pillow's), `--light` the light theme, and `--batch` which batch of a concurrency file to draw. Frames use one
+fixed palette in kindlingai.dev's colors, and a frame stores only what changed from the one before. The tool prints
+the frame count and the file size.
+
+## kindling.json
+
+```bash
+python3 bench/bench.py kindling report.json --out kindling.json --config-id tp1 --label "TP=1" --nodes 1 --default
+```
+
+creates or updates the config `tp1` in a `kindling.json` (a missing file starts as `{"version": 1, "configs": []}`)
+from a report's numbers: `decode` code, prose and structured (tok/s over every run, one decimal), `prefill` (cold,
+whole tok/s, at each size the report ran), `concurrency` (total tok/s per stream count, one decimal), the
+`Needle recall` line of `quality` (e.g. "found at 128K"), and `max_context` (the server's `max_model_len`).
+The command keeps everything else in the entry and the whole top level. `--default` sets `default_config`. A stage
+the report did not run leaves its field alone, and the command says which. Keys keep their order and the file is
+written with 2-space indentation, so a regenerated file diffs cleanly.
+
+`gif.py card` draws a config of a kindling.json as a model card, in the GIF tool's font, palette and look: a header
+(title, variant, model, hardware, label and nodes, stack), a bar for each decode workload, prefill size and stream
+count, and a footer with the limits and the quality lines. Each section scales its own bars, and a section the
+config lacks is left out.
+
+```bash
+python3 bench/gif.py card kindling.json --config tp4 --out card.png       # without --config: default_config
+python3 bench/gif.py card kindling.json --out card.gif                    # the bars fill once, then hold
+python3 bench/gif.py card kindling.json --all --across 2 --light          # every config, two to a row
+```
+
+`--width` sets the image width (800 px), and `--light` the light theme. With `--all` a section's bars share one scale
+across the cards.
 
 ## Other tools here
 
