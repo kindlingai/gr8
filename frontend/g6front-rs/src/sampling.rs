@@ -362,6 +362,7 @@ pub fn build(
             grammar: None,
             steering_profile: None,
             steering_scale: None,
+            images: Default::default(),
         },
         stop,
         include_stop: pyjson::truthy(body.get("include_stop_str_in_output")),

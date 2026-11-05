@@ -240,7 +240,8 @@ fn lists<'a>(messages: Option<&'a Value>, tools: Option<&'a Value>) -> Result<(&
 
 /// The prompt text for a chat request: the release's encoder, then the generation header off for
 /// `add_generation_prompt: false` and the closing end-of-sentence off for `continue_final_message`. It starts with the
-/// BOS text, so it is encoded without special tokens added.
+/// BOS text, so it is encoded without special tokens added. Also returns the request's image blocks in prompt order,
+/// one `<｜deepseek_image｜>` in the text for each.
 pub fn ds_prompt(
     messages: Option<&Value>,
     tools: Option<&Value>,
@@ -248,10 +249,10 @@ pub fn ds_prompt(
     effort: u32,
     add_generation_prompt: bool,
     continue_final: bool,
-) -> Result<String, ApiError> {
+) -> Result<(String, Vec<Value>), ApiError> {
     use crate::dschat::{self, Opts};
     let (m, t) = lists(messages, tools)?;
-    let mut text = dschat::render(m, t, &Opts { thinking, effort }).map_err(render_err)?;
+    let (mut text, images) = dschat::render_mm(m, t, &Opts { thinking, effort }).map_err(render_err)?;
     if continue_final {
         match text.strip_suffix(dschat::EOS) {
             Some(open) if m.last().and_then(|x| x.get("role")).and_then(Value::as_str) == Some("assistant") => {
@@ -272,7 +273,7 @@ pub fn ds_prompt(
             }
         }
     }
-    Ok(text)
+    Ok((text, images))
 }
 
 /// The prompt's system span in the same render: the leading system or developer messages and the tools alone (an empty
@@ -430,26 +431,26 @@ mod tests {
         assert!(t.tk.token_to_id("｜DSML｜").is_some());
         let msgs = json!([{"role": "system", "content": "Be brief."}, {"role": "user", "content": "hi"}]);
         // thinking on: BOS first, the header and an open <think> last
-        let on = ds_prompt(Some(&msgs), None, true, 75, true, false).unwrap();
+        let on = ds_prompt(Some(&msgs), None, true, 75, true, false).unwrap().0;
         let ids = t.encode(&on, false).unwrap();
         assert_eq!(ids[0], 0);
         assert_eq!(&ids[ids.len() - 2..], &[128804, 128821]);
         assert!(think_open(&ids, 128821, 128822));
         // thinking off: the header and a closed block
-        let off = ds_prompt(Some(&msgs), None, false, 75, true, false).unwrap();
+        let off = ds_prompt(Some(&msgs), None, false, 75, true, false).unwrap().0;
         let ids = t.encode(&off, false).unwrap();
         assert_eq!(&ids[ids.len() - 2..], &[128804, 128822]);
         assert!(!think_open(&ids, 128821, 128822));
         // add_generation_prompt false drops the header; continue_final_message keeps an assistant turn open
-        let bare = ds_prompt(Some(&msgs), None, true, 75, false, false).unwrap();
+        let bare = ds_prompt(Some(&msgs), None, true, 75, false, false).unwrap().0;
         assert!(bare.ends_with("hi") && !bare.contains("<｜Assistant｜>"));
         let cont = json!([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "Hel"}]);
-        let c = ds_prompt(Some(&cont), None, false, 75, false, true).unwrap();
+        let c = ds_prompt(Some(&cont), None, false, 75, false, true).unwrap().0;
         assert!(c.ends_with("</think>Hel"), "{c:?}");
         assert!(ds_prompt(Some(&msgs), None, false, 75, false, true).is_err());
         // the system span: the leading system message and the tools, the same tokens at the front of the whole prompt
         let tools = json!([{"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object", "properties": {}}}}]);
-        let full = ds_prompt(Some(&msgs), Some(&tools), true, 75, true, false).unwrap();
+        let full = ds_prompt(Some(&msgs), Some(&tools), true, 75, true, false).unwrap().0;
         let sys = ds_system_text(Some(&msgs), Some(&tools), true, 75).unwrap();
         assert!(full.starts_with(&sys), "system text is a prefix of the prompt");
         let (full_ids, sys_ids) = (t.encode(&full, false).unwrap(), t.encode(&sys, false).unwrap());
@@ -461,6 +462,16 @@ mod tests {
         let back = t.decode(&ids[1..], false);
         assert_eq!(back, ds_forced_text(Some("f")));
         assert!(ToolChoice::Required.forced_ids_ds(&t, &[]).unwrap().len() < 64);
+        // images: each placeholder is the one image token, in a short prompt and in a long one the parallel encode cuts
+        let img = json!({"type": "image", "data": "QUJD"});
+        for pad in [0usize, 200_000] {
+            let m = json!([{"role": "user", "content": [{"type": "text", "text": "x".repeat(pad)}, img, {"type": "text", "text": "y"}, img]}]);
+            let (text, images) = ds_prompt(Some(&m), None, true, 75, true, false).unwrap();
+            assert_eq!(images.len(), 2);
+            let ids = t.encode(&text, false).unwrap();
+            assert_eq!(ids.iter().filter(|&&i| i == crate::vision::IMAGE_TOKEN_ID).count(), 2);
+            assert_eq!(t.tk.token_to_id(crate::dschat::IMAGE_PLACEHOLDER), Some(crate::vision::IMAGE_TOKEN_ID));
+        }
     }
 
     #[test]

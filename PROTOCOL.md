@@ -31,7 +31,7 @@ Every message in both directions is one frame:
 The front end refuses to serve if `version` != 1. `max_model_len` bounds prompt + max_tokens. `max_logprobs` is
 the largest k the engine accepts for `logprobs` and `prompt_logprobs`. `"insert": true` (absent = false) says the
 engine applies `generate`'s `insert` rule. `"grammar": true` (absent = false) says it masks a reply with `generate`'s
-`grammar`.
+`grammar`. `"vision": true` (absent = false) says it takes `generate`'s `images` (DeepSeek-V4.1 with its vision tower).
 
 An optional `steering` object advertises a loaded profile: `profile` (name), `digest` (64 lowercase hex
 manifest SHA-256), `scope` (`shared` or `full`), `layers` (positive active-layer count), `forced` (boolean),
@@ -71,6 +71,7 @@ See [request transport](docs/STEERING-TRANSPORT.md).
 | `steering_scale` | optional finite number in [0,4], default 1 with a profile. Converted to FP32 once, negative zero normalized to positive zero. A nonzero scale requires a profile; zero selects the stock identity |
 | `insert` | optional, only to an engine whose hello says `"insert": true`. A list of at most one rule `{"after_tokens": N, "unless_emitted": X or null, "tokens": [ids]}` (1 to 64 ids): once the reply holds N tokens and none of them is X, the engine puts `tokens` in place of the reply's next token, even when that token is X. The tokens count as generated tokens, toward `max_tokens` (which cuts them short) and `completion_tokens`, and stop ids among them stop the request. The reply goes on from them as from a prompt that ended with them. Not with `logprobs`: an inserted token has none |
 | `grammar` | optional, only to an engine whose hello says `"grammar": true`. `{"kind": "json" or "json_schema", "schema": the JSON schema as a string (json_schema), "strict": bool, "after_token": id or null}`: from the token after `after_token` (the think close; null = from the first) the engine samples only tokens its XGrammar grammar allows, so the reply's content is one JSON object (`json`) or one value of the schema (`json_schema`; `strict` refuses properties and items the schema does not name), then a stop id. Logprobs and the rejection sampling of drafts see the masked distribution. The shim passes it on as `gram <kind>:<strict>:<arm>:<schema hex>` in the request header |
+| `images` | optional, only to an engine whose hello says `"vision": true`; absent when the prompt has no image. A list, in prompt order, of `{"pos": first prompt index of the span, "vit_h": patch rows, "vit_w": patch columns, "key": 16 hex digits, "rgb": base64}`. Every prompt id in `[pos, pos + span)` is the image token (129264), span = `ceil(vit_h/3) * (ceil(vit_w/3) + 1) + 2`; spans ascend and do not overlap. `rgb` is the image as the release's `load_image` builds it before it normalises: `vit_h*14` rows of `vit_w*14` RGB pixels, uint8, padded grey. `key` is the first 8 bytes of sha256(vit_h u32 LE, vit_w u32 LE, rgb) in hex (for logs; the engine digests the pixels itself). The engine runs the vision tower on the image and puts its rows in the span's embeddings. Not with `prompt_logprobs` or a steering profile. The shim passes each on as `img <pos>:<vit_h>:<vit_w>:<key>:<rgb>` after the other header fields |
 
 Logprobs are of the distribution the token was sampled from **before** temperature/top-p/top-k/min-p are applied
 (vLLM's default `logprobs_mode=raw_logprobs`), log-softmax over the full vocab. Rank is 1-based over that same
@@ -207,3 +208,5 @@ The front end maps these to vLLM's Prometheus names on `/metrics` (see frontend/
   front end then sends no `insert`, so the version stays 1.
 - v1 (2026-10-24): `generate` `grammar` and hello `grammar`, the same way: an engine started without `--grammar-dir`
   leaves the hello key out and the front end sends no `grammar`.
+- v1 (2026-11-04): `generate` `images` and hello `vision`, the same way: an engine without the vision tower leaves the
+  hello key out and the front end refuses a request with images (400).

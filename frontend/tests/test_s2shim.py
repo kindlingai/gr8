@@ -111,6 +111,40 @@ class UnitTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 g6s2shim.parse_ready(bad)
 
+    def test_build_request_images(self):
+        import base64
+        T = g6s2shim.IMAGE_TOKEN
+        rgb = base64.b64encode(bytes(14 * 14 * 3)).decode()          # a 1 x 1 patch grid: span 1 * 2 + 2 = 4
+        im = {'pos': 1, 'vit_h': 1, 'vit_w': 1, 'key': '0123456789abcdef', 'rgb': rgb}
+        prompt = [5, T, T, T, T, 6]
+        body, err = g6s2shim.build_request({'prompt': prompt, 'max_tokens': 4, 'images': [im]}, 0)
+        self.assertIsNone(err)
+        head = body.split(b'\n')[0]
+        self.assertTrue(head.endswith(b' img 1:1:1:0123456789abcdef:' + rgb.encode()), head[:120])
+        # no images: the header is byte-identical to a request without the key
+        self.assertEqual(g6s2shim.build_request({'prompt': [5, 6], 'max_tokens': 4, 'images': []}, 0),
+                         g6s2shim.build_request({'prompt': [5, 6], 'max_tokens': 4}, 0))
+        two = [5, T, T, T, T, T, T, T, T]
+        self.assertIsNone(g6s2shim.build_request({'prompt': two, 'max_tokens': 4,
+                                                  'images': [im, {**im, 'pos': 5}]}, 0)[1])
+        bad = [
+            {**im, 'pos': 2},                       # runs past the span / onto a text token
+            {**im, 'vit_h': 0},
+            {**im, 'vit_w': 3073},
+            {**im, 'vit_h': 40, 'vit_w': 120},      # span over 1024
+            {**im, 'key': 'XYZ'},
+            {**im, 'rgb': rgb[:-4]},                # wrong size
+            {**im, 'rgb': rgb[:-1] + '!'},
+            {**im, 'pos': True},
+        ]
+        for b in bad:
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': prompt, 'max_tokens': 4, 'images': [b]}, 0)[1], b)
+        overlap = {'prompt': two, 'max_tokens': 4, 'images': [im, {**im, 'pos': 3}]}
+        self.assertIsNotNone(g6s2shim.build_request(overlap, 0)[1])
+        self.assertIsNotNone(g6s2shim.build_request({'prompt': prompt, 'max_tokens': 4, 'images': [im] * 17}, 0)[1])
+        self.assertIsNotNone(g6s2shim.build_request({'prompt': prompt, 'max_tokens': 4, 'images': [im],
+                                                     'prompt_logprobs': 0}, 0)[1])
+
     def test_build_request(self):
         body, err = g6s2shim.build_request({'prompt': [5, 6, 7], 'max_tokens': 9, 'temperature': 0.5, 'top_p': 0.9,
                                             'seed': 3, 'min_tokens': 4, 'stop_ids': [2, 2, 8]}, 11)

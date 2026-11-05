@@ -13,6 +13,7 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
   shim -> DIR/req.<id>                 written as req.<id>.tmp, then renamed. Two lines:
         n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float> [lp <k>] [plp <k>]
         [sys <system_tokens>] [ins <after>:<unless or -1>:<id,id,...>]      (version 3: the generate frame's insert rule, never with lp)
+        [img <pos>:<vit_h>:<vit_w>:<key>:<rgb base64>] ...    (one per image, last; only when the head wrote DIR/vision.s2)
         <prompt id,id,...>
       <id> is the request ordinal: unique, strictly increasing in submit order (gaps are fine).
   shim -> rank 0 DIR/cmd.<k>           k = 0, 1, 2, ... with no gap, written the same way, one line:
@@ -67,6 +68,11 @@ READY_FIELDS = {'1': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows')
                 '3': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows', 'max_lp')}
 INSERT_MAX = 64   # tokens one insert rule may hold (engine/runtime/insert_rule.h)
 PAGE = 64         # KV rows per page (engine/runtime/s2/scheduler.h); status.s2 counts pages
+# DS41 images (engine/runtime/ds41_vision_plan.h, PROTOCOL.md `images`)
+IMAGE_TOKEN = 129264
+IMAGE_PATCH, IMAGE_DOWN, IMAGE_MAX_SPAN = 14, 3, 1024
+IMAGES_MAX = 16
+IMAGES_B64_MAX = 48 << 20
 
 
 def payload_hash(data: bytes) -> int:
@@ -226,6 +232,53 @@ def _steering_header(f: dict, capability: dict | None):
     return f' steer {profile} {bits:08x}', None
 
 
+def image_span(vit_h: int, vit_w: int) -> int | None:
+    """The span of a patch grid, None when plan_image_grid cannot produce it (ds41v::grid_of)."""
+    lim = IMAGE_DOWN * IMAGE_MAX_SPAN
+    if not (1 <= vit_h <= lim and 1 <= vit_w <= lim):
+        return None
+    lh, lw = -(-vit_h // IMAGE_DOWN), -(-vit_w // IMAGE_DOWN)
+    n = lh * (lw + 1) + 2
+    return n if n <= IMAGE_MAX_SPAN else None
+
+
+def images_field(images, prompt) -> tuple[str, str | None]:
+    """The generate frame's `images` -> (the request line's img fields or '', error or None). Checks what
+    g6s2::parse_request checks (a request it refuses ends the epoch): the grid, the span inside the prompt and made of the
+    image token, ascending spans, the pixel bytes' size."""
+    if images is None or images == []:
+        return '', None
+    if not isinstance(images, list) or len(images) > IMAGES_MAX:
+        return '', f'images must be a list of at most {IMAGES_MAX}'
+    out, end, total = [], 0, 0
+    for im in images:
+        if not isinstance(im, dict):
+            return '', 'bad image'
+        pos, vh, vw, key, rgb = (im.get(k) for k in ('pos', 'vit_h', 'vit_w', 'key', 'rgb'))
+        if not all(isinstance(v, int) and not isinstance(v, bool) for v in (pos, vh, vw)):
+            return '', 'image pos/vit_h/vit_w must be integers'
+        span = image_span(vh, vw)
+        if span is None:
+            return '', f'bad image grid {vh}x{vw}'
+        if pos < end or pos + span > len(prompt):
+            return '', 'image spans must ascend, not overlap and lie inside the prompt'
+        if any(t != IMAGE_TOKEN for t in prompt[pos:pos + span]):
+            return '', f'an image span must be {span} image tokens ({IMAGE_TOKEN})'
+        if not isinstance(key, str) or not re.fullmatch(r'[0-9a-f]{16}', key):
+            return '', 'image key must be 16 lowercase hex digits'
+        if not isinstance(rgb, str) or len(rgb) % 4 or not re.fullmatch(r'[A-Za-z0-9+/]*={0,2}', rgb):
+            return '', 'image rgb must be padded base64'
+        n = len(rgb) // 4 * 3 - (len(rgb) - len(rgb.rstrip('=')))
+        if n != vh * vw * IMAGE_PATCH * IMAGE_PATCH * 3:
+            return '', f'image rgb must be {vh * IMAGE_PATCH}x{vw * IMAGE_PATCH} RGB bytes'
+        total += len(rgb)
+        if total > IMAGES_B64_MAX:
+            return '', f'images over {IMAGES_B64_MAX} bytes of base64'
+        out.append(f' img {pos}:{vh}:{vw}:{key}:{rgb}')
+        end = pos + span
+    return ''.join(out), None
+
+
 def build_request(f: dict, ordinal: int, steering: dict | None = None):
     """-> (req.<id> bytes, error message or None). Validates what g6s2::parse_request / reserve_rows would reject."""
     prompt = f.get('prompt') or []
@@ -277,9 +330,14 @@ def build_request(f: dict, ordinal: int, steering: dict | None = None):
     steer, err = _steering_header(f, steering)
     if err:
         return None, err
+    img, err = images_field(f.get('images'), prompt)
+    if err:
+        return None, err
+    if img and ('plp' in lps or steer):
+        return None, 'images cannot be combined with prompt_logprobs or steering'
 
     body = (f"n_gen {mt} temp {temp!r} seed {seed} min {max(mn, 0)} stop {','.join(map(str, stops)) or '-'} top_p {top_p!r}"
-            + ''.join(f' {w} {v}' for w, v in lps.items()) + ins + gram + steer + '\n' + ','.join(map(str, prompt))
+            + ''.join(f' {w} {v}' for w, v in lps.items()) + ins + gram + steer + img + '\n' + ','.join(map(str, prompt))
             + '\n').encode()
     return body, None
 
@@ -460,6 +518,8 @@ class Shim:
             hello['insert'] = True
         if self.cfg.get('grammar'):
             hello['grammar'] = True
+        if self.cfg.get('vision'):
+            hello['vision'] = True
         if self.cfg['steering']:
             hello['steering'] = self.cfg['steering']
         wire.write_frame(writer, hello)
@@ -514,6 +574,8 @@ class Shim:
             return self.finish(r, 'error', message='not supported by this engine: insert')
         if f.get('grammar') is not None and not self.cfg.get('grammar'):   # the engine would refuse the gram field
             return self.finish(r, 'error', message='not supported by this engine: grammar')
+        if f.get('images') not in (None, []) and not self.cfg.get('vision'):   # the engine would refuse the img field
+            return self.finish(r, 'error', message='not supported by this engine: images')
         if f.get('prompt_logprobs') is not None and len(prompt) > self.a.max_plp_prompt:
             return self.finish(r, 'error', message=f'prompt too long for prompt_logprobs (max {self.a.max_plp_prompt})')
         if not isinstance(mt, int) or not prompt or mt < 1 or len(prompt) + mt > self.max_model_len():
@@ -738,6 +800,8 @@ class Shim:
                             raise ValueError('ready.s2 pool rows not divisible by --capacity-slots')
                         # g6m4 --grammar-dir: the head writes grammar.s2 before ready.s2
                         self.cfg['grammar'] = os.path.exists(f'{self.a.dir}/grammar.s2')
+                        # a DS41 engine with its vision tower loaded: the head writes vision.s2 before ready.s2
+                        self.cfg['vision'] = os.path.exists(f'{self.a.dir}/vision.s2')
                         break
                 except ValueError as e:
                     log.error('%s', e)

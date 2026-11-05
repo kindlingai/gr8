@@ -1,0 +1,462 @@
+[
+ {
+  "name": "user_two/chat",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "compare"
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,IMG0"
+      }
+     },
+     {
+      "type": "image",
+      "source": {
+       "type": "base64",
+       "media_type": "image/png",
+       "data": "IMG1"
+      }
+     }
+    ]
+   }
+  ],
+  "thinking": false,
+  "effort": 75,
+  "prompt": "<｜begin▁of▁sentence｜><｜User｜>compare\n\n<｜deepseek_image｜>\n\n<｜deepseek_image｜><｜Assistant｜></think>",
+  "order": [
+   "IMG0",
+   "IMG1"
+  ]
+ },
+ {
+  "name": "user_two/thinking",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "compare"
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,IMG0"
+      }
+     },
+     {
+      "type": "image",
+      "source": {
+       "type": "base64",
+       "media_type": "image/png",
+       "data": "IMG1"
+      }
+     }
+    ]
+   }
+  ],
+  "thinking": true,
+  "effort": 75,
+  "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>compare\n\n<｜deepseek_image｜>\n\n<｜deepseek_image｜><｜Assistant｜><think>",
+  "order": [
+   "IMG0",
+   "IMG1"
+  ]
+ },
+ {
+  "name": "system_and_assistant/chat",
+  "messages": [
+   {
+    "role": "system",
+    "content": [
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,IMG0"
+      }
+     },
+     {
+      "type": "text",
+      "text": "sys"
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": "hi"
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "look"
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,IMG1"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,IMG2"
+      }
+     },
+     {
+      "type": "text",
+      "text": "what"
+     }
+    ]
+   }
+  ],
+  "thinking": false,
+  "effort": 75,
+  "prompt": "<｜begin▁of▁sentence｜><｜System｜><｜deepseek_image｜>\n\nsys<｜User｜>hi<｜Assistant｜></think>look\n\n<｜deepseek_image｜><｜end▁of▁sentence｜><｜User｜><｜deepseek_image｜>\n\nwhat<｜Assistant｜></think>",
+  "order": [
+   "IMG0",
+   "IMG1",
+   "IMG2"
+  ]
+ },
+ {
+  "name": "system_and_assistant/thinking",
+  "messages": [
+   {
+    "role": "system",
+    "content": [
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,IMG0"
+      }
+     },
+     {
+      "type": "text",
+      "text": "sys"
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": "hi"
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "look"
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,IMG1"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,IMG2"
+      }
+     },
+     {
+      "type": "text",
+      "text": "what"
+     }
+    ]
+   }
+  ],
+  "thinking": true,
+  "effort": 75,
+  "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜deepseek_image｜>\n\nsys<｜User｜>hi<｜Assistant｜></think>look\n\n<｜deepseek_image｜><｜end▁of▁sentence｜><｜User｜><｜deepseek_image｜>\n\nwhat<｜Assistant｜><think>",
+  "order": [
+   "IMG0",
+   "IMG1",
+   "IMG2"
+  ]
+ },
+ {
+  "name": "tool_results_sorted/chat",
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "a",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{}"
+      }
+     },
+     {
+      "id": "b",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "b",
+    "content": [
+     {
+      "type": "text",
+      "text": "B"
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,IMG1"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "a",
+    "content": [
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,IMG0"
+      }
+     },
+     {
+      "type": "text",
+      "text": "A"
+     }
+    ]
+   }
+  ],
+  "thinking": false,
+  "effort": 75,
+  "prompt": "<｜begin▁of▁sentence｜><｜User｜>go<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result><｜deepseek_image｜>\n\nA</tool_result>\n\n<tool_result>B\n\n<｜deepseek_image｜></tool_result><｜Assistant｜></think>",
+  "order": [
+   "IMG0",
+   "IMG1"
+  ]
+ },
+ {
+  "name": "tool_results_sorted/thinking",
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "a",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{}"
+      }
+     },
+     {
+      "id": "b",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "b",
+    "content": [
+     {
+      "type": "text",
+      "text": "B"
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,IMG1"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "a",
+    "content": [
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,IMG0"
+      }
+     },
+     {
+      "type": "text",
+      "text": "A"
+     }
+    ]
+   }
+  ],
+  "thinking": true,
+  "effort": 75,
+  "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>go<｜Assistant｜><think></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"f\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result><｜deepseek_image｜>\n\nA</tool_result>\n\n<tool_result>B\n\n<｜deepseek_image｜></tool_result><｜Assistant｜><think>",
+  "order": [
+   "IMG0",
+   "IMG1"
+  ]
+ },
+ {
+  "name": "anthropic_tool_result_block/chat",
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "a",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "a",
+      "content": [
+       {
+        "type": "image",
+        "source": {
+         "type": "base64",
+         "media_type": "image/png",
+         "data": "IMG0"
+        }
+       },
+       {
+        "type": "text",
+        "text": "r"
+       }
+      ]
+     },
+     {
+      "type": "text",
+      "text": "and"
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,IMG1"
+      }
+     }
+    ]
+   }
+  ],
+  "thinking": false,
+  "effort": 75,
+  "prompt": "<｜begin▁of▁sentence｜><｜User｜>go<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result><｜deepseek_image｜>\n\nr</tool_result>\n\nand\n\n<｜deepseek_image｜><｜Assistant｜></think>",
+  "order": [
+   "IMG0",
+   "IMG1"
+  ]
+ },
+ {
+  "name": "anthropic_tool_result_block/thinking",
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "a",
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": "{}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "tool_result",
+      "tool_use_id": "a",
+      "content": [
+       {
+        "type": "image",
+        "source": {
+         "type": "base64",
+         "media_type": "image/png",
+         "data": "IMG0"
+        }
+       },
+       {
+        "type": "text",
+        "text": "r"
+       }
+      ]
+     },
+     {
+      "type": "text",
+      "text": "and"
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,IMG1"
+      }
+     }
+    ]
+   }
+  ],
+  "thinking": true,
+  "effort": 75,
+  "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>go<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result><｜deepseek_image｜>\n\nr</tool_result>\n\nand\n\n<｜deepseek_image｜><｜Assistant｜><think>",
+  "order": [
+   "IMG0",
+   "IMG1"
+  ]
+ }
+]
