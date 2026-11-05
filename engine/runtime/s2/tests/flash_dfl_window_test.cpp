@@ -125,7 +125,7 @@ static std::vector<int> next_turn(const std::vector<int>& prompt, const std::vec
 // starts as on a cold prompt, with or without GR8_DFL_REUSE
 static void resend(int n)
 {
-    std::vector<int> p(size_t(n));
+    std::vector<int> p(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) p[size_t(i)] = (i * 13 + 7) % 991;
     const uint32_t c = g6s2::aligned_point(uint32_t(n), GRID);
     CHECK(c > 0 && int(c) <= n - 1 - WIN);
@@ -153,7 +153,7 @@ static void resend(int n)
 static void turns(int grid_points)
 {
     const int n1 = grid_points * GRID + 101;
-    std::vector<int> p1(size_t(n1));
+    std::vector<int> p1(static_cast<size_t>(n1));
     for (int i = 0; i < n1; ++i) p1[size_t(i)] = (i * 13 + 7) % 991;
     const uint32_t c1 = g6s2::aligned_point(uint32_t(n1), GRID);
     CHECK(int(c1) == grid_points * GRID);
@@ -197,7 +197,7 @@ static void turns(int grid_points)
         // turn 4: another conversation on slot 1 (its tokens differ from 100 on, so the ring is not its context), a
         // hit at c1 of a c1 + 108-token prompt: 107 rows < GR8_DFL_REUSE_MIN, MTP rounds that feed the drafter, then
         // DFlash2 once it holds that many
-        std::vector<int> p4(size_t(c1) + 108);
+        std::vector<int> p4(static_cast<size_t>(c1) + 108);
         for (size_t i = 0; i < p4.size(); ++i) p4[i] = i < 100 ? p1[i] : int(i * 11 + 5) % 983;
         f.turn(b, 1, p4, c1, 400);
         CHECK(exact(f.got, int(p4.size())));
