@@ -228,6 +228,167 @@ void g6sch_parsed_free(g6sch_parsed* handle);
 const char* g6sch_parse_grammar(const uint8_t* s, size_t n, uint32_t* kind, bool* strict, int32_t* arm, const uint8_t** schema,
                                 size_t* schema_n, g6sch_parsed** handle);
 
+// s2_batch.h: the batch planner (docs/HOST-CORE.md R3b). Hooks must not call back into the planner. Rust owns its state
+// behind g6s2_batch. The C++ s2::Batch is a facade: it passes settings in as the plain structs below, answers the hooks
+// through the function pointers, and reads results and the learned state back. Calls that run steps return 0, 1 when a
+// hook returned nonzero (the facade holds its exception), or 2 when the planner refused (g6s2_batch_error). A failed
+// call leaves the state as far as it got, as the C++ planner's exceptions did.
+struct g6s2_row { int32_t sess, tok, pos, spos, tgt; };
+// a step as the run hook sees it, its arrays valid during the call (s2_batch.h Step less scheduler_decode)
+struct g6s2_step {
+    int32_t kind, event, cls, round_active;
+    int64_t round;
+    int32_t n_sess, n_rows;
+    const int32_t *sess, *row0, *rows, *ctx, *ev;
+    const g6s2_row* r;
+};
+struct g6s2_dfl_req { int32_t sess, rows, pos0, tok0, lo; bool query; int32_t phase; };
+struct g6s2_dfl_drafts { int32_t tok[8]; float lp[8]; };
+// each returns 0, or nonzero when the C++ hook threw. has_*: the C++ Hooks member is set
+struct g6s2_hooks {
+    void* ctx;
+    int32_t (*run)(void* ctx, const g6s2_step* s, int32_t* out);          // out: n_rows tokens
+    int32_t (*round)(void* ctx, int32_t q, int64_t n, int32_t base, int32_t a, int32_t k);
+    int32_t (*prompt)(void* ctx, int32_t q, int32_t m, int32_t pos0);
+    int32_t (*emit)(void* ctx, int32_t q, const int32_t* t, int32_t k, int32_t row, bool* done);
+    int32_t (*dfl)(void* ctx, const g6s2_dfl_req* r, g6s2_dfl_drafts* out);
+    int32_t (*dfl_start)(void* ctx, int32_t q, int32_t* lo);
+    int32_t (*lp)(void* ctx, int32_t row, float* out);
+    bool has_round, has_prompt, has_emit, has_dfl, has_dfl_start, has_lp;
+};
+// spec_len.h SpecLen, its levels inline (at most 16)
+struct g6s2_spec_len {
+    bool on;
+    int32_t n_levels, levels[16];
+    double draft_round, draft_each, table[9], seed[8], pn[8], pk[8], bn[8][8], bk[8][8], pos_decay, bucket_decay, prior;
+    int64_t rounds, chosen[8];
+    double pred_sum, got_sum;
+};
+struct g6s2_dsel_table { double v[9]; double d, m, e, p, g, k, n, w, r; };
+struct g6s2_dsel {
+    bool on;
+    int32_t dwell;
+    double margin;
+    int32_t probe, model;
+    g6s2_spec_len d, m;
+    g6s2_dsel_table tab;
+    double rn, rc, an, ag, prior, dn, dt, dc;
+};
+// KStop; KStopB's tau as b_tau_rows rows of 8, its widths by pointer
+struct g6s2_kstop {
+    int32_t mode, kmax;
+    double tau[4], seed3;
+    bool log, solo;
+    int32_t b_mode, b_kmin, b_explore, b_tau_rows;
+    const double* b_tau;
+    const int32_t* b_widths;
+    int32_t b_n_widths;
+};
+// NgramSrc and, when table, the table's entries (ngram_lookup.h parses it)
+struct g6s2_ngram {
+    bool table;
+    int32_t n_ns;
+    const int32_t* ns;
+    bool has_cal;
+    double cal[8];
+    size_t n;
+    const uint64_t* keys;
+    const int32_t* toks;
+    const double* ps;
+    int32_t kmax, kmin;
+    double margin;
+    bool log;
+};
+struct g6s2_session {
+    const int32_t* prompt;
+    size_t n_prompt;
+    int32_t first, chunk, n_gen;
+    bool dflash;
+    int32_t ins_after, ins_unless;
+    const int32_t* ins_tokens;
+    size_t n_ins;
+};
+// S2Cost, with Flash's solo table when flash (spec_len.h flash_cost)
+struct g6s2_cost {
+    double main0, main_row, draft0, draft_sess, chain0, chain_sess;
+    bool flash;
+    double flash_table[9], flash_draft_round, flash_draft_each;
+};
+// Stats. acc is valid until the planner's next call
+struct g6s2_stats {
+    int64_t rounds, tokens, drafted, mtp_rounds, switches, inserted, ngram_rounds, ngram_drafted, ngram_acc, dfl_rounds;
+    int32_t dfl_from, dfl_lo, dfl_warm, promoted;
+    const int64_t* acc;
+    size_t n_acc;
+};
+// one slot's session and draft state, for the round log's learn record. The arrays are valid until the next call
+struct g6s2_slot {
+    int32_t first, chunk, n_gen;
+    bool dflash;
+    int32_t ins_after, ins_unless;
+    size_t n_ins;
+    const int32_t* ins_tokens;
+    size_t n_tokens;
+    const int32_t* tokens;
+    size_t n_d;
+    const int32_t* d;
+    size_t n_dlm;
+    const float* dlm;
+    int32_t n;
+    bool on, done;
+    int32_t rounds, k;
+    bool dfl, mtp;
+    int32_t pb, pd[8];
+    float pl[8];
+    int32_t since, mn, lo, warm;
+    bool armed;
+    int32_t force, dd[8];
+    float dl[8];
+};
+// the drafter's ring and the round counters
+struct g6s2_learn {
+    int64_t round_no, cur_round;
+    int32_t cur_active, ring_q, ring_lo, ring_end, ring_top;
+    size_t n_ring_tok;
+    const int32_t* ring_tok;
+};
+struct g6s2_batch;
+// null when slots is above 32
+g6s2_batch* g6s2_batch_new(int32_t K, int32_t max_rows, int32_t slots, bool par, bool fresh_spec, const g6s2_cost* cost,
+                           const g6s2_hooks* hooks);
+void g6s2_batch_free(g6s2_batch* b);
+const char* g6s2_batch_error(const g6s2_batch* b);
+int32_t g6s2_batch_admit(g6s2_batch* b, const int32_t* qs, size_t n, const g6s2_session* ss, size_t n_ss);
+int32_t g6s2_batch_admit_packed_tail(g6s2_batch* b, const int32_t* qs, size_t n, const g6s2_session* ss, size_t n_ss);
+int32_t g6s2_batch_round(g6s2_batch* b, const int32_t* order, size_t n, bool* ran);
+int32_t g6s2_batch_demote(g6s2_batch* b);
+void g6s2_batch_promote(g6s2_batch* b, int32_t q);
+void g6s2_batch_cancel(g6s2_batch* b, int32_t q);
+void g6s2_batch_release(g6s2_batch* b, int32_t q);
+void g6s2_batch_set_mtp_sessions(g6s2_batch* b, int32_t n);
+void g6s2_batch_set_sess_drafts(g6s2_batch* b, bool on);
+void g6s2_batch_adapt(g6s2_batch* b, bool on);
+void g6s2_batch_draft_par(g6s2_batch* b, bool on);
+void g6s2_batch_fresh_spec(g6s2_batch* b, bool on);
+void g6s2_batch_dflash(g6s2_batch* b, int32_t kv, const g6s2_spec_len* sl);
+void g6s2_batch_dsel(g6s2_batch* b, const g6s2_dsel* d);
+void g6s2_batch_kstop(g6s2_batch* b, const g6s2_kstop* k);
+void g6s2_batch_dfl_reuse(g6s2_batch* b, int32_t mode, int32_t min);
+int32_t g6s2_batch_ngram(g6s2_batch* b, const g6s2_ngram* n);   // 2: kmin / kmax refused
+int32_t g6s2_batch_mtp_max_sess(const g6s2_batch* b);
+bool g6s2_batch_active(const g6s2_batch* b, int32_t q);
+bool g6s2_batch_finished(const g6s2_batch* b, int32_t q);
+int32_t g6s2_batch_length(const g6s2_batch* b, int32_t q);
+void g6s2_batch_result(const g6s2_batch* b, int32_t q, const int32_t** p, size_t* n);   // valid until the next call
+void g6s2_batch_stats(const g6s2_batch* b, int32_t q, g6s2_stats* out);
+void g6s2_batch_state(const g6s2_batch* b, uint64_t* out);   // the round log's state record: 6 values a slot
+void g6s2_batch_dsel_state(const g6s2_batch* b, g6s2_dsel* out);
+void g6s2_batch_dsel_rates(const g6s2_batch* b, double* rm, double* rd);
+// an estimate: 0 = the DFlash2 rounds' (dflash), 1 / 2 = the n-gram choice's DFlash2 / MTP, 3 + q = slot q's
+void g6s2_batch_spec_len(const g6s2_batch* b, int32_t which, g6s2_spec_len* out);
+void g6s2_batch_slot(const g6s2_batch* b, int32_t q, g6s2_slot* out);
+void g6s2_batch_learn(const g6s2_batch* b, g6s2_learn* out);
+
 // The layout digest of every type above (and g6kvman.h's g6kv_tier_totals), computed the way src/layout.rs computes
 // it over the Rust types: per type its size and alignment, per field its offset, size and kind. The C++ compares it
 // with g6sch_layout() once at startup (scheduler.h check_abi).
@@ -283,6 +444,20 @@ constexpr uint64_t g6sch_layout_cpp() {
     G6SCH_TYPE(g6sch_shrink) G6SCH_FIELD(g6sch_shrink, key) G6SCH_FIELD(g6sch_shrink, r_rows) G6SCH_FIELD(g6sch_shrink, run)
     G6SCH_TYPE(g6sch_commit) G6SCH_FIELD(g6sch_commit, epoch) G6SCH_FIELD(g6sch_commit, event) G6SCH_FIELD(g6sch_commit, boundary) G6SCH_FIELD(g6sch_commit, before_hash) G6SCH_FIELD(g6sch_commit, has_cancel) G6SCH_FIELD(g6sch_commit, cancel) G6SCH_FIELD(g6sch_commit, has_admit) G6SCH_FIELD(g6sch_commit, admit) G6SCH_FIELD(g6sch_commit, has_shrink) G6SCH_FIELD(g6sch_commit, shrink)
     G6SCH_TYPE(g6sch_completion) G6SCH_FIELD(g6sch_completion, key) G6SCH_FIELD(g6sch_completion, emitted) G6SCH_FIELD(g6sch_completion, finished) G6SCH_FIELD(g6sch_completion, inserted)
+    G6SCH_TYPE(g6s2_row) G6SCH_FIELD(g6s2_row, sess) G6SCH_FIELD(g6s2_row, tok) G6SCH_FIELD(g6s2_row, pos) G6SCH_FIELD(g6s2_row, spos) G6SCH_FIELD(g6s2_row, tgt)
+    G6SCH_TYPE(g6s2_step) G6SCH_FIELD(g6s2_step, kind) G6SCH_FIELD(g6s2_step, event) G6SCH_FIELD(g6s2_step, cls) G6SCH_FIELD(g6s2_step, round_active) G6SCH_FIELD(g6s2_step, round) G6SCH_FIELD(g6s2_step, n_sess) G6SCH_FIELD(g6s2_step, n_rows) G6SCH_FIELD(g6s2_step, sess) G6SCH_FIELD(g6s2_step, row0) G6SCH_FIELD(g6s2_step, rows) G6SCH_FIELD(g6s2_step, ctx) G6SCH_FIELD(g6s2_step, ev) G6SCH_FIELD(g6s2_step, r)
+    G6SCH_TYPE(g6s2_dfl_req) G6SCH_FIELD(g6s2_dfl_req, sess) G6SCH_FIELD(g6s2_dfl_req, rows) G6SCH_FIELD(g6s2_dfl_req, pos0) G6SCH_FIELD(g6s2_dfl_req, tok0) G6SCH_FIELD(g6s2_dfl_req, lo) G6SCH_FIELD(g6s2_dfl_req, query) G6SCH_FIELD(g6s2_dfl_req, phase)
+    G6SCH_TYPE(g6s2_dfl_drafts) G6SCH_FIELD(g6s2_dfl_drafts, tok) G6SCH_FIELD(g6s2_dfl_drafts, lp)
+    G6SCH_TYPE(g6s2_spec_len) G6SCH_FIELD(g6s2_spec_len, on) G6SCH_FIELD(g6s2_spec_len, n_levels) G6SCH_FIELD(g6s2_spec_len, levels) G6SCH_FIELD(g6s2_spec_len, draft_round) G6SCH_FIELD(g6s2_spec_len, draft_each) G6SCH_FIELD(g6s2_spec_len, table) G6SCH_FIELD(g6s2_spec_len, seed) G6SCH_FIELD(g6s2_spec_len, pn) G6SCH_FIELD(g6s2_spec_len, pk) G6SCH_FIELD(g6s2_spec_len, bn) G6SCH_FIELD(g6s2_spec_len, bk) G6SCH_FIELD(g6s2_spec_len, pos_decay) G6SCH_FIELD(g6s2_spec_len, bucket_decay) G6SCH_FIELD(g6s2_spec_len, prior) G6SCH_FIELD(g6s2_spec_len, rounds) G6SCH_FIELD(g6s2_spec_len, chosen) G6SCH_FIELD(g6s2_spec_len, pred_sum) G6SCH_FIELD(g6s2_spec_len, got_sum)
+    G6SCH_TYPE(g6s2_dsel_table) G6SCH_FIELD(g6s2_dsel_table, v) G6SCH_FIELD(g6s2_dsel_table, d) G6SCH_FIELD(g6s2_dsel_table, m) G6SCH_FIELD(g6s2_dsel_table, e) G6SCH_FIELD(g6s2_dsel_table, p) G6SCH_FIELD(g6s2_dsel_table, g) G6SCH_FIELD(g6s2_dsel_table, k) G6SCH_FIELD(g6s2_dsel_table, n) G6SCH_FIELD(g6s2_dsel_table, w) G6SCH_FIELD(g6s2_dsel_table, r)
+    G6SCH_TYPE(g6s2_dsel) G6SCH_FIELD(g6s2_dsel, on) G6SCH_FIELD(g6s2_dsel, dwell) G6SCH_FIELD(g6s2_dsel, margin) G6SCH_FIELD(g6s2_dsel, probe) G6SCH_FIELD(g6s2_dsel, model) G6SCH_FIELD(g6s2_dsel, d) G6SCH_FIELD(g6s2_dsel, m) G6SCH_FIELD(g6s2_dsel, tab) G6SCH_FIELD(g6s2_dsel, rn) G6SCH_FIELD(g6s2_dsel, rc) G6SCH_FIELD(g6s2_dsel, an) G6SCH_FIELD(g6s2_dsel, ag) G6SCH_FIELD(g6s2_dsel, prior) G6SCH_FIELD(g6s2_dsel, dn) G6SCH_FIELD(g6s2_dsel, dt) G6SCH_FIELD(g6s2_dsel, dc)
+    G6SCH_TYPE(g6s2_kstop) G6SCH_FIELD(g6s2_kstop, mode) G6SCH_FIELD(g6s2_kstop, kmax) G6SCH_FIELD(g6s2_kstop, tau) G6SCH_FIELD(g6s2_kstop, seed3) G6SCH_FIELD(g6s2_kstop, log) G6SCH_FIELD(g6s2_kstop, solo) G6SCH_FIELD(g6s2_kstop, b_mode) G6SCH_FIELD(g6s2_kstop, b_kmin) G6SCH_FIELD(g6s2_kstop, b_explore) G6SCH_FIELD(g6s2_kstop, b_tau_rows) G6SCH_FIELD(g6s2_kstop, b_tau) G6SCH_FIELD(g6s2_kstop, b_widths) G6SCH_FIELD(g6s2_kstop, b_n_widths)
+    G6SCH_TYPE(g6s2_ngram) G6SCH_FIELD(g6s2_ngram, table) G6SCH_FIELD(g6s2_ngram, n_ns) G6SCH_FIELD(g6s2_ngram, ns) G6SCH_FIELD(g6s2_ngram, has_cal) G6SCH_FIELD(g6s2_ngram, cal) G6SCH_FIELD(g6s2_ngram, n) G6SCH_FIELD(g6s2_ngram, keys) G6SCH_FIELD(g6s2_ngram, toks) G6SCH_FIELD(g6s2_ngram, ps) G6SCH_FIELD(g6s2_ngram, kmax) G6SCH_FIELD(g6s2_ngram, kmin) G6SCH_FIELD(g6s2_ngram, margin) G6SCH_FIELD(g6s2_ngram, log)
+    G6SCH_TYPE(g6s2_session) G6SCH_FIELD(g6s2_session, prompt) G6SCH_FIELD(g6s2_session, n_prompt) G6SCH_FIELD(g6s2_session, first) G6SCH_FIELD(g6s2_session, chunk) G6SCH_FIELD(g6s2_session, n_gen) G6SCH_FIELD(g6s2_session, dflash) G6SCH_FIELD(g6s2_session, ins_after) G6SCH_FIELD(g6s2_session, ins_unless) G6SCH_FIELD(g6s2_session, ins_tokens) G6SCH_FIELD(g6s2_session, n_ins)
+    G6SCH_TYPE(g6s2_cost) G6SCH_FIELD(g6s2_cost, main0) G6SCH_FIELD(g6s2_cost, main_row) G6SCH_FIELD(g6s2_cost, draft0) G6SCH_FIELD(g6s2_cost, draft_sess) G6SCH_FIELD(g6s2_cost, chain0) G6SCH_FIELD(g6s2_cost, chain_sess) G6SCH_FIELD(g6s2_cost, flash) G6SCH_FIELD(g6s2_cost, flash_table) G6SCH_FIELD(g6s2_cost, flash_draft_round) G6SCH_FIELD(g6s2_cost, flash_draft_each)
+    G6SCH_TYPE(g6s2_stats) G6SCH_FIELD(g6s2_stats, rounds) G6SCH_FIELD(g6s2_stats, tokens) G6SCH_FIELD(g6s2_stats, drafted) G6SCH_FIELD(g6s2_stats, mtp_rounds) G6SCH_FIELD(g6s2_stats, switches) G6SCH_FIELD(g6s2_stats, inserted) G6SCH_FIELD(g6s2_stats, ngram_rounds) G6SCH_FIELD(g6s2_stats, ngram_drafted) G6SCH_FIELD(g6s2_stats, ngram_acc) G6SCH_FIELD(g6s2_stats, dfl_rounds) G6SCH_FIELD(g6s2_stats, dfl_from) G6SCH_FIELD(g6s2_stats, dfl_lo) G6SCH_FIELD(g6s2_stats, dfl_warm) G6SCH_FIELD(g6s2_stats, promoted) G6SCH_FIELD(g6s2_stats, acc) G6SCH_FIELD(g6s2_stats, n_acc)
+    G6SCH_TYPE(g6s2_slot) G6SCH_FIELD(g6s2_slot, first) G6SCH_FIELD(g6s2_slot, chunk) G6SCH_FIELD(g6s2_slot, n_gen) G6SCH_FIELD(g6s2_slot, dflash) G6SCH_FIELD(g6s2_slot, ins_after) G6SCH_FIELD(g6s2_slot, ins_unless) G6SCH_FIELD(g6s2_slot, n_ins) G6SCH_FIELD(g6s2_slot, ins_tokens) G6SCH_FIELD(g6s2_slot, n_tokens) G6SCH_FIELD(g6s2_slot, tokens) G6SCH_FIELD(g6s2_slot, n_d) G6SCH_FIELD(g6s2_slot, d) G6SCH_FIELD(g6s2_slot, n_dlm) G6SCH_FIELD(g6s2_slot, dlm) G6SCH_FIELD(g6s2_slot, n) G6SCH_FIELD(g6s2_slot, on) G6SCH_FIELD(g6s2_slot, done) G6SCH_FIELD(g6s2_slot, rounds) G6SCH_FIELD(g6s2_slot, k) G6SCH_FIELD(g6s2_slot, dfl) G6SCH_FIELD(g6s2_slot, mtp) G6SCH_FIELD(g6s2_slot, pb) G6SCH_FIELD(g6s2_slot, pd) G6SCH_FIELD(g6s2_slot, pl) G6SCH_FIELD(g6s2_slot, since) G6SCH_FIELD(g6s2_slot, mn) G6SCH_FIELD(g6s2_slot, lo) G6SCH_FIELD(g6s2_slot, warm) G6SCH_FIELD(g6s2_slot, armed) G6SCH_FIELD(g6s2_slot, force) G6SCH_FIELD(g6s2_slot, dd) G6SCH_FIELD(g6s2_slot, dl)
+    G6SCH_TYPE(g6s2_learn) G6SCH_FIELD(g6s2_learn, round_no) G6SCH_FIELD(g6s2_learn, cur_round) G6SCH_FIELD(g6s2_learn, cur_active) G6SCH_FIELD(g6s2_learn, ring_q) G6SCH_FIELD(g6s2_learn, ring_lo) G6SCH_FIELD(g6s2_learn, ring_end) G6SCH_FIELD(g6s2_learn, ring_top) G6SCH_FIELD(g6s2_learn, n_ring_tok) G6SCH_FIELD(g6s2_learn, ring_tok)
     return h;
 }
 #undef G6SCH_TYPE
