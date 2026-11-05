@@ -385,7 +385,7 @@ pub fn parse(
         image(v)?;
         next!();
     }
-    require(k.is_empty(), "invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram, steer and img)")?;
+    require(k.is_empty(), "invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram and steer)")?;
     require(r.ins.after < 0 || r.lp < 0, "ins with lp")?;
     r.steering = resolve(&sf)?;
     let g = number(gen)?;
@@ -472,7 +472,7 @@ mod tests {
         );
         assert_eq!(
             parse(b"n_gen 9 temp 0 seed 7 min 1 stop - lp 2x\n1\n", false, &mut off, &mut no_img).err(),
-            Some(Msg("invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram, steer and img)"))
+            Some(Msg("invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram and steer)"))
         );
     }
 
@@ -499,7 +499,7 @@ mod tests {
         let mut any = |_: &[u8]| -> R<()> { Ok(()) };
         assert_eq!(
             parse(b"n_gen 9 temp 0 seed 7 min 1 stop - img a top_p 0.5\n1\n", false, &mut off, &mut any).err(),
-            Some(Msg("invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram, steer and img)"))
+            Some(Msg("invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram and steer)"))
         );
     }
 
