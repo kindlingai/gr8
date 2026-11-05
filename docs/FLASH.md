@@ -155,7 +155,8 @@ Then the index is written beside the blocks after every capture and resize (`fla
 once, in `flash-ckpt.tokens/<generation>`; every file is written to a temporary name, synced, renamed and its folder
 synced. A boot with the same compat line (model set, TP, rank, CAP, layout, engine build) and store size reads the
 index, and a helper thread checks every entry's stored manifest, pages and KDA state against the manifest's checksums
-(about the time to read the store once: the SSD at full speed). Before serving, the ranks agree: each sends one line an
+(on a GB10's SSD about 6 GiB/s, as fast as reading the store alone: some 11 s for a full 64 GiB store; the thread
+runs during the graph capture, and the serve waits for it). Before serving, the ranks agree: each sends one line an
 entry, every rank keeps the entries every rank kept, and rewrites its index. So a rank whose index was lost or torn, or
 whose check dropped an entry, makes the others drop it too, and the boot goes on. Persistence is for fixed-size `ssd:`
 stores: after a group lease resizes, the next boot finds another store size and starts empty. Entries a capture drops
