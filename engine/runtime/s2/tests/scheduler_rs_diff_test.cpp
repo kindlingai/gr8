@@ -48,7 +48,7 @@ int main()
             io.push_back({kind, uint32_t(U(0, 30)), uint32_t(U(0, 2)), uint32_t(U(0, 2)), uint64_t(U(0, 6)), uint64_t(U(0, 6)),
                           uint32_t(U(0, 2)), uint32_t(U(0, 3))});
         }
-        const int batch = U(0, 8), items_cap = U(0, 12);
+        const int batch = U(-1, 8), items_cap = U(-1, 12);
         const uint32_t per_slot = uint32_t(U(0, 4));
         size_t i1 = 0, i2 = 0;
         for (int guard = 0; guard < 64 && (i1 < io.size() || guard == 0); ++guard)

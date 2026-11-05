@@ -94,7 +94,7 @@ jobs:
         with:
           predicate-quantifier: some-with-excludes
           filters: |
-            # the Dockerfile's rust-dist: the loader, the page allocator and the front end
+            # the Dockerfile's rust-dist: the loader, the page allocator, the scheduling logic and the front end
             rust:
               - '!**/*.md'
               - '.github/workflows/ci.yml'

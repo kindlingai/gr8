@@ -96,7 +96,7 @@ COPY --from=xgrammar-src /out-xgrammar /opt/xgrammar
 RUN /xgrammar_build.sh /opt/xgrammar /xb && mkdir -p /out && cp /xb/libxgrammar.a /out/ && rm -rf /xb
 
 # engine-src copies only the engine sources, so edits to docs, scripts or the front end keep the engine layers cached.
-# This stage has no cargo: build.sh skips its cargo step and links the libg6load.a, libg6kvman.a and libgr8knobs.a
+# This stage has no cargo: build.sh skips its cargo step and links the libg6load.a, libg6kvman.a, libg6sched.a and libgr8knobs.a
 # built above.
 FROM toolchain AS engine-src
 WORKDIR /src
@@ -151,7 +151,7 @@ RUN GR8_WIDTHS="$GR8_WIDTHS" KV_FORMAT=int4 scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4-int4 -exec rm -rf {} +
 
 # rust-dist holds the Rust binaries only: CI builds them on a hosted arm runner, and its engine job links libg6load.a,
-# libg6kvman.a and libgr8knobs.a
+# libg6kvman.a, libg6sched.a and libgr8knobs.a
 FROM scratch AS rust-dist
 COPY --from=loader /out/libg6load.a /out/g6load /
 COPY --from=kvman /out/libg6kvman.a /

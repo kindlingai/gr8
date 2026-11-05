@@ -43,7 +43,7 @@ impl Lend {
             self.idle = true;
             self.since_ns = now_ns;
         }
-        if self.lent || now_ns - self.since_ns < self.idle_ms * 1_000_000 {
+        if self.lent || now_ns.saturating_sub(self.since_ns) < self.idle_ms.saturating_mul(1_000_000) {
             return None;
         }
         self.lent = true;

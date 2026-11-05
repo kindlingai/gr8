@@ -27,7 +27,9 @@ struct Batch {
 inline Batch next_batch(const std::vector<g6kv_io>& io, size_t& i, int batch, uint32_t per_slot, int items_cap) {
     (void)io.at(i);
     Batch b;
-    const size_t ni = size_t(std::max(items_cap, 0)), ns = size_t(std::max(batch, 0));
+    // a negative batch or cap bounds nothing: room for every copy left
+    const size_t left = io.size() - i;
+    const size_t ni = items_cap < 0 ? left : size_t(items_cap), ns = batch < 0 ? left : size_t(batch);
     b.items.resize(ni); b.from.resize(ns); b.to.resize(ns); b.slots.resize(ns); b.to_slots.resize(ns);
     g6sch_batch out{0, reinterpret_cast<g6sch_item*>(b.items.data()), int32_t(ni), 0, b.from.data(), b.to.data(),
                     b.slots.data(), b.to_slots.data(), int32_t(ns), 0};

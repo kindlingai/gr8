@@ -35,9 +35,8 @@ K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DP
 # missing (the CUDA image), build it on the host first: cargo build --release --manifest-path engine/loader-rs/Cargo.toml
 # (g6m4 links target/release/libg6load.a when it exists, and target/release/g6load is copied next to g6m4)
 # The S2 page allocator (engine/kvman-rs), the knob table's C API (engine/knobs-rs) and the S2 scheduling logic
-# (engine/scheduler-rs, libg6sched.a) are not optional: g6m4 always
-# links target/release/libg6kvman.a and libgr8knobs.a, built the same way, and every test that reads a knob links the
-# second.
+# (engine/scheduler-rs) are not optional: g6m4 always links target/release/libg6kvman.a, libgr8knobs.a and
+# libg6sched.a, built the same way, and every test that reads a knob links the last two.
 if command -v cargo > /dev/null 2>&1; then
   cargo build --release --quiet --manifest-path "$REPO/engine/loader-rs/Cargo.toml"
   cargo build --release --quiet --manifest-path "$REPO/engine/kvman-rs/Cargo.toml"

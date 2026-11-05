@@ -1,5 +1,9 @@
 //! The C entry points (g6sched.h). Each fallible call returns 0 or a code the C++ wrapper turns into its message; a
 //! failed call leaves its state unchanged. Release builds abort on a panic, so none unwinds into C++.
+//!
+//! Safety, for every function here: pointers are valid for the counts passed with them (null only with a count of
+//! 0), and state pointers point at the matching C++ struct.
+#![allow(clippy::missing_safety_doc)]
 
 use crate::cp_rows::{self, Cand};
 use crate::flash_lend::Lend;
@@ -107,7 +111,10 @@ pub unsafe extern "C" fn g6sch_ring_rows(
     kslot: *mut i32,
     src: *mut i32,
 ) -> i32 {
-    match flash_ring::rows(&mut *r, per, q, pos, n, verify, slice_mut(kslot, n.max(0) as usize)) {
+    if n < 1 || (verify && n > per) {
+        return 2; // checked before kslot is read as n entries
+    }
+    match flash_ring::rows(&mut *r, per, q, pos, n, verify, slice_mut(kslot, n as usize)) {
         Ok(s) => {
             *src = s;
             0
