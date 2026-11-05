@@ -96,6 +96,7 @@ struct Serve
     void turn(Batch& b, int q, const std::vector<int>& prompt, uint32_t reused, int n_gen)
     {
         reqs.clear(); rounds.clear(); got.clear();
+        fill_from = fill_to = -1;     // dfl_start sets them; a session that never takes the drafter never calls it
         const uint32_t n = uint32_t(prompt.size()), id = uint32_t(next_id++);
         w.bind(q, n, reused);
         for (uint32_t at = reused; at + 1 < n; at += GRID) w.quantum(q, id, n, at);
