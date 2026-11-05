@@ -1,6 +1,7 @@
 # One host core, per-model GPU modules
 
-Status: R0 done (#343), R1 in progress. Inventory taken at 35a8f1c; reviewed against the code by a second pass.
+Status: R0 (#343), R1 (#344) and R2 (#345, #346, #351, #353) done; R3a in progress. Inventory taken at 35a8f1c; reviewed
+against the code by a second pass.
 
 ## Why
 
@@ -196,13 +197,15 @@ first request of the boot only (later requests can differ under `--spec-adaptive
    are recorded on a cluster boot.
 2. The model-generic S2 host tests also built with `-DG6_MODEL_FLASH=1` (`scripts/host_tests.sh`).
 3. A round-replay log: `GR8_S2_REPLAY_LOG=PATH` makes each rank's planner write its settings, every driver call and
-   every hook's request and answer (the `round` and `prompt` hooks return nothing and are not logged), and after each
-   outermost call the per-slot state the driver reads back, to `PATH.<pid>` (`s2_log.h`; the field lists sit beside
+   every hook's request and answer, and after each outermost call the per-slot state the driver reads back, to
+   `PATH.<pid>` (`s2_log.h`; the field lists sit beside
    each struct in `s2_batch.h`, with a size check for most fields left out). `engine/runtime/s2/tests/round_replay`
    reruns the planner from a log and checks every step it asks for and every state it leaves (`s2/round_replay.h`). This is the guard that sees
    planner changes after the first round, which a first-request T=0 check cannot.
 4. A floating-point check: `scripts/host_tests.sh` replays a log with `round_replay` built with `-ffp-contract=off` and
-   with `-ffp-contract=fast`. A log from a serving boot gets the same check before R3.
+   with `-ffp-contract=fast`. Since R3a's learn records (below) the `off` build must keep every learned estimate bit
+   for bit and the `fast` build only every step (`--steps-only`): contracted multiply-adds change the estimates' bits
+   from the first round on, without changing a step in the logs so far.
 5. The in-tree tests nothing built (`s2/tests/ds41_prefill_test.cpp`, `ds41_prefill_lanes_test.cpp`,
    `ds41_s32_step_test.cpp`, `s32_64k_mtp8_test.cpp`, `batch_ds41_dspark_test.cpp`) are built; two needed fixes for
    fields added since they were written (steering slots, a loaded steering profile). The dead `s2/v1_state.h` is gone.
@@ -257,10 +260,21 @@ R2 lands in four parts:
 ### R3. The planner to Rust
 
 Moves `s2_batch.h` (about 1,500 lines), `spec_len.h`, `insert_rule.h`, `ngram_lookup.h` and `ctx_lookup.h`. The boundary is
-`g6s2_batch_round(order)` with the module's `run`, `lp` and `dfl` as C callbacks. It removes `S2N_SLOTS`
-(`s2_batch.h:181-185`), the Flash `S2Cost` and `SpecLen::flash_cost` `#if`s and the static `SpecLen`. This is the one
-step that can change T=0 output: the replay must reproduce every `Step` bit for bit across whole sessions, the R0
-floating-point check must have passed, and `exp` comes from the platform libm. Gate it hardest.
+`g6s2_batch_round(order)` with the module's `run`, `lp` and `dfl` as C callbacks. It removes `S2N_SLOTS` from the planner
+(`dispatch.h` and `g6m4.cu` keep it until R5 and R8), the Flash `S2Cost` and `SpecLen::flash_cost` `#if`s and the static
+`SpecLen`. This is the one step that can change T=0 output, so it lands in two parts, the guard first:
+
+1. R3a, no behaviour change: the round log (version 3) carries everything the port must reproduce. A `learn` record
+   after each state record hashes everything else the planner keeps between calls (the per-session and shared
+   `SpecLen` estimates, the drafter choice, the confidence stop, the drafter's ring, the per-slot state and counters);
+   the `round` and `prompt` hooks are logged; the header carries the step costs (`S2Cost`), which the replay checks
+   against its build, and the C library. `ModuleInfo` gains the drafter's block rows and the pack size, which the host
+   headers now read. Confirmed on the cluster: each rank's log, less the version 3 records, is the earlier boots' log,
+   and replays with its learn records.
+2. R3b, the port, behind a thin C++ `s2::Batch` over the Rust, so `round_replay`, `batch_replay_test` and the version 3
+   format run unchanged against it. The replay must reproduce every step and every learn record across whole sessions.
+   The planner's `exp` and the Rust's both come from the platform libm (the header names it); Rust does not contract
+   multiply-adds, which matches the `-std=c++17` g6m4 build (the learn records confirm it on a serving log).
 
 ### R4. The driver to Rust
 

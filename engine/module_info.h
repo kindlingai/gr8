@@ -8,7 +8,7 @@
 #pragma once
 #include <stdint.h>
 
-#define G6_MODULE_ABI 1
+#define G6_MODULE_ABI 2
 
 enum G6ModelId { G6_MODEL_ID_GLM53 = 1, G6_MODEL_ID_GLM53F = 2, G6_MODEL_ID_DS41 = 3 };
 
@@ -40,6 +40,8 @@ struct G6ModuleInfo
     int32_t kv_page;                 // tokens in a KV page
     char kv_format[16];              // g6kv::NAME
     uint32_t caps;                   // G6ModuleCap bits
+    int32_t dfl_block;               // DFlash2 block rows, the bonus row and its drafts (dflash.cuh dfl::B); the planner sizes by it
+    int32_t pack_members;            // sessions in one prefill pack at most (ds41::pack::MAX_SEGMENTS); the scheduler sizes by it
 };
 
 #ifdef __cplusplus
@@ -85,6 +87,8 @@ constexpr G6ModuleInfo make()
     m.kv_row_bytes = g6kv::ROW;
     m.kv_page = 64;
     for (int i = 0; g6kv::NAME[i] && i < 15; ++i) m.kv_format[i] = g6kv::NAME[i];
+    m.dfl_block = 8;      // dflash.cuh checks
+    m.pack_members = 8;   // s2/ds41_prefill.h checks
     switch (m.model)
     {
     case G6_MODEL_ID_DS41: m.caps = G6_CAP_MTP0 | G6_CAP_PACK | G6_CAP_PARK | G6_CAP_PROMPT_DECODE | G6_CAP_DSPARK; break;

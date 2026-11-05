@@ -76,6 +76,9 @@
 #include <unistd.h>
 #include "../knobs-rs/gr8_knobs.h"
 #include "insert_rule.h"
+#if defined(__GLIBC__)
+#include <gnu/libc-version.h>
+#endif
 #include "s2_log.h"
 #include "ngram_lookup.h"
 #include "spec_len.h"
@@ -145,7 +148,7 @@ struct Stats
 };
 // one DFlash2 drafter step of session sess (dflash.cuh DflIn): context = its target rows at positions pos0 .. pos0 + rows - 1,
 // lo = the lowest position the drafter holds; query: also draft the block after them, bonus token tok0
-constexpr int DFL_B = 8;              // = dfl::B: the bonus row and 7 drafts
+constexpr int DFL_B = g6mod::INFO.dfl_block;   // the bonus row and 7 drafts
 constexpr int DFL_WIN = 2048, DFL_RING = 4096;   // = dfl::WIN, dfl::RING: the drafter's window and its KV ring (positions)
 // phase (GR8_DRAFT_PAR): 0 = launch and wait; 1 = launch on the drafter's own stream and return at once; 2 = wait for
 // that launch and return its drafts
@@ -190,6 +193,16 @@ static_assert(S2N_SLOTS == g6rt::S2N, "the planner's slots and a step's S2In slo
 // sessions it measured within 0-3% of K drafts every round (the K-th draft is still accepted ~60% of the time), and
 // its extra main-step graphs take ~1 GiB
 inline bool adapt_env() { return knob::s2_adapt(); }
+// the C library the planner's exp() and strtod come from, for the round log's header: a replay under another one may round
+// differently
+inline std::string libc_version()
+{
+#if defined(__GLIBC__)
+    return std::string("glibc-") + gnu_get_libc_version();
+#else
+    return "other";
+#endif
+}
 // Step times at TP4, 2200 MHz, contexts < 2K (GR8_DEC_EVPROF / GR8_S2_ROUNDLOG), ms
 struct S2Cost
 {
@@ -466,11 +479,19 @@ template <class V> void fields(V& v, DSel& d)
 template <class V> void fields(V& v, KStopB& b) { v(b.mode)(b.kmin)(b.tau)(b.widths)(b.explore); }
 template <class V> void fields(V& v, KStop& k) { v(k.mode)(k.kmax)(k.tau)(k.seed3)(k.log)(k.solo)(k.b); }
 template <class V> void fields(V& v, DflReuse& r) { v(r.mode)(r.min); }
+template <class V> void fields(V& v, Stats& s)
+{
+    v(s.rounds)(s.tokens)(s.drafted)(s.mtp_rounds)(s.switches)(s.inserted)(s.ngram_rounds)(s.ngram_drafted)(s.ngram_acc)(s.acc)
+     (s.dfl_rounds)(s.dfl_from)(s.dfl_lo)(s.dfl_warm)(s.promoted);
+}
+// the constants (Flash's table switch is the log header's flash_cost)
+template <class V> void fields(V& v, S2Cost& c) { v(c.main0)(c.main_row)(c.draft0)(c.draft_sess)(c.chain0)(c.chain_sess); }
 template <class V> void fields(V& v, NgramSrc& n) { v(n.kmax)(n.kmin)(n.margin)(n.log); }   // the table: its digest, logged beside
 static_assert(sizeof(Row) == 20 && sizeof(Step) == 184 && sizeof(Session) == 72 && sizeof(DflReq) == 28 &&
               sizeof(DflDrafts) == 64 && sizeof(DSelTable) == 144 && sizeof(DSel) == 3136 &&
               sizeof(KStopB) == (S2N_SLOTS + 1) * 64 + 40 && sizeof(KStop) == sizeof(KStopB) + 56 &&
-              sizeof(DflReuse) == 8 && sizeof(NgramSrc) == 32,
+              sizeof(DflReuse) == 8 && sizeof(NgramSrc) == 32 && sizeof(Stats) == 120 &&
+              sizeof(S2Cost) == (G6_MODEL_FLASH ? 56 : 48),
               "a field is missing from its fields() list (the round log, s2_log.h)");
 
 class Batch
@@ -503,14 +524,17 @@ public:
         const bool flash_cost = false;
         const int flash_tp = 0;
 #endif
-        rec("g6s2log", 2, K_, max_rows_, S2N_SLOTS, par_, fresh_spec_, flash_cost, flash_tp, bool(h_.dfl), bool(h_.dfl_start),
-            bool(h_.lp));
+        rec("g6s2log", 3, K_, max_rows_, S2N_SLOTS, par_, fresh_spec_, flash_cost, flash_tp, bool(h_.dfl), bool(h_.dfl_start),
+            bool(h_.lp), bool(h_.round), bool(h_.prompt), cost_, libc_version());
         if (wrapped_) return;
         wrapped_ = true;
         if (h_.run) h_.run = [this, run = h_.run](const Step& s) { std::vector<int> t = run(s); rec("run", s, t); return t; };
         if (h_.dfl) h_.dfl = [this, dfl = h_.dfl](const DflReq& r) { const DflDrafts o = dfl(r); rec("dfl", r, o); return o; };
         if (h_.dfl_start) h_.dfl_start = [this, f0 = h_.dfl_start](int q) { const int lo = f0(q); rec("dfl_start", q, lo); return lo; };
         if (h_.lp) h_.lp = [this, lp = h_.lp](int r) { const float v = lp(r); rec("lp", r, v); return v; };
+        if (h_.round)
+            h_.round = [this, f = h_.round](int q, long n, int base, int a, int k) { rec("on_round", q, n, base, a, k); f(q, n, base, a, k); };
+        if (h_.prompt) h_.prompt = [this, f = h_.prompt](int q, int M, int pos0) { rec("on_prompt", q, M, pos0); f(q, M, pos0); };
         if (h_.emit)
             h_.emit = [this, emit = h_.emit](int q, const int* t, int k, int row) {
                 const bool done = emit(q, t, k, row);
@@ -627,6 +651,15 @@ public:
                                (unsigned long long)x.tokens.size(), h, (unsigned long long)stats_[q].inserted});
         }
         return s2log::line("state", v);
+    }
+    // the round log's learn record: a hash of everything else the planner keeps between calls (its estimates, drafter
+    // choice, confidence stop, ring and per-slot state), so a replay that drifts there fails at the call it drifts on
+    uint64_t learn() const
+    {
+        s2log::Hash h;
+        h(K_)(max_rows_)(mtp_sessions_)(sess_drafts_)(adapt_)(dkv_)(par_)(fresh_spec_)(dsl_)(sel_)(ks_)(reuse_)(ng_)(ngd_)(ngm_)
+         (ring_)(cost_)(sl_)(round_no_)(cur_round_)(cur_active_)(st_)(stats_);
+        return h.h;
     }
     // the session's tokens so far, prompt included: its next round writes rows from length - 1 on
     int length(int q) const { return (int)st_[q].tokens.size(); }
@@ -1051,6 +1084,11 @@ private:
         int force = -1;                   // inserted tokens from this position on wait for their steps (forced); -1: none
         int dd[DFL_B] = {};               // DFlash2 drafts d1..d7 and their log-probabilities under the drafter
         float dl[DFL_B] = {};
+        template <class V> friend void fields(V& v, St& x)
+        {
+            v(x.s)(x.tokens)(x.d)(x.dlm)(x.n)(x.on)(x.done)(x.rounds)(x.k)(x.dfl)(x.mtp)(x.pb)(x.pd)(x.pl)(x.since)(x.mn)(x.lo)
+             (x.warm)(x.armed)(x.force)(x.dd)(x.dl);
+        }
     };
     // GR8_NGRAM: the table's chain after tokens[0..base] when it promises more tokens per verify ms than the drafter's k
     // drafts (their expected tokens from ngd_ / ngm_, which learn every round of the request): its length (0: the
@@ -1155,7 +1193,9 @@ private:
         int q = -1;
         std::vector<int> tok;
         int lo = 0, end = 0, top = -1;
+        template <class V> friend void fields(V& v, Ring& r) { v(r.q)(r.tok)(r.lo)(r.end)(r.top); }
     };
+    static_assert(sizeof(St) == 320 && sizeof(Ring) == 48, "a field is missing from its fields() list (the round log's learn record)");
     void ring_rows(int q, const DflReq& r)
     {
         if (ring_.q != q) ring_ = Ring{q, {}, r.pos0, r.pos0, r.pos0 - 1};
@@ -1308,7 +1348,10 @@ private:
     {
         Batch* b;
         template <class... T> Api(Batch* b, const char* tag, const T&... x) : b(b) { if (b->depth_++ == 0) b->rec(tag, x...); }
-        ~Api() { if (--b->depth_ == 0 && b->log_) b->line(b->state()); }
+        ~Api()
+        {
+            if (--b->depth_ == 0 && b->log_) { b->line(b->state()); b->line(s2log::line("learn", b->learn())); }
+        }
     };
     bool wrapped_ = false;            // record() has wrapped the hooks
     template <class... T> void rec(const char* tag, const T&... x) { if (log_) line(s2log::line(tag, x...)); }

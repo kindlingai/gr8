@@ -90,11 +90,13 @@ done
 g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_replay_test.cpp" -o "$T/batch_replay_test" "${KNOBS[@]}"
 "$T/batch_replay_test" "$T/replay.log"
 GR8_S2_REPLAY_LOG="$T/env.log" "$T/batch_replay_test"   # the knob set as well: record() moves the log, wraps once
-# the planner's floating-point decisions with and without contracted multiply-adds: both builds must replay the log
+# the planner's floating-point state with and without contracted multiply-adds: without (as -std=c++17 builds g6m4, and as
+# Rust computes) the replay keeps every learned estimate bit for bit; with, it must still ask for every step the log has
 for c in off fast; do
   g++ -std=c++17 -O2 -Wall -ffp-contract=$c -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/round_replay.cpp" -o "$T/round_replay_$c" "${KNOBS[@]}"
-  "$T/round_replay_$c" "$T/replay.log"
 done
+"$T/round_replay_off" "$T/replay.log"
+"$T/round_replay_fast" --steps-only "$T/replay.log"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/ngram_lookup_check.cpp" -o "$T/ngram_lookup_check" "${KNOBS[@]}"
 (cd "$REPO/tools/ngram/tests" && NGRAM_LOOKUP_CHECK="$T/ngram_lookup_check" python3 -m unittest -q test_ngram.ExportTest)
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dflreuse_test.cpp" -o "$T/batch_dflreuse_test" "${KNOBS[@]}"

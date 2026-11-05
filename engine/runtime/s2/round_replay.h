@@ -20,6 +20,8 @@ struct ReplayResult
     bool ok = false;
     long calls = 0, steps = 0, hooks = 0;
     size_t line = 0;                  // the log line where the replay stopped (1-based; 0: none)
+    int version = 0;                  // the log's format
+    std::string libc;                 // version 3: the C library the logging planner ran on (libc_version())
     std::string error;
 };
 
@@ -32,7 +34,9 @@ inline std::string tag(const std::string& l) { return l.substr(0, l.find(' ')); 
 }   // namespace replay_detail
 
 // replays the log's lines. table: the n-gram table when the log's planner had one (its digest must match)
-inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::NgramTable* table = nullptr)
+// learn = false (round_replay --steps-only): skip the learn records, so a build that rounds the estimates differently
+// (contracted multiply-adds) still shows whether any step, hook or driver state changes
+inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::NgramTable* table = nullptr, bool learn = true)
 {
     using namespace replay_detail;
     ReplayResult res;
@@ -45,9 +49,21 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
         if (h.word() != "g6s2log") fail("not a round log");
         int ver = 0, K = 0, max_rows = 0, slots = 0, flash_tp = 0;
         bool par = false, fresh = false, flash_cost = false, has_dfl = false, has_dfl_start = false, has_lp = false;
+        bool has_round = false, has_prompt = false;
         h(ver);
-        if (ver != 2) fail("log version " + std::to_string(ver) + ", want 2");
+        if (ver != 2 && ver != 3) fail("log version " + std::to_string(ver) + ", want 2 or 3");
+        res.version = ver;
         h(K)(max_rows)(slots)(par)(fresh)(flash_cost)(flash_tp)(has_dfl)(has_dfl_start)(has_lp);
+        // version 3: the round and prompt hooks are logged, the step costs and C library are in the header, and every
+        // state record is followed by a learn record
+        const bool v3 = ver >= 3;
+        if (v3)
+        {
+            S2Cost cost;
+            h(has_round)(has_prompt)(cost)(res.libc);
+            if (s2log::line("", cost) != s2log::line("", S2Cost{}))
+                fail("the log's step costs (S2Cost) differ from this build's: replay with the build that logged it");
+        }
         if (slots != S2N_SLOTS)
             fail("the log's planner has " + std::to_string(slots) + " slots, this build " + std::to_string(S2N_SLOTS) +
                  ": replay with the same model's build");
@@ -104,6 +120,9 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
                 in(v);
                 return v;
             };
+        if (has_round)
+            hk.round = [&](int q, long n, int base, int a, int k) { next(s2log::line("on_round", q, n, base, a, k)); };
+        if (has_prompt) hk.prompt = [&](int q, int M, int pos0) { next(s2log::line("on_prompt", q, M, pos0)); };
         Batch b(K, max_rows, hk);
         b.draft_par(par);
         b.fresh_spec(fresh);
@@ -154,6 +173,13 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
             if (i >= lines.size() || lines[i] != st)
                 fail("after " + t + " the planner's state is\n  " + st.substr(0, 400) + "\nthe log has\n  " +
                      (i < lines.size() ? lines[i].substr(0, 400) : std::string("(end of log)")));
+            ++i;
+            if (!v3) continue;
+            if (!learn) { if (i < lines.size() && starts(lines[i], "learn")) ++i; continue; }
+            const std::string lr = s2log::line("learn", b.learn());
+            if (i >= lines.size() || lines[i] != lr)
+                fail("after " + t + " the planner's learned state differs: " + lr + ", the log has " +
+                     (i < lines.size() ? lines[i].substr(0, 100) : std::string("(end of log)")));
             ++i;
         }
         res.line = 0;
