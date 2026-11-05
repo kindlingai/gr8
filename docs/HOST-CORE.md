@@ -286,6 +286,18 @@ Moves `s2_batch.h` (about 1,500 lines), `spec_len.h`, `insert_rule.h`, `ngram_lo
    names it); `DSelTable::parse`'s `strtod` and `str`'s `%.10g` (it feeds the runtime signature) stay C++ or are tested
    against it.
 
+   Landed as `engine/scheduler-rs` `spec_len.rs`, `ngram.rs`, `planner.rs` and `planner_ffi.rs` (`g6s2_*` in
+   `g6sched.h`, in the layout digest). The C++ parses the n-gram table and passes its entries. Each `Batch` call is one
+   C call. Each hook is a C function pointer over the facade's `std::function`. The facade catches a hook's exception
+   and rethrows it after the Rust returns. `SpecLen`, `DSelTable::parse`/`str`, the knob reads and the Flash cost table stay C++ (the plain
+   build's `--spec-adaptive` keeps `SpecLen`). Checked on macOS: the GLM serving logs v2 and v3 replay in full (learn
+   records included, so no estimate drifted), as do the R3b baseline logs: `batch_replay_test`'s log in each model shape
+   and every log the planner tests wrote under `GR8_S2_REPLAY_LOG` that the C++ itself replays (11,086). The `round`
+   call over the v3 log: mean 1.2 us, p50 1.1, p99 2.7 (C++: 1.9, 1.7, 3.8, ten runs each). A round allocates nothing in
+   the Rust after warm-up (a counting-allocator test). One C++ bug surfaced and is kept: when an insert rule fires
+   exactly at `n_gen`, the verify's draft step reads the token one past the committed ones. The C++ read past its
+   vector, and the port reads 0. The session is over and the row's output unused. `s2::Batch` is move-only.
+
 ### R3c. DS41's KV on the shared paged pool (with Chuck)
 
 A DS41 slot reserves a whole slab (`--capacity-slots`) whatever its request's length, and its prefix snapshots and park
