@@ -73,10 +73,15 @@ class OptionTests(unittest.TestCase):
         plan = opt.engine_plan(o)
         self.assertEqual((plan['knobs']['SESS'], plan['knobs']['DFLASH']), ('1', '1'))
         self.assertIn('--dflash-manifest', plan['args'])
+        self.assertIn('GR8_PF_ROUTER_SPLIT=0', plan['env'])
+        self.assertEqual(models.GLM53F.default_variant[1], ('k2',))
         self.assertEqual(S.engine_bin(flash('--tp', '1', '--kv-format', 'int4', peers='10.0.0.1')), 'g6m4_flash-int4')
         plan = opt.engine_plan(flash('--tp', '1', '--flash-cache', 'aligned', '--kv-store',
                                      'ssd:/tmp/fc,size=64G,persist=on', peers='10.0.0.1'))
         self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], 'ssd:/tmp/fc,size=64G,persist=on')
+        with self.assertRaises(opt.OptionError) as e:
+            flash('--tp', '1', '--ips', '10.1.0.1', '--ips2', '10.2.0.1', peers='10.0.0.1')
+        self.assertIn('--tp 1 takes no --ips', str(e.exception))
 
     def test_flash_cache(self):
         plan = opt.engine_plan(flash())
