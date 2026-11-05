@@ -1,6 +1,6 @@
 # One host core, per-model GPU modules
 
-Status: design, not started. Inventory taken at 35a8f1c; reviewed against the code by a second pass.
+Status: R0 in progress. Inventory taken at 35a8f1c; reviewed against the code by a second pass.
 
 ## Why
 
@@ -188,16 +188,21 @@ first request of the boot only (later requests can differ under `--spec-adaptive
 
 ### R0. Guard rails
 
-1. A T=0 prompt set per model, each prompt the first request of a fresh boot.
-2. The S2 host tests also built with `-DG6_MODEL_FLASH=1`.
-3. A round-replay log: every `Batch::round` input (session order, `StepOut` tokens and log-probabilities, emit results)
-   and output (`Step` rows) from a serving boot, plus the scheduler's command stream (`pool_conc_replay_test` already
-   replays the pool's). Off by default. Every later step diffs against these logs offline. This is the guard that sees
+1. Whole-session T=0 comparisons: `GR8_S2_FRESH_SPEC=1` restarts the adaptive verify-width estimates with every request,
+   so with `GR8_DFL_REUSE=0` as well every request's T=0 reply is independent of the ones before it, and one boot per
+   side compares a whole prompt set (`docs/TESTING.md`, "A cluster"). The reference replies per model are recorded on a
+   cluster boot.
+2. The model-generic S2 host tests also built with `-DG6_MODEL_FLASH=1` (`scripts/host_tests.sh`).
+3. A round-replay log: `GR8_S2_REPLAY_LOG=PATH` makes each rank's planner write its settings, every driver call and
+   every hook's request and answer to `PATH.<pid>` (`s2_log.h`; the field lists sit beside each struct in `s2_batch.h`,
+   with a size check that names a field left out). `engine/runtime/s2/tests/round_replay` reruns the planner from a log
+   and checks that it asks for every step the logged one did (`s2/round_replay.h`). This is the guard that sees
    planner changes after the first round, which a first-request T=0 check cannot.
-4. A floating-point check before any planner work: build with `-ffp-contract=off` and `-ffp-contract=fast` and compare
-   the replay. The planner uses `std::exp` (`spec_len.h:81`) and about 73 float and double values (`s2_batch.h`).
-5. Build or delete the unbuilt in-tree tests (`s2/tests/ds41_prefill_test.cpp`, `ds41_prefill_lanes_test.cpp`,
-   `ds41_s32_step_test.cpp`, `s32_64k_mtp8_test.cpp`, `batch_ds41_dspark_test.cpp`); delete the dead `s2/v1_state.h`.
+4. A floating-point check: `scripts/host_tests.sh` replays a log with `round_replay` built with `-ffp-contract=off` and
+   with `-ffp-contract=fast`. A log from a serving boot gets the same check before R3.
+5. The in-tree tests nothing built (`s2/tests/ds41_prefill_test.cpp`, `ds41_prefill_lanes_test.cpp`,
+   `ds41_s32_step_test.cpp`, `s32_64k_mtp8_test.cpp`, `batch_ds41_dspark_test.cpp`) are built; two needed fixes for
+   fields added since they were written (steering slots, a loaded steering profile). The dead `s2/v1_state.h` is gone.
 
 ### R1. ModuleInfo
 

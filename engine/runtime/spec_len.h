@@ -203,4 +203,12 @@ struct SpecLen
     }
 };
 
+// the round log's field list (s2_log.h); the size check names a new field that is not in it
+template <class V> void fields(V& v, SpecLen& s)
+{
+    v(s.on)(s.levels)(s.draft_round)(s.draft_each)(s.table)(s.seed)(s.pn)(s.pk)(s.bn)(s.bk)(s.pos_decay)(s.bucket_decay)(s.prior)
+     (s.rounds)(s.chosen)(s.pred_sum)(s.got_sum);
+}
+static_assert(sizeof(SpecLen) == 1448, "a SpecLen field is missing from fields() (s2_log.h)");
+
 }   // namespace g6rt
