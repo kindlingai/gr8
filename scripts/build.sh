@@ -38,10 +38,10 @@ K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DP
 # (engine/scheduler-rs) are not optional: g6m4 always links target/release/libg6kvman.a, libgr8knobs.a and
 # libg6sched.a, built the same way, and every test that reads a knob links the last two.
 if command -v cargo > /dev/null 2>&1; then
-  cargo build --release --quiet --manifest-path "$REPO/engine/loader-rs/Cargo.toml"
-  cargo build --release --quiet --manifest-path "$REPO/engine/kvman-rs/Cargo.toml"
-  cargo build --release --quiet --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
-  cargo build --release --quiet --manifest-path "$REPO/engine/scheduler-rs/Cargo.toml"
+  cargo build --release --locked --quiet --manifest-path "$REPO/engine/loader-rs/Cargo.toml"
+  cargo build --release --locked --quiet --manifest-path "$REPO/engine/kvman-rs/Cargo.toml"
+  cargo build --release --locked --quiet --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
+  cargo build --release --locked --quiet --manifest-path "$REPO/engine/scheduler-rs/Cargo.toml"
 fi
 # the knob table and the host-side S2 scheduling logic (engine/scheduler-rs): every engine and test binary links both
 KNOBS=("$REPO/engine/knobs-rs/target/release/libgr8knobs.a" "$REPO/engine/scheduler-rs/target/release/libg6sched.a" -lpthread -ldl -lm)

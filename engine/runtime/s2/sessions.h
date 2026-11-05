@@ -51,13 +51,15 @@ inline g6rt::GrammarSpec parse_grammar(const std::string& s) {
     g.schema.assign(reinterpret_cast<const char*>(schema), n);
     return g;
 }
-inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steering::BootConfig& steering = {}) {
+// grammar_ready: the engine was started with --grammar-dir (a test passes true to reach the grammar path)
+inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steering::BootConfig& steering = {},
+                                    bool grammar_ready = g6rt::grammar_ready()) {
     static_assert(sizeof(g6rt::steering::Identity) == sizeof(g6sch_identity), "scheduler-rs Identity layout");
     sch::check_abi();
     parse::Resolve ctx{&steering, {}};
     g6sch_parsed_req p{};
     g6sch_parsed* h = nullptr;
-    check(g6sch_parse_request(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), g6rt::grammar_ready(),
+    check(g6sch_parse_request(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), grammar_ready,
                               parse::resolve, &ctx, &p, &h));
     const parse::Handle own(h, g6sch_parsed_free);
     g6rt::ServeReq r;
