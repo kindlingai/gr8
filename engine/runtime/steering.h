@@ -92,9 +92,14 @@ struct Identity {
     std::array<uint8_t, 32> schedule_digest{};
     uint32_t scale_bits = 0;
     uint32_t slot = 0;               // index of the profile in the boot's load order; the digest also identifies it
+    // DS41 image prompts (ds41_image.h): not steering, but the same exact prefix-cache identity. A prompt with images
+    // shares cached prefixes only with prompts of the same images at the same positions (image_digest).
+    bool images = false;
+    std::array<uint8_t, 32> image_digest{};
 
     static Identity off() { return {}; }
     bool operator==(const Identity& b) const {
+        if (images != b.images || (images && image_digest != b.image_digest)) return false;
         if (enabled != b.enabled) return false;
         return !enabled || (profile_digest == b.profile_digest && scope == b.scope &&
                             schedule_digest == b.schedule_digest && scale_bits == b.scale_bits && slot == b.slot);
@@ -108,6 +113,11 @@ struct Identity {
 constexpr size_t CACHE_NAMESPACE_BYTES = 70;
 inline std::array<uint8_t, CACHE_NAMESPACE_BYTES> cache_namespace(const Identity& s) {
     std::array<uint8_t, CACHE_NAMESPACE_BYTES> out{};
+    if (s.images) {   // never with a profile (the engine refuses images with steering)
+        out[0] = 2;
+        std::copy(s.image_digest.begin(), s.image_digest.end(), out.begin() + 1);
+        return out;
+    }
     if (!s.enabled) return out;
     out[0] = 1;
     std::copy(s.profile_digest.begin(), s.profile_digest.end(), out.begin() + 1);
@@ -122,6 +132,7 @@ inline std::array<uint8_t, CACHE_NAMESPACE_BYTES> cache_namespace(const Identity
 inline void hash_identity(uint64_t& h, const Identity& s) {
     auto add = [&](uint8_t v) { h = (h ^ v) * 1099511628211ull; };
     add(s.enabled ? 1 : 0);
+    if (s.images) { add(2); for (uint8_t v : s.image_digest) add(v); }
     if (!s.enabled) return;
     for (uint8_t v : s.profile_digest) add(v);
     add(uint8_t(s.scope));

@@ -21,6 +21,7 @@
 #pragma once
 #include "grammar.h"
 #include "steering.h"
+#include "ds41_image.h"
 #include <sys/stat.h>
 #include <chrono>
 #include <ctime>
@@ -47,6 +48,7 @@ struct ServeReq
     steering::Identity steering{};
     InsertRule ins;               // S2 only (s2/sessions.h parse_request)
     GrammarSpec gram;             // S2 only: the reply's grammar (grammar.h), off unless the request has one
+    std::vector<ImageIn> images;  // S2 only, DS41: the prompt's image spans (ds41_image.h), ascending
 };
 
 constexpr int LP_MAX = 20;       // = glue::LP_K (rank.cuh checks)

@@ -56,6 +56,11 @@
 #include "../kernels/ds41_moe_kernels.h"   // global-scope kernels of the MoE op adapters (ds41_moe_ops.cuh, included by ds41_step.cuh)
 #include "../kernels/bind_prefill.cuh"   // bindp::Expert: the trellis layers' prefill MoE (ds41_moe_ops.cuh trellis_prefill)
 #include "../mhc/ds_mhc.cuh"
+#if G6_MODEL_DS41
+#include "ds41_vision.cuh"      // DS41 image input: the vision tower + aligner (ds41v::Tower), outside namespace g6rt
+#include <chrono>
+#include "ds41_image.h"         // DS41 image input, host side: g6rt::ImageIn (a request's spans)
+#endif
 #include "../mhc/ds_mhc_decomp.cuh" // the two-stage mHC k_step; the ds_mhc wrappers stay the base path
 #include "ds41_dspark.h"        // host rules of DSpark (ds41::dsp); like ds41_ops.h it must stay outside namespace g6rt
 #include "ds41_dspark_api.h"    // ds41dsp::Dsp and the DSpark device API (declarations only; the kernels are compiled in the attention TU, never here)
@@ -521,6 +526,13 @@ struct Model
     int ds_slots = 1;                     // set before build_ds41: S2 sessions (--s2-sessions); the attention / index / Engram state has one slab per slot
     int ds_pf_slot = 0;                   // slot of the active single-lane wide prefill chunk (dc.prefill); read when routing through shared ring_pf
     int* sess = nullptr;                  // device [hc_rows]: the slot of each row (k_step_in from StepIn::sess; a prefill chunk: its slot). Read only when ds_slots > 1
+    // DS41 image input (ds41_step.cuh Ds41Vision): set on the host around one eager prefill launch, 0 / unused otherwise, so
+    // no captured graph ever holds an image row. vis_tab: device [VIS_TAB_MAX] of {slot, first position, rows, pool row};
+    // vis_pool: device bf16 [*][HID] span rows; vis_flag: device [hc_rows], 1 = the row is an image row (router bias_vl).
+    int vis_n = 0;
+    int4* vis_tab = nullptr;
+    const __nv_bfloat16* vis_pool = nullptr;
+    uint8_t* vis_flag = nullptr;
     int ds_ns = 1;                        // sessions of the step being launched or captured: rows r = j * (M / ds_ns) .. are session j's (uniform rows per session)
     bool ds_moe_decode_step = false;      // scheduler Kind::Decode, set before eager launch or graph capture
     bool ds41_idx_pipe_b = false;         // boot-bound GR8_DS41_IDX_PIPE_B=1; the four dense index-source logits only

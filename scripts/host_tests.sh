@@ -57,6 +57,9 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/knobs-rs" "$REPO/engine/knobs-
 "$T/knobs_header_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/grammar_request_test.cpp" -o "$T/grammar_request_test" "${KNOBS[@]}"
 "$T/grammar_request_test"
+# DS41 image requests: the img header fields, the prompt checks, the image digest in the cache namespace and the control protocol
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/image_request_test.cpp" -o "$T/image_request_test" "${KNOBS[@]}"
+"$T/image_request_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_round_test.cpp" -o "$T/batch_round_test" "${KNOBS[@]}"
 "$T/batch_round_test"
 # K = 0 (no draft head): a Batch runs no DRAFT or CHAIN step and never writes past St::d, and a Driver serves requests

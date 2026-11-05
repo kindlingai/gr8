@@ -11,6 +11,7 @@
 // sequence + 1. Every rank runs the same Driver, so the ids agree.
 #pragma once
 #include "scheduler.h"
+#include "../ds41_image.h"
 #include "../ds41_coll_order.h"
 #include "../ds41_pack_layout.h"
 #include <algorithm>
@@ -41,6 +42,7 @@ struct Ds41PrefillChunk {
     unsigned slot = 0;             // Slot::key.slot (0 with one session)
     uint32_t first_page = 0, pages = 0;   // Slot::run
     uint32_t prompt_rows = 0;      // the prompt size N (GR8_DS_PF_LATE_FINAL: rows after this chunk = N - 1 - context)
+    const std::vector<g6rt::ImageIn>* images = nullptr;   // the session's image spans (Payload::images), valid for the call; null = none
 };
 using Ds41PrefillFn = std::function<void(const Ds41PrefillChunk&)>;
 // One indivisible ragged W launch. Host token spans remain separately owned by the

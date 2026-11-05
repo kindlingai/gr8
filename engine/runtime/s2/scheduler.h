@@ -26,8 +26,8 @@ constexpr unsigned PACK_MAX_MEMBERS = 8;
 // carries it (bootstrap.h), so ranks built with different commit frames refuse at bootstrap, not at the first event.
 // 6 adds Commit::hold. 7 adds the Resize event (Commit::resize). 9 adds Ack::room (8 is the fail-soft store's, #159).
 // 10 adds the steering profile slot. 11 adds Request::r_rows. 12 adds Commit::shrink. 13 adds 32 session slots and the
-// DS41 prefill packs.
-constexpr unsigned CONTROL_VERSION = 13;
+// DS41 prefill packs. 14 adds the image digest to a request's identity (DS41 image input).
+constexpr unsigned CONTROL_VERSION = 14;
 constexpr uint32_t MAX_DECODE_ROUNDS = 64;   // Config::decode_rounds bound
 // Prefill choice (Scheduler::next): of the sessions with prompt rows left, the one with the fewest runs next, so a short
 // request admitted behind a long prefill is served instead of waiting out every quantum of it (#61). Shortest-first

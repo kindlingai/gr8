@@ -167,7 +167,7 @@ class Service {
     void intake(const Command& command) {
         auto bytes = ingress_.request(command);
         auto request = parse_request(bytes, c_.scheduler.steering);
-        if (!grammar_ok(command.request, request)) return;
+        if (!grammar_ok(command.request, request) || !images_ok(command.request, request)) return;
         const auto queued = Sessions::request(command.request, request);
         if (trace_)
             trace_.instant("arrive", Trace::CONTROL, targ("request", queued.id) + "," +
@@ -415,6 +415,21 @@ class Service {
             atomic_file(c_.directory + "/resp." + std::to_string(id), "end error -1 0\n");
             return false;
         }
+    }
+    // An image request the engine cannot run (ds41_image.h img::refusal) ends with an error before it is queued, as a
+    // grammar that does not compile does. The front end refuses the same cases first.
+    bool images_ok(uint64_t id, const g6rt::ServeReq& r) {
+        if (r.images.empty()) return true;
+#if G6_MODEL_DS41
+        const bool decode_prompt = ds41_decode_prompt(c_.prefill_min, r.prompt.size(), r.plp, r.steering.enabled);
+#else
+        const bool decode_prompt = true;
+#endif
+        const char* why = g6rt::img::refusal(r.prompt, r.images, decode_prompt);
+        if (!*why) return true;
+        fprintf(stderr, "# s2: request %llu: images refused: %s\n", (unsigned long long)id, why);
+        atomic_file(c_.directory + "/resp." + std::to_string(id), "end error -1 0\n");
+        return false;
     }
     void controller() {
         uint64_t status_revision = UINT64_MAX;

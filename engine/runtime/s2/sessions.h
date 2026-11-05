@@ -79,7 +79,12 @@ inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steeri
         sf.has_profile = sf.has_scale = true; sf.profile = std::move(name);
         sf.scale = g6rt::steering::bits_float(scale);
     }
-    require(k.empty(), "invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram and steer)");
+    while (k == "img") {   // DS41 images (ds41_image.h), last, one field each
+        std::string v; require(bool(in >> v), "invalid img header");
+        try { r.images.push_back(g6rt::img::parse_field(v)); } catch (const std::exception& e) { require(false, e.what()); }
+        next();
+    }
+    require(k.empty(), "invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram, steer and img)");
     require(!r.ins.on() || r.lp < 0, "ins with lp");
     r.steering = steering.resolve(sf);
     auto g = number(gen), sd = number(seed), mn = number(min);
@@ -90,7 +95,12 @@ inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steeri
     if (stop != "-") r.stop = request_ids(stop);
     std::istringstream ids(bytes.substr(line + 1)); std::string prompt;
     require(bool(ids >> prompt) && !(ids >> extra), "invalid prompt line");
-    r.prompt = request_ids(prompt); return r;
+    r.prompt = request_ids(prompt);
+    if (!r.images.empty()) {
+        try { g6rt::img::check(r.prompt, r.images); } catch (const std::exception& e) { require(false, e.what()); }
+        r.steering.images = true; r.steering.image_digest = g6rt::img::digest(r.images);
+    }
+    return r;
 }
 struct Sampling { float inv_temp = 0, top_p = 0; uint32_t seed = 1234; int lp = -1, plp = -1; };   // lp, plp: g6rt::ServeReq
 struct Session {
@@ -122,10 +132,10 @@ public:
     }
 #if G6_MODEL_DS41   // DS41 by default has no tensor prefill: every prompt runs as decode steps from position 0 (Driver decode_prompt), unless prefill_min admits it (ds41_prefill.h)
     Payload payload(const g6rt::ServeReq& r) const {
-        return {r.prompt, chunk_, ds41_decode_prompt(prefill_min_, r.prompt.size(), r.plp, r.steering.enabled), r.ins, r.steering, r.gram};
+        return {r.prompt, chunk_, ds41_decode_prompt(prefill_min_, r.prompt.size(), r.plp, r.steering.enabled), r.ins, r.steering, r.gram, r.images};
     }
 #else
-    Payload payload(const g6rt::ServeReq& r) const { return {r.prompt, chunk_, r.plp >= 0, r.ins, r.steering, r.gram}; }
+    Payload payload(const g6rt::ServeReq& r) const { return {r.prompt, chunk_, r.plp >= 0, r.ins, r.steering, r.gram, {}}; }
 #endif
     // (row, target, k) -> a row's logprob entry in the last main step (DispatchHooks::logprob)
     using Logprob = std::function<g6rt::LpRow(int, bool, int)>;

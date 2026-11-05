@@ -40,13 +40,13 @@ static bool boot(uint16_t port, const std::string& dir, unsigned version, std::s
 }
 
 int main() {
-    CHECK(CONTROL_VERSION == 13);
+    CHECK(CONTROL_VERSION == 14);
     BootstrapConfig c; c.runtime_signature = "x";
-    CHECK(c.agreement().find(" ctl 13\n") != std::string::npos);
+    CHECK(c.agreement().find(" ctl 14\n") != std::string::npos);
     // a smaller R per grant joins the agreement only when set
     CHECK(c.agreement().find(" r2 ") == std::string::npos);
     BootstrapConfig r2 = c; r2.scheduler.window_pages = 40; r2.scheduler.r2_rows = 16384;
-    CHECK(r2.agreement().find(" r2 16384 ctl 13\n") != std::string::npos);
+    CHECK(r2.agreement().find(" r2 16384 ctl 14\n") != std::string::npos);
     CHECK(agreement_difference(1, "a b\nenv G6_X=1", "a b\nenv G6_X=1").empty());
     CHECK(agreement_difference(1, "a b\nenv G6_X=1", "a b\nenv G6_X=2") == "rank 1 has 'G6_X=2', the head has 'G6_X=1'");
     CHECK(agreement_difference(3, "a b", "a b c") == "rank 3 has 'c', the head has ''");
@@ -57,7 +57,7 @@ int main() {
     CHECK(boot(port, dir + "/same", CONTROL_VERSION, why));
     const bool mixed = boot(uint16_t(port + 1), dir + "/mixed", 6, why);
     CHECK(!mixed);
-    CHECK(why.find("bootstrap config mismatch: rank 2 has '6', the head has '13'") != std::string::npos);
+    CHECK(why.find("bootstrap config mismatch: rank 2 has '6', the head has '14'") != std::string::npos);
     std::printf("control_version_test: mixed boot refused: %s\n", why.c_str());
 
     // a frame with the previous numeric magic is refused before any field is read

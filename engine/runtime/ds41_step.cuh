@@ -519,12 +519,98 @@ inline int ds41_op_step_in(void* model,int,int,void* stream) {
 }
 // the mHC ops hold rows up to Model::hc_rows (the buffers of build_ds41): more answers 1, "the op failed", before any launch
 inline bool ds41_hc_fits(const Model& m,int rows) { return rows>=1 && rows<=m.hc_rows; }
+// ---- DS41 image input (official model.py merge_image_embeddings): the rows of an image span take the vision tower's
+// span rows in place of the image token's embedding, in all 4 mHC streams (the carried pre stays one-hot), and are flagged
+// for the router's bias_vl. Only an eager prefill launch has image rows (Model::vis_n > 0, set by Ds41Vision::stage).
+constexpr int VIS_TAB_MAX = 128;   // table entries of one launch: 16 images per request x 8 pack members
+template <class TT>
+__global__ void k_vis_embed(ds_mhc::BuffersT<TT> b, const int* pos, const int* sess, const int4* tab, int n,
+                            const __nv_bfloat16* pool, uint8_t* flag, int H) {
+    const int m = blockIdx.y, h = blockIdx.x * ds_mhc::THREADS + threadIdx.x;
+    const int p = pos[m], s = sess ? sess[m] : 0;
+    int row = -1;
+    for (int e = 0; e < n; ++e) {
+        const int4 t = tab[e];
+        if (t.x == s && p >= t.y && p < t.y + t.z) { row = t.w + (p - t.y); break; }
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) flag[m] = row >= 0 ? 1 : 0;
+    if (row < 0 || h >= H) return;
+    const float v = __bfloat162float(pool[(size_t)row * H + h]);
+    for (int j = 0; j < 4; ++j) ds_mhc::st_t(b.streams + ((size_t)m * 4 + j) * H + h, v);
+}
 inline int ds41_op_embed(void* model,int,int rows,void* stream) {
     Model& m=*(Model*)model;
     if(!ds41_hc_fits(m,rows)) return 1;
     ds_mhc::embed(ds41_buffers(m),m.tok,m.emb,rows,HID,(cudaStream_t)stream);
+    if(m.vis_n>0) {
+        const dim3 g((HID+ds_mhc::THREADS-1)/ds_mhc::THREADS,rows);
+        k_vis_embed<<<g,ds_mhc::THREADS,0,(cudaStream_t)stream>>>(ds41_buffers(m),m.pos,m.ds_slots>1?m.sess:nullptr,m.vis_tab,m.vis_n,
+                                                                  m.vis_pool,m.vis_flag,HID);
+    }
     return 0;
 }
+// One prefill chunk's view for the image staging (g6m4.cu builds it from g6s2::Ds41PrefillChunk).
+struct VisChunk { int slot = 0; uint32_t first = 0, rows = 0; const std::vector<ImageIn>* images = nullptr; };
+// The vision tower and the device rows of the images of one prefill launch (GR8_DS_VISION). Stateless across launches:
+// every image that overlaps a chunk is encoded for that chunk (an image across two chunks is encoded twice).
+class Ds41Vision {
+public:
+    // weights + a pool of pool_rows span rows (2 x W: both lanes of a quantum) + one span of staging; the tower workspace
+    // too, so the KV pool is sized after all of it
+    void boot(const std::string& path, int pool_rows) {
+        tower_.load(path);
+        tower_.ensure_workspace();
+        pool_rows_ = pool_rows;
+        G6RT_CK(cudaMalloc(&pool_, (size_t)pool_rows * HID * sizeof(__nv_bfloat16)));
+        G6RT_CK(cudaMalloc(&stage_, (size_t)ds41v::MAX_TOKENS * HID * sizeof(__nv_bfloat16)));
+    }
+    size_t device_bytes() const {
+        return tower_.w.bytes + tower_.workspace_bytes() + ((size_t)pool_rows_ + ds41v::MAX_TOKENS) * HID * sizeof(__nv_bfloat16);
+    }
+    // a Model (a lane's view) that may launch image rows: its table and row flags
+    void attach(Model& m) {
+        G6RT_CK(cudaMalloc(&m.vis_tab, VIS_TAB_MAX * sizeof(int4)));
+        G6RT_CK(cudaMalloc(&m.vis_flag, (size_t)m.hc_rows));
+        G6RT_CK(cudaMemset(m.vis_flag, 0, (size_t)m.hc_rows));
+        m.vis_pool = pool_; m.vis_n = 0;
+    }
+    // Before a launch of m on st: encode the images that overlap the chunks' rows, copy those rows into the pool from
+    // pool_row on (the lanes of one quantum share the pool: pass the same counter), and set m.vis_n. lane picks the host
+    // table, which must outlive the async copy (the serve hook fences st before the next launch). Returns the images run.
+    int stage(Model& m, int lane, const VisChunk* c, int n, int& pool_row, cudaStream_t st) {
+        auto& tab = host_[lane & 1];
+        tab.clear();
+        int encoded = 0;
+        for (int i = 0; i < n; ++i) {
+            if (!c[i].images) continue;
+            for (const ImageIn& im : *c[i].images) {
+                const int a = std::max<int>(im.pos, (int)c[i].first), b = std::min<int>(im.pos + im.span, (int)(c[i].first + c[i].rows));
+                if (a >= b) continue;
+                if (pool_row + (b - a) > pool_rows_ || (int)tab.size() >= VIS_TAB_MAX)
+                    die("DS41 vision: the image rows of one prefill launch overflow the span pool");
+                const auto t0 = std::chrono::steady_clock::now();
+                tower_.encode(im.rgb->data(), im.vit_h, im.vit_w, stage_, st);
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                if (m.rank == 0) fprintf(stderr, "# ds41 vision: slot %d image %dx%d patches (%d span rows, %d in this chunk) %.1f ms\n",
+                                         c[i].slot, im.vit_h, im.vit_w, im.span, b - a, ms);
+                G6RT_CK(cudaMemcpyAsync(pool_ + (size_t)pool_row * HID, stage_ + (size_t)(a - im.pos) * HID,
+                                        (size_t)(b - a) * HID * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, st));
+                tab.push_back(make_int4(c[i].slot, a, b - a, pool_row));
+                pool_row += b - a;
+                ++encoded;
+            }
+        }
+        m.vis_n = (int)tab.size();
+        if (m.vis_n) G6RT_CK(cudaMemcpyAsync(m.vis_tab, tab.data(), tab.size() * sizeof(int4), cudaMemcpyHostToDevice, st));
+        return encoded;
+    }
+private:
+    ds41v::Tower tower_;
+    __nv_bfloat16* pool_ = nullptr;
+    __nv_bfloat16* stage_ = nullptr;
+    int pool_rows_ = 0;
+    std::vector<int4> host_[2];
+};
 inline int ds41_op_hc_attn(void* model,int i,int rows,void* stream) {
     Model& m=*(Model*)model;
     if(!ds41_hc_fits(m,rows)) return 1;

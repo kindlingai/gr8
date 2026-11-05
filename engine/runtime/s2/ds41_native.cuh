@@ -329,7 +329,8 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
         h.dispatch.prefill_seq = [&](const Slot& s, const Payload& p, uint32_t first, uint32_t rows, uint64_t sequence) {
             c.main.ds_moe_decode_step = false;
             require(!p.decode_prompt, "DS41 prefill of a decode_prompt session");
-            const Ds41PrefillChunk chunk = ds41_make_chunk(p.prompt, first, rows, sc.prefill_rows, sequence, s.req.id, s.key.slot, s.run);
+            Ds41PrefillChunk chunk = ds41_make_chunk(p.prompt, first, rows, sc.prefill_rows, sequence, s.req.id, s.key.slot, s.run);
+            chunk.images = &p.images;
             c.prefill(chunk);
             fence();
             if (const unsigned e = c.errors()) {
@@ -348,8 +349,9 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
         h.dispatch.prefill_seq = [&](const Slot& s, const Payload& p, uint32_t first, uint32_t rows, uint64_t sequence) {
             c.main.ds_moe_decode_step = false;
             require(!p.decode_prompt, "DS41 prefill of a decode_prompt session");
-            const Ds41LaneChunks q = ds41_make_lane_chunks(p.prompt, first, rows, sc.prefill_rows, sc.two_lanes, sequence, lane_b,
-                                                           s.req.id, s.key.slot, s.run);
+            Ds41LaneChunks q = ds41_make_lane_chunks(p.prompt, first, rows, sc.prefill_rows, sc.two_lanes, sequence, lane_b,
+                                                     s.req.id, s.key.slot, s.run);
+            q.a.images = q.b.images = &p.images;
             if (q.b.rows) c.prefill2(q.a, q.b); else c.prefill(q.a);
             fence();
             for (int lane = 0; lane < (q.b.rows ? 2 : 1); ++lane)
@@ -371,8 +373,11 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
             c.main.ds_moe_decode_step = false;
             std::vector<Ds41PrefillChunk> chunks; chunks.reserve(parts.size());
             for (const auto& p : parts)
+            {
                 chunks.push_back(ds41_make_chunk(p.payload->prompt, p.first, p.rows, sc.prefill_rows,
                                                   sequence, p.slot->req.id, p.slot->key.slot, p.slot->run));
+                chunks.back().images = &p.payload->images;
+            }
             const Ds41PrefillPack pack = ds41_make_pack(chunks, sc.prefill_rows, unsigned(slots));
             c.prefill_pack(pack);
             fence(); // one W pass and one fence, not N solo W steps
