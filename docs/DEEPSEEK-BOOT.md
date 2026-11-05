@@ -19,8 +19,27 @@ one to choose its settings.
   exlr8 native layout. Unlike the GLM releases, each box does **not** fetch its own part into a model cache: the
   release is a local copy, read in place ([DEPLOY.md](DEPLOY.md#the-model)). Fetch it to local NVMe on every box
   before you boot.
-- **Disk**: well over 100 GB a box. The copy on one of our boxes measures 134 GB, 78 GB of it routed experts and
-  57 GB the dense files, which include the two Engram tables (12 files of about 4.4 GB each).
+- **Disk**: about 145 GB a box — but read the next bullet before you download, because the release as published is
+  510.60 GB. Our copy on one box measures 133.70 GiB (143.55 GB) on disk: 77.00 GiB routed experts, 56.66 GiB dense
+  files, the rest tokenizer and manifests.
+- **Do not fetch the whole release to every box.** The two Engram tables are sharded into 23 parts each
+  (`dense/exlr8-split-001.engram.embed.p000…p022.safetensors`, and the same for `-014`), 4.43 GB a part, 46 files in
+  all. With TP=4 **each rank reads only a contiguous run of about 6 of the 23**, so the other parts need no bytes on
+  that box. The runs we measured, with the full set published on Hugging Face:
+
+  | rank | parts it reads, of each table |
+  |---|---|
+  | 0 | `p000`-`p005` |
+  | 1 | `p005`-`p011` |
+  | 2 | `p011`-`p017` |
+  | 3 | `p017`-`p022` |
+
+  A boundary part (`p005`, `p011`, `p017`) is named by both of the ranks that share it, and each of them reads only
+  its own rows out of it. The bytes come out even: all four of our boxes hold **50.74 GB** of Engram table data and
+  143.55 GB of release in total, whether the rank spans 12 part names or 14. Fetch every non-Engram file plus this
+  rank's run and the box lands near 145 GB instead of 510 GB. On our boxes the parts a rank does not read are present
+  as sparse stubs (about 1.2 MB of disk each), which is why `du --apparent-size` reads 510 GB there and `du` reads
+  143 GB.
 - **No drafter.** `ds41` drafts with the checkpoint's own MTP layers (DSpark), so leave `DRAFTER` out of the config.
   The check refuses a boot that names one.
 
@@ -42,9 +61,15 @@ So the prefix only needs a writable directory: with `g6engram-v2` the table rows
 release's `dense/exlr8-split-001.engram.embed.p0NN.safetensors` and `exlr8-split-014.…` files, and no sidecar copy of
 the tables is made.
 
-The cmap is the compressed token map (516 KB). It is rank-independent: write it once and copy the same file to every
-box. Its sha256 must equal `kCmapSha256` in `engine/engram/hash_consts.h`, so a wrong or stale file fails the boot
-closed instead of serving wrong logits. Write it with the generator, from the release's tokenizer and the official
+The cmap is the compressed token map, 517,144 bytes. It is rank-independent: write it once and copy the same file to
+every box. Its sha256 must equal `kCmapSha256` in `engine/engram/hash_consts.h`, so a wrong or stale file fails the
+boot closed instead of serving wrong logits. That constant is checked in, so you can check your own file before you
+boot — on a good copy:
+
+    $ sha256sum /opt/gr8/engram/ds41.engram.cmap
+    46ed86d2ee83d4b764e4390d38393a373886efdf2baeaa71a5370090d85b76de  …
+
+which is the value in `engine/engram/hash_consts.h` and the same file on every rank. Write it with the generator, from the release's tokenizer and the official
 reference:
 
     python3 engine/engram/gen_engram.py \
