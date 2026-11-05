@@ -5,9 +5,13 @@
 //! Every function here is deterministic in its inputs: each rank runs the same calls on the same replicated state and
 //! must reach the same answer.
 
+pub mod admission;
 pub mod cp_rows;
 pub mod ffi;
 pub mod flash_lend;
 pub mod flash_ring;
 pub mod kv_plan;
+pub mod kv_share;
+pub mod layout;
+pub mod request;
 pub mod scheduler;

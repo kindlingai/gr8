@@ -1001,6 +1001,10 @@ class Supervisor:
                      '--eos-ids', ','.join(map(str, model.eos_ids))]
         if self.o.get('TP') == '6':
             argv += ['--stall-timeout', '2400']
+        # the longest request (prompt + max_tokens): MAX_MODEL_LEN, else the model's max positions. The shim takes the
+        # smaller of it and the pool's room (pool_rows / capacity_slots - guard), and the front end reads the result from
+        # the shim's hello, so the two never disagree
+        argv += ['--max-model-len', str(self.o.get('MAX_MODEL_LEN') or model.max_positions)]
         self.spawn('shim', self.pin() + argv, REPO, env={**os.environ, 'PYTHONPATH': os.path.join(REPO, 'frontend')})
         for _ in range(150):
             if os.path.exists(sock):
