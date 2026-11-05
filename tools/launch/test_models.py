@@ -138,6 +138,10 @@ class OptionTests(unittest.TestCase):
         with self.assertRaises(opt.OptionError) as e:
             flash('--flash-cache', 'aligned', '--dfl-reuse', '2')
         self.assertIn('glm53f takes 0 or 1', str(e.exception))
+        # terminal checkpoints are not cold-exact: the drafter takes aligned only (the engine refuses it too)
+        with self.assertRaises(opt.OptionError) as e:
+            flash('--dflash', '1', '--dflash-dir', '/d', '--flash-cache', 'terminal')
+        self.assertIn('aligned checkpoints only', str(e.exception))
 
     def test_sessions(self):
         # SESS 2..8 share decode steps (each session its own KDA slots); a round of every session fits 32 rows

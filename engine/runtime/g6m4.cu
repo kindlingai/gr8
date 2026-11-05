@@ -477,6 +477,10 @@ int main(int argc, char** argv)
     // drafter's window keeps the drafter through GR8_DFL_REUSE (s2/flash_dfl_window.h; on by default with the cache)
     if (s2mode && dfl && !mtp)
         die("Flash serve with DFlash2 needs --mtp (a second session moves the DFlash2 one to MTP)");
+    // a terminal checkpoint's KDA state comes from the verify ring, not a cold prefill, so the drafter would resume on
+    // state a cold run does not have: aligned checkpoints only (allowing terminal is a decision of its own)
+    if (s2mode && dfl && flash_cache == g6s2::FlashCache::Terminal)
+        die("Flash serve with DFlash2 needs GR8_GLM53F_CACHE=aligned or off (a terminal checkpoint's KDA state is not cold-exact)");
     if (s2mode && s2sess > 1 && s2sess * (mtp + 1) > MX)
         die("Flash serve: --s2-sessions x (--mtp + 1) rows exceed G6_MX (every session's round is one step)");
     if (flash_cache != g6s2::FlashCache::Off) {

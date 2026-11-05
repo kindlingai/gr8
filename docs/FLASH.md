@@ -122,7 +122,9 @@ index, the aligned point, the manifest) and `flash_checkpoint.cuh` (the store), 
   next boundary as with one session; no other session's work touches the run or the slot until then.
 - With the DFlash2 drafter (`DFLASH=1`, below).
 
-With the DFlash2 drafter: a checkpoint holds the target's state but not the drafter's context, the last 2,048
+With the DFlash2 drafter (aligned checkpoints only: the engine refuses `GR8_GLM53F_CACHE=terminal` with it, since a
+terminal checkpoint's KDA state comes from the verify ring and is not cold-exact): a checkpoint holds the target's state
+but not the drafter's context, the last 2,048
 positions of taps in its KV ring (84 MB a rank as prompt taps). Nothing more is stored. The prefill from `p` taps the
 positions it runs, and the drafter takes its context from those (`engine/runtime/s2/flash_dfl_window.h`):
 
