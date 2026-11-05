@@ -99,8 +99,9 @@ of DFlash2, and its front end speaks the DeepSeek dialect (DSML tool calls, nume
 serves text and refuses image content.
 
 Its boot takes two steps GLM's does not: the release is read in place, and Engram — part of the model, not an option —
-needs a token map you write once. [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is that boot in order, from the four
-boxes to a passing `smoke`:
+needs a token map you write once. It also wants far more disk than GLM: the release is 510.6 GB, fetched whole to
+every box. [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is that boot in order, from the four boxes to a passing
+`smoke`:
 
     ./gr8 ds41 check
     ./gr8 ds41 up

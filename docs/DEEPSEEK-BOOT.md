@@ -25,32 +25,41 @@ one to choose its settings.
   exlr8 native layout. Unlike the GLM releases, each box does **not** fetch its own part into a model cache: the
   release is a local copy, read in place ([DEPLOY.md](DEPLOY.md#the-model)). Fetch it to local NVMe on every box
   before you boot.
-- **Disk**: about 145 GB a box — but read the next bullet before you download, because the release as published is
-  510.60 GB. Our copy on one box measures 133.70 GiB (143.55 GB) on disk: 77.00 GiB routed experts, 56.66 GiB dense
-  files, the rest tokenizer and manifests.
-- **Do not fetch the whole release to every box.** The two Engram tables are sharded into 23 parts each
+- **Disk: fetch the whole release, about 510.6 GB a box, and allow headroom.** That is the supported path, and the
+  one to plan disk for. The published release is 510.60 GB over 604 files: 307.79 GB of weights and metadata, plus
+  202.81 GB of Engram table parts.
+- **Every Engram part file must be present.** The two tables are sharded into 23 parts each
   (`dense/exlr8-split-001.engram.embed.p000…p022.safetensors`, and the same for `-014`), 4.43 GB a part, 46 files in
-  all. With TP=4 **each rank reads only a contiguous run of about 6 of the 23**, so the other parts need no bytes on
-  that box. The runs we measured, with the full set published on Hugging Face:
+  all. The loader scans them from `p000` and **stops at the first one missing**, then adds up the row counts of every
+  part it found to work out the table's size before it splits that by TP
+  (`engine/loader-rs/src/ds41.rs:278-285`, `:930-948`). So a box missing `p000` finds no table at all, and a box
+  holding only some of the parts computes the wrong shard and reads the wrong rows. **Do not delete, skip or truncate
+  part files to save space.**
 
-  | rank | parts it reads, of each table |
+  With TP=4 each rank only reads the rows in about 6 of the 23 parts, which is worth knowing when you are reading
+  logs or sizing a cache — it is *not* a download list:
+
+  | rank | parts holding its rows |
   |---|---|
   | 0 | `p000`-`p005` |
   | 1 | `p005`-`p011` |
   | 2 | `p011`-`p017` |
   | 3 | `p017`-`p022` |
 
-  A boundary part (`p005`, `p011`, `p017`) is named by both of the ranks that share it, and each of them reads only
-  its own rows out of it. The bytes come out even: all four of our boxes hold **50.74 GB** of Engram table data and
-  143.55 GB of release in total, whether the rank spans 12 part names or 14. Fetch every non-Engram file plus this
-  rank's run and the box lands near 145 GB instead of 510 GB. On our boxes the parts a rank does not read are present
-  as sparse stubs (about 1.2 MB of disk each), which is why `du --apparent-size` reads 510 GB there and `du` reads
-  143 GB.
+  A boundary part (`p005`, `p011`, `p017`) holds rows for both of the ranks that share it, and each reads only its
+  own. Fetching whole files for one rank's run plus the other files saves far less than it looks: 360.95 GB for
+  rank 0, and more for ranks 1 and 2.
+
+  Our own boxes measure 133.70 GiB (143.55 GB) each — 77.00 GiB routed experts, 56.66 GiB dense, and 50.74 GB of
+  Engram rows. That is a **measurement of a sparse-staged copy**, not what downloading gives you: every one of the 46
+  part files is there with its real header and logical size, and only the byte ranges that rank reads were ever
+  written, so `du` reads 143 GB where `du --apparent-size` reads 510 GB. We have no public tool that stages a copy
+  that way, so treat 143 GB as our number and 510.6 GB as yours.
 - **No drafter.** `ds41` drafts with the checkpoint's own MTP layers (DSpark), so leave `DRAFTER` out of the config.
   The check refuses a boot that names one.
 - **The DeepSeek binary, built on every box.** `up` does not build it for you:
 
-      ./gr8 ds41 build        # this box's engine (bin/g6m4_ds41) and the front end (bin/g6front)
+      ./gr8 ds41 build        # this box's engine (bin/g6m4_ds41) and the front end (bin/g6front-rs)
       python3 -m venv venv && venv/bin/pip install -r frontend/requirements.txt   # the shim, rank 0 only
 
   `ds41` has its own engine binary, so a box built only for `glm53` is not ready for it — build `ds41` on all four.
