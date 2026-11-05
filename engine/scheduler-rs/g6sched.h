@@ -94,7 +94,8 @@ struct g6sch_completion { g6sch_key key; uint32_t emitted; bool finished; uint32
 enum {
     G6SCH_ABI_SLOT, G6SCH_ABI_CONFIG, G6SCH_ABI_QUANTUM, G6SCH_ABI_STATE, G6SCH_ABI_COMMIT, G6SCH_ABI_COMPLETION,
     G6SCH_ABI_GRANT, G6SCH_ABI_PAGE, G6SCH_ABI_PREFILL_DEFER_MAX, G6SCH_ABI_NOTICE_MIN, G6SCH_ABI_NOTICE_MAX,
-    G6SCH_ABI_NOTICE_ROWS, G6SCH_ABI_MAX_DECODE_ROUNDS, G6SCH_ABI_PACK_MAX_MEMBERS, G6SCH_ABI_QMAX,
+    G6SCH_ABI_NOTICE_ROWS, G6SCH_ABI_MAX_DECODE_ROUNDS, G6SCH_ABI_PACK_MAX_MEMBERS, G6SCH_ABI_QMAX, G6SCH_ABI_TOTALS, G6SCH_ABI_RESIZE, G6SCH_ABI_PARSED_REQ,
+    G6SCH_ABI_STATUS,
 };
 uint64_t g6sch_abi(uint32_t what);
 
@@ -142,5 +143,55 @@ const char* g6sch_complete_prefill_pack(const g6sch_config* c, g6sch_slot* s, si
 const char* g6sch_complete_tail(const g6sch_config* c, g6sch_slot* s, size_t n, g6sch_state* st, const g6sch_completion* r);
 const char* g6sch_complete_tail_pack(const g6sch_config* c, g6sch_slot* s, size_t n, g6sch_state* st, const g6sch_completion* r, size_t nr);
 const char* g6sch_complete_decode(const g6sch_config* c, g6sch_slot* s, size_t n, g6sch_state* st, const g6sch_completion* r, size_t nr);
+
+// kv_share.h: a tier's counters are g6kvman.h g6kv_tier_totals (the same layout); a Resize is scheduler.h's
+struct g6sch_resize { uint32_t tier; uint64_t segs, slots, txn; };
+struct g6kv_tier_totals;
+uint64_t g6sch_share_want(const g6kv_tier_totals* last, const g6kv_tier_totals* now, uint64_t per, bool busy);
+// true and *out written when the node's answer is a resize
+bool g6sch_share_resize(uint32_t tier, uint64_t segs, uint64_t per, uint64_t grant, uint64_t give, uint64_t txn, g6sch_resize* out);
+
+// scheduler.h AdmissionQueue: a Rust-owned queue behind an opaque pointer
+struct g6sch_queue;
+struct g6sch_status { uint32_t why, requested, room; };   // why: scheduler.h Stall
+g6sch_queue* g6sch_queue_new(const g6sch_config* c);
+void g6sch_queue_free(g6sch_queue* q);
+const char* g6sch_queue_push(g6sch_queue* q, const g6sch_request* r);
+bool g6sch_queue_cancel(g6sch_queue* q, uint64_t id);
+const g6sch_request* g6sch_queue_front(const g6sch_queue* q);   // null when empty; valid until the queue changes
+size_t g6sch_queue_size(const g6sch_queue* q);
+uint64_t g6sch_queue_stalls(const g6sch_queue* q);
+const char* g6sch_queue_admitted(g6sch_queue* q, uint64_t id);
+const char* g6sch_queue_check(g6sch_queue* q, uint64_t revision, bool slot, bool fits, uint32_t room, bool* has, g6sch_status* out);
+
+// sessions.h parse_request: the parsed request, its arrays owned by the handle the parse returned
+struct g6sch_ints { const int32_t* p; size_t n; };
+struct g6sch_parsed_req {
+    g6sch_ints prompt, stop;
+    int32_t n_gen, min_tokens;
+    float temp, top_p;
+    uint32_t seed;
+    int32_t lp, plp;
+    int64_t sys;
+    g6sch_identity steering;
+    int32_t ins_after, ins_unless;
+    g6sch_ints ins_tokens;
+    uint32_t gram_kind;
+    bool gram_strict;
+    int32_t gram_arm;
+    const uint8_t* schema;
+    size_t schema_n;
+};
+struct g6sch_parsed;
+// the caller's steering resolution: null and *out written, or its refusal (valid until the caller's next call). It
+// must not throw.
+typedef const char* (*g6sch_resolve_fn)(void* ctx, bool has_profile, const uint8_t* profile, size_t profile_n,
+                                        uint32_t scale_bits, g6sch_identity* out);
+const char* g6sch_parse_request(const uint8_t* bytes, size_t n, bool grammar_ready, g6sch_resolve_fn resolve, void* ctx,
+                                g6sch_parsed_req* out, g6sch_parsed** handle);
+void g6sch_parsed_free(g6sch_parsed* handle);
+// one `gram` field; *handle owns the schema bytes (g6sch_parsed_free)
+const char* g6sch_parse_grammar(const uint8_t* s, size_t n, uint32_t* kind, bool* strict, int32_t* arm, const uint8_t** schema,
+                                size_t* schema_n, g6sch_parsed** handle);
 
 }

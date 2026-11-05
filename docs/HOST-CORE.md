@@ -241,8 +241,12 @@ R2 lands in four parts:
    which runs seeded random inputs through both and requires the same results and refusals. Every build, test and image
    links the library (`scripts/build.sh`, `build_m4.sh`, `host_tests.sh`, `c1_tests.sh`, the Dockerfile, CI).
 2. R2b: the `Scheduler` itself, against the retained C++ on random command streams.
-3. R2c: the session logic and `kv_share.h`.
-4. R2d: `s2/pool.h` goes, the pool called Rust to Rust; the reference copies go with it.
+3. R2c: the request file's parser (`sessions.h` `parse_request`, read the way libstdc++'s `istringstream` read it, so
+   the same requests pass and fail), `kv_share.h`'s `share_want` and grant/give rule, and the admission FIFO, now a
+   Rust-owned queue. `Sessions` itself stays C++ glue over the `Emitter` (`serve.h`) and the grammar state, which the
+   non-S2 path shares.
+4. R2d: `s2/pool.h` goes, the pool called Rust to Rust, with `share_apply` (it orders pool calls); the reference
+   copies go with it.
 
 ### R3. The planner to Rust
 
