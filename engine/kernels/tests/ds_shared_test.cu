@@ -673,7 +673,7 @@ template <int NE, int TK> static void old_pdl(const MtBuf& b, int M, cudaStream_
     using P = dsr::PlanT<TK>;
     mx4::build_xfrag_p<<<(K1 / 16 * 64 + 255) / 256, 256, 0, st>>>(b.x, M, K1, b.xf);       // plain launch, the first of the chain
     tl_launch(true, dsr::k_gate_logits<NE, 1>, dim3(NE / 8), dim3(256), st, b.gate, b.x, M, b.log);
-    tl_launch(true, dsr::k_plan_p<NE, TK>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)b.log, b.bias, M, reinterpret_cast<P*>(b.plan));
+    tl_launch(true, dsr::k_plan_p<NE, TK>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)b.log, b.bias, M, reinterpret_cast<P*>(b.plan), (const float*)nullptr, (const unsigned char*)nullptr);
     dsh::Args SA{b.sg, b.su, b.sd, b.xf, (1 << M) - 1, 10.f, b.sact, b.sout};
     tl_launch(true, dsh::k_sh_fc1<K1, I, 8, 1, 2, 1>, dim3(I / 16), dim3(8 * 32), st, SA);
     tl_launch(true, dsh::k_sh_fc2<I, NOUT, 8, 3, 1>, dim3(NOUT / 16 / 8), dim3(8 * 32), st, SA);
@@ -689,7 +689,7 @@ template <int NE, int TK, int NT> static void mt_pdl(const MtBuf& b, int M, cuda
     const int nt = (M + 7) / 8;
     mx4::build_xfrag_mt<1><<<(nt * K1 * 4 + 255) / 256, 256, 0, st>>>(b.x, M, K1, nt, b.xf);        // plain launch, the first of the chain
     tl_launch(true, dsr::k_gate_logits_mt<NE, 1>, dim3(NE / 8), dim3(256), st, b.gate, b.x, M, b.log);
-    tl_launch(true, dsr::k_plan_mt<NE, TK, dsr::MT_MAX, 1>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)b.log, b.bias, M, reinterpret_cast<P*>(b.plan));
+    tl_launch(true, dsr::k_plan_mt<NE, TK, dsr::MT_MAX, 1>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)b.log, b.bias, M, reinterpret_cast<P*>(b.plan), (const float*)nullptr, (const unsigned char*)nullptr);
     dsh::ArgsMT SA{b.sg, b.su, b.sd, b.xf, M, 10.f, b.sact, b.sout};
     tl_launch(true, dsh::k_sh_fc1_mt<K1, I, 8, 1, 2, NT, 1>, dim3(I / 16), dim3(8 * 32), st, SA);
     tl_launch(true, dsh::k_sh_fc2_mt<I, NOUT, 8, 3, NT, 1>, dim3(NOUT / 16 / 8), dim3(8 * 32), st, SA);

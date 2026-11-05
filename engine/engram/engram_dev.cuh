@@ -141,12 +141,15 @@ __device__ __forceinline__ float eg_ld(const float* p) { return *p; }
 __device__ __forceinline__ float eg_ld(const __nv_bfloat16* p) { return __bfloat162float(*p); }
 __device__ __forceinline__ void eg_st(float* p, float v) { *p = v; }
 __device__ __forceinline__ void eg_st(__nv_bfloat16* p, float v) { *p = __ushort_as_bfloat16(f32_to_bf16(v)); }
+// dead (DS41 image input; null on every text-only launch): a row with dead[r] set keeps its trunk (official Engram: the gate is 0
+// on image tokens).
 template <class TT>
-__device__ __forceinline__ void gate_body(TT* T, const __nv_bfloat16* kv, const float* wgt, int rows)
+__device__ __forceinline__ void gate_body(TT* T, const __nv_bfloat16* kv, const float* wgt, int rows, const unsigned char* dead = nullptr)
 {
     __shared__ float red[kGateThreads / 32][3];
     __shared__ float gate_s;
     const int r = blockIdx.x, j = blockIdx.y, tid = threadIdx.x;
+    if (dead && dead[r]) return;
     TT* t = T + ((size_t)r * kStreams + j) * kHid;
     const __nv_bfloat16* key = kv + (size_t)r * kKvDim + (size_t)j * kHid;
     const __nv_bfloat16* val = kv + (size_t)r * kKvDim + (size_t)kStreams * kHid;
@@ -189,6 +192,9 @@ __device__ __forceinline__ void gate_body(TT* T, const __nv_bfloat16* kv, const 
 }
 __global__ void __launch_bounds__(kGateThreads) k_gate(float* T, const __nv_bfloat16* kv, const float* wgt, int rows) { gate_body<float>(T, kv, wgt, rows); }
 __global__ void __launch_bounds__(kGateThreads) k_gate(__nv_bfloat16* T, const __nv_bfloat16* kv, const float* wgt, int rows) { gate_body<__nv_bfloat16>(T, kv, wgt, rows); }
+// the same with image rows (a launch with set_dead): separate symbols, so the text-only kernels above are unchanged
+__global__ void __launch_bounds__(kGateThreads) k_gate_dead(float* T, const __nv_bfloat16* kv, const float* wgt, int rows, const unsigned char* dead) { gate_body<float>(T, kv, wgt, rows, dead); }
+__global__ void __launch_bounds__(kGateThreads) k_gate_dead(__nv_bfloat16* T, const __nv_bfloat16* kv, const float* wgt, int rows, const unsigned char* dead) { gate_body<__nv_bfloat16>(T, kv, wgt, rows, dead); }
 
 #define EG_CK(call, err) do { const cudaError_t e_ = (call); if (e_ != cudaSuccess) { *(err) = std::string("engram: " #call ": ") + cudaGetErrorString(e_); return false; } } while (0)
 
@@ -362,6 +368,9 @@ public:
 
     // The ST_ENGRAM op of layer slot e (0 = layer 1, 1 = layer 14). T = the trunk [rows][4][5120], BF16-valued, edited in place: FP32, or BF16 under
     // DS_MHC_TRUNK_BF16 (the overload below; same body).
+    // DS41 image input: device [rows] row flags of the next op launches (1 = an image row: gate 0), or null (every text-only launch).
+    // Host state read at launch; the caller sets it per launch (ds41_op_engram).
+    void set_dead(const unsigned char* dead) { dead_ = dead; }
     int op(void* model, int e, int rows, float* T, cudaStream_t main) { return op_t(model, e, rows, T, main); }
     int op(void* model, int e, int rows, __nv_bfloat16* T, cudaStream_t main) { return op_t(model, e, rows, T, main); }
     template <class TT>
@@ -376,7 +385,8 @@ public:
         if (int x = hooks_.reduce(model, e, rows, main, emb_d_[e])) return x;
         if (!(tc_ && rows > kDecodeRows && project_wide(e, rows, main)))   // chunks of <= kDecodeRows rows: the hook, as in the decode build
             if (int x = hooks_.project(model, e, rows, main, emb_d_[e], kv_d_)) return x;
-        k_gate<<<dim3(rows, kStreams), kGateThreads, 0, main>>>(T, kv_d_, wgt_d_[e], rows);
+        if (dead_) k_gate_dead<<<dim3(rows, kStreams), kGateThreads, 0, main>>>(T, kv_d_, wgt_d_[e], rows, dead_);
+        else k_gate<<<dim3(rows, kStreams), kGateThreads, 0, main>>>(T, kv_d_, wgt_d_[e], rows);
         return cudaGetLastError();
     }
 
@@ -611,6 +621,7 @@ private:
     RowStore store_;
     EngramHooks hooks_;
     bool ready_ = false, verbose_ = false, tc_ = false, warned_ = false;
+    const unsigned char* dead_ = nullptr;   // set_dead
     uint8_t *aq_codes_ = nullptr, *aq_scales_ = nullptr;    // the quantized embedding of a W-row chunk (tc_ only)
     const uint8_t* wkv_codes_[kNE] = {};
     const uint8_t* wkv_scales_[kNE] = {};

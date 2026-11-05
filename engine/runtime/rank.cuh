@@ -533,6 +533,7 @@ struct Model
     int4* vis_tab = nullptr;
     const __nv_bfloat16* vis_pool = nullptr;
     uint8_t* vis_flag = nullptr;
+    int* vis_etok = nullptr;            // device [hc_rows]: m.tok with -1 at the image rows, Engram's window only (ds41_engram_tok)
     int ds_ns = 1;                        // sessions of the step being launched or captured: rows r = j * (M / ds_ns) .. are session j's (uniform rows per session)
     bool ds_moe_decode_step = false;      // scheduler Kind::Decode, set before eager launch or graph capture
     bool ds41_idx_pipe_b = false;         // boot-bound GR8_DS41_IDX_PIPE_B=1; the four dense index-source logits only

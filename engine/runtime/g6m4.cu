@@ -2335,7 +2335,7 @@ int main(int argc, char** argv)
                 if (vis_on) {   // DS41 image input: the images whose span overlaps this chunk, encoded into the pool (m.vis_n)
                     int pr = 0;
                     const VisChunk vc{(int)c.slot, c.first, c.rows, c.images};
-                    vis.stage(m, 0, &vc, 1, pr, st);
+                    vis.stage(m, 0, &vc, 1, (int)c.rows, pr, st);
                 }
                 g6s2::require(ds41_idx_set_chunk(&m, c.context) == 0, "DS41 prefill index chunk bound refused");
                 if (skip_late) prepare_ds41_prefill(m, (int)c.rows, st, 0, split.i_late);
@@ -2543,7 +2543,7 @@ int main(int argc, char** argv)
                         int pr = 0;
                         for (int L = 0; L < 2; ++L) {
                             const VisChunk vc{(int)ch[L]->slot, ch[L]->first, ch[L]->rows, ch[L]->images};
-                            vis.stage(*mm[L], L, &vc, 1, pr, ss[L]);
+                            vis.stage(*mm[L], L, &vc, 1, (int)ch[L]->rows, pr, ss[L]);
                         }
                     }
                     ds41::Stop stop{};
@@ -2636,9 +2636,9 @@ int main(int argc, char** argv)
                 g6s2::require(ds41_idx_set_chunk(&m, max_context) == 0, "DS41 ragged index bound refused");
                 if (vis_on) {   // DS41 image input: every member's images that overlap its rows (the table keys rows by slot)
                     VisChunk vc[ds41::pack::MAX_SEGMENTS];
-                    for (int j = 0; j < shape.count; ++j) vc[j] = VisChunk{(int)p.chunk[j].slot, p.chunk[j].first, p.chunk[j].rows, p.chunk[j].images};
+                    for (int j = 0; j < shape.count; ++j) vc[j] = VisChunk{(int)p.chunk[j].slot, p.chunk[j].first, p.chunk[j].rows, p.chunk[j].images, shape.seg[j].row0};
                     int pr = 0;
-                    vis.stage(m, 0, vc, shape.count, pr, st);
+                    vis.stage(m, 0, vc, shape.count, rows, pr, st);
                 }
                 if (split.on()) { prepare_ds41_prefill(m, rows, st, 0, split.i_late); prepare_ds41_prefill(m, rows, st, split.i_late, m.nl); }
                 else prepare_ds41_prefill(m, rows, st);
