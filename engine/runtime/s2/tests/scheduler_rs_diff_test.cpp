@@ -56,7 +56,7 @@ template <class S> static std::string state(const S& x)
                     std::to_string(x.parked()) + " h" + std::to_string(x.horizon()) + " d" + std::to_string(x.digest()) + "|";
     for (const auto& t : x.slots())
         s += str(t.key) + " " + std::to_string(t.req.id) + " " + std::to_string(t.req.prompt_tokens) + " " + std::to_string(t.req.max_tokens) +
-             " " + std::to_string(t.req.steering.enabled) + " " + std::to_string(t.req.r_rows) + " " + str(t.run) + " " +
+             " " + std::to_string(t.req.steering.enabled) + std::to_string(t.req.steering.slot) + std::to_string(t.req.steering.scale_bits) + " " + std::to_string(t.req.r_rows) + " " + str(t.run) + " " +
              std::to_string(int(t.phase)) + " " + std::to_string(t.prefilled) + " " + std::to_string(t.emitted) + " " +
              std::to_string(t.inserted) + " " + std::to_string(t.deferred) + " " + std::to_string(t.packable) +
              std::to_string(t.pack_tail) + " " + std::to_string(t.parked) + ";";
@@ -113,11 +113,15 @@ static void scheduler_diff(std::mt19937_64& rng)
                 e.boundary = r.boundary() + uint64_t(!U(0, 30));
                 e.before_hash = U(0, 30) ? r.digest() : 7;
                 const auto& sl = r.slots();
-                if (!U(0, 3)) e.cancel = sl[size_t(U(0, int(MAX_SESSIONS) - 1))].key;
+                if (!U(0, 3))
+                {
+                    e.cancel = sl[size_t(U(0, int(MAX_SESSIONS) - 1))].key;
+                    if (!U(0, 30)) e.cancel->epoch++;
+                }
                 if (U(0, 3))
                 {
                     std::optional<unsigned> park;
-                    if (c.park && !U(0, 2)) park = unsigned(U(0, int(MAX_SESSIONS)));
+                    if ((c.park || !U(0, 20)) && !U(0, 2)) park = unsigned(U(0, int(MAX_SESSIONS)));
                     Key key{};
                     const std::string ka = outcome([&] { key = a.next_key(e.cancel, park); return str(key); });
                     const std::string kr = outcome([&] { return str(r.next_key(e.cancel, park)); });
@@ -126,12 +130,22 @@ static void scheduler_diff(std::mt19937_64& rng)
                     {
                         Grant g;
                         g.key = key;
+                        if (!U(0, 40)) g.key.epoch++;
+                        if (!U(0, 40)) g.key.slot = MAX_SESSIONS + uint32_t(U(0, 2));
                         if (!U(0, 20)) g.key.generation++;
                         g.req.id = U(0, 20) ? (id += uint64_t(U(1, 3))) : id;
                         g.req.prompt_tokens = uint32_t(U(0, 30) ? (U(0, 3) ? U(1, 400) : U(1, 6000)) : 0);
                         g.req.max_tokens = uint32_t(U(0, 30) ? U(1, 60) : 0);
                         g.req.steering.enabled = !U(0, 8);
-                        if (g.req.steering.enabled) g.req.steering.profile_digest[size_t(U(0, 31))] = uint8_t(U(0, 255));
+                        if (g.req.steering.enabled)
+                        {
+                            auto& st = g.req.steering;
+                            st.profile_digest[size_t(U(0, 31))] = uint8_t(U(0, 255));
+                            st.schedule_digest[size_t(U(0, 31))] = uint8_t(U(0, 255));
+                            st.scope = U(0, 1) ? g6rt::steering::Scope::Shared : g6rt::steering::Scope::Full;
+                            st.scale_bits = uint32_t(U(0, 1 << 30));
+                            st.slot = uint32_t(U(0, 7));
+                        }
                         g.req.r_rows = U(0, 4) ? 0 : c.r2_rows;
                         const std::string pa = outcome([&] { return std::to_string(grant_pages(c, g.req)) + "/" + std::to_string(reserve_pages(c, g.req)); });
                         const std::string pr = outcome([&] { return std::to_string(g6s2ref::grant_pages(c, g.req)) + "/" + std::to_string(g6s2ref::reserve_pages(c, g.req)); });
@@ -152,6 +166,8 @@ static void scheduler_diff(std::mt19937_64& rng)
                 {
                     const auto& x = sl[size_t(U(0, int(MAX_SESSIONS) - 1))];
                     e.shrink = Shrink{x.key, U(0, 8) ? c.r2_rows : 0, Run{x.run.first_page + uint32_t(!U(0, 4)), x.run.pages, x.run.table_version, 99}};
+                    if (!U(0, 20)) e.shrink->key.epoch++;
+                    if (!U(0, 20)) e.shrink->key.slot = MAX_SESSIONS;
                 }
                 e.hold = U(0, 1);
                 auto changes = [](const Changes& d) {

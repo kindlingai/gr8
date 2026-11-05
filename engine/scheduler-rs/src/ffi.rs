@@ -11,6 +11,7 @@ use crate::flash_ring::{self, Ring};
 use crate::kv_plan::{self, Io, Item};
 
 unsafe fn slice<'a, T>(p: *const T, n: usize) -> &'a [T] {
+    debug_assert!(n == 0 || !p.is_null());
     if n == 0 || p.is_null() {
         &[]
     } else {
@@ -19,6 +20,7 @@ unsafe fn slice<'a, T>(p: *const T, n: usize) -> &'a [T] {
 }
 
 unsafe fn slice_mut<'a, T>(p: *mut T, n: usize) -> &'a mut [T] {
+    debug_assert!(n == 0 || !p.is_null());
     if n == 0 || p.is_null() {
         &mut []
     } else {
@@ -522,4 +524,28 @@ pub unsafe extern "C" fn g6sch_complete_decode(
     nr: usize,
 ) -> *const c_char {
     err(sch::complete_decode(&*c, slice_mut(s, n), &mut *st, slice(r, nr)))
+}
+
+/// The struct sizes and constants the C++ side duplicates, by index (g6sched.h G6SCH_ABI_*); 0 past the end.
+#[no_mangle]
+pub extern "C" fn g6sch_abi(what: u32) -> u64 {
+    use std::mem::size_of;
+    let v = [
+        size_of::<Slot>(),
+        size_of::<Config>(),
+        size_of::<Quantum>(),
+        size_of::<State>(),
+        size_of::<Commit>(),
+        size_of::<Completion>(),
+        size_of::<sch::Grant>(),
+        sch::PAGE as usize,
+        sch::PREFILL_DEFER_MAX as usize,
+        sch::NOTICE_MIN as usize,
+        sch::NOTICE_MAX as usize,
+        sch::NOTICE_ROWS as usize,
+        sch::MAX_DECODE_ROUNDS as usize,
+        sch::PACK_MAX_MEMBERS,
+        sch::QMAX,
+    ];
+    v.get(what as usize).map_or(0, |&x| x as u64)
 }

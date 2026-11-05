@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstring>
+#include <utility>
 #include <cstdint>
 #include <deque>
 #include <limits>
@@ -104,9 +106,14 @@ struct Config {
     }
     // the settings scheduler-rs reads: every field but the steering receipt
     g6sch_config scalars() const {
-        return {epoch, pool_rows, max_rows, max_sessions, mtp, guard_tokens, prefill_rows, two_lanes, decode_prefill_rows,
-                decode_rounds, window_pages, cp_step_rows, cp_after, cp_seg, r2_rows, tail_first, notice_max, c8_pack,
-                mtp_sessions, sess_drafts, park};
+        g6sch_config x{};
+        x.epoch = epoch; x.pool_rows = pool_rows; x.max_rows = max_rows; x.max_sessions = max_sessions; x.mtp = mtp;
+        x.guard_tokens = guard_tokens; x.prefill_rows = prefill_rows; x.two_lanes = two_lanes;
+        x.decode_prefill_rows = decode_prefill_rows; x.decode_rounds = decode_rounds; x.window_pages = window_pages;
+        x.cp_step_rows = cp_step_rows; x.cp_after = cp_after; x.cp_seg = cp_seg; x.r2_rows = r2_rows;
+        x.tail_first = tail_first; x.notice_max = notice_max; x.c8_pack = c8_pack; x.mtp_sessions = mtp_sessions;
+        x.sess_drafts = sess_drafts; x.park = park;
+        return x;
     }
     void validate() const {
         const g6sch_config c = scalars();
@@ -273,6 +280,23 @@ inline Quantum from_rs(const g6sch_quantum& o) {
     }
     return q;
 }
+// the Rust side agrees on every size and constant both sides define
+inline void check_abi() {
+    static const bool ok = [] {
+        const std::pair<uint32_t, uint64_t> want[] = {
+            {G6SCH_ABI_SLOT, sizeof(g6sch_slot)}, {G6SCH_ABI_CONFIG, sizeof(g6sch_config)},
+            {G6SCH_ABI_QUANTUM, sizeof(g6sch_quantum)}, {G6SCH_ABI_STATE, sizeof(g6sch_state)},
+            {G6SCH_ABI_COMMIT, sizeof(g6sch_commit)}, {G6SCH_ABI_COMPLETION, sizeof(g6sch_completion)},
+            {G6SCH_ABI_GRANT, sizeof(g6sch_grant)}, {G6SCH_ABI_PAGE, PAGE},
+            {G6SCH_ABI_PREFILL_DEFER_MAX, PREFILL_DEFER_MAX}, {G6SCH_ABI_NOTICE_MIN, NOTICE_MIN},
+            {G6SCH_ABI_NOTICE_MAX, NOTICE_MAX}, {G6SCH_ABI_NOTICE_ROWS, NOTICE_ROWS},
+            {G6SCH_ABI_MAX_DECODE_ROUNDS, MAX_DECODE_ROUNDS}, {G6SCH_ABI_PACK_MAX_MEMBERS, PACK_MAX_MEMBERS},
+            {G6SCH_ABI_QMAX, G6SCH_QMAX}};
+        for (const auto& [what, v] : want) if (g6sch_abi(what) != v) return false;
+        return true;
+    }();
+    require(ok, "scheduler-rs: struct sizes or constants differ from scheduler.h");
+}
 } // namespace sch
 inline uint64_t reserve_rows(const Config& c, const Request& r) {
     const auto x = c.scalars();
@@ -308,6 +332,7 @@ class Scheduler {
     g6sch_slot* rs() { return sch::m<g6sch_slot>(s_.data()); }
 public:
     explicit Scheduler(Config c) : c_(c), x_(c.scalars()) {
+        sch::check_abi();
         c_.validate();
         st_.want_decode = true;
         g6sch_init(&x_, rs(), MAX_SESSIONS);
@@ -350,9 +375,9 @@ public:
     Changes apply(const Commit& e) {
         g6sch_commit x{};
         x.epoch = e.epoch; x.event = e.event; x.boundary = e.boundary; x.before_hash = e.before_hash;
-        if ((x.has_cancel = bool(e.cancel))) x.cancel = *sch::c<g6sch_key>(&*e.cancel);
-        if ((x.has_admit = bool(e.admit))) x.admit = *sch::c<g6sch_grant>(&*e.admit);
-        if ((x.has_shrink = bool(e.shrink))) x.shrink = *sch::c<g6sch_shrink>(&*e.shrink);
+        if ((x.has_cancel = bool(e.cancel))) std::memcpy(&x.cancel, &*e.cancel, sizeof x.cancel);
+        if ((x.has_admit = bool(e.admit))) std::memcpy(&x.admit, &*e.admit, sizeof x.admit);
+        if ((x.has_shrink = bool(e.shrink))) std::memcpy(&x.shrink, &*e.shrink, sizeof x.shrink);
         Changes d;
         d.freed.resize(MAX_SESSIONS);
         size_t n = 0; bool admitted = false;

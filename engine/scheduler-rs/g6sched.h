@@ -90,6 +90,13 @@ struct g6sch_commit {
     bool has_shrink; g6sch_shrink shrink;
 };
 struct g6sch_completion { g6sch_key key; uint32_t emitted; bool finished; uint32_t inserted; };
+// the Rust side's struct sizes and constants, which the C++ wrapper checks once (scheduler.h check_abi)
+enum {
+    G6SCH_ABI_SLOT, G6SCH_ABI_CONFIG, G6SCH_ABI_QUANTUM, G6SCH_ABI_STATE, G6SCH_ABI_COMMIT, G6SCH_ABI_COMPLETION,
+    G6SCH_ABI_GRANT, G6SCH_ABI_PAGE, G6SCH_ABI_PREFILL_DEFER_MAX, G6SCH_ABI_NOTICE_MIN, G6SCH_ABI_NOTICE_MAX,
+    G6SCH_ABI_NOTICE_ROWS, G6SCH_ABI_MAX_DECODE_ROUNDS, G6SCH_ABI_PACK_MAX_MEMBERS, G6SCH_ABI_QMAX,
+};
+uint64_t g6sch_abi(uint32_t what);
 
 // Config::validate's scalar rules; mtp0, pack, park: the module's capabilities
 const char* g6sch_validate(const g6sch_config* c, uint32_t max_sessions, bool mtp0, bool pack, bool park);
@@ -119,6 +126,7 @@ uint64_t g6sch_digest_slots(const g6sch_config* c, const g6sch_slot* s, size_t n
 // digest: the state's digest before the commit. freed: n runs
 const char* g6sch_apply(const g6sch_config* c, g6sch_slot* s, size_t n, g6sch_state* st, const g6sch_commit* e,
                         uint64_t digest, g6sch_run* freed, size_t* n_freed, bool* admitted);
+// k and r must not point into s
 const char* g6sch_grow(const g6sch_config* c, g6sch_slot* s, size_t n, const g6sch_state* st, const g6sch_key* k, const g6sch_run* r);
 size_t g6sch_decoding(const g6sch_slot* s, size_t n, g6sch_key* out);   // out: n keys
 void g6sch_alternate(const g6sch_config* c, uint32_t kind, bool* want, uint32_t* run);
@@ -127,6 +135,7 @@ void g6sch_plan(const g6sch_config* c, const g6sch_slot* s, size_t n, bool want,
 const char* g6sch_next(const g6sch_config* c, const g6sch_slot* s, size_t n, g6sch_state* st, const bool* stalled, g6sch_quantum* out);
 void g6sch_advance(g6sch_slot* s, size_t n, const g6sch_quantum* q);
 uint64_t g6sch_horizon(const g6sch_config* c, const g6sch_slot* s, size_t n, const g6sch_state* st);
+// k must not point into s
 const char* g6sch_skip_prefill(g6sch_slot* s, size_t n, const g6sch_state* st, const g6sch_key* k);
 const char* g6sch_complete_prefill(const g6sch_config* c, g6sch_slot* s, size_t n, g6sch_state* st);
 const char* g6sch_complete_prefill_pack(const g6sch_config* c, g6sch_slot* s, size_t n, g6sch_state* st);
