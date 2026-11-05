@@ -276,6 +276,24 @@ Moves `s2_batch.h` (about 1,500 lines), `spec_len.h`, `insert_rule.h`, `ngram_lo
    The planner's `exp` and the Rust's both come from the platform libm (the header names it); Rust does not contract
    multiply-adds, which matches the `-std=c++17` g6m4 build (the learn records confirm it on a serving log).
 
+### R3c. DS41's KV on the shared paged pool (with Chuck)
+
+A DS41 slot reserves a whole slab (`--capacity-slots`) whatever its request's length, and its prefix snapshots and park
+duplicate what the pool already has (paged stores, the spare-RAM cache, prefix reuse and stash, checkpoints). GLM and
+Flash reserve `prompt + max_tokens` pages, so short requests leave room for long ones, under one admission rule and one
+meaning of the per-request limit. This step moves DS41 onto that pool, which removes a model-specific KV path and leaves
+R8 one KV model to describe. DS41's rows are already defined per 64-token kvman page (`engine/attn/kvfmt.h`, the DS41
+section: ca/ica rows, ratio-2 and ratio-1 layers). The work:
+
+- the DS41 attention and indexer kernels address a slot's slab directly; they take a block table as GLM's and Flash's do;
+- prefix snapshots and park become pool stash entries or checkpoints (`ds41_prefix_cache.cuh`, `Config::park`, the
+  scheduler's parked phase);
+- per-session state that is not KV stays per session (the 128-token windows, Engram, DSpark), as Flash keeps its KDA
+  slots (`FlashSlots`).
+
+It is DS41's owner's area, so it is planned with him. It fits after R3: the planner port does not depend on it, and R4
+and R5 then move one pool's callers, not two KV models'.
+
 ### R4. The driver to Rust
 
 `s2/driver.h` is glue between R2, R3 and the hooks; after them it is Rust to Rust plus the module callbacks (`grow`,
