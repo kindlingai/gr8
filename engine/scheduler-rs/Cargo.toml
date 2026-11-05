@@ -1,0 +1,15 @@
+[package]
+name = "g6sched"
+version = "0.1.0"
+edition = "2021"
+description = "gr8's host-side S2 scheduling logic in Rust (docs/HOST-CORE.md, R2), called from C++ through g6sched.h"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[profile.release]
+opt-level = 3
+panic = "abort"        # a panic must not unwind into the C++ engine
+
+[profile.dev]
+panic = "abort"

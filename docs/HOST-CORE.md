@@ -14,7 +14,7 @@ Only the kernels and the code that sizes and launches them need the model and th
 reads them as constants because it happens to be compiled in the same translation unit. The result:
 
 - The host logic exists once per model, width and variant. The host tests compile it with a model flag chosen per
-  test: most with none (the GLM shape), five with `-DG6_MODEL_DS41=1` (`scripts/host_tests.sh:90,118,122,215,267`), none
+  test: most with none (the GLM shape), five with `-DG6_MODEL_DS41=1` (`scripts/host_tests.sh`), none
   of the S2 layer with `-DG6_MODEL_FLASH=1`, so the Flash cost table at `s2_batch.h:196` is never compiled on the host.
 - What a model must provide is not written down anywhere. It is spread over about 72 model `#if`s in `g6m4.cu` and 85
   in `engine/runtime/*.cuh` (52 of them in `rank.cuh`), and three serve adapters of different shapes.
@@ -226,11 +226,23 @@ checks it against the constants in each model's shape.
 
 Moves `s2/scheduler.h`, `sessions.h`, `kv_plan.h`, `kv_share.h`, `cp_rows.h`, `flash_lend.h` and `flash_ring.h` (about
 1,300 lines, integer logic). The boundary is `#[repr(C)]` `Key`, `Slot`, `Run`, `Grant`, `Shrink`, `Resize`, `Quantum`,
-`Config` and `g6s2_sched_*` calls. It turns the compile-time slot capacity (`MAX_SESSIONS`,
+`Config` and `g6sch_*` calls (`g6sched.h`). It turns the compile-time slot capacity (`MAX_SESSIONS`,
 `S2N_SLOTS`) into the runtime `ModuleInfo::max_sessions`; the model rules already read `ModuleInfo` since R1. It will
 also want `PACK_MAX_MEMBERS` and the drafters' block sizes in `ModuleInfo`. The pool becomes Rust to Rust, so `s2/pool.h` (218 lines of FFI) goes away. Proof: the
 scheduler, driver and pool host tests ported, and a differential run of the C++ and Rust versions on the command log
 (same `Quantum` sequence and pool digest, which ranks compare at `service.h:499`). One C call per round.
+
+R2 lands in four parts:
+
+1. R2a: the crate (`engine/scheduler-rs`, `libg6sched.a`, `g6sched.h`) and the small policies first: KV copy batches
+   (`kv_plan.h`), Flash chunk lending (`flash_lend.h`), Flash KDA rings and capture sets (`flash_ring.h`), rounds past R
+   (`cp_rows.h`). The C++ headers keep their types and call Rust; the state stays in C++ structs with the same layout,
+   so C++ copies and owns it as before. The C++ they replaced stays in `s2/tests/ref/` for `scheduler_rs_diff_test`,
+   which runs seeded random inputs through both and requires the same results and refusals. Every build, test and image
+   links the library (`scripts/build.sh`, `build_m4.sh`, `host_tests.sh`, `c1_tests.sh`, the Dockerfile, CI).
+2. R2b: the `Scheduler` itself, against the retained C++ on random command streams.
+3. R2c: the session logic and `kv_share.h`.
+4. R2d: `s2/pool.h` goes, the pool called Rust to Rust; the reference copies go with it.
 
 ### R3. The planner to Rust
 

@@ -46,11 +46,15 @@ KN=$REPO/engine/knobs-rs/target/release/libgr8knobs.a
 if command -v cargo > /dev/null 2>&1; then
   cargo build --release --quiet --manifest-path "$REPO/engine/kvman-rs/Cargo.toml"
   cargo build --release --quiet --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
+  cargo build --release --quiet --manifest-path "$REPO/engine/scheduler-rs/Cargo.toml"
 fi
 [ -f "$KV" ] || { echo "no $KV: cargo build --release --manifest-path engine/kvman-rs/Cargo.toml"; exit 1; }
 [ -f "$KN" ] || { echo "no $KN: cargo build --release --features capi --manifest-path engine/knobs-rs/Cargo.toml"; exit 1; }
-KVLIB=("$KV" "$KN" -lpthread -ldl -lm)
-KNOBS=("$KN" -lpthread -ldl -lm)
+# the host-side S2 scheduling logic in Rust (engine/scheduler-rs): every test that includes the S2 headers links it
+SL=$REPO/engine/scheduler-rs/target/release/libg6sched.a
+[ -f "$SL" ] || { echo "no $SL: cargo build --release --manifest-path engine/scheduler-rs/Cargo.toml"; exit 1; }
+KVLIB=("$KV" "$KN" "$SL" -lpthread -ldl -lm)
+KNOBS=("$KN" "$SL" -lpthread -ldl -lm)
 # the knob table: its C++ header over the C API
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/knobs-rs" "$REPO/engine/knobs-rs/tests/header_test.cpp" "${KNOBS[@]}" \
   -o "$T/knobs_header_test"
@@ -76,6 +80,9 @@ for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_M
   g++ -std=c++17 -O2 -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/module_info_test.cpp" -o "$T/module_info_test" "${KVLIB[@]}"
   "$T/module_info_test"
 done
+# engine/scheduler-rs against the C++ it replaced (tests/ref/*_ref.h)
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rs_diff_test.cpp" -o "$T/scheduler_rs_diff_test" "${KNOBS[@]}"
+"$T/scheduler_rs_diff_test"
 # the planner's round log and its replay (GR8_S2_REPLAY_LOG, s2/round_replay.h); GR8_S2_FRESH_SPEC
 g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_replay_test.cpp" -o "$T/batch_replay_test" "${KNOBS[@]}"
 "$T/batch_replay_test" "$T/replay.log"

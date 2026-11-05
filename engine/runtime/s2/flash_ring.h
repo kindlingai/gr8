@@ -1,5 +1,9 @@
-// KDA rollback per session, independent of CUDA and the acceptance policy.
+// KDA rollback per session, independent of CUDA and the acceptance policy; the rules are
+// engine/scheduler-rs/src/flash_ring.rs.
 #pragma once
+#include "../../scheduler-rs/g6sched.h"
+#include <algorithm>
+#include <cstdint>
 #include <set>
 #include <stdexcept>
 #include <vector>
@@ -9,14 +13,14 @@ struct FlashRing {
     bool ring = false;
     void reset() { first = -1; rows = 0; ring = false; }
     int source(int next) const {
-        if (first < 0) return 0;
-        const int accepted = next - first;
-        if (accepted < 1 || accepted > rows)
+        int src = 0;
+        if (g6sch_ring_source(reinterpret_cast<const g6sch_ring*>(this), next, &src))
             throw std::runtime_error("Flash next main position outside previous step");
-        return ring ? accepted - 1 : 0;
+        return src;
     }
     void record(int pos, int n, bool verify) { first = pos; rows = n; ring = verify; }
 };
+static_assert(sizeof(FlashRing) == sizeof(g6sch_ring), "scheduler-rs layout");
 // Every S2 session's KDA state slots (Model::kda_sessions x kda_ring of them): session q owns slots
 // [q * per, (q + 1) * per), per = the ring (K + 1, or 1 without MTP), with a FlashRing of its own. In a main step a
 // verify session's row r goes to slot base + r, other rows to base; the session's first row loads base + its ring's
@@ -35,10 +39,10 @@ struct FlashSlots {
     // loads from returned, the step recorded for the next one
     int rows(int q, int pos, int n, bool verify, int* kslot) {
         FlashRing& r = at(q);
-        if (n < 1 || (verify && n > per)) throw std::runtime_error("Flash verify exceeds KDA ring");
-        const int b = q * per, src = b + r.source(pos);
-        for (int i = 0; i < n; ++i) kslot[i] = b + (verify ? i : 0);
-        r.record(pos, n, verify);
+        int src = 0;
+        const int rc = g6sch_ring_rows(reinterpret_cast<g6sch_ring*>(&r), per, q, pos, n, verify, kslot, &src);
+        if (rc == 2) throw std::runtime_error("Flash verify exceeds KDA ring");
+        if (rc) throw std::runtime_error("Flash next main position outside previous step");
         return src;
     }
     // the KDA inputs of a main step whose session j holds rows [row0[j], row0[j] + n[j]) (StepIn: kslot, kda_src for
@@ -79,15 +83,16 @@ private:
 // with GR8_S2_ADAPT (else K); draft = 1..chunk and 1..sessions x (K + 1); chain = 1..sessions (K >= 2 only).
 struct FlashShapes { std::set<int> mains, drafts, chains; };
 inline FlashShapes flash_shapes(int sessions, int mtp, int chunk, bool adapt, int mx) {
-    if (sessions < 1 || mtp < 1 || chunk < 1 || chunk > mx) throw std::runtime_error("Flash capture set: invalid sessions, mtp or chunk");
+    std::vector<uint8_t> m(size_t(std::max(mx, 0)) + 1), d(m.size()), c(m.size());
+    const int rc = g6sch_flash_shapes(sessions, mtp, chunk, adapt, mx, m.data(), d.data(), c.data());
+    if (rc == 1) throw std::runtime_error("Flash capture set: invalid sessions, mtp or chunk");
+    if (rc) throw std::runtime_error("Flash capture set: sessions x (mtp + 1) rows exceed G6_MX");
     FlashShapes f;
-    for (int M = 1; M <= chunk; ++M) { f.mains.insert(M); f.drafts.insert(M); }
-    for (int S = 1; S <= sessions; ++S)
-        for (int k = adapt ? 1 : mtp; k <= mtp; ++k) f.mains.insert(S * (k + 1));
-    for (int M = 1; M <= sessions * (mtp + 1); ++M) f.drafts.insert(M);
-    if (mtp >= 2) for (int M = 1; M <= sessions; ++M) f.chains.insert(M);
-    if (*f.mains.rbegin() > mx || *f.drafts.rbegin() > mx)
-        throw std::runtime_error("Flash capture set: sessions x (mtp + 1) rows exceed G6_MX");
+    for (int M = 0; M <= mx; ++M) {
+        if (m[size_t(M)]) f.mains.insert(M);
+        if (d[size_t(M)]) f.drafts.insert(M);
+        if (c[size_t(M)]) f.chains.insert(M);
+    }
     return f;
 }
 }
