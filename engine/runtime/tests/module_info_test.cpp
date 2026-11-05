@@ -22,10 +22,9 @@ int main()
     CHECK(m.hidden == geom::HID && m.layers == geom::L_MAIN && m.vocab == geom::VOCAB && m.experts == geom::NEXP &&
           m.topk == geom::TOPK);
     CHECK(m.kv_row_bytes == g6kv::ROW && std::strcmp(m.kv_format, g6kv::NAME) == 0 && m.kv_page == 64);
-    const uint32_t ds41 = G6_CAP_MTP0 | G6_CAP_PACK | G6_CAP_PARK | G6_CAP_PROMPT_DECODE | G6_CAP_DSPARK;
 #if G6_MODEL_DS41
     CHECK(m.model == G6_MODEL_ID_DS41 && std::strcmp(m.name, "ds41") == 0 && m.max_sessions == 32 && m.mtp_layers == 3);
-    CHECK(m.caps == ds41);
+    CHECK(m.caps == (G6_CAP_MTP0 | G6_CAP_PACK | G6_CAP_PARK | G6_CAP_PROMPT_DECODE | G6_CAP_DSPARK));
 #elif G6_MODEL_FLASH
     CHECK(m.model == G6_MODEL_ID_GLM53F && std::strcmp(m.name, "glm-5.3-flash") == 0 && m.max_sessions == 8);
     CHECK(m.caps == (G6_CAP_DFLASH2 | G6_CAP_FLASH_COST | G6_CAP_KDA | G6_CAP_GRAMMAR));
