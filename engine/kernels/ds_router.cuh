@@ -6,7 +6,8 @@
 //   key[m][e]    = score + bias[e]                    bias = e_score_correction_bias, fp32 [384] (selection only)
 //   routes       = the 6 largest keys, ties -> lowest expert id
 //   weight[m][k] = score[sel k] / (sum of the 6 selected scores + 1e-20) * 1.5          (the UNBIASED score is normalized)
-// Text only: gate.bias_vl (image tokens) is not used.
+// Image tokens (DS41 vision): a row whose vflag is set selects with gate.bias_vl in place of bias (model.py Gate, training
+// noaux_tc_for_vl); vflag null (the text-only launch) = every row uses bias, the code before vision.
 //
 // Two kernels, M <= 8 (decode):
 //   k_gate_logits<<<NEXP / 8, 256>>>(gate, x, M, logits)   warp per expert row, whole row in flight, fixed-order butterfly sum
@@ -144,7 +145,8 @@ __device__ __forceinline__ unsigned key_bits(float f)       // order-preserving 
 // KC = routes kept per token (the top-k cut, GR8_DS_MOE_TOPK): the first KC picks in selection order (best biased key first); the weights renormalize over the
 // kept picks; a dropped route k >= KC is absent (the init above leaves tok_slot -1, tok_col 0, tok_w 0, tok_expert -1 for it). KC == TK is today's code.
 template <int NE, int TK, int PDLM, int KC = TK>
-__device__ __forceinline__ void plan_body(const float* __restrict__ logits, const float* __restrict__ bias, int M, PlanT<TK>* __restrict__ P)
+__device__ __forceinline__ void plan_body(const float* __restrict__ logits, const float* __restrict__ bias, int M, PlanT<TK>* __restrict__ P,
+                                          const float* __restrict__ bias_vl, const unsigned char* __restrict__ vflag)
 {
     static_assert(KC >= 1 && KC <= TK, "plan_body: kept routes");
     constexpr int RW = RouterGeom<NE, TK>::RW, SM = RouterGeom<NE, TK>::SM;
@@ -170,7 +172,7 @@ __device__ __forceinline__ void plan_body(const float* __restrict__ logits, cons
             const float x = logits[i];
             const float sc = sqrt_softplus(x);
             (&s_sm[0][0])[i] = sc;
-            (&k_sm[0][0])[i] = sc + bias[i % NE];
+            (&k_sm[0][0])[i] = sc + ((vflag && vflag[i / NE]) ? bias_vl : bias)[i % NE];
         }
     }
     __syncthreads();
@@ -273,15 +275,15 @@ __device__ __forceinline__ void plan_body(const float* __restrict__ logits, cons
     }
 }
 template <int NE = NEXP, int TK = TOPK, int KC = TK>
-__global__ void __launch_bounds__(PLAN_THREADS) k_plan(const float* __restrict__ logits, const float* __restrict__ bias, int M, PlanT<TK>* __restrict__ P)
+__global__ void __launch_bounds__(PLAN_THREADS) k_plan(const float* __restrict__ logits, const float* __restrict__ bias, int M, PlanT<TK>* __restrict__ P, const float* __restrict__ bias_vl = nullptr, const unsigned char* __restrict__ vflag = nullptr)
 {
-    plan_body<NE, TK, 0, KC>(logits, bias, M, P);
+    plan_body<NE, TK, 0, KC>(logits, bias, M, P, bias_vl, vflag);
 }
 // PDL twin: waits for the gate (head), then triggers so the shared expert's fc1 can start while the plan is still being built.
 template <int NE = NEXP, int TK = TOPK, int KC = TK>
-__global__ void __launch_bounds__(PLAN_THREADS) k_plan_p(const float* __restrict__ logits, const float* __restrict__ bias, int M, PlanT<TK>* __restrict__ P)
+__global__ void __launch_bounds__(PLAN_THREADS) k_plan_p(const float* __restrict__ logits, const float* __restrict__ bias, int M, PlanT<TK>* __restrict__ P, const float* __restrict__ bias_vl = nullptr, const unsigned char* __restrict__ vflag = nullptr)
 {
-    plan_body<NE, TK, 1, KC>(logits, bias, M, P);
+    plan_body<NE, TK, 1, KC>(logits, bias, M, P, bias_vl, vflag);
 }
 
 // ------------------------------------------------------------------------------------------------ multi-tile router, M <= 32
@@ -475,7 +477,7 @@ __global__ void __launch_bounds__(256, 1) k_gate_logits_ro(const __nv_bfloat16* 
 // Output = PlanMT (ds_plan_mt.h); every field is written here (initial values as plan_ref).
 // PDLM = 1: the PDL chain instance (wait for the gate before the logits are read, then trigger), as plan_body.
 template <int NE = NEXP, int TK = TOPK, int MM = MT_MAX, int PDLM = 0, int KC = TK>
-__global__ void __launch_bounds__(PLAN_THREADS) k_plan_mt(const float* __restrict__ logits, const float* __restrict__ bias, int M, PlanMT<TK, MM>* __restrict__ P)
+__global__ void __launch_bounds__(PLAN_THREADS) k_plan_mt(const float* __restrict__ logits, const float* __restrict__ bias, int M, PlanMT<TK, MM>* __restrict__ P, const float* __restrict__ bias_vl = nullptr, const unsigned char* __restrict__ vflag = nullptr)
 {
     constexpr int RW = NE / 32, SM = PlanMT<TK, MM>::SM;
     static_assert(NE % 32 == 0 && NE <= PLAN_THREADS && MM <= PLAN_THREADS / 32 && MM <= 32 && TK <= 8 && TK <= NE && MM * TK <= PLAN_THREADS,
@@ -498,12 +500,13 @@ __global__ void __launch_bounds__(PLAN_THREADS) k_plan_mt(const float* __restric
     float s[RW], key[RW];
     if (w < M)
     {
+        const float* __restrict__ bsel = (vflag && vflag[w]) ? bias_vl : bias;
         #pragma unroll
         for (int i = 0; i < RW; ++i)
         {
             const float sc = sqrt_softplus(logits[w * NE + l + 32 * i]);
             s[i] = sc;
-            key[i] = sc + bias[l + 32 * i];
+            key[i] = sc + bsel[l + 32 * i];
         }
     }
     __syncthreads();
@@ -619,7 +622,7 @@ __global__ void __launch_bounds__(PLAN_THREADS) k_plan_mt(const float* __restric
 // per expert, the tile scan over ceil(n / 8) as before, so an expert's tiles are laid out exactly as in the unchunked plan. Route threads loop
 // (M * TK can exceed the 1024 threads). Output = PlanMT<TK, MM>, every field written (plan_ref_chunked is the specification). Plain launch only.
 template <int NE = NEXP, int TK = TOPK, int MM = 128, int KC = TK>
-__global__ void __launch_bounds__(PLAN_THREADS) k_plan_pw(const float* __restrict__ logits, const float* __restrict__ bias, int M, PlanMT<TK, MM>* __restrict__ P)
+__global__ void __launch_bounds__(PLAN_THREADS) k_plan_pw(const float* __restrict__ logits, const float* __restrict__ bias, int M, PlanMT<TK, MM>* __restrict__ P, const float* __restrict__ bias_vl = nullptr, const unsigned char* __restrict__ vflag = nullptr)
 {
     constexpr int RW = NE / 32, SM = PlanMT<TK, MM>::SM, MW = MM / 32;
     static_assert(NE % 32 == 0 && NE <= PLAN_THREADS && MM % 32 == 0 && MM <= PW_MAX && TK <= 8 && TK <= NE, "k_plan_pw tiling");
@@ -642,12 +645,13 @@ __global__ void __launch_bounds__(PLAN_THREADS) k_plan_pw(const float* __restric
     for (int m = w; m < M; m += PLAN_THREADS / 32)
     {
         float s[RW], key[RW];
+        const float* __restrict__ bsel = (vflag && vflag[m]) ? bias_vl : bias;
         #pragma unroll
         for (int i = 0; i < RW; ++i)
         {
             const float sc = sqrt_softplus(logits[m * NE + l + 32 * i]);
             s[i] = sc;
-            key[i] = sc + bias[l + 32 * i];
+            key[i] = sc + bsel[l + 32 * i];
         }
         unsigned taken = 0;
         float my_k = key[0];
