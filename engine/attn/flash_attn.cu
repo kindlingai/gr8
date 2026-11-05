@@ -397,7 +397,9 @@ __global__ void value_project(Input input,int start,int n,const float* context){
     }
 }
 
-struct Work { float *q,*ps,*prob,*parts,*ctx; int pstride; size_t total; };
+// ps: the pool scores, [R][tstride]; a call whose pool stride passes KP_TILE scores key tiles (tstride = KP_TILE) and
+// keeps the running top-512 in cs / ci (two of each, [R][512], kp_select_tile)
+struct Work { float *q,*ps,*prob,*parts,*ctx,*cs[2]; int* ci[2]; int pstride,tstride; size_t total; };
 static int pool_stride(int context){return ((context+KP-1)/KP+31)/32*32;}
 static bool valid(const G6Attn& a){
 #if defined(G6_CP) && G6_CP
@@ -409,9 +411,11 @@ static bool valid(const G6Attn& a){
 static Work workspace(const G6Attn& a,void* base){
     Work w{};size_t n=0;const size_t R=std::min(a.rows,a.query_tile),H=a.heads;
     auto alloc=[&](size_t bytes){size_t old=n;n=(n+bytes+255)&~size_t(255);return (void*)((uintptr_t)base+old);};
-    w.pstride=pool_stride(a.context);
-    w.q=(float*)alloc(R*H*LAT*4);w.ps=(float*)alloc(R*w.pstride*4);w.prob=(float*)alloc(R*H*TOP*4);
-    w.parts=(float*)alloc(R*H*PART*LAT*4);w.ctx=(float*)alloc(R*H*LAT*4);w.total=n;return w;
+    w.pstride=pool_stride(a.context);w.tstride=std::min(w.pstride,KP_TILE);
+    w.q=(float*)alloc(R*H*LAT*4);w.ps=(float*)alloc(R*w.tstride*4);w.prob=(float*)alloc(R*H*TOP*4);
+    w.parts=(float*)alloc(R*H*PART*LAT*4);w.ctx=(float*)alloc(R*H*LAT*4);
+    if(w.pstride>KP_TILE)for(int k=0;k<2;k++){w.cs[k]=(float*)alloc(R*g6kv::TOP_POOLS*4);w.ci[k]=(int*)alloc(R*g6kv::TOP_POOLS*4);}
+    w.total=n;return w;
 }
 template<class Input>
 static void append(const G6Attn& a,Input input,cudaStream_t stream){
@@ -420,8 +424,16 @@ static void append(const G6Attn& a,Input input,cudaStream_t stream){
 }
 template<class Input>
 static void make_index(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t stream){
-    kp_scores<<<dim3(w.pstride/32,n),256,0,stream>>>(input,start,w.ps,w.pstride);
-    kp_select<<<n,SELT,0,stream>>>(input,start,w.ps,w.pstride);
+    if(w.pstride<=KP_TILE){
+        kp_scores<<<dim3(w.pstride/32,n),256,0,stream>>>(input,start,w.ps,w.pstride);
+        kp_select<<<n,SELT,0,stream>>>(input,start,w.ps,w.pstride);
+        return;
+    }
+    for(int t0=0,k=0;t0<w.pstride;t0+=KP_TILE,k^=1){
+        const int nt=std::min(KP_TILE,w.pstride-t0);
+        kp_scores<<<dim3(nt/32,n),256,0,stream>>>(input,start,w.ps,KP_TILE,t0);
+        kp_select_tile<<<n,SELT,0,stream>>>(input,start,w.ps,KP_TILE,w.cs[k],w.ci[k],w.cs[k^1],w.ci[k^1],t0,nt,t0+nt>=w.pstride);
+    }
 }
 template<class Input>
 static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t stream){
@@ -516,9 +528,9 @@ __device__ __forceinline__ int4 lat8_half(const uint8_t* v,int d){
 // Multi-row kpool scorer: 16 query rows (4 passes of 4) share each 32-pool tile load (ks[32][128]).
 // 0-ULP bit-identical to kp_scores: exact same d=0..127 FMA order, k=0..3 head loop, and xor-1/2/4 warp reduction.
 template<class Input>
-__global__ void __launch_bounds__(256) kp_scores_pf(Input input,int start,int n,float* scores,int pstride){
+__global__ void __launch_bounds__(256) kp_scores_pf(Input input,int start,int n,float* scores,int pstride,int p_off){
     auto a=resolve(input);if(!a.active)return;
-    const int row0=blockIdx.y*16,m16=min(16,n-row0),p0=blockIdx.x*32,t=threadIdx.x;
+    const int row0=blockIdx.y*16,m16=min(16,n-row0),p0=p_off+blockIdx.x*32,t=threadIdx.x;
     int max_nvis=0;
     for(int rr=0;rr<m16;rr++){
         DeviceAttn ar=a;FOR_ROW(ar,input,start+row0+rr);
@@ -611,7 +623,7 @@ __global__ void __launch_bounds__(256) kp_scores_pf(Input input,int start,int n,
             if(hl==0&&p0+pp<nvis_s[rr]){
                 s=s*(1.f/64)+0.f;
                 if(!isfinite(s)){error(a,4);s=-INFINITY;}
-                scores[(int64_t)(row0+pass+rr)*pstride+p0+pp]=s;
+                scores[(int64_t)(row0+pass+rr)*pstride+p0-p_off+pp]=s;
             }
         }
     }
@@ -621,12 +633,12 @@ __global__ void __launch_bounds__(256) kp_scores_pf(Input input,int start,int n,
 // Each of the 4 warps (128 threads) holds the 32x128 pooled keys in WMMA B-fragments and processes
 // one query row [IHEADS=32, IDIM=128] per iteration via wmma::mma_sync (16x16x16 FP16 -> FP32).
 // TC_TERMS=1: single FP16 pooled key; TC_TERMS=2: 22-bit hi+lo FP16 pooled key pair.
-// Grid: (pstride / 32, (n + 63) / 64), 128 threads (4 warps)
+// Grid: (pools / 32, (n + 63) / 64), 128 threads (4 warps); pools from p_off, as kp_scores
 template<int TC_TERMS,class Input>
-__global__ void __launch_bounds__(128) kp_scores_tc(Input input,int start,int n,float* scores,int pstride){
+__global__ void __launch_bounds__(128) kp_scores_tc(Input input,int start,int n,float* scores,int pstride,int p_off){
     using namespace nvcuda;
     auto a=resolve(input);if(!a.active)return;
-    const int p0=blockIdx.x*32,row0=blockIdx.y*64,t=threadIdx.x,w=t>>5,lane=t&31;
+    const int p0=p_off+blockIdx.x*32,row0=blockIdx.y*64,t=threadIdx.x,w=t>>5,lane=t&31;
     const int m64=min(64,n-row0);
     if(m64<=0)return;
     const int last_r=start+row0+m64-1;
@@ -712,7 +724,7 @@ __global__ void __launch_bounds__(128) kp_scores_tc(Input input,int start,int n,
             for(int h=0;h<IHEADS;h++)sum=fmaf(fmaxf(out_w[w][h][lane],0.f),ws_w[w][h],sum);
             float s=sum*(1.f/64.f)+0.f;
             if(!isfinite(s)){error(a,4);s=-INFINITY;}
-            scores[(int64_t)(row0+rr)*pstride+p0+lane]=s;
+            scores[(int64_t)(row0+rr)*pstride+p0-p_off+lane]=s;
         }
         __syncwarp();
     }
@@ -723,10 +735,10 @@ __global__ void __launch_bounds__(128) kp_scores_tc(Input input,int start,int n,
 // the head sum still visits heads 0..31. Half-sized output staging reduces shared memory too.
 // GR8_GLM53F_PF_KP_TC=3 selects this candidate; the default (=2) remains unchanged.
 template<int TC_TERMS,class Input>
-__global__ void __launch_bounds__(128) kp_scores_tc_stream(Input input,int start,int n,float* scores,int pstride){
+__global__ void __launch_bounds__(128) kp_scores_tc_stream(Input input,int start,int n,float* scores,int pstride,int p_off){
     using namespace nvcuda;
     auto a=resolve(input);if(!a.active)return;
-    const int p0=blockIdx.x*32,row0=blockIdx.y*64,t=threadIdx.x,w=t>>5,lane=t&31;
+    const int p0=p_off+blockIdx.x*32,row0=blockIdx.y*64,t=threadIdx.x,w=t>>5,lane=t&31;
     const int m64=min(64,n-row0);
     if(m64<=0)return;
     const int last_r=start+row0+m64-1;
@@ -802,7 +814,7 @@ __global__ void __launch_bounds__(128) kp_scores_tc_stream(Input input,int start
         if(p0+lane<nvis){
             float s=sum*(1.f/64.f)+0.f;
             if(!isfinite(s)){error(a,4);s=-INFINITY;}
-            scores[(int64_t)(row0+rr)*pstride+p0+lane]=s;
+            scores[(int64_t)(row0+rr)*pstride+p0-p_off+lane]=s;
         }
         __syncwarp();
     }
@@ -1549,9 +1561,10 @@ __global__ void __launch_bounds__(512) sparse_mla_pf_v2(Input input,int start,co
 struct G6AttnPrefillScratch {
     void* data=nullptr;
     size_t bytes=0;
-    int H=0,cap=0,maxrows=0,R=0,pstride=0,device=0;
+    int H=0,cap=0,maxrows=0,R=0,pstride=0,tstride=0,device=0;
     fa::half *qh=nullptr,*ctxh=nullptr,*output=nullptr;
     float *ps=nullptr,*prob=nullptr;
+    float* cs[2]={};int* ci[2]={};   // a cap past KP_TILE pools: the running top-512 of the key tiles (fa::Work)
     int* indices=nullptr;
     std::atomic<unsigned> refs{1};
 };
@@ -1568,13 +1581,14 @@ static size_t scratch_layout(G6AttnPrefillScratch& w,void* base){
     size_t used=0;
     auto take=[&](size_t n){size_t at=used;used=(used+n+255)&~size_t(255);return (void*)((uintptr_t)base+at);};
     const size_t R=w.R,H=w.H,M=w.maxrows;
-    w.pstride=pool_stride(w.cap);
+    w.pstride=pool_stride(w.cap);w.tstride=std::min(w.pstride,KP_TILE);
     w.qh=(half*)take(R*H*LAT*2);
     w.ctxh=(half*)take(R*H*LAT*2);
-    w.ps=(float*)take(R*w.pstride*4);
+    w.ps=(float*)take(R*w.tstride*4);
     w.prob=(float*)take(R*H*TOP*4);
     w.indices=(int*)take(M*TOP*4);
     w.output=(half*)take(M*H*VD*2);
+    if(w.pstride>KP_TILE)for(int k=0;k<2;k++){w.cs[k]=(float*)take(R*g6kv::TOP_POOLS*4);w.ci[k]=(int*)take(R*g6kv::TOP_POOLS*4);}
     return used;
 }
 static cudaError_t release_scratch(G6AttnPrefillScratch* w){
@@ -1689,12 +1703,26 @@ static int flash_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep*
         if(ce!=cudaSuccess)return (int)ce;
     }
     const bool proj2=knob::glm53f_pf_mla_proj2();   // fa_pf::mla_proj2 (=0: old kernels)
+    // pools [p_off, p_off + np) of rows [start, start + n): score p at w->ps[row * stride + p - p_off]
+    auto score = [&](int start, int n, int stride, int p_off, int np) {
+            if(kp_tc==3)fa_pf::kp_scores_tc_stream<2><<<dim3(np/32,(n+63)/64),128,0,stream>>>(a,start,n,w->ps,stride,p_off);
+            else if(kp_tc>=2)fa_pf::kp_scores_tc<2><<<dim3(np/32,(n+63)/64),128,0,stream>>>(a,start,n,w->ps,stride,p_off);
+            else if(kp_tc==1)fa_pf::kp_scores_tc<1><<<dim3(np/32,(n+63)/64),128,0,stream>>>(a,start,n,w->ps,stride,p_off);
+            else fa_pf::kp_scores_pf<<<dim3(np/32,(n+15)/16),256,0,stream>>>(a,start,n,w->ps,stride,p_off);
+    };
+    // past KP_TILE pools, key tiles with a running top-512 (kpool.cuh kp_select_tile): the same lists, ties included
     auto select = [&](int start, int n) {
-            if(kp_tc==3)fa_pf::kp_scores_tc_stream<2><<<dim3(pstride/32,(n+63)/64),128,0,stream>>>(a,start,n,w->ps,pstride);
-            else if(kp_tc>=2)fa_pf::kp_scores_tc<2><<<dim3(pstride/32,(n+63)/64),128,0,stream>>>(a,start,n,w->ps,pstride);
-            else if(kp_tc==1)fa_pf::kp_scores_tc<1><<<dim3(pstride/32,(n+63)/64),128,0,stream>>>(a,start,n,w->ps,pstride);
-            else fa_pf::kp_scores_pf<<<dim3(pstride/32,(n+15)/16),256,0,stream>>>(a,start,n,w->ps,pstride);
-            fa::kp_select<<<n,fa::SELT,0,stream>>>(a,start,w->ps,pstride);
+            if(pstride<=fa::KP_TILE){
+                score(start,n,pstride,0,pstride);
+                fa::kp_select<<<n,fa::SELT,0,stream>>>(a,start,w->ps,pstride);
+                return;
+            }
+            for(int t0=0,k=0;t0<pstride;t0+=fa::KP_TILE,k^=1){
+                const int nt=std::min(fa::KP_TILE,pstride-t0);
+                score(start,n,fa::KP_TILE,t0,nt);
+                fa::kp_select_tile<<<n,fa::SELT,0,stream>>>(a,start,w->ps,fa::KP_TILE,w->cs[k],w->ci[k],w->cs[k^1],w->ci[k^1],
+                                                             t0,nt,t0+nt>=pstride);
+            }
     };
     if(owner){
         const int lo=flash_pool_owner::begin(a.rows,owner->rank),hi=flash_pool_owner::end(a.rows,owner->rank);
