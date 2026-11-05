@@ -64,13 +64,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <atomic>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include "s2/ds41_sess_drafts.h"
 #include <utility>
 #include <vector>
+#include <unistd.h>
 #include "../knobs-rs/gr8_knobs.h"
 #include "insert_rule.h"
+#include "s2_log.h"
 #include "ngram_lookup.h"
 #include "spec_len.h"
 
@@ -445,17 +449,83 @@ inline std::string ngram_sig(const NgramSrc& s)
     snprintf(b, sizeof b, " ngram %016llx kmax %d kmin %d margin %.17g", (unsigned long long)s.t->digest, s.kmax, s.kmin, s.margin);
     return b;
 }
+// the round log's field lists (s2_log.h). The size check catches most new fields; one that fits in existing padding
+// (a bool after Step::scheduler_decode) does not, so a new field also goes in its list by hand
+template <class V> void fields(V& v, Row& r) { v(r.sess)(r.tok)(r.pos)(r.spos)(r.tgt); }
+template <class V> void fields(V& v, Step& s)
+{
+    v(s.kind)(s.scheduler_decode)(s.event)(s.ev)(s.cls)(s.round)(s.round_active)(s.sess)(s.row0)(s.rows)(s.ctx)(s.r);
+}
+template <class V> void fields(V& v, Session& s) { v(s.prompt)(s.first)(s.chunk)(s.n_gen)(s.dflash)(s.ins); }
+template <class V> void fields(V& v, DflReq& r) { v(r.sess)(r.rows)(r.pos0)(r.tok0)(r.lo)(r.query)(r.phase); }
+template <class V> void fields(V& v, DflDrafts& d) { v(d.tok)(d.lp); }
+template <class V> void fields(V& v, DSelTable& t) { v(t.v)(t.d)(t.m)(t.e)(t.p)(t.g)(t.k)(t.n)(t.w)(t.r); }
+template <class V> void fields(V& v, DSel& d)
+{
+    v(d.on)(d.dwell)(d.margin)(d.probe)(d.d)(d.m)(d.model)(d.tab)(d.rn)(d.rc)(d.an)(d.ag)(d.prior)(d.dn)(d.dt)(d.dc);
+}
+template <class V> void fields(V& v, KStopB& b) { v(b.mode)(b.kmin)(b.tau)(b.widths)(b.explore); }
+template <class V> void fields(V& v, KStop& k) { v(k.mode)(k.kmax)(k.tau)(k.seed3)(k.log)(k.solo)(k.b); }
+template <class V> void fields(V& v, DflReuse& r) { v(r.mode)(r.min); }
+template <class V> void fields(V& v, NgramSrc& n) { v(n.kmax)(n.kmin)(n.margin)(n.log); }   // the table: its digest, logged beside
+static_assert(sizeof(Row) == 20 && sizeof(Step) == 184 && sizeof(Session) == 72 && sizeof(DflReq) == 28 &&
+              sizeof(DflDrafts) == 64 && sizeof(DSelTable) == 144 && sizeof(DSel) == 3136 &&
+              sizeof(KStopB) == (S2N_SLOTS + 1) * 64 + 40 && sizeof(KStop) == sizeof(KStopB) + 56 &&
+              sizeof(DflReuse) == 8 && sizeof(NgramSrc) == 32,
+              "a field is missing from its fields() list (the round log, s2_log.h)");
+
 class Batch
 {
 public:
-    Batch(int K, int max_rows, Hooks h) : K_(K), max_rows_(max_rows), h_(std::move(h)), st_(S2N_SLOTS), stats_(S2N_SLOTS) {}
+    Batch(int K, int max_rows, Hooks h) : K_(K), max_rows_(max_rows), h_(std::move(h)), st_(S2N_SLOTS), stats_(S2N_SLOTS)
+    {
+        if (const auto& path = knob::s2_replay_log())
+        {
+            static std::atomic<int> made{0};   // m4sim builds a Batch per run: PATH.<pid>, then PATH.<pid>.1, ..
+            const int n = made++;
+            const std::string name = *path + "." + std::to_string((long)getpid()) + (n ? "." + std::to_string(n) : "");
+            std::FILE* f = std::fopen(name.c_str(), "w");
+            if (!f) throw std::runtime_error("s2: GR8_S2_REPLAY_LOG: cannot write " + name);
+            logf_ = std::shared_ptr<std::FILE>(f, [](std::FILE* x) { std::fclose(x); });
+            record(f);
+        }
+    }
+
+    // GR8_S2_REPLAY_LOG (s2_log.h): from now on, write every setting, driver call and hook result to f, which round_replay
+    // reads back; after each outermost call, the state the driver reads back (state()). Call it before any other call. A
+    // second call moves the log to f. f stays the caller's to close
+    void record(std::FILE* f)
+    {
+        log_ = f;
+#if G6_MODEL_FLASH
+        const bool flash_cost = cost_.flash;
+        const int flash_tp = S2Cost::flash_tp;
+#else
+        const bool flash_cost = false;
+        const int flash_tp = 0;
+#endif
+        rec("g6s2log", 2, K_, max_rows_, S2N_SLOTS, par_, fresh_spec_, flash_cost, flash_tp, bool(h_.dfl), bool(h_.dfl_start),
+            bool(h_.lp));
+        if (wrapped_) return;
+        wrapped_ = true;
+        if (h_.run) h_.run = [this, run = h_.run](const Step& s) { std::vector<int> t = run(s); rec("run", s, t); return t; };
+        if (h_.dfl) h_.dfl = [this, dfl = h_.dfl](const DflReq& r) { const DflDrafts o = dfl(r); rec("dfl", r, o); return o; };
+        if (h_.dfl_start) h_.dfl_start = [this, f0 = h_.dfl_start](int q) { const int lo = f0(q); rec("dfl_start", q, lo); return lo; };
+        if (h_.lp) h_.lp = [this, lp = h_.lp](int r) { const float v = lp(r); rec("lp", r, v); return v; };
+        if (h_.emit)
+            h_.emit = [this, emit = h_.emit](int q, const int* t, int k, int row) {
+                const bool done = emit(q, t, k, row);
+                rec("emit", q, std::vector<int>(t, t + k), row, done);
+                return done;
+            };
+    }
 
     // Config::mtp_sessions: n > 0 = no drafting while more than n sessions are active. The cap keeps K_ + 1 in its
     // divisor, so a drafting round of mtp_max_sess() sessions always fits max_rows_ (round()'s guard counts sessions).
-    void set_mtp_sessions(int n) { mtp_sessions_ = n; }
+    void set_mtp_sessions(int n) { const Api api_(this, "mtp_sessions", n); mtp_sessions_ = n; }
     // GR8_DS_SESS_DRAFTS=1 (s2/ds41_sess_drafts.h): a shared round of n sessions verifies at most sess_drafts_kv(K, max_rows, n)
     // drafts a session, and sessions draft while that is >= 1 (mtp_sessions_ is not read). Off: unchanged
-    void set_sess_drafts(bool on) { sess_drafts_ = on; }
+    void set_sess_drafts(bool on) { const Api api_(this, "sess_drafts", on); sess_drafts_ = on; }
     int mtp_max_sess() const {
         if (K_ <= 0) return 0;
         if (sess_drafts_) return sess_drafts_max(K_, max_rows_, S2N_SLOTS);
@@ -464,6 +534,7 @@ public:
 
     void admit(const std::vector<int>& qs, const std::vector<Session>& ss)
     {
+        const Api api_(this, "admit", qs, ss);
         if (qs.size() != ss.size()) throw std::runtime_error("s2: admit: slots and sessions differ in count");
         int existing_active = 0;
         for (int q = 0; q < S2N_SLOTS; ++q) if (active(q)) ++existing_active;
@@ -490,6 +561,7 @@ public:
     // pack's membership.
     void admit_packed_tail(const std::vector<int>& qs, const std::vector<Session>& ss)
     {
+        const Api api_(this, "admit_packed_tail", qs, ss);
         if (qs.size() < 2 || qs.size() > S2N_SLOTS || qs.size() != ss.size() || int(qs.size()) > max_rows_)
             throw std::runtime_error("s2: packed tail count/width invalid");
         std::array<bool, S2N_SLOTS> seen{};
@@ -542,10 +614,25 @@ public:
         else { std::vector<int> evs(live.size(), Step::TAIL); chain(live, evs, choose(all)); }
     }
     bool active(int q) const { const St& x = st_[q]; return x.on && !x.done && (int)x.tokens.size() - x.n < x.s.n_gen; }
+    // the round log's state record: per slot what the driver reads back (on, active, finished, length, the committed
+    // tokens' FNV-1a, inserted tokens)
+    std::string state() const
+    {
+        std::vector<unsigned long long> v;
+        for (int q = 0; q < S2N_SLOTS; ++q)
+        {
+            const St& x = st_[q];
+            unsigned long long h = 1469598103934665603ull;
+            for (int t : x.tokens) { h ^= (unsigned)t; h *= 1099511628211ull; }
+            v.insert(v.end(), {(unsigned long long)x.on, (unsigned long long)active(q), (unsigned long long)finished(q),
+                               (unsigned long long)x.tokens.size(), h, (unsigned long long)stats_[q].inserted});
+        }
+        return s2log::line("state", v);
+    }
     // the session's tokens so far, prompt included: its next round writes rows from length - 1 on
     int length(int q) const { return (int)st_[q].tokens.size(); }
     bool finished(int q) const { return st_[q].on && !active(q); }
-    void cancel(int q) { St& x = st_[q]; x.done = true; x.on = false; }
+    void cancel(int q) { const Api api_(this, "cancel", q); St& x = st_[q]; x.done = true; x.on = false; }
     std::vector<int> result(int q) const
     {
         const St& x = st_[q];
@@ -554,12 +641,13 @@ public:
     }
     const Stats& stats(int q) const { return stats_[q]; }
     // choose each round's draft count (k <= K); off: every round verifies K drafts
-    void adapt(bool on) { adapt_ = on; }
+    void adapt(bool on) { const Api api_(this, "adapt", on); adapt_ = on; }
     // a solo DFlash2 round's drafter step runs under the MTP first form (GR8_DRAFT_PAR, which sets the default)
-    void draft_par(bool on) { par_ = on; }
+    void draft_par(bool on) { const Api api_(this, "draft_par", on); par_ = on; }
+    void fresh_spec(bool on) { const Api api_(this, "fresh_spec", on); fresh_spec_ = on; }
     // DFlash2 sessions verify up to kv of the 7 drafts; sl: the plain build's --spec-adaptive policy (sl.on = false: kv)
-    void dflash(int kv, const g6rt::SpecLen& sl) { dkv_ = kv; dsl_ = sl; }
-    void dsel(const DSel& d) { sel_ = d; price(); kstop(ks_); }
+    void dflash(int kv, const g6rt::SpecLen& sl) { const Api api_(this, "dflash", kv, sl); dkv_ = kv; dsl_ = sl; }
+    void dsel(const DSel& d) { const Api api_(this, "dsel", d); sel_ = d; price(); kstop(ks_); }
     const DSel& dsel() const { return sel_; }
     // the drafter choice's tokens per ms of an MTP round and of a DFlash2 round, as next_mtp compares them
     std::pair<double, double> dsel_rates() const
@@ -573,6 +661,7 @@ public:
     // solo MTP rounds' draft count (KStop; mode 2 sets DSel::m's levels and third-position seed, so call it after dsel)
     void kstop(const KStop& k)
     {
+        const Api api_(this, "kstop", k);
         ks_ = k;
         if (ks_.mode != 2) return;
         std::vector<int> lv;
@@ -580,9 +669,10 @@ public:
         sel_.m.set_levels(lv);
         sel_.m.seed[3] = ks_.seed3;
     }
-    void dfl_reuse(const DflReuse& r) { reuse_ = r; }
+    void dfl_reuse(const DflReuse& r) { const Api api_(this, "dfl_reuse", r); reuse_ = r; }
     void ngram(const NgramSrc& n)
     {
+        const Api api_(this, "ngram", n, n.t ? n.t->digest : 0ull);
         if (n.t && (n.kmin < 1 || n.kmax < n.kmin || n.kmax > DFL_B - 1)) throw std::runtime_error("s2: ngram: 1 <= kmin <= kmax <= 7");
         ng_ = n;
         ng_fresh();
@@ -593,6 +683,7 @@ public:
     // The driver calls it while q is the only live session. Inserted tokens waiting for their steps: not this round
     void promote(int q)
     {
+        const Api api_(this, "promote", q);
         St& x = st_[q];
         if (reuse_.mode < 2 || !h_.dfl || !active(q) || x.dfl || x.force >= 0) return;
         for (int o = 0; o < S2N_SLOTS; ++o) if (o != q && active(o)) return;
@@ -611,6 +702,7 @@ public:
     // a second session is resident: every DFlash2 session goes to MTP (the K-1 chain steps), before the next round
     void demote()
     {
+        const Api api_(this, "demote");
         for (int q = 0; q < S2N_SLOTS; ++q)
             if (st_[q].dfl && active(q))
             {
@@ -623,12 +715,13 @@ public:
             }
     }
     // the slot can be admitted again (after finished(q) or cancel(q))
-    void release(int q) { st_[q].on = false; }
+    void release(int q) { const Api api_(this, "release", q); st_[q].on = false; }
 
     // one decode round of every active session: one main step (all rows), one first-form draft step, K-1 chain steps.
     // A session's rows and steps do not depend on which other sessions are in the round (row invariance, A1).
     bool round(const std::vector<int>& order)
     {
+        const Api api_(this, "round", order);
         std::vector<int> act;
         for (int q : order) if (active(q)) act.push_back(q);
         if (act.empty()) return false;
@@ -1208,6 +1301,24 @@ private:
     bool adapt_ = false;
     int dkv_ = DFL_B - 1;
     bool par_ = knob::draft_par().value_or(0) != 0;
+    bool fresh_spec_ = knob::s2_fresh_spec();
+    std::FILE* log_ = nullptr;        // record()
+    std::shared_ptr<std::FILE> logf_; // the GR8_S2_REPLAY_LOG file, when this Batch opened it
+    int depth_ = 0;                   // public calls in progress: only the outermost one is logged (round calls demote)
+    struct Api
+    {
+        Batch* b;
+        template <class... T> Api(Batch* b, const char* tag, const T&... x) : b(b) { if (b->depth_++ == 0) b->rec(tag, x...); }
+        ~Api() { if (--b->depth_ == 0 && b->log_) b->line(b->state()); }
+    };
+    bool wrapped_ = false;            // record() has wrapped the hooks
+    template <class... T> void rec(const char* tag, const T&... x) { if (log_) line(s2log::line(tag, x...)); }
+    void line(const std::string& l)
+    {
+        std::fputs(l.c_str(), log_);
+        std::fputc('\n', log_);
+        if (l.compare(0, 6, "state ") == 0 && depth_ == 0) std::fflush(log_);   // a crash leaves the log whole to the last call
+    }
     g6rt::SpecLen dsl_;
     DSel sel_;
     KStop ks_;
@@ -1283,6 +1394,7 @@ private:
         x.d.assign(std::max({K_, kmax(), 1}) + 1, 0);   // K = 0 (DS41, no draft head): d[1] still exists, never written
         x.dlm.assign(x.d.size(), NAN);
         sl_[q] = g6rt::SpecLen();
+        if (p.dflash && fresh_spec_) dsl_ = fresh(dsl_);   // GR8_S2_FRESH_SPEC
         stats_[q] = Stats();
         x.dfl = p.dflash;
         x.armed = p.ins.on();

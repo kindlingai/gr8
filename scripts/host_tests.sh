@@ -70,6 +70,15 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 # the n-gram table as a draft source (GR8_NGRAM, #56): the table file, chains, the round choice, exact output
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_ngram_test.cpp" -o "$T/batch_ngram_test" "${KNOBS[@]}"
 "$T/batch_ngram_test" 2>/dev/null    # the GR8_MTP_LPLOG case prints its round lines
+# the planner's round log and its replay (GR8_S2_REPLAY_LOG, s2/round_replay.h); GR8_S2_FRESH_SPEC
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_replay_test.cpp" -o "$T/batch_replay_test" "${KNOBS[@]}"
+"$T/batch_replay_test" "$T/replay.log"
+GR8_S2_REPLAY_LOG="$T/env.log" "$T/batch_replay_test"   # the knob set as well: record() moves the log, wraps once
+# the planner's floating-point decisions with and without contracted multiply-adds: both builds must replay the log
+for c in off fast; do
+  g++ -std=c++17 -O2 -Wall -ffp-contract=$c -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/round_replay.cpp" -o "$T/round_replay_$c" "${KNOBS[@]}"
+  "$T/round_replay_$c" "$T/replay.log"
+done
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/ngram_lookup_check.cpp" -o "$T/ngram_lookup_check" "${KNOBS[@]}"
 (cd "$REPO/tools/ngram/tests" && NGRAM_LOOKUP_CHECK="$T/ngram_lookup_check" python3 -m unittest -q test_ngram.ExportTest)
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dflreuse_test.cpp" -o "$T/batch_dflreuse_test" "${KNOBS[@]}"
@@ -280,6 +289,21 @@ g++ -std=c++17 -O2 -Wall "$REPO/engine/runtime/tests/pf_peer_stage_test.cpp" -o 
 "$T/pf_peer_stage_test"
 g++ -std=c++17 -O2 -I "$REPO/engine/kernels" "$REPO/engine/tests/test_topk.cpp" -o "$T/test_topk" "${KNOBS[@]}"
 "$T/test_topk"
+# DS41 S2 host tests: prefill admission, its two lanes, 32-session steps, the 32-session 64K config, the DSpark round
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" -I "$REPO/engine/comms" "$REPO/engine/runtime/s2/tests/ds41_prefill_test.cpp" -o "$T/ds41_prefill_test" "${KNOBS[@]}"
+"$T/ds41_prefill_test"
+for t in ds41_prefill_lanes_test ds41_s32_step_test s32_64k_mtp8_test batch_ds41_dspark_test; do
+  g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" -I "$REPO/engine/runtime/s2" -I "$REPO/engine" "$REPO/engine/runtime/s2/tests/$t.cpp" -o "$T/$t" "${KVLIB[@]}"
+  "$T/$t" > "$T/$t.out" 2>&1 || { cat "$T/$t.out"; exit 1; }
+done
+# the S2 layer in the Flash build's shape (s2_batch.h's Flash cost model, its slot count): the model-generic tests again
+for t in batch_dflash_test batch_dflreuse_test batch_draftpar_test batch_dsel_test batch_dselmodel_test batch_insert_test \
+         batch_kstop_test batch_kstopb_test batch_kstop_mtp_test batch_ngram_test batch_round_test batch_replay_test \
+         driver_grow_test driver_prefill_quantum_test scheduler_fair_test scheduler_rounds_test scheduler_r_test \
+         scheduler_tail_first_test cp_rows_test grammar_request_test kv_plan_test; do
+  g++ -std=c++17 -O1 -Wall -pthread -DG6_MODEL_FLASH=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/$t.cpp" -o "$T/flash_$t" "${KVLIB[@]}"
+  (cd "$T" && "$T/flash_$t" > "$T/flash_$t.out" 2>&1) || { cat "$T/flash_$t.out"; echo "flash build: $t failed"; exit 1; }
+done
 # the control channel: sync and idle peers (the socketpair cases; the silent-peer case needs a network
 # namespace)
 for t in control_sync_test control_idle_test; do

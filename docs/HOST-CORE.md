@@ -1,0 +1,313 @@
+# One host core, per-model GPU modules
+
+Status: R0 in progress. Inventory taken at 35a8f1c; reviewed against the code by a second pass.
+
+## Why
+
+The engine binary is a compile of `engine/runtime/g6m4.cu` per model (GLM-5.3, GLM-5.3-Flash, DeepSeek-V4.1-Flash), per
+TP width and per build variant (int4 KV, `DS41_MX`, the DS41 trunk). Every compile carries the whole program: option
+parsing, bootstrap, the S2 service, the scheduler, the KV pool and the loader, as well as the kernels.
+`build_m4.sh` then hides each width's copy from the others with `ld -r` and `objcopy`, and `scripts/build.sh` makes one
+binary per model.
+
+Only the kernels and the code that sizes and launches them need the model and the width at compile time. The rest
+reads them as constants because it happens to be compiled in the same translation unit. The result:
+
+- The host logic exists once per model, width and variant. The host tests compile it with a model flag chosen per
+  test: most with none (the GLM shape), five with `-DG6_MODEL_DS41=1` (`scripts/host_tests.sh:90,118,122,215,267`), none
+  of the S2 layer with `-DG6_MODEL_FLASH=1`, so the Flash cost table at `s2_batch.h:196` is never compiled on the host.
+- What a model must provide is not written down anywhere. It is spread over about 72 model `#if`s in `g6m4.cu` and 85
+  in `engine/runtime/*.cuh` (52 of them in `rank.cuh`), and three serve adapters of different shapes.
+- Two tests (`engine/tests/test_flash_serve_check.py`, `test_flash_serve_prefill_check.py`) cut code out of
+  `flash_native.cuh` as text, because that code only exists inside nvcc. The GLM pool and bind wiring
+  (`g6m4.cu:3057-3323`) has no unit test.
+- Settings that must agree across ranks live in hand-built signature strings (`g6m4.cu:1919`, `2186-2191`, `3459`).
+
+## Target
+
+```
+g6m4 (one binary)
+├── host core        Rust, compiled once, plus a small C++ main and the fabric
+│   options and knobs, bootstrap, fabric plan, the S2 service, scheduler, sessions, planner, driver,
+│   KV pool (kvman-rs), tier and checkpoint indexes, loader planning (loader-rs), logging, signatures
+│   reads the model and width as data: ModuleInfo
+└── GPU modules      nvcc, one per (model, width, variant)
+    kernels, attention, MoE, device buffers, step graphs and their capture, prefill, drafters
+    behind one C table: ModuleOps
+```
+
+The core picks a module by `--model` and the width (`--ips` count), as `widths.cpp` picks a width today. Inside a module
+`NR`, `MX` and the geometry stay `constexpr`, so kernels are unchanged.
+
+### ModuleInfo
+
+What the core needs to know about a module, filled from the module's constants:
+
+- model id and name, architecture, layer count, hidden size, vocabulary, top-k
+- `nr`, `mx` (rows a step), `s2n` (session slots in `S2In`), session slot limit
+- KV: row bytes and name (`g6kv::ROW`, `g6kv::NAME`), page size, Flash KDA state size
+- drafting: MTP depth, DFlash2 (block, window, which widths), DSpark
+- capabilities: prefix park, Flash checkpoints, grammars, `GR8_PF_OWN=4`, relaxed accept, Engram
+- the fabric plan: collective count and slot bytes per fabric, port offset and proxy CPU, in bring-up order. It is a
+  function of the module and the knobs (`GR8_DS_PF_LANES`, `GR8_PF_OWN`, `GR8_GLM53F_PF_POOL_OWNER` change it), because
+  each `Fabric::init` is its own TCP rendezvous on `port + offset` (`comms/fabric.cpp:100-110`) and the order of those
+  calls is part of the contract across ranks
+- the runtime-signature fragment for every compile-time choice the module was built with
+
+### ModuleOps
+
+One C table per module, null for unsupported, as `G6AttnOps` (`attn/ops.h:15-39`) does today. There are four hook
+layers now: `NativeHooks` (`s2/service.h:62-99`), `DispatchHooks` (`s2/dispatch.h:28-52`), `DriverHooks`
+(`s2/driver.h:21-60`) and `s2::Hooks` (`s2_batch.h`). Only `DispatchHooks` and `bind`, `grown`, `retire`,
+`fence`, `shrink`, `resize`, `before_work`, `drained` and `flash_room` are module calls. `emit`, `prompt`, `round`,
+`terminal` and `settle` are callbacks between host layers and stay out of the table.
+
+| Call | Contract |
+|---|---|
+| `abi_version()` | the core refuses a module built against another version |
+| `info()` | the ModuleInfo above |
+| `boot(args, &m)` | device image from the loader's binding table, fabrics from the core, graph capture |
+| `pool_geometry(m)` | pages, `place`, `below`, slot pages, tier pieces |
+| `bind`, `grown`, `shrink`, `retire`, `fence` | write a slot's run into the main and draft tables; no pool policy |
+| `mode(old, new)`, `bucket(draft, ctx)` | solo/batched switch; graph bucket for a context |
+| `step_sizes(kind, M)` | per-step collective sizes (computed in four places in `g6m4.cu` today) |
+| `launch(view)` | one MAIN, DRAFT or CHAIN step: `StepIn` in, tokens and the error word out |
+| `prefill(view)` | one quantum, single or packed, with its sequence number |
+| `logprob`, `draft_lp`, `grammar_mask` | per-row read-backs |
+| `dfl_start`, `dfl_ok`, `dfl` | DFlash2, optional |
+| `dspark_round` | DSpark, optional |
+| `snapshot`, `restore`, `tier_copy` | byte movers for prefix park, Flash checkpoints and KV tiers; the indexes stay in the core |
+| `resize`, `flash_room`, `errors`, `shutdown` | |
+
+### Boundary types
+
+One common header holds what crosses the table:
+
+- `StepIn`, `StepOut`, `glue::SampleRow`: sized to the largest `MX` (48), every field present. The Flash and DS41 fields
+  add about 0.6 KB.
+- `S2In` stays per module. It is a device struct that kernels copy into shared memory (`s2_in.h:34-41`), so fixing it
+  at 32 slots would change GLM's kernels. The core needs only the host session limit, from `ModuleInfo`, and treats
+  `S2In` as an opaque buffer of `2 + 5 * s2n` words.
+- `DflIn`/`DflOut`, `Grant`/`Run`, the prefill views.
+- `g6rt::Model` (`rank.cuh:417-589`) splits: the host-set fields become a `ModelConfig` passed to `boot`, and the rest
+  stays inside the module as an opaque handle. `StepCtl`, `Layer`, `Draft`, `Prefill`, `S2Model` never cross.
+
+## Inventory
+
+Classes: H = host behaviour that becomes data or a trait, L = host-side sizing, graph or buffer planning that moves into
+the module, D = device code, S = already shared and model-free.
+
+### g6m4.cu
+
+All of it after line 156 is one `main()`; sections share locals through lambdas.
+
+| Lines | Section | Class |
+|---|---|---|
+| 156-577 | flags, option checks, DS41 checks, `--check-args` | H (model flags, spec defaults, session defaults) |
+| 579-675 | row counts to capture, `NC`, collective order, grammar and QP checks | L, H |
+| 677-1160 | fabric bring-up (main, DS41 W runs and lane B, prefill, Flash pool-owner and router-split, draft, DSpark, DFlash2, QP at TP4) | L; the drafter knobs (990-1106) are H |
+| 1191-1311 | weight load and build | load S, build L |
+| 1312-1619 | steering, drafts, prefill and DFlash2 build, S2 init, `prepare` | L |
+| 1726-1906 | graph tables, `launch_main`, capture | L |
+| 1908-2121 | Flash serve | H + L |
+| 2122-2644 | DS41 serve, W-row prefill hook, lane B | H + L + D |
+| 2645-3550 | GLM serve: `RunPool`, `KvTiers`, `NativeDispatch`, `Service` | H (inside the GLM branch) + L |
+| 3552-4001 | offline prompt loop | L |
+
+Of 59 grouped blocks: H 25, L 28, S 2, and 6 that mix L with device calls. The file launches no kernel directly, but
+it launches captured graphs (`g6m4.cu:1781`) from graph tables that are `main()` locals (1726-1751). Besides `NR` (46
+uses) it reads `MP` 83 times, `HID` 38 and `NL` 33 (`model_geom.h:25-33`).
+
+### engine/runtime headers
+
+- Stay as they are: about 40 pure host headers, among them `serve.h`, `grammar.h`, `insert_rule.h`, `ngram_lookup.h`,
+  `ctx_lookup.h`, the steering headers, `flash_kv.h` and the small DS41 headers. `ds41_lanes.h` already takes `NR` and
+  `MX` as arguments and is the model to copy.
+- Need geometry or width as data: `s2_batch.h` (`S2N_SLOTS`, the Flash `S2Cost` reading `G6_NR`), `spec_len.h`,
+  `ds41_ops.h`, `ds41_dspark.h`, `ds41_pf_split.h`, `ds41_slots.h`, `ds41_rowshard.h`, `qp_wire.h`.
+- Split into a host half and a module half:
+  - `rank.cuh` (2,833 lines; 31 Flash, 22 DS41, 48 `NR`). Its speculation loop (`Plan`, `step_inputs`, `plan_rows`,
+    `mtp_sequence`, `rank.cuh:2485-2800`) serves only the offline `--prompt` loop and `m4sim`; the serving planner is
+    `s2::Batch`. `build`, `launch_step`, graph capture and the kernels (`rank.cuh:747-2160`) stay in the module.
+  - `s2.cuh`: page-list arithmetic (`s2_run_list`, `s2_check_pages`, `s2_list_place`, `s2_cp_map`) to the core;
+    `s2_set_pages` and the page kernels behind `bind`/`tier_copy`.
+  - `prefill.cuh`: `pf_slot_bytes`, `pf_perm_order` and `pf_env_check` already take `nr` and go to the core; the TP4-only
+    stubs become a capability.
+  - `dflash.cuh`: meta parsing and checks to the core; the replicated-versus-split body (`OK_NR`, `REP`) stays
+    compile-time in the module.
+  - `rt_rows.cuh`: lease and eviction policy to the core; gathers and spills in the module.
+  - `packfind.h`: the planning is already Rust (`g6l_ds41_plan`, `g6l_release_plan`, called at `packfind.h:225-233`).
+    What is left in C++ is `RsSink` (pinned staging and device copies, `packfind.h:98-173`) and the `Find` map, which are
+    module material.
+  - `steering_boot.cuh`, `reuse_hdump.cuh`, `weight_check.cuh`: small, same pattern.
+- Move whole into modules: `flash_step.cuh`, `ds41_step.cuh` (already included under `#if` at `rank.cuh:2821-2828`),
+  `flash_prefill.cuh`, the `flash_dsa*`, `qo_weights.cuh`, `qp.cuh`, the DS41 ops headers.
+
+### engine/runtime/s2
+
+- Already model-free host code: bootstrap, control, ingress, trace, resources, `pool.h`, `kv_plan.h`, `kv_share.h`,
+  `cp_rows.h`, `flash_lend.h`, `flash_ring.h`, `flash_checkpoint.h`, `driver.h`, `service.h`, and the DS41 step-layout
+  and lane logic.
+- Compile-time model switches in host code: `scheduler.h` (`MAX_SESSIONS` 32 or 8; DS41-only rules in
+  `Config::validate`), `sessions.h` (`ds41_decode_prompt`), `dispatch.h` (DSpark row keys), `s2_in.h` (`S2N`).
+- Host code with CUDA calls, needing a module call each: `kv_tier.cuh`, `flash_checkpoint.cuh`,
+  `ds41_prefix_cache.cuh`, `ds41_dspark_round.cuh`.
+- The three adapters differ in shape:
+
+  | | GLM `native.cuh` | Flash `flash_native.cuh` | DS41 `ds41_native.cuh` |
+  |---|---|---|---|
+  | entry | `NativeDispatch::hooks()`, dispatch hooks only; the pool and bind wiring is in `g6m4.cu` | `serve_flash()` builds every hook and runs `Service` | `serve_ds41()` builds every hook and runs `Service` |
+  | prefill | `begin_prefill`/`end_prefill` on two `Prefill`s | `dispatch.prefill`, checkpoint variant | `prefill_seq`, `prefill_pack_seq` |
+  | drafter | MTP, DFlash2 | MTP, DFlash2, borrow-idle | DSpark |
+  | KV | paged pool, tiers, CP rows | paged pool, KDA slots, checkpoints | a slab per slot, prefix snapshots, park |
+
+### kernels, attention, build, launcher
+
+- The attention triples (`attn.cu`/`bind.cu`/`ops_glm.cu` and the Flash and DS41 equivalents) are separate compile
+  units already and are module material as they stand. Everything in `engine/kernels/*.cuh` is header-only and compiles
+  inside `g6m4.cu`.
+- Compile-time choices that stay inside modules: `G6_NR`, `G6_MX`/`DS41_MX`, `G6_KV4`, `G6_FLASH_KV_FP8`,
+  `DS_MHC_TRUNK_BF16`, `PF_F12`, `PF_FC2GL`, `G6_CP`, the `DEC_*` flags. TP4-only types (`QpW`, `QpRoll`, `QpWire`,
+  `Prefill::qp*`) change struct layouts by width, which is fine inside a module.
+- The launcher picks a binary per model (`tools/launch/models.py`, `supervisor.py` `engine_bin`), finds engines by
+  process name (`ENGINES`), and hashes `bin/<engine>` and `bin/lib` into `engine_build`, which ranks compare at the
+  handshake. Modules must join that hash.
+- `m4sim.cu` (2,529 lines, 32 model `#if`s) repeats much of `g6m4.cu` and drives `s2::Batch` directly, not `Service`.
+
+## Sequence
+
+The host core is written in Rust, one piece at a time, each piece chosen so that moving it removes a coupling (a model
+`#if`, a compile-time width or geometry use in host code, a host and device mix, a duplicated block) rather than only
+translating code. The pattern is the one `knobs-rs` uses: a static library with a generated C header, `#[repr(C)]`
+structs mirrored by a C++ `static_assert` on size (as `s2_in.h:30` does). Anything that takes a `cudaStream_t` stays C++.
+
+Each step is one PR. Each keeps serving output the same, checked three ways: host tests (ported to Rust where the code
+moved), a replay of logged rounds (R0), and on the cluster one fresh boot per model with T=0 replies compared for the
+first request of the boot only (later requests can differ under `--spec-adaptive`; see `tools/ngram/README.md`), plus a
+`bench/bench.py` gate.
+
+### R0. Guard rails
+
+1. Whole-session T=0 comparisons: `GR8_S2_FRESH_SPEC=1` restarts the adaptive verify-width estimates with every request.
+   With `GR8_DFL_REUSE=0`, prompts that share no prefix (a prefix hit gives the drafter only the suffix), the drafter
+   choice on, and DS41's park and prefix snapshots off, every request's T=0 reply is independent of the ones before it,
+   and one boot per side compares a whole prompt set (`docs/TESTING.md`, "A cluster"). The reference replies per model
+   are recorded on a cluster boot.
+2. The model-generic S2 host tests also built with `-DG6_MODEL_FLASH=1` (`scripts/host_tests.sh`).
+3. A round-replay log: `GR8_S2_REPLAY_LOG=PATH` makes each rank's planner write its settings, every driver call and
+   every hook's request and answer (the `round` and `prompt` hooks return nothing and are not logged), and after each
+   outermost call the per-slot state the driver reads back, to `PATH.<pid>` (`s2_log.h`; the field lists sit beside
+   each struct in `s2_batch.h`, with a size check for most fields left out). `engine/runtime/s2/tests/round_replay`
+   reruns the planner from a log and checks every step it asks for and every state it leaves (`s2/round_replay.h`). This is the guard that sees
+   planner changes after the first round, which a first-request T=0 check cannot.
+4. A floating-point check: `scripts/host_tests.sh` replays a log with `round_replay` built with `-ffp-contract=off` and
+   with `-ffp-contract=fast`. A log from a serving boot gets the same check before R3.
+5. The in-tree tests nothing built (`s2/tests/ds41_prefill_test.cpp`, `ds41_prefill_lanes_test.cpp`,
+   `ds41_s32_step_test.cpp`, `s32_64k_mtp8_test.cpp`, `batch_ds41_dspark_test.cpp`) are built; two needed fixes for
+   fields added since they were written (steering slots, a loaded steering profile). The dead `s2/v1_state.h` is gone.
+
+### R1. ModuleInfo
+
+The module exports a `#[repr(C)] ModuleInfo` filled from its constants: model id, `nr`, `mx`, `s2n`, hidden size,
+layers, `MP`, vocabulary, top-k, KV row bytes and name, page size, drafting limits, capabilities, and the model traits
+the scheduler and sessions branch on today. It comes first so that later steps read traits from one place instead of
+growing a second mechanism. Still one build per model.
+
+### R2. Scheduler and sessions to Rust (`engine/s2core-rs`)
+
+Moves `s2/scheduler.h`, `sessions.h`, `kv_plan.h`, `kv_share.h`, `cp_rows.h`, `flash_lend.h` and `flash_ring.h` (about
+1,300 lines, integer logic). The boundary is `#[repr(C)]` `Key`, `Slot`, `Run`, `Grant`, `Shrink`, `Resize`, `Quantum`,
+`Config` and `g6s2_sched_*` calls. It removes `MAX_SESSIONS` (`scheduler.h:18-21`), the DS41 rules in
+`Config::validate`, `ds41_decode_prompt` (`sessions.h:123`) and the DSpark row keys (`dispatch.h:149`) in favour of
+`ModuleInfo` traits. The pool becomes Rust to Rust, so `s2/pool.h` (218 lines of FFI) goes away. Proof: the
+scheduler, driver and pool host tests ported, and a differential run of the C++ and Rust versions on the command log
+(same `Quantum` sequence and pool digest, which ranks compare at `service.h:499`). One C call per round.
+
+### R3. The planner to Rust
+
+Moves `s2_batch.h` (about 1,500 lines), `spec_len.h`, `insert_rule.h`, `ngram_lookup.h` and `ctx_lookup.h`. The boundary is
+`g6s2_batch_round(order)` with the module's `run`, `lp` and `dfl` as C callbacks. It removes `S2N_SLOTS`
+(`s2_batch.h:181-185`), the Flash `S2Cost` and `SpecLen::flash_cost` `#if`s and the static `SpecLen`. This is the one
+step that can change T=0 output: the replay must reproduce every `Step` bit for bit across whole sessions, the R0
+floating-point check must have passed, and `exp` comes from the platform libm. Gate it hardest.
+
+### R4. The driver to Rust
+
+`s2/driver.h` is glue between R2, R3 and the hooks; after them it is Rust to Rust plus the module callbacks (`grow`,
+`prefill`, `prefill_pack`, `dfl_*`). Small.
+
+### R5. Service, control, bootstrap and ingress to Rust; ModuleOps
+
+Moves `service.h`, `bootstrap.h`, `control_*.h`, `ingress.h`, `trace.h`, `event_gate.h` and `resources.h`;
+`frontend/pseudo-engine/src/s2.rs` already implements the S2 file protocol in Rust and can be lifted. `ModuleOps` is
+born here as the module-facing subset of `NativeHooks` and `DispatchHooks`. Each adapter's `std::function`s become
+`extern "C"` trampolines over the same lambdas, so no device code moves. Most of the work is building the context
+struct those lambdas need: today they capture `main()` locals by reference (`g6m4.cu:3057-3323` captures the pool, the
+tiers, the model, the draft, the fabric and the step buffers). Consider two PRs: bootstrap and control, then compute.
+
+### R6. Options, signatures and the fabric plan to Rust
+
+Moves `g6m4.cu:156-577` (about 20 model `#if`s, spec defaults, `--check-args`), the signature builders (`g6m4.cu:1919`,
+`2186-2191`, `3459`) and the planning half of `677-1160` as a `#[repr(C)] FabricPlan` (per fabric: port offset, proxy
+CPU, collective count, slot bytes, first run, pool), computed from `ModuleInfo` and the knobs. C++ `fabric_bring_up(plan)`
+creates the `Fabric`s in plan order. The DS41 plan headers (`ds41_ops.h`, `ds41_pf_split.h`, `ds41_slots.h`,
+`ds41_rowshard.h`, `ds41_lanes.h`) and `qp_wire.h` port here as pure functions of `(nr, mx, hid, nl)`. Proof:
+`--check-args` on the launcher's argument lists per model, signature strings compared byte for byte with today's over a
+knob matrix, one boot per model.
+
+### R7. Step sizes
+
+One Rust `step_sizes(kind, M)` per model replaces the four copies of the collective-size code (`g6m4.cu:2214, 2878,
+3839, 3950`) and the draft and DSpark ones, calling the C++ `enqueue_step`. The DS41 sizes include reduce-scatter and
+row-shard math over `Fabric::Rs` and `CollMask` (`fabric.h:99-107, 276`, `g6m4.cu:2304-2324, 2458-2476, 2589-2603`),
+which need a C layout. Per step, so measure.
+
+### R8. Adapter host halves, one PR per model (GLM, Flash, DS41)
+
+GLM first: `NativeDispatch::hooks()` (`native.cuh:468`) is already the device side, and its pool and tier wiring
+(`g6m4.cu:2645-3550` without `NativeDispatch`) is host code over a Rust pool. Then the `KvTiers` index
+(`kv_tier.cuh:153-225`; the byte movers stay), the Flash checkpoint index (`flash_checkpoint.h`; `pages`, `state` and
+the IO stay in the `.cuh`), and the DS41 prefix-cache policy (`ds41_prefix_cache.cuh:52-330`; its nine CUDA calls become
+`snapshot` and `restore`). The text-scraping Flash tests retire here.
+
+### R9. Leftovers
+
+The loader hands each module a binding table of (name, offset, bytes); `RsSink` and `devimage.cpp` stay C++. The offline
+prompt loop (`g6m4.cu:3552-4001` with `rank.cuh:2485-2800`) is deleted in favour of `m4sim` or ported last. `m4sim`
+becomes the core over a simulated fabric, so it runs the same service as `g6m4`.
+
+### R10. One compile
+
+The core is a Rust static library and a C++ `main` of about 200 lines. Modules compile per (model, width, variant) with
+today's `ld -r` and `objcopy` localization; the core selects one by `--model` and width. `scripts/build.sh` makes one
+`g6m4`, the launcher passes `--model` instead of choosing a binary, and `engine_build` hashes the one binary. CI builds
+modules on separate jobs and links once. Modules as shared objects loaded at boot (`RTLD_LOCAL`, hidden visibility)
+can follow; `engine_build` then hashes every module file.
+
+### What stays C++ and CUDA
+
+`rank.cuh:747-2160` (build, bind, launch, capture), the `s2.cuh` page kernels and `s2_set_pages`, `prefill.cuh`, the
+`dflash.cuh` bodies, the `rt_rows.cuh` gathers, `flash_step.cuh`, `ds41_step.cuh`, `attn/`, `kernels/`,
+`NativeDispatch` (`native.cuh:152-486`, which owns streams and graphs), the fabric and its proxy (`comms/fabric.cpp`;
+`kvman-rs/src/remote/verbs.rs` shows Rust verbs are possible later), `devimage.cpp`, `grammar.cc` (XGrammar), and the
+byte movers in `kv_tier.cuh` and `flash_checkpoint.cuh`.
+
+### How much moves
+
+An estimate from line counts: about 8,000-9,000 lines of C++ host code move to Rust (the `s2/` host headers about
+4,000, `s2_batch.h` and `spec_len.h` 1,630, about 2,500 of `g6m4.cu`'s 4,106, the plan headers about 600). About 55-60 of
+`g6m4.cu`'s model `#if`s go (flags, serve wiring, signatures), and all 10 in `s2/`, `s2_batch.h`, `spec_len.h` and
+`s2_in.h`. The 85 in `engine/runtime/*.cuh` stay and become internal to modules. Left as host-side C++: about 1,600
+lines of `g6m4.cu` (weight load, build, capture, the device halves of the adapters) and `m4sim.cu` until R9.
+
+## Open questions
+
+- Whether the planner's floating-point decisions survive the port unchanged (R0.4, R3).
+- Which variants stay: int4 KV, `DS41_MX` 40/48, the FP32 DS41 trunk. Each one kept is another module per width.
+- Static state that must be per module or per process: `s2_tl()` (`native.cuh:114`, read from the GLM hooks at
+  `g6m4.cu:3414-3424`), `EvProf` (`rank.cuh:680`), `made` (`rank.cuh:1822`), `Ds41PrefixCache::live()` (read at
+  `g6m4.cu:4091-4100`), the static `SpecLen` in `S2Cost`, function-static knob caches (the C++ knob header becomes
+  module-only), about 370 `__device__` globals.
+  The device globals are fine per module; the host singletons must move to the core or into the module handle.
+- The fabric plan must reproduce today's order of `Fabric::init` calls and port offsets exactly, for every knob
+  setting that changes it, and keep `capture_barrier` (`bootstrap.h:222`) after capture.

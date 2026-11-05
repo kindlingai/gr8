@@ -388,11 +388,21 @@ static void check_plan()
 }
 
 // g. Sessions + Dispatch (+ Driver), as service.h wires them
+// a synthetic loaded steering profile (slot 0): a steering request must name one (sessions.h bind)
+static g6rt::steering::BootConfig steer_boot()
+{
+    g6rt::steering::BootConfig b;
+    b.loaded = true;
+    b.profiles.push_back({"example", {}, {}, 2});
+    for (unsigned i = 0; i < 32; ++i) { b.profiles[0].profile_digest[i] = uint8_t(i); b.profiles[0].schedule_digest[i] = uint8_t(63 - i); }
+    return b;
+}
 static g6rt::ServeReq serve_req(size_t n, int plp = -1, bool steering = false, int n_gen = 12)
 {
     g6rt::ServeReq r;
     for (size_t i = 0; i < n; ++i) r.prompt.push_back(int(i * 7 % 1000));
-    r.n_gen = n_gen; r.plp = plp; r.steering.enabled = steering;
+    r.n_gen = n_gen; r.plp = plp;
+    if (steering) r.steering = steer_boot().selected(0x3f800000u, 0);
     return r;
 }
 static Config w_cfg(uint32_t W = 1024)
@@ -596,7 +606,9 @@ static void check_path()
     }
     for (const auto& q : {std::make_pair(5, false), std::make_pair(-1, true)})
     {   // prompt logprobs / steering: the decode path even with prefill_min 64
-        Rank r(w_cfg(W), 64, W);
+        Config c = w_cfg(W);
+        if (q.second) c.steering = steer_boot();
+        Rank r(c, 64, W);
         r.admit(1, serve_req(3000, q.first, q.second));
         r.drain();
         CHECK(r.fab.chunks.empty() && r.fab.ev[0].kind == 'M' && r.fab.ev[0].pos0 == 0);
