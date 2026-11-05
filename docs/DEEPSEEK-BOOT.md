@@ -29,10 +29,10 @@ one to choose its settings.
   one to plan disk for. The published release is 510.60 GB over 604 files: 307.79 GB of weights and metadata, plus
   202.81 GB of Engram table parts.
 - **Every Engram part file must be present.** The two tables are sharded into 23 parts each
-  (`dense/exlr8-split-001.engram.embed.p000…p022.safetensors`, and the same for `-014`), 4.43 GB a part, 46 files in
-  all. The loader scans them from `p000` and **stops at the first one missing**, then adds up the row counts of every
-  part it found to work out the table's size before it splits that by TP
-  (`engine/loader-rs/src/ds41.rs:278-285`, `:930-948`). So a box missing `p000` finds no table at all, and a box
+  (`dense/exlr8-split-001.engram.embed.p000…p022.safetensors`, and the same for `-014`), 46 files in all — 4.43 GB a
+  part, except `p022` of each table, which is 3.94 GB. The loader scans them from `p000` and **stops at the first one
+  missing**, then adds up the row counts of every part it found to work out the table's size before it splits that by
+  TP (`engine/loader-rs/src/ds41.rs:278-285`, `:930-948`). So a box missing `p000` finds no table at all, and a box
   holding only some of the parts computes the wrong shard and reads the wrong rows. **Do not delete, skip or truncate
   part files to save space.**
 
@@ -50,7 +50,7 @@ one to choose its settings.
   own. Fetching whole files for one rank's run plus the other files saves far less than it looks: 360.95 GB for
   rank 0, and more for ranks 1 and 2.
 
-  Our own boxes measure 133.70 GiB (143.55 GB) each — 77.00 GiB routed experts, 56.66 GiB dense, and 50.74 GB of
+  Our own boxes measure 133.69 GiB (143.55 GB) each — 77.00 GiB routed experts, 56.66 GiB dense, and 50.74 GB of
   Engram rows. That is a **measurement of a sparse-staged copy**, not what downloading gives you: every one of the 46
   part files is there with its real header and logical size, and only the byte ranges that rank reads were ever
   written, so `du` reads 143 GB where `du --apparent-size` reads 510 GB. We have no public tool that stages a copy
@@ -127,8 +127,9 @@ OpenAI-compatible API on port 8100.
     EXTRA_ENV="GR8_DS_ENGRAM=1 GR8_DS_ENGRAM_PREFIX=/opt/gr8/engram/ds41"
 
 No `DRAFTER` line and no `--variant`: the release has no width variants. `MODEL_CACHE` is where a box puts its part of
-a Hugging Face `MODEL`; a local release is read where it lies. Boxes cabled without a switch add `SHAPE=ring`, in cable order. `./gr8 ds41 show-config` prints every value
-and where it came from, and `./gr8 knobs` lists every option.
+a Hugging Face `MODEL`; a local release is read where it lies. Boxes cabled without a switch add `SHAPE=ring`, in
+cable order. `./gr8 ds41 show-config` prints every value and where it came from, and `./gr8 knobs` lists every
+option.
 
 ## 4. Boot and check
 
