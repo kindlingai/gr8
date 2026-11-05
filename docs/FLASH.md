@@ -77,7 +77,8 @@ prefill sends none, so a prefill longer than that fails.
 `--tp 1` serves the whole model on one GB10 with the k2 width (about 93 GB of weights on the device). The ranks' fabric
 has no peers then: `g6::Fabric` keeps its region for the kernels' own slots and skips the NIC, the bootstrap and the
 proxy (`engine/comms/fabric.cpp`), and the S2 head agrees with itself (`s2/control_channel.h`). The launcher skips the
-RDMA checks. The router is not split (no ranks to split it over), so the routed experts run on the expert tiles.
+RDMA checks. The router is not split (no ranks to split it over), so the routed experts run on the expert tiles. A session alone
+drafts with the DFlash2 drafter when the boot has one (`--drafter`): its body is whole on the one rank, about 1.3 GB.
 
 ## Several sessions
 
@@ -195,9 +196,10 @@ Limits:
 ## Not yet
 
 - CP and prefix reuse: the engine refuses them under `--serve`. `GR8_GLM53F_CACHE=aligned` (above) is the
-  experimental Flash form of prefix reuse, and it refuses DFlash2. The DFlash2 drafter's taps are the mean of the four
-  mHC streams after each tapped layer, in decode steps and in the prefill, which keeps the last 2,048 prompt positions
-  for the drafter's prompt context. DFlash2 at TP=2 and TP=3 runs offline only.
+  experimental Flash form of prefix reuse. With DFlash2 it takes aligned checkpoints only: a hit whose prefill skips
+  part of the drafter's prompt window (the last 2,048 prompt positions, whose taps the prefill keeps) decodes that
+  request on MTP. The taps are the mean of the four mHC streams after each tapped layer, in decode steps and in the
+  prefill. DFlash2 at TP=2 and TP=3 runs offline only.
 - The int4 KV build.
 - The vision tower: the engine serves text, and the fetch skips `dense/vision-*`.
 - A 262K prefill's time and memory headroom on a GB10: the `CAP` above is computed, not measured.
