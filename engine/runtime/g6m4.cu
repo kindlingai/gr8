@@ -1280,6 +1280,8 @@ int main(int argc, char** argv)
 #if G6_MODEL_FLASH
     if (mtp || dfl) m.kda_ring = std::max(mtp + 1, dfl ? dfl::B : 0);   // KDA state slots for the verify ring (DFlash2: B rows)
     if (s2mode) m.kda_sessions = s2sess;   // each S2 session its own ring (s2/flash_ring.h FlashSlots)
+    // only session 0 drafts with DFlash2 (dfl_ok), so only its ring is B wide; the others hold an MTP round
+    if (s2mode && mtp) m.kda_ring_rest = mtp + 1;
 #endif
 #if G6_MODEL_FLASH
     // Flash prefill (flash_prefill.cuh): the P1 bodies run the decode blocks in MX-row chunks, so the decode bindings
@@ -2020,7 +2022,8 @@ int main(int argc, char** argv)
                 }
                 prefill(sl, p, first, rows);
             };
-            h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1; };
+            // session 0 alone has the DFlash2 ring (FlashSlots first): a request alone on another session decodes on MTP
+            h.dispatch.dfl_ok = [&](int q) { return (q == 0 || m.kda_ring_rest >= dfl::B) && (dfl_owner == q || slot_prompt[q] == 1); };
             h.dispatch.dfl_start = [&](int q) {     // the prefill's taps -> the drafter's context ring, 8 rows a fill step
                 if (dfl_owner != q || DF.pf_hi <= DF.pf_lo) return (int)slot_prompt[q] - 1;
                 for (int c0 = dfl_from; c0 < DF.pf_hi; c0 += dfl::B)

@@ -23,6 +23,11 @@ inline flash_mhc::Weights mhc_weights(const Find& find,int layer,const char* blo
 }
 // W3/W4/W5 allocate and bind outside graph capture. Every main-model layer
 // owns an attention error word, including KDA layers (which leave it zero).
+// KDA state slots: session 0's ring (kda_ring) and the other sessions' (kda_ring_rest, else kda_ring); s2/flash_ring.h
+inline int flash_kda_slots(const Model& m){
+    const int r=std::max(1,m.kda_ring),s=std::max(1,m.kda_sessions);
+    return r+(s-1)*(m.kda_ring_rest?m.kda_ring_rest:r);
+}
 inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find& find,int capacity,
                          const g6::FabricDev& f,u64* stepp,cudaStream_t st,int max_rows) {
     if(ids.empty() || capacity<1 || rank<0 || rank>=g6nr::NR || f.nr!=g6nr::NR)
@@ -65,7 +70,7 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
     bool any_kda=false;
     for(int l:ids) any_kda|=geom::is_kda(l);
     if(any_kda) {
-        if(const char* e=kda::build_state(m.kda_st,std::max(1,m.kda_ring)*std::max(1,m.kda_sessions),g6nr::NR)) die(e);
+        if(const char* e=kda::build_state(m.kda_st,flash_kda_slots(m),g6nr::NR)) die(e);
         if(m.kda_ring>1) m.kda_st.src=m.kda_src;
         if(const char* e=kda::build_scratch(m.kda_sc,MX,g6nr::NR)) die(e);
     }
