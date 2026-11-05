@@ -509,6 +509,14 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     ControlLinks links = bootstrap(bc);
     try {
         if (multi) capture_all();
+        // persist=on: the entries this rank's checks passed (settle waits for them; they ran during the capture), then
+        // only those every rank kept, the same index everywhere (agree_lines waits with no timeout: ranks check at
+        // different speeds). At TP=1 the agreement is with this rank alone
+        if (ck && ck->persisted()) {
+            const std::string checked = ck->settle();
+            const std::string agreed = ck->agree(agree_lines(bc, links, ck->agree_summary(), true));
+            fprintf(stderr, "# rank %d: flash ckpt persist: %s; %s\n", c.main.rank, checked.c_str(), agreed.c_str());
+        }
         wcheck::seal(c.main.rank);
         int dev = 0; G6RT_CK(cudaGetDevice(&dev));
         wcheck::start_watcher(bc.directory, c.main.rank, dev);

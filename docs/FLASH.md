@@ -150,18 +150,22 @@ which drafts are accepted. The boot and request log lines say `terminal`. Aligne
 must match no cache.
 
 The store: the one `KV_STORE` (`--kv-store`; `mem:`, `ssd:PATH` or `remote:HOST:PORT`), else this process's memory,
-`FLASH_STATE_BUDGET_MIB` (8,192) a rank. An SSD folder starts empty at every boot unless `persist=on` (aligned only):
-then the index is written beside the blocks after every capture and resize (`flash-ckpt.index`, a temporary file
-renamed over it), and a boot with the same compat line (model set, TP, rank, CAP, layout, engine build) and store size
-takes back every entry whose manifest block is still its own. Persistence is for fixed-size `ssd:` stores: after a
-group lease resizes, the next boot finds another store size and starts empty. Entries a capture drops leave the index
-before their blocks are overwritten, and an index that cannot be written turns persistence off for that boot. A spare
-RAM cache on the store (the launcher's `cache:NAME,kind=spare_ram` in `KV_STORE`, which it passes to the engine as
-`spare_ram_cache=on`; not with `group=`) keeps a copy of the blocks in memory the kernel may take back, as on GLM-5.3's
-stores. On a KV node the lease is `g6m4f-ckpt-<host>-<epoch>-r<rank>`, never the pool stash's. Each checkpoint is one
-contiguous range of blocks with a manifest and GPU checksums of every extent; a restore that does not match its
-checksums takes the entry out of the persisted index and stops the engine. The index digest joins the runtime
-signature, so ranks that took back different entries are refused at the bootstrap.
+`FLASH_STATE_BUDGET_MIB` (8,192) a rank. An SSD folder starts empty at every boot unless `persist=on` (aligned only).
+Then the index is written beside the blocks after every capture and resize (`flash-ckpt.index`), and each entry's tokens
+once, in `flash-ckpt.tokens/<generation>`; every file is written to a temporary name, synced, renamed and its folder
+synced. A boot with the same compat line (model set, TP, rank, CAP, layout, engine build) and store size reads the
+index, and a helper thread checks every entry's stored manifest, pages and KDA state against the manifest's checksums
+(about the time to read the store once: the SSD at full speed). Before serving, the ranks agree: each sends one line an
+entry, every rank keeps the entries every rank kept, and rewrites its index. So a rank whose index was lost or torn, or
+whose check dropped an entry, makes the others drop it too, and the boot goes on. Persistence is for fixed-size `ssd:`
+stores: after a group lease resizes, the next boot finds another store size and starts empty. Entries a capture drops
+leave the index before their blocks are overwritten, and an index that cannot be written turns persistence off for that
+boot (the file goes, so the next boot starts with no index). A spare RAM cache on the store (the launcher's
+`cache:NAME,kind=spare_ram` in `KV_STORE`, which it passes to the engine as `spare_ram_cache=on`; not with `group=`)
+keeps a copy of the blocks in memory the kernel may take back, as on GLM-5.3's stores. On a KV node the lease is
+`g6m4f-ckpt-<host>-<epoch>-r<rank>`, never the pool stash's. Each checkpoint is one contiguous range of blocks with a
+manifest and GPU checksums of every extent; a restore that does not match its checksums removes the persisted index and
+stops the engine.
 A full store drops the least recently used checkpoints. Every rank keeps the same index, and its digest joins the pool
 digest the ranks compare.
 

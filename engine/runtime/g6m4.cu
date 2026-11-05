@@ -1976,19 +1976,16 @@ int main(int argc, char** argv)
                 std::to_string(g6s2::FlashManifest::FORMAT) + " engine " + exe;
             try { ckpt.reset(new g6s2::FlashCheckpoints(v, spec, name, bytes, compat, group ? &*group : nullptr, index_path)); }
             catch (const std::exception& e) { die(std::string("GR8_GLM53F_CACHE: ") + e.what()); }
-            if (!index_path.empty())
-            {
-                fprintf(stderr, "# rank %d: flash ckpt persist: %s: %s\n", R, index_path.c_str(), ckpt->loaded.c_str());
-                const std::string checked = ckpt->settle();
-                fprintf(stderr, "# rank %d: flash ckpt persist: %s\n", R, checked.c_str());
-            }
+            // persist=on: the entries are checked on a helper thread and agreed by every rank in serve_flash
+            if (!index_path.empty()) fprintf(stderr, "# rank %d: flash ckpt persist: %s: %s\n", R, index_path.c_str(), ckpt->loaded.c_str());
             fprintf(stderr, "# rank %d: flash ckpt %s: %s, %llu blocks of %zu B (%zu bindings, KDA state %.1f MB = %llu blocks), grid %d rows%s\n",
                     R, g6s2::flash_cache_name(flash_cache), ckpt->describe().c_str(), (unsigned long long)ckpt->blocks(), ckpt->slot_bytes(),
                     v.bindings.size(), v.state_bytes() / 1e6, (unsigned long long)(ckpt->entry_blocks(0) - 1), MP * (two ? 2 : 1),
                     group ? (", group " + group->group + " lease, " + std::to_string(ckpt->segments()) + " segments to start").c_str() : "");
-            // the index digest: ranks that took back different persisted entries are refused at the bootstrap, by name
+            // persist: every rank joins the agreement on persisted entries (serve_flash), or none does. The index itself is
+            // not here: the agreement makes it the same on every rank, and the pool digest compares it at every event
             bc.runtime_signature += std::string(" ckpt ") + g6s2::flash_cache_name(flash_cache) + " blocks " + std::to_string(ckpt->blocks()) +
-                " index " + std::to_string(ckpt->index().digest());
+                (index_path.empty() ? "" : " persist");
         }
         // DFlash2 (--dflash-manifest): a session alone drafts with the drafter, as on GLM-5.3 (s2_batch.h Batch::dflash);
         // Dfl::pf_feat holds the prefill taps of the session whose prefill started last (dfl_owner, -1 = none)

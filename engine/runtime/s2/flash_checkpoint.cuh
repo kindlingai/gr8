@@ -111,6 +111,7 @@ class FlashCheckpoints {
     uint64_t compat_ = 0;
     g6kv_tier_totals seen_{};   // a group lease, the head: the index counters at its last report
     FlashIndexFiles files_;     // persist=on: the index and token files beside the store's blocks, else off
+    bool persist_ = false;      // persist=on at boot
     uint8_t *host_ = nullptr, *host_dev_ = nullptr;   // mapped pinned: batch_ slots, registered with the store
     int* d_list_ = nullptr;                           // the run's pool pages, pool_pages of them at most
     fck::Binding* d_bind_ = nullptr;
@@ -278,6 +279,7 @@ public:
         tk(g6kv_tier_register(t_, host_, slot_ * batch_), "register");
         layout_.slot = slot_; layout_.state_bytes = v_.state_bytes();
         for (const auto& b : v_.bindings) layout_.parts.push_back({size_t(b.mla_page16) * 16, b.idx ? size_t(b.idx_page16) * 16 : 0});
+        persist_ = files_.on();
         if (files_.on()) {
             uint64_t stale = 0;
             if (const char* why = files_.load(compat_, index_.blocks(), found_, stale)) loaded = std::string(why) + ", starting empty";
@@ -289,6 +291,8 @@ public:
         }
     }
     std::string loaded;   // persist=on: what the boot found in the index file (the boot log)
+    // persist=on at boot (true even after a failed write turned it off): this rank joins the bootstrap's agreement
+    bool persisted() const { return persist_; }
     // persist=on: waits for the verification and publishes the entries that passed; what it did, for the boot log.
     // Call before anything reads the index (the bootstrap's agreement, the serve): until then it is empty.
     std::string settle() {
@@ -298,8 +302,19 @@ public:
         try { index_.adopt(found_.next, found_.clock, std::move(found_.entries)); }
         catch (const std::exception& e) { checked_ += std::string("; ") + e.what() + ", starting empty"; }
         found_ = FlashIndexImage{};
-        save();   // the index on disk loses what failed
         return checked_;
+    }
+    // the bootstrap's agreement (flash_ckpt_index.h): this rank's lines, then the entries every rank kept. Rewrites the
+    // index; returns what it dropped, for the boot log
+    std::string agree_summary() const { return flash_agree_summary(index_); }
+    std::string agree(const std::string& agreed) {
+        const size_t n = index_.size();
+        const std::vector<uint64_t> gone = flash_keep_agreed(index_, agreed);
+        save();
+        std::string s = std::to_string(index_.size()) + " of " + std::to_string(n) + " entries kept by every rank, next " +
+            std::to_string(index_.next_generation());
+        for (size_t i = 0; i < gone.size(); ++i) s += (i ? ", " : "; dropped ") + std::to_string(gone[i]);
+        return s;
     }
     ~FlashCheckpoints() {
         if (verify_.joinable()) verify_.join();
@@ -407,11 +422,12 @@ public:
         last = Last{need, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()};
         return g;
     }
-    // a restore of `generation` read bytes that are not the entry's: the entry leaves the persisted index first, so the
-    // next boot does not stop on it again
+    // a restore of `generation` read bytes that are not the entry's: the whole index file goes, so this rank's next boot
+    // starts with no index and the bootstrap's agreement drops the other ranks' entries too (they may hold the entry
+    // this rank lost; one shard of an entry is no use)
     [[noreturn]] void fail(uint64_t generation, const char* why) {
         index_.drop(generation);
-        save();
+        if (files_.on()) { files_.remove(); files_ = FlashIndexFiles(); }
         throw std::runtime_error("Flash checkpoint " + std::to_string(generation) + ": " + why);
     }
     // entry `generation` back into the run's logical rows [0, position) and KDA slot `slot`; throws when the stored bytes

@@ -10,6 +10,7 @@
 #pragma once
 #include "flash_checkpoint.h"
 #include <cerrno>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -206,6 +207,50 @@ inline const char* flash_index_decode(const std::string& b, FlashIndexImage& out
         out.entries.push_back(std::move(x));
     }
     return nullptr;
+}
+
+// The bootstrap's agreement (bootstrap.h agree_lines, after FlashCheckpoints::settle): ranks can hold different
+// persisted entries (a failed index write, a torn or lost index after a power loss, an entry one rank's check dropped),
+// and every rank must keep the same index. Each rank sends the index clocks and one line per entry with what every
+// rank holds alike; the head keeps the lines every rank sent. Not the page and state sums: each rank holds its own
+// shard, so they differ by rank (each rank checked its own at load).
+inline std::string flash_agree_line(const FlashEntry& x) {
+    char b[256];
+    snprintf(b, sizeof b, "flash entry %llu used %llu base %llu blocks %llu position %u terminal %d tokens %llu %016llx ns %016llx",
+             (unsigned long long)x.generation, (unsigned long long)x.used, (unsigned long long)x.base,
+             (unsigned long long)x.blocks, x.position, int(x.terminal), (unsigned long long)x.manifest.tokens,
+             (unsigned long long)x.manifest.token_hash, (unsigned long long)x.manifest.ns_hash);
+    return b;
+}
+inline std::string flash_agree_summary(const FlashIndex& ix) {
+    std::string s = "flash next " + std::to_string(ix.next_generation()) + " clock " + std::to_string(ix.clock()) + "\n";
+    for (const auto& x : ix.entries()) s += flash_agree_line(x) + "\n";
+    return s;
+}
+// keeps the entries `agreed` lists (the head's answer, the same on every rank). The clocks are the agreed clock line's,
+// or, when the ranks' clocks differ, one past the newest entry kept: the same on every rank either way. Returns the
+// generations dropped.
+inline std::vector<uint64_t> flash_keep_agreed(FlashIndex& ix, const std::string& agreed) {
+    std::set<std::string> lines;
+    for (size_t a = 0; a < agreed.size();) {
+        size_t e = agreed.find('\n', a);
+        if (e == std::string::npos) e = agreed.size();
+        if (e > a) lines.insert(agreed.substr(a, e - a));
+        a = e + 1;
+    }
+    std::vector<FlashEntry> kept;
+    std::vector<uint64_t> gone;
+    uint64_t next = 1, clock = 0;
+    for (const auto& x : ix.entries()) {
+        if (!lines.count(flash_agree_line(x))) { gone.push_back(x.generation); continue; }
+        next = std::max(next, x.generation + 1); clock = std::max(clock, x.used);
+        kept.push_back(x);
+    }
+    if (lines.count("flash next " + std::to_string(ix.next_generation()) + " clock " + std::to_string(ix.clock()))) {
+        next = ix.next_generation(); clock = ix.clock();
+    }
+    ix.adopt(next, clock, std::move(kept));
+    return gone;
 }
 
 // The index file and the token files of one store (persist=on). Not thread safe: FlashCheckpoints calls it under the
