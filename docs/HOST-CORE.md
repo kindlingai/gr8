@@ -222,7 +222,7 @@ The slot capacities stay compile-time (`S2N` in `s2_in.h` is shared with device 
 until R2 makes them runtime in Rust. `g6m4` prints the description at boot. `engine/runtime/tests/module_info_test.cpp`
 checks it against the constants in each model's shape.
 
-### R2. Scheduler and sessions to Rust (`engine/s2core-rs`)
+### R2. Scheduler and sessions to Rust (`engine/scheduler-rs`)
 
 Moves `s2/scheduler.h`, `sessions.h`, `kv_plan.h`, `kv_share.h`, `cp_rows.h`, `flash_lend.h` and `flash_ring.h` (about
 1,300 lines, integer logic). The boundary is `#[repr(C)]` `Key`, `Slot`, `Run`, `Grant`, `Shrink`, `Resize`, `Quantum`,
