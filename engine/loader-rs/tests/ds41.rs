@@ -545,7 +545,12 @@ fn slices_match_the_checkpoint() {
                 assert_eq!(tensor(&img, &format!("{p}.hc_attn.fn")), *m.get(&format!("{pre}hc_attn_fn")));
                 assert_eq!(tensor(&img, &format!("{p}.hc_ffn.scale")), *m.get(&format!("{pre}hc_ffn_scale")));
                 assert_eq!(tensor(&img, &format!("{p}.router.bias")), *m.get(&format!("{pre}ffn.gate.bias")));
-                assert!(!names.iter().any(|n| n.contains("bias_vl")));
+                // gate.bias_vl (image rows): bound whole on the main layers, not loaded on the DSpark layers
+                if l < NMAIN {
+                    assert_eq!(tensor(&img, &format!("{p}.router.bias_vl")), *m.get(&format!("{pre}ffn.gate.bias_vl")));
+                } else {
+                    assert!(!names.contains(&format!("{p}.router.bias_vl").as_str()));
+                }
                 // attention: q_b rows, attn_sink, o_a rows, o_b columns of this rank's groups
                 let sink = m.get(&format!("{pre}attn.attn_sink"));
                 assert_eq!(tensor(&img, &format!("{p}.attn_sink")), sink[g.start * hpg * 4..g.end * hpg * 4]);

@@ -1301,6 +1301,33 @@ int main(int argc, char** argv)
             die("DS41: a " + std::to_string(ns) + "-session step has " + std::to_string(ds_ms_rps(ns)) + " rows a session, above the per-session index scratch (" +
                 std::to_string(m.ds41_sess_rows) + " rows)");
     build_ds41(m, R, layers, find, cap, f, stepp, st, pf_attn_rows(MP), dsk.on() ? 1 : 0, rs_k, rowshard);
+    // DS41 image input (GR8_DS41_VISION, default 1): with --serve and W-row prefill, the release's vision tower loads here,
+    // before the rest of the boot allocates, so the ready memory counts it. Every rank runs the tower on its own images
+    // (each rank embeds every row). The head writes DIR/vision.s2, so the shim's hello offers `vision`.
+    Ds41Vision vis;
+    bool vis_on = false;
+    if (s2mode && release && knob::ds41_vision()) {
+        std::string vpath;
+        for (const char* rel : {"/exlr8-extra-vision.safetensors", "/dense/exlr8-extra-vision.safetensors"}) {
+            const std::string c = v2src.dense + rel;
+            if (FILE* fv = fopen(c.c_str(), "rb")) { fclose(fv); vpath = c; break; }
+        }
+        if (vpath.empty())
+            fprintf(stderr, "# rank %d: ds41 vision off: no exlr8-extra-vision.safetensors in --v2-dense\n", R);
+        else if (!knob::ds_prefill_min())
+            fprintf(stderr, "# rank %d: ds41 vision off: image prompts prefill, and GR8_DS_PREFILL_MIN is 0\n", R);
+        else {
+            vis.boot(vpath, 2 * m.hc_rows);
+            vis.attach(m);
+            vis_on = true;
+            g6rt::vision_flag() = true;
+            fprintf(stderr, "# rank %d: ds41 vision: tower %s, %.1f MiB on the device (weights, workspace, %d-row span pool)\n", R,
+                    vpath.c_str(), vis.device_bytes() / (1024.0 * 1024.0), 2 * m.hc_rows);
+            if (R == 0)
+                if (FILE* fv = fopen((s2dir + "/vision.s2").c_str(), "w")) { fputs("1\n", fv); fclose(fv); }
+        }
+    }
+    if (s2mode && R == 0 && !vis_on) std::remove((s2dir + "/vision.s2").c_str());   // a stale one from an earlier boot
     if (rs_k) ds41_rs_setup(m, R, NC, rs_k, rowshard, y_mxfp8);
     m.ds41_direct = pf_direct;                 // GR8_DS_PF_DIRECT=1
     if (ds41moe::ro_order_on())                // GR8_DS_RO_ORDER liveness, read through the same parser the expert loop launch uses (ds41_moe_ops.cuh)
@@ -2295,6 +2322,11 @@ int main(int argc, char** argv)
                     std::fill(pf_sess.begin(), pf_sess.begin() + c.rows, (int)c.slot);
                     G6RT_CK(cudaMemcpyAsync(m.sess, pf_sess.data(), c.rows * sizeof(int), cudaMemcpyHostToDevice, st));
                 }
+                if (vis_on) {   // DS41 image input: the images whose span overlaps this chunk, encoded into the pool (m.vis_n)
+                    int pr = 0;
+                    const VisChunk vc{(int)c.slot, c.first, c.rows, c.images};
+                    vis.stage(m, 0, &vc, 1, pr, st);
+                }
                 g6s2::require(ds41_idx_set_chunk(&m, c.context) == 0, "DS41 prefill index chunk bound refused");
                 if (skip_late) prepare_ds41_prefill(m, (int)c.rows, st, 0, split.i_late);
                 else if (split.on()) { prepare_ds41_prefill(m, (int)c.rows, st, 0, split.i_late); prepare_ds41_prefill(m, late, st, split.i_late, m.nl); }
@@ -2353,6 +2385,7 @@ int main(int argc, char** argv)
                 span_pass.close();
                 m.ds41_pf_late = 0;
                 m.ds_pf_slot = 0;
+                m.vis_n = 0;
                 m.ds41_dchunk = false; m.ds41_dir_used[0] = m.ds41_dir_used[1] = false;
                 if (stop.stopped) die(ds41::stop_message(stop));
                 G6RT_CK(cudaPeekAtLastError());
@@ -2377,6 +2410,7 @@ int main(int argc, char** argv)
                 if (pf_lanes_fab != 2) die("GR8_DS_PF_LANES changed between the fabric setup and the serve setup");
                 mBp = std::make_unique<Model>();
                 const size_t lb = build_ds41_lane_b(*mBp, m, fabB.dev(), st);
+                if (vis_on) vis.attach(*mBp);   // lane B's own table and row flags (the pool is shared)
                 G6RT_CK(cudaStreamCreateWithFlags(&sb, cudaStreamNonBlocking));
                 pf_pos2.assign(m.hc_rows, 0); pf_tgt2.assign(m.hc_rows, -1); pf_sess2.assign(m.ds_slots > 1 ? m.hc_rows : 0, 0); pf_cells2.resize(m.nl);
                 fprintf(stderr, "# rank %d DS41 two-lane prefill: GR8_DS_PF_LANES=2 (quanta up to %d rows, lane B: own stream, fabric, sequence; view %.1f MiB device)\n",
@@ -2495,6 +2529,13 @@ int main(int argc, char** argv)
                             fprintf(stderr, "# rank %d request %llu chunk %u rows %u late tail skipped (rows after %d) lane %c\n", R, (unsigned long long)c.request, c.first, c.rows, rows_after[L], L ? 'B' : 'A');
                     };
                     if (m.engram) m.engram->plan_next_warm(ca.tok - ca.first, (int)ca.prompt_rows, (int)cb.first + (int)cb.rows, 2);
+                    if (vis_on) {   // DS41 image input: each lane's images on its own stream; the lanes share the pool (one counter)
+                        int pr = 0;
+                        for (int L = 0; L < 2; ++L) {
+                            const VisChunk vc{(int)ch[L]->slot, ch[L]->first, ch[L]->rows, ch[L]->images};
+                            vis.stage(*mm[L], L, &vc, 1, pr, ss[L]);
+                        }
+                    }
                     ds41::Stop stop{};
                     Ds41SpanPass span_pass[2] = {Ds41SpanPass(R, (int)ca.rows, ss[0], 0), Ds41SpanPass(R, (int)cb.rows, ss[1], 1)};   // GR8_DS_SPAN: each lane's ops
                     for (const ds41::lanes::Seg& g : sched.seg) {
@@ -2516,6 +2557,7 @@ int main(int argc, char** argv)
                         Model& M = *mm[L];
                         M.ds41_pf_late = 0;
                         M.ds_pf_slot = 0;
+                        M.vis_n = 0;
                         M.ds41_dchunk = false; M.ds41_dir_used[0] = M.ds41_dir_used[1] = false;
                         g6s2::require(M.ds41_rowshard_pending_c < 0, "DS41 two-lane row shard: missing y all-gather");
                         M.ds41_rowshard_chunk = false; M.ds41_rowshard_state = false; M.ds41_y_quant_ready = false;
@@ -2582,6 +2624,12 @@ int main(int argc, char** argv)
                 G6RT_CK(cudaMemcpyAsync(m.sess, pf_sess.data(), size_t(rows) * sizeof(int), cudaMemcpyHostToDevice, st));
                 m.ds_ns = 1; m.ds41_pack = &shape;
                 g6s2::require(ds41_idx_set_chunk(&m, max_context) == 0, "DS41 ragged index bound refused");
+                if (vis_on) {   // DS41 image input: every member's images that overlap its rows (the table keys rows by slot)
+                    VisChunk vc[ds41::pack::MAX_SEGMENTS];
+                    for (int j = 0; j < shape.count; ++j) vc[j] = VisChunk{(int)p.chunk[j].slot, p.chunk[j].first, p.chunk[j].rows, p.chunk[j].images};
+                    int pr = 0;
+                    vis.stage(m, 0, vc, shape.count, pr, st);
+                }
                 if (split.on()) { prepare_ds41_prefill(m, rows, st, 0, split.i_late); prepare_ds41_prefill(m, rows, st, split.i_late, m.nl); }
                 else prepare_ds41_prefill(m, rows, st);
                 if (dsk.on()) { m.dsp.main_lo = 0; m.dsp.main_hi = rows; }
@@ -2615,7 +2663,7 @@ int main(int argc, char** argv)
                     stop = ds41_run_pass(split.ops, split.b, split.ops.size(), &m, rows, st, span_pass);
                 }
                 span_pass.close();
-                m.ds41_pack = nullptr; m.ds41_pf_late = 0;
+                m.ds41_pack = nullptr; m.ds41_pf_late = 0; m.vis_n = 0;
                 m.ds41_dchunk = false; m.ds41_dir_used[0] = m.ds41_dir_used[1] = false;
                 if (stop.stopped) die(ds41::stop_message(stop));
                 G6RT_CK(cudaPeekAtLastError());

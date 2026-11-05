@@ -138,6 +138,7 @@ struct LayerState
     int layer = 0;                           // checkpoint layer number (the counter's record)
     const __nv_bfloat16* gate = nullptr;     // [NE][HID]
     const float* bias = nullptr;             // [NE] e_score_correction_bias (selection only)
+    const float* bias_vl = nullptr;          // [NE] gate.bias_vl, image rows' selection bias (DS41 vision); null = none bound
     const uint8_t *sh_w1 = nullptr, *sh_w3 = nullptr, *sh_w2 = nullptr;   // MXFP8 gv records of the shared expert's I-slice
     const uint8_t *fc1 = nullptr, *fc2 = nullptr;                          // MXFP4 mx4g records of all NE experts' I-slice
     Scratch* sc = nullptr;
@@ -469,6 +470,7 @@ inline int bind_moe(void* model, int i, int, void*)
     s->ne = ne; s->tk = ne == dsr::NEXP ? dsr::TOPK : geom::DS_TOPK; s->layer = y.l;
     s->gate = (const __nv_bfloat16*)get("router.w", 2, {ne, HID}, 1).p;
     s->bias = (const float*)get("router.bias", 1, {ne}, 2).p;
+    if (find(lname(y.l, "router.bias_vl")).p) s->bias_vl = (const float*)get("router.bias_vl", 1, {ne}, 2).p;   // main layers of a release with vision
     s->sc = scratch_of(&m);
     if (find(lname(y.l, "tr3.table")).p)
     {
@@ -609,8 +611,8 @@ inline int router(Model& m, const LayerState& s, int M, cudaStream_t st)
     if constexpr (PD) mx4::build_xfrag_p<<<xg, 256, 0, st>>>(m.hc_y, M, HID, s.sc->xfrag);       // plain launch, the first of the chain
     else mx4::build_xfrag<<<xg, 256, 0, st>>>(m.hc_y, M, HID, s.sc->xfrag);
     launch(PD, dsr::k_gate_logits<NE, PD>, dim3(NE / 8), dim3(256), st, (const __nv_bfloat16*)s.gate, (const __nv_bfloat16*)m.hc_y, M, s.sc->logits);
-    if constexpr (PD) launch(true, dsr::k_plan_p<NE, TK, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)s.sc->logits, s.bias, M, (dsr::PlanT<TK>*)s.sc->plan);
-    else launch(false, dsr::k_plan<NE, TK, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)s.sc->logits, s.bias, M, (dsr::PlanT<TK>*)s.sc->plan);
+    if constexpr (PD) launch(true, dsr::k_plan_p<NE, TK, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)s.sc->logits, s.bias, M, (dsr::PlanT<TK>*)s.sc->plan, s.bias_vl && m.vis_n > 0 ? s.bias_vl : nullptr, s.bias_vl && m.vis_n > 0 ? (const unsigned char*)m.vis_flag : nullptr);
+    else launch(false, dsr::k_plan<NE, TK, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)s.sc->logits, s.bias, M, (dsr::PlanT<TK>*)s.sc->plan, s.bias_vl && m.vis_n > 0 ? s.bias_vl : nullptr, s.bias_vl && m.vis_n > 0 ? (const unsigned char*)m.vis_flag : nullptr);
     return (int)cudaGetLastError();
 }
 template <int PD>
@@ -647,7 +649,7 @@ inline int router_mt(Model& m, const LayerState& s, int M, cudaStream_t st)
     const int nt = (M + 7) / 8;
     mx4::build_xfrag_mt<PD><<<(nt * HID * 4 + 255) / 256, 256, 0, st>>>(m.hc_y, M, HID, nt, s.sc->xfrag);      // plain launch, the first of the chain
     launch(PD, dsr::k_gate_logits_mt<NE, PD>, dim3(NE / 8), dim3(256), st, (const __nv_bfloat16*)s.gate, (const __nv_bfloat16*)m.hc_y, M, s.sc->logits);
-    launch(PD, dsr::k_plan_mt<NE, TK, MTMAX, PD, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)s.sc->logits, s.bias, M, (dsr::PlanMT<TK, MTMAX>*)s.sc->plan);
+    launch(PD, dsr::k_plan_mt<NE, TK, MTMAX, PD, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)s.sc->logits, s.bias, M, (dsr::PlanMT<TK, MTMAX>*)s.sc->plan, s.bias_vl && m.vis_n > 0 ? s.bias_vl : nullptr, s.bias_vl && m.vis_n > 0 ? (const unsigned char*)m.vis_flag : nullptr);
     return (int)cudaGetLastError();
 }
 template <int NT, int PD>
@@ -698,7 +700,7 @@ inline int router_pw(Model& m, const LayerState& s, int M, cudaStream_t st)
     const int nt = (M + MTMAX - 1) / MTMAX * 4;
     mx4::build_xfrag_mt<0><<<(nt * HID * 4 + 255) / 256, 256, 0, st>>>(m.hc_y, M, HID, nt, q.xfrag);
     launch(false, dsr::k_gate_logits_mt<NE, 0>, dim3(NE / 8), dim3(256), st, (const __nv_bfloat16*)s.gate, (const __nv_bfloat16*)m.hc_y, M, q.logits);
-    launch(false, dsr::k_plan_pw<NE, TK, MM, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)q.logits, s.bias, M, (dsr::PlanMT<TK, MM>*)q.plan);
+    launch(false, dsr::k_plan_pw<NE, TK, MM, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)q.logits, s.bias, M, (dsr::PlanMT<TK, MM>*)q.plan, s.bias_vl && m.vis_n > 0 ? s.bias_vl : nullptr, s.bias_vl && m.vis_n > 0 ? (const unsigned char*)m.vis_flag : nullptr);
     if (elog_on()) launch(false, dsr::k_expert_log<NE, TK, MM, KC>, dim3(1), dim3(256), st, (const dsr::PlanMT<TK, MM>*)q.plan, M, s.layer, s.sc->elog);
     return (int)cudaGetLastError();
 }
@@ -781,7 +783,7 @@ inline int router_ro(Model& m, const LayerState& s, int M, cudaStream_t st)
     else launch(false, dsr::k_gate_logits_mt<NE, 0>, dim3(NE / 8), dim3(256), st, (const __nv_bfloat16*)s.gate, (const __nv_bfloat16*)m.hc_y, M, q.logits);
     ds41_span_mark("ro_gate", st);
     cudaMemsetAsync(q.emask, 0, (size_t)NE * MW * sizeof(unsigned), st);
-    launch(false, dsr::k_route_ro<NE, TK, ROMAX, KC>, dim3((M + 7) / 8), dim3(256), st, (const float*)q.logits, s.bias, M, (P*)q.plan, q.emask);
+    launch(false, dsr::k_route_ro<NE, TK, ROMAX, KC>, dim3((M + 7) / 8), dim3(256), st, (const float*)q.logits, s.bias, M, (P*)q.plan, q.emask, s.bias_vl && m.vis_n > 0 ? s.bias_vl : nullptr, s.bias_vl && m.vis_n > 0 ? (const unsigned char*)m.vis_flag : nullptr);
     launch(false, dsr::k_scan_ro<NE, TK, ROMAX>, dim3(1), dim3(NE), st, (P*)q.plan, (const unsigned*)q.emask, q.tile0_of);
     launch(false, dsr::k_place_ro<NE, TK, ROMAX, KC>, dim3((M * TK + 255) / 256), dim3(256), st, (P*)q.plan, (const unsigned*)q.emask, (const int*)q.tile0_of, M);
     if (ro_order_on()) launch(false, dsr::k_order_ro<NE, TK, ROMAX>, dim3(1), dim3(NE), st, (const P*)q.plan, q.order);

@@ -723,6 +723,7 @@ inline int ds41_op_pf_compact(void* model,int,int rows,void* stream) {
     sh(m.hc_pre,(size_t)geom::HC*sizeof(float)); sh(m.hc_post,(size_t)geom::HC*sizeof(float)); sh(m.hc_comb,(size_t)geom::HC*geom::HC*sizeof(float));
     sh(m.hc_y,(size_t)HID*sizeof(__nv_bfloat16));
     sh(m.pos,sizeof(int)); sh(m.tok,sizeof(int)); sh(m.tgt,sizeof(int));
+    if(m.vis_n>0) sh(m.vis_flag,1);   // DS41 image rows: the router's bias_vl flags of range B's rows
     ds41_idx_pf_compact(model,sh);   // 1 = no indexer state (a subset without ratio layers): nothing to move
     return 0;
 }
