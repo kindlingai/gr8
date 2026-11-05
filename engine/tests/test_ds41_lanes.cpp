@@ -6,6 +6,7 @@
 //    AG + direct) and does not carry a 512-row pack's late collective, which the main table does.
 // 4. Per fabric the step ids are consecutive with lane B on its own counter.
 // 5. The real scheduler with decode_prefill_rows(2, W): no quantum above W while a session decodes; 2W when none does.
+// Run with the argument l20 for the same checks with GR8_DS_PF_L20_TAIL=1 (scripts/host_tests.sh runs both).
 // Mutants (each must be refused): drop lane B's waits (ea) / lane A's waits (eb) / the fork / the join, share the index list / trunk /
 // Engram step buffers / DSpark tap / MoE scratch, lane B on the main fabric, B before A, a wait before its record, a lane missing ops,
 // lane B with lane A's window floor, one sequence for both lanes, a pack on lane B, two lanes while decoding.
@@ -231,7 +232,7 @@ static void fabric()
 {
     const std::vector<int> ids = ids40();
     const int tail = 128, i_late = br::late_start(ids);
-    CHECK(i_late == geom::LATE_LAYER_START);
+    CHECK(i_late == br::late_layer_start());
     long n = 0;
     for (int mx : {32, 48})
         for (int nx : {0, 2})
@@ -359,8 +360,11 @@ static void scheduler()
     }
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    // "l20": the whole battery with GR8_DS_PF_L20_TAIL=1 (layer 20 in range B, its ca row hoisted into range A)
+    if (argc > 1 && std::string(argv[1]) == "l20") br::l20_tail() = true;
+    std::printf("test_ds41_lanes: GR8_DS_PF_L20_TAIL=%d, range B from layer %d\n", int(br::l20_tail()), br::late_layer_start());
     parse_split();
     schedules();
     schedule_mutants();
