@@ -29,10 +29,10 @@ The `ds41` engine takes images in chat requests, the way the release's own code 
 
 ## Knob
 
-`GR8_DS41_VISION` (agree, default 1). With `--serve`, `--v2-dense` and `GR8_DS_PREFILL_MIN` set, a release that has
+`GR8_DS41_VISION` (agree, default 0: image input is opt-in). With `GR8_DS41_VISION=1`, `--serve`, `--v2-dense` and `GR8_DS_PREFILL_MIN` set, a release that has
 `exlr8-extra-vision.safetensors` (in the dense directory or in `dense/`) loads the tower at boot. The head then writes
 `DIR/vision.s2`, and the shim's hello offers `vision`. The boot line is
-`# rank R: ds41 vision: tower ..., N MiB on the device (...)`. `0` never loads the tower, and the engine runs the
+`# rank R: ds41 vision: tower ..., N MiB on the device (...)`. `0` (the default) never loads the tower, and the engine runs the
 text-only code (the router and Engram take the text-only kernels: their image arguments are null).
 Each rank looks for the tower file on its own. A rank that loaded it adds `vision <file id>` (the file's byte size and
 a hash of its safetensors header) to the rank agreement; a rank without it adds nothing. So ranks that differ (a box
@@ -75,7 +75,7 @@ live steps leave it (`engine/runtime/s2/ds41_engram_ring.h`).
    aligner rows within tolerance on the 3 images, repeat runs identical; it prints the tower time per grid.
 2. No image rebuild: every boot plans the rank image from the release and loads it (engine/runtime/packfind.h
    rs_plan_release; no on-disk cache for ds41), so the new binary binds `router.bias_vl` itself. Boot the usual serve twice,
-   with `GR8_DS41_VISION=0` and with it unset (1). Compare the ready memory per rank (the `ds41 vision:` boot line has
+   with `GR8_DS41_VISION` unset (0) and with `GR8_DS41_VISION=1`. Compare the ready memory per rank (the `ds41 vision:` boot line has
    the device bytes). With 1, `DIR/vision.s2` exists and the front end's hello has `vision`.
 3. Text unchanged: the usual text battery against both boots and against the current serve reference. With the
    same seed and temperature 0 the outputs must match the reference token for token (the text path takes the

@@ -311,9 +311,10 @@ knobs:
   GR8_DS41_VISION:
     scope: agree
     kind: flag
-    default: "1"
+    default: "0"
     values: "0|1"
     doc: >-
       1 = with --serve, a release that has dense/exlr8-extra-vision.safetensors loads the vision tower at boot, before
       the KV pool is sized, and the engine takes requests with images (hello `vision`). Without that file the engine
-      serves text only. 0 never loads the tower: the engine runs as it did before image input.
+      serves text only. 0 (the default) never loads the tower: the engine runs as it did before image input. The
+      tower costs about 1.5 GB of device memory a rank, so image input is opt-in.

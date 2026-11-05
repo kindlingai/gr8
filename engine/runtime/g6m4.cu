@@ -1307,7 +1307,7 @@ int main(int argc, char** argv)
             die("DS41: a " + std::to_string(ns) + "-session step has " + std::to_string(ds_ms_rps(ns)) + " rows a session, above the per-session index scratch (" +
                 std::to_string(m.ds41_sess_rows) + " rows)");
     build_ds41(m, R, layers, find, cap, f, stepp, st, pf_attn_rows(MP), dsk.on() ? 1 : 0, rs_k, rowshard);
-    // DS41 image input (GR8_DS41_VISION, default 1): with --serve and W-row prefill, the release's vision tower loads here,
+    // DS41 image input (GR8_DS41_VISION, default 0, opt-in): with --serve and W-row prefill, the release's vision tower loads here,
     // before the rest of the boot allocates, so the ready memory counts it. Every rank runs the tower on its own images
     // (each rank embeds every row). The head writes DIR/vision.s2, so the shim's hello offers `vision`.
     Ds41Vision vis;
