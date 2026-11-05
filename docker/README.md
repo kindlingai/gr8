@@ -90,9 +90,10 @@ keeps it in the home volume.
 ## Settings
 
 `docker/.env` holds the launcher's options, one `KEY=value` per line: compose passes every line into the container, and
-the launcher owns every default. `GR8_MODEL` has none: it names the model, `glm53` (GLM-5.3) or `glm53f`
-(GLM-5.3-Flash), and `MODEL` must be a release of that model. Without it the container exits 2 at once, naming the
-line to add. `docker run --rm --entrypoint /opt/gr8/gr8 ghcr.io/kindlingai/gr8 models` lists each model's release, TP
+the launcher owns every default. `GR8_MODEL` has none: it names the model, `glm53` (GLM-5.3), `glm53f`
+(GLM-5.3-Flash) or `ds41` (DeepSeek-V4.1-Flash-1017), and `MODEL` must be a release of that model. For `ds41`, `MODEL`
+is a local copy of the release mounted into the container ([DEPLOY.md](../docs/DEPLOY.md), "The two settings"). Without
+`GR8_MODEL` the container exits 2 at once, naming the line to add. `docker run --rm --entrypoint /opt/gr8/gr8 ghcr.io/kindlingai/gr8 models` lists each model's release, TP
 sizes and variants. Three more lines are for compose itself:
 
 | variable | default | |

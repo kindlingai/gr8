@@ -33,6 +33,7 @@ downloads anything.
 |---|---|---|---|---|
 | `glm53` | GLM-5.3 | `https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4` | 3, 4, 5 or 6 | TP=4: `https://huggingface.co/incoai/GLM-5.3-DFlash2` |
 | `glm53f` | GLM-5.3-Flash ([FLASH.md](FLASH.md)) | `https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4` | 2, 3 or 4 | none |
+| `ds41` | DeepSeek-V4.1-Flash-1017 ([FIRST-BOOT.md](FIRST-BOOT.md)) | a local copy of `https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native`, read in place | 4 | none |
 
 `./gr8 models` lists each model's release and the values `--tp` and `--variant` take. Each box fetches only its own part
 of the release into its model cache: the first `up` downloads it (about 90 GB at TP=4, 35 minutes at 40 MB/s), and later
@@ -89,8 +90,8 @@ checkout on every box: then `./gr8 glm53 up` alone is enough. Then, on the head 
 
 ## Docker Compose
 
-Nothing to build or clone: CI publishes the image, `ghcr.io/kindlingai/gr8`, with the engine for every TP width and both
-models. On every box, with Docker Compose and the NVIDIA container toolkit (DGX OS has both):
+Nothing to build or clone: CI publishes the image, `ghcr.io/kindlingai/gr8`, with the engine for every TP width and all
+three models. On every box, with Docker Compose and the NVIDIA container toolkit (DGX OS has both):
 
     mkdir -p ~/gr8 && cd ~/gr8
     curl -fsSLO https://raw.githubusercontent.com/kindlingai/gr8/main/docker/compose.yaml
