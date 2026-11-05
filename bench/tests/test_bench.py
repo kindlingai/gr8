@@ -31,6 +31,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.srv.st.drift, self.srv.st.retrieve, self.srv.st.cache_hit = 0.0, True, 0
         self.srv.st.fail_nth = self.srv.st.chat_calls = 0
+        self.srv.st.needle_cutoff = False
 
     def bench(self, *args):
         with tempfile.TemporaryDirectory() as d:
@@ -194,6 +195,29 @@ class Stages(Base):
         self.assertTrue(S.needle(self.ctx(), [3072], None)['3K']['passed'])
         self.srv.st.retrieve = False
         self.assertFalse(S.needle(self.ctx(), [3072], None)['3K']['passed'])
+
+    def test_needle_answered_and_cut_off(self):
+        ok = S.needle(self.ctx(), [3072], None)['3K']
+        self.assertEqual((ok['passed'], ok['cut_off'], ok['finish']), (True, False, 'stop'))
+        self.assertLess(ok['tokens'], S.NEEDLE_TOKENS)
+        self.assertIn(ok['secret'], ok['content'])
+        self.srv.st.needle_cutoff = True
+        ctx = self.ctx()
+        ctx.a.needle_seed = ok['seed']        # the same document and secret again
+        cut = S.needle(ctx, [3072], None)['3K']
+        self.assertEqual(cut['secret'], ok['secret'])
+        self.assertEqual((cut['passed'], cut['cut_off'], cut['in_reasoning_only']), (False, True, True))
+        self.assertEqual((cut['finish'], cut['tokens'], cut['content']), ('length', S.NEEDLE_TOKENS, ''))
+        self.assertIn(cut['secret'], cut['reasoning'])
+        self.assertLess(len(cut['reasoning']), 2 * S.KEEP_CHARS + 100)
+        rep = {'correct': {'needle': {'3K': cut}}}
+        checks = {c: (v, d) for c, v, d in report.verdicts(rep, report.compare(rep, None), None)}
+        verdict, detail = checks['needle 3K']
+        self.assertEqual(verdict, 'FAIL')
+        self.assertIn(f'found in the reasoning, answer cut off at {S.NEEDLE_TOKENS} tokens', detail)
+        self.assertIn(f"seed {cut['seed']}", detail)
+        q, _ = kindling.fields({'correct': {'needle': {'3K': cut, '8K': ok}}})
+        self.assertEqual(q['quality'], 'found at 8K; found at 3K (answer cut off)')
 
     def test_needle_over_the_context_is_skipped(self):
         self.assertIn('skipped', S.needle(self.ctx(), [8192], 4096)['8K'])

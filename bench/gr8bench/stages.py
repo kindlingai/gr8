@@ -15,6 +15,9 @@ OK_FINISH = ('stop', 'length')
 # Hangul and the replacement character: GLM-5.3 corruption has shown up as both
 SUSPECT = re.compile('[가-힣�]')
 DECODE_TOKENS = {'code': 512, 'prose': 512, 'structured': 512, 'counting': 2048}
+# a needle reply thinks, then answers: at 400 a 128K reply ran out while still thinking (answers took 75-166)
+NEEDLE_TOKENS = 1024
+KEEP_CHARS = 2048   # of a needle reply's content and reasoning kept in the report, from each end
 REPO = Path(__file__).resolve().parents[2]
 
 
@@ -107,21 +110,36 @@ def kl_check(ctx, ref_path):
     return out
 
 
+def _keep(text):
+    """text, or its first and last KEEP_CHARS characters"""
+    if len(text) <= 2 * KEEP_CHARS:
+        return text
+    return f'{text[:KEEP_CHARS]}\n[... {len(text) - 2 * KEEP_CHARS} characters ...]\n{text[-KEEP_CHARS:]}'
+
+
 def needle(ctx, sizes, max_len):
+    """A passphrase at 15% depth of a salted document of each size. The seed fixes the document and the secret, and
+    --needle-seed reruns one. A reply that runs out of tokens with the secret only in its reasoning is cut_off: found,
+    but not answered."""
     out = {}
+    norm = lambda t: ''.join(t.lower().split())
     for tokens in sizes:
         if max_len and tokens + 1000 > max_len:
             out[f'{tokens // 1024}K'] = {'skipped': f'over max_model_len {max_len}'}
             continue
-        seed = random.randrange(1 << 30)
+        seed = getattr(ctx.a, 'needle_seed', None)
+        seed = random.randrange(1 << 30) if seed is None else seed
         secret = docs.passphrase(random.Random(seed))
         messages, where = docs.needle_prompt(ctx.cl, tokens, 0.15, seed, secret)
-        r = ctx.chat('correct', 'needle', messages, 400, temperature=0.0)
-        norm = lambda t: ''.join(t.lower().split())
-        out[f'{tokens // 1024}K'] = {'passed': norm(secret) in norm(r['content']),
-                                     'in_reasoning_only': norm(secret) in norm(r['reasoning'])
-                                     and norm(secret) not in norm(r['content']),
-                                     'prompt_tokens': r['prompt_tokens'], 'ttft_s': round(r['ttft'], 2), **where}
+        r = ctx.chat('correct', 'needle', messages, NEEDLE_TOKENS, temperature=0.0)
+        answered = norm(secret) in norm(r['content'])
+        thought = norm(secret) in norm(r['reasoning'])
+        out[f'{tokens // 1024}K'] = {'passed': answered, 'in_reasoning_only': thought and not answered,
+                                     'cut_off': thought and not answered and r['finish_reason'] == 'length',
+                                     'prompt_tokens': r['prompt_tokens'], 'ttft_s': round(r['ttft'], 2), **where,
+                                     'seed': seed, 'secret': secret, 'finish': r['finish_reason'],
+                                     'tokens': r['tokens'], 'content': _keep(r['content']),
+                                     'reasoning': _keep(r['reasoning'])}
     return out
 
 
