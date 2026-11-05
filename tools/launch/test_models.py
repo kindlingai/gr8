@@ -67,6 +67,19 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(plan['args'][plan['args'].index('--chunk') + 1], '1')
             self.assertIn('GR8_GLM53F_PF_DSA_F16GEMM=1', plan['env'])
 
+    def test_max_model_len(self):
+        # #339: the longest request, apart from the pool; a cluster option, so the boxes compare it
+        o = flash('--cap', '1048640', '--max-model-len', '262144')
+        c, _, _ = opt.canonical(o, opt.engine_plan(o), opt.split_list(PEERS))
+        self.assertEqual(c['MAX_MODEL_LEN'], '262144')
+        self.assertNotIn('MAX_MODEL_LEN', opt.canonical(flash(), opt.engine_plan(flash()), opt.split_list(PEERS))[0])
+        for argv, want in ((['--max-model-len', '0'], 'want 1 to 1048576'), (['--max-model-len', '2000000'], 'want 1 to 1048576'),
+                           (['--cap', '131136', '--max-model-len', '262144'], 'more than CAP 131136'),
+                           (['--max-model-len', 'x'], 'want a whole number')):
+            with self.assertRaises(opt.OptionError) as e:
+                flash(*argv)
+            self.assertIn(want, str(e.exception))
+
     def test_flash_cache(self):
         plan = opt.engine_plan(flash())
         self.assertFalse([e for e in plan['env'] if e.startswith(('GR8_GLM53F_CACHE=', 'GR8_GLM53F_STATE_BUDGET_MIB='))])
