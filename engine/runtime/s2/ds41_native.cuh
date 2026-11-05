@@ -80,12 +80,13 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
     std::atomic<uint64_t> claimed{0};
     // GR8_DS_PARK (Config::park): a finished chat's slot keeps its KV; its tokens [0, pos) and namespace, under ck_mu (the
     // head's match reads them). The same on every rank: parks at the same finishes, cleared at the same binds
-    struct Parked { bool on = false; uint32_t pos = 0; std::vector<int> tokens; CacheNamespace ns{}; };
+    struct Parked { bool on = false; uint32_t pos = 0; std::vector<int> tokens; CacheNamespace ns{}; Ds41ImageRows images; };
     std::array<Parked, MAX_SESSIONS> parked{};
     std::atomic<int> claimed_slot{-1};   // the parked slot a take claimed, for the bind
     require(!sc.park || (ck && slots > 1), "DS41 GR8_DS_PARK needs the prefix cache and --s2-sessions >= 2");
     std::array<Run, MAX_SESSIONS> bound{};
     std::array<bool, MAX_SESSIONS> bound_live{};
+    std::array<Ds41ImageRows, MAX_SESSIONS> img_rows{};   // each slot's bound request's image rows: -1 in its snapshots' Engram rings
     Ds41SnapSlots snaps(slots);   // GR8_DS_CACHE_REPLACE: each slot's prompt-end entry and the kind it restored
     LpStep lp{};
     int lp_rows = 0;
@@ -127,7 +128,7 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
                 ? st.valid : std::min<int>(st.main_end, int(st.history.size()) - 1));
             if (p) {
                 std::lock_guard<std::mutex> l(ck_mu);
-                const uint64_t gen = snaps.capture_request_end(*ck, q, p, st.history, ns, c.stream);
+                const uint64_t gen = snaps.capture_request_end(*ck, q, p, st.history, ns, c.stream, img_rows[size_t(q)]);
                 if (gen) fprintf(stderr, "# rank %d ds41 ckpt capture gen %llu slot %d pos %u bytes %zu used %zu/%zu\n",
                                  c.main.rank, (unsigned long long)gen, q, p, ck->last.bytes,
                                  ck->used_bytes(), ck->budget_bytes());
@@ -174,7 +175,7 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
                 {
                     std::lock_guard<std::mutex> l(ck_mu);
                     Parked& k = parked[size_t(q)];
-                    k.on = p > 0; k.pos = p; k.ns = ns;
+                    k.on = p > 0; k.pos = p; k.ns = ns; k.images = img_rows[size_t(q)];
                     k.tokens.assign(st.history.begin(), st.history.begin() + std::min<size_t>(p, st.history.size()));
                     if (k.on) snaps.park(*ck, q, p, k.tokens, ns);   // GR8_DS_CACHE_REPLACE bookkeeping of the request end, now
                     else snaps.reset(q);
@@ -190,6 +191,10 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
     }
     // a request starts at position 0 on the pool's first pages (no reuse, no adoption of a retired run): reset() leaves the first
     // request's zeroed buffers alone and clears the attention and index state before every later one. No step is in flight here.
+    h.bind_request = [&](unsigned slot, const g6rt::ServeReq& r) {
+        require(slot < MAX_SESSIONS, "DS41 bind: slot outside the sessions");
+        img_rows[slot] = ds41_image_rows(r.images);
+    };
     h.bind = [&](const Grant& g) {
         if (slots > 1) {   // a fresh run on slot q: clear that slot's slabs only (the other sessions keep theirs; no step is in flight)
             const int q = int(g.key.slot);
@@ -198,7 +203,8 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
             // parked slot evicts that chat into the prefix cache first (what retain did when it finished)
             const int cs = claimed_slot.exchange(-1);
             const bool resume = g.reuse && cs >= 0;
-            std::vector<int> last;   // resume: the parked chat's tokens, for its Engram ring
+            std::vector<int> last;   // resume: the parked chat's tokens and image rows, for its Engram ring
+            Ds41ImageRows last_images;
             fence();
             if (sc.park) {
                 std::lock_guard<std::mutex> l(ck_mu);
@@ -207,12 +213,13 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
                     require(cs == q && k.on && k.pos == g.reuse, "DS41 park: the claimed parked slot differs from the grant");
                     snaps.resume(*ck, q, k.pos, k.tokens, k.ns);   // the slot's snapshot state as a restore of its request end
                     last = std::move(k.tokens);
+                    last_images = std::move(k.images);
                 } else if (k.on) {
                     // the request-end capture retain would have made at the finish (GR8_DS_CACHE_REPLACE kind and sibling link,
                     // from the slot's snapshot state, kept since the park). This grant's own cache hit, restored below, is never
                     // evicted or replaced by it (the capture is skipped when only that entry is in the way)
                     const uint64_t keep = claimed.load();
-                    const uint64_t gen = snaps.evict_parked(*ck, q, k.pos, k.tokens, k.ns, c.stream, keep);
+                    const uint64_t gen = snaps.evict_parked(*ck, q, k.pos, k.tokens, k.ns, c.stream, keep, k.images);
                     fprintf(stderr, "# rank %d ds41 park evict slot %d pos %u capture gen %llu used %zu/%zu\n", c.main.rank, q, k.pos,
                             (unsigned long long)gen, ck->used_bytes(), ck->budget_bytes());
                     require(!keep || ck->find(keep), "DS41 park: the evicted chat's capture evicted the grant's own snapshot");
@@ -223,10 +230,9 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
                             // no cached drafts, the Engram ring of the last tokens
                 require(ds41_idx_clear_shared(&c.main, c.stream) == 0, "DS41 bind: index shared clear failed");
                 if (round) round->reset_drafts(q);
-                if (c.main.ehist) {   // as Ds41PrefixCache::restore writes it: the ring of tokens [pos - kRing, pos)
+                if (c.main.ehist) {   // as Ds41PrefixCache::restore writes it: the ring of tokens [pos - kRing, pos), -1 at image rows
                     int eh[ds41::engram::kRing];
-                    std::fill_n(eh, ds41::engram::kRing, -1);
-                    for (int i = std::max(0, int(g.reuse) - ds41::engram::kRing); i < int(g.reuse); ++i) ds41::engram::ring_put(eh, i, last[size_t(i)]);
+                    ds41_engram_ring(eh, last, g.reuse, last_images);
                     G6RT_CK(cudaMemcpyAsync(c.main.ehist + size_t(q) * ENG_RING, eh, sizeof(eh), cudaMemcpyHostToDevice, c.stream));
                 }
                 fence();
@@ -320,7 +326,7 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
         if (!ck || p.prompt.empty() || end != p.prompt.size() - 1) return;
         const CacheNamespace ns = steering::cache_namespace(s.req.steering);
         std::lock_guard<std::mutex> l(ck_mu);
-        const uint64_t gen = snaps.capture_prompt_end(*ck, int(s.key.slot), end, p.prompt, ns, c.stream);
+        const uint64_t gen = snaps.capture_prompt_end(*ck, int(s.key.slot), end, p.prompt, ns, c.stream, ds41_image_rows(p.images));
         if (gen) fprintf(stderr, "# rank %d ds41 ckpt capture gen %llu slot %u pos %u bytes %zu used %zu/%zu\n",
                          c.main.rank, (unsigned long long)gen, unsigned(s.key.slot), end,
                          ck->last.bytes, ck->used_bytes(), ck->budget_bytes());

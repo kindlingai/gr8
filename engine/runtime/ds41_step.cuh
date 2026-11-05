@@ -563,6 +563,7 @@ public:
         pool_rows_ = pool_rows;
         G6RT_CK(cudaMalloc(&pool_, (size_t)pool_rows * HID * sizeof(__nv_bfloat16)));
         G6RT_CK(cudaMalloc(&stage_, (size_t)ds41v::MAX_TOKENS * HID * sizeof(__nv_bfloat16)));
+        G6RT_CK(cudaEventCreateWithFlags(&staged_, cudaEventDisableTiming));
     }
     size_t device_bytes() const {
         return tower_.w.bytes + tower_.workspace_bytes() + ((size_t)pool_rows_ + ds41v::MAX_TOKENS) * HID * sizeof(__nv_bfloat16);
@@ -594,12 +595,16 @@ public:
                 if (pool_row + (b - a) > pool_rows_ || (int)tab.size() >= VIS_TAB_MAX)
                     die("DS41 vision: the image rows of one prefill launch overflow the span pool");
                 const auto t0 = std::chrono::steady_clock::now();
+                // stage_ is shared by the lanes: this encode overwrites it only after the last copy out of it, on whichever
+                // stream that copy ran (lane A's, before lane B's encode on its own stream)
+                G6RT_CK(cudaStreamWaitEvent(st, staged_, 0));
                 tower_.encode(im.rgb->data(), im.vit_h, im.vit_w, stage_, st);
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 if (m.rank == 0) fprintf(stderr, "# ds41 vision: slot %d image %dx%d patches (%d span rows, %d in this chunk) %.1f ms\n",
                                          c[i].slot, im.vit_h, im.vit_w, im.span, b - a, ms);
                 G6RT_CK(cudaMemcpyAsync(pool_ + (size_t)pool_row * HID, stage_ + (size_t)(a - im.pos) * HID,
                                         (size_t)(b - a) * HID * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, st));
+                G6RT_CK(cudaEventRecord(staged_, st));
                 if (tab.empty()) flag.assign((size_t)rows, 0);
                 for (int p = a; p < b; ++p) {
                     const int r = c[i].row0 + (p - (int)c[i].first);
@@ -622,6 +627,7 @@ private:
     ds41v::Tower tower_;
     __nv_bfloat16* pool_ = nullptr;
     __nv_bfloat16* stage_ = nullptr;
+    cudaEvent_t staged_ = nullptr;   // after the last copy out of stage_ (the next encode's stream waits for it)
     int pool_rows_ = 0;
     std::vector<int4> host_[2];
     std::vector<uint8_t> flag_[2];

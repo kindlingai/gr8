@@ -62,6 +62,9 @@ struct PoolHooks {
 struct NativeHooks {
     PoolHooks pool;
     std::function<void(const Grant&)> bind; // native main AND draft binding, no pool mutation
+    // optional, before bind on every rank: the bound request itself (DS41: its image rows, for the Engram ring of the
+    // slot's snapshots and parks, s2/ds41_engram_ring.h)
+    std::function<void(unsigned slot, const g6rt::ServeReq&)> bind_request;
     // with pool.grow: slot's run grew; its new pages go into the main and draft tables before the round
     std::function<void(unsigned slot, const Run&)> grown;
     std::function<void(const Slot&)> retire; // native per-slot graph/view cleanup only
@@ -606,6 +609,7 @@ public:
                 require(mine == g.run, "worker page list differs from the head's grant");
             }
             dispatch_.begin(g.key.slot, int(g.reuse), g6rt::steering::cache_namespace(g.req.steering));
+            if (native_.bind_request) native_.bind_request(g.key.slot, *staged_);
             native_.bind(g); sessions_.bind(g,*staged_);
         };
         h.retire = [&](const Slot& old) {
