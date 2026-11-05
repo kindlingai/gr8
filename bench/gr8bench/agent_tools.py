@@ -14,7 +14,10 @@ not offered, and calls whose arguments did not parse.
 import copy
 import json
 import re
+import time
 import urllib.request
+
+from . import record
 
 REFUSED = "_rejected_by_server"
 MAX_TURNS = 12
@@ -101,9 +104,13 @@ TASKS = [
 ]
 
 
-def chat(url, model, messages, stream):
+def chat(url, model, messages, stream, events=None):
+    """events: a list that gets every streamed delta with its arrival time (record.add), or None."""
     body = {"model": model, "messages": messages, "tools": TOOLS, "temperature": 0, "max_tokens": 2048,
             "stream": stream, "chat_template_kwargs": {"reasoning_effort": "low"}}
+    if events is not None:
+        body["stream_options"] = {"include_usage": True}
+    t0 = time.time()
     req = urllib.request.Request(url + "/v1/chat/completions", json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
@@ -114,7 +121,10 @@ def chat(url, model, messages, stream):
             line = raw.decode().strip()
             if not line.startswith("data:") or line == "data: [DONE]":
                 continue
-            delta = json.loads(line[5:])["choices"][0].get("delta", {})
+            chunk = json.loads(line[5:])
+            if events is not None:
+                record.add(events, time.time() - t0, chunk)
+            delta = (chunk.get("choices") or [{}])[0].get("delta", {})
             content += delta.get("content") or ""
             for tc in delta.get("tool_calls") or []:
                 c = calls.setdefault(tc["index"], {"id": "", "type": "function",
@@ -127,8 +137,10 @@ def chat(url, model, messages, stream):
                 "tool_calls": [calls[i] for i in sorted(calls)] or None}
 
 
-def run_task(url, model, task, stream, verbose):
+def run_task(url, model, task, stream, verbose, requests=None):
+    """requests: a list that gets each streamed request of the task (its messages and events), or None."""
     name, prompt, check = task
+    start = time.time()
     box, answer = Sandbox(), None
     stats = {"turns": 0, "calls": 0, "refused": 0, "unknown": 0, "bad_args": 0}
     messages = [{"role": "system", "content": "You operate on a small repository through the tools given. "
@@ -136,7 +148,13 @@ def run_task(url, model, task, stream, verbose):
                 {"role": "user", "content": prompt}]
     for _ in range(MAX_TURNS):
         stats["turns"] += 1
-        msg = chat(url, model, messages, stream)
+        if requests is not None and stream:
+            events = []
+            requests.append({"i": len(requests), "t0": round(time.time() - start, 3), "messages": list(messages),
+                             "events": events})
+            msg = chat(url, model, messages, stream, events)
+        else:
+            msg = chat(url, model, messages, stream)
         calls = msg.get("tool_calls") or []
         messages.append({k: v for k, v in msg.items() if k in ("role", "content", "tool_calls") and v})
         if not calls:
@@ -175,13 +193,17 @@ def run_task(url, model, task, stream, verbose):
     return check(box, answer), stats
 
 
-def run(url, model):
-    """Every task, whole and streamed. -> passes and the call counts."""
+def run(url, model, save=None):
+    """Every task, whole and streamed. -> passes and the call counts.
+    save(task name, its streamed requests, passed) is called after each streamed task when given."""
     totals = {"passed": 0, "runs": 0, "turns": 0, "calls": 0, "refused": 0, "unknown": 0, "bad_args": 0}
     tasks = []
     for task in TASKS:
         for stream in (False, True):
-            ok, s = run_task(url.rstrip("/"), model, task, stream, False)
+            reqs = [] if save and stream else None
+            ok, s = run_task(url.rstrip("/"), model, task, stream, False, reqs)
+            if reqs is not None:
+                save(task[0], reqs, ok)
             totals["passed"] += ok
             totals["runs"] += 1
             for k in s:

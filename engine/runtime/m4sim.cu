@@ -363,6 +363,8 @@ int main(int argc, char** argv)
     if (pfw && (pfw <= MX || pfw != ds41_prefill_rowcap(DS41_TEXT(knob::ds_prefill_w()), MX))) die("GR8_TEST_DS41_M4_PFW=W needs MX < W = GR8_DS_PREFILL_W");
     const int pf_tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
     if (pfw && pf_tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
+    ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1)
+    if (pfw && ds41::br::l20_tail()) fprintf(stderr, "# GR8_TEST_DS41_M4_PFW: GR8_DS_PF_L20_TAIL=1: layer 20 in the bounded replay\n");
     if (pfw && (graph || mtp || MP)) die("GR8_TEST_DS41_M4_PFW: eager only (no --graph, --mtp, --prefill)");
     if (pfw) fprintf(stderr, "# GR8_TEST_DS41_M4_PFW: W-row non-final prefill chunks of %d rows, bounded replay tail %d\n", pfw, pf_tail);
 #endif

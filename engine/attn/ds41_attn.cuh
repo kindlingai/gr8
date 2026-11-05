@@ -1636,10 +1636,12 @@ template <int BM, int BN, int ST> inline void launch_tc_t(const GemmP& p, int gr
     q.mfast = tc_mfast_pick(g_tc_mfast, p.N, p.K, groups, mt) ? 1 : 0;
     k_gemm_mx8t<BM, BN, ST><<<q.mfast ? dim3(mt, nt, groups) : dim3(nt, mt, groups), 256, TcCfg<BM, BN, ST>::SMEM, st>>>(q);
 }
-// tile pick: the tallest row tile the M fills, the wider column tile when it still leaves >= 96 CTAs (48 SMs x 2)
+// tile pick: the tallest row tile the M fills, the wider column tile when it still leaves >= 96 CTAs (48 SMs x 2).
+// 33..63 rows take BM 64 (one M tile, so one CTA reads each weight tile): the same Y bits as BM 32, and on the Spark at 33-48 rows
+// faster summed over the 5 attention weights (10-15%), the Engram wkv the same, the DSpark main_proj ~35% faster (TC48/TC48X bench, 11-05).
 inline void launch_gemm_tc(const GemmP& p, int groups, cudaStream_t st)
 {
-    const int BM = p.M >= 128 ? 128 : (p.M >= 64 ? 64 : 32);
+    const int BM = p.M >= 128 ? 128 : (p.M > 32 ? 64 : 32);
     const long ctas128 = (long)(p.N / 128) * ((p.M + BM - 1) / BM) * groups;
     const bool wide = p.N % 128 == 0 && ctas128 >= 96;
     if (BM == 128)

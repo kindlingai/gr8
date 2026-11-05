@@ -11,6 +11,11 @@
 // The dial: GR8_DS_PF_TAIL (read once at boot, ds41_pf_tail()). Unset = geom::TAIL_ROWS (128). 0 = off: the chunk runs the unsplit plan at
 // `rows` rows. tail >= rows (e.g. tail = W) runs the split plan with no compaction and no window floor:
 // byte-identical to off. 1 .. WINDOW-1 is refused (the first decode step reads the last 128 positions' window KV).
+// GR8_DS_PF_L20_TAIL=1 (L1, default off; l20_tail() below, set once at boot): the boundary moves to layer 20 (geom::CAND_SOURCE, the last kv
+// source). Layer 20's ST_CA_ROW (compressed-KV row + index-K row + bf16 shadow of every position; it reads only hc_y, which hc_attn(20) in
+// U_CONS_F(19) made) is hoisted into range A, right before ST_PF_COMPACT, as an op of U_CONS_F(19) with i = 20. The rest of layer 20
+// (attn_proj, index_topk, cand_blocks, attn_core, attn_out, MLP) joins range B: its outputs are layer 20's window ring and per-row lists
+// (the top-k and candidate lists of the rows that run them), and layers 21..39 read those only for their own (tail) rows.
 // DSpark: ST_DS_TAP (layers 37..39) and ST_DS_MAIN sit in range B, so main_rows() is [0, late_rows): the draft rings get the tail positions,
 // which hold the window the first draft round reads (q = N-1 needs N-128 .. N-1; the last chunk ends at N-2).
 #pragma once
@@ -27,6 +32,11 @@ namespace br
 constexpr int TAIL_OFF = 0;
 constexpr int TAIL_MAX = 4096;   // the largest GR8_DS_PREFILL_W (ds41_prefill_rowcap)
 inline bool tail_valid(int tail) { return tail == TAIL_OFF || (tail >= geom::WINDOW && tail <= TAIL_MAX); }
+// GR8_DS_PF_L20_TAIL: the host switch the boot sets once (g6m4.cu, m4sim.cu) and tests set directly. false = the boundary at LATE_LAYER_START.
+inline bool& l20_tail() { static bool on = false; return on; }
+// the first layer id of range B: 21, or 20 with GR8_DS_PF_L20_TAIL=1
+inline int late_layer_start() { return l20_tail() ? geom::CAND_SOURCE : geom::LATE_LAYER_START; }
+static_assert(geom::CAND_SOURCE + 1 == geom::LATE_LAYER_START, "L1 moves the boundary one layer: layer 20 is the last kv source and the candidate source");
 // GR8_DS_PF_TAIL: -1 = not a valid value (the caller dies with tail_error())
 inline int parse_tail(const char* v)
 {
@@ -39,17 +49,17 @@ inline int parse_tail(const char* v)
 inline std::string tail_error(const char* v)
 {
     return std::string("GR8_DS_PF_TAIL=") + (v ? v : "") + ": must be 0 (bounded replay off) or " + std::to_string(geom::WINDOW) + ".." +
-           std::to_string(TAIL_MAX) + " (rows of each prefill chunk that run the layers >= " + std::to_string(geom::LATE_LAYER_START) + ")";
+           std::to_string(TAIL_MAX) + " (rows of each prefill chunk that run the layers >= " + std::to_string(late_layer_start()) + ")";
 }
 // rows of range B for a chunk of `rows` rows
 inline int late_rows(int rows, int tail) { return tail == TAIL_OFF || tail >= rows ? rows : tail; }
 // rows range B leaves out (the compaction shift): 0 = no compaction
 inline int shift_rows(int rows, int tail) { return rows - late_rows(rows, tail); }
-// first position i in Model::layers with ids[i] >= LATE_LAYER_START, -1 when there is none or it is position 0 (nothing to run full-row)
+// first position i in Model::layers with ids[i] >= late_layer_start(), -1 when there is none or it is position 0 (nothing to run full-row)
 inline int late_start(const std::vector<int>& ids)
 {
     for (int i = 0; i < (int)ids.size(); ++i)
-        if (ids[i] >= geom::LATE_LAYER_START) return i > 0 ? i : -1;
+        if (ids[i] >= late_layer_start()) return i > 0 ? i : -1;
     return -1;
 }
 // A non-final chunk's window floor for range B: positions below it were not written to the layers' rings this chunk and are masked
@@ -63,7 +73,9 @@ struct Split
     int i_late = -1;       // first position of range B; -1 = no split (ops = the input, b = ops.size())
     bool on() const { return i_late >= 0; }
 };
-// nf = dsp::pf::nonfinal_plan(...) of ids. No layer >= 21 (or only such layers) -> no split.
+// An op split_plan hoists out of U_ATTN(i_late) into range A: ST_CA_ROW of the boundary layer (only a kv source has one: layer 20 under L1).
+inline bool hoisted(const Op& o, int i_late) { return o.stage == ST_CA_ROW && o.unit == U_ATTN && o.ui == i_late; }
+// nf = dsp::pf::nonfinal_plan(...) of ids. No layer >= late_layer_start() (or only such layers) -> no split.
 inline Split split_plan(const std::vector<Op>& nf, const std::vector<int>& ids)
 {
     Split s;
@@ -73,10 +85,13 @@ inline Split split_plan(const std::vector<Op>& nf, const std::vector<int>& ids)
     {
         if (s.b == 0 && o.unit == U_ATTN && o.ui >= s.i_late)
         {
+            for (const Op& h : nf)   // L1: layer 20's ca row, run on every row, as the last op of U_CONS_F(i_late - 1) before the compaction
+                if (hoisted(h, s.i_late)) { Op x = h; x.unit = U_CONS_F; x.ui = s.i_late - 1; s.ops.push_back(x); }
             Op c; c.stage = ST_PF_COMPACT; c.unit = U_CONS_F; c.ui = s.i_late - 1; c.i = s.i_late - 1; c.l = ids[s.i_late - 1];
             s.ops.push_back(c);
             s.b = s.ops.size();
         }
+        if (s.b > 0 && hoisted(o, s.i_late)) continue;
         s.ops.push_back(o);
     }
     if (s.b == 0) { s.ops = nf; s.b = nf.size(); s.i_late = -1; }   // the plan has no layer >= i_late (cannot happen for a nonfinal plan of ids)
@@ -93,41 +108,68 @@ inline std::string check_split(const std::vector<Op>& nf, const Split& s, const 
         if (s.ops.size() != nf.size() || s.b != nf.size()) return "an unsplit plan is not the non-final plan";
         return late_start(ids) < 0 ? "" : "the layers have a late layer but the plan is not split";
     }
-    if (s.i_late != late_start(ids) || s.i_late <= 0 || ids[s.i_late] < geom::LATE_LAYER_START || ids[s.i_late - 1] >= geom::LATE_LAYER_START)
-        return "the split does not sit at the first layer id >= LATE_LAYER_START";
+    const int lls = late_layer_start();
+    if (s.i_late != late_start(ids) || s.i_late <= 0 || ids[s.i_late] < lls || ids[s.i_late - 1] >= lls)
+        return "the split does not sit at the first layer id >= the late layer start";
     if (s.b < 1 || s.b >= s.ops.size() || s.ops[s.b - 1].stage != ST_PF_COMPACT) return "range A does not end with ST_PF_COMPACT";
     int compacts = 0;
     for (const Op& o : s.ops) compacts += o.stage == ST_PF_COMPACT;
     if (compacts != 1) return "the split plan does not have exactly one ST_PF_COMPACT";
-    // removing the compaction gives the non-final plan op for op
-    size_t k = 0;
+    // the hoisted ops (L1: ST_CA_ROW of layer i_late) sit right before the compaction, as ops of U_CONS_F(i_late - 1) with i = i_late, and only
+    // when the boundary layer is a kv source (under L1 it must have one)
+    size_t h0 = s.b - 1;
+    while (h0 > 0 && s.ops[h0 - 1].stage == ST_CA_ROW && s.ops[h0 - 1].i == s.i_late) --h0;
+    const size_t nh = s.b - 1 - h0;
+    if (nh != (geom::is_kv_source(ids[s.i_late]) ? 1u : 0u)) return "range A does not end with the boundary layer's ca row (exactly when it is a kv source)";
+    for (size_t x = h0; x < s.b - 1; ++x)
+    {
+        const Op& a = s.ops[x];
+        if (a.unit != U_CONS_F || a.ui != s.i_late - 1 || a.l != ids[s.i_late] || a.rc != -1) return "a hoisted ca row is not in U_CONS_F of the last full-row layer";
+    }
+    // removing the compaction and putting each hoisted op back after ST_ATTN_PROJ of layer i_late (unit U_ATTN(i_late)) gives the non-final
+    // plan op for op
+    std::vector<Op> back;
     for (size_t x = 0; x < s.ops.size(); ++x)
     {
-        if (x == s.b - 1) continue;
-        const Op& a = s.ops[x];
+        if (x >= h0 && x < s.b) continue;
+        back.push_back(s.ops[x]);
+        if (x >= s.b && s.ops[x].stage == ST_ATTN_PROJ && s.ops[x].i == s.i_late)
+            for (size_t y = h0; y < s.b - 1; ++y) { Op o = s.ops[y]; o.unit = U_ATTN; o.ui = s.i_late; back.push_back(o); }
+    }
+    size_t k = 0;
+    for (const Op& a : back)
+    {
         if (k >= nf.size()) return "the split plan has an op the non-final plan does not have";
         const Op& o = nf[k++];
         if (a.stage != o.stage || a.unit != o.unit || a.ui != o.ui || a.i != o.i || a.l != o.l || a.src != o.src || a.rc != o.rc)
             return "the split plan dropped or reordered an op of the non-final plan";
     }
     if (k != nf.size()) return "the split plan dropped an op of the non-final plan";
-    // range A: only layers before i_late; range B: only layers >= i_late (ST_DS_MAIN, outside the layers, is the last op of range B)
+    // range A: only layers before i_late (and the hoisted ca row); range B: only layers >= i_late (ST_DS_MAIN, outside the layers, is the
+    // last op of range B)
     for (size_t x = 0; x < s.b; ++x)
     {
-        const int u = unit_layer(s.ops[x]);
-        if (u >= s.i_late) return "range A has an op of a layer >= LATE_LAYER_START";
+        const Op& o = s.ops[x];
+        if (unit_layer(o) >= s.i_late) return "range A has an op of a late layer";
+        // an op of layer i_late in range A: only its entry (hc_attn(i_late) in U_CONS_F(i_late - 1)) and the hoisted ca row
+        const bool entry = o.i == s.i_late && (o.stage == ST_HC_ATTN || o.stage == ST_ENGRAM), hoist = x >= h0 && x < s.b - 1;
+        if (o.i >= s.i_late && !entry && !hoist) return "range A has an op of a late layer";
     }
     for (size_t x = s.b; x < s.ops.size(); ++x)
     {
         const Op& o = s.ops[x];
         const int u = unit_layer(o);
-        if (u < s.i_late || ids[u] < geom::LATE_LAYER_START) return "range B has an op outside the layers >= LATE_LAYER_START";
-        if (o.stage == ST_EMBED || o.stage == ST_ENGRAM || o.stage == ST_CA_ROW || o.stage == ST_CAND_BLOCKS)
+        if (u < s.i_late || ids[u] < lls) return "range B has an op outside the late layers";
+        // ca row: the compressed / index-K rows of every position (layers >= 20 read them for every row). Candidate blocks are a per-row list
+        // (the rows that run them; layers 24..36 read it for the same rows, the compaction moves it when range A made it), so they may sit
+        // in range B when their layer is the boundary (L1): their keys are the index-K rows the hoisted ca row wrote for every row.
+        if (o.stage == ST_EMBED || o.stage == ST_ENGRAM || o.stage == ST_CA_ROW || (o.stage == ST_CAND_BLOCKS && u != s.i_late))
             return "range B has an op that writes state every row needs (embed / engram / ca row / candidate blocks)";
     }
     const Op& c = s.ops[s.b - 1];
     if (c.unit != U_CONS_F || c.ui != s.i_late - 1 || c.i != s.i_late - 1 || c.rc != -1) return "ST_PF_COMPACT is not in U_CONS_F of the last full-row layer";
-    if (s.b < 2 || s.ops[s.b - 2].unit != U_CONS_F || s.ops[s.b - 2].ui != s.i_late - 1) return "ST_PF_COMPACT does not follow that layer's consume_ffn unit";
+    if (h0 < 1 || s.ops[h0 - 1].unit != U_CONS_F || s.ops[h0 - 1].ui != s.i_late - 1 || s.ops[h0 - 1].stage == ST_CA_ROW)
+        return "ST_PF_COMPACT does not follow that layer's consume_ffn unit";
     return "";
 }
 // Late tail on the final chunk only (GR8_DS_PF_LATE_FINAL=1, default off). After a chunk ends at `context`, the readers of the layers

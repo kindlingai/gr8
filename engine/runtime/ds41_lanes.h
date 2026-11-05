@@ -196,7 +196,11 @@ inline std::vector<Acc> access(const Op& o)
                             {BF_TRUNK, true}};
     case ST_HC_ATTN: case ST_HC_FFN: return {{BF_TRUNK, false}, {BF_TRUNK, true}, {BF_HCY, true}};
     case ST_ATTN_PROJ: return {{BF_HCY, false}, {BF_IO, false}, {BF_ATTN_SCR, true}, {BF_KV, true, l}};
-    case ST_CA_ROW: return {{BF_ATTN_SCR, false}, {BF_CKV, true, l}};
+    case ST_CA_ROW:   // reads hc_y, not attn_proj's output (ds41_idx_op_ca_row): ratio 2 = comp_row(hc_y) -> the attention block's cnorm -> the index-K
+    {                 // row; ratio 1 (layer 20) = wkv(hc_y) -> the indexer's y512 / pre -> ca row, shadow, index-K row
+        const int sc = geom::compress_ratio(l) == 1 ? BF_IDX_SCR : BF_ATTN_SCR;
+        return {{BF_HCY, false}, {BF_IO, false}, {sc, true}, {sc, false}, {BF_CKV, true, l}};
+    }
     case ST_INDEX_TOPK:
     {
         std::vector<Acc> a = {{BF_CKV, false, ks}, {BF_IDX_SCR, true}, {BF_IDX_SCR, false}};
