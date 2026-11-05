@@ -6,12 +6,14 @@
 #include "../cp_rows.h"
 #include "../scheduler.h"
 #include "../kv_share.h"
+#include "../sessions.h"
 #include "ref/kv_plan_ref.h"
 #include "ref/flash_lend_ref.h"
 #include "ref/flash_ring_ref.h"
 #include "ref/cp_rows_ref.h"
 #include "ref/scheduler_ref.h"
 #include "ref/kv_share_ref.h"
+#include "ref/sessions_ref.h"
 #include <cstdio>
 #include <random>
 #include <string>
@@ -357,6 +359,105 @@ static void share_queue_diff(std::mt19937_64& rng)
     }
 }
 
+
+// a parsed request, every field (floats by their bits)
+static std::string str(const g6rt::ServeReq& r)
+{
+    auto bits = [](float f) { uint32_t b; std::memcpy(&b, &f, 4); return std::to_string(b); };
+    auto ids = [](const std::vector<int>& v) { std::string s; for (int x : v) s += std::to_string(x) + ","; return s; };
+    std::string s = ids(r.prompt) + "|" + ids(r.stop) + "|" + std::to_string(r.n_gen) + " " + std::to_string(r.min_tokens) + " " +
+                    bits(r.temp) + " " + bits(r.top_p) + " " + std::to_string(r.seed) + " " + std::to_string(r.lp) + " " +
+                    std::to_string(r.plp) + " " + std::to_string(r.sys) + "|" + std::to_string(r.ins.after) + " " +
+                    std::to_string(r.ins.unless) + " " + ids(r.ins.tokens) + "|" + std::to_string(int(r.gram.kind)) +
+                    std::to_string(r.gram.strict) + " " + std::to_string(r.gram.arm) + " " + r.gram.schema + "|" +
+                    std::to_string(r.steering.enabled) + " " + std::to_string(int(r.steering.scope)) + " " +
+                    std::to_string(r.steering.scale_bits) + " " + std::to_string(r.steering.slot) + " ";
+    for (auto b : r.steering.profile_digest) s += std::to_string(b) + ".";
+    for (auto b : r.steering.schedule_digest) s += std::to_string(b) + ".";
+    return s;
+}
+
+// both request parsers over generated request files, well formed and mutated
+static void request_diff(std::mt19937_64& rng)
+{
+    auto U = [&](int lo, int hi) { return int(std::uniform_int_distribution<int>(lo, hi)(rng)); };
+    auto pick = [&](const std::vector<std::string>& v) { return v[size_t(U(0, int(v.size()) - 1))]; };
+    namespace st = g6rt::steering;
+    st::BootConfig off, one, forced;
+    one.loaded = true;
+    one.profiles.push_back({"calm", {}, {}, 2});
+    for (unsigned i = 0; i < 32; ++i) { one.profiles[0].profile_digest[i] = uint8_t(i); one.profiles[0].schedule_digest[i] = uint8_t(63 - i); }
+    forced = one;
+    forced.forced = true;
+    forced.forced_scale_bits = 0x3f800000u;
+    const st::BootConfig* boots[] = {&off, &one, &forced};
+    const std::vector<std::string> nums = {"0", "1", "7", "42", "4096", "2147483647", "2147483648", "4294967295", "4294967296",
+                                           "18446744073709551615", "18446744073709551616", "", "-1", "+3", "1a", "007"};
+    const std::vector<std::string> floats = {"0", "0.5", "1", "1.0", "0.25", "2", "1e-3", "0.9999999", "1.00000001"
+#ifdef __GLIBCXX__
+                                             , "-0", ".5", "5.", "+0.5", "1e", "1e+", "1e40", "1e-50", "-1", "nan", "inf", "0x1p3",
+                                             "0.5seed", ".", "-", "1.2.3", "1e5e5", "00000.5", "3E2", "1,5"
+#endif
+    };
+    const std::vector<std::string> ints = {"0", "1", "5", "20", "21", "-1", "2147483647", "2147483648"
+#ifdef __GLIBCXX__
+                                           , "+4", "-0", "0x5", "5x", "", "99999999999999999999", "-9223372036854775809", "1.5"
+#endif
+    };
+    const std::vector<std::string> idlists = {"1", "1,2,3", "0,2147483647", "2147483648", "1,,2", ",1", "1,", "", "x", "5,6,7,8"};
+    for (int t = 0; t < 60000; ++t)
+    {
+        std::vector<std::string> w = {"n_gen", pick(nums), "temp", pick(floats), "seed", pick(nums), "min", pick(nums), "stop",
+                                      U(0, 1) ? "-" : pick(idlists)};
+        if (U(0, 2)) w.insert(w.end(), {"top_p", pick(floats)});
+        if (!U(0, 2)) w.insert(w.end(), {"lp", pick(ints)});
+        if (!U(0, 2)) w.insert(w.end(), {"plp", pick(ints)});
+        if (!U(0, 2)) w.insert(w.end(), {"sys", pick(ints)});
+        if (!U(0, 3)) w.insert(w.end(), {"ins", pick({"3:-1:8,9", "3:7:8", "3::8", "3:-1:", "x:-1:1", "2147483648:-1:1", "3:-1",
+                                                     "3:99999999999:1", "1:2:" + std::string("1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1")})});
+        if (!U(0, 3)) w.insert(w.end(), {"gram", pick({"1:0:-1:", "2:1:5:7b7d", "2:0:-1:7B22", "2:0:-1:7", "2:0:-1:zz", "3:0:-1:", "1:2:-1:",
+                                                       "1:0:-1", "1:0:x:", "2:1:99999999999:7b7d", "1:0:-1:7b"})});
+        if (!U(0, 3))
+        {
+            w.push_back("steer");
+            w.push_back(pick({"calm", "other", "-bad", "a.b_c-d", ""}));
+            w.push_back(pick({"3f800000", "00000000", "80000000", "40800000", "40800001", "7f800000", "3F800000", "3f8000", "bf800000"}));
+        }
+        // mutations: a dropped, swapped, doubled or glued word, odd whitespace, a stray word at the end
+        for (int m = U(0, 3) ? 0 : U(1, 3); m > 0 && !w.empty(); --m)
+        {
+            const size_t i = size_t(U(0, int(w.size()) - 1));
+            switch (U(0, 4))
+            {
+            case 0: w.erase(w.begin() + long(i)); break;
+#ifdef __GLIBCXX__
+            // these can put any word where a number is read, and libc++ reads numbers differently (production is libstdc++)
+            case 1: std::swap(w[i], w[size_t(U(0, int(w.size()) - 1))]); break;
+            case 2: w.insert(w.begin() + long(i), w[i]); break;
+            case 3: if (i + 1 < w.size()) { w[i] += w[i + 1]; w.erase(w.begin() + long(i) + 1); } break;
+#endif
+            default: w.push_back(pick({"extra", "top_p", "lp", "0"})); break;
+            }
+        }
+        std::string head;
+        for (const auto& x : w) head += (head.empty() ? "" : pick({" ", " ", " ", "  ", "\t", "\r", "\v"})) + x;
+        if (!U(0, 20)) head = pick({" ", "\t"}) + head;
+        std::string bytes = head;
+        if (U(0, 30)) bytes += "\n" + pick({"1,2,3", "1", "", "1 2", "1,2\n", " 7 ", "2147483648", "1,,2", "1\n\n"});
+        if (!U(0, 4)) bytes += "\n";
+        const st::BootConfig& b = *boots[U(0, 2)];
+        const std::string a = outcome([&] { return str(g6s2::parse_request(bytes, b)); });
+        const std::string r = outcome([&] { return str(g6s2ref::parse_request(bytes, b)); });
+        CHECK(a == r);
+        if (a != r && fails < 20) std::printf("  request [%s]\n    rs:  %s\n    ref: %s\n", bytes.c_str(), a.c_str(), r.c_str());
+    }
+    for (const char* g : {"1:0:-1:", "2:1:5:7b7d", "2:0:-1:7", "x", "1:0", "2:0:-1:zZ", "2:1:-1:7B7d"})
+    {
+        auto gs = [](const g6rt::GrammarSpec& x) { return std::to_string(int(x.kind)) + std::to_string(x.strict) + std::to_string(x.arm) + x.schema; };
+        CHECK(outcome([&] { return gs(g6s2::parse_grammar(g)); }) == outcome([&] { return gs(g6s2ref::parse_grammar(g)); }));
+    }
+}
+
 int main()
 {
     std::mt19937_64 rng(20261105);
@@ -469,6 +570,7 @@ int main()
     }
     scheduler_diff(rng);
     share_queue_diff(rng);
+    request_diff(rng);
     std::printf("scheduler_rs_diff_test: %s (%ld comparisons)\n", fails ? "FAIL" : "PASS", cases);
     return fails ? 1 : 0;
 }

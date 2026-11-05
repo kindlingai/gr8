@@ -163,4 +163,34 @@ uint64_t g6sch_queue_stalls(const g6sch_queue* q);
 const char* g6sch_queue_admitted(g6sch_queue* q, uint64_t id);
 const char* g6sch_queue_check(g6sch_queue* q, uint64_t revision, bool slot, bool fits, uint32_t room, bool* has, g6sch_status* out);
 
+// sessions.h parse_request: the parsed request, its arrays owned by the handle the parse returned
+struct g6sch_ints { const int32_t* p; size_t n; };
+struct g6sch_parsed_req {
+    g6sch_ints prompt, stop;
+    int32_t n_gen, min_tokens;
+    float temp, top_p;
+    uint32_t seed;
+    int32_t lp, plp;
+    int64_t sys;
+    g6sch_identity steering;
+    int32_t ins_after, ins_unless;
+    g6sch_ints ins_tokens;
+    uint32_t gram_kind;
+    bool gram_strict;
+    int32_t gram_arm;
+    const uint8_t* schema;
+    size_t schema_n;
+};
+struct g6sch_parsed;
+// the caller's steering resolution: null and *out written, or its refusal (valid until the caller's next call). It
+// must not throw.
+typedef const char* (*g6sch_resolve_fn)(void* ctx, bool has_profile, const uint8_t* profile, size_t profile_n,
+                                        uint32_t scale_bits, g6sch_identity* out);
+const char* g6sch_parse_request(const uint8_t* bytes, size_t n, bool grammar_ready, g6sch_resolve_fn resolve, void* ctx,
+                                g6sch_parsed_req* out, g6sch_parsed** handle);
+void g6sch_parsed_free(g6sch_parsed* handle);
+// one `gram` field; *handle owns the schema bytes (g6sch_parsed_free)
+const char* g6sch_parse_grammar(const uint8_t* s, size_t n, uint32_t* kind, bool* strict, int32_t* arm, const uint8_t** schema,
+                                size_t* schema_n, g6sch_parsed** handle);
+
 }
