@@ -181,7 +181,9 @@ def release_hidden(manifest_path):
                 c = json.load(f)
         except (OSError, ValueError):
             continue
-        return c.get('hidden_size') or (c.get('text_config') or {}).get('hidden_size')
+        h = c.get('hidden_size') or (c.get('text_config') or {}).get('hidden_size')
+        if h:
+            return h
     return None
 
 

@@ -530,7 +530,7 @@ void Fabric::init(const FabricConfig& cfg) {
   // One rank (TP=1): a kernel reads only the slots of other ranks, of which there are none, so nothing needs sending.
   // The region stays, for the kernels' own slots and doorbells; steps and barriers do nothing.
   if (nr == 1) {
-    FCHECK(!cfg.ring);
+    FCHECK(!cfg.ring && !I.bulk);                     // a bulk job always has a peer: no bulk fabric on one rank
     I.solo = true;
     live(kLiveFab, 1);
     return;
@@ -793,7 +793,6 @@ void Fabric::enqueue_bulk(BulkJob job) {
   FCHECK(I.bulk && job.db < I.bd.nflags && job.wait_flag < I.bd.nflags && job.post_flag < I.bd.nflags);
   for (const auto& r : job.ranges) FCHECK(r.first % 8 == 0 && r.second % 8 == 0 && r.second > 0 && r.first + r.second <= cfg_.bulk_bytes);
   FCHECK(job.peer == -1 || (job.peer >= 0 && job.peer < I.bd.nr && job.peer != I.bd.rank));
-  if (I.solo) return;
   Job j{}; j.bulk = true; j.b = std::move(job);
   { std::lock_guard<std::mutex> lk(I.mu); I.q.push_back(std::move(j)); I.pending++; }
   I.cv.notify_one();
