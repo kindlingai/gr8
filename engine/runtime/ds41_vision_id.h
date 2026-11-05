@@ -1,7 +1,8 @@
 // DS41 image input in the rank agreement (g6m4.cu, the DS41 S2 runtime signature). Each rank looks for the tower file on its
-// own, and a rank without it boots text-only, so the ranks agree on what they loaded, not on the GR8_DS41_VISION knob: a
-// rank with the tower adds " vision <id>" (the file's byte size and the FNV-1a of its safetensors header), a rank without it
-// adds nothing. Ranks that differ (one without the file, or another file) refuse at bootstrap. No CUDA types.
+// own, and a rank without it boots text-only, so the ranks agree on the effective capability, not on the GR8_DS41_VISION
+// knob: a rank with the tower adds " vision <id>", a rank without it adds nothing. The id is the file's byte size and the
+// FNV-1a of its safetensors header length + header bytes, so it checks header, layout and size agreement, NOT the tensor
+// data. Ranks that differ (one without the file, or a file whose header or size differs) refuse at bootstrap. No CUDA types.
 #pragma once
 #include <cstdint>
 #include <cstdio>
