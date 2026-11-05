@@ -318,9 +318,25 @@ and R5 then move one pool's callers, not two KV models'.
 
 ### R4. The driver to Rust
 
-`s2/driver.h` is glue between R2, R3 and the hooks; after them it is Rust to Rust plus the module callbacks (`grow`,
-`prefill`, `prefill_pack`, `dfl_*`). With the driver and then the service in Rust, the pool is called Rust to Rust and
-`s2/pool.h` (218 lines of FFI) and `kv_share.h`'s `share_apply` go.
+`s2/driver.h` (289 lines) is glue between the scheduler (R2), the planner (R3) and the engine hooks: it applies commits,
+grows runs before a round, picks capped rounds past R, runs one scheduler quantum on the planner and reports
+completions. After R3 every piece it calls is Rust, so the driver moves whole and owns what it drives:
+
+- State: the driver owns the scheduler's slots and state and the planner (both Rust-owned handles, not C++ mirrors),
+  the per-slot payloads, emitted counts and initialised flags, and the capped-round cycle. `Scheduler`'s C++ mirror of
+  the slots goes; the service, still C++ until R5, reads the slots through one exported view (`slots()` today).
+- Hooks: `DriverHooks` becomes one C table of engine callbacks (`bind`, `retire`, `prefill`, `prefill_pack`, `run`,
+  `emit`, `prompt`, `round`, `dfl_ok`, `dfl_start`, `dfl`, `draft_lp`, `terminal`, `grow`, `finished`, `resize`,
+  `shrink`, `settle`), each a function pointer and a context, as the planner's hooks are since R3b. This table is the
+  first half of R5's `ModuleOps`.
+- The pool: `grow`, `finished`, `bind`, `retire`, `shrink` and `resize` reach the pool through g6m4's lambdas today.
+  Linking kvman-rs into the same library as scheduler-rs (one Cargo workspace, one staticlib; R10 needs it anyway)
+  lets the driver call the pool Rust to Rust, under the lock the C++ `RunPool` takes today (the head's control thread
+  reads the pool). `s2/pool.h` then serves only the C++ still left (g6m4's tier and checkpoint wiring, until R8), and
+  `kv_share.h`'s `share_apply`, which orders pool calls, moves beside the driver.
+- Proof: the round log replays unchanged (the driver's calls into the planner are the log's calls), the scheduler and
+  driver host tests (`driver_grow_test`, the `scheduler_*` tests, `cp_rows_test`) run against the Rust driver behind a
+  thin C++ facade as R3b did, and a confirmation boot's logs equal the earlier boots'. One C call per quantum.
 
 ### R5. Service, control, bootstrap and ingress to Rust; ModuleOps
 
