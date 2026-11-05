@@ -64,6 +64,9 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 # DS41 image requests: the img header fields, the prompt checks, the image digest in the cache namespace and the control protocol
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/image_request_test.cpp" -o "$T/image_request_test" "${KNOBS[@]}"
 "$T/image_request_test"
+# a grant with DS41 images through the Rust scheduler: the slot keeps images + image_digest, and both change the state digest
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/image_state_test.cpp" -o "$T/image_state_test" "${KNOBS[@]}"
+"$T/image_state_test"
 # DS41 image rows in the Engram ring of a prefix-cache entry and a GR8_DS_PARK resume: equal to the live ring (gaps 0..3)
 g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -I "$REPO/engine/runtime" \
   "$REPO/engine/runtime/s2/tests/ds41_engram_ring_test.cpp" -o "$T/ds41_engram_ring_test"
