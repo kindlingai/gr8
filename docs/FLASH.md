@@ -42,18 +42,21 @@ own metadata (`hidden_size` 4096) and maps Flash's tensors with `engine/loader-r
 scheduler keeps past it (2 at MTP=1), so the front end's `max_model_len` is 262,206 (`pool_rows - guard`).
 
 Only the attention layers keep KV: the 11 DSA layers and the MTP layer, 12 bindings a rank. KDA's state is the same size
-at any context. A token costs each of them a 1,024 B bf16 latent row and 640 B of indexer keys (`engine/attn/kvfmt.h`;
-a build with `-DG6_FLASH_KV_FP8=1` makes the row 528 B, the int4 build below 288 B), 19,968 B in all (11,136 B with
-int4). Flash has no CP, so every rank holds the whole context and
-the cost is the same at TP=4 and TP=2:
+at any context. A token costs each of them a 1,024 B bf16 latent row and 128 B of pooled indexer keys
+(`engine/attn/kvfmt.h`; a build with `-DG6_FLASH_KV_FP8=1` makes the row 528 B, the int4 build below 288 B), 13,824 B
+in all (4,992 B with int4). A token's raw indexer row (512 B) feeds only the pool of 4 it belongs to, so it is not in
+the pages: the pool reads it from its own call, or from the binding's raw ring of the last 64 positions of each session
+(256 KB a binding). Flash has no CP, so every rank holds the whole context and the cost is the same at TP=4 and TP=2:
 
-| CAP | pages of 64 | KV a rank |
-|---|---|---|
-| 33,280 (the old default) | 520 | 0.66 GB |
-| 262,208 | 4,097 | 5.24 GB |
-| 1,048,640 | 16,385 | 20.9 GB |
+| CAP | pages of 64 | KV a rank | with int4 |
+|---|---|---|---|
+| 33,280 (the old default) | 520 | 0.46 GB | 0.17 GB |
+| 262,208 | 4,097 | 3.62 GB | 1.31 GB |
+| 1,048,640 | 16,385 | 14.50 GB | 5.23 GB |
 
-Decode and prefill scratch grow with a quarter of `CAP` and stay small by comparison. The model's config allows
+The indexer's score scratch holds one key tile per row: a call whose context passes 16,384 pools (64K tokens) scores
+the pools in tiles of that size and keeps a running top-512 (`kp_select_tile` in `engine/attn/kpool.cuh`, the same
+lists as one pass), so decode and prefill scratch stop growing with `CAP` past 64K. The model's config allows
 1,048,576 positions, and `CAP` may go higher where memory allows. Each layer's bind checks that `GR8_MEM_MIN` (8 GiB)
 stays free, so a `CAP` that leaves too little stops the boot; the boot log's `MemAvailable` line shows what is left.
 
@@ -69,9 +72,11 @@ With one session (`SESS=1`, the default) `SHARE_LIMIT` (32768) shares nothing: i
 request without one gets, `SHARE_LIMIT - 64 - prompt` but at least 8192, capped by the room left. With several (below)
 it also decides which requests share decode steps, as on GLM-5.3: a longer one waits for the others and runs alone.
 
-Prefill time grows faster than the prompt because the indexer scores every earlier key for each row. The time of a
-262K prefill has not been measured. The shim errors a request after 900 s with no output (`--stall-timeout`), and a
-prefill sends none, so a prefill longer than that fails.
+Prefill time grows faster than the prompt because the indexer scores every earlier key for each row. At TP=1 a
+4,096-row quantum takes 3.2 s at the start of a prompt, 5.1 s at 240K and 8.4 s at 900K (90 C, clocks held at
+1,781 MHz). The shim errors a request after 900 s with no output (`--stall-timeout`), but the engine reports each
+quantum to it (an `f` line, `s2/sessions.h progress`), so the timeout bounds one quantum, not the whole prefill: a
+923K-token prompt prefilled in 1,371 s with the default.
 
 ## One box (TP=1)
 
@@ -80,10 +85,23 @@ has no peers then: `g6::Fabric` keeps its region for the kernels' own slots and 
 proxy (`engine/comms/fabric.cpp`), and the S2 head agrees with itself (`s2/control_channel.h`). The launcher skips the
 RDMA checks. The router is not split (no ranks to split it over), so the routed experts run on the expert tiles.
 
+Memory on one GB10 with the K2 release, int4 KV, `--sess 4`, the DFlash2 drafter and aligned checkpoints on an SSD
+store with a spare-RAM cache (`--pf-lanes 1`), MemAvailable at boot and the lowest under a long prompt:
+
+| CAP | boot | lowest | prompt |
+|---|---|---|---|
+| 262,208 | 6.7 GiB | 6.6 GiB | 128K and 240K |
+| 524,352 | 5.6 GiB | 4.8 GiB | 448K |
+| 1,048,640 | 3.1 GiB | 2.4 GiB | 900K: TTFT 1,371 s (673 tok/s), then 15.8 tok/s decode; cached TTFT 5.0 s |
+
+At 1,048,640 the boot's headroom check after the prefill lane is 5.5 GiB, so it needs `GR8_MEM_MIN=5` (the others
+pass at 6).
+
 ## int4 KV (`--kv-format int4`, experimental)
 
 `bin/g6m4_flash-int4` (`KV_FORMAT=int4 MODEL=flash scripts/build.sh`, `-DG6_KV4=1`) stores the latent in 4 bits: 256 B
-of codes and one FP16 scale per 32 dims (amax / 7), 288 B a row against bf16's 1,024. The indexer keys are unchanged.
+of codes and one FP16 scale per 32 dims (amax / 7), 288 B a row against bf16's 1,024. The pooled indexer keys are
+unchanged.
 There is no rotation: Flash's latent is NoPE, and every read dequantizes in place (`latent`, `lat4`, `stage_cvt8` in
 `engine/attn/flash_attn.cu`). `--kv-format int4` makes the launcher run it and pass the flag, which the build requires.
 
@@ -127,8 +145,8 @@ index, the aligned point, the manifest) and `flash_checkpoint.cuh` (the store), 
 
 - The grid is the prefill quantum: `--prefill` rows times the lanes, 4,096 x 2 = 8,192 rows. A prompt of N tokens keeps
   a checkpoint at `p = floor((N - 1) / 8192) * 8192`, so prompts of 8,192 tokens or fewer keep none.
-- A checkpoint holds rows `[0, p)` of the 12 attention bindings (the latent rows and the indexer keys), the session's
-  first KDA slot's state and conv history, and the prompt's tokens `[0, p]`. A later prompt hits it when it starts with
+- A checkpoint holds rows `[0, p)` of the 12 attention bindings (the latent rows and the pooled indexer keys), the
+  session's first KDA slot's state and conv history, its raw index rings, and the prompt's tokens `[0, p]`. A later prompt hits it when it starts with
   those `p + 1` tokens under the same cache namespace (the steering profile); the longest entry wins, then the newest.
 - A hit restores the checkpoint at bind, after the cold reset, and prefills from `p`.
 - With several sessions (`SESS` 2 to 8) each session keeps and restores its own: the rows are the session's run's
