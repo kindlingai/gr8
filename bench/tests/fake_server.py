@@ -59,6 +59,10 @@ class Handler(BaseHTTPRequestHandler):
         st = self.server.st
         if self.path == '/v1/models':
             return self._json({'data': [{'id': 'fake-model', 'max_model_len': 200000}]})
+        if self.path == '/health':
+            return self._json({'ready': True})
+        if self.path != '/metrics':
+            return self.send_error(404)
         c = st.counters
         lines = [f'vllm:spec_decode_num_drafts_total{{engine="0"}} {c["drafts"]}',
                  f'vllm:spec_decode_num_draft_tokens_total{{engine="0"}} {c["draft"]}',
@@ -134,7 +138,31 @@ class Handler(BaseHTTPRequestHandler):
         usage = {'prompt_tokens': len(p), 'completion_tokens': n, 'total_tokens': len(p) + n}
         self.wfile.write(b'data: ' + json.dumps({'choices': [], 'usage': usage}).encode() + b'\n\ndata: [DONE]\n\n')
 
+    def _tool_chat(self, body):
+        """With tools: list /app on the first turn, then finish. Streamed: thinking, then the call in two argument pieces."""
+        first = body['messages'][-1]['role'] == 'user'
+        name, args = ('list_dir', ['{"path": ', '"/app"}']) if first else ('finish', ['{"answer": ', '"3"}'])
+        if not body.get('stream'):
+            call = {'id': 'call_1', 'type': 'function', 'function': {'name': name, 'arguments': ''.join(args)}}
+            return self._json({'choices': [{'index': 0, 'finish_reason': 'tool_calls',
+                                            'message': {'role': 'assistant', 'content': None, 'tool_calls': [call]}}]})
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.end_headers()
+        chunks = [{'reasoning_content': 'Let me look. '},
+                  {'tool_calls': [{'index': 0, 'id': 'call_1', 'type': 'function', 'function': {'name': name}}]}]
+        chunks += [{'tool_calls': [{'index': 0, 'function': {'arguments': a}}]} for a in args]
+        for d in chunks:
+            self.wfile.write(b'data: ' + json.dumps({'choices': [{'index': 0, 'delta': d}]}).encode() + b'\n\n')
+            time.sleep(0.002)
+        end = {'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'}]}
+        self.wfile.write(b'data: ' + json.dumps(end).encode() + b'\n\n')
+        usage = {'prompt_tokens': 10, 'completion_tokens': 9, 'total_tokens': 19}
+        self.wfile.write(b'data: ' + json.dumps({'choices': [], 'usage': usage}).encode() + b'\n\ndata: [DONE]\n\n')
+
     def _chat(self, st, body):
+        if body.get('tools'):
+            return self._tool_chat(body)
         text = body['messages'][-1]['content']
         n_prompt = len(toks(text))
         st.chat_prompts.append(text)
