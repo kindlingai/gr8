@@ -1,7 +1,7 @@
 //! The S2 request file's parser (was parse_request and its helpers in engine/runtime/s2/sessions.h). A request is a
 //! header line, `n_gen <n> temp <f> seed <n> min <n> stop <ids|->` and then, in this order and each optional,
-//! `top_p <f>`, `lp <k>`, `plp <k>`, `sys <n>`, `ins <rule>`, `gram <grammar>` and `steer <profile> <hex>`, then a
-//! line of comma-separated prompt ids. The header is read the way libstdc++'s istringstream read it, so every request
+//! `top_p <f>`, `lp <k>`, `plp <k>`, `sys <n>`, `ins <rule>`, `gram <grammar>` and `steer <profile> <hex>`, then any
+//! number of `img <field>` (DS41 images, ds41_image.h), then a line of comma-separated prompt ids. The header is read the way libstdc++'s istringstream read it, so every request
 //! the C++ took, and every refusal it gave, is the same here: a number ends at the first character it cannot take, and
 //! the rest of that word is the next word.
 
@@ -280,8 +280,14 @@ pub struct SteerFields<'a> {
 }
 
 /// `grammar_ready`: the engine was started with --grammar-dir. `resolve` turns the steering fields into the request's
-/// identity, or refuses.
-pub fn parse(bytes: &[u8], grammar_ready: bool, resolve: &mut dyn FnMut(&SteerFields) -> R<Identity>) -> R<Request> {
+/// identity, or refuses. `image` takes each `img` field's value in order, or refuses it: the caller keeps the images
+/// (ds41_image.h parse_field) and checks them against the prompt after the parse (img::check, img::digest).
+pub fn parse(
+    bytes: &[u8],
+    grammar_ready: bool,
+    resolve: &mut dyn FnMut(&SteerFields) -> R<Identity>,
+    image: &mut dyn FnMut(&[u8]) -> R<()>,
+) -> R<Request> {
     let line = find(bytes, b'\n', 0).ok_or(Msg("request missing prompt line"))?;
     let mut inp = Stream::new(&bytes[..line]);
     let mut temp = 0f32;
@@ -317,6 +323,8 @@ pub fn parse(bytes: &[u8], grammar_ready: bool, resolve: &mut dyn FnMut(&SteerFi
             schedule_digest: [0; 32],
             scale_bits: 0,
             slot: 0,
+            images: false,
+            image_digest: [0; 32],
         },
         ins: Insert { after: -1, unless: -1, tokens: vec![] },
         gram: Grammar { kind: 0, strict: false, arm: -1, schema: vec![] },
@@ -372,7 +380,12 @@ pub fn parse(bytes: &[u8], grammar_ready: bool, resolve: &mut dyn FnMut(&SteerFi
         require(valid_profile_name(name), "invalid steering profile name")?;
         sf = SteerFields { profile: Some(name), scale_bits: parse_scale_bits(bits)? };
     }
-    require(k.is_empty(), "invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram and steer)")?;
+    while k == b"img" {
+        let v = inp.word().ok_or(Msg("invalid img header"))?;
+        image(v)?;
+        next!();
+    }
+    require(k.is_empty(), "invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram, steer and img)")?;
     require(r.ins.after < 0 || r.lp < 0, "ins with lp")?;
     r.steering = resolve(&sf)?;
     let g = number(gen)?;
@@ -416,7 +429,12 @@ mod tests {
             schedule_digest: [0; 32],
             scale_bits: 0,
             slot: 0,
+            images: false,
+            image_digest: [0; 32],
         })
+    }
+    fn no_img(_: &[u8]) -> R<()> {
+        Err(Msg("no img here"))
     }
 
     #[test]
@@ -425,12 +443,13 @@ mod tests {
             b"n_gen 9 temp 0.5 seed 7 min 1 stop 3,4 top_p 0.9 plp 2 sys 5 ins 3:-1:8,9\n1,2,3\n",
             false,
             &mut off,
+            &mut no_img,
         )
         .unwrap();
         assert_eq!((r.n_gen, r.seed, r.min_tokens, r.temp, r.top_p, r.plp, r.sys), (9, 7, 1, 0.5, 0.9, 2, 5));
         assert_eq!((r.stop, r.prompt, r.ins.tokens), (vec![3, 4], vec![1, 2, 3], vec![8, 9]));
         assert_eq!(
-            parse(b"n_gen 9 temp 0.5 seed 7 min 1 stop - lp 2 ins 3:-1:8\n1\n", false, &mut off).err(),
+            parse(b"n_gen 9 temp 0.5 seed 7 min 1 stop - lp 2 ins 3:-1:8\n1\n", false, &mut off, &mut no_img).err(),
             Some(Msg("ins with lp"))
         );
     }
@@ -438,22 +457,49 @@ mod tests {
     #[test]
     fn numbers_end_where_libstdcxx_stops() {
         // "0.5seed" reads 0.5, then "seed" is the next word
-        assert!(parse(b"n_gen 9 temp 0.5seed 7 min 1 stop -\n1\n", false, &mut off).is_ok());
+        assert!(parse(b"n_gen 9 temp 0.5seed 7 min 1 stop -\n1\n", false, &mut off, &mut no_img).is_ok());
         assert_eq!(
-            parse(b"n_gen 9 temp 1e seed 7 min 1 stop -\n1\n", false, &mut off).err(),
+            parse(b"n_gen 9 temp 1e seed 7 min 1 stop -\n1\n", false, &mut off, &mut no_img).err(),
             Some(Msg("invalid request header"))
         );
         assert_eq!(
-            parse(b"n_gen 9 temp 1e99 seed 7 min 1 stop -\n1\n", false, &mut off).err(),
+            parse(b"n_gen 9 temp 1e99 seed 7 min 1 stop -\n1\n", false, &mut off, &mut no_img).err(),
             Some(Msg("invalid request header"))
         );
         assert_eq!(
-            parse(b"n_gen 9 temp 0 seed 7 min 1 stop - lp 21\n1\n", false, &mut off).err(),
+            parse(b"n_gen 9 temp 0 seed 7 min 1 stop - lp 21\n1\n", false, &mut off, &mut no_img).err(),
             Some(Msg("invalid lp header"))
         );
         assert_eq!(
-            parse(b"n_gen 9 temp 0 seed 7 min 1 stop - lp 2x\n1\n", false, &mut off).err(),
-            Some(Msg("invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram and steer)"))
+            parse(b"n_gen 9 temp 0 seed 7 min 1 stop - lp 2x\n1\n", false, &mut off, &mut no_img).err(),
+            Some(Msg("invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram, steer and img)"))
+        );
+    }
+
+    #[test]
+    fn img_fields_go_to_the_caller_in_order() {
+        let mut seen: Vec<Vec<u8>> = vec![];
+        let mut keep = |v: &[u8]| -> R<()> {
+            seen.push(v.to_vec());
+            Ok(())
+        };
+        let r = parse(b"n_gen 9 temp 0 seed 7 min 1 stop - steer calm 3f800000 img a img b\n1\n", false, &mut off, &mut keep);
+        assert!(r.is_ok());
+        assert_eq!(seen, vec![b"a".to_vec(), b"b".to_vec()]);
+        // the caller's refusal comes back where the C++ loop threw it: before the tail, ins/lp and steering checks
+        assert_eq!(
+            parse(b"n_gen 9 temp 0 seed 7 min 1 stop - lp 2 ins 3:-1:8 img a extra\n1\n", false, &mut off, &mut no_img).err(),
+            Some(Msg("no img here"))
+        );
+        assert_eq!(
+            parse(b"n_gen 9 temp 0 seed 7 min 1 stop - img\n1\n", false, &mut off, &mut no_img).err(),
+            Some(Msg("invalid img header"))
+        );
+        // img comes last: a field after it is the tail
+        let mut any = |_: &[u8]| -> R<()> { Ok(()) };
+        assert_eq!(
+            parse(b"n_gen 9 temp 0 seed 7 min 1 stop - img a top_p 0.5\n1\n", false, &mut off, &mut any).err(),
+            Some(Msg("invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram, steer and img)"))
         );
     }
 

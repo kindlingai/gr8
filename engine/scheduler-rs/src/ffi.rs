@@ -498,6 +498,7 @@ pub extern "C" fn g6sch_abi(what: u32) -> u64 {
         u64::from(sch::MAX_DECODE_ROUNDS),
         sch::PACK_MAX_MEMBERS as u64,
         sch::QMAX as u64,
+        PARSE_FN,
     ];
     v.get(what as usize).copied().unwrap_or(0)
 }
@@ -641,13 +642,23 @@ pub type ResolveFn = unsafe extern "C" fn(
     out: *mut Identity,
 ) -> *const c_char;
 
+/// The version of g6sch_parse_request's parameters and its callback types (g6sched.h G6SCH_PARSE_FN, which the C++
+/// requires through g6sch_abi in scheduler.h check_abi): no compiler checks them across the C ABI, so change any -> bump both. 2: `image`.
+pub const PARSE_FN: u64 = 2;
+
+/// The caller's `img` field (DS41, ds41_image.h parse_field): null when it kept the image, or its refusal message
+/// (valid until the caller's next call). Called once per field, in order, at the point the C++ parser read them.
+pub type ImageFn = unsafe extern "C" fn(ctx: *mut std::ffi::c_void, field: *const u8, field_n: usize) -> *const c_char;
+
 /// Parses a request file's bytes; on success *out describes it and *handle owns its arrays (g6sch_parsed_free).
+/// `resolve` and `image` share `ctx`.
 #[no_mangle]
 pub unsafe extern "C" fn g6sch_parse_request(
     bytes: *const u8,
     n: usize,
     grammar_ready: bool,
     resolve: ResolveFn,
+    image: ImageFn,
     ctx: *mut std::ffi::c_void,
     out: *mut ParsedReq,
     handle: *mut *mut rq::Request,
@@ -662,7 +673,15 @@ pub unsafe extern "C" fn g6sch_parse_request(
             Err(Refusal::Foreign(e))
         }
     };
-    match rq::parse(slice(bytes, n), grammar_ready, &mut cb) {
+    let mut img = |v: &[u8]| -> Result<(), Refusal> {
+        let e = image(ctx, v.as_ptr(), v.len());
+        if e.is_null() {
+            Ok(())
+        } else {
+            Err(Refusal::Foreign(e))
+        }
+    };
+    match rq::parse(slice(bytes, n), grammar_ready, &mut cb, &mut img) {
         Ok(r) => {
             let r = Box::new(r);
             *out = ParsedReq {
@@ -736,6 +755,8 @@ pub unsafe extern "C" fn g6sch_parse_grammar(
                     schedule_digest: [0; 32],
                     scale_bits: 0,
                     slot: 0,
+                    images: false,
+                    image_digest: [0; 32],
                 },
                 ins: rq::Insert { after: -1, unless: -1, tokens: vec![] },
                 gram: g,

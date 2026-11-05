@@ -127,7 +127,7 @@ struct g6sch_completion { g6sch_key key; uint32_t emitted; bool finished; uint32
 // the Rust side's constants, which the C++ wrapper checks once (scheduler.h check_abi) with the layout digest below
 enum {
     G6SCH_ABI_PAGE, G6SCH_ABI_PREFILL_DEFER_MAX, G6SCH_ABI_NOTICE_MIN, G6SCH_ABI_NOTICE_MAX, G6SCH_ABI_NOTICE_ROWS,
-    G6SCH_ABI_MAX_DECODE_ROUNDS, G6SCH_ABI_PACK_MAX_MEMBERS, G6SCH_ABI_QMAX,
+    G6SCH_ABI_MAX_DECODE_ROUNDS, G6SCH_ABI_PACK_MAX_MEMBERS, G6SCH_ABI_QMAX, G6SCH_ABI_PARSE_FN,
 };
 uint64_t g6sch_abi(uint32_t what);
 
@@ -222,8 +222,15 @@ struct g6sch_parsed;
 // must not throw.
 typedef const char* (*g6sch_resolve_fn)(void* ctx, bool has_profile, const uint8_t* profile, size_t profile_n,
                                         uint32_t scale_bits, g6sch_identity* out);
-const char* g6sch_parse_request(const uint8_t* bytes, size_t n, bool grammar_ready, g6sch_resolve_fn resolve, void* ctx,
-                                g6sch_parsed_req* out, g6sch_parsed** handle);
+// the caller's `img` field (DS41, ds41_image.h): null when kept, or its refusal (valid until the caller's next call).
+// Called once per field, in order. It must not throw. resolve and image share ctx.
+typedef const char* (*g6sch_image_fn)(void* ctx, const uint8_t* field, size_t field_n);
+// The version of g6sch_parse_request's parameters and callback types, which no compiler checks across the C ABI:
+// scheduler.h check_abi requires g6sch_abi(G6SCH_ABI_PARSE_FN) == G6SCH_PARSE_FN. Change any of them -> bump it here and
+// PARSE_FN in src/ffi.rs. 2: the image callback.
+#define G6SCH_PARSE_FN 2
+const char* g6sch_parse_request(const uint8_t* bytes, size_t n, bool grammar_ready, g6sch_resolve_fn resolve,
+                                g6sch_image_fn image, void* ctx, g6sch_parsed_req* out, g6sch_parsed** handle);
 void g6sch_parsed_free(g6sch_parsed* handle);
 // one `gram` field; *handle owns the schema bytes (g6sch_parsed_free)
 const char* g6sch_parse_grammar(const uint8_t* s, size_t n, uint32_t* kind, bool* strict, int32_t* arm, const uint8_t** schema,

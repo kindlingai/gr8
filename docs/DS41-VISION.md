@@ -13,7 +13,8 @@ The `ds41` engine takes images in chat requests, the way the release's own code 
    becomes the image's span of `llm_h * (llm_w + 1) + 2` image tokens. The front end sends the padded RGB to the engine in
    the `generate` frame's `images` (PROTOCOL.md). Limits: 16 images and 48 MiB of base64 a request.
 2. **Engine, admission** (`engine/runtime/ds41_image.h`, `s2/sessions.h`, `s2/service.h`). The shim's `img` header
-   fields are parsed and checked against the prompt (every span row is the image token, spans in order, no overlap).
+   fields are parsed (the Rust request parser, `engine/scheduler-rs/src/request.rs`, hands each one back to
+   `ds41_image.h` through a callback, at the point the C++ parser read it) and checked against the prompt (every span row is the image token, spans in order, no overlap).
    The pixel digest joins the request's cache identity, so an image prompt never shares prefix-cache pages with a
    text prompt or with a prompt that has other images (control protocol version 14). A request is refused
    (`end error`) when the tower is not loaded, when the prompt would not prefill (prompt_logprobs, steering, or

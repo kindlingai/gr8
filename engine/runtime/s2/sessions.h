@@ -13,12 +13,15 @@
 namespace g6s2 {
 // The request file's parser is engine/scheduler-rs/src/request.rs. A request is the header line
 // `n_gen <n> temp <f> seed <n> min <n> stop <ids|->`, then optionally and in this order `top_p <f>`, `lp <k>`,
-// `plp <k>`, `sys <n>`, `ins <rule>`, `gram <grammar>` and `steer <profile> <canonical-fp32-hex>`, then the prompt ids.
+// `plp <k>`, `sys <n>`, `ins <rule>`, `gram <grammar>` and `steer <profile> <canonical-fp32-hex>`, then any number of
+// `img <field>` (DS41 images, ds41_image.h: parsed here through parse::image, checked after the prompt), then the
+// prompt ids.
 namespace parse {
 using Handle = std::unique_ptr<g6sch_parsed, void (*)(g6sch_parsed*)>;
 inline std::vector<int> ints(const g6sch_ints& v) { return std::vector<int>(v.p, v.p + v.n); }
-// the steering fields to the request's identity (BootConfig::resolve), its refusal kept for the parser to return
-struct Resolve { const g6rt::steering::BootConfig* boot; std::string error; };
+// the steering fields to the request's identity (BootConfig::resolve), its refusal kept for the parser to return;
+// images: the request's `img` fields (parse::image), in order
+struct Resolve { const g6rt::steering::BootConfig* boot; std::string error; std::vector<g6rt::ImageIn> images; };
 inline const char* resolve(void* ctx, bool has_profile, const uint8_t* profile, size_t n, uint32_t bits, g6sch_identity* out) {
     auto& r = *static_cast<Resolve*>(ctx);
     try {
@@ -39,6 +42,20 @@ inline const char* resolve(void* ctx, bool has_profile, const uint8_t* profile, 
         return r.error.c_str();
     }
 }
+// one `img` field (ds41_image.h parse_field), kept in the context; its refusal kept for the parser to return
+inline const char* image(void* ctx, const uint8_t* field, size_t n) {
+    auto& r = *static_cast<Resolve*>(ctx);
+    try {
+        r.images.push_back(g6rt::img::parse_field(std::string(reinterpret_cast<const char*>(field), n)));
+        return nullptr;
+    } catch (const std::exception& e) {
+        r.error = e.what();
+        return r.error.c_str();
+    } catch (...) {   // nothing may unwind into the Rust caller
+        r.error = "img field failed";
+        return r.error.c_str();
+    }
+}
 } // namespace parse
 // `gram <kind>:<strict>:<arm or -1>:<hex>` (grammar.h): kind 1 = JSON, 2 = the JSON schema whose UTF-8 bytes are <hex>
 inline g6rt::GrammarSpec parse_grammar(const std::string& s) {
@@ -54,11 +71,11 @@ inline g6rt::GrammarSpec parse_grammar(const std::string& s) {
 inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steering::BootConfig& steering = {}) {
     static_assert(sizeof(g6rt::steering::Identity) == sizeof(g6sch_identity), "scheduler-rs Identity layout");
     sch::check_abi();
-    parse::Resolve ctx{&steering, {}};
+    parse::Resolve ctx{&steering, {}, {}};
     g6sch_parsed_req p{};
     g6sch_parsed* h = nullptr;
     check(g6sch_parse_request(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), g6rt::grammar_ready(),
-                              parse::resolve, &ctx, &p, &h));
+                              parse::resolve, parse::image, &ctx, &p, &h));
     const parse::Handle own(h, g6sch_parsed_free);
     g6rt::ServeReq r;
     r.prompt = parse::ints(p.prompt); r.stop = parse::ints(p.stop);
@@ -68,6 +85,12 @@ inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steeri
     r.ins.after = p.ins_after; r.ins.unless = p.ins_unless; r.ins.tokens = parse::ints(p.ins_tokens);
     r.gram.kind = g6rt::GrammarSpec::Kind(p.gram_kind); r.gram.strict = p.gram_strict; r.gram.arm = p.gram_arm;
     r.gram.schema.assign(reinterpret_cast<const char*>(p.schema), p.schema_n);
+    // the C++ parser's last step, after the prompt line: the images against the prompt, and their cache identity
+    r.images = std::move(ctx.images);
+    if (!r.images.empty()) {
+        try { g6rt::img::check(r.prompt, r.images); } catch (const std::exception& e) { require(false, e.what()); }
+        r.steering.images = true; r.steering.image_digest = g6rt::img::digest(r.images);
+    }
     return r;
 }
 struct Sampling { float inv_temp = 0, top_p = 0; uint32_t seed = 1234; int lp = -1, plp = -1; };   // lp, plp: g6rt::ServeReq

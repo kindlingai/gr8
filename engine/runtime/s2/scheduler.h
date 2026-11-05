@@ -239,7 +239,7 @@ inline void check_abi() {
             {G6SCH_ABI_PREFILL_DEFER_MAX, PREFILL_DEFER_MAX}, {G6SCH_ABI_NOTICE_MIN, NOTICE_MIN},
             {G6SCH_ABI_NOTICE_MAX, NOTICE_MAX}, {G6SCH_ABI_NOTICE_ROWS, NOTICE_ROWS},
             {G6SCH_ABI_MAX_DECODE_ROUNDS, MAX_DECODE_ROUNDS}, {G6SCH_ABI_PACK_MAX_MEMBERS, PACK_MAX_MEMBERS},
-            {G6SCH_ABI_QMAX, G6SCH_QMAX}};
+            {G6SCH_ABI_QMAX, G6SCH_QMAX}, {G6SCH_ABI_PARSE_FN, G6SCH_PARSE_FN}};
         for (const auto& [what, v] : want) if (g6sch_abi(what) != v) return false;
         return true;
     }();
