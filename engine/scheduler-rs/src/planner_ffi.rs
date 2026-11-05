@@ -12,8 +12,8 @@
 
 use crate::ngram::{NgramTable, NB};
 use crate::planner::{
-    Batch, Cost, DSel, DSelTable, DflDrafts, DflReq, DflReuse, Engine, KStop, KStopB, NgramSrc, Res, Row, SessIn,
-    StepBuf, Stop, DFL_B, MAX_SLOTS, VX,
+    Batch, Cost, DSel, DSelTable, DflDrafts, DflReq, DflReuse, Engine, KStop, KStopB, NgramSrc, Res, Ring, Row, SessIn,
+    St, Stats, StepBuf, Stop, DFL_B, MAX_SLOTS, VX,
 };
 use crate::spec_len::{SpecLen, KX, LEVELS_MAX, NB as SNB};
 use std::ffi::{c_char, c_void, CString};
@@ -209,25 +209,46 @@ impl From<&CSpecLen> for SpecLen {
 
 impl From<&SpecLen> for CSpecLen {
     fn from(s: &SpecLen) -> CSpecLen {
+        // every field named: a new one fails to compile here until the learn record exports it
+        let SpecLen {
+            on,
+            levels,
+            n_levels,
+            draft_round,
+            draft_each,
+            table,
+            seed,
+            pn,
+            pk,
+            bn,
+            bk,
+            pos_decay,
+            bucket_decay,
+            prior,
+            rounds,
+            chosen,
+            pred_sum,
+            got_sum,
+        } = *s;
         CSpecLen {
-            on: s.on,
-            n_levels: s.n_levels as i32,
-            levels: s.levels,
-            draft_round: s.draft_round,
-            draft_each: s.draft_each,
-            table: s.table,
-            seed: s.seed,
-            pn: s.pn,
-            pk: s.pk,
-            bn: s.bn,
-            bk: s.bk,
-            pos_decay: s.pos_decay,
-            bucket_decay: s.bucket_decay,
-            prior: s.prior,
-            rounds: s.rounds,
-            chosen: s.chosen,
-            pred_sum: s.pred_sum,
-            got_sum: s.got_sum,
+            on,
+            n_levels: n_levels as i32,
+            levels,
+            draft_round,
+            draft_each,
+            table,
+            seed,
+            pn,
+            pk,
+            bn,
+            bk,
+            pos_decay,
+            bucket_decay,
+            prior,
+            rounds,
+            chosen,
+            pred_sum,
+            got_sum,
         }
     }
 }
@@ -296,24 +317,26 @@ impl From<&CDSel> for DSel {
 
 impl From<&DSel> for CDSel {
     fn from(s: &DSel) -> CDSel {
-        let t = &s.tab;
+        // every field named: a new one fails to compile here until the learn record exports it
+        let DSel { on, dwell, margin, probe, ref d, ref m, model, tab, rn, rc, an, ag, prior, dn, dt, dc } = *s;
+        let DSelTable { v, d: td, m: tm, e, p, g, k, n, w, r } = tab;
         CDSel {
-            on: s.on,
-            dwell: s.dwell,
-            margin: s.margin,
-            probe: s.probe,
-            model: s.model,
-            d: (&s.d).into(),
-            m: (&s.m).into(),
-            tab: CDSelTable { v: t.v, d: t.d, m: t.m, e: t.e, p: t.p, g: t.g, k: t.k, n: t.n, w: t.w, r: t.r },
-            rn: s.rn,
-            rc: s.rc,
-            an: s.an,
-            ag: s.ag,
-            prior: s.prior,
-            dn: s.dn,
-            dt: s.dt,
-            dc: s.dc,
+            on,
+            dwell,
+            margin,
+            probe,
+            model,
+            d: d.into(),
+            m: m.into(),
+            tab: CDSelTable { v, d: td, m: tm, e, p, g, k, n, w, r },
+            rn,
+            rc,
+            an,
+            ag,
+            prior,
+            dn,
+            dt,
+            dc,
         }
     }
 }
@@ -457,6 +480,19 @@ pub struct CLearn {
     pub ring_tok: *const i32,
 }
 
+fn in_range<E: Engine>(b: &Batch<E>, q: i32) -> bool {
+    q >= 0 && (q as usize) < b.slots()
+}
+
+/// q, or a refusal when it is not one of the planner's slots (a corrupt round log)
+fn slot<E: Engine>(b: &Batch<E>, q: i32) -> Res<i32> {
+    if in_range(b, q) {
+        Ok(q)
+    } else {
+        Err(Stop::Refused(format!("s2: slot {q} is out of range")))
+    }
+}
+
 /// the handle: the planner and its last refusal
 pub struct Planner {
     b: Batch<CHooks>,
@@ -472,6 +508,35 @@ fn rc(p: &mut Planner, r: Res<()>) -> i32 {
             2
         }
     }
+}
+
+/// GR8_DS_SESS_DRAFTS's rule (s2/ds41_sess_drafts.h calls these)
+#[no_mangle]
+pub extern "C" fn g6s2_sess_drafts_kv(k: i32, max_rows: i32, n: i32) -> i32 {
+    crate::planner::sess_drafts_kv(k, max_rows, n)
+}
+
+#[no_mangle]
+pub extern "C" fn g6s2_sess_drafts_max(k: i32, max_rows: i32, slots: i32) -> i32 {
+    crate::planner::sess_drafts_max(k, max_rows, slots)
+}
+
+/// the n-gram table's key of a context (ngram_lookup.h NgramTable::key calls it)
+#[no_mangle]
+pub unsafe extern "C" fn g6s2_ngram_key(ctx: *const i32, n: i32) -> u64 {
+    NgramTable::key(slice(ctx, n.max(0) as usize))
+}
+
+/// a new SpecLen's settings and seeds, for the C++'s check against g6rt::SpecLen
+#[no_mangle]
+pub unsafe extern "C" fn g6s2_spec_len_default(out: *mut CSpecLen) {
+    *out = (&SpecLen::default()).into();
+}
+
+/// SpecLen::bucket, for the same check
+#[no_mangle]
+pub extern "C" fn g6s2_spec_len_bucket(lp: f32) -> i32 {
+    SpecLen::bucket(lp) as i32
 }
 
 /// a new planner, or null when slots exceeds the most it holds
@@ -579,18 +644,24 @@ pub unsafe extern "C" fn g6s2_batch_demote(b: *mut Planner) -> i32 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn g6s2_batch_promote(b: *mut Planner, q: i32) {
-    (*b).b.promote(q)
+pub unsafe extern "C" fn g6s2_batch_promote(b: *mut Planner, q: i32) -> i32 {
+    let p = &mut *b;
+    let r = slot(&p.b, q).map(|q| p.b.promote(q));
+    rc(p, r)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn g6s2_batch_cancel(b: *mut Planner, q: i32) {
-    (*b).b.cancel(q)
+pub unsafe extern "C" fn g6s2_batch_cancel(b: *mut Planner, q: i32) -> i32 {
+    let p = &mut *b;
+    let r = slot(&p.b, q).map(|q| p.b.cancel(q));
+    rc(p, r)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn g6s2_batch_release(b: *mut Planner, q: i32) {
-    (*b).b.release(q)
+pub unsafe extern "C" fn g6s2_batch_release(b: *mut Planner, q: i32) -> i32 {
+    let p = &mut *b;
+    let r = slot(&p.b, q).map(|q| p.b.release(q));
+    rc(p, r)
 }
 
 #[no_mangle]
@@ -686,23 +757,27 @@ pub unsafe extern "C" fn g6s2_batch_mtp_max_sess(b: *const Planner) -> i32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn g6s2_batch_active(b: *const Planner, q: i32) -> bool {
-    (*b).b.active(q)
+    in_range(&(*b).b, q) && (*b).b.active(q)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn g6s2_batch_finished(b: *const Planner, q: i32) -> bool {
-    (*b).b.finished(q)
+    in_range(&(*b).b, q) && (*b).b.finished(q)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn g6s2_batch_length(b: *const Planner, q: i32) -> i32 {
-    (*b).b.length(q)
+    if in_range(&(*b).b, q) {
+        (*b).b.length(q)
+    } else {
+        0
+    }
 }
 
 /// the session's generated tokens, valid until the next call
 #[no_mangle]
 pub unsafe extern "C" fn g6s2_batch_result(b: *const Planner, q: i32, p: *mut *const i32, n: *mut usize) {
-    let r = (*b).b.result(q);
+    let r = if in_range(&(*b).b, q) { (*b).b.result(q) } else { &[] };
     *p = r.as_ptr();
     *n = r.len();
 }
@@ -710,24 +785,45 @@ pub unsafe extern "C" fn g6s2_batch_result(b: *const Planner, q: i32, p: *mut *c
 #[no_mangle]
 pub unsafe extern "C" fn g6s2_batch_stats(b: *const Planner, q: i32, out: *mut CStats) {
     let p = &*b;
-    let s = &p.b.stats[q as usize];
+    let Some(s) = p.b.stats.get(q as usize) else {
+        *out = std::mem::zeroed();
+        return;
+    };
+    // every field named: a new one fails to compile here until the learn record exports it
+    let Stats {
+        rounds,
+        tokens,
+        drafted,
+        mtp_rounds,
+        switches,
+        inserted,
+        ngram_rounds,
+        ngram_drafted,
+        ngram_acc,
+        ref acc,
+        dfl_rounds,
+        dfl_from,
+        dfl_lo,
+        dfl_warm,
+        promoted,
+    } = *s;
     *out = CStats {
-        rounds: s.rounds,
-        tokens: s.tokens,
-        drafted: s.drafted,
-        mtp_rounds: s.mtp_rounds,
-        switches: s.switches,
-        inserted: s.inserted,
-        ngram_rounds: s.ngram_rounds,
-        ngram_drafted: s.ngram_drafted,
-        ngram_acc: s.ngram_acc,
-        dfl_rounds: s.dfl_rounds,
-        dfl_from: s.dfl_from,
-        dfl_lo: s.dfl_lo,
-        dfl_warm: s.dfl_warm,
-        promoted: s.promoted,
-        acc: s.acc.as_ptr(),
-        n_acc: s.acc.len(),
+        rounds,
+        tokens,
+        drafted,
+        mtp_rounds,
+        switches,
+        inserted,
+        ngram_rounds,
+        ngram_drafted,
+        ngram_acc,
+        dfl_rounds,
+        dfl_from,
+        dfl_lo,
+        dfl_warm,
+        promoted,
+        acc: acc.as_ptr(),
+        n_acc: acc.len(),
     };
 }
 
@@ -759,7 +855,13 @@ pub unsafe extern "C" fn g6s2_batch_spec_len(b: *const Planner, which: i32, out:
         0 => &p.dsl,
         1 => &p.ngd,
         2 => &p.ngm,
-        w => &p.sl[(w - 3) as usize],
+        w => match p.sl.get((w as usize).wrapping_sub(3)) {
+            Some(s) => s,
+            None => {
+                *out = std::mem::zeroed();
+                return;
+            }
+        },
     };
     *out = s.into();
 }
@@ -767,55 +869,90 @@ pub unsafe extern "C" fn g6s2_batch_spec_len(b: *const Planner, which: i32, out:
 #[no_mangle]
 pub unsafe extern "C" fn g6s2_batch_slot(b: *const Planner, q: i32, out: *mut CSlot) {
     let p = &*b;
-    let x = &p.b.st[q as usize];
+    let Some(x) = p.b.st.get(q as usize) else {
+        *out = std::mem::zeroed();
+        return;
+    };
+    // every field named: a new one fails to compile here until the learn record exports it
+    let St {
+        first,
+        chunk,
+        n_gen,
+        dflash,
+        ins_after,
+        ins_unless,
+        ref ins_tokens,
+        ref tokens,
+        ref d,
+        ref dlm,
+        n,
+        on,
+        done,
+        rounds,
+        k,
+        dfl,
+        mtp,
+        pb,
+        pd,
+        pl,
+        since,
+        mn,
+        lo,
+        warm,
+        armed,
+        force,
+        dd,
+        dl,
+    } = *x;
     *out = CSlot {
-        first: x.first,
-        chunk: x.chunk,
-        n_gen: x.n_gen,
-        dflash: x.dflash,
-        ins_after: x.ins_after,
-        ins_unless: x.ins_unless,
-        n_ins: x.ins_tokens.len(),
-        ins_tokens: x.ins_tokens.as_ptr(),
-        n_tokens: x.tokens.len(),
-        tokens: x.tokens.as_ptr(),
-        n_d: x.d.len(),
-        d: x.d.as_ptr(),
-        n_dlm: x.dlm.len(),
-        dlm: x.dlm.as_ptr(),
-        n: x.n,
-        on: x.on,
-        done: x.done,
-        rounds: x.rounds,
-        k: x.k,
-        dfl: x.dfl,
-        mtp: x.mtp,
-        pb: x.pb,
-        pd: x.pd,
-        pl: x.pl,
-        since: x.since,
-        mn: x.mn,
-        lo: x.lo,
-        warm: x.warm,
-        armed: x.armed,
-        force: x.force,
-        dd: x.dd,
-        dl: x.dl,
+        first,
+        chunk,
+        n_gen,
+        dflash,
+        ins_after,
+        ins_unless,
+        n_ins: ins_tokens.len(),
+        ins_tokens: ins_tokens.as_ptr(),
+        n_tokens: tokens.len(),
+        tokens: tokens.as_ptr(),
+        n_d: d.len(),
+        d: d.as_ptr(),
+        n_dlm: dlm.len(),
+        dlm: dlm.as_ptr(),
+        n,
+        on,
+        done,
+        rounds,
+        k,
+        dfl,
+        mtp,
+        pb,
+        pd,
+        pl,
+        since,
+        mn,
+        lo,
+        warm,
+        armed,
+        force,
+        dd,
+        dl,
     };
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn g6s2_batch_learn(b: *const Planner, out: *mut CLearn) {
     let p = &(*b).b;
+    let Ring { q, ref tok, lo, end, top } = p.ring; // every field named, as above
     *out = CLearn {
         round_no: p.round_no,
         cur_round: p.cur_round,
         cur_active: p.cur_active,
-        ring_q: p.ring.q,
-        ring_lo: p.ring.lo,
-        ring_end: p.ring.end,
-        ring_top: p.ring.top,
-        n_ring_tok: p.ring.tok.len(),
-        ring_tok: p.ring.tok.as_ptr(),
+        ring_q: q,
+        ring_lo: lo,
+        ring_end: end,
+        ring_top: top,
+        n_ring_tok: tok.len(),
+        ring_tok: tok.as_ptr(),
     };
 }

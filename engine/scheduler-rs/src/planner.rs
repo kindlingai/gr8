@@ -848,6 +848,7 @@ impl<E: Engine> Batch<E> {
         let x = &self.st[q as usize];
         let len = x.tokens.len();
         let e = x.n as i64 + x.n_gen as i64;
+        // admit() takes any n_gen. The C++ added a negative one to size_t, and n + n_gen < 0 wrapped to every token
         let end = if e < 0 { len } else { len.min(e as usize) };
         &x.tokens[(x.n as usize).min(end)..end]
     }
@@ -2307,6 +2308,49 @@ mod tests {
         fn lp(&self, _: i32) -> Res<f32> {
             Ok(f32::NAN)
         }
+    }
+
+    /// Every Batch field named. The C++ facade's learn record (s2_batch.h Batch::learn_fields) hashes, in order: K,
+    /// max_rows, mtp_sessions, sess_drafts, adapt, dkv, par, fresh_spec (the facade's copies of the settings), dsl, sel,
+    /// ks, reuse, ng, ngd, ngm, ring, cost, sl, round_no, cur_round, cur_active, st, stats. ks, reuse, ng and cost are
+    /// the facade's copies too. The rest come through g6s2_batch_spec_len, _dsel_state, _learn, _slot and _stats. A new
+    /// field fails to compile here until it is exported to the learn record or marked as left out.
+    #[allow(dead_code)]
+    fn learn_record_covers<E: Engine>(b: Batch<E>) {
+        let Batch {
+            e: _, // the hooks
+            k: _,
+            max_rows: _,
+            slots: _, // S2N_SLOTS: the vectors' length
+            mtp_sessions: _,
+            sess_drafts: _,
+            adapt: _,
+            dkv: _,
+            par: _,
+            fresh_spec: _,
+            dsl: _,
+            sel: _,
+            ks: _,
+            reuse: _,
+            ng: _,
+            ngd: _,
+            ngm: _,
+            ring: _,
+            cost: _,
+            sl: _,
+            round_no: _,
+            cur_round: _,
+            cur_active: _,
+            st: _,
+            stats: _,
+            // step and output buffers, refilled by every step
+            sm: _,
+            sd: _,
+            sc: _,
+            tm: _,
+            td: _,
+            tc: _,
+        } = b;
     }
 
     fn session(prompt: &[i32], n_gen: i32) -> SessIn<'_> {

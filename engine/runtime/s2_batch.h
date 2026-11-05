@@ -164,6 +164,8 @@ struct DflDrafts { int tok[DFL_B]; float lp[DFL_B]; };
 // prompt(sess, M, pos0): after each prompt MAIN step of a session (rows pos0 .. pos0 + M - 1, row r at pos0 + r)
 // emit(sess, toks, k, row) -> true = the session is finished (stop id or max tokens); row: toks[0]'s row in the last MAIN step
 // returns per session the generated tokens (as mtp_sequence returns them)
+// A hook must not call the Batch back, its getters included: the planner holds its state mutably while a hook runs, and
+// every Batch call made from a hook throws std::logic_error.
 struct Hooks
 {
     std::function<std::vector<int>(const Step&)> run;
@@ -560,7 +562,7 @@ public:
     // GR8_DS_SESS_DRAFTS=1 (s2/ds41_sess_drafts.h): a shared round of n sessions verifies at most sess_drafts_kv(K, max_rows, n)
     // drafts a session, and sessions draft while that is >= 1 (mtp_sessions_ is not read). Off: unchanged
     void set_sess_drafts(bool on) { const Api api_(this, "sess_drafts", on); sess_drafts_ = on; g6s2_batch_set_sess_drafts(b(), on); }
-    int mtp_max_sess() const { return g6s2_batch_mtp_max_sess(b()); }
+    int mtp_max_sess() const { return g6s2_batch_mtp_max_sess(get()); }
 
     void admit(const std::vector<int>& qs, const std::vector<Session>& ss)
     {
@@ -577,13 +579,13 @@ public:
         const std::vector<g6s2_session> cs = sessions(ss);
         check(g6s2_batch_admit_packed_tail(b(), qs.data(), qs.size(), cs.data(), cs.size()));
     }
-    bool active(int q) const { return g6s2_batch_active(b(), q); }
+    bool active(int q) const { return g6s2_batch_active(get(), q); }
     // the round log's state record: per slot what the driver reads back (on, active, finished, length, the committed
     // tokens' FNV-1a, inserted tokens)
     std::string state() const
     {
         std::vector<uint64_t> v(6 * S2N_SLOTS);
-        g6s2_batch_state(b(), v.data());
+        g6s2_batch_state(get(), v.data());
         return s2log::line("state", v);
     }
     // the round log's learn record: a hash of everything else the planner keeps between calls (its estimates, drafter
@@ -611,18 +613,23 @@ public:
          (l.ring)(cost_)(l.sl)(l.round_no)(l.cur_round)(l.cur_active)(l.st)(l.stats);
     }
     // the session's tokens so far, prompt included: its next round writes rows from length - 1 on
-    int length(int q) const { return g6s2_batch_length(b(), q); }
-    bool finished(int q) const { return g6s2_batch_finished(b(), q); }
-    void cancel(int q) { const Api api_(this, "cancel", q); g6s2_batch_cancel(b(), q); }
+    int length(int q) const { return g6s2_batch_length(get(), q); }
+    bool finished(int q) const { return g6s2_batch_finished(get(), q); }
+    void cancel(int q) { const Api api_(this, "cancel", q); check(g6s2_batch_cancel(b(), q)); }
     std::vector<int> result(int q) const
     {
         const int32_t* p = nullptr;
         size_t n = 0;
-        g6s2_batch_result(b(), q, &p, &n);
+        g6s2_batch_result(get(), q, &p, &n);
         return std::vector<int>(p, p + n);
     }
     // valid until the next call of stats(q)
-    const Stats& stats(int q) const { pull_stats(q, stats_[q]); return stats_[q]; }
+    const Stats& stats(int q) const
+    {
+        if (q < 0 || q >= S2N_SLOTS) throw std::out_of_range("s2: stats of slot " + std::to_string(q));
+        pull_stats(q, stats_[q]);
+        return stats_[q];
+    }
     // choose each round's draft count (k <= K); off: every round verifies K drafts
     void adapt(bool on) { const Api api_(this, "adapt", on); adapt_ = on; g6s2_batch_adapt(b(), on); }
     // a solo DFlash2 round's drafter step runs under the MTP first form (GR8_DRAFT_PAR, which sets the default)
@@ -646,7 +653,7 @@ public:
     const DSel& dsel() const
     {
         g6s2_dsel c;
-        g6s2_batch_dsel_state(b(), &c);
+        g6s2_batch_dsel_state(get(), &c);
         from_c(c, dsel_);
         return dsel_;
     }
@@ -654,7 +661,7 @@ public:
     std::pair<double, double> dsel_rates() const
     {
         double rm = 0, rd = 0;
-        g6s2_batch_dsel_rates(b(), &rm, &rd);
+        g6s2_batch_dsel_rates(get(), &rm, &rd);
         return {rm, rd};
     }
     // solo MTP rounds' draft count (KStop; mode 2 sets DSel::m's levels and third-position seed, so call it after dsel)
@@ -692,11 +699,11 @@ public:
     // demoted), takes the drafter before the next round: MTP rounds feed it the accepted rows as context from the
     // session's last token on, and once it holds reuse_.min rows the session drafts with DFlash2, as a new request starts.
     // The driver calls it while q is the only live session. Inserted tokens waiting for their steps: not this round
-    void promote(int q) { const Api api_(this, "promote", q); g6s2_batch_promote(b(), q); }
+    void promote(int q) { const Api api_(this, "promote", q); check(g6s2_batch_promote(b(), q)); }
     // a second session is resident: every DFlash2 session goes to MTP (the K-1 chain steps), before the next round
     void demote() { const Api api_(this, "demote"); check(g6s2_batch_demote(b())); }
     // the slot can be admitted again (after finished(q) or cancel(q))
-    void release(int q) { const Api api_(this, "release", q); g6s2_batch_release(b(), q); }
+    void release(int q) { const Api api_(this, "release", q); check(g6s2_batch_release(b(), q)); }
 
     // one decode round of every active session: one main step (all rows), one first-form draft step, K-1 chain steps.
     // A session's rows and steps do not depend on which other sessions are in the round (row invariance, A1).
@@ -753,6 +760,12 @@ private:
     };
     struct Free { void operator()(g6s2_batch* p) const { g6s2_batch_free(p); } };
     g6s2_batch* b() const { return b_.get(); }
+    // the handle for a getter: throws when a hook calls back (the planner holds its state mutably then)
+    g6s2_batch* get() const
+    {
+        if (g_->busy) throw std::logic_error("s2: a hook read the Batch back: hooks must not call back");
+        return b_.get();
+    }
     // a call's result: 1 = a hook threw (rethrown here), 2 = the planner refused
     void check(int32_t rc)
     {
@@ -885,7 +898,7 @@ private:
     void pull_stats(int q, Stats& s) const
     {
         g6s2_stats c;
-        g6s2_batch_stats(b(), q, &c);
+        g6s2_batch_stats(get(), q, &c);
         s.rounds = c.rounds; s.tokens = c.tokens; s.drafted = c.drafted; s.mtp_rounds = c.mtp_rounds; s.switches = c.switches;
         s.inserted = c.inserted; s.ngram_rounds = c.ngram_rounds; s.ngram_drafted = c.ngram_drafted; s.ngram_acc = c.ngram_acc;
         s.acc.assign(c.acc, c.acc + c.n_acc);
@@ -943,6 +956,7 @@ private:
     };
     const Learned& pull() const
     {
+        get();   // throws in a hook
         Learned& l = learned_;
         g6s2_spec_len c;
         g6s2_batch_spec_len(b(), 0, &c); from_c(c, l.dsl);

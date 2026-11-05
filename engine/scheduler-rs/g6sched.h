@@ -352,6 +352,13 @@ struct g6s2_learn {
     size_t n_ring_tok;
     const int32_t* ring_tok;
 };
+// GR8_DS_SESS_DRAFTS's rule (s2/ds41_sess_drafts.h), the n-gram table's key (ngram_lookup.h), and a new SpecLen and its
+// confidence bucket (for the check against spec_len.h): one implementation each, the planner's
+int32_t g6s2_sess_drafts_kv(int32_t K, int32_t max_rows, int32_t n);
+int32_t g6s2_sess_drafts_max(int32_t K, int32_t max_rows, int32_t slots);
+uint64_t g6s2_ngram_key(const int32_t* ctx, int32_t n);
+void g6s2_spec_len_default(g6s2_spec_len* out);
+int32_t g6s2_spec_len_bucket(float lp);
 struct g6s2_batch;
 // null when slots is above 32
 g6s2_batch* g6s2_batch_new(int32_t K, int32_t max_rows, int32_t slots, bool par, bool fresh_spec, const g6s2_cost* cost,
@@ -362,9 +369,10 @@ int32_t g6s2_batch_admit(g6s2_batch* b, const int32_t* qs, size_t n, const g6s2_
 int32_t g6s2_batch_admit_packed_tail(g6s2_batch* b, const int32_t* qs, size_t n, const g6s2_session* ss, size_t n_ss);
 int32_t g6s2_batch_round(g6s2_batch* b, const int32_t* order, size_t n, bool* ran);
 int32_t g6s2_batch_demote(g6s2_batch* b);
-void g6s2_batch_promote(g6s2_batch* b, int32_t q);
-void g6s2_batch_cancel(g6s2_batch* b, int32_t q);
-void g6s2_batch_release(g6s2_batch* b, int32_t q);
+// a q out of range: 2
+int32_t g6s2_batch_promote(g6s2_batch* b, int32_t q);
+int32_t g6s2_batch_cancel(g6s2_batch* b, int32_t q);
+int32_t g6s2_batch_release(g6s2_batch* b, int32_t q);
 void g6s2_batch_set_mtp_sessions(g6s2_batch* b, int32_t n);
 void g6s2_batch_set_sess_drafts(g6s2_batch* b, bool on);
 void g6s2_batch_adapt(g6s2_batch* b, bool on);
@@ -376,6 +384,7 @@ void g6s2_batch_kstop(g6s2_batch* b, const g6s2_kstop* k);
 void g6s2_batch_dfl_reuse(g6s2_batch* b, int32_t mode, int32_t min);
 int32_t g6s2_batch_ngram(g6s2_batch* b, const g6s2_ngram* n);   // 2: kmin / kmax refused
 int32_t g6s2_batch_mtp_max_sess(const g6s2_batch* b);
+// a q out of range reads as an empty slot: false, 0, no tokens, a zeroed struct
 bool g6s2_batch_active(const g6s2_batch* b, int32_t q);
 bool g6s2_batch_finished(const g6s2_batch* b, int32_t q);
 int32_t g6s2_batch_length(const g6s2_batch* b, int32_t q);
@@ -397,7 +406,8 @@ uint64_t g6sch_layout(void);
 #include <type_traits>
 namespace g6sch_abi_detail {
 template <class T> constexpr uint64_t kind() {
-    if constexpr (std::is_pointer_v<T>) return 0x70 | kind<std::remove_cv_t<std::remove_pointer_t<T>>>();
+    if constexpr (std::is_pointer_v<T> && std::is_function_v<std::remove_pointer_t<T>>) return 0x76;   // as a struct pointer
+    else if constexpr (std::is_pointer_v<T>) return 0x70 | kind<std::remove_cv_t<std::remove_pointer_t<T>>>();
     else if constexpr (std::is_array_v<T>) return 0x50 | kind<std::remove_extent_t<T>>();
     else if constexpr (std::is_same_v<T, bool>) return 4;
     else if constexpr (std::is_floating_point_v<T>) return 3;
@@ -406,7 +416,10 @@ template <class T> constexpr uint64_t kind() {
     else return 6;
 }
 template <class T> constexpr uint64_t psize() {
-    if constexpr (std::is_pointer_v<T>) return sizeof(std::remove_pointer_t<T>);
+    // a function has no size, and void counts as 1 byte (Rust's c_void)
+    if constexpr (std::is_pointer_v<T> && std::is_function_v<std::remove_pointer_t<T>>) return 0;
+    else if constexpr (std::is_pointer_v<T> && std::is_void_v<std::remove_pointer_t<T>>) return 1;
+    else if constexpr (std::is_pointer_v<T>) return sizeof(std::remove_pointer_t<T>);
     else return 0;
 }
 constexpr uint64_t mix(uint64_t h, uint64_t v) {
@@ -458,6 +471,7 @@ constexpr uint64_t g6sch_layout_cpp() {
     G6SCH_TYPE(g6s2_stats) G6SCH_FIELD(g6s2_stats, rounds) G6SCH_FIELD(g6s2_stats, tokens) G6SCH_FIELD(g6s2_stats, drafted) G6SCH_FIELD(g6s2_stats, mtp_rounds) G6SCH_FIELD(g6s2_stats, switches) G6SCH_FIELD(g6s2_stats, inserted) G6SCH_FIELD(g6s2_stats, ngram_rounds) G6SCH_FIELD(g6s2_stats, ngram_drafted) G6SCH_FIELD(g6s2_stats, ngram_acc) G6SCH_FIELD(g6s2_stats, dfl_rounds) G6SCH_FIELD(g6s2_stats, dfl_from) G6SCH_FIELD(g6s2_stats, dfl_lo) G6SCH_FIELD(g6s2_stats, dfl_warm) G6SCH_FIELD(g6s2_stats, promoted) G6SCH_FIELD(g6s2_stats, acc) G6SCH_FIELD(g6s2_stats, n_acc)
     G6SCH_TYPE(g6s2_slot) G6SCH_FIELD(g6s2_slot, first) G6SCH_FIELD(g6s2_slot, chunk) G6SCH_FIELD(g6s2_slot, n_gen) G6SCH_FIELD(g6s2_slot, dflash) G6SCH_FIELD(g6s2_slot, ins_after) G6SCH_FIELD(g6s2_slot, ins_unless) G6SCH_FIELD(g6s2_slot, n_ins) G6SCH_FIELD(g6s2_slot, ins_tokens) G6SCH_FIELD(g6s2_slot, n_tokens) G6SCH_FIELD(g6s2_slot, tokens) G6SCH_FIELD(g6s2_slot, n_d) G6SCH_FIELD(g6s2_slot, d) G6SCH_FIELD(g6s2_slot, n_dlm) G6SCH_FIELD(g6s2_slot, dlm) G6SCH_FIELD(g6s2_slot, n) G6SCH_FIELD(g6s2_slot, on) G6SCH_FIELD(g6s2_slot, done) G6SCH_FIELD(g6s2_slot, rounds) G6SCH_FIELD(g6s2_slot, k) G6SCH_FIELD(g6s2_slot, dfl) G6SCH_FIELD(g6s2_slot, mtp) G6SCH_FIELD(g6s2_slot, pb) G6SCH_FIELD(g6s2_slot, pd) G6SCH_FIELD(g6s2_slot, pl) G6SCH_FIELD(g6s2_slot, since) G6SCH_FIELD(g6s2_slot, mn) G6SCH_FIELD(g6s2_slot, lo) G6SCH_FIELD(g6s2_slot, warm) G6SCH_FIELD(g6s2_slot, armed) G6SCH_FIELD(g6s2_slot, force) G6SCH_FIELD(g6s2_slot, dd) G6SCH_FIELD(g6s2_slot, dl)
     G6SCH_TYPE(g6s2_learn) G6SCH_FIELD(g6s2_learn, round_no) G6SCH_FIELD(g6s2_learn, cur_round) G6SCH_FIELD(g6s2_learn, cur_active) G6SCH_FIELD(g6s2_learn, ring_q) G6SCH_FIELD(g6s2_learn, ring_lo) G6SCH_FIELD(g6s2_learn, ring_end) G6SCH_FIELD(g6s2_learn, ring_top) G6SCH_FIELD(g6s2_learn, n_ring_tok) G6SCH_FIELD(g6s2_learn, ring_tok)
+    G6SCH_TYPE(g6s2_hooks) G6SCH_FIELD(g6s2_hooks, ctx) G6SCH_FIELD(g6s2_hooks, run) G6SCH_FIELD(g6s2_hooks, round) G6SCH_FIELD(g6s2_hooks, prompt) G6SCH_FIELD(g6s2_hooks, emit) G6SCH_FIELD(g6s2_hooks, dfl) G6SCH_FIELD(g6s2_hooks, dfl_start) G6SCH_FIELD(g6s2_hooks, lp) G6SCH_FIELD(g6s2_hooks, has_round) G6SCH_FIELD(g6s2_hooks, has_prompt) G6SCH_FIELD(g6s2_hooks, has_emit) G6SCH_FIELD(g6s2_hooks, has_dfl) G6SCH_FIELD(g6s2_hooks, has_dfl_start) G6SCH_FIELD(g6s2_hooks, has_lp)
     return h;
 }
 #undef G6SCH_TYPE

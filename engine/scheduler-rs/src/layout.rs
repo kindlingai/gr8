@@ -182,6 +182,26 @@ impl Kind for crate::planner_ffi::CSlot {
 impl Kind for crate::planner_ffi::CLearn {
     const K: u64 = 6;
 }
+impl Kind for crate::planner_ffi::CHooks {
+    const K: u64 = 6;
+}
+// g6sched.h counts void as 1 byte, as Rust's c_void
+impl Kind for std::ffi::c_void {
+    const K: u64 = 6;
+}
+// a function pointer: a pointer to a struct-like kind with no size
+macro_rules! fn_kinds {
+    ($($t:ty),*) => { $(impl Kind for Option<$t> { const K: u64 = 0x76; })* };
+}
+fn_kinds!(
+    crate::planner_ffi::RunFn,
+    crate::planner_ffi::RoundFn,
+    crate::planner_ffi::PromptFn,
+    crate::planner_ffi::EmitFn,
+    crate::planner_ffi::DflFn,
+    crate::planner_ffi::DflStartFn,
+    crate::planner_ffi::LpFn
+);
 
 /// The digest of every shared type's layout.
 pub fn digest() -> u64 {
@@ -496,6 +516,25 @@ pub fn digest() -> u64 {
             ring_top,
             n_ring_tok,
             ring_tok
+        }
+    );
+    layout!(
+        h,
+        crate::planner_ffi::CHooks {
+            ctx,
+            run,
+            round,
+            prompt,
+            emit,
+            dfl,
+            dfl_start,
+            lp,
+            has_round,
+            has_prompt,
+            has_emit,
+            has_dfl,
+            has_dfl_start,
+            has_lp
         }
     );
     h

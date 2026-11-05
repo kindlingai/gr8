@@ -10,19 +10,12 @@
 #include <algorithm>
 #include <utility>
 #include <vector>
+#include "../../scheduler-rs/g6sched.h"
 namespace s2 {
-inline int sess_drafts_kv(int K, int max_rows, int n)
-{
-    if (K <= 0 || n < 1 || max_rows < 1) return 0;
-    return std::max(std::min(K, max_rows / n - 1), 0);
-}
+// the planner's rule (engine/scheduler-rs planner.rs), so the boot checks and the captured widths read the same one
+inline int sess_drafts_kv(int K, int max_rows, int n) { return g6s2_sess_drafts_kv(K, max_rows, n); }
 // the most sessions that still draft (kv >= 1), at most slots
-inline int sess_drafts_max(int K, int max_rows, int slots)
-{
-    int n = 0;
-    while (n < slots && sess_drafts_kv(K, max_rows, n + 1) >= 1) ++n;
-    return n;
-}
+inline int sess_drafts_max(int K, int max_rows, int slots) { return g6s2_sess_drafts_max(K, max_rows, slots); }
 // the sessions one DSpark draft launch holds: block rows each within max_rows, at most maxs (the markov step's session tile)
 inline int sess_drafts_chunk(int max_rows, int block, int maxs) { return std::max(1, std::min(max_rows / block, maxs)); }
 // the most rows a session has in a main step of ns > 1 sessions (g6m4.cu captures ns x 1..this): 1 without DSpark (on = GR8_DS_MTP > 0),
