@@ -30,11 +30,15 @@ class OptionTests(unittest.TestCase):
         o = flash()
         self.assertEqual((models.of(o), o.get('GROUP'), S.engine_bin(o)), (models.GLM53F, 'gr8-glm53f', 'g6m4_flash'))
         self.assertEqual(flash('--group', 'mine').get('GROUP'), 'mine')
+        # --kv-format int4 runs g6m4_flash-int4 and passes the flag, which that build requires
+        o = flash('--kv-format', 'int4')
+        self.assertEqual(S.engine_bin(o), 'g6m4_flash-int4')
+        self.assertEqual(opt.engine_plan(o)['args'][-2:], ['--kv-format', 'int4'])
         glm = opt.parse(['--no-config', '--peers', PEERS], GLM)
         self.assertEqual((models.of(glm), glm.get('GROUP')), (models.GLM53, 'gr8-glm53'))
 
     def test_refusals(self):
-        for argv, want in ((['--tp', '6'], 'want 4, 3 or 2 (glm53f)'), (['--kv-format', 'int4'], 'fp8 KV build only'),
+        for argv, want in ((['--tp', '6'], 'want 4, 3 or 2 (glm53f)'),
                            (['--tp', '3', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3', '--drafter', 'https://huggingface.co/a/b'],
                             'runs at TP=4 (split) and TP=6')):
             with self.assertRaises(opt.OptionError) as e:
@@ -349,7 +353,7 @@ class RequiredTests(unittest.TestCase):
         self.assertIn('TP=3 bit225 else down1', glm)
         self.assertIn(models.GLM53.release, glm)
         self.assertIn('--tp       4, 3 or 2', flash)
-        self.assertIn('--drafter URL (DFlash2)', flash)
+        self.assertIn('--drafter URL (DFlash2), --kv-format int4', flash)
         self.assertEqual(models.SERVED, (models.GLM53, models.GLM53F))
 
 

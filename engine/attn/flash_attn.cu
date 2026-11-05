@@ -118,7 +118,16 @@ __device__ __forceinline__ const uint8_t* kv_at(const DeviceAttn& a,int pos){
     const int p=page(a,pos);return p<0?nullptr:(const uint8_t*)a.mla_cache+((int64_t)p*a.page_size+pos%a.page_size)*g6kv::ROW;
 }
 // latent element d of a cached row; lat4: elements d..d+3 (d % 4 == 0)
-#if G6_FLASH_KV_FP8
+#if G6_KV4
+__device__ __forceinline__ float i4(unsigned code){return (float)((int)(code&15)-8);}
+__device__ __forceinline__ float scale4(const uint8_t* v,int d){return __half2float(__ldg(((const half*)(v+g6kv::SCALE_OFF))+(d>>5)));}
+__device__ __forceinline__ float latent(const uint8_t* v,int d){return i4(__ldg(v+(d>>1))>>(4*(d&1)))*scale4(v,d);}
+__device__ __forceinline__ void lat4(const uint8_t* v,int d,float* x){
+    const unsigned c=__ldg((const uint16_t*)(v+(d>>1)));const float s=scale4(v,d);
+    #pragma unroll
+    for(int i=0;i<4;i++)x[i]=i4(c>>(4*i))*s;
+}
+#elif G6_FLASH_KV_FP8
 __device__ __forceinline__ float latent(const uint8_t* v,int d){return e4(__ldg(v+d))*__ldg(((const float*)(v+g6kv::SCALE_OFF))+(d>>7));}
 __device__ __forceinline__ void lat4(const uint8_t* v,int d,float* x){
     const uint32_t c=__ldg((const uint32_t*)(v+d));const float s=__ldg(((const float*)(v+g6kv::SCALE_OFF))+(d>>7));
@@ -150,7 +159,15 @@ __global__ void append_kv(Input input){
     const float v0=x0*inv*bfloat(a.kv_norm,t),v1=x1*inv*bfloat(a.kv_norm,t+256);
     if(!isfinite(v0)||!isfinite(v1))error(a,4);
     uint8_t* dst=(uint8_t*)a.mla_cache+((int64_t)pg*a.page_size+pos%a.page_size)*g6kv::ROW;
-#if G6_FLASH_KV_FP8
+#if G6_KV4
+    // INT4 per 32 dims, scale amax / 7 rounded to FP16 before the codes use it: warp w holds group w (v0) and 8 + w (v1);
+    // an even lane packs its dim and the next lane's into one byte
+    const half h0=__float2half_rn(fmaxf(warp_max(fabsf(v0))/7.f,6.2e-5f)),h1=__float2half_rn(fmaxf(warp_max(fabsf(v1))/7.f,6.2e-5f));
+    const int q0=(int)fminf(fmaxf(rintf(v0/__half2float(h0)),-7.f),7.f)+8,q1=(int)fminf(fmaxf(rintf(v1/__half2float(h1)),-7.f),7.f)+8;
+    const int n0=__shfl_down_sync(0xffffffff,q0,1),n1=__shfl_down_sync(0xffffffff,q1,1);
+    if(!(lane&1)){dst[t>>1]=(uint8_t)(q0|n0<<4);dst[(t+256)>>1]=(uint8_t)(q1|n1<<4);}
+    if(lane==0){((half*)(dst+g6kv::SCALE_OFF))[w]=h0;((half*)(dst+g6kv::SCALE_OFF))[8+w]=h1;}
+#elif G6_FLASH_KV_FP8
     // E4M3 per 128 dims, scale amax / 448: warps 0-3 hold dims 0-127 (v0) and 256-383 (v1), warps 4-7 the others
     __syncthreads();
     const float m0=warp_max(fabsf(v0)),m1=warp_max(fabsf(v1));if(lane==0){red[w][0]=m0;red[w][1]=m1;}
@@ -483,7 +500,7 @@ using namespace fa;
 
 __device__ __forceinline__ int4 lat8_half(const uint8_t* v,int d){
     half h[8];
-#if G6_FLASH_KV_FP8
+#if G6_KV4 || G6_FLASH_KV_FP8
     float x[8];
     lat4(v,d,x);lat4(v,d+4,x+4);
     #pragma unroll
@@ -1357,9 +1374,12 @@ __device__ __forceinline__ void mma16816(float* c,uint32_t a0,uint32_t a1,uint32
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
         :"+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3]):"r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1));
 }
-// Raw (unconverted) 8 latent elements of one cached row: BF16 = 16 B; FP8 = 2 x 4 B + the 128-element group scale.
+// Raw (unconverted) 8 latent elements of one cached row: BF16 = 16 B; FP8 = 2 x 4 B + the 128-element group scale;
+// INT4 = 4 B + the 32-element group scale.
 __device__ __forceinline__ uint4 stage_ld8(const uint8_t* v,int d){
-#if G6_FLASH_KV_FP8
+#if G6_KV4
+    return make_uint4(__ldg((const uint32_t*)(v+(d>>1))),__float_as_uint(scale4(v,d)),0u,0u);
+#elif G6_FLASH_KV_FP8
     return make_uint4(__ldg((const uint32_t*)(v+d)),__ldg((const uint32_t*)(v+d+4)),
         __float_as_uint(__ldg(((const float*)(v+g6kv::SCALE_OFF))+(d>>7))),0u);
 #else
@@ -1369,7 +1389,11 @@ __device__ __forceinline__ uint4 stage_ld8(const uint8_t* v,int d){
 // Same conversion as lat8_half applied to staged raw data.
 __device__ __forceinline__ int4 stage_cvt8(const uint4 c){
     half h[8];
-#if G6_FLASH_KV_FP8
+#if G6_KV4
+    const float s=__uint_as_float(c.y);
+    #pragma unroll
+    for(int i=0;i<8;i++)h[i]=__float2half_rn(i4(c.x>>(4*i))*s);
+#elif G6_FLASH_KV_FP8
     const float s=__uint_as_float(c.z);
     #pragma unroll
     for(int i=0;i<4;i++)h[i]=__float2half_rn(e4((c.x>>(8*i))&255)*s);

@@ -264,7 +264,7 @@ engine_defaults() {
 # (about 1.3-1.4 GB of device memory plus 84 MB pinned per rank). About 1.4 KB per position of it scales with QP_CTX.
 # GLM-5.3-Flash: the prefill speed stack at top-k 8 (docs/FLASH.md). GR8_PF_RS, GR8_PF_OWN and CP stay off.
 flash_env() {
-  ENGINE_BIN=g6m4_flash
+  ENGINE_BIN=g6m4_flash; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=g6m4_flash-int4
   # TP=4: mHC sequence-parallel (partials reduce-scatter, each owner runs mHC on its rows, the rows all-gather), which
   # sends a quarter of the bytes and replaces the peer-partial staging: 8K prefill 2,151 -> 2,533 tok/s. And the routed
   # experts on the expert tiles (GR8_PF_WT), which need the router unsplit: 8K 2,818 -> 2,963 with the G9 scan below.
@@ -471,7 +471,8 @@ engine_args() {
       for t in $KV_STORE; do [ -n "$t" ] && a="$a --kv-store $t"; done
       unset IFS
     fi
-    (set -f; echo $a)
+    [ "${KV_FORMAT:-fp8}" = int4 ] && a="$a --kv-format int4"   # bin/g6m4_flash-int4, which needs it
+    (set -f; echo $a ${EXTRA_ARGS:-})
     return
   fi
   # DeepSeek-V4.1-Flash-1017: a release only, CHUNK rows a step for a prompt tail (8 unless set). No --prefill or --pf-lanes: the
