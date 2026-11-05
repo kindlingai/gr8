@@ -472,8 +472,10 @@ int main(int argc, char** argv)
     // Flash: --s2-sessions 1 (the default) is the solo path; 2..8 share the --cap pool (s2/flash_native.cuh)
     if (s2mode && (reuse_prefix || plan.rs))
         die("Flash serve supports no prefix reuse or rejection sampling");
-    if (s2mode && dfl && (!mtp || flash_cache != g6s2::FlashCache::Off))
-        die("Flash serve with DFlash2 needs --mtp (a second session moves the DFlash2 one to MTP) and no GR8_GLM53F_CACHE");
+    // aligned checkpoints and DFlash2: a hit that skips part of the drafter's prompt window decodes that request on MTP
+    // (dfl_owner below), and the drafter never changes the output, so a hit is still cold-exact
+    if (s2mode && dfl && (!mtp || flash_cache == g6s2::FlashCache::Terminal))
+        die("Flash serve with DFlash2 needs --mtp (a second session moves the DFlash2 one to MTP) and no GR8_GLM53F_CACHE=terminal");
     if (s2mode && s2sess > 1 && s2sess * (mtp + 1) > MX)
         die("Flash serve: --s2-sessions x (--mtp + 1) rows exceed G6_MX (every session's round is one step)");
     if (flash_cache != g6s2::FlashCache::Off) {

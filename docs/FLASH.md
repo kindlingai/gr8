@@ -207,8 +207,9 @@ Limits:
 ## Not yet
 
 - CP and prefix reuse: the engine refuses them under `--serve`. `GR8_GLM53F_CACHE=aligned` (above) is the
-  experimental Flash form of prefix reuse, and it refuses DFlash2. The DFlash2 drafter's taps are the mean of the four
-  mHC streams after each tapped layer, in decode steps and in the prefill, which keeps the last 2,048 prompt positions
-  for the drafter's prompt context. DFlash2 at TP=2 and TP=3 runs offline only.
+  experimental Flash form of prefix reuse. With DFlash2 it takes aligned checkpoints only: a hit whose prefill skips
+  part of the drafter's prompt window (the last 2,048 prompt positions, whose taps the prefill keeps) decodes that
+  request on MTP. The taps are the mean of the four mHC streams after each tapped layer, in decode steps and in the
+  prefill. DFlash2 at TP=2 and TP=3 runs offline only.
 - The vision tower: the engine serves text, and the fetch skips `dense/vision-*`.
 - A 262K prefill's time and memory headroom on a GB10: the `CAP` above is computed, not measured.
