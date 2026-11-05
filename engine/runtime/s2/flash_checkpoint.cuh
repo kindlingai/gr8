@@ -19,6 +19,8 @@
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <vector>
@@ -106,6 +108,7 @@ class FlashCheckpoints {
     int batch_ = 0;
     uint64_t compat_ = 0;
     g6kv_tier_totals seen_{};   // a group lease, the head: the index counters at its last report
+    std::string index_path_;    // persist=on: the index file beside the store's blocks, else empty
     uint8_t *host_ = nullptr, *host_dev_ = nullptr;   // mapped pinned: batch_ slots, registered with the store
     int* d_list_ = nullptr;                           // the run's pool pages, pool_pages of them at most
     fck::Binding* d_bind_ = nullptr;
@@ -189,15 +192,85 @@ class FlashCheckpoints {
             block += n;
         }
     }
+    // The index file: a header, each entry, then the fnv64 of everything before it. Written to a temporary file and
+    // renamed, so a crash leaves the old index or the new one.
+    static constexpr uint64_t INDEX_MAGIC = 0x31584449484c4646ull;   // "FFLHIDX1"
+    template<class T> static void put(std::string& b, const T& x) { b.append(reinterpret_cast<const char*>(&x), sizeof x); }
+    template<class T> static bool get(const std::string& b, size_t& at, T& x) {
+        if (b.size() - at < sizeof x) return false;
+        std::memcpy(&x, b.data() + at, sizeof x); at += sizeof x; return true;
+    }
+    void save() {
+        if (index_path_.empty()) return;
+        std::string b;
+        put(b, INDEX_MAGIC); put(b, compat_); put(b, index_.blocks()); put(b, index_.next_generation()); put(b, index_.clock());
+        put(b, (uint64_t)index_.size());
+        for (const auto& x : index_.entries()) {
+            put(b, x.generation); put(b, x.used); put(b, x.base); put(b, x.blocks); put(b, x.position); put(b, (uint32_t)x.terminal);
+            put(b, x.ns); put(b, (uint64_t)x.tokens.size());
+            b.append(reinterpret_cast<const char*>(x.tokens.data()), x.tokens.size() * sizeof(int));
+            put(b, x.manifest);
+        }
+        put(b, fnv64(b.data(), b.size()));
+        const std::string tmp = index_path_ + ".tmp";
+        {
+            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+            f.write(b.data(), (std::streamsize)b.size());
+            if (!f.flush()) throw std::runtime_error("Flash checkpoint: cannot write " + tmp);
+        }
+        std::filesystem::rename(tmp, index_path_);
+    }
+    // the persisted index, if it is this store's: the entries whose manifest block still holds their manifest. Returns
+    // what it did, for the boot log.
+    std::string load() {
+        std::ifstream f(index_path_, std::ios::binary);
+        if (!f) return "no index";
+        const std::string b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (b.size() < 8 || fnv64(b.data(), b.size() - 8) != *reinterpret_cast<const uint64_t*>(b.data() + b.size() - 8))
+            return "index checksum differs, starting empty";
+        size_t at = 0;
+        uint64_t magic = 0, compat = 0, blocks = 0, next = 0, clock = 0, n = 0;
+        if (!get(b, at, magic) || magic != INDEX_MAGIC || !get(b, at, compat) || !get(b, at, blocks) || !get(b, at, next) ||
+            !get(b, at, clock) || !get(b, at, n))
+            return "not an index, starting empty";
+        if (compat != compat_) return "another engine or layout, starting empty";
+        if (blocks != index_.blocks()) return "another store size, starting empty";
+        std::vector<FlashEntry> kept;
+        uint64_t stale = 0;
+        for (uint64_t i = 0; i < n; ++i) {
+            FlashEntry x;
+            uint32_t terminal = 0;
+            uint64_t ntok = 0;
+            if (!get(b, at, x.generation) || !get(b, at, x.used) || !get(b, at, x.base) || !get(b, at, x.blocks) ||
+                !get(b, at, x.position) || !get(b, at, terminal) || !get(b, at, x.ns) || !get(b, at, ntok) ||
+                ntok != uint64_t(x.position) + 1 || b.size() - at < ntok * sizeof(int))
+                return "index cut short, starting empty";
+            x.terminal = terminal != 0;
+            x.tokens.resize(ntok);
+            std::memcpy(x.tokens.data(), b.data() + at, ntok * sizeof(int)); at += ntok * sizeof(int);
+            if (!get(b, at, x.manifest)) return "index cut short, starting empty";
+            if (x.manifest.differs(x.manifest) || x.base >= blocks || x.blocks != entry_blocks(x.position)) { ++stale; continue; }
+            io(x.base, 1, false);
+            FlashManifest m;
+            std::memcpy(&m, host_, sizeof m);
+            if (m.differs(x.manifest)) { ++stale; continue; }
+            x.used_ms = index_.now_ms();
+            kept.push_back(std::move(x));
+        }
+        index_.adopt(next, clock, std::move(kept));
+        return std::to_string(index_.size()) + " entries kept" + (stale ? ", " + std::to_string(stale) + " stale dropped" : "");
+    }
 public:
     // the last capture or restore: blocks, bytes and milliseconds (the log lines)
     struct Last { uint64_t blocks = 0; double ms = 0; } last;
     bool log = true;
     // spec / name / bytes: as KvTiers::add (name: this rank's lease, never the pool stash's). compat: what makes an entry
     // this engine's (model set, TP, rank, layout, engine build)
-    // group: a group lease of `bytes` to start (FlashGroup), else a store of `bytes`
+    // group: a group lease of `bytes` to start (FlashGroup), else a store of `bytes`. index_path: persist=on, the file
+    // the index is kept in (loaded here, rewritten after every capture and resize)
     FlashCheckpoints(FlashStateView v, const std::string& spec, const std::string& name, uint64_t bytes,
-                     const std::string& compat, const FlashGroup* group = nullptr, int batch = 32) : v_(std::move(v)), batch_(batch) {
+                     const std::string& compat, const FlashGroup* group = nullptr, const std::string& index_path = {},
+                     int batch = 32) : v_(std::move(v)), index_path_(index_path), batch_(batch) {
         if (v_.bindings.empty() || !v_.S || !v_.conv || v_.layers <= 0 || v_.slots <= 0 || v_.pool_pages <= 0) throw std::runtime_error("Flash checkpoint: no state to keep");
         block_ = v_.page_bytes();
         slot_ = (block_ + 4095) / 4096 * 4096;
@@ -225,7 +298,9 @@ public:
         fck::ck(cudaHostAlloc(reinterpret_cast<void**>(&host_), slot_ * batch_, cudaHostAllocMapped), "alloc");
         fck::ck(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_dev_), host_, 0), "alloc");
         tk(g6kv_tier_register(t_, host_, slot_ * batch_), "register");
+        if (!index_path_.empty()) loaded = load();
     }
+    std::string loaded;   // persist=on: what the boot took back from the index file (the boot log)
     ~FlashCheckpoints() {
         if (t_) g6kv_tier_free(t_);
         cudaFree(d_bind_); cudaFree(d_off_); cudaFree(d_sum_); cudaFree(d_list_); cudaFreeHost(host_);
@@ -287,6 +362,7 @@ public:
             tk(rc, "shrink");
             if (blocks != r.slots) throw std::runtime_error("Flash checkpoint: the lease shrank to a different size than the event's");
         }
+        save();
         return true;
     }
     // keep the run's logical rows [0, position) (run: its pool pages in order) and KDA slot `slot` (the state after them)
@@ -322,6 +398,7 @@ public:
         io(base, 1, true);
         const uint64_t g = x.generation;
         index_.add(std::move(x));
+        save();
         last = Last{need, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()};
         return g;
     }

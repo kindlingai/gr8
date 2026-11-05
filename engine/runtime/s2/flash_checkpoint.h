@@ -27,6 +27,9 @@
 // the same index (the same captures in the same order, the same sizes), and the index digest joins the pool digest
 // every rank compares.
 //
+// persist=on (an ssd: store): the index is written next to the blocks after every capture and resize, and a boot whose
+// compat line and store size match takes back each entry whose manifest block is still its own (FlashCheckpoints::load).
+//
 // A group lease (--kv-store ...,group=, s2/kv_share.h, D-331 M8 (c)): the store shares its KV node with other clusters
 // (the full model's pool) and changes size by whole segments at a Resize event. The index reports what the pool stash
 // reports: its counters as g6kv_tier_totals (share_want asks from them) and the ages of what a give would drop
@@ -201,6 +204,19 @@ public:
         return true;
     }
     uint64_t next_generation() const { return next_; }
+    uint64_t clock() const { return clock_; }
+    // a persisted index back (FlashCheckpoints, persist=on): the entries that passed their manifest check, in any order.
+    // Throws when one lies past the store or two overlap.
+    void adopt(uint64_t next, uint64_t clock, std::vector<FlashEntry> v) {
+        std::sort(v.begin(), v.end(), [](const FlashEntry& a, const FlashEntry& b) { return a.base < b.base; });
+        uint64_t end = 0;
+        for (const auto& x : v) {
+            if (x.base < end || x.blocks > blocks_ || x.base > blocks_ - x.blocks || x.generation >= next)
+                throw std::runtime_error("Flash checkpoint: persisted entry " + std::to_string(x.generation) + " does not fit the store");
+            end = x.base + x.blocks;
+        }
+        e_ = std::move(v); next_ = next; clock_ = clock;
+    }
     // publish an entry whose blocks are written (reserve gave `base`)
     void add(FlashEntry x) {
         if (x.generation != next_) throw std::runtime_error("Flash checkpoint: generation out of order");

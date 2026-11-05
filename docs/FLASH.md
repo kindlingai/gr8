@@ -143,8 +143,12 @@ aligned entries stay exact. The MTP layer's row `p - 1` may not hold the last to
 which drafts are accepted. The boot and request log lines say `terminal`. Aligned stays the mode to use when the output
 must match no cache.
 
-The store: the one `KV_STORE` (`--kv-store`; `mem:`, `ssd:PATH` or `remote:HOST:PORT`, `persist=on` refused), else
-this process's memory, `FLASH_STATE_BUDGET_MIB` (8,192) a rank. An SSD folder starts empty at every boot. On a KV node
+The store: the one `KV_STORE` (`--kv-store`; `mem:`, `ssd:PATH` or `remote:HOST:PORT`), else this process's memory,
+`FLASH_STATE_BUDGET_MIB` (8,192) a rank. An SSD folder starts empty at every boot unless `persist=on` (aligned only):
+then the index is written beside the blocks after every capture and resize (`flash-ckpt.index`, a temporary file
+renamed over it), and a boot with the same compat line (model set, TP, rank, CAP, layout, engine build) and store size
+takes back every entry whose manifest block is still its own. A spare RAM cache on the store
+(`cache:NAME,kind=spare_ram`) keeps a copy of the blocks in memory the kernel may take back, as on GLM-5.3's stores. On a KV node
 the lease is `g6m4f-ckpt-<host>-<epoch>-r<rank>`, never the pool stash's. Each checkpoint is one contiguous range of
 blocks with a manifest and GPU checksums of every extent; a restore that does not match its checksums stops the engine.
 A full store drops the least recently used checkpoints. Every rank keeps the same index, and its digest joins the pool
