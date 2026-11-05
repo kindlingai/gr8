@@ -212,13 +212,23 @@ class FlashCheckpoints {
             put(b, x.manifest);
         }
         put(b, fnv64(b.data(), b.size()));
+        // a full or read-only disk costs the persistence, not the serve: the index goes, and this boot keeps its entries
+        // in the store without one
         const std::string tmp = index_path_ + ".tmp";
+        std::error_code ec;
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
             f.write(b.data(), (std::streamsize)b.size());
-            if (!f.flush()) throw std::runtime_error("Flash checkpoint: cannot write " + tmp);
+            if (!f.flush()) ec = std::make_error_code(std::errc::io_error);
         }
-        std::filesystem::rename(tmp, index_path_);
+        if (!ec) std::filesystem::rename(tmp, index_path_, ec);
+        if (ec) {
+            fprintf(stderr, "# flash ckpt persist: cannot write %s (%s): persistence off for this boot\n", index_path_.c_str(),
+                    ec.message().c_str());
+            std::filesystem::remove(tmp, ec);
+            std::filesystem::remove(index_path_, ec);
+            index_path_.clear();
+        }
     }
     // the persisted index, if it is this store's: the entries whose manifest block still holds their manifest. Returns
     // what it did, for the boot log.
@@ -377,7 +387,11 @@ public:
         const auto t0 = std::chrono::steady_clock::now();
         const uint64_t np = (position + 63) / 64, need = entry_blocks(position);
         uint64_t base = 0;
-        if (!index_.reserve(need, base)) return 0;
+        std::vector<uint64_t> gone;
+        if (!index_.reserve(need, base, &gone)) return 0;
+        // the entries reserve dropped leave the index on disk before their blocks are overwritten, so a crash during the
+        // capture never leaves an index naming a range that holds part of another entry
+        if (!gone.empty()) save();
         FlashEntry x;
         x.generation = index_.next_generation(); x.base = base; x.blocks = need; x.position = position; x.terminal = terminal;
         x.tokens = tokens; x.ns = ns;
@@ -402,6 +416,13 @@ public:
         last = Last{need, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()};
         return g;
     }
+    // a restore of `generation` read bytes that are not the entry's: the entry leaves the persisted index first, so the
+    // next boot does not stop on it again
+    [[noreturn]] void fail(uint64_t generation, const char* why) {
+        index_.drop(generation);
+        save();
+        throw std::runtime_error("Flash checkpoint " + std::to_string(generation) + ": " + why);
+    }
     // entry `generation` back into the run's logical rows [0, position) and KDA slot `slot`; throws when the stored bytes
     // are not the entry's (the serve fails: the other ranks restore too, so one rank cannot fall back to a cold prefill alone)
     void restore(uint64_t generation, int slot, const std::vector<int>& run, cudaStream_t st) {
@@ -412,7 +433,7 @@ public:
         io(x->base, 1, false);
         FlashManifest m;
         std::memcpy(&m, host_, sizeof m);
-        if (const char* why = m.differs(x->manifest)) throw std::runtime_error(std::string("Flash checkpoint ") + std::to_string(generation) + ": " + why);
+        if (const char* why = m.differs(x->manifest)) fail(generation, why);
         const uint64_t np = (x->position + 63) / 64;
         set_pages(run, np, st);
         for (uint64_t p = 0; p < np; p += batch_) {
@@ -422,8 +443,8 @@ public:
         }
         const auto sx = v_.state(slot);
         state(sx, x->base + 1 + np, false, st);
-        if (page_sum(np, st) != m.page_sum) throw std::runtime_error("Flash checkpoint " + std::to_string(generation) + ": page checksum");
-        if (sum(sx, st) != m.state_sum) throw std::runtime_error("Flash checkpoint " + std::to_string(generation) + ": KDA state checksum");
+        if (page_sum(np, st) != m.page_sum) fail(generation, "page checksum");
+        if (sum(sx, st) != m.state_sum) fail(generation, "KDA state checksum");
         last = Last{x->blocks, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()};
         index_.touch(generation);
     }
