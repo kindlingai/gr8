@@ -12,14 +12,11 @@
 #include <string>
 #include <vector>
 #include "../steering.h"
+#include "../../module_info.h"
 
 namespace g6s2 {
 inline void require(bool ok, const char* what) { if (!ok) throw std::runtime_error(what); }
-#if defined(G6_MODEL_DS41) && G6_MODEL_DS41
-constexpr unsigned MAX_SESSIONS = 32, PAGE = 64;
-#else
-constexpr unsigned MAX_SESSIONS = 8, PAGE = 64;
-#endif
+constexpr unsigned MAX_SESSIONS = unsigned(g6mod::INFO.max_sessions), PAGE = unsigned(g6mod::INFO.kv_page);
 // DS41: members of one ragged prefill pack (ds41::pack::MAX_SEGMENTS); the slots they name range over MAX_SESSIONS
 constexpr unsigned PACK_MAX_MEMBERS = 8;
 // The control link's version: the frame magic is the numeric base "G6S2E0" + this version (control_protocol.h), and the bootstrap agreement
@@ -103,13 +100,10 @@ struct Config {
     }
     void validate() const {
         require(epoch && pool_rows >= PAGE && pool_rows % PAGE == 0, "bad epoch/pool");
-#if G6_MODEL_DS41
-        require(mtp <= 7 && max_sessions && max_sessions <= MAX_SESSIONS && limit(), "bad session/row limit");   // DS41 allows MTP 0 (no draft head)
-#else
-        require(mtp > 0 && mtp <= 7 && max_sessions && max_sessions <= MAX_SESSIONS && limit(), "bad session/row limit");
-        require(!c8_pack, "c8 prefill pack is DS41 only");
-        require(!park, "parked slots are DS41 only");
-#endif
+        require((mtp > 0 || g6mod::has(G6_CAP_MTP0)) && mtp <= 7 && max_sessions && max_sessions <= MAX_SESSIONS && limit(),
+                "bad session/row limit");
+        require(!c8_pack || g6mod::has(G6_CAP_PACK), "c8 prefill pack is DS41 only");
+        require(!park || g6mod::has(G6_CAP_PARK), "parked slots are DS41 only");
         require(guard() >= 2 * mtp && prefill_rows, "insufficient guard/prefill rows");
         require(!decode_prefill_rows || (decode_prefill_rows % PAGE == 0 && decode_prefill_rows <= prefill_rows),
                 "decode_prefill_rows must be 0 or a multiple of 64 no larger than prefill_rows");

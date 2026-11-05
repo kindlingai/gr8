@@ -10,6 +10,7 @@
 // coll_seq(step, c, ncoll). A chunk takes one id from Dispatch's main sequence (Dispatch::prefill, prefill_seq); the next MAIN step has
 // sequence + 1. Every rank runs the same Driver, so the ids agree.
 #pragma once
+#include "prompt_rule.h"
 #include "scheduler.h"
 #include "../ds41_coll_order.h"
 #include "../ds41_pack_layout.h"
@@ -25,11 +26,6 @@ inline void ds41_prefill_single_lane(Config& sc, uint32_t rows) {
     require(rows > 0, "DS41 prefill width must be positive");
     sc.prefill_rows = rows;
     sc.two_lanes = false;
-}
-// does this prompt run as MAIN decode steps (true) or prefill (false)? Prompt logprobs (plp) score each prompt row against the next prompt
-// token, which only a decode step produces; steering scales target MAIN rows. Both stay on the decode path.
-inline bool ds41_decode_prompt(uint32_t prefill_min, size_t prompt_tokens, int plp, bool steering) {
-    return prefill_min == 0 || prompt_tokens < prefill_min || plp >= 0 || steering;
 }
 // One W-row chunk of one session, as Dispatch hands it to the callee. The callee ENQUEUES and LAUNCHES (no sync); the caller fences.
 struct Ds41PrefillChunk {

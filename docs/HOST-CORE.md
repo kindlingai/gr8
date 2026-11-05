@@ -1,6 +1,6 @@
 # One host core, per-model GPU modules
 
-Status: R0 in progress. Inventory taken at 35a8f1c; reviewed against the code by a second pass.
+Status: R0 done (#343), R1 in progress. Inventory taken at 35a8f1c; reviewed against the code by a second pass.
 
 ## Why
 
@@ -208,10 +208,18 @@ first request of the boot only (later requests can differ under `--spec-adaptive
 
 ### R1. ModuleInfo
 
-The module exports a `#[repr(C)] ModuleInfo` filled from its constants: model id, `nr`, `mx`, `s2n`, hidden size,
-layers, `MP`, vocabulary, top-k, KV row bytes and name, page size, drafting limits, capabilities, and the model traits
-the scheduler and sessions branch on today. It comes first so that later steps read traits from one place instead of
-growing a second mechanism. Still one build per model.
+`engine/module_info.h`: a C struct `G6ModuleInfo` filled at compile time from the build's constants (model, `nr`, `mx`,
+session slots, hidden size, layers, MTP layers, vocabulary, experts, top-k, KV row bytes and format, page) and
+capability bits for the model behaviours host code branches on (MTP 0, prefill packs, parked slots, prompts as decode
+steps, DSpark, DFlash2, the Flash cost table, KDA state, grammars). `g6mod::INFO` is a constant expression, so the
+scheduler's and planner's slot counts are array sizes taken from it. It comes first so that later steps read traits from
+one place instead of growing a second mechanism. Still one build per model.
+
+The S2 layer's model `#if`s that encode behaviour read it instead: the scheduler's rules (`Config::validate`),
+`Sessions::payload` (the prompt rule moves to `s2/prompt_rule.h`, which every build includes), and Dispatch's DSpark keys.
+The slot capacities stay compile-time (`S2N` in `s2_in.h` is shared with device code; a check ties it to `ModuleInfo`)
+until R2 makes them runtime in Rust. `g6m4` prints the description at boot. `engine/runtime/tests/module_info_test.cpp`
+checks it against the constants in each model's shape.
 
 ### R2. Scheduler and sessions to Rust (`engine/s2core-rs`)
 

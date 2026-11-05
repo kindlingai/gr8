@@ -514,6 +514,10 @@ int main(int argc, char** argv)
         if (kv_format != built)
             die("--kv-format " + kv_format + ": this engine is the " + built + " build (bin/g6m4 is fp8, bin/g6m4-int4 is int4)");
         if (cfg.rank == 0) fprintf(stderr, "# rank 0: KV format %s (latent row %d B, %s)\n", kv_format.c_str(), g6kv::ROW, g6kv::NAME);
+        if (cfg.rank == 0)   // module_info.h: what host code reads about this build
+            fprintf(stderr, "# rank 0: module %s abi %u: TP%d, %d rows a step, %d session slots, KV %s %d B a row, caps %#x\n",
+                    g6mod::INFO.name, g6mod::INFO.abi, g6mod::INFO.nr, g6mod::INFO.mx, g6mod::INFO.max_sessions, g6mod::INFO.kv_format,
+                    g6mod::INFO.kv_row_bytes, g6mod::INFO.caps);
     }
 #if G6_MODEL_DS41
     // Parse before --check-args, CUDA, fabric or weights. Unset decode cut inherits the main cut.

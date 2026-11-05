@@ -6,9 +6,7 @@
 #include "../serve.h"
 #include <cmath>
 #include <functional>
-#if G6_MODEL_DS41
-#include "ds41_prefill.h"
-#endif
+#include "prompt_rule.h"
 
 namespace g6s2 {
 inline std::vector<int> request_ids(const std::string& s) {
@@ -120,13 +118,14 @@ public:
     static Request request(uint64_t id, const g6rt::ServeReq& r) {
         return {id, uint32_t(r.prompt.size()), uint32_t(r.n_gen), r.steering};
     }
-#if G6_MODEL_DS41   // DS41 by default has no tensor prefill: every prompt runs as decode steps from position 0 (Driver decode_prompt), unless prefill_min admits it (ds41_prefill.h)
+    // G6_CAP_PROMPT_DECODE (DS41): no tensor prefill by default, every prompt runs as decode steps from position 0
+    // (Driver decode_prompt) unless prefill_min admits it (ds41_prefill.h); otherwise only prompt logprobs keep a prompt
+    // on the decode path
     Payload payload(const g6rt::ServeReq& r) const {
-        return {r.prompt, chunk_, ds41_decode_prompt(prefill_min_, r.prompt.size(), r.plp, r.steering.enabled), r.ins, r.steering, r.gram};
+        const bool decode = g6mod::has(G6_CAP_PROMPT_DECODE) ? ds41_decode_prompt(prefill_min_, r.prompt.size(), r.plp, r.steering.enabled)
+                                                             : r.plp >= 0;
+        return {r.prompt, chunk_, decode, r.ins, r.steering, r.gram};
     }
-#else
-    Payload payload(const g6rt::ServeReq& r) const { return {r.prompt, chunk_, r.plp >= 0, r.ins, r.steering, r.gram}; }
-#endif
     // (row, target, k) -> a row's logprob entry in the last main step (DispatchHooks::logprob)
     using Logprob = std::function<g6rt::LpRow(int, bool, int)>;
     void bind(const Grant& g, const g6rt::ServeReq& r) {
