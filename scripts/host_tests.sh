@@ -226,6 +226,8 @@ g++ -std=c++17 -O2 -ffp-contract=off -DG6_MODEL_FLASH=1 "$REPO/engine/kda/tests/
 "$T/kda_carry_cpu_test"
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_tp2_test.cpp" -o "$T/control_tp2_test" "${KNOBS[@]}"
 "$T/control_tp2_test"
+g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_tp1_test.cpp" -o "$T/control_tp1_test" "${KNOBS[@]}"
+"$T/control_tp1_test"
 # FLASH_CAP_POLICY=borrow-idle's rule (s2/flash_lend.h) and the ACK's room (Ack::room): lend once idle, recall before a
 # request that needs the chunks, the head admits within the least room over the ranks
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/flash_lend_test.cpp" -o "$T/flash_lend_test" "${KNOBS[@]}"

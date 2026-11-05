@@ -2,7 +2,7 @@
 
 gr8 serves [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) from its exlr8 release
 ([kindlingai/glm-5.3-flash-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4)) at TP=4,
-TP=3 (a three-box ring, variant k4) or TP=2. The engine is `bin/g6m4_flash`, a build of the same `g6m4` source with `-DG6_MODEL_FLASH=1`
+TP=3 (a three-box ring, variant k4), TP=2 or TP=1 (one box, variant k2, the one width whose weights fit). The engine is `bin/g6m4_flash`, a build of the same `g6m4` source with `-DG6_MODEL_FLASH=1`
 (`engine/model_geom.h` holds the geometry).
 
 ## Build and run
@@ -71,6 +71,13 @@ it also decides which requests share decode steps, as on GLM-5.3: a longer one w
 Prefill time grows faster than the prompt because the indexer scores every earlier key for each row. The time of a
 262K prefill has not been measured. The shim errors a request after 900 s with no output (`--stall-timeout`), and a
 prefill sends none, so a prefill longer than that fails.
+
+## One box (TP=1)
+
+`--tp 1` serves the whole model on one GB10 with the k2 width (about 93 GB of weights on the device). The ranks' fabric
+has no peers then: `g6::Fabric` keeps its region for the kernels' own slots and skips the NIC, the bootstrap and the
+proxy (`engine/comms/fabric.cpp`), and the S2 head agrees with itself (`s2/control_channel.h`). The launcher skips the
+RDMA checks. The router is not split (no ranks to split it over), so the routed experts run on the expert tiles.
 
 ## Several sessions
 
