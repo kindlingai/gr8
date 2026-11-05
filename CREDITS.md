@@ -7,6 +7,9 @@ KindlingAI is:
   - Earlier engine, TP=3 conversion and gate foundations preserved in the Git history
     ([range fetching and manifests](https://github.com/kindlingai/gr8/commit/2d88926cb08bec602ba6382ccf10d90e1a735841),
     [gate harness](https://github.com/kindlingai/gr8/commit/3d6116f084b86aa96d4be47b253e223ef7a5dcea)).
+  - DeepSeek-V4.1-Flash on four boxes: the `ds41` tuning knobs and served defaults
+    ([#327](https://github.com/kindlingai/gr8/pull/327)-[#338](https://github.com/kindlingai/gr8/pull/338),
+    [#342](https://github.com/kindlingai/gr8/pull/342)), and this boot guide.
 - [@coffee-the-dev](https://github.com/coffee-the-dev)
 - [@mmastrac](https://github.com/mmastrac)
 
