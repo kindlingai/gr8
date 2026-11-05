@@ -34,6 +34,12 @@ The `ds41` engine takes images in chat requests, the way the release's own code 
 `DIR/vision.s2`, and the shim's hello offers `vision`. The boot line is
 `# rank R: ds41 vision: tower ..., N MiB on the device (...)`. `0` never loads the tower, and the engine runs the
 text-only code (the router and Engram take the text-only kernels: their image arguments are null).
+Each rank looks for the tower file on its own. A rank that loaded it adds `vision <file id>` (the file's byte size and
+a hash of its safetensors header) to the rank agreement; a rank without it adds nothing. So ranks that differ (a box
+without the file, or with another file) refuse at bootstrap.
+
+A prefix-cache entry and a `GR8_DS_PARK` resume rebuild the Engram ring with -1 at the request's image rows, as the
+live steps leave it (`engine/runtime/s2/ds41_engram_ring.h`).
 
 ## Costs and limits
 
@@ -44,7 +50,9 @@ text-only code (the router and Engram take the text-only kernels: their image ar
 - An image that straddles two prefill chunks is encoded once for each chunk.
 - JPEG and lossy WebP decode a few levels from PIL (another decoder); lossless input is exact.
 - The DSpark (MTP) draft layers get no vision input of their own: their embedding at image rows is the image
-  token's. Not checked against the official MTP code; it can only change draft acceptance, not the output.
+  token's. Not checked against the official MTP code. With strict (exact) acceptance it can only change how many
+  drafts are accepted, not the output. With relaxed acceptance (`GR8_DS_RELAXED_ACCEPT`) a draft token is kept
+  when it is close enough to the main model's, so a draft image embedding can change the emitted token.
 
 ## Tests (no GPU)
 
@@ -56,6 +64,9 @@ text-only code (the router and Engram take the text-only kernels: their image ar
   control frames, the refusals).
 - `cargo test --release` in `engine/loader-rs`: `router.bias_vl` bound on the main layers only.
 - `engine/ref/ds41/vision_layout_check.py`: a CPU replay of every cuBLAS call and kernel index of the tower.
+- `scripts/host_tests.sh` also runs `ds41_engram_ring_test` (an image 0..3 tokens before a prompt-end or request-end
+  snapshot: the rebuilt ring equals the live ring) and `ds41_agree_vision_test` (4 ranks on loopback: a rank without
+  the tower file, or with another file, refuses).
 
 ## Boot test (GPU; one TP4 `ds41` serve)
 

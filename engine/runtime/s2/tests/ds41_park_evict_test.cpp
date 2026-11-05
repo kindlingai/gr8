@@ -455,6 +455,58 @@ static void park_digest_link() {
 #endif
 }
 
+// DS41 image input (Astra, review of 4b7ef70): a prefix-cache entry captured after an image (0..3 text tokens before the
+// snapshot) restores the Engram ring the live steps left, -1 at the image rows, not the image token. The prompt-end entry
+// (capture_prompt_end) and a request-end entry captured by a park eviction (evict_parked), each restored on slot 0.
+static void image_ring() {
+    constexpr int TI = g6rt::TOK_IMAGE;
+    int cases = 0;
+    for (int gap = 0; gap <= 3; ++gap) {
+        Fixture f(false);
+        Ds41PrefixCache cache(f.m, nullptr, 4);
+        g6s2::Ds41SnapSlots snaps(1);
+        std::vector<int> t;
+        for (int i = 0; i < 300; ++i) t.push_back(1000 + i);
+        g6rt::ImageIn im; im.pos = 300; im.span = 16;
+        for (int i = 0; i < im.span; ++i) t.push_back(TI);
+        for (int i = 0; i <= gap; ++i) t.push_back(2000 + i);
+        const uint32_t pe_pos = uint32_t(t.size()) - 1;   // the prompt end: the image ends gap tokens before it
+        const g6s2::Ds41ImageRows rows = g6s2::ds41_image_rows({im});
+        auto live = [&](const std::vector<int>& tok, uint32_t pos, int* want) {   // the live ring: -1 at image rows
+            std::fill_n(want, 64, -1);
+            for (int q = std::max(0, int(pos) - 64); q < int(pos); ++q)
+                want[q & 63] = q >= im.pos && q < im.pos + im.span ? -1 : tok[size_t(q)];
+        };
+        int want[64];
+        const uint64_t pe = snaps.capture_prompt_end(cache, 0, pe_pos, t, ns(1), 0, rows);
+        CHECK(pe != 0);
+        std::fill_n(f.hist, 64, 12345);
+        cache.restore(pe, 0, 0);
+        live(t, pe_pos, want);
+        CHECK(std::equal(want, want + 64, f.hist));
+        CHECK(gap == 3 || f.hist[(pe_pos - 1 - uint32_t(gap)) & 63] == -1);   // the image's last row is in the next n-gram
+        ++cases;
+        // the request end of the same chat (a park evicted into the cache, in a cache of its own: the dedup would keep the
+        // prompt-end entry instead), 0..3 tokens generated after the prompt
+        for (uint32_t g = 0; g <= 3; ++g) {
+            Fixture f2(false);
+            Ds41PrefixCache c2(f2.m, nullptr, 4);
+            g6s2::Ds41SnapSlots s2(1);
+            std::vector<int> hh = t;
+            for (uint32_t i = 0; i < g + 1; ++i) hh.push_back(3000 + int(i));
+            const uint32_t re_pos = pe_pos + g;
+            const uint64_t re = s2.evict_parked(c2, 0, re_pos, hh, ns(1), 0, 0, rows);
+            CHECK(re != 0);
+            std::fill_n(f2.hist, 64, 12345);
+            if (re) c2.restore(re, 0, 0);
+            live(hh, re_pos, want);
+            CHECK(std::equal(want, want + 64, f2.hist));
+            ++cases;
+        }
+    }
+    printf("ds41_park_evict_test image ring: %d prompt-end and request-end restores equal the live ring (image 0..3 tokens before)\n", cases);
+}
+
 int main() {
     for (bool fp4 : {false, true}) {
         tight_budget(fp4, false);
@@ -465,6 +517,7 @@ int main() {
     }
     combined();
     lifecycle();
+    image_ring();
     if (knob::ds_cache_replace()) {
         for (bool fp4 : {false, true}) {
             stale_placeholder(fp4, false);
@@ -475,6 +528,6 @@ int main() {
     }
     CHECK(mem.empty());
     if (fails) { fprintf(stderr, "ds41_park_evict_test: %d FAIL\n", fails); return 1; }
-    printf("ds41_park_evict_test: ok (%d cases)\n", knob::ds_cache_replace() ? 19 : 12);
+    printf("ds41_park_evict_test: ok (%d cases)\n", knob::ds_cache_replace() ? 20 : 13);
     return 0;
 }

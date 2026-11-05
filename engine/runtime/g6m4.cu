@@ -1312,6 +1312,7 @@ int main(int argc, char** argv)
     // (each rank embeds every row). The head writes DIR/vision.s2, so the shim's hello offers `vision`.
     Ds41Vision vis;
     bool vis_on = false;
+    std::string vis_id;   // the loaded tower file's id (ds41_vision_id.h): in the S2 runtime signature, so every rank loaded the same
     if (s2mode && release && knob::ds41_vision()) {
         std::string vpath;
         for (const char* rel : {"/exlr8-extra-vision.safetensors", "/dense/exlr8-extra-vision.safetensors"}) {
@@ -1323,6 +1324,8 @@ int main(int argc, char** argv)
         else if (!knob::ds_prefill_min())
             fprintf(stderr, "# rank %d: ds41 vision off: image prompts prefill, and GR8_DS_PREFILL_MIN is 0\n", R);
         else {
+            vis_id = ds41v::file_id(vpath);
+            if (vis_id.empty()) die("DS41 vision: cannot read the safetensors header of " + vpath);
             vis.boot(vpath, 2 * m.hc_rows);
             vis.attach(m);
             vis_on = true;
@@ -2219,6 +2222,9 @@ int main(int argc, char** argv)
         if (ds_idx_q_trig) bc.runtime_signature += " idxqtrig 1";
         if (ds_idx_pipe_qr) bc.runtime_signature += " idxpipeqr 1";
         if (reuse_prefix) bc.runtime_signature += " reuse 1";
+        // DS41 image input: what this rank loaded, not the knob (a rank without the tower file boots text-only). With the tower,
+        // " vision <file id>"; without, nothing. A rank that differs (no file, another file) refuses at bootstrap
+        bc.runtime_signature += ds41v::signature(vis_on, vis_id);
         // the agree-scope knobs that are not at their default (knob::signature(), as Flash and GLM add): a rank whose value
         // differs (GR8_DS_COMP_FP4 on three ranks and off on one) refuses at bootstrap instead of diverging later
         bc.runtime_signature += knob::signature();

@@ -31,6 +31,7 @@
 
 #include "json.h"
 #include "ds41_vision_plan.h"
+#include "ds41_vision_id.h"
 
 namespace ds41v {
 
