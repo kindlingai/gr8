@@ -1,7 +1,8 @@
 // The C-ABI functions of gr8's host-side S2 scheduling logic in Rust (for C++ callers: bool fields, <cstdint>) (engine/scheduler-rs, docs/HOST-CORE.md R2). Built as
 // libg6sched.a with cargo; g6m4, m4sim and the host tests link it. The C++ headers in engine/runtime/s2 keep their
-// types and call these; the structs here have the same layout as theirs (each wrapper checks with a static_assert).
-// Fallible calls return 0 or a code the wrapper turns into its message, and leave their state unchanged on failure.
+// types and call these; the structs here have the same layout as theirs (static_asserts in each wrapper) and as the
+// Rust's (the layout digest at the end, checked at startup). Fallible calls return 0 or a code, or null or the refusal's
+// message, which the wrapper throws; see each call for what a refusal leaves changed.
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -235,13 +236,17 @@ uint64_t g6sch_layout(void);
 #include <type_traits>
 namespace g6sch_abi_detail {
 template <class T> constexpr uint64_t kind() {
-    if constexpr (std::is_pointer_v<T>) return 7;
+    if constexpr (std::is_pointer_v<T>) return 0x70 | kind<std::remove_cv_t<std::remove_pointer_t<T>>>();
     else if constexpr (std::is_array_v<T>) return 0x50 | kind<std::remove_extent_t<T>>();
     else if constexpr (std::is_same_v<T, bool>) return 4;
     else if constexpr (std::is_floating_point_v<T>) return 3;
     else if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) return 2;
     else if constexpr (std::is_integral_v<T>) return 1;
     else return 6;
+}
+template <class T> constexpr uint64_t psize() {
+    if constexpr (std::is_pointer_v<T>) return sizeof(std::remove_pointer_t<T>);
+    else return 0;
 }
 constexpr uint64_t mix(uint64_t h, uint64_t v) {
     for (unsigned i = 0; i < 8; ++i) h = (h ^ ((v >> (8 * i)) & 0xff)) * 1099511628211ull;
@@ -251,8 +256,9 @@ constexpr uint64_t mix(uint64_t h, uint64_t v) {
 #define G6SCH_TYPE(T) h = g6sch_abi_detail::mix(g6sch_abi_detail::mix(h, sizeof(T)), alignof(T));
 #define G6SCH_FIELD(T, f) \
     h = g6sch_abi_detail::mix(g6sch_abi_detail::mix(g6sch_abi_detail::mix(h, offsetof(T, f)), sizeof(decltype(T::f))), \
-                              g6sch_abi_detail::kind<decltype(T::f)>());
-inline uint64_t g6sch_layout_cpp() {
+                              g6sch_abi_detail::kind<decltype(T::f)>());                                   \
+    h = g6sch_abi_detail::mix(h, g6sch_abi_detail::psize<decltype(T::f)>());
+constexpr uint64_t g6sch_layout_cpp() {
     uint64_t h = 14695981039346656037ull;
     G6SCH_TYPE(g6sch_status) G6SCH_FIELD(g6sch_status, why) G6SCH_FIELD(g6sch_status, requested) G6SCH_FIELD(g6sch_status, room)
     G6SCH_TYPE(g6sch_cand) G6SCH_FIELD(g6sch_cand, id) G6SCH_FIELD(g6sch_cand, past)

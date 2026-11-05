@@ -229,7 +229,7 @@ inline Quantum from_rs(const g6sch_quantum& o) {
     }
     return q;
 }
-// the Rust side agrees on every size and constant both sides define
+// the Rust side agrees on every shared struct layout (g6sch_layout) and every constant both sides define
 inline void check_abi() {
     static const bool ok = [] {
         if (g6sch_layout() != g6sch_layout_cpp()) return false;
