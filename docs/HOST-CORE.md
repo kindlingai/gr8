@@ -274,11 +274,14 @@ Moves `s2_batch.h` (about 1,500 lines), `spec_len.h`, `insert_rule.h`, `ngram_lo
    which the host headers now read. Confirmed on the cluster: each rank's log, less the version 3 records, is the
    earlier boots' log, and replays with its learn records.
 2. R3b, the port, behind a thin C++ `s2::Batch` over the Rust, so `round_replay`, `batch_replay_test` and the version 3
-   format run unchanged against it. The replay must reproduce every step and every learn record across whole sessions.
-   Before it, g6m4 and m4sim build their host code with `-Xcompiler -ffp-contract=off`: g++ contracts C++ under every
-   `-std`, so the planner on the GB10 fuses multiply-adds today, and Rust never does. That step can change the
-   estimates' bits, so it lands alone with its own confirmation (T=0 and the replay of a serving log with
-   `round_replay_off`). In the port: the Rust exports its state through C getters and the C++ facade hashes it with
+   format run unchanged against it. The gate is behaviour and speed, not bit-exact estimates: the replay must ask for
+   every step of the test logs and of a serving log (`--steps-only`), T=0 must match on the cluster, and the planning
+   time per round must not grow (measured before and after, one C call a round, no heap allocation per round in the
+   Rust). The learn records stay as the diagnostic: when a step differs, `--dump-learn` shows which estimate drifted
+   first. g++ contracts multiply-adds in C++ under every `-std`, so the GB10 planner fuses them and Rust does not unless
+   it calls `mul_add`; the last bits of an estimate may then differ, which is acceptable while every step matches. The
+   planner's floating point is a few hundred operations a round, so its speed is the per-round overhead, not FMA or
+   vectorization. In the port: the Rust exports its state through C getters and the C++ facade hashes it with
    `s2log::Hash`, so the learn record has one implementation; `exp` (`kprob`) is `f64::exp` from the same libm (the header
    names it); `DSelTable::parse`'s `strtod` and `str`'s `%.10g` (it feeds the runtime signature) stay C++ or are tested
    against it.
