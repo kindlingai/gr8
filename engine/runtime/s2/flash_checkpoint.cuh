@@ -259,7 +259,7 @@ class FlashCheckpoints {
             x.tokens.resize(ntok);
             std::memcpy(x.tokens.data(), b.data() + at, ntok * sizeof(int)); at += ntok * sizeof(int);
             if (!get(b, at, x.manifest)) return "index cut short, starting empty";
-            if (x.manifest.differs(x.manifest) || x.base >= blocks || x.blocks != entry_blocks(x.position)) { ++stale; continue; }
+            if (!x.manifest.sealed() || x.base >= blocks || x.blocks != entry_blocks(x.position)) { ++stale; continue; }
             io(x.base, 1, false);
             FlashManifest m;
             std::memcpy(&m, host_, sizeof m);

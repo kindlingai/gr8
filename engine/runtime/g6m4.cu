@@ -1968,6 +1968,8 @@ int main(int argc, char** argv)
             // its own lease name on a KV node: never the pool stash's (g6m4-...)
             const std::string name = std::string("g6m4f-ckpt-") + host + "-" + std::to_string(s2epoch) + "-r" + std::to_string(R);
             static const std::string exe = g6s2::exe_stamp();
+            // the cache mode is not in it: the launcher (tools/launch/options.py) and the check above refuse persist=on
+            // with terminal, so a persisted entry is always aligned (cold-exact)
             const std::string compat = "flash set " + set_id + " nr " + std::to_string(g6nr::NR) + " rank " + std::to_string(R) +
                 " cap " + std::to_string(cap) + " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " bindings " +
                 std::to_string(v.bindings.size()) + " state " + std::to_string(v.state_bytes()) + " format " +
