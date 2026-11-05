@@ -403,6 +403,12 @@ def validate(o):
         raise OptionError('IPS and IPS2 go together')
     for k in ('CONTROL_PORT', 'PORT', 'PROXY_CPU', 'JOIN_TIMEOUT'):
         o.int(k)
+    if o.get('MAX_MODEL_LEN') is not None:
+        n = o.int('MAX_MODEL_LEN')
+        if not 1 <= n <= model.max_positions:
+            raise OptionError(f'--max-model-len {n}: want 1 to {model.max_positions}, the model\'s max positions')
+        if o.get('CAP') is not None and n > o.int('CAP'):
+            raise OptionError(f'--max-model-len {n}: more than CAP {o.int("CAP")}, the KV pool a request comes from')
     stores = kv_stores(o)
     cache = o.get('FLASH_CACHE')
     if cache not in (None, 'off', 'aligned', 'terminal'):
@@ -955,6 +961,8 @@ def canonical(o, plan, members, variant=None, ring=''):
     # names it. DFLASH and PF_OWN decide which pack files a rank needs.
     for k in ('CAP', 'DFLASH', 'PF_OWN'):
         c[k] = plan['knobs'].get(k, '')
+    if o.get('MAX_MODEL_LEN'):   # the head's shim takes it; by name, so a box with another limit is refused
+        c['MAX_MODEL_LEN'] = o.get('MAX_MODEL_LEN')
     if variant:
         c['variant'] = variant.name
         c['variant.sha256'] = variant.sha256 or ''
