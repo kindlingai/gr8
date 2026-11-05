@@ -78,8 +78,7 @@ static bool same_digest(const std::vector<FlashIndex>& ix) {
 }
 
 int main() {
-    const char* base = getenv("TMPDIR");
-    std::string tmpl = std::string(base && *base ? base : "/tmp") + "/fckagrXXXXXX";
+    std::string tmpl = (std::filesystem::temp_directory_path() / "fckagrXXXXXX").string();
     if (!mkdtemp(&tmpl[0])) { std::perror("mkdtemp"); return 1; }
     const std::string dir = tmpl;
     uint16_t port = uint16_t(20000 + getpid() % 20000);

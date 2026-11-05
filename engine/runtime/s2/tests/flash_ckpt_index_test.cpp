@@ -353,8 +353,7 @@ static void bench(const std::string& dir) {
 }
 
 int main(int argc, char** argv) {
-    const char* base = getenv("TMPDIR");
-    std::string tmpl = std::string(base && *base ? base : "/tmp") + "/fckidxXXXXXX";
+    std::string tmpl = (std::filesystem::temp_directory_path() / "fckidxXXXXXX").string();
     if (!mkdtemp(&tmpl[0])) { std::perror("mkdtemp"); return 1; }
     const std::string dir = tmpl;
     auto sub = [&](const char* n) { const std::string d = dir + "/" + n; std::filesystem::create_directories(d); return d; };
