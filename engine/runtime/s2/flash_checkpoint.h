@@ -27,8 +27,9 @@
 // the same index (the same captures in the same order, the same sizes), and the index digest joins the pool digest
 // every rank compares.
 //
-// persist=on (an ssd: store): the index is written next to the blocks after every capture and resize, and a boot whose
-// compat line and store size match takes back each entry whose manifest block is still its own (FlashCheckpoints::load).
+// persist=on (an ssd: store): the index is written next to the blocks after every capture and resize
+// (flash_ckpt_index.h), and a boot whose compat line and store size match takes back each entry whose stored manifest,
+// pages and KDA state still match its manifest's checksums (flash_entry_check, FlashCheckpoints::settle).
 //
 // A group lease (--kv-store ...,group=, s2/kv_share.h, D-331 M8 (c)): the store shares its KV node with other clusters
 // (the full model's pool) and changes size by whole segments at a Resize event. The index reports what the pool stash

@@ -24,6 +24,7 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace g6s2 {
@@ -204,25 +205,38 @@ class FlashCheckpoints {
             files_ = FlashIndexFiles();
         }
     }
-    // the persisted index, if it is this store's: the entries whose manifest block still holds their manifest. Returns
-    // what it did, for the boot log.
-    std::string load() {
-        FlashIndexImage img;
-        uint64_t stale = 0;
-        if (const char* why = files_.load(compat_, index_.blocks(), img, stale)) return std::string(why) + ", starting empty";
+    // persist=on at boot: the index on disk (read in the constructor), its entries checked on the verify_ thread
+    // (flash_entry_check: manifest block, page and KDA state checksums of the stored bytes), published by settle()
+    FlashLayout layout_;
+    FlashIndexImage found_;               // the index read at boot; its entries that passed, once verify_ is done
+    std::string checked_;                 // what verify_ dropped and how long it took (the boot log)
+    std::thread verify_;
+    void verify() {
+        const auto t0 = std::chrono::steady_clock::now();
+        const FlashRead read = [this](uint64_t first, int n, uint8_t* dst) {
+            std::vector<uint64_t> b(static_cast<size_t>(n)); std::vector<void*> p(static_cast<size_t>(n));
+            for (int i = 0; i < n; ++i) { b[size_t(i)] = first + uint64_t(i); p[size_t(i)] = dst + size_t(i) * slot_; }
+            tk(g6kv_tier_read_many(t_, size_t(n), b.data(), p.data()), "read");
+        };
+        const int threads = int(std::max(1u, std::min(8u, std::thread::hardware_concurrency() / 2)));
         std::vector<FlashEntry> kept;
-        for (auto& x : img.entries) {
-            if (!x.manifest.sealed() || x.base >= img.blocks || x.blocks != entry_blocks(x.position)) { ++stale; continue; }
-            io(x.base, 1, false);
-            FlashManifest m;
-            std::memcpy(&m, host_, sizeof m);
-            if (m.differs(x.manifest)) { ++stale; continue; }
-            x.used_ms = index_.now_ms();
+        std::string dropped;
+        uint64_t bytes = 0;
+        for (auto& x : found_.entries) {
+            const char* why = nullptr;
+            std::string err;
+            try { why = flash_entry_check(x, compat_, index_.blocks(), layout_, read, batch_, threads); }
+            catch (const std::exception& e) { err = e.what(); why = err.c_str(); }
+            if (why) { dropped += (dropped.empty() ? "" : ", ") + std::to_string(x.generation) + " (" + why + ")"; continue; }
+            bytes += x.blocks * slot_;
             kept.push_back(std::move(x));
         }
-        try { index_.adopt(img.next, img.clock, std::move(kept)); }
-        catch (const std::exception& e) { return std::string(e.what()) + ", starting empty"; }
-        return std::to_string(index_.size()) + " entries kept" + (stale ? ", " + std::to_string(stale) + " stale dropped" : "");
+        const size_t n = found_.entries.size();
+        found_.entries = std::move(kept);
+        char b[160];
+        snprintf(b, sizeof b, "%zu of %zu entries verified (%.2f GiB) in %.2f s", found_.entries.size(), n, bytes / 1073741824.0,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        checked_ = b + (dropped.empty() ? std::string() : "; dropped " + dropped);
     }
 public:
     // the last capture or restore: blocks, bytes and milliseconds (the log lines)
@@ -262,10 +276,33 @@ public:
         fck::ck(cudaHostAlloc(reinterpret_cast<void**>(&host_), slot_ * batch_, cudaHostAllocMapped), "alloc");
         fck::ck(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_dev_), host_, 0), "alloc");
         tk(g6kv_tier_register(t_, host_, slot_ * batch_), "register");
-        if (files_.on()) loaded = load();
+        layout_.slot = slot_; layout_.state_bytes = v_.state_bytes();
+        for (const auto& b : v_.bindings) layout_.parts.push_back({size_t(b.mla_page16) * 16, b.idx ? size_t(b.idx_page16) * 16 : 0});
+        if (files_.on()) {
+            uint64_t stale = 0;
+            if (const char* why = files_.load(compat_, index_.blocks(), found_, stale)) loaded = std::string(why) + ", starting empty";
+            else {
+                loaded = std::to_string(found_.entries.size()) + " entries to verify" +
+                    (stale ? ", " + std::to_string(stale) + " without their token file dropped" : "");
+                verify_ = std::thread([this] { verify(); });
+            }
+        }
     }
-    std::string loaded;   // persist=on: what the boot took back from the index file (the boot log)
+    std::string loaded;   // persist=on: what the boot found in the index file (the boot log)
+    // persist=on: waits for the verification and publishes the entries that passed; what it did, for the boot log.
+    // Call before anything reads the index (the bootstrap's agreement, the serve): until then it is empty.
+    std::string settle() {
+        if (!verify_.joinable()) return loaded;
+        verify_.join();
+        for (auto& x : found_.entries) x.used_ms = index_.now_ms();
+        try { index_.adopt(found_.next, found_.clock, std::move(found_.entries)); }
+        catch (const std::exception& e) { checked_ += std::string("; ") + e.what() + ", starting empty"; }
+        found_ = FlashIndexImage{};
+        save();   // the index on disk loses what failed
+        return checked_;
+    }
     ~FlashCheckpoints() {
+        if (verify_.joinable()) verify_.join();
         if (t_) g6kv_tier_free(t_);
         cudaFree(d_bind_); cudaFree(d_off_); cudaFree(d_sum_); cudaFree(d_list_); cudaFreeHost(host_);
     }
@@ -275,7 +312,7 @@ public:
     FlashIndex& index() { return index_; }
     uint64_t blocks() const { return index_.blocks(); }
     size_t slot_bytes() const { return slot_; }
-    uint64_t entry_blocks(uint32_t position) const { return 1 + (position + 63) / 64 + state_blocks_; }
+    uint64_t entry_blocks(uint32_t position) const { return layout_.entry_blocks(position); }
     std::string describe() const { char b[256]; g6kv_tier_describe(t_, b, sizeof b); return b; }
     // a group lease (its segments move between the clusters on its node)
     bool group() const { return g6kv_store_seg_blocks(t_) != 0; }

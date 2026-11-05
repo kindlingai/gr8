@@ -1,7 +1,7 @@
 // persist=on for Flash checkpoints (s2/flash_ckpt_index.h, s2/flash_checkpoint.h): the index bytes and files round
-// trip; a cut, a flipped byte, another compat or store size, two entries of one generation start empty; FlashIndex::adopt
-// keeps base order and the LRU order and refuses what does not fit; an entry a capture's reserve dropped does not come
-// back after a crash. `bench`: the cost of one capture's save at 64 entries of 262,145 tokens.
+// trip; a cut, a flipped byte, another compat or store size, two entries of one generation start empty;
+// flash_entry_check refuses stored bytes that are not the entry's; FlashIndex::adopt keeps base order and the LRU order
+// and refuses what does not fit; an entry a capture's reserve dropped does not come back after a crash. `bench`: the cost of one capture's save at 64 entries of 262,145 tokens.
 // Build: g++ -std=c++17 -O2 -I engine/runtime engine/runtime/s2/tests/flash_ckpt_index_test.cpp -o /tmp/flash_ckpt_index_test
 #include "s2/flash_ckpt_index.h"
 #include <chrono>
@@ -212,6 +212,124 @@ static void crash_after_reserve(const std::string& dir) {
     CHECK(capture(back, 640, 3) == b + 1);
 }
 
+// A store of blocks in memory, written as FlashCheckpoints::capture writes (flash_checkpoint.cuh): the manifest last,
+// page i of every binding (latent rows, then indexer rows) in block base + 1 + i, then the KDA state stream. The
+// manifest sums are computed as the device computes them, each cache's pages end to end, not from the blocks.
+struct FakeStore {
+    FlashLayout L;
+    std::vector<std::vector<uint8_t>> b;
+    FakeStore(uint64_t n) {
+        L.slot = 4096; L.parts = {{1024, 512}, {2048, 0}}; L.state_bytes = 3 * 4096 + 1000;
+        b.assign(n, std::vector<uint8_t>(L.slot, 0xEE));
+    }
+    FlashRead read() {
+        return [this](uint64_t first, int n, uint8_t* dst) {
+            for (int i = 0; i < n; ++i) {
+                if (first + i >= b.size()) throw std::runtime_error("read past the store");
+                std::memcpy(dst + size_t(i) * L.slot, b[first + i].data(), L.slot);
+            }
+        };
+    }
+    // capture at `position` from caches filled from `seed`; manifest: false = crash before it is written
+    FlashEntry write(FlashIndex& ix, uint32_t position, int seed, bool manifest = true, std::vector<uint64_t>* gone = nullptr) {
+        const uint64_t np = (position + 63) / 64;
+        FlashEntry x;
+        x.blocks = L.entry_blocks(position);
+        if (!ix.reserve(x.blocks, x.base, gone)) throw std::runtime_error("no room");
+        x.generation = ix.next_generation(); x.position = position;
+        for (uint32_t i = 0; i <= position; ++i) x.tokens.push_back(int(i * 3 + seed));
+        x.manifest = flash_manifest(x.generation, COMPAT, position, x.tokens, x.ns, np, L.page_bytes(), L.state_bytes);
+        uint64_t rng = 0x9E3779B97F4A7C15ull * uint64_t(seed + 1);
+        auto fill = [&](size_t bytes) { std::vector<uint64_t> v(bytes / 8); for (auto& w : v) { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; w = rng; } return v; };
+        uint64_t first = 0, page_sum = 0;
+        for (size_t k = 0; k < L.parts.size(); ++k) {
+            for (int c = 0; c < 2; ++c) {
+                const size_t bytes = c ? L.parts[k].second : L.parts[k].first;
+                if (!bytes) continue;
+                const auto cache = fill(bytes * np);             // the device cache: pages [0, np) end to end
+                page_sum += ckpt_sum_host(cache.data(), bytes * np, first);
+                first += np * bytes / 8;
+                size_t off = c ? L.parts[k].first : 0;
+                for (size_t j = 0; j < k; ++j) off += L.parts[j].first + L.parts[j].second;
+                for (uint64_t i = 0; i < np; ++i)
+                    std::memcpy(b[x.base + 1 + i].data() + off, reinterpret_cast<const uint8_t*>(cache.data()) + i * bytes, bytes);
+            }
+        }
+        const auto state = fill(L.state_bytes);
+        x.manifest.page_sum = page_sum;
+        x.manifest.state_sum = ckpt_sum_host(state.data(), L.state_bytes);
+        for (uint64_t j = 0; j < L.state_blocks(); ++j) {
+            auto& blk = b[x.base + 1 + np + j];
+            std::fill(blk.begin(), blk.end(), 0);
+            std::memcpy(blk.data(), reinterpret_cast<const uint8_t*>(state.data()) + j * L.slot, std::min<size_t>(L.slot, L.state_bytes - j * L.slot));
+        }
+        x.manifest.seal();
+        if (manifest) {
+            std::fill(b[x.base].begin(), b[x.base].end(), 0);
+            std::memcpy(b[x.base].data(), &x.manifest, sizeof x.manifest);
+            ix.add(x);
+        }
+        return x;
+    }
+};
+static std::string check(const FlashEntry& x, FakeStore& st, int threads = 4) {
+    const char* why = flash_entry_check(x, COMPAT, st.b.size(), st.L, st.read(), 3, threads);
+    return why ? why : "ok";
+}
+
+static void entry_checks() {
+    FakeStore st(200);
+    FlashIndex ix(200);
+    const FlashEntry a = st.write(ix, 640, 1), c = st.write(ix, 64, 2);
+    CHECK(check(a, st) == "ok" && check(c, st) == "ok" && check(a, st, 1) == "ok");
+    CHECK(flash_entry_check(a, COMPAT + 1, st.b.size(), st.L, st.read()) != nullptr);
+    { FlashEntry y = a; y.tokens[5] ^= 1; CHECK(check(y, st) == "other tokens"); }
+    { FlashEntry y = a; y.blocks += 1; CHECK(check(y, st) == "other sizes"); }
+    { FlashEntry y = a; y.manifest.self_sum ^= 1; CHECK(check(y, st) == "manifest checksum"); }
+    { FlashEntry y = a; y.terminal = true; CHECK(check(y, st) == "a terminal entry"); }
+    { FlashEntry y = a; y.base = 195; CHECK(check(y, st) == "past the store"); }
+    // a byte of a page, of the KDA state, or of the manifest block changed on disk
+    auto flipped = [&](uint64_t block, size_t at) {
+        st.b[block][at] ^= 0x40; const std::string r = check(a, st); st.b[block][at] ^= 0x40; return r;
+    };
+    CHECK(flipped(a.base + 1, 0) == "page checksum");
+    CHECK(flipped(a.base + 1 + 9, 1024 + 511) == "page checksum");      // the last page's indexer rows
+    CHECK(flipped(a.base + 1 + 3, 1536 + 2047) == "page checksum");     // the second binding
+    CHECK(flipped(a.base + 1 + 10, 7) == "KDA state checksum");
+    CHECK(flipped(a.base + 1 + 10 + 3, 999) == "KDA state checksum");   // the last state block's last byte
+    CHECK(flipped(a.base + 1 + 2, 4000) == "ok");                       // a page block's padding is not summed
+    CHECK(flipped(a.base, 8) != "ok");
+    // two pages swapped: the sum numbers every word by its place
+    std::swap(st.b[a.base + 1], st.b[a.base + 2]);
+    CHECK(check(a, st) == "page checksum");
+    std::swap(st.b[a.base + 1], st.b[a.base + 2]);
+    // a read error reaches the caller (FlashCheckpoints::verify drops the entry with it)
+    bool threw = false;
+    const FlashRead bad = [](uint64_t, int, uint8_t*) { throw std::runtime_error("read"); };
+    try { flash_entry_check(a, COMPAT, st.b.size(), st.L, bad); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+}
+
+// The crash case again, with an index that still names the dropped entry (as the first version wrote it, before a
+// capture saved after reserve): the new entry starts at the dropped one's base and crashes before its manifest, so the
+// old manifest is still in place, but the pages under it are not its own and the page checksum drops it.
+static void crash_with_stale_index(const std::string& dir) {
+    FakeStore st(2 * FakeStore(0).L.entry_blocks(640));
+    FlashIndex ix(st.b.size());
+    const FlashEntry a = st.write(ix, 640, 1), b = st.write(ix, 640, 2);
+    FlashIndexFiles f(dir + "/flash-ckpt.index");
+    f.save(COMPAT, ix);   // names a and b
+    ix.touch(b.generation);
+    std::vector<uint64_t> gone;
+    const FlashEntry c = st.write(ix, 640, 3, false, &gone);   // drops a, writes over it, no manifest yet: the crash
+    CHECK(gone.size() == 1 && gone[0] == a.generation && c.base == a.base);
+    FlashIndexImage img;
+    uint64_t stale = 0;
+    FlashIndexFiles g(dir + "/flash-ckpt.index");
+    CHECK(!g.load(COMPAT, ix.blocks(), img, stale) && img.entries.size() == 2);
+    for (const auto& x : img.entries) CHECK(check(x, st) == (x.generation == a.generation ? "page checksum" : "ok"));
+}
+
 // one capture's save at 64 entries of 262,145 tokens: the new entry's token file and the index, against the whole
 // index with every entry's tokens inline (the first format)
 static void bench(const std::string& dir) {
@@ -249,6 +367,8 @@ int main(int argc, char** argv) {
     files_round_trip(sub("files"));
     adopt_rules();
     crash_after_reserve(sub("crash"));
+    entry_checks();
+    crash_with_stale_index(sub("crash2"));
     std::filesystem::remove_all(dir);
     if (!fails) std::printf("flash_ckpt_index_test: PASS\n");
     return fails ? 1 : 0;

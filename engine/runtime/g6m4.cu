@@ -1976,7 +1976,12 @@ int main(int argc, char** argv)
                 std::to_string(g6s2::FlashManifest::FORMAT) + " engine " + exe;
             try { ckpt.reset(new g6s2::FlashCheckpoints(v, spec, name, bytes, compat, group ? &*group : nullptr, index_path)); }
             catch (const std::exception& e) { die(std::string("GR8_GLM53F_CACHE: ") + e.what()); }
-            if (!index_path.empty()) fprintf(stderr, "# rank %d: flash ckpt persist: %s: %s\n", R, index_path.c_str(), ckpt->loaded.c_str());
+            if (!index_path.empty())
+            {
+                fprintf(stderr, "# rank %d: flash ckpt persist: %s: %s\n", R, index_path.c_str(), ckpt->loaded.c_str());
+                const std::string checked = ckpt->settle();
+                fprintf(stderr, "# rank %d: flash ckpt persist: %s\n", R, checked.c_str());
+            }
             fprintf(stderr, "# rank %d: flash ckpt %s: %s, %llu blocks of %zu B (%zu bindings, KDA state %.1f MB = %llu blocks), grid %d rows%s\n",
                     R, g6s2::flash_cache_name(flash_cache), ckpt->describe().c_str(), (unsigned long long)ckpt->blocks(), ckpt->slot_bytes(),
                     v.bindings.size(), v.state_bytes() / 1e6, (unsigned long long)(ckpt->entry_blocks(0) - 1), MP * (two ? 2 : 1),

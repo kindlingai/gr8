@@ -12,7 +12,10 @@
 #include <cerrno>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <iterator>
+#include <thread>
 #include <set>
 #include <string>
 #include <system_error>
@@ -69,6 +72,92 @@ inline void write_durable(const std::string& path, const void* bytes, size_t n, 
     if (sync_dir) fsync_path(parent(path), true);
 }
 } // namespace fidx
+
+// What an entry's blocks hold (flash_checkpoint.cuh): block base the manifest, base + 1 + i logical page i of every
+// binding (its latent rows, then its indexer rows), then the KDA state stream cut into blocks.
+struct FlashLayout {
+    size_t slot = 0;                                // bytes a block, a multiple of 4 KiB
+    std::vector<std::pair<size_t, size_t>> parts;   // per binding, main then draft: latent and indexer bytes of one page
+    size_t state_bytes = 0;
+    size_t page_bytes() const { size_t n = 0; for (const auto& p : parts) n += p.first + p.second; return n; }
+    uint64_t state_blocks() const { return (state_bytes + slot - 1) / slot; }
+    uint64_t entry_blocks(uint32_t position) const { return 1 + (position + 63) / 64 + state_blocks(); }
+};
+// n blocks from `first` into dst (n * slot bytes); throws on a read error
+using FlashRead = std::function<void(uint64_t first, int n, uint8_t* dst)>;
+
+// The wrapping sum of hash(i, block) over blocks [first, first + n) of the store: `batch` blocks a read, the next batch
+// read while the last one is hashed on `threads` threads. The sum does not depend on the order (ckpt_sum_host).
+inline uint64_t flash_sum_blocks(uint64_t first, uint64_t n, size_t slot, const FlashRead& read, int batch, int threads,
+                                 const std::function<uint64_t(uint64_t, const uint8_t*)>& hash) {
+    batch = std::max(1, batch); threads = std::max(1, threads);
+    std::vector<uint8_t> buf[2];
+    buf[0].resize(size_t(std::min<uint64_t>(batch, n)) * slot); buf[1].resize(buf[0].size());
+    auto start = [&](uint64_t at, int k) {
+        return std::async(std::launch::async, [&, at, k] { read(first + at, int(std::min<uint64_t>(batch, n - at)), buf[k].data()); });
+    };
+    std::future<void> next;
+    if (n) next = start(0, 0);
+    uint64_t total = 0;
+    for (uint64_t at = 0; at < n; at += batch) {
+        const int k = int(at / batch % 2), m = int(std::min<uint64_t>(batch, n - at));
+        next.get();
+        if (at + batch < n) next = start(at + batch, k ^ 1);
+        std::vector<uint64_t> part(size_t(threads), 0);
+        std::vector<std::thread> pool;
+        for (int t = 0; t < std::min(threads, m); ++t)
+            pool.emplace_back([&, t] { for (int j = t; j < m; j += threads) part[size_t(t)] += hash(at + j, buf[k].data() + size_t(j) * slot); });
+        for (auto& t : pool) t.join();
+        for (uint64_t x : part) total += x;
+    }
+    return total;
+}
+// Why entry x's blocks are not its own (nullptr: they are): its manifest or sizes do not fit this store, its manifest
+// block holds another manifest, or the page or KDA state checksum of what is stored differs from the manifest's. The
+// sums are the ones capture computed on the device (flash_checkpoint.cuh page_sum, sum), in the same word numbering.
+inline const char* flash_entry_check(const FlashEntry& x, uint64_t compat, uint64_t store_blocks, const FlashLayout& L,
+                                     const FlashRead& read, int batch = 32, int threads = 8) {
+    const FlashManifest& m = x.manifest;
+    const uint64_t np = (x.position + 63) / 64;
+    if (const char* why = m.unsealed()) return why;
+    if (m.generation != x.generation || m.compat != compat) return "another entry";
+    if (m.position != x.position || m.tokens != x.tokens.size() || m.token_hash != fnv64(x.tokens.data(), x.tokens.size() * sizeof(int)) ||
+        m.ns_hash != fnv64(x.ns.data(), x.ns.size()))
+        return "other tokens";
+    if (x.terminal) return "a terminal entry";   // persist=on keeps aligned entries only
+    if (x.blocks != L.entry_blocks(x.position) || m.pages != np || m.page_bytes != L.page_bytes() || m.state_bytes != L.state_bytes)
+        return "other sizes";
+    if (x.base >= store_blocks || x.blocks > store_blocks - x.base) return "past the store";
+    std::vector<uint8_t> one(L.slot);
+    read(x.base, 1, one.data());
+    FlashManifest got;
+    std::memcpy(&got, one.data(), sizeof got);
+    if (const char* why = got.differs(m)) return why;
+    if (std::memcmp(&got, &m, sizeof got)) return "another manifest";
+    // page i of binding b's latent cache starts at word first_b + i * w (the device sums each cache's pages end to end)
+    std::vector<uint64_t> lat_first, idx_first;
+    uint64_t first = 0;
+    for (const auto& p : L.parts) {
+        lat_first.push_back(first); first += np * (p.first / 8);
+        idx_first.push_back(first); first += np * (p.second / 8);
+    }
+    const uint64_t pages = flash_sum_blocks(x.base + 1, np, L.slot, read, batch, threads, [&](uint64_t i, const uint8_t* b) {
+        uint64_t s = 0;
+        for (size_t k = 0; k < L.parts.size(); ++k) {
+            const auto& p = L.parts[k];
+            s += ckpt_sum_host(b, p.first, lat_first[k] + i * (p.first / 8)); b += p.first;
+            if (p.second) { s += ckpt_sum_host(b, p.second, idx_first[k] + i * (p.second / 8)); b += p.second; }
+        }
+        return s;
+    });
+    if (pages != m.page_sum) return "page checksum";
+    const uint64_t state = flash_sum_blocks(x.base + 1 + np, L.state_blocks(), L.slot, read, batch, threads, [&](uint64_t j, const uint8_t* b) {
+        const size_t at = size_t(j) * L.slot;
+        return ckpt_sum_host(b, std::min(L.slot, L.state_bytes - at), at / 8);
+    });
+    if (state != m.state_sum) return "KDA state checksum";
+    return nullptr;
+}
 
 // the index bytes of `ix` for the store `compat` (tokens not included)
 inline std::string flash_index_encode(uint64_t compat, const FlashIndex& ix) {
