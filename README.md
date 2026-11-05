@@ -90,6 +90,23 @@ An agent that starts gr8 for someone asks them the questions in [docs/FIRST-BOOT
 each way to run it, each ending with a passing `smoke`: [bare metal](docs/DEPLOY.md#bare-metal),
 [Docker Compose](docs/DEPLOY.md#docker-compose) and [Kubernetes](docs/DEPLOY.md#kubernetes).
 
+### DeepSeek-V4.1-Flash
+
+gr8 also serves [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) as `ds41`, on
+four GB10 boxes (TP=4), from the [exlr8 native release](https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native):
+the official weights, byte for byte, in the exlr8 file layout. It drafts with the checkpoint's own MTP layers instead
+of DFlash2, and its front end speaks the DeepSeek dialect (DSML tool calls, numeric reasoning effort). This build
+serves text and refuses image content.
+
+Its boot takes two steps GLM's does not: the release is read in place, and Engram — part of the model, not an option —
+needs a token map you write once. It also wants far more disk than GLM: the release is 510.6 GB, fetched whole to
+every box. [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is that boot in order, from the four boxes to a passing
+`smoke`:
+
+    ./gr8 ds41 check
+    ./gr8 ds41 up
+    ./gr8 ds41 smoke
+
 ### With model-loader
 
 [model-loader](https://github.com/kindlingai/model-loader) can fetch the weights instead of gr8: the boxes copy the
@@ -309,6 +326,10 @@ KindlingAI is:
   - Earlier engine, TP=3 conversion and gate foundations preserved in the Git history
     ([range fetching and manifests](https://github.com/kindlingai/gr8/commit/2d88926cb08bec602ba6382ccf10d90e1a735841),
     [gate harness](https://github.com/kindlingai/gr8/commit/3d6116f084b86aa96d4be47b253e223ef7a5dcea)).
+  - DeepSeek-V4.1-Flash on four boxes: the `ds41` tuning knobs and served defaults
+    ([#327](https://github.com/kindlingai/gr8/pull/327)-[#333](https://github.com/kindlingai/gr8/pull/333),
+    [#335](https://github.com/kindlingai/gr8/pull/335)-[#338](https://github.com/kindlingai/gr8/pull/338)),
+    and this boot guide.
 - [@coffee-the-dev](https://github.com/coffee-the-dev)
 - [@mmastrac](https://github.com/mmastrac)
 

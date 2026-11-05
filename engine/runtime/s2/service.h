@@ -216,7 +216,7 @@ class Service {
         o << "{\"epoch\":" << c_.scheduler.epoch << ",\"resident\":" << progress_.resident.load()
           << ",\"queued\":" << queue_.size() << ",\"retiring\":" << progress_.retiring.load()
           << ",\"reserved_pages\":" << c_.scheduler.pool_rows / PAGE - free << ",\"free_pages\":" << free
-          << ",\"largest_free_run\":" << room << ",\"admission_stalls\":" << queue_.stalls;
+          << ",\"largest_free_run\":" << room << ",\"admission_stalls\":" << queue_.stalls();
         // growth on demand: pages the live runs hold and could grow to, each run's pair, and rounds a session sat out
         if (native_.pool.stats) {
             const auto st = native_.pool.stats();

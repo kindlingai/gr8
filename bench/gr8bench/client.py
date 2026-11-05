@@ -3,6 +3,8 @@ import json
 import time
 import urllib.request
 
+from . import record
+
 class Client:
     def __init__(self, url, model=None, timeout=3600):
         """model None: the first model /v1/models lists."""
@@ -50,17 +52,18 @@ class Client:
         m = self.metrics()
         return msum(m, 'vllm:num_requests_running') if any(k.startswith('vllm:num_requests_running') for k in m) else None
 
-    def chat(self, messages, max_tokens, temperature=0.0, effort='low', min_p=0.0, extra=None):
+    def chat(self, messages, max_tokens, temperature=0.0, effort='low', min_p=0.0, extra=None, events=None):
         """Streamed /v1/chat/completions. Times the first generated token (reasoning or content).
         -> dict: ttft, decode_s, tokens (completion_tokens from usage), prompt_tokens, cached_tokens, content,
         reasoning, finish_reason.
         effort 'nothink' sends no thinking controls: GLM 5.3 cannot turn thinking off (the front end refuses
-        enable_thinking false), so it renders the template's default effort, Max."""
+        enable_thinking false), so it renders the template's default effort, Max.
+        events: a list that gets every delta with its arrival time (record.add), or None."""
         kwargs = {} if effort == 'nothink' else {'reasoning_effort': effort}
         body = {'model': self.model, 'messages': messages, 'max_tokens': max_tokens, 'stream': True,
                 'temperature': temperature, 'min_p': min_p, 'stream_options': {'include_usage': True},
                 'chat_template_kwargs': kwargs, **(extra or {})}
-        return self._stream('/v1/chat/completions', body)
+        return self._stream('/v1/chat/completions', body, events)
 
     def complete_stream(self, prompt_ids, max_tokens, temperature=0.0):
         """Streamed /v1/completions on exact prompt token ids (no chat template). Same fields as chat()."""
@@ -68,7 +71,7 @@ class Client:
                 'temperature': temperature, 'stream_options': {'include_usage': True}}
         return self._stream('/v1/completions', body)
 
-    def _stream(self, path, body):
+    def _stream(self, path, body, events=None):
         t0 = time.time()
         tfirst = None
         usage = None
@@ -80,6 +83,8 @@ class Client:
                 if not line.startswith(b'data: ') or line == b'data: [DONE]':
                     continue
                 d = json.loads(line[6:])
+                if events is not None:
+                    record.add(events, time.time() - t0, d)
                 if d.get('usage'):
                     usage = d['usage']
                 ch = d.get('choices') or []

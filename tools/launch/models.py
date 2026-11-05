@@ -36,6 +36,7 @@ class Model:
     defaults: tuple = ()        # (KEY, value) option defaults for this model, over the table's: origin '<name> default'
     vocab: int = 0              # the shim's --vocab-size: the ids the engine's embedding table takes (0: the shim's own, GLM-5.3's)
     eos_ids: tuple = ()         # the shim's --eos-ids (empty: the shim's own, GLM-5.3's)
+    max_positions: int = 1048576   # config.json max_position_embeddings: the longest request MAX_MODEL_LEN allows
 
     @property
     def tp_sizes(self):
