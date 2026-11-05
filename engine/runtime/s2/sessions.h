@@ -34,6 +34,9 @@ inline const char* resolve(void* ctx, bool has_profile, const uint8_t* profile, 
     } catch (const std::exception& e) {
         r.error = e.what();
         return r.error.c_str();
+    } catch (...) {   // nothing may unwind into the Rust caller
+        r.error = "steering resolve failed";
+        return r.error.c_str();
     }
 }
 } // namespace parse
@@ -50,6 +53,8 @@ inline g6rt::GrammarSpec parse_grammar(const std::string& s) {
 }
 inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steering::BootConfig& steering = {}) {
     static_assert(sizeof(g6rt::steering::Identity) == sizeof(g6sch_identity), "scheduler-rs Identity layout");
+    static const bool abi = g6sch_abi(G6SCH_ABI_PARSED_REQ) == sizeof(g6sch_parsed_req);
+    require(abi, "scheduler-rs: the parsed request differs from g6sched.h");
     parse::Resolve ctx{&steering, {}};
     g6sch_parsed_req p{};
     g6sch_parsed* h = nullptr;

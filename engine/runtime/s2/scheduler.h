@@ -451,6 +451,7 @@ class AdmissionQueue {
 public:
     explicit AdmissionQueue(Config c) : q_(nullptr, g6sch_queue_free) {
         sch::check_abi();
+        require(g6sch_abi(G6SCH_ABI_STATUS) == sizeof(g6sch_status), "scheduler-rs: the admission status differs from g6sched.h");
         c.validate();
         const g6sch_config x = c.scalars();
         q_.reset(g6sch_queue_new(&x));

@@ -499,6 +499,8 @@ pub extern "C" fn g6sch_abi(what: u32) -> u64 {
         sch::QMAX,
         size_of::<crate::kv_share::Totals>(),
         size_of::<crate::kv_share::Resize>(),
+        size_of::<ParsedReq>(),
+        size_of::<crate::admission::Status>(),
     ];
     v.get(what as usize).map_or(0, |&x| x as u64)
 }

@@ -199,8 +199,7 @@ impl<'a> Stream<'a> {
             }
             self.at += 1;
         }
-        let v = std::str::from_utf8(&self.s[a..self.at]).ok().and_then(|t| t.parse::<f32>().ok());
-        match v {
+        match strtof_all(&self.s[a..self.at]) {
             Some(v) if v.is_finite() => Some(v),
             _ => {
                 self.failed = true;
@@ -240,6 +239,22 @@ impl<'a> Stream<'a> {
     }
 }
 
+extern "C" {
+    fn strtof(s: *const std::ffi::c_char, end: *mut *mut std::ffi::c_char) -> f32;
+}
+
+/// C strtof over all of `t`, as libstdc++ converts what num_get took (the engine stays in the C locale): None when it
+/// converts nothing or leaves text over. Rust's own float parser rounds differently on very long exponents.
+fn strtof_all(t: &[u8]) -> Option<f32> {
+    let mut z = Vec::with_capacity(t.len() + 1);
+    z.extend_from_slice(t);
+    z.push(0);
+    let mut end: *mut std::ffi::c_char = std::ptr::null_mut();
+    // SAFETY: z is NUL-terminated and outlives the call
+    let v = unsafe { strtof(z.as_ptr().cast(), &mut end) };
+    let used = end as usize - z.as_ptr() as usize;
+    (used != 0 && used == t.len()).then_some(v)
+}
 /// The parsed request (serve.h ServeReq, but steering already resolved by the caller's callback).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Request {

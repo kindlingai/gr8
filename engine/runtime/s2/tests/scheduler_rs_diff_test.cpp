@@ -396,12 +396,17 @@ static void request_diff(std::mt19937_64& rng)
     const std::vector<std::string> floats = {"0", "0.5", "1", "1.0", "0.25", "2", "1e-3", "0.9999999", "1.00000001"
 #ifdef __GLIBCXX__
                                              , "-0", ".5", "5.", "+0.5", "1e", "1e+", "1e40", "1e-50", "-1", "nan", "inf", "0x1p3",
-                                             "0.5seed", ".", "-", "1.2.3", "1e5e5", "00000.5", "3E2", "1,5"
+                                             "0.5seed", ".", "-", "1.2.3", "1e5e5", "00000.5", "3E2", "1,5", "1e+5", "1e-5",
+                                             "1.e5", "0e5", "00e5", ".e5", "+-5", "1e-", "-.5", "+.", "0.30000000000000000000000001",
+                                             "1e-40", "9e-46", "3.40282356e38", "3.4028236e38", "0." + std::string(70000, '0') + "1e70001",
+                                             "1" + std::string(70000, '0') + "e-70001"
 #endif
     };
     const std::vector<std::string> ints = {"0", "1", "5", "20", "21", "-1", "2147483647", "2147483648"
 #ifdef __GLIBCXX__
-                                           , "+4", "-0", "0x5", "5x", "", "99999999999999999999", "-9223372036854775809", "1.5"
+                                           , "+4", "-0", "0x5", "5x", "", "99999999999999999999", "-9223372036854775809", "1.5",
+                                           "-2147483648", "-2147483649", "9223372036854775807", "-9223372036854775808", "0x", "00",
+                                           "+0", "1e5"
 #endif
     };
     const std::vector<std::string> idlists = {"1", "1,2,3", "0,2147483647", "2147483648", "1,,2", ",1", "1,", "", "x", "5,6,7,8"};
@@ -420,7 +425,7 @@ static void request_diff(std::mt19937_64& rng)
         if (!U(0, 3))
         {
             w.push_back("steer");
-            w.push_back(pick({"calm", "other", "-bad", "a.b_c-d", ""}));
+            w.push_back(pick({"calm", "other", "-bad", "a.b_c-d", "", std::string(128, 'a'), std::string(129, 'a'), "caf\xc3\xa9"}));
             w.push_back(pick({"3f800000", "00000000", "80000000", "40800000", "40800001", "7f800000", "3F800000", "3f8000", "bf800000"}));
         }
         // mutations: a dropped, swapped, doubled or glued word, odd whitespace, a stray word at the end
@@ -440,11 +445,12 @@ static void request_diff(std::mt19937_64& rng)
             }
         }
         std::string head;
-        for (const auto& x : w) head += (head.empty() ? "" : pick({" ", " ", " ", "  ", "\t", "\r", "\v"})) + x;
+        for (const auto& x : w) head += (head.empty() ? "" : pick({" ", " ", " ", "  ", "\t", "\r", "\v", "\f"})) + x;
         if (!U(0, 20)) head = pick({" ", "\t"}) + head;
         std::string bytes = head;
         if (U(0, 30)) bytes += "\n" + pick({"1,2,3", "1", "", "1 2", "1,2\n", " 7 ", "2147483648", "1,,2", "1\n\n"});
         if (!U(0, 4)) bytes += "\n";
+        if (!U(0, 40)) bytes.insert(size_t(U(0, int(bytes.size()))), 1, pick({std::string(1, '\0'), "\xff", "\xa0", "\x85"})[0]);
         const st::BootConfig& b = *boots[U(0, 2)];
         const std::string a = outcome([&] { return str(g6s2::parse_request(bytes, b)); });
         const std::string r = outcome([&] { return str(g6s2ref::parse_request(bytes, b)); });
