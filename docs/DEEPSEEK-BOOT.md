@@ -1,4 +1,4 @@
-# Booting DeepSeek-V4.1-Flash: the whole process
+# Booting DeepSeek-V4.1-Flash
 
 `ds41` serves [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) on four GB10
 boxes. It takes the same two settings as every other model ([DEPLOY.md](DEPLOY.md)), and it needs two things GLM does
@@ -8,6 +8,12 @@ not: the release is read in place, and Engram needs a token map you write once. 
 [FIRST-BOOT.md](FIRST-BOOT.md) is the companion: it asks what you will run on the model and gives the measured numbers
 for each answer (how many chats, how long a context, speed against exactness). Read this page to get it serving, that
 one to choose its settings.
+
+> **What this page is, and is not.** Every step and every number below was read out of this tree or measured on a
+> four-box set. The `./gr8 ds41` route itself has been checked against the launcher source, not yet run end to end on
+> four boxes from a clean machine — our own boots go through a separate test harness. So treat a surprise here as a
+> gap in this page and say so, rather than assuming you did it wrong. The settings numbers in
+> [FIRST-BOOT.md](FIRST-BOOT.md) come from that harness, not from this route.
 
 ## 1. What you need
 
@@ -42,6 +48,15 @@ one to choose its settings.
   143 GB.
 - **No drafter.** `ds41` drafts with the checkpoint's own MTP layers (DSpark), so leave `DRAFTER` out of the config.
   The check refuses a boot that names one.
+- **The DeepSeek binary, built on every box.** `up` does not build it for you:
+
+      ./gr8 ds41 build        # this box's engine (bin/g6m4_ds41) and the front end (bin/g6front)
+      python3 -m venv venv && venv/bin/pip install -r frontend/requirements.txt   # the shim, rank 0 only
+
+  `ds41` has its own engine binary, so a box built only for `glm53` is not ready for it — build `ds41` on all four.
+  That one command also builds the front end, which only rank 0 runs. The shim venv is rank 0's too, and
+  `frontend/requirements.txt` is empty by design: the venv itself is what the shim needs. `./gr8 ds41 check` names
+  whichever piece is missing, and says which command would make it.
 
 ## 2. Engram: the token map you write once
 
@@ -69,19 +84,25 @@ boot — on a good copy:
     $ sha256sum /opt/gr8/engram/ds41.engram.cmap
     46ed86d2ee83d4b764e4390d38393a373886efdf2baeaa71a5370090d85b76de  …
 
-which is the value in `engine/engram/hash_consts.h` and the same file on every rank. Write it with the generator, from the release's tokenizer and the official
-reference:
+which is the value in `engine/engram/hash_consts.h` and the same file on every rank.
+
+Write it with the generator. It reads two files out of the official DeepSeek repo and the tokenizer out of the
+release — not the original multi-hundred-GB checkpoint, so fetch just those two:
+
+    pip install torch tokenizers numpy          # numpy is imported directly by the generator
+    mkdir -p /opt/gr8/engram                    # nothing below creates this directory for you
 
     python3 engine/engram/gen_engram.py \
-      --ref <official DeepSeek-V4.1-Flash-1017 reference checkout> \
+      --ref <reference dir holding inference/config.json and inference/engram.py> \
       --tok <release>/tokenizer.json \
       --out-h /tmp/hash_consts.h \
       --out-cmap /opt/gr8/engram/ds41.engram.cmap
 
-It needs `torch` and `tokenizers`, and the reference's `inference/config.json` and `inference/engram.py`. Send
-`--out-h` to a scratch path: `engine/engram/hash_consts.h` is checked in and the constants are never recomputed at run
-time. If your scratch copy differs from the checked-in header, your reference is not the one the engine was built
-against — stop there rather than boot.
+The reference is the official `DeepSeek-V4.1-Flash-1017` repo; the exlr8 release records the revision it was built
+from, `1bae0e1088993b9b82de08f59de5be5a34e42170`. The sha256 check below is what finally decides whether your
+reference matches this engine. Send `--out-h` to a scratch path: `engine/engram/hash_consts.h` is checked in and the
+constants are never recomputed at run time. If your scratch copy differs from the checked-in header, your reference is
+not the one the engine was built against — stop there rather than boot.
 
 Without `GR8_DS_ENGRAM_PREFIX`, `GR8_DS_ENGRAM=1` stops the boot. Engram together with `GR8_DS_MTP` additionally needs
 `GR8_DS_ENGRAM_MTP=1` ([ENV.md](ENV.md)).
@@ -102,10 +123,17 @@ and where it came from, and `./gr8 knobs` lists every option.
 
 ## 4. Boot and check
 
-    ./gr8 ds41 check        # what would stop this box's boot
-    ./gr8 ds41 up           # the same command on every box
-    ./gr8 ds41 smoke        # smoketest/ds41.sh against this head's API
+    ./gr8 ds41 check        # on every box: what would stop this box's boot
+    ./gr8 ds41 up           # on every box, the same command
+    ./gr8 ds41 smoke        # on rank 0: smoketest/ds41.sh against 127.0.0.1:8100
     ./gr8 ds41 status       # and health, logs, restart, down
+
+`smoke` with no argument asks `http://127.0.0.1:<PORT>`, so run it on rank 0 — the head is the only box serving the
+API. From any other box, give it the head: `./gr8 ds41 smoke http://<head>:8100`.
+
+`check` is preflight, not proof: it reads the config, the binaries and this box's memory, and it never reads the cmap
+or starts the engine. The cmap's sha256 is checked by the engine as Engram boots, and a cold graph capture happens
+only on a real `up`. A clean `check` means nothing known will stop the boot, not that the boot works.
 
 `smoke` asks the questions a client relies on and whose answers can be checked: the served name
 (`deepseek-v4.1-flash`), a one-prompt answer, the thinking switch, DSML tool calls and a forced `tool_choice`. A wrong
