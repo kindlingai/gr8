@@ -69,6 +69,8 @@
 #include <stdexcept>
 #include <string>
 #include "s2/ds41_sess_drafts.h"
+#include "../module_info.h"
+#include "s2_in.h"
 #include <utility>
 #include <vector>
 #include <unistd.h>
@@ -182,11 +184,8 @@ struct Hooks
 //   active(q) / finished(q) / result(q) / stats(q)
 // Acceptance and draft state stay here; the scheduler keeps generations and pages. mtp_batch below = admit(all) and
 // rounds in slot order until none is active.
-#if defined(G6_MODEL_DS41) && G6_MODEL_DS41
-constexpr int S2N_SLOTS = 32;   // g6s2::MAX_SESSIONS
-#else
-constexpr int S2N_SLOTS = 8;
-#endif
+constexpr int S2N_SLOTS = g6mod::INFO.max_sessions;   // g6s2::MAX_SESSIONS
+static_assert(S2N_SLOTS == g6rt::S2N, "the planner's slots and a step's S2In slots (s2_in.h) differ");
 // GR8_S2_ADAPT=1 (every rank, read at boot): choose each round's draft count. Off by default: on code and prose at 1-8
 // sessions it measured within 0-3% of K drafts every round (the K-th draft is still accepted ~60% of the time), and
 // its extra main-step graphs take ~1 GiB

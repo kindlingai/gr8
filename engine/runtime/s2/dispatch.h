@@ -146,9 +146,7 @@ public:
             const int first = sp.r[sp.row0[j]].pos, n = sp.rows[j];
             if (!draft) {
                 w.main_rows(first, n);
-#if G6_MODEL_DS41
-                if (sp.round < 0 || n == 1) w.draft_rows(first, n, false);   // DSpark keys come from the main step's rows
-#endif
+                if (g6mod::has(G6_CAP_DSPARK) && (sp.round < 0 || n == 1)) w.draft_rows(first, n, false);   // DSpark keys come from the main step's rows
             } else w.draft_rows(first, n, sp.kind == s2::Step::CHAIN);
         }
         return ids;

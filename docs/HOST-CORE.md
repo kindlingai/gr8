@@ -1,6 +1,6 @@
 # One host core, per-model GPU modules
 
-Status: R0 in progress. Inventory taken at 35a8f1c; reviewed against the code by a second pass.
+Status: R0 done (#343), R1 in progress. Inventory taken at 35a8f1c; reviewed against the code by a second pass.
 
 ## Why
 
@@ -41,7 +41,8 @@ The core picks a module by `--model` and the width (`--ips` count), as `widths.c
 
 ### ModuleInfo
 
-What the core needs to know about a module, filled from the module's constants:
+What the core needs to know about a module, filled from the module's constants. R1 carries the part host code branches on
+today; the rest joins as the steps that need it arrive:
 
 - model id and name, architecture, layer count, hidden size, vocabulary, top-k
 - `nr`, `mx` (rows a step), `s2n` (session slots in `S2In`), session slot limit
@@ -208,18 +209,26 @@ first request of the boot only (later requests can differ under `--spec-adaptive
 
 ### R1. ModuleInfo
 
-The module exports a `#[repr(C)] ModuleInfo` filled from its constants: model id, `nr`, `mx`, `s2n`, hidden size,
-layers, `MP`, vocabulary, top-k, KV row bytes and name, page size, drafting limits, capabilities, and the model traits
-the scheduler and sessions branch on today. It comes first so that later steps read traits from one place instead of
-growing a second mechanism. Still one build per model.
+`engine/module_info.h`: a C struct `G6ModuleInfo` filled at compile time from the build's constants (model, `nr`, `mx`,
+session slots, hidden size, layers, MTP layers, vocabulary, experts, top-k, KV row bytes and format, page) and
+capability bits for the model behaviours host code branches on (MTP 0, prefill packs, parked slots, prompts as decode
+steps, DSpark, DFlash2, the Flash cost table, KDA state, grammars). `g6mod::INFO` is a constant expression, so the
+scheduler's and planner's slot counts are array sizes taken from it. It comes first so that later steps read traits from
+one place instead of growing a second mechanism. Still one build per model.
 
-### R2. Scheduler and sessions to Rust (`engine/s2core-rs`)
+The S2 layer's model `#if`s that encode behaviour read it instead: the scheduler's rules (`Config::validate`),
+`Sessions::payload` (the prompt rule moves to `s2/prompt_rule.h`, which every build includes), and Dispatch's DSpark keys.
+The slot capacities stay compile-time (`S2N` in `s2_in.h` is shared with device code; a check ties it to `ModuleInfo`)
+until R2 makes them runtime in Rust. `g6m4` prints the description at boot. `engine/runtime/tests/module_info_test.cpp`
+checks it against the constants in each model's shape.
+
+### R2. Scheduler and sessions to Rust (`engine/scheduler-rs`)
 
 Moves `s2/scheduler.h`, `sessions.h`, `kv_plan.h`, `kv_share.h`, `cp_rows.h`, `flash_lend.h` and `flash_ring.h` (about
 1,300 lines, integer logic). The boundary is `#[repr(C)]` `Key`, `Slot`, `Run`, `Grant`, `Shrink`, `Resize`, `Quantum`,
-`Config` and `g6s2_sched_*` calls. It removes `MAX_SESSIONS` (`scheduler.h:18-21`), the DS41 rules in
-`Config::validate`, `ds41_decode_prompt` (`sessions.h:123`) and the DSpark row keys (`dispatch.h:149`) in favour of
-`ModuleInfo` traits. The pool becomes Rust to Rust, so `s2/pool.h` (218 lines of FFI) goes away. Proof: the
+`Config` and `g6s2_sched_*` calls. It turns the compile-time slot capacity (`MAX_SESSIONS`,
+`S2N_SLOTS`) into the runtime `ModuleInfo::max_sessions`; the model rules already read `ModuleInfo` since R1. It will
+also want `PACK_MAX_MEMBERS` and the drafters' block sizes in `ModuleInfo`. The pool becomes Rust to Rust, so `s2/pool.h` (218 lines of FFI) goes away. Proof: the
 scheduler, driver and pool host tests ported, and a differential run of the C++ and Rust versions on the command log
 (same `Quantum` sequence and pool digest, which ranks compare at `service.h:499`). One C call per round.
 
