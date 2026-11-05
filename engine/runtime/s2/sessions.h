@@ -53,8 +53,7 @@ inline g6rt::GrammarSpec parse_grammar(const std::string& s) {
 }
 inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steering::BootConfig& steering = {}) {
     static_assert(sizeof(g6rt::steering::Identity) == sizeof(g6sch_identity), "scheduler-rs Identity layout");
-    static const bool abi = g6sch_abi(G6SCH_ABI_PARSED_REQ) == sizeof(g6sch_parsed_req);
-    require(abi, "scheduler-rs: the parsed request differs from g6sched.h");
+    sch::check_abi();
     parse::Resolve ctx{&steering, {}};
     g6sch_parsed_req p{};
     g6sch_parsed* h = nullptr;
