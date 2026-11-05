@@ -390,6 +390,8 @@ def validate(o):
         if o.get('IPS'):
             raise OptionError('--shape ring takes no --ips/--ips2: the engine finds its devices by name (--ring-devs) '
                               'and bootstraps over the LAN')
+    if tp == '1' and (o.get('IPS') or o.get('IPS2')):
+        raise OptionError('--tp 1 takes no --ips/--ips2: one box has no fabric, and the engine bootstraps over the LAN')
     if o.get('RING_DEVS') and len(split_list(o.get('RING_DEVS'))) != 4:
         raise OptionError(f'--ring-devs {o.get("RING_DEVS")}: want four devices')
     if mode(o) == 'peers' and len(split_list(o.get('PEERS'))) != int(tp):

@@ -78,6 +78,9 @@ class OptionTests(unittest.TestCase):
         self.assertIn('GR8_PF_ROUTER_SPLIT=0', plan['env'])
         self.assertEqual(models.GLM53F.default_variant[1], ('k2',))
         self.assertEqual((S.fabric_needed(o), S.fabric_needed(flash())), (False, True))
+        with self.assertRaises(opt.OptionError) as e:
+            flash('--tp', '1', '--ips', '10.1.0.1', '--ips2', '10.2.0.1', peers='10.0.0.1')
+        self.assertIn('--tp 1 takes no --ips', str(e.exception))
 
     def test_flash_cache(self):
         plan = opt.engine_plan(flash())
