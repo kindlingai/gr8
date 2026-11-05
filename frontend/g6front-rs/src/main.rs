@@ -21,6 +21,7 @@ mod thinking;
 mod tok;
 mod tool_choice;
 mod util;
+mod vision;
 mod wire;
 
 use std::net::SocketAddr;

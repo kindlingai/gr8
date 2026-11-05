@@ -1,0 +1,135 @@
+[
+{
+"file": "up_37x23.png",
+"best_w": 700,
+"best_h": 434,
+"key": "0836863345ae38dc",
+"exact": true
+},
+{
+"file": "up_23x61.png",
+"best_w": 336,
+"best_h": 896,
+"key": "4e78ac6b03798002",
+"exact": true
+},
+{
+"file": "up_120x200.png",
+"best_w": 434,
+"best_h": 714,
+"key": "591a58c8a05bb7d5",
+"exact": true
+},
+{
+"file": "up_301x157.png",
+"best_w": 756,
+"best_h": 392,
+"key": "92e2f569a9f262fa",
+"exact": true
+},
+{
+"file": "up_500x31.png",
+"best_w": 2184,
+"best_h": 140,
+"key": "fdfb7d18580c4500",
+"exact": true
+},
+{
+"file": "pad_700x500.png",
+"best_w": 700,
+"best_h": 504,
+"key": "a5ba056525c148ba",
+"exact": true
+},
+{
+"file": "down_1600x1203.png",
+"best_w": 1498,
+"best_h": 1134,
+"key": "0694cbd25983a1a9",
+"exact": true
+},
+{
+"file": "down_900x2500.png",
+"best_w": 756,
+"best_h": 2100,
+"key": "216ec8628e7cf7c3",
+"exact": true
+},
+{
+"file": "down_3000x200.png",
+"best_w": 3010,
+"best_h": 210,
+"key": "9776790b63e97ef5",
+"exact": true
+},
+{
+"file": "mode_L.png",
+"best_w": 728,
+"best_h": 420,
+"key": "20ee7ddff3174852",
+"exact": true
+},
+{
+"file": "mode_LA.png",
+"best_w": 728,
+"best_h": 420,
+"key": "20ee7ddff3174852",
+"exact": true
+},
+{
+"file": "mode_RGBA.png",
+"best_w": 728,
+"best_h": 420,
+"key": "dd344041f6d706f5",
+"exact": true
+},
+{
+"file": "mode_P.png",
+"best_w": 728,
+"best_h": 420,
+"key": "7c446880eac4e5bc",
+"exact": true
+},
+{
+"file": "mode_P_trns.png",
+"best_w": 728,
+"best_h": 420,
+"key": "7c446880eac4e5bc",
+"exact": true
+},
+{
+"file": "mode_1.png",
+"best_w": 728,
+"best_h": 420,
+"key": "ac65877dce98fc6b",
+"exact": true
+},
+{
+"file": "mode_I16.png",
+"best_w": 728,
+"best_h": 420,
+"key": "3b11adc632fd5796",
+"exact": true
+},
+{
+"file": "mode_P.gif",
+"best_w": 728,
+"best_h": 420,
+"key": "7c446880eac4e5bc",
+"exact": true
+},
+{
+"file": "mode_P_trns.gif",
+"best_w": 728,
+"best_h": 420,
+"key": "7c446880eac4e5bc",
+"exact": true
+},
+{
+"file": "lossless.webp",
+"best_w": 728,
+"best_h": 420,
+"key": "dd344041f6d706f5",
+"exact": true
+}
+]
