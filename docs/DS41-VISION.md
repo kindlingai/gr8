@@ -62,7 +62,8 @@ text-only code (the router and Engram take the text-only kernels: their image ar
 1. Tower alone, one GPU: build and run `engine/runtime/tests/ds41_vision_test.cu` (its header has the command) on
    the release's `exlr8-extra-vision.safetensors` and `engine/ref/ds41/fixtures/vision`. Pass = delimiters exact,
    aligner rows within tolerance on the 3 images, repeat runs identical; it prints the tower time per grid.
-2. Rebuild the rank images from the release (the loader now binds `router.bias_vl`). Boot the usual serve twice,
+2. No image rebuild: every boot plans the rank image from the release and loads it (engine/runtime/packfind.h
+   rs_plan_release; no on-disk cache for ds41), so the new binary binds `router.bias_vl` itself. Boot the usual serve twice,
    with `GR8_DS41_VISION=0` and with it unset (1). Compare the ready memory per rank (the `ds41 vision:` boot line has
    the device bytes). With 1, `DIR/vision.s2` exists and the front end's hello has `vision`.
 3. Text unchanged: the usual text battery against both boots and against the current serve reference. With the
