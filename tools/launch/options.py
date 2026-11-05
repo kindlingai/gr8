@@ -288,8 +288,8 @@ def validate(o):
         raise OptionError(f'--drafter {o.get("DRAFTER")}: want https://huggingface.co/<org>/<repo>[@rev]')
     if not model.drafter and (o.get('DRAFTER') or o.get('DFLASH') == '1'):
         raise OptionError(f'--drafter, --dflash 1: {model.name} has no DFlash2 drafter')
-    if o.get('DRAFTER') and tp not in ('4', '6'):
-        raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4 (split) and TP=6 (replicated) only, not TP={tp}')
+    if o.get('DRAFTER') and tp not in ('4', '6', '1'):
+        raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4 and TP=1 (split) and TP=6 (replicated) only, not TP={tp}')
     if not str(o.get('DEFAULT_MAX_TOKENS')).isdigit():
         raise OptionError(f'--default-max-tokens {o.get("DEFAULT_MAX_TOKENS")}: want a whole number (0 = fit SHARE_LIMIT)')
     effort = o.get('DEFAULT_REASONING_EFFORT')
@@ -415,8 +415,8 @@ def validate(o):
             raise OptionError('--kv-store on glm53f holds Flash session checkpoints: it needs --flash-cache aligned or terminal')
         if len(stores) > 1:
             raise OptionError('--flash-cache keeps its checkpoints in one store: give one --kv-store')
-        if any(t['persist'] for t in stores):
-            raise OptionError('--flash-cache: Flash checkpoints do not persist across boots (persist=on)')
+        if any(t['persist'] for t in stores) and cache == 'terminal':
+            raise OptionError('--flash-cache terminal: persist=on keeps cold-exact (aligned) checkpoints only')
     elif stores and o.get('REUSE') == '0':
         raise OptionError('--kv-store keeps the runs prefix reuse retains: it needs REUSE (on by default)')
     if stores:

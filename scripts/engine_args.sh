@@ -61,24 +61,25 @@ tp4_default() {
 # GLM-5.3-Flash under --serve takes no CP, prefix reuse or PF_OWN (engine/runtime/g6m4.cu refuses them). DFLASH=1 (TP=4,
 # the default): a session alone drafts with the DFlash2 drafter, SPEC_ADAPT on with it. MTP=1 for sessions sharing steps.
 # SESS: 2..8 share decode steps and the CAP pool, each with its own KDA state slots (docs/FLASH.md, Several sessions);
-# 8 at TP=4, 4 at TP=3, 1 (one request at a time) at TP=2. A round of every session, SESS x (MTP + 1) rows, must fit
+# 8 at TP=4, 4 at TP=3, 1 (one request at a time) at TP=2 and TP=1. A round of every session, SESS x (MTP + 1) rows, must fit
 # the engine's 32. CAP is a 262,144-token request plus a page for the guard rows (2 at MTP=1). Only the 11 DSA layers and
 # the MTP layer keep KV, 1,664 B a token each, and without CP every rank holds the whole context: about 5.2 GB a rank at
 # any TP (docs/FLASH.md, Context). With one session SHARE_LIMIT only sets the front end's default max_tokens.
 flash_defaults() {
-  case $TP in 4|3|2) ;; *) echo "engine_defaults: TP=$TP; GLM-5.3-Flash wants 4, 3 or 2" >&2; return 2 ;; esac
+  case $TP in 4|3|2|1) ;; *) echo "engine_defaults: TP=$TP; GLM-5.3-Flash wants 4, 3, 2 or 1" >&2; return 2 ;; esac
   local k
   for k in REUSE PF_OWN; do
     [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: GLM-5.3-Flash has no $k" >&2; return 2; }
   done
-  [ "${DFLASH:-0}" = 0 ] || [ "$TP" = 4 ] || { echo "engine_defaults: DFLASH=1: GLM-5.3-Flash runs its DFlash2 drafter at TP=4" >&2; return 2; }
+  [ "${DFLASH:-0}" = 0 ] || [ "$TP" = 4 ] || [ "$TP" = 1 ] || { echo "engine_defaults: DFLASH=1: GLM-5.3-Flash runs its DFlash2 drafter at TP=4 and TP=1" >&2; return 2; }
   SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-262208}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}
   case $TP in 4) SESS=${SESS:-8} ;; 3) SESS=${SESS:-4} ;; *) SESS=${SESS:-1} ;; esac
   case $SESS in [1-8]) ;; *) echo "engine_defaults: SESS=$SESS: GLM-5.3-Flash serves 1 to 8 sessions" >&2; return 2 ;; esac
   [ "$SESS" = 1 ] || [ $((SESS * (MTP + 1))) -le 32 ] ||
     { echo "engine_defaults: SESS=$SESS MTP=$MTP: a round of $((SESS * (MTP + 1))) rows; GLM-5.3-Flash steps hold 32" >&2; return 2; }
-  # DFLASH: on at TP=4 as on GLM-5.3 (the supervisor turns it off, with a notice, when no drafter is given)
-  [ "$TP" = 4 ] && DFLASH=${DFLASH:-1} || DFLASH=${DFLASH:-0}
+  # DFLASH: on at TP=4 as on GLM-5.3, and at TP=1, where the drafter's body is whole on the one rank (the supervisor
+  # turns it off, with a notice, when no drafter is given)
+  case $TP in 4|1) DFLASH=${DFLASH:-1} ;; *) DFLASH=${DFLASH:-0} ;; esac
   S2PORT=${S2PORT:-7341}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=0; REUSE=0
   flash_donor_defaults
 }
@@ -271,6 +272,7 @@ flash_env() {
   # GR8_GLM53F_PF_SP_X16: an MoE layer's all-gathered MLP input as FP16 rows (byte-equal), about +1.5%
   local sp=0 stage=1 rsplit=1
   [ "$TP" = 4 ] && sp=1 stage=0 rsplit=0
+  [ "$TP" = 1 ] && rsplit=0   # one rank: no router to split
   ENGINE_ENV="GR8_CP=0 GR8_PF_RS=0 GR8_PF_OWN=0 GR8_GLM53F_PF_POOL_OWNER=0 GR8_FPF_P1=0 GR8_FPF_DSA_P1=0 \
 GR8_FPF_ATTN_P1=0 GR8_GLM53F_PF_SPARSE_MLA=1 GR8_GLM53F_PF_SPARSE_MLA_512=1 \
 GR8_GLM53F_PF_SPARSE_MLA_V2=1 GR8_GLM53F_PF_SPARSE_MLA_H16C=1 GR8_PF_DTR8=1 GR8_GLM53F_PF_SHFP8=1 GR8_PF_FC2V2=1 GR8_GLM53F_PF_KDA_WS=1 \
@@ -471,7 +473,8 @@ engine_args() {
       for t in $KV_STORE; do [ -n "$t" ] && a="$a --kv-store $t"; done
       unset IFS
     fi
-    (set -f; echo $a)
+    [ "${KV_FORMAT:-fp8}" = int4 ] && a="$a --kv-format int4"   # bin/g6m4_flash-int4, which needs it
+    (set -f; echo $a ${EXTRA_ARGS:-})
     return
   fi
   # DeepSeek-V4.1-Flash-1017: a release only, CHUNK rows a step for a prompt tail (8 unless set). No --prefill or --pf-lanes: the

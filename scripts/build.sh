@@ -11,8 +11,8 @@
 #   KV_FORMAT=int4 scripts/build.sh bin   only OUT_DIR/g6m4-int4: the engine with the 4-bit KV latent (-DG6_KV4=1,
 #                                         docs/KV4.md), which `--kv-format int4` runs. The same widths.
 #   MODEL=flash scripts/build.sh bin      only OUT_DIR/g6m4_flash and OUT_DIR/m4sim_flash: GLM 5.3 Flash
-#                                         (-DG6_MODEL_FLASH=1, engine/model_geom.h), fp8 KV only; TP = 2 and 4 unless
-#                                         GR8_WIDTHS or GR8_NR says otherwise
+#                                         (-DG6_MODEL_FLASH=1, engine/model_geom.h); TP = 1 to 4 unless GR8_WIDTHS or
+#                                         GR8_NR says otherwise. With KV_FORMAT=int4, only OUT_DIR/g6m4_flash-int4
 #   MODEL=ds41 scripts/build.sh bin       only OUT_DIR/g6m4_ds41 and OUT_DIR/m4sim_ds41: DeepSeek-V4.1-Flash-1017
 #                                         (-DG6_MODEL_DS41=1, engine/model_geom_ds41.h, docs/DEEPSEEK.md), fp8 KV only; TP = 4
 #                                         unless GR8_WIDTHS or GR8_NR says otherwise
@@ -97,9 +97,9 @@ widths_ok() {   # widths_ok <g6m4> [<m4sim>]
   done
   echo "$(basename "$1")${2:+ and $(basename "$2")} run TP = $WIDTHS"
 }
-case "${KV_FORMAT:-fp8}" in
-  fp8) ;;
-  int4)   # g6m4 alone, in its own object dir, installed as g6m4-int4 next to the fp8 build
+case "${MODEL:-glm}:${KV_FORMAT:-fp8}" in
+  *:fp8|flash:int4) ;;
+  *:int4)   # g6m4 alone, in its own object dir, installed as g6m4-int4 next to the fp8 build
     WIDTHS="$WIDTHS" EXTRA="$K1H2_FLAGS -DG6_KV4=1 ${EXTRA:-}" OUT="$OUT/int4" bash build_m4.sh "${ARCH:-121a}" g6
     mv "$OUT/int4/g6m4" "$OUT/g6m4-int4" && rm -rf "$OUT/int4"
     strings "$OUT/g6m4-int4" | grep -q int4g32h || { echo "g6m4-int4: not the int4 build (no int4g32h row name)"; exit 1; }
@@ -110,12 +110,20 @@ case "${KV_FORMAT:-fp8}" in
 esac
 case "${MODEL:-glm}" in
   glm) ;;
-  flash)   # g6m4 and m4sim in their own object dir, installed as g6m4_flash / m4sim_flash next to the GLM build
-    [ "${KV_FORMAT:-fp8}" = fp8 ] || { echo "MODEL=flash: KV_FORMAT=fp8 only"; exit 2; }
-    WIDTHS=${GR8_WIDTHS:-${GR8_NR:-2 3 4}}
+  flash)   # g6m4 and m4sim in their own object dir, installed as g6m4_flash / m4sim_flash next to the GLM build;
+           # KV_FORMAT=int4: g6m4 alone with the int4 latent row (-DG6_KV4=1), installed as g6m4_flash-int4
+    WIDTHS=${GR8_WIDTHS:-${GR8_NR:-1 2 3 4}}
+    fx="${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_FLASH=1"
+    if [ "${KV_FORMAT:-fp8}" = int4 ]; then
+      WIDTHS="$WIDTHS" EXTRA="$fx -DG6_KV4=1 ${EXTRA:-}" OUT="$OUT/flash-int4" bash build_m4.sh "${ARCH:-121a}" g6
+      mv "$OUT/flash-int4/g6m4" "$OUT/g6m4_flash-int4" && rm -rf "$OUT/flash-int4"
+      strings "$OUT/g6m4_flash-int4" | grep -q int4nope || { echo "g6m4_flash-int4: not the int4 build (no int4nope row name)"; exit 1; }
+      md5sum "$OUT/g6m4_flash-int4"
+      widths_ok "$OUT/g6m4_flash-int4"
+      exit 0
+    fi
     # PF_FC2GL must divide HID / 128 = 32 (GLM 48: 6); build_m4.sh leaves out PF_F12, which the Flash fp16 MoE refuses
-    WIDTHS="$WIDTHS" EXTRA="${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_FLASH=1 ${EXTRA:-}" OUT="$OUT/flash" \
-      bash build_m4.sh "${ARCH:-121a}" all
+    WIDTHS="$WIDTHS" EXTRA="$fx ${EXTRA:-}" OUT="$OUT/flash" bash build_m4.sh "${ARCH:-121a}" all
     mv "$OUT/flash/m4sim" "$OUT/m4sim_flash" && mv "$OUT/flash/g6m4" "$OUT/g6m4_flash" && rm -rf "$OUT/flash"
     md5sum "$OUT/m4sim_flash" "$OUT/g6m4_flash"
     widths_ok "$OUT/g6m4_flash" "$OUT/m4sim_flash"

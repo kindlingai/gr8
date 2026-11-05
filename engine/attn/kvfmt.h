@@ -29,10 +29,12 @@ constexpr int CA_CODES = 256, CA_SF_OFF = 256, ICA_CODES = 64, ICA_SF = 4;
 constexpr int CA_PAGE_R2 = 32 * ROW, ICA_PAGE_R2 = 32 * IDX_ROW, CA_PAGE_R1 = 64 * ROW, ICA_PAGE_R1 = 64 * IDX_ROW;   // 9216, 2176, 18432, 4352
 constexpr const char* NAME = "ds41-fp4";
 #elif G6_MODEL_FLASH
-// GLM 5.3 Flash (attn/flash_attn.cu): NoPE MLA, the 512-d latent only (kv_a_layernorm applied), selected by
-// G6_FLASH_KV_FP8 (default 0):
-//   0  1024 B: [512 BF16]
-//   1   528 B: [512 E4M3 codes][4 FP32 scales, one per 128 dims, amax / 448]
+// GLM 5.3 Flash (attn/flash_attn.cu): NoPE MLA, the 512-d latent only (kv_a_layernorm applied), selected by G6_KV4
+// (the int4 engine, `--kv-format int4`) and otherwise by G6_FLASH_KV_FP8 (default 0):
+//   G6_KV4=1            288 B: [256 B INT4 codes][16 FP16 scales, one per 32 dims, amax / 7]. Byte i holds dims 2i (low
+//                              nibble) and 2i+1 (high nibble) as code q + 8, q in -7..7; the value is q * scale. No rotation.
+//   G6_FLASH_KV_FP8=0  1024 B: [512 BF16]
+//   G6_FLASH_KV_FP8=1   528 B: [512 E4M3 codes][4 FP32 scales, one per 128 dims, amax / 448]
 // Index cache (kpool indexer, every DSA layer), per 64-row page (16 pools of KPOOL = 4 consecutive tokens):
 //   [64 tokens][IDX_DIM FP16 raw key = wk(x), before k_norm][IDX_DIM FP16 raw pool gate = x @ compress_gate^T]  32 KB
 //   [16 pools][IDX_DIM FP32 pooled key]                                                                         8 KB
@@ -42,7 +44,13 @@ constexpr const char* NAME = "ds41-fp4";
 #ifndef G6_FLASH_KV_FP8
 #define G6_FLASH_KV_FP8 0
 #endif
-#if G6_FLASH_KV_FP8
+#if G6_KV4 && G6_FLASH_KV_FP8
+#error "G6_KV4 and G6_FLASH_KV_FP8 pick two Flash latent rows"
+#endif
+#if G6_KV4
+constexpr int ROW = 288, SCALE_OFF = 256;
+constexpr const char* NAME = "int4nope";
+#elif G6_FLASH_KV_FP8
 constexpr int ROW = 528, SCALE_OFF = 512;
 constexpr const char* NAME = "fp8nope";
 #else

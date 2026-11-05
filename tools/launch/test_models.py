@@ -34,9 +34,9 @@ class OptionTests(unittest.TestCase):
         self.assertEqual((models.of(glm), glm.get('GROUP')), (models.GLM53, 'gr8-glm53'))
 
     def test_refusals(self):
-        for argv, want in ((['--tp', '6'], 'want 4, 3 or 2 (glm53f)'), (['--kv-format', 'int4'], 'fp8 KV build only'),
+        for argv, want in ((['--tp', '6'], 'want 4, 3, 2 or 1 (glm53f)'),
                            (['--tp', '3', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3', '--drafter', 'https://huggingface.co/a/b'],
-                            'runs at TP=4 (split) and TP=6')):
+                            'runs at TP=4 and TP=1 (split) and TP=6')):
             with self.assertRaises(opt.OptionError) as e:
                 flash(*argv)
             self.assertIn(want, str(e.exception))
@@ -67,6 +67,17 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(plan['args'][plan['args'].index('--chunk') + 1], '1')
             self.assertIn('GR8_GLM53F_PF_DSA_F16GEMM=1', plan['env'])
 
+    def test_one_box(self):
+        # TP=1: one box, K2 (the width whose experts fit), no drafter; --kv-format int4 runs g6m4_flash-int4
+        o = flash('--tp', '1', peers='10.0.0.1')
+        plan = opt.engine_plan(o)
+        self.assertEqual((plan['knobs']['SESS'], plan['knobs']['DFLASH']), ('1', '1'))
+        self.assertIn('--dflash-manifest', plan['args'])
+        self.assertEqual(S.engine_bin(flash('--tp', '1', '--kv-format', 'int4', peers='10.0.0.1')), 'g6m4_flash-int4')
+        plan = opt.engine_plan(flash('--tp', '1', '--flash-cache', 'aligned', '--kv-store',
+                                     'ssd:/tmp/fc,size=64G,persist=on', peers='10.0.0.1'))
+        self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], 'ssd:/tmp/fc,size=64G,persist=on')
+
     def test_flash_cache(self):
         plan = opt.engine_plan(flash())
         self.assertFalse([e for e in plan['env'] if e.startswith(('GR8_GLM53F_CACHE=', 'GR8_GLM53F_STATE_BUDGET_MIB='))])
@@ -90,8 +101,8 @@ class OptionTests(unittest.TestCase):
                            (['--kv-store', 'ssd:/tmp/fc,size=64G'], 'needs --flash-cache aligned or terminal'),
                            (['--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/a,size=1G', '--kv-store',
                              'ssd:/tmp/b,size=1G'], 'give one --kv-store'),
-                           (['--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/a,size=1G,persist=on'],
-                            'do not persist')):
+                           (['--flash-cache', 'terminal', '--kv-store', 'ssd:/tmp/a,size=1G,persist=on'],
+                            'cold-exact (aligned) checkpoints only')):
             with self.assertRaises(opt.OptionError) as e:
                 flash(*argv)
             self.assertIn(want, str(e.exception))
@@ -348,8 +359,9 @@ class RequiredTests(unittest.TestCase):
         self.assertIn('--tp       4, 6, 3 or 5', glm)
         self.assertIn('TP=3 bit225 else down1', glm)
         self.assertIn(models.GLM53.release, glm)
-        self.assertIn('--tp       4, 3 or 2', flash)
-        self.assertIn('--drafter URL (DFlash2)', flash)
+        self.assertIn('--tp       4, 3, 2 or 1', flash)
+        self.assertIn('TP=1 k2', flash)
+        self.assertIn('--drafter URL (DFlash2), --kv-format int4', flash)
         self.assertEqual(models.SERVED, (models.GLM53, models.GLM53F))
 
 
