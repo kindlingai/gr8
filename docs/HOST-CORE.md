@@ -41,7 +41,8 @@ The core picks a module by `--model` and the width (`--ips` count), as `widths.c
 
 ### ModuleInfo
 
-What the core needs to know about a module, filled from the module's constants:
+What the core needs to know about a module, filled from the module's constants. R1 carries the part host code branches on
+today; the rest joins as the steps that need it arrive:
 
 - model id and name, architecture, layer count, hidden size, vocabulary, top-k
 - `nr`, `mx` (rows a step), `s2n` (session slots in `S2In`), session slot limit
@@ -225,9 +226,9 @@ checks it against the constants in each model's shape.
 
 Moves `s2/scheduler.h`, `sessions.h`, `kv_plan.h`, `kv_share.h`, `cp_rows.h`, `flash_lend.h` and `flash_ring.h` (about
 1,300 lines, integer logic). The boundary is `#[repr(C)]` `Key`, `Slot`, `Run`, `Grant`, `Shrink`, `Resize`, `Quantum`,
-`Config` and `g6s2_sched_*` calls. It removes `MAX_SESSIONS` (`scheduler.h:18-21`), the DS41 rules in
-`Config::validate`, `ds41_decode_prompt` (`sessions.h:123`) and the DSpark row keys (`dispatch.h:149`) in favour of
-`ModuleInfo` traits. The pool becomes Rust to Rust, so `s2/pool.h` (218 lines of FFI) goes away. Proof: the
+`Config` and `g6s2_sched_*` calls. It turns the compile-time slot capacity (`MAX_SESSIONS`,
+`S2N_SLOTS`) into the runtime `ModuleInfo::max_sessions`; the model rules already read `ModuleInfo` since R1. It will
+also want `PACK_MAX_MEMBERS` and the drafters' block sizes in `ModuleInfo`. The pool becomes Rust to Rust, so `s2/pool.h` (218 lines of FFI) goes away. Proof: the
 scheduler, driver and pool host tests ported, and a differential run of the C++ and Rust versions on the command log
 (same `Quantum` sequence and pool digest, which ranks compare at `service.h:499`). One C call per round.
 

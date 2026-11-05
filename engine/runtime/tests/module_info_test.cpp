@@ -3,6 +3,7 @@
 #include "../../module_info.h"
 #include "../s2/prompt_rule.h"
 #include "../s2/scheduler.h"
+#include "../s2/sessions.h"
 #include "../s2_batch.h"
 #include <cstdio>
 #include <cstring>
@@ -32,14 +33,32 @@ int main()
     CHECK(m.model == G6_MODEL_ID_GLM53 && std::strcmp(m.name, "glm-5.3") == 0 && m.max_sessions == 8 && m.mtp_layers == 1);
     CHECK(m.caps == (G6_CAP_DFLASH2 | G6_CAP_GRAMMAR));
 #endif
-    // the scheduler's model rules read the capabilities
-    g6s2::Config c;
-    c.epoch = 1; c.pool_rows = 64 * 64; c.mtp = 0; c.max_rows = 32; c.max_sessions = 1; c.prefill_rows = 64;
-    bool threw = false;
-    try { c.validate(); } catch (const std::exception&) { threw = true; }
-    CHECK(threw == !(m.caps & G6_CAP_MTP0));
-    // the prompt rule: decode steps by default on DS41, prefill unless prompt logprobs elsewhere
-    CHECK(g6s2::ds41_decode_prompt(0, 5000, -1, false) && !g6s2::ds41_decode_prompt(64, 5000, -1, false));
+    // the scheduler's model rules read the capabilities: each refusal by its own message, nothing else refused
+    auto refusal = [](const g6s2::Config& c) -> std::string {
+        try { c.validate(); } catch (const std::exception& e) { return e.what(); }
+        return "";
+    };
+    g6s2::Config ok;
+    ok.epoch = 1; ok.pool_rows = 64 * 64; ok.mtp = 3; ok.max_rows = 32; ok.max_sessions = 1; ok.prefill_rows = 64;
+    CHECK(refusal(ok).empty());
+    g6s2::Config c = ok;
+    c.mtp = 0;
+    CHECK(refusal(c) == ((m.caps & G6_CAP_MTP0) ? "" : "bad session/row limit"));
+    c = ok;
+    c.c8_pack = true;
+    CHECK(refusal(c) == ((m.caps & G6_CAP_PACK) ? "" : "c8 prefill pack is DS41 only"));
+    c = ok;
+    c.park = true;
+    CHECK(refusal(c) == ((m.caps & G6_CAP_PARK) ? "" : "parked slots are DS41 only"));
+    // the session prompt rule: with prefill_min 0 every prompt decodes where prompts decode by default, elsewhere only
+    // prompt logprobs keep a prompt on the decode path
+    const g6s2::Sessions none(ok, "", false, 4), pf(ok, "", false, 4, 64);
+    g6rt::ServeReq r;
+    r.prompt.assign(5000, 7); r.n_gen = 8;
+    const bool dflt = (m.caps & G6_CAP_PROMPT_DECODE) != 0;
+    CHECK(none.payload(r).decode_prompt == dflt && !pf.payload(r).decode_prompt);
+    r.plp = 0;
+    CHECK(none.payload(r).decode_prompt && pf.payload(r).decode_prompt);
     std::printf("module_info_test (%s, TP%d, %d rows, %d slots, KV %s): %s\n", m.name, m.nr, m.mx, m.max_sessions, m.kv_format,
                 fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;

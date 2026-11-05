@@ -71,8 +71,9 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_ngram_test.cpp" -o "$T/batch_ngram_test" "${KNOBS[@]}"
 "$T/batch_ngram_test" 2>/dev/null    # the GR8_MTP_LPLOG case prints its round lines
 # the build's description (module_info.h) in each model's shape
-for f in "" -DG6_MODEL_FLASH=1 -DG6_MODEL_DS41=1; do
-  g++ -std=c++17 -O2 -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/module_info_test.cpp" -o "$T/module_info_test" "${KNOBS[@]}"
+# (the serving shapes: build_m4.sh's -DDEC_S2 and widths, DS41 at 48 rows; and a TP6 build's defaults)
+for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O2 -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/module_info_test.cpp" -o "$T/module_info_test" "${KVLIB[@]}"
   "$T/module_info_test"
 done
 # the planner's round log and its replay (GR8_S2_REPLAY_LOG, s2/round_replay.h); GR8_S2_FRESH_SPEC
