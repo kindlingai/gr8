@@ -37,7 +37,7 @@ keeps Flash and GLM-5.3 apart (`served` in `tools/launch/models.py`). `./gr8 glm
 - `./gr8 glm53f up` boots in about 16 s from a local cache and passes `./gr8 glm53f smoke`.
 - TP=4 prefill of an 8K prompt: about 3.55 s at 2200 MHz.
 - 8 sessions at TP=4 and 4 at TP=3 share decode steps (below), with MTP=1 (`flash_defaults` in `scripts/engine_args.sh`).
-- At TP=4 a session that runs alone drafts with the DFlash2 drafter when the boot has one: `--drafter https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2` (below).
+- At TP=4, TP=2 and TP=1 a session that runs alone drafts with the DFlash2 drafter when the boot has one: `--drafter https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2` (below).
 - `response_format` `json_object` and `json_schema` replies are masked to their XGrammar grammar, as on GLM-5.3 (`GRAMMAR`).
 
 ## Context
@@ -140,7 +140,7 @@ been measured on Flash yet.
 
 ## DFlash2
 
-At TP=4 a session that runs alone drafts with the DFlash2 block drafter, as on GLM-5.3 (`s2_batch.h`, `Batch::dflash`).
+At TP=4, TP=2 and TP=1 a session that runs alone drafts with the DFlash2 block drafter, as on GLM-5.3 (`s2_batch.h`, `Batch::dflash`).
 When a second session arrives it moves to MTP, and the sessions share steps. `--spec-adaptive` (on with the drafter) picks
 each round's draft count from the verify table in `spec_len.h` (`flash_cost`), and the drafter choice (`GR8_S2_DSEL`) runs
 MTP rounds when they commit more tokens a millisecond, which they do on prose. A DFlash2 round writes up to 8 rows, so
@@ -293,6 +293,6 @@ Limits:
 - CP and prefix reuse: the engine refuses them under `--serve`. `GR8_GLM53F_CACHE=aligned` (above) is the
   experimental Flash form of prefix reuse, with or without DFlash2. The DFlash2 drafter's taps are the mean of the four
   mHC streams after each tapped layer, in decode steps and in the prefill, which keeps the last 2,048 prompt positions
-  for the drafter's prompt context. DFlash2 at TP=2 and TP=3 runs offline only.
+  for the drafter's prompt context. DFlash2 at TP=3 runs offline only.
 - The vision tower: the engine serves text, and the fetch skips `dense/vision-*`.
 - A 262K prefill's time and memory headroom on a GB10: the `CAP` above is computed, not measured.

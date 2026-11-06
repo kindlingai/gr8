@@ -71,15 +71,15 @@ flash_defaults() {
   for k in REUSE PF_OWN; do
     [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: GLM-5.3-Flash has no $k" >&2; return 2; }
   done
-  [ "${DFLASH:-0}" = 0 ] || [ "$TP" = 4 ] || [ "$TP" = 1 ] || { echo "engine_defaults: DFLASH=1: GLM-5.3-Flash runs its DFlash2 drafter at TP=4 and TP=1" >&2; return 2; }
+  [ "${DFLASH:-0}" = 0 ] || [ "$TP" != 3 ] || { echo "engine_defaults: DFLASH=1: GLM-5.3-Flash runs its DFlash2 drafter at TP=4, TP=2 and TP=1" >&2; return 2; }
   SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-262208}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}
   case $TP in 4) SESS=${SESS:-8} ;; 3) SESS=${SESS:-4} ;; *) SESS=${SESS:-1} ;; esac
   case $SESS in [1-8]) ;; *) echo "engine_defaults: SESS=$SESS: GLM-5.3-Flash serves 1 to 8 sessions" >&2; return 2 ;; esac
   [ "$SESS" = 1 ] || [ $((SESS * (MTP + 1))) -le 32 ] ||
     { echo "engine_defaults: SESS=$SESS MTP=$MTP: a round of $((SESS * (MTP + 1))) rows; GLM-5.3-Flash steps hold 32" >&2; return 2; }
-  # DFLASH: on at TP=4 as on GLM-5.3, and at TP=1, where the drafter's body is whole on the one rank (the supervisor
+  # DFLASH: on at TP=4, TP=2 and TP=1, where the drafter's 8 KV heads split evenly across the ranks (the supervisor
   # turns it off, with a notice, when no drafter is given)
-  case $TP in 4|1) DFLASH=${DFLASH:-1} ;; *) DFLASH=${DFLASH:-0} ;; esac
+  case $TP in 4|2|1) DFLASH=${DFLASH:-1} ;; *) DFLASH=${DFLASH:-0} ;; esac
   S2PORT=${S2PORT:-7341}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=0; REUSE=0
   flash_donor_defaults
 }
