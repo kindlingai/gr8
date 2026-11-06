@@ -48,7 +48,9 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             "Flash serve of several sessions needs S2 pools, graphs, --mtp and a KDA ring per session");
     const unsigned pages = sc.pool_rows / PAGE;
     RunPool pool(pages, pages, sc.pool_rows);
-    FlashSlots ks(int(sc.limit()), std::max(1, c.main.kda_ring));
+    FlashSlots ks(int(sc.limit()), std::max(1, c.main.kda_ring_rest ? c.main.kda_ring_rest : c.main.kda_ring),
+                  std::max(1, c.main.kda_ring));
+    require(ks.total() <= c.main.kda_st.slots, "Flash serve: the KDA state has fewer slots than the sessions' rings");
     u64 pfseq = 1, pfseq2 = 1, dseq = 0;
     LpStep lp{};
     int lp_rows = 0;

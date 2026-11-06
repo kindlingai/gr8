@@ -127,6 +127,25 @@ void errors() {
     si.pos[0] = 13; assert(throws([&] { ks.inputs(si, {0}, {0}, {1}, {true}); }));  // past the last step's rows
     assert(ks.base(1) == 4 && throws([&] { ks.base(-1); }));
 }
+// Session 0 with the DFlash2 ring (8 slots), the others an MTP round (2): the bases follow the widths, each session's
+// verify rows stay inside its own slots, and only session 0 takes an 8-row verify.
+void wide_first() {
+    g6s2::FlashSlots ks(3, 2, 8);
+    assert(ks.base(0) == 0 && ks.base(1) == 8 && ks.base(2) == 10 && ks.total() == 12);
+    assert(ks.width(0) == 8 && ks.width(2) == 2 && throws([] { g6s2::FlashSlots(2, 4, 2); }));
+    StepIn si;
+    for (int r = 0; r < 8; ++r) si.pos[r] = 100 + r;
+    ks.inputs(si, {0}, {0}, {8}, {true});
+    for (int r = 0; r < 8; ++r) assert(si.kslot[r] == r);
+    si.pos[0] = 105; si.pos[1] = 50; si.pos[2] = 51; si.pos[3] = 70; si.pos[4] = 71;
+    ks.inputs(si, {0, 1, 2}, {0, 1, 3}, {1, 2, 2}, {true, true, true});
+    assert(si.kda_src == 4 && si.kslot[0] == 0);                       // session 0 accepted 5 of 8: slot 4 holds it
+    assert(si.krun[1] == 8 + 1 && si.kslot[1] == 8 && si.kslot[2] == 9);
+    assert(si.krun[3] == 10 + 1 && si.kslot[3] == 10 && si.kslot[4] == 11);
+    StepIn w;
+    for (int r = 0; r < 3; ++r) w.pos[r] = 52 + r;
+    assert(throws([&] { ks.inputs(w, {1}, {0}, {3}, {true}); }));     // session 1's ring holds 2
+}
 // FlashSlots::step from an s2::Step layout and its sessions' event classes is inputs() with verify = not the prompt tail
 struct Step { std::vector<unsigned> sess, row0, rows; };
 constexpr int TAIL = 3;
@@ -166,7 +185,7 @@ void shapes() {
 }
 }
 int main() {
-    ring(); solo(); sessions(); errors(); step(); shapes();
+    ring(); solo(); sessions(); errors(); wide_first(); step(); shapes();
     puts("flash_ring: PASS (all accepted lengths, insertion, reset, invalid positions; FlashSlots: one session as before, "
-         "sessions sharing steps in their own slots, reset, invalid layouts, the s2::Step form; the capture set)");
+         "sessions sharing steps in their own slots, reset, invalid layouts, a wide first ring, the s2::Step form; the capture set)");
 }

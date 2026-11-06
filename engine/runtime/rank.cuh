@@ -474,7 +474,8 @@ struct Model
     int* row_slot = nullptr;          // [MX], single-session decode uses slot zero (MTP ring: StepIn::kslot)
     int* kda_src = nullptr;           // device [MX], Args::src: StepIn::kda_src at row 0, StepIn::krun - 1 after it
     int kda_ring = 0;                 // set before build: > 1 = KDA state slots for the MTP verify ring (--mtp K: K + 1)
-    int kda_sessions = 1;             // set before build: S2 sessions, each with its own kda_ring slots (FlashSlots)
+    int kda_sessions = 1;             // set before build: S2 sessions: the first with kda_ring slots, the rest kda_ring_rest
+    int kda_ring_rest = 0;            // set before build: the other sessions' slots (0 = kda_ring; FlashSlots)
     __half* idx_g = nullptr;
     kda::KdaState kda_st;
     kda::KdaScratch kda_sc;
