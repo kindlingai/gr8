@@ -100,10 +100,11 @@ There is no rotation: Flash's latent is NoPE, and every read dequantizes in plac
 `--sess N` (`SESS`, 1 to 8; 8 at TP=4, 4 at TP=3, 1 at TP=2) serves up to N requests at once on S2, as GLM-5.3 does: their decode
 rounds share main and draft steps, and their KV runs share the `CAP` pool (`--s2-sessions N` to `g6m4_flash`).
 
-- KDA state: session q owns slots `q x (MTP + 1)` up to `(q + 1) x (MTP + 1)` (`FlashSlots` in
-  `engine/runtime/s2/flash_ring.h`), reset when a request starts on q. In a main step each session's first row loads its
-  own committed slot (`StepIn::krun`, `Args::src` per row in `engine/kda`), and its verify rows write its own ring, so
-  sessions sharing a step never read each other's state. The engine allocates `SESS x (MTP + 1)` slots.
+- KDA state: each session holds a region of `MTP + 1` slots (`FlashSlots` in `engine/runtime/s2/flash_ring.h`), reset
+  when a request starts on it. With the drafter, region 0 is 8 slots wide (below). In a main step each session's first
+  row loads its own committed slot (`StepIn::krun`, `Args::src` per row in `engine/kda`), and its verify rows write its
+  own ring, so sessions sharing a step never read each other's state. The engine allocates `SESS x (MTP + 1)` slots, plus
+  `8 - (MTP + 1)` with the drafter.
 - Prefill runs a request alone on its own slots and KV run.
 - Every main and draft width a round can take is captured as a graph per context bucket at boot
   (`flash_shapes`, `engine/runtime/s2/flash_native.cuh`); a step outside the set is an error, not a capture.
@@ -120,8 +121,17 @@ At TP=4 a session that runs alone drafts with the DFlash2 block drafter, as on G
 When a second session arrives it moves to MTP, and the sessions share steps. `--spec-adaptive` (on with the drafter) picks
 each round's draft count from the verify table in `spec_len.h` (`flash_cost`), and the drafter choice (`GR8_S2_DSEL`) runs
 MTP rounds when they commit more tokens a millisecond, which they do on prose. A DFlash2 round writes up to 8 rows, so
-the KDA ring holds 8 slots a session (`Model::kda_ring`) and the scheduler keeps 14 guard rows (`Config::guard_tokens`).
-The prefill fills the drafter's prompt context; the batched graphs of several sessions carry no drafter taps.
+one KDA region is 8 slots wide (`Model::kda_ring`; 153 MB a slot at TP=1) and the scheduler keeps 14 guard rows
+(`Config::guard_tokens`). DFlash2 drafts for a session alone, so one wide region is enough: at its first DFlash2
+round the session takes region 0 and the session that held it, retiring or free, takes the session's MTP region
+(`FlashSlots::take_wide`, `widen` in `engine/runtime/s2/flash_native.cuh`, which copies the session's `MTP + 1` slots
+across first). The prefill fills the drafter's prompt context. The batched graphs of several sessions leave out the
+drafter taps.
+
+A session that started next to others decodes on MTP. When the others finish, `DFL_REUSE=2` (the default with MTP and
+the drafter) promotes it, as on GLM-5.3 (`Batch::promote`): MTP rounds feed the drafter the accepted rows as context
+until it holds `DFL_REUSE_MIN` (256) rows, then the session drafts with DFlash2 and takes region 0 as above. Rank 0's
+`# s2 dflash reuse slot` line for the request shows the position it was promoted at.
 
 speedbench `run` at TP=4, 2200 MHz, one stream (tok/s): code 70.2 -> 88.9, structured 72.1 -> 97.2, agentic 67.5 -> 84.7;
 prose 65.0 -> 59.0 before the drafter choice settles on MTP.
@@ -155,7 +165,7 @@ positions it runs, and the drafter takes its context from those (`engine/runtime
   `N - 1`, so this holds whenever the last grid point is 2,048 rows or more back) leaves the drafter's whole window to
   the prefill. The drafter starts as on a cold prompt.
 - A hit inside the window (an agent's next turn, a few hundred tokens past the last turn's grid point): the prefill taps
-  only `[p, N - 1)`. Under `DFL_REUSE=1` (`GR8_DFL_REUSE`, the default with `FLASH_CACHE`) the session keeps the
+  only `[p, N - 1)`. Under `DFL_REUSE=1` (`GR8_DFL_REUSE`; on with `FLASH_CACHE`, and in mode 2) the session keeps the
   drafter, as a GLM-5.3 prefix-reuse hit does (`s2_batch.h` `Batch::reuse_start`). When the drafter's ring still holds
   the previous turn of the same conversation (the last DFlash2 session there had this prompt's tokens up to `p`, and its
   rows were not written over), the context starts at the window's start and the session drafts with DFlash2 from its
@@ -164,8 +174,8 @@ positions it runs, and the drafter takes its context from those (`engine/runtime
   rounds on each drafter and the warm-up.
 - A hit that holds every prompt row but the last (a replay) has no prefill: the drafter starts at the prompt step, with
   the ring's rows when they are this conversation's.
-- `DFL_REUSE=0`: a hit inside the window runs MTP for the whole request, as before. `DFL_REUSE=2` (GLM-5.3's promotion of
-  a session alone on MTP) is not measured on Flash, and the engine refuses it.
+- `DFL_REUSE=0`: a hit inside the window runs MTP for the whole request, as before. `DFL_REUSE=2` adds the promotion of
+  a session alone on MTP (DFlash2, above).
 
 The ring's rows below `p` came from the previous turn's prefill and decode taps, not from a cold prefill of this prompt,
 so drafts may differ from a cold boot's. The target verifies every draft: the output is the same as without the drafter

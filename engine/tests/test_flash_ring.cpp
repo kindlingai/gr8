@@ -146,6 +146,23 @@ void wide_first() {
     for (int r = 0; r < 3; ++r) w.pos[r] = 52 + r;
     assert(throws([&] { ks.inputs(w, {1}, {0}, {3}, {true}); }));     // session 1's ring holds 2
 }
+// take_wide: session 2 (an MTP ring of 2) takes the 8 slots of region 0 and keeps its ring positions. Session 0 gets
+// region 2, and a later take moves region 0 on again
+void take_wide() {
+    g6s2::FlashSlots ks(3, 2, 8);
+    StepIn si;
+    si.pos[0] = 70; si.pos[1] = 71;
+    ks.inputs(si, {2}, {0}, {2}, {true});
+    assert(si.kslot[0] == 10 && si.kslot[1] == 11);
+    assert(ks.wide() == 0 && ks.take_wide(2) == 0 && ks.wide() == 2);
+    assert(ks.base(2) == 0 && ks.width(2) == 8 && ks.base(0) == 10 && ks.width(0) == 2 && ks.base(1) == 8);
+    for (int r = 0; r < 8; ++r) si.pos[r] = 72 + r;
+    ks.inputs(si, {2}, {0}, {8}, {true});                              // both rows were accepted: slot 1 holds 71
+    assert(si.kda_src == 1);
+    for (int r = 0; r < 8; ++r) assert(si.kslot[r] == r);
+    assert(ks.take_wide(2) == 2 && ks.wide() == 2);                    // already held: no change
+    assert(ks.take_wide(1) == 2 && ks.base(1) == 0 && ks.base(2) == 8 && ks.width(2) == 2);
+}
 // FlashSlots::step from an s2::Step layout and its sessions' event classes is inputs() with verify = not the prompt tail
 struct Step { std::vector<unsigned> sess, row0, rows; };
 constexpr int TAIL = 3;
@@ -185,7 +202,7 @@ void shapes() {
 }
 }
 int main() {
-    ring(); solo(); sessions(); errors(); wide_first(); step(); shapes();
+    ring(); solo(); sessions(); errors(); wide_first(); take_wide(); step(); shapes();
     puts("flash_ring: PASS (all accepted lengths, insertion, reset, invalid positions; FlashSlots: one session as before, "
-         "sessions sharing steps in their own slots, reset, invalid layouts, a wide first ring, the s2::Step form; the capture set)");
+         "sessions sharing steps in their own slots, reset, invalid layouts, a wide first ring, taking the wide ring, the s2::Step form; the capture set)");
 }
