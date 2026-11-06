@@ -367,6 +367,8 @@ public:
             if (blocks != r.slots) throw std::runtime_error("Flash checkpoint: the lease grew to a different size than the event's");
             index_.grow(blocks);
         } else if (r.segs < segs) {
+            // the moves run before the index is saved (capture saves first): a crash between them leaves an index whose
+            // entries the load checks and the agreement drop, never a wrong restore
             for (const auto& m : index_.shrink(r.slots, gone))
                 for (uint64_t i = 0; i < m.blocks; i += batch_) {
                     const int n = (int)std::min<uint64_t>(batch_, m.blocks - i);

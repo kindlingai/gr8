@@ -352,7 +352,17 @@ static void bench(const std::string& dir) {
                 size_t(P + 1) * 4, whole.size() / 1048576.0, wms);
 }
 
+// the verify buffers are 4 KiB aligned: an ssd: store reads into them with O_DIRECT
+void aligned_buffers() {
+    for (size_t n : {size_t(1), size_t(4096), size_t(712704), size_t(32) * 712704}) {
+        FlashBuf b(n);
+        CHECK(reinterpret_cast<uintptr_t>(b.data()) % 4096 == 0);
+        b.data()[n - 1] = 1;
+    }
+}
+
 int main(int argc, char** argv) {
+    aligned_buffers();
     std::string tmpl = (std::filesystem::temp_directory_path() / "fckidxXXXXXX").string();
     if (!mkdtemp(&tmpl[0])) { std::perror("mkdtemp"); return 1; }
     const std::string dir = tmpl;

@@ -11,6 +11,8 @@
 #include "flash_checkpoint.h"
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
+#include <memory>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -87,13 +89,25 @@ struct FlashLayout {
 // n blocks from `first` into dst (n * slot bytes); throws on a read error
 using FlashRead = std::function<void(uint64_t first, int n, uint8_t* dst)>;
 
+// A read buffer for FlashRead, 4 KiB aligned: an ssd: store reads with O_DIRECT, which needs an aligned destination on
+// kernels before 6.0 and on devices without byte-granular DMA (an unaligned one fails every read with EINVAL)
+struct FlashBuf {
+    std::unique_ptr<uint8_t, decltype(&std::free)> p{nullptr, &std::free};
+    explicit FlashBuf(size_t bytes = 0) { resize(bytes); }
+    void resize(size_t bytes) {
+        p.reset(bytes ? static_cast<uint8_t*>(std::aligned_alloc(4096, (bytes + 4095) / 4096 * 4096)) : nullptr);
+        if (bytes && !p) throw std::bad_alloc();
+    }
+    uint8_t* data() const { return p.get(); }
+};
+
 // The wrapping sum of hash(i, block) over blocks [first, first + n) of the store: `batch` blocks a read, the next batch
 // read while the last one is hashed on `threads` threads. The sum does not depend on the order (ckpt_sum_host).
 inline uint64_t flash_sum_blocks(uint64_t first, uint64_t n, size_t slot, const FlashRead& read, int batch, int threads,
                                  const std::function<uint64_t(uint64_t, const uint8_t*)>& hash) {
     batch = std::max(1, batch); threads = std::max(1, threads);
-    std::vector<uint8_t> buf[2];
-    buf[0].resize(size_t(std::min<uint64_t>(batch, n)) * slot); buf[1].resize(buf[0].size());
+    const size_t bytes = size_t(std::min<uint64_t>(batch, n)) * slot;
+    FlashBuf buf[2] = {FlashBuf(bytes), FlashBuf(bytes)};
     auto start = [&](uint64_t at, int k) {
         return std::async(std::launch::async, [&, at, k] { read(first + at, int(std::min<uint64_t>(batch, n - at)), buf[k].data()); });
     };
@@ -129,7 +143,7 @@ inline const char* flash_entry_check(const FlashEntry& x, uint64_t compat, uint6
     if (x.blocks != L.entry_blocks(x.position) || m.pages != np || m.page_bytes != L.page_bytes() || m.state_bytes != L.state_bytes)
         return "other sizes";
     if (x.base >= store_blocks || x.blocks > store_blocks - x.base) return "past the store";
-    std::vector<uint8_t> one(L.slot);
+    FlashBuf one(L.slot);
     read(x.base, 1, one.data());
     FlashManifest got;
     std::memcpy(&got, one.data(), sizeof got);

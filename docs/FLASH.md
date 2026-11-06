@@ -154,7 +154,9 @@ The store: the one `KV_STORE` (`--kv-store`; `mem:`, `ssd:PATH` or `remote:HOST:
 Then the index is written beside the blocks after every capture and resize (`flash-ckpt.index`), and each entry's tokens
 once, in `flash-ckpt.tokens/<generation>`. Every file is written to a temporary name, synced, renamed and its folder
 synced. A boot with the same compat line (model set, TP, rank, CAP, layout, engine build) and store size reads the
-index, and a helper thread checks every entry's stored manifest, pages and KDA state against the manifest's checksums
+index, and a helper thread checks every entry's stored manifest, pages and KDA state against the manifest's checksums.
+The blocks of an entry are not synced before the index names it, so after a power loss the index can name an entry whose
+blocks never reached the disk: the checks drop it, so the boot loses the entry, never serves its bytes.
 On a GB10's SSD the checks run at about 6 GiB/s, as fast as reading the store alone, so a full 64 GiB store takes
 some 11 s. The thread runs during the graph capture, and the serve waits for it. Before serving, the ranks agree: each sends one line an
 entry, every rank keeps the entries every rank kept, and rewrites its index. So a rank whose index was lost or torn, or
