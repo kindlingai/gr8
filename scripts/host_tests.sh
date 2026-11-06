@@ -293,6 +293,13 @@ g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/run
 # GR8_S2_ADMIT_HOLD=1: ADMIT files that land inside a held admission join the held boundary
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/admit_hold_drain_test.cpp" "${KVLIB[@]}" -o "$T/admit_hold_drain_test"
 (cd "$T" && "$T/admit_hold_drain_test" 2>/dev/null)
+# the calls the service makes on a model module, against transcripts recorded from the service before ModuleOps, in
+# each model's shape
+for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O2 -Wall -Wextra -pthread -ffp-contract=off $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/module_calls_test.cpp" \
+    -o "$T/module_calls_test" "${KVLIB[@]}"
+  "$T/module_calls_test" 2>/dev/null
+done
 # DeepSeek-V4.1-Flash-1017 geometry (engine/model_geom_ds41.h) against the release's config.json
 g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/ds41_geom_dump.cpp" -o "$T/ds41_geom_dump"
 (cd "$REPO/engine/tests" && DS41_GEOM_DUMP="$T/ds41_geom_dump" python3 -m unittest -q test_ds41_geom)
