@@ -91,30 +91,16 @@ struct Loader<'a> {
 
 unsafe impl Sync for Loader<'_> {}
 
-// Per-op profiling of the load, gated by G6_LOAD_PROF=1 (cu-fastboot arm A): ns/bytes/count
-// triplets printed at the end of run(). Off = one relaxed atomic load per op, no accumulation.
+// Per-op profiling of the load, GR8_LOAD_PROF=1 (cu-fastboot arm A, ported to DS41): ns/bytes/count triplets printed at
+// the end of run(). Off = one relaxed atomic load per op, no accumulation.
 // bases: 0 zero | 3 pack | 6 copy | 9 O_DIRECT head | 12 buffered tail | 15 mem | 18 gen
 //        21 i128_read | 24 i128_geom | 27 segs iterated | 28 segs <= 64KB
 fn prof_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("G6_LOAD_PROF").as_deref() == Ok("1"))
+    gr8knobs::LOAD_PROF.get()
 }
-pub static PROF: [std::sync::atomic::AtomicU64; 29] = [
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0)];
+#[allow(clippy::declare_interior_mutable_const)]
+const PROF0: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PROF: [std::sync::atomic::AtomicU64; 29] = [PROF0; 29];
 #[inline]
 fn prof_op<F: FnOnce() -> R, R>(base: usize, bytes: u64, f: F) -> R {
     use std::sync::atomic::Ordering::Relaxed;
@@ -168,9 +154,13 @@ impl Loader<'_> {
             read += y - x;
         }
         for s in self.plan.sources(a, b) {
-            use std::sync::atomic::Ordering::Relaxed;
-            PROF[27].fetch_add(1, Relaxed);
-            if s.nbytes <= 65536 { PROF[28].fetch_add(1, Relaxed); }
+            if prof_on() {
+                use std::sync::atomic::Ordering::Relaxed;
+                PROF[27].fetch_add(1, Relaxed);
+                if s.nbytes <= 65536 {
+                    PROF[28].fetch_add(1, Relaxed);
+                }
+            }
             let (x, y) = (s.pack_off.max(a), (s.pack_off + s.nbytes).min(b));
             match s.op {
                 Op::Copy => {
@@ -180,16 +170,18 @@ impl Loader<'_> {
                 }
                 Op::Mem => {
                     let m = &self.plan.mems[s.file];
-                    prof_op(15, y - x, ||
+                    prof_op(15, y - x, || {
                         buf[(x - a) as usize..(y - a) as usize]
-                            .copy_from_slice(&m[(x - s.pack_off) as usize..(y - s.pack_off) as usize]));
+                            .copy_from_slice(&m[(x - s.pack_off) as usize..(y - s.pack_off) as usize])
+                    });
                 }
                 Op::Gen => {
                     let g = &self.plan.gens[s.file];
-                    let m = prof_op(18, y - x, || g.get(self.cache))?;
-                    prof_op(18, y - x, ||
+                    let m = prof_op(18, y - x, || g.get(self.cache, s.pack_off))?;
+                    prof_op(18, 0, || {
                         buf[(x - a) as usize..(y - a) as usize]
-                            .copy_from_slice(&m[(x - s.pack_off) as usize..(y - s.pack_off) as usize]));
+                            .copy_from_slice(&m[(x - s.pack_off) as usize..(y - s.pack_off) as usize])
+                    });
                     g.used(y - x);
                 }
                 Op::Item128 { hidden } => {
@@ -297,9 +289,7 @@ fn run(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant, cache: Option<&
     if prof_on() {
         use std::sync::atomic::Ordering::Relaxed;
         let g = |i: usize| PROF[i].load(Relaxed);
-        let trip = |b: usize| {
-            format!("{:.2}s/{:.2}GB/{}", g(b) as f64 / 1e9, g(b + 1) as f64 / 1e9, g(b + 2))
-        };
+        let trip = |b: usize| format!("{:.2}s/{:.2}GB/{}", g(b) as f64 / 1e9, g(b + 1) as f64 / 1e9, g(b + 2));
         eprintln!("# load-prof zero={} pack={} copy={} direct={} buffered={} mem={} gen={} i128read={} i128geom={} segs={} small={}",
                   trip(0), trip(3), trip(6), trip(9), trip(12), trip(15), trip(18), trip(21), trip(24), g(27), g(28));
     }
@@ -358,8 +348,6 @@ pub unsafe extern "C" fn g6l_v2_plan(base_manifest: *const c_char, base_pack: *c
                                &arg(v2_dir, "v2 dir")?, &arg(slices_dir, "slices dir")?, &arg(widths, "width manifest")?)?;
         let out = arg(out_manifest, "output manifest")?;
         std::fs::write(&out, img.manifest()).map_err(|e| format!("{out}: {e}"))?;
-        let mut img = img;
-        img.cache = gencache::GenCache::from_env(&img.manifest());
         Ok::<_, String>(img)
     })();
     match r {
@@ -400,8 +388,6 @@ pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *con
                 eprintln!("#   {line}");
             }
         }
-        let mut img = img;
-        img.cache = gencache::GenCache::from_env(&img.manifest());
         Ok::<_, String>(img)
     })();
     match r {

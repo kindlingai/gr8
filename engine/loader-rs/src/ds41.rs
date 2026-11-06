@@ -1049,7 +1049,7 @@ pub fn plan_from(rel: &Release, nr: usize, rank: usize, opts: &Opts) -> Result<D
     let (b, reads) = (p.b, p.reads);
     let bytes = b.cur.div_ceil(4096) * 4096;
     let plan = Plan::from_segs(b.files, b.segs, b.mems, b.gens, bytes)?;
-    Ok(Ds41Plan { img: V2Image { rank, tensors: b.tensors, bytes, plan }, engram, reads })
+    Ok(Ds41Plan { img: V2Image { rank, tensors: b.tensors, bytes, plan, cache: None }, engram, reads })
 }
 
 // ---------------------------------------------------------------------------------------------------- mx4g records
@@ -1353,7 +1353,14 @@ pub unsafe extern "C" fn g6l_ds41_plan(release_dir: *const c_char, nr: u32, rank
         std::fs::write(&out, manifest_json(&p.img, &zeros, nr as usize)).map_err(|e| format!("{out}: {e}"))?;
         let out = arg(out_engram, "Engram output")?;
         std::fs::write(&out, engram_json(&p.engram, nr as usize, rank as usize)).map_err(|e| format!("{out}: {e}"))?;
-        Ok::<_, String>(p.img)
+        // GR8_GEN_CACHE (gencache.rs): the key binds the engine binary, the planned manifest (tensor names, offsets,
+        // sizes), the plan options and the release directory (its name carries the release revision).
+        let mut img = p.img;
+        let key_text = format!("ds41 release={} nr={nr} rank={rank} head_mx={} manifest={:?}\n{}",
+                               arg(release_dir, "release dir")?, opts.head_mx, opts.manifest,
+                               manifest_json(&img, &zeros, nr as usize));
+        img.cache = crate::gencache::GenCache::from_env(&key_text);
+        Ok::<_, String>(img)
     })();
     match r {
         Ok(img) => Box::into_raw(Box::new((img, t0))) as *mut c_void,

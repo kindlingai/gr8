@@ -1,9 +1,9 @@
-//! G6_GEN_CACHE: disk cache of Op::Gen outputs (engine/loader-rs). The generators are pure functions of the
+//! GR8_GEN_CACHE: disk cache of Op::Gen outputs (engine/loader-rs). The generators are pure functions of the
 //! release files, TP width, rank and options, so their outputs can be computed once and read afterwards: the
 //! OWN=3 full-head QO tensors alone cost ~600 s of thread-time per rank on every boot (cu-fastboot, 11-06).
 //! The cache key binds the engine binary (sha256 of /proc/self/exe) and the planned manifest (xxh64), so any
 //! rebuild or release/plan change is an automatic miss. Every read is verified (key, size, xxh64); any miss
-//! or error falls back to computing, and the boot proceeds unchanged. G6_GEN_CACHE unset = old behavior.
+//! or error falls back to computing, and the boot proceeds unchanged. GR8_GEN_CACHE unset = old behavior.
 
 use crate::sha256::Sha256;
 use crate::xxh64::xxh64;
@@ -40,11 +40,18 @@ fn engine_id() -> &'static str {
     })
 }
 
+/// A key dir name: <16 hex engine id>-<16 hex manifest xxh64>. prune_old removes only these, so a GR8_GEN_CACHE set to
+/// a wrong directory (e.g. /root) never loses other directories.
+fn is_key_name(n: &str) -> bool {
+    let b = n.as_bytes();
+    b.len() == 33 && b[16] == b'-' && b.iter().enumerate().all(|(i, c)| i == 16 || c.is_ascii_hexdigit())
+}
+
 impl GenCache {
-    /// From G6_GEN_CACHE plus the planned manifest. None when the env is unset or empty: cache off.
+    /// From GR8_GEN_CACHE plus the planned manifest (the key text). None when the env is unset or empty: cache off.
     /// Old key dirs of other builds are pruned to the newest two (each rebuild makes a new ~17 GB dir).
     pub fn from_env(manifest: &str) -> Option<GenCache> {
-        let dir = std::env::var("G6_GEN_CACHE").ok().filter(|s| !s.is_empty())?;
+        let dir = gr8knobs::GEN_CACHE.get().filter(|s| !s.is_empty())?.to_string();
         let key = format!("{}-{:016x}", engine_id(), xxh64(&[manifest.as_bytes()], 0));
         let c = GenCache {
             dir: PathBuf::from(&dir),
@@ -65,7 +72,7 @@ impl GenCache {
         let Ok(rd) = std::fs::read_dir(&self.dir) else { return };
         let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = rd
             .flatten()
-            .filter(|e| e.path().is_dir())
+            .filter(|e| e.path().is_dir() && is_key_name(&e.file_name().to_string_lossy()))
             .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
             .collect();
         if dirs.len() <= keep {
@@ -77,12 +84,12 @@ impl GenCache {
         }
     }
 
-    /// <dir>/<key>/<what sanitized>.{bin,meta}
+    /// <dir>/<key>/<what sanitized>.{bin,meta}; callers pass "@<image offset hex>-<tensor>" so every entry is unique
     fn paths(&self, what: &str) -> (PathBuf, PathBuf) {
         let name: String = what
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
-            .take(120)
+            .take(160)
             .collect();
         let base = self.dir.join(&self.key).join(name);
         (PathBuf::from(format!("{}.bin", base.display())), PathBuf::from(format!("{}.meta", base.display())))
@@ -142,5 +149,17 @@ impl GenCache {
             self.written.load(Ordering::Relaxed),
             self.written_bytes.load(Ordering::Relaxed) as f64 / 1e9
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn prune_touches_key_dirs_only() {
+        assert!(super::is_key_name("0123456789abcdef-fedcba9876543210"));
+        for n in ["models", "ds41gencache", "0123456789abcdef-fedcba987654321", "0123456789abcdefxfedcba9876543210",
+                  "?-fedcba9876543210", "0123456789abcdeg-fedcba9876543210"] {
+            assert!(!super::is_key_name(n), "{n}");
+        }
     }
 }

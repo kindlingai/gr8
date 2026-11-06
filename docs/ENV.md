@@ -348,6 +348,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_DS_SUBDUMP` | path | off |  | Debug: a directory where each step's sub-layer partials are written. |
 | `GR8_DS_XTRACE` | flag | `0` | 0\|1 | With GR8_XTRACE=1 and DSpark, also trace the DSpark draft fabric. |
 | `GR8_FABRIC_CONNECT_TRIES` | int | `1200` |  | Fabric TCP connect attempts, 100 ms apart. Raise it when ranks load at different speeds. |
+| `GR8_GEN_CACHE` | path | no cache: every boot computes the loader's generated tensors |  | A directory where the Rust loader keeps the tensors it computes at load (Op::Gen), read back on the next boot instead of computed. The key binds the engine binary and the planned image, so a rebuild or another plan is a miss; every read is checked (key, size, xxh64), and any miss or error computes as before. The first boot writes them. |
 | `GR8_GLM53F_DRAFT_CACHE_DUMP` | path | unset |  | Flash with --mtp: each rank writes its draft cache pages before the first live draft to this path plus .s<seq>.r<rank>.bin. |
 | `GR8_GLM53F_KDA_STATE_DUMP` | path | unset |  | After each offline sequence, each rank writes the KDA S state and conv state of every layer to PATH.rank<R>. |
 | `GR8_GLM53F_KV_CRASH_AT` | text | unset | begun\|synced\|released | Ends the process at that ledger point of a chunk resize (flash_kv.h). |
@@ -374,6 +375,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_LOADER` | text | the Rust loader | cpp | cpp loads a pack through the C++ path instead of the Rust loader. |
 | `GR8_LOAD_CHUNK_MB` | int | `32` | 1.. | Sets the chunk size in MB that the Rust loader reads and the weight check sums. |
 | `GR8_LOAD_MODE` | text | `read` | read\|mmap | Picks how the Rust loader reads weight files: read or mmap. Other values fail the load. |
+| `GR8_LOAD_PROF` | flag | `0` | 0\|1 | 1 = the Rust loader prints one load-prof line at the end of the load: time, bytes and calls per operation (zero fill, copies, O_DIRECT and buffered reads, generated tensors). Same bytes. |
 | `GR8_LOAD_THREADS` | int | `8` | 1.. | Sets the number of Rust loader worker threads. |
 | `GR8_LOGIT_DUMP` | path | unset |  | Offline runs write each main step's head logits (each rank's vocab slice) to PATH.rank<R>, with a header. Not with --serve. |
 | `GR8_LOGIT_DUMP_FROM` | int | `0` |  | Main-step dumps (GR8_LOGIT_DUMP, GR8_RESID_DUMP) start at this step. |

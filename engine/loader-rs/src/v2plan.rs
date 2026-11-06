@@ -32,7 +32,7 @@ pub struct V2Image {
     pub tensors: Vec<Tensor>,
     pub bytes: u64,
     pub plan: Plan,
-    /// G6_GEN_CACHE (loader-rs/gencache.rs): set by the C entry point after planning; None = cache off.
+    /// GR8_GEN_CACHE (loader-rs/gencache.rs): set by the C entry point after planning; None = cache off.
     pub cache: Option<crate::gencache::GenCache>,
 }
 

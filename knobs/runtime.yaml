@@ -7,6 +7,14 @@ knobs:
     default: "1200"
     doc: >-
       Fabric TCP connect attempts, 100 ms apart. Raise it when ranks load at different speeds.
+  GR8_GEN_CACHE:
+    scope: local
+    kind: path
+    unset: "no cache: every boot computes the loader's generated tensors"
+    doc: >-
+      A directory where the Rust loader keeps the tensors it computes at load (Op::Gen), read back on the next boot
+      instead of computed. The key binds the engine binary and the planned image, so a rebuild or another plan is a miss;
+      every read is checked (key, size, xxh64), and any miss or error computes as before. The first boot writes them.
   GR8_IMG_VMM:
     scope: local
     kind: int
@@ -35,6 +43,14 @@ knobs:
     values: "read|mmap"
     doc: >-
       Picks how the Rust loader reads weight files: read or mmap. Other values fail the load.
+  GR8_LOAD_PROF:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      1 = the Rust loader prints one load-prof line at the end of the load: time, bytes and calls per operation (zero
+      fill, copies, O_DIRECT and buffered reads, generated tensors). Same bytes.
   GR8_LOAD_THREADS:
     scope: local
     kind: int

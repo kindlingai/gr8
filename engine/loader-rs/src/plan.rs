@@ -44,9 +44,11 @@ impl Gen {
         }
     }
 
-    /// The bytes, computing them on first use. With a cache (G6_GEN_CACHE, gencache.rs): read the verified
+    /// The bytes, computing them on first use. With a cache (GR8_GEN_CACHE, gencache.rs): read the verified
     /// cache entry instead; on any miss compute and write. The state mutex keeps one worker per gen either way.
-    pub fn get(&self, cache: Option<&crate::gencache::GenCache>) -> Result<Arc<Vec<u8>>, String> {
+    /// `at` = the image offset of this tensor's byte 0 (its sources' pack_off): with the planned manifest in the cache
+    /// key it names the entry uniquely; `what` alone does not (DS41 splits one tensor name into several Gen pieces).
+    pub fn get(&self, cache: Option<&crate::gencache::GenCache>, at: u64) -> Result<Arc<Vec<u8>>, String> {
         let t_lock = std::time::Instant::now();
         let mut s = self.state.lock().unwrap();
         let lock_ns = t_lock.elapsed().as_nanos() as u64;
@@ -59,7 +61,7 @@ impl Gen {
             return Err(format!("{}: computed twice", self.what));
         }
         if let Some(c) = cache {
-            if let Some(bytes) = c.read(&self.what, self.nbytes) {
+            if let Some(bytes) = c.read(&format!("@{at:x}-{}", self.what), self.nbytes) {
                 use std::sync::atomic::Ordering::Relaxed;
                 c.hits.fetch_add(1, Relaxed);
                 c.hit_bytes.fetch_add(self.nbytes, Relaxed);
@@ -77,7 +79,7 @@ impl Gen {
             return Err(format!("{}: {} bytes computed, {} planned", self.what, v.len(), self.nbytes));
         }
         if let Some(c) = cache {
-            c.write(&self.what, &v);
+            c.write(&format!("@{at:x}-{}", self.what), &v);
         }
         let a = Arc::new(v);
         *s = Some(a.clone());
