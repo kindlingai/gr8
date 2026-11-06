@@ -578,7 +578,10 @@ public:
         require(native_.pool.pool, "the service needs the rank's pool");
         require(!native_.module.ctx || !(native_.bind || native_.bind_request || native_.grown || native_.retire || native_.fence ||
                                          native_.before_work || native_.drained || native_.resize || native_.shrink ||
-                                         native_.flash_room || native_.pool.retain || native_.pool.park || native_.dispatch.launch),
+                                         native_.flash_room || native_.pool.retain || native_.pool.park || native_.dispatch.launch ||
+                                         native_.dispatch.bucket || native_.dispatch.mode || native_.dispatch.prefill ||
+                                         native_.dispatch.logprob || native_.dispatch.dfl_ok || native_.dispatch.dfl_start ||
+                                         native_.dispatch.dfl || native_.dispatch.draft_lp),
                 "a module table and module hooks together");
         const g6s2_module_ops& m = mod_.o;
         require(bool(native_.pool.free_pages) && bool(native_.pool.room) && bool(native_.pool.reserve) && bool(native_.pool.fits) &&

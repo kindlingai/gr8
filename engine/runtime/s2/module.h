@@ -22,7 +22,9 @@ static_assert(sizeof(s2::DflReq) == sizeof(g6s2_dfl_req) && offsetof(s2::DflReq,
               sizeof(s2::DflDrafts) == sizeof(g6s2_dfl_drafts), "DflReq layout");
 static_assert(sizeof(g6rt::CacheNamespace) == G6KV_NAMESPACE_BYTES, "cache namespace size");
 
-/// The base of every module context: ModuleOps::ctx points at it, and it holds the exception a call threw.
+/// The base of every module context: ModuleOps::ctx points at it, and it holds the exception a call threw. Module calls
+/// never overlap: the head's control thread calls the module only inside the event-boundary pause. A call moved off the
+/// pause needs its own error slot.
 struct ModuleCtx { std::exception_ptr err; };
 
 namespace mod {

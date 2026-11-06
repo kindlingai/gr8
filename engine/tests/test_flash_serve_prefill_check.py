@@ -1,4 +1,4 @@
-"""Compile the actual serve prefill lambda against CPU mocks: where its fences and error checks fall.
+"""Compile the actual serve prefill (FlashModule::on_prefill) against CPU mocks: where its fences and error checks fall.
 
 The draft's cache fill (default) checks once after the last chunk; the GR8_GLM53F_DRAFT_KV=0 draft step checks after the
 main prefill and after every chunk, as before. Every case: an error word set by the main prefill or by any draft chunk
@@ -16,9 +16,13 @@ import tempfile
 
 def main():
     source = (Path(__file__).resolve().parents[1] / 'runtime/s2/flash_native.cuh').read_text()
-    start = source.index('    h.dispatch.prefill = [&](')
-    prefill = source[start:source.index('\n    };', start) + len('\n    };')]
-    prefill = prefill.replace('h.dispatch.prefill = [&]', 'auto prefill = [&]', 1)
+    # FlashModule::on_prefill, the serve's prefill, as a lambda: its body names the module's captures, which the mock
+    # declares as locals
+    head = '        void on_prefill(const Slot& slot, const Payload& p, uint32_t first, uint32_t rows) {'
+    start = source.index(head)
+    end = source.index('\n        }\n', start) + len('\n        }')
+    prefill = source[start:end].replace(head, '    auto prefill = [&](const Slot& slot, const Payload& p, uint32_t first, uint32_t rows) {', 1)
+    prefill += ';'
     program = r'''
 #include <algorithm>
 #include <cassert>
