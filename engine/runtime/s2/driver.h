@@ -48,7 +48,11 @@ struct DriverHooks {
     std::function<void(Key, const s2::Stats&)> terminal;
     // optional: before a round, a decoding session's run grows to cover `rows` (round_rows). The run, perhaps the same,
     // or nothing: the pages would leave the pool unsafe and the session sits this round out. Every rank, same order.
+    // Not with DriverPool::grow, where the driver grows the run in the pool itself
     std::function<std::optional<Run>(const Slot&, uint64_t rows)> grow;
+    // optional, with DriverPool::grow: a decoding session's run grew before a round (the slot as it was, its new run);
+    // the engine's tables take the new pages. Every rank, same order
+    std::function<void(const Slot&, const Run&)> grown;
     // optional: a session finished at this step (now Retiring): its pages go back to the pool now, on every rank, so
     // the sessions still decoding can grow before the next event fence frees the slot
     std::function<void(const Slot&)> finished;
@@ -65,6 +69,12 @@ struct DriverHooks {
     // DS41 prefill pack: one native pass for the ordered segments, never N solo hooks.
     std::function<void(const std::vector<PrefillPart>&)> prefill_pack;
 };
+// The pool calls the Rust driver makes itself on the rank's pool (pool.h RunPool::handle; the pool must outlive the
+// Driver), each under the pool's lock for that call alone and with no hook running. grow: runs grow before a round
+// (then DriverHooks::grown). shrink: a worker's half of a shrink commit, checked against the head's, before the shrink
+// hook. release: a session's run goes back when it leaves (no prefix reuse: retain and park stay in the retire and
+// finished hooks). head: this rank made the commit's cancel and shrink calls itself when it built the commit
+struct DriverPool { g6kv_pool* pool = nullptr; bool grow = false, shrink = false, release = false, head = false; };
 class Driver {
     struct Impl {
         Config cfg;                        // the C++ copy: the Rust's scalars and the steering receipt the digest reads
@@ -164,6 +174,9 @@ class Driver {
                 if ((*some = bool(r))) std::memcpy(out, &*r, sizeof *out);
             });
         }
+        static int32_t t_grown(void* c, const g6sch_slot* s, const g6sch_run* r) noexcept {
+            Impl& m = of(c); return m.guard([&] { m.hooks.grown(m.live(s), *sch::c<Run>(r)); });
+        }
         static int32_t t_finished(void* c, const g6sch_slot* s) noexcept {
             Impl& m = of(c); return m.guard([&] { m.hooks.finished(m.live(s)); });
         }
@@ -220,21 +233,25 @@ class Driver {
     std::unique_ptr<Impl> m_;   // on the heap: the Rust holds its address, so a moved Driver keeps working
     bool initialized(unsigned slot) const { return g6s2_driver_initialized(m_->rs.get(), slot); }
 public:
-    Driver(Config c, DriverHooks h) : m_(new Impl(c, std::move(h))) {
+    Driver(Config c, DriverHooks h, DriverPool pool = {}) : m_(new Impl(c, std::move(h))) {
         Impl& m = *m_;
         m.batch.adapt(s2::adapt_env());
         m.batch.set_mtp_sessions(int(c.mtp_sessions));
         m.batch.set_sess_drafts(c.sess_drafts);
         const DriverHooks& k = m.hooks;
         require(bool(k.bind) && bool(k.retire) && bool(k.prefill) && bool(k.run) && bool(k.emit), "missing driver callback");
+        require(pool.pool || !(pool.grow || pool.shrink || pool.release), "driver pool calls without a pool");
+        require(!(pool.grow && k.grow), "the grow hook and the driver's pool growth together");
         const g6s2_drv_hooks hooks{&m, Impl::t_bind, Impl::t_retire, Impl::t_prefill, Impl::t_prefill_pack, Impl::t_dfl_ok,
                                    Impl::t_terminal, Impl::t_grow, Impl::t_finished, Impl::t_resize, Impl::t_shrink,
-                                   Impl::t_settle, Impl::t_payload, bool(k.prefill_pack), bool(k.dfl_ok), bool(k.terminal),
-                                   bool(k.grow), bool(k.finished), bool(k.resize), bool(k.shrink), bool(k.settle)};
+                                   Impl::t_settle, Impl::t_payload, Impl::t_grown, bool(k.prefill_pack), bool(k.dfl_ok),
+                                   bool(k.terminal), bool(k.grow), bool(k.finished), bool(k.resize), bool(k.shrink),
+                                   bool(k.settle), bool(k.grown)};
         const g6s2_drv_planner planner{&m, Impl::t_admit, Impl::t_admit_pack, Impl::t_round, Impl::t_demote, Impl::t_promote,
                                        Impl::t_release, Impl::t_length, Impl::t_finished_q, Impl::t_active, Impl::t_inserted};
         const Slot empty{};
-        m.rs.reset(g6s2_driver_new(&hooks, &planner, &m.cfg, MAX_SESSIONS, sch::c<g6sch_slot>(&empty)));
+        const g6s2_drv_pool use{pool.grow, pool.shrink, pool.release, pool.head};
+        m.rs.reset(g6s2_driver_new(&hooks, &planner, &m.cfg, MAX_SESSIONS, sch::c<g6sch_slot>(&empty), pool.pool, &use));
         require(bool(m.rs), "missing driver callback");
         g6s2_drv_view v;
         g6s2_driver_view(m.rs.get(), &v);

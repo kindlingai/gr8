@@ -112,6 +112,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         for (int r = 0; r < si.M; ++r) e = std::max(e, si.pos[r] + 1);
         wrote(e);
     };
+    h.pool.pool = &pool;   // the driver releases runs on it itself when nothing is retained
     h.pool.free_pages = [&] { return pool.free_pages(); };
     h.pool.room = [&] { return pool.room(); };
     h.pool.reserve = [&](uint64_t n, uint64_t worst, uint32_t r) { return pool.reserve(n, worst, r); };

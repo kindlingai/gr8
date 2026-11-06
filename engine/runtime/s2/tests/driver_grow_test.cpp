@@ -1,6 +1,6 @@
 // Growth on demand through Driver::step (driver.h) and the Rust pool (s2/pool.h): runs start with their prompt + 1 +
 // guard rows, grow before each round, sit a round out when the pool would be unsafe, and give their pages back when
-// they finish. Every request must emit exactly what it emits alone, no step may touch a row past its session's pages,
+// they finish. The driver makes those pool calls itself (DriverPool), as the service's does. Every request must emit exactly what it emits alone, no step may touch a row past its session's pages,
 // and two ranks driven by the same events must agree on every digest. A third of the requests carry an insert rule
 // (s2_batch.h): their tokens must be the solo run's with the same rule, the growth must cover the inserted tokens' rows,
 // and a rank that misses the rule must disagree at the next digest after it fires. Host only.
@@ -38,7 +38,7 @@ struct Rank {
     RunPool pool;
     std::unique_ptr<Driver> d;
     std::map<uint64_t, std::vector<int>> out;   // request id -> emitted tokens
-    long steps = 0, outside = 0;
+    long steps = 0, outside = 0, grown = 0;
     Rank(const Config& cfg, uint32_t pages) : c(cfg), pool(pages, pages, pages * 64) {
         DriverHooks h;
         h.bind = [](const Grant&) {};
@@ -63,9 +63,8 @@ struct Rank {
             o.insert(o.end(), ids, ids + c);
             return Emission{uint32_t(c), o.size() == s.req.max_tokens};
         };
-        h.grow = [this](const Slot& s, uint64_t rows) { return pool.grow(s.run, rows); };
-        h.finished = [this](const Slot& s) { pool.release(s.run); };
-        d = std::make_unique<Driver>(c, h);
+        h.grown = [this](const Slot& s, const Run& r) { if (r.table_version != s.run.table_version) ++outside; ++grown; };
+        d = std::make_unique<Driver>(c, h, DriverPool{pool.handle(), true, false, true, true});
     }
 };
 
@@ -195,6 +194,7 @@ int main()
         CHECK(a.outside == 0);
         const auto st = a.pool.stats();
         CHECK(st.live_runs == 0 && st.held_pages == 0);
+        CHECK(a.grown == long(st.grows));   // the grown hook once a growth, after the driver's pool call
         total_stalls += long(st.stalls); total_grows += long(st.grows);
     }
     CHECK(total_stalls > 0 && total_grows > 0 && max_live >= 3 && inserts > 20 && blind_caught > 10);

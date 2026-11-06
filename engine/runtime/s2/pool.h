@@ -36,6 +36,8 @@ public:
     RunPool(const RunPool&) = delete;
     RunPool& operator=(const RunPool&) = delete;
     ~RunPool() { g6kv_free(p_); }
+    // the pool for the Rust driver's own calls (driver.h DriverPool), which lock it per call as these do
+    g6kv_pool* handle() const { return p_; }
     // r: the R a grant takes, in rows (0 = the pool's). With window() on it may be a smaller multiple of 64
     bool exclusive(uint64_t rows, uint32_t r = 0) const {
         const int x = g6kv_exclusive_r(p_, rows, r); require(x >= 0, "pool R the pool cannot lay out"); return x;
