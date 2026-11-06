@@ -1,7 +1,7 @@
 // C interface of the Rust S2 page allocator (engine/kvman-rs). Built as libg6kvman.a with cargo. g6m4 links it, and
 // engine/runtime/s2/pool.h (RunPool) wraps it. See src/lib.rs for the allocation rules.
 // Calls that can fail return 0 or an error code, which g6kv_error names (the C++ pool's messages). An error leaves the
-// pool unchanged.
+// pool unchanged. Each call on a g6kv_pool locks it for that call, so two threads may call at once.
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -62,8 +62,9 @@ int g6kv_reserve(g6kv_pool* p, uint64_t rows, uint64_t worst, g6kv_run* out);
 // the pages would leave the pool unsafe
 int g6kv_grow(g6kv_pool* p, const g6kv_run* r, uint64_t rows, g6kv_run* out, int* granted);
 int g6kv_release(g6kv_pool* p, const g6kv_run* r);
-// a live run's pages in table order, valid until the next call that changes the pool, and whether it is exclusive
-int g6kv_list(const g6kv_pool* p, const g6kv_run* r, const uint32_t** pages, size_t* n, int* exclusive);
+// a live run's pages in table order, up to cap of them copied into pages (NULL with cap 0), n = the run's length (may
+// exceed cap), and whether it is exclusive
+int g6kv_list(const g6kv_pool* p, const g6kv_run* r, uint32_t* pages, size_t cap, size_t* n, int* exclusive);
 
 // prefix reuse on, with PrefixReuse's strict / noend / grid rules
 void g6kv_keep(g6kv_pool* p, int strict, int noend, int32_t grid);
