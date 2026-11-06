@@ -36,6 +36,7 @@ public:
         struct Ctx { Digest& digest; const std::function<uint32_t()>& room; std::exception_ptr err; } ctx{digest, room, nullptr};
         auto fn = [](void* p, uint64_t* d, uint32_t* r) -> int32_t {
             auto& c = *static_cast<Ctx*>(p);
+            // digest before room: both only read the engine (flash_room), so the order does not matter today
             try { *d = c.digest(); *r = c.room ? c.room() : UINT32_MAX; return 0; }
             catch (...) { c.err = std::current_exception(); return 1; }
         };

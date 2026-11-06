@@ -209,7 +209,7 @@ pub fn set_user_timeout(fd: c_int, ms: u32) -> bool {
 /// The constants and layouts above, by index (g6sched.h G6CTL_SYS_*), for the C++ to compare with its headers.
 pub fn constant(what: u32) -> i64 {
     use std::mem::{offset_of, size_of};
-    let v: [i64; 39] = [
+    let v: [i64; 43] = [
         AF_INET.into(),
         SOCK_STREAM.into(),
         SOL_SOCKET.into(),
@@ -249,6 +249,10 @@ pub fn constant(what: u32) -> i64 {
         size_of::<timeval>() as i64,
         offset_of!(timeval, tv_usec) as i64,
         size_of::<pollfd>() as i64,
+        offset_of!(pollfd, events) as i64,
+        offset_of!(pollfd, revents) as i64,
+        size_of::<socklen_t>() as i64,
+        size_of::<nfds_t>() as i64,
     ];
     v.get(what as usize).copied().unwrap_or(i64::MIN)
 }

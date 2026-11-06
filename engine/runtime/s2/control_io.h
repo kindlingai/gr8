@@ -40,7 +40,8 @@ inline void check_sys() {
             sock_cloexec, sock_nonblock, nosigpipe, O_NONBLOCK, F_GETFL, F_SETFL, F_SETFD, FD_CLOEXEC, EINTR, EAGAIN,
             EWOULDBLOCK, EINPROGRESS, ECONNREFUSED, POLLIN, POLLOUT, POLLNVAL, SHUT_RDWR, sizeof(sockaddr_in),
             offsetof(sockaddr_in, sin_family), offsetof(sockaddr_in, sin_port), offsetof(sockaddr_in, sin_addr),
-            sizeof(timeval), offsetof(timeval, tv_usec), sizeof(pollfd)};
+            sizeof(timeval), offsetof(timeval, tv_usec), sizeof(pollfd), offsetof(pollfd, events),
+            offsetof(pollfd, revents), sizeof(socklen_t), sizeof(nfds_t)};
         static_assert(sizeof want / sizeof want[0] == G6CTL_SYS_N, "one value per G6CTL_SYS_*");
         for (uint32_t i = 0; i < G6CTL_SYS_N; ++i) if (g6ctl_sys(i) != want[i]) return false;
         return true;
