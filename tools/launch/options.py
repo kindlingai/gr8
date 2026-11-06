@@ -321,6 +321,36 @@ def penalty_spec_error(spec):
     return None
 
 
+def boost_spec_error(spec):
+    """Why `spec` is not a think-end boost spec (the front end's sampling.rs BoostSpec::parse), or None:
+    start=S,per1k=P,max=M, S a token count or a fraction like 0.5x, P 0 or more, M 0 to 20, each key once."""
+    seen = set()
+    for part in spec.split(','):
+        key, sep, value = part.partition('=')
+        key, value = key.strip(), value.strip()
+        if not sep or key not in ('start', 'per1k', 'max'):
+            return f'{part.strip()!r}: want start=, per1k= or max='
+        if key in seen:
+            return f'{key} is given twice'
+        seen.add(key)
+        if key == 'start' and value.endswith('x'):
+            value = value[:-1]
+            lo, hi = 0, 1
+        elif key == 'start':
+            if not value.isdigit():
+                return f'start={value!r}: want a token count or a fraction like 0.5x'
+            continue
+        else:
+            lo, hi = (0, math.inf) if key == 'per1k' else (0, 20)
+        try:
+            v = float(value)
+        except ValueError:
+            return f'{key}={value!r} is not a number'
+        if math.isnan(v) or not lo <= v <= hi:
+            return f'{key}={value}: want {lo} to {hi}'
+    return None
+
+
 def validate(o):
     """Refuse what this version cannot boot, with the reason."""
     if not o.get('GR8_MODEL'):
@@ -386,6 +416,10 @@ def validate(o):
         err = penalty_spec_error(str(o.get(k)))
         if err:
             raise OptionError(f'--{k.lower().replace("_", "-")} {o.get(k)}: {err}')
+    if o.get('DEFAULT_THINK_END_BOOST') is not None:
+        err = boost_spec_error(o.get('DEFAULT_THINK_END_BOOST'))
+        if err:
+            raise OptionError(f'--default-think-end-boost {o.get("DEFAULT_THINK_END_BOOST")}: {err}')
     if o.get('TOOL_REPEAT_GUARD') not in ('0', '1'):
         raise OptionError(f'--tool-repeat-guard {o.get("TOOL_REPEAT_GUARD")}: want 0 or 1')
     if not (str(o.get('TOOL_REPEAT_GUARD_REPEATS')).isdigit() and int(o.get('TOOL_REPEAT_GUARD_REPEATS')) >= 1):

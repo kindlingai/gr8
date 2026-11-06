@@ -68,6 +68,15 @@ static void row_logic() {
     const int drafts[] = {3, 50, 4};
     CHECK(g6rt::pen_in_think(50, drafts, 0) && g6rt::pen_in_think(50, drafts, 1) && !g6rt::pen_in_think(50, drafts, 2) && !g6rt::pen_in_think(50, drafts, 3));
     CHECK(!g6rt::pen_in_think(-1, drafts, 0) && g6rt::pen_in_think(7, drafts, 3));
+    // the think-end boost: 0 through start, per1k a thousand tokens past it, capped at max, and off at per1k 0
+    CHECK(g6rt::pen_boost(0, 4096, 2.f, 10.f) == 0.f && g6rt::pen_boost(4096, 4096, 2.f, 10.f) == 0.f);
+    CHECK(g6rt::pen_boost(4097, 4096, 2.f, 10.f) == 2.f * 1.f / 1000.f);
+    CHECK(g6rt::pen_boost(4596, 4096, 2.f, 10.f) == 2.f * 500.f / 1000.f);
+    CHECK(g6rt::pen_boost(9096, 4096, 2.f, 10.f) == 10.f && g6rt::pen_boost(100000, 4096, 2.f, 10.f) == 10.f);
+    CHECK(g6rt::pen_boost(5000, 4096, 0.f, 10.f) == 0.f && g6rt::pen_boost(5, 0, 1.f, 0.f) == 0.f);
+    // the kernel's n for row first + k: the committed thinking tokens plus k drafts, so a verify row at draft 3 sees
+    // what a step alone at that position would (think_n + 3)
+    CHECK(g6rt::pen_boost(4096 + 3, 4096, 2.f, 10.f) == g6rt::pen_boost(4099, 4096, 2.f, 10.f));
 }
 
 static const std::string header = "n_gen 20 temp 0 seed 1 min 0 stop 99 top_p 1";
@@ -145,9 +154,10 @@ static void tables() {
 }
 // the thinking penalties: the row table carries the close while the block is open, and a committed close ends it
 static void thinking() {
-    const auto think = request(" pen 0.5 0 1.5 -0.25 50"), closed = request(" pen 0 0 1.5 0 -1");
+    const auto think = request(" pen 0.5 0 1.5 -0.25 50 boost 4 2 10"), closed = request(" pen 0 0 1.5 0 -1");
     CHECK(think.tpresence == 1.5f && think.tfrequency == -0.25f && think.think_end == 50 && closed.think_end == -1);
-    CHECK(throws([] { request(" pen 0 0 2.5 0 50"); }));
+    CHECK(think.boost_start == 4 && think.boost_per1k == 2.f && think.boost_max == 10.f);
+    CHECK(throws([] { request(" pen 0 0 2.5 0 50"); }) && throws([] { request(" boost 1 2 21"); }));
     Config c; c.epoch = 9; c.max_rows = 24;
     Sessions sessions(c, "", false, 4);
     Grant g0{{9, 0, 1}, Sessions::request(1, think), {0, 1, 1}, 0};
@@ -164,6 +174,8 @@ static void thinking() {
     s2::Step verify; add(verify, 0, 8, 3, 11); add(verify, 1, 8, 3, 11);
     d.run(verify);
     CHECK(rows[0].think_end == 50 && rows[2].think_end == 50 && rows[0].tpresence == 1.5f && rows[0].tfrequency == -0.25f && rows[0].presence == 0.5f);
+    // the boost's n at the sampling row: no thinking token committed yet. The kernel adds the drafts before each row
+    CHECK(rows[0].think_n == 0 && rows[2].think_n == 0 && rows[0].boost_start == 4 && rows[0].boost_per1k == 2.f && rows[0].boost_max == 10.f);
     // a session whose prompt left no block open: the thinking penalties never apply, so its rows carry no close
     CHECK(rows[3].slot == 1 && rows[3].think_end == -1 && rows[3].tpresence == 1.5f);
     // the reply commits the close (a drafted close the verify accepted): the rows after it are outside the block
@@ -173,12 +185,42 @@ static void thinking() {
     s2::Step next; add(next, 0, 11, 3, 12);
     d.run(next);
     CHECK(rows[0].think_end == -1 && rows[0].presence == 0.5f && rows[0].tpresence == 1.5f && sess[0].nnew == 3 && sess[0].news[1] == 50);
+    // the thinking tokens stop counting at the close: 11 and 50 were thinking, 12 was not
+    CHECK(sessions.at(0).think_tokens == 2 && rows[0].think_n == 2);
+}
+// a boost without a penalty: the session is tracked all the same, its rows carry the boost and no coefficients
+static void boost_only() {
+    const auto b = request(" pen 0 0 0 0 50 boost 2 1 5");
+    CHECK(!b.presence && b.boost_per1k == 1.f);
+    Config c; c.epoch = 9; c.max_rows = 24;
+    Sessions sessions(c, "", false, 4);
+    Grant g0{{9, 0, 1}, Sessions::request(1, b), {0, 1, 1}, 0};
+    sessions.bind(g0, b);
+    CHECK(!sessions.at(0).sampling.penalty() && sessions.at(0).sampling.boost() && sessions.at(0).think_open);
+    std::vector<g6rt::PenRow> rows(24); std::vector<g6rt::PenSess> sess(MAX_SESSIONS);
+    DispatchHooks h; h.bucket = [](bool, int) { return 0; }; h.mode = [](int, int) {};
+    h.launch = [&](const Launch& l) { return std::vector<int>(l.step.r.size(), 1); };
+    h.prefill = [](const Slot&, const Payload&, uint32_t, uint32_t) {};
+    h.pen_rows = rows.data(); h.pen_sess = sess.data();
+    Dispatch d(sessions, 24, h);
+    d.begin(0, 0);
+    const int t1[] = {11, 12, 13};
+    sessions.emit({9, 0, 1}, t1, 3, 0, {});
+    s2::Step verify; add(verify, 0, 11, 3, 14);
+    d.run(verify);
+    CHECK(rows[0].slot == 0 && rows[0].think_end == 50 && rows[0].think_n == 3 && rows[0].boost_start == 2 && rows[0].presence == 0.f && rows[0].tpresence == 0.f);
+    CHECK(sess[0].nnew == 3);   // the counts still sync, so a penalty and a boost share one table
+    // without an open block the boost never applies: the session is not tracked at all
+    const auto nb = request(" pen 0 0 0 0 -1 boost 2 1 5");
+    const Sampling nob{0, 0, 0, -1, -1, 0, 0, 0, 0, -1, 2, 1.f, 5.f};
+    CHECK(!nb.presence && !nob.boost());
 }
 
 int main() {
     row_logic();
     tables();
     thinking();
+    boost_only();
     std::printf(fails ? "penalty_test: %d FAIL\n" : "penalty_test: PASS\n", fails);
     return fails != 0;
 }

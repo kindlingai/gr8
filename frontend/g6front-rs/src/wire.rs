@@ -202,6 +202,8 @@ pub struct GenParams {
     pub thinking_presence_penalty: f64,
     pub thinking_frequency_penalty: f64,
     pub think_end: Option<u32>,
+    /// the think-end boost (PROTOCOL.md), sent when set, with `think_end`
+    pub think_end_boost: Option<crate::sampling::Boost>,
     pub seed: Option<i64>,
     pub stop_ids: Vec<i64>,
     pub logprobs: Option<i64>,
@@ -276,6 +278,7 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
         || p.frequency_penalty != 0.0
         || p.thinking_presence_penalty != 0.0
         || p.thinking_frequency_penalty != 0.0
+        || p.think_end_boost.is_some()
     {
         b.extend_from_slice(b",\"presence_penalty\":");
         pyjson::float(b, p.presence_penalty);
@@ -287,6 +290,15 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
         pyjson::float(b, p.thinking_frequency_penalty);
         b.extend_from_slice(b",\"think_end\":");
         opt_int(b, p.think_end.map(i64::from));
+    }
+    if let Some(t) = &p.think_end_boost {
+        b.extend_from_slice(b",\"think_end_boost\":{\"start\":");
+        pyjson::int(b, t.start);
+        b.extend_from_slice(b",\"per1k\":");
+        pyjson::float(b, t.per1k);
+        b.extend_from_slice(b",\"max\":");
+        pyjson::float(b, t.max);
+        b.push(b'}');
     }
     b.extend_from_slice(b",\"seed\":");
     opt_int(b, p.seed);
@@ -398,6 +410,7 @@ mod tests {
             thinking_presence_penalty: 0.0,
             thinking_frequency_penalty: 0.0,
             think_end: None,
+            think_end_boost: None,
             seed: None,
             stop_ids: vec![1, 2],
             logprobs: Some(3),
@@ -438,6 +451,12 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &pen)[4..]).unwrap();
         assert_eq!((v["presence_penalty"].as_f64(), v["thinking_frequency_penalty"].as_f64()), (Some(0.0), Some(-0.5)));
         assert_eq!(v["think_end"], serde_json::json!(154842));
+        assert!(!v.as_object().unwrap().contains_key("think_end_boost"));
+        let boost = crate::sampling::Boost { start: 4096, per1k: 2.0, max: 10.0 };
+        let pen = GenParams { think_end: Some(154842), think_end_boost: Some(boost), ..p.clone() };
+        let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &pen)[4..]).unwrap();
+        assert_eq!(v["think_end_boost"], serde_json::json!({"start": 4096, "per1k": 2.0, "max": 10.0}));
+        assert_eq!((v["presence_penalty"].as_f64(), v["think_end"].as_u64()), (Some(0.0), Some(154842)));
         let selected =
             GenParams { steering_profile: Some("example".into()), steering_scale: Some(1.1f32 as f64), ..p.clone() };
         let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &selected)[4..]).unwrap();

@@ -1,4 +1,6 @@
-// Presence / frequency penalties (OpenAI's presence_penalty and frequency_penalty, vLLM's semantics). Before a row
+// Presence / frequency penalties (OpenAI's presence_penalty and frequency_penalty, vLLM's semantics), and the think-end
+// boost, a soft thinking budget: inside the think block the </think> logit gains min(max, per1k * (n - start) / 1000)
+// once the reply's n-th thinking token is past start. Before a row
 // samples, the logit of every id the request has generated so far drops by presence + frequency * count. The prompt
 // does not count. The thinking penalties add to those coefficients on the rows inside the think block the prompt left
 // open (until the reply's </think>), over the same counts. s2/dispatch.h writes this layout before each main step.
@@ -36,6 +38,9 @@ struct PenRow
     int think_end;                // the </think> id while the request's think block is open, else -1
     float presence, frequency;    // the whole reply's
     float tpresence, tfrequency;  // added inside the think block
+    int think_n;                  // thinking tokens the session has committed (the boost's n at row `first`)
+    int boost_start;              // the boost (pen_boost): 0 per1k = off
+    float boost_per1k, boost_max;
 };
 // one session slot
 struct PenSess
@@ -47,6 +52,14 @@ struct PenSess
 
 // what a count of c takes off a logit. The caller skips c = 0, so an id never generated keeps its exact logit
 G6_PEN_HD inline float pen_drop(int c, float presence, float frequency) { return presence + frequency * float(c); }
+
+// the think-end boost at thinking token n: 0 up to start, then per1k a thousand tokens, at most max
+G6_PEN_HD inline float pen_boost(int n, int start, float per1k, float max)
+{
+    if (per1k <= 0.f || n <= start) return 0.f;
+    const float b = per1k * float(n - start) / 1000.f;
+    return b < max ? b : max;
+}
 
 // whether a row is inside the think block: the block is open (think_end >= 0) and none of the drafts before the row
 // (d[0..n)) is the close

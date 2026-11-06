@@ -186,6 +186,80 @@ pub struct Penalties {
     pub frequency: PenaltySpec,
 }
 
+/// The think-end boost, a soft thinking budget (`--default-think-end-boost SPEC`, a request's `think_end_boost`):
+/// inside the think block the `</think>` logit gains min(max, per1k * (n - start) / 1000) at the reply's n-th thinking
+/// token. SPEC is `start=S,per1k=P,max=M`: S a token count or a fraction of the request's max_tokens written `0.5x`,
+/// P logits per thousand tokens past S, M the cap (0 to 20). per1k or max 0 = off.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoostSpec {
+    pub start: Start,
+    pub per1k: f64,
+    pub max: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Start {
+    Tokens(u64),
+    /// of the request's max_tokens
+    Fraction(f64),
+}
+
+/// The boost as the engine takes it (PROTOCOL.md `think_end_boost`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Boost {
+    pub start: u64,
+    pub per1k: f64,
+    pub max: f64,
+}
+
+impl BoostSpec {
+    pub fn parse(s: &str) -> Result<BoostSpec, String> {
+        let (mut start, mut per1k, mut max) = (None, None, None);
+        for part in s.split(',') {
+            let (key, value) = part.split_once('=').ok_or_else(|| format!("{part:?}: want key=value"))?;
+            let (key, value) = (key.trim(), value.trim());
+            let num = |t: &str, lo: f64, hi: f64| -> Result<f64, String> {
+                let v: f64 = t.parse().map_err(|_| format!("{key}={t:?} is not a number"))?;
+                if !v.is_finite() || !(lo..=hi).contains(&v) {
+                    return Err(format!("{key}={t}: want {lo} to {hi}"));
+                }
+                Ok(v)
+            };
+            match key {
+                "start" if start.is_some() => return Err("start is given twice".into()),
+                "start" => {
+                    start = Some(match value.strip_suffix('x') {
+                        Some(f) => Start::Fraction(num(f, 0.0, 1.0)?),
+                        None => Start::Tokens(
+                            value
+                                .parse()
+                                .map_err(|_| format!("start={value:?}: want a token count or a fraction like 0.5x"))?,
+                        ),
+                    })
+                }
+                "per1k" if per1k.is_some() => return Err("per1k is given twice".into()),
+                "per1k" => per1k = Some(num(value, 0.0, f64::MAX)?),
+                "max" if max.is_some() => return Err("max is given twice".into()),
+                "max" => max = Some(num(value, 0.0, 20.0)?),
+                _ => return Err(format!("{key:?}: want start, per1k or max")),
+            }
+        }
+        Ok(BoostSpec { start: start.unwrap_or(Start::Tokens(0)), per1k: per1k.unwrap_or(0.0), max: max.unwrap_or(0.0) })
+    }
+
+    /// The boost for a request of `max_tokens`, or None when off.
+    pub fn resolve(&self, max_tokens: u64) -> Option<Boost> {
+        if self.per1k <= 0.0 || self.max <= 0.0 {
+            return None;
+        }
+        let start = match self.start {
+            Start::Tokens(n) => n,
+            Start::Fraction(f) => (f * max_tokens as f64).round() as u64,
+        };
+        Some(Boost { start, per1k: self.per1k, max: self.max })
+    }
+}
+
 pub fn steering(
     body: &Map<String, Value>,
     capability: Option<&Value>,
@@ -348,6 +422,7 @@ pub fn build(
     vocab_size: usize,
     gen_defaults: &Map<String, Value>,
     penalties: &Penalties,
+    boost: Option<&BoostSpec>,
     default_max_tokens: Option<u64>,
     max_logprobs: i64,
     chat: bool,
@@ -484,6 +559,22 @@ pub fn build(
             )
         })
     };
+    // the think-end boost: the request's spec, else the server's. `false` or "off" turns it off
+    let think_end_boost = match body.get("think_end_boost").filter(|v| !v.is_null()) {
+        None => boost.copied(),
+        Some(Value::Bool(false)) => None,
+        Some(Value::String(s)) if s == "off" => None,
+        Some(Value::String(s)) => Some(
+            BoostSpec::parse(s).map_err(|e| ApiError::bad(format!("think_end_boost: {e}"), Some("think_end_boost")))?,
+        ),
+        Some(_) => {
+            return Err(ApiError::bad(
+                "think_end_boost must be a string like \"start=0.5x,per1k=2,max=10\", \"off\" or false",
+                Some("think_end_boost"),
+            ))
+        }
+    }
+    .and_then(|b| b.resolve(max_tokens as u64));
     let presence = resolve(&penalties.presence, "presence_penalty", "thinking_presence_penalty")?;
     let frequency = resolve(&penalties.frequency, "frequency_penalty", "thinking_frequency_penalty")?;
     let (presence_penalty, thinking_presence_penalty) = (presence.out, presence.extra());
@@ -541,6 +632,7 @@ pub fn build(
             thinking_presence_penalty,
             thinking_frequency_penalty,
             think_end: None,
+            think_end_boost,
             seed,
             stop_ids,
             logprobs: lp.map(|v| v as i64),
@@ -575,6 +667,7 @@ mod tests {
             VOCAB,
             &Map::new(),
             &Penalties::default(),
+            None,
             Some(16),
             20,
             false,
@@ -616,6 +709,7 @@ mod tests {
             VOCAB,
             &Map::new(),
             &Penalties::default(),
+            None,
             default,
             20,
             true,
@@ -638,7 +732,7 @@ mod tests {
         let d: Map<String, Value> = serde_json::from_str(defaults).unwrap();
         let one = PenaltySpec::parse(spec).unwrap();
         let pen = Penalties { presence: one, frequency: one };
-        let p = build(&m, body.as_bytes(), 10, 4096, &[], VOCAB, &d, &pen, Some(16), 20, true)?;
+        let p = build(&m, body.as_bytes(), 10, 4096, &[], VOCAB, &d, &pen, None, Some(16), 20, true)?;
         assert_eq!(p.gen.think_end, None); // api.rs sets it from the prompt
         Ok((
             p.gen.presence_penalty,
@@ -824,6 +918,88 @@ mod tests {
             assert_eq!((e.status, e.param.as_deref()), (400, Some(param)), "{body}");
         }
         assert!(resolved(r#"{"repetition_penalty": 1}"#, spec, "{}").is_ok());
+    }
+
+    fn boosted(body: &str, spec: Option<&str>, default_max: Option<u64>) -> Result<Option<Boost>, ApiError> {
+        let m: Map<String, Value> = serde_json::from_str(body).unwrap();
+        let spec = spec.map(|s| BoostSpec::parse(s).unwrap());
+        let p = build(
+            &m,
+            body.as_bytes(),
+            10,
+            40000,
+            &[],
+            VOCAB,
+            &Map::new(),
+            &Penalties::default(),
+            spec.as_ref(),
+            default_max,
+            20,
+            true,
+        )?;
+        Ok(p.gen.think_end_boost)
+    }
+
+    #[test]
+    fn a_boost_spec_names_start_per1k_and_max() {
+        let s = BoostSpec::parse("start=0.5x,per1k=2,max=10").unwrap();
+        assert_eq!(s, BoostSpec { start: Start::Fraction(0.5), per1k: 2.0, max: 10.0 });
+        assert_eq!(
+            BoostSpec::parse(" start = 4096 , per1k=0.5,max=1.5").unwrap(),
+            BoostSpec { start: Start::Tokens(4096), per1k: 0.5, max: 1.5 }
+        );
+        assert_eq!(BoostSpec::parse("per1k=1,max=1").unwrap().start, Start::Tokens(0));
+        assert_eq!(BoostSpec::parse("start=1x,per1k=1,max=20").unwrap().start, Start::Fraction(1.0));
+        for bad in [
+            "",
+            "x",
+            "start=-1,per1k=1,max=1",
+            "start=1.5x,per1k=1,max=1",
+            "start=1,per1k=-1,max=1",
+            "start=1,per1k=1,max=21",
+            "start=1,per1k=1,max=1,max=2",
+            "start=1,ramp=1,max=1",
+            "start=abc,per1k=1,max=1",
+        ] {
+            assert!(BoostSpec::parse(bad).is_err(), "{bad}");
+        }
+        // off when per1k or max is 0 or absent
+        assert_eq!(BoostSpec::parse("start=1,per1k=0,max=10").unwrap().resolve(100), None);
+        assert_eq!(BoostSpec::parse("start=1,per1k=1,max=0").unwrap().resolve(100), None);
+        assert_eq!(BoostSpec::parse("start=0.5x").unwrap().resolve(100), None);
+    }
+
+    #[test]
+    fn the_boost_s_start_resolves_against_the_request_s_max_tokens() {
+        let spec = Some("start=0.5x,per1k=2,max=10");
+        // the request's max_tokens, the default when it names none, else the room the context leaves
+        assert_eq!(
+            boosted(r#"{"max_tokens": 8192}"#, spec, None).unwrap(),
+            Some(Boost { start: 4096, per1k: 2.0, max: 10.0 })
+        );
+        assert_eq!(boosted("{}", spec, Some(16384)).unwrap().unwrap().start, 8192);
+        assert_eq!(boosted("{}", spec, None).unwrap().unwrap().start, 19995); // half of the room, 40000 - 10
+        assert_eq!(
+            boosted(r#"{"max_tokens": 100}"#, Some("start=4096,per1k=2,max=10"), None).unwrap().unwrap().start,
+            4096
+        );
+        // no default: off. The request's own spec, or off, wins over the default
+        assert_eq!(boosted(r#"{"max_tokens": 100}"#, None, None).unwrap(), None);
+        assert_eq!(
+            boosted(r#"{"max_tokens": 1000, "think_end_boost": "start=0.1x,per1k=1,max=2"}"#, None, None).unwrap(),
+            Some(Boost { start: 100, per1k: 1.0, max: 2.0 })
+        );
+        assert_eq!(boosted(r#"{"max_tokens": 100, "think_end_boost": "off"}"#, spec, None).unwrap(), None);
+        assert_eq!(boosted(r#"{"max_tokens": 100, "think_end_boost": false}"#, spec, None).unwrap(), None);
+        assert_eq!(boosted(r#"{"max_tokens": 100, "think_end_boost": null}"#, spec, None).unwrap().unwrap().start, 50);
+        for body in [
+            r#"{"think_end_boost": "start=1,per1k=1,max=30"}"#,
+            r#"{"think_end_boost": 1}"#,
+            r#"{"think_end_boost": {"start": 1}}"#,
+        ] {
+            let e = boosted(body, spec, None).err().expect(body);
+            assert_eq!((e.status, e.param.as_deref()), (400, Some("think_end_boost")));
+        }
     }
 
     #[test]

@@ -77,6 +77,10 @@ impl Engine {
     pub fn penalties(&self) -> bool {
         self.hello().is_some_and(|h| h.get("penalties") == Some(&Value::Bool(true)))
     }
+    /// The engine applies `generate`'s think-end boost (its hello says `"think_end_boost": true`).
+    pub fn think_end_boost(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("think_end_boost") == Some(&Value::Bool(true)))
+    }
 
     pub fn start(self: &Arc<Self>) {
         let me = self.clone();

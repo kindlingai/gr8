@@ -214,6 +214,19 @@ class UnitTests(unittest.TestCase):
         self.assertIn(b' top_p 1.0 pen 0.0 0.0 1.5 -0.25 154842\n', body)
         body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'thinking_presence_penalty': 1.5, 'think_end': None}, 0)
         self.assertIn(b' pen 0.0 0.0 1.5 0.0 -1\n', body)
+        # the think-end boost: after pen, which carries the close even with every penalty 0
+        body, err = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'think_end': 154842,
+                                            'think_end_boost': {'start': 4096, 'per1k': 2, 'max': 10}}, 0)
+        self.assertIsNone(err)
+        self.assertIn(b' top_p 1.0 pen 0.0 0.0 0.0 0.0 154842 boost 4096 2.0 10.0\n', body)
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'presence_penalty': 1, 'think_end': 5,
+                                          'think_end_boost': {'start': 0, 'per1k': 0.5, 'max': 1.5}, 'logprobs': 1}, 0)
+        self.assertIn(b' pen 1.0 0.0 0.0 0.0 5 boost 0 0.5 1.5 lp 1\n', body)
+        self.assertNotIn(b' boost ', g6s2shim.build_request({'prompt': [1], 'max_tokens': 4,
+                                                              'think_end_boost': {'start': 1, 'per1k': 0, 'max': 10}}, 0)[0])
+        for bad in ({'start': -1, 'per1k': 2, 'max': 10}, {'start': 1, 'per1k': -1, 'max': 10}, {'start': 1, 'per1k': 1, 'max': 21},
+                    {'start': 'x', 'per1k': 1, 'max': 1}, {'per1k': 1, 'max': 1}, 'start=1', {'start': True, 'per1k': 1, 'max': 1}):
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'think_end_boost': bad}, 0)[1], bad)
         # all zero, null or absent: no field
         for kw in ({}, {'presence_penalty': 0, 'frequency_penalty': 0.0}, {'presence_penalty': None},
                    {'thinking_presence_penalty': 0, 'think_end': 5}):

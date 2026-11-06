@@ -66,6 +66,8 @@ pub struct State {
     pub guard: guard::Config,
     /// the server-default penalties (`--default-presence-penalty`, `--default-frequency-penalty`)
     pub penalties: sampling::Penalties,
+    /// the server-default think-end boost (`--default-think-end-boost`); None = off
+    pub boost: Option<sampling::BoostSpec>,
     pub started: u64,
     /// HOST:PORT of the head's supervisor, which runs the cluster's self-checks for /health?deep
     pub supervisor: Option<String>,
@@ -93,6 +95,7 @@ struct Args {
     emit_undeclared: bool,
     supervisor: Option<String>,
     penalties: sampling::Penalties,
+    boost: Option<sampling::BoostSpec>,
     guard: guard::Config,
 }
 
@@ -105,6 +108,7 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--default-reasoning-effort minimal|low|medium|high|xhigh|max (ds41: or an integer 1-100)]
                   [--default-thinking-budget N] [--allow-thinking-off]
                   [--default-presence-penalty SPEC] [--default-frequency-penalty SPEC]
+                  [--default-think-end-boost start=S,per1k=P,max=M]
                   [--tool-repeat-guard 0|1] [--tool-repeat-guard-repeats N] [--tool-repeat-guard-temperature F]
                   [--tool-repeat-guard-retries N]
                   [--undeclared-tool-calls text|emit] [--supervisor HOST:PORT]";
@@ -132,6 +136,7 @@ fn parse_args() -> Result<Args, String> {
         emit_undeclared: false,
         supervisor: None,
         penalties: sampling::Penalties::default(),
+        boost: None,
         guard: guard::Config::default(),
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -205,6 +210,11 @@ fn parse_args() -> Result<Args, String> {
                     return Err(format!("{flag}: want a number in [0, 2]"));
                 }
                 a.guard.temperature = v
+            }
+            "--default-think-end-boost" => {
+                a.boost = Some(
+                    sampling::BoostSpec::parse(&next(&mut i, &flag, inline)?).map_err(|e| format!("{flag}: {e}"))?,
+                )
             }
             "--default-presence-penalty" | "--default-frequency-penalty" => {
                 let spec =
@@ -386,6 +396,7 @@ async fn serve(args: Args) -> Result<(), String> {
         emit_undeclared: args.emit_undeclared,
         guard: args.guard,
         penalties: args.penalties,
+        boost: args.boost,
         started: util::now_secs(),
         supervisor: args.supervisor,
     }));

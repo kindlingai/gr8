@@ -2073,12 +2073,13 @@ __global__ void __launch_bounds__(256) k_grammar_mask(float* logits, int ldl, in
     }
 }
 
-// grid M, block 256: the penalties of row m (penalty.h). From the session's sampling row on, every generated id loses
-// presence + frequency * count from its logit, the thinking coefficients added while the row is inside the think block
-// (no draft before it in this step is the close). The count adds the slot's device counts, the tokens committed since
-// their last update (PenSess::news) and the drafts the rows before m in this step carry (tok). Pass 2 writes each
-// pending id from its raw logit, so a penalized logit is one subtraction either way. A row without a penalty returns at
-// once.
+// grid M, block 256: the penalties and the think-end boost of row m (penalty.h). From the session's sampling row on,
+// every generated id loses presence + frequency * count from its logit, the thinking coefficients added while the row
+// is inside the think block (no draft before it in this step is the close). The count adds the slot's device counts,
+// the tokens committed since their last update (PenSess::news) and the drafts the rows before m in this step carry
+// (tok). Pass 2 writes each pending id from its raw logit, so a penalized logit is one subtraction either way. Inside
+// the block the close's logit then gains pen_boost at n = the thinking tokens committed plus the drafts before the
+// row. A row with neither returns at once.
 __global__ void __launch_bounds__(256) k_penalty(float* logits, int ldl, int vlo, int vn, const int* tok, const PenRow* rows,
                                                  const PenSess* sess, const int* counts)
 {
@@ -2096,12 +2097,18 @@ __global__ void __launch_bounds__(256) k_penalty(float* logits, int ldl, int vlo
     const bool think = pen_in_think(pr.think_end, s_tok + nnew, n - nnew);
     const float presence = think ? pr.presence + pr.tpresence : pr.presence;
     const float frequency = think ? pr.frequency + pr.tfrequency : pr.frequency;
-    if (presence == 0.f && frequency == 0.f) return;
-    pen_pass0(row, vlo, vn, s_tok, n, s_raw, threadIdx.x, 256);
-    __syncthreads();
-    pen_pass1(row, vn, cnt, presence, frequency, threadIdx.x, 256);
-    __syncthreads();
-    pen_pass2(row, vlo, vn, cnt, s_tok, n, s_raw, presence, frequency, threadIdx.x, 256);
+    const float boost = think ? pen_boost(pr.think_n + (m - pr.first), pr.boost_start, pr.boost_per1k, pr.boost_max) : 0.f;
+    if (presence == 0.f && frequency == 0.f && boost == 0.f) return;
+    if (presence != 0.f || frequency != 0.f)
+    {
+        pen_pass0(row, vlo, vn, s_tok, n, s_raw, threadIdx.x, 256);
+        __syncthreads();
+        pen_pass1(row, vn, cnt, presence, frequency, threadIdx.x, 256);
+        __syncthreads();
+        pen_pass2(row, vlo, vn, cnt, s_tok, n, s_raw, presence, frequency, threadIdx.x, 256);
+        __syncthreads();
+    }
+    if (boost != 0.f && threadIdx.x == 0 && pr.think_end >= vlo && pr.think_end < vlo + vn) row[pr.think_end - vlo] += boost;
 }
 // grid M, block 256, after k_penalty read the counts: on the one row of each session that carries commit, the slot's
 // counts take the tokens committed since the last update, from zero for a new request on the slot

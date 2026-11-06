@@ -13,7 +13,8 @@
 namespace g6s2 {
 // The request file's parser is engine/scheduler-rs/src/request.rs. A request is the header line
 // `n_gen <n> temp <f> seed <n> min <n> stop <ids|->`, then optionally and in this order `top_p <f>`,
-// `pen <presence> <frequency> <thinking presence> <thinking frequency> <think_end or -1>` (penalty.h), `lp <k>`, `plp <k>`, `sys <n>`, `ins <rule>`, `gram <grammar>` and
+// `pen <presence> <frequency> <thinking presence> <thinking frequency> <think_end or -1>`, `boost <start> <per1k> <max>`
+// (penalty.h), `lp <k>`, `plp <k>`, `sys <n>`, `ins <rule>`, `gram <grammar>` and
 // `steer <profile> <canonical-fp32-hex>`, then any number of
 // `img <field>` (DS41 images, ds41_image.h: parsed here through parse::image, checked after the prompt), then the
 // prompt ids.
@@ -85,6 +86,7 @@ inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steeri
     r.n_gen = p.n_gen; r.min_tokens = p.min_tokens; r.temp = p.temp; r.top_p = p.top_p; r.seed = p.seed;
     r.presence = p.presence; r.frequency = p.frequency;
     r.tpresence = p.tpresence; r.tfrequency = p.tfrequency; r.think_end = p.think_end;
+    r.boost_start = p.boost_start; r.boost_per1k = p.boost_per1k; r.boost_max = p.boost_max;
     r.lp = p.lp; r.plp = p.plp; r.sys = p.sys;
     std::memcpy(static_cast<void*>(&r.steering), &p.steering, sizeof r.steering);
     r.ins.after = p.ins_after; r.ins.unless = p.ins_unless; r.ins.tokens = parse::ints(p.ins_tokens);
@@ -102,14 +104,19 @@ struct Sampling {
     float inv_temp = 0, top_p = 0; uint32_t seed = 1234; int lp = -1, plp = -1;   // lp, plp: g6rt::ServeReq
     float presence = 0, frequency = 0;                                            // penalties (penalty.h); 0 = off
     float tpresence = 0, tfrequency = 0; int think_end = -1;                      // the thinking penalties and the block's close
+    int boost_start = 0; float boost_per1k = 0, boost_max = 0;                    // the think-end boost (penalty.h pen_boost)
     bool penalty() const { return presence != 0.f || frequency != 0.f || tpresence != 0.f || tfrequency != 0.f; }
+    bool boost() const { return boost_per1k > 0.f && boost_max > 0.f && think_end >= 0; }
+    // the head's row table carries the session (Dispatch::penalty_rows): a penalty or a boost
+    bool tracked() const { return penalty() || boost(); }
 };
 struct Session {
     Key key; uint64_t request = 0;
     Run run; Payload payload; Sampling sampling; g6rt::Emitter emitter;
     g6rt::GrammarRef grammar;         // the reply's grammar (Payload::gram), on every rank; null = none
-    std::vector<int> out;             // the tokens emitted so far, kept only with a penalty (Dispatch::penalty_rows counts them)
-    bool think_open = false;          // with a penalty: the prompt's think block is open and the reply has not emitted its close
+    std::vector<int> out;             // the tokens emitted so far, kept only when tracked (Dispatch::penalty_rows counts them)
+    bool think_open = false;          // when tracked: the prompt's think block is open and the reply has not emitted its close
+    int think_tokens = 0;             // when tracked: thinking tokens emitted (through the close), the boost's n
     bool bound = false, ended = false;
 };
 class Sessions {
@@ -157,8 +164,9 @@ public:
                 "session steering is not a loaded profile");
         s = Session{}; s.key = g.key; s.request = g.req.id; s.run = g.run;
         s.payload = payload(r);
-        s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed, r.lp, r.plp, r.presence, r.frequency, r.tpresence, r.tfrequency, r.think_end};
-        s.think_open = s.sampling.penalty() && r.think_end >= 0;
+        s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed, r.lp, r.plp, r.presence, r.frequency, r.tpresence, r.tfrequency, r.think_end,
+                      r.boost_start, r.boost_per1k, r.boost_max};
+        s.think_open = s.sampling.tracked() && r.think_end >= 0;
         // the head compiled this grammar before queueing the request (Service::controller), so a failure here means
         // the ranks disagree, and the epoch ends
         if (r.gram.on()) s.grammar = g6rt::GrammarRef(g6rt::grammar_open(r.gram).release(), g6rt::GrammarDeleter{});
@@ -205,10 +213,13 @@ public:
         const int before = s.emitter.emitted;
         if (s.grammar) g6rt::grammar_commit(*s.grammar, ids, count);
         const bool done = s.emitter.push(ids, count, lps.empty() ? nullptr : lps.data()); output_ok(s.emitter);
-        // the penalty's output: the tokens counted (a stop id ends the count)
-        if (s.sampling.penalty()) {
+        // the penalty's output: the tokens counted (a stop id ends the count), and how many were thinking
+        if (s.sampling.tracked()) {
             s.out.insert(s.out.end(), ids, ids + (s.emitter.emitted - before));
-            for (int i = 0; s.think_open && i < s.emitter.emitted - before; ++i) s.think_open = ids[i] != s.sampling.think_end;
+            for (int i = 0; s.think_open && i < s.emitter.emitted - before; ++i) {
+                ++s.think_tokens;
+                s.think_open = ids[i] != s.sampling.think_end;
+            }
         }
         return {uint32_t(s.emitter.emitted - before), done};
     }

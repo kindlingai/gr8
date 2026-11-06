@@ -64,6 +64,7 @@ On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 
 | `--default-reasoning-effort` | none | `reasoning_effort` for a chat request that names none: `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, heard as the nearest level the template names. `./gr8 glm53 up` passes `DEFAULT_REASONING_EFFORT` when it is set. |
 | `--default-thinking-budget` | 0 | `thinking_budget` for a chat request that names none, 0 or null (0 = no limit). A request with `logprobs` gets none. `./gr8 glm53 up` passes `DEFAULT_THINKING_BUDGET` when it is set. |
 | `--default-presence-penalty` / `--default-frequency-penalty` | 0 | The server's `presence_penalty` / `frequency_penalty` spec (OpenAI's penalties: the engine lowers the logit of every token the reply already holds by `presence_penalty` + `frequency_penalty` x its count, before temperature and top-p; the prompt does not count, vLLM's semantics). One part, or a comma list of `base=`, `thinking=`, `greedy=` and `nongreedy=` parts, each once. A part is `[+]A[*M]`: an amount added and a multiplier (`base=0.2` adds 0.2 at multiplier 1; `thinking=*1.1` adds nothing and boosts by 10%; `thinking=+0.1*1.1` both; `-0.1*0.5` is fine). For a request the amounts of the matching parts add up and the product of their multipliers scales the sum: `base` always; `greedy` when the request's temperature after defaults is exactly 0, else `nongreedy` (any other temperature, however small, is sampling); `thinking` inside the think block the prompt leaves open (a chat prompt's, until `</think>`; a `thinking_budget` continuation has none). So out = (base.A + gn.A) x base.M x gn.M for the reply and in = (base.A + gn.A + thinking.A) x base.M x gn.M x thinking.M inside the block; the engine gets `presence_penalty` = out and `thinking_presence_penalty` = in - out. The request's own `presence_penalty` replaces `base`'s amount, 0 included (the multiplier stays), and its `thinking_presence_penalty` replaces `thinking`'s amount; the greedy and nongreedy parts are the server's conditions and always apply, so a client that sends `presence_penalty: 0` by habit still gets them. A `temperature=[[+]A][*B]` part is a last stage over each total at the request's effective temperature T (a guard retry keeps the request's T): total' = (total + A x T) x (B x T), the factor only when `*B` is written. So `temperature=*1` makes the penalty proportional to the temperature and exactly zero under greedy, and `temperature=+0.1` adds 0.1 per unit of temperature. (A multiplier of B^T, 1 at T = 0 and B at T = 1, would keep a greedy penalty while still scaling with temperature; not implemented, a possible change.) A spec any combination of which resolves outside -2..2 (either total, or their difference) at any T in 0..2 is refused at boot; a request whose value pushes one outside gets a 400 naming the field. The guard's resamples keep the request's resolved values. A nonzero penalty needs an engine whose hello says `penalties` (g6m4 with the `pen` field, the pseudo engine), else 400. The TP=1 Flash recipe: `thinking=0.5,greedy=0.2,nongreedy=0` for presence. `./gr8 glm53 up` passes `DEFAULT_PRESENCE_PENALTY` / `DEFAULT_FREQUENCY_PENALTY` when they are set. |
+| `--default-think-end-boost` | off | The think-end boost, a soft thinking budget, below. `./gr8 glm53 up` passes `DEFAULT_THINK_END_BOOST` when it is set. |
 | `--tool-repeat-guard` | 0 | 1 = the repeated-tool-call guard, below. `./gr8 glm53 up` passes `TOOL_REPEAT_GUARD` and, when they differ from these defaults, `--tool-repeat-guard-repeats` (2), `--tool-repeat-guard-temperature` (0.7) and `--tool-repeat-guard-retries` (2). |
 | `--undeclared-tool-calls` | `text` | A call to a tool name the request did not declare. `text`: the call's text stays in `content` and the reply finishes `stop` (vLLM's glm47 parser). `emit`: it is a tool call like any other (`tool_calls`, `finish_reason: tool_calls`, streamed or not), so the client can answer it with its own unknown-tool error; the name must be an identifier (1-128 ASCII letters, digits, `_`, `-`, `.` or `:`, starting with a letter or `_`), the call arrives when the reply ends with it rather than as it is written (so prose after it keeps it prose), and the arguments are strings, having no schema. The rules that tell a call from prose about one are unchanged. `./gr8 glm53 up` passes `UNDECLARED_TOOL_CALLS` when it is `emit`. |
 | `--log-level` | `INFO` | |
@@ -116,6 +117,23 @@ mock engine with S2's reuse rule, TP=4's cold prefill rate (1,374 tokens/s) and 
 
 The front end logs each continuation's cached tokens (`thinking budget: the continuation took N of its M prompt
 tokens from the cache`).
+
+## Soft thinking budget (`--default-think-end-boost`)
+
+A reply that spends its whole `max_tokens` thinking never answers. On the TP=1 Flash recipe the greedy log-report task
+failed 5 of 5 that way, re-listing log lines until the cap. A `thinking_budget` cuts mid-thought. The boost instead
+raises the `</think>` logit a little more with every thinking token, so the model ends its reasoning where it was
+closest to ending anyway. The spec is `start=S,per1k=P,max=M`: inside the think block, at the reply's n-th thinking
+token, `</think>` gains min(M, P x (n - S) / 1000) logits once n is past S, before temperature and top-p. S is a token
+count or a fraction of the request's `max_tokens` written `0.5x` (resolved per request: the request's `max_tokens`,
+else the server default, else the room the context leaves); P is logits per thousand tokens past S; M the cap (0 to
+20). P or M 0 = off. A request's `think_end_boost` (the same string, `"off"` or `false`) wins over the server default.
+The engine counts the drafts before a verify row, so the boost is exact at any draft length. A drafted `</think>` takes
+it off the rows after it, and the committed one ends it. A `thinking_budget` stays the hard backstop. After its close the
+continuation has no open block, so no boost. Drafts are not boosted: around the close, where the boost flips the
+argmax to `</think>`, the drafter's continuation is rejected and that round commits one token. Elsewhere the ramp (2
+logits per thousand tokens) rarely changes the argmax, so the cost is a few short rounds near the close. The first
+recipe value: `start=0.5x,per1k=2,max=10`.
 
 ## Repeated tool calls (`--tool-repeat-guard`)
 

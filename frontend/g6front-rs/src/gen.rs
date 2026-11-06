@@ -817,6 +817,7 @@ mod tests {
                 thinking_presence_penalty: 0.0,
                 thinking_frequency_penalty: 0.0,
                 think_end: None,
+                think_end_boost: None,
                 seed: None,
                 stop_ids: vec![EOS as i64],
                 logprobs: None,

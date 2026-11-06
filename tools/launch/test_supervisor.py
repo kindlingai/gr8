@@ -378,6 +378,11 @@ class FrontTests(unittest.TestCase):
         self.assertEqual(a[a.index('--default-presence-penalty') + 1], 'thinking=0.5,greedy=0.2,nongreedy=0')
         self.assertEqual(a[a.index('--default-frequency-penalty') + 1], '-0.5')
 
+    def test_the_think_end_boost_reaches_the_front_end_when_set(self):
+        self.assertNotIn('--default-think-end-boost', self.front_argv())
+        a = self.front_argv('--default-think-end-boost', 'start=0.5x,per1k=2,max=10')
+        self.assertEqual(a[a.index('--default-think-end-boost') + 1], 'start=0.5x,per1k=2,max=10')
+
     def test_the_tool_repeat_guard_reaches_the_front_end_when_on(self):
         a = self.front_argv()
         self.assertNotIn('--tool-repeat-guard', a)

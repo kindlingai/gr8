@@ -187,6 +187,14 @@ class ValidateTests(unittest.TestCase):
         opt.validate(o)
         self.assertEqual((o.get('DEFAULT_PRESENCE_PENALTY'), o.get('DEFAULT_FREQUENCY_PENALTY')),
                          ('thinking=0.5, greedy=0.2,nongreedy=0', '-0.5'))
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=0.5x,ramp=2,max=10'], 'want start=, per1k= or max=')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=1.5x,per1k=2,max=10'], 'want 0 to 1')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=-1,per1k=2,max=10'], 'want a token count')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=1,per1k=2,max=21'], 'want 0 to 20')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=1,per1k=x,max=1'], 'is not a number')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'max=1,max=2'], 'given twice')
+        for ok in ('start=0.5x,per1k=2,max=10', 'start=4096, per1k=0.5, max=1.5', 'per1k=1,max=1'):
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-think-end-boost', ok], GLM))
         self.check(['--peers', PEERS, '--tool-repeat-guard', 'yes'], 'want 0 or 1')
         self.check(['--peers', PEERS, '--tool-repeat-guard-repeats', '0'], 'want a whole number from 1')
         self.check(['--peers', PEERS, '--tool-repeat-guard-temperature', '3'], 'want a number from 0 to 2')
