@@ -59,9 +59,12 @@ the cost is the same at TP=4 and TP=2:
 | 262,208 | 4,097 | 5.24 GB |
 | 1,048,640 | 16,385 | 20.9 GB |
 
-Decode and prefill scratch grow with a quarter of `CAP` and stay small by comparison. The model's config allows
-1,048,576 positions, and `CAP` may go higher where memory allows. Each layer's bind checks that `GR8_MEM_MIN` (8 GiB)
-stays free, so a `CAP` that leaves too little stops the boot; the boot log's `MemAvailable` line shows what is left.
+The indexer's score scratch holds one key tile per row: a call whose context passes 16,384 pools (64K tokens) scores
+the pools in tiles of that size and keeps a running top-512 (`kp_select_tile` in `engine/attn/kpool.cuh`, the same
+lists as one pass; `engine/tests/test_flash_kpool.cu`), so decode and prefill scratch stop growing with `CAP` past 64K.
+The model's config allows 1,048,576 positions, and `CAP` may go higher where memory allows. Each layer's bind checks
+that `GR8_MEM_MIN` (8 GiB) stays free, so a `CAP` that leaves too little stops the boot; the boot log's `MemAvailable`
+line shows what is left.
 
 Nothing else in the engine limits the context to less than `CAP`:
 
@@ -75,9 +78,11 @@ With one session (`SESS=1`, the default) `SHARE_LIMIT` (32768) shares nothing: i
 request without one gets, `SHARE_LIMIT - 64 - prompt` but at least 8192, capped by the room left. With several (below)
 it also decides which requests share decode steps, as on GLM-5.3: a longer one waits for the others and runs alone.
 
-Prefill time grows faster than the prompt because the indexer scores every earlier key for each row. The time of a
-262K prefill has not been measured. The shim errors a request after 900 s with no output (`--stall-timeout`), and a
-prefill sends none, so a prefill longer than that fails.
+Prefill time grows faster than the prompt because the indexer scores every earlier key for each row. At TP=1 a
+4,096-row quantum takes 3.2 s at the start of a prompt, 5.1 s at 240K and 8.4 s at 900K (90 C, clocks held at
+1,781 MHz). The shim errors a request after 900 s with no output (`--stall-timeout`), but the engine reports each
+quantum to it (an `f` line, `s2/sessions.h progress`), so the timeout bounds one quantum, not the whole prefill: a
+923K-token prompt prefilled in 1,371 s with the default.
 
 ## One box (TP=1)
 
