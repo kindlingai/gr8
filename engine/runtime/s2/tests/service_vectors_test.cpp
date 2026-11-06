@@ -5,7 +5,8 @@
 // one. A changed rule changes a hash: rerecord only for a change meant to alter the files or a refusal, and say so in
 // the commit.
 //   --dump SECTION   print that section's transcript (to diff two builds line by line)
-// The generator is mt19937_64 with modulo ranges, and no call takes two draws as arguments. Host only.
+// The generator is mt19937_64 with modulo ranges. No call or + takes two draws, or a write and its read, as
+// operands: their order is unspecified, and GCC on x86_64 takes them right to left. Host only.
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -159,9 +160,13 @@ uint64_t ingress_section(uint64_t seed, std::vector<std::string>* lines) {
                 const bool good_hash = r.coin(85);
                 const uint64_t h = good_hash ? payload_hash(bytes) : r.raw();
                 if (r.coin(85)) atomic_file(d + "/req." + u(id), bytes);
-                std::string c = r.coin(85) ? (r.coin(70) ? "ADMIT " : "CANCEL ") + u(r.coin(90) ? epoch : epoch + 1) + " " + u(id) +
-                                                 " " + (r.coin(80) ? u(h) : "0") + "\n"
-                                           : command_text(r, epoch);
+                std::string c;
+                if (r.coin(85)) {
+                    const char* verb = r.coin(70) ? "ADMIT " : "CANCEL ";   // one draw a statement
+                    const uint64_t e = r.coin(90) ? epoch : epoch + 1;
+                    const std::string hs = r.coin(80) ? u(h) : "0";
+                    c = verb + u(e) + " " + u(id) + " " + hs + "\n";
+                } else c = command_text(r, epoch);
                 const int at = r.coin(95) ? written : written + 1;   // a gap leaves the next command unread
                 atomic_file(d + "/cmd." + u(at), c);
                 tx("cmd." + u(at) + " [" + c + "]");
@@ -267,8 +272,8 @@ uint64_t files_section(uint64_t seed, std::vector<std::string>* lines) {
         const uint64_t n = r.U(0, 200);
         for (uint64_t i = 0; i < n; ++i) bytes += char(r.U(0, 255));
         const std::string p = r.coin(95) ? d + "/x" : d + "/missing/x";
-        tx("atomic " + outcome([&] { atomic_file(p, bytes); return std::string(); }) + " " + u(payload_hash(slurp(p))) +
-           " tmp" + u(::access((p + ".tmp").c_str(), F_OK) == 0));
+        const std::string wrote = outcome([&] { atomic_file(p, bytes); return std::string(); });   // write before the reads
+        tx("atomic " + wrote + " " + u(payload_hash(slurp(p))) + " tmp" + u(::access((p + ".tmp").c_str(), F_OK) == 0));
         BootstrapConfig b;
         b.scheduler = config(r);
         b.ranks = unsigned(r.U(1, 3)); b.rank = r.coin(90) ? 0 : 1;
@@ -283,7 +288,8 @@ uint64_t files_section(uint64_t seed, std::vector<std::string>* lines) {
             ::close(sp[1]);
         }
         if (r.coin(10)) atomic_file(d + "/abort.s2", "x\n");
-        tx("ready " + outcome([&] { publish_ready(b, links); return std::string(); }) + " [" + slurp(d + "/ready.s2") + "]");
+        const std::string ready = outcome([&] { publish_ready(b, links); return std::string(); });   // write before the read
+        tx("ready " + ready + " [" + slurp(d + "/ready.s2") + "]");
     }
     clear_dir(d); ::rmdir(d.c_str());
     return tx.h;
@@ -429,7 +435,8 @@ uint64_t status_section(uint64_t seed, std::vector<std::string>* lines) {
                 (s.*get(NativeOf{})).pool.runs = [in] { return *in->runs; };
             } else (s.*get(NativeOf{})).pool.runs = nullptr;
             ::unlink((d + "/status.s2").c_str());
-            tx(outcome([&] { (s.*get(StatusOf{}))(); return std::string(); }) + " [" + slurp(d + "/status.s2") + "]");
+            const std::string wrote = outcome([&] { (s.*get(StatusOf{}))(); return std::string(); });   // write before the read
+            tx(wrote + " [" + slurp(d + "/status.s2") + "]");
         }
         ::unlink((d + "/status.s2").c_str()); ::unlink((d + "/status.s2.tmp").c_str());
         ::rmdir(d.c_str());
