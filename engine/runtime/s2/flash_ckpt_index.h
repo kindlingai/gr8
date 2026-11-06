@@ -77,7 +77,9 @@ inline void write_durable(const std::string& path, const void* bytes, size_t n, 
 } // namespace fidx
 
 // What an entry's blocks hold (flash_checkpoint.cuh): block base the manifest, base + 1 + i logical page i of every
-// binding (its latent rows, then its indexer rows), then the KDA state stream cut into blocks.
+// binding (its latent rows, then its pooled index keys), then the state stream cut into blocks: the KDA state of one
+// slot, then the session's raw index ring of every binding (attn/kvfmt.h). state_bytes covers both, so the state
+// checksum covers the rings.
 struct FlashLayout {
     size_t slot = 0;                                // bytes a block, a multiple of 4 KiB
     std::vector<std::pair<size_t, size_t>> parts;   // per binding, main then draft: latent and indexer bytes of one page
@@ -170,7 +172,7 @@ inline const char* flash_entry_check(const FlashEntry& x, uint64_t compat, uint6
         const size_t at = size_t(j) * L.slot;
         return ckpt_sum_host(b, std::min(L.slot, L.state_bytes - at), at / 8);
     });
-    if (state != m.state_sum) return "KDA state checksum";
+    if (state != m.state_sum) return "KDA state / raw ring checksum";
     return nullptr;
 }
 

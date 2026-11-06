@@ -243,6 +243,7 @@ inline G6AttnStep dsa_step(Model& m, int M, int context)
     s.rows = M; s.context = context;
     s.q_b = m.q_b; s.kv_a = m.kv_a; s.positions = m.pos;
     s.index_q = m.idx_q; s.index_k = m.idx_k; s.index_weight = m.idx_w; s.index_gate = m.idx_g;
+    s.raw_sess = m.rsess;
     return s;
 }
 

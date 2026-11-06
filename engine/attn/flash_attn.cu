@@ -2,7 +2,7 @@
 // the G6_MODEL_FLASH build (runtime/build_m4.sh) behind the same C ABI (attn.h, bind.h, replay.h), so the rank driver
 // binds, runs and replays it as the GLM attention.
 // Per row r at position pos (decode or verify rows; rows of one call may hold several positions of one sequence):
-//   append   latent[pos] = RMSNorm(kv_a, kv_a_norm) (eps 1e-5) as the kvfmt.h row; index raw slot; pool key at pos%4==3
+//   append   latent[pos] = RMSNorm(kv_a, kv_a_norm) (eps 1e-5) as the kvfmt.h row; pool key at pos%4==3; raw ring
 //   select   indices[r] = kpool selection (kpool.cuh), or a copy of reuse_indices
 //   attend   q_abs[h] = q_b[h] (256) @ UK[h] (256 x 512); s_j = q_abs . latent[id_j] / 16; p = softmax(s);
 //            ctx = sum_j p_j latent[id_j]; output[h] = UV[h] (256 x 512) @ ctx, FP16 [rows][heads][256]
@@ -15,6 +15,7 @@
 #include "flash_pool_owner.h"
 #include "prefill-qo-bind.h"
 #include "../g6nr.h"
+#include "../g6mx.h"
 #include "../model_geom.h"
 #include "kvfmt.h"
 #include "../knobs-rs/gr8_knobs.h"
@@ -40,6 +41,8 @@ constexpr int IHEADS=g6kv::IDX_HEADS, IDIM=g6kv::IDX_DIM, KP=g6kv::KPOOL;
 constexpr int HC=16;   // heads per CTA in mla_scores / context_parts
 static_assert(NOPE==256&&VD==256&&LAT==512&&TOP%256==0&&geom::QK_ROPE==0,"Flash MLA geometry");
 static_assert(IDIM==128&&IHEADS==32&&KP==4&&g6kv::PAGE%KP==0,"kpool geometry");
+// a call's rows of one session span at most G6_MX positions: its ring writes never reach a slot an earlier pool still reads
+static_assert(g6kv::RAW_RING>G6_MX+KP,"raw ring narrower than a decode step");
 using half=__half; using bf16=__nv_bfloat16;
 struct ReplayInput { G6Attn fixed; const G6AttnStepCell* cell; };
 struct DeviceAttn : G6Attn { int live_context; bool active; };
@@ -420,7 +423,7 @@ static Work workspace(const G6Attn& a,void* base){
 template<class Input>
 static void append(const G6Attn& a,Input input,cudaStream_t stream){
     append_kv<<<a.rows,256,0,stream>>>(input);
-    if(!a.reuse_indices){kp_append<<<a.rows,2*IDIM,0,stream>>>(input);kp_pool<<<a.rows,IDIM,0,stream>>>(input);}
+    if(!a.reuse_indices){kp_pool<<<a.rows,IDIM,0,stream>>>(input);kp_ring<<<std::min(a.rows,g6kv::RAW_RING),2*IDIM,0,stream>>>(input);}
 }
 template<class Input>
 static void make_index(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t stream){
@@ -459,7 +462,7 @@ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t str
 }
 static bool append_ok(const G6Attn& a){
     return a.kv_a&&a.kv_norm&&a.mla_cache&&a.positions&&a.block_table&&a.error&&
-        (a.reuse_indices||(a.index_k&&a.index_gate&&a.index_ape&&a.index_norm&&a.index_bias&&a.index_cache));
+        (a.reuse_indices||(a.index_k&&a.index_gate&&a.index_ape&&a.index_norm&&a.index_bias&&a.index_cache&&a.index_raw));
 }
 static bool run_ok(const G6Attn& a){
     return a.q_b&&a.uk&&a.uv&&a.indices&&a.output&&(a.reuse_indices||(a.index_q&&a.index_weight))&&
@@ -546,7 +549,7 @@ __global__ void __launch_bounds__(256) kp_scores_pf(Input input,int start,int n,
     for(int i=t;i<npools*IDIM;i+=256){
         const int pp=i/IDIM,d=i%IDIM,p=p0+pp;float v=0.f;
         const uint8_t* b=ix_page(a,p*KP);
-        if(b)v=__ldg(((const float*)(b+g6kv::IDX_POOL_OFF))+((p%g6kv::PAGE_POOLS)*IDIM+d));
+        if(b)v=__ldg(((const float*)b)+((p%g6kv::PAGE_POOLS)*IDIM+d));
         ks[pp][d]=v;
     }
     const int pp=t>>3,hl=t&7;
@@ -656,7 +659,7 @@ __global__ void __launch_bounds__(128) kp_scores_tc(Input input,int start,int n,
         float v=0.f;
         if(pp<npools){
             const uint8_t* b=ix_page(a,p*KP);
-            if(b)v=__ldg(((const float*)(b+g6kv::IDX_POOL_OFF))+((p%g6kv::PAGE_POOLS)*IDIM+d));
+            if(b)v=__ldg(((const float*)b)+((p%g6kv::PAGE_POOLS)*IDIM+d));
         }
         const half hi=__float2half_rn(v);
         ks_hi[pp][d]=hi;
@@ -756,7 +759,7 @@ __global__ void __launch_bounds__(128) kp_scores_tc_stream(Input input,int start
         float v=0.f;
         if(pp<npools){
             const uint8_t* b=ix_page(a,p*KP);
-            if(b)v=__ldg(((const float*)(b+g6kv::IDX_POOL_OFF))+((p%g6kv::PAGE_POOLS)*IDIM+d));
+            if(b)v=__ldg(((const float*)b)+((p%g6kv::PAGE_POOLS)*IDIM+d));
         }
         const half hi=__float2half_rn(v);
         ks_hi[pp][d]=hi;
@@ -1671,7 +1674,7 @@ static int flash_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep*
     a.rows=step->rows;a.context=step->context;
     a.q_b=step->q_b;a.kv_a=step->kv_a;a.positions=step->positions;
     a.index_q=step->index_q;a.index_k=step->index_k;a.index_weight=step->index_weight;
-    a.index_gate=step->index_gate;
+    a.index_gate=step->index_gate;a.raw_sess=step->raw_sess;
     a.reuse_indices=step->reuse_indices;a.reuse_row_map=step->reuse_row_map;a.reuse_rows=step->reuse_rows;
     auto* w=p->workspace;
     if(step->rows>b->max_rows){
