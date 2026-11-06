@@ -42,6 +42,11 @@ temperature-0 replies. The longest request on that boot was 163,830 tokens; `mai
 
 [DEEPSEEK-BOOT.md](DEEPSEEK-BOOT.md) has each step in order, with the disk and Engram details.
 
+The Docker recipe [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)
+puts these steps in one image (not yet built). Its default is fast mode: 32 chats at once on an engine built with
+`DS41_MX=48`, and output that is not bit-identical to the exact model's. Its README lists the settings, including how
+to run gr8's launcher defaults instead: 5 chats at once, `CAP` 262,144 and exact output.
+
 ## Settings
 
 The launcher's defaults: 5 chats at once, `CAP` 262,144 (a request holds at most 262,134 tokens, prompt and reply),
