@@ -8,7 +8,8 @@ It follows the engine code (engine/runtime/s2/ingress.h, sessions.h, service.h, 
     sends the bytes to the other ranks itself)
   - a request waits in a FIFO until a session slot (--sessions) and a KV run (--pool-rows) are free, then gets
     an "a" line, then decodes together with the other sessions: every round (--round-ms, the same for any number of
-    sessions) each session commits 1 + accepted tokens ("t" lines); at the end an "m" line and "end"
+    sessions) each session commits 1 + accepted tokens ("t" lines); its cumulative "m" line every --m-ms while it
+    decodes, and at the end an "m" line and "end"
   - CANCEL: queued -> only "end abort -1 0"; resident -> "m ..." + "end abort -1 <emitted>", slot and run freed;
   - with --progress-ms, "f <rows>" lines while a resident request prefills (--prefill-ms);
     unknown (already ended) -> nothing
@@ -192,13 +193,16 @@ class Fake:
             self.say(f'RESIDENT {len(self.res)} (admitted {q["id"]} slot {slot})')
             self.dirty = True
 
+    def write_m(self, s):
+        m = self.a.mtp
+        s['f'].write(f'm {s["rounds"]} {s["rounds"] * m} {s["emitted"] - s["rounds"]}' +
+                     ''.join(' %d' % sum(s['acc'][i + 1:]) for i in range(m)) + '\n')
+
     def terminal(self, slot, reason=None):
         s = self.res.pop(slot)
-        f, m = s['f'], self.a.mtp
-        f.write(f'm {s["rounds"]} {s["rounds"] * m} {s["emitted"] - s["rounds"]}')
-        for i in range(m):
-            f.write(' %d' % sum(s['acc'][i + 1:]))
-        f.write(f'\nend {reason or ("stop" if s["stop_id"] >= 0 else "length")} {s["stop_id"]} {s["emitted"]}\n')
+        f = s['f']
+        self.write_m(s)
+        f.write(f'end {reason or ("stop" if s["stop_id"] >= 0 else "length")} {s["stop_id"]} {s["emitted"]}\n')
         f.close()
         self.pages_used -= s['pages']
         self.say(f'END {s["id"]} {reason or "natural"} {s["emitted"]} tokens (resident {len(self.res)})')
@@ -243,6 +247,9 @@ class Fake:
             s['f'].write('t ' + ' '.join(map(str, ids)) + '\n')
             if done:
                 self.terminal(slot)
+            elif self.a.m_ms and now >= s.get('next_m', 0):   # the real engine's live counters (sessions.h counters)
+                s['next_m'] = now + self.a.m_ms / 1e3
+                self.write_m(s)
 
     def status(self):
         free = self.a.pool_rows // 64 - self.pages_used
@@ -298,6 +305,7 @@ if __name__ == '__main__':
     ap.add_argument('--max-rows', type=int, default=8)
     ap.add_argument('--round-ms', type=float, default=20.0)
     ap.add_argument('--prefill-ms', type=float, default=30.0)
+    ap.add_argument('--m-ms', type=float, default=100.0, help='write the cumulative "m" line this often while a request decodes (0 = only at the end)')
     ap.add_argument('--progress-ms', type=float, default=0.0, help='write an "f" (prefill progress) line this often while a request prefills (0 = never)')
     ap.add_argument('--ready-delay', type=float, default=0.0)
     ap.add_argument('--ready-version', type=int, default=3, help='2: an engine without the insert rule')

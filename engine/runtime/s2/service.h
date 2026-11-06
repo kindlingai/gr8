@@ -538,6 +538,11 @@ class Service {
             if (native_.before_work) native_.before_work();
             const auto t0 = trace_ ? Trace::now() : 0;
             const auto work = driver_->step(); require(work.kind != Kind::Idle, "departed idle boundary");
+            for (unsigned i = 0; i < work.count; ++i) {   // rank 0: each session's spec counters, once a second
+                const Key k = work.keys[i];
+                if (!sessions_.counters_due(k) || driver_->state().slots()[k.slot].key != k) continue;
+                if (const auto* st = driver_->stats_if_initialized(k)) sessions_.counters(k, *st);
+            }
             if (trace_) {
                 std::string ids;
                 for (unsigned i = 0; i < work.count; ++i)

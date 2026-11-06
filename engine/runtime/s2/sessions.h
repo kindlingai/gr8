@@ -5,6 +5,7 @@
 #include "ingress.h"
 #include "../serve.h"
 #include "../penalty.h"
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -128,6 +129,7 @@ struct Session {
     bool think_open = false;          // when tracked: the prompt's think block is open and the reply has not emitted its close
     int think_tokens = 0;             // when tracked: thinking tokens emitted (through the close), the boost's n
     bool bound = false, ended = false;
+    std::chrono::steady_clock::time_point m_at{};   // when the head last wrote this session's "m" line
 };
 class Sessions {
     Config config_; std::string directory_; bool head_; int chunk_; [[maybe_unused]] uint32_t prefill_min_;
@@ -233,27 +235,46 @@ public:
         }
         return {uint32_t(s.emitter.emitted - before), done};
     }
+    // rank 0: whether a live session's "m" line is due (a second since its last one); counters() then writes it, so
+    // /metrics moves while a request decodes. The Batch's stats are read only for a session that is due.
+    bool counters_due(Key k) const {
+        if (k.slot >= MAX_SESSIONS) return false;
+        const auto& s = sessions_[k.slot];
+        return s.bound && s.key == k && !s.ended && s.emitter.f &&
+               std::chrono::steady_clock::now() - s.m_at >= std::chrono::seconds(1);
+    }
+    void counters(Key k, const s2::Stats& stats) {
+        auto& s = get(k);
+        write_m(s.emitter, stats);
+        require(!fflush(s.emitter.f), "S2 counters output failed");
+        s.m_at = std::chrono::steady_clock::now();
+    }
     void terminal(Key k, const s2::Stats& stats, const char* reason = nullptr) {
         auto& s = get(k); if (s.ended) return;
-        // Emitter::end uses per-request counters here, never process-wide totals.
-        // K + 1 bins: K = the MTP draft count, or 7 for a session that started on DFlash2 (s2_batch.h)
-        require(stats.acc.empty() || (stats.acc.size() >= config_.mtp + 1 && stats.acc.size() <= 16), "bad per-request acceptance histogram");
-        std::array<long, 8> zero{};
         auto& em = s.emitter;
         if (em.f) {
-            const long* acc = stats.acc.empty() ? zero.data() : stats.acc.data();
-            const unsigned K = stats.acc.empty() ? config_.mtp : unsigned(stats.acc.size() - 1);
-            fprintf(em.f, "m %ld %ld %ld", stats.rounds, stats.drafted, stats.tokens - stats.rounds);
-            for (unsigned i = 0; i < K; ++i) {
-                long accepted = 0; for (unsigned a = i + 1; a <= K; ++a) accepted += acc[a];
-                fprintf(em.f, " %ld", accepted);
-            }
-            fprintf(em.f, "\nend %s %d %d\n", reason ? reason : em.stop_id >= 0 ? "stop" : "length", em.stop_id, em.emitted);
+            write_m(em, stats);
+            fprintf(em.f, "end %s %d %d\n", reason ? reason : em.stop_id >= 0 ? "stop" : "length", em.stop_id, em.emitted);
             const bool ok = !ferror(em.f); const int rc = fclose(em.f); em.f = nullptr;
             require(ok && !rc, "S2 terminal output failed");
         }
         em.on = false;
         s.ended = true;
+    }
+    // "m <rounds> <drafted> <accepted> <accepted at draft position 0> ...": this request's counters to date. The shim
+    // sums the requests' lines into the process totals. K + 1 acceptance bins: K = the MTP draft count, or 7 for a
+    // session that started on DFlash2 (s2_batch.h).
+    void write_m(g6rt::Emitter& em, const s2::Stats& stats) const {
+        require(stats.acc.empty() || (stats.acc.size() >= config_.mtp + 1 && stats.acc.size() <= 16), "bad per-request acceptance histogram");
+        std::array<long, 8> zero{};
+        const long* acc = stats.acc.empty() ? zero.data() : stats.acc.data();
+        const unsigned K = stats.acc.empty() ? config_.mtp : unsigned(stats.acc.size() - 1);
+        fprintf(em.f, "m %ld %ld %ld", stats.rounds, stats.drafted, stats.tokens - stats.rounds);
+        for (unsigned i = 0; i < K; ++i) {
+            long accepted = 0; for (unsigned a = i + 1; a <= K; ++a) accepted += acc[a];
+            fprintf(em.f, " %ld", accepted);
+        }
+        fputc('\n', em.f);
     }
     void retire(const Slot& old) {
         auto& s = get(old.key);

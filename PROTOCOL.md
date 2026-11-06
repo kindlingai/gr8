@@ -154,7 +154,7 @@ The last frame for a request; the id may be reused after it.
 | `cached_tokens` | prompt tokens served from the prefix cache (0 if none) |
 | `completion_tokens` | ids emitted in `tokens` frames for this request |
 | `message` | only with `reason: error`: human-readable cause (e.g. `"prompt too long"`, `"KV cache full"`) |
-| `spec` | optional: this request's share of the `metrics` frame's `spec` counters, the same numbers added there when it ended: `{"drafts", "draft_tokens", "accepted", "accepted_per_pos"}` (verify rounds, draft tokens, accepted draft tokens, accepted per draft position) |
+| `spec` | optional: this request's share of the `metrics` frame's `spec` counters, all of what it added there by the time it ended: `{"drafts", "draft_tokens", "accepted", "accepted_per_pos"}` (verify rounds, draft tokens, accepted draft tokens, accepted per draft position) |
 | `timing` | optional: this request's share of the `metrics` frame's `latency` times, in seconds: `{"prefill_s", "decode_s"}` (added to `prefill_sum` / `decode_sum`) |
 
 A request that fails validation in the engine gets `finish` with `reason: error` directly (no `tokens`).
@@ -179,7 +179,8 @@ All values are monotonically increasing counters since engine start, except `req
 - `spec.drafts`: number of verify rounds that had at least one draft token;
   `draft_tokens`: total draft tokens proposed; `accepted`: total draft tokens accepted;
   `accepted_per_pos[i]`: rounds whose draft token at position i (0-based) was accepted. The array length is the
-  max draft depth (k); positions the engine never drafts are 0.
+  max draft depth (k); positions the engine never drafts are 0. The counters grow while a request decodes: the S2
+  engine reports a request's counters about once a second.
 - `prefix_cache.queries` / `hits` count **tokens** (prompt tokens looked up / found), like vLLM.
 - `tokens.generation` counts generated tokens. When `tokens.cached` is present, `tokens.prompt` must count the whole
   prompt, including cached tokens, so the front end can derive computed tokens as `prompt - cached`. Without

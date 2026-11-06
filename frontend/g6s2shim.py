@@ -35,7 +35,8 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
                                                              first t line; the shim sends one prompt_logprobs frame then
         l <lp> <rank> <n> <id>:<lp> ...                      with lp: one per token of the next t line, before it
         t <id> <id> ...                                      newly committed tokens -> tokens frame (+ logprobs)
-        m <rounds> <draft_tokens> <accepted> <acc_pos0> ...  this request's spec counters, just before end
+        m <rounds> <draft_tokens> <accepted> <acc_pos0> ...  this request's spec counters so far: about once a second
+                                                             while it decodes, and once just before end
         end <stop|length|error|abort> <stop_id or -1> <completion_tokens>   -> finish frame (with the request's
                                                              `spec` and `timing`: what it added to the metrics frame)
       A request cancelled while still queued gets only "end abort -1 0".
@@ -783,21 +784,24 @@ class Shim:
                         return self.finish(r, 'error', ct=r.emitted, message='engine returned mismatched logprobs')
                     fr['logprobs'] = lps
                 self.send(r, fr)
-        elif w[0] == 'm':
-            r.m = [int(x) for x in w[1:]]
+        elif w[0] == 'm':   # cumulative: the metrics counters take the change since the request's last m line
+            v = [int(x) for x in w[1:]]
+            old = r.m or []
+            d = [v[i] - (old[i] if i < len(old) else 0) for i in range(len(v))]
+            self.c['rounds'] += d[0]
+            self.c['draft_tokens'] += d[1]
+            self.c['accepted'] += d[2]
+            cur, pp = self.c['per_pos'], d[3:]
+            self.c['per_pos'] = [(cur[i] if i < len(cur) else 0) + (pp[i] if i < len(pp) else 0)
+                                 for i in range(max(len(cur), len(pp)))]
+            r.m = v
         elif w[0] == 'end':
             reason, sid, ct = w[1], int(w[2]), int(w[3])
             if ct != r.emitted:
                 log.warning('req.%s: end says %d tokens, saw %d', r.ordinal, ct, r.emitted)
-            if r.m:   # per-request counters, added once
+            if r.m:   # the request's last m line: what it added to the metrics counters
                 v = r.m
-                self.c['rounds'] += v[0]
-                self.c['draft_tokens'] += v[1]
-                self.c['accepted'] += v[2]
-                cur, pp = self.c['per_pos'], v[3:]
-                self.c['per_pos'] = [(cur[i] if i < len(cur) else 0) + (pp[i] if i < len(pp) else 0)
-                                     for i in range(max(len(cur), len(pp)))]
-                r.spec = {'drafts': v[0], 'draft_tokens': v[1], 'accepted': v[2], 'accepted_per_pos': pp}
+                r.spec = {'drafts': v[0], 'draft_tokens': v[1], 'accepted': v[2], 'accepted_per_pos': v[3:]}
             if reason not in ('stop', 'length', 'error', 'abort'):
                 reason = 'error'
             self.finish(r, reason, ct=ct, stop_id=sid if sid >= 0 else None,

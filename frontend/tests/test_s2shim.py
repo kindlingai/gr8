@@ -568,6 +568,7 @@ class RequestMetrics(S2Base):
         c.send(gen('r1', prompt, max_tokens=n))
         await asyncio.sleep(0.4)                    # mid-request: held pages differ from the reservation
         mid = await self.metrics(c, 2)
+        self.assertGreater(mid['spec']['drafts'], 0)                 # the counters move while the request decodes
         self.assertGreater(mid['kv']['active_tokens'], 0)
         self.assertEqual(mid['kv']['active_tokens'] % 64, 0)
         self.assertGreater(mid['kv']['reserved_tokens'], mid['kv']['active_tokens'])
