@@ -31,6 +31,16 @@ release. If you run it, please tell us what breaks: issues and PRs are welcome.*
   three to six boxes needs no build ([Docker Compose](docs/DEPLOY.md#docker-compose)). The one-box and two-box recipes publish their
   own images.
 
+## Recipes
+
+`gr8` is available in easy-to-use recipes preconfigured for the best performance for a given
+model and cluster size.
+
+### GLM 5.3 Flash
+
+ - One DGX Spark: https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark
+ - Two DGX Sparks: https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark
+
 ## Models
 
 | model | boxes | weights on Hugging Face | one stream: decode code / prose, prefill of an 8K prompt | page |
