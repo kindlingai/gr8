@@ -4,6 +4,7 @@
   bench.py [--quick | --full] [--url U] [--hosts H1,H2,...] [--cap HOST=MHZ] [--baseline OLD.json] [--json OUT.json]
   bench.py compare OLD.json NEW.json
   bench.py kl-ref --out FILE [--url U]
+  bench.py kindling REPORT.json --out kindling.json --config-id ID [--label L] [--nodes N] [--default]
 
 Levels (README.md has the table): --quick is prefill, code and prose decode, and concurrent streams; the default adds
 the smoke test, the correctness checks and structured and counting decode, in about 20 minutes; --full adds more runs,
@@ -26,7 +27,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gr8bench import client as C, kl, report, stages as S, thermal  # noqa: E402
+from gr8bench import client as C, kindling, kl, record, report, stages as S, thermal  # noqa: E402
 
 DATA = Path(__file__).resolve().parent / 'data'
 # the timed stages first: each starts from a cooled cluster, uncapped; the rest run capped and need no cooldown
@@ -72,6 +73,9 @@ def run(a):
            'heat': {}, 'requests': ctx.requests, 'suspect': ctx.suspect}
     if a.health:
         rep['meta']['rank_health'] = json.loads(Path(a.health).read_text())
+    if a.record:
+        ctx.recorder = record.Recorder(Path(a.record), record.context(cl, label, rep['meta']['hosts'], a.effort))
+        rep['meta']['record'] = a.record
 
     def finish(*_):
         th.stop()
@@ -168,6 +172,13 @@ def main():
     k.add_argument('--out', required=True)
     k.add_argument('--commit', default='')
     k.add_argument('--topology', default='')
+    kj = sub.add_parser('kindling', help="create or update one config of a kindling.json from a report's numbers")
+    kj.add_argument('report')
+    kj.add_argument('--out', default='kindling.json')
+    kj.add_argument('--config-id', required=True)
+    kj.add_argument('--label', help='the config\'s label, e.g. "TP=1" (an existing one is kept without it)')
+    kj.add_argument('--nodes', type=int)
+    kj.add_argument('--default', action='store_true', help='make this config the default_config')
     g = ap.add_mutually_exclusive_group()
     g.add_argument('--quick', action='store_true', help='prefill, code and prose decode, concurrent streams')
     g.add_argument('--full', action='store_true', help='everything, with GSM8K and HumanEval')
@@ -190,8 +201,12 @@ def main():
     ap.add_argument('--label', default='')
     ap.add_argument('--series', default='gr8bench-1', help='runs pair only within one series')
     ap.add_argument('--effort', default='low', help='reasoning_effort: low, high, max, or nothink')
+    ap.add_argument('--needle-seed', type=int,
+                    help="the needle stage's seed (the document and the secret; a failed needle's report has it)")
     ap.add_argument('--kl-ref', help='a KL reference (bench.py kl-ref) of this model and topology')
     ap.add_argument('--kl-max', type=float, help='largest mean KL that passes (shown, not gated, without it)')
+    ap.add_argument('--record', metavar='DIR',
+                    help='save every streamed delta of the concurrency and agentic stages, with arrival times, to DIR')
     ap.add_argument('--health', help="this boot's rank health probe result (scripts/rank_health.sh), kept in the report")
     ap.add_argument('--data-dir', default=str(Path.home() / '.cache' / 'gr8bench'), help='GSM8K and HumanEval data')
     a = ap.parse_args()
@@ -199,6 +214,8 @@ def main():
         return compare_files(a)
     if a.cmd == 'kl-ref':
         return kl_ref(a)
+    if a.cmd == 'kindling':
+        return kindling.run(a.report, a.out, a.config_id, a.label, a.nodes, a.default)
     return run(a)
 
 

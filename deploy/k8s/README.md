@@ -33,7 +33,7 @@ image:
   tag: sha-<commit>                 # the same build on every box: they refuse a mix
 size: 4                             # TP: 3, 4, 5 or 6
 options:                            # the launcher's options (./gr8 knobs)
-  GR8_MODEL: glm53                  # required: glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash)
+  GR8_MODEL: glm53                  # required: glm53 (GLM-5.3), glm53f (GLM-5.3-Flash) or ds41 (DeepSeek-V4.1-Flash-1017)
   MODEL: https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4    # required: a release of that model
   DRAFTER: https://huggingface.co/incoai/GLM-5.3-DFlash2     # glm53 at TP=4 only
   # SHAPE: ring                     # no switch: the boxes cabled in a ring
@@ -49,7 +49,9 @@ storage:
 
 `GR8_MODEL` and `MODEL` have no default, and `helm install` refuses a values file without them: `./gr8 models` lists
 each model's release, TP sizes and variants (for GLM-5.3-Flash, `GR8_MODEL: glm53f`, its release, and no `DRAFTER`).
-For TP=3, `size: 3` and no `DRAFTER`. Then, from a checkout:
+For TP=3, `size: 3` and no `DRAFTER`. For DeepSeek-V4.1-Flash, `GR8_MODEL: ds41`, `size: 4`, no `DRAFTER`, and `MODEL` the
+release's directory inside the pod (a local copy, read in place: `extraVolumes`, or the model-loader store below); ask
+[FIRST-BOOT.md](../../docs/FIRST-BOOT.md)'s questions first. Then, from a checkout:
 
     kubectl create namespace gr8
     kubectl label namespace gr8 pod-security.kubernetes.io/enforce=privileged

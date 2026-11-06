@@ -5,7 +5,7 @@
 #                                                                              only the binaries, into out/bin
 #
 # Stages: toolchain (CUDA devel + rdma-core) -> rust -> loader (the Rust loader) and kvman (the Rust S2 page allocator)
-# -> engine and engine-int4, with front (the Rust front end) beside them -> dist (the binaries only)
+# -> engine, engine-int4, engine-flash and engine-ds41, with front (the Rust front end) beside them -> dist (the binaries only)
 # -> runtime (CUDA runtime + binaries, scripts, shims).
 ARG CUDA_VERSION=13.0.1
 ARG UBUNTU=ubuntu24.04
@@ -41,10 +41,13 @@ FROM rust AS kvman
 COPY engine/knobs-rs engine/knobs-rs
 COPY knobs knobs
 COPY engine/kvman-rs engine/kvman-rs
+COPY engine/scheduler-rs engine/scheduler-rs
 RUN mkdir -p /out \
  && cargo build --release --locked --manifest-path engine/kvman-rs/Cargo.toml \
+ && cargo build --release --locked --manifest-path engine/scheduler-rs/Cargo.toml \
  && cp engine/kvman-rs/target/release/libg6kvman.a engine/kvman-rs/target/release/kvman-remote /out/ \
- && rm -rf engine/kvman-rs/target
+ && cp engine/scheduler-rs/target/release/libg6sched.a /out/ \
+ && rm -rf engine/kvman-rs/target engine/scheduler-rs/target
 
 FROM rust AS knobs
 COPY engine/knobs-rs engine/knobs-rs
@@ -93,7 +96,7 @@ COPY --from=xgrammar-src /out-xgrammar /opt/xgrammar
 RUN /xgrammar_build.sh /opt/xgrammar /xb && mkdir -p /out && cp /xb/libxgrammar.a /out/ && rm -rf /xb
 
 # engine-src copies only the engine sources, so edits to docs, scripts or the front end keep the engine layers cached.
-# This stage has no cargo: build.sh skips its cargo step and links the libg6load.a, libg6kvman.a and libgr8knobs.a
+# This stage has no cargo: build.sh skips its cargo step and links the libg6load.a, libg6kvman.a, libg6sched.a and libgr8knobs.a
 # built above.
 FROM toolchain AS engine-src
 WORKDIR /src
@@ -102,6 +105,7 @@ COPY tools/health/gpuprobe.cu tools/health/gpuprobe.cu
 COPY scripts/build.sh scripts/build.sh
 COPY --from=loader /out/libg6load.a engine/loader-rs/target/release/libg6load.a
 COPY --from=kvman /out/libg6kvman.a engine/kvman-rs/target/release/libg6kvman.a
+COPY --from=kvman /out/libg6sched.a engine/scheduler-rs/target/release/libg6sched.a
 COPY --from=knobs /out/libgr8knobs.a engine/knobs-rs/target/release/libgr8knobs.a
 
 # the GLM and Flash engine stages add XGrammar; the tests build without it, so they do not wait for its stage
@@ -131,6 +135,14 @@ FROM engine-src-glm AS engine-flash
 RUN MODEL=flash scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4_flash ! -name m4sim_flash -exec rm -rf {} +
 
+# DeepSeek-V4.1-Flash-1017: g6m4_ds41 and m4sim_ds41 (MODEL=ds41), TP 4. build.sh builds it without request grammars, so
+# it starts from engine-src and does not wait for XGrammar. Its build knobs (GR8_DS_TRUNK_BF16) come from
+# ds41_build_flags.sh, which only this stage copies, so the other engine stages keep their cache.
+FROM engine-src AS engine-ds41
+COPY scripts/ds41_build_flags.sh scripts/ds41_build_flags.sh
+RUN MODEL=ds41 scripts/build.sh /out/bin \
+ && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4_ds41 ! -name m4sim_ds41 -exec rm -rf {} +
+
 # the 4-bit KV latent (--kv-format int4, docs/KV4.md): g6m4 alone, built with -DG6_KV4=1, as g6m4-int4 next to the fp8
 # engine, for every TP width
 FROM engine-src-glm AS engine-int4
@@ -139,17 +151,18 @@ RUN GR8_WIDTHS="$GR8_WIDTHS" KV_FORMAT=int4 scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4-int4 -exec rm -rf {} +
 
 # rust-dist holds the Rust binaries only: CI builds them on a hosted arm runner, and its engine job links libg6load.a,
-# libg6kvman.a and libgr8knobs.a
+# libg6kvman.a, libg6sched.a and libgr8knobs.a
 FROM scratch AS rust-dist
 COPY --from=loader /out/libg6load.a /out/g6load /
 COPY --from=kvman /out/libg6kvman.a /
+COPY --from=kvman /out/libg6sched.a /
 COPY --from=knobs /out/libgr8knobs.a /
 COPY --from=front /out/g6front-rs /
 
 # dist holds the shipped binaries in bin/: g6m4 (fp8 KV) and g6m4-int4 (--kv-format int4), both for every TP width,
 # and g6load (the Hugging Face fetch's planner and checker). build.sh's CPU test binaries and objects stay behind.
 # tr3_e4m3_test is the GPU decode check build.sh cannot run without a GPU.
-# dist-fp8, dist-int4, dist-flash and dist-tests are the four parts of dist. Their
+# dist-fp8, dist-int4, dist-flash, dist-ds41 and dist-tests are the five parts of dist. Their
 # stages are the whole cost of a build and they share nothing, so CI builds each
 # in its own job and unpacks the artifacts into one directory. dist stays the
 # union, for a local build and for anything that wants every binary from one target.
@@ -167,6 +180,9 @@ COPY --from=engine-int4 /out/bin/g6m4-int4 /bin/
 FROM scratch AS dist-flash
 COPY --from=engine-flash /out/bin/g6m4_flash /out/bin/m4sim_flash /bin/
 
+FROM scratch AS dist-ds41
+COPY --from=engine-ds41 /out/bin/g6m4_ds41 /out/bin/m4sim_ds41 /bin/
+
 FROM scratch AS dist-tests
 COPY --from=engine-tests /out/bin/gpuprobe /out/bin/tr3_e4m3_test /bin/
 
@@ -174,6 +190,7 @@ FROM scratch AS dist
 COPY --from=dist-fp8 / /
 COPY --from=dist-int4 / /
 COPY --from=dist-flash / /
+COPY --from=dist-ds41 / /
 COPY --from=dist-tests / /
 
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-${UBUNTU} AS runtime

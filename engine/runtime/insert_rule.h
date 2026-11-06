@@ -14,4 +14,5 @@ struct InsertRule
     bool on() const { return after >= 0; }
 };
 constexpr int INSERT_MAX = 64;        // tokens one rule may insert
+template <class V> void fields(V& v, InsertRule& r) { v(r.after)(r.unless)(r.tokens); }
 }   // namespace g6rt

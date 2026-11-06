@@ -20,7 +20,9 @@ These have no default ([DEPLOY.md](DEPLOY.md), "The two settings"):
    model-loader ([DEPLOY.md](DEPLOY.md#with-model-loader)).
 
 For `ds41`, also set Engram on every box: `GR8_DS_ENGRAM=1` and `GR8_DS_ENGRAM_PREFIX` in `EXTRA_ENV`
-([ENV.md](ENV.md)). It is part of the model, not a trade-off.
+([ENV.md](ENV.md)). It is part of the model, not a trade-off. Its prefix needs a token map that is in neither the repo
+nor the release, so write it before the first `up`: [DEEPSEEK-BOOT.md](DEEPSEEK-BOOT.md) is the whole ds41 boot in
+order.
 
 ## 2. DeepSeek-V4.1-Flash (`ds41`): how many chats, and how long
 

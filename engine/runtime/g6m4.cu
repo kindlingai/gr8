@@ -521,6 +521,10 @@ int main(int argc, char** argv)
         if (kv_format != built)
             die("--kv-format " + kv_format + ": this engine is the " + built + " build (bin/g6m4 is fp8, bin/g6m4-int4 is int4)");
         if (cfg.rank == 0) fprintf(stderr, "# rank 0: KV format %s (latent row %d B, %s)\n", kv_format.c_str(), g6kv::ROW, g6kv::NAME);
+        if (cfg.rank == 0)   // module_info.h: what host code reads about this build
+            fprintf(stderr, "# rank 0: module %s abi %u: TP%d, %d rows a step, %d session slots, KV %s %d B a row, caps %#x\n",
+                    g6mod::INFO.name, g6mod::INFO.abi, g6mod::INFO.nr, g6mod::INFO.mx, g6mod::INFO.max_sessions, g6mod::INFO.kv_format,
+                    g6mod::INFO.kv_row_bytes, g6mod::INFO.caps);
     }
 #if G6_MODEL_DS41
     // Parse before --check-args, CUDA, fabric or weights. Unset decode cut inherits the main cut.
@@ -705,6 +709,8 @@ int main(int argc, char** argv)
         // decode slot. Fabric::enqueue_step still checks each collective against its own slot.
         const int tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
         if (tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
+        ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1): before late_start() sizes the fabric runs below
+        if (ds41::br::l20_tail() && !tail) die("GR8_DS_PF_L20_TAIL=1 needs GR8_DS_PF_TAIL (layer 20 joins the bounded replay)");
         const int i_late = tail ? ds41::br::late_start(layers) : -1;
         bool pf_rs_on = false;
         // GR8_DS_PF_RS=1: layer exchanges c < 2 i_late of a prefill chunk run as reduce-scatter + all-gather (ds41_rs.h). Run 0 holds NR
@@ -2260,7 +2266,11 @@ int main(int argc, char** argv)
         // bounded replay (ds41_pf_split.h): GR8_DS_PF_TAIL, read once; 0 = off (the unsplit non-final plan)
         const int pf_tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
         if (pf_tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
-        if (pf_min) fprintf(stderr, "# rank %d DS41 prefill bounded replay tail %d (layers >= %d)\n", R, pf_tail, geom::LATE_LAYER_START);
+        ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1); the same value the fabric block set
+        if (ds41::br::l20_tail() && !pf_tail) die("GR8_DS_PF_L20_TAIL=1 needs GR8_DS_PF_TAIL (layer 20 joins the bounded replay)");
+        if (pf_min) fprintf(stderr, "# rank %d DS41 prefill bounded replay tail %d (layers >= %d)\n", R, pf_tail, ds41::br::late_layer_start());
+        if (pf_min && ds41::br::l20_tail())
+            fprintf(stderr, "# rank %d DS41 GR8_DS_PF_L20_TAIL=1: layer 20 in the bounded replay (ca row on every row, the rest of the layer on the tail rows)\n", R);
         // ds41_pf_split.h late_skip: GR8_DS_PF_LATE_FINAL=1 = a chunk with (N-1) - context >= tail + WINDOW rows after it skips range B. Default off.
         bool pf_late_final = false;
         if (knob::ds_pf_late_final()) {

@@ -332,6 +332,14 @@ class ShimTests(unittest.TestCase):
             self.assertEqual(a[a.index('--sessions') + 1], want)
             self.assertNotIn('--capacity-slots', a)
 
+    def test_the_shim_takes_max_model_len(self):
+        # #339: MAX_MODEL_LEN caps a request apart from CAP; unset, the model's max positions (the shim then takes the
+        # smaller of that and the pool's room)
+        a = self.shim_argv('--gr8-model', 'glm53f')
+        self.assertEqual(a[a.index('--max-model-len') + 1], '1048576')
+        a = self.shim_argv('--gr8-model', 'glm53f', '--cap', '1048640', '--max-model-len', '262144')
+        self.assertEqual(a[a.index('--max-model-len') + 1], '262144')
+
     def test_the_ds41_identity_is_the_engines_own(self):
         geom = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'engine', 'model_geom_ds41.h')).read()
         vocab = int(re.search(r'constexpr int VOCAB = (\d+);', geom).group(1))

@@ -1,6 +1,6 @@
 #!/bin/bash
 # The image's entrypoint: ./gr8 $GR8_MODEL COMMAND [OPTIONS], with no command meaning `up`. GR8_MODEL is required
-# (glm53 or glm53f): nothing picks the model for the runner. It first sets up this box's working directory (GR8_WORK_DIR):
+# (glm53, glm53f or ds41): nothing picks the model for the runner. It first sets up this box's working directory (GR8_WORK_DIR):
 # out/ exists, and bin/ links to the image's engine, which runs every TP width.
 #
 # It sets its own limits, so a runtime without compose's `ulimits:` (Kubernetes has no such field) needs no wrapper: no
@@ -18,7 +18,8 @@ cmd=$1; shift
 
 # ./gr8 refuses an unknown name, listing the models; this names the line to add.
 if [ -z "${GR8_MODEL:-}" ]; then
-  echo "gr8: GR8_MODEL is not set: name the model, GR8_MODEL=glm53 (GLM-5.3) or GR8_MODEL=glm53f (GLM-5.3-Flash)," \
+  echo "gr8: GR8_MODEL is not set: name the model, GR8_MODEL=glm53 (GLM-5.3), GR8_MODEL=glm53f (GLM-5.3-Flash)" \
+       "or GR8_MODEL=ds41 (DeepSeek-V4.1-Flash-1017)," \
        "in docker/.env, with docker run -e, or in the container's env on Kubernetes" >&2
   exit 2
 fi

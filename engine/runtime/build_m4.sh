@@ -30,7 +30,10 @@ cache_counts() { [ -f $GR8_NVCC_CACHE_LOG ] && echo "nvcc cache: $(grep -c '^hit
 # builds it with cargo
 KNOBLIB=../knobs-rs/target/release/libgr8knobs.a
 [ -f "$KNOBLIB" ] || { echo "need $KNOBLIB: cargo build --release --features capi --manifest-path engine/knobs-rs/Cargo.toml"; exit 1; }
-KNOBS="$KNOBLIB -lpthread -ldl -lm"
+# the host-side S2 scheduling logic in Rust (engine/scheduler-rs, g6sched.h): everything that links the knob table
+SCHEDLIB=../scheduler-rs/target/release/libg6sched.a
+[ -f "$SCHEDLIB" ] || { echo "need $SCHEDLIB: cargo build --release --manifest-path engine/scheduler-rs/Cargo.toml"; exit 1; }
+KNOBS="$KNOBLIB $SCHEDLIB -lpthread -ldl -lm"
 # the attention TU, its binder and its op table (attn/ops.h): attn.cu + bind.cu + ops_glm.cu (GLM), flash_attn.cu +
 # flash_bind.cu + ops_flash.cu (Flash: NoPE MLA + kpool indexer), ds41_attn_dspark.cu + ds41_bind.cu + ops_ds41.cu (DeepSeek-V4.1-Flash-1017:
 # ops_ds41.cu is the table that names the ops that exist)
@@ -127,7 +130,7 @@ done
 wait
 cat $O/*.log
 if ls $O/*.failed > /dev/null 2>&1; then echo "build_m4.sh failed: $(cd $O && ls *.failed | sed 's/\.log\.failed//')"; exit 1; fi
-SHARED="$O/g6pack.o $O/devimage.o ${KVC%% *} $KVLIB $KNOBLIB"
+SHARED="$O/g6pack.o $O/devimage.o ${KVC%% *} $KVLIB $KNOBLIB $SCHEDLIB"
 if [ "$WHAT" != sim ]; then SHARED="$SHARED $O/fabric.o"; fi
 if [ -n "$RSDEF" ]; then SHARED="$SHARED $RSLIB"; fi
 nm --defined-only -g $SHARED 2> /dev/null | awk 'NF == 3 { print $3 }' | sort -u > $O/shared.syms

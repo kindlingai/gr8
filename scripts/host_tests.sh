@@ -46,11 +46,15 @@ KN=$REPO/engine/knobs-rs/target/release/libgr8knobs.a
 if command -v cargo > /dev/null 2>&1; then
   cargo build --release --quiet --manifest-path "$REPO/engine/kvman-rs/Cargo.toml"
   cargo build --release --quiet --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
+  cargo build --release --quiet --manifest-path "$REPO/engine/scheduler-rs/Cargo.toml"
 fi
 [ -f "$KV" ] || { echo "no $KV: cargo build --release --manifest-path engine/kvman-rs/Cargo.toml"; exit 1; }
 [ -f "$KN" ] || { echo "no $KN: cargo build --release --features capi --manifest-path engine/knobs-rs/Cargo.toml"; exit 1; }
-KVLIB=("$KV" "$KN" -lpthread -ldl -lm)
-KNOBS=("$KN" -lpthread -ldl -lm)
+# the host-side S2 scheduling logic in Rust (engine/scheduler-rs): every test that includes the S2 headers links it
+SL=$REPO/engine/scheduler-rs/target/release/libg6sched.a
+[ -f "$SL" ] || { echo "no $SL: cargo build --release --manifest-path engine/scheduler-rs/Cargo.toml"; exit 1; }
+KVLIB=("$KV" "$KN" "$SL" -lpthread -ldl -lm)
+KNOBS=("$KN" "$SL" -lpthread -ldl -lm)
 # the knob table: its C++ header over the C API
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/knobs-rs" "$REPO/engine/knobs-rs/tests/header_test.cpp" "${KNOBS[@]}" \
   -o "$T/knobs_header_test"
@@ -70,6 +74,29 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 # the n-gram table as a draft source (GR8_NGRAM, #56): the table file, chains, the round choice, exact output
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_ngram_test.cpp" -o "$T/batch_ngram_test" "${KNOBS[@]}"
 "$T/batch_ngram_test" 2>/dev/null    # the GR8_MTP_LPLOG case prints its round lines
+# the build's description (module_info.h) in each model's shape
+# (the serving shapes: build_m4.sh's -DDEC_S2 and widths, DS41 at 48 rows; and a TP6 build's defaults)
+for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O2 -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/module_info_test.cpp" -o "$T/module_info_test" "${KVLIB[@]}"
+  "$T/module_info_test"
+done
+# engine/scheduler-rs against transcripts recorded from the C++ it replaced, in each model's shape (the module's slots
+# and caps decide which configs the scheduler takes)
+# under the sanitizers in the default shape only: the 32-slot DS41 shape took 13 minutes there on CI's runner
+for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  if [ -z "$f" ]; then opt="-O1 -g -fsanitize=address,undefined"; else opt="-O2"; fi
+  g++ -std=c++17 $opt -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rs_vectors_test.cpp" -o "$T/scheduler_rs_vectors_test" "${KVLIB[@]}"
+  "$T/scheduler_rs_vectors_test"
+done
+# the planner's round log and its replay (GR8_S2_REPLAY_LOG, s2/round_replay.h); GR8_S2_FRESH_SPEC
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_replay_test.cpp" -o "$T/batch_replay_test" "${KNOBS[@]}"
+"$T/batch_replay_test" "$T/replay.log"
+GR8_S2_REPLAY_LOG="$T/env.log" "$T/batch_replay_test"   # the knob set as well: record() moves the log, wraps once
+# the planner's floating-point decisions with and without contracted multiply-adds: both builds must replay the log
+for c in off fast; do
+  g++ -std=c++17 -O2 -Wall -ffp-contract=$c -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/round_replay.cpp" -o "$T/round_replay_$c" "${KNOBS[@]}"
+  "$T/round_replay_$c" "$T/replay.log"
+done
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/ngram_lookup_check.cpp" -o "$T/ngram_lookup_check" "${KNOBS[@]}"
 (cd "$REPO/tools/ngram/tests" && NGRAM_LOOKUP_CHECK="$T/ngram_lookup_check" python3 -m unittest -q test_ngram.ExportTest)
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dflreuse_test.cpp" -o "$T/batch_dflreuse_test" "${KNOBS[@]}"
@@ -271,6 +298,17 @@ g++ -std=c++17 -O2 -Wall "$REPO/engine/kernels/tests/ds_ro_host_test.cpp" -o "$T
 # DS41 W4096: RO_MAX 4096 is the largest prefill width, and the RoScratch tile capacity holds the 4096-row plan
 g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" -I "$REPO/engine/kernels" "$REPO/engine/tests/test_ds41_w4096.cpp" -o "$T/test_ds41_w4096"
 "$T/test_ds41_w4096"
+# the bounded-replay split (runtime/ds41_pf_split.h), off and with GR8_DS_PF_L20_TAIL=1 (layer 20 in range B, its ca row hoisted)
+g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/test_ds41_pf_split.cpp" -o "$T/test_ds41_pf_split"
+"$T/test_ds41_pf_split" > "$T/pf_split.log" || { cat "$T/pf_split.log"; exit 1; }
+tail -1 "$T/pf_split.log"
+# the two-lane W prefill contract (runtime/ds41_lanes.h): schedules, fabric tables, scheduler; again with GR8_DS_PF_L20_TAIL=1
+g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" -I "$REPO/engine/runtime" -I "$REPO/engine/comms" -I "$REPO/engine/kernels" \
+  "$REPO/engine/tests/test_ds41_lanes.cpp" -o "$T/test_ds41_lanes" "${KNOBS[@]}"
+"$T/test_ds41_lanes" > "$T/lanes.log" || { cat "$T/lanes.log"; exit 1; }
+tail -1 "$T/lanes.log"
+"$T/test_ds41_lanes" l20 > "$T/lanes_l20.log" || { cat "$T/lanes_l20.log"; exit 1; }
+tail -1 "$T/lanes_l20.log"
 # DS41 shifted-mHC trunk (engine/mhc/ds_cpu.h) against the torch reference; it needs torch, so it skips without it
 if python3 -c "import torch, numpy" 2>/dev/null; then
   bash "$REPO/engine/runtime/tests/ds_mhc_cpu_test.sh" "$T/ds_mhc_cpu_test"
@@ -285,6 +323,21 @@ g++ -std=c++17 -O2 -Wall "$REPO/engine/runtime/tests/pf_peer_stage_test.cpp" -o 
 "$T/pf_peer_stage_test"
 g++ -std=c++17 -O2 -I "$REPO/engine/kernels" "$REPO/engine/tests/test_topk.cpp" -o "$T/test_topk" "${KNOBS[@]}"
 "$T/test_topk"
+# DS41 S2 host tests: prefill admission, its two lanes, 32-session steps, the 32-session 64K config, the DSpark round
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" -I "$REPO/engine/comms" "$REPO/engine/runtime/s2/tests/ds41_prefill_test.cpp" -o "$T/ds41_prefill_test" "${KNOBS[@]}"
+"$T/ds41_prefill_test"
+for t in ds41_prefill_lanes_test ds41_s32_step_test s32_64k_mtp8_test batch_ds41_dspark_test; do
+  g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" -I "$REPO/engine/runtime/s2" -I "$REPO/engine" "$REPO/engine/runtime/s2/tests/$t.cpp" -o "$T/$t" "${KVLIB[@]}"
+  "$T/$t" > "$T/$t.out" 2>&1 || { cat "$T/$t.out"; exit 1; }
+done
+# the S2 layer in the Flash build's shape (s2_batch.h's Flash cost model, its slot count): the model-generic tests again
+for t in batch_dflash_test batch_dflreuse_test batch_draftpar_test batch_dsel_test batch_dselmodel_test batch_insert_test \
+         batch_kstop_test batch_kstopb_test batch_kstop_mtp_test batch_ngram_test batch_round_test batch_replay_test \
+         driver_grow_test driver_prefill_quantum_test scheduler_fair_test scheduler_rounds_test scheduler_r_test \
+         scheduler_tail_first_test cp_rows_test grammar_request_test kv_plan_test; do
+  g++ -std=c++17 -O1 -Wall -pthread -DG6_MODEL_FLASH=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/$t.cpp" -o "$T/flash_$t" "${KVLIB[@]}"
+  (cd "$T" && "$T/flash_$t" > "$T/flash_$t.out" 2>&1) || { cat "$T/flash_$t.out"; echo "flash build: $t failed"; exit 1; }
+done
 # the control channel: sync and idle peers (the socketpair cases; the silent-peer case needs a network
 # namespace)
 for t in control_sync_test control_idle_test; do

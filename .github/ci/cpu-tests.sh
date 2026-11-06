@@ -50,6 +50,8 @@ if [ "$PART" != frontend ]; then
   cargo test --locked --manifest-path engine/kvman-rs/Cargo.toml
   step "Rust: engine/knobs-rs"
   cargo test --locked --manifest-path engine/knobs-rs/Cargo.toml
+  step "Rust: engine/scheduler-rs"
+  cargo test --locked --manifest-path engine/scheduler-rs/Cargo.toml
 fi
 
 [ "$PART" = engine ] && exit 0
@@ -66,9 +68,10 @@ else
 fi
 
 step "Python tests (front end and launcher)"
-# the S2 headers read knobs: link the knob table's C API
+# the S2 headers read knobs and call the S2 scheduling logic: link the knob table's C API and engine/scheduler-rs
 cargo build --release --locked --quiet --features capi --manifest-path engine/knobs-rs/Cargo.toml
-KNOBS=(engine/knobs-rs/target/release/libgr8knobs.a -lpthread -ldl -lm)
+cargo build --release --locked --quiet --manifest-path engine/scheduler-rs/Cargo.toml
+KNOBS=(engine/knobs-rs/target/release/libgr8knobs.a engine/scheduler-rs/target/release/libg6sched.a -lpthread -ldl -lm)
 g++ -std=c++17 -O2 -Wall -Wextra -I engine/runtime \
   engine/runtime/s2/tests/steering_transport_test.cpp -o "$T/steering_transport_test" "${KNOBS[@]}"
 (cd frontend && STEERING_TRANSPORT_CHECK="$T/steering_transport_test" python3 -m unittest tests.test_s2shim tests.test_steering)

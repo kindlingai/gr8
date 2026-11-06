@@ -362,6 +362,14 @@ knobs:
     doc: >-
       S2: logs one line when the head anchors a notice, one when each rank applies the commit, and one per prefill
       quantum. Logs only.
+  GR8_S2_FRESH_SPEC:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1: the adaptive verify-width estimates (--spec-adaptive) restart with every DFlash2 request, as the drafter choice
+      does, so a request's T=0 reply does not depend on the requests before it. For gates that compare T=0 replies across
+      boots; serving keeps 0.
   GR8_S2_GROW:
     scope: agree
     kind: flag
@@ -370,6 +378,14 @@ knobs:
     doc: >-
       S2: a session holds the KV pages it needs now and takes more as its output grows, while every live session can
       still reach its worst case. 0 = every run holds its worst case from admission.
+  GR8_S2_REPLAY_LOG:
+    scope: local
+    kind: path
+    unset: "no log"
+    doc: >-
+      S2: every rank writes its planner's round log to PATH.<pid>: its settings, each call the driver makes and each
+      step's tokens, enough for engine/runtime/s2/tests/round_replay to rerun the planner and check every step. Each
+      call also hashes every slot's tokens and writes on the compute thread, so take no timing from a logging boot.
   GR8_S2_ROUNDLOG:
     scope: local
     kind: flag

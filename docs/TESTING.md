@@ -23,9 +23,10 @@ What the two halves cover, and how to run one part alone:
 
 | test | half | command |
 |---|---|---|
-| S2 batch planner (with insert rules), control barrier, pool reuse, runs that grow on demand, the pool's block stores (`--kv-store`) in lock-step through memory, a file and a loopback KV node | engine | `scripts/host_tests.sh` |
+| S2 batch planner (with insert rules), control barrier, pool reuse, runs that grow on demand, the pool's block stores (`--kv-store`) in lock-step through memory, a file and a loopback KV node; the planner's round log and its replay; the model-generic S2 tests again in the Flash build's shape; the DS41 prefill, lane and 32-session tests | engine | `scripts/host_tests.sh` |
 | the S2 page allocator's properties (no page lost or held twice, growth only from a safe state, no deadlock, ranks agree, across shrinks and grows of the pool), and the SSD and remote page stores (the remote one over loopback TCP; `kvman-remote-bench --isolation` checks RDMA on the hardware) | engine | `cargo test --manifest-path engine/kvman-rs/Cargo.toml` |
 | the exlr8 dense decoder against `loader/exlr8.py` (a synthetic fixture), the layout planner (`engine/loader-rs/src/layout.rs`): the counts the engine reads, balance, the fewest pieces moved, and the trellis codebooks (`src/codebook.rs`): every state against the GPU test's hashes, and each layer's codebook from its width files, with the refusals | engine | `cargo test --manifest-path engine/loader-rs/Cargo.toml` |
+| the S2 host logic moved to Rust (`engine/scheduler-rs`: KV copy batches, Flash chunk lending and KDA rings, rounds past R, the scheduler, the admission queue, the KV share rule, the request parser); through its C++ headers against transcripts recorded from the C++ it replaced: `scheduler_rs_vectors_test` in `scripts/host_tests.sh` | engine | `cargo test --manifest-path engine/scheduler-rs/Cargo.toml` |
 | the Python reference's trellis codebooks (`engine/ref/g6ref.py`) against the same hashes | engine | `python3 -m unittest discover -s engine/ref -p 'test_*.py'` |
 | the v2 expert converter (`tools/convert/v2.py`), with each codebook and its refusals | engine | `python3 -m unittest tools.convert.test_v2` |
 | the benchmark | engine | `python3 -m unittest discover -s bench/tests` |
@@ -131,3 +132,18 @@ On a booted cluster, from the head:
 - `./gr8 glm53 smoke` passes every case.
 - `./gr8 glm53 bench` checks correctness and measures decode, concurrency and prefill; with `--baseline` it gates them
   against `main` ([bench/README.md](../bench/README.md), [AGENTS.md](../AGENTS.md), "The gate").
+- T=0 replies between two builds or settings: under `--spec-adaptive` the planner's verify-width estimates learn across
+  requests, and the verify's tokens are not bit-identical across widths, so a request's T=0 reply can depend on the
+  requests before it. Compare replies of the first request of a fresh boot only, or boot both sides with
+  `GR8_S2_FRESH_SPEC=1` (the estimates restart with every request) and `GR8_DFL_REUSE=0` (no drafter context carried
+  from the request before), use prompts that share no prefix (or `--reuse-prefix` off: a prefix hit gives the drafter
+  only the suffix's context), keep the drafter choice on (`GR8_S2_DSEL`; with it off and `GR8_MTP_KSTOP=2` its MTP
+  estimates are not restarted), and on DS41 leave `GR8_DS_PARK` and the prefix snapshot cache off. Then every request
+  can be compared.
+- The planner's decisions over a whole session: boot with `GR8_S2_REPLAY_LOG=PATH` in `EXTRA_ENV`, serve the requests,
+  and replay each rank's `PATH.<pid>` on a build of the change:
+  `g++ -std=c++17 -O2 [-DG6_MODEL_DS41=1 | -DG6_MODEL_FLASH=1] -I engine/runtime engine/runtime/s2/tests/round_replay.cpp
+  engine/knobs-rs/target/release/libgr8knobs.a -lpthread -ldl -lm -o round_replay && ./round_replay PATH.<pid>`.
+  It passes when the change's planner asks for every step the logged one did and leaves the same sessions active, as
+  long and with the same committed tokens after every call; it names the first difference. A Flash log also needs
+  `GR8_GLM53F_S2_COST` set as the engine had it and, when that is 1, `-DG6_NR=` the engine's width.

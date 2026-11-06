@@ -83,8 +83,10 @@ def verdicts(rep, cmp, kl_max, base=None):
         if 'skipped' in n:
             add(f'needle {size}', 'INFO', n['skipped'])
         else:
-            add(f'needle {size}', 'PASS' if n['passed'] else 'FAIL', f"{n['prompt_tokens']:,} tokens"
-                + (', found in reasoning only' if n.get('in_reasoning_only') else ''))
+            why = (f", found in the reasoning, answer cut off at {n.get('tokens', '?')} tokens" if n.get('cut_off')
+                   else ', found in reasoning only' if n.get('in_reasoning_only') else '')
+            seed = f", seed {n['seed']}" if 'seed' in n and not n['passed'] else ''
+            add(f'needle {size}', 'PASS' if n['passed'] else 'FAIL', f"{n['prompt_tokens']:,} tokens{why}{seed}")
     a = rep.get('agentic') or {}
     if 'toolcall' in a:
         t = a['toolcall']
