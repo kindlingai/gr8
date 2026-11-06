@@ -2,7 +2,7 @@
 
 gr8 serves [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) from its exlr8 release
 ([kindlingai/glm-5.3-flash-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4)) at TP=4,
-TP=3 (a three-box ring, variant k4) or TP=2. The engine is `bin/g6m4_flash`, a build of the same `g6m4` source with `-DG6_MODEL_FLASH=1`
+TP=3 (a three-box ring, variant k4), TP=2 or TP=1 (one box, variant k2, the one width whose weights fit). The engine is `bin/g6m4_flash`, a build of the same `g6m4` source with `-DG6_MODEL_FLASH=1`
 (`engine/model_geom.h` holds the geometry).
 
 ## Build and run
@@ -78,6 +78,13 @@ Prefill time grows faster than the prompt because the indexer scores every earli
 262K prefill has not been measured. The shim errors a request after 900 s with no output (`--stall-timeout`), and a
 prefill sends none, so a prefill longer than that fails.
 
+## One box (TP=1)
+
+`--tp 1` serves the whole model on one GB10 with the k2 width (about 93 GB of weights on the device). The ranks' fabric
+has no peers then: `g6::Fabric` keeps its region for the kernels' own slots and skips the NIC, the bootstrap and the
+proxy (`engine/comms/fabric.cpp`), and the S2 head agrees with itself (`s2/control_channel.h`). The launcher skips the
+RDMA checks. The router is not split (no ranks to split it over), so the routed experts run on the expert tiles.
+
 ## Several sessions
 
 `--sess N` (`SESS`, 1 to 8; 8 at TP=4, 4 at TP=3, 1 at TP=2) serves up to N requests at once on S2, as GLM-5.3 does: their decode
@@ -126,6 +133,34 @@ index, the aligned point, the manifest) and `flash_checkpoint.cuh` (the store), 
   pages in order (its logical pages, wherever the pool put them), and the KDA state is its first slot (`FlashSlots`).
   An entry is the same bytes whichever session or pages took it, so any session may restore it. Captures wait for the
   next boundary as with one session; no other session's work touches the run or the slot until then.
+- With the DFlash2 drafter (`DFLASH=1`, below).
+
+With the DFlash2 drafter (aligned checkpoints only: the engine refuses `GR8_GLM53F_CACHE=terminal` with it, since a
+terminal checkpoint's KDA state comes from the verify ring and is not cold-exact): a checkpoint holds the target's state
+but not the drafter's context, the last 2,048
+positions of taps in its KV ring (84 MB a rank as prompt taps). Nothing more is stored. The prefill from `p` taps the
+positions it runs, and the drafter takes its context from those (`engine/runtime/s2/flash_dfl_window.h`):
+
+- A hit at least 2,048 rows before the prompt's end (an identical prompt sent again: `p` is the grid point at or below
+  `N - 1`, so this holds whenever the last grid point is 2,048 rows or more back) leaves the drafter's whole window to
+  the prefill. The drafter starts as on a cold prompt.
+- A hit inside the window (an agent's next turn, a few hundred tokens past the last turn's grid point): the prefill taps
+  only `[p, N - 1)`. Under `DFL_REUSE=1` (`GR8_DFL_REUSE`, the default with `FLASH_CACHE`) the session keeps the
+  drafter, as a GLM-5.3 prefix-reuse hit does (`s2_batch.h` `Batch::reuse_start`). When the drafter's ring still holds
+  the previous turn of the same conversation (the last DFlash2 session there had this prompt's tokens up to `p`, and its
+  rows were not written over), the context starts at the window's start and the session drafts with DFlash2 from its
+  first round. Else the context starts at `p`, and with fewer than `DFL_REUSE_MIN` (256) rows the session runs MTP rounds
+  that feed the drafter until it holds that many, then DFlash2. Rank 0 prints `# s2 dflash reuse slot` lines with the
+  rounds on each drafter and the warm-up.
+- A hit that holds every prompt row but the last (a replay) has no prefill: the drafter starts at the prompt step, with
+  the ring's rows when they are this conversation's.
+- `DFL_REUSE=0`: a hit inside the window runs MTP for the whole request, as before. `DFL_REUSE=2` (GLM-5.3's promotion of
+  a session alone on MTP) is not measured on Flash, and the engine refuses it.
+
+The ring's rows below `p` came from the previous turn's prefill and decode taps, not from a cold prefill of this prompt,
+so drafts may differ from a cold boot's. The target verifies every draft: the output is the same as without the drafter
+(aligned is still bit-exact against no cache). Not measured on a cluster yet: smoke, bench's `TTFT cached` with the
+drafter, and decode after a restore against a cold-prefilled request's are open on #340.
 
 Why the output is bit-exact against no cache: a cold prefill runs its quanta as `[kG, (k+1)G)`, and the KDA prefill is
 chunked by quantum, so a warm prefill from `p = kG` runs the same quanta on the same KDA state and the same pages. The
@@ -194,7 +229,7 @@ Limits:
 ## Not yet
 
 - CP and prefix reuse: the engine refuses them under `--serve`. `GR8_GLM53F_CACHE=aligned` (above) is the
-  experimental Flash form of prefix reuse, and it refuses DFlash2. The DFlash2 drafter's taps are the mean of the four
+  experimental Flash form of prefix reuse, with or without DFlash2. The DFlash2 drafter's taps are the mean of the four
   mHC streams after each tapped layer, in decode steps and in the prefill, which keeps the last 2,048 prompt positions
   for the drafter's prompt context. DFlash2 at TP=2 and TP=3 runs offline only.
 - The int4 KV build.

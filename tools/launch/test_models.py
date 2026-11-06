@@ -34,7 +34,7 @@ class OptionTests(unittest.TestCase):
         self.assertEqual((models.of(glm), glm.get('GROUP')), (models.GLM53, 'gr8-glm53'))
 
     def test_refusals(self):
-        for argv, want in ((['--tp', '6'], 'want 4, 3 or 2 (glm53f)'), (['--kv-format', 'int4'], 'fp8 KV build only'),
+        for argv, want in ((['--tp', '6'], 'want 4, 3, 2 or 1 (glm53f)'), (['--kv-format', 'int4'], 'fp8 KV build only'),
                            (['--tp', '3', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3', '--drafter', 'https://huggingface.co/a/b'],
                             'runs at TP=4 (split) and TP=6')):
             with self.assertRaises(opt.OptionError) as e:
@@ -66,6 +66,19 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], sess)
             self.assertEqual(plan['args'][plan['args'].index('--chunk') + 1], '1')
             self.assertIn('GR8_GLM53F_PF_DSA_F16GEMM=1', plan['env'])
+
+    def test_one_box(self):
+        # TP=1: one box, K2 (the width whose experts fit), one session, no drafter
+        o = flash('--tp', '1', peers='10.0.0.1')
+        plan = opt.engine_plan(o)
+        self.assertEqual((plan['knobs']['SESS'], plan['knobs']['DFLASH']), ('1', '0'))
+        self.assertNotIn('--dflash-manifest', plan['args'])
+        self.assertIn('GR8_PF_ROUTER_SPLIT=0', plan['env'])
+        self.assertEqual(models.GLM53F.default_variant[1], ('k2',))
+        self.assertEqual((S.fabric_needed(o), S.fabric_needed(flash())), (False, True))
+        with self.assertRaises(opt.OptionError) as e:
+            flash('--tp', '1', '--ips', '10.1.0.1', '--ips2', '10.2.0.1', peers='10.0.0.1')
+        self.assertIn('--tp 1 takes no --ips', str(e.exception))
 
     def test_max_model_len(self):
         # #339: the longest request, apart from the pool; a cluster option, so the boxes compare it
@@ -136,6 +149,25 @@ class OptionTests(unittest.TestCase):
         a = ' '.join(plan['args'])
         self.assertIn('--dflash-manifest @DFLASH_DIR/dflash.r@R.manifest.json --dflash-pack @DFLASH_DIR/dflash.r@R.pack', a)
         self.assertIn('--spec-adaptive', a)
+
+    def test_flash_cache_with_the_drafter(self):
+        # FLASH_CACHE and DFLASH=1 together (#340): both reach the engine; DFL_REUSE (0 or 1 on glm53f) and
+        # DFL_REUSE_MIN pass through when set, else the engine's default (1 with the cache) holds
+        plan = opt.engine_plan(flash('--dflash', '1', '--dflash-dir', '/d', '--flash-cache', 'aligned'))
+        self.assertIn('GR8_GLM53F_CACHE=aligned', plan['env'])
+        self.assertIn('--dflash-manifest', ' '.join(plan['args']))
+        self.assertFalse([e for e in plan['env'] if e.startswith('GR8_DFL_REUSE')])
+        plan = opt.engine_plan(flash('--dflash', '1', '--dflash-dir', '/d', '--flash-cache', 'aligned',
+                                     '--dfl-reuse', '0', '--dfl-reuse-min', '64'))
+        self.assertIn('GR8_DFL_REUSE=0', plan['env'])
+        self.assertIn('GR8_DFL_REUSE_MIN=64', plan['env'])
+        with self.assertRaises(opt.OptionError) as e:
+            flash('--flash-cache', 'aligned', '--dfl-reuse', '2')
+        self.assertIn('glm53f takes 0 or 1', str(e.exception))
+        # terminal checkpoints are not cold-exact: the drafter takes aligned only (the engine refuses it too)
+        with self.assertRaises(opt.OptionError) as e:
+            flash('--dflash', '1', '--dflash-dir', '/d', '--flash-cache', 'terminal')
+        self.assertIn('aligned checkpoints only', str(e.exception))
 
     def test_sessions(self):
         # SESS 2..8 share decode steps (each session its own KDA slots); a round of every session fits 32 rows
@@ -361,7 +393,8 @@ class RequiredTests(unittest.TestCase):
         self.assertIn('--tp       4, 6, 3 or 5', glm)
         self.assertIn('TP=3 bit225 else down1', glm)
         self.assertIn(models.GLM53.release, glm)
-        self.assertIn('--tp       4, 3 or 2', flash)
+        self.assertIn('--tp       4, 3, 2 or 1', flash)
+        self.assertIn('TP=1 k2', flash)
         self.assertIn('--drafter URL (DFlash2)', flash)
         self.assertEqual(models.SERVED, (models.GLM53, models.GLM53F))
 

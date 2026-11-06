@@ -579,7 +579,7 @@ class Supervisor:
                 self.rdma = mentat.node_view(local)[2]
                 for p in mentat.probe_problems(local, ranks, node_ip, self.rails):
                     log(f'warning: {p}')
-        if o.get('SHAPE') == 'ring' or not models.of(o).fabric:   # no switch: the engine bootstraps over the LAN
+        if o.get('SHAPE') == 'ring' or not fabric_needed(o):   # no switch, or one box: the engine bootstraps over the LAN
             self.rails = (self.lan, self.lan)
         elif o.get('IPS'):
             self.rails = (opt.split_list(o.get('IPS'))[self.rank], opt.split_list(o.get('IPS2'))[self.rank])
@@ -687,7 +687,7 @@ class Supervisor:
             name = engine_bin(o)
             fails.append(f'no {self.home}/bin/{name}: ' + ('KV_FORMAT=int4 ' if name.endswith('-int4') else '') +
                          f'./gr8 {models.of(o).name} build')
-        if models.of(o).fabric and not os.path.isdir('/dev/infiniband'):
+        if fabric_needed(o) and not os.path.isdir('/dev/infiniband'):
             fails.append('no /dev/infiniband')
         if self.rank == 0:
             if not os.access(self.front_bin(), os.X_OK):
@@ -1145,6 +1145,11 @@ def ledger_bin(home):
         if os.access(p, os.X_OK):
             return p
     return None
+
+
+def fabric_needed(o):
+    """Whether the ranks talk over RDMA: a model with a fabric, on more than one box."""
+    return models.of(o).fabric and int(o.get('TP') or 0) > 1
 
 
 def engine_bin(o):

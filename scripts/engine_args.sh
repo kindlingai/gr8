@@ -61,12 +61,12 @@ tp4_default() {
 # GLM-5.3-Flash under --serve takes no CP, prefix reuse or PF_OWN (engine/runtime/g6m4.cu refuses them). DFLASH=1 (TP=4,
 # the default): a session alone drafts with the DFlash2 drafter, SPEC_ADAPT on with it. MTP=1 for sessions sharing steps.
 # SESS: 2..8 share decode steps and the CAP pool, each with its own KDA state slots (docs/FLASH.md, Several sessions);
-# 8 at TP=4, 4 at TP=3, 1 (one request at a time) at TP=2. A round of every session, SESS x (MTP + 1) rows, must fit
+# 8 at TP=4, 4 at TP=3, 1 (one request at a time) at TP=2 and TP=1. A round of every session, SESS x (MTP + 1) rows, must fit
 # the engine's 32. CAP is a 262,144-token request plus a page for the guard rows (2 at MTP=1). Only the 11 DSA layers and
 # the MTP layer keep KV, 1,664 B a token each, and without CP every rank holds the whole context: about 5.2 GB a rank at
 # any TP (docs/FLASH.md, Context). With one session SHARE_LIMIT only sets the front end's default max_tokens.
 flash_defaults() {
-  case $TP in 4|3|2) ;; *) echo "engine_defaults: TP=$TP; GLM-5.3-Flash wants 4, 3 or 2" >&2; return 2 ;; esac
+  case $TP in 4|3|2|1) ;; *) echo "engine_defaults: TP=$TP; GLM-5.3-Flash wants 4, 3, 2 or 1" >&2; return 2 ;; esac
   local k
   for k in REUSE PF_OWN; do
     [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: GLM-5.3-Flash has no $k" >&2; return 2; }
@@ -271,6 +271,7 @@ flash_env() {
   # GR8_GLM53F_PF_SP_X16: an MoE layer's all-gathered MLP input as FP16 rows (byte-equal), about +1.5%
   local sp=0 stage=1 rsplit=1
   [ "$TP" = 4 ] && sp=1 stage=0 rsplit=0
+  [ "$TP" = 1 ] && rsplit=0   # one rank: no router to split
   ENGINE_ENV="GR8_CP=0 GR8_PF_RS=0 GR8_PF_OWN=0 GR8_GLM53F_PF_POOL_OWNER=0 GR8_FPF_P1=0 GR8_FPF_DSA_P1=0 \
 GR8_FPF_ATTN_P1=0 GR8_GLM53F_PF_SPARSE_MLA=1 GR8_GLM53F_PF_SPARSE_MLA_512=1 \
 GR8_GLM53F_PF_SPARSE_MLA_V2=1 GR8_GLM53F_PF_SPARSE_MLA_H16C=1 GR8_PF_DTR8=1 GR8_GLM53F_PF_SHFP8=1 GR8_PF_FC2V2=1 GR8_GLM53F_PF_KDA_WS=1 \
@@ -288,6 +289,9 @@ GR8_GLM53F_PF_STAGE_ASYNC=$stage GR8_GLM53F_PF_SP=$sp GR8_GLM53F_PF_SP_X16=$sp"
     ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_CACHE=$FLASH_CACHE"
     [ -n "${FLASH_STATE_BUDGET_MIB:-}" ] && ENGINE_ENV="$ENGINE_ENV GR8_GLM53F_STATE_BUDGET_MIB=$FLASH_STATE_BUDGET_MIB"
   fi
+  # with DFLASH=1, a checkpoint hit inside the drafter's window keeps the drafter (DFL_REUSE, on with FLASH_CACHE; the
+  # engine's default) after DFL_REUSE_MIN warm-up rows (docs/FLASH.md): off unless set
+  ENGINE_ENV="$ENGINE_ENV${DFL_REUSE:+ GR8_DFL_REUSE=$DFL_REUSE}${DFL_REUSE_MIN:+ GR8_DFL_REUSE_MIN=$DFL_REUSE_MIN}"
   # its KV_STORE on a group lease: when it gives segments to other groups (KV_SHARE_WHEN; docs/SETTINGS.md)
   ENGINE_ENV="$ENGINE_ENV${KV_SHARE_WHEN:+ GR8_KV_SHARE_WHEN=$KV_SHARE_WHEN}"
   # GR8_PF_STRIPE at the engine default at TP=3 and TP=4 (on: large prefill writes use both rails, or at TP=3 the devices

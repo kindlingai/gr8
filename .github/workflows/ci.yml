@@ -294,7 +294,7 @@ jobs:
           [ "${{ github.event_name }}" = pull_request ] && widths='1 4 8'
           echo "widths=$widths" >> "$GITHUB_OUTPUT"
           case "${{ matrix.leg }}" in
-            flash) echo "Flash, TP widths 2 3 4" ;;
+            flash) echo "Flash, TP widths 1 2 3 4" ;;
             ds41) echo "DeepSeek-V4.1-Flash, TP width 4" ;;
             tests) echo "test binaries, dtr_test at TP4" ;;
             *) echo "${{ matrix.label }}, TP widths ${widths:-1 2 3 4 5 6 8}" ;;

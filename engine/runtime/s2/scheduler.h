@@ -25,7 +25,7 @@ inline void require(bool ok, const char* what) { if (!ok) throw std::runtime_err
 inline void check(const char* refused) { if (refused) throw std::runtime_error(refused); }
 constexpr unsigned MAX_SESSIONS = unsigned(g6mod::INFO.max_sessions), PAGE = unsigned(g6mod::INFO.kv_page);
 // DS41: members of one ragged prefill pack (ds41::pack::MAX_SEGMENTS); the slots they name range over MAX_SESSIONS
-constexpr unsigned PACK_MAX_MEMBERS = 8;
+constexpr unsigned PACK_MAX_MEMBERS = unsigned(g6mod::INFO.pack_members);
 // The control link's version: the frame magic is the numeric base "G6S2E0" + this version (control_protocol.h), and the bootstrap agreement
 // carries it (bootstrap.h), so ranks built with different commit frames refuse at bootstrap, not at the first event.
 // 6 adds Commit::hold. 7 adds the Resize event (Commit::resize). 9 adds Ack::room (8 is the fail-soft store's, #159).

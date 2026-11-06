@@ -38,12 +38,14 @@
 // slices on collective NT).
 #pragma once
 #include "prefill.cuh"
+#include "../module_info.h"
 
 namespace g6rt
 {
 namespace dfl
 {
 constexpr int B = 8, K = B - 1;               // block rows (bonus + drafts) = verify rows
+static_assert(B == g6mod::INFO.dfl_block, "the drafter's block rows and the module description (module_info.h) differ");
 constexpr int L = geom::DFL_L, NT = geom::DFL_NT;   // drafter layers, tapped target layers (6, 6; Flash 5, 5)
 constexpr int HD = 128, NH = geom::DFL_NH, NKV = 8, INTER = 12288;   // q heads: 64, Flash 32
 constexpr bool OK_NR = NKV % g6nr::NR == 0;   // TP4 (and TP1/2/8): the body split across the ranks

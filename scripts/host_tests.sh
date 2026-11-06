@@ -99,18 +99,27 @@ for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 
   "$T/scheduler_rs_vectors_test"
 done
 # the planner's round log and its replay (GR8_S2_REPLAY_LOG, s2/round_replay.h); GR8_S2_FRESH_SPEC
-g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_replay_test.cpp" -o "$T/batch_replay_test" "${KNOBS[@]}"
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -ffp-contract=off -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_replay_test.cpp" -o "$T/batch_replay_test" "${KNOBS[@]}"
 "$T/batch_replay_test" "$T/replay.log"
 GR8_S2_REPLAY_LOG="$T/env.log" "$T/batch_replay_test"   # the knob set as well: record() moves the log, wraps once
-# the planner's floating-point decisions with and without contracted multiply-adds: both builds must replay the log
+# the planner's floating-point state with and without contracted multiply-adds (g++ contracts C++ under every -std; x86
+# needs -mfma to have them): batch_replay_test writes the log uncontracted (-ffp-contract=off above), so
+# the off replay keeps every learned estimate bit for bit and the fast one must still ask for every step the log has
+FMA=""; [ "$(uname -m)" = x86_64 ] && FMA="-mfma"
 for c in off fast; do
-  g++ -std=c++17 -O2 -Wall -ffp-contract=$c -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/round_replay.cpp" -o "$T/round_replay_$c" "${KNOBS[@]}"
-  "$T/round_replay_$c" "$T/replay.log"
+  g++ -std=c++17 -O2 -Wall -ffp-contract=$c $([ $c = fast ] && echo $FMA) -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/round_replay.cpp" -o "$T/round_replay_$c" "${KNOBS[@]}"
 done
+"$T/round_replay_off" "$T/replay.log"
+"$T/round_replay_fast" --steps-only "$T/replay.log"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/ngram_lookup_check.cpp" -o "$T/ngram_lookup_check" "${KNOBS[@]}"
 (cd "$REPO/tools/ngram/tests" && NGRAM_LOOKUP_CHECK="$T/ngram_lookup_check" python3 -m unittest -q test_ngram.ExportTest)
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dflreuse_test.cpp" -o "$T/batch_dflreuse_test" "${KNOBS[@]}"
 "$T/batch_dflreuse_test"
+# GLM-5.3-Flash, DFlash2 with session checkpoints (#340): the prefill taps' owner and the drafter's start after a
+# checkpoint hit (s2/flash_dfl_window.h), driving a Batch through an agent's turns at 32K and 128K
+g++ -std=c++17 -O2 -Wall -Wextra -fsanitize=address,undefined -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/flash_dfl_window_test.cpp" \
+  -o "$T/flash_dfl_window_test" "${KVLIB[@]}"
+"$T/flash_dfl_window_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_insert_test.cpp" -o "$T/batch_insert_test" "${KNOBS[@]}"
 "$T/batch_insert_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_kstop_test.cpp" -o "$T/batch_kstop_test" "${KNOBS[@]}"
@@ -244,6 +253,8 @@ g++ -std=c++17 -O2 -ffp-contract=off -DG6_MODEL_FLASH=1 "$REPO/engine/kda/tests/
 "$T/kda_carry_cpu_test"
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_tp2_test.cpp" -o "$T/control_tp2_test" "${KNOBS[@]}"
 "$T/control_tp2_test"
+g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/control_tp1_test.cpp" -o "$T/control_tp1_test" "${KNOBS[@]}"
+"$T/control_tp1_test"
 # FLASH_CAP_POLICY=borrow-idle's rule (s2/flash_lend.h) and the ACK's room (Ack::room): lend once idle, recall before a
 # request that needs the chunks, the head admits within the least room over the ranks
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/runtime/s2/tests/flash_lend_test.cpp" -o "$T/flash_lend_test" "${KNOBS[@]}"

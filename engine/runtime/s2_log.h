@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -24,6 +25,7 @@ struct Out
     {
         using U = std::remove_cv_t<T>;
         if constexpr (std::is_same_v<U, bool>) put(x ? "1" : "0");
+        else if constexpr (std::is_same_v<U, std::string>) put(x);   // one word: no spaces
         else if constexpr (std::is_unsigned_v<U>) put(std::to_string((unsigned long long)x));
         else if constexpr (std::is_integral_v<U> || std::is_enum_v<U>) put(std::to_string((long long)x));
         else if constexpr (std::is_floating_point_v<U>)
@@ -62,6 +64,7 @@ struct In
     {
         using U = std::remove_cv_t<T>;
         if constexpr (std::is_same_v<U, bool>) x = word() == "1";
+        else if constexpr (std::is_same_v<U, std::string>) x = word();
         else if constexpr (std::is_enum_v<U>) x = (U)std::stoll(word());
         else if constexpr (std::is_unsigned_v<U>) x = (U)std::stoull(word());
         else if constexpr (std::is_integral_v<U>) x = (U)std::stoll(word());
@@ -83,6 +86,54 @@ struct In
         if (n < 0 || n > (1LL << 28)) throw std::runtime_error("s2log: bad vector length");
         v.assign((size_t)n, T());
         for (T& e : v) (*this)(e);
+        return *this;
+    }
+};
+
+// a hash of the values passed to it, field by field as Out lists them: integers as 64 bits, floating point as its own
+// bits, a vector as its length and elements. A NaN hashes as the one In reads back from Out's "nan" (its sign kept),
+// so a logged state and its replay agree whatever payload the GPU gave it. One multiply and shift a word, mixed again
+// at the end (value()): the round log's "learn" record carries it for state too large to write out.
+struct Hash
+{
+    uint64_t h = 14695981039346656037ull;
+    void mix(uint64_t v)
+    {
+        h = (h ^ v) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+    }
+    uint64_t value() const
+    {
+        uint64_t z = h + 0x9E3779B97F4A7C15ull;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    }
+    template <class T> Hash& operator()(const T& x)
+    {
+        using U = std::remove_cv_t<T>;
+        if constexpr (std::is_same_v<U, float>)
+        {
+            uint32_t b;
+            std::memcpy(&b, &x, 4);
+            mix(std::isnan(x) ? (std::signbit(x) ? 0xffc00000u : 0x7fc00000u) : b);
+        }
+        else if constexpr (std::is_same_v<U, double>)
+        {
+            uint64_t b;
+            std::memcpy(&b, &x, 8);
+            mix(std::isnan(x) ? (std::signbit(x) ? 0xfff8000000000000ull : 0x7ff8000000000000ull) : b);
+        }
+        else if constexpr (std::is_integral_v<U> || std::is_enum_v<U>) mix((uint64_t)(long long)x);
+        else if constexpr (std::is_same_v<U, std::string>) { mix(x.size()); for (unsigned char c : x) mix(c); }
+        else if constexpr (std::is_array_v<U>) { for (const auto& e : x) (*this)(e); }
+        else fields(*this, const_cast<U&>(x));
+        return *this;
+    }
+    template <class T> Hash& operator()(const std::vector<T>& v)
+    {
+        mix(v.size());
+        for (const T& e : v) (*this)(e);
         return *this;
     }
 };
