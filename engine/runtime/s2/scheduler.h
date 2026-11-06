@@ -54,6 +54,25 @@ constexpr uint32_t PREFILL_DEFER_MAX = 3;
 // so the collective, not the fastest rank, sets the margin.
 constexpr uint64_t NOTICE_MIN = 2, NOTICE_MAX = 8;
 constexpr uint32_t NOTICE_ROWS = 2048;
+namespace svc {
+// a boot's steering receipt as the Rust reads it, valid while the receipt is
+struct SteeringView {
+    std::vector<g6svc_profile> p;
+    g6svc_steering v{};
+    explicit SteeringView(const g6rt::steering::BootConfig& s) {
+        for (const auto& x : s.profiles) {
+            g6svc_profile q{};
+            q.name = reinterpret_cast<const uint8_t*>(x.name.data()); q.name_n = x.name.size();
+            std::memcpy(q.digest, x.profile_digest.data(), sizeof q.digest); q.active_layers = x.active_layers;
+            p.push_back(q);
+        }
+        v.profiles = p.data(); v.n = p.size(); v.scope = uint32_t(s.scope); v.forced_scale_bits = s.forced_scale_bits;
+        v.loaded = s.loaded; v.forced = s.forced;
+    }
+    SteeringView(const SteeringView&) = delete;
+    SteeringView& operator=(const SteeringView&) = delete;
+};
+} // namespace svc
 // The scheduler's settings: the scalars are g6sch_config (g6sched.h, which documents each), shared with scheduler-rs as
 // they are; the steering receipt stays C++.
 struct Config : g6sch_config {
@@ -67,17 +86,8 @@ struct Config : g6sch_config {
     unsigned limit() const { return g6sch_limit(this); }
     void validate() const {
         check(g6sch_validate(this, MAX_SESSIONS, g6mod::has(G6_CAP_MTP0), g6mod::has(G6_CAP_PACK), g6mod::has(G6_CAP_PARK)));
-        require(steering.loaded == !steering.profiles.empty() && steering.profiles.size() <= g6rt::steering::PROFILES_MAX &&
-                (steering.scope == g6rt::steering::Scope::Shared || steering.scope == g6rt::steering::Scope::Full),
-                "invalid loaded steering receipt");
-        for (const auto& p : steering.profiles)
-            require(g6rt::steering::valid_profile_name(p.name) && p.active_layers, "invalid loaded steering receipt");
-        require(!steering.forced || steering.profiles.size() == 1, "forced steering needs exactly one loaded profile");
-        if (steering.forced) {
-            const float scale = g6rt::steering::bits_float(steering.forced_scale_bits);
-            require(std::isfinite(scale) && scale > 0.f && scale <= g6rt::steering::SCALE_MAX,
-                    "forced steering needs a finite scale in (0,4]");
-        } else require(!steering.forced_scale_bits, "unforced steering has a forced scale");
+        const svc::SteeringView s(steering);
+        if (g6svc_steering_check(&s.v)) throw std::runtime_error(g6ctl_error());
     }
 };
 struct Key {
@@ -248,7 +258,8 @@ inline void check_abi() {
             {G6SCH_ABI_NOTICE_MAX, NOTICE_MAX}, {G6SCH_ABI_NOTICE_ROWS, NOTICE_ROWS},
             {G6SCH_ABI_MAX_DECODE_ROUNDS, MAX_DECODE_ROUNDS}, {G6SCH_ABI_PACK_MAX_MEMBERS, PACK_MAX_MEMBERS},
             {G6SCH_ABI_QMAX, G6SCH_QMAX}, {G6SCH_ABI_PARSE_FN, G6SCH_PARSE_FN},
-            {G6SCH_ABI_CONTROL_VERSION, CONTROL_VERSION}};
+            {G6SCH_ABI_CONTROL_VERSION, CONTROL_VERSION}, {G6SCH_ABI_PROFILES_MAX, g6rt::steering::PROFILES_MAX},
+            {G6SCH_ABI_SCALE_MAX_BITS, g6rt::steering::float_bits(g6rt::steering::SCALE_MAX)}};
         for (const auto& [what, v] : want) if (g6sch_abi(what) != v) return false;
         return true;
     }();
