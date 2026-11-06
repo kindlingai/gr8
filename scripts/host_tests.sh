@@ -39,22 +39,19 @@ python3 "$REPO/engine/comms/tests/relay_loop_test.py"
 # the fabric pool (engine/comms/fabric_pool.h, #154): boot, groups and their ports over loopback, no leaked descriptor
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_pool_test.cpp" -o "$T/fabric_pool_test"
 "$T/fabric_pool_test"
-# the Rust page allocator (engine/kvman-rs) that s2/pool.h wraps, built here where cargo is on the PATH
-KV=$REPO/engine/kvman-rs/target/release/libg6kvman.a
+# the host Rust (engine/Cargo.toml): the page allocator s2/pool.h wraps (engine/kvman-rs) and the S2 scheduling logic
+# (engine/scheduler-rs) in one library, built here where cargo is on the PATH
+HL=$REPO/engine/target/release/libg6host.a
 # and the knob table's C API (engine/knobs-rs), which every test that reads a knob links
 KN=$REPO/engine/knobs-rs/target/release/libgr8knobs.a
 if command -v cargo > /dev/null 2>&1; then
-  cargo build --release --quiet --manifest-path "$REPO/engine/kvman-rs/Cargo.toml"
+  cargo build --release --quiet --manifest-path "$REPO/engine/Cargo.toml"
   cargo build --release --quiet --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
-  cargo build --release --quiet --manifest-path "$REPO/engine/scheduler-rs/Cargo.toml"
 fi
-[ -f "$KV" ] || { echo "no $KV: cargo build --release --manifest-path engine/kvman-rs/Cargo.toml"; exit 1; }
+[ -f "$HL" ] || { echo "no $HL: cargo build --release --manifest-path engine/Cargo.toml"; exit 1; }
 [ -f "$KN" ] || { echo "no $KN: cargo build --release --features capi --manifest-path engine/knobs-rs/Cargo.toml"; exit 1; }
-# the host-side S2 scheduling logic in Rust (engine/scheduler-rs): every test that includes the S2 headers links it
-SL=$REPO/engine/scheduler-rs/target/release/libg6sched.a
-[ -f "$SL" ] || { echo "no $SL: cargo build --release --manifest-path engine/scheduler-rs/Cargo.toml"; exit 1; }
-KVLIB=("$KV" "$KN" "$SL" -lpthread -ldl -lm)
-KNOBS=("$KN" "$SL" -lpthread -ldl -lm)
+KVLIB=("$HL" "$KN" -lpthread -ldl -lm)
+KNOBS=("$KN" "$HL" -lpthread -ldl -lm)
 # the knob table: its C++ header over the C API
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/knobs-rs" "$REPO/engine/knobs-rs/tests/header_test.cpp" "${KNOBS[@]}" \
   -o "$T/knobs_header_test"
@@ -188,7 +185,7 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engin
 "$T/cp_rows_test" 2> >(grep -v '^# s2 GR8_CP_STEP_ROWS=' >&2)   # the driver's cap transition lines, thousands here
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_stash_test.cpp" "${KVLIB[@]}" -o "$T/pool_stash_test"
 STORES=("mem:" "ssd:$T/store")
-NODE=$REPO/engine/kvman-rs/target/release/kvman-remote
+NODE=$REPO/engine/target/release/kvman-remote
 if [ -x "$NODE" ]; then   # a small unlocked node on loopback (RLIMIT_MEMLOCK in a container is usually 8 MiB)
   "$NODE" --gb 0.05 --port 0 --bind 127.0.0.1 --min-free-gb 0 --no-lock --ready "$T/node.json" > "$T/node.log" 2>&1 &
   NODE_PID=$!

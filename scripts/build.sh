@@ -34,17 +34,18 @@ K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DP
 # the Rust pack loader (engine/loader-rs), and bin/g6load, which plans and checks the Hugging Face fetch. Where cargo is
 # missing (the CUDA image), build it on the host first: cargo build --release --manifest-path engine/loader-rs/Cargo.toml
 # (g6m4 links target/release/libg6load.a when it exists, and target/release/g6load is copied next to g6m4)
-# The S2 page allocator (engine/kvman-rs), the knob table's C API (engine/knobs-rs) and the S2 scheduling logic
-# (engine/scheduler-rs) are not optional: g6m4 always links target/release/libg6kvman.a, libgr8knobs.a and
-# libg6sched.a, built the same way, and every test that reads a knob links the last two.
+# The knob table's C API (engine/knobs-rs) and the host Rust (engine/Cargo.toml: the S2 page allocator in kvman-rs and
+# the S2 scheduling logic in scheduler-rs) are not optional: every engine and test binary links
+# engine/knobs-rs/target/release/libgr8knobs.a and engine/target/release/libg6host.a, built the same way.
+# libgr8knobs.so is the knob table for the launcher.
 if command -v cargo > /dev/null 2>&1; then
   cargo build --release --locked --quiet --manifest-path "$REPO/engine/loader-rs/Cargo.toml"
-  cargo build --release --locked --quiet --manifest-path "$REPO/engine/kvman-rs/Cargo.toml"
+  cargo build --release --locked --quiet --manifest-path "$REPO/engine/Cargo.toml"
   cargo build --release --locked --quiet --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
-  cargo build --release --locked --quiet --manifest-path "$REPO/engine/scheduler-rs/Cargo.toml"
+  cargo rustc --release --locked --quiet --features capi --lib --crate-type cdylib \
+    --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
 fi
-# the knob table and the host-side S2 scheduling logic (engine/scheduler-rs): every engine and test binary links both
-KNOBS=("$REPO/engine/knobs-rs/target/release/libgr8knobs.a" "$REPO/engine/scheduler-rs/target/release/libg6sched.a" -lpthread -ldl -lm)
+KNOBS=("$REPO/engine/knobs-rs/target/release/libgr8knobs.a" "$REPO/engine/target/release/libg6host.a" -lpthread -ldl -lm)
 # the old G6_ names of these variables still work
 for v in NR WIDTHS TESTS XGRAMMAR XGRAMMAR_LIB NVCC_CACHE NVCC_CACHE_DIR; do
   o=G6_$v n=GR8_$v; if [ -n "${!o:-}" ] && [ -z "${!n:-}" ]; then export "$n=${!o}"; fi
@@ -76,10 +77,10 @@ if [ -x "$G6LOAD_BIN" ]; then cp "$G6LOAD_BIN" "$OUT/"; fi
 KNOBSO=$REPO/engine/knobs-rs/target/release/libgr8knobs.so
 if [ -f "$KNOBSO" ]; then mkdir -p "$OUT/lib" && cp "$KNOBSO" "$OUT/lib/"; fi
 # the KV node ./gr8 kv up runs
-KVNODE_BIN=$REPO/engine/kvman-rs/target/release/kvman-remote
+KVNODE_BIN=$REPO/engine/target/release/kvman-remote
 if [ -x "$KVNODE_BIN" ]; then cp "$KVNODE_BIN" "$OUT/"; fi
 # the host ledger of a Flash box that lends memory to a KV node (FLASH_KV_DONATE_GIB)
-LEDGER_BIN=$REPO/engine/kvman-rs/target/release/kvman-ledger
+LEDGER_BIN=$REPO/engine/target/release/kvman-ledger
 if [ -x "$LEDGER_BIN" ]; then cp "$LEDGER_BIN" "$OUT/"; fi
 cd "$REPO/engine/runtime"
 [ "${PLAIN:-0}" = 1 ] && { echo "PLAIN=1 is retired: every width has the multi-session path (DEC_S2)"; exit 2; }

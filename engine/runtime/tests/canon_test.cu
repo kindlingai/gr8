@@ -14,7 +14,7 @@
 //      matches; and back: the replicated caches imported into NR CP bindings equal the CP bindings' own caches. The CP
 //      run here is the CP map as built (list 0, 1, ..); other page lists past R are the Rust tests' (tests/canon.rs);
 //   4. a live migration's two parts: rows [0, B) then [B, T) imported one after the other equal one import of [0, T).
-// Build and run: TEST=canon_test scripts/c1_tests.sh <bin_dir> (links engine/kvman-rs's libg6kvman.a)
+// Build and run: TEST=canon_test scripts/c1_tests.sh <bin_dir> (links libg6host.a, which holds engine/kvman-rs)
 // Exit code: 0 PASS, 1 FAIL, 2 CUDA error.
 #include <algorithm>
 #include <cstdint>

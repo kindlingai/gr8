@@ -33,6 +33,7 @@ fn fresh(file: &std::path::Path) -> Book {
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "release kvman-ledger has no crash points")]
 fn a_crash_at_every_phase_leaves_a_book_that_balances_and_recovers() {
     let d = dir("crash");
     let file = d.join("ledger");

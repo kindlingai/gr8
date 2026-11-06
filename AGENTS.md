@@ -39,9 +39,10 @@ On a GB10 with CUDA 13:
 
 g6m4 takes its width from `--ips`, m4sim from `--tp N` or the rank packs in `--packs DIR`. Each width is compiled as
 its own build was (`engine/runtime/build_m4.sh`), so one build covers every topology. `scripts/build.sh` also runs
-`tr3_e4m3_test` when a GPU is visible. g6m4 links the S2 page allocator from
-`engine/kvman-rs`, which build.sh builds with cargo. Where cargo is missing, build that crate (and `engine/loader-rs`)
-first with `cargo build --release --manifest-path <crate>/Cargo.toml`.
+`tr3_e4m3_test` when a GPU is visible. g6m4 links the host Rust (the S2 page allocator, scheduler and planner) as one
+staticlib, `engine/target/release/libg6host.a`, which build.sh builds with cargo from the workspace `engine/Cargo.toml`.
+Where build.sh cannot run cargo, build it first with `cargo build --release --manifest-path engine/Cargo.toml`, plus
+`engine/loader-rs` and `engine/knobs-rs` (`--features capi`) with their own manifests.
 
 ## Test
 

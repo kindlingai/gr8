@@ -1141,7 +1141,7 @@ def gpu_lendable(ledger):
 
 def ledger_bin(home):
     for p in (os.path.join(home, 'bin', 'kvman-ledger'),
-              os.path.join(opt.REPO, 'engine', 'kvman-rs', 'target', 'release', 'kvman-ledger')):
+              os.path.join(opt.REPO, 'engine', 'target', 'release', 'kvman-ledger')):
         if os.access(p, os.X_OK):
             return p
     return None

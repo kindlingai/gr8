@@ -4,7 +4,7 @@
 #   docker buildx build --platform linux/arm64 --target dist -o type=local,dest=out .
 #                                                                              only the binaries, into out/bin
 #
-# Stages: toolchain (CUDA devel + rdma-core) -> rust -> loader (the Rust loader) and kvman (the Rust S2 page allocator)
+# Stages: toolchain (CUDA devel + rdma-core) -> rust -> loader (the Rust loader) and kvman (the host Rust: page allocator, scheduler, planner)
 # -> engine, engine-int4, engine-flash, engine-flash-int4 and engine-ds41, with front (the Rust front end) beside them -> dist (the binaries only)
 # -> runtime (CUDA runtime + binaries, scripts, shims).
 ARG CUDA_VERSION=13.0.1
@@ -40,20 +40,21 @@ RUN mkdir -p /out \
 FROM rust AS kvman
 COPY engine/knobs-rs engine/knobs-rs
 COPY knobs knobs
+COPY engine/Cargo.toml engine/Cargo.lock engine/
+COPY engine/hostcore-rs engine/hostcore-rs
 COPY engine/kvman-rs engine/kvman-rs
 COPY engine/scheduler-rs engine/scheduler-rs
 RUN mkdir -p /out \
- && cargo build --release --locked --manifest-path engine/kvman-rs/Cargo.toml \
- && cargo build --release --locked --manifest-path engine/scheduler-rs/Cargo.toml \
- && cp engine/kvman-rs/target/release/libg6kvman.a engine/kvman-rs/target/release/kvman-remote /out/ \
- && cp engine/scheduler-rs/target/release/libg6sched.a /out/ \
- && rm -rf engine/kvman-rs/target engine/scheduler-rs/target
+ && cargo build --release --locked --manifest-path engine/Cargo.toml \
+ && cp engine/target/release/libg6host.a engine/target/release/kvman-remote /out/ \
+ && rm -rf engine/target
 
 FROM rust AS knobs
 COPY engine/knobs-rs engine/knobs-rs
 COPY knobs knobs
 RUN mkdir -p /out \
  && cargo build --release --locked --features capi --manifest-path engine/knobs-rs/Cargo.toml \
+ && cargo rustc --release --locked --features capi --lib --crate-type cdylib --manifest-path engine/knobs-rs/Cargo.toml \
  && cp engine/knobs-rs/target/release/libgr8knobs.a engine/knobs-rs/target/release/libgr8knobs.so /out/ \
  && rm -rf engine/knobs-rs/target
 
@@ -96,7 +97,7 @@ COPY --from=xgrammar-src /out-xgrammar /opt/xgrammar
 RUN /xgrammar_build.sh /opt/xgrammar /xb && mkdir -p /out && cp /xb/libxgrammar.a /out/ && rm -rf /xb
 
 # engine-src copies only the engine sources, so edits to docs, scripts or the front end keep the engine layers cached.
-# This stage has no cargo: build.sh skips its cargo step and links the libg6load.a, libg6kvman.a, libg6sched.a and libgr8knobs.a
+# This stage has no cargo: build.sh skips its cargo step and links the libg6load.a, libg6host.a and libgr8knobs.a
 # built above.
 FROM toolchain AS engine-src
 WORKDIR /src
@@ -104,8 +105,7 @@ COPY engine engine
 COPY tools/health/gpuprobe.cu tools/health/gpuprobe.cu
 COPY scripts/build.sh scripts/build.sh
 COPY --from=loader /out/libg6load.a engine/loader-rs/target/release/libg6load.a
-COPY --from=kvman /out/libg6kvman.a engine/kvman-rs/target/release/libg6kvman.a
-COPY --from=kvman /out/libg6sched.a engine/scheduler-rs/target/release/libg6sched.a
+COPY --from=kvman /out/libg6host.a engine/target/release/libg6host.a
 COPY --from=knobs /out/libgr8knobs.a engine/knobs-rs/target/release/libgr8knobs.a
 
 # the GLM and Flash engine stages add XGrammar; the tests build without it, so they do not wait for its stage
@@ -156,11 +156,10 @@ RUN GR8_WIDTHS="$GR8_WIDTHS" KV_FORMAT=int4 scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4-int4 -exec rm -rf {} +
 
 # rust-dist holds the Rust binaries only: CI builds them on a hosted arm runner, and its engine job links libg6load.a,
-# libg6kvman.a, libg6sched.a and libgr8knobs.a
+# libg6host.a and libgr8knobs.a
 FROM scratch AS rust-dist
 COPY --from=loader /out/libg6load.a /out/g6load /
-COPY --from=kvman /out/libg6kvman.a /
-COPY --from=kvman /out/libg6sched.a /
+COPY --from=kvman /out/libg6host.a /
 COPY --from=knobs /out/libgr8knobs.a /
 COPY --from=front /out/g6front-rs /
 

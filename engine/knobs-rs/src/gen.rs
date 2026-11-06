@@ -42,7 +42,7 @@ pub fn header() -> String {
 //
 // knob::name() returns the value of GR8_NAME: its default when unset, or an optional for a knob without one. The value
 // is read once per process. A value the table refuses stops the process at its first read. knob::init() at the start
-// of main prints every problem of the environment and returns how many are errors. The C API is in libg6kvman.a.
+// of main prints every problem of the environment and returns how many are errors. The C API is in libgr8knobs.a.
 #include <cstddef>
 #include <cstdint>
 #include <optional>

@@ -30,11 +30,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "g6host"
+version = "0.1.0"
+dependencies = [
+ "g6kvman",
+ "g6sched",
+]
+
+[[package]]
 name = "g6kvman"
 version = "0.1.0"
 dependencies = [
  "gr8-knobs",
 ]
+
+[[package]]
+name = "g6sched"
+version = "0.1.0"
 
 [[package]]
 name = "gr8-knobs"

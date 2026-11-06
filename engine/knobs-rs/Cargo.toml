@@ -6,10 +6,13 @@ description = "gr8 knobs: every setting the engine reads from the environment, t
 
 [lib]
 name = "gr8knobs"
-crate-type = ["staticlib", "rlib", "cdylib"]
+# libgr8knobs.so for the launcher: cargo rustc --release --features capi --lib --crate-type cdylib. A cdylib here
+# would drop the hash from every output file name, and a crate that builds twice (abort for binaries, unwind for
+# tests under cargo test --release) would then overwrite its own outputs.
+crate-type = ["staticlib", "rlib"]
 
 [features]
-# the C API (gr8_knob_*): on in exactly one Rust library of a binary, libg6kvman.a for the engine
+# the C API (gr8_knob_*): on in exactly one Rust library of a binary, libgr8knobs.a for the engine
 capi = []
 
 [profile.release]

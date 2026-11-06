@@ -241,7 +241,7 @@ confirmation boots whose round logs (R0) match byte for byte.
 
 R2 lands in four parts:
 
-1. R2a: the crate (`engine/scheduler-rs`, `libg6sched.a`, `g6sched.h`) and the small policies first: KV copy batches
+1. R2a: the crate (`engine/scheduler-rs`, `g6sched.h`) and the small policies first: KV copy batches
    (`kv_plan.h`), Flash chunk lending (`flash_lend.h`), Flash KDA rings and capture sets (`flash_ring.h`), rounds past R
    (`cp_rows.h`). The C++ headers keep their types and call Rust; the state stays in C++ structs with the same layout,
    so C++ copies and owns it as before. Until R2d the C++ they replaced stayed in `s2/tests/ref/` for a differential
@@ -344,7 +344,7 @@ completions. After R3 every piece it calls is Rust, so the driver moves whole an
     read the whole prefix index, so admission would have to move to the compute thread. That is an R5 question.
   - R4 in PRs, each with a boot. R4a: the driver logic, behind a facade. R4b: the lock moves into kvman-rs's handle
     and `RunPool` drops its mutex, with today's build. R4b2: kvman-rs and scheduler-rs in one Cargo workspace and one
-    staticlib. `panic = "abort"` for dev and release goes in the workspace root, since member profiles are ignored. The
+    staticlib. `panic = "abort"` for release goes in the workspace root, since member profiles are ignored. The
     scripts that link two libraries (`build_m4.sh`, `scripts/build.sh`, `c1_tests.sh`, `host_tests.sh`) link one. R4c:
     the driver calls the pool Rust to Rust, the `Scheduler` mirror goes, and `share_apply` moves beside the driver.
     R4a and R4b do not depend on each other.
@@ -354,6 +354,16 @@ completions. After R3 every piece it calls is Rust, so the driver moves whole an
     `remote/server.rs`), so a poisoned lock hands the pool on as it is. No pool call calls a C function pointer.
     Checked: `tests/ffi_threads.rs` (a compute and a control thread on one handle through the C API), kvman-rs's
     `cargo test` and `host_tests.sh` on Linux, and the pool host tests on macOS. Boot pending.
+  - R4b2 landed. `engine/Cargo.toml` is the workspace (`hostcore-rs`, `kvman-rs`, `scheduler-rs`; one `Cargo.lock`,
+    the same dependency versions). `hostcore-rs` is the one staticlib, `engine/target/release/libg6host.a`; the other
+    two are rlibs. Release keeps `opt-level = 3` and `panic = "abort"`; dev unwinds. knobs-rs and loader-rs stay
+    separate builds. `cargo test --release` no longer fails at random: a crate with a `cdylib` has no hash in its file
+    names, and the tests (unwind) and the binaries (abort) each built it to the same files. kvman-rs and knobs-rs drop
+    their `cdylib`s, and `libgr8knobs.so` comes from `cargo rustc --crate-type cdylib`. The ledger's crash test runs
+    in dev only, since release `kvman-ledger` has no crash points. Checked: `nm` finds all 97 `g6kvman.h` and all 108
+    `g6sched.h` functions in `libg6host.a`; on Linux, `host_tests.sh` passes and `cargo test --release --workspace`
+    passes from clean six times with no collision (the remote arena test needs `CAP_IPC_LOCK` in a container); the
+    pool and driver host tests pass on macOS. Boot pending.
 - Proof: the round log replays unchanged (the driver's calls into the planner are the log's calls), the scheduler and
   driver host tests (`driver_grow_test`, the `scheduler_*` tests, `cp_rows_test`) run against the Rust driver behind a
   thin C++ facade as R3b did, and a confirmation boot's logs equal the earlier boots'. One C call per quantum.
