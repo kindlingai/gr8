@@ -102,7 +102,8 @@ setting, and has bare metal and Kubernetes. An agent that starts gr8 for someone
 **DeepSeek-V4.1-Flash** (four boxes): the recipe
 [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)
 is the quickest way: the same image on every box, in fast mode by default. We booted that image on four boxes on
-2026-11-06: ready in 104 s, smoke test 11 of 11, 72 of 75 on the 75-item check.
+2026-11-06: ready in 104 s, smoke test 11 of 11, 72 of 75 right on our own 75-item check (a different set from
+FIRST-BOOT.md's).
 [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is the boot with gr8's own launcher, which gives exact output by default,
 in order, from the four boxes to a passing `./gr8 ds41 smoke`.
 

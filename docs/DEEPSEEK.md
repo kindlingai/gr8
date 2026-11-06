@@ -63,8 +63,9 @@ The quickest way is the recipe
 [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark): the same
 Docker image on all four boxes, in fast mode. On every box, fetch the release (510.6 GB) with the image, then start
 the image. Its README has the commands (`docker run` or Docker Compose), the cabling and the settings, and shows how to
-get the exact model instead. We booted the recipe's image on four boxes on 2026-11-06 (ready in 104 s, smoke test 11
-of 11, 72 of 75 on the 75-item check in fast mode): if a step fails, tell us.
+get the exact model instead. We booted the recipe's image on four boxes on 2026-11-06: ready in 104 s, smoke test 11
+of 11, 72 of 75 right on our own 75-item check (a different set from FIRST-BOOT.md's) in fast mode. If a step fails,
+tell us.
 
 With gr8's own launcher, which gives exact output by default:
 
