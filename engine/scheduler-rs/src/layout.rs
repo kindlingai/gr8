@@ -140,6 +140,68 @@ impl Kind for crate::scheduler::Commit {
 impl Kind for crate::scheduler::Completion {
     const K: u64 = 6;
 }
+impl Kind for crate::planner::Row {
+    const K: u64 = 6;
+}
+impl Kind for crate::planner_ffi::CStep {
+    const K: u64 = 6;
+}
+impl Kind for crate::planner::DflReq {
+    const K: u64 = 6;
+}
+impl Kind for crate::planner::DflDrafts {
+    const K: u64 = 6;
+}
+impl Kind for crate::planner_ffi::CSpecLen {
+    const K: u64 = 6;
+}
+impl Kind for crate::planner_ffi::CDSelTable {
+    const K: u64 = 6;
+}
+impl Kind for crate::planner_ffi::CDSel {
+    const K: u64 = 6;
+}
+impl Kind for crate::planner_ffi::CKStop {
+    const K: u64 = 6;
+}
+impl Kind for crate::planner_ffi::CNgram {
+    const K: u64 = 6;
+}
+impl Kind for crate::planner_ffi::CSession {
+    const K: u64 = 6;
+}
+impl Kind for crate::planner_ffi::CCost {
+    const K: u64 = 6;
+}
+impl Kind for crate::planner_ffi::CStats {
+    const K: u64 = 6;
+}
+impl Kind for crate::planner_ffi::CSlot {
+    const K: u64 = 6;
+}
+impl Kind for crate::planner_ffi::CLearn {
+    const K: u64 = 6;
+}
+impl Kind for crate::planner_ffi::CHooks {
+    const K: u64 = 6;
+}
+// g6sched.h counts void as 1 byte, as Rust's c_void
+impl Kind for std::ffi::c_void {
+    const K: u64 = 6;
+}
+// a function pointer: a pointer to a struct-like kind with no size
+macro_rules! fn_kinds {
+    ($($t:ty),*) => { $(impl Kind for Option<$t> { const K: u64 = 0x76; })* };
+}
+fn_kinds!(
+    crate::planner_ffi::RunFn,
+    crate::planner_ffi::RoundFn,
+    crate::planner_ffi::PromptFn,
+    crate::planner_ffi::EmitFn,
+    crate::planner_ffi::DflFn,
+    crate::planner_ffi::DflStartFn,
+    crate::planner_ffi::LpFn
+);
 
 /// The digest of every shared type's layout.
 pub fn digest() -> u64 {
@@ -283,6 +345,198 @@ pub fn digest() -> u64 {
         }
     );
     layout!(h, crate::scheduler::Completion { key, emitted, finished, inserted });
+    layout!(h, crate::planner::Row { sess, tok, pos, spos, tgt });
+    layout!(
+        h,
+        crate::planner_ffi::CStep {
+            kind,
+            event,
+            cls,
+            round_active,
+            round,
+            n_sess,
+            n_rows,
+            sess,
+            row0,
+            rows,
+            ctx,
+            ev,
+            r
+        }
+    );
+    layout!(h, crate::planner::DflReq { sess, rows, pos0, tok0, lo, query, phase });
+    layout!(h, crate::planner::DflDrafts { tok, lp });
+    layout!(
+        h,
+        crate::planner_ffi::CSpecLen {
+            on,
+            n_levels,
+            levels,
+            draft_round,
+            draft_each,
+            table,
+            seed,
+            pn,
+            pk,
+            bn,
+            bk,
+            pos_decay,
+            bucket_decay,
+            prior,
+            rounds,
+            chosen,
+            pred_sum,
+            got_sum
+        }
+    );
+    layout!(h, crate::planner_ffi::CDSelTable { v, d, m, e, p, g, k, n, w, r });
+    layout!(
+        h,
+        crate::planner_ffi::CDSel { on, dwell, margin, probe, model, d, m, tab, rn, rc, an, ag, prior, dn, dt, dc }
+    );
+    layout!(
+        h,
+        crate::planner_ffi::CKStop {
+            mode,
+            kmax,
+            tau,
+            seed3,
+            log,
+            solo,
+            b_mode,
+            b_kmin,
+            b_explore,
+            b_tau_rows,
+            b_tau,
+            b_widths,
+            b_n_widths
+        }
+    );
+    layout!(
+        h,
+        crate::planner_ffi::CNgram { table, n_ns, ns, has_cal, cal, n, keys, toks, ps, kmax, kmin, margin, log }
+    );
+    layout!(
+        h,
+        crate::planner_ffi::CSession {
+            prompt,
+            n_prompt,
+            first,
+            chunk,
+            n_gen,
+            dflash,
+            ins_after,
+            ins_unless,
+            ins_tokens,
+            n_ins
+        }
+    );
+    layout!(
+        h,
+        crate::planner_ffi::CCost {
+            main0,
+            main_row,
+            draft0,
+            draft_sess,
+            chain0,
+            chain_sess,
+            flash,
+            flash_table,
+            flash_draft_round,
+            flash_draft_each
+        }
+    );
+    layout!(
+        h,
+        crate::planner_ffi::CStats {
+            rounds,
+            tokens,
+            drafted,
+            mtp_rounds,
+            switches,
+            inserted,
+            ngram_rounds,
+            ngram_drafted,
+            ngram_acc,
+            dfl_rounds,
+            dfl_from,
+            dfl_lo,
+            dfl_warm,
+            promoted,
+            acc,
+            n_acc
+        }
+    );
+    layout!(
+        h,
+        crate::planner_ffi::CSlot {
+            first,
+            chunk,
+            n_gen,
+            dflash,
+            ins_after,
+            ins_unless,
+            n_ins,
+            ins_tokens,
+            n_tokens,
+            tokens,
+            n_d,
+            d,
+            n_dlm,
+            dlm,
+            n,
+            on,
+            done,
+            rounds,
+            k,
+            dfl,
+            mtp,
+            pb,
+            pd,
+            pl,
+            since,
+            mn,
+            lo,
+            warm,
+            armed,
+            force,
+            dd,
+            dl
+        }
+    );
+    layout!(
+        h,
+        crate::planner_ffi::CLearn {
+            round_no,
+            cur_round,
+            cur_active,
+            ring_q,
+            ring_lo,
+            ring_end,
+            ring_top,
+            n_ring_tok,
+            ring_tok
+        }
+    );
+    layout!(
+        h,
+        crate::planner_ffi::CHooks {
+            ctx,
+            run,
+            round,
+            prompt,
+            emit,
+            dfl,
+            dfl_start,
+            lp,
+            has_round,
+            has_prompt,
+            has_emit,
+            has_dfl,
+            has_dfl_start,
+            has_lp
+        }
+    );
     h
 }
 

@@ -8,7 +8,9 @@
 // logged state. So a replay passes when this build of the planner makes every decision the logged one made, over every
 // round of every request in the log.
 #pragma once
+#include <chrono>
 #include <cstdio>
+#include <map>
 #include <string>
 #include <vector>
 #include "../s2_batch.h"
@@ -23,6 +25,8 @@ struct ReplayResult
     int version = 0;                  // the log's format
     std::string libc;                 // version 3: the C library the logging planner ran on (libc_version())
     std::string learn_text;           // dump_learn: the replaying planner's learned state at that log line (Batch::learn_text)
+    // time: per call tag, the planner's own time in microseconds (each call's wall time less its hook answers')
+    std::map<std::string, std::vector<double>> time_us;
     std::string error;
 };
 
@@ -39,7 +43,7 @@ inline std::string tag(const std::string& l) { return l.substr(0, l.find(' ')); 
 // (contracted multiply-adds) still shows whether any step, hook or driver state changes
 // dump_learn: the 1-based log line of a learn record whose state to write out (learn_text), 0 = none
 inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::NgramTable* table = nullptr, bool learn = true,
-                           size_t dump_learn = 0)
+                           size_t dump_learn = 0, bool time = false)
 {
     using namespace replay_detail;
     ReplayResult res;
@@ -83,6 +87,14 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
 #endif
         i = 1;
         // the next hook record: its request must be `want`; returns the reader positioned at the answer
+        using clock = std::chrono::steady_clock;
+        double hook_us = 0;   // time spent answering hooks during the current call
+        struct HookTimer
+        {
+            double& acc;
+            clock::time_point t0 = clock::now();
+            ~HookTimer() { acc += std::chrono::duration<double, std::micro>(clock::now() - t0).count(); }
+        };
         auto next = [&](const std::string& want) -> s2log::In {
             if (i >= lines.size()) fail("the planner made a call the log does not have: " + want.substr(0, 200));
             const std::string& l = lines[i];
@@ -94,6 +106,7 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
         };
         Hooks hk;
         hk.run = [&](const Step& s) {
+            const HookTimer ht{hook_us};
             s2log::In in = next(s2log::line("run", s));
             std::vector<int> t;
             in(t);
@@ -101,6 +114,7 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
             return t;
         };
         hk.emit = [&](int q, const int* t, int k, int row) {
+            const HookTimer ht{hook_us};
             s2log::In in = next(s2log::line("emit", q, std::vector<int>(t, t + k), row));
             bool done = false;
             in(done);
@@ -108,6 +122,7 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
         };
         if (has_dfl)
             hk.dfl = [&](const DflReq& r) {
+                const HookTimer ht{hook_us};
                 s2log::In in = next(s2log::line("dfl", r));
                 DflDrafts o{};
                 in(o);
@@ -115,6 +130,7 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
             };
         if (has_dfl_start)
             hk.dfl_start = [&](int q) {
+                const HookTimer ht{hook_us};
                 s2log::In in = next(s2log::line("dfl_start", q));
                 int lo = 0;
                 in(lo);
@@ -122,14 +138,22 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
             };
         if (has_lp)
             hk.lp = [&](int r) {
+                const HookTimer ht{hook_us};
                 s2log::In in = next(s2log::line("lp", r));
                 float v = 0;
                 in(v);
                 return v;
             };
         if (has_round)
-            hk.round = [&](int q, long n, int base, int a, int k) { next(s2log::line("on_round", q, n, base, a, k)); };
-        if (has_prompt) hk.prompt = [&](int q, int M, int pos0) { next(s2log::line("on_prompt", q, M, pos0)); };
+            hk.round = [&](int q, long n, int base, int a, int k) {
+                const HookTimer ht{hook_us};
+                next(s2log::line("on_round", q, n, base, a, k));
+            };
+        if (has_prompt)
+            hk.prompt = [&](int q, int M, int pos0) {
+                const HookTimer ht{hook_us};
+                next(s2log::line("on_prompt", q, M, pos0));
+            };
         Batch b(K, max_rows, hk);
         b.draft_par(par);
         b.fresh_spec(fresh);
@@ -142,6 +166,8 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
             const size_t at = i++;
             ++res.calls;
             res.line = at + 1;
+            hook_us = 0;
+            const clock::time_point t0 = clock::now();
             if (t == "round") { std::vector<int> o; in(o); b.round(o); }
             else if (t == "admit" || t == "admit_packed_tail")
             {
@@ -176,6 +202,7 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
                 b.ngram(n);
             }
             else fail("a hook record the planner did not ask for, or an unknown call: " + l.substr(0, 200));
+            if (time) res.time_us[t].push_back(std::chrono::duration<double, std::micro>(clock::now() - t0).count() - hook_us);
             const std::string st = b.state();
             if (i >= lines.size() || lines[i] != st)
                 fail("after " + t + " the planner's state is\n  " + st.substr(0, 400) + "\nthe log has\n  " +

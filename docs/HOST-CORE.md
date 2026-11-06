@@ -286,6 +286,18 @@ Moves `s2_batch.h` (about 1,500 lines), `spec_len.h`, `insert_rule.h`, `ngram_lo
    names it); `DSelTable::parse`'s `strtod` and `str`'s `%.10g` (it feeds the runtime signature) stay C++ or are tested
    against it.
 
+   Landed as `engine/scheduler-rs` `spec_len.rs`, `ngram.rs`, `planner.rs` and `planner_ffi.rs` (`g6s2_*` in
+   `g6sched.h`, in the layout digest). The C++ parses the n-gram table and passes its entries. Each `Batch` call is one
+   C call. Each hook is a C function pointer over the facade's `std::function`. The facade catches a hook's exception
+   and rethrows it after the Rust returns. `SpecLen`, `DSelTable::parse`/`str`, the knob reads and the Flash cost table stay C++ (the plain
+   build's `--spec-adaptive` keeps `SpecLen`). Checked on macOS: the GLM serving logs v2 and v3 replay in full (learn
+   records included, so no estimate drifted), as do the R3b baseline logs: `batch_replay_test`'s log in each model shape
+   and every log the planner tests wrote under `GR8_S2_REPLAY_LOG` that the C++ itself replays (11,086). The `round`
+   call over the v3 log: mean 1.2 us, p50 1.1, p99 2.7 (C++: 1.9, 1.7, 3.8, ten runs each). A round allocates nothing in
+   the Rust after warm-up (a counting-allocator test). One C++ bug surfaced and is kept: when an insert rule fires
+   exactly at `n_gen`, the verify's draft step reads the token one past the committed ones. The C++ read past its
+   vector, and the port reads 0. The session is over and the row's output unused. `s2::Batch` is move-only.
+
 ### R3c. DS41's KV on the shared paged pool (with Chuck)
 
 A DS41 slot reserves a whole slab (`--capacity-slots`) whatever its request's length, and its prefix snapshots and park
@@ -306,9 +318,25 @@ and R5 then move one pool's callers, not two KV models'.
 
 ### R4. The driver to Rust
 
-`s2/driver.h` is glue between R2, R3 and the hooks; after them it is Rust to Rust plus the module callbacks (`grow`,
-`prefill`, `prefill_pack`, `dfl_*`). With the driver and then the service in Rust, the pool is called Rust to Rust and
-`s2/pool.h` (218 lines of FFI) and `kv_share.h`'s `share_apply` go.
+`s2/driver.h` (289 lines) is glue between the scheduler (R2), the planner (R3) and the engine hooks: it applies commits,
+grows runs before a round, picks capped rounds past R, runs one scheduler quantum on the planner and reports
+completions. After R3 every piece it calls is Rust, so the driver moves whole and owns what it drives:
+
+- State: the driver owns the scheduler's slots and state and the planner (both Rust-owned handles, not C++ mirrors),
+  the per-slot payloads, emitted counts and initialised flags, and the capped-round cycle. `Scheduler`'s C++ mirror of
+  the slots goes; the service, still C++ until R5, reads the slots through one exported view (`slots()` today).
+- Hooks: `DriverHooks` becomes one C table of engine callbacks (`bind`, `retire`, `prefill`, `prefill_pack`, `run`,
+  `emit`, `prompt`, `round`, `dfl_ok`, `dfl_start`, `dfl`, `draft_lp`, `terminal`, `grow`, `finished`, `resize`,
+  `shrink`, `settle`), each a function pointer and a context, as the planner's hooks are since R3b. This table is the
+  first half of R5's `ModuleOps`.
+- The pool: `grow`, `finished`, `bind`, `retire`, `shrink` and `resize` reach the pool through g6m4's lambdas today.
+  Linking kvman-rs into the same library as scheduler-rs (one Cargo workspace, one staticlib; R10 needs it anyway)
+  lets the driver call the pool Rust to Rust, under the lock the C++ `RunPool` takes today (the head's control thread
+  reads the pool). `s2/pool.h` then serves only the C++ still left (g6m4's tier and checkpoint wiring, until R8), and
+  `kv_share.h`'s `share_apply`, which orders pool calls, moves beside the driver.
+- Proof: the round log replays unchanged (the driver's calls into the planner are the log's calls), the scheduler and
+  driver host tests (`driver_grow_test`, the `scheduler_*` tests, `cp_rows_test`) run against the Rust driver behind a
+  thin C++ facade as R3b did, and a confirmation boot's logs equal the earlier boots'. One C call per quantum.
 
 ### R5. Service, control, bootstrap and ingress to Rust; ModuleOps
 

@@ -124,7 +124,7 @@ mod tests {
         assert_eq!(p.in_round, vec![false, true, false, true]);
         let p = pick(&cand, &[1, 2, 3, 4], 6, 3, true);
         assert!(p.fresh);
-        assert_eq!(pick(&cand, &[], 12, 3, false).capped, false); // everyone fits
-        assert_eq!(pick(&cand, &[], 12, 3, true).capped, true); // seg and mixed
+        assert!(!pick(&cand, &[], 12, 3, false).capped); // everyone fits
+        assert!(pick(&cand, &[], 12, 3, true).capped); // seg and mixed
     }
 }

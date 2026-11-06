@@ -24,6 +24,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include "../scheduler-rs/g6sched.h"
 
 namespace g6rt {
 
@@ -44,16 +45,8 @@ struct NgramTable
         while (b < NB - 1 && p >= edge[b]) ++b;
         return b;
     }
-    static uint64_t key(const int* ctx, int n)
-    {
-        uint64_t h = 1469598103934665603ull ^ (uint64_t)n;
-        for (int i = 0; i < n; ++i)
-        {
-            uint32_t v = (uint32_t)ctx[i];
-            for (int b = 0; b < 4; ++b) { h ^= (v >> (8 * b)) & 0xff; h *= 1099511628211ull; }
-        }
-        return h;
-    }
+    // the planner's key (engine/scheduler-rs ngram.rs), which looks the entries up: FNV-1a over n and each token's bytes
+    static uint64_t key(const int* ctx, int n) { return g6s2_ngram_key(ctx, n); }
     static uint64_t fnv(const std::string& s)
     {
         uint64_t h = 1469598103934665603ull;
