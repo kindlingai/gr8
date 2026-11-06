@@ -3,7 +3,6 @@
 `ds41` serves [DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017) on four GB10
 boxes. It takes the same two settings as every other model ([DEPLOY.md](DEPLOY.md)), and it needs two things GLM does
 not: the release is read in place, and Engram needs a token map you write once. This page is the whole boot in order.
-`./gr8 models` does not list `ds41` and the README's table does not hold it, so start here.
 
 [FIRST-BOOT.md](FIRST-BOOT.md) is the companion: it asks what you will run on the model and gives the measured numbers
 for each answer (how many chats, how long a context, speed against exactness). Read this page to get it serving, that

@@ -31,7 +31,8 @@ progress
 ### GLM-5.3 on 4 or 6 Sparks
 
 52.1 tok/s for one request writing code on four boxes, 57.4 on six (one of the six clock-capped) · up to 8 requests at
-once · recipes coming soon. Today it runs from gr8's own image with Docker Compose (Models and install, below).
+once · recipes coming soon. Until then, start it on three to six boxes with Docker Compose, from the
+[Models and install](#models-and-install) table.
 
 [Model page](docs/GLM-5.3.md)
 
@@ -39,8 +40,9 @@ once · recipes coming soon. Today it runs from gr8's own image with Docker Comp
 
 [![DeepSeek-V4.1-Flash on four GB10s in fast mode: decode, prefill and concurrency](docs/cards/deepseek-v4.1-flash-exlr8-4x-spark.png)](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)
 
-142.9 tok/s for one request writing code · 3,655 tok/s prefill on an 8K prompt · 32 requests at once · fast mode by
-default, output not exact · image not yet built
+142.9 tok/s for one request writing code · 3,655 tok/s prefill on an 8K prompt · 32 requests at once (the recipe's
+setting) · fast mode by default, so the output is not identical to the exact model's · the recipe's image is not built
+yet
 
 **[Recipe](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)** · [Model page](docs/DEEPSEEK.md)
 
