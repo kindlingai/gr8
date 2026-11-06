@@ -1,25 +1,25 @@
-# gr8: a super-fast local AI engine
+# gr8: a CUDA inference engine for DGX Spark
 
 Need help? Join us on discord: https://discord.gg/M7XTrRJW3
 
-Full GLM-5.3 on DGX Spark (GB10). *Beta release. If you run it, please tell us what breaks: issues and PRs are welcome.*
+gr8 serves GLM-5.3, GLM-5.3-Flash and DeepSeek-V4.1-Flash on one to six DGX Spark (GB10) boxes, tensor-parallel
+across all of them. It is written from scratch in CUDA and uses no vLLM, PyTorch or NCCL at serve time. Each box runs
+one `g6m4` process, the ranks talk over RoCE v2 through their own verbs fabric, and an OpenAI-compatible API runs on
+the first box. *Beta release. If you run it, please tell us what breaks: issues and PRs are welcome.*
 
-gr8 is a from-scratch CUDA inference engine for the full GLM 5.3 model (MoE with 256 experts, MLA attention with the
-sparse indexer, one MTP layer) on three to six DGX Spark (GB10) boxes, tensor-parallel across all of them. It
-uses no vLLM, PyTorch or NCCL at serve time. Each box runs one `g6m4` process, the ranks talk over RoCE v2 through
-their own verbs fabric, and an OpenAI-compatible API runs on the first box.
+## Pick your path
 
-## Recipes
+| boxes | model | start here | the first boot downloads |
+|---|---|---|---|
+| 1 | GLM-5.3-Flash | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark): one `docker run` | 87 GB |
+| 2 | GLM-5.3-Flash | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark): the same image on both boxes | about 86 GB a box |
+| 3 to 6 | GLM-5.3 | [Quick start](#quick-start), then [docs/DEPLOY.md](docs/DEPLOY.md): Docker Compose, bare metal or Kubernetes | about 90 GB a box at TP=4 |
+| 4 | DeepSeek-V4.1-Flash | [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md): you fetch the release yourself and write an Engram token map once | 510.6 GB a box, before the first boot |
 
-`gr8` is available in easy-to-use recipes preconfigured for the best performance for a given
-model and cluster size.
+The two recipe repos run gr8's image with the settings tuned for that many boxes. GLM-5.3-Flash also runs on three or
+four boxes as `glm53f` ([docs/FLASH.md](docs/FLASH.md)).
 
-### GLM 5.3 Flash
-
- - One DGX Spark: https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark
- - Two DGX Sparks: https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark
-
-## Results
+## GLM-5.3 results
 
 | | TP=3 | TP=4 | TP=5 | TP=6 |
 |---|---|---|---|---|
@@ -46,6 +46,10 @@ are estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [doc
 
 [kindling.json](kindling.json) has this table in a form a program can read. A PR that changes one changes the other.
 
+The other models' numbers are kept next to their setup: GLM-5.3-Flash on one and two boxes in each recipe repo's
+README, and DeepSeek-V4.1-Flash on four boxes in [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md#2-deepseek-v41-flash-ds41-how-many-chats-and-how-long)
+(how many chats at once against each chat's speed, and how long a chat can be).
+
 ## How it works
 
 - One model: the [exlr8 release](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) on Hugging Face. Each box
@@ -67,6 +71,9 @@ are estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [doc
   latent and their indexer keys) are spread across ranks, so the pools above fit. Requests up to that size share decode steps.
 
 ## What you need
+
+This section is for GLM-5.3. The recipe repos list what one or two boxes need, and
+[docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md#1-what-you-need) what DeepSeek-V4.1-Flash needs.
 
 - Three to six DGX Spark or other GB10 boxes (sm_121a, 128 GB unified memory), one rank per box, with nothing
   else holding much memory. A rank's weights take about 83 GB at TP=4 and 78 GB at TP=3. The KV pool and the step

@@ -32,7 +32,7 @@ downloads anything.
 | name | model | `MODEL` | TP | `DRAFTER` |
 |---|---|---|---|---|
 | `glm53` | GLM-5.3 | `https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4` | 3, 4, 5 or 6 | TP=4: `https://huggingface.co/incoai/GLM-5.3-DFlash2` |
-| `glm53f` | GLM-5.3-Flash ([FLASH.md](FLASH.md)) | `https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4` | 2, 3 or 4 | none |
+| `glm53f` | GLM-5.3-Flash ([FLASH.md](FLASH.md)) | `https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4` | 1, 2, 3 or 4 | none |
 | `ds41` | DeepSeek-V4.1-Flash-1017 ([DEEPSEEK-BOOT.md](DEEPSEEK-BOOT.md), [FIRST-BOOT.md](FIRST-BOOT.md)) | a local copy of `https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native`, read in place | 4 | none |
 
 `./gr8 models` lists each model's release and the values `--tp` and `--variant` take. For the GLM models each box
