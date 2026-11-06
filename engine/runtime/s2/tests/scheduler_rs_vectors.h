@@ -425,6 +425,23 @@ inline uint64_t share(uint64_t seed, std::vector<std::string>* lines = nullptr)
     return tx.h;
 }
 
+// the node's answer to a lease report (grant, give) as the Resize it becomes
+inline uint64_t share_resize(uint64_t seed, std::vector<std::string>* lines = nullptr)
+{
+    Rng R(seed);
+    Tx tx{{}, lines};
+    auto W = [&] { return R.U(0, 9) ? uint64_t(R.U(0, 40)) : R.U(0, 1) ? UINT64_MAX - uint64_t(R.U(0, 3)) : R.raw(); };
+    for (int t = 0; t < 50000; ++t)
+    {
+        const uint32_t tier = uint32_t(R.U(0, 3));
+        const uint64_t segs = W(), per = W(), grant = R.U(0, 2) ? 0 : W(), give = R.U(0, 2) ? 0 : W(), txn = R.raw();
+        g6sch_resize r{};
+        const bool on = g6sch_share_resize(tier, segs, per, grant, give, txn, &r);
+        tx(on ? std::to_string(r.tier) + " " + std::to_string(r.segs) + " " + std::to_string(r.slots) + " " + std::to_string(r.txn) : "-");
+    }
+    return tx.h;
+}
+
 // the admission queue through random streams
 inline uint64_t queue(uint64_t seed, std::vector<std::string>* lines = nullptr)
 {
@@ -474,8 +491,9 @@ inline uint64_t queue(uint64_t seed, std::vector<std::string>* lines = nullptr)
     return tx.h;
 }
 
-// the request parser over generated request files, well formed and mutated
-inline uint64_t request(uint64_t seed, std::vector<std::string>* lines = nullptr)
+// the request parser over generated request files, well formed and mutated; ready: the engine has a grammar loaded
+// (otherwise every gram request stops at that refusal)
+inline uint64_t request(uint64_t seed, std::vector<std::string>* lines = nullptr, bool ready = false)
 {
     Rng R(seed);
     Tx tx{{}, lines};
@@ -548,7 +566,7 @@ inline uint64_t request(uint64_t seed, std::vector<std::string>* lines = nullptr
             bytes.insert(at, 1, pick({std::string(1, '\0'), "\xff", "\xa0", "\x85"})[0]);
         }
         const st::BootConfig& b = *boots[U(0, 2)];
-        tx(outcome([&] { return str(impl::parse_request(bytes, b)); }));
+        tx(outcome([&] { return str(impl::parse_request(bytes, b, ready)); }));
     }
     for (const char* g : {"1:0:-1:", "2:1:5:7b7d", "2:0:-1:7", "x", "1:0", "2:0:-1:zZ", "2:1:-1:7B7d"})
         tx(outcome([&] {

@@ -2,7 +2,8 @@
 // scheduler_rs_vectors.h runs a seeded command stream and must hash to the value the C++ gave (recorded with
 // libstdc++, where the request parser's number rules come from). The scheduler's streams depend on the module's shape
 // (slots and caps), so it has one value per shape. A changed rule changes a hash: rerecord only for a change meant to
-// alter behaviour, and say so in the commit. Host only.
+// alter behaviour, and say so in the commit. The first eight were recorded at R2d (kindlingai/gr8#353) from the C++ then
+// in s2/tests/ref; --dump SECTION prints a section's transcript, to diff two builds line by line. Host only.
 #include "../kv_plan.h"
 #include "../flash_lend.h"
 #include "../flash_ring.h"
@@ -24,7 +25,8 @@ inline void validate(const Config& c) { c.validate(); }
 #include "scheduler_rs_vectors.h"
 } // namespace vec
 
-int main()
+// --dump SECTION: write that section's transcript to stdout instead of checking the hashes (to diff two builds)
+int main(int argc, char** argv)
 {
     struct Shape { int max_sessions; bool mtp0, pack, park; uint64_t scheduler; };
     const Shape shapes[] = {
@@ -45,8 +47,24 @@ int main()
         {"scheduler", 5, vec::scheduler, shape ? shape->scheduler : 0},
         {"share", 6, vec::share, 0x5a98bacc9f262ab7ull},
         {"queue", 7, vec::queue, 0xaf92603441c49eaaull},
-        {"request", 8, vec::request, 0xaaab3710d1030662ull},
+        {"request", 8, [](uint64_t s, std::vector<std::string>* l) { return vec::request(s, l, false); }, 0xaaab3710d1030662ull},
+        // recorded from the Rust after the old C++ parser (git c74d024, libstdc++) gave the same transcript
+        {"request_gram", 9, [](uint64_t s, std::vector<std::string>* l) { return vec::request(s, l, true); }, 0x18a523b6c0f716ceull},
+        {"share_resize", 10, vec::share_resize, 0xd99c642674175c07ull},
     };
+    if (argc == 3 && std::string(argv[1]) == "--dump")
+    {
+        for (const auto& s : sections)
+            if (s.name == std::string(argv[2]))
+            {
+                std::vector<std::string> lines;
+                s.run(s.seed, &lines);
+                for (const auto& l : lines) std::printf("%s\n", l.c_str());
+                return 0;
+            }
+        std::fprintf(stderr, "no section %s\n", argv[2]);
+        return 2;
+    }
     int fails = 0;
     for (const auto& s : sections)
     {
@@ -54,7 +72,7 @@ int main()
         if (h == s.want) continue;
         ++fails;
         std::printf("FAIL %s: transcript %016llx, recorded %016llx%s\n", s.name, (unsigned long long)h, (unsigned long long)s.want,
-                    s.want ? "" : " (no value recorded for this shape)");
+                    s.want ? "" : " (no value recorded)");
     }
     std::printf("scheduler_rs_vectors_test (%d slots%s%s%s): %s\n", ms, mtp0 ? ", mtp0" : "", pack ? ", pack" : "", park ? ", park" : "",
                 fails ? "FAIL" : "PASS");
