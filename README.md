@@ -9,12 +9,12 @@ the first box. *Beta release. If you run it, please tell us what breaks: issues 
 
 ## Pick your path
 
-| boxes | model | start here | the first boot downloads |
+| boxes | model | start here | download |
 |---|---|---|---|
 | 1 | GLM-5.3-Flash | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark): one `docker run` | 87 GB |
 | 2 | GLM-5.3-Flash | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark): the same image on both boxes | about 86 GB a box |
 | 3 to 6 | GLM-5.3 | [Quick start](#quick-start), then [docs/DEPLOY.md](docs/DEPLOY.md): Docker Compose, bare metal or Kubernetes | about 90 GB a box at TP=4 |
-| 4 | DeepSeek-V4.1-Flash | [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md): you fetch the release yourself and write an Engram token map once | 510.6 GB a box, before the first boot |
+| 4 | DeepSeek-V4.1-Flash | [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md): you fetch the release yourself and write an Engram token map once | 510.6 GB a box, fetched before the first boot |
 
 The two recipe repos run gr8's image with the settings tuned for that many boxes. GLM-5.3-Flash also runs on three or
 four boxes as `glm53f` ([docs/FLASH.md](docs/FLASH.md)).
