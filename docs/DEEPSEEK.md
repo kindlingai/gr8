@@ -21,7 +21,8 @@ Engram on, 5 chat slots, four GB10 boxes on one 200G switch.
 
 `bench/bench.py` (gr8's own benchmark, `reasoning_effort` low, timed stages at uncapped GPU clocks), two runs on one
 boot of `main` at 40a91f5 with the launcher's defaults, on 2026-11-02. A range is the two runs. The first word after a
-128K prompt came in 34.3-35.1 s. Both runs passed smoke (11/11) and gave the same temperature-0 replies.
+128K prompt came in 34.3-35.1 s. Both runs passed smoke (11/11) and gave the same temperature-0 replies. The longest request on that boot was 163,830
+tokens; `main` now allows 262,134 (#325).
 
 - Quality: 73 of 75 in each of three runs of the 75-item check of [FIRST-BOOT.md](FIRST-BOOT.md#3-deepseek-v41-flash-ds41-speed-against-exactness)
   (code, math, JSON, reasoning), exact output, on `main` at b10aae4 (2026-11-03).
