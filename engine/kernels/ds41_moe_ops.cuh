@@ -109,7 +109,7 @@ struct RoScratch                                      // read-once path, M RO_FR
     uint8_t* mt_xs = nullptr;     // [ROMAX][HID/32] its E8M0 bytes
     uint8_t* mt_aq = nullptr;     // [tiles*8][IW/64][64] fc1's act quantized
     uint8_t* mt_as = nullptr;     // [tiles*8][mxtc::ASP]
-    int* mt_cnt = nullptr;        // [ROMAX][DS41_TC_OS2] the fused combine's route counts (DS41_TC_COMBINE); null = k_combine_mt runs after fc2
+    int* mt_cnt = nullptr;        // [ROMAX][moe_tc_os2()] the fused combine's route counts (DS41_TC_COMBINE); null = k_combine_mt runs after fc2
 };
 struct Scratch
 {
@@ -201,6 +201,20 @@ inline int ro_fc1bstg() { return knob::ds_moe_fc1bstg() ? 1 : 0; }
 // layouts and the combine are the fp16 loop's. Not bit-equal to the fp16 loop (the activation rounding and the tensor cores' sum order); a configuration
 // choice, as GR8_DS_ATTN_TC. The shape is DS41_TC_* (ds_ro_cfg.h). Decode, the M <= 256 paths and the shared expert are not touched.
 inline bool moe_tc_on() { return knob::ds_moe_tc(); }
+// GR8_DS_MOE_TC_OS2 (default 0 = DS41_TC_OS2, 16): the CTAs k_fc2_tc splits an expert's 40 output blocks over (a slice at a time, os the slowest block index).
+// More slices = a smaller set of ypart slots live in L2 between fc2's stores and the fused combine's loads, and more re-reads of the act rows. fc2's sums and
+// the combine's route order do not depend on it, so every value gives the same output bits (tests/ds_moe_tc_bench.cu -DMXTC_OS2=N: bitEq yes).
+constexpr int MOE_TC_OS2_MAX = 40;
+inline int moe_tc_os2()
+{
+    static const int v = []
+    {
+        const int k = (int)knob::ds_moe_tc_os2(), n = k >= 1 && k <= MOE_TC_OS2_MAX ? k : DS41_TC_OS2;
+        if (k != 0) fprintf(stderr, "# DS41 GR8_DS_MOE_TC_OS2=%d: fc2 output slices %d\n", k, n);   // first use, a line a rank (nothing when 0)
+        return n;
+    }();
+    return v;
+}
 // The top-k cut GR8_DS_MOE_TOPK (quality not measured): routed experts kept per token on the main layers (384 experts). Default dsr::TOPK.
 // The kept routes are the planner's first KC picks (best biased key first); the weights renormalize over
 // them (sum of the kept scores, x ROUTE_SCALE). The DSpark draft layers (128 experts, top-3) keep their k. GR8_MOE_TOPK is the Flash model's knob, so it is not
@@ -464,7 +478,7 @@ inline int bind_moe(void* model, int i, int, void*)
         for (int j = 0; j < i; ++j) if (m.layers[j].moe) first = false;
         if (first)
             fprintf(stderr, "# rank %d DS41 GR8_DS_MOE_TC=%d fc1 cw%d ntg%d st%d gy%d fc2 w%d wt%d tpc%d st%d gy%d os%d\n", m.rank, g, DS41_TC_CW, DS41_TC_NTG1, DS41_TC_ST1, DS41_TC_GY1,
-                    DS41_TC_W2, DS41_TC_WT, DS41_TC_TPC, DS41_TC_ST2, DS41_TC_GY2, DS41_TC_OS2);
+                    DS41_TC_W2, DS41_TC_WT, DS41_TC_TPC, DS41_TC_ST2, DS41_TC_GY2, moe_tc_os2());
     }
     LayerState* s = new LayerState();
     s->ne = ne; s->tk = ne == dsr::NEXP ? dsr::TOPK : geom::DS_TOPK; s->layer = y.l;
@@ -556,7 +570,7 @@ inline RoScratch* ro_alloc()
         p->mt_xs = dmalloc<uint8_t>((size_t)ROMAX * (HID / 32));
         p->mt_aq = dmalloc<uint8_t>((size_t)TILES * 8 * IW);
         p->mt_as = dmalloc<uint8_t>((size_t)TILES * 8 * mxtc::ASP);
-        if (DS41_TC_COMBINE) p->mt_cnt = dmalloc<int>((size_t)ROMAX * DS41_TC_OS2);
+        if (DS41_TC_COMBINE) p->mt_cnt = dmalloc<int>((size_t)ROMAX * moe_tc_os2());
     }
     return p;
 }
@@ -891,7 +905,7 @@ inline int experts_ro(Model& m, const LayerState& s, int M, cudaStream_t st)
     {
         const int kc = NE == dsr::NEXP ? topk_for_step(m) : TK;              // the routes the planner kept per token (op_router's cut)
         const mxtc::Args TA{s.fc1, s.fc2, q.mt_xq, q.mt_xs, RA.slot_expert, RA.slot_tile0, RA.slot_nt, RA.tile_mask, RA.tile_w, RA.tile_tok, RA.n_slots_dev,
-                            (const int*)(p + offsetof(P, n_tiles)), sb, DS41_TC_GY1, DS41_TC_GY2, DS41_TC_OS2,
+                            (const int*)(p + offsetof(P, n_tiles)), sb, DS41_TC_GY1, DS41_TC_GY2, moe_tc_os2(),
                             q.mt_cnt, kc, (const int*)(p + offsetof(P, tok_slot)), (const int*)(p + offsetof(P, tok_col)), q.sh_out, s.tc_w13 ? 1 : 0, (void*)m.sc.part[1],
                             geom::SWIGLU_LIMIT, q.act, q.mt_aq, q.mt_as, q.ypart};
         const cudaError_t e = mxtc::launch_layer<HID, IW, HID, DS41_TC_CW, DS41_TC_NTG1, DS41_TC_ST1, DS41_TC_W2, DS41_TC_WT, DS41_TC_TPC, DS41_TC_ST2>(

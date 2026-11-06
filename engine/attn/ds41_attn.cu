@@ -80,6 +80,8 @@ void ds41_attn_comp_prepack(const ds41a::bf16* src, uint8_t* codes, uint8_t* sca
 // Launch order of that GEMM (default 0 = N tile fastest): 1 = M tile fastest for every launch; 2 = auto, M tile fastest only for a weight of >= 100 MB (ds41a::TC_MF_AUTO_BYTES).
 // Only matters when the weights are much bigger than L2 and M spans several tiles (Engram wkv). Any other nonzero value means 1.
 void ds41_attn_set_tc_mfast(int mode) { ds41a::g_tc_mfast = mode == 2 ? 2 : mode != 0 ? 1 : 0; }
+// The 128 x 128 tile of that GEMM (GR8_DS_ATTN_TC_TILE, default 0): 1 = k_gemm_mx8t_sw, a 3-deep ring of swizzled rows. The same output bits.
+void ds41_attn_set_tc_tile(int mode) { ds41a::g_tc_tile = mode == 1 ? 1 : 0; }
 // Explicit tensor-core MXFP8 GEMM for other TUs (the indexer's wq_b), one group, independent of ds41_attn_set_tc:
 //   Y[M][N] (bf16, row stride ldy elements) = fp8gemm(A codes [M][K] (row stride lda bytes) + E8M0 scales SA (row stride lsa bytes),
 //                                                      W codes [N][K] + E8M0 scales SW [N][K/32]), all device pointers, async on st.

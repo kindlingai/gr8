@@ -51,6 +51,15 @@ knobs:
       records as stored are the e2m1 operand, the activations are rounded to MXFP8 (E4M3 per 32 with an E8M0 scale, as
       GR8_DS_ATTN_TC rounds the attention inputs), fp32 accumulate. Not bit-equal to 0, which keeps the fp16 kernels.
       Decode and the shared expert are not touched. DS41's launcher defaults set 1.
+  GR8_DS_MOE_TC_OS2:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0|8|10|20|40"
+    doc: >-
+      With GR8_DS_MOE_TC=1: the number of slices the fc2 kernel splits an expert's output columns into, one slice at a
+      time. 0 = the build's value (16). More slices keep fewer partial sums in L2 before the fused combine reads them,
+      and read the activations more times. Every value gives the same output bits.
   GR8_DS_MOE_PDL:
     scope: agree
     kind: flag
