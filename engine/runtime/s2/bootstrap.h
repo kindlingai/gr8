@@ -182,6 +182,10 @@ inline ControlLinks bootstrap(const BootstrapConfig& c) {
 // order, and sends them back. Every rank then starts from the same stored entries (pool.h keep_agreed). idle: wait for
 // the other ranks with no receive timeout, as capture_barrier (Flash agrees after the graph capture and its checkpoint
 // checks, whose times differ by rank)
+// A worker sends its lines before the head reads them, under the link's send timeout (BootstrapConfig timeout,
+// GR8_S2_TIMEOUT, 120 s). Lines past the socket buffers (about 110 bytes an entry, a few thousand entries) wait for the
+// head. If the head works longer than the timeout first (Flash entry verification), the worker fails with "control send
+// failed". Widen the timeout then.
 inline std::string agree_lines(const BootstrapConfig& c, ControlLinks& links, const std::string& mine, bool idle = false) {
     auto lines = [](const std::string& s) {
         std::vector<std::string> v;
