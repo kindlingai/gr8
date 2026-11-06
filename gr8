@@ -124,6 +124,8 @@ case $cmd in
     PORT=$(python3 "$REPO/tools/launch/launch.py" get PORT "${named[@]}") || exit 2   # the port as up reads it, from the same file
     url=${1:-$(api)}; [ $# -gt 0 ] && shift
     [ "$model" = ds41 ] && exec bash "$REPO/smoketest/ds41.sh" "$url" "$@"   # DeepSeek's cases: its dialect, its served name
+    # the model's own served name (models.py), else smoketest/lib.sh's from model.yaml: GLM-5.3's
+    [ $# = 0 ] && name=$(python3 "$REPO/tools/launch/models.py" served "$model") && [ -n "$name" ] && set -- "$name"
     exec bash "$REPO/smoketest/run.sh" "$url" "$@" ;;
   bench)
     PORT=$(python3 "$REPO/tools/launch/launch.py" get PORT "${named[@]}") || exit 2

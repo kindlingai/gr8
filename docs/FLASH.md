@@ -21,6 +21,10 @@ it through the same release planner as GLM-5.3 (`engine/loader-rs`): `release::p
 own metadata (`hidden_size` 4096) and maps Flash's tensors with `engine/loader-rs/src/flash.rs`. The width manifests are
 `k2`, `k3` and `k4` (the default).
 
+The front end serves the model as `glm-5.3-flash` (`/v1/models` lists it first) and also answers to `glm53f`. A request
+that names `glm-5.3` gets a 404 (one that names no model is served), so a router that picks backends by model name
+keeps Flash and GLM-5.3 apart (`served` in `tools/launch/models.py`). `./gr8 glm53f smoke` sends the Flash name.
+
 ## The model
 
 - 45 layers plus the MTP layer 45. 34 layers use KDA linear attention (`engine/kda`). The others (3, 7, ..., 43) use
