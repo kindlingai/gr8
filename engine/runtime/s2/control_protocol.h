@@ -11,7 +11,9 @@ struct Encoder {
     void notice(const Notice& n){u64(n.epoch);u64(n.event);u64(n.boundary);u64(n.request);u64(n.payload_hash);u64(uint64_t(n.kind));}
     void key(Key k){u64(k.epoch);u64(k.slot);u64(k.generation);}
     void steering(const g6rt::steering::Identity& s){
-        u64(s.enabled);if(!s.enabled)return;
+        u64(uint64_t(s.enabled)|(s.images?2u:0u));
+        if(s.images)for(unsigned i=0;i<32;i+=8){uint64_t x=0;for(unsigned k=0;k<8;++k)x=x*256+s.image_digest[i+k];u64(x);}
+        if(!s.enabled)return;
         for(unsigned i=0;i<32;i+=8){uint64_t x=0;for(unsigned k=0;k<8;++k)x=x*256+s.profile_digest[i+k];u64(x);}
         u64(uint64_t(s.scope));
         for(unsigned i=0;i<32;i+=8){uint64_t x=0;for(unsigned k=0;k<8;++k)x=x*256+s.schedule_digest[i+k];u64(x);}
@@ -26,7 +28,8 @@ struct Decoder {
     Notice notice(){Notice n;n.epoch=u64();n.event=u64();n.boundary=u64();n.request=u64();n.payload_hash=u64();auto k=u64();require(k>=1&&k<=3,"unknown event kind");n.kind=EventKind(k);return n;}
     Key key(){Key k;k.epoch=u64();k.slot=u32();k.generation=u32();return k;}
     g6rt::steering::Identity steering(){
-        g6rt::steering::Identity s;auto on=u64();require(on<=1,"invalid steering enabled bit");s.enabled=on;
+        g6rt::steering::Identity s;auto on=u64();require(on<=3,"invalid steering enabled bits");s.enabled=on&1;s.images=on&2;
+        if(s.images)for(unsigned i=0;i<32;i+=8){auto x=u64();for(int k=7;k>=0;--k){s.image_digest[i+k]=uint8_t(x);x>>=8;}}
         if(!s.enabled)return s;
         for(unsigned i=0;i<32;i+=8){auto x=u64();for(int k=7;k>=0;--k){s.profile_digest[i+k]=uint8_t(x);x>>=8;}}
         auto scope=u64();require(scope==uint64_t(g6rt::steering::Scope::Shared)||scope==uint64_t(g6rt::steering::Scope::Full),"invalid steering scope");s.scope=g6rt::steering::Scope(scope);

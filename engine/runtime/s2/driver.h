@@ -2,6 +2,7 @@
 // All calls run on the compute thread at safe boundaries. apply() requires an
 // EventGate all-rank fence; callbacks must fail the whole epoch on any error.
 #pragma once
+#include "../ds41_image.h"
 #include "scheduler.h"
 #include "cp_rows.h"
 #include "../s2_batch.h"
@@ -14,6 +15,7 @@ struct Payload {
     g6rt::InsertRule ins;
     g6rt::steering::Identity steering{};
     g6rt::GrammarSpec gram;
+    std::vector<g6rt::ImageIn> images;   // DS41 image spans (ds41_image.h); only on prefilled prompts (Service::images_ok)
 };
 // One member of a single bounded W pass. Pointers remain valid for Driver::step's synchronous callback.
 struct PrefillPart { const Slot* slot = nullptr; const Payload* payload = nullptr; uint32_t first = 0, rows = 0; };

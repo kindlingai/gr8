@@ -264,7 +264,7 @@ pub fn digest() -> u64 {
     );
     layout!(h, crate::kv_share::Resize { tier, segs, slots, txn });
     layout!(h, crate::scheduler::Key { epoch, slot, generation });
-    layout!(h, crate::scheduler::Identity { enabled, profile_digest, scope, schedule_digest, scale_bits, slot });
+    layout!(h, crate::scheduler::Identity { enabled, profile_digest, scope, schedule_digest, scale_bits, slot, images, image_digest });
     layout!(h, crate::scheduler::Request { id, prompt_tokens, max_tokens, steering, r_rows });
     layout!(h, crate::scheduler::Run { first_page, pages, table_version, list_hash });
     layout!(

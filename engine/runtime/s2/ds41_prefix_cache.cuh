@@ -16,6 +16,7 @@
 #endif
 #include "../../attn/kvfmt.h"
 #include "../../engram/engram_ring.h"
+#include "ds41_engram_ring.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -174,9 +175,11 @@ public:
     //     is lost only to prompts that share its prefix and leave the reply (a retry, regenerate or edit: a re-prefill).
     //   replace = false: a new entry is linked to it as its sibling; the first restore of either frees the other (restore()).
     // keep (GR8_DS_PARK: a grant's own hit, restored after this capture) is never freed or evicted here: when only it stands
-    // in the way the capture is skipped (returns 0)
+    // in the way the capture is skipped (returns 0). images: the request's image rows, -1 in the entry's Engram ring as in the
+    // live ring (ds41_engram_ring.h)
     uint64_t capture(int slot, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns, cudaStream_t st,
-                     Ds41Snap kind = Ds41Snap::Other, uint64_t prompt_gen = 0, bool replace = false, uint64_t keep = 0) {
+                     Ds41Snap kind = Ds41Snap::Other, uint64_t prompt_gen = 0, bool replace = false, uint64_t keep = 0,
+                     const Ds41ImageRows& images = {}) {
         const uint64_t replace_gen = replace && prompt_gen != keep ? prompt_gen : 0;
         if (pos == 0 || tokens.size() < size_t(pos)) return 0;
         for (size_t i = 0; i < entries_.size(); ++i) {
@@ -237,10 +240,7 @@ public:
         e.tokens.assign(tokens.begin(), tokens.begin() + pos);
         e.ns = ns;
         e.dev_buf = dev_buf;
-        std::fill_n(e.ehist, ds41::engram::kRing, -1);
-        for (int t = std::max(0, int(pos) - ds41::engram::kRing); t < int(pos); ++t) {
-            ds41::engram::ring_put(e.ehist, t, e.tokens[size_t(t)]);
-        }
+        ds41_engram_ring(e.ehist, e.tokens, pos, images);
         const uint64_t gen = e.generation;
         used_bytes_ += need;
         captured_bytes_ += need;
@@ -548,16 +548,16 @@ public:
         return kind;
     }
     uint64_t capture_prompt_end(Ds41PrefixCache& ck, int q, uint32_t pos, const std::vector<int>& prompt,
-                                const g6rt::CacheNamespace& ns, cudaStream_t st) {
+                                const g6rt::CacheNamespace& ns, cudaStream_t st, const Ds41ImageRows& images = {}) {
         const uint64_t before = ck.captures();
-        const uint64_t gen = ck.capture(q, pos, prompt, ns, st, Ds41Snap::PromptEnd);
+        const uint64_t gen = ck.capture(q, pos, prompt, ns, st, Ds41Snap::PromptEnd, 0, false, 0, images);
         // only a new entry is this request's own: a refreshed one may belong to another request that still needs it
         if (ck.captures() != before) prompt_gen_[size_t(q)] = gen;
         return gen;
     }
     uint64_t capture_request_end(Ds41PrefixCache& ck, int q, uint32_t pos, const std::vector<int>& history,
-                                 const g6rt::CacheNamespace& ns, cudaStream_t st) {
-        return ck.capture(q, pos, history, ns, st, Ds41Snap::RequestEnd, prompt_gen_[size_t(q)], restored_end_[size_t(q)]);
+                                 const g6rt::CacheNamespace& ns, cudaStream_t st, const Ds41ImageRows& images = {}) {
+        return ck.capture(q, pos, history, ns, st, Ds41Snap::RequestEnd, prompt_gen_[size_t(q)], restored_end_[size_t(q)], 0, images);
     }
     // GR8_DS_PARK: a park keeps q's state for the bind that resumes or evicts it; the request-end bookkeeping happens now
     void park(Ds41PrefixCache& ck, int q, uint32_t pos, const std::vector<int>& history, const g6rt::CacheNamespace& ns) {
@@ -568,9 +568,9 @@ public:
     // (keep = the new grant's claimed entry, never freed here; the capture is skipped when only it is in the way). Nothing
     // when a restore already freed it as a sibling. The park is detached and q's state reset on every path
     uint64_t evict_parked(Ds41PrefixCache& ck, int q, uint32_t pos, const std::vector<int>& history, const g6rt::CacheNamespace& ns,
-                          cudaStream_t st, uint64_t keep) {
+                          cudaStream_t st, uint64_t keep, const Ds41ImageRows& images = {}) {
         const bool freed = ck.evict_parked_freed(park_id_[size_t(q)], keep);
-        const uint64_t gen = freed ? 0 : ck.capture(q, pos, history, ns, st, Ds41Snap::RequestEnd, prompt_gen_[size_t(q)], false, keep);
+        const uint64_t gen = freed ? 0 : ck.capture(q, pos, history, ns, st, Ds41Snap::RequestEnd, prompt_gen_[size_t(q)], false, keep, images);
         reset(q);
         return gen;
     }

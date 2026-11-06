@@ -79,6 +79,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_DS41_IDX_TOPK` | text | `mc` | mc\|1cta | Top-k kernel of the dense index stage: mc = several CTAs per long row, 1cta = the single-CTA reference kernel. Both give the same lists. |
 | `GR8_DS41_IDX_WQB_TC` | int | `0` | 0.. | The indexer's wq_b runs on the attention block's tensor-core GEMM at this many rows or more. Not bit-exact against the scalar GEMM. 0 = off. |
 | `GR8_DS41_PUB16` | flag | `0` |  | 1 = a publish of 8 rows or fewer (the layer exchanges and the Engram reduce) copies into the send slot with 16 CTAs instead of 1, the grid a publish of more rows already runs. The same bytes and the same doorbell, so the outputs do not change. |
+| `GR8_DS41_VISION` | flag | `0` | 0\|1 | 1 = with --serve, a release that has dense/exlr8-extra-vision.safetensors loads the vision tower at boot, before the KV pool is sized, and the engine takes requests with images (hello `vision`). Without that file the engine serves text only. 0 (the default) never loads the tower: the engine runs as it did before image input. The tower costs about 1.5 GB of device memory a rank, so image input is opt-in. |
 | `GR8_DS_ATTN_CPA` | flag | `0` |  | 1 = the attention core gathers its K rows with cp.async (k_attn_cpa). The output is bit-identical to k_attn. |
 | `GR8_DS_ATTN_GV` | flag | `1` |  | Decode projections of up to 8 rows run on the MXFP8 GEMV where the weight has .mx.gv records. 0 = the generic MXFP8 GEMM for every projection. |
 | `GR8_DS_ATTN_GV_KS` | int | `0` | 0.. | k-parts per output tile of the attention GEMV. 0 = the built-in pick per shape (gv_pick_ks). |
@@ -480,6 +481,7 @@ Read by test programs, audits and benchmarks. `g6m4 --serve` refuses to start wh
 | `GR8_TEST_S2_SOLO1` | flag | `1` |  | m4sim --s2: a session left alone runs the single-session path. 0 keeps it on the S2 path. |
 | `GR8_TEST_S2_XLIST` | ints | unset |  | m4sim gate: seed[,pages] runs every sequence as one session past R on a shuffled page list of the pool's two classes. Stdout must equal the run without it. |
 | `GR8_TEST_TOKENIZER_DIR` | path | unset |  | The tokenizer directory the front end tests need, unset skips them. |
+| `GR8_TEST_VISION_CASES` | path | the committed set, frontend/g6front-rs/src/vision_cases |  | A directory of random image cases (frontend/tests/vision_pil_cases.py --n) for the front end's PIL comparison test; its lossy cases only report how far they are off. |
 
 ## Build and launcher
 

@@ -31,6 +31,12 @@ knobs:
     doc: >-
       The DeepSeek-V4.1-Flash tokenizer directory (tokenizer.json, tokenizer_config.json) the front end's ds41 dialect
       test reads; unset skips it.
+  GR8_TEST_VISION_CASES:
+    kind: path
+    unset: "the committed set, frontend/g6front-rs/src/vision_cases"
+    doc: >-
+      A directory of random image cases (frontend/tests/vision_pil_cases.py --n) for the front end's PIL comparison
+      test; its lossy cases only report how far they are off.
   GR8_TEST_FUZZ_ROUNDS:
     kind: int
     default: "40"

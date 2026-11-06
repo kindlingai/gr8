@@ -24,7 +24,8 @@ namespace dsr
 // a route k in [KC, TK) is written as tok_expert -1, tok_w 0 and is in no emask row (k_place_ro skips it, k_expert_log does not count it).
 template <int NE = NEXP, int TK = TOPK, int MM = 1024, int KC = TK>
 __global__ void __launch_bounds__(256) k_route_ro(const float* __restrict__ logits, const float* __restrict__ bias, int M, PlanMT<TK, MM>* __restrict__ P,
-                                                 unsigned* __restrict__ emask)
+                                                 unsigned* __restrict__ emask, const float* __restrict__ bias_vl = nullptr,
+                                                 const unsigned char* __restrict__ vflag = nullptr)
 {
     constexpr int RW = NE / 32, MW = MM / 32;
     static_assert(NE % 32 == 0 && MM % 32 == 0 && MM <= RO_MAX && TK <= 8 && TK <= NE, "k_route_ro tiling");
@@ -32,12 +33,13 @@ __global__ void __launch_bounds__(256) k_route_ro(const float* __restrict__ logi
     const int w = threadIdx.x >> 5, l = threadIdx.x & 31, m = blockIdx.x * 8 + w;
     if (m >= M) return;
     float s[RW], key[RW];
+    const float* __restrict__ bsel = (vflag && vflag[m]) ? bias_vl : bias;   // image rows: gate.bias_vl (ds_router.cuh)
     #pragma unroll
     for (int i = 0; i < RW; ++i)
     {
         const float sc = sqrt_softplus(logits[m * NE + l + 32 * i]);
         s[i] = sc;
-        key[i] = sc + bias[l + 32 * i];
+        key[i] = sc + bsel[l + 32 * i];
     }
     unsigned taken = 0;
     float my_k = key[0];

@@ -454,7 +454,8 @@ impl Release {
 
 // ---------------------------------------------------------------------------------------------------- planner
 
-/// Release tensors that are not part of the text model: skipped on purpose.
+/// Release tensors the engine does not load: skipped on purpose (the DSpark layers' gate.bias_vl; the main layers' is
+/// bound as router.bias_vl).
 fn skipped(name: &str) -> bool {
     name.ends_with(".bias_vl")
 }
@@ -812,6 +813,10 @@ impl Planner<'_> {
         // the MoE block
         self.bf16_mat(&format!("{p}.router.w"), &t("ffn.gate"), None, true)?;
         self.vector(format!("{p}.router.bias"), &t("ffn.gate.bias"))?;
+        // image rows select with gate.bias_vl (DS41 vision, kernels/ds_router.cuh); the DSpark layers never see an image row
+        if l < MTP0 && self.rel.has(&t("ffn.gate.bias_vl")) {
+            self.vector(format!("{p}.router.bias_vl"), &t("ffn.gate.bias_vl"))?;
+        }
         let n_exp = self.rel.dims(&t("ffn.gate"))?[0];
         if self.trellis.contains_key(&l) {
             self.trellis_experts(l)?;

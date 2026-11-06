@@ -447,9 +447,12 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     };
     let t0 = std::time::Instant::now();
     let kw_system = kw.clone();
+    let mut images = Vec::new();
     let text = if ds {
         let (agp, cfm) = dialect::ds_gen_flags(body)?;
-        dialect::ds_prompt(Some(&messages), tools.as_ref(), !th.off, ds_effort, agp, cfm)?
+        let (text, im) = dialect::ds_prompt(Some(&messages), tools.as_ref(), !th.off, ds_effort, agp, cfm)?;
+        images = im;
+        text
     } else {
         let mut text = st.tpl().render(Some(&messages), tools.as_ref(), kw)?;
         if th.off {
@@ -466,6 +469,13 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         ds_system_span(st, body.get("messages"), tools.as_ref(), !th.off, ds_effort, &prompt).await
     } else {
         system_span(st, body.get("messages"), tools.as_ref(), kw_system, add_special, th.off, &prompt).await
+    };
+    let (prompt, system, spans) = if images.is_empty() {
+        (prompt, system, Vec::new())
+    } else {
+        let (ids, spans, n_spans) = with_images(st, &images, &prompt).await?;
+        let system = system.map(|n| crate::vision::expanded_index(&prompt, n as usize, &n_spans) as u64);
+        (ids, system, spans)
     };
     log::debug!(
         "chat prompt: {chars} bytes -> {} tokens; template {:.2} ms, encode {:.2} ms, system span {system:?} tokens {:.2} ms",
@@ -532,7 +542,57 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         });
     }
     (params.gen.steering_profile, params.gen.steering_scale) = sampling::steering(body, st.steering().as_ref())?;
+    if !spans.is_empty() {
+        // the engine runs image rows only through its prefill chunks, which prompt logprobs and steering do not use
+        if params.gen.prompt_logprobs.is_some() {
+            return Err(ApiError::bad("images cannot be combined with prompt_logprobs", Some("prompt_logprobs")));
+        }
+        if params.gen.steering_profile.is_some() {
+            return Err(ApiError::bad("images cannot be combined with steering", Some("messages")));
+        }
+        params.gen.images = std::sync::Arc::new(spans);
+    }
     Ok(ChatReq { tools, choice, force, prompt, params, budget, rf })
+}
+
+fn image_err(e: crate::vision::VisionError) -> ApiError {
+    ApiError::bad(e.0, Some("messages"))
+}
+
+/// The request's images (blocks in prompt order) -> the prompt with each placeholder token grown to its span, the
+/// spans for the engine, and each span's length. Decoding and resizing run off the async threads.
+async fn with_images(
+    st: &'static State,
+    images: &[Value],
+    prompt: &[u32],
+) -> Result<(Vec<u32>, Vec<crate::vision::Span>, Vec<usize>), ApiError> {
+    use crate::vision;
+    if !st.engine.vision() {
+        return Err(ApiError::bad("this engine takes no images", Some("messages")));
+    }
+    let b64: Vec<String> =
+        images.iter().map(|b| vision::block_b64(b).map(str::to_string)).collect::<Result<_, _>>().map_err(image_err)?;
+    vision::check_budget(&b64).map_err(image_err)?;
+    let prepared = tokio::task::spawn_blocking(move || {
+        b64.iter().map(|s| vision::prepare_b64(s)).collect::<Result<Vec<_>, _>>()
+    })
+    .await
+    .map_err(|e| ApiError::new(500, &e.to_string(), None))?
+    .map_err(image_err)?;
+    let n_spans: Vec<usize> = prepared.iter().map(|p| p.plan.n_span()).collect();
+    let (ids, pos) = vision::expand(prompt, &n_spans).map_err(image_err)?;
+    let spans = prepared
+        .into_iter()
+        .zip(pos)
+        .map(|(p, pos)| vision::Span {
+            pos,
+            vit_h: p.vit_h(),
+            vit_w: p.vit_w(),
+            rgb_b64: vision::b64_encode(&p.rgb),
+            key: p.key,
+        })
+        .collect();
+    Ok((ids, spans, n_spans))
 }
 
 /// Append a one-line instruction after the last user or tool message (vLLM's chat-ml injection shape).
@@ -1338,8 +1398,24 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                 let (th, effort) = dialect::resolve_ds(&body, st.thinking, st.ds_effort)?;
                 let tools = normalize_tools(body.get("tools"))?;
                 let (agp, cfm) = dialect::ds_gen_flags(&body)?;
-                let text = dialect::ds_prompt(body.get("messages"), tools.as_ref(), !th.off, effort, agp, cfm)?;
-                st.tok.aencode(text, false).await.map_err(|e| ApiError::new(500, &e, None))?
+                let (text, images) =
+                    dialect::ds_prompt(body.get("messages"), tools.as_ref(), !th.off, effort, agp, cfm)?;
+                let ids = st.tok.aencode(text, false).await.map_err(|e| ApiError::new(500, &e, None))?;
+                if images.is_empty() {
+                    ids
+                } else {
+                    // the span lengths come from the images' headers; the pixels are not built
+                    use crate::vision;
+                    let b64: Vec<&str> =
+                        images.iter().map(vision::block_b64).collect::<Result<_, _>>().map_err(image_err)?;
+                    vision::check_budget(&b64).map_err(image_err)?;
+                    let n_spans: Vec<usize> = b64
+                        .iter()
+                        .map(|s| vision::plan_b64(s).map(|p| p.n_span()))
+                        .collect::<Result<_, _>>()
+                        .map_err(image_err)?;
+                    vision::expand(&ids, &n_spans).map_err(image_err)?.0
+                }
             } else {
                 // the same effort and the same refusals as a chat request, so the counts agree
                 let th = st.tpl().resolve_thinking(&body, st.thinking)?;

@@ -48,7 +48,8 @@ void g6sch_cp_pick(const g6sch_cand* cand, size_t n, const uint64_t* served, siz
 // except where the C++ they replaced changed some first (complete_decode, complete_tail_pack's revision).
 #define G6SCH_QMAX 32
 struct g6sch_key { uint64_t epoch; uint32_t slot, generation; };
-struct g6sch_identity { bool enabled; uint8_t profile_digest[32]; uint8_t scope; uint8_t schedule_digest[32]; uint32_t scale_bits, slot; };
+struct g6sch_identity { bool enabled; uint8_t profile_digest[32]; uint8_t scope; uint8_t schedule_digest[32]; uint32_t scale_bits, slot;
+                        bool images; uint8_t image_digest[32]; };
 struct g6sch_request { uint64_t id; uint32_t prompt_tokens, max_tokens; g6sch_identity steering; uint32_t r_rows; };
 struct g6sch_run { uint32_t first_page, pages, table_version; uint64_t list_hash; };
 struct g6sch_slot {
@@ -126,7 +127,7 @@ struct g6sch_completion { g6sch_key key; uint32_t emitted; bool finished; uint32
 // the Rust side's constants, which the C++ wrapper checks once (scheduler.h check_abi) with the layout digest below
 enum {
     G6SCH_ABI_PAGE, G6SCH_ABI_PREFILL_DEFER_MAX, G6SCH_ABI_NOTICE_MIN, G6SCH_ABI_NOTICE_MAX, G6SCH_ABI_NOTICE_ROWS,
-    G6SCH_ABI_MAX_DECODE_ROUNDS, G6SCH_ABI_PACK_MAX_MEMBERS, G6SCH_ABI_QMAX,
+    G6SCH_ABI_MAX_DECODE_ROUNDS, G6SCH_ABI_PACK_MAX_MEMBERS, G6SCH_ABI_QMAX, G6SCH_ABI_PARSE_FN,
 };
 uint64_t g6sch_abi(uint32_t what);
 
@@ -221,8 +222,15 @@ struct g6sch_parsed;
 // must not throw.
 typedef const char* (*g6sch_resolve_fn)(void* ctx, bool has_profile, const uint8_t* profile, size_t profile_n,
                                         uint32_t scale_bits, g6sch_identity* out);
-const char* g6sch_parse_request(const uint8_t* bytes, size_t n, bool grammar_ready, g6sch_resolve_fn resolve, void* ctx,
-                                g6sch_parsed_req* out, g6sch_parsed** handle);
+// the caller's `img` field (DS41, ds41_image.h): null when kept, or its refusal (valid until the caller's next call).
+// Called once per field, in order. It must not throw. resolve and image share ctx.
+typedef const char* (*g6sch_image_fn)(void* ctx, const uint8_t* field, size_t field_n);
+// The version of g6sch_parse_request's parameters and callback types, which no compiler checks across the C ABI:
+// scheduler.h check_abi requires g6sch_abi(G6SCH_ABI_PARSE_FN) == G6SCH_PARSE_FN. Change any of them -> bump it here and
+// PARSE_FN in src/ffi.rs. 2: the image callback.
+#define G6SCH_PARSE_FN 2
+const char* g6sch_parse_request(const uint8_t* bytes, size_t n, bool grammar_ready, g6sch_resolve_fn resolve,
+                                g6sch_image_fn image, void* ctx, g6sch_parsed_req* out, g6sch_parsed** handle);
 void g6sch_parsed_free(g6sch_parsed* handle);
 // one `gram` field; *handle owns the schema bytes (g6sch_parsed_free)
 const char* g6sch_parse_grammar(const uint8_t* s, size_t n, uint32_t* kind, bool* strict, int32_t* arm, const uint8_t** schema,
@@ -446,7 +454,7 @@ constexpr uint64_t g6sch_layout_cpp() {
     G6SCH_TYPE(g6kv_tier_totals) G6SCH_FIELD(g6kv_tier_totals, slots) G6SCH_FIELD(g6kv_tier_totals, free_slots) G6SCH_FIELD(g6kv_tier_totals, entries) G6SCH_FIELD(g6kv_tier_totals, shared) G6SCH_FIELD(g6kv_tier_totals, spilled_pages) G6SCH_FIELD(g6kv_tier_totals, moved_in_pages) G6SCH_FIELD(g6kv_tier_totals, restored_pages) G6SCH_FIELD(g6kv_tier_totals, hits) G6SCH_FIELD(g6kv_tier_totals, dropped) G6SCH_FIELD(g6kv_tier_totals, dropped_pages) G6SCH_FIELD(g6kv_tier_totals, moved_out) G6SCH_FIELD(g6kv_tier_totals, moved_out_pages) G6SCH_FIELD(g6kv_tier_totals, refused) G6SCH_FIELD(g6kv_tier_totals, refused_pages) G6SCH_FIELD(g6kv_tier_totals, full) G6SCH_FIELD(g6kv_tier_totals, block_bytes) G6SCH_FIELD(g6kv_tier_totals, credit) G6SCH_FIELD(g6kv_tier_totals, oversize) G6SCH_FIELD(g6kv_tier_totals, oversize_last)
     G6SCH_TYPE(g6sch_resize) G6SCH_FIELD(g6sch_resize, tier) G6SCH_FIELD(g6sch_resize, segs) G6SCH_FIELD(g6sch_resize, slots) G6SCH_FIELD(g6sch_resize, txn)
     G6SCH_TYPE(g6sch_key) G6SCH_FIELD(g6sch_key, epoch) G6SCH_FIELD(g6sch_key, slot) G6SCH_FIELD(g6sch_key, generation)
-    G6SCH_TYPE(g6sch_identity) G6SCH_FIELD(g6sch_identity, enabled) G6SCH_FIELD(g6sch_identity, profile_digest) G6SCH_FIELD(g6sch_identity, scope) G6SCH_FIELD(g6sch_identity, schedule_digest) G6SCH_FIELD(g6sch_identity, scale_bits) G6SCH_FIELD(g6sch_identity, slot)
+    G6SCH_TYPE(g6sch_identity) G6SCH_FIELD(g6sch_identity, enabled) G6SCH_FIELD(g6sch_identity, profile_digest) G6SCH_FIELD(g6sch_identity, scope) G6SCH_FIELD(g6sch_identity, schedule_digest) G6SCH_FIELD(g6sch_identity, scale_bits) G6SCH_FIELD(g6sch_identity, slot) G6SCH_FIELD(g6sch_identity, images) G6SCH_FIELD(g6sch_identity, image_digest)
     G6SCH_TYPE(g6sch_request) G6SCH_FIELD(g6sch_request, id) G6SCH_FIELD(g6sch_request, prompt_tokens) G6SCH_FIELD(g6sch_request, max_tokens) G6SCH_FIELD(g6sch_request, steering) G6SCH_FIELD(g6sch_request, r_rows)
     G6SCH_TYPE(g6sch_run) G6SCH_FIELD(g6sch_run, first_page) G6SCH_FIELD(g6sch_run, pages) G6SCH_FIELD(g6sch_run, table_version) G6SCH_FIELD(g6sch_run, list_hash)
     G6SCH_TYPE(g6sch_slot) G6SCH_FIELD(g6sch_slot, key) G6SCH_FIELD(g6sch_slot, req) G6SCH_FIELD(g6sch_slot, run) G6SCH_FIELD(g6sch_slot, phase) G6SCH_FIELD(g6sch_slot, prefilled) G6SCH_FIELD(g6sch_slot, emitted) G6SCH_FIELD(g6sch_slot, inserted) G6SCH_FIELD(g6sch_slot, deferred) G6SCH_FIELD(g6sch_slot, packable) G6SCH_FIELD(g6sch_slot, pack_tail) G6SCH_FIELD(g6sch_slot, parked)

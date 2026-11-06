@@ -736,6 +736,7 @@ mod tests {
                 grammar: None,
                 steering_profile: None,
                 steering_scale: None,
+                images: Default::default(),
             },
             stop: vec![],
             include_stop: false,

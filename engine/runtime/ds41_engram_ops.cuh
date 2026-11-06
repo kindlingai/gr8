@@ -71,11 +71,26 @@ inline int ds41_engram_reduce(void* model, int e, int rows, void* stream, __nv_b
 // The step's Engram prologue, after k_step_in and before the embed: the token window, then the hash + NVMe prefetch of both layers.
 // M <= MX: the decode kernel (put, then get, in one block). M > MX (a W-row prefill chunk): get kernel, then put kernel (Engram::window_wide).
 // slot: the S2 slot of a W-row chunk (one session; its ring); the decode kernel reads each row's slot from Model::sess when ds_slots > 1.
+// DS41 image input (official engram.py: an image token is DEAD in every n-gram): on a launch with image rows (Model::vis_n > 0, the
+// row flags already copied by Ds41Vision::stage) the window reads the chunk's tokens with -1 at the image rows, so an n-gram that
+// reaches one is padded from there on (hash_row), and the ring keeps the -1 for the steps after. Text-only launches read m.tok.
+__global__ void k_engram_dead_tok(const int* tok, const unsigned char* flag, int rows, int* out)
+{
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < rows) out[r] = flag[r] ? -1 : tok[r];
+}
+inline const int* ds41_engram_tok(Model& m, int M, cudaStream_t st)
+{
+    if (m.vis_n <= 0) return m.tok;
+    k_engram_dead_tok<<<(M + 255) / 256, 256, 0, st>>>(m.tok, m.vis_flag, M, m.vis_etok);
+    return m.vis_etok;
+}
 inline void ds41_engram_begin(Model& m, int M, cudaStream_t st, int slot = 0)
 {
     if (slot < 0 || slot >= m.ds_slots) die("DS41 Engram: slot " + std::to_string(slot) + " outside the S2 slots");
-    if (M <= MX) k_engram_win<<<1, MX, 0, st>>>(m.tok, m.pos, M, m.ehist, m.win, m.ds_slots > 1 ? m.sess : nullptr);
-    else if (const int x = m.engram->window_wide(m.tok, m.pos, M, m.ehist + (size_t)slot * ENG_RING, m.win, st)) die("DS41 Engram window_wide: code " + std::to_string(x));
+    const int* tok = ds41_engram_tok(m, M, st);
+    if (M <= MX) k_engram_win<<<1, MX, 0, st>>>(tok, m.pos, M, m.ehist, m.win, m.ds_slots > 1 ? m.sess : nullptr);
+    else if (const int x = m.engram->window_wide(tok, m.pos, M, m.ehist + (size_t)slot * ENG_RING, m.win, st)) die("DS41 Engram window_wide: code " + std::to_string(x));
     G6RT_CK(cudaGetLastError());
     if (const int x = m.engram->begin_step(M, m.win, st)) die("DS41 Engram begin_step: code " + std::to_string(x));
 }
@@ -84,9 +99,10 @@ inline void ds41_engram_begin(Model& m, int M, cudaStream_t st, int slot = 0)
 inline void ds41_engram_begin_pack(Model& m, const ds41::pack::Layout& p, cudaStream_t st)
 {
     if (const char* e = ds41::pack::error(p, m.hc_rows, m.ds_slots)) die(std::string("DS41 Engram pack: ") + e);
+    const int* tok = ds41_engram_tok(m, p.rows, st);
     for (int i = 0; i < p.count; ++i) {
         const auto& s = p.seg[i];
-        const int rc = m.engram->window_wide(m.tok + s.row0, m.pos + s.row0, s.rows,
+        const int rc = m.engram->window_wide(tok + s.row0, m.pos + s.row0, s.rows,
                                            m.ehist + size_t(s.slot) * ENG_RING, m.win + size_t(s.row0) * 4, st);
         if (rc) die("DS41 Engram ragged window_wide: code " + std::to_string(rc));
     }
@@ -99,6 +115,7 @@ inline int ds41_op_engram(void* model, int i, int rows, void* stream)
 {
     Model& m = *(Model*)model;
     if (!m.engram) return ds41::NOTSUP;
+    m.engram->set_dead(m.vis_n > 0 ? m.vis_flag : nullptr);   // image rows: gate 0 (captured graphs see vis_n = 0)
     return m.engram->op(model, m.layers[i].l == geom::ENGRAM_L0 ? 0 : 1, rows, m.resid4, (cudaStream_t)stream);
 }
 

@@ -37,6 +37,9 @@ pub struct Identity {
     pub schedule_digest: [u8; 32],
     pub scale_bits: u32,
     pub slot: u32,
+    /// DS41 image prompts: the prefix-cache identity of the prompt's images (steering.h)
+    pub images: bool,
+    pub image_digest: [u8; 32],
 }
 
 #[repr(C)]
@@ -499,6 +502,12 @@ pub fn digest_head(c: &Config, st: &State) -> u64 {
 
 fn hash_identity(h: &mut u64, s: &Identity) {
     fnv_byte(h, u8::from(s.enabled));
+    if s.images {
+        fnv_byte(h, 2);
+        for &v in &s.image_digest {
+            fnv_byte(h, v);
+        }
+    }
     if !s.enabled {
         return;
     }

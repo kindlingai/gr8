@@ -62,6 +62,9 @@ struct PoolHooks {
 struct NativeHooks {
     PoolHooks pool;
     std::function<void(const Grant&)> bind; // native main AND draft binding, no pool mutation
+    // optional, before bind on every rank: the bound request itself (DS41: its image rows, for the Engram ring of the
+    // slot's snapshots and parks, s2/ds41_engram_ring.h)
+    std::function<void(unsigned slot, const g6rt::ServeReq&)> bind_request;
     // with pool.grow: slot's run grew; its new pages go into the main and draft tables before the round
     std::function<void(unsigned slot, const Run&)> grown;
     std::function<void(const Slot&)> retire; // native per-slot graph/view cleanup only
@@ -167,7 +170,7 @@ class Service {
     void intake(const Command& command) {
         auto bytes = ingress_.request(command);
         auto request = parse_request(bytes, c_.scheduler.steering);
-        if (!grammar_ok(command.request, request)) return;
+        if (!grammar_ok(command.request, request) || !images_ok(command.request, request)) return;
         const auto queued = Sessions::request(command.request, request);
         if (trace_)
             trace_.instant("arrive", Trace::CONTROL, targ("request", queued.id) + "," +
@@ -417,6 +420,21 @@ class Service {
             return false;
         }
     }
+    // An image request the engine cannot run (ds41_image.h img::refusal) ends with an error before it is queued, as a
+    // grammar that does not compile does. The front end refuses the same cases first.
+    bool images_ok(uint64_t id, const g6rt::ServeReq& r) {
+        if (r.images.empty()) return true;
+#if G6_MODEL_DS41
+        const bool decode_prompt = ds41_decode_prompt(c_.prefill_min, r.prompt.size(), r.plp, r.steering.enabled);
+#else
+        const bool decode_prompt = true;
+#endif
+        const char* why = g6rt::img::refusal(r.prompt, r.images, decode_prompt);
+        if (!*why) return true;
+        fprintf(stderr, "# s2: request %llu: images refused: %s\n", (unsigned long long)id, why);
+        atomic_file(c_.directory + "/resp." + std::to_string(id), "end error -1 0\n");
+        return false;
+    }
     void controller() {
         uint64_t status_revision = UINT64_MAX;
         auto next_share = std::chrono::steady_clock::now();
@@ -592,6 +610,7 @@ public:
                 require(mine == g.run, "worker page list differs from the head's grant");
             }
             dispatch_.begin(g.key.slot, int(g.reuse), g6rt::steering::cache_namespace(g.req.steering));
+            if (native_.bind_request) native_.bind_request(g.key.slot, *staged_);
             native_.bind(g); sessions_.bind(g,*staged_);
         };
         h.retire = [&](const Slot& old) {

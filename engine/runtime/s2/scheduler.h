@@ -30,8 +30,8 @@ constexpr unsigned PACK_MAX_MEMBERS = unsigned(g6mod::INFO.pack_members);
 // carries it (bootstrap.h), so ranks built with different commit frames refuse at bootstrap, not at the first event.
 // 6 adds Commit::hold. 7 adds the Resize event (Commit::resize). 9 adds Ack::room (8 is the fail-soft store's, #159).
 // 10 adds the steering profile slot. 11 adds Request::r_rows. 12 adds Commit::shrink. 13 adds 32 session slots and the
-// DS41 prefill packs.
-constexpr unsigned CONTROL_VERSION = 13;
+// DS41 prefill packs. 14 adds the image digest to a request's identity (DS41 image input).
+constexpr unsigned CONTROL_VERSION = 14;
 constexpr uint32_t MAX_DECODE_ROUNDS = 64;   // Config::decode_rounds bound
 // Prefill choice (Scheduler::next): of the sessions with prompt rows left, the one with the fewest runs next, so a short
 // request admitted behind a long prefill is served instead of waiting out every quantum of it (#61). Shortest-first
@@ -193,7 +193,8 @@ struct Completion { Key key; uint32_t emitted = 0; bool finished = false; uint32
 G6S2_SAME(Key, g6sch_key) G6S2_AT(Key, g6sch_key, slot) G6S2_AT(Key, g6sch_key, generation)
 G6S2_SAME(g6rt::steering::Identity, g6sch_identity) G6S2_AT(g6rt::steering::Identity, g6sch_identity, scope)
 G6S2_AT(g6rt::steering::Identity, g6sch_identity, schedule_digest) G6S2_AT(g6rt::steering::Identity, g6sch_identity, scale_bits)
-G6S2_AT(g6rt::steering::Identity, g6sch_identity, slot)
+G6S2_AT(g6rt::steering::Identity, g6sch_identity, slot) G6S2_AT(g6rt::steering::Identity, g6sch_identity, images)
+G6S2_AT(g6rt::steering::Identity, g6sch_identity, image_digest)
 G6S2_SAME(Request, g6sch_request) G6S2_AT(Request, g6sch_request, steering) G6S2_AT(Request, g6sch_request, r_rows)
 G6S2_SAME(Run, g6sch_run) G6S2_AT(Run, g6sch_run, table_version) G6S2_AT(Run, g6sch_run, list_hash)
 G6S2_SAME(Phase, uint32_t)
@@ -238,7 +239,7 @@ inline void check_abi() {
             {G6SCH_ABI_PREFILL_DEFER_MAX, PREFILL_DEFER_MAX}, {G6SCH_ABI_NOTICE_MIN, NOTICE_MIN},
             {G6SCH_ABI_NOTICE_MAX, NOTICE_MAX}, {G6SCH_ABI_NOTICE_ROWS, NOTICE_ROWS},
             {G6SCH_ABI_MAX_DECODE_ROUNDS, MAX_DECODE_ROUNDS}, {G6SCH_ABI_PACK_MAX_MEMBERS, PACK_MAX_MEMBERS},
-            {G6SCH_ABI_QMAX, G6SCH_QMAX}};
+            {G6SCH_ABI_QMAX, G6SCH_QMAX}, {G6SCH_ABI_PARSE_FN, G6SCH_PARSE_FN}};
         for (const auto& [what, v] : want) if (g6sch_abi(what) != v) return false;
         return true;
     }();
