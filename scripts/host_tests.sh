@@ -224,6 +224,15 @@ g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/run
 # ranks of different control builds refuse at bootstrap (CONTROL_VERSION in the agreement and the frame magic)
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/control_version_test.cpp" -o "$T/control_version_test" "${KNOBS[@]}"
 "$T/control_version_test"
+# the control links in Rust (engine/scheduler-rs src/control) against the C++ they replaced: every frame, decode,
+# refusal, gate step and agreement diff in each model's shape, and the bytes on the links of a TP3 boot through a
+# recording relay (the workers' readers log the head's close at the end)
+for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O2 -Wall -Wextra -pthread $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/control_vectors_test.cpp" -o "$T/control_vectors_test" "${KNOBS[@]}"
+  "$T/control_vectors_test"
+done
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/control_wire_test.cpp" -o "$T/control_wire_test" "${KNOBS[@]}"
+"$T/control_wire_test" 2> >(grep -v '^g6ctl: control recv failed: ret=0 ' >&2)
 # DS41 ranks that disagree on an agree-scope knob refuse at bootstrap (knob::signature() in the DS41 runtime signature):
 # GR8_DS_COMP_FP4 [1,1,0,1] refuses, [1,1,1,1] and [0,0,0,0] boot
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/ds41_agree_knobs_test.cpp" -o "$T/ds41_agree_knobs_test" "${KNOBS[@]}"

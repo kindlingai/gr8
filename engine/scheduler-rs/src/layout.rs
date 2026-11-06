@@ -200,6 +200,21 @@ impl Kind for crate::driver::CPlanner {
 impl Kind for crate::driver::CPool {
     const K: u64 = 6;
 }
+impl Kind for crate::control::wire::Notice {
+    const K: u64 = 6;
+}
+impl Kind for crate::control::wire::Ack {
+    const K: u64 = 6;
+}
+impl Kind for crate::control::wire::Commit {
+    const K: u64 = 6;
+}
+impl Kind for crate::control::ffi::Frame {
+    const K: u64 = 6;
+}
+impl Kind for crate::control::ffi::CBoot {
+    const K: u64 = 6;
+}
 // g6sched.h counts void as 1 byte, as Rust's c_void
 impl Kind for std::ffi::c_void {
     const K: u64 = 6;
@@ -295,7 +310,19 @@ pub fn digest() -> u64 {
     );
     layout!(h, crate::kv_share::Resize { tier, segs, slots, txn });
     layout!(h, crate::scheduler::Key { epoch, slot, generation });
-    layout!(h, crate::scheduler::Identity { enabled, profile_digest, scope, schedule_digest, scale_bits, slot, images, image_digest });
+    layout!(
+        h,
+        crate::scheduler::Identity {
+            enabled,
+            profile_digest,
+            scope,
+            schedule_digest,
+            scale_bits,
+            slot,
+            images,
+            image_digest
+        }
+    );
     layout!(h, crate::scheduler::Request { id, prompt_tokens, max_tokens, steering, r_rows });
     layout!(h, crate::scheduler::Run { first_page, pages, table_version, list_hash });
     layout!(
@@ -613,6 +640,25 @@ pub fn digest() -> u64 {
             finished,
             active,
             inserted
+        }
+    );
+    layout!(h, crate::control::wire::Notice { epoch, event, boundary, request, payload_hash, kind });
+    layout!(h, crate::control::wire::Ack { notice, rank, state_hash, room });
+    layout!(h, crate::control::wire::Commit { c, hold, has_resize, resize });
+    layout!(h, crate::control::ffi::Frame { tag, notice, ack, commit, epoch, request, seq, rank, bytes, n });
+    layout!(
+        h,
+        crate::control::ffi::CBoot {
+            rank,
+            ranks,
+            timeout,
+            port,
+            head_ip,
+            head_ip_n,
+            directory,
+            directory_n,
+            agreement,
+            agreement_n
         }
     );
     h

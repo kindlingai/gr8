@@ -1,5 +1,7 @@
 // Persistent host-control sockets for the opt-in S2 server. No CUDA/fabric I/O.
 // Call AFTER local model load. A failed handshake never publishes ready.s2.
+// The bootstrap's sockets and exchanges are Rust (engine/scheduler-rs src/control/bootstrap.rs); the settings, their
+// agreement string and the S2 files stay here.
 #pragma once
 #include "control_io.h"
 #include "ingress.h"
@@ -11,79 +13,6 @@
 #include <fcntl.h>
 
 namespace g6s2 {
-class Socket {
-    int fd_ = -1;
-public:
-    explicit Socket(int fd = -1) : fd_(fd) {}
-    ~Socket() { if (fd_ >= 0) ::close(fd_); }
-    Socket(const Socket&) = delete;
-    Socket& operator=(const Socket&) = delete;
-    int get() const { return fd_; }
-    int release() { int fd = fd_; fd_ = -1; return fd; }
-};
-using Deadline = std::chrono::steady_clock::time_point;
-inline Deadline deadline(unsigned seconds) {
-    require(seconds && seconds <= 86400, "invalid control timeout");
-    return std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
-}
-inline int remaining_ms(Deadline end) {
-    auto n = std::chrono::duration_cast<std::chrono::milliseconds>(end - std::chrono::steady_clock::now()).count();
-    require(n > 0, "control bootstrap timed out");
-    return int(std::min<int64_t>(n, INT32_MAX));
-}
-inline void socket_wait(int fd, short events, Deadline end) {
-    for (;;) {
-        pollfd p{fd, events, 0};
-        int n = ::poll(&p, 1, remaining_ms(end));
-        if (n < 0 && errno == EINTR) continue;
-        require(n > 0 && !(p.revents & POLLNVAL), "control socket wait failed");
-        return; // caller's accept / SO_ERROR / recv distinguishes hangup and readiness
-    }
-}
-inline sockaddr_in address(const std::string& ip, uint16_t port) {
-    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(port);
-    require(port && inet_pton(AF_INET, ip.c_str(), &a.sin_addr) == 1, "control requires IPv4 and nonzero port");
-    return a;
-}
-inline int listen_control(const std::string& ip, uint16_t port) {
-    Socket fd(cloexec_socket(AF_INET, SOCK_STREAM, true));
-    require(fd.get() >= 0, "control socket failed");
-    int one = 1;
-    require(!setsockopt(fd.get(), SOL_SOCKET, SO_REUSEADDR, &one, sizeof one), "control reuseaddr failed");
-    const auto a = address(ip, port);
-    require(!posix_bind(fd.get(), reinterpret_cast<const sockaddr*>(&a), sizeof a) && !::listen(fd.get(), 8), "control listen failed");
-    return fd.release();
-}
-inline std::unique_ptr<ControlIO> accept_control(int listener, unsigned timeout) {
-    auto end = deadline(timeout);
-    for (;;) {
-        socket_wait(listener, POLLIN, end);
-        Socket fd(cloexec_accept(listener));
-        if (fd.get() < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-        require(fd.get() >= 0, "control accept failed");
-        auto io = std::make_unique<ControlIO>(fd.release()); io->timeout_seconds(timeout); io->keepalive(10, 5, 4); io->nodelay(); return io; // dead peer seen in <= 30 s
-    }
-}
-inline std::unique_ptr<ControlIO> connect_control(const std::string& ip, uint16_t port, unsigned timeout) {
-    const auto a = address(ip, port); const auto end = deadline(timeout);
-    for (;;) {
-        Socket fd(cloexec_socket(AF_INET, SOCK_STREAM, true));
-        require(fd.get() >= 0, "control socket failed");
-        int rc = ::connect(fd.get(), reinterpret_cast<const sockaddr*>(&a), sizeof a), error = 0;
-        if (rc && errno == EINPROGRESS) {
-            socket_wait(fd.get(), POLLOUT, end); socklen_t n = sizeof error;
-            require(!getsockopt(fd.get(), SOL_SOCKET, SO_ERROR, &error, &n), "control connect status failed");
-        } else if (rc) error = errno;
-        if (!error) {
-            require(!fcntl(fd.get(), F_SETFL, 0), "control blocking mode failed");
-            auto io = std::make_unique<ControlIO>(fd.release()); io->timeout_seconds(timeout); io->keepalive(10, 5, 4); io->nodelay(); return io; // dead peer seen in <= 30 s
-        }
-        require(error == ECONNREFUSED || error == EINTR, "control connect failed");
-        // Worker may finish loading before rank0. Bootstrap only, never decode.
-        std::this_thread::sleep_for(std::chrono::milliseconds(std::min(20, remaining_ms(end))));
-    }
-}
-inline std::vector<uint8_t> frame(const std::string& s) { return {s.begin(), s.end()}; }
 struct BootstrapConfig {
     Config scheduler;
     unsigned rank = 0, ranks = 6, timeout = 120;
@@ -94,7 +23,7 @@ struct BootstrapConfig {
     void validate() const {
         scheduler.validate();
         require(ranks >= 1 && ranks <= 6 && rank < ranks, "invalid control rank count");   // 1: one box, no workers to link
-        (void)address(head_ip, port); (void)deadline(timeout);
+        ctl::check(g6ctl_boot_check(reinterpret_cast<const uint8_t*>(head_ip.c_str()), std::strlen(head_ip.c_str()), port, timeout));
         require(!directory.empty() && !runtime_signature.empty(), "missing bootstrap directory/runtime signature");
     }
     std::string agreement() const {
@@ -116,17 +45,9 @@ struct BootstrapConfig {
 // The first word where a worker's agreement differs from the head's, for the refusal: "rank 2 has 'G6_X=1', the head
 // has 'G6_X=2'". Empty when they are equal.
 inline std::string agreement_difference(unsigned rank, const std::string& head, const std::string& worker) {
-    auto words = [](const std::string& s) {
-        std::vector<std::string> v; size_t a = 0;
-        while (a < s.size()) { const size_t e = std::min(s.find_first_of(" \n", a), s.size()); if (e > a) v.push_back(s.substr(a, e - a)); a = e + 1; }
-        return v;
-    };
-    const auto h = words(head), w = words(worker);
-    for (size_t i = 0; i < std::max(h.size(), w.size()); ++i)
-        if (i >= h.size() || i >= w.size() || h[i] != w[i])
-            return "rank " + std::to_string(rank) + " has '" + (i < w.size() ? w[i] : "") + "', the head has '" +
-                (i < h.size() ? h[i] : "") + "'";
-    return "";
+    std::string out;
+    g6ctl_agreement_difference(rank, ctl::bytes(head), head.size(), ctl::bytes(worker), worker.size(), ctl::grow_string, &out);
+    return out;
 }
 inline void atomic_file(const std::string& path, const std::string& bytes) {
     const auto temp = path + ".tmp";
@@ -139,44 +60,34 @@ struct ControlLinks {
     std::vector<ControlIO*> peers() const {
         std::vector<ControlIO*> p; for (const auto& x : links) p.push_back(x.get()); return p;
     }
+    std::vector<const g6ctl_io*> handles() const {
+        std::vector<const g6ctl_io*> p; for (const auto& x : links) p.push_back(x ? x->handle() : nullptr); return p;
+    }
     void shutdown() { for (auto& p : links) if (p) p->shutdown(); }
 };
+namespace ctl {
+inline g6ctl_boot boot(const BootstrapConfig& c, const std::string& agreement) {
+    g6ctl_boot b{};
+    b.rank = c.rank; b.ranks = c.ranks; b.timeout = c.timeout; b.port = c.port;
+    b.head_ip = bytes(c.head_ip); b.head_ip_n = std::strlen(c.head_ip.c_str());
+    b.directory = bytes(c.directory); b.directory_n = std::strlen(c.directory.c_str());
+    b.agreement = bytes(agreement); b.agreement_n = agreement.size();
+    return b;
+}
+} // namespace ctl
+// The directory must be fresh (no ready, ready.s2, abort.s2, quit, cmd.0 or req.0). The head returns with every rank's
+// identity and agreement acknowledged. Its caller starts the control/compute service before publishing readiness.
 inline ControlLinks bootstrap(const BootstrapConfig& c) {
-    c.validate();
-    // Fresh per-rank directory is part of the protocol. Check before any socket.
-    for (const char* f : {"ready", "ready.s2", "abort.s2", "quit", "cmd.0", "req.0"})
-        require(!exists(c.directory + "/" + f), "S2 directory is not fresh");
+    c.validate(); sch::check_abi(); ctl::check_sys();
     const auto agree = c.agreement();
-    const auto release = frame("G6S2 START\n" + agree);
-    const auto ack = frame("G6S2 STARTED\n" + agree);
-    ControlLinks out;
-    try {
-        if (!c.rank) {
-            Socket listener(listen_control(c.head_ip, c.port));
-            out.links.resize(c.ranks - 1);
-            for (unsigned n = 1; n < c.ranks; ++n) {
-                auto io = accept_control(listener.get(), c.timeout); const auto b = io->receive();
-                std::string hello(b.begin(), b.end()); const auto eol = hello.find('\n');
-                require(eol != std::string::npos && hello.substr(0, 5) == "G6S2 ", "bad bootstrap hello");
-                unsigned rank = 0; const auto nr = number(hello.substr(5, eol - 5));
-                require(nr > 0 && nr < c.ranks, "bad bootstrap worker rank"); rank = unsigned(nr);
-                require(!out.links[rank - 1], "duplicate rank");
-                const std::string diff = agreement_difference(rank, agree, hello.substr(eol + 1));
-                require(diff.empty(), ("bootstrap config mismatch: " + diff).c_str());
-                out.links[rank - 1] = std::move(io);
-            }
-            for (auto& io : out.links) io->send(release);
-            for (auto& io : out.links) require(io->receive() == ack, "worker bootstrap ACK mismatch");
-            // Return with all rank identities/configs acknowledged. Caller starts
-            // its control/compute service before publishing capability below.
-        } else {
-            auto io = connect_control(c.head_ip, c.port, c.timeout);
-            io->send(frame("G6S2 " + std::to_string(c.rank) + "\n" + agree));
-            require(io->receive() == release, "head bootstrap config mismatch");
-            io->send(ack); out.links.push_back(std::move(io));
-        }
-        return out;
-    } catch (...) { out.shutdown(); throw; }
+    const auto b = ctl::boot(c, agree);
+    std::vector<g6ctl_io*> out(std::max(1u, c.ranks - 1), nullptr);
+    size_t n = 0;
+    const int32_t rc = g6ctl_bootstrap(&b, out.data(), &n);
+    ControlLinks links;
+    for (size_t i = 0; i < n; ++i) links.links.push_back(std::make_unique<ControlIO>(ControlIO::Adopt{}, out[i]));
+    ctl::check(rc);
+    return links;
 }
 // After bootstrap, every rank sends its lines (one stored entry each). The head keeps the lines every rank has, in its own
 // order, and sends them back. Every rank then starts from the same stored entries (pool.h keep_agreed). idle: wait for
@@ -187,38 +98,9 @@ inline ControlLinks bootstrap(const BootstrapConfig& c) {
 // head. If the head works longer than the timeout first (Flash entry verification), the worker fails with "control send
 // failed". Widen the timeout then.
 inline std::string agree_lines(const BootstrapConfig& c, ControlLinks& links, const std::string& mine, bool idle = false) {
-    auto lines = [](const std::string& s) {
-        std::vector<std::string> v;
-        for (size_t a = 0; a < s.size();) {
-            size_t e = s.find('\n', a);
-            if (e == std::string::npos) e = s.size();
-            if (e > a) v.push_back(s.substr(a, e - a));
-            a = e + 1;
-        }
-        return v;
-    };
-    const std::string ask = "G6S2 STORED\n", agreed = "G6S2 AGREED\n";
-    if (c.rank) {
-        require(links.links.size() == 1 && links.links[0], "store agreement without head link");
-        links.links[0]->send(frame(ask + mine));
-        const auto b = links.links[0]->receive(idle);
-        const std::string r(b.begin(), b.end());
-        require(r.rfind(agreed, 0) == 0, "store agreement: unexpected frame");
-        return r.substr(agreed.size());
-    }
-    std::vector<std::string> keep = lines(mine);
-    for (auto& io : links.links) {
-        require(bool(io), "store agreement with missing rank");
-        const auto b = io->receive(idle);
-        const std::string r(b.begin(), b.end());
-        require(r.rfind(ask, 0) == 0, "store agreement: unexpected frame");
-        const auto theirs = lines(r.substr(ask.size()));
-        keep.erase(std::remove_if(keep.begin(), keep.end(), [&](const std::string& l) {
-            return std::find(theirs.begin(), theirs.end(), l) == theirs.end(); }), keep.end());
-    }
+    const auto h = links.handles();
     std::string out;
-    for (const auto& l : keep) out += l + "\n";
-    for (auto& io : links.links) io->send(frame(agreed + out));
+    ctl::check(g6ctl_agree_lines(c.rank, h.data(), h.size(), ctl::bytes(mine), mine.size(), idle, ctl::grow_string, &out));
     return out;
 }
 // All-rank barrier after the boot graph capture (native.cuh capture_all, which runs after bootstrap): every worker reports
@@ -226,14 +108,10 @@ inline std::string agree_lines(const BootstrapConfig& c, ControlLinks& links, co
 // idle (no receive timeout, as the event reader): the capture time of the ranks may differ by more than the bootstrap
 // timeout, and a rank that dies mid-capture closes its link (recv 0) or fails the TCP keepalive.
 inline void capture_barrier(const BootstrapConfig& c, ControlLinks& links) {
-    const auto done = frame("G6S2 CAPTURED\n" + c.agreement());
-    if (c.rank) {
-        require(links.links.size() == 1 && links.links[0], "capture barrier without head link");
-        links.links[0]->send(done);
-    } else {
-        require(links.links.size() == c.ranks - 1, "capture barrier before all-rank bootstrap");
-        for (auto& io : links.links) { require(bool(io), "capture barrier with missing rank"); require(io->receive(true) == done, "worker capture barrier mismatch"); }
-    }
+    const auto agree = c.agreement();
+    const auto b = ctl::boot(c, agree);
+    const auto h = links.handles();
+    ctl::check(g6ctl_capture_barrier(&b, h.data(), h.size()));
 }
 inline void publish_ready(const BootstrapConfig& c, const ControlLinks& links) {
     require(c.rank == 0 && links.links.size() == c.ranks - 1, "ready before all-rank bootstrap");
