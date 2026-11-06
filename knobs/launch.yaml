@@ -168,6 +168,19 @@ options:
       the head's front end: thinking_budget for a chat request that names none, or names 0 or null (TensorFold's rule).
       The front end closes the think block at the reply's Nth token. 0 = no limit. A request with logprobs gets no
       default budget
+  DEFAULT_PRESENCE_PENALTY:
+    scope: box
+    default: "0"
+    doc: >-
+      the head's front end: presence_penalty for a request that names none, -2 to 2 (OpenAI's). The engine lowers the
+      logit of every token the reply already holds by it, before temperature and top_p; the prompt does not count.
+      Qwen recommends 1.5 for thinking models that fall into repetition loops. 0 = off
+  DEFAULT_FREQUENCY_PENALTY:
+    scope: box
+    default: "0"
+    doc: >-
+      the head's front end: frequency_penalty for a request that names none, -2 to 2 (OpenAI's): the logit drops by it
+      times the number of times the reply already holds the token. 0 = off
   ALLOW_THINKING_OFF:
     scope: box
     default: "0"

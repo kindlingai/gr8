@@ -202,6 +202,19 @@ class UnitTests(unittest.TestCase):
                     {'prompt': [1], 'max_tokens': 4, 'temperature': float('nan')}):
             self.assertIsNotNone(g6s2shim.build_request(bad, 0)[1], bad)
 
+    def test_build_request_penalties(self):
+        body, err = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'presence_penalty': 1.5, 'frequency_penalty': -0.5}, 0)
+        self.assertIsNone(err)
+        self.assertIn(b' top_p 1.0 pen 1.5 -0.5\n', body)
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'frequency_penalty': 2, 'logprobs': 1}, 0)
+        self.assertIn(b' top_p 1.0 pen 0.0 2.0 lp 1\n', body)
+        # both zero, null or absent: no field
+        for kw in ({}, {'presence_penalty': 0, 'frequency_penalty': 0.0}, {'presence_penalty': None}):
+            self.assertNotIn(b' pen ', g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, **kw}, 0)[0], kw)
+        for kw in ({'presence_penalty': 2.5}, {'frequency_penalty': -2.01}, {'presence_penalty': 'x'},
+                   {'presence_penalty': float('nan')}):
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, **kw}, 0)[1], kw)
+
     def test_build_request_insert(self):
         rule = {'after_tokens': 7, 'unless_emitted': 154842, 'tokens': [198, 154842, 271]}
         body, err = g6s2shim.build_request({'prompt': [1], 'max_tokens': 9, 'prompt_logprobs': 1, 'insert': [rule]}, 0)

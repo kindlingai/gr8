@@ -285,6 +285,8 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
     h.retire = [&](const Slot&) { fence(); };
     h.fence = fence;
     h.dispatch.bucket = [&](bool, int ctx) { return bucket_of(c.main, ctx); };
+    // penalties (penalty.h): Dispatch writes these tables before every main step and rank.cuh k_penalty reads them
+    h.dispatch.pen_rows = c.main.pen_rows_host; h.dispatch.pen_sess = c.main.pen_sess_host;
     h.dispatch.mode = [&](int, int next) { fence(); require(slots > 1 || next == -1 || next == 0, "DS41 non-solo mode"); };
     h.dispatch.launch = [&](const Launch& l) {
         require(slots > 1 || (l.solo == 0 && l.step.sess.size() == 1), "DS41 launch is not solo");

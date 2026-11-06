@@ -3,6 +3,7 @@
 #pragma once
 #include "sessions.h"
 #include "../prefix_reuse.h"
+#include "../penalty.h"
 #include <functional>
 
 namespace g6s2 {
@@ -50,6 +51,9 @@ struct DispatchHooks {
     std::function<void(const Slot&, const Payload&, uint32_t, uint32_t, uint64_t)> prefill_seq;
     // DS41 prefill pack: one main fabric sequence for a bounded ordered pack (append: native hooks use positional initialization).
     std::function<void(const std::vector<PrefillPart>&, uint64_t)> prefill_pack_seq;
+    // optional, penalties (penalty.h, Dispatch::set_penalty): the host side of the row table (max_rows entries) and the
+    // session table (MAX_SESSIONS entries) the main head reads
+    g6rt::PenRow* pen_rows = nullptr; g6rt::PenSess* pen_sess = nullptr;
 };
 // The row of the step's j-th session that samples its next reply token: the one whose input is the last committed token,
 // at position `last` (the prompt's length + the tokens emitted - 1). -1 when the step holds none (a prompt step before
@@ -71,10 +75,14 @@ class Dispatch {
     std::array<g6rt::PrefixReuse, MAX_SESSIONS> rows_;   // prefix reuse: each session's written rows (main, draft, prefill)
     bool track_ = false;
     int* gm_on_ = nullptr; uint32_t* gm_bits_ = nullptr; int gm_words_ = 0;   // the grammar masks (set_grammar)
+    g6rt::PenRow* pen_rows_ = nullptr; g6rt::PenSess* pen_sess_ = nullptr;    // the penalty tables (set_penalty)
+    std::array<int, MAX_SESSIONS> pen_synced_{};                              // per slot: Session::out tokens the device counts hold
+    std::array<bool, MAX_SESSIONS> pen_reset_{};                              // per slot: the counts are an earlier request's
 public:
     Dispatch(const Sessions& sessions, uint32_t rows, DispatchHooks h) : sessions_(sessions), hooks_(std::move(h)), max_rows_(rows) {
         require(rows && bool(hooks_.bucket) && bool(hooks_.mode) && bool(hooks_.launch) && (bool(hooks_.prefill) || bool(hooks_.prefill_seq)), "incomplete dispatch hooks");
         if (hooks_.gm_on) set_grammar(hooks_.gm_on, hooks_.gm_bits, hooks_.gm_words);
+        if (hooks_.pen_rows) set_penalty(hooks_.pen_rows, hooks_.pen_sess);
     }
     // Call at every safe boundary after local EOS/commit, not inside a Step.
     // Resident means Prefill OR Decode; a 1-session prompt step within S>=2 is
@@ -89,10 +97,16 @@ public:
     // Grammars (grammar.h): before every step, on[r] = 1 where row r's sample follows its session's grammar, with the
     // row's mask at bits + r * words; the head reads both (rank.cuh launch_head_local). Draft steps are not masked.
     void set_grammar(int* on, uint32_t* bits, int words) { gm_on_ = on; gm_bits_ = bits; gm_words_ = words; }
+    // Penalties (penalty.h). Before every main step, rows[r] names row r's session and sampling row (or slot -1), and
+    // sess[q] the tokens session q committed since the device counts were updated. The head reads both (rank.cuh
+    // k_penalty, k_penalty_commit). A draft step has every row at slot -1. The counts live on the device, one slice
+    // per slot. pen_synced_ tracks how many tokens they hold and pen_reset_ marks a slot with a new session.
+    void set_penalty(g6rt::PenRow* rows, g6rt::PenSess* sess) { require(rows && sess, "penalty tables"); pen_rows_ = rows; pen_sess_ = sess; }
     // a new session on `slot`; skip: rows its run already holds (Grant::reuse)
     void begin(unsigned slot, int skip, const g6rt::CacheNamespace& ns = {}) {
         require(slot < MAX_SESSIONS, "invalid dispatch slot");
         rows_[slot].resume(skip, ns);
+        pen_synced_[slot] = 0; pen_reset_[slot] = true;
     }
     const g6rt::PrefixReuse& rows(unsigned slot) const { require(slot < MAX_SESSIONS, "invalid dispatch slot"); return rows_[slot]; }
     void release(unsigned slot) {
@@ -135,6 +149,7 @@ public:
         require(next_row == sp.M(), "unmapped native rows");
         l.graph_key = launch_key(sp.key(), l.bucket);
         if (gm_on_) grammar_masks(sp, draft);
+        if (pen_rows_) penalty_rows(sp, draft);
         auto& seq = draft ? draft_sequence_ : main_sequence_;
         require(seq != UINT64_MAX, "fabric sequence exhausted"); l.sequence = ++seq;
         auto ids = hooks_.launch(l); require(ids.size() == sp.r.size(), "native output row mismatch");
@@ -162,6 +177,30 @@ public:
             std::vector<int> drafts;
             for (int r = i0 + 1; r < sp.row0[j] + sp.rows[j]; ++r) drafts.push_back(sp.r[r].tok);
             g6rt::grammar_masks(*s.grammar, drafts.data(), int(drafts.size()), gm_on_ + i0, gm_bits_ + size_t(i0) * gm_words_);
+        }
+    }
+    // the tokens of session `slot` the device counts do not hold yet (Session::out past pen_synced_)
+    int penalty_new(const Session& s, unsigned slot) const {
+        require(int(s.out.size()) == s.emitter.emitted && int(s.out.size()) >= pen_synced_[slot], "penalty output count");
+        return int(s.out.size()) - pen_synced_[slot];
+    }
+    // the tables of a step. After the step the device counts hold every token its sessions had emitted before it: the
+    // launch hook returns with the step done, and a session emits only between steps
+    void penalty_rows(const s2::Step& sp, bool draft) {
+        for (int r = 0; r < sp.M(); ++r) pen_rows_[r] = {-1, 0, 0, 0.f, 0.f};
+        if (draft) return;
+        for (size_t j = 0; j < sp.sess.size(); ++j) {
+            const unsigned q = unsigned(sp.sess[j]); const auto& s = sessions_.at(q);
+            if (!s.sampling.penalty()) continue;
+            const int nnew = penalty_new(s, q);
+            require(nnew <= g6rt::PEN_NEW_MAX, "too many tokens since the session's last penalty update");
+            int first = grammar_row0(sp, j, int(s.payload.prompt.size()) + s.emitter.emitted - 1);
+            if (first < 0) first = sp.M();   // a prompt step: no row samples a reply token
+            auto& ps = pen_sess_[q]; ps.reset = pen_reset_[q]; ps.nnew = nnew;
+            std::copy(s.out.end() - nnew, s.out.end(), ps.news);
+            for (int r = sp.row0[j]; r < sp.row0[j] + sp.rows[j]; ++r)
+                pen_rows_[r] = {int(q), first, r == sp.row0[j], s.sampling.presence, s.sampling.frequency};
+            pen_synced_[q] = int(s.out.size()); pen_reset_[q] = false;
         }
     }
     bool dfl_ok(unsigned slot) const { return hooks_.dfl_ok && hooks_.dfl_ok(int(slot)); }

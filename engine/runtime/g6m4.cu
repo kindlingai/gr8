@@ -1659,6 +1659,25 @@ int main(int argc, char** argv)
         m.gm_on = on;
         m.gm_bits = bits;
     }
+    if (s2mode)                         // before any capture: the main head's penalties (penalty.h, rank.cuh k_penalty)
+    {
+        if (m.vn <= 0) die("penalty tables before the vocab slice");
+        G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&m.pen_rows_host), sizeof(PenRow) * MX, cudaHostAllocMapped));
+        G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&m.pen_sess_host), sizeof(PenSess) * S2N, cudaHostAllocMapped));
+        for (int r = 0; r < MX; ++r) m.pen_rows_host[r] = PenRow{-1, 0, 0, 0.f, 0.f};
+        memset(m.pen_sess_host, 0, sizeof(PenSess) * S2N);
+        PenRow* rows;
+        PenSess* sess;
+        G6RT_CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&rows), m.pen_rows_host, 0));
+        G6RT_CK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&sess), m.pen_sess_host, 0));
+        m.pen_rows = rows;
+        m.pen_sess = sess;
+        m.pen_counts = dmalloc<int>((size_t)S2N * m.vn);
+        G6RT_CK(cudaMemset(m.pen_counts, 0, sizeof(int) * (size_t)S2N * m.vn));
+        // the head writes penalty.s2 next to ready.s2, so the shim offers the pen field
+        if (R == 0)
+            if (FILE* f = fopen((s2dir + "/penalty.s2").c_str(), "w")) { fputs("presence frequency\n", f); fclose(f); }
+    }
     m.rs = plan.rs;                     // the target's verify steps only; the MTP layer's head stays as it is
     if (!pf_qo && !pf_qp)               // QO attention builds the decode RoPE table; without it absorb would take FP64 sincos
         if (int e = g6_attn_rope_init(cap, st)) die("g6_attn_rope_init failed (" + std::to_string(e) + ")");

@@ -265,6 +265,8 @@ pub fn digest() -> u64 {
             min_tokens,
             temp,
             top_p,
+            presence,
+            frequency,
             seed,
             lp,
             plp,

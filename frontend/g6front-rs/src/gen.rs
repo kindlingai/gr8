@@ -727,6 +727,8 @@ mod tests {
                 top_p: 1.0,
                 top_k: 0,
                 min_p: 0.0,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
                 seed: None,
                 stop_ids: vec![EOS as i64],
                 logprobs: None,

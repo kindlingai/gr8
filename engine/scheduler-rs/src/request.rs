@@ -1,6 +1,6 @@
 //! The S2 request file's parser (was parse_request and its helpers in engine/runtime/s2/sessions.h). A request is a
 //! header line, `n_gen <n> temp <f> seed <n> min <n> stop <ids|->` and then, in this order and each optional,
-//! `top_p <f>`, `lp <k>`, `plp <k>`, `sys <n>`, `ins <rule>`, `gram <grammar>` and `steer <profile> <hex>`, then any
+//! `top_p <f>`, `pen <presence> <frequency>`, `lp <k>`, `plp <k>`, `sys <n>`, `ins <rule>`, `gram <grammar>` and `steer <profile> <hex>`, then any
 //! number of `img <field>` (DS41 images, ds41_image.h), then a line of comma-separated prompt ids. The header is read the way libstdc++'s istringstream read it, so every request
 //! the C++ took, and every refusal it gave, is the same here: a number ends at the first character it cannot take, and
 //! the rest of that word is the next word.
@@ -264,6 +264,9 @@ pub struct Request {
     pub min_tokens: i32,
     pub temp: f32,
     pub top_p: f32,
+    /// presence / frequency penalties (engine/runtime/penalty.h), each in [-2, 2]; 0 = off
+    pub presence: f32,
+    pub frequency: f32,
     pub seed: u32,
     pub lp: i32,
     pub plp: i32,
@@ -312,6 +315,8 @@ pub fn parse(
         min_tokens: 0,
         temp,
         top_p: 0.0,
+        presence: 0.0,
+        frequency: 0.0,
         seed: 1234,
         lp: -1,
         plp: -1,
@@ -337,6 +342,15 @@ pub fn parse(
     if k == b"top_p" {
         r.top_p = inp.float().ok_or(Msg("invalid top_p header"))?;
         next!();
+    }
+    if k == b"pen" {
+        r.presence = inp.float().ok_or(Msg("invalid pen header"))?;
+        r.frequency = inp.float().ok_or(Msg("invalid pen header"))?;
+        next!();
+        require(
+            (-2.0..=2.0).contains(&r.presence) && (-2.0..=2.0).contains(&r.frequency),
+            "pen: presence and frequency penalties must be in [-2, 2]",
+        )?;
     }
     if k == b"lp" {
         r.lp = inp
@@ -385,7 +399,7 @@ pub fn parse(
         image(v)?;
         next!();
     }
-    require(k.is_empty(), "invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram and steer)")?;
+    require(k.is_empty(), "invalid request header tail (S2 accepts top_p, pen, lp, plp, sys, ins, gram and steer)")?;
     require(r.ins.after < 0 || r.lp < 0, "ins with lp")?;
     r.steering = resolve(&sf)?;
     let g = number(gen)?;
@@ -472,8 +486,28 @@ mod tests {
         );
         assert_eq!(
             parse(b"n_gen 9 temp 0 seed 7 min 1 stop - lp 2x\n1\n", false, &mut off, &mut no_img).err(),
-            Some(Msg("invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram and steer)"))
+            Some(Msg("invalid request header tail (S2 accepts top_p, pen, lp, plp, sys, ins, gram and steer)"))
         );
+    }
+
+    #[test]
+    fn penalties() {
+        let r = parse(b"n_gen 9 temp 0 seed 7 min 1 stop - top_p 0.9 pen 1.5 -0.25 lp 2\n1\n", false, &mut off, &mut no_img).unwrap();
+        assert_eq!((r.top_p, r.presence, r.frequency, r.lp), (0.9, 1.5, -0.25, 2));
+        // without top_p, and absent: off
+        assert_eq!(parse(b"n_gen 9 temp 0 seed 7 min 1 stop - pen 2 2\n1\n", false, &mut off, &mut no_img).unwrap().frequency, 2.0);
+        let r = parse(b"n_gen 9 temp 0 seed 7 min 1 stop - lp 2\n1\n", false, &mut off, &mut no_img).unwrap();
+        assert_eq!((r.presence, r.frequency), (0.0, 0.0));
+        for (bad, why) in [
+            (&b"n_gen 9 temp 0 seed 7 min 1 stop - pen 1.5\n1\n"[..], "invalid pen header"),
+            (b"n_gen 9 temp 0 seed 7 min 1 stop - pen 1.5 x\n1\n", "invalid pen header"),
+            (b"n_gen 9 temp 0 seed 7 min 1 stop - pen 2.5 0\n1\n", "pen: presence and frequency penalties must be in [-2, 2]"),
+            (b"n_gen 9 temp 0 seed 7 min 1 stop - pen 0 -2.5\n1\n", "pen: presence and frequency penalties must be in [-2, 2]"),
+            // after lp: the tail
+            (b"n_gen 9 temp 0 seed 7 min 1 stop - lp 2 pen 1 1\n1\n", "invalid request header tail (S2 accepts top_p, pen, lp, plp, sys, ins, gram and steer)"),
+        ] {
+            assert_eq!(parse(bad, false, &mut off, &mut no_img).err(), Some(Msg(why)), "{}", String::from_utf8_lossy(bad));
+        }
     }
 
     #[test]
@@ -499,7 +533,7 @@ mod tests {
         let mut any = |_: &[u8]| -> R<()> { Ok(()) };
         assert_eq!(
             parse(b"n_gen 9 temp 0 seed 7 min 1 stop - img a top_p 0.5\n1\n", false, &mut off, &mut any).err(),
-            Some(Msg("invalid request header tail (S2 accepts top_p, lp, plp, sys, ins, gram and steer)"))
+            Some(Msg("invalid request header tail (S2 accepts top_p, pen, lp, plp, sys, ins, gram and steer)"))
         );
     }
 

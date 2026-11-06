@@ -2,8 +2,10 @@
 // (g6m4 --serve, s2/sessions.h) parses the same request format itself and writes the same response lines through
 // Emitter, plus its own `a` line (frontend/g6s2shim.py describes the S2 files).
 //   DIR/req.<n>  (written atomically: req.<n>.tmp then rename), two lines:
-//       n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,..|-> [top_p <float>] [lp <k>] [plp <k>]
-//       (lp: logprobs of the generated tokens with their top k, 0..20; plp: the same for the prompt tokens; absent = off.
+//       n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,..|-> [top_p <float>]
+//       [pen <presence> <frequency>] [lp <k>] [plp <k>]
+//       (pen: presence / frequency penalties, each in [-2, 2] (penalty.h); S2 applies them, m4sim reads and ignores them.
+//        lp: logprobs of the generated tokens with their top k, 0..20; plp: the same for the prompt tokens; absent = off.
 //        A request with plp is run as decode steps from its first token, no prefill path: the shim limits its length.)
 //       <prompt ids, comma-separated>
 //   DIR/quit     ends the loop
@@ -42,6 +44,7 @@ struct ServeReq
     std::vector<int> prompt, stop;
     int n_gen = 0, min_tokens = 0;
     float temp = 0.f, top_p = 0.f;
+    float presence = 0.f, frequency = 0.f;   // penalties (penalty.h); 0 = off
     uint32_t seed = 1234u;
     int lp = -1, plp = -1;        // logprobs / prompt_logprobs: k (0..LP_MAX) or -1 = off
     int64_t sys = -1;             // the system span: the prompt's first tokens that are system message and tools (-1 = unknown)
@@ -122,6 +125,11 @@ inline void serve_parse(const std::string& text, int vocab, ServeReq& r)
     {
         long k;
         if (w[i] == "top_p") { if (!real(w[i + 1], &r.top_p)) r.top_p = 0.f; }
+        else if (w[i] == "pen" && i + 2 < w.size())
+        {
+            if (!real(w[i + 1], &r.presence) || !real(w[i + 2], &r.frequency)) r.presence = r.frequency = 0.f;
+            ++i;
+        }
         // the shim never sends k > LP_MAX; clamping is a backstop
         else if (w[i] == "lp") r.lp = num(w[i + 1], 0, 1 << 30, &k) ? (int)std::min<long>(k, LP_MAX) : -1;
         else if (w[i] == "plp") r.plp = num(w[i + 1], 0, 1 << 30, &k) ? (int)std::min<long>(k, LP_MAX) : -1;

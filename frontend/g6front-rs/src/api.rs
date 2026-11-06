@@ -319,6 +319,15 @@ async fn read_json_raw(req: Request<Incoming>) -> Result<(Map<String, Value>, By
     }
 }
 
+/// A nonzero penalty needs an engine whose hello says `"penalties": true` (PROTOCOL.md).
+fn check_penalties(st: &State, g: &crate::wire::GenParams) -> Result<(), ApiError> {
+    if (g.presence_penalty != 0.0 || g.frequency_penalty != 0.0) && !st.engine.penalties() {
+        let k = if g.presence_penalty != 0.0 { "presence_penalty" } else { "frequency_penalty" };
+        return Err(ApiError::bad(format!("{k} is not supported by this engine"), Some(k)));
+    }
+    Ok(())
+}
+
 impl State {
     /// The jinja chat template, which only the glm dialect has.
     fn tpl(&self) -> &crate::template::ChatTemplate {
@@ -519,6 +528,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     if choice.is_forced() && !st.engine.inserts() {
         return Err(ApiError::bad("the engine does not support a forced tool_choice", Some("tool_choice")));
     }
+    check_penalties(st, &params.gen)?;
     // The template leaves `<think>` open at the end of a chat prompt, so the reply's first token sits in the reasoning
     // span: the forced opener has to follow the close, or the call it opens is reasoning and the parser reads prose.
     let close = match (st.tok.think_start, st.tok.think_end) {
@@ -573,12 +583,11 @@ async fn with_images(
     let b64: Vec<String> =
         images.iter().map(|b| vision::block_b64(b).map(str::to_string)).collect::<Result<_, _>>().map_err(image_err)?;
     vision::check_budget(&b64).map_err(image_err)?;
-    let prepared = tokio::task::spawn_blocking(move || {
-        b64.iter().map(|s| vision::prepare_b64(s)).collect::<Result<Vec<_>, _>>()
-    })
-    .await
-    .map_err(|e| ApiError::new(500, &e.to_string(), None))?
-    .map_err(image_err)?;
+    let prepared =
+        tokio::task::spawn_blocking(move || b64.iter().map(|s| vision::prepare_b64(s)).collect::<Result<Vec<_>, _>>())
+            .await
+            .map_err(|e| ApiError::new(500, &e.to_string(), None))?
+            .map_err(image_err)?;
     let n_spans: Vec<usize> = prepared.iter().map(|p| p.plan.n_span()).collect();
     let (ids, pos) = vision::expand(prompt, &n_spans).map_err(image_err)?;
     let spans = prepared
@@ -1188,6 +1197,7 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
             false,
         )?;
         (params.gen.steering_profile, params.gen.steering_scale) = sampling::steering(&body, st.steering().as_ref())?;
+        check_penalties(st, &params.gen)?;
         Ok((prompt, params))
     };
     let (prompt, params) = match prep.await {

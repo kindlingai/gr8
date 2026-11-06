@@ -193,6 +193,9 @@ pub struct GenParams {
     pub top_p: f64,
     pub top_k: i64,
     pub min_p: f64,
+    /// OpenAI's penalties, in [-2, 2]; both 0: the fields are not sent (an engine without them keeps its frame bytes)
+    pub presence_penalty: f64,
+    pub frequency_penalty: f64,
     pub seed: Option<i64>,
     pub stop_ids: Vec<i64>,
     pub logprobs: Option<i64>,
@@ -263,6 +266,12 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
     pyjson::int(b, p.top_k);
     b.extend_from_slice(b",\"min_p\":");
     pyjson::float(b, p.min_p);
+    if p.presence_penalty != 0.0 || p.frequency_penalty != 0.0 {
+        b.extend_from_slice(b",\"presence_penalty\":");
+        pyjson::float(b, p.presence_penalty);
+        b.extend_from_slice(b",\"frequency_penalty\":");
+        pyjson::float(b, p.frequency_penalty);
+    }
     b.extend_from_slice(b",\"seed\":");
     opt_int(b, p.seed);
     b.extend_from_slice(b",\"stop_ids\":[");
@@ -368,6 +377,8 @@ mod tests {
             top_p: 1.0,
             top_k: 0,
             min_p: 0.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             seed: None,
             stop_ids: vec![1, 2],
             logprobs: Some(3),
@@ -396,6 +407,10 @@ mod tests {
         assert!(!String::from_utf8_lossy(&generate("x", &[1], &p)[4..]).contains("insert"));
         assert!(!v.as_object().unwrap().contains_key("steering_profile"));
         assert!(!v.as_object().unwrap().contains_key("steering_scale"));
+        assert!(!v.as_object().unwrap().contains_key("presence_penalty"));
+        let pen = GenParams { presence_penalty: 1.5, ..p.clone() };
+        let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &pen)[4..]).unwrap();
+        assert_eq!((v["presence_penalty"].as_f64(), v["frequency_penalty"].as_f64()), (Some(1.5), Some(0.0)));
         let selected =
             GenParams { steering_profile: Some("example".into()), steering_scale: Some(1.1f32 as f64), ..p.clone() };
         let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &selected)[4..]).unwrap();

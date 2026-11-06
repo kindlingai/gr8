@@ -11,6 +11,7 @@ how this launcher waits or checks.
 """
 import hashlib
 import ipaddress
+import math
 import os
 import re
 import socket
@@ -317,6 +318,13 @@ def validate(o):
         raise OptionError(f'--allow-thinking-off {o.get("ALLOW_THINKING_OFF")}: want 0 or 1')
     if o.get('UNDECLARED_TOOL_CALLS') not in ('text', 'emit'):
         raise OptionError(f'--undeclared-tool-calls {o.get("UNDECLARED_TOOL_CALLS")}: want text or emit')
+    for k in ('DEFAULT_PRESENCE_PENALTY', 'DEFAULT_FREQUENCY_PENALTY'):
+        try:
+            v = float(o.get(k))
+        except (TypeError, ValueError):
+            v = math.nan
+        if not -2 <= v <= 2:
+            raise OptionError(f'--{k.lower().replace("_", "-")} {o.get(k)}: want a number from -2 to 2 (0 = off)')
     if not str(o.get('DEFAULT_THINKING_BUDGET')).isdigit():
         raise OptionError(f'--default-thinking-budget {o.get("DEFAULT_THINKING_BUDGET")}: want a whole number '
                           '(0 = no limit)')

@@ -12,8 +12,9 @@
 
 namespace g6s2 {
 // The request file's parser is engine/scheduler-rs/src/request.rs. A request is the header line
-// `n_gen <n> temp <f> seed <n> min <n> stop <ids|->`, then optionally and in this order `top_p <f>`, `lp <k>`,
-// `plp <k>`, `sys <n>`, `ins <rule>`, `gram <grammar>` and `steer <profile> <canonical-fp32-hex>`, then any number of
+// `n_gen <n> temp <f> seed <n> min <n> stop <ids|->`, then optionally and in this order `top_p <f>`,
+// `pen <presence> <frequency>` (penalty.h), `lp <k>`, `plp <k>`, `sys <n>`, `ins <rule>`, `gram <grammar>` and
+// `steer <profile> <canonical-fp32-hex>`, then any number of
 // `img <field>` (DS41 images, ds41_image.h: parsed here through parse::image, checked after the prompt), then the
 // prompt ids.
 namespace parse {
@@ -82,6 +83,7 @@ inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steeri
     g6rt::ServeReq r;
     r.prompt = parse::ints(p.prompt); r.stop = parse::ints(p.stop);
     r.n_gen = p.n_gen; r.min_tokens = p.min_tokens; r.temp = p.temp; r.top_p = p.top_p; r.seed = p.seed;
+    r.presence = p.presence; r.frequency = p.frequency;
     r.lp = p.lp; r.plp = p.plp; r.sys = p.sys;
     std::memcpy(static_cast<void*>(&r.steering), &p.steering, sizeof r.steering);
     r.ins.after = p.ins_after; r.ins.unless = p.ins_unless; r.ins.tokens = parse::ints(p.ins_tokens);
@@ -95,11 +97,16 @@ inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steeri
     }
     return r;
 }
-struct Sampling { float inv_temp = 0, top_p = 0; uint32_t seed = 1234; int lp = -1, plp = -1; };   // lp, plp: g6rt::ServeReq
+struct Sampling {
+    float inv_temp = 0, top_p = 0; uint32_t seed = 1234; int lp = -1, plp = -1;   // lp, plp: g6rt::ServeReq
+    float presence = 0, frequency = 0;                                            // penalties (penalty.h); 0 = off
+    bool penalty() const { return presence != 0.f || frequency != 0.f; }
+};
 struct Session {
     Key key; uint64_t request = 0;
     Run run; Payload payload; Sampling sampling; g6rt::Emitter emitter;
     g6rt::GrammarRef grammar;         // the reply's grammar (Payload::gram), on every rank; null = none
+    std::vector<int> out;             // the tokens emitted so far, kept only with a penalty (Dispatch::penalty_rows counts them)
     bool bound = false, ended = false;
 };
 class Sessions {
@@ -146,7 +153,7 @@ public:
                 req.steering == config_.steering.selected(req.steering.scale_bits, req.steering.slot)),
                 "session steering is not a loaded profile");
         s = Session{}; s.key = g.key; s.request = g.req.id; s.run = g.run;
-        s.payload = payload(r); s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed, r.lp, r.plp};
+        s.payload = payload(r); s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed, r.lp, r.plp, r.presence, r.frequency};
         // the head compiled this grammar before queueing the request (Service::controller), so a failure here means
         // the ranks disagree, and the epoch ends
         if (r.gram.on()) s.grammar = g6rt::GrammarRef(g6rt::grammar_open(r.gram).release(), g6rt::GrammarDeleter{});
@@ -193,6 +200,8 @@ public:
         const int before = s.emitter.emitted;
         if (s.grammar) g6rt::grammar_commit(*s.grammar, ids, count);
         const bool done = s.emitter.push(ids, count, lps.empty() ? nullptr : lps.data()); output_ok(s.emitter);
+        // the penalty's output: the tokens counted (a stop id ends the count)
+        if (s.sampling.penalty()) s.out.insert(s.out.end(), ids, ids + (s.emitter.emitted - before));
         return {uint32_t(s.emitter.emitted - before), done};
     }
     void terminal(Key k, const s2::Stats& stats, const char* reason = nullptr) {

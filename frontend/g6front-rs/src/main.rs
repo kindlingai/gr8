@@ -87,6 +87,9 @@ struct Args {
     allow_thinking_off: bool,
     emit_undeclared: bool,
     supervisor: Option<String>,
+    /// presence_penalty / frequency_penalty for a request that names none (0 = off)
+    default_presence: f64,
+    default_frequency: f64,
 }
 
 const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--host H] [--port N]
@@ -97,6 +100,7 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--share-tokens N] [--max-connections N]
                   [--default-reasoning-effort minimal|low|medium|high|xhigh|max (ds41: or an integer 1-100)]
                   [--default-thinking-budget N] [--allow-thinking-off]
+                  [--default-presence-penalty F] [--default-frequency-penalty F]
                   [--undeclared-tool-calls text|emit] [--supervisor HOST:PORT]";
 
 fn parse_args() -> Result<Args, String> {
@@ -121,6 +125,8 @@ fn parse_args() -> Result<Args, String> {
         allow_thinking_off: false,
         emit_undeclared: false,
         supervisor: None,
+        default_presence: 0.0,
+        default_frequency: 0.0,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -169,6 +175,17 @@ fn parse_args() -> Result<Args, String> {
                     next(&mut i, &flag, inline)?.parse().map_err(|_| "--default-thinking-budget: not a number")?
             }
             "--allow-thinking-off" => a.allow_thinking_off = true,
+            "--default-presence-penalty" | "--default-frequency-penalty" => {
+                let v: f64 = next(&mut i, &flag, inline)?.parse().map_err(|_| format!("{flag}: not a number"))?;
+                if !v.is_finite() || !(-2.0..=2.0).contains(&v) {
+                    return Err(format!("{flag}: want a number in [-2, 2]"));
+                }
+                if flag == "--default-presence-penalty" {
+                    a.default_presence = v
+                } else {
+                    a.default_frequency = v
+                }
+            }
             "--undeclared-tool-calls" => {
                 a.emit_undeclared = match next(&mut i, &flag, inline)?.as_str() {
                     "text" => false,
@@ -305,6 +322,13 @@ async fn serve(args: Args) -> Result<(), String> {
             (None, d, effort)
         }
     };
+    // the server's penalty defaults: a request that names none samples with them (sampling.rs build)
+    for (key, v) in [("presence_penalty", args.default_presence), ("frequency_penalty", args.default_frequency)] {
+        if v != 0.0 {
+            tok.gen_defaults.insert(key.into(), serde_json::Value::from(v));
+            log::info!("default {key} {v}");
+        }
+    }
     let served = args.served.unwrap_or_else(|| match dialect {
         dialect::Dialect::Glm => vec!["glm-5.3".into(), "glm53".into()],
         dialect::Dialect::Ds41 => vec!["deepseek-v4.1-flash".into()],

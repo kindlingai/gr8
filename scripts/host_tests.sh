@@ -58,6 +58,10 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/knobs-rs" "$REPO/engine/knobs-
 "$T/knobs_header_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/grammar_request_test.cpp" -o "$T/grammar_request_test" "${KNOBS[@]}"
 "$T/grammar_request_test"
+# presence / frequency penalties (engine/runtime/penalty.h): the head kernel's row logic against a plain count, and the
+# tables s2/dispatch.h writes before a main step (the sampling row, the new tokens, a slot's reset)
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/penalty_test.cpp" -o "$T/penalty_test" "${KNOBS[@]}"
+"$T/penalty_test"
 # DS41 image requests: the img header fields, the prompt checks, the image digest in the cache namespace and the control protocol
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/image_request_test.cpp" -o "$T/image_request_test" "${KNOBS[@]}"
 "$T/image_request_test"

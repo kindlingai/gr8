@@ -31,7 +31,7 @@ Every message in both directions is one frame:
 The front end refuses to serve if `version` != 1. `max_model_len` bounds prompt + max_tokens. `max_logprobs` is
 the largest k the engine accepts for `logprobs` and `prompt_logprobs`. `"insert": true` (absent = false) says the
 engine applies `generate`'s `insert` rule. `"grammar": true` (absent = false) says it masks a reply with `generate`'s
-`grammar`. `"vision": true` (absent = false) says it takes `generate`'s `images` (DeepSeek-V4.1 with its vision tower).
+`grammar`. `"vision": true` (absent = false) says it takes `generate`'s `images` (DeepSeek-V4.1 with its vision tower). `"penalties": true` (absent = false) says it applies `generate`'s `presence_penalty` and `frequency_penalty`.
 
 An optional `steering` object advertises a loaded profile: `profile` (name), `digest` (64 lowercase hex
 manifest SHA-256), `scope` (`shared` or `full`), `layers` (positive active-layer count), `forced` (boolean),
@@ -62,6 +62,7 @@ See [request transport](docs/STEERING-TRANSPORT.md).
 | `top_p` | nucleus mass, 1.0 = off |
 | `top_k` | 0 = off (the front end maps OpenAI/vLLM `-1` to 0) |
 | `min_p` | 0.0 = off; keep tokens with p >= min_p * p_max |
+| `presence_penalty`, `frequency_penalty` | optional, each in [-2, 2], 0 = off. Sent when one is nonzero, and only to an engine whose hello says `"penalties": true`. OpenAI's penalties with vLLM's semantics: before a position samples, the logit of every id the reply has generated so far drops by `presence_penalty` plus `frequency_penalty` times the number of times it was generated, before temperature and top-p. The prompt does not count, so a reply the front end continues after a `thinking_budget` close (below) counts from that continuation. Logprobs see the penalized distribution. Exact under speculative decoding: a row that checks a draft counts the drafts before it. The shim passes them on as `pen <presence> <frequency>` after `top_p` |
 | `seed` | integer or null. With a seed the sampled sequence is a pure function of (seed, logits) |
 | `stop_ids` | generation stops after emitting any of these ids. The front end always sends the full list (EOS ids from `generation_config.json` + request `stop_token_ids`), empty if `ignore_eos` |
 | `logprobs` | null = none. k >= 0: for every generated token return its logprob and rank plus the top-k (k = 0 means the sampled token only) |

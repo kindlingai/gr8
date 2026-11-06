@@ -73,6 +73,10 @@ impl Engine {
     pub fn inserts(&self) -> bool {
         self.hello().is_some_and(|h| h.get("insert") == Some(&Value::Bool(true)))
     }
+    /// The engine applies `generate`'s presence / frequency penalties (its hello says `"penalties": true`).
+    pub fn penalties(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("penalties") == Some(&Value::Bool(true)))
+    }
 
     pub fn start(self: &Arc<Self>) {
         let me = self.clone();

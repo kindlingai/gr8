@@ -298,13 +298,12 @@ pub fn build(
         .copied()
         .filter(|i| seen.insert(*i))
         .collect();
-    for k in ["frequency_penalty", "presence_penalty"] {
-        if let Some(v) = body.get(k).filter(|v| !v.is_null()) {
-            if !pyjson::eq_int(v, 0) {
-                return Err(ApiError::bad(format!("{k} is not supported by the gr8 engine yet"), Some(k)));
-            }
-        }
-    }
+    // OpenAI's penalties (PROTOCOL.md): request value, else the server default (--default-presence-penalty, in
+    // gen_defaults), else off. The engine counts the tokens it generated, vLLM's way
+    let presence_penalty = float_num(body, "presence_penalty", -2.0, 2.0)?
+        .unwrap_or_else(|| default_num(gen_defaults, "presence_penalty", 0.0));
+    let frequency_penalty = float_num(body, "frequency_penalty", -2.0, 2.0)?
+        .unwrap_or_else(|| default_num(gen_defaults, "frequency_penalty", 0.0));
     if let Some(v) = body.get("repetition_penalty").filter(|v| !v.is_null()) {
         if !pyjson::eq_int(v, 1) {
             return Err(ApiError::bad(
@@ -353,6 +352,8 @@ pub fn build(
             // Python passes any size through; a top_k beyond i64 means "off" to every engine, as 0 does
             top_k: if top_k == -1 { 0 } else { i64::try_from(top_k).unwrap_or(0) },
             min_p,
+            presence_penalty,
+            frequency_penalty,
             seed,
             stop_ids,
             logprobs: lp.map(|v| v as i64),
@@ -418,6 +419,32 @@ mod tests {
         assert_eq!(max_tokens("{}", 393000, 393202, Some(16384)), 202); // less room than the default
         assert_eq!(max_tokens(r#"{"max_tokens": 200000}"#, 100, 393202, Some(16384)), 200000);
         // named: kept
+    }
+
+    fn penalties(body: &str, defaults: &str) -> Result<(f64, f64), ApiError> {
+        let m: Map<String, Value> = serde_json::from_str(body).unwrap();
+        let d: Map<String, Value> = serde_json::from_str(defaults).unwrap();
+        let p = build(&m, body.as_bytes(), 10, 4096, &[], VOCAB, &d, Some(16), 20, true)?;
+        Ok((p.gen.presence_penalty, p.gen.frequency_penalty))
+    }
+
+    #[test]
+    fn penalties_are_the_request_s_else_the_server_default_else_off() {
+        assert_eq!(penalties("{}", "{}").unwrap(), (0.0, 0.0));
+        assert_eq!(penalties(r#"{"presence_penalty": 1.5, "frequency_penalty": -0.5}"#, "{}").unwrap(), (1.5, -0.5));
+        assert_eq!(penalties(r#"{"presence_penalty": 2, "frequency_penalty": null}"#, "{}").unwrap(), (2.0, 0.0));
+        assert_eq!(penalties("{}", r#"{"presence_penalty": 1.5}"#).unwrap(), (1.5, 0.0));
+        assert_eq!(penalties(r#"{"presence_penalty": 0}"#, r#"{"presence_penalty": 1.5}"#).unwrap(), (0.0, 0.0));
+        for (body, param) in [
+            (r#"{"presence_penalty": 2.5}"#, "presence_penalty"),
+            (r#"{"frequency_penalty": -2.5}"#, "frequency_penalty"),
+            (r#"{"presence_penalty": "1"}"#, "presence_penalty"),
+            (r#"{"repetition_penalty": 1.1}"#, "repetition_penalty"),
+        ] {
+            let e = penalties(body, "{}").err().expect(body);
+            assert_eq!((e.status, e.param.as_deref()), (400, Some(param)), "{body}");
+        }
+        assert!(penalties(r#"{"repetition_penalty": 1}"#, "{}").is_ok());
     }
 
     #[test]

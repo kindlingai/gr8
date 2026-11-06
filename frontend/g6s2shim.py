@@ -11,7 +11,9 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
                                        Version 5 has several profiles: <scope> <n>, then n x <profile> <digest> <layers>.
   engine rank 0 -> DIR/status.s2       JSON (resident, queued, free_pages, ...), rewritten on queue/lifecycle changes
   shim -> DIR/req.<id>                 written as req.<id>.tmp, then renamed. Two lines:
-        n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float> [lp <k>] [plp <k>]
+        n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float>
+        [pen <presence> <frequency>] [lp <k>] [plp <k>]     (pen: the generate frame's penalties, each in [-2, 2]; only
+                                                             when one is nonzero and the head wrote DIR/penalty.s2)
         [sys <system_tokens>] [ins <after>:<unless or -1>:<id,id,...>]      (version 3: the generate frame's insert rule, never with lp)
         [img <pos>:<vit_h>:<vit_w>:<key>:<rgb base64>] ...    (one per image, last; only when the head wrote DIR/vision.s2)
         <prompt id,id,...>
@@ -306,6 +308,16 @@ def build_request(f: dict, ordinal: int, steering: dict | None = None):
         return None, 'bad temperature'
     if not (math.isfinite(top_p) and 0 < top_p <= 1):
         return None, 'top_p must be in (0, 1]'
+    pen = ''
+    try:
+        presence = float(f.get('presence_penalty') or 0.0)
+        frequency = float(f.get('frequency_penalty') or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return None, 'bad presence_penalty/frequency_penalty'
+    if not (math.isfinite(presence) and -2 <= presence <= 2 and math.isfinite(frequency) and -2 <= frequency <= 2):
+        return None, 'presence_penalty and frequency_penalty must be in [-2, 2]'
+    if presence or frequency:
+        pen = f' pen {presence!r} {frequency!r}'
     lps = {}
     for key, word in (('logprobs', 'lp'), ('prompt_logprobs', 'plp')):
         v = f.get(key)
@@ -337,7 +349,7 @@ def build_request(f: dict, ordinal: int, steering: dict | None = None):
         return None, 'images cannot be combined with prompt_logprobs or steering'
 
     body = (f"n_gen {mt} temp {temp!r} seed {seed} min {max(mn, 0)} stop {','.join(map(str, stops)) or '-'} top_p {top_p!r}"
-            + ''.join(f' {w} {v}' for w, v in lps.items()) + ins + gram + steer + img + '\n' + ','.join(map(str, prompt))
+            + pen + ''.join(f' {w} {v}' for w, v in lps.items()) + ins + gram + steer + img + '\n' + ','.join(map(str, prompt))
             + '\n').encode()
     return body, None
 
@@ -520,6 +532,8 @@ class Shim:
             hello['grammar'] = True
         if self.cfg.get('vision'):
             hello['vision'] = True
+        if self.cfg.get('penalty'):
+            hello['penalties'] = True
         if self.cfg['steering']:
             hello['steering'] = self.cfg['steering']
         wire.write_frame(writer, hello)
@@ -576,6 +590,8 @@ class Shim:
             return self.finish(r, 'error', message='not supported by this engine: grammar')
         if f.get('images') not in (None, []) and not self.cfg.get('vision'):   # the engine would refuse the img field
             return self.finish(r, 'error', message='not supported by this engine: images')
+        if (f.get('presence_penalty') or f.get('frequency_penalty')) and not self.cfg.get('penalty'):   # the pen field
+            return self.finish(r, 'error', message='not supported by this engine: penalties')
         if f.get('prompt_logprobs') is not None and len(prompt) > self.a.max_plp_prompt:
             return self.finish(r, 'error', message=f'prompt too long for prompt_logprobs (max {self.a.max_plp_prompt})')
         if not isinstance(mt, int) or not prompt or mt < 1 or len(prompt) + mt > self.max_model_len():
@@ -802,6 +818,8 @@ class Shim:
                         self.cfg['grammar'] = os.path.exists(f'{self.a.dir}/grammar.s2')
                         # a DS41 engine with its vision tower loaded: the head writes vision.s2 before ready.s2
                         self.cfg['vision'] = os.path.exists(f'{self.a.dir}/vision.s2')
+                        # presence / frequency penalties (engine/runtime/penalty.h): the head writes penalty.s2 before ready.s2
+                        self.cfg['penalty'] = os.path.exists(f'{self.a.dir}/penalty.s2')
                         break
                 except ValueError as e:
                     log.error('%s', e)
