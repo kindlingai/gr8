@@ -13,11 +13,14 @@ release. If you run it, please tell us what breaks: issues and PRs are welcome.*
 - **Three models, one to six boxes.** GLM-5.3 on three to six boxes, GLM-5.3-Flash on one to four, DeepSeek-V4.1-Flash
   on four ([Models](#models)).
 - **Boots from its own cache.** Each box fetches only its own part of the release, once. After that, GLM-5.3 boots in
-  about 40 s and GLM-5.3-Flash on one box in 45 s. TODO-DS-BOOT
-- **Speed.** One stream, code: GLM-5.3 decodes 57.4 tok/s on six boxes, GLM-5.3-Flash 54.3 tok/s on one box, and
-  TODO-DS-SPEED. The [Models](#models) table has prose and prefill, and how each was measured.
+  about 40 s and GLM-5.3-Flash on one box in 45 s.
+- **Speed.** One stream, code: GLM-5.3 decodes 57.4 tok/s on six boxes (RigMark), GLM-5.3-Flash 54.3 tok/s on one
+  box and DeepSeek-V4.1-Flash 104.6-105.9 tok/s on four (gr8's own bench). The [Models](#models) table has prose,
+  prefill and dates.
 - **Many chats at once, and long ones.** GLM-5.3 decodes 8 requests at once from a KV pool of up to 614,400 tokens
-  (TP=6). GLM-5.3-Flash on one box decodes 4 at once from a 700,032-token pool. TODO-DS-SLOTS
+  (TP=6). GLM-5.3-Flash on one box decodes 4 at once from a 700,032-token pool. DeepSeek-V4.1-Flash runs 5 chats at
+  once by default and up to 16, and one chat can be up to 1,048,576 tokens
+  ([docs/FIRST-BOOT.md](docs/FIRST-BOOT.md#2-deepseek-v41-flash-ds41-how-many-chats-and-how-long)).
 - **Prefix reuse and KV below the pool.** A request that continues a conversation prefills only its new part: a
   continued 20K-token conversation takes 7.1 s instead of 17.3 s (GLM-5.3, TP=4). Evicted prefixes can go to an SSD or
   to a KV node with spare memory, over RDMA. From a KV node, the next turn of a 445,855-token prompt answered in 11.4 s
@@ -34,7 +37,7 @@ release. If you run it, please tell us what breaks: issues and PRs are welcome.*
 |---|---|---|---|---|
 | GLM-5.3 | 3 to 6 | [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) | six boxes: 57.4 / 43.1 tok/s, 1,808 tok/s (RigMark, 2026-10-24; one box clock-capped) | [docs/GLM-5.3.md](docs/GLM-5.3.md) |
 | GLM-5.3-Flash | 1 to 4 | [kindlingai/glm-5.3-flash-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4) | one box: 54.3 / 29.1 tok/s, 1,214 tok/s (`gr8 bench`, 2026-11-06) | [docs/FLASH.md](docs/FLASH.md) |
-| DeepSeek-V4.1-Flash | 4 | [kindlingai/deepseek-v4.1-flash-exlr8-native](https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native) | TODO-DS-ROW | [docs/DEEPSEEK.md](docs/DEEPSEEK.md) |
+| DeepSeek-V4.1-Flash | 4 | [kindlingai/deepseek-v4.1-flash-exlr8-native](https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native) | four boxes: 104.6-105.9 / 61.7-62.0 tok/s, 3,197-3,700 tok/s (`gr8 bench`, two runs, 2026-11-02) | [docs/DEEPSEEK.md](docs/DEEPSEEK.md) |
 
 Each page has the model's full results, how to start it, its settings and its known issues.
 

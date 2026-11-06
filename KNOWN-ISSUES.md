@@ -37,4 +37,31 @@ No open bugs recorded. [docs/FLASH.md](docs/FLASH.md#not-yet) lists what Flash d
 
 ## DeepSeek-V4.1-Flash
 
-TODO-DS-ISSUES
+### 1. The `./gr8 ds41` route has not been run end to end from a clean machine - Open
+
+- [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) was checked against the launcher source. Our own boots, and every
+  number in [docs/DEEPSEEK.md](docs/DEEPSEEK.md) and [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md), went through a separate
+  test harness. So no boot time through `./gr8 ds41 up` is measured yet.
+- Setup has two manual steps GLM does not: the whole 510.6 GB release on every box, and the Engram token map.
+
+### 2. No KV store below the device - Open
+
+- `KV_STORE` (`--kv-store`) is refused for `ds41`: the launcher stops ("has no KV store") and so does the engine
+  (`scripts/engine_args.sh`, `engine/runtime/g6m4.cu`). There is no SSD or KV-node tier for DeepSeek.
+- Prefix reuse is the snapshot cache on the device (`GR8_DS_CACHE_MIB`, 4,096 MiB a box by default;
+  [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md#q2-how-long-can-one-chat-be)).
+
+### 3. No JSON-schema masking - Open
+
+- The `ds41` build has no XGrammar (`scripts/build.sh`), and the engine refuses `--grammar-dir`, so it cannot mask a
+  reply to a JSON schema as it does on GLM-5.3.
+
+### 4. Recall at 1M tokens is unreliable - Open
+
+- 2 of 7 different 1M-token prompts found all 3 facts hidden in them. Up to 262,144 tokens, every run that completed
+  found all 3 ([docs/FIRST-BOOT.md](docs/FIRST-BOOT.md#q2-how-long-can-one-chat-be)).
+
+### 5. An image request holds the other chats - Open
+
+- The vision tower runs on the step loop's thread, so a request with images holds every other chat's steps while its
+  images are encoded ([docs/DS41-VISION.md](docs/DS41-VISION.md#costs-and-limits)). Image input is off by default.

@@ -20,7 +20,7 @@ On one and two boxes, from the recipe repos (the one-box numbers are the image's
 | prefill, 8K / 32K / 128K prompt | 1,214 / 1,224 / 1,048 tok/s | 1,698 / 1,694 / 1,404 tok/s |
 | aggregate decode, 1 / 2 / 4 / 8 streams | 40.8 / 44.1 / 58.0 / 59.2 tok/s | not measured yet |
 | KV pool | 700,032 tokens, up to 4 requests at once | `CAP` 262,208 |
-| from | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark), `gr8 glm53f bench`, 2026-11-06 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark), "First numbers", 2026-11-06 |
+| from | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark), `gr8 glm53f bench`, 2026-11-06 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark), "First numbers" in its README of 2026-11-06 |
 
 The two-box numbers are from a first run and are not yet in a kindling.json. At TP=3 and TP=4 the sections below have
 what is measured so far. Open bugs: [KNOWN-ISSUES.md](../KNOWN-ISSUES.md#glm-53-flash).
