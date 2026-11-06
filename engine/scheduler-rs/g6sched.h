@@ -185,10 +185,10 @@ struct g6sch_resize { uint32_t tier; uint64_t segs, slots, txn; };
 uint64_t g6sch_share_want(const g6kv_tier_totals* last, const g6kv_tier_totals* now, uint64_t per, bool busy);
 // true and *out written when the node's answer is a resize
 bool g6sch_share_resize(uint32_t tier, uint64_t segs, uint64_t per, uint64_t grant, uint64_t give, uint64_t txn, g6sch_resize* out);
-// share_apply: every rank's change at a Resize commit, on the pool and the tier's store. The pool is locked only for the
-// tier's resize, never around run_io (which runs the pool's copies and calls io_done; nonzero = it failed). 0 applied,
-// 1 the lease or tier keeps its size, 2 a store fault (g6kv_tier_error), 3 a pool error or a size the event did not
-// name (*msg), 4 run_io failed
+// share_apply: every rank's change at a Resize commit, on the pool and the tier's store. The pool is locked only for
+// the tier's resize, never around run_io (which runs the pool's copies and calls io_done; nonzero = it failed). 0
+// applied, 1 the lease or tier keeps its size, 2 a store fault (g6kv_tier_error), 3 a pool error or a size the event
+// did not name (*msg), 4 run_io failed
 int32_t g6s2_share_apply(g6kv_pool* pool, const g6kv_tier* store, const g6sch_resize* r, int32_t (*run_io)(void* ctx),
                          void* ctx, const char** msg);
 
@@ -426,8 +426,8 @@ struct g6s2_drv_payload { size_t prompt_len; int32_t chunk; bool decode_prompt; 
 // a leaving session's run (no prefix reuse); head, this rank made the commit's cancel and shrink calls itself
 struct g6s2_drv_pool { bool grow, shrink, release, head; };
 // the engine's callbacks; each returns 0, or nonzero when the C++ hook threw. has_*: the C++ member is set. payload:
-// the facade copies apply's payload into the slot (set) or clears it. prefill and prefill_pack find the payload by slot.
-// grow decides growth itself; with g6s2_drv_pool::grow, grown follows a run that grew (the slot as it was)
+// the facade copies apply's payload into the slot (set) or clears it. prefill and prefill_pack find the payload by
+// slot. grow decides growth itself; with g6s2_drv_pool::grow, grown follows a run that grew (the slot as it was)
 struct g6s2_drv_hooks {
     void* ctx;
     int32_t (*bind)(void* ctx, const g6sch_grant* g);

@@ -777,11 +777,11 @@ inline uint64_t driver(uint64_t seed, std::vector<std::string>* lines = nullptr)
     return tx.h;
 }
 
-// the driver's own pool calls (driver.h DriverPool): a head and a worker, each a Driver over its own pool, take the same
-// commits. The head reserves a grant's run, gives a cancelled session's run back and shrinks a session to the smaller R
-// as it builds the commit (service.h event); the worker reserves at its bind. Runs grow before each round and go back
-// when a session finishes, or on the worker when it is cancelled; the worker makes the head's shrink. Every hook call,
-// step and both pools' digests go in.
+// the driver's own pool calls (driver.h DriverPool): a head and a worker, each a Driver over its own pool, take the
+// same commits. The head reserves a grant's run, gives a cancelled session's run back and shrinks a session to the
+// smaller R as it builds the commit (service.h event); the worker reserves at its bind. Runs grow before each round and
+// go back when a session finishes, or on the worker when it is cancelled; the worker makes the head's shrink. Every
+// hook call, step and both pools' digests go in.
 inline uint64_t driver_pool(uint64_t seed, std::vector<std::string>* lines = nullptr)
 {
     using namespace g6s2;

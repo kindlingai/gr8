@@ -1,9 +1,10 @@
 // Growth on demand through Driver::step (driver.h) and the Rust pool (s2/pool.h): runs start with their prompt + 1 +
 // guard rows, grow before each round, sit a round out when the pool would be unsafe, and give their pages back when
-// they finish. The driver makes those pool calls itself (DriverPool), as the service's does. Every request must emit exactly what it emits alone, no step may touch a row past its session's pages,
-// and two ranks driven by the same events must agree on every digest. A third of the requests carry an insert rule
-// (s2_batch.h): their tokens must be the solo run's with the same rule, the growth must cover the inserted tokens' rows,
-// and a rank that misses the rule must disagree at the next digest after it fires. Host only.
+// they finish. The driver makes those pool calls itself (DriverPool), as the service's does. Every request must emit
+// exactly what it emits alone, no step may touch a row past its session's pages, and two ranks driven by the same
+// events must agree on every digest. A third of the requests carry an insert rule (s2_batch.h): their tokens must be
+// the solo run's with the same rule, the growth must cover the inserted tokens' rows, and a rank that misses the rule
+// must disagree at the next digest after it fires. Host only.
 // The fake model is a pure function of (request, row position, row token), as batch_round_test's, so any difference
 // from the solo run comes from the scheduler, the driver or the pool.
 #include "s2/sessions.h"

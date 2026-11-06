@@ -3,9 +3,9 @@
 // EventGate all-rank fence; callbacks must fail the whole epoch on any error.
 // The driver's logic is Rust (engine/scheduler-rs src/driver.rs), and so is the scheduler's state, which state() reads.
 // Driver is a facade: it keeps the payloads and the Batch (which writes the round log), and answers the Rust's hooks
-// and planner calls from them. An exception a hook throws is held until the Rust returns, then rethrown. The Batch's hooks (run, emit, prompt, round,
-// dfl, dfl_start) must not call stats() or emitted(), which read the Batch; the other hooks may call any getter. No hook
-// may call apply() or step(): the Rust refuses them.
+// and planner calls from them. An exception a hook throws is held until the Rust returns, then rethrown. The Batch's
+// hooks (run, emit, prompt, round, dfl, dfl_start) must not call stats() or emitted(), which read the Batch; the other
+// hooks may call any getter. No hook may call apply() or step(): the Rust refuses them.
 #pragma once
 #include "../ds41_image.h"
 #include "scheduler.h"
@@ -253,7 +253,7 @@ public:
         const Slot empty{};
         const g6s2_drv_pool use{pool.grow, pool.shrink, pool.release, pool.head};
         m.rs.reset(g6s2_driver_new(&hooks, &planner, &m.cfg, MAX_SESSIONS, sch::c<g6sch_slot>(&empty), pool.pool, &use));
-        require(bool(m.rs), "missing driver callback");
+        require(bool(m.rs), "the Rust driver refused its slot count or pool calls");
         g6s2_drv_view v;
         g6s2_driver_view(m.rs.get(), &v);
         require(v.n == MAX_SESSIONS, "driver slot count");

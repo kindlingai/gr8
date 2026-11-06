@@ -36,9 +36,9 @@ struct PoolHooks {
     // optional, head only: the R a request's run takes (Request::r_rows: 0 or Config::r2_rows). prompt: null without
     // prefix reuse. Unset = 0
     std::function<uint32_t(const Request&, uint64_t rows, uint64_t worst, const std::vector<int>* prompt)> r_rows;
-    // optional (with r_rows and pool): a request that does not fit. make_room, head only: a decoding session to take the
-    // smaller R, its run shrunk on the head's pool (nothing = none to shrink). The driver makes the same change on a
-    // worker's pool
+    // optional (with r_rows and pool): a request that does not fit. make_room, head only: a decoding session to take
+    // the smaller R, its run shrunk on the head's pool (nothing = none to shrink). The driver makes the same change on
+    // a worker's pool
     std::function<std::optional<Shrink>(const std::array<Slot, MAX_SESSIONS>& slots, const Request&, uint64_t rows,
                                         uint64_t worst)> make_room;
     // growth on demand (pool.h grow, with pool): the driver grows each decoding run before a round, every rank; a run
@@ -69,8 +69,8 @@ struct NativeHooks {
     // optional, before bind on every rank: the bound request itself (DS41: its image rows, for the Engram ring of the
     // slot's snapshots and parks, s2/ds41_engram_ring.h)
     std::function<void(unsigned slot, const g6rt::ServeReq&)> bind_request;
-    // with pool.grow: slot's run grew (the driver's pool call); its new pages go into the main and draft tables before the
-    // round
+    // with pool.grow: slot's run grew (the driver's pool call); its new pages go into the main and draft tables before
+    // the round
     std::function<void(unsigned slot, const Run&)> grown;
     std::function<void(const Slot&)> retire; // native per-slot graph/view cleanup only
     std::function<void()> fence; // all native streams/drafts quiescent before event ACK

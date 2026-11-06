@@ -1,9 +1,9 @@
 // The C++ facade over the Rust driver (driver.h Driver, engine/scheduler-rs src/driver.rs): a hook's exception comes
 // out of apply() or step() as itself and fails the scheduler, as do the driver's own refusals after the scheduler
 // changed; a refusal before it leaves the state as it was. Hooks may read the driver back (the planner's own getters
-// only from the driver's hooks) but not call apply(), step(), idle_boundary() or pool_digest(); a hook that calls apply()
-// and catches the refusal leaves the outer apply() whole. The scheduler's state is the Rust's, read through state(),
-// which stays the same object when the Driver moves. Host only.
+// only from the driver's hooks) but not call apply(), step(), idle_boundary() or pool_digest(); a hook that calls
+// apply() and catches the refusal leaves the outer apply() whole. The scheduler's state is the Rust's, read through
+// state(), which stays the same object when the Driver moves. Host only.
 #include "s2/driver.h"
 #include <cstdio>
 #include <memory>
