@@ -335,6 +335,35 @@ completions. After R3 every piece it calls is Rust, so the driver moves whole an
   lets the driver call the pool Rust to Rust, under the lock the C++ `RunPool` takes today (the head's control thread
   reads the pool). `s2/pool.h` then serves only the C++ still left (g6m4's tier and checkpoint wiring, until R8), and
   `kv_share.h`'s `share_apply`, which orders pool calls, moves beside the driver.
+- The pool's lock. `RunPool` (`pool.h`) takes one `std::mutex` for each call and holds it only for that call. The
+  compute thread changes the pool on every rank (bind, grow, retire, park, the resize hook's `share_apply`). On the
+  head, the control thread also changes it at an event (a cancel's retire, `make_room`'s shrink, `count`, `match` then
+  `take`, `reserve`) while the compute thread waits in the event boundary. Outside an event it runs at the same time as
+  the compute thread: `publish_status` reads `free_pages`, `room` and `stats`, and the share poll's `coldest` updates
+  the pool's ages. Workers' control threads never touch the pool. The sequences of several calls (`match` then `take`,
+  `fits` then `reserve`, `share_apply`) hold because the other thread is waiting at the boundary, not because of the
+  lock, and that stays true when the lock moves. R5 must keep that pause when the control loop moves to Rust.
+  The lock moves into kvman-rs at the same granularity:
+  - `Pool` sits behind a `Mutex` in its handle. Every C entry point and every Rust caller locks it for one call.
+    `RunPool` loses its own mutex and stays a thin face. A decode round makes one `grow` per decoding slot, and an
+    uncontended Rust `Mutex` costs what `std::mutex` does.
+  - The pool never calls out while it holds the lock. That keeps the order acyclic: Flash takes `ck_mu` and then calls
+    the pool, and kvman-rs's own locks (the RAM stripes, tier buffers) are taken inside pool calls. When `share_apply`
+    moves to Rust (R4c), it locks for `resize_tier` and drops the lock before `run_io`, which calls back into C++.
+  - `g6kv_list` is the one call that returns a pointer into the pool. It copies into the caller's buffer under the
+    lock, as `RunPool` does today. Callers use it per bind, grow and retire, not per round.
+  - Some calls block under the lock today and still will: `io_done` and `add_tier` sync the tier index, and pool logging
+    writes to stderr. On the head they delay admission and status during a drain. Moving that I/O outside the lock is
+    a possible later change.
+  - Not chosen: holding the lock for a whole quantum. Admission and status would wait out a round, which takes
+    milliseconds. Also not chosen: a status snapshot that the compute thread publishes, with no lock. `match` and `fits`
+    read the whole prefix index, so admission would have to move to the compute thread. That is an R5 question.
+  - R4 in PRs, each with a boot. R4a: the driver logic, behind a facade. R4b: the lock moves into kvman-rs's handle
+    and `RunPool` drops its mutex, with today's build. R4b2: kvman-rs and scheduler-rs in one Cargo workspace and one
+    staticlib. `panic = "abort"` for dev and release goes in the workspace root, since member profiles are ignored. The
+    scripts that link two libraries (`build_m4.sh`, `scripts/build.sh`, `c1_tests.sh`, `host_tests.sh`) link one. R4c:
+    the driver calls the pool Rust to Rust, the `Scheduler` mirror goes, and `share_apply` moves beside the driver.
+    R4a and R4b do not depend on each other.
 - Proof: the round log replays unchanged (the driver's calls into the planner are the log's calls), the scheduler and
   driver host tests (`driver_grow_test`, the `scheduler_*` tests, `cp_rows_test`) run against the Rust driver behind a
   thin C++ facade as R3b did, and a confirmation boot's logs equal the earlier boots'. One C call per quantum.
