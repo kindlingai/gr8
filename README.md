@@ -9,6 +9,16 @@ sparse indexer, one MTP layer) on three to six DGX Spark (GB10) boxes, tensor-pa
 uses no vLLM, PyTorch or NCCL at serve time. Each box runs one `g6m4` process, the ranks talk over RoCE v2 through
 their own verbs fabric, and an OpenAI-compatible API runs on the first box.
 
+## Recipes
+
+`gr8` is available in easy-to-use recipes preconfigured for the best performance for a given
+model and cluster size.
+
+### GLM 5.3 Flash
+
+ - One DGX Spark: https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark
+ - Two DGX Sparks: https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark
+
 ## Results
 
 | | TP=3 | TP=4 | TP=5 | TP=6 |
