@@ -3,8 +3,8 @@
 // libstdc++, where the request parser's number rules come from). The scheduler's streams depend on the module's shape
 // (slots and caps), so it has one value per shape. A changed rule changes a hash: rerecord only for a change meant to
 // alter behaviour, and say so in the commit. The first eight were recorded at R2d (kindlingai/gr8#353) from the C++ then
-// in s2/tests/ref, the driver's at R4a from the C++ driver; --dump SECTION prints a section's transcript, to diff two
-// builds line by line. Host only.
+// in s2/tests/ref, the driver's from the C++ driver; --dump SECTION prints a section's transcript, to diff two builds
+// line by line. Host only.
 #include "../kv_plan.h"
 #include "../flash_lend.h"
 #include "../flash_ring.h"
@@ -34,8 +34,8 @@ int main(int argc, char** argv)
 {
     struct Shape { int max_sessions; bool mtp0, pack, park; uint64_t scheduler, driver; };
     const Shape shapes[] = {
-        {8, false, false, false, 0x516723cb09cd4014ull, 0x3ca932a26b074904ull},   // GLM-5.3 and Flash
-        {32, true, true, true, 0x6ab1879c4a43bb14ull, 0x7875b3c2624121fbull},     // DS41
+        {8, false, false, false, 0x516723cb09cd4014ull, 0x3508037ae19f733cull},   // GLM-5.3 and Flash
+        {32, true, true, true, 0x6ab1879c4a43bb14ull, 0xaa629dc3f6a951dbull},     // DS41
     };
     const int ms = int(g6mod::INFO.max_sessions);
     const bool mtp0 = g6mod::has(G6_CAP_MTP0), pack = g6mod::has(G6_CAP_PACK), park = g6mod::has(G6_CAP_PARK);
@@ -55,7 +55,7 @@ int main(int argc, char** argv)
         // recorded from the Rust after the old C++ parser (git c74d024, libstdc++) gave the same transcript
         {"request_gram", 9, [](uint64_t s, std::vector<std::string>* l) { return vec::request(s, l, true); }, 0x18a523b6c0f716ceull},
         {"share_resize", 10, vec::share_resize, 0xd99c642674175c07ull},
-        // recorded from the C++ driver it replaced (git 49cc742), in each shape
+        // recorded from the C++ driver it replaced (git bd1bb6a), in each shape
         {"driver", 11, vec::driver, shape ? shape->driver : 0},
     };
     if (argc == 3 && std::string(argv[1]) == "--dump")

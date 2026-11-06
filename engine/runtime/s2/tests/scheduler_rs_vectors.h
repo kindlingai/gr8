@@ -577,8 +577,9 @@ inline uint64_t request(uint64_t seed, std::vector<std::string>* lines = nullptr
 }
 
 // the driver (driver.h): Drivers over a fake engine that answers from a hash of each row, taking grants (decode-prompt
-// requests and insert rules among them), cancels and Resize commits between steps, with runs that grow, stall or stay,
-// rounds capped past R, emitters that stop early or miscount, and hooks that throw. Every hook call, step, refusal and
+// requests and insert rules among them), cancels, Resize and shrink commits between steps, with runs that grow, stall or
+// stay, rounds capped past R, packed prefills and prompt tails where the model packs, emitters that stop early or
+// miscount, and hooks that throw. Every hook call, step, refusal and
 // digest goes in. The planner's own choices are the planner tests'; this pins the driver's calls into it.
 inline uint64_t driver(uint64_t seed, std::vector<std::string>* lines = nullptr)
 {
@@ -606,6 +607,12 @@ inline uint64_t driver(uint64_t seed, std::vector<std::string>* lines = nullptr)
         c.cp_seg = !U(0, 3);
         c.tail_first = U(0, 1);
         c.mtp_sessions = uint32_t(U(0, 2) ? 0 : U(1, 3));
+        c.c8_pack = U(0, 1) && g6mod::has(G6_CAP_PACK);
+        if (!U(0, 2))
+        {
+            c.window_pages = uint32_t(U(1, 4));
+            c.r2_rows = uint32_t(64 * U(1, 4));
+        }
         const std::string v = outcome([&] { impl::validate(c); return std::string(); });
         tx(v);
         if (v != "ok ") continue;
@@ -671,6 +678,19 @@ inline uint64_t driver(uint64_t seed, std::vector<std::string>* lines = nullptr)
             };
         h.finished = [&](const Slot& s) { hook("finished " + str(s.key) + " " + std::to_string(s.emitted)); };
         if (with_resize) h.resize = [&](const Resize& z) { hook("resize " + std::to_string(z.tier) + " " + std::to_string(z.segs)); };
+        if (U(0, 9))
+            h.shrink = [&](const Shrink& z, const Run& was, uint64_t length) {
+                hook("shrink " + str(z.key) + " " + std::to_string(z.r_rows) + " " + str(z.run) + " was " + str(was) + " length " +
+                     std::to_string(length));
+            };
+        if (U(0, 9))
+            h.prefill_pack = [&](const std::vector<PrefillPart>& parts) {
+                std::string s = "pack";
+                for (const auto& x : parts)
+                    s += " " + str(x.slot->key) + ":" + std::to_string(x.payload->prompt.size()) + ":" + std::to_string(x.first) + "+" +
+                         std::to_string(x.rows);
+                hook(s);
+            };
         h.settle = [&] { hook("settle"); };
         const std::string made = outcome([&] { d = std::make_unique<impl::Driver>(c, h); return std::string(); });
         tx(made);
@@ -679,7 +699,7 @@ inline uint64_t driver(uint64_t seed, std::vector<std::string>* lines = nullptr)
         int refused = 0;
         for (int k = 0; k < 400 && refused < 3; ++k)
         {
-            const int op = U(0, 9);
+            const int op = U(0, c.c8_pack ? 3 : 9);   // packing: more commits, so short prompts wait together
             std::string o;
             if (op <= 1)
             {
@@ -696,13 +716,28 @@ inline uint64_t driver(uint64_t seed, std::vector<std::string>* lines = nullptr)
                     const auto& s = sl[unsigned(U(0, int(MAX_SESSIONS) - 1))];
                     if (s.phase != Phase::Free || !U(0, 3)) e.cancel = s.key;
                 }
+                if (c.r2_rows && !U(0, 4))
+                {   // a session takes the smaller R: one that may, or one that may not (not decoding, already shrunk)
+                    unsigned at = unsigned(U(0, int(c.max_sessions) - 1));
+                    if (U(0, 2))
+                        for (unsigned i = 0; i < c.max_sessions; ++i)
+                            if (sl[(at + i) % c.max_sessions].phase == Phase::Decode)
+                            {
+                                at = (at + i) % c.max_sessions;
+                                break;
+                            }
+                    const auto& s = sl[at];
+                    const uint32_t first = s.run.first_page + uint32_t(U(0, 1));
+                    e.shrink = Shrink{s.key, c.r2_rows, Run{first, s.run.pages, s.run.table_version, R.raw()}};
+                }
                 if (kind == 3 && U(0, 1)) e.resize = Resize{uint32_t(U(0, 3)), uint64_t(U(0, 9)), 0, 0};
                 else if (kind >= 3 && d->state().resident() < c.limit())
                 {
                     Request r;
                     r.id = ++id;
-                    r.prompt_tokens = uint32_t(U(0, 4) ? U(2, 200) : U(201, 600));
+                    r.prompt_tokens = uint32_t(U(0, 4) ? U(2, c.c8_pack ? 64 : 200) : U(201, 600));
                     r.max_tokens = uint32_t(U(1, 80));
+                    if (c.r2_rows && !U(0, 3)) r.r_rows = c.r2_rows;
                     Payload q;
                     for (uint32_t i = 0; i < r.prompt_tokens; ++i) q.prompt.push_back(U(0, 3));
                     q.chunk = U(0, 20) ? U(1, 8) : 0;   // 0: refused
@@ -716,7 +751,8 @@ inline uint64_t driver(uint64_t seed, std::vector<std::string>* lines = nullptr)
                     const std::string key = outcome([&] { e.admit = Grant{d->state().next_key(e.cancel), r, {}, 0}; return std::string(); });
                     if (e.admit)
                     {
-                        e.admit->run = Run{uint32_t(U(0, 1000)), grant_pages(c, r), 1, R.raw()};
+                        const uint32_t first = uint32_t(U(0, 1000));
+                        e.admit->run = Run{first, grant_pages(c, r), 1, R.raw()};
                         if (!U(0, 30)) q.prompt.pop_back();   // a payload that does not match its grant
                         p = q;
                     }
