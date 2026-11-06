@@ -215,6 +215,24 @@ impl Kind for crate::control::ffi::Frame {
 impl Kind for crate::control::ffi::CBoot {
     const K: u64 = 6;
 }
+impl Kind for crate::service::files::Command {
+    const K: u64 = 6;
+}
+impl Kind for crate::service::status::RunUse {
+    const K: u64 = 6;
+}
+impl Kind for crate::service::ffi::CProfile {
+    const K: u64 = 6;
+}
+impl Kind for crate::service::ffi::CSteering {
+    const K: u64 = 6;
+}
+impl Kind for crate::service::ffi::CBoot {
+    const K: u64 = 6;
+}
+impl Kind for crate::service::ffi::CStatus {
+    const K: u64 = 6;
+}
 // g6sched.h counts void as 1 byte, as Rust's c_void
 impl Kind for std::ffi::c_void {
     const K: u64 = 6;
@@ -659,6 +677,54 @@ pub fn digest() -> u64 {
             directory_n,
             agreement,
             agreement_n
+        }
+    );
+    layout!(h, crate::service::files::Command { epoch, request, hash, admit });
+    layout!(h, crate::service::status::RunUse { table_version, held, worst });
+    layout!(h, crate::service::ffi::CProfile { name, name_n, digest, active_layers });
+    layout!(h, crate::service::ffi::CSteering { profiles, n, scope, forced_scale_bits, loaded, forced });
+    layout!(
+        h,
+        crate::service::ffi::CBoot {
+            scheduler,
+            steering,
+            max_sessions,
+            rank,
+            ranks,
+            prefill_min,
+            control_version,
+            lp_max,
+            directory,
+            directory_n,
+            signature,
+            signature_n,
+            mtp0,
+            pack,
+            park
+        }
+    );
+    layout!(
+        h,
+        crate::service::ffi::CStatus {
+            epoch,
+            queued,
+            stalls,
+            grows,
+            stalled,
+            tiers,
+            n_tiers,
+            runs,
+            n_runs,
+            pool_pages,
+            resident,
+            retiring,
+            free,
+            room,
+            held_pages,
+            worst_pages,
+            has_growth,
+            has_tiers,
+            has_runs
         }
     );
     h

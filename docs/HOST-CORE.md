@@ -449,6 +449,31 @@ resize, barriers, quit) and matches the C++'s bytes. The control, bootstrap, agr
 tests pass unchanged in each shape on macOS, and `scripts/host_tests.sh` and `cargo test --release --workspace` pass on
 Linux. Boot pending.
 
+R5b goes in three parts, in this order. R5b1, the S2 files: `ingress.h`, `trace.h`, and from `bootstrap.h` and
+`service.h` the agreement string, `atomic_file`, `publish_ready` and status.s2. R5c: `ModuleOps` and the adapters'
+trampolines and context struct, which changes no behaviour, so the loops then port onto a C hook table rather than
+inventing trampolines while their logic moves. R5b2: `service.h`'s intake, admission and its control, watcher and
+compute loops. Its decisions depend on timing in a running service, so they are first pulled out, in the C++, as pure
+functions of explicit inputs and frozen with seeded vectors: the notice target from (boundary, horizon, held,
+notice_max), the `queue_.check` sequence from (revision, live, limit, fits, room), and the ADMIT_HOLD drain from (queue
+front, command stream). The loop wiring rests on the round logs, the hold, drain and loopback tests and a boot.
+
+R5b1 landed as `engine/scheduler-rs` `src/service/` (`g6svc_*` in `g6sched.h`; its structs in the layout digest). Rust
+owns the command and request files (`files.rs` `Ingress`: next, peek, the request and its hash; `parse_command`,
+`number`), the capability line and the agreement, ready.s2, `atomic_file`, status.s2's JSON (`status.rs`) and the trace
+file (`trace.rs`, one write per event from a reused buffer under its lock). Config::validate's steering half moved with
+the capability, and `check_abi` compares `PROFILES_MAX` and `SCALE_MAX`. The C++ keeps its APIs; `publish_status` still
+calls the pool hooks, in the same order, and hands their values to the Rust. `resources.h` had no caller and no test
+and is deleted rather than ported. `frontend/pseudo-engine/src/s2.rs` was not lifted: its messages differ from the
+engine's. Checked on macOS: `service_vectors_test` (commands, numbers, the ingress files with gaps and abort.s2,
+capability and agreement over seeded configs and steering receipts, `atomic_file`, `publish_ready`, the trace with its
+instants' times masked, status.s2 through the service's own `publish_status`) matches hashes recorded from the C++ (git
+05425dab) in every model shape; the 10,936 round logs the driver, scheduler, service and DS41 host tests write in the
+three shapes are byte-identical to the build before; the control, hold, drain, steering, image, grammar, pool and Flash
+checkpoint tests pass unchanged. Linux: `scripts/host_tests.sh` passes. Boot: TP4 GLM on the stock pool, main then
+R5b1, the round logs byte-identical on all four ranks and the 24 T=0 replies matching. The stock-pool logs equal the
+earlier boots' with the efcd row store too, so a gate needs no KV node.
+
 ### R6. Options, signatures and the fabric plan to Rust
 
 Moves `g6m4.cu:156-577` (about 20 model `#if`s, spec defaults, `--check-args`), the signature builders (`g6m4.cu:1919`,

@@ -6,8 +6,8 @@
 //! view. It reaches the planner through the C++ `s2::Batch`, which writes the round log.
 //!
 //! Every function here is deterministic in its inputs: each rank runs the same calls on the same replicated state and
-//! must reach the same answer. The exception is `control`: the links between the ranks (bootstrap, frames, the event
-//! gate and channels) and their socket I/O.
+//! must reach the same answer. The exceptions are `control`, the links between the ranks (bootstrap, frames, the event
+//! gate and channels) and their socket I/O, and `service`, the S2 files and the trace.
 
 pub mod admission;
 pub mod control;
@@ -24,4 +24,5 @@ pub mod planner;
 pub mod planner_ffi;
 pub mod request;
 pub mod scheduler;
+pub mod service;
 pub mod spec_len;

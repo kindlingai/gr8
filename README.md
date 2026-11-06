@@ -42,7 +42,7 @@ once · recipes coming soon. Until then, start it on three to six boxes with Doc
 
 142.9 tok/s for one request writing code · 3,655 tok/s prefill on an 8K prompt · 32 requests at once (the recipe's
 setting) · fast mode by default (`TUNE=speed`), so the output is not identical to the exact model's; `TUNE=quality`
-gives the exact model's output · the recipe's image is not built yet
+gives the exact model's output · not yet booted on four boxes
 
 **[Recipe](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)** · [Model page](docs/DEEPSEEK.md)
 
@@ -56,8 +56,9 @@ redraws them). The model pages give each benchmark and its date.</sub>
 - **Boots from its own cache.** On GLM-5.3 each box fetches only its own part of the release, once. After that, GLM-5.3 boots in
   about 40 s and GLM-5.3-Flash on one box in 45 s.
 - **Many chats at once, and long ones.** GLM-5.3 decodes 8 requests at once from a KV pool of up to 614,400 tokens
-  (TP=6). GLM-5.3-Flash on one box decodes 4 at once from a 700,032-token pool. DeepSeek-V4.1-Flash runs 5 chats at
-  once by default and up to 16, and with `CAP=1048576` one request can hold up to 1,048,566 tokens, prompt and reply
+  (TP=6). GLM-5.3-Flash on one box decodes 4 at once from a 700,032-token pool. DeepSeek-V4.1-Flash runs 32 chats
+  at once in fast mode, its recipe's default, each up to 327,670 tokens; `./gr8 ds41 up` defaults to exact output and
+  5 chats. With `CAP=1048576` and 16 chats, one request can hold up to 1,048,566 tokens, prompt and reply
   ([docs/FIRST-BOOT.md](docs/FIRST-BOOT.md#2-deepseek-v41-flash-ds41-how-many-chats-and-how-long)).
 - **Prefix reuse and KV below the pool.** A request that continues a conversation prefills only its new part: a
   continued 20K-token conversation takes 7.1 s instead of 17.3 s (GLM-5.3, TP=4). On GLM-5.3, evicted prefixes can go
@@ -80,7 +81,7 @@ redraws them). The model pages give each benchmark and its date.</sub>
 | GLM-5.3-Flash | 2 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark): the same image on both boxes | about 86 GB a box | |
 | GLM-5.3-Flash | 3 or 4 | [docs/FLASH.md](docs/FLASH.md) | see the page | |
 | [GLM-5.3](docs/GLM-5.3.md) | 3 to 6 | Docker Compose (below), or [docs/DEPLOY.md](docs/DEPLOY.md) for bare metal and Kubernetes | about 90 GB a box with 4 boxes (TP=4) | [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) |
-| [DeepSeek-V4.1-Flash](docs/DEEPSEEK.md) | 4 | [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark), or [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) on bare metal | 510.6 GB a box, fetched before the first boot | [kindlingai/deepseek-v4.1-flash-exlr8-native](https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native) |
+| [DeepSeek-V4.1-Flash](docs/DEEPSEEK.md) | 4 | [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark): the same image on all four boxes, fast mode by default; or [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) with gr8's own launcher, exact output by default | 510.6 GB a box, fetched before the first boot | [kindlingai/deepseek-v4.1-flash-exlr8-native](https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native) |
 
 Each model's page has its results, how to start it and its known issues.
 
@@ -98,8 +99,11 @@ Then `docker compose exec gr8 /opt/gr8/gr8 glm53 smoke` on the head. [docs/DEPLO
 setting, and has bare metal and Kubernetes. An agent that starts gr8 for someone asks them the questions in
 [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md) first.
 
-**DeepSeek-V4.1-Flash** on bare metal: [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is its boot in order, from the
-four boxes to a passing `./gr8 ds41 smoke`.
+**DeepSeek-V4.1-Flash** (four boxes): the recipe
+[deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)
+is the quickest way: the same image on every box, in fast mode by default. We have not yet booted that image on four
+boxes. [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is the boot with gr8's own launcher, which gives exact output by
+default, in order, from the four boxes to a passing `./gr8 ds41 smoke`.
 
 ### With model-loader
 

@@ -500,6 +500,8 @@ pub extern "C" fn g6sch_abi(what: u32) -> u64 {
         sch::QMAX as u64,
         PARSE_FN,
         crate::control::wire::CONTROL_VERSION,
+        crate::service::files::PROFILES_MAX as u64,
+        u64::from(crate::service::files::SCALE_MAX.to_bits()),
     ];
     v.get(what as usize).copied().unwrap_or(0)
 }
