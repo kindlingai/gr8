@@ -20,12 +20,12 @@ Engram on, 5 chat slots, four GB10 boxes on one 200G switch.
 | aggregate decode: 1 / 2 / 4 / 8 streams | 88.9-91.1 / 110.0-113.6 / 119.7-131.2 / 137.8-145.9 |
 
 `bench/bench.py` (gr8's own benchmark, `reasoning_effort` low, timed stages at uncapped GPU clocks), two runs on one
-boot of `main` at 40a91f5 with the launcher's defaults, on 2026-11-02. A range is the two runs. The first word after a
-128K prompt came in 34.3-35.1 s. Both runs passed smoke (11/11) and gave the same temperature-0 replies. The longest request on that boot was 163,830
-tokens; `main` now allows 262,134 (#325).
+boot of serving code equivalent to `main` at 40a91f5, with the launcher's defaults, on 2026-11-02. A range is the two
+runs. The first word after a 128K prompt came in 34.3-35.1 s. Both runs passed smoke (11/11) and gave the same
+temperature-0 replies. The longest request on that boot was 163,830 tokens; `main` now allows 262,134 (#325).
 
 - Quality: 73 of 75 in each of three runs of the 75-item check of [FIRST-BOOT.md](FIRST-BOOT.md#3-deepseek-v41-flash-ds41-speed-against-exactness)
-  (code, math, JSON, reasoning), exact output, on `main` at b10aae4 (2026-11-03).
+  (code, math, JSON, reasoning), exact output, on serving code equivalent to `main` at b10aae4 (2026-11-03).
 - Faster, not exact: with the Q3 switches of [FIRST-BOOT.md](FIRST-BOOT.md#q3-faster-writing-for-a-small-quality-loss),
   one chat writes 162-164 tok/s on short code prompts and 8 chats write 249-254 tok/s together, and the check gives 71
   of 75 ([FIRST-BOOT.md](FIRST-BOOT.md#q1-how-many-chats-at-once) has the table).
@@ -44,14 +44,14 @@ tokens; `main` now allows 262,134 (#325).
 
 ## Settings
 
-The launcher's defaults: 5 chats at once, 262,144 tokens a chat, exact output. A request that names no reasoning effort
-gets low (50), one that names no `max_tokens` gets 32,768 (`DEFAULT_MAX_TOKENS`), and one that names no `top_p` samples
-with 0.95.
+The launcher's defaults: 5 chats at once, `CAP` 262,144 (a request holds at most 262,134 tokens, prompt and reply),
+exact output. A request that names no reasoning effort gets low (50), one that names no `max_tokens` gets 32,768
+(`DEFAULT_MAX_TOKENS`), and one that names no `top_p` samples with 0.95.
 
 [FIRST-BOOT.md](FIRST-BOOT.md#2-deepseek-v41-flash-ds41-how-many-chats-and-how-long) has the measured numbers for each
-choice: how many chats at once (up to 16), how long a chat can be (up to 1,048,576 tokens), faster writing for a small
-quality loss, a smaller output head, the first word sooner with several chats, and long prompts while other chats write.
-Each one is a config line or an `EXTRA_ENV` word, with no rebuild.
+choice: how many chats at once (up to 16), how long a chat can be (`CAP` up to 1,048,576, so a request of up to
+1,048,566 tokens), faster writing for a small quality loss, a smaller output head, the first word sooner with several
+chats, and long prompts while other chats write. Each one is a config line or an `EXTRA_ENV` word, with no rebuild.
 
 ## Known issues
 

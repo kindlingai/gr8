@@ -104,7 +104,7 @@ read back as decode selects them ([Remote KV](#remote-kv)).
 - `--reuse 0` turns prefix reuse off.
 - `--kv-store` and `--kv-rows` (experimental, off by default) put KV below the pool, on an SSD or a KV node: see
   [Remote KV](#remote-kv) below.
-- `--kv-format int4` (experimental) caches the KV latent in 4 bits: about 1.34x the context at TP=4 (CAP 513,536 against
+- `--kv-format int4` (experimental) caches the KV latent in 4 bits: about 1.26x the context at TP=4 (CAP 513,536 against
   408,832; the fp8 default has since grown to 485,376 and int4 is not re-measured) for about 3% slower decode, with needles found as with the default fp8 row ([KV4.md](KV4.md)).
 - `--dflash 0` runs MTP only at TP=4. `--mtp` is the MTP draft count (2).
 - `--steering-profile DIR[,DIR...]` loads local schema-v1 profiles; with an HF model, `hf:default` or `hf:NAME`

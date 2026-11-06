@@ -19,12 +19,15 @@ release. If you run it, please tell us what breaks: issues and PRs are welcome.*
   prefill and dates.
 - **Many chats at once, and long ones.** GLM-5.3 decodes 8 requests at once from a KV pool of up to 614,400 tokens
   (TP=6). GLM-5.3-Flash on one box decodes 4 at once from a 700,032-token pool. DeepSeek-V4.1-Flash runs 5 chats at
-  once by default and up to 16, and one chat can be up to 1,048,576 tokens
+  once by default and up to 16, and with `CAP=1048576` one request can hold up to 1,048,566 tokens, prompt and reply
   ([docs/FIRST-BOOT.md](docs/FIRST-BOOT.md#2-deepseek-v41-flash-ds41-how-many-chats-and-how-long)).
 - **Prefix reuse and KV below the pool.** A request that continues a conversation prefills only its new part: a
-  continued 20K-token conversation takes 7.1 s instead of 17.3 s (GLM-5.3, TP=4). Evicted prefixes can go to an SSD or
-  to a KV node with spare memory, over RDMA. From a KV node, the next turn of a 445,855-token prompt answered in 11.4 s
-  (experimental, [Remote KV](docs/GLM-5.3.md#remote-kv)).
+  continued 20K-token conversation takes 7.1 s instead of 17.3 s (GLM-5.3, TP=4). On GLM-5.3, evicted prefixes can go
+  to an SSD or to a KV node with spare memory, over RDMA. From a KV node, the next turn of a 445,855-token prompt
+  answered in 11.4 s (experimental, [Remote KV](docs/GLM-5.3.md#remote-kv)). GLM-5.3-Flash can keep its session
+  checkpoints in the same kinds of store
+  ([experimental](docs/FLASH.md#session-checkpoints-gr8_glm53f_cachealigned-experimental)). DeepSeek-V4.1-Flash has no
+  store below the device.
 - **Image input.** DeepSeek-V4.1-Flash takes images in chat requests (opt-in, `GR8_DS41_VISION=1`,
   [docs/DS41-VISION.md](docs/DS41-VISION.md)).
 - **A Docker image.** `ghcr.io/kindlingai/gr8` has the engine for every TP width and all three models, so GLM-5.3 on
@@ -106,16 +109,20 @@ Each model's page gives its box count. [docs/GLM-5.3.md](docs/GLM-5.3.md#what-yo
 
 - DGX Spark or other GB10 boxes (sm_121a, 128 GB unified memory), one rank per box, with nothing else holding much
   memory.
-- A RoCE v2 fabric with two rails: each box's ConnectX-7 has one address on each PCIe root. We use one 200G switch.
-  At TP=3 or 4, `--shape ring` runs without one: each box's f0 port is cabled to the next box's f1 port, and at TP=4
-  the diagonal's writes are relayed by the box between, through a 32 MB ring per fabric (about 0.25 GB pinned per
-  rank). It costs about 10% of single-stream decode (4-5% at 4 streams). memlock must be unlimited. With mentat
+- One box needs no fabric and no LAN: at TP=1 the launcher skips the RDMA checks
+  ([docs/FLASH.md](docs/FLASH.md#one-box-tp1)).
+- Two or more boxes need a RoCE v2 fabric with two rails: each box's ConnectX-7 has one address on each PCIe root. Two
+  boxes need no switch: one 200G cable joins their ConnectX ports, as in the
+  [two-box recipe](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark#clustering). For three or more we use one
+  200G switch. At TP=3 or 4, `--shape ring` runs without one: each box's f0 port is cabled to the next box's f1 port, and
+  at TP=4 the diagonal's writes are relayed by the box between, through a 32 MB ring per fabric (about 0.25 GB pinned
+  per rank). It costs about 10% of single-stream decode (4-5% at 4 streams). memlock must be unlimited. With mentat
   (`--mentat localhost --tp 3 --shape ring`, mentatd 0.24.0 or later on every box), the cabling can be any ring: the
-  boxes claim a ring from mentat and take their rank order and RDMA devices from its one answer, so a scheduler such as
-  a Kubernetes LeaderWorkerSet can place them in any order. Tag both addresses of each ConnectX port `rdma` in mentat
-  (`MENTAT_ANNOUNCE_IFACES`).
-- A LAN between the boxes with TCP ports 7340 and 7341 open. The boxes need no ssh between them: the head engine
-  passes each request to the other ranks over its control links.
+  boxes claim a ring from mentat and take their rank order and RDMA devices from its one answer, so a scheduler such
+  as a Kubernetes LeaderWorkerSet can place them in any order. Tag both addresses of each ConnectX port `rdma` in
+  mentat (`MENTAT_ANNOUNCE_IFACES`).
+- Two or more boxes also need a LAN between them with TCP ports 7340 and 7341 open. The boxes need no ssh between
+  them: the head engine passes each request to the other ranks over its control links.
 - Proactive memory compaction off on every box ([docs/DEPLOY.md](docs/DEPLOY.md#before-you-start) has the commands).
   A rank fills the box to about 2 GB under its limit, and at that level the kernel's background compaction moves pages
   under the engine in bursts that delay every collective.
