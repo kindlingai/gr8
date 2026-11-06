@@ -474,6 +474,39 @@ checkpoint tests pass unchanged. Linux: `scripts/host_tests.sh` passes. Boot: TP
 R5b1, the round logs byte-identical on all four ranks and the 24 T=0 replies matching. The stock-pool logs equal the
 earlier boots' with the efcd row store too, so a gate needs no KV node.
 
+R5c landed. `g6s2_module_ops` (g6sched.h) is a module's table: `bind`, `bind_request`, `grown`, `shrink`, `retire`,
+`retain`, `park`, `fence`, `before_work`, `drained`, `resize`, `flash_room`, the step calls `bucket`, `mode`, `launch`,
+`prefill`, `prefill_seq`, `prefill_pack`, `logprob`, `draft_lp`, `dfl_ok`, `dfl_start`, `dfl`, and the grammar arena as
+data. `scheduler-rs` `module.rs` fixes its layout, and the layout digest covers it with `g6s2_sampling` and
+`g6s2_lp_row`. A null member is a call the module does not have. Each call returns 0, or 1 when the module threw. The
+module's `ModuleCtx` holds the exception, and `Module` (`s2/module.h`), the caller's side, rethrows it. The core passes
+what it does not read as opaque pointers to the C++ objects (launch, payload, prefill parts, the output vector, request,
+reuse state). R10's boundary types replace them.
+
+The service and `Dispatch` call only the table. `NativeHooks::module` carries it. When it is unset, `FnModule` builds
+one over `NativeHooks`' std::function members, so the tests build unchanged. Each adapter's hooks are member functions
+of a context struct (`GlmModule` in g6m4.cu, `FlashModule`, `Ds41Module`). The struct's members are references to the locals
+the lambdas captured, under the same names, so each body is the lambda's text. One template trampoline per call
+(`mod::bind<C, &C::on_bind>`) fills the table. g6m4.cu's Flash additions (DFlash2, borrow-idle) keep their state in
+g6m4.cu, so they reach serve_flash as `FlashExtras`, std::functions that its members call.
+
+Still std::function: `PoolHooks` other than retain and park (pool policy over `RunPool`, R8), `share`, `FlashExtras`,
+and `DriverHooks`. `DriverHooks` are the driver's calls into the service, and R5b2 folds them into the Rust service.
+Their module calls go through the table. retain and park stay two calls, and R4c's `leave(slot) -> retained | released`
+waits. DS41 alone parks, and the service refuses `Config::park` without that call. No hook knows whether the run was
+kept: GLM's hands it to the pool's `retain` and the pool's keep policy decides, and DS41's and Flash's release it after their
+snapshot. An outcome means moving those releases out of the bodies.
+
+Checked on macOS. `module_calls_test` runs two ranks over the real Service, Driver, scheduler, pools and gate, with a
+fake module that logs every call with its arguments. Its scenarios cover burst admissions, prefill quanta and packs,
+growth, prefix reuse, cancels, a shrink, a resize, DFlash2 and parks. A command meant for mid-run is written inside a
+step, and the step waits for its notice in the head's trace. Its transcripts match hashes recorded from the service at
+2ecb4b43 in every shape, as std::function hooks and as a table, under clang and GCC 15, and its round logs equal the
+old build's. The 10,936 round logs the driver, scheduler, service and DS41 host tests write in the three shapes are
+byte-identical to the build before. The control, hold, drain, steering, image, grammar, pool and Flash checkpoint tests
+pass unchanged. The CUDA files are not compiled here: a script compared every moved body with its lambda. Linux not
+run (d800 and a6e2 were booked). Boot pending.
+
 ### R6. Options, signatures and the fabric plan to Rust
 
 Moves `g6m4.cu:156-577` (about 20 model `#if`s, spec defaults, `--check-args`), the signature builders (`g6m4.cu:1919`,
