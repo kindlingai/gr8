@@ -3,8 +3,9 @@
 // EventGate all-rank fence; callbacks must fail the whole epoch on any error.
 // The driver's logic is Rust (engine/scheduler-rs src/driver.rs). Driver is a facade: it keeps the payloads, the
 // Scheduler and the Batch (which writes the round log), and answers the Rust's hooks and planner calls from them. An
-// exception a hook throws is held until the Rust returns, then rethrown. Hooks may call the getters (run, emit, prompt,
-// round, dfl and dfl_start not stats() or emitted(), which read the Batch), never apply() or step().
+// exception a hook throws is held until the Rust returns, then rethrown. The Batch's hooks (run, emit, prompt, round,
+// dfl, dfl_start) must not call stats() or emitted(), which read the Batch; the other hooks may call any getter. No hook
+// may call apply() or step(): the Rust refuses them.
 #pragma once
 #include "../ds41_image.h"
 #include "scheduler.h"
@@ -75,6 +76,12 @@ class Driver {
         std::exception_ptr err;            // the exception a hook threw, rethrown when the Rust returns
         const Payload* admit = nullptr;    // apply's payload and commit, for the payload and resize hooks
         const Commit* commit = nullptr;
+        // apply's admit and commit as they were, back on any exit: a hook's own apply() (refused) leaves the outer call's
+        struct Restore {
+            Impl& m; const Payload* admit; const Commit* commit;
+            explicit Restore(Impl& i) : m(i), admit(i.admit), commit(i.commit) {}
+            ~Restore() { m.admit = admit; m.commit = commit; }
+        };
         s2::Step work;                     // reused buffers: a round allocates nothing here after warm-up
         std::vector<int> order, ids;
         std::vector<s2::Session> sessions;
@@ -112,7 +119,10 @@ class Driver {
         }
         // a call's result: 1 = a hook threw (rethrown here), 2 = the Rust refused
         void check(int32_t rc) {
-            if (rc == 1 && err) { std::exception_ptr e = err; err = nullptr; std::rethrow_exception(e); }
+            if (rc == 1) {
+                if (!err) throw std::runtime_error("s2: a driver hook failed without an exception");
+                std::exception_ptr e = err; err = nullptr; std::rethrow_exception(e);
+            }
             if (rc) throw std::runtime_error(g6s2_driver_error(rs.get()));
         }
         template <class F> int32_t guard(F&& f) noexcept {
@@ -262,10 +272,13 @@ public:
         Changes d;
         d.freed.resize(MAX_SESSIONS);
         size_t n = 0; bool admitted = false;
-        m.admit = p; m.commit = &c;
-        const int32_t rc = g6s2_driver_apply(m.rs.get(), &s, &x, digest, bool(c.resize), p ? &pay : nullptr,
-                                             sch::m<g6sch_run>(d.freed.data()), &n, &admitted);
-        m.admit = nullptr; m.commit = nullptr;
+        int32_t rc;
+        {
+            const Impl::Restore keep(m);
+            m.admit = p; m.commit = &c;
+            rc = g6s2_driver_apply(m.rs.get(), &s, &x, digest, bool(c.resize), p ? &pay : nullptr,
+                                   sch::m<g6sch_run>(d.freed.data()), &n, &admitted);
+        }
         m.check(rc);
         d.freed.resize(n);
         if (admitted) d.admitted = c.admit;

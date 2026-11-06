@@ -1,7 +1,8 @@
 // The C++ facade over the Rust driver (driver.h Driver, engine/scheduler-rs src/driver.rs): a hook's exception comes
 // out of apply() or step() as itself and fails the scheduler, as do the driver's own refusals after the scheduler
 // changed; a refusal before it leaves the state as it was. Hooks may read the driver back (the planner's own getters
-// only from the driver's hooks) but not call apply() or step(), and a moved Driver keeps working. Host only.
+// only from the driver's hooks) but not call apply() or step(); a hook that calls apply() and catches the refusal leaves
+// the outer apply() whole. A moved Driver keeps working. Host only.
 #include "s2/driver.h"
 #include <cstdio>
 #include <memory>
@@ -35,7 +36,7 @@ struct Fix {
         const Key k = d->state().next_key();
         const Request r{id, 4, max_tokens, {}, 0};
         const Commit cm{c.epoch, ++event, d->state().boundary(), d->state().digest(), {}, Grant{k, r, {0, 1, 1}, 0}, false, {}, {}};
-        Payload p{{5, 6, 7, 8}, 4, false, {}, {}, {}};
+        Payload p{{5, 6, 7, 8}, 4, false, {}, {}, {}, {}};
         d->apply(cm, &p);
         return k;
     }
@@ -80,7 +81,7 @@ int main() {
         const auto before = f.d->state().digest();
         const Request r{1, 4, 64, {}, 0};
         const Commit cm{f.c.epoch, 1, 0, before, {}, Grant{f.d->state().next_key(), r, {0, 1, 1}, 0}, false, {}, {}};
-        Payload p{{5, 6, 7}, 4, false, {}, {}, {}};
+        Payload p{{5, 6, 7}, 4, false, {}, {}, {}, {}};
         CHECK(throws<std::runtime_error>([&] { f.d->apply(cm, &p); }, "admit payload mismatch"));
         CHECK(throws<std::runtime_error>([&] { f.d->apply(Commit{f.c.epoch, 1, 0, before, {}, {}, false, {}, {}}, &p); }, "payload without grant"));
         CHECK(f.d->state().digest() == before);
@@ -111,6 +112,32 @@ int main() {
         f.cancel(k);
         CHECK(n > 0 && at_retire == n && f.d->emitted(k.slot).empty() && f.d->prompt(k.slot).empty());
         CHECK(f.d->stats_if_initialized(f.admit(2)) == nullptr);
+    }
+    {   // the retire hook calls apply() and catches the refusal: the outer commit (a cancel and a grant) still admits with
+        // its own payload
+        Fix f;
+        const Key k = f.admit(1);
+        f.to_decode();
+        std::string refused;
+        f.on_retire = [&] {
+            const Request r{9, 4, 64, {}, 0};
+            const Commit inner{f.c.epoch, f.event + 1, f.d->state().boundary(), f.d->state().digest(), {},
+                               Grant{f.d->state().next_key(), r, {0, 1, 1}, 0}, false, {}, {}};
+            Payload p{{1, 1, 1, 1}, 4, false, {}, {}, {}, {}};
+            try { f.d->apply(inner, &p); } catch (const std::runtime_error& e) { refused = e.what(); }
+        };
+        const Key k2 = f.d->state().next_key(k);
+        const Request r{2, 4, 64, {}, 0};
+        const Commit cm{f.c.epoch, ++f.event, f.d->state().boundary(), f.d->state().digest(), k, Grant{k2, r, {0, 1, 1}, 0},
+                        false, {}, {}};
+        Payload p{{9, 8, 7, 6}, 4, false, {}, {}, {}, {}};
+        const Changes ch = f.d->apply(cm, &p);
+        CHECK(refused == "s2: a driver hook called the driver back");
+        CHECK(ch.admitted && ch.admitted->key == k2 && f.d->prompt(k2.slot) == p.prompt);
+        f.on_retire = nullptr;
+        f.to_decode();
+        f.d->step();
+        CHECK(!f.d->emitted(k2.slot).empty() && f.d->stats(k2).rounds >= 1);
     }
     {   // a moved Driver keeps its hooks and state
         Fix f;

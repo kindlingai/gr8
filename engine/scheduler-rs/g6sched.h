@@ -406,12 +406,11 @@ void g6s2_batch_spec_len(const g6s2_batch* b, int32_t which, g6s2_spec_len* out)
 void g6s2_batch_slot(const g6s2_batch* b, int32_t q, g6s2_slot* out);
 void g6s2_batch_learn(const g6s2_batch* b, g6s2_learn* out);
 
-// s2/driver.h: the driver (docs/HOST-CORE.md R4a). Rust owns the per-slot emitted counts, initialised flags, what it
-// reads of each payload and the capped-round cycle behind g6s2_driver. The C++ Driver is a facade: it passes the
-// scheduler's state (still held by the C++ Scheduler) per call, answers the engine's hooks and the planner's calls
-// through the tables below, and keeps the payloads. Hooks may read the driver back. Calls return 0, 1 when a hook
-// returned nonzero (the facade holds its exception), or 2 when refused (g6s2_driver_error); after the scheduler
-// changed, either fails it.
+// s2/driver.h: the driver. Rust owns the per-slot emitted counts, initialised flags, what it reads of each payload and
+// the capped-round cycle behind g6s2_driver. The C++ Driver is a facade: it passes the scheduler's state (still held by
+// the C++ Scheduler) per call, answers the engine's hooks and the planner's calls through the tables below, and keeps
+// the payloads. Hooks may read the driver back. Calls return 0, 1 when a hook returned nonzero (the facade holds its
+// exception), or 2 when refused (g6s2_driver_error); after the scheduler changed, either fails it.
 struct g6s2_drv_sched { const g6sch_config* c; g6sch_slot* s; size_t n; g6sch_state* st; };
 // what the driver reads of an admitted payload; steering_ok: its steering equals the grant's
 struct g6s2_drv_payload { size_t prompt_len; int32_t chunk; bool decode_prompt; bool steering_ok; };
