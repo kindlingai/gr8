@@ -260,7 +260,7 @@ static void run(uint64_t seed)
     auto list = [&](const g6kv_run& r) {
         std::vector<uint32_t> v(r.pages); size_t n; int ex;
         CKI(g6kv_list(pool, &r, v.data(), v.size(), &n, &ex));
-        v.resize(std::min(n, v.size()));
+        if (n != v.size()) { fprintf(stderr, "g6kv_list: %zu pages, run says %zu\n", n, v.size()); exit(1); }
         return v;
     };
     // session a: 2,600 tokens + room for 3 steps of 8 (pages 0..40); a filler to page 229; session b in chunk 2

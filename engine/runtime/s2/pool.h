@@ -108,20 +108,17 @@ public:
     void stores(uint32_t shared_after) { g6kv_stores(p_, shared_after); }
     // keep: 0 evicted, 1 shared, 2 all. index_dir: empty, or the folder of the tier's index
     void add_tier(uint64_t slots, int keep, const std::string& index_dir, const std::string& compat) {
-        
         require(g6kv_add_tier(p_, slots, keep, index_dir.empty() ? nullptr : index_dir.c_str(), compat.c_str()) == 0,
                 g6kv_tier_error());
     }
     // at admission, before the grant, on every rank. span: the prompt's system span in tokens, -1 = none
     uint32_t count(const std::vector<int>& prompt, int64_t span, const g6rt::CacheNamespace& ns = {}) {
-        
         uint32_t out;
         check(g6kv_count_namespaced(p_, prompt.data(), prompt.size(), span, ns.data(), ns.size(), &out));
         return out;
     }
     // tier t's policy: evicted runs need min_rows rows and min_hits continuations; block_bytes for the counters
     void policy(uint32_t t, uint64_t min_rows, uint32_t min_hits, uint64_t block_bytes) {
-        
         check(g6kv_tier_policy(p_, t, min_rows, min_hits, block_bytes));
     }
     // runs past R keep their tails: nr ranks share the attention caches past R, per_slot replicated parts a block.
@@ -158,7 +155,6 @@ public:
     void write_limit(uint64_t milli) { g6kv_write_limit(p_, milli); }
     // the copies queued since the last io(), in the order to run them. Then io_done()
     std::vector<g6kv_io> io() {
-        
         std::vector<g6kv_io> v(g6kv_io_pending(p_));
         check(g6kv_io_take(p_, v.data(), v.size()));
         return v;
@@ -167,13 +163,11 @@ public:
     const char* io_done() { return g6kv_io_done(p_) ? g6kv_tier_error() : nullptr; }
     size_t io_pending() const { return g6kv_io_pending(p_); }
     std::vector<g6kv_tier_totals> tiers() const {
-        
         std::vector<g6kv_tier_totals> v;
         for (g6kv_tier_totals t; g6kv_tier_stats(p_, uint32_t(v.size()), &t) == 0;) v.push_back(t);
         return v;
     }
     std::string stored_summary() const {
-        
         std::string s(g6kv_stored_summary(p_, nullptr, 0), '\0');
         g6kv_stored_summary(p_, s.data(), s.size());
         s.pop_back();
@@ -205,10 +199,11 @@ public:
     std::vector<uint32_t> grow_pool(uint32_t n) {
         std::vector<uint32_t> v(n); check(g6kv_grow_pool(p_, n, v.data(), v.size())); return v;
     }
+    // publish_status calls this on the control thread while the compute thread changes the pool, so the count can
+    // change between the two calls: fill again until the runs fit
     std::vector<PoolUse> runs() const {
-        
         std::vector<g6kv_use> u(g6kv_runs(p_, nullptr, 0));
-        g6kv_runs(p_, u.data(), u.size());
+        for (size_t n; (n = g6kv_runs(p_, u.data(), u.size())) != u.size();) u.resize(n);
         std::vector<PoolUse> v;
         for (const auto& x : u) v.push_back(PoolUse{x.table_version, x.held, x.worst});
         return v;

@@ -342,7 +342,9 @@ completions. After R3 every piece it calls is Rust, so the driver moves whole an
   the compute thread: `publish_status` reads `free_pages`, `room` and `stats`, and the share poll's `coldest` updates
   the pool's ages. Workers' control threads never touch the pool. The sequences of several calls (`match` then `take`,
   `fits` then `reserve`, `share_apply`) hold because the other thread is waiting at the boundary, not because of the
-  lock, and that stays true when the lock moves. R5 must keep that pause when the control loop moves to Rust.
+  lock, and that stays true when the lock moves. R5 must keep that pause when the control loop moves to Rust,
+  and must not read the pool back to back: Rust's `Mutex` is not fair, and a reader that locks again at once starves
+  the compute thread.
   The lock moves into kvman-rs at the same granularity:
   - `Pool` sits behind a `Mutex` in its handle. Every C entry point and every Rust caller locks it for one call.
     `RunPool` loses its own mutex and stays a thin face. A decode round makes one `grow` per decoding slot, and an
