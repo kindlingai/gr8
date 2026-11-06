@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::dialect::{self, AnyParser, Dialect};
 use crate::gen::{think_open, Budget, Generation, Res, Step, StepStats, StopReason};
+use crate::guard;
 use crate::jsonmode;
 use crate::parser::Delta;
 use crate::pyjson::{self, truthy};
@@ -717,9 +718,16 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
         (Some(start), Some(end)) => !think_open(&cr.prompt, start, end),
         _ => false,
     };
+    // the repeated-tool-call guard (guard.rs): GLM's parser, tools offered, no forced call (that is the client's own)
+    let guard_on = body.get("tool_repeat_guard").filter(|v| !v.is_null()).map_or(st.guard.on, |v| truthy(Some(v)));
+    let mut guard = (st.dialect == Dialect::Glm && cr.tools.is_some() && cr.force.is_empty())
+        .then(|| guard::Guard::new(st.guard, guard_on, body.get("messages")))
+        .flatten();
+    let guard_names = guard.as_ref().map(guard::Guard::names).unwrap_or_default();
     let new_parser = || {
         let p = AnyParser::new(st.dialect, cr.tools.as_ref(), &choice_value, include_reasoning)
-            .emit_undeclared(st.emit_undeclared);
+            .emit_undeclared(st.emit_undeclared)
+            .guard_names(guard_names.clone());
         if content_first {
             p.content_first()
         } else {
@@ -732,6 +740,9 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     let mut gen = Generation::new(&st.tok, rid, cr.prompt, cr.params, false, !stream);
     if truthy(body.get("return_step_stats")) {
         gen.want_step_stats();
+    }
+    if guard.is_some() {
+        gen.keep_reply();
     }
     let rf = cr.rf;
     if let (Some(start), Some(end)) = (st.tok.think_start, st.tok.think_end) {
@@ -759,24 +770,39 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     }
     if stream {
         let (sse, resp) = Sse::open();
-        tokio::spawn(async move { chat_stream(st, body, gen, parser, rf, sse).await });
+        tokio::spawn(async move { chat_stream(st, body, gen, parser, guard, rf, sse).await });
         return resp;
     }
     let created = now_secs();
     // a second parser watches the reply as it arrives, so a closed call block ends the generation (chat_full parses the
-    // whole text afterwards, which reads the same call)
-    let mut watch = (st.dialect == Dialect::Ds41).then(new_parser);
-    if let Err(e) = run_to_end(st, &mut gen, watch.as_mut()).await {
+    // whole text afterwards, which reads the same call), and the guard reads a held call before the reply ends
+    let mut watch = (st.dialect == Dialect::Ds41 || guard.is_some()).then(new_parser);
+    if let Err(e) = run_to_end(st, &mut gen, watch.as_mut(), guard.as_mut()).await {
         return e.response();
     }
     chat_full(st, &body, &gen, parser, &rf, created)
 }
 
-async fn run_to_end(st: &State, gen: &mut Generation, mut watch: Option<&mut AnyParser>) -> Result<(), ApiError> {
+async fn run_to_end(
+    st: &State,
+    gen: &mut Generation,
+    mut watch: Option<&mut AnyParser>,
+    mut guard: Option<&mut guard::Guard>,
+) -> Result<(), ApiError> {
     gen.start(&st.engine)?;
     while let Some(step) = gen.next().await? {
         if let Some(w) = watch.as_deref_mut() {
             let finished = step.finish_reason.is_some();
+            if finished {
+                if let (Some(g), Some(p)) = (guard.as_deref_mut(), w.glm_mut()) {
+                    p.delta(&step.text, false);
+                    if guard::take_back(gen, p, g).await? {
+                        continue; // the reply goes on from before the call
+                    }
+                    p.delta("", true);
+                    continue;
+                }
+            }
             w.delta(&step.text, finished);
             if !finished && w.call_closed() {
                 gen.end_now();
@@ -948,6 +974,7 @@ async fn chat_stream(
     body: Map<String, Value>,
     mut gen: Generation,
     mut parser: AnyParser,
+    mut guard: Option<guard::Guard>,
     rf: jsonmode::Rf,
     sse: Sse,
 ) {
@@ -992,6 +1019,25 @@ async fn chat_stream(
                 }
             }
             let last = step.finish_reason.is_some();
+            // the guard: the final text goes to the parser short of `finished`, so a held call stays held while the
+            // guard reads it. Taken back, the reply goes on. Otherwise an empty final step lets the call out
+            let step = match (last, guard.as_mut(), parser.glm_mut()) {
+                (true, Some(g), Some(_)) => {
+                    let pre = Step { text: step.text.clone(), ids: step.ids.clone(), logprobs: step.logprobs.clone(), ..Default::default() };
+                    if chat_step(st, &gen, &mut parser, &pre, &sse, created, lp_k, ret_ids, as_ids, continuous,
+                                 &mut tools_streamed, json_mode, &mut held_content, &rf)
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                    if guard::take_back(&mut gen, parser.glm_mut().unwrap(), g).await? {
+                        continue;
+                    }
+                    Step { finish_reason: step.finish_reason, stop_reason: step.stop_reason, ..Default::default() }
+                }
+                _ => step,
+            };
             if chat_step(st, &gen, &mut parser, &step, &sse, created, lp_k, ret_ids, as_ids, continuous,
                          &mut tools_streamed, json_mode, &mut held_content, &rf)
                 .await
@@ -1231,7 +1277,7 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
         return resp;
     }
     let created = now_secs();
-    if let Err(e) = run_to_end(st, &mut gen, None).await {
+    if let Err(e) = run_to_end(st, &mut gen, None, None).await {
         return e.response();
     }
     completions_full(st, &body, &gen, created)
@@ -1620,7 +1666,13 @@ async fn ask_supervisor(addr: &str, msg: &str) -> Result<Value, String> {
 
 async fn metrics_route(st: &State) -> Response<HttpBody> {
     match st.engine.metrics(Duration::from_secs(5)).await {
-        Ok(snap) => response(200, "text/plain; charset=utf-8", metrics::render(&snap, &st.model_name).into_bytes()),
+        Ok(snap) => {
+            let front = metrics::Front {
+                guard_retries: guard::RETRIES.load(std::sync::atomic::Ordering::Relaxed),
+                guard_given_up: guard::GIVEN_UP.load(std::sync::atomic::Ordering::Relaxed),
+            };
+            response(200, "text/plain; charset=utf-8", metrics::render(&snap, &st.model_name, front).into_bytes())
+        }
         Err(e) => {
             response(503, "text/plain; charset=utf-8", format!("engine metrics unavailable: {}\n", e.0).into_bytes())
         }

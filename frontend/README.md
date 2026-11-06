@@ -65,6 +65,7 @@ On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 
 | `--default-thinking-budget` | 0 | `thinking_budget` for a chat request that names none, 0 or null (0 = no limit). A request with `logprobs` gets none. `./gr8 glm53 up` passes `DEFAULT_THINKING_BUDGET` when it is set. |
 | `--default-presence-penalty` / `--default-frequency-penalty` | 0 | `presence_penalty` / `frequency_penalty` for a request that names none, -2 to 2 (OpenAI's). A request's own value wins, 0 included. The engine lowers the logit of every token the reply already holds by `presence_penalty` + `frequency_penalty` x its count, before temperature and top-p. The prompt does not count (vLLM's semantics). Qwen recommends `presence_penalty` 1.5 for thinking models caught in repetition loops. A nonzero value needs an engine whose hello says `penalties` (g6m4 with the `pen` field, the pseudo engine), else 400. `./gr8 glm53 up` passes `DEFAULT_PRESENCE_PENALTY` / `DEFAULT_FREQUENCY_PENALTY` when they are set. |
 | `--default-thinking-presence-penalty` / `--default-thinking-frequency-penalty` | 0 | `thinking_presence_penalty` / `thinking_frequency_penalty` for a request that names none, -2 to 2. Added to the two above on the tokens inside the think block the prompt leaves open (a chat prompt's, until the reply writes `</think>`), over the same counts. A prompt that leaves no block open, such as the continuation after a `thinking_budget` close, never gets them. `./gr8 glm53 up` passes `DEFAULT_THINKING_PRESENCE_PENALTY` / `DEFAULT_THINKING_FREQUENCY_PENALTY` when they are set. |
+| `--tool-repeat-guard` | 0 | 1 = the repeated-tool-call guard, below. `./gr8 glm53 up` passes `TOOL_REPEAT_GUARD` and, when they differ from these defaults, `--tool-repeat-guard-repeats` (2), `--tool-repeat-guard-temperature` (0.7) and `--tool-repeat-guard-retries` (2). |
 | `--undeclared-tool-calls` | `text` | A call to a tool name the request did not declare. `text`: the call's text stays in `content` and the reply finishes `stop` (vLLM's glm47 parser). `emit`: it is a tool call like any other (`tool_calls`, `finish_reason: tool_calls`, streamed or not), so the client can answer it with its own unknown-tool error; the name must be an identifier (1-128 ASCII letters, digits, `_`, `-`, `.` or `:`, starting with a letter or `_`), the call arrives when the reply ends with it rather than as it is written (so prose after it keeps it prose), and the arguments are strings, having no schema. The rules that tell a call from prose about one are unchanged. `./gr8 glm53 up` passes `UNDECLARED_TOOL_CALLS` when it is `emit`. |
 | `--log-level` | `INFO` | |
 
@@ -116,6 +117,26 @@ mock engine with S2's reuse rule, TP=4's cold prefill rate (1,374 tokens/s) and 
 
 The front end logs each continuation's cached tokens (`thinking budget: the continuation took N of its M prompt
 tokens from the cache`).
+
+## Repeated tool calls (`--tool-repeat-guard`)
+
+An agent loop can make the model repeat one tool call turn after turn: at temperature 0 the same 35-token reply with
+the same call came 26 turns in a row, and at temperature 1.0 `run_tests({})` three times with the identical result. With
+the guard on, a chat reply whose tool calls equal the previous assistant turn's (name plus arguments as canonical JSON,
+the set of them when a turn has several) is taken back when that same set already ended the conversation
+`--tool-repeat-guard-repeats` turns in a row with identical tool results (the `tool` messages' content). A changed
+result or another call in between resets the count, so running the tests again after an edit is never blocked.
+
+The reply is cut back to just before the call block's `<tool_call>` and continued in a new engine run, the way a
+thinking budget continues after its close: temperature max(the request's, `--tool-repeat-guard-temperature`), top_p
+min(the request's, 0.95), a request seed moved by the attempt number. Text the client already received is never
+regenerated: while the guard is armed a call whose name is one of the previous turn's never streams live but is held
+until the reply ends, where the guard reads it first (other calls stream as always). After
+`--tool-repeat-guard-retries` resamples the call goes out as sampled, so the guard cannot loop. A request's
+`tool_repeat_guard: true|false` wins over the server default. A forced `tool_choice` is never guarded. GLM only: the
+DSML parser ends the reply at a call's closer and streams it, so it has nothing held to take back. One log line per
+resample names the call and the attempt; `/metrics` counts `gr8:tool_repeat_retries_total` and
+`gr8:tool_repeat_given_up_total`.
 
 ## Per-request step counters (`return_step_stats`)
 

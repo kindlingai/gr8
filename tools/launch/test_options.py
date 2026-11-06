@@ -175,6 +175,14 @@ class ValidateTests(unittest.TestCase):
         self.assertEqual((o.get('DEFAULT_PRESENCE_PENALTY'), o.get('DEFAULT_FREQUENCY_PENALTY'),
                           o.get('DEFAULT_THINKING_PRESENCE_PENALTY'), o.get('DEFAULT_THINKING_FREQUENCY_PENALTY')),
                          ('1.5', '0', '0', '-0.5'))
+        self.check(['--peers', PEERS, '--tool-repeat-guard', 'yes'], 'want 0 or 1')
+        self.check(['--peers', PEERS, '--tool-repeat-guard-repeats', '0'], 'want a whole number from 1')
+        self.check(['--peers', PEERS, '--tool-repeat-guard-temperature', '3'], 'want a number from 0 to 2')
+        self.check(['--peers', PEERS, '--tool-repeat-guard-retries', '-1'], 'want a whole number')
+        o = opt.parse(['--no-config', '--peers', PEERS, '--tool-repeat-guard', '1', '--tool-repeat-guard-retries', '3'], GLM)
+        opt.validate(o)
+        self.assertEqual((o.get('TOOL_REPEAT_GUARD'), o.get('TOOL_REPEAT_GUARD_REPEATS'), o.get('TOOL_REPEAT_GUARD_TEMPERATURE'),
+                          o.get('TOOL_REPEAT_GUARD_RETRIES')), ('1', '2', '0.7', '3'))
         self.check(['--peers', PEERS, '--allow-thinking-off', 'yes'], 'want 0 or 1')
         self.check(['--peers', PEERS, '--undeclared-tool-calls', 'on'], 'want text or emit')
         self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('UNDECLARED_TOOL_CALLS'), 'text')

@@ -381,6 +381,18 @@ class FrontTests(unittest.TestCase):
         self.assertEqual(a[a.index('--default-thinking-presence-penalty') + 1], '1')
         self.assertNotIn('--default-thinking-frequency-penalty', a)
 
+    def test_the_tool_repeat_guard_reaches_the_front_end_when_on(self):
+        a = self.front_argv()
+        self.assertNotIn('--tool-repeat-guard', a)
+        a = self.front_argv('--tool-repeat-guard', '1')
+        self.assertEqual(a[a.index('--tool-repeat-guard') + 1], '1')
+        self.assertNotIn('--tool-repeat-guard-repeats', a)   # the defaults stay the front end's own
+        a = self.front_argv('--tool-repeat-guard', '1', '--tool-repeat-guard-repeats', '3',
+                            '--tool-repeat-guard-temperature', '1', '--tool-repeat-guard-retries', '1')
+        self.assertEqual(a[a.index('--tool-repeat-guard-repeats') + 1], '3')
+        self.assertEqual(a[a.index('--tool-repeat-guard-temperature') + 1], '1')
+        self.assertEqual(a[a.index('--tool-repeat-guard-retries') + 1], '1')
+
     def test_the_thinking_defaults_reach_the_front_end_only_when_set(self):
         a = self.front_argv()
         self.assertNotIn('--default-reasoning-effort', a)

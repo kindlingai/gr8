@@ -972,6 +972,12 @@ class Supervisor:
                   'DEFAULT_THINKING_FREQUENCY_PENALTY'):
             if float(o.get(k)) != 0:
                 front += ['--' + k.lower().replace('_', '-'), o.get(k)]
+        if o.get('TOOL_REPEAT_GUARD') == '1':
+            front += ['--tool-repeat-guard', '1']
+            for k, dflt in (('TOOL_REPEAT_GUARD_REPEATS', '2'), ('TOOL_REPEAT_GUARD_TEMPERATURE', '0.7'),
+                            ('TOOL_REPEAT_GUARD_RETRIES', '2')):
+                if o.get(k) != dflt:
+                    front += ['--' + k.lower().replace('_', '-'), o.get(k)]
         if o.get('ALLOW_THINKING_OFF') == '1' and model.dialect == 'glm':   # ds41 turns thinking off by itself
             front += ['--allow-thinking-off']
         if o.get('UNDECLARED_TOOL_CALLS') != 'text':

@@ -10,6 +10,7 @@ mod dsparser;
 mod engine;
 mod gen;
 mod grammar;
+mod guard;
 mod jsonmode;
 mod logprobs;
 mod metrics;
@@ -61,6 +62,8 @@ pub struct State {
     pub grammars: grammar::Grammars,
     /// `--undeclared-tool-calls emit`: a call to a tool the request did not declare comes back as a call, not text
     pub emit_undeclared: bool,
+    /// the repeated-tool-call guard's settings (`--tool-repeat-guard*`; a request's `tool_repeat_guard` wins)
+    pub guard: guard::Config,
     pub started: u64,
     /// HOST:PORT of the head's supervisor, which runs the cluster's self-checks for /health?deep
     pub supervisor: Option<String>,
@@ -92,6 +95,7 @@ struct Args {
     default_frequency: f64,
     default_thinking_presence: f64,
     default_thinking_frequency: f64,
+    guard: guard::Config,
 }
 
 const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--host H] [--port N]
@@ -104,6 +108,8 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--default-thinking-budget N] [--allow-thinking-off]
                   [--default-presence-penalty F] [--default-frequency-penalty F]
                   [--default-thinking-presence-penalty F] [--default-thinking-frequency-penalty F]
+                  [--tool-repeat-guard 0|1] [--tool-repeat-guard-repeats N] [--tool-repeat-guard-temperature F]
+                  [--tool-repeat-guard-retries N]
                   [--undeclared-tool-calls text|emit] [--supervisor HOST:PORT]";
 
 fn parse_args() -> Result<Args, String> {
@@ -132,6 +138,7 @@ fn parse_args() -> Result<Args, String> {
         default_frequency: 0.0,
         default_thinking_presence: 0.0,
         default_thinking_frequency: 0.0,
+        guard: guard::Config::default(),
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -180,6 +187,31 @@ fn parse_args() -> Result<Args, String> {
                     next(&mut i, &flag, inline)?.parse().map_err(|_| "--default-thinking-budget: not a number")?
             }
             "--allow-thinking-off" => a.allow_thinking_off = true,
+            "--tool-repeat-guard" => {
+                a.guard.on = match next(&mut i, &flag, inline)?.as_str() {
+                    "1" => true,
+                    "0" => false,
+                    _ => return Err("--tool-repeat-guard: want 0 or 1".into()),
+                }
+            }
+            "--tool-repeat-guard-repeats" | "--tool-repeat-guard-retries" => {
+                let v: u32 = next(&mut i, &flag, inline)?.parse().map_err(|_| format!("{flag}: not a whole number"))?;
+                if flag == "--tool-repeat-guard-repeats" {
+                    if v == 0 {
+                        return Err("--tool-repeat-guard-repeats: want 1 or more".into());
+                    }
+                    a.guard.repeats = v
+                } else {
+                    a.guard.retries = v
+                }
+            }
+            "--tool-repeat-guard-temperature" => {
+                let v: f64 = next(&mut i, &flag, inline)?.parse().map_err(|_| format!("{flag}: not a number"))?;
+                if !v.is_finite() || !(0.0..=2.0).contains(&v) {
+                    return Err(format!("{flag}: want a number in [0, 2]"));
+                }
+                a.guard.temperature = v
+            }
             "--default-presence-penalty"
             | "--default-frequency-penalty"
             | "--default-thinking-presence-penalty"
@@ -369,6 +401,7 @@ async fn serve(args: Args) -> Result<(), String> {
         thinking: thinking_defaults,
         grammars,
         emit_undeclared: args.emit_undeclared,
+        guard: args.guard,
         started: util::now_secs(),
         supervisor: args.supervisor,
     }));

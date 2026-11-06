@@ -326,6 +326,18 @@ def validate(o):
             v = math.nan
         if not -2 <= v <= 2:
             raise OptionError(f'--{k.lower().replace("_", "-")} {o.get(k)}: want a number from -2 to 2 (0 = off)')
+    if o.get('TOOL_REPEAT_GUARD') not in ('0', '1'):
+        raise OptionError(f'--tool-repeat-guard {o.get("TOOL_REPEAT_GUARD")}: want 0 or 1')
+    if not (str(o.get('TOOL_REPEAT_GUARD_REPEATS')).isdigit() and int(o.get('TOOL_REPEAT_GUARD_REPEATS')) >= 1):
+        raise OptionError(f'--tool-repeat-guard-repeats {o.get("TOOL_REPEAT_GUARD_REPEATS")}: want a whole number from 1')
+    if not str(o.get('TOOL_REPEAT_GUARD_RETRIES')).isdigit():
+        raise OptionError(f'--tool-repeat-guard-retries {o.get("TOOL_REPEAT_GUARD_RETRIES")}: want a whole number')
+    try:
+        gt = float(o.get('TOOL_REPEAT_GUARD_TEMPERATURE'))
+    except (TypeError, ValueError):
+        gt = math.nan
+    if not 0 <= gt <= 2:
+        raise OptionError(f'--tool-repeat-guard-temperature {o.get("TOOL_REPEAT_GUARD_TEMPERATURE")}: want a number from 0 to 2')
     if not str(o.get('DEFAULT_THINKING_BUDGET')).isdigit():
         raise OptionError(f'--default-thinking-budget {o.get("DEFAULT_THINKING_BUDGET")}: want a whole number '
                           '(0 = no limit)')

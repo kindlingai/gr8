@@ -194,6 +194,32 @@ options:
     doc: >-
       the head's front end: thinking_frequency_penalty for a request that names none, -2 to 2. Added to
       frequency_penalty inside the think block, as DEFAULT_THINKING_PRESENCE_PENALTY. 0 = off
+  TOOL_REPEAT_GUARD:
+    scope: box
+    default: "0"
+    doc: >-
+      the head's front end: 1 = a reply that makes the same tool call the last TOOL_REPEAT_GUARD_REPEATS assistant
+      turns made, with identical tool results each time, is taken back before the client sees it and resampled from
+      just before the call at temperature max(the request's, TOOL_REPEAT_GUARD_TEMPERATURE) and top_p min(the
+      request's, 0.95). A changed result or another call in between resets the count. After TOOL_REPEAT_GUARD_RETRIES
+      resamples the call goes out as sampled. A request's tool_repeat_guard field wins. GLM only
+      (frontend/README.md, "Repeated tool calls")
+  TOOL_REPEAT_GUARD_REPEATS:
+    scope: box
+    default: "2"
+    doc: >-
+      the head's front end: turns in a row, ending the conversation, that must already have made the same call with the
+      same result before the guard takes a repeat back (1 or more)
+  TOOL_REPEAT_GUARD_TEMPERATURE:
+    scope: box
+    default: "0.7"
+    doc: >-
+      the head's front end: the resample's temperature floor, 0 to 2
+  TOOL_REPEAT_GUARD_RETRIES:
+    scope: box
+    default: "2"
+    doc: >-
+      the head's front end: resamples per request before the repeated call goes out as sampled
   ALLOW_THINKING_OFF:
     scope: box
     default: "0"
