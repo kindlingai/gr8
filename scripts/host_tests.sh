@@ -105,6 +105,11 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/n
 (cd "$REPO/tools/ngram/tests" && NGRAM_LOOKUP_CHECK="$T/ngram_lookup_check" python3 -m unittest -q test_ngram.ExportTest)
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_dflreuse_test.cpp" -o "$T/batch_dflreuse_test" "${KNOBS[@]}"
 "$T/batch_dflreuse_test"
+# GLM-5.3-Flash, DFlash2 with session checkpoints (#340): the prefill taps' owner and the drafter's start after a
+# checkpoint hit (s2/flash_dfl_window.h), driving a Batch through an agent's turns at 32K and 128K
+g++ -std=c++17 -O2 -Wall -Wextra -fsanitize=address,undefined -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/flash_dfl_window_test.cpp" \
+  -o "$T/flash_dfl_window_test" "${KVLIB[@]}"
+"$T/flash_dfl_window_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_insert_test.cpp" -o "$T/batch_insert_test" "${KNOBS[@]}"
 "$T/batch_insert_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_kstop_test.cpp" -o "$T/batch_kstop_test" "${KNOBS[@]}"
