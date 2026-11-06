@@ -45,9 +45,9 @@ pub struct CPayload {
 }
 
 /// g6s2_drv_pool: the pool calls the driver makes itself on the pool passed to g6s2_driver_new. grow: runs grow before
-/// a round (then the grown hook). shrink: a worker's half of a shrink commit, before the shrink hook. release: a
-/// leaving session's run goes back to the pool (no prefix reuse; retain and park stay in the hooks). head: this rank
-/// made the commit's cancel and shrink calls when it built the commit, so the driver skips them
+/// a round (then the grown hook, required). shrink: a worker's half of a shrink commit, before the shrink hook.
+/// release: a leaving session's run goes back to the pool (no prefix reuse; retain and park stay in the hooks). head:
+/// this rank made the commit's cancel and shrink calls when it built the commit, so the driver skips them
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CPool {
@@ -270,7 +270,7 @@ impl Driver {
         if h.bind.is_none() || h.retire.is_none() || h.prefill.is_none() || h.payload.is_none() || n == 0 || n > QMAX {
             return None;
         }
-        if ((u.grow || u.shrink || u.release) && pool.is_null()) || (u.grow && h.has_grow) {
+        if ((u.grow || u.shrink || u.release) && pool.is_null()) || (u.grow && (h.has_grow || !h.has_grown)) {
             return None;
         }
         let mut s = [empty; QMAX];
@@ -544,7 +544,7 @@ impl Driver {
                 match got {
                     None => stalled[k.slot as usize] = true,
                     Some(r) if r != x.run => {
-                        if !self.h.has_grow && self.h.has_grown {
+                        if !self.h.has_grow {
                             // SAFETY: as above; r outlives the call
                             ok(unsafe { self.h.grown.ok_or_else(missing)?(self.h.ctx, &x, &r) })?;
                         }
@@ -1118,13 +1118,17 @@ mod tests {
         let pool = Handle::new(g6kvman::Pool::new(64, 64, 64 * 64).unwrap());
         let t = PoolTest { len: Cell::new(10), step: 16, grown: Cell::new(0), pool: &pool };
         let u = CPool { grow: true, ..Default::default() };
-        // the grow hook and the driver's growth together, or pool calls without a pool, are refused
+        // the grow hook and the driver's growth together, the driver's growth without the grown hook, or pool calls
+        // without a pool, are refused
         let z: CHooks = unsafe { std::mem::zeroed() };
         let p: CPlanner = unsafe { std::mem::zeroed() };
         let h = CHooks { bind: Some(b_), retire: Some(s_), prefill: Some(p_), payload: Some(y_), has_grow: true, ..z };
         assert!(Driver::new(h, p, decode_config(), 8, slot(0, 0, FREE), &pool, u).is_none());
         let h = CHooks { has_grow: false, ..h };
+        assert!(Driver::new(h, p, decode_config(), 8, slot(0, 0, FREE), &pool, u).is_none());
+        let h = CHooks { grown: Some(grown_), has_grown: true, ..h };
         assert!(Driver::new(h, p, decode_config(), 8, slot(0, 0, FREE), std::ptr::null(), u).is_none());
+        assert!(Driver::new(h, p, decode_config(), 8, slot(0, 0, FREE), &pool, u).is_some());
 
         let d = pool_driver(&t, decode_config(), u);
         seat(&d, &pool, 64, 64 * 20);

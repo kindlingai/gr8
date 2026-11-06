@@ -463,7 +463,7 @@ struct g6s2_drv_planner {
 struct g6s2_driver;
 // a driver with n slots over c, each slot `empty` (the C++ default) before it is keyed, making the pool calls u names
 // on pool (null: none; it must outlive the driver). Null when bind, retire, prefill or payload is missing, n is not in
-// 1..G6SCH_QMAX, u names a call without a pool, or both the grow hook and u.grow are set
+// 1..G6SCH_QMAX, u names a call without a pool, or u.grow is set with the grow hook or without the grown hook
 g6s2_driver* g6s2_driver_new(const g6s2_drv_hooks* h, const g6s2_drv_planner* p, const g6sch_config* c, size_t n,
                              const g6sch_slot* empty, g6kv_pool* pool, const g6s2_drv_pool* u);
 void g6s2_driver_free(g6s2_driver* d);

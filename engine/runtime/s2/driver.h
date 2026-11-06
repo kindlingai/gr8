@@ -71,9 +71,9 @@ struct DriverHooks {
 };
 // The pool calls the Rust driver makes itself on the rank's pool (pool.h RunPool::handle; the pool must outlive the
 // Driver), each under the pool's lock for that call alone and with no hook running. grow: runs grow before a round
-// (then DriverHooks::grown). shrink: a worker's half of a shrink commit, checked against the head's, before the shrink
-// hook. release: a session's run goes back when it leaves (no prefix reuse: retain and park stay in the retire and
-// finished hooks). head: this rank made the commit's cancel and shrink calls itself when it built the commit
+// (then DriverHooks::grown, required). shrink: a worker's half of a shrink commit, checked against the head's, before
+// the shrink hook. release: a session's run goes back when it leaves (no prefix reuse: retain and park stay in the
+// retire and finished hooks). head: this rank made the commit's cancel and shrink calls itself when it built the commit
 struct DriverPool { g6kv_pool* pool = nullptr; bool grow = false, shrink = false, release = false, head = false; };
 class Driver {
     struct Impl {
@@ -242,6 +242,7 @@ public:
         require(bool(k.bind) && bool(k.retire) && bool(k.prefill) && bool(k.run) && bool(k.emit), "missing driver callback");
         require(pool.pool || !(pool.grow || pool.shrink || pool.release), "driver pool calls without a pool");
         require(!(pool.grow && k.grow), "the grow hook and the driver's pool growth together");
+        require(!pool.grow || bool(k.grown), "the driver's pool growth without the grown hook");
         const g6s2_drv_hooks hooks{&m, Impl::t_bind, Impl::t_retire, Impl::t_prefill, Impl::t_prefill_pack, Impl::t_dfl_ok,
                                    Impl::t_terminal, Impl::t_grow, Impl::t_finished, Impl::t_resize, Impl::t_shrink,
                                    Impl::t_settle, Impl::t_payload, Impl::t_grown, bool(k.prefill_pack), bool(k.dfl_ok),
