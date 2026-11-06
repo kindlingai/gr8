@@ -1,6 +1,6 @@
 # Working on this repo
 
-gr8 serves the full GLM 5.3 on three, four or six GB10 boxes, and every change has to keep its numbers. Most of what follows is
+gr8 serves GLM-5.3, GLM-5.3-Flash and DeepSeek-V4.1-Flash on GB10 boxes, and every change has to keep its numbers. Most of what follows is
 about proving a change does, before it lands.
 
 If you're an agent working here, read this whole file first. If you're a person, the same rules apply to you.
@@ -91,9 +91,10 @@ Run `main` once on the same boxes with the same options and keep its JSON report
 
 ## kindling.json
 
-`kindling.json` is the README's results table in a form a program can read. When a PR changes the table, it changes
-`kindling.json` in the same PR, with the same numbers and rounding. Leave out a number that wasn't measured; don't
-write 0 or an estimate. Check it parses: `python3 -m json.tool kindling.json`.
+`kindling.json` is GLM-5.3's results table ([docs/GLM-5.3.md](docs/GLM-5.3.md#results)) in a form a program can
+read. When a PR changes the table, it changes `kindling.json` in the same PR, with the same numbers and rounding.
+Leave out a number that wasn't measured; don't write 0 or an estimate. Check it parses:
+`python3 -m json.tool kindling.json`.
 
 ## Things worth knowing
 
