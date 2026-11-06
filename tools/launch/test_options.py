@@ -172,14 +172,18 @@ class ValidateTests(unittest.TestCase):
         self.check(['--peers', PEERS, '--default-presence-penalty', 'greedy=1,greedy=1'], 'given twice')
         self.check(['--peers', PEERS, '--default-presence-penalty', 'greedy=3'], 'must be in -2..2')
         self.check(['--peers', PEERS, '--default-presence-penalty', 'base=1.5,greedy=1'], 'must be in -2..2')
-        self.check(['--peers', PEERS, '--default-presence-penalty', 'base=1,thinking=*3'], 'must be in -2..2')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'thinking=2.5*1'], 'must be in -2..2')
         self.check(['--peers', PEERS, '--default-presence-penalty', 'base=1**2'], 'is not a multiplier')
         self.check(['--peers', PEERS, '--default-presence-penalty', 'base=*-1'], 'want a finite number, 0 or more')
         self.check(['--peers', PEERS, '--default-presence-penalty', '+'], 'is not a number')
         self.check(['--peers', PEERS, '--default-presence-penalty', 'base=1,temperature=*1.5'], 'at temperature 2')
         self.check(['--peers', PEERS, '--default-presence-penalty', 'temperature=+1.5'], 'must be in -2..2')
         self.check(['--peers', PEERS, '--default-presence-penalty', 'base=-1,temperature=+1.5*1'], 'must be in -2..2')
-        for ok in ('+0.5', '*1.1', '+0.1*1.1', 'thinking=+0.1*1.1,greedy=*2', 'base=-0.1 * 0.5', 'base=1,temperature=*1',
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'greedy=0.1,greedy.base=0.1'], 'given twice')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'sampling.thinking=1'], 'want base=')
+        self.check(['--peers', PEERS, '--default-presence-penalty', 'base=1,greedy.thinking=1.5'], 'must be in -2..2')
+        for ok in ('greedy=0.2,greedy.thinking=0.5', 'thinking=0.5,nongreedy.thinking=*0', 'greedy.base=0.2,nongreedy.base=0',
+                   '+0.5', '*1.1', '+0.1*1.1', 'thinking=+0.1*1.1,greedy=*2', 'base=-0.1 * 0.5', 'base=1,temperature=*1',
                    'temperature=+1', 'base=-1,temperature=+0.75*1', 'thinking=0.5,greedy=0.2,nongreedy=0'):
             opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-frequency-penalty', ok], GLM))
         o = opt.parse(['--no-config', '--peers', PEERS, '--default-presence-penalty', 'thinking=0.5, greedy=0.2,nongreedy=0',

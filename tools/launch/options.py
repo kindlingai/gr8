@@ -260,8 +260,8 @@ def mode(o):
 def penalty_spec_error(spec):
     """Why `spec` is not a penalty spec (the front end's sampling.rs PenaltySpec::parse), or None. A part is
     `[+]A[*M]`, an amount and a multiplier; the spec is one part (the base) or a comma list of base=, thinking=,
-    greedy=, nongreedy= and temperature= parts, each once. Every combination of matching parts must resolve within
-    -2..2 at every temperature from 0 to 2."""
+    greedy=, nongreedy=, greedy.thinking=, nongreedy.thinking= and temperature= parts, each once (greedy.base= is
+    greedy=). Every combination of the operator's parts must resolve within -2..2 at every temperature from 0 to 2."""
     def part(v):
         v = v.strip()
         add, star, mul = v.partition('*')
@@ -282,7 +282,10 @@ def penalty_spec_error(spec):
             if math.isnan(m) or math.isinf(m) or m < 0:
                 return None, f'multiplier {mul!r}: want a finite number, 0 or more'
         return (a, m), None
-    parts = {k: (0.0, None) for k in ('base', 'thinking', 'greedy', 'nongreedy', 'temperature')}
+    names = {'base': 'base', 'thinking': 'thinking', 'greedy': 'greedy', 'greedy.base': 'greedy', 'nongreedy': 'nongreedy',
+             'nongreedy.base': 'nongreedy', 'greedy.thinking': 'greedy.thinking', 'nongreedy.thinking': 'nongreedy.thinking',
+             'temperature': 'temperature'}
+    parts = {k: (0.0, None) for k in set(names.values())}
     if '=' not in spec:
         parts['base'], err = part(spec)
         if err:
@@ -291,9 +294,10 @@ def penalty_spec_error(spec):
         seen = set()
         for item in spec.split(','):
             key, sep, value = item.partition('=')
-            key = key.strip()
-            if not sep or key not in parts:
-                return f'{item.strip()!r}: want base=, thinking=, greedy=, nongreedy= or temperature='
+            key = names.get(key.strip())
+            if not sep or key is None:
+                return (f'{item.strip()!r}: want base=, thinking=, greedy=, nongreedy=, greedy.thinking=, '
+                        'nongreedy.thinking= or temperature=')
             if key in seen:
                 return f'{key} is given twice'
             seen.add(key)
@@ -304,9 +308,9 @@ def penalty_spec_error(spec):
         return 1.0 if parts[k][1] is None else parts[k][1]
     (ba, _), (ta, _), (xa, xb) = parts['base'], parts['thinking'], parts['temperature']
     for cond in ('greedy', 'nongreedy'):
-        ga = parts[cond][0]
+        ga, gta = parts[cond][0], parts[cond + '.thinking'][0]
         rest_out = (ba + ga) * factor('base') * factor(cond)
-        rest_in = (ba + ga + ta) * factor('base') * factor(cond) * factor('thinking')
+        rest_in = rest_out + (ta + gta) * factor('thinking') * factor(cond + '.thinking')
         # (rest + A T) * (B T) is a quadratic in T: its extremes on 0..2 are at the ends or at its vertex
         ts = [0.0, 2.0]
         if xb is not None and xb and xa:

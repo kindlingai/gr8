@@ -57,17 +57,22 @@ impl Part {
 
 /// A server-default penalty (`--default-presence-penalty SPEC`, `--default-frequency-penalty SPEC`): the parts that
 /// make up a request's penalty. SPEC is one part (the base alone) or a comma list of `base=`, `thinking=`, `greedy=`,
-/// `nongreedy=` and `temperature=` parts. For a token, the amounts of the parts whose condition matches add up, and the
-/// product of their multipliers scales the sum: base always, greedy or nongreedy by the request's temperature, thinking
-/// inside the think block. The temperature part is a last stage over that: (rest + A * T) * (B * T) with the request's
-/// temperature T, the `* (B * T)` only when `*B` was written. A spec is refused when any combination, at any T in
-/// [0, 2], resolves outside [-2, 2].
+/// `nongreedy=`, `greedy.thinking=`, `nongreedy.thinking=` and `temperature=` parts (`greedy.base=` is `greedy=`).
+/// The operator's amounts add up within each total and their multipliers compound: the whole reply's from base and
+/// the condition the request's temperature picks, the think block's addition from thinking and that condition's
+/// thinking part. The temperature part is a last stage over the operator's totals: (total + A * T) * (B * T), the
+/// `* (B * T)` only when `*B` was written. A request's own value replaces the operator's base amount and is added
+/// after all of that, unscaled, and its thinking value replaces the operator's thinking amount the same way (the
+/// conditions' parts stay), so no condition multiplier reaches a value the client set. A spec is refused when any combination, at any T in [0, 2],
+/// resolves outside [-2, 2].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PenaltySpec {
     pub base: Part,
     pub thinking: Part,
     pub greedy: Part,
     pub nongreedy: Part,
+    pub greedy_thinking: Part,
+    pub nongreedy_thinking: Part,
     pub temperature: Part,
 }
 
@@ -100,18 +105,24 @@ impl PenaltySpec {
             for part in s.split(',') {
                 let (key, value) = part.split_once('=').ok_or_else(|| format!("{part:?}: want key=value"))?;
                 let key = key.trim();
-                let slot = match key {
-                    "base" => &mut spec.base,
-                    "thinking" => &mut spec.thinking,
-                    "greedy" => &mut spec.greedy,
-                    "nongreedy" => &mut spec.nongreedy,
-                    "temperature" => &mut spec.temperature,
-                    _ => return Err(format!("{key:?}: want base, thinking, greedy, nongreedy or temperature")),
+                let (slot, name) = match key {
+                    "base" => (&mut spec.base, "base"),
+                    "thinking" => (&mut spec.thinking, "thinking"),
+                    "greedy" | "greedy.base" => (&mut spec.greedy, "greedy"),
+                    "nongreedy" | "nongreedy.base" => (&mut spec.nongreedy, "nongreedy"),
+                    "greedy.thinking" => (&mut spec.greedy_thinking, "greedy.thinking"),
+                    "nongreedy.thinking" => (&mut spec.nongreedy_thinking, "nongreedy.thinking"),
+                    "temperature" => (&mut spec.temperature, "temperature"),
+                    _ => {
+                        return Err(format!(
+                            "{key:?}: want base, thinking, greedy, nongreedy, greedy.thinking, nongreedy.thinking or temperature"
+                        ))
+                    }
                 };
-                if seen.contains(&key) {
-                    return Err(format!("{key} is given twice"));
+                if seen.contains(&name) {
+                    return Err(format!("{name} is given twice"));
                 }
-                seen.push(key);
+                seen.push(name);
                 *slot = Part::parse(value)?;
             }
         }
@@ -123,7 +134,7 @@ impl PenaltySpec {
     /// extremes on the interval are at its ends or its vertex.
     fn check(&self) -> Result<(), String> {
         for greedy in [true, false] {
-            let (rest_out, rest_in) = self.rests(self.base.add, self.thinking.add, greedy);
+            let (rest_out, rest_in) = self.rests(None, None, greedy);
             let mut ts = vec![0.0, 2.0];
             if let Some(b) = self.temperature.mul {
                 // f(T) = (rest + A T) B T: the vertex at -rest / (2 A), for out, in and their difference
@@ -134,7 +145,7 @@ impl PenaltySpec {
                 }
             }
             for t in ts.into_iter().filter(|t| (0.0..=2.0).contains(t)) {
-                let r = self.at(rest_out, rest_in, t);
+                let r = self.at(rest_out, rest_in, t, 0.0, 0.0);
                 if !r.ok() {
                     return Err(format!(
                         "resolves to {} outside the think block and {} inside for a {} request at temperature {t}; \
@@ -149,28 +160,31 @@ impl PenaltySpec {
         Ok(())
     }
 
-    /// The totals before the temperature stage, with `base_add` and `thinking_add` in place of the base's and the
-    /// thinking part's amounts.
-    fn rests(&self, base_add: f64, thinking_add: f64, greedy: bool) -> (f64, f64) {
-        let gn = if greedy { self.greedy } else { self.nongreedy };
+    /// The operator's totals before the temperature stage: the whole reply's, and that plus the think block's
+    /// addition. A request value given for the base or the thinking amount takes that amount out (it is added after
+    /// the stage, unscaled).
+    fn rests(&self, value: Option<f64>, thinking: Option<f64>, greedy: bool) -> (f64, f64) {
+        let (gn, gt) =
+            if greedy { (self.greedy, self.greedy_thinking) } else { (self.nongreedy, self.nongreedy_thinking) };
+        let base_add = if value.is_some() { 0.0 } else { self.base.add };
+        let think_add = if thinking.is_some() { 0.0 } else { self.thinking.add };
         let out = (base_add + gn.add) * (self.base.factor() * gn.factor());
-        let inside = (base_add + gn.add + thinking_add) * (self.base.factor() * gn.factor() * self.thinking.factor());
-        (out, inside)
+        let think = (think_add + gt.add) * (self.thinking.factor() * gt.factor());
+        (out, out + think)
     }
 
-    /// The temperature stage at `t`.
-    fn at(&self, rest_out: f64, rest_in: f64, t: f64) -> Resolved {
+    /// The temperature stage at `t` over the operator's totals, then the request's own values on top.
+    fn at(&self, rest_out: f64, rest_in: f64, t: f64, value: f64, thinking: f64) -> Resolved {
         let stage = |rest: f64| (rest + self.temperature.add * t) * self.temperature.mul.map_or(1.0, |b| b * t);
-        Resolved { out: stage(rest_out), inside: stage(rest_in) }
+        Resolved { out: stage(rest_out) + value, inside: stage(rest_in) + value + thinking }
     }
 
-    /// A request's penalty at temperature `t`: its own `value` replaces the base's amount (the multiplier stays) and
-    /// its own `thinking` the thinking part's amount. Err: whether the whole reply's total left [-2, 2] (else the
-    /// difference inside the block did), with the totals.
+    /// A request's penalty at temperature `t`: its own `value` replaces the operator's base amount and its own
+    /// `thinking` the operator's thinking amount, both added unscaled. The conditions' parts stay. Err: whether the whole reply's total left
+    /// [-2, 2] (else the difference inside the block did), with the totals.
     pub fn resolve(&self, value: Option<f64>, thinking: Option<f64>, t: f64) -> Result<Resolved, (bool, Resolved)> {
-        let (rest_out, rest_in) =
-            self.rests(value.unwrap_or(self.base.add), thinking.unwrap_or(self.thinking.add), t == 0.0);
-        let r = self.at(rest_out, rest_in, t);
+        let (rest_out, rest_in) = self.rests(value, thinking, t == 0.0);
+        let r = self.at(rest_out, rest_in, t, value.unwrap_or(0.0), thinking.unwrap_or(0.0));
         if r.ok() {
             Ok(r)
         } else {
@@ -851,6 +865,13 @@ mod tests {
         assert_eq!(p("temperature=*1").temperature, part(0.0, Some(1.0)));
         assert_eq!(p("temperature=+0.1").temperature, part(0.1, None));
         assert_eq!(p("temperature=0.1*0.5").temperature, part(0.1, Some(0.5)));
+        // the condition-scoped thinking parts, and greedy.base as another name for greedy
+        let s = p("greedy=0.2,greedy.thinking=0.5,nongreedy.thinking=*0");
+        assert_eq!(
+            (s.greedy, s.greedy_thinking, s.nongreedy_thinking),
+            (part(0.2, None), part(0.5, None), part(0.0, Some(0.0)))
+        );
+        assert_eq!(p("greedy.base=0.2,nongreedy.base=-0.1"), p("greedy=0.2,nongreedy=-0.1"));
         for bad in [
             "x",
             "2.5",
@@ -872,13 +893,17 @@ mod tests {
             "base=1*x",
             "temperature=",
             "temperature=*",
+            "greedy=0.1,greedy.base=0.1",
+            "greedy.thinking=1,greedy.thinking=1",
+            "sampling.thinking=1",
             // in range part by part, outside it in combination
             "base=1.5,greedy=1",
             "base=1,thinking=1.5",
             "base=1*1.5,greedy=0.5",
             "base=1,nongreedy=-3.5",
             "base=2,thinking=-2.5*1",
-            "base=-1,thinking=*4",
+            "base=1,greedy.thinking=1.5",
+            "thinking=1,nongreedy.thinking=1.5",
             // outside it at some temperature in [0, 2]
             "base=1,temperature=*1.5",
             "temperature=+1.5",
@@ -888,7 +913,7 @@ mod tests {
             assert!(PenaltySpec::parse(bad).is_err(), "{bad}");
         }
         // the difference inside the block is what the engine takes, so it is bounded too
-        assert!(PenaltySpec::parse("base=1,thinking=*3").is_err());
+        assert!(PenaltySpec::parse("thinking=2.5*1").is_err());
         assert!(PenaltySpec::parse("base=-1,thinking=1.5").is_ok());
         // temperature forms that stay within the range over 0..2
         for ok in [
@@ -902,28 +927,32 @@ mod tests {
         }
         // a vertex inside the interval: (-1 + 0.75 T) T dips to -1/3 at T = 2/3 and reaches 1 at T = 2. With 1.5 the
         // top at T = 2 is 4
-        assert!(PenaltySpec::parse("base=-1,temperature=+1.5*1").is_err()); // 4 at T = 2
+        assert!(PenaltySpec::parse("base=-1,temperature=+1.5*1").is_err());
         assert!(PenaltySpec::parse("base=-1,temperature=+0.75*1").is_ok());
     }
 
     #[test]
     fn parts_add_and_their_multipliers_compound() {
         let s = PenaltySpec::parse("base=0.2*1.5,thinking=+0.1*1.1,greedy=0.3*2,nongreedy=-0.1").unwrap();
-        // greedy: out = (0.2 + 0.3) * (1.5 * 2) = 1.5; in = (0.2 + 0.3 + 0.1) * (1.5 * 2 * 1.1) = 1.98
+        // greedy: out = (0.2 + 0.3) * (1.5 * 2) = 1.5, and the block adds 0.1 * 1.1 = 0.11
         let r = s.resolve(None, None, 0.0).unwrap();
-        assert!(near(r.out, 1.5) && near(r.inside, 1.98) && near(r.extra(), 0.48));
-        // sampling: out = (0.2 - 0.1) * 1.5 = 0.15; in = (0.2 - 0.1 + 0.1) * (1.5 * 1.1) = 0.33
+        assert!(near(r.out, 1.5) && near(r.inside, 1.61) && near(r.extra(), 0.11));
+        // sampling: out = (0.2 - 0.1) * 1.5 = 0.15
         let r = s.resolve(None, None, 1.0).unwrap();
-        assert!(near(r.out, 0.15) && near(r.inside, 0.33));
-        // the request's value replaces the base's amount, not its multiplier. The same for thinking
+        assert!(near(r.out, 0.15) && near(r.inside, 0.26));
+        // the request's value takes the base amount out and is added after the multipliers. The same for thinking
         let r = s.resolve(Some(0.0), None, 0.0).unwrap();
-        assert!(near(r.out, 0.9) && near(r.inside, 1.32));
+        assert!(near(r.out, 0.9) && near(r.inside, 1.01));
+        let r = s.resolve(Some(0.5), None, 0.0).unwrap();
+        assert!(near(r.out, 1.4) && near(r.inside, 1.51));
         let r = s.resolve(None, Some(0.0), 0.0).unwrap();
-        assert!(near(r.out, 1.5) && near(r.inside, 1.65));
+        assert!(near(r.out, 1.5) && near(r.inside, 1.5));
+        let r = s.resolve(None, Some(0.25), 0.0).unwrap();
+        assert!(near(r.extra(), 0.25));
         // an override that leaves the range names the total that did
-        assert!(s.resolve(Some(1.0), None, 0.0).unwrap_err().0); // out = 3.9
-        let s = PenaltySpec::parse("thinking=*1.5").unwrap();
-        assert!(!s.resolve(Some(2.0), None, 1.0).unwrap_err().0); // out 2, inside 3
+        assert!(s.resolve(Some(1.5), None, 0.0).unwrap_err().0); // out = 2.4
+        let s = PenaltySpec::parse("thinking=0.5*1.5").unwrap();
+        assert!(!s.resolve(Some(2.0), None, 1.0).unwrap_err().0); // out 2, inside 2.75
         assert_eq!(
             PenaltySpec::default().resolve(Some(2.0), Some(-2.0), 1.0).unwrap(),
             Resolved { out: 2.0, inside: 0.0 }
@@ -931,8 +960,34 @@ mod tests {
     }
 
     #[test]
+    fn condition_parts_apply_under_their_temperature_and_never_scale_a_request_s_value() {
+        // the recipe: greedy requests get 0.2 outside the block and 0.7 inside, sampling requests nothing
+        let s = PenaltySpec::parse("greedy=0.2,greedy.thinking=0.5").unwrap();
+        assert_eq!(s.resolve(None, None, 0.0).unwrap(), Resolved { out: 0.2, inside: 0.7 });
+        assert_eq!(s.resolve(None, None, 1.0).unwrap(), Resolved { out: 0.0, inside: 0.0 });
+        assert_eq!(s.resolve(None, None, 0.7).unwrap(), Resolved { out: 0.0, inside: 0.0 });
+        // a client's own value rides on top, under either condition, and an explicit 0 still gets the greedy part
+        assert_eq!(s.resolve(Some(1.0), None, 0.0).unwrap(), Resolved { out: 1.2, inside: 1.7 });
+        assert_eq!(s.resolve(Some(1.5), None, 1.0).unwrap(), Resolved { out: 1.5, inside: 1.5 });
+        assert_eq!(s.resolve(Some(0.0), None, 0.0).unwrap(), Resolved { out: 0.2, inside: 0.7 });
+        // the request's thinking value takes thinking's amount out, and the condition's thinking part stays
+        assert_eq!(s.resolve(None, Some(0.0), 0.0).unwrap(), Resolved { out: 0.2, inside: 0.7 });
+        // the old way of writing it, with a zero multiplier for sampling requests: the multiplier scales the operator's
+        // amounts only, so Qwen's 1.5 comes through
+        let s = PenaltySpec::parse("thinking=0.5,greedy=0.2,nongreedy=*0").unwrap();
+        assert_eq!(s.resolve(None, None, 1.0).unwrap(), Resolved { out: 0.0, inside: 0.5 });
+        assert_eq!(s.resolve(Some(1.5), None, 1.0).unwrap(), Resolved { out: 1.5, inside: 2.0 });
+        assert_eq!(s.resolve(Some(1.5), Some(0.0), 1.0).unwrap(), Resolved { out: 1.5, inside: 1.5 });
+        // a condition's thinking multiplier
+        let s = PenaltySpec::parse("thinking=0.5,nongreedy.thinking=*0").unwrap();
+        assert_eq!(s.resolve(None, None, 0.0).unwrap().extra(), 0.5);
+        assert_eq!(s.resolve(None, None, 1.0).unwrap().extra(), 0.0);
+        assert_eq!(s.resolve(None, Some(0.3), 1.0).unwrap().extra(), 0.3);
+    }
+
+    #[test]
     fn the_temperature_part_is_a_last_stage_scaled_by_the_request_s_temperature() {
-        // rest: out = (0.5 + gn) * 1, in = rest_out + 0.25 (thinking); then (rest + 0.1 T) * (0.5 T)
+        // rest: out = 0.5 + gn, the block adds 0.25; then (rest + 0.1 T) * (0.5 T)
         let s = PenaltySpec::parse("base=0.5,thinking=0.25,greedy=0.25,nongreedy=-0.25,temperature=+0.1*0.5").unwrap();
         let r = s.resolve(None, None, 0.0).unwrap();
         assert_eq!(r, Resolved { out: 0.0, inside: 0.0 }); // the factor B T is 0 under greedy
@@ -950,11 +1005,13 @@ mod tests {
         assert_eq!(s.resolve(None, None, 0.0).unwrap(), Resolved { out: 0.0, inside: 0.0 });
         assert_eq!(s.resolve(None, None, 1.0).unwrap(), Resolved { out: 0.5, inside: 1.0 });
         assert_eq!(s.resolve(None, None, 2.0).unwrap(), Resolved { out: 1.0, inside: 2.0 });
-        // the request's value goes through the stage too, and the stage's amount is not scaled by the other multipliers
+        // the stage scales the operator's amounts. The request's value comes after it, whole
         let s = PenaltySpec::parse("base=*2,temperature=+0.5*0.5").unwrap();
         let r = s.resolve(Some(0.5), None, 1.0).unwrap();
-        assert_eq!(r.out, (1.0 + 0.5) * 0.5);
-        assert!(s.resolve(Some(2.0), None, 2.0).unwrap_err().0); // (4 + 1) * 1
+        assert_eq!(r.out, 0.5 * 0.5 + 0.5);
+        assert!(s.resolve(Some(2.0), None, 2.0).unwrap_err().0); // 1 + 2
+        let s = PenaltySpec::parse("base=0.5,temperature=*1").unwrap();
+        assert_eq!(s.resolve(Some(1.5), None, 0.0).unwrap().out, 1.5); // zero under greedy for the operator's part only
     }
 
     #[test]
@@ -974,9 +1031,15 @@ mod tests {
         let r = resolved(r#"{"temperature": 0, "thinking_presence_penalty": 1.5}"#, spec, "{}").unwrap();
         assert_eq!((r.0, r.2, r.3), (0.5, 1.5, 0.5));
         assert_eq!(resolved(r#"{"thinking_frequency_penalty": 0}"#, spec, "{}").unwrap().3, 0.0);
-        // a multiplier scales the request's value too, so the engine's fields carry the resolved totals
+        // a multiplier scales the operator's amounts, never the request's value
         let r = resolved(r#"{"temperature": 0, "presence_penalty": 1}"#, "base=*1.5,thinking=*1.2", "{}").unwrap();
-        assert!(near(r.0, 1.5) && near(r.2, 0.3));
+        assert_eq!((r.0, r.2), (1.0, 0.0));
+        let r =
+            resolved(r#"{"temperature": 1, "presence_penalty": 1.5}"#, "greedy=0.2,greedy.thinking=0.5", "{}").unwrap();
+        assert_eq!((r.0, r.2), (1.5, 0.0));
+        let r =
+            resolved(r#"{"temperature": 0, "presence_penalty": 1}"#, "greedy=0.2,greedy.thinking=0.5", "{}").unwrap();
+        assert!(near(r.0, 1.2) && near(r.2, 0.5));
         // no spec: the request's values alone, else off
         assert_eq!(resolved("{}", "0", "{}").unwrap(), (0.0, 0.0, 0.0, 0.0));
         assert_eq!(
