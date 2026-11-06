@@ -119,7 +119,9 @@ std::string command_text(Rng& r, uint64_t epoch) {
     const std::string req = num();
     const std::string hash = kind == "CANCEL" && r.coin(80) ? "0" : num();
     const char* sep[] = {" ", "  ", "\t", "\n"};
-    std::string s = kind + sep[r.U(0, 3)] + e + sep[r.U(0, 3)] + req;
+    const char* s1 = sep[r.U(0, 3)];   // one draw a statement: operands of + have no order
+    const char* s2 = sep[r.U(0, 3)];
+    std::string s = kind + s1 + e + s2 + req;
     if (r.coin(97)) s += sep[r.U(0, 3)] + hash;
     if (r.coin(5)) s += " " + num();
     if (r.coin(80)) s += "\n";
@@ -151,7 +153,9 @@ uint64_t ingress_section(uint64_t seed, std::vector<std::string>* lines) {
             const uint64_t k = r.U(0, 9);
             if (k <= 2 && written < 60) {   // the next cmd file
                 const uint64_t id = r.U(0, 40);
-                std::string bytes = "n_gen " + u(r.U(1, 9)) + " temp 0 seed 1 min 0 stop -\n" + u(r.U(0, 99)) + "\n";
+                const uint64_t n_gen = r.U(1, 9);
+                const uint64_t tok = r.U(0, 99);
+                std::string bytes = "n_gen " + u(n_gen) + " temp 0 seed 1 min 0 stop -\n" + u(tok) + "\n";
                 const bool good_hash = r.coin(85);
                 const uint64_t h = good_hash ? payload_hash(bytes) : r.raw();
                 if (r.coin(85)) atomic_file(d + "/req." + u(id), bytes);
@@ -388,7 +392,11 @@ uint64_t status_section(uint64_t seed, std::vector<std::string>* lines) {
                 const uint64_t n = r.U(0, 3);
                 for (uint64_t i = 0; i < n; ++i) (s.*get(QueueOf{})).push(Request{next_id++, uint32_t(r.U(1, 300)), uint32_t(r.U(1, 300)), {}, 0});
             }
-            if (r.coin(20) && (s.*get(QueueOf{})).size()) (s.*get(QueueOf{})).check(revision++, r.coin(50), r.coin(50), uint32_t(r.U(0, pages)));
+            if (r.coin(20) && (s.*get(QueueOf{})).size()) {
+                const bool a = r.coin(50), b = r.coin(50);
+                const uint32_t room = uint32_t(r.U(0, pages));
+                (s.*get(QueueOf{})).check(revision++, a, b, room);
+            }
             if (r.coin(10) && (s.*get(QueueOf{})).front()) (s.*get(QueueOf{})).cancel((s.*get(QueueOf{})).front()->id);
             (s.*get(ProgressOf{})).resident.store(unsigned(r.U(0, 8)));
             (s.*get(ProgressOf{})).retiring.store(unsigned(r.U(0, 8)));
