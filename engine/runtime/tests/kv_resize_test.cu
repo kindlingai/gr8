@@ -258,9 +258,10 @@ static void run(uint64_t seed)
     g6kv_keep(pool, 0, 1, 0);
     CKI(g6kv_chunks(pool, CHUNK));
     auto list = [&](const g6kv_run& r) {
-        const uint32_t* p; size_t n; int ex;
-        CKI(g6kv_list(pool, &r, &p, &n, &ex));
-        return std::vector<uint32_t>(p, p + n);
+        std::vector<uint32_t> v(r.pages); size_t n; int ex;
+        CKI(g6kv_list(pool, &r, v.data(), v.size(), &n, &ex));
+        v.resize(std::min(n, v.size()));
+        return v;
     };
     // session a: 2,600 tokens + room for 3 steps of 8 (pages 0..40); a filler to page 229; session b in chunk 2
     // (230..253); a filler to 299; a retained run in chunk 3 (300..339); then the fillers go, so chunk 1 is free
