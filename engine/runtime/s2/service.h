@@ -284,6 +284,7 @@ class Service {
             for (const auto& sl : s.slots())
                 if (cm.cancel && sl.phase != Phase::Free && sl.phase != Phase::Retiring && sl.key == *cm.cancel) retire_run(sl);
             if (command.admit) {
+                // copied at once: the queue's front pointer is valid only until the queue changes (drain_admits pushes)
                 const auto* queued = queue_.front(); require(queued && queued->id == command.request, "admission FIFO changed during event");
                 Request req = *queued;
                 const Request* request = &req;

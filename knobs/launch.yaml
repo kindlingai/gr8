@@ -431,7 +431,8 @@ options:
     scope: cluster
     doc: >-
       1 = a request whose prefix-reuse hit skipped into the DFlash2 drafter's window keeps the drafter; 2 = also a
-      request alone on MTP takes it (GR8_DFL_REUSE). Defaults to 2 when serving DFlash2 with MTP. Needs DFLASH=1
+      request alone on MTP takes it (GR8_DFL_REUSE). Defaults to 2 when serving DFlash2 with MTP. glm53f: a session
+      checkpoint hit (FLASH_CACHE), 0 or 1, defaults to 1 with FLASH_CACHE. Needs DFLASH=1
   DFL_REUSE_MIN:
     scope: cluster
     doc: >-

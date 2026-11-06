@@ -169,6 +169,14 @@ knobs:
     doc: >-
       With GR8_DS_PF_TAIL, a chunk with at least tail + window rows after it skips the late layers' rows that no later
       reader needs.
+  GR8_DS_PF_L20_TAIL:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_PF_TAIL, layer 20 joins the late layers: its compressed-KV row runs on every row of a chunk, the rest
+      of the layer only on the tail rows.
   GR8_DS_PF_POOL:
     scope: agree
     kind: text

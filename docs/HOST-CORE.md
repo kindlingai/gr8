@@ -1,6 +1,7 @@
 # One host core, per-model GPU modules
 
-Status: R0 done (#343), R1 in progress. Inventory taken at 35a8f1c; reviewed against the code by a second pass.
+Status: R0 (#343), R1 (#344) and R2 (#345, #346, #351, #353) done; R3a in progress. Inventory taken at 35a8f1c; reviewed
+against the code by a second pass.
 
 ## Why
 
@@ -196,13 +197,16 @@ first request of the boot only (later requests can differ under `--spec-adaptive
    are recorded on a cluster boot.
 2. The model-generic S2 host tests also built with `-DG6_MODEL_FLASH=1` (`scripts/host_tests.sh`).
 3. A round-replay log: `GR8_S2_REPLAY_LOG=PATH` makes each rank's planner write its settings, every driver call and
-   every hook's request and answer (the `round` and `prompt` hooks return nothing and are not logged), and after each
-   outermost call the per-slot state the driver reads back, to `PATH.<pid>` (`s2_log.h`; the field lists sit beside
+   every hook's request and answer, and after each outermost call the per-slot state the driver reads back, to
+   `PATH.<pid>` (`s2_log.h`; the field lists sit beside
    each struct in `s2_batch.h`, with a size check for most fields left out). `engine/runtime/s2/tests/round_replay`
    reruns the planner from a log and checks every step it asks for and every state it leaves (`s2/round_replay.h`). This is the guard that sees
    planner changes after the first round, which a first-request T=0 check cannot.
 4. A floating-point check: `scripts/host_tests.sh` replays a log with `round_replay` built with `-ffp-contract=off` and
-   with `-ffp-contract=fast`. A log from a serving boot gets the same check before R3.
+   with `-ffp-contract=fast`. Since R3a's learn records (below) the `off` build must keep every learned estimate bit
+   for bit and the `fast` build only every step (`--steps-only`): on the test's workload (the drafter choice and the
+   confidence stop on) contracted multiply-adds change the estimates' bits from the first round on, without changing
+   a step. On the GLM cluster's serving log both builds keep every bit (R3a's boot).
 5. The in-tree tests nothing built (`s2/tests/ds41_prefill_test.cpp`, `ds41_prefill_lanes_test.cpp`,
    `ds41_s32_step_test.cpp`, `s32_64k_mtp8_test.cpp`, `batch_ds41_dspark_test.cpp`) are built; two needed fixes for
    fields added since they were written (steering slots, a loaded steering profile). The dead `s2/v1_state.h` is gone.
@@ -257,10 +261,48 @@ R2 lands in four parts:
 ### R3. The planner to Rust
 
 Moves `s2_batch.h` (about 1,500 lines), `spec_len.h`, `insert_rule.h`, `ngram_lookup.h` and `ctx_lookup.h`. The boundary is
-`g6s2_batch_round(order)` with the module's `run`, `lp` and `dfl` as C callbacks. It removes `S2N_SLOTS`
-(`s2_batch.h:181-185`), the Flash `S2Cost` and `SpecLen::flash_cost` `#if`s and the static `SpecLen`. This is the one
-step that can change T=0 output: the replay must reproduce every `Step` bit for bit across whole sessions, the R0
-floating-point check must have passed, and `exp` comes from the platform libm. Gate it hardest.
+`g6s2_batch_round(order)` with the module's `run`, `lp` and `dfl` as C callbacks. It removes `S2N_SLOTS` from the planner
+(`dispatch.h` and `g6m4.cu` keep it until R5 and R8), the Flash `S2Cost` and `SpecLen::flash_cost` `#if`s and the static
+`SpecLen`. This is the one step that can change T=0 output, so it lands in two parts, the guard first:
+
+1. R3a, no behaviour change: the round log (version 3) carries everything the port must reproduce. A `learn` record
+   after each state record hashes everything else the planner keeps between calls (the per-session and shared
+   `SpecLen` estimates, the drafter choice, the confidence stop, the drafter's ring, the per-slot state and counters);
+   the `round` and `prompt` hooks are logged; the header carries the step costs (`S2Cost`), which the replay checks
+   against its build, the C library and the model. `round_replay --dump-learn LINE` writes the learned state out at a
+   learn record, to find the field a mismatch is in. `ModuleInfo` gains the drafter's block rows and the pack size,
+   which the host headers now read. Confirmed on the cluster: each rank's log, less the version 3 records, is the
+   earlier boots' log, and replays with its learn records.
+2. R3b, the port, behind a thin C++ `s2::Batch` over the Rust, so `round_replay`, `batch_replay_test` and the version 3
+   format run unchanged against it. The gate is behaviour and speed, not bit-exact estimates: the replay must ask for
+   every step of the test logs and of a serving log (`--steps-only`), T=0 must match on the cluster, and the planning
+   time per round must not grow (measured before and after, one C call a round, no heap allocation per round in the
+   Rust). The learn records stay as the diagnostic: when a step differs, `--dump-learn` shows which estimate drifted
+   first. g++ contracts multiply-adds in C++ under every `-std`, so the GB10 planner fuses them and Rust does not unless
+   it calls `mul_add`; the last bits of an estimate may then differ, which is acceptable while every step matches. The
+   planner's floating point is a few hundred operations a round, so its speed is the per-round overhead, not FMA or
+   vectorization. In the port: the Rust exports its state through C getters and the C++ facade hashes it with
+   `s2log::Hash`, so the learn record has one implementation; `exp` (`kprob`) is `f64::exp` from the same libm (the header
+   names it); `DSelTable::parse`'s `strtod` and `str`'s `%.10g` (it feeds the runtime signature) stay C++ or are tested
+   against it.
+
+### R3c. DS41's KV on the shared paged pool (with Chuck)
+
+A DS41 slot reserves a whole slab (`--capacity-slots`) whatever its request's length, and its prefix snapshots and park
+duplicate what the pool already has (paged stores, the spare-RAM cache, prefix reuse and stash, checkpoints). GLM and
+Flash reserve `prompt + max_tokens` pages, so short requests leave room for long ones, under one admission rule and one
+meaning of the per-request limit. This step moves DS41 onto that pool, which removes a model-specific KV path and leaves
+R8 one KV model to describe. DS41's rows are already defined per 64-token kvman page (`engine/attn/kvfmt.h`, the DS41
+section: ca/ica rows, ratio-2 and ratio-1 layers). The work:
+
+- the DS41 attention and indexer kernels address a slot's slab directly; they take a block table as GLM's and Flash's do;
+- prefix snapshots and park become pool stash entries or checkpoints (`ds41_prefix_cache.cuh`, `Config::park`, the
+  scheduler's parked phase);
+- per-session state that is not KV stays per session (the 128-token windows, Engram, DSpark), as Flash keeps its KDA
+  slots (`FlashSlots`).
+
+It is DS41's owner's area, so it is planned with him. It fits after R3: the planner port does not depend on it, and R4
+and R5 then move one pool's callers, not two KV models'.
 
 ### R4. The driver to Rust
 

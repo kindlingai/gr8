@@ -418,6 +418,11 @@ def validate(o):
     budget = o.get('FLASH_STATE_BUDGET_MIB')
     if budget is not None and not (str(budget).isdigit() and int(budget) >= 1):
         raise OptionError(f'--flash-state-budget-mib {budget}: want a whole number of MiB from 1')
+    if model.name == 'glm53f' and cache == 'terminal' and o.get('DFLASH') == '1':
+        raise OptionError('--flash-cache terminal with --dflash 1: the drafter takes aligned checkpoints only (a terminal '
+                          "checkpoint's KDA state is not cold-exact)")
+    if model.name == 'glm53f' and o.get('DFL_REUSE') not in (None, '0', '1'):
+        raise OptionError(f'--dfl-reuse {o.get("DFL_REUSE")}: glm53f takes 0 or 1 (a session checkpoint hit keeps the drafter)')
     if model.name == 'glm53f' and stores:
         if cache in (None, 'off'):
             raise OptionError('--kv-store on glm53f holds Flash session checkpoints: it needs --flash-cache aligned or terminal')

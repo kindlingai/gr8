@@ -23,6 +23,7 @@ int main()
     CHECK(m.hidden == geom::HID && m.layers == geom::L_MAIN && m.vocab == geom::VOCAB && m.experts == geom::NEXP &&
           m.topk == geom::TOPK);
     CHECK(m.kv_row_bytes == g6kv::ROW && std::strcmp(m.kv_format, g6kv::NAME) == 0 && m.kv_page == 64);
+    CHECK(m.abi == 2 && m.dfl_block == 8 && m.pack_members == 8);
 #if G6_MODEL_DS41
     CHECK(m.model == G6_MODEL_ID_DS41 && std::strcmp(m.name, "ds41") == 0 && m.max_sessions == 32 && m.mtp_layers == 3);
     CHECK(m.caps == (G6_CAP_MTP0 | G6_CAP_PACK | G6_CAP_PARK | G6_CAP_PROMPT_DECODE | G6_CAP_DSPARK));
