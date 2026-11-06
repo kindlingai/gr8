@@ -103,6 +103,9 @@ class OptionTests(unittest.TestCase):
         self.assertNotIn('--kv-store', plan['args'])
         plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/fc,size=64G'))
         self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], 'ssd:/tmp/fc,size=64G')
+        # persist=on keeps aligned checkpoints and their index across boots
+        plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/fc,size=64G,persist=on'))
+        self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], 'ssd:/tmp/fc,size=64G,persist=on')
         plan = opt.engine_plan(flash('--flash-cache', 'terminal'))
         self.assertIn('GR8_GLM53F_CACHE=terminal', plan['env'])
         # the checkpoint store on a group lease (D-331 M8 (c)): the store as given, KV_SHARE_WHEN reaches the engine
@@ -116,8 +119,8 @@ class OptionTests(unittest.TestCase):
                            (['--kv-store', 'ssd:/tmp/fc,size=64G'], 'needs --flash-cache aligned or terminal'),
                            (['--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/a,size=1G', '--kv-store',
                              'ssd:/tmp/b,size=1G'], 'give one --kv-store'),
-                           (['--flash-cache', 'aligned', '--kv-store', 'ssd:/tmp/a,size=1G,persist=on'],
-                            'do not persist')):
+                           (['--flash-cache', 'terminal', '--kv-store', 'ssd:/tmp/a,size=1G,persist=on'],
+                            'cold-exact (aligned) checkpoints only')):
             with self.assertRaises(opt.OptionError) as e:
                 flash(*argv)
             self.assertIn(want, str(e.exception))

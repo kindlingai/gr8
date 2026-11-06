@@ -1963,38 +1963,49 @@ int main(int argc, char** argv)
             std::string spec = "mem:";
             uint64_t bytes = (uint64_t)flash_budget_mib << 20;
             std::optional<g6s2::FlashGroup> group;
+            std::string index_path;
             if (!kv_tiers.empty())
             {
                 g6s2::TierSpec t;
                 try { t = g6s2::TierSpec::parse(kv_tiers[0], false); } catch (const std::exception& e) { die(std::string("GR8_GLM53F_CACHE: ") + e.what()); }
-                if (t.persist) die("GR8_GLM53F_CACHE: persist=on is not supported (checkpoints live for one boot)");
+                if (t.persist && flash_cache == g6s2::FlashCache::Terminal)
+                    die("GR8_GLM53F_CACHE=terminal: persist=on keeps cold-exact (aligned) checkpoints only");
                 spec = t.store; bytes = t.bytes;
                 // group=: the lease shares its KV node with other clusters (s2/flash_checkpoint.h); it starts at size=
                 if (!t.group.empty()) group = g6s2::FlashGroup{t.group, (uint32_t)g6nr::NR, (uint32_t)R, t.cap, t.weight};
                 if (t.ssd())
-                {   // as the pool's stores: the folder starts empty at every boot
+                {   // as the pool's stores: the folder starts empty at every boot unless persist=on keeps it and its index
                     const std::string dir = t.store.substr(4) + "/r" + std::to_string(R);
-                    if (std::filesystem::exists(dir)) std::filesystem::remove_all(dir);
+                    if (!t.persist && std::filesystem::exists(dir)) std::filesystem::remove_all(dir);
                     std::filesystem::create_directories(dir);
                     spec = "ssd:" + dir + "/flash-ckpt";
+                    if (t.persist) index_path = dir + "/flash-ckpt.index";
                 }
+                if (t.spare_ram) spec = "ram:" + std::to_string(t.spare_ram_floor) + "+" + spec;
             }
             char host[64] = "host";
             gethostname(host, sizeof host - 1);
             // its own lease name on a KV node: never the pool stash's (g6m4-...)
             const std::string name = std::string("g6m4f-ckpt-") + host + "-" + std::to_string(s2epoch) + "-r" + std::to_string(R);
             static const std::string exe = g6s2::exe_stamp();
+            // the cache mode is not in it: the launcher (tools/launch/options.py) and the check above refuse persist=on
+            // with terminal, so a persisted entry is always aligned (cold-exact)
             const std::string compat = "flash set " + set_id + " nr " + std::to_string(g6nr::NR) + " rank " + std::to_string(R) +
                 " cap " + std::to_string(cap) + " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " bindings " +
                 std::to_string(v.bindings.size()) + " state " + std::to_string(v.state_bytes()) + " format " +
                 std::to_string(g6s2::FlashManifest::FORMAT) + " engine " + exe;
-            try { ckpt.reset(new g6s2::FlashCheckpoints(v, spec, name, bytes, compat, group ? &*group : nullptr)); }
+            try { ckpt.reset(new g6s2::FlashCheckpoints(v, spec, name, bytes, compat, group ? &*group : nullptr, index_path)); }
             catch (const std::exception& e) { die(std::string("GR8_GLM53F_CACHE: ") + e.what()); }
+            // persist=on: the entries are checked on a helper thread and agreed by every rank in serve_flash
+            if (!index_path.empty()) fprintf(stderr, "# rank %d: flash ckpt persist: %s: %s\n", R, index_path.c_str(), ckpt->loaded.c_str());
             fprintf(stderr, "# rank %d: flash ckpt %s: %s, %llu blocks of %zu B (%zu bindings, KDA state %.1f MB = %llu blocks), grid %d rows%s\n",
                     R, g6s2::flash_cache_name(flash_cache), ckpt->describe().c_str(), (unsigned long long)ckpt->blocks(), ckpt->slot_bytes(),
                     v.bindings.size(), v.state_bytes() / 1e6, (unsigned long long)(ckpt->entry_blocks(0) - 1), MP * (two ? 2 : 1),
                     group ? (", group " + group->group + " lease, " + std::to_string(ckpt->segments()) + " segments to start").c_str() : "");
-            bc.runtime_signature += std::string(" ckpt ") + g6s2::flash_cache_name(flash_cache) + " blocks " + std::to_string(ckpt->blocks());
+            // persist: every rank joins the agreement on persisted entries (serve_flash), or none does. The index itself is
+            // not here: the agreement makes it the same on every rank, and the pool digest compares it at every event
+            bc.runtime_signature += std::string(" ckpt ") + g6s2::flash_cache_name(flash_cache) + " blocks " + std::to_string(ckpt->blocks()) +
+                (index_path.empty() ? "" : " persist");
         }
         // DFlash2 (--dflash-manifest): a session alone drafts with the drafter, as on GLM-5.3 (s2_batch.h Batch::dflash);
         // Dfl::pf_feat holds the prefill taps of the session whose prefill started last (s2/flash_dfl_window.h: with

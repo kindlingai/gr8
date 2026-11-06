@@ -428,8 +428,8 @@ def validate(o):
             raise OptionError('--kv-store on glm53f holds Flash session checkpoints: it needs --flash-cache aligned or terminal')
         if len(stores) > 1:
             raise OptionError('--flash-cache keeps its checkpoints in one store: give one --kv-store')
-        if any(t['persist'] for t in stores):
-            raise OptionError('--flash-cache: Flash checkpoints do not persist across boots (persist=on)')
+        if any(t['persist'] for t in stores) and cache == 'terminal':
+            raise OptionError('--flash-cache terminal: persist=on keeps cold-exact (aligned) checkpoints only')
     elif stores and o.get('REUSE') == '0':
         raise OptionError('--kv-store keeps the runs prefix reuse retains: it needs REUSE (on by default)')
     if stores:

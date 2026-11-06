@@ -234,6 +234,14 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/h
 # Flash KDA state rollback across accepted prefixes, and each session's slots and ring (s2/flash_ring.h).
 g++ -std=c++17 -O2 -Wall "$REPO/engine/tests/test_flash_ring.cpp" -o "$T/test_flash_ring" "${KNOBS[@]}"
 "$T/test_flash_ring"
+# Flash checkpoints with persist=on (s2/flash_ckpt_index.h): the index and token files round trip, damaged or foreign
+# files start empty, FlashIndex::adopt's rules, and an entry a capture dropped does not come back after a crash
+g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/flash_ckpt_index_test.cpp" -o "$T/flash_ckpt_index_test"
+TMPDIR="$T" "$T/flash_ckpt_index_test"
+# ranks that took back different persisted entries agree at the bootstrap (agree_lines) at TP=1, 2 and 4, and wait for
+# a rank that checks its entries for longer than the socket timeout
+g++ -std=c++17 -O1 -g -Wall -Wextra -pthread -fsanitize=address,undefined -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/flash_ckpt_agree_test.cpp" -o "$T/flash_ckpt_agree_test" "${KNOBS[@]}"
+TMPDIR="$T" "$T/flash_ckpt_agree_test"
 # the KDA carry mode (Args::src per row: the ring, and several sessions in one step) on the CPU model of k_kda_core.
 # Bit for bit across the kernel's M paths, so no FMA contraction (the host compiler would contract each path its own way).
 g++ -std=c++17 -O2 -ffp-contract=off -DG6_MODEL_FLASH=1 "$REPO/engine/kda/tests/kda_carry_cpu_test.cpp" -o "$T/kda_carry_cpu_test" "${KNOBS[@]}"

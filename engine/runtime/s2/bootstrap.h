@@ -179,8 +179,10 @@ inline ControlLinks bootstrap(const BootstrapConfig& c) {
     } catch (...) { out.shutdown(); throw; }
 }
 // After bootstrap, every rank sends its lines (one stored entry each). The head keeps the lines every rank has, in its own
-// order, and sends them back. Every rank then starts from the same stored entries (pool.h keep_agreed).
-inline std::string agree_lines(const BootstrapConfig& c, ControlLinks& links, const std::string& mine) {
+// order, and sends them back. Every rank then starts from the same stored entries (pool.h keep_agreed). idle: wait for
+// the other ranks with no receive timeout, as capture_barrier (Flash agrees after the graph capture and its checkpoint
+// checks, whose times differ by rank)
+inline std::string agree_lines(const BootstrapConfig& c, ControlLinks& links, const std::string& mine, bool idle = false) {
     auto lines = [](const std::string& s) {
         std::vector<std::string> v;
         for (size_t a = 0; a < s.size();) {
@@ -195,7 +197,7 @@ inline std::string agree_lines(const BootstrapConfig& c, ControlLinks& links, co
     if (c.rank) {
         require(links.links.size() == 1 && links.links[0], "store agreement without head link");
         links.links[0]->send(frame(ask + mine));
-        const auto b = links.links[0]->receive();
+        const auto b = links.links[0]->receive(idle);
         const std::string r(b.begin(), b.end());
         require(r.rfind(agreed, 0) == 0, "store agreement: unexpected frame");
         return r.substr(agreed.size());
@@ -203,7 +205,7 @@ inline std::string agree_lines(const BootstrapConfig& c, ControlLinks& links, co
     std::vector<std::string> keep = lines(mine);
     for (auto& io : links.links) {
         require(bool(io), "store agreement with missing rank");
-        const auto b = io->receive();
+        const auto b = io->receive(idle);
         const std::string r(b.begin(), b.end());
         require(r.rfind(ask, 0) == 0, "store agreement: unexpected frame");
         const auto theirs = lines(r.substr(ask.size()));

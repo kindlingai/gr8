@@ -14,13 +14,17 @@
 // the entry's. Both run on the serve stream, synchronously: the copies sit between prefill quanta or before a bind.
 #pragma once
 #include "flash_checkpoint.h"
+#include "flash_ckpt_index.h"
 #include "kv_share.h"
 #include "../../kvman-rs/g6kvman.h"
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace g6s2 {
@@ -106,6 +110,8 @@ class FlashCheckpoints {
     int batch_ = 0;
     uint64_t compat_ = 0;
     g6kv_tier_totals seen_{};   // a group lease, the head: the index counters at its last report
+    FlashIndexFiles files_;     // persist=on: the index and token files beside the store's blocks, else off
+    bool persist_ = false;      // persist=on at boot
     uint8_t *host_ = nullptr, *host_dev_ = nullptr;   // mapped pinned: batch_ slots, registered with the store
     int* d_list_ = nullptr;                           // the run's pool pages, pool_pages of them at most
     fck::Binding* d_bind_ = nullptr;
@@ -189,15 +195,61 @@ class FlashCheckpoints {
             block += n;
         }
     }
+    // persist=on: the index and token files (flash_ckpt_index.h). A full or read-only disk turns persistence off and
+    // the serve goes on: the index goes, and this boot keeps its entries in the store without one
+    void save() {
+        if (!files_.on()) return;
+        try { files_.save(compat_, index_); }
+        catch (const std::exception& e) {
+            fprintf(stderr, "# flash ckpt persist: cannot write %s (%s): persistence off for this boot\n", files_.path().c_str(), e.what());
+            files_.remove();
+            files_ = FlashIndexFiles();
+        }
+    }
+    // persist=on at boot: the index on disk (read in the constructor), its entries checked on the verify_ thread
+    // (flash_entry_check: manifest block, page and KDA state checksums of the stored bytes), published by settle()
+    FlashLayout layout_;
+    FlashIndexImage found_;               // the index read at boot, then the entries that passed verify_
+    std::string checked_;                 // what verify_ dropped and how long it took (the boot log)
+    std::thread verify_;
+    void verify() {
+        const auto t0 = std::chrono::steady_clock::now();
+        const FlashRead read = [this](uint64_t first, int n, uint8_t* dst) {
+            std::vector<uint64_t> b(static_cast<size_t>(n)); std::vector<void*> p(static_cast<size_t>(n));
+            for (int i = 0; i < n; ++i) { b[size_t(i)] = first + uint64_t(i); p[size_t(i)] = dst + size_t(i) * slot_; }
+            tk(g6kv_tier_read_many(t_, size_t(n), b.data(), p.data()), "read");
+        };
+        const int threads = int(std::max(1u, std::min(8u, std::thread::hardware_concurrency() / 2)));
+        std::vector<FlashEntry> kept;
+        std::string dropped;
+        uint64_t bytes = 0;
+        for (auto& x : found_.entries) {
+            const char* why = nullptr;
+            std::string err;
+            try { why = flash_entry_check(x, compat_, index_.blocks(), layout_, read, batch_, threads); }
+            catch (const std::exception& e) { err = e.what(); why = err.c_str(); }
+            if (why) { dropped += (dropped.empty() ? "" : ", ") + std::to_string(x.generation) + " (" + why + ")"; continue; }
+            bytes += x.blocks * slot_;
+            kept.push_back(std::move(x));
+        }
+        const size_t n = found_.entries.size();
+        found_.entries = std::move(kept);
+        char b[160];
+        snprintf(b, sizeof b, "%zu of %zu entries verified (%.2f GiB) in %.2f s", found_.entries.size(), n, bytes / 1073741824.0,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        checked_ = b + (dropped.empty() ? std::string() : "; dropped " + dropped);
+    }
 public:
     // the last capture or restore: blocks, bytes and milliseconds (the log lines)
     struct Last { uint64_t blocks = 0; double ms = 0; } last;
     bool log = true;
     // spec / name / bytes: as KvTiers::add (name: this rank's lease, never the pool stash's). compat: what makes an entry
     // this engine's (model set, TP, rank, layout, engine build)
-    // group: a group lease of `bytes` to start (FlashGroup), else a store of `bytes`
+    // group: a group lease of `bytes` to start (FlashGroup), else a store of `bytes`. index_path: persist=on, the file
+    // the index is kept in (loaded here, rewritten after every capture and resize)
     FlashCheckpoints(FlashStateView v, const std::string& spec, const std::string& name, uint64_t bytes,
-                     const std::string& compat, const FlashGroup* group = nullptr, int batch = 32) : v_(std::move(v)), batch_(batch) {
+                     const std::string& compat, const FlashGroup* group = nullptr, const std::string& index_path = {},
+                     int batch = 32) : v_(std::move(v)), batch_(batch), files_(index_path) {
         if (v_.bindings.empty() || !v_.S || !v_.conv || v_.layers <= 0 || v_.slots <= 0 || v_.pool_pages <= 0) throw std::runtime_error("Flash checkpoint: no state to keep");
         block_ = v_.page_bytes();
         slot_ = (block_ + 4095) / 4096 * 4096;
@@ -225,8 +277,47 @@ public:
         fck::ck(cudaHostAlloc(reinterpret_cast<void**>(&host_), slot_ * batch_, cudaHostAllocMapped), "alloc");
         fck::ck(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_dev_), host_, 0), "alloc");
         tk(g6kv_tier_register(t_, host_, slot_ * batch_), "register");
+        layout_.slot = slot_; layout_.state_bytes = v_.state_bytes();
+        for (const auto& b : v_.bindings) layout_.parts.push_back({size_t(b.mla_page16) * 16, b.idx ? size_t(b.idx_page16) * 16 : 0});
+        persist_ = files_.on();
+        if (files_.on()) {
+            uint64_t stale = 0;
+            if (const char* why = files_.load(compat_, index_.blocks(), found_, stale)) loaded = std::string(why) + ", starting empty";
+            else {
+                loaded = std::to_string(found_.entries.size()) + " entries to verify" +
+                    (stale ? ", " + std::to_string(stale) + " without their token file dropped" : "");
+                verify_ = std::thread([this] { verify(); });
+            }
+        }
+    }
+    std::string loaded;   // persist=on: what the boot found in the index file (the boot log)
+    // persist=on at boot (true even after a failed write turned it off): this rank joins the bootstrap's agreement
+    bool persisted() const { return persist_; }
+    // persist=on: waits for the verification and publishes the entries that passed. Returns the boot log text.
+    // Call before anything reads the index (the bootstrap's agreement, the serve): until then it is empty.
+    std::string settle() {
+        if (!verify_.joinable()) return loaded;
+        verify_.join();
+        for (auto& x : found_.entries) x.used_ms = index_.now_ms();
+        try { index_.adopt(found_.next, found_.clock, std::move(found_.entries)); }
+        catch (const std::exception& e) { checked_ += std::string("; ") + e.what() + ", starting empty"; }
+        found_ = FlashIndexImage{};
+        return checked_;
+    }
+    // the bootstrap's agreement (flash_ckpt_index.h): this rank's lines, then the entries every rank kept. agree()
+    // rewrites the index and returns the boot log text
+    std::string agree_summary() const { return flash_agree_summary(index_); }
+    std::string agree(const std::string& agreed) {
+        const size_t n = index_.size();
+        const std::vector<uint64_t> gone = flash_keep_agreed(index_, agreed);
+        save();
+        std::string s = std::to_string(index_.size()) + " of " + std::to_string(n) + " entries kept by every rank, next " +
+            std::to_string(index_.next_generation());
+        for (size_t i = 0; i < gone.size(); ++i) s += (i ? ", " : "; dropped ") + std::to_string(gone[i]);
+        return s;
     }
     ~FlashCheckpoints() {
+        if (verify_.joinable()) verify_.join();
         if (t_) g6kv_tier_free(t_);
         cudaFree(d_bind_); cudaFree(d_off_); cudaFree(d_sum_); cudaFree(d_list_); cudaFreeHost(host_);
     }
@@ -236,7 +327,7 @@ public:
     FlashIndex& index() { return index_; }
     uint64_t blocks() const { return index_.blocks(); }
     size_t slot_bytes() const { return slot_; }
-    uint64_t entry_blocks(uint32_t position) const { return 1 + (position + 63) / 64 + state_blocks_; }
+    uint64_t entry_blocks(uint32_t position) const { return layout_.entry_blocks(position); }
     std::string describe() const { char b[256]; g6kv_tier_describe(t_, b, sizeof b); return b; }
     // a group lease (its segments move between the clusters on its node)
     bool group() const { return g6kv_store_seg_blocks(t_) != 0; }
@@ -276,6 +367,8 @@ public:
             if (blocks != r.slots) throw std::runtime_error("Flash checkpoint: the lease grew to a different size than the event's");
             index_.grow(blocks);
         } else if (r.segs < segs) {
+            // the moves run before the index is saved (capture saves first): a crash between them leaves an index whose
+            // entries the load checks and the agreement drop, never a wrong restore
             for (const auto& m : index_.shrink(r.slots, gone))
                 for (uint64_t i = 0; i < m.blocks; i += batch_) {
                     const int n = (int)std::min<uint64_t>(batch_, m.blocks - i);
@@ -287,6 +380,7 @@ public:
             tk(rc, "shrink");
             if (blocks != r.slots) throw std::runtime_error("Flash checkpoint: the lease shrank to a different size than the event's");
         }
+        save();
         return true;
     }
     // keep the run's logical rows [0, position) (run: its pool pages in order) and KDA slot `slot` (the state after them)
@@ -301,7 +395,11 @@ public:
         const auto t0 = std::chrono::steady_clock::now();
         const uint64_t np = (position + 63) / 64, need = entry_blocks(position);
         uint64_t base = 0;
-        if (!index_.reserve(need, base)) return 0;
+        std::vector<uint64_t> gone;
+        if (!index_.reserve(need, base, &gone)) return 0;
+        // the entries reserve dropped leave the index on disk before their blocks are overwritten, so a crash during the
+        // capture never leaves an index naming a range that holds part of another entry
+        if (!gone.empty()) save();
         FlashEntry x;
         x.generation = index_.next_generation(); x.base = base; x.blocks = need; x.position = position; x.terminal = terminal;
         x.tokens = tokens; x.ns = ns;
@@ -322,8 +420,17 @@ public:
         io(base, 1, true);
         const uint64_t g = x.generation;
         index_.add(std::move(x));
+        save();
         last = Last{need, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()};
         return g;
+    }
+    // a restore of `generation` read bytes that are not the entry's: the whole index file goes, so this rank's next boot
+    // starts with no index and the bootstrap's agreement drops the other ranks' entries too. They may hold the entry
+    // this rank lost, and one shard of an entry is no use.
+    [[noreturn]] void fail(uint64_t generation, const char* why) {
+        index_.drop(generation);
+        if (files_.on()) { files_.remove(); files_ = FlashIndexFiles(); }
+        throw std::runtime_error("Flash checkpoint " + std::to_string(generation) + ": " + why);
     }
     // entry `generation` back into the run's logical rows [0, position) and KDA slot `slot`; throws when the stored bytes
     // are not the entry's (the serve fails: the other ranks restore too, so one rank cannot fall back to a cold prefill alone)
@@ -335,7 +442,7 @@ public:
         io(x->base, 1, false);
         FlashManifest m;
         std::memcpy(&m, host_, sizeof m);
-        if (const char* why = m.differs(x->manifest)) throw std::runtime_error(std::string("Flash checkpoint ") + std::to_string(generation) + ": " + why);
+        if (const char* why = m.differs(x->manifest)) fail(generation, why);
         const uint64_t np = (x->position + 63) / 64;
         set_pages(run, np, st);
         for (uint64_t p = 0; p < np; p += batch_) {
@@ -345,8 +452,8 @@ public:
         }
         const auto sx = v_.state(slot);
         state(sx, x->base + 1 + np, false, st);
-        if (page_sum(np, st) != m.page_sum) throw std::runtime_error("Flash checkpoint " + std::to_string(generation) + ": page checksum");
-        if (sum(sx, st) != m.state_sum) throw std::runtime_error("Flash checkpoint " + std::to_string(generation) + ": KDA state checksum");
+        if (page_sum(np, st) != m.page_sum) fail(generation, "page checksum");
+        if (sum(sx, st) != m.state_sum) fail(generation, "KDA state checksum");
         last = Last{x->blocks, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()};
         index_.touch(generation);
     }

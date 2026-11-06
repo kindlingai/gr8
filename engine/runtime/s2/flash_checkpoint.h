@@ -27,6 +27,11 @@
 // the same index (the same captures in the same order, the same sizes), and the index digest joins the pool digest
 // every rank compares.
 //
+// persist=on (an ssd: store): the index is written next to the blocks after every capture and resize
+// (flash_ckpt_index.h), and a boot whose compat line and store size match takes back each entry whose stored manifest,
+// pages and KDA state still match its manifest's checksums (flash_entry_check, FlashCheckpoints::settle) and that every
+// other rank kept too (the bootstrap's agreement, flash_keep_agreed).
+//
 // A group lease (--kv-store ...,group=, s2/kv_share.h, D-331 M8 (c)): the store shares its KV node with other clusters
 // (the full model's pool) and changes size by whole segments at a Resize event. The index reports what the pool stash
 // reports: its counters as g6kv_tier_totals (share_want asks from them) and the ages of what a give would drop
@@ -103,11 +108,17 @@ struct FlashManifest {
     uint64_t self_sum = 0;           // fnv64 of every field above
     uint64_t own_sum() const { return fnv64(this, offsetof(FlashManifest, self_sum)); }
     void seal() { magic = MAGIC; format = FORMAT; complete = 1; self_sum = own_sum(); }
-    // why this block is not the manifest of `want` (nullptr: it is)
-    const char* differs(const FlashManifest& want) const {
+    // why this is not a sealed manifest (nullptr: it is)
+    const char* unsealed() const {
         if (magic != MAGIC || format != FORMAT) return "no manifest";
         if (self_sum != own_sum()) return "manifest checksum";
         if (!complete) return "incomplete";
+        return nullptr;
+    }
+    bool sealed() const { return !unsealed(); }
+    // why this block is not the manifest of `want` (nullptr: it is)
+    const char* differs(const FlashManifest& want) const {
+        if (const char* why = unsealed()) return why;
         if (generation != want.generation) return "another entry";
         if (compat != want.compat) return "another engine or layout";
         if (position != want.position || tokens != want.tokens || token_hash != want.token_hash || ns_hash != want.ns_hash)
@@ -201,6 +212,24 @@ public:
         return true;
     }
     uint64_t next_generation() const { return next_; }
+    uint64_t clock() const { return clock_; }
+    // a persisted index back (FlashCheckpoints, persist=on): the entries that passed their checks, in any order. Throws
+    // when one lies past the store, two overlap, two share a generation, or a generation or use is not below next / clock.
+    void adopt(uint64_t next, uint64_t clock, std::vector<FlashEntry> v) {
+        std::sort(v.begin(), v.end(), [](const FlashEntry& a, const FlashEntry& b) { return a.base < b.base; });
+        uint64_t end = 0;
+        std::vector<uint64_t> gens;
+        for (const auto& x : v) {
+            if (!x.blocks || x.base < end || x.blocks > blocks_ || x.base > blocks_ - x.blocks || x.generation >= next || x.used > clock)
+                throw std::runtime_error("Flash checkpoint: persisted entry " + std::to_string(x.generation) + " does not fit the store");
+            end = x.base + x.blocks;
+            gens.push_back(x.generation);
+        }
+        std::sort(gens.begin(), gens.end());
+        if (std::adjacent_find(gens.begin(), gens.end()) != gens.end())
+            throw std::runtime_error("Flash checkpoint: two persisted entries share a generation");
+        e_ = std::move(v); next_ = next; clock_ = clock;
+    }
     // publish an entry whose blocks are written (reserve gave `base`)
     void add(FlashEntry x) {
         if (x.generation != next_) throw std::runtime_error("Flash checkpoint: generation out of order");
