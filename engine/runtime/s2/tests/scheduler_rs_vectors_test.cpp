@@ -51,9 +51,10 @@ int main(int argc, char** argv)
         {"scheduler", 5, vec::scheduler, shape ? shape->scheduler : 0},
         {"share", 6, vec::share, 0x5a98bacc9f262ab7ull},
         {"queue", 7, vec::queue, 0xaf92603441c49eaaull},
-        {"request", 8, [](uint64_t s, std::vector<std::string>* l) { return vec::request(s, l, false); }, 0xaaab3710d1030662ull},
+        // rerecorded when the header gained pen: the transcripts differ only in the error text that lists the accepted fields
+        {"request", 8, [](uint64_t s, std::vector<std::string>* l) { return vec::request(s, l, false); }, 0x055865c0e871e48aull},
         // recorded from the Rust after the old C++ parser (git c74d024, libstdc++) gave the same transcript
-        {"request_gram", 9, [](uint64_t s, std::vector<std::string>* l) { return vec::request(s, l, true); }, 0x18a523b6c0f716ceull},
+        {"request_gram", 9, [](uint64_t s, std::vector<std::string>* l) { return vec::request(s, l, true); }, 0xcc007e45e42dd75cull},
         {"share_resize", 10, vec::share_resize, 0xd99c642674175c07ull},
         // recorded from the C++ driver it replaced (git bd1bb6a), in each shape
         {"driver", 11, vec::driver, shape ? shape->driver : 0},
