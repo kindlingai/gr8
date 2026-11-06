@@ -145,6 +145,45 @@ static void files_round_trip(const std::string& dir) {
       CHECK(why && std::string(why) == "no index" && std::filesystem::is_empty(dir + "/flash-ckpt.tokens")); }
 }
 
+// A save into a read-only folder throws (FlashCheckpoints::save turns persistence off on it, then calls remove()). It
+// leaves no .tmp file and no index a load would take for the failed save: a load gives the last good index, or none.
+static bool any_tmp(const std::string& dir) {
+    for (const auto& e : std::filesystem::recursive_directory_iterator(dir))
+        if (e.path().extension() == ".tmp") return true;
+    return false;
+}
+static void read_only_save(const std::string& dir) {
+    if (geteuid() == 0) { std::printf("flash_ckpt_index_test: read-only save skipped (root ignores permissions)\n"); return; }
+    for (int which = 0; which < 2; ++which) {   // 0: the token folder is read-only, 1: the folder holding the index
+        const std::string d = dir + "/" + std::to_string(which), path = d + "/flash-ckpt.index", toks = d + "/flash-ckpt.tokens";
+        std::filesystem::create_directories(d);
+        FlashIndexFiles f(path);
+        FlashIndex ix(100);
+        capture(ix, 64, 1);
+        f.save(COMPAT, ix);
+        const FlashIndex good = ix;
+        capture(ix, 128, 2);
+        const std::string ro = which ? d : toks;
+        chmod(ro.c_str(), 0555);
+        std::string err;
+        try { f.save(COMPAT, ix); } catch (const std::system_error& e) { err = e.what(); }
+        CHECK(!err.empty());
+        f.remove();   // what the owner does next
+        chmod(ro.c_str(), 0755);
+        CHECK(!any_tmp(d));
+        FlashIndexFiles g(path);
+        FlashIndexImage img;
+        uint64_t stale = 0;
+        const char* why = g.load(COMPAT, 100, img, stale);
+        // no index (it was removed), or the last good one: never the failed save's
+        CHECK((why && img.entries.empty()) || (!why && stale == 0 && same_entries(img.entries, good.entries())));
+        CHECK(access((toks + "/2").c_str(), F_OK) != 0);   // no token file of the failed entry survives a load
+        CHECK(!any_tmp(d));
+        std::printf("flash_ckpt_index_test: read-only %s: save threw \"%s\", load: %s\n", which ? "index folder" : "token folder",
+                    err.c_str(), why ? why : "last good index");
+    }
+}
+
 static void adopt_rules() {
     auto entry = [](uint64_t gen, uint64_t base, uint64_t blocks, uint64_t used) {
         FlashEntry x; x.generation = gen; x.base = base; x.blocks = blocks; x.used = used; return x;
@@ -375,6 +414,7 @@ int main(int argc, char** argv) {
     bytes_round_trip();
     files_round_trip(sub("files"));
     adopt_rules();
+    read_only_save(sub("readonly"));
     crash_after_reserve(sub("crash"));
     entry_checks();
     crash_with_stale_index(sub("crash2"));
