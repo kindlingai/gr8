@@ -2,12 +2,15 @@
 //! C++ headers keep their types and call these functions through `g6sched.h`. For the R2 pieces the state they act on
 //! stays in C++ structs with the same layout (`#[repr(C)]`), so C++ copies and owns it as before. The batch planner
 //! (R3, `planner`) owns its state here, behind an opaque handle. The C++ passes settings in and reads results out.
+//! The driver (`driver`) owns its per-slot state here too; the scheduler's state and the planner it reaches through
+//! the C++ that still holds them.
 //!
 //! Every function here is deterministic in its inputs: each rank runs the same calls on the same replicated state and
 //! must reach the same answer.
 
 pub mod admission;
 pub mod cp_rows;
+pub mod driver;
 pub mod ffi;
 pub mod flash_lend;
 pub mod flash_ring;

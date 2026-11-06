@@ -202,7 +202,7 @@ fn err(r: Result<(), sch::Err>) -> *const c_char {
     }
 }
 // a refusal message as a NUL-terminated string that lives as long as the process (one copy per message)
-fn msg(m: &'static str) -> *const c_char {
+pub(crate) fn msg(m: &'static str) -> *const c_char {
     use std::collections::HashMap;
     use std::ffi::CString;
     use std::sync::{Mutex, OnceLock};

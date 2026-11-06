@@ -368,6 +368,25 @@ completions. After R3 every piece it calls is Rust, so the driver moves whole an
   driver host tests (`driver_grow_test`, the `scheduler_*` tests, `cp_rows_test`) run against the Rust driver behind a
   thin C++ facade as R3b did, and a confirmation boot's logs equal the earlier boots'. One C call per quantum.
 
+R4a landed as `engine/scheduler-rs` `driver.rs` (`g6s2_driver_*` in `g6sched.h`, its tables in the layout digest). Rust
+owns apply, step, the completions, the emit hook's accounting and the capped-round cycle (`cp_rows.rs` called directly),
+with the per-slot emitted counts, initialised flags and what the driver reads of a payload (prompt length,
+`decode_prompt`). `DriverHooks` crosses as one C table of function pointers and a context. The planner's calls go
+through a second table to the C++ `s2::Batch`, which writes the round log, and the scheduler's state is still the C++
+`Scheduler`'s, passed per call. A quantum is one call into the Rust; its planner calls come back out through the table
+(a decode round: `active` and the completion reads per session, `demote` or `promote`, `round`), as the C++ driver made
+them. `Payload` stays C++: the facade copies it into and out of the slot when the Rust says and builds each planner
+`Session` from it, so a new `Payload` field does not cross the boundary. Hooks may read the driver back, as the
+service's retire does, so the Rust state is `Cell`s behind `&self` and apply and step refuse to be entered from a hook.
+`Driver` keeps its API (service.h and the tests build unchanged) and is movable. Checked on macOS: every round log the
+driver tests write (5,531 in the default, Flash and DS41 shapes) is byte-identical to the C++ driver's;
+`scheduler_rs_vectors_test` gains a driver section (seeded grants, cancels, resizes, growth, capped rounds, early stops,
+miscounts and throwing hooks) whose hashes were recorded from the C++ driver and match in every shape; `round_replay
+--steps-only` replays the GLM serving logs v2 and v3 and the same 11,092 earlier test logs as the build before it. A
+decode round allocates nothing in the Rust after warm-up (a counting-allocator test; `scheduler.rs` `plan` and the
+capped-round pick moved to stack arrays for it). Linux: `scripts/host_tests.sh` passes with Rust 1.94.1.
+`driver_facade_test` covers the exception, refusal, call-back and move paths.
+
 ### R5. Service, control, bootstrap and ingress to Rust; ModuleOps
 
 Moves `service.h`, `bootstrap.h`, `control_*.h`, `ingress.h`, `trace.h`, `event_gate.h` and `resources.h`;

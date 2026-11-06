@@ -230,6 +230,14 @@ inline Quantum from_rs(const g6sch_quantum& o) {
     }
     return q;
 }
+inline g6sch_commit to_rs(const Commit& e) {
+    g6sch_commit x{};
+    x.epoch = e.epoch; x.event = e.event; x.boundary = e.boundary; x.before_hash = e.before_hash;
+    if ((x.has_cancel = bool(e.cancel))) std::memcpy(&x.cancel, &*e.cancel, sizeof x.cancel);
+    if ((x.has_admit = bool(e.admit))) std::memcpy(&x.admit, &*e.admit, sizeof x.admit);
+    if ((x.has_shrink = bool(e.shrink))) std::memcpy(&x.shrink, &*e.shrink, sizeof x.shrink);
+    return x;
+}
 // the Rust side agrees on every shared struct layout (g6sch_layout) and every constant both sides define
 inline void check_abi() {
     static const bool ok = [] {
@@ -272,6 +280,8 @@ class Scheduler {
     g6sch_state st_{};
     const g6sch_slot* rs() const { return sch::c<g6sch_slot>(s_.data()); }
     g6sch_slot* rs() { return sch::m<g6sch_slot>(s_.data()); }
+    friend class Driver;   // the Rust driver acts on this state (driver.h)
+    g6s2_drv_sched raw() { return {&c_, rs(), MAX_SESSIONS, &st_}; }
 public:
     explicit Scheduler(Config c) : c_(c) {
         sch::check_abi();
@@ -315,11 +325,7 @@ public:
         return g6sch_digest_slots(&c_, rs(), MAX_SESSIONS, h);
     }
     Changes apply(const Commit& e) {
-        g6sch_commit x{};
-        x.epoch = e.epoch; x.event = e.event; x.boundary = e.boundary; x.before_hash = e.before_hash;
-        if ((x.has_cancel = bool(e.cancel))) std::memcpy(&x.cancel, &*e.cancel, sizeof x.cancel);
-        if ((x.has_admit = bool(e.admit))) std::memcpy(&x.admit, &*e.admit, sizeof x.admit);
-        if ((x.has_shrink = bool(e.shrink))) std::memcpy(&x.shrink, &*e.shrink, sizeof x.shrink);
+        const g6sch_commit x = sch::to_rs(e);
         Changes d;
         d.freed.resize(MAX_SESSIONS);
         size_t n = 0; bool admitted = false;
@@ -332,7 +338,7 @@ public:
     void grow(const Key& k, const Run& r) {
         check(g6sch_grow(&c_, rs(), MAX_SESSIONS, &st_, sch::c<g6sch_key>(&k), sch::c<g6sch_run>(&r)));
     }
-    // the decoding sessions in ascending request id, as next() orders them
+    // the decoding sessions in ascending request id, as next() orders them (tests only; the driver's is Rust's)
     std::vector<Key> decoding() const {
         std::vector<Key> out(MAX_SESSIONS);
         out.resize(g6sch_decoding(rs(), MAX_SESSIONS, sch::m<g6sch_key>(out.data())));

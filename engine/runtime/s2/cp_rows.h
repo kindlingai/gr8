@@ -37,6 +37,7 @@ inline int cp_step_rows(int64_t v, int solo, int full, std::string* err)
 }
 struct CpCand { uint64_t id; bool past; };   // a decoding session: its immutable id, its next round may run past R
 static_assert(sizeof(CpCand) == sizeof(g6sch_cand), "scheduler-rs layout");
+// CpPick and CpRound: m4sim.cu and the tests only; the driver picks in Rust (driver.rs)
 struct CpPick {
     std::vector<bool> in;   // per candidate: in this round
     bool capped = false;    // a cycle round (the others sit it out); false = everyone, and the cycle resets
