@@ -1,18 +1,20 @@
 # Known issues
 
-Bugs we are still working out. The PR that fixes one removes its entry.
+Bugs we are still working out, by model. The PR that fixes one removes its entry.
 
-## 1. Prefix-reuse miss near 786K tokens (TP=6, six Sparks) - Open
+## GLM-5.3
+
+### 1. Prefix-reuse miss near 786K tokens (TP=6, six Sparks) - Open
 
 - A request that should reuse a ~786K-token resident prefix misses and does a full re-prefill.
 - Next step: log a reason code for each miss and return the longest valid resident prefix, not all-or-nothing.
 
-## 2. Aggregate decode stays flat past S=4 (TP=6, six Sparks) - Open
+### 2. Aggregate decode stays flat past S=4 (TP=6, six Sparks) - Open
 
 - Aggregate decode, tok/s: S1 39.7, S2 53.1, S4 52.1, S6 52.8 (2200 MHz cap).
 - We do not know yet if the cause is the scheduler or weight bandwidth.
 
-## 3. One first-request output mismatch after a boot - Open (not reproduced)
+### 3. One first-request output mismatch after a boot - Open (not reproduced)
 
 - **Symptom:** once, on a fresh TP6 boot (engine started with `--top 20`), the first-request check did not repeat itself.
   The check sends the same 8,203-row prompt twice and decodes 32 tokens greedily (A1, A2). A1 and A2 differed (text hash
@@ -28,3 +30,11 @@ Bugs we are still working out. The PR that fixes one removes its entry.
   sub-batch was already wrong, which points at something before or during the first prefill, not at decode). Not proven.
 - **If it happens again:** keep the rank logs of that boot (each rank's first three `prefill rows` residual lines), note which binary and
   arguments ran, and repeat the check on a fresh boot of main.
+
+## GLM-5.3-Flash
+
+No open bugs recorded. [docs/FLASH.md](docs/FLASH.md#not-yet) lists what Flash does not do yet.
+
+## DeepSeek-V4.1-Flash
+
+TODO-DS-ISSUES

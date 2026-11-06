@@ -1,9 +1,29 @@
 # GLM-5.3-Flash
 
+One to four DGX Spark (GB10) boxes (TP=1 to TP=4). Weights: the exlr8 release on Hugging Face,
+[kindlingai/glm-5.3-flash-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4).
+
 gr8 serves [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) from its exlr8 release
 ([kindlingai/glm-5.3-flash-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4)) at TP=4,
 TP=3 (a three-box ring, variant k4), TP=2 or TP=1 (one box, variant k2, the one width whose weights fit). The engine is `bin/g6m4_flash`, a build of the same `g6m4` source with `-DG6_MODEL_FLASH=1`
 (`engine/model_geom.h` holds the geometry).
+
+## Results
+
+On one and two boxes, from the recipe repos (the one-box numbers are the image's defaults, also in its
+[kindling.json](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark/blob/main/kindling.json)):
+
+| | one box (TP=1) | two boxes (TP=2), first run |
+|---|---|---|
+| width, KV, drafting | K2, int4 KV, DFlash2 | K4, int4 KV, DFlash2 |
+| decode, code / prose / structured | 54.3 / 29.1 / 66.0 tok/s | 71.1 / 41.5 / 90.0 tok/s |
+| prefill, 8K / 32K / 128K prompt | 1,214 / 1,224 / 1,048 tok/s | 1,698 / 1,694 / 1,404 tok/s |
+| aggregate decode, 1 / 2 / 4 / 8 streams | 40.8 / 44.1 / 58.0 / 59.2 tok/s | not measured yet |
+| KV pool | 700,032 tokens, up to 4 requests at once | `CAP` 262,208 |
+| from | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark), `gr8 glm53f bench`, 2026-11-06 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark), "First numbers", 2026-11-06 |
+
+The two-box numbers are from a first run and are not yet in a kindling.json. At TP=3 and TP=4 the sections below have
+what is measured so far. Open bugs: [KNOWN-ISSUES.md](../KNOWN-ISSUES.md#glm-53-flash).
 
 ## Build and run
 
