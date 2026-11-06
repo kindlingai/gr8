@@ -36,7 +36,7 @@ class OptionTests(unittest.TestCase):
     def test_refusals(self):
         for argv, want in ((['--tp', '6'], 'want 4, 3, 2 or 1 (glm53f)'), (['--kv-format', 'int4'], 'fp8 KV build only'),
                            (['--tp', '3', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3', '--drafter', 'https://huggingface.co/a/b'],
-                            'runs at TP=4 (split) and TP=6')):
+                            'runs at TP=4 and TP=1 (split) and TP=6')):
             with self.assertRaises(opt.OptionError) as e:
                 flash(*argv)
             self.assertIn(want, str(e.exception))
@@ -68,11 +68,13 @@ class OptionTests(unittest.TestCase):
             self.assertIn('GR8_GLM53F_PF_DSA_F16GEMM=1', plan['env'])
 
     def test_one_box(self):
-        # TP=1: one box, K2 (the width whose experts fit), one session, no drafter
+        # TP=1: one box, K2 (the width whose experts fit), one session, the drafter on as at TP=4 (the supervisor turns
+        # it off when the boot names none)
         o = flash('--tp', '1', peers='10.0.0.1')
         plan = opt.engine_plan(o)
-        self.assertEqual((plan['knobs']['SESS'], plan['knobs']['DFLASH']), ('1', '0'))
-        self.assertNotIn('--dflash-manifest', plan['args'])
+        self.assertEqual((plan['knobs']['SESS'], plan['knobs']['DFLASH']), ('1', '1'))
+        self.assertIn('--dflash-manifest', plan['args'])
+        flash('--tp', '1', '--drafter', 'https://huggingface.co/a/b', peers='10.0.0.1')
         self.assertIn('GR8_PF_ROUTER_SPLIT=0', plan['env'])
         self.assertEqual(models.GLM53F.default_variant[1], ('k2',))
         self.assertEqual((S.fabric_needed(o), S.fabric_needed(flash())), (False, True))

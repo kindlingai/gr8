@@ -288,8 +288,8 @@ def validate(o):
         raise OptionError(f'--drafter {o.get("DRAFTER")}: want https://huggingface.co/<org>/<repo>[@rev]')
     if not model.drafter and (o.get('DRAFTER') or o.get('DFLASH') == '1'):
         raise OptionError(f'--drafter, --dflash 1: {model.name} has no DFlash2 drafter')
-    if o.get('DRAFTER') and tp not in ('4', '6'):
-        raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4 (split) and TP=6 (replicated) only, not TP={tp}')
+    if o.get('DRAFTER') and tp not in ('4', '6', '1'):
+        raise OptionError(f'--drafter: the DFlash2 drafter runs at TP=4 and TP=1 (split) and TP=6 (replicated) only, not TP={tp}')
     if not str(o.get('DEFAULT_MAX_TOKENS')).isdigit():
         raise OptionError(f'--default-max-tokens {o.get("DEFAULT_MAX_TOKENS")}: want a whole number (0 = fit SHARE_LIMIT)')
     effort = o.get('DEFAULT_REASONING_EFFORT')

@@ -83,7 +83,9 @@ prefill sends none, so a prefill longer than that fails.
 `--tp 1` serves the whole model on one GB10 with the k2 width (about 93 GB of weights on the device). The ranks' fabric
 has no peers then: `g6::Fabric` keeps its region for the kernels' own slots and skips the NIC, the bootstrap and the
 proxy (`engine/comms/fabric.cpp`), and the S2 head agrees with itself (`s2/control_channel.h`). The launcher skips the
-RDMA checks. The router is not split (no ranks to split it over), so the routed experts run on the expert tiles.
+RDMA checks. The router is not split (no ranks to split it over), so the routed experts run on the expert tiles. A
+session alone drafts with the DFlash2 drafter when the boot names one (`--drafter`): its body is whole on the one rank,
+about 1.3 GB, and the supervisor converts it for the rank on the first boot.
 
 ## Several sessions
 
