@@ -6,6 +6,8 @@
 //                       (complete, last token <= the row's position); 1/64 = 128^-0.5 * 32^-0.5
 //           kp_select   the top min(512, visible) pools, ties to the lower pool index, written as their 4 positions in
 //                       ascending order, then the incomplete tail (positions (pos+1) - (pos+1) % 4 .. pos), -1 after
+//           kp_select_tile  the same list from key tiles of KP_TILE pools and a running top-512 (below), for a call
+//                       whose pool stride passes KP_TILE: its scratch is one tile per row, not the context
 // Every product and sum is FP32 from the FP16 inputs, so the selection equals the float64 reference on the same inputs
 // up to pools whose scores differ by FP32 rounding.
 
@@ -56,11 +58,12 @@ __global__ void kp_pool(Input input){
 __device__ __forceinline__ int kp_visible(const DeviceAttn& a,int r){
     const int cnt=min(a.positions[r]+1,a.live_context);return cnt>0?cnt/KP:0;
 }
-// grid (pstride / 32, rows), 256 threads: 32 pools x 32 heads per CTA; thread = (pool t / 8, heads t % 8 + 8 k)
+// grid (pools / 32, rows), 256 threads: 32 pools x 32 heads per CTA; thread = (pool t / 8, heads t % 8 + 8 k). Pools
+// from p_off (a key tile, kp_select_tile; 0 = all of them): pool p's score at scores[row * pstride + p - p_off]
 template<class Input>
-__global__ void kp_scores(Input input,int start,float* scores,int pstride){
+__global__ void kp_scores(Input input,int start,float* scores,int pstride,int p_off=0){
     auto a=resolve(input);if(!a.active)return;
-    const int row=blockIdx.y,r=start+row,p0=blockIdx.x*32,t=threadIdx.x;FOR_ROW(a,input,r);
+    const int row=blockIdx.y,r=start+row,p0=p_off+blockIdx.x*32,t=threadIdx.x;FOR_ROW(a,input,r);
     const int nvis=kp_visible(a,r);
     if(p0>=nvis)return;
     const int npools=min(32,nvis-p0);
@@ -85,7 +88,7 @@ __global__ void kp_scores(Input input,int start,float* scores,int pstride){
     if(hl==0&&pp<npools){
         float s=sum*(1.f/64)+0.f;   // + 0: -0 (all relu 0, negative weights) ties with +0, as in the reference
         if(!isfinite(s)){error(a,4);s=-INFINITY;}
-        scores[(int64_t)row*pstride+p0+pp]=s;}
+        scores[(int64_t)row*pstride+p0-p_off+pp]=s;}
 }
 // descending float order as unsigned (larger float -> larger key)
 __device__ __forceinline__ unsigned kp_key(float f){const unsigned u=__float_as_uint(f);return (u&0x80000000u)?~u:(u|0x80000000u);}
@@ -210,5 +213,95 @@ __global__ void __launch_bounds__(SELT) kp_select(Input input,int start,const fl
         }
     }
     const int nsel=base_s*KP,tail0=cnt-cnt%KP;
+    for(int j=nsel+t;j<TOP;j+=SELT){const int x=tail0+(j-nsel);out[j]=x<cnt?x:-1;}
+}
+// A call whose pool stride passes KP_TILE scores its pools in key tiles of KP_TILE and keeps a running top-512 per row
+// (kp_select_tile), so its scratch holds one tile, not the context. Tile k reads the carry of tiles < k: the top
+// min(512, pools before the tile) pools so far in ascending pool id, with their scores. The candidates are the carry,
+// then the tile's visible pools; every carry id is below the tile's, so ascending candidate order is ascending pool id,
+// and the same radix select (ties to the lower candidate) keeps the top 512 of the pools seen. The top 512 of a set
+// under (score descending, id ascending) is the top 512 of (the top 512 of its first part, the rest), so the last tile's
+// list is kp_select's, ties included. The last tile writes the row's indices; a row with no pool in a tile copies its
+// carry to the other buffer, and one with at most 512 visible pools takes them all at the last tile, as kp_select.
+#ifndef KP_TILE_POOLS
+#define KP_TILE_POOLS 16384   // 64K tokens: one tile at the contexts the benches run; a smaller value tests the tiles
+#endif
+constexpr int KP_TILE=KP_TILE_POOLS;
+static_assert(KP_TILE%32==0&&KP_TILE>=g6kv::TOP_POOLS,"KP_TILE_POOLS: a multiple of 32, at least 512");
+template<class Input>
+__global__ void __launch_bounds__(SELT) kp_select_tile(Input input,int start,const float* scores,int tstride,
+                                                       const float* cs_in,const int* ci_in,float* cs_out,int* ci_out,
+                                                       int t0,int nt,int last){
+    auto a=resolve(input);if(!a.active)return;
+    const int row=blockIdx.x,r=start+row,t=threadIdx.x;FOR_ROW(a,input,r);
+    const int nvis=kp_visible(a,r),cnt=a.positions[r]+1,tail0=cnt-cnt%KP;
+    int* out=a.indices+(int64_t)r*TOP;
+    if(nvis<=g6kv::TOP_POOLS){
+        if(!last)return;
+        for(int p=t;p<nvis;p+=SELT){
+            #pragma unroll
+            for(int j=0;j<KP;j++)out[p*KP+j]=p*KP+j;
+        }
+        const int nsel=nvis*KP;
+        for(int j=nsel+t;j<TOP;j+=SELT){const int x=tail0+(j-nsel);out[j]=x<cnt?x:-1;}
+        return;
+    }
+    const int cc=min(g6kv::TOP_POOLS,min(nvis,t0)),vt=max(0,min(nvis-t0,nt));
+    const float* s=scores+(int64_t)row*tstride;
+    const float* cs=cs_in+(int64_t)row*g6kv::TOP_POOLS;
+    const int* ci=ci_in+(int64_t)row*g6kv::TOP_POOLS;
+    if(!vt){
+        if(!last){   // no pool of the row in this tile: its carry moves to the buffer the next tile reads
+            for(int i=t;i<cc;i+=SELT){cs_out[(int64_t)row*g6kv::TOP_POOLS+i]=cs[i];ci_out[(int64_t)row*g6kv::TOP_POOLS+i]=ci[i];}
+            return;
+        }
+        for(int i=t;i<cc;i+=SELT){
+            const int p=ci[i];
+            #pragma unroll
+            for(int j=0;j<KP;j++)out[i*KP+j]=p*KP+j;
+        }
+        const int nsel=cc*KP;
+        for(int j=nsel+t;j<TOP;j+=SELT){const int x=tail0+(j-nsel);out[j]=x<cnt?x:-1;}
+        return;
+    }
+    const int n=cc+vt;
+    auto score=[&](int i){return i<cc?cs[i]:s[i-cc];};
+    __shared__ int hist[256],need_s,base_s,eqbase_s;__shared__ unsigned prefix_s;
+    unsigned prefix=0,mask=0;int k=g6kv::TOP_POOLS;
+    for(int pass=0;pass<4;pass++){const int shift=24-8*pass;
+        for(int i=t;i<256;i+=SELT)hist[i]=0;
+        __syncthreads();
+        for(int i=t;i<n;i+=SELT){const unsigned key=kp_key(score(i));if((key&mask)==prefix)atomicAdd(&hist[(key>>shift)&255],1);}
+        __syncthreads();
+        if(t<32)kp_pick(hist,k,prefix,shift,&prefix_s,&need_s);
+        __syncthreads();
+        prefix=prefix_s;k=need_s;mask|=255u<<shift;
+        __syncthreads();
+    }
+    const unsigned thr=prefix;const int need=k;
+    typedef cub::BlockScan<int,SELT> Scan;
+    __shared__ typename Scan::TempStorage ts;
+    if(t==0){base_s=0;eqbase_s=0;}
+    __syncthreads();
+    for(int c=0;c<n;c+=SELT){
+        const int i=c+t;const bool in=i<n;const float v=in?score(i):0.f;const unsigned key=in?kp_key(v):0u;
+        const bool gt=in&&key>thr,eq=in&&key==thr;
+        int ex,etot;Scan(ts).ExclusiveSum(eq?1:0,ex,etot);
+        __syncthreads();
+        const bool sel=gt||(eq&&eqbase_s+ex<need);
+        int sx,stot;Scan(ts).ExclusiveSum(sel?1:0,sx,stot);
+        if(sel){
+            const int o=base_s+sx,p=i<cc?ci[i]:t0+i-cc;
+            if(last){
+                #pragma unroll
+                for(int j=0;j<KP;j++)out[o*KP+j]=p*KP+j;
+            }else{cs_out[(int64_t)row*g6kv::TOP_POOLS+o]=v;ci_out[(int64_t)row*g6kv::TOP_POOLS+o]=p;}
+        }
+        __syncthreads();
+        if(t==0){base_s+=stot;eqbase_s+=etot;}
+        __syncthreads();
+    }
+    if(!last)return;
+    const int nsel=base_s*KP;
     for(int j=nsel+t;j<TOP;j+=SELT){const int x=tail0+(j-nsel);out[j]=x<cnt?x:-1;}
 }
