@@ -1,5 +1,5 @@
 // The C-ABI functions of gr8's host-side S2 scheduling logic in Rust (for C++ callers: bool fields, <cstdint>) (engine/scheduler-rs, docs/HOST-CORE.md R2). Built as
-// libg6sched.a with cargo; g6m4, m4sim and the host tests link it. The C++ headers in engine/runtime/s2 keep their
+// libg6host.a (engine/Cargo.toml); g6m4, m4sim and the host tests link it. The C++ headers in engine/runtime/s2 keep their
 // types and call these; the structs here have the same layout as theirs (static_asserts in each wrapper) and as the
 // Rust's (the layout digest at the end, checked at startup). Fallible calls return 0 or a code, or null or the refusal's
 // message, which the wrapper throws; see each call for what a refusal leaves changed.

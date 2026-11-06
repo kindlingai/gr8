@@ -30,10 +30,11 @@ cache_counts() { [ -f $GR8_NVCC_CACHE_LOG ] && echo "nvcc cache: $(grep -c '^hit
 # builds it with cargo
 KNOBLIB=../knobs-rs/target/release/libgr8knobs.a
 [ -f "$KNOBLIB" ] || { echo "need $KNOBLIB: cargo build --release --features capi --manifest-path engine/knobs-rs/Cargo.toml"; exit 1; }
-# the host-side S2 scheduling logic in Rust (engine/scheduler-rs, g6sched.h): everything that links the knob table
-SCHEDLIB=../scheduler-rs/target/release/libg6sched.a
-[ -f "$SCHEDLIB" ] || { echo "need $SCHEDLIB: cargo build --release --manifest-path engine/scheduler-rs/Cargo.toml"; exit 1; }
-KNOBS="$KNOBLIB $SCHEDLIB -lpthread -ldl -lm"
+# the host Rust (engine/Cargo.toml): the S2 scheduling logic (g6sched.h) and the S2 page allocator (g6kvman.h, wrapped
+# by s2/pool.h) in one library. Everything that links the knob table links it. scripts/build.sh builds it with cargo
+HOSTLIB=../target/release/libg6host.a
+[ -f "$HOSTLIB" ] || { echo "need $HOSTLIB: cargo build --release --manifest-path engine/Cargo.toml"; exit 1; }
+KNOBS="$KNOBLIB $HOSTLIB -lpthread -ldl -lm"
 # the attention TU, its binder and its op table (attn/ops.h): attn.cu + bind.cu + ops_glm.cu (GLM), flash_attn.cu +
 # flash_bind.cu + ops_flash.cu (Flash: NoPE MLA + kpool indexer), ds41_attn_dspark.cu + ds41_bind.cu + ops_ds41.cu (DeepSeek-V4.1-Flash-1017:
 # ops_ds41.cu is the table that names the ops that exist)
@@ -86,9 +87,6 @@ if [ -n "${GR8_XGRAMMAR:-}" ] && [ "$WHAT" != sim ]; then
   g++ -O2 -std=c++17 -DG6_GRAMMAR=1 -I. -o $OUT/grammar_test tests/grammar_test.cc $GRLINK -lpthread || exit 1
   $OUT/grammar_test || exit 1
 fi
-# the S2 page allocator (engine/kvman-rs, wrapped by s2/pool.h): g6m4 and m4sim link it. scripts/build.sh builds it with cargo
-KVLIB=../kvman-rs/target/release/libg6kvman.a
-[ -f "$KVLIB" ] || { echo "g6m4 and m4sim need $KVLIB: cargo build --release --manifest-path engine/kvman-rs/Cargo.toml"; exit 1; }
 
 # One binary for every TP width. Each width compiles the sources that depend on it (m4sim.cu / g6m4.cu and the
 # attn.cu / bind.cu they link) with that width's flags, as a one-width build did, so its kernels are the same ones.
@@ -130,7 +128,7 @@ done
 wait
 cat $O/*.log
 if ls $O/*.failed > /dev/null 2>&1; then echo "build_m4.sh failed: $(cd $O && ls *.failed | sed 's/\.log\.failed//')"; exit 1; fi
-SHARED="$O/g6pack.o $O/devimage.o ${KVC%% *} $KVLIB $KNOBLIB $SCHEDLIB"
+SHARED="$O/g6pack.o $O/devimage.o ${KVC%% *} $KNOBLIB $HOSTLIB"
 if [ "$WHAT" != sim ]; then SHARED="$SHARED $O/fabric.o"; fi
 if [ -n "$RSDEF" ]; then SHARED="$SHARED $RSLIB"; fi
 nm --defined-only -g $SHARED 2> /dev/null | awk 'NF == 3 { print $3 }' | sort -u > $O/shared.syms
@@ -145,13 +143,13 @@ inst() {   # inst <bin> <width>: $O/<bin>.w<width>.i.o, the width's instance of 
 if [ "$WHAT" != g6 ]; then
   I=""
   for n in $WIDTHS; do inst m4sim $n; I="$I $O/m4sim.w$n.i.o"; done
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN -DM4SIM -o $OUT/m4sim widths.cpp $I $O/g6pack.o $O/devimage.o $KVC $RSLINK $KVLIB $KNOBS -lcublas -lcublasLt
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN -DM4SIM -o $OUT/m4sim widths.cpp $I $O/g6pack.o $O/devimage.o $KVC $RSLINK $KNOBS -lcublas -lcublasLt
   ls -la $OUT/m4sim
 fi
 if [ "$WHAT" != sim ]; then
   I=""
   for n in $WIDTHS; do inst g6m4 $n; I="$I $O/g6m4.w$n.i.o"; done
-  nice -n 19 $NVCC -O2 -std=c++17 $GEN $GRDEF -o $OUT/g6m4 widths.cpp $I $O/fabric.o $O/g6pack.o $O/devimage.o $KVC $GRLINK $RSLINK $KVLIB $KNOBS -lcublas -lcublasLt -libverbs
+  nice -n 19 $NVCC -O2 -std=c++17 $GEN $GRDEF -o $OUT/g6m4 widths.cpp $I $O/fabric.o $O/g6pack.o $O/devimage.o $KVC $GRLINK $RSLINK $KNOBS -lcublas -lcublasLt -libverbs
   if [ -n "$GRDEF" ]; then echo "g6m4: request grammars (XGrammar) linked"; fi
   if [ -n "$RSDEF" ]; then echo "g6m4: Rust pack loader linked"; else echo "g6m4: no $RSLIB, C++ pack loader only"; fi
   ls -la $OUT/g6m4

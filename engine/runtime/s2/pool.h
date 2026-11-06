@@ -3,7 +3,7 @@
 // evicted least recently retired first, runs that grow on demand under a safe-state check). Host only, no CUDA. One
 // instance per rank. Every rank makes the same calls in the same order: admissions at the event fences (service.h),
 // growth and retirement in Driver::step. The lock is in kvman-rs, one call at a time: on the head, publish_status reads
-// the pool from the control thread. Binaries that include it link libg6kvman.a. A pool error throws, with the message
+// the pool from the control thread. Binaries that include it link libg6host.a. A pool error throws, with the message
 // of require().
 // log(true) (g6m4: GR8_POOL_LOG=1): one stderr line per claim, with its pages and every retained run it evicted.
 // stores() + add_tier(): block stores below the pool (kvman-rs src/stash.rs). The engine then takes io() after each

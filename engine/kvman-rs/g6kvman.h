@@ -1,4 +1,4 @@
-// C interface of the Rust S2 page allocator (engine/kvman-rs). Built as libg6kvman.a with cargo. g6m4 links it, and
+// C interface of the Rust S2 page allocator (engine/kvman-rs). Built into libg6host.a (engine/Cargo.toml). g6m4 links it, and
 // engine/runtime/s2/pool.h (RunPool) wraps it. See src/lib.rs for the allocation rules.
 // Calls that can fail return 0 or an error code, which g6kv_error names (the C++ pool's messages). An error leaves the
 // pool unchanged. Each call on a g6kv_pool locks it for that call, so two threads may call at once.

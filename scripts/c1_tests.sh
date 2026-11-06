@@ -37,8 +37,9 @@ FLAGS="-gencode=arch=compute_$A,code=sm_$A $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR8_NR
 # every test links the knob table (engine/knobs-rs): the engine headers read their settings through it
 KNOBLIB="$REPO/engine/knobs-rs/target/release/libgr8knobs.a"
 [ -f "$KNOBLIB" ] || cargo build --quiet --release --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
-SCHEDLIB="$REPO/engine/scheduler-rs/target/release/libg6sched.a"   # the S2 scheduling logic (engine/scheduler-rs)
-[ -f "$SCHEDLIB" ] || cargo build --quiet --release --manifest-path "$REPO/engine/scheduler-rs/Cargo.toml"
+# and the host Rust (engine/Cargo.toml): the S2 scheduling logic and the S2 page allocator
+HOSTLIB="$REPO/engine/target/release/libg6host.a"
+[ -f "$HOSTLIB" ] || cargo build --quiet --release --manifest-path "$REPO/engine/Cargo.toml"
 build_run() {   # build_run <test> <extra sources...>  (test args in ARGS); a test outside runtime/tests is a path under engine/
   local src=$1; shift
   case "$src" in */*) ;; *) src=runtime/tests/$src ;; esac
@@ -48,12 +49,12 @@ build_run() {   # build_run <test> <extra sources...>  (test args in ARGS); a te
   [ -x "$BIN" ] || stale=1
   [ "$(cat "$BIN.flags" 2>/dev/null)" = "$FLAGS" ] || stale=1
   if [ "$stale" = 0 ] && [ -n "$(find "$REPO/engine" -type f \( -name '*.cu' -o -name '*.cuh' -o -name '*.h' \) -newer "$BIN" -print -quit)" ]; then stale=1; fi
-  local a; for a in "$@" "$KNOBLIB" "$SCHEDLIB"; do [ -f "$a" ] && [ "$a" -nt "$BIN" ] && stale=1; done   # e.g. a rebuilt libg6kvman.a
+  local a; for a in "$@" "$KNOBLIB" "$HOSTLIB"; do [ -f "$a" ] && [ "$a" -nt "$BIN" ] && stale=1; done   # e.g. a rebuilt libg6host.a
   if [ "$stale" = 1 ]; then
     echo "building $BIN ($FLAGS)"
     rm -f "$BIN" "$BIN.flags"
     # shellcheck disable=SC2086
-    nvcc -O2 -std=c++17 $FLAGS -o "$BIN" "$SRC" "$@" "$KNOBLIB" "$SCHEDLIB" -lpthread -ldl -lm
+    nvcc -O2 -std=c++17 $FLAGS -o "$BIN" "$SRC" "$@" "$KNOBLIB" "$HOSTLIB" -lpthread -ldl -lm
     echo "$FLAGS" > "$BIN.flags"
   else
     echo "up to date: $BIN"
@@ -72,16 +73,17 @@ with_flags() {
   return $r
 }
 FLASH_FLAGS="-DG6_MODEL_FLASH=1 -DG6_NR=2"
-# kvlib_ready: target/release/libg6kvman.a for the tests that link it, built first when cargo is on PATH; 1 (with
-# the reason) when it is missing or older than the crate's sources
+# kvlib_ready: a current libg6host.a for the tests that use the page allocator, built first when cargo is on PATH; 1
+# (with the reason) when it is missing or older than the crates' sources
 kvlib_ready() {
-  local crate="$REPO/engine/kvman-rs" lib="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
+  local e="$REPO/engine"
   if command -v cargo > /dev/null; then
-    cargo build --release -q --manifest-path "$crate/Cargo.toml" || { echo "cargo build --release failed"; return 1; }
+    cargo build --release -q --manifest-path "$e/Cargo.toml" || { echo "cargo build --release failed"; return 1; }
   fi
-  [ -f "$lib" ] || { echo "no $lib (cargo build --release --manifest-path engine/kvman-rs/Cargo.toml)"; return 1; }
-  if [ -n "$(find "$crate/src" "$crate/Cargo.toml" -newer "$lib" -print -quit)" ]; then
-    echo "$lib is older than engine/kvman-rs/src (cargo build --release --manifest-path engine/kvman-rs/Cargo.toml)"
+  [ -f "$HOSTLIB" ] || { echo "no $HOSTLIB (cargo build --release --manifest-path engine/Cargo.toml)"; return 1; }
+  if [ -n "$(find "$e/Cargo.toml" "$e/hostcore-rs" "$e/kvman-rs/src" "$e/kvman-rs/Cargo.toml" "$e/scheduler-rs/src" \
+      "$e/scheduler-rs/Cargo.toml" -newer "$HOSTLIB" -print -quit)" ]; then
+    echo "$HOSTLIB is older than its sources (cargo build --release --manifest-path engine/Cargo.toml)"
     return 1
   fi
 }
@@ -111,11 +113,10 @@ if [ "$TEST" = all ] || [ "$TEST" = kvb8_test ]; then
   esac
 fi
 if [ "$TEST" = all ] || [ "$TEST" = canon_test ]; then
-  # a session's KV across page lists and layouts (#152): links the S2 page allocator's library (engine/kvman-rs)
+  # a session's KV across page lists and layouts (#152): needs the S2 page allocator (engine/kvman-rs)
   [ "$TEST" = all ] && ARGS=()
-  KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
   if why=$(kvlib_ready); then
-    build_run canon_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" "$KVLIB" -lcublas -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    build_run canon_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   else
     echo "SKIP canon_test: $why"
   fi
@@ -123,9 +124,8 @@ fi
 if [ "$TEST" = all ] || [ "$TEST" = kv_resize_test ]; then
   # the KV pool's chunks shrunk and grown under live sessions (#153): the allocator's library and the driver API
   [ "$TEST" = all ] && ARGS=()
-  KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
   if why=$(kvlib_ready); then
-    build_run kv_resize_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" "$REPO/engine/attn/kvchunks.cu" "$KVLIB" -lcublas -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    build_run kv_resize_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" "$REPO/engine/attn/kvchunks.cu" -lcublas -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   else
     echo "SKIP kv_resize_test: $why"
   fi
@@ -133,10 +133,9 @@ fi
 if [ "$TEST" = all ] || [ "$TEST" = flash_kv_chunks_test ]; then
   # the Flash KV caches in chunks (GR8_GLM53F_KV_CHUNKS, runtime/flash_kv.h): the Flash attention, the ledger's library
   [ "$TEST" = all ] && ARGS=()
-  KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
   if why=$(kvlib_ready); then
     GLM_FLAGS="$FLAGS"; FLAGS="$FLAGS -DG6_MODEL_FLASH=1"
-    GR8_TEST_KVMAN_LEDGER="$REPO/engine/kvman-rs/target/release/kvman-ledger" build_run flash_kv_chunks_test "$REPO/engine/attn/flash_attn.cu" "$REPO/engine/attn/flash_bind.cu" "$REPO/engine/attn/ops_flash.cu" "$REPO/engine/attn/kvchunks.cu" "$KVLIB" -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    GR8_TEST_KVMAN_LEDGER="$REPO/engine/target/release/kvman-ledger" build_run flash_kv_chunks_test "$REPO/engine/attn/flash_attn.cu" "$REPO/engine/attn/flash_bind.cu" "$REPO/engine/attn/ops_flash.cu" "$REPO/engine/attn/kvchunks.cu" -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
     FLAGS="$GLM_FLAGS"
   else
     echo "SKIP flash_kv_chunks_test: $why"

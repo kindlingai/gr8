@@ -241,7 +241,7 @@ confirmation boots whose round logs (R0) match byte for byte.
 
 R2 lands in four parts:
 
-1. R2a: the crate (`engine/scheduler-rs`, `libg6sched.a`, `g6sched.h`) and the small policies first: KV copy batches
+1. R2a: the crate (`engine/scheduler-rs`, `g6sched.h`) and the small policies first: KV copy batches
    (`kv_plan.h`), Flash chunk lending (`flash_lend.h`), Flash KDA rings and capture sets (`flash_ring.h`), rounds past R
    (`cp_rows.h`). The C++ headers keep their types and call Rust; the state stays in C++ structs with the same layout,
    so C++ copies and owns it as before. Until R2d the C++ they replaced stayed in `s2/tests/ref/` for a differential
@@ -362,7 +362,7 @@ completions. After R3 every piece it calls is Rust, so the driver moves whole an
     read the whole prefix index, so admission would have to move to the compute thread. That is an R5 question.
   - R4 in PRs, each with a boot. R4a: the driver logic, behind a facade. R4b: the lock moves into kvman-rs's handle
     and `RunPool` drops its mutex, with today's build. R4b2: kvman-rs and scheduler-rs in one Cargo workspace and one
-    staticlib. `panic = "abort"` for dev and release goes in the workspace root, since member profiles are ignored. The
+    staticlib. `panic = "abort"` for release goes in the workspace root, since member profiles are ignored. The
     scripts that link two libraries (`build_m4.sh`, `scripts/build.sh`, `c1_tests.sh`, `host_tests.sh`) link one. R4c:
     the driver calls the pool Rust to Rust, the `Scheduler` mirror goes, and `share_apply` moves beside the driver.
     R4a and R4b do not depend on each other.

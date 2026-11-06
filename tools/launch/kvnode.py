@@ -166,7 +166,7 @@ def read_json(path):
 
 def node_bin(o):
     for p in (o.get('KV_BIN'), os.path.join(o.get('GR8_WORK_DIR'), 'bin', 'kvman-remote'),
-              os.path.join(REPO, 'engine', 'kvman-rs', 'target', 'release', 'kvman-remote')):
+              os.path.join(REPO, 'engine', 'target', 'release', 'kvman-remote')):
         if p and os.access(p, os.X_OK):
             return p
     return None
@@ -265,7 +265,7 @@ class Supervisor:
         b = node_bin(o)
         if not b:
             raise RuntimeError('no kvman-remote: ./gr8 glm53 build, or cargo build --release --manifest-path '
-                               'engine/kvman-rs/Cargo.toml')
+                               'engine/Cargo.toml')
         ready_path = os.path.join(self.out, 'ready.json')
         try:
             os.unlink(ready_path)

@@ -579,7 +579,7 @@ class DonorTests(unittest.TestCase):
             s.donate(knobs)
         return s, ' '.join(str(c.args[0]) for c in logged.call_args_list)
 
-    @unittest.skipUnless(S.ledger_bin(opt.REPO), 'kvman-ledger is not built (cargo build --release in engine/kvman-rs)')
+    @unittest.skipUnless(S.ledger_bin(opt.REPO), 'kvman-ledger is not built (cargo build --release in engine)')
     def test_a_flash_box_starts_a_lazy_node_with_a_ledger_and_stops_it(self):
         s, said = self.donor({'FLASH_KV_DONATE_GIB': '1', 'FLASH_KV_GROWTH_GIB': '0', 'FLASH_KV_GROUP': 'gr8-full'})
         try:
@@ -605,7 +605,7 @@ class DonorTests(unittest.TestCase):
         self.assertFalse(s.donor)
         self.assertFalse(S.kvnode.running(os.path.join(s.home, 'out', 'kv')))
 
-    @unittest.skipUnless(S.ledger_bin(opt.REPO), 'kvman-ledger is not built (cargo build --release in engine/kvman-rs)')
+    @unittest.skipUnless(S.ledger_bin(opt.REPO), 'kvman-ledger is not built (cargo build --release in engine)')
     def test_borrow_idle_books_the_gpu_chunks_in_the_ledger(self):
         g = 5 * (1 << 30) + 12345
         s, said = self.donor({'FLASH_KV_DONATE_GIB': '1', 'FLASH_KV_GROWTH_GIB': '0', 'FLASH_KV_GROUP': 'gr8-full',

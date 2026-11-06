@@ -9,7 +9,7 @@
 //   3. the live sessions' pages are byte-identical before and after the shrink and the grow, and pages that come back
 //      read as zero;
 //   4. a shrink while a live session holds a page in every chunk it could take waits (nothing unmapped).
-// Build and run: TEST=kv_resize_test scripts/c1_tests.sh <bin_dir> (links engine/kvman-rs's libg6kvman.a and -lcuda)
+// Build and run: TEST=kv_resize_test scripts/c1_tests.sh <bin_dir> (links libg6host.a, which holds engine/kvman-rs, and -lcuda)
 // Exit code: 0 PASS, 1 FAIL, 2 CUDA error.
 #include <algorithm>
 #include <cstdint>
