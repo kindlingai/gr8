@@ -364,6 +364,12 @@ completions. After R3 every piece it calls is Rust, so the driver moves whole an
     scripts that link two libraries (`build_m4.sh`, `scripts/build.sh`, `c1_tests.sh`, `host_tests.sh`) link one. R4c:
     the driver calls the pool Rust to Rust, the `Scheduler` mirror goes, and `share_apply` moves beside the driver.
     R4a and R4b do not depend on each other.
+  - R4b landed. `ffi::Handle` holds the `Mutex<Pool>`, and each `g6kv_*` call on a `g6kv_pool` locks it once, reads
+    included. `g6kv_list` takes the caller's buffer and its `cap`, and reports the run's length. `RunPool::list` sizes
+    the buffer from `Run::pages`, one allocation as before. kvman-rs still unwinds in dev (a `#[should_panic]` test in
+    `remote/server.rs`), so a poisoned lock hands the pool on as it is. No pool call calls a C function pointer.
+    Checked: `tests/ffi_threads.rs` (a compute and a control thread on one handle through the C API), kvman-rs's
+    `cargo test` and `host_tests.sh` on Linux, and the pool host tests on macOS. Boot pending.
 - Proof: the round log replays unchanged (the driver's calls into the planner are the log's calls), the scheduler and
   driver host tests (`driver_grow_test`, the `scheduler_*` tests, `cp_rows_test`) run against the Rust driver behind a
   thin C++ facade as R3b did, and a confirmation boot's logs equal the earlier boots'. One C call per quantum.
