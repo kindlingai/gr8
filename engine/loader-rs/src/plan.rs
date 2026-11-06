@@ -44,8 +44,9 @@ impl Gen {
         }
     }
 
-    /// The bytes, computing them on first use.
-    pub fn get(&self) -> Result<Arc<Vec<u8>>, String> {
+    /// The bytes, computing them on first use. With a cache (G6_GEN_CACHE, gencache.rs): read the verified
+    /// cache entry instead; on any miss compute and write. The state mutex keeps one worker per gen either way.
+    pub fn get(&self, cache: Option<&crate::gencache::GenCache>) -> Result<Arc<Vec<u8>>, String> {
         let t_lock = std::time::Instant::now();
         let mut s = self.state.lock().unwrap();
         let lock_ns = t_lock.elapsed().as_nanos() as u64;
@@ -57,11 +58,26 @@ impl Gen {
         if self.left.load(Ordering::Relaxed) < self.nbytes {
             return Err(format!("{}: computed twice", self.what));
         }
+        if let Some(c) = cache {
+            if let Some(bytes) = c.read(&self.what, self.nbytes) {
+                use std::sync::atomic::Ordering::Relaxed;
+                c.hits.fetch_add(1, Relaxed);
+                c.hit_bytes.fetch_add(self.nbytes, Relaxed);
+                let a = Arc::new(bytes);
+                *s = Some(a.clone());
+                return Ok(a);
+            }
+            use std::sync::atomic::Ordering::Relaxed;
+            c.misses.fetch_add(1, Relaxed);
+        }
         let t_comp = std::time::Instant::now();
         let v = (self.make)().map_err(|e| format!("{}: {e}", self.what))?;
         self.compute_ns.store(t_comp.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if v.len() as u64 != self.nbytes {
             return Err(format!("{}: {} bytes computed, {} planned", self.what, v.len(), self.nbytes));
+        }
+        if let Some(c) = cache {
+            c.write(&self.what, &v);
         }
         let a = Arc::new(v);
         *s = Some(a.clone());

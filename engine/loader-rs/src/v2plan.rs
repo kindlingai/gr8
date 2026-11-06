@@ -32,6 +32,8 @@ pub struct V2Image {
     pub tensors: Vec<Tensor>,
     pub bytes: u64,
     pub plan: Plan,
+    /// G6_GEN_CACHE (loader-rs/gencache.rs): set by the C entry point after planning; None = cache off.
+    pub cache: Option<crate::gencache::GenCache>,
 }
 
 impl V2Image {
@@ -276,7 +278,7 @@ pub fn plan(base_manifest: &str, base_pack: &str, v2_dir: &str, slices_dir: &str
     }
     let bytes = b.cur.div_ceil(ALIGN) * ALIGN;
     let plan = Plan::from_segs(b.files, b.segs, b.mems, b.gens, bytes)?;
-    Ok(V2Image { rank, tensors: b.tensors, bytes, plan })
+    Ok(V2Image { rank, tensors: b.tensors, bytes, plan, cache: None })
 }
 
 /// A width manifest (exlr8-v2-manifest).

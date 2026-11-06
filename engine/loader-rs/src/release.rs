@@ -778,7 +778,7 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
     let table = p.table();
     let b = p.b;
     let plan = Plan::from_segs(b.files, b.segs, b.mems, b.gens, bytes)?;
-    Ok((V2Image { rank, tensors: b.tensors, bytes, plan }, table))
+    Ok((V2Image { rank, tensors: b.tensors, bytes, plan, cache: None }, table))
 }
 
 #[cfg(test)]
