@@ -65,6 +65,7 @@ On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 
 | `--default-thinking-budget` | 0 | `thinking_budget` for a chat request that names none, 0 or null (0 = no limit). A request with `logprobs` gets none. `./gr8 glm53 up` passes `DEFAULT_THINKING_BUDGET` when it is set. |
 | `--default-presence-penalty` / `--default-frequency-penalty` | 0 | The server's `presence_penalty` / `frequency_penalty` spec (OpenAI's penalties: the engine lowers the logit of every token the reply already holds by `presence_penalty` + `frequency_penalty` x its count, before temperature and top-p; the prompt does not count, vLLM's semantics). One part, or a comma list of `base=`, `thinking=`, `greedy=` and `nongreedy=` parts, each once. A part is `[+]A[*M]`: an amount added and a multiplier (`base=0.2` adds 0.2 at multiplier 1; `thinking=*1.1` adds nothing and boosts by 10%; `thinking=+0.1*1.1` both; `-0.1*0.5` is fine). For a request the amounts of the matching parts add up and the product of their multipliers scales the sum: `base` always; `greedy` when the request's temperature after defaults is exactly 0, else `nongreedy` (any other temperature, however small, is sampling); `thinking` inside the think block the prompt leaves open (a chat prompt's, until `</think>`; a `thinking_budget` continuation has none). So out = (base.A + gn.A) x base.M x gn.M for the reply and in = (base.A + gn.A + thinking.A) x base.M x gn.M x thinking.M inside the block; the engine gets `presence_penalty` = out and `thinking_presence_penalty` = in - out. The request's own `presence_penalty` replaces `base`'s amount, 0 included (the multiplier stays), and its `thinking_presence_penalty` replaces `thinking`'s amount; the greedy and nongreedy parts are the server's conditions and always apply, so a client that sends `presence_penalty: 0` by habit still gets them. A `temperature=[[+]A][*B]` part is a last stage over each total at the request's effective temperature T (a guard retry keeps the request's T): total' = (total + A x T) x (B x T), the factor only when `*B` is written. So `temperature=*1` makes the penalty proportional to the temperature and exactly zero under greedy, and `temperature=+0.1` adds 0.1 per unit of temperature. (A multiplier of B^T, 1 at T = 0 and B at T = 1, would keep a greedy penalty while still scaling with temperature; not implemented, a possible change.) A spec any combination of which resolves outside -2..2 (either total, or their difference) at any T in 0..2 is refused at boot; a request whose value pushes one outside gets a 400 naming the field. The guard's resamples keep the request's resolved values. A nonzero penalty needs an engine whose hello says `penalties` (g6m4 with the `pen` field, the pseudo engine), else 400. The TP=1 Flash recipe: `thinking=0.5,greedy=0.2,nongreedy=0` for presence. `./gr8 glm53 up` passes `DEFAULT_PRESENCE_PENALTY` / `DEFAULT_FREQUENCY_PENALTY` when they are set. |
 | `--default-think-end-boost` | off | The think-end boost, a soft thinking budget, below. `./gr8 glm53 up` passes `DEFAULT_THINK_END_BOOST` when it is set. |
+| `--default-sequence-penalty` | off | The sequence penalty, below. `./gr8 glm53 up` passes `DEFAULT_SEQUENCE_PENALTY` when it is set. |
 | `--tool-repeat-guard` | 0 | 1 = the repeated-tool-call guard, below. `./gr8 glm53 up` passes `TOOL_REPEAT_GUARD` and, when they differ from these defaults, `--tool-repeat-guard-repeats` (2), `--tool-repeat-guard-temperature` (0.7) and `--tool-repeat-guard-retries` (2). |
 | `--undeclared-tool-calls` | `text` | A call to a tool name the request did not declare. `text`: the call's text stays in `content` and the reply finishes `stop` (vLLM's glm47 parser). `emit`: it is a tool call like any other (`tool_calls`, `finish_reason: tool_calls`, streamed or not), so the client can answer it with its own unknown-tool error; the name must be an identifier (1-128 ASCII letters, digits, `_`, `-`, `.` or `:`, starting with a letter or `_`), the call arrives when the reply ends with it rather than as it is written (so prose after it keeps it prose), and the arguments are strings, having no schema. The rules that tell a call from prose about one are unchanged. `./gr8 glm53 up` passes `UNDECLARED_TOOL_CALLS` when it is `emit`. |
 | `--log-level` | `INFO` | |
@@ -134,6 +135,26 @@ continuation has no open block, so no boost. Drafts are not boosted: around the 
 argmax to `</think>`, the drafter's continuation is rejected and that round commits one token. Elsewhere the ramp (2
 logits per thousand tokens) rarely changes the argmax, so the cost is a few short rounds near the close. The first
 recipe value: `start=0.5x,per1k=2,max=10`.
+
+## Sequence penalty (`--default-sequence-penalty`)
+
+On greedy log-report every failed reply read one log file and transcribed it into its thinking line by line. In one
+reply 274 of 362 log-format lines were verbatim copies of the tool result, and with a hard `thinking_budget` the
+transcription moved into the visible answer after the close. The presence penalty barely touches that (every line has
+a new timestamp, and the prompt is not counted). The sequence penalty is DRY's form, prompt-aware: when the reply's
+last tokens repeat an earlier run of L >= `min` tokens verbatim, the token that continued that run loses min(`cap`,
+`mult` x `base`^(L - `min`)) before temperature and top-p, so a copy gets harder to extend the longer it runs while
+short repeats stay free. The spec is `thinking=M:B:N:C,answer=M:B:N:C,guard=M:B:N:C` (mult:base:min:cap), any of the
+scopes, each off by default. M or C 0 = off. `thinking` applies inside the think block and `answer` outside it, both
+against the whole context (prompt, tool results, reply so far); give `answer` a longer `min`, so a timestamp or an
+error code quoted in the report stays free while a run of whole copied lines is penalized. `guard` applies only in the
+repeated-tool-call guard's retry run, against the token sequence of the call it took back: a confident loop that
+resamples the same call at 0.7 (46 retries and 22 give-ups in one run) is pushed off that sequence from its first
+tokens. A request's `sequence_penalty` (the same string, `"off"` or `false`) wins over the server default. The engine
+finds the longest earlier occurrence on the host before each step (a bigram index over the request, the drafts before a
+verify row included, so it is exact at any draft length; a drafted `</think>` moves the rows after it from the
+thinking scope to the answer scope). Drafters are not penalized. A starting value:
+`thinking=0.8:1.75:4:6,answer=1:1.75:12:6,guard=1:2:1:8`.
 
 ## Repeated tool calls (`--tool-repeat-guard`)
 

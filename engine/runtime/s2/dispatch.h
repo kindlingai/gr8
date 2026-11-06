@@ -4,6 +4,7 @@
 #include "sessions.h"
 #include "../prefix_reuse.h"
 #include "../penalty.h"
+#include "../ctx_index.h"
 #include <functional>
 
 namespace g6s2 {
@@ -78,6 +79,7 @@ class Dispatch {
     g6rt::PenRow* pen_rows_ = nullptr; g6rt::PenSess* pen_sess_ = nullptr;    // the penalty tables (set_penalty)
     std::array<int, MAX_SESSIONS> pen_synced_{};                              // per slot: Session::out tokens the device counts hold
     std::array<bool, MAX_SESSIONS> pen_reset_{};                              // per slot: the counts are an earlier request's
+    std::array<g6rt::CtxIndex, MAX_SESSIONS> ctx_;                             // per slot: prompt + reply indexed (the sequence penalty's thinking scope)
 public:
     Dispatch(const Sessions& sessions, uint32_t rows, DispatchHooks h) : sessions_(sessions), hooks_(std::move(h)), max_rows_(rows) {
         require(rows && bool(hooks_.bucket) && bool(hooks_.mode) && bool(hooks_.launch) && (bool(hooks_.prefill) || bool(hooks_.prefill_seq)), "incomplete dispatch hooks");
@@ -107,7 +109,7 @@ public:
     void begin(unsigned slot, int skip, const g6rt::CacheNamespace& ns = {}) {
         require(slot < MAX_SESSIONS, "invalid dispatch slot");
         rows_[slot].resume(skip, ns);
-        pen_synced_[slot] = 0; pen_reset_[slot] = true;
+        pen_synced_[slot] = 0; pen_reset_[slot] = true; ctx_[slot].clear();
     }
     const g6rt::PrefixReuse& rows(unsigned slot) const { require(slot < MAX_SESSIONS, "invalid dispatch slot"); return rows_[slot]; }
     void release(unsigned slot) {
@@ -188,7 +190,7 @@ public:
     // the tables of a step. After the step the device counts hold every token its sessions had emitted before it: the
     // launch hook returns with the step done, and a session emits only between steps
     void penalty_rows(const s2::Step& sp, bool draft) {
-        for (int r = 0; r < sp.M(); ++r) pen_rows_[r] = {-1, 0, 0, -1, 0.f, 0.f, 0.f, 0.f, 0, 0, 0.f, 0.f};
+        for (int r = 0; r < sp.M(); ++r) pen_rows_[r] = {-1, 0, 0, -1, 0.f, 0.f, 0.f, 0.f, 0, 0, 0.f, 0.f, {-1, -1, -1}, {0.f, 0.f, 0.f}};
         if (draft) return;
         for (size_t j = 0; j < sp.sess.size(); ++j) {
             const unsigned q = unsigned(sp.sess[j]); const auto& s = sessions_.at(q);
@@ -203,8 +205,44 @@ public:
             for (int r = sp.row0[j]; r < sp.row0[j] + sp.rows[j]; ++r)
                 pen_rows_[r] = {int(q), first, r == sp.row0[j], s.think_open ? p.think_end : -1,
                                 p.presence, p.frequency, p.tpresence, p.tfrequency,
-                                s.think_tokens, p.boost_start, p.boost_per1k, p.boost_max};
+                                s.think_tokens, p.boost_start, p.boost_per1k, p.boost_max, {-1, -1, -1}, {0.f, 0.f, 0.f}};
+            if (first < sp.M()) sequence_rows(sp, j, first, s, q);
             pen_synced_[q] = int(s.out.size()); pen_reset_[q] = false;
+        }
+    }
+    // The sequence penalty of session q's rows from `first` on (penalty.h pen_seq, ctx_index.h). Row first + k ends the
+    // sequence prompt ++ reply ++ drafts of rows first + 1 .. first + k, as a step alone at its position would. The
+    // thinking scope matches that sequence against itself while the row is inside the think block (no draft before it
+    // is the close), the answer scope once it is not. The guard scope matches the reply's part against the avoided ids.
+    void sequence_rows(const s2::Step& sp, size_t j, int first, const Session& s, unsigned q) {
+        const auto& p = s.sampling;
+        const bool thinking = p.seq_thinking() && s.think_open, answer = p.seq_answer(), guard = p.seq_guard();
+        if (!thinking && !answer && !guard) return;
+        const auto& prompt = s.payload.prompt;
+        const int np = int(prompt.size()), no = int(s.out.size());
+        const int end = sp.row0[j] + sp.rows[j];
+        std::vector<int> tail; tail.reserve(end - first);   // the drafts: the tokens of rows first + 1 ..
+        for (int r = first + 1; r < end; ++r) tail.push_back(sp.r[r].tok);
+        const auto full = [&](int i) { return i < np ? prompt[i] : i < np + no ? s.out[i - np] : tail[i - np - no]; };
+        const auto reply = [&](int i) { return i < no ? s.out[i] : tail[i - no]; };
+        const auto ref = [&](int i) { return p.avoid[i]; };
+        if (thinking || answer) ctx_[q].extend(full, np + no);
+        for (int r = first; r < end; ++r) {
+            const int k = r - first;
+            auto& row = pen_rows_[r];
+            // inside the block: the thinking scope, else the answer scope, over the whole context
+            const bool in = s.think_open && g6rt::pen_in_think(p.think_end, tail.data(), k);
+            const int scope = in ? 0 : 1;
+            if (in ? thinking : answer) {
+                const g6rt::CtxMatch m = ctx_[q].longest(full, np + no + k);
+                const float pen = g6rt::pen_seq(m.len, p.seq[scope].mult, p.seq[scope].base, p.seq[scope].min, p.seq[scope].cap);
+                if (pen > 0.f) { row.seq_tok[scope] = full(m.next); row.seq_pen[scope] = pen; }
+            }
+            if (guard) {
+                const g6rt::CtxMatch m = g6rt::longest_in(reply, no + k, ref, int(p.avoid.size()));
+                const float pen = g6rt::pen_seq(m.len, p.seq[2].mult, p.seq[2].base, p.seq[2].min, p.seq[2].cap);
+                if (pen > 0.f) { row.seq_tok[2] = p.avoid[m.next]; row.seq_pen[2] = pen; }
+            }
         }
     }
     bool dfl_ok(unsigned slot) const { return hooks_.dfl_ok && hooks_.dfl_ok(int(slot)); }

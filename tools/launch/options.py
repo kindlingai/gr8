@@ -351,6 +351,30 @@ def boost_spec_error(spec):
     return None
 
 
+def seq_spec_error(spec):
+    """Why `spec` is not a sequence penalty spec (the front end's sampling.rs SeqSpec::parse), or None:
+    thinking=M:B:N:C,answer=M:B:N:C,guard=M:B:N:C, M 0 or more, B 1 or more, N 1 or more, C 0 to 20, each scope once."""
+    seen = set()
+    for part in spec.split(','):
+        key, sep, value = part.partition('=')
+        key = key.strip()
+        if not sep or key not in ('thinking', 'answer', 'guard'):
+            return f'{part.strip()!r}: want thinking=, answer= or guard='
+        if key in seen:
+            return f'{key} is given twice'
+        seen.add(key)
+        v = [x.strip() for x in value.split(':')]
+        if len(v) != 4:
+            return f'{key}={value.strip()!r}: want mult:base:min:cap'
+        try:
+            m, b, c = float(v[0]), float(v[1]), float(v[3])
+        except ValueError:
+            return f'{key}: a value is not a number'
+        if not v[2].isdigit() or not (m >= 0 and b >= 1 and int(v[2]) >= 1 and 0 <= c <= 20):
+            return f'{key}={value.strip()}: want mult >= 0, base >= 1, min >= 1 and cap 0 to 20'
+    return None
+
+
 def validate(o):
     """Refuse what this version cannot boot, with the reason."""
     if not o.get('GR8_MODEL'):
@@ -420,6 +444,10 @@ def validate(o):
         err = boost_spec_error(o.get('DEFAULT_THINK_END_BOOST'))
         if err:
             raise OptionError(f'--default-think-end-boost {o.get("DEFAULT_THINK_END_BOOST")}: {err}')
+    if o.get('DEFAULT_SEQUENCE_PENALTY') is not None:
+        err = seq_spec_error(o.get('DEFAULT_SEQUENCE_PENALTY'))
+        if err:
+            raise OptionError(f'--default-sequence-penalty {o.get("DEFAULT_SEQUENCE_PENALTY")}: {err}')
     if o.get('TOOL_REPEAT_GUARD') not in ('0', '1'):
         raise OptionError(f'--tool-repeat-guard {o.get("TOOL_REPEAT_GUARD")}: want 0 or 1')
     if not (str(o.get('TOOL_REPEAT_GUARD_REPEATS')).isdigit() and int(o.get('TOOL_REPEAT_GUARD_REPEATS')) >= 1):

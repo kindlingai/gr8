@@ -200,6 +200,17 @@ options:
       thousand tokens past S (0 or more); M is the cap, 0 to 20. P or M 0 = off. A request's think_end_boost (the same
       string, "off" or false) wins. A thinking_budget still closes the block at its token. Drafts are not boosted, so
       acceptance drops near the close
+  DEFAULT_SEQUENCE_PENALTY:
+    scope: box
+    doc: >-
+      the head's front end: the sequence penalty, DRY's form, as thinking=M:B:N:C,answer=M:B:N:C,guard=M:B:N:C
+      (mult:base:min:cap), any of the scopes; unset = off. When the reply's last tokens repeat an earlier run of L >= N
+      tokens verbatim, the token that continued that run loses min(C, M * B^(L - N)) before temperature and top_p. The
+      thinking scope applies inside the think block and the answer scope outside it, both against the prompt, the tool
+      results and the reply (a model transcribing a tool result stops; give the answer a longer min so short quotes
+      such as a timestamp stay free). The guard scope applies only in the repeated-tool-call guard's retry, against
+      the call it took back, so a retry cannot reproduce it. M or C 0 = the scope off. A request's sequence_penalty
+      (the same string, "off" or false) wins
   TOOL_REPEAT_GUARD:
     scope: box
     default: "0"

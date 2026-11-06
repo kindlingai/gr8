@@ -327,6 +327,9 @@ fn check_penalties(st: &State, prompt: &[u32], g: &mut crate::wire::GenParams) -
     if g.think_end_boost.is_some() && !st.engine.think_end_boost() {
         return Err(ApiError::bad("think_end_boost is not supported by this engine", Some("think_end_boost")));
     }
+    if (g.seq_thinking.is_some() || g.seq_answer.is_some() || g.seq_guard.is_some()) && !st.engine.sequence_penalty() {
+        return Err(ApiError::bad("sequence_penalty is not supported by this engine", Some("sequence_penalty")));
+    }
     let named = [
         ("presence_penalty", g.presence_penalty),
         ("frequency_penalty", g.frequency_penalty),
@@ -338,13 +341,18 @@ fn check_penalties(st: &State, prompt: &[u32], g: &mut crate::wire::GenParams) -
             return Err(ApiError::bad(format!("{k} is not supported by this engine"), Some(k)));
         }
     }
-    if g.thinking_presence_penalty != 0.0 || g.thinking_frequency_penalty != 0.0 || g.think_end_boost.is_some() {
+    if g.thinking_presence_penalty != 0.0
+        || g.thinking_frequency_penalty != 0.0
+        || g.think_end_boost.is_some()
+        || g.seq_thinking.is_some()
+    {
         g.think_end = match (st.tok.think_start, st.tok.think_end) {
             (Some(s), Some(e)) if think_open(prompt, s, e) => Some(e),
             _ => None,
         };
         if g.think_end.is_none() {
             g.think_end_boost = None;
+            g.seq_thinking = None;
         }
     }
     Ok(())
@@ -525,6 +533,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         &st.tok.gen_defaults,
         &st.penalties,
         st.boost.as_ref(),
+        st.sequence.as_ref(),
         st.chat_default_max_tokens(prompt.len()),
         st.max_logprobs(),
         true,
@@ -1263,6 +1272,7 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
             &st.tok.gen_defaults,
             &st.penalties,
             st.boost.as_ref(),
+            st.sequence.as_ref(),
             Some(16),
             st.max_logprobs(),
             false,

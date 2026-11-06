@@ -195,6 +195,14 @@ class ValidateTests(unittest.TestCase):
         self.check(['--peers', PEERS, '--default-think-end-boost', 'max=1,max=2'], 'given twice')
         for ok in ('start=0.5x,per1k=2,max=10', 'start=4096, per1k=0.5, max=1.5', 'per1k=1,max=1'):
             opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-think-end-boost', ok], GLM))
+        self.check(['--peers', PEERS, '--default-sequence-penalty', 'reply=1:1:1:1'], 'want thinking=, answer= or guard=')
+        self.check(['--peers', PEERS, '--default-sequence-penalty', 'thinking=1:1:1'], 'want mult:base:min:cap')
+        self.check(['--peers', PEERS, '--default-sequence-penalty', 'thinking=1:0.5:1:1'], 'want mult >= 0')
+        self.check(['--peers', PEERS, '--default-sequence-penalty', 'answer=1:2:1:21'], 'want mult >= 0')
+        self.check(['--peers', PEERS, '--default-sequence-penalty', 'thinking=1:2:1:1,thinking=1:2:1:1'], 'given twice')
+        self.check(['--peers', PEERS, '--default-sequence-penalty', 'guard=x:2:1:1'], 'is not a number')
+        for ok in ('thinking=0.8:1.75:4:6,answer=1:1.75:12:6,guard=1:2:1:8', 'guard = 1 : 2 : 1 : 8'):
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-sequence-penalty', ok], GLM))
         self.check(['--peers', PEERS, '--tool-repeat-guard', 'yes'], 'want 0 or 1')
         self.check(['--peers', PEERS, '--tool-repeat-guard-repeats', '0'], 'want a whole number from 1')
         self.check(['--peers', PEERS, '--tool-repeat-guard-temperature', '3'], 'want a number from 0 to 2')

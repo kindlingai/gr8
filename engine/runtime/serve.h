@@ -4,9 +4,11 @@
 //   DIR/req.<n>  (written atomically: req.<n>.tmp then rename), two lines:
 //       n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,..|-> [top_p <float>]
 //       [pen <presence> <frequency> <thinking presence> <thinking frequency> <think_end id or -1>]
-//       [boost <start> <per1k> <max>] [lp <k>] [plp <k>]
+//       [boost <start> <per1k> <max>] [seqt <mult>:<base>:<min>:<cap>] [seqa <mult>:<base>:<min>:<cap>]
+//       [seqg <mult>:<base>:<min>:<cap>:<id,id,..>] [lp <k>] [plp <k>]
 //       (pen: presence / frequency penalties, each in [-2, 2], the thinking ones inside the think block that the id
-//        closes. boost: the think-end boost past thinking token <start> (penalty.h). S2 applies them, m4sim reads and
+//        closes. boost: the think-end boost past thinking token <start>. seqt / seqa / seqg: the sequence penalty's
+//        thinking, answer and guard scopes, the guard's against the ids (penalty.h). S2 applies them, m4sim reads and
 //        ignores them.
 //        lp: logprobs of the generated tokens with their top k, 0..20; plp: the same for the prompt tokens; absent = off.
 //        A request with plp is run as decode steps from its first token, no prefill path: the shim limits its length.)
@@ -51,6 +53,8 @@ struct ServeReq
     float tpresence = 0.f, tfrequency = 0.f; // the thinking penalties, while the block think_end closes is open
     int think_end = -1;                      // the </think> id when the prompt left a think block open, else -1
     int boost_start = 0; float boost_per1k = 0.f, boost_max = 0.f;   // the think-end boost (penalty.h); per1k 0 = off
+    struct Seq { float mult = 0.f, base = 1.f, cap = 0.f; int min = 1; } seq[3];   // the sequence penalty's scopes (penalty.h PEN_SEQ)
+    std::vector<int> avoid;                  // the guard scope's reference: the call a retry must not repeat
     uint32_t seed = 1234u;
     int lp = -1, plp = -1;        // logprobs / prompt_logprobs: k (0..LP_MAX) or -1 = off
     int64_t sys = -1;             // the system span: the prompt's first tokens that are system message and tools (-1 = unknown)
@@ -148,6 +152,7 @@ inline void serve_parse(const std::string& text, int vocab, ServeReq& r)
             else r.boost_start = (int)start;
             i += 2;
         }
+        else if (w[i] == "seqt" || w[i] == "seqa" || w[i] == "seqg") {}   // S2 only (s2/sessions.h): m4sim does not apply the sequence penalty
         // the shim never sends k > LP_MAX; clamping is a backstop
         else if (w[i] == "lp") r.lp = num(w[i + 1], 0, 1 << 30, &k) ? (int)std::min<long>(k, LP_MAX) : -1;
         else if (w[i] == "plp") r.plp = num(w[i + 1], 0, 1 << 30, &k) ? (int)std::min<long>(k, LP_MAX) : -1;

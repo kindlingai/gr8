@@ -204,6 +204,12 @@ pub struct GenParams {
     pub think_end: Option<u32>,
     /// the think-end boost (PROTOCOL.md), sent when set, with `think_end`
     pub think_end_boost: Option<crate::sampling::Boost>,
+    /// the sequence penalty's scopes (PROTOCOL.md): thinking (with `think_end`) and answer sent when set, guard only
+    /// once a retry filled `seq_avoid` with the call it must not repeat
+    pub seq_thinking: Option<crate::sampling::Seq>,
+    pub seq_answer: Option<crate::sampling::Seq>,
+    pub seq_guard: Option<crate::sampling::Seq>,
+    pub seq_avoid: Vec<u32>,
     pub seed: Option<i64>,
     pub stop_ids: Vec<i64>,
     pub logprobs: Option<i64>,
@@ -298,6 +304,41 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
         pyjson::float(b, t.per1k);
         b.extend_from_slice(b",\"max\":");
         pyjson::float(b, t.max);
+        b.push(b'}');
+    }
+    let guard = p.seq_guard.filter(|_| !p.seq_avoid.is_empty());
+    let scopes: Vec<(&str, &crate::sampling::Seq, bool)> =
+        [("thinking", &p.seq_thinking, false), ("answer", &p.seq_answer, false), ("guard", &guard, true)]
+            .into_iter()
+            .filter_map(|(k, s, g)| s.as_ref().map(|s| (k, s, g)))
+            .collect();
+    if !scopes.is_empty() {
+        b.extend_from_slice(b",\"sequence_penalty\":{");
+        for (i, (k, s, is_guard)) in scopes.iter().enumerate() {
+            if i > 0 {
+                b.push(b',');
+            }
+            pyjson::string(b, k);
+            b.extend_from_slice(b":{\"mult\":");
+            pyjson::float(b, s.mult);
+            b.extend_from_slice(b",\"base\":");
+            pyjson::float(b, s.base);
+            b.extend_from_slice(b",\"min\":");
+            pyjson::int(b, s.min);
+            b.extend_from_slice(b",\"cap\":");
+            pyjson::float(b, s.cap);
+            if *is_guard {
+                b.extend_from_slice(b",\"avoid\":[");
+                for (i, t) in p.seq_avoid.iter().enumerate() {
+                    if i > 0 {
+                        b.push(b',');
+                    }
+                    pyjson::int(b, *t);
+                }
+                b.push(b']');
+            }
+            b.push(b'}');
+        }
         b.push(b'}');
     }
     b.extend_from_slice(b",\"seed\":");
@@ -411,6 +452,10 @@ mod tests {
             thinking_frequency_penalty: 0.0,
             think_end: None,
             think_end_boost: None,
+            seq_thinking: None,
+            seq_answer: None,
+            seq_guard: None,
+            seq_avoid: Vec::new(),
             seed: None,
             stop_ids: vec![1, 2],
             logprobs: Some(3),
@@ -457,6 +502,21 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &pen)[4..]).unwrap();
         assert_eq!(v["think_end_boost"], serde_json::json!({"start": 4096, "per1k": 2.0, "max": 10.0}));
         assert_eq!((v["presence_penalty"].as_f64(), v["think_end"].as_u64()), (Some(0.0), Some(154842)));
+        assert!(!v.as_object().unwrap().contains_key("sequence_penalty"));
+        let t = crate::sampling::Seq { mult: 0.8, base: 1.75, min: 4, cap: 6.0 };
+        let g = crate::sampling::Seq { mult: 1.0, base: 2.0, min: 1, cap: 8.0 };
+        let sp = GenParams { seq_thinking: Some(t), seq_guard: Some(g), ..p.clone() };
+        let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &sp)[4..]).unwrap();
+        assert_eq!(
+            v["sequence_penalty"],
+            serde_json::json!({"thinking": {"mult": 0.8, "base": 1.75, "min": 4, "cap": 6.0}})
+        ); // the guard waits for a retry
+        let sp = GenParams { seq_guard: Some(g), seq_avoid: vec![5, 6], ..p.clone() };
+        let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &sp)[4..]).unwrap();
+        assert_eq!(
+            v["sequence_penalty"],
+            serde_json::json!({"guard": {"mult": 1.0, "base": 2.0, "min": 1, "cap": 8.0, "avoid": [5, 6]}})
+        );
         let selected =
             GenParams { steering_profile: Some("example".into()), steering_scale: Some(1.1f32 as f64), ..p.clone() };
         let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &selected)[4..]).unwrap();

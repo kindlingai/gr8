@@ -2079,7 +2079,8 @@ __global__ void __launch_bounds__(256) k_grammar_mask(float* logits, int ldl, in
 // the tokens committed since their last update (PenSess::news) and the drafts the rows before m in this step carry
 // (tok). Pass 2 writes each pending id from its raw logit, so a penalized logit is one subtraction either way. Inside
 // the block the close's logit then gains pen_boost at n = the thinking tokens committed plus the drafts before the
-// row. A row with neither returns at once.
+// row, and the sequence penalty's tokens (found on the host, PenRow::seq_tok) lose theirs. A row with none of these
+// returns at once.
 __global__ void __launch_bounds__(256) k_penalty(float* logits, int ldl, int vlo, int vn, const int* tok, const PenRow* rows,
                                                  const PenSess* sess, const int* counts)
 {
@@ -2098,7 +2099,7 @@ __global__ void __launch_bounds__(256) k_penalty(float* logits, int ldl, int vlo
     const float presence = think ? pr.presence + pr.tpresence : pr.presence;
     const float frequency = think ? pr.frequency + pr.tfrequency : pr.frequency;
     const float boost = think ? pen_boost(pr.think_n + (m - pr.first), pr.boost_start, pr.boost_per1k, pr.boost_max) : 0.f;
-    if (presence == 0.f && frequency == 0.f && boost == 0.f) return;
+    if (presence == 0.f && frequency == 0.f && boost == 0.f && pr.seq_tok[0] < 0 && pr.seq_tok[1] < 0 && pr.seq_tok[2] < 0) return;
     if (presence != 0.f || frequency != 0.f)
     {
         pen_pass0(row, vlo, vn, s_tok, n, s_raw, threadIdx.x, 256);
@@ -2108,7 +2109,10 @@ __global__ void __launch_bounds__(256) k_penalty(float* logits, int ldl, int vlo
         pen_pass2(row, vlo, vn, cnt, s_tok, n, s_raw, presence, frequency, threadIdx.x, 256);
         __syncthreads();
     }
-    if (boost != 0.f && threadIdx.x == 0 && pr.think_end >= vlo && pr.think_end < vlo + vn) row[pr.think_end - vlo] += boost;
+    if (threadIdx.x != 0) return;
+    if (boost != 0.f && pr.think_end >= vlo && pr.think_end < vlo + vn) row[pr.think_end - vlo] += boost;
+    for (int e = 0; e < PEN_SEQ; ++e)
+        if (pr.seq_tok[e] >= vlo && pr.seq_tok[e] < vlo + vn) row[pr.seq_tok[e] - vlo] -= pr.seq_pen[e];
 }
 // grid M, block 256, after k_penalty read the counts: on the one row of each session that carries commit, the slot's
 // counts take the tokens committed since the last update, from zero for a new request on the slot

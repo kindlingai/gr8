@@ -212,6 +212,64 @@ pub struct Boost {
     pub max: f64,
 }
 
+/// One scope of the sequence penalty (DRY's form, PROTOCOL.md `sequence_penalty`): the token that would extend a
+/// verbatim copy of an earlier run of L >= min tokens loses min(cap, mult * base^(L - min)).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Seq {
+    pub mult: f64,
+    pub base: f64,
+    pub min: u32,
+    pub cap: f64,
+}
+
+/// `--default-sequence-penalty SPEC`, a request's `sequence_penalty`: `thinking=M:B:N:C,answer=M:B:N:C,guard=M:B:N:C`
+/// (mult:base:min:cap). `thinking` applies inside the think block and `answer` outside it, both against the prompt,
+/// the tool results and the reply; `guard` only in the repeated-tool-call guard's retry, against the call it took
+/// back. A scope absent, or with mult or cap 0, is off.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SeqSpec {
+    pub thinking: Option<Seq>,
+    pub answer: Option<Seq>,
+    pub guard: Option<Seq>,
+}
+
+impl SeqSpec {
+    pub fn parse(s: &str) -> Result<SeqSpec, String> {
+        let mut spec = SeqSpec::default();
+        for part in s.split(',') {
+            let (key, value) = part.split_once('=').ok_or_else(|| format!("{part:?}: want key=value"))?;
+            let (key, value) = (key.trim(), value.trim());
+            let slot = match key {
+                "thinking" => &mut spec.thinking,
+                "answer" => &mut spec.answer,
+                "guard" => &mut spec.guard,
+                _ => return Err(format!("{key:?}: want thinking, answer or guard")),
+            };
+            if slot.is_some() {
+                return Err(format!("{key} is given twice"));
+            }
+            let v: Vec<&str> = value.split(':').map(str::trim).collect();
+            if v.len() != 4 {
+                return Err(format!("{key}={value:?}: want mult:base:min:cap"));
+            }
+            let num = |t: &str| {
+                t.parse::<f64>().ok().filter(|x| x.is_finite()).ok_or_else(|| format!("{key}: {t:?} is not a number"))
+            };
+            let seq = Seq {
+                mult: num(v[0])?,
+                base: num(v[1])?,
+                min: v[2].parse().map_err(|_| format!("{key}: min {:?} is not a count", v[2]))?,
+                cap: num(v[3])?,
+            };
+            if seq.mult < 0.0 || seq.base < 1.0 || seq.min < 1 || !(0.0..=20.0).contains(&seq.cap) {
+                return Err(format!("{key}={value}: want mult >= 0, base >= 1, min >= 1 and cap 0 to 20"));
+            }
+            *slot = (seq.mult > 0.0 && seq.cap > 0.0).then_some(seq);
+        }
+        Ok(spec)
+    }
+}
+
 impl BoostSpec {
     pub fn parse(s: &str) -> Result<BoostSpec, String> {
         let (mut start, mut per1k, mut max) = (None, None, None);
@@ -423,6 +481,7 @@ pub fn build(
     gen_defaults: &Map<String, Value>,
     penalties: &Penalties,
     boost: Option<&BoostSpec>,
+    sequence: Option<&SeqSpec>,
     default_max_tokens: Option<u64>,
     max_logprobs: i64,
     chat: bool,
@@ -575,6 +634,22 @@ pub fn build(
         }
     }
     .and_then(|b| b.resolve(max_tokens as u64));
+    // the sequence penalty: the request's spec, else the server's. `false` or "off" turns it off
+    let seq = match body.get("sequence_penalty").filter(|v| !v.is_null()) {
+        None => sequence.copied(),
+        Some(Value::Bool(false)) => None,
+        Some(Value::String(s)) if s == "off" => None,
+        Some(Value::String(s)) => Some(
+            SeqSpec::parse(s).map_err(|e| ApiError::bad(format!("sequence_penalty: {e}"), Some("sequence_penalty")))?,
+        ),
+        Some(_) => {
+            return Err(ApiError::bad(
+                "sequence_penalty must be a string like \"thinking=0.8:1.75:4:6,guard=1:2:1:8\", \"off\" or false",
+                Some("sequence_penalty"),
+            ))
+        }
+    }
+    .unwrap_or_default();
     let presence = resolve(&penalties.presence, "presence_penalty", "thinking_presence_penalty")?;
     let frequency = resolve(&penalties.frequency, "frequency_penalty", "thinking_frequency_penalty")?;
     let (presence_penalty, thinking_presence_penalty) = (presence.out, presence.extra());
@@ -633,6 +708,10 @@ pub fn build(
             thinking_frequency_penalty,
             think_end: None,
             think_end_boost,
+            seq_thinking: seq.thinking,
+            seq_answer: seq.answer,
+            seq_guard: seq.guard,
+            seq_avoid: Vec::new(),
             seed,
             stop_ids,
             logprobs: lp.map(|v| v as i64),
@@ -667,6 +746,7 @@ mod tests {
             VOCAB,
             &Map::new(),
             &Penalties::default(),
+            None,
             None,
             Some(16),
             20,
@@ -710,6 +790,7 @@ mod tests {
             &Map::new(),
             &Penalties::default(),
             None,
+            None,
             default,
             20,
             true,
@@ -732,7 +813,7 @@ mod tests {
         let d: Map<String, Value> = serde_json::from_str(defaults).unwrap();
         let one = PenaltySpec::parse(spec).unwrap();
         let pen = Penalties { presence: one, frequency: one };
-        let p = build(&m, body.as_bytes(), 10, 4096, &[], VOCAB, &d, &pen, None, Some(16), 20, true)?;
+        let p = build(&m, body.as_bytes(), 10, 4096, &[], VOCAB, &d, &pen, None, None, Some(16), 20, true)?;
         assert_eq!(p.gen.think_end, None); // api.rs sets it from the prompt
         Ok((
             p.gen.presence_penalty,
@@ -933,11 +1014,80 @@ mod tests {
             &Map::new(),
             &Penalties::default(),
             spec.as_ref(),
+            None,
             default_max,
             20,
             true,
         )?;
         Ok(p.gen.think_end_boost)
+    }
+
+    fn sequenced(body: &str, spec: Option<&str>) -> Result<(Option<Seq>, Option<Seq>), ApiError> {
+        let m: Map<String, Value> = serde_json::from_str(body).unwrap();
+        let spec = spec.map(|s| SeqSpec::parse(s).unwrap());
+        let p = build(
+            &m,
+            body.as_bytes(),
+            10,
+            4096,
+            &[],
+            VOCAB,
+            &Map::new(),
+            &Penalties::default(),
+            None,
+            spec.as_ref(),
+            Some(16),
+            20,
+            true,
+        )?;
+        assert!(p.gen.seq_avoid.is_empty()); // a guard retry fills it
+        Ok((p.gen.seq_thinking, p.gen.seq_guard))
+    }
+
+    #[test]
+    fn a_sequence_spec_names_its_scopes() {
+        let t = Seq { mult: 0.8, base: 1.75, min: 4, cap: 6.0 };
+        let g = Seq { mult: 1.0, base: 2.0, min: 1, cap: 8.0 };
+        assert_eq!(
+            SeqSpec::parse("thinking=0.8:1.75:4:6,guard=1:2:1:8").unwrap(),
+            SeqSpec { thinking: Some(t), answer: None, guard: Some(g) }
+        );
+        assert_eq!(
+            SeqSpec::parse(" guard = 1 : 2 : 1 : 8 ").unwrap(),
+            SeqSpec { thinking: None, answer: None, guard: Some(g) }
+        );
+        let a = Seq { mult: 1.0, base: 1.75, min: 12, cap: 6.0 };
+        assert_eq!(
+            SeqSpec::parse("answer=1:1.75:12:6").unwrap(),
+            SeqSpec { thinking: None, answer: Some(a), guard: None }
+        );
+        assert_eq!(SeqSpec::parse("thinking=0:1.75:4:6").unwrap(), SeqSpec::default()); // mult 0 = off
+        for bad in [
+            "",
+            "x",
+            "thinking=0.8:1.75:4",
+            "thinking=0.8:0.5:4:6",
+            "thinking=0.8:1.75:0:6",
+            "thinking=0.8:1.75:4:21",
+            "thinking=-1:1.75:4:6",
+            "thinking=0.8:1.75:4:6,thinking=1:1:1:1",
+            "thinking=a:1:1:1",
+        ] {
+            assert!(SeqSpec::parse(bad).is_err(), "{bad}");
+        }
+        // per request: the spec, off, or the server's
+        assert_eq!(sequenced("{}", Some("thinking=0.8:1.75:4:6")).unwrap(), (Some(t), None));
+        assert_eq!(sequenced("{}", None).unwrap(), (None, None));
+        assert_eq!(
+            sequenced(r#"{"sequence_penalty": "guard=1:2:1:8"}"#, Some("thinking=0.8:1.75:4:6")).unwrap(),
+            (None, Some(g))
+        );
+        assert_eq!(sequenced(r#"{"sequence_penalty": "off"}"#, Some("thinking=0.8:1.75:4:6")).unwrap(), (None, None));
+        assert_eq!(sequenced(r#"{"sequence_penalty": false}"#, Some("thinking=0.8:1.75:4:6")).unwrap(), (None, None));
+        for body in [r#"{"sequence_penalty": "thinking=1:1:1:30"}"#, r#"{"sequence_penalty": 1}"#] {
+            let e = sequenced(body, None).err().expect(body);
+            assert_eq!((e.status, e.param.as_deref()), (400, Some("sequence_penalty")));
+        }
     }
 
     #[test]

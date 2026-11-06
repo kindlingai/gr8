@@ -470,6 +470,9 @@ impl Generation {
             return Ok(false);
         }
         self.end_run().await?;
+        // the sequence penalty's guard scope: the retry must not reproduce the call it takes back
+        let avoid: Vec<u32> =
+            self.reply[cut..].iter().copied().filter(|&t| !self.params.gen.stop_ids.contains(&i64::from(t))).collect();
         self.reply.truncate(cut);
         self.offsets.truncate(cut);
         self.res.text.truncate(cut_bytes);
@@ -492,6 +495,9 @@ impl Generation {
         p.temperature = temperature;
         p.top_p = top_p;
         p.seed = p.seed.map(|s| s.wrapping_add(i64::from(attempt)));
+        if p.seq_guard.is_some() {
+            p.seq_avoid = avoid;
+        }
         p.insert = None; // a budget or forced close already happened in the reply that stays
         if self.think_end.is_none() {
             p.think_end = None;
@@ -818,6 +824,10 @@ mod tests {
                 thinking_frequency_penalty: 0.0,
                 think_end: None,
                 think_end_boost: None,
+                seq_thinking: None,
+                seq_answer: None,
+                seq_guard: None,
+                seq_avoid: Vec::new(),
                 seed: None,
                 stop_ids: vec![EOS as i64],
                 logprobs: None,
@@ -1132,6 +1142,7 @@ mod tests {
         let mut guard = guard_for(2, cfg);
         let mut p = params(50, 0);
         p.gen.presence_penalty = 0.2; // resolved for a greedy request: the retry keeps it though it samples at 0.7
+        p.gen.seq_guard = Some(crate::sampling::Seq { mult: 1.0, base: 2.0, min: 1, cap: 8.0 });
         let (deltas, calls, g) = run_guarded(&fake, p, &mut guard).await;
         assert_eq!(calls, vec!["b"]);
         assert_eq!(g.res.ids, [END, Y, TC, B, TCE, EOS]);
@@ -1152,6 +1163,9 @@ mod tests {
             (gens[0]["presence_penalty"].as_f64(), gens[1]["presence_penalty"].as_f64()),
             (Some(0.2), Some(0.2))
         );
+        // the retry carries the taken-back call (its stop id left out) for the sequence penalty's guard scope
+        assert!(!gens[0].as_object().unwrap().contains_key("sequence_penalty"));
+        assert_eq!(gens[1]["sequence_penalty"]["guard"]["avoid"], json!([TC, A, TCE]));
         assert_eq!(gens[1]["max_tokens"], json!(48));
         assert_ne!(gens[0]["id"], gens[1]["id"]);
         assert_eq!(crate::guard::RETRIES.load(std::sync::atomic::Ordering::Relaxed) >= 1, true);

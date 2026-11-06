@@ -1664,7 +1664,7 @@ int main(int argc, char** argv)
         if (m.vn <= 0) die("penalty tables before the vocab slice");
         G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&m.pen_rows_host), sizeof(PenRow) * MX, cudaHostAllocMapped));
         G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&m.pen_sess_host), sizeof(PenSess) * S2N, cudaHostAllocMapped));
-        for (int r = 0; r < MX; ++r) m.pen_rows_host[r] = PenRow{-1, 0, 0, -1, 0.f, 0.f, 0.f, 0.f, 0, 0, 0.f, 0.f};
+        for (int r = 0; r < MX; ++r) m.pen_rows_host[r] = PenRow{-1, 0, 0, -1, 0.f, 0.f, 0.f, 0.f, 0, 0, 0.f, 0.f, {-1, -1, -1}, {0.f, 0.f, 0.f}};
         memset(m.pen_sess_host, 0, sizeof(PenSess) * S2N);
         PenRow* rows;
         PenSess* sess;
@@ -1674,9 +1674,9 @@ int main(int argc, char** argv)
         m.pen_sess = sess;
         m.pen_counts = dmalloc<int>((size_t)S2N * m.vn);
         G6RT_CK(cudaMemset(m.pen_counts, 0, sizeof(int) * (size_t)S2N * m.vn));
-        // the head writes penalty.s2 next to ready.s2, so the shim offers the pen and boost fields
+        // the head writes penalty.s2 next to ready.s2, so the shim offers the pen, boost and seq fields
         if (R == 0)
-            if (FILE* f = fopen((s2dir + "/penalty.s2").c_str(), "w")) { fputs("presence frequency boost\n", f); fclose(f); }
+            if (FILE* f = fopen((s2dir + "/penalty.s2").c_str(), "w")) { fputs("presence frequency boost seq\n", f); fclose(f); }
     }
     m.rs = plan.rs;                     // the target's verify steps only; the MTP layer's head stays as it is
     if (!pf_qo && !pf_qp)               // QO attention builds the decode RoPE table; without it absorb would take FP64 sincos

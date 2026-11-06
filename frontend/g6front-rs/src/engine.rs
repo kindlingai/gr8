@@ -81,6 +81,10 @@ impl Engine {
     pub fn think_end_boost(&self) -> bool {
         self.hello().is_some_and(|h| h.get("think_end_boost") == Some(&Value::Bool(true)))
     }
+    /// The engine applies `generate`'s sequence penalty (its hello says `"sequence_penalty": true`).
+    pub fn sequence_penalty(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("sequence_penalty") == Some(&Value::Bool(true)))
+    }
 
     pub fn start(self: &Arc<Self>) {
         let me = self.clone();

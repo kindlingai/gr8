@@ -1,6 +1,8 @@
-// Presence / frequency penalties (OpenAI's presence_penalty and frequency_penalty, vLLM's semantics), and the think-end
-// boost, a soft thinking budget: inside the think block the </think> logit gains min(max, per1k * (n - start) / 1000)
-// once the reply's n-th thinking token is past start. Before a row
+// Presence / frequency penalties (OpenAI's presence_penalty and frequency_penalty, vLLM's semantics), the think-end
+// boost, a soft thinking budget (inside the think block the </think> logit gains min(max, per1k * (n - start) / 1000)
+// once the reply's n-th thinking token is past start), and the sequence penalty (DRY's form: the token that would
+// extend a verbatim copy of an earlier run of L >= min tokens loses min(cap, mult * base^(L - min)); the host finds the
+// run and the token, ctx_index.h and s2/dispatch.h, the kernel subtracts). Before a row
 // samples, the logit of every id the request has generated so far drops by presence + frequency * count. The prompt
 // does not count. The thinking penalties add to those coefficients on the rows inside the think block the prompt left
 // open (until the reply's </think>), over the same counts. s2/dispatch.h writes this layout before each main step.
@@ -41,7 +43,10 @@ struct PenRow
     int think_n;                  // thinking tokens the session has committed (the boost's n at row `first`)
     int boost_start;              // the boost (pen_boost): 0 per1k = off
     float boost_per1k, boost_max;
+    int seq_tok[3];               // the sequence penalty's tokens by scope (PEN_SEQ), -1 = none
+    float seq_pen[3];             // what each loses
 };
+constexpr int PEN_SEQ = 3;        // sequence penalty scopes: 0 thinking (inside the block), 1 answer (outside it), 2 guard
 // one session slot
 struct PenSess
 {
@@ -52,6 +57,15 @@ struct PenSess
 
 // what a count of c takes off a logit. The caller skips c = 0, so an id never generated keeps its exact logit
 G6_PEN_HD inline float pen_drop(int c, float presence, float frequency) { return presence + frequency * float(c); }
+
+// the sequence penalty for a match of len tokens: mult * base^(len - min) from min on, at most cap; 0 below min
+G6_PEN_HD inline float pen_seq(int len, float mult, float base, int min, float cap)
+{
+    if (mult <= 0.f || len < min) return 0.f;
+    float p = mult;
+    for (int i = min; i < len && p < cap; ++i) p *= base;
+    return p < cap ? p : cap;
+}
 
 // the think-end boost at thinking token n: 0 up to start, then per1k a thousand tokens, at most max
 G6_PEN_HD inline float pen_boost(int n, int start, float per1k, float max)

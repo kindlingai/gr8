@@ -227,6 +227,21 @@ class UnitTests(unittest.TestCase):
         for bad in ({'start': -1, 'per1k': 2, 'max': 10}, {'start': 1, 'per1k': -1, 'max': 10}, {'start': 1, 'per1k': 1, 'max': 21},
                     {'start': 'x', 'per1k': 1, 'max': 1}, {'per1k': 1, 'max': 1}, 'start=1', {'start': True, 'per1k': 1, 'max': 1}):
             self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'think_end_boost': bad}, 0)[1], bad)
+        # the sequence penalty's scopes, after boost
+        sp = {'thinking': {'mult': 0.8, 'base': 1.75, 'min': 4, 'cap': 6}, 'answer': {'mult': 1, 'base': 1.75, 'min': 12, 'cap': 6},
+              'guard': {'mult': 1, 'base': 2, 'min': 1, 'cap': 8, 'avoid': [154822, 3, 4]}}
+        body, err = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': sp, 'logprobs': 0}, 0)
+        self.assertIsNone(err)
+        self.assertIn(b' top_p 1.0 seqt 0.8:1.75:4:6.0 seqa 1.0:1.75:12:6.0 seqg 1.0:2.0:1:8.0:154822,3,4 lp 0\n', body)
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': {'thinking': sp['thinking']}}, 0)
+        self.assertIn(b' seqt 0.8:1.75:4:6.0\n', body)
+        self.assertNotIn(b'seqg', body)
+        self.assertNotIn(b'seq', g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': {
+            'thinking': dict(sp['thinking'], mult=0)}}, 0)[0])
+        for bad in ('x', {'thinking': dict(sp['thinking'], base=0.5)}, {'thinking': dict(sp['thinking'], min=0)},
+                    {'thinking': dict(sp['thinking'], cap=21)}, {'guard': dict(sp['guard'], avoid=[])},
+                    {'guard': dict(sp['guard'], avoid=[g6s2shim.VOCAB])}, {'guard': {'mult': 1, 'base': 2, 'min': 1, 'cap': 8}}):
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': bad}, 0)[1], bad)
         # all zero, null or absent: no field
         for kw in ({}, {'presence_penalty': 0, 'frequency_penalty': 0.0}, {'presence_penalty': None},
                    {'thinking_presence_penalty': 0, 'think_end': 5}):

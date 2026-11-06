@@ -3,6 +3,7 @@
 // carry a penalty, each session's sampling row, the tokens committed since the device counts were updated, and the reset
 // of a slot a new request takes.
 #include "s2/dispatch.h"
+#include "ctx_index.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -188,6 +189,122 @@ static void thinking() {
     // the thinking tokens stop counting at the close: 11 and 50 were thinking, 12 was not
     CHECK(sessions.at(0).think_tokens == 2 && rows[0].think_n == 2);
 }
+// the sequence penalty: the longest earlier occurrence of a sequence's tail (ctx_index.h), the penalty's curve, and the
+// rows Dispatch writes for the thinking scope (prompt + reply + drafts) and the guard scope (the reply against a call)
+static void sequence() {
+    using g6rt::CtxIndex; using g6rt::CtxMatch;
+    // the curve: nothing below min, mult at min, times base per token after, and capped
+    CHECK(g6rt::pen_seq(3, 0.8f, 1.75f, 4, 6.f) == 0.f && g6rt::pen_seq(4, 0.8f, 1.75f, 4, 6.f) == 0.8f);
+    CHECK(g6rt::pen_seq(6, 0.8f, 1.75f, 4, 6.f) == 0.8f * 1.75f * 1.75f && g6rt::pen_seq(40, 0.8f, 1.75f, 4, 6.f) == 6.f);
+    CHECK(g6rt::pen_seq(10, 0.f, 1.75f, 4, 6.f) == 0.f && g6rt::pen_seq(2, 0.5f, 2.f, 1, 8.f) == 1.f);
+    // a transcribed log: the prompt holds three log lines (each: time, level, msg, newline); the reply copies the first
+    // line's start, so the longest match ends where that line continues
+    //                     0    1    2    3    4    5    6    7    8    9    10   11
+    std::vector<int> ctx = {100, 200, 300, 9,   101, 201, 301, 9,   102, 202, 302, 9};
+    std::vector<int> reply = {7, 7, 100, 200};   // "...", then the first line's time and level
+    const auto t = [&](int i) { return i < int(ctx.size()) ? ctx[i] : reply[i - ctx.size()]; };
+    CtxIndex ix;
+    ix.extend(t, int(ctx.size()));
+    CtxMatch m = ix.longest(t, int(ctx.size() + reply.size()));
+    CHECK(m.len == 2 && m.next == 2 && t(m.next) == 300);          // the copy would go on with the message token
+    reply.push_back(300);
+    m = ix.longest(t, int(ctx.size() + reply.size()));
+    CHECK(m.len == 3 && t(m.next) == 9);
+    // the newline after the message: the latest of the three places wins the tie (len 1 run " 9" after 302 vs 300)
+    // a run inside the unindexed tail: the reply repeats itself before anything is committed
+    std::vector<int> ctx2 = {1};
+    std::vector<int> tail = {5, 6, 7, 5, 6};
+    const auto t2 = [&](int i) { return i < 1 ? ctx2[i] : tail[i - 1]; };
+    CtxIndex ix2; ix2.extend(t2, 1);
+    m = ix2.longest(t2, 6);
+    CHECK(m.len == 2 && m.next == 3 && t2(m.next) == 7);
+    // the index extended later gives the same answer as the scan did
+    ix2.extend(t2, 6);
+    CHECK(ix2.longest(t2, 6).len == 2 && ix2.longest(t2, 6).next == 3);
+    // nothing to match: too short, or no earlier bigram
+    CHECK(ix.longest(t, 1).len == 0);
+    std::vector<int> fresh = {1, 2, 3, 4};
+    CtxIndex ix3; ix3.extend([&](int i) { return fresh[i]; }, 4);
+    CHECK(ix3.longest([&](int i) { return fresh[i]; }, 4).len == 0);
+    // the guard scope: the retry's reply against the call it must not repeat
+    std::vector<int> call = {50, 60, 61, 70, 71, 72, 51};   // <tool_call> read _file <arg..> path .. </tool_call>
+    const auto r = [&](int i) { return call[i]; };
+    std::vector<int> out = {50};
+    const auto o = [&](int i) { return out[i]; };
+    m = g6rt::longest_in(o, 1, r, int(call.size()));
+    CHECK(m.len == 1 && m.next == 1 && call[m.next] == 60);
+    out = {50, 60, 61};
+    m = g6rt::longest_in(o, 3, r, int(call.size()));
+    CHECK(m.len == 3 && call[m.next] == 70);
+    out = {50, 99, 61};   // a different name: only the one-token run " 61" at its own place
+    m = g6rt::longest_in(o, 3, r, int(call.size()));
+    CHECK(m.len == 1 && call[m.next] == 70);
+    out = {40, 41};
+    CHECK(g6rt::longest_in(o, 2, r, int(call.size())).len == 0);
+
+    // Dispatch: a session with both scopes. Prompt 1..8 (the test request's), think block open, the reply so far
+    // copies prompt tokens 3 4 5; the step's rows carry drafts 6 7 (the copy going on) and then a row after a drafted
+    // close
+    const auto req = request(" pen 0 0 0 0 50 seqt 0.8:1.75:3:6 seqa 1:2:2:8 seqg 1:2:1:8:3,4,5,6,7");
+    CHECK(req.seq[0].mult == 0.8f && req.seq[0].min == 3 && req.seq[1].min == 2 && req.seq[2].min == 1 && req.avoid.size() == 5);
+    Config c; c.epoch = 9; c.max_rows = 24;
+    Sessions sessions(c, "", false, 4);
+    Grant g0{{9, 0, 1}, Sessions::request(1, req), {0, 1, 1}, 0};
+    sessions.bind(g0, req);
+    CHECK(sessions.at(0).sampling.seq_thinking() && sessions.at(0).sampling.seq_answer() && sessions.at(0).sampling.seq_guard());
+    std::vector<g6rt::PenRow> rows(24); std::vector<g6rt::PenSess> sess(MAX_SESSIONS);
+    DispatchHooks h; h.bucket = [](bool, int) { return 0; }; h.mode = [](int, int) {};
+    h.launch = [&](const Launch& l) { return std::vector<int>(l.step.r.size(), 1); };
+    h.prefill = [](const Slot&, const Payload&, uint32_t, uint32_t) {};
+    h.pen_rows = rows.data(); h.pen_sess = sess.data();
+    Dispatch d(sessions, 24, h);
+    d.begin(0, 0);
+    const int emitted[] = {3, 4, 5};
+    sessions.emit({9, 0, 1}, emitted, 3, 0, {});
+    // rows: 0 samples after "3 4 5" (input 5, at position 10), 1 after draft 6, 2 after draft 7, 3 after a drafted
+    // close 50, 4 after draft 3, 5 after draft 4 (the copy starting again, outside the block)
+    s2::Step v; v.sess = {0}; v.row0 = {0}; v.rows = {6}; v.ctx = {16};
+    v.r = {{0, 5, 10, 11, -1}, {0, 6, 11, 12, -1}, {0, 7, 12, 13, -1}, {0, 50, 13, 14, -1}, {0, 3, 14, 15, -1}, {0, 4, 15, 16, -1}};
+    d.run(v);
+    // thinking scope: row 0's tail "3 4 5" matches prompt 3 4 5 (len 3, the copy would go on with 6): mult at min.
+    // Row 1 (len 4) -> 7 at mult * base, row 2 (len 5) -> 8. Rows 3 to 5 are past the drafted close
+    CHECK(rows[0].seq_tok[0] == 6 && rows[0].seq_pen[0] == 0.8f);
+    CHECK(rows[1].seq_tok[0] == 7 && rows[1].seq_pen[0] == 0.8f * 1.75f);
+    CHECK(rows[2].seq_tok[0] == 8 && rows[2].seq_pen[0] == 0.8f * 1.75f * 1.75f);
+    CHECK(rows[3].seq_tok[0] == -1 && rows[4].seq_tok[0] == -1 && rows[5].seq_tok[0] == -1);
+    // answer scope: off inside the block. Past the drafted close, row 5's tail "3 4" (after 50) matches the prompt's
+    // and the reply's "3 4" (the latest, the reply's at positions 8-9, continues with 5): len 2 at its min 2 -> 5 at
+    // mult 1; row 4's tail "50 3" matches nothing
+    CHECK(rows[0].seq_tok[1] == -1 && rows[2].seq_tok[1] == -1 && rows[4].seq_tok[1] == -1);
+    CHECK(rows[5].seq_tok[1] == 5 && rows[5].seq_pen[1] == 1.f);
+    // guard scope: the reply "3 4 5" against the call 3 4 5 6 7: len 3 -> 6 at 1 * 2^2; with draft 6, len 4 -> 7;
+    // with draft 7 the match reaches the call's end, which has no token after it: nothing. The rows after the close
+    // still match (the guard scope does not care about the block): row 5's "3 4" -> 5 at 1 * 2
+    CHECK(rows[0].seq_tok[2] == 6 && rows[0].seq_pen[2] == 4.f);
+    CHECK(rows[1].seq_tok[2] == 7 && rows[1].seq_pen[2] == 8.f);
+    CHECK(rows[2].seq_tok[2] == -1 && rows[3].seq_tok[2] == -1 && rows[5].seq_tok[2] == 5 && rows[5].seq_pen[2] == 2.f);
+    // a legitimate short repeat below min: the reply "3" alone after the prompt matches 1 token, under min 3
+    Sessions s2(c, "", false, 4);
+    s2.bind(g0, req);
+    Dispatch d2(s2, 24, h); d2.begin(0, 0);
+    const int one[] = {3};
+    s2.emit({9, 0, 1}, one, 1, 0, {});
+    s2::Step w; w.sess = {0}; w.row0 = {0}; w.rows = {1}; w.ctx = {9}; w.r = {{0, 3, 8, 9, -1}};
+    d2.run(w);
+    CHECK(rows[0].seq_tok[0] == -1 && rows[0].seq_tok[1] == -1 && rows[0].seq_tok[2] == 4 && rows[0].seq_pen[2] == 1.f);   // the guard's min is 1: "3" -> 4
+    // a prompt with no open block (think_end -1): the answer scope alone covers every row
+    const auto ans = request(" seqa 1:2:2:8");
+    CHECK(!ans.presence && ans.seq[1].mult == 1.f);
+    Sessions s3(c, "", false, 4);
+    s3.bind(g0, ans);
+    CHECK(!s3.at(0).sampling.seq_thinking() && s3.at(0).sampling.seq_answer() && s3.at(0).sampling.tracked() && !s3.at(0).think_open);
+    Dispatch d3(s3, 24, h); d3.begin(0, 0);
+    const int two[] = {3, 4};
+    s3.emit({9, 0, 1}, two, 2, 0, {});
+    s2::Step y; y.sess = {0}; y.row0 = {0}; y.rows = {2}; y.ctx = {11}; y.r = {{0, 4, 9, 10, -1}, {0, 5, 10, 11, -1}};
+    d3.run(y);
+    CHECK(rows[0].seq_tok[1] == 5 && rows[0].seq_pen[1] == 1.f && rows[1].seq_tok[1] == 6 && rows[1].seq_pen[1] == 2.f && rows[0].seq_tok[0] == -1);
+}
 // a boost without a penalty: the session is tracked all the same, its rows carry the boost and no coefficients
 static void boost_only() {
     const auto b = request(" pen 0 0 0 0 50 boost 2 1 5");
@@ -212,7 +329,7 @@ static void boost_only() {
     CHECK(sess[0].nnew == 3);   // the counts still sync, so a penalty and a boost share one table
     // without an open block the boost never applies: the session is not tracked at all
     const auto nb = request(" pen 0 0 0 0 -1 boost 2 1 5");
-    const Sampling nob{0, 0, 0, -1, -1, 0, 0, 0, 0, -1, 2, 1.f, 5.f};
+    const Sampling nob{0, 0, 0, -1, -1, 0, 0, 0, 0, -1, 2, 1.f, 5.f, {}, {}};
     CHECK(!nb.presence && !nob.boost());
 }
 
@@ -221,6 +338,7 @@ int main() {
     tables();
     thinking();
     boost_only();
+    sequence();
     std::printf(fails ? "penalty_test: %d FAIL\n" : "penalty_test: PASS\n", fails);
     return fails != 0;
 }
