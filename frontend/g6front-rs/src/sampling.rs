@@ -18,6 +18,174 @@ pub struct Params {
     pub include_stop: bool,
 }
 
+/// One part of a penalty spec: `[+]A[*M]`, an amount added and a multiplier (`base=0.2` adds 0.2; `thinking=*1.1`
+/// adds nothing and boosts by 10%; `thinking=+0.1*1.1` both). `mul` is None when `*M` was not written: 1 for every
+/// part but `temperature`, whose factor is then absent rather than 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Part {
+    pub add: f64,
+    pub mul: Option<f64>,
+}
+
+impl Part {
+    fn parse(t: &str) -> Result<Part, String> {
+        let t = t.trim();
+        let (add, mul) = match t.split_once('*') {
+            Some((a, m)) => (a.trim(), Some(m.trim())),
+            None => (t, None),
+        };
+        let mut p = Part::default();
+        if !add.is_empty() || mul.is_none() {
+            p.add = add.parse().map_err(|_| format!("{add:?} is not a number"))?;
+            if !p.add.is_finite() {
+                return Err(format!("{add:?} is not a number"));
+            }
+        }
+        if let Some(m) = mul {
+            let v: f64 = m.parse().map_err(|_| format!("{m:?} is not a multiplier"))?;
+            if !v.is_finite() || v < 0.0 {
+                return Err(format!("multiplier {m:?}: want a finite number, 0 or more"));
+            }
+            p.mul = Some(v);
+        }
+        Ok(p)
+    }
+    fn factor(&self) -> f64 {
+        self.mul.unwrap_or(1.0)
+    }
+}
+
+/// A server-default penalty (`--default-presence-penalty SPEC`, `--default-frequency-penalty SPEC`): the parts that
+/// make up a request's penalty. SPEC is one part (the base alone) or a comma list of `base=`, `thinking=`, `greedy=`,
+/// `nongreedy=` and `temperature=` parts. For a token, the amounts of the parts whose condition matches add up, and the
+/// product of their multipliers scales the sum: base always, greedy or nongreedy by the request's temperature, thinking
+/// inside the think block. The temperature part is a last stage over that: (rest + A * T) * (B * T) with the request's
+/// temperature T, the `* (B * T)` only when `*B` was written. A spec is refused when any combination, at any T in
+/// [0, 2], resolves outside [-2, 2].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PenaltySpec {
+    pub base: Part,
+    pub thinking: Part,
+    pub greedy: Part,
+    pub nongreedy: Part,
+    pub temperature: Part,
+}
+
+/// What a request's penalty resolves to: `out` for the whole reply, `inside` within the think block.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Resolved {
+    pub out: f64,
+    pub inside: f64,
+}
+
+const RANGE: std::ops::RangeInclusive<f64> = -2.0..=2.0;
+
+impl Resolved {
+    fn ok(&self) -> bool {
+        RANGE.contains(&self.out) && RANGE.contains(&self.inside) && RANGE.contains(&self.extra())
+    }
+    /// what the engine adds inside the block (its `thinking_*` field): the sum there equals `inside`
+    pub fn extra(&self) -> f64 {
+        self.inside - self.out
+    }
+}
+
+impl PenaltySpec {
+    pub fn parse(s: &str) -> Result<PenaltySpec, String> {
+        let mut spec = PenaltySpec::default();
+        if !s.contains('=') {
+            spec.base = Part::parse(s)?;
+        } else {
+            let mut seen = Vec::new();
+            for part in s.split(',') {
+                let (key, value) = part.split_once('=').ok_or_else(|| format!("{part:?}: want key=value"))?;
+                let key = key.trim();
+                let slot = match key {
+                    "base" => &mut spec.base,
+                    "thinking" => &mut spec.thinking,
+                    "greedy" => &mut spec.greedy,
+                    "nongreedy" => &mut spec.nongreedy,
+                    "temperature" => &mut spec.temperature,
+                    _ => return Err(format!("{key:?}: want base, thinking, greedy, nongreedy or temperature")),
+                };
+                if seen.contains(&key) {
+                    return Err(format!("{key} is given twice"));
+                }
+                seen.push(key);
+                *slot = Part::parse(value)?;
+            }
+        }
+        spec.check()?;
+        Ok(spec)
+    }
+
+    /// Every combination within [-2, 2] at every temperature in [0, 2]. A total is at most quadratic in T, so its
+    /// extremes on the interval are at its ends or its vertex.
+    fn check(&self) -> Result<(), String> {
+        for greedy in [true, false] {
+            let (rest_out, rest_in) = self.rests(self.base.add, self.thinking.add, greedy);
+            let mut ts = vec![0.0, 2.0];
+            if let Some(b) = self.temperature.mul {
+                // f(T) = (rest + A T) B T: the vertex at -rest / (2 A), for out, in and their difference
+                for rest in [rest_out, rest_in, rest_in - rest_out] {
+                    if b != 0.0 && self.temperature.add != 0.0 {
+                        ts.push(-rest / (2.0 * self.temperature.add));
+                    }
+                }
+            }
+            for t in ts.into_iter().filter(|t| (0.0..=2.0).contains(t)) {
+                let r = self.at(rest_out, rest_in, t);
+                if !r.ok() {
+                    return Err(format!(
+                        "resolves to {} outside the think block and {} inside for a {} request at temperature {t}; \
+                         every total and the difference must be in [-2, 2]",
+                        r.out,
+                        r.inside,
+                        if greedy { "greedy" } else { "sampling" }
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The totals before the temperature stage, with `base_add` and `thinking_add` in place of the base's and the
+    /// thinking part's amounts.
+    fn rests(&self, base_add: f64, thinking_add: f64, greedy: bool) -> (f64, f64) {
+        let gn = if greedy { self.greedy } else { self.nongreedy };
+        let out = (base_add + gn.add) * (self.base.factor() * gn.factor());
+        let inside = (base_add + gn.add + thinking_add) * (self.base.factor() * gn.factor() * self.thinking.factor());
+        (out, inside)
+    }
+
+    /// The temperature stage at `t`.
+    fn at(&self, rest_out: f64, rest_in: f64, t: f64) -> Resolved {
+        let stage = |rest: f64| (rest + self.temperature.add * t) * self.temperature.mul.map_or(1.0, |b| b * t);
+        Resolved { out: stage(rest_out), inside: stage(rest_in) }
+    }
+
+    /// A request's penalty at temperature `t`: its own `value` replaces the base's amount (the multiplier stays) and
+    /// its own `thinking` the thinking part's amount. Err: whether the whole reply's total left [-2, 2] (else the
+    /// difference inside the block did), with the totals.
+    pub fn resolve(&self, value: Option<f64>, thinking: Option<f64>, t: f64) -> Result<Resolved, (bool, Resolved)> {
+        let (rest_out, rest_in) =
+            self.rests(value.unwrap_or(self.base.add), thinking.unwrap_or(self.thinking.add), t == 0.0);
+        let r = self.at(rest_out, rest_in, t);
+        if r.ok() {
+            Ok(r)
+        } else {
+            Err((!RANGE.contains(&r.out), r))
+        }
+    }
+}
+
+/// The server's two penalty defaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Penalties {
+    pub presence: PenaltySpec,
+    pub frequency: PenaltySpec,
+}
+
 pub fn steering(
     body: &Map<String, Value>,
     capability: Option<&Value>,
@@ -156,7 +324,6 @@ fn default_num(defaults: &Map<String, Value>, key: &str, neutral: f64) -> f64 {
     defaults.get(key).and_then(Value::as_f64).unwrap_or(neutral)
 }
 
-#[allow(clippy::too_many_arguments)]
 /// The least max_tokens a chat request without one gets under --share-tokens.
 pub const SHARE_MIN_MAX_TOKENS: u64 = 8192;
 
@@ -171,6 +338,7 @@ pub fn chat_default_max_tokens(default: u64, share: u64, prompt_len: usize) -> O
     (share > 0).then(|| share.saturating_sub(prompt_len as u64).max(SHARE_MIN_MAX_TOKENS))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     body: &Map<String, Value>,
     raw: &[u8],
@@ -179,6 +347,7 @@ pub fn build(
     eos_ids: &[i64],
     vocab_size: usize,
     gen_defaults: &Map<String, Value>,
+    penalties: &Penalties,
     default_max_tokens: Option<u64>,
     max_logprobs: i64,
     chat: bool,
@@ -298,17 +467,27 @@ pub fn build(
         .copied()
         .filter(|i| seen.insert(*i))
         .collect();
-    // OpenAI's penalties (PROTOCOL.md): request value, else the server default (--default-presence-penalty, in
-    // gen_defaults), else off. The engine counts the tokens it generated, vLLM's way
-    let presence_penalty = float_num(body, "presence_penalty", -2.0, 2.0)?
-        .unwrap_or_else(|| default_num(gen_defaults, "presence_penalty", 0.0));
-    let frequency_penalty = float_num(body, "frequency_penalty", -2.0, 2.0)?
-        .unwrap_or_else(|| default_num(gen_defaults, "frequency_penalty", 0.0));
-    // the same, added inside the think block the prompt leaves open (api.rs sets think_end)
-    let thinking_presence_penalty = float_num(body, "thinking_presence_penalty", -2.0, 2.0)?
-        .unwrap_or_else(|| default_num(gen_defaults, "thinking_presence_penalty", 0.0));
-    let thinking_frequency_penalty = float_num(body, "thinking_frequency_penalty", -2.0, 2.0)?
-        .unwrap_or_else(|| default_num(gen_defaults, "thinking_frequency_penalty", 0.0));
+    // OpenAI's penalties (PROTOCOL.md), and the thinking additions inside the think block the prompt leaves open
+    // (api.rs sets think_end): the request's values and the server's spec resolved at its temperature
+    // (PenaltySpec::resolve, where exactly 0 is greedy). The engine counts the tokens it generated, vLLM's way
+    let resolve = |spec: &PenaltySpec, key: &str, tkey: &str| -> Result<Resolved, ApiError> {
+        let (value, thinking) = (float_num(body, key, -2.0, 2.0)?, float_num(body, tkey, -2.0, 2.0)?);
+        spec.resolve(value, thinking, temperature).map_err(|(whole, r)| {
+            let k = if whole { key } else { tkey };
+            ApiError::bad(
+                format!(
+                    "`{k}` with the server's default gives {} outside the think block and {} inside, outside [-2, 2]",
+                    pyjson::float_string(r.out),
+                    pyjson::float_string(r.inside)
+                ),
+                Some(k),
+            )
+        })
+    };
+    let presence = resolve(&penalties.presence, "presence_penalty", "thinking_presence_penalty")?;
+    let frequency = resolve(&penalties.frequency, "frequency_penalty", "thinking_frequency_penalty")?;
+    let (presence_penalty, thinking_presence_penalty) = (presence.out, presence.extra());
+    let (frequency_penalty, thinking_frequency_penalty) = (frequency.out, frequency.extra());
     if let Some(v) = body.get("repetition_penalty").filter(|v| !v.is_null()) {
         if !pyjson::eq_int(v, 1) {
             return Err(ApiError::bad(
@@ -387,7 +566,19 @@ mod tests {
     fn stop_ids(stop_token_ids: Value) -> Result<Vec<i64>, ApiError> {
         let body = serde_json::json!({"stop_token_ids": stop_token_ids});
         let raw = serde_json::to_vec(&body).unwrap();
-        let p = build(body.as_object().unwrap(), &raw, 10, 4096, &[999], VOCAB, &Map::new(), Some(16), 20, false)?;
+        let p = build(
+            body.as_object().unwrap(),
+            &raw,
+            10,
+            4096,
+            &[999],
+            VOCAB,
+            &Map::new(),
+            &Penalties::default(),
+            Some(16),
+            20,
+            false,
+        )?;
         Ok(p.gen.stop_ids)
     }
 
@@ -416,7 +607,19 @@ mod tests {
 
     fn max_tokens(body: &str, prompt_len: usize, max_model_len: u64, default: Option<u64>) -> u64 {
         let m: Map<String, Value> = serde_json::from_str(body).unwrap();
-        let p = build(&m, body.as_bytes(), prompt_len, max_model_len, &[], VOCAB, &Map::new(), default, 20, true);
+        let p = build(
+            &m,
+            body.as_bytes(),
+            prompt_len,
+            max_model_len,
+            &[],
+            VOCAB,
+            &Map::new(),
+            &Penalties::default(),
+            default,
+            20,
+            true,
+        );
         p.unwrap_or_else(|e| panic!("{}", e.message)).gen.max_tokens
     }
 
@@ -429,51 +632,198 @@ mod tests {
         // named: kept
     }
 
-    fn penalties(body: &str, defaults: &str) -> Result<(f64, f64), ApiError> {
+    /// the four resolved penalties of a request under `spec` (presence and frequency alike), with gen_defaults `defaults`
+    fn resolved(body: &str, spec: &str, defaults: &str) -> Result<(f64, f64, f64, f64), ApiError> {
         let m: Map<String, Value> = serde_json::from_str(body).unwrap();
         let d: Map<String, Value> = serde_json::from_str(defaults).unwrap();
-        let p = build(&m, body.as_bytes(), 10, 4096, &[], VOCAB, &d, Some(16), 20, true)?;
-        Ok((p.gen.presence_penalty, p.gen.frequency_penalty))
-    }
-    fn thinking_penalties(body: &str, defaults: &str) -> Result<(f64, f64), ApiError> {
-        let m: Map<String, Value> = serde_json::from_str(body).unwrap();
-        let d: Map<String, Value> = serde_json::from_str(defaults).unwrap();
-        let p = build(&m, body.as_bytes(), 10, 4096, &[], VOCAB, &d, Some(16), 20, true)?;
+        let one = PenaltySpec::parse(spec).unwrap();
+        let pen = Penalties { presence: one, frequency: one };
+        let p = build(&m, body.as_bytes(), 10, 4096, &[], VOCAB, &d, &pen, Some(16), 20, true)?;
         assert_eq!(p.gen.think_end, None); // api.rs sets it from the prompt
-        Ok((p.gen.thinking_presence_penalty, p.gen.thinking_frequency_penalty))
+        Ok((
+            p.gen.presence_penalty,
+            p.gen.frequency_penalty,
+            p.gen.thinking_presence_penalty,
+            p.gen.thinking_frequency_penalty,
+        ))
+    }
+
+    fn part(add: f64, mul: Option<f64>) -> Part {
+        Part { add, mul }
+    }
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-12
     }
 
     #[test]
-    fn penalties_are_the_request_s_else_the_server_default_else_off() {
-        assert_eq!(penalties("{}", "{}").unwrap(), (0.0, 0.0));
-        assert_eq!(penalties(r#"{"presence_penalty": 1.5, "frequency_penalty": -0.5}"#, "{}").unwrap(), (1.5, -0.5));
-        assert_eq!(penalties(r#"{"presence_penalty": 2, "frequency_penalty": null}"#, "{}").unwrap(), (2.0, 0.0));
-        assert_eq!(penalties("{}", r#"{"presence_penalty": 1.5}"#).unwrap(), (1.5, 0.0));
-        assert_eq!(penalties(r#"{"presence_penalty": 0}"#, r#"{"presence_penalty": 1.5}"#).unwrap(), (0.0, 0.0));
-        for (body, param) in [
-            (r#"{"presence_penalty": 2.5}"#, "presence_penalty"),
-            (r#"{"frequency_penalty": -2.5}"#, "frequency_penalty"),
-            (r#"{"presence_penalty": "1"}"#, "presence_penalty"),
-            (r#"{"repetition_penalty": 1.1}"#, "repetition_penalty"),
+    fn a_penalty_spec_is_one_part_or_named_parts() {
+        let p = |s| PenaltySpec::parse(s).unwrap();
+        assert_eq!(p("1.5").base, part(1.5, None));
+        assert_eq!(p(" -0.5 ").base, part(-0.5, None));
+        assert_eq!(p("+0.5").base, part(0.5, None));
+        assert_eq!(p("*1.1").base, part(0.0, Some(1.1)));
+        assert_eq!(p("+0.1*1.1").base, part(0.1, Some(1.1)));
+        assert_eq!(p("-0.1 * 0.5").base, part(-0.1, Some(0.5)));
+        assert_eq!(p("0"), PenaltySpec::default());
+        let s = p("thinking=0.5,greedy=0.2,nongreedy=0");
+        assert_eq!(
+            (s.base, s.thinking, s.greedy, s.nongreedy),
+            (part(0.0, None), part(0.5, None), part(0.2, None), part(0.0, None))
+        );
+        let s = p("base=1, thinking = +0.1*1.1,greedy=*1.5 , nongreedy=-1*0, temperature = +0.1 * 0.25");
+        assert_eq!((s.base, s.thinking, s.greedy), (part(1.0, None), part(0.1, Some(1.1)), part(0.0, Some(1.5))));
+        assert_eq!((s.nongreedy, s.temperature), (part(-1.0, Some(0.0)), part(0.1, Some(0.25))));
+        assert_eq!(p("temperature=*1").temperature, part(0.0, Some(1.0)));
+        assert_eq!(p("temperature=+0.1").temperature, part(0.1, None));
+        assert_eq!(p("temperature=0.1*0.5").temperature, part(0.1, Some(0.5)));
+        for bad in [
+            "x",
+            "2.5",
+            "base=3",
+            "base=1,base=2",
+            "warm=1",
+            "base",
+            "base=",
+            "thinking=0.5,,greedy=1",
+            "nan",
+            "greedy=inf",
+            "*",
+            "+",
+            "**1",
+            "1**2",
+            "base=*-1",
+            "base=1*nan",
+            "base=1*",
+            "base=1*x",
+            "temperature=",
+            "temperature=*",
+            // in range part by part, outside it in combination
+            "base=1.5,greedy=1",
+            "base=1,thinking=1.5",
+            "base=1*1.5,greedy=0.5",
+            "base=1,nongreedy=-3.5",
+            "base=2,thinking=-2.5*1",
+            "base=-1,thinking=*4",
+            // outside it at some temperature in [0, 2]
+            "base=1,temperature=*1.5",
+            "temperature=+1.5",
+            "base=1,temperature=+1",
+            "base=-1,temperature=+1.5*1",
         ] {
-            let e = penalties(body, "{}").err().expect(body);
+            assert!(PenaltySpec::parse(bad).is_err(), "{bad}");
+        }
+        // the difference inside the block is what the engine takes, so it is bounded too
+        assert!(PenaltySpec::parse("base=1,thinking=*3").is_err());
+        assert!(PenaltySpec::parse("base=-1,thinking=1.5").is_ok());
+        // temperature forms that stay within the range over 0..2
+        for ok in [
+            "base=1,temperature=*1",
+            "temperature=+1",
+            "base=1,temperature=-0.5*1",
+            "temperature=-0.5*1",
+            "base=0.5,temperature=+0.5*0.5",
+        ] {
+            assert!(PenaltySpec::parse(ok).is_ok(), "{ok}");
+        }
+        // a vertex inside the interval: (-1 + 0.75 T) T dips to -1/3 at T = 2/3 and reaches 1 at T = 2. With 1.5 the
+        // top at T = 2 is 4
+        assert!(PenaltySpec::parse("base=-1,temperature=+1.5*1").is_err()); // 4 at T = 2
+        assert!(PenaltySpec::parse("base=-1,temperature=+0.75*1").is_ok());
+    }
+
+    #[test]
+    fn parts_add_and_their_multipliers_compound() {
+        let s = PenaltySpec::parse("base=0.2*1.5,thinking=+0.1*1.1,greedy=0.3*2,nongreedy=-0.1").unwrap();
+        // greedy: out = (0.2 + 0.3) * (1.5 * 2) = 1.5; in = (0.2 + 0.3 + 0.1) * (1.5 * 2 * 1.1) = 1.98
+        let r = s.resolve(None, None, 0.0).unwrap();
+        assert!(near(r.out, 1.5) && near(r.inside, 1.98) && near(r.extra(), 0.48));
+        // sampling: out = (0.2 - 0.1) * 1.5 = 0.15; in = (0.2 - 0.1 + 0.1) * (1.5 * 1.1) = 0.33
+        let r = s.resolve(None, None, 1.0).unwrap();
+        assert!(near(r.out, 0.15) && near(r.inside, 0.33));
+        // the request's value replaces the base's amount, not its multiplier. The same for thinking
+        let r = s.resolve(Some(0.0), None, 0.0).unwrap();
+        assert!(near(r.out, 0.9) && near(r.inside, 1.32));
+        let r = s.resolve(None, Some(0.0), 0.0).unwrap();
+        assert!(near(r.out, 1.5) && near(r.inside, 1.65));
+        // an override that leaves the range names the total that did
+        assert!(s.resolve(Some(1.0), None, 0.0).unwrap_err().0); // out = 3.9
+        let s = PenaltySpec::parse("thinking=*1.5").unwrap();
+        assert!(!s.resolve(Some(2.0), None, 1.0).unwrap_err().0); // out 2, inside 3
+        assert_eq!(
+            PenaltySpec::default().resolve(Some(2.0), Some(-2.0), 1.0).unwrap(),
+            Resolved { out: 2.0, inside: 0.0 }
+        );
+    }
+
+    #[test]
+    fn the_temperature_part_is_a_last_stage_scaled_by_the_request_s_temperature() {
+        // rest: out = (0.5 + gn) * 1, in = rest_out + 0.25 (thinking); then (rest + 0.1 T) * (0.5 T)
+        let s = PenaltySpec::parse("base=0.5,thinking=0.25,greedy=0.25,nongreedy=-0.25,temperature=+0.1*0.5").unwrap();
+        let r = s.resolve(None, None, 0.0).unwrap();
+        assert_eq!(r, Resolved { out: 0.0, inside: 0.0 }); // the factor B T is 0 under greedy
+        for (t, out, inside) in
+            [(0.7, (0.25 + 0.07) * 0.35, (0.5 + 0.07) * 0.35), (1.0, 0.35 * 0.5, 0.6 * 0.5), (2.0, 0.45, 0.7)]
+        {
+            let r = s.resolve(None, None, t).unwrap();
+            assert!(near(r.out, out) && near(r.inside, inside), "T {t}: {r:?}");
+        }
+        // an amount alone adds A T with no factor, and a factor alone scales by B T
+        let s = PenaltySpec::parse("base=0.5,temperature=+0.25").unwrap();
+        assert_eq!(s.resolve(None, None, 0.0).unwrap().out, 0.5);
+        assert_eq!(s.resolve(None, None, 2.0).unwrap().out, 1.0);
+        let s = PenaltySpec::parse("base=0.5,thinking=0.5,temperature=*1").unwrap();
+        assert_eq!(s.resolve(None, None, 0.0).unwrap(), Resolved { out: 0.0, inside: 0.0 });
+        assert_eq!(s.resolve(None, None, 1.0).unwrap(), Resolved { out: 0.5, inside: 1.0 });
+        assert_eq!(s.resolve(None, None, 2.0).unwrap(), Resolved { out: 1.0, inside: 2.0 });
+        // the request's value goes through the stage too, and the stage's amount is not scaled by the other multipliers
+        let s = PenaltySpec::parse("base=*2,temperature=+0.5*0.5").unwrap();
+        let r = s.resolve(Some(0.5), None, 1.0).unwrap();
+        assert_eq!(r.out, (1.0 + 0.5) * 0.5);
+        assert!(s.resolve(Some(2.0), None, 2.0).unwrap_err().0); // (4 + 1) * 1
+    }
+
+    #[test]
+    fn a_request_s_value_replaces_the_base_and_the_temperature_picks_the_rest() {
+        let spec = "base=0.25,thinking=0.5,greedy=0.25,nongreedy=-0.125";
+        // nothing named: greedy (temperature 0 after defaults) adds greedy, a sampling request adds nongreedy. The
+        // engine's thinking field is what the block adds on top
+        assert_eq!(resolved(r#"{"temperature": 0}"#, spec, "{}").unwrap(), (0.5, 0.5, 0.5, 0.5));
+        assert_eq!(resolved("{}", spec, r#"{"temperature": 0.0}"#).unwrap(), (0.5, 0.5, 0.5, 0.5));
+        assert_eq!(resolved("{}", spec, "{}").unwrap(), (0.125, 0.125, 0.5, 0.5)); // vLLM's default temperature 1.0
+        assert_eq!(resolved(r#"{"temperature": 1e-6}"#, spec, "{}").unwrap().0, 0.125); // only exactly 0 is greedy
+                                                                                        // the request's own value replaces the base, 0 included, and the condition's part still adds
+        assert_eq!(resolved(r#"{"temperature": 0, "presence_penalty": 1.0}"#, spec, "{}").unwrap().0, 1.25);
+        assert_eq!(resolved(r#"{"temperature": 0, "presence_penalty": 0}"#, spec, "{}").unwrap().0, 0.25);
+        assert_eq!(resolved(r#"{"temperature": 1, "frequency_penalty": 0}"#, spec, "{}").unwrap().1, -0.125);
+        // the request's thinking value replaces the thinking part alone
+        let r = resolved(r#"{"temperature": 0, "thinking_presence_penalty": 1.5}"#, spec, "{}").unwrap();
+        assert_eq!((r.0, r.2, r.3), (0.5, 1.5, 0.5));
+        assert_eq!(resolved(r#"{"thinking_frequency_penalty": 0}"#, spec, "{}").unwrap().3, 0.0);
+        // a multiplier scales the request's value too, so the engine's fields carry the resolved totals
+        let r = resolved(r#"{"temperature": 0, "presence_penalty": 1}"#, "base=*1.5,thinking=*1.2", "{}").unwrap();
+        assert!(near(r.0, 1.5) && near(r.2, 0.3));
+        // no spec: the request's values alone, else off
+        assert_eq!(resolved("{}", "0", "{}").unwrap(), (0.0, 0.0, 0.0, 0.0));
+        assert_eq!(
+            resolved(r#"{"presence_penalty": 1.5, "frequency_penalty": -0.5}"#, "0", "{}").unwrap(),
+            (1.5, -0.5, 0.0, 0.0)
+        );
+        assert_eq!(resolved(r#"{"presence_penalty": 2, "frequency_penalty": null}"#, "0", "{}").unwrap().0, 2.0);
+        for (body, spec, param) in [
+            (r#"{"presence_penalty": 2.5}"#, "0", "presence_penalty"),
+            (r#"{"frequency_penalty": -2.5}"#, "0", "frequency_penalty"),
+            (r#"{"presence_penalty": "1"}"#, "0", "presence_penalty"),
+            (r#"{"thinking_presence_penalty": 2.5}"#, "0", "thinking_presence_penalty"),
+            (r#"{"thinking_frequency_penalty": "x"}"#, "0", "thinking_frequency_penalty"),
+            (r#"{"repetition_penalty": 1.1}"#, "0", "repetition_penalty"),
+            // in range alone, outside it with the server's parts
+            (r#"{"temperature": 0, "presence_penalty": 2}"#, "greedy=0.5", "presence_penalty"),
+            (r#"{"thinking_presence_penalty": 1.5}"#, "base=1", "thinking_presence_penalty"),
+        ] {
+            let e = resolved(body, spec, "{}").err().expect(body);
             assert_eq!((e.status, e.param.as_deref()), (400, Some(param)), "{body}");
         }
-        assert!(penalties(r#"{"repetition_penalty": 1}"#, "{}").is_ok());
-        assert_eq!(thinking_penalties("{}", "{}").unwrap(), (0.0, 0.0));
-        assert_eq!(thinking_penalties(r#"{"thinking_presence_penalty": 1.5}"#, "{}").unwrap(), (1.5, 0.0));
-        assert_eq!(
-            thinking_penalties(r#"{"presence_penalty": 1}"#, r#"{"thinking_frequency_penalty": -1}"#).unwrap(),
-            (0.0, -1.0)
-        );
-        assert_eq!(
-            thinking_penalties(r#"{"thinking_frequency_penalty": 0}"#, r#"{"thinking_frequency_penalty": -1}"#)
-                .unwrap(),
-            (0.0, 0.0)
-        );
-        for body in [r#"{"thinking_presence_penalty": 2.5}"#, r#"{"thinking_frequency_penalty": "x"}"#] {
-            assert_eq!(thinking_penalties(body, "{}").err().map(|e| e.status), Some(400), "{body}");
-        }
+        assert!(resolved(r#"{"repetition_penalty": 1}"#, spec, "{}").is_ok());
     }
 
     #[test]

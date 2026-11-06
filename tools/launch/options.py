@@ -257,6 +257,70 @@ def mode(o):
     return 'peers' if o.get('PEERS') else 'mentat'
 
 
+def penalty_spec_error(spec):
+    """Why `spec` is not a penalty spec (the front end's sampling.rs PenaltySpec::parse), or None. A part is
+    `[+]A[*M]`, an amount and a multiplier; the spec is one part (the base) or a comma list of base=, thinking=,
+    greedy=, nongreedy= and temperature= parts, each once. Every combination of matching parts must resolve within
+    -2..2 at every temperature from 0 to 2."""
+    def part(v):
+        v = v.strip()
+        add, star, mul = v.partition('*')
+        add, mul = add.strip(), mul.strip()
+        a, m = 0.0, None
+        if add or not star:
+            try:
+                a = float(add)
+            except ValueError:
+                return None, f'{add!r} is not a number'
+            if math.isnan(a) or math.isinf(a):
+                return None, f'{add!r} is not a number'
+        if star:
+            try:
+                m = float(mul)
+            except ValueError:
+                return None, f'{mul!r} is not a multiplier'
+            if math.isnan(m) or math.isinf(m) or m < 0:
+                return None, f'multiplier {mul!r}: want a finite number, 0 or more'
+        return (a, m), None
+    parts = {k: (0.0, None) for k in ('base', 'thinking', 'greedy', 'nongreedy', 'temperature')}
+    if '=' not in spec:
+        parts['base'], err = part(spec)
+        if err:
+            return err
+    else:
+        seen = set()
+        for item in spec.split(','):
+            key, sep, value = item.partition('=')
+            key = key.strip()
+            if not sep or key not in parts:
+                return f'{item.strip()!r}: want base=, thinking=, greedy=, nongreedy= or temperature='
+            if key in seen:
+                return f'{key} is given twice'
+            seen.add(key)
+            parts[key], err = part(value)
+            if err:
+                return err
+    def factor(k):
+        return 1.0 if parts[k][1] is None else parts[k][1]
+    (ba, _), (ta, _), (xa, xb) = parts['base'], parts['thinking'], parts['temperature']
+    for cond in ('greedy', 'nongreedy'):
+        ga = parts[cond][0]
+        rest_out = (ba + ga) * factor('base') * factor(cond)
+        rest_in = (ba + ga + ta) * factor('base') * factor(cond) * factor('thinking')
+        # (rest + A T) * (B T) is a quadratic in T: its extremes on 0..2 are at the ends or at its vertex
+        ts = [0.0, 2.0]
+        if xb is not None and xb and xa:
+            ts += [-r / (2 * xa) for r in (rest_out, rest_in, rest_in - rest_out)]
+        for t in (t for t in ts if 0 <= t <= 2):
+            def stage(rest):
+                return (rest + xa * t) * (1.0 if xb is None else xb * t)
+            out, inside = stage(rest_out), stage(rest_in)
+            if not all(-2 <= x <= 2 for x in (out, inside, inside - out)):
+                return (f'resolves to {out:g} outside the think block and {inside:g} inside for a {cond} request at '
+                        f'temperature {t:g}; every total and the difference must be in -2..2')
+    return None
+
+
 def validate(o):
     """Refuse what this version cannot boot, with the reason."""
     if not o.get('GR8_MODEL'):
@@ -318,14 +382,10 @@ def validate(o):
         raise OptionError(f'--allow-thinking-off {o.get("ALLOW_THINKING_OFF")}: want 0 or 1')
     if o.get('UNDECLARED_TOOL_CALLS') not in ('text', 'emit'):
         raise OptionError(f'--undeclared-tool-calls {o.get("UNDECLARED_TOOL_CALLS")}: want text or emit')
-    for k in ('DEFAULT_PRESENCE_PENALTY', 'DEFAULT_FREQUENCY_PENALTY', 'DEFAULT_THINKING_PRESENCE_PENALTY',
-              'DEFAULT_THINKING_FREQUENCY_PENALTY'):
-        try:
-            v = float(o.get(k))
-        except (TypeError, ValueError):
-            v = math.nan
-        if not -2 <= v <= 2:
-            raise OptionError(f'--{k.lower().replace("_", "-")} {o.get(k)}: want a number from -2 to 2 (0 = off)')
+    for k in ('DEFAULT_PRESENCE_PENALTY', 'DEFAULT_FREQUENCY_PENALTY'):
+        err = penalty_spec_error(str(o.get(k)))
+        if err:
+            raise OptionError(f'--{k.lower().replace("_", "-")} {o.get(k)}: {err}')
     if o.get('TOOL_REPEAT_GUARD') not in ('0', '1'):
         raise OptionError(f'--tool-repeat-guard {o.get("TOOL_REPEAT_GUARD")}: want 0 or 1')
     if not (str(o.get('TOOL_REPEAT_GUARD_REPEATS')).isdigit() and int(o.get('TOOL_REPEAT_GUARD_REPEATS')) >= 1):

@@ -1129,7 +1129,9 @@ mod tests {
         let fake = fake_engine(repeats_a_then_b).await;
         let cfg = crate::guard::Config { on: true, repeats: 2, temperature: 0.7, retries: 2 };
         let mut guard = guard_for(2, cfg);
-        let (deltas, calls, g) = run_guarded(&fake, params(50, 0), &mut guard).await;
+        let mut p = params(50, 0);
+        p.gen.presence_penalty = 0.2; // resolved for a greedy request: the retry keeps it though it samples at 0.7
+        let (deltas, calls, g) = run_guarded(&fake, p, &mut guard).await;
         assert_eq!(calls, vec!["b"]);
         assert_eq!(g.res.ids, [END, Y, TC, B, TCE, EOS]);
         assert_eq!(g.res.text, "</think>y<tool_call>b</tool_call>");
@@ -1145,6 +1147,10 @@ mod tests {
         cont.extend([END, Y]);
         assert_eq!(gens[1]["prompt"], json!(cont));
         assert_eq!((gens[1]["temperature"].as_f64(), gens[1]["top_p"].as_f64()), (Some(0.7), Some(0.95)));
+        assert_eq!(
+            (gens[0]["presence_penalty"].as_f64(), gens[1]["presence_penalty"].as_f64()),
+            (Some(0.2), Some(0.2))
+        );
         assert_eq!(gens[1]["max_tokens"], json!(48));
         assert_ne!(gens[0]["id"], gens[1]["id"]);
         assert_eq!(crate::guard::RETRIES.load(std::sync::atomic::Ordering::Relaxed) >= 1, true);

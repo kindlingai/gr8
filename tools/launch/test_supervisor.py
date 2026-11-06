@@ -373,13 +373,10 @@ class FrontTests(unittest.TestCase):
         a = self.front_argv()
         self.assertNotIn('--default-presence-penalty', a)
         self.assertNotIn('--default-frequency-penalty', a)
-        self.assertNotIn('--default-thinking-presence-penalty', a)
-        a = self.front_argv('--default-presence-penalty', '1.5', '--default-frequency-penalty', '-0.5',
-                            '--default-thinking-presence-penalty', '1')
-        self.assertEqual(a[a.index('--default-presence-penalty') + 1], '1.5')
+        a = self.front_argv('--default-presence-penalty', 'thinking=0.5,greedy=0.2,nongreedy=0',
+                            '--default-frequency-penalty', '-0.5')
+        self.assertEqual(a[a.index('--default-presence-penalty') + 1], 'thinking=0.5,greedy=0.2,nongreedy=0')
         self.assertEqual(a[a.index('--default-frequency-penalty') + 1], '-0.5')
-        self.assertEqual(a[a.index('--default-thinking-presence-penalty') + 1], '1')
-        self.assertNotIn('--default-thinking-frequency-penalty', a)
 
     def test_the_tool_repeat_guard_reaches_the_front_end_when_on(self):
         a = self.front_argv()

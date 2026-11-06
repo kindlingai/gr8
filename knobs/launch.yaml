@@ -172,28 +172,24 @@ options:
     scope: box
     default: "0"
     doc: >-
-      the head's front end: presence_penalty for a request that names none, -2 to 2 (OpenAI's). The engine lowers the
-      logit of every token the reply already holds by it, before temperature and top_p; the prompt does not count.
-      Qwen recommends 1.5 for thinking models that fall into repetition loops. 0 = off
+      the head's front end: the presence_penalty spec for requests (OpenAI's penalty: the engine lowers the logit of
+      every token the reply already holds by it, before temperature and top_p; the prompt does not count). One part,
+      or a comma list of base=, thinking=, greedy= and nongreedy= parts; a part is [+]A[*M], an amount added and a
+      multiplier (base=0.2 adds 0.2; thinking=*1.1 boosts by 10%; thinking=+0.1*1.1 both). For a request the amounts
+      of the matching parts add up and their multipliers compound: base always, greedy when the request's
+      temperature (after defaults) is exactly 0 else nongreedy, thinking inside the think block. The request's own
+      presence_penalty replaces base's amount (0 included; the multiplier stays), its thinking_presence_penalty
+      replaces thinking's; the greedy and nongreedy parts always apply. A temperature=[[+]A][*B] part is a last stage
+      over that total: (total + A*T) * (B*T) at the request's temperature T, the factor only when *B is written, so
+      temperature=*1 makes the penalty proportional to the temperature and zero under greedy. A spec any combination of
+      which resolves outside -2..2 at any T from 0 to 2 is refused at boot, and a request whose value pushes a total
+      outside it gets a 400. 0 = off
   DEFAULT_FREQUENCY_PENALTY:
     scope: box
     default: "0"
     doc: >-
-      the head's front end: frequency_penalty for a request that names none, -2 to 2 (OpenAI's): the logit drops by it
-      times the number of times the reply already holds the token. 0 = off
-  DEFAULT_THINKING_PRESENCE_PENALTY:
-    scope: box
-    default: "0"
-    doc: >-
-      the head's front end: thinking_presence_penalty for a request that names none, -2 to 2. Added to presence_penalty
-      on the tokens inside the think block the prompt leaves open, until the reply closes it, over the same counts.
-      0 = off
-  DEFAULT_THINKING_FREQUENCY_PENALTY:
-    scope: box
-    default: "0"
-    doc: >-
-      the head's front end: thinking_frequency_penalty for a request that names none, -2 to 2. Added to
-      frequency_penalty inside the think block, as DEFAULT_THINKING_PRESENCE_PENALTY. 0 = off
+      the head's front end: the frequency_penalty spec, in DEFAULT_PRESENCE_PENALTY's form (the logit drops by the value
+      times the number of times the reply already holds the token). 0 = off
   TOOL_REPEAT_GUARD:
     scope: box
     default: "0"
