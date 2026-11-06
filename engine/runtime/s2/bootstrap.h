@@ -1,7 +1,7 @@
 // Persistent host-control sockets for the opt-in S2 server. No CUDA/fabric I/O.
 // Call AFTER local model load. A failed handshake never publishes ready.s2.
-// The bootstrap's sockets and exchanges are Rust (engine/scheduler-rs src/control/bootstrap.rs); the settings, their
-// agreement string and the S2 files stay here.
+// The bootstrap's sockets and exchanges are Rust (engine/scheduler-rs src/control/bootstrap.rs), and so are the
+// agreement string and the S2 files (src/service/files.rs); the settings stay here.
 #pragma once
 #include "control_io.h"
 #include "ingress.h"
@@ -27,19 +27,12 @@ struct BootstrapConfig {
         require(!directory.empty() && !runtime_signature.empty(), "missing bootstrap directory/runtime signature");
     }
     std::string agreement() const {
-        return capability(scheduler, ranks) + std::to_string(scheduler.max_sessions) + " " +
-            std::to_string(scheduler.prefill_rows) + " " + std::to_string(scheduler.two_lanes) +
-            (scheduler.decode_prefill_rows ? " dpf " + std::to_string(scheduler.decode_prefill_rows) : std::string()) +
-            (scheduler.decode_rounds > 1 ? " dr " + std::to_string(scheduler.decode_rounds) : std::string()) +
-            (scheduler.cp_step_rows ? " cpsr " + std::to_string(scheduler.cp_step_rows) + (scheduler.cp_seg ? " seg" : "") +
-                                      " after " + std::to_string(scheduler.cp_after) : std::string()) +
-            (scheduler.r2_rows ? " r2 " + std::to_string(scheduler.r2_rows) : std::string()) +
-            (scheduler.tail_first ? " tf" : std::string()) +
-            (scheduler.c8_pack ? " c8pack" : std::string()) +
-            (scheduler.park ? " park" : std::string()) +
-            (scheduler.notice_max != NOTICE_MAX ? " nmax " + std::to_string(scheduler.notice_max) : std::string()) +
-            (prefill_min ? " pfmin " + std::to_string(prefill_min) : std::string()) +
-            " ctl " + std::to_string(control_version) + "\n" + runtime_signature;
+        svc::Boot b(scheduler, ranks);
+        b.b.prefill_min = prefill_min; b.b.control_version = control_version;
+        b.b.signature = ctl::bytes(runtime_signature); b.b.signature_n = runtime_signature.size();
+        std::string out;
+        ctl::check(g6svc_agreement(&b.b, ctl::grow_string, &out));
+        return out;
     }
 };
 // The first word where a worker's agreement differs from the head's, for the refusal: "rank 2 has 'G6_X=1', the head
@@ -50,10 +43,7 @@ inline std::string agreement_difference(unsigned rank, const std::string& head, 
     return out;
 }
 inline void atomic_file(const std::string& path, const std::string& bytes) {
-    const auto temp = path + ".tmp";
-    { std::ofstream f(temp, std::ios::binary | std::ios::trunc); require(bool(f), "cannot create S2 file");
-      f << bytes; f.close(); require(bool(f), "S2 file write failed"); }
-    require(!::rename(temp.c_str(), path.c_str()), "S2 file publication failed");
+    ctl::check(g6svc_atomic_file(ctl::bytes(path), path_n(path), ctl::bytes(bytes), bytes.size()));
 }
 struct ControlLinks {
     std::vector<std::unique_ptr<ControlIO>> links; // head: rank1..NR-1; worker: only head
@@ -114,9 +104,10 @@ inline void capture_barrier(const BootstrapConfig& c, ControlLinks& links) {
     ctl::check(g6ctl_capture_barrier(&b, h.data(), h.size()));
 }
 inline void publish_ready(const BootstrapConfig& c, const ControlLinks& links) {
-    require(c.rank == 0 && links.links.size() == c.ranks - 1, "ready before all-rank bootstrap");
-    for (auto& p : links.links) require(bool(p), "ready with missing rank");
-    require(!exists(c.directory + "/abort.s2"), "aborted before ready");
-    atomic_file(c.directory + "/ready.s2", capability(c.scheduler, c.ranks));
+    bool missing = false;
+    for (const auto& p : links.links) missing = missing || !p;
+    svc::Boot b(c.scheduler, c.ranks);
+    b.b.rank = c.rank; b.b.directory = ctl::bytes(c.directory); b.b.directory_n = path_n(c.directory);
+    ctl::check(g6svc_publish_ready(&b.b, links.links.size(), missing));
 }
 } // namespace g6s2

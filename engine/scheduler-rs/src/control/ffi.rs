@@ -60,7 +60,7 @@ thread_local! {
     static ERROR: RefCell<CString> = RefCell::new(CString::default());
 }
 
-fn code<T>(r: R<T>) -> i32 {
+pub(crate) fn code<T>(r: R<T>) -> i32 {
     match r {
         Ok(_) => 0,
         Err(Fail::Hook) => 1,
@@ -72,14 +72,14 @@ fn code<T>(r: R<T>) -> i32 {
         }
     }
 }
-unsafe fn bytes<'a>(p: *const u8, n: usize) -> &'a [u8] {
+pub(crate) unsafe fn bytes<'a>(p: *const u8, n: usize) -> &'a [u8] {
     if n == 0 {
         &[]
     } else {
         std::slice::from_raw_parts(p, n)
     }
 }
-unsafe fn give(b: &[u8], grow: GrowFn, ctx: *mut c_void) {
+pub(crate) unsafe fn give(b: &[u8], grow: GrowFn, ctx: *mut c_void) {
     let p = grow(ctx, b.len());
     if !b.is_empty() {
         std::ptr::copy_nonoverlapping(b.as_ptr(), p, b.len());

@@ -128,6 +128,7 @@ struct g6sch_completion { g6sch_key key; uint32_t emitted; bool finished; uint32
 enum {
     G6SCH_ABI_PAGE, G6SCH_ABI_PREFILL_DEFER_MAX, G6SCH_ABI_NOTICE_MIN, G6SCH_ABI_NOTICE_MAX, G6SCH_ABI_NOTICE_ROWS,
     G6SCH_ABI_MAX_DECODE_ROUNDS, G6SCH_ABI_PACK_MAX_MEMBERS, G6SCH_ABI_QMAX, G6SCH_ABI_PARSE_FN, G6SCH_ABI_CONTROL_VERSION,
+    G6SCH_ABI_PROFILES_MAX, G6SCH_ABI_SCALE_MAX_BITS,
 };
 uint64_t g6sch_abi(uint32_t what);
 
@@ -599,6 +600,56 @@ int32_t g6ctl_receive_events(const g6ctl_endpoint* e, g6ctl_quit_fn on_quit, voi
 int32_t g6ctl_request(const g6ctl_endpoint* e, uint64_t id, g6ctl_grow_fn grow, void* ctx);
 void g6ctl_admitted(const g6ctl_endpoint* e, uint64_t id);
 
+// s2/ingress.h, trace.h, bootstrap.h's files and service.h's status.s2: the S2 files and the trace. Fallible calls
+// return 0, or 2 when refused, with the message in g6ctl_error(). Strings are bytes and a length.
+struct g6svc_command { uint64_t epoch, request, hash; bool admit; };
+struct g6svc_run_use { uint32_t table_version, held, worst; };   // kvman-rs g6kv_use
+struct g6svc_profile { const uint8_t* name; size_t name_n; uint8_t digest[32]; uint32_t active_layers; };
+struct g6svc_steering { const g6svc_profile* profiles; size_t n; uint32_t scope, forced_scale_bits; bool loaded, forced; };
+// BootstrapConfig's fields that ready.s2 and the agreement read, and the module's limits its config is checked against
+struct g6svc_boot {
+    const g6sch_config* scheduler; g6svc_steering steering;
+    uint32_t max_sessions, rank, ranks, prefill_min, control_version, lp_max;
+    const uint8_t* directory; size_t directory_n; const uint8_t* signature; size_t signature_n;
+    bool mtp0, pack, park;
+};
+// status.s2; the growth counters, tiers and runs are read only with their has_ flag
+struct g6svc_status {
+    uint64_t epoch, queued, stalls, grows, stalled;
+    const g6kv_tier_totals* tiers; size_t n_tiers; const g6svc_run_use* runs; size_t n_runs;
+    uint32_t pool_pages, resident, retiring, free, room, held_pages, worst_pages;
+    bool has_growth, has_tiers, has_runs;
+};
+uint64_t g6svc_payload_hash(const uint8_t* b, size_t n);
+bool g6svc_exists(const uint8_t* p, size_t n);
+int32_t g6svc_read_file(const uint8_t* p, size_t n, g6ctl_grow_fn grow, void* ctx);
+int32_t g6svc_atomic_file(const uint8_t* p, size_t n, const uint8_t* b, size_t bn);
+int32_t g6svc_number(const uint8_t* s, size_t n, uint64_t* out);
+int32_t g6svc_parse_command(const uint8_t* t, size_t n, uint64_t epoch, g6svc_command* out);
+// the head's reader of DIR's cmd.<k> and req.<id>: next consumes, peek does not; *has = false when none is there yet
+struct g6svc_ingress;
+int32_t g6svc_ingress_new(const uint8_t* dir, size_t n, uint64_t epoch, g6svc_ingress** out);
+void g6svc_ingress_free(g6svc_ingress* i);
+int32_t g6svc_ingress_next(const g6svc_ingress* i, bool* has, g6svc_command* out);
+int32_t g6svc_ingress_peek(const g6svc_ingress* i, bool* has, g6svc_command* out);
+int32_t g6svc_ingress_request(const g6svc_ingress* i, const g6svc_command* c, g6ctl_grow_fn grow, void* ctx);
+int32_t g6svc_steering_check(const g6svc_steering* s);
+int32_t g6svc_capability(const g6svc_boot* b, g6ctl_grow_fn grow, void* ctx);
+int32_t g6svc_agreement(const g6svc_boot* b, g6ctl_grow_fn grow, void* ctx);
+// links: the head's links, missing: one of them is absent
+int32_t g6svc_publish_ready(const g6svc_boot* b, size_t links, bool missing);
+int32_t g6svc_status_pool(uint32_t free, uint32_t room, uint32_t pool_pages);
+int32_t g6svc_status_publish(const g6svc_status* s, const uint8_t* dir, size_t n);
+// GR8_S2_TRACE: PATH.r<rank>.json, null when not traced; the steps and control threads write at once
+struct g6svc_trace;
+g6svc_trace* g6svc_trace_open(const uint8_t* p, size_t n, uint32_t rank);
+void g6svc_trace_free(g6svc_trace* t);
+void g6svc_trace_span(const g6svc_trace* t, const uint8_t* name, size_t name_n, int32_t tid, uint64_t t0, uint64_t t1,
+                      const uint8_t* args, size_t args_n);
+void g6svc_trace_instant(const g6svc_trace* t, const uint8_t* name, size_t name_n, int32_t tid, const uint8_t* args,
+                         size_t args_n);
+uint64_t g6svc_trace_now(void);
+
 // The layout digest of every type above (and g6kvman.h's g6kv_tier_totals), computed the way src/layout.rs computes
 // it over the Rust types: per type its size and alignment, per field its offset, size and kind. The C++ compares it
 // with g6sch_layout() once at startup (scheduler.h check_abi).
@@ -683,6 +734,12 @@ constexpr uint64_t g6sch_layout_cpp() {
     G6SCH_TYPE(g6ctl_commit) G6SCH_FIELD(g6ctl_commit, c) G6SCH_FIELD(g6ctl_commit, hold) G6SCH_FIELD(g6ctl_commit, has_resize) G6SCH_FIELD(g6ctl_commit, resize)
     G6SCH_TYPE(g6ctl_frame) G6SCH_FIELD(g6ctl_frame, tag) G6SCH_FIELD(g6ctl_frame, notice) G6SCH_FIELD(g6ctl_frame, ack) G6SCH_FIELD(g6ctl_frame, commit) G6SCH_FIELD(g6ctl_frame, epoch) G6SCH_FIELD(g6ctl_frame, request) G6SCH_FIELD(g6ctl_frame, seq) G6SCH_FIELD(g6ctl_frame, rank) G6SCH_FIELD(g6ctl_frame, bytes) G6SCH_FIELD(g6ctl_frame, n)
     G6SCH_TYPE(g6ctl_boot) G6SCH_FIELD(g6ctl_boot, rank) G6SCH_FIELD(g6ctl_boot, ranks) G6SCH_FIELD(g6ctl_boot, timeout) G6SCH_FIELD(g6ctl_boot, port) G6SCH_FIELD(g6ctl_boot, head_ip) G6SCH_FIELD(g6ctl_boot, head_ip_n) G6SCH_FIELD(g6ctl_boot, directory) G6SCH_FIELD(g6ctl_boot, directory_n) G6SCH_FIELD(g6ctl_boot, agreement) G6SCH_FIELD(g6ctl_boot, agreement_n)
+    G6SCH_TYPE(g6svc_command) G6SCH_FIELD(g6svc_command, epoch) G6SCH_FIELD(g6svc_command, request) G6SCH_FIELD(g6svc_command, hash) G6SCH_FIELD(g6svc_command, admit)
+    G6SCH_TYPE(g6svc_run_use) G6SCH_FIELD(g6svc_run_use, table_version) G6SCH_FIELD(g6svc_run_use, held) G6SCH_FIELD(g6svc_run_use, worst)
+    G6SCH_TYPE(g6svc_profile) G6SCH_FIELD(g6svc_profile, name) G6SCH_FIELD(g6svc_profile, name_n) G6SCH_FIELD(g6svc_profile, digest) G6SCH_FIELD(g6svc_profile, active_layers)
+    G6SCH_TYPE(g6svc_steering) G6SCH_FIELD(g6svc_steering, profiles) G6SCH_FIELD(g6svc_steering, n) G6SCH_FIELD(g6svc_steering, scope) G6SCH_FIELD(g6svc_steering, forced_scale_bits) G6SCH_FIELD(g6svc_steering, loaded) G6SCH_FIELD(g6svc_steering, forced)
+    G6SCH_TYPE(g6svc_boot) G6SCH_FIELD(g6svc_boot, scheduler) G6SCH_FIELD(g6svc_boot, steering) G6SCH_FIELD(g6svc_boot, max_sessions) G6SCH_FIELD(g6svc_boot, rank) G6SCH_FIELD(g6svc_boot, ranks) G6SCH_FIELD(g6svc_boot, prefill_min) G6SCH_FIELD(g6svc_boot, control_version) G6SCH_FIELD(g6svc_boot, lp_max) G6SCH_FIELD(g6svc_boot, directory) G6SCH_FIELD(g6svc_boot, directory_n) G6SCH_FIELD(g6svc_boot, signature) G6SCH_FIELD(g6svc_boot, signature_n) G6SCH_FIELD(g6svc_boot, mtp0) G6SCH_FIELD(g6svc_boot, pack) G6SCH_FIELD(g6svc_boot, park)
+    G6SCH_TYPE(g6svc_status) G6SCH_FIELD(g6svc_status, epoch) G6SCH_FIELD(g6svc_status, queued) G6SCH_FIELD(g6svc_status, stalls) G6SCH_FIELD(g6svc_status, grows) G6SCH_FIELD(g6svc_status, stalled) G6SCH_FIELD(g6svc_status, tiers) G6SCH_FIELD(g6svc_status, n_tiers) G6SCH_FIELD(g6svc_status, runs) G6SCH_FIELD(g6svc_status, n_runs) G6SCH_FIELD(g6svc_status, pool_pages) G6SCH_FIELD(g6svc_status, resident) G6SCH_FIELD(g6svc_status, retiring) G6SCH_FIELD(g6svc_status, free) G6SCH_FIELD(g6svc_status, room) G6SCH_FIELD(g6svc_status, held_pages) G6SCH_FIELD(g6svc_status, worst_pages) G6SCH_FIELD(g6svc_status, has_growth) G6SCH_FIELD(g6svc_status, has_tiers) G6SCH_FIELD(g6svc_status, has_runs)
     return h;
 }
 #undef G6SCH_TYPE

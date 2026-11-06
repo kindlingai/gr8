@@ -220,46 +220,26 @@ class Service {
         native_.pool.retain(s.run, st, g6rt::steering::cache_namespace(s.req.steering));
     }
     void publish_status() { // head CONTROL thread only, on queue/lifecycle revisions
+        const uint32_t pages = c_.scheduler.pool_rows / PAGE;
         const auto free = native_.pool.free_pages(), room = native_.pool.room();
-        require(room <= free && free <= c_.scheduler.pool_rows / PAGE, "invalid pool status");
-        std::ostringstream o;
-        o << "{\"epoch\":" << c_.scheduler.epoch << ",\"resident\":" << progress_.resident.load()
-          << ",\"queued\":" << queue_.size() << ",\"retiring\":" << progress_.retiring.load()
-          << ",\"reserved_pages\":" << c_.scheduler.pool_rows / PAGE - free << ",\"free_pages\":" << free
-          << ",\"largest_free_run\":" << room << ",\"admission_stalls\":" << queue_.stalls();
+        ctl::check(g6svc_status_pool(free, room, pages));
+        g6svc_status st{};
+        st.epoch = c_.scheduler.epoch; st.pool_pages = pages; st.free = free; st.room = room;
+        st.resident = progress_.resident.load(); st.queued = queue_.size(); st.retiring = progress_.retiring.load();
+        st.stalls = queue_.stalls();
         // growth on demand: pages the live runs hold and could grow to, each run's pair, and rounds a session sat out
-        if (native_.pool.stats) {
-            const auto st = native_.pool.stats();
-            o << ",\"held_pages\":" << st.held_pages << ",\"worst_pages\":" << st.worst_pages << ",\"grown\":" << st.grows
-              << ",\"stalled_rounds\":" << st.stalls;
+        if ((st.has_growth = bool(native_.pool.stats))) {
+            const auto g = native_.pool.stats();
+            st.held_pages = g.held_pages; st.worst_pages = g.worst_pages; st.grows = g.grows; st.stalled = g.stalls;
         }
-        if (native_.pool.tiers) {
-            o << ",\"tiers\":[";
-            const auto ts = native_.pool.tiers();
-            for (size_t i = 0; i < ts.size(); ++i) {
-                const auto& t = ts[i];
-                // pages are page blocks; *_bytes = pages x block_bytes
-                const uint64_t bb = t.block_bytes;
-                o << (i ? "," : "") << "{\"slots\":" << t.slots << ",\"free_slots\":" << t.free_slots << ",\"entries\":" << t.entries
-                  << ",\"shared\":" << t.shared << ",\"block_bytes\":" << bb << ",\"spilled_pages\":" << t.spilled_pages
-                  << ",\"spilled_bytes\":" << t.spilled_pages * bb << ",\"moved_in_pages\":" << t.moved_in_pages
-                  << ",\"moved_in_bytes\":" << t.moved_in_pages * bb << ",\"moved_out\":" << t.moved_out
-                  << ",\"moved_out_pages\":" << t.moved_out_pages << ",\"restored_pages\":" << t.restored_pages
-                  << ",\"restored_bytes\":" << t.restored_pages * bb << ",\"hits\":" << t.hits << ",\"dropped\":" << t.dropped
-                  << ",\"dropped_pages\":" << t.dropped_pages << ",\"refused\":" << t.refused << ",\"refused_pages\":" << t.refused_pages
-                  << ",\"full\":" << t.full << ",\"write_credit\":" << t.credit << "}";
-            }
-            o << "]";
+        std::vector<g6kv_tier_totals> tiers;
+        if ((st.has_tiers = bool(native_.pool.tiers))) { tiers = native_.pool.tiers(); st.tiers = tiers.data(); st.n_tiers = tiers.size(); }
+        std::vector<PoolUse> runs;
+        if ((st.has_runs = bool(native_.pool.runs))) {
+            runs = native_.pool.runs();
+            st.runs = reinterpret_cast<const g6svc_run_use*>(runs.data()); st.n_runs = runs.size();
         }
-        if (native_.pool.runs) {
-            o << ",\"runs\":[";
-            const auto runs = native_.pool.runs();
-            for (size_t i = 0; i < runs.size(); ++i)
-                o << (i ? "," : "") << "{\"held\":" << runs[i].held << ",\"worst\":" << runs[i].worst << "}";
-            o << "]";
-        }
-        o << "}\n";
-        atomic_file(c_.directory + "/status.s2", o.str());
+        ctl::check(g6svc_status_publish(&st, ctl::bytes(c_.directory), path_n(c_.directory)));
     }
     // held: the boundary every rank is stopped at after a commit with hold (Commit::hold); the notice names it, not a
     // future one. Only event() itself passes it, at once after the held commit, so nothing else is announced between.
