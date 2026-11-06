@@ -406,6 +406,66 @@ void g6s2_batch_spec_len(const g6s2_batch* b, int32_t which, g6s2_spec_len* out)
 void g6s2_batch_slot(const g6s2_batch* b, int32_t q, g6s2_slot* out);
 void g6s2_batch_learn(const g6s2_batch* b, g6s2_learn* out);
 
+// s2/driver.h: the driver (docs/HOST-CORE.md R4a). Rust owns the per-slot emitted counts, initialised flags, what it
+// reads of each payload and the capped-round cycle behind g6s2_driver. The C++ Driver is a facade: it passes the
+// scheduler's state (still held by the C++ Scheduler) per call, answers the engine's hooks and the planner's calls
+// through the tables below, and keeps the payloads. Hooks may read the driver back. Calls return 0, 1 when a hook
+// returned nonzero (the facade holds its exception), or 2 when refused (g6s2_driver_error); after the scheduler
+// changed, either fails it.
+struct g6s2_drv_sched { const g6sch_config* c; g6sch_slot* s; size_t n; g6sch_state* st; };
+// what the driver reads of an admitted payload; steering_ok: its steering equals the grant's
+struct g6s2_drv_payload { size_t prompt_len; int32_t chunk; bool decode_prompt; bool steering_ok; };
+// the engine's callbacks; each returns 0, or nonzero when the C++ hook threw. has_*: the C++ member is set. payload:
+// the facade copies apply's payload into the slot (set) or clears it. prefill and prefill_pack find the payload by slot
+struct g6s2_drv_hooks {
+    void* ctx;
+    int32_t (*bind)(void* ctx, const g6sch_grant* g);
+    int32_t (*retire)(void* ctx, const g6sch_slot* s);
+    int32_t (*prefill)(void* ctx, const g6sch_slot* s, uint32_t first, uint32_t rows);
+    int32_t (*prefill_pack)(void* ctx, const uint32_t* slots, const uint32_t* firsts, const uint32_t* rows, uint32_t n);
+    int32_t (*dfl_ok)(void* ctx, const g6sch_key* k, bool* ok);
+    int32_t (*terminal)(void* ctx, const g6sch_key* k);
+    int32_t (*grow)(void* ctx, const g6sch_slot* s, uint64_t rows, g6sch_run* out, bool* some);
+    int32_t (*finished)(void* ctx, const g6sch_slot* s);
+    int32_t (*resize)(void* ctx);
+    int32_t (*shrink)(void* ctx, const g6sch_shrink* k, const g6sch_run* was, uint64_t length);
+    int32_t (*settle)(void* ctx);
+    int32_t (*payload)(void* ctx, uint32_t slot, bool set);
+    bool has_prefill_pack, has_dfl_ok, has_terminal, has_grow, has_finished, has_resize, has_shrink, has_settle;
+};
+// the planner's calls, through the C++ s2::Batch (which writes the round log); admit builds the session from the slot's
+// payload; inserted: Stats::inserted
+struct g6s2_drv_planner {
+    void* ctx;
+    int32_t (*admit)(void* ctx, uint32_t slot, int32_t first, int32_t n_gen, bool dfl);
+    int32_t (*admit_pack)(void* ctx, const uint32_t* slots, const int32_t* firsts, const int32_t* n_gens, uint32_t n);
+    int32_t (*round)(void* ctx, const int32_t* order, uint32_t n, bool* ran);
+    int32_t (*demote)(void* ctx);
+    int32_t (*promote)(void* ctx, int32_t q);
+    int32_t (*release)(void* ctx, int32_t q);
+    int32_t (*length)(void* ctx, int32_t q, int32_t* out);
+    int32_t (*finished)(void* ctx, int32_t q, bool* out);
+    int32_t (*active)(void* ctx, int32_t q, bool* out);
+    int32_t (*inserted)(void* ctx, int32_t q, int32_t* out);
+};
+struct g6s2_driver;
+// null when bind, retire, prefill or payload is missing
+g6s2_driver* g6s2_driver_new(const g6s2_drv_hooks* h, const g6s2_drv_planner* p);
+void g6s2_driver_free(g6s2_driver* d);
+const char* g6s2_driver_error(const g6s2_driver* d);
+// digest: the scheduler's before the commit; pay: null without an admit; freed: room for s->n runs
+int32_t g6s2_driver_apply(const g6s2_driver* d, const g6s2_drv_sched* s, const g6sch_commit* e, uint64_t digest, bool resize,
+                          const g6s2_drv_payload* pay, g6sch_run* freed, size_t* n_freed, bool* admitted);
+int32_t g6s2_driver_step(const g6s2_driver* d, const g6s2_drv_sched* s, g6sch_quantum* out);
+// the emit hook's accounting: *done = finished, or max_tokens emitted
+int32_t g6s2_driver_emit(const g6s2_driver* d, uint32_t q, int32_t n, uint32_t count, bool finished, uint32_t max_tokens,
+                         bool* done);
+bool g6s2_driver_decoding(const g6s2_driver* d);   // the quantum in flight is a decode round
+// a slot out of range reads 0 / false
+uint32_t g6s2_driver_emitted(const g6s2_driver* d, uint32_t q);
+bool g6s2_driver_initialized(const g6s2_driver* d, uint32_t q);
+uint64_t g6s2_driver_cp_rounds(const g6s2_driver* d);
+
 // The layout digest of every type above (and g6kvman.h's g6kv_tier_totals), computed the way src/layout.rs computes
 // it over the Rust types: per type its size and alignment, per field its offset, size and kind. The C++ compares it
 // with g6sch_layout() once at startup (scheduler.h check_abi).
@@ -480,6 +540,10 @@ constexpr uint64_t g6sch_layout_cpp() {
     G6SCH_TYPE(g6s2_slot) G6SCH_FIELD(g6s2_slot, first) G6SCH_FIELD(g6s2_slot, chunk) G6SCH_FIELD(g6s2_slot, n_gen) G6SCH_FIELD(g6s2_slot, dflash) G6SCH_FIELD(g6s2_slot, ins_after) G6SCH_FIELD(g6s2_slot, ins_unless) G6SCH_FIELD(g6s2_slot, n_ins) G6SCH_FIELD(g6s2_slot, ins_tokens) G6SCH_FIELD(g6s2_slot, n_tokens) G6SCH_FIELD(g6s2_slot, tokens) G6SCH_FIELD(g6s2_slot, n_d) G6SCH_FIELD(g6s2_slot, d) G6SCH_FIELD(g6s2_slot, n_dlm) G6SCH_FIELD(g6s2_slot, dlm) G6SCH_FIELD(g6s2_slot, n) G6SCH_FIELD(g6s2_slot, on) G6SCH_FIELD(g6s2_slot, done) G6SCH_FIELD(g6s2_slot, rounds) G6SCH_FIELD(g6s2_slot, k) G6SCH_FIELD(g6s2_slot, dfl) G6SCH_FIELD(g6s2_slot, mtp) G6SCH_FIELD(g6s2_slot, pb) G6SCH_FIELD(g6s2_slot, pd) G6SCH_FIELD(g6s2_slot, pl) G6SCH_FIELD(g6s2_slot, since) G6SCH_FIELD(g6s2_slot, mn) G6SCH_FIELD(g6s2_slot, lo) G6SCH_FIELD(g6s2_slot, warm) G6SCH_FIELD(g6s2_slot, armed) G6SCH_FIELD(g6s2_slot, force) G6SCH_FIELD(g6s2_slot, dd) G6SCH_FIELD(g6s2_slot, dl)
     G6SCH_TYPE(g6s2_learn) G6SCH_FIELD(g6s2_learn, round_no) G6SCH_FIELD(g6s2_learn, cur_round) G6SCH_FIELD(g6s2_learn, cur_active) G6SCH_FIELD(g6s2_learn, ring_q) G6SCH_FIELD(g6s2_learn, ring_lo) G6SCH_FIELD(g6s2_learn, ring_end) G6SCH_FIELD(g6s2_learn, ring_top) G6SCH_FIELD(g6s2_learn, n_ring_tok) G6SCH_FIELD(g6s2_learn, ring_tok)
     G6SCH_TYPE(g6s2_hooks) G6SCH_FIELD(g6s2_hooks, ctx) G6SCH_FIELD(g6s2_hooks, run) G6SCH_FIELD(g6s2_hooks, round) G6SCH_FIELD(g6s2_hooks, prompt) G6SCH_FIELD(g6s2_hooks, emit) G6SCH_FIELD(g6s2_hooks, dfl) G6SCH_FIELD(g6s2_hooks, dfl_start) G6SCH_FIELD(g6s2_hooks, lp) G6SCH_FIELD(g6s2_hooks, has_round) G6SCH_FIELD(g6s2_hooks, has_prompt) G6SCH_FIELD(g6s2_hooks, has_emit) G6SCH_FIELD(g6s2_hooks, has_dfl) G6SCH_FIELD(g6s2_hooks, has_dfl_start) G6SCH_FIELD(g6s2_hooks, has_lp)
+    G6SCH_TYPE(g6s2_drv_sched) G6SCH_FIELD(g6s2_drv_sched, c) G6SCH_FIELD(g6s2_drv_sched, s) G6SCH_FIELD(g6s2_drv_sched, n) G6SCH_FIELD(g6s2_drv_sched, st)
+    G6SCH_TYPE(g6s2_drv_payload) G6SCH_FIELD(g6s2_drv_payload, prompt_len) G6SCH_FIELD(g6s2_drv_payload, chunk) G6SCH_FIELD(g6s2_drv_payload, decode_prompt) G6SCH_FIELD(g6s2_drv_payload, steering_ok)
+    G6SCH_TYPE(g6s2_drv_hooks) G6SCH_FIELD(g6s2_drv_hooks, ctx) G6SCH_FIELD(g6s2_drv_hooks, bind) G6SCH_FIELD(g6s2_drv_hooks, retire) G6SCH_FIELD(g6s2_drv_hooks, prefill) G6SCH_FIELD(g6s2_drv_hooks, prefill_pack) G6SCH_FIELD(g6s2_drv_hooks, dfl_ok) G6SCH_FIELD(g6s2_drv_hooks, terminal) G6SCH_FIELD(g6s2_drv_hooks, grow) G6SCH_FIELD(g6s2_drv_hooks, finished) G6SCH_FIELD(g6s2_drv_hooks, resize) G6SCH_FIELD(g6s2_drv_hooks, shrink) G6SCH_FIELD(g6s2_drv_hooks, settle) G6SCH_FIELD(g6s2_drv_hooks, payload) G6SCH_FIELD(g6s2_drv_hooks, has_prefill_pack) G6SCH_FIELD(g6s2_drv_hooks, has_dfl_ok) G6SCH_FIELD(g6s2_drv_hooks, has_terminal) G6SCH_FIELD(g6s2_drv_hooks, has_grow) G6SCH_FIELD(g6s2_drv_hooks, has_finished) G6SCH_FIELD(g6s2_drv_hooks, has_resize) G6SCH_FIELD(g6s2_drv_hooks, has_shrink) G6SCH_FIELD(g6s2_drv_hooks, has_settle)
+    G6SCH_TYPE(g6s2_drv_planner) G6SCH_FIELD(g6s2_drv_planner, ctx) G6SCH_FIELD(g6s2_drv_planner, admit) G6SCH_FIELD(g6s2_drv_planner, admit_pack) G6SCH_FIELD(g6s2_drv_planner, round) G6SCH_FIELD(g6s2_drv_planner, demote) G6SCH_FIELD(g6s2_drv_planner, promote) G6SCH_FIELD(g6s2_drv_planner, release) G6SCH_FIELD(g6s2_drv_planner, length) G6SCH_FIELD(g6s2_drv_planner, finished) G6SCH_FIELD(g6s2_drv_planner, active) G6SCH_FIELD(g6s2_drv_planner, inserted)
     return h;
 }
 #undef G6SCH_TYPE

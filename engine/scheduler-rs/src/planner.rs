@@ -2248,7 +2248,7 @@ impl<E: Engine> Batch<E> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
 
@@ -2415,7 +2415,7 @@ mod tests {
     }
 
     /// counts the heap allocations of the thread that set COUNTING
-    mod counting {
+    pub(crate) mod counting {
         use std::alloc::{GlobalAlloc, Layout, System};
         use std::cell::Cell;
         thread_local! {

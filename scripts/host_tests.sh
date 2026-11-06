@@ -148,6 +148,9 @@ g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/test
 "$T/pool_conc_replay_test"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/driver_grow_test.cpp" "${KVLIB[@]}" -o "$T/driver_grow_test"
 "$T/driver_grow_test"
+# the facade over the Rust driver: a hook's exception and the driver's refusals, hooks reading it back, a moved Driver
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/driver_facade_test.cpp" -o "$T/driver_facade_test" "${KVLIB[@]}"
+"$T/driver_facade_test"
 # the scheduler's own prefill choice (fewest prompt rows first, with a deferral bound): no pool, no CUDA
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_fair_test.cpp" -o "$T/scheduler_fair_test" "${KNOBS[@]}"
 "$T/scheduler_fair_test"

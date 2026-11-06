@@ -185,6 +185,18 @@ impl Kind for crate::planner_ffi::CLearn {
 impl Kind for crate::planner_ffi::CHooks {
     const K: u64 = 6;
 }
+impl Kind for crate::driver::CSched {
+    const K: u64 = 6;
+}
+impl Kind for crate::driver::CPayload {
+    const K: u64 = 6;
+}
+impl Kind for crate::driver::CHooks {
+    const K: u64 = 6;
+}
+impl Kind for crate::driver::CPlanner {
+    const K: u64 = 6;
+}
 // g6sched.h counts void as 1 byte, as Rust's c_void
 impl Kind for std::ffi::c_void {
     const K: u64 = 6;
@@ -199,8 +211,23 @@ fn_kinds!(
     crate::planner_ffi::PromptFn,
     crate::planner_ffi::EmitFn,
     crate::planner_ffi::DflFn,
-    crate::planner_ffi::DflStartFn,
-    crate::planner_ffi::LpFn
+    crate::planner_ffi::DflStartFn, // also driver::QIntFn, the same type
+    crate::planner_ffi::LpFn,
+    crate::driver::BindFn,
+    crate::driver::SlotFn,
+    crate::driver::PrefillFn,
+    crate::driver::PrefillPackFn,
+    crate::driver::KeyBoolFn,
+    crate::driver::KeyFn,
+    crate::driver::GrowFn,
+    crate::driver::VoidFn,
+    crate::driver::ShrinkFn,
+    crate::driver::PayloadFn,
+    crate::driver::AdmitFn,
+    crate::driver::AdmitPackFn,
+    crate::driver::RoundFn,
+    crate::driver::QFn,
+    crate::driver::QBoolFn
 );
 
 /// The digest of every shared type's layout.
@@ -535,6 +562,50 @@ pub fn digest() -> u64 {
             has_dfl,
             has_dfl_start,
             has_lp
+        }
+    );
+    layout!(h, crate::driver::CSched { c, s, n, st });
+    layout!(h, crate::driver::CPayload { prompt_len, chunk, decode_prompt, steering_ok });
+    layout!(
+        h,
+        crate::driver::CHooks {
+            ctx,
+            bind,
+            retire,
+            prefill,
+            prefill_pack,
+            dfl_ok,
+            terminal,
+            grow,
+            finished,
+            resize,
+            shrink,
+            settle,
+            payload,
+            has_prefill_pack,
+            has_dfl_ok,
+            has_terminal,
+            has_grow,
+            has_finished,
+            has_resize,
+            has_shrink,
+            has_settle
+        }
+    );
+    layout!(
+        h,
+        crate::driver::CPlanner {
+            ctx,
+            admit,
+            admit_pack,
+            round,
+            demote,
+            promote,
+            release,
+            length,
+            finished,
+            active,
+            inserted
         }
     );
     h
