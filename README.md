@@ -15,11 +15,12 @@ release. If you run it, please tell us what breaks: issues and PRs are welcome.*
 - **Boots from its own cache.** On GLM-5.3 each box fetches only its own part of the release, once. After that, GLM-5.3 boots in
   about 40 s and GLM-5.3-Flash on one box in 45 s.
 - **Speed.** On one stream writing code, GLM-5.3 decodes 57.4 tok/s on six boxes (RigMark), GLM-5.3-Flash 54.3 tok/s on one
-  box and DeepSeek-V4.1-Flash 104.6-105.9 tok/s on four (gr8's own bench). The [Models](#models) table has prose,
-  prefill and dates.
+  box and DeepSeek-V4.1-Flash 142.4-145.6 tok/s on four in fast mode, whose output is not bit-identical to the exact
+  model's (gr8's own bench). The [Models](#models) table has prose, prefill and dates.
 - **Many chats at once, and long ones.** GLM-5.3 decodes 8 requests at once from a KV pool of up to 614,400 tokens
-  (TP=6). GLM-5.3-Flash on one box decodes 4 at once from a 700,032-token pool. DeepSeek-V4.1-Flash runs 5 chats at
-  once by default and up to 16, and with `CAP=1048576` one request can hold up to 1,048,566 tokens, prompt and reply
+  (TP=6). GLM-5.3-Flash on one box decodes 4 at once from a 700,032-token pool. DeepSeek-V4.1-Flash runs 32 chats
+  at once in fast mode, its recipe's default, each up to 327,670 tokens; `./gr8 ds41 up` defaults to exact output and
+  5 chats. With `CAP=1048576` and 16 chats, one request can hold up to 1,048,566 tokens, prompt and reply
   ([docs/FIRST-BOOT.md](docs/FIRST-BOOT.md#2-deepseek-v41-flash-ds41-how-many-chats-and-how-long)).
 - **Prefix reuse and KV below the pool.** A request that continues a conversation prefills only its new part: a
   continued 20K-token conversation takes 7.1 s instead of 17.3 s (GLM-5.3, TP=4). On GLM-5.3, evicted prefixes can go
@@ -50,7 +51,7 @@ model and cluster size.
 |---|---|---|---|---|
 | GLM-5.3 | 3 to 6 | [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) | six boxes: 57.4 / 43.1 tok/s, 1,808 tok/s (RigMark, 2026-10-24; one box clock-capped) | [docs/GLM-5.3.md](docs/GLM-5.3.md) |
 | GLM-5.3-Flash | 1 to 4 | [kindlingai/glm-5.3-flash-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4) | one box: 54.3 / 29.1 tok/s, 1,214 tok/s (`gr8 glm53f bench`, 2026-11-06) | [docs/FLASH.md](docs/FLASH.md) |
-| DeepSeek-V4.1-Flash | 4 | [kindlingai/deepseek-v4.1-flash-exlr8-native](https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native) | four boxes: 104.6-105.9 / 61.7-62.0 tok/s, 3,197-3,700 tok/s (`bench/bench.py`, two runs, 2026-11-02) | [docs/DEEPSEEK.md](docs/DEEPSEEK.md) |
+| DeepSeek-V4.1-Flash | 4 | [kindlingai/deepseek-v4.1-flash-exlr8-native](https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native) | four boxes, fast mode: 142.4-145.6 / 83.5-84.6 tok/s, 3,655-4,463 tok/s (`bench/bench.py`, four runs, 2026-11-05) | [docs/DEEPSEEK.md](docs/DEEPSEEK.md) |
 
 Each page has the model's results, how to start it and where its known issues are.
 
@@ -62,7 +63,7 @@ Each page has the model's results, how to start it and where its known issues ar
 | 2 | GLM-5.3-Flash | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark): the same image on both boxes | about 86 GB a box |
 | 3 or 4 | GLM-5.3-Flash | [docs/FLASH.md](docs/FLASH.md) | see the page |
 | 3 to 6 | GLM-5.3 | Docker Compose (below), or [docs/DEPLOY.md](docs/DEPLOY.md) for bare metal and Kubernetes | about 90 GB a box with 4 boxes (TP=4) |
-| 4 | DeepSeek-V4.1-Flash | [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md): fetch the whole release to every box, then write a token map once | 510.6 GB a box, fetched before the first boot |
+| 4 | DeepSeek-V4.1-Flash | [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark): the same image on all four boxes, fast mode by default; or [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) with gr8's own launcher, exact output by default | 510.6 GB a box, fetched before the first boot |
 
 Each recipe repo pins one image and one set of settings for its box count.
 
@@ -93,8 +94,11 @@ Then `docker compose exec gr8 /opt/gr8/gr8 glm53 smoke` on the head. [docs/DEPLO
 setting, and has bare metal and Kubernetes. An agent that starts gr8 for someone asks them the questions in
 [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md) first.
 
-**DeepSeek-V4.1-Flash** has no one-command path yet. [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is its boot in
-order, from the four boxes to a passing `./gr8 ds41 smoke`.
+**DeepSeek-V4.1-Flash** (four boxes): the recipe
+[deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)
+is the quickest way: the same image on every box, in fast mode by default. We have not yet booted that image on four
+boxes. [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is the boot with gr8's own launcher, which gives exact output by
+default, in order, from the four boxes to a passing `./gr8 ds41 smoke`.
 
 ### With model-loader
 
