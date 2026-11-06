@@ -418,7 +418,7 @@ std::array<std::vector<std::string>, 2> run(const Scenario& sc, bool table, std:
         b[r].scheduler = sc.cfg; b[r].ranks = 2; b[r].rank = r; b[r].head_ip = "127.0.0.1"; b[r].port = 1;
         b[r].runtime_signature = "module_calls_test"; b[r].directory = fresh_dir(); b[r].prefill_min = sc.prefill_min;
     }
-    const std::string dir = b[0].directory, trace = std::string(getenv("GR8_S2_TRACE")) + ".r0.json";
+    const std::string dir = b[0].directory, trace = knob::s2_trace().value_or("") + ".r0.json";
     Lockstep ls;
     Fake f0(0, sc, ls), f1(1, sc, ls);
     unsigned next_cmd = 0;
