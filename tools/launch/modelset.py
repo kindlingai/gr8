@@ -170,13 +170,30 @@ def model_id(ms, variant):
     return hashlib.sha256(f'{ms.id} {variant.name} {variant.sha256}{src}'.encode()).hexdigest()
 
 
+def release_hidden(manifest_path):
+    """hidden_size from the config.json of the release a manifest belongs to (manifests/ sits in the release root, and
+    config.json in it or in tokenizer/; a multimodal config keeps it in text_config), or None. Flash's manifests do not
+    carry it."""
+    root = os.path.dirname(os.path.dirname(manifest_path))
+    for path in (os.path.join(root, 'config.json'), os.path.join(root, 'tokenizer', 'config.json')):
+        try:
+            with open(path) as f:
+                c = json.load(f)
+        except (OSError, ValueError):
+            continue
+        h = c.get('hidden_size') or (c.get('text_config') or {}).get('hidden_size')
+        if h:
+            return h
+    return None
+
+
 def expert_gb(path, tp):
     """GB of routed and shared expert weights on the busiest rank at this TP, under the manifest's widths (half h of
     expert e in layer l belongs to rank (16e + h + l) mod tp)."""
     with open(path) as f:
         manifest = json.load(f)
         layers = manifest['layers']
-    hidden = int(manifest.get('hidden_size', 6144))
+    hidden = int(manifest.get('hidden_size') or release_hidden(path) or 6144)
     half_bytes = {k: hidden * 16 * k for k in (2, 3, 4)}
     per = [0] * tp
     for key, e in layers.items():

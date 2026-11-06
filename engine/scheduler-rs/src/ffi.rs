@@ -201,65 +201,24 @@ fn err(r: Result<(), sch::Err>) -> *const c_char {
         Err(m) => msg(m),
     }
 }
-// each refusal message as a NUL-terminated static string
+// a refusal message as a NUL-terminated string that lives as long as the process (one copy per message)
 fn msg(m: &'static str) -> *const c_char {
-    macro_rules! table {
-        ($($s:literal),* $(,)?) => {
-            match m {
-                $($s => concat!($s, "\0").as_ptr() as *const c_char,)*
-                _ => "scheduler-rs: unknown refusal\0".as_ptr() as *const c_char,
-            }
-        };
-    }
-    table!(
-        "empty request",
-        "request exceeds pool including guard",
-        "bad epoch/pool",
-        "bad session/row limit",
-        "c8 prefill pack is DS41 only",
-        "parked slots are DS41 only",
-        "insufficient guard/prefill rows",
-        "decode_prefill_rows must be 0 or a multiple of 64 no larger than prefill_rows",
-        "decode_rounds must be at most 64",
-        "notice_max must be 2..8",
-        "cp_step_rows must be 0 or at least one session's verify (mtp + 1)",
-        "cp_seg needs cp_step_rows",
-        "r2_rows must be 0, or a multiple of 64 with window_pages",
-        "stale session key",
-        "invalid completion",
-        "insert count went back",
-        "cannot advance a live boundary",
-        "session generation exhausted",
-        "no parked session on that slot",
-        "no session slot",
-        "commit requires quiescent live engine",
-        "event/state mismatch",
-        "cancel epoch mismatch",
-        "bad shrink key",
-        "bad shrink",
-        "native request ordinals must increase",
-        "bad grant key",
-        "grant slot generation mismatch",
-        "bad reservation",
-        "duplicate native request id",
-        "active session/row limit",
-        "reused rows past the prompt",
-        "grant at an R the engine does not have",
-        "bad run growth",
-        "scheduler failed or work in flight",
-        "skip_prefill outside admission",
-        "not a prefill quantum",
-        "not a prefill pack quantum",
-        "prefill pack membership changed",
-        "not this prompt tail",
-        "not this prompt tail pack",
-        "tail pack completion invalid",
-        "not this decode round",
-        "decode completion order differs",
-        "too many output tokens",
-    )
+    use std::collections::HashMap;
+    use std::ffi::CString;
+    use std::sync::{Mutex, OnceLock};
+    static INTERNED: OnceLock<Mutex<HashMap<&'static str, CString>>> = OnceLock::new();
+    let mut t = INTERNED.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    t.entry(m).or_insert_with(|| CString::new(m).unwrap_or_default()).as_ptr()
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_guard(c: *const Config) -> u32 {
+    (*c).guard()
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_limit(c: *const Config) -> u32 {
+    (*c).limit()
+}
 #[no_mangle]
 pub unsafe extern "C" fn g6sch_validate(
     c: *const Config,
@@ -526,26 +485,267 @@ pub unsafe extern "C" fn g6sch_complete_decode(
     err(sch::complete_decode(&*c, slice_mut(s, n), &mut *st, slice(r, nr)))
 }
 
-/// The struct sizes and constants the C++ side duplicates, by index (g6sched.h G6SCH_ABI_*); 0 past the end.
+/// The constants the C++ side duplicates, by index (g6sched.h G6SCH_ABI_*); 0 past the end. The struct layouts are
+/// checked by g6sch_layout.
 #[no_mangle]
 pub extern "C" fn g6sch_abi(what: u32) -> u64 {
-    use std::mem::size_of;
     let v = [
-        size_of::<Slot>(),
-        size_of::<Config>(),
-        size_of::<Quantum>(),
-        size_of::<State>(),
-        size_of::<Commit>(),
-        size_of::<Completion>(),
-        size_of::<sch::Grant>(),
-        sch::PAGE as usize,
-        sch::PREFILL_DEFER_MAX as usize,
-        sch::NOTICE_MIN as usize,
-        sch::NOTICE_MAX as usize,
-        sch::NOTICE_ROWS as usize,
-        sch::MAX_DECODE_ROUNDS as usize,
-        sch::PACK_MAX_MEMBERS,
-        sch::QMAX,
+        u64::from(sch::PAGE),
+        u64::from(sch::PREFILL_DEFER_MAX),
+        sch::NOTICE_MIN,
+        sch::NOTICE_MAX,
+        u64::from(sch::NOTICE_ROWS),
+        u64::from(sch::MAX_DECODE_ROUNDS),
+        sch::PACK_MAX_MEMBERS as u64,
+        sch::QMAX as u64,
     ];
-    v.get(what as usize).map_or(0, |&x| x as u64)
+    v.get(what as usize).copied().unwrap_or(0)
+}
+
+// ---- kv_share.rs ---------------------------------------------------------------------------------------------------
+
+use crate::kv_share::{self as share, Resize, Totals};
+
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_share_want(last: *const Totals, now: *const Totals, per: u64, busy: bool) -> u64 {
+    share::want(&*last, &*now, per, busy)
+}
+/// true and *out written when the answer is a resize.
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_share_resize(
+    tier: u32,
+    segs: u64,
+    per: u64,
+    grant: u64,
+    give: u64,
+    txn: u64,
+    out: *mut Resize,
+) -> bool {
+    match share::resize(tier, segs, per, grant, give, txn) {
+        Some(r) => {
+            *out = r;
+            true
+        }
+        None => false,
+    }
+}
+
+// ---- admission.rs: the queue is Rust-owned, behind an opaque pointer ---------------------------------------------
+
+use crate::admission::{Queue, Status};
+
+/// A new empty queue for the (validated) config; free it with g6sch_queue_free.
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_new(c: *const Config) -> *mut Queue {
+    Box::into_raw(Box::new(Queue::new(*c)))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_free(q: *mut Queue) {
+    if !q.is_null() {
+        drop(Box::from_raw(q));
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_push(q: *mut Queue, r: *const Request) -> *const c_char {
+    err((*q).push(*r))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_cancel(q: *mut Queue, id: u64) -> bool {
+    (*q).cancel(id)
+}
+/// The front request, or null when the queue is empty; valid until the next call that changes the queue.
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_front(q: *const Queue) -> *const Request {
+    (*q).front().map_or(std::ptr::null(), |r| r as *const Request)
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_size(q: *const Queue) -> usize {
+    (*q).len()
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_stalls(q: *const Queue) -> u64 {
+    (*q).stalls
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_admitted(q: *mut Queue, id: u64) -> *const c_char {
+    err((*q).admitted(id))
+}
+/// *has: whether *out holds a status.
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_queue_check(
+    q: *mut Queue,
+    revision: u64,
+    slot: bool,
+    fits: bool,
+    room: u32,
+    has: *mut bool,
+    out: *mut Status,
+) -> *const c_char {
+    match (*q).check(revision, slot, fits, room) {
+        Ok(s) => {
+            *has = s.is_some();
+            if let Some(s) = s {
+                *out = s;
+            }
+            std::ptr::null()
+        }
+        Err(m) => msg(m),
+    }
+}
+
+// ---- request.rs ----------------------------------------------------------------------------------------------------
+
+use crate::request::{self as rq, Refusal, SteerFields};
+use crate::scheduler::Identity;
+
+#[repr(C)]
+pub struct Ints {
+    pub p: *const i32,
+    pub n: usize,
+}
+fn ints(v: &[i32]) -> Ints {
+    Ints { p: v.as_ptr(), n: v.len() }
+}
+
+/// The parsed request; its arrays point into the handle g6sch_parse_request returned.
+#[repr(C)]
+pub struct ParsedReq {
+    pub prompt: Ints,
+    pub stop: Ints,
+    pub n_gen: i32,
+    pub min_tokens: i32,
+    pub temp: f32,
+    pub top_p: f32,
+    pub seed: u32,
+    pub lp: i32,
+    pub plp: i32,
+    pub sys: i64,
+    pub steering: Identity,
+    pub ins_after: i32,
+    pub ins_unless: i32,
+    pub ins_tokens: Ints,
+    pub gram_kind: u32,
+    pub gram_strict: bool,
+    pub gram_arm: i32,
+    pub schema: *const u8,
+    pub schema_n: usize,
+}
+
+/// The caller's steering resolution: null and *out written, or its refusal message (valid until the caller's next call).
+pub type ResolveFn = unsafe extern "C" fn(
+    ctx: *mut std::ffi::c_void,
+    has_profile: bool,
+    profile: *const u8,
+    profile_n: usize,
+    scale_bits: u32,
+    out: *mut Identity,
+) -> *const c_char;
+
+/// Parses a request file's bytes; on success *out describes it and *handle owns its arrays (g6sch_parsed_free).
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_parse_request(
+    bytes: *const u8,
+    n: usize,
+    grammar_ready: bool,
+    resolve: ResolveFn,
+    ctx: *mut std::ffi::c_void,
+    out: *mut ParsedReq,
+    handle: *mut *mut rq::Request,
+) -> *const c_char {
+    let mut cb = |f: &SteerFields| -> Result<Identity, Refusal> {
+        let mut id = std::mem::MaybeUninit::<Identity>::zeroed();
+        let (p, pn) = f.profile.map_or((std::ptr::null(), 0), |s| (s.as_ptr(), s.len()));
+        let e = resolve(ctx, f.profile.is_some(), p, pn, f.scale_bits, id.as_mut_ptr());
+        if e.is_null() {
+            Ok(id.assume_init())
+        } else {
+            Err(Refusal::Foreign(e))
+        }
+    };
+    match rq::parse(slice(bytes, n), grammar_ready, &mut cb) {
+        Ok(r) => {
+            let r = Box::new(r);
+            *out = ParsedReq {
+                prompt: ints(&r.prompt),
+                stop: ints(&r.stop),
+                n_gen: r.n_gen,
+                min_tokens: r.min_tokens,
+                temp: r.temp,
+                top_p: r.top_p,
+                seed: r.seed,
+                lp: r.lp,
+                plp: r.plp,
+                sys: r.sys,
+                steering: r.steering,
+                ins_after: r.ins.after,
+                ins_unless: r.ins.unless,
+                ins_tokens: ints(&r.ins.tokens),
+                gram_kind: r.gram.kind,
+                gram_strict: r.gram.strict,
+                gram_arm: r.gram.arm,
+                schema: r.gram.schema.as_ptr(),
+                schema_n: r.gram.schema.len(),
+            };
+            *handle = Box::into_raw(r);
+            std::ptr::null()
+        }
+        Err(Refusal::Msg(m)) => msg(m),
+        Err(Refusal::Foreign(e)) => e,
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_parsed_free(handle: *mut rq::Request) {
+    if !handle.is_null() {
+        drop(Box::from_raw(handle));
+    }
+}
+
+/// One `gram` field: on success *kind, *strict, *arm written and *handle owns the schema bytes (g6sch_parsed_free).
+#[no_mangle]
+pub unsafe extern "C" fn g6sch_parse_grammar(
+    s: *const u8,
+    n: usize,
+    kind: *mut u32,
+    strict: *mut bool,
+    arm: *mut i32,
+    schema: *mut *const u8,
+    schema_n: *mut usize,
+    handle: *mut *mut rq::Request,
+) -> *const c_char {
+    match rq::parse_grammar(slice(s, n)) {
+        Ok(g) => {
+            *kind = g.kind;
+            *strict = g.strict;
+            *arm = g.arm;
+            // the schema lives in a request handle so one free function serves both parses
+            let r = Box::new(rq::Request {
+                prompt: vec![],
+                stop: vec![],
+                n_gen: 0,
+                min_tokens: 0,
+                temp: 0.0,
+                top_p: 0.0,
+                seed: 0,
+                lp: -1,
+                plp: -1,
+                sys: -1,
+                steering: Identity {
+                    enabled: false,
+                    profile_digest: [0; 32],
+                    scope: 0,
+                    schedule_digest: [0; 32],
+                    scale_bits: 0,
+                    slot: 0,
+                },
+                ins: rq::Insert { after: -1, unless: -1, tokens: vec![] },
+                gram: g,
+            });
+            *schema = r.gram.schema.as_ptr();
+            *schema_n = r.gram.schema.len();
+            *handle = Box::into_raw(r);
+            std::ptr::null()
+        }
+        Err(Refusal::Msg(m)) => msg(m),
+        Err(Refusal::Foreign(e)) => e,
+    }
 }

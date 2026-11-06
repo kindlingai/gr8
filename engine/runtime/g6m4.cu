@@ -131,6 +131,7 @@ bool ds41_c2_trace_on();
 #include "ds41_knobs.h"
 #endif
 #include "s2/flash_checkpoint.h"   // GR8_GLM53F_CACHE parsed in every build, refused outside Flash
+#include "s2/flash_dfl_window.h"   // the Flash serve's DFlash2 prompt context (with GR8_GLM53F_CACHE hits)
 #include "s2/cp_rows.h"
 #include "s2/pool.h"
 #include "s2/kv_tier.cuh"
@@ -472,8 +473,14 @@ int main(int argc, char** argv)
     // Flash: --s2-sessions 1 (the default) is the solo path; 2..8 share the --cap pool (s2/flash_native.cuh)
     if (s2mode && (reuse_prefix || plan.rs))
         die("Flash serve supports no prefix reuse or rejection sampling");
-    if (s2mode && dfl && (!mtp || flash_cache != g6s2::FlashCache::Off))
-        die("Flash serve with DFlash2 needs --mtp (a second session moves the DFlash2 one to MTP) and no GR8_GLM53F_CACHE");
+    // DFlash2 with GR8_GLM53F_CACHE: a checkpoint hit restores none of the drafter's context, so a hit inside the
+    // drafter's window keeps the drafter through GR8_DFL_REUSE (s2/flash_dfl_window.h; on by default with the cache)
+    if (s2mode && dfl && !mtp)
+        die("Flash serve with DFlash2 needs --mtp (a second session moves the DFlash2 one to MTP)");
+    // a terminal checkpoint's KDA state comes from the verify ring, not a cold prefill, so the drafter would resume on
+    // state a cold run does not have: aligned checkpoints only (allowing terminal is a decision of its own)
+    if (s2mode && dfl && flash_cache == g6s2::FlashCache::Terminal)
+        die("Flash serve with DFlash2 needs GR8_GLM53F_CACHE=aligned or off (a terminal checkpoint's KDA state is not cold-exact)");
     if (s2mode && s2sess > 1 && s2sess * (mtp + 1) > MX)
         die("Flash serve: --s2-sessions x (--mtp + 1) rows exceed G6_MX (every session's round is one step)");
     if (flash_cache != g6s2::FlashCache::Off) {
@@ -709,6 +716,8 @@ int main(int argc, char** argv)
         // decode slot. Fabric::enqueue_step still checks each collective against its own slot.
         const int tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
         if (tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
+        ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1): before late_start() sizes the fabric runs below
+        if (ds41::br::l20_tail() && !tail) die("GR8_DS_PF_L20_TAIL=1 needs GR8_DS_PF_TAIL (layer 20 joins the bounded replay)");
         const int i_late = tail ? ds41::br::late_start(layers) : -1;
         bool pf_rs_on = false;
         // GR8_DS_PF_RS=1: layer exchanges c < 2 i_late of a prefill chunk run as reduce-scatter + all-gather (ds41_rs.h). Run 0 holds NR
@@ -1002,9 +1011,19 @@ int main(int argc, char** argv)
     // prefill a prefix-reuse hit cut into the drafter's window keeps the drafter (the rows the prefill taps, and the ring's
     // rows of the last DFlash2 session with the same tokens); 2 = also a session alone on MTP takes it. GR8_DFL_REUSE_MIN=
     // <rows> (0..2048, default 256): MTP rounds until the drafter holds that many context rows. Drafts only. In the S2
-    // runtime signature
-    const int dfl_reuse = (int)knob::dfl_reuse().value_or((dfl && s2mode && mtp) ? 2 : 0);
+    // runtime signature. GLM-5.3-Flash: 1 with GR8_GLM53F_CACHE (a checkpoint hit inside the drafter's window keeps the
+    // drafter, s2/flash_dfl_window.h), else 0: its serve without checkpoints has no hit to reuse, and mode 2's promotion
+    // is not measured there
+#if G6_MODEL_FLASH
+    const int dfl_reuse_unset = (dfl && s2mode && flash_cache != g6s2::FlashCache::Off) ? 1 : 0;
+#else
+    const int dfl_reuse_unset = (dfl && s2mode && mtp) ? 2 : 0;
+#endif
+    const int dfl_reuse = (int)knob::dfl_reuse().value_or(dfl_reuse_unset);
     if (dfl_reuse && !(dfl && s2mode)) die("GR8_DFL_REUSE needs --dflash-manifest and --serve");
+#if G6_MODEL_FLASH
+    if (dfl_reuse > 1) die("GR8_DFL_REUSE=2 on GLM-5.3-Flash: not measured (0 or 1)");
+#endif
     const int dfl_reuse_min = (int)knob::dfl_reuse_min();
     if (dfl_reuse_min > dfl::WIN) die("GR8_DFL_REUSE_MIN: 0.." + std::to_string(dfl::WIN) + " rows");
     // GR8_NGRAM=<file> (s2_batch.h NgramSrc, ngram_lookup.h; default off; S5, #56): the GLM-distilled n-gram table
@@ -1932,6 +1951,7 @@ int main(int argc, char** argv)
             " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " mtp " + std::to_string(mtp) +
             " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id +
             (dfl ? " dflash k " + std::to_string(dfl_k) : std::string()) +
+            (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : std::string()) +
             (s2sess > 1 ? " sessions " + std::to_string(s2sess) + " split " + std::to_string(gsplit) : std::string()) +
             knob::signature();
         // GR8_GLM53F_CACHE: the checkpoint store of this rank. Every rank must keep the same entries, so the mode, the
@@ -1984,10 +2004,9 @@ int main(int argc, char** argv)
             bc.runtime_signature += std::string(" ckpt ") + g6s2::flash_cache_name(flash_cache) + " blocks " + std::to_string(ckpt->blocks());
         }
         // DFlash2 (--dflash-manifest): a session alone drafts with the drafter, as on GLM-5.3 (s2_batch.h Batch::dflash);
-        // Dfl::pf_feat holds the prefill taps of the session whose prefill started last (dfl_owner, -1 = none)
-        int dfl_owner = -1, dfl_from = 0;
-        uint64_t dfl_req = UINT64_MAX;
-        std::array<uint32_t, g6s2::MAX_SESSIONS> slot_prompt{};
+        // Dfl::pf_feat holds the prefill taps of the session whose prefill started last (s2/flash_dfl_window.h: with
+        // GR8_GLM53F_CACHE, a checkpoint hit inside the window keeps the drafter through GR8_DFL_REUSE)
+        g6s2::FlashDflWindow dwin((int)g6s2::MAX_SESSIONS, dfl::WIN, dfl_reuse);
         u64 s2_dstep = 0;
         cudaStream_t dfl_ds = st;        // GR8_DRAFT_PAR: the stream of the drafter step in flight
         auto dfl_install = [&](g6s2::NativeHooks& h) {
@@ -2001,29 +2020,27 @@ int main(int argc, char** argv)
             h.dsel.m.draft_each = 1.25;
             for (int r = 1; r <= SpecLen::KX + 1; ++r) h.dsel.d.table[r] = h.dsel.m.table[r] = spec.table[r];
             h.kstop = kstop;
+            h.dfl_reuse.mode = dfl_reuse;
+            h.dfl_reuse.min = dfl_reuse_min;
             auto bind = h.bind;
             h.bind = [&, bind](const g6s2::Grant& g) {
-                if (bind) bind(g);
-                const int q = (int)g.key.slot;
-                slot_prompt[q] = g.req.prompt_tokens;
-                if (dfl_owner == q) dfl_owner = -1;     // the slot's previous session owned the taps
+                if (bind) bind(g);               // serve_flash's: a checkpoint hit's rows are restored here
+                dwin.bind((int)g.key.slot, g.req.prompt_tokens, g.reuse);
             };
             auto prefill = h.dispatch.prefill;
             h.dispatch.prefill = [&, prefill](const g6s2::Slot& sl, const g6s2::Payload& p, uint32_t first, uint32_t rows) {
-                if (DF.pf_feat && sl.req.id != dfl_req)   // a request's first prefill quantum: the window its taps fill
+                // a request's first prefill quantum: the window its taps fill
+                if (DF.pf_feat && dwin.quantum((int)sl.key.slot, sl.req.id, sl.req.prompt_tokens, sl.prefilled))
                 {
-                    dfl_req = sl.req.id;
-                    DF.pf_hi = (int)sl.req.prompt_tokens - 1; DF.pf_lo = std::max(0, DF.pf_hi - dfl::WIN);
+                    DF.pf_hi = dwin.hi; DF.pf_lo = dwin.lo;
                     if (DF.pf_hi > DF.pf_lo) G6RT_CK(cudaMemsetAsync(DF.pf_feat, 0, (size_t)(DF.pf_hi - DF.pf_lo) * dfl::NT * HID * 2, st));
-                    dfl_owner = (int)sl.prefilled <= DF.pf_lo ? (int)sl.key.slot : -1;
-                    dfl_from = std::max(DF.pf_lo, (int)sl.prefilled);
                 }
                 prefill(sl, p, first, rows);
             };
-            h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1; };
+            h.dispatch.dfl_ok = [&](int q) { return dwin.ok(q); };
             h.dispatch.dfl_start = [&](int q) {     // the prefill's taps -> the drafter's context ring, 8 rows a fill step
-                if (dfl_owner != q || DF.pf_hi <= DF.pf_lo) return (int)slot_prompt[q] - 1;
-                for (int c0 = dfl_from; c0 < DF.pf_hi; c0 += dfl::B)
+                if (!dwin.fills(q)) return dwin.start(q);
+                for (int c0 = dwin.from; c0 < DF.pf_hi; c0 += dfl::B)
                 {
                     DflIn di;
                     memset(&di, 0, sizeof di);
@@ -2035,7 +2052,7 @@ int main(int argc, char** argv)
                     G6RT_CK(cudaStreamSynchronize(st));
                     g6s2::require(!*fabf.dev().error, "Flash DFlash2 fabric error (prompt context)");
                 }
-                return dfl_from;
+                return dwin.start(q);
             };
             h.dispatch.dfl = [&](const s2::DflReq& r, const g6s2::Sampling& smp) {
                 // GR8_DRAFT_PAR: phase 1 launches on the drafter's stream and returns, phase 2 waits for it (s2::DflReq)
@@ -2058,8 +2075,10 @@ int main(int argc, char** argv)
                 for (int i = 0; i < dfl::B; ++i) { o.tok[i] = out_f->tok[i]; o.lp[i] = out_f->lp[i]; }
                 return o;
             };
-            if (R == 0) fprintf(stderr, "# flash serve: DFlash2 for a session alone (k <= %d)%s\n", dfl_k,
-                                h.dsel.on ? ", drafter choice on" : "");
+            if (R == 0) fprintf(stderr, "# flash serve: DFlash2 for a session alone (k <= %d)%s%s\n", dfl_k,
+                                h.dsel.on ? ", drafter choice on" : "",
+                                dfl_reuse ? (", checkpoint hits keep the drafter (GR8_DFL_REUSE 1, warm-up " + std::to_string(dfl_reuse_min) +
+                                             " context rows)").c_str() : "");
         };
         // GR8_GLM53F_KV_CHUNKS=1 (borrow-idle): hooks serve_flash adds to its own before the service starts
         auto flash_install = [&](g6s2::NativeHooks& h) {
@@ -2254,7 +2273,11 @@ int main(int argc, char** argv)
         // bounded replay (ds41_pf_split.h): GR8_DS_PF_TAIL, read once; 0 = off (the unsplit non-final plan)
         const int pf_tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
         if (pf_tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
-        if (pf_min) fprintf(stderr, "# rank %d DS41 prefill bounded replay tail %d (layers >= %d)\n", R, pf_tail, geom::LATE_LAYER_START);
+        ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1); the same value the fabric block set
+        if (ds41::br::l20_tail() && !pf_tail) die("GR8_DS_PF_L20_TAIL=1 needs GR8_DS_PF_TAIL (layer 20 joins the bounded replay)");
+        if (pf_min) fprintf(stderr, "# rank %d DS41 prefill bounded replay tail %d (layers >= %d)\n", R, pf_tail, ds41::br::late_layer_start());
+        if (pf_min && ds41::br::l20_tail())
+            fprintf(stderr, "# rank %d DS41 GR8_DS_PF_L20_TAIL=1: layer 20 in the bounded replay (ca row on every row, the rest of the layer on the tail rows)\n", R);
         // ds41_pf_split.h late_skip: GR8_DS_PF_LATE_FINAL=1 = a chunk with (N-1) - context >= tail + WINDOW rows after it skips range B. Default off.
         bool pf_late_final = false;
         if (knob::ds_pf_late_final()) {

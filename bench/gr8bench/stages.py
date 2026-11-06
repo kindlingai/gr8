@@ -15,6 +15,9 @@ OK_FINISH = ('stop', 'length')
 # Hangul and the replacement character: GLM-5.3 corruption has shown up as both
 SUSPECT = re.compile('[가-힣�]')
 DECODE_TOKENS = {'code': 512, 'prose': 512, 'structured': 512, 'counting': 2048}
+# a needle reply thinks, then answers: at 400 a 128K reply ran out while still thinking (answers took 75-166)
+NEEDLE_TOKENS = 1024
+KEEP_CHARS = 2048   # of a needle reply's content and reasoning kept in the report, from each end
 REPO = Path(__file__).resolve().parents[2]
 
 
@@ -23,6 +26,7 @@ class Ctx:
         self.cl, self.a, self.log = cl, a, log
         self.requests = []     # single-stream requests in send order (route_bytes.py --drive reads them)
         self.suspect = []      # replies with suspect characters: (stage, what, excerpt)
+        self.recorder = None   # a record.Recorder with --record
 
     def chat(self, stage, kind, messages, max_tokens, **kw):
         r = self.cl.chat(messages, max_tokens, effort=kw.pop('effort', self.a.effort), **kw)
@@ -106,21 +110,36 @@ def kl_check(ctx, ref_path):
     return out
 
 
+def _keep(text):
+    """text, or its first and last KEEP_CHARS characters"""
+    if len(text) <= 2 * KEEP_CHARS:
+        return text
+    return f'{text[:KEEP_CHARS]}\n[... {len(text) - 2 * KEEP_CHARS} characters ...]\n{text[-KEEP_CHARS:]}'
+
+
 def needle(ctx, sizes, max_len):
+    """A passphrase at 15% depth of a salted document of each size. The seed fixes the document and the secret, and
+    --needle-seed reruns one. A reply that runs out of tokens with the secret only in its reasoning is cut_off: found,
+    but not answered."""
     out = {}
+    norm = lambda t: ''.join(t.lower().split())
     for tokens in sizes:
         if max_len and tokens + 1000 > max_len:
             out[f'{tokens // 1024}K'] = {'skipped': f'over max_model_len {max_len}'}
             continue
-        seed = random.randrange(1 << 30)
+        seed = getattr(ctx.a, 'needle_seed', None)
+        seed = random.randrange(1 << 30) if seed is None else seed
         secret = docs.passphrase(random.Random(seed))
         messages, where = docs.needle_prompt(ctx.cl, tokens, 0.15, seed, secret)
-        r = ctx.chat('correct', 'needle', messages, 400, temperature=0.0)
-        norm = lambda t: ''.join(t.lower().split())
-        out[f'{tokens // 1024}K'] = {'passed': norm(secret) in norm(r['content']),
-                                     'in_reasoning_only': norm(secret) in norm(r['reasoning'])
-                                     and norm(secret) not in norm(r['content']),
-                                     'prompt_tokens': r['prompt_tokens'], 'ttft_s': round(r['ttft'], 2), **where}
+        r = ctx.chat('correct', 'needle', messages, NEEDLE_TOKENS, temperature=0.0)
+        answered = norm(secret) in norm(r['content'])
+        thought = norm(secret) in norm(r['reasoning'])
+        out[f'{tokens // 1024}K'] = {'passed': answered, 'in_reasoning_only': thought and not answered,
+                                     'cut_off': thought and not answered and r['finish_reason'] == 'length',
+                                     'prompt_tokens': r['prompt_tokens'], 'ttft_s': round(r['ttft'], 2), **where,
+                                     'seed': seed, 'secret': secret, 'finish': r['finish_reason'],
+                                     'tokens': r['tokens'], 'content': _keep(r['content']),
+                                     'reasoning': _keep(r['reasoning'])}
     return out
 
 
@@ -168,36 +187,51 @@ def decode(ctx, works, runs, warmup):
 def conc_batch(ctx, n, b):
     jobs = [(P.prompt_for('mixed', b * n + s), P.run_tag(ctx.a.series, f'c{n}', f'{b}.{s}')) for s in range(n)]
     res = [None] * n
+    rec = [None] * n if ctx.recorder else None   # with --record: each stream's deltas
 
     def go(s):
-        t = time.time()
+        t = sent = time.time()
+        events = [] if rec is not None else None
         try:
-            r = ctx.cl.chat(P.tagged(*jobs[s]), 512, effort=ctx.a.effort)
+            r = ctx.cl.chat(P.tagged(*jobs[s]), 512, effort=ctx.a.effort, events=events)
+            sent = r['t0']   # the events' times count from here
             res[s] = {'sent': t, 'first': t + r['ttft'], 'end': t + r['total_s'], 'tokens': r['tokens'],
                       'tps': rate(r), 'ttft': r['ttft'], 'problem': _problem('mixed', r)}
         except Exception as e:   # the other streams keep their numbers; this batch is marked failed
             res[s] = {'sent': t, 'first': None, 'end': time.time(), 'tokens': 0, 'tps': None, 'ttft': None,
                       'problem': repr(e)}
+        if rec is not None:
+            rec[s] = {'i': s, 't0': round(sent - start, 3), 'messages': P.tagged(*jobs[s]), 'max_tokens': 512,
+                      'tokens': res[s]['tokens'], 'problem': res[s]['problem'], 'events': events}
     s0 = C.spec_snapshot(ctx.cl.metrics())
     ths = [threading.Thread(target=go, args=(s,)) for s in range(n)]
+    start = time.time()
     [t.start() for t in ths]
     [t.join() for t in ths]
     d = C.spec_delta(s0, C.spec_snapshot(ctx.cl.metrics()))
     ok = [x for x in res if not x['problem']]
     t0 = min((x['first'] for x in ok), default=None)
     t1 = max((x['end'] for x in ok), default=None)
-    return {'i': b, 'streams': res, 'problems': [x['problem'] for x in res if x['problem']],
-            # streams' tokens over the time from the first stream's first token to the last stream's end
-            'tps': sum(x['tokens'] for x in ok) / (t1 - t0) if ok and t1 > t0 else None,
-            'tokens': sum(x['tokens'] for x in ok), 'decode_s': (t1 - t0) if ok else None,
-            'per_stream': statistics.median(x['tps'] for x in ok if x['tps']) if ok else None,
-            'ttft': [x['ttft'] for x in ok], 'tok_per_step': d['tokens_per_step']}
+    out = {'i': b, 'streams': res, 'problems': [x['problem'] for x in res if x['problem']],
+           # streams' tokens over the time from the first stream's first token to the last stream's end
+           'tps': sum(x['tokens'] for x in ok) / (t1 - t0) if ok and t1 > t0 else None,
+           'tokens': sum(x['tokens'] for x in ok), 'decode_s': (t1 - t0) if ok else None,
+           'per_stream': statistics.median(x['tps'] for x in ok if x['tps']) if ok else None,
+           'ttft': [x['ttft'] for x in ok], 'tok_per_step': d['tokens_per_step']}
+    if rec is not None:
+        out['recorded'] = {'i': b, 'start': start, 'tps': out['tps'], 'streams': rec}
+    return out
 
 
 def concurrency(ctx, ns, batches):
     out = {}
     for n in ns:
-        bs = [conc_batch(ctx, n, b) for b in range(batches)]
+        bs, recs = [], []
+        for b in range(batches):
+            bs.append(conc_batch(ctx, n, b))
+            if ctx.recorder:   # rewritten after each batch, so a run cut short keeps what it streamed
+                recs.append(bs[-1].pop('recorded'))
+                ctx.recorder.save(f'concurrency-c{n}', {'stage': 'concurrency', 'streams': n, 'batches': recs})
         good = [b for b in bs if not b['problems']]
         ttft = sorted(t for b in good for t in b['ttft'])
         out[str(n)] = {'batches': bs, 'failed': sum(len(b['problems']) for b in bs),
@@ -244,8 +278,13 @@ def prefill(ctx, sizes, reps, max_len):
 
 def agentic(ctx):
     out = {}
+    rec = None
+    if ctx.recorder:   # the agent tasks' streamed runs (toolcall and longreply do not stream)
+        tools = [t['function']['name'] for t in agent_tools.TOOLS]
+        rec = lambda task, reqs, ok: ctx.recorder.save(f'agentic-{task}', {
+            'stage': 'agentic', 'task': task, 'passed': ok, 'tools': tools, 'requests': reqs})
     for name, fn in (('toolcall', lambda: toolcall.run(ctx.cl.url, ctx.cl.model, 40, 4)),
-                     ('agent_tools', lambda: agent_tools.run(ctx.cl.url, ctx.cl.model)),
+                     ('agent_tools', lambda: agent_tools.run(ctx.cl.url, ctx.cl.model, rec)),
                      ('longreply', lambda: longreply.run(ctx.cl.url, ctx.cl.model, 2))):
         try:
             out[name] = fn()

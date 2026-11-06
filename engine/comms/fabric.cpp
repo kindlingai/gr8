@@ -306,6 +306,7 @@ struct Fabric::Impl {
   std::vector<int> unsignaled;
   bool var = false; VLayout L;  // variable layout (cfg.vcap non-empty)
   bool bulk = false; BulkDev bd{};                    // bulk mode (cfg.bulk_bytes > 0)
+  bool solo = false;                                  // one rank: the region only, no NIC, bootstrap or proxy
   std::vector<std::deque<int>> batches;               // bulk: per peer, WR counts of the signaled batches in flight
   std::vector<int> inflight;                          // bulk: per peer, WRs posted and not yet known complete
   std::thread th;
@@ -474,7 +475,7 @@ void Fabric::init(const FabricConfig& cfg) {
     cfg_.ncoll = (int)cfg.vcap.size(); cfg_.slot_bytes = 0;
     I.L.make(nr, cfg.vcap, cfg.vdst_k);
   }
-  FCHECK(cfg_.rank >= 0 && cfg_.rank < nr && nr >= 2 && (I.bulk || (cfg_.ncoll > 0 && (I.var || cfg_.slot_bytes > 0))));
+  FCHECK(cfg_.rank >= 0 && cfg_.rank < nr && (I.bulk || (cfg_.ncoll > 0 && (I.var || cfg_.slot_bytes > 0))));
   I.nrails = cfg.ips2.empty() ? 1 : 2;
   if (I.bulk) {
     const size_t fl = (size_t)cfg.bulk_flags * nr * 16, db = (size_t)cfg.bulk_flags * 8;
@@ -526,6 +527,14 @@ void Fabric::init(const FabricConfig& cfg) {
   }
   }
   I.xenv = xtrace_env();
+  // One rank (TP=1): a kernel reads only the slots of other ranks, of which there are none, so nothing needs sending.
+  // The region stays, for the kernels' own slots and doorbells; steps and barriers do nothing.
+  if (nr == 1) {
+    FCHECK(!cfg.ring && !I.bulk);                     // a bulk job always has a peer: no bulk fabric on one rank
+    I.solo = true;
+    live(kLiveFab, 1);
+    return;
+  }
 
   if (cfg.ring) {                                     // switchless ring (see RelayHdr above)
     FCHECK(nr == 3 || nr == 4);
@@ -733,6 +742,7 @@ void Fabric::init(const FabricConfig& cfg) {
 
 void Fabric::barrier() {
   FCHECK(impl_);
+  if (impl_->solo) return;
   char z = 0; allgather(cfg_.rank, nranks(), cfg_.ips[0], cfg_.port + (impl_->bump++ % 3) + 1, &z, 1);
 }
 
@@ -772,6 +782,7 @@ void Fabric::enqueue_step(unsigned long long step, const std::vector<uint32_t>& 
     for (size_t k = 0; k < n; k++) { const int c = rs.order.empty() ? (int)k : rs.order[k]; if (!mask_bit(rs.skip, (size_t)c)) walk.push_back(c); }
     if (!fab_pool_credits(dev_, walk, &credit)) { fprintf(stderr, "[fabric r%d] enqueue_step %llu: slot pool %d has no credit collective (two users of one slot back to back)\n", cfg_.rank, step, dev_.pool); FCHECK(false); }
   }
+  if (impl_->solo) return;
   { std::lock_guard<std::mutex> lk(impl_->mu); { Job j{step, sizes, rs.mask, rs.ss, rs.bytes, rs.skip}; j.rs_flat = rs.flat; j.p2p = rs.p2p; j.peer = rs.peer; j.order = rs.order; j.credit = std::move(credit); impl_->q.push_back(std::move(j)); } impl_->pending++; }
   impl_->cv.notify_one();
 }
@@ -792,6 +803,7 @@ BulkDev Fabric::bulk_dev() const { FCHECK(impl_ && impl_->bulk); return impl_->b
 bool Fabric::wait_proxy_idle(double stall_s) {
   FCHECK(impl_);
   Impl& I = *impl_;
+  if (I.solo) return true;
   const unsigned e = drain_wait([&] { return I.pending.load(std::memory_order_acquire); },
                                 [&] { return I.exited.load(std::memory_order_acquire); },
                                 [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); },
@@ -806,6 +818,7 @@ bool Fabric::wait_proxy_idle(double stall_s) {
 void Fabric::start_proxy() {
   FCHECK(impl_);
   Impl& I = *impl_;
+  if (I.solo) return;
   I.stop = false; I.exited = false; I.proxy_started = false;
   if (cfg_.proxy_cpu >= 0 && I.pinned_cpu < 0) { I.pinned_cpu = cfg_.proxy_cpu; progress_cpu_add(I.pinned_cpu); }
   I.th = std::thread([this]() {

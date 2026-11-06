@@ -390,6 +390,8 @@ def validate(o):
         if o.get('IPS'):
             raise OptionError('--shape ring takes no --ips/--ips2: the engine finds its devices by name (--ring-devs) '
                               'and bootstraps over the LAN')
+    if tp == '1' and (o.get('IPS') or o.get('IPS2')):
+        raise OptionError('--tp 1 takes no --ips/--ips2: one box has no fabric, and the engine bootstraps over the LAN')
     if o.get('RING_DEVS') and len(split_list(o.get('RING_DEVS'))) != 4:
         raise OptionError(f'--ring-devs {o.get("RING_DEVS")}: want four devices')
     if mode(o) == 'peers' and len(split_list(o.get('PEERS'))) != int(tp):
@@ -401,6 +403,12 @@ def validate(o):
         raise OptionError('IPS and IPS2 go together')
     for k in ('CONTROL_PORT', 'PORT', 'PROXY_CPU', 'JOIN_TIMEOUT'):
         o.int(k)
+    if o.get('MAX_MODEL_LEN') is not None:
+        n = o.int('MAX_MODEL_LEN')
+        if not 1 <= n <= model.max_positions:
+            raise OptionError(f'--max-model-len {n}: want 1 to {model.max_positions}, the model\'s max positions')
+        if o.get('CAP') is not None and n > o.int('CAP'):
+            raise OptionError(f'--max-model-len {n}: more than CAP {o.int("CAP")}, the KV pool a request comes from')
     stores = kv_stores(o)
     cache = o.get('FLASH_CACHE')
     if cache not in (None, 'off', 'aligned', 'terminal'):
@@ -410,6 +418,11 @@ def validate(o):
     budget = o.get('FLASH_STATE_BUDGET_MIB')
     if budget is not None and not (str(budget).isdigit() and int(budget) >= 1):
         raise OptionError(f'--flash-state-budget-mib {budget}: want a whole number of MiB from 1')
+    if model.name == 'glm53f' and cache == 'terminal' and o.get('DFLASH') == '1':
+        raise OptionError('--flash-cache terminal with --dflash 1: the drafter takes aligned checkpoints only (a terminal '
+                          "checkpoint's KDA state is not cold-exact)")
+    if model.name == 'glm53f' and o.get('DFL_REUSE') not in (None, '0', '1'):
+        raise OptionError(f'--dfl-reuse {o.get("DFL_REUSE")}: glm53f takes 0 or 1 (a session checkpoint hit keeps the drafter)')
     if model.name == 'glm53f' and stores:
         if cache in (None, 'off'):
             raise OptionError('--kv-store on glm53f holds Flash session checkpoints: it needs --flash-cache aligned or terminal')
@@ -953,6 +966,8 @@ def canonical(o, plan, members, variant=None, ring=''):
     # names it. DFLASH and PF_OWN decide which pack files a rank needs.
     for k in ('CAP', 'DFLASH', 'PF_OWN'):
         c[k] = plan['knobs'].get(k, '')
+    if o.get('MAX_MODEL_LEN'):   # the head's shim takes it; by name, so a box with another limit is refused
+        c['MAX_MODEL_LEN'] = o.get('MAX_MODEL_LEN')
     if variant:
         c['variant'] = variant.name
         c['variant.sha256'] = variant.sha256 or ''

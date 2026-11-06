@@ -36,6 +36,7 @@ class Model:
     defaults: tuple = ()        # (KEY, value) option defaults for this model, over the table's: origin '<name> default'
     vocab: int = 0              # the shim's --vocab-size: the ids the engine's embedding table takes (0: the shim's own, GLM-5.3's)
     eos_ids: tuple = ()         # the shim's --eos-ids (empty: the shim's own, GLM-5.3's)
+    max_positions: int = 1048576   # config.json max_position_embeddings: the longest request MAX_MODEL_LEN allows
 
     @property
     def tp_sizes(self):
@@ -53,10 +54,10 @@ GLM53 = Model('glm53', 'GLM-5.3', 'https://huggingface.co/kindlingai/glm-5.3-exl
               {'home': 3.25, 'down1': 2.25, 'up1': 4.0,
                'bit225': 2.25, 'bit243': 2.43, 'bit260': 2.60, 'bit325': 3.25, 'bit338': 3.38},
               {3: ('bit225', 'down1')}, 'gr8-glm53', 'GlmMoeDsaForCausalLM', True, True, False)
-# GLM-5.3-Flash: uniform-width releases, K4 by default.
+# GLM-5.3-Flash: uniform-width releases, K4 by default. K2 is the width whose experts fit one box (TP=1).
 GLM53F = Model('glm53f', 'GLM-5.3-Flash', 'https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4',
-               'g6m4_flash', 'flash', ('4', '3', '2'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},
-               {2: ('k4',), 3: ('k4',), 4: ('k4',)}, 'gr8-glm53f', 'Glm5NextForConditionalGeneration', True, True, True)
+               'g6m4_flash', 'flash', ('4', '3', '2', '1'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},
+               {1: ('k2',), 2: ('k4',), 3: ('k4',), 4: ('k4',)}, 'gr8-glm53f', 'Glm5NextForConditionalGeneration', True, True, True)
 # DeepSeek-V4.1-Flash-1017 (docs/DEEPSEEK.md): the official weights in the exlr8 native layout (FP8 trunk, MXFP4 routed
 # experts), no width variants, TP=4. Its drafter is DSpark, the checkpoint's MTP layers (GR8_DS_MTP), not DFlash2. The front
 # end speaks the ds41 dialect (DSML tool calls, numeric reasoning effort). A request that names no reasoning effort gets

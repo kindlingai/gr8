@@ -117,9 +117,18 @@ int main(int argc, char** argv)
         bad[k] = bad[k].substr(0, bad[k].rfind(' ')) + " 123456";   // the last answer token of that step
         const ReplayResult rb = replay(bad);
         CHECK(!rb.ok && rb.line > k);
-        // a missing record
-        std::vector<std::string> cut(l.begin(), l.end() - 3);
+        // a missing record: the last call keeps its line but loses its state and learn records
+        std::vector<std::string> cut(l.begin(), l.end() - 2);
         CHECK(!replay(cut).ok);
+        // learned state that differs (the estimates, the drafter choice, ...) although the steps and the driver's state
+        // match: caught at that learn record
+        std::vector<std::string> lr = l;
+        size_t l0 = 0;
+        for (size_t i = lr.size() / 2; i < lr.size() && !l0; ++i) if (lr[i].rfind("learn ", 0) == 0) l0 = i;
+        CHECK(l0 > 0);
+        lr[l0] = "learn 12345";
+        const ReplayResult rl = replay(lr);
+        CHECK(!rl.ok && rl.line == l0 + 1);
         // a state the driver would read back differently (one session's length): caught although every step matches
         std::vector<std::string> st = l;
         size_t s0 = 0;

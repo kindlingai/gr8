@@ -130,12 +130,12 @@ ARG GR8_WIDTHS=
 RUN GR8_WIDTHS="$GR8_WIDTHS" GR8_TESTS=only scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name gpuprobe ! -name tr3_e4m3_test -exec rm -rf {} +
 
-# GLM-5.3-Flash: g6m4_flash and m4sim_flash (MODEL=flash), TP 2, 3 and 4
+# GLM-5.3-Flash: g6m4_flash and m4sim_flash (MODEL=flash), TP 1, 2, 3 and 4
 FROM engine-src-glm AS engine-flash
 RUN MODEL=flash scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4_flash ! -name m4sim_flash -exec rm -rf {} +
 
-# GLM-5.3-Flash with the 4-bit KV latent (--kv-format int4, docs/FLASH.md): g6m4_flash-int4, TP 2, 3 and 4
+# GLM-5.3-Flash with the 4-bit KV latent (--kv-format int4, docs/FLASH.md): g6m4_flash-int4, TP 1, 2, 3 and 4
 FROM engine-src-glm AS engine-flash-int4
 RUN MODEL=flash KV_FORMAT=int4 scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4_flash-int4 -exec rm -rf {} +

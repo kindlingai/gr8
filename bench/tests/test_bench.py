@@ -12,9 +12,10 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 import fake_server  # noqa: E402
-from gr8bench import client as C, docs, kl, report, stages as S, stats, thermal  # noqa: E402
+from gr8bench import agent_tools, client as C, docs, kindling, kl, report, stages as S, stats, thermal  # noqa: E402
 
 BENCH = HERE.parent / 'bench.py'
+GIF = HERE.parent / 'gif.py'
 
 
 class Base(unittest.TestCase):
@@ -30,6 +31,7 @@ class Base(unittest.TestCase):
     def setUp(self):
         self.srv.st.drift, self.srv.st.retrieve, self.srv.st.cache_hit = 0.0, True, 0
         self.srv.st.fail_nth = self.srv.st.chat_calls = 0
+        self.srv.st.needle_cutoff = False
 
     def bench(self, *args):
         with tempfile.TemporaryDirectory() as d:
@@ -194,6 +196,29 @@ class Stages(Base):
         self.srv.st.retrieve = False
         self.assertFalse(S.needle(self.ctx(), [3072], None)['3K']['passed'])
 
+    def test_needle_answered_and_cut_off(self):
+        ok = S.needle(self.ctx(), [3072], None)['3K']
+        self.assertEqual((ok['passed'], ok['cut_off'], ok['finish']), (True, False, 'stop'))
+        self.assertLess(ok['tokens'], S.NEEDLE_TOKENS)
+        self.assertIn(ok['secret'], ok['content'])
+        self.srv.st.needle_cutoff = True
+        ctx = self.ctx()
+        ctx.a.needle_seed = ok['seed']        # the same document and secret again
+        cut = S.needle(ctx, [3072], None)['3K']
+        self.assertEqual(cut['secret'], ok['secret'])
+        self.assertEqual((cut['passed'], cut['cut_off'], cut['in_reasoning_only']), (False, True, True))
+        self.assertEqual((cut['finish'], cut['tokens'], cut['content']), ('length', S.NEEDLE_TOKENS, ''))
+        self.assertIn(cut['secret'], cut['reasoning'])
+        self.assertLess(len(cut['reasoning']), 2 * S.KEEP_CHARS + 100)
+        rep = {'correct': {'needle': {'3K': cut}}}
+        checks = {c: (v, d) for c, v, d in report.verdicts(rep, report.compare(rep, None), None)}
+        verdict, detail = checks['needle 3K']
+        self.assertEqual(verdict, 'FAIL')
+        self.assertIn(f'found in the reasoning, answer cut off at {S.NEEDLE_TOKENS} tokens', detail)
+        self.assertIn(f"seed {cut['seed']}", detail)
+        q, _ = kindling.fields({'correct': {'needle': {'3K': cut, '8K': ok}}})
+        self.assertEqual(q['quality'], 'found at 8K; found at 3K (answer cut off)')
+
     def test_needle_over_the_context_is_skipped(self):
         self.assertIn('skipped', S.needle(self.ctx(), [8192], 4096)['8K'])
 
@@ -235,6 +260,191 @@ class EndToEnd(Base):
         p, _ = self.bench('--quick', '--series', 'other', '--baseline', f.name)
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('would not pair', p.stderr)
+
+
+class Record(Base):
+    def test_concurrency_streams_are_recorded(self):
+        with tempfile.TemporaryDirectory() as d:
+            p, rep = self.bench('--stages', 'info,concurrency', '--streams', '1,2', '--label', 'rec', '--record', d)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertEqual(sorted(x.name for x in Path(d).iterdir()), ['concurrency-c1.json', 'concurrency-c2.json'])
+            r = json.loads((Path(d) / 'concurrency-c2.json').read_text())
+        self.assertEqual(r['format'], 'gr8bench-record-1')
+        m = r['meta']
+        self.assertEqual((m['model'], m['label'], m['health']), ('fake-model', 'rec', {'ready': True}))
+        self.assertEqual(m['models'], ['fake-model'])
+        self.assertEqual(r['streams'], 2)
+        self.assertEqual(len(r['batches']), 2)          # the quick and default levels run two batches a level
+        streams = r['batches'][0]['streams']
+        self.assertEqual([s['i'] for s in streams], [0, 1])
+        for s in streams:
+            self.assertGreaterEqual(s['t0'], 0)
+            self.assertEqual(s['messages'][-1]['role'], 'user')
+            kinds = [e[1] for e in s['events']]
+            self.assertEqual(kinds[-2:], ['finish', 'usage'])
+            text = ''.join(e[2] for e in s['events'] if e[1] == 'answer')
+            self.assertEqual(len(text.split()), 512)
+            times = [e[0] for e in s['events']]
+            self.assertEqual(times, sorted(times))
+            self.assertEqual(s['events'][-1][2]['completion_tokens'], s['tokens'])
+        self.assertNotIn('recorded', rep['concurrency']['2']['batches'][0])   # the report itself is unchanged
+
+    def test_no_record_no_files(self):
+        b = S.conc_batch(Stages.ctx(self), 1, 0)
+        self.assertNotIn('recorded', b)
+
+    def test_agent_task_requests_in_order(self):
+        reqs = []
+        ok, st = agent_tools.run_task(self.url, 'fake-model', agent_tools.TASKS[2], True, False, reqs)
+        self.assertTrue(ok)                              # the fake finishes with "3", the TODO count
+        self.assertEqual([r['i'] for r in reqs], [0, 1])
+        self.assertLess(reqs[0]['t0'], reqs[1]['t0'])
+        self.assertEqual(reqs[1]['messages'][-1]['role'], 'tool')
+        tools = [e[2] for e in reqs[0]['events'] if e[1] == 'tool']
+        self.assertEqual(tools[0], {'index': 0, 'id': 'call_1', 'name': 'list_dir'})
+        self.assertEqual(''.join(t.get('arguments', '') for t in tools), '{"path": "/app"}')
+        self.assertEqual([e[1] for e in reqs[0]['events']][0], 'think')
+        self.assertEqual([e[2] for e in reqs[0]['events'] if e[1] == 'finish'], ['tool_calls'])
+
+    def test_agentic_stage_writes_one_file_per_task(self):
+        with tempfile.TemporaryDirectory() as d:
+            ctx = Stages.ctx(self)
+            from gr8bench import record
+            ctx.recorder = record.Recorder(Path(d), {'model': 'fake-model'})
+            agent_tools.run(self.url, 'fake-model', lambda task, reqs, ok: ctx.recorder.save(
+                f'agentic-{task}', {'stage': 'agentic', 'task': task, 'passed': ok, 'requests': reqs}))
+            names = sorted(x.name for x in Path(d).iterdir())
+            self.assertEqual(names, sorted(f'agentic-{t[0]}.json' for t in agent_tools.TASKS))
+            r = json.loads((Path(d) / 'agentic-count-todos.json').read_text())
+        self.assertEqual((r['task'], len(r['requests'])), ('count-todos', 2))
+
+
+class Gif(unittest.TestCase):
+    def setUp(self):
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest('Pillow is not installed')
+
+    def render(self, rec, *args):
+        with tempfile.TemporaryDirectory() as d:
+            src, out = Path(d) / 'rec.json', Path(d) / 'rec.gif'
+            src.write_text(json.dumps(rec))
+            p = subprocess.run([sys.executable, str(GIF), str(src), '--out', str(out), '--fps', '5', '--hold', '1',
+                                *args], capture_output=True, text=True, timeout=120)
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            from PIL import Image
+            with Image.open(out) as im:
+                return p.stdout, im.size, im.n_frames
+
+    def test_concurrency_recording(self):
+        def stream(i, t0):
+            ev = [[0.3 + k * 0.05, 'think', 'hmm '] for k in range(5)]
+            ev += [[0.6 + k * 0.05, 'answer', f'word{k} '] for k in range(30)]
+            return {'i': i, 't0': t0, 'messages': [], 'tokens': 35,
+                    'events': ev + [[2.2, 'finish', 'length'], [2.2, 'usage', {'completion_tokens': 35}]]}
+        rec = {'format': 'gr8bench-record-1', 'meta': {'model': 'fake'}, 'stage': 'concurrency', 'streams': 4,
+               'batches': [{'i': 0, 'start': 0, 'streams': [stream(i, 0.1 * i) for i in range(4)]}]}
+        out, size, frames = self.render(rec, '--cols', '20', '--rows', '5', '--title', 'test')
+        self.assertIn('4 panes in 2x2', out)
+        self.assertGreater(frames, 5)
+
+    def test_query_recording(self):
+        rec = {'prompt': 'hi', 'events': [[0.1, 'think', 'Thinking about it. '], [0.5, 'answer', 'Hello there.']]}
+        out, size, frames = self.render(rec)
+        self.assertIn('1 pane in 1x1', out)
+
+    def test_agentic_recording_with_tools(self):
+        ev = [[0.1, 'think', 'Look first. '], [0.2, 'tool', {'index': 0, 'id': 'c', 'name': 'list_dir'}],
+              [0.3, 'tool', {'index': 0, 'arguments': '{"path": "/app"}'}], [0.3, 'finish', 'tool_calls'],
+              [0.3, 'usage', {'completion_tokens': 9}]]
+        rec = {'format': 'gr8bench-record-1', 'stage': 'agentic', 'task': 'find-port',
+               'requests': [{'i': 0, 't0': 0, 'messages': [], 'events': ev},
+                            {'i': 1, 't0': 0.5, 'messages': [], 'events': ev}]}
+        out, size, frames = self.render(rec, '--grid', '1x1')
+        self.assertIn('1 pane in 1x1', out)
+
+    def test_card_from_a_generated_kindling_json(self):
+        doc, _, _ = kindling.update({'version': 1, 'title': 'Model', 'stack': ['gr8'], 'configs': []},
+                                    Kindling.REPORT, 'tp1', 'TP=1', 1, True)
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / 'kindling.json'
+            src.write_text(json.dumps(doc))
+            from PIL import Image
+            for out, frames in (('card.png', 1), ('card.gif', 2)):
+                p = subprocess.run([sys.executable, str(GIF), 'card', str(src), '--out', str(Path(d) / out),
+                                    '--light'], capture_output=True, text=True, timeout=120)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                with Image.open(Path(d) / out) as im:
+                    self.assertEqual(im.size[0], 800)
+                    self.assertGreaterEqual(getattr(im, 'n_frames', 1), frames)
+            p = subprocess.run([sys.executable, str(GIF), 'card', str(src), '--config', 'tp9'],
+                               capture_output=True, text=True, timeout=120)
+            self.assertIn("no config 'tp9'", p.stderr)
+
+    def test_card_rows_only_hold_what_the_config_has(self):
+        sys.path.insert(0, str(GIF.parent))
+        import gif
+        rows = gif.card_rows({'title': 'M'}, {'id': 'x', 'decode': {'code': 50.0}})
+        self.assertEqual([r[0] for r in rows], ['title', 'section', 'bar'])
+        self.assertEqual(rows[2][1:5], ('code', 50.0, 50.0, '50.0'))
+
+
+class Kindling(unittest.TestCase):
+    REPORT = {'info': {'model': 'm', 'max_model_len': 262144},
+              'decode': {'code': {'summary': {'tps': 61.234}}, 'prose': {'summary': {'tps': 40.06}},
+                         'structured': {'summary': None}},
+              'prefill': {'8K': {'tok_s': 1234.6}, '32K': {'tok_s': 1100.2}, '128K': {'skipped': 'over'}},
+              'concurrency': {'1': {'tps': 60.04}, '4': {'tps': 120.56}, '8': {'tps': None}},
+              'correct': {'needle': {'128K': {'passed': True}, '32K': {'passed': True}}}}
+
+    def test_new_file(self):
+        doc, filled, skipped = kindling.update({'version': 1, 'configs': []}, self.REPORT, 'tp1', 'TP=1', 1, True)
+        self.assertEqual(list(doc), ['version', 'default_config', 'configs'])
+        e = doc['configs'][0]
+        self.assertEqual(list(e), ['id', 'label', 'nodes', 'decode', 'prefill', 'concurrency', 'max_context',
+                                   'quality'])
+        self.assertEqual(e['decode'], {'code': 61.2, 'prose': 40.1})
+        self.assertEqual(e['prefill'], [{'context': 8192, 'tps': 1235}, {'context': 32768, 'tps': 1100}])
+        self.assertEqual(e['concurrency'], [{'streams': 1, 'aggregate_tps': 60.0},
+                                            {'streams': 4, 'aggregate_tps': 120.6}])
+        self.assertEqual(e['quality'], [{'name': 'Needle recall', 'value': 'found at 32K, 128K'}])
+        self.assertIn('decode structured', skipped)
+
+    def test_update_keeps_everything_else(self):
+        old = {'version': 1, 'title': 'T', 'summary': 'S', 'default_config': 'tp4', 'configs': [
+            {'id': 'tp4', 'label': 'TP=4', 'nodes': 4},
+            {'id': 'tp1', 'label': 'one', 'nodes': 1, 'decode': {'code': 1.0, 'structured': 9.9},
+             'kv_pool_tokens': 5, 'quality': [{'name': 'GSM8K', 'value': '90%'}], 'notes': 'kept'}]}
+        before = json.dumps(old)
+        rep = {k: v for k, v in self.REPORT.items() if k != 'prefill'}
+        doc, _, skipped = kindling.update(json.loads(before), rep, 'tp1')
+        self.assertEqual(doc['configs'][0], json.loads(before)['configs'][0])
+        self.assertEqual(doc['default_config'], 'tp4')
+        e = doc['configs'][1]
+        self.assertEqual(list(e), ['id', 'label', 'nodes', 'decode', 'concurrency', 'max_context', 'kv_pool_tokens',
+                                   'quality', 'notes'])
+        self.assertEqual(e['label'], 'one')
+        self.assertEqual(e['decode'], {'code': 61.2, 'structured': 9.9, 'prose': 40.1})
+        self.assertEqual(e['quality'], [{'name': 'GSM8K', 'value': '90%'},
+                                        {'name': 'Needle recall', 'value': 'found at 32K, 128K'}])
+        self.assertEqual((e['kv_pool_tokens'], e['notes']), (5, 'kept'))
+        self.assertIn('prefill', skipped)
+
+    def test_command_round_trips_the_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            rep, out = Path(d) / 'r.json', Path(d) / 'kindling.json'
+            rep.write_text(json.dumps(self.REPORT))
+            cmd = [sys.executable, str(BENCH), 'kindling', str(rep), '--out', str(out), '--config-id', 'tp1',
+                   '--label', 'TP=1', '--nodes', '1', '--default']
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn('not in the report', p.stdout)
+            first = out.read_text()
+            subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            self.assertEqual(out.read_text(), first)          # a second run changes nothing
+            self.assertEqual(json.loads(first)['configs'][0]['max_context'], 262144)
+            self.assertTrue(first.startswith('{\n  "version": 1,'))
 
 
 if __name__ == '__main__':
