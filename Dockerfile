@@ -5,7 +5,7 @@
 #                                                                              only the binaries, into out/bin
 #
 # Stages: toolchain (CUDA devel + rdma-core) -> rust -> loader (the Rust loader) and kvman (the Rust S2 page allocator)
-# -> engine, engine-int4, engine-flash and engine-ds41, with front (the Rust front end) beside them -> dist (the binaries only)
+# -> engine, engine-int4, engine-flash, engine-flash-int4 and engine-ds41, with front (the Rust front end) beside them -> dist (the binaries only)
 # -> runtime (CUDA runtime + binaries, scripts, shims).
 ARG CUDA_VERSION=13.0.1
 ARG UBUNTU=ubuntu24.04
@@ -135,6 +135,11 @@ FROM engine-src-glm AS engine-flash
 RUN MODEL=flash scripts/build.sh /out/bin \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4_flash ! -name m4sim_flash -exec rm -rf {} +
 
+# GLM-5.3-Flash with the 4-bit KV latent (--kv-format int4, docs/FLASH.md): g6m4_flash-int4, TP 1, 2, 3 and 4
+FROM engine-src-glm AS engine-flash-int4
+RUN MODEL=flash KV_FORMAT=int4 scripts/build.sh /out/bin \
+ && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4_flash-int4 -exec rm -rf {} +
+
 # DeepSeek-V4.1-Flash-1017: g6m4_ds41 and m4sim_ds41 (MODEL=ds41), TP 4. build.sh builds it without request grammars, so
 # it starts from engine-src and does not wait for XGrammar. Its build knobs (GR8_DS_TRUNK_BF16) come from
 # ds41_build_flags.sh, which only this stage copies, so the other engine stages keep their cache.
@@ -162,7 +167,7 @@ COPY --from=front /out/g6front-rs /
 # dist holds the shipped binaries in bin/: g6m4 (fp8 KV) and g6m4-int4 (--kv-format int4), both for every TP width,
 # and g6load (the Hugging Face fetch's planner and checker). build.sh's CPU test binaries and objects stay behind.
 # tr3_e4m3_test is the GPU decode check build.sh cannot run without a GPU.
-# dist-fp8, dist-int4, dist-flash, dist-ds41 and dist-tests are the five parts of dist. Their
+# dist-fp8, dist-int4, dist-flash, dist-flash-int4, dist-ds41 and dist-tests are the six parts of dist. Their
 # stages are the whole cost of a build and they share nothing, so CI builds each
 # in its own job and unpacks the artifacts into one directory. dist stays the
 # union, for a local build and for anything that wants every binary from one target.
@@ -180,6 +185,9 @@ COPY --from=engine-int4 /out/bin/g6m4-int4 /bin/
 FROM scratch AS dist-flash
 COPY --from=engine-flash /out/bin/g6m4_flash /out/bin/m4sim_flash /bin/
 
+FROM scratch AS dist-flash-int4
+COPY --from=engine-flash-int4 /out/bin/g6m4_flash-int4 /bin/
+
 FROM scratch AS dist-ds41
 COPY --from=engine-ds41 /out/bin/g6m4_ds41 /out/bin/m4sim_ds41 /bin/
 
@@ -190,6 +198,7 @@ FROM scratch AS dist
 COPY --from=dist-fp8 / /
 COPY --from=dist-int4 / /
 COPY --from=dist-flash / /
+COPY --from=dist-flash-int4 / /
 COPY --from=dist-ds41 / /
 COPY --from=dist-tests / /
 

@@ -63,8 +63,8 @@ tp4_default() {
 # SESS: 2..8 share decode steps and the CAP pool, each with its own KDA state slots (docs/FLASH.md, Several sessions);
 # 8 at TP=4, 4 at TP=3, 1 (one request at a time) at TP=2 and TP=1. A round of every session, SESS x (MTP + 1) rows, must fit
 # the engine's 32. CAP is a 262,144-token request plus a page for the guard rows (2 at MTP=1). Only the 11 DSA layers and
-# the MTP layer keep KV, 1,664 B a token each, and without CP every rank holds the whole context: about 5.2 GB a rank at
-# any TP (docs/FLASH.md, Context). With one session SHARE_LIMIT only sets the front end's default max_tokens.
+# the MTP layer keep KV, 1,664 B a token each (928 B with KV_FORMAT=int4), and without CP every rank holds the whole
+# context: about 5.2 GB a rank at any TP (2.9 GB with int4; docs/FLASH.md, Context). With one session SHARE_LIMIT only sets the front end's default max_tokens.
 flash_defaults() {
   case $TP in 4|3|2|1) ;; *) echo "engine_defaults: TP=$TP; GLM-5.3-Flash wants 4, 3, 2 or 1" >&2; return 2 ;; esac
   local k
@@ -265,7 +265,7 @@ engine_defaults() {
 # (about 1.3-1.4 GB of device memory plus 84 MB pinned per rank). About 1.4 KB per position of it scales with QP_CTX.
 # GLM-5.3-Flash: the prefill speed stack at top-k 8 (docs/FLASH.md). GR8_PF_RS, GR8_PF_OWN and CP stay off.
 flash_env() {
-  ENGINE_BIN=g6m4_flash
+  ENGINE_BIN=g6m4_flash; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=g6m4_flash-int4
   # TP=4: mHC sequence-parallel (partials reduce-scatter, each owner runs mHC on its rows, the rows all-gather), which
   # sends a quarter of the bytes and replaces the peer-partial staging: 8K prefill 2,151 -> 2,533 tok/s. And the routed
   # experts on the expert tiles (GR8_PF_WT), which need the router unsplit: 8K 2,818 -> 2,963 with the G9 scan below.
@@ -476,7 +476,8 @@ engine_args() {
       for t in $KV_STORE; do [ -n "$t" ] && a="$a --kv-store $t"; done
       unset IFS
     fi
-    (set -f; echo $a)
+    [ "${KV_FORMAT:-fp8}" = int4 ] && a="$a --kv-format int4"   # bin/g6m4_flash-int4, which needs it
+    (set -f; echo $a ${EXTRA_ARGS:-})
     return
   fi
   # DeepSeek-V4.1-Flash-1017: a release only, CHUNK rows a step for a prompt tail (8 unless set). No --prefill or --pf-lanes: the

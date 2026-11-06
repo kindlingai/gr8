@@ -49,7 +49,8 @@ reserves each request's `prompt + max_tokens` pages from the pool, so with sever
 
 Only the attention layers keep KV: the 11 DSA layers and the MTP layer, 12 bindings a rank. KDA's state is the same size
 at any context. A token costs each of them a 1,024 B bf16 latent row and 640 B of indexer keys (`engine/attn/kvfmt.h`;
-a build with `-DG6_FLASH_KV_FP8=1` makes the row 528 B), 19,968 B in all. Flash has no CP, so every rank holds the whole context and
+a build with `-DG6_FLASH_KV_FP8=1` makes the row 528 B, the int4 build below 288 B), 19,968 B in all (11,136 B with
+int4). Flash has no CP, so every rank holds the whole context and
 the cost is the same at TP=4 and TP=2:
 
 | CAP | pages of 64 | KV a rank |
@@ -86,6 +87,13 @@ proxy (`engine/comms/fabric.cpp`), and the S2 head agrees with itself (`s2/contr
 RDMA checks. The router is not split (no ranks to split it over), so the routed experts run on the expert tiles. A
 session alone drafts with the DFlash2 drafter when the boot names one (`--drafter`): its body is whole on the one rank,
 about 1.3 GB, and the supervisor converts it for the rank on the first boot.
+
+## int4 KV (`--kv-format int4`, experimental)
+
+`bin/g6m4_flash-int4` (`KV_FORMAT=int4 MODEL=flash scripts/build.sh`, `-DG6_KV4=1`) stores the latent in 4 bits: 256 B
+of codes and one FP16 scale per 32 dims (amax / 7), 288 B a row against bf16's 1,024. The indexer keys are unchanged.
+There is no rotation: Flash's latent is NoPE, and every read dequantizes in place (`latent`, `lat4`, `stage_cvt8` in
+`engine/attn/flash_attn.cu`). `--kv-format int4` makes the launcher run it and pass the flag, which the build requires.
 
 ## Several sessions
 
@@ -250,6 +258,5 @@ Limits:
   experimental Flash form of prefix reuse, with or without DFlash2. The DFlash2 drafter's taps are the mean of the four
   mHC streams after each tapped layer, in decode steps and in the prefill, which keeps the last 2,048 prompt positions
   for the drafter's prompt context. DFlash2 at TP=2 and TP=3 runs offline only.
-- The int4 KV build.
 - The vision tower: the engine serves text, and the fetch skips `dense/vision-*`.
 - A 262K prefill's time and memory headroom on a GB10: the `CAP` above is computed, not measured.

@@ -515,11 +515,18 @@ int main(int argc, char** argv)
 #else
         const std::string built = "fp8";
 #endif
-        if (kv_format.empty() && built == "int4") die("this engine is the int4 KV build (bin/g6m4-int4): it needs --kv-format int4");
+#if G6_MODEL_FLASH
+        const std::string bin = "bin/g6m4_flash";
+#elif G6_MODEL_DS41
+        const std::string bin = "bin/g6m4_ds41";
+#else
+        const std::string bin = "bin/g6m4";
+#endif
+        if (kv_format.empty() && built == "int4") die("this engine is the int4 KV build (" + bin + "-int4): it needs --kv-format int4");
         if (kv_format.empty()) kv_format = built;
         if (kv_format != "fp8" && kv_format != "int4") die("--kv-format fp8 or int4");
         if (kv_format != built)
-            die("--kv-format " + kv_format + ": this engine is the " + built + " build (bin/g6m4 is fp8, bin/g6m4-int4 is int4)");
+            die("--kv-format " + kv_format + ": this engine is the " + built + " build (" + bin + " is fp8, " + bin + "-int4 is int4)");
         if (cfg.rank == 0) fprintf(stderr, "# rank 0: KV format %s (latent row %d B, %s)\n", kv_format.c_str(), g6kv::ROW, g6kv::NAME);
         if (cfg.rank == 0)   // module_info.h: what host code reads about this build
             fprintf(stderr, "# rank 0: module %s abi %u: TP%d, %d rows a step, %d session slots, KV %s %d B a row, caps %#x\n",
