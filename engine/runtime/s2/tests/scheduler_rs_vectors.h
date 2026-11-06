@@ -575,3 +575,166 @@ inline uint64_t request(uint64_t seed, std::vector<std::string>* lines = nullptr
         }));
     return tx.h;
 }
+
+// the driver (driver.h): Drivers over a fake engine that answers from a hash of each row, taking grants (decode-prompt
+// requests and insert rules among them), cancels and Resize commits between steps, with runs that grow, stall or stay,
+// rounds capped past R, emitters that stop early or miscount, and hooks that throw. Every hook call, step, refusal and
+// digest goes in. The planner's own choices are the planner tests'; this pins the driver's calls into it.
+inline uint64_t driver(uint64_t seed, std::vector<std::string>* lines = nullptr)
+{
+    using namespace g6s2;
+    Rng R(seed);
+    Tx tx{{}, lines};
+    auto U = [&](int lo, int hi) { return R.U(lo, hi); };
+    auto mix = [](uint64_t a, uint64_t b, uint64_t c) {
+        uint64_t x = a * 0x9E3779B97F4A7C15ull ^ (b + 0x632BE59BD9B4E019ull) * 0xBF58476D1CE4E5B9ull ^ (c + 7) * 0x94D049BB133111EBull;
+        x ^= x >> 29; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 32;
+        return x;
+    };
+    for (int t = 0; t < 60; ++t)
+    {
+        Config c;
+        c.max_sessions = uint32_t(U(1, int(std::min(MAX_SESSIONS, 8u))));
+        c.mtp = uint32_t(U(1, 3));
+        c.max_rows = uint32_t(U(int(c.mtp) + 1, 32));
+        c.pool_rows = PAGE * 4096;
+        c.prefill_rows = uint32_t(64 * U(1, 4));
+        c.two_lanes = U(0, 1);
+        c.decode_rounds = uint32_t(U(0, 2) ? 0 : U(1, 4));
+        c.cp_step_rows = uint32_t(U(0, 1) ? 0 : U(int(c.mtp) + 1, 12));
+        c.cp_after = U(0, 3) ? uint64_t(U(0, 300)) : UINT64_MAX;
+        c.cp_seg = !U(0, 3);
+        c.tail_first = U(0, 1);
+        c.mtp_sessions = uint32_t(U(0, 2) ? 0 : U(1, 3));
+        const std::string v = outcome([&] { impl::validate(c); return std::string(); });
+        tx(v);
+        if (v != "ok ") continue;
+        const uint64_t salt = R.raw();
+        const int throw_rate = U(0, 1) ? 0 : 400;   // per hook call, 1 in throw_rate throws
+        const bool with_grow = U(0, 3), with_resize = U(0, 3);
+        std::unique_ptr<impl::Driver> d;
+        std::map<uint64_t, uint32_t> sent;   // request id -> tokens the emitter let out
+        auto hook = [&](const std::string& s) {
+            tx(s);
+            if (throw_rate && !U(0, throw_rate - 1)) throw std::runtime_error("hook threw at " + s);
+        };
+        DriverHooks h;
+        h.bind = [&](const Grant& g) { hook("bind " + str(g.key) + " " + str(g.run) + " id " + std::to_string(g.req.id)); };
+        h.retire = [&](const Slot& s) {
+            hook("retire " + str(s.key) + " phase " + std::to_string(int(s.phase)) + " emitted " + std::to_string(d->emitted(s.key.slot).size()) +
+                 " prompt " + std::to_string(d->prompt(s.key.slot).size()));
+        };
+        h.prefill = [&](const Slot& s, const Payload& p, uint32_t first, uint32_t rows) {
+            hook("prefill " + str(s.key) + " " + std::to_string(p.prompt.size()) + " " + std::to_string(first) + "+" + std::to_string(rows));
+        };
+        h.run = [&](const s2::Step& st) {
+            std::string s = "run " + st.key() + " d" + std::to_string(st.scheduler_decode) + " e" + std::to_string(int(st.event));
+            std::vector<int> ids;
+            for (const auto& r : st.r)
+            {
+                ids.push_back(int(mix(salt + uint64_t(r.sess), uint64_t(r.pos) + (st.kind != s2::Step::MAIN), uint64_t(r.tok)) % 4));
+                s += " " + std::to_string(r.sess) + ":" + std::to_string(r.pos) + ":" + std::to_string(r.tok);
+            }
+            hook(s);
+            return ids;
+        };
+        h.emit = [&](Key k, const int* ids, int n, int row) {
+            const Slot& s = d->state().slots()[k.slot];
+            uint32_t& out = sent[s.req.id];
+            const uint32_t left = s.req.max_tokens - out;
+            Emission e{uint32_t(n), false};
+            const int r = U(0, 40);
+            if (r == 0) e = {uint32_t(U(0, n)), true};   // a stop
+            if (e.count > left) e = {left, true};
+            if (r == 1 && !throw_rate) e.count = uint32_t(n) + 1;   // a miscount: refused
+            out += std::min(e.count, left);
+            hook("emit " + str(k) + " " + std::to_string(n) + " row " + std::to_string(row) + " first " + std::to_string(n ? ids[0] : -1) +
+                 " -> " + std::to_string(e.count) + (e.finished ? " stop" : ""));
+            return e;
+        };
+        h.prompt = [&](Key k, int M, int pos0) { hook("prompt " + str(k) + " " + std::to_string(M) + " " + std::to_string(pos0)); };
+        h.round = [&](Key k, long n, int base, int a, int K) {
+            hook("round " + str(k) + " " + std::to_string(n) + " " + std::to_string(base) + " " + std::to_string(a) + "/" + std::to_string(K));
+        };
+        h.dfl_ok = [&](Key k) { hook("dfl_ok " + str(k)); return false; };
+        h.terminal = [&](Key k, const s2::Stats& st) {
+            hook("terminal " + str(k) + " " + std::to_string(st.rounds) + " " + std::to_string(st.tokens) + " " + std::to_string(st.inserted));
+        };
+        if (with_grow)
+            h.grow = [&](const Slot& s, uint64_t rows) -> std::optional<Run> {
+                hook("grow " + str(s.key) + " " + std::to_string(rows) + " " + str(s.run));
+                const int r = U(0, 5);
+                if (r == 0) return std::nullopt;
+                const uint32_t most = reserve_pages(c, s.req);
+                if (r == 1 || s.run.pages >= most) return s.run;
+                return Run{s.run.first_page, std::min(most, s.run.pages + uint32_t(U(1, 3))), s.run.table_version, R.raw()};
+            };
+        h.finished = [&](const Slot& s) { hook("finished " + str(s.key) + " " + std::to_string(s.emitted)); };
+        if (with_resize) h.resize = [&](const Resize& z) { hook("resize " + std::to_string(z.tier) + " " + std::to_string(z.segs)); };
+        h.settle = [&] { hook("settle"); };
+        const std::string made = outcome([&] { d = std::make_unique<impl::Driver>(c, h); return std::string(); });
+        tx(made);
+        if (!d) continue;
+        uint64_t id = 0;
+        int refused = 0;
+        for (int k = 0; k < 400 && refused < 3; ++k)
+        {
+            const int op = U(0, 9);
+            std::string o;
+            if (op <= 1)
+            {
+                const auto& sl = d->state().slots();
+                Commit e;
+                e.epoch = c.epoch;
+                e.event = d->state().next_event();
+                e.boundary = d->state().boundary();
+                e.before_hash = d->state().digest();
+                std::optional<Payload> p;
+                const int kind = U(0, 9);
+                if (kind <= 2)
+                {   // cancel a live session, or a key that is not one
+                    const auto& s = sl[unsigned(U(0, int(MAX_SESSIONS) - 1))];
+                    if (s.phase != Phase::Free || !U(0, 3)) e.cancel = s.key;
+                }
+                if (kind == 3 && U(0, 1)) e.resize = Resize{uint32_t(U(0, 3)), uint64_t(U(0, 9)), 0, 0};
+                else if (kind >= 3 && d->state().resident() < c.limit())
+                {
+                    Request r;
+                    r.id = ++id;
+                    r.prompt_tokens = uint32_t(U(0, 4) ? U(2, 200) : U(201, 600));
+                    r.max_tokens = uint32_t(U(1, 80));
+                    Payload q;
+                    for (uint32_t i = 0; i < r.prompt_tokens; ++i) q.prompt.push_back(U(0, 3));
+                    q.chunk = U(0, 20) ? U(1, 8) : 0;   // 0: refused
+                    q.decode_prompt = !U(0, 6);
+                    if (!U(0, 3))
+                    {
+                        q.ins.after = U(0, 20);
+                        q.ins.unless = U(0, 1) ? -1 : U(0, 3);
+                        for (int i = U(1, 6); i > 0; --i) q.ins.tokens.push_back(U(0, 3));
+                    }
+                    const std::string key = outcome([&] { e.admit = Grant{d->state().next_key(e.cancel), r, {}, 0}; return std::string(); });
+                    if (e.admit)
+                    {
+                        e.admit->run = Run{uint32_t(U(0, 1000)), grant_pages(c, r), 1, R.raw()};
+                        if (!U(0, 30)) q.prompt.pop_back();   // a payload that does not match its grant
+                        p = q;
+                    }
+                    else tx("next_key " + key);
+                }
+                o = "apply " + outcome([&] {
+                    const Changes ch = d->apply(e, p ? &*p : nullptr);
+                    std::string s;
+                    for (const auto& r : ch.freed) s += str(r) + ",";
+                    return s + (ch.admitted ? " admitted " + str(ch.admitted->key) : "");
+                });
+            }
+            else o = "step " + outcome([&] { return str(d->step()); });
+            const bool dead = o.find("failed or work in flight") != std::string::npos || o.find("quiescent") != std::string::npos;
+            refused = dead ? refused + 1 : 0;
+            tx(o);
+            tx("digest " + std::to_string(d->state().digest()) + " cp " + std::to_string(d->cp_capped_rounds()));
+        }
+    }
+    return tx.h;
+}

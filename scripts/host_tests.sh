@@ -99,7 +99,7 @@ done
 for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
   if [ -z "$f" ]; then opt="-O1 -g -fsanitize=address,undefined"; else opt="-O2"; fi
   g++ -std=c++17 $opt -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rs_vectors_test.cpp" -o "$T/scheduler_rs_vectors_test" "${KVLIB[@]}"
-  "$T/scheduler_rs_vectors_test"
+  "$T/scheduler_rs_vectors_test" 2> >(grep -v '^# s2 GR8_CP_STEP_ROWS=' >&2)   # the driver section's cap lines
 done
 # the planner's round log and its replay (GR8_S2_REPLAY_LOG, s2/round_replay.h); GR8_S2_FRESH_SPEC
 g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -ffp-contract=off -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/batch_replay_test.cpp" -o "$T/batch_replay_test" "${KNOBS[@]}"
