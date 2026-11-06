@@ -48,48 +48,53 @@ pub struct Pick {
 /// ids served in the current cycle. rows = n (0 = off: everyone), per = the most rows one session's verify takes
 /// (mtp + 1), seg = GR8_CP_STEP_SEG.
 pub fn pick(cand: &[Cand], served: &[u64], rows: u32, per: u32, seg: bool) -> Pick {
-    let mut p = Pick { in_round: vec![true; cand.len()], ..Default::default() };
+    let mut in_round = vec![true; cand.len()];
+    let (capped, fresh) = pick_into(cand, served, rows, per, seg, &mut in_round);
+    Pick { in_round, capped, fresh }
+}
+
+/// `pick` without allocating: per candidate whether it is in the round goes to `in_round` (cand.len() entries);
+/// returns (capped, fresh).
+pub fn pick_into(cand: &[Cand], served: &[u64], rows: u32, per: u32, seg: bool, in_round: &mut [bool]) -> (bool, bool) {
+    let in_round = &mut in_round[..cand.len()];
+    in_round.fill(true);
     if rows == 0 || cand.is_empty() {
-        return p;
+        return (false, false);
     }
     let past = cand.iter().filter(|c| c.past).count();
     if past == 0 {
-        return p;
+        return (false, false);
     }
     let mixed = past < cand.len();
     if cand.len() as u64 * u64::from(per) <= u64::from(rows) && !(seg && mixed) {
-        return p; // everyone fits in one step past R
+        return (false, false); // everyone fits in one step past R
     }
-    p.capped = true;
-    let mut open: Vec<usize> = (0..cand.len()).filter(|&i| !served.contains(&cand[i].id)).collect();
-    if open.is_empty() {
-        p.fresh = true;
-        open = (0..cand.len()).collect();
-    }
-    p.in_round = vec![false; cand.len()];
-    if !open.iter().any(|&i| cand[i].past) {
-        for &i in &open {
-            p.in_round[i] = true; // a step below R: every open session
+    let fresh = cand.iter().all(|c| served.contains(&c.id));
+    let open = |i: usize| fresh || !served.contains(&cand[i].id);
+    in_round.fill(false);
+    if !(0..cand.len()).any(|i| open(i) && cand[i].past) {
+        for (i, x) in in_round.iter_mut().enumerate() {
+            *x = open(i); // a step below R: every open session
         }
-        return p;
+        return (true, fresh);
     }
     let most = ((rows / per.max(1)) as usize).max(1);
     let mut n = 0;
-    for &i in &open {
-        if cand[i].past && n < most {
-            p.in_round[i] = true;
+    for i in 0..cand.len() {
+        if open(i) && cand[i].past && n < most {
+            in_round[i] = true;
             n += 1;
         }
     }
     if !seg {
-        for &i in &open {
-            if !cand[i].past && n < most {
-                p.in_round[i] = true;
+        for i in 0..cand.len() {
+            if open(i) && !cand[i].past && n < most {
+                in_round[i] = true;
                 n += 1;
             }
         }
     }
-    p
+    (true, fresh)
 }
 
 #[cfg(test)]

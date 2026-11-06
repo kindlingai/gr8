@@ -705,12 +705,17 @@ pub fn alternate(c: &Config, k: u32, want: &mut bool, run: &mut u32) {
 pub fn plan(c: &Config, s: &[Slot], want_decode: bool, stalled: &[bool]) -> Quantum {
     let mut q = Quantum::default();
     let is_stalled = |i: usize| stalled.get(i).copied().unwrap_or(false);
-    let mut ordered: Vec<&Slot> = Vec::with_capacity(s.len());
+    let Some(first) = s.first() else { return q };
+    // on the stack: a decode round allocates nothing (the slot count is at most QMAX)
+    let mut buf = [first; QMAX];
+    let mut n = 0;
     for (i, x) in s.iter().enumerate() {
         if x.phase == PREFILL || (x.phase == DECODE && !is_stalled(i)) {
-            ordered.push(x);
+            buf[n] = x;
+            n += 1;
         }
     }
+    let ordered = &mut buf[..n];
     for i in 1..ordered.len() {
         let x = ordered[i];
         let mut j = i;
@@ -720,9 +725,10 @@ pub fn plan(c: &Config, s: &[Slot], want_decode: bool, stalled: &[bool]) -> Quan
         }
         ordered[j] = x;
     }
+    let ordered: &[&Slot] = ordered;
     let mut pf: Option<&Slot> = None;
     let decoding_any = s.iter().any(|x| x.phase == DECODE);
-    for &x in &ordered {
+    for &x in ordered {
         if x.phase == DECODE {
             q.keys[q.count as usize] = x.key;
             q.count += 1;
@@ -740,7 +746,7 @@ pub fn plan(c: &Config, s: &[Slot], want_decode: bool, stalled: &[bool]) -> Quan
     }
     if c.c8_pack {
         let mut held = 0usize;
-        for &x in &ordered {
+        for &x in ordered {
             if x.phase == PREFILL && x.pack_tail {
                 q.keys[held] = x.key;
                 q.firsts[held] = x.prefilled;
@@ -767,7 +773,7 @@ pub fn plan(c: &Config, s: &[Slot], want_decode: bool, stalled: &[bool]) -> Quan
             };
             let mut take: Vec<&Slot> = vec![p];
             let mut total = prefill_left(p);
-            for &x in &ordered {
+            for &x in ordered {
                 if take.len() >= PACK_MAX_MEMBERS {
                     break;
                 }
