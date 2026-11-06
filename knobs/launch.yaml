@@ -182,9 +182,9 @@ options:
       (total + A*T) * (B*T) at the request's temperature T, the factor only when *B is written, so temperature=*1
       makes the operator's penalty zero under greedy. The request's own presence_penalty replaces base's amount and
       is added after all of that, unscaled (0 included: the conditions still apply); its thinking_presence_penalty
-      replaces thinking's amount the same way, the condition's thinking part staying. No multiplier reaches a value the client set. A spec any
-      combination of which resolves outside -2..2 at any T from 0 to 2 is refused at boot, and a request whose value
-      pushes a total outside it gets a 400. "greedy only": greedy=0.2,greedy.thinking=0.5. 0 = off
+      replaces thinking's amount the same way, the condition's thinking part staying. No multiplier reaches a value the client set. A spec any combination of which resolves outside -2..2 at any T from 0 to 2 is refused at boot;
+      a request's valid value over the operator's parts is held to -2..2 (the think block's total also to within 2 of
+      the reply's), never refused. "greedy only": greedy=0.2,greedy.thinking=0.5. 0 = off
   DEFAULT_FREQUENCY_PENALTY:
     scope: box
     default: "0"

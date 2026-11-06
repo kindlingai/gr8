@@ -180,16 +180,14 @@ impl PenaltySpec {
     }
 
     /// A request's penalty at temperature `t`: its own `value` replaces the operator's base amount and its own
-    /// `thinking` the operator's thinking amount, both added unscaled. The conditions' parts stay. Err: whether the whole reply's total left
-    /// [-2, 2] (else the difference inside the block did), with the totals.
-    pub fn resolve(&self, value: Option<f64>, thinking: Option<f64>, t: f64) -> Result<Resolved, (bool, Resolved)> {
+    /// `thinking` the operator's thinking amount, both added unscaled. The conditions' parts stay. The totals are
+    /// held to the engine's [-2, 2], `inside` also to within 2 of `out` (the engine takes the difference): a client's
+    /// valid value never earns a refusal from the operator's parts.
+    pub fn resolve(&self, value: Option<f64>, thinking: Option<f64>, t: f64) -> Resolved {
         let (rest_out, rest_in) = self.rests(value, thinking, t == 0.0);
         let r = self.at(rest_out, rest_in, t, value.unwrap_or(0.0), thinking.unwrap_or(0.0));
-        if r.ok() {
-            Ok(r)
-        } else {
-            Err((!RANGE.contains(&r.out), r))
-        }
+        let out = r.out.clamp(-2.0, 2.0);
+        Resolved { out, inside: r.inside.clamp(-2.0, 2.0).clamp(out - 2.0, out + 2.0) }
     }
 }
 
@@ -620,17 +618,7 @@ pub fn build(
     // (PenaltySpec::resolve, where exactly 0 is greedy). The engine counts the tokens it generated, vLLM's way
     let resolve = |spec: &PenaltySpec, key: &str, tkey: &str| -> Result<Resolved, ApiError> {
         let (value, thinking) = (float_num(body, key, -2.0, 2.0)?, float_num(body, tkey, -2.0, 2.0)?);
-        spec.resolve(value, thinking, temperature).map_err(|(whole, r)| {
-            let k = if whole { key } else { tkey };
-            ApiError::bad(
-                format!(
-                    "`{k}` with the server's default gives {} outside the think block and {} inside, outside [-2, 2]",
-                    pyjson::float_string(r.out),
-                    pyjson::float_string(r.inside)
-                ),
-                Some(k),
-            )
-        })
+        Ok(spec.resolve(value, thinking, temperature))
     };
     // the think-end boost: the request's spec, else the server's. `false` or "off" turns it off
     let think_end_boost = match body.get("think_end_boost").filter(|v| !v.is_null()) {
@@ -935,83 +923,91 @@ mod tests {
     fn parts_add_and_their_multipliers_compound() {
         let s = PenaltySpec::parse("base=0.2*1.5,thinking=+0.1*1.1,greedy=0.3*2,nongreedy=-0.1").unwrap();
         // greedy: out = (0.2 + 0.3) * (1.5 * 2) = 1.5, and the block adds 0.1 * 1.1 = 0.11
-        let r = s.resolve(None, None, 0.0).unwrap();
+        let r = s.resolve(None, None, 0.0);
         assert!(near(r.out, 1.5) && near(r.inside, 1.61) && near(r.extra(), 0.11));
         // sampling: out = (0.2 - 0.1) * 1.5 = 0.15
-        let r = s.resolve(None, None, 1.0).unwrap();
+        let r = s.resolve(None, None, 1.0);
         assert!(near(r.out, 0.15) && near(r.inside, 0.26));
         // the request's value takes the base amount out and is added after the multipliers. The same for thinking
-        let r = s.resolve(Some(0.0), None, 0.0).unwrap();
+        let r = s.resolve(Some(0.0), None, 0.0);
         assert!(near(r.out, 0.9) && near(r.inside, 1.01));
-        let r = s.resolve(Some(0.5), None, 0.0).unwrap();
+        let r = s.resolve(Some(0.5), None, 0.0);
         assert!(near(r.out, 1.4) && near(r.inside, 1.51));
-        let r = s.resolve(None, Some(0.0), 0.0).unwrap();
+        let r = s.resolve(None, Some(0.0), 0.0);
         assert!(near(r.out, 1.5) && near(r.inside, 1.5));
-        let r = s.resolve(None, Some(0.25), 0.0).unwrap();
+        let r = s.resolve(None, Some(0.25), 0.0);
         assert!(near(r.extra(), 0.25));
-        // an override that leaves the range names the total that did
-        assert!(s.resolve(Some(1.5), None, 0.0).unwrap_err().0); // out = 2.4
+        // a client's valid value over the operator's parts is held to the range, never refused
+        assert_eq!(s.resolve(Some(1.5), None, 0.0).out, 2.0); // 2.4 before the clamp
         let s = PenaltySpec::parse("thinking=0.5*1.5").unwrap();
-        assert!(!s.resolve(Some(2.0), None, 1.0).unwrap_err().0); // out 2, inside 2.75
-        assert_eq!(
-            PenaltySpec::default().resolve(Some(2.0), Some(-2.0), 1.0).unwrap(),
-            Resolved { out: 2.0, inside: 0.0 }
-        );
+        assert_eq!(s.resolve(Some(2.0), None, 1.0), Resolved { out: 2.0, inside: 2.0 }); // inside 2.75 before it
+        assert_eq!(PenaltySpec::default().resolve(Some(2.0), Some(-2.0), 1.0), Resolved { out: 2.0, inside: 0.0 });
     }
 
     #[test]
     fn condition_parts_apply_under_their_temperature_and_never_scale_a_request_s_value() {
         // the recipe: greedy requests get 0.2 outside the block and 0.7 inside, sampling requests nothing
         let s = PenaltySpec::parse("greedy=0.2,greedy.thinking=0.5").unwrap();
-        assert_eq!(s.resolve(None, None, 0.0).unwrap(), Resolved { out: 0.2, inside: 0.7 });
-        assert_eq!(s.resolve(None, None, 1.0).unwrap(), Resolved { out: 0.0, inside: 0.0 });
-        assert_eq!(s.resolve(None, None, 0.7).unwrap(), Resolved { out: 0.0, inside: 0.0 });
-        // a client's own value rides on top, under either condition, and an explicit 0 still gets the greedy part
-        assert_eq!(s.resolve(Some(1.0), None, 0.0).unwrap(), Resolved { out: 1.2, inside: 1.7 });
-        assert_eq!(s.resolve(Some(1.5), None, 1.0).unwrap(), Resolved { out: 1.5, inside: 1.5 });
-        assert_eq!(s.resolve(Some(0.0), None, 0.0).unwrap(), Resolved { out: 0.2, inside: 0.7 });
+        assert_eq!(s.resolve(None, None, 0.0), Resolved { out: 0.2, inside: 0.7 });
+        assert_eq!(s.resolve(None, None, 1.0), Resolved { out: 0.0, inside: 0.0 });
+        assert_eq!(s.resolve(None, None, 0.7), Resolved { out: 0.0, inside: 0.0 });
+        // a client's own value rides on top, under either condition, and an explicit 0 still gets the greedy part.
+        // Qwen's 1.5: 1.7 outside the block, 2.2 inside held to 2.0, no refusal
+        assert_eq!(s.resolve(Some(1.5), None, 0.0), Resolved { out: 1.7, inside: 2.0 });
+        assert_eq!(s.resolve(Some(1.0), None, 0.0), Resolved { out: 1.2, inside: 1.7 });
+        assert_eq!(s.resolve(Some(1.5), None, 1.0), Resolved { out: 1.5, inside: 1.5 });
+        assert_eq!(s.resolve(Some(0.0), None, 0.0), Resolved { out: 0.2, inside: 0.7 });
         // the request's thinking value takes thinking's amount out, and the condition's thinking part stays
-        assert_eq!(s.resolve(None, Some(0.0), 0.0).unwrap(), Resolved { out: 0.2, inside: 0.7 });
+        assert_eq!(s.resolve(None, Some(0.0), 0.0), Resolved { out: 0.2, inside: 0.7 });
         // the old way of writing it, with a zero multiplier for sampling requests: the multiplier scales the operator's
         // amounts only, so Qwen's 1.5 comes through
         let s = PenaltySpec::parse("thinking=0.5,greedy=0.2,nongreedy=*0").unwrap();
-        assert_eq!(s.resolve(None, None, 1.0).unwrap(), Resolved { out: 0.0, inside: 0.5 });
-        assert_eq!(s.resolve(Some(1.5), None, 1.0).unwrap(), Resolved { out: 1.5, inside: 2.0 });
-        assert_eq!(s.resolve(Some(1.5), Some(0.0), 1.0).unwrap(), Resolved { out: 1.5, inside: 1.5 });
+        assert_eq!(s.resolve(None, None, 1.0), Resolved { out: 0.0, inside: 0.5 });
+        assert_eq!(s.resolve(Some(1.5), None, 1.0), Resolved { out: 1.5, inside: 2.0 });
+        assert_eq!(s.resolve(Some(1.5), Some(0.0), 1.0), Resolved { out: 1.5, inside: 1.5 });
+        // the clamp at -2, and inside held to within 2 of out (the engine takes the difference)
+        let s = PenaltySpec::parse("greedy=-1,greedy.thinking=-0.5").unwrap();
+        assert_eq!(s.resolve(Some(-1.5), None, 0.0), Resolved { out: -2.0, inside: -2.0 });
+        let s = PenaltySpec::parse("greedy.thinking=-2").unwrap();
+        assert_eq!(s.resolve(Some(2.0), Some(-2.0), 0.0), Resolved { out: 2.0, inside: 0.0 });
+        assert_eq!(s.resolve(Some(2.0), Some(-2.0), 0.0).extra(), -2.0);
+        // the boot check still refuses operator parts that leave the range on their own
+        assert!(PenaltySpec::parse("greedy=1.5,greedy.thinking=1").is_err());
+        assert!(PenaltySpec::parse("nongreedy=-2.5").is_err());
         // a condition's thinking multiplier
         let s = PenaltySpec::parse("thinking=0.5,nongreedy.thinking=*0").unwrap();
-        assert_eq!(s.resolve(None, None, 0.0).unwrap().extra(), 0.5);
-        assert_eq!(s.resolve(None, None, 1.0).unwrap().extra(), 0.0);
-        assert_eq!(s.resolve(None, Some(0.3), 1.0).unwrap().extra(), 0.3);
+        assert_eq!(s.resolve(None, None, 0.0).extra(), 0.5);
+        assert_eq!(s.resolve(None, None, 1.0).extra(), 0.0);
+        assert_eq!(s.resolve(None, Some(0.3), 1.0).extra(), 0.3);
     }
 
     #[test]
     fn the_temperature_part_is_a_last_stage_scaled_by_the_request_s_temperature() {
         // rest: out = 0.5 + gn, the block adds 0.25; then (rest + 0.1 T) * (0.5 T)
         let s = PenaltySpec::parse("base=0.5,thinking=0.25,greedy=0.25,nongreedy=-0.25,temperature=+0.1*0.5").unwrap();
-        let r = s.resolve(None, None, 0.0).unwrap();
+        let r = s.resolve(None, None, 0.0);
         assert_eq!(r, Resolved { out: 0.0, inside: 0.0 }); // the factor B T is 0 under greedy
         for (t, out, inside) in
             [(0.7, (0.25 + 0.07) * 0.35, (0.5 + 0.07) * 0.35), (1.0, 0.35 * 0.5, 0.6 * 0.5), (2.0, 0.45, 0.7)]
         {
-            let r = s.resolve(None, None, t).unwrap();
+            let r = s.resolve(None, None, t);
             assert!(near(r.out, out) && near(r.inside, inside), "T {t}: {r:?}");
         }
         // an amount alone adds A T with no factor, and a factor alone scales by B T
         let s = PenaltySpec::parse("base=0.5,temperature=+0.25").unwrap();
-        assert_eq!(s.resolve(None, None, 0.0).unwrap().out, 0.5);
-        assert_eq!(s.resolve(None, None, 2.0).unwrap().out, 1.0);
+        assert_eq!(s.resolve(None, None, 0.0).out, 0.5);
+        assert_eq!(s.resolve(None, None, 2.0).out, 1.0);
         let s = PenaltySpec::parse("base=0.5,thinking=0.5,temperature=*1").unwrap();
-        assert_eq!(s.resolve(None, None, 0.0).unwrap(), Resolved { out: 0.0, inside: 0.0 });
-        assert_eq!(s.resolve(None, None, 1.0).unwrap(), Resolved { out: 0.5, inside: 1.0 });
-        assert_eq!(s.resolve(None, None, 2.0).unwrap(), Resolved { out: 1.0, inside: 2.0 });
+        assert_eq!(s.resolve(None, None, 0.0), Resolved { out: 0.0, inside: 0.0 });
+        assert_eq!(s.resolve(None, None, 1.0), Resolved { out: 0.5, inside: 1.0 });
+        assert_eq!(s.resolve(None, None, 2.0), Resolved { out: 1.0, inside: 2.0 });
         // the stage scales the operator's amounts. The request's value comes after it, whole
         let s = PenaltySpec::parse("base=*2,temperature=+0.5*0.5").unwrap();
-        let r = s.resolve(Some(0.5), None, 1.0).unwrap();
+        let r = s.resolve(Some(0.5), None, 1.0);
         assert_eq!(r.out, 0.5 * 0.5 + 0.5);
-        assert!(s.resolve(Some(2.0), None, 2.0).unwrap_err().0); // 1 + 2
+        assert_eq!(s.resolve(Some(2.0), None, 2.0).out, 2.0); // 1 + 2, held to 2
         let s = PenaltySpec::parse("base=0.5,temperature=*1").unwrap();
-        assert_eq!(s.resolve(Some(1.5), None, 0.0).unwrap().out, 1.5); // zero under greedy for the operator's part only
+        assert_eq!(s.resolve(Some(1.5), None, 0.0).out, 1.5); // zero under greedy for the operator's part only
     }
 
     #[test]
@@ -1054,14 +1050,19 @@ mod tests {
             (r#"{"thinking_presence_penalty": 2.5}"#, "0", "thinking_presence_penalty"),
             (r#"{"thinking_frequency_penalty": "x"}"#, "0", "thinking_frequency_penalty"),
             (r#"{"repetition_penalty": 1.1}"#, "0", "repetition_penalty"),
-            // in range alone, outside it with the server's parts
-            (r#"{"temperature": 0, "presence_penalty": 2}"#, "greedy=0.5", "presence_penalty"),
-            (r#"{"thinking_presence_penalty": 1.5}"#, "base=1", "thinking_presence_penalty"),
         ] {
             let e = resolved(body, spec, "{}").err().expect(body);
             assert_eq!((e.status, e.param.as_deref()), (400, Some(param)), "{body}");
         }
         assert!(resolved(r#"{"repetition_penalty": 1}"#, spec, "{}").is_ok());
+        // in range alone, outside it with the server's parts: held to the range, and the engine's fields carry the
+        // clamped totals (out, in - out)
+        assert_eq!(resolved(r#"{"temperature": 0, "presence_penalty": 2}"#, "greedy=0.5", "{}").unwrap().0, 2.0);
+        let r = resolved(r#"{"thinking_presence_penalty": 1.5}"#, "base=1", "{}").unwrap();
+        assert_eq!((r.0, r.2), (1.0, 1.0)); // inside 2.5 held to 2
+        let r =
+            resolved(r#"{"temperature": 0, "presence_penalty": 1.5}"#, "greedy=0.2,greedy.thinking=0.5", "{}").unwrap();
+        assert!(near(r.0, 1.7) && near(r.2, 0.3));
     }
 
     fn boosted(body: &str, spec: Option<&str>, default_max: Option<u64>) -> Result<Option<Boost>, ApiError> {
