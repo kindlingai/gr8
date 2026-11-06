@@ -99,7 +99,6 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
         require(worst <= uint64_t(slot_pages) * PAGE, "DS41 run larger than one session's slab");
         return pool.reserve(n, worst, r);
     };
-    h.pool.release = [&](const Run& r) { pool.release(r); };
     h.pool.fits = [&](uint64_t n, uint64_t worst, uint32_t r) { return worst <= uint64_t(slot_pages) * PAGE && pool.fits(n, worst, r); };
     h.pool.digest = [&]() -> uint64_t {
         if (!ck) return pool.digest();

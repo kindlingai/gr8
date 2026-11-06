@@ -414,8 +414,8 @@ impl Driver {
             let k = e.shrink.key.slot;
             let len = self.length(k)?;
             let was = &before[k as usize].run;
-            if !self.pool.is_null() && !self.u.head {
-                // the head's change, on the same pool state
+            if !self.u.head {
+                // the head's change, on the same pool state (a worker without the pool's shrink refuses)
                 require(self.u.shrink, "a shrink commit without the pool's shrink")?;
                 let r = self.pool()?.shrink_run(&kv(was), e.shrink.r_rows).map_err(pool_err)?;
                 require(run_of(&r) == e.shrink.run, "worker shrink differs from the head's")?;
@@ -1192,16 +1192,21 @@ mod tests {
         let mut c = decode_config();
         (c.pool_rows, c.window_pages, c.r2_rows) = (400 * 64, 4, 4 * 64);
         // slot 2 takes the small R with this run
-        let shrink = |pool: &Handle, u: CPool, run: Run| {
+        // own: the driver has the pool (seated either way)
+        let shrink_own = |pool: &Handle, u: CPool, run: Run, own: bool| {
             let t = PoolTest { len: Cell::new(10), step: 0, grown: Cell::new(0), pool };
             let mut d = pool_driver(&t, c, u);
             (d.h.shrink, d.h.has_shrink) = (Some(shrink_ as ShrinkFn), true);
             seat(&d, pool, 20 * 64, 20 * 64);
+            if !own {
+                d.pool = std::ptr::null();
+            }
             let mut e = commit(&d);
             e.has_shrink = true;
             e.shrink = Shrink { key: d.s().slot(2).key, r_rows: c.r2_rows, run };
             d.apply(&e, 0, false, None).map(|_| (d.s().slot(2).run, pool.lock().digest()))
         };
+        let shrink = |pool: &Handle, u: CPool, run: Run| shrink_own(pool, u, run, true);
         // the head's change, made when it built the commit, on a pool seated alike
         let mirror = mk();
         let runs: Vec<_> = (0..3).map(|_| mirror.lock().reserve(20 * 64, 20 * 64).unwrap()).collect();
@@ -1211,9 +1216,12 @@ mod tests {
         let (r, d) = shrink(&mk(), CPool { shrink: true, head: true, ..Default::default() }, want).unwrap();
         assert!(r == want && d != shrunk);
         assert_eq!(shrink(&mk(), CPool { shrink: true, ..Default::default() }, want), Ok((want, shrunk)));
-        // a worker without the pool's shrink, or whose change differs, refuses and fails the scheduler
+        // a worker without the pool's shrink (or without a pool), or whose change differs, refuses and fails the
+        // scheduler
         let no = CPool { release: true, ..Default::default() };
         assert_eq!(shrink(&mk(), no, want), Err(Stop::Refused("a shrink commit without the pool's shrink")));
+        let none = shrink_own(&mk(), CPool::default(), want, false);
+        assert_eq!(none, Err(Stop::Refused("a shrink commit without the pool's shrink")));
         let bad = Run { list_hash: want.list_hash ^ 1, ..want };
         let yes = CPool { shrink: true, ..Default::default() };
         assert_eq!(shrink(&mk(), yes, bad), Err(Stop::Refused("worker shrink differs from the head's")));

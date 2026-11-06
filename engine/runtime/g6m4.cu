@@ -3164,7 +3164,6 @@ int main(int argc, char** argv)
             h.pool.room = [&] { return pool.room(); };
             h.pool.reserve = [&](uint64_t rows, uint64_t worst, uint32_t r) { return pool.reserve(rows, worst, r); };
             h.pool.digest = [&] { return pool.digest(); };
-            h.pool.release = [&](const g6s2::Run& r) { pool.release(r); };
             h.pool.fits = [&](uint64_t rows, uint64_t worst, uint32_t r) { return pool.fits(rows, worst, r); };
             if (rtt && rtt->local)
                 h.pool.refusal = [&](uint64_t worst, uint32_t r) -> std::string {

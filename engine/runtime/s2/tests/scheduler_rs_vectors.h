@@ -692,7 +692,9 @@ inline uint64_t driver(uint64_t seed, std::vector<std::string>* lines = nullptr)
                 hook(s);
             };
         h.settle = [&] { hook("settle"); };
-        const std::string made = outcome([&] { d = std::make_unique<impl::Driver>(c, h); return std::string(); });
+        // a head: no pool, and the shrink hook makes the pool change, as the old C++ driver did when this was recorded
+        const DriverPool head{nullptr, false, false, false, true};
+        const std::string made = outcome([&] { d = std::make_unique<impl::Driver>(c, h, head); return std::string(); });
         tx(made);
         if (!d) continue;
         uint64_t id = 0;

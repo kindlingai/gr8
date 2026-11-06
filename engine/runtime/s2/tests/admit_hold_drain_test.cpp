@@ -6,8 +6,9 @@
 // i.e. while the head is still inside that event (it waits for every rank's ACK). Asserted: all 8 grants apply at one boundary on
 // both ranks (the same step count at every bind) and the hold chain ends with the 8th (live + 1 == limit). Without the drain
 // (Service::drain_admits) the 3rd .. 8th grants apply after the 2nd grant's release, at a later step count.
-// Real Service, Driver, scheduler and event gate on two ranks over socket pairs; the native layer is a stand-in with no GPU
-// (a prefill quantum and a step each sleep 20 ms so boundaries pass while a notice waits). Build and run: see scripts/host_tests.sh.
+// Real Service, Driver, scheduler, pool and event gate on two ranks over socket pairs; the rest of the native layer is a
+// stand-in with no GPU (a prefill quantum and a step each sleep 20 ms so boundaries pass while a notice waits). Build
+// and run: see scripts/host_tests.sh.
 #include "s2/service.h"
 #include <cstdio>
 #include <sys/socket.h>
@@ -31,13 +32,14 @@ struct Rank {
     std::atomic<long> step{0};               // prefill quanta + steps run: a bind at the same count = the same boundary
     std::vector<long> bind_at;               // the step count at each grant's bind, in grant order
     std::function<void()> on_first_bind;     // head: writes cmd.2 .. cmd.7 during the first event
+    RunPool pool{1024, 1024, 64 * 1024};     // Config::pool_rows in pages
     NativeHooks hooks() {
         NativeHooks h;
-        h.pool.free_pages = [] { return uint32_t(1024); };
-        h.pool.room = [] { return uint32_t(1024); };
-        h.pool.reserve = [](uint64_t, uint64_t worst, uint32_t) { return Run{0, uint32_t((worst + PAGE - 1) / PAGE), 1, 7}; };
-        h.pool.release = [](const Run&) {};
-        h.pool.fits = [](uint64_t, uint64_t, uint32_t) { return true; };
+        h.pool.pool = &pool;
+        h.pool.free_pages = [this] { return pool.free_pages(); };
+        h.pool.room = [this] { return pool.room(); };
+        h.pool.reserve = [this](uint64_t n, uint64_t worst, uint32_t r) { return pool.reserve(n, worst, r); };
+        h.pool.fits = [this](uint64_t n, uint64_t worst, uint32_t r) { return pool.fits(n, worst, r); };
         h.bind = [this](const Grant&) {
             std::function<void()> f;
             {

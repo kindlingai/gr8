@@ -116,7 +116,6 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     h.pool.free_pages = [&] { return pool.free_pages(); };
     h.pool.room = [&] { return pool.room(); };
     h.pool.reserve = [&](uint64_t n, uint64_t worst, uint32_t r) { return pool.reserve(n, worst, r); };
-    h.pool.release = [&](const Run& r) { pool.release(r); };
     h.pool.fits = [&](uint64_t n, uint64_t worst, uint32_t r) { return pool.fits(n, worst, r); };
     h.pool.digest = [&]() -> uint64_t {
         if (!ck) return pool.digest();
