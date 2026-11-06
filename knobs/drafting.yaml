@@ -33,12 +33,11 @@ knobs:
   GR8_DFL_REUSE:
     scope: agree
     kind: int
-    unset: "2 when serving DFlash2 with MTP, else 0; GLM-5.3-Flash: 1 with GR8_GLM53F_CACHE, else 0"
+    unset: "2 when serving DFlash2 with MTP, else 0; GLM-5.3-Flash without MTP: 1 with GR8_GLM53F_CACHE, else 0"
     values: "0..2"
     doc: >-
       With DFlash2 under S2, 1 lets a request whose prefix-reuse hit (on GLM-5.3-Flash, a session checkpoint hit)
-      landed in the drafter's window keep the drafter, and 2 also gives the drafter to a request alone on MTP
-      (GLM-5.3 only).
+      landed in the drafter's window keep the drafter, and 2 also gives the drafter to a request alone on MTP.
   GR8_DFL_REUSE_MIN:
     scope: agree
     kind: int

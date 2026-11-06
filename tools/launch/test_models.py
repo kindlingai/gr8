@@ -160,8 +160,8 @@ class OptionTests(unittest.TestCase):
         self.assertIn('--spec-adaptive', a)
 
     def test_flash_cache_with_the_drafter(self):
-        # FLASH_CACHE and DFLASH=1 together (#340): both reach the engine; DFL_REUSE (0 or 1 on glm53f) and
-        # DFL_REUSE_MIN pass through when set, else the engine's default (1 with the cache) holds
+        # FLASH_CACHE and DFLASH=1 together (#340): both reach the engine; DFL_REUSE and DFL_REUSE_MIN pass through
+        # when set, else the engine's default holds
         plan = opt.engine_plan(flash('--dflash', '1', '--dflash-dir', '/d', '--flash-cache', 'aligned'))
         self.assertIn('GR8_GLM53F_CACHE=aligned', plan['env'])
         self.assertIn('--dflash-manifest', ' '.join(plan['args']))
@@ -170,9 +170,8 @@ class OptionTests(unittest.TestCase):
                                      '--dfl-reuse', '0', '--dfl-reuse-min', '64'))
         self.assertIn('GR8_DFL_REUSE=0', plan['env'])
         self.assertIn('GR8_DFL_REUSE_MIN=64', plan['env'])
-        with self.assertRaises(opt.OptionError) as e:
-            flash('--flash-cache', 'aligned', '--dfl-reuse', '2')
-        self.assertIn('glm53f takes 0 or 1', str(e.exception))
+        plan = opt.engine_plan(flash('--dflash', '1', '--dflash-dir', '/d', '--dfl-reuse', '2'))
+        self.assertIn('GR8_DFL_REUSE=2', plan['env'])
         # terminal checkpoints are not cold-exact: the drafter takes aligned only (the engine refuses it too)
         with self.assertRaises(opt.OptionError) as e:
             flash('--dflash', '1', '--dflash-dir', '/d', '--flash-cache', 'terminal')

@@ -21,23 +21,37 @@ struct FlashRing {
     void record(int pos, int n, bool verify) { first = pos; rows = n; ring = verify; }
 };
 static_assert(sizeof(FlashRing) == sizeof(g6sch_ring), "scheduler-rs layout");
-// Every S2 session's KDA state slots (Model::kda_ring + (kda_sessions - 1) x kda_ring_rest of them): session 0 owns
-// slots [0, first), session q > 0 owns [first + (q - 1) x per, first + q x per), each with a FlashRing of its own. per is
-// the MTP ring (K + 1, or 1 without MTP); first is wider when session 0 is the one that may draft with DFlash2 (8 rows a
-// round, Model::kda_ring), so only that session pays for the wide ring. In a main step a verify session's row r goes to
-// slot base + r, other rows to base; the session's first row loads base + its ring's source, so sessions sharing a step
-// never touch each other's state.
+// Every S2 session's KDA state slots (Model::kda_ring + (kda_sessions - 1) x kda_ring_rest of them), in regions: region
+// 0 is slots [0, first), region r > 0 is [first + (r - 1) x per, first + r x per). per is the MTP ring (K + 1, or 1
+// without MTP); first is wider when one session may draft with DFlash2 (8 rows a round, Model::kda_ring), so only the
+// session holding region 0 pays for the wide ring. Session q holds region q until take_wide swaps two sessions' regions;
+// each session keeps its own FlashRing. In a main step a verify session's row r goes to slot base + r, other rows to
+// base. The session's first row loads base + its ring's source, so sessions sharing a step never touch each other's
+// state.
 struct FlashSlots {
     int per = 1, first = 1;
     std::vector<FlashRing> rings;
+    std::vector<int> region;   // session -> region
     FlashSlots(int sessions, int per_session, int first_session = 0)
         : per(per_session), first(first_session ? first_session : per_session), rings(size_t(sessions)) {
         if (sessions < 1 || per_session < 1 || first < per) throw std::runtime_error("Flash KDA slots: no sessions or slots");
+        for (int q = 0; q < sessions; ++q) region.push_back(q);
     }
     int sessions() const { return int(rings.size()); }
-    int base(int q) const { check(q); return q ? first + (q - 1) * per : 0; }
-    int width(int q) const { check(q); return q ? per : first; }
+    int base(int q) const { check(q); const int r = region[size_t(q)]; return r ? first + (r - 1) * per : 0; }
+    int width(int q) const { check(q); return region[size_t(q)] ? per : first; }
     int total() const { return first + (sessions() - 1) * per; }
+    // the session holding region 0
+    int wide() const { return int(std::find(region.begin(), region.end(), 0) - region.begin()); }
+    // session q takes region 0 and the session that held it, which must be retiring or free, takes q's region. The
+    // caller first copies q's slots [base(q), base(q) + width(q)) to [0, width(q)): q's ring positions are relative to
+    // its base, so its next step reads the same state. Returns the previous holder (q: no change)
+    int take_wide(int q) {
+        check(q);
+        const int o = wide();
+        std::swap(region[size_t(q)], region[size_t(o)]);
+        return o;
+    }
     // a new session on q (its slots are reset on the device at the same time)
     void reset(int q) { at(q).reset(); }
     // session q's n rows from position pos in a main step: each row's slot into kslot[0..n), the slot the first row

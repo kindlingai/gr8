@@ -1011,19 +1011,16 @@ int main(int argc, char** argv)
     // prefill a prefix-reuse hit cut into the drafter's window keeps the drafter (the rows the prefill taps, and the ring's
     // rows of the last DFlash2 session with the same tokens); 2 = also a session alone on MTP takes it. GR8_DFL_REUSE_MIN=
     // <rows> (0..2048, default 256): MTP rounds until the drafter holds that many context rows. Drafts only. In the S2
-    // runtime signature. GLM-5.3-Flash: 1 with GR8_GLM53F_CACHE (a checkpoint hit inside the drafter's window keeps the
-    // drafter, s2/flash_dfl_window.h), else 0: its serve without checkpoints has no hit to reuse, and mode 2's promotion
-    // is not measured there
+    // runtime signature. GLM-5.3-Flash without MTP: 1 with GR8_GLM53F_CACHE (a checkpoint hit inside the drafter's window
+    // keeps the drafter, s2/flash_dfl_window.h), else 0. A promoted Flash session takes the wide KDA ring at its first
+    // DFlash2 round (s2/flash_native.cuh widen)
 #if G6_MODEL_FLASH
-    const int dfl_reuse_unset = (dfl && s2mode && flash_cache != g6s2::FlashCache::Off) ? 1 : 0;
+    const int dfl_reuse_unset = (dfl && s2mode) ? (mtp ? 2 : flash_cache != g6s2::FlashCache::Off ? 1 : 0) : 0;
 #else
     const int dfl_reuse_unset = (dfl && s2mode && mtp) ? 2 : 0;
 #endif
     const int dfl_reuse = (int)knob::dfl_reuse().value_or(dfl_reuse_unset);
     if (dfl_reuse && !(dfl && s2mode)) die("GR8_DFL_REUSE needs --dflash-manifest and --serve");
-#if G6_MODEL_FLASH
-    if (dfl_reuse > 1) die("GR8_DFL_REUSE=2 on GLM-5.3-Flash: not measured (0 or 1)");
-#endif
     const int dfl_reuse_min = (int)knob::dfl_reuse_min();
     if (dfl_reuse_min > dfl::WIN) die("GR8_DFL_REUSE_MIN: 0.." + std::to_string(dfl::WIN) + " rows");
     // GR8_NGRAM=<file> (s2_batch.h NgramSrc, ngram_lookup.h; default off; S5, #56): the GLM-distilled n-gram table
@@ -1304,7 +1301,7 @@ int main(int argc, char** argv)
 #if G6_MODEL_FLASH
     if (mtp || dfl) m.kda_ring = std::max(mtp + 1, dfl ? dfl::B : 0);   // KDA state slots for the verify ring (DFlash2: B rows)
     if (s2mode) m.kda_sessions = s2sess;   // each S2 session its own ring (s2/flash_ring.h FlashSlots)
-    // only session 0 drafts with DFlash2 (dfl_ok), so only its ring is B wide; the others hold an MTP round
+    // one ring is B wide, for the session drafting with DFlash2 (FlashSlots::take_wide); the others hold an MTP round
     if (s2mode && mtp) m.kda_ring_rest = mtp + 1;
 #endif
 #if G6_MODEL_FLASH
@@ -2080,9 +2077,8 @@ int main(int argc, char** argv)
                 }
                 prefill(sl, p, first, rows);
             };
-            // session 0 alone has the DFlash2-wide KDA ring (FlashSlots first): a request alone on another session decodes
-            // on MTP
-            h.dispatch.dfl_ok = [&](int q) { return (q == 0 || m.kda_ring_rest >= dfl::B) && dwin.ok(q); };
+            // a session alone takes the DFlash2-wide KDA ring at its first round (s2/flash_native.cuh widen)
+            h.dispatch.dfl_ok = [&](int q) { return dwin.ok(q); };
             h.dispatch.dfl_start = [&](int q) {     // the prefill's taps -> the drafter's context ring, 8 rows a fill step
                 if (!dwin.fills(q)) return dwin.start(q);
                 for (int c0 = dwin.from; c0 < DF.pf_hi; c0 += dfl::B)
@@ -2122,7 +2118,8 @@ int main(int argc, char** argv)
             };
             if (R == 0) fprintf(stderr, "# flash serve: DFlash2 for a session alone (k <= %d)%s%s\n", dfl_k,
                                 h.dsel.on ? ", drafter choice on" : "",
-                                dfl_reuse ? (", checkpoint hits keep the drafter (GR8_DFL_REUSE 1, warm-up " + std::to_string(dfl_reuse_min) +
+                                dfl_reuse ? (", checkpoint hits keep the drafter" + std::string(dfl_reuse > 1 ? ", a session alone on MTP takes it" : "") +
+                                             " (GR8_DFL_REUSE " + std::to_string(dfl_reuse) + ", warm-up " + std::to_string(dfl_reuse_min) +
                                              " context rows)").c_str() : "");
         };
         // GR8_GLM53F_KV_CHUNKS=1 (borrow-idle): hooks serve_flash adds to its own before the service starts

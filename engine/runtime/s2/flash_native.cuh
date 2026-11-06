@@ -256,6 +256,20 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     auto key = [](char kind, int M, int bucket) { return kind + std::to_string(M) + ":b" + std::to_string(bucket); };
     S2In *layout = nullptr, *draft_layout = nullptr;
     const S2In *old_layout = nullptr, *old_draft_layout = nullptr;
+    // A session that verifies more rows than its region holds takes the wide region (FlashSlots::take_wide): DFlash2 for
+    // a request admitted alone on a narrow region, or promoted there (GR8_DFL_REUSE=2). A session verifies that many
+    // rows only while it is alone (Batch::demote moves it to MTP when a second session arrives), so the previous holder
+    // is retiring or free, and h.before_work took its pending checkpoint at the boundary
+    auto widen = [&](const s2::Step& sp, const std::vector<int>& events) {
+        for (size_t j = 0; j < sp.sess.size(); ++j) {
+            const int q = int(sp.sess[j]);
+            if (events[j] == s2::Step::TAIL || int(sp.rows[j]) <= ks.width(q)) continue;
+            require(sp.sess.size() == 1, "Flash KDA: a verify wider than its session's ring in a shared step");
+            if (c.main.kda_st.S) G6RT_CK(kda::copy(c.main.kda_st, 0, ks.base(q), ks.width(q), c.stream));
+            const int o = ks.take_wide(q);
+            fprintf(stderr, "# flash KDA: session %d takes the wide ring from session %d\n", q, o);
+        }
+    };
     h.dispatch.launch = [&](const Launch& l) {
         const bool d = l.step.kind != s2::Step::MAIN, chain = l.step.kind == s2::Step::CHAIN;
         require(multi ? l.solo < 0 || l.step.sess.size() == 1 : l.solo == 0 && l.step.sess.size() == 1,
@@ -286,6 +300,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             wrote_step(si);
             if (!g) c.draft_graph(l.buckets[0], chain, si.M);
         } else {
+            widen(l.step, l.events);
             ks.step(si, l.step, l.events, s2::Step::TAIL);
             *c.input = si;
             std::vector<uint32_t> sizes(c.main.ncoll(), uint32_t(si.M * HID * 2));

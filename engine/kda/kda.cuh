@@ -4,6 +4,7 @@
 //   kda::build_state / build_scratch      build: fp32 state S [N_KDA][slots][nhmax][128][128] + conv history
 //                                         [N_KDA][slots][3][3][nhmax*128]; scratch for `rows` rows
 //   kda::reset(state, slot, st)           zero one slot's state, every KDA layer (session start)
+//   kda::copy(state, dst, src, n, st)     slots [src, src + n) to [dst, dst + n), disjoint ranges, every KDA layer
 //   kda::launch(w, state, scratch, xb, row_slot, M, partial, st)
 //       xb: BF16 fragment table of the fp32 block input (K = HID); row_slot: device [M]; partial: BF16 [M][HID], this
 //       rank's heads through its o_proj shard. Rows of one slot must be consecutive and in position order.
@@ -374,6 +375,16 @@ __global__ void k_kda_reset(float* S, float* conv, size_t s_layer, size_t c_laye
 inline void reset(const KdaState& s, int slot, cudaStream_t st)
 {
     k_kda_reset<<<dim3(32, N_KDA), 256, 0, st>>>(s.S, s.conv, s.s_layer(), s.c_layer(), s.s_layer() / s.slots, s.c_layer() / s.slots, slot);
+}
+
+inline cudaError_t copy(const KdaState& s, int dst, int src, int n, cudaStream_t st)
+{
+    const size_t ss = s.s_layer() / s.slots, cs = s.c_layer() / s.slots;
+    cudaError_t e = cudaMemcpy2DAsync(s.S + dst * ss, s.s_layer() * sizeof(float), s.S + src * ss, s.s_layer() * sizeof(float),
+                                      n * ss * sizeof(float), N_KDA, cudaMemcpyDeviceToDevice, st);
+    if (e != cudaSuccess) return e;
+    return cudaMemcpy2DAsync(s.conv + dst * cs, s.c_layer() * sizeof(float), s.conv + src * cs, s.c_layer() * sizeof(float),
+                             n * cs * sizeof(float), N_KDA, cudaMemcpyDeviceToDevice, st);
 }
 
 inline Args make_args(const KdaLayer& w, const KdaState& s, const KdaScratch& sc, const int* row_slot, int M)
