@@ -42,7 +42,7 @@ once · recipes coming soon. Until then, start it on three to six boxes with Doc
 
 142.9 tok/s for one request writing code · 3,655 tok/s prefill on an 8K prompt · 32 requests at once (the recipe's
 setting) · fast mode by default (`TUNE=speed`), so the output is not identical to the exact model's; `TUNE=quality`
-gives the exact model's output · not yet booted on four boxes
+gives the exact model's output · booted on four boxes from the recipe's image: ready in 104 s
 
 **[Recipe](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)** · [Model page](docs/DEEPSEEK.md)
 
@@ -101,9 +101,10 @@ setting, and has bare metal and Kubernetes. An agent that starts gr8 for someone
 
 **DeepSeek-V4.1-Flash** (four boxes): the recipe
 [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)
-is the quickest way: the same image on every box, in fast mode by default. We have not yet booted that image on four
-boxes. [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is the boot with gr8's own launcher, which gives exact output by
-default, in order, from the four boxes to a passing `./gr8 ds41 smoke`.
+is the quickest way: the same image on every box, in fast mode by default. We booted that image on four boxes on
+2026-11-06: ready in 104 s, smoke test 11 of 11, 72 of 75 on the 75-item check.
+[docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is the boot with gr8's own launcher, which gives exact output by default,
+in order, from the four boxes to a passing `./gr8 ds41 smoke`.
 
 ### With model-loader
 
