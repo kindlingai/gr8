@@ -52,16 +52,17 @@ reserves each request's `prompt + max_tokens` pages from the pool, so with sever
 `CAP=1048640 MAX_MODEL_LEN=262144` holds four full-length requests at once, or more shorter ones.
 
 Only the attention layers keep KV: the 11 DSA layers and the MTP layer, 12 bindings a rank. KDA's state is the same size
-at any context. A token costs each of them a 1,024 B bf16 latent row and 640 B of indexer keys (`engine/attn/kvfmt.h`;
-a build with `-DG6_FLASH_KV_FP8=1` makes the row 528 B, the int4 build below 288 B), 19,968 B in all (11,136 B with
-int4). Flash has no CP, so every rank holds the whole context and
-the cost is the same at TP=4 and TP=2:
+at any context. A token costs each of them a 1,024 B bf16 latent row and 128 B of pooled indexer keys
+(`engine/attn/kvfmt.h`; a build with `-DG6_FLASH_KV_FP8=1` makes the row 528 B, the int4 build below 288 B), 13,824 B
+in all (4,992 B with int4). A token's raw indexer row (512 B) feeds only the pool of 4 it belongs to, so it is not in
+the pages: the pool reads it from its own call, or from the binding's raw ring of the last 64 positions of each session
+(256 KB a binding). Flash has no CP, so every rank holds the whole context and the cost is the same at TP=4 and TP=2:
 
-| CAP | pages of 64 | KV a rank |
-|---|---|---|
-| 33,280 (the old default) | 520 | 0.66 GB |
-| 262,208 | 4,097 | 5.24 GB |
-| 1,048,640 | 16,385 | 20.9 GB |
+| CAP | pages of 64 | KV a rank | with int4 |
+|---|---|---|---|
+| 33,280 (the old default) | 520 | 0.46 GB | 0.17 GB |
+| 262,208 | 4,097 | 3.62 GB | 1.31 GB |
+| 1,048,640 | 16,385 | 14.50 GB | 5.23 GB |
 
 The indexer's score scratch holds one key tile per row: a call whose context passes 16,384 pools (64K tokens) scores
 the pools in tiles of that size and keeps a running top-512 (`kp_select_tile` in `engine/attn/kpool.cuh`, the same
@@ -97,10 +98,23 @@ RDMA checks. The router is not split (no ranks to split it over), so the routed 
 session alone drafts with the DFlash2 drafter when the boot names one (`--drafter`): its body is whole on the one rank,
 about 1.3 GB, and the supervisor converts it for the rank on the first boot.
 
+Memory on one GB10 with the K2 release, int4 KV, `--sess 4`, the DFlash2 drafter and aligned checkpoints on an SSD
+store with a spare-RAM cache (`--pf-lanes 1`), MemAvailable at boot and the lowest under a long prompt:
+
+| CAP | boot | lowest | prompt |
+|---|---|---|---|
+| 262,208 | 6.8 GiB | 6.3 GiB | 240K |
+| 700,032 | 4.8 GiB | 4.5 GiB | 640K: TTFT 863 s (760 tok/s) |
+| 1,048,640 | 2.9 GiB | 2.3 GiB | 900K: TTFT 1,361 s (677 tok/s), then 14.5 tok/s decode; cached TTFT 10.5 s |
+
+At 1,048,640 the boot's headroom checks after the prefill lane come to about 5.5 and 4.8 GiB, so it needs
+`GR8_MEM_MIN=4` (the others pass at 6).
+
 ## int4 KV (`--kv-format int4`, experimental)
 
 `bin/g6m4_flash-int4` (`KV_FORMAT=int4 MODEL=flash scripts/build.sh`, `-DG6_KV4=1`) stores the latent in 4 bits: 256 B
-of codes and one FP16 scale per 32 dims (amax / 7), 288 B a row against bf16's 1,024. The indexer keys are unchanged.
+of codes and one FP16 scale per 32 dims (amax / 7), 288 B a row against bf16's 1,024. The pooled indexer keys are
+unchanged.
 There is no rotation: Flash's latent is NoPE, and every read dequantizes in place (`latent`, `lat4`, `stage_cvt8` in
 `engine/attn/flash_attn.cu`). `--kv-format int4` makes the launcher run it and pass the flag, which the build requires.
 
@@ -154,9 +168,10 @@ index, the aligned point, the manifest) and `flash_checkpoint.cuh` (the store), 
 
 - The grid is the prefill quantum: `--prefill` rows times the lanes, 4,096 x 2 = 8,192 rows. A prompt of N tokens keeps
   a checkpoint at `p = floor((N - 1) / 8192) * 8192`, so prompts of 8,192 tokens or fewer keep none.
-- A checkpoint holds rows `[0, p)` of the 12 attention bindings (the latent rows and the indexer keys), the session's
-  first KDA slot's state and conv history, and the prompt's tokens `[0, p]`. A later prompt hits it when it starts with
-  those `p + 1` tokens under the same cache namespace (the steering profile); the longest entry wins, then the newest.
+- A checkpoint holds rows `[0, p)` of the 12 attention bindings (the latent rows and the pooled indexer keys), the
+  session's first KDA slot's state and conv history, its raw index rings, and the prompt's tokens `[0, p]`. A later
+  prompt hits it when it starts with those `p + 1` tokens under the same cache namespace (the steering profile); the
+  longest entry wins, then the newest.
 - A hit restores the checkpoint at bind, after the cold reset, and prefills from `p`.
 - With several sessions (`SESS` 2 to 8) each session keeps and restores its own: the rows are the session's run's
   pages in order (its logical pages, wherever the pool put them), and the KDA state is its first slot (`FlashSlots`).
@@ -218,7 +233,9 @@ The store: the one `KV_STORE` (`--kv-store`; `mem:`, `ssd:PATH` or `remote:HOST:
 Then the index is written beside the blocks after every capture and resize (`flash-ckpt.index`), and each entry's tokens
 once, in `flash-ckpt.tokens/<generation>`. Every file is written to a temporary name, synced, renamed and its folder
 synced. A boot with the same compat line (model set, TP, rank, CAP, layout, engine build) and store size reads the
-index, and a helper thread checks every entry's stored manifest, pages and KDA state against the manifest's checksums.
+index, and a helper thread checks every entry's stored manifest, pages and state (the KDA state, then the raw index
+rings) against the manifest's checksums. An entry sealed by another entry format (`FlashManifest::FORMAT`; 2 since the
+raw index rows left the pages) is dropped.
 The blocks of an entry are not synced before the index names it, so after a power loss the index can name an entry whose
 blocks never reached the disk: the checks drop it, so the boot loses the entry, never serves its bytes.
 On a GB10's SSD the checks run at about 6 GiB/s, as fast as reading the store alone, so a full 64 GiB store takes
