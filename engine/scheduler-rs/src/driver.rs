@@ -1,11 +1,17 @@
 //! The S2 driver (s2/driver.h `g6s2::Driver` is its C++ facade): it applies commits, grows runs before a round, picks
-//! the capped rounds past R, runs one scheduler quantum on the planner and reports completions. It owns the per-slot
-//! emitted counts, the initialised flags, what it reads of each payload and the capped-round cycle. The scheduler's
-//! state is still held by the C++ `Scheduler` and passed in per call. The planner is reached through the C++
-//! `s2::Batch`, which writes the round log.
+//! the capped rounds past R, runs one scheduler quantum on the planner and reports completions. It owns the
+//! scheduler's state (config, slots, counters), the per-slot emitted counts, the initialised flags, what it reads of
+//! each payload and the capped-round cycle. The C++ reads the slots and counters through one view
+//! (`g6s2_driver_view`). The planner is reached through the C++ `s2::Batch`, which writes the round log.
 //!
-//! Hooks may read the driver back (the service's retire reads a slot's emitted tokens), so every field is a `Cell`
-//! and every method takes `&self`; apply and step refuse to be entered again from a hook.
+//! Given the rank's pool, the driver makes the pure pool calls itself (`CPool`): growth before a round, a worker's
+//! half of a shrink commit, and a leaving session's release when nothing is retained. Each locks the pool for that call
+//! only, and no hook runs while it is held. Binds, retains, parks and tier resizes stay in the engine's hooks, which
+//! wrap their pool calls in model work.
+//!
+//! Hooks may read the driver back (the service's retire reads a slot's emitted tokens, the view's slots), so every
+//! field is a `Cell` or behind an `UnsafeCell` and every method takes `&self`; apply and step refuse to be entered
+//! again from a hook.
 #![allow(clippy::missing_safety_doc)]
 
 use crate::cp_rows::{self, Cand};
@@ -13,17 +19,18 @@ use crate::scheduler::{
     self as sch, Commit, Completion, Config, Grant, Key, Quantum, Run, Shrink, Slot, State, DECODE, FREE, K_DECODE,
     K_PREFILL, PARKED, PREFILL, PREFILL_PACK, PROMPT_TAIL, PROMPT_TAIL_PACK, QMAX, RETIRING,
 };
-use std::cell::{Cell, RefCell};
+use g6kvman::ffi::Handle;
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::ffi::{c_char, c_void};
 use std::io::Write;
 
-/// g6s2_drv_sched: the scheduler's state, which the C++ `Scheduler` holds
+/// g6s2_drv_view: the scheduler's slots (n of them) and counters, as the driver holds them; valid while the driver
+/// lives
 #[repr(C)]
-pub struct CSched {
-    pub c: *const Config,
-    pub s: *mut Slot,
+pub struct CView {
+    pub s: *const Slot,
     pub n: usize,
-    pub st: *mut State,
+    pub st: *const State,
 }
 
 /// g6s2_drv_payload: what the driver reads of an admitted request's payload. steering_ok: its steering equals the
@@ -35,6 +42,19 @@ pub struct CPayload {
     pub chunk: i32,
     pub decode_prompt: bool,
     pub steering_ok: bool,
+}
+
+/// g6s2_drv_pool: the pool calls the driver makes itself on the pool passed to g6s2_driver_new. grow: runs grow before
+/// a round (then the grown hook, required). shrink: a worker's half of a shrink commit, before the shrink hook.
+/// release: a leaving session's run goes back to the pool (no prefix reuse; retain and park stay in the hooks). head:
+/// this rank made the commit's cancel and shrink calls when it built the commit, so the driver skips them
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CPool {
+    pub grow: bool,
+    pub shrink: bool,
+    pub release: bool,
+    pub head: bool,
 }
 
 /// bind(grant)
@@ -57,10 +77,13 @@ pub type VoidFn = unsafe extern "C" fn(*mut c_void) -> i32;
 pub type ShrinkFn = unsafe extern "C" fn(*mut c_void, *const Shrink, *const Run, u64) -> i32;
 /// payload(slot, set)
 pub type PayloadFn = unsafe extern "C" fn(*mut c_void, u32, bool) -> i32;
+/// grown(slot as it was, its new run)
+pub type GrownFn = unsafe extern "C" fn(*mut c_void, *const Slot, *const Run) -> i32;
 
 /// g6s2_drv_hooks: the engine's callbacks (s2/driver.h DriverHooks less the planner's). Each returns 0, or nonzero
 /// when the C++ hook threw. has_*: the C++ member is set. payload: the C++ copies apply's payload into the slot (set)
-/// or clears it
+/// or clears it. grow decides growth itself; with the driver's own pool growth (CPool::grow), grown follows a run
+/// that grew
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CHooks {
@@ -77,6 +100,7 @@ pub struct CHooks {
     pub shrink: Option<ShrinkFn>,
     pub settle: Option<VoidFn>,
     pub payload: Option<PayloadFn>,
+    pub grown: Option<GrownFn>,
     pub has_prefill_pack: bool,
     pub has_dfl_ok: bool,
     pub has_terminal: bool,
@@ -85,6 +109,7 @@ pub struct CHooks {
     pub has_resize: bool,
     pub has_shrink: bool,
     pub has_settle: bool,
+    pub has_grown: bool,
 }
 
 /// admit(slot, first, n_gen, dfl)
@@ -146,11 +171,31 @@ fn missing() -> Stop {
 fn sch_err(e: sch::Err) -> Stop {
     Stop::Refused(e)
 }
+fn pool_err(e: g6kvman::Error) -> Stop {
+    Stop::Refused(e.message().to_str().unwrap_or("pool error"))
+}
+fn kv(r: &Run) -> g6kvman::Run {
+    g6kvman::Run { first_page: r.first_page, pages: r.pages, table_version: r.table_version, list_hash: r.list_hash }
+}
+fn run_of(r: &g6kvman::Run) -> Run {
+    Run { first_page: r.first_page, pages: r.pages, table_version: r.table_version, list_hash: r.list_hash }
+}
 
-/// One driver: its hooks and the per-slot state it keeps between calls.
+/// the scheduler's state; the C++ view points into it
+struct Sched {
+    c: Config,
+    s: [Slot; QMAX],
+    n: usize,
+    st: State,
+}
+
+/// One driver: its hooks, the scheduler's state and the per-slot state it keeps between calls.
 pub struct Driver {
     h: CHooks,
     p: CPlanner,
+    pool: *const Handle,
+    u: CPool,
+    sch: UnsafeCell<Sched>,
     emitted: [Cell<u32>; QMAX],
     initialized: [Cell<bool>; QMAX],
     prompt_len: [Cell<usize>; QMAX],
@@ -164,7 +209,7 @@ pub struct Driver {
 }
 
 /// the scheduler's state for one call; slices are formed only around scheduler calls, since hooks read the slots
-pub(crate) struct S {
+struct S {
     c: *const Config,
     s: *mut Slot,
     n: usize,
@@ -209,14 +254,36 @@ impl std::fmt::Write for Line {
 }
 
 impl Driver {
-    /// A driver over these hooks; None when a required one (bind, retire, prefill, payload) is missing.
-    pub fn new(h: CHooks, p: CPlanner) -> Option<Driver> {
-        if h.bind.is_none() || h.retire.is_none() || h.prefill.is_none() || h.payload.is_none() {
+    /// A driver over these hooks with `n` slots, each `empty` (the C++ default slot) before `init` keys it, making
+    /// the pool calls `u` names on `pool`, which must outlive it. None when a required hook (bind, retire, prefill,
+    /// payload) is missing, n is not in 1..=QMAX, `u` names a call without a pool, or both the grow hook and the
+    /// driver would grow runs.
+    pub fn new(
+        h: CHooks,
+        p: CPlanner,
+        c: Config,
+        n: usize,
+        empty: Slot,
+        pool: *const Handle,
+        u: CPool,
+    ) -> Option<Driver> {
+        if h.bind.is_none() || h.retire.is_none() || h.prefill.is_none() || h.payload.is_none() || n == 0 || n > QMAX {
             return None;
         }
+        if ((u.grow || u.shrink || u.release) && pool.is_null()) || (u.grow && (h.has_grow || !h.has_grown)) {
+            return None;
+        }
+        let mut s = [empty; QMAX];
+        sch::init(&c, &mut s[..n]);
+        // SAFETY: State is integers and bools; all zero is the C++ value-initialised state
+        let mut st: State = unsafe { std::mem::zeroed() };
+        st.want_decode = true;
         Some(Driver {
             h,
             p,
+            pool,
+            u,
+            sch: UnsafeCell::new(Sched { c, s, n, st }),
             emitted: Default::default(),
             initialized: Default::default(),
             prompt_len: Default::default(),
@@ -228,6 +295,22 @@ impl Driver {
             busy: Cell::new(false),
             err: Cell::new(""),
         })
+    }
+
+    fn s(&self) -> S {
+        let x = self.sch.get();
+        // SAFETY: field addresses only; S forms references for the length of one scheduler call
+        unsafe { S { c: &raw const (*x).c, s: (&raw mut (*x).s).cast(), n: (*x).n, st: &raw mut (*x).st } }
+    }
+
+    /// the pool for one call; the guard must not outlive the statement that calls the pool
+    fn pool(&self) -> Res<std::sync::MutexGuard<'_, g6kvman::Pool>> {
+        require(!self.pool.is_null(), "s2: the driver has no pool")?;
+        // SAFETY: the caller of new() keeps the pool alive while the driver lives
+        Ok(unsafe { &*self.pool }.lock())
+    }
+    fn release(&self, r: &Run) -> Res<()> {
+        self.pool()?.release(&kv(r)).map_err(pool_err)
     }
 
     fn enter(&self) -> Res<Busy<'_>> {
@@ -277,15 +360,9 @@ impl Driver {
     /// Driver::apply: validate the payload, apply the commit to the scheduler, then the hooks it implies. `digest` is
     /// the scheduler's digest before it. Refusals before the scheduler changes leave it as it was; a failure after it
     /// fails the scheduler.
-    pub(crate) fn apply(
-        &self,
-        s: &S,
-        e: &Commit,
-        digest: u64,
-        resize: bool,
-        pay: Option<&CPayload>,
-    ) -> Res<sch::Changes> {
+    pub fn apply(&self, e: &Commit, digest: u64, resize: bool, pay: Option<&CPayload>) -> Res<sch::Changes> {
         let _b = self.enter()?;
+        let s = &self.s();
         if e.has_admit {
             let r = &e.admit.req;
             let p = pay.filter(|p| p.prompt_len == r.prompt_tokens as usize && p.chunk > 0 && p.steering_ok);
@@ -316,6 +393,11 @@ impl Driver {
             {
                 continue;
             }
+            // a cancelled live session's run; the head gave it back when it built the commit, and a finished one went
+            // back at its step
+            if self.u.release && !self.u.head && old.phase != RETIRING {
+                self.release(&old.run)?;
+            }
             // SAFETY: the facade's trampoline; old outlives the call
             ok(unsafe { self.h.retire.ok_or_else(missing)?(self.h.ctx, old) })?;
             if self.initialized[i].get() {
@@ -331,10 +413,15 @@ impl Driver {
             require(self.h.has_shrink, "a shrink commit without the shrink hook")?;
             let k = e.shrink.key.slot;
             let len = self.length(k)?;
+            let was = &before[k as usize].run;
+            if !self.u.head {
+                // the head's change, on the same pool state (a worker without the pool's shrink refuses)
+                require(self.u.shrink, "a shrink commit without the pool's shrink")?;
+                let r = self.pool()?.shrink_run(&kv(was), e.shrink.r_rows).map_err(pool_err)?;
+                require(run_of(&r) == e.shrink.run, "worker shrink differs from the head's")?;
+            }
             // SAFETY: as retire
-            ok(unsafe {
-                self.h.shrink.ok_or_else(missing)?(self.h.ctx, &e.shrink, &before[k as usize].run, len as u64)
-            })?;
+            ok(unsafe { self.h.shrink.ok_or_else(missing)?(self.h.ctx, &e.shrink, was, len as u64) })?;
         }
         if e.has_admit {
             let (g, p) = (&e.admit, pay.expect("validated"));
@@ -357,8 +444,9 @@ impl Driver {
     }
 
     /// Driver::step: grow, pick the capped round, take the scheduler's next quantum and run it.
-    pub(crate) fn step(&self, s: &S, out: &mut Quantum) -> Res<()> {
+    pub fn step(&self, out: &mut Quantum) -> Res<()> {
         let _b = self.enter()?;
+        let s = &self.s();
         let mut stalled = [false; QMAX];
         if let Err(e) = self.grow(s, &mut stalled) {
             s.fail();
@@ -438,19 +526,31 @@ impl Driver {
     }
 
     fn grow(&self, s: &S, stalled: &mut [bool; QMAX]) -> Res<()> {
-        if self.h.has_grow {
+        if self.h.has_grow || self.u.grow {
             let mut keys = [Key::default(); QMAX];
             let nd = sch::decoding_into(s.slots(), &mut keys);
             for k in &keys[..nd] {
                 let x = s.slot(k.slot as usize);
                 let rows = sch::round_rows(s.c(), self.length(k.slot)? as u64);
-                let (mut r, mut some) = (Run::default(), false);
-                // SAFETY: the facade's trampoline; x outlives the call
-                ok(unsafe { self.h.grow.ok_or_else(missing)?(self.h.ctx, &x, rows, &mut r, &mut some) })?;
-                if !some {
-                    stalled[k.slot as usize] = true;
-                } else if r != x.run {
-                    s.with(|c, sl, st| sch::grow(c, sl, st, k, &r)).map_err(sch_err)?;
+                let got = if self.h.has_grow {
+                    let (mut r, mut some) = (Run::default(), false);
+                    // SAFETY: the facade's trampoline; x outlives the call
+                    ok(unsafe { self.h.grow.ok_or_else(missing)?(self.h.ctx, &x, rows, &mut r, &mut some) })?;
+                    some.then_some(r)
+                } else {
+                    let g = self.pool()?.grow(&kv(&x.run), rows).map_err(pool_err)?;
+                    g.map(|r| run_of(&r))
+                };
+                match got {
+                    None => stalled[k.slot as usize] = true,
+                    Some(r) if r != x.run => {
+                        if !self.h.has_grow {
+                            // SAFETY: as above; r outlives the call
+                            ok(unsafe { self.h.grown.ok_or_else(missing)?(self.h.ctx, &x, &r) })?;
+                        }
+                        s.with(|c, sl, st| sch::grow(c, sl, st, k, &r)).map_err(sch_err)?;
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -567,12 +667,29 @@ impl Driver {
                     // SAFETY: as prefill
                     ok(unsafe { self.h.terminal.ok_or_else(missing)?(self.h.ctx, k) })?;
                 }
+                // its pages go back now, on every rank, so the sessions still decoding can grow before the next event
+                if self.u.release {
+                    self.release(&x.run)?;
+                }
                 if self.h.has_finished {
                     // SAFETY: as prefill
                     ok(unsafe { self.h.finished.ok_or_else(missing)?(self.h.ctx, &x) })?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Scheduler::idle_boundary: an event-only boundary, no model work.
+    pub fn idle_boundary(&self, target: u64) -> Res<()> {
+        let _b = self.enter()?;
+        self.s().with(|_, sl, st| sch::idle_boundary(sl, st, target)).map_err(sch_err)
+    }
+
+    /// The pool's digest at this event boundary, folded into the scheduler's.
+    pub fn pool_digest(&self, d: u64) -> Res<()> {
+        let _b = self.enter()?;
+        self.s().with(|_, _, st| st.pool = d);
         Ok(())
     }
 
@@ -608,16 +725,19 @@ fn rc(d: &Driver, r: Res<()>) -> i32 {
         }
     }
 }
-fn sched(p: *const CSched) -> S {
-    // SAFETY: the caller's struct, valid during the call
-    let x = unsafe { &*p };
-    S { c: x.c, s: x.s, n: x.n.min(QMAX), st: x.st }
-}
-
-/// a new driver, or null when bind, retire, prefill or payload is missing
+/// a new driver with `n` slots over the scheduler config `c`, each slot `empty` (the C++ default) before it is keyed,
+/// making the pool calls `u` names on `pool` (null: none; it must outlive the driver). Null as Driver::new refuses
 #[no_mangle]
-pub unsafe extern "C" fn g6s2_driver_new(h: *const CHooks, p: *const CPlanner) -> *mut Driver {
-    match Driver::new(*h, *p) {
+pub unsafe extern "C" fn g6s2_driver_new(
+    h: *const CHooks,
+    p: *const CPlanner,
+    c: *const Config,
+    n: usize,
+    empty: *const Slot,
+    pool: *const Handle,
+    u: *const CPool,
+) -> *mut Driver {
+    match Driver::new(*h, *p, *c, n, *empty, pool, *u) {
         Some(d) => Box::into_raw(Box::new(d)),
         None => std::ptr::null_mut(),
     }
@@ -636,11 +756,17 @@ pub unsafe extern "C" fn g6s2_driver_error(d: *const Driver) -> *const c_char {
     crate::ffi::msg((*d).err.get())
 }
 
-/// Driver::apply. pay: null without an admit. freed: room for the scheduler's slot count
+/// the scheduler's slots and counters, where the driver keeps them for its life
+#[no_mangle]
+pub unsafe extern "C" fn g6s2_driver_view(d: *const Driver, out: *mut CView) {
+    let s = (*d).s();
+    *out = CView { s: s.s, n: s.n, st: s.st };
+}
+
+/// Driver::apply. pay: null without an admit. freed: room for the driver's slot count
 #[no_mangle]
 pub unsafe extern "C" fn g6s2_driver_apply(
     d: *const Driver,
-    s: *const CSched,
     e: *const Commit,
     digest: u64,
     resize: bool,
@@ -650,9 +776,9 @@ pub unsafe extern "C" fn g6s2_driver_apply(
     admitted: *mut bool,
 ) -> i32 {
     let d = &*d;
-    let s = sched(s);
-    let r = d.apply(&s, &*e, digest, resize, pay.as_ref()).map(|c| {
-        let n = c.freed.len().min(s.n);
+    let n_slots = d.s().n;
+    let r = d.apply(&*e, digest, resize, pay.as_ref()).map(|c| {
+        let n = c.freed.len().min(n_slots);
         std::slice::from_raw_parts_mut(freed, n).copy_from_slice(&c.freed[..n]);
         *n_freed = n;
         *admitted = c.admitted;
@@ -662,10 +788,30 @@ pub unsafe extern "C" fn g6s2_driver_apply(
 
 /// Driver::step: the quantum it ran in *out
 #[no_mangle]
-pub unsafe extern "C" fn g6s2_driver_step(d: *const Driver, s: *const CSched, out: *mut Quantum) -> i32 {
+pub unsafe extern "C" fn g6s2_driver_step(d: *const Driver, out: *mut Quantum) -> i32 {
     let d = &*d;
-    let r = d.step(&sched(s), &mut *out);
+    let r = d.step(&mut *out);
     rc(d, r)
+}
+
+/// fails the scheduler: no later commit or step runs
+#[no_mangle]
+pub unsafe extern "C" fn g6s2_driver_fail(d: *const Driver) {
+    (*d).s().fail();
+}
+
+/// Scheduler::idle_boundary
+#[no_mangle]
+pub unsafe extern "C" fn g6s2_driver_idle_boundary(d: *const Driver, target: u64) -> i32 {
+    let d = &*d;
+    rc(d, d.idle_boundary(target))
+}
+
+/// the pool's digest at this event boundary (Scheduler::pool_digest)
+#[no_mangle]
+pub unsafe extern "C" fn g6s2_driver_pool_digest(d: *const Driver, v: u64) -> i32 {
+    let d = &*d;
+    rc(d, d.pool_digest(v))
 }
 
 /// the emit hook's accounting (Driver::emit); a slot out of range is refused
@@ -735,7 +881,9 @@ mod tests {
     fn emit_accounting() {
         let h: CHooks = unsafe { std::mem::zeroed() };
         let p: CPlanner = unsafe { std::mem::zeroed() };
-        assert!(Driver::new(h, p).is_none());
+        let c: Config = unsafe { std::mem::zeroed() };
+        let e = slot(0, 0, FREE);
+        assert!(Driver::new(h, p, c, 8, e, std::ptr::null(), CPool::default()).is_none());
         extern "C" fn nop_b(_: *mut c_void, _: *const Grant) -> i32 {
             0
         }
@@ -749,7 +897,9 @@ mod tests {
             0
         }
         let h = CHooks { bind: Some(nop_b), retire: Some(nop_s), prefill: Some(nop_p), payload: Some(nop_y), ..h };
-        let d = Driver::new(h, p).unwrap();
+        assert!(Driver::new(h, p, c, 0, e, std::ptr::null(), CPool::default()).is_none());
+        assert!(Driver::new(h, p, c, QMAX + 1, e, std::ptr::null(), CPool::default()).is_none());
+        let d = Driver::new(h, p, c, 8, e, std::ptr::null(), CPool::default()).unwrap();
         assert_eq!(d.emit(1, 3, 3, false, 5), Ok(false));
         assert_eq!(d.emit(1, 3, 2, false, 5), Err(Stop::Refused("partial emission without stop")));
         assert_eq!(d.emit(1, 3, 3, false, 5), Err(Stop::Refused("bad emitter count")));
@@ -818,16 +968,6 @@ mod tests {
         c.notice_max = 8;
         c.cp_step_rows = 6; // three sessions past R: capped rounds of two
         c.cp_after = 0;
-        let mut sl = [slot(0, 0, FREE); 8];
-        sch::init(&c, &mut sl);
-        for (n, i) in [0usize, 2, 5].into_iter().enumerate() {
-            sl[i].key.epoch = 1;
-            sl[i].phase = DECODE;
-            sl[i].req.id = 10 + n as u64;
-            sl[i].req.max_tokens = 1_000_000;
-        }
-        let mut st: State = unsafe { std::mem::zeroed() };
-        st.want_decode = true;
         let mut rounds = 0u64;
         let z: CHooks = unsafe { std::mem::zeroed() };
         let h = CHooks {
@@ -852,24 +992,269 @@ mod tests {
             active: Some(yes_),
             inserted: Some(zero_),
         };
-        let d = Driver::new(h, p).unwrap();
+        let d = Driver::new(h, p, c, 8, slot(0, 0, FREE), std::ptr::null(), CPool::default()).unwrap();
+        d.s().with(|_, sl, _| {
+            for (n, i) in [0usize, 2, 5].into_iter().enumerate() {
+                sl[i].key.epoch = 1;
+                sl[i].phase = DECODE;
+                sl[i].req.id = 10 + n as u64;
+                sl[i].req.max_tokens = 1_000_000;
+            }
+        });
         for i in [0, 2, 5] {
             d.initialized[i].set(true);
         }
-        let s = S { c: &c, s: sl.as_mut_ptr(), n: 8, st: &mut st };
         let mut q = Quantum::default();
         for _ in 0..10 {
-            d.step(&s, &mut q).unwrap();
+            d.step(&mut q).unwrap();
         }
         ALLOCS.with(|a| a.set(0));
         COUNTING.with(|x| x.set(true));
         for _ in 0..500 {
-            d.step(&s, &mut q).unwrap();
+            d.step(&mut q).unwrap();
         }
         COUNTING.with(|x| x.set(false));
         assert_eq!(ALLOCS.with(|a| a.get()), 0);
         assert_eq!(rounds, 510);
         assert_eq!(q.kind, K_DECODE);
         assert_eq!(d.cp_rounds.get(), 510);
+    }
+
+    // the driver's own pool growth: a fake planner whose sessions grow by `step` rows a round
+    unsafe extern "C" fn len_grow(c: *mut c_void, _: i32, out: *mut i32) -> i32 {
+        let t = &*(c as *const PoolTest);
+        *out = t.len.get();
+        0
+    }
+    unsafe extern "C" fn round_grow(c: *mut c_void, _: *const i32, _: u32, ran: *mut bool) -> i32 {
+        let t = &*(c as *const PoolTest);
+        t.len.set(t.len.get() + t.step);
+        *ran = true;
+        0
+    }
+    // grown: counts, and checks that another thread can take the pool meanwhile (the driver holds no lock here)
+    unsafe extern "C" fn grown_(c: *mut c_void, s: *const Slot, r: *const Run) -> i32 {
+        let t = &*(c as *const PoolTest);
+        assert!((*r).pages > (*s).run.pages && (*r).table_version == (*s).run.table_version);
+        t.grown.set(t.grown.get() + 1);
+        let pool = t.pool as usize;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let p = unsafe { &*(pool as *const Handle) };
+            tx.send(p.lock().stats().live_runs).ok();
+        });
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)), Ok(3));
+        0
+    }
+    struct PoolTest {
+        len: Cell<i32>,
+        step: i32,
+        grown: Cell<u32>,
+        pool: *const Handle,
+    }
+
+    fn pool_driver(t: &PoolTest, c: Config, u: CPool) -> Driver {
+        let z: CHooks = unsafe { std::mem::zeroed() };
+        let h = CHooks {
+            ctx: t as *const PoolTest as *mut c_void,
+            bind: Some(b_),
+            retire: Some(s_),
+            prefill: Some(p_),
+            payload: Some(y_),
+            grown: Some(grown_),
+            has_grown: true,
+            ..z
+        };
+        let p = CPlanner {
+            ctx: t as *const PoolTest as *mut c_void,
+            admit: None,
+            admit_pack: None,
+            round: Some(round_grow),
+            demote: Some(v_),
+            promote: Some(q_),
+            release: Some(q_),
+            length: Some(len_grow),
+            finished: Some(no_),
+            active: Some(yes_),
+            inserted: Some(zero_),
+        };
+        Driver::new(h, p, c, 8, slot(0, 0, FREE), t.pool, u).unwrap()
+    }
+
+    fn decode_config() -> Config {
+        let mut c: Config = unsafe { std::mem::zeroed() };
+        c.epoch = 1;
+        c.pool_rows = 64 * 64;
+        c.max_rows = 24;
+        c.max_sessions = 8;
+        c.mtp = 2;
+        c.guard_tokens = u32::MAX;
+        c.prefill_rows = 4096;
+        c.two_lanes = true;
+        c.notice_max = 8;
+        c
+    }
+
+    // three decoding sessions on runs of the pool
+    fn seat(d: &Driver, pool: &Handle, rows: u64, worst: u64) {
+        let runs: Vec<Run> = (0..3).map(|_| run_of(&pool.lock().reserve(rows, worst).unwrap())).collect();
+        d.s().with(|_, sl, _| {
+            for (n, i) in [0usize, 2, 5].into_iter().enumerate() {
+                sl[i].key.epoch = 1;
+                sl[i].phase = DECODE;
+                sl[i].req.id = 10 + n as u64;
+                sl[i].req.prompt_tokens = 4;
+                sl[i].req.max_tokens = 1200;
+                sl[i].run = runs[n];
+            }
+        });
+        for i in [0, 2, 5] {
+            d.initialized[i].set(true);
+        }
+    }
+
+    #[test]
+    fn grows_runs_in_the_pool() {
+        let pool = Handle::new(g6kvman::Pool::new(64, 64, 64 * 64).unwrap());
+        let t = PoolTest { len: Cell::new(10), step: 16, grown: Cell::new(0), pool: &pool };
+        let u = CPool { grow: true, ..Default::default() };
+        // the grow hook and the driver's growth together, the driver's growth without the grown hook, or pool calls
+        // without a pool, are refused
+        let z: CHooks = unsafe { std::mem::zeroed() };
+        let p: CPlanner = unsafe { std::mem::zeroed() };
+        let h = CHooks { bind: Some(b_), retire: Some(s_), prefill: Some(p_), payload: Some(y_), has_grow: true, ..z };
+        assert!(Driver::new(h, p, decode_config(), 8, slot(0, 0, FREE), &pool, u).is_none());
+        let h = CHooks { has_grow: false, ..h };
+        assert!(Driver::new(h, p, decode_config(), 8, slot(0, 0, FREE), &pool, u).is_none());
+        let h = CHooks { grown: Some(grown_), has_grown: true, ..h };
+        assert!(Driver::new(h, p, decode_config(), 8, slot(0, 0, FREE), std::ptr::null(), u).is_none());
+        assert!(Driver::new(h, p, decode_config(), 8, slot(0, 0, FREE), &pool, u).is_some());
+
+        let d = pool_driver(&t, decode_config(), u);
+        seat(&d, &pool, 64, 64 * 20);
+        let mut q = Quantum::default();
+        for _ in 0..20 {
+            d.step(&mut q).unwrap();
+        }
+        // each run grew to cover its length + guard at the last round; the slots hold the pool's runs
+        let st = pool.lock().stats();
+        assert_eq!((st.live_runs, st.grows as u32), (3, t.grown.get()));
+        assert!(t.grown.get() >= 3 * 3);
+        let rows = sch::round_rows(&decode_config(), (t.len.get() - t.step) as u64);
+        for i in [0, 2, 5] {
+            let r = d.s().slot(i).run;
+            assert_eq!(r.pages as u64, rows.div_ceil(64));
+            assert_eq!(pool.lock().list(&kv(&r)).unwrap().len(), r.pages as usize);
+        }
+        // past a run's worst case the pool refuses, and the driver fails the scheduler with its message
+        t.len.set(64 * 20);
+        assert_eq!(d.step(&mut q), Err(Stop::Refused("pool growth past the run's worst case")));
+        assert!(d.s().with(|_, _, st| st.failed));
+    }
+
+    #[test]
+    fn pool_rounds_do_not_allocate() {
+        use crate::planner::tests::counting::{ALLOCS, COUNTING};
+        let pool = Handle::new(g6kvman::Pool::new(64, 64, 64 * 64).unwrap());
+        // the runs already cover every round: each grow is the pool's lookup, no new pages
+        let t = PoolTest { len: Cell::new(10), step: 0, grown: Cell::new(0), pool: &pool };
+        let d = pool_driver(&t, decode_config(), CPool { grow: true, release: true, ..Default::default() });
+        seat(&d, &pool, 64 * 4, 64 * 4);
+        let mut q = Quantum::default();
+        for _ in 0..10 {
+            d.step(&mut q).unwrap();
+        }
+        ALLOCS.with(|a| a.set(0));
+        COUNTING.with(|x| x.set(true));
+        for _ in 0..500 {
+            d.step(&mut q).unwrap();
+        }
+        COUNTING.with(|x| x.set(false));
+        assert_eq!(ALLOCS.with(|a| a.get()), 0);
+        assert_eq!((q.kind, t.grown.get()), (K_DECODE, 0));
+    }
+
+    unsafe extern "C" fn shrink_(_: *mut c_void, _: *const Shrink, _: *const Run, _: u64) -> i32 {
+        0
+    }
+    fn commit(d: &Driver) -> Commit {
+        let st = d.s().with(|_, _, st| *st);
+        let mut e: Commit = unsafe { std::mem::zeroed() };
+        (e.epoch, e.event, e.boundary) = (1, st.event + 1, st.boundary);
+        e
+    }
+
+    #[test]
+    fn a_worker_shrinks_in_the_pool_and_the_head_does_not() {
+        // place 40, window 4, nr 4: the pool's R is 8 pages, the small one 4; seats of 20 pages
+        let mk = || {
+            let mut p = g6kvman::Pool::new(400, 40, 8 * 64).unwrap();
+            p.tail(4, 0);
+            p.window(4, 0, 0).unwrap();
+            Handle::new(p)
+        };
+        let mut c = decode_config();
+        (c.pool_rows, c.window_pages, c.r2_rows) = (400 * 64, 4, 4 * 64);
+        // slot 2 takes the small R with this run
+        // own: the driver has the pool (seated either way)
+        let shrink_own = |pool: &Handle, u: CPool, run: Run, own: bool| {
+            let t = PoolTest { len: Cell::new(10), step: 0, grown: Cell::new(0), pool };
+            let mut d = pool_driver(&t, c, u);
+            (d.h.shrink, d.h.has_shrink) = (Some(shrink_ as ShrinkFn), true);
+            seat(&d, pool, 20 * 64, 20 * 64);
+            if !own {
+                d.pool = std::ptr::null();
+            }
+            let mut e = commit(&d);
+            e.has_shrink = true;
+            e.shrink = Shrink { key: d.s().slot(2).key, r_rows: c.r2_rows, run };
+            d.apply(&e, 0, false, None).map(|_| (d.s().slot(2).run, pool.lock().digest()))
+        };
+        let shrink = |pool: &Handle, u: CPool, run: Run| shrink_own(pool, u, run, true);
+        // the head's change, made when it built the commit, on a pool seated alike
+        let mirror = mk();
+        let runs: Vec<_> = (0..3).map(|_| mirror.lock().reserve(20 * 64, 20 * 64).unwrap()).collect();
+        let want = run_of(&mirror.lock().shrink_run(&runs[1], c.r2_rows).unwrap());
+        let shrunk = mirror.lock().digest();
+        // the head's driver leaves its pool alone; a worker's makes the change and then agrees with the head
+        let (r, d) = shrink(&mk(), CPool { shrink: true, head: true, ..Default::default() }, want).unwrap();
+        assert!(r == want && d != shrunk);
+        assert_eq!(shrink(&mk(), CPool { shrink: true, ..Default::default() }, want), Ok((want, shrunk)));
+        // a worker without the pool's shrink (or without a pool), or whose change differs, refuses and fails the
+        // scheduler
+        let no = CPool { release: true, ..Default::default() };
+        assert_eq!(shrink(&mk(), no, want), Err(Stop::Refused("a shrink commit without the pool's shrink")));
+        let none = shrink_own(&mk(), CPool::default(), want, false);
+        assert_eq!(none, Err(Stop::Refused("a shrink commit without the pool's shrink")));
+        let bad = Run { list_hash: want.list_hash ^ 1, ..want };
+        let yes = CPool { shrink: true, ..Default::default() };
+        assert_eq!(shrink(&mk(), yes, bad), Err(Stop::Refused("worker shrink differs from the head's")));
+    }
+
+    #[test]
+    fn leaving_sessions_release_their_runs() {
+        let pool = Handle::new(g6kvman::Pool::new(64, 64, 64 * 64).unwrap());
+        let live = |p: &Handle| p.lock().stats().live_runs;
+        for head in [false, true] {
+            let t = PoolTest { len: Cell::new(10), step: 0, grown: Cell::new(0), pool: &pool };
+            let mut d = pool_driver(&t, decode_config(), CPool { release: true, head, ..Default::default() });
+            seat(&d, &pool, 64, 64);
+            // a cancelled live session: a worker releases its run, the head released it when it built the commit
+            let x = d.s().slot(0);
+            let mut e = commit(&d);
+            (e.has_cancel, e.cancel) = (true, x.key);
+            d.apply(&e, 0, false, None).unwrap();
+            assert_eq!(live(&pool), if head { 3 } else { 2 });
+            if head {
+                pool.lock().release(&kv(&x.run)).unwrap();
+            }
+            // a session that finishes gives its run back at that step, on every rank
+            let mut q = Quantum::default();
+            d.step(&mut q).unwrap();
+            assert_eq!(live(&pool), 2);
+            d.p.finished = Some(yes_);
+            d.step(&mut q).unwrap();
+            assert_eq!((q.kind, live(&pool)), (K_DECODE, 0));
+        }
     }
 }

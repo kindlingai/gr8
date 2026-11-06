@@ -1,11 +1,11 @@
 // Bridge from the scheduler to the persistent Batch. No CUDA or allocator.
 // All calls run on the compute thread at safe boundaries. apply() requires an
 // EventGate all-rank fence; callbacks must fail the whole epoch on any error.
-// The driver's logic is Rust (engine/scheduler-rs src/driver.rs). Driver is a facade: it keeps the payloads, the
-// Scheduler and the Batch (which writes the round log), and answers the Rust's hooks and planner calls from them. An
-// exception a hook throws is held until the Rust returns, then rethrown. The Batch's hooks (run, emit, prompt, round,
-// dfl, dfl_start) must not call stats() or emitted(), which read the Batch; the other hooks may call any getter. No hook
-// may call apply() or step(): the Rust refuses them.
+// The driver's logic is Rust (engine/scheduler-rs src/driver.rs), and so is the scheduler's state, which state() reads.
+// Driver is a facade: it keeps the payloads and the Batch (which writes the round log), and answers the Rust's hooks
+// and planner calls from them. An exception a hook throws is held until the Rust returns, then rethrown. The Batch's
+// hooks (run, emit, prompt, round, dfl, dfl_start) must not call stats() or emitted(), which read the Batch; the other
+// hooks may call any getter. No hook may call apply() or step(): the Rust refuses them.
 #pragma once
 #include "../ds41_image.h"
 #include "scheduler.h"
@@ -48,7 +48,11 @@ struct DriverHooks {
     std::function<void(Key, const s2::Stats&)> terminal;
     // optional: before a round, a decoding session's run grows to cover `rows` (round_rows). The run, perhaps the same,
     // or nothing: the pages would leave the pool unsafe and the session sits this round out. Every rank, same order.
+    // Not with DriverPool::grow, where the driver grows the run in the pool itself
     std::function<std::optional<Run>(const Slot&, uint64_t rows)> grow;
+    // optional, with DriverPool::grow: a decoding session's run grew before a round (the slot as it was, its new run);
+    // the engine's tables take the new pages. Every rank, same order
+    std::function<void(const Slot&, const Run&)> grown;
     // optional: a session finished at this step (now Retiring): its pages go back to the pool now, on every rank, so
     // the sessions still decoding can grow before the next event fence frees the slot
     std::function<void(const Slot&)> finished;
@@ -65,9 +69,16 @@ struct DriverHooks {
     // DS41 prefill pack: one native pass for the ordered segments, never N solo hooks.
     std::function<void(const std::vector<PrefillPart>&)> prefill_pack;
 };
+// The pool calls the Rust driver makes itself on the rank's pool (pool.h RunPool::handle; the pool must outlive the
+// Driver), each under the pool's lock for that call alone and with no hook running. grow: runs grow before a round
+// (then DriverHooks::grown, required). shrink: a worker's half of a shrink commit, checked against the head's, before
+// the shrink hook. release: a session's run goes back when it leaves (no prefix reuse: retain and park stay in the
+// retire and finished hooks). head: this rank made the commit's cancel and shrink calls itself when it built the commit
+struct DriverPool { g6kv_pool* pool = nullptr; bool grow = false, shrink = false, release = false, head = false; };
 class Driver {
     struct Impl {
-        Scheduler scheduler;
+        Config cfg;                        // the C++ copy: the Rust's scalars and the steering receipt the digest reads
+        SchedulerView view;                // the Rust's slots and counters, set once the Rust driver exists
         DriverHooks hooks;
         std::array<Payload, MAX_SESSIONS> payload;
         s2::Batch batch;
@@ -87,7 +98,8 @@ class Driver {
         std::vector<s2::Session> sessions;
         std::vector<PrefillPart> parts;
 
-        Impl(const Config& c, DriverHooks h) : scheduler(c), hooks(std::move(h)), batch(int(c.mtp), int(c.max_rows), batch_hooks()) {}
+        static const Config& checked(const Config& c) { sch::check_abi(); c.validate(); return c; }
+        Impl(const Config& c, DriverHooks h) : cfg(checked(c)), hooks(std::move(h)), batch(int(c.mtp), int(c.max_rows), batch_hooks()) {}
         s2::Hooks batch_hooks() {
             return {
                 [this](const s2::Step& s) {
@@ -98,22 +110,22 @@ class Driver {
                     return ids;
                 },
                 [this](int q, long round, int base, int accepted, int K) {
-                    if (hooks.round) hooks.round(scheduler.slots()[q].key, round, base, accepted, K);
+                    if (hooks.round) hooks.round(view.slots()[q].key, round, base, accepted, K);
                 },
                 [this](int q, int M, int pos0) {
-                    if (hooks.prompt) hooks.prompt(scheduler.slots()[q].key, M, pos0);
+                    if (hooks.prompt) hooks.prompt(view.slots()[q].key, M, pos0);
                 },
                 [this](int q, const int* ids, int n, int row) {
-                    const auto& s = scheduler.slots()[q];
+                    const auto& s = view.slots()[q];
                     const auto e = hooks.emit(s.key, ids, n, row);
                     bool done = false;
                     check(g6s2_driver_emit(rs.get(), unsigned(q), n, e.count, e.finished, s.req.max_tokens, &done));
                     return done;
                 },
                 hooks.dfl ? std::function<s2::DflDrafts(const s2::DflReq&)>([this](const s2::DflReq& r) {
-                    return hooks.dfl(scheduler.slots()[r.sess].key, r);
+                    return hooks.dfl(view.slots()[r.sess].key, r);
                 }) : nullptr,
-                hooks.dfl_start ? std::function<int(int)>([this](int q) { return hooks.dfl_start(scheduler.slots()[q].key); }) : nullptr,
+                hooks.dfl_start ? std::function<int(int)>([this](int q) { return hooks.dfl_start(view.slots()[q].key); }) : nullptr,
                 hooks.draft_lp
             };
         }
@@ -130,7 +142,7 @@ class Driver {
         }
         static Impl& of(void* c) { return *static_cast<Impl*>(c); }
         // the live slot a Rust slot copy names (the hooks have always seen the scheduler's own)
-        const Slot& live(const g6sch_slot* s) const { return scheduler.slots()[s->key.slot]; }
+        const Slot& live(const g6sch_slot* s) const { return view.slots()[s->key.slot]; }
 
         static int32_t t_bind(void* c, const g6sch_grant* g) noexcept {
             Impl& m = of(c); return m.guard([&] { m.hooks.bind(*sch::c<Grant>(g)); });
@@ -145,7 +157,7 @@ class Driver {
             Impl& m = of(c);
             return m.guard([&] {
                 m.parts.clear();
-                for (uint32_t i = 0; i < n; ++i) m.parts.push_back({&m.scheduler.slots()[slots[i]], &m.payload[slots[i]], firsts[i], rows[i]});
+                for (uint32_t i = 0; i < n; ++i) m.parts.push_back({&m.view.slots()[slots[i]], &m.payload[slots[i]], firsts[i], rows[i]});
                 m.hooks.prefill_pack(m.parts);
             });
         }
@@ -161,6 +173,9 @@ class Driver {
                 const auto r = m.hooks.grow(m.live(s), rows);
                 if ((*some = bool(r))) std::memcpy(out, &*r, sizeof *out);
             });
+        }
+        static int32_t t_grown(void* c, const g6sch_slot* s, const g6sch_run* r) noexcept {
+            Impl& m = of(c); return m.guard([&] { m.hooks.grown(m.live(s), *sch::c<Run>(r)); });
         }
         static int32_t t_finished(void* c, const g6sch_slot* s) noexcept {
             Impl& m = of(c); return m.guard([&] { m.hooks.finished(m.live(s)); });
@@ -218,23 +233,35 @@ class Driver {
     std::unique_ptr<Impl> m_;   // on the heap: the Rust holds its address, so a moved Driver keeps working
     bool initialized(unsigned slot) const { return g6s2_driver_initialized(m_->rs.get(), slot); }
 public:
-    Driver(Config c, DriverHooks h) : m_(new Impl(c, std::move(h))) {
+    Driver(Config c, DriverHooks h, DriverPool pool = {}) : m_(new Impl(c, std::move(h))) {
         Impl& m = *m_;
         m.batch.adapt(s2::adapt_env());
         m.batch.set_mtp_sessions(int(c.mtp_sessions));
         m.batch.set_sess_drafts(c.sess_drafts);
         const DriverHooks& k = m.hooks;
         require(bool(k.bind) && bool(k.retire) && bool(k.prefill) && bool(k.run) && bool(k.emit), "missing driver callback");
+        require(pool.pool || !(pool.grow || pool.shrink || pool.release), "driver pool calls without a pool");
+        require(!(pool.grow && k.grow), "the grow hook and the driver's pool growth together");
+        require(!pool.grow || bool(k.grown), "the driver's pool growth without the grown hook");
         const g6s2_drv_hooks hooks{&m, Impl::t_bind, Impl::t_retire, Impl::t_prefill, Impl::t_prefill_pack, Impl::t_dfl_ok,
                                    Impl::t_terminal, Impl::t_grow, Impl::t_finished, Impl::t_resize, Impl::t_shrink,
-                                   Impl::t_settle, Impl::t_payload, bool(k.prefill_pack), bool(k.dfl_ok), bool(k.terminal),
-                                   bool(k.grow), bool(k.finished), bool(k.resize), bool(k.shrink), bool(k.settle)};
+                                   Impl::t_settle, Impl::t_payload, Impl::t_grown, bool(k.prefill_pack), bool(k.dfl_ok),
+                                   bool(k.terminal), bool(k.grow), bool(k.finished), bool(k.resize), bool(k.shrink),
+                                   bool(k.settle), bool(k.grown)};
         const g6s2_drv_planner planner{&m, Impl::t_admit, Impl::t_admit_pack, Impl::t_round, Impl::t_demote, Impl::t_promote,
                                        Impl::t_release, Impl::t_length, Impl::t_finished_q, Impl::t_active, Impl::t_inserted};
-        m.rs.reset(g6s2_driver_new(&hooks, &planner));
-        require(bool(m.rs), "missing driver callback");
+        const Slot empty{};
+        const g6s2_drv_pool use{pool.grow, pool.shrink, pool.release, pool.head};
+        m.rs.reset(g6s2_driver_new(&hooks, &planner, &m.cfg, MAX_SESSIONS, sch::c<g6sch_slot>(&empty), pool.pool, &use));
+        require(bool(m.rs), "the Rust driver refused its slot count or pool calls");
+        g6s2_drv_view v;
+        g6s2_driver_view(m.rs.get(), &v);
+        require(v.n == MAX_SESSIONS, "driver slot count");
+        m.view = SchedulerView(&m.cfg, v.s, v.st);
     }
-    const Scheduler& state() const { return m_->scheduler; }
+    // the scheduler's slots and counters. Valid for the Driver's life; while apply() or step() runs, only its hooks
+    // may read them
+    const SchedulerView& state() const { return m_->view; }
     uint64_t cp_capped_rounds() const { return g6s2_driver_cp_rounds(m_->rs.get()); }
     const s2::Stats& stats(Key k) const {
         require(k.slot < MAX_SESSIONS && state().slots()[k.slot].key == k && initialized(k.slot), "stats for stale/uninitialized slot");
@@ -259,16 +286,16 @@ public:
     void kstop(const s2::KStop& k) { m_->batch.kstop(k); }
     void dfl_reuse(const s2::DflReuse& r) { m_->batch.dfl_reuse(r); }
     void ngram(const s2::NgramSrc& n) { m_->batch.ngram(n); }
-    void fail() { m_->scheduler.fail(); }
-    void idle_boundary(uint64_t b) { m_->scheduler.idle_boundary(b); }
-    void pool_digest(uint64_t d) { m_->scheduler.pool_digest(d); }
+    void fail() { g6s2_driver_fail(m_->rs.get()); }
+    void idle_boundary(uint64_t b) { m_->check(g6s2_driver_idle_boundary(m_->rs.get(), b)); }   // event-only: no model work
+    // the pool's digest (pool.h RunPool::digest) at this event boundary, so the ranks also agree on their pages
+    void pool_digest(uint64_t d) { m_->check(g6s2_driver_pool_digest(m_->rs.get(), d)); }
     Changes apply(const Commit& c, const Payload* p = nullptr) {
         Impl& m = *m_;
         const g6sch_commit x = sch::to_rs(c);
         g6s2_drv_payload pay{};
         if (p) pay = {p->prompt.size(), p->chunk, p->decode_prompt, c.admit && p->steering == c.admit->req.steering};
-        const uint64_t digest = m.scheduler.digest();
-        const g6s2_drv_sched s = m.scheduler.raw();
+        const uint64_t digest = m.view.digest();
         Changes d;
         d.freed.resize(MAX_SESSIONS);
         size_t n = 0; bool admitted = false;
@@ -276,7 +303,7 @@ public:
         {
             const Impl::Restore keep(m);
             m.admit = p; m.commit = &c;
-            rc = g6s2_driver_apply(m.rs.get(), &s, &x, digest, bool(c.resize), p ? &pay : nullptr,
+            rc = g6s2_driver_apply(m.rs.get(), &x, digest, bool(c.resize), p ? &pay : nullptr,
                                    sch::m<g6sch_run>(d.freed.data()), &n, &admitted);
         }
         m.check(rc);
@@ -286,9 +313,8 @@ public:
     }
     Quantum step() {
         Impl& m = *m_;
-        const g6s2_drv_sched s = m.scheduler.raw();
         g6sch_quantum q;
-        m.check(g6s2_driver_step(m.rs.get(), &s, &q));
+        m.check(g6s2_driver_step(m.rs.get(), &q));
         return sch::from_rs(q);
     }
 };

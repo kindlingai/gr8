@@ -3159,11 +3159,11 @@ int main(int argc, char** argv)
         {
             g6s2::NativeDispatch nd(nx, sc);
             g6s2::NativeHooks h;
+            h.pool.pool = &pool;   // the driver grows, shrinks (workers) and releases runs on it itself
             h.pool.free_pages = [&] { return pool.free_pages(); };
             h.pool.room = [&] { return pool.room(); };
             h.pool.reserve = [&](uint64_t rows, uint64_t worst, uint32_t r) { return pool.reserve(rows, worst, r); };
             h.pool.digest = [&] { return pool.digest(); };
-            h.pool.release = [&](const g6s2::Run& r) { pool.release(r); };
             h.pool.fits = [&](uint64_t rows, uint64_t worst, uint32_t r) { return pool.fits(rows, worst, r); };
             if (rtt && rtt->local)
                 h.pool.refusal = [&](uint64_t worst, uint32_t r) -> std::string {
@@ -3186,9 +3186,7 @@ int main(int argc, char** argv)
             h.pool.stats = [&] { return pool.stats(); };
             h.pool.runs = [&] { return pool.runs(); };
             // GR8_S2_GROW=0: every run holds its worst case (prompt + max_tokens + guard) from admission, as before growth
-            {
-                if (knob::s2_grow()) h.pool.grow = [&](const g6s2::Run& r, uint64_t rows) { return pool.grow(r, rows); };
-            }
+            h.pool.grow = knob::s2_grow();
             if (pool.keeping())
             {
                 h.pool.retain = [&](const g6s2::Run& r, const PrefixReuse& s, const CacheNamespace& ns) { pool.retain(r, s, ns); };
@@ -3225,7 +3223,6 @@ int main(int argc, char** argv)
                             return g6s2::Shrink{sl.key, (uint32_t)cp_R2, pool.shrink(sl.run, (uint32_t)cp_R2)};
                     return std::nullopt;
                 };
-                h.pool.shrink = [&](const g6s2::Run& r, uint32_t r2) { return pool.shrink(r, r2); };
             }
             if (kvt)
             {

@@ -119,7 +119,7 @@ struct Rank {
         d = std::make_unique<Driver>(c, h);
     }
     std::map<uint64_t, std::vector<int>> prompt_of;
-    const Scheduler& s() const { return d->state(); }
+    const SchedulerView& s() const { return d->state(); }
     // the head's match over the parked table (ds41_native.cuh): the slot whose tokens the prompt extends, longest first
     int match(const std::vector<int>& prompt) const {
         int best = -1;
@@ -143,7 +143,7 @@ static Config cfg(bool park, uint32_t sessions = 3)
 #endif
     return c;
 }
-static Commit commit_for(const Scheduler& s)
+static Commit commit_for(const SchedulerView& s)
 {
     Commit cm;
     cm.epoch = s.config().epoch; cm.event = s.next_event(); cm.boundary = s.boundary(); cm.before_hash = s.digest();

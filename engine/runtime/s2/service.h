@@ -21,10 +21,12 @@ namespace g6s2 {
 // rows: what a request needs at admission (grant_rows), worst: all it may grow to (reserve_rows), r: the R its run
 // takes (Request::r_rows, 0 = the pool's)
 struct PoolHooks {
+    // the rank's pool itself, on which the driver makes the pure pool calls (driver.h DriverPool): growth, a worker's
+    // half of a shrink, and a leaving session's release when nothing is retained. Required
+    RunPool* pool = nullptr;
     std::function<uint32_t()> free_pages, room;
     // head after ALL event ACKs, workers at the grant (the same call on the same pool state must give the same Run)
     std::function<Run(uint64_t rows, uint64_t worst, uint32_t r)> reserve;
-    std::function<void(const Run&)> release;
     // can the FIFO head be admitted now: room, no exclusive run in the way (on the page classes a split run past R
     // shares the pool, kvman-rs pool.rs), and every live run still able to reach its worst case (pool.h fits). false is
     // counted as an admission stall
@@ -34,13 +36,14 @@ struct PoolHooks {
     // optional, head only: the R a request's run takes (Request::r_rows: 0 or Config::r2_rows). prompt: null without
     // prefix reuse. Unset = 0
     std::function<uint32_t(const Request&, uint64_t rows, uint64_t worst, const std::vector<int>* prompt)> r_rows;
-    // optional (with r_rows): a request that does not fit. make_room, head only: a decoding session to take the smaller R,
-    // its run shrunk on the head's pool (nothing = none to shrink). shrink: the same change on a worker's pool
+    // optional (with r_rows and pool): a request that does not fit. make_room, head only: a decoding session to take
+    // the smaller R, its run shrunk on the head's pool (nothing = none to shrink). The driver makes the same change on
+    // a worker's pool
     std::function<std::optional<Shrink>(const std::array<Slot, MAX_SESSIONS>& slots, const Request&, uint64_t rows,
                                         uint64_t worst)> make_room;
-    std::function<Run(const Run&, uint32_t r2)> shrink;
-    // optional (growth on demand, pool.h grow): before a round, every rank; nothing = the session sits the round out
-    std::function<std::optional<Run>(const Run&, uint64_t rows)> grow;
+    // growth on demand (pool.h grow, with pool): the driver grows each decoding run before a round, every rank; a run
+    // the pool cannot grow sits the round out
+    bool grow = false;
     // optional, status.s2: each live run's pages now and at worst, granted growth and stalled rounds
     std::function<std::vector<PoolUse>()> runs;
     std::function<g6kv_totals()> stats;
@@ -66,7 +69,8 @@ struct NativeHooks {
     // optional, before bind on every rank: the bound request itself (DS41: its image rows, for the Engram ring of the
     // slot's snapshots and parks, s2/ds41_engram_ring.h)
     std::function<void(unsigned slot, const g6rt::ServeReq&)> bind_request;
-    // with pool.grow: slot's run grew; its new pages go into the main and draft tables before the round
+    // with pool.grow: slot's run grew (the driver's pool call); its new pages go into the main and draft tables before
+    // the round
     std::function<void(unsigned slot, const Run&)> grown;
     std::function<void(const Slot&)> retire; // native per-slot graph/view cleanup only
     std::function<void()> fence; // all native streams/drafts quiescent before event ACK
@@ -108,7 +112,7 @@ struct NativeHooks {
 struct Progress {
     std::atomic<uint64_t> boundary{0}, revision{0}, horizon{0};
     std::atomic<unsigned> resident{0}, retiring{0};
-    void publish(const Scheduler& s) {
+    void publish(const SchedulerView& s) {
         // horizon before boundary: a reader that loads boundary first and horizon second (event) sees a horizon
         // computed for that boundary or a later one, never an earlier one. Later only widens the margin.
         horizon.store(s.horizon());
@@ -200,9 +204,11 @@ class Service {
     void shutdown() { stopping_.store(true); endpoint_->fail(); }
     // a slot leaves: its run back to the pool, retained with the session's reuse state when prefix reuse is on. A
     // finished session at the step it finished (Driver finished hook, every rank), a cancelled one at the event: head in
-    // event(), workers at apply, the same point of the same commit. So every rank keeps the same runs.
+    // event(), workers at apply, the same point of the same commit. So every rank keeps the same runs. Without prefix
+    // reuse the driver releases the run itself (DriverPool::release), except the head's cancelled one: that goes back
+    // here, when the head builds the commit
     void retire_run(const Slot& s) {
-        if (!reuse()) { native_.pool.release(s.run); return; }
+        if (!reuse()) { native_.pool.pool->release(s.run); return; }
         g6rt::PrefixReuse st = dispatch_.rows(s.key.slot);
         const auto gen = driver_->emitted(s.key.slot);
         st.finish(driver_->prompt(s.key.slot), gen, int(gen.size()), true);
@@ -575,19 +581,16 @@ public:
           dispatch_(sessions_,c_.scheduler.max_rows,native_.dispatch), ingress_(c_.directory,c_.scheduler.epoch), queue_(c_.scheduler) {
         c_.validate();
         trace_.open(knob::s2_trace().value_or(""), c_.rank);
+        require(native_.pool.pool, "the service needs the rank's pool");
         require(bool(native_.pool.free_pages) && bool(native_.pool.room) && bool(native_.pool.reserve) && bool(native_.pool.fits) &&
-                bool(native_.pool.release) && bool(native_.bind) && bool(native_.retire) && bool(native_.fence), "incomplete native service hooks");
+                bool(native_.bind) && bool(native_.retire) && bool(native_.fence), "incomplete native service hooks");
         require(!native_.pool.grow || bool(native_.grown), "pool growth needs the native table hook");
-        require(!native_.pool.make_room || (bool(native_.pool.shrink) && bool(native_.shrink)), "a shrink needs the pool's and the native hook");
+        require(!native_.pool.make_room || bool(native_.shrink), "a shrink needs the native hook");
         require(!native_.share || bool(native_.resize), "a share report needs the resize hook");
         require(!native_.flash.chunk_rows || bool(native_.resize), "borrow-idle needs the resize hook");
         DriverHooks h;
         h.resize = native_.resize;
-        h.shrink = [&](const Shrink& k, const Run& was, uint64_t length) {
-            if (c_.rank) {   // the head's change, on the same pool state
-                require(bool(native_.pool.shrink), "a shrink commit without the pool's shrink");
-                require(native_.pool.shrink(was, k.r_rows) == k.run, "worker shrink differs from the head's");
-            }
+        h.shrink = [&](const Shrink& k, const Run& was, uint64_t length) {   // a worker's pool changed in the driver first
             require(bool(native_.shrink), "a shrink commit without the native shrink hook");
             native_.shrink(k, was, length);
         };
@@ -615,7 +618,8 @@ public:
             native_.bind(g); sessions_.bind(g,*staged_);
         };
         h.retire = [&](const Slot& old) {
-            if (c_.rank && old.phase != Phase::Retiring) retire_run(old);   // a cancelled live session (finished ones: below)
+            // a cancelled live session (finished ones: below)
+            if (c_.rank && old.phase != Phase::Retiring && reuse()) retire_run(old);
             native_.retire(old); sessions_.retire(old); dispatch_.release(old.key.slot);
         };
         h.prefill = [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows) {
@@ -640,7 +644,7 @@ public:
                 trace_.instant("finish", Trace::STEPS, targ("request", s.req.id) + "," + targ("tokens", s.emitted));
                 first_.erase(s.req.id);
             }
-            retire_run(s);
+            if (reuse()) retire_run(s);
         };
         if (native_.drained)   // the copies run at a bind, a growth or a retire: all before the next step's round
             h.settle = [&] {
@@ -653,11 +657,7 @@ public:
                 fprintf(stderr, "# rank %u: s2 drain barrier %llu: in %lld ms, out %lld ms\n", (unsigned)c_.rank, (unsigned long long)sync_, b0, wall());
             };
         if (native_.pool.grow)
-            h.grow = [&](const Slot& s, uint64_t rows) {
-                const auto r = native_.pool.grow(s.run, rows);
-                if (r && *r != s.run) { native_.grown(s.key.slot, *r); sessions_.grow(s.key.slot, *r); }
-                return r;
-            };
+            h.grown = [&](const Slot& s, const Run& r) { native_.grown(s.key.slot, r); sessions_.grow(s.key.slot, r); };
         h.terminal = [&](Key k,const s2::Stats& stats) {
             if (stats.switches || stats.mtp_rounds)
                 fprintf(stderr,"# s2 drafter choice slot %u: %ld of %ld rounds on MTP, %ld switches, %ld tokens\n",unsigned(k.slot),
@@ -681,7 +681,9 @@ public:
         // MTP only (no drafter): the confidence stops of round_all read the draft log-probabilities too (g6m4 sets kstop)
         const bool kstop_mtp = !native_.dispatch.dfl && (native_.kstop.mode || native_.kstop.b.mode || native_.kstop.log);
         if (kstop_mtp) h.draft_lp = native_.dispatch.draft_lp;
-        driver_ = std::make_unique<Driver>(c_.scheduler,std::move(h));
+        const DriverPool dp{native_.pool.pool->handle(), native_.pool.grow, bool(native_.pool.make_room), !reuse(),
+                            c_.rank == 0};
+        driver_ = std::make_unique<Driver>(c_.scheduler,std::move(h),dp);
         if (native_.dispatch.dfl) {
             driver_->dflash(native_.dfl_kv, native_.dfl_spec); driver_->dsel(native_.dsel); driver_->kstop(native_.kstop);
             driver_->dfl_reuse(native_.dfl_reuse);

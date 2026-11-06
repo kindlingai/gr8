@@ -3,8 +3,8 @@
 // libstdc++, where the request parser's number rules come from). The scheduler's streams depend on the module's shape
 // (slots and caps), so it has one value per shape. A changed rule changes a hash: rerecord only for a change meant to
 // alter behaviour, and say so in the commit. The first eight were recorded at R2d (kindlingai/gr8#353) from the C++ then
-// in s2/tests/ref, the driver's from the C++ driver; --dump SECTION prints a section's transcript, to diff two builds
-// line by line. Host only.
+// in s2/tests/ref, the driver's from the C++ driver, driver_pool's from the service's pool hooks; --dump SECTION prints
+// a section's transcript, to diff two builds line by line. Host only.
 #include "../kv_plan.h"
 #include "../flash_lend.h"
 #include "../flash_ring.h"
@@ -32,10 +32,10 @@ inline void validate(const Config& c) { c.validate(); }
 // --dump SECTION: write that section's transcript to stdout instead of checking the hashes (to diff two builds)
 int main(int argc, char** argv)
 {
-    struct Shape { int max_sessions; bool mtp0, pack, park; uint64_t scheduler, driver; };
+    struct Shape { int max_sessions; bool mtp0, pack, park; uint64_t scheduler, driver, driver_pool; };
     const Shape shapes[] = {
-        {8, false, false, false, 0x516723cb09cd4014ull, 0x3508037ae19f733cull},   // GLM-5.3 and Flash
-        {32, true, true, true, 0x6ab1879c4a43bb14ull, 0xaa629dc3f6a951dbull},     // DS41
+        {8, false, false, false, 0x516723cb09cd4014ull, 0x3508037ae19f733cull, 0xaebb24ec50c72c50ull},   // GLM-5.3 and Flash
+        {32, true, true, true, 0x6ab1879c4a43bb14ull, 0xaa629dc3f6a951dbull, 0x75108cfa718bede4ull},     // DS41
     };
     const int ms = int(g6mod::INFO.max_sessions);
     const bool mtp0 = g6mod::has(G6_CAP_MTP0), pack = g6mod::has(G6_CAP_PACK), park = g6mod::has(G6_CAP_PARK);
@@ -57,6 +57,8 @@ int main(int argc, char** argv)
         {"share_resize", 10, vec::share_resize, 0xd99c642674175c07ull},
         // recorded from the C++ driver it replaced (git bd1bb6a), in each shape
         {"driver", 11, vec::driver, shape ? shape->driver : 0},
+        // recorded from the service's C++ pool hooks before the driver made these calls (git 7440bda), in each shape
+        {"driver_pool", 12, vec::driver_pool, shape ? shape->driver_pool : 0},
     };
     if (argc == 3 && std::string(argv[1]) == "--dump")
     {

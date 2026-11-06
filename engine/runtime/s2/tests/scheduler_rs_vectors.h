@@ -692,7 +692,9 @@ inline uint64_t driver(uint64_t seed, std::vector<std::string>* lines = nullptr)
                 hook(s);
             };
         h.settle = [&] { hook("settle"); };
-        const std::string made = outcome([&] { d = std::make_unique<impl::Driver>(c, h); return std::string(); });
+        // a head: no pool, and the shrink hook makes the pool change, as the old C++ driver did when this was recorded
+        const DriverPool head{nullptr, false, false, false, true};
+        const std::string made = outcome([&] { d = std::make_unique<impl::Driver>(c, h, head); return std::string(); });
         tx(made);
         if (!d) continue;
         uint64_t id = 0;
@@ -770,6 +772,167 @@ inline uint64_t driver(uint64_t seed, std::vector<std::string>* lines = nullptr)
             refused = dead ? refused + 1 : 0;
             tx(o);
             tx("digest " + std::to_string(d->state().digest()) + " cp " + std::to_string(d->cp_capped_rounds()));
+        }
+    }
+    return tx.h;
+}
+
+// the driver's own pool calls (driver.h DriverPool): a head and a worker, each a Driver over its own pool, take the
+// same commits. The head reserves a grant's run, gives a cancelled session's run back and shrinks a session to the
+// smaller R as it builds the commit (service.h event); the worker reserves at its bind. Runs grow before each round and
+// go back when a session finishes, or on the worker when it is cancelled; the worker makes the head's shrink. Every
+// hook call, step and both pools' digests go in.
+inline uint64_t driver_pool(uint64_t seed, std::vector<std::string>* lines = nullptr)
+{
+    using namespace g6s2;
+    Rng R(seed);
+    Tx tx{{}, lines};
+    auto U = [&](int lo, int hi) { return R.U(lo, hi); };
+    auto mix = [](uint64_t a, uint64_t b, uint64_t c) {
+        uint64_t x = a * 0x9E3779B97F4A7C15ull ^ (b + 0x632BE59BD9B4E019ull) * 0xBF58476D1CE4E5B9ull ^ (c + 7) * 0x94D049BB133111EBull;
+        x ^= x >> 29; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 32;
+        return x;
+    };
+    for (int t = 0; t < 40; ++t)
+    {
+        Config c;
+        c.max_sessions = uint32_t(U(1, int(std::min(MAX_SESSIONS, 8u))));
+        c.mtp = uint32_t(U(1, 3));
+        c.max_rows = uint32_t(U(int(c.mtp) + 1, 32));
+        c.prefill_rows = uint32_t(64 * U(1, 4));
+        c.two_lanes = U(0, 1);
+        // the window: place 40, R 8 pages, the smaller R 4 (kvman-rs tests/r_classes.rs); else a small pool all below R
+        const bool window = !U(0, 2);
+        uint32_t pages = 400, place = 40;
+        if (window) { c.window_pages = 4; c.r2_rows = 4 * PAGE; }
+        else pages = place = uint32_t(U(8, 48));
+        const uint32_t below = window ? 8 * PAGE : pages * PAGE;
+        c.pool_rows = pages * PAGE;
+        const std::string v = outcome([&] { impl::validate(c); return std::string(); });
+        tx(v);
+        if (v != "ok ") continue;
+        const uint64_t salt = R.raw();
+        struct Rank { std::unique_ptr<RunPool> pool; std::unique_ptr<impl::Driver> d; std::map<uint64_t, uint32_t> sent; };
+        Rank rk[2];
+        for (int i = 0; i < 2; ++i)
+        {
+            Rank& x = rk[i];
+            const std::string p = i ? "w " : "h ";
+            x.pool = std::make_unique<RunPool>(pages, place, below);
+            if (window) { x.pool->tail(4, 0); x.pool->window(4, 0, 0); }
+            DriverHooks h;
+            h.bind = [&, i, p](const Grant& g) {
+                std::string s = p + "bind " + str(g.key) + " " + str(g.run);
+                if (i) s += " mine " + outcome([&] { return str(x.pool->reserve(grant_rows(c, g.req), reserve_rows(c, g.req), g.req.r_rows)); });
+                tx(s);
+            };
+            h.retire = [&, p](const Slot& s) { tx(p + "retire " + str(s.key) + " phase " + std::to_string(int(s.phase)) + " " + str(s.run)); };
+            h.prefill = [&, p](const Slot& s, const Payload&, uint32_t first, uint32_t rows) {
+                tx(p + "prefill " + str(s.key) + " " + std::to_string(first) + "+" + std::to_string(rows));
+            };
+            h.run = [&, p](const s2::Step& st) {
+                std::vector<int> ids;
+                for (const auto& r : st.r) ids.push_back(int(mix(salt + uint64_t(r.sess), uint64_t(r.pos) + (st.kind != s2::Step::MAIN), uint64_t(r.tok)) % 4));
+                tx(p + "run " + st.key() + " " + std::to_string(st.r.size()));
+                return ids;
+            };
+            h.emit = [&, p](Key k, const int*, int n, int) {
+                const Slot& s = x.d->state().slots()[k.slot];
+                uint32_t& out = x.sent[s.req.id];
+                const uint32_t left = s.req.max_tokens - out;
+                Emission e{uint32_t(n), false};
+                if (mix(salt, s.req.id, out) % 40 == 0) e = {uint32_t(n ? 1 : 0), true};   // a stop
+                if (e.count > left) e = {left, true};
+                out += e.count;
+                tx(p + "emit " + str(k) + " " + std::to_string(n) + " -> " + std::to_string(e.count) + (e.finished ? " stop" : ""));
+                return e;
+            };
+            h.grown = [&, p](const Slot& s, const Run& r) { tx(p + "grown " + str(s.key) + " " + str(s.run) + " -> " + str(r)); };
+            h.finished = [&, p](const Slot& s) { tx(p + "finished " + str(s.key) + " " + str(s.run)); };
+            h.shrink = [&, p](const Shrink& z, const Run& was, uint64_t length) {
+                tx(p + "shrink " + str(z.key) + " " + str(z.run) + " was " + str(was) + " length " + std::to_string(length));
+            };
+            const std::string made = outcome([&] {
+                x.d = std::make_unique<impl::Driver>(c, h, DriverPool{x.pool->handle(), true, window, true, i == 0});
+                return std::string();
+            });
+            tx(made);
+        }
+        if (!rk[0].d || !rk[1].d) continue;
+        RunPool& hp = *rk[0].pool;
+        uint64_t id = 0;
+        for (int k = 0; k < 300; ++k)
+        {
+            if (U(0, 9) <= 2)
+            {
+                const auto& sl = rk[0].d->state().slots();
+                Commit e;
+                e.epoch = c.epoch;
+                e.event = rk[0].d->state().next_event();
+                e.boundary = rk[0].d->state().boundary();
+                e.before_hash = rk[0].d->state().digest();
+                std::optional<Payload> pay;
+                const int kind = U(0, 9);
+                if (kind <= 2)
+                {   // the head gives a cancelled live session's run back now (service.h event)
+                    const auto& s = sl[unsigned(U(0, int(MAX_SESSIONS) - 1))];
+                    if (s.phase != Phase::Free)
+                    {
+                        e.cancel = s.key;
+                        if (s.phase != Phase::Retiring) tx("h cancel release " + outcome([&] { hp.release(s.run); return str(s.run); }));
+                    }
+                }
+                if (window && !U(0, 3))
+                    for (const auto& s : sl)
+                        if (s.phase == Phase::Decode && !s.req.r_rows && !(e.cancel && *e.cancel == s.key) && hp.shrinkable(s.run, c.r2_rows))
+                        {
+                            const std::string o = outcome([&] { e.shrink = Shrink{s.key, c.r2_rows, hp.shrink(s.run, c.r2_rows)}; return str(e.shrink->run); });
+                            tx("h shrink " + o);
+                            break;
+                        }
+                if (kind >= 3 && rk[0].d->state().resident() < c.limit())
+                {
+                    Request r;
+                    r.id = ++id;
+                    r.prompt_tokens = uint32_t(U(2, window ? 800 : 200));   // the window's R is 512 rows
+                    r.max_tokens = uint32_t(U(1, 160));
+                    if (window && !U(0, 2)) r.r_rows = c.r2_rows;
+                    const uint64_t rows = grant_rows(c, r), worst = reserve_rows(c, r);
+                    if (hp.fits(rows, worst, r.r_rows))
+                    {
+                        const std::string o = outcome([&] {
+                            const Key key = rk[0].d->state().next_key(e.cancel);
+                            e.admit = Grant{key, r, hp.reserve(rows, worst, r.r_rows), 0};
+                            return str(e.admit->run);
+                        });
+                        tx("h grant " + o);
+                        if (e.admit)
+                        {
+                            Payload q;
+                            for (uint32_t i = 0; i < r.prompt_tokens; ++i) q.prompt.push_back(U(0, 3));
+                            q.chunk = U(1, 8);
+                            pay = q;
+                        }
+                    }
+                    else tx("h no room");
+                }
+                for (Rank& x : rk)
+                    tx("apply " + outcome([&] {
+                        const Changes ch = x.d->apply(e, pay ? &*pay : nullptr);
+                        std::string s;
+                        for (const auto& r : ch.freed) s += str(r) + ",";
+                        return s;
+                    }));
+            }
+            else
+                for (Rank& x : rk) tx("step " + outcome([&] { return str(x.d->step()); }));
+            for (Rank& x : rk)
+            {
+                const auto st = x.pool->stats();
+                tx("digest " + std::to_string(x.d->state().digest()) + " pool " + std::to_string(x.pool->digest()) + " live " +
+                   std::to_string(st.live_runs) + " held " + std::to_string(st.held_pages) + " grows " + std::to_string(st.grows) +
+                   " stalls " + std::to_string(st.stalls));
+            }
         }
     }
     return tx.h;

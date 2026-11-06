@@ -298,7 +298,7 @@ static void driver_k0()
     long guard = 0;
     while (!queue.empty() || d->state().resident())
     {
-        const Scheduler& s = d->state();
+        const SchedulerView& s = d->state();
         Commit cm;
         cm.epoch = 1; cm.event = s.next_event(); cm.boundary = s.boundary();
         Payload p;

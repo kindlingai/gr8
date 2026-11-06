@@ -273,57 +273,81 @@ inline bool grant_pages_ok(const Config& c, const Request& r, uint32_t pages) {
 inline uint32_t prefill_left(const Slot& s) { return g6sch_prefill_left(sch::c<g6sch_slot>(&s)); }
 inline bool prefill_first(const Slot& a, const Slot& b) { return g6sch_prefill_first(sch::c<g6sch_slot>(&a), sch::c<g6sch_slot>(&b)); }
 
-// The scheduler's rules are engine/scheduler-rs/src/scheduler.rs; this class owns the state they act on.
-class Scheduler {
+// The scheduler's state, read only: a Scheduler's own, or the Rust driver's (Driver::state). The rules are
+// engine/scheduler-rs/src/scheduler.rs.
+class SchedulerView {
+    const Config* vc_ = nullptr;
+    const g6sch_slot* vs_ = nullptr;
+    const g6sch_state* vst_ = nullptr;
+public:
+    SchedulerView() = default;
+    // s: MAX_SESSIONS slots
+    SchedulerView(const Config* c, const g6sch_slot* s, const g6sch_state* st) : vc_(c), vs_(s), vst_(st) {}
+    const Config& config() const { return *vc_; }
+    const std::array<Slot, MAX_SESSIONS>& slots() const { return *reinterpret_cast<const std::array<Slot, MAX_SESSIONS>*>(vs_); }
+    uint64_t boundary() const { return vst_->boundary; }
+    uint64_t next_event() const { return vst_->event + 1; }
+    uint64_t revision() const { return vst_->revision; }
+    bool busy() const { return vst_->busy; }
+    unsigned resident() const { return g6sch_resident(vs_, MAX_SESSIONS); }
+    unsigned retiring() const { return g6sch_retiring(vs_, MAX_SESSIONS); }
+    unsigned parked() const { return g6sch_parked(vs_, MAX_SESSIONS); }
+    std::optional<Key> find(uint64_t id) const {
+        g6sch_key k;
+        if (!g6sch_find(vs_, MAX_SESSIONS, id, &k)) return {};
+        return Key{k.epoch, k.slot, k.generation};
+    }
+    // park: a parked slot (or a Retiring one, which the commit parks) the grant takes for a follow-up that extends it
+    Key next_key(std::optional<Key> cancel = {}, std::optional<unsigned> park = {}) const {
+        g6sch_key k;
+        check(g6sch_next_key(vc_, vs_, MAX_SESSIONS, cancel ? sch::c<g6sch_key>(&*cancel) : nullptr, bool(park),
+                             park.value_or(0), &k));
+        return Key{k.epoch, k.slot, k.generation};
+    }
+    std::vector<Run> reclaimable(std::optional<Key> cancel = {}) const {
+        std::vector<Run> out(MAX_SESSIONS);
+        out.resize(g6sch_reclaimable(vc_, vs_, MAX_SESSIONS, cancel ? sch::c<g6sch_key>(&*cancel) : nullptr, sch::m<g6sch_run>(out.data())));
+        return out;
+    }
+    uint64_t digest() const { // event diagnostics only; NEVER called by next()/complete()
+        uint64_t h = g6sch_digest_head(vc_, vst_);
+        g6rt::steering::hash_boot(h, vc_->steering);
+        return g6sch_digest_slots(vc_, vs_, MAX_SESSIONS, h);
+    }
+    // the decoding sessions in ascending request id, as next() orders them (tests only; the driver's is Rust's)
+    std::vector<Key> decoding() const {
+        std::vector<Key> out(MAX_SESSIONS);
+        out.resize(g6sch_decoding(vs_, MAX_SESSIONS, sch::m<g6sch_key>(out.data())));
+        return out;
+    }
+    // The boundary a notice anchored now should target (service.h event): the first boundary whose work after the one
+    // in flight covers NOTICE_ROWS prefill rows, within [boundary + NOTICE_MIN, boundary + notice_max]. A pure function
+    // of the slots and the alternation flag, so every rank names the same boundary.
+    uint64_t horizon() const { return g6sch_horizon(vc_, vs_, MAX_SESSIONS, vst_); }
+};
+
+// A scheduler that owns its state (tests and tools; the service's is the Rust driver's).
+class Scheduler : public SchedulerView {
     Config c_;
     std::array<Slot, MAX_SESSIONS> s_{};
     g6sch_state st_{};
-    const g6sch_slot* rs() const { return sch::c<g6sch_slot>(s_.data()); }
     g6sch_slot* rs() { return sch::m<g6sch_slot>(s_.data()); }
-    friend class Driver;   // the Rust driver acts on this state (driver.h)
-    g6s2_drv_sched raw() { return {&c_, rs(), MAX_SESSIONS, &st_}; }
+    // the view points at this object's own state, again after a copy
+    void point() { static_cast<SchedulerView&>(*this) = SchedulerView(&c_, sch::c<g6sch_slot>(s_.data()), &st_); }
 public:
     explicit Scheduler(Config c) : c_(c) {
         sch::check_abi();
         c_.validate();
         st_.want_decode = true;
         g6sch_init(&c_, rs(), MAX_SESSIONS);
+        point();
     }
-    const Config& config() const { return c_; }
-    const auto& slots() const { return s_; }
-    uint64_t boundary() const { return st_.boundary; }
-    uint64_t next_event() const { return st_.event + 1; }
-    uint64_t revision() const { return st_.revision; }
-    bool busy() const { return st_.busy; }
+    Scheduler(const Scheduler& o) : SchedulerView(), c_(o.c_), s_(o.s_), st_(o.st_) { point(); }
+    Scheduler& operator=(const Scheduler& o) { c_ = o.c_; s_ = o.s_; st_ = o.st_; point(); return *this; }
     void idle_boundary(uint64_t target) { check(g6sch_idle_boundary(rs(), MAX_SESSIONS, &st_, target)); }   // event-only: no model work
     void fail() { st_.failed = true; }
     // the pool's digest (pool.h RunPool::digest) at this event boundary, so the ranks also agree on their pages
     void pool_digest(uint64_t d) { st_.pool = d; }
-    unsigned resident() const { return g6sch_resident(rs(), MAX_SESSIONS); }
-    unsigned retiring() const { return g6sch_retiring(rs(), MAX_SESSIONS); }
-    unsigned parked() const { return g6sch_parked(rs(), MAX_SESSIONS); }
-    std::optional<Key> find(uint64_t id) const {
-        g6sch_key k;
-        if (!g6sch_find(rs(), MAX_SESSIONS, id, &k)) return {};
-        return Key{k.epoch, k.slot, k.generation};
-    }
-    // park: a parked slot (or a Retiring one, which the commit parks) the grant takes for a follow-up that extends it
-    Key next_key(std::optional<Key> cancel = {}, std::optional<unsigned> park = {}) const {
-        g6sch_key k;
-        check(g6sch_next_key(&c_, rs(), MAX_SESSIONS, cancel ? sch::c<g6sch_key>(&*cancel) : nullptr, bool(park),
-                             park.value_or(0), &k));
-        return Key{k.epoch, k.slot, k.generation};
-    }
-    std::vector<Run> reclaimable(std::optional<Key> cancel = {}) const {
-        std::vector<Run> out(MAX_SESSIONS);
-        out.resize(g6sch_reclaimable(&c_, rs(), MAX_SESSIONS, cancel ? sch::c<g6sch_key>(&*cancel) : nullptr, sch::m<g6sch_run>(out.data())));
-        return out;
-    }
-    uint64_t digest() const { // event diagnostics only; NEVER called by next()/complete()
-        uint64_t h = g6sch_digest_head(&c_, &st_);
-        g6rt::steering::hash_boot(h, c_.steering);
-        return g6sch_digest_slots(&c_, rs(), MAX_SESSIONS, h);
-    }
     Changes apply(const Commit& e) {
         const g6sch_commit x = sch::to_rs(e);
         Changes d;
@@ -337,12 +361,6 @@ public:
     // a decoding session's run grew (Driver::step, every rank alike, between events)
     void grow(const Key& k, const Run& r) {
         check(g6sch_grow(&c_, rs(), MAX_SESSIONS, &st_, sch::c<g6sch_key>(&k), sch::c<g6sch_run>(&r)));
-    }
-    // the decoding sessions in ascending request id, as next() orders them (tests only; the driver's is Rust's)
-    std::vector<Key> decoding() const {
-        std::vector<Key> out(MAX_SESSIONS);
-        out.resize(g6sch_decoding(rs(), MAX_SESSIONS, sch::m<g6sch_key>(out.data())));
-        return out;
     }
     // The alternation flag after a completed quantum of kind k: a prefill (or tail) asks for a decode round next; a decode
     // round asks for the prefill unless fewer than decode_rounds rounds have run since the last prefill. horizon() runs
@@ -369,10 +387,6 @@ public:
         const g6sch_quantum x = sch::to_rs(q);
         g6sch_advance(sch::m<g6sch_slot>(sim.data()), MAX_SESSIONS, &x);
     }
-    // The boundary a notice anchored now should target (service.h event): the first boundary whose work after the one
-    // in flight covers NOTICE_ROWS prefill rows, within [boundary + NOTICE_MIN, boundary + notice_max]. A pure function
-    // of the slots and the alternation flag, so every rank names the same boundary.
-    uint64_t horizon() const { return g6sch_horizon(&c_, rs(), MAX_SESSIONS, &st_); }
     // a just-admitted session that runs its whole prompt as decode steps (prompt logprobs): straight to PromptTail
     void skip_prefill(const Key& k) { check(g6sch_skip_prefill(rs(), MAX_SESSIONS, &st_, sch::c<g6sch_key>(&k))); }
     void complete_prefill() { check(g6sch_complete_prefill(&c_, rs(), MAX_SESSIONS, &st_)); }   // both lanes and draft prefill

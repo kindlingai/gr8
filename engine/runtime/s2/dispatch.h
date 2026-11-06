@@ -79,7 +79,7 @@ public:
     // Call at every safe boundary after local EOS/commit, not inside a Step.
     // Resident means Prefill OR Decode; a 1-session prompt step within S>=2 is
     // NOT the S=1 fast path. No callback if mode unchanged.
-    void synchronize_mode(const Scheduler& scheduler) {
+    void synchronize_mode(const SchedulerView& scheduler) {
         int q = -1; unsigned live = 0;
         for (const auto& s : scheduler.slots()) if (s.phase == Phase::Prefill || s.phase == Phase::Decode) { q = int(s.key.slot); ++live; }
         const int next = live == 1 ? q : -1;

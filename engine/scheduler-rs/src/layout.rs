@@ -185,7 +185,7 @@ impl Kind for crate::planner_ffi::CLearn {
 impl Kind for crate::planner_ffi::CHooks {
     const K: u64 = 6;
 }
-impl Kind for crate::driver::CSched {
+impl Kind for crate::driver::CView {
     const K: u64 = 6;
 }
 impl Kind for crate::driver::CPayload {
@@ -195,6 +195,9 @@ impl Kind for crate::driver::CHooks {
     const K: u64 = 6;
 }
 impl Kind for crate::driver::CPlanner {
+    const K: u64 = 6;
+}
+impl Kind for crate::driver::CPool {
     const K: u64 = 6;
 }
 // g6sched.h counts void as 1 byte, as Rust's c_void
@@ -223,6 +226,7 @@ fn_kinds!(
     crate::driver::VoidFn,
     crate::driver::ShrinkFn,
     crate::driver::PayloadFn,
+    crate::driver::GrownFn,
     crate::driver::AdmitFn,
     crate::driver::AdmitPackFn,
     crate::driver::RoundFn,
@@ -564,8 +568,9 @@ pub fn digest() -> u64 {
             has_lp
         }
     );
-    layout!(h, crate::driver::CSched { c, s, n, st });
+    layout!(h, crate::driver::CView { s, n, st });
     layout!(h, crate::driver::CPayload { prompt_len, chunk, decode_prompt, steering_ok });
+    layout!(h, crate::driver::CPool { grow, shrink, release, head });
     layout!(
         h,
         crate::driver::CHooks {
@@ -582,6 +587,7 @@ pub fn digest() -> u64 {
             shrink,
             settle,
             payload,
+            grown,
             has_prefill_pack,
             has_dfl_ok,
             has_terminal,
@@ -589,7 +595,8 @@ pub fn digest() -> u64 {
             has_finished,
             has_resize,
             has_shrink,
-            has_settle
+            has_settle,
+            has_grown
         }
     );
     layout!(
