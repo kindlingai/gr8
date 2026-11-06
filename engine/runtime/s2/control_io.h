@@ -1,97 +1,77 @@
 // Host control transport primitive. Owns an ALREADY CONNECTED stream socket
 // (TCP in a native adapter, socketpair in CPU tests). Only event/control threads use it.
 // Persistent fd; no per-request or per-round connect. No CUDA dependency.
+// The link is Rust (engine/scheduler-rs src/control/io.rs): ControlIO is a facade that owns its handle.
 #pragma once
-#include "scheduler.h"
+#include "control_rs.h"
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include "posix_socket.h"
 #include <netinet/tcp.h>
+#include <poll.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 namespace g6s2 {
+namespace ctl {
+// the Rust declares the socket calls' constants and layouts itself: they must be this system's
+inline void check_sys() {
+    static const bool ok = [] {
+#ifdef TCP_USER_TIMEOUT
+        constexpr int64_t user_timeout = TCP_USER_TIMEOUT;
+#else
+        constexpr int64_t user_timeout = -1;
+#endif
+#ifdef SOCK_CLOEXEC
+        constexpr int64_t sock_cloexec = SOCK_CLOEXEC, sock_nonblock = SOCK_NONBLOCK;
+#else
+        constexpr int64_t sock_cloexec = 0, sock_nonblock = 0;
+#endif
+#ifdef SO_NOSIGPIPE
+        constexpr int64_t nosigpipe = SO_NOSIGPIPE;
+#else
+        constexpr int64_t nosigpipe = -1;
+#endif
+        const int64_t want[] = {
+            AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR, SO_ERROR, SO_RCVTIMEO, SO_SNDTIMEO, SO_KEEPALIVE,
+            IPPROTO_TCP, TCP_NODELAY, TCP_KEEPALIVE_IDLE, TCP_KEEPINTVL, TCP_KEEPCNT, user_timeout, SEND_FLAGS,
+            sock_cloexec, sock_nonblock, nosigpipe, O_NONBLOCK, F_GETFL, F_SETFL, F_SETFD, FD_CLOEXEC, EINTR, EAGAIN,
+            EWOULDBLOCK, EINPROGRESS, ECONNREFUSED, POLLIN, POLLOUT, POLLNVAL, SHUT_RDWR, sizeof(sockaddr_in),
+            offsetof(sockaddr_in, sin_family), offsetof(sockaddr_in, sin_port), offsetof(sockaddr_in, sin_addr),
+            sizeof(timeval), offsetof(timeval, tv_usec), sizeof(pollfd)};
+        static_assert(sizeof want / sizeof want[0] == G6CTL_SYS_N, "one value per G6CTL_SYS_*");
+        for (uint32_t i = 0; i < G6CTL_SYS_N; ++i) if (g6ctl_sys(i) != want[i]) return false;
+        return true;
+    }();
+    require(ok, "scheduler-rs: socket constants differ from the system headers");
+}
+} // namespace ctl
 class ControlIO {
-    int fd_;
-    static constexpr uint32_t MAX_BYTES = 64u << 20; // event metadata and request payloads (a 393K-token prompt; DS41 images, up to 48 MiB of base64 a request), never model tensors
-    // disconnect logging (root-cause follow-up: r1 died with only 'control disconnected/truncated' across 5 crashes):
-    // before the epoch-fatal require, print ONE greppable reason line to stderr (rN.err) so the
-    // next FABRIC capture shows WHY the control link dropped: recv/send return code, errno text,
-    // bytes still missing, and the frame counters. Diagnostics only: the throw stays identical.
-    [[gnu::cold]] void log_disconnect(const char* dir, ssize_t k, size_t remaining, size_t total) const {
-        const int e = errno; // captured before anything else can touch it
-        std::fprintf(stderr, "g6ctl: control %s failed: ret=%zd errno=%d (%s) remaining=%zu of %zu bytes, frames sent=%llu recv=%llu\n",
-                     dir, k, e, std::strerror(e), remaining, total,
-                     (unsigned long long)sent, (unsigned long long)received);
-    }
-    void send_all(const uint8_t* p, size_t n) {
-        const size_t total = n;
-        while (n) {
-            ssize_t k = ::send(fd_, p, n, SEND_FLAGS);
-            if (k < 0 && errno == EINTR) continue;
-            if (k <= 0) log_disconnect("send", k, n, total);
-            require(k > 0, "control send failed"); p += k; n -= size_t(k);
-        }
-    }
-    // idle: the link may stay silent indefinitely before the first byte (a worker's event reader between
-    // admit/cancel events), so a receive timeout (EAGAIN) with nothing read yet is retried. Once a frame has
-    // started, the timeout applies again. A peer close or shutdown() still ends the wait (recv returns 0).
-    void read_all(uint8_t* p, size_t n, bool idle = false) {
-        const size_t total = n;
-        while (n) {
-            ssize_t k = ::recv(fd_, p, n, 0);
-            if (k < 0 && errno == EINTR) continue;
-            if (k < 0 && idle && n == total && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-            if (k <= 0) log_disconnect("recv", k, n, total);
-            require(k > 0, "control disconnected/truncated"); p += k; n -= size_t(k);
-        }
-    }
+    struct Free { void operator()(g6ctl_io* p) const { g6ctl_io_free(p); } };
+    std::unique_ptr<g6ctl_io, Free> h_;
 public:
-    uint64_t sent = 0, received = 0;
-    explicit ControlIO(int fd) : fd_(fd) { require(fd >= 0, "bad control fd"); }
-    ~ControlIO() { if (fd_ >= 0) ::close(fd_); }
-    ControlIO(const ControlIO&) = delete; ControlIO& operator=(const ControlIO&) = delete;
-    void shutdown() { ::shutdown(fd_, SHUT_RDWR); } // wake both control directions on epoch failure
+    struct Adopt {};   // a link the Rust bootstrap made
+    explicit ControlIO(int fd) : h_((ctl::check_sys(), g6ctl_io_new(fd))) { require(bool(h_), "bad control fd"); }
+    ControlIO(Adopt, g6ctl_io* io) : h_(io) { require(bool(h_), "bad control fd"); }
+    const g6ctl_io* handle() const { return h_.get(); }
+    uint64_t sent() const { uint64_t s, r; g6ctl_io_counts(h_.get(), &s, &r); return s; }
+    uint64_t received() const { uint64_t s, r; g6ctl_io_counts(h_.get(), &s, &r); return r; }
+    void shutdown() { g6ctl_io_shutdown(h_.get()); } // wake both control directions on epoch failure
     // Adapter configures runtime timeout on the socket. Failure is epoch-fatal;
     // an adapter must call EventGate::fail() to wake a boundary waiter.
-    void timeout_seconds(unsigned seconds) {
-        require(seconds > 0, "control timeout must be positive");
-        timeval tv{time_t(seconds), 0};
-        require(!setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) &&
-                !setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv), "control timeout setup failed");
-    }
-    // TCP peer liveness for the idle event wait: the idle read has no timeout, so a peer that is lost without a
-    // FIN/RST (power loss, cable pull) must be detected by the kernel. Keepalive probes after idle_s of silence, every
-    // intvl_s, cnt times; TCP_USER_TIMEOUT bounds unacknowledged sends the same way. A dead peer then fails recv/send
-    // with ETIMEDOUT, which ends the idle wait. TCP sockets only.
-    void keepalive(int idle_s, int intvl_s, int cnt) {
-        require(idle_s > 0 && intvl_s > 0 && cnt > 0, "invalid keepalive");
-        const int on = 1; const unsigned user_ms = unsigned(idle_s + intvl_s * cnt) * 1000u;
-        require(!setsockopt(fd_, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof on) &&
-                !setsockopt(fd_, IPPROTO_TCP, TCP_KEEPALIVE_IDLE, &idle_s, sizeof idle_s) &&
-                !setsockopt(fd_, IPPROTO_TCP, TCP_KEEPINTVL, &intvl_s, sizeof intvl_s) &&
-                !setsockopt(fd_, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt) &&
-                !set_user_timeout(fd_, user_ms), "control keepalive setup failed");
-    }
-    // TCP_NODELAY: send() writes a frame as two segments (4-byte header, then body). With Nagle on, the body waits
-    // for the ACK of the header, and the peer (blocked in recv for the body) delays that ACK by up to 40 ms: every
-    // small frame, such as an admission, reached the workers ~40 ms late. TCP sockets only.
-    void nodelay() {
-        const int on = 1;
-        require(!setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &on, sizeof on), "control nodelay setup failed");
-    }
-    void send(const std::vector<uint8_t>& body) {
-        require(!body.empty() && body.size() <= MAX_BYTES, "control frame size invalid");
-        const uint32_t n = uint32_t(body.size());
-        const uint8_t head[4] = {uint8_t(n >> 24), uint8_t(n >> 16), uint8_t(n >> 8), uint8_t(n)};
-        send_all(head, 4); send_all(body.data(), body.size()); ++sent;
-    }
-    // idle = true: wait for the next frame header with no timeout (event readers only; see read_all)
+    void timeout_seconds(unsigned seconds) { ctl::check(g6ctl_io_timeout(h_.get(), seconds)); }
+    // TCP peer liveness for the idle event wait: keepalive probes after idle_s of silence, every intvl_s, cnt times,
+    // and TCP_USER_TIMEOUT for unacknowledged sends. A dead peer then fails recv/send. TCP sockets only.
+    void keepalive(int idle_s, int intvl_s, int cnt) { ctl::check(g6ctl_io_keepalive(h_.get(), idle_s, intvl_s, cnt)); }
+    void nodelay() { ctl::check(g6ctl_io_nodelay(h_.get())); }   // TCP sockets only
+    void send(const std::vector<uint8_t>& body) { ctl::check(g6ctl_io_send(h_.get(), body.data(), body.size())); }
+    // idle = true: wait for the next frame header with no timeout (event readers only)
     std::vector<uint8_t> receive(bool idle = false) {
-        uint8_t h[4]; read_all(h, 4, idle);
-        const uint32_t n = uint32_t(h[0]) << 24 | uint32_t(h[1]) << 16 | uint32_t(h[2]) << 8 | h[3];
-        require(n && n <= MAX_BYTES, "control frame size invalid");
-        std::vector<uint8_t> body(n); read_all(body.data(), n); ++received; return body;
+        std::vector<uint8_t> b;
+        ctl::check(g6ctl_io_receive(h_.get(), idle, ctl::grow_vector, &b));
+        return b;
     }
 };
 } // namespace g6s2

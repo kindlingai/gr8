@@ -415,7 +415,39 @@ Moves `service.h`, `bootstrap.h`, `control_*.h`, `ingress.h`, `trace.h`, `event_
 born here as the module-facing subset of `NativeHooks` and `DispatchHooks`. Each adapter's `std::function`s become
 `extern "C"` trampolines over the same lambdas, so no device code moves. Most of the work is building the context
 struct those lambdas need: today they capture `main()` locals by reference (`g6m4.cu:3057-3323` captures the pool, the
-tiers, the model, the draft, the fabric and the step buffers). Consider two PRs: bootstrap and control, then compute.
+tiers, the model, the draft, the fabric and the step buffers). Two PRs:
+
+1. R5a, bootstrap and control: `bootstrap.h`, `control_io.h`, `control_protocol.h`, `control_channel.h` and
+   `event_gate.h`. The gate goes with them: the channels drive it, and the event-boundary pause lives in it.
+2. R5b, the service and compute side: `service.h` (its control, watcher and compute loops), `ingress.h`, `trace.h`,
+   `resources.h`, and `ModuleOps`.
+
+R5a landed as `engine/scheduler-rs` `src/control/` (`g6ctl_*` in `g6sched.h`; its structs in the layout digest). Rust owns
+each link's socket (`io.rs`, closed when the C++ `ControlIO` that owns the handle goes), the frames (`wire.rs`), the
+gate and the ACK set (`gate.rs`), the head's and workers' channels (`channel.rs`) and the bootstrap's sockets and
+exchanges (`bootstrap.rs`: listen, accept, connect with its retry, the hello, release and ACK, `agree_lines`,
+`capture_barrier`, `agreement_difference`). The C++ classes keep their APIs (the service, `g6m4.cu`, the Flash and DS41
+adapters and the tests build unchanged) and hold one Rust handle each. Callbacks (the digest with the room,
+`make_commit`, `on_quit`) cross as a function pointer and a context per call. The facade holds a callback's exception
+and rethrows it once the Rust returns, after the Rust failed the epoch as the C++ did. A refusal's message is per thread,
+since the head's control and compute threads call one channel at once. No thread is started in Rust and the threads
+touch what they touched: on the head the control thread runs `event` (announce, ACKs, commit) and the compute thread
+`boundary`, `applied` and `sync`, the watcher `quit` and `fail`; sends to the workers share one lock, and whichever of
+the control and compute threads waits reads a worker's link. A worker's control thread is its link's only reader. The
+channels hold the links as borrowed pointers, as the C++ did: the links outlive them. The gate's no-event path is
+atomics only, and `make_commit` runs with no Rust lock held while every rank waits in the gate, so the pause that makes
+the head's multi-call pool sequences safe is unchanged. The socket calls are declared in `sys.rs` (std has no keepalive
+or poll), with Linux's and macOS's constants; `control_io.h` compares every constant and the `sockaddr_in`, `timeval`
+and `pollfd` layouts with the system headers once (`g6ctl_sys`). `BootstrapConfig`, its `agreement()` string (the
+capability, which moves with `ingress.h`), `atomic_file` and `publish_ready` stay C++ until R5b. `ControlIO`'s frame
+counters are now methods. Checked: `control_vectors_test` (every frame kind, each decoder on each frame and on cut,
+flipped and extended copies, the Encoder and Decoder pieces, `match`, seeded gate and ACK-set sequences, the
+agreement diff) matches hashes recorded from the C++ (git 5381433c) in every model shape, and each build decodes the
+other's 2,696 frames, which are byte-identical; `control_wire_test` records both directions of each link of a TP3 boot
+through a relay (bootstrap, store agreement, capture barrier, held and released admissions with a shrink, a cancel, a
+resize, barriers, quit) and matches the C++'s bytes. The control, bootstrap, agreement, hold, drain and loopback TP1/2
+tests pass unchanged in each shape on macOS, and `scripts/host_tests.sh` and `cargo test --release --workspace` pass on
+Linux. Boot pending.
 
 ### R6. Options, signatures and the fabric plan to Rust
 
@@ -500,4 +532,4 @@ lines of `g6m4.cu` (weight load, build, capture, the device halves of the adapte
   module-only), about 370 `__device__` globals.
   The device globals are fine per module; the host singletons must move to the core or into the module handle.
 - The fabric plan must reproduce today's order of `Fabric::init` calls and port offsets exactly, for every knob
-  setting that changes it, and keep `capture_barrier` (`bootstrap.h:222`) after capture.
+  setting that changes it, and keep `capture_barrier` (`s2/bootstrap.h`) after capture.
