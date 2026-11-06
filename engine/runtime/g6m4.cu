@@ -702,6 +702,8 @@ int main(int argc, char** argv)
         // decode slot. Fabric::enqueue_step still checks each collective against its own slot.
         const int tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
         if (tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
+        ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1): before late_start() sizes the fabric runs below
+        if (ds41::br::l20_tail() && !tail) die("GR8_DS_PF_L20_TAIL=1 needs GR8_DS_PF_TAIL (layer 20 joins the bounded replay)");
         const int i_late = tail ? ds41::br::late_start(layers) : -1;
         bool pf_rs_on = false;
         // GR8_DS_PF_RS=1: layer exchanges c < 2 i_late of a prefill chunk run as reduce-scatter + all-gather (ds41_rs.h). Run 0 holds NR
@@ -2247,7 +2249,11 @@ int main(int argc, char** argv)
         // bounded replay (ds41_pf_split.h): GR8_DS_PF_TAIL, read once; 0 = off (the unsplit non-final plan)
         const int pf_tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
         if (pf_tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
-        if (pf_min) fprintf(stderr, "# rank %d DS41 prefill bounded replay tail %d (layers >= %d)\n", R, pf_tail, geom::LATE_LAYER_START);
+        ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1); the same value the fabric block set
+        if (ds41::br::l20_tail() && !pf_tail) die("GR8_DS_PF_L20_TAIL=1 needs GR8_DS_PF_TAIL (layer 20 joins the bounded replay)");
+        if (pf_min) fprintf(stderr, "# rank %d DS41 prefill bounded replay tail %d (layers >= %d)\n", R, pf_tail, ds41::br::late_layer_start());
+        if (pf_min && ds41::br::l20_tail())
+            fprintf(stderr, "# rank %d DS41 GR8_DS_PF_L20_TAIL=1: layer 20 in the bounded replay (ca row on every row, the rest of the layer on the tail rows)\n", R);
         // ds41_pf_split.h late_skip: GR8_DS_PF_LATE_FINAL=1 = a chunk with (N-1) - context >= tail + WINDOW rows after it skips range B. Default off.
         bool pf_late_final = false;
         if (knob::ds_pf_late_final()) {

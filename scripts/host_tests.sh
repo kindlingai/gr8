@@ -82,8 +82,10 @@ for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_M
 done
 # engine/scheduler-rs against transcripts recorded from the C++ it replaced, in each model's shape (the module's slots
 # and caps decide which configs the scheduler takes)
+# under the sanitizers in the default shape only: the 32-slot DS41 shape took 13 minutes there on CI's runner
 for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
-  g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rs_vectors_test.cpp" -o "$T/scheduler_rs_vectors_test" "${KVLIB[@]}"
+  if [ -z "$f" ]; then opt="-O1 -g -fsanitize=address,undefined"; else opt="-O2"; fi
+  g++ -std=c++17 $opt -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rs_vectors_test.cpp" -o "$T/scheduler_rs_vectors_test" "${KVLIB[@]}"
   "$T/scheduler_rs_vectors_test"
 done
 # the planner's round log and its replay (GR8_S2_REPLAY_LOG, s2/round_replay.h); GR8_S2_FRESH_SPEC
@@ -293,6 +295,17 @@ g++ -std=c++17 -O2 -Wall "$REPO/engine/kernels/tests/ds_ro_host_test.cpp" -o "$T
 # DS41 W4096: RO_MAX 4096 is the largest prefill width, and the RoScratch tile capacity holds the 4096-row plan
 g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" -I "$REPO/engine/kernels" "$REPO/engine/tests/test_ds41_w4096.cpp" -o "$T/test_ds41_w4096"
 "$T/test_ds41_w4096"
+# the bounded-replay split (runtime/ds41_pf_split.h), off and with GR8_DS_PF_L20_TAIL=1 (layer 20 in range B, its ca row hoisted)
+g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/test_ds41_pf_split.cpp" -o "$T/test_ds41_pf_split"
+"$T/test_ds41_pf_split" > "$T/pf_split.log" || { cat "$T/pf_split.log"; exit 1; }
+tail -1 "$T/pf_split.log"
+# the two-lane W prefill contract (runtime/ds41_lanes.h): schedules, fabric tables, scheduler; again with GR8_DS_PF_L20_TAIL=1
+g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" -I "$REPO/engine/runtime" -I "$REPO/engine/comms" -I "$REPO/engine/kernels" \
+  "$REPO/engine/tests/test_ds41_lanes.cpp" -o "$T/test_ds41_lanes" "${KNOBS[@]}"
+"$T/test_ds41_lanes" > "$T/lanes.log" || { cat "$T/lanes.log"; exit 1; }
+tail -1 "$T/lanes.log"
+"$T/test_ds41_lanes" l20 > "$T/lanes_l20.log" || { cat "$T/lanes_l20.log"; exit 1; }
+tail -1 "$T/lanes_l20.log"
 # DS41 shifted-mHC trunk (engine/mhc/ds_cpu.h) against the torch reference; it needs torch, so it skips without it
 if python3 -c "import torch, numpy" 2>/dev/null; then
   bash "$REPO/engine/runtime/tests/ds_mhc_cpu_test.sh" "$T/ds_mhc_cpu_test"
