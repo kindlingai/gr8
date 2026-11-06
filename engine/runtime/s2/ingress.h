@@ -32,7 +32,7 @@ inline Command parse_command(const std::string& text, uint64_t epoch) {
     require(c.epoch==epoch && (c.admit || c.hash==0), "ingress epoch/cancel mismatch"); return c;
 }
 inline std::string capability(Config c, unsigned ranks) {
-    c.validate(); require(ranks==2 || ranks==3 || ranks==4 || ranks==5 || ranks==6, "invalid rank count");
+    c.validate(); require(ranks>=1 && ranks<=6, "invalid rank count");
     const std::string base=std::to_string(c.epoch)+" "+std::to_string(ranks)+" "+std::to_string(c.pool_rows)+" "+
         std::to_string(c.mtp)+" "+std::to_string(c.guard())+" "+std::to_string(c.max_rows)+" "+std::to_string(g6rt::LP_MAX);
     // Version 3 adds insert rules. Version 4 appends the immutable steering receipt of one profile, version 5 that

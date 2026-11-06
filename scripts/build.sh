@@ -11,7 +11,7 @@
 #   KV_FORMAT=int4 scripts/build.sh bin   only OUT_DIR/g6m4-int4: the engine with the 4-bit KV latent (-DG6_KV4=1,
 #                                         docs/KV4.md), which `--kv-format int4` runs. The same widths.
 #   MODEL=flash scripts/build.sh bin      only OUT_DIR/g6m4_flash and OUT_DIR/m4sim_flash: GLM 5.3 Flash
-#                                         (-DG6_MODEL_FLASH=1, engine/model_geom.h), fp8 KV only; TP = 2 and 4 unless
+#                                         (-DG6_MODEL_FLASH=1, engine/model_geom.h), fp8 KV only; TP = 1 to 4 unless
 #                                         GR8_WIDTHS or GR8_NR says otherwise
 #   MODEL=ds41 scripts/build.sh bin       only OUT_DIR/g6m4_ds41 and OUT_DIR/m4sim_ds41: DeepSeek-V4.1-Flash-1017
 #                                         (-DG6_MODEL_DS41=1, engine/model_geom_ds41.h, docs/DEEPSEEK.md), fp8 KV only; TP = 4
@@ -112,7 +112,7 @@ case "${MODEL:-glm}" in
   glm) ;;
   flash)   # g6m4 and m4sim in their own object dir, installed as g6m4_flash / m4sim_flash next to the GLM build
     [ "${KV_FORMAT:-fp8}" = fp8 ] || { echo "MODEL=flash: KV_FORMAT=fp8 only"; exit 2; }
-    WIDTHS=${GR8_WIDTHS:-${GR8_NR:-2 3 4}}
+    WIDTHS=${GR8_WIDTHS:-${GR8_NR:-1 2 3 4}}
     # PF_FC2GL must divide HID / 128 = 32 (GLM 48: 6); build_m4.sh leaves out PF_F12, which the Flash fp16 MoE refuses
     WIDTHS="$WIDTHS" EXTRA="${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_FLASH=1 ${EXTRA:-}" OUT="$OUT/flash" \
       bash build_m4.sh "${ARCH:-121a}" all
