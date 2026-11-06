@@ -1,6 +1,6 @@
 # gr8: a super-fast local AI engine
 
-Need help? Join us on discord: https://discord.gg/M7XTrRJW3
+Need help? Join us on Discord: https://discord.gg/VmsM9GWqZ
 
 Full GLM-5.3 on DGX Spark (GB10). *Beta release. If you run it, please tell us what breaks: issues and PRs are welcome.*
 
