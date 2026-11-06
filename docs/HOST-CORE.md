@@ -387,6 +387,25 @@ decode round allocates nothing in the Rust after warm-up (a counting-allocator t
 capped-round pick moved to stack arrays for it). Linux: `scripts/host_tests.sh` passes with Rust 1.94.1.
 `driver_facade_test` covers the exception, refusal, call-back and move paths.
 
+R4c landed. The Rust driver owns the scheduler's config, slots and counters, and the C++ reads them through one view
+(`g6s2_driver_view`): `SchedulerView`, the read half of `Scheduler`'s API, which `Driver::state()` returns and the
+service, `Dispatch`, `Progress` and the tests take. `Scheduler` stays for the tests and tools that run one without a
+driver. The service hands the driver the rank's pool (`PoolHooks::pool`, the adapter's `RunPool`), and the driver makes
+the pure pool calls Rust to Rust (`DriverPool`): growth before a round, then a `grown` hook for the engine's tables and
+`Sessions`; a worker's `shrink_run`, checked against the head's; and the release of a leaving session's run when
+nothing is retained. The head skips the cancel and shrink calls it made while building the commit. Each call locks the
+pool once, and no hook runs under the lock. The worker's bind (`count`, `match`, `take`, `reserve`, which Flash and DS41
+wrap), `retain` and `park`, and the resize hooks stay C++. `share_apply` is `kv_share.rs` `apply`: it locks the pool
+for `resize_tier` alone and calls `run_io` unlocked, and `kv_share.h` keeps its signature over it. Flash's checkpoint
+lease keeps its own C++ sequence, since it resizes the checkpoint index, not the pool. Checked on macOS: the 10,693
+round logs that the driver, scheduler and DS41 host tests write in the default, Flash and DS41 shapes are
+byte-identical to the build before, with `driver_grow_test` on the driver's pool path; the vectors keep their hashes,
+and a new section, `driver_pool` (a head and a worker over real pools: grants, cancels, shrinks, growth, finishes), was
+recorded from the service's old pool hooks in each shape; `kv_share_test` against a loopback node prints what the build
+before did; `round_replay --steps-only` replays the GLM serving logs v2 and v3 and the same 11,092 test logs; a decode
+round with pool growth allocates nothing in the Rust. Linux (Rust 1.99.1): `scripts/host_tests.sh` and `cargo test
+--release --workspace` pass. Boot pending.
+
 ### R5. Service, control, bootstrap and ingress to Rust; ModuleOps
 
 Moves `service.h`, `bootstrap.h`, `control_*.h`, `ingress.h`, `trace.h`, `event_gate.h` and `resources.h`;
