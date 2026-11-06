@@ -185,6 +185,12 @@ struct g6sch_resize { uint32_t tier; uint64_t segs, slots, txn; };
 uint64_t g6sch_share_want(const g6kv_tier_totals* last, const g6kv_tier_totals* now, uint64_t per, bool busy);
 // true and *out written when the node's answer is a resize
 bool g6sch_share_resize(uint32_t tier, uint64_t segs, uint64_t per, uint64_t grant, uint64_t give, uint64_t txn, g6sch_resize* out);
+// share_apply: every rank's change at a Resize commit, on the pool and the tier's store. The pool is locked only for the
+// tier's resize, never around run_io (which runs the pool's copies and calls io_done; nonzero = it failed). 0 applied,
+// 1 the lease or tier keeps its size, 2 a store fault (g6kv_tier_error), 3 a pool error or a size the event did not
+// name (*msg), 4 run_io failed
+int32_t g6s2_share_apply(g6kv_pool* pool, const g6kv_tier* store, const g6sch_resize* r, int32_t (*run_io)(void* ctx),
+                         void* ctx, const char** msg);
 
 // scheduler.h AdmissionQueue: a Rust-owned queue behind an opaque pointer
 struct g6sch_queue;

@@ -7,6 +7,7 @@
 #include "pool.h"
 #include "../../scheduler-rs/g6sched.h"
 #include <algorithm>
+#include <exception>
 #include <functional>
 #include <optional>
 
@@ -39,31 +40,27 @@ inline std::optional<Resize> share_poll(RunPool& pool, uint32_t tier, const g6kv
 
 // Every rank, at the event, with no copies pending. Grow: the lease first, then the tier, then the copies the pool
 // had waiting for room. Shrink: the tier first (it evicts and queues moves into the slots that stay), the copies, then
-// the lease gives its top segments back. run_io runs the pool's queued copies in order and calls io_done. false: the
-// lease or tier keeps its size, on every rank alike: the tier refused a shrink (an indexed tier, or entries it may not
-// evict), or the node refused the transaction (G6KV_STORE_REFUSED: a grant no rank took in time). A shrink the node
-// refuses after the tier shrank leaves the lease larger than the tier, which is safe (the tier never addresses past
-// its slots). A fault (-1) throws.
+// the lease gives its top segments back. run_io runs the pool's queued copies in order and calls io_done; the pool is
+// not locked while it runs. false: the lease or tier keeps its size, on every rank alike: the tier refused a shrink (an
+// indexed tier, or entries it may not evict), or the node refused the transaction (G6KV_STORE_REFUSED: a grant no rank
+// took in time). A shrink the node refuses after the tier shrank leaves the lease larger than the tier, which is safe
+// (the tier never addresses past its slots). A fault throws, as does run_io's own exception. The rule is
+// engine/scheduler-rs/src/kv_share.rs apply.
 inline bool share_apply(RunPool& pool, const g6kv_tier* store, const Resize& r, const std::function<void()>& run_io) {
-    const uint64_t segs = g6kv_store_segs(store);
-    if (r.segs > segs) {
-        uint64_t blocks = 0;
-        const int rc = g6kv_store_grow(store, r.segs, r.txn, &blocks);
-        if (rc == G6KV_STORE_REFUSED) return false;
-        require(rc == 0, g6kv_tier_error());
-        require(blocks == r.slots, "share_apply: the lease grew to a different size than the event's");
-        require(pool.resize_tier(r.tier, blocks), "share_apply: the tier refused to grow");
-        run_io();
-    } else if (r.segs < segs) {
-        if (!pool.resize_tier(r.tier, r.slots)) return false;
-        run_io();
-        uint64_t blocks = 0;
-        const int rc = g6kv_store_shrink(store, r.segs, r.txn, &blocks);
-        if (rc == G6KV_STORE_REFUSED) return false;
-        require(rc == 0, g6kv_tier_error());
-        require(blocks == r.slots, "share_apply: the lease shrank to a different size than the event's");
-    }
-    return true;
+    sch::check_abi();
+    struct Io { const std::function<void()>& f; std::exception_ptr err; } io{run_io, nullptr};
+    auto t = [](void* c) noexcept -> int32_t {
+        Io& x = *static_cast<Io*>(c);
+        try { x.f(); return 0; } catch (...) { x.err = std::current_exception(); return 1; }
+    };
+    const g6sch_resize x{r.tier, r.segs, r.slots, r.txn};
+    const char* msg = "";
+    const int32_t rc = g6s2_share_apply(pool.handle(), store, &x, t, &io, &msg);
+    if (io.err) std::rethrow_exception(io.err);
+    require(rc != 2, g6kv_tier_error());
+    require(rc != 3, msg);
+    require(rc != 4, "share_apply: the copies failed");
+    return rc == 0;
 }
 
 } // namespace g6s2
