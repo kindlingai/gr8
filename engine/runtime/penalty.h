@@ -1,12 +1,15 @@
 // Presence / frequency penalties (OpenAI's presence_penalty and frequency_penalty, vLLM's semantics). Before a row
 // samples, the logit of every id the request has generated so far drops by presence + frequency * count. The prompt
-// does not count. s2/dispatch.h writes this layout before each main step. rank.cuh k_penalty and k_penalty_commit read
-// it. The header compiles without CUDA, as s2_in.h does, and s2/tests/penalty_test.cpp runs the kernel's row logic.
+// does not count. The thinking penalties add to those coefficients on the rows inside the think block the prompt left
+// open (until the reply's </think>), over the same counts. s2/dispatch.h writes this layout before each main step.
+// rank.cuh k_penalty and k_penalty_commit read it. The header compiles without CUDA, as s2_in.h does, and
+// s2/tests/penalty_test.cpp runs the kernel's row logic.
 //
 // Exact with speculative decoding. The row that checks draft j counts the tokens committed so far plus the drafts of
-// the rows before it in the same step, as a step alone at its position would. Every penalized logit is one subtraction
-// from the raw logit, raw - (presence + frequency * count), whichever way the count was reached. The sample therefore
-// does not depend on the draft length.
+// the rows before it in the same step, as a step alone at its position would. A drafted </think> among those drafts
+// takes the thinking penalties off the rows after it. Every penalized logit is one subtraction from the raw
+// logit, raw - (presence + frequency * count), whichever way the count was reached. The sample therefore does not
+// depend on the draft length.
 #pragma once
 #include <cstdint>
 
@@ -30,7 +33,9 @@ struct PenRow
                                   // does. Rows before it are teacher-forced and keep their logits. Row first + k also
                                   // counts the drafts of rows first + 1 .. first + k (the step's input tokens)
     int commit;                   // 1 on one row of the session: after the head, the session's counts take its new tokens
-    float presence, frequency;
+    int think_end;                // the </think> id while the request's think block is open, else -1
+    float presence, frequency;    // the whole reply's
+    float tpresence, tfrequency;  // added inside the think block
 };
 // one session slot
 struct PenSess
@@ -42,6 +47,16 @@ struct PenSess
 
 // what a count of c takes off a logit. The caller skips c = 0, so an id never generated keeps its exact logit
 G6_PEN_HD inline float pen_drop(int c, float presence, float frequency) { return presence + frequency * float(c); }
+
+// whether a row is inside the think block: the block is open (think_end >= 0) and none of the drafts before the row
+// (d[0..n)) is the close
+G6_PEN_HD inline bool pen_in_think(int think_end, const int* d, int n)
+{
+    if (think_end < 0) return false;
+    for (int i = 0; i < n; ++i)
+        if (d[i] == think_end) return false;
+    return true;
+}
 
 // the pending ids p[0..n) of a row: for p[t], its total count (base plus its occurrences in p), or -1 when p[t] already
 // appeared in p[0..t) (that entry writes the logit)

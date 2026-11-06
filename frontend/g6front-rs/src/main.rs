@@ -87,9 +87,11 @@ struct Args {
     allow_thinking_off: bool,
     emit_undeclared: bool,
     supervisor: Option<String>,
-    /// presence_penalty / frequency_penalty for a request that names none (0 = off)
+    /// presence_penalty / frequency_penalty for a request that names none (0 = off), and the thinking ones
     default_presence: f64,
     default_frequency: f64,
+    default_thinking_presence: f64,
+    default_thinking_frequency: f64,
 }
 
 const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--host H] [--port N]
@@ -101,6 +103,7 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--default-reasoning-effort minimal|low|medium|high|xhigh|max (ds41: or an integer 1-100)]
                   [--default-thinking-budget N] [--allow-thinking-off]
                   [--default-presence-penalty F] [--default-frequency-penalty F]
+                  [--default-thinking-presence-penalty F] [--default-thinking-frequency-penalty F]
                   [--undeclared-tool-calls text|emit] [--supervisor HOST:PORT]";
 
 fn parse_args() -> Result<Args, String> {
@@ -127,6 +130,8 @@ fn parse_args() -> Result<Args, String> {
         supervisor: None,
         default_presence: 0.0,
         default_frequency: 0.0,
+        default_thinking_presence: 0.0,
+        default_thinking_frequency: 0.0,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -175,15 +180,19 @@ fn parse_args() -> Result<Args, String> {
                     next(&mut i, &flag, inline)?.parse().map_err(|_| "--default-thinking-budget: not a number")?
             }
             "--allow-thinking-off" => a.allow_thinking_off = true,
-            "--default-presence-penalty" | "--default-frequency-penalty" => {
+            "--default-presence-penalty"
+            | "--default-frequency-penalty"
+            | "--default-thinking-presence-penalty"
+            | "--default-thinking-frequency-penalty" => {
                 let v: f64 = next(&mut i, &flag, inline)?.parse().map_err(|_| format!("{flag}: not a number"))?;
                 if !v.is_finite() || !(-2.0..=2.0).contains(&v) {
                     return Err(format!("{flag}: want a number in [-2, 2]"));
                 }
-                if flag == "--default-presence-penalty" {
-                    a.default_presence = v
-                } else {
-                    a.default_frequency = v
+                match flag.as_str() {
+                    "--default-presence-penalty" => a.default_presence = v,
+                    "--default-frequency-penalty" => a.default_frequency = v,
+                    "--default-thinking-presence-penalty" => a.default_thinking_presence = v,
+                    _ => a.default_thinking_frequency = v,
                 }
             }
             "--undeclared-tool-calls" => {
@@ -323,7 +332,12 @@ async fn serve(args: Args) -> Result<(), String> {
         }
     };
     // the server's penalty defaults: a request that names none samples with them (sampling.rs build)
-    for (key, v) in [("presence_penalty", args.default_presence), ("frequency_penalty", args.default_frequency)] {
+    for (key, v) in [
+        ("presence_penalty", args.default_presence),
+        ("frequency_penalty", args.default_frequency),
+        ("thinking_presence_penalty", args.default_thinking_presence),
+        ("thinking_frequency_penalty", args.default_thinking_frequency),
+    ] {
         if v != 0.0 {
             tok.gen_defaults.insert(key.into(), serde_json::Value::from(v));
             log::info!("default {key} {v}");

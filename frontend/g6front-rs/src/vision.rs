@@ -87,10 +87,7 @@ fn solve_resize_ratio(height: i64, width: i64) -> (i64, i64) {
     let bw = (max_w_float.floor() as i64 * cell) as f64 / width as f64;
     let bh = (max_h_float.floor() as i64 * cell) as f64 / height as f64;
     let beta = bw.min(bh);
-    (
-        (height as f64 * beta / p as f64).floor() as i64 * p,
-        (width as f64 * beta / p as f64).floor() as i64 * p,
-    )
+    ((height as f64 * beta / p as f64).floor() as i64 * p, (width as f64 * beta / p as f64).floor() as i64 * p)
 }
 
 /// `plan_image_grid(width, height, args)` with the release's vision_config (max_wh_ratio null).
@@ -343,7 +340,8 @@ fn decode_gif(bytes: &[u8]) -> Result<Rgb, VisionError> {
 /// Decode PNG / JPEG / WebP / GIF bytes to RGB as PIL's `Image.open(...).convert("RGB")` does.
 pub fn decode_rgb(bytes: &[u8]) -> Result<Rgb, VisionError> {
     use image::{DynamicImage as D, ImageFormat as F};
-    let fmt = image::guess_format(bytes).map_err(|_| VisionError("unrecognised image data (PNG, JPEG, WebP or GIF)".into()))?;
+    let fmt = image::guess_format(bytes)
+        .map_err(|_| VisionError("unrecognised image data (PNG, JPEG, WebP or GIF)".into()))?;
     match fmt {
         F::Gif => return decode_gif(bytes),
         F::Png | F::Jpeg | F::WebP => {}
@@ -377,7 +375,9 @@ pub fn decode_rgb(bytes: &[u8]) -> Result<Rgb, VisionError> {
             px.extend_from_slice(&[v, v, v])
         }),
         D::ImageRgb16(b) => b.iter().for_each(|&v| px.push((v >> 8) as u8)),
-        D::ImageRgba16(b) => b.chunks_exact(4).for_each(|p| px.extend_from_slice(&[(p[0] >> 8) as u8, (p[1] >> 8) as u8, (p[2] >> 8) as u8])),
+        D::ImageRgba16(b) => b
+            .chunks_exact(4)
+            .for_each(|p| px.extend_from_slice(&[(p[0] >> 8) as u8, (p[1] >> 8) as u8, (p[2] >> 8) as u8])),
         other => px = other.to_rgb8().into_raw(),
     }
     debug_assert_eq!(px.len(), n * 3);
@@ -631,7 +631,8 @@ mod tests {
         for name in ["square_300x300", "wide_1100x280", "tall_320x1000"] {
             let png = std::fs::read(fixtures().join(format!("{name}.png"))).unwrap();
             let meta: Value =
-                serde_json::from_str(&std::fs::read_to_string(fixtures().join(format!("{name}.json"))).unwrap()).unwrap();
+                serde_json::from_str(&std::fs::read_to_string(fixtures().join(format!("{name}.json"))).unwrap())
+                    .unwrap();
             let (w, h, want) = read_ppm(&fixtures().join(format!("{name}.ppm")));
             let p = prepare_rgb(&decode_rgb(&png).unwrap()).unwrap();
             assert_eq!((p.plan.best_w, p.plan.best_h), (w, h), "{name}");

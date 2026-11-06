@@ -181,6 +181,19 @@ options:
     doc: >-
       the head's front end: frequency_penalty for a request that names none, -2 to 2 (OpenAI's): the logit drops by it
       times the number of times the reply already holds the token. 0 = off
+  DEFAULT_THINKING_PRESENCE_PENALTY:
+    scope: box
+    default: "0"
+    doc: >-
+      the head's front end: thinking_presence_penalty for a request that names none, -2 to 2. Added to presence_penalty
+      on the tokens inside the think block the prompt leaves open, until the reply closes it, over the same counts.
+      0 = off
+  DEFAULT_THINKING_FREQUENCY_PENALTY:
+    scope: box
+    default: "0"
+    doc: >-
+      the head's front end: thinking_frequency_penalty for a request that names none, -2 to 2. Added to
+      frequency_penalty inside the think block, as DEFAULT_THINKING_PRESENCE_PENALTY. 0 = off
   ALLOW_THINKING_OFF:
     scope: box
     default: "0"

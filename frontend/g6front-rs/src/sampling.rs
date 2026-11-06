@@ -304,6 +304,11 @@ pub fn build(
         .unwrap_or_else(|| default_num(gen_defaults, "presence_penalty", 0.0));
     let frequency_penalty = float_num(body, "frequency_penalty", -2.0, 2.0)?
         .unwrap_or_else(|| default_num(gen_defaults, "frequency_penalty", 0.0));
+    // the same, added inside the think block the prompt leaves open (api.rs sets think_end)
+    let thinking_presence_penalty = float_num(body, "thinking_presence_penalty", -2.0, 2.0)?
+        .unwrap_or_else(|| default_num(gen_defaults, "thinking_presence_penalty", 0.0));
+    let thinking_frequency_penalty = float_num(body, "thinking_frequency_penalty", -2.0, 2.0)?
+        .unwrap_or_else(|| default_num(gen_defaults, "thinking_frequency_penalty", 0.0));
     if let Some(v) = body.get("repetition_penalty").filter(|v| !v.is_null()) {
         if !pyjson::eq_int(v, 1) {
             return Err(ApiError::bad(
@@ -354,6 +359,9 @@ pub fn build(
             min_p,
             presence_penalty,
             frequency_penalty,
+            thinking_presence_penalty,
+            thinking_frequency_penalty,
+            think_end: None,
             seed,
             stop_ids,
             logprobs: lp.map(|v| v as i64),
@@ -427,6 +435,13 @@ mod tests {
         let p = build(&m, body.as_bytes(), 10, 4096, &[], VOCAB, &d, Some(16), 20, true)?;
         Ok((p.gen.presence_penalty, p.gen.frequency_penalty))
     }
+    fn thinking_penalties(body: &str, defaults: &str) -> Result<(f64, f64), ApiError> {
+        let m: Map<String, Value> = serde_json::from_str(body).unwrap();
+        let d: Map<String, Value> = serde_json::from_str(defaults).unwrap();
+        let p = build(&m, body.as_bytes(), 10, 4096, &[], VOCAB, &d, Some(16), 20, true)?;
+        assert_eq!(p.gen.think_end, None); // api.rs sets it from the prompt
+        Ok((p.gen.thinking_presence_penalty, p.gen.thinking_frequency_penalty))
+    }
 
     #[test]
     fn penalties_are_the_request_s_else_the_server_default_else_off() {
@@ -445,6 +460,20 @@ mod tests {
             assert_eq!((e.status, e.param.as_deref()), (400, Some(param)), "{body}");
         }
         assert!(penalties(r#"{"repetition_penalty": 1}"#, "{}").is_ok());
+        assert_eq!(thinking_penalties("{}", "{}").unwrap(), (0.0, 0.0));
+        assert_eq!(thinking_penalties(r#"{"thinking_presence_penalty": 1.5}"#, "{}").unwrap(), (1.5, 0.0));
+        assert_eq!(
+            thinking_penalties(r#"{"presence_penalty": 1}"#, r#"{"thinking_frequency_penalty": -1}"#).unwrap(),
+            (0.0, -1.0)
+        );
+        assert_eq!(
+            thinking_penalties(r#"{"thinking_frequency_penalty": 0}"#, r#"{"thinking_frequency_penalty": -1}"#)
+                .unwrap(),
+            (0.0, 0.0)
+        );
+        for body in [r#"{"thinking_presence_penalty": 2.5}"#, r#"{"thinking_frequency_penalty": "x"}"#] {
+            assert_eq!(thinking_penalties(body, "{}").err().map(|e| e.status), Some(400), "{body}");
+        }
     }
 
     #[test]

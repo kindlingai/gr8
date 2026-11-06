@@ -205,14 +205,23 @@ class UnitTests(unittest.TestCase):
     def test_build_request_penalties(self):
         body, err = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'presence_penalty': 1.5, 'frequency_penalty': -0.5}, 0)
         self.assertIsNone(err)
-        self.assertIn(b' top_p 1.0 pen 1.5 -0.5\n', body)
+        self.assertIn(b' top_p 1.0 pen 1.5 -0.5 0.0 0.0 -1\n', body)
         body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'frequency_penalty': 2, 'logprobs': 1}, 0)
-        self.assertIn(b' top_p 1.0 pen 0.0 2.0 lp 1\n', body)
-        # both zero, null or absent: no field
-        for kw in ({}, {'presence_penalty': 0, 'frequency_penalty': 0.0}, {'presence_penalty': None}):
+        self.assertIn(b' top_p 1.0 pen 0.0 2.0 0.0 0.0 -1 lp 1\n', body)
+        # the thinking penalties, with the think block's close
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'thinking_presence_penalty': 1.5,
+                                          'thinking_frequency_penalty': -0.25, 'think_end': 154842}, 0)
+        self.assertIn(b' top_p 1.0 pen 0.0 0.0 1.5 -0.25 154842\n', body)
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'thinking_presence_penalty': 1.5, 'think_end': None}, 0)
+        self.assertIn(b' pen 0.0 0.0 1.5 0.0 -1\n', body)
+        # all zero, null or absent: no field
+        for kw in ({}, {'presence_penalty': 0, 'frequency_penalty': 0.0}, {'presence_penalty': None},
+                   {'thinking_presence_penalty': 0, 'think_end': 5}):
             self.assertNotIn(b' pen ', g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, **kw}, 0)[0], kw)
         for kw in ({'presence_penalty': 2.5}, {'frequency_penalty': -2.01}, {'presence_penalty': 'x'},
-                   {'presence_penalty': float('nan')}):
+                   {'presence_penalty': float('nan')}, {'thinking_frequency_penalty': 2.5},
+                   {'thinking_presence_penalty': 1, 'think_end': -1}, {'thinking_presence_penalty': 1, 'think_end': 'x'},
+                   {'thinking_presence_penalty': 1, 'think_end': g6s2shim.VOCAB}):
             self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, **kw}, 0)[1], kw)
 
     def test_build_request_insert(self):

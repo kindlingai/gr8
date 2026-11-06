@@ -327,8 +327,8 @@ fn lp_fields(v: &Value) -> String {
     s
 }
 
-/// req.<id>: `n_gen N temp F seed U min M stop ids|- [top_p F] [pen F F] [lp K] [plp K] [sys N] [ins A:U:ids]`, then the
-/// prompt. The penalties are read and ignored (the replies come from the rules).
+/// req.<id>: `n_gen N temp F seed U min M stop ids|- [top_p F] [pen F F F F N] [lp K] [plp K] [sys N] [ins A:U:ids]`,
+/// then the prompt. The penalties are read and ignored (the replies come from the rules).
 fn parse_request(data: &[u8], vocab: u32) -> Result<Request, String> {
     let text = std::str::from_utf8(data).map_err(|_| "not UTF-8")?;
     let (head, prompt) = text.split_once('\n').ok_or("no prompt line")?;
@@ -350,7 +350,7 @@ fn parse_request(data: &[u8], vocab: u32) -> Result<Request, String> {
     };
     let mut i = 10;
     while i < w.len() {
-        let (k, n) = (w[i], if w[i] == "pen" { 3 } else { 2 });
+        let (k, n) = (w[i], if w[i] == "pen" { 6 } else { 2 });
         if i + n > w.len() {
             return Err(format!("invalid request header {head:?}"));
         }
@@ -358,11 +358,15 @@ fn parse_request(data: &[u8], vocab: u32) -> Result<Request, String> {
         match k {
             "top_p" | "sys" => {}
             "pen" => {
-                for x in &w[i + 1..i + 3] {
+                for x in &w[i + 1..i + 5] {
                     let f: f32 = x.parse().map_err(|_| format!("bad pen {x:?}"))?;
                     if !(-2.0..=2.0).contains(&f) {
                         return Err(format!("pen {x}: outside [-2, 2]"));
                     }
+                }
+                let end: i64 = w[i + 5].parse().map_err(|_| format!("bad pen think_end {:?}", w[i + 5]))?;
+                if end < -1 || end >= i64::from(vocab) {
+                    return Err(format!("pen think_end {end}: outside -1..{vocab}"));
                 }
             }
             "lp" => r.lp = Some(num(v)?.min(MAX_LOGPROBS)),
@@ -400,10 +404,11 @@ mod tests {
         assert_eq!(r.ins, Some((4, -1, vec![7, 8])));
         assert_eq!(r.prompt, vec![1, 2, 3]);
         assert!(parse_request(b"n_gen 64 temp 0 seed 0 min 0 stop - gram 1:0:-1:\n1\n", 100).is_err());
-        let r = parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - top_p 0.9 pen 1.5 -0.5 lp 2\n1\n", 100).unwrap();
+        let r = parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - top_p 0.9 pen 1.5 -0.5 0 1 7 lp 2\n1\n", 100).unwrap();
         assert_eq!(r.lp, Some(2));
-        assert!(parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - pen 2.5 0\n1\n", 100).is_err());
-        assert!(parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - pen 1\n1\n", 100).is_err());
+        assert!(parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - pen 2.5 0 0 0 -1\n1\n", 100).is_err());
+        assert!(parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - pen 1 0 0 0\n1\n", 100).is_err());
+        assert!(parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - pen 1 0 0 0 100\n1\n", 100).is_err());
         assert!(parse_request(b"n_gen 64 temp 0 seed 0 min 0 stop -\n1,200\n", 100).is_err());
     }
 }

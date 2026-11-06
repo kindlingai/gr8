@@ -12,8 +12,10 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
   engine rank 0 -> DIR/status.s2       JSON (resident, queued, free_pages, ...), rewritten on queue/lifecycle changes
   shim -> DIR/req.<id>                 written as req.<id>.tmp, then renamed. Two lines:
         n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float>
-        [pen <presence> <frequency>] [lp <k>] [plp <k>]     (pen: the generate frame's penalties, each in [-2, 2]; only
-                                                             when one is nonzero and the head wrote DIR/penalty.s2)
+        [pen <presence> <frequency> <thinking presence> <thinking frequency> <think_end or -1>] [lp <k>] [plp <k>]
+                                                            (pen: the generate frame's penalties, each in [-2, 2], and the
+                                                             think block's close; only when one is nonzero and the head
+                                                             wrote DIR/penalty.s2)
         [sys <system_tokens>] [ins <after>:<unless or -1>:<id,id,...>]      (version 3: the generate frame's insert rule, never with lp)
         [img <pos>:<vit_h>:<vit_w>:<key>:<rgb base64>] ...    (one per image, last; only when the head wrote DIR/vision.s2)
         <prompt id,id,...>
@@ -310,14 +312,17 @@ def build_request(f: dict, ordinal: int, steering: dict | None = None):
         return None, 'top_p must be in (0, 1]'
     pen = ''
     try:
-        presence = float(f.get('presence_penalty') or 0.0)
-        frequency = float(f.get('frequency_penalty') or 0.0)
+        pens = [float(f.get(k) or 0.0) for k in ('presence_penalty', 'frequency_penalty',
+                                                 'thinking_presence_penalty', 'thinking_frequency_penalty')]
     except (TypeError, ValueError, OverflowError):
         return None, 'bad presence_penalty/frequency_penalty'
-    if not (math.isfinite(presence) and -2 <= presence <= 2 and math.isfinite(frequency) and -2 <= frequency <= 2):
+    if not all(math.isfinite(x) and -2 <= x <= 2 for x in pens):
         return None, 'presence_penalty and frequency_penalty must be in [-2, 2]'
-    if presence or frequency:
-        pen = f' pen {presence!r} {frequency!r}'
+    think_end = f.get('think_end')
+    if think_end is not None and (not isinstance(think_end, int) or isinstance(think_end, bool) or not 0 <= think_end < VOCAB):
+        return None, f'bad think_end (must be 0..{VOCAB - 1})'
+    if any(pens):
+        pen = ' pen ' + ' '.join(repr(x) for x in pens) + f" {-1 if think_end is None else think_end}"
     lps = {}
     for key, word in (('logprobs', 'lp'), ('prompt_logprobs', 'plp')):
         v = f.get(key)
@@ -590,7 +595,8 @@ class Shim:
             return self.finish(r, 'error', message='not supported by this engine: grammar')
         if f.get('images') not in (None, []) and not self.cfg.get('vision'):   # the engine would refuse the img field
             return self.finish(r, 'error', message='not supported by this engine: images')
-        if (f.get('presence_penalty') or f.get('frequency_penalty')) and not self.cfg.get('penalty'):   # the pen field
+        if any(f.get(k) for k in ('presence_penalty', 'frequency_penalty', 'thinking_presence_penalty',
+                                  'thinking_frequency_penalty')) and not self.cfg.get('penalty'):   # the pen field
             return self.finish(r, 'error', message='not supported by this engine: penalties')
         if f.get('prompt_logprobs') is not None and len(prompt) > self.a.max_plp_prompt:
             return self.finish(r, 'error', message=f'prompt too long for prompt_logprobs (max {self.a.max_plp_prompt})')

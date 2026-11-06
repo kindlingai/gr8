@@ -318,7 +318,8 @@ def validate(o):
         raise OptionError(f'--allow-thinking-off {o.get("ALLOW_THINKING_OFF")}: want 0 or 1')
     if o.get('UNDECLARED_TOOL_CALLS') not in ('text', 'emit'):
         raise OptionError(f'--undeclared-tool-calls {o.get("UNDECLARED_TOOL_CALLS")}: want text or emit')
-    for k in ('DEFAULT_PRESENCE_PENALTY', 'DEFAULT_FREQUENCY_PENALTY'):
+    for k in ('DEFAULT_PRESENCE_PENALTY', 'DEFAULT_FREQUENCY_PENALTY', 'DEFAULT_THINKING_PRESENCE_PENALTY',
+              'DEFAULT_THINKING_FREQUENCY_PENALTY'):
         try:
             v = float(o.get(k))
         except (TypeError, ValueError):

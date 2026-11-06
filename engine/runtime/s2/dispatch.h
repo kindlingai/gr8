@@ -97,8 +97,9 @@ public:
     // Grammars (grammar.h): before every step, on[r] = 1 where row r's sample follows its session's grammar, with the
     // row's mask at bits + r * words; the head reads both (rank.cuh launch_head_local). Draft steps are not masked.
     void set_grammar(int* on, uint32_t* bits, int words) { gm_on_ = on; gm_bits_ = bits; gm_words_ = words; }
-    // Penalties (penalty.h). Before every main step, rows[r] names row r's session and sampling row (or slot -1), and
-    // sess[q] the tokens session q committed since the device counts were updated. The head reads both (rank.cuh
+    // Penalties (penalty.h). Before every main step, rows[r] names row r's session, sampling row and coefficients (or
+    // slot -1), with the think block's close while the session's block is open, and sess[q] the tokens session q
+    // committed since the device counts were updated. The head reads both (rank.cuh
     // k_penalty, k_penalty_commit). A draft step has every row at slot -1. The counts live on the device, one slice
     // per slot. pen_synced_ tracks how many tokens they hold and pen_reset_ marks a slot with a new session.
     void set_penalty(g6rt::PenRow* rows, g6rt::PenSess* sess) { require(rows && sess, "penalty tables"); pen_rows_ = rows; pen_sess_ = sess; }
@@ -187,7 +188,7 @@ public:
     // the tables of a step. After the step the device counts hold every token its sessions had emitted before it: the
     // launch hook returns with the step done, and a session emits only between steps
     void penalty_rows(const s2::Step& sp, bool draft) {
-        for (int r = 0; r < sp.M(); ++r) pen_rows_[r] = {-1, 0, 0, 0.f, 0.f};
+        for (int r = 0; r < sp.M(); ++r) pen_rows_[r] = {-1, 0, 0, -1, 0.f, 0.f, 0.f, 0.f};
         if (draft) return;
         for (size_t j = 0; j < sp.sess.size(); ++j) {
             const unsigned q = unsigned(sp.sess[j]); const auto& s = sessions_.at(q);
@@ -198,8 +199,10 @@ public:
             if (first < 0) first = sp.M();   // a prompt step: no row samples a reply token
             auto& ps = pen_sess_[q]; ps.reset = pen_reset_[q]; ps.nnew = nnew;
             std::copy(s.out.end() - nnew, s.out.end(), ps.news);
+            const auto& p = s.sampling;
             for (int r = sp.row0[j]; r < sp.row0[j] + sp.rows[j]; ++r)
-                pen_rows_[r] = {int(q), first, r == sp.row0[j], s.sampling.presence, s.sampling.frequency};
+                pen_rows_[r] = {int(q), first, r == sp.row0[j], s.think_open ? p.think_end : -1,
+                                p.presence, p.frequency, p.tpresence, p.tfrequency};
             pen_synced_[q] = int(s.out.size()); pen_reset_[q] = false;
         }
     }

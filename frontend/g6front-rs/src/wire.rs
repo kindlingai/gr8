@@ -193,9 +193,15 @@ pub struct GenParams {
     pub top_p: f64,
     pub top_k: i64,
     pub min_p: f64,
-    /// OpenAI's penalties, in [-2, 2]; both 0: the fields are not sent (an engine without them keeps its frame bytes)
+    /// OpenAI's penalties, in [-2, 2]. With all four at 0 the fields are not sent, so an engine without them keeps its
+    /// frame bytes
     pub presence_penalty: f64,
     pub frequency_penalty: f64,
+    /// added inside the think block the prompt leaves open, whose close is `think_end` (None: no open block, so they
+    /// never apply)
+    pub thinking_presence_penalty: f64,
+    pub thinking_frequency_penalty: f64,
+    pub think_end: Option<u32>,
     pub seed: Option<i64>,
     pub stop_ids: Vec<i64>,
     pub logprobs: Option<i64>,
@@ -266,11 +272,21 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
     pyjson::int(b, p.top_k);
     b.extend_from_slice(b",\"min_p\":");
     pyjson::float(b, p.min_p);
-    if p.presence_penalty != 0.0 || p.frequency_penalty != 0.0 {
+    if p.presence_penalty != 0.0
+        || p.frequency_penalty != 0.0
+        || p.thinking_presence_penalty != 0.0
+        || p.thinking_frequency_penalty != 0.0
+    {
         b.extend_from_slice(b",\"presence_penalty\":");
         pyjson::float(b, p.presence_penalty);
         b.extend_from_slice(b",\"frequency_penalty\":");
         pyjson::float(b, p.frequency_penalty);
+        b.extend_from_slice(b",\"thinking_presence_penalty\":");
+        pyjson::float(b, p.thinking_presence_penalty);
+        b.extend_from_slice(b",\"thinking_frequency_penalty\":");
+        pyjson::float(b, p.thinking_frequency_penalty);
+        b.extend_from_slice(b",\"think_end\":");
+        opt_int(b, p.think_end.map(i64::from));
     }
     b.extend_from_slice(b",\"seed\":");
     opt_int(b, p.seed);
@@ -379,6 +395,9 @@ mod tests {
             min_p: 0.0,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            thinking_presence_penalty: 0.0,
+            thinking_frequency_penalty: 0.0,
+            think_end: None,
             seed: None,
             stop_ids: vec![1, 2],
             logprobs: Some(3),
@@ -411,6 +430,14 @@ mod tests {
         let pen = GenParams { presence_penalty: 1.5, ..p.clone() };
         let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &pen)[4..]).unwrap();
         assert_eq!((v["presence_penalty"].as_f64(), v["frequency_penalty"].as_f64()), (Some(1.5), Some(0.0)));
+        assert_eq!(
+            (v["thinking_presence_penalty"].as_f64(), v["think_end"].clone()),
+            (Some(0.0), serde_json::Value::Null)
+        );
+        let pen = GenParams { thinking_frequency_penalty: -0.5, think_end: Some(154842), ..p.clone() };
+        let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &pen)[4..]).unwrap();
+        assert_eq!((v["presence_penalty"].as_f64(), v["thinking_frequency_penalty"].as_f64()), (Some(0.0), Some(-0.5)));
+        assert_eq!(v["think_end"], serde_json::json!(154842));
         let selected =
             GenParams { steering_profile: Some("example".into()), steering_scale: Some(1.1f32 as f64), ..p.clone() };
         let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &selected)[4..]).unwrap();

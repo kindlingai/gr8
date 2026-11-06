@@ -968,7 +968,8 @@ class Supervisor:
             front += ['--default-reasoning-effort', o.get('DEFAULT_REASONING_EFFORT')]
         if o.get('DEFAULT_THINKING_BUDGET') != '0':
             front += ['--default-thinking-budget', o.get('DEFAULT_THINKING_BUDGET')]
-        for k in ('DEFAULT_PRESENCE_PENALTY', 'DEFAULT_FREQUENCY_PENALTY'):
+        for k in ('DEFAULT_PRESENCE_PENALTY', 'DEFAULT_FREQUENCY_PENALTY', 'DEFAULT_THINKING_PRESENCE_PENALTY',
+                  'DEFAULT_THINKING_FREQUENCY_PENALTY'):
             if float(o.get(k)) != 0:
                 front += ['--' + k.lower().replace('_', '-'), o.get(k)]
         if o.get('ALLOW_THINKING_OFF') == '1' and model.dialect == 'glm':   # ds41 turns thinking off by itself

@@ -1,6 +1,6 @@
 //! The S2 request file's parser (was parse_request and its helpers in engine/runtime/s2/sessions.h). A request is a
 //! header line, `n_gen <n> temp <f> seed <n> min <n> stop <ids|->` and then, in this order and each optional,
-//! `top_p <f>`, `pen <presence> <frequency>`, `lp <k>`, `plp <k>`, `sys <n>`, `ins <rule>`, `gram <grammar>` and `steer <profile> <hex>`, then any
+//! `top_p <f>`, `pen <presence> <frequency> <thinking presence> <thinking frequency> <think_end or -1>`, `lp <k>`, `plp <k>`, `sys <n>`, `ins <rule>`, `gram <grammar>` and `steer <profile> <hex>`, then any
 //! number of `img <field>` (DS41 images, ds41_image.h), then a line of comma-separated prompt ids. The header is read the way libstdc++'s istringstream read it, so every request
 //! the C++ took, and every refusal it gave, is the same here: a number ends at the first character it cannot take, and
 //! the rest of that word is the next word.
@@ -267,6 +267,10 @@ pub struct Request {
     /// presence / frequency penalties (engine/runtime/penalty.h), each in [-2, 2]; 0 = off
     pub presence: f32,
     pub frequency: f32,
+    /// the thinking penalties, inside the think block `think_end` closes (-1: the prompt left none open)
+    pub tpresence: f32,
+    pub tfrequency: f32,
+    pub think_end: i32,
     pub seed: u32,
     pub lp: i32,
     pub plp: i32,
@@ -317,6 +321,9 @@ pub fn parse(
         top_p: 0.0,
         presence: 0.0,
         frequency: 0.0,
+        tpresence: 0.0,
+        tfrequency: 0.0,
+        think_end: -1,
         seed: 1234,
         lp: -1,
         plp: -1,
@@ -346,9 +353,12 @@ pub fn parse(
     if k == b"pen" {
         r.presence = inp.float().ok_or(Msg("invalid pen header"))?;
         r.frequency = inp.float().ok_or(Msg("invalid pen header"))?;
+        r.tpresence = inp.float().ok_or(Msg("invalid pen header"))?;
+        r.tfrequency = inp.float().ok_or(Msg("invalid pen header"))?;
+        r.think_end = inp.int(-1, i32::MAX.into()).ok_or(Msg("invalid pen header"))? as i32;
         next!();
         require(
-            (-2.0..=2.0).contains(&r.presence) && (-2.0..=2.0).contains(&r.frequency),
+            [r.presence, r.frequency, r.tpresence, r.tfrequency].iter().all(|v| (-2.0..=2.0).contains(v)),
             "pen: presence and frequency penalties must be in [-2, 2]",
         )?;
     }
@@ -492,19 +502,21 @@ mod tests {
 
     #[test]
     fn penalties() {
-        let r = parse(b"n_gen 9 temp 0 seed 7 min 1 stop - top_p 0.9 pen 1.5 -0.25 lp 2\n1\n", false, &mut off, &mut no_img).unwrap();
-        assert_eq!((r.top_p, r.presence, r.frequency, r.lp), (0.9, 1.5, -0.25, 2));
+        let r = parse(b"n_gen 9 temp 0 seed 7 min 1 stop - top_p 0.9 pen 1.5 -0.25 0 0 -1 lp 2\n1\n", false, &mut off, &mut no_img).unwrap();
+        assert_eq!((r.top_p, r.presence, r.frequency, r.think_end, r.lp), (0.9, 1.5, -0.25, -1, 2));
         // without top_p, and absent: off
-        assert_eq!(parse(b"n_gen 9 temp 0 seed 7 min 1 stop - pen 2 2\n1\n", false, &mut off, &mut no_img).unwrap().frequency, 2.0);
+        let r = parse(b"n_gen 9 temp 0 seed 7 min 1 stop - pen 0 2 1.5 -1 154842\n1\n", false, &mut off, &mut no_img).unwrap();
+        assert_eq!((r.frequency, r.tpresence, r.tfrequency, r.think_end), (2.0, 1.5, -1.0, 154842));
         let r = parse(b"n_gen 9 temp 0 seed 7 min 1 stop - lp 2\n1\n", false, &mut off, &mut no_img).unwrap();
-        assert_eq!((r.presence, r.frequency), (0.0, 0.0));
+        assert_eq!((r.presence, r.frequency, r.tpresence, r.tfrequency, r.think_end), (0.0, 0.0, 0.0, 0.0, -1));
         for (bad, why) in [
-            (&b"n_gen 9 temp 0 seed 7 min 1 stop - pen 1.5\n1\n"[..], "invalid pen header"),
-            (b"n_gen 9 temp 0 seed 7 min 1 stop - pen 1.5 x\n1\n", "invalid pen header"),
-            (b"n_gen 9 temp 0 seed 7 min 1 stop - pen 2.5 0\n1\n", "pen: presence and frequency penalties must be in [-2, 2]"),
-            (b"n_gen 9 temp 0 seed 7 min 1 stop - pen 0 -2.5\n1\n", "pen: presence and frequency penalties must be in [-2, 2]"),
+            (&b"n_gen 9 temp 0 seed 7 min 1 stop - pen 1.5 0 0 0\n1\n"[..], "invalid pen header"),
+            (b"n_gen 9 temp 0 seed 7 min 1 stop - pen 1.5 x 0 0 -1\n1\n", "invalid pen header"),
+            (b"n_gen 9 temp 0 seed 7 min 1 stop - pen 1.5 0 0 0 -2\n1\n", "invalid pen header"),
+            (b"n_gen 9 temp 0 seed 7 min 1 stop - pen 2.5 0 0 0 -1\n1\n", "pen: presence and frequency penalties must be in [-2, 2]"),
+            (b"n_gen 9 temp 0 seed 7 min 1 stop - pen 0 0 0 -2.5 -1\n1\n", "pen: presence and frequency penalties must be in [-2, 2]"),
             // after lp: the tail
-            (b"n_gen 9 temp 0 seed 7 min 1 stop - lp 2 pen 1 1\n1\n", "invalid request header tail (S2 accepts top_p, pen, lp, plp, sys, ins, gram and steer)"),
+            (b"n_gen 9 temp 0 seed 7 min 1 stop - lp 2 pen 1 1 0 0 -1\n1\n", "invalid request header tail (S2 accepts top_p, pen, lp, plp, sys, ins, gram and steer)"),
         ] {
             assert_eq!(parse(bad, false, &mut off, &mut no_img).err(), Some(Msg(why)), "{}", String::from_utf8_lossy(bad));
         }

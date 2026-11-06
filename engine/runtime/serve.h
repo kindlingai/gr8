@@ -3,8 +3,9 @@
 // Emitter, plus its own `a` line (frontend/g6s2shim.py describes the S2 files).
 //   DIR/req.<n>  (written atomically: req.<n>.tmp then rename), two lines:
 //       n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,..|-> [top_p <float>]
-//       [pen <presence> <frequency>] [lp <k>] [plp <k>]
-//       (pen: presence / frequency penalties, each in [-2, 2] (penalty.h); S2 applies them, m4sim reads and ignores them.
+//       [pen <presence> <frequency> <thinking presence> <thinking frequency> <think_end id or -1>] [lp <k>] [plp <k>]
+//       (pen: presence / frequency penalties, each in [-2, 2], the thinking ones inside the think block that the id
+//        closes (penalty.h); S2 applies them, m4sim reads and ignores them.
 //        lp: logprobs of the generated tokens with their top k, 0..20; plp: the same for the prompt tokens; absent = off.
 //        A request with plp is run as decode steps from its first token, no prefill path: the shim limits its length.)
 //       <prompt ids, comma-separated>
@@ -45,6 +46,8 @@ struct ServeReq
     int n_gen = 0, min_tokens = 0;
     float temp = 0.f, top_p = 0.f;
     float presence = 0.f, frequency = 0.f;   // penalties (penalty.h); 0 = off
+    float tpresence = 0.f, tfrequency = 0.f; // the thinking penalties, while the block think_end closes is open
+    int think_end = -1;                      // the </think> id when the prompt left a think block open, else -1
     uint32_t seed = 1234u;
     int lp = -1, plp = -1;        // logprobs / prompt_logprobs: k (0..LP_MAX) or -1 = off
     int64_t sys = -1;             // the system span: the prompt's first tokens that are system message and tools (-1 = unknown)
@@ -125,10 +128,14 @@ inline void serve_parse(const std::string& text, int vocab, ServeReq& r)
     {
         long k;
         if (w[i] == "top_p") { if (!real(w[i + 1], &r.top_p)) r.top_p = 0.f; }
-        else if (w[i] == "pen" && i + 2 < w.size())
+        else if (w[i] == "pen" && i + 5 < w.size())
         {
-            if (!real(w[i + 1], &r.presence) || !real(w[i + 2], &r.frequency)) r.presence = r.frequency = 0.f;
-            ++i;
+            long end;
+            if (!real(w[i + 1], &r.presence) || !real(w[i + 2], &r.frequency) || !real(w[i + 3], &r.tpresence) ||
+                !real(w[i + 4], &r.tfrequency) || !(w[i + 5] == "-1" || num(w[i + 5], 0, vocab - 1, &end)))
+                r.presence = r.frequency = r.tpresence = r.tfrequency = 0.f;
+            else r.think_end = w[i + 5] == "-1" ? -1 : (int)end;
+            i += 4;
         }
         // the shim never sends k > LP_MAX; clamping is a backstop
         else if (w[i] == "lp") r.lp = num(w[i + 1], 0, 1 << 30, &k) ? (int)std::min<long>(k, LP_MAX) : -1;

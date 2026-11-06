@@ -2074,7 +2074,8 @@ __global__ void __launch_bounds__(256) k_grammar_mask(float* logits, int ldl, in
 }
 
 // grid M, block 256: the penalties of row m (penalty.h). From the session's sampling row on, every generated id loses
-// presence + frequency * count from its logit. The count adds the slot's device counts, the tokens committed since
+// presence + frequency * count from its logit, the thinking coefficients added while the row is inside the think block
+// (no draft before it in this step is the close). The count adds the slot's device counts, the tokens committed since
 // their last update (PenSess::news) and the drafts the rows before m in this step carry (tok). Pass 2 writes each
 // pending id from its raw logit, so a penalized logit is one subtraction either way. A row without a penalty returns at
 // once.
@@ -2092,11 +2093,15 @@ __global__ void __launch_bounds__(256) k_penalty(float* logits, int ldl, int vlo
     float* row = logits + (size_t)m * ldl;
     for (int t = threadIdx.x; t < n; t += 256) s_tok[t] = t < nnew ? ps.news[t] : tok[pr.first + 1 + t - nnew];
     __syncthreads();
+    const bool think = pen_in_think(pr.think_end, s_tok + nnew, n - nnew);
+    const float presence = think ? pr.presence + pr.tpresence : pr.presence;
+    const float frequency = think ? pr.frequency + pr.tfrequency : pr.frequency;
+    if (presence == 0.f && frequency == 0.f) return;
     pen_pass0(row, vlo, vn, s_tok, n, s_raw, threadIdx.x, 256);
     __syncthreads();
-    pen_pass1(row, vn, cnt, pr.presence, pr.frequency, threadIdx.x, 256);
+    pen_pass1(row, vn, cnt, presence, frequency, threadIdx.x, 256);
     __syncthreads();
-    pen_pass2(row, vlo, vn, cnt, s_tok, n, s_raw, pr.presence, pr.frequency, threadIdx.x, 256);
+    pen_pass2(row, vlo, vn, cnt, s_tok, n, s_raw, presence, frequency, threadIdx.x, 256);
 }
 // grid M, block 256, after k_penalty read the counts: on the one row of each session that carries commit, the slot's
 // counts take the tokens committed since the last update, from zero for a new request on the slot

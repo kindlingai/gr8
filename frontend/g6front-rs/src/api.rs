@@ -319,11 +319,25 @@ async fn read_json_raw(req: Request<Incoming>) -> Result<(Map<String, Value>, By
     }
 }
 
-/// A nonzero penalty needs an engine whose hello says `"penalties": true` (PROTOCOL.md).
-fn check_penalties(st: &State, g: &crate::wire::GenParams) -> Result<(), ApiError> {
-    if (g.presence_penalty != 0.0 || g.frequency_penalty != 0.0) && !st.engine.penalties() {
-        let k = if g.presence_penalty != 0.0 { "presence_penalty" } else { "frequency_penalty" };
-        return Err(ApiError::bad(format!("{k} is not supported by this engine"), Some(k)));
+/// A nonzero penalty needs an engine whose hello says `"penalties": true` (PROTOCOL.md). The thinking penalties apply
+/// inside the think block the prompt leaves open, so the frame names its close (`think_end`) when there is one.
+fn check_penalties(st: &State, prompt: &[u32], g: &mut crate::wire::GenParams) -> Result<(), ApiError> {
+    let named = [
+        ("presence_penalty", g.presence_penalty),
+        ("frequency_penalty", g.frequency_penalty),
+        ("thinking_presence_penalty", g.thinking_presence_penalty),
+        ("thinking_frequency_penalty", g.thinking_frequency_penalty),
+    ];
+    if let Some((k, _)) = named.iter().find(|(_, v)| *v != 0.0) {
+        if !st.engine.penalties() {
+            return Err(ApiError::bad(format!("{k} is not supported by this engine"), Some(k)));
+        }
+    }
+    if g.thinking_presence_penalty != 0.0 || g.thinking_frequency_penalty != 0.0 {
+        g.think_end = match (st.tok.think_start, st.tok.think_end) {
+            (Some(s), Some(e)) if think_open(prompt, s, e) => Some(e),
+            _ => None,
+        };
     }
     Ok(())
 }
@@ -528,7 +542,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     if choice.is_forced() && !st.engine.inserts() {
         return Err(ApiError::bad("the engine does not support a forced tool_choice", Some("tool_choice")));
     }
-    check_penalties(st, &params.gen)?;
+    check_penalties(st, &prompt, &mut params.gen)?;
     // The template leaves `<think>` open at the end of a chat prompt, so the reply's first token sits in the reasoning
     // span: the forced opener has to follow the close, or the call it opens is reasoning and the parser reads prose.
     let close = match (st.tok.think_start, st.tok.think_end) {
@@ -1197,7 +1211,7 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
             false,
         )?;
         (params.gen.steering_profile, params.gen.steering_scale) = sampling::steering(&body, st.steering().as_ref())?;
-        check_penalties(st, &params.gen)?;
+        check_penalties(st, &prompt, &mut params.gen)?;
         Ok((prompt, params))
     };
     let (prompt, params) = match prep.await {

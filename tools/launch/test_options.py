@@ -168,9 +168,13 @@ class ValidateTests(unittest.TestCase):
         self.assertEqual((o.get('DEFAULT_REASONING_EFFORT'), o.get('DEFAULT_THINKING_BUDGET')), ('medium', '4096'))
         self.check(['--peers', PEERS, '--default-presence-penalty', '2.5'], 'want a number from -2 to 2')
         self.check(['--peers', PEERS, '--default-frequency-penalty', 'x'], 'want a number from -2 to 2')
-        o = opt.parse(['--no-config', '--peers', PEERS, '--default-presence-penalty', '1.5'], GLM)
+        self.check(['--peers', PEERS, '--default-thinking-presence-penalty', '-3'], 'want a number from -2 to 2')
+        o = opt.parse(['--no-config', '--peers', PEERS, '--default-presence-penalty', '1.5',
+                       '--default-thinking-frequency-penalty', '-0.5'], GLM)
         opt.validate(o)
-        self.assertEqual((o.get('DEFAULT_PRESENCE_PENALTY'), o.get('DEFAULT_FREQUENCY_PENALTY')), ('1.5', '0'))
+        self.assertEqual((o.get('DEFAULT_PRESENCE_PENALTY'), o.get('DEFAULT_FREQUENCY_PENALTY'),
+                          o.get('DEFAULT_THINKING_PRESENCE_PENALTY'), o.get('DEFAULT_THINKING_FREQUENCY_PENALTY')),
+                         ('1.5', '0', '0', '-0.5'))
         self.check(['--peers', PEERS, '--allow-thinking-off', 'yes'], 'want 0 or 1')
         self.check(['--peers', PEERS, '--undeclared-tool-calls', 'on'], 'want text or emit')
         self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('UNDECLARED_TOOL_CALLS'), 'text')

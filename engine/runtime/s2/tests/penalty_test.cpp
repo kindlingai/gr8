@@ -63,6 +63,11 @@ static void row_logic() {
     CHECK(a[0] == 1.f / 3 && a[5] == 1.f / 8 - (1.1f + 0.3f * 3) && a[7] == 1.f / 10 - (1.1f + 0.3f * 2));
     // an id outside the slice (20) is another rank's
     CHECK(g6rt::pen_pending_total(pend, 5, 1, 0) == 2 && g6rt::pen_pending_total(pend, 5, 2, 0) == -1 && g6rt::pen_pending_total(pend, 5, 0, 2) == 3);
+    // inside the think block: the block is open and no draft before the row is its close. The kernel then adds the
+    // thinking coefficients, so a drafted close switches the rows after it to the whole-reply ones
+    const int drafts[] = {3, 50, 4};
+    CHECK(g6rt::pen_in_think(50, drafts, 0) && g6rt::pen_in_think(50, drafts, 1) && !g6rt::pen_in_think(50, drafts, 2) && !g6rt::pen_in_think(50, drafts, 3));
+    CHECK(!g6rt::pen_in_think(-1, drafts, 0) && g6rt::pen_in_think(7, drafts, 3));
 }
 
 static const std::string header = "n_gen 20 temp 0 seed 1 min 0 stop 99 top_p 1";
@@ -73,9 +78,9 @@ static void add(s2::Step& s, int q, int pos0, int n, int tok0, int prompt = 0) {
     for (int i = 0; i < n; ++i) s.r.push_back({q, tok0 + i, pos0 + i, pos0 + i + 1, pos0 + i + 1 < prompt ? 1 : -1});
 }
 static void tables() {
-    const auto on = request(" pen 1.5 0.25"), off = request(""), freq = request(" pen 0 -1");
+    const auto on = request(" pen 1.5 0.25 0 0 -1"), off = request(""), freq = request(" pen 0 -1 0 0 -1");
     CHECK(on.presence == 1.5f && on.frequency == 0.25f && off.presence == 0.f && off.frequency == 0.f && freq.frequency == -1.f);
-    CHECK(throws([] { request(" pen 2.5 0"); }) && throws([] { request(" pen 1"); }));
+    CHECK(throws([] { request(" pen 2.5 0 0 0 -1"); }) && throws([] { request(" pen 1 0 0 0"); }));
     Config c; c.epoch = 9; c.max_rows = 24;
     Sessions sessions(c, "", false, 4);
     Grant g0{{9, 0, 1}, Sessions::request(1, on), {0, 1, 1}, 0};
@@ -138,10 +143,42 @@ static void tables() {
     CHECK(sessions.at(1).out.empty());
     CHECK(launches == 8);
 }
+// the thinking penalties: the row table carries the close while the block is open, and a committed close ends it
+static void thinking() {
+    const auto think = request(" pen 0.5 0 1.5 -0.25 50"), closed = request(" pen 0 0 1.5 0 -1");
+    CHECK(think.tpresence == 1.5f && think.tfrequency == -0.25f && think.think_end == 50 && closed.think_end == -1);
+    CHECK(throws([] { request(" pen 0 0 2.5 0 50"); }));
+    Config c; c.epoch = 9; c.max_rows = 24;
+    Sessions sessions(c, "", false, 4);
+    Grant g0{{9, 0, 1}, Sessions::request(1, think), {0, 1, 1}, 0};
+    Grant g1{{9, 1, 1}, Sessions::request(2, closed), {1, 1, 2}, 0};
+    sessions.bind(g0, think); sessions.bind(g1, closed);
+    CHECK(sessions.at(0).think_open && !sessions.at(1).think_open && sessions.at(1).sampling.penalty());
+    std::vector<g6rt::PenRow> rows(24); std::vector<g6rt::PenSess> sess(MAX_SESSIONS);
+    DispatchHooks h; h.bucket = [](bool, int) { return 0; }; h.mode = [](int, int) {};
+    h.launch = [&](const Launch& l) { return std::vector<int>(l.step.r.size(), 1); };
+    h.prefill = [](const Slot&, const Payload&, uint32_t, uint32_t) {};
+    h.pen_rows = rows.data(); h.pen_sess = sess.data();
+    Dispatch d(sessions, 24, h);
+    d.begin(0, 0); d.begin(1, 0);
+    s2::Step verify; add(verify, 0, 8, 3, 11); add(verify, 1, 8, 3, 11);
+    d.run(verify);
+    CHECK(rows[0].think_end == 50 && rows[2].think_end == 50 && rows[0].tpresence == 1.5f && rows[0].tfrequency == -0.25f && rows[0].presence == 0.5f);
+    // a session whose prompt left no block open: the thinking penalties never apply, so its rows carry no close
+    CHECK(rows[3].slot == 1 && rows[3].think_end == -1 && rows[3].tpresence == 1.5f);
+    // the reply commits the close (a drafted close the verify accepted): the rows after it are outside the block
+    const int t1[] = {11, 50, 12};
+    sessions.emit({9, 0, 1}, t1, 3, 0, {});
+    CHECK(!sessions.at(0).think_open);
+    s2::Step next; add(next, 0, 11, 3, 12);
+    d.run(next);
+    CHECK(rows[0].think_end == -1 && rows[0].presence == 0.5f && rows[0].tpresence == 1.5f && sess[0].nnew == 3 && sess[0].news[1] == 50);
+}
 
 int main() {
     row_logic();
     tables();
+    thinking();
     std::printf(fails ? "penalty_test: %d FAIL\n" : "penalty_test: PASS\n", fails);
     return fails != 0;
 }

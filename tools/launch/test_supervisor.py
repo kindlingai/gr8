@@ -373,9 +373,13 @@ class FrontTests(unittest.TestCase):
         a = self.front_argv()
         self.assertNotIn('--default-presence-penalty', a)
         self.assertNotIn('--default-frequency-penalty', a)
-        a = self.front_argv('--default-presence-penalty', '1.5', '--default-frequency-penalty', '-0.5')
+        self.assertNotIn('--default-thinking-presence-penalty', a)
+        a = self.front_argv('--default-presence-penalty', '1.5', '--default-frequency-penalty', '-0.5',
+                            '--default-thinking-presence-penalty', '1')
         self.assertEqual(a[a.index('--default-presence-penalty') + 1], '1.5')
         self.assertEqual(a[a.index('--default-frequency-penalty') + 1], '-0.5')
+        self.assertEqual(a[a.index('--default-thinking-presence-penalty') + 1], '1')
+        self.assertNotIn('--default-thinking-frequency-penalty', a)
 
     def test_the_thinking_defaults_reach_the_front_end_only_when_set(self):
         a = self.front_argv()

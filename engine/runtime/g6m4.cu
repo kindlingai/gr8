@@ -1664,7 +1664,7 @@ int main(int argc, char** argv)
         if (m.vn <= 0) die("penalty tables before the vocab slice");
         G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&m.pen_rows_host), sizeof(PenRow) * MX, cudaHostAllocMapped));
         G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&m.pen_sess_host), sizeof(PenSess) * S2N, cudaHostAllocMapped));
-        for (int r = 0; r < MX; ++r) m.pen_rows_host[r] = PenRow{-1, 0, 0, 0.f, 0.f};
+        for (int r = 0; r < MX; ++r) m.pen_rows_host[r] = PenRow{-1, 0, 0, -1, 0.f, 0.f, 0.f, 0.f};
         memset(m.pen_sess_host, 0, sizeof(PenSess) * S2N);
         PenRow* rows;
         PenSess* sess;
