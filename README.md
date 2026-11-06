@@ -16,7 +16,7 @@ model and cluster size.
 
 ### GLM 5.3 Flash
 
- - One DGX Spark: https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark
+ - One DGX Spark: https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark
  - Two DGX Sparks: https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark
 
 ## Results
