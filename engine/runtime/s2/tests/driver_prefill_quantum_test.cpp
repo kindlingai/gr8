@@ -96,7 +96,7 @@ struct Rank {
         };
         d = std::make_unique<Driver>(c, h);
     }
-    const Scheduler& s() const { return d->state(); }
+    const SchedulerView& s() const { return d->state(); }
     std::vector<uint32_t> rows_of(uint64_t id) const {
         std::vector<uint32_t> v;
         for (const auto& x : pf) if (x.id == id) v.push_back(x.rows);
@@ -121,7 +121,7 @@ static Grant grant_for(const Rank& head, const Req& r, uint32_t& page)
     page += run.pages;
     return Grant{head.s().next_key(), rq, run, 0};
 }
-static Commit commit_for(const Scheduler& s)
+static Commit commit_for(const SchedulerView& s)
 {
     Commit cm;
     cm.epoch = s.config().epoch; cm.event = s.next_event(); cm.boundary = s.boundary(); cm.before_hash = s.digest();

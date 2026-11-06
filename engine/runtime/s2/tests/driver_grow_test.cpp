@@ -140,7 +140,7 @@ int main()
         long guard = 0;
         for (;;) {
             // an event: retiring slots free, the FIFO head admitted when it fits; both ranks make the same calls
-            const Scheduler& s = a.d->state();
+            const SchedulerView& s = a.d->state();
             Commit cm;
             cm.epoch = 1; cm.event = s.next_event(); cm.boundary = s.boundary();
             if (!queue.empty() && s.resident() < c.limit()) {

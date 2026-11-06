@@ -108,7 +108,7 @@ struct NativeHooks {
 struct Progress {
     std::atomic<uint64_t> boundary{0}, revision{0}, horizon{0};
     std::atomic<unsigned> resident{0}, retiring{0};
-    void publish(const Scheduler& s) {
+    void publish(const SchedulerView& s) {
         // horizon before boundary: a reader that loads boundary first and horizon second (event) sees a horizon
         // computed for that boundary or a later one, never an earlier one. Later only widens the margin.
         horizon.store(s.horizon());

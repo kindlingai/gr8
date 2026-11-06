@@ -1,8 +1,9 @@
 // The C++ facade over the Rust driver (driver.h Driver, engine/scheduler-rs src/driver.rs): a hook's exception comes
 // out of apply() or step() as itself and fails the scheduler, as do the driver's own refusals after the scheduler
 // changed; a refusal before it leaves the state as it was. Hooks may read the driver back (the planner's own getters
-// only from the driver's hooks) but not call apply() or step(); a hook that calls apply() and catches the refusal leaves
-// the outer apply() whole. A moved Driver keeps working. Host only.
+// only from the driver's hooks) but not call apply(), step(), idle_boundary() or pool_digest(); a hook that calls apply()
+// and catches the refusal leaves the outer apply() whole. The scheduler's state is the Rust's, read through state(),
+// which stays the same object when the Driver moves. Host only.
 #include "s2/driver.h"
 #include <cstdio>
 #include <memory>
@@ -139,14 +140,43 @@ int main() {
         f.d->step();
         CHECK(!f.d->emitted(k2.slot).empty() && f.d->stats(k2).rounds >= 1);
     }
-    {   // a moved Driver keeps its hooks and state
+    {   // a hook that sets the pool digest or an idle boundary is refused, and the state is as it was
         Fix f;
         const Key k = f.admit(1);
+        f.to_decode();
+        std::string pool, idle;
+        uint64_t before = 0, after = 0;
+        f.on_emit = [&] {
+            before = f.d->state().digest();
+            try { f.d->pool_digest(7); } catch (const std::runtime_error& e) { pool = e.what(); }
+            try { f.d->idle_boundary(f.d->state().boundary() + 1); } catch (const std::runtime_error& e) { idle = e.what(); }
+            after = f.d->state().digest();
+        };
+        f.d->step();
+        CHECK(pool == "s2: a driver hook called the driver back" && idle == pool && before == after);
+        f.on_emit = nullptr;
+        f.d->step();
+        CHECK(f.d->stats(k).rounds >= 2);
+        f.cancel(k);   // the engine is idle
+        const uint64_t d0 = f.d->state().digest(), b0 = f.d->state().boundary();
+        f.d->pool_digest(42);
+        CHECK(f.d->state().digest() != d0);
+        f.d->idle_boundary(b0 + 3);
+        CHECK(f.d->state().boundary() == b0 + 3);
+        f.d->fail();
+        CHECK(failed(*f.d));
+    }
+    {   // a moved Driver keeps its hooks and state, and state() is the same view
+        Fix f;
+        const Key k = f.admit(1);
+        const SchedulerView& v = f.d->state();
         Driver moved = std::move(*f.d);
         f.d.reset();
+        CHECK(&v == &moved.state());
         for (int i = 0; i < 8 && moved.step().kind != Kind::Decode; ++i) {}
         moved.step();
         CHECK(!moved.emitted(k.slot).empty() && moved.stats(k).rounds >= 1);
+        CHECK(v.slots()[k.slot].phase == Phase::Decode && v.slots()[k.slot].emitted > 0 && v.resident() == 1);
     }
     if (fails) { std::fprintf(stderr, "driver_facade_test: %d FAIL\n", fails); return 1; }
     std::printf("driver_facade_test: PASS\n");

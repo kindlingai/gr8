@@ -183,7 +183,7 @@ static void admission(bool fp4, bool pressure)
     };
     d = std::make_unique<Driver>(c, h);
     auto admit = [&](uint64_t id, std::vector<int> pr, uint32_t mt, uint32_t reuse) {
-        const Scheduler& sc = d->state();
+        const SchedulerView& sc = d->state();
         if (!sc.resident()) d->idle_boundary(sc.boundary() + NOTICE_MIN);
         prompt[id] = pr; maxt[id] = mt;
         const Request rq{id, uint32_t(pr.size()), mt};

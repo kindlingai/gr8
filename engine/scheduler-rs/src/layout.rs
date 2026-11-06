@@ -185,7 +185,7 @@ impl Kind for crate::planner_ffi::CLearn {
 impl Kind for crate::planner_ffi::CHooks {
     const K: u64 = 6;
 }
-impl Kind for crate::driver::CSched {
+impl Kind for crate::driver::CView {
     const K: u64 = 6;
 }
 impl Kind for crate::driver::CPayload {
@@ -564,7 +564,7 @@ pub fn digest() -> u64 {
             has_lp
         }
     );
-    layout!(h, crate::driver::CSched { c, s, n, st });
+    layout!(h, crate::driver::CView { s, n, st });
     layout!(h, crate::driver::CPayload { prompt_len, chunk, decode_prompt, steering_ok });
     layout!(
         h,

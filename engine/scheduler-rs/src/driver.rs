@@ -1,11 +1,12 @@
 //! The S2 driver (s2/driver.h `g6s2::Driver` is its C++ facade): it applies commits, grows runs before a round, picks
-//! the capped rounds past R, runs one scheduler quantum on the planner and reports completions. It owns the per-slot
-//! emitted counts, the initialised flags, what it reads of each payload and the capped-round cycle. The scheduler's
-//! state is still held by the C++ `Scheduler` and passed in per call. The planner is reached through the C++
-//! `s2::Batch`, which writes the round log.
+//! the capped rounds past R, runs one scheduler quantum on the planner and reports completions. It owns the
+//! scheduler's state (config, slots, counters), the per-slot emitted counts, the initialised flags, what it reads of
+//! each payload and the capped-round cycle. The C++ reads the slots and counters through one view
+//! (`g6s2_driver_view`). The planner is reached through the C++ `s2::Batch`, which writes the round log.
 //!
-//! Hooks may read the driver back (the service's retire reads a slot's emitted tokens), so every field is a `Cell`
-//! and every method takes `&self`; apply and step refuse to be entered again from a hook.
+//! Hooks may read the driver back (the service's retire reads a slot's emitted tokens, the view's slots), so every
+//! field is a `Cell` or behind an `UnsafeCell` and every method takes `&self`; apply and step refuse to be entered
+//! again from a hook.
 #![allow(clippy::missing_safety_doc)]
 
 use crate::cp_rows::{self, Cand};
@@ -13,17 +14,17 @@ use crate::scheduler::{
     self as sch, Commit, Completion, Config, Grant, Key, Quantum, Run, Shrink, Slot, State, DECODE, FREE, K_DECODE,
     K_PREFILL, PARKED, PREFILL, PREFILL_PACK, PROMPT_TAIL, PROMPT_TAIL_PACK, QMAX, RETIRING,
 };
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 use std::ffi::{c_char, c_void};
 use std::io::Write;
 
-/// g6s2_drv_sched: the scheduler's state, which the C++ `Scheduler` holds
+/// g6s2_drv_view: the scheduler's slots (n of them) and counters, as the driver holds them; valid while the driver
+/// lives
 #[repr(C)]
-pub struct CSched {
-    pub c: *const Config,
-    pub s: *mut Slot,
+pub struct CView {
+    pub s: *const Slot,
     pub n: usize,
-    pub st: *mut State,
+    pub st: *const State,
 }
 
 /// g6s2_drv_payload: what the driver reads of an admitted request's payload. steering_ok: its steering equals the
@@ -147,10 +148,19 @@ fn sch_err(e: sch::Err) -> Stop {
     Stop::Refused(e)
 }
 
-/// One driver: its hooks and the per-slot state it keeps between calls.
+/// the scheduler's state; the C++ view points into it
+struct Sched {
+    c: Config,
+    s: [Slot; QMAX],
+    n: usize,
+    st: State,
+}
+
+/// One driver: its hooks, the scheduler's state and the per-slot state it keeps between calls.
 pub struct Driver {
     h: CHooks,
     p: CPlanner,
+    sch: UnsafeCell<Sched>,
     emitted: [Cell<u32>; QMAX],
     initialized: [Cell<bool>; QMAX],
     prompt_len: [Cell<usize>; QMAX],
@@ -164,7 +174,7 @@ pub struct Driver {
 }
 
 /// the scheduler's state for one call; slices are formed only around scheduler calls, since hooks read the slots
-pub(crate) struct S {
+struct S {
     c: *const Config,
     s: *mut Slot,
     n: usize,
@@ -209,14 +219,21 @@ impl std::fmt::Write for Line {
 }
 
 impl Driver {
-    /// A driver over these hooks; None when a required one (bind, retire, prefill, payload) is missing.
-    pub fn new(h: CHooks, p: CPlanner) -> Option<Driver> {
-        if h.bind.is_none() || h.retire.is_none() || h.prefill.is_none() || h.payload.is_none() {
+    /// A driver over these hooks with `n` slots, each `empty` (the C++ default slot) before `init` keys it; None when
+    /// a required hook (bind, retire, prefill, payload) is missing or n is not in 1..=QMAX.
+    pub fn new(h: CHooks, p: CPlanner, c: Config, n: usize, empty: Slot) -> Option<Driver> {
+        if h.bind.is_none() || h.retire.is_none() || h.prefill.is_none() || h.payload.is_none() || n == 0 || n > QMAX {
             return None;
         }
+        let mut s = [empty; QMAX];
+        sch::init(&c, &mut s[..n]);
+        // SAFETY: State is integers and bools; all zero is the C++ value-initialised state
+        let mut st: State = unsafe { std::mem::zeroed() };
+        st.want_decode = true;
         Some(Driver {
             h,
             p,
+            sch: UnsafeCell::new(Sched { c, s, n, st }),
             emitted: Default::default(),
             initialized: Default::default(),
             prompt_len: Default::default(),
@@ -228,6 +245,12 @@ impl Driver {
             busy: Cell::new(false),
             err: Cell::new(""),
         })
+    }
+
+    fn s(&self) -> S {
+        let x = self.sch.get();
+        // SAFETY: field addresses only; S forms references for the length of one scheduler call
+        unsafe { S { c: &raw const (*x).c, s: (&raw mut (*x).s).cast(), n: (*x).n, st: &raw mut (*x).st } }
     }
 
     fn enter(&self) -> Res<Busy<'_>> {
@@ -277,15 +300,9 @@ impl Driver {
     /// Driver::apply: validate the payload, apply the commit to the scheduler, then the hooks it implies. `digest` is
     /// the scheduler's digest before it. Refusals before the scheduler changes leave it as it was; a failure after it
     /// fails the scheduler.
-    pub(crate) fn apply(
-        &self,
-        s: &S,
-        e: &Commit,
-        digest: u64,
-        resize: bool,
-        pay: Option<&CPayload>,
-    ) -> Res<sch::Changes> {
+    pub fn apply(&self, e: &Commit, digest: u64, resize: bool, pay: Option<&CPayload>) -> Res<sch::Changes> {
         let _b = self.enter()?;
+        let s = &self.s();
         if e.has_admit {
             let r = &e.admit.req;
             let p = pay.filter(|p| p.prompt_len == r.prompt_tokens as usize && p.chunk > 0 && p.steering_ok);
@@ -357,8 +374,9 @@ impl Driver {
     }
 
     /// Driver::step: grow, pick the capped round, take the scheduler's next quantum and run it.
-    pub(crate) fn step(&self, s: &S, out: &mut Quantum) -> Res<()> {
+    pub fn step(&self, out: &mut Quantum) -> Res<()> {
         let _b = self.enter()?;
+        let s = &self.s();
         let mut stalled = [false; QMAX];
         if let Err(e) = self.grow(s, &mut stalled) {
             s.fail();
@@ -576,6 +594,19 @@ impl Driver {
         Ok(())
     }
 
+    /// Scheduler::idle_boundary: an event-only boundary, no model work.
+    pub fn idle_boundary(&self, target: u64) -> Res<()> {
+        let _b = self.enter()?;
+        self.s().with(|_, sl, st| sch::idle_boundary(sl, st, target)).map_err(sch_err)
+    }
+
+    /// The pool's digest at this event boundary, folded into the scheduler's.
+    pub fn pool_digest(&self, d: u64) -> Res<()> {
+        let _b = self.enter()?;
+        self.s().with(|_, _, st| st.pool = d);
+        Ok(())
+    }
+
     /// The emit hook's accounting: `count` of the `n` tokens offered went out, `finished` the emitter's stop. Returns
     /// whether the session is finished (its stop, or max_tokens emitted).
     pub fn emit(&self, q: usize, n: i32, count: u32, finished: bool, max_tokens: u32) -> Res<bool> {
@@ -608,16 +639,17 @@ fn rc(d: &Driver, r: Res<()>) -> i32 {
         }
     }
 }
-fn sched(p: *const CSched) -> S {
-    // SAFETY: the caller's struct, valid during the call
-    let x = unsafe { &*p };
-    S { c: x.c, s: x.s, n: x.n.min(QMAX), st: x.st }
-}
-
-/// a new driver, or null when bind, retire, prefill or payload is missing
+/// a new driver with `n` slots over the scheduler config `c`, each slot `empty` (the C++ default) before it is keyed;
+/// null when bind, retire, prefill or payload is missing or n is not in 1..=QMAX
 #[no_mangle]
-pub unsafe extern "C" fn g6s2_driver_new(h: *const CHooks, p: *const CPlanner) -> *mut Driver {
-    match Driver::new(*h, *p) {
+pub unsafe extern "C" fn g6s2_driver_new(
+    h: *const CHooks,
+    p: *const CPlanner,
+    c: *const Config,
+    n: usize,
+    empty: *const Slot,
+) -> *mut Driver {
+    match Driver::new(*h, *p, *c, n, *empty) {
         Some(d) => Box::into_raw(Box::new(d)),
         None => std::ptr::null_mut(),
     }
@@ -636,11 +668,17 @@ pub unsafe extern "C" fn g6s2_driver_error(d: *const Driver) -> *const c_char {
     crate::ffi::msg((*d).err.get())
 }
 
-/// Driver::apply. pay: null without an admit. freed: room for the scheduler's slot count
+/// the scheduler's slots and counters, where the driver keeps them for its life
+#[no_mangle]
+pub unsafe extern "C" fn g6s2_driver_view(d: *const Driver, out: *mut CView) {
+    let s = (*d).s();
+    *out = CView { s: s.s, n: s.n, st: s.st };
+}
+
+/// Driver::apply. pay: null without an admit. freed: room for the driver's slot count
 #[no_mangle]
 pub unsafe extern "C" fn g6s2_driver_apply(
     d: *const Driver,
-    s: *const CSched,
     e: *const Commit,
     digest: u64,
     resize: bool,
@@ -650,9 +688,9 @@ pub unsafe extern "C" fn g6s2_driver_apply(
     admitted: *mut bool,
 ) -> i32 {
     let d = &*d;
-    let s = sched(s);
-    let r = d.apply(&s, &*e, digest, resize, pay.as_ref()).map(|c| {
-        let n = c.freed.len().min(s.n);
+    let n_slots = d.s().n;
+    let r = d.apply(&*e, digest, resize, pay.as_ref()).map(|c| {
+        let n = c.freed.len().min(n_slots);
         std::slice::from_raw_parts_mut(freed, n).copy_from_slice(&c.freed[..n]);
         *n_freed = n;
         *admitted = c.admitted;
@@ -662,10 +700,30 @@ pub unsafe extern "C" fn g6s2_driver_apply(
 
 /// Driver::step: the quantum it ran in *out
 #[no_mangle]
-pub unsafe extern "C" fn g6s2_driver_step(d: *const Driver, s: *const CSched, out: *mut Quantum) -> i32 {
+pub unsafe extern "C" fn g6s2_driver_step(d: *const Driver, out: *mut Quantum) -> i32 {
     let d = &*d;
-    let r = d.step(&sched(s), &mut *out);
+    let r = d.step(&mut *out);
     rc(d, r)
+}
+
+/// fails the scheduler: no later commit or step runs
+#[no_mangle]
+pub unsafe extern "C" fn g6s2_driver_fail(d: *const Driver) {
+    (*d).s().fail();
+}
+
+/// Scheduler::idle_boundary
+#[no_mangle]
+pub unsafe extern "C" fn g6s2_driver_idle_boundary(d: *const Driver, target: u64) -> i32 {
+    let d = &*d;
+    rc(d, d.idle_boundary(target))
+}
+
+/// the pool's digest at this event boundary (Scheduler::pool_digest)
+#[no_mangle]
+pub unsafe extern "C" fn g6s2_driver_pool_digest(d: *const Driver, v: u64) -> i32 {
+    let d = &*d;
+    rc(d, d.pool_digest(v))
 }
 
 /// the emit hook's accounting (Driver::emit); a slot out of range is refused
@@ -735,7 +793,9 @@ mod tests {
     fn emit_accounting() {
         let h: CHooks = unsafe { std::mem::zeroed() };
         let p: CPlanner = unsafe { std::mem::zeroed() };
-        assert!(Driver::new(h, p).is_none());
+        let c: Config = unsafe { std::mem::zeroed() };
+        let e = slot(0, 0, FREE);
+        assert!(Driver::new(h, p, c, 8, e).is_none());
         extern "C" fn nop_b(_: *mut c_void, _: *const Grant) -> i32 {
             0
         }
@@ -749,7 +809,9 @@ mod tests {
             0
         }
         let h = CHooks { bind: Some(nop_b), retire: Some(nop_s), prefill: Some(nop_p), payload: Some(nop_y), ..h };
-        let d = Driver::new(h, p).unwrap();
+        assert!(Driver::new(h, p, c, 0, e).is_none());
+        assert!(Driver::new(h, p, c, QMAX + 1, e).is_none());
+        let d = Driver::new(h, p, c, 8, e).unwrap();
         assert_eq!(d.emit(1, 3, 3, false, 5), Ok(false));
         assert_eq!(d.emit(1, 3, 2, false, 5), Err(Stop::Refused("partial emission without stop")));
         assert_eq!(d.emit(1, 3, 3, false, 5), Err(Stop::Refused("bad emitter count")));
@@ -818,16 +880,6 @@ mod tests {
         c.notice_max = 8;
         c.cp_step_rows = 6; // three sessions past R: capped rounds of two
         c.cp_after = 0;
-        let mut sl = [slot(0, 0, FREE); 8];
-        sch::init(&c, &mut sl);
-        for (n, i) in [0usize, 2, 5].into_iter().enumerate() {
-            sl[i].key.epoch = 1;
-            sl[i].phase = DECODE;
-            sl[i].req.id = 10 + n as u64;
-            sl[i].req.max_tokens = 1_000_000;
-        }
-        let mut st: State = unsafe { std::mem::zeroed() };
-        st.want_decode = true;
         let mut rounds = 0u64;
         let z: CHooks = unsafe { std::mem::zeroed() };
         let h = CHooks {
@@ -852,19 +904,26 @@ mod tests {
             active: Some(yes_),
             inserted: Some(zero_),
         };
-        let d = Driver::new(h, p).unwrap();
+        let d = Driver::new(h, p, c, 8, slot(0, 0, FREE)).unwrap();
+        d.s().with(|_, sl, _| {
+            for (n, i) in [0usize, 2, 5].into_iter().enumerate() {
+                sl[i].key.epoch = 1;
+                sl[i].phase = DECODE;
+                sl[i].req.id = 10 + n as u64;
+                sl[i].req.max_tokens = 1_000_000;
+            }
+        });
         for i in [0, 2, 5] {
             d.initialized[i].set(true);
         }
-        let s = S { c: &c, s: sl.as_mut_ptr(), n: 8, st: &mut st };
         let mut q = Quantum::default();
         for _ in 0..10 {
-            d.step(&s, &mut q).unwrap();
+            d.step(&mut q).unwrap();
         }
         ALLOCS.with(|a| a.set(0));
         COUNTING.with(|x| x.set(true));
         for _ in 0..500 {
-            d.step(&s, &mut q).unwrap();
+            d.step(&mut q).unwrap();
         }
         COUNTING.with(|x| x.set(false));
         assert_eq!(ALLOCS.with(|a| a.get()), 0);
