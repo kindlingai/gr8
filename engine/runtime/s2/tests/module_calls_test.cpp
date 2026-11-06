@@ -5,8 +5,9 @@
 // mid-run is written from inside a head step. The step then waits for its notice in the head's trace, so the boundary
 // the notice names, and every call after it, is the same on every run. The ranks' steps meet as a fabric's would.
 // Not logged, because how many there are depends on the clock: the pool reads of the head's status (free pages, room,
-// stats, runs, tiers) and share polls that find nothing. Each rank's transcript is hashed (FNV-1a). The hashes were
-// recorded from the service before ModuleOps, in each shape.
+// stats, runs, tiers) and share polls that find nothing. Each scenario runs twice, its module calls as std::function
+// hooks and as a table (ModuleOps). Each rank's transcript is hashed (FNV-1a). The hashes were recorded from the service
+// before ModuleOps, in each shape.
 //   --dump   print every transcript
 // The generator is mt19937_64 with modulo ranges, and no call takes two draws as arguments. Host only.
 #include <array>
@@ -395,8 +396,17 @@ struct Fake {
     }
 };
 
-// runs one scenario and returns both ranks' transcripts
-std::array<std::vector<std::string>, 2> run(const Scenario& sc, std::string& error) {
+// the service's hooks with the module's calls moved into a table (ModuleOps) over `all`, as an adapter hands it over
+NativeHooks as_table(const NativeHooks& all, FnModule<NativeHooks>& m) {
+    NativeHooks h;
+    h.pool = all.pool; h.pool.retain = nullptr; h.pool.park = nullptr;
+    h.share = all.share; h.flash = all.flash;
+    h.dfl_kv = all.dfl_kv; h.dfl_spec = all.dfl_spec; h.dsel = all.dsel; h.kstop = all.kstop; h.dfl_reuse = all.dfl_reuse; h.ngram = all.ngram;
+    h.module = m.ops();
+    return h;
+}
+// runs one scenario and returns both ranks' transcripts. table: the service gets the module's calls as a table
+std::array<std::vector<std::string>, 2> run(const Scenario& sc, bool table, std::string& error) {
     int sp[2];
     require(!::socketpair(AF_UNIX, SOCK_STREAM, 0, sp), "socketpair");
     ControlLinks head_links, worker_links;
@@ -443,9 +453,13 @@ std::array<std::vector<std::string>, 2> run(const Scenario& sc, std::string& err
     for (const auto& q : sc.phases[0].reqs) { send_req(q); admit(q); }
     std::exception_ptr err[2];
     std::unique_ptr<Service> s[2];
+    NativeHooks all[2] = {f0.hooks(), f1.hooks()};
+    std::unique_ptr<FnModule<NativeHooks>> mods[2];
     try {
-        s[0] = std::make_unique<Service>(b[0], head_links, f0.hooks(), 1);
-        s[1] = std::make_unique<Service>(b[1], worker_links, f1.hooks(), 1);
+        for (unsigned r = 0; r < 2; ++r) {
+            if (table) mods[r] = std::make_unique<FnModule<NativeHooks>>(all[r]);
+            s[r] = std::make_unique<Service>(b[r], r ? worker_links : head_links, table ? as_table(all[r], *mods[r]) : all[r], 1);
+        }
     } catch (const std::exception& e) { error = sc.name + ": " + e.what(); return {}; }
     s[0]->quit_linger_ms = s[1]->quit_linger_ms = 300;
     std::thread t0([&] { try { s[0]->run(); } catch (...) { err[0] = std::current_exception(); } });
@@ -585,23 +599,25 @@ int main(int argc, char** argv) {
     int fails = 0, n = 0;
     const auto all = scenarios();
     require(all.size() == sizeof EXPECT / sizeof EXPECT[0], "a scenario without its hashes");
-    for (size_t k = 0; k < all.size(); ++k) {
-        const Scenario& sc = all[k];
-        std::string error;
-        const auto t = run(sc, error);
-        if (!error.empty()) { std::printf("FAIL %s\n", error.c_str()); ++fails; continue; }
-        for (int r = 0; r < 2; ++r) {
-            uint64_t h = 14695981039346656037ull;
-            for (const auto& l : t[r]) { h = fnv(l.data(), l.size(), h); h = fnv("\n", 1, h); }
-            if (dump) for (const auto& l : t[r]) std::printf("%s r%d %s\n", sc.name.c_str(), r, l.c_str());
-            const bool ok = sc.name == EXPECT[k].name && h == EXPECT[k].h[r];
-            if (!ok) {
-                std::printf("FAIL %s rank %d: %zu calls, hash %llu\n", sc.name.c_str(), r, t[r].size(), (unsigned long long)h);
-                ++fails;
+    for (size_t k = 0; k < all.size(); ++k)
+        for (const bool table : {false, true}) {
+            const Scenario& sc = all[k];
+            std::string error;
+            const auto t = run(sc, table, error);
+            if (!error.empty()) { std::printf("FAIL %s\n", error.c_str()); ++fails; continue; }
+            for (int r = 0; r < 2; ++r) {
+                uint64_t h = 14695981039346656037ull;
+                for (const auto& l : t[r]) { h = fnv(l.data(), l.size(), h); h = fnv("\n", 1, h); }
+                if (dump) for (const auto& l : t[r]) std::printf("%s r%d %s\n", sc.name.c_str(), r, l.c_str());
+                const bool ok = sc.name == EXPECT[k].name && h == EXPECT[k].h[r];
+                if (!ok) {
+                    std::printf("FAIL %s%s rank %d: %zu calls, hash %llu\n", sc.name.c_str(), table ? " (table)" : "", r, t[r].size(),
+                                (unsigned long long)h);
+                    ++fails;
+                }
+                ++n;
             }
-            ++n;
         }
-    }
     remove_dir(traces);
     std::printf(fails ? "module_calls_test: %d FAIL\n" : "module_calls_test: PASS (%d transcripts)\n", fails ? fails : n);
     return fails != 0;

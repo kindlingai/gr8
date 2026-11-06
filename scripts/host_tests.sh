@@ -293,8 +293,8 @@ g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/run
 # GR8_S2_ADMIT_HOLD=1: ADMIT files that land inside a held admission join the held boundary
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/admit_hold_drain_test.cpp" "${KVLIB[@]}" -o "$T/admit_hold_drain_test"
 (cd "$T" && "$T/admit_hold_drain_test" 2>/dev/null)
-# the calls the service makes on a model module, against transcripts recorded from the service before ModuleOps, in
-# each model's shape
+# the calls the service makes on a model module (ModuleOps), as std::function hooks and as a table, against transcripts
+# recorded before ModuleOps, in each model's shape
 for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
   g++ -std=c++17 -O2 -Wall -Wextra -pthread -ffp-contract=off $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/module_calls_test.cpp" \
     -o "$T/module_calls_test" "${KVLIB[@]}"

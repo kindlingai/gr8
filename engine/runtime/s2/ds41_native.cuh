@@ -117,26 +117,6 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
         return d;
     };
     if (ck) {
-        h.pool.retain = [&](const Run& r, const PrefixReuse& st, const CacheNamespace& ns) {
-            int q = -1;
-            for (int i = 0; i < slots; ++i)
-                if (bound_live[size_t(i)] && bound[size_t(i)] == r) { q = i; break; }
-            require(q >= 0, "DS41 prefix retain: run has no bound slot");
-            // DSpark's final MAIN verify may finish without a following DRAFT/comp_commit;
-            // only st.valid (which includes draft_end) is safe to snapshot then.
-            const uint32_t p = st.history.empty() ? 0u : uint32_t(c.dsp
-                ? st.valid : std::min<int>(st.main_end, int(st.history.size()) - 1));
-            if (p) {
-                std::lock_guard<std::mutex> l(ck_mu);
-                const uint64_t gen = snaps.capture_request_end(*ck, q, p, st.history, ns, c.stream, img_rows[size_t(q)]);
-                if (gen) fprintf(stderr, "# rank %d ds41 ckpt capture gen %llu slot %d pos %u bytes %zu used %zu/%zu\n",
-                                 c.main.rank, (unsigned long long)gen, q, p, ck->last.bytes,
-                                 ck->used_bytes(), ck->budget_bytes());
-            }
-            bound_live[size_t(q)] = false;
-            snaps.reset(q);
-            pool.release(r); // the snapshot owns separate device storage, not the run's pages
-        };
         h.pool.match = [&](const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit, const CacheNamespace& ns, uint32_t r) {
             std::lock_guard<std::mutex> l(ck_mu);
             const Ds41PrefixHit f = ck->match(prompt, limit, ns);
@@ -164,166 +144,11 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
             if (hit.slot >= 0) claimed_slot.store(hit.slot); else claimed.store(hit.age);
             return pool.reserve(rows, worst, r);
         };
-        // park: the finished session's slot keeps its KV at the position retain would capture; its pages go back to the
-        // pool now, as retain's do (DS41's KV lives in the slot's slabs, not in the pages)
-        if (sc.park)
-            h.pool.park = [&](unsigned slot, const Run& r, const PrefixReuse& st, const CacheNamespace& ns) {
-                const int q = int(slot);
-                require(q < slots && bound_live[size_t(q)] && bound[size_t(q)] == r, "DS41 park: run has no bound slot");
-                const uint32_t p = st.history.empty() ? 0u : uint32_t(c.dsp
-                    ? st.valid : std::min<int>(st.main_end, int(st.history.size()) - 1));
-                {
-                    std::lock_guard<std::mutex> l(ck_mu);
-                    Parked& k = parked[size_t(q)];
-                    k.on = p > 0; k.pos = p; k.ns = ns; k.images = img_rows[size_t(q)];
-                    k.tokens.assign(st.history.begin(), st.history.begin() + std::min<size_t>(p, st.history.size()));
-                    if (k.on) snaps.park(*ck, q, p, k.tokens, ns);   // GR8_DS_CACHE_REPLACE bookkeeping of the request end, now
-                    else snaps.reset(q);
-                }
-                fprintf(stderr, "# rank %d ds41 park slot %d pos %u\n", c.main.rank, q, p);
-                bound_live[size_t(q)] = false;
-                pool.release(r);
-            };
         h.pool.tiers = [&] {
             std::lock_guard<std::mutex> l(ck_mu);
             return std::vector<g6kv_tier_totals>{ck->tier_stat()};
         };
     }
-    // a request starts at position 0 on the pool's first pages (no reuse, no adoption of a retired run): reset() leaves the first
-    // request's zeroed buffers alone and clears the attention and index state before every later one. No step is in flight here.
-    h.bind_request = [&](unsigned slot, const g6rt::ServeReq& r) {
-        require(slot < MAX_SESSIONS, "DS41 bind: slot outside the sessions");
-        img_rows[slot] = ds41_image_rows(r.images);
-    };
-    h.bind = [&](const Grant& g) {
-        if (slots > 1) {   // a fresh run on slot q: clear that slot's slabs only (the other sessions keep theirs; no step is in flight)
-            const int q = int(g.key.slot);
-            require(q >= 0 && q < slots && (!g.reuse || ck), "DS41 serve requires a fresh run or prefix snapshot on a session slot");
-            // park: a follow-up that extends the chat parked on q resumes it (no clear, no restore); any other grant on a
-            // parked slot evicts that chat into the prefix cache first (what retain did when it finished)
-            const int cs = claimed_slot.exchange(-1);
-            const bool resume = g.reuse && cs >= 0;
-            std::vector<int> last;   // resume: the parked chat's tokens and image rows, for its Engram ring
-            Ds41ImageRows last_images;
-            fence();
-            if (sc.park) {
-                std::lock_guard<std::mutex> l(ck_mu);
-                Parked& k = parked[size_t(q)];
-                if (resume) {
-                    require(cs == q && k.on && k.pos == g.reuse, "DS41 park: the claimed parked slot differs from the grant");
-                    snaps.resume(*ck, q, k.pos, k.tokens, k.ns);   // the slot's snapshot state as a restore of its request end
-                    last = std::move(k.tokens);
-                    last_images = std::move(k.images);
-                } else if (k.on) {
-                    // the request-end capture retain would have made at the finish (GR8_DS_CACHE_REPLACE kind and sibling link,
-                    // from the slot's snapshot state, kept since the park). This grant's own cache hit, restored below, is never
-                    // evicted or replaced by it (the capture is skipped when only that entry is in the way)
-                    const uint64_t keep = claimed.load();
-                    const uint64_t gen = snaps.evict_parked(*ck, q, k.pos, k.tokens, k.ns, c.stream, keep, k.images);
-                    fprintf(stderr, "# rank %d ds41 park evict slot %d pos %u capture gen %llu used %zu/%zu\n", c.main.rank, q, k.pos,
-                            (unsigned long long)gen, ck->used_bytes(), ck->budget_bytes());
-                    require(!keep || ck->find(keep), "DS41 park: the evicted chat's capture evicted the grant's own snapshot");
-                }
-                k = Parked{};
-            }
-            if (resume) {   // what a clear and a restore of this chat leave outside the parked state: the shared index buffers,
-                            // no cached drafts, the Engram ring of the last tokens
-                require(ds41_idx_clear_shared(&c.main, c.stream) == 0, "DS41 bind: index shared clear failed");
-                if (round) round->reset_drafts(q);
-                if (c.main.ehist) {   // as Ds41PrefixCache::restore writes it: the ring of tokens [pos - kRing, pos), -1 at image rows
-                    int eh[ds41::engram::kRing];
-                    ds41_engram_ring(eh, last, g.reuse, last_images);
-                    G6RT_CK(cudaMemcpyAsync(c.main.ehist + size_t(q) * ENG_RING, eh, sizeof(eh), cudaMemcpyHostToDevice, c.stream));
-                }
-                fence();
-                lp_rows = 0;
-                bound[size_t(q)] = g.run; bound_live[size_t(q)] = true;
-                fprintf(stderr, "# rank %d ds41 park resume slot %d pos %u\n", c.main.rank, q, g.reuse);
-                return;
-            }
-            require(ds41_attn_clear(&c.main, c.stream, q) == 0, "DS41 bind: attention slot clear failed");
-            require(ds41_idx_clear(&c.main, c.stream, q) == 0, "DS41 bind: index slot clear failed");
-            if (round) round->reset(q);           // DSpark: that slot's cached drafts and its draft key-ring slab
-            fence();
-            lp_rows = 0;
-            bound[size_t(q)] = g.run; bound_live[size_t(q)] = true; snaps.reset(q);
-            if (g.reuse) {
-                const uint64_t gen = claimed.exchange(0);
-                require(gen != 0, "DS41 prefix hit without a claimed entry");
-                std::lock_guard<std::mutex> l(ck_mu);
-                const Ds41PrefixEntry* e = ck->find(gen);
-                require(e && e->position == g.reuse, "DS41 prefix claim differs from granted skip");
-                snaps.restore(*ck, gen, q, c.stream);
-                fprintf(stderr, "# rank %d ds41 ckpt restore gen %llu slot %d pos %u bytes %zu hits %llu\n",
-                        c.main.rank, (unsigned long long)gen, q, g.reuse, ck->last.bytes,
-                        (unsigned long long)ck->hits());
-            }
-            return;
-        }
-        require(g.key.slot == 0 && (!g.reuse || ck) && g.run.first_page == 0, "DS41 serve requires an identity run on slot 0");
-        const auto list = pool.list(g.run);
-        for (size_t i = 0; i < list.size(); ++i) require(list[i] == int(i), "DS41 run is not contiguous");
-        fence();
-        reset(c.main, c.stream);
-        fence();
-        if (round) round->reset();
-        fence();
-        lp_rows = 0;
-        bound[0] = g.run; bound_live[0] = true; snaps.reset(0);
-        if (g.reuse) {
-            const uint64_t gen = claimed.exchange(0);
-            require(gen != 0, "DS41 prefix hit without a claimed entry");
-            std::lock_guard<std::mutex> l(ck_mu);
-            const Ds41PrefixEntry* e = ck->find(gen);
-            require(e && e->position == g.reuse, "DS41 prefix claim differs from granted skip");
-            snaps.restore(*ck, gen, 0, c.stream);
-            fprintf(stderr, "# rank %d ds41 ckpt restore gen %llu slot 0 pos %u bytes %zu hits %llu\n",
-                    c.main.rank, (unsigned long long)gen, g.reuse, ck->last.bytes,
-                    (unsigned long long)ck->hits());
-        }
-    };
-    h.retire = [&](const Slot&) { fence(); };
-    h.fence = fence;
-    h.dispatch.bucket = [&](bool, int ctx) { return bucket_of(c.main, ctx); };
-    // penalties (penalty.h): Dispatch writes these tables before every main step and rank.cuh k_penalty reads them
-    h.dispatch.pen_rows = c.main.pen_rows_host; h.dispatch.pen_sess = c.main.pen_sess_host;
-    h.dispatch.mode = [&](int, int next) { fence(); require(slots > 1 || next == -1 || next == 0, "DS41 non-solo mode"); };
-    h.dispatch.launch = [&](const Launch& l) {
-        require(slots > 1 || (l.solo == 0 && l.step.sess.size() == 1), "DS41 launch is not solo");
-        if (l.step.kind == s2::Step::DRAFT && round) return round->draft_step(l);
-        if (l.step.kind == s2::Step::CHAIN && round) return round->chain_step(l);
-        if (l.step.kind != s2::Step::MAIN) return std::vector<int>(size_t(l.step.M()), 0);
-        StepIn si{}; S2In h2{};
-        native_inputs(l, si, h2);
-        if (slots > 1) {   // each row's slot; ns sessions of rps rows (ns > 1: the captured ns-session graphs, rps = 1 at MTP 0, 1..k + 1 with DSpark)
-            if (const char* e = ds41_session_rows(h2, slots, int(sc.mtp), bool(round), si)) require(false, e);
-            c.main.ds_ns = h2.ns;
-        }
-        *c.input = si;
-        c.main.ds_moe_decode_step = l.step.scheduler_decode;
-        c.enqueue(si);
-        c.launch(l.buckets[0], si);
-        fence();
-        if (const unsigned e = c.errors()) {      // names the code, the stuck collective and the peer (first Engram light, 10-25: no word reached any log)
-            std::vector<int> ids;
-            for (const auto& y : c.main.layers) ids.push_back(y.l);
-            require(false, ds41::fabric_error_text("DS41 serve fabric error", e, ids, c.main.ecoll, ds41::engram::kLayerIds).c_str());
-        }
-        const auto& out = *c.output;
-        require(!out.attn_err, "DS41 step attention error");
-        lp_rows = 0;
-        if (std::any_of(l.samples.begin(), l.samples.end(), [](const Sampling& s) { return s.lp >= 0 || s.plp >= 0; })) {
-            lp_fetch(c.main, out, si, lp); lp_rows = si.M;
-        }
-        return std::vector<int>(out.tok, out.tok + si.M);
-    };
-    h.dispatch.logprob = [&](int row, bool target, int k) {
-        require(row >= 0 && row < lp_rows, "DS41 logprob row outside main step");
-        return lp_row(lp, row, target, k);
-    };
-    h.dispatch.prefill = [&](const Slot&, const Payload&, uint32_t, uint32_t) {
-        require(false, "DS41 serve: prefill is not built (every prompt runs as decode steps)");
-    };
     auto capture_prompt_end = [&](const Slot& s, const Payload& p, uint32_t end) {
         if (!ck || p.prompt.empty() || end != p.prompt.size() - 1) return;
         const CacheNamespace ns = steering::cache_namespace(s.req.steering);
@@ -333,8 +158,184 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
                          c.main.rank, (unsigned long long)gen, unsigned(s.key.slot), end,
                          ck->last.bytes, ck->used_bytes(), ck->budget_bytes());
     };
-    if (c.prefill && !c.prefill2)   // one chunk: one id of the main fabric sequence (Dispatch::prefill), fenced like a step; no head, so no output to read
-        h.dispatch.prefill_seq = [&](const Slot& s, const Payload& p, uint32_t first, uint32_t rows, uint64_t sequence) {
+    ds41::lanes::Counter lane_b;   // lane B's fabric sequence: one id per lane-B chunk
+    // DS41's module (ModuleOps): its hooks as members over references to the locals they use. The locals outlive it and the service
+#define DS41_CAPTURES(X) X(c) X(sc) X(slots) X(round) X(pool) X(ck) X(ck_mu) X(claimed) X(parked) X(claimed_slot) \
+    X(bound) X(bound_live) X(img_rows) X(snaps) X(lp) X(lp_rows) X(fence) X(capture_prompt_end) X(lane_b)
+    DS41_CAPTURES(G6S2_CAPTURE_TYPE)
+    struct Ds41Module : ModuleCtx {
+        DS41_CAPTURES(G6S2_CAPTURE_REF)
+        void on_retain(const Run& r, const PrefixReuse& st, const CacheNamespace& ns) {
+            int q = -1;
+            for (int i = 0; i < slots; ++i)
+                if (bound_live[size_t(i)] && bound[size_t(i)] == r) { q = i; break; }
+            require(q >= 0, "DS41 prefix retain: run has no bound slot");
+            // DSpark's final MAIN verify may finish without a following DRAFT/comp_commit;
+            // only st.valid (which includes draft_end) is safe to snapshot then.
+            const uint32_t p = st.history.empty() ? 0u : uint32_t(c.dsp
+                ? st.valid : std::min<int>(st.main_end, int(st.history.size()) - 1));
+            if (p) {
+                std::lock_guard<std::mutex> l(ck_mu);
+                const uint64_t gen = snaps.capture_request_end(*ck, q, p, st.history, ns, c.stream, img_rows[size_t(q)]);
+                if (gen) fprintf(stderr, "# rank %d ds41 ckpt capture gen %llu slot %d pos %u bytes %zu used %zu/%zu\n",
+                                 c.main.rank, (unsigned long long)gen, q, p, ck->last.bytes,
+                                 ck->used_bytes(), ck->budget_bytes());
+            }
+            bound_live[size_t(q)] = false;
+            snaps.reset(q);
+            pool.release(r); // the snapshot owns separate device storage, not the run's pages
+        }
+        void on_park(unsigned slot, const Run& r, const PrefixReuse& st, const CacheNamespace& ns) {
+            const int q = int(slot);
+            require(q < slots && bound_live[size_t(q)] && bound[size_t(q)] == r, "DS41 park: run has no bound slot");
+            const uint32_t p = st.history.empty() ? 0u : uint32_t(c.dsp
+                ? st.valid : std::min<int>(st.main_end, int(st.history.size()) - 1));
+            {
+                std::lock_guard<std::mutex> l(ck_mu);
+                Parked& k = parked[size_t(q)];
+                k.on = p > 0; k.pos = p; k.ns = ns; k.images = img_rows[size_t(q)];
+                k.tokens.assign(st.history.begin(), st.history.begin() + std::min<size_t>(p, st.history.size()));
+                if (k.on) snaps.park(*ck, q, p, k.tokens, ns);   // GR8_DS_CACHE_REPLACE bookkeeping of the request end, now
+                else snaps.reset(q);
+            }
+            fprintf(stderr, "# rank %d ds41 park slot %d pos %u\n", c.main.rank, q, p);
+            bound_live[size_t(q)] = false;
+            pool.release(r);
+        }
+        // a request starts at position 0 on the pool's first pages (no reuse, no adoption of a retired run): reset() leaves the first
+        // request's zeroed buffers alone and clears the attention and index state before every later one. No step is in flight here.
+        void on_bind_request(unsigned slot, const g6rt::ServeReq& r) {
+            require(slot < MAX_SESSIONS, "DS41 bind: slot outside the sessions");
+            img_rows[slot] = ds41_image_rows(r.images);
+        }
+        void on_bind(const Grant& g) {
+            if (slots > 1) {   // a fresh run on slot q: clear that slot's slabs only (the other sessions keep theirs; no step is in flight)
+                const int q = int(g.key.slot);
+                require(q >= 0 && q < slots && (!g.reuse || ck), "DS41 serve requires a fresh run or prefix snapshot on a session slot");
+                // park: a follow-up that extends the chat parked on q resumes it (no clear, no restore); any other grant on a
+                // parked slot evicts that chat into the prefix cache first (what retain did when it finished)
+                const int cs = claimed_slot.exchange(-1);
+                const bool resume = g.reuse && cs >= 0;
+                std::vector<int> last;   // resume: the parked chat's tokens and image rows, for its Engram ring
+                Ds41ImageRows last_images;
+                fence();
+                if (sc.park) {
+                    std::lock_guard<std::mutex> l(ck_mu);
+                    Parked& k = parked[size_t(q)];
+                    if (resume) {
+                        require(cs == q && k.on && k.pos == g.reuse, "DS41 park: the claimed parked slot differs from the grant");
+                        snaps.resume(*ck, q, k.pos, k.tokens, k.ns);   // the slot's snapshot state as a restore of its request end
+                        last = std::move(k.tokens);
+                        last_images = std::move(k.images);
+                    } else if (k.on) {
+                        // the request-end capture retain would have made at the finish (GR8_DS_CACHE_REPLACE kind and sibling link,
+                        // from the slot's snapshot state, kept since the park). This grant's own cache hit, restored below, is never
+                        // evicted or replaced by it (the capture is skipped when only that entry is in the way)
+                        const uint64_t keep = claimed.load();
+                        const uint64_t gen = snaps.evict_parked(*ck, q, k.pos, k.tokens, k.ns, c.stream, keep, k.images);
+                        fprintf(stderr, "# rank %d ds41 park evict slot %d pos %u capture gen %llu used %zu/%zu\n", c.main.rank, q, k.pos,
+                                (unsigned long long)gen, ck->used_bytes(), ck->budget_bytes());
+                        require(!keep || ck->find(keep), "DS41 park: the evicted chat's capture evicted the grant's own snapshot");
+                    }
+                    k = Parked{};
+                }
+                if (resume) {   // what a clear and a restore of this chat leave outside the parked state: the shared index buffers,
+                                // no cached drafts, the Engram ring of the last tokens
+                    require(ds41_idx_clear_shared(&c.main, c.stream) == 0, "DS41 bind: index shared clear failed");
+                    if (round) round->reset_drafts(q);
+                    if (c.main.ehist) {   // as Ds41PrefixCache::restore writes it: the ring of tokens [pos - kRing, pos), -1 at image rows
+                        int eh[ds41::engram::kRing];
+                        ds41_engram_ring(eh, last, g.reuse, last_images);
+                        G6RT_CK(cudaMemcpyAsync(c.main.ehist + size_t(q) * ENG_RING, eh, sizeof(eh), cudaMemcpyHostToDevice, c.stream));
+                    }
+                    fence();
+                    lp_rows = 0;
+                    bound[size_t(q)] = g.run; bound_live[size_t(q)] = true;
+                    fprintf(stderr, "# rank %d ds41 park resume slot %d pos %u\n", c.main.rank, q, g.reuse);
+                    return;
+                }
+                require(ds41_attn_clear(&c.main, c.stream, q) == 0, "DS41 bind: attention slot clear failed");
+                require(ds41_idx_clear(&c.main, c.stream, q) == 0, "DS41 bind: index slot clear failed");
+                if (round) round->reset(q);           // DSpark: that slot's cached drafts and its draft key-ring slab
+                fence();
+                lp_rows = 0;
+                bound[size_t(q)] = g.run; bound_live[size_t(q)] = true; snaps.reset(q);
+                if (g.reuse) {
+                    const uint64_t gen = claimed.exchange(0);
+                    require(gen != 0, "DS41 prefix hit without a claimed entry");
+                    std::lock_guard<std::mutex> l(ck_mu);
+                    const Ds41PrefixEntry* e = ck->find(gen);
+                    require(e && e->position == g.reuse, "DS41 prefix claim differs from granted skip");
+                    snaps.restore(*ck, gen, q, c.stream);
+                    fprintf(stderr, "# rank %d ds41 ckpt restore gen %llu slot %d pos %u bytes %zu hits %llu\n",
+                            c.main.rank, (unsigned long long)gen, q, g.reuse, ck->last.bytes,
+                            (unsigned long long)ck->hits());
+                }
+                return;
+            }
+            require(g.key.slot == 0 && (!g.reuse || ck) && g.run.first_page == 0, "DS41 serve requires an identity run on slot 0");
+            const auto list = pool.list(g.run);
+            for (size_t i = 0; i < list.size(); ++i) require(list[i] == int(i), "DS41 run is not contiguous");
+            fence();
+            reset(c.main, c.stream);
+            fence();
+            if (round) round->reset();
+            fence();
+            lp_rows = 0;
+            bound[0] = g.run; bound_live[0] = true; snaps.reset(0);
+            if (g.reuse) {
+                const uint64_t gen = claimed.exchange(0);
+                require(gen != 0, "DS41 prefix hit without a claimed entry");
+                std::lock_guard<std::mutex> l(ck_mu);
+                const Ds41PrefixEntry* e = ck->find(gen);
+                require(e && e->position == g.reuse, "DS41 prefix claim differs from granted skip");
+                snaps.restore(*ck, gen, 0, c.stream);
+                fprintf(stderr, "# rank %d ds41 ckpt restore gen %llu slot 0 pos %u bytes %zu hits %llu\n",
+                        c.main.rank, (unsigned long long)gen, g.reuse, ck->last.bytes,
+                        (unsigned long long)ck->hits());
+            }
+        }
+        void on_retire(const Slot&) { fence(); }
+        void on_fence() { fence(); }
+        int on_bucket(bool, int ctx) { return bucket_of(c.main, ctx); }
+        void on_mode(int, int next) { fence(); require(slots > 1 || next == -1 || next == 0, "DS41 non-solo mode"); }
+        std::vector<int> on_launch(const Launch& l) {
+            require(slots > 1 || (l.solo == 0 && l.step.sess.size() == 1), "DS41 launch is not solo");
+            if (l.step.kind == s2::Step::DRAFT && round) return round->draft_step(l);
+            if (l.step.kind == s2::Step::CHAIN && round) return round->chain_step(l);
+            if (l.step.kind != s2::Step::MAIN) return std::vector<int>(size_t(l.step.M()), 0);
+            StepIn si{}; S2In h2{};
+            native_inputs(l, si, h2);
+            if (slots > 1) {   // each row's slot; ns sessions of rps rows (ns > 1: the captured ns-session graphs, rps = 1 at MTP 0, 1..k + 1 with DSpark)
+                if (const char* e = ds41_session_rows(h2, slots, int(sc.mtp), bool(round), si)) require(false, e);
+                c.main.ds_ns = h2.ns;
+            }
+            *c.input = si;
+            c.main.ds_moe_decode_step = l.step.scheduler_decode;
+            c.enqueue(si);
+            c.launch(l.buckets[0], si);
+            fence();
+            if (const unsigned e = c.errors()) {      // names the code, the stuck collective and the peer (first Engram light, 10-25: no word reached any log)
+                std::vector<int> ids;
+                for (const auto& y : c.main.layers) ids.push_back(y.l);
+                require(false, ds41::fabric_error_text("DS41 serve fabric error", e, ids, c.main.ecoll, ds41::engram::kLayerIds).c_str());
+            }
+            const auto& out = *c.output;
+            require(!out.attn_err, "DS41 step attention error");
+            lp_rows = 0;
+            if (std::any_of(l.samples.begin(), l.samples.end(), [](const Sampling& s) { return s.lp >= 0 || s.plp >= 0; })) {
+                lp_fetch(c.main, out, si, lp); lp_rows = si.M;
+            }
+            return std::vector<int>(out.tok, out.tok + si.M);
+        }
+        g6rt::LpRow on_logprob(int row, bool target, int k) {
+            require(row >= 0 && row < lp_rows, "DS41 logprob row outside main step");
+            return lp_row(lp, row, target, k);
+        }
+        void on_prefill(const Slot&, const Payload&, uint32_t, uint32_t) {
+            require(false, "DS41 serve: prefill is not built (every prompt runs as decode steps)");
+        }
+        void on_prefill_seq(const Slot& s, const Payload& p, uint32_t first, uint32_t rows, uint64_t sequence) {
             c.main.ds_moe_decode_step = false;
             require(!p.decode_prompt, "DS41 prefill of a decode_prompt session");
             Ds41PrefillChunk chunk = ds41_make_chunk(p.prompt, first, rows, sc.prefill_rows, sequence, s.req.id, s.key.slot, s.run);
@@ -351,10 +352,8 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
                 require(false, ("DS41 prefill attention error layer " + std::to_string(layer) + " word " + std::to_string(e)).c_str());
             if (c.after_prefill) c.after_prefill(chunk);
             capture_prompt_end(s, p, first + rows);
-        };
-    ds41::lanes::Counter lane_b;   // lane B's fabric sequence: one id per lane-B chunk
-    if (c.prefill2)   // a quantum of W + 1 .. 2W rows: lane A + lane B, one fence; up to W rows: the one-lane callee, as above
-        h.dispatch.prefill_seq = [&](const Slot& s, const Payload& p, uint32_t first, uint32_t rows, uint64_t sequence) {
+        }
+        void on_prefill_seq2(const Slot& s, const Payload& p, uint32_t first, uint32_t rows, uint64_t sequence) {
             c.main.ds_moe_decode_step = false;
             require(!p.decode_prompt, "DS41 prefill of a decode_prompt session");
             Ds41LaneChunks q = ds41_make_lane_chunks(p.prompt, first, rows, sc.prefill_rows, sc.two_lanes, sequence, lane_b,
@@ -375,9 +374,8 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
             if (c.after_prefill) c.after_prefill(q.a);
             if (q.b.rows && c.after_prefill2) c.after_prefill2(q.b);
             capture_prompt_end(s, p, first + rows);
-        };
-    if (c.prefill_pack)
-        h.dispatch.prefill_pack_seq = [&](const std::vector<PrefillPart>& parts, uint64_t sequence) {
+        }
+        void on_prefill_pack(const std::vector<PrefillPart>& parts, uint64_t sequence) {
             c.main.ds_moe_decode_step = false;
             std::vector<Ds41PrefillChunk> chunks; chunks.reserve(parts.size());
             for (const auto& p : parts)
@@ -400,7 +398,34 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
             if (c.after_prefill_pack) c.after_prefill_pack(pack);
             for (const auto& part : parts)
                 capture_prompt_end(*part.slot, *part.payload, part.first + part.rows);
-        };
+        }
+    };
+    Ds41Module dm{{}, DS41_CAPTURES(G6S2_CAPTURE_ARG)};
+#undef DS41_CAPTURES
+    using M = Ds41Module;
+    g6s2_module_ops& o = h.module = mod::table(dm);
+    if (ck) {
+        o.retain = mod::retain<M, &M::on_retain>;
+        // park: the finished session's slot keeps its KV at the position retain would capture; its pages go back to the
+        // pool now, as retain's do (DS41's KV lives in the slot's slabs, not in the pages)
+        if (sc.park) o.park = mod::park<M, &M::on_park>;
+    }
+    o.bind_request = mod::bind_request<M, &M::on_bind_request>;
+    o.bind = mod::bind<M, &M::on_bind>;
+    o.retire = mod::retire<M, &M::on_retire>;
+    o.fence = mod::call<M, &M::on_fence>;
+    o.bucket = mod::bucket<M, &M::on_bucket>;
+    o.mode = mod::mode<M, &M::on_mode>;
+    o.launch = mod::launch<M, &M::on_launch>;
+    o.logprob = mod::logprob<M, &M::on_logprob>;
+    // penalties (penalty.h): Dispatch writes these tables before every main step and rank.cuh k_penalty reads them
+    o.pen_rows = c.main.pen_rows_host; o.pen_sess = c.main.pen_sess_host;
+    o.prefill = mod::prefill<M, &M::on_prefill>;
+    if (c.prefill && !c.prefill2)   // one chunk: one id of the main fabric sequence (Dispatch::prefill), fenced like a step; no head, so no output to read
+        o.prefill_seq = mod::prefill_seq<M, &M::on_prefill_seq>;
+    if (c.prefill2)   // a quantum of W + 1 .. 2W rows: lane A + lane B, one fence; up to W rows: the one-lane callee, as above
+        o.prefill_seq = mod::prefill_seq<M, &M::on_prefill_seq2>;
+    if (c.prefill_pack) o.prefill_pack = mod::prefill_pack<M, &M::on_prefill_pack>;
     ControlLinks links = bootstrap(bc);
     try {
         wcheck::seal(c.main.rank);

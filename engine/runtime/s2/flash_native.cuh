@@ -18,6 +18,17 @@
 #include <atomic>
 #include <mutex>
 namespace g6s2 {
+// The engine's additions to serve_flash's module (g6m4.cu: DFlash2, GR8_GLM53F_KV_CHUNKS borrow-idle); each optional
+struct FlashExtras {
+    std::function<void(const Grant&)> bind;   // after serve_flash's
+    std::function<void(const Slot&)> prefill;  // before serve_flash's prefill quantum
+    // a Resize on the engine's tier (FLASH_KV_TIER): true when it was, false for serve_flash's
+    std::function<bool(const Resize&)> resize;
+    std::function<bool(int)> dfl_ok;
+    std::function<int(int)> dfl_start;
+    std::function<s2::DflDrafts(const s2::DflReq&, const Sampling&)> dfl;
+    std::function<uint32_t()> flash_room;
+};
 struct FlashContext {
     g6rt::Model& main;
     g6rt::Draft& draft;
@@ -31,9 +42,8 @@ struct FlashContext {
     int split = 0;    // GR8_DEC_SPLIT: the batched main graphs in two parts, as the solo ones
     FlashCheckpoints* ckpt = nullptr;   // GR8_GLM53F_CACHE on: the checkpoint store, else none
     bool terminal = false;              // GR8_GLM53F_CACHE=terminal: also a checkpoint at the end of every request
-    // optional: the engine's own hooks (GR8_GLM53F_KV_CHUNKS borrow-idle: resize on FLASH_KV_TIER, flash_room, flash),
-    // added after serve_flash's; a resize hook chains to the one already set for any other tier
-    std::function<void(NativeHooks&)> install;
+    // optional: the engine's settings and additions (DFlash2, GR8_GLM53F_KV_CHUNKS borrow-idle), before the service starts
+    std::function<void(NativeHooks&, FlashExtras&)> install;
 };
 inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     using namespace g6rt;
@@ -77,7 +87,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     std::vector<uint32_t> capture_at(size_t(ks.sessions()));
     std::vector<g6rt::CacheNamespace> capture_ns(size_t(ks.sessions()));
     // a quantum that ends at its session's capture_at has run: the capture waits for the next boundary's commits
-    // (h.before_work), so a Resize announced during the prefill and landing at that boundary sizes the store first.
+    // (before_work), so a Resize announced during the prefill and landing at that boundary sizes the store first.
     // Until then no step runs, and no other session's work touches the session's run or KDA slots: rows [0, capture_at)
     // and its first KDA slot are the ones the quantum left
     struct Pending { int q; std::vector<int> tokens; uint64_t req; };
@@ -128,29 +138,6 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         // state its session's ring holds for p (flash_checkpoint.h: not cold-exact). Every rank retires at the same step.
         // A session cancelled at the boundary its aligned capture waits for: that capture first, so the entry for those
         // tokens is the aligned one (a terminal capture of the same tokens then only touches it)
-        h.pool.retain = [&](const Run& r, const g6rt::PrefixReuse& st, const g6rt::CacheNamespace& ns) {
-            take_capture();
-            int q = -1;
-            for (int i = 0; i < ks.sessions(); ++i)
-                if (live[size_t(i)] && bound[size_t(i)] == r) { q = i; break; }
-            require(q >= 0, "Flash checkpoint retain: the run has no bound session");
-            live[size_t(q)] = false;
-            if (c.terminal && st.history.size() > 1) {
-                const uint32_t p = uint32_t(std::min<int>(st.main_end, int(st.history.size()) - 1));
-                const FlashRing& ring = ks.rings[size_t(q)];
-                int slot = -1;
-                try { slot = ks.base(q) + ring.source(int(p)); } catch (const std::exception&) {}
-                if (p > 0 && slot >= 0) {
-                    const std::vector<int> tokens(st.history.begin(), st.history.begin() + p + 1);
-                    std::lock_guard<std::mutex> l(ck_mu);
-                    const uint64_t gen = ck->capture(p, slot, q, pool.list(r), tokens, ns, c.stream, true);
-                    if (gen) fprintf(stderr, "# flash ckpt terminal kept %u rows (session %d, KDA slot %d) as entry %llu (%llu blocks) in %.1f ms; %zu entries\n",
-                                     p, q, slot, (unsigned long long)gen, (unsigned long long)ck->last.blocks, ck->last.ms, ck->index().size());
-                    else fprintf(stderr, "# flash ckpt terminal: %u rows do not fit the store (%llu blocks)\n", p, (unsigned long long)ck->blocks());
-                } else fprintf(stderr, "# flash ckpt terminal: no state for %u rows (session %d, ring %d+%d)\n", p, q, ring.first, ring.rows);
-            }
-            pool.release(r);
-        };
         h.pool.match = [&](const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit, const g6rt::CacheNamespace& ns,
                            uint32_t r) {
             std::lock_guard<std::mutex> l(ck_mu);
@@ -190,68 +177,6 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         const uint32_t at = aligned_point(g.req.prompt_tokens, grid);
         if (exact && at > g.reuse) capture_at[size_t(q)] = at;
     };
-    h.bind = [&](const Grant& g) {
-        const int q = int(g.key.slot);
-        require((!g.reuse || ck) && q < ks.sessions(), "Flash serve requires a fresh run on a session slot");
-        const auto list = pool.list(g.run);
-        bound[size_t(q)] = g.run; live[size_t(q)] = true;
-        if (multi) {
-            // the run's pages into slot q's tables, cleared (not reset(), which clears the whole pool and KDA slot 0);
-            // the session's first KDA slot from zero (its other slots are written before they are read)
-            const int most = std::max(c.main.s2->pool_pages, c.draft.d.s2->pool_pages);
-            for (Model* x : {&c.main, &c.draft.d}) {
-                s2_set_pages(*x, q, list);
-                s2_reset_pages(*x, x->s2->run[q], c.stream, most);
-                for (Layer& y : x->layers) if (!y.kda && y.ab.storage) G6RT_CK(g6_attn_bind_raw_reset(&y.ab, q, c.stream));
-            }
-            if (c.main.kda_st.S) kda::reset(c.main.kda_st, ks.base(q), c.stream);
-            ks.reset(q); lp_rows = 0; fence();
-            bind_ckpt(g, q, list);
-            return;
-        }
-        require(g.key.slot == 0 && (!g.reuse || ck) && g.run.first_page == 0,
-                "Flash serve requires a fresh identity run");
-        for (size_t i = 0; i < list.size(); ++i) require(list[i] == int(i), "Flash run is not contiguous");
-        if (dirty < 0 || reset_all) { reset(c.main, c.stream); reset(c.draft.d, c.stream); }
-        else {
-            const int pg = (dirty + PAGE - 1) / PAGE + 1;
-            if (reset_check) {
-                const int lm = reset_dirty_layer(c.main, pg, zflag, c.stream), ld = reset_dirty_layer(c.draft.d, pg, zflag, c.stream);
-                if (lm >= 0 || ld >= 0) {
-                    fprintf(stderr, "# GR8_GLM53F_RESET_CHECK: request %llu: nonzero cache past page %d (rows < %d written): main layer %d, draft layer %d\n",
-                            (unsigned long long)g.req.id, pg, dirty, lm, ld);
-                    require(false, "Flash partial reset: a cache page past the written rows is not zero");
-                }
-            }
-            reset_pages(c.main, pg, c.stream); reset_pages(c.draft.d, pg, c.stream);
-        }
-        dirty = 0;
-        ks.reset(0); lp_rows = 0; fence();
-        bind_ckpt(g, 0, list);
-    };
-    // a session cancelled at the boundary its capture waits for: its rows are still in place (the next bind resets them)
-    h.retire = [&](const Slot&) { fence(); if (ck) take_capture(); };
-    if (ck) h.before_work = take_capture;
-    h.fence = fence;
-    h.dispatch.bucket = [&](bool d, int ctx) { return bucket_of(d ? c.draft.d : c.main, ctx); };
-    // request grammars (grammar.h): the masks the main head reads (rank.cuh k_grammar_mask), set before every main step
-    h.dispatch.gm_on = c.main.gm_on_host; h.dispatch.gm_bits = c.main.gm_bits_host; h.dispatch.gm_words = c.main.gm_words;
-    // penalties (penalty.h): Dispatch writes these tables before every main step and rank.cuh k_penalty reads them
-    h.dispatch.pen_rows = c.main.pen_rows_host; h.dispatch.pen_sess = c.main.pen_sess_host;
-    h.dispatch.mode = [&](int old, int next) {
-        fence();
-        if (!multi) { require(next == -1 || next == 0, "Flash non-solo mode"); return; }
-        // as the full model's NativeDispatch::mode: the kept draft row moves between the solo path and the session's
-        // slot, the solo session's pages go into the layers' own tables (no KV moves)
-        if (old >= 0) s2_hprev_from_solo(c.draft, old, c.stream);
-        if (next >= 0) {
-            const std::vector<int>& run = c.main.s2->run[next];
-            require(!run.empty() && run == c.draft.d.s2->run[next], "Flash main/draft survivor runs differ");
-            s2_solo_pages(c.main, run); s2_solo_pages(c.draft.d, run);
-            s2_hprev_to_solo(c.draft, next, c.stream);
-        }
-        c.main.s2on = c.draft.d.s2on = next < 0; fence();
-    };
     // the batched graphs (several sessions): kind, M and bucket. Flash's bound layers have no row class, so the main
     // graphs of one M serve every class
     struct Graphs { cudaGraphExec_t a = nullptr, b = nullptr; };
@@ -262,7 +187,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     // A session that verifies more rows than its region holds takes the wide region (FlashSlots::take_wide): DFlash2 for
     // a request admitted alone on a narrow region, or promoted there (GR8_DFL_REUSE=2). A session verifies that many
     // rows only while it is alone (Batch::demote moves it to MTP when a second session arrives), so the previous holder
-    // is retiring or free, and h.before_work took its pending checkpoint at the boundary
+    // is retiring or free, and before_work took its pending checkpoint at the boundary
     auto widen = [&](const s2::Step& sp, const std::vector<int>& events) {
         for (size_t j = 0; j < sp.sess.size(); ++j) {
             const int q = int(sp.sess[j]);
@@ -273,165 +198,6 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             fprintf(stderr, "# flash KDA: session %d takes the wide ring from session %d\n", q, o);
         }
     };
-    h.dispatch.launch = [&](const Launch& l) {
-        const bool d = l.step.kind != s2::Step::MAIN, chain = l.step.kind == s2::Step::CHAIN;
-        require(multi ? l.solo < 0 || l.step.sess.size() == 1 : l.solo == 0 && l.step.sess.size() == 1,
-                "Flash launch is not solo");
-        Model& model = d ? c.draft.d : c.main;
-        StepIn si{}; S2In h2{};
-        native_inputs(l, si, h2);
-        // each row's session: its DSA layers' raw index ring (attn/kvfmt.h)
-        for (size_t j = 0; j < l.step.sess.size(); ++j)
-            for (int r = l.step.row0[j]; r < l.step.row0[j] + l.step.rows[j]; ++r) si.sess[r] = l.step.sess[j];
-        Graphs* g = nullptr;
-        if (multi) {
-            require(model.s2on == (l.solo < 0), "Flash solo mode differs from host");
-            if (l.solo >= 0) si.page_bound = model.s2->pool_pages;   // the solo tables hold -1 past the session's pages
-            else {
-                const auto it = graphs.find(key(d ? (chain ? 'c' : 'd') : 'm', si.M, l.bucket));
-                if (it == graphs.end())
-                    throw std::runtime_error("Flash launch of an uncaptured shape " + l.graph_key + ": not in the boot capture set");
-                g = &it->second;
-                model.s2->h = h2; model.s2->bucket = l.bucket;
-                for (int j = 0; j < S2N; ++j) model.s2->bk[j] = l.bucket;
-                *(d ? draft_layout : layout) = h2;
-            }
-        }
-        if (d) {
-            si.step = ++dseq;
-            *c.draft_input = si;
-            std::vector<uint32_t> sizes(3, uint32_t(si.M * HID * 2));
-            sizes[2] = uint32_t(glue::head_bytes(si.M, c.draft.d.nc));
-            c.draft_fabric.enqueue_step(si.step, sizes);
-            wrote_step(si);
-            if (!g) c.draft_graph(l.buckets[0], chain, si.M);
-        } else {
-            widen(l.step, l.events);
-            ks.step(si, l.step, l.events, s2::Step::TAIL);
-            *c.input = si;
-            std::vector<uint32_t> sizes(c.main.ncoll(), uint32_t(si.M * HID * 2));
-            sizes.back() = head_size(si, c.main.nc);
-            c.main_fabric.enqueue_step(si.step, sizes);
-            wrote_step(si);
-            if (!g) c.main_graph(l.buckets[0], si.M);
-        }
-        if (g) {
-            G6RT_CK(cudaGraphLaunch(g->a, c.stream));
-            if (g->b) G6RT_CK(cudaGraphLaunch(g->b, c.stream));
-        }
-        fence(); check();
-        const auto& out = *(d ? c.draft_output : c.output);
-        require(!out.attn_err, "Flash step attention error");
-        if (!d) {
-            g6rt::evprof_read(si.M, c.stream, c.main.rank);
-            lp_rows = 0;
-            if (std::any_of(l.samples.begin(), l.samples.end(), [](const Sampling& s) { return s.lp >= 0 || s.plp >= 0; })) {
-                lp_fetch(c.main, out, si, lp); lp_rows = si.M;
-            }
-        }
-        return std::vector<int>(out.tok, out.tok + si.M);
-    };
-    h.dispatch.logprob = [&](int row, bool target, int k) {
-        require(row >= 0 && row < lp_rows, "Flash logprob row outside main step");
-        return lp_row(lp, row, target, k);
-    };
-    h.dispatch.prefill = [&](const Slot& slot, const Payload& p, uint32_t first, uint32_t rows) {
-        const auto start = std::chrono::steady_clock::now();
-        const int a = int(first), ma = std::min(int(rows), int(sc.prefill_rows)), mb = int(rows) - ma;
-        require(!mb || (sc.two_lanes && mb <= int(sc.prefill_rows)), "Flash prefill exceeds lanes");
-        std::vector<int> pos(rows);
-        for (unsigned r = 0; r < rows; ++r) pos[r] = a + int(r);
-        wrote(a + int(rows));
-        // several sessions: the prefill runs today's path (s2on off) on the session's pages in the layers' own tables
-        // (the batched steps read the slots' tables) and its first KDA slot
-        const int q = int(slot.key.slot), kslot = multi ? ks.base(q) : 0;
-        const bool on = multi && c.main.s2on;
-        if (multi) {
-            const std::vector<int>& run = c.main.s2->run[q];
-            require(!run.empty() && run == c.draft.d.s2->run[q], "Flash main/draft prefill runs differ");
-            s2_solo_pages(c.main, run); s2_solo_pages(c.draft.d, run);
-            c.main.s2on = c.draft.d.s2on = false;
-        }
-        pf_inputs_flash(c.prefill, ma, p.prompt.data() + a, pos.data(), kslot, multi ? q : 0);
-        pf_enqueue_flash(c.prefill_fabric, c.main, c.prefill, pfseq, c.main.nl, ma);
-        if (mb) {
-            pf_inputs_flash(c.prefill2, mb, p.prompt.data() + a + ma, pos.data() + ma, kslot, multi ? q : 0);
-            pf_enqueue_flash(c.prefill_fabric2, c.main, c.prefill2, pfseq2, c.main.nl, mb);
-            pf_step2_flash(c.main, c.prefill, c.prefill2, ma, mb, a + ma, a + ma + mb, pfseq, pfseq2, c.stream);
-            pfseq2 += c.main.nl;
-        } else pf_step_flash(c.main, c.prefill, ma, a + ma, pfseq, c.stream);
-        pfseq += c.main.nl;
-        // The cache fill (the default) touches no fabric and no main layer, and leaves its own error word set, so every
-        // word check() reads stays set until the next request's reset: one check after the last chunk sees what one per
-        // chunk saw, without check()'s blocking copy per layer each MX rows. The fence per chunk stays (k_step_in reads
-        // *c.draft_input, which the next chunk rewrites).
-        const bool cache = knob::glm53f_draft_kv();
-        fence();
-        if (!cache) check();
-        auto draft = [&](FlashPrefill& fp, int n, int base) {
-            if (cache && pf_draft_full() && pf_draft_full_ok(c.draft))   // GR8_GLM53F_PF_DRAFT_FULL (flash_prefill.cuh)
-            {
-                const bool chk = pf_draft_full() == 2;
-                DraftFull& F = pf_draft_cache_full(c.draft, fp, n, base, p.prompt.data() + base + 1, chk, c.stream);
-                if (!chk) { dseq += (n + MX - 1) / MX; wrote(base + n); fence(); return; }   // fence: check() reads the error words
-                pf_draft_flash(c.draft, fp, n, base, p.prompt.data() + base + 1, dseq, [&](const StepIn& di) {
-                    *c.draft_input = di;
-                    wrote_step(di);
-                    Model& d = c.draft.d;
-                    const bind::Layer& b = d.layers[0].L[di.M];
-                    launch_step_in(d, c.stream);
-                    launch_draft_embed(c.draft, di.M, false, c.stream);
-                    bind::launch(b.kv_a, c.stream);
-                    bind::launch(b.idx_k, c.stream);
-                    bind::launch(b.idx_g, c.stream);
-                    pf_draft_full_cmp(c.draft, F, di.pos[0] - base, di.M, c.stream);
-                    fence();
-                }, multi ? q : 0);
-                unsigned dw = 0;
-                G6RT_CK(cudaMemcpy(&dw, F.diff, 4, cudaMemcpyDeviceToHost));
-                fprintf(stderr, "# GR8_GLM53F_PF_DRAFT_FULL check: rows %d at %d, differing kv_a/idx_k/idx_g words %u\n", n, base, dw);
-                return;
-            }
-            pf_draft_flash(c.draft, fp, n, base, p.prompt.data() + base + 1, dseq, [&](const StepIn& di) {
-                *c.draft_input = di;
-                wrote_step(di);
-                if (cache) pf_draft_cache_flash(c.draft, di.M, di.context, c.stream);
-                else {
-                    std::vector<uint32_t> sizes(3, uint32_t(di.M * HID * 2));
-                    sizes[2] = uint32_t(glue::head_bytes(di.M, c.draft.d.nc));
-                    c.draft_fabric.enqueue_step(di.step, sizes);
-                    const int old = c.draft.d.cur;
-                    c.draft.d.cur = bucket_of(c.draft.d, di.context);
-                    launch_draft_step(c.draft, di.M, di.context, false, c.stream);
-                    c.draft.d.cur = old;
-                }
-                fence();
-                if (!cache) check();
-            }, multi ? q : 0);
-        };
-        draft(c.prefill, ma, a);
-        if (mb) draft(c.prefill2, mb, a + ma);
-        if (cache) check();
-        uint32_t& at = capture_at[size_t(q)];
-        if (at && first + rows == at) {   // the quantum that ends at the prompt's last grid point
-            require(p.prompt.size() > at, "Flash checkpoint past the prompt");
-            pending.push_back(Pending{q, std::vector<int>(p.prompt.begin(), p.prompt.begin() + at + 1), slot.req.id});
-            at = 0;
-        }
-        if (on) c.main.s2on = c.draft.d.s2on = true;
-        fprintf(stderr, "# flash serve request %llu prefill %u rows at %u (main + draft): %.3f ms\n",
-                (unsigned long long)slot.req.id, rows, first,
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
-    };
-    if (pf_prof().on) {   // GR8_PF_PROF=1: each prefill quantum's stage profile
-        auto run = h.dispatch.prefill;
-        h.dispatch.prefill = [&, run](const Slot& slot, const Payload& p, uint32_t first, uint32_t rows) {
-            run(slot, p, first, rows);
-            const std::string tag = "rank " + std::to_string(c.main.rank) + " request " + std::to_string(slot.req.id) + ",";
-            flash_pf_prof().print(tag.c_str());
-            flash_pf_prof() = FlashPfProf{};
-        };
-    }
     // several sessions: every batched shape at every context bucket, captured after the bootstrap (its timeout does not
     // cover the capture) and before the weights are sealed, as the full model's capture_all; then serving starts in S2
     // mode with no session (solo -1)
@@ -502,13 +268,261 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         old_layout = c.main.s2->in; old_draft_layout = c.draft.d.s2->in;
         c.main.s2->in = layout; c.draft.d.s2->in = draft_layout;
     }
-    // the checkpoint store on a group lease (D-331 M8 (c)): it shares its KV node with the full model's pool. Every rank
-    // resizes it at the Resize commit; the head reports to the node every GR8_S2_SHARE_MS, offering what it holds only
-    // while idle (GR8_KV_SHARE_WHEN=idle, default) or whenever the node asks (always), as the full model's pool does
-    if (ck && ck->group()) {
-        const bool always = knob::kv_share_when() == "always";
-        const int rank = c.main.rank;
-        h.resize = [&, rank](const Resize& r) {
+    FlashExtras extra;   // the engine's additions (FlashContext::install)
+    const int rank = c.main.rank;
+    // Flash's module (ModuleOps): its hooks as members over references to the locals they use. The locals outlive it and the service
+#define FLASH_CAPTURES(X) X(c) X(sc) X(multi) X(pool) X(ks) X(pfseq) X(pfseq2) X(dseq) X(lp) X(lp_rows) X(fence) \
+    X(check) X(ck) X(ck_mu) X(bound) X(live) X(capture_at) X(pending) X(take_capture) X(reset_all) X(reset_check) \
+    X(dirty) X(zflag) X(wrote) X(wrote_step) X(bind_ckpt) X(graphs) X(key) X(layout) X(draft_layout) X(widen) X(rank) \
+    X(extra)
+    FLASH_CAPTURES(G6S2_CAPTURE_TYPE)
+    struct FlashModule : ModuleCtx {
+        FLASH_CAPTURES(G6S2_CAPTURE_REF)
+        void on_retain(const Run& r, const g6rt::PrefixReuse& st, const g6rt::CacheNamespace& ns) {
+            take_capture();
+            int q = -1;
+            for (int i = 0; i < ks.sessions(); ++i)
+                if (live[size_t(i)] && bound[size_t(i)] == r) { q = i; break; }
+            require(q >= 0, "Flash checkpoint retain: the run has no bound session");
+            live[size_t(q)] = false;
+            if (c.terminal && st.history.size() > 1) {
+                const uint32_t p = uint32_t(std::min<int>(st.main_end, int(st.history.size()) - 1));
+                const FlashRing& ring = ks.rings[size_t(q)];
+                int slot = -1;
+                try { slot = ks.base(q) + ring.source(int(p)); } catch (const std::exception&) {}
+                if (p > 0 && slot >= 0) {
+                    const std::vector<int> tokens(st.history.begin(), st.history.begin() + p + 1);
+                    std::lock_guard<std::mutex> l(ck_mu);
+                    const uint64_t gen = ck->capture(p, slot, q, pool.list(r), tokens, ns, c.stream, true);
+                    if (gen) fprintf(stderr, "# flash ckpt terminal kept %u rows (session %d, KDA slot %d) as entry %llu (%llu blocks) in %.1f ms; %zu entries\n",
+                                     p, q, slot, (unsigned long long)gen, (unsigned long long)ck->last.blocks, ck->last.ms, ck->index().size());
+                    else fprintf(stderr, "# flash ckpt terminal: %u rows do not fit the store (%llu blocks)\n", p, (unsigned long long)ck->blocks());
+                } else fprintf(stderr, "# flash ckpt terminal: no state for %u rows (session %d, ring %d+%d)\n", p, q, ring.first, ring.rows);
+            }
+            pool.release(r);
+        }
+        void on_bind(const Grant& g) {
+            const int q = int(g.key.slot);
+            require((!g.reuse || ck) && q < ks.sessions(), "Flash serve requires a fresh run on a session slot");
+            const auto list = pool.list(g.run);
+            bound[size_t(q)] = g.run; live[size_t(q)] = true;
+            if (multi) {
+                // the run's pages into slot q's tables, cleared (not reset(), which clears the whole pool and KDA slot 0);
+                // the session's first KDA slot from zero (its other slots are written before they are read)
+                const int most = std::max(c.main.s2->pool_pages, c.draft.d.s2->pool_pages);
+                for (Model* x : {&c.main, &c.draft.d}) {
+                    s2_set_pages(*x, q, list);
+                    s2_reset_pages(*x, x->s2->run[q], c.stream, most);
+                    for (Layer& y : x->layers) if (!y.kda && y.ab.storage) G6RT_CK(g6_attn_bind_raw_reset(&y.ab, q, c.stream));
+                }
+                if (c.main.kda_st.S) kda::reset(c.main.kda_st, ks.base(q), c.stream);
+                ks.reset(q); lp_rows = 0; fence();
+                bind_ckpt(g, q, list);
+                return;
+            }
+            require(g.key.slot == 0 && (!g.reuse || ck) && g.run.first_page == 0,
+                    "Flash serve requires a fresh identity run");
+            for (size_t i = 0; i < list.size(); ++i) require(list[i] == int(i), "Flash run is not contiguous");
+            if (dirty < 0 || reset_all) { reset(c.main, c.stream); reset(c.draft.d, c.stream); }
+            else {
+                const int pg = (dirty + PAGE - 1) / PAGE + 1;
+                if (reset_check) {
+                    const int lm = reset_dirty_layer(c.main, pg, zflag, c.stream), ld = reset_dirty_layer(c.draft.d, pg, zflag, c.stream);
+                    if (lm >= 0 || ld >= 0) {
+                        fprintf(stderr, "# GR8_GLM53F_RESET_CHECK: request %llu: nonzero cache past page %d (rows < %d written): main layer %d, draft layer %d\n",
+                                (unsigned long long)g.req.id, pg, dirty, lm, ld);
+                        require(false, "Flash partial reset: a cache page past the written rows is not zero");
+                    }
+                }
+                reset_pages(c.main, pg, c.stream); reset_pages(c.draft.d, pg, c.stream);
+            }
+            dirty = 0;
+            ks.reset(0); lp_rows = 0; fence();
+            bind_ckpt(g, 0, list);
+        }
+        void on_bind_ext(const Grant& g) { on_bind(g); extra.bind(g); }
+        // a session cancelled at the boundary its capture waits for: its rows are still in place (the next bind resets them)
+        void on_retire(const Slot&) { fence(); if (ck) take_capture(); }
+        void on_before_work() { take_capture(); }
+        void on_fence() { fence(); }
+        int on_bucket(bool d, int ctx) { return bucket_of(d ? c.draft.d : c.main, ctx); }
+        void on_mode(int old, int next) {
+            fence();
+            if (!multi) { require(next == -1 || next == 0, "Flash non-solo mode"); return; }
+            // as the full model's NativeDispatch::mode: the kept draft row moves between the solo path and the session's
+            // slot, the solo session's pages go into the layers' own tables (no KV moves)
+            if (old >= 0) s2_hprev_from_solo(c.draft, old, c.stream);
+            if (next >= 0) {
+                const std::vector<int>& run = c.main.s2->run[next];
+                require(!run.empty() && run == c.draft.d.s2->run[next], "Flash main/draft survivor runs differ");
+                s2_solo_pages(c.main, run); s2_solo_pages(c.draft.d, run);
+                s2_hprev_to_solo(c.draft, next, c.stream);
+            }
+            c.main.s2on = c.draft.d.s2on = next < 0; fence();
+        }
+        std::vector<int> on_launch(const Launch& l) {
+            const bool d = l.step.kind != s2::Step::MAIN, chain = l.step.kind == s2::Step::CHAIN;
+            require(multi ? l.solo < 0 || l.step.sess.size() == 1 : l.solo == 0 && l.step.sess.size() == 1,
+                    "Flash launch is not solo");
+            Model& model = d ? c.draft.d : c.main;
+            StepIn si{}; S2In h2{};
+            native_inputs(l, si, h2);
+            // each row's session: its DSA layers' raw index ring (attn/kvfmt.h)
+            for (size_t j = 0; j < l.step.sess.size(); ++j)
+                for (int r = l.step.row0[j]; r < l.step.row0[j] + l.step.rows[j]; ++r) si.sess[r] = l.step.sess[j];
+            Graphs* g = nullptr;
+            if (multi) {
+                require(model.s2on == (l.solo < 0), "Flash solo mode differs from host");
+                if (l.solo >= 0) si.page_bound = model.s2->pool_pages;   // the solo tables hold -1 past the session's pages
+                else {
+                    const auto it = graphs.find(key(d ? (chain ? 'c' : 'd') : 'm', si.M, l.bucket));
+                    if (it == graphs.end())
+                        throw std::runtime_error("Flash launch of an uncaptured shape " + l.graph_key + ": not in the boot capture set");
+                    g = &it->second;
+                    model.s2->h = h2; model.s2->bucket = l.bucket;
+                    for (int j = 0; j < S2N; ++j) model.s2->bk[j] = l.bucket;
+                    *(d ? draft_layout : layout) = h2;
+                }
+            }
+            if (d) {
+                si.step = ++dseq;
+                *c.draft_input = si;
+                std::vector<uint32_t> sizes(3, uint32_t(si.M * HID * 2));
+                sizes[2] = uint32_t(glue::head_bytes(si.M, c.draft.d.nc));
+                c.draft_fabric.enqueue_step(si.step, sizes);
+                wrote_step(si);
+                if (!g) c.draft_graph(l.buckets[0], chain, si.M);
+            } else {
+                widen(l.step, l.events);
+                ks.step(si, l.step, l.events, s2::Step::TAIL);
+                *c.input = si;
+                std::vector<uint32_t> sizes(c.main.ncoll(), uint32_t(si.M * HID * 2));
+                sizes.back() = head_size(si, c.main.nc);
+                c.main_fabric.enqueue_step(si.step, sizes);
+                wrote_step(si);
+                if (!g) c.main_graph(l.buckets[0], si.M);
+            }
+            if (g) {
+                G6RT_CK(cudaGraphLaunch(g->a, c.stream));
+                if (g->b) G6RT_CK(cudaGraphLaunch(g->b, c.stream));
+            }
+            fence(); check();
+            const auto& out = *(d ? c.draft_output : c.output);
+            require(!out.attn_err, "Flash step attention error");
+            if (!d) {
+                g6rt::evprof_read(si.M, c.stream, c.main.rank);
+                lp_rows = 0;
+                if (std::any_of(l.samples.begin(), l.samples.end(), [](const Sampling& s) { return s.lp >= 0 || s.plp >= 0; })) {
+                    lp_fetch(c.main, out, si, lp); lp_rows = si.M;
+                }
+            }
+            return std::vector<int>(out.tok, out.tok + si.M);
+        }
+        g6rt::LpRow on_logprob(int row, bool target, int k) {
+            require(row >= 0 && row < lp_rows, "Flash logprob row outside main step");
+            return lp_row(lp, row, target, k);
+        }
+        void on_prefill(const Slot& slot, const Payload& p, uint32_t first, uint32_t rows) {
+            const auto start = std::chrono::steady_clock::now();
+            const int a = int(first), ma = std::min(int(rows), int(sc.prefill_rows)), mb = int(rows) - ma;
+            require(!mb || (sc.two_lanes && mb <= int(sc.prefill_rows)), "Flash prefill exceeds lanes");
+            std::vector<int> pos(rows);
+            for (unsigned r = 0; r < rows; ++r) pos[r] = a + int(r);
+            wrote(a + int(rows));
+            // several sessions: the prefill runs today's path (s2on off) on the session's pages in the layers' own tables
+            // (the batched steps read the slots' tables) and its first KDA slot
+            const int q = int(slot.key.slot), kslot = multi ? ks.base(q) : 0;
+            const bool on = multi && c.main.s2on;
+            if (multi) {
+                const std::vector<int>& run = c.main.s2->run[q];
+                require(!run.empty() && run == c.draft.d.s2->run[q], "Flash main/draft prefill runs differ");
+                s2_solo_pages(c.main, run); s2_solo_pages(c.draft.d, run);
+                c.main.s2on = c.draft.d.s2on = false;
+            }
+            pf_inputs_flash(c.prefill, ma, p.prompt.data() + a, pos.data(), kslot, multi ? q : 0);
+            pf_enqueue_flash(c.prefill_fabric, c.main, c.prefill, pfseq, c.main.nl, ma);
+            if (mb) {
+                pf_inputs_flash(c.prefill2, mb, p.prompt.data() + a + ma, pos.data() + ma, kslot, multi ? q : 0);
+                pf_enqueue_flash(c.prefill_fabric2, c.main, c.prefill2, pfseq2, c.main.nl, mb);
+                pf_step2_flash(c.main, c.prefill, c.prefill2, ma, mb, a + ma, a + ma + mb, pfseq, pfseq2, c.stream);
+                pfseq2 += c.main.nl;
+            } else pf_step_flash(c.main, c.prefill, ma, a + ma, pfseq, c.stream);
+            pfseq += c.main.nl;
+            // The cache fill (the default) touches no fabric and no main layer, and leaves its own error word set, so every
+            // word check() reads stays set until the next request's reset: one check after the last chunk sees what one per
+            // chunk saw, without check()'s blocking copy per layer each MX rows. The fence per chunk stays (k_step_in reads
+            // *c.draft_input, which the next chunk rewrites).
+            const bool cache = knob::glm53f_draft_kv();
+            fence();
+            if (!cache) check();
+            auto draft = [&](FlashPrefill& fp, int n, int base) {
+                if (cache && pf_draft_full() && pf_draft_full_ok(c.draft))   // GR8_GLM53F_PF_DRAFT_FULL (flash_prefill.cuh)
+                {
+                    const bool chk = pf_draft_full() == 2;
+                    DraftFull& F = pf_draft_cache_full(c.draft, fp, n, base, p.prompt.data() + base + 1, chk, c.stream);
+                    if (!chk) { dseq += (n + MX - 1) / MX; wrote(base + n); fence(); return; }   // fence: check() reads the error words
+                    pf_draft_flash(c.draft, fp, n, base, p.prompt.data() + base + 1, dseq, [&](const StepIn& di) {
+                        *c.draft_input = di;
+                        wrote_step(di);
+                        Model& d = c.draft.d;
+                        const bind::Layer& b = d.layers[0].L[di.M];
+                        launch_step_in(d, c.stream);
+                        launch_draft_embed(c.draft, di.M, false, c.stream);
+                        bind::launch(b.kv_a, c.stream);
+                        bind::launch(b.idx_k, c.stream);
+                        bind::launch(b.idx_g, c.stream);
+                        pf_draft_full_cmp(c.draft, F, di.pos[0] - base, di.M, c.stream);
+                        fence();
+                    }, multi ? q : 0);
+                    unsigned dw = 0;
+                    G6RT_CK(cudaMemcpy(&dw, F.diff, 4, cudaMemcpyDeviceToHost));
+                    fprintf(stderr, "# GR8_GLM53F_PF_DRAFT_FULL check: rows %d at %d, differing kv_a/idx_k/idx_g words %u\n", n, base, dw);
+                    return;
+                }
+                pf_draft_flash(c.draft, fp, n, base, p.prompt.data() + base + 1, dseq, [&](const StepIn& di) {
+                    *c.draft_input = di;
+                    wrote_step(di);
+                    if (cache) pf_draft_cache_flash(c.draft, di.M, di.context, c.stream);
+                    else {
+                        std::vector<uint32_t> sizes(3, uint32_t(di.M * HID * 2));
+                        sizes[2] = uint32_t(glue::head_bytes(di.M, c.draft.d.nc));
+                        c.draft_fabric.enqueue_step(di.step, sizes);
+                        const int old = c.draft.d.cur;
+                        c.draft.d.cur = bucket_of(c.draft.d, di.context);
+                        launch_draft_step(c.draft, di.M, di.context, false, c.stream);
+                        c.draft.d.cur = old;
+                    }
+                    fence();
+                    if (!cache) check();
+                }, multi ? q : 0);
+            };
+            draft(c.prefill, ma, a);
+            if (mb) draft(c.prefill2, mb, a + ma);
+            if (cache) check();
+            uint32_t& at = capture_at[size_t(q)];
+            if (at && first + rows == at) {   // the quantum that ends at the prompt's last grid point
+                require(p.prompt.size() > at, "Flash checkpoint past the prompt");
+                pending.push_back(Pending{q, std::vector<int>(p.prompt.begin(), p.prompt.begin() + at + 1), slot.req.id});
+                at = 0;
+            }
+            if (on) c.main.s2on = c.draft.d.s2on = true;
+            fprintf(stderr, "# flash serve request %llu prefill %u rows at %u (main + draft): %.3f ms\n",
+                    (unsigned long long)slot.req.id, rows, first,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+        }
+        // GR8_PF_PROF=1: each prefill quantum's stage profile
+        void on_prefill_prof(const Slot& slot, const Payload& p, uint32_t first, uint32_t rows) {
+            on_prefill(slot, p, first, rows);
+            const std::string tag = "rank " + std::to_string(c.main.rank) + " request " + std::to_string(slot.req.id) + ",";
+            flash_pf_prof().print(tag.c_str());
+            flash_pf_prof() = FlashPfProf{};
+        }
+        void on_prefill_ext(const Slot& slot, const Payload& p, uint32_t first, uint32_t rows) { extra.prefill(slot); on_prefill(slot, p, first, rows); }
+        void on_prefill_ext_prof(const Slot& slot, const Payload& p, uint32_t first, uint32_t rows) {
+            extra.prefill(slot);
+            on_prefill_prof(slot, p, first, rows);
+        }
+        void on_resize(const Resize& r) {
             if (r.tier != FLASH_CKPT_TIER) throw std::runtime_error("Flash serve: a Resize on tier " + std::to_string(r.tier));
             std::lock_guard<std::mutex> l(ck_mu);
             std::vector<uint64_t> gone;
@@ -520,7 +534,21 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                 fprintf(stderr, "# rank %d: flash ckpt share: now %llu segments, %llu blocks (%zu entries, %zu dropped) in %.1f ms at %lld ms\n",
                         rank, (unsigned long long)r.segs, (unsigned long long)r.slots, ck->index().size(), gone.size(),
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), (long long)s2_wall_ms());
-        };
+        }
+        void on_resize_kv(const Resize& r) { extra.resize(r); }
+        void on_resize_kv_ckpt(const Resize& r) { if (!extra.resize(r)) on_resize(r); }
+        bool on_dfl_ok(int q) { return extra.dfl_ok(q); }
+        int on_dfl_start(int q) { return extra.dfl_start(q); }
+        s2::DflDrafts on_dfl(const s2::DflReq& r, const Sampling& smp) { return extra.dfl(r, smp); }
+        uint32_t on_flash_room() { return extra.flash_room(); }
+    };
+    FlashModule fm{{}, FLASH_CAPTURES(G6S2_CAPTURE_ARG)};
+#undef FLASH_CAPTURES
+    // the checkpoint store on a group lease (D-331 M8 (c)): it shares its KV node with the full model's pool. Every rank
+    // resizes it at the Resize commit; the head reports to the node every GR8_S2_SHARE_MS, offering what it holds only
+    // while idle (GR8_KV_SHARE_WHEN=idle, default) or whenever the node asks (always), as the full model's pool does
+    if (ck && ck->group()) {
+        const bool always = knob::kv_share_when() == "always";
         if (bc.rank == 0)
             h.share = [&, always](bool idle) -> std::optional<Resize> {
                 std::pair<uint64_t, std::vector<uint64_t>> a;
@@ -528,7 +556,37 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                 return ck->share_report(FLASH_CKPT_TIER, a.first, a.second);
             };
     }
-    if (c.install) c.install(h);
+    if (c.install) c.install(h, extra);
+    using M = FlashModule;
+    g6s2_module_ops& o = h.module = mod::table(fm);
+    if (ck) o.retain = mod::retain<M, &M::on_retain>;
+    if (extra.bind) o.bind = mod::bind<M, &M::on_bind_ext>;
+    else o.bind = mod::bind<M, &M::on_bind>;
+    o.retire = mod::retire<M, &M::on_retire>;
+    if (ck) o.before_work = mod::call<M, &M::on_before_work>;
+    o.fence = mod::call<M, &M::on_fence>;
+    o.bucket = mod::bucket<M, &M::on_bucket>;
+    // request grammars (grammar.h): the masks the main head reads (rank.cuh k_grammar_mask), set before every main step
+    o.gm_on = c.main.gm_on_host; o.gm_bits = c.main.gm_bits_host; o.gm_words = c.main.gm_words;
+    // penalties (penalty.h): Dispatch writes these tables before every main step and rank.cuh k_penalty reads them
+    o.pen_rows = c.main.pen_rows_host; o.pen_sess = c.main.pen_sess_host;
+    o.mode = mod::mode<M, &M::on_mode>;
+    o.launch = mod::launch<M, &M::on_launch>;
+    o.logprob = mod::logprob<M, &M::on_logprob>;
+    const bool prof = pf_prof().on;
+    if (extra.prefill && prof) o.prefill = mod::prefill<M, &M::on_prefill_ext_prof>;
+    else if (extra.prefill) o.prefill = mod::prefill<M, &M::on_prefill_ext>;
+    else if (prof) o.prefill = mod::prefill<M, &M::on_prefill_prof>;
+    else o.prefill = mod::prefill<M, &M::on_prefill>;
+    // a Resize on the engine's tier goes to it, any other to the checkpoint store's lease (when it has one)
+    const bool ckpt_lease = ck && ck->group();
+    if (extra.resize && ckpt_lease) o.resize = mod::resize<M, &M::on_resize_kv_ckpt>;
+    else if (extra.resize) o.resize = mod::resize<M, &M::on_resize_kv>;
+    else if (ckpt_lease) o.resize = mod::resize<M, &M::on_resize>;
+    if (extra.dfl_ok) o.dfl_ok = mod::dfl_ok<M, &M::on_dfl_ok>;
+    if (extra.dfl_start) o.dfl_start = mod::dfl_start<M, &M::on_dfl_start>;
+    if (extra.dfl) o.dfl = mod::dfl<M, &M::on_dfl>;
+    if (extra.flash_room) o.flash_room = mod::flash_room<M, &M::on_flash_room>;
     ControlLinks links = bootstrap(bc);
     try {
         if (multi) capture_all();
