@@ -299,24 +299,6 @@ Moves `s2_batch.h` (about 1,500 lines), `spec_len.h`, `insert_rule.h`, `ngram_lo
    exactly at `n_gen`, the verify's draft step reads the token one past the committed ones. The C++ read past its
    vector, and the port reads 0. The session is over and the row's output unused. `s2::Batch` is move-only.
 
-### R3c. DS41's KV on the shared paged pool (with Chuck)
-
-A DS41 slot reserves a whole slab (`--capacity-slots`) whatever its request's length, and its prefix snapshots and park
-duplicate what the pool already has (paged stores, the spare-RAM cache, prefix reuse and stash, checkpoints). GLM and
-Flash reserve `prompt + max_tokens` pages, so short requests leave room for long ones, under one admission rule and one
-meaning of the per-request limit. This step moves DS41 onto that pool, which removes a model-specific KV path and leaves
-R8 one KV model to describe. DS41's rows are already defined per 64-token kvman page (`engine/attn/kvfmt.h`, the DS41
-section: ca/ica rows, ratio-2 and ratio-1 layers). The work:
-
-- the DS41 attention and indexer kernels address a slot's slab directly; they take a block table as GLM's and Flash's do;
-- prefix snapshots and park become pool stash entries or checkpoints (`ds41_prefix_cache.cuh`, `Config::park`, the
-  scheduler's parked phase);
-- per-session state that is not KV stays per session (the 128-token windows, Engram, DSpark), as Flash keeps its KDA
-  slots (`FlashSlots`).
-
-It is DS41's owner's area, so it is planned with him. It fits after R3: the planner port does not depend on it, and R4
-and R5 then move one pool's callers, not two KV models'.
-
 ### R4. The driver to Rust
 
 `s2/driver.h` (289 lines) is glue between the scheduler (R2), the planner (R3) and the engine hooks: it applies commits,
@@ -450,6 +432,24 @@ can follow; `engine_build` then hashes every module file.
 `NativeDispatch` (`native.cuh:152-486`, which owns streams and graphs), the fabric and its proxy (`comms/fabric.cpp`;
 `kvman-rs/src/remote/verbs.rs` shows Rust verbs are possible later), `devimage.cpp`, `grammar.cc` (XGrammar), and the
 byte movers in `kv_tier.cuh` and `flash_checkpoint.cuh`.
+
+### R11. DS41's KV on the shared paged pool (with Chuck)
+
+A DS41 slot reserves a whole slab (`--capacity-slots`) whatever its request's length, and its prefix snapshots and park
+duplicate what the pool already has (paged stores, the spare-RAM cache, prefix reuse and stash, checkpoints). GLM and
+Flash reserve `prompt + max_tokens` pages, so short requests leave room for long ones, under one admission rule and one
+meaning of the per-request limit. This step moves DS41 onto that pool, which removes a model-specific KV path and leaves
+R8 one KV model to describe. DS41's rows are already defined per 64-token kvman page (`engine/attn/kvfmt.h`, the DS41
+section: ca/ica rows, ratio-2 and ratio-1 layers). The work:
+
+- the DS41 attention and indexer kernels address a slot's slab directly; they take a block table as GLM's and Flash's do;
+- prefix snapshots and park become pool stash entries or checkpoints (`ds41_prefix_cache.cuh`, `Config::park`, the
+  scheduler's parked phase);
+- per-session state that is not KV stays per session (the 128-token windows, Engram, DSpark), as Flash keeps its KDA
+  slots (`FlashSlots`).
+
+It is DS41's owner's area, so it waits for him. Nothing in R4 to R10 depends on it: until it lands, those steps move
+DS41's slab path beside the pool's callers.
 
 ### How much moves
 
