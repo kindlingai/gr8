@@ -680,10 +680,23 @@ pub fn grow(c: &Config, s: &mut [Slot], st: &State, k: &Key, r: &Run) -> Result<
     Ok(())
 }
 
+/// The decoding sessions' keys in ascending request id (ties in slot order) into `out`, which holds at least that many;
+/// returns how many.
+pub fn decoding_into(s: &[Slot], out: &mut [Key]) -> usize {
+    let mut n = 0;
+    for (i, x) in s.iter().enumerate().filter(|(_, x)| x.phase == DECODE) {
+        let ahead = |(j, y): &(usize, &Slot)| y.phase == DECODE && (y.req.id, *j) < (x.req.id, i);
+        out[s.iter().enumerate().filter(ahead).count()] = x.key;
+        n += 1;
+    }
+    n
+}
+
 pub fn decoding(s: &[Slot]) -> Vec<Key> {
-    let mut v: Vec<&Slot> = s.iter().filter(|x| x.phase == DECODE).collect();
-    v.sort_by_key(|x| x.req.id);
-    v.iter().map(|x| x.key).collect()
+    let mut v = vec![Key::default(); s.len()];
+    let n = decoding_into(s, &mut v);
+    v.truncate(n);
+    v
 }
 
 pub fn alternate(c: &Config, k: u32, want: &mut bool, run: &mut u32) {

@@ -338,7 +338,7 @@ public:
     void grow(const Key& k, const Run& r) {
         check(g6sch_grow(&c_, rs(), MAX_SESSIONS, &st_, sch::c<g6sch_key>(&k), sch::c<g6sch_run>(&r)));
     }
-    // the decoding sessions in ascending request id, as next() orders them
+    // the decoding sessions in ascending request id, as next() orders them (tests only; the driver's is Rust's)
     std::vector<Key> decoding() const {
         std::vector<Key> out(MAX_SESSIONS);
         out.resize(g6sch_decoding(rs(), MAX_SESSIONS, sch::m<g6sch_key>(out.data())));

@@ -194,21 +194,6 @@ impl S {
     }
 }
 
-/// the decoding sessions in ascending request id (scheduler.rs decoding, without its allocation)
-fn decoding(s: &[Slot], out: &mut [Key; QMAX]) -> usize {
-    let mut n = 0;
-    for x in s.iter().filter(|x| x.phase == DECODE) {
-        let mut i = n;
-        while i > 0 && s[out[i - 1].slot as usize].req.id > x.req.id {
-            out[i] = out[i - 1];
-            i -= 1;
-        }
-        out[i] = x.key;
-        n += 1;
-    }
-    n
-}
-
 /// a fixed buffer for one log line, written to stderr in one call
 struct Line {
     b: [u8; 256],
@@ -389,7 +374,7 @@ impl Driver {
         let (mut nc, mut capped, mut fresh) = (0, false, false);
         if cc.cp_step_rows != 0 {
             let mut keys = [Key::default(); QMAX];
-            let nd = decoding(s.slots(), &mut keys);
+            let nd = sch::decoding_into(s.slots(), &mut keys);
             for k in &keys[..nd] {
                 if !stalled[k.slot as usize] {
                     let ctx = (self.length(k.slot)? as u64).wrapping_add(u64::from(cc.mtp));
@@ -455,7 +440,7 @@ impl Driver {
     fn grow(&self, s: &S, stalled: &mut [bool; QMAX]) -> Res<()> {
         if self.h.has_grow {
             let mut keys = [Key::default(); QMAX];
-            let nd = decoding(s.slots(), &mut keys);
+            let nd = sch::decoding_into(s.slots(), &mut keys);
             for k in &keys[..nd] {
                 let x = s.slot(k.slot as usize);
                 let rows = sch::round_rows(s.c(), self.length(k.slot)? as u64);
@@ -740,11 +725,10 @@ mod tests {
     }
 
     #[test]
-    fn decoding_matches_the_scheduler() {
-        let s = [slot(0, 9, DECODE), slot(1, 3, PREFILL), slot(2, 5, DECODE), slot(3, 1, DECODE), slot(4, 7, FREE)];
-        let mut k = [Key::default(); QMAX];
-        let n = decoding(&s, &mut k);
-        assert_eq!(&k[..n], &sch::decoding(&s)[..]);
+    fn decoding_in_request_order() {
+        let s = [slot(0, 9, DECODE), slot(1, 3, PREFILL), slot(2, 5, DECODE), slot(3, 1, DECODE), slot(4, 5, DECODE)];
+        let slots: Vec<u32> = sch::decoding(&s).iter().map(|k| k.slot).collect();
+        assert_eq!(slots, [3, 2, 4, 0]); // request 5 twice: slot order
     }
 
     #[test]
