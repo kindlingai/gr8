@@ -1,6 +1,6 @@
 # gr8: a CUDA inference engine for DGX Spark
 
-Need help? Join us on Discord: https://discord.gg/VmsM9GWqZ
+Need help? Join us on Discord: https://discord.gg/8EAvYPV2rE
 
 gr8 serves GLM-5.3, GLM-5.3-Flash and DeepSeek-V4.1-Flash on one to six DGX Spark (GB10) boxes (the count depends on
 the model, see below). The model is split across all the boxes (tensor parallel, TP). gr8 is written from scratch in
