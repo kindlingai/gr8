@@ -40,12 +40,12 @@ class OptionTests(unittest.TestCase):
     def test_refusals(self):
         for argv, want in ((['--tp', '6'], 'want 4, 3, 2 or 1 (glm53f)'),
                            (['--tp', '3', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3', '--drafter', 'https://huggingface.co/a/b'],
-                            'runs at TP=4 and TP=1 (split) and TP=6')):
+                            'runs at TP=4, TP=2 and TP=1 (split) and TP=6')):
             with self.assertRaises(opt.OptionError) as e:
                 flash(*argv)
             self.assertIn(want, str(e.exception))
         for argv, want in ((['--reuse', '1'], 'GLM-5.3-Flash has no REUSE'), (['--sess', '9'], 'serves 1 to 8 sessions'),
-                           (['--tp', '2', '--peers', '10.0.0.1,10.0.0.2', '--dflash', '1'], 'drafter at TP=4'),
+                           (['--tp', '3', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3', '--dflash', '1'], 'drafter at TP=4'),
                            (['--sess', '0'], 'serves 1 to 8 sessions'),
                            (['--sess', '8', '--mtp', '4'], 'a round of 40 rows')):
             with self.assertRaises(opt.OptionError) as e:
@@ -66,7 +66,7 @@ class OptionTests(unittest.TestCase):
             self.assertIn('GR8_PF_ROUTER_SPLIT=' + ('0' if tp == '4' else '1'), plan['env'])
             for a in ('--reuse-prefix', '--wide', '--pfv2', '--qo-manifest'):
                 self.assertNotIn(a, plan['args'])
-            (self.assertIn if tp == '4' else self.assertNotIn)('--dflash-manifest', plan['args'])
+            (self.assertNotIn if tp == '3' else self.assertIn)('--dflash-manifest', plan['args'])
             self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], sess)
             self.assertEqual(plan['args'][plan['args'].index('--chunk') + 1], '1')
             self.assertIn('GR8_GLM53F_PF_DSA_F16GEMM=1', plan['env'])
@@ -150,10 +150,11 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(plan['args'][plan['args'].index('--cap') + 1], '131072')
 
     def test_dflash(self):
-        # DFLASH=1 (TP=4, the default; the supervisor turns it off with no drafter): the drafter packs and the adaptive
-        # draft count; off at TP=2
+        # DFLASH=1 at TP=4 and TP=2 gives the drafter packs and the adaptive draft count, and DFLASH=0 at TP=3. The
+        # supervisor turns DFLASH off when there is no drafter.
         self.assertEqual(opt.engine_plan(flash())['knobs']['DFLASH'], '1')
-        self.assertEqual(opt.engine_plan(flash(peers='10.0.0.1,10.0.0.2'))['knobs']['DFLASH'], '0')
+        self.assertEqual(opt.engine_plan(flash(peers='10.0.0.1,10.0.0.2'))['knobs']['DFLASH'], '1')
+        self.assertEqual(opt.engine_plan(flash(peers='10.0.0.1,10.0.0.2,10.0.0.3'))['knobs']['DFLASH'], '0')
         plan = opt.engine_plan(flash('--dflash', '1', '--dflash-dir', '/d'))
         a = ' '.join(plan['args'])
         self.assertIn('--dflash-manifest @DFLASH_DIR/dflash.r@R.manifest.json --dflash-pack @DFLASH_DIR/dflash.r@R.pack', a)

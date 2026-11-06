@@ -43,7 +43,7 @@ above: it is read in place from a local copy you fetch yourself, and `./gr8 mode
 required. On bare metal a Hugging Face `MODEL` needs `MODEL_CACHE`, a local directory for this box's part; the container
 sets its own. `MODEL` may also be a local copy of the release, used in place.
 
-`DRAFTER` is optional: without it, TP=4 drafts with MTP only. TP=3, 5 and 6 leave it out, since its 8 KV heads do not
+`DRAFTER` is optional: without it, TP=4 (and Flash's TP=2 and TP=1) drafts with MTP only. TP=3, 5 and 6 leave it out, since its 8 KV heads do not
 split three, five or six ways (TP=6 runs its whole body on every box with `DFLASH=1`). Its licence (CC BY-NC-ND 4.0)
 forbids sharing a converted copy, so each box downloads the drafter and converts its own rank.
 
