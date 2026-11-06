@@ -4,7 +4,7 @@
 #   docker buildx build --platform linux/arm64 --target dist -o type=local,dest=out .
 #                                                                              only the binaries, into out/bin
 #
-# Stages: toolchain (CUDA devel + rdma-core) -> rust -> loader (the Rust loader) and kvman (the Rust S2 page allocator)
+# Stages: toolchain (CUDA devel + rdma-core) -> rust -> loader (the Rust loader) and kvman (the host Rust: page allocator, scheduler, planner)
 # -> engine, engine-int4, engine-flash, engine-flash-int4 and engine-ds41, with front (the Rust front end) beside them -> dist (the binaries only)
 # -> runtime (CUDA runtime + binaries, scripts, shims).
 ARG CUDA_VERSION=13.0.1
