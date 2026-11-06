@@ -25,8 +25,6 @@ namespace g6s2 {
 struct PoolHit { int skip = 0, lcp = 0; const char* why = "none"; uint64_t age = 0; bool stored = false; uint32_t tier = 0; int slot = -1; };
 // status.s2: one live run's pages now and at worst
 struct PoolUse { uint32_t table_version = 0, held = 0, worst = 0; };
-static_assert(sizeof(PoolUse) == sizeof(g6svc_run_use) && offsetof(PoolUse, held) == offsetof(g6svc_run_use, held) &&
-              offsetof(PoolUse, worst) == offsetof(g6svc_run_use, worst), "PoolUse layout");
 class RunPool {
     g6kv_pool* p_ = nullptr;
     static void check(int rc) { require(rc == 0, g6kv_error(rc)); }

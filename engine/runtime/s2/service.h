@@ -234,10 +234,10 @@ class Service {
         }
         std::vector<g6kv_tier_totals> tiers;
         if ((st.has_tiers = bool(native_.pool.tiers))) { tiers = native_.pool.tiers(); st.tiers = tiers.data(); st.n_tiers = tiers.size(); }
-        std::vector<PoolUse> runs;
+        std::vector<g6svc_run_use> runs;
         if ((st.has_runs = bool(native_.pool.runs))) {
-            runs = native_.pool.runs();
-            st.runs = reinterpret_cast<const g6svc_run_use*>(runs.data()); st.n_runs = runs.size();
+            for (const PoolUse& u : native_.pool.runs()) runs.push_back({u.table_version, u.held, u.worst});
+            st.runs = runs.data(); st.n_runs = runs.size();
         }
         ctl::check(g6svc_status_publish(&st, ctl::bytes(c_.directory), path_n(c_.directory)));
     }

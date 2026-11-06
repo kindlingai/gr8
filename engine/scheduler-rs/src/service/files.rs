@@ -124,7 +124,7 @@ impl Ingress {
         Ok(Ingress { dir: dir.to_vec(), epoch, next: AtomicU64::new(0) })
     }
 
-    /// The next command, consumed, or none yet.
+    /// The next command, consumed, or none yet. Control thread only: the load and store are not one increment.
     pub fn next(&self) -> R<Option<Command>> {
         let c = self.peek()?;
         if c.is_some() {
