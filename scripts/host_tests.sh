@@ -82,8 +82,10 @@ for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_M
 done
 # engine/scheduler-rs against transcripts recorded from the C++ it replaced, in each model's shape (the module's slots
 # and caps decide which configs the scheduler takes)
+# under the sanitizers in the default shape only: the 32-slot DS41 shape took 13 minutes there on CI's runner
 for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
-  g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rs_vectors_test.cpp" -o "$T/scheduler_rs_vectors_test" "${KVLIB[@]}"
+  if [ -z "$f" ]; then opt="-O1 -g -fsanitize=address,undefined"; else opt="-O2"; fi
+  g++ -std=c++17 $opt -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/scheduler_rs_vectors_test.cpp" -o "$T/scheduler_rs_vectors_test" "${KVLIB[@]}"
   "$T/scheduler_rs_vectors_test"
 done
 # the planner's round log and its replay (GR8_S2_REPLAY_LOG, s2/round_replay.h); GR8_S2_FRESH_SPEC
