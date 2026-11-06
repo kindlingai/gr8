@@ -127,7 +127,7 @@ struct g6sch_completion { g6sch_key key; uint32_t emitted; bool finished; uint32
 // the Rust side's constants, which the C++ wrapper checks once (scheduler.h check_abi) with the layout digest below
 enum {
     G6SCH_ABI_PAGE, G6SCH_ABI_PREFILL_DEFER_MAX, G6SCH_ABI_NOTICE_MIN, G6SCH_ABI_NOTICE_MAX, G6SCH_ABI_NOTICE_ROWS,
-    G6SCH_ABI_MAX_DECODE_ROUNDS, G6SCH_ABI_PACK_MAX_MEMBERS, G6SCH_ABI_QMAX, G6SCH_ABI_PARSE_FN,
+    G6SCH_ABI_MAX_DECODE_ROUNDS, G6SCH_ABI_PACK_MAX_MEMBERS, G6SCH_ABI_QMAX, G6SCH_ABI_PARSE_FN, G6SCH_ABI_CONTROL_VERSION,
 };
 uint64_t g6sch_abi(uint32_t what);
 
@@ -486,6 +486,119 @@ uint32_t g6s2_driver_emitted(const g6s2_driver* d, uint32_t q);
 bool g6s2_driver_initialized(const g6s2_driver* d, uint32_t q);
 uint64_t g6s2_driver_cp_rounds(const g6s2_driver* d);
 
+// s2/bootstrap.h, control_io.h, control_protocol.h, control_channel.h, event_gate.h: the control links between the
+// ranks. Rust owns each link's socket (g6ctl_io, the C++ ControlIO's), the event gate, the head's and workers' event
+// channels (g6ctl_endpoint) and the bootstrap's exchanges. The C++ classes are facades. No call starts a thread. Fallible
+// calls return 0, 1 when a callback returned nonzero (the facade holds its exception), or 2 when refused, with the
+// message in g6ctl_error(), kept per thread. Bytes come back through a g6ctl_grow_fn. It appends n bytes to the caller's
+// buffer and returns them.
+struct g6ctl_notice { uint64_t epoch, event, boundary, request, payload_hash; uint32_t kind; };
+struct g6ctl_ack { g6ctl_notice notice; uint32_t rank; uint64_t state_hash; uint32_t room; };
+struct g6ctl_commit { g6sch_commit c; bool hold; bool has_resize; g6sch_resize resize; };
+// any frame: tag picks the fields (notice: NOTICE and COMMIT; ack: ACK; commit: COMMIT; epoch, request and bytes:
+// REQUEST; epoch: QUIT; epoch, rank and seq: SYNC; epoch and seq: GO). A decoded REQUEST's bytes point into the input
+struct g6ctl_frame {
+    uint32_t tag; g6ctl_notice notice; g6ctl_ack ack; g6ctl_commit commit;
+    uint64_t epoch, request, seq; uint32_t rank; const uint8_t* bytes; size_t n;
+};
+// BootstrapConfig's fields the bootstrap reads (strings up to their first NUL, as c_str()) and its agreement()
+struct g6ctl_boot {
+    uint32_t rank, ranks, timeout; uint16_t port;
+    const uint8_t* head_ip; size_t head_ip_n; const uint8_t* directory; size_t directory_n;
+    const uint8_t* agreement; size_t agreement_n;
+};
+typedef uint8_t* (*g6ctl_grow_fn)(void* ctx, size_t n);
+typedef int32_t (*g6ctl_digest_fn)(void* ctx, uint64_t* digest, uint32_t* room);
+typedef int32_t (*g6ctl_commit_fn)(void* ctx, uint64_t hash, g6ctl_commit* out);
+typedef int32_t (*g6ctl_quit_fn)(void* ctx);
+const char* g6ctl_error(void);
+// the socket constants and layouts the Rust declares, which the C++ compares with its headers (control_io.h check_sys)
+enum {
+    G6CTL_SYS_AF_INET, G6CTL_SYS_SOCK_STREAM, G6CTL_SYS_SOL_SOCKET, G6CTL_SYS_SO_REUSEADDR, G6CTL_SYS_SO_ERROR,
+    G6CTL_SYS_SO_RCVTIMEO, G6CTL_SYS_SO_SNDTIMEO, G6CTL_SYS_SO_KEEPALIVE, G6CTL_SYS_IPPROTO_TCP, G6CTL_SYS_TCP_NODELAY,
+    G6CTL_SYS_TCP_KEEPIDLE, G6CTL_SYS_TCP_KEEPINTVL, G6CTL_SYS_TCP_KEEPCNT, G6CTL_SYS_TCP_USER_TIMEOUT,
+    G6CTL_SYS_SEND_FLAGS, G6CTL_SYS_SOCK_CLOEXEC, G6CTL_SYS_SOCK_NONBLOCK, G6CTL_SYS_SO_NOSIGPIPE, G6CTL_SYS_O_NONBLOCK,
+    G6CTL_SYS_F_GETFL, G6CTL_SYS_F_SETFL, G6CTL_SYS_F_SETFD, G6CTL_SYS_FD_CLOEXEC, G6CTL_SYS_EINTR, G6CTL_SYS_EAGAIN,
+    G6CTL_SYS_EWOULDBLOCK, G6CTL_SYS_EINPROGRESS, G6CTL_SYS_ECONNREFUSED, G6CTL_SYS_POLLIN, G6CTL_SYS_POLLOUT,
+    G6CTL_SYS_POLLNVAL, G6CTL_SYS_SHUT_RDWR, G6CTL_SYS_SOCKADDR_IN, G6CTL_SYS_SIN_FAMILY, G6CTL_SYS_SIN_PORT,
+    G6CTL_SYS_SIN_ADDR, G6CTL_SYS_TIMEVAL, G6CTL_SYS_TV_USEC, G6CTL_SYS_POLLFD,
+    G6CTL_SYS_POLLFD_EVENTS, G6CTL_SYS_POLLFD_REVENTS, G6CTL_SYS_SOCKLEN_T, G6CTL_SYS_NFDS_T, G6CTL_SYS_N
+};
+int64_t g6ctl_sys(uint32_t what);
+// frames: encode appends the frame, decode reads b as a frame of `tag`
+int32_t g6ctl_encode(const g6ctl_frame* f, g6ctl_grow_fn grow, void* ctx);
+int32_t g6ctl_decode(const uint8_t* b, size_t n, uint32_t tag, g6ctl_frame* out);
+int32_t g6ctl_match(const g6ctl_notice* n, const g6ctl_commit* c);
+// the Encoder's and Decoder's pieces: put appends, get reads at *i and moves it on (header: the magic and the tag)
+void g6ctl_put_header(uint32_t tag, g6ctl_grow_fn grow, void* ctx);
+void g6ctl_put_u64(uint64_t x, g6ctl_grow_fn grow, void* ctx);
+void g6ctl_put_notice(const g6ctl_notice* n, g6ctl_grow_fn grow, void* ctx);
+void g6ctl_put_key(const g6sch_key* k, g6ctl_grow_fn grow, void* ctx);
+void g6ctl_put_steering(const g6sch_identity* s, g6ctl_grow_fn grow, void* ctx);
+int32_t g6ctl_get_header(const uint8_t* b, size_t n, size_t* i, uint32_t* tag);
+int32_t g6ctl_get_u64(const uint8_t* b, size_t n, size_t* i, uint64_t* out);
+int32_t g6ctl_get_u32(const uint8_t* b, size_t n, size_t* i, uint32_t* out);
+int32_t g6ctl_get_notice(const uint8_t* b, size_t n, size_t* i, g6ctl_notice* out);
+int32_t g6ctl_get_key(const uint8_t* b, size_t n, size_t* i, g6sch_key* out);
+int32_t g6ctl_get_steering(const uint8_t* b, size_t n, size_t* i, g6sch_identity* out);
+int32_t g6ctl_get_end(const uint8_t* b, size_t n, size_t i);
+// one link: owns fd (null when negative) and closes it at free
+struct g6ctl_io;
+g6ctl_io* g6ctl_io_new(int32_t fd);
+void g6ctl_io_free(g6ctl_io* io);
+void g6ctl_io_shutdown(const g6ctl_io* io);
+int32_t g6ctl_io_timeout(const g6ctl_io* io, uint32_t seconds);
+int32_t g6ctl_io_keepalive(const g6ctl_io* io, int32_t idle_s, int32_t intvl_s, int32_t cnt);
+int32_t g6ctl_io_nodelay(const g6ctl_io* io);
+int32_t g6ctl_io_send(const g6ctl_io* io, const uint8_t* b, size_t n);
+int32_t g6ctl_io_receive(const g6ctl_io* io, bool idle, g6ctl_grow_fn grow, void* ctx);
+void g6ctl_io_counts(const g6ctl_io* io, uint64_t* sent, uint64_t* received);
+// the bootstrap: out has room for ranks - 1 links (the head's, in rank order) or 1 (a worker's)
+int32_t g6ctl_boot_check(const uint8_t* ip, size_t ip_n, uint16_t port, uint32_t timeout);
+int32_t g6ctl_bootstrap(const g6ctl_boot* c, g6ctl_io** out, size_t* n);
+int32_t g6ctl_agree_lines(uint32_t rank, const g6ctl_io* const* links, size_t n, const uint8_t* mine, size_t mine_n,
+                          bool idle, g6ctl_grow_fn grow, void* ctx);
+int32_t g6ctl_capture_barrier(const g6ctl_boot* c, const g6ctl_io* const* links, size_t n);
+void g6ctl_agreement_difference(uint32_t rank, const uint8_t* h, size_t hn, const uint8_t* w, size_t wn,
+                                g6ctl_grow_fn grow, void* ctx);
+// the event gate and the head's ACK set (null when refused)
+struct g6ctl_gate;
+g6ctl_gate* g6ctl_gate_new(uint64_t epoch, uint32_t rank);
+void g6ctl_gate_free(g6ctl_gate* g);
+int32_t g6ctl_gate_before_work(const g6ctl_gate* g, uint64_t b, bool* due);
+int32_t g6ctl_gate_announce(const g6ctl_gate* g, const g6ctl_notice* n);
+int32_t g6ctl_gate_arrive(const g6ctl_gate* g, uint64_t b, uint64_t hash, uint32_t room, g6ctl_ack* out);
+int32_t g6ctl_gate_commit(const g6ctl_gate* g, const g6ctl_notice* n);
+int32_t g6ctl_gate_wait_commit(const g6ctl_gate* g);
+int32_t g6ctl_gate_applied(const g6ctl_gate* g, const g6ctl_notice* n, bool hold);
+void g6ctl_gate_fail(const g6ctl_gate* g);
+struct g6ctl_agreement;
+g6ctl_agreement* g6ctl_agreement_new(uint32_t nr, const g6ctl_notice* n);
+void g6ctl_agreement_free(g6ctl_agreement* a);
+int32_t g6ctl_agreement_ack(g6ctl_agreement* a, const g6ctl_ack* k);
+bool g6ctl_agreement_ready(const g6ctl_agreement* a);
+int32_t g6ctl_agreement_hash(const g6ctl_agreement* a, uint64_t* out);
+int32_t g6ctl_agreement_room(const g6ctl_agreement* a, uint32_t* out);
+// one rank's event channel over links that outlive it (null when refused). The head's calls (event, agreed_room,
+// quit) and the worker's (receive_events, request, admitted) refuse on the other's channel
+struct g6ctl_endpoint;
+g6ctl_endpoint* g6ctl_head_new(uint64_t epoch, const g6ctl_io* const* peers, size_t n);
+g6ctl_endpoint* g6ctl_worker_new(uint64_t epoch, uint32_t rank, const g6ctl_io* io);
+void g6ctl_endpoint_free(g6ctl_endpoint* e);
+void g6ctl_fail(const g6ctl_endpoint* e);
+int32_t g6ctl_boundary(const g6ctl_endpoint* e, uint64_t b, g6ctl_digest_fn digest, void* ctx, bool* due, g6ctl_commit* out);
+int32_t g6ctl_wait_notice(const g6ctl_endpoint* e, g6ctl_notice* out);
+void g6ctl_stamps(const g6ctl_endpoint* e, int64_t* installed, int64_t* arrived);
+int32_t g6ctl_applied(const g6ctl_endpoint* e);
+int32_t g6ctl_sync(const g6ctl_endpoint* e, uint64_t seq);
+int32_t g6ctl_event(const g6ctl_endpoint* e, const g6ctl_notice* n, g6ctl_commit_fn make_commit, void* ctx, bool has_payload,
+                    const uint8_t* payload, size_t payload_n);
+uint32_t g6ctl_agreed_room(const g6ctl_endpoint* e);
+void g6ctl_quit(const g6ctl_endpoint* e);
+int32_t g6ctl_receive_events(const g6ctl_endpoint* e, g6ctl_quit_fn on_quit, void* ctx);
+int32_t g6ctl_request(const g6ctl_endpoint* e, uint64_t id, g6ctl_grow_fn grow, void* ctx);
+void g6ctl_admitted(const g6ctl_endpoint* e, uint64_t id);
+
 // The layout digest of every type above (and g6kvman.h's g6kv_tier_totals), computed the way src/layout.rs computes
 // it over the Rust types: per type its size and alignment, per field its offset, size and kind. The C++ compares it
 // with g6sch_layout() once at startup (scheduler.h check_abi).
@@ -565,6 +678,11 @@ constexpr uint64_t g6sch_layout_cpp() {
     G6SCH_TYPE(g6s2_drv_pool) G6SCH_FIELD(g6s2_drv_pool, grow) G6SCH_FIELD(g6s2_drv_pool, shrink) G6SCH_FIELD(g6s2_drv_pool, release) G6SCH_FIELD(g6s2_drv_pool, head)
     G6SCH_TYPE(g6s2_drv_hooks) G6SCH_FIELD(g6s2_drv_hooks, ctx) G6SCH_FIELD(g6s2_drv_hooks, bind) G6SCH_FIELD(g6s2_drv_hooks, retire) G6SCH_FIELD(g6s2_drv_hooks, prefill) G6SCH_FIELD(g6s2_drv_hooks, prefill_pack) G6SCH_FIELD(g6s2_drv_hooks, dfl_ok) G6SCH_FIELD(g6s2_drv_hooks, terminal) G6SCH_FIELD(g6s2_drv_hooks, grow) G6SCH_FIELD(g6s2_drv_hooks, finished) G6SCH_FIELD(g6s2_drv_hooks, resize) G6SCH_FIELD(g6s2_drv_hooks, shrink) G6SCH_FIELD(g6s2_drv_hooks, settle) G6SCH_FIELD(g6s2_drv_hooks, payload) G6SCH_FIELD(g6s2_drv_hooks, grown) G6SCH_FIELD(g6s2_drv_hooks, has_prefill_pack) G6SCH_FIELD(g6s2_drv_hooks, has_dfl_ok) G6SCH_FIELD(g6s2_drv_hooks, has_terminal) G6SCH_FIELD(g6s2_drv_hooks, has_grow) G6SCH_FIELD(g6s2_drv_hooks, has_finished) G6SCH_FIELD(g6s2_drv_hooks, has_resize) G6SCH_FIELD(g6s2_drv_hooks, has_shrink) G6SCH_FIELD(g6s2_drv_hooks, has_settle) G6SCH_FIELD(g6s2_drv_hooks, has_grown)
     G6SCH_TYPE(g6s2_drv_planner) G6SCH_FIELD(g6s2_drv_planner, ctx) G6SCH_FIELD(g6s2_drv_planner, admit) G6SCH_FIELD(g6s2_drv_planner, admit_pack) G6SCH_FIELD(g6s2_drv_planner, round) G6SCH_FIELD(g6s2_drv_planner, demote) G6SCH_FIELD(g6s2_drv_planner, promote) G6SCH_FIELD(g6s2_drv_planner, release) G6SCH_FIELD(g6s2_drv_planner, length) G6SCH_FIELD(g6s2_drv_planner, finished) G6SCH_FIELD(g6s2_drv_planner, active) G6SCH_FIELD(g6s2_drv_planner, inserted)
+    G6SCH_TYPE(g6ctl_notice) G6SCH_FIELD(g6ctl_notice, epoch) G6SCH_FIELD(g6ctl_notice, event) G6SCH_FIELD(g6ctl_notice, boundary) G6SCH_FIELD(g6ctl_notice, request) G6SCH_FIELD(g6ctl_notice, payload_hash) G6SCH_FIELD(g6ctl_notice, kind)
+    G6SCH_TYPE(g6ctl_ack) G6SCH_FIELD(g6ctl_ack, notice) G6SCH_FIELD(g6ctl_ack, rank) G6SCH_FIELD(g6ctl_ack, state_hash) G6SCH_FIELD(g6ctl_ack, room)
+    G6SCH_TYPE(g6ctl_commit) G6SCH_FIELD(g6ctl_commit, c) G6SCH_FIELD(g6ctl_commit, hold) G6SCH_FIELD(g6ctl_commit, has_resize) G6SCH_FIELD(g6ctl_commit, resize)
+    G6SCH_TYPE(g6ctl_frame) G6SCH_FIELD(g6ctl_frame, tag) G6SCH_FIELD(g6ctl_frame, notice) G6SCH_FIELD(g6ctl_frame, ack) G6SCH_FIELD(g6ctl_frame, commit) G6SCH_FIELD(g6ctl_frame, epoch) G6SCH_FIELD(g6ctl_frame, request) G6SCH_FIELD(g6ctl_frame, seq) G6SCH_FIELD(g6ctl_frame, rank) G6SCH_FIELD(g6ctl_frame, bytes) G6SCH_FIELD(g6ctl_frame, n)
+    G6SCH_TYPE(g6ctl_boot) G6SCH_FIELD(g6ctl_boot, rank) G6SCH_FIELD(g6ctl_boot, ranks) G6SCH_FIELD(g6ctl_boot, timeout) G6SCH_FIELD(g6ctl_boot, port) G6SCH_FIELD(g6ctl_boot, head_ip) G6SCH_FIELD(g6ctl_boot, head_ip_n) G6SCH_FIELD(g6ctl_boot, directory) G6SCH_FIELD(g6ctl_boot, directory_n) G6SCH_FIELD(g6ctl_boot, agreement) G6SCH_FIELD(g6ctl_boot, agreement_n)
     return h;
 }
 #undef G6SCH_TYPE

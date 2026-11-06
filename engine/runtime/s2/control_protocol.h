@@ -1,4 +1,5 @@
 // Versioned big-endian event metadata, and the head's request payloads; control frames never contain model tensors.
+// The codec is Rust (engine/scheduler-rs src/control/wire.rs); these are facades with the same API.
 #pragma once
 #include "event_gate.h"
 #include <string>
@@ -6,91 +7,60 @@ namespace g6s2 {
 enum class Tag : uint64_t { Notice=1, Ack=2, Commit=3, Request=4, Quit=5, Sync=6, Go=7 };
 struct Encoder {
     std::vector<uint8_t> b;
-    void u64(uint64_t x){for(int i=7;i>=0;--i)b.push_back(uint8_t(x>>(i*8)));}
-    explicit Encoder(Tag t){u64(0x473653324530ull+CONTROL_VERSION);u64(uint64_t(t));} // numeric base G6S2E0 + CONTROL_VERSION (10 ends in 0x3A)
-    void notice(const Notice& n){u64(n.epoch);u64(n.event);u64(n.boundary);u64(n.request);u64(n.payload_hash);u64(uint64_t(n.kind));}
-    void key(Key k){u64(k.epoch);u64(k.slot);u64(k.generation);}
-    void steering(const g6rt::steering::Identity& s){
-        u64(uint64_t(s.enabled)|(s.images?2u:0u));
-        if(s.images)for(unsigned i=0;i<32;i+=8){uint64_t x=0;for(unsigned k=0;k<8;++k)x=x*256+s.image_digest[i+k];u64(x);}
-        if(!s.enabled)return;
-        for(unsigned i=0;i<32;i+=8){uint64_t x=0;for(unsigned k=0;k<8;++k)x=x*256+s.profile_digest[i+k];u64(x);}
-        u64(uint64_t(s.scope));
-        for(unsigned i=0;i<32;i+=8){uint64_t x=0;for(unsigned k=0;k<8;++k)x=x*256+s.schedule_digest[i+k];u64(x);}
-        u64(s.scale_bits);u64(s.slot);
-    }
+    explicit Encoder(Tag t) { g6ctl_put_header(uint32_t(t), ctl::grow_vector, &b); }   // numeric base G6S2E0 + CONTROL_VERSION
+    void u64(uint64_t x) { g6ctl_put_u64(x, ctl::grow_vector, &b); }
+    void notice(const Notice& n) { g6ctl_put_notice(sch::c<g6ctl_notice>(&n), ctl::grow_vector, &b); }
+    void key(Key k) { g6ctl_put_key(sch::c<g6sch_key>(&k), ctl::grow_vector, &b); }
+    void steering(const g6rt::steering::Identity& s) { g6ctl_put_steering(sch::c<g6sch_identity>(&s), ctl::grow_vector, &b); }
 };
 struct Decoder {
-    const std::vector<uint8_t>& b;size_t i=0;Tag tag;
-    uint64_t u64(){require(b.size()-i>=8,"truncated control metadata");uint64_t x=0;for(unsigned n=0;n<8;++n)x=x*256+b[i++];return x;}
-    uint32_t u32(){auto x=u64();require(x<=UINT32_MAX,"control integer overflow");return uint32_t(x);}
-    explicit Decoder(const std::vector<uint8_t>& bytes):b(bytes){require(u64()==0x473653324530ull+CONTROL_VERSION,"control version mismatch");auto t=u64();require(t>=1&&t<=7,"unknown control tag");tag=Tag(t);}
-    Notice notice(){Notice n;n.epoch=u64();n.event=u64();n.boundary=u64();n.request=u64();n.payload_hash=u64();auto k=u64();require(k>=1&&k<=3,"unknown event kind");n.kind=EventKind(k);return n;}
-    Key key(){Key k;k.epoch=u64();k.slot=u32();k.generation=u32();return k;}
-    g6rt::steering::Identity steering(){
-        g6rt::steering::Identity s;auto on=u64();require(on<=3,"invalid steering enabled bits");s.enabled=on&1;s.images=on&2;
-        if(s.images)for(unsigned i=0;i<32;i+=8){auto x=u64();for(int k=7;k>=0;--k){s.image_digest[i+k]=uint8_t(x);x>>=8;}}
-        if(!s.enabled)return s;
-        for(unsigned i=0;i<32;i+=8){auto x=u64();for(int k=7;k>=0;--k){s.profile_digest[i+k]=uint8_t(x);x>>=8;}}
-        auto scope=u64();require(scope==uint64_t(g6rt::steering::Scope::Shared)||scope==uint64_t(g6rt::steering::Scope::Full),"invalid steering scope");s.scope=g6rt::steering::Scope(scope);
-        for(unsigned i=0;i<32;i+=8){auto x=u64();for(int k=7;k>=0;--k){s.schedule_digest[i+k]=uint8_t(x);x>>=8;}}
-        s.scale_bits=u32();const float scale=g6rt::steering::bits_float(s.scale_bits);
-        require(s.scale_bits&&std::isfinite(scale)&&scale>0&&scale<=g6rt::steering::SCALE_MAX,"invalid steering scale bits");
-        s.slot=u32();require(s.slot<g6rt::steering::PROFILES_MAX,"invalid steering profile slot");return s;
+    const std::vector<uint8_t>& b; size_t i = 0; Tag tag;
+    explicit Decoder(const std::vector<uint8_t>& bytes) : b(bytes) {
+        uint32_t t = 0; ctl::check(g6ctl_get_header(b.data(), b.size(), &i, &t)); tag = Tag(t);
     }
-    void end(){require(i==b.size(),"trailing control metadata");}
+    uint64_t u64() { uint64_t x = 0; ctl::check(g6ctl_get_u64(b.data(), b.size(), &i, &x)); return x; }
+    uint32_t u32() { uint32_t x = 0; ctl::check(g6ctl_get_u32(b.data(), b.size(), &i, &x)); return x; }
+    Notice notice() { Notice n; ctl::check(g6ctl_get_notice(b.data(), b.size(), &i, sch::m<g6ctl_notice>(&n))); return n; }
+    Key key() { Key k; ctl::check(g6ctl_get_key(b.data(), b.size(), &i, sch::m<g6sch_key>(&k))); return k; }
+    g6rt::steering::Identity steering() {
+        g6rt::steering::Identity s; ctl::check(g6ctl_get_steering(b.data(), b.size(), &i, sch::m<g6sch_identity>(&s))); return s;
+    }
+    void end() { ctl::check(g6ctl_get_end(b.data(), b.size(), i)); }
 };
-inline std::vector<uint8_t> encode(const Notice& n){Encoder e(Tag::Notice);e.notice(n);return e.b;}
-inline std::vector<uint8_t> encode(const Ack& a){Encoder e(Tag::Ack);e.notice(a.notice);e.u64(a.rank);e.u64(a.state_hash);e.u64(a.room);return e.b;}
+namespace ctl {
+inline std::vector<uint8_t> encode(const g6ctl_frame& f) { std::vector<uint8_t> b; check(g6ctl_encode(&f, grow_vector, &b)); return b; }
+inline g6ctl_frame decode(const std::vector<uint8_t>& b, Tag t) { g6ctl_frame f{}; check(g6ctl_decode(b.data(), b.size(), uint32_t(t), &f)); return f; }
+inline g6ctl_frame frame(Tag t) { g6ctl_frame f{}; f.tag = uint32_t(t); return f; }
+inline Notice notice(const g6ctl_notice& n) { Notice x; std::memcpy(static_cast<void*>(&x), &n, sizeof x); return x; }
+} // namespace ctl
+inline std::vector<uint8_t> encode(const Notice& n){auto f=ctl::frame(Tag::Notice);std::memcpy(&f.notice,&n,sizeof n);return ctl::encode(f);}
+inline std::vector<uint8_t> encode(const Ack& a){auto f=ctl::frame(Tag::Ack);std::memcpy(&f.ack,&a,sizeof a);return ctl::encode(f);}
 struct EventCommit { Notice notice; Commit commit; };
-inline void match(const EventCommit& e){
-    require(e.notice.epoch==e.commit.epoch && e.notice.event==e.commit.event && e.notice.boundary==e.commit.boundary,"commit/notice mismatch");
-    if(e.commit.admit) require(e.notice.kind==EventKind::Admit && e.commit.admit->req.id==e.notice.request,"grant does not match announced request");
-    require(!e.commit.hold || e.commit.admit,"a held boundary needs a grant");
-    require((e.notice.kind==EventKind::Resize)==e.commit.resize.has_value(),"a resize commit needs a RESIZE notice and back");
-    if(e.commit.resize) require(!e.commit.admit && !e.commit.cancel && !e.commit.hold && !e.commit.shrink,"a resize commit changes nothing else");
-    if(e.commit.shrink) require(e.notice.kind==EventKind::Admit,"a shrink comes with an admission");
-}
+inline void match(const EventCommit& e){const auto c=ctl::to_ctl(e.commit);ctl::check(g6ctl_match(sch::c<g6ctl_notice>(&e.notice),&c));}
 inline std::vector<uint8_t> encode(const EventCommit& x){
-    match(x);Encoder e(Tag::Commit);e.notice(x.notice);const auto& c=x.commit;
-    e.u64(c.before_hash);e.u64(c.cancel.has_value());if(c.cancel)e.key(*c.cancel);
-    e.u64(c.admit.has_value());if(c.admit){const auto&g=*c.admit;e.key(g.key);e.u64(g.req.id);e.u64(g.req.prompt_tokens);e.u64(g.req.max_tokens);e.steering(g.req.steering);e.u64(g.run.first_page);e.u64(g.run.pages);e.u64(g.run.table_version);e.u64(g.run.list_hash);e.u64(g.reuse);e.u64(g.restored);e.u64(g.counted);e.u64(g.req.r_rows);}
-    e.u64(c.hold);
-    e.u64(c.resize.has_value());if(c.resize){e.u64(c.resize->tier);e.u64(c.resize->segs);e.u64(c.resize->slots);e.u64(c.resize->txn);}
-    e.u64(c.shrink.has_value());if(c.shrink){const auto&k=*c.shrink;e.key(k.key);e.u64(k.r_rows);e.u64(k.run.first_page);e.u64(k.run.pages);e.u64(k.run.table_version);e.u64(k.run.list_hash);}
-    return e.b;
+    auto f=ctl::frame(Tag::Commit);std::memcpy(&f.notice,&x.notice,sizeof x.notice);f.commit=ctl::to_ctl(x.commit);return ctl::encode(f);
 }
-inline Notice decode_notice(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Notice,"expected notice");auto n=d.notice();d.end();return n;}
-inline Ack decode_ack(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Ack,"expected ACK");Ack a;a.notice=d.notice();a.rank=d.u32();a.state_hash=d.u64();a.room=d.u32();d.end();return a;}
-inline EventCommit decode_commit(const std::vector<uint8_t>& b){
-    Decoder d(b);require(d.tag==Tag::Commit,"expected commit");EventCommit e;e.notice=d.notice();auto&c=e.commit;
-    c.epoch=e.notice.epoch;c.event=e.notice.event;c.boundary=e.notice.boundary;c.before_hash=d.u64();
-    auto has=d.u64();require(has<=1,"invalid optional cancel");if(has)c.cancel=d.key();
-    has=d.u64();require(has<=1,"invalid optional grant");if(has){Grant g;g.key=d.key();g.req.id=d.u64();g.req.prompt_tokens=d.u32();g.req.max_tokens=d.u32();g.req.steering=d.steering();g.run.first_page=d.u32();g.run.pages=d.u32();g.run.table_version=d.u32();g.run.list_hash=d.u64();g.reuse=d.u32();g.restored=d.u32();g.counted=d.u32();g.req.r_rows=d.u32();require(!g.restored||g.reuse,"invalid restored grant");require(g.req.r_rows%PAGE==0,"invalid grant R");c.admit=g;}
-    has=d.u64();require(has<=1,"invalid hold flag");c.hold=has!=0;
-    has=d.u64();require(has<=1,"invalid optional resize");if(has){Resize r;r.tier=d.u32();r.segs=d.u64();r.slots=d.u64();r.txn=d.u64();c.resize=r;}
-    has=d.u64();require(has<=1,"invalid optional shrink");if(has){Shrink k;k.key=d.key();k.r_rows=d.u32();k.run.first_page=d.u32();k.run.pages=d.u32();k.run.table_version=d.u32();k.run.list_hash=d.u64();require(k.r_rows&&k.r_rows%PAGE==0,"invalid shrink R");c.shrink=k;}
-    match(e);
-    d.end();return e;
-}
+inline Notice decode_notice(const std::vector<uint8_t>& b){return ctl::notice(ctl::decode(b,Tag::Notice).notice);}
+inline Ack decode_ack(const std::vector<uint8_t>& b){const auto f=ctl::decode(b,Tag::Ack);Ack a;std::memcpy(static_cast<void*>(&a),&f.ack,sizeof a);return a;}
+inline EventCommit decode_commit(const std::vector<uint8_t>& b){const auto f=ctl::decode(b,Tag::Commit);return {ctl::notice(f.notice),ctl::from_ctl(f.commit)};}
 // The head sends a request's bytes (the shim's req.<id>) to every worker just before each ADMIT notice for it, on
 // the same link, so the workers need no copy of the head's files.
 struct RequestBytes { uint64_t epoch=0, request=0; std::string bytes; };
 inline std::vector<uint8_t> encode(const RequestBytes& r){
-    Encoder e(Tag::Request);e.u64(r.epoch);e.u64(r.request);e.u64(r.bytes.size());e.b.insert(e.b.end(),r.bytes.begin(),r.bytes.end());return e.b;
+    auto f=ctl::frame(Tag::Request);f.epoch=r.epoch;f.request=r.request;f.bytes=ctl::bytes(r.bytes);f.n=r.bytes.size();return ctl::encode(f);
 }
 inline RequestBytes decode_request(const std::vector<uint8_t>& b){
-    Decoder d(b);require(d.tag==Tag::Request,"expected request");RequestBytes r;r.epoch=d.u64();r.request=d.u64();
-    const auto n=d.u64();require(n==b.size()-d.i,"request length mismatch");r.bytes.assign(b.begin()+long(d.i),b.end());d.i=b.size();d.end();return r;
+    const auto f=ctl::decode(b,Tag::Request);RequestBytes r;r.epoch=f.epoch;r.request=f.request;
+    r.bytes.assign(reinterpret_cast<const char*>(f.bytes),f.n);return r;
 }
 // The head's orderly quit (its DIR/quit), passed on so every worker quits the same way
-inline std::vector<uint8_t> encode_quit(uint64_t epoch){Encoder e(Tag::Quit);e.u64(epoch);return e.b;}
-inline uint64_t decode_quit(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Quit,"expected quit");auto e=d.u64();d.end();return e;}
+inline std::vector<uint8_t> encode_quit(uint64_t epoch){auto f=ctl::frame(Tag::Quit);f.epoch=epoch;return ctl::encode(f);}
+inline uint64_t decode_quit(const std::vector<uint8_t>& b){return ctl::decode(b,Tag::Quit).epoch;}
 // A barrier between rounds (EventEndpoint::sync): each worker sends Sync with the barrier's number, the head answers Go
 // once every worker has. No tensors, no event: it only lines the ranks up in time.
 struct SyncFrame { uint64_t epoch = 0; unsigned rank = 0; uint64_t seq = 0; };
-inline std::vector<uint8_t> encode(const SyncFrame& s){Encoder e(Tag::Sync);e.u64(s.epoch);e.u64(s.rank);e.u64(s.seq);return e.b;}
-inline SyncFrame decode_sync(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Sync,"expected sync");SyncFrame s;s.epoch=d.u64();s.rank=d.u32();s.seq=d.u64();d.end();return s;}
-inline std::vector<uint8_t> encode_go(uint64_t epoch,uint64_t seq){Encoder e(Tag::Go);e.u64(epoch);e.u64(seq);return e.b;}
-inline std::pair<uint64_t,uint64_t> decode_go(const std::vector<uint8_t>& b){Decoder d(b);require(d.tag==Tag::Go,"expected go");auto e=d.u64();auto q=d.u64();d.end();return {e,q};}
+inline std::vector<uint8_t> encode(const SyncFrame& s){auto f=ctl::frame(Tag::Sync);f.epoch=s.epoch;f.rank=s.rank;f.seq=s.seq;return ctl::encode(f);}
+inline SyncFrame decode_sync(const std::vector<uint8_t>& b){const auto f=ctl::decode(b,Tag::Sync);return {f.epoch,f.rank,f.seq};}
+inline std::vector<uint8_t> encode_go(uint64_t epoch,uint64_t seq){auto f=ctl::frame(Tag::Go);f.epoch=epoch;f.seq=seq;return ctl::encode(f);}
+inline std::pair<uint64_t,uint64_t> decode_go(const std::vector<uint8_t>& b){const auto f=ctl::decode(b,Tag::Go);return {f.epoch,f.seq};}
 } // namespace g6s2

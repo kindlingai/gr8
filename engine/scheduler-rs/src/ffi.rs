@@ -499,6 +499,7 @@ pub extern "C" fn g6sch_abi(what: u32) -> u64 {
         sch::PACK_MAX_MEMBERS as u64,
         sch::QMAX as u64,
         PARSE_FN,
+        crate::control::wire::CONTROL_VERSION,
     ];
     v.get(what as usize).copied().unwrap_or(0)
 }
