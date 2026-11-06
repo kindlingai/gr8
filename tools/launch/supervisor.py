@@ -954,7 +954,7 @@ class Supervisor:
         if model.dialect != 'glm':
             front += ['--dialect', model.dialect]
         if model.served:
-            front += ['--served-model-name', model.served]
+            front += ['--served-model-name', *model.served]
         if model is models.DS41 and plan['knobs'].get('REUSE') == '1':
             front += ['--enable-prompt-tokens-details']
         elif model.dialect == 'glm':
@@ -997,7 +997,7 @@ class Supervisor:
         if model is models.DS41:  # DS41 pool_rows = SESS * per-session CAP, unlike the shared GLM pool
             argv += ['--capacity-slots', sess]
         if model.vocab:     # the shim's hello and id bound default to GLM-5.3's: a DeepSeek engine takes ids 0..129279 only
-            argv += ['--model-name', model.served or model.name, '--vocab-size', str(model.vocab),
+            argv += ['--model-name', (model.served or (model.name,))[0], '--vocab-size', str(model.vocab),
                      '--eos-ids', ','.join(map(str, model.eos_ids))]
         if self.o.get('TP') == '6':
             argv += ['--stall-timeout', '2400']

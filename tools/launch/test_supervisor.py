@@ -398,6 +398,12 @@ class FrontTests(unittest.TestCase):
         self.assertNotIn('--served-model-name', a)
         self.assertIn('--allow-thinking-off', a)
 
+    def test_flash_serves_under_its_own_names(self):
+        a = self.front_argv('--gr8-model', 'glm53f')
+        i = a.index('--served-model-name')
+        self.assertEqual(a[i + 1:i + 3], ['glm-5.3-flash', 'glm53f'])
+        self.assertNotIn('--dialect', a)
+
     def test_the_front_end_finds_the_supervisor_for_deep_health(self):
         a = self.front_argv()
         host, port = a[a.index('--supervisor') + 1].rsplit(':', 1)

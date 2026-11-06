@@ -2,6 +2,7 @@
 Nothing picks one for the runner. `./gr8 models` (this file run) lists each model and the values its options take."""
 import json
 import os
+import sys
 from dataclasses import dataclass
 
 
@@ -32,7 +33,8 @@ class Model:
     thinking_off: bool          # the chat template can turn thinking off (reasoning_effort none)
     fabric: bool = True         # the ranks talk over RDMA: rails and /dev/infiniband
     dialect: str = 'glm'        # the front end's --dialect: glm (GLM chat template and <tool_call>) or ds41 (DeepSeek DSML)
-    served: str = ''            # the front end's --served-model-name (empty: the dialect's own default)
+    served: tuple = ()          # the front end's --served-model-name: /v1/models lists the first first, a request may
+                                # name any (empty: the dialect's own, glm-5.3 and glm53 for GLM)
     defaults: tuple = ()        # (KEY, value) option defaults for this model, over the table's: origin '<name> default'
     vocab: int = 0              # the shim's --vocab-size: the ids the engine's embedding table takes (0: the shim's own, GLM-5.3's)
     eos_ids: tuple = ()         # the shim's --eos-ids (empty: the shim's own, GLM-5.3's)
@@ -57,14 +59,15 @@ GLM53 = Model('glm53', 'GLM-5.3', 'https://huggingface.co/kindlingai/glm-5.3-exl
 # GLM-5.3-Flash: uniform-width releases, K4 by default. K2 is the width whose experts fit one box (TP=1).
 GLM53F = Model('glm53f', 'GLM-5.3-Flash', 'https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4',
                'g6m4_flash', 'flash', ('4', '3', '2', '1'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},
-               {1: ('k2',), 2: ('k4',), 3: ('k4',), 4: ('k4',)}, 'gr8-glm53f', 'Glm5NextForConditionalGeneration', True, True, True)
+               {1: ('k2',), 2: ('k4',), 3: ('k4',), 4: ('k4',)}, 'gr8-glm53f', 'Glm5NextForConditionalGeneration', True, True, True,
+               served=('glm-5.3-flash', 'glm53f'))   # its own names: a router that lists models by name keeps it apart from GLM-5.3
 # DeepSeek-V4.1-Flash-1017 (docs/DEEPSEEK.md): the official weights in the exlr8 native layout (FP8 trunk, MXFP4 routed
 # experts), no width variants, TP=4. Its drafter is DSpark, the checkpoint's MTP layers (GR8_DS_MTP), not DFlash2. The front
 # end speaks the ds41 dialect (DSML tool calls, numeric reasoning effort). A request that names no reasoning effort gets
 # low (50), which kept the release's answers at about a quarter of high's thinking tokens.
 DS41 = Model('ds41', 'DeepSeek-V4.1-Flash', 'https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native',
              'g6m4_ds41', 'ds41', ('4',), {}, {}, 'gr8-ds41', 'DeepseekV41ForCausalLM', False, False, True,
-             dialect='ds41', served='deepseek-v4.1-flash', vocab=129280, eos_ids=(1,),   # engine/model_geom_ds41.h VOCAB, TOK_EOS
+             dialect='ds41', served=('deepseek-v4.1-flash',), vocab=129280, eos_ids=(1,),   # engine/model_geom_ds41.h VOCAB, TOK_EOS
              defaults=(('DEFAULT_MAX_TOKENS', '32768'), ('DEFAULT_REASONING_EFFORT', 'low')))
 # The pseudo engine (frontend/pseudo-engine): GLM-5.3's tokens and chat template, answers from a TOML file of rules, on
 # a CPU. Its release is a directory with responses.toml and the tokenizer files.
@@ -112,6 +115,9 @@ def describe(m):
 
 
 if __name__ == '__main__':
+    if sys.argv[1:2] == ['served']:   # ./gr8 <name> smoke: the name its requests send
+        print(MODELS[sys.argv[2]].served[0] if MODELS[sys.argv[2]].served else '')
+        sys.exit()
     print('\n\n'.join(describe(m) for m in SERVED))
     print('\n./gr8 knobs lists every option. The pseudo engine (./gr8 pseudo, no GPU) is for tests: '
           'frontend/pseudo-engine.')
