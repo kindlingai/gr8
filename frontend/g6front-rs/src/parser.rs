@@ -773,7 +773,7 @@ const NAME_MAX: usize = 128;
 /// 1 to `NAME_MAX` bytes that starts with an ASCII letter or `_` and goes on with letters, digits, `_`, `-`, `.` and
 /// `:` (OpenAI's `[a-zA-Z0-9_-]`, plus the separators namespaced tool names use). Prose between the tags -- spaces,
 /// markup, a placeholder like `...` or `-`, a number -- stays prose.
-fn plausible_name(name: &str) -> bool {
+pub(crate) fn plausible_name(name: &str) -> bool {
     name.len() <= NAME_MAX
         && name.bytes().next().is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
