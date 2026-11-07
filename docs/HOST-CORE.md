@@ -668,6 +668,32 @@ flag) that DS41's old exit passed. `scripts/host_tests.sh` and `cargo test --rel
 and DS41 engines build on a GB10. Boot: TP4 GLM, R5b2c then R6a, the round logs byte-identical on all four ranks, the 24 T=0
 replies matching and the head's log lines equal apart from memory, load speed and the epoch.
 
+R6b landed. The parse is `engine/scheduler-rs` `src/options.rs` and the signatures `src/signature.rs`; `engine_options.h`
+and `s2/signature.h` are facades over `g6opt_*` and `g6sig_runtime` (g6sched.h; `g6opt_knobs`, `g6opt_host`,
+`g6opt_strs`, `g6opt_plan`, `g6opt_options`, `g6sig_inputs` and `G6ModuleInfo` in the layout digest, which the facade
+checks before it parses). The Rust returns the refusal, or `g6opt_options`: scalars, with strings and lists in its own
+storage until `g6opt_free`. The facade rebuilds `EngineOptions` from it (`Plan`, `SpecLen`, `KStop`, `CommonOpts`,
+`FabricConfig`), and `describe()` stays C++ over the result, so `options_vectors_test` checks the whole path. Knobs come
+through gr8_knobs.h's C API, passed in as function pointers so `libg6host.a` needs nothing from `libgr8knobs.a`'s place
+on the link line; `knobs gen` writes their ids to `gr8_knob_ids.rs`, and `env_lint.py` counts those reads. The model
+`#if`s are a match on the module's model. The constants the parse read from device headers joined `G6ModuleInfo`
+(the DFlash2 round's drafts and its replicated body, `TP_SORT`, the int4 KV build, XGrammar, DS41's markov tile and
+draft block), which went to ABI 3; `g6m4.cu` checks them against the headers. atoi, atof, strtoul, the @file reader and
+`std::to_string(double)` (printf's %f, which Rust's formatting does not match for every double) call the C library.
+Three pieces stay C++: the DSpark knob parse (`ds41_dspark.h`, shared with the DS41 serve path and tests; it reads
+knobs only, so it runs first and its result is passed in), `ds41_engram_colls` (it dies on a bad Engram config, so the
+Rust calls back into it where the C++ called it) and `coll_exec_order`, which the facade applies to the parsed layers.
+`flash_route_split_mode` stays for its other callers; the parse reads its knob itself. `qp_wire.h`'s
+`roll_env_refusal` had no other caller and moved. m4sim still parses the shared flags with `engine_opts.h`.
+
+Checked on Linux (GCC 12, x86_64, Rust 1.99.1). The ABI bump changes one number in the parse's rank 0 module line, so
+the `options_vectors_test` hashes were rerecorded in that commit alone, from the C++ parse: every shape's dump equals
+R6a's with "abi 2" read as "abi 3". The Rust parse keeps those hashes in all four shapes, and the coverage check reaches
+93 of 93 refusals (7 unreachable). `signature_vectors_test` keeps its three hashes. `scripts/check_args.py` on a GB10:
+the 352 transcripts of R6a's engines and R6b's (121 GLM, 116 Flash, 115 DS41) are byte-identical apart from the ABI
+number. `scripts/host_tests.sh` and `cargo test --release --workspace` pass, and the 13,777 round logs the host tests
+write are byte-identical to R6a's. The GLM, Flash and DS41 engines build on a GB10. Boot pending.
+
 ### R7. Step sizes
 
 One Rust `step_sizes(kind, M)` per model replaces the four copies of the collective-size code (`g6m4.cu:2214, 2878,
