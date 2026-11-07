@@ -3,10 +3,9 @@
 Need help? Join us on Discord: https://discord.gg/8EAvYPV2rE
 
 gr8 serves GLM-5.3, GLM-5.3-Flash and DeepSeek-V4.1-Flash on one to six DGX Spark (GB10) boxes (the count depends on
-the model, see below). The model is split across all the boxes (tensor parallel, TP). gr8 is written from scratch in
-CUDA and uses no vLLM, PyTorch or NCCL at serve time. Each box runs one engine process (`g6m4`) and is one rank. The
-ranks talk over RoCE v2 through gr8's own RDMA code, and an OpenAI-compatible API runs on the first box. *Beta
-release. If you run it, please tell us what breaks: issues and PRs are welcome.*
+the model, see below), with an OpenAI-compatible API on the first box. gr8 is written from scratch in CUDA and uses no
+vLLM, PyTorch or NCCL at serve time. *Beta release. If you run it, please tell us what breaks:
+[issues](https://github.com/kindlingai/gr8/issues) and PRs are welcome.*
 
 ## Recipes
 
@@ -142,6 +141,9 @@ Each model's page gives its box count. [docs/GLM-5.3.md](docs/GLM-5.3.md#what-yo
   with the NVIDIA container toolkit (DGX OS has both): see [Docker Compose](docs/DEPLOY.md#docker-compose).
 
 ## Running it
+
+The model is split across all the boxes (tensor parallel, TP). Each box runs one engine process (`g6m4`) and is one
+rank. The ranks talk over RoCE v2 through gr8's own RDMA code.
 
 Every box runs the same `./gr8 <model> up`, where the model is `glm53`, `glm53f` or `ds41`
 ([docs/DEPLOY.md](docs/DEPLOY.md)). The first address in `--peers` is the
