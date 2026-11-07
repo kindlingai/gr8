@@ -5,7 +5,7 @@
     outside tests (a test sets a child's environment with them), and no "G6_NAME" string where NAME is a knob and
     G6_NAME no compile-time macro. Rust anywhere: no std::env::var, var_os or vars, and no set_var or remove_var
     outside tests. The knobs crate itself is the one exception. Read a setting through its knob: knob::name() in C++,
-    gr8knobs::NAME.get() in Rust.
+    gr8knobs::NAME.get() in Rust, or its id (gr8_knob_ids.rs, knob_ids::NAME or kid::NAME) through the C API.
   - every knob the engine, its tests or the front end should read (scope agree, local or test) is read somewhere.
   - every G6_ or GR8_ assignment in the launcher (scripts/engine_args.sh) and the recipes (recipes/**/*.env) is one the
     engine accepts (`knobs validate`).
@@ -113,7 +113,8 @@ def unread(paths, table):
     for name, scope, _kind, _family in table:
         if scope == 'Outside':
             continue
-        if not re.search(r'\bknob::' + name.lower() + r'\s*\(', text) and not re.search(r'\b' + name + r'\.(?:get|var)\(', text):
+        if not re.search(r'\bknob::' + name.lower() + r'\s*\(', text) and not re.search(r'\b' + name + r'\.(?:get|var)\(', text) \
+                and not re.search(r'\b(?:knob_ids|kid)::' + name + r'\b', text):
             errs.append(f'{name}: scope {scope.lower()}, but nothing reads knob::{name.lower()}() or {name}.get(): '
                         'remove it from the table, or mark it outside')
     return errs

@@ -19,9 +19,16 @@ pub mod flash_lend;
 pub mod flash_ring;
 pub mod kv_plan;
 pub mod kv_share;
+/// gr8_knobs.h's ids, which `knobs gen` writes
+#[allow(dead_code)]
+pub mod knob_ids {
+    include!("../../knobs-rs/gr8_knob_ids.rs");
+}
 pub mod layout;
 pub mod module;
+pub mod module_info;
 pub mod ngram;
+pub mod options;
 pub mod planner;
 pub mod planner_ffi;
 pub mod pool_ops;

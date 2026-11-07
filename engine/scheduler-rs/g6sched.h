@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include "../kvman-rs/g6kvman.h"
+#include "../module_info.h"
 
 extern "C" {
 
@@ -873,6 +874,189 @@ struct g6sig_inputs {
 };
 const char* g6sig_runtime(const g6sig_inputs* in);
 
+// engine_options.h: g6m4's option parse (src/options.rs) over the build's description (module_info.h) and the knob
+// table's C API (gr8_knobs.h; passed in, so this library needs nothing from libgr8knobs.a at link time). The host
+// table holds what stays C++: the DSpark knob parse's result (DS41) and ds41_engram_colls, which dies on a bad Engram
+// config as the boot does. The options' strings and lists live until g6opt_free; g6opt_options is null after a
+// refusal, and g6opt_refusal is "" when the options pass.
+struct g6opt_knobs {
+    uint64_t table_hash;
+    int (*flag)(uint32_t, uint32_t, int*);
+    int (*int_)(uint32_t, uint32_t, int64_t*);
+    int (*float_)(uint32_t, uint32_t, double*);
+    const char* (*text)(uint32_t, uint32_t);
+    ptrdiff_t (*ints)(uint32_t, uint32_t, const int64_t**);
+    ptrdiff_t (*floats)(uint32_t, uint32_t, const double**);
+    const char* (*tests_set)(void);
+};
+struct g6opt_host {
+    void* ctx;
+    int32_t (*engram_colls)(void*, const int32_t*, size_t);
+    int32_t dsk_mtp;
+    bool dsk_relaxed;
+    double dsk_relax_topp;
+    const char* dsk_err;
+};
+struct g6opt_strs {
+    const char* const* p;
+    size_t n;
+};
+struct g6opt_plan {
+    g6sch_ints prompt;
+    int32_t first;
+    int32_t chunk;
+    int32_t n_gen;
+    float inv_temp;
+    uint32_t seed;
+    float top_p;
+    int32_t lp;
+    int32_t plp;
+    bool rs;
+};
+struct g6opt_options {
+    int32_t rank;
+    g6opt_strs ips;
+    g6opt_strs ips2;
+    bool ring;
+    g6opt_strs ring_devs;
+    int32_t proxy_cpu;
+    g6opt_strs pf_ips2;
+    const char* manifest;
+    const char* packfile;
+    const char* v2_dir;
+    const char* v2_slices;
+    const char* v2_widths;
+    const char* v2_dense;
+    const char* v2_layout;
+    bool v2_trellis;
+    const char* qo_man;
+    const char* qo_file;
+    const char* layers_s;
+    const char* levels_s;
+    g6opt_strs prompts;
+    int32_t co_cap;
+    int32_t co_mp;
+    int32_t co_top;
+    int32_t co_pfrows;
+    int32_t co_mtp;
+    int32_t co_lanes;
+    int32_t co_nc;
+    float co_temp;
+    bool co_graph;
+    bool co_wide;
+    bool co_pfv2;
+    bool co_adapt;
+    bool has_n_gen;
+    int32_t n_gen;
+    bool has_chunk;
+    int32_t chunk;
+    bool has_seed;
+    uint32_t seed;
+    bool has_top_p;
+    float top_p;
+    bool has_rs;
+    bool rs;
+    const char* qp_man;
+    const char* qp_file;
+    const char* dfl_man;
+    const char* dfl_file;
+    int32_t dfl_sel;
+    int32_t dfl_k;
+    bool spec_reset_per_request;
+    bool spec_fixed;
+    g6opt_plan plan;
+    bool image;
+    bool hash;
+    bool reuse_prefix;
+    bool check_args;
+    bool lanes_explicit;
+    const char* s2dir;
+    const char* grammar_dir;
+    g6opt_strs kv_tiers;
+    const char* kv_keep;
+    int32_t kv_system_after;
+    double kv_write_limit;
+    const char* kv_format;
+    bool kv_old;
+    bool kv_old_all;
+    const char* set_id;
+    const char* steering_dir;
+    const char* steering_force_s;
+    const char* steering_model_revision;
+    const char* steering_tokenizer_revision;
+    const char* steering_template_digest;
+    const char* steering_weight_set;
+    const char* steering_template_file;
+    int32_t s2port;
+    int32_t s2sess;
+    uint64_t s2epoch;
+    int32_t cap;
+    int32_t top;
+    int32_t pfrows;
+    int32_t nc;
+    int32_t mtp;
+    int32_t mp;
+    int32_t lanes;
+    float temp;
+    bool graph;
+    bool wide;
+    bool pfv2;
+    bool adapt;
+    bool release;
+    bool s2mode;
+    bool dfl;
+    int32_t k;
+    g6sch_ints layers;
+    bool progress_isolate;
+    int32_t route_split_mode;
+    int32_t c8_pack_env;
+    bool spec_on;
+    g6sch_ints spec_levels;
+    double spec_draft_round;
+    double spec_draft_each;
+    double spec_table[9];
+    int32_t rt_win;
+    int32_t kstop_mode;
+    int32_t kstop_kmax;
+    double kstop_tau[4];
+    double kstop_seed3;
+    bool kstop_log;
+    bool kstop_solo;
+    int32_t kstopb_mode;
+    int32_t kstopb_kmin;
+    const double* kstopb_tau;
+    size_t kstopb_tau_n;
+    g6sch_ints kstopb_widths;
+    int32_t kstopb_explore;
+    int32_t flash_cache;
+    int64_t flash_budget_mib;
+    int32_t ds_moe_main_topk;
+    int32_t ds_moe_decode_topk;
+    int32_t ds_idx_pipe_b;
+    int32_t ds_idx_q_trig;
+    int32_t ds_idx_pipe_qr;
+    int32_t ds_admit_keep_scratch;
+    bool ds_sess_drafts;
+    int32_t ds_draft_cap;
+    const g6opt_plan* plans;
+    size_t n_plans;
+    g6sch_ints row_counts;
+    g6sch_ints draft_rows;
+    int32_t nl;
+    int32_t nx;
+    int32_t ncoll;
+    int32_t r;
+    bool own4;
+    int32_t qp_roll_s;
+    bool qp_roll_ser;
+    int32_t qp_wire_e;
+};
+struct g6opt_parsed;
+g6opt_parsed* g6opt_parse(const G6ModuleInfo* m, const g6opt_knobs* k, const g6opt_host* h, int argc, const char* const* argv);
+const char* g6opt_refusal(const g6opt_parsed* p);
+const g6opt_options* g6opt_options_of(const g6opt_parsed* p);
+void g6opt_free(g6opt_parsed* p);
+
 // The layout digest of every type above (and g6kvman.h's g6kv_tier_totals), computed the way src/layout.rs computes
 // it over the Rust types: per type its size and alignment, per field its offset, size and kind. The C++ compares it
 // with g6sch_layout() once at startup (scheduler.h check_abi).
@@ -974,6 +1158,12 @@ constexpr uint64_t g6sch_layout_cpp() {
     G6SCH_TYPE(g6svc_control_cfg) G6SCH_FIELD(g6svc_control_cfg, scheduler) G6SCH_FIELD(g6svc_control_cfg, directory) G6SCH_FIELD(g6svc_control_cfg, directory_n) G6SCH_FIELD(g6svc_control_cfg, endpoint) G6SCH_FIELD(g6svc_control_cfg, ingress) G6SCH_FIELD(g6svc_control_cfg, queue) G6SCH_FIELD(g6svc_control_cfg, trace) G6SCH_FIELD(g6svc_control_cfg, slots) G6SCH_FIELD(g6svc_control_cfg, n_slots) G6SCH_FIELD(g6svc_control_cfg, state) G6SCH_FIELD(g6svc_control_cfg, pool) G6SCH_FIELD(g6svc_control_cfg, host) G6SCH_FIELD(g6svc_control_cfg, lend) G6SCH_FIELD(g6svc_control_cfg, share_ms) G6SCH_FIELD(g6svc_control_cfg, rank) G6SCH_FIELD(g6svc_control_cfg, head) G6SCH_FIELD(g6svc_control_cfg, admit_hold) G6SCH_FIELD(g6svc_control_cfg, elog)
     G6SCH_TYPE(g6svc_compute_cfg) G6SCH_FIELD(g6svc_compute_cfg, control) G6SCH_FIELD(g6svc_compute_cfg, endpoint) G6SCH_FIELD(g6svc_compute_cfg, ingress) G6SCH_FIELD(g6svc_compute_cfg, trace) G6SCH_FIELD(g6svc_compute_cfg, slots) G6SCH_FIELD(g6svc_compute_cfg, n_slots) G6SCH_FIELD(g6svc_compute_cfg, state) G6SCH_FIELD(g6svc_compute_cfg, module) G6SCH_FIELD(g6svc_compute_cfg, host) G6SCH_FIELD(g6svc_compute_cfg, rank) G6SCH_FIELD(g6svc_compute_cfg, elog) G6SCH_FIELD(g6svc_compute_cfg, dfl_reuse) G6SCH_FIELD(g6svc_compute_cfg, ngram)
     G6SCH_TYPE(g6sig_inputs) G6SCH_FIELD(g6sig_inputs, model) G6SCH_FIELD(g6sig_inputs, cap) G6SCH_FIELD(g6sig_inputs, layers_s) G6SCH_FIELD(g6sig_inputs, chunk) G6SCH_FIELD(g6sig_inputs, nc) G6SCH_FIELD(g6sig_inputs, set_id) G6SCH_FIELD(g6sig_inputs, dfl) G6SCH_FIELD(g6sig_inputs, dfl_k) G6SCH_FIELD(g6sig_inputs, s2sess) G6SCH_FIELD(g6sig_inputs, knobs) G6SCH_FIELD(g6sig_inputs, mp) G6SCH_FIELD(g6sig_inputs, mtp) G6SCH_FIELD(g6sig_inputs, dfl_reuse) G6SCH_FIELD(g6sig_inputs, dfl_reuse_min) G6SCH_FIELD(g6sig_inputs, lanes) G6SCH_FIELD(g6sig_inputs, gsplit) G6SCH_FIELD(g6sig_inputs, ckpt) G6SCH_FIELD(g6sig_inputs, ckpt_blocks) G6SCH_FIELD(g6sig_inputs, ckpt_persist) G6SCH_FIELD(g6sig_inputs, s2_below) G6SCH_FIELD(g6sig_inputs, two) G6SCH_FIELD(g6sig_inputs, pf_own) G6SCH_FIELD(g6sig_inputs, pf_qp) G6SCH_FIELD(g6sig_inputs, qp_ctx) G6SCH_FIELD(g6sig_inputs, qp_min) G6SCH_FIELD(g6sig_inputs, grammar) G6SCH_FIELD(g6sig_inputs, ngram) G6SCH_FIELD(g6sig_inputs, kstop_mode) G6SCH_FIELD(g6sig_inputs, kstop_kmax) G6SCH_FIELD(g6sig_inputs, kstop_tau) G6SCH_FIELD(g6sig_inputs, kstop_seed3) G6SCH_FIELD(g6sig_inputs, draft_par) G6SCH_FIELD(g6sig_inputs, qs_mode) G6SCH_FIELD(g6sig_inputs, iq_split) G6SCH_FIELD(g6sig_inputs, mtp_split) G6SCH_FIELD(g6sig_inputs, dhead_on) G6SCH_FIELD(g6sig_inputs, dhead_tpc) G6SCH_FIELD(g6sig_inputs, dhead_ks) G6SCH_FIELD(g6sig_inputs, mtp_last) G6SCH_FIELD(g6sig_inputs, dhead2) G6SCH_FIELD(g6sig_inputs, dfl_i4) G6SCH_FIELD(g6sig_inputs, dfl_body_i4) G6SCH_FIELD(g6sig_inputs, dfl_alpha) G6SCH_FIELD(g6sig_inputs, dsel_model) G6SCH_FIELD(g6sig_inputs, dsel_tab) G6SCH_FIELD(g6sig_inputs, kstopb) G6SCH_FIELD(g6sig_inputs, cp_step) G6SCH_FIELD(g6sig_inputs, cp_seg) G6SCH_FIELD(g6sig_inputs, ctx_sp) G6SCH_FIELD(g6sig_inputs, posidx) G6SCH_FIELD(g6sig_inputs, steer_shared) G6SCH_FIELD(g6sig_inputs, ds_mtp) G6SCH_FIELD(g6sig_inputs, sh_tc) G6SCH_FIELD(g6sig_inputs, l2hint) G6SCH_FIELD(g6sig_inputs, fc2stg) G6SCH_FIELD(g6sig_inputs, fc1bstg) G6SCH_FIELD(g6sig_inputs, c8_pack) G6SCH_FIELD(g6sig_inputs, sess_drafts) G6SCH_FIELD(g6sig_inputs, pf_lanes) G6SCH_FIELD(g6sig_inputs, tk_main) G6SCH_FIELD(g6sig_inputs, tk_decode) G6SCH_FIELD(g6sig_inputs, idx_pipe_b) G6SCH_FIELD(g6sig_inputs, idx_q_trig) G6SCH_FIELD(g6sig_inputs, idx_pipe_qr) G6SCH_FIELD(g6sig_inputs, reuse) G6SCH_FIELD(g6sig_inputs, vis_on) G6SCH_FIELD(g6sig_inputs, vis_id)
+    G6SCH_TYPE(G6ModuleInfo) G6SCH_FIELD(G6ModuleInfo, abi) G6SCH_FIELD(G6ModuleInfo, model) G6SCH_FIELD(G6ModuleInfo, name) G6SCH_FIELD(G6ModuleInfo, nr) G6SCH_FIELD(G6ModuleInfo, mx) G6SCH_FIELD(G6ModuleInfo, s2n) G6SCH_FIELD(G6ModuleInfo, max_sessions) G6SCH_FIELD(G6ModuleInfo, hidden) G6SCH_FIELD(G6ModuleInfo, layers) G6SCH_FIELD(G6ModuleInfo, mtp_layers) G6SCH_FIELD(G6ModuleInfo, vocab) G6SCH_FIELD(G6ModuleInfo, experts) G6SCH_FIELD(G6ModuleInfo, topk) G6SCH_FIELD(G6ModuleInfo, kv_row_bytes) G6SCH_FIELD(G6ModuleInfo, kv_page) G6SCH_FIELD(G6ModuleInfo, kv_format) G6SCH_FIELD(G6ModuleInfo, caps) G6SCH_FIELD(G6ModuleInfo, dfl_block) G6SCH_FIELD(G6ModuleInfo, pack_members) G6SCH_FIELD(G6ModuleInfo, dfl_drafts) G6SCH_FIELD(G6ModuleInfo, dfl_rep) G6SCH_FIELD(G6ModuleInfo, tp_sort) G6SCH_FIELD(G6ModuleInfo, kv4) G6SCH_FIELD(G6ModuleInfo, xgrammar) G6SCH_FIELD(G6ModuleInfo, ds_markov_maxs) G6SCH_FIELD(G6ModuleInfo, ds_block)
+    G6SCH_TYPE(g6opt_knobs) G6SCH_FIELD(g6opt_knobs, table_hash) G6SCH_FIELD(g6opt_knobs, flag) G6SCH_FIELD(g6opt_knobs, int_) G6SCH_FIELD(g6opt_knobs, float_) G6SCH_FIELD(g6opt_knobs, text) G6SCH_FIELD(g6opt_knobs, ints) G6SCH_FIELD(g6opt_knobs, floats) G6SCH_FIELD(g6opt_knobs, tests_set)
+    G6SCH_TYPE(g6opt_host) G6SCH_FIELD(g6opt_host, ctx) G6SCH_FIELD(g6opt_host, engram_colls) G6SCH_FIELD(g6opt_host, dsk_mtp) G6SCH_FIELD(g6opt_host, dsk_relaxed) G6SCH_FIELD(g6opt_host, dsk_relax_topp) G6SCH_FIELD(g6opt_host, dsk_err)
+    G6SCH_TYPE(g6opt_strs) G6SCH_FIELD(g6opt_strs, p) G6SCH_FIELD(g6opt_strs, n)
+    G6SCH_TYPE(g6opt_plan) G6SCH_FIELD(g6opt_plan, prompt) G6SCH_FIELD(g6opt_plan, first) G6SCH_FIELD(g6opt_plan, chunk) G6SCH_FIELD(g6opt_plan, n_gen) G6SCH_FIELD(g6opt_plan, inv_temp) G6SCH_FIELD(g6opt_plan, seed) G6SCH_FIELD(g6opt_plan, top_p) G6SCH_FIELD(g6opt_plan, lp) G6SCH_FIELD(g6opt_plan, plp) G6SCH_FIELD(g6opt_plan, rs)
+    G6SCH_TYPE(g6opt_options) G6SCH_FIELD(g6opt_options, rank) G6SCH_FIELD(g6opt_options, ips) G6SCH_FIELD(g6opt_options, ips2) G6SCH_FIELD(g6opt_options, ring) G6SCH_FIELD(g6opt_options, ring_devs) G6SCH_FIELD(g6opt_options, proxy_cpu) G6SCH_FIELD(g6opt_options, pf_ips2) G6SCH_FIELD(g6opt_options, manifest) G6SCH_FIELD(g6opt_options, packfile) G6SCH_FIELD(g6opt_options, v2_dir) G6SCH_FIELD(g6opt_options, v2_slices) G6SCH_FIELD(g6opt_options, v2_widths) G6SCH_FIELD(g6opt_options, v2_dense) G6SCH_FIELD(g6opt_options, v2_layout) G6SCH_FIELD(g6opt_options, v2_trellis) G6SCH_FIELD(g6opt_options, qo_man) G6SCH_FIELD(g6opt_options, qo_file) G6SCH_FIELD(g6opt_options, layers_s) G6SCH_FIELD(g6opt_options, levels_s) G6SCH_FIELD(g6opt_options, prompts) G6SCH_FIELD(g6opt_options, co_cap) G6SCH_FIELD(g6opt_options, co_mp) G6SCH_FIELD(g6opt_options, co_top) G6SCH_FIELD(g6opt_options, co_pfrows) G6SCH_FIELD(g6opt_options, co_mtp) G6SCH_FIELD(g6opt_options, co_lanes) G6SCH_FIELD(g6opt_options, co_nc) G6SCH_FIELD(g6opt_options, co_temp) G6SCH_FIELD(g6opt_options, co_graph) G6SCH_FIELD(g6opt_options, co_wide) G6SCH_FIELD(g6opt_options, co_pfv2) G6SCH_FIELD(g6opt_options, co_adapt) G6SCH_FIELD(g6opt_options, has_n_gen) G6SCH_FIELD(g6opt_options, n_gen) G6SCH_FIELD(g6opt_options, has_chunk) G6SCH_FIELD(g6opt_options, chunk) G6SCH_FIELD(g6opt_options, has_seed) G6SCH_FIELD(g6opt_options, seed) G6SCH_FIELD(g6opt_options, has_top_p) G6SCH_FIELD(g6opt_options, top_p) G6SCH_FIELD(g6opt_options, has_rs) G6SCH_FIELD(g6opt_options, rs) G6SCH_FIELD(g6opt_options, qp_man) G6SCH_FIELD(g6opt_options, qp_file) G6SCH_FIELD(g6opt_options, dfl_man) G6SCH_FIELD(g6opt_options, dfl_file) G6SCH_FIELD(g6opt_options, dfl_sel) G6SCH_FIELD(g6opt_options, dfl_k) G6SCH_FIELD(g6opt_options, spec_reset_per_request) G6SCH_FIELD(g6opt_options, spec_fixed) G6SCH_FIELD(g6opt_options, plan) G6SCH_FIELD(g6opt_options, image) G6SCH_FIELD(g6opt_options, hash) G6SCH_FIELD(g6opt_options, reuse_prefix) G6SCH_FIELD(g6opt_options, check_args) G6SCH_FIELD(g6opt_options, lanes_explicit) G6SCH_FIELD(g6opt_options, s2dir) G6SCH_FIELD(g6opt_options, grammar_dir) G6SCH_FIELD(g6opt_options, kv_tiers) G6SCH_FIELD(g6opt_options, kv_keep) G6SCH_FIELD(g6opt_options, kv_system_after) G6SCH_FIELD(g6opt_options, kv_write_limit) G6SCH_FIELD(g6opt_options, kv_format) G6SCH_FIELD(g6opt_options, kv_old) G6SCH_FIELD(g6opt_options, kv_old_all) G6SCH_FIELD(g6opt_options, set_id) G6SCH_FIELD(g6opt_options, steering_dir) G6SCH_FIELD(g6opt_options, steering_force_s) G6SCH_FIELD(g6opt_options, steering_model_revision) G6SCH_FIELD(g6opt_options, steering_tokenizer_revision) G6SCH_FIELD(g6opt_options, steering_template_digest) G6SCH_FIELD(g6opt_options, steering_weight_set) G6SCH_FIELD(g6opt_options, steering_template_file) G6SCH_FIELD(g6opt_options, s2port) G6SCH_FIELD(g6opt_options, s2sess) G6SCH_FIELD(g6opt_options, s2epoch) G6SCH_FIELD(g6opt_options, cap) G6SCH_FIELD(g6opt_options, top) G6SCH_FIELD(g6opt_options, pfrows) G6SCH_FIELD(g6opt_options, nc) G6SCH_FIELD(g6opt_options, mtp) G6SCH_FIELD(g6opt_options, mp) G6SCH_FIELD(g6opt_options, lanes) G6SCH_FIELD(g6opt_options, temp) G6SCH_FIELD(g6opt_options, graph) G6SCH_FIELD(g6opt_options, wide) G6SCH_FIELD(g6opt_options, pfv2) G6SCH_FIELD(g6opt_options, adapt) G6SCH_FIELD(g6opt_options, release) G6SCH_FIELD(g6opt_options, s2mode) G6SCH_FIELD(g6opt_options, dfl) G6SCH_FIELD(g6opt_options, k) G6SCH_FIELD(g6opt_options, layers) G6SCH_FIELD(g6opt_options, progress_isolate) G6SCH_FIELD(g6opt_options, route_split_mode) G6SCH_FIELD(g6opt_options, c8_pack_env) G6SCH_FIELD(g6opt_options, spec_on) G6SCH_FIELD(g6opt_options, spec_levels) G6SCH_FIELD(g6opt_options, spec_draft_round) G6SCH_FIELD(g6opt_options, spec_draft_each) G6SCH_FIELD(g6opt_options, spec_table) G6SCH_FIELD(g6opt_options, rt_win) G6SCH_FIELD(g6opt_options, kstop_mode) G6SCH_FIELD(g6opt_options, kstop_kmax) G6SCH_FIELD(g6opt_options, kstop_tau) G6SCH_FIELD(g6opt_options, kstop_seed3) G6SCH_FIELD(g6opt_options, kstop_log) G6SCH_FIELD(g6opt_options, kstop_solo) G6SCH_FIELD(g6opt_options, kstopb_mode) G6SCH_FIELD(g6opt_options, kstopb_kmin) G6SCH_FIELD(g6opt_options, kstopb_tau) G6SCH_FIELD(g6opt_options, kstopb_tau_n) G6SCH_FIELD(g6opt_options, kstopb_widths) G6SCH_FIELD(g6opt_options, kstopb_explore) G6SCH_FIELD(g6opt_options, flash_cache) G6SCH_FIELD(g6opt_options, flash_budget_mib) G6SCH_FIELD(g6opt_options, ds_moe_main_topk) G6SCH_FIELD(g6opt_options, ds_moe_decode_topk) G6SCH_FIELD(g6opt_options, ds_idx_pipe_b) G6SCH_FIELD(g6opt_options, ds_idx_q_trig) G6SCH_FIELD(g6opt_options, ds_idx_pipe_qr) G6SCH_FIELD(g6opt_options, ds_admit_keep_scratch) G6SCH_FIELD(g6opt_options, ds_sess_drafts) G6SCH_FIELD(g6opt_options, ds_draft_cap) G6SCH_FIELD(g6opt_options, plans) G6SCH_FIELD(g6opt_options, n_plans) G6SCH_FIELD(g6opt_options, row_counts) G6SCH_FIELD(g6opt_options, draft_rows) G6SCH_FIELD(g6opt_options, nl) G6SCH_FIELD(g6opt_options, nx) G6SCH_FIELD(g6opt_options, ncoll) G6SCH_FIELD(g6opt_options, r) G6SCH_FIELD(g6opt_options, own4) G6SCH_FIELD(g6opt_options, qp_roll_s) G6SCH_FIELD(g6opt_options, qp_roll_ser) G6SCH_FIELD(g6opt_options, qp_wire_e)
     return h;
 }
 #undef G6SCH_TYPE

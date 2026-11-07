@@ -83,6 +83,12 @@ impl Kind for crate::ffi::Batch {
 impl Kind for crate::ffi::Ints {
     const K: u64 = 6;
 }
+impl Kind for crate::options::Strs {
+    const K: u64 = 6;
+}
+impl Kind for crate::options::CPlan {
+    const K: u64 = 6;
+}
 impl Kind for crate::ffi::ParsedReq {
     const K: u64 = 6;
 }
@@ -272,6 +278,14 @@ macro_rules! fn_kinds {
     ($($t:ty),*) => { $(impl Kind for Option<$t> { const K: u64 = 0x76; })* };
 }
 fn_kinds!(
+    crate::options::FlagFn,
+    crate::options::IntFn,
+    crate::options::FloatFn,
+    crate::options::TextFn,
+    crate::options::IntsFn,
+    crate::options::FloatsFn,
+    crate::options::StrFn,
+    crate::options::EngramFn,
     crate::planner_ffi::RunFn,
     crate::planner_ffi::RoundFn,
     crate::planner_ffi::PromptFn,
@@ -993,6 +1007,224 @@ pub fn digest() -> u64 {
             reuse,
             vis_on,
             vis_id
+        }
+    );
+    layout!(
+        h,
+        crate::module_info::ModuleInfo {
+            abi,
+            model,
+            name,
+            nr,
+            mx,
+            s2n,
+            max_sessions,
+            hidden,
+            layers,
+            mtp_layers,
+            vocab,
+            experts,
+            topk,
+            kv_row_bytes,
+            kv_page,
+            kv_format,
+            caps,
+            dfl_block,
+            pack_members,
+            dfl_drafts,
+            dfl_rep,
+            tp_sort,
+            kv4,
+            xgrammar,
+            ds_markov_maxs,
+            ds_block
+        }
+    );
+    layout!(
+        h,
+        crate::options::KnobApi {
+            table_hash,
+            flag,
+            int_,
+            float_,
+            text,
+            ints,
+            floats,
+            tests_set
+        }
+    );
+    layout!(
+        h,
+        crate::options::Host {
+            ctx,
+            engram_colls,
+            dsk_mtp,
+            dsk_relaxed,
+            dsk_relax_topp,
+            dsk_err
+        }
+    );
+    layout!(
+        h,
+        crate::options::Strs {
+            p,
+            n
+        }
+    );
+    layout!(
+        h,
+        crate::options::CPlan {
+            prompt,
+            first,
+            chunk,
+            n_gen,
+            inv_temp,
+            seed,
+            top_p,
+            lp,
+            plp,
+            rs
+        }
+    );
+    layout!(
+        h,
+        crate::options::Options {
+            rank,
+            ips,
+            ips2,
+            ring,
+            ring_devs,
+            proxy_cpu,
+            pf_ips2,
+            manifest,
+            packfile,
+            v2_dir,
+            v2_slices,
+            v2_widths,
+            v2_dense,
+            v2_layout,
+            v2_trellis,
+            qo_man,
+            qo_file,
+            layers_s,
+            levels_s,
+            prompts,
+            co_cap,
+            co_mp,
+            co_top,
+            co_pfrows,
+            co_mtp,
+            co_lanes,
+            co_nc,
+            co_temp,
+            co_graph,
+            co_wide,
+            co_pfv2,
+            co_adapt,
+            has_n_gen,
+            n_gen,
+            has_chunk,
+            chunk,
+            has_seed,
+            seed,
+            has_top_p,
+            top_p,
+            has_rs,
+            rs,
+            qp_man,
+            qp_file,
+            dfl_man,
+            dfl_file,
+            dfl_sel,
+            dfl_k,
+            spec_reset_per_request,
+            spec_fixed,
+            plan,
+            image,
+            hash,
+            reuse_prefix,
+            check_args,
+            lanes_explicit,
+            s2dir,
+            grammar_dir,
+            kv_tiers,
+            kv_keep,
+            kv_system_after,
+            kv_write_limit,
+            kv_format,
+            kv_old,
+            kv_old_all,
+            set_id,
+            steering_dir,
+            steering_force_s,
+            steering_model_revision,
+            steering_tokenizer_revision,
+            steering_template_digest,
+            steering_weight_set,
+            steering_template_file,
+            s2port,
+            s2sess,
+            s2epoch,
+            cap,
+            top,
+            pfrows,
+            nc,
+            mtp,
+            mp,
+            lanes,
+            temp,
+            graph,
+            wide,
+            pfv2,
+            adapt,
+            release,
+            s2mode,
+            dfl,
+            k,
+            layers,
+            progress_isolate,
+            route_split_mode,
+            c8_pack_env,
+            spec_on,
+            spec_levels,
+            spec_draft_round,
+            spec_draft_each,
+            spec_table,
+            rt_win,
+            kstop_mode,
+            kstop_kmax,
+            kstop_tau,
+            kstop_seed3,
+            kstop_log,
+            kstop_solo,
+            kstopb_mode,
+            kstopb_kmin,
+            kstopb_tau,
+            kstopb_tau_n,
+            kstopb_widths,
+            kstopb_explore,
+            flash_cache,
+            flash_budget_mib,
+            ds_moe_main_topk,
+            ds_moe_decode_topk,
+            ds_idx_pipe_b,
+            ds_idx_q_trig,
+            ds_idx_pipe_qr,
+            ds_admit_keep_scratch,
+            ds_sess_drafts,
+            ds_draft_cap,
+            plans,
+            n_plans,
+            row_counts,
+            draft_rows,
+            nl,
+            nx,
+            ncoll,
+            r,
+            own4,
+            qp_roll_s,
+            qp_roll_ser,
+            qp_wire_e
         }
     );
     h

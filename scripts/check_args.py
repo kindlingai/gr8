@@ -8,7 +8,7 @@
 limits a case to builds of that width. The lists come from tools/launch/options.py engine_plan, run as the supervisor
 runs it for rank 0, with fixture paths for every file (the checks open none of them), for each model and launcher
 variant. Then one mutation of a model's default list
-per refusal in engine/runtime/engine_options.h, and a few the engine makes after the parse (steering, grammar).
+per refusal of the parse (engine/scheduler-rs/src/options.rs), and a few the engine makes after the parse (steering, grammar).
 In ARGS, @IPS and @IPS2 stand for the build's NR rail addresses and @EMPTY for an empty argument.
 engine/runtime/s2/tests/options_vectors_test.cpp parses the same cases without CUDA.
 
@@ -148,7 +148,7 @@ DFLASH = arg_add('--dflash-manifest', FX + '/dflash.manifest.json', '--dflash-pa
 G, F, D = ('glm53',), ('glm53f',), ('ds41',)
 GF, ALL = ('glm53', 'glm53f'), MODELS
 MUTATIONS = [
-    # every model's checks, in engine_options.h order
+    # every model's checks, in the parse's order (options.rs)
     (G + D, 'moe-topk', env_set('GR8_MOE_TOPK=4')),
     (F, 'moe-topk-screen', env_set('GR8_MOE_TOPK=4')),
     (G + D, 'router-split', env_set('GR8_PF_ROUTER_SPLIT=1')),

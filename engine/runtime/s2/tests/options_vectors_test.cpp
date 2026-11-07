@@ -1,9 +1,10 @@
-// g6m4's option parse (engine_options.h) over the cases scripts/check_args.py writes (options_cases.txt): the launcher's
-// argument lists per model and variant, and one mutation per refusal (a MODEL@NR case runs only at that width). The
-// knob table is read once a process, so each case runs in a child with its environment alone, as g6m4's main runs it:
-// knob::init, then the parse. The child's exit code, its stderr and either the refusal or describe() make the case's
-// transcript; each shape's hash must equal the recorded one. Rerecord only for a change meant to alter a check, and say
-// so in the commit. scripts/check_options_coverage.py reads the --dump of every shape and checks each refusal is reached.
+// g6m4's option parse (engine_options.h, the facade over scheduler-rs options.rs) over the cases scripts/check_args.py
+// writes (options_cases.txt): the launcher's argument lists per model and variant, and one mutation per refusal (a
+// MODEL@NR case runs only at that width). The knob table is read once a process, so each case runs in a child with its
+// environment alone, as g6m4's main runs it: knob::init, then the parse. The child's exit code, its stderr and either
+// the refusal or describe() make the case's transcript; each shape's hash must equal the recorded one. Rerecord only
+// for a change meant to alter a check, and say so in the commit. scripts/check_options_coverage.py reads the --dump of
+// every shape and checks each refusal is reached.
 //   options_vectors_test CASES [--dump]   --dump prints every case's transcript
 // Host only, Linux only (clearenv; scripts/host_tests.sh runs it there).
 #include <cinttypes>
