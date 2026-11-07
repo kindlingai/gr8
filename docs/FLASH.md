@@ -76,7 +76,7 @@ at any context. A token costs each of them a 1,024 B bf16 latent row and 128 B o
 (`engine/attn/kvfmt.h`; a build with `-DG6_FLASH_KV_FP8=1` makes the row 528 B, the int4 build below 288 B), 13,824 B
 in all (4,992 B with int4). A token's raw indexer row (512 B) feeds only the pool of 4 it belongs to, so it is not in
 the pages: the pool reads it from its own call, or from the binding's raw ring of the last 64 positions of each session
-(256 KB a binding). Flash has no CP, so every rank holds the whole context and the cost is the same at TP=4 and TP=2:
+(256 KB a binding). Without CP (below) every rank holds the whole context, and the cost is the same at TP=4 and TP=2:
 
 | CAP | pages of 64 | KV a rank | with int4 |
 |---|---|---|---|
@@ -108,6 +108,35 @@ Prefill time grows faster than the prompt because the indexer scores every earli
 1,781 MHz). The shim errors a request after 900 s with no output (`--stall-timeout`), but the engine reports each
 quantum to it (an `f` line, `s2/sessions.h progress`), so the timeout bounds one quantum, not the whole prefill: a
 923K-token prompt prefilled in 1,371 s with the default.
+
+## Context-parallel KV (`GR8_CP=1`, experimental)
+
+Off by default in the Flash build (`GR8_CP` unset is 0 here, 1 in GLM-5.3's). With `GR8_CP=1 GR8_CP_R=R` (in
+`EXTRA_ENV`; `engine_args.sh` sets `GR8_CP=0` before it), the 12 attention bindings keep the first `R` tokens on every
+rank, and each later 64-row page on one rank only, `(pos / 64) % TP`, as GLM-5.3's CP does (#384). A page holds 16 whole
+pools of the indexer, so a pool and its key live on one rank. Decode past R runs five stages per DSA layer
+(`engine/attn/flash_attn.cu`, `engine/runtime/flash_dsa.cuh` `launch_dsa_cp`):
+
+1. append the rows this rank stores (every rank writes the raw index ring, which stays replicated), absorb its heads;
+2. score the pools this rank owns, the prefix's too, and keep a top 512 per row;
+3. all-gather the candidates (512 x 8 B a row) and merge them into the replicated path's list, bit for bit;
+4. all-gather the absorbed queries, and for every head group a partial attention over this rank's selected keys, each
+   sent to the group's rank;
+5. merge the partials in rank order (log-sum-exp), then the value projection.
+
+The lists and the cache bytes equal the replicated path's. The output does not: the merge sums in another order, as
+GLM-5.3's does, so T=0 output with CP on is not the same bits as with it off. `engine/tests/test_flash_cp.cu`
+(`TEST=test_flash_cp scripts/c1_tests.sh`) checks all three against the replicated bindings on one GPU.
+
+Limits for now:
+
+- The prefill runs only below R: under `--serve` a prompt longer than R ends with an error, and `--prefill` refuses one
+  offline. A prompt run as decode steps (no `--prefill`) may pass R.
+- With several sessions the pool takes GLM-5.3's page classes (S2 below R): a request whose `prompt + max_tokens`
+  passes R gets its prefix and its share of the tail below `place`, the MTP layer's copy above it.
+- The MTP layer keeps its whole KV (it is the draft model's binding), and the DFlash2 drafter its own window.
+- Not with `GR8_GLM53F_CACHE` or `GR8_GLM53F_KV_CHUNKS`.
+- Not measured on a cluster yet.
 
 ## One box (TP=1)
 
@@ -310,7 +339,7 @@ Limits:
 
 ## Not yet
 
-- CP and prefix reuse: the engine refuses them under `--serve`. `GR8_GLM53F_CACHE=aligned` (above) is the
+- Prefix reuse: the engine refuses it under `--serve`, and CP is experimental (above). `GR8_GLM53F_CACHE=aligned` (above) is the
   experimental Flash form of prefix reuse, with or without DFlash2. The DFlash2 drafter's taps are the mean of the four
   mHC streams after each tapped layer, in decode steps and in the prefill, which keeps the last 2,048 prompt positions
   for the drafter's prompt context. DFlash2 at TP=3 runs offline only.
