@@ -879,15 +879,15 @@ __global__ void __launch_bounds__(128) absorb_tc(Input input,int start,int n,hal
     }
 }
 
-// Tensor-Core sparse QK: all native heads (MT*16) share one gather of 64 selected latent rows.
-// Grid: (TOP / 64, n), 128 threads (4 warps)
+// Tensor-Core sparse QK: a group of MT*16 heads shares one gather of 64 selected latent rows.
+// Grid: (TOP / 64, n, head groups), 128 threads (4 warps)
 template<int MT,class Input>
 __global__ void __launch_bounds__(128) sparse_qk_pf(Input input,int start,const half* qh,float* scores){
     using namespace nvcuda;
     auto a=resolve(input);if(!a.active)return;
     constexpr int N=64,K=64,THREADS=128;
     const int row=blockIdx.y,r=start+row,k0=blockIdx.x*N,t=threadIdx.x,w=t>>5;FOR_ROW(a,input,r);
-    const int hn=min(16*MT,a.heads);
+    const int h0=blockIdx.z*16*MT,hn=min(16*MT,a.heads-h0);
     __shared__ const uint8_t* sh_v[N];
     __shared__ unsigned sh_any;
     if(t==0)sh_any=0;
@@ -902,7 +902,7 @@ __global__ void __launch_bounds__(128) sparse_qk_pf(Input input,int start,const 
     if(!sh_any){
         for(int i=t;i<hn*N;i+=THREADS){
             const int h=i/N,j=i%N;
-            scores[((int64_t)row*a.heads+h)*TOP+k0+j]=-INFINITY;
+            scores[((int64_t)row*a.heads+h0+h)*TOP+k0+j]=-INFINITY;
         }
         return;
     }
@@ -916,7 +916,7 @@ __global__ void __launch_bounds__(128) sparse_qk_pf(Input input,int start,const 
     for(int base=0;base<LAT;base+=K){
         for(int i=t;i<16*MT*K/8;i+=THREADS){
             const int h=i/(K/8),d=base+(i%(K/8))*8;
-            ((int4*)A)[i]=(h<a.heads)?__ldg((const int4*)(qh+((int64_t)row*a.heads+h)*LAT+d)):make_int4(0,0,0,0);
+            ((int4*)A)[i]=(h<hn)?__ldg((const int4*)(qh+((int64_t)row*a.heads+h0+h)*LAT+d)):make_int4(0,0,0,0);
         }
         for(int i=t;i<N*K/8;i+=THREADS){
             const int j=i/(K/8),d=base+(i%(K/8))*8;
@@ -940,19 +940,19 @@ __global__ void __launch_bounds__(128) sparse_qk_pf(Input input,int start,const 
     __syncthreads();
     for(int i=t;i<hn*N;i+=THREADS){
         const int h=i/N,j=i%N;
-        scores[((int64_t)row*a.heads+h)*TOP+k0+j]=sh_v[j]?O[i]*(1.f/16):-INFINITY;
+        scores[((int64_t)row*a.heads+h0+h)*TOP+k0+j]=sh_v[j]?O[i]*(1.f/16):-INFINITY;
     }
 }
 
-// Tensor-Core sparse PV: all native heads (MT*16) share one gather of 128 selected latent rows per step, writing FP16 ctxh.
-// Grid: (LAT / 64, n), 128 threads (4 warps)
+// Tensor-Core sparse PV: a group of MT*16 heads shares one gather of 128 selected latent rows per step, writing FP16 ctxh.
+// Grid: (LAT / 64, n, head groups), 128 threads (4 warps)
 template<int MT,class Input>
 __global__ void __launch_bounds__(128) sparse_pv_pf(Input input,int start,const float* p,half* ctxh){
     using namespace nvcuda;
     auto a=resolve(input);if(!a.active)return;
     constexpr int N=64,K=128,THREADS=128;
     const int row=blockIdx.y,r=start+row,d0=blockIdx.x*N,t=threadIdx.x,w=t>>5;FOR_ROW(a,input,r);
-    const int hn=min(16*MT,a.heads),pos=a.positions[r];
+    const int h0=blockIdx.z*16*MT,hn=min(16*MT,a.heads-h0),pos=a.positions[r];
     __shared__ const uint8_t* sh_v[K];
     __shared__ unsigned sh_any;
     __shared__ __align__(32) half arena[(16*MT+N)*K];
@@ -973,7 +973,7 @@ __global__ void __launch_bounds__(128) sparse_pv_pf(Input input,int start,const 
         if(!sh_any)continue;
         for(int i=t;i<16*MT*K/2;i+=THREADS){
             const int h=i/(K/2),j=base+(i%(K/2))*2;
-            const float2 pv=(h<a.heads)?*(const float2*)(p+((int64_t)row*a.heads+h)*TOP+j):make_float2(0.f,0.f);
+            const float2 pv=(h<hn)?*(const float2*)(p+((int64_t)row*a.heads+h0+h)*TOP+j):make_float2(0.f,0.f);
             ((half2*)A)[i]=__floats2half2_rn(pv.x,pv.y);
         }
         for(int i=t;i<K*N/8;i+=THREADS){
@@ -998,7 +998,7 @@ __global__ void __launch_bounds__(128) sparse_pv_pf(Input input,int start,const 
     __syncthreads();
     for(int i=t;i<hn*N;i+=THREADS){
         const int h=i/N,d=i%N;
-        ctxh[((int64_t)row*a.heads+h)*LAT+d0+d]=__float2half_rn(O[i]);
+        ctxh[((int64_t)row*a.heads+h0+h)*LAT+d0+d]=__float2half_rn(O[i]);
     }
 }
 
@@ -1763,12 +1763,14 @@ static int flash_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep*
             AMARK(4);
             AMARK(5);
         }else{
-            if(a.heads>16)fa_pf::sparse_qk_pf<2><<<dim3(fa::TOP/64,n),128,0,stream>>>(a,start,w->qh,w->prob);
+            // heads past 32 (TP=1: 64 a rank) take more groups of 32 on grid z
+            const int hg=(a.heads+31)/32;
+            if(a.heads>16)fa_pf::sparse_qk_pf<2><<<dim3(fa::TOP/64,n,hg),128,0,stream>>>(a,start,w->qh,w->prob);
             else fa_pf::sparse_qk_pf<1><<<dim3(fa::TOP/64,n),128,0,stream>>>(a,start,w->qh,w->prob);
             AMARK(4);
             fa::normalize<<<n*a.heads,256,0,stream>>>(a,w->prob);
             AMARK(5);
-            if(a.heads>16)fa_pf::sparse_pv_pf<2><<<dim3(fa::LAT/64,n),128,0,stream>>>(a,start,w->prob,w->ctxh);
+            if(a.heads>16)fa_pf::sparse_pv_pf<2><<<dim3(fa::LAT/64,n,hg),128,0,stream>>>(a,start,w->prob,w->ctxh);
             else fa_pf::sparse_pv_pf<1><<<dim3(fa::LAT/64,n),128,0,stream>>>(a,start,w->prob,w->ctxh);
         }
         AMARK(6);
