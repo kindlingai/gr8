@@ -618,13 +618,55 @@ round logs byte-identical on all four ranks, the 24 T=0 replies matching and the
 
 ### R6. Options, signatures and the fabric plan to Rust
 
-Moves `g6m4.cu:156-577` (about 20 model `#if`s, spec defaults, `--check-args`), the signature builders (`g6m4.cu:1919`,
-`2186-2191`, `3459`) and the planning half of `677-1160` as a `#[repr(C)] FabricPlan` (per fabric: port offset, proxy
-CPU, collective count, slot bytes, first run, pool), computed from `ModuleInfo` and the knobs. C++ `fabric_bring_up(plan)`
-creates the `Fabric`s in plan order. The DS41 plan headers (`ds41_ops.h`, `ds41_pf_split.h`, `ds41_slots.h`,
-`ds41_rowshard.h`, `ds41_lanes.h`) and `qp_wire.h` port here as pure functions of `(nr, mx, hid, nl)`. Proof:
-`--check-args` on the launcher's argument lists per model, signature strings compared byte for byte with today's over a
-knob matrix, one boot per model.
+Four PRs: each move to Rust follows a C++-only PR that freezes what moves.
+
+- R6a, options and signatures frozen. `main()`'s option parse (about 87 knob reads, 20 model `#if`s, the spec and
+  session defaults) becomes `engine_options.h` `parse_engine_options`, a host function that fills `EngineOptions` and
+  returns a refusal as its message. The three runtime signature builders become `s2/signature.h`
+  `runtime_signature(SigInputs)`. `--check-args` works for every model. Checked by `options_vectors_test` (the launcher's
+  argument lists per model and variant and one mutation per refusal, from `scripts/check_args.py`),
+  `signature_vectors_test` (a seeded sweep recorded from the C++ before the move) and `--check-args` transcripts of the
+  old and new engines.
+- R6b, options and signatures to Rust. The same two vectors tests hold unchanged, and the `--check-args` transcripts of
+  R6a's engines and R6b's are byte-identical.
+- R6c, the fabric plan frozen. The planning half of the fabric bring-up becomes a pure function of `EngineOptions` and
+  `ModuleInfo` that returns a `FabricPlan` (per fabric: port offset, proxy CPU, collective count, slot bytes, runs,
+  pool); `fabric_bring_up(plan)` creates the `Fabric`s in plan order. A dump of the plan per model and launcher list,
+  recorded from the C++ first.
+- R6d, the plan and its sizing headers to Rust: `FabricPlan` as `#[repr(C)]`, and the DS41 plan headers (`ds41_ops.h`,
+  `ds41_pf_split.h`, `ds41_slots.h`, `ds41_rowshard.h`, `ds41_lanes.h`) and `qp_wire.h` as pure functions of
+  `(nr, mx, hid, nl)`. The plan dumps are byte-identical.
+
+Boots: one TP4 GLM boot per PR, the round logs byte-identical and the 24 T=0 replies matching. Flash and DS41 get no
+boot. What each PR moves runs before the first CUDA call and reads only argv, the knob table and the build's constants
+(or, for a signature, a few values main already has), so a dump of every field it produces, byte-identical for every
+launcher list on the real engines, shows the boot starts from the same state.
+
+R6a landed. `engine_options.h` holds the parse that was `g6m4.cu:157-694`: `EngineOptions` has every value `main()`
+reads afterwards, `parse_engine_options` returns `""` or the message `main()` dies with (same text, same exit code), and
+`describe()` dumps every field. The host pieces it needs moved out of CUDA headers: `rank_host.h` (`die`, `Plan`,
+`V2Src`, `parse_ints`), `ds41_engram_boot.h` (the Engram boot reads) and `flash_route_split_mode`; the four device
+constants it reads have copies that `g6m4.cu` asserts. `steering::prepare_boot` and `grammar_init` read files, so they
+stay in `main()` after the parse: a steering or grammar refusal now comes after the parse's checks, and no successful
+boot changes. `--check-args` exits once, after them and before the first CUDA call, in all three builds (it was DS41's
+alone, before the prompt and QP checks). `s2/signature.h` builds the three signatures from one `SigInputs`; Flash's
+checkpoint suffix joins it after the store is made, and the strings the other builders make (`knob::signature()`,
+`ngram_sig`, `kstopb_sig`, the drafter choice's table) are inputs. The DS41 agreement tests use it instead of reading
+`g6m4.cu`.
+
+Checked on Linux (GCC 12, x86_64). `signature_vectors_test` was recorded from the three expressions as they were
+(bd1a1201): 20,000 strings a model, the hashes the same after the move. `options_vectors_test` runs `options_cases.txt`
+(19 GLM, 16 Flash and 9 DS41 launcher lists, then 102, 100 and 106 mutations), each case in its own process: 121 GLM
+cases in the default (TP6) shape and at TP4, 116 Flash, 115 DS41. The TP6 shape's GLM mutations start from the TP4 list
+with `GR8_PF_OWN=3`, which TP6 takes. `scripts/check_options_coverage.py` reads every shape's transcripts: each of the
+93 reachable refusals is reached, and the 7 no case can reach are listed with the reason. `scripts/check_args.py` ran
+the same cases through the base commit's engines (built with `scripts/check_args_base.patch`, which adds `--check-args`
+to GLM and Flash at the new exit point) and through R6a's on a GB10: of 352 transcripts, 341 are byte-identical. The
+other 11 are the changes above: a steering refusal after the parse's lines, or the parse's refusal before main's (three
+GLM cases, one Flash, one DS41), and the six DS41 cases (an empty or unreadable prompt, a prompt past `--cap`, a QP
+flag) that DS41's old exit passed. `scripts/host_tests.sh` and `cargo test --release --workspace` pass. The GLM, Flash
+and DS41 engines build on a GB10. Boot: TP4 GLM, R5b2c then R6a, the round logs byte-identical on all four ranks, the 24 T=0
+replies matching and the head's log lines equal apart from memory, load speed and the epoch.
 
 ### R7. Step sizes
 

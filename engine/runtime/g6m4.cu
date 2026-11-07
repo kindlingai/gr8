@@ -101,7 +101,7 @@
 #endif
 #include <algorithm>
 #include <chrono>
-#include "engine_opts.h"
+#include "engine_options.h"
 #include "../knobs-rs/gr8_knobs.h"
 #include "packfind.h"
 #include "weight_check.cuh"
@@ -133,6 +133,7 @@ bool ds41_c2_trace_on();
 #include "s2/flash_checkpoint.h"   // GR8_GLM53F_CACHE parsed in every build, refused outside Flash
 #include "s2/flash_dfl_window.h"   // the Flash serve's DFlash2 prompt context (with GR8_GLM53F_CACHE hits)
 #include "s2/cp_rows.h"
+#include "s2/signature.h"
 #include "s2/pool.h"
 #include "s2/kv_tier.cuh"
 #include "rt_rows.cuh"
@@ -145,14 +146,12 @@ bool ds41_c2_trace_on();
 
 using namespace g6rt;
 
-static std::vector<std::string> split(const std::string& s, char c)
-{
-    std::vector<std::string> v;
-    size_t a = 0, b;
-    while ((b = s.find(c, a)) != std::string::npos) { v.push_back(s.substr(a, b - a)); a = b + 1; }
-    if (a < s.size()) v.push_back(s.substr(a));
-    return v;
-}
+static_assert(eopt::DFL_K == dfl::K && eopt::DFL_REP == dfl::REP && eopt::TP_SORT == glue::TP_SORT,
+              "engine_options.h's copies of the device-header constants");
+#if G6_MODEL_DS41
+static_assert(eopt::DS_MARKOV_MAXS == ::ds41dsp::MARKOV_MAXS && dsr::TOPK == geom::TOPK,
+              "engine_options.h's copies of the device-header constants");
+#endif
 
 int main(int argc, char** argv)
 {
@@ -165,532 +164,105 @@ int main(int argc, char** argv)
     };
     setvbuf(stdout, nullptr, _IOLBF, 0);
     pf_env_check();                    // strict GR8_PF_* choices: a bad value exits before any work
-    // GR8_MOE_TOPK (model change, screen arm): unset = the model's top-k (8, the table's default)
+    EngineOptions eo;                  // engine_options.h: argv and the knob table, every parse-time check
+    if (const std::string e = parse_engine_options(argc, argv, eo); !e.empty()) die(e);
+    g6::FabricConfig& cfg = eo.cfg;
+    const std::vector<std::string>& pf_ips2 = eo.pf_ips2;
+    const std::string &manifest = eo.manifest, &packfile = eo.packfile;
+    V2Src& v2src = eo.v2src;
+    const std::string &qp_man = eo.qp_man, &qp_file = eo.qp_file, &dfl_man = eo.dfl_man, &dfl_file = eo.dfl_file;
+    const int &dfl_sel = eo.dfl_sel, &dfl_k = eo.dfl_k;
+#if G6_MODEL_FLASH
+    const bool& spec_reset_per_request = eo.spec_reset_per_request;
+#endif
+    const Plan& plan = eo.plan;
+    const bool &image = eo.image, &hash = eo.hash, &reuse_prefix = eo.reuse_prefix;
+    const std::string& s2dir = eo.s2dir;
+    const std::string& grammar_dir = eo.grammar_dir;
 #if !G6_MODEL_DS41
-    static_assert(geom::TOPK == 8, "GR8_MOE_TOPK's default and range (knobs/decode.yaml) are the model's top-k");
+    const std::vector<std::string>& kv_tiers = eo.kv_tiers;
+#endif
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41
+    const std::string& kv_keep = eo.kv_keep;
+    const int& kv_system_after = eo.kv_system_after;
+    const double& kv_write_limit = eo.kv_write_limit;
+#endif
+    const std::string& kv_format = eo.kv_format;
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41
+    const bool& kv_old = eo.kv_old;
+#endif
+    const std::string& set_id = eo.set_id;
+    const std::string& steering_force_s = eo.steering_force_s;
+    const int &s2port = eo.s2port, &s2sess = eo.s2sess;
+    const unsigned long long& s2epoch = eo.s2epoch;
+    const int &cap = eo.cap, &top = eo.top, &nc = eo.nc, &mtp = eo.mtp, &MP = eo.MP, &lanes = eo.lanes;
+    const float& temp = eo.temp;
+    const bool &graph = eo.graph, &wide = eo.wide, &pfv2 = eo.pfv2;
+    const std::string &layers_s = eo.co.layers_s, &qo_man = eo.co.qo_man, &qo_file = eo.co.qo_file;
+    const bool &release = eo.release, &s2mode = eo.s2mode, &dfl = eo.dfl;
+    const int& K = eo.K;
+    const std::vector<int>& layers = eo.layers;
+    const bool& progress_isolate = eo.progress_isolate;
+#if G6_MODEL_FLASH
+    const int& route_split_mode = eo.route_split_mode;
 #endif
 #if G6_MODEL_DS41
-    const int c8_pack_env = knob::ds_c8pack() ? 1 : 0;
+    const int& c8_pack_env = eo.c8_pack_env;
+#endif
+    SpecLen& spec = eo.spec;
+#if G6_MODEL_FLASH
+    const SpecLen& spec_initial = eo.spec_initial;
+#endif
+    const int& rt_win = eo.rt_win;
+#if !G6_MODEL_DS41
+    s2::KStop& kstop = eo.kstop;
 #endif
 #if G6_MODEL_FLASH
-    if (const int tk = (int)knob::moe_topk(); tk < geom::TOPK)
-        fprintf(stderr, "# GR8_MOE_TOPK=%d: routed experts per token cut %d -> %d, weights renormalized (screen arm)\n",
-                tk, geom::TOPK, tk);
-#elif G6_MODEL_DS41
-    if (knob::moe_topk() != 8) die("GR8_MOE_TOPK is a Flash-model option: DeepSeek-V4.1 reads GR8_DS_MOE_TOPK");
-    if (knob::pf_router_split()) die("GR8_PF_ROUTER_SPLIT is a Flash-model option");
-#else
-    if (knob::moe_topk() != geom::TOPK) die("GR8_MOE_TOPK is a Flash-model option (this build is the GLM model)");
-    if (knob::pf_router_split()) die("GR8_PF_ROUTER_SPLIT is a Flash-model option (this build is the GLM model)");
-#endif
-#if G6_MODEL_FLASH
-    const int route_split_mode = flash_route_split_mode();     // GR8_PF_ROUTER_SPLIT: strict 0/1, a bad value dies before any load
-#endif
-    const bool progress_isolate = knob::progress_isolate();   // other threads stay off the proxy CPUs (progress_cpus.h)
-    g6::FabricConfig cfg;
-    std::vector<std::string> pf_ips2;   // --pf-ips2: rail-1 addresses of the prefill fabrics only (GR8_PF_STRIPE dual-rail)
-    std::string manifest, packfile;
-    V2Src v2src;
-    g6rt::CommonOpts co;                // every flag m4sim takes too, parsed in engine_opts.h
-    std::string qp_man, qp_file;        // --qp-manifest/--qp-pack: this rank's pair weights, GR8_PF_OWN=4
-    std::string dfl_man, dfl_file;      // --dflash-manifest/--dflash-pack: the DFlash2 drafter (engine/loader-rs/src/dflash2.rs)
-    int dfl_sel = -1;                   // --dflash-sel: 1 = selector walk, 0 = argmax, -1 = the pack decides
-    int dfl_k = dfl::K;                 // --dflash-k: drafts a round verifies (1..7; the drafter always drafts 7)
-#if G6_MODEL_FLASH
-    bool spec_reset_per_request = false; // offline evaluation: no adaptive history from earlier requests
-    bool spec_fixed = false;            // --spec-fixed: Flash --mtp K verifies all K drafts every round
-#endif
-    Plan plan;
-    bool image = false, hash = true, reuse_prefix = false;
-#if G6_MODEL_DS41
-    bool check_args = false;            // --check-args: parse and refuse as a boot would, then exit 0 before any CUDA work
-#endif
-    bool lanes_explicit = false;        // --pf-lanes given (common_arg parses it)
-    std::string s2dir;                  // --serve DIR: serve through S2 (below R)
-    std::string grammar_dir;            // --grammar-dir DIR: request grammars (grammar.h)
-    std::vector<std::string> kv_tiers;  // --kv-store (and the deprecated --kv-tier), in flag order
-    std::string kv_keep;                // --kv-keep system|sessions|all
-    int kv_system_after = 2;            // --kv-system-after
-    double kv_write_limit = 0;          // --kv-write-limit F
-    std::string kv_format;              // --kv-format fp8|int4: which latent row this binary was built for (refused otherwise)
-    bool kv_old = false, kv_old_all = false;   // a deprecated --kv-tier, and whether one kept evicted runs
-    std::string set_id;                 // --set-id HEX: joins the S2 bootstrap agreement
-    std::string steering_dir, steering_force_s;
-    std::string steering_model_revision, steering_tokenizer_revision, steering_template_digest, steering_weight_set, steering_template_file;
-    int s2port = 0, s2sess = G6_MODEL_FLASH ? 1 : 8;
-    unsigned long long s2epoch = 1;
-    for (int i = 1; i < argc; ++i)
-    {
-        const std::string a = argv[i];
-        auto next = [&]() { if (i + 1 >= argc) die("missing value for " + a); return std::string(argv[++i]); };
-        std::string oerr;
-        if (a == "--pf-lanes") lanes_explicit = true;
-        if (g6rt::common_arg(a, next, co, oerr)) { if (!oerr.empty()) die(oerr); continue; }
-        if (a == "--rank") cfg.rank = atoi(next().c_str());
-        else if (a == "--ips") cfg.ips = split(next(), ',');
-        else if (a == "--ips2") cfg.ips2 = split(next(), ',');
-        else if (a == "--pf-ips2") pf_ips2 = split(next(), ',');
-        else if (a == "--ring") cfg.ring = true;
-        else if (a == "--ring-devs") cfg.ring_devs = split(next(), ',');
-        else if (a == "--proxy-cpu") cfg.proxy_cpu = atoi(next().c_str());
-        else if (a == "--manifest") manifest = next();
-        else if (a == "--pack") packfile = next();
-        else if (a == "--qp-manifest") qp_man = next();
-        else if (a == "--qp-pack") qp_file = next();
-        else if (a == "--dflash-manifest") dfl_man = next();
-        else if (a == "--dflash-pack") dfl_file = next();
-        else if (a == "--dflash-sel") dfl_sel = atoi(next().c_str());
-        else if (a == "--dflash-k") dfl_k = atoi(next().c_str());
-#if G6_MODEL_FLASH
-        else if (a == "--spec-fixed") spec_fixed = true;
-        else if (a == "--spec-reset-per-request") spec_reset_per_request = true;
-#endif
-        else if (a == "--image") image = true;
-        else if (a == "--no-hash") hash = false;
-        else if (a == "--reuse-prefix") reuse_prefix = true;
-#if G6_MODEL_DS41
-        else if (a == "--check-args") check_args = true;
-#endif
-        else if (a == "--kv-store") kv_tiers.push_back(next());
-        else if (a == "--kv-keep") kv_keep = next();
-        else if (a == "--kv-system-after") kv_system_after = atoi(next().c_str());
-        else if (a == "--kv-write-limit") kv_write_limit = atof(next().c_str());
-        else if (a == "--kv-format") kv_format = next();
-        else if (a == "--kv-tier")
-        {
-            const std::string v = next();
-            kv_old = true;
-            kv_old_all = kv_old_all || v.find("keep=evicted") != std::string::npos || v.find("keep=all") != std::string::npos ||
-                         v.find("keep=") == std::string::npos;
-            kv_tiers.push_back(v);
-        }
-        else if (a == "--kv-shared-after") { kv_old = true; kv_system_after = atoi(next().c_str()); }
-        else if (a == "--serve") s2dir = next();
-        else if (a == "--grammar-dir") grammar_dir = next();
-        else if (a == "--s2-port") s2port = atoi(next().c_str());
-        else if (a == "--s2-sessions") s2sess = atoi(next().c_str());
-        else if (a == "--s2-epoch") s2epoch = strtoull(next().c_str(), nullptr, 10);
-        else if (a == "--set-id")
-        {
-            set_id = next();
-            if (set_id.empty() || set_id.size() > 64 || set_id.find_first_not_of("0123456789abcdef") != std::string::npos)
-                die("--set-id must be 1..64 lowercase hex digits");
-        }
-        else if (a == "--steering-profile") steering_dir = next();
-        else if (a == "--steering-weight-set") steering_weight_set = next();
-        else if (a == "--steering-force") steering_force_s = next();
-        else if (a == "--steering-model-revision") steering_model_revision = next();
-        else if (a == "--steering-tokenizer-revision") steering_tokenizer_revision = next();
-        else if (a == "--steering-chat-template") steering_template_file = next();
-        else if (a == "--steering-chat-template-sha256") steering_template_digest = next();
-        else die("unknown argument " + a);
-    }
-    // the shared flags, under the names the rest of this file uses
-    const int cap = co.cap, top = co.top, pfrows = co.pfrows, nc = co.nc, mtp = co.mtp, MP = co.MP;
-    int lanes = co.lanes;               // Flash: two lanes for a prefill of up to 8192 rows unless --pf-lanes (below)
-    const float temp = co.temp;
-    const bool graph = co.graph, wide = co.wide, pfv2 = co.pfv2;
-    bool adapt = co.adapt;              // Flash: --mtp turns it on unless --spec-fixed (below)
-    const std::string &layers_s = co.layers_s, &levels_s = co.levels_s, &qo_man = co.qo_man, &qo_file = co.qo_file;
-    std::vector<std::string>& prompts = co.prompts;
-    v2src.dir = co.v2_dir; v2src.slices = co.v2_slices; v2src.widths = co.v2_widths; v2src.dense = co.v2_dense;
-    v2src.trellis = co.v2_trellis; v2src.layout = co.v2_layout;
-    if (co.n_gen) plan.n_gen = *co.n_gen;          // Plan owns these defaults; apply only what the command line set
-    if (co.seed) plan.seed = *co.seed;
-    if (co.chunk) plan.chunk = *co.chunk;
-    if (co.top_p) plan.top_p = *co.top_p;
-    if (co.rs) plan.rs = *co.rs;
-    const bool release = !v2src.dense.empty();
-    if (knob::kvb() == "fp8" && !release) die("GR8_KVB=fp8 needs --v2-dense: packs hold kv_b in BF16");   // #50: read by the release planner only
-    if (cfg.rank < 0 || cfg.ips.size() != (size_t)g6nr::NR || (!release && (manifest.empty() || packfile.empty())))
-        die("usage: g6m4 --rank R --ips NR,addresses (this build: NR = " + std::to_string(g6nr::NR) + ") [--ips2 ..] --manifest M --pack P|- [--qo-manifest QM --qo-pack QP] [--qp-manifest PM --qp-pack PP] [--layers ..] [--gen N] [--temp T]");
-#if G6_MODEL_DS41
-    if (release && (!manifest.empty() || !packfile.empty() || !image))
-        die("--v2-dense CHECKPOINT_DIR replaces --manifest / --pack and needs --image (DS41: no --v2 / --v2-slices / --v2-widths)");
-#else
-    if (release && (!manifest.empty() || !packfile.empty() || v2src.dir.empty()))
-        die("--v2-dense replaces --manifest / --pack and needs --v2 (the image comes from the release alone)");
-#endif
-    if (!release && !v2src.layout.empty()) die("--layout needs --v2-dense (it places the release's pieces)");
-    if (knob::dec_shared_scratch() && !pfv2) die("GR8_DEC_SHARED_SCRATCH=1 needs --pfv2");
-    const std::vector<int> layers = parse_ints(layers_s);
-#if G6_MODEL_FLASH
-    if (layers_s == "all") {
-        if (layers.size() != (size_t)geom::L_MAIN) die("Flash --layers all did not select every main layer");
-        for (int i = 0; i < geom::L_MAIN; ++i)
-            if (layers[i] != i) die("Flash --layers all selected an unexpected layer");
-    }
-    fprintf(stderr, "# rank %d: Flash actual main layers %zu first %d last %d\n", cfg.rank, layers.size(),
-            layers.empty() ? -1 : layers.front(), layers.empty() ? -1 : layers.back());
-#endif
-    if (prompts.empty()) prompts.push_back(g6rt::DEFAULT_PROMPT);
-    plan.inv_temp = g6rt::inv_temp(temp);
-    if (const std::string e = g6rt::common_check(co, MX, plan.chunk); !e.empty()) die(e);
-    if (nc < 0 || nc * g6nr::NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / g6nr::NR));
-    // Flash lane default: the MP8192 memory gate passed; larger MPs remain opt-in.
-#if G6_MODEL_FLASH
-    if (!lanes_explicit && MP > 0 && MP <= 8192) lanes = 2;
-#endif
-    const bool s2mode = !s2dir.empty();
-    const bool dfl = !dfl_man.empty();
-    if (s2mode && (knob::resid_dump() || knob::logit_dump()))
-        die("GR8_RESID_DUMP / GR8_LOGIT_DUMP support offline main steps, not --serve");
-    // S2 keeps --mtp next to the drafter: a session alone at its prompt tail runs DFlash2, the others MTP (s2_batch.h)
-    if (dfl && (dfl_file.empty() || (mtp && !s2mode) || dfl_sel < -1 || dfl_sel > 1 || dfl_k < 1 || dfl_k > dfl::K))
-        die("--dflash-manifest needs --dflash-pack, and replaces --mtp (7 drafts per round) except under S2; --dflash-sel 0|1; --dflash-k 1..7");
-    // TP=6 runs the drafter body replicated (dflash.cuh dfl::REP), and so does Flash at TP=3; GLM-5.3's TP=3 would too, but is not measured
-    if (dfl && dfl::REP && g6nr::NR != 6 && !(G6_MODEL_FLASH && g6nr::NR == 3))
-        die("--dflash: TP=" + std::to_string(g6nr::NR) + " has no DFlash2 drafter (TP=4 splits it, TP=6 and Flash's TP=3 replicate it)");
-    if (plan.rs && !mtp && !dfl) die("--spec-accept rejection needs --mtp or --dflash-manifest");
-    const int K = dfl ? dfl::K : mtp;   // drafts per round
-#if G6_MODEL_FLASH
-    if (spec_reset_per_request && s2mode) die("--spec-reset-per-request is offline only (no --serve)");
-    // Flash: --mtp K is adaptive speculation (up to K drafts) unless --spec-fixed
-    if (spec_fixed && (adapt || !levels_s.empty() || !mtp)) die("--spec-fixed needs --mtp, and not --spec-adaptive / --spec-levels");
-    if (mtp && !spec_fixed && !s2mode && !dfl) adapt = true;
-#endif
-    if ((adapt || !levels_s.empty()) && ((s2mode && !dfl) || (!mtp && !dfl))) die("--spec-adaptive needs --mtp or --dflash-manifest; under S2 it is the DFlash2 sessions' policy");
-    if (!levels_s.empty() && !adapt) die("--spec-levels needs --spec-adaptive");
-    SpecLen spec;                       // --spec-adaptive. Estimates persist unless the offline reset option is on
-    if (adapt)
-    {
-        const int kmax = dfl ? dfl_k : mtp;
-        std::vector<int> lv;
-        if (levels_s.empty()) for (int k = 1; k <= kmax; ++k) lv.push_back(k);
-        else lv = parse_ints(levels_s);
-        for (int k : lv) if (k < 1 || k > kmax) die("--spec-levels: each level must be 1.." + std::to_string(kmax));
-        spec.on = true;
-        if (!spec.set_levels(lv)) die("--spec-levels: no level");
-        spec.draft_round = dfl ? 5.6 : 2.5;      // ms at 2200 MHz: the DFlash2 step, the MTP first-form pass
-        spec.draft_each = dfl ? 0 : 2.1;         // an MTP chain step
-#if G6_MODEL_FLASH
-        spec.flash_cost(g6nr::NR);
-        if (dfl) { spec.draft_round = 5.3; spec.draft_each = 0; }   // Flash's verify table; a DFlash2 round's drafting (the gap between main steps)
-#endif
-    }
-#if G6_MODEL_FLASH
-    const SpecLen spec_initial = spec;  // fully configured, before any observations; includes Flash costs and levels
+    const g6s2::FlashCache& flash_cache = eo.flash_cache;
+    const long long& flash_budget_mib = eo.flash_budget_mib;
 #endif
 #if G6_MODEL_DS41
-    // DS41 serve (s2/ds41_native.cuh): no --prefill tensor prefill and no --mtp draft (the draft is DSpark, GR8_DS_MTP); --graph is optional
-    if (s2mode && (s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 32 || !s2epoch))
-        die("DS41 serving (--serve) needs --s2-port 1..65535, --s2-sessions 1..32 and --s2-epoch > 0 (no --prefill, --mtp 0; GR8_DS_MTP 1..5 is the DSpark draft); --graph is optional (without it each step runs eagerly)");
-#else
-    if (s2mode && (!graph || !mtp || !MP || s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 8 || !s2epoch))
-        die("serving (--serve) needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8 and --s2-epoch > 0");
+    const int &ds_moe_main_topk = eo.ds_moe_main_topk, &ds_moe_decode_topk = eo.ds_moe_decode_topk;
+    const int &ds_idx_pipe_b = eo.ds_idx_pipe_b, &ds_idx_q_trig = eo.ds_idx_q_trig, &ds_idx_pipe_qr = eo.ds_idx_pipe_qr;
+    const int& ds_admit_keep_scratch = eo.ds_admit_keep_scratch;
+    const ds41::dsp::Knobs& dsk = eo.dsk;
+    const bool& ds_sess_drafts = eo.ds_sess_drafts;
+    const int& ds_draft_cap = eo.ds_draft_cap;
+    auto ds_ms_rps = [&](int ns) { return s2::ms_rps(dsk.on(), ds_sess_drafts, dsk.mtp, MX, ns); };
 #endif
-    if (s2mode && !knob::tests_set().empty())
-        die("serving (--serve) refuses test knobs (knobs/test.yaml): " + knob::tests_set());
-    if (knob::rt_store() && !s2mode) die("GR8_RT_STORE needs --serve (S2 below R with GR8_CP on)");
-    if (knob::test_rt_poison()) die("GR8_TEST_RT_POISON is an m4sim test: g6m4 reads the local copy of a row without a slot");
-    // GR8_RT_LOCAL (release): each split run's tail cycles through that many window pages per rank; the pool grants the
-    // drafter's whole tail apart from them (kvman-rs Pool::window, s2_cp_map). GR8_RT_PLACE: the main model's physical
-    // pages per rank (m.cp.phys), so --cap (the logical length) may pass what the local pages hold
-    const int rt_win = (int)knob::rt_local();
-    if (rt_win < 0 || (rt_win && !knob::rt_store())) die("GR8_RT_LOCAL needs GR8_RT_STORE and a page count >= 1");
-    if (knob::rt_place() && !rt_win) die("GR8_RT_PLACE needs GR8_RT_LOCAL (the pages past it are reached through the rows tier only)");
-    // --kv-store with it: the pool never retains a window run (kvman-rs Pool::window), so the block stores copy at most
-    // its prefix, which stays on pool pages; runs below R are as without the tier
-    if (rt_win && knob::rt_l() && *knob::rt_l() != knob::cp_r())
-        die("GR8_RT_LOCAL needs GR8_RT_L = GR8_CP_R (the window holds every tail page past R)");
+    std::vector<Plan>& plans = eo.plans;
+    std::vector<int>& row_counts = eo.row_counts;
+    const std::vector<int>& draft_rows = eo.draft_rows;
+    const int &NL = eo.NL, &NX = eo.NX, &NC = eo.NC, &R = eo.R;
+    const std::vector<int>& fab_order = eo.fab_order;
+    const bool& own4 = eo.own4;
+    const int& qp_roll_s = eo.qp_roll_s;
+    const bool& qp_roll_ser = eo.qp_roll_ser;
+    const int& qp_wire_e = eo.qp_wire_e;
+    // the files the options name: the steering profile and the request grammar
     steering::PreparedBoot steering_prepared;
     try {
-        if (!steering_dir.empty() && !hash) die("--steering-profile requires weight hash checks");
-        if (!steering_dir.empty() && (set_id.empty() || steering_weight_set.empty()))
-            die("--steering-profile needs --set-id and --steering-weight-set");
-        const steering::ExpectedModel expected{"glm-5.3", steering_model_revision, steering_weight_set,
-            steering_tokenizer_revision, steering_template_digest, HID, 78};
-        steering_prepared = steering::prepare_boot(steering_dir, expected, steering_template_file, layers, steering_force_s);
+        const steering::ExpectedModel expected{"glm-5.3", eo.steering_model_revision, eo.steering_weight_set,
+            eo.steering_tokenizer_revision, eo.steering_template_digest, HID, 78};
+        steering_prepared = steering::prepare_boot(eo.steering_dir, expected, eo.steering_template_file, layers, steering_force_s);
     } catch (const std::exception& e) { die(e.what()); }
     const auto& steering_profiles = steering_prepared.profiles;
     const auto& steering_boot = steering_prepared.config;
-    // GR8_MTP_KSTOP=1|2 (s2_batch.h KStop; default 0): a solo DFlash2 session's MTP rounds draft and verify 1..
-    // GR8_MTP_KSTOP_KMAX (1..3, default --mtp) drafts, chosen from the drafts' log-probabilities: 1 by GR8_MTP_KSTOP_TAU=
-    // t1,t2,t3 (draft j while p_1 * .. * p_j >= t_j; default 0,0.2,0.5), 2 by the drafter choice's MTP estimates
-    // (GR8_MTP_KSTOP_SEED3: their prior for a third draft). GR8_MTP_LPLOG=1 (rank 0; 2: every rank): one "# kstop" line per
-    // solo round, nothing else changes. The policy is in the S2 runtime signature
-    s2::KStop kstop;
-    {
-        kstop.mode = (int)knob::mtp_kstop().value_or((s2mode && dfl && mtp >= 2) ? 2 : 0);
-        const int lplog = (int)knob::mtp_lplog();
-        kstop.log = lplog == 2 || (lplog == 1 && cfg.rank == 0);
-        kstop.kmax = (int)knob::mtp_kstop_kmax().value_or(mtp);
-        const std::vector<double>& tau = knob::mtp_kstop_tau();
-        if (tau.size() > 3) die("GR8_MTP_KSTOP_TAU: at most 3 thresholds");
-        for (size_t j = 0; j < tau.size(); ++j) kstop.tau[j + 1] = tau[j];
-        kstop.seed3 = knob::mtp_kstop_seed3();
-        // Without --dflash-manifest (TP=6 / TP=3, MTP only): mode 1 stops the chain of a session that decodes alone
-        // (s2_batch.h KStop::solo), with GR8_MTP_KSTOP_KMAX <= --mtp; mode 2 needs the drafter choice's estimates
-        if (kstop.mode && (!s2mode || (!dfl && (kstop.mode != 1 || kstop.kmax > mtp)) || mtp < 2 || kstop.kmax < 1 || kstop.kmax > 3 ||
-                           !(kstop.seed3 > 0 && kstop.seed3 < 1) || kstop.kmax + 1 > std::max(s2sess * (mtp + 1), plan.chunk)))
-            die("GR8_MTP_KSTOP needs --serve and --mtp 2+ (without --dflash-manifest: mode 1 and GR8_MTP_KSTOP_KMAX <= --mtp); "
-                "GR8_MTP_KSTOP_KMAX 1..3 (verify rows within a step's), GR8_MTP_KSTOP_SEED3 in (0, 1)");
-        if (!kstop.mode) kstop.kmax = 0;
-        kstop.solo = kstop.mode == 1 && !dfl;
-        // GR8_MTP_KSTOPB=1 (s2_batch.h KStopB; default 0): in shared rounds each session verifies its own k_q of the K
-        // drafts: the most j with p_1 * .. * p_i >= t_i for every i <= j, at least GR8_MTP_KSTOPB_KMIN (0|1, default 0).
-        // GR8_MTP_KSTOPB_TAU=t1[,t2[,...]] (up to 7; default 0.6,0.88) at every session count, GR8_MTP_KSTOPB_TAU_S<n> at n
-        // sessions; past the configured entries there is no stop (the remaining drafts all verify).
-        // GR8_MTP_KSTOPB_WIDTHS=M,..: the main widths captured besides the multiples of K + 1 (default every width the rule reaches;
-        // a width outside them takes the next most likely drafts). GR8_MTP_KSTOPB_EXPLORE=n (measurement): every n-th
-        // round's shared sessions verify a hashed k_q instead. In the S2 runtime signature
-        kstop.b.mode = knob::mtp_kstopb() ? 1 : 0;
-        kstop.b.kmin = (int)knob::mtp_kstopb_kmin();
-        double bt[8] = {};                 // tau 0 past the entries: no stop there
-        const std::vector<double>& btau = knob::mtp_kstopb_tau();
-        if (btau.size() > 7) die("GR8_MTP_KSTOPB_TAU: at most 7 comma-separated numbers");
-        std::copy(btau.begin(), btau.end(), bt + 1);
-        for (int S = 1; S <= s2::S2N_SLOTS; ++S)
-        {
-            std::copy(bt, bt + 8, kstop.b.tau[S]);
-            if (const auto t = knob::mtp_kstopb_tau_s(S))
-            {
-                if (t->size() > 7) die("GR8_MTP_KSTOPB_TAU_S" + std::to_string(S) + ": at most 7 comma-separated numbers");
-                std::copy(t->begin(), t->end(), kstop.b.tau[S] + 1);
-            }
-        }
-        if (const auto& widths = knob::mtp_kstopb_widths())
-        {
-            if (widths->size() > 64) die("GR8_MTP_KSTOPB_WIDTHS: at most 64 comma-separated numbers");
-            for (int64_t w : *widths)
-            {
-                if (w < 1 || w > s2sess * (mtp + 1)) die("GR8_MTP_KSTOPB_WIDTHS: whole widths 1..sessions x (mtp + 1)");
-                kstop.b.widths.push_back((int)w);
-            }
-        }
-        kstop.b.explore = (int)knob::mtp_kstopb_explore();
-        // the draft log-probabilities come from every MTP draft step (StepOut::lp), with or without the DFlash2 drafter
-        if (kstop.b.mode && (!s2mode || kstop.b.explore < 0))
-            die("GR8_MTP_KSTOPB needs --serve; GR8_MTP_KSTOPB_EXPLORE >= 0");
-        if (!kstop.b.mode) kstop.b = s2::KStopB();
-    }
-    // GR8_GLM53F_CACHE (s2/flash_checkpoint.h): Flash session checkpoints under --serve, in place of prefix reuse. Its
-    // store is the one --kv-store (a lease of its own), else this process's memory, GR8_GLM53F_STATE_BUDGET_MIB a rank
-    g6s2::FlashCache flash_cache = g6s2::FlashCache::Off;
-    try { flash_cache = g6s2::flash_cache_mode(knob::glm53f_cache().c_str()); } catch (const std::exception& e) { die(e.what()); }
-    const long long flash_budget_mib = knob::glm53f_state_budget_mib();
-#if G6_MODEL_FLASH
-    // Flash: --s2-sessions 1 (the default) is the solo path; 2..8 share the --cap pool (s2/flash_native.cuh)
-    if (s2mode && (reuse_prefix || plan.rs))
-        die("Flash serve supports no prefix reuse or rejection sampling");
-    // DFlash2 with GR8_GLM53F_CACHE: a checkpoint hit restores none of the drafter's context, so a hit inside the
-    // drafter's window keeps the drafter through GR8_DFL_REUSE (s2/flash_dfl_window.h; on by default with the cache)
-    if (s2mode && dfl && !mtp)
-        die("Flash serve with DFlash2 needs --mtp (a second session moves the DFlash2 one to MTP)");
-    // a terminal checkpoint's KDA state comes from the verify ring, not a cold prefill, so the drafter would resume on
-    // state a cold run does not have: aligned checkpoints only (allowing terminal is a decision of its own)
-    if (s2mode && dfl && flash_cache == g6s2::FlashCache::Terminal)
-        die("Flash serve with DFlash2 needs GR8_GLM53F_CACHE=aligned or off (a terminal checkpoint's KDA state is not cold-exact)");
-    if (s2mode && s2sess > 1 && s2sess * (mtp + 1) > MX)
-        die("Flash serve: --s2-sessions x (--mtp + 1) rows exceed G6_MX (every session's round is one step)");
-    if (flash_cache != g6s2::FlashCache::Off) {
-        if (!s2mode || !MP) die("GR8_GLM53F_CACHE needs --serve and tensor prefill (--prefill N)");
-        if (kv_tiers.size() > 1) die("GR8_GLM53F_CACHE: one --kv-store at most (its checkpoint store)");
-        if (kv_tiers.empty() && flash_budget_mib < 1) die("GR8_GLM53F_STATE_BUDGET_MIB: >= 1");
-    }
-    if (!kv_tiers.empty() && flash_cache == g6s2::FlashCache::Off) die("--kv-store on Flash needs GR8_GLM53F_CACHE (its checkpoint store)");
-    if (s2mode && s2sess != 1 && flashkv::env_mode() == 1)
-        die("GR8_GLM53F_KV_CHUNKS needs --s2-sessions 1");
-#else
-    if (flash_cache != g6s2::FlashCache::Off) die("GR8_GLM53F_CACHE is GLM-5.3-Flash only (bin/g6m4_flash)");
-    // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under S2 every retired session's run (s2/pool.h).
-    // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
-    if (!kv_tiers.empty() && !(s2mode && reuse_prefix)) die("--kv-store needs --serve and --reuse-prefix (it keeps the runs prefix reuse retains)");
-#endif
-    if (kv_old)
-    {
-        if (kv_keep.empty()) kv_keep = kv_old_all ? "all" : "system";
-        if (cfg.rank == 0)
-            fprintf(stderr, "# warning: --kv-tier and --kv-shared-after are deprecated: --kv-store STORE,size=N, --kv-keep %s, "
-                            "--kv-system-after %d\n", kv_keep.c_str(), kv_system_after);
-    }
-    if (kv_keep.empty()) kv_keep = "system";
-    if (kv_keep != "system" && kv_keep != "sessions" && kv_keep != "all") die("--kv-keep system, sessions or all");
-    if (kv_system_after < 1) die("--kv-system-after N: N >= 1");
-    if (!(kv_write_limit >= 0) || kv_write_limit > 1000) die("--kv-write-limit F: 0 (off) to 1000 blocks per page computed");
-    {   // the KV row is fixed at build time (attn/kvfmt.h): the launcher runs bin/g6m4 for fp8 and bin/g6m4-int4 for int4,
-        // and each binary refuses the other's format. The int4 build needs the flag, so it never starts by accident.
-#if defined(G6_KV4) && G6_KV4
-        const std::string built = "int4";
-#else
-        const std::string built = "fp8";
-#endif
-#if G6_MODEL_FLASH
-        const std::string bin = "bin/g6m4_flash";
-#elif G6_MODEL_DS41
-        const std::string bin = "bin/g6m4_ds41";
-#else
-        const std::string bin = "bin/g6m4";
-#endif
-        if (kv_format.empty() && built == "int4") die("this engine is the int4 KV build (" + bin + "-int4): it needs --kv-format int4");
-        if (kv_format.empty()) kv_format = built;
-        if (kv_format != "fp8" && kv_format != "int4") die("--kv-format fp8 or int4");
-        if (kv_format != built)
-            die("--kv-format " + kv_format + ": this engine is the " + built + " build (" + bin + " is fp8, " + bin + "-int4 is int4)");
-        if (cfg.rank == 0) fprintf(stderr, "# rank 0: KV format %s (latent row %d B, %s)\n", kv_format.c_str(), g6kv::ROW, g6kv::NAME);
-        if (cfg.rank == 0)   // module_info.h: what host code reads about this build
-            fprintf(stderr, "# rank 0: module %s abi %u: TP%d, %d rows a step, %d session slots, KV %s %d B a row, caps %#x\n",
-                    g6mod::INFO.name, g6mod::INFO.abi, g6mod::INFO.nr, g6mod::INFO.mx, g6mod::INFO.max_sessions, g6mod::INFO.kv_format,
-                    g6mod::INFO.kv_row_bytes, g6mod::INFO.caps);
-    }
-#if G6_MODEL_DS41
-    // Parse before --check-args, CUDA, fabric or weights. Unset decode cut inherits the main cut.
-    std::string moe_topk_error;
-    const int ds_moe_main_topk = ds41moe::topk_cut_env(&moe_topk_error);
-    if (ds_moe_main_topk < 0) die(moe_topk_error);
-    const int ds_moe_decode_topk = ds41_moe_topk::decode_env(ds_moe_main_topk, dsr::TOPK, &moe_topk_error);
-    if (ds_moe_decode_topk < 0) die(moe_topk_error);
-    fprintf(stderr, "# rank %d ds41 moe topk main %d decode %d\n", cfg.rank, ds_moe_main_topk, ds_moe_decode_topk);
-    const int ds_idx_pipe_b = knob::ds41_idx_pipe_b() ? 1 : 0;
-    fprintf(stderr, "# rank %d ds41 idx pipe B %d\n", cfg.rank, ds_idx_pipe_b);
-    const int ds_idx_q_trig = knob::ds41_idx_q_trig() ? 1 : 0;
-    const int ds_idx_pipe_qr = knob::ds41_idx_pipe_qr() ? 1 : 0;
-    fprintf(stderr, "# rank %d ds41 idx q trig %d pipe QR %d\n", cfg.rank, ds_idx_q_trig, ds_idx_pipe_qr);
-    const int ds_admit_keep_scratch = knob::ds41_admit_keep_scratch() ? 1 : 0;
-    fprintf(stderr, "# rank %d ds41 idx admit keep scratch %d\n", cfg.rank, ds_admit_keep_scratch);
-    // Prefix reuse is served by the DS41 snapshot cache; the separate --kv-store tier is not implemented for DS41.
-    if (reuse_prefix && !s2mode) die("DS41: --reuse-prefix needs --serve");
-    if (!kv_tiers.empty()) die("DS41: --kv-store is not supported");
-    // what DS41 cannot do dies here, at parse time, not mid-boot: prefill.cuh has no DS41 branch, --mtp N > 0 would run GLM's build_draft
-    if (MP > 0) die("DS41: --prefill is not supported (there is no DS41 tensor prefill; the prompt runs as decode steps)");
-    if (mtp > 0) die("DS41: --mtp N > 0 is not supported (the draft is DSpark: GR8_DS_MTP=1..5 with --mtp 0)");
-    // DSpark (off unless GR8_DS_MTP = 1..5): served only, the round runner is the S2 DRAFT / CHAIN path (s2/ds41_dspark_round.cuh)
-    const ds41::dsp::Knobs dsk = ds41::dsp::parse_knobs(ds41_dspark_knob);   // every DSpark knob, GR8_DS_VERIFY_CAP / GR8_DS_CONF_TEMP included
-    if (!dsk.err.empty()) die(dsk.err);
-    if (dsk.on() && !s2mode) die("DS41: GR8_DS_MTP is served only (it needs --serve)");
-    // GR8_DS_SESS_DRAFTS=1 (s2/ds41_sess_drafts.h): a round's drafts a session go by its active sessions (Batch), the DSpark draft step runs
-    // launches of at most ds_draft_cap sessions (5 rows each within MX), and ds_ms_rps(ns) is the most rows a session of an ns-session main step
-    // has (its captured graphs). Off: the cap is MARKOV_MAXS and k + 1 rows up to 8 sessions, as before
-    const bool ds_sess_drafts = knob::ds_sess_drafts();
-    if (ds_sess_drafts && !dsk.on()) die("DS41: GR8_DS_SESS_DRAFTS=1 needs --serve and GR8_DS_MTP = 1..5");
-    const int ds_draft_cap = ds_sess_drafts ? s2::sess_drafts_chunk(MX, g6s2::Ds41Round::BLOCK, ::ds41dsp::MARKOV_MAXS) : ::ds41dsp::MARKOV_MAXS;
-    auto ds_ms_rps = [&](int ns) { return s2::ms_rps(dsk.on(), ds_sess_drafts, dsk.mtp, MX, ns); };
-    if (dsk.relaxed && !dsk.on()) die("DS41: GR8_DS_RELAXED_ACCEPT needs GR8_DS_MTP = 1..5 (there are no drafts to accept)");
-    if (dsk.relax_topp > 0 && nc == 0) die("DS41: GR8_DS_RELAXED_ACCEPT topp:P needs --top-p-cands > 0 (the candidates carry the mass above the draft)");
-    if (dfl) die("DS41: --dflash-manifest is not supported");
-    if (!grammar_dir.empty()) die("DS41: --grammar-dir is not supported");
-    // the DS41 serve runs the whole step as one graph (GR8_DEC_SPLIT=0); the split3 graphs are the GLM serve path (the GR8_DEC_SPLIT check below asks for them from every GLM serve)
-    if (s2mode && knob::dec_split() != 0) die("DS41: serving runs GR8_DEC_SPLIT=0 (a split serve graph is not built for DS41 yet)");
-    // Engram (GR8_DS_ENGRAM=1) under --serve: the token ring of ds41_engram_ops.cuh holds the n-gram window of each session, whose rows are
-    // consecutive positions. A draft-and-verify round (GR8_DS_MTP) is not checked against the ring, so Engram with DSpark is refused unless
-    // GR8_DS_ENGRAM_MTP=1. ds41_engram_colls is host-only: it reads the GR8_DS_ENGRAM knobs and dies on a bad config exactly as the boot
-    // does (layers 1 and 14 needed, PREFIX set), so --check-args reports it.
-    if (ds41_engram_colls(layers) && dsk.on() && !knob::ds_engram_mtp())
-        die("DS41: GR8_DS_ENGRAM=1 with GR8_DS_MTP is not validated yet (Engram on serves at MTP 0)");
-    // GR8_DS_C8PACK=1: a pack needs 2+ real S2 slots and the W-prefill buffers. Check before
-    // --check-args and before loading weights: no zero-sized pf_pos/pf_tgt/pf_sess.
-    if (c8_pack_env && (!s2mode || s2sess < 2 || knob::ds_prefill_min() < 2))
-        die("GR8_DS_C8PACK=1 needs --serve, --s2-sessions >= 2 and GR8_DS_PREFILL_MIN >= 2");
-    // SESS > 1 (s2/ds41_native.cuh): one attention / index / Engram slab per session slot, and every prompt of 2+ tokens on the W-row
-    // prefill (GR8_DS_PREFILL_MIN >= 2), so a step of several sessions has the same rows per session (the captured ns-session graphs:
-    // 1 row at MTP 0, k + 1 verify rows with DSpark up to 8 sessions; above 8 sessions MTP is dynamically off).
-    if (s2mode && s2sess != 1 && (knob::ds_prefill_min() < 2))
-        die("DS41: --s2-sessions > 1 needs GR8_DS_PREFILL_MIN >= 2 (with GR8_DS_PREFILL_W)");
-    if (s2mode && s2sess != 1 && dsk.on() && !ds_sess_drafts && (std::min(s2sess, 8) * (dsk.mtp + 1) > MX || std::min(s2sess, 8) * g6s2::Ds41Round::BLOCK > MX))
-        die("DS41: --s2-sessions x (GR8_DS_MTP + 1) verify rows and --s2-sessions x 5 draft rows must fit G6_MX " + std::to_string(MX));
-    // GR8_DS_PARK=1: a parked slot is evicted through the prefix cache (--reuse-prefix); one slot has nothing to park beside
-    if (knob::ds_park() && (!s2mode || s2sess < 2 || !reuse_prefix)) die("DS41: GR8_DS_PARK=1 needs --serve, --s2-sessions >= 2 and --reuse-prefix");
-    // --check-args: every parse-time check above passed; stop before any CUDA, fabric or weight work (the launcher smoke test runs the engine arg list through this)
-    if (check_args) { fprintf(stderr, "g6m4: --check-args: the arguments pass the parse-time checks (no CUDA, no weights)\n"); return 0; }
-#endif
-    if (reuse_prefix && dfl && !s2mode) die("--reuse-prefix is not supported with --dflash-manifest (the drafter's prompt-context taps come from the prefill)");
-    std::vector<Plan> plans;            // one sequence per --prompt
-    std::vector<int> row_counts;
-    for (const std::string& ps : prompts)
-    {
-        Plan p = plan;
-        if (steering_boot.forced) {
+    if (steering_boot.forced)
+        for (Plan& p : plans) {
             p.steering = steering_boot.selected(steering_boot.forced_scale_bits);
             p.steering_scale = steering::bits_float(steering_boot.forced_scale_bits);
         }
-        p.prompt = parse_ints(ps);
-        if (p.prompt.empty()) die("empty prompt");
-        if ((int)p.prompt.size() + p.n_gen + 2 * K > cap) die("prompt + gen (+ 2 x drafts) exceeds --cap");
-        if (MP) { const int pr = pfrows < 0 ? (int)p.prompt.size() + pfrows : pfrows;   // --pf-rows -N: all rows but the last N
-                  p.first = pr > 0 && pr < (int)p.prompt.size() - 1 ? pr : (int)p.prompt.size() - 1; }   // --pf-rows: the rest is teacher-forced through decode steps
-        for (int M : plan_rows(p))
-            if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
-        plans.push_back(p);
-    }
-    if (s2mode || reuse_prefix)         // any prompt (reuse changes the offline prompt-step row counts too): 1..chunk
-        for (int M = 1; M <= plan.chunk; ++M)
-            if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
-    std::vector<int> draft_rows;        // row counts of first-form draft passes: the prompt steps' and 1..K+1
-    if (mtp)
-    {
-        draft_rows = row_counts;
-        for (int M = 1; M <= mtp + 1; ++M)
-            if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
-        if (std::find(row_counts.begin(), row_counts.end(), mtp + 1) == row_counts.end()) row_counts.push_back(mtp + 1);
-    }
-    if (dfl && std::find(row_counts.begin(), row_counts.end(), dfl_k + 1) == row_counts.end()) row_counts.push_back(dfl_k + 1);
-    // a DFlash2 round's MTP first form runs on the accepted prefix + 1 rows (1 .. dfl_k + 1): capture every one of them
-    // (the prompt chunk and the verify widths above cover them for a block-8 drafter, not for a wider one)
-    if (dfl && mtp)
-        for (int M = 1; M <= dfl_k + 1; ++M)
-            if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
-    for (int M = 2; M <= kstop.kmax + 1; ++M)   // GR8_MTP_KSTOP: solo MTP verifies of 2..kmax + 1 rows, first forms of as many
-    {
-        if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
-        if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
-    }
-    // GR8_MTP_KSTOPB: a session alone in round_all (MTP only) verifies the rule's widths of one session; its first forms
-    // are within 1..mtp + 1 (draft_rows above)
-    for (int M : s2::kstopb_widths(kstop.b, 1, mtp))
-        if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
-    // GR8_S2_ADAPT: a session alone may verify any k <= mtp, also outside limited GR8_MTP_KSTOPB_WIDTHS (s2_batch.h kshared)
-    if (s2mode && s2::adapt_env())
-        for (int M = 2; M <= mtp + 1; ++M)
-            if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
-    for (int k : spec.levels)           // --spec-adaptive: a verify graph per level
-        if (std::find(row_counts.begin(), row_counts.end(), k + 1) == row_counts.end()) row_counts.push_back(k + 1);
-#if G6_MODEL_FLASH
-    if (s2mode) for (int n = 1; n <= mtp + 1; ++n)
-        if (std::find(row_counts.begin(), row_counts.end(), n) == row_counts.end()) row_counts.push_back(n);
-#endif
-#if G6_MODEL_DS41
-    const int NL = (int)layers.size(), NX = ds41_engram_colls(layers), NC = 2 * NL + 1 + NX, R = cfg.rank;   // NX: 2 Engram collectives after the head slot (GR8_DS_ENGRAM=1), else 0
-    const std::vector<int> fab_order = ds41::coll_exec_order(layers, NX);   // the step's collective order with Engram on, else empty (identity)
-    if (dsk.on())                       // DSpark verify steps of 2..k + 1 rows (the prompt chunk covers 1..chunk); SESS > 1: ns x (k + 1) for ns <= 8
-        for (int ns = 1; ns <= std::min(s2mode ? s2sess : 1, ds_sess_drafts ? 32 : 8); ++ns)
-            for (int M = ns; M <= ns * ds_ms_rps(ns) && M <= MX; M += ns)
-                if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
-#else
-    const int NL = (int)layers.size(), NX = 0, NC = 2 * NL + 1, R = cfg.rank;
-    const std::vector<int> fab_order;
-#endif
-    if (!grammar_dir.empty())
-    {
-        if (!s2mode) die("--grammar-dir needs --serve");
-#if !G6_GRAMMAR
-        // GRAMMAR defaults to 1, so a build without XGrammar serves without grammars: its hello leaves out
-        // `grammar`, and the front end sends none
-        fprintf(stderr, "# rank %d: --grammar-dir ignored: this engine was built without XGrammar (GR8_XGRAMMAR)\n", R);
-        grammar_dir.clear();
-#endif
-    }
     if (!grammar_dir.empty())
     {
         const std::string e = g6rt::grammar_init(grammar_dir, geom::VOCAB);
         if (!e.empty()) die("--grammar-dir " + grammar_dir + ": " + e);
-        if (R == 0)
-            if (FILE* f = fopen((s2dir + "/grammar.s2").c_str(), "w")) { fputs("json json_schema\n", f); fclose(f); }
         fprintf(stderr, "# rank %d: request grammars from %s (%d mask words a row)\n", R, grammar_dir.c_str(), g6rt::grammar_words());
     }
-    // GR8_PF_OWN=4 (TP4) env refusals before any CUDA / fabric work (qp_wire.h roll_env_refusal)
-    const bool own4 = MP && knob::pf_own() == 4;
-    const int qp_roll_s = (int)knob::pf_qp_roll();              // rolling pack: 0 or 2..4
-    const bool qp_roll_ser = knob::pf_qp_roll_ser();
-    const int qp_wire_e = (int)knob::pf_qp_wire_e().value_or(1);   // wire ring entries (qp_wire.h)
-    {
-        const std::string qp_ctx = knob::pf_qp_ctx() ? std::to_string(*knob::pf_qp_ctx()) : "";
-        const std::string why = qw::roll_env_refusal(own4, qp_roll_s, knob::pf_qp_wire_e().has_value(), qp_wire_e,
-                                                     qp_ctx.c_str(), !qp_file.empty());
-        if (!why.empty()) die(why);
-        if (own4 && g6nr::NR != 4) die("GR8_PF_OWN=4 is TP4 only (G6_NR=4)");
-        if (own4 && !qp_roll_s && (qp_man.empty() || qp_file.empty())) die("GR8_PF_OWN=4 needs --qp-manifest and --qp-pack (or GR8_PF_QP_ROLL)");
-        if (!own4 && (!qp_man.empty() || !qp_file.empty())) die("--qp-manifest / --qp-pack need GR8_PF_OWN=4 and --prefill");
-    }
+    // --check-args: every check a boot makes before CUDA passed; stop before any CUDA, fabric or weight work
+    if (eo.check_args) { fprintf(stderr, "g6m4: --check-args: the arguments pass the parse-time checks (no CUDA, no weights)\n"); return 0; }
+    if (!grammar_dir.empty() && R == 0)
+        if (FILE* f = fopen((s2dir + "/grammar.s2").c_str(), "w")) { fputs("json json_schema\n", f); fclose(f); }
 
     G6RT_CK(cudaSetDeviceFlags(cudaDeviceMapHost));
     cfg.slot_bytes = NX ? (size_t)MX * 6144 * 2 : (size_t)MX * HID * 2;   // Engram: [rows][6144] BF16 slots (ds41_engram_ops.cuh)
@@ -1995,15 +1567,13 @@ int main(int argc, char** argv)
         bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = cfg.ips[0];
         bc.directory = s2dir; bc.port = s2port;
         bc.timeout = (unsigned)knob::s2_timeout();
-        bc.runtime_signature = "flash solo cap " + std::to_string(cap) + " layers " + layers_s +
-            " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " mtp " + std::to_string(mtp) +
-            " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id +
-            (dfl ? " dflash k " + std::to_string(dfl_k) : std::string()) +
-            (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : std::string()) +
-            (s2sess > 1 ? " sessions " + std::to_string(s2sess) + " split " + std::to_string(gsplit) : std::string()) +
-            knob::signature();
-        // GR8_GLM53F_CACHE: the checkpoint store of this rank. Every rank must keep the same entries, so the mode, the
-        // store's blocks and the grid join the signature
+        g6s2::SigInputs sig;               // s2/signature.h
+        sig.model = g6s2::SigModel::Flash;
+        sig.cap = cap; sig.layers_s = layers_s; sig.MP = MP; sig.lanes = lanes; sig.mtp = mtp; sig.chunk = plan.chunk; sig.nc = nc;
+        sig.set_id = set_id; sig.dfl = dfl; sig.dfl_k = dfl_k; sig.dfl_reuse = dfl_reuse; sig.dfl_reuse_min = dfl_reuse_min;
+        sig.s2sess = s2sess; sig.gsplit = gsplit; sig.knobs = knob::signature();
+        // GR8_GLM53F_CACHE: the checkpoint store of this rank. Every rank must keep the same entries, so the mode and
+        // the store's blocks join the signature
         std::unique_ptr<g6s2::FlashCheckpoints> ckpt;
         if (flash_cache != g6s2::FlashCache::Off)
         {
@@ -2063,9 +1633,11 @@ int main(int argc, char** argv)
                     group ? (", group " + group->group + " lease, " + std::to_string(ckpt->segments()) + " segments to start").c_str() : "");
             // persist: every rank joins the agreement on persisted entries (serve_flash), or none does. The index itself is
             // not here: the agreement makes it the same on every rank, and the pool digest compares it at every event
-            bc.runtime_signature += std::string(" ckpt ") + g6s2::flash_cache_name(flash_cache) + " blocks " + std::to_string(ckpt->blocks()) +
-                (index_path.empty() ? "" : " persist");
+            sig.ckpt = g6s2::flash_cache_name(flash_cache);
+            sig.ckpt_blocks = ckpt->blocks();
+            sig.ckpt_persist = !index_path.empty();
         }
+        bc.runtime_signature = g6s2::runtime_signature(sig);
         // DFlash2 (--dflash-manifest): a session alone drafts with the drafter, as on GLM-5.3 (s2_batch.h Batch::dflash);
         // Dfl::pf_feat holds the prefill taps of the session whose prefill started last (s2/flash_dfl_window.h: with
         // GR8_GLM53F_CACHE, a checkpoint hit inside the window keeps the drafter through GR8_DFL_REUSE)
@@ -2260,30 +1832,17 @@ int main(int argc, char** argv)
         bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = cfg.ips[0];
         bc.directory = s2dir; bc.port = s2port;
         bc.timeout = (unsigned)knob::s2_timeout();
-        bc.runtime_signature = std::string(s2sess > 1 ? "ds41 sessions " + std::to_string(s2sess) : std::string("ds41 solo")) + " cap " + std::to_string(cap) + " layers " + layers_s + " mtp " + std::to_string(dsk.mtp) +
-            " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id +
-            (dfl ? " dflash k " + std::to_string(dfl_k) : std::string()) +
-            " shtc " + std::to_string(ds41moe::sh_tc_on() ? 1 : 0) +   // GR8_DS_SH_TC: ranks must agree (W8A8 shared expert, not bit-identical to 0)
-            (ds41moe::ro_l2hint() ? " l2h " + std::to_string(ds41moe::ro_l2hint()) : std::string()) +   // GR8_DS_MOE_L2HINT: 0 adds nothing; ranks that disagree on 1 / 2 refuse to join
-            (ds41moe::ro_fc2stg() ? std::string(" stg 1") : std::string()) +   // GR8_DS_MOE_FC2STG: 0 adds nothing; ranks that disagree refuse to join
-            (ds41moe::ro_fc1bstg() ? std::string(" fc1bstg 1") : std::string()); // off adds nothing; ranks with the staged B arm must agree
-        if (sc.c8_pack) bc.runtime_signature += " c8pack 1";
-        if (ds_sess_drafts) bc.runtime_signature += " sessdrafts 1";   // off adds nothing; ranks that disagree refuse to join
-        if (pf_lanes == 2) bc.runtime_signature += " pflanes 2";   // unset / 1 adds nothing; ranks that disagree refuse to join
-        if (ds_moe_decode_topk != ds_moe_main_topk)
-            bc.runtime_signature += " tkmain " + std::to_string(ds_moe_main_topk) +
-                                    " tkdecode " + std::to_string(ds_moe_decode_topk);
-        if (ds_idx_pipe_b) bc.runtime_signature += " idxpipeb 1";
-        if (ds_idx_q_trig) bc.runtime_signature += " idxqtrig 1";
-        if (ds_idx_pipe_qr) bc.runtime_signature += " idxpipeqr 1";
-        if (reuse_prefix) bc.runtime_signature += " reuse 1";
-        // DS41 image input: the effective capability, not the knob (a rank without the tower file boots text-only). With the
-        // tower, " vision <file id>" (header length + header bytes + file size: header/layout/size agreement, not tensor data);
-        // without, nothing. A rank that differs (no file, another header or size) refuses at bootstrap
-        bc.runtime_signature += ds41v::signature(vis_on, vis_id);
-        // the agree-scope knobs that are not at their default (knob::signature(), as Flash and GLM add): a rank whose value
-        // differs (GR8_DS_COMP_FP4 on three ranks and off on one) refuses at bootstrap instead of diverging later
-        bc.runtime_signature += knob::signature();
+        g6s2::SigInputs sig;               // s2/signature.h
+        sig.model = g6s2::SigModel::Ds41;
+        sig.s2sess = s2sess; sig.cap = cap; sig.layers_s = layers_s; sig.ds_mtp = dsk.mtp; sig.chunk = plan.chunk; sig.nc = nc;
+        sig.set_id = set_id; sig.dfl = dfl; sig.dfl_k = dfl_k;
+        sig.sh_tc = ds41moe::sh_tc_on(); sig.l2hint = ds41moe::ro_l2hint(); sig.fc2stg = ds41moe::ro_fc2stg(); sig.fc1bstg = ds41moe::ro_fc1bstg();
+        sig.c8_pack = sc.c8_pack; sig.sess_drafts = ds_sess_drafts; sig.pf_lanes = pf_lanes;
+        sig.tk_main = ds_moe_main_topk; sig.tk_decode = ds_moe_decode_topk;
+        sig.idx_pipe_b = ds_idx_pipe_b; sig.idx_q_trig = ds_idx_q_trig; sig.idx_pipe_qr = ds_idx_pipe_qr; sig.reuse = reuse_prefix;
+        sig.vis_on = vis_on; sig.vis_id = vis_id;
+        sig.knobs = knob::signature();
+        bc.runtime_signature = g6s2::runtime_signature(sig);
         // DSpark (GR8_DS_MTP): the draft Model, its fabric, the 5-row draft graph (or the eager step) and the compressor commit of the main Model
         g6s2::Ds41Dspark ds{DS, in_ds, out_ds,
             [&](const StepIn& si) {     // 11 collectives: 6 layer exchanges of the 5 block rows, then the 5 markov merges of one row each (x DS.ds_ns sessions)
@@ -3656,29 +3215,21 @@ int main(int argc, char** argv)
             bc.port = (uint16_t)s2port;
             if (g6_attn_ctx_sp() || g6_attn_posidx())   // round 10 E1 attention flags (attn.cu), read once before the bindings
                 fprintf(stderr, "# rank %d: decode attention E1: GR8_ATTN_CTX3_SP %d GR8_ATTN_POSIDX %d\n", R, g6_attn_ctx_sp(), g6_attn_posidx());
-            bc.runtime_signature = "g6m4 s2 below " + std::to_string(s2_below) + " cap " + std::to_string(cap) + " layers " + layers_s +
-                " mp " + std::to_string(MP) + " lanes " + std::to_string(two ? 2 : 1) + " mtp " + std::to_string(mtp) + " chunk " +
-                std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
-                " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0) + " qpmin " + std::to_string(pf_qp ? pf_qp_min() : 0) +
-                (set_id.empty() ? "" : " set " + set_id) + (g6rt::grammar_ready() ? " grammar" : "") +
-                (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : "") + s2::ngram_sig(ngram) +
-                (kstop.mode ? " kstop " + std::to_string(kstop.mode) + " kmax " + std::to_string(kstop.kmax) + " tau " + std::to_string(kstop.tau[1]) + "," +
-                              std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "") +
-                (draft_par ? " draftpar " + std::to_string(draft_par) : "") +
-                (qs_mode ? " qasplit " + std::to_string(qs_mode) : "") +
-                (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
-                (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
-                (mtp_last ? " mtplast 1" : "") + (dhead2 ? " dhead2 " + std::to_string(dhead2) : "") +
-                (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
-                (dfl_body_i4_on ? " dflbodyi4 1" : "") +
-                (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
-                (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "") + s2::kstopb_sig(kstop.b) +
-                (cp_step ? " cpsr " + std::to_string(cp_step) + (sc.cp_seg ? " seg" : "") : "") +
-                (g6_attn_ctx_sp() ? " ctxsp " + std::to_string(g6_attn_ctx_sp()) : "") + (g6_attn_posidx() ? " posidx 1" : "") +
-                // the S2 layers carry the shared-scope MoE finalize steering; every rank must (a rank without it would
-                // leave its share of the shared-expert correction out of batched steps)
-                (steering_boot.loaded && steering_boot.scope == steering::Scope::Shared ? " s2steer 1" : "") +
-                knob::signature();
+            g6s2::SigInputs sig;           // s2/signature.h
+            sig.model = g6s2::SigModel::Glm;
+            sig.s2_below = s2_below; sig.cap = cap; sig.layers_s = layers_s; sig.MP = MP; sig.two = two; sig.mtp = mtp;
+            sig.chunk = plan.chunk; sig.nc = nc; sig.pf_own = pf_own; sig.pf_qp = pf_qp; sig.qp_ctx = P.qp_ctx; sig.qp_min = pf_qp_min();
+            sig.set_id = set_id; sig.grammar = g6rt::grammar_ready(); sig.dfl_reuse = dfl_reuse; sig.dfl_reuse_min = dfl_reuse_min;
+            sig.ngram = s2::ngram_sig(ngram);
+            sig.kstop_mode = kstop.mode; sig.kstop_kmax = kstop.kmax; std::copy(kstop.tau, kstop.tau + 4, sig.kstop_tau); sig.kstop_seed3 = kstop.seed3;
+            sig.draft_par = draft_par; sig.qs_mode = qs_mode; sig.iq_split = iq_split; sig.mtp_split = mtp_split;
+            sig.dhead_on = dhead.on; sig.dhead_tpc = dhead.tpc; sig.dhead_ks = dhead.ks; sig.mtp_last = mtp_last; sig.dhead2 = dhead2;
+            sig.dfl_i4 = dfl_i4; sig.dfl_body_i4 = dfl_body_i4_on; sig.dfl_alpha = dfl_alpha;
+            sig.dsel_model = dsel_model; sig.dsel_tab = dsel_tab.str(); sig.kstopb = s2::kstopb_sig(kstop.b);
+            sig.cp_step = cp_step; sig.cp_seg = sc.cp_seg; sig.ctx_sp = g6_attn_ctx_sp(); sig.posidx = g6_attn_posidx();
+            sig.steer_shared = steering_boot.loaded && steering_boot.scope == steering::Scope::Shared;
+            sig.knobs = knob::signature();
+            bc.runtime_signature = g6s2::runtime_signature(sig);
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);

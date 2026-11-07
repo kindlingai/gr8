@@ -1,10 +1,11 @@
-// DS41 ranks that differ in the vision tower they loaded refuse at bootstrap (ds41_vision_id.h; g6m4.cu adds
-// ds41v::signature(vis_on, vis_id) to the DS41 runtime signature). Four ranks on loopback, each its own process: every rank
+// DS41 ranks that differ in the vision tower they loaded refuse at bootstrap (ds41_vision_id.h; g6m4.cu passes vis_on and
+// vis_id to the DS41 runtime signature, s2/signature.h). Four ranks on loopback, each its own process: every rank
 // with the same tower file boots, every rank without one boots (text-only), a rank without the file among ranks with it
 // refuses, and a rank with another tower file refuses. Host only. Model: ds41_agree_knobs_test.cpp.
 // Run: ds41_agree_vision_test engine/runtime/g6m4.cu
 #include "s2/bootstrap.h"
 #include "ds41_vision_id.h"
+#include "s2/signature.h"
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -36,7 +37,10 @@ static void tower(const std::string& path, const std::string& header, size_t bod
     if (!file.empty() && id.empty()) std::_Exit(2);
     BootstrapConfig c; c.rank = r; c.ranks = 4; c.timeout = 3; c.head_ip = "127.0.0.1"; c.port = port;
     c.directory = dir + "/r" + std::to_string(r); ::mkdir(c.directory.c_str(), 0700);
-    c.runtime_signature = "ds41 sessions 32 cap 327680 layers all mtp 0" + ds41v::signature(!file.empty(), id);
+    SigInputs s;
+    s.model = SigModel::Ds41; s.s2sess = 32; s.cap = 327680; s.layers_s = "all"; s.set_id = "ab12";
+    s.vis_on = !file.empty(); s.vis_id = id;
+    c.runtime_signature = runtime_signature(s);
     try { auto links = bootstrap(c); std::_Exit(0); }
     catch (const std::exception& e) {
         if (r == 0) { std::ofstream(why) << e.what(); }
@@ -66,11 +70,11 @@ int main(int argc, char** argv) {
     if (argc != 2) { std::fprintf(stderr, "usage: %s engine/runtime/g6m4.cu\n", argv[0]); return 2; }
     // g6m4.cu: the effective vision state and the file id go into the DS41 signature (not the knob)
     const std::string src = slurp(argv[1]);
-    const size_t a = src.find("bc.runtime_signature = std::string(s2sess > 1 ? \"ds41 sessions ");
+    const size_t a = src.find("sig.model = g6s2::SigModel::Ds41;");
     const size_t b = a == std::string::npos ? a : src.find("g6s2::serve_ds41(dc, bc", a);
     CHECK(a != std::string::npos && b != std::string::npos);
     if (a != std::string::npos && b != std::string::npos)
-        CHECK(src.substr(a, b - a).find("bc.runtime_signature += ds41v::signature(vis_on, vis_id);") != std::string::npos);
+        CHECK(src.substr(a, b - a).find("sig.vis_on = vis_on; sig.vis_id = vis_id;") != std::string::npos);
     CHECK(src.find("vis_id = ds41v::file_id(vpath);") != std::string::npos);
 
     char tmpl[] = "/tmp/ds41agreevisXXXXXX"; const std::string dir = mkdtemp(tmpl);

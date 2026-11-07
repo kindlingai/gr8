@@ -75,16 +75,6 @@ inline Find image_find(const g6::Pack& pack, const g6::DevImage& img)
         return t;
     };
 }
-// exlr8 v2 experts from the raw width files (--v2 DIR --v2-slices DIR --v2-widths FILE). With dense (--v2-dense DIR),
-// every other tensor comes from the release's dense and vocab files too, with no base pack. trellis keeps the trellis
-// matrices as the release's entries (engine/kernels/dtr.cuh, --v2-dense-form trellis); false rounds them to a
-// converted pack's MXFP8 / int4 forms. qo adds the GR8_PF_OWN=3 full-head tensors to the image. layout (--layout FILE)
-// says which pieces each rank holds (engine/loader-rs/src/layout.rs); empty: the formulas.
-struct V2Src
-{
-    std::string dir, slices, widths, dense, layout;
-    bool trellis = true, qo = false;
-};
 
 #ifdef G6_RS_LOADER
 #include <mutex>
@@ -344,28 +334,5 @@ inline void load_pack(g6::Pack& pack, const std::string& manifest, const std::st
             st.gb_per_s);
 }
 
-// comma-separated integers; "@file" reads them (comma or white space separated) from a file; "all" = 0..77
-inline std::vector<int> parse_ints(std::string s)
-{
-    std::vector<int> v;
-    if (s == "all") { for (int i = 0; i < geom::L_MAIN; ++i) v.push_back(i); return v; }
-    if (!s.empty() && s[0] == '@')
-    {
-        FILE* f = fopen(s.c_str() + 1, "r");
-        if (!f) die("cannot read " + s.substr(1));
-        int x;
-        while (fscanf(f, "%d%*[, \n\t]", &x) == 1) v.push_back(x);
-        fclose(f);
-        return v;
-    }
-    for (size_t p = 0; p < s.size();)
-    {
-        size_t q = s.find(',', p);
-        if (q == std::string::npos) q = s.size();
-        v.push_back(atoi(s.substr(p, q - p).c_str()));
-        p = q + 1;
-    }
-    return v;
-}
 
 }   // namespace g6rt
