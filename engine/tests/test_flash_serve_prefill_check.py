@@ -51,6 +51,7 @@ StepIn draft_in{};
 struct Context {
     Main main; Draft draft; FlashPrefill prefill{0}, prefill2{1};
     Fabric prefill_fabric, prefill_fabric2, draft_fabric; int stream = 0; StepIn* draft_input = &draft_in;
+    int cp_R = 0;   // GR8_CP off: no quantum runs on the staged view
 } c;
 struct Config { int prefill_rows = 8; bool two_lanes = true; } sc;
 struct Slot { struct { u64 id; } req; struct { unsigned slot; } key; };
@@ -99,6 +100,9 @@ void pf_draft_flash(Draft&, FlashPrefill&, int M, int pos0, const int*, u64& dst
 int main() {
     u64 pfseq = 1, pfseq2 = 1, dseq = 0;
     auto fence = [&] { events += 'F'; };
+    const bool cp_staging = false;
+    auto stage = [](bool) {};
+    auto solo_tables = [&](int q) { s2_solo_pages(c.main, c.main.s2->run[size_t(q)]); s2_solo_pages(c.draft.d, c.draft.d.s2->run[size_t(q)]); };
     auto check = [&] { events += 'C'; assert(!c.main.s2on && !c.draft.d.s2on); require(!word, "Flash serve fabric/attention error"); };
     std::vector<uint32_t> capture_at(2);   // GR8_GLM53F_CACHE: each session's checkpoint point (0: none)
     struct Pending { int q; std::vector<int> tokens; u64 req; };
