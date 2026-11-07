@@ -50,9 +50,10 @@ knobs:
     default: "0"
     values: "0.."
     doc: >-
-      0 = the Rust loader reads each file range with its own read. N > 0 = in read mode it sorts each chunk's ranges by
-      file offset and reads the ranges of one file that are at most N KB apart with one read, gaps included. Same
-      bytes. Measured gains by drive class: docs/SWITCHING.md.
+      0 = the Rust loader reads each file range with its own read. N > 0, with GR8_LOAD_MODE=read (the default; mmap
+      ignores it): it sorts each chunk's ranges by file offset and reads the ranges of one file that are at most N KB
+      apart with one read, gaps included, so it reads more of the file than it loads. Each worker thread then holds a
+      scratch buffer of about twice GR8_LOAD_CHUNK_MB. Same bytes. Measured gains by drive class: docs/SWITCHING.md.
   GR8_LOAD_MODE:
     scope: local
     kind: text
