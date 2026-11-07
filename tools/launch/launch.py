@@ -165,17 +165,19 @@ def cmd_down(argv):
     else:
         print('no handshake on this box: stopping this box only')
     pid = supervisor_running(out)
+    # the supervisor gives its engine quit_wait for an orderly quit (120 s when the quit stores the pool), as it
+    # recorded at its start (a store given only on the up command line)
+    qw = sv.recorded_quit_wait(out, o)
     if pid and pid > 0:
         os.kill(pid, signal.SIGTERM)
-        # the supervisor gives its engine quit_wait for an orderly quit (120 s when the quit stores the pool)
-        for _ in range(300 + 10 * sv.quit_wait(o)):
+        for _ in range(300 + 10 * qw):
             if not supervisor_running(out):
                 break
             time.sleep(0.1)
         else:
             print(f'the supervisor (pid {pid}) did not stop; killing it')
             os.kill(pid, signal.SIGKILL)
-    stopped = sv.stop_local(home, lambda s: print(s), sv.quit_wait(o))
+    stopped = sv.stop_local(home, lambda s: print(s), qw)
     print(f'this box: {"stopped" if pid or stopped else "nothing was running"}')
     return 0
 

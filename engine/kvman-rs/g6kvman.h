@@ -111,6 +111,10 @@ void g6kv_stores(g6kv_pool* p, uint32_t shared_after);
 // quit that stores the pool brings sessions back). index_dir (or NULL): the tier's shared prefixes survive
 // restarts while `compat` stays the same. 0, or -1 with g6kv_tier_error.
 int g6kv_add_tier(g6kv_pool* p, uint64_t slots, int32_t keep, const char* index_dir, const char* compat);
+// after the last g6kv_add_tier: an index run waits (slots held) for a base a later tier may bring back; this drops
+// the runs whose base came back in no tier, records and all. Returns how many. + 4 needs index_dir: without it the
+// tier keeps a prefixes-only index
+uint64_t g6kv_tiers_loaded(g6kv_pool* p);
 // at admission, before the grant, on every rank: counts the prompt toward its prefixes and returns how many
 // span: the prompt's system span in tokens (the system message and tool definitions as templated), or -1 when the
 // front end sent none

@@ -427,6 +427,11 @@ impl Pool {
         Ok(())
     }
 
+    /// After the last add_tier(): drops the index runs whose base came back in no tier (stash.rs Stash::loaded).
+    pub fn tiers_loaded(&mut self) -> usize {
+        self.stash.as_mut().map_or(0, |s| s.loaded())
+    }
+
     pub fn stash(&self) -> Option<&Stash> {
         self.stash.as_ref()
     }

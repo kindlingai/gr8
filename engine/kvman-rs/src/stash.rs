@@ -48,7 +48,7 @@
 use crate::pool::{Kept, PAGE};
 use crate::reuse::Finished;
 use crate::tier::SlotAlloc;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -229,6 +229,9 @@ pub struct Stash {
     grid: u64,
     next_id: u64,
     pin: Vec<u64>,
+    // index runs whose base is not loaded yet (tier, entry): their slots stay claimed until a later tier brings the
+    // base (evict() moves an entry on to a later tier) or loaded() drops them
+    waiting: Vec<(usize, Entry)>,
     pub index_errors: u64,
     // the write limit: blocks per 1000 pages computed (0 = none), and the credit in thousandths of a block
     limit_milli: u64,
@@ -266,6 +269,7 @@ impl Stash {
             grid: if grid == 0 { GRID } else { grid },
             next_id: 1,
             pin: Vec::new(),
+            waiting: Vec::new(),
             index_errors: 0,
             limit_milli: 0,
             credit: 0,
@@ -288,24 +292,31 @@ impl Stash {
             policy: Policy::default(),
         };
         if let Some((mut ix, loaded)) = index {
-            // a run stored on a prefix comes back only with its prefix (in this tier or one before it). The records come
-            // in write order, and a compaction or a move can write a base after the runs on it, so the runs wait for
-            // passes until their base is in (a base never comes back: they stay out)
-            let mut ids: Vec<u64> = self.tiers.iter().flat_map(|x| &x.entries).map(|e| e.id).collect();
-            let mut wait: Vec<Entry> = loaded;
+            // a run stored on a prefix comes back only with its prefix, in this tier or any other (evict() moves an
+            // entry on to a LATER tier, so a base can be in a tier added after the run's). The records come in write
+            // order, and a compaction or a move can write a base after the runs on it, so the runs wait for passes
+            // until their base is in. A run whose base is in no tier so far keeps its slots claimed and waits for the
+            // later tiers (retry_waiting); loaded() drops what never finds its base
+            let mut ids: HashSet<u64> = self.tiers.iter().flat_map(|x| &x.entries).map(|e| e.id).collect();
+            let mut wait: Vec<Entry> = Vec::new();
+            for e in loaded {
+                if e.slots.iter().all(|&s| s < slots) && t.alloc.claim(&e.slots) {
+                    self.next_id = self.next_id.max(e.id + 1);
+                    wait.push(e);
+                } else if ix.drop(e.id).is_err() {
+                    // slots past the tier or taken twice: its record goes, so no later boot reads blocks reused since
+                    self.index_errors += 1;
+                }
+            }
             loop {
                 let before = wait.len();
                 let mut rest = Vec::new();
                 for e in wait {
                     if e.base.is_some_and(|b| !ids.contains(&b.0)) {
                         rest.push(e);
-                    } else if e.slots.iter().all(|&s| s < slots) && t.alloc.claim(&e.slots) {
-                        ids.push(e.id);
-                        self.next_id = self.next_id.max(e.id + 1);
+                    } else {
+                        ids.insert(e.id);
                         t.entries.push(e);
-                    } else if ix.drop(e.id).is_err() {
-                        // slots past the tier or taken twice: its record goes, so no later boot reads blocks reused since
-                        self.index_errors += 1;
                     }
                 }
                 wait = rest;
@@ -313,11 +324,8 @@ impl Stash {
                     break;
                 }
             }
-            for e in wait {
-                if ix.drop(e.id).is_err() {
-                    self.index_errors += 1;
-                }
-            }
+            let ti = self.tiers.len();
+            self.waiting.extend(wait.into_iter().map(|e| (ti, e)));
             // the counts live in the first index
             if !self.tiers.iter().any(|x| x.index.is_some()) {
                 for (&k, &c) in &ix.counts {
@@ -328,6 +336,42 @@ impl Stash {
             t.index = Some(ix);
         }
         self.tiers.push(t);
+        self.retry_waiting();
+    }
+
+    // the waiting runs whose base is now in some tier join their tier, until a pass places none
+    fn retry_waiting(&mut self) {
+        let mut ids: HashSet<u64> = self.tiers.iter().flat_map(|x| &x.entries).map(|e| e.id).collect();
+        loop {
+            let before = self.waiting.len();
+            for (ti, e) in std::mem::take(&mut self.waiting) {
+                if e.base.is_some_and(|b| !ids.contains(&b.0)) {
+                    self.waiting.push((ti, e));
+                } else {
+                    ids.insert(e.id);
+                    self.tiers[ti].entries.push(e);
+                }
+            }
+            if self.waiting.is_empty() || self.waiting.len() == before {
+                break;
+            }
+        }
+    }
+
+    /// After the last add_tier: the index runs whose base came back in no tier are dropped (slots freed, records
+    /// gone), so no later boot reads blocks reused since. Returns how many.
+    pub fn loaded(&mut self) -> usize {
+        let gone = std::mem::take(&mut self.waiting);
+        for (ti, e) in &gone {
+            let t = &mut self.tiers[*ti];
+            t.alloc.release(&e.slots);
+            if let Some(ix) = &mut t.index {
+                if ix.drop(e.id).is_err() {
+                    self.index_errors += 1;
+                }
+            }
+        }
+        gone.len()
     }
 
     pub fn tiers(&self) -> usize {
@@ -1226,6 +1270,7 @@ fn decode(p: &[u8]) -> Option<Record> {
                 e.base = (b != u64::MAX).then_some((b, bp as usize));
                 e.hits = hits;
                 let (logical, own, rep) = (c.u32()?, c.u32()?, c.u32()?);
+                // a tail always has logical pages (own and rep count parts of them), so logical 0 is no tail
                 e.tail = (logical > 0).then_some(Tail { logical, own, rep });
                 e.namespace.copy_from_slice(c.take(crate::pool::NAMESPACE_BYTES)?);
             }

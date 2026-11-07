@@ -466,6 +466,10 @@ class Supervisor:
         self.locked = True
         with open(os.path.join(self.out, 'supervisor.pid'), 'w') as f:
             f.write(f'{os.getpid()}\n')
+        # gr8 down reads this box's quit wait here: a store given only on the up command line is in self.o, not in
+        # the environment down parses
+        with open(os.path.join(self.out, 'quit_wait'), 'w') as f:
+            f.write(f'{quit_wait(self.o)}\n')
         for p in ('handshake.json', 'gr8.state'):
             try:
                 os.unlink(os.path.join(self.out, p))
@@ -1284,7 +1288,8 @@ def signal_pid(pid, sig, name, log=log):
 
 def quit_wait(o):
     """Seconds an engine gets for its orderly quit before SIGTERM: 120 with a persist=on ssd store that keeps sessions
-    (KV_STORE keep=sessions or all, or KV_KEEP): the quit stores the pool's runs there for the next boot. Else 10."""
+    (KV_STORE keep=sessions or all, or KV_KEEP): the quit stores the pool's runs there for the next boot. Else 10.
+    The engine also needs --set-id for that store's index; the launcher always passes one (modelset.py set_id)."""
     try:
         stores = opt.kv_stores(o)
     except Exception:
@@ -1292,6 +1297,15 @@ def quit_wait(o):
     keep = o.get('KV_KEEP') or 'system'
     whole = any(t['kind'] == 'ssd' and t.get('persist') and (t.get('keep') or keep) != 'system' for t in stores)
     return 120 if whole else 10
+
+
+def recorded_quit_wait(out, o):
+    """The quit wait the running supervisor recorded at its start (out/quit_wait), else quit_wait(o)."""
+    try:
+        with open(os.path.join(out, 'quit_wait')) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return quit_wait(o)
 
 
 def stop_local(home, log=log, quit_s=10):

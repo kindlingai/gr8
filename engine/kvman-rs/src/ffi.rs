@@ -608,6 +608,12 @@ pub unsafe extern "C" fn g6kv_add_tier(
     }
 }
 
+/// After the last g6kv_add_tier: drops the index runs whose base came back in no tier. Returns how many.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tiers_loaded(p: *mut Handle) -> u64 {
+    (*p).lock().tiers_loaded() as u64
+}
+
 /// At admission, before the grant, on every rank: counts the prompt toward the prefixes it starts. Returns how many.
 /// span: its system span in tokens, or -1 for none.
 ///

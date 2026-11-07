@@ -1023,5 +1023,14 @@ class QuitWait(unittest.TestCase):
         self.assertEqual(self.wait(KV_STORE='ssd:/nvme/kv,size=64G,persist=on,keep=system', KV_KEEP='all'), 10)
         self.assertEqual(self.wait(KV_STORE='ssd:/nvme/kv,size=64G,keep=sessions'), 10)   # not kept across a boot
 
+    def test_down_takes_the_wait_the_supervisor_recorded(self):
+        import tempfile
+        o = opt.parse([], environ={'GR8_WORK_DIR': '/tmp/gr8-qw'})   # down's own parse sees no store
+        with tempfile.TemporaryDirectory() as out:
+            self.assertEqual(S.recorded_quit_wait(out, o), 10)
+            with open(os.path.join(out, 'quit_wait'), 'w') as f:
+                f.write('120\n')   # the store was given on the up command line only
+            self.assertEqual(S.recorded_quit_wait(out, o), 120)
+
 if __name__ == '__main__':
     unittest.main()

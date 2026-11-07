@@ -1166,3 +1166,45 @@ fn the_quit_drain_stores_the_pool_past_the_write_limit() {
     assert!(stored(Some(0)) > 0, "with the limit off, the drain stores them");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// evict() moves an entry on to a later tier, so a run's base can be in a tier added after the run's: the run waits
+// for it (slots held) and joins its tier when the base comes back; loaded() drops a run whose base came back nowhere,
+// record and all, so no later boot reads its reused blocks
+#[test]
+fn a_run_whose_base_is_in_a_later_tier_comes_back_and_a_lost_base_drops_it() {
+    use g6kvman::stash::{Entry, Index, Stash};
+    let root = std::env::temp_dir().join(format!("g6kv-later-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (a, b) = (root.join("a"), root.join("b"));
+    let entry = |id: u64, kind: Kind, slots: Vec<u64>, base: Option<(u64, usize)>| Entry {
+        id,
+        kind,
+        key: id,
+        st: Finished { history: toks(id as i32, 64), valid: 64, written_end: 64, pf_end: 64 },
+        slots,
+        base,
+        hits: 1,
+        tail: None,
+        namespace: g6kvman::pool::STOCK_NAMESPACE,
+    };
+    let write = |dir: &std::path::Path, e: &Entry| {
+        let (mut ix, _) = Index::open(dir, "later").unwrap();
+        ix.add(e).unwrap();
+    };
+    write(&a, &entry(7, Kind::Evicted, vec![0, 1], Some((3, 2))));
+    write(&b, &entry(3, Kind::Prefix, vec![5, 6], None));
+    let load = |with_b: bool| {
+        let mut s = Stash::new(2, 64);
+        s.add_tier(16, Keep::All, Some(Index::open(&a, "later").unwrap()));
+        assert!(s.entries(0).is_empty(), "the run waits for its base");
+        if with_b {
+            s.add_tier(16, Keep::All, Some(Index::open(&b, "later").unwrap()));
+        }
+        let gone = s.loaded();
+        (s.entries(0).iter().map(|e| e.id).collect::<Vec<_>>(), gone)
+    };
+    assert_eq!(load(true), (vec![7], 0), "the base in the later tier brings the run back");
+    assert_eq!(load(false), (vec![], 1), "no tier brought the base: dropped");
+    assert!(Index::open(&a, "later").unwrap().1.is_empty(), "and its record is gone");
+    let _ = std::fs::remove_dir_all(&root);
+}

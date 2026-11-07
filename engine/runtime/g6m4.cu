@@ -2907,6 +2907,8 @@ int main(int argc, char** argv)
                     fprintf(stderr, "# rank %d: s2 store %zu: %s, %llu blocks of %zu B, keep %s%s\n", R, i, kvt->describe(i).c_str(),
                             (unsigned long long)slots, kvt->blocks().slot_bytes(), keep.c_str(), index.empty() ? "" : ", indexed");
                 }
+                if (const uint64_t gone = pool.tiers_loaded())
+                    fprintf(stderr, "# rank %d: s2 stores: %llu stored runs dropped, their base came back in no store\n", R, (unsigned long long)gone);
                 pool.write_limit((uint64_t)std::llround(kv_write_limit * 1000));
                 // a run past R keeps its tail: each rank's shard and the replicated parts (only when the pool's R is the CP
                 // map's, so the pages past it are the sharded ones)
@@ -3676,9 +3678,23 @@ int main(int argc, char** argv)
                 {
                     const long long t0 = g6s2::s2_wall_ms();
                     pool.write_limit(0);
-                    const auto all = pool.reserve((uint64_t)cap, (uint64_t)cap);
+                    kv_drain();   // reserve fails while store copies are queued (g6kvman.h): run them first
+                    // the whole pool in one reserve; when that does not fit (rows a run still holds), take it in
+                    // chunks, each evicting what it needs, until no chunk fits. Every rank makes the same calls
+                    std::vector<g6s2::Run> held;
+                    try { held.push_back(pool.reserve((uint64_t)cap, (uint64_t)cap)); }
+                    catch (const std::exception&)
+                    {
+                        for (uint64_t rows = (uint64_t)cap / 2; rows >= 64; rows /= 2)
+                            for (;;)
+                            {
+                                kv_drain();
+                                try { held.push_back(pool.reserve(rows, rows)); }
+                                catch (const std::exception&) { break; }
+                            }
+                    }
                     kv_drain();
-                    pool.release(all);
+                    for (const auto& r : held) pool.release(r);
                     kv_drain();
                     size_t n = 0;
                     uint64_t pages = 0;
