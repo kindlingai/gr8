@@ -496,9 +496,8 @@ inline void parse(int argc, char** argv, EngineOptions& o)
     }
 #if G6_MODEL_DS41
     // Parse before CUDA, fabric or weights. Unset decode cut inherits the main cut.
+    const int ds_moe_main_topk = o.ds_moe_main_topk = (int)knob::ds_moe_topk();   // the knob table refuses a bad value
     std::string moe_topk_error;
-    const int ds_moe_main_topk = o.ds_moe_main_topk = (int)knob::ds_moe_topk();   // ds41_moe_ops.cuh topk_cut_env: the table refuses a bad value
-    if (ds_moe_main_topk < 0) refuse(moe_topk_error);
     const int ds_moe_decode_topk = o.ds_moe_decode_topk = ds41_moe_topk::decode_env(ds_moe_main_topk, geom::TOPK, &moe_topk_error);
     if (ds_moe_decode_topk < 0) refuse(moe_topk_error);
     fprintf(stderr, "# rank %d ds41 moe topk main %d decode %d\n", cfg.rank, ds_moe_main_topk, ds_moe_decode_topk);
