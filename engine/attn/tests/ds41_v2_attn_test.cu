@@ -83,13 +83,13 @@ void projection_test() {
     cf.comp=a.alloc<bf16>(cap*HD);co.comp=a.alloc<bf16>(cap*HD);cf.kvs=a.alloc<float>(2*HD);co.kvs=a.alloc<float>(2*HD);
     cf.scs=a.alloc<float>(2*HD);co.scs=a.alloc<float>(2*HD);auto* norm=a.alloc<bf16>(HD);std::vector<bf16> ones(HD,bf16(1.f));CK(cudaMemcpy(norm,ones.data(),HD*2,cudaMemcpyHostToDevice));w.c_norm=norm;
     auto* inv=a.alloc<float>(32); w.inv=inv;auto* pos=a.alloc<int>(M);std::vector<int> pv(M);for(int r=0;r<M;++r)pv[r]=start+r;CK(cudaMemcpy(pos,pv.data(),M*4,cudaMemcpyHostToDevice));
-    // Compare state machinery with identical gathered inputs, not lossy vs
-    // unquantized fp4 boundary decisions (the end-to-end eval owns that gate).
-    CK(cudaMemcpyAsync(sf.ckv,own.ckv,size_t(M)*HD*4,cudaMemcpyDeviceToDevice));CK(cudaMemcpyAsync(sf.csc,own.csc,size_t(M)*HD*4,cudaMemcpyDeviceToDevice));
-    auto gathered=own; gathered.ckv=sf.ckv;gathered.csc=sf.csc;
-    v2::comp_row_rest(w,cf,sf,gathered,M,0,0,pos);v2::comp_row_rest(w,co,so,own,M,0,0,pos);CK(cudaDeviceSynchronize());
-    close("ratio2 odd-start gathered pooling",host(co.comp,cap*HD),host(cf.comp,cap*HD),.003f);
-    close("ratio2 carry",host(co.kvs,2*HD),host(cf.kvs,2*HD),.003f);
+    // Independent stock compressor computes its own projections; v2 consumes
+    // the gathered pre-wire projections. Lossy wire quality is the model gate.
+    comp_row(w,cf,sf,y,M,0,0,pos);
+    v2::comp_row_rest(w,co,so,full,M,0,0,pos);CK(cudaDeviceSynchronize());
+    close("ratio2 odd-start pool vs stock",host(co.comp,cap*HD),host(cf.comp,cap*HD),.003f);
+    close("ratio2 carry vs stock",host(co.kvs,2*HD),host(cf.kvs,2*HD),.003f);
+
 }
 void output_test(int M) {
     Arena a;const int nr=4,Q=(M+nr-1)/nr,heads=16,K=v2::output_width(heads),stride=v2::output_stride(heads);
@@ -118,4 +118,4 @@ void output_test(int M) {
     }
 }
 }
-int main(){ ds41a::g_use_tc=true;test::wire_test();test::projection_test();test::output_test(65);test::output_test(128);CK(cudaGetLastError());puts("PASS v2 attention synthetic tolerance/layout suite; model quality and fabric speed NOT measured"); }
+int main(){ ds41a::g_use_tc=true;test::wire_test();test::projection_test();test::output_test(65);test::output_test(128);test::output_test(2);CK(cudaGetLastError());puts("PASS v2 attention synthetic tolerance/layout suite; model quality and fabric speed NOT measured"); }
