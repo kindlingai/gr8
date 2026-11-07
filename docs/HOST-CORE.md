@@ -656,14 +656,16 @@ checkpoint suffix joins it after the store is made, and the strings the other bu
 
 Checked on Linux (GCC 12, x86_64). `signature_vectors_test` was recorded from the three expressions as they were
 (bd1a1201): 20,000 strings a model, the hashes the same after the move. `options_vectors_test` runs `options_cases.txt`
-(19 GLM, 16 Flash and 9 DS41 launcher lists, then 100, 99 and 105 mutations), each case in its own process: GLM in the
-default shape and at TP4 119 cases, Flash 115, DS41 114. `scripts/check_args.py` ran the same cases through the base
-commit's engines (with `--check-args` added to GLM and Flash at the new exit point, for the comparison only) and through
-R6a's on a GB10: of 348 transcripts, 337 are byte-identical. The other 11 are the changes above: a steering refusal
-after the parse's lines, or the parse's refusal before main's (three GLM cases, one Flash, one DS41), and the six DS41
-cases (an empty or unreadable prompt, a prompt past `--cap`, a QP flag) that DS41's old exit passed.
-`scripts/host_tests.sh` and `cargo test --release --workspace` pass. The GLM, Flash and DS41 engines build on a GB10.
-Boot pending.
+(19 GLM, 16 Flash and 9 DS41 launcher lists, then 102, 100 and 106 mutations), each case in its own process: 121 GLM
+cases in the default (TP6) shape and at TP4, 116 Flash, 115 DS41. The TP6 shape's GLM mutations start from the TP4 list
+with `GR8_PF_OWN=3`, which TP6 takes. `scripts/check_options_coverage.py` reads every shape's transcripts: each of the
+93 reachable refusals is reached, and the 7 no case can reach are listed with the reason. `scripts/check_args.py` ran
+the same cases through the base commit's engines (built with `scripts/check_args_base.patch`, which adds `--check-args`
+to GLM and Flash at the new exit point) and through R6a's on a GB10: of 352 transcripts, 341 are byte-identical. The
+other 11 are the changes above: a steering refusal after the parse's lines, or the parse's refusal before main's (three
+GLM cases, one Flash, one DS41), and the six DS41 cases (an empty or unreadable prompt, a prompt past `--cap`, a QP
+flag) that DS41's old exit passed. `scripts/host_tests.sh` and `cargo test --release --workspace` pass. The GLM, Flash
+and DS41 engines build on a GB10. Boot pending.
 
 ### R7. Step sizes
 
