@@ -126,7 +126,9 @@ namespace ds41::v2 {
 // Per-model ownership: conductor owns streams/events/fabric and own mHC state;
 // A/B own their numerical scratch, referenced through attn/ffn. No two-lane
 // aliases. st is borrowed; cs and the events are created/destroyed here.
+struct Timing;
 struct State {
+    Timing* timing = nullptr;
     cudaStream_t st = nullptr, cs = nullptr;
     cudaEvent_t produced[int(Coll::Count)] = {}, received[int(Coll::Count)] = {};
     g6::Fabric* fabric = nullptr;
