@@ -73,7 +73,7 @@ returning, including orchestration:
   TP=4, one build with the knob off and on, gen cache warm, two starts each way. On a DGX Spark's own NVMe, a rank's
   load went from 14.2-14.8 s (the 15 s above) to 11.8-11.9 s. On the PCIe Gen4 NVMe of the other two boxes, a rank's
   load went from 58.5-60.4 s to 57.3-58.9 s, 2-3%. Those boxes set each start: ready after `up -d` returned went
-  from 70.2-70.5 s to 68.8-68.9 s. The default is 0 (off).
+  from 70.1-70.5 s to 68.8-68.9 s. The default is 0 (off).
 - First starts, which write the gen cache, from `up -d` returning to ready: DeepSeek 226 s, 79.6 GB on each box's
   disk; GLM-5.3 73 s, 4.8 GB a box. At TP=4 GLM-5.3 computes few tensors at load, so its gen cache saves little.
   The gen cache is keyed on the engine binary, so the first start after any image change also writes it. The warm
