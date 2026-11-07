@@ -27,8 +27,8 @@ struct PoolHooks {
     // runs; held to ops.max_run_pages), and the driver its own (driver.h DriverPool): growth, a worker's half of a
     // shrink, and a leaving session's release when nothing is retained. Required
     RunPool* pool = nullptr;
-    // the module's pool policy (PoolOps, pool_ops.h). Unset: a table over the members below (FnPool), which must then be
-    // empty and at their defaults when it is set
+    // the module's pool policy (PoolOps, pool_ops.h). When it is set, the members below stay empty. Unset: FnPool builds
+    // a table over them
     g6s2_pool_ops ops{};
     // optional (remote rows release): why a stalled request past R does not fit its page classes; empty = no reason
     std::function<std::string(uint64_t worst, uint32_t r)> refusal;

@@ -616,7 +616,7 @@ std::vector<Scenario> scenarios() {
 }
 
 struct Expect { const char* name; uint64_t h[2]; };
-// recorded from the service before PoolOps (git 5ae7cebf), the pool's plain calls logged
+// recorded from the service before PoolOps (git 51569016), the pool's plain calls logged
 #if G6_MODEL_DS41
 const Expect EXPECT[] = {{"reuse", {12273334368408301276ull, 1903311641579599510ull}},
                          {"park", {5353181497655196732ull, 9462988945752174063ull}}};

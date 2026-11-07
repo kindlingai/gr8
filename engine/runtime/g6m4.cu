@@ -3191,7 +3191,7 @@ int main(int argc, char** argv)
             GLM_CAPTURES(G6S2_CAPTURE_TYPE)
             uint32_t big = 0;   // GR8_CP_R2_BIG, with GR8_CP_R2
 #define GLM_POOL_ONLY(X) X(cap) X(rt_runs) X(cp_R2) X(big)
-#define GLM_POOL_CAPTURES(X) X(pool) X(rtt) X(m) X(D) GLM_POOL_ONLY(X)
+#define GLM_POOL_CAPTURES(X) X(pool) X(m) X(D) GLM_POOL_ONLY(X)
             GLM_POOL_ONLY(G6S2_CAPTURE_TYPE)
             struct GlmPool : g6s2::ModuleCtx
             {
