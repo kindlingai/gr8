@@ -121,6 +121,7 @@ struct Ds41V2Engine {
             const bool eg=bool(m.engram) && geom::is_engram(l),last=i+1==late_i;
             auto* idx=ds41_idx_detail::find(m,false);
             const bool cand=l==geom::CAND_SOURCE && idx && !ds41_idx_detail::cand_skipped(*idx,3);
+            timing_layer(v,l);
             begin_layer(v,g,eg,geom::is_index_source(l),last&&!skip_late,cand);
             if(eg)engram(m,i);
             if(!prepared)prepare(m,i,false);

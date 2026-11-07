@@ -1787,7 +1787,9 @@ int main(int argc, char** argv)
                 const size_t range_a_end = skip_late ? split.b - 1 : split.b;
                 ds41::Stop stop;
                 if (pf_v2) {
+                    ds41::v2::timing_begin_chunk(v2engine.v,c.request,c.first,c.rows);
                     v2engine.run(m,(int)c.rows,split.i_late,skip_late);
+                    ds41::v2::timing_end_chunk(v2engine.v);
                 } else stop = ds41_run_pass(split.ops, 0, range_a_end, &m, (int)c.rows, st, span_pass);
                 if (!stop.stopped && split.on() && !skip_late) {   // range B: the layers >= 21 over the chunk's last `late` rows (now rows 0 .. late-1)
                     ds41_attn_set_win_floor(ds41::br::win_floor((int)c.context, (int)c.rows, pf_tail));
@@ -1805,6 +1807,9 @@ int main(int argc, char** argv)
                 if (dsk.on()) { m.dsp.main_lo = 0; m.dsp.main_hi = -1; }
             };
             dc.after_prefill = [&](const g6s2::Ds41PrefillChunk& c) {
+                // Native already fenced the chunk. Retire diagnostics here so
+                // arbitrary prompt lengths cannot exhaust the bounded ring.
+                if(pf_v2)ds41::v2::timing_report(v2engine.v,c.request);
                 std::vector<dsr::ExpertLogRec> records;
                 const int n = ds41moe::elog_read(&m, records, true);
                 g6s2::require(n >= 0, "DS41 prefill distinct-expert counter read failed");
