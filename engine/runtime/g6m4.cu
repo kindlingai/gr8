@@ -101,7 +101,8 @@
 #endif
 #include <algorithm>
 #include <chrono>
-#include "engine_opts.h"
+#include "engine_options.h"
+#include "fabric_plan.h"
 #include "../knobs-rs/gr8_knobs.h"
 #include "packfind.h"
 #include "weight_check.cuh"
@@ -133,6 +134,7 @@ bool ds41_c2_trace_on();
 #include "s2/flash_checkpoint.h"   // GR8_GLM53F_CACHE parsed in every build, refused outside Flash
 #include "s2/flash_dfl_window.h"   // the Flash serve's DFlash2 prompt context (with GR8_GLM53F_CACHE hits)
 #include "s2/cp_rows.h"
+#include "s2/signature.h"
 #include "s2/pool.h"
 #include "s2/kv_tier.cuh"
 #include "rt_rows.cuh"
@@ -145,14 +147,12 @@ bool ds41_c2_trace_on();
 
 using namespace g6rt;
 
-static std::vector<std::string> split(const std::string& s, char c)
-{
-    std::vector<std::string> v;
-    size_t a = 0, b;
-    while ((b = s.find(c, a)) != std::string::npos) { v.push_back(s.substr(a, b - a)); a = b + 1; }
-    if (a < s.size()) v.push_back(s.substr(a));
-    return v;
-}
+static_assert(g6mod::INFO.dfl_drafts == dfl::K && g6mod::INFO.dfl_rep == int(dfl::REP) && g6mod::INFO.tp_sort == glue::TP_SORT,
+              "module_info.h's copies of the device-header constants");
+#if G6_MODEL_DS41
+static_assert(g6mod::INFO.ds_markov_maxs == ::ds41dsp::MARKOV_MAXS && dsr::TOPK == geom::TOPK,
+              "module_info.h's copies of the device-header constants");
+#endif
 
 int main(int argc, char** argv)
 {
@@ -165,679 +165,114 @@ int main(int argc, char** argv)
     };
     setvbuf(stdout, nullptr, _IOLBF, 0);
     pf_env_check();                    // strict GR8_PF_* choices: a bad value exits before any work
-    // GR8_MOE_TOPK (model change, screen arm): unset = the model's top-k (8, the table's default)
+    EngineOptions eo;                  // engine_options.h: argv and the knob table, every parse-time check
+    if (const std::string e = parse_engine_options(argc, argv, eo); !e.empty()) die(e);
+    const g6::FabricConfig& cfg = eo.cfg;
+    const std::vector<std::string>& pf_ips2 = eo.pf_ips2;
+    const std::string &manifest = eo.manifest, &packfile = eo.packfile;
+    V2Src& v2src = eo.v2src;
+    const std::string &qp_man = eo.qp_man, &qp_file = eo.qp_file, &dfl_man = eo.dfl_man, &dfl_file = eo.dfl_file;
+    const int &dfl_sel = eo.dfl_sel, &dfl_k = eo.dfl_k;
+#if G6_MODEL_FLASH
+    const bool& spec_reset_per_request = eo.spec_reset_per_request;
+#endif
+    const Plan& plan = eo.plan;
+    const bool &image = eo.image, &hash = eo.hash, &reuse_prefix = eo.reuse_prefix;
+    const std::string& s2dir = eo.s2dir;
+    const std::string& grammar_dir = eo.grammar_dir;
 #if !G6_MODEL_DS41
-    static_assert(geom::TOPK == 8, "GR8_MOE_TOPK's default and range (knobs/decode.yaml) are the model's top-k");
+    const std::vector<std::string>& kv_tiers = eo.kv_tiers;
+#endif
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41
+    const std::string& kv_keep = eo.kv_keep;
+    const int& kv_system_after = eo.kv_system_after;
+    const double& kv_write_limit = eo.kv_write_limit;
+#endif
+    const std::string& kv_format = eo.kv_format;
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41
+    const bool& kv_old = eo.kv_old;
+#endif
+    const std::string& set_id = eo.set_id;
+    const std::string& steering_force_s = eo.steering_force_s;
+    const int &s2port = eo.s2port, &s2sess = eo.s2sess;
+    const unsigned long long& s2epoch = eo.s2epoch;
+    const int &cap = eo.cap, &top = eo.top, &nc = eo.nc, &mtp = eo.mtp, &MP = eo.MP, &lanes = eo.lanes;
+    const float& temp = eo.temp;
+    const bool &graph = eo.graph, &wide = eo.wide, &pfv2 = eo.pfv2;
+    const std::string &layers_s = eo.co.layers_s, &qo_man = eo.co.qo_man, &qo_file = eo.co.qo_file;
+    const bool &release = eo.release, &s2mode = eo.s2mode, &dfl = eo.dfl;
+    const int& K = eo.K;
+    const std::vector<int>& layers = eo.layers;
+    const bool& progress_isolate = eo.progress_isolate;
+#if G6_MODEL_FLASH
+    const int& route_split_mode = eo.route_split_mode;
 #endif
 #if G6_MODEL_DS41
-    const int c8_pack_env = knob::ds_c8pack() ? 1 : 0;
+    const int& c8_pack_env = eo.c8_pack_env;
+#endif
+    SpecLen& spec = eo.spec;
+#if G6_MODEL_FLASH
+    const SpecLen& spec_initial = eo.spec_initial;
+#endif
+    const int& rt_win = eo.rt_win;
+#if !G6_MODEL_DS41
+    s2::KStop& kstop = eo.kstop;
 #endif
 #if G6_MODEL_FLASH
-    if (const int tk = (int)knob::moe_topk(); tk < geom::TOPK)
-        fprintf(stderr, "# GR8_MOE_TOPK=%d: routed experts per token cut %d -> %d, weights renormalized (screen arm)\n",
-                tk, geom::TOPK, tk);
-#elif G6_MODEL_DS41
-    if (knob::moe_topk() != 8) die("GR8_MOE_TOPK is a Flash-model option: DeepSeek-V4.1 reads GR8_DS_MOE_TOPK");
-    if (knob::pf_router_split()) die("GR8_PF_ROUTER_SPLIT is a Flash-model option");
-#else
-    if (knob::moe_topk() != geom::TOPK) die("GR8_MOE_TOPK is a Flash-model option (this build is the GLM model)");
-    if (knob::pf_router_split()) die("GR8_PF_ROUTER_SPLIT is a Flash-model option (this build is the GLM model)");
-#endif
-#if G6_MODEL_FLASH
-    const int route_split_mode = flash_route_split_mode();     // GR8_PF_ROUTER_SPLIT: strict 0/1, a bad value dies before any load
-#endif
-    const bool progress_isolate = knob::progress_isolate();   // other threads stay off the proxy CPUs (progress_cpus.h)
-    g6::FabricConfig cfg;
-    std::vector<std::string> pf_ips2;   // --pf-ips2: rail-1 addresses of the prefill fabrics only (GR8_PF_STRIPE dual-rail)
-    std::string manifest, packfile;
-    V2Src v2src;
-    g6rt::CommonOpts co;                // every flag m4sim takes too, parsed in engine_opts.h
-    std::string qp_man, qp_file;        // --qp-manifest/--qp-pack: this rank's pair weights, GR8_PF_OWN=4
-    std::string dfl_man, dfl_file;      // --dflash-manifest/--dflash-pack: the DFlash2 drafter (engine/loader-rs/src/dflash2.rs)
-    int dfl_sel = -1;                   // --dflash-sel: 1 = selector walk, 0 = argmax, -1 = the pack decides
-    int dfl_k = dfl::K;                 // --dflash-k: drafts a round verifies (1..7; the drafter always drafts 7)
-#if G6_MODEL_FLASH
-    bool spec_reset_per_request = false; // offline evaluation: no adaptive history from earlier requests
-    bool spec_fixed = false;            // --spec-fixed: Flash --mtp K verifies all K drafts every round
-#endif
-    Plan plan;
-    bool image = false, hash = true, reuse_prefix = false;
-#if G6_MODEL_DS41
-    bool check_args = false;            // --check-args: parse and refuse as a boot would, then exit 0 before any CUDA work
-#endif
-    bool lanes_explicit = false;        // --pf-lanes given (common_arg parses it)
-    std::string s2dir;                  // --serve DIR: serve through S2 (below R)
-    std::string grammar_dir;            // --grammar-dir DIR: request grammars (grammar.h)
-    std::vector<std::string> kv_tiers;  // --kv-store (and the deprecated --kv-tier), in flag order
-    std::string kv_keep;                // --kv-keep system|sessions|all
-    int kv_system_after = 2;            // --kv-system-after
-    double kv_write_limit = 0;          // --kv-write-limit F
-    std::string kv_format;              // --kv-format fp8|int4: which latent row this binary was built for (refused otherwise)
-    bool kv_old = false, kv_old_all = false;   // a deprecated --kv-tier, and whether one kept evicted runs
-    std::string set_id;                 // --set-id HEX: joins the S2 bootstrap agreement
-    std::string steering_dir, steering_force_s;
-    std::string steering_model_revision, steering_tokenizer_revision, steering_template_digest, steering_weight_set, steering_template_file;
-    int s2port = 0, s2sess = G6_MODEL_FLASH ? 1 : 8;
-    unsigned long long s2epoch = 1;
-    for (int i = 1; i < argc; ++i)
-    {
-        const std::string a = argv[i];
-        auto next = [&]() { if (i + 1 >= argc) die("missing value for " + a); return std::string(argv[++i]); };
-        std::string oerr;
-        if (a == "--pf-lanes") lanes_explicit = true;
-        if (g6rt::common_arg(a, next, co, oerr)) { if (!oerr.empty()) die(oerr); continue; }
-        if (a == "--rank") cfg.rank = atoi(next().c_str());
-        else if (a == "--ips") cfg.ips = split(next(), ',');
-        else if (a == "--ips2") cfg.ips2 = split(next(), ',');
-        else if (a == "--pf-ips2") pf_ips2 = split(next(), ',');
-        else if (a == "--ring") cfg.ring = true;
-        else if (a == "--ring-devs") cfg.ring_devs = split(next(), ',');
-        else if (a == "--proxy-cpu") cfg.proxy_cpu = atoi(next().c_str());
-        else if (a == "--manifest") manifest = next();
-        else if (a == "--pack") packfile = next();
-        else if (a == "--qp-manifest") qp_man = next();
-        else if (a == "--qp-pack") qp_file = next();
-        else if (a == "--dflash-manifest") dfl_man = next();
-        else if (a == "--dflash-pack") dfl_file = next();
-        else if (a == "--dflash-sel") dfl_sel = atoi(next().c_str());
-        else if (a == "--dflash-k") dfl_k = atoi(next().c_str());
-#if G6_MODEL_FLASH
-        else if (a == "--spec-fixed") spec_fixed = true;
-        else if (a == "--spec-reset-per-request") spec_reset_per_request = true;
-#endif
-        else if (a == "--image") image = true;
-        else if (a == "--no-hash") hash = false;
-        else if (a == "--reuse-prefix") reuse_prefix = true;
-#if G6_MODEL_DS41
-        else if (a == "--check-args") check_args = true;
-#endif
-        else if (a == "--kv-store") kv_tiers.push_back(next());
-        else if (a == "--kv-keep") kv_keep = next();
-        else if (a == "--kv-system-after") kv_system_after = atoi(next().c_str());
-        else if (a == "--kv-write-limit") kv_write_limit = atof(next().c_str());
-        else if (a == "--kv-format") kv_format = next();
-        else if (a == "--kv-tier")
-        {
-            const std::string v = next();
-            kv_old = true;
-            kv_old_all = kv_old_all || v.find("keep=evicted") != std::string::npos || v.find("keep=all") != std::string::npos ||
-                         v.find("keep=") == std::string::npos;
-            kv_tiers.push_back(v);
-        }
-        else if (a == "--kv-shared-after") { kv_old = true; kv_system_after = atoi(next().c_str()); }
-        else if (a == "--serve") s2dir = next();
-        else if (a == "--grammar-dir") grammar_dir = next();
-        else if (a == "--s2-port") s2port = atoi(next().c_str());
-        else if (a == "--s2-sessions") s2sess = atoi(next().c_str());
-        else if (a == "--s2-epoch") s2epoch = strtoull(next().c_str(), nullptr, 10);
-        else if (a == "--set-id")
-        {
-            set_id = next();
-            if (set_id.empty() || set_id.size() > 64 || set_id.find_first_not_of("0123456789abcdef") != std::string::npos)
-                die("--set-id must be 1..64 lowercase hex digits");
-        }
-        else if (a == "--steering-profile") steering_dir = next();
-        else if (a == "--steering-weight-set") steering_weight_set = next();
-        else if (a == "--steering-force") steering_force_s = next();
-        else if (a == "--steering-model-revision") steering_model_revision = next();
-        else if (a == "--steering-tokenizer-revision") steering_tokenizer_revision = next();
-        else if (a == "--steering-chat-template") steering_template_file = next();
-        else if (a == "--steering-chat-template-sha256") steering_template_digest = next();
-        else die("unknown argument " + a);
-    }
-    // the shared flags, under the names the rest of this file uses
-    const int cap = co.cap, top = co.top, pfrows = co.pfrows, nc = co.nc, mtp = co.mtp, MP = co.MP;
-    int lanes = co.lanes;               // Flash: two lanes for a prefill of up to 8192 rows unless --pf-lanes (below)
-    const float temp = co.temp;
-    const bool graph = co.graph, wide = co.wide, pfv2 = co.pfv2;
-    bool adapt = co.adapt;              // Flash: --mtp turns it on unless --spec-fixed (below)
-    const std::string &layers_s = co.layers_s, &levels_s = co.levels_s, &qo_man = co.qo_man, &qo_file = co.qo_file;
-    std::vector<std::string>& prompts = co.prompts;
-    v2src.dir = co.v2_dir; v2src.slices = co.v2_slices; v2src.widths = co.v2_widths; v2src.dense = co.v2_dense;
-    v2src.trellis = co.v2_trellis; v2src.layout = co.v2_layout;
-    if (co.n_gen) plan.n_gen = *co.n_gen;          // Plan owns these defaults; apply only what the command line set
-    if (co.seed) plan.seed = *co.seed;
-    if (co.chunk) plan.chunk = *co.chunk;
-    if (co.top_p) plan.top_p = *co.top_p;
-    if (co.rs) plan.rs = *co.rs;
-    const bool release = !v2src.dense.empty();
-    if (knob::kvb() == "fp8" && !release) die("GR8_KVB=fp8 needs --v2-dense: packs hold kv_b in BF16");   // #50: read by the release planner only
-    if (cfg.rank < 0 || cfg.ips.size() != (size_t)g6nr::NR || (!release && (manifest.empty() || packfile.empty())))
-        die("usage: g6m4 --rank R --ips NR,addresses (this build: NR = " + std::to_string(g6nr::NR) + ") [--ips2 ..] --manifest M --pack P|- [--qo-manifest QM --qo-pack QP] [--qp-manifest PM --qp-pack PP] [--layers ..] [--gen N] [--temp T]");
-#if G6_MODEL_DS41
-    if (release && (!manifest.empty() || !packfile.empty() || !image))
-        die("--v2-dense CHECKPOINT_DIR replaces --manifest / --pack and needs --image (DS41: no --v2 / --v2-slices / --v2-widths)");
-#else
-    if (release && (!manifest.empty() || !packfile.empty() || v2src.dir.empty()))
-        die("--v2-dense replaces --manifest / --pack and needs --v2 (the image comes from the release alone)");
-#endif
-    if (!release && !v2src.layout.empty()) die("--layout needs --v2-dense (it places the release's pieces)");
-    if (knob::dec_shared_scratch() && !pfv2) die("GR8_DEC_SHARED_SCRATCH=1 needs --pfv2");
-    const std::vector<int> layers = parse_ints(layers_s);
-#if G6_MODEL_FLASH
-    if (layers_s == "all") {
-        if (layers.size() != (size_t)geom::L_MAIN) die("Flash --layers all did not select every main layer");
-        for (int i = 0; i < geom::L_MAIN; ++i)
-            if (layers[i] != i) die("Flash --layers all selected an unexpected layer");
-    }
-    fprintf(stderr, "# rank %d: Flash actual main layers %zu first %d last %d\n", cfg.rank, layers.size(),
-            layers.empty() ? -1 : layers.front(), layers.empty() ? -1 : layers.back());
-#endif
-    if (prompts.empty()) prompts.push_back(g6rt::DEFAULT_PROMPT);
-    plan.inv_temp = g6rt::inv_temp(temp);
-    if (const std::string e = g6rt::common_check(co, MX, plan.chunk); !e.empty()) die(e);
-    if (nc < 0 || nc * g6nr::NR > glue::TP_SORT) die("--top-p-cands must be 0.." + std::to_string(glue::TP_SORT / g6nr::NR));
-    // Flash lane default: the MP8192 memory gate passed; larger MPs remain opt-in.
-#if G6_MODEL_FLASH
-    if (!lanes_explicit && MP > 0 && MP <= 8192) lanes = 2;
-#endif
-    const bool s2mode = !s2dir.empty();
-    const bool dfl = !dfl_man.empty();
-    if (s2mode && (knob::resid_dump() || knob::logit_dump()))
-        die("GR8_RESID_DUMP / GR8_LOGIT_DUMP support offline main steps, not --serve");
-    // S2 keeps --mtp next to the drafter: a session alone at its prompt tail runs DFlash2, the others MTP (s2_batch.h)
-    if (dfl && (dfl_file.empty() || (mtp && !s2mode) || dfl_sel < -1 || dfl_sel > 1 || dfl_k < 1 || dfl_k > dfl::K))
-        die("--dflash-manifest needs --dflash-pack, and replaces --mtp (7 drafts per round) except under S2; --dflash-sel 0|1; --dflash-k 1..7");
-    // TP=6 runs the drafter body replicated (dflash.cuh dfl::REP), and so does Flash at TP=3; GLM-5.3's TP=3 would too, but is not measured
-    if (dfl && dfl::REP && g6nr::NR != 6 && !(G6_MODEL_FLASH && g6nr::NR == 3))
-        die("--dflash: TP=" + std::to_string(g6nr::NR) + " has no DFlash2 drafter (TP=4 splits it, TP=6 and Flash's TP=3 replicate it)");
-    if (plan.rs && !mtp && !dfl) die("--spec-accept rejection needs --mtp or --dflash-manifest");
-    const int K = dfl ? dfl::K : mtp;   // drafts per round
-#if G6_MODEL_FLASH
-    if (spec_reset_per_request && s2mode) die("--spec-reset-per-request is offline only (no --serve)");
-    // Flash: --mtp K is adaptive speculation (up to K drafts) unless --spec-fixed
-    if (spec_fixed && (adapt || !levels_s.empty() || !mtp)) die("--spec-fixed needs --mtp, and not --spec-adaptive / --spec-levels");
-    if (mtp && !spec_fixed && !s2mode && !dfl) adapt = true;
-#endif
-    if ((adapt || !levels_s.empty()) && ((s2mode && !dfl) || (!mtp && !dfl))) die("--spec-adaptive needs --mtp or --dflash-manifest; under S2 it is the DFlash2 sessions' policy");
-    if (!levels_s.empty() && !adapt) die("--spec-levels needs --spec-adaptive");
-    SpecLen spec;                       // --spec-adaptive. Estimates persist unless the offline reset option is on
-    if (adapt)
-    {
-        const int kmax = dfl ? dfl_k : mtp;
-        std::vector<int> lv;
-        if (levels_s.empty()) for (int k = 1; k <= kmax; ++k) lv.push_back(k);
-        else lv = parse_ints(levels_s);
-        for (int k : lv) if (k < 1 || k > kmax) die("--spec-levels: each level must be 1.." + std::to_string(kmax));
-        spec.on = true;
-        if (!spec.set_levels(lv)) die("--spec-levels: no level");
-        spec.draft_round = dfl ? 5.6 : 2.5;      // ms at 2200 MHz: the DFlash2 step, the MTP first-form pass
-        spec.draft_each = dfl ? 0 : 2.1;         // an MTP chain step
-#if G6_MODEL_FLASH
-        spec.flash_cost(g6nr::NR);
-        if (dfl) { spec.draft_round = 5.3; spec.draft_each = 0; }   // Flash's verify table; a DFlash2 round's drafting (the gap between main steps)
-#endif
-    }
-#if G6_MODEL_FLASH
-    const SpecLen spec_initial = spec;  // fully configured, before any observations; includes Flash costs and levels
+    const g6s2::FlashCache& flash_cache = eo.flash_cache;
+    const long long& flash_budget_mib = eo.flash_budget_mib;
 #endif
 #if G6_MODEL_DS41
-    // DS41 serve (s2/ds41_native.cuh): no --prefill tensor prefill and no --mtp draft (the draft is DSpark, GR8_DS_MTP); --graph is optional
-    if (s2mode && (s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 32 || !s2epoch))
-        die("DS41 serving (--serve) needs --s2-port 1..65535, --s2-sessions 1..32 and --s2-epoch > 0 (no --prefill, --mtp 0; GR8_DS_MTP 1..5 is the DSpark draft); --graph is optional (without it each step runs eagerly)");
-#else
-    if (s2mode && (!graph || !mtp || !MP || s2port < 1 || s2port > 65535 || s2sess < 1 || s2sess > 8 || !s2epoch))
-        die("serving (--serve) needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8 and --s2-epoch > 0");
+    const int &ds_moe_main_topk = eo.ds_moe_main_topk, &ds_moe_decode_topk = eo.ds_moe_decode_topk;
+    const int &ds_idx_pipe_b = eo.ds_idx_pipe_b, &ds_idx_q_trig = eo.ds_idx_q_trig, &ds_idx_pipe_qr = eo.ds_idx_pipe_qr;
+    const int& ds_admit_keep_scratch = eo.ds_admit_keep_scratch;
+    const ds41::dsp::Knobs& dsk = eo.dsk;
+    const bool& ds_sess_drafts = eo.ds_sess_drafts;
+    const int& ds_draft_cap = eo.ds_draft_cap;
+    auto ds_ms_rps = [&](int ns) { return s2::ms_rps(dsk.on(), ds_sess_drafts, dsk.mtp, MX, ns); };
 #endif
-    if (s2mode && !knob::tests_set().empty())
-        die("serving (--serve) refuses test knobs (knobs/test.yaml): " + knob::tests_set());
-    if (knob::rt_store() && !s2mode) die("GR8_RT_STORE needs --serve (S2 below R with GR8_CP on)");
-    if (knob::test_rt_poison()) die("GR8_TEST_RT_POISON is an m4sim test: g6m4 reads the local copy of a row without a slot");
-    // GR8_RT_LOCAL (release): each split run's tail cycles through that many window pages per rank; the pool grants the
-    // drafter's whole tail apart from them (kvman-rs Pool::window, s2_cp_map). GR8_RT_PLACE: the main model's physical
-    // pages per rank (m.cp.phys), so --cap (the logical length) may pass what the local pages hold
-    const int rt_win = (int)knob::rt_local();
-    if (rt_win < 0 || (rt_win && !knob::rt_store())) die("GR8_RT_LOCAL needs GR8_RT_STORE and a page count >= 1");
-    if (knob::rt_place() && !rt_win) die("GR8_RT_PLACE needs GR8_RT_LOCAL (the pages past it are reached through the rows tier only)");
-    // --kv-store with it: the pool never retains a window run (kvman-rs Pool::window), so the block stores copy at most
-    // its prefix, which stays on pool pages; runs below R are as without the tier
-    if (rt_win && knob::rt_l() && *knob::rt_l() != knob::cp_r())
-        die("GR8_RT_LOCAL needs GR8_RT_L = GR8_CP_R (the window holds every tail page past R)");
+    std::vector<Plan>& plans = eo.plans;
+    std::vector<int>& row_counts = eo.row_counts;
+    const std::vector<int>& draft_rows = eo.draft_rows;
+    const int &NL = eo.NL, &NX = eo.NX, &NC = eo.NC, &R = eo.R;
+    const std::vector<int>& fab_order = eo.fab_order;
+    const bool& own4 = eo.own4;
+    const int& qp_roll_s = eo.qp_roll_s;
+    const bool& qp_roll_ser = eo.qp_roll_ser;
+    const int& qp_wire_e = eo.qp_wire_e;
+    // the files the options name: the steering profile and the request grammar
     steering::PreparedBoot steering_prepared;
     try {
-        if (!steering_dir.empty() && !hash) die("--steering-profile requires weight hash checks");
-        if (!steering_dir.empty() && (set_id.empty() || steering_weight_set.empty()))
-            die("--steering-profile needs --set-id and --steering-weight-set");
-        const steering::ExpectedModel expected{"glm-5.3", steering_model_revision, steering_weight_set,
-            steering_tokenizer_revision, steering_template_digest, HID, 78};
-        steering_prepared = steering::prepare_boot(steering_dir, expected, steering_template_file, layers, steering_force_s);
+        const steering::ExpectedModel expected{"glm-5.3", eo.steering_model_revision, eo.steering_weight_set,
+            eo.steering_tokenizer_revision, eo.steering_template_digest, HID, 78};
+        steering_prepared = steering::prepare_boot(eo.steering_dir, expected, eo.steering_template_file, layers, steering_force_s);
     } catch (const std::exception& e) { die(e.what()); }
     const auto& steering_profiles = steering_prepared.profiles;
     const auto& steering_boot = steering_prepared.config;
-    // GR8_MTP_KSTOP=1|2 (s2_batch.h KStop; default 0): a solo DFlash2 session's MTP rounds draft and verify 1..
-    // GR8_MTP_KSTOP_KMAX (1..3, default --mtp) drafts, chosen from the drafts' log-probabilities: 1 by GR8_MTP_KSTOP_TAU=
-    // t1,t2,t3 (draft j while p_1 * .. * p_j >= t_j; default 0,0.2,0.5), 2 by the drafter choice's MTP estimates
-    // (GR8_MTP_KSTOP_SEED3: their prior for a third draft). GR8_MTP_LPLOG=1 (rank 0; 2: every rank): one "# kstop" line per
-    // solo round, nothing else changes. The policy is in the S2 runtime signature
-    s2::KStop kstop;
-    {
-        kstop.mode = (int)knob::mtp_kstop().value_or((s2mode && dfl && mtp >= 2) ? 2 : 0);
-        const int lplog = (int)knob::mtp_lplog();
-        kstop.log = lplog == 2 || (lplog == 1 && cfg.rank == 0);
-        kstop.kmax = (int)knob::mtp_kstop_kmax().value_or(mtp);
-        const std::vector<double>& tau = knob::mtp_kstop_tau();
-        if (tau.size() > 3) die("GR8_MTP_KSTOP_TAU: at most 3 thresholds");
-        for (size_t j = 0; j < tau.size(); ++j) kstop.tau[j + 1] = tau[j];
-        kstop.seed3 = knob::mtp_kstop_seed3();
-        // Without --dflash-manifest (TP=6 / TP=3, MTP only): mode 1 stops the chain of a session that decodes alone
-        // (s2_batch.h KStop::solo), with GR8_MTP_KSTOP_KMAX <= --mtp; mode 2 needs the drafter choice's estimates
-        if (kstop.mode && (!s2mode || (!dfl && (kstop.mode != 1 || kstop.kmax > mtp)) || mtp < 2 || kstop.kmax < 1 || kstop.kmax > 3 ||
-                           !(kstop.seed3 > 0 && kstop.seed3 < 1) || kstop.kmax + 1 > std::max(s2sess * (mtp + 1), plan.chunk)))
-            die("GR8_MTP_KSTOP needs --serve and --mtp 2+ (without --dflash-manifest: mode 1 and GR8_MTP_KSTOP_KMAX <= --mtp); "
-                "GR8_MTP_KSTOP_KMAX 1..3 (verify rows within a step's), GR8_MTP_KSTOP_SEED3 in (0, 1)");
-        if (!kstop.mode) kstop.kmax = 0;
-        kstop.solo = kstop.mode == 1 && !dfl;
-        // GR8_MTP_KSTOPB=1 (s2_batch.h KStopB; default 0): in shared rounds each session verifies its own k_q of the K
-        // drafts: the most j with p_1 * .. * p_i >= t_i for every i <= j, at least GR8_MTP_KSTOPB_KMIN (0|1, default 0).
-        // GR8_MTP_KSTOPB_TAU=t1[,t2[,...]] (up to 7; default 0.6,0.88) at every session count, GR8_MTP_KSTOPB_TAU_S<n> at n
-        // sessions; past the configured entries there is no stop (the remaining drafts all verify).
-        // GR8_MTP_KSTOPB_WIDTHS=M,..: the main widths captured besides the multiples of K + 1 (default every width the rule reaches;
-        // a width outside them takes the next most likely drafts). GR8_MTP_KSTOPB_EXPLORE=n (measurement): every n-th
-        // round's shared sessions verify a hashed k_q instead. In the S2 runtime signature
-        kstop.b.mode = knob::mtp_kstopb() ? 1 : 0;
-        kstop.b.kmin = (int)knob::mtp_kstopb_kmin();
-        double bt[8] = {};                 // tau 0 past the entries: no stop there
-        const std::vector<double>& btau = knob::mtp_kstopb_tau();
-        if (btau.size() > 7) die("GR8_MTP_KSTOPB_TAU: at most 7 comma-separated numbers");
-        std::copy(btau.begin(), btau.end(), bt + 1);
-        for (int S = 1; S <= s2::S2N_SLOTS; ++S)
-        {
-            std::copy(bt, bt + 8, kstop.b.tau[S]);
-            if (const auto t = knob::mtp_kstopb_tau_s(S))
-            {
-                if (t->size() > 7) die("GR8_MTP_KSTOPB_TAU_S" + std::to_string(S) + ": at most 7 comma-separated numbers");
-                std::copy(t->begin(), t->end(), kstop.b.tau[S] + 1);
-            }
-        }
-        if (const auto& widths = knob::mtp_kstopb_widths())
-        {
-            if (widths->size() > 64) die("GR8_MTP_KSTOPB_WIDTHS: at most 64 comma-separated numbers");
-            for (int64_t w : *widths)
-            {
-                if (w < 1 || w > s2sess * (mtp + 1)) die("GR8_MTP_KSTOPB_WIDTHS: whole widths 1..sessions x (mtp + 1)");
-                kstop.b.widths.push_back((int)w);
-            }
-        }
-        kstop.b.explore = (int)knob::mtp_kstopb_explore();
-        // the draft log-probabilities come from every MTP draft step (StepOut::lp), with or without the DFlash2 drafter
-        if (kstop.b.mode && (!s2mode || kstop.b.explore < 0))
-            die("GR8_MTP_KSTOPB needs --serve; GR8_MTP_KSTOPB_EXPLORE >= 0");
-        if (!kstop.b.mode) kstop.b = s2::KStopB();
-    }
-    // GR8_GLM53F_CACHE (s2/flash_checkpoint.h): Flash session checkpoints under --serve, in place of prefix reuse. Its
-    // store is the one --kv-store (a lease of its own), else this process's memory, GR8_GLM53F_STATE_BUDGET_MIB a rank
-    g6s2::FlashCache flash_cache = g6s2::FlashCache::Off;
-    try { flash_cache = g6s2::flash_cache_mode(knob::glm53f_cache().c_str()); } catch (const std::exception& e) { die(e.what()); }
-    const long long flash_budget_mib = knob::glm53f_state_budget_mib();
-#if G6_MODEL_FLASH
-    // Flash: --s2-sessions 1 (the default) is the solo path; 2..8 share the --cap pool (s2/flash_native.cuh)
-    if (s2mode && (reuse_prefix || plan.rs))
-        die("Flash serve supports no prefix reuse or rejection sampling");
-    // DFlash2 with GR8_GLM53F_CACHE: a checkpoint hit restores none of the drafter's context, so a hit inside the
-    // drafter's window keeps the drafter through GR8_DFL_REUSE (s2/flash_dfl_window.h; on by default with the cache)
-    if (s2mode && dfl && !mtp)
-        die("Flash serve with DFlash2 needs --mtp (a second session moves the DFlash2 one to MTP)");
-    // a terminal checkpoint's KDA state comes from the verify ring, not a cold prefill, so the drafter would resume on
-    // state a cold run does not have: aligned checkpoints only (allowing terminal is a decision of its own)
-    if (s2mode && dfl && flash_cache == g6s2::FlashCache::Terminal)
-        die("Flash serve with DFlash2 needs GR8_GLM53F_CACHE=aligned or off (a terminal checkpoint's KDA state is not cold-exact)");
-    if (s2mode && s2sess > 1 && s2sess * (mtp + 1) > MX)
-        die("Flash serve: --s2-sessions x (--mtp + 1) rows exceed G6_MX (every session's round is one step)");
-    if (flash_cache != g6s2::FlashCache::Off) {
-        if (!s2mode || !MP) die("GR8_GLM53F_CACHE needs --serve and tensor prefill (--prefill N)");
-        if (kv_tiers.size() > 1) die("GR8_GLM53F_CACHE: one --kv-store at most (its checkpoint store)");
-        if (kv_tiers.empty() && flash_budget_mib < 1) die("GR8_GLM53F_STATE_BUDGET_MIB: >= 1");
-    }
-    if (!kv_tiers.empty() && flash_cache == g6s2::FlashCache::Off) die("--kv-store on Flash needs GR8_GLM53F_CACHE (its checkpoint store)");
-    if (s2mode && s2sess != 1 && flashkv::env_mode() == 1)
-        die("GR8_GLM53F_KV_CHUNKS needs --s2-sessions 1");
-#else
-    if (flash_cache != g6s2::FlashCache::Off) die("GR8_GLM53F_CACHE is GLM-5.3-Flash only (bin/g6m4_flash)");
-    // --reuse-prefix: one conversation's caches (prefix_reuse.h), or under S2 every retired session's run (s2/pool.h).
-    // The DFlash2 drafter's prompt-context taps (DF.pf_feat) are written by the prefill rows a hit skips.
-    if (!kv_tiers.empty() && !(s2mode && reuse_prefix)) die("--kv-store needs --serve and --reuse-prefix (it keeps the runs prefix reuse retains)");
-#endif
-    if (kv_old)
-    {
-        if (kv_keep.empty()) kv_keep = kv_old_all ? "all" : "system";
-        if (cfg.rank == 0)
-            fprintf(stderr, "# warning: --kv-tier and --kv-shared-after are deprecated: --kv-store STORE,size=N, --kv-keep %s, "
-                            "--kv-system-after %d\n", kv_keep.c_str(), kv_system_after);
-    }
-    if (kv_keep.empty()) kv_keep = "system";
-    if (kv_keep != "system" && kv_keep != "sessions" && kv_keep != "all") die("--kv-keep system, sessions or all");
-    if (kv_system_after < 1) die("--kv-system-after N: N >= 1");
-    if (!(kv_write_limit >= 0) || kv_write_limit > 1000) die("--kv-write-limit F: 0 (off) to 1000 blocks per page computed");
-    {   // the KV row is fixed at build time (attn/kvfmt.h): the launcher runs bin/g6m4 for fp8 and bin/g6m4-int4 for int4,
-        // and each binary refuses the other's format. The int4 build needs the flag, so it never starts by accident.
-#if defined(G6_KV4) && G6_KV4
-        const std::string built = "int4";
-#else
-        const std::string built = "fp8";
-#endif
-#if G6_MODEL_FLASH
-        const std::string bin = "bin/g6m4_flash";
-#elif G6_MODEL_DS41
-        const std::string bin = "bin/g6m4_ds41";
-#else
-        const std::string bin = "bin/g6m4";
-#endif
-        if (kv_format.empty() && built == "int4") die("this engine is the int4 KV build (" + bin + "-int4): it needs --kv-format int4");
-        if (kv_format.empty()) kv_format = built;
-        if (kv_format != "fp8" && kv_format != "int4") die("--kv-format fp8 or int4");
-        if (kv_format != built)
-            die("--kv-format " + kv_format + ": this engine is the " + built + " build (" + bin + " is fp8, " + bin + "-int4 is int4)");
-        if (cfg.rank == 0) fprintf(stderr, "# rank 0: KV format %s (latent row %d B, %s)\n", kv_format.c_str(), g6kv::ROW, g6kv::NAME);
-        if (cfg.rank == 0)   // module_info.h: what host code reads about this build
-            fprintf(stderr, "# rank 0: module %s abi %u: TP%d, %d rows a step, %d session slots, KV %s %d B a row, caps %#x\n",
-                    g6mod::INFO.name, g6mod::INFO.abi, g6mod::INFO.nr, g6mod::INFO.mx, g6mod::INFO.max_sessions, g6mod::INFO.kv_format,
-                    g6mod::INFO.kv_row_bytes, g6mod::INFO.caps);
-    }
-#if G6_MODEL_DS41
-    // Parse before --check-args, CUDA, fabric or weights. Unset decode cut inherits the main cut.
-    std::string moe_topk_error;
-    const int ds_moe_main_topk = ds41moe::topk_cut_env(&moe_topk_error);
-    if (ds_moe_main_topk < 0) die(moe_topk_error);
-    const int ds_moe_decode_topk = ds41_moe_topk::decode_env(ds_moe_main_topk, dsr::TOPK, &moe_topk_error);
-    if (ds_moe_decode_topk < 0) die(moe_topk_error);
-    fprintf(stderr, "# rank %d ds41 moe topk main %d decode %d\n", cfg.rank, ds_moe_main_topk, ds_moe_decode_topk);
-    const int ds_idx_pipe_b = knob::ds41_idx_pipe_b() ? 1 : 0;
-    fprintf(stderr, "# rank %d ds41 idx pipe B %d\n", cfg.rank, ds_idx_pipe_b);
-    const int ds_idx_q_trig = knob::ds41_idx_q_trig() ? 1 : 0;
-    const int ds_idx_pipe_qr = knob::ds41_idx_pipe_qr() ? 1 : 0;
-    fprintf(stderr, "# rank %d ds41 idx q trig %d pipe QR %d\n", cfg.rank, ds_idx_q_trig, ds_idx_pipe_qr);
-    const int ds_admit_keep_scratch = knob::ds41_admit_keep_scratch() ? 1 : 0;
-    fprintf(stderr, "# rank %d ds41 idx admit keep scratch %d\n", cfg.rank, ds_admit_keep_scratch);
-    // Prefix reuse is served by the DS41 snapshot cache; the separate --kv-store tier is not implemented for DS41.
-    if (reuse_prefix && !s2mode) die("DS41: --reuse-prefix needs --serve");
-    if (!kv_tiers.empty()) die("DS41: --kv-store is not supported");
-    // what DS41 cannot do dies here, at parse time, not mid-boot: prefill.cuh has no DS41 branch, --mtp N > 0 would run GLM's build_draft
-    if (MP > 0) die("DS41: --prefill is not supported (there is no DS41 tensor prefill; the prompt runs as decode steps)");
-    if (mtp > 0) die("DS41: --mtp N > 0 is not supported (the draft is DSpark: GR8_DS_MTP=1..5 with --mtp 0)");
-    // DSpark (off unless GR8_DS_MTP = 1..5): served only, the round runner is the S2 DRAFT / CHAIN path (s2/ds41_dspark_round.cuh)
-    const ds41::dsp::Knobs dsk = ds41::dsp::parse_knobs(ds41_dspark_knob);   // every DSpark knob, GR8_DS_VERIFY_CAP / GR8_DS_CONF_TEMP included
-    if (!dsk.err.empty()) die(dsk.err);
-    if (dsk.on() && !s2mode) die("DS41: GR8_DS_MTP is served only (it needs --serve)");
-    // GR8_DS_SESS_DRAFTS=1 (s2/ds41_sess_drafts.h): a round's drafts a session go by its active sessions (Batch), the DSpark draft step runs
-    // launches of at most ds_draft_cap sessions (5 rows each within MX), and ds_ms_rps(ns) is the most rows a session of an ns-session main step
-    // has (its captured graphs). Off: the cap is MARKOV_MAXS and k + 1 rows up to 8 sessions, as before
-    const bool ds_sess_drafts = knob::ds_sess_drafts();
-    if (ds_sess_drafts && !dsk.on()) die("DS41: GR8_DS_SESS_DRAFTS=1 needs --serve and GR8_DS_MTP = 1..5");
-    const int ds_draft_cap = ds_sess_drafts ? s2::sess_drafts_chunk(MX, g6s2::Ds41Round::BLOCK, ::ds41dsp::MARKOV_MAXS) : ::ds41dsp::MARKOV_MAXS;
-    auto ds_ms_rps = [&](int ns) { return s2::ms_rps(dsk.on(), ds_sess_drafts, dsk.mtp, MX, ns); };
-    if (dsk.relaxed && !dsk.on()) die("DS41: GR8_DS_RELAXED_ACCEPT needs GR8_DS_MTP = 1..5 (there are no drafts to accept)");
-    if (dsk.relax_topp > 0 && nc == 0) die("DS41: GR8_DS_RELAXED_ACCEPT topp:P needs --top-p-cands > 0 (the candidates carry the mass above the draft)");
-    if (dfl) die("DS41: --dflash-manifest is not supported");
-    if (!grammar_dir.empty()) die("DS41: --grammar-dir is not supported");
-    // the DS41 serve runs the whole step as one graph (GR8_DEC_SPLIT=0); the split3 graphs are the GLM serve path (the GR8_DEC_SPLIT check below asks for them from every GLM serve)
-    if (s2mode && knob::dec_split() != 0) die("DS41: serving runs GR8_DEC_SPLIT=0 (a split serve graph is not built for DS41 yet)");
-    // Engram (GR8_DS_ENGRAM=1) under --serve: the token ring of ds41_engram_ops.cuh holds the n-gram window of each session, whose rows are
-    // consecutive positions. A draft-and-verify round (GR8_DS_MTP) is not checked against the ring, so Engram with DSpark is refused unless
-    // GR8_DS_ENGRAM_MTP=1. ds41_engram_colls is host-only: it reads the GR8_DS_ENGRAM knobs and dies on a bad config exactly as the boot
-    // does (layers 1 and 14 needed, PREFIX set), so --check-args reports it.
-    if (ds41_engram_colls(layers) && dsk.on() && !knob::ds_engram_mtp())
-        die("DS41: GR8_DS_ENGRAM=1 with GR8_DS_MTP is not validated yet (Engram on serves at MTP 0)");
-    // GR8_DS_C8PACK=1: a pack needs 2+ real S2 slots and the W-prefill buffers. Check before
-    // --check-args and before loading weights: no zero-sized pf_pos/pf_tgt/pf_sess.
-    if (c8_pack_env && (!s2mode || s2sess < 2 || knob::ds_prefill_min() < 2))
-        die("GR8_DS_C8PACK=1 needs --serve, --s2-sessions >= 2 and GR8_DS_PREFILL_MIN >= 2");
-    // SESS > 1 (s2/ds41_native.cuh): one attention / index / Engram slab per session slot, and every prompt of 2+ tokens on the W-row
-    // prefill (GR8_DS_PREFILL_MIN >= 2), so a step of several sessions has the same rows per session (the captured ns-session graphs:
-    // 1 row at MTP 0, k + 1 verify rows with DSpark up to 8 sessions; above 8 sessions MTP is dynamically off).
-    if (s2mode && s2sess != 1 && (knob::ds_prefill_min() < 2))
-        die("DS41: --s2-sessions > 1 needs GR8_DS_PREFILL_MIN >= 2 (with GR8_DS_PREFILL_W)");
-    if (s2mode && s2sess != 1 && dsk.on() && !ds_sess_drafts && (std::min(s2sess, 8) * (dsk.mtp + 1) > MX || std::min(s2sess, 8) * g6s2::Ds41Round::BLOCK > MX))
-        die("DS41: --s2-sessions x (GR8_DS_MTP + 1) verify rows and --s2-sessions x 5 draft rows must fit G6_MX " + std::to_string(MX));
-    // GR8_DS_PARK=1: a parked slot is evicted through the prefix cache (--reuse-prefix); one slot has nothing to park beside
-    if (knob::ds_park() && (!s2mode || s2sess < 2 || !reuse_prefix)) die("DS41: GR8_DS_PARK=1 needs --serve, --s2-sessions >= 2 and --reuse-prefix");
-    // --check-args: every parse-time check above passed; stop before any CUDA, fabric or weight work (the launcher smoke test runs the engine arg list through this)
-    if (check_args) { fprintf(stderr, "g6m4: --check-args: the arguments pass the parse-time checks (no CUDA, no weights)\n"); return 0; }
-#endif
-    if (reuse_prefix && dfl && !s2mode) die("--reuse-prefix is not supported with --dflash-manifest (the drafter's prompt-context taps come from the prefill)");
-    std::vector<Plan> plans;            // one sequence per --prompt
-    std::vector<int> row_counts;
-    for (const std::string& ps : prompts)
-    {
-        Plan p = plan;
-        if (steering_boot.forced) {
+    if (steering_boot.forced)
+        for (Plan& p : plans) {
             p.steering = steering_boot.selected(steering_boot.forced_scale_bits);
             p.steering_scale = steering::bits_float(steering_boot.forced_scale_bits);
         }
-        p.prompt = parse_ints(ps);
-        if (p.prompt.empty()) die("empty prompt");
-        if ((int)p.prompt.size() + p.n_gen + 2 * K > cap) die("prompt + gen (+ 2 x drafts) exceeds --cap");
-        if (MP) { const int pr = pfrows < 0 ? (int)p.prompt.size() + pfrows : pfrows;   // --pf-rows -N: all rows but the last N
-                  p.first = pr > 0 && pr < (int)p.prompt.size() - 1 ? pr : (int)p.prompt.size() - 1; }   // --pf-rows: the rest is teacher-forced through decode steps
-        for (int M : plan_rows(p))
-            if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
-        plans.push_back(p);
-    }
-    if (s2mode || reuse_prefix)         // any prompt (reuse changes the offline prompt-step row counts too): 1..chunk
-        for (int M = 1; M <= plan.chunk; ++M)
-            if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
-    std::vector<int> draft_rows;        // row counts of first-form draft passes: the prompt steps' and 1..K+1
-    if (mtp)
-    {
-        draft_rows = row_counts;
-        for (int M = 1; M <= mtp + 1; ++M)
-            if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
-        if (std::find(row_counts.begin(), row_counts.end(), mtp + 1) == row_counts.end()) row_counts.push_back(mtp + 1);
-    }
-    if (dfl && std::find(row_counts.begin(), row_counts.end(), dfl_k + 1) == row_counts.end()) row_counts.push_back(dfl_k + 1);
-    // a DFlash2 round's MTP first form runs on the accepted prefix + 1 rows (1 .. dfl_k + 1): capture every one of them
-    // (the prompt chunk and the verify widths above cover them for a block-8 drafter, not for a wider one)
-    if (dfl && mtp)
-        for (int M = 1; M <= dfl_k + 1; ++M)
-            if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
-    for (int M = 2; M <= kstop.kmax + 1; ++M)   // GR8_MTP_KSTOP: solo MTP verifies of 2..kmax + 1 rows, first forms of as many
-    {
-        if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
-        if (std::find(draft_rows.begin(), draft_rows.end(), M) == draft_rows.end()) draft_rows.push_back(M);
-    }
-    // GR8_MTP_KSTOPB: a session alone in round_all (MTP only) verifies the rule's widths of one session; its first forms
-    // are within 1..mtp + 1 (draft_rows above)
-    for (int M : s2::kstopb_widths(kstop.b, 1, mtp))
-        if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
-    // GR8_S2_ADAPT: a session alone may verify any k <= mtp, also outside limited GR8_MTP_KSTOPB_WIDTHS (s2_batch.h kshared)
-    if (s2mode && s2::adapt_env())
-        for (int M = 2; M <= mtp + 1; ++M)
-            if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
-    for (int k : spec.levels)           // --spec-adaptive: a verify graph per level
-        if (std::find(row_counts.begin(), row_counts.end(), k + 1) == row_counts.end()) row_counts.push_back(k + 1);
-#if G6_MODEL_FLASH
-    if (s2mode) for (int n = 1; n <= mtp + 1; ++n)
-        if (std::find(row_counts.begin(), row_counts.end(), n) == row_counts.end()) row_counts.push_back(n);
-#endif
-#if G6_MODEL_DS41
-    const int NL = (int)layers.size(), NX = ds41_engram_colls(layers), NC = 2 * NL + 1 + NX, R = cfg.rank;   // NX: 2 Engram collectives after the head slot (GR8_DS_ENGRAM=1), else 0
-    const std::vector<int> fab_order = ds41::coll_exec_order(layers, NX);   // the step's collective order with Engram on, else empty (identity)
-    if (dsk.on())                       // DSpark verify steps of 2..k + 1 rows (the prompt chunk covers 1..chunk); SESS > 1: ns x (k + 1) for ns <= 8
-        for (int ns = 1; ns <= std::min(s2mode ? s2sess : 1, ds_sess_drafts ? 32 : 8); ++ns)
-            for (int M = ns; M <= ns * ds_ms_rps(ns) && M <= MX; M += ns)
-                if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
-#else
-    const int NL = (int)layers.size(), NX = 0, NC = 2 * NL + 1, R = cfg.rank;
-    const std::vector<int> fab_order;
-#endif
-    if (!grammar_dir.empty())
-    {
-        if (!s2mode) die("--grammar-dir needs --serve");
-#if !G6_GRAMMAR
-        // GRAMMAR defaults to 1, so a build without XGrammar serves without grammars: its hello leaves out
-        // `grammar`, and the front end sends none
-        fprintf(stderr, "# rank %d: --grammar-dir ignored: this engine was built without XGrammar (GR8_XGRAMMAR)\n", R);
-        grammar_dir.clear();
-#endif
-    }
     if (!grammar_dir.empty())
     {
         const std::string e = g6rt::grammar_init(grammar_dir, geom::VOCAB);
         if (!e.empty()) die("--grammar-dir " + grammar_dir + ": " + e);
-        if (R == 0)
-            if (FILE* f = fopen((s2dir + "/grammar.s2").c_str(), "w")) { fputs("json json_schema\n", f); fclose(f); }
         fprintf(stderr, "# rank %d: request grammars from %s (%d mask words a row)\n", R, grammar_dir.c_str(), g6rt::grammar_words());
     }
-    // GR8_PF_OWN=4 (TP4) env refusals before any CUDA / fabric work (qp_wire.h roll_env_refusal)
-    const bool own4 = MP && knob::pf_own() == 4;
-    const int qp_roll_s = (int)knob::pf_qp_roll();              // rolling pack: 0 or 2..4
-    const bool qp_roll_ser = knob::pf_qp_roll_ser();
-    const int qp_wire_e = (int)knob::pf_qp_wire_e().value_or(1);   // wire ring entries (qp_wire.h)
-    {
-        const std::string qp_ctx = knob::pf_qp_ctx() ? std::to_string(*knob::pf_qp_ctx()) : "";
-        const std::string why = qw::roll_env_refusal(own4, qp_roll_s, knob::pf_qp_wire_e().has_value(), qp_wire_e,
-                                                     qp_ctx.c_str(), !qp_file.empty());
-        if (!why.empty()) die(why);
-        if (own4 && g6nr::NR != 4) die("GR8_PF_OWN=4 is TP4 only (G6_NR=4)");
-        if (own4 && !qp_roll_s && (qp_man.empty() || qp_file.empty())) die("GR8_PF_OWN=4 needs --qp-manifest and --qp-pack (or GR8_PF_QP_ROLL)");
-        if (!own4 && (!qp_man.empty() || !qp_file.empty())) die("--qp-manifest / --qp-pack need GR8_PF_OWN=4 and --prefill");
-    }
+    // --check-args: every check a boot makes before CUDA passed; stop before any CUDA, fabric or weight work
+    if (eo.check_args) { fprintf(stderr, "g6m4: --check-args: the arguments pass the parse-time checks (no CUDA, no weights)\n"); return 0; }
+    // GR8_FABRIC_DUMP=1: every planned fabric's config on stdout, then exit; no file, CUDA, fabric or network work
+    const bool fabric_dump = knob::fabric_dump();
+    if (!fabric_dump && !grammar_dir.empty() && R == 0)
+        if (FILE* f = fopen((s2dir + "/grammar.s2").c_str(), "w")) { fputs("json json_schema\n", f); fclose(f); }
 
-    G6RT_CK(cudaSetDeviceFlags(cudaDeviceMapHost));
-    cfg.slot_bytes = NX ? (size_t)MX * 6144 * 2 : (size_t)MX * HID * 2;   // Engram: [rows][6144] BF16 slots (ds41_engram_ops.cuh)
-    const size_t dec_slot_bytes = cfg.slot_bytes;   // the decode slot: every decode collective (layer, head, Engram) of MX rows fits it
-    g6::FabricConfig cm;                            // the main fabric's own runs (DS41 serve), set below; run1 = 0 = uniform
-    bool pf_direct = false;                         // GR8_DS_PF_DIRECT=1: prefill producers write the pinned send slots (ds41_step.cuh ds41_op_direct)
-    int rs_k = 0;                                   // GR8_DS_PF_RS=1 (ds41_rs.h): the RS layer exchanges 0..rs_k-1, AG collectives NC..NC+rs_k-1; 0 = off
-    bool rowshard = false;                          // GR8_DS_MHC_ROW_SHARD=1 (default off): local-Q mHC + AG(y) + one boundary-state collective
-    bool y_mxfp8 = false;                           // default-off lossy MXFP8 AG(y), requires rowshard
-#if G6_MODEL_DS41
-    g6::FabricConfig cmB;                           // GR8_DS_PF_LANES=2: lane B's fabric runs (ds41::lanes::fabric_runs_b), set below
-    int pf_lanes_fab = 1;                           // GR8_DS_PF_LANES, read here for the lane-B fabric (the serve setup reads it again)
-    // A W-row headless prefill chunk uses the same fabric as decode. Unset, the
-    // slot holds MX rows; Fabric::init adds the 8-byte tail and alignment to
-    // this payload capacity.
-    if (s2mode) {
-        const int pf_rows = ds41_prefill_rowcap(DS41_TEXT(knob::ds_prefill_w()), MX);
-        if (!pf_rows) die("DS41 serve: GR8_DS_PREFILL_W must be MX..4096");
-        cfg.slot_bytes = ds41_prefill_fabric_payload(pf_rows, HID, NX ? 6144 : 0);
-        // the main fabric's slots sized per collective (FabricConfig::run1) as a W chunk sends them (s2/ds41_prefill.h
-        // ds41_chunk_collectives): [0, c1) layer exchanges of W rows; [c1, 2 NL + 1) the bounded-replay layers (late rows,
-        // GR8_DS_PF_TAIL) and the head (0 B in prefill); [2 NL + 1, NC) the Engram reduces of W rows. Every run also holds the
-        // decode slot. Fabric::enqueue_step still checks each collective against its own slot.
-        const int tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
-        if (tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
-        ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1): before late_start() sizes the fabric runs below
-        if (ds41::br::l20_tail() && !tail) die("GR8_DS_PF_L20_TAIL=1 needs GR8_DS_PF_TAIL (layer 20 joins the bounded replay)");
-        const int i_late = tail ? ds41::br::late_start(layers) : -1;
-        bool pf_rs_on = false;
-        // GR8_DS_PF_RS=1: layer exchanges c < 2 i_late of a prefill chunk run as reduce-scatter + all-gather (ds41_rs.h). Run 0 holds NR
-        // slices of ss each (+256 B a slot at W2048), and a 4th run [NC, NC + rs_k) holds the AG collectives (one slice payload each).
-        // Mesh and ring take the same proxy path (send / recv by offset; the ring relays the diagonal by that offset).
-        if (knob::ds_pf_rs()) {
-            if (i_late < 0) die("GR8_DS_PF_RS=1 needs GR8_DS_PF_TAIL (the RS collectives are the layer exchanges before the bounded-replay split)");
-            if (pf_rows <= MX || pf_rows < g6nr::NR) die("GR8_DS_PF_RS=1 needs GR8_DS_PREFILL_W > MX");
-            pf_rs_on = true;
-            if (NC + 2 * i_late > (int)g6::CollMask::kBits) die("GR8_DS_PF_RS=1: more than 128 collectives (NC + 2 i_late)");
-        }
-        if (knob::ds_mhc_row_shard()) {
-            const bool fuse = knob::ds_mhc_fuse();
-            if (!ds41::rowshard::boot_ok(pf_rows,tail,g6nr::NR,pf_rs_on,fuse))
-                die("GR8_DS_MHC_ROW_SHARD=1 needs W=4096, tail=128, TP4, PF_RS=1, MHC_FUSE=1");
-            if (NC + 2*i_late + 1 > (int)g6::CollMask::kBits) die("GR8_DS_MHC_ROW_SHARD: more than 128 collectives");
-            const size_t state=ds41::rowshard::state_bytes(tail,HID,sizeof(ds_mhc::trunk_t));
-            if (state > (size_t)1024*HID*2) die("GR8_DS_MHC_ROW_SHARD: late state exceeds an AG slot");
-            rowshard = true;
-            fprintf(stderr,"# rank %d: GR8_DS_MHC_ROW_SHARD=1 Q=1024 late=128 state_bytes=%zu\n",cfg.rank,state);
-        }
-        if (knob::ds_mhc_y_mxfp8()) {
-            if (!rowshard) die("GR8_DS_MHC_Y_MXFP8=1 needs GR8_DS_MHC_ROW_SHARD=1");
-            y_mxfp8 = true;
-            fprintf(stderr,"# rank %d: GR8_DS_MHC_Y_MXFP8=1 lossy y all-gather\n",cfg.rank);
-        }
-        const auto runs = ds41::pf::fabric_runs(pf_rows, tail, i_late, NL, NX, MX, HID, g6nr::NR,
-                                                glue::head_bytes_tk(MX, nc, true), pf_rs_on, c8_pack_env == 1, rowshard);
-        cm = runs.cfg;
-        rs_k = runs.rs_k;
-        // GR8_DS_PF_POOL=P: run 0 (the layer exchanges before the late split) and run 3 (the AG collectives) keep P slots each,
-        // collective c in slot c mod P (comms/fabric.h FabricConfig::pool; the proxy posts a reused slot after the peer's credit tail).
-        if (const char* pv = DS41_TEXT(knob::ds_pf_pool()); pv && *pv && strcmp(pv, "0") != 0) {
-            char* end = nullptr;
-            const long P = strtol(pv, &end, 10);
-            if (!end || *end || P < 2 || P > cm.run1) die("GR8_DS_PF_POOL must be 0 (off) or 2..the run 0 collectives (2 i_late with GR8_DS_PF_TAIL, else 2 NL)");
-            cm.pool = (int)P;
-            fprintf(stderr, "# rank %d DS41 fabric slot pool: GR8_DS_PF_POOL=%d (run 0: %d collectives, %s)\n", cfg.rank, cm.pool, cm.run1,
-                    rs_k ? "run 3 AG pooled too" : "no run 3");
-        }
-        // GR8_DS_PF_LANES=2 (ds41_lanes.h): lane B's slot table = the main one without the C8-pack late slots (a ragged pack is never a
-        // lane-B chunk); the same pool. Unset / 1: nothing here.
-        pf_lanes_fab = ds41::lanes::parse(DS41_TEXT(knob::ds_pf_lanes()));
-        if (!pf_lanes_fab) die(ds41::lanes::kParseError);
-        if (pf_lanes_fab == 2) {
-            const auto rb = ds41::lanes::fabric_runs_b(pf_rows, tail, i_late, NL, NX, MX, HID, g6nr::NR, glue::head_bytes_tk(MX, nc, true), pf_rs_on, rowshard);
-            if (rb.rs_k != rs_k || rb.cfg.run1 != cm.run1 || rb.cfg.ncoll != cm.ncoll)
-                die("DS41 lane B fabric: its runs or row-shard state collective differ from the main fabric's");
-            cmB = rb.cfg;
-            cmB.pool = cm.pool;
-        }
-        if (pf_rs_on) {
-            fprintf(stderr, "# rank %d DS41 prefill RS+AG: GR8_DS_PF_RS=1 (c < %d; Q %d rows, slice stride %zu B; AG collectives %d..%d, %zu B each)\n",
-                    cfg.rank, rs_k, runs.quarter, runs.slice_stride, NC, NC + rs_k - 1, cm.slot_bytes3);
-        }
-        // GR8_DS_PF_DIRECT=1: on an eager W-row prefill chunk the attention output and the MoE combine write the pinned send slot of
-        // their collective (flat [rows][HID]); the publish only rings. RS collectives of such a chunk go as flat slices (payload + tail-word
-        // SGEs, Fabric::Rs::flat), so the fabric QPs take 2 send SGEs (FabricConfig::sge2). Decode graphs do not use it.
-        if (knob::ds_pf_direct()) {
-            if (pf_rows <= MX) die("GR8_DS_PF_DIRECT=1 needs GR8_DS_PREFILL_W > MX");
-            if (knob::ds_subdump()) die("GR8_DS_PF_DIRECT=1: GR8_DS_SUBDUMP reads Model::sc.part after the publish (not supported)");
-            pf_direct = true;
-            fprintf(stderr, "# rank %d DS41 prefill direct publish: GR8_DS_PF_DIRECT=1 (send slots written by the producers; RS slices flat: %s)\n",
-                    cfg.rank, rs_k ? "yes" : "no RS");
-        }
-    }
-    // DS41 W-prefill uses this main, uniform-layout fabric (not the Flash MP prefill fabrics below).
-    // The two --ips2 rails alone do not stripe: Fabric::init requires stripe_min > 0.
-    {
-        if (knob::ds_stripe()) {
-            if (cfg.ips2.size() != cfg.ips.size()) die("GR8_DS_STRIPE=1 needs --ips2 with one address per rank");
-            if (cfg.ring || !cfg.vcap.empty() || cfg.bulk_bytes) die("GR8_DS_STRIPE=1 needs a uniform, non-bulk mesh fabric");
-            cfg.stripe_min = (size_t)knob::ds_stripe_min();
-        }
-    }
-    // no recv slot for a rank's own contribution: DS41 reads it from the send slot, and a W-row prefill fabric's slots are large
-    cfg.compact = true;
-#endif
-    cfg.ncoll = NC;
-    cfg.relay_cpu = cfg.proxy_cpu > 7 ? cfg.proxy_cpu - 8 : -1;   // --ring: the relay thread's own core (N-1..N-7 are proxies)
-    g6::Fabric fab;
+    if (!fabric_dump) G6RT_CK(cudaSetDeviceFlags(cudaDeviceMapHost));
+    // every fabric main creates, in creation order (fabric_plan.h); the plan below sets them up
+    g6::Fabric fab, fabB, fabp, fabp2, fabix, fabix2, fabrs, fabrs2, fabd, fabds, fabf, fabq, fabc, fabg, fabs, fabdg;
     boot_rank = cfg.rank;
     mem_min_gib();                      // a bad GR8_MEM_MIN stops the boot here, not after the weights have loaded
     boot("start");
-    // GR8_XTRACE=1: stage-0 trace (xtrace.h, default off) on the decode fabric, or with GR8_XTRACE_PF=1 on the two prefill
-    // fabrics instead
-    const bool xtrace_pf = knob::xtrace_pf();
-    cfg.xtrace = xtrace_pf ? 0 : 1;
-    {
-        g6::FabricConfig mc = cfg;
-        if (cm.run1) { mc.slot_bytes = cm.slot_bytes; mc.run1 = cm.run1; mc.run2 = cm.run2; mc.slot_bytes1 = cm.slot_bytes1; mc.slot_bytes2 = cm.slot_bytes2; mc.pool = cm.pool; }
-#if G6_MODEL_DS41
-        if (rs_k) { mc.run3 = cm.run3; mc.slot_bytes3 = cm.slot_bytes3; mc.ncoll = ds41::rs::main_ncoll(NC, rs_k, rowshard); }   // the RS AG collectives plus the row-shard state collective
-#endif
-        mc.sge2 = pf_direct;                                                                     // GR8_DS_PF_DIRECT: flat RS slices = 2 SGEs
-        fab.init(mc);
-    }
-    cfg.xtrace = 0;
-    const g6::FabricDev f = fab.dev();
-    fab.start_proxy();
-#if G6_MODEL_DS41
-    // GR8_DS_PF_LANES=2: lane B's own fabric (own QPs, proxy thread and sequence), as Flash's fabp2: port + 96, proxy core N-2 (DS41 builds no
-    // fabp / fabp2: --prefill is refused for DS41). Same rails, ring / mesh and stripe as the main fabric. Unset / 1: not built.
-    g6::Fabric fabB;
-    if (pf_lanes_fab == 2) {
-        if (!s2mode || !cmB.run1) die("GR8_DS_PF_LANES=2 needs --serve with W-row prefill (GR8_DS_PREFILL_W > MX)");
-        g6::FabricConfig mc = cfg;
-        mc.slot_bytes = cmB.slot_bytes; mc.run1 = cmB.run1; mc.run2 = cmB.run2; mc.slot_bytes1 = cmB.slot_bytes1; mc.slot_bytes2 = cmB.slot_bytes2;
-        mc.pool = cmB.pool;
-        if (rs_k) { mc.run3 = cmB.run3; mc.slot_bytes3 = cmB.slot_bytes3; mc.ncoll = ds41::rs::main_ncoll(NC, rs_k, rowshard); }
-        mc.sge2 = pf_direct;
-        mc.port = cfg.port + 96;
-        mc.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
-        mc.xtrace = 0;
-        fabB.init(mc);
-        fabB.start_proxy();
-        fprintf(stderr, "# rank %d DS41 two-lane prefill: lane B fabric port %d proxy cpu %d, slot table without the C8-pack late slots (run1 %d)\n",
-                cfg.rank, mc.port, mc.proxy_cpu, mc.run1);
-    }
-#endif
     // DS41 with Engram: the step rings each Engram reduce (c = 2*nl+1+e) mid-step, not after the head, so the proxy must wait for the collectives in
     // the step's own order (ds41_coll_order.h, Fabric::Rs::order). Every rank builds the same vector. Empty (Engram off, every other model): the
     // plain enqueue_step(step, sizes) call in the proxy's numeric order.
@@ -847,7 +282,6 @@ int main(int argc, char** argv)
         rs.order = fab_order;
         fab.enqueue_step(step, sizes, rs);
     };
-    g6::Fabric fabp;                    // prefill region
     const bool pf_rs = knob::pf_rs();                                            // reduce-scatter form (prefill.cuh)
     const int pf_own = (int)knob::pf_own();                                      // 1: row-owner projections, 2: + index (prefill.cuh)
     const bool pf_qo = MP && pf_own == 3;                                        // 3: row-owner QO attention (QO-INTEGRATION.md)
@@ -855,154 +289,8 @@ int main(int argc, char** argv)
     if (pf_qo && !release && (qo_man.empty() || qo_file.empty())) die("GR8_PF_OWN=3 needs --qo-manifest and --qo-pack");
     if (release && (!qo_man.empty() || !qp_man.empty())) die("--v2-dense: the QO weights come from the release (no --qo- / --qp- packs)");
     v2src.qo = pf_qo;
-    // GR8_PF_STRIPE=1 (needs --pf-ips2 or --ips2, or a three-rank --ring): prefill payload writes >= GR8_PF_STRIPE_MIN
-    // bytes (default 1 MiB) go out half on each rail (FabricConfig::stripe_min). At a three-rank ring the second half
-    // takes the same port's device on the other PCIe root. Unset = on when --pf-ips2 is given or at a three-rank ring,
-    // else one rail as before; 0 = one rail.
-    auto pf_stripe_cfg = [&](g6::FabricConfig& cp, const std::vector<std::string>& ips2) {
-        const bool ring3 = cp.ring && cp.ips.size() == 3;   // three-rank ring: stripes over the other PCIe root, no ips2
-        const bool on = knob::pf_stripe().value_or(!ips2.empty() || ring3);
-        if (!ips2.empty()) cp.ips2 = ips2;
-        if (!on) return;
-        if (!ring3 && cp.ips2.size() != cp.ips.size()) die("GR8_PF_STRIPE=1 needs --pf-ips2 (or --ips2) with one address per rank");
-        cp.stripe_min = (size_t)knob::pf_stripe_min();
-    };
-    if (MP)
-    {
-        g6::FabricConfig cp = cfg;
-        cp.slot_bytes = pf_slot_bytes(MP, pf_rs, (int)cfg.ips.size());
-        cp.ncoll = pf_rs ? 5 : 2;
-#if G6_MODEL_FLASH
-        if (pf_sp()) { cp.slot_bytes = pf_sp_slot_bytes(MP, (int)cfg.ips.size()); cp.ncoll = 4; }
-#endif
-        cp.port = cfg.port + 8;
-        pf_stripe_cfg(cp, pf_ips2);
-        cp.proxy_cpu = cfg.proxy_cpu > 0 ? cfg.proxy_cpu - 1 : -1;
-        cp.xtrace = xtrace_pf ? 1 : 0;
-        fabp.init(cp);
-        fabp.start_proxy();
-    }
-    if (lanes != 1 && lanes != 2) die("--pf-lanes must be 1 or 2");
-    const bool two = MP && lanes == 2;
-    g6::Fabric fabp2;                   // prefill region of the second lane (--pf-lanes 2)
-    if (two)
-    {
-        g6::FabricConfig cp = cfg;
-        cp.slot_bytes = pf_slot_bytes(MP, pf_rs, (int)cfg.ips.size());
-        cp.ncoll = pf_rs ? 5 : 2;
-#if G6_MODEL_FLASH
-        if (pf_sp()) { cp.slot_bytes = pf_sp_slot_bytes(MP, (int)cfg.ips.size()); cp.ncoll = 4; }
-#endif
-        cp.port = cfg.port + 24;
-        pf_stripe_cfg(cp, pf_ips2);
-        cp.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
-        cp.xtrace = xtrace_pf ? 1 : 0;
-        fabp2.init(cp);
-        fabp2.start_proxy();
-    }
-#if G6_MODEL_FLASH
-    // Independent pool-ID exchange: default on for TP2 Flash prefill (GR8_GLM53F_PF_POOL_OWNER unset = auto, 0 = off,
-    // 1 = on and die if unsupported). Existing fabp/fabp2 are unchanged.
-    g6::Fabric fabix, fabix2;
-    const int pool_mode = flash_pool_owner_mode();
-    const bool pool_fits = MP && g6nr::NR == 2 && cfg.ips.size() == 2 && !cfg.ring;
-    const char* pool_conflict = knob::fpf_attn_p1() ? "GR8_FPF_ATTN_P1" : knob::fpf_dsa_p1() ? "GR8_FPF_DSA_P1"
-                              : knob::fpf_p1() ? "GR8_FPF_P1" : nullptr;
-    if (pool_mode == 1 && !pool_fits) die("GR8_GLM53F_PF_POOL_OWNER=1 needs TP2 Flash prefill (not ring)");
-    if (pool_mode == 1 && pool_conflict) die(std::string("GR8_GLM53F_PF_POOL_OWNER=1 conflicts with ") + pool_conflict);
-    const bool pool_owner = pool_mode == 1 || (pool_mode == 2 && pool_fits && !pool_conflict);
-    if (pool_owner)
-    {
-        auto init_ids = [&](g6::Fabric& ids, int port, int cpu_offset) {
-            g6::FabricConfig cp = cfg;
-            cp.ncoll = 1; cp.slot_bytes = flash_pool_owner::payload(MP);
-            cp.port = cfg.port + port;
-            cp.proxy_cpu = cfg.proxy_cpu > cpu_offset ? cfg.proxy_cpu - cpu_offset : -1;
-            pf_stripe_cfg(cp, pf_ips2);
-            ids.init(cp); ids.start_proxy();
-        };
-        init_ids(fabix, 64, 9);
-        if (two) init_ids(fabix2, 72, 10);
-    }
-    // GR8_PF_ROUTER_SPLIT=1 (opt-in): one ncoll = 1 route-table fabric per prefill lane, at any rank count and on a
-    // switched mesh or the switchless ring (the fabric relays the diagonal, as it does for the prefill fabric).
-    // Ports +80 / +88 and proxy CPU offsets 11 / 12 (taken: ports 8 16 24 32 40 48 56 64 72, offsets 1..10).
-    g6::Fabric fabrs, fabrs2;
-    const bool route_split = route_split_mode == 1;
-    if (route_split)
-    {
-        if (!(MP && g6nr::NR >= 2 && g6nr::NR <= flash_route_split::MAX_NR && cfg.ips.size() == (size_t)g6nr::NR))
-            die("GR8_PF_ROUTER_SPLIT=1 needs Flash prefill (--prefill) on 2 to 8 ranks");
-        auto init_rs = [&](g6::Fabric& rs, int port, int cpu_offset) {
-            g6::FabricConfig cp = cfg;
-            cp.ncoll = 1; cp.slot_bytes = flash_route_split::payload(MP, (int)cfg.ips.size());
-            cp.port = cfg.port + port;
-            cp.proxy_cpu = cfg.proxy_cpu > cpu_offset ? cfg.proxy_cpu - cpu_offset : -1;
-            pf_stripe_cfg(cp, pf_ips2);
-            rs.init(cp); rs.start_proxy();
-        };
-        init_rs(fabrs, 80, 11);
-        if (two) init_rs(fabrs2, 88, 12);
-        fprintf(stderr, "# rank %d: GR8_PF_ROUTER_SPLIT=1: prefill MoE router row-split, route tables over a dedicated fabric%s\n",
-                cfg.rank, two ? " per lane" : "");
-    }
-#endif
-    g6::Fabric fabd;                    // MTP draft region: 3 collectives, decode-sized slots
-    if (mtp)
-    {
-        g6::FabricConfig cd = cfg;
-        cd.ncoll = 3;
-        cd.port = cfg.port + 16;
-        cd.proxy_cpu = cfg.proxy_cpu > 5 ? cfg.proxy_cpu - 6 : -1;   // own core: fabp2 (prefill lane 2) has N-2
-        fabd.init(cd);
-        fabd.start_proxy();
-    }
-#if G6_MODEL_DS41
-    g6::Fabric fabds;                   // DSpark draft block: its own region of DRAFT_NCOLL collectives (6 layer exchanges + 5 markov merges)
-    if (dsk.on())
-    {
-        g6::FabricConfig cd = cfg;
-        cd.ncoll = ds41::dsp::DRAFT_NCOLL;
-        // the draft block sends 5 rows a session, never W rows: decode-sized slots (the W-sized cfg.slot_bytes is the main fabric's)
-        cd.slot_bytes = dec_slot_bytes;
-        for (int c = 0; c < cd.ncoll; ++c)
-            if (ds41::dsp::coll_bytes(c, HID, std::min(s2sess, ds_draft_cap)) > cd.slot_bytes) die("DSpark draft fabric: a collective is larger than the decode slot");
-        cd.port = cfg.port + 16;        // the MTP draft region's port (--mtp is refused with DSpark)
-        cd.proxy_cpu = cfg.proxy_cpu > 5 ? cfg.proxy_cpu - 6 : -1;
-        // GR8_XTRACE=1 with GR8_DS_XTRACE=1: stage-0 trace (xtrace.h) on this draft fabric too; default off
-        cd.xtrace = knob::ds_xtrace() ? 1 : 0;
-        fabds.init(cd);
-        fabds.start_proxy();
-    }
-#endif
-    g6::Fabric fabf;                    // --dflash: the drafter's region, dfl::NC collectives, decode-sized slots
-    if (dfl)
-    {
-        g6::FabricConfig cd = cfg;
-        cd.ncoll = dfl::NC;
-        cd.port = cfg.port + 40;
-        cd.proxy_cpu = cfg.proxy_cpu > 6 ? cfg.proxy_cpu - 7 : -1;   // own core: not N-2 (fabp2) or N-6 (fabd)
-        fabf.init(cd);
-        fabf.start_proxy();
-    }
 #if G6_NR == 4
-    g6::Fabric fabq;                    // GR8_PF_QP_ROLL: ring of [lo | hi] pair half images, one-peer jobs (qp_wire.h)
-    QpWire qp_wire;
-    if (qp_roll_s)
-    {
-        g6::FabricConfig qc = cfg;
-        qc.vcap.clear(); qc.vdst_k.clear();
-        qc.bulk_bytes = qw::bulk_bytes(qp_wire_e);
-        qc.bulk_flags = qw::bulk_flags(qp_wire_e);
-        qc.port = cfg.port + 56;
-        qc.proxy_cpu = cfg.proxy_cpu > 4 ? cfg.proxy_cpu - 5 : -1;
-        fabq.init(qc);
-        fabq.start_proxy();
-        qp_wire.bd = fabq.bulk_dev(); qp_wire.E = qp_wire_e; qp_wire.peer = qw::partner(cfg.rank);
-        qp_wire.enqueue = [&fabq](g6::Fabric::BulkJob j) { fabq.enqueue_bulk(std::move(j)); };
-        fprintf(stderr, "# rank %d: GR8_PF_QP_ROLL=%d wire fabric: %d entr%s x [lo | hi] %.2f MB = %.3f GB pinned + registered, partner rank %d\n",
-                cfg.rank, qp_roll_s, qp_wire_e, qp_wire_e == 1 ? "y" : "ies", qw::HALF / 1e6, qw::bulk_bytes(qp_wire_e) / 1e9, qp_wire.peer);
-    }
+    QpWire qp_wire;                     // GR8_PF_QP_ROLL: the wire over fabq (qp_wire.h), set up after its init
     auto qp_err = [&]() -> unsigned { return qp_roll_s ? *fabq.bulk_dev().error : 0u; };
 #else
     auto qp_err = [&]() -> unsigned { return 0u; };
@@ -1094,22 +382,6 @@ int main(int argc, char** argv)
     const float dfl_alpha = (float)knob::dfl_sel_alpha();
     if (!std::isfinite(dfl_alpha)) die("GR8_DFL_SEL_ALPHA: not a finite float");
     if (dfl_alpha != 1.f && !dfl) die("GR8_DFL_SEL_ALPHA needs --dflash-manifest");
-    g6::Fabric fabg, fabdg;
-    bool fabg_on = false, fabdg_on = false;
-    auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
-        g6::FabricConfig gc = cfg;
-        gc.vcap.clear(); gc.vdst_k.clear();
-        gc.ncoll = mm.qs.ncoll();
-        gc.slot_bytes = qs_slot_bytes(mm);
-        gc.port = cfg.port + port_off;
-        // GR8_QA_SPLIT_CPU: its proxy's core (-1 = unpinned); A/B of the placement
-        gc.proxy_cpu = (int)knob::qa_split_cpu().value_or(cfg.proxy_cpu > 8 ? cfg.proxy_cpu - 9 : -1);
-        fb.init(gc);
-        fb.start_proxy();
-        fprintf(stderr, "# rank %d: %s gather fabric: %d collectives of up to %zu B, %.1f MB pinned, proxy CPU %d\n", cfg.rank, what,
-                gc.ncoll, gc.slot_bytes, 2.0 * gc.ncoll * (1 + cfg.ips.size()) * ((gc.slot_bytes + 8 + 255) & ~size_t(255)) / 1e6, gc.proxy_cpu);
-    };
-    auto qs_err = [&]() -> unsigned { return (fabg_on ? *fabg.dev().error : 0u) | (fabdg_on ? *fabdg.dev().error : 0u); };   // the gather proxies' own error words
     // GR8_DRAFT_HEAD_I4=1 (rank.cuh build_draft_head_i4; default 0): the MTP draft's head reads INT4 g32 records of the
     // rank's vocab slice; the target's head is unchanged. In the S2 runtime signature.
     const DraftHeadI4 dhead = draft_head_i4_env();
@@ -1131,59 +403,96 @@ int main(int argc, char** argv)
     // MXFP8 records. Drafts only; +382 MB per rank. In the S2 runtime signature
     const bool dfl_body_i4_on = knob::dfl_body_i4();
     if (dfl_body_i4_on && !dfl) die("GR8_DFL_BODY_I4=1 needs --dflash-manifest");
-    int cp_step = 0;                    // GR8_CP_STEP_ROWS (s2/cp_rows.h): the rows a step past R may carry; 0 = off
+    // the fabric plan (fabric_plan.h): every fabric's config, and the bring-up's refusals, before the first fabric
+    PlanInputs fpi;
+    fpi.k = plan_knobs();
+#if G6_MODEL_FLASH
+    fpi.pf_sp = pf_sp();
+    fpi.pool_owner_mode = flash_pool_owner_mode();
+#endif
+    fpi.dfl_ncoll = dfl::NC;
+#if G6_MODEL_DS41
+    fpi.head_payload = glue::head_bytes_tk(MX, nc, true);
+    fpi.trunk_bytes = sizeof(ds_mhc::trunk_t);
+#endif
+    for (int l : layers) { fpi.full_index.push_back(cp_full_index(l)); fpi.attn.push_back(cp_attn_layer(l)); }
 #if defined(G6_CP) && G6_CP
-    // CP: env as m4sim (GR8_CP, GR8_CP_R, GR8_CP_S3, GR8_CP_MMAX). Own fabric `fabc` (cplayout.h variable
-    // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
-    const bool cp_on = knob::cp().value_or(!G6_MODEL_FLASH);   // Flash: off unless asked for
-    const int cp_R = (int)knob::cp_r();
-    const int cp_s3 = knob::cp_s3() ? 1 : 0;
-#if G6_MODEL_FLASH
-    if (cp_on && s2mode && s2sess > 1 && (cp_R < 64 || cp_R >= cap)) die("Flash GR8_CP with several sessions: GR8_CP_R must be 64..--cap - 1");
+    fpi.cp_build = true;
 #endif
-    int cp_mmax = K + 1;
-    for (int M : row_counts) cp_mmax = std::max(cp_mmax, M);
-#if G6_MODEL_FLASH
-    cp_mmax = MX;   // a CP step may carry any row count of a decode step (prompt chunks, MTP and DFlash2 verifies)
+    fpi.gather = qs_mode || iq_split;
+    fpi.draft_gather = mtp_split;
+    const FabricPlan fplan = fabric_plan(eo, fpi);
+    for (const std::string& l : fplan.log) fputs(l.c_str(), stderr);
+    if (!fplan.refusal.empty()) die(fplan.refusal);
+    const bool& two = fplan.two;
+#if G6_MODEL_DS41
+    const bool &rowshard = fplan.rowshard, &y_mxfp8 = fplan.y_mxfp8, &pf_direct = fplan.pf_direct;
+    const int &rs_k = fplan.rs_k, &pf_lanes_fab = fplan.pf_lanes_fab;
 #endif
-    // S2: a split run past R shares batched steps, so any S2 step (sc.max_rows below) may run the CP block.
-    // GR8_CP_STEP_ROWS=n: S2 steps past R carry at most n rows (Driver::step caps their rounds, cp_rows.h), so the fabric
-    // is sized for n: at least the rows before #94 (cp_mmax here), at most the widest S2 step
-    if (s2mode)
+#if G6_MODEL_FLASH
+    const bool &pool_owner = fplan.pool_owner, &route_split = fplan.route_split;
+#endif
+    [[maybe_unused]] const int& cp_step = fplan.cp_step;   // GR8_CP_STEP_ROWS (s2/cp_rows.h): the rows a step past R may carry; 0 = off
+    g6::Fabric* const fabrics[kFabKinds] = {&fab, &fabB, &fabp, &fabp2, &fabix, &fabix2, &fabrs, &fabrs2,
+                                            &fabd, &fabds, &fabf, &fabq, &fabc, &fabg, &fabs, &fabdg};
+    fabric_bring_up(fplan, fabrics, fabric_dump, [&](const PlannedFabric& e, g6::Fabric& fb) {
+        switch (e.kind)
+        {
+        case FabKind::LaneB:
+            fprintf(stderr, "# rank %d DS41 two-lane prefill: lane B fabric port %d proxy cpu %d, slot table without the C8-pack late slots (run1 %d)\n",
+                    cfg.rank, e.cfg.port, e.cfg.proxy_cpu, e.cfg.run1);
+            break;
+        case FabKind::RouteSplit:
+        case FabKind::RouteSplit2:
+            if (e.kind == FabKind::RouteSplit2 || !two)
+                fprintf(stderr, "# rank %d: GR8_PF_ROUTER_SPLIT=1: prefill MoE router row-split, route tables over a dedicated fabric%s\n",
+                        cfg.rank, two ? " per lane" : "");
+            break;
+#if G6_NR == 4
+        case FabKind::QpWire:
+            qp_wire.bd = fb.bulk_dev(); qp_wire.E = qp_wire_e; qp_wire.peer = qw::partner(cfg.rank);
+            qp_wire.enqueue = [&fabq](g6::Fabric::BulkJob j) { fabq.enqueue_bulk(std::move(j)); };
+            fprintf(stderr, "# rank %d: GR8_PF_QP_ROLL=%d wire fabric: %d entr%s x [lo | hi] %.2f MB = %.3f GB pinned + registered, partner rank %d\n",
+                    cfg.rank, qp_roll_s, qp_wire_e, qp_wire_e == 1 ? "y" : "ies", qw::HALF / 1e6, qw::bulk_bytes(qp_wire_e) / 1e9, qp_wire.peer);
+            break;
+#endif
+        case FabKind::Cp:
+            fprintf(stderr, "# rank %d: GR8_CP fabric %d collectives, mmax %d, %.3f GB pinned + registered\n", cfg.rank,
+                    fplan.cp_colls.ncoll(), fplan.cp_mmax, (fb.vlayout().send_bytes() + fb.vlayout().recv_bytes()) / 1e9);
+            break;
+        default:
+            break;
+        }
+    });
+    if (fabric_dump)
     {
-        const int full = std::min(MX, std::max(s2sess * (mtp + 1), plan.chunk));
-        std::string ce;
-        cp_step = g6s2::cp_step_rows(knob::cp_step_rows(), cp_mmax, full, &ce);
-        if (cp_step < 0) die(ce);
-        cp_mmax = std::max(cp_mmax, cp_step ? cp_step : full);
+        fprintf(stderr, "g6m4: GR8_FABRIC_DUMP: stopping before the first fabric\n");
+        return 4;                       // not a clean stop, should the knob be left set
     }
-    else if (knob::cp_step_rows()) die("GR8_CP_STEP_ROWS needs --serve");
-    if (const auto v = knob::cp_mmax()) cp_mmax = std::max(cp_mmax, (int)*v);
-    if (cp_R < 0 || cp_R % 64) die("GR8_CP_R must be a multiple of 64");
-    // GR8_CP_R2: a session may take a smaller R; every step past it runs the CP block (CpState::step_R)
-    const int cp_R2 = (int)knob::cp_r2().value_or(0);
-    if (cp_R2 && (cp_R2 < 64 || cp_R2 % 64 || cp_R2 >= cp_R || !cp_on || !s2mode || !rt_win))
-        die("GR8_CP_R2 must be a multiple of 64 below GR8_CP_R, with GR8_CP on, --serve and GR8_RT_LOCAL");
-    const int cp_step_R = cp_R2 ? cp_R2 : cp_R;
-    g6::CpColls cp_colls;
-    {
-        std::vector<bool> full, attn;   // attn: the layers with an attention block (Flash: not the KDA layers)
-        for (int l : layers) { full.push_back(cp_full_index(l)); attn.push_back(cp_attn_layer(l)); }
-        cp_colls.make(full, (int)cfg.ips.size(), cp_mmax, attn);
-    }
-    g6::Fabric fabc;
-    if (cp_on)
-    {
-        g6::FabricConfig cc = cfg;
-        cc.vcap = cp_colls.cap;
-        cc.vdst_k = cp_colls.dst_k;
-        cc.port = cfg.port + 32;
-        cc.proxy_cpu = cfg.proxy_cpu > 2 ? cfg.proxy_cpu - 3 : -1;
-        fabc.init(cc);
-        fabc.start_proxy();
-        fprintf(stderr, "# rank %d: GR8_CP fabric %d collectives, mmax %d, %.3f GB pinned + registered\n", cfg.rank, cp_colls.ncoll(),
-                cp_mmax, (fabc.vlayout().send_bytes() + fabc.vlayout().recv_bytes()) / 1e9);
-    }
+    const g6::FabricDev f = fab.dev();
+    // a late fabric's planned config; its init site sets what the built model decides
+    auto late_fabric = [&](FabKind k) -> g6::FabricConfig {
+        const PlannedFabric* e = fplan.find(k);
+        if (!e) die(std::string("the fabric plan has no ") + fab_name(k));
+        return e->cfg;
+    };
+    bool fabg_on = false, fabdg_on = false;
+    auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, FabKind kind, const char* what) {
+        g6::FabricConfig gc = late_fabric(kind);
+        gc.ncoll = mm.qs.ncoll();
+        gc.slot_bytes = qs_slot_bytes(mm);
+        fb.init(gc);
+        fb.start_proxy();
+        fprintf(stderr, "# rank %d: %s gather fabric: %d collectives of up to %zu B, %.1f MB pinned, proxy CPU %d\n", cfg.rank, what,
+                gc.ncoll, gc.slot_bytes, 2.0 * gc.ncoll * (1 + cfg.ips.size()) * ((gc.slot_bytes + 8 + 255) & ~size_t(255)) / 1e6, gc.proxy_cpu);
+    };
+    auto qs_err = [&]() -> unsigned { return (fabg_on ? *fabg.dev().error : 0u) | (fabdg_on ? *fabdg.dev().error : 0u); };   // the gather proxies' own error words
+#if defined(G6_CP) && G6_CP
+    // CP: env as m4sim (GR8_CP, GR8_CP_R, GR8_CP_S3, GR8_CP_MMAX). Own fabric `fabc` (cplayout.h variable layout:
+    // per-collective slots, single-destination partials), sized in the plan
+    const bool& cp_on = fplan.cp_on;
+    const int &cp_R = fplan.cp_R, &cp_R2 = fplan.cp_R2, &cp_s3 = fplan.cp_s3, &cp_step_R = fplan.cp_step_R;
+    const g6::CpColls& cp_colls = fplan.cp_colls;
     // enqueue the CP collectives of a step that runs the CP block (context > CpState::step_R), before its GPU work
     auto cp_enqueue = [&](unsigned long long step, int M, int context) { if (cp_on && context > cp_step_R) fabc.enqueue_step(step, cp_colls.sizes(M)); };
     auto cp_error = [&]() -> unsigned { return (cp_on ? *fabc.dev().error : 0u) | qs_err(); };   // + the GR8_QA_SPLIT proxy
@@ -1401,7 +710,7 @@ int main(int argc, char** argv)
 #endif
     if (m.qs.on())                      // every rank, at the same point: its TCP bootstrap is a barrier
     {
-        qs_fabric(fabg, m, 64, "GR8_QA_SPLIT / GR8_IDXQ_SPLIT");
+        qs_fabric(fabg, m, FabKind::Gather, "GR8_QA_SPLIT / GR8_IDXQ_SPLIT");
         fabg_on = true;
         qs_attach(m, fabg.dev(), f.error);   // GPU-side gather wait timeouts land in the error word the step loop checks
     }
@@ -1419,16 +728,11 @@ int main(int argc, char** argv)
             m.cp.vs.push_back(v);
         }
     // step 4d: CP prefill staging pools = the registered area of a bulk-mode fabric (prefill.cuh CpPfNet)
-    g6::Fabric fabs;
     const bool cp_pf = cp_on && MP;
     if (cp_pf)
     {
-        g6::FabricConfig sc = cfg;
-        sc.vcap.clear(); sc.vdst_k.clear();
+        g6::FabricConfig sc = late_fabric(FabKind::CpStage);
         sc.bulk_bytes = 2 * cp_pf_pool_bytes(m);
-        sc.bulk_flags = 4;
-        sc.port = cfg.port + 48;
-        sc.proxy_cpu = cfg.proxy_cpu > 3 ? cfg.proxy_cpu - 4 : -1;
         fabs.init(sc);
         fabs.start_proxy();
         cp_pf_net_init(m, fabs, st);
@@ -1511,7 +815,7 @@ int main(int argc, char** argv)
         build_draft(D, m, find, cap, fd, dmalloc<u64>(1), st, MP ? pf_attn_rows(MP) : MX);
         if (D.d.qs.on())
         {
-            qs_fabric(fabdg, D.d, 72, "GR8_MTP_SPLIT");
+            qs_fabric(fabdg, D.d, FabKind::DraftGather, "GR8_MTP_SPLIT");
             fabdg_on = true;
             qs_attach(D.d, fabdg.dev(), fd.error);   // the draft fabric's error word, which the draft step checks
         }
@@ -2002,15 +1306,13 @@ int main(int argc, char** argv)
         bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = cfg.ips[0];
         bc.directory = s2dir; bc.port = s2port;
         bc.timeout = (unsigned)knob::s2_timeout();
-        bc.runtime_signature = "flash solo cap " + std::to_string(cap) + " layers " + layers_s +
-            " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " mtp " + std::to_string(mtp) +
-            " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id +
-            (dfl ? " dflash k " + std::to_string(dfl_k) : std::string()) +
-            (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : std::string()) +
-            (s2sess > 1 ? " sessions " + std::to_string(s2sess) + " split " + std::to_string(gsplit) : std::string()) +
-            knob::signature();
-        // GR8_GLM53F_CACHE: the checkpoint store of this rank. Every rank must keep the same entries, so the mode, the
-        // store's blocks and the grid join the signature
+        g6s2::SigInputs sig;               // s2/signature.h
+        sig.model = g6s2::SigModel::Flash;
+        sig.cap = cap; sig.layers_s = layers_s; sig.MP = MP; sig.lanes = lanes; sig.mtp = mtp; sig.chunk = plan.chunk; sig.nc = nc;
+        sig.set_id = set_id; sig.dfl = dfl; sig.dfl_k = dfl_k; sig.dfl_reuse = dfl_reuse; sig.dfl_reuse_min = dfl_reuse_min;
+        sig.s2sess = s2sess; sig.gsplit = gsplit; sig.knobs = knob::signature();
+        // GR8_GLM53F_CACHE: the checkpoint store of this rank. Every rank must keep the same entries, so the mode and
+        // the store's blocks join the signature
         std::unique_ptr<g6s2::FlashCheckpoints> ckpt;
         if (flash_cache != g6s2::FlashCache::Off)
         {
@@ -2074,9 +1376,11 @@ int main(int argc, char** argv)
                     group ? (", group " + group->group + " lease, " + std::to_string(ckpt->segments()) + " segments to start").c_str() : "");
             // persist: every rank joins the agreement on persisted entries (serve_flash), or none does. The index itself is
             // not here: the agreement makes it the same on every rank, and the pool digest compares it at every event
-            bc.runtime_signature += std::string(" ckpt ") + g6s2::flash_cache_name(flash_cache) + " blocks " + std::to_string(ckpt->blocks()) +
-                (index_path.empty() ? "" : " persist");
+            sig.ckpt = g6s2::flash_cache_name(flash_cache);
+            sig.ckpt_blocks = ckpt->blocks();
+            sig.ckpt_persist = !index_path.empty();
         }
+        bc.runtime_signature = g6s2::runtime_signature(sig);
         // DFlash2 (--dflash-manifest): a session alone drafts with the drafter, as on GLM-5.3 (s2_batch.h Batch::dflash);
         // Dfl::pf_feat holds the prefill taps of the session whose prefill started last (s2/flash_dfl_window.h: with
         // GR8_GLM53F_CACHE, a checkpoint hit inside the window keeps the drafter through GR8_DFL_REUSE)
@@ -2274,30 +1578,17 @@ int main(int argc, char** argv)
         bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = cfg.ips[0];
         bc.directory = s2dir; bc.port = s2port;
         bc.timeout = (unsigned)knob::s2_timeout();
-        bc.runtime_signature = std::string(s2sess > 1 ? "ds41 sessions " + std::to_string(s2sess) : std::string("ds41 solo")) + " cap " + std::to_string(cap) + " layers " + layers_s + " mtp " + std::to_string(dsk.mtp) +
-            " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id +
-            (dfl ? " dflash k " + std::to_string(dfl_k) : std::string()) +
-            " shtc " + std::to_string(ds41moe::sh_tc_on() ? 1 : 0) +   // GR8_DS_SH_TC: ranks must agree (W8A8 shared expert, not bit-identical to 0)
-            (ds41moe::ro_l2hint() ? " l2h " + std::to_string(ds41moe::ro_l2hint()) : std::string()) +   // GR8_DS_MOE_L2HINT: 0 adds nothing; ranks that disagree on 1 / 2 refuse to join
-            (ds41moe::ro_fc2stg() ? std::string(" stg 1") : std::string()) +   // GR8_DS_MOE_FC2STG: 0 adds nothing; ranks that disagree refuse to join
-            (ds41moe::ro_fc1bstg() ? std::string(" fc1bstg 1") : std::string()); // off adds nothing; ranks with the staged B arm must agree
-        if (sc.c8_pack) bc.runtime_signature += " c8pack 1";
-        if (ds_sess_drafts) bc.runtime_signature += " sessdrafts 1";   // off adds nothing; ranks that disagree refuse to join
-        if (pf_lanes == 2) bc.runtime_signature += " pflanes 2";   // unset / 1 adds nothing; ranks that disagree refuse to join
-        if (ds_moe_decode_topk != ds_moe_main_topk)
-            bc.runtime_signature += " tkmain " + std::to_string(ds_moe_main_topk) +
-                                    " tkdecode " + std::to_string(ds_moe_decode_topk);
-        if (ds_idx_pipe_b) bc.runtime_signature += " idxpipeb 1";
-        if (ds_idx_q_trig) bc.runtime_signature += " idxqtrig 1";
-        if (ds_idx_pipe_qr) bc.runtime_signature += " idxpipeqr 1";
-        if (reuse_prefix) bc.runtime_signature += " reuse 1";
-        // DS41 image input: the effective capability, not the knob (a rank without the tower file boots text-only). With the
-        // tower, " vision <file id>" (header length + header bytes + file size: header/layout/size agreement, not tensor data);
-        // without, nothing. A rank that differs (no file, another header or size) refuses at bootstrap
-        bc.runtime_signature += ds41v::signature(vis_on, vis_id);
-        // the agree-scope knobs that are not at their default (knob::signature(), as Flash and GLM add): a rank whose value
-        // differs (GR8_DS_COMP_FP4 on three ranks and off on one) refuses at bootstrap instead of diverging later
-        bc.runtime_signature += knob::signature();
+        g6s2::SigInputs sig;               // s2/signature.h
+        sig.model = g6s2::SigModel::Ds41;
+        sig.s2sess = s2sess; sig.cap = cap; sig.layers_s = layers_s; sig.ds_mtp = dsk.mtp; sig.chunk = plan.chunk; sig.nc = nc;
+        sig.set_id = set_id; sig.dfl = dfl; sig.dfl_k = dfl_k;
+        sig.sh_tc = ds41moe::sh_tc_on(); sig.l2hint = ds41moe::ro_l2hint(); sig.fc2stg = ds41moe::ro_fc2stg(); sig.fc1bstg = ds41moe::ro_fc1bstg();
+        sig.c8_pack = sc.c8_pack; sig.sess_drafts = ds_sess_drafts; sig.pf_lanes = pf_lanes;
+        sig.tk_main = ds_moe_main_topk; sig.tk_decode = ds_moe_decode_topk;
+        sig.idx_pipe_b = ds_idx_pipe_b; sig.idx_q_trig = ds_idx_q_trig; sig.idx_pipe_qr = ds_idx_pipe_qr; sig.reuse = reuse_prefix;
+        sig.vis_on = vis_on; sig.vis_id = vis_id;
+        sig.knobs = knob::signature();
+        bc.runtime_signature = g6s2::runtime_signature(sig);
         // DSpark (GR8_DS_MTP): the draft Model, its fabric, the 5-row draft graph (or the eager step) and the compressor commit of the main Model
         g6s2::Ds41Dspark ds{DS, in_ds, out_ds,
             [&](const StepIn& si) {     // 11 collectives: 6 layer exchanges of the 5 block rows, then the 5 markov merges of one row each (x DS.ds_ns sessions)
@@ -2352,7 +1643,7 @@ int main(int argc, char** argv)
         // bounded replay (ds41_pf_split.h): GR8_DS_PF_TAIL, read once; 0 = off (the unsplit non-final plan)
         const int pf_tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
         if (pf_tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
-        ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1); the same value the fabric block set
+        ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1); the value the fabric plan set
         if (ds41::br::l20_tail() && !pf_tail) die("GR8_DS_PF_L20_TAIL=1 needs GR8_DS_PF_TAIL (layer 20 joins the bounded replay)");
         if (pf_min) fprintf(stderr, "# rank %d DS41 prefill bounded replay tail %d (layers >= %d)\n", R, pf_tail, ds41::br::late_layer_start());
         if (pf_min && ds41::br::l20_tail())
@@ -2918,7 +2209,7 @@ int main(int argc, char** argv)
                             (unsigned long long)slots, kvt->blocks().slot_bytes(), keep.c_str(), index.empty() ? "" : ", indexed");
                 }
                 if (const uint64_t gone = pool.tiers_loaded())
-                    fprintf(stderr, "# rank %d: s2 stores: %llu stored runs dropped (their base came back in no store, or a whole index reopened with keep=system)\n", R, (unsigned long long)gone);
+                    fprintf(stderr, "# rank %d: s2 stores: %llu stored records dropped (base came back in no store, a whole index reopened with keep=system, or slots past the store or taken twice)\n", R, (unsigned long long)gone);
                 pool.write_limit((uint64_t)std::llround(kv_write_limit * 1000));
                 // a run past R keeps its tail: each rank's shard and the replicated parts (only when the pool's R is the CP
                 // map's, so the pages past it are the sharded ones)
@@ -3670,29 +2961,21 @@ int main(int argc, char** argv)
             bc.port = (uint16_t)s2port;
             if (g6_attn_ctx_sp() || g6_attn_posidx())   // round 10 E1 attention flags (attn.cu), read once before the bindings
                 fprintf(stderr, "# rank %d: decode attention E1: GR8_ATTN_CTX3_SP %d GR8_ATTN_POSIDX %d\n", R, g6_attn_ctx_sp(), g6_attn_posidx());
-            bc.runtime_signature = "g6m4 s2 below " + std::to_string(s2_below) + " cap " + std::to_string(cap) + " layers " + layers_s +
-                " mp " + std::to_string(MP) + " lanes " + std::to_string(two ? 2 : 1) + " mtp " + std::to_string(mtp) + " chunk " +
-                std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
-                " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0) + " qpmin " + std::to_string(pf_qp ? pf_qp_min() : 0) +
-                (set_id.empty() ? "" : " set " + set_id) + (g6rt::grammar_ready() ? " grammar" : "") +
-                (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : "") + s2::ngram_sig(ngram) +
-                (kstop.mode ? " kstop " + std::to_string(kstop.mode) + " kmax " + std::to_string(kstop.kmax) + " tau " + std::to_string(kstop.tau[1]) + "," +
-                              std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "") +
-                (draft_par ? " draftpar " + std::to_string(draft_par) : "") +
-                (qs_mode ? " qasplit " + std::to_string(qs_mode) : "") +
-                (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
-                (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
-                (mtp_last ? " mtplast 1" : "") + (dhead2 ? " dhead2 " + std::to_string(dhead2) : "") +
-                (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
-                (dfl_body_i4_on ? " dflbodyi4 1" : "") +
-                (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
-                (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "") + s2::kstopb_sig(kstop.b) +
-                (cp_step ? " cpsr " + std::to_string(cp_step) + (sc.cp_seg ? " seg" : "") : "") +
-                (g6_attn_ctx_sp() ? " ctxsp " + std::to_string(g6_attn_ctx_sp()) : "") + (g6_attn_posidx() ? " posidx 1" : "") +
-                // the S2 layers carry the shared-scope MoE finalize steering; every rank must (a rank without it would
-                // leave its share of the shared-expert correction out of batched steps)
-                (steering_boot.loaded && steering_boot.scope == steering::Scope::Shared ? " s2steer 1" : "") +
-                knob::signature();
+            g6s2::SigInputs sig;           // s2/signature.h
+            sig.model = g6s2::SigModel::Glm;
+            sig.s2_below = s2_below; sig.cap = cap; sig.layers_s = layers_s; sig.MP = MP; sig.two = two; sig.mtp = mtp;
+            sig.chunk = plan.chunk; sig.nc = nc; sig.pf_own = pf_own; sig.pf_qp = pf_qp; sig.qp_ctx = P.qp_ctx; sig.qp_min = pf_qp_min();
+            sig.set_id = set_id; sig.grammar = g6rt::grammar_ready(); sig.dfl_reuse = dfl_reuse; sig.dfl_reuse_min = dfl_reuse_min;
+            sig.ngram = s2::ngram_sig(ngram);
+            sig.kstop_mode = kstop.mode; sig.kstop_kmax = kstop.kmax; std::copy(kstop.tau, kstop.tau + 4, sig.kstop_tau); sig.kstop_seed3 = kstop.seed3;
+            sig.draft_par = draft_par; sig.qs_mode = qs_mode; sig.iq_split = iq_split; sig.mtp_split = mtp_split;
+            sig.dhead_on = dhead.on; sig.dhead_tpc = dhead.tpc; sig.dhead_ks = dhead.ks; sig.mtp_last = mtp_last; sig.dhead2 = dhead2;
+            sig.dfl_i4 = dfl_i4; sig.dfl_body_i4 = dfl_body_i4_on; sig.dfl_alpha = dfl_alpha;
+            sig.dsel_model = dsel_model; sig.dsel_tab = dsel_tab.str(); sig.kstopb = s2::kstopb_sig(kstop.b);
+            sig.cp_step = cp_step; sig.cp_seg = sc.cp_seg; sig.ctx_sp = g6_attn_ctx_sp(); sig.posidx = g6_attn_posidx();
+            sig.steer_shared = steering_boot.loaded && steering_boot.scope == steering::Scope::Shared;
+            sig.knobs = knob::signature();
+            bc.runtime_signature = g6s2::runtime_signature(sig);
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);
@@ -3742,8 +3025,8 @@ int main(int argc, char** argv)
                     pool.write_limit(0);
                     kv_drain();   // reserve fails while store copies are queued (g6kvman.h): run them first
                     // sweep the pool: reserve at --cap rows (the pool's capacity) until the pool refuses, then halve down
-                    // to one page (64 rows, always tried last, also when cap < 128): runs still live keep their rows, so
-                    // the whole pool rarely fits one reserve. Each reserve evicts what it needs through the
+                    // to one page (64 rows, always tried last, also when cap < 128). The halving is the fallback for when a
+                    // cap-sized reserve cannot take everything (rows a live run still holds). Each reserve evicts what it needs through the
                     // stores. The calls depend only on the pool's state, which every rank shares, so every rank makes
                     // the same ones; no wall-clock stop (it could end ranks at different points). At most the pool's
                     // pages plus one refusal per size

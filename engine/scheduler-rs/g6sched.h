@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include "../kvman-rs/g6kvman.h"
+#include "../module_info.h"
 
 extern "C" {
 
@@ -88,7 +89,7 @@ struct g6sch_config {
     // not, and its tail does not ask for a decode round (Scheduler::alternate), so a burst of short prompts reaches its
     // first tokens one tail per step instead of after every prefill and a decode round per tail.
     bool tail_first;
-    // GR8_S2_NOTICE_MAX=<k>: the notice target's cap, NOTICE_MIN..NOTICE_MAX boundaries (horizon(), service.h event).
+    // GR8_S2_NOTICE_MAX=<k>: the notice target's cap, NOTICE_MIN..NOTICE_MAX boundaries (horizon(), control.rs event).
     // Lower only from a measured margin: a notice that lands after its boundary is fatal
     uint32_t notice_max;
     // DS41 only: short fresh prompts prefill together in one ragged pass, then share one prompt-tail step
@@ -742,6 +743,320 @@ void g6svc_trace_instant(const g6svc_trace* t, const uint8_t* name, size_t name_
                          size_t args_n);
 uint64_t g6svc_trace_now(void);
 
+// s2/admit.h: the head's admission decisions. why: g6sch_status's (0 none, 1 slots, 2 capacity); recall_note: 0 none,
+// 1 begin, 2 done
+uint64_t g6svc_notice_target(uint64_t boundary, uint64_t horizon, bool held, uint64_t held_at, uint32_t notice_max);
+bool g6svc_admit_retry(uint64_t head, uint64_t attempted_head, uint64_t revision, uint64_t attempted_revision);
+uint64_t g6svc_attempted_revision(uint64_t revision);
+bool g6svc_admit_shrink(bool fits, bool can_make_room, uint32_t live, uint32_t limit);
+bool g6svc_admit_grant(uint32_t why, uint32_t short_of);
+bool g6svc_admit_drain(bool admit_hold, uint32_t live, uint32_t limit);
+bool g6svc_admit_hold(bool admit_hold, bool queued, uint32_t live, uint32_t limit);
+bool g6svc_wait_line(uint32_t why, uint64_t last, uint64_t head);
+bool g6svc_refusal_line(uint32_t why, uint64_t last, uint64_t head);
+uint32_t g6svc_recall_note(uint32_t why, uint32_t short_of, uint64_t waiting, uint64_t head);
+bool g6svc_share_idle(uint32_t resident, size_t queued);
+bool g6svc_lend_idle(uint32_t resident, size_t queued, uint32_t retiring);
+// Sessions::request, and steering.h's cache namespace (G6KV_NAMESPACE_BYTES into out)
+void g6svc_request(uint64_t id, size_t prompt_tokens, int32_t n_gen, const g6sch_identity* steering,
+                   g6sch_request* out);
+void g6svc_cache_namespace(const g6sch_identity* s, uint8_t* out);
+
+// s2/service.h: the head's control thread (controller, event and its commit, intake, the ADMIT_HOLD drain), every
+// rank's watcher (monitor) and every rank's compute thread (the event boundary, the commit's application and the step
+// loop, and the driver's hooks with service logic) run in Rust; the C++ Service starts the threads and calls in. The
+// Rust borrows the Service's endpoint, ingress, queue, trace, the driver's slots and counters and the rank's pool for its
+// life. What stays C++ is g6svc_host. Fallible calls return 0, 1 when a host or pool-table call threw (the C++ holds the
+// exception), or 2 when refused, with the message in g6ctl_error().
+// a request file the host parsed and checked: ok false = refused and answered, nothing queued. prompt: valid until the
+// next host call
+struct g6svc_checked {
+    const int32_t* prompt; size_t n; int64_t sys; int32_t plp, n_gen; g6sch_identity steering; bool ok;
+};
+// one plain pool call of the head's control thread or a worker's bind, for a test's observer. kind: 0 room, 1 fits, 2 reserve, 3 count; out:
+// room's or count's result, or fits' as 0 or 1; run: reserve's
+struct g6svc_pool_call {
+    uint32_t kind; uint64_t rows, worst; uint32_t r, out; g6sch_run run; const int32_t* prompt; size_t n; int64_t span;
+    const uint8_t* ns;
+};
+// the request the compute thread staged for an ADMIT: req, the parser's g6rt::ServeReq (void: the layout digest needs
+// the pointee's size), and what a worker's bind reads of it. Valid until the next stage or unstage
+struct g6svc_staged { const void* req; const int32_t* prompt; size_t n; int64_t sys; int32_t plp; };
+// what the service's threads call in C++, each thread with its own ctx. Each returns 0, or 1 when the C++ threw. The
+// control thread: check, retire_run, share (null without a KV share), refusal and tiers (the pool policy's, whose bytes
+// and counters stay valid until the next host call). The compute thread: retire_run, the driver facade (idle_boundary;
+// digest, the pool's into the driver when has_pool, then the scheduler's; apply, with the staged request's payload when
+// admit; step), the staged request (stage parses it, unstage drops it), and Sessions and Dispatch: abort (a cancelled
+// session's terminal lines), mode (Dispatch::synchronize_mode), counters (the "m" lines due for these keys), begin
+// (Dispatch::begin), bound (Sessions::bind with the staged request) and release (Sessions::retire, Dispatch::release)
+struct g6svc_host {
+    void* ctx;
+    int32_t (*check)(void* ctx, uint64_t id, const uint8_t* bytes, size_t n, g6svc_checked* out);
+    int32_t (*retire_run)(void* ctx, const g6sch_slot* s);
+    int32_t (*share)(void* ctx, bool idle, bool* has, g6sch_resize* out);
+    int32_t (*refusal)(void* ctx, uint64_t worst, uint32_t r, const uint8_t** bytes, size_t* n);
+    int32_t (*tiers)(void* ctx, const g6kv_tier_totals** out, size_t* n);
+    int32_t (*idle_boundary)(void* ctx, uint64_t boundary);
+    int32_t (*stage)(void* ctx, const uint8_t* bytes, size_t n, g6svc_staged* out);
+    int32_t (*unstage)(void* ctx);
+    int32_t (*digest)(void* ctx, bool has_pool, uint64_t pool, uint64_t* out);
+    int32_t (*abort)(void* ctx, const g6sch_key* k);
+    int32_t (*apply)(void* ctx, const g6ctl_commit* c, bool admit);
+    int32_t (*mode)(void* ctx);
+    int32_t (*step)(void* ctx, g6sch_quantum* out);
+    int32_t (*counters)(void* ctx, const g6sch_key* keys, uint32_t n);
+    int32_t (*begin)(void* ctx, const g6sch_grant* g);
+    int32_t (*bound)(void* ctx, const g6sch_grant* g);
+    int32_t (*release)(void* ctx, const g6sch_slot* s);
+};
+// the control thread's settings, and the Service's objects it borrows (void: the C++ facades' handles, g6ctl_endpoint,
+// g6svc_ingress, g6sch_queue, g6svc_trace or null)
+struct g6svc_control_cfg {
+    const g6sch_config* scheduler; const uint8_t* directory; size_t directory_n;
+    const void* endpoint; const void* ingress; void* queue; const void* trace;
+    const g6sch_slot* slots; size_t n_slots; const g6sch_state* state;
+    g6s2_pool_ops pool; g6svc_host host; g6sch_lend lend;
+    int64_t share_ms; uint32_t rank; bool head, admit_hold, elog;
+};
+struct g6svc_control;
+int32_t g6svc_control_new(const g6svc_control_cfg* c, g6svc_control** out);
+void g6svc_control_free(g6svc_control* c);
+int32_t g6svc_control_run(const g6svc_control* c);                     // the head's control thread, until stopped
+int32_t g6svc_control_monitor(const g6svc_control* c, uint32_t linger_ms);   // every rank's watcher
+// the compute thread: its progress after each commit and step, and a Resize commit applied
+void g6svc_control_publish(const g6svc_control* c, uint64_t boundary, uint64_t revision, uint64_t horizon,
+                           uint32_t resident, uint32_t retiring);
+void g6svc_control_resized(const g6svc_control* c);
+uint32_t g6svc_control_resident(const g6svc_control* c);
+bool g6svc_control_stopping(const g6svc_control* c);
+void g6svc_control_stop(const g6svc_control* c);
+void g6svc_control_shutdown(const g6svc_control* c);   // stop, and fail the channel so every waiter wakes
+// status.s2 from the pool's values in s (free, room, growth, tiers, runs); the service's own fields are not read
+int32_t g6svc_control_write_status(const g6svc_control* c, const g6svc_status* s);
+// tests: an observer of the control thread's and a worker's bind's plain pool calls, set before the threads run
+void g6svc_control_observe(const g6svc_control* c, void (*f)(void* ctx, const g6svc_pool_call* call), void* ctx);
+// the compute thread's settings, and the Service's objects it borrows (void: the C++ facades' handles, g6svc_control,
+// g6ctl_endpoint, g6svc_ingress (the head's; a worker may pass null), g6svc_trace or null). dfl_reuse and ngram: the
+// head's terminal lines for GR8_DFL_REUSE and GR8_NGRAM
+struct g6svc_compute_cfg {
+    const void* control; const void* endpoint; const void* ingress; const void* trace;
+    const g6sch_slot* slots; size_t n_slots; const g6sch_state* state;
+    g6s2_module_ops module; g6svc_host host;
+    uint32_t rank; bool elog, dfl_reuse, ngram;
+};
+struct g6svc_compute;
+int32_t g6svc_compute_new(const g6svc_compute_cfg* c, g6svc_compute** out);
+void g6svc_compute_free(g6svc_compute* c);   // before the control it borrows
+int32_t g6svc_compute_run(const g6svc_compute* c);   // the compute thread, until stopped
+// the driver's hooks (DriverHooks) whose logic is the service's, on the compute thread inside the host's apply and step:
+// a grant (a worker checks its pool calls against the head's), a slot that leaves at a commit, a session that finished
+// at its step, a session's first emission (tracing only), the barrier after tier copies, and a session's drafter lines
+// at its completion
+int32_t g6svc_compute_bind(const g6svc_compute* c, const g6sch_grant* g);
+int32_t g6svc_compute_retire(const g6svc_compute* c, const g6sch_slot* s);
+int32_t g6svc_compute_finished(const g6svc_compute* c, const g6sch_slot* s);
+void g6svc_compute_first_token(const g6svc_compute* c, const g6sch_key* k);
+int32_t g6svc_compute_settle(const g6svc_compute* c);
+void g6svc_compute_terminal(const g6svc_compute* c, uint32_t slot, const g6s2_stats* s);
+
+// s2/signature.h: SigInputs with C strings (null reads as empty); model is SigModel (0 GLM, 1 Flash, 2 DS41). The
+// signature lives until the calling thread's next call.
+struct g6sig_inputs {
+    uint32_t model;
+    int32_t cap; const char* layers_s; int32_t chunk, nc; const char* set_id; bool dfl; int32_t dfl_k, s2sess; const char* knobs;
+    int32_t mp, mtp, dfl_reuse, dfl_reuse_min, lanes, gsplit; const char* ckpt; uint64_t ckpt_blocks; bool ckpt_persist;
+    int32_t s2_below; bool two; int32_t pf_own; bool pf_qp; int32_t qp_ctx, qp_min; bool grammar; const char* ngram;
+    int32_t kstop_mode, kstop_kmax; double kstop_tau[4]; double kstop_seed3; int32_t draft_par, qs_mode; bool iq_split, mtp_split;
+    int32_t dhead_on, dhead_tpc, dhead_ks; bool mtp_last; int32_t dhead2; bool dfl_i4, dfl_body_i4; float dfl_alpha;
+    int32_t dsel_model; const char* dsel_tab; const char* kstopb; int32_t cp_step; bool cp_seg; int32_t ctx_sp, posidx;
+    bool steer_shared; int32_t ds_mtp; bool sh_tc; int32_t l2hint, fc2stg, fc1bstg; bool c8_pack, sess_drafts;
+    int32_t pf_lanes, tk_main, tk_decode, idx_pipe_b, idx_q_trig, idx_pipe_qr; bool reuse, vis_on; const char* vis_id;
+};
+const char* g6sig_runtime(const g6sig_inputs* in);
+
+// engine_options.h: g6m4's option parse (src/options.rs) over the build's description (module_info.h) and the knob
+// table's C API (gr8_knobs.h; passed in, so this library needs nothing from libgr8knobs.a at link time). The host
+// table holds what stays C++: the DSpark knob parse's result (DS41) and ds41_engram_colls, which dies on a bad Engram
+// config as the boot does. The options' strings and lists live until g6opt_free; g6opt_options is null after a
+// refusal, and g6opt_refusal is "" when the options pass.
+struct g6opt_knobs {
+    uint64_t table_hash;
+    int (*flag)(uint32_t, uint32_t, int*);
+    int (*int_)(uint32_t, uint32_t, int64_t*);
+    int (*float_)(uint32_t, uint32_t, double*);
+    const char* (*text)(uint32_t, uint32_t);
+    ptrdiff_t (*ints)(uint32_t, uint32_t, const int64_t**);
+    ptrdiff_t (*floats)(uint32_t, uint32_t, const double**);
+    const char* (*tests_set)(void);
+};
+struct g6opt_host {
+    void* ctx;
+    int32_t (*engram_colls)(void*, const int32_t*, size_t);
+    int32_t dsk_mtp;
+    bool dsk_relaxed;
+    double dsk_relax_topp;
+    const char* dsk_err;
+};
+struct g6opt_strs {
+    const char* const* p;
+    size_t n;
+};
+struct g6opt_plan {
+    g6sch_ints prompt;
+    int32_t first;
+    int32_t chunk;
+    int32_t n_gen;
+    float inv_temp;
+    uint32_t seed;
+    float top_p;
+    int32_t lp;
+    int32_t plp;
+    bool rs;
+};
+struct g6opt_options {
+    int32_t rank;
+    g6opt_strs ips;
+    g6opt_strs ips2;
+    bool ring;
+    g6opt_strs ring_devs;
+    int32_t proxy_cpu;
+    g6opt_strs pf_ips2;
+    const char* manifest;
+    const char* packfile;
+    const char* v2_dir;
+    const char* v2_slices;
+    const char* v2_widths;
+    const char* v2_dense;
+    const char* v2_layout;
+    bool v2_trellis;
+    const char* qo_man;
+    const char* qo_file;
+    const char* layers_s;
+    const char* levels_s;
+    g6opt_strs prompts;
+    int32_t co_cap;
+    int32_t co_mp;
+    int32_t co_top;
+    int32_t co_pfrows;
+    int32_t co_mtp;
+    int32_t co_lanes;
+    int32_t co_nc;
+    float co_temp;
+    bool co_graph;
+    bool co_wide;
+    bool co_pfv2;
+    bool co_adapt;
+    bool has_n_gen;
+    int32_t n_gen;
+    bool has_chunk;
+    int32_t chunk;
+    bool has_seed;
+    uint32_t seed;
+    bool has_top_p;
+    float top_p;
+    bool has_rs;
+    bool rs;
+    const char* qp_man;
+    const char* qp_file;
+    const char* dfl_man;
+    const char* dfl_file;
+    int32_t dfl_sel;
+    int32_t dfl_k;
+    bool spec_reset_per_request;
+    bool spec_fixed;
+    g6opt_plan plan;
+    bool image;
+    bool hash;
+    bool reuse_prefix;
+    bool check_args;
+    bool lanes_explicit;
+    const char* s2dir;
+    const char* grammar_dir;
+    g6opt_strs kv_tiers;
+    const char* kv_keep;
+    int32_t kv_system_after;
+    double kv_write_limit;
+    const char* kv_format;
+    bool kv_old;
+    bool kv_old_all;
+    const char* set_id;
+    const char* steering_dir;
+    const char* steering_force_s;
+    const char* steering_model_revision;
+    const char* steering_tokenizer_revision;
+    const char* steering_template_digest;
+    const char* steering_weight_set;
+    const char* steering_template_file;
+    int32_t s2port;
+    int32_t s2sess;
+    uint64_t s2epoch;
+    int32_t cap;
+    int32_t top;
+    int32_t pfrows;
+    int32_t nc;
+    int32_t mtp;
+    int32_t mp;
+    int32_t lanes;
+    float temp;
+    bool graph;
+    bool wide;
+    bool pfv2;
+    bool adapt;
+    bool release;
+    bool s2mode;
+    bool dfl;
+    int32_t k;
+    g6sch_ints layers;
+    bool progress_isolate;
+    int32_t route_split_mode;
+    int32_t c8_pack_env;
+    bool spec_on;
+    g6sch_ints spec_levels;
+    double spec_draft_round;
+    double spec_draft_each;
+    double spec_table[9];
+    int32_t rt_win;
+    int32_t kstop_mode;
+    int32_t kstop_kmax;
+    double kstop_tau[4];
+    double kstop_seed3;
+    bool kstop_log;
+    bool kstop_solo;
+    int32_t kstopb_mode;
+    int32_t kstopb_kmin;
+    const double* kstopb_tau;
+    size_t kstopb_tau_n;
+    g6sch_ints kstopb_widths;
+    int32_t kstopb_explore;
+    int32_t flash_cache;
+    int64_t flash_budget_mib;
+    int32_t ds_moe_main_topk;
+    int32_t ds_moe_decode_topk;
+    int32_t ds_idx_pipe_b;
+    int32_t ds_idx_q_trig;
+    int32_t ds_idx_pipe_qr;
+    int32_t ds_admit_keep_scratch;
+    bool ds_sess_drafts;
+    int32_t ds_draft_cap;
+    const g6opt_plan* plans;
+    size_t n_plans;
+    g6sch_ints row_counts;
+    g6sch_ints draft_rows;
+    int32_t nl;
+    int32_t nx;
+    int32_t ncoll;
+    int32_t r;
+    bool own4;
+    int32_t qp_roll_s;
+    bool qp_roll_ser;
+    int32_t qp_wire_e;
+};
+struct g6opt_parsed;
+g6opt_parsed* g6opt_parse(const G6ModuleInfo* m, const g6opt_knobs* k, const g6opt_host* h, int argc, const char* const* argv);
+const char* g6opt_refusal(const g6opt_parsed* p);
+const g6opt_options* g6opt_options_of(const g6opt_parsed* p);
+void g6opt_free(g6opt_parsed* p);
+
 // The layout digest of every type above (and g6kvman.h's g6kv_tier_totals), computed the way src/layout.rs computes
 // it over the Rust types: per type its size and alignment, per field its offset, size and kind. The C++ compares it
 // with g6sch_layout() once at startup (scheduler.h check_abi).
@@ -836,6 +1151,19 @@ constexpr uint64_t g6sch_layout_cpp() {
     G6SCH_TYPE(g6svc_steering) G6SCH_FIELD(g6svc_steering, profiles) G6SCH_FIELD(g6svc_steering, n) G6SCH_FIELD(g6svc_steering, scope) G6SCH_FIELD(g6svc_steering, forced_scale_bits) G6SCH_FIELD(g6svc_steering, loaded) G6SCH_FIELD(g6svc_steering, forced)
     G6SCH_TYPE(g6svc_boot) G6SCH_FIELD(g6svc_boot, scheduler) G6SCH_FIELD(g6svc_boot, steering) G6SCH_FIELD(g6svc_boot, max_sessions) G6SCH_FIELD(g6svc_boot, rank) G6SCH_FIELD(g6svc_boot, ranks) G6SCH_FIELD(g6svc_boot, prefill_min) G6SCH_FIELD(g6svc_boot, control_version) G6SCH_FIELD(g6svc_boot, lp_max) G6SCH_FIELD(g6svc_boot, directory) G6SCH_FIELD(g6svc_boot, directory_n) G6SCH_FIELD(g6svc_boot, signature) G6SCH_FIELD(g6svc_boot, signature_n) G6SCH_FIELD(g6svc_boot, mtp0) G6SCH_FIELD(g6svc_boot, pack) G6SCH_FIELD(g6svc_boot, park)
     G6SCH_TYPE(g6svc_status) G6SCH_FIELD(g6svc_status, epoch) G6SCH_FIELD(g6svc_status, queued) G6SCH_FIELD(g6svc_status, stalls) G6SCH_FIELD(g6svc_status, grows) G6SCH_FIELD(g6svc_status, stalled) G6SCH_FIELD(g6svc_status, tiers) G6SCH_FIELD(g6svc_status, n_tiers) G6SCH_FIELD(g6svc_status, runs) G6SCH_FIELD(g6svc_status, n_runs) G6SCH_FIELD(g6svc_status, pool_pages) G6SCH_FIELD(g6svc_status, resident) G6SCH_FIELD(g6svc_status, retiring) G6SCH_FIELD(g6svc_status, free) G6SCH_FIELD(g6svc_status, room) G6SCH_FIELD(g6svc_status, held_pages) G6SCH_FIELD(g6svc_status, worst_pages) G6SCH_FIELD(g6svc_status, has_growth) G6SCH_FIELD(g6svc_status, has_tiers) G6SCH_FIELD(g6svc_status, has_runs)
+    G6SCH_TYPE(g6svc_checked) G6SCH_FIELD(g6svc_checked, prompt) G6SCH_FIELD(g6svc_checked, n) G6SCH_FIELD(g6svc_checked, sys) G6SCH_FIELD(g6svc_checked, plp) G6SCH_FIELD(g6svc_checked, n_gen) G6SCH_FIELD(g6svc_checked, steering) G6SCH_FIELD(g6svc_checked, ok)
+    G6SCH_TYPE(g6svc_pool_call) G6SCH_FIELD(g6svc_pool_call, kind) G6SCH_FIELD(g6svc_pool_call, rows) G6SCH_FIELD(g6svc_pool_call, worst) G6SCH_FIELD(g6svc_pool_call, r) G6SCH_FIELD(g6svc_pool_call, out) G6SCH_FIELD(g6svc_pool_call, run) G6SCH_FIELD(g6svc_pool_call, prompt) G6SCH_FIELD(g6svc_pool_call, n) G6SCH_FIELD(g6svc_pool_call, span) G6SCH_FIELD(g6svc_pool_call, ns)
+    G6SCH_TYPE(g6svc_staged) G6SCH_FIELD(g6svc_staged, req) G6SCH_FIELD(g6svc_staged, prompt) G6SCH_FIELD(g6svc_staged, n) G6SCH_FIELD(g6svc_staged, sys) G6SCH_FIELD(g6svc_staged, plp)
+    G6SCH_TYPE(g6svc_host) G6SCH_FIELD(g6svc_host, ctx) G6SCH_FIELD(g6svc_host, check) G6SCH_FIELD(g6svc_host, retire_run) G6SCH_FIELD(g6svc_host, share) G6SCH_FIELD(g6svc_host, refusal) G6SCH_FIELD(g6svc_host, tiers) G6SCH_FIELD(g6svc_host, idle_boundary) G6SCH_FIELD(g6svc_host, stage) G6SCH_FIELD(g6svc_host, unstage) G6SCH_FIELD(g6svc_host, digest) G6SCH_FIELD(g6svc_host, abort) G6SCH_FIELD(g6svc_host, apply) G6SCH_FIELD(g6svc_host, mode) G6SCH_FIELD(g6svc_host, step) G6SCH_FIELD(g6svc_host, counters) G6SCH_FIELD(g6svc_host, begin) G6SCH_FIELD(g6svc_host, bound) G6SCH_FIELD(g6svc_host, release)
+    G6SCH_TYPE(g6svc_control_cfg) G6SCH_FIELD(g6svc_control_cfg, scheduler) G6SCH_FIELD(g6svc_control_cfg, directory) G6SCH_FIELD(g6svc_control_cfg, directory_n) G6SCH_FIELD(g6svc_control_cfg, endpoint) G6SCH_FIELD(g6svc_control_cfg, ingress) G6SCH_FIELD(g6svc_control_cfg, queue) G6SCH_FIELD(g6svc_control_cfg, trace) G6SCH_FIELD(g6svc_control_cfg, slots) G6SCH_FIELD(g6svc_control_cfg, n_slots) G6SCH_FIELD(g6svc_control_cfg, state) G6SCH_FIELD(g6svc_control_cfg, pool) G6SCH_FIELD(g6svc_control_cfg, host) G6SCH_FIELD(g6svc_control_cfg, lend) G6SCH_FIELD(g6svc_control_cfg, share_ms) G6SCH_FIELD(g6svc_control_cfg, rank) G6SCH_FIELD(g6svc_control_cfg, head) G6SCH_FIELD(g6svc_control_cfg, admit_hold) G6SCH_FIELD(g6svc_control_cfg, elog)
+    G6SCH_TYPE(g6svc_compute_cfg) G6SCH_FIELD(g6svc_compute_cfg, control) G6SCH_FIELD(g6svc_compute_cfg, endpoint) G6SCH_FIELD(g6svc_compute_cfg, ingress) G6SCH_FIELD(g6svc_compute_cfg, trace) G6SCH_FIELD(g6svc_compute_cfg, slots) G6SCH_FIELD(g6svc_compute_cfg, n_slots) G6SCH_FIELD(g6svc_compute_cfg, state) G6SCH_FIELD(g6svc_compute_cfg, module) G6SCH_FIELD(g6svc_compute_cfg, host) G6SCH_FIELD(g6svc_compute_cfg, rank) G6SCH_FIELD(g6svc_compute_cfg, elog) G6SCH_FIELD(g6svc_compute_cfg, dfl_reuse) G6SCH_FIELD(g6svc_compute_cfg, ngram)
+    G6SCH_TYPE(g6sig_inputs) G6SCH_FIELD(g6sig_inputs, model) G6SCH_FIELD(g6sig_inputs, cap) G6SCH_FIELD(g6sig_inputs, layers_s) G6SCH_FIELD(g6sig_inputs, chunk) G6SCH_FIELD(g6sig_inputs, nc) G6SCH_FIELD(g6sig_inputs, set_id) G6SCH_FIELD(g6sig_inputs, dfl) G6SCH_FIELD(g6sig_inputs, dfl_k) G6SCH_FIELD(g6sig_inputs, s2sess) G6SCH_FIELD(g6sig_inputs, knobs) G6SCH_FIELD(g6sig_inputs, mp) G6SCH_FIELD(g6sig_inputs, mtp) G6SCH_FIELD(g6sig_inputs, dfl_reuse) G6SCH_FIELD(g6sig_inputs, dfl_reuse_min) G6SCH_FIELD(g6sig_inputs, lanes) G6SCH_FIELD(g6sig_inputs, gsplit) G6SCH_FIELD(g6sig_inputs, ckpt) G6SCH_FIELD(g6sig_inputs, ckpt_blocks) G6SCH_FIELD(g6sig_inputs, ckpt_persist) G6SCH_FIELD(g6sig_inputs, s2_below) G6SCH_FIELD(g6sig_inputs, two) G6SCH_FIELD(g6sig_inputs, pf_own) G6SCH_FIELD(g6sig_inputs, pf_qp) G6SCH_FIELD(g6sig_inputs, qp_ctx) G6SCH_FIELD(g6sig_inputs, qp_min) G6SCH_FIELD(g6sig_inputs, grammar) G6SCH_FIELD(g6sig_inputs, ngram) G6SCH_FIELD(g6sig_inputs, kstop_mode) G6SCH_FIELD(g6sig_inputs, kstop_kmax) G6SCH_FIELD(g6sig_inputs, kstop_tau) G6SCH_FIELD(g6sig_inputs, kstop_seed3) G6SCH_FIELD(g6sig_inputs, draft_par) G6SCH_FIELD(g6sig_inputs, qs_mode) G6SCH_FIELD(g6sig_inputs, iq_split) G6SCH_FIELD(g6sig_inputs, mtp_split) G6SCH_FIELD(g6sig_inputs, dhead_on) G6SCH_FIELD(g6sig_inputs, dhead_tpc) G6SCH_FIELD(g6sig_inputs, dhead_ks) G6SCH_FIELD(g6sig_inputs, mtp_last) G6SCH_FIELD(g6sig_inputs, dhead2) G6SCH_FIELD(g6sig_inputs, dfl_i4) G6SCH_FIELD(g6sig_inputs, dfl_body_i4) G6SCH_FIELD(g6sig_inputs, dfl_alpha) G6SCH_FIELD(g6sig_inputs, dsel_model) G6SCH_FIELD(g6sig_inputs, dsel_tab) G6SCH_FIELD(g6sig_inputs, kstopb) G6SCH_FIELD(g6sig_inputs, cp_step) G6SCH_FIELD(g6sig_inputs, cp_seg) G6SCH_FIELD(g6sig_inputs, ctx_sp) G6SCH_FIELD(g6sig_inputs, posidx) G6SCH_FIELD(g6sig_inputs, steer_shared) G6SCH_FIELD(g6sig_inputs, ds_mtp) G6SCH_FIELD(g6sig_inputs, sh_tc) G6SCH_FIELD(g6sig_inputs, l2hint) G6SCH_FIELD(g6sig_inputs, fc2stg) G6SCH_FIELD(g6sig_inputs, fc1bstg) G6SCH_FIELD(g6sig_inputs, c8_pack) G6SCH_FIELD(g6sig_inputs, sess_drafts) G6SCH_FIELD(g6sig_inputs, pf_lanes) G6SCH_FIELD(g6sig_inputs, tk_main) G6SCH_FIELD(g6sig_inputs, tk_decode) G6SCH_FIELD(g6sig_inputs, idx_pipe_b) G6SCH_FIELD(g6sig_inputs, idx_q_trig) G6SCH_FIELD(g6sig_inputs, idx_pipe_qr) G6SCH_FIELD(g6sig_inputs, reuse) G6SCH_FIELD(g6sig_inputs, vis_on) G6SCH_FIELD(g6sig_inputs, vis_id)
+    G6SCH_TYPE(G6ModuleInfo) G6SCH_FIELD(G6ModuleInfo, abi) G6SCH_FIELD(G6ModuleInfo, model) G6SCH_FIELD(G6ModuleInfo, name) G6SCH_FIELD(G6ModuleInfo, nr) G6SCH_FIELD(G6ModuleInfo, mx) G6SCH_FIELD(G6ModuleInfo, s2n) G6SCH_FIELD(G6ModuleInfo, max_sessions) G6SCH_FIELD(G6ModuleInfo, hidden) G6SCH_FIELD(G6ModuleInfo, layers) G6SCH_FIELD(G6ModuleInfo, mtp_layers) G6SCH_FIELD(G6ModuleInfo, vocab) G6SCH_FIELD(G6ModuleInfo, experts) G6SCH_FIELD(G6ModuleInfo, topk) G6SCH_FIELD(G6ModuleInfo, kv_row_bytes) G6SCH_FIELD(G6ModuleInfo, kv_page) G6SCH_FIELD(G6ModuleInfo, kv_format) G6SCH_FIELD(G6ModuleInfo, caps) G6SCH_FIELD(G6ModuleInfo, dfl_block) G6SCH_FIELD(G6ModuleInfo, pack_members) G6SCH_FIELD(G6ModuleInfo, dfl_drafts) G6SCH_FIELD(G6ModuleInfo, dfl_rep) G6SCH_FIELD(G6ModuleInfo, tp_sort) G6SCH_FIELD(G6ModuleInfo, kv4) G6SCH_FIELD(G6ModuleInfo, xgrammar) G6SCH_FIELD(G6ModuleInfo, ds_markov_maxs) G6SCH_FIELD(G6ModuleInfo, ds_block)
+    G6SCH_TYPE(g6opt_knobs) G6SCH_FIELD(g6opt_knobs, table_hash) G6SCH_FIELD(g6opt_knobs, flag) G6SCH_FIELD(g6opt_knobs, int_) G6SCH_FIELD(g6opt_knobs, float_) G6SCH_FIELD(g6opt_knobs, text) G6SCH_FIELD(g6opt_knobs, ints) G6SCH_FIELD(g6opt_knobs, floats) G6SCH_FIELD(g6opt_knobs, tests_set)
+    G6SCH_TYPE(g6opt_host) G6SCH_FIELD(g6opt_host, ctx) G6SCH_FIELD(g6opt_host, engram_colls) G6SCH_FIELD(g6opt_host, dsk_mtp) G6SCH_FIELD(g6opt_host, dsk_relaxed) G6SCH_FIELD(g6opt_host, dsk_relax_topp) G6SCH_FIELD(g6opt_host, dsk_err)
+    G6SCH_TYPE(g6opt_strs) G6SCH_FIELD(g6opt_strs, p) G6SCH_FIELD(g6opt_strs, n)
+    G6SCH_TYPE(g6opt_plan) G6SCH_FIELD(g6opt_plan, prompt) G6SCH_FIELD(g6opt_plan, first) G6SCH_FIELD(g6opt_plan, chunk) G6SCH_FIELD(g6opt_plan, n_gen) G6SCH_FIELD(g6opt_plan, inv_temp) G6SCH_FIELD(g6opt_plan, seed) G6SCH_FIELD(g6opt_plan, top_p) G6SCH_FIELD(g6opt_plan, lp) G6SCH_FIELD(g6opt_plan, plp) G6SCH_FIELD(g6opt_plan, rs)
+    G6SCH_TYPE(g6opt_options) G6SCH_FIELD(g6opt_options, rank) G6SCH_FIELD(g6opt_options, ips) G6SCH_FIELD(g6opt_options, ips2) G6SCH_FIELD(g6opt_options, ring) G6SCH_FIELD(g6opt_options, ring_devs) G6SCH_FIELD(g6opt_options, proxy_cpu) G6SCH_FIELD(g6opt_options, pf_ips2) G6SCH_FIELD(g6opt_options, manifest) G6SCH_FIELD(g6opt_options, packfile) G6SCH_FIELD(g6opt_options, v2_dir) G6SCH_FIELD(g6opt_options, v2_slices) G6SCH_FIELD(g6opt_options, v2_widths) G6SCH_FIELD(g6opt_options, v2_dense) G6SCH_FIELD(g6opt_options, v2_layout) G6SCH_FIELD(g6opt_options, v2_trellis) G6SCH_FIELD(g6opt_options, qo_man) G6SCH_FIELD(g6opt_options, qo_file) G6SCH_FIELD(g6opt_options, layers_s) G6SCH_FIELD(g6opt_options, levels_s) G6SCH_FIELD(g6opt_options, prompts) G6SCH_FIELD(g6opt_options, co_cap) G6SCH_FIELD(g6opt_options, co_mp) G6SCH_FIELD(g6opt_options, co_top) G6SCH_FIELD(g6opt_options, co_pfrows) G6SCH_FIELD(g6opt_options, co_mtp) G6SCH_FIELD(g6opt_options, co_lanes) G6SCH_FIELD(g6opt_options, co_nc) G6SCH_FIELD(g6opt_options, co_temp) G6SCH_FIELD(g6opt_options, co_graph) G6SCH_FIELD(g6opt_options, co_wide) G6SCH_FIELD(g6opt_options, co_pfv2) G6SCH_FIELD(g6opt_options, co_adapt) G6SCH_FIELD(g6opt_options, has_n_gen) G6SCH_FIELD(g6opt_options, n_gen) G6SCH_FIELD(g6opt_options, has_chunk) G6SCH_FIELD(g6opt_options, chunk) G6SCH_FIELD(g6opt_options, has_seed) G6SCH_FIELD(g6opt_options, seed) G6SCH_FIELD(g6opt_options, has_top_p) G6SCH_FIELD(g6opt_options, top_p) G6SCH_FIELD(g6opt_options, has_rs) G6SCH_FIELD(g6opt_options, rs) G6SCH_FIELD(g6opt_options, qp_man) G6SCH_FIELD(g6opt_options, qp_file) G6SCH_FIELD(g6opt_options, dfl_man) G6SCH_FIELD(g6opt_options, dfl_file) G6SCH_FIELD(g6opt_options, dfl_sel) G6SCH_FIELD(g6opt_options, dfl_k) G6SCH_FIELD(g6opt_options, spec_reset_per_request) G6SCH_FIELD(g6opt_options, spec_fixed) G6SCH_FIELD(g6opt_options, plan) G6SCH_FIELD(g6opt_options, image) G6SCH_FIELD(g6opt_options, hash) G6SCH_FIELD(g6opt_options, reuse_prefix) G6SCH_FIELD(g6opt_options, check_args) G6SCH_FIELD(g6opt_options, lanes_explicit) G6SCH_FIELD(g6opt_options, s2dir) G6SCH_FIELD(g6opt_options, grammar_dir) G6SCH_FIELD(g6opt_options, kv_tiers) G6SCH_FIELD(g6opt_options, kv_keep) G6SCH_FIELD(g6opt_options, kv_system_after) G6SCH_FIELD(g6opt_options, kv_write_limit) G6SCH_FIELD(g6opt_options, kv_format) G6SCH_FIELD(g6opt_options, kv_old) G6SCH_FIELD(g6opt_options, kv_old_all) G6SCH_FIELD(g6opt_options, set_id) G6SCH_FIELD(g6opt_options, steering_dir) G6SCH_FIELD(g6opt_options, steering_force_s) G6SCH_FIELD(g6opt_options, steering_model_revision) G6SCH_FIELD(g6opt_options, steering_tokenizer_revision) G6SCH_FIELD(g6opt_options, steering_template_digest) G6SCH_FIELD(g6opt_options, steering_weight_set) G6SCH_FIELD(g6opt_options, steering_template_file) G6SCH_FIELD(g6opt_options, s2port) G6SCH_FIELD(g6opt_options, s2sess) G6SCH_FIELD(g6opt_options, s2epoch) G6SCH_FIELD(g6opt_options, cap) G6SCH_FIELD(g6opt_options, top) G6SCH_FIELD(g6opt_options, pfrows) G6SCH_FIELD(g6opt_options, nc) G6SCH_FIELD(g6opt_options, mtp) G6SCH_FIELD(g6opt_options, mp) G6SCH_FIELD(g6opt_options, lanes) G6SCH_FIELD(g6opt_options, temp) G6SCH_FIELD(g6opt_options, graph) G6SCH_FIELD(g6opt_options, wide) G6SCH_FIELD(g6opt_options, pfv2) G6SCH_FIELD(g6opt_options, adapt) G6SCH_FIELD(g6opt_options, release) G6SCH_FIELD(g6opt_options, s2mode) G6SCH_FIELD(g6opt_options, dfl) G6SCH_FIELD(g6opt_options, k) G6SCH_FIELD(g6opt_options, layers) G6SCH_FIELD(g6opt_options, progress_isolate) G6SCH_FIELD(g6opt_options, route_split_mode) G6SCH_FIELD(g6opt_options, c8_pack_env) G6SCH_FIELD(g6opt_options, spec_on) G6SCH_FIELD(g6opt_options, spec_levels) G6SCH_FIELD(g6opt_options, spec_draft_round) G6SCH_FIELD(g6opt_options, spec_draft_each) G6SCH_FIELD(g6opt_options, spec_table) G6SCH_FIELD(g6opt_options, rt_win) G6SCH_FIELD(g6opt_options, kstop_mode) G6SCH_FIELD(g6opt_options, kstop_kmax) G6SCH_FIELD(g6opt_options, kstop_tau) G6SCH_FIELD(g6opt_options, kstop_seed3) G6SCH_FIELD(g6opt_options, kstop_log) G6SCH_FIELD(g6opt_options, kstop_solo) G6SCH_FIELD(g6opt_options, kstopb_mode) G6SCH_FIELD(g6opt_options, kstopb_kmin) G6SCH_FIELD(g6opt_options, kstopb_tau) G6SCH_FIELD(g6opt_options, kstopb_tau_n) G6SCH_FIELD(g6opt_options, kstopb_widths) G6SCH_FIELD(g6opt_options, kstopb_explore) G6SCH_FIELD(g6opt_options, flash_cache) G6SCH_FIELD(g6opt_options, flash_budget_mib) G6SCH_FIELD(g6opt_options, ds_moe_main_topk) G6SCH_FIELD(g6opt_options, ds_moe_decode_topk) G6SCH_FIELD(g6opt_options, ds_idx_pipe_b) G6SCH_FIELD(g6opt_options, ds_idx_q_trig) G6SCH_FIELD(g6opt_options, ds_idx_pipe_qr) G6SCH_FIELD(g6opt_options, ds_admit_keep_scratch) G6SCH_FIELD(g6opt_options, ds_sess_drafts) G6SCH_FIELD(g6opt_options, ds_draft_cap) G6SCH_FIELD(g6opt_options, plans) G6SCH_FIELD(g6opt_options, n_plans) G6SCH_FIELD(g6opt_options, row_counts) G6SCH_FIELD(g6opt_options, draft_rows) G6SCH_FIELD(g6opt_options, nl) G6SCH_FIELD(g6opt_options, nx) G6SCH_FIELD(g6opt_options, ncoll) G6SCH_FIELD(g6opt_options, r) G6SCH_FIELD(g6opt_options, own4) G6SCH_FIELD(g6opt_options, qp_roll_s) G6SCH_FIELD(g6opt_options, qp_roll_ser) G6SCH_FIELD(g6opt_options, qp_wire_e)
     return h;
 }
 #undef G6SCH_TYPE

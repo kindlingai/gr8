@@ -1,4 +1,4 @@
-// The notice target (s2/scheduler.h, Scheduler::horizon; service.h event): the first boundary whose work after the one
+// The notice target (s2/scheduler.h, Scheduler::horizon; control.rs event): the first boundary whose work after the one
 // in flight covers NOTICE_ROWS prefill rows, within [boundary + NOTICE_MIN, boundary + NOTICE_MAX]. The constant it
 // replaces (LOOKAHEAD = 8 boundaries) was the margin a decode round needs, and during a prefill eight ~6 s quanta for a
 // propagation that takes milliseconds -- which is why a cancel could never land inside a below-R prefill: R is exactly

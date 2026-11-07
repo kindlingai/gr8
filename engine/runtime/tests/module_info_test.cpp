@@ -5,6 +5,9 @@
 #include "../s2/scheduler.h"
 #include "../s2/sessions.h"
 #include "../s2_batch.h"
+#if G6_MODEL_DS41
+#include "../s2/ds41_dspark_round_logic.h"
+#endif
 #include <cstdio>
 #include <cstring>
 
@@ -23,15 +26,24 @@ int main()
     CHECK(m.hidden == geom::HID && m.layers == geom::L_MAIN && m.vocab == geom::VOCAB && m.experts == geom::NEXP &&
           m.topk == geom::TOPK);
     CHECK(m.kv_row_bytes == g6kv::ROW && std::strcmp(m.kv_format, g6kv::NAME) == 0 && m.kv_page == 64);
-    CHECK(m.abi == 2 && m.dfl_block == 8 && m.pack_members == 8);
+    CHECK(m.abi == 3 && m.dfl_block == 8 && m.pack_members == 8);
+    CHECK(m.dfl_drafts == 7 && m.dfl_rep == (8 % G6_NR != 0) && m.tp_sort == 2048 && m.kv4 == G6_KV4);
+#if defined(G6_GRAMMAR) && G6_GRAMMAR
+    CHECK(m.xgrammar == 1);
+#else
+    CHECK(m.xgrammar == 0);
+#endif
 #if G6_MODEL_DS41
     CHECK(m.model == G6_MODEL_ID_DS41 && std::strcmp(m.name, "ds41") == 0 && m.max_sessions == 32 && m.mtp_layers == 3);
+    CHECK(m.ds_markov_maxs == 8 && m.ds_block == g6s2::Ds41RoundLogic::BLOCK);
     CHECK(m.caps == (G6_CAP_MTP0 | G6_CAP_PACK | G6_CAP_PARK | G6_CAP_PROMPT_DECODE | G6_CAP_DSPARK));
 #elif G6_MODEL_FLASH
     CHECK(m.model == G6_MODEL_ID_GLM53F && std::strcmp(m.name, "glm-5.3-flash") == 0 && m.max_sessions == 8);
+    CHECK(m.ds_markov_maxs == 0 && m.ds_block == 0);
     CHECK(m.caps == (G6_CAP_DFLASH2 | G6_CAP_FLASH_COST | G6_CAP_KDA | G6_CAP_GRAMMAR));
 #else
     CHECK(m.model == G6_MODEL_ID_GLM53 && std::strcmp(m.name, "glm-5.3") == 0 && m.max_sessions == 8 && m.mtp_layers == 1);
+    CHECK(m.ds_markov_maxs == 0 && m.ds_block == 0);
     CHECK(m.caps == (G6_CAP_DFLASH2 | G6_CAP_GRAMMAR));
 #endif
     // the scheduler's model rules read the capabilities: each refusal by its own message, nothing else refused

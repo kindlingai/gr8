@@ -246,6 +246,28 @@ for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 
   g++ -std=c++17 -O2 -Wall -Wextra -pthread $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/admit_vectors_test.cpp" -o "$T/admit_vectors_test" "${KVLIB[@]}"
   "$T/admit_vectors_test"
 done
+# g6m4's option parse (scheduler-rs options.rs behind engine_options.h) over the launcher's lists and one mutation per
+# refusal (scripts/check_args.py writes the cases), in each model's shape and GLM's serving one; then every refusal
+# reached in some shape
+i=0
+for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O2 -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/options_vectors_test.cpp" -o "$T/options_vectors_test" "${KVLIB[@]}"
+  "$T/options_vectors_test" "$REPO/engine/runtime/s2/tests/options_cases.txt" --dump > "$T/options_$i.txt" || { tail -1 "$T/options_$i.txt"; exit 1; }
+  tail -1 "$T/options_$i.txt"
+  i=$((i + 1))
+done
+python3 "$REPO/scripts/check_options_coverage.py" "$REPO/engine/scheduler-rs/src/options.rs" "$T"/options_*.txt
+# the S2 runtime signatures (scheduler-rs signature.rs) over a seeded sweep of their inputs, against transcripts of
+# g6m4.cu's builders
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/signature_vectors_test.cpp" -o "$T/signature_vectors_test" "${KVLIB[@]}"
+"$T/signature_vectors_test"
+# the fabric plan (fabric_plan.h) over a seeded sweep of its inputs, in each model's shape, GLM's serving one, and the
+# widths only some paths take (the Flash pool owner at TP2, the three-rank ring's stripe at TP3)
+for f in "" "-DDEC_S2 -DG6_NR=4" "-DDEC_S2 -DG6_NR=3" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=3" \
+         "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=2" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O2 -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/fabric_plan_vectors_test.cpp" -o "$T/fabric_plan_vectors_test" "${KVLIB[@]}"
+  "$T/fabric_plan_vectors_test"
+done
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/control_wire_test.cpp" -o "$T/control_wire_test" "${KNOBS[@]}"
 "$T/control_wire_test" 2> >(grep -v '^g6ctl: control recv failed: ret=0 ' >&2)
 # DS41 ranks that disagree on an agree-scope knob refuse at bootstrap (knob::signature() in the DS41 runtime signature):
@@ -299,12 +321,20 @@ g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime/s2" "$REPO/engine/run
 g++ -std=c++17 -O2 -Wall -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/admit_hold_drain_test.cpp" "${KVLIB[@]}" -o "$T/admit_hold_drain_test"
 (cd "$T" && "$T/admit_hold_drain_test" 2>/dev/null)
 # the calls the service makes on a model module (ModuleOps) and its plain pool calls, as std::function hooks and as a
-# table, against transcripts recorded before PoolOps, in each model's shape
+# table, against transcripts recorded from the C++ service, in each model's shape
 for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
   g++ -std=c++17 -O2 -Wall -Wextra -pthread -ffp-contract=off $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/module_calls_test.cpp" \
     -o "$T/module_calls_test" "${KVLIB[@]}"
   "$T/module_calls_test" 2>/dev/null
 done
+# the same, and the ADMIT_HOLD drain, under ASan and UBSan: the head's control thread is Rust and calls back into the
+# C++ host table and pool policy inside every commit
+g++ -std=c++17 -O1 -g -Wall -Wextra -pthread -ffp-contract=off -fsanitize=address,undefined -I "$REPO/engine/runtime" \
+  "$REPO/engine/runtime/s2/tests/module_calls_test.cpp" -o "$T/module_calls_test_asan" "${KVLIB[@]}"
+"$T/module_calls_test_asan" 2>/dev/null
+g++ -std=c++17 -O1 -g -Wall -pthread -fsanitize=address,undefined -I "$REPO/engine/runtime" \
+  "$REPO/engine/runtime/s2/tests/admit_hold_drain_test.cpp" "${KVLIB[@]}" -o "$T/admit_hold_drain_test_asan"
+(cd "$T" && "$T/admit_hold_drain_test_asan" 2>/dev/null)
 # DeepSeek-V4.1-Flash-1017 geometry (engine/model_geom_ds41.h) against the release's config.json
 g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/ds41_geom_dump.cpp" -o "$T/ds41_geom_dump"
 (cd "$REPO/engine/tests" && DS41_GEOM_DUMP="$T/ds41_geom_dump" python3 -m unittest -q test_ds41_geom)

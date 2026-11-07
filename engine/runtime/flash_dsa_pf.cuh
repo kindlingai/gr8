@@ -443,7 +443,10 @@ inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
                 gv.a.slot = dslot::Slot{};
 #endif
                 gv.a.x = S.q_a_n + static_cast<size_t>(m0 + c0) * QA;
+                gv.a.ldx = QA;
                 gv.a.y = S.q_b + static_cast<size_t>(m0 + c0) * (h * 256);
+                // a GEMV bound for pre-rotated input (GR8_GLM53F_DSA_QB_ROT) reads xa, not x
+                if (!gv.rot) dtr::launch_rot(gv.a.x, gv.a.ldx, gv.a.suh[0], const_cast<u32*>(gv.a.xa), gv.a.K, cr, st);
                 dtr::launch(gv, st);
             }
         }
@@ -527,7 +530,10 @@ inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
             gv.a.slot = dslot::Slot{};
 #endif
             gv.a.x = attn_out + static_cast<size_t>(m0) * (h * 256);
+            gv.a.ldx = h * 256;
             gv.a.y = P.part[0] + static_cast<size_t>(m0) * HID;
+            // a GEMV bound for pre-rotated input (GR8_GLM53F_DSA_OPROJ_ROT, the default at 2+ rows) reads xa, not x
+            if (!gv.rot) dtr::launch_rot(gv.a.x, gv.a.ldx, gv.a.suh[0], const_cast<u32*>(gv.a.xa), gv.a.K, r, st);
             dtr::launch(gv, st);
         }
     }

@@ -2,12 +2,16 @@
 //! `g6ctl_error`, as the control links' calls do. Bytes go back through a grow callback.
 #![allow(clippy::missing_safety_doc)]
 
+use super::admit;
+use super::compute::{CCompute, Compute};
+use super::control::{self, CControl, Control, ObserveFn};
 use super::files::{self, Boot, Command, Ingress, Profile, Shape, Steering};
 use super::status::{self, Growth, RunUse, Status};
 use super::trace::{self, Trace};
 use crate::control::ffi::{bytes, code, give, GrowFn};
 use crate::kv_share::Totals;
-use crate::scheduler::Config;
+use crate::planner_ffi::CStats;
+use crate::scheduler::{Config, Grant, Identity, Key, Request, Slot};
 use std::ffi::c_void;
 
 /// g6svc_profile: one loaded steering profile.
@@ -326,4 +330,191 @@ pub unsafe extern "C" fn g6svc_trace_instant(
 #[no_mangle]
 pub extern "C" fn g6svc_trace_now() -> u64 {
     trace::now()
+}
+
+// --- the admission decisions (admit.h)
+
+/// held: the notice names `held_at`.
+#[no_mangle]
+pub extern "C" fn g6svc_notice_target(boundary: u64, horizon: u64, held: bool, held_at: u64, notice_max: u32) -> u64 {
+    admit::notice_target(boundary, horizon, held.then_some(held_at), notice_max)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_admit_retry(head: u64, attempted_head: u64, revision: u64, attempted_revision: u64) -> bool {
+    admit::retry(head, attempted_head, revision, attempted_revision)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_attempted_revision(revision: u64) -> u64 {
+    admit::attempted_revision(revision)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_admit_shrink(fits: bool, can_make_room: bool, live: u32, limit: u32) -> bool {
+    admit::shrink(fits, can_make_room, live, limit)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_admit_grant(why: u32, short_of: u32) -> bool {
+    admit::grant(why, short_of)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_admit_drain(admit_hold: bool, live: u32, limit: u32) -> bool {
+    admit::drain(admit_hold, live, limit)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_admit_hold(admit_hold: bool, queued: bool, live: u32, limit: u32) -> bool {
+    admit::hold(admit_hold, queued, live, limit)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_wait_line(why: u32, last: u64, head: u64) -> bool {
+    admit::wait_line(why, last, head)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_refusal_line(why: u32, last: u64, head: u64) -> bool {
+    admit::refusal_line(why, last, head)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_recall_note(why: u32, short_of: u32, waiting: u64, head: u64) -> u32 {
+    admit::recall_note(why, short_of, waiting, head)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_share_idle(resident: u32, queued: usize) -> bool {
+    admit::share_idle(resident, queued)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_lend_idle(resident: u32, queued: usize, retiring: u32) -> bool {
+    admit::lend_idle(resident, queued, retiring)
+}
+/// Sessions::request
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_request(
+    id: u64,
+    prompt_tokens: usize,
+    n_gen: i32,
+    steering: *const Identity,
+    out: *mut Request,
+) {
+    *out = control::request(id, prompt_tokens, n_gen, *steering);
+}
+/// steering.h cache_namespace: NAMESPACE_BYTES into out
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_cache_namespace(s: *const Identity, out: *mut u8) {
+    let n = control::cache_namespace(&*s);
+    std::ptr::copy_nonoverlapping(n.as_ptr(), out, n.len());
+}
+
+// --- the head's control thread (control.rs) and the state the compute thread shares with it
+
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_control_new(c: *const CControl, out: *mut *mut Control) -> i32 {
+    *out = std::ptr::null_mut();
+    code(Control::new(&*c).map(|x| *out = Box::into_raw(Box::new(x))))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_control_free(c: *mut Control) {
+    if !c.is_null() {
+        drop(Box::from_raw(c));
+    }
+}
+/// The head's control thread: returns once the service stops, or when something failed.
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_control_run(c: *const Control) -> i32 {
+    code((*c).run())
+}
+/// Every rank's watcher (abort.s2 and quit).
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_control_monitor(c: *const Control, linger_ms: u32) -> i32 {
+    code((*c).monitor(linger_ms))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_control_publish(
+    c: *const Control,
+    boundary: u64,
+    revision: u64,
+    horizon: u64,
+    resident: u32,
+    retiring: u32,
+) {
+    (*c).publish(boundary, revision, horizon, resident, retiring);
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_control_resized(c: *const Control) {
+    (*c).resized();
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_control_resident(c: *const Control) -> u32 {
+    (*c).resident()
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_control_stopping(c: *const Control) -> bool {
+    (*c).stopping()
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_control_stop(c: *const Control) {
+    (*c).stop();
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_control_shutdown(c: *const Control) {
+    (*c).shutdown();
+}
+/// status.s2 from the pool's values in s (free, room, and the growth, tiers and runs with their has_ flags); the
+/// service's own fields in s are not read.
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_control_write_status(c: *const Control, s: *const CStatus) -> i32 {
+    let s = &*s;
+    let growth = s.has_growth.then_some(Growth {
+        held_pages: s.held_pages,
+        worst_pages: s.worst_pages,
+        grows: s.grows,
+        stalls: s.stalled,
+    });
+    let tiers = s.has_tiers.then(|| slice(s.tiers, s.n_tiers));
+    let runs = s.has_runs.then(|| slice(s.runs, s.n_runs));
+    code((*c).write_status(s.free, s.room, growth, tiers, runs))
+}
+/// A test's observer of the control thread's plain pool calls; set before the control thread starts.
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_control_observe(c: *const Control, f: ObserveFn, ctx: *mut c_void) {
+    (*c).observe(f, ctx);
+}
+
+// --- every rank's compute thread (compute.rs) and the driver's hooks it answers
+
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_new(c: *const CCompute, out: *mut *mut Compute) -> i32 {
+    *out = std::ptr::null_mut();
+    code(Compute::new(&*c).map(|x| *out = Box::into_raw(Box::new(x))))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_free(c: *mut Compute) {
+    if !c.is_null() {
+        drop(Box::from_raw(c));
+    }
+}
+/// The compute thread: returns once the service stops, or when something failed.
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_run(c: *const Compute) -> i32 {
+    code((*c).run())
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_bind(c: *const Compute, g: *const Grant) -> i32 {
+    code((*c).bind(&*g))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_retire(c: *const Compute, s: *const Slot) -> i32 {
+    code((*c).retire(&*s))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_finished(c: *const Compute, s: *const Slot) -> i32 {
+    code((*c).finished(&*s))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_first_token(c: *const Compute, k: *const Key) {
+    (*c).first_token(&*k);
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_settle(c: *const Compute) -> i32 {
+    code((*c).settle())
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_terminal(c: *const Compute, slot: u32, s: *const CStats) {
+    (*c).terminal(slot, &*s);
 }

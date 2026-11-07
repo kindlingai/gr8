@@ -27,12 +27,14 @@ class PrefixReuseTests(unittest.TestCase):
 
     def test_integration_order(self):
         s = (ROOT / 'engine/runtime/g6m4.cu').read_text()
-        self.assertIn('reuse_prefix = false;', s)
+        opts = (ROOT / 'engine/runtime/engine_options.h').read_text()   # EngineOptions and its defaults
+        parse = (ROOT / 'engine/scheduler-rs/src/options.rs').read_text()   # the option parse
+        self.assertIn('reuse_prefix = false;', opts)
         self.assertLess(s.index('reuse.begin(sp.prompt'), s.index('const int PS = prompt_steps(p)'))
         # Offline reuse must use the same steering namespace as the request plan.
         self.assertRegex(s, r'reuse\.begin\(sp\.prompt, MP \? sp\.first : \(int\)sp\.prompt\.size\(\) - 1, mtp > 0,\s*'
                             r'steering::cache_namespace\(sp\.steering\)\)')
-        self.assertIn('if (s2mode || reuse_prefix)', s)   # prompt-step row counts 1..chunk
+        self.assertIn('if s2mode || reuse_prefix {', parse)   # prompt-step row counts 1..chunk
         self.assertIn('for (int a = skip; a < p.first; a += MP)', s)
         # the reuse grid is ONE sub-batch (MP = --prefill = 4096 served), not 2 * MP
         self.assertIn('reuse.grid = align ? MP : 0;', s)
@@ -57,8 +59,8 @@ class PrefixReuseTests(unittest.TestCase):
             self.assertIn('reuse.finish(p.prompt, gen, (int)gen.size(), ' + str(mtp).lower() + ');', s)
         # the offline loop refuses DFlash2 with reuse (the drafter's prompt taps come from the prefill a hit
         # skips); S2 keeps retired runs in its pool (s2/pool.h) and gives DFlash2 only to a session that owns them
-        self.assertIn('if (reuse_prefix && dfl && !s2mode) die(', s)
-        self.assertNotIn('if (reuse_prefix && s2mode) die(', s)
+        self.assertIn('if reuse_prefix && dfl && !s2mode {\n        return Err(', parse)
+        self.assertNotIn('if reuse_prefix && s2mode {', parse)
 
 
 if __name__ == '__main__':

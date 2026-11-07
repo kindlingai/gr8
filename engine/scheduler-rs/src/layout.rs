@@ -83,6 +83,12 @@ impl Kind for crate::ffi::Batch {
 impl Kind for crate::ffi::Ints {
     const K: u64 = 6;
 }
+impl Kind for crate::options::Strs {
+    const K: u64 = 6;
+}
+impl Kind for crate::options::CPlan {
+    const K: u64 = 6;
+}
 impl Kind for crate::ffi::ParsedReq {
     const K: u64 = 6;
 }
@@ -245,6 +251,24 @@ impl Kind for crate::service::ffi::CBoot {
 impl Kind for crate::service::ffi::CStatus {
     const K: u64 = 6;
 }
+impl Kind for crate::service::control::Checked {
+    const K: u64 = 6;
+}
+impl Kind for crate::service::control::PoolCall {
+    const K: u64 = 6;
+}
+impl Kind for crate::service::control::Host {
+    const K: u64 = 6;
+}
+impl Kind for crate::service::control::CControl {
+    const K: u64 = 6;
+}
+impl Kind for crate::service::control::Staged {
+    const K: u64 = 6;
+}
+impl Kind for crate::service::compute::CCompute {
+    const K: u64 = 6;
+}
 // g6sched.h counts void as 1 byte, as Rust's c_void
 impl Kind for std::ffi::c_void {
     const K: u64 = 6;
@@ -254,6 +278,14 @@ macro_rules! fn_kinds {
     ($($t:ty),*) => { $(impl Kind for Option<$t> { const K: u64 = 0x76; })* };
 }
 fn_kinds!(
+    crate::options::FlagFn,
+    crate::options::IntFn,
+    crate::options::FloatFn,
+    crate::options::TextFn,
+    crate::options::IntsFn,
+    crate::options::FloatsFn,
+    crate::options::StrFn,
+    crate::options::EngramFn,
     crate::planner_ffi::RunFn,
     crate::planner_ffi::RoundFn,
     crate::planner_ffi::PromptFn,
@@ -298,7 +330,17 @@ fn_kinds!(
     crate::pool_ops::TiersFn,
     crate::pool_ops::RefusalFn,
     crate::pool_ops::RRowsFn,
-    crate::pool_ops::MakeRoomFn
+    crate::pool_ops::MakeRoomFn,
+    crate::service::control::CheckFn,
+    crate::service::control::ShareFn,
+    crate::service::control::ReasonFn,
+    crate::service::control::TotalsFn,
+    crate::service::control::BoundaryFn,
+    crate::service::control::StageFn,
+    crate::service::control::DigestFn,
+    crate::service::control::ApplyFn,
+    crate::service::control::StepFn,
+    crate::service::control::CountersFn
 );
 
 /// The digest of every shared type's layout.
@@ -826,6 +868,363 @@ pub fn digest() -> u64 {
             has_growth,
             has_tiers,
             has_runs
+        }
+    );
+    layout!(h, crate::service::control::Checked { prompt, n, sys, plp, n_gen, steering, ok });
+    layout!(h, crate::service::control::PoolCall { kind, rows, worst, r, out, run, prompt, n, span, ns });
+    layout!(h, crate::service::control::Staged { req, prompt, n, sys, plp });
+    layout!(
+        h,
+        crate::service::control::Host {
+            ctx,
+            check,
+            retire_run,
+            share,
+            refusal,
+            tiers,
+            idle_boundary,
+            stage,
+            unstage,
+            digest,
+            abort,
+            apply,
+            mode,
+            step,
+            counters,
+            begin,
+            bound,
+            release
+        }
+    );
+    layout!(
+        h,
+        crate::service::control::CControl {
+            scheduler,
+            directory,
+            directory_n,
+            endpoint,
+            ingress,
+            queue,
+            trace,
+            slots,
+            n_slots,
+            state,
+            pool,
+            host,
+            lend,
+            share_ms,
+            rank,
+            head,
+            admit_hold,
+            elog
+        }
+    );
+    layout!(
+        h,
+        crate::service::compute::CCompute {
+            control,
+            endpoint,
+            ingress,
+            trace,
+            slots,
+            n_slots,
+            state,
+            module,
+            host,
+            rank,
+            elog,
+            dfl_reuse,
+            ngram
+        }
+    );
+    layout!(
+        h,
+        crate::signature::SigInputs {
+            model,
+            cap,
+            layers_s,
+            chunk,
+            nc,
+            set_id,
+            dfl,
+            dfl_k,
+            s2sess,
+            knobs,
+            mp,
+            mtp,
+            dfl_reuse,
+            dfl_reuse_min,
+            lanes,
+            gsplit,
+            ckpt,
+            ckpt_blocks,
+            ckpt_persist,
+            s2_below,
+            two,
+            pf_own,
+            pf_qp,
+            qp_ctx,
+            qp_min,
+            grammar,
+            ngram,
+            kstop_mode,
+            kstop_kmax,
+            kstop_tau,
+            kstop_seed3,
+            draft_par,
+            qs_mode,
+            iq_split,
+            mtp_split,
+            dhead_on,
+            dhead_tpc,
+            dhead_ks,
+            mtp_last,
+            dhead2,
+            dfl_i4,
+            dfl_body_i4,
+            dfl_alpha,
+            dsel_model,
+            dsel_tab,
+            kstopb,
+            cp_step,
+            cp_seg,
+            ctx_sp,
+            posidx,
+            steer_shared,
+            ds_mtp,
+            sh_tc,
+            l2hint,
+            fc2stg,
+            fc1bstg,
+            c8_pack,
+            sess_drafts,
+            pf_lanes,
+            tk_main,
+            tk_decode,
+            idx_pipe_b,
+            idx_q_trig,
+            idx_pipe_qr,
+            reuse,
+            vis_on,
+            vis_id
+        }
+    );
+    layout!(
+        h,
+        crate::module_info::ModuleInfo {
+            abi,
+            model,
+            name,
+            nr,
+            mx,
+            s2n,
+            max_sessions,
+            hidden,
+            layers,
+            mtp_layers,
+            vocab,
+            experts,
+            topk,
+            kv_row_bytes,
+            kv_page,
+            kv_format,
+            caps,
+            dfl_block,
+            pack_members,
+            dfl_drafts,
+            dfl_rep,
+            tp_sort,
+            kv4,
+            xgrammar,
+            ds_markov_maxs,
+            ds_block
+        }
+    );
+    layout!(
+        h,
+        crate::options::KnobApi {
+            table_hash,
+            flag,
+            int_,
+            float_,
+            text,
+            ints,
+            floats,
+            tests_set
+        }
+    );
+    layout!(
+        h,
+        crate::options::Host {
+            ctx,
+            engram_colls,
+            dsk_mtp,
+            dsk_relaxed,
+            dsk_relax_topp,
+            dsk_err
+        }
+    );
+    layout!(
+        h,
+        crate::options::Strs {
+            p,
+            n
+        }
+    );
+    layout!(
+        h,
+        crate::options::CPlan {
+            prompt,
+            first,
+            chunk,
+            n_gen,
+            inv_temp,
+            seed,
+            top_p,
+            lp,
+            plp,
+            rs
+        }
+    );
+    layout!(
+        h,
+        crate::options::Options {
+            rank,
+            ips,
+            ips2,
+            ring,
+            ring_devs,
+            proxy_cpu,
+            pf_ips2,
+            manifest,
+            packfile,
+            v2_dir,
+            v2_slices,
+            v2_widths,
+            v2_dense,
+            v2_layout,
+            v2_trellis,
+            qo_man,
+            qo_file,
+            layers_s,
+            levels_s,
+            prompts,
+            co_cap,
+            co_mp,
+            co_top,
+            co_pfrows,
+            co_mtp,
+            co_lanes,
+            co_nc,
+            co_temp,
+            co_graph,
+            co_wide,
+            co_pfv2,
+            co_adapt,
+            has_n_gen,
+            n_gen,
+            has_chunk,
+            chunk,
+            has_seed,
+            seed,
+            has_top_p,
+            top_p,
+            has_rs,
+            rs,
+            qp_man,
+            qp_file,
+            dfl_man,
+            dfl_file,
+            dfl_sel,
+            dfl_k,
+            spec_reset_per_request,
+            spec_fixed,
+            plan,
+            image,
+            hash,
+            reuse_prefix,
+            check_args,
+            lanes_explicit,
+            s2dir,
+            grammar_dir,
+            kv_tiers,
+            kv_keep,
+            kv_system_after,
+            kv_write_limit,
+            kv_format,
+            kv_old,
+            kv_old_all,
+            set_id,
+            steering_dir,
+            steering_force_s,
+            steering_model_revision,
+            steering_tokenizer_revision,
+            steering_template_digest,
+            steering_weight_set,
+            steering_template_file,
+            s2port,
+            s2sess,
+            s2epoch,
+            cap,
+            top,
+            pfrows,
+            nc,
+            mtp,
+            mp,
+            lanes,
+            temp,
+            graph,
+            wide,
+            pfv2,
+            adapt,
+            release,
+            s2mode,
+            dfl,
+            k,
+            layers,
+            progress_isolate,
+            route_split_mode,
+            c8_pack_env,
+            spec_on,
+            spec_levels,
+            spec_draft_round,
+            spec_draft_each,
+            spec_table,
+            rt_win,
+            kstop_mode,
+            kstop_kmax,
+            kstop_tau,
+            kstop_seed3,
+            kstop_log,
+            kstop_solo,
+            kstopb_mode,
+            kstopb_kmin,
+            kstopb_tau,
+            kstopb_tau_n,
+            kstopb_widths,
+            kstopb_explore,
+            flash_cache,
+            flash_budget_mib,
+            ds_moe_main_topk,
+            ds_moe_decode_topk,
+            ds_idx_pipe_b,
+            ds_idx_q_trig,
+            ds_idx_pipe_qr,
+            ds_admit_keep_scratch,
+            ds_sess_drafts,
+            ds_draft_cap,
+            plans,
+            n_plans,
+            row_counts,
+            draft_rows,
+            nl,
+            nx,
+            ncoll,
+            r,
+            own4,
+            qp_roll_s,
+            qp_roll_ser,
+            qp_wire_e
         }
     );
     h

@@ -1,15 +1,17 @@
 // Freezes what the S2 service calls on a model module. Two ranks (a head and a worker over a socket pair) run the
 // real Service, Driver, scheduler, pools and event gate over a fake module that logs every call it gets, with its
 // arguments and what it returns, through scenarios that reach every hook: burst admissions, prefill quanta and packs,
-// growth, prefix reuse, cancels, a shrink, a resize, DFlash2 and parks where the shape has them. A command meant to land
-// mid-run is written from inside a head step. The step then waits for its notice in the head's trace, so the boundary
-// the notice names, and every call after it, is the same on every run. The ranks' steps meet as a fabric's would.
-// The service's plain pool calls (reserve, fits, room, count) are logged by an observer: a RunPool that hides the real
-// one's methods, which every header after pool.h names in its place. Not logged, because how many there are depends on
-// the clock: the pool reads of the head's status (free pages and the room read after it, stats, runs, tiers) and share
-// polls that find nothing. Each scenario runs twice, its module calls and pool policy as std::function hooks and as
-// tables (ModuleOps, PoolOps). Each rank's transcript is hashed (FNV-1a). The hashes were recorded from the service
-// before PoolOps, in each shape.
+// growth, prefix reuse, cancels, a shrink, a resize, DFlash2 and parks where the shape has them, and a tight pool where an
+// admission fits only on the pages a cancelled reused run gives back, and a cancel of a session still in its prefill
+// (the head's resp files' last lines join that transcript). A command meant to land mid-run is written from
+// inside a head step. The step then waits for its notice in the head's trace, so the boundary the notice names, and
+// every call after it, is the same on every run. The ranks' steps meet as a fabric's would.
+// The service's plain pool calls (reserve, fits, room, count) are logged by observers: the head's control thread (Rust)
+// reports its own, and a worker's bind calls a RunPool that hides the real one's methods, which every header after
+// pool.h names in its place. Not logged, because how many there are depends on the clock: the pool reads of the head's
+// status (free pages, room, stats, runs, tiers) and share polls that find nothing. Each scenario runs twice, its module
+// calls and pool policy as std::function hooks and as tables (ModuleOps, PoolOps). Each rank's transcript is hashed
+// (FNV-1a). The hashes were recorded from the C++ service, in each shape.
 //   --dump   print every transcript
 // The generator is mt19937_64 with modulo ranges, and no call takes two draws as arguments. Host only.
 #include <array>
@@ -41,8 +43,6 @@ public:
     using RunPoolBase::RunPoolBase;
     using RunPoolBase::reserve;
     std::function<void(const std::string&)> see;
-    uint32_t free_pages() const;
-    uint32_t room() const;
     Run reserve(uint64_t rows, uint64_t worst, uint32_t r = 0);
     bool fits(uint64_t rows, uint64_t worst, uint32_t r = 0) const;
     uint32_t count(const std::vector<int>& prompt, int64_t span, const g6rt::CacheNamespace& ns = {});
@@ -53,8 +53,8 @@ public:
 using namespace g6s2;
 namespace {
 template <class Tag, typename Tag::type M> struct Rob { friend typename Tag::type get(Tag) { return M; } };
-struct ProgressOf { using type = Progress Service::*; friend type get(ProgressOf); };
-template struct Rob<ProgressOf, &Service::progress_>;
+struct ControlOf { using type = ControlHandle Service::*; friend type get(ControlOf); };
+template struct Rob<ControlOf, &Service::ctl_>;
 
 struct Rng {
     std::mt19937_64 g;
@@ -124,34 +124,38 @@ std::string str(const s2::DflReq& r) {
     return "dfl sess " + i(r.sess) + " rows " + i(r.rows) + " pos0 " + i(r.pos0) + " tok0 " + i(r.tok0) + " lo " + i(r.lo) + " q " +
            u(r.query) + " phase " + i(r.phase);
 }
-// publish_status reads free_pages and then room on the head's control thread: that room is not logged
-thread_local bool status_read = false;
 } // namespace
-uint32_t g6s2::RunPool::free_pages() const { status_read = true; return RunPoolBase::free_pages(); }
-uint32_t g6s2::RunPool::room() const {
-    const uint32_t n = RunPoolBase::room();
-    if (!std::exchange(status_read, false) && see) see("room -> " + u(n));
-    return n;
-}
 Run g6s2::RunPool::reserve(uint64_t rows, uint64_t worst, uint32_t r) {
-    status_read = false;
     const Run x = RunPoolBase::reserve(rows, worst, r);
     if (see) see("reserve " + u(rows) + " " + u(worst) + " r" + u(r) + " -> " + str(x));
     return x;
 }
 bool g6s2::RunPool::fits(uint64_t rows, uint64_t worst, uint32_t r) const {
-    status_read = false;
     const bool f = RunPoolBase::fits(rows, worst, r);
     if (see) see("fits " + u(rows) + " " + u(worst) + " r" + u(r) + " -> " + u(f));
     return f;
 }
 uint32_t g6s2::RunPool::count(const std::vector<int>& prompt, int64_t span, const g6rt::CacheNamespace& ns) {
-    status_read = false;
     const uint32_t n = RunPoolBase::count(prompt, span, ns);
     if (see) see("count " + u(prompt.size()) + "#" + u(fnv_ints(prompt)) + " span " + i(span) + " " + str(ns) + " -> " + u(n));
     return n;
 }
 namespace {
+// the head's control thread's plain pool calls, in the RunPool observer's words
+void seen(void* ctx, const g6svc_pool_call* c) {
+    auto& p = *static_cast<RunPool*>(ctx);
+    if (!p.see) return;
+    if (c->kind == 0) p.see("room -> " + u(c->out));
+    else if (c->kind == 1) p.see("fits " + u(c->rows) + " " + u(c->worst) + " r" + u(c->r) + " -> " + u(c->out));
+    else if (c->kind == 2)
+        p.see("reserve " + u(c->rows) + " " + u(c->worst) + " r" + u(c->r) + " -> " + str(*sch::c<Run>(&c->run)));
+    else {
+        g6rt::CacheNamespace ns;
+        std::memcpy(ns.data(), c->ns, ns.size());
+        p.see("count " + u(c->n) + "#" + u(fnv(c->prompt, c->n * sizeof(int))) + " span " + i(c->span) + " " + str(ns) + " -> " +
+              u(c->out));
+    }
+}
 uint64_t mix(uint64_t a, uint64_t b, uint64_t c) {
     uint64_t x = a * 0x9E3779B97F4A7C15ull ^ (b + 0x632BE59BD9B4E019ull) * 0xBF58476D1CE4E5B9ull ^ (c + 7) * 0x94D049BB133111EBull;
     x ^= x >> 29; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 32;
@@ -196,6 +200,7 @@ struct Scenario {
     uint32_t prefill_min = 0, pages = 256, place = 256, below = 256 * 64;
     bool window = false;   // a window pool (kvman-rs Pool::window): runs past R, r_rows and make_room
     bool reuse = false, park = false, dfl = false, seq = false, drained = false, grow = true, kstop_log = false;
+    bool ends = false;   // the head's transcript ends with each request's last two resp lines (its "m" and "end")
     std::vector<Stage> phases;
 };
 
@@ -497,6 +502,7 @@ std::array<std::vector<std::string>, 2> run(const Scenario& sc, bool table, std:
                 pools[r] = std::make_unique<FnPool<PoolHooks>>(all[r].pool);
             }
             s[r] = std::make_unique<Service>(b[r], r ? worker_links : head_links, table ? as_table(all[r], *mods[r], *pools[r]) : all[r], 1);
+            g6svc_control_observe(((*s[r]).*get(ControlOf{})).get(), seen, (r ? f1 : f0).pool.get());
         }
     } catch (const std::exception& e) { error = sc.name + ": " + e.what(); return {}; }
     s[0]->quit_linger_ms = s[1]->quit_linger_ms = 300;
@@ -512,7 +518,7 @@ std::array<std::vector<std::string>, 2> run(const Scenario& sc, bool table, std:
                     for (const auto& q : *l)
                         if (slurp(dir + "/resp." + u(q.id)).find("\nend ") == std::string::npos) return false;
             for (auto& x : s)
-                if (((*x).*get(ProgressOf{})).resident.load()) return false;
+                if (g6svc_control_resident(((*x).*get(ControlOf{})).get())) return false;
             return true;
         };
         while (!done() && !failed() && std::chrono::steady_clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -538,6 +544,14 @@ std::array<std::vector<std::string>, 2> run(const Scenario& sc, bool table, std:
     for (int r = 0; r < 2; ++r)
         if (err[r]) try { std::rethrow_exception(err[r]); } catch (const std::exception& e) { error = sc.name + " rank " + i(r) + ": " + e.what(); }
     for (auto& x : s) x.reset();
+    if (sc.ends)
+        for (const auto& e : by_id) {
+            std::vector<std::string> ls;
+            std::istringstream in(slurp(dir + "/resp." + u(e.first)));
+            for (std::string l; std::getline(in, l);) ls.push_back(l);
+            const size_t n = ls.size();
+            f0.lines.push_back("resp " + u(e.first) + " " + (n > 1 ? ls[n - 2] : "") + " | " + (n ? ls[n - 1] : ""));
+        }
     for (const auto& x : b) remove_dir(x.directory);
     return {f0.lines, f1.lines};
 }
@@ -612,18 +626,54 @@ std::vector<Scenario> scenarios() {
         s.phases = {a, b};
         v.push_back(s);
     }
+    {   // a tight pool: a follow-up continues a retained run and decodes; a long prompt waits for room while it is live,
+        // and fits on the pages its cancel gives back
+        Scenario s; s.name = "tight";
+        s.cfg.pool_rows = 48 * PAGE; s.cfg.max_rows = 16; s.cfg.max_sessions = 4; s.cfg.mtp = 1; s.cfg.prefill_rows = 256;
+        s.cfg.two_lanes = false;
+        s.pages = 48; s.place = 48; s.below = 48 * 64;
+        s.reuse = true;
+        if (ds41) { s.seq = true; s.prefill_min = 2; }
+        Stage a;
+        a.reqs = {req(41, tokens(r, 150), 5)};
+        Stage b;
+        std::vector<int> p42 = a.reqs[0].prompt;
+        for (int k = 0; k < 60; ++k) p42.push_back(int(r.U(100, 147)));
+        b.reqs = {req(42, p42, 600)};
+        b.late = {req(43, tokens(r, 2900), 6)};
+        b.triggers = {Trigger{30, {43}, {}, false}, Trigger{34, {}, {42}, false}};
+        s.phases = {a, b};
+        v.push_back(s);
+    }
+    {   // a cancel that lands while its session is still prefilling, beside a session that decodes on
+        Scenario s; s.name = "cancel_prefill";
+        s.cfg.pool_rows = 256 * PAGE; s.cfg.max_rows = 16; s.cfg.max_sessions = 4; s.cfg.mtp = 1; s.cfg.prefill_rows = 64;
+        s.cfg.two_lanes = false;
+        s.ends = true;
+        if (ds41) { s.seq = true; s.prefill_min = 2; }
+        Stage a;
+        a.reqs = {req(51, tokens(r, 20), 200), req(52, tokens(r, 1500), 6)};
+        a.triggers = {Trigger{8, {}, {52}, false}};
+        s.phases = {a};
+        v.push_back(s);
+    }
     return v;
 }
 
 struct Expect { const char* name; uint64_t h[2]; };
-// recorded from the service before PoolOps (git 51569016), the pool's plain calls logged
+// recorded from the service before PoolOps (git 51569016), the pool's plain calls logged; "tight" from the C++ control
+// thread before R5b2b (git d07cc4c4); "cancel_prefill" from the C++ compute thread before R5b2c (git b35a5055)
 #if G6_MODEL_DS41
 const Expect EXPECT[] = {{"reuse", {12273334368408301276ull, 1903311641579599510ull}},
-                         {"park", {5353181497655196732ull, 9462988945752174063ull}}};
+                         {"park", {5353181497655196732ull, 9462988945752174063ull}},
+                         {"tight", {2545044441529557428ull, 3958922421392140002ull}},
+                         {"cancel_prefill", {10265519460376455732ull, 9550749956254985946ull}}};
 #else
 const Expect EXPECT[] = {{"reuse", {10598747977024483389ull, 69881064300217143ull}},
                          {"window", {7913264433038465795ull, 13857834022035593827ull}},
-                         {"dflash", {3112206073251698158ull, 11351924592827138150ull}}};
+                         {"dflash", {3112206073251698158ull, 11351924592827138150ull}},
+                         {"tight", {5452963098483769817ull, 10140779659768827361ull}},
+                         {"cancel_prefill", {2544064351436808419ull, 13390850078757270789ull}}};
 #endif
 } // namespace
 

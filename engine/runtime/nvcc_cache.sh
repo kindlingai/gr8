@@ -10,8 +10,8 @@
 # file's contents), the contents of every other input file named on the command line (objects, archives), and for each
 # -l library the file the linker would take (contents for an archive; path, size and time for a shared library). Equal
 # keys mean the compiler saw the same bytes with the same flags, so the cached output is the one it would write.
-# A hit copies the output into place and replays the compiler's stderr (its warnings); a miss runs the compiler and
-# stores what it wrote. These run the compiler as they are: no -o or two, stdin, -x, response files (@F, -optf),
+# A hit copies the output into place, replays the compiler's stderr (its warnings) and sets the entry's time to now; a
+# miss runs the compiler and stores what it wrote. These run the compiler as they are: no -o or two, stdin, -x, response files (@F, -optf),
 # dependency and preprocess runs (-M*, -E), a -l library not found, a path with a space.
 # docs/BUILD-CACHE.md has the details.
 #
@@ -106,6 +106,9 @@ if [ -f "$C" ]; then
   # copy, then rename: a reader never sees half a file, and the cache entry is not tied to the output's inode
   if cp "$C" "$OUTF.nc$$" 2> /dev/null && chmod --reference="$C" "$OUTF.nc$$" && mv -f "$OUTF.nc$$" "$OUTF"; then
     [ -s "$C.err" ] && cat "$C.err" >&2
+    # the entry's time is its last use: the entries a build read are newer than its start (the Dockerfile's engine
+    # stages keep only those, for CI)
+    touch -c "$C" "$C.err" 2> /dev/null
     log hit "$OUTF"; exit 0
   fi
   rm -f "$OUTF.nc$$"

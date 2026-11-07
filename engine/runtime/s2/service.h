@@ -1,7 +1,6 @@
 // Host orchestration for g6m4's OPT-IN S2 adapter. NativeHooks must be backed by
 // the real TP4 pool and fc2 CUDA APIs; test pools never enable native readiness.
 #pragma once
-#include "admit.h"
 #include "bootstrap.h"
 #include "control_channel.h"
 #include "dispatch.h"
@@ -112,20 +111,6 @@ struct NativeHooks {
     s2::DflReuse dfl_reuse;           // GR8_DFL_REUSE
     s2::NgramSrc ngram;               // GR8_NGRAM: the n-gram table as a draft source (S5, #56)
 };
-// Only atomic scalar stores/loads on the compute hot path. No request-file
-// checks, digest, allocation, or lock in an event-free boundary. horizon() is
-// a bounded six-step projection over the eight slots: no allocation, no lock,
-// a few hundred nanoseconds against a >= 20 ms round.
-struct Progress {
-    std::atomic<uint64_t> boundary{0}, revision{0}, horizon{0};
-    std::atomic<unsigned> resident{0}, retiring{0};
-    void publish(const SchedulerView& s) {
-        // horizon before boundary: a reader that loads boundary first and horizon second (event) sees a horizon
-        // computed for that boundary or a later one, never an earlier one. Later only widens the margin.
-        horizon.store(s.horizon());
-        boundary.store(s.boundary()); resident.store(s.resident()); retiring.store(s.retiring()); revision.store(s.revision());
-    }
-};
 // what status.s2 shows of the pool (Service::write_status)
 struct PoolStatus {
     uint32_t free = 0, room = 0;
@@ -133,6 +118,11 @@ struct PoolStatus {
     std::optional<std::vector<g6kv_tier_totals>> tiers;
     std::optional<std::vector<PoolUse>> runs;
 };
+// the Rust control and compute threads (engine/scheduler-rs src/service/control.rs, compute.rs)
+struct ControlFree { void operator()(g6svc_control* c) const { g6svc_control_free(c); } };
+using ControlHandle = std::unique_ptr<g6svc_control, ControlFree>;
+struct ComputeFree { void operator()(g6svc_compute* c) const { g6svc_compute_free(c); } };
+using ComputeHandle = std::unique_ptr<g6svc_compute, ComputeFree>;
 class Service {
     BootstrapConfig c_; ControlLinks& links_; NativeHooks native_;
     std::unique_ptr<FnModule<NativeHooks>> fn_;   // the table over native_'s hooks, when native_.module is unset
@@ -143,40 +133,10 @@ class Service {
     Sessions sessions_; Dispatch dispatch_; std::unique_ptr<Driver> driver_;
     std::unique_ptr<LeaderChannel> leader_; std::unique_ptr<WorkerChannel> worker_;
     EventEndpoint* endpoint_ = nullptr;
-    Ingress ingress_; AdmissionQueue queue_;
-    std::map<uint64_t, Command> commands_;
-    std::map<uint64_t, std::string> payloads_;   // head: queued requests' bytes, sent to the workers with each ADMIT notice
-    std::map<uint64_t, std::vector<int>> prompts_;   // head, prefix reuse: queued requests' prompts (none for prompt logprobs)
-    std::map<uint64_t, int64_t> spans_;              // head: their system spans (ServeReq::sys)
+    Ingress ingress_; AdmissionQueue queue_;   // the head's: the Rust control thread reads and keeps them
     bool reuse() const { return pol_.o.match != nullptr; }
-    // rows a request's run holds at admission: grant_rows when runs grow on demand, else its worst case
-    uint64_t admit_rows(const Request& r) const { return pol_.o.grow ? grant_rows(c_.scheduler, r) : reserve_rows(c_.scheduler, r); }
-    // the plain pool calls, each run held to the module's max_run_pages. reserve: the head after all event ACKs, a worker
-    // at the grant, so the same call on the same pool state gives the same Run
     RunPool& pool() const { return *native_.pool.pool; }
-    bool within(uint64_t worst) const { return !pol_.o.max_run_pages || worst <= uint64_t(pol_.o.max_run_pages) * PAGE; }
-    uint32_t pool_room() const { const uint32_t n = pool().room(); return pol_.o.max_run_pages ? std::min(n, pol_.o.max_run_pages) : n; }
-    bool pool_fits(uint64_t rows, uint64_t worst, uint32_t r) const { return within(worst) && pool().fits(rows, worst, r); }
-    Run pool_reserve(uint64_t rows, uint64_t worst, uint32_t r) const {
-        require(within(worst), "a run larger than the module's max_run_pages (DS41: one session's slab)");
-        return pool().reserve(rows, worst, r);
-    }
-    std::optional<g6rt::ServeReq> staged_; // COMPUTE thread only, parsed before event ACK
-    Progress progress_;
-    std::atomic<bool> stopping_{false};
     std::mutex failure_mu_; std::exception_ptr failure_;
-    uint64_t attempted_head_ = UINT64_MAX, attempted_revision_ = UINT64_MAX;
-    uint64_t event_ = 1;
-    uint64_t sync_ = 0;   // compute thread: barriers passed (the module's drained)
-    // head: a Resize announced and not yet applied on this rank (no second report until then: it would ask again for
-    // segments already granted)
-    std::atomic<bool> resizing_{false};
-    // head, borrow-idle: the chunks the FIFO head waits for (0 = none), when its first recall went out, the last
-    // request the wait line named
-    uint32_t recall_ = 0;
-    std::chrono::steady_clock::time_point recall_t0_{};
-    uint64_t recall_for_ = UINT64_MAX;
-    const long share_ms_ = std::max<long>(1, knob::s2_share_ms());
     // GR8_S2_EVENTLOG=1: the event-latency diagnostic #61 needs. One "notice" line when the head anchors a notice (the
     // boundary it read and the future boundary it chose), one "commit" line when that notice lands on each rank, and one
     // "step" line per prefill quantum. Together they say whether a cancel was installed while a long prefill was still
@@ -186,51 +146,137 @@ class Service {
     // GR8_S2_TRACE=PATH: this rank's steps, and on the head the arrivals, waits and admissions, as a Chrome trace
     // (trace.h). A step's span runs from its launch to the next boundary.
     Trace trace_;
-    struct { bool open = false; const char* kind = ""; uint64_t t0 = 0; std::string args; } step_;
-    std::set<uint64_t> first_;    // requests whose first token the trace has
-    uint64_t waited_ = 0;         // the request whose wait the trace has
-    void end_step() {
-        if (!step_.open) return;
-        trace_.span(step_.kind, Trace::STEPS, step_.t0, Trace::now(), step_.args);
-        step_.open = false;
-    }
-    // GR8_S2_ADMIT_HOLD=1 (head only; the workers follow Commit::hold): an admission with another request queued behind it
-    // and a slot left holds its boundary, and the next admission is announced at that same boundary (event below), so a
-    // burst of queued requests is granted in milliseconds rather than one per NOTICE_MIN boundaries (~15 s each behind
-    // 8,192-row prefill quanta). Default off: one admission per notice, as before.
-    const bool admit_hold_ = knob::s2_admit_hold();
-    uint64_t refused_ = UINT64_MAX;   // the last request the refusal line named (head)
-    // head: an ADMIT command into the FIFO (its req file read and checked); a grammar refusal answers it and queues nothing
-    void intake(const Command& command) {
-        auto bytes = ingress_.request(command);
-        auto request = parse_request(bytes, c_.scheduler.steering);
-        if (!grammar_ok(command.request, request) || !images_ok(command.request, request) || !engine_ok(command.request, request)) return;
-        const auto queued = Sessions::request(command.request, request);
-        if (trace_)
-            trace_.instant("arrive", Trace::CONTROL, targ("request", queued.id) + "," +
-                           targ("prompt_tokens", queued.prompt_tokens) + "," + targ("max_tokens", queued.max_tokens) +
-                           "," + targ("queued", queue_.size()));
-        queue_.push(queued); commands_.emplace(command.request, command);
-        payloads_.emplace(command.request, std::move(bytes));
-        if (reuse() && request.plp < 0) {
-            spans_.emplace(command.request, request.sys);
-            prompts_.emplace(command.request, std::move(request.prompt));
-        }
-    }
-    // head, inside an admission's commit: queue the ADMITs already written, in cmd order; stop at the first other
-    // command (a CANCEL may need its own event, which only the loop may start), so the order of commands is unchanged
-    void drain_admits() {
-        while (const auto command = ingress_.peek()) {
-            if (!command->admit) return;
-            ingress_.next();
-            intake(*command);
-        }
-    }
+    // the Rust control thread and the state the threads share: the progress the compute thread publishes, a resize in
+    // flight, and the stop flag. ctl_ outlives the threads (run joins them) and is freed before what it borrows
+    ControlHandle ctl_;
+    bool stopping() const { return g6svc_control_stopping(ctl_.get()); }
     void fail(std::exception_ptr error) {
         { std::lock_guard<std::mutex> lock(failure_mu_); if (!failure_) failure_ = error; }
-        stopping_.store(true); endpoint_->fail();
+        g6svc_control_shutdown(ctl_.get());
     }
-    void shutdown() { stopping_.store(true); endpoint_->fail(); }
+    void shutdown() { g6svc_control_shutdown(ctl_.get()); }
+    // What the Rust threads call in C++ (g6svc_host), one Host each, so each holds its own thread's exception. The
+    // module's and the pool policy's exceptions, if one threw inside the Rust, stay in their own contexts and are
+    // rethrown from there.
+    struct Host : ModuleCtx {
+        Service& s;
+        std::vector<int> prompt;                  // control: the last checked request's, until the next check
+        std::string why;                          // control: the pool policy's last refusal
+        std::vector<g6kv_tier_totals> tiers;      // control: and its last tier counters
+        std::optional<g6rt::ServeReq> staged;     // compute: the ADMIT's request, parsed before the event ACK
+        explicit Host(Service& x) : s(x) {}
+        static int32_t check(void* x, uint64_t id, const uint8_t* b, size_t n, g6svc_checked* out) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) {
+                auto request = parse_request(std::string(reinterpret_cast<const char*>(b), n), h.s.c_.scheduler.steering);
+                out->ok = h.s.grammar_ok(id, request) && h.s.images_ok(id, request) && h.s.engine_ok(id, request);
+                if (!out->ok) return;
+                h.prompt = std::move(request.prompt);
+                out->prompt = h.prompt.data(); out->n = h.prompt.size();
+                out->sys = request.sys; out->plp = request.plp; out->n_gen = request.n_gen;
+                std::memcpy(&out->steering, &request.steering, sizeof out->steering);
+            });
+        }
+        static int32_t retire_run(void* x, const g6sch_slot* sl) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) { h.s.retire_run(*mod::as<const Slot>(sl)); });
+        }
+        static int32_t share(void* x, bool idle, bool* has, g6sch_resize* out) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) {
+                const auto r = h.s.native_.share(idle);
+                if ((*has = r.has_value())) *out = g6sch_resize{r->tier, r->segs, r->slots, r->txn};
+            });
+        }
+        static int32_t refusal(void* x, uint64_t worst, uint32_t r, const uint8_t** b, size_t* n) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) {
+                h.why = h.s.pol_.refusal(worst, r);
+                *b = reinterpret_cast<const uint8_t*>(h.why.data()); *n = h.why.size();
+            });
+        }
+        static int32_t tiers_of(void* x, const g6kv_tier_totals** t, size_t* n) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) { h.tiers = h.s.pol_.tiers(); *t = h.tiers.data(); *n = h.tiers.size(); });
+        }
+        static int32_t idle_boundary(void* x, uint64_t b) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) { h.s.driver_->idle_boundary(b); });
+        }
+        static int32_t stage(void* x, const uint8_t* b, size_t n, g6svc_staged* out) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) {
+                h.staged = parse_request(std::string(reinterpret_cast<const char*>(b), n), h.s.c_.scheduler.steering);
+                const g6rt::ServeReq& r = *h.staged;
+                *out = g6svc_staged{&r, r.prompt.data(), r.prompt.size(), r.sys, r.plp};
+            });
+        }
+        static int32_t unstage(void* x) noexcept { return mod::guard<Host>(x, [&](Host& h) { h.staged.reset(); }); }
+        static int32_t digest(void* x, bool has_pool, uint64_t pool, uint64_t* out) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) {
+                if (has_pool) h.s.driver_->pool_digest(pool);
+                *out = h.s.driver_->state().digest();
+            });
+        }
+        static int32_t abort(void* x, const g6sch_key* k) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) {
+                const Key& key = *mod::as<const Key>(k);
+                const auto* stats = h.s.driver_->stats_if_initialized(key);
+                h.s.sessions_.terminal(key, stats ? *stats : s2::Stats{}, "abort");
+            });
+        }
+        static int32_t apply(void* x, const g6ctl_commit* c, bool admit) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) {
+                std::optional<Payload> payload;
+                if (admit) payload = h.s.sessions_.payload(h.staged.value());
+                h.s.driver_->apply(ctl::from_ctl(*c), payload ? &*payload : nullptr);
+            });
+        }
+        static int32_t mode(void* x) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) { h.s.dispatch_.synchronize_mode(h.s.driver_->state()); });
+        }
+        static int32_t step(void* x, g6sch_quantum* out) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) { *out = sch::to_rs(h.s.driver_->step()); });
+        }
+        static int32_t counters(void* x, const g6sch_key* keys, uint32_t n) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) {
+                for (uint32_t i = 0; i < n; ++i) {
+                    const Key k = *mod::as<const Key>(&keys[i]);
+                    if (!h.s.sessions_.counters_due(k) || h.s.driver_->state().slots()[k.slot].key != k) continue;
+                    if (const auto* st = h.s.driver_->stats_if_initialized(k)) h.s.sessions_.counters(k, *st);
+                }
+            });
+        }
+        static int32_t begin(void* x, const g6sch_grant* gr) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) {
+                const Grant& g = *mod::as<const Grant>(gr);
+                h.s.dispatch_.begin(g.key.slot, int(g.reuse), g6rt::steering::cache_namespace(g.req.steering));
+            });
+        }
+        static int32_t bound(void* x, const g6sch_grant* g) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) { h.s.sessions_.bind(*mod::as<const Grant>(g), h.staged.value()); });
+        }
+        static int32_t release(void* x, const g6sch_slot* sl) noexcept {
+            return mod::guard<Host>(x, [&](Host& h) {
+                const Slot& old = *mod::as<const Slot>(sl);
+                h.s.sessions_.retire(old); h.s.dispatch_.release(old.key.slot);
+            });
+        }
+    };
+    Host host_{*this}, chost_{*this};   // the control thread's, the compute thread's
+    // a control call's result: what the host or the pool policy threw (rc 1) rethrown, or the refusal (rc 2)
+    void control_check(int32_t rc) {
+        if (rc == 1 && !host_.err && pol_.o.ctx) {
+            std::exception_ptr& e = static_cast<ModuleCtx*>(pol_.o.ctx)->err;
+            if (e) { std::exception_ptr x = e; e = nullptr; std::rethrow_exception(x); }
+        }
+        ctl::check(rc, &host_.err);
+    }
+    // the Rust compute thread and the driver's hooks it answers. Freed before ctl_, which it borrows
+    ComputeHandle cmp_;
+    // a compute call's result: what the host, the module or the pool policy threw (rc 1) rethrown, or the refusal (rc 2)
+    void compute_check(int32_t rc) {
+        if (rc == 1 && !chost_.err)
+            for (void* c : {mod_.o.ctx, pol_.o.ctx}) {
+                if (!c) continue;
+                std::exception_ptr& e = static_cast<ModuleCtx*>(c)->err;
+                if (e) { std::exception_ptr x = e; e = nullptr; std::rethrow_exception(x); }
+            }
+        ctl::check(rc, &chost_.err);
+    }
     // a slot leaves: its run back to the pool, retained with the session's reuse state when prefix reuse is on. A
     // finished session at the step it finished (Driver finished hook, every rank), a cancelled one at the event: head in
     // event(), workers at apply, the same point of the same commit. So every rank keeps the same runs. Without prefix
@@ -248,23 +294,10 @@ class Service {
         }
         mod_.retain(s.run, st, g6rt::steering::cache_namespace(s.req.steering));
     }
-    void publish_status() { // head CONTROL thread only, on queue/lifecycle revisions
-        PoolStatus p;
-        p.free = pool().free_pages(); p.room = pool_room();
-        if (pol_.o.status) p.stats = pool().stats();
-        if (pol_.o.tiers) p.tiers = pol_.tiers();
-        if (pol_.o.status) p.runs = pool().runs();
-        write_status(p);
-    }
+    // status.s2 from these pool values. Only service_vectors_test calls it: the control thread's publish reads the pool itself
     void write_status(const PoolStatus& p) {
-        const uint32_t pages = c_.scheduler.pool_rows / PAGE;
-        const auto free = p.free, room = p.room;
-        ctl::check(g6svc_status_pool(free, room, pages));
         g6svc_status st{};
-        st.epoch = c_.scheduler.epoch; st.pool_pages = pages; st.free = free; st.room = room;
-        st.resident = progress_.resident.load(); st.queued = queue_.size(); st.retiring = progress_.retiring.load();
-        st.stalls = queue_.stalls();
-        // growth on demand: pages the live runs hold and could grow to, each run's pair, and rounds a session sat out
+        st.free = p.free; st.room = p.room;
         if ((st.has_growth = p.stats.has_value())) {
             const auto& g = *p.stats;
             st.held_pages = g.held_pages; st.worst_pages = g.worst_pages; st.grows = g.grows; st.stalled = g.stalls;
@@ -275,156 +308,7 @@ class Service {
             for (const PoolUse& u : *p.runs) runs.push_back({u.table_version, u.held, u.worst});
             st.runs = runs.data(); st.n_runs = runs.size();
         }
-        ctl::check(g6svc_status_publish(&st, ctl::bytes(c_.directory), path_n(c_.directory)));
-    }
-    // held: the boundary every rank is stopped at after a commit with hold (Commit::hold); the notice names it, not a
-    // future one. Only event() itself passes it, at once after the held commit, so nothing else is announced between.
-    void event(const Command& command, std::optional<uint64_t> held = {}) { // CONTROL thread: never read Driver until ALL ACKs
-        const auto boundary = held ? *held : progress_.boundary.load(); // first: the horizon below is for this boundary or a later one
-        const auto horizon = progress_.horizon.load();
-        require(boundary <= uint64_t(INT64_MAX) - NOTICE_MAX, "event boundary overflow");
-        const auto target = admit::notice_target(boundary, horizon, held, c_.scheduler.notice_max);
-        if (trace_)
-            trace_.instant("notice", Trace::CONTROL, targ("request", command.request) + "," +
-                           targ("kind", command.resize ? "resize" : command.admit ? "admit" : "cancel") + "," +
-                           targ("anchored", boundary) + "," + targ("boundary", target));
-        if (elog_)
-            fprintf(stderr, "# s2_event notice rank %u event %llu %s request %llu anchored %llu -> boundary %llu (lookahead %llu) t_us %lld\n",
-                    c_.rank, (unsigned long long)event_, command.resize ? "resize" : command.admit ? "admit" : "cancel",
-                    (unsigned long long)command.request,
-                    (unsigned long long)boundary, (unsigned long long)target, (unsigned long long)(target - boundary), wall_us());
-        Notice n{c_.scheduler.epoch, event_, target, command.request, command.hash,
-                 command.resize ? EventKind::Resize : command.admit ? EventKind::Admit : EventKind::Cancel};
-        bool hold = false;
-        leader_->event(n, [&](uint64_t hash) {
-            const auto& s = driver_->state(); // compute paused in boundary() until this commit
-            Commit cm{n.epoch, n.event, n.boundary, hash, {}, {}};
-            cm.resize = command.resize;   // every rank applies it at the commit (Driver resize hook), the head too
-            if (!command.admit && !command.resize) cm.cancel = s.find(command.request);
-            // Head owns the real pool delta once; Driver callbacks skip it here. A Retiring slot gave its run back when it
-            // finished (Driver finished hook); a cancelled live one gives it back now.
-            for (const auto& sl : s.slots())
-                if (cm.cancel && sl.phase != Phase::Free && sl.phase != Phase::Retiring && sl.key == *cm.cancel) retire_run(sl);
-            if (command.admit) {
-                // copied at once: the queue's front pointer is valid only until the queue changes (drain_admits pushes)
-                const auto* queued = queue_.front(); require(queued && queued->id == command.request, "admission FIFO changed during event");
-                Request req = *queued;
-                const Request* request = &req;
-                unsigned live = s.resident();
-                const auto worst = reserve_rows(c_.scheduler, *request), rows = admit_rows(*request);
-                // a prompt that continues a retained run fits when the hit does (match checks the room the hit needs, with
-                // the run's own pages and records counted as its own), even when a fresh run of it would not
-                const auto pr0 = prompts_.find(request->id);
-                const std::vector<int>* prompt = reuse() && pr0 != prompts_.end() ? &pr0->second : nullptr;
-                uint32_t r = 0;
-                PoolHit pre{};
-                bool fits = false;
-                auto try_fit = [&] {
-                    if (pol_.o.r_rows) req.r_rows = pol_.r_rows(req, rows, worst, prompt);
-                    r = req.r_rows;
-                    pre = prompt ? pol_.match(*prompt, rows, worst, int(request->prompt_tokens) - 1,
-                                              g6rt::steering::cache_namespace(request->steering), r) : PoolHit{};
-                    fits = pre.skip > 0 || pool_fits(rows, worst, r);
-                };
-                try_fit();
-                // no room: a decoding session may take the smaller R, and this request then tries the room it gave up
-                if (admit::shrink(fits, pol_.o.make_room != nullptr, live, c_.scheduler.limit()))
-                    if ((cm.shrink = pol_.make_room(s.slots(), req, rows, worst))) {
-                        if (trace_)
-                            trace_.instant("shrink", Trace::CONTROL, targ("request", request->id) + "," +
-                                           targ("slot", cm.shrink->key.slot) + "," + targ("r", cm.shrink->r_rows));
-                        try_fit();
-                    }
-                const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), fits, pool_room());
-                require(fit.has_value(), "duplicate admission attempt without revision");
-                if (trace_ && admit::wait_line(fit->why, waited_, request->id)) {
-                    waited_ = request->id;
-                    trace_.instant("wait", Trace::CONTROL, targ("request", request->id) + "," +
-                                   targ("why", fit->why == Stall::Slots ? "slots" : "capacity") + "," +
-                                   targ("requested", fit->requested) + "," + targ("room", fit->room) + "," +
-                                   targ("live", live));
-                }
-                if (admit::refusal_line(fit->why, refused_, request->id)) {
-                    refused_ = request->id;   // once per request
-                    if (reuse() && pr0 != prompts_.end())
-                        fprintf(stderr, "# s2 reuse request %llu waits: %s retained %d lcp %d prompt %u\n", (unsigned long long)request->id,
-                                pre.why, pre.skip, pre.lcp, request->prompt_tokens);
-                    if (pol_.o.refusal)
-                        if (const std::string why = pol_.refusal(worst, r); !why.empty())
-                            fprintf(stderr, "# s2 rt: request %llu (%llu rows) waits: %s\n", (unsigned long long)request->id,
-                                    (unsigned long long)worst, why.c_str());
-                }
-                // borrow-idle: a request whose worst case passes the chunks every rank has online waits for a recall
-                const uint32_t short_of = fit->why == Stall::None && native_.flash.chunk_rows
-                                              ? native_.flash.recall(worst, leader_->agreed_room()) : 0;
-                const auto note = admit::recall_note(fit->why, short_of, recall_for_, request->id);
-                if (note == admit::Recall::Begin) {
-                    recall_for_ = request->id; recall_t0_ = std::chrono::steady_clock::now();
-                    fprintf(stderr, "# s2 flash kv: request %llu (%llu rows) waits for a recall to %u chunks (%u online)\n",
-                            (unsigned long long)request->id, (unsigned long long)worst, short_of, leader_->agreed_room());
-                } else if (note == admit::Recall::Done) {
-                    fprintf(stderr, "# s2 flash kv: request %llu admitted %lld ms after its recall began\n",
-                            (unsigned long long)request->id, (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::steady_clock::now() - recall_t0_).count());
-                    recall_for_ = UINT64_MAX;
-                }
-                if (short_of) recall_ = short_of;
-                if (admit::grant(fit->why, short_of)) {
-                    Run run{}; uint32_t skip = 0, restored = 0, counted = 0;
-                    int parked = -1;   // park: the parked slot the prompt extends, which the grant takes
-                    const auto pr = prompts_.find(request->id);
-                    if (reuse() && pr != prompts_.end()) {
-                        if (pol_.o.count)
-                            counted = pool().count(pr->second, spans_.count(request->id) ? spans_.at(request->id) : -1,
-                                g6rt::steering::cache_namespace(request->steering));
-                        const PoolHit h = pol_.match(pr->second, rows, worst, int(request->prompt_tokens) - 1,
-                                                     g6rt::steering::cache_namespace(request->steering), r);
-                        if (h.skip > 0) {
-                            run = pol_.take(h, rows, worst, r); skip = uint32_t(h.skip); restored = h.stored ? h.tier + 1 : 0;
-                            parked = h.slot;
-                        }
-                        fprintf(stderr, "# s2 reuse request %llu %s retained %d lcp %d prompt %u first page %u\n", (unsigned long long)request->id,
-                                h.why, h.skip, h.lcp, request->prompt_tokens, skip ? run.first_page : 0u);
-                    }
-                    // a pool that said it fits and then refuses is a bug, but one request's: it waits, the epoch goes on
-                    bool got = true;
-                    if (!skip) {
-                        try { run = pool_reserve(rows, worst, r); }
-                        catch (const std::exception& e) {
-                            got = false;
-                            fprintf(stderr, "# s2: request %llu (%llu rows): the pool refused its reservation after fits(): %s; it waits\n",
-                                    (unsigned long long)request->id, (unsigned long long)worst, e.what());
-                        }
-                    }
-                    if (got) cm.admit = Grant{parked >= 0 ? s.next_key({}, unsigned(parked)) : s.next_key(), *request, run, skip, restored, counted};
-                }
-                attempted_head_ = request->id; attempted_revision_ = admit::attempted_revision(s.revision());
-                if (cm.admit) {
-                    if (trace_)
-                        trace_.instant("admit", Trace::CONTROL, targ("request", request->id) + "," +
-                                       targ("reused", cm.admit->reuse) + "," + targ("rows", worst) + "," + targ("live", live));
-                    queue_.admitted(request->id); commands_.erase(command.request); prompts_.erase(command.request);
-                    spans_.erase(command.request); payloads_.erase(command.request);
-                    // another request queued and a slot left after this one: keep the ranks at this boundary for it.
-                    // first queue the ADMIT files that landed while this thread was inside the event chain (each
-                    // event waits for every rank's ACK, ~8 ms); the loop reads cmd files only between events, so without
-                    // this a burst written within 1 ms loses the hold after its 2nd grant and waits NOTICE_MAX boundaries
-                    if (admit::drain(admit_hold_, live, c_.scheduler.limit())) drain_admits();
-                    hold = cm.hold = admit::hold(admit_hold_, queue_.front() != nullptr, live, c_.scheduler.limit());
-                }
-            }
-            return cm;
-        }, command.admit ? &payloads_.at(command.request) : nullptr);
-        require(event_ != UINT64_MAX, "event sequence exhausted"); ++event_; publish_status();
-        // Every rank is stopped at n.boundary and waits for a notice that names it (event_gate.h held_): announce the new
-        // FIFO head there now. Its commit holds again or releases (no grant, or nothing left to chain), so the chain
-        // ends within limit() admissions.
-        if (hold) { const auto next = commands_.at(queue_.front()->id); event(next, n.boundary); }
-        // the FIFO head waits for lent chunks: recall them (every rank grows at the commit), then it is tried again
-        if (recall_ && !resizing_.load()) {
-            Command c; c.epoch = c_.scheduler.epoch; c.resize = Resize{FLASH_KV_TIER, recall_, 0, 0};
-            recall_ = 0; resizing_.store(true); event(c);
-        }
+        ctl::check(g6svc_control_write_status(ctl_.get(), &st));
     }
     // A grammar that does not compile ends its request with an error before it is queued, so no request that asks
     // for a grammar runs without one. The front end compiles each schema first and returns a 400 for one that fails.
@@ -460,147 +344,6 @@ class Service {
         atomic_file(c_.directory + "/resp." + std::to_string(id), "end error -1 0\n");
         return false;
     }
-    void controller() {
-        uint64_t status_revision = UINT64_MAX;
-        auto next_share = std::chrono::steady_clock::now();
-        while (!stopping_.load()) {
-            bool changed = false;
-            if (native_.share && !resizing_.load() && std::chrono::steady_clock::now() >= next_share) {
-                next_share = std::chrono::steady_clock::now() + std::chrono::milliseconds(share_ms_);
-                const unsigned resident = progress_.resident.load();
-                if (const auto r = native_.share(admit::share_idle(resident, queue_.size()))) {
-                    fprintf(stderr, "# s2 share: tier %u to %llu segments (%llu blocks)\n", r->tier, (unsigned long long)r->segs,
-                            (unsigned long long)r->slots);
-                    resizing_.store(true);
-                    Command c; c.epoch = c_.scheduler.epoch; c.resize = *r;
-                    event(c); changed = true;
-                }
-            }
-            // borrow-idle: lend the chunks above flash.keep once the engine has been idle flash.idle_ms
-            if (native_.flash.chunk_rows && !resizing_.load()) {
-                const unsigned resident = progress_.resident.load();
-                const size_t queued = queue_.size();
-                const unsigned retiring = progress_.retiring.load();
-                if (const auto n = native_.flash.poll(admit::lend_idle(resident, queued, retiring), std::chrono::steady_clock::now())) {
-                    fprintf(stderr, "# s2 flash kv: idle, lending down to %u chunks\n", *n);
-                    resizing_.store(true);
-                    Command c; c.epoch = c_.scheduler.epoch; c.resize = Resize{FLASH_KV_TIER, *n, 0, 0};
-                    event(c); changed = true;
-                }
-            }
-            while (auto command = ingress_.next()) {
-                changed = true;
-                if (command->admit) {
-                    intake(*command);
-                } else if (queue_.cancel(command->request)) {
-                    commands_.erase(command->request); prompts_.erase(command->request); spans_.erase(command->request);
-                    payloads_.erase(command->request);
-                    atomic_file(c_.directory + "/resp." + std::to_string(command->request), "end abort -1 0\n");
-                } else event(*command); // resident/retiring lookup only at the fence
-                if (stopping_.load()) return;
-            }
-            if (const auto* front = queue_.front()) {
-                if (admit::retry(front->id, attempted_head_, progress_.revision.load(), attempted_revision_)) {
-                    // Copy: event() may erase the map entry after all ACKs.
-                    auto command = commands_.at(front->id); event(command); changed = true;
-                }
-            }
-            const auto rev = progress_.revision.load();
-            if (changed || rev != status_revision) { publish_status(); status_revision = rev; }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1)); // control only
-        }
-    }
-    void monitor() {
-        while (!stopping_.load()) {
-            require(!exists(c_.directory + "/abort.s2"), "shim aborted S2 epoch");
-            if (exists(c_.directory + "/quit")) {
-                // Orderly quit: stop at once (controller/compute loops end, later control errors are ignored) but keep
-                // this rank's control sockets open for quit_linger_ms before closing them, so a worker reads EOF only
-                // after it is stopping too. The head passes its quit to the workers over the control links, and each
-                // worker writes its own DIR/quit. Closing at once made the workers fail with 'control disconnected'
-                // (g6m4 exit 3) on a clean quit.
-                // Quit is for an idle engine (no resident session): a rank stopping mid-round leaves its peers' step.
-                if (leader_) leader_->quit();
-                stopping_.store(true);
-                const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(quit_linger_ms);
-                while (std::chrono::steady_clock::now() < end && !exists(c_.directory + "/abort.s2"))
-                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                shutdown(); return;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    }
-    void compute() {
-        while (!stopping_.load()) {
-            end_step();
-            Notice noticed{};
-            if (!driver_->state().resident()) {
-                const auto n = endpoint_->wait_notice(); driver_->idle_boundary(n.boundary);
-            }
-            auto cm = endpoint_->boundary(driver_->state().boundary(), [&] {
-                mod_.fence(); const auto n = endpoint_->wait_notice(); noticed = n; staged_.reset();
-                if (n.kind == EventKind::Admit) {   // the head reads its own req.<id>; a worker has the bytes from the head
-                    const auto bytes = worker_ ? worker_->request(n.request) : ingress_.request({true,n.epoch,n.request,n.payload_hash});
-                    require(payload_hash(bytes) == n.payload_hash, "request bytes do not match the ADMIT notice");
-                    staged_ = parse_request(bytes, c_.scheduler.steering);
-                }
-                if (pol_.o.digest) driver_->pool_digest(pol_.digest());
-                return driver_->state().digest(); // once per event, NEVER per round
-            });
-            if (cm) {
-                // CANCEL may arrive before Batch::admit, or after several rounds.
-                // Capture its actual request counters before Driver releases Batch.
-                for (const auto& old : driver_->state().slots())
-                    if (old.phase != Phase::Free && old.phase != Phase::Retiring && cm->cancel && old.key == *cm->cancel) {
-                        const auto* stats = driver_->stats_if_initialized(old.key);
-                        sessions_.terminal(old.key, stats ? *stats : s2::Stats{}, "abort");
-                    }
-                std::optional<Payload> payload;
-                if (cm->admit) { require(staged_.has_value(), "commit without verified request"); payload = sessions_.payload(*staged_); }
-                driver_->apply(*cm, payload ? &*payload : nullptr);
-                if (trace_)
-                    trace_.instant("commit", Trace::STEPS, targ("request", noticed.request) + "," +
-                                   targ("kind", noticed.kind == EventKind::Resize ? "resize"
-                                                : noticed.kind == EventKind::Cancel ? "cancel" : "admit") + "," +
-                                   targ("boundary", cm->boundary));
-                if (elog_) {
-                    // t_us: now (applied); installed_us / arrived_us: this rank's notice install and boundary arrival
-                    // (control_channel.h stamps), so arrived - installed is the notice's margin on this rank
-                    const auto st = endpoint_->stamps();
-                    fprintf(stderr, "# s2_event commit rank %u event %llu %s request %llu boundary %llu t_us %lld installed_us %lld arrived_us %lld\n", c_.rank,
-                            (unsigned long long)noticed.event,
-                            noticed.kind == EventKind::Resize ? "resize" : noticed.kind == EventKind::Cancel ? "cancel" : "admit",
-                            (unsigned long long)noticed.request, (unsigned long long)cm->boundary, wall_us(), st.first, st.second);
-                }
-                if (worker_ && cm->admit) worker_->admitted(cm->admit->req.id);
-                if (cm->resize) resizing_.store(false);
-                dispatch_.synchronize_mode(driver_->state()); progress_.publish(driver_->state());
-                staged_.reset(); endpoint_->applied(); continue;
-            }
-            if (mod_.o.before_work) mod_.before_work();
-            const auto t0 = trace_ ? Trace::now() : 0;
-            const auto work = driver_->step(); require(work.kind != Kind::Idle, "departed idle boundary");
-            for (unsigned i = 0; i < work.count; ++i) {   // rank 0: each session's spec counters, once a second
-                const Key k = work.keys[i];
-                if (!sessions_.counters_due(k) || driver_->state().slots()[k.slot].key != k) continue;
-                if (const auto* st = driver_->stats_if_initialized(k)) sessions_.counters(k, *st);
-            }
-            if (trace_) {
-                std::string ids;
-                for (unsigned i = 0; i < work.count; ++i)
-                    ids += (i ? "," : "") + std::to_string(driver_->state().slots()[work.keys[i].slot].req.id);
-                step_ = {true, work.kind == Kind::Prefill ? "prefill" : work.kind == Kind::PromptTail ? "prompt tail" : "decode",
-                         t0, targ("boundary", work.boundary) + "," + targ("first", work.first) + "," + targ("rows", work.rows) +
-                                 ",\"requests\":[" + ids + "]"};
-            }
-            if (elog_ && work.kind != Kind::Decode)
-                fprintf(stderr, "# s2_event step rank %u boundary %llu request %llu %s first %u rows %u\n", c_.rank,
-                        (unsigned long long)work.boundary, (unsigned long long)driver_->state().slots()[work.keys[0].slot].req.id,
-                        work.kind == Kind::Prefill ? "prefill" : work.kind == Kind::PrefillPack ? "prefill_pack" :
-                        work.kind == Kind::PromptTailPack ? "tail_pack" : "tail", work.first, work.rows);
-            dispatch_.synchronize_mode(driver_->state()); progress_.publish(driver_->state());
-        }
-    }
 public:
     unsigned quit_linger_ms = 15000; // orderly-quit linger (monitor); > the time the workers take to see the head's quit
     Service(BootstrapConfig c, ControlLinks& links, NativeHooks hooks, int chunk)
@@ -632,40 +375,15 @@ public:
         require(!native_.share || m.resize, "a share report needs the resize hook");
         require(!native_.flash.chunk_rows || m.resize, "borrow-idle needs the resize hook");
         if (m.logprob) logprob_ = [this](int row, bool target, int k) { return mod_.logprob(row, target, k); };
+        // the hooks whose logic is the service's are Rust (compute.rs); the rest forward to Dispatch and Sessions
         DriverHooks h;
         if (m.resize) h.resize = [&](const Resize& r) { mod_.resize(r); };
         h.shrink = [&](const Shrink& k, const Run& was, uint64_t length) {   // a worker's pool changed in the driver first
             require(mod_.o.shrink != nullptr, "a shrink commit without the native shrink hook");
             mod_.shrink(k, was, length);
         };
-        h.bind = [&](const Grant& g) {
-            require(staged_.has_value(), "binding without verified payload");
-            require(!g.reuse || reuse(), "reused rows without prefix reuse");
-            if (c_.rank) {   // the head's call, on the same pool state
-                const auto worst = reserve_rows(c_.scheduler,g.req), rows = admit_rows(g.req);
-                Run mine;
-                if (pol_.o.count && reuse() && staged_->plp < 0)
-                    require(pool().count(staged_->prompt, staged_->sys,
-                        g6rt::steering::cache_namespace(g.req.steering)) == g.counted, "worker prefix counts differ from the head");
-                else require(!g.counted, "a counted grant without counting");
-                if (g.reuse) {
-                    const PoolHit h = pol_.match(staged_->prompt, rows, worst, int(g.req.prompt_tokens) - 1,
-                                                 g6rt::steering::cache_namespace(g.req.steering), g.req.r_rows);
-                    require(h.skip == int(g.reuse) && (h.stored ? h.tier + 1 : 0) == g.restored, "worker prefix reuse differs from the head");
-                    require(h.slot < 0 || h.slot == int(g.key.slot), "worker parked slot differs from the head's grant");
-                    mine = pol_.take(h, rows, worst, g.req.r_rows);
-                } else mine = pool_reserve(rows, worst, g.req.r_rows);
-                require(mine == g.run, "worker page list differs from the head's grant");
-            }
-            dispatch_.begin(g.key.slot, int(g.reuse), g6rt::steering::cache_namespace(g.req.steering));
-            if (mod_.o.bind_request) mod_.bind_request(g.key.slot, *staged_);
-            mod_.bind(g); sessions_.bind(g,*staged_);
-        };
-        h.retire = [&](const Slot& old) {
-            // a cancelled live session (finished ones: below)
-            if (c_.rank && old.phase != Phase::Retiring && reuse()) retire_run(old);
-            mod_.retire(old); sessions_.retire(old); dispatch_.release(old.key.slot);
-        };
+        h.bind = [&](const Grant& g) { compute_check(g6svc_compute_bind(cmp_.get(), sch::c<g6sch_grant>(&g))); };
+        h.retire = [&](const Slot& old) { compute_check(g6svc_compute_retire(cmp_.get(), sch::c<g6sch_slot>(&old))); };
         h.prefill = [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows) {
             dispatch_.prefill(s,p,first,rows);
             sessions_.progress(s.key,first + rows);   // rank 0: a long prefill tells the front end it is alive
@@ -676,44 +394,21 @@ public:
         };
         h.run = [&](const s2::Step& step) { return dispatch_.run(step); };
         h.emit = [&](Key k,const int* ids,int n,int row) {
-            if (trace_ && n > 0) {
-                const auto id = driver_->state().slots()[k.slot].req.id;
-                if (first_.insert(id).second) trace_.instant("first token", Trace::STEPS, targ("request", id));
-            }
+            if (trace_ && n > 0) g6svc_compute_first_token(cmp_.get(), sch::c<g6sch_key>(&k));
             return sessions_.emit(k,ids,n,row,logprob_);
         };
         h.prompt = [&](Key k,int M,int pos0) { sessions_.prompt_rows(k,M,pos0,logprob_); };
-        h.finished = [&](const Slot& s) {
-            if (trace_) {
-                trace_.instant("finish", Trace::STEPS, targ("request", s.req.id) + "," + targ("tokens", s.emitted));
-                first_.erase(s.req.id);
-            }
-            if (reuse()) retire_run(s);
-        };
+        h.finished = [&](const Slot& s) { compute_check(g6svc_compute_finished(cmp_.get(), sch::c<g6sch_slot>(&s))); };
         if (m.drained)   // the copies run at a bind, a growth or a retire: all before the next step's round
-            h.settle = [&] {
-                if (!mod_.drained()) return;
-                // the barrier after a drain: every rank waits here for the slowest rank's drain (the drain trace's other
-                // half: the tier io lines carry the same ranks' drains)
-                auto wall = [] { return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); };
-                const long long b0 = wall();
-                endpoint_->sync(++sync_);
-                fprintf(stderr, "# rank %u: s2 drain barrier %llu: in %lld ms, out %lld ms\n", (unsigned)c_.rank, (unsigned long long)sync_, b0, wall());
-            };
+            h.settle = [&] { compute_check(g6svc_compute_settle(cmp_.get())); };
         if (pol_.o.grow)
             h.grown = [&](const Slot& s, const Run& r) { mod_.grown(s.key.slot, r); sessions_.grow(s.key.slot, r); };
-        h.terminal = [&](Key k,const s2::Stats& stats) {
-            if (stats.switches || stats.mtp_rounds)
-                fprintf(stderr,"# s2 drafter choice slot %u: %ld of %ld rounds on MTP, %ld switches, %ld tokens\n",unsigned(k.slot),
-                        stats.mtp_rounds,stats.rounds,stats.switches,stats.tokens);
-            if (native_.dfl_reuse.mode && !c_.rank)   // every request, so one that never had the drafter shows too
-                fprintf(stderr,"# s2 dflash reuse slot %u: %ld of %ld rounds on DFlash2, %ld on MTP; context from %d (taps from %d), "
-                        "warm-up to %d, promoted at %d, %ld tokens\n",unsigned(k.slot),stats.dfl_rounds,stats.rounds,stats.mtp_rounds,
-                        stats.dfl_lo,stats.dfl_from,stats.dfl_warm,stats.promoted,stats.tokens);
-            if (native_.ngram.t && !c_.rank)
-                fprintf(stderr,"# s2 ngram slot %u: %ld of %ld rounds verified a table chain, %ld of %ld of its tokens accepted, %ld tokens\n",
-                        unsigned(k.slot),stats.ngram_rounds,stats.rounds,stats.ngram_acc,stats.ngram_drafted,stats.tokens);
-            sessions_.terminal(k,stats);
+        h.terminal = [&](Key k,const s2::Stats& st) {
+            const g6s2_stats x{st.rounds, st.tokens, st.drafted, st.mtp_rounds, st.switches, st.inserted, st.ngram_rounds,
+                               st.ngram_drafted, st.ngram_acc, st.dfl_rounds, st.dfl_from, st.dfl_lo, st.dfl_warm, st.promoted,
+                               nullptr, 0};
+            g6svc_compute_terminal(cmp_.get(), k.slot, &x);
+            sessions_.terminal(k,st);
         };
         if (m.dfl) {
             require(m.dfl_ok && m.dfl_start, "DFlash2 needs dfl_ok, dfl_start and dfl");
@@ -746,22 +441,62 @@ public:
             worker_ = std::make_unique<WorkerChannel>(c_.scheduler.epoch,c_.rank,*links_.links[0]); endpoint_ = worker_.get();
             worker_->on_quit = [this] { atomic_file(c_.directory + "/quit", ""); };
         }
-        if (m.flash_room) endpoint_->room = [this] { return mod_.flash_room(); };
+        g6svc_control_cfg cc{};
+        cc.scheduler = &c_.scheduler; cc.directory = ctl::bytes(c_.directory); cc.directory_n = path_n(c_.directory);
+        cc.endpoint = endpoint_->handle(); cc.ingress = ingress_.handle(); cc.queue = queue_.handle(); cc.trace = trace_.handle();
+        cc.slots = driver_->state().slot_data(); cc.n_slots = MAX_SESSIONS; cc.state = driver_->state().counters();
+        cc.pool = pol_.o;
+        cc.host.ctx = static_cast<ModuleCtx*>(&host_);
+        cc.host.check = Host::check; cc.host.retire_run = Host::retire_run;
+        if (native_.share) cc.host.share = Host::share;
+        if (pol_.o.refusal) cc.host.refusal = Host::refusal;
+        if (pol_.o.tiers) cc.host.tiers = Host::tiers_of;
+        const FlashLend& fl = native_.flash;
+        cc.lend = g6sch_lend{int64_t(fl.idle_ms), fl.keep, fl.chunk_rows, fl.chunks, false, false, 0};
+        cc.share_ms = std::max<long>(1, knob::s2_share_ms());
+        cc.rank = c_.rank; cc.head = c_.rank == 0;
+        // GR8_S2_ADMIT_HOLD=1 (head only; the workers follow Commit::hold): an admission with another request queued
+        // behind it and a slot left holds its boundary, and the next admission is announced at that same boundary, so
+        // a burst of queued requests is granted in milliseconds rather than one per NOTICE_MIN boundaries (~15 s each
+        // behind 8,192-row prefill quanta). Default off: one admission per notice
+        cc.admit_hold = knob::s2_admit_hold();
+        cc.elog = elog_;
+        g6svc_control* ch = nullptr;
+        const int32_t rc = g6svc_control_new(&cc, &ch);
+        ctl_.reset(ch);
+        ctl::check(rc);
+        g6svc_compute_cfg pc{};
+        pc.control = ctl_.get(); pc.endpoint = endpoint_->handle(); pc.ingress = ingress_.handle(); pc.trace = trace_.handle();
+        pc.slots = driver_->state().slot_data(); pc.n_slots = MAX_SESSIONS; pc.state = driver_->state().counters();
+        pc.module = mod_.o;
+        g6svc_host& ct = pc.host;
+        ct.ctx = static_cast<ModuleCtx*>(&chost_);
+        ct.retire_run = Host::retire_run; ct.idle_boundary = Host::idle_boundary; ct.stage = Host::stage; ct.unstage = Host::unstage;
+        ct.digest = Host::digest; ct.abort = Host::abort; ct.apply = Host::apply; ct.mode = Host::mode; ct.step = Host::step;
+        ct.counters = Host::counters; ct.begin = Host::begin; ct.bound = Host::bound; ct.release = Host::release;
+        pc.rank = c_.rank; pc.elog = elog_;
+        pc.dfl_reuse = native_.dfl_reuse.mode != 0; pc.ngram = native_.ngram.t != nullptr;
+        g6svc_compute* mh = nullptr;
+        const int32_t mrc = g6svc_compute_new(&pc, &mh);
+        cmp_.reset(mh);
+        ctl::check(mrc);
     }
     // Blocking compute loop, with persistent control + abort/quit monitor threads.
     // Caller must use the runtime's all-rank failure path if this throws.
     void run() {
         std::thread control, watcher;
         auto guarded = [&](const std::function<void()>& f) {
-            try { f(); } catch (...) { if (!stopping_.load()) fail(std::current_exception()); }
+            try { f(); } catch (...) { if (!stopping()) fail(std::current_exception()); }
         };
         try {
-            control = std::thread([&] { guarded([&] { if (leader_) controller(); else worker_->receive_events(); }); });
-            watcher = std::thread([&] { guarded([&] { monitor(); }); });
+            control = std::thread([&] {
+                guarded([&] { if (leader_) control_check(g6svc_control_run(ctl_.get())); else worker_->receive_events(); });
+            });
+            watcher = std::thread([&] { guarded([&] { control_check(g6svc_control_monitor(ctl_.get(), quit_linger_ms)); }); });
             if (!c_.rank) publish_ready(c_,links_);
-            guarded([&] { compute(); });
+            guarded([&] { compute_check(g6svc_compute_run(cmp_.get())); });
         } catch (...) { fail(std::current_exception()); }
-        // Orderly quit: compute leaves its loop as soon as stopping_ is set, possibly mid-work (a straggler or a
+        // Orderly quit: compute leaves its loop as soon as the service is stopping, possibly mid-work (a straggler or a
         // descheduled head); the links stay open until the monitor has finished its bounded linger. On a
         // failure fail() has already woken/closed the endpoints and the monitor returns within one poll.
         if (watcher.joinable()) watcher.join();

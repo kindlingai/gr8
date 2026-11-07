@@ -207,6 +207,8 @@ inline const char* scan_widths(LayerTensors& T, bool allow_empty = false)
             continue;
         }
         if (tr[3] > g6nr::EB) err = "an expert has more blocks than this build's EB";
+        // kmix packs 8 bits per block in one 64-bit word
+        if (kmi && tr[3] > 8) { err = "an expert with mixed widths (tr3.kmix) has more than 8 blocks on this rank"; continue; }
         auto chk = [&](long long w) {
             if (w < 2 || w > 4) err = "routed expert width outside 2..4";
             all += w;
@@ -430,7 +432,9 @@ inline size_t scratch_layout(Scratch* s, char* base, int rows = G6_MX)
     t.xf_x = reinterpret_cast<u32*>(take(xf));
     t.xb_x = reinterpret_cast<u32*>(take(xf));
     t.xf_qa = reinterpret_cast<u32*>(take(xf));
-    t.xf_attn = reinterpret_cast<u32*>(take(xf));
+    // the o_proj input: K = HID at GLM, h * 256 at Flash (QBW: 4*HID at TP=1, flash_dsa.cuh)
+    const size_t xf_sw = static_cast<size_t>(g6nr::SMALLW / 16) * 64 * 4 * NT;
+    t.xf_attn = reinterpret_cast<u32*>(take(xf > xf_sw ? xf : xf_sw));
     t.xf_x2 = reinterpret_cast<u32*>(take(xf));
     t.xb_x2 = reinterpret_cast<u32*>(take(xf));
     t.gpart = reinterpret_cast<float*>(take(static_cast<size_t>(smax) * g6nr::EB * 2 * GPMAX * 8 * 128 * sizeof(float)));
@@ -1010,6 +1014,9 @@ inline const char* make_k1(const LayerTensors& T, int M, const Scratch& sc, cons
     }
     else if (fuse)                                         // dense layers: the fused remap of K1_DENSE_SPLIT (4 x 2)
         if (const char* e = k1_fuse_split(s)) return e;
+    // the shared / dense fc2 gives each of its s_ns2 CTAs KSH / s_ns2 n-tiles: a remainder would stay unwritten
+    // (KSH 256 with s_ns2 24 leaves columns 3840..4095)
+    if (!sh && (s.s_ns2 < 1 || KSH % s.s_ns2)) return "K1 split: s_ns2 must divide KSH (shared / dense MLP fc2)";
     const int w1 = 8 * s.WG;
 
     K1Args& a = k.a;

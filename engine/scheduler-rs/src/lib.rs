@@ -12,19 +12,28 @@
 pub mod admission;
 pub mod control;
 pub mod cp_rows;
+pub mod cstd;
 pub mod driver;
 pub mod ffi;
 pub mod flash_lend;
 pub mod flash_ring;
 pub mod kv_plan;
 pub mod kv_share;
+/// gr8_knobs.h's ids, which `knobs gen` writes
+#[allow(dead_code)]
+pub mod knob_ids {
+    include!("../../knobs-rs/gr8_knob_ids.rs");
+}
 pub mod layout;
 pub mod module;
+pub mod module_info;
 pub mod ngram;
+pub mod options;
 pub mod planner;
 pub mod planner_ffi;
 pub mod pool_ops;
 pub mod request;
 pub mod scheduler;
 pub mod service;
+pub mod signature;
 pub mod spec_len;

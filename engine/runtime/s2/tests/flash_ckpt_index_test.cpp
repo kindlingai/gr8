@@ -372,7 +372,7 @@ static void ring_checks() {
     std::fill(st.b[a.base].begin(), st.b[a.base].end(), 0);
     std::memcpy(st.b[a.base].data(), &old.manifest, sizeof old.manifest);
     CHECK(check(old, st) == "no manifest");
-    CHECK(FlashManifest::FORMAT == 2);
+    CHECK(FlashManifest::FORMAT == 3);
 }
 
 // The crash case again, with an index that still names the dropped entry (as the first version wrote it, before a

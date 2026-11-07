@@ -1,0 +1,30 @@
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -202,7 +202,7 @@
+ #endif
+     Plan plan;
+     bool image = false, hash = true, reuse_prefix = false;
+-#if G6_MODEL_DS41
++#if 1
+     bool check_args = false;            // --check-args: parse and refuse as a boot would, then exit 0 before any CUDA work
+ #endif
+     bool lanes_explicit = false;        // --pf-lanes given (common_arg parses it)
+@@ -248,7 +248,7 @@
+         else if (a == "--image") image = true;
+         else if (a == "--no-hash") hash = false;
+         else if (a == "--reuse-prefix") reuse_prefix = true;
+-#if G6_MODEL_DS41
++#if 1
+         else if (a == "--check-args") check_args = true;
+ #endif
+         else if (a == "--kv-store") kv_tiers.push_back(next());
+@@ -692,6 +692,9 @@
+         if (!own4 && (!qp_man.empty() || !qp_file.empty())) die("--qp-manifest / --qp-pack need GR8_PF_OWN=4 and --prefill");
+     }
+ 
++#if !G6_MODEL_DS41
++    if (check_args) { fprintf(stderr, "g6m4: --check-args: the arguments pass the parse-time checks (no CUDA, no weights)\n"); return 0; }
++#endif
+     G6RT_CK(cudaSetDeviceFlags(cudaDeviceMapHost));
+     cfg.slot_bytes = NX ? (size_t)MX * 6144 * 2 : (size_t)MX * HID * 2;   // Engram: [rows][6144] BF16 slots (ds41_engram_ops.cuh)
+     const size_t dec_slot_bytes = cfg.slot_bytes;   // the decode slot: every decode collective (layer, head, Engram) of MX rows fits it

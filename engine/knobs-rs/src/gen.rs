@@ -1,10 +1,15 @@
-//! The files `knobs gen` writes from the table: the C++ header and docs/ENV.md.
+//! The files `knobs gen` writes from the table: the C++ header, the ids for Rust code that reads knobs through the C
+//! API, and docs/ENV.md.
 
 use crate::{table_hash, Kind, Scope, Spec, TABLE};
 
 /// Where `knobs gen` writes each file, relative to the repository, and its text.
-pub fn files() -> [(&'static str, String); 2] {
-    [("engine/knobs-rs/gr8_knobs.h", header()), ("docs/ENV.md", env_md())]
+pub fn files() -> [(&'static str, String); 3] {
+    [
+        ("engine/knobs-rs/gr8_knobs.h", header()),
+        ("engine/knobs-rs/gr8_knob_ids.rs", ids()),
+        ("docs/ENV.md", env_md()),
+    ]
 }
 
 fn doc(s: &Spec) -> String {
@@ -64,9 +69,12 @@ ptrdiff_t gr8_knob_floats(uint32_t id, uint32_t n, const double** out);
 namespace knob
 {{
 
+/// The hash of the table this header was written from.
+constexpr uint64_t TABLE_HASH = 0x{:016x}ull;
+
 /// Prints the environment's problems (bad values, unknown GR8_ names, old G6_ names) to stderr and returns the number
 /// of errors. The engine stops when it is not 0.
-inline int init() {{ return gr8_knobs_init(0x{:016x}ull); }}
+inline int init() {{ return gr8_knobs_init(TABLE_HASH); }}
 
 /// The set agree-scope knobs that differ from their defaults, as " env NAME=value ...", or "".
 inline std::string signature() {{ return gr8_knobs_signature(); }}
@@ -133,6 +141,24 @@ inline std::optional<std::vector<double>> floats(uint32_t id, uint32_t n)
         };
     }
     h + "\n} // namespace knob\n"
+}
+
+/// gr8_knob_ids.rs: each knob's id in the C API (gr8_knob_flag and the others), for Rust code linked beside
+/// libgr8knobs.a rather than with this crate (engine/scheduler-rs includes it).
+pub fn ids() -> String {
+    let mut out = format!(
+        "// Written by `cargo run --manifest-path engine/knobs-rs/Cargo.toml --bin knobs -- gen` from the knobs/ YAML files:
+// change the table, not this file. Each knob's id in the C API of gr8_knobs.h; a NAME<n> family takes n as well.
+
+/// The hash of the table these ids are from (gr8_knobs.h knob::TABLE_HASH).
+pub const TABLE_HASH: u64 = 0x{:016x};
+",
+        table_hash()
+    );
+    for (i, s) in TABLE.iter().enumerate() {
+        out += &format!("pub const {}: u32 = {i};\n", s.name);
+    }
+    out
 }
 
 fn cell(s: &str) -> String {

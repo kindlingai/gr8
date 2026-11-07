@@ -38,10 +38,10 @@ namespace {
 // status.s2 is written by a private Service member: an explicit instantiation may name private members
 template <class Tag, typename Tag::type M> struct Rob { friend typename Tag::type get(Tag) { return M; } };
 struct QueueOf { using type = AdmissionQueue Service::*; friend type get(QueueOf); };
-struct ProgressOf { using type = Progress Service::*; friend type get(ProgressOf); };
+struct ControlOf { using type = ControlHandle Service::*; friend type get(ControlOf); };
 struct StatusOf { using type = void (Service::*)(const PoolStatus&); friend type get(StatusOf); };
 template struct Rob<QueueOf, &Service::queue_>;
-template struct Rob<ProgressOf, &Service::progress_>;
+template struct Rob<ControlOf, &Service::ctl_>;
 template struct Rob<StatusOf, &Service::write_status>;
 struct Rng {
     std::mt19937_64 g;
@@ -392,8 +392,9 @@ uint64_t status_section(uint64_t seed, std::vector<std::string>* lines) {
                 (s.*get(QueueOf{})).check(revision++, a, b, room);
             }
             if (r.coin(10) && (s.*get(QueueOf{})).front()) (s.*get(QueueOf{})).cancel((s.*get(QueueOf{})).front()->id);
-            (s.*get(ProgressOf{})).resident.store(unsigned(r.U(0, 8)));
-            (s.*get(ProgressOf{})).retiring.store(unsigned(r.U(0, 8)));
+            const unsigned resident = unsigned(r.U(0, 8));
+            const unsigned retiring = unsigned(r.U(0, 8));
+            g6svc_control_publish((s.*get(ControlOf{})).get(), 0, 0, 0, resident, retiring);
             auto big = [&] { return r.coin(80) ? r.U(0, 5000) : r.raw(); };
             if (r.coin(50)) {
                 g6kv_totals t{};

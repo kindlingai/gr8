@@ -126,7 +126,7 @@ static Env* env_make() {
     float* dd=v->mem.alloc<float>(HID); put(dd,direction());
     m.steering_dir={dd}; m.steering_alpha={3.f};          // ablit-behavior-v1 embeds alpha 3.0
     m.steering_scope=steering::Scope::Shared;
-    m.steering_scale=v->mem.alloc<float>(MX); m.steering_slot=v->mem.alloc<int>(MX); m.steering_part=v->mem.alloc<float>(size_t(MX)*48); m.steering_count=v->mem.alloc<unsigned>(MX);
+    m.steering_scale=v->mem.alloc<float>(MX); m.steering_slot=v->mem.alloc<int>(MX); m.steering_part=v->mem.alloc<float>(size_t(MX)*geom::HB); m.steering_count=v->mem.alloc<unsigned>(MX);
     v->base=fresh_layer(); v->s2=fresh_layer(); v->old=fresh_layer();
     base_bind(m,0,*v->base); s2_bind(m,0,*v->base,*v->s2);
     v->in=v->mem.alloc<uint32_t>(sizeof(StepIn)/4+1); v->stepp=v->mem.alloc<u64>(1);
