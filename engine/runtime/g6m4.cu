@@ -102,6 +102,7 @@
 #include <algorithm>
 #include <chrono>
 #include "engine_options.h"
+#include "fabric_dump.h"
 #include "../knobs-rs/gr8_knobs.h"
 #include "packfind.h"
 #include "weight_check.cuh"
@@ -261,10 +262,18 @@ int main(int argc, char** argv)
     }
     // --check-args: every check a boot makes before CUDA passed; stop before any CUDA, fabric or weight work
     if (eo.check_args) { fprintf(stderr, "g6m4: --check-args: the arguments pass the parse-time checks (no CUDA, no weights)\n"); return 0; }
-    if (!grammar_dir.empty() && R == 0)
+    // GR8_FABRIC_DUMP=1: each fabric's config on stdout where it would be created; no file, CUDA, fabric or network work
+    const bool fabric_dump = knob::fabric_dump();
+    if (!fabric_dump && !grammar_dir.empty() && R == 0)
         if (FILE* f = fopen((s2dir + "/grammar.s2").c_str(), "w")) { fputs("json json_schema\n", f); fclose(f); }
 
-    G6RT_CK(cudaSetDeviceFlags(cudaDeviceMapHost));
+    auto fab_up = [&](g6::Fabric& fb, const g6::FabricConfig& c, const char* name) {
+        if (fabric_dump) { printf("%s\n", describe_fabric(name, c).c_str()); return false; }
+        fb.init(c);
+        fb.start_proxy();
+        return true;
+    };
+    if (!fabric_dump) G6RT_CK(cudaSetDeviceFlags(cudaDeviceMapHost));
     cfg.slot_bytes = NX ? (size_t)MX * 6144 * 2 : (size_t)MX * HID * 2;   // Engram: [rows][6144] BF16 slots (ds41_engram_ops.cuh)
     const size_t dec_slot_bytes = cfg.slot_bytes;   // the decode slot: every decode collective (layer, head, Engram) of MX rows fits it
     g6::FabricConfig cm;                            // the main fabric's own runs (DS41 serve), set below; run1 = 0 = uniform
@@ -385,11 +394,10 @@ int main(int argc, char** argv)
         if (rs_k) { mc.run3 = cm.run3; mc.slot_bytes3 = cm.slot_bytes3; mc.ncoll = ds41::rs::main_ncoll(NC, rs_k, rowshard); }   // the RS AG collectives plus the row-shard state collective
 #endif
         mc.sge2 = pf_direct;                                                                     // GR8_DS_PF_DIRECT: flat RS slices = 2 SGEs
-        fab.init(mc);
+        fab_up(fab, mc, "fab");
     }
     cfg.xtrace = 0;
     const g6::FabricDev f = fab.dev();
-    fab.start_proxy();
 #if G6_MODEL_DS41
     // GR8_DS_PF_LANES=2: lane B's own fabric (own QPs, proxy thread and sequence), as Flash's fabp2: port + 96, proxy core N-2 (DS41 builds no
     // fabp / fabp2: --prefill is refused for DS41). Same rails, ring / mesh and stripe as the main fabric. Unset / 1: not built.
@@ -404,8 +412,7 @@ int main(int argc, char** argv)
         mc.port = cfg.port + 96;
         mc.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
         mc.xtrace = 0;
-        fabB.init(mc);
-        fabB.start_proxy();
+        if (fab_up(fabB, mc, "fabB"))
         fprintf(stderr, "# rank %d DS41 two-lane prefill: lane B fabric port %d proxy cpu %d, slot table without the C8-pack late slots (run1 %d)\n",
                 cfg.rank, mc.port, mc.proxy_cpu, mc.run1);
     }
@@ -451,8 +458,7 @@ int main(int argc, char** argv)
         pf_stripe_cfg(cp, pf_ips2);
         cp.proxy_cpu = cfg.proxy_cpu > 0 ? cfg.proxy_cpu - 1 : -1;
         cp.xtrace = xtrace_pf ? 1 : 0;
-        fabp.init(cp);
-        fabp.start_proxy();
+        fab_up(fabp, cp, "fabp");
     }
     if (lanes != 1 && lanes != 2) die("--pf-lanes must be 1 or 2");
     const bool two = MP && lanes == 2;
@@ -469,8 +475,7 @@ int main(int argc, char** argv)
         pf_stripe_cfg(cp, pf_ips2);
         cp.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
         cp.xtrace = xtrace_pf ? 1 : 0;
-        fabp2.init(cp);
-        fabp2.start_proxy();
+        fab_up(fabp2, cp, "fabp2");
     }
 #if G6_MODEL_FLASH
     // Independent pool-ID exchange: default on for TP2 Flash prefill (GR8_GLM53F_PF_POOL_OWNER unset = auto, 0 = off,
@@ -485,16 +490,16 @@ int main(int argc, char** argv)
     const bool pool_owner = pool_mode == 1 || (pool_mode == 2 && pool_fits && !pool_conflict);
     if (pool_owner)
     {
-        auto init_ids = [&](g6::Fabric& ids, int port, int cpu_offset) {
+        auto init_ids = [&](g6::Fabric& ids, int port, int cpu_offset, const char* name) {
             g6::FabricConfig cp = cfg;
             cp.ncoll = 1; cp.slot_bytes = flash_pool_owner::payload(MP);
             cp.port = cfg.port + port;
             cp.proxy_cpu = cfg.proxy_cpu > cpu_offset ? cfg.proxy_cpu - cpu_offset : -1;
             pf_stripe_cfg(cp, pf_ips2);
-            ids.init(cp); ids.start_proxy();
+            fab_up(ids, cp, name);
         };
-        init_ids(fabix, 64, 9);
-        if (two) init_ids(fabix2, 72, 10);
+        init_ids(fabix, 64, 9, "fabix");
+        if (two) init_ids(fabix2, 72, 10, "fabix2");
     }
     // GR8_PF_ROUTER_SPLIT=1 (opt-in): one ncoll = 1 route-table fabric per prefill lane, at any rank count and on a
     // switched mesh or the switchless ring (the fabric relays the diagonal, as it does for the prefill fabric).
@@ -505,16 +510,17 @@ int main(int argc, char** argv)
     {
         if (!(MP && g6nr::NR >= 2 && g6nr::NR <= flash_route_split::MAX_NR && cfg.ips.size() == (size_t)g6nr::NR))
             die("GR8_PF_ROUTER_SPLIT=1 needs Flash prefill (--prefill) on 2 to 8 ranks");
-        auto init_rs = [&](g6::Fabric& rs, int port, int cpu_offset) {
+        auto init_rs = [&](g6::Fabric& rs, int port, int cpu_offset, const char* name) {
             g6::FabricConfig cp = cfg;
             cp.ncoll = 1; cp.slot_bytes = flash_route_split::payload(MP, (int)cfg.ips.size());
             cp.port = cfg.port + port;
             cp.proxy_cpu = cfg.proxy_cpu > cpu_offset ? cfg.proxy_cpu - cpu_offset : -1;
             pf_stripe_cfg(cp, pf_ips2);
-            rs.init(cp); rs.start_proxy();
+            fab_up(rs, cp, name);
         };
-        init_rs(fabrs, 80, 11);
-        if (two) init_rs(fabrs2, 88, 12);
+        init_rs(fabrs, 80, 11, "fabrs");
+        if (two) init_rs(fabrs2, 88, 12, "fabrs2");
+        if (!fabric_dump)
         fprintf(stderr, "# rank %d: GR8_PF_ROUTER_SPLIT=1: prefill MoE router row-split, route tables over a dedicated fabric%s\n",
                 cfg.rank, two ? " per lane" : "");
     }
@@ -526,8 +532,7 @@ int main(int argc, char** argv)
         cd.ncoll = 3;
         cd.port = cfg.port + 16;
         cd.proxy_cpu = cfg.proxy_cpu > 5 ? cfg.proxy_cpu - 6 : -1;   // own core: fabp2 (prefill lane 2) has N-2
-        fabd.init(cd);
-        fabd.start_proxy();
+        fab_up(fabd, cd, "fabd");
     }
 #if G6_MODEL_DS41
     g6::Fabric fabds;                   // DSpark draft block: its own region of DRAFT_NCOLL collectives (6 layer exchanges + 5 markov merges)
@@ -543,8 +548,7 @@ int main(int argc, char** argv)
         cd.proxy_cpu = cfg.proxy_cpu > 5 ? cfg.proxy_cpu - 6 : -1;
         // GR8_XTRACE=1 with GR8_DS_XTRACE=1: stage-0 trace (xtrace.h) on this draft fabric too; default off
         cd.xtrace = knob::ds_xtrace() ? 1 : 0;
-        fabds.init(cd);
-        fabds.start_proxy();
+        fab_up(fabds, cd, "fabds");
     }
 #endif
     g6::Fabric fabf;                    // --dflash: the drafter's region, dfl::NC collectives, decode-sized slots
@@ -554,8 +558,7 @@ int main(int argc, char** argv)
         cd.ncoll = dfl::NC;
         cd.port = cfg.port + 40;
         cd.proxy_cpu = cfg.proxy_cpu > 6 ? cfg.proxy_cpu - 7 : -1;   // own core: not N-2 (fabp2) or N-6 (fabd)
-        fabf.init(cd);
-        fabf.start_proxy();
+        fab_up(fabf, cd, "fabf");
     }
 #if G6_NR == 4
     g6::Fabric fabq;                    // GR8_PF_QP_ROLL: ring of [lo | hi] pair half images, one-peer jobs (qp_wire.h)
@@ -568,12 +571,12 @@ int main(int argc, char** argv)
         qc.bulk_flags = qw::bulk_flags(qp_wire_e);
         qc.port = cfg.port + 56;
         qc.proxy_cpu = cfg.proxy_cpu > 4 ? cfg.proxy_cpu - 5 : -1;
-        fabq.init(qc);
-        fabq.start_proxy();
+        if (fab_up(fabq, qc, "fabq")) {
         qp_wire.bd = fabq.bulk_dev(); qp_wire.E = qp_wire_e; qp_wire.peer = qw::partner(cfg.rank);
         qp_wire.enqueue = [&fabq](g6::Fabric::BulkJob j) { fabq.enqueue_bulk(std::move(j)); };
         fprintf(stderr, "# rank %d: GR8_PF_QP_ROLL=%d wire fabric: %d entr%s x [lo | hi] %.2f MB = %.3f GB pinned + registered, partner rank %d\n",
                 cfg.rank, qp_roll_s, qp_wire_e, qp_wire_e == 1 ? "y" : "ies", qw::HALF / 1e6, qw::bulk_bytes(qp_wire_e) / 1e9, qp_wire.peer);
+        }
     }
     auto qp_err = [&]() -> unsigned { return qp_roll_s ? *fabq.bulk_dev().error : 0u; };
 #else
@@ -668,14 +671,18 @@ int main(int argc, char** argv)
     if (dfl_alpha != 1.f && !dfl) die("GR8_DFL_SEL_ALPHA needs --dflash-manifest");
     g6::Fabric fabg, fabdg;
     bool fabg_on = false, fabdg_on = false;
-    auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
+    auto qs_cfg = [&](int port_off) {
         g6::FabricConfig gc = cfg;
         gc.vcap.clear(); gc.vdst_k.clear();
-        gc.ncoll = mm.qs.ncoll();
-        gc.slot_bytes = qs_slot_bytes(mm);
         gc.port = cfg.port + port_off;
         // GR8_QA_SPLIT_CPU: its proxy's core (-1 = unpinned); A/B of the placement
         gc.proxy_cpu = (int)knob::qa_split_cpu().value_or(cfg.proxy_cpu > 8 ? cfg.proxy_cpu - 9 : -1);
+        return gc;
+    };
+    auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
+        g6::FabricConfig gc = qs_cfg(port_off);
+        gc.ncoll = mm.qs.ncoll();
+        gc.slot_bytes = qs_slot_bytes(mm);
         fb.init(gc);
         fb.start_proxy();
         fprintf(stderr, "# rank %d: %s gather fabric: %d collectives of up to %zu B, %.1f MB pinned, proxy CPU %d\n", cfg.rank, what,
@@ -745,18 +752,37 @@ int main(int argc, char** argv)
         cc.vdst_k = cp_colls.dst_k;
         cc.port = cfg.port + 32;
         cc.proxy_cpu = cfg.proxy_cpu > 2 ? cfg.proxy_cpu - 3 : -1;
-        fabc.init(cc);
-        fabc.start_proxy();
+        if (fab_up(fabc, cc, "fabc"))
         fprintf(stderr, "# rank %d: GR8_CP fabric %d collectives, mmax %d, %.3f GB pinned + registered\n", cfg.rank, cp_colls.ncoll(),
                 cp_mmax, (fabc.vlayout().send_bytes() + fabc.vlayout().recv_bytes()) / 1e9);
     }
     // enqueue the CP collectives of a step that runs the CP block (context > CpState::step_R), before its GPU work
     auto cp_enqueue = [&](unsigned long long step, int M, int context) { if (cp_on && context > cp_step_R) fabc.enqueue_step(step, cp_colls.sizes(M)); };
     auto cp_error = [&]() -> unsigned { return (cp_on ? *fabc.dev().error : 0u) | qs_err(); };   // + the GR8_QA_SPLIT proxy
+    // step 4d's staging fabric below, apart from its bulk bytes (the model sizes them)
+    auto cp_pf_cfg = [&]() {
+        g6::FabricConfig sc = cfg;
+        sc.vcap.clear(); sc.vdst_k.clear();
+        sc.bulk_flags = 4;
+        sc.port = cfg.port + 48;
+        sc.proxy_cpu = cfg.proxy_cpu > 3 ? cfg.proxy_cpu - 4 : -1;
+        return sc;
+    };
 #else
     auto cp_enqueue = [&](unsigned long long, int, int) {};
     auto cp_error = [&]() -> unsigned { return qs_err(); };   // the GR8_QA_SPLIT proxy
 #endif
+    if (fabric_dump)                    // and the fabrics the built model completes, in their order
+    {
+        if (qs_mode || iq_split) printf("%s\n", describe_fabric("fabg", qs_cfg(64)).c_str());
+#if defined(G6_CP) && G6_CP
+        if (cp_on && MP) printf("%s\n", describe_fabric("fabs", cp_pf_cfg()).c_str());
+#endif
+        if (mtp_split) printf("%s\n", describe_fabric("fabdg", qs_cfg(72)).c_str());
+        fprintf(stderr, "g6m4: GR8_FABRIC_DUMP: stopping before the first fabric\n");
+        return 4;                       // not a clean stop, should the knob be left set
+
+    }
     G6RT_CK(bind::init());
     G6RT_CK(l2pf::init_env());     // GR8_L2PF (kernels/l2pf.cuh); unset = off
     // GR8_MTP_L2PF=1|2|3 (kernels/l2pf.cuh; rank.cuh l2pf_window, l2pf_tail; default 0; needs GR8_L2PF and --mtp): 1 = the MTP
@@ -992,12 +1018,8 @@ int main(int argc, char** argv)
     const bool cp_pf = cp_on && MP;
     if (cp_pf)
     {
-        g6::FabricConfig sc = cfg;
-        sc.vcap.clear(); sc.vdst_k.clear();
+        g6::FabricConfig sc = cp_pf_cfg();
         sc.bulk_bytes = 2 * cp_pf_pool_bytes(m);
-        sc.bulk_flags = 4;
-        sc.port = cfg.port + 48;
-        sc.proxy_cpu = cfg.proxy_cpu > 3 ? cfg.proxy_cpu - 4 : -1;
         fabs.init(sc);
         fabs.start_proxy();
         cp_pf_net_init(m, fabs, st);
