@@ -89,9 +89,18 @@ pub struct AlignedBuf {
 }
 
 impl AlignedBuf {
+    /// Aborts through handle_alloc_error when the allocation fails.
     pub fn new(n: usize) -> AlignedBuf {
         let layout = std::alloc::Layout::from_size_align(n.div_ceil(4096) * 4096, 4096).unwrap();
-        AlignedBuf { p: unsafe { std::alloc::alloc(layout) }, layout }
+        AlignedBuf::try_new(n).unwrap_or_else(|| std::alloc::handle_alloc_error(layout))
+    }
+
+    /// None when the size has no layout or the allocation fails.
+    pub fn try_new(n: usize) -> Option<AlignedBuf> {
+        let layout = std::alloc::Layout::from_size_align(n.checked_next_multiple_of(4096)?.max(4096), 4096).ok()?;
+        let p = unsafe { std::alloc::alloc(layout) };
+        // not then_some: that builds the AlignedBuf first, and dropping it would free the null pointer
+        if p.is_null() { None } else { Some(AlignedBuf { p, layout }) }
     }
 
     pub fn slice(&mut self, n: usize) -> &mut [u8] {

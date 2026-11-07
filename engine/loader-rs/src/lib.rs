@@ -356,10 +356,21 @@ fn run_cfg(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant, cache: Opti
                 // a merged pread holds a chunk's ranges and the gaps between them: twice the chunk, plus one
                 // Item128 range that starts before the chunk
                 let scratch_len = (2 * chunk as usize + max_half).div_ceil(ALIGN as usize) * ALIGN as usize;
+                let scratch = match l.merge.map(|_| sys::AlignedBuf::try_new(scratch_len)) {
+                    Some(None) => {
+                        failed.store(true, Ordering::Relaxed);
+                        error.lock().unwrap().get_or_insert(format!(
+                            "worker {w}: no merge scratch buffer of {scratch_len} bytes (GR8_LOAD_MERGE_KB; a smaller \
+                             GR8_LOAD_CHUNK_MB or GR8_LOAD_THREADS needs less)"));
+                        (l.sink.free_staging)(l.sink.ctx, p as *mut c_void);
+                        return;
+                    }
+                    s => s.flatten(),
+                };
                 let mut bufs = Bufs {
                     half: sys::AlignedBuf::new(max_half.max(1)),
                     perm: sys::AlignedBuf::new(max_half.max(1)),
-                    scratch: l.merge.map(|_| sys::AlignedBuf::new(scratch_len)),
+                    scratch,
                     scratch_len,
                 };
                 while !failed.load(Ordering::Relaxed) {
@@ -662,6 +673,14 @@ mod tests {
     fn plan_of(files: &[String], segs: &[(u64, u64, Op, usize, u64)], bytes: u64) -> Plan {
         let s = segs.iter().map(|&(pack_off, nbytes, op, file, file_off)| Seg { pack_off, nbytes, op, file_off, file }).collect();
         Plan::from_segs(files.to_vec(), s, Vec::new(), Vec::new(), bytes).unwrap()
+    }
+
+    #[test]
+    fn aligned_buf_try_new_reports_a_failed_allocation() {
+        assert!(sys::AlignedBuf::try_new(isize::MAX as usize).is_none());
+        assert!(sys::AlignedBuf::try_new(usize::MAX).is_none());
+        let mut b = sys::AlignedBuf::try_new(5000).unwrap();
+        assert_eq!(b.slice(8192).len(), 8192);
     }
 
     #[test]
