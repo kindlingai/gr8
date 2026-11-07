@@ -17,6 +17,7 @@
 #include "ds41_prefill_fabric.h"
 #include "ds41_rs.h"
 #include "ds41_rowshard.h"
+#include "../scheduler-rs/g6plan.h"
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -25,13 +26,10 @@
 
 namespace ds41::lanes
 {
-// GR8_DS_PF_LANES: unset / "" / "1" -> 1, "2" -> 2, anything else -> 0 (the caller dies with kParseError)
-inline int parse(const char* v)
-{
-    if (!v || !*v || std::strcmp(v, "1") == 0) return 1;
-    return std::strcmp(v, "2") == 0 ? 2 : 0;
-}
-constexpr const char* kParseError = "GR8_DS_PF_LANES must be 1 (one lane, the default) or 2 (two-lane W prefill)";
+// GR8_DS_PF_LANES: unset / "" / "1" -> 1, "2" -> 2, anything else -> 0 (the caller dies with kParseError). The fabric
+// plan reads it too: engine/scheduler-rs src/plan_sizes.rs.
+inline int parse(const char* v) { return g6plan_ds41_lanes(v); }
+inline const char* const kParseError = g6plan_ds41_lanes_error();
 
 // The rows of one quantum: lane A = the first min(rows, W), lane B = the rest (0 = one lane). rows must be 1..2W.
 struct Split { uint32_t a = 0, b = 0; };

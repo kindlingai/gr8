@@ -268,6 +268,9 @@ for f in "" "-DDEC_S2 -DG6_NR=4" "-DDEC_S2 -DG6_NR=3" "-DG6_MODEL_FLASH=1 -DDEC_
   g++ -std=c++17 -O2 -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/fabric_plan_vectors_test.cpp" -o "$T/fabric_plan_vectors_test" "${KVLIB[@]}"
   "$T/fabric_plan_vectors_test"
 done
+# the sizing rules the kernels keep in C++ and the plan's Rust copies of them (scheduler-rs src/plan_sizes.rs)
+g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/plan_twins_test.cpp" -o "$T/plan_twins_test" "${KVLIB[@]}"
+"$T/plan_twins_test"
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/control_wire_test.cpp" -o "$T/control_wire_test" "${KNOBS[@]}"
 "$T/control_wire_test" 2> >(grep -v '^g6ctl: control recv failed: ret=0 ' >&2)
 # DS41 ranks that disagree on an agree-scope knob refuse at bootstrap (knob::signature() in the DS41 runtime signature):
@@ -388,10 +391,10 @@ g++ -std=c++17 -O2 -Wall -ffp-contract=off "$REPO/engine/kernels/tests/ds_multit
 g++ -std=c++17 -O2 -Wall "$REPO/engine/kernels/tests/ds_ro_host_test.cpp" -o "$T/ds_ro_host_test"
 "$T/ds_ro_host_test"
 # DS41 W4096: RO_MAX 4096 is the largest prefill width, and the RoScratch tile capacity holds the 4096-row plan
-g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" -I "$REPO/engine/kernels" "$REPO/engine/tests/test_ds41_w4096.cpp" -o "$T/test_ds41_w4096"
+g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" -I "$REPO/engine/kernels" "$REPO/engine/tests/test_ds41_w4096.cpp" -o "$T/test_ds41_w4096" "${KVLIB[@]}"
 "$T/test_ds41_w4096"
 # the bounded-replay split (runtime/ds41_pf_split.h), off and with GR8_DS_PF_L20_TAIL=1 (layer 20 in range B, its ca row hoisted)
-g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/test_ds41_pf_split.cpp" -o "$T/test_ds41_pf_split"
+g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/test_ds41_pf_split.cpp" -o "$T/test_ds41_pf_split" "${KVLIB[@]}"
 "$T/test_ds41_pf_split" > "$T/pf_split.log" || { cat "$T/pf_split.log"; exit 1; }
 tail -1 "$T/pf_split.log"
 # the two-lane W prefill contract (runtime/ds41_lanes.h): schedules, fabric tables, scheduler; again with GR8_DS_PF_L20_TAIL=1
