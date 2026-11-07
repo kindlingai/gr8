@@ -7,6 +7,7 @@
 #include <memory>
 #include <algorithm>
 #include "../ds41_v2_moe.cuh"
+#include "../ds41_v2_fc2.cuh"
 #define CK(x) do { cudaError_t e=(x); if(e!=cudaSuccess){fprintf(stderr,"%s:%d %s: %s\n",__FILE__,__LINE__,#x,cudaGetErrorString(e));exit(2);} } while(0)
 #define CHECK(x) do { if(!(x)){fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x);exit(1);} } while(0)
 template<class T> struct Dev {
@@ -90,6 +91,38 @@ void run(int M, int cut)
             float expect=__bfloat162float(__float2bfloat16(sum)),v=__bfloat162float(out[m*1280+n]);CHECK(std::isfinite(v)&&fabs(v-expect)<=0.008*(1+fabs(expect)));
         }
     }
+    // Resident-weight variant, heavy-first ordering. Check against stock before
+    // any timing claim. All four column launches reuse the same bucket data.
+    Dev<int> order(NE);
+    ds41v2moe::k_order_desc<NE,TK,MM><<<1,NE>>>(p.p,order.p);
+    const auto ho=order.get();
+    for(int j=1;j<got.n_slots;++j)CHECK(got.slot_nt[ho[j-1]]>=got.slot_nt[ho[j]]);
+    constexpr size_t RS=ds41v2moe::resident_smem<4,8,I>();
+    auto kr=ds41v2moe::k_fc2_resident<I,H>;
+    CK(cudaFuncSetAttribute(kr,cudaFuncAttributeMaxDynamicSharedMemorySize,RS));
+    grouped.put(init.data());
+    for(int c=0;c<4;++c){args.col_group=c;kr<<<args.n_slots*10,128,RS>>>(args,order.p);CK(cudaGetLastError());}
+    auto resident=grouped.get();double rmax=0;
+    for(int t=0;t<got.n_tiles;++t)for(int r=0;r<8;++r)if(got.tile_mask[t]>>r&1)for(int n=0;n<H;++n){size_t j=(t*8+r)*H+n;
+        double d=fabs(__half2float(resident[j])-__half2float(f[j]));rmax=std::max(rmax,d);CHECK(std::isfinite(d)&&d<=.002*(1+fabs(__half2float(f[j]))));}
+    printf("PASS resident M=%d cut=%d max_abs=%g\n",M,cut,rmax);
     printf("PASS M=%d cut=%d slots=%d tiles=%d grouped_max_abs=%g plan/export/padding/relayout/combine\n",M,cut,got.n_slots,got.n_tiles,maxdiff);
 }
-int main(){for(int m:{1,5,33,71,97}){run(m,6);run(m,3);}puts("DS41_V2_MOE_PASS");}
+void large_plan() {
+    constexpr int LM=8192;using LP=dsr::PlanMT<TK,LM>;
+    Dev<LP> p(1);Dev<int> idx(LM*TK),off(NE);Dev<float> wt(LM*TK);Dev<unsigned> masks(NE*(LM/32));
+    std::vector<int> hi(idx.n);std::vector<float> hw(wt.n,0.25f);
+    for(size_t i=0;i<hi.size();++i)hi[i]=i%TK;
+    idx.put(hi.data());wt.put(hw.data());auto h=std::make_unique<LP>();
+    for(int M:{4095,4096,8191,8192}) {
+        CK(cudaMemset(masks.p,0,masks.n*sizeof(unsigned)));
+        ds41v2moe::k_import_routes<NE,TK,LM><<<(M*8+255)/256,256>>>(idx.p,wt.p,M,p.p,masks.p);
+        dsr::k_scan_ro<NE,TK,LM><<<1,NE>>>(p.p,masks.p,off.p);
+        ds41v2moe::k_place_routes<TK,LM><<<(M*TK+255)/256,256>>>(p.p,masks.p,off.p,M);
+        CK(cudaMemcpy(h.get(),p.p,sizeof(LP),cudaMemcpyDeviceToHost));
+        const int nt=(M+7)/8;CHECK(h->n_slots==TK&&h->n_tiles==TK*nt);
+        for(int m=0;m<M;++m)for(int k=0;k<TK;++k)CHECK(h->tok_slot[m][k]==k*nt+m/8&&h->tok_col[m][k]==m%8);
+        printf("PASS plan capacity M=%d tiles=%d\n",M,h->n_tiles);
+    }
+}
+int main(){for(int m:{1,5,33,71,97}){run(m,6);run(m,3);}large_plan();puts("DS41_V2_MOE_PASS");}
