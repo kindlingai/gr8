@@ -234,9 +234,11 @@ static void check_interleave(uint32_t mtp, uint32_t dpr, uint32_t rounds, long& 
     uint32_t sum = 0;
     for (uint32_t x : rows) { CHECK(x <= cap); sum += x; }
     CHECK(sum == NB - 1 && rows.back() == (NB - 1) % cap);
-    // D D D P ... : decode_rounds rounds before each quantum of the prefill, and before the tail
+    // D D D P ... : decode_rounds rounds before each quantum of the prefill and before the tail. With decode_rounds > 1
+    // the first quantum and the tail go at once
     const std::string seq = kinds(r.q, from);
-    CHECK(seq == repeat(repeat("D", D) + "P", nP) + repeat("D", D) + "T");
+    if (rounds > 1) CHECK(seq == "P" + repeat(repeat("D", D) + "P", nP - 1) + "T");
+    else CHECK(seq == repeat(repeat("D", D) + "P", nP) + repeat("D", D) + "T");
     for (size_t i = from; i < r.q.size(); ++i) if (r.q[i].kind == Kind::Decode) CHECK(r.q[i].count == 1);   // only A decodes
     drain(r);
     CHECK(r.out[A.id] == solo(A, int(mtp), int(A.prompt.size()) - 1));

@@ -775,7 +775,10 @@ pub fn plan(c: &Config, s: &[Slot], want_decode: bool, stalled: &[bool]) -> Quan
             return q;
         }
     }
-    if q.count != 0 && (want_decode || pf.is_none()) {
+    // With decode_rounds > 1 the rounds hold back a long prompt's middle quanta, not a session's first quantum or its
+    // one-row tail: a burst of new chats is admitted at once instead of one per K rounds
+    let fresh = c.decode_rounds > 1 && pf.is_some_and(|p| p.prefilled == 0 || prefill_left(p) == 0);
+    if q.count != 0 && ((want_decode && !fresh) || pf.is_none()) {
         q.kind = K_DECODE;
     } else if let Some(p) = pf {
         if c.c8_pack && p.packable && p.prefilled == 0 && prefill_left(p) >= 1 && prefill_left(p) <= 64 {
