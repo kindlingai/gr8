@@ -2,6 +2,7 @@
 // Caller gates this path with GR8_DS_PF_V2; stock operators/scratch are untouched.
 #pragma once
 #include "ds41_v2.h"
+#include "ds41_v2_timing.cuh"
 #include "../kernels/ds41_v2_moe.cuh"
 #include "../kernels/ds41_v2_fc2.cuh"
 #include "../knobs-rs/gr8_knobs.h"
@@ -159,9 +160,15 @@ inline cudaError_t run(State& s,const Layer& w,Scratch& q,int kc=TK,const uint8_
     if(e!=cudaSuccess)return e;
     const Segment seg[]={{q.own_q,q.all_q,H},{q.own_s,q.all_s,H/32},{q.own_idx,q.all_idx,TK*sizeof(int)},{q.own_wt,q.all_wt,TK*sizeof(float)}};
     all_gather(s,Coll::FfnIn,seg,4,s.st);
-    if((e=up(s.g,w,q,s.st))!=cudaSuccess)return e;
+    {
+        TimingSpan timer(s,TimingStage::FfnUp,s.st);
+        if((e=up(s.g,w,q,s.st))!=cudaSuccess)return e;
+    }
     for(int c=0;c<COLUMN_GROUPS;++c) {
-        if((e=down_group(s.g,w,q,c,s.st))!=cudaSuccess)return e;
+        {
+            TimingSpan timer(s,TimingStage::FfnDown,s.st,c);
+            if((e=down_group(s.g,w,q,c,s.st))!=cudaSuccess)return e;
+        }
         fork(s,ffn_group(c));
         reduce_scatter(s,c,q.send[c],q.recv[c],COLS,s.cs);
         record_received(s,ffn_group(c));

@@ -1,6 +1,8 @@
 // Standalone CUDA implementation of the v2 fabric contract. Include globally.
 #pragma once
 #include "ds41_v2.h"
+#include "ds41_v2_timing.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -130,12 +132,14 @@ inline void init(State& s,g6::Fabric& f,cudaStream_t st) {
         check(cudaEventCreateWithFlags(&s.received[c],cudaEventDisableTiming));
     }
     s.live=true;
+    timing_init(s,knob::ds_pf_v2() && knob::ds_pf_v2_timing());
 }
 inline void release(State& s) {
     if(!s.live) return;
     check(cudaStreamSynchronize(s.st)); check(cudaStreamSynchronize(s.cs));
     require(s.fabric->wait_proxy_idle(),"v2 proxy did not drain");
     for(int c=0;c<int(Coll::Count);++c) { check(cudaEventDestroy(s.produced[c])); check(cudaEventDestroy(s.received[c])); }
+    timing_release(s);
     check(cudaStreamDestroy(s.cs)); s.live=false;
 }
 inline void begin_layer(State& s,Geometry g,bool engram,bool index,bool tail,bool candidates) {
@@ -148,9 +152,16 @@ inline void fork(State& s,Coll c) {
     check(cudaEventRecord(s.produced[int(c)],s.st)); check(cudaStreamWaitEvent(s.cs,s.produced[int(c)],0));
 }
 inline void record_received(State& s,Coll c) { check(cudaEventRecord(s.received[int(c)],s.cs)); }
-inline void join(State& s,Coll c) { check(cudaStreamWaitEvent(s.st,s.received[int(c)],0)); }
+inline void join(State& s,Coll c) {
+    // group names the joined Coll id (AttnOut=7, Engram=6, Ffn3=11).
+    TimingSpan timer(s,TimingStage::Join,s.st,int(c));
+    check(cudaStreamWaitEvent(s.st,s.received[int(c)],0));
+}
 inline void all_gather(State& s,Coll c,const Segment* segments,int count,cudaStream_t st) {
     auto p=detail::segments(s.g,segments,count); detail::enqueue(s,c,p.w,false);
+    const auto stage=c==Coll::AttnIn?TimingStage::AttnInAg:c==Coll::Index?TimingStage::IndexAg:
+        c==Coll::Candidates?TimingStage::CandidatesAg:c==Coll::FfnIn?TimingStage::FfnAg:TimingStage::TailAg;
+    TimingSpan timer(s,stage,st); // boot gathers have no active timing chunk
     detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,false);
     detail::publish<<<1,32,0,st>>>(s.wire,s.epoch,int(c));
     detail::wait<<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
@@ -159,6 +170,7 @@ inline void all_gather(State& s,Coll c,const Segment* segments,int count,cudaStr
 }
 inline void all_to_all(State& s,Coll c,const Segment* segments,int count,cudaStream_t st) {
     auto p=detail::segments(s.g,segments,count); detail::enqueue(s,c,p.w,true);
+    TimingSpan timer(s,c==Coll::AttnOut?TimingStage::AttnA2A:TimingStage::EngramA2A,st);
     detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
     detail::publish<<<1,32,0,st>>>(s.wire,s.epoch,int(c));
     detail::wait<<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
@@ -169,6 +181,7 @@ inline void reduce_scatter(State& s,int group,const __nv_bfloat16* all,__nv_bflo
     require(group>=0 && group<COLUMN_GROUPS && cols>0,"invalid reduce-scatter group");
     Segment seg{all,own,size_t(cols)*2}; auto p=detail::segments(s.g,&seg,1); const Coll c=ffn_group(group);
     detail::enqueue(s,c,p.w,true);
+    TimingSpan timer(s,TimingStage::Rs,st,group);
     detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
     detail::publish<<<1,32,0,st>>>(s.wire,s.epoch,int(c));
     detail::wait<<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
