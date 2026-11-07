@@ -665,7 +665,8 @@ to GLM and Flash at the new exit point) and through R6a's on a GB10: of 352 tran
 other 11 are the changes above: a steering refusal after the parse's lines, or the parse's refusal before main's (three
 GLM cases, one Flash, one DS41), and the six DS41 cases (an empty or unreadable prompt, a prompt past `--cap`, a QP
 flag) that DS41's old exit passed. `scripts/host_tests.sh` and `cargo test --release --workspace` pass. The GLM, Flash
-and DS41 engines build on a GB10. Boot pending.
+and DS41 engines build on a GB10. Boot: TP4 GLM, R5b2c then R6a, the round logs byte-identical on all four ranks, the 24 T=0
+replies matching and the head's log lines equal apart from memory, load speed and the epoch.
 
 ### R7. Step sizes
 
