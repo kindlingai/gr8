@@ -200,6 +200,18 @@ impl Kind for crate::driver::CPlanner {
 impl Kind for crate::driver::CPool {
     const K: u64 = 6;
 }
+impl Kind for crate::module::LpRow {
+    const K: u64 = 6;
+}
+impl Kind for crate::module::ModuleOps {
+    const K: u64 = 6;
+}
+impl Kind for crate::pool_ops::PoolHit {
+    const K: u64 = 6;
+}
+impl Kind for crate::pool_ops::PoolOps {
+    const K: u64 = 6;
+}
 impl Kind for crate::control::wire::Notice {
     const K: u64 = 6;
 }
@@ -264,7 +276,29 @@ fn_kinds!(
     crate::driver::AdmitPackFn,
     crate::driver::RoundFn,
     crate::driver::QFn,
-    crate::driver::QBoolFn
+    crate::driver::QBoolFn,
+    crate::module::BindRequestFn,
+    crate::module::SlotRunFn,
+    crate::module::RetainFn,
+    crate::module::ParkFn,
+    crate::module::BoolOutFn,
+    crate::module::ResizeFn,
+    crate::module::U32OutFn,
+    crate::module::BucketFn,
+    crate::module::ModeFn,
+    crate::module::LaunchFn,
+    crate::module::ModPrefillFn,
+    crate::module::PrefillSeqFn,
+    crate::module::PackSeqFn,
+    crate::module::LogprobFn,
+    crate::module::ModDflFn,
+    crate::pool_ops::MatchFn,
+    crate::pool_ops::TakeFn,
+    crate::pool_ops::U64OutFn,
+    crate::pool_ops::TiersFn,
+    crate::pool_ops::RefusalFn,
+    crate::pool_ops::RRowsFn,
+    crate::pool_ops::MakeRoomFn
 );
 
 /// The digest of every shared type's layout.
@@ -671,6 +705,60 @@ pub fn digest() -> u64 {
             finished,
             active,
             inserted
+        }
+    );
+    layout!(h, crate::module::LpRow { lp, rank, n, id, tlp });
+    layout!(
+        h,
+        crate::module::ModuleOps {
+            ctx,
+            bind,
+            bind_request,
+            grown,
+            shrink,
+            retire,
+            retain,
+            park,
+            fence,
+            before_work,
+            drained,
+            resize,
+            flash_room,
+            bucket,
+            mode,
+            launch,
+            prefill,
+            prefill_seq,
+            prefill_pack,
+            logprob,
+            draft_lp,
+            dfl_ok,
+            dfl_start,
+            dfl,
+            gm_on,
+            gm_bits,
+            gm_words,
+            pen_rows,
+            pen_sess
+        }
+    );
+    layout!(h, crate::pool_ops::PoolHit { skip, lcp, why, age, stored, tier, slot });
+    layout!(
+        h,
+        crate::pool_ops::PoolOps {
+            ctx,
+            r#match,
+            take,
+            digest,
+            tiers,
+            refusal,
+            r_rows,
+            make_room,
+            pool,
+            max_run_pages,
+            grow,
+            count,
+            status
         }
     );
     layout!(h, crate::control::wire::Notice { epoch, event, boundary, request, payload_hash, kind });

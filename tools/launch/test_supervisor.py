@@ -1007,5 +1007,30 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(self.run_health()[0], 0)
         self.assertFalse(os.path.exists(os.path.join(self.out, 'supervisor.lock')), 'health created the lock file')
 
+
+class QuitWait(unittest.TestCase):
+    """quit_wait: an ssd store with persist=on that keeps sessions gives the engine's quit 120 s (it stores the pool)."""
+
+    def wait(self, **env):
+        return S.quit_wait(opt.parse([], environ={'GR8_WORK_DIR': '/tmp/gr8-qw', **env}))
+
+    def test_only_a_persisted_ssd_store_that_keeps_sessions_waits_long(self):
+        self.assertEqual(self.wait(), 10)
+        self.assertEqual(self.wait(KV_STORE='ssd:/nvme/kv,size=64G'), 10)
+        self.assertEqual(self.wait(KV_STORE='ssd:/nvme/kv,size=64G,persist=on'), 10)   # keep system: prefixes only
+        self.assertEqual(self.wait(KV_STORE='ssd:/nvme/kv,size=64G,persist=on,keep=sessions'), 120)
+        self.assertEqual(self.wait(KV_STORE='ssd:/nvme/kv,size=64G,persist=on', KV_KEEP='all'), 120)
+        self.assertEqual(self.wait(KV_STORE='ssd:/nvme/kv,size=64G,persist=on,keep=system', KV_KEEP='all'), 10)
+        self.assertEqual(self.wait(KV_STORE='ssd:/nvme/kv,size=64G,keep=sessions'), 10)   # not kept across a boot
+
+    def test_down_takes_the_wait_the_supervisor_recorded(self):
+        import tempfile
+        o = opt.parse([], environ={'GR8_WORK_DIR': '/tmp/gr8-qw'})   # down's own parse sees no store
+        with tempfile.TemporaryDirectory() as out:
+            self.assertEqual(S.recorded_quit_wait(out, o), 10)
+            with open(os.path.join(out, 'quit_wait'), 'w') as f:
+                f.write('120\n')   # the store was given on the up command line only
+            self.assertEqual(S.recorded_quit_wait(out, o), 120)
+
 if __name__ == '__main__':
     unittest.main()

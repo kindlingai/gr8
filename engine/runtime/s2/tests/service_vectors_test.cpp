@@ -37,14 +37,12 @@ using namespace g6s2;
 namespace {
 // status.s2 is written by a private Service member: an explicit instantiation may name private members
 template <class Tag, typename Tag::type M> struct Rob { friend typename Tag::type get(Tag) { return M; } };
-struct NativeOf { using type = NativeHooks Service::*; friend type get(NativeOf); };
 struct QueueOf { using type = AdmissionQueue Service::*; friend type get(QueueOf); };
 struct ProgressOf { using type = Progress Service::*; friend type get(ProgressOf); };
-struct StatusOf { using type = void (Service::*)(); friend type get(StatusOf); };
-template struct Rob<NativeOf, &Service::native_>;
+struct StatusOf { using type = void (Service::*)(const PoolStatus&); friend type get(StatusOf); };
 template struct Rob<QueueOf, &Service::queue_>;
 template struct Rob<ProgressOf, &Service::progress_>;
-template struct Rob<StatusOf, &Service::publish_status>;
+template struct Rob<StatusOf, &Service::write_status>;
 struct Rng {
     std::mt19937_64 g;
     explicit Rng(uint64_t seed) : g(seed) {}
@@ -355,13 +353,7 @@ uint64_t trace_section(uint64_t seed, std::vector<std::string>* lines) {
     clear_dir(d); ::rmdir(d.c_str());
     return tx.h;
 }
-// status.s2 as the head's control thread writes it: a Service built and not run (ranks 1), its pool hooks seeded
-struct StatusIn {
-    uint32_t free = 0, room = 0;
-    std::optional<g6kv_totals> stats;
-    std::optional<std::vector<g6kv_tier_totals>> tiers;
-    std::optional<std::vector<PoolUse>> runs;
-};
+// status.s2 as the head's control thread writes it: a Service built and not run (ranks 1), given seeded pool values
 uint64_t status_section(uint64_t seed, std::vector<std::string>* lines) {
     Tx tx; tx.lines = lines;
     Rng r(seed);
@@ -375,13 +367,8 @@ uint64_t status_section(uint64_t seed, std::vector<std::string>* lines) {
         b.runtime_signature = "service_vectors_test";
         ControlLinks links;
         RunPool pool{pages, pages, c.pool_rows};
-        auto in = std::make_shared<StatusIn>();
         NativeHooks h;
         h.pool.pool = &pool;
-        h.pool.free_pages = [in] { return in->free; };
-        h.pool.room = [in] { return in->room; };
-        h.pool.reserve = [&pool](uint64_t n, uint64_t worst, uint32_t rr) { return pool.reserve(n, worst, rr); };
-        h.pool.fits = [](uint64_t, uint64_t, uint32_t) { return true; };
         h.bind = [](const Grant&) {};
         h.retire = [](const Slot&) {};
         h.fence = [] {};
@@ -392,8 +379,9 @@ uint64_t status_section(uint64_t seed, std::vector<std::string>* lines) {
         Service s(b, links, std::move(h), 1);
         uint64_t next_id = 1, revision = 0;
         for (int step = 0; step < 150; ++step) {
-            in->free = uint32_t(r.coin(95) ? r.U(0, pages) : r.U(0, pages + 3));
-            in->room = uint32_t(r.coin(95) ? r.U(0, in->free) : r.U(0, pages + 3));
+            PoolStatus in;
+            in.free = uint32_t(r.coin(95) ? r.U(0, pages) : r.U(0, pages + 3));
+            in.room = uint32_t(r.coin(95) ? r.U(0, in.free) : r.U(0, pages + 3));
             if (r.coin(30)) {
                 const uint64_t n = r.U(0, 3);
                 for (uint64_t i = 0; i < n; ++i) (s.*get(QueueOf{})).push(Request{next_id++, uint32_t(r.U(1, 300)), uint32_t(r.U(1, 300)), {}, 0});
@@ -411,9 +399,8 @@ uint64_t status_section(uint64_t seed, std::vector<std::string>* lines) {
                 g6kv_totals t{};
                 t.live_runs = uint32_t(r.U(0, 8)); t.held_pages = uint32_t(big()); t.worst_pages = uint32_t(big());
                 t.grows = big(); t.stalls = big();
-                in->stats = t;
-                (s.*get(NativeOf{})).pool.stats = [in] { return *in->stats; };
-            } else (s.*get(NativeOf{})).pool.stats = nullptr;
+                in.stats = t;
+            }
             if (r.coin(50)) {
                 std::vector<g6kv_tier_totals> ts(r.U(0, 3));
                 for (auto& t : ts) {
@@ -425,17 +412,15 @@ uint64_t status_section(uint64_t seed, std::vector<std::string>* lines) {
                     t.credit = int64_t(r.coin(80) ? r.U(0, 100) : r.raw());
                     t.oversize = big(); t.oversize_last = big();
                 }
-                in->tiers = ts;
-                (s.*get(NativeOf{})).pool.tiers = [in] { return *in->tiers; };
-            } else (s.*get(NativeOf{})).pool.tiers = nullptr;
+                in.tiers = ts;
+            }
             if (r.coin(50)) {
                 std::vector<PoolUse> us(r.U(0, 8));
                 for (auto& x : us) { x.table_version = uint32_t(r.U(0, 9)); x.held = uint32_t(big()); x.worst = uint32_t(big()); }
-                in->runs = us;
-                (s.*get(NativeOf{})).pool.runs = [in] { return *in->runs; };
-            } else (s.*get(NativeOf{})).pool.runs = nullptr;
+                in.runs = us;
+            }
             ::unlink((d + "/status.s2").c_str());
-            const std::string wrote = outcome([&] { (s.*get(StatusOf{}))(); return std::string(); });   // write before the read
+            const std::string wrote = outcome([&] { (s.*get(StatusOf{}))(in); return std::string(); });   // write before the read
             tx(wrote + " [" + slurp(d + "/status.s2") + "]");
         }
         ::unlink((d + "/status.s2").c_str()); ::unlink((d + "/status.s2.tmp").c_str());

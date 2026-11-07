@@ -2,6 +2,7 @@
 // CUDA layout/graphs/fabric; this layer never recreates Batch accept decisions.
 #pragma once
 #include "sessions.h"
+#include "module.h"
 #include "../prefix_reuse.h"
 #include "../penalty.h"
 #include "../ctx_index.h"
@@ -48,9 +49,9 @@ struct DispatchHooks {
     int* gm_on = nullptr; uint32_t* gm_bits = nullptr; int gm_words = 0;
     // optional, DS41 (ds41_prefill.h): in place of `prefill`, with the chunk's fabric step id: one id from the main sequence, the one
     // counter prefill and decode share on the fabric. The next MAIN step has sequence + 1.
-    // LAST: native.cuh builds this struct positionally, so a new member goes at the end.
+    // LAST: tests build this struct positionally, so a new member goes at the end.
     std::function<void(const Slot&, const Payload&, uint32_t, uint32_t, uint64_t)> prefill_seq;
-    // DS41 prefill pack: one main fabric sequence for a bounded ordered pack (append: native hooks use positional initialization).
+    // DS41 prefill pack: one main fabric sequence for a bounded ordered pack (append: tests use positional initialization).
     std::function<void(const std::vector<PrefillPart>&, uint64_t)> prefill_pack_seq;
     // optional, penalties (penalty.h, Dispatch::set_penalty): the host side of the row table (max_rows entries) and the
     // session table (MAX_SESSIONS entries) the main head reads
@@ -67,7 +68,11 @@ inline int grammar_row0(const s2::Step& sp, size_t j, int last) {
 // the graph key of a step of shape `shape` (s2::Step::key: kind and M) whose largest context bucket is `bucket`
 inline std::string launch_key(const std::string& shape, int bucket) { return shape + ":b" + std::to_string(bucket); }
 class Dispatch {
-    const Sessions& sessions_; DispatchHooks hooks_; uint32_t max_rows_;
+    const Sessions& sessions_;
+    DispatchHooks hooks_;                                    // the std::function hooks a caller gave, if any
+    std::unique_ptr<FnModule<DispatchHooks>> fn_;            // the table over them
+    Module m_;
+    uint32_t max_rows_;
     uint64_t main_sequence_ = 0, draft_sequence_ = 0;
     int solo_ = -1;
     bool mode_dirty_ = false;
@@ -81,10 +86,17 @@ class Dispatch {
     std::array<bool, MAX_SESSIONS> pen_reset_{};                              // per slot: the counts are an earlier request's
     std::array<g6rt::CtxIndex, MAX_SESSIONS> ctx_;                             // per slot: prompt + reply indexed (the sequence penalty's thinking scope)
 public:
-    Dispatch(const Sessions& sessions, uint32_t rows, DispatchHooks h) : sessions_(sessions), hooks_(std::move(h)), max_rows_(rows) {
-        require(rows && bool(hooks_.bucket) && bool(hooks_.mode) && bool(hooks_.launch) && (bool(hooks_.prefill) || bool(hooks_.prefill_seq)), "incomplete dispatch hooks");
-        if (hooks_.gm_on) set_grammar(hooks_.gm_on, hooks_.gm_bits, hooks_.gm_words);
-        if (hooks_.pen_rows) set_penalty(hooks_.pen_rows, hooks_.pen_sess);
+    Dispatch(const Sessions& sessions, uint32_t rows, DispatchHooks h)
+        : sessions_(sessions), hooks_(std::move(h)), fn_(new FnModule<DispatchHooks>(hooks_)), m_(fn_->ops()), max_rows_(rows) { init(); }
+    // the steps of a module's table (ModuleOps). The table's module outlives the Dispatch
+    Dispatch(const Sessions& sessions, uint32_t rows, const g6s2_module_ops& m) : sessions_(sessions), m_(m), max_rows_(rows) { init(); }
+    Dispatch(const Dispatch&) = delete;
+    Dispatch& operator=(const Dispatch&) = delete;
+    void init() {
+        const g6s2_module_ops& o = m_.o;
+        require(max_rows_ && o.bucket && o.mode && o.launch && (o.prefill || o.prefill_seq), "incomplete dispatch hooks");
+        if (o.gm_on) set_grammar(o.gm_on, o.gm_bits, o.gm_words);
+        if (o.pen_rows) set_penalty(static_cast<g6rt::PenRow*>(o.pen_rows), static_cast<g6rt::PenSess*>(o.pen_sess));
     }
     // Call at every safe boundary after local EOS/commit, not inside a Step.
     // Resident means Prefill OR Decode; a 1-session prompt step within S>=2 is
@@ -93,7 +105,7 @@ public:
         int q = -1; unsigned live = 0;
         for (const auto& s : scheduler.slots()) if (s.phase == Phase::Prefill || s.phase == Phase::Decode) { q = int(s.key.slot); ++live; }
         const int next = live == 1 ? q : -1;
-        if (next != solo_ || mode_dirty_) { hooks_.mode(solo_, next); solo_ = next; mode_dirty_ = false; }
+        if (next != solo_ || mode_dirty_) { m_.mode(solo_, next); solo_ = next; mode_dirty_ = false; }
     }
     void track_rows() { track_ = true; }
     // Grammars (grammar.h): before every step, on[r] = 1 where row r's sample follows its session's grammar, with the
@@ -130,7 +142,7 @@ public:
             const auto& s = sessions_.at(unsigned(q));
             require(sp.row0[j] == next_row && sp.rows[j] > 0 && sp.rows[j] <= sp.M() - next_row && sp.ctx[j] > 0 &&
                     uint64_t(sp.ctx[j]) <= uint64_t(s.run.pages) * PAGE, "step outside session run");
-            const int bucket = hooks_.bucket(draft, sp.ctx[j]);
+            const int bucket = m_.bucket(draft, sp.ctx[j]);
             require(bucket >= 0, "native bucket outside the captured ones");
             require(!draft || have_main_[q], "draft before session target step");
             l.buckets.push_back(bucket); l.source_rows.push_back(source_[q]);
@@ -155,7 +167,7 @@ public:
         if (pen_rows_) penalty_rows(sp, draft);
         auto& seq = draft ? draft_sequence_ : main_sequence_;
         require(seq != UINT64_MAX, "fabric sequence exhausted"); l.sequence = ++seq;
-        auto ids = hooks_.launch(l); require(ids.size() == sp.r.size(), "native output row mismatch");
+        auto ids = m_.launch(l); require(ids.size() == sp.r.size(), "native output row mismatch");
         if (!draft) for (size_t j = 0; j < sp.sess.size(); ++j) {
             source_[sp.sess[j]] = sp.row0[j]; have_main_[sp.sess[j]] = true;
         }
@@ -245,23 +257,23 @@ public:
             }
         }
     }
-    bool dfl_ok(unsigned slot) const { return hooks_.dfl_ok && hooks_.dfl_ok(int(slot)); }
-    int dfl_start(unsigned slot) { require(int(slot) == solo_, "DFlash2 outside the solo path"); return hooks_.dfl_start(int(slot)); }
+    bool dfl_ok(unsigned slot) const { return m_.o.dfl_ok && m_.dfl_ok(int(slot)); }
+    int dfl_start(unsigned slot) { require(int(slot) == solo_, "DFlash2 outside the solo path"); return m_.dfl_start(int(slot)); }
     s2::DflDrafts dfl(const s2::DflReq& r) {
         require(r.sess == solo_ && have_main_[r.sess], "DFlash2 step outside the solo path or before a target step");
-        return hooks_.dfl(r, sessions_.at(unsigned(r.sess)).sampling);
+        return m_.dfl(r, sessions_.at(unsigned(r.sess)).sampling);
     }
     void prefill(const Slot& s, const Payload& p, uint32_t first, uint32_t rows) {
         require(rows && first <= p.prompt.size() && uint64_t(first) + rows < p.prompt.size() &&
                 uint64_t(first) + rows <= uint64_t(s.run.pages) * PAGE, "invalid prefill quantum");
-        if (hooks_.prefill_seq) {
+        if (m_.o.prefill_seq) {
             require(main_sequence_ != UINT64_MAX, "fabric sequence exhausted");
-            hooks_.prefill_seq(s, p, first, rows, ++main_sequence_);
-        } else hooks_.prefill(s, p, first, rows);
+            m_.prefill_seq(s, p, first, rows, ++main_sequence_);
+        } else m_.prefill(s, p, first, rows);
         if (track_) rows_[s.key.slot].prefill_rows(int(first), int(rows), true);
     }
     void prefill_pack(const std::vector<PrefillPart>& parts) {
-        require(parts.size() >= 2 && parts.size() <= MAX_SESSIONS && bool(hooks_.prefill_pack_seq), "invalid/unwired prefill pack");
+        require(parts.size() >= 2 && parts.size() <= MAX_SESSIONS && m_.o.prefill_pack, "invalid/unwired prefill pack");
         require(main_sequence_ != UINT64_MAX, "fabric sequence exhausted");
         uint32_t total = 0;
         uint64_t last_id = 0;
@@ -279,7 +291,7 @@ public:
             total += p.rows;
         }
         require(total <= 512, "prefill pack exceeds 512 rows");
-        hooks_.prefill_pack_seq(parts, ++main_sequence_);
+        m_.prefill_pack(parts, ++main_sequence_);
         if (track_) for (const auto& p : parts) rows_[p.slot->key.slot].prefill_rows(int(p.first), int(p.rows), true);
     }
 };

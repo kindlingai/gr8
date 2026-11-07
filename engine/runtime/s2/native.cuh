@@ -465,24 +465,22 @@ public:
             fprintf(stderr,"# s2 boot capture: GR8_CP_STEP_ROWS=%d: %zu main keys wider than that at the buckets past R not captured\n",
                 cp_rows,cp_skipped);
     }
-    DispatchHooks hooks() {
-        DispatchHooks h{
-            [&](bool draft,int ctx){return g6rt::bucket_of(draft?c_.draft.d:c_.main,ctx);},
-            [&](int old,int next){mode(old,next);},
-            [&](const Launch& l){return launch(l);},
-            [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows){prefill(s,p,first,rows);},
-            [&](int row,bool target,int k){
-                require(row >= 0 && row < lp_rows_, "logprob row outside the last main step");
-                return g6rt::lp_row(lp_,row,target,k);
-            }
-        };
-        h.gm_on = c_.main.gm_on_host; h.gm_bits = c_.main.gm_bits_host; h.gm_words = c_.main.gm_words;
-        h.pen_rows = c_.main.pen_rows_host; h.pen_sess = c_.main.pen_sess_host;
-        h.draft_lp = [&](int row) {
-            require(row >= 0 && row < dlp_rows_, "draft logprob row outside the last draft step");
-            return dlp_[row];
-        };
-        return h;
+    // the step calls of the module's table (g6m4.cu)
+    int on_bucket(bool draft,int ctx){return g6rt::bucket_of(draft?c_.draft.d:c_.main,ctx);}
+    void on_mode(int old,int next){mode(old,next);}
+    std::vector<int> on_launch(const Launch& l){return launch(l);}
+    void on_prefill(const Slot& s,const Payload& p,uint32_t first,uint32_t rows){prefill(s,p,first,rows);}
+    g6rt::LpRow on_logprob(int row,bool target,int k){
+        require(row >= 0 && row < lp_rows_, "logprob row outside the last main step");
+        return g6rt::lp_row(lp_,row,target,k);
+    }
+    float on_draft_lp(int row) {
+        require(row >= 0 && row < dlp_rows_, "draft logprob row outside the last draft step");
+        return dlp_[row];
+    }
+    void grammar(g6s2_module_ops& o) const {
+        o.gm_on = c_.main.gm_on_host; o.gm_bits = c_.main.gm_bits_host; o.gm_words = c_.main.gm_words;
+        o.pen_rows = c_.main.pen_rows_host; o.pen_sess = c_.main.pen_sess_host;
     }
     void synchronize() { fence(); }
 };
