@@ -2845,6 +2845,7 @@ int main(int argc, char** argv)
         // one model). A store's keep=, else --kv-keep, sets its keep rule and policy (kvman-rs stash.rs Keep, Policy)
         std::unique_ptr<g6s2::KvTiers> kvt;
         bool kv_index = false;
+        bool kv_whole = false;   // a persist=on ssd store that keeps sessions: the quit stores the pool's runs there
         if (!kv_tiers.empty())
         {
             std::vector<const G6AttnBinding*> bs;
@@ -2896,7 +2897,11 @@ int main(int argc, char** argv)
 #endif
                         ;
                     const std::string& keep = t.rule.empty() ? kv_keep : t.rule;
-                    pool.add_tier(slots, keep == "system" ? 1 : 2, index, compat);   // shared prefixes, or those and evicted runs
+                    // persist=on ssd with keep=sessions or all: the index records every entry (+ 4), not only prefixes, so
+                    // the runs the quit stores (below, after service.run) come back at the next boot with their sessions
+                    const bool whole = t.ssd() && !index.empty() && keep != "system";
+                    kv_whole = kv_whole || whole;
+                    pool.add_tier(slots, (keep == "system" ? 1 : 2) | (whole ? 4 : 0), index, compat);   // shared prefixes, or those and evicted runs
                     pool.policy((uint32_t)i, 0, keep == "sessions" ? 1 : 0, kvt->blocks().slot_bytes());
                     kv_index = kv_index || !index.empty();
                     fprintf(stderr, "# rank %d: s2 store %zu: %s, %llu blocks of %zu B, keep %s%s\n", R, i, kvt->describe(i).c_str(),
@@ -3661,6 +3666,29 @@ int main(int argc, char** argv)
             catch (...) { links.shutdown(); throw; }
             g6s2::Service service(bc, links, std::move(h), plan.chunk);
             service.run();               // returns on DIR/quit
+            // a persist=on ssd store that keeps sessions: an orderly quit (an idle engine) stores the runs the pool still
+            // holds, the same calls on every rank, so the next boot finds the open sessions and their prefixes. Taking the
+            // whole pool evicts every retained run through the stores; the write limit is for serving, not this once-only
+            // drain. A SIGKILL or a crash skips it: the index then holds only what was stored while serving
+            if (kv_whole)
+            {
+                try
+                {
+                    const long long t0 = g6s2::s2_wall_ms();
+                    pool.write_limit(0);
+                    const auto all = pool.reserve((uint64_t)cap, (uint64_t)cap);
+                    kv_drain();
+                    pool.release(all);
+                    kv_drain();
+                    size_t n = 0;
+                    uint64_t pages = 0;
+                    uint64_t refused = 0;
+                    for (const auto& t : pool.tiers()) { n += t.entries; pages += t.spilled_pages; refused += t.refused; }
+                    fprintf(stderr, "# rank %d: s2 stores: quit stored the pool's runs, %zu entries kept for the next engine (%llu pages spilled in all, %llu refused, %lld ms)\n",
+                            R, n, (unsigned long long)pages, (unsigned long long)refused, g6s2::s2_wall_ms() - t0);
+                }
+                catch (const std::exception& e) { fprintf(stderr, "# rank %d: s2 stores: drain at quit failed: %s\n", R, e.what()); }
+            }
             links.shutdown();
         }
         catch (const std::exception& e)

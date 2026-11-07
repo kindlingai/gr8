@@ -167,14 +167,15 @@ def cmd_down(argv):
     pid = supervisor_running(out)
     if pid and pid > 0:
         os.kill(pid, signal.SIGTERM)
-        for _ in range(300):
+        # the supervisor gives its engine quit_wait for an orderly quit (120 s when the quit stores the pool)
+        for _ in range(300 + 10 * sv.quit_wait(o)):
             if not supervisor_running(out):
                 break
             time.sleep(0.1)
         else:
             print(f'the supervisor (pid {pid}) did not stop; killing it')
             os.kill(pid, signal.SIGKILL)
-    stopped = sv.stop_local(home, lambda s: print(s))
+    stopped = sv.stop_local(home, lambda s: print(s), sv.quit_wait(o))
     print(f'this box: {"stopped" if pid or stopped else "nothing was running"}')
     return 0
 
