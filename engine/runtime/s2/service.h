@@ -581,7 +581,8 @@ public:
                                          native_.flash_room || native_.pool.retain || native_.pool.park || native_.dispatch.launch ||
                                          native_.dispatch.bucket || native_.dispatch.mode || native_.dispatch.prefill ||
                                          native_.dispatch.logprob || native_.dispatch.dfl_ok || native_.dispatch.dfl_start ||
-                                         native_.dispatch.dfl || native_.dispatch.draft_lp),
+                                         native_.dispatch.dfl || native_.dispatch.draft_lp || native_.dispatch.prefill_seq ||
+                                         native_.dispatch.prefill_pack_seq || native_.dispatch.gm_on || native_.dispatch.pen_rows),
                 "a module table and module hooks together");
         const g6s2_module_ops& m = mod_.o;
         require(bool(native_.pool.free_pages) && bool(native_.pool.room) && bool(native_.pool.reserve) && bool(native_.pool.fits) &&
