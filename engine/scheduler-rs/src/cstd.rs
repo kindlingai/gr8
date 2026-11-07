@@ -71,6 +71,17 @@ pub fn c_strtol10(s: &[u8]) -> (i64, bool) {
     (v as i64, unsafe { *end } == 0)
 }
 
+/// strtol base 10: the value, the bytes it read and whether that was the whole string
+pub fn c_strtol10_end(s: &[u8]) -> (i64, usize, bool) {
+    let c = cs(s);
+    let mut end: *mut c_char = std::ptr::null_mut();
+    // SAFETY: as c_strtol10
+    let v = unsafe { strtol(c.as_ptr(), &mut end, 10) };
+    // SAFETY: end points into c, at its NUL at the latest
+    let used = unsafe { end.offset_from(c.as_ptr()) } as usize;
+    (v as i64, used, unsafe { *end } == 0)
+}
+
 /// The integers of a file, comma or white space separated, read as rank_host.h parse_ints reads them (fscanf
 /// "%d%*[, \n\t]"). None when the file cannot be opened.
 pub fn read_ints(path: &[u8]) -> Option<Vec<i32>> {
