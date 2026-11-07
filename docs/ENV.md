@@ -346,6 +346,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_DS_ENGRAM_WAYS` | int | `16` | 1..16 | Ways of the set-associative Engram row cache. |
 | `GR8_DS_FEED_DIR` | path | off |  | Debug: a directory of reference activations the step driver feeds in place of its own, layer by layer. |
 | `GR8_DS_MOE_ELOG` | flag | `1` |  | 1: every prefill router call (more than 32 rows) writes the distinct experts of each layer to a device ring that the host reads after the chunk. 0: no record is written. |
+| `GR8_DS_PF_V2_TIMING` | flag | `0` | 0\|1 | With GR8_DS_PF_V2=1, record per-layer compute/communication CUDA-event pairs into a bounded ring and print once per request after its final v2 chunk. Reports intervals relative to each chunk's start to expose stream overlap. Never synchronizes the GPU; not-ready or overflow samples are labelled. Default 0 allocates no timing events and leaves the stock path unchanged. |
 | `GR8_DS_SPAN` | int | `0` | 0..2 | Prints the GPU time of each plan unit (attention, consume, MoE, head, ...) summed over the layers: every eager step, and for a captured step graph the mean per step over 16 sampled replays (every 16th replay is read, through globaltimer stamps the capture adds around each unit). 2: also one line per unit kind with the time of each layer. |
 | `GR8_DS_SUBDUMP` | path | off |  | Debug: a directory where each step's sub-layer partials are written. |
 | `GR8_DS_XTRACE` | flag | `0` | 0\|1 | With GR8_XTRACE=1 and DSpark, also trace the DSpark draft fabric. |

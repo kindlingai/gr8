@@ -149,6 +149,17 @@ knobs:
       Experimental sequence-parallel prefill conductor for layers 0..20. Own-row residual state,
       a dedicated fabric and high-priority communication stream; late layers remain on the stock path.
       Needs TP4, one prefill lane and a 128-row late tail. Off leaves the stock path unchanged.
+  GR8_DS_PF_V2_TIMING:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_PF_V2=1, record per-layer compute/communication CUDA-event pairs
+      into a bounded ring and print once per request after its final v2 chunk.
+      Reports intervals relative to each chunk's start to expose stream overlap.
+      Never synchronizes the GPU; not-ready or overflow samples are labelled.
+      Default 0 allocates no timing events and leaves the stock path unchanged.
   GR8_DS_PF_V2_FC2:
     scope: agree
     kind: flag

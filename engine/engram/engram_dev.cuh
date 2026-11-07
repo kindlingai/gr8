@@ -403,7 +403,10 @@ public:
         if(rc!=cudaSuccess)return rc;
         if(int x=exchange(ids_d_+size_t(e)*rows*kIds,stage_d_[e],s8_d_[e],sc_.t[e].first,sc_.t[e].valid,emb_d_[e]))return x;
         if(!owned)return 0;
-        if(!(tc_ && owned>kDecodeRows && project_wide(e,owned,main)))
+        // Match the STOCK chunk's projection family, not the owner's smaller
+        // row count. A full-row TC chunk must not turn into scalar GEMV merely
+        // because its ragged owner has <=32 rows (different activation quant).
+        if(!(tc_ && rows>kDecodeRows && project_wide(e,owned,main)))
             if(int x=hooks_.project(model,e,owned,main,emb_d_[e],kv_d_))return x;
         if(dead_)k_gate_dead<<<dim3(owned,kStreams),kGateThreads,0,main>>>(T,kv_d_,wgt_d_[e],owned,dead_+row0);
         else k_gate<<<dim3(owned,kStreams),kGateThreads,0,main>>>(T,kv_d_,wgt_d_[e],owned);
