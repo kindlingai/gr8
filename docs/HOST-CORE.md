@@ -543,6 +543,24 @@ Each one is checked by the round logs, the hold, drain and loopback tests, `modu
 R5b2b on, `module_calls_test` also has a tight-pool scenario (a cancel of a live reused run, then an admission that
 fits only on the pages it freed, with a worker), and it and `admit_hold_drain_test` run under ASan and TSan.
 
+R5b2a landed. `g6s2_pool_ops` (g6sched.h, `s2/pool_ops.h`) is a module's pool policy: `match`, `take`, `digest`,
+`tiers`, `refusal`, `r_rows` and `make_room`, with the pool's g6kv handle, `max_run_pages`, `grow`, `count` and `status`
+as data. `scheduler-rs` `pool_ops.rs` fixes its layout and `g6s2_pool_hit`'s (`PoolHit`), and the layout digest covers
+both. The calls return 0, or 1 when the module threw, and the context is a `ModuleCtx`, as in ModuleOps. `PoolPolicy`
+is the caller's side. When `PoolHooks::ops` is unset, `FnPool` builds the table over `PoolHooks`' std::functions, so the
+tests keep their hooks. Each adapter's policy lambdas are member functions of `GlmPool` (g6m4.cu), `FlashPool` and
+`Ds41Pool`, over references to the same locals, filled in with `pol::` trampolines. The service calls the pool itself
+for free pages, room, reserve, fits, count, stats and runs. Each was a one-line forward wherever it was set. What
+differed between adapters is now data: DS41 held room, reserve and fits to one session's slab (`max_run_pages`), only
+GLM with block stores counted prompts (`count`), and only GLM showed growth totals and runs in status.s2 (`status`).
+`publish_status` reads the pool and `write_status` writes the file, so `service_vectors_test` seeds the second.
+
+Checked on Linux (GCC 12, x86_64). `module_calls_test` logs the service's plain pool calls through a test RunPool that
+hides the real one's methods, so production has no hook for it. Its hashes were recorded from the service before the
+change (51569016) and hold after it, in every shape, with the pool policy as std::functions and as a table. The 13,731
+round logs the host tests write are byte-identical before and after. `scripts/host_tests.sh` and `cargo test --release
+--workspace` pass. The GLM, Flash and DS41 engines build on a GB10. Boot pending.
+
 ### R6. Options, signatures and the fabric plan to Rust
 
 Moves `g6m4.cu:156-577` (about 20 model `#if`s, spec defaults, `--check-args`), the signature builders (`g6m4.cu:1919`,
