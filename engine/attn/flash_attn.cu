@@ -7,8 +7,9 @@
 //   attend   q_abs[h] = q_b[h] (256) @ UK[h] (256 x 512); s_j = q_abs . latent[id_j] / 16; p = softmax(s);
 //            ctx = sum_j p_j latent[id_j]; output[h] = UV[h] (256 x 512) @ ctx, FP16 [rows][heads][256]
 // Context-parallel decode (attn.h G6_CP, a CP binding from flash_bind.cu): the five stages below run_body, over pools in
-// place of keys. Not in the Flash build: the QO pair prefill and the prefill traces. g6_attn_bind_prefill_run runs the
-// decode path over the rows (same results, query tiles).
+// place of keys; the prefill runs on a CP binding only below R (the replicated path). Not in the Flash build: the QO
+// pair prefill and the prefill traces. g6_attn_bind_prefill_run runs the decode path over the rows (same results, query
+// tiles).
 #include "attn.h"
 #include "bind.h"
 #include "replay.h"
@@ -1923,9 +1924,6 @@ extern "C" int* g6_attn_bind_prefill_indices(const G6AttnPrefill* p,const G6Attn
 static int flash_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,void* s,
                              const G6FlashPoolOwner* owner){
     if(!p||!b||!b->storage||p->owner!=b||!step)return INVAL;
-#if defined(G6_CP) && G6_CP
-    if(b->args.cp_nr)return NOTSUP;   // the prefill reads every page: not on a CP binding
-#endif
     const bool force_p1=knob::fpf_attn_p1();
     if(owner && (g6nr::NR!=2 || owner->rank!=b->rank || !owner->opaque || !owner->publish ||
                  !owner->receive || step->reuse_indices || force_p1)) return INVAL;
@@ -1938,6 +1936,10 @@ static int flash_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep*
              step->reuse_row_map||step->reuse_rows)return INVAL;
     cudaStream_t stream=(cudaStream_t)s;
     G6Attn a=b->args;
+#if defined(G6_CP) && G6_CP
+    // a CP binding: the caller keeps the step's context <= R, where every page is replicated (as g6a_run)
+    a.cp_nr=0;a.cp_rank=0;
+#endif
     a.rows=step->rows;a.context=step->context;
     a.q_b=step->q_b;a.kv_a=step->kv_a;a.positions=step->positions;
     a.index_q=step->index_q;a.index_k=step->index_k;a.index_weight=step->index_weight;

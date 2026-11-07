@@ -66,6 +66,9 @@ struct PoolHooks {
 struct NativeHooks {
     PoolHooks pool;
     std::function<void(const Grant&)> bind; // native main AND draft binding, no pool mutation
+    // optional, head: why the engine cannot run this request at all (nullptr = it can); a refused request ends with an
+    // error before it is queued, as a grammar that does not compile
+    std::function<const char*(const g6rt::ServeReq&)> refuse;
     // optional, before bind on every rank: the bound request itself (DS41: its image rows, for the Engram ring of the
     // slot's snapshots and parks, s2/ds41_engram_ring.h)
     std::function<void(unsigned slot, const g6rt::ServeReq&)> bind_request;
@@ -175,7 +178,7 @@ class Service {
     void intake(const Command& command) {
         auto bytes = ingress_.request(command);
         auto request = parse_request(bytes, c_.scheduler.steering);
-        if (!grammar_ok(command.request, request) || !images_ok(command.request, request)) return;
+        if (!grammar_ok(command.request, request) || !images_ok(command.request, request) || !engine_ok(command.request, request)) return;
         const auto queued = Sessions::request(command.request, request);
         if (trace_)
             trace_.instant("arrive", Trace::CONTROL, targ("request", queued.id) + "," +
@@ -406,6 +409,13 @@ class Service {
             atomic_file(c_.directory + "/resp." + std::to_string(id), "end error -1 0\n");
             return false;
         }
+    }
+    bool engine_ok(uint64_t id, const g6rt::ServeReq& r) {
+        const char* why = native_.refuse ? native_.refuse(r) : nullptr;
+        if (!why) return true;
+        fprintf(stderr, "# s2: request %llu refused: %s\n", (unsigned long long)id, why);
+        atomic_file(c_.directory + "/resp." + std::to_string(id), "end error -1 0\n");
+        return false;
     }
     // An image request the engine cannot run (ds41_image.h img::refusal) ends with an error before it is queued, as a
     // grammar that does not compile does. The front end refuses the same cases first.

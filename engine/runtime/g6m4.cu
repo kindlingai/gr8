@@ -1137,12 +1137,17 @@ int main(int argc, char** argv)
     // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
     const bool cp_on = knob::cp().value_or(!G6_MODEL_FLASH);   // Flash: off unless asked for
 #if G6_MODEL_FLASH
-    if (cp_on && s2mode) die("Flash GR8_CP: not with S2 serving yet (decode and the offline mode only)");
+    // Flash: one session under --serve, prompts below R, no checkpoints (serve_flash refuses the rest)
+    if (cp_on && s2mode && (s2sess > 1 || flash_cache != g6s2::FlashCache::Off))
+        die("Flash GR8_CP under --serve: one session (--s2-sessions 1) and no GR8_GLM53F_CACHE yet");
 #endif
     const int cp_R = (int)knob::cp_r();
     const int cp_s3 = knob::cp_s3() ? 1 : 0;
     int cp_mmax = K + 1;
     for (int M : row_counts) cp_mmax = std::max(cp_mmax, M);
+#if G6_MODEL_FLASH
+    cp_mmax = MX;   // a CP step may carry any row count of a decode step (prompt chunks, MTP and DFlash2 verifies)
+#endif
     // S2: a split run past R shares batched steps, so any S2 step (sc.max_rows below) may run the CP block.
     // GR8_CP_STEP_ROWS=n: S2 steps past R carry at most n rows (Driver::step caps their rounds, cp_rows.h), so the fabric
     // is sized for n: at least the rows before #94 (cp_mmax here), at most the widest S2 step
@@ -1310,12 +1315,14 @@ int main(int argc, char** argv)
 #if G6_MODEL_FLASH
     // Flash prefill (flash_prefill.cuh): the P1 bodies run the decode blocks in MX-row chunks, so the decode bindings
     // stay decode-sized. Combinations the Flash prefill does not support yet stop here.
-    if (MP && (pf_rs || pf_own || !qp_man.empty() || !qo_man.empty() || reuse_prefix
+    // with GR8_CP the prefill runs below R only: serve_flash refuses longer prompts, and offline the prompt must fit
+    if (MP && (pf_rs || pf_own || !qp_man.empty() || !qo_man.empty() || reuse_prefix))
+        die("Flash --prefill: not with GR8_PF_RS, GR8_PF_OWN, --qo-/--qp- packs or --reuse-prefix (P1)");
 #if defined(G6_CP) && G6_CP
-               || cp_on
+    if (MP && cp_on && !s2mode)
+        for (const auto& p : plans)
+            if ((int)p.prompt.size() > cp_R) die("Flash --prefill with GR8_CP: a prompt longer than GR8_CP_R (the prefill runs below R only)");
 #endif
-               ))
-        die("Flash --prefill: not with GR8_PF_RS, GR8_PF_OWN, --qo-/--qp- packs, --reuse-prefix or CP (P1)");
     if (two && knob::pf_streams() == 2)
         die("Flash --pf-lanes 2 uses one compute stream; GR8_PF_STREAMS=2 is not supported");
     if (two && knob::resid_dump())
@@ -2214,6 +2221,9 @@ int main(int argc, char** argv)
                 g6s2::require(k >= 0 && k < D.d.nbk && rows > 0 && rows <= MX && exec_d[k][chain][rows], "Flash draft graph missing");
                 G6RT_CK(cudaGraphLaunch(exec_d[k][chain][rows], st));
             }, gsplit, ckpt.get(), flash_cache == g6s2::FlashCache::Terminal, flash_install};
+#if defined(G6_CP) && G6_CP
+        if (cp_on) { fc.cp_R = cp_R; fc.cp_enqueue = cp_enqueue; }
+#endif
         try { g6s2::serve_flash(fc, bc, plan.chunk); }
         catch (const std::exception& e) { fprintf(stderr, "g6m4: rank %d Flash serve failed: %s\n", R, e.what()); return 3; }
     }

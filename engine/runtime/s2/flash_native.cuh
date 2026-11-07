@@ -34,6 +34,10 @@ struct FlashContext {
     // optional: the engine's own hooks (GR8_GLM53F_KV_CHUNKS borrow-idle: resize on FLASH_KV_TIER, flash_room, flash),
     // added after serve_flash's; a resize hook chains to the one already set for any other tier
     std::function<void(NativeHooks&)> install;
+    // GR8_CP: a main step past cp_R runs the CP block, whose collectives go on the CP fabric before its launch
+    // (cp_enqueue(step, M, context)); 0 = CP off. A prompt longer than cp_R is refused (the prefill runs below R only)
+    int cp_R = 0;
+    std::function<void(unsigned long long, int, int)> cp_enqueue;
 };
 inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     using namespace g6rt;
@@ -51,6 +55,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     FlashSlots ks(int(sc.limit()), std::max(1, c.main.kda_ring_rest ? c.main.kda_ring_rest : c.main.kda_ring),
                   std::max(1, c.main.kda_ring));
     require(ks.total() <= c.main.kda_st.slots, "Flash serve: the KDA state has fewer slots than the sessions' rings");
+    require(!c.cp_R || (!multi && !c.ckpt && c.cp_enqueue), "Flash serve with GR8_CP: one session, no checkpoints");
     u64 pfseq = 1, pfseq2 = 1, dseq = 0;
     LpStep lp{};
     int lp_rows = 0;
@@ -97,6 +102,10 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         pending.clear();
     };
     NativeHooks h;
+    if (c.cp_R)
+        h.refuse = [&](const g6rt::ServeReq& r) -> const char* {
+            return r.prompt.size() > size_t(c.cp_R) ? "the prompt is longer than GR8_CP_R (Flash CP prefills below R only)" : nullptr;
+        };
     // Rows the steps wrote into the attention caches (main and draft) since the last clear: a request clears only the
     // pages that hold them, one page past the last, and every later page is still zero from that clear (the full reset
     // cleared 12 x 436 MB per request at the 262K cap, ~27 ms). -1 = not known (boot): every page.
@@ -312,6 +321,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             std::vector<uint32_t> sizes(c.main.ncoll(), uint32_t(si.M * HID * 2));
             sizes.back() = head_size(si, c.main.nc);
             c.main_fabric.enqueue_step(si.step, sizes);
+            if (c.cp_R) c.cp_enqueue(si.step, si.M, si.context);
             wrote_step(si);
             if (!g) c.main_graph(l.buckets[0], si.M);
         }
