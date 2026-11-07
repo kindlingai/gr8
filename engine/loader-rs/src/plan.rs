@@ -195,6 +195,64 @@ impl Plan {
         &self.segs[i..j.max(i)]
     }
 
+    /// GR8_LOAD_COMPACT: reads file ranges from compacted copies under `dir`. For a source file `<x>/<name>` with a
+    /// `dir/<name>.g6map` (first line `g6map-v1 <source bytes>`, then `<source offset> <bytes> <copy offset>` per
+    /// run, sorted), every Copy and Item128 range inside one run is read from `dir/<name>` instead. A range no run
+    /// holds stays on the source file. A map whose source size differs is refused. Returns (files, ranges moved,
+    /// ranges left).
+    pub fn remap_compact(&mut self, dir: &str) -> Result<(usize, usize, usize), String> {
+        let (mut nf, mut moved, mut left) = (0, 0, 0);
+        for f in 0..self.files.len() {
+            let src = self.files[f].clone();
+            let name = std::path::Path::new(&src).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let mpath = format!("{dir}/{name}.g6map");
+            let text = match std::fs::read_to_string(&mpath) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("{mpath}: {e}")),
+            };
+            let mut lines = text.lines();
+            let head = lines.next().unwrap_or("");
+            let want = std::fs::metadata(&src).map_err(|e| format!("{src}: {e}"))?.len();
+            if head != format!("g6map-v1 {want}") {
+                return Err(format!("{mpath}: header '{head}', the source holds {want} bytes (a stale copy?)"));
+            }
+            let mut runs: Vec<(u64, u64, u64)> = Vec::new();
+            for l in lines {
+                let v: Vec<u64> = l.split_ascii_whitespace().map(|x| x.parse::<u64>()).collect::<Result<_, _>>()
+                    .map_err(|_| format!("{mpath}: bad line '{l}'"))?;
+                if v.len() != 3 || runs.last().is_some_and(|r| r.0 + r.1 > v[0]) {
+                    return Err(format!("{mpath}: bad or unsorted line '{l}'"));
+                }
+                if v[1] == 0 || v[0].checked_add(v[1]).is_none_or(|end| end > want)
+                    || v[2].checked_add(v[1]).is_none() {
+                    return Err(format!("{mpath}: range out of bounds in line '{l}'"));
+                }
+                runs.push((v[0], v[1], v[2]));
+            }
+            let copy = format!("{dir}/{name}");
+            let clen = std::fs::metadata(&copy).map_err(|e| format!("{copy}: {e}"))?.len();
+            if runs.iter().any(|r| r.2 + r.1 > clen) {
+                return Err(format!("{copy}: {clen} bytes, shorter than its map"));
+            }
+            let ix = self.files.len();
+            self.files.push(copy);
+            nf += 1;
+            for s in self.segs.iter_mut().filter(|s| s.file == f && matches!(s.op, Op::Copy | Op::Item128 { .. })) {
+                let i = runs.partition_point(|r| r.0 <= s.file_off);
+                match i.checked_sub(1).map(|i| runs[i]) {
+                    Some((o, n, c)) if s.file_off - o <= n && s.nbytes <= n - (s.file_off - o) => {
+                        s.file = ix;
+                        s.file_off = c + (s.file_off - o);
+                        moved += 1;
+                    }
+                    _ => left += 1,
+                }
+            }
+        }
+        Ok((nf, moved, left))
+    }
+
     pub fn ranges(&self) -> usize {
         self.segs.len()
     }

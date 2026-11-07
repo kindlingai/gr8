@@ -44,6 +44,13 @@ knobs:
     values: "1.."
     doc: >-
       Sets the chunk size in MB that the Rust loader reads and the weight check sums.
+  GR8_LOAD_COMPACT:
+    scope: local
+    kind: text
+    unset: "every range is read from its source file"
+    doc: >-
+      A directory of compacted copies: for a source file with DIR/<name>.g6map, the Rust loader reads the ranges that
+      map holds from DIR/<name> instead. Same bytes.
   GR8_LOAD_MERGE_KB:
     scope: local
     kind: int
