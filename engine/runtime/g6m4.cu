@@ -1807,9 +1807,9 @@ int main(int argc, char** argv)
                 if (dsk.on()) { m.dsp.main_lo = 0; m.dsp.main_hi = -1; }
             };
             dc.after_prefill = [&](const g6s2::Ds41PrefillChunk& c) {
-                // Native already fenced the chunk. Retire diagnostics here so
-                // arbitrary prompt lengths cannot exhaust the bounded ring.
-                if(pf_v2)ds41::v2::timing_report(v2engine.v,c.request);
+                // Native already fenced this final prefill chunk. Diagnostics
+                // print once per request; bounded-ring overflow is labelled.
+                if(pf_v2 && c.first+c.rows==c.prompt_rows-1)ds41::v2::timing_report(v2engine.v,c.request);
                 std::vector<dsr::ExpertLogRec> records;
                 const int n = ds41moe::elog_read(&m, records, true);
                 g6s2::require(n >= 0, "DS41 prefill distinct-expert counter read failed");
