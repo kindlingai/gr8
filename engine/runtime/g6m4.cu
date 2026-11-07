@@ -130,7 +130,6 @@ bool ds41_c2_trace_on();
 #include "ds41_rs.h"
 #include "ds41_prefill_fabric.h"
 #include "ds41_v2.h"
-#include "ds41_v2_walk.h"
 #include "ds41_v2.cuh"
 #include "ds41_v2_ffn.cuh"
 #include "ds41_v2_engram.cuh"

@@ -23,6 +23,11 @@ int main() {
             assert(f->cfg.ncoll==12 && f->cfg.compact && f->cfg.pool==0);
             assert(f->cfg.slot_bytes>=128*(4*5120*2+48*4+5120*2));
             assert(f->cfg.slot_bytes1>=4*ds41::v2::aligned(size_t((w+3)/4)*6352+8,256)-8);
+            g6::FabricDev wire{}; assert(g6::fab_slot_layout(f->cfg,12,&wire));
+            const size_t a2a=4*ds41::v2::aligned(size_t((w+3)/4)*6352+8,256);
+            assert(a2a<=g6::fab_slot_stride(wire,int(ds41::v2::Coll::Engram)));
+            if(w>=4096)assert(a2a>wire.stride); // enqueue must check the actual run, not run0
+
         }
         in.k.ds_pf_lanes="2";
         auto two=fabric_plan(o,in);

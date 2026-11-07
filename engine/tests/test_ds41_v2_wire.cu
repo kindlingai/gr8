@@ -91,7 +91,42 @@ static void reduction(int M) {
         check(cudaFree(src[r]));check(cudaFree(dst[r]));delete net[r];
     }
 }
+static void tail_gather(int M) {
+    const size_t widths[]={40960,96,16,16,64,10240};
+    Segment shape[6]; for(int k=0;k<6;++k)shape[k].row_bytes=widths[k];
+    const auto w=wire_layout(128,shape,6);
+    Region* net[4]; Data* data[4][6]; detail::Segments seg[4]{};
+    for(int r=0;r<4;++r) {
+        net[r]=new Region(r,w.stride); seg[r].w=w;
+        const auto g=geometry(M,4,r); const auto t=tail_slice(g);
+        for(int k=0;k<6;++k) {
+            auto* d=data[r][k]=new Data(128*widths[k],512*widths[k]);
+            for(int m=0;m<t.count;++m)for(size_t j=0;j<widths[k];++j)
+                d->input[size_t(m)*widths[k]+j]=pattern(k,g.row0+t.local+m,int(j));
+            check(cudaMemcpy(d->src,d->input.data(),d->input.size(),cudaMemcpyHostToDevice));
+            seg[r].s[k]={d->src,d->dst,widths[k]};
+        }
+        detail::pack<<<COMM_BLOCKS,COMM_THREADS>>>(net[r]->f,1,0,geometry(512,4,r),seg[r],false);
+    }
+    check(cudaDeviceSynchronize());proxy(net,1,w,false);
+    for(int r=0;r<4;++r) {
+        detail::unpack<<<COMM_BLOCKS,COMM_THREADS>>>(net[r]->f,1,0,geometry(512,4,r),seg[r],false);
+        for(int k=0;k<6;++k) {
+            auto* d=data[r][k];check(cudaMemcpy(d->output.data(),d->dst,d->output.size(),cudaMemcpyDeviceToHost));
+            for(int p=0;p<4;++p) {
+                const auto g=geometry(M,4,p);const auto t=tail_slice(g);
+                for(int m=0;m<128;++m)for(size_t j=0;j<widths[k];++j) {
+                    const auto want=m<t.count?pattern(k,g.row0+t.local+m,int(j)):0;
+                    assert(d->output[(size_t(p)*128+m)*widths[k]+j]==want);
+                }
+            }
+        }
+    }
+    for(int r=0;r<4;++r) {for(int k=0;k<6;++k)delete data[r][k];delete net[r];}
+}
 int main() {
+    for(int M:{1,3,5,17,127,128,129,257,511,4093,4096,8191,8192})tail_gather(M);
+    std::cout<<"ds41_v2_wire: six-array tail gather, 13 ragged chunks PASS (proxy-copy emulation)\n";
     for(int M:{1,3,5,17,257,4096,8191}) {test(M,false);test(M,true);reduction(M);}
     std::cout<<"ds41_v2_wire: 7 row shapes x AG/A2A/RS, ragged padding and unaligned segments PASS (proxy-copy emulation, not RDMA)\n";
 }
