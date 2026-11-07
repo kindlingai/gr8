@@ -39,15 +39,10 @@ pub struct Reuse {
     _p: [u8; 0],
 }
 
-/// A row's sampling (sessions.h Sampling).
+/// C++ `g6s2::Sampling`, passed through.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Sampling {
-    pub inv_temp: f32,
-    pub top_p: f32,
-    pub seed: u32,
-    pub lp: i32,
-    pub plp: i32,
+    _p: [u8; 0],
 }
 
 /// A row's logprob entry (serve.h LpRow; LP_MAX = 20).

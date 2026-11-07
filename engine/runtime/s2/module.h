@@ -12,8 +12,6 @@
 namespace g6s2 {
 struct Launch;
 struct DispatchHooks;
-static_assert(sizeof(Sampling) == sizeof(g6s2_sampling) && offsetof(Sampling, seed) == offsetof(g6s2_sampling, seed) &&
-              offsetof(Sampling, plp) == offsetof(g6s2_sampling, plp), "Sampling layout");
 static_assert(sizeof(g6rt::LpRow) == sizeof(g6s2_lp_row) && offsetof(g6rt::LpRow, id) == offsetof(g6s2_lp_row, id) &&
               offsetof(g6rt::LpRow, tlp) == offsetof(g6s2_lp_row, tlp), "LpRow layout");
 static_assert(sizeof(Resize) == sizeof(g6sch_resize) && offsetof(Resize, segs) == offsetof(g6sch_resize, segs) &&

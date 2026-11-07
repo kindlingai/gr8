@@ -200,9 +200,6 @@ impl Kind for crate::driver::CPlanner {
 impl Kind for crate::driver::CPool {
     const K: u64 = 6;
 }
-impl Kind for crate::module::Sampling {
-    const K: u64 = 6;
-}
 impl Kind for crate::module::LpRow {
     const K: u64 = 6;
 }
@@ -697,7 +694,6 @@ pub fn digest() -> u64 {
             inserted
         }
     );
-    layout!(h, crate::module::Sampling { inv_temp, top_p, seed, lp, plp });
     layout!(h, crate::module::LpRow { lp, rank, n, id, tlp });
     layout!(
         h,
