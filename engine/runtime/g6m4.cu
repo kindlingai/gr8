@@ -2904,7 +2904,7 @@ int main(int argc, char** argv)
                             (unsigned long long)slots, kvt->blocks().slot_bytes(), keep.c_str(), index.empty() ? "" : ", indexed");
                 }
                 if (const uint64_t gone = pool.tiers_loaded())
-                    fprintf(stderr, "# rank %d: s2 stores: %llu stored runs dropped (their base came back in no store, or a whole index reopened with keep=system)\n", R, (unsigned long long)gone);
+                    fprintf(stderr, "# rank %d: s2 stores: %llu stored records dropped (base came back in no store, a whole index reopened with keep=system, or slots past the store or taken twice)\n", R, (unsigned long long)gone);
                 pool.write_limit((uint64_t)std::llround(kv_write_limit * 1000));
                 // a run past R keeps its tail: each rank's shard and the replicated parts (only when the pool's R is the CP
                 // map's, so the pages past it are the sharded ones)
@@ -3728,8 +3728,8 @@ int main(int argc, char** argv)
                     pool.write_limit(0);
                     kv_drain();   // reserve fails while store copies are queued (g6kvman.h): run them first
                     // sweep the pool: reserve at --cap rows (the pool's capacity) until the pool refuses, then halve down
-                    // to one page (64 rows, always tried last, also when cap < 128): runs still live keep their rows, so
-                    // the whole pool rarely fits one reserve. Each reserve evicts what it needs through the
+                    // to one page (64 rows, always tried last, also when cap < 128). The halving is the fallback for when a
+                    // cap-sized reserve cannot take everything (rows a live run still holds). Each reserve evicts what it needs through the
                     // stores. The calls depend only on the pool's state, which every rank shares, so every rank makes
                     // the same ones; no wall-clock stop (it could end ranks at different points). At most the pool's
                     // pages plus one refusal per size
