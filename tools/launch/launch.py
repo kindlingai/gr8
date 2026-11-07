@@ -426,8 +426,12 @@ def prepare_compact(o, rank, variant):
     if not variant.path or not o.get('V2_SLICES'):
         raise modelset.ModelError('GR8_LOAD_COMPACT prepare needs an exlr8 v2 release with index slices and a width manifest')
     import fetch_ranks
+    plan = opt.engine_plan(o, rank=str(rank))
+    runtime = dict(word.split('=', 1) for word in plan['env'] if '=' in word)
     result = fetch_ranks.compact_rank(o.get('V2'), directory, o.get('V2_SLICES'), int(o.get('TP')), rank,
-                                      variant.path, o.get('LAYOUT'))
+                                     variant.path, o.get('LAYOUT'), dense=o.get('V2_DENSE'),
+                                     dense_form=o.get('V2_DENSE_FORM') or 'trellis',
+                                     qo=runtime.get('GR8_PF_OWN') == '3', kvb=runtime.get('GR8_KVB') or 'bf16')
     print(f'compact copies: {result["checked"]} halves verified in {directory}')
 
 

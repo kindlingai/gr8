@@ -50,7 +50,7 @@ knobs:
     unset: "every range is read from its source file"
     doc: >-
       A directory of compacted copies: for a source file with DIR/<name>.g6map, the Rust loader reads the ranges that
-      map holds from DIR/<name> instead. Same bytes. Set this for prepare to write and verify this rank's expert copies
+      map holds from DIR/<name> instead. Same bytes. Set this for prepare to write and verify this rank's expert and dense/vocabulary copies
       first; see docs/COMPACT-WEIGHTS.md.
   GR8_LOAD_MERGE_KB:
     scope: local

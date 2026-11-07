@@ -1,4 +1,4 @@
-//! Prepare one rank's expert ranges as dense copies with the g6map-v1 maps the loader reads.
+//! Prepare one rank's weight ranges as dense copies with the g6map-v1 maps the loader reads.
 //! Originals stay in place: their headers, generated tensors and uncovered ranges are still needed.
 
 use crate::fetch::{self, Unit};
@@ -44,12 +44,56 @@ pub fn verify(src: &str, dir: &str, units: &[Unit]) -> Result<(), String> {
     Ok(())
 }
 
+/// The release planner is the source of truth for dense/vocabulary ownership and load forms. Do not include Gen
+/// segments: their inputs are still read by the existing generation/cache path, not by the compact reader.
+fn dense_segments(plan: &Plan) -> Vec<Seg> {
+    plan.sources(0, u64::MAX).iter().filter(|s| {
+        if !matches!(s.op, Op::Copy | Op::Item128 { .. }) { return false; }
+        let name = Path::new(&plan.files[s.file]).file_name().unwrap_or_default().to_string_lossy();
+        name.starts_with("exlr8-dense-") || name == "exlr8-vocab.safetensors"
+    }).map(|s| Seg { pack_off: s.pack_off, nbytes: s.nbytes, op: s.op, file: s.file, file_off: s.file_off }).collect()
+}
+
+fn verify_dense(plan: &Plan, dir: &str) -> Result<(), String> {
+    let segs = dense_segments(plan);
+    let end = segs.last().map_or(0, |s| s.pack_off + s.nbytes);
+    let mut copy = Plan::from_segs(plan.files.clone(), segs, Vec::new(), Vec::new(), end)?;
+    let (_, moved, _) = copy.remap_compact(dir)?;
+    let ranges = dense_segments(plan);
+    if moved != ranges.len() { return Err(format!("{dir}: compact maps cover {moved} of {} dense ranges", ranges.len())); }
+    let mut original = vec![0; 4 << 20];
+    let mut packed = vec![0; 4 << 20];
+    for s in ranges {
+        let mut offset = 0;
+        while offset < s.nbytes {
+            let n = (s.nbytes - offset).min(original.len() as u64) as usize;
+            crate::read_range(plan, s.pack_off + offset, &mut original[..n])?;
+            crate::read_range(&copy, s.pack_off + offset, &mut packed[..n])?;
+            if original[..n] != packed[..n] {
+                return Err(format!("{dir}: dense copy differs from its source at image byte {}", s.pack_off + offset));
+            }
+            offset += n as u64;
+        }
+    }
+    Ok(())
+}
+
 /// Write a new directory, checking its copies before publishing it. An existing directory is verified and reused,
 /// never overwritten: use another destination when preparing another release, rank, width or layout.
 pub fn write(src: &str, out: &str, units: &[Unit]) -> Result<(), String> {
-    if units.is_empty() { return Err("no expert halves to compact".into()); }
+    write_with_dense(src, out, units, None)
+}
+
+/// Also compact the dense/vocabulary file ranges in the rank's release plan, using the same map format.
+pub fn write_with_dense(src: &str, out: &str, units: &[Unit], dense: Option<&Plan>) -> Result<(), String> {
+    if units.is_empty() && dense.is_none() { return Err("no weight ranges to compact".into()); }
+    let check = |dir: &str| -> Result<(), String> {
+        verify(src, dir, units)?;
+        if let Some(plan) = dense { verify_dense(plan, dir)?; }
+        Ok(())
+    };
     let dest = Path::new(out);
-    if dest.exists() { return verify(src, out, units); }
+    if dest.exists() { return check(out); }
     let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     fs::create_dir_all(parent).map_err(io)?;
     let name = dest.file_name().ok_or("compact destination needs a directory name")?.to_string_lossy();
@@ -61,12 +105,19 @@ pub fn write(src: &str, out: &str, units: &[Unit]) -> Result<(), String> {
         fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
     }
     let _cleanup = Cleanup(temp.clone());
-    let mut files: BTreeMap<String, Vec<(u64, u64)>> = BTreeMap::new();
+    let mut files: BTreeMap<PathBuf, Vec<(u64, u64)>> = BTreeMap::new();
     for u in units {
-        files.entry(fetch::width_file(u.layer, u.k)).or_default().push((u.offset, u.nbytes));
+        files.entry(Path::new(src).join(fetch::width_file(u.layer, u.k))).or_default().push((u.offset, u.nbytes));
     }
-    for (name, mut ranges) in files {
-        let source = Path::new(src).join(&name);
+    if let Some(plan) = dense {
+        for s in dense_segments(plan) {
+            files.entry(PathBuf::from(&plan.files[s.file])).or_default().push((s.file_off, s.nbytes));
+        }
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for (source, mut ranges) in files {
+        let name = source.file_name().ok_or("source has no basename")?.to_string_lossy().to_string();
+        if !names.insert(name.clone()) { return Err(format!("two sources have basename {name}")); }
         let mut input = File::open(&source).map_err(|e| format!("{}: {e}", source.display()))?;
         let size = input.metadata().map_err(io)?.len();
         ranges.sort_unstable();
@@ -94,9 +145,37 @@ pub fn write(src: &str, out: &str, units: &[Unit]) -> Result<(), String> {
         copy.sync_all().map_err(io)?;
         map.sync_all().map_err(io)?;
     }
-    verify(src, temp.to_str().ok_or("compact destination is not UTF-8")?, units)?;
+    check(temp.to_str().ok_or("compact destination is not UTF-8")?)?;
     File::open(&temp).and_then(|f| f.sync_all()).map_err(io)?;
     fs::rename(&temp, dest).map_err(|e| format!("{out}: {e}"))?;
     File::open(parent).and_then(|f| f.sync_all()).map_err(io)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_and_vocab_round_trip_uses_the_planned_ranges() {
+        let dir = std::env::temp_dir().join(format!("g6compact-dense-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let files: Vec<String> = ["exlr8-dense-000.safetensors", "exlr8-vocab.safetensors"].iter()
+            .map(|name| dir.join(name).to_str().unwrap().to_string()).collect();
+        let bytes: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+        for f in &files { fs::write(f, &bytes).unwrap(); }
+        let segs = vec![Seg { pack_off: 0, nbytes: 16, file: 0, file_off: 100, op: Op::Copy },
+                        Seg { pack_off: 16, nbytes: 3072, file: 0, file_off: 1024, op: Op::Item128 { hidden: 128 } },
+                        Seg { pack_off: 3088, nbytes: 32, file: 1, file_off: 400, op: Op::Copy }];
+        let plan = Plan::from_segs(files, segs, Vec::new(), Vec::new(), 3120).unwrap();
+        let out = dir.join("copies");
+        write_with_dense("", out.to_str().unwrap(), &[], Some(&plan)).unwrap();
+        write_with_dense("", out.to_str().unwrap(), &[], Some(&plan)).unwrap();
+        assert_eq!(fs::read(out.join("exlr8-dense-000.safetensors")).unwrap(),
+                   [&bytes[100..116], &bytes[1024..4096]].concat());
+        assert_eq!(fs::read(out.join("exlr8-vocab.safetensors")).unwrap(), bytes[400..432]);
+        fs::write(out.join("exlr8-vocab.safetensors"), [0; 32]).unwrap();
+        assert!(write_with_dense("", out.to_str().unwrap(), &[], Some(&plan)).unwrap_err().contains("differs"));
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

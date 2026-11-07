@@ -271,16 +271,23 @@ class HFTests(unittest.TestCase):
 
     def test_prepare_compact_round_trip(self):
         import launch
+        # Dense files in this fake hub are placeholders. Keep the real prepare/fetch/expert writer path, but
+        # suppress dense planning at the helper boundary; loader tests cover dense planning's Copy/Item128 output.
         dest = os.path.join(self.cache, 'compact-rank1')
-        args = ['prepare', '--no-config', '--model', f'https://huggingface.co/{RELEASE}',
+        args = ['--no-config', '--model', f'https://huggingface.co/{RELEASE}',
                 '--model-cache', self.cache, '--rank', '1', '--tp', '4', '--variant', 'home',
                 '--extra-env', f'GR8_LOAD_COMPACT={dest}']
-        env = {**os.environ, **GLM, 'G6LOAD': hfsource.fetch_ranks().g6load()}
-        cmd = [sys.executable, launch.__file__, *args]
-        for _ in range(2):  # initial prepare, then verify/reuse with an already-complete fetch
-            r = subprocess.run(cmd, capture_output=True, text=True, env=env)
-            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-            self.assertIn('halves verified', r.stdout)
+        fetch = hfsource.fetch_ranks()
+        compact = fetch.compact_rank
+
+        def expert_only(*a, **kw):
+            self.assertTrue(kw.pop('dense'))  # the real prepare supplied the resolved dense directory
+            return compact(*a, **kw)
+
+        with mock.patch.dict(os.environ, GLM), mock.patch.object(fetch, 'compact_rank', side_effect=expert_only) as run:
+            for _ in range(2):  # prepare, then verify/reuse through the same command
+                self.assertEqual(launch.cmd_prepare(args), 0)
+            self.assertEqual(run.call_count, 2)
         release = self.release()
         variant = self.variant(release)
         # Each dense copy equals the original ranges, in sorted order without holes. The command above also

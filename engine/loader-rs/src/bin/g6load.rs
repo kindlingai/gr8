@@ -12,6 +12,8 @@
 //!   g6load compact --slices DIR --v2 DIR --out DIR --tp N --rank R (--manifest FILE | --widths ...)
 //!       [--layers ...] [--layout FILE]: write dense expert copies and g6map-v1 maps for this rank, verify every
 //!       half through the compact reader, then publish the directory. An existing directory is checked and reused.
+//!       --dense DIR adds the release planner's dense/vocabulary ranges, with --dense-form trellis|rounded,
+//!       --qo 0|1 and --kvb bf16|fp8 selecting the load forms (defaults: trellis, 0, bf16).
 //!
 //! DIR for --slices holds tp<N>/k<K>/rank<R>.safetensors (the release's index-slices/).
 //!
@@ -88,7 +90,17 @@ fn run() -> Result<i32, String> {
             Ok(0)
         }
         "compact" => {
-            g6load::compact::write(need("--v2")?, need("--out")?, &units)?;
+            let dense = opt.get("--dense").map(|dir| {
+                let form = opt.get("--dense-form").copied().unwrap_or("trellis");
+                if !matches!(form, "trellis" | "rounded") { return Err("--dense-form: trellis or rounded".into()); }
+                let kvb = opt.get("--kvb").copied().unwrap_or("bf16");
+                if !matches!(kvb, "bf16" | "fp8") { return Err("--kvb: bf16 or fp8".into()); }
+                let opts = g6load::release::Opts { qo: opt.get("--qo").is_some_and(|v| *v == "1"),
+                                                 trellis: form == "trellis", kvb_fp8: kvb == "fp8" };
+                g6load::release::plan(dir, need("--v2")?, need("--slices")?, need("--manifest")?,
+                                     num("--tp")?, num("--rank")?, layout.as_ref(), opts).map(|(img, _)| img)
+            }).transpose()?;
+            g6load::compact::write_with_dense(need("--v2")?, need("--out")?, &units, dense.as_ref().map(|i| &i.plan))?;
             println!("{{\"checked\": {}, \"bad\": []}}", units.len());
             Ok(0)
         }

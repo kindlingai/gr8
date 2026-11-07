@@ -270,12 +270,14 @@ def g6load_run(cmd, slices, nr, rank, man=None, allk=None, layers=None, v2_dir=N
     return json.loads(r.stdout)
 
 
-def compact_rank(source, out, slices, nr, rank, manifest, layout=None):
+def compact_rank(source, out, slices, nr, rank, manifest, layout=None, dense=None, dense_form="trellis", qo=False, kvb="bf16"):
     """Write this rank's dense expert copies and maps; g6load verifies them through the loader before publishing."""
     argv = [g6load(), 'compact', '--v2', source, '--out', out, '--slices', slices,
             '--tp', str(nr), '--rank', str(rank), '--manifest', manifest]
     if layout:
         argv += ['--layout', layout]
+    if dense:
+        argv += ['--dense', dense, '--dense-form', dense_form, '--qo', '1' if qo else '0', '--kvb', kvb]
     r = subprocess.run(argv, capture_output=True, text=True)
     if r.returncode:
         raise RuntimeError(f'g6load compact: {r.stderr.strip() or r.returncode}')

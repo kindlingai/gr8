@@ -1,6 +1,6 @@
 # Compact expert copies
 
-The optional `GR8_LOAD_COMPACT` directory lets the Rust loader read a rank's expert
+The optional `GR8_LOAD_COMPACT` directory lets the Rust loader read a rank's weight
 ranges from dense copies instead of the sparse release files. Unset or empty keeps
 the normal loader path. This changes where bytes are read, not their values.
 
@@ -16,12 +16,12 @@ export EXTRA_ENV="GR8_LOAD_COMPACT=$COMPACT_DIR"
 ```
 
 Keep any other `EXTRA_ENV` assignments your configuration needs. `prepare` first
-fetches/checks the release normally, then writes only this rank's expert ranges.
+fetches/checks the release normally, then writes this rank's expert ranges and the dense/vocabulary ranges its release plan copies.
 Local releases work too. Custom ownership follows `--layout` on both commands.
 Boot does not write or refresh compact files.
 
-Preparation writes to a sibling staging directory, reads every requested half back
-through the loader's compact map, checks its index-slice xxhash64, then publishes the
+Preparation writes to a sibling staging directory, reads every requested expert half back
+through the loader's compact map, checks its index-slice xxhash64, compares dense/vocabulary reads against the originals, then publishes the
 directory. An existing directory is checked and reused, never overwritten. If it is
 stale or corrupt, prepare fails; select a new destination to rebuild it. Preparation
 needs additional disk space for the copies. Interrupted preparation may leave a
@@ -30,9 +30,14 @@ needs additional disk space for the copies. Interrupted preparation may leave a
 The standalone fetch helper can do the same for an already-fetched release:
 
 ```sh
-g6load compact --v2 "$EXPERTS" --slices "$SLICES" --manifest "$WIDTHS" \
+g6load compact --dense "$MODEL" --v2 "$EXPERTS" --slices "$SLICES" --manifest "$WIDTHS" \
     --tp 4 --rank "$RANK" --out "$COMPACT_DIR"
 ```
+
+`--dense` plans dense and vocabulary ranges from the release; omit it only for
+expert-only copies. `--dense-form trellis|rounded`, `--qo 0|1` and `--kvb bf16|fp8`
+select the load forms (defaults: trellis, 0, bf16). `prepare` derives these from the
+same resolved options as the engine, including runtime overrides and `--layout`.
 
 Do not remove the originals. They still provide metadata, non-expert weights,
 generated tensors and any unmapped ranges. Keep the normal boot weight hash check
