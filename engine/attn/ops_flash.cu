@@ -15,15 +15,15 @@ extern "C" const G6AttnOps* g6_attn_ops(void) {
     static const G6AttnOps ops = {
         "GLM-5.3-Flash",
         g6a_append,   // append
-        nullptr,   // cp_finish
-        nullptr,   // cp_front
-        nullptr,   // cp_group
-        nullptr,   // cp_groups
-        nullptr,   // cp_groups_bytes
-        nullptr,   // cp_groups_ok
-        nullptr,   // cp_index
-        nullptr,   // cp_merge_index
-        nullptr,   // cp_qabs
+        G6_CP_OP(g6a_cp_finish),   // cp_finish
+        G6_CP_OP(g6a_cp_front),   // cp_front
+        G6_CP_OP(g6a_cp_group),   // cp_group
+        G6_CP_OP(g6a_cp_groups),   // cp_groups
+        G6_CP_OP(g6a_cp_groups_bytes),   // cp_groups_bytes
+        G6_CP_OP(g6a_cp_groups_ok),   // cp_groups_ok
+        G6_CP_OP(g6a_cp_index),   // cp_index
+        G6_CP_OP(g6a_cp_merge_index),   // cp_merge_index
+        G6_CP_OP(g6a_cp_qabs),   // cp_qabs
         nullptr,   // ctx_sp
         g6a_index_scores,   // index_scores
         nullptr,   // posidx

@@ -263,7 +263,8 @@ engine_defaults() {
 # TP=4 defaults GR8_PF_OWN to 4. OWN=3 needs the 13 GB full-head QO pack on every rank, and that pack does not fit next to
 # a 90 GB TP=4 rank pack. OWN=4 runs the same attention over two head pairs, with the pair weights rolled in per layer
 # (about 1.3-1.4 GB of device memory plus 84 MB pinned per rank). About 1.4 KB per position of it scales with QP_CTX.
-# GLM-5.3-Flash: the prefill speed stack at top-k 8 (docs/FLASH.md). GR8_PF_RS, GR8_PF_OWN and CP stay off.
+# GLM-5.3-Flash: the prefill speed stack at top-k 8 (docs/FLASH.md). GR8_PF_RS, GR8_PF_OWN and CP stay off; EXTRA_ENV=GR8_CP=1
+# turns CP on with R = SHARE_LIMIT (docs/FLASH.md).
 flash_env() {
   ENGINE_BIN=g6m4_flash; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=g6m4_flash-int4
   # TP=4: mHC sequence-parallel (partials reduce-scatter, each owner runs mHC on its rows, the rows all-gather), which
@@ -273,7 +274,7 @@ flash_env() {
   local sp=0 stage=1 rsplit=1
   [ "$TP" = 4 ] && sp=1 stage=0 rsplit=0
   [ "$TP" = 1 ] && rsplit=0   # one rank: no router to split
-  ENGINE_ENV="GR8_CP=0 GR8_PF_RS=0 GR8_PF_OWN=0 GR8_GLM53F_PF_POOL_OWNER=0 GR8_FPF_P1=0 GR8_FPF_DSA_P1=0 \
+  ENGINE_ENV="GR8_CP=0 GR8_CP_R=$SHARE_LIMIT GR8_PF_RS=0 GR8_PF_OWN=0 GR8_GLM53F_PF_POOL_OWNER=0 GR8_FPF_P1=0 GR8_FPF_DSA_P1=0 \
 GR8_FPF_ATTN_P1=0 GR8_GLM53F_PF_SPARSE_MLA=1 GR8_GLM53F_PF_SPARSE_MLA_512=1 \
 GR8_GLM53F_PF_SPARSE_MLA_V2=1 GR8_GLM53F_PF_SPARSE_MLA_H16C=1 GR8_PF_DTR8=1 GR8_GLM53F_PF_SHFP8=1 GR8_PF_FC2V2=1 GR8_GLM53F_PF_KDA_WS=1 \
 GR8_GLM53F_PF_DSA_FULL_GV=1 GR8_PF_ROUTER_SPLIT=$rsplit GR8_GLM53F_PF_DSA_F16GEMM=1 GR8_GLM53F_PF_PREWARM=1 GR8_GLM53F_PF_MHC_STAGE=1 GR8_GLM53F_PF_MHC_FUSE=2 \

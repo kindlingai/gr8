@@ -4,7 +4,7 @@ knobs:
   GR8_CP:
     scope: agree
     kind: flag
-    unset: "1 in a CP build"
+    unset: "1 in a CP build, 0 in the Flash build"
     doc: >-
       Context-parallel KV: the first GR8_CP_R tokens are replicated and later pages are spread across ranks on a CP
       fabric of their own. Read only in builds with -DG6_CP=1.

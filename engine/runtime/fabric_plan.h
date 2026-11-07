@@ -112,6 +112,7 @@ struct PlanInputs
     size_t head_payload = 0;        // DS41: glue::head_bytes_tk(MX, nc, true)
     size_t trunk_bytes = 0;         // DS41: sizeof(ds_mhc::trunk_t)
     std::vector<bool> full_index;   // per --layers entry: cp_full_index
+    std::vector<bool> attn;         // per --layers entry: cp_attn_layer (Flash: not the KDA layers); empty = every layer
     bool cp_build = false;          // G6_CP
     bool gather = false;            // GR8_QA_SPLIT or GR8_IDXQ_SPLIT: fabg
     bool draft_gather = false;      // GR8_MTP_SPLIT: fabdg
@@ -399,7 +400,7 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
 #endif
     // CP (GR8_CP, GR8_CP_R, GR8_CP_S3, GR8_CP_MMAX): its own fabric, cplayout.h's variable layout, port + 32
     if (in.cp_build) {
-        p.cp_on = k.cp.value_or(true);
+        p.cp_on = k.cp.value_or(!G6_MODEL_FLASH);   // Flash: off unless asked for
         p.cp_R = (int)k.cp_r;
         p.cp_s3 = k.cp_s3 ? 1 : 0;
         int cp_mmax = eo.K + 1;
@@ -414,6 +415,11 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
         }
         else if (k.cp_step_rows) return "GR8_CP_STEP_ROWS needs --serve";
         if (k.cp_mmax) cp_mmax = std::max(cp_mmax, (int)*k.cp_mmax);
+#if G6_MODEL_FLASH
+        cp_mmax = MX;   // a CP step may carry any decode step's rows (prompt chunks, MTP and DFlash2 verifies)
+        if (p.cp_on && s2mode && eo.s2sess > 1 && (p.cp_R < 64 || p.cp_R >= eo.cap))
+            return "Flash GR8_CP with several sessions: GR8_CP_R must be 64..--cap - 1";
+#endif
         p.cp_mmax = cp_mmax;
         if (p.cp_R < 0 || p.cp_R % 64) return "GR8_CP_R must be a multiple of 64";
         // GR8_CP_R2: a session may take a smaller R; every step past it runs the CP block (CpState::step_R)
@@ -421,7 +427,7 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
         if (p.cp_R2 && (p.cp_R2 < 64 || p.cp_R2 % 64 || p.cp_R2 >= p.cp_R || !p.cp_on || !s2mode || !eo.rt_win))
             return "GR8_CP_R2 must be a multiple of 64 below GR8_CP_R, with GR8_CP on, --serve and GR8_RT_LOCAL";
         p.cp_step_R = p.cp_R2 ? p.cp_R2 : p.cp_R;
-        p.cp_colls.make(in.full_index, (int)cfg.ips.size(), cp_mmax);
+        p.cp_colls.make(in.full_index, (int)cfg.ips.size(), cp_mmax, in.attn);
         if (p.cp_on) {
             g6::FabricConfig cc = cfg;
             cc.vcap = p.cp_colls.cap;

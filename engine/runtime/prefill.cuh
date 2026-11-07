@@ -1851,11 +1851,19 @@ inline void pf_resdump(Prefill& P, int M, size_t seq, int first)
 // pool; cp_pf_back then copies the rows this rank stores into its sharded store (before the pool is reused at i + 2).
 // cp_pf_exit restores the CP args. Plain launches only (the args go by value into every launch). A missing owner page
 // sets 0x63000400 in the fabric error word (the attention error word is cleared by every prepare).
+// Flash: only the DSA layers have KV bindings, and they take the pools in their own order (CpState::pf_use). Its index
+// page is 16 pooled keys of 512 B: a pool is sent once complete below start, and copied back by the row that completes
+// it. No page hash (GR8_CP_PF_VERIFY): the hash's index part is GLM's layout.
 constexpr int CP_KVB = g6kv::ROW;     // attn.cu KV_BYTES: one latent record (kvfmt.h)
 constexpr int CP_IXB = g6kv::IDX_ROW; // attn.cu IDX_BYTES: one index key; a page is 64 x 128 codes, then 64 FP32 scales
 constexpr int CP_PF_MAXNR = 8;
-// Keep the GLM launch unchanged; the BF16 Flash record needs 64 + 9 lanes.
-constexpr int CP_BACK_THREADS = CP_KVB / 16 + 9 <= 64 ? 64 : 128;
+// Keep the GLM launch unchanged; the BF16 Flash record needs 64 + 9 lanes. Flash copies back a 512-B pooled key: 32 lanes
+#if G6_MODEL_FLASH
+constexpr int CP_IXK = 32;
+#else
+constexpr int CP_IXK = 9;
+#endif
+constexpr int CP_BACK_THREADS = CP_KVB / 16 + CP_IXK <= 64 ? 64 : 128;
 // np: each rank's physical pages; a table entry at or past it is a page the rows tier released (rt_rows.cuh rt_pf_stage
 // fills it)
 struct CpPfSrc { const char* kv[CP_PF_MAXNR]; const int* table[CP_PF_MAXNR]; const char* ix[CP_PF_MAXNR]; int np[CP_PF_MAXNR]; };
@@ -1892,18 +1900,33 @@ __global__ void __launch_bounds__(CP_BACK_THREADS) k_cp_pf_back(const char* pool
     if (!ixoff) return;
     const char* sp = pool + ixoff + (size_t)(pos / ps) * ps * CP_IXB;
     char* dp = ix + (size_t)pg * ps * CP_IXB;
-    const int off = pos % ps, t = threadIdx.x - CP_KVB / 16;   // threads 41..48: codes, 49: the scale (64 >= 50)
+    const int off = pos % ps, t = threadIdx.x - CP_KVB / 16;
+#if G6_MODEL_FLASH
+    // the pooled key this row completes (pos % 4 == 3, kvfmt.h): 512 B at its pool's place in the page
+    if ((pos & 3) != 3) return;
+    const int pk = off / 4 * 512;
+    if (t >= 0 && t < 32) reinterpret_cast<uint4*>(dp + pk)[t] = reinterpret_cast<const uint4*>(sp + pk)[t];
+#else
+    // threads 41..48: codes, 49: the scale (64 >= 50)
     if (t >= 0 && t < 8) reinterpret_cast<uint4*>(dp + off * 128)[t] = reinterpret_cast<const uint4*>(sp + off * 128)[t];
     if (t == 8) reinterpret_cast<float*>(dp + ps * 128)[off] = reinterpret_cast<const float*>(sp + ps * 128)[off];
+#endif
 }
-static_assert(CP_KVB / 16 + 9 <= CP_BACK_THREADS, "k_cp_pf_back: one thread per 16 B of a row and its index key");
+static_assert(CP_KVB / 16 + CP_IXK <= CP_BACK_THREADS, "k_cp_pf_back: one thread per 16 B of a row and its index key");
 // the R of the session whose prefill runs: its pages below it are replicated, the rest staged by owner
 inline int cp_pf_R(const Model& m) { return m.cp.pf_R ? m.cp.pf_R : m.cp.R; }
+// the first KV binding's args (Flash: the KDA layers have none)
+inline const G6Attn& cp_pf_args0(const Model& m)
+{
+    for (const Layer& y : m.layers)
+        if (y.ab.storage) return y.ab.args;
+    die("CP prefill: no attention binding");
+}
 inline size_t cp_pf_mla_bytes(const Model& m)
 {
-    const G6Attn& a = m.layers[0].ab.args;
+    const G6Attn& a = cp_pf_args0(m);
     for (const Layer& y : m.layers)
-        if (y.ab.args.table_size != a.table_size || y.ab.args.page_size != a.page_size) die("CP prefill: layers differ in table size");
+        if (y.ab.storage && (y.ab.args.table_size != a.table_size || y.ab.args.page_size != a.page_size)) die("CP prefill: layers differ in table size");
     if (a.page_size != 64) die("CP prefill: page size " + std::to_string(a.page_size) + ", staging needs 64");
     return (size_t)a.table_size * a.page_size * CP_KVB;
 }
@@ -1912,7 +1935,7 @@ inline size_t cp_pf_pool_bytes(const Model& m)
 {
     bool ix = false;
     for (const Layer& y : m.layers) ix = ix || y.ab.args.index_cache;
-    const G6Attn& a = m.layers[0].ab.args;
+    const G6Attn& a = cp_pf_args0(m);
     return cp_pf_mla_bytes(m) + (ix ? (size_t)a.table_size * a.page_size * CP_IXB : 0);
 }
 // layer i's index region offset in its pool while staged (0: the layer has no index keys, or an S2 run below R reads
@@ -1925,8 +1948,12 @@ inline size_t cp_pf_ixoff(const Model& m, int i)
 // fabric area, 2 x cp_pf_pool_bytes) and the identity table
 inline void cp_pf_alloc(Model& m, cudaStream_t st, char* region = nullptr)
 {
-    const G6Attn& a = m.layers[0].ab.args;
+    const G6Attn& a = cp_pf_args0(m);
     const size_t pool = cp_pf_pool_bytes(m);
+    m.cp.pf_use.assign(m.nl, -1);
+    m.cp.pf_nuse = 0;
+    for (int i = 0; i < m.nl; ++i)
+        if (m.layers[i].ab.storage) m.cp.pf_use[i] = m.cp.pf_nuse++;
     for (int k = 0; k < 2; ++k) m.cp.pf_pool[k] = region ? region + k * pool : dmalloc<char>(pool);
     m.cp.pf_ixoff = pool > cp_pf_mla_bytes(m) ? cp_pf_mla_bytes(m) : 0;
     m.cp.pf_ident = dmalloc<int>(a.table_size);
@@ -1954,7 +1981,8 @@ inline void cp_pf_enter(Model& m)
     {
         G6Attn& a = m.layers[i].ab.args;
         m.cp.pf_saved.push_back(a);
-        a.mla_cache = m.cp.pf_pool[(m.cp.pf_g0 + i) % 2]; a.block_table = m.cp.pf_ident; a.page_count = a.table_size; a.cp_nr = 0; a.cp_rank = 0;
+        if (m.cp.pf_use[i] < 0) continue;   // no KV binding (a Flash KDA layer)
+        a.mla_cache = m.cp.pf_pool[(m.cp.pf_g0 + m.cp.pf_use[i]) % 2]; a.block_table = m.cp.pf_ident; a.page_count = a.table_size; a.cp_nr = 0; a.cp_rank = 0;
         a.rt_page = nullptr; a.rt_group = nullptr;   // the staging pool's pages are not the pool's: no remote rows here
         if (m.cp.pf_ixon && a.index_cache) a.index_cache = (char*)a.mla_cache + m.cp.pf_ixoff;   // the staged index keys
 #ifdef DEC_S2
@@ -1969,7 +1997,7 @@ inline void cp_pf_exit(Model& m)
     if (!m.cp.pf_staged) die("CP prefill: exit without enter");
     for (int i = 0; i < m.nl; ++i) m.layers[i].ab.args = m.cp.pf_saved[i];
     m.cp.pf_staged = false;
-    m.cp.pf_g = m.cp.pf_g0 + m.nl;
+    m.cp.pf_g = m.cp.pf_g0 + m.cp.pf_nuse;
 }
 // layer i's stored latent of every rank (the saved CP args); loopback drivers only (one address space)
 inline CpPfSrc cp_pf_src(const std::vector<Model>& R, int i)
@@ -1985,7 +2013,8 @@ inline CpPfSrc cp_pf_src(const std::vector<Model>& R, int i)
     }
     return s;
 }
-inline int cp_pf_k(const Model& m, int i) { return (int)((m.cp.pf_g0 + i) % 2); }
+inline unsigned long long cp_pf_g(const Model& m, int i) { return m.cp.pf_g0 + m.cp.pf_use[i]; }
+inline int cp_pf_k(const Model& m, int i) { return (int)(cp_pf_g(m, i) % 2); }
 // layer i's pool <- every page with positions < start (first position of the earliest lane)
 inline void cp_pf_gather(Model& m, const CpPfSrc& s, int i, int start, cudaStream_t st)
 {
@@ -2130,7 +2159,7 @@ inline void cp_pf_net_init(Model& m, g6::Fabric& fabs, cudaStream_t st)
 {
     auto* n = new CpPfNet;
     n->fab = &fabs; n->bd = fabs.bulk_dev();
-    n->verify = knob::cp_pf_verify();
+    n->verify = knob::cp_pf_verify() && !G6_MODEL_FLASH;   // the hash covers GLM's index layout
     for (cudaEvent_t& e : n->done) G6RT_CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
 #if defined(G6_CP_PF_HASH2) && G6_CP_PF_HASH2
     n->hash2 = knob::cp_pf_hash2();   // unset / 1 = hash2, 0 = k_cp_pf_hash
@@ -2166,7 +2195,7 @@ inline void cp_pf_begin(Model& m, int i, int start, cudaStream_t st)
     CpPfNet& n = cp_pf_net(m);
     const G6Attn& a = m.cp.pf_saved[i];
     const int k = cp_pf_k(m, i), ps = a.page_size, Rp = cp_pf_R(m) / ps, np = (start + ps - 1) / ps, nr = g6nr::NR;
-    const unsigned long long g = m.cp.pf_g0 + i;
+    const unsigned long long g = cp_pf_g(m, i);
     G6RT_CK(cudaStreamWaitEvent(st, n.done[k], 0));    // my previous use of pool k (g - 2) is over (both lanes)
     const size_t ixoff = cp_pf_ixoff(m, i);
     cp_pf_fill_local(m, i, start, n.bd.error, st);   // before the hash and the doorbell read the pool
@@ -2196,6 +2225,11 @@ inline void cp_pf_begin(Model& m, int i, int start, cudaStream_t st)
         {
             const int rows = cp_pf_rows(lp, ps, start);
             j.ranges.push_back({base + lp * pb, (uint32_t)((size_t)rows * CP_KVB)});
+#if G6_MODEL_FLASH
+            // the page's pooled keys complete below start (a pool's 4 rows all < start), 512 B each
+            if (ixoff && rows >= 4)
+                j.ranges.push_back({base + ixoff + (size_t)lp * ps * CP_IXB, (uint32_t)((size_t)(rows / 4) * 512)});
+#else
             if (ixoff)                 // the page's index keys: the rows' codes, and their scales after the page's codes
             {
                 // ranges are whole 8-B words (fabric.cpp), so an odd row count also sends the scale of row `rows`, the
@@ -2205,6 +2239,7 @@ inline void cp_pf_begin(Model& m, int i, int start, cudaStream_t st)
                 j.ranges.push_back({ib, (uint32_t)((size_t)rows * 128)});
                 j.ranges.push_back({ib + (size_t)ps * 128, (uint32_t)((size_t)(rows + 1) / 2 * 8)});
             }
+#endif
         }
     j.post_flag = k; j.post_val = g + 1;
     n.fab->enqueue_bulk(std::move(j));
@@ -2214,7 +2249,7 @@ inline void cp_pf_wait(Model& m, int i, int start, cudaStream_t st)
 {
     CpPfNet& n = cp_pf_net(m);
     const int k = cp_pf_k(m, i);
-    const unsigned long long g = m.cp.pf_g0 + i;
+    const unsigned long long g = cp_pf_g(m, i);
     k_cp_pf_wait<<<1, 32, 0, st>>>(n.bd, k, g + 1, 0x63000c00u);
     if (n.verify)
     {
@@ -2243,7 +2278,7 @@ inline void cp_pf_end(Model& m, int i, cudaStream_t st)
 {
     CpPfNet& n = cp_pf_net(m);
     const int k = cp_pf_k(m, i);
-    const unsigned long long g = m.cp.pf_g0 + i;
+    const unsigned long long g = cp_pf_g(m, i);
     k_cp_pf_bell<<<1, 32, 0, st>>>(n.bd.doorbell + 2 + k, g + 1);
     G6RT_CK(cudaEventRecord(n.done[k], st));
     g6::Fabric::BulkJob j;
