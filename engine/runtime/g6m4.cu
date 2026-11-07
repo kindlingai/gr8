@@ -3182,13 +3182,22 @@ int main(int argc, char** argv)
             g6s2::NativeDispatch nd(nx, sc);
             g6s2::NativeHooks h;
             h.pool.pool = &pool;   // the driver grows, shrinks (workers) and releases runs on it itself
-            h.pool.free_pages = [&] { return pool.free_pages(); };
-            h.pool.room = [&] { return pool.room(); };
-            h.pool.reserve = [&](uint64_t rows, uint64_t worst, uint32_t r) { return pool.reserve(rows, worst, r); };
-            h.pool.digest = [&] { return pool.digest(); };
-            h.pool.fits = [&](uint64_t rows, uint64_t worst, uint32_t r) { return pool.fits(rows, worst, r); };
-            if (rtt && rtt->local)
-                h.pool.refusal = [&](uint64_t worst, uint32_t r) -> std::string {
+            // GLM's module (ModuleOps) and pool policy (PoolOps): their hooks as members over references to the locals they
+            // use. The locals outlive them and the service
+#define GLM_CAPTURES(X) X(R) X(m) X(D) X(DF) X(st) X(st_par) X(exec_f) X(fabf) X(in_f) X(out_f) X(plan) X(dfl_reuse) \
+    X(rtt) X(pool) X(kvt) X(kv_drained) X(kv_drain) X(bind_delay_rank) X(bind_delay_ms) X(dfl_owner) X(dfl_from) \
+    X(slot_prompt) X(slot_whole) X(s2_dstep) X(dfl_par_st) X(dfl_tl) X(dfl_t0) X(rt_told) X(rt_log) X(rt_layers) \
+    X(rt_gen) X(nd)
+            GLM_CAPTURES(G6S2_CAPTURE_TYPE)
+            uint32_t big = 0;   // GR8_CP_R2_BIG, with GR8_CP_R2
+#define GLM_POOL_ONLY(X) X(cap) X(rt_runs) X(cp_R2) X(big)
+#define GLM_POOL_CAPTURES(X) X(pool) X(rtt) X(m) X(D) GLM_POOL_ONLY(X)
+            GLM_POOL_ONLY(G6S2_CAPTURE_TYPE)
+            struct GlmPool : g6s2::ModuleCtx
+            {
+                GLM_POOL_CAPTURES(G6S2_CAPTURE_REF)
+                uint64_t on_digest() { return pool.digest(); }
+                std::string on_refusal(uint64_t worst, uint32_t r) {
                     const auto v = pool.split_view(worst, r);
                     if (!v) return "";
                     const auto [lo, hi, lofree, hifree] = *v;
@@ -3204,25 +3213,12 @@ int main(int argc, char** argv)
                         if ((*iv)[0] > (*iv)[2]) why += ": more than the lease holds (KV_ROWS size=), it never fits";
                     }
                     return why;
-                };
-            h.pool.stats = [&] { return pool.stats(); };
-            h.pool.runs = [&] { return pool.runs(); };
-            // GR8_S2_GROW=0: every run holds its worst case (prompt + max_tokens + guard) from admission, as before growth
-            h.pool.grow = knob::s2_grow();
-            if (pool.keeping())
-            {
-                h.pool.match = [&](const std::vector<int>& p, uint64_t rows, uint64_t worst, int limit, const CacheNamespace& ns, uint32_t r) {
+                }
+                g6s2::PoolHit on_match(const std::vector<int>& p, uint64_t rows, uint64_t worst, int limit, const CacheNamespace& ns, uint32_t r) {
                     return pool.match(p, rows, worst, limit, ns, r);
-                };
-                h.pool.take = [&](const g6s2::PoolHit& x, uint64_t rows, uint64_t worst, uint32_t r) { return pool.take(x, rows, worst, r); };
-            }
-            // GR8_CP_R2: up to GR8_CP_R2_BIG sessions past it run at GR8_CP_R (their decode reads no released rows below
-            // it); the others, and one the pool has no room for at GR8_CP_R, take GR8_CP_R2. A turn that continues a
-            // retained run keeps that run's R, since a hit never crosses Rs (kvman-rs Pool::match_prefix_r)
-            if (cp_R2)
-            {
-                const uint32_t big = (uint32_t)knob::cp_r2_big();
-                h.pool.r_rows = [&, big](const g6s2::Request& r, uint64_t rows, uint64_t worst, const std::vector<int>* prompt) -> uint32_t {
+                }
+                g6s2::Run on_take(const g6s2::PoolHit& x, uint64_t rows, uint64_t worst, uint32_t r) { return pool.take(x, rows, worst, r); }
+                uint32_t on_r_rows(const g6s2::Request& r, uint64_t rows, uint64_t worst, const std::vector<int>* prompt) {
                     if (worst <= (uint64_t)cp_R2) return 0;   // below both Rs: one layout
                     if (prompt)
                     {
@@ -3233,29 +3229,47 @@ int main(int argc, char** argv)
                         if (at_big != at_small) return at_big ? 0 : (uint32_t)cp_R2;
                     }
                     return pool.window_runs(0) < big && pool.fits(rows, worst, 0) ? 0 : (uint32_t)cp_R2;
-                };
-                if (R == 0) fprintf(stderr, "# rank 0: GR8_CP_R2 %d: up to %u sessions past it run at GR8_CP_R %d, the rest at %d\n", cp_R2, big, cp_R, cp_R2);
-                // a request that does not fit: a decoding session at GR8_CP_R takes GR8_CP_R2, and its pages between the two Rs
-                // below place go back to the pool (s2/pool.h shrink, the engine's half below)
-                h.pool.make_room = [&](const std::array<g6s2::Slot, g6s2::MAX_SESSIONS>& slots, const g6s2::Request&, uint64_t, uint64_t)
-                    -> std::optional<g6s2::Shrink> {
+                }
+                std::optional<g6s2::Shrink> on_make_room(const std::array<g6s2::Slot, g6s2::MAX_SESSIONS>& slots, const g6s2::Request&, uint64_t, uint64_t) {
                     for (const g6s2::Slot& sl : slots)
                         if (sl.phase == g6s2::Phase::Decode && !sl.req.r_rows && pool.shrinkable(sl.run, (uint32_t)cp_R2))
                             return g6s2::Shrink{sl.key, (uint32_t)cp_R2, pool.shrink(sl.run, (uint32_t)cp_R2)};
                     return std::nullopt;
-                };
+                }
+                std::vector<g6kv_tier_totals> on_tiers() { return pool.tiers(); }
+            };
+            GlmPool gp{{}, GLM_POOL_CAPTURES(G6S2_CAPTURE_ARG)};
+#undef GLM_POOL_CAPTURES
+#undef GLM_POOL_ONLY
+            using GP = GlmPool;
+            g6s2_pool_ops& po = h.pool.ops = g6s2::pol::table(gp, pool);
+            po.digest = g6s2::pol::digest<GP, &GP::on_digest>;
+            if (rtt && rtt->local) po.refusal = g6s2::pol::refusal<GP, &GP::on_refusal>;
+            po.status = true;
+            // GR8_S2_GROW=0: every run holds its worst case (prompt + max_tokens + guard) from admission, as before growth
+            po.grow = knob::s2_grow();
+            if (pool.keeping())
+            {
+                po.match = g6s2::pol::match<GP, &GP::on_match>;
+                po.take = g6s2::pol::take<GP, &GP::on_take>;
+            }
+            // GR8_CP_R2: up to GR8_CP_R2_BIG sessions past it run at GR8_CP_R (their decode reads no released rows below
+            // it); the others, and one the pool has no room for at GR8_CP_R, take GR8_CP_R2. A turn that continues a
+            // retained run keeps that run's R, since a hit never crosses Rs (kvman-rs Pool::match_prefix_r)
+            if (cp_R2)
+            {
+                big = (uint32_t)knob::cp_r2_big();
+                po.r_rows = g6s2::pol::r_rows<GP, &GP::on_r_rows>;
+                if (R == 0) fprintf(stderr, "# rank 0: GR8_CP_R2 %d: up to %u sessions past it run at GR8_CP_R %d, the rest at %d\n", cp_R2, big, cp_R, cp_R2);
+                // a request that does not fit: a decoding session at GR8_CP_R takes GR8_CP_R2, and its pages between the two Rs
+                // below place go back to the pool (s2/pool.h shrink, the engine's half below)
+                po.make_room = g6s2::pol::make_room<GP, &GP::on_make_room>;
             }
             if (kvt)
             {
-                h.pool.tiers = [&] { return pool.tiers(); };
-                h.pool.count = [&](const std::vector<int>& p, int64_t span, const CacheNamespace& ns) { return pool.count(p, span, ns); };
+                po.tiers = g6s2::pol::tiers<GP, &GP::on_tiers>;
+                po.count = true;
             }
-            // GLM's module (ModuleOps): its hooks as members over references to the locals they use. The locals outlive it and the service
-#define GLM_CAPTURES(X) X(R) X(m) X(D) X(DF) X(st) X(st_par) X(exec_f) X(fabf) X(in_f) X(out_f) X(plan) X(dfl_reuse) \
-    X(rtt) X(pool) X(kvt) X(kv_drained) X(kv_drain) X(bind_delay_rank) X(bind_delay_ms) X(dfl_owner) X(dfl_from) \
-    X(slot_prompt) X(slot_whole) X(s2_dstep) X(dfl_par_st) X(dfl_tl) X(dfl_t0) X(rt_told) X(rt_log) X(rt_layers) \
-    X(rt_gen) X(nd)
-            GLM_CAPTURES(G6S2_CAPTURE_TYPE)
             struct GlmModule : g6s2::ModuleCtx
             {
                 GLM_CAPTURES(G6S2_CAPTURE_REF)

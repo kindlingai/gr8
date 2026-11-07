@@ -36,10 +36,6 @@ struct Rank {
     NativeHooks hooks() {
         NativeHooks h;
         h.pool.pool = &pool;
-        h.pool.free_pages = [this] { return pool.free_pages(); };
-        h.pool.room = [this] { return pool.room(); };
-        h.pool.reserve = [this](uint64_t n, uint64_t worst, uint32_t r) { return pool.reserve(n, worst, r); };
-        h.pool.fits = [this](uint64_t n, uint64_t worst, uint32_t r) { return pool.fits(n, worst, r); };
         h.bind = [this](const Grant&) {
             std::function<void()> f;
             {

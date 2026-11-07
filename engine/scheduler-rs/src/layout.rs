@@ -206,6 +206,12 @@ impl Kind for crate::module::LpRow {
 impl Kind for crate::module::ModuleOps {
     const K: u64 = 6;
 }
+impl Kind for crate::pool_ops::PoolHit {
+    const K: u64 = 6;
+}
+impl Kind for crate::pool_ops::PoolOps {
+    const K: u64 = 6;
+}
 impl Kind for crate::control::wire::Notice {
     const K: u64 = 6;
 }
@@ -285,7 +291,14 @@ fn_kinds!(
     crate::module::PrefillSeqFn,
     crate::module::PackSeqFn,
     crate::module::LogprobFn,
-    crate::module::ModDflFn
+    crate::module::ModDflFn,
+    crate::pool_ops::MatchFn,
+    crate::pool_ops::TakeFn,
+    crate::pool_ops::U64OutFn,
+    crate::pool_ops::TiersFn,
+    crate::pool_ops::RefusalFn,
+    crate::pool_ops::RRowsFn,
+    crate::pool_ops::MakeRoomFn
 );
 
 /// The digest of every shared type's layout.
@@ -727,6 +740,25 @@ pub fn digest() -> u64 {
             gm_words,
             pen_rows,
             pen_sess
+        }
+    );
+    layout!(h, crate::pool_ops::PoolHit { skip, lcp, why, age, stored, tier, slot });
+    layout!(
+        h,
+        crate::pool_ops::PoolOps {
+            ctx,
+            r#match,
+            take,
+            digest,
+            tiers,
+            refusal,
+            r_rows,
+            make_room,
+            pool,
+            max_run_pages,
+            grow,
+            count,
+            status
         }
     );
     layout!(h, crate::control::wire::Notice { epoch, event, boundary, request, payload_hash, kind });

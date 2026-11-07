@@ -548,6 +548,36 @@ struct g6s2_module_ops {
     void* pen_rows;
     void* pen_sess;
 };
+// s2/pool_ops.h: a module's policy over its rank's pool (PoolOps). The service makes the plain calls on `pool` itself
+// (free pages, room, reserve, fits, count, stats, runs), each run held to max_run_pages. ctx, the return value and the
+// null members as in g6s2_module_ops. The calls run on the head's control thread (tiers also outside the event pause,
+// while no other pool call runs) and on the compute thread. prompt: n tokens (r_rows: has_prompt false without prefix
+// reuse). slots: MAX_SESSIONS of them. The C++ std::string and std::vector<g6kv_tier_totals> pass through.
+struct g6s2_pool_hit { int32_t skip, lcp; const char* why; uint64_t age; bool stored; uint32_t tier; int32_t slot; };  // pool.h PoolHit
+struct g6s2_str;
+struct g6s2_tiers;
+struct g6s2_pool_ops {
+    void* ctx;
+    // prefix reuse: the retained run (or parked slot) a prompt can continue, and claiming it as a grant
+    int32_t (*match)(void* ctx, const int32_t* prompt, size_t n, uint64_t rows, uint64_t worst, int32_t limit, const uint8_t* ns,
+                     uint32_t r, g6s2_pool_hit* out);
+    int32_t (*take)(void* ctx, const g6s2_pool_hit* h, uint64_t rows, uint64_t worst, uint32_t r, g6sch_run* out);
+    // the pool's state, compared across ranks at every event, and each tier's counters for status.s2
+    int32_t (*digest)(void* ctx, uint64_t* out);
+    int32_t (*tiers)(void* ctx, g6s2_tiers* out);
+    // why a stalled request does not fit (empty: no reason), the R its run takes, and a decoding session shrunk to the
+    // smaller R to make room (*made false: none)
+    int32_t (*refusal)(void* ctx, uint64_t worst, uint32_t r, g6s2_str* out);
+    int32_t (*r_rows)(void* ctx, const g6sch_request* req, uint64_t rows, uint64_t worst, const int32_t* prompt, size_t n,
+                      bool has_prompt, uint32_t* out);
+    int32_t (*make_room)(void* ctx, const g6sch_slot* slots, const g6sch_request* req, uint64_t rows, uint64_t worst, bool* made,
+                         g6sch_shrink* out);
+    void* pool;               // the rank's g6kv_pool (void: the layout digest needs the pointee's size)
+    uint32_t max_run_pages;   // the most pages a run may hold (0: no limit): fits refuses past it, room clamps to it
+    bool grow;                // runs grow on demand (the driver grows them before each round)
+    bool count;               // admissions count their prompts toward the block stores' prefixes (g6kv_count_namespaced)
+    bool status;              // status.s2 shows the growth totals and the live runs
+};
 
 // s2/bootstrap.h, control_io.h, control_protocol.h, control_channel.h, event_gate.h: the control links between the
 // ranks. Rust owns each link's socket (g6ctl_io, the C++ ControlIO's), the event gate, the head's and workers' event
@@ -793,6 +823,8 @@ constexpr uint64_t g6sch_layout_cpp() {
     G6SCH_TYPE(g6s2_drv_planner) G6SCH_FIELD(g6s2_drv_planner, ctx) G6SCH_FIELD(g6s2_drv_planner, admit) G6SCH_FIELD(g6s2_drv_planner, admit_pack) G6SCH_FIELD(g6s2_drv_planner, round) G6SCH_FIELD(g6s2_drv_planner, demote) G6SCH_FIELD(g6s2_drv_planner, promote) G6SCH_FIELD(g6s2_drv_planner, release) G6SCH_FIELD(g6s2_drv_planner, length) G6SCH_FIELD(g6s2_drv_planner, finished) G6SCH_FIELD(g6s2_drv_planner, active) G6SCH_FIELD(g6s2_drv_planner, inserted)
     G6SCH_TYPE(g6s2_lp_row) G6SCH_FIELD(g6s2_lp_row, lp) G6SCH_FIELD(g6s2_lp_row, rank) G6SCH_FIELD(g6s2_lp_row, n) G6SCH_FIELD(g6s2_lp_row, id) G6SCH_FIELD(g6s2_lp_row, tlp)
     G6SCH_TYPE(g6s2_module_ops) G6SCH_FIELD(g6s2_module_ops, ctx) G6SCH_FIELD(g6s2_module_ops, bind) G6SCH_FIELD(g6s2_module_ops, bind_request) G6SCH_FIELD(g6s2_module_ops, grown) G6SCH_FIELD(g6s2_module_ops, shrink) G6SCH_FIELD(g6s2_module_ops, retire) G6SCH_FIELD(g6s2_module_ops, retain) G6SCH_FIELD(g6s2_module_ops, park) G6SCH_FIELD(g6s2_module_ops, fence) G6SCH_FIELD(g6s2_module_ops, before_work) G6SCH_FIELD(g6s2_module_ops, drained) G6SCH_FIELD(g6s2_module_ops, resize) G6SCH_FIELD(g6s2_module_ops, flash_room) G6SCH_FIELD(g6s2_module_ops, bucket) G6SCH_FIELD(g6s2_module_ops, mode) G6SCH_FIELD(g6s2_module_ops, launch) G6SCH_FIELD(g6s2_module_ops, prefill) G6SCH_FIELD(g6s2_module_ops, prefill_seq) G6SCH_FIELD(g6s2_module_ops, prefill_pack) G6SCH_FIELD(g6s2_module_ops, logprob) G6SCH_FIELD(g6s2_module_ops, draft_lp) G6SCH_FIELD(g6s2_module_ops, dfl_ok) G6SCH_FIELD(g6s2_module_ops, dfl_start) G6SCH_FIELD(g6s2_module_ops, dfl) G6SCH_FIELD(g6s2_module_ops, gm_on) G6SCH_FIELD(g6s2_module_ops, gm_bits) G6SCH_FIELD(g6s2_module_ops, gm_words) G6SCH_FIELD(g6s2_module_ops, pen_rows) G6SCH_FIELD(g6s2_module_ops, pen_sess)
+    G6SCH_TYPE(g6s2_pool_hit) G6SCH_FIELD(g6s2_pool_hit, skip) G6SCH_FIELD(g6s2_pool_hit, lcp) G6SCH_FIELD(g6s2_pool_hit, why) G6SCH_FIELD(g6s2_pool_hit, age) G6SCH_FIELD(g6s2_pool_hit, stored) G6SCH_FIELD(g6s2_pool_hit, tier) G6SCH_FIELD(g6s2_pool_hit, slot)
+    G6SCH_TYPE(g6s2_pool_ops) G6SCH_FIELD(g6s2_pool_ops, ctx) G6SCH_FIELD(g6s2_pool_ops, match) G6SCH_FIELD(g6s2_pool_ops, take) G6SCH_FIELD(g6s2_pool_ops, digest) G6SCH_FIELD(g6s2_pool_ops, tiers) G6SCH_FIELD(g6s2_pool_ops, refusal) G6SCH_FIELD(g6s2_pool_ops, r_rows) G6SCH_FIELD(g6s2_pool_ops, make_room) G6SCH_FIELD(g6s2_pool_ops, pool) G6SCH_FIELD(g6s2_pool_ops, max_run_pages) G6SCH_FIELD(g6s2_pool_ops, grow) G6SCH_FIELD(g6s2_pool_ops, count) G6SCH_FIELD(g6s2_pool_ops, status)
     G6SCH_TYPE(g6ctl_notice) G6SCH_FIELD(g6ctl_notice, epoch) G6SCH_FIELD(g6ctl_notice, event) G6SCH_FIELD(g6ctl_notice, boundary) G6SCH_FIELD(g6ctl_notice, request) G6SCH_FIELD(g6ctl_notice, payload_hash) G6SCH_FIELD(g6ctl_notice, kind)
     G6SCH_TYPE(g6ctl_ack) G6SCH_FIELD(g6ctl_ack, notice) G6SCH_FIELD(g6ctl_ack, rank) G6SCH_FIELD(g6ctl_ack, state_hash) G6SCH_FIELD(g6ctl_ack, room)
     G6SCH_TYPE(g6ctl_commit) G6SCH_FIELD(g6ctl_commit, c) G6SCH_FIELD(g6ctl_commit, hold) G6SCH_FIELD(g6ctl_commit, has_resize) G6SCH_FIELD(g6ctl_commit, resize)

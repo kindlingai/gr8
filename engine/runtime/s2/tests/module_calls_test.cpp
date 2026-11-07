@@ -7,9 +7,9 @@
 // The service's plain pool calls (reserve, fits, room, count) are logged by an observer: a RunPool that hides the real
 // one's methods, which every header after pool.h names in its place. Not logged, because how many there are depends on
 // the clock: the pool reads of the head's status (free pages and the room read after it, stats, runs, tiers) and share
-// polls that find nothing. Each scenario runs twice, its module calls as std::function hooks and as a table
-// (ModuleOps). Each rank's transcript is hashed (FNV-1a). The hashes were recorded from the service before PoolOps, in
-// each shape.
+// polls that find nothing. Each scenario runs twice, its module calls and pool policy as std::function hooks and as
+// tables (ModuleOps, PoolOps). Each rank's transcript is hashed (FNV-1a). The hashes were recorded from the service
+// before PoolOps, in each shape.
 //   --dump   print every transcript
 // The generator is mt19937_64 with modulo ranges, and no call takes two draws as arguments. Host only.
 #include <array>
@@ -239,10 +239,6 @@ struct Fake {
         NativeHooks h;
         RunPool& p = *pool;
         h.pool.pool = &p;
-        h.pool.free_pages = [&p] { return p.free_pages(); };
-        h.pool.room = [&p] { return p.room(); };
-        h.pool.reserve = [&p](uint64_t rows, uint64_t worst, uint32_t r) { return p.reserve(rows, worst, r); };
-        h.pool.fits = [&p](uint64_t rows, uint64_t worst, uint32_t r) { return p.fits(rows, worst, r); };
         h.pool.digest = [this, &p] {
             uint64_t d = p.digest();
             for (const Parked& k : parked) d = (d ^ (uint64_t(k.on) + (uint64_t(k.pos) << 1))) * 0x100000001B3ull;
@@ -271,7 +267,7 @@ struct Fake {
             };
         }
         if (sc.reuse) {
-            h.pool.count = [&p](const std::vector<int>& pr, int64_t span, const g6rt::CacheNamespace& ns) { return p.count(pr, span, ns); };
+            h.pool.count = true;
             if (!sc.park) {
                 h.pool.retain = [this, &p](const Run& r, const g6rt::PrefixReuse& st, const g6rt::CacheNamespace& ns) {
                     tx("retain " + str(r) + " " + str(st) + " " + str(ns));
@@ -433,10 +429,11 @@ struct Fake {
     }
 };
 
-// the service's hooks with the module's calls moved into a table (ModuleOps) over `all`, as an adapter hands it over
-NativeHooks as_table(const NativeHooks& all, FnModule<NativeHooks>& m) {
+// the service's hooks with the module's calls and its pool policy moved into tables (ModuleOps, PoolOps) over `all`, as
+// an adapter hands them over
+NativeHooks as_table(const NativeHooks& all, FnModule<NativeHooks>& m, FnPool<PoolHooks>& p) {
     NativeHooks h;
-    h.pool = all.pool; h.pool.retain = nullptr; h.pool.park = nullptr;
+    h.pool.pool = all.pool.pool; h.pool.ops = p.ops();
     h.share = all.share; h.flash = all.flash;
     h.dfl_kv = all.dfl_kv; h.dfl_spec = all.dfl_spec; h.dsel = all.dsel; h.kstop = all.kstop; h.dfl_reuse = all.dfl_reuse; h.ngram = all.ngram;
     h.module = m.ops();
@@ -492,10 +489,14 @@ std::array<std::vector<std::string>, 2> run(const Scenario& sc, bool table, std:
     std::unique_ptr<Service> s[2];
     NativeHooks all[2] = {f0.hooks(), f1.hooks()};
     std::unique_ptr<FnModule<NativeHooks>> mods[2];
+    std::unique_ptr<FnPool<PoolHooks>> pools[2];
     try {
         for (unsigned r = 0; r < 2; ++r) {
-            if (table) mods[r] = std::make_unique<FnModule<NativeHooks>>(all[r]);
-            s[r] = std::make_unique<Service>(b[r], r ? worker_links : head_links, table ? as_table(all[r], *mods[r]) : all[r], 1);
+            if (table) {
+                mods[r] = std::make_unique<FnModule<NativeHooks>>(all[r]);
+                pools[r] = std::make_unique<FnPool<PoolHooks>>(all[r].pool);
+            }
+            s[r] = std::make_unique<Service>(b[r], r ? worker_links : head_links, table ? as_table(all[r], *mods[r], *pools[r]) : all[r], 1);
         }
     } catch (const std::exception& e) { error = sc.name + ": " + e.what(); return {}; }
     s[0]->quit_linger_ms = s[1]->quit_linger_ms = 300;

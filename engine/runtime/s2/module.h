@@ -35,6 +35,15 @@ template <class C, class F> int32_t guard(void* x, F&& f) noexcept {
     ModuleCtx* m = static_cast<ModuleCtx*>(x);
     try { f(*static_cast<C*>(m)); return 0; } catch (...) { m->err = std::current_exception(); return 1; }
 }
+// the caller's side: a call through f, and what the module threw (rc 1) rethrown. A missing call throws what calling an
+// empty std::function hook did
+template <class Fn, class... A> void call(void* ctx, Fn f, A... a) {
+    if (!f) throw std::bad_function_call();
+    if (!f(ctx, a...)) return;
+    std::exception_ptr& err = static_cast<ModuleCtx*>(ctx)->err;
+    if (!err) throw std::runtime_error("s2: a module call failed without an exception");
+    std::exception_ptr e = err; err = nullptr; std::rethrow_exception(e);
+}
 // one trampoline per call, over context C's member function F
 template <class C, void (C::*F)(const Grant&)> int32_t bind(void* x, const g6sch_grant* g) noexcept {
     return guard<C>(x, [&](C& c) { (c.*F)(*as<const Grant>(g)); });
@@ -118,14 +127,7 @@ int32_t dfl(void* x, const g6s2_dfl_req* r, const g6s2_sampling* s, g6s2_dfl_dra
 
 /// The caller's side of a table: each call through its pointer, and what the module threw rethrown.
 class Module {
-    // a missing call throws what calling an empty std::function hook did
-    template <class Fn, class... A> void call(Fn f, A... a) const {
-        if (!f) throw std::bad_function_call();
-        if (!f(o.ctx, a...)) return;
-        std::exception_ptr& err = static_cast<ModuleCtx*>(o.ctx)->err;
-        if (!err) throw std::runtime_error("s2: a module call failed without an exception");
-        std::exception_ptr e = err; err = nullptr; std::rethrow_exception(e);
-    }
+    template <class Fn, class... A> void call(Fn f, A... a) const { mod::call(o.ctx, f, a...); }
 public:
     g6s2_module_ops o{};
     Module() = default;
