@@ -27,8 +27,9 @@ order.
 Optional, every model: faster restarts. Put `GR8_GEN_CACHE=<dir>` in `EXTRA_ENV` on every box, a directory on a local
 disk ([ENV.md](ENV.md)). The loader then keeps the tensors it computes at load and reads them back on the next boot
 instead of computing them again. The first boot of an engine build writes them; a rebuild is a miss and writes them
-again, and the loader keeps the two newest builds' entries. The served bytes are the same. Measured: GLM-5.3 at TP=6,
-17.4 GB a rank, "engines ready" 93-96 s without it, 97 s on the boot that writes it, 20-21 s after.
+again, and the loader keeps the two newest builds' entries. The served bytes are the same. Measured: GLM-5.3 at TP=6
+(on the GLM TP6 team's cu-fastboot build, arms A+B, before this port), 17.4 GB a rank, "engines ready" 93-96 s
+without it, 97 s on the boot that writes it, 20-21 s after.
 DeepSeek-V4.1-Flash at TP=4, 79.6 GB a rank: 84 s without it, 110 s on the boot that writes it, 16 s after.
 
 ## 2. DeepSeek-V4.1-Flash (`ds41`): how many chats, and how long
