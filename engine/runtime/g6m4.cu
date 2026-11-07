@@ -1136,13 +1136,13 @@ int main(int argc, char** argv)
     // CP: env as m4sim (GR8_CP, GR8_CP_R, GR8_CP_S3, GR8_CP_MMAX). Own fabric `fabc` (cplayout.h variable
     // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
     const bool cp_on = knob::cp().value_or(!G6_MODEL_FLASH);   // Flash: off unless asked for
+    const int cp_R = (int)knob::cp_r();
+    const int cp_s3 = knob::cp_s3() ? 1 : 0;
 #if G6_MODEL_FLASH
     // Flash under --serve: prompts below R (serve_flash refuses longer ones) and no checkpoints yet
     if (cp_on && s2mode && flash_cache != g6s2::FlashCache::Off) die("Flash GR8_CP under --serve: not with GR8_GLM53F_CACHE yet");
     if (cp_on && s2mode && s2sess > 1 && (cp_R < 64 || cp_R >= cap)) die("Flash GR8_CP with several sessions: GR8_CP_R must be 64..--cap - 1");
 #endif
-    const int cp_R = (int)knob::cp_r();
-    const int cp_s3 = knob::cp_s3() ? 1 : 0;
     int cp_mmax = K + 1;
     for (int M : row_counts) cp_mmax = std::max(cp_mmax, M);
 #if G6_MODEL_FLASH
@@ -1427,7 +1427,7 @@ int main(int argc, char** argv)
         }
     // step 4d: CP prefill staging pools = the registered area of a bulk-mode fabric (prefill.cuh CpPfNet)
     g6::Fabric fabs;
-    const bool cp_pf = cp_on && MP;
+    const bool cp_pf = cp_on && MP && !G6_MODEL_FLASH;   // Flash: the prefill runs below R only, on the replicated prefix
     if (cp_pf)
     {
         g6::FabricConfig sc = cfg;

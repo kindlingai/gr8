@@ -473,13 +473,19 @@ int main(int argc, char** argv)
     // CP: GR8_CP=0|1 (default 1 in a CP build, 0 in the Flash build), GR8_CP_R (replicated prefix tokens, multiple of 64, default 0),
     // GR8_CP_S3=0|1 (default 1), GR8_CP_MMAX (CP fabric rows, default = the most rows of any step)
     const bool cp_on = knob::cp().value_or(!G6_MODEL_FLASH);   // Flash: off unless asked for
-#if G6_MODEL_FLASH
-    if (cp_on && s2mode) die("Flash GR8_CP: not with S2 serving yet (decode and the offline mode only)");
-#endif
     const int cp_R = (int)knob::cp_r();
     const int cp_s3 = knob::cp_s3();
+#if G6_MODEL_FLASH
+    if (cp_on && s2mode) die("Flash GR8_CP: not with --s2");
+    if (cp_on && MP)
+        for (const auto& p : plans)
+            if ((int)p.prompt.size() > cp_R) die("Flash --prefill with GR8_CP: a prompt longer than GR8_CP_R (the prefill runs below R only)");
+#endif
     int cp_mmax = mtp + 1;
     for (int M : row_counts) cp_mmax = std::max(cp_mmax, M);
+#if G6_MODEL_FLASH
+    cp_mmax = MX;   // as g6m4: a CP step may carry any decode step's rows
+#endif
 #ifdef DEC_S2
     // --s2 + GR8_CP_STEP_ROWS=n: as g6m4, the rounds whose step runs past R take at most n rows (s2/cp_rows.h) and the CP
     // loopback is sized for n. (An --s2 run's sessions stay below GR8_S2_BELOW <= R, so here the cap never engages.)
@@ -705,7 +711,7 @@ int main(int argc, char** argv)
 #if defined(G6_CP) && G6_CP
         if (cp_on)
             for (int c = 0; c < cp_colls.ncoll(); ++c) R[r].cp.vs.push_back(cp_L.vslot(c, r, cp_send[r], cp_recv[r], cp_bell[r], err));
-        if (cp_on && MP) cp_pf_alloc(R[r], st);     // step 4: prefill staging pools
+        if (cp_on && MP && !G6_MODEL_FLASH) cp_pf_alloc(R[r], st);     // step 4: prefill staging pools (Flash: none, it prefills below R)
 #endif
         R[r].graph = graph; R[r].in = in; R[r].out = out + r;
         loop.send[r] = f.send;
@@ -1279,7 +1285,7 @@ int main(int argc, char** argv)
 #if defined(G6_CP) && G6_CP
     // step 4 (prefill.cuh cp_pf_*): staged view around a prefill sub-batch; gather layer i before its first attention
     // block, copy the rows back after its last
-    const bool cp_pf = cp_on && MP;
+    const bool cp_pf = cp_on && MP && !G6_MODEL_FLASH;
     // negative control (gate4.sh): GR8_TEST_CP_PF_BREAK=gather|back skips that half of the staging (the gate must then FAIL)
     const std::string cp_break = knob::test_cp_pf_break().value_or("");
     auto cp_enter = [&]() { if (cp_pf) for (Model& m : R) cp_pf_enter(m); };
