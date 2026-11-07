@@ -44,6 +44,23 @@ int main(int argc,char**) {
     timing_end_chunk(s); assert(report(s,1).empty());
     std::puts("PASS default off: no ring/events/output");
 
+    timing_init(s,true,16);
+    timing_begin_chunk(s,9,4096,4096); timing_layer(s,3);
+    const auto serial=s.timing->serial;
+    { TimingDetailSpan span(s,TimingStage::Wait,s.st,0); }
+    assert(s.timing->serial==serial); // old TIMING alone has no new boundaries
+    s.wire.xt=reinterpret_cast<unsigned long long*>(uintptr_t(1)); // gate only; never dereferenced
+    { TimingDetailSpan span(s,TimingStage::Wait,s.st,0); work<<<1,32,0,s.st>>>(1000); span.finish(); span.finish(); }
+    { TimingDetailSpan span(s,TimingStage::Unpack,s.st,0); work<<<1,32,0,s.st>>>(1000); }
+    s.wire.xt=nullptr;
+    timing_end_chunk(s); CK(cudaStreamSynchronize(s.st));
+    auto detailed=report(s,9);
+    assert(detailed.find("chunks=1 measured=3 pending=0 dropped=0")!=std::string::npos);
+    assert(detailed.find("stage=wait group=0 stream=st")!=std::string::npos);
+    assert(detailed.find("stage=unpack group=0 stream=st")!=std::string::npos);
+    std::puts("PASS detailed boundaries need XTRACE; wait/unpack separate; finish idempotent");
+    timing_release(s);
+
     timing_init(s,true,8);
     std::atomic<bool> gate{false};
     CK(cudaLaunchHostFunc(s.st,block,&gate));

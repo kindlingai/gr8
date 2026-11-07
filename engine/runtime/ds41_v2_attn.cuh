@@ -165,6 +165,7 @@ inline void ds41_v2_attn_index(::ds41::v2::State& v, Ds41V2Attention& x, Model& 
 inline void ds41_v2_attention(::ds41::v2::State& v, Model& m, int i, const __nv_bfloat16* own_y, __nv_bfloat16* own_out)
 {
     using ::ds41::v2::Coll;
+    ::ds41::v2::TimingDetailSpan timer(v,::ds41::v2::TimingStage::Attention,v.st);
     auto* x = static_cast<Ds41V2Attention*>(v.attn);
     if (!x || i < 0 || i >= m.nl || x->wob[i].empty() || v.g.M > x->rows || v.g.Q > x->q ||
         v.g.nr != g6nr::NR || v.g.rank != m.rank || m.ds41_pack || m.ds_ns != 1)

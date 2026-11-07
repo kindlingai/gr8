@@ -115,7 +115,8 @@ inline mxtc::Args args(const Layer& w, Scratch& q, int M) {
     a.limit=w.limit; a.aq=q.aq; a.as=q.as; a.ypart=q.partial;
     return a;
 }
-inline cudaError_t up(const Geometry& g,const Layer& w,Scratch& q,cudaStream_t st) {
+inline cudaError_t up(const Geometry& g,const Layer& w,Scratch& q,cudaStream_t st,State* trace=nullptr) {
+    TimingDetailSpan dispatch(trace,TimingStage::Dispatch,st);
     cudaError_t e=cudaMemsetAsync(q.masks,0,NE*(MM/32)*sizeof(unsigned),st);
     if(e!=cudaSuccess)return e;
     ds41v2moe::k_import_routes<NE,TK,MM><<<(g.M*8+255)/256,256,0,st>>>(q.all_idx,q.all_wt,g.M,q.plan,q.masks);
@@ -124,6 +125,8 @@ inline cudaError_t up(const Geometry& g,const Layer& w,Scratch& q,cudaStream_t s
     if(q.resident_fc2)ds41v2moe::k_order_desc<NE,TK,MM><<<1,NE,0,st>>>(q.plan,q.order);
     ds41v2moe::k_relayout<true><<<(size_t(g.M)*H+255)/256,256,0,st>>>(q.all_q,q.record_q,g.M,H);
     if((e=cudaGetLastError())!=cudaSuccess)return e;
+    dispatch.finish();
+    TimingDetailSpan compute(trace,TimingStage::ExpertFc1,st);
     if(ds41_gemm_mx_tc(q.all_q,H,q.all_s,H/32,w.w13,w.sw13,q.sh13,2*I,g.M,2*I,H,st))return cudaErrorInvalidValue;
     if(ds41_sh_swiglu_q(q.sh13,2*I,I,w.limit,q.sh_q,KP,q.sh_s,KP/32,g.M,KP,st))return cudaErrorInvalidValue;
     const auto a=args(w,q,g.M);
@@ -131,7 +134,8 @@ inline cudaError_t up(const Geometry& g,const Layer& w,Scratch& q,cudaStream_t s
     mxtc::k_fc1_tc<H,I,DS41_TC_CW,DS41_TC_NTG1,DS41_TC_ST1,true><<<a.n_slots*(I/16/DS41_TC_CW)*a.gy1,DS41_TC_CW*32,SM,st>>>(a);
     return cudaGetLastError();
 }
-inline cudaError_t down_group(const Geometry& g,const Layer& w,Scratch& q,int c,cudaStream_t st) {
+inline cudaError_t down_group(const Geometry& g,const Layer& w,Scratch& q,int c,cudaStream_t st,State* trace=nullptr) {
+    TimingDetailSpan compute(trace,TimingStage::ExpertFc2,st,c);
     if(c<0||c>=COLUMN_GROUPS)return cudaErrorInvalidValue;
     const int col0=c*COLS;
     if(ds41_gemm_mx_tc(q.sh_q,KP,q.sh_s,KP/32,w.w2+size_t(col0)*KP,w.sw2+size_t(col0)*(KP/32),q.shared,COLS,g.M,COLS,KP,st))return cudaErrorInvalidValue;
@@ -141,6 +145,8 @@ inline cudaError_t down_group(const Geometry& g,const Layer& w,Scratch& q,int c,
         constexpr size_t RS=ds41v2moe::resident_smem<4,8,I>();
         ds41v2moe::k_fc2_resident<I,H><<<a.n_slots*(COLS/128),128,RS,st>>>(a,q.order);
     } else mxtc::k_fc2_tc<I,H,DS41_TC_W2,DS41_TC_WT,DS41_TC_TPC,DS41_TC_ST2,COLUMN_GROUPS><<<a.n_slots*a.gy2*a.os2,DS41_TC_W2*32,SM,st>>>(a);
+    compute.finish();
+    TimingDetailSpan combine(trace,TimingStage::Combine,st,c);
     ds41v2moe::k_combine_group<H,TK,MM,__nv_bfloat16><<<(size_t(g.padded())*COLS+255)/256,256,0,st>>>(q.plan,q.partial,q.shared,q.send[c],g.M,g.padded(),col0,COLS);
     return cudaGetLastError();
 }
@@ -156,24 +162,27 @@ __global__ void k_assemble(const __nv_bfloat16* a,const __nv_bfloat16* b,const _
 // buffers are independent: cs never consumes a buffer st may overwrite next.
 inline cudaError_t run(State& s,const Layer& w,Scratch& q,int kc=TK,const uint8_t* own_vflag=nullptr) {
     if(s.g.nr!=4 || !s.ffn_out || !s.y || !supported(w))return cudaErrorInvalidValue;
+    TimingDetailSpan dispatch(s,TimingStage::Dispatch,s.st);
     cudaError_t e=router_own(s.g,w,q,s.y,own_vflag,kc,s.st);
     if(e!=cudaSuccess)return e;
     const Segment seg[]={{q.own_q,q.all_q,H},{q.own_s,q.all_s,H/32},{q.own_idx,q.all_idx,TK*sizeof(int)},{q.own_wt,q.all_wt,TK*sizeof(float)}};
     all_gather(s,Coll::FfnIn,seg,4,s.st);
+    dispatch.finish();
     {
         TimingSpan timer(s,TimingStage::FfnUp,s.st);
-        if((e=up(s.g,w,q,s.st))!=cudaSuccess)return e;
+        if((e=up(s.g,w,q,s.st,&s))!=cudaSuccess)return e;
     }
     for(int c=0;c<COLUMN_GROUPS;++c) {
         {
             TimingSpan timer(s,TimingStage::FfnDown,s.st,c);
-            if((e=down_group(s.g,w,q,c,s.st))!=cudaSuccess)return e;
+            if((e=down_group(s.g,w,q,c,s.st,&s))!=cudaSuccess)return e;
         }
         fork(s,ffn_group(c));
         reduce_scatter(s,c,q.send[c],q.recv[c],COLS,s.cs);
         record_received(s,ffn_group(c));
     }
     join(s,ffn_group(COLUMN_GROUPS-1));
+    TimingDetailSpan assemble(s,TimingStage::Assemble,s.st);
     if(s.g.owned)k_assemble<<<(s.g.owned*H+255)/256,256,0,s.st>>>(q.recv[0],q.recv[1],q.recv[2],q.recv[3],s.ffn_out,s.g.owned);
     return cudaGetLastError();
 }

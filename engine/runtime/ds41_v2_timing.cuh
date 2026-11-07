@@ -10,7 +10,9 @@
 namespace ds41::v2 {
 enum class TimingStage {
     Chunk, AttnInAg, IndexAg, CandidatesAg, TailAg, EngramA2A, AttnA2A,
-    WoBOwn, WoBRemote, FfnAg, FfnUp, FfnDown, Rs, Join
+    WoBOwn, WoBRemote, FfnAg, FfnUp, FfnDown, Rs, Join,
+    Layer, Attention, Engram, Dispatch, ExpertFc1, ExpertFc2, Combine, Assemble,
+    PackPublish, Wait, Unpack, Reduce
 };
 inline const char* timing_stage_name(TimingStage s) {
     switch(s) {
@@ -28,6 +30,18 @@ inline const char* timing_stage_name(TimingStage s) {
     case TimingStage::FfnDown:return "ffn_down";
     case TimingStage::Rs:return "rs";
     case TimingStage::Join:return "join";
+    case TimingStage::Layer:return "layer";
+    case TimingStage::Attention:return "attention";
+    case TimingStage::Engram:return "engram";
+    case TimingStage::Dispatch:return "dispatch";
+    case TimingStage::ExpertFc1:return "expert_fc1";
+    case TimingStage::ExpertFc2:return "expert_fc2";
+    case TimingStage::Combine:return "combine";
+    case TimingStage::Assemble:return "assemble";
+    case TimingStage::PackPublish:return "pack_publish";
+    case TimingStage::Wait:return "wait";
+    case TimingStage::Unpack:return "unpack";
+    case TimingStage::Reduce:return "reduce";
     }
     return "unknown";
 }
@@ -162,11 +176,22 @@ inline void timing_report(State& s,uint64_t request,FILE* out=stderr) { if(s.tim
 struct TimingSpan {
     Timing* timing=nullptr;
     int slot=-1;
-    TimingSpan(State& s,TimingStage stage,cudaStream_t stream,int group=-1):timing(s.timing) {
-        if(timing)slot=timing->begin(stage,stream,stream==s.cs,group);
+    TimingSpan(Timing* t,TimingStage stage,cudaStream_t stream,bool comm,int group=-1):timing(t) {
+        if(timing)slot=timing->begin(stage,stream,comm,group);
     }
-    ~TimingSpan() { if(timing)timing->end(slot); }
+    TimingSpan(State& s,TimingStage stage,cudaStream_t stream,int group=-1)
+        :TimingSpan(s.timing,stage,stream,stream==s.cs,group) {}
+    void finish() { if(timing && slot>=0) { timing->end(slot); slot=-1; } }
+    ~TimingSpan() { finish(); }
     TimingSpan(const TimingSpan&)=delete;
     TimingSpan& operator=(const TimingSpan&)=delete;
+};
+// Extra stage boundaries are enabled only by the v2 transport trace, not by
+// the pre-existing timing knob alone. No new event launches on the off path.
+struct TimingDetailSpan : TimingSpan {
+    TimingDetailSpan(State* s,TimingStage stage,cudaStream_t stream,int group=-1)
+        :TimingSpan(s && s->wire.xt ? s->timing : nullptr,stage,stream,s && stream==s->cs,group) {}
+    TimingDetailSpan(State& s,TimingStage stage,cudaStream_t stream,int group=-1)
+        :TimingDetailSpan(&s,stage,stream,group) {}
 };
 } // namespace ds41::v2

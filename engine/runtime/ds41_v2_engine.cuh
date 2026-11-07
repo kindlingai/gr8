@@ -68,6 +68,7 @@ struct Ds41V2Engine {
     }
     void engram(Model& m,int i) {
         using namespace ::ds41::v2;
+        TimingDetailSpan timer(v,TimingStage::Engram,v.st);
         m.engram->set_dead(m.vis_n>0?m.vis_flag:nullptr);
         const int e=m.layers[i].l==geom::ENGRAM_L0?0:1;
         const int rc=m.engram->op_owned(&m,e,v.g.M,v.g.row0,v.g.owned,b.streams,v.st,
@@ -123,6 +124,7 @@ struct Ds41V2Engine {
             const bool cand=l==geom::CAND_SOURCE && idx && !ds41_idx_detail::cand_skipped(*idx,3);
             timing_layer(v,l);
             begin_layer(v,g,eg,geom::is_index_source(l),last&&!skip_late,cand);
+            TimingDetailSpan layer_timer(v,TimingStage::Layer,v.st);
             if(eg)engram(m,i);
             if(!prepared)prepare(m,i,false);
             ds41_v2_attention(v,m,i,v.y,v.attn_out);

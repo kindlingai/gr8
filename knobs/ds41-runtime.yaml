@@ -149,6 +149,21 @@ knobs:
       Experimental sequence-parallel prefill conductor for layers 0..20. Own-row residual state,
       a dedicated fabric and high-priority communication stream; late layers remain on the stock path.
       Needs TP4, one prefill lane and a 128-row late tail. Off leaves the stock path unchanged.
+  GR8_DS_PF_V2_XTRACE:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_XTRACE=1 and GR8_DS_PF_V2=1, trace the dedicated v2 fabric,
+      independently of GR8_XTRACE_PF. GPU producer, publish, peer-tail,
+      consume and join stamps accompany the existing proxy doorbell/post stamps.
+      Also enables v2 per-chunk timing and epoch/request/layer correlation on stderr,
+      with layer/attention/Engram/dispatch/FC1/FC2/combine/assemble boundaries and
+      separate pack-publication, peer wait, unpack and reduce event intervals.
+      Uses GR8_XTRACE_OUT/QUIT; retains the last 64 fabric epochs (one per v2
+      layer, including boot gathers), not a complete long request. Default 0
+      leaves v2's kernels, launches and timing setting unchanged.
   GR8_DS_PF_V2_TIMING:
     scope: local
     kind: flag

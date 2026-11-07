@@ -2,6 +2,7 @@
 #pragma once
 #include "ds41_v2.h"
 #include "ds41_v2_timing.cuh"
+#include "../comms/xtrace.h"
 #include "../knobs-rs/gr8_knobs.h"
 #include <cstdio>
 #include <cstdlib>
@@ -26,15 +27,45 @@ __device__ inline const char* peer(g6::FabricDev f, Seq epoch, int c, int rank) 
 __device__ inline Seq acquire(const Seq* p) {
     Seq x; asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(x) : "l"(p) : "memory"); return x;
 }
+// Only the traced specialization reads clocks or writes trace storage. The
+// default specialization retains the original kernels; no device-side branch.
+__device__ inline Seq trace_now() {
+    Seq t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t;
+}
+__device__ inline Seq* trace_record(g6::FabricDev f,Seq epoch,int c) {
+    return f.xt+((epoch%g6::XT_STEPS)*f.ncoll+c)*g6::XT_W;
+}
+__global__ void trace_produced(g6::FabricDev f,Seq epoch,int c) {
+    if(threadIdx.x)return;
+    auto* r=trace_record(f,epoch,c);
+    for(int i=0;i<g6::XT_W;++i)r[i]=0; // including stale optional peers/joins on wrap
+    r[g6::XT_PRODUCED]=trace_now();
+}
+__global__ void trace_stamp(g6::FabricDev f,Seq epoch,int c,int stage) {
+    if(!threadIdx.x)trace_record(f,epoch,c)[stage]=trace_now();
+}
+__device__ inline void trace_done(g6::FabricDev f,Seq epoch,int c) {
+    __syncthreads(); // traced only: last writer in every CTA, not only thread 0
+    if(!threadIdx.x)atomicMax(trace_record(f,epoch,c)+g6::XT_RED,trace_now());
+}
+template<bool Trace=false>
 __global__ void publish(g6::FabricDev f, Seq epoch, int c) {
     // Separate stream-ordered launch after every pack CTA has exited.
     if (!threadIdx.x) {
+        if constexpr(Trace)trace_record(f,epoch,c)[g6::XT_PUB]=trace_now();
         __threadfence_system();
         Seq* p = f.doorbell+c; const Seq v=g6::coll_seq(epoch,c,f.ncoll);
         asm volatile("st.release.sys.global.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
+        if constexpr(Trace) {
+            auto* r=trace_record(f,epoch,c); r[g6::XT_DB]=trace_now(); r[g6::XT_SEQ]=v;
+        }
     }
 }
+template<bool Trace=false>
 __global__ void wait(g6::FabricDev f, Seq epoch, int c, size_t bytes) {
+    if constexpr(Trace) {
+        if(!threadIdx.x)trace_record(f,epoch,c)[g6::XT_WAIT_BEGIN]=trace_now();
+    }
     const int p=threadIdx.x;
     if (p >= f.nr || p == f.rank) return;
     const Seq seq=g6::coll_seq(epoch,c,f.ncoll);
@@ -46,6 +77,7 @@ __global__ void wait(g6::FabricDev f, Seq epoch, int c, size_t bytes) {
             atomicCAS(f.error,0u,0x79000000u | (unsigned(c)<<8) | unsigned(p)); return;
         }
     }
+    if constexpr(Trace)trace_record(f,epoch,c)[g6::XT_TAIL+p]=trace_now();
 }
 // Copies one 16-byte wire unit, zero filling the part outside the valid rows.
 // Irregular rows (e.g. Q odd with 24-byte routing entries) use the byte path
@@ -78,6 +110,7 @@ __global__ void pack(g6::FabricDev f,Seq epoch,int c,Geometry g,Segments seg,boo
         }
     }
 }
+template<bool Trace=false>
 __global__ void unpack(g6::FabricDev f,Seq epoch,int c,Geometry g,Segments seg,bool scatter) {
     const size_t first=(size_t(blockIdx.x)*blockDim.x+threadIdx.x)*16;
     const size_t step=size_t(gridDim.x)*blockDim.x*16;
@@ -91,7 +124,9 @@ __global__ void unpack(g6::FabricDev f,Seq epoch,int c,Geometry g,Segments seg,b
             for(size_t i=first;i<n;i+=step) get16(dst,source+seg.w.offsets[s]+i,i,n);
         }
     }
+    if constexpr(Trace)trace_done(f,epoch,c);
 }
+template<bool Trace=false>
 __global__ void reduce(g6::FabricDev f,Seq epoch,int c,Geometry g,size_t stride,int cols,__nv_bfloat16* out) {
     for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<size_t(g.owned)*cols;i+=size_t(gridDim.x)*blockDim.x) {
         float sum=0.f;
@@ -101,6 +136,7 @@ __global__ void reduce(g6::FabricDev f,Seq epoch,int c,Geometry g,size_t stride,
         }
         out[i]=__float2bfloat16_rn(sum);
     }
+    if constexpr(Trace)trace_done(f,epoch,c);
 }
 inline Segments segments(const Geometry& g,const Segment* src,int count) {
     Segments p{}; p.w=wire_layout(g.Q,src,count);
@@ -132,7 +168,7 @@ inline void init(State& s,g6::Fabric& f,cudaStream_t st) {
         check(cudaEventCreateWithFlags(&s.received[c],cudaEventDisableTiming));
     }
     s.live=true;
-    timing_init(s,knob::ds_pf_v2() && knob::ds_pf_v2_timing());
+    timing_init(s,knob::ds_pf_v2() && (knob::ds_pf_v2_timing() || s.wire.xt));
 }
 inline void release(State& s) {
     if(!s.live) return;
@@ -146,35 +182,67 @@ inline void begin_layer(State& s,Geometry g,bool engram,bool index,bool tail,boo
     require(s.live && s.order.complete(),"previous layer has unissued collectives");
     require(g.M>0 && g.nr==s.wire.nr && g.rank==s.wire.rank,"geometry does not match fabric");
     s.g=g; ++s.epoch; s.order={layer_order(engram,index,tail,candidates),0};
+    if(s.wire.xt && s.timing)
+        std::fprintf(stderr,"# ds41_v2_xtrace rank=%d epoch=%llu request=%llu chunk=%u rows=%d layer=%d\n",
+            s.wire.rank,(unsigned long long)s.epoch,(unsigned long long)s.timing->request,
+            s.timing->chunk,g.M,s.timing->layer);
 }
 inline void end_layer(State& s) { require(s.order.complete(),"layer missing a collective"); }
 inline void fork(State& s,Coll c) {
+    if(s.wire.xt)detail::trace_produced<<<1,32,0,s.st>>>(s.wire,s.epoch,int(c));
     check(cudaEventRecord(s.produced[int(c)],s.st)); check(cudaStreamWaitEvent(s.cs,s.produced[int(c)],0));
 }
 inline void record_received(State& s,Coll c) { check(cudaEventRecord(s.received[int(c)],s.cs)); }
 inline void join(State& s,Coll c) {
     // group names the joined Coll id (AttnOut=7, Engram=6, Ffn3=11).
     TimingSpan timer(s,TimingStage::Join,s.st,int(c));
+    if(s.wire.xt)detail::trace_stamp<<<1,32,0,s.st>>>(s.wire,s.epoch,int(c),g6::XT_JOIN_BEGIN);
     check(cudaStreamWaitEvent(s.st,s.received[int(c)],0));
+    if(s.wire.xt)detail::trace_stamp<<<1,32,0,s.st>>>(s.wire,s.epoch,int(c),g6::XT_JOIN_END);
 }
 inline void all_gather(State& s,Coll c,const Segment* segments,int count,cudaStream_t st) {
     auto p=detail::segments(s.g,segments,count); detail::enqueue(s,c,p.w,false);
     const auto stage=c==Coll::AttnIn?TimingStage::AttnInAg:c==Coll::Index?TimingStage::IndexAg:
         c==Coll::Candidates?TimingStage::CandidatesAg:c==Coll::FfnIn?TimingStage::FfnAg:TimingStage::TailAg;
     TimingSpan timer(s,stage,st); // boot gathers have no active timing chunk
-    detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,false);
-    detail::publish<<<1,32,0,st>>>(s.wire,s.epoch,int(c));
-    detail::wait<<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
-    detail::unpack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,false);
+    if(s.wire.xt) {
+        detail::trace_produced<<<1,32,0,st>>>(s.wire,s.epoch,int(c));
+        TimingDetailSpan packed(s,TimingStage::PackPublish,st,int(c));
+        detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,false);
+        detail::publish<true><<<1,32,0,st>>>(s.wire,s.epoch,int(c));
+        packed.finish();
+        TimingDetailSpan waited(s,TimingStage::Wait,st,int(c));
+        detail::wait<true><<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
+        waited.finish();
+        TimingDetailSpan consumed(s,TimingStage::Unpack,st,int(c));
+        detail::unpack<true><<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,false);
+    } else {
+        detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,false);
+        detail::publish<<<1,32,0,st>>>(s.wire,s.epoch,int(c));
+        detail::wait<<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
+        detail::unpack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,false);
+    }
     check(cudaPeekAtLastError());
 }
 inline void all_to_all(State& s,Coll c,const Segment* segments,int count,cudaStream_t st) {
     auto p=detail::segments(s.g,segments,count); detail::enqueue(s,c,p.w,true);
     TimingSpan timer(s,c==Coll::AttnOut?TimingStage::AttnA2A:TimingStage::EngramA2A,st);
-    detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
-    detail::publish<<<1,32,0,st>>>(s.wire,s.epoch,int(c));
-    detail::wait<<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
-    detail::unpack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
+    if(s.wire.xt) {
+        TimingDetailSpan packed(s,TimingStage::PackPublish,st,int(c));
+        detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
+        detail::publish<true><<<1,32,0,st>>>(s.wire,s.epoch,int(c));
+        packed.finish();
+        TimingDetailSpan waited(s,TimingStage::Wait,st,int(c));
+        detail::wait<true><<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
+        waited.finish();
+        TimingDetailSpan consumed(s,TimingStage::Unpack,st,int(c));
+        detail::unpack<true><<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
+    } else {
+        detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
+        detail::publish<<<1,32,0,st>>>(s.wire,s.epoch,int(c));
+        detail::wait<<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
+        detail::unpack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
+    }
     check(cudaPeekAtLastError());
 }
 inline void reduce_scatter(State& s,int group,const __nv_bfloat16* all,__nv_bfloat16* own,int cols,cudaStream_t st) {
@@ -182,10 +250,22 @@ inline void reduce_scatter(State& s,int group,const __nv_bfloat16* all,__nv_bflo
     Segment seg{all,own,size_t(cols)*2}; auto p=detail::segments(s.g,&seg,1); const Coll c=ffn_group(group);
     detail::enqueue(s,c,p.w,true);
     TimingSpan timer(s,TimingStage::Rs,st,group);
-    detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
-    detail::publish<<<1,32,0,st>>>(s.wire,s.epoch,int(c));
-    detail::wait<<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
-    detail::reduce<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p.w.stride,cols,own);
+    if(s.wire.xt) {
+        TimingDetailSpan packed(s,TimingStage::PackPublish,st,int(c));
+        detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
+        detail::publish<true><<<1,32,0,st>>>(s.wire,s.epoch,int(c));
+        packed.finish();
+        TimingDetailSpan waited(s,TimingStage::Wait,st,int(c));
+        detail::wait<true><<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
+        waited.finish();
+        TimingDetailSpan consumed(s,TimingStage::Reduce,st,int(c));
+        detail::reduce<true><<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p.w.stride,cols,own);
+    } else {
+        detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
+        detail::publish<<<1,32,0,st>>>(s.wire,s.epoch,int(c));
+        detail::wait<<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
+        detail::reduce<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p.w.stride,cols,own);
+    }
     check(cudaPeekAtLastError());
 }
 inline void gather_weight(State& s,const void* source,size_t bytes,void* output) {
