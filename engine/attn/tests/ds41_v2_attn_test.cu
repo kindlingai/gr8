@@ -58,6 +58,30 @@ void wire_test() {
         printf("input mode=%d stride=%d ragged/padding PASS\n",mode,v2::input_stride(mode));
     }
 }
+void capacity_test() {
+    Arena a; const int M=8192,Q=2048,heads=16;
+    auto in=input(a,M,Q),out=input(a,M,Q);
+    auto* wire=a.alloc<uint8_t>(size_t(M)*v2::input_stride(2));
+    const bf16 one=bf16(1.f); const float fone=1.f;
+    CK(cudaMemcpy(in.qa+size_t(M)*QA-1,&one,2,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(in.kv0+size_t(M)*HD-1,&one,2,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(in.ckv+size_t(M)*HD-1,&fone,4,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(in.csc+size_t(M)*HD-1,&fone,4,cudaMemcpyHostToDevice));
+    v2::pack_input(in,wire,M,M,2,0);v2::unpack_input(wire,out,M,2,0);
+    require(val(host(out.qa+size_t(M)*QA-1,1)[0])==1.f,"8192 qa last row");
+    require(val(host(out.kv0+size_t(M)*HD-1,1)[0])==1.f,"8192 kv last row");
+    require(host(out.ckv+size_t(M)*HD-1,1)[0]==1.f,"8192 ckv last row");
+    require(host(out.csc+size_t(M)*HD-1,1)[0]==1.f,"8192 csc last row");
+    // Stock scratch carving used by the v2 all-row core/wo_a also covers row8191.
+    auto sc=scratch(a,M,heads);
+    CK(cudaMemcpy(sc.q+size_t(M)*heads*HD-1,&one,2,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(sc.o+size_t(M)*heads*HD-1,&one,2,cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(sc.oaq+size_t(M)*v2::output_width(heads)-1,"x",1,cudaMemcpyHostToDevice));
+    CK(cudaDeviceSynchronize());
+    printf("8192 input wire + stock all-row scratch: input_bytes=%zu scratch_bytes=%zu PASS\n",
+            v2::InputBuf::bytes(M,Q),Scratch::bytes(M,heads));
+}
+
 void projection_test() {
     Arena a; const int M=65,Q=17; Weights w{};w.wq_a=weight(a,QA,HID);w.wkv=weight(a,HD,HID);
     auto* ckv=a.alloc<bf16>(size_t(HD)*HID);auto* csc=a.alloc<bf16>(size_t(HD)*HID);
@@ -118,4 +142,4 @@ void output_test(int M) {
     }
 }
 }
-int main(){ ds41a::g_use_tc=true;test::wire_test();test::projection_test();test::output_test(65);test::output_test(128);test::output_test(2);CK(cudaGetLastError());puts("PASS v2 attention synthetic tolerance/layout suite; model quality and fabric speed NOT measured"); }
+int main(){ ds41a::g_use_tc=true;test::wire_test();test::capacity_test();test::projection_test();test::output_test(65);test::output_test(128);test::output_test(2);CK(cudaGetLastError());puts("PASS v2 attention synthetic tolerance/layout suite; model quality and fabric speed NOT measured"); }
