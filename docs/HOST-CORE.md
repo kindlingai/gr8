@@ -476,8 +476,8 @@ earlier boots' with the efcd row store too, so a gate needs no KV node.
 
 R5c landed. `g6s2_module_ops` (g6sched.h) is a module's table: `bind`, `bind_request`, `grown`, `shrink`, `retire`,
 `retain`, `park`, `fence`, `before_work`, `drained`, `resize`, `flash_room`, the step calls `bucket`, `mode`, `launch`,
-`prefill`, `prefill_seq`, `prefill_pack`, `logprob`, `draft_lp`, `dfl_ok`, `dfl_start`, `dfl`, and the grammar arena as
-data. `scheduler-rs` `module.rs` fixes its layout, and the layout digest covers it with `g6s2_sampling` and
+`prefill`, `prefill_seq`, `prefill_pack`, `logprob`, `draft_lp`, `dfl_ok`, `dfl_start`, `dfl`, and the grammar arena and
+the penalty tables as data. `scheduler-rs` `module.rs` fixes its layout, and the layout digest covers it with `g6s2_sampling` and
 `g6s2_lp_row`. A null member is a call the module does not have. Each call returns 0, or 1 when the module threw. The
 module's `ModuleCtx` holds the exception, and `Module` (`s2/module.h`), the caller's side, rethrows it. The core passes
 what it does not read as opaque pointers to the C++ objects (launch, payload, prefill parts, the output vector, request,
