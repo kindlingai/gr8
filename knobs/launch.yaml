@@ -624,6 +624,11 @@ options:
     doc: >-
       S2: while a session decodes, a prefill quantum takes at most this many rows on one lane (GR8_S2_DECODE_PF; a
       multiple of 64, at most --prefill)
+  S2_DECODE_ROUNDS:
+    scope: cluster
+    doc: >-
+      S2: while a prefill waits and sessions decode, this many decode rounds per prefill quantum instead of one
+      (GR8_S2_DECODE_ROUNDS, 0..64). GLM-5.3-Flash defaults to 32 at TP 1-2 (with S2_DECODE_PF 1024) and 8 at TP 3-4
   S2_ADMIT_HOLD:
     scope: cluster
     doc: >-

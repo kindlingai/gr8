@@ -299,6 +299,14 @@ GR8_GLM53F_PF_STAGE_ASYNC=$stage GR8_GLM53F_PF_SP=$sp GR8_GLM53F_PF_SP_X16=$sp"
   # GR8_PF_STRIPE at the engine default at TP=3 and TP=4 (on: large prefill writes use both rails, or at TP=3 the devices
   # on the other PCIe root); TP=4 8K prefill 2,965 -> 3,067 tok/s. TP=2 keeps it off
   [ "$TP" = 2 ] && ENGINE_ENV="$ENGINE_ENV GR8_PF_STRIPE=0"
+  # while sessions decode: S2_DECODE_ROUNDS decode rounds per prefill quantum, quanta of S2_DECODE_PF rows (#402).
+  # Without them a long prompt holds the other sessions to one decode round per 8,192-row quantum. TP=2, a 240K prompt
+  # beside seven 600-token requests: 32 rounds and 1,024 rows bring the short ones from 232 s to 65 s (alone ~40 s)
+  # and the long one from 201 s to 249 s. TP 3 and 4 are not measured: 8 rounds, whole quanta
+  local drounds=8 dpf=
+  [ "$TP" -le 2 ] && drounds=32 dpf=1024
+  dpf=${S2_DECODE_PF:-$dpf}
+  ENGINE_ENV="$ENGINE_ENV GR8_S2_DECODE_ROUNDS=${S2_DECODE_ROUNDS:-$drounds}${dpf:+ GR8_S2_DECODE_PF=$dpf}"
   ENGINE_ENV="$ENGINE_ENV ${EXTRA_ENV:-}"
 }
 
