@@ -732,7 +732,8 @@ inline void pf_kda_block(Model& m, FlashPrefill& P, int i, int M, cudaStream_t s
     flash_pf_prof().mark(2, st);
 }
 
-// DSA: the decode block per MX chunk; o_proj into m.sc.part[0] (decode slot mode off), copied to P.part[0]
+// DSA: the decode block per MX chunk (as launch_dsa_block, with the pre-rotated q_b / o_proj inputs); o_proj into
+// m.sc.part[0] (decode slot mode off), copied to P.part[0]
 inline void pf_dsa_block_p1(Model& m, FlashPrefill& P, int i, int M, int context, cudaStream_t st)
 {
     pf_need_fp32_xn(P, "pf_dsa_block_p1");
@@ -750,8 +751,11 @@ inline void pf_dsa_block_p1(Model& m, FlashPrefill& P, int i, int M, int context
         G6RT_CK(cudaMemcpyAsync(m.rsess, P.rsess + m0, r * sizeof(int), cudaMemcpyDeviceToDevice, st));
         if (b.x_in.n) bind::launch(b.x_in, st);
         else { bind::launch(b.q_a, st); bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); bind::launch(b.idx_g, st); }
+        const bool use_qb_rot = b.q_b_t.on && !b.q_b_t.rot;
         glue::k_rmsnorm_rows<__half><<<r, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, geom::RMS_EPS_FLASH, m.q_a_n, QA,
-                                                        b.xf_qa.on ? b.xf_qa.f16 : nullptr, b.xf_qa.on ? b.xf_qa.bf16 : nullptr);
+                                                        b.xf_qa.on ? b.xf_qa.f16 : nullptr, b.xf_qa.on ? b.xf_qa.bf16 : nullptr,
+                                                        use_qb_rot ? b.q_b_t.a.suh[0] : nullptr,
+                                                        use_qb_rot ? const_cast<u32*>(b.q_b_t.a.xa) : nullptr);
         bind::launch_q_b(b, st);
         bind::launch(b.idx_q, st);
         flash_pf_prof().mark(3, st);
@@ -759,6 +763,8 @@ inline void pf_dsa_block_p1(Model& m, FlashPrefill& P, int i, int M, int context
         const G6AttnStep s = dsa_step(m, r, context - M + m0 + r);
         G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
         flash_pf_prof().mark(4, st);
+        if (b.o_proj_t.on && !b.o_proj_t.rot)
+            dtr::launch_rot(b.o_proj_t.a.x, b.o_proj_t.a.ldx, b.o_proj_t.a.suh[0], const_cast<u32*>(b.o_proj_t.a.xa), b.o_proj_t.a.K, r, st);
         bind::launch(b.xf_attn, st);
         bind::launch_o_proj(b, st);
         G6RT_CK(cudaMemcpyAsync(P.part[0] + (size_t)m0 * HID, m.sc.part[0], (size_t)r * HID * 2, cudaMemcpyDeviceToDevice, st));

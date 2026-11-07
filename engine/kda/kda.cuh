@@ -12,6 +12,8 @@
 //       step (fp32 state recurrence) -> out (o_norm * sigmoid gate, BF16 fragments) -> o_proj.
 // Graph-capturable: no host sync, no allocation in reset/launch.
 #pragma once
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <cuda_runtime.h>
@@ -438,7 +440,11 @@ inline void launch_oproj(const KdaLayer& w, const uint16_t* OF, int M, void* par
     {
         dtr::Gemv g;
         const int dodt = odt == gv::O_BF16 ? dtr::O_BF16 : dtr::O_F32;
-        dtr::make_out(w.ot, M, reinterpret_cast<const __half*>(OH), w.nh * DK, nullptr, partial, HID, dodt, *dt, 192, 0, 1, g);
+        if (const char* e = dtr::make_out(w.ot, M, reinterpret_cast<const __half*>(OH), w.nh * DK, nullptr, partial, HID, dodt, *dt, 192, 0, 1, g))
+        {
+            fprintf(stderr, "kda o_proj trellis, %d rows: %s\n", M, e);
+            abort();
+        }
 #ifdef DEC_SLOT
         if (slot) g.a.slot = *slot;
 #endif
@@ -890,6 +896,12 @@ inline void launch_proj_in(const KdaLayer& w, const Args& a, float* P, const u32
             ta.part = dt->part; ta.cnt = dt->cnt; ta.ldy = pl.ld();
             ta.dtr_ctas = nblk * 3 * KS;
             ta.pa = pa;
+            // k_kda_proj_trellis stages its rotated x slice, tiles(M) x (HID / 16 / KS) x 64 words, in sm[4096]
+            if (!(xa && (mode == 1 || mode == 2)) && static_cast<long>(g6mx::tiles(M)) * (HID / 16 / KS) * 64 > 4096)
+            {
+                fprintf(stderr, "kda: GR8_GLM53F_KDA_PROJ_KS=%d at %d rows overflows the projection kernel's shared x table\n", KS, M);
+                abort();
+            }
             g6mx::nt_dispatch(g6mx::tiles(M), [&](auto N) {
                 constexpr int NTv = decltype(N)::value;
                 if (xa && mode == 1)
@@ -913,7 +925,11 @@ inline void launch_proj_in(const KdaLayer& w, const Args& a, float* P, const u32
         for (int s = 0; s < 3; ++s)
         {
             dtr::Gemv g;
-            dtr::make_out(*m3[s], M, x, HID, nullptr, P + pl.q() + s * dl, pl.ld(), dtr::O_F32, *dt, s * 64, 0, 1, g);
+            if (const char* e = dtr::make_out(*m3[s], M, x, HID, nullptr, P + pl.q() + s * dl, pl.ld(), dtr::O_F32, *dt, s * 64, 0, 1, g))
+            {
+                fprintf(stderr, "kda %c projection trellis, %d rows: %s\n", "qkv"[s], M, e);
+                abort();
+            }
             dtr::launch(g, st);
         }
     }

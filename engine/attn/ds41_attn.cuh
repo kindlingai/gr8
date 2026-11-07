@@ -1756,6 +1756,11 @@ inline void launch_attn(const AttnP& p, cudaStream_t st)
         cudaFuncSetAttribute(k_attn_cpa_split_t<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_CPA);
         init = true;
     }
+    if (p.heads % 16)   // one CTA = 16 heads: a remainder would skip the last heads
+    {
+        fprintf(stderr, "ds41 launch_attn: heads %d is not a multiple of 16\n", p.heads);
+        abort();
+    }
     const bool q = p.ckq != 0 && p.TK > 0;   // packed fp4 compressed rows: the _q kernels (same arithmetic, the rows dequantized in the gather)
     const dim3 g(p.n, p.heads / 16);
     if (p.floor > 0) {   // bounded replay range B (ds41_attn_set_win_floor): the _floor kernels; floor 0 runs the plain kernels

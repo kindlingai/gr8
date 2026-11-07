@@ -14,7 +14,8 @@ python3 fetch_ranks.py --out DIR --nr 6 --ranks 0,1,2 --widths MANIFEST.json|all
 - With --layout (bin/g6layout) the ranks fetch the halves the layout gives them, and every rank's index slices at
   the TP, which list them.
 - Progress is kept in DIR/.fetch/<file>.json (done ranges). A half inside a done range is not fetched again, so a
-  rerun, or a fetch for another TP or layout into the same DIR, takes only the halves DIR does not hold yet.
+  rerun, or a fetch for another TP or layout into the same DIR, takes only the halves DIR does not hold yet. A width
+  file that is missing or has the wrong size loses its journal, so all of its wanted ranges are fetched again.
 - --verify checks the xxhash64 of every wanted half once all are fetched (bin/g6load verify), and fetches the bad ones
   again once.
 - Each file's wanted ranges are allocated in offset order before the parallel fetch writes them, so a rank's halves
@@ -196,10 +197,22 @@ class Progress:
             os.replace(tmp, self.p)
 
 
+def drop_stale(out, name, size):
+    """Forget out's journal of width file `name` when the local file is missing or not `size` bytes (deleted or cut
+    by hand): the journal's ranges, the header's too, are not on disk then."""
+    local = os.path.join(out, name)
+    if not (os.path.isfile(local) and os.path.getsize(local) == size):
+        try:
+            os.remove(os.path.join(out, '.fetch', name + '.json'))
+        except FileNotFoundError:
+            pass
+
+
 def fetch_ranges(hub, out, path, size, ranges, workers, on_bytes=None):
     """Write the ranges of repo file `path` into the sparse local file of the same name. Returns bytes fetched.
     on_bytes(n) is called after each range lands."""
     local = os.path.join(out, os.path.basename(path))
+    drop_stale(out, os.path.basename(path), size)
     fd = os.open(local, os.O_RDWR | os.O_CREAT, 0o644)
     if os.fstat(fd).st_size != size:
         os.ftruncate(fd, size)
@@ -289,8 +302,8 @@ def plan_files(hub, nr, ranks, slices, man=None, allk=None, layers=None, layout=
             raise RuntimeError(f'{name}: not in {hub.repo}@{hub.rev}')
         hn = int.from_bytes(hub.get(where[name], 0, 8), 'little')
         rng = [(0, 8 + hn)] + rng
-        local = os.path.join(out, name) if out else None
-        if local and os.path.isfile(local) and os.path.getsize(local) == tree[where[name]]:
+        if out:
+            drop_stale(out, name, tree[where[name]])
             have = covered(Progress(out, name).done)
             rng = [r for r in rng if not have(*r)]
         if rng:

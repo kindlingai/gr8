@@ -463,7 +463,7 @@ struct Model
     std::vector<float> steering_alphas;     // [nl][profiles], 0 where a profile leaves the layer out
     std::vector<const float*> steering_slot_alpha; // [nl] device [profiles] alphas; empty with one profile
     steering::Scope steering_scope = steering::Scope::Full;
-    float* steering_part = nullptr;         // [MX][48], deterministic shared-scope finalize reductions
+    float* steering_part = nullptr;         // [MX][HB], deterministic shared-scope finalize reductions
     unsigned* steering_count = nullptr;     // [MX], shared across stream-ordered layer finalizers
 #if G6_MODEL_FLASH
     float *resid4 = nullptr, *hc_inv = nullptr, *hc_mix = nullptr, *hc_pre = nullptr;
