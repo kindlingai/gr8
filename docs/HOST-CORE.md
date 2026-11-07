@@ -508,6 +508,41 @@ pass unchanged. The CUDA files are not compiled here: a script compared every mo
 `scripts/host_tests.sh` passes, and GLM, Flash and DS41 build. Boot: TP4 GLM on the stock pool, main then R5c, the
 round logs byte-identical on all four ranks and the 24 T=0 replies matching.
 
+R5b2's decisions are frozen. `s2/admit.h` holds them as functions of their inputs: the notice target, the retry gate,
+the shrink, the grant, the recall and refusal lines, the ADMIT_HOLD drain and hold, and the idle tests. `service.h`
+calls them where the expressions were. `admit_vectors_test` records each over seeded inputs, and records the control
+loop's admission path over the Rust `AdmissionQueue` with scripted pool answers. That path covers grants, both stalls,
+shrinks, recalls, held chains, commands landing during a chain and resizes in flight. Its hashes match under GCC on
+x86_64 and clang on arm64. `scripts/host_tests.sh` passes on Linux, and GLM, Flash and DS41 build. Boot: TP4 GLM, R5c
+then this, the round logs byte-identical on all four ranks and the 24 T=0 replies matching.
+
+The loops call four kinds of C++ that stay C++ past R5: the pool policy (`PoolHooks`, until R8), `Sessions` (the
+emitters, the resp files, the terminal lines and the counters), the request checks that compile a grammar or read
+images, and what `retire_run` reads before it retains or parks a run (`Dispatch::rows`, the driver facade's emitted
+tokens and prompt). So R5b2 lands in three PRs:
+
+1. R5b2a, `PoolOps`: the pool policy becomes one C table, `g6s2_pool_ops`, as R5c did for the module. It holds the
+   calls that are policy: `match`, `take`, `digest`, `tiers`, `refusal`, `r_rows` and `make_room`, with `pool`, `grow`
+   and DS41's run clamp as data. The other members (`free_pages`, `room`, `reserve`, `fits`, `runs`, `stats`, `count`)
+   are one-line forwards to `RunPool` in every adapter, and the service calls the pool for them directly. Each
+   adapter's policy lambdas become member functions of a context struct. `module_calls_test` logs the forwards through
+   a test observer on the pool, against hashes recorded first.
+2. R5b2b, the head's control thread (workers keep `receive_events`): `controller`, `event` with its commit, `intake`,
+   `drain_admits`, `monitor` and the request maps. They call `admit.rs` (`admit.h` ported, against
+   `admit_vectors_test`), the pool, the pool table, the Rust queue, ingress, trace, status and channels, and a host
+   table for the request checks and `retire_run`. `Sessions::request` is pure and moves. `FlashLend` is already Rust
+   (`g6sch_lend_*`) and becomes the service's state. The state both threads touch (`progress_`, `resizing_`,
+   `stopping_`) moves into the Rust service, with C calls for the compute thread. The commit keeps its pool-call order,
+   which the workers replay: the cancel's retire, then `r_rows`, `match`, `fits`, an optional `make_room` and a second
+   fit, the queue's check, and in a grant `count`, `match`, then `take` or `reserve`. It reads the driver's state only
+   inside the event-boundary pause, and the Rust says so where it reads it.
+3. R5b2c, the compute thread: `compute`, the staged request, the commit's application and the step loop. `DriverHooks`
+   fold into the Rust service. `Sessions` and `Dispatch` stay C++ behind the host table until R9 and R8.
+
+Each one is checked by the round logs, the hold, drain and loopback tests, `module_calls_test` and a TP4 boot. From
+R5b2b on, `module_calls_test` also has a tight-pool scenario (a cancel of a live reused run, then an admission that
+fits only on the pages it freed, with a worker), and it and `admit_hold_drain_test` run under ASan and TSan.
+
 ### R6. Options, signatures and the fabric plan to Rust
 
 Moves `g6m4.cu:156-577` (about 20 model `#if`s, spec defaults, `--check-args`), the signature builders (`g6m4.cu:1919`,

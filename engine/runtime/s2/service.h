@@ -1,6 +1,7 @@
 // Host orchestration for g6m4's OPT-IN S2 adapter. NativeHooks must be backed by
 // the real TP4 pool and fc2 CUDA APIs; test pools never enable native readiness.
 #pragma once
+#include "admit.h"
 #include "bootstrap.h"
 #include "control_channel.h"
 #include "dispatch.h"
@@ -254,11 +255,7 @@ class Service {
         const auto boundary = held ? *held : progress_.boundary.load(); // first: the horizon below is for this boundary or a later one
         const auto horizon = progress_.horizon.load();
         require(boundary <= uint64_t(INT64_MAX) - NOTICE_MAX, "event boundary overflow");
-        // The notice lands at the first boundary whose work after the one in flight covers NOTICE_ROWS rows, so a
-        // prefill no longer waits out eight ~6 s quanta for a propagation that takes milliseconds (#61); late notices
-        // remain fatal. Clamped, so a torn read of the pair can only widen the target, never narrow it past the floor.
-        // A held boundary has no work in flight: every rank is stopped at it (event_gate.h before_work returns true).
-        const auto target = held ? *held : std::clamp(horizon, boundary + NOTICE_MIN, boundary + c_.scheduler.notice_max);
+        const auto target = admit::notice_target(boundary, horizon, held, c_.scheduler.notice_max);
         if (trace_)
             trace_.instant("notice", Trace::CONTROL, targ("request", command.request) + "," +
                            targ("kind", command.resize ? "resize" : command.admit ? "admit" : "cancel") + "," +
@@ -303,7 +300,7 @@ class Service {
                 };
                 try_fit();
                 // no room: a decoding session may take the smaller R, and this request then tries the room it gave up
-                if (!fits && native_.pool.make_room && live < c_.scheduler.limit())
+                if (admit::shrink(fits, bool(native_.pool.make_room), live, c_.scheduler.limit()))
                     if ((cm.shrink = native_.pool.make_room(s.slots(), req, rows, worst))) {
                         if (trace_)
                             trace_.instant("shrink", Trace::CONTROL, targ("request", request->id) + "," +
@@ -312,14 +309,14 @@ class Service {
                     }
                 const auto fit = queue_.check(s.revision(), live < c_.scheduler.limit(), fits, native_.pool.room());
                 require(fit.has_value(), "duplicate admission attempt without revision");
-                if (trace_ && fit->why != Stall::None && waited_ != request->id) {
+                if (trace_ && admit::wait_line(fit->why, waited_, request->id)) {
                     waited_ = request->id;
                     trace_.instant("wait", Trace::CONTROL, targ("request", request->id) + "," +
                                    targ("why", fit->why == Stall::Slots ? "slots" : "capacity") + "," +
                                    targ("requested", fit->requested) + "," + targ("room", fit->room) + "," +
                                    targ("live", live));
                 }
-                if (fit->why == Stall::Capacity && refused_ != request->id) {
+                if (admit::refusal_line(fit->why, refused_, request->id)) {
                     refused_ = request->id;   // once per request
                     if (reuse() && pr0 != prompts_.end())
                         fprintf(stderr, "# s2 reuse request %llu waits: %s retained %d lcp %d prompt %u\n", (unsigned long long)request->id,
@@ -332,20 +329,19 @@ class Service {
                 // borrow-idle: a request whose worst case passes the chunks every rank has online waits for a recall
                 const uint32_t short_of = fit->why == Stall::None && native_.flash.chunk_rows
                                               ? native_.flash.recall(worst, leader_->agreed_room()) : 0;
-                if (short_of) {
-                    if (recall_for_ != request->id) {
-                        recall_for_ = request->id; recall_t0_ = std::chrono::steady_clock::now();
-                        fprintf(stderr, "# s2 flash kv: request %llu (%llu rows) waits for a recall to %u chunks (%u online)\n",
-                                (unsigned long long)request->id, (unsigned long long)worst, short_of, leader_->agreed_room());
-                    }
-                    recall_ = short_of;
-                } else if (fit->why == Stall::None && recall_for_ == request->id) {
+                const auto note = admit::recall_note(fit->why, short_of, recall_for_, request->id);
+                if (note == admit::Recall::Begin) {
+                    recall_for_ = request->id; recall_t0_ = std::chrono::steady_clock::now();
+                    fprintf(stderr, "# s2 flash kv: request %llu (%llu rows) waits for a recall to %u chunks (%u online)\n",
+                            (unsigned long long)request->id, (unsigned long long)worst, short_of, leader_->agreed_room());
+                } else if (note == admit::Recall::Done) {
                     fprintf(stderr, "# s2 flash kv: request %llu admitted %lld ms after its recall began\n",
                             (unsigned long long)request->id, (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now() - recall_t0_).count());
                     recall_for_ = UINT64_MAX;
                 }
-                if (fit->why == Stall::None && !short_of) {
+                if (short_of) recall_ = short_of;
+                if (admit::grant(fit->why, short_of)) {
                     Run run{}; uint32_t skip = 0, restored = 0, counted = 0;
                     int parked = -1;   // park: the parked slot the prompt extends, which the grant takes
                     const auto pr = prompts_.find(request->id);
@@ -374,7 +370,7 @@ class Service {
                     }
                     if (got) cm.admit = Grant{parked >= 0 ? s.next_key({}, unsigned(parked)) : s.next_key(), *request, run, skip, restored, counted};
                 }
-                attempted_head_ = request->id; attempted_revision_ = s.revision() + 1;
+                attempted_head_ = request->id; attempted_revision_ = admit::attempted_revision(s.revision());
                 if (cm.admit) {
                     if (trace_)
                         trace_.instant("admit", Trace::CONTROL, targ("request", request->id) + "," +
@@ -385,8 +381,8 @@ class Service {
                     // first queue the ADMIT files that landed while this thread was inside the event chain (each
                     // event waits for every rank's ACK, ~8 ms); the loop reads cmd files only between events, so without
                     // this a burst written within 1 ms loses the hold after its 2nd grant and waits NOTICE_MAX boundaries
-                    if (admit_hold_ && live + 1 < c_.scheduler.limit()) drain_admits();
-                    hold = cm.hold = admit_hold_ && queue_.front() && live + 1 < c_.scheduler.limit();
+                    if (admit::drain(admit_hold_, live, c_.scheduler.limit())) drain_admits();
+                    hold = cm.hold = admit::hold(admit_hold_, queue_.front() != nullptr, live, c_.scheduler.limit());
                 }
             }
             return cm;
@@ -436,7 +432,8 @@ class Service {
             bool changed = false;
             if (native_.share && !resizing_.load() && std::chrono::steady_clock::now() >= next_share) {
                 next_share = std::chrono::steady_clock::now() + std::chrono::milliseconds(share_ms_);
-                if (const auto r = native_.share(progress_.resident.load() == 0 && queue_.size() == 0)) {
+                const unsigned resident = progress_.resident.load();
+                if (const auto r = native_.share(admit::share_idle(resident, queue_.size()))) {
                     fprintf(stderr, "# s2 share: tier %u to %llu segments (%llu blocks)\n", r->tier, (unsigned long long)r->segs,
                             (unsigned long long)r->slots);
                     resizing_.store(true);
@@ -445,14 +442,17 @@ class Service {
                 }
             }
             // borrow-idle: lend the chunks above flash.keep once the engine has been idle flash.idle_ms
-            if (native_.flash.chunk_rows && !resizing_.load())
-                if (const auto n = native_.flash.poll(progress_.resident.load() == 0 && queue_.size() == 0 &&
-                                                      progress_.retiring.load() == 0, std::chrono::steady_clock::now())) {
+            if (native_.flash.chunk_rows && !resizing_.load()) {
+                const unsigned resident = progress_.resident.load();
+                const size_t queued = queue_.size();
+                const unsigned retiring = progress_.retiring.load();
+                if (const auto n = native_.flash.poll(admit::lend_idle(resident, queued, retiring), std::chrono::steady_clock::now())) {
                     fprintf(stderr, "# s2 flash kv: idle, lending down to %u chunks\n", *n);
                     resizing_.store(true);
                     Command c; c.epoch = c_.scheduler.epoch; c.resize = Resize{FLASH_KV_TIER, *n, 0, 0};
                     event(c); changed = true;
                 }
+            }
             while (auto command = ingress_.next()) {
                 changed = true;
                 if (command->admit) {
@@ -465,7 +465,7 @@ class Service {
                 if (stopping_.load()) return;
             }
             if (const auto* front = queue_.front()) {
-                if (front->id != attempted_head_ || progress_.revision.load() != attempted_revision_) {
+                if (admit::retry(front->id, attempted_head_, progress_.revision.load(), attempted_revision_)) {
                     // Copy: event() may erase the map entry after all ACKs.
                     auto command = commands_.at(front->id); event(command); changed = true;
                 }
