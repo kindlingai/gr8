@@ -2,8 +2,10 @@
 
 A box runs one gr8 model at a time. To move four boxes between GLM-5.3 at TP=4 and DeepSeek-V4.1-Flash at TP=4
 ([the DeepSeek recipe](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)), stop one model and start
-the other on every box. Both models keep their files on the boxes, so a switch fetches nothing. Three settings make
-the switch fast. All three keep their data on each box's local disk.
+the other on every box. A two-box pair can also switch with GLM-5.3-Flash at TP=2;
+[the pair's numbers](#the-glm-53-flash-pair-tp2) are at the bottom of this page. Both models keep their files on
+the boxes, so a switch fetches nothing. Three settings make the switch fast. All three keep their data on each
+box's local disk.
 
 ## The settings
 
@@ -80,3 +82,30 @@ orchestration:
   disk; GLM-5.3 73 s, 4.8 GB a box. At TP=4 GLM-5.3 computes few tensors at load, so its gen cache saves little.
   The gen cache is keyed on the engine binary, so the first start after any image change also writes it. The warm
   numbers on this page are from the second start on.
+
+## The GLM-5.3-Flash pair (TP=2)
+
+A two-box pair can also switch between GLM-5.3-Flash at TP=2
+([the two-box recipe](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark)) and the TP=4 models above. The
+pair in the runs below was two DGX Sparks; the TP=4 models ran on their four-box set. Measured on 2026-11-07,
+warm, two runs each way, with GLM-5.3-Flash on a local build of its recipe at `319ed60` with gr8 `4ed9e7b` (the
+engine the recipe pins after its gr8 bump). Same columns as above; "Down" here is the parallel
+`docker compose down` that stops and removes the old model's containers:
+
+| Switch | Down | Wait after `up -d` returns | Total |
+|---|---|---|---|
+| GLM-5.3 to GLM-5.3-Flash (TP=2) | 4.9 s | 24.8 s | 31.3 s |
+| GLM-5.3-Flash (TP=2) to GLM-5.3 | 3.4-4.3 s | 69.8-70.6 s | 75.8 s (both runs) |
+| DeepSeek-V4.1-Flash to GLM-5.3-Flash (TP=2) | 3.2-4.2 s | 23.8-24.0 s | 28.5 / 29.3 s |
+| GLM-5.3-Flash (TP=2) to DeepSeek-V4.1-Flash | 3.1-3.6 s | 34.0-35.4 s | 39.7 / 40.2 s |
+
+- The pair's stop-and-remove on this engine build took 3.1-4.3 s. On the recipe's engine 32 commits back
+  (gr8 `16351164`), the same phase took about 13-14 s, most of it the fixed quit wait that gr8 #429 removed.
+- The pair's boot is loading its about 86 GB of weights and starting the engines: the pack loads 21.2 s into the
+  boot, the graphs capture at 22.1 s, and the engines report ready 23 s in. The first boot after the weights were
+  in place and the warm restart both waited 24.8 s (rounded) after `up -d` returned; the first boot's whole-run
+  total, with nothing to stop first, was 26.5 s. The runs kept the recipe's published setting, gen cache off.
+- Chats survive the pair's round trip. Four Flash chats, their next turn replayed after a full round trip to the
+  TP=4 model and back, answered in 3.1-5.9 s (total response time), all four with their context intact. These
+  test prompts are short, and the prompt cache's checkpoints land at 4,096-token multiples, so the replays read
+  their prompts fresh.
