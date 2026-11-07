@@ -99,7 +99,11 @@ RUN /xgrammar_build.sh /opt/xgrammar /xb && mkdir -p /out && cp /xb/libxgrammar.
 # engine-src copies only the engine sources, so edits to docs, scripts or the front end keep the engine layers cached.
 # This stage has no cargo: build.sh skips its cargo step and links the libg6load.a, libg6host.a and libgr8knobs.a
 # built above.
+# The compile cache (docs/BUILD-CACHE.md) is a cache mount in each engine stage, one id a stage, which CI keeps between
+# runs (ci.yml). A layer that has to run again then compiles only what its edit reaches. After the build the stage
+# deletes the entries the build did not read (a hit sets its entry's time), so the cache holds one build.
 FROM toolchain AS engine-src
+ENV GR8_NVCC_CACHE_DIR=/var/cache/gr8-nvcc
 WORKDIR /src
 COPY engine engine
 COPY tools/health/gpuprobe.cu tools/health/gpuprobe.cu
@@ -121,23 +125,35 @@ ENV GR8_XGRAMMAR=/opt/xgrammar GR8_XGRAMMAR_LIB=/opt/xgrammar-lib/libxgrammar.a
 # leaves it empty, for all seven widths (1 2 3 4 5 6 8), on main and on tags.
 FROM engine-src-glm AS engine
 ARG GR8_WIDTHS=
-RUN GR8_WIDTHS="$GR8_WIDTHS" GR8_TESTS=0 scripts/build.sh /out/bin \
+RUN --mount=type=cache,id=gr8-nvcc-fp8,target=/var/cache/gr8-nvcc \
+    touch "$GR8_NVCC_CACHE_DIR/.start" \
+ && GR8_WIDTHS="$GR8_WIDTHS" GR8_TESTS=0 scripts/build.sh /out/bin \
+ && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4 ! -name m4sim -exec rm -rf {} +
 
 # the test binaries build.sh makes after the GLM engine (gpuprobe and tr3_e4m3_test ship), on their own CI runner
 FROM engine-src AS engine-tests
 ARG GR8_WIDTHS=
-RUN GR8_WIDTHS="$GR8_WIDTHS" GR8_TESTS=only scripts/build.sh /out/bin \
+RUN --mount=type=cache,id=gr8-nvcc-tests,target=/var/cache/gr8-nvcc \
+    touch "$GR8_NVCC_CACHE_DIR/.start" \
+ && GR8_WIDTHS="$GR8_WIDTHS" GR8_TESTS=only scripts/build.sh /out/bin \
+ && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name gpuprobe ! -name tr3_e4m3_test -exec rm -rf {} +
 
 # GLM-5.3-Flash: g6m4_flash and m4sim_flash (MODEL=flash), TP 1, 2, 3 and 4
 FROM engine-src-glm AS engine-flash
-RUN MODEL=flash scripts/build.sh /out/bin \
+RUN --mount=type=cache,id=gr8-nvcc-flash,target=/var/cache/gr8-nvcc \
+    touch "$GR8_NVCC_CACHE_DIR/.start" \
+ && MODEL=flash scripts/build.sh /out/bin \
+ && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4_flash ! -name m4sim_flash -exec rm -rf {} +
 
 # GLM-5.3-Flash with the 4-bit KV latent (--kv-format int4, docs/FLASH.md): g6m4_flash-int4, TP 1, 2, 3 and 4
 FROM engine-src-glm AS engine-flash-int4
-RUN MODEL=flash KV_FORMAT=int4 scripts/build.sh /out/bin \
+RUN --mount=type=cache,id=gr8-nvcc-flash-int4,target=/var/cache/gr8-nvcc \
+    touch "$GR8_NVCC_CACHE_DIR/.start" \
+ && MODEL=flash KV_FORMAT=int4 scripts/build.sh /out/bin \
+ && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4_flash-int4 -exec rm -rf {} +
 
 # DeepSeek-V4.1-Flash-1017: g6m4_ds41 and m4sim_ds41 (MODEL=ds41), TP 4. build.sh builds it without request grammars, so
@@ -145,14 +161,20 @@ RUN MODEL=flash KV_FORMAT=int4 scripts/build.sh /out/bin \
 # ds41_build_flags.sh, which only this stage copies, so the other engine stages keep their cache.
 FROM engine-src AS engine-ds41
 COPY scripts/ds41_build_flags.sh scripts/ds41_build_flags.sh
-RUN MODEL=ds41 scripts/build.sh /out/bin \
+RUN --mount=type=cache,id=gr8-nvcc-ds41,target=/var/cache/gr8-nvcc \
+    touch "$GR8_NVCC_CACHE_DIR/.start" \
+ && MODEL=ds41 scripts/build.sh /out/bin \
+ && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4_ds41 ! -name m4sim_ds41 -exec rm -rf {} +
 
 # the 4-bit KV latent (--kv-format int4, docs/KV4.md): g6m4 alone, built with -DG6_KV4=1, as g6m4-int4 next to the fp8
 # engine, for every TP width
 FROM engine-src-glm AS engine-int4
 ARG GR8_WIDTHS=
-RUN GR8_WIDTHS="$GR8_WIDTHS" KV_FORMAT=int4 scripts/build.sh /out/bin \
+RUN --mount=type=cache,id=gr8-nvcc-int4,target=/var/cache/gr8-nvcc \
+    touch "$GR8_NVCC_CACHE_DIR/.start" \
+ && GR8_WIDTHS="$GR8_WIDTHS" KV_FORMAT=int4 scripts/build.sh /out/bin \
+ && find "$GR8_NVCC_CACHE_DIR" -type f ! -newer "$GR8_NVCC_CACHE_DIR/.start" -delete \
  && find /out/bin -mindepth 1 -maxdepth 1 ! -name g6m4-int4 -exec rm -rf {} +
 
 # rust-dist holds the Rust binaries only: CI builds them on a hosted arm runner, and its engine job links libg6load.a,

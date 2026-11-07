@@ -68,6 +68,10 @@ for j in 1 2 3 4 5 6 7 8; do "$C" g++ -O2 -c k.cpp -o k$j.o & done; wait
 for j in 2 3 4 5 6 7 8; do cmp -s k1.o k$j.o || fail "concurrent compiles of one key differ"; done
 "$C" g++ -O2 -c k.cpp -o k9.o;           [ "$(last)" = hit ] || fail "after concurrent compiles: not a hit"
 cmp -s k1.o k9.o || fail "concurrent compiles stored other bytes"
+# a hit sets its entry's time (output and stderr) to now, and leaves the other entries alone
+find "$GR8_NVCC_CACHE_DIR" -type f -exec touch -t 200001010000 {} +
+"$C" g++ -O2 -c k.cpp -o k10.o;          [ "$(last)" = hit ] || fail "k.cpp again: not a hit"
+[ "$(find "$GR8_NVCC_CACHE_DIR" -type f -newermt 2000-01-02 | wc -l)" = 2 ] || fail "a hit does not refresh its entry alone"
 # off: the compiler alone, nothing logged
 : > "$GR8_NVCC_CACHE_LOG"
 GR8_NVCC_CACHE=0 "$C" g++ -O2 -c a.cpp -o a.o
