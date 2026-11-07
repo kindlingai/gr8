@@ -85,7 +85,8 @@ redraws them). The model pages give each benchmark and its date.</sub>
 
 Each model's page has its results, how to start it and its known issues.
 
-**Three to six boxes** (GLM-5.3), with Docker Compose. On every box:
+**Three to six boxes** (GLM-5.3), with Docker Compose. First, on every box, turn off proactive memory compaction and
+open TCP ports 7340 and 7341 between the boxes ([What you need](#what-you-need)). Then, on every box:
 
 ```bash
 mkdir -p ~/gr8 && cd ~/gr8
