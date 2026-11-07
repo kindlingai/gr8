@@ -111,8 +111,8 @@ quantum to it (an `f` line, `s2/sessions.h progress`), so the timeout bounds one
 
 ## Context-parallel KV (`GR8_CP=1`, experimental)
 
-Off by default in the Flash build (`GR8_CP` unset is 0 here, 1 in GLM-5.3's). With `GR8_CP=1 GR8_CP_R=R` (in
-`EXTRA_ENV`; `engine_args.sh` sets `GR8_CP=0` before it), the 12 attention bindings keep the first `R` tokens on every
+Off by default in the Flash build (`GR8_CP` unset is 0 here, 1 in GLM-5.3's). With `EXTRA_ENV=GR8_CP=1` (the launcher
+sets `GR8_CP=0` and `GR8_CP_R=$SHARE_LIMIT` before it; add `GR8_CP_R=R` for another R), the 12 attention bindings keep the first `R` tokens on every
 rank, and each later 64-row page on one rank only, `(pos / 64) % TP`, as GLM-5.3's CP does (#384). A page holds 16 whole
 pools of the indexer, so a pool and its key live on one rank. Decode past R runs five stages per DSA layer
 (`engine/attn/flash_attn.cu`, `engine/runtime/flash_dsa.cuh` `launch_dsa_cp`):
