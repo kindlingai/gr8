@@ -3679,20 +3679,26 @@ int main(int argc, char** argv)
                     const long long t0 = g6s2::s2_wall_ms();
                     pool.write_limit(0);
                     kv_drain();   // reserve fails while store copies are queued (g6kvman.h): run them first
-                    // the whole pool in one reserve; when that does not fit (rows a run still holds), take it in
-                    // chunks, each evicting what it needs, until no chunk fits. Every rank makes the same calls
+                    // sweep the pool: --cap rows is one session's, so reserve at that size until the pool refuses, then
+                    // halve down to one page (64 rows, always tried last). Each reserve evicts what it needs through the
+                    // stores. The calls depend only on the pool's state, which every rank shares, so every rank makes
+                    // the same ones; no wall-clock stop (it could end ranks at different points). At most the pool's
+                    // pages plus one refusal per size
+                    const unsigned before = pool.kept_runs();
                     std::vector<g6s2::Run> held;
-                    try { held.push_back(pool.reserve((uint64_t)cap, (uint64_t)cap)); }
-                    catch (const std::exception&)
+                    std::string why;
+                    for (uint64_t rows = std::max<uint64_t>(64, (uint64_t)cap);; rows = std::max<uint64_t>(64, rows / 2))
                     {
-                        for (uint64_t rows = (uint64_t)cap / 2; rows >= 64; rows /= 2)
-                            for (;;)
-                            {
-                                kv_drain();
-                                try { held.push_back(pool.reserve(rows, rows)); }
-                                catch (const std::exception&) { break; }
-                            }
+                        for (;;)
+                        {
+                            kv_drain();
+                            try { held.push_back(pool.reserve(rows, rows)); }
+                            catch (const std::exception& e) { if (why.empty()) why = e.what(); break; }
+                        }
+                        if (rows == 64) break;
                     }
+                    fprintf(stderr, "# rank %d: s2 stores: quit sweep took %zu chunks, %u retained runs before, first refusal: %s\n",
+                            R, held.size(), before, why.c_str());
                     kv_drain();
                     for (const auto& r : held) pool.release(r);
                     kv_drain();
@@ -3700,8 +3706,8 @@ int main(int argc, char** argv)
                     uint64_t pages = 0;
                     uint64_t refused = 0;
                     for (const auto& t : pool.tiers()) { n += t.entries; pages += t.spilled_pages; refused += t.refused; }
-                    fprintf(stderr, "# rank %d: s2 stores: quit stored the pool's runs, %zu entries kept for the next engine (%llu pages spilled in all, %llu refused, %lld ms)\n",
-                            R, n, (unsigned long long)pages, (unsigned long long)refused, g6s2::s2_wall_ms() - t0);
+                    fprintf(stderr, "# rank %d: s2 stores: quit stored the pool's runs, %zu entries kept for the next engine (%llu pages spilled in all, %llu refused, %u retained runs left in the pool, %lld ms)\n",
+                            R, n, (unsigned long long)pages, (unsigned long long)refused, pool.kept_runs(), g6s2::s2_wall_ms() - t0);
                 }
                 catch (const std::exception& e) { fprintf(stderr, "# rank %d: s2 stores: drain at quit failed: %s\n", R, e.what()); }
             }

@@ -167,7 +167,7 @@ def cmd_down(argv):
     pid = supervisor_running(out)
     # the supervisor gives its engine quit_wait for an orderly quit (120 s when the quit stores the pool), as it
     # recorded at its start (a store given only on the up command line)
-    qw = sv.recorded_quit_wait(out, o)
+    qw = sv.recorded_quit_wait(out, o) if pid else sv.quit_wait(o)   # a dead supervisor's file is stale
     if pid and pid > 0:
         os.kill(pid, signal.SIGTERM)
         for _ in range(300 + 10 * qw):

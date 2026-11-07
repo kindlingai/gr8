@@ -1196,9 +1196,11 @@ fn a_run_whose_base_is_in_a_later_tier_comes_back_and_a_lost_base_drops_it() {
     let load = |with_b: bool| {
         let mut s = Stash::new(2, 64);
         s.add_tier(16, Keep::All, Some(Index::open(&a, "later").unwrap()));
+        s.index_whole(0); // a run's record is only in a whole index
         assert!(s.entries(0).is_empty(), "the run waits for its base");
         if with_b {
             s.add_tier(16, Keep::All, Some(Index::open(&b, "later").unwrap()));
+            s.index_whole(1);
         }
         let gone = s.loaded();
         (s.entries(0).iter().map(|e| e.id).collect::<Vec<_>>(), gone)
@@ -1207,4 +1209,78 @@ fn a_run_whose_base_is_in_a_later_tier_comes_back_and_a_lost_base_drops_it() {
     assert_eq!(load(false), (vec![], 1), "no tier brought the base: dropped");
     assert!(Index::open(&a, "later").unwrap().1.is_empty(), "and its record is gone");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// the quit sweep (g6m4.cu): reserve at --cap rows until refused (a live run still holds rows), then
+// halving sizes down to one page, which is always tried last, so a retained one-page run is stored too (pool of 12
+// pages: 768, 384, 192, 96, then 64 rows)
+#[test]
+fn the_quit_drains_fallback_ends_with_one_page_and_stores_the_last_retained_run() {
+    let mut r = Rank::new(12, 12, 12 * 64, &[(64, Keep::All)], 2);
+    let _live = r.pool.reserve(128, 128).unwrap();
+    let run = r.pool.reserve(64, 64).unwrap();
+    let tokens = toks(1, 64);
+    let list = r.pool.list(&run).unwrap().to_vec();
+    r.write(&list, 0, &tokens);
+    r.pool.retain(&run, finished(&tokens)).unwrap();
+    r.run_io();
+    r.pool.write_limit(0);
+    r.run_io();
+    let cap = 12 * 64u64;
+    let mut held = Vec::new();
+    // the sweep starts at --cap rows (one session's; here the whole 12-page pool, which the live run refuses)
+    let mut rows = cap.max(64);
+    loop {
+        loop {
+            r.run_io();
+            match r.pool.reserve(rows, rows) {
+                Ok(x) => held.push(x),
+                Err(_) => break,
+            }
+        }
+        if rows == 64 {
+            break;
+        }
+        rows = (rows / 2).max(64);
+    }
+    r.run_io();
+    for x in held {
+        r.pool.release(&x).unwrap();
+    }
+    r.run_io();
+    assert_eq!(r.pool.kept_runs(), 0, "no retained run left in the pool");
+    assert!(r.pool.stash().unwrap().entries(0).iter().any(|e| e.kind == Kind::Evicted && e.st.history == tokens));
+}
+
+// a store whose index was whole at the last boot and is keep=system now: the evicted runs it recorded are dropped at
+// load (slots and records), since a prefixes-only index never journals their restore
+#[test]
+fn a_whole_index_reopened_with_keep_system_drops_its_runs() {
+    let dir = std::env::temp_dir().join(format!("g6kv-tosystem-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let mut p = pool(12, 12, 12 * 64, 2);
+        p.add_tier(64, Keep::All, Some((dir.as_path(), "to-system"))).unwrap();
+        p.stash_mut().unwrap().index_whole(0);
+        let mut r = Rank::with(p, vec![64]);
+        let system = toks(1, 200);
+        for c in 2..4 {
+            let mut p = system.clone();
+            p.extend(toks(c, 150));
+            session(&mut r, &p, 20);
+        }
+        flush(&mut r);
+        r.run_io();
+        r.pool.io_done().unwrap();
+    }
+    let recorded = g6kvman::stash::Index::open(&dir, "to-system").unwrap().1;
+    assert!(recorded.iter().any(|e| !e.kind.prefix()), "the whole index recorded runs");
+    let mut p = pool(12, 12, 12 * 64, 2);
+    p.add_tier(64, Keep::Shared, Some((dir.as_path(), "to-system"))).unwrap();
+    p.tiers_loaded();
+    assert!(p.stash().unwrap().entries(0).iter().all(|e| e.kind.prefix()), "only prefixes load");
+    drop(p);
+    let left = g6kvman::stash::Index::open(&dir, "to-system").unwrap().1;
+    assert!(left.iter().all(|e| e.kind.prefix()) && !left.is_empty(), "the runs' records are gone, the prefixes stay");
+    let _ = std::fs::remove_dir_all(&dir);
 }

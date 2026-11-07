@@ -360,7 +360,19 @@ impl Stash {
 
     /// After the last add_tier: the index runs whose base came back in no tier are dropped (slots freed, records
     /// gone), so no later boot reads blocks reused since. Returns how many.
+    /// A tier whose index is not whole (keep=system now) drops the runs an earlier whole index recorded: it never
+    /// journals their lifecycle, so a kept one could later point at reused blocks.
     pub fn loaded(&mut self) -> usize {
+        for t in self.tiers.iter_mut().filter(|t| t.index.is_some() && !t.whole) {
+            let (gone, keep): (Vec<Entry>, Vec<Entry>) = std::mem::take(&mut t.entries).into_iter().partition(|e| !e.kind.prefix());
+            t.entries = keep;
+            for e in gone {
+                t.alloc.release(&e.slots);
+                if t.index.as_mut().is_some_and(|ix| ix.drop(e.id).is_err()) {
+                    self.index_errors += 1;
+                }
+            }
+        }
         let gone = std::mem::take(&mut self.waiting);
         for (ti, e) in &gone {
             let t = &mut self.tiers[*ti];
