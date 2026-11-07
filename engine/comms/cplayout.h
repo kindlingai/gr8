@@ -83,16 +83,22 @@ struct VLayout
 // order): per CP layer i, q(i) = q_abs all-gather, cand(i) = (score, pos) candidates all-gather (full-index layers only),
 // part(i, k) for k = 1..nr-1 = the partial (m, l, c) of head group (rank + k) % nr, single destination.
 // Capacities scale with mmax (the most verify rows a step may carry); a step with M rows sends M x row bytes.
+// Flash: a candidate is a pool (512 a row), and a layer without attention (KDA, attn[i] false) has no collectives.
 struct CpColls
 {
-    static constexpr int HEADS = geom::HEADS, KV_RANK = geom::KV_LORA, QK_DIM = geom::KVA, TOPK = 2048;
+#if G6_MODEL_FLASH
+    static constexpr int TOPK = geom::IDX_TOPK / geom::KPOOL;
+#else
+    static constexpr int TOPK = 2048;
+#endif
+    static constexpr int HEADS = geom::HEADS, KV_RANK = geom::KV_LORA, QK_DIM = geom::KVA;
     int nr = 0, nl = 0, mmax = 0;
     uint32_t q_row = 0, cand_row = 0, part_row = 0;   // payload bytes per verify row
     std::vector<int> q, cand, part;                   // [layer], [layer] (-1 = none), [layer * (nr - 1) + k - 1]
     std::vector<uint32_t> cap;
     std::vector<uint8_t> dst_k;
 
-    void make(const std::vector<bool>& full, int nr_, int mmax_)
+    void make(const std::vector<bool>& full, int nr_, int mmax_, const std::vector<bool>& attn = {})
     {
         nr = nr_; nl = (int)full.size(); mmax = mmax_;
         // rows sized for the WIDEST head group (NR=6: 11 of 11/11/11/11/10/10; NR=4: 16), rounded to 16 B so
@@ -107,6 +113,7 @@ struct CpColls
         auto add = [&](uint32_t row, int k) { cap.push_back(row * (uint32_t)mmax); dst_k.push_back((uint8_t)k); return (int)cap.size() - 1; };
         for (int i = 0; i < nl; ++i)
         {
+            if (!attn.empty() && !attn[i]) continue;
             q[i] = add(q_row, 0);
             if (full[i]) cand[i] = add(cand_row, 0);
             for (int k = 1; k < nr; ++k) part[(size_t)i * (nr - 1) + k - 1] = add(part_row, k);

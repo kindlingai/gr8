@@ -85,6 +85,7 @@ one GPU and makes its own synthetic weights.
 | `s2_steer_test` | S2 batched decode steers each row as solo decode does (S2 builds) |
 | `headgroup_test` | sparse prefill attention for more than 16 heads, against a CPU reference |
 | `kda_g9_det` | the G9 ON kernels give the same bits run to run |
+| `test_flash_cp` | Flash context-parallel decode at TP=2: the caches each rank holds, the merged index lists and the outputs against the replicated path (the lists and caches bit for bit, the outputs within the LSE merge's rounding) |
 
 `scripts/build.sh` runs `tr3_e4m3_test` (the trellis codebook decode, when a GPU is visible: every state of the mcg,
 mul1 and pmcgx codebooks against a host reference and the hashes the Rust and Python references check, and every lane
