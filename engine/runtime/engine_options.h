@@ -32,14 +32,14 @@
 namespace g6rt
 {
 
-// device-header constants the checks read; g6m4.cu asserts each against its source
+// device-header constants the checks read (module_info.h; g6m4.cu asserts each against its source)
 namespace eopt
 {
-constexpr int DFL_K = 7;                          // dflash.cuh dfl::K
-constexpr bool DFL_REP = 8 % g6nr::NR != 0;       // dflash.cuh dfl::REP (NKV = 8)
-constexpr int TP_SORT = 2048;                     // glue.cuh glue::TP_SORT
+constexpr int DFL_K = g6mod::INFO.dfl_drafts;
+constexpr bool DFL_REP = g6mod::INFO.dfl_rep != 0;
+constexpr int TP_SORT = g6mod::INFO.tp_sort;
 #if G6_MODEL_DS41
-constexpr int DS_MARKOV_MAXS = 8;                 // ds41_dspark_api.h ::ds41dsp::MARKOV_MAXS
+constexpr int DS_MARKOV_MAXS = g6mod::INFO.ds_markov_maxs;
 #endif
 }
 

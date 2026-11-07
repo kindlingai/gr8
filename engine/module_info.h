@@ -8,7 +8,7 @@
 #pragma once
 #include <stdint.h>
 
-#define G6_MODULE_ABI 2
+#define G6_MODULE_ABI 3
 
 enum G6ModelId { G6_MODEL_ID_GLM53 = 1, G6_MODEL_ID_GLM53F = 2, G6_MODEL_ID_DS41 = 3 };
 
@@ -42,6 +42,14 @@ struct G6ModuleInfo
     uint32_t caps;                   // G6ModuleCap bits
     int32_t dfl_block;               // DFlash2 block rows, the bonus row and its drafts (dflash.cuh dfl::B); the planner sizes by it
     int32_t pack_members;            // sessions in one prefill pack at most (ds41::pack::MAX_SEGMENTS); the scheduler sizes by it
+    // what the option parse (scheduler-rs options.rs) reads besides the above; g6m4.cu checks each against its device header
+    int32_t dfl_drafts;              // drafts a DFlash2 round verifies at most (dflash.cuh dfl::K)
+    int32_t dfl_rep;                 // 1: the drafter body runs replicated at this width (dfl::REP)
+    int32_t tp_sort;                 // top-p candidates all ranks hold together, at most (glue.cuh glue::TP_SORT)
+    int32_t kv4;                     // 1: the int4 KV build (G6_KV4)
+    int32_t xgrammar;                // 1: built with XGrammar (G6_GRAMMAR)
+    int32_t ds_markov_maxs;          // DS41: sessions of one DSpark markov launch (ds41dsp::MARKOV_MAXS); else 0
+    int32_t ds_block;                // DS41: the DSpark draft block rows (Ds41RoundLogic::BLOCK); else 0
 };
 
 #ifdef __cplusplus
@@ -89,6 +97,16 @@ constexpr G6ModuleInfo make()
     for (int i = 0; g6kv::NAME[i] && i < 15; ++i) m.kv_format[i] = g6kv::NAME[i];
     m.dfl_block = 8;      // dflash.cuh checks
     m.pack_members = 8;   // s2/ds41_prefill.h checks
+    m.dfl_drafts = 7;
+    m.dfl_rep = 8 % g6nr::NR != 0;   // NKV = 8
+    m.tp_sort = 2048;
+#if defined(G6_KV4) && G6_KV4
+    m.kv4 = 1;
+#endif
+#if defined(G6_GRAMMAR) && G6_GRAMMAR
+    m.xgrammar = 1;
+#endif
+    if (m.model == G6_MODEL_ID_DS41) { m.ds_markov_maxs = 8; m.ds_block = 5; }
     switch (m.model)
     {
     case G6_MODEL_ID_DS41: m.caps = G6_CAP_MTP0 | G6_CAP_PACK | G6_CAP_PARK | G6_CAP_PROMPT_DECODE | G6_CAP_DSPARK; break;
