@@ -360,7 +360,7 @@ inline bool dsa_cp(const Model& m, int context)
 // rows at positions m.pos[0..M-1], context = last position + 1 (plain form; the graph form reads the step cell).
 // phase (a step past R with GR8_CP, m4sim's loopback): launch_dsa_cp's phase; 0 also runs the projections, 2 o_proj and the
 // publish. -1 = the whole block
-inline void launch_dsa_block(Model& m, int i, int M, int context, cudaStream_t st, int phase = -1)
+inline void launch_dsa_block(Model& m, int i, int M, int context, cudaStream_t st, int phase)
 {
     Layer& y = m.layers[i];
     if (!y.built[M]) die("launch_dsa_block: bind_dsa_layer did not run for layer " + std::to_string(y.l));

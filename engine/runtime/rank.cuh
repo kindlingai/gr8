@@ -630,7 +630,7 @@ inline void launch_embed_flash(Model&,int,cudaStream_t);
 inline void launch_consume_flash_draft(Model&,int,int,cudaStream_t);
 inline void launch_consume_mhc(Model&,int,int,cudaStream_t);
 inline void launch_kda_block(Model&,int,int,cudaStream_t);
-inline void launch_dsa_block(Model&,int,int,int,cudaStream_t);
+inline void launch_dsa_block(Model&,int,int,int,cudaStream_t,int phase=-1);
 inline void launch_moe_block(Model&,int,int,cudaStream_t);
 inline void launch_dense_block(Model&,int,int,cudaStream_t);
 inline void launch_step_flash(Model&,int,int,cudaStream_t,int,int,const std::function<void(int,int)>&);
