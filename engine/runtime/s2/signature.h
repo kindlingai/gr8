@@ -2,16 +2,18 @@
 // options, knobs or loaded files would plan differently refuse to start instead of diverging. One format per model.
 // SigInputs holds what each format reads, including values main has only after the load (the checkpoint store's
 // blocks, the vision tower's id, the QO table size) and the strings other builders make (knob::signature(),
-// s2::ngram_sig, s2::kstopb_sig, s2::DSelTable::str). Host only.
+// s2::ngram_sig, s2::kstopb_sig, s2::DSelTable::str). The formats are engine/scheduler-rs src/signature.rs; this is the
+// facade over it. Host only.
 #pragma once
 #include <cstdint>
 #include <string>
 #include "../ds41_vision_id.h"
+#include "../../scheduler-rs/g6sched.h"
 
 namespace g6s2
 {
 
-enum class SigModel { Glm, Flash, Ds41 };
+enum class SigModel { Glm, Flash, Ds41 };   // signature.rs SIG_GLM, SIG_FLASH, SIG_DS41
 
 struct SigInputs
 {
@@ -67,65 +69,25 @@ struct SigInputs
 
 inline std::string runtime_signature(const SigInputs& in)
 {
-    if (in.model == SigModel::Flash)
-    {
-        std::string s = "flash solo cap " + std::to_string(in.cap) + " layers " + in.layers_s +
-            " mp " + std::to_string(in.MP) + " lanes " + std::to_string(in.lanes) + " mtp " + std::to_string(in.mtp) +
-            " chunk " + std::to_string(in.chunk) + " cands " + std::to_string(in.nc) + " set " + in.set_id +
-            (in.dfl ? " dflash k " + std::to_string(in.dfl_k) : std::string()) +
-            (in.dfl_reuse ? " dflreuse " + std::to_string(in.dfl_reuse) + "/" + std::to_string(in.dfl_reuse_min) : std::string()) +
-            (in.s2sess > 1 ? " sessions " + std::to_string(in.s2sess) + " split " + std::to_string(in.gsplit) : std::string()) +
-            in.knobs;
-        // every rank must keep the same checkpoint entries: the mode, the store's blocks and whether they persist
-        if (!in.ckpt.empty())
-            s += " ckpt " + in.ckpt + " blocks " + std::to_string(in.ckpt_blocks) + (in.ckpt_persist ? " persist" : "");
-        return s;
-    }
-    if (in.model == SigModel::Ds41)
-    {
-        std::string s = std::string(in.s2sess > 1 ? "ds41 sessions " + std::to_string(in.s2sess) : std::string("ds41 solo")) +
-            " cap " + std::to_string(in.cap) + " layers " + in.layers_s + " mtp " + std::to_string(in.ds_mtp) +
-            " chunk " + std::to_string(in.chunk) + " cands " + std::to_string(in.nc) + " set " + in.set_id +
-            (in.dfl ? " dflash k " + std::to_string(in.dfl_k) : std::string()) +
-            " shtc " + std::to_string(in.sh_tc ? 1 : 0) +
-            (in.l2hint ? " l2h " + std::to_string(in.l2hint) : std::string()) +
-            (in.fc2stg ? std::string(" stg 1") : std::string()) +
-            (in.fc1bstg ? std::string(" fc1bstg 1") : std::string());
-        if (in.c8_pack) s += " c8pack 1";
-        if (in.sess_drafts) s += " sessdrafts 1";
-        if (in.pf_lanes == 2) s += " pflanes 2";
-        if (in.tk_decode != in.tk_main) s += " tkmain " + std::to_string(in.tk_main) + " tkdecode " + std::to_string(in.tk_decode);
-        if (in.idx_pipe_b) s += " idxpipeb 1";
-        if (in.idx_q_trig) s += " idxqtrig 1";
-        if (in.idx_pipe_qr) s += " idxpipeqr 1";
-        if (in.reuse) s += " reuse 1";
-        // with the tower, " vision <file id>" (header and size agreement, not tensor data); a rank without the file
-        // boots text-only and refuses beside ranks with it
-        s += ds41v::signature(in.vis_on, in.vis_id);
-        return s + in.knobs;
-    }
-    return "g6m4 s2 below " + std::to_string(in.s2_below) + " cap " + std::to_string(in.cap) + " layers " + in.layers_s +
-        " mp " + std::to_string(in.MP) + " lanes " + std::to_string(in.two ? 2 : 1) + " mtp " + std::to_string(in.mtp) + " chunk " +
-        std::to_string(in.chunk) + " cands " + std::to_string(in.nc) + " split 3 own " + std::to_string(in.pf_own) +
-        " qpctx " + std::to_string(in.pf_qp ? in.qp_ctx : 0) + " qpmin " + std::to_string(in.pf_qp ? in.qp_min : 0) +
-        (in.set_id.empty() ? "" : " set " + in.set_id) + (in.grammar ? " grammar" : "") +
-        (in.dfl_reuse ? " dflreuse " + std::to_string(in.dfl_reuse) + "/" + std::to_string(in.dfl_reuse_min) : "") + in.ngram +
-        (in.kstop_mode ? " kstop " + std::to_string(in.kstop_mode) + " kmax " + std::to_string(in.kstop_kmax) + " tau " +
-                         std::to_string(in.kstop_tau[1]) + "," + std::to_string(in.kstop_tau[2]) + "," + std::to_string(in.kstop_tau[3]) +
-                         " seed3 " + std::to_string(in.kstop_seed3) : "") +
-        (in.draft_par ? " draftpar " + std::to_string(in.draft_par) : "") +
-        (in.qs_mode ? " qasplit " + std::to_string(in.qs_mode) : "") +
-        (in.iq_split ? " idxqsplit 1" : "") + (in.mtp_split ? " mtpsplit 1" : "") +
-        (in.dhead_on ? " dheadi4 " + std::to_string(in.dhead_tpc) + "x" + std::to_string(in.dhead_ks) : "") +
-        (in.mtp_last ? " mtplast 1" : "") + (in.dhead2 ? " dhead2 " + std::to_string(in.dhead2) : "") +
-        (in.dfl_i4 ? " dflheadi4 " + std::to_string(in.dhead_tpc) + "x" + std::to_string(in.dhead_ks) : "") +
-        (in.dfl_body_i4 ? " dflbodyi4 1" : "") +
-        (in.dfl_alpha != 1.f ? " dflalpha " + std::to_string(in.dfl_alpha) : "") +
-        (in.dsel_model ? " dselmodel " + std::to_string(in.dsel_model) + " " + in.dsel_tab : "") + in.kstopb +
-        (in.cp_step ? " cpsr " + std::to_string(in.cp_step) + (in.cp_seg ? " seg" : "") : "") +
-        (in.ctx_sp ? " ctxsp " + std::to_string(in.ctx_sp) : "") + (in.posidx ? " posidx 1" : "") +
-        (in.steer_shared ? " s2steer 1" : "") +
-        in.knobs;
+    g6sig_inputs c{};
+    c.model = uint32_t(in.model);
+    c.cap = in.cap; c.layers_s = in.layers_s.c_str(); c.chunk = in.chunk; c.nc = in.nc; c.set_id = in.set_id.c_str();
+    c.dfl = in.dfl; c.dfl_k = in.dfl_k; c.s2sess = in.s2sess; c.knobs = in.knobs.c_str();
+    c.mp = in.MP; c.mtp = in.mtp; c.dfl_reuse = in.dfl_reuse; c.dfl_reuse_min = in.dfl_reuse_min;
+    c.lanes = in.lanes; c.gsplit = in.gsplit; c.ckpt = in.ckpt.c_str(); c.ckpt_blocks = in.ckpt_blocks; c.ckpt_persist = in.ckpt_persist;
+    c.s2_below = in.s2_below; c.two = in.two; c.pf_own = in.pf_own; c.pf_qp = in.pf_qp; c.qp_ctx = in.qp_ctx; c.qp_min = in.qp_min;
+    c.grammar = in.grammar; c.ngram = in.ngram.c_str(); c.kstop_mode = in.kstop_mode; c.kstop_kmax = in.kstop_kmax;
+    for (int j = 0; j < 4; ++j) c.kstop_tau[j] = in.kstop_tau[j];
+    c.kstop_seed3 = in.kstop_seed3; c.draft_par = in.draft_par; c.qs_mode = in.qs_mode; c.iq_split = in.iq_split;
+    c.mtp_split = in.mtp_split; c.dhead_on = in.dhead_on; c.dhead_tpc = in.dhead_tpc; c.dhead_ks = in.dhead_ks;
+    c.mtp_last = in.mtp_last; c.dhead2 = in.dhead2; c.dfl_i4 = in.dfl_i4; c.dfl_body_i4 = in.dfl_body_i4;
+    c.dfl_alpha = in.dfl_alpha; c.dsel_model = in.dsel_model; c.dsel_tab = in.dsel_tab.c_str(); c.kstopb = in.kstopb.c_str();
+    c.cp_step = in.cp_step; c.cp_seg = in.cp_seg; c.ctx_sp = in.ctx_sp; c.posidx = in.posidx; c.steer_shared = in.steer_shared;
+    c.ds_mtp = in.ds_mtp; c.sh_tc = in.sh_tc; c.l2hint = in.l2hint; c.fc2stg = in.fc2stg; c.fc1bstg = in.fc1bstg;
+    c.c8_pack = in.c8_pack; c.sess_drafts = in.sess_drafts; c.pf_lanes = in.pf_lanes; c.tk_main = in.tk_main;
+    c.tk_decode = in.tk_decode; c.idx_pipe_b = in.idx_pipe_b; c.idx_q_trig = in.idx_q_trig; c.idx_pipe_qr = in.idx_pipe_qr;
+    c.reuse = in.reuse; c.vis_on = in.vis_on; c.vis_id = in.vis_id.c_str();
+    return g6sig_runtime(&c);
 }
 
 }   // namespace g6s2

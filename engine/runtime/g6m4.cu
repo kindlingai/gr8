@@ -146,11 +146,11 @@ bool ds41_c2_trace_on();
 
 using namespace g6rt;
 
-static_assert(eopt::DFL_K == dfl::K && eopt::DFL_REP == dfl::REP && eopt::TP_SORT == glue::TP_SORT,
-              "engine_options.h's copies of the device-header constants");
+static_assert(g6mod::INFO.dfl_drafts == dfl::K && g6mod::INFO.dfl_rep == int(dfl::REP) && g6mod::INFO.tp_sort == glue::TP_SORT,
+              "module_info.h's copies of the device-header constants");
 #if G6_MODEL_DS41
-static_assert(eopt::DS_MARKOV_MAXS == ::ds41dsp::MARKOV_MAXS && dsr::TOPK == geom::TOPK,
-              "engine_options.h's copies of the device-header constants");
+static_assert(g6mod::INFO.ds_markov_maxs == ::ds41dsp::MARKOV_MAXS && dsr::TOPK == geom::TOPK,
+              "module_info.h's copies of the device-header constants");
 #endif
 
 int main(int argc, char** argv)

@@ -26,9 +26,12 @@ ptrdiff_t gr8_knob_floats(uint32_t id, uint32_t n, const double** out);
 namespace knob
 {
 
+/// The hash of the table this header was written from.
+constexpr uint64_t TABLE_HASH = 0x6f2a72331b5ad974ull;
+
 /// Prints the environment's problems (bad values, unknown GR8_ names, old G6_ names) to stderr and returns the number
 /// of errors. The engine stops when it is not 0.
-inline int init() { return gr8_knobs_init(0x6f2a72331b5ad974ull); }
+inline int init() { return gr8_knobs_init(TABLE_HASH); }
 
 /// The set agree-scope knobs that differ from their defaults, as " env NAME=value ...", or "".
 inline std::string signature() { return gr8_knobs_signature(); }
