@@ -9,8 +9,9 @@
 # that never resized; #153) and kvb8_test (kv_b in FP8: decode and prefill against the BF16 form of the same weights,
 # byte for byte; --bench times absorb / value_project; #50) and s2_steer_test (S2 batched decode steers each row as solo
 # decode does: the S2 and solo layer bindings, the shared-expert finalize and the attention consume per row against each
-# session's and each row's own launch; needs EXTRA=-DDEC_S2, else it only prints SKIP). headgroup_test and kda_g9_det
-# build in one fixed configuration each, whatever GR8_NR and EXTRA say (docs/TESTING.md).
+# session's and each row's own launch; needs EXTRA=-DDEC_S2, else it only prints SKIP) and test_flash_cp (Flash
+# context-parallel decode against the replicated path). headgroup_test, kda_g9_det and test_flash_cp build in one fixed
+# configuration each, whatever GR8_NR and EXTRA say (docs/TESTING.md).
 #   scripts/c1_tests.sh <bin_dir> [test args]       default bin_dir = ./bin; TEST=row_budget_test|s2_attn_test runs one
 #   GR8_NR=4 scripts/c1_tests.sh bin4               the TP4 build of the test
 #   EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2       the 32-row build: M = 1..32 against chunks of 8 (without it: M <= 8)
@@ -170,6 +171,11 @@ fi
 if [ "$TEST" = all ] || [ "$TEST" = kda_g9_det ]; then
   [ "$TEST" = all ] && ARGS=()
   with_flags "$FLASH_FLAGS -DG9_CONV_DBG=1" build_run kda/tests/kda_g9_det || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
+if [ "$TEST" = all ] || [ "$TEST" = test_flash_cp ]; then
+  # Flash context-parallel decode against the replicated path, every rank of TP=2 on this GPU, 4096-token key tiles
+  [ "$TEST" = all ] && ARGS=()
+  with_flags "$FLASH_FLAGS -DG6_KV4=1 -DG6_CP=1 -DDEC_S2 -DKP_TILE_POOLS=1024" build_run tests/test_flash_cp -lcuda || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
 if [ "$rc" = 0 ]; then echo "c1_tests: PASS"; else echo "c1_tests: FAIL (exit $rc)"; fi
 exit "$rc"

@@ -10,6 +10,8 @@
 //                       ascending order, then the incomplete tail (positions (pos+1) - (pos+1) % 4 .. pos), -1 after
 //           kp_select_tile  the same list from key tiles of KP_TILE pools and a running top-512 (below), for a call
 //                       whose pool stride passes KP_TILE: its scratch is one tile per row, not the context
+// CP (a CP binding): a pool and its key live on the rank that stores its page; every rank writes the raw ring, which
+// stays replicated. kp_scores<true> scores only the pools this rank owns (cp_mine), for flash_attn.cu's cp_local.
 // Every product and sum is FP32 from the FP16 inputs, so the selection equals the float64 reference on the same inputs
 // up to pools whose scores differ by FP32 rounding.
 
@@ -29,7 +31,7 @@ template<class Input>
 __global__ void kp_pool(Input input){
     auto a=resolve(input);if(!a.active)return;
     const int row=blockIdx.x,t=threadIdx.x,pos=a.positions[row],w=t>>5,lane=t&31;FOR_ROW(a,input,row);
-    if(pos%KP!=KP-1)return;
+    if(pos%KP!=KP-1||cp_remote(a,pos))return;
     uint8_t* base=ix_page(a,pos);if(!base)return;
     const int sess=raw_sess(a,row);if(sess<0)return;
     __shared__ float red[KP][4];
@@ -64,12 +66,13 @@ __global__ void kp_pool(Input input){
 }
 // grid min(rows, RAW_RING), 256 threads: row rows - gridDim.x + blockIdx.x writes its raw key (wk x, FP16, before
 // k_norm) and pool gate (FP16) to its session's ring slot pos % RAW_RING, after kp_pool read the ring. Only the last
-// RAW_RING rows of a call write, so no two rows of one session share a slot
+// RAW_RING rows of a call write, so no two rows of one session share a slot. CP: a row on another rank's page writes too
 template<class Input>
 __global__ void kp_ring(Input input){
     auto a=resolve(input);if(!a.active)return;
     const int row=a.rows-(int)gridDim.x+blockIdx.x,t=threadIdx.x,pos=a.positions[row];FOR_ROW(a,input,row);
-    if(page(a,pos)<0)return;
+    if(cp_remote(a,pos)){if(pos>=a.live_context){error(a,1);return;}}
+    else if(page(a,pos)<0)return;
     const int sess=raw_sess(a,row);if(sess<0)return;
     half* raw=(half*)((uint8_t*)a.index_raw+((int64_t)sess*g6kv::RAW_RING+pos%g6kv::RAW_RING)*g6kv::IDX_RAW);
     raw[t]=t<IDIM?((const half*)a.index_k)[(int64_t)row*IDIM+t]:((const half*)a.index_gate)[(int64_t)row*IDIM+t-IDIM];
@@ -79,19 +82,21 @@ __device__ __forceinline__ int kp_visible(const DeviceAttn& a,int r){
     const int cnt=min(a.positions[r]+1,a.live_context);return cnt>0?cnt/KP:0;
 }
 // grid (pools / 32, rows), 256 threads: 32 pools x 32 heads per CTA; thread = (pool t / 8, heads t % 8 + 8 k). Pools
-// from p_off (a key tile, kp_select_tile; 0 = all of them): pool p's score at scores[row * pstride + p - p_off]
-template<class Input>
+// from p_off (a key tile, kp_select_tile; 0 = all of them): pool p's score at scores[row * pstride + p - p_off].
+// CP: the pools of this rank only (the others are neither read nor written)
+template<bool CP=false,class Input>
 __global__ void kp_scores(Input input,int start,float* scores,int pstride,int p_off=0){
     auto a=resolve(input);if(!a.active)return;
     const int row=blockIdx.y,r=start+row,p0=p_off+blockIdx.x*32,t=threadIdx.x;FOR_ROW(a,input,r);
     const int nvis=kp_visible(a,r);
     if(p0>=nvis)return;
     const int npools=min(32,nvis-p0);
+    if(CP&&!cp_mine(a,p0*KP)&&!cp_mine(a,(p0+npools-1)*KP))return;   // 32 pools span two pages
     __shared__ float qs[IHEADS][IDIM+1],ks[32][IDIM+1],ws[IHEADS];
     for(int i=t;i<IHEADS*IDIM;i+=256)qs[i/IDIM][i%IDIM]=hfloat(a.index_q,(int64_t)r*IHEADS*IDIM+i);
     if(t<IHEADS)ws[t]=hfloat(a.index_weight,(int64_t)r*IHEADS+t);
     for(int i=t;i<npools*IDIM;i+=256){const int pp=i/IDIM,d=i%IDIM,p=p0+pp;float v=0;
-        const uint8_t* b=ix_page(a,p*KP);if(b)v=__ldg(((const float*)b)+((p%g6kv::PAGE_POOLS)*IDIM+d));
+        const uint8_t* b=(!CP||cp_mine(a,p*KP))?ix_page(a,p*KP):nullptr;if(b)v=__ldg(((const float*)b)+((p%g6kv::PAGE_POOLS)*IDIM+d));
         ks[pp][d]=v;}
     __syncthreads();
     const int pp=t>>3,hl=t&7;
@@ -105,7 +110,7 @@ __global__ void kp_scores(Input input,int start,float* scores,int pstride,int p_
             sum=fmaf(fmaxf(dot,0.f),ws[h],sum);}
     }
     sum+=__shfl_xor_sync(0xffffffff,sum,1);sum+=__shfl_xor_sync(0xffffffff,sum,2);sum+=__shfl_xor_sync(0xffffffff,sum,4);
-    if(hl==0&&pp<npools){
+    if(hl==0&&pp<npools&&(!CP||cp_mine(a,(p0+pp)*KP))){
         float s=sum*(1.f/64)+0.f;   // + 0: -0 (all relu 0, negative weights) ties with +0, as in the reference
         if(!isfinite(s)){error(a,4);s=-INFINITY;}
         scores[(int64_t)row*pstride+p0-p_off+pp]=s;}
