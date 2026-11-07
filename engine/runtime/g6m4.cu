@@ -131,6 +131,14 @@ bool ds41_c2_trace_on();
 #include "ds41_prefill_fabric.h"
 #include "ds41_v2.h"
 #include "ds41_v2_walk.h"
+#include "ds41_v2.cuh"
+#include "ds41_v2_ffn.cuh"
+#include "ds41_v2_engram.cuh"
+#include "../attn/ds41_attn_v2_api.h"
+namespace g6rt {
+#include "ds41_v2_attn.cuh"
+#include "ds41_v2_engine.cuh"
+}
 #include "ds41_knobs.h"
 #endif
 #include "s2/flash_checkpoint.h"   // GR8_GLM53F_CACHE parsed in every build, refused outside Flash
@@ -271,7 +279,7 @@ int main(int argc, char** argv)
 
     if (!fabric_dump) G6RT_CK(cudaSetDeviceFlags(cudaDeviceMapHost));
     // every fabric main creates, in creation order (fabric_plan.h); the plan below sets them up
-    g6::Fabric fab, fabB, fabp, fabp2, fabix, fabix2, fabrs, fabrs2, fabd, fabds, fabf, fabq, fabc, fabg, fabs, fabdg;
+    g6::Fabric fab, fabB, fabp, fabp2, fabix, fabix2, fabrs, fabrs2, fabd, fabds, fabf, fabq, fabc, fabg, fabs, fabdg, fabv2;
     boot_rank = cfg.rank;
     mem_min_gib();                      // a bad GR8_MEM_MIN stops the boot here, not after the weights have loaded
     boot("start");
@@ -436,7 +444,7 @@ int main(int argc, char** argv)
 #endif
     [[maybe_unused]] const int& cp_step = fplan.cp_step;   // GR8_CP_STEP_ROWS (s2/cp_rows.h): the rows a step past R may carry; 0 = off
     g6::Fabric* const fabrics[kFabKinds] = {&fab, &fabB, &fabp, &fabp2, &fabix, &fabix2, &fabrs, &fabrs2,
-                                            &fabd, &fabds, &fabf, &fabq, &fabc, &fabg, &fabs, &fabdg};
+                                            &fabd, &fabds, &fabf, &fabq, &fabc, &fabg, &fabs, &fabdg, &fabv2};
     fabric_bring_up(fplan, fabrics, fabric_dump, [&](const PlannedFabric& e, g6::Fabric& fb) {
         switch (e.kind)
         {
@@ -1550,15 +1558,17 @@ int main(int argc, char** argv)
         sc.notice_max = (uint32_t)knob::s2_notice_max();
         fprintf(stderr, "# rank %d ds41 s2 scheduler tail_first %d notice_max %u\n", R, sc.tail_first ? 1 : 0, sc.notice_max);
         const int pf_min = (int)knob::ds_prefill_min();
+        const bool pf_v2 = knob::ds_pf_v2(); // boot-once, agreed signature
+        Ds41V2Engine v2engine;
+        const int pf_max = pf_v2 ? ds41::v2::MAX_ROWS : ds41moe::ROMAX;
         // Engram on is allowed with W-row prefill (engine max_rows = W, one chunk in flight -- ds41_prefill_single_lane keeps the engine's one slot safe)
-        if (pf_min && (pf_min < 2 || m.hc_rows <= MX || m.hc_rows > ds41moe::ROMAX || m.qs.on()))
-            die("DS41 W-row prefill needs GR8_DS_PREFILL_MIN>=2, MX<W<=" + std::to_string(ds41moe::ROMAX) + ", and QA/QS split off");
+        if (pf_min && (pf_min < 2 || m.hc_rows <= MX || m.hc_rows > pf_max || m.qs.on()))
+            die("DS41 W-row prefill needs GR8_DS_PREFILL_MIN>=2, MX<W<=" + std::to_string(pf_max) + ", and QA/QS split off");
         if (pf_min && dsk.prefill_keep != 0)
             die("DS41 W-row prefill needs GR8_DS_PREFILL_KEEP=0");
         // GR8_DS_PF_LANES=2 (ds41_lanes.h): two-lane W prefill, quanta of up to 2W rows of one session; unset / 1 = one lane
         const int pf_lanes = ds41::lanes::parse(DS41_TEXT(knob::ds_pf_lanes()));
         if (!pf_lanes) die(ds41::lanes::kParseError);
-        const bool pf_v2 = knob::ds_pf_v2();  // boot-once; also in the agreed runtime signature
         if (pf_lanes == 2 && !pf_min) die("GR8_DS_PF_LANES=2 needs W-row prefill (GR8_DS_PREFILL_MIN)");
         bc.prefill_min = (uint32_t)pf_min;
         if (pf_min) g6s2::ds41_prefill_lanes(sc, (uint32_t)m.hc_rows, pf_lanes);
@@ -1614,7 +1624,7 @@ int main(int argc, char** argv)
                 cp_enqueue(si.step, si.M, si.context);
                 qs_enqueue(si.step, si.M);
             },
-            [&]() -> unsigned { return *f.error | cp_error() | ds41_engram_error(m); },
+            [&]() -> unsigned { return *f.error | cp_error() | ds41_engram_error(m) | (v2engine.v.live ? *v2engine.v.wire.error : 0u); },
             [&](int k, const StepIn& si) {
                 if (!graph) { launch_step(m, si.M, si.context, st, -1, 0, residual_copy); return; }   // eager: the offline loop's launch (rm lambda); reads m.ds_ns
                 g6s2::require(k >= 0 && k < m.nbk && si.M >= 1 && si.M <= MX &&
@@ -1643,8 +1653,10 @@ int main(int argc, char** argv)
         if (pf_v2 && (!pf_min || !ds41::v2::boot_ok(m.hc_rows, pf_tail, g6nr::NR, pf_lanes,
                                                     ds41::br::late_layer_start())))
             die("GR8_DS_PF_V2 needs W-row prefill, TP4, one lane, tail 128 and the range boundary at layer 21");
-        if (pf_v2)
-            fprintf(stderr, "# rank %d GR8_DS_PF_V2=1 bootstrap conductor: stock math/layout callbacks, W=%d; not a speed arm\n", R, m.hc_rows);
+        if (pf_v2) {
+            v2engine.boot(m,fabv2,st);
+            fprintf(stderr, "# rank %d GR8_DS_PF_V2=1 own-row conductor W=%d, rangeA=0..20, stock tail=128, dedicated port=%d\n", R, m.hc_rows,cfg.port+104);
+        }
         if (pf_min) fprintf(stderr, "# rank %d DS41 prefill bounded replay tail %d (layers >= %d)\n", R, pf_tail, ds41::br::late_layer_start());
         if (pf_min && ds41::br::l20_tail())
             fprintf(stderr, "# rank %d DS41 GR8_DS_PF_L20_TAIL=1: layer 20 in the bounded replay (ca row on every row, the rest of the layer on the tail rows)\n", R);
@@ -1705,12 +1717,32 @@ int main(int argc, char** argv)
                     vis.stage(m, 0, &vc, 1, (int)c.rows, pr, st);
                 }
                 g6s2::require(ds41_idx_set_chunk(&m, c.context) == 0, "DS41 prefill index chunk bound refused");
-                if (skip_late) prepare_ds41_prefill(m, (int)c.rows, st, 0, split.i_late);
+                if (pf_v2) {
+                    const auto& table=ds41_table();
+                    for(int i=0;i<split.i_late;++i)
+                        if(table.prepare_attn && table.prepare_attn(&m,i,(int)c.rows,st))die("DS41 v2 attention prepare failed");
+                    if(!skip_late)prepare_ds41_prefill(m,late,st,split.i_late,m.nl);
+                }
+                else if (skip_late) prepare_ds41_prefill(m, (int)c.rows, st, 0, split.i_late);
                 else if (split.on()) { prepare_ds41_prefill(m, (int)c.rows, st, 0, split.i_late); prepare_ds41_prefill(m, late, st, split.i_late, m.nl); }
                 else prepare_ds41_prefill(m, (int)c.rows, st);
                 if (dsk.on()) { m.dsp.main_lo = 0; m.dsp.main_hi = late; }
                 g6::Fabric::Rs rs; rs.order = coll.order;
-                if (ds41::rs::on(rs_k > 0, 0, rs_k, (int)c.rows, MX, g6nr::NR)) {   // GR8_DS_PF_RS=1: the same rule as the ops' ds41_rs_on
+                if(pf_v2) {
+                    // Range A only rings the dedicated fabric. Main fabric must
+                    // never wait on those old doorbells; keep just stock B.
+                    if(!skip_late) {
+                        auto sizes=coll.sizes; g6::Fabric::Rs late_rs;
+                        for(size_t q=0;q<sizes.size();++q) {
+                            if(q>=size_t(2*split.i_late) && q<size_t(2*m.nl))late_rs.order.push_back(int(q));
+                            else sizes[q]=0;
+                        }
+                        fab.enqueue_step(c.sequence,sizes,late_rs);
+                    }
+                    m.ds41_rowshard_chunk=false; m.ds41_rowshard_state=false;
+                    m.ds41_rowshard_pending_c=-1; m.ds41_y_quant_ready=false;
+                }
+                else if (ds41::rs::on(rs_k > 0, 0, rs_k, (int)c.rows, MX, g6nr::NR)) {   // GR8_DS_PF_RS=1: the same rule as the ops' ds41_rs_on
                     const size_t rb = (size_t)HID * 2;
                     if (const char* e = ds41::rs::job_error(coll.sizes, NC, rs_k, (int)c.rows, g6nr::NR, rb)) g6s2::require(false, e);
                     const bool shard_chunk=ds41::rowshard::chunk_on(rowshard,(int)c.rows,late,g6nr::NR);
@@ -1756,12 +1788,7 @@ int main(int argc, char** argv)
                 const size_t range_a_end = skip_late ? split.b - 1 : split.b;
                 ds41::Stop stop;
                 if (pf_v2) {
-                    // M0: exercise the new conductor with stock callbacks. The
-                    // numerical hook replacements land separately; this stage
-                    // neither claims own-row execution nor a prefill speed win.
-                    stop = ds41::v2::walk_stock(split.ops, range_a_end, [&](const ds41::v2::Run& run) {
-                        return ds41_run_pass(split.ops, run.begin, run.end, &m, (int)c.rows, st, span_pass);
-                    });
+                    v2engine.run(m,(int)c.rows,split.i_late,skip_late);
                 } else stop = ds41_run_pass(split.ops, 0, range_a_end, &m, (int)c.rows, st, span_pass);
                 if (!stop.stopped && split.on() && !skip_late) {   // range B: the layers >= 21 over the chunk's last `late` rows (now rows 0 .. late-1)
                     ds41_attn_set_win_floor(ds41::br::win_floor((int)c.context, (int)c.rows, pf_tail));
@@ -2075,6 +2102,7 @@ int main(int argc, char** argv)
         }
         try { g6s2::serve_ds41(dc, bc, plan.chunk); }
         catch (const std::exception& e) { fprintf(stderr, "g6m4: rank %d DS41 serve failed: %s\n", R, e.what()); return 3; }
+        if(pf_v2) { v2engine.release(); fabv2.stop_proxy(); }
     }
 #else
     if (s2mode)
