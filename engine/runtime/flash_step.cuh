@@ -35,12 +35,18 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
     m.flash_draft=ids.size()==1 && ids[0]==geom::MTP_LAYER;
     for(int l:ids) if(!m.flash_draft && (l<0 || l>=geom::L_MAIN)) die("Flash main model layer outside 0..44");
 #if defined(G6_CP) && G6_CP
-    if(m.cp.on) die("Flash CP is not implemented");
+    // GR8_CP: the main model's DSA layers (flash_dsa.cuh launch_dsa_cp); the MTP draft keeps its whole KV
+    if(m.cp.on && m.flash_draft) die("Flash CP: the MTP draft model has no CP binding");
+    if(m.cp.on && (m.cp.R2 || m.cp.R<64)) die("Flash CP: GR8_CP_R must be at least 64, and GR8_CP_R2 is not supported");
 #endif
     if(max_rows>MX) die("Flash main model currently supports decode rows only (no prefill)");
     m.rank=rank; m.nl=(int)ids.size(); m.f=f; m.stepp=stepp;
     if(f.ncoll!=m.ncoll()) die("Flash fabric ncoll must be 2 * layers + 1");
-    m.nbk=context_buckets(m.bk,(int)knob::dec_bk(),capacity,0);
+    int cp_r=0;
+#if defined(G6_CP) && G6_CP
+    if(m.cp.on) cp_r=m.cp.step_R();   // R is a bucket boundary: a graph step runs the CP block exactly past R
+#endif
+    m.nbk=context_buckets(m.bk,(int)knob::dec_bk(),capacity,cp_r);
 #ifdef DEC_S2
     m.s2_run_pages=(capacity+63)/64;
 #endif
@@ -98,6 +104,21 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
     }
     G6RT_CK(bind::init());
     G6RT_CK(g6h2d::copy(m.errs,errors.data(),errors.size()*sizeof(unsigned*)));
+#if defined(G6_CP) && G6_CP
+    if(m.cp.on) {
+        // the exchange buffers of launch_dsa_cp, for MX rows and the widest head group
+        const int H=g6nr::HMAX,NR=g6nr::NR;
+        m.cp.tickets=dmalloc<unsigned>(m.cp.colls.ncoll());
+        m.cp.cand=dmalloc<uint64_t>((size_t)NR*MX*g6kv::TOP_POOLS);
+        m.cp.qbuf=dmalloc<float>((size_t)MX*H*KVA);
+        m.cp.part_all=dmalloc<float>((size_t)NR*cp_blk(MX,H));
+        m.cp.part_tmp=dmalloc<float>(cp_blk(MX,H));
+        size_t held=0,full=0;
+        for(const Layer& y:m.layers) if(!y.kda) { held+=(size_t)y.ab.args.page_count; full+=(size_t)y.ab.args.table_size; }
+        fprintf(stderr,"# rank %d: GR8_CP on (Flash), R %d, %d CP collectives (mmax %d); the DSA layers hold %zu of %zu pages\n",
+                rank,m.cp.R,m.cp.colls.ncoll(),m.cp.colls.mmax,held,full);
+    }
+#endif
     auto emb=find("G.embed"),norm=find("G.final_norm"),head=find("G.lm_head.r8.gv"),hscale=find("G.lm_head.scale");
     if(!head.p) head=find("G.lm_head.mx.gv");
     if(!head.p) head=find("G.lm_head.gv");

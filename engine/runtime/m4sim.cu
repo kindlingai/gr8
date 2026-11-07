@@ -470,9 +470,12 @@ int main(int argc, char** argv)
     bool cp_seg = false;                //       GR8_CP_STEP_SEG
     (void)cp_step; (void)cp_seg;
 #if defined(G6_CP) && G6_CP
-    // CP: GR8_CP=0|1 (default 1 in a CP build), GR8_CP_R (replicated prefix tokens, multiple of 64, default 0),
+    // CP: GR8_CP=0|1 (default 1 in a CP build, 0 in the Flash build), GR8_CP_R (replicated prefix tokens, multiple of 64, default 0),
     // GR8_CP_S3=0|1 (default 1), GR8_CP_MMAX (CP fabric rows, default = the most rows of any step)
-    const bool cp_on = knob::cp().value_or(true);
+    const bool cp_on = knob::cp().value_or(!G6_MODEL_FLASH);   // Flash: off unless asked for
+#if G6_MODEL_FLASH
+    if (cp_on && s2mode) die("Flash GR8_CP: not with S2 serving yet (decode and the offline mode only)");
+#endif
     const int cp_R = (int)knob::cp_r();
     const int cp_s3 = knob::cp_s3();
     int cp_mmax = mtp + 1;
@@ -500,9 +503,9 @@ int main(int argc, char** argv)
         die("GR8_CP_R2 must be a multiple of 64 below GR8_CP_R, with GR8_CP on and GR8_TEST_S2_XLIST (the runs it lays out)");
     g6::CpColls cp_colls;
     {
-        std::vector<bool> full;
-        for (int l : layers) full.push_back(cp_full_index(l));
-        cp_colls.make(full, NR, cp_mmax);
+        std::vector<bool> full, attn;   // attn: the layers with an attention block (Flash: not the KDA layers)
+        for (int l : layers) { full.push_back(cp_full_index(l)); attn.push_back(cp_attn_layer(l)); }
+        cp_colls.make(full, NR, cp_mmax, attn);
     }
     g6::VLayout cp_L;
     cp_L.make(NR, cp_colls.cap, cp_colls.dst_k);
@@ -1141,6 +1144,17 @@ int main(int argc, char** argv)
     // layer i's attention block on every rank: the CP block in its three phases with the loopback between them
     auto attn_all = [&](int i, int M, int context) {
         if (!cp_block(R[0], context)) { attn_qs(rptr, qsl, i, M, context); return; }
+#if G6_MODEL_FLASH
+        // Flash: a KDA layer has no CP block; a DSA layer runs launch_dsa_cp's phases (flash_dsa.cuh)
+        if (R[0].layers[i].kda) { attn_qs(rptr, qsl, i, M, context); return; }
+        for (Model& m : R) launch_dsa_block(m, i, M, context, st, 0);
+        vdeliver(cp_colls.q[i], M);
+        vdeliver(cp_colls.cand[i], M);
+        for (Model& m : R) launch_dsa_block(m, i, M, context, st, 1);
+        for (int k = 1; k < NR; ++k) vdeliver(cp_colls.part[(size_t)i * (NR - 1) + k - 1], M);
+        for (Model& m : R) launch_dsa_block(m, i, M, context, st, 2);
+        return;
+#endif
         {
             const std::vector<int> gs = R[0].qs.layer_gathers(i);     // phase 0 in gather phases
             for (size_t p = 0; p <= gs.size(); ++p)

@@ -1135,7 +1135,10 @@ int main(int argc, char** argv)
 #if defined(G6_CP) && G6_CP
     // CP: env as m4sim (GR8_CP, GR8_CP_R, GR8_CP_S3, GR8_CP_MMAX). Own fabric `fabc` (cplayout.h variable
     // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
-    const bool cp_on = knob::cp().value_or(true);
+    const bool cp_on = knob::cp().value_or(!G6_MODEL_FLASH);   // Flash: off unless asked for
+#if G6_MODEL_FLASH
+    if (cp_on && s2mode) die("Flash GR8_CP: not with S2 serving yet (decode and the offline mode only)");
+#endif
     const int cp_R = (int)knob::cp_r();
     const int cp_s3 = knob::cp_s3() ? 1 : 0;
     int cp_mmax = K + 1;
@@ -1161,9 +1164,9 @@ int main(int argc, char** argv)
     const int cp_step_R = cp_R2 ? cp_R2 : cp_R;
     g6::CpColls cp_colls;
     {
-        std::vector<bool> full;
-        for (int l : layers) full.push_back(cp_full_index(l));
-        cp_colls.make(full, (int)cfg.ips.size(), cp_mmax);
+        std::vector<bool> full, attn;   // attn: the layers with an attention block (Flash: not the KDA layers)
+        for (int l : layers) { full.push_back(cp_full_index(l)); attn.push_back(cp_attn_layer(l)); }
+        cp_colls.make(full, (int)cfg.ips.size(), cp_mmax, attn);
     }
     g6::Fabric fabc;
     if (cp_on)

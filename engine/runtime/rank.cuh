@@ -338,6 +338,12 @@ struct CpState
 };
 // binder rule (engine/attn/bind.cu): the layers that run their own indexer
 inline bool cp_full_index(int l) { return geom::full_index(l); }
+// the layers with an attention block, and so with CP collectives (Flash: the DSA layers; the KDA layers carry O(1) state)
+#if G6_MODEL_FLASH
+inline bool cp_attn_layer(int l) { return !geom::is_kda(l); }
+#else
+inline bool cp_attn_layer(int) { return true; }
+#endif
 // floats of one partial block (c [M][H][512], m [M][H], l [M][H]), padded to 16 B as cp_lse (attn.cu) indexes it
 inline size_t cp_blk(int M, int H) { return ((size_t)M * H * 514 + 3) & ~(size_t)3; }
 // heads of rank d's group at model layer l (bind.cu: group (d - l) % NR, larger groups first)
