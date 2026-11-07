@@ -138,7 +138,8 @@ Limits for now:
 - With several sessions the pool takes GLM-5.3's page classes (S2 below R): a request whose `prompt + max_tokens`
   passes R gets its prefix and its share of the tail below `place`, the MTP layer's copy above it.
 - The MTP layer keeps its whole KV (it is the draft model's binding), and the DFlash2 drafter its own window.
-- Not with `GR8_GLM53F_CACHE` or `GR8_GLM53F_KV_CHUNKS`.
+- With `GR8_GLM53F_CACHE`, each rank's checkpoint keeps the pages of the 11 DSA layers it holds (another rank's page
+  is zeros in the entry) and the MTP layer's whole pages. Not with `GR8_GLM53F_KV_CHUNKS`.
 - Not measured on a cluster yet.
 
 ## One box (TP=1)
@@ -287,7 +288,7 @@ once, in `flash-ckpt.tokens/<generation>`. Every file is written to a temporary 
 synced. A boot with the same compat line (model set, TP, rank, CAP, layout, engine build) and store size reads the
 index, and a helper thread checks every entry's stored manifest, pages and state (the KDA state, then the raw index
 rings) against the manifest's checksums. An entry sealed by another entry format (`FlashManifest::FORMAT`; 2 since the
-raw index rows left the pages) is dropped.
+raw index rows left the pages, 3 since a CP binding keeps only its own pages) is dropped.
 The blocks of an entry are not synced before the index names it, so after a power loss the index can name an entry whose
 blocks never reached the disk: the checks drop it, so the boot loses the entry, never serves its bytes.
 On a GB10's SSD the checks run at about 6 GiB/s, as fast as reading the store alone, so a full 64 GiB store takes

@@ -1139,8 +1139,6 @@ int main(int argc, char** argv)
     const int cp_R = (int)knob::cp_r();
     const int cp_s3 = knob::cp_s3() ? 1 : 0;
 #if G6_MODEL_FLASH
-    // Flash under --serve: no checkpoints yet
-    if (cp_on && s2mode && flash_cache != g6s2::FlashCache::Off) die("Flash GR8_CP under --serve: not with GR8_GLM53F_CACHE yet");
     if (cp_on && s2mode && s2sess > 1 && (cp_R < 64 || cp_R >= cap)) die("Flash GR8_CP with several sessions: GR8_CP_R must be 64..--cap - 1");
 #endif
     int cp_mmax = K + 1;
@@ -2021,8 +2019,12 @@ int main(int argc, char** argv)
                 for (g6rt::Layer& y : x->layers)
                     if (!y.kda && y.ab.storage)
                     {
+                        int cpb = 0;   // a CP binding keeps this rank's pages only (flash_checkpoint.cuh)
+#if defined(G6_CP) && G6_CP
+                        cpb = y.ab.args.cp_nr ? 1 : 0;
+#endif
                         v.bindings.push_back({static_cast<uint4*>(y.ab.args.mla_cache), static_cast<uint4*>(y.ab.args.index_cache),
-                                              (unsigned long long)(64 * g6kv::ROW / 16), (unsigned long long)(g6kv::IDX_PAGE / 16)});
+                                              (unsigned long long)(64 * g6kv::ROW / 16), (unsigned long long)(g6kv::IDX_PAGE / 16), cpb});
                         v.rings.push_back(static_cast<uint8_t*>(y.ab.args.index_raw));
                     }
             v.ring_bytes = (size_t)g6kv::RAW_RING * g6kv::IDX_RAW;

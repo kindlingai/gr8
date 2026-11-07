@@ -75,7 +75,26 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     FlashSlots ks(int(sc.limit()), std::max(1, c.main.kda_ring_rest ? c.main.kda_ring_rest : c.main.kda_ring),
                   std::max(1, c.main.kda_ring));
     require(ks.total() <= c.main.kda_st.slots, "Flash serve: the KDA state has fewer slots than the sessions' rings");
-    require(!c.cp_R || (!c.ckpt && c.cp_enqueue), "Flash serve with GR8_CP: no checkpoints");
+    require(!c.cp_R || c.cp_enqueue, "Flash serve with GR8_CP: no CP fabric");
+    // GR8_CP, checkpoints: the main model's page of each logical page of slot q's run (-1: another rank holds it), which
+    // FlashCheckpoints keeps for the CP bindings. One session: the layers' tables as built; several: a split run's CP map,
+    // else the run's own pages
+    std::vector<int> cp_built;
+    if (c.cp_R && !multi)
+        for (const Layer& y : c.main.layers)
+            if (y.ab.storage) {
+                cp_built.resize(size_t(y.ab.args.table_size));
+                G6RT_CK(cudaMemcpy(cp_built.data(), y.ab.args.block_table, cp_built.size() * 4, cudaMemcpyDeviceToHost));
+                break;
+            }
+    auto cp_pages = [&c, &cp_built, multi, rp](int q, const std::vector<int>& list) {
+        std::vector<int> t;
+        if (!multi) t.assign(cp_built.begin(), cp_built.begin() + std::min(cp_built.size(), list.size()));
+        else if (c.main.s2->ex_split[q]) t = s2_cp_map(*c.main.s2, s2_args0(c.main), list, rp, list.size());
+        else t = list;
+        for (int& p : t) p = std::max(p, -1);
+        return t;
+    };
     u64 pfseq = 1, pfseq2 = 1, dseq = 0;
     LpStep lp{};
     int lp_rows = 0;
@@ -112,7 +131,9 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         std::lock_guard<std::mutex> l(ck_mu);
         for (const Pending& x : pending) {
             const uint32_t at = uint32_t(x.tokens.size() - 1);
-            const uint64_t gen = ck->capture(at, ks.base(x.q), x.q, pool.list(bound[size_t(x.q)]), x.tokens, capture_ns[size_t(x.q)], c.stream);
+            const std::vector<int> list = pool.list(bound[size_t(x.q)]), cpl = c.cp_R ? cp_pages(x.q, list) : std::vector<int>{};
+            const uint64_t gen = ck->capture(at, ks.base(x.q), x.q, list, x.tokens, capture_ns[size_t(x.q)], c.stream, false,
+                                             c.cp_R ? &cpl : nullptr);
             if (gen) fprintf(stderr, "# flash ckpt request %llu kept %u rows (session %d) as entry %llu (%llu blocks) in %.1f ms; %zu entries\n",
                              (unsigned long long)x.req, at, x.q, (unsigned long long)gen,
                              (unsigned long long)ck->last.blocks, ck->last.ms, ck->index().size());
@@ -174,7 +195,8 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             const FlashEntry* x = ck->index().find(gen);
             require(x && x->position == g.reuse, "Flash checkpoint hit differs from its entry");
             exact = !x->terminal;
-            ck->restore(gen, ks.base(q), q, list, c.stream);
+            const std::vector<int> cpl = c.cp_R ? cp_pages(q, list) : std::vector<int>{};
+            ck->restore(gen, ks.base(q), q, list, c.stream, c.cp_R ? &cpl : nullptr);
             wrote((int(g.reuse) + PAGE - 1) / PAGE * PAGE);   // whole pages of both models' caches (one session)
             fprintf(stderr, "# flash ckpt request %llu restored %u rows (session %d, %s entry %llu, %llu blocks) in %.1f ms\n",
                     (unsigned long long)g.req.id, g.reuse, q, exact ? "aligned" : "terminal", (unsigned long long)gen,
@@ -282,7 +304,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
 #define FLASH_CAPTURES(X) X(c) X(sc) X(multi) X(pool) X(ks) X(pfseq) X(pfseq2) X(dseq) X(lp) X(lp_rows) X(fence) \
     X(check) X(ck) X(ck_mu) X(bound) X(live) X(capture_at) X(pending) X(take_capture) X(reset_all) X(reset_check) \
     X(dirty) X(zflag) X(wrote) X(wrote_step) X(bind_ckpt) X(graphs) X(key) X(layout) X(draft_layout) X(widen) X(rank) \
-    X(extra) X(cp_split) X(rp) X(cp_staging) X(stage) X(solo_tables)
+    X(extra) X(cp_split) X(rp) X(cp_staging) X(stage) X(solo_tables) X(cp_pages)
     FLASH_CAPTURES(G6S2_CAPTURE_TYPE)
     struct FlashModule : ModuleCtx {
         FLASH_CAPTURES(G6S2_CAPTURE_REF)
@@ -301,7 +323,8 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                 if (p > 0 && slot >= 0) {
                     const std::vector<int> tokens(st.history.begin(), st.history.begin() + p + 1);
                     std::lock_guard<std::mutex> l(ck_mu);
-                    const uint64_t gen = ck->capture(p, slot, q, pool.list(r), tokens, ns, c.stream, true);
+                    const std::vector<int> list = pool.list(r), cpl = c.cp_R ? cp_pages(q, list) : std::vector<int>{};
+                    const uint64_t gen = ck->capture(p, slot, q, list, tokens, ns, c.stream, true, c.cp_R ? &cpl : nullptr);
                     if (gen) fprintf(stderr, "# flash ckpt terminal kept %u rows (session %d, KDA slot %d) as entry %llu (%llu blocks) in %.1f ms; %zu entries\n",
                                      p, q, slot, (unsigned long long)gen, (unsigned long long)ck->last.blocks, ck->last.ms, ck->index().size());
                     else fprintf(stderr, "# flash ckpt terminal: %u rows do not fit the store (%llu blocks)\n", p, (unsigned long long)ck->blocks());
