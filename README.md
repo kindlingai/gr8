@@ -10,7 +10,9 @@ release. If you run it, please tell us what breaks: issues and PRs are welcome.*
 
 ## Recipes
 
-Each recipe is one Docker image, set up for one model on a fixed number of boxes.
+Each recipe is one Docker image, set up for one model on a fixed number of boxes. For other box counts (GLM-5.3 on
+three to six boxes, GLM-5.3-Flash on three or four), start from [Models and install](#models-and-install). A box runs
+one model at a time: stop the running recipe's container on every box before you start another.
 
 ### GLM-5.3-Flash on 1 Spark
 
