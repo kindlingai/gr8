@@ -2,7 +2,8 @@
 // real Service, Driver, scheduler, pools and event gate over a fake module that logs every call it gets, with its
 // arguments and what it returns, through scenarios that reach every hook: burst admissions, prefill quanta and packs,
 // growth, prefix reuse, cancels, a shrink, a resize, DFlash2 and parks where the shape has them, and a tight pool where an
-// admission fits only on the pages a cancelled reused run gives back. A command meant to land mid-run is written from
+// admission fits only on the pages a cancelled reused run gives back, and a cancel of a session still in its prefill
+// (the head's resp files' last lines join that transcript). A command meant to land mid-run is written from
 // inside a head step. The step then waits for its notice in the head's trace, so the boundary the notice names, and
 // every call after it, is the same on every run. The ranks' steps meet as a fabric's would.
 // The service's plain pool calls (reserve, fits, room, count) are logged by observers: the head's control thread (Rust)
@@ -199,6 +200,7 @@ struct Scenario {
     uint32_t prefill_min = 0, pages = 256, place = 256, below = 256 * 64;
     bool window = false;   // a window pool (kvman-rs Pool::window): runs past R, r_rows and make_room
     bool reuse = false, park = false, dfl = false, seq = false, drained = false, grow = true, kstop_log = false;
+    bool ends = false;   // the head's transcript ends with each request's last two resp lines (its "m" and "end")
     std::vector<Stage> phases;
 };
 
@@ -542,6 +544,14 @@ std::array<std::vector<std::string>, 2> run(const Scenario& sc, bool table, std:
     for (int r = 0; r < 2; ++r)
         if (err[r]) try { std::rethrow_exception(err[r]); } catch (const std::exception& e) { error = sc.name + " rank " + i(r) + ": " + e.what(); }
     for (auto& x : s) x.reset();
+    if (sc.ends)
+        for (const auto& e : by_id) {
+            std::vector<std::string> ls;
+            std::istringstream in(slurp(dir + "/resp." + u(e.first)));
+            for (std::string l; std::getline(in, l);) ls.push_back(l);
+            const size_t n = ls.size();
+            f0.lines.push_back("resp " + u(e.first) + " " + (n > 1 ? ls[n - 2] : "") + " | " + (n ? ls[n - 1] : ""));
+        }
     for (const auto& x : b) remove_dir(x.directory);
     return {f0.lines, f1.lines};
 }
@@ -635,21 +645,35 @@ std::vector<Scenario> scenarios() {
         s.phases = {a, b};
         v.push_back(s);
     }
+    {   // a cancel that lands while its session is still prefilling, beside a session that decodes on
+        Scenario s; s.name = "cancel_prefill";
+        s.cfg.pool_rows = 256 * PAGE; s.cfg.max_rows = 16; s.cfg.max_sessions = 4; s.cfg.mtp = 1; s.cfg.prefill_rows = 64;
+        s.cfg.two_lanes = false;
+        s.ends = true;
+        if (ds41) { s.seq = true; s.prefill_min = 2; }
+        Stage a;
+        a.reqs = {req(51, tokens(r, 20), 200), req(52, tokens(r, 1500), 6)};
+        a.triggers = {Trigger{8, {}, {52}, false}};
+        s.phases = {a};
+        v.push_back(s);
+    }
     return v;
 }
 
 struct Expect { const char* name; uint64_t h[2]; };
 // recorded from the service before PoolOps (git 51569016), the pool's plain calls logged; "tight" from the C++ control
-// thread before R5b2b (git d07cc4c4)
+// thread before R5b2b (git d07cc4c4); "cancel_prefill" from the C++ compute thread before R5b2c (git b35a5055)
 #if G6_MODEL_DS41
 const Expect EXPECT[] = {{"reuse", {12273334368408301276ull, 1903311641579599510ull}},
                          {"park", {5353181497655196732ull, 9462988945752174063ull}},
-                         {"tight", {2545044441529557428ull, 3958922421392140002ull}}};
+                         {"tight", {2545044441529557428ull, 3958922421392140002ull}},
+                         {"cancel_prefill", {10265519460376455732ull, 9550749956254985946ull}}};
 #else
 const Expect EXPECT[] = {{"reuse", {10598747977024483389ull, 69881064300217143ull}},
                          {"window", {7913264433038465795ull, 13857834022035593827ull}},
                          {"dflash", {3112206073251698158ull, 11351924592827138150ull}},
-                         {"tight", {5452963098483769817ull, 10140779659768827361ull}}};
+                         {"tight", {5452963098483769817ull, 10140779659768827361ull}},
+                         {"cancel_prefill", {2544064351436808419ull, 13390850078757270789ull}}};
 #endif
 } // namespace
 

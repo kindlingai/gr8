@@ -3,11 +3,12 @@
 //! publishes status.s2. Every rank's watcher runs `monitor`. No thread is started here: the C++ Service's threads call
 //! in, and a worker's control thread stays in the channel's receive_events.
 //!
-//! What both threads touch is atomics here: the scheduler's progress, which the compute thread publishes after each
-//! commit and step, whether a resize is in flight, and whether the service is stopping. Everything else is the control
-//! thread's. What stays C++ is reached through `Host`: the request checks (the parser's ServeReq, the grammar, the
-//! images), a cancelled session's retire_run (it reads Dispatch and the driver facade), the KV share report, and the
-//! pool policy's two calls that return C++ objects (refusal, tiers).
+//! What both threads touch is atomics here: the scheduler's progress, which the compute thread (compute.rs) publishes
+//! after each commit and step, whether a resize is in flight, and whether the service is stopping. Everything else is
+//! the control thread's, apart from the plain pool and policy calls a worker's bind makes through it. What stays C++
+//! is reached through `Host`: the request checks (the parser's ServeReq, the grammar, the images), a cancelled
+//! session's retire_run (it reads Dispatch and the driver facade), the KV share report, and the pool policy's two calls
+//! that return C++ objects (refusal, tiers).
 //!
 //! The commit's pool calls have an order every worker replays at its grant: the cancel's retire, then `r_rows`,
 //! `match`, `fits`, an optional `make_room` and a second fit, the queue's check, and in a grant `count`, `match`,
@@ -52,8 +53,8 @@ pub struct Checked {
     pub ok: bool,
 }
 
-/// g6svc_pool_call: one plain pool call of the control thread, for a test's observer. out: room's or count's result,
-/// or fits' as 0 or 1; run: reserve's.
+/// g6svc_pool_call: one plain pool call of the service (the head's control thread, or a worker's bind), for a test's
+/// observer. out: room's or count's result, or fits' as 0 or 1; run: reserve's.
 #[repr(C)]
 pub struct PoolCall {
     pub kind: u32,
@@ -84,9 +85,39 @@ pub type ReasonFn = unsafe extern "C" fn(*mut c_void, u64, u32, *mut *const u8, 
 pub type TotalsFn = unsafe extern "C" fn(*mut c_void, *mut *const Totals, *mut usize) -> i32;
 /// a test's observer of the plain pool calls
 pub type ObserveFn = unsafe extern "C" fn(*mut c_void, *const PoolCall);
+pub(super) type Observer = Option<(ObserveFn, *mut c_void)>;
 
-/// g6svc_host: the C++ the control thread calls. Each call returns 0, or 1 when the C++ threw (the C++ caller of the
-/// control thread rethrows it). share: null without a KV share. Only the control thread calls these.
+/// g6svc_staged: the request the compute thread staged for an ADMIT (req: the parser's ServeReq, kept by the host;
+/// void for the layout digest), and what the worker's bind reads of it. Valid until the host's next stage or unstage.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Staged {
+    pub req: *const c_void,
+    pub prompt: *const i32,
+    pub n: usize,
+    pub sys: i64,
+    pub plp: i32,
+}
+
+/// idle_boundary(boundary)
+pub type BoundaryFn = unsafe extern "C" fn(*mut c_void, u64) -> i32;
+/// stage(bytes, n, *staged)
+pub type StageFn = unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut Staged) -> i32;
+/// digest(has_pool, pool, *out)
+pub type DigestFn = unsafe extern "C" fn(*mut c_void, bool, u64, *mut u64) -> i32;
+/// apply(commit, admit)
+pub type ApplyFn = unsafe extern "C" fn(*mut c_void, *const Commit, bool) -> i32;
+/// step(*quantum)
+pub type StepFn = unsafe extern "C" fn(*mut c_void, *mut crate::scheduler::Quantum) -> i32;
+/// counters(keys, n)
+pub type CountersFn = unsafe extern "C" fn(*mut c_void, *const Key, u32) -> i32;
+
+/// g6svc_host: the C++ the service's threads call. Each call returns 0, or 1 when the C++ threw (the C++ caller
+/// rethrows it). The control thread calls check, retire_run, share, refusal and tiers (share: null without a KV
+/// share); the compute thread retire_run and the rest, each thread with its own ctx. The compute thread's are the
+/// driver facade (idle_boundary, digest with the pool's, apply, step), the staged request (stage, unstage) and Sessions
+/// and Dispatch: abort (a cancel's terminal lines), mode (Dispatch::synchronize_mode), counters (the "m" lines due),
+/// begin (Dispatch::begin), bound (Sessions::bind) and release (Sessions::retire, Dispatch::release).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Host {
@@ -96,6 +127,18 @@ pub struct Host {
     pub share: Option<ShareFn>,
     pub refusal: Option<ReasonFn>,
     pub tiers: Option<TotalsFn>,
+    pub idle_boundary: Option<BoundaryFn>,
+    pub stage: Option<StageFn>,
+    pub unstage: Option<crate::driver::VoidFn>,
+    pub digest: Option<DigestFn>,
+    pub abort: Option<crate::driver::KeyFn>,
+    pub apply: Option<ApplyFn>,
+    pub mode: Option<crate::driver::VoidFn>,
+    pub step: Option<StepFn>,
+    pub counters: Option<CountersFn>,
+    pub begin: Option<crate::driver::BindFn>,
+    pub bound: Option<crate::driver::BindFn>,
+    pub release: Option<crate::driver::SlotFn>,
 }
 
 /// g6svc_control_cfg: the control thread's settings, and what it borrows from the C++ Service for its life: the
@@ -158,7 +201,7 @@ fn resize_cmd(epoch: u64, r: Resize) -> Cmd {
     Cmd { c: Command { epoch, ..Command::default() }, resize: Some(r) }
 }
 
-fn hook(rc: i32) -> R<()> {
+pub(super) fn hook(rc: i32) -> R<()> {
     if rc == 0 {
         Ok(())
     } else {
@@ -180,15 +223,15 @@ fn run_of(r: &g6kvman::Run) -> Run {
 }
 
 // "key":value pairs for the trace's args
-fn targ(k: &str, v: u64) -> String {
+pub(super) fn targ(k: &str, v: u64) -> String {
     format!("\"{k}\":{v}")
 }
-fn tstr(k: &str, v: &str) -> String {
+pub(super) fn tstr(k: &str, v: &str) -> String {
     format!("\"{k}\":\"{v}\"")
 }
 
 // one write per line, as fprintf to the unbuffered stderr makes it, so lines from other threads do not cut into it
-fn eline(s: String) {
+pub(super) fn eline(s: String) {
     let _ = std::io::stderr().lock().write_all(s.as_bytes());
 }
 
@@ -210,7 +253,6 @@ struct Inner {
     recall_t0: Instant,
     recall_for: u64,
     lend: Lend,
-    observe: Option<(ObserveFn, *mut c_void)>,
 }
 
 /// The head's control thread and the state the compute thread shares with it (every rank has one: the watcher and
@@ -245,6 +287,8 @@ pub struct Control {
     resizing: AtomicBool,
     stopping: AtomicBool,
     inner: Mutex<Inner>,
+    // set before the threads start; the compute thread's plain pool calls (a worker's bind) report here too
+    observe: Mutex<Observer>,
 }
 
 impl Control {
@@ -309,8 +353,8 @@ impl Control {
                 recall_t0: now,
                 recall_for: u64::MAX,
                 lend: c.lend,
-                observe: None,
             }),
+            observe: Mutex::new(None),
         })
     }
 
@@ -344,9 +388,16 @@ impl Control {
         self.stop();
         self.endpoint().fail();
     }
-    /// A test's observer of the control thread's plain pool calls; set before the control thread starts.
+    /// A test's observer of the plain pool calls (the head's control thread and a worker's binds); set before the threads
+    /// start.
     pub fn observe(&self, f: ObserveFn, ctx: *mut c_void) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).observe = Some((f, ctx));
+        *self.observe.lock().unwrap_or_else(|e| e.into_inner()) = Some((f, ctx));
+    }
+    pub(super) fn observer(&self) -> Observer {
+        *self.observe.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub(super) fn config(&self) -> &Config {
+        &self.c
     }
 
     // --- borrowed objects
@@ -406,8 +457,11 @@ impl Control {
         (std::slice::from_raw_parts(self.slots, self.n_slots), &*self.state)
     }
 
-    fn reuse(&self) -> bool {
+    pub(super) fn reuse(&self) -> bool {
         self.ops.r#match.is_some()
+    }
+    pub(super) fn counts(&self) -> bool {
+        self.ops.count
     }
     fn path(&self, name: &str) -> Vec<u8> {
         let mut p = self.dir.clone();
@@ -421,7 +475,7 @@ impl Control {
 
     // --- the plain pool calls, each run held to the module's max_run_pages
 
-    fn seen(obs: Option<(ObserveFn, *mut c_void)>, call: PoolCall) {
+    fn seen(obs: Observer, call: PoolCall) {
         if let Some((f, ctx)) = obs {
             // SAFETY: the observer and its context outlive the run (observe's contract)
             unsafe { f(ctx, &call) }
@@ -444,7 +498,7 @@ impl Control {
     fn within(&self, worst: u64) -> bool {
         self.ops.max_run_pages == 0 || worst <= u64::from(self.ops.max_run_pages) * u64::from(PAGE)
     }
-    fn room(&self, obs: Option<(ObserveFn, *mut c_void)>) -> u32 {
+    fn room(&self, obs: Observer) -> u32 {
         let n = self.pool().lock().room();
         Self::seen(obs, PoolCall { out: n, ..Self::call(CALL_ROOM) });
         if self.ops.max_run_pages != 0 {
@@ -453,7 +507,7 @@ impl Control {
             n
         }
     }
-    fn fits(&self, rows: u64, worst: u64, r: u32, obs: Option<(ObserveFn, *mut c_void)>) -> bool {
+    fn fits(&self, rows: u64, worst: u64, r: u32, obs: Observer) -> bool {
         if !self.within(worst) {
             return false;
         }
@@ -462,7 +516,7 @@ impl Control {
         f
     }
     // the refusal's message on failure: the pool said it fits and then refused, one request's bug
-    fn reserve(&self, rows: u64, worst: u64, r: u32, obs: Option<(ObserveFn, *mut c_void)>) -> Result<Run, String> {
+    pub(super) fn reserve(&self, rows: u64, worst: u64, r: u32, obs: Observer) -> Result<Run, String> {
         if !self.within(worst) {
             return Err("a run larger than the module's max_run_pages (DS41: one session's slab)".into());
         }
@@ -471,7 +525,7 @@ impl Control {
         Self::seen(obs, PoolCall { rows, worst, r, run, ..Self::call(CALL_RESERVE) });
         Ok(run)
     }
-    fn count(&self, prompt: &[i32], span: i64, ns: &Namespace, obs: Option<(ObserveFn, *mut c_void)>) -> u32 {
+    pub(super) fn count(&self, prompt: &[i32], span: i64, ns: &Namespace, obs: Observer) -> u32 {
         let n = self.pool().lock().count_namespaced(prompt, u32::try_from(span).ok(), *ns);
         let c = PoolCall {
             prompt: prompt.as_ptr(),
@@ -485,7 +539,8 @@ impl Control {
         n
     }
 
-    // --- the pool policy (PoolOps), called only inside a commit
+    // --- the pool policy (PoolOps): on this thread only inside a commit, on the compute thread at its own bind and
+    // event boundary
 
     fn r_rows(&self, q: &Request, rows: u64, worst: u64, prompt: Option<&[i32]>) -> R<u32> {
         let f = self.ops.r_rows.ok_or_else(|| refused("bad_function_call"))?;
@@ -495,19 +550,35 @@ impl Control {
         hook(unsafe { f(self.ops.ctx, q, rows, worst, p, n, prompt.is_some(), &mut out) })?;
         Ok(out)
     }
-    fn pool_match(&self, prompt: &[i32], rows: u64, worst: u64, limit: i32, ns: &Namespace, r: u32) -> R<PoolHit> {
+    pub(super) fn pool_match(
+        &self,
+        prompt: &[i32],
+        rows: u64,
+        worst: u64,
+        limit: i32,
+        ns: &Namespace,
+        r: u32,
+    ) -> R<PoolHit> {
         let f = self.ops.r#match.ok_or_else(|| refused("bad_function_call"))?;
         let mut h = no_hit();
         // SAFETY: as r_rows
         hook(unsafe { f(self.ops.ctx, prompt.as_ptr(), prompt.len(), rows, worst, limit, ns.as_ptr(), r, &mut h) })?;
         Ok(h)
     }
-    fn take(&self, h: &PoolHit, rows: u64, worst: u64, r: u32) -> R<Run> {
+    pub(super) fn take(&self, h: &PoolHit, rows: u64, worst: u64, r: u32) -> R<Run> {
         let f = self.ops.take.ok_or_else(|| refused("bad_function_call"))?;
         let mut run = Run::default();
         // SAFETY: as r_rows
         hook(unsafe { f(self.ops.ctx, h, rows, worst, r, &mut run) })?;
         Ok(run)
+    }
+    /// The pool's digest, when the policy has one.
+    pub(super) fn digest(&self) -> R<Option<u64>> {
+        let Some(f) = self.ops.digest else { return Ok(None) };
+        let mut d = 0u64;
+        // SAFETY: as r_rows
+        hook(unsafe { f(self.ops.ctx, &mut d) })?;
+        Ok(Some(d))
     }
     fn make_room(&self, slots: &[Slot], q: &Request, rows: u64, worst: u64) -> R<Option<Shrink>> {
         let f = self.ops.make_room.ok_or_else(|| refused("bad_function_call"))?;
@@ -835,7 +906,7 @@ impl Control {
     }
 
     // A grant's rows at admission: grant_rows when runs grow on demand, else its worst case.
-    fn admit_rows(&self, r: &Request) -> R<u64> {
+    pub(super) fn admit_rows(&self, r: &Request) -> R<u64> {
         if self.ops.grow { sch::grant_rows(&self.c, r) } else { sch::reserve_rows(&self.c, r) }.map_err(refused)
     }
 
@@ -847,7 +918,7 @@ impl Control {
         worst: u64,
         prompt: Option<&[i32]>,
         ns: &Namespace,
-        obs: Option<(ObserveFn, *mut c_void)>,
+        obs: Observer,
     ) -> R<(u32, PoolHit, bool)> {
         if self.ops.r_rows.is_some() {
             req.r_rows = self.r_rows(req, rows, worst, prompt)?;
@@ -875,7 +946,7 @@ impl Control {
         let worst = sch::reserve_rows(&self.c, &req).map_err(refused)?;
         let rows = self.admit_rows(&req)?;
         let ns = cache_namespace(&req.steering);
-        let obs = inn.observe;
+        let obs = self.observer();
         {
             let Inner { prompts, spans, waited, refused: refused_for, recall, recall_t0, recall_for, lend, .. } =
                 &mut *inn;
