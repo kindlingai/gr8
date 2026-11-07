@@ -4,10 +4,12 @@
 // growth, prefix reuse, cancels, a shrink, a resize, DFlash2 and parks where the shape has them. A command meant to land
 // mid-run is written from inside a head step. The step then waits for its notice in the head's trace, so the boundary
 // the notice names, and every call after it, is the same on every run. The ranks' steps meet as a fabric's would.
-// Not logged, because how many there are depends on the clock: the pool reads of the head's status (free pages, room,
-// stats, runs, tiers) and share polls that find nothing. Each scenario runs twice, its module calls as std::function
-// hooks and as a table (ModuleOps). Each rank's transcript is hashed (FNV-1a). The hashes were recorded from the service
-// before ModuleOps, in each shape.
+// The service's plain pool calls (reserve, fits, room, count) are logged by an observer: a RunPool that hides the real
+// one's methods, which every header after pool.h names in its place. Not logged, because how many there are depends on
+// the clock: the pool reads of the head's status (free pages and the room read after it, stats, runs, tiers) and share
+// polls that find nothing. Each scenario runs twice, its module calls as std::function hooks and as a table
+// (ModuleOps). Each rank's transcript is hashed (FNV-1a). The hashes were recorded from the service before PoolOps, in
+// each shape.
 //   --dump   print every transcript
 // The generator is mt19937_64 with modulo ranges, and no call takes two draws as arguments. Host only.
 #include <array>
@@ -29,6 +31,23 @@
 #include <sys/socket.h>
 #include <dirent.h>
 #include <unistd.h>
+#define RunPool RunPoolBase
+#include "../pool.h"
+#undef RunPool
+namespace g6s2 {
+// the test's observer on the pool: each plain call the service makes, with what it returned, to `see`
+class RunPool : public RunPoolBase {
+public:
+    using RunPoolBase::RunPoolBase;
+    using RunPoolBase::reserve;
+    std::function<void(const std::string&)> see;
+    uint32_t free_pages() const;
+    uint32_t room() const;
+    Run reserve(uint64_t rows, uint64_t worst, uint32_t r = 0);
+    bool fits(uint64_t rows, uint64_t worst, uint32_t r = 0) const;
+    uint32_t count(const std::vector<int>& prompt, int64_t span, const g6rt::CacheNamespace& ns = {});
+};
+} // namespace g6s2
 #include "../service.h"
 
 using namespace g6s2;
@@ -105,6 +124,34 @@ std::string str(const s2::DflReq& r) {
     return "dfl sess " + i(r.sess) + " rows " + i(r.rows) + " pos0 " + i(r.pos0) + " tok0 " + i(r.tok0) + " lo " + i(r.lo) + " q " +
            u(r.query) + " phase " + i(r.phase);
 }
+// publish_status reads free_pages and then room on the head's control thread: that room is not logged
+thread_local bool status_read = false;
+} // namespace
+uint32_t g6s2::RunPool::free_pages() const { status_read = true; return RunPoolBase::free_pages(); }
+uint32_t g6s2::RunPool::room() const {
+    const uint32_t n = RunPoolBase::room();
+    if (!std::exchange(status_read, false) && see) see("room -> " + u(n));
+    return n;
+}
+Run g6s2::RunPool::reserve(uint64_t rows, uint64_t worst, uint32_t r) {
+    status_read = false;
+    const Run x = RunPoolBase::reserve(rows, worst, r);
+    if (see) see("reserve " + u(rows) + " " + u(worst) + " r" + u(r) + " -> " + str(x));
+    return x;
+}
+bool g6s2::RunPool::fits(uint64_t rows, uint64_t worst, uint32_t r) const {
+    status_read = false;
+    const bool f = RunPoolBase::fits(rows, worst, r);
+    if (see) see("fits " + u(rows) + " " + u(worst) + " r" + u(r) + " -> " + u(f));
+    return f;
+}
+uint32_t g6s2::RunPool::count(const std::vector<int>& prompt, int64_t span, const g6rt::CacheNamespace& ns) {
+    status_read = false;
+    const uint32_t n = RunPoolBase::count(prompt, span, ns);
+    if (see) see("count " + u(prompt.size()) + "#" + u(fnv_ints(prompt)) + " span " + i(span) + " " + str(ns) + " -> " + u(n));
+    return n;
+}
+namespace {
 uint64_t mix(uint64_t a, uint64_t b, uint64_t c) {
     uint64_t x = a * 0x9E3779B97F4A7C15ull ^ (b + 0x632BE59BD9B4E019ull) * 0xBF58476D1CE4E5B9ull ^ (c + 7) * 0x94D049BB133111EBull;
     x ^= x >> 29; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 32;
@@ -177,6 +224,7 @@ struct Fake {
     std::atomic<int> claimed{-1};
     Fake(unsigned r, const Scenario& s, Lockstep& l) : rank(r), sc(s), ls(l) {
         pool = std::make_unique<RunPool>(s.pages, s.place, s.below);
+        pool->see = [this](const std::string& x) { tx(x); };
         if (s.window) { pool->tail(4, 0); pool->window(4, 0, 0); }
         if (s.reuse && !s.park) { g6rt::PrefixReuse rules; pool->keep(rules); }
     }
@@ -193,16 +241,8 @@ struct Fake {
         h.pool.pool = &p;
         h.pool.free_pages = [&p] { return p.free_pages(); };
         h.pool.room = [&p] { return p.room(); };
-        h.pool.reserve = [this, &p](uint64_t rows, uint64_t worst, uint32_t r) {
-            const Run x = p.reserve(rows, worst, r);
-            tx("reserve " + u(rows) + " " + u(worst) + " r" + u(r) + " -> " + str(x));
-            return x;
-        };
-        h.pool.fits = [this, &p](uint64_t rows, uint64_t worst, uint32_t r) {
-            const bool f = p.fits(rows, worst, r);
-            tx("fits " + u(rows) + " " + u(worst) + " r" + u(r) + " -> " + u(f));
-            return f;
-        };
+        h.pool.reserve = [&p](uint64_t rows, uint64_t worst, uint32_t r) { return p.reserve(rows, worst, r); };
+        h.pool.fits = [&p](uint64_t rows, uint64_t worst, uint32_t r) { return p.fits(rows, worst, r); };
         h.pool.digest = [this, &p] {
             uint64_t d = p.digest();
             for (const Parked& k : parked) d = (d ^ (uint64_t(k.on) + (uint64_t(k.pos) << 1))) * 0x100000001B3ull;
@@ -231,10 +271,7 @@ struct Fake {
             };
         }
         if (sc.reuse) {
-            h.pool.count = [this](const std::vector<int>& pr, int64_t span, const g6rt::CacheNamespace& ns) {
-                tx("count " + u(pr.size()) + "#" + u(fnv_ints(pr)) + " span " + i(span) + " " + str(ns));
-                return uint32_t(0);
-            };
+            h.pool.count = [&p](const std::vector<int>& pr, int64_t span, const g6rt::CacheNamespace& ns) { return p.count(pr, span, ns); };
             if (!sc.park) {
                 h.pool.retain = [this, &p](const Run& r, const g6rt::PrefixReuse& st, const g6rt::CacheNamespace& ns) {
                     tx("retain " + str(r) + " " + str(st) + " " + str(ns));
@@ -578,14 +615,14 @@ std::vector<Scenario> scenarios() {
 }
 
 struct Expect { const char* name; uint64_t h[2]; };
-// recorded from the service before ModuleOps (git 2ecb4b43)
+// recorded from the service before PoolOps (git 5ae7cebf), the pool's plain calls logged
 #if G6_MODEL_DS41
-const Expect EXPECT[] = {{"reuse", {652028632431067897ull, 14288870821311185535ull}},
-                         {"park", {16381555634043136237ull, 8985360053230262351ull}}};
+const Expect EXPECT[] = {{"reuse", {12273334368408301276ull, 1903311641579599510ull}},
+                         {"park", {5353181497655196732ull, 9462988945752174063ull}}};
 #else
-const Expect EXPECT[] = {{"reuse", {18226266933912327520ull, 10985657705981054062ull}},
-                         {"window", {17176164987038062498ull, 13857834022035593827ull}},
-                         {"dflash", {5140230150173089825ull, 11351924592827138150ull}}};
+const Expect EXPECT[] = {{"reuse", {10598747977024483389ull, 69881064300217143ull}},
+                         {"window", {7913264433038465795ull, 13857834022035593827ull}},
+                         {"dflash", {3112206073251698158ull, 11351924592827138150ull}}};
 #endif
 } // namespace
 
