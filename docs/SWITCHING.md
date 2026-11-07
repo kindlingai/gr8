@@ -88,7 +88,9 @@ orchestration:
 A two-box pair can also switch between GLM-5.3-Flash at TP=2
 ([the two-box recipe](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark)) and the TP=4 models above. The
 pair in the runs below was two DGX Sparks; the TP=4 models ran on their four-box set. Measured on 2026-11-07,
-warm, two runs each way, with GLM-5.3-Flash's engine built on gr8 `4ed9e7b`. Same columns as above:
+warm, two runs each way, with GLM-5.3-Flash on a local build of its recipe at `319ed60` with gr8 `4ed9e7b` (the
+engine the recipe pins after its gr8 bump). Same columns as above; "Down" here is the parallel
+`docker compose down` that stops and removes the old model's containers:
 
 | Switch | Down | Wait after `up -d` returns | Total |
 |---|---|---|---|
@@ -97,12 +99,12 @@ warm, two runs each way, with GLM-5.3-Flash's engine built on gr8 `4ed9e7b`. Sam
 | DeepSeek-V4.1-Flash to GLM-5.3-Flash (TP=2) | 3.2-4.2 s | 23.8-24.0 s | 28.5 / 29.3 s |
 | GLM-5.3-Flash (TP=2) to DeepSeek-V4.1-Flash | 3.1-3.6 s | 34.0-35.4 s | 39.7 / 40.2 s |
 
-- The Flash stop is quick on this engine build: 3.1-4.3 s. On the recipe's engine 32 commits back
-  (gr8 `16351164`), the same stop waited out about 13-14 s; gr8 #429 ended that linger.
-- The pair's boot is the read of its about 86 GB of weights: the pack loads 21.2 s into the boot, the graphs
-  capture at 22.1 s, and the engines report ready 23 s in. The first boot after the weights are in place cost the
-  same as the warm restart (24.8 s after `up -d` returned, both; the first boot's total, with nothing to stop
-  first, was 26.5 s), so the Flash side gains nothing from
+- The pair's stop-and-remove on this engine build took 3.1-4.3 s. On the recipe's engine 32 commits back
+  (gr8 `16351164`), the same phase took about 13-14 s, most of it the fixed quit wait that gr8 #429 removed.
+- The pair's boot is loading its about 86 GB of weights and starting the engines: the pack loads 21.2 s into the
+  boot, the graphs capture at 22.1 s, and the engines report ready 23 s in. The first boot after the weights are
+  in place cost the same as the warm restart (24.8 s after `up -d` returned, both; the first boot's whole-run
+  total, with nothing to stop first, was 26.5 s), so the Flash side gains nothing from
   `GR8_GEN_CACHE`: its generated-tensor build is not a boot cost. The runs kept the recipe's published setting,
   gen cache off.
 - Chats survive the pair's round trip. Four Flash chats, their next turn replayed after a full round trip to the
