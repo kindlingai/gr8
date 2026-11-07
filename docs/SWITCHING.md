@@ -52,7 +52,8 @@ The head's `/health` reports `"ready":true` when the new model serves.
 whose NVMe is PCIe Gen4. GLM-5.3 from the image `ghcr.io/kindlingai/gr8:sha-7962e74`, DeepSeek from the recipe built
 on gr8 `7962e74`. Warm (gen cache written), two runs each way. "Down" is the old model's `down` on all four. "Wait
 after `up -d` returns" runs from the moment the new model's `up -d` returns until `/health` reports ready. The total
-runs from the start of `down` to ready, so it also holds the 3.1-3.3 s that the `up -d` commands themselves take:
+runs from the start of `down` to ready, so it also holds the 3.1-3.3 s between `down` finishing and `up -d`
+returning, including orchestration:
 
 | Switch | Down | Wait after `up -d` returns | Total |
 |---|---|---|---|
