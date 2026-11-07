@@ -56,4 +56,4 @@ void run(int M,int keys){
     same("stock late consumer after handoff",lg,lf,size_t(tail)*TOPK);
     printf("M=%d Q=%d keys=%d nonzero-slot=%d PASS\n",M,Q,keys,slot);
 }
-int main(){run(129,512);run(65,20032);CK(cudaDeviceSynchronize());puts("PASS v2 owned index and candidate handoff; fabric/model eval NOT measured");}
+int main(){run(129,512);run(65,20032);run(8192,64);CK(cudaDeviceSynchronize());puts("PASS v2 owned index and candidate handoff; fabric/model eval NOT measured");}
