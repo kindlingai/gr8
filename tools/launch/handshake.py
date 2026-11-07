@@ -92,6 +92,7 @@ class Head:
     def __init__(self, own, drop_s=DROP_S, clock=time.monotonic):
         self.own, self.have, self.verdict = own, {0: own}, None
         self.seen, self.first, self.drop_s, self.clock = {}, None, drop_s, clock
+        self.told = set()   # the ranks that got a refusal
         self.cv = threading.Condition()
         self.tp = int(own['opts']['tp']) if own else 0
 
@@ -106,6 +107,9 @@ class Head:
         """A hello or a verdict poll. Never blocks."""
         with self.cv:
             v = self.verdict
+            if v and v['t'] != 'ok':
+                self.told.add(m.get('rank'))
+                self.cv.notify_all()
             if m.get('t') == 'hello':
                 if v and v['t'] == 'ok':
                     return {'t': 'refused', 'field': 'booted', 'values': {}, 'exit': 4,
@@ -115,6 +119,7 @@ class Head:
                 bad = compare(self.own, m, peer, self.have)
                 if bad:
                     self.verdict = bad
+                    self.told.add(m.get('rank'))
                     self.cv.notify_all()
                     return bad
                 self.have[m['rank']] = m
@@ -162,6 +167,17 @@ class Head:
                 self.verdict = self.failed_checks()
             self.cv.notify_all()
             return self.verdict is None
+
+    def wait_told(self, timeout, stop=None):
+        """Wait until every worker rank has got the refusal, a stop, or the timeout. True when all were told (or
+        there are no ranks to tell: a head that refused before it read its own options)."""
+        end = self.clock() + timeout
+        with self.cv:
+            while not set(range(1, self.tp)) <= self.told:
+                if (stop is not None and stop.is_set()) or self.clock() >= end:
+                    return False
+                self.cv.wait(min(0.5, max(0.0, end - self.clock())))
+            return True
 
     def decide(self, verdict):
         with self.cv:
