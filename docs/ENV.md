@@ -375,7 +375,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_L2PF_WAVE` | int | `8` | 1..32 | Sets the most 8 KiB GR8_L2PF prefetch chunks issued per poll. |
 | `GR8_LOADER` | text | the Rust loader | cpp | cpp loads a pack through the C++ path instead of the Rust loader. |
 | `GR8_LOAD_CHUNK_MB` | int | `32` | 1.. | Sets the chunk size in MB that the Rust loader reads and the weight check sums. |
-| `GR8_LOAD_MERGE_KB` | int | `0` | 0.. | 0 = the Rust loader reads each file range with its own read. N > 0 = in read mode it sorts each chunk's ranges by file offset and reads the ranges of one file that are at most N KB apart with one read, gaps included. Same bytes. |
+| `GR8_LOAD_MERGE_KB` | int | `0` | 0.. | 0 = the Rust loader reads each file range with its own read. N > 0 = in read mode it sorts each chunk's ranges by file offset and reads the ranges of one file that are at most N KB apart with one read, gaps included. Same bytes. Measured gains by drive class: docs/SWITCHING.md. |
 | `GR8_LOAD_MODE` | text | `read` | read\|mmap | Picks how the Rust loader reads weight files: read or mmap. Other values fail the load. |
 | `GR8_LOAD_PROF` | flag | `0` | 0\|1 | 1 = the Rust loader prints one load-prof line at the end of the load: time, bytes and calls per operation (zero fill, copies, O_DIRECT and buffered reads, generated tensors). Same bytes. |
 | `GR8_LOAD_THREADS` | int | `8` | 1.. | Sets the number of Rust loader worker threads. |

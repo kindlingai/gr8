@@ -52,7 +52,7 @@ knobs:
     doc: >-
       0 = the Rust loader reads each file range with its own read. N > 0 = in read mode it sorts each chunk's ranges by
       file offset and reads the ranges of one file that are at most N KB apart with one read, gaps included. Same
-      bytes.
+      bytes. Measured gains by drive class: docs/SWITCHING.md.
   GR8_LOAD_MODE:
     scope: local
     kind: text

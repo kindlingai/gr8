@@ -67,5 +67,9 @@ returning, including orchestration:
 - The slowest boxes set each start. DeepSeek: the DGX Spark ranks were ready 13-15 s after the start, the Gen4 boxes
   27-30 s, reading 79.6 GB of gen cache each. GLM-5.3: the DGX Sparks read their 78.3 GB of weights in 15 s, the Gen4
   boxes in 59-60 s. The loader, not the drive, sets that time: it reads at 31-46% of each drive's sequential speed.
+- `GR8_LOAD_MERGE_KB=1024` makes the loader read each chunk's file ranges in file order, one read for ranges up to
+  1 MB apart. Measured warm on 2026-11-07, GLM-5.3 at TP=4: a DGX Spark rank's load went from 18.5-19.1 s to 11.9 s,
+  reading 223.4 GB of file for its 78.3 GB (about 2.9x). A Gen4 box's went from 62.2-63.6 s to 56.8-59.0 s, so leave
+  it off (0, the default) there.
 - First starts, which write the gen cache, from `up -d` returning to ready: DeepSeek 226 s, 79.6 GB on each box's
   disk; GLM-5.3 73 s, 4.8 GB a box. At TP=4 GLM-5.3 computes few tensors at load, so its gen cache saves little.
