@@ -123,35 +123,6 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         wrote(e);
     };
     h.pool.pool = &pool;   // the driver releases runs on it itself when nothing is retained
-    h.pool.free_pages = [&] { return pool.free_pages(); };
-    h.pool.room = [&] { return pool.room(); };
-    h.pool.reserve = [&](uint64_t n, uint64_t worst, uint32_t r) { return pool.reserve(n, worst, r); };
-    h.pool.fits = [&](uint64_t n, uint64_t worst, uint32_t r) { return pool.fits(n, worst, r); };
-    h.pool.digest = [&]() -> uint64_t {
-        if (!ck) return pool.digest();
-        std::lock_guard<std::mutex> l(ck_mu);
-        return pool.digest() ^ (ck->index().digest() * 0x9E3779B97F4A7C15ull);
-    };
-    if (ck) {
-        // a retiring run goes back to the pool: its aligned checkpoint, if any, was taken during its prefill. terminal:
-        // first keep rows [0, p), p = the rows it consumed (its last output token is pending: token p), with the KDA
-        // state its session's ring holds for p (flash_checkpoint.h: not cold-exact). Every rank retires at the same step.
-        // A session cancelled at the boundary its aligned capture waits for: that capture first, so the entry for those
-        // tokens is the aligned one (a terminal capture of the same tokens then only touches it)
-        h.pool.match = [&](const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit, const g6rt::CacheNamespace& ns,
-                           uint32_t r) {
-            std::lock_guard<std::mutex> l(ck_mu);
-            const FlashHit f = ck->index().match(prompt, limit, ns);
-            PoolHit hit; hit.lcp = f.lcp; hit.why = f.why;
-            if (f.hit && pool.fits(rows, worst, r)) { hit.skip = int(f.position); hit.age = f.generation; }
-            else if (f.hit) hit.why = "room";
-            return hit;
-        };
-        h.pool.take = [&](const PoolHit& hit, uint64_t rows, uint64_t worst, uint32_t r) {
-            claimed.store(hit.age);
-            return pool.reserve(rows, worst, r);
-        };
-    }
     // GR8_GLM53F_CACHE at bind, after the session's cold reset: a hit's entry into the run's rows [0, reuse) and the
     // session's first KDA slot, then the prompt's checkpoint point
     auto bind_ckpt = [&](const Grant& g, int q, const std::vector<int>& list) {
@@ -587,6 +558,44 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     if (extra.dfl_start) o.dfl_start = mod::dfl_start<M, &M::on_dfl_start>;
     if (extra.dfl) o.dfl = mod::dfl<M, &M::on_dfl>;
     if (extra.flash_room) o.flash_room = mod::flash_room<M, &M::on_flash_room>;
+    // Flash's pool policy (PoolOps), as its module above
+#define FLASH_POOL_CAPTURES(X) X(pool) X(ck) X(ck_mu) X(claimed)
+    G6S2_CAPTURE_TYPE(claimed)
+    struct FlashPool : ModuleCtx {
+        FLASH_POOL_CAPTURES(G6S2_CAPTURE_REF)
+        uint64_t on_digest() {
+            if (!ck) return pool.digest();
+            std::lock_guard<std::mutex> l(ck_mu);
+            return pool.digest() ^ (ck->index().digest() * 0x9E3779B97F4A7C15ull);
+        }
+        // a retiring run goes back to the pool: its aligned checkpoint, if any, was taken during its prefill. terminal:
+        // first keep rows [0, p), p = the rows it consumed (its last output token is pending: token p), with the KDA
+        // state its session's ring holds for p (flash_checkpoint.h: not cold-exact). Every rank retires at the same step.
+        // A session cancelled at the boundary its aligned capture waits for: that capture first, so the entry for those
+        // tokens is the aligned one (a terminal capture of the same tokens then only touches it)
+        PoolHit on_match(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit, const g6rt::CacheNamespace& ns,
+                         uint32_t r) {
+            std::lock_guard<std::mutex> l(ck_mu);
+            const FlashHit f = ck->index().match(prompt, limit, ns);
+            PoolHit hit; hit.lcp = f.lcp; hit.why = f.why;
+            if (f.hit && pool.fits(rows, worst, r)) { hit.skip = int(f.position); hit.age = f.generation; }
+            else if (f.hit) hit.why = "room";
+            return hit;
+        }
+        Run on_take(const PoolHit& hit, uint64_t rows, uint64_t worst, uint32_t r) {
+            claimed.store(hit.age);
+            return pool.reserve(rows, worst, r);
+        }
+    };
+    FlashPool fp{{}, FLASH_POOL_CAPTURES(G6S2_CAPTURE_ARG)};
+#undef FLASH_POOL_CAPTURES
+    using P = FlashPool;
+    g6s2_pool_ops& po = h.pool.ops = pol::table(fp, pool);
+    po.digest = pol::digest<P, &P::on_digest>;
+    if (ck) {
+        po.match = pol::match<P, &P::on_match>;
+        po.take = pol::take<P, &P::on_take>;
+    }
     ControlLinks links = bootstrap(bc);
     try {
         if (multi) capture_all();

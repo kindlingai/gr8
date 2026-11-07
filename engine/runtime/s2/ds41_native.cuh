@@ -93,62 +93,6 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
     auto fence = [&] { G6RT_CK(cudaStreamSynchronize(c.stream)); };
     NativeHooks h;
     h.pool.pool = &pool;   // the driver releases runs on it itself when nothing is retained
-    h.pool.free_pages = [&] { return pool.free_pages(); };
-    h.pool.room = [&] { return std::min(pool.room(), slot_pages); };
-    h.pool.reserve = [&](uint64_t n, uint64_t worst, uint32_t r) {
-        require(worst <= uint64_t(slot_pages) * PAGE, "DS41 run larger than one session's slab");
-        return pool.reserve(n, worst, r);
-    };
-    h.pool.fits = [&](uint64_t n, uint64_t worst, uint32_t r) { return worst <= uint64_t(slot_pages) * PAGE && pool.fits(n, worst, r); };
-    h.pool.digest = [&]() -> uint64_t {
-        if (!ck) return pool.digest();
-        std::lock_guard<std::mutex> l(ck_mu);
-        uint64_t d = pool.digest() ^ (ck->digest() * 0x9E3779B97F4A7C15ull);
-        if (sc.park) {   // the parked table and the snapshot ownership too, so a rank whose park state differs fails at the next event
-            for (int q = 0; q < slots; ++q) {
-                const Parked& k = parked[size_t(q)];
-                d = (d ^ (uint64_t(k.on) + (uint64_t(k.pos) << 1) + (uint64_t(q) << 40))) * 0x100000001B3ull;
-                for (int t : k.tokens) d = (d ^ uint32_t(t)) * 0x100000001B3ull;
-                for (auto b : k.ns) d = (d ^ uint64_t(b)) * 0x100000001B3ull;
-            }
-            d ^= ck->park_digest() * 0xBF58476D1CE4E5B9ull;
-            d ^= snaps.digest() * 0x94D049BB133111EBull;
-        }
-        return d;
-    };
-    if (ck) {
-        h.pool.match = [&](const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit, const CacheNamespace& ns, uint32_t r) {
-            std::lock_guard<std::mutex> l(ck_mu);
-            const Ds41PrefixHit f = ck->match(prompt, limit, ns);
-            PoolHit hit; hit.lcp = f.lcp; hit.why = f.why;
-            // park: the parked slot whose tokens the prompt extends, when it reaches at least as far as the cache's hit
-            // (the same state; a tie goes to the slot, no copy). Longest first, then the lowest slot
-            int q = -1;
-            for (int i = 0; sc.park && i < slots; ++i) {
-                const Parked& k = parked[size_t(i)];
-                if (!k.on || k.ns != ns || !k.pos || k.pos > uint32_t(std::max(limit, 0)) ||
-                    g6rt::PrefixReuse::common_prefix(k.tokens, prompt) < int(k.pos)) continue;
-                if (q < 0 || k.pos > parked[size_t(q)].pos) q = i;
-            }
-            if (q >= 0 && (!f.hit || parked[size_t(q)].pos >= f.position)) {
-                hit.lcp = std::max(hit.lcp, int(parked[size_t(q)].pos));
-                if (pool.fits(rows, worst, r)) { hit.skip = int(parked[size_t(q)].pos); hit.slot = q; hit.why = "parked"; }
-                else hit.why = "room";
-                return hit;
-            }
-            if (f.hit && pool.fits(rows, worst, r)) { hit.skip = int(f.position); hit.age = f.generation; }
-            else if (f.hit) hit.why = "room";
-            return hit;
-        };
-        h.pool.take = [&](const PoolHit& hit, uint64_t rows, uint64_t worst, uint32_t r) {
-            if (hit.slot >= 0) claimed_slot.store(hit.slot); else claimed.store(hit.age);
-            return pool.reserve(rows, worst, r);
-        };
-        h.pool.tiers = [&] {
-            std::lock_guard<std::mutex> l(ck_mu);
-            return std::vector<g6kv_tier_totals>{ck->tier_stat()};
-        };
-    }
     auto capture_prompt_end = [&](const Slot& s, const Payload& p, uint32_t end) {
         if (!ck || p.prompt.empty() || end != p.prompt.size() - 1) return;
         const CacheNamespace ns = steering::cache_namespace(s.req.steering);
@@ -426,6 +370,69 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
     if (c.prefill2)   // a quantum of W + 1 .. 2W rows: lane A + lane B, one fence; up to W rows: the one-lane callee, as above
         o.prefill_seq = mod::prefill_seq<M, &M::on_prefill_seq2>;
     if (c.prefill_pack) o.prefill_pack = mod::prefill_pack<M, &M::on_prefill_pack>;
+    // DS41's pool policy (PoolOps), as its module above
+#define DS41_POOL_CAPTURES(X) X(sc) X(slots) X(pool) X(ck) X(ck_mu) X(claimed) X(parked) X(claimed_slot) X(snaps)
+    struct Ds41Pool : ModuleCtx {
+        DS41_POOL_CAPTURES(G6S2_CAPTURE_REF)
+        uint64_t on_digest() {
+            if (!ck) return pool.digest();
+            std::lock_guard<std::mutex> l(ck_mu);
+            uint64_t d = pool.digest() ^ (ck->digest() * 0x9E3779B97F4A7C15ull);
+            if (sc.park) {   // the parked table and the snapshot ownership too, so a rank whose park state differs fails at the next event
+                for (int q = 0; q < slots; ++q) {
+                    const Parked& k = parked[size_t(q)];
+                    d = (d ^ (uint64_t(k.on) + (uint64_t(k.pos) << 1) + (uint64_t(q) << 40))) * 0x100000001B3ull;
+                    for (int t : k.tokens) d = (d ^ uint32_t(t)) * 0x100000001B3ull;
+                    for (auto b : k.ns) d = (d ^ uint64_t(b)) * 0x100000001B3ull;
+                }
+                d ^= ck->park_digest() * 0xBF58476D1CE4E5B9ull;
+                d ^= snaps.digest() * 0x94D049BB133111EBull;
+            }
+            return d;
+        }
+        PoolHit on_match(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit, const CacheNamespace& ns, uint32_t r) {
+            std::lock_guard<std::mutex> l(ck_mu);
+            const Ds41PrefixHit f = ck->match(prompt, limit, ns);
+            PoolHit hit; hit.lcp = f.lcp; hit.why = f.why;
+            // park: the parked slot whose tokens the prompt extends, when it reaches at least as far as the cache's hit
+            // (the same state; a tie goes to the slot, no copy). Longest first, then the lowest slot
+            int q = -1;
+            for (int i = 0; sc.park && i < slots; ++i) {
+                const Parked& k = parked[size_t(i)];
+                if (!k.on || k.ns != ns || !k.pos || k.pos > uint32_t(std::max(limit, 0)) ||
+                    g6rt::PrefixReuse::common_prefix(k.tokens, prompt) < int(k.pos)) continue;
+                if (q < 0 || k.pos > parked[size_t(q)].pos) q = i;
+            }
+            if (q >= 0 && (!f.hit || parked[size_t(q)].pos >= f.position)) {
+                hit.lcp = std::max(hit.lcp, int(parked[size_t(q)].pos));
+                if (pool.fits(rows, worst, r)) { hit.skip = int(parked[size_t(q)].pos); hit.slot = q; hit.why = "parked"; }
+                else hit.why = "room";
+                return hit;
+            }
+            if (f.hit && pool.fits(rows, worst, r)) { hit.skip = int(f.position); hit.age = f.generation; }
+            else if (f.hit) hit.why = "room";
+            return hit;
+        }
+        Run on_take(const PoolHit& hit, uint64_t rows, uint64_t worst, uint32_t r) {
+            if (hit.slot >= 0) claimed_slot.store(hit.slot); else claimed.store(hit.age);
+            return pool.reserve(rows, worst, r);
+        }
+        std::vector<g6kv_tier_totals> on_tiers() {
+            std::lock_guard<std::mutex> l(ck_mu);
+            return std::vector<g6kv_tier_totals>{ck->tier_stat()};
+        }
+    };
+    Ds41Pool dp{{}, DS41_POOL_CAPTURES(G6S2_CAPTURE_ARG)};
+#undef DS41_POOL_CAPTURES
+    using P = Ds41Pool;
+    g6s2_pool_ops& po = h.pool.ops = pol::table(dp, pool);
+    po.max_run_pages = slot_pages;   // SESS > 1: one run fits one slot's slabs
+    po.digest = pol::digest<P, &P::on_digest>;
+    if (ck) {
+        po.match = pol::match<P, &P::on_match>;
+        po.take = pol::take<P, &P::on_take>;
+        po.tiers = pol::tiers<P, &P::on_tiers>;
+    }
     ControlLinks links = bootstrap(bc);
     try {
         wcheck::seal(c.main.rank);

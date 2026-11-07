@@ -23,6 +23,7 @@ pub mod module;
 pub mod ngram;
 pub mod planner;
 pub mod planner_ffi;
+pub mod pool_ops;
 pub mod request;
 pub mod scheduler;
 pub mod service;
