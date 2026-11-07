@@ -129,6 +129,8 @@ bool ds41_c2_trace_on();
 #include "ds41_pf_split.h"
 #include "ds41_rs.h"
 #include "ds41_prefill_fabric.h"
+#include "ds41_v2.h"
+#include "ds41_v2_walk.h"
 #include "ds41_knobs.h"
 #endif
 #include "s2/flash_checkpoint.h"   // GR8_GLM53F_CACHE parsed in every build, refused outside Flash
@@ -1556,6 +1558,7 @@ int main(int argc, char** argv)
         // GR8_DS_PF_LANES=2 (ds41_lanes.h): two-lane W prefill, quanta of up to 2W rows of one session; unset / 1 = one lane
         const int pf_lanes = ds41::lanes::parse(DS41_TEXT(knob::ds_pf_lanes()));
         if (!pf_lanes) die(ds41::lanes::kParseError);
+        const bool pf_v2 = knob::ds_pf_v2();  // boot-once; also in the agreed runtime signature
         if (pf_lanes == 2 && !pf_min) die("GR8_DS_PF_LANES=2 needs W-row prefill (GR8_DS_PREFILL_MIN)");
         bc.prefill_min = (uint32_t)pf_min;
         if (pf_min) g6s2::ds41_prefill_lanes(sc, (uint32_t)m.hc_rows, pf_lanes);
@@ -1637,6 +1640,11 @@ int main(int argc, char** argv)
         if (pf_tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
         ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1); the value the fabric plan set
         if (ds41::br::l20_tail() && !pf_tail) die("GR8_DS_PF_L20_TAIL=1 needs GR8_DS_PF_TAIL (layer 20 joins the bounded replay)");
+        if (pf_v2 && (!pf_min || !ds41::v2::boot_ok(m.hc_rows, pf_tail, g6nr::NR, pf_lanes,
+                                                    ds41::br::late_layer_start())))
+            die("GR8_DS_PF_V2 needs W-row prefill, TP4, one lane, tail 128 and the range boundary at layer 21");
+        if (pf_v2)
+            fprintf(stderr, "# rank %d GR8_DS_PF_V2=1 bootstrap conductor: stock math/layout callbacks, W=%d; not a speed arm\n", R, m.hc_rows);
         if (pf_min) fprintf(stderr, "# rank %d DS41 prefill bounded replay tail %d (layers >= %d)\n", R, pf_tail, ds41::br::late_layer_start());
         if (pf_min && ds41::br::l20_tail())
             fprintf(stderr, "# rank %d DS41 GR8_DS_PF_L20_TAIL=1: layer 20 in the bounded replay (ca row on every row, the rest of the layer on the tail rows)\n", R);
@@ -1745,7 +1753,16 @@ int main(int argc, char** argv)
                     fprintf(stderr, "# rank %d request %llu chunk %u rows %u late tail skipped (rows after %d)\n", R, (unsigned long long)c.request, c.first, c.rows, rows_after);
                 // skip_late: range A without its last op ST_PF_COMPACT (split.b - 1, check_split), no range B
                 Ds41SpanPass span_pass(R, (int)c.rows, st, 0);   // GR8_DS_SPAN: the chunk's ops, a mark each
-                ds41::Stop stop = ds41_run_pass(split.ops, 0, skip_late ? split.b - 1 : split.b, &m, (int)c.rows, st, span_pass);
+                const size_t range_a_end = skip_late ? split.b - 1 : split.b;
+                ds41::Stop stop;
+                if (pf_v2) {
+                    // M0: exercise the new conductor with stock callbacks. The
+                    // numerical hook replacements land separately; this stage
+                    // neither claims own-row execution nor a prefill speed win.
+                    stop = ds41::v2::walk_stock(split.ops, range_a_end, [&](const ds41::v2::Run& run) {
+                        return ds41_run_pass(split.ops, run.begin, run.end, &m, (int)c.rows, st, span_pass);
+                    });
+                } else stop = ds41_run_pass(split.ops, 0, range_a_end, &m, (int)c.rows, st, span_pass);
                 if (!stop.stopped && split.on() && !skip_late) {   // range B: the layers >= 21 over the chunk's last `late` rows (now rows 0 .. late-1)
                     ds41_attn_set_win_floor(ds41::br::win_floor((int)c.context, (int)c.rows, pf_tail));
                     stop = ds41_run_pass(split.ops, split.b, split.ops.size(), &m, late, st, span_pass);
