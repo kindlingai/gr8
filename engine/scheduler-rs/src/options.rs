@@ -8,9 +8,10 @@
 //! libgr8knobs.a at link time. Two pieces stay C++ and arrive in `Host`: the DSpark knob parse (ds41_dspark.h
 //! parse_knobs, which DS41's serve path and tests also call) and the Engram collective count (ds41_engram_boot.h).
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CStr};
+use std::io::Write;
 
-use crate::cstd::{c_atof, c_atoi, c_strtol10, c_strtoul10, c_strtoull10, read_ints};
+use crate::cstd::{c_atof, c_atoi, c_strtol10, c_strtoul10, c_strtoull10, cs, read_ints};
 use crate::ffi::Ints;
 use crate::knob_ids as kid;
 use crate::module_info::{ModuleInfo, MODEL_DS41, MODEL_GLM53F, MODULE_ABI};
@@ -216,6 +217,9 @@ pub struct Options {
     pub qp_wire_e: i32,
 }
 
+/// An option value or message: bytes, as the C++ kept them, whatever their encoding.
+pub type Str = Vec<u8>;
+
 // ---------------------------------------------------------------------------------------------------- the knob table
 
 struct Knobs<'a>(&'a KnobApi);
@@ -239,11 +243,11 @@ impl Knobs<'_> {
         // SAFETY: as above
         (unsafe { f(id, 0, &mut v) } != 0).then_some(v)
     }
-    fn text_opt(&self, id: u32) -> Option<String> {
+    fn text_opt(&self, id: u32) -> Option<Str> {
         let f = self.0.text?;
         // SAFETY: the C API returns null or a string that lives for the process
         let p = unsafe { f(id, 0) };
-        (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+        (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_bytes().to_vec())
     }
     fn ints_opt(&self, id: u32) -> Option<Vec<i64>> {
         let f = self.0.ints?;
@@ -269,20 +273,20 @@ impl Knobs<'_> {
     fn float(&self, id: u32) -> f64 {
         self.float_opt(id).unwrap_or(0.0)
     }
-    fn text(&self, id: u32) -> String {
+    fn text(&self, id: u32) -> Str {
         self.text_opt(id).unwrap_or_default()
     }
     fn floats(&self, id: u32) -> Vec<f64> {
         self.floats_n(id, 0).unwrap_or_default()
     }
-    fn tests_set(&self) -> String {
-        let Some(f) = self.0.tests_set else { return String::new() };
+    fn tests_set(&self) -> Str {
+        let Some(f) = self.0.tests_set else { return Str::new() };
         // SAFETY: as text_opt
         let p = unsafe { f() };
         if p.is_null() {
-            String::new()
+            Str::new()
         } else {
-            unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+            unsafe { CStr::from_ptr(p) }.to_bytes().to_vec()
         }
     }
 }
@@ -336,17 +340,17 @@ impl Plan {
 /// engine_opts.h CommonOpts: the flags m4sim takes too
 #[derive(Clone, Debug)]
 pub struct Common {
-    pub v2_dir: String,
-    pub v2_slices: String,
-    pub v2_widths: String,
-    pub v2_dense: String,
-    pub v2_layout: String,
+    pub v2_dir: Str,
+    pub v2_slices: Str,
+    pub v2_widths: Str,
+    pub v2_dense: Str,
+    pub v2_layout: Str,
     pub v2_trellis: bool,
-    pub qo_man: String,
-    pub qo_file: String,
-    pub layers_s: String,
-    pub levels_s: String,
-    pub prompts: Vec<String>,
+    pub qo_man: Str,
+    pub qo_file: Str,
+    pub layers_s: Str,
+    pub levels_s: Str,
+    pub prompts: Vec<Str>,
     pub cap: i32,
     pub mp: i32,
     pub top: i32,
@@ -369,16 +373,16 @@ pub struct Common {
 impl Default for Common {
     fn default() -> Self {
         Common {
-            v2_dir: String::new(),
-            v2_slices: String::new(),
-            v2_widths: String::new(),
-            v2_dense: String::new(),
-            v2_layout: String::new(),
+            v2_dir: Str::new(),
+            v2_slices: Str::new(),
+            v2_widths: Str::new(),
+            v2_dense: Str::new(),
+            v2_layout: Str::new(),
             v2_trellis: true,
-            qo_man: String::new(),
-            qo_file: String::new(),
+            qo_man: Str::new(),
+            qo_file: Str::new(),
             layers_s: "0,3,40,77".into(),
-            levels_s: String::new(),
+            levels_s: Str::new(),
             prompts: Vec::new(),
             cap: 64,
             mp: 0,
@@ -451,19 +455,19 @@ pub struct KStop {
 #[derive(Clone, Debug, Default)]
 pub struct Opts {
     pub rank: i32,
-    pub ips: Vec<String>,
-    pub ips2: Vec<String>,
+    pub ips: Vec<Str>,
+    pub ips2: Vec<Str>,
     pub ring: bool,
-    pub ring_devs: Vec<String>,
+    pub ring_devs: Vec<Str>,
     pub proxy_cpu: i32,
-    pub pf_ips2: Vec<String>,
-    pub manifest: String,
-    pub packfile: String,
+    pub pf_ips2: Vec<Str>,
+    pub manifest: Str,
+    pub packfile: Str,
     pub co: Common,
-    pub qp_man: String,
-    pub qp_file: String,
-    pub dfl_man: String,
-    pub dfl_file: String,
+    pub qp_man: Str,
+    pub qp_file: Str,
+    pub dfl_man: Str,
+    pub dfl_file: Str,
     pub dfl_sel: i32,
     pub dfl_k: i32,
     pub spec_reset_per_request: bool,
@@ -474,23 +478,23 @@ pub struct Opts {
     pub reuse_prefix: bool,
     pub check_args: bool,
     pub lanes_explicit: bool,
-    pub s2dir: String,
-    pub grammar_dir: String,
-    pub kv_tiers: Vec<String>,
-    pub kv_keep: String,
+    pub s2dir: Str,
+    pub grammar_dir: Str,
+    pub kv_tiers: Vec<Str>,
+    pub kv_keep: Str,
     pub kv_system_after: i32,
     pub kv_write_limit: f64,
-    pub kv_format: String,
+    pub kv_format: Str,
     pub kv_old: bool,
     pub kv_old_all: bool,
-    pub set_id: String,
-    pub steering_dir: String,
-    pub steering_force_s: String,
-    pub steering_model_revision: String,
-    pub steering_tokenizer_revision: String,
-    pub steering_template_digest: String,
-    pub steering_weight_set: String,
-    pub steering_template_file: String,
+    pub set_id: Str,
+    pub steering_dir: Str,
+    pub steering_force_s: Str,
+    pub steering_model_revision: Str,
+    pub steering_tokenizer_revision: Str,
+    pub steering_template_digest: Str,
+    pub steering_weight_set: Str,
+    pub steering_template_file: Str,
     pub s2port: i32,
     pub s2sess: i32,
     pub s2epoch: u64,
@@ -541,7 +545,7 @@ pub struct Opts {
 }
 
 /// The prompt both mains run when none is given (engine_opts.h DEFAULT_PROMPT).
-pub const DEFAULT_PROMPT: &str = "154822,154824,154826,25062";
+pub const DEFAULT_PROMPT: &[u8] = b"154822,154824,154826,25062";
 
 fn add(v: &mut Vec<i32>, m: i32) {
     if !v.contains(&m) {
@@ -550,33 +554,45 @@ fn add(v: &mut Vec<i32>, m: i32) {
 }
 
 /// engine_options.h eopt::split: "a,,b" keeps the empty piece, a trailing separator adds none
-fn split(s: &str, c: char) -> Vec<String> {
-    let mut v: Vec<String> = s.split(c).map(str::to_string).collect();
+fn split(s: &[u8], c: u8) -> Vec<Str> {
+    let mut v: Vec<Str> = s.split(|&b| b == c).map(<[u8]>::to_vec).collect();
     if v.last().is_some_and(|x| x.is_empty()) {
         v.pop();
     }
     v
 }
 
+fn cat(parts: &[&[u8]]) -> Str {
+    parts.concat()
+}
+
+fn has(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// a line to stderr, its bytes as they are
+fn err_line(b: &[u8]) {
+    let _ = std::io::stderr().write_all(b);
+}
+
 /// rank_host.h die
-fn die(m: &str) -> ! {
-    eprint!("g6: {m}\n");
+fn die(m: &[u8]) -> ! {
+    err_line(&cat(&[b"g6: ", m, b"\n"]));
     std::process::exit(2)
 }
 
 /// rank_host.h parse_ints: comma-separated integers, "@file" read from a file, "all" every main layer
-fn parse_ints(s: &str, layers: i32) -> Vec<i32> {
-    if s == "all" {
+fn parse_ints(s: &[u8], layers: i32) -> Vec<i32> {
+    if s == b"all" {
         return (0..layers).collect();
     }
-    if let Some(path) = s.strip_prefix('@') {
-        return read_ints(path).unwrap_or_else(|| die(&format!("cannot read {path}")));
+    if let Some(path) = s.strip_prefix(b"@") {
+        return read_ints(path).unwrap_or_else(|| die(&cat(&[b"cannot read ", path])));
     }
     let mut v = Vec::new();
-    let b = s.as_bytes();
     let mut p = 0;
-    while p < b.len() {
-        let q = s[p..].find(',').map_or(s.len(), |i| p + i);
+    while p < s.len() {
+        let q = s[p..].iter().position(|&c| c == b',').map_or(s.len(), |i| p + i);
         v.push(c_atoi(&s[p..q]));
         p = q + 1;
     }
@@ -584,46 +600,46 @@ fn parse_ints(s: &str, layers: i32) -> Vec<i32> {
 }
 
 /// engine_opts.h common_arg: Ok(true) when `a` is a shared flag
-fn common_arg(a: &str, next: &mut dyn FnMut() -> Result<String, String>, o: &mut Common) -> Result<bool, String> {
+fn common_arg(a: &[u8], next: &mut dyn FnMut() -> Result<Str, Str>, o: &mut Common) -> Result<bool, Str> {
     match a {
-        "--v2" => o.v2_dir = next()?,
-        "--v2-slices" => o.v2_slices = next()?,
-        "--v2-widths" => o.v2_widths = next()?,
-        "--v2-dense" => o.v2_dense = next()?,
-        "--layout" => o.v2_layout = next()?,
-        "--v2-dense-form" => {
+        b"--v2" => o.v2_dir = next()?,
+        b"--v2-slices" => o.v2_slices = next()?,
+        b"--v2-widths" => o.v2_widths = next()?,
+        b"--v2-dense" => o.v2_dense = next()?,
+        b"--layout" => o.v2_layout = next()?,
+        b"--v2-dense-form" => {
             let f = next()?;
-            if f != "trellis" && f != "rounded" {
+            if f != b"trellis" && f != b"rounded" {
                 return Err("--v2-dense-form: trellis or rounded".into());
             }
-            o.v2_trellis = f == "trellis";
+            o.v2_trellis = f == b"trellis";
         }
-        "--qo-manifest" => o.qo_man = next()?,
-        "--qo-pack" => o.qo_file = next()?,
-        "--spec-adaptive" => o.adapt = true,
-        "--spec-levels" => o.levels_s = next()?,
-        "--layers" => o.layers_s = next()?,
-        "--prompt" => o.prompts.push(next()?),
-        "--gen" => o.n_gen = Some(c_atoi(&next()?)),
-        "--temp" => o.temp = c_atof(&next()?) as f32,
-        "--seed" => o.seed = Some(c_strtoul10(&next()?) as u32),
-        "--cap" => o.cap = c_atoi(&next()?),
-        "--chunk" => o.chunk = Some(c_atoi(&next()?)),
-        "--graph" => o.graph = true,
-        "--prefill" => o.mp = c_atoi(&next()?),
-        "--top" => o.top = c_atoi(&next()?),
-        "--wide" => o.wide = true,
-        "--pfv2" => o.pfv2 = true,
-        "--pf-rows" => o.pfrows = c_atoi(&next()?),
-        "--mtp" => o.mtp = c_atoi(&next()?),
-        "--pf-lanes" => o.lanes = c_atoi(&next()?),
-        "--top-p" => o.top_p = Some(c_atof(&next()?) as f32),
-        "--top-p-cands" => o.nc = c_atoi(&next()?),
-        "--spec-accept" => {
+        b"--qo-manifest" => o.qo_man = next()?,
+        b"--qo-pack" => o.qo_file = next()?,
+        b"--spec-adaptive" => o.adapt = true,
+        b"--spec-levels" => o.levels_s = next()?,
+        b"--layers" => o.layers_s = next()?,
+        b"--prompt" => o.prompts.push(next()?),
+        b"--gen" => o.n_gen = Some(c_atoi(&next()?)),
+        b"--temp" => o.temp = c_atof(&next()?) as f32,
+        b"--seed" => o.seed = Some(c_strtoul10(&next()?) as u32),
+        b"--cap" => o.cap = c_atoi(&next()?),
+        b"--chunk" => o.chunk = Some(c_atoi(&next()?)),
+        b"--graph" => o.graph = true,
+        b"--prefill" => o.mp = c_atoi(&next()?),
+        b"--top" => o.top = c_atoi(&next()?),
+        b"--wide" => o.wide = true,
+        b"--pfv2" => o.pfv2 = true,
+        b"--pf-rows" => o.pfrows = c_atoi(&next()?),
+        b"--mtp" => o.mtp = c_atoi(&next()?),
+        b"--pf-lanes" => o.lanes = c_atoi(&next()?),
+        b"--top-p" => o.top_p = Some(c_atof(&next()?) as f32),
+        b"--top-p-cands" => o.nc = c_atoi(&next()?),
+        b"--spec-accept" => {
             let v = next()?;
-            o.rs = Some(match v.as_str() {
-                "coupled" => false,
-                "rejection" => true,
+            o.rs = Some(match v.as_slice() {
+                b"coupled" => false,
+                b"rejection" => true,
                 _ => return Err("--spec-accept must be coupled or rejection".into()),
             });
         }
@@ -633,9 +649,9 @@ fn common_arg(a: &str, next: &mut dyn FnMut() -> Result<String, String>, o: &mut
 }
 
 /// engine_opts.h common_check
-fn common_check(o: &Common, mx: i32, chunk: i32) -> Result<(), String> {
+fn common_check(o: &Common, mx: i32, chunk: i32) -> Result<(), Str> {
     if chunk < 1 || chunk > mx {
-        return Err(format!("--chunk must be 1..{mx}"));
+        return Err(format!("--chunk must be 1..{mx}").into());
     }
     if o.mtp < 0 || o.mtp > (mx - 1).min(7) {
         return Err("--mtp must be 1..7 drafts".into());
@@ -644,19 +660,19 @@ fn common_check(o: &Common, mx: i32, chunk: i32) -> Result<(), String> {
 }
 
 /// GR8_PF_OWN=4 with GR8_PF_QP_ROLL: the rolling pack's env refusals (qp_wire.h's protocol), "" when they pass
-fn roll_env_refusal(pf_qp: bool, roll: i32, wire_e_set: bool, wire_e: i32, qp_ctx: &str, qp_pack: bool) -> String {
+fn roll_env_refusal(pf_qp: bool, roll: i32, wire_e_set: bool, wire_e: i32, qp_ctx: &str, qp_pack: bool) -> Str {
     const MAX_ENTRIES: i32 = 4;
     if wire_e_set && roll <= 0 {
         return "GR8_PF_QP_WIRE_E is set but GR8_PF_QP_ROLL is not (the wire ring exists only with ROLL)".into();
     }
     if roll <= 0 {
-        return String::new();
+        return Str::new();
     }
     if !pf_qp {
         return "GR8_PF_QP_ROLL needs GR8_PF_OWN=4 and --prefill".into();
     }
     if !(1..=MAX_ENTRIES).contains(&wire_e) {
-        return format!("GR8_PF_QP_WIRE_E: 1..{MAX_ENTRIES} (unset = 1)");
+        return format!("GR8_PF_QP_WIRE_E: 1..{MAX_ENTRIES} (unset = 1)").into();
     }
     if qp_pack {
         return "GR8_PF_QP_ROLL: no --qp-pack (the rolling pack is built from this rank's pack + the partner's half by RDMA)"
@@ -666,21 +682,21 @@ fn roll_env_refusal(pf_qp: bool, roll: i32, wire_e_set: bool, wire_e: i32, qp_ct
     if qp_ctx.is_empty() {
         return "GR8_PF_QP_ROLL needs GR8_PF_QP_CTX (the QO key / RoPE table size, in positions)".into();
     }
-    let (v, whole) = c_strtol10(qp_ctx);
+    let (v, whole) = c_strtol10(qp_ctx.as_bytes());
     let first = qp_ctx.as_bytes()[0];
     if !whole || !(b'1'..=b'9').contains(&first) || v <= 0 || v > 0x7fffffff {
-        return format!("GR8_PF_QP_CTX='{qp_ctx}': a positive decimal position count");
+        return format!("GR8_PF_QP_CTX='{qp_ctx}': a positive decimal position count").into();
     }
-    String::new()
+    Str::new()
 }
 
 /// s2/flash_checkpoint.h flash_cache_mode
-fn flash_cache_mode(s: &str) -> Result<i32, String> {
+fn flash_cache_mode(s: &[u8]) -> Result<i32, Str> {
     match s {
-        "off" | "0" => Ok(0),
-        "aligned" => Ok(1),
-        "terminal" => Ok(2),
-        _ => Err(format!("GR8_GLM53F_CACHE={s}: off, aligned or terminal")),
+        b"off" | b"0" => Ok(0),
+        b"aligned" => Ok(1),
+        b"terminal" => Ok(2),
+        _ => Err(cat(&[b"GR8_GLM53F_CACHE=", s, b": off, aligned or terminal"])),
     }
 }
 
@@ -704,7 +720,7 @@ fn alt_hex(v: u32) -> String {
 }
 
 /// The parse. Err is the message main dies with.
-pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[String]) -> Result<Opts, String> {
+pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[Str]) -> Result<Opts, Str> {
     let k = Knobs(api);
     let (ds41, flash) = (m.model == MODEL_DS41, m.model == MODEL_GLM53F);
     let (nr, mx, s2n) = (m.nr, m.mx, m.s2n);
@@ -765,77 +781,77 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[String]) -> Res
     let mut i = 1;
     while i < argv.len() {
         let a = argv[i].clone();
-        let mut next = || -> Result<String, String> {
+        let mut next = || -> Result<Str, Str> {
             if i + 1 >= argv.len() {
-                return Err(format!("missing value for {a}"));
+                return Err(cat(&[b"missing value for ", &a]));
             }
             i += 1;
             Ok(argv[i].clone())
         };
-        if a == "--pf-lanes" {
+        if a == b"--pf-lanes" {
             o.lanes_explicit = true;
         }
         if common_arg(&a, &mut next, &mut o.co)? {
             i += 1;
             continue;
         }
-        match a.as_str() {
-            "--rank" => o.rank = c_atoi(&next()?),
-            "--ips" => o.ips = split(&next()?, ','),
-            "--ips2" => o.ips2 = split(&next()?, ','),
-            "--pf-ips2" => o.pf_ips2 = split(&next()?, ','),
-            "--ring" => o.ring = true,
-            "--ring-devs" => o.ring_devs = split(&next()?, ','),
-            "--proxy-cpu" => o.proxy_cpu = c_atoi(&next()?),
-            "--manifest" => o.manifest = next()?,
-            "--pack" => o.packfile = next()?,
-            "--qp-manifest" => o.qp_man = next()?,
-            "--qp-pack" => o.qp_file = next()?,
-            "--dflash-manifest" => o.dfl_man = next()?,
-            "--dflash-pack" => o.dfl_file = next()?,
-            "--dflash-sel" => o.dfl_sel = c_atoi(&next()?),
-            "--dflash-k" => o.dfl_k = c_atoi(&next()?),
-            "--spec-fixed" if flash => o.spec_fixed = true,
-            "--spec-reset-per-request" if flash => o.spec_reset_per_request = true,
-            "--image" => o.image = true,
-            "--no-hash" => o.hash = false,
-            "--reuse-prefix" => o.reuse_prefix = true,
-            "--check-args" => o.check_args = true,
-            "--kv-store" => o.kv_tiers.push(next()?),
-            "--kv-keep" => o.kv_keep = next()?,
-            "--kv-system-after" => o.kv_system_after = c_atoi(&next()?),
-            "--kv-write-limit" => o.kv_write_limit = c_atof(&next()?),
-            "--kv-format" => o.kv_format = next()?,
-            "--kv-tier" => {
+        match a.as_slice() {
+            b"--rank" => o.rank = c_atoi(&next()?),
+            b"--ips" => o.ips = split(&next()?, b','),
+            b"--ips2" => o.ips2 = split(&next()?, b','),
+            b"--pf-ips2" => o.pf_ips2 = split(&next()?, b','),
+            b"--ring" => o.ring = true,
+            b"--ring-devs" => o.ring_devs = split(&next()?, b','),
+            b"--proxy-cpu" => o.proxy_cpu = c_atoi(&next()?),
+            b"--manifest" => o.manifest = next()?,
+            b"--pack" => o.packfile = next()?,
+            b"--qp-manifest" => o.qp_man = next()?,
+            b"--qp-pack" => o.qp_file = next()?,
+            b"--dflash-manifest" => o.dfl_man = next()?,
+            b"--dflash-pack" => o.dfl_file = next()?,
+            b"--dflash-sel" => o.dfl_sel = c_atoi(&next()?),
+            b"--dflash-k" => o.dfl_k = c_atoi(&next()?),
+            b"--spec-fixed" if flash => o.spec_fixed = true,
+            b"--spec-reset-per-request" if flash => o.spec_reset_per_request = true,
+            b"--image" => o.image = true,
+            b"--no-hash" => o.hash = false,
+            b"--reuse-prefix" => o.reuse_prefix = true,
+            b"--check-args" => o.check_args = true,
+            b"--kv-store" => o.kv_tiers.push(next()?),
+            b"--kv-keep" => o.kv_keep = next()?,
+            b"--kv-system-after" => o.kv_system_after = c_atoi(&next()?),
+            b"--kv-write-limit" => o.kv_write_limit = c_atof(&next()?),
+            b"--kv-format" => o.kv_format = next()?,
+            b"--kv-tier" => {
                 let v = next()?;
                 o.kv_old = true;
-                o.kv_old_all = o.kv_old_all || v.contains("keep=evicted") || v.contains("keep=all") || !v.contains("keep=");
+                o.kv_old_all = o.kv_old_all || has(&v, b"keep=evicted") || has(&v, b"keep=all") || !has(&v, b"keep=");
                 o.kv_tiers.push(v);
             }
-            "--kv-shared-after" => {
+            b"--kv-shared-after" => {
                 o.kv_old = true;
                 o.kv_system_after = c_atoi(&next()?);
             }
-            "--serve" => o.s2dir = next()?,
-            "--grammar-dir" => o.grammar_dir = next()?,
-            "--s2-port" => o.s2port = c_atoi(&next()?),
-            "--s2-sessions" => o.s2sess = c_atoi(&next()?),
-            "--s2-epoch" => o.s2epoch = c_strtoull10(&next()?),
-            "--set-id" => {
+            b"--serve" => o.s2dir = next()?,
+            b"--grammar-dir" => o.grammar_dir = next()?,
+            b"--s2-port" => o.s2port = c_atoi(&next()?),
+            b"--s2-sessions" => o.s2sess = c_atoi(&next()?),
+            b"--s2-epoch" => o.s2epoch = c_strtoull10(&next()?),
+            b"--set-id" => {
                 o.set_id = next()?;
                 let s = &o.set_id;
-                if s.is_empty() || s.len() > 64 || s.bytes().any(|c| !matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
+                if s.is_empty() || s.len() > 64 || s.iter().any(|c| !matches!(c, b'0'..=b'9' | b'a'..=b'f')) {
                     return Err("--set-id must be 1..64 lowercase hex digits".into());
                 }
             }
-            "--steering-profile" => o.steering_dir = next()?,
-            "--steering-weight-set" => o.steering_weight_set = next()?,
-            "--steering-force" => o.steering_force_s = next()?,
-            "--steering-model-revision" => o.steering_model_revision = next()?,
-            "--steering-tokenizer-revision" => o.steering_tokenizer_revision = next()?,
-            "--steering-chat-template" => o.steering_template_file = next()?,
-            "--steering-chat-template-sha256" => o.steering_template_digest = next()?,
-            _ => return Err(format!("unknown argument {a}")),
+            b"--steering-profile" => o.steering_dir = next()?,
+            b"--steering-weight-set" => o.steering_weight_set = next()?,
+            b"--steering-force" => o.steering_force_s = next()?,
+            b"--steering-model-revision" => o.steering_model_revision = next()?,
+            b"--steering-tokenizer-revision" => o.steering_tokenizer_revision = next()?,
+            b"--steering-chat-template" => o.steering_template_file = next()?,
+            b"--steering-chat-template-sha256" => o.steering_template_digest = next()?,
+            _ => return Err(cat(&[b"unknown argument ", &a])),
         }
         i += 1;
     }
@@ -871,13 +887,13 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[String]) -> Res
     }
     let release = !co.v2_dense.is_empty();
     o.release = release;
-    if k.text(kid::KVB) == "fp8" && !release {
+    if k.text(kid::KVB) == b"fp8" && !release {
         return Err("GR8_KVB=fp8 needs --v2-dense: packs hold kv_b in BF16".into());
     }
     if o.rank < 0 || o.ips.len() != nr as usize || (!release && (o.manifest.is_empty() || o.packfile.is_empty())) {
         return Err(format!(
             "usage: g6m4 --rank R --ips NR,addresses (this build: NR = {nr}) [--ips2 ..] --manifest M --pack P|- [--qo-manifest QM --qo-pack QP] [--qp-manifest PM --qp-pack PP] [--layers ..] [--gen N] [--temp T]"
-        ));
+        ).into());
     }
     if ds41 {
         if release && (!o.manifest.is_empty() || !o.packfile.is_empty() || !o.image) {
@@ -894,7 +910,7 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[String]) -> Res
     }
     o.layers = parse_ints(&co.layers_s, m.layers);
     if flash {
-        if co.layers_s == "all" {
+        if co.layers_s == b"all" {
             if o.layers.len() != m.layers as usize {
                 return Err("Flash --layers all did not select every main layer".into());
             }
@@ -911,12 +927,12 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[String]) -> Res
         );
     }
     if co.prompts.is_empty() {
-        co.prompts.push(DEFAULT_PROMPT.into());
+        co.prompts.push(DEFAULT_PROMPT.to_vec());
     }
     plan.inv_temp = if o.temp > 0.0 { 1.0 / o.temp } else { 0.0 };
     common_check(co, mx, plan.chunk)?;
     if nc < 0 || nc.wrapping_mul(nr) > m.tp_sort {
-        return Err(format!("--top-p-cands must be 0..{}", m.tp_sort / nr));
+        return Err(format!("--top-p-cands must be 0..{}", m.tp_sort / nr).into());
     }
     // Flash lane default: the MP8192 memory gate passed; larger MPs remain opt-in
     if flash && !o.lanes_explicit && mp > 0 && mp <= 8192 {
@@ -938,7 +954,7 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[String]) -> Res
     if dfl && m.dfl_rep != 0 && nr != 6 && !(flash && nr == 3) {
         return Err(format!(
             "--dflash: TP={nr} has no DFlash2 drafter (TP=4 splits it, TP=6 and Flash's TP=3 replicate it)"
-        ));
+        ).into());
     }
     if plan.rs && mtp == 0 && !dfl {
         return Err("--spec-accept rejection needs --mtp or --dflash-manifest".into());
@@ -969,7 +985,7 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[String]) -> Res
         let kmax = if dfl { dfl_k } else { mtp };
         let lv: Vec<i32> = if levels_s.is_empty() { (1..=kmax).collect() } else { parse_ints(&levels_s, m.layers) };
         if lv.iter().any(|&l| l < 1 || l > kmax) {
-            return Err(format!("--spec-levels: each level must be 1..{kmax}"));
+            return Err(format!("--spec-levels: each level must be 1..{kmax}").into());
         }
         o.spec.on = true;
         if !o.spec.set_levels(&lv) {
@@ -999,7 +1015,7 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[String]) -> Res
     if s2mode {
         let t = k.tests_set();
         if !t.is_empty() {
-            return Err(format!("serving (--serve) refuses test knobs (knobs/test.yaml): {t}"));
+            return Err(cat(&[b"serving (--serve) refuses test knobs (knobs/test.yaml): ", &t]));
         }
     }
     let rt_store = k.text_opt(kid::RT_STORE).is_some();
@@ -1070,7 +1086,7 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[String]) -> Res
             *row = bt;
             if let Some(t) = k.floats_n(kid::MTP_KSTOPB_TAU_S, s as u32) {
                 if t.len() > 7 {
-                    return Err(format!("GR8_MTP_KSTOPB_TAU_S{s}: at most 7 comma-separated numbers"));
+                    return Err(format!("GR8_MTP_KSTOPB_TAU_S{s}: at most 7 comma-separated numbers").into());
                 }
                 row[1..1 + t.len()].copy_from_slice(&t);
             }
@@ -1149,16 +1165,17 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[String]) -> Res
             o.kv_keep = if o.kv_old_all { "all" } else { "system" }.into();
         }
         if o.rank == 0 {
-            eprint!(
-                "# warning: --kv-tier and --kv-shared-after are deprecated: --kv-store STORE,size=N, --kv-keep {}, --kv-system-after {}\n",
-                o.kv_keep, o.kv_system_after
-            );
+            err_line(&cat(&[
+                b"# warning: --kv-tier and --kv-shared-after are deprecated: --kv-store STORE,size=N, --kv-keep ",
+                &o.kv_keep,
+                format!(", --kv-system-after {}\n", o.kv_system_after).as_bytes(),
+            ]));
         }
     }
     if o.kv_keep.is_empty() {
         o.kv_keep = "system".into();
     }
-    if !matches!(o.kv_keep.as_str(), "system" | "sessions" | "all") {
+    if !matches!(o.kv_keep.as_slice(), b"system" | b"sessions" | b"all") {
         return Err("--kv-keep system, sessions or all".into());
     }
     if o.kv_system_after < 1 {
@@ -1179,22 +1196,23 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[String]) -> Res
             "bin/g6m4"
         };
         if o.kv_format.is_empty() && built == "int4" {
-            return Err(format!("this engine is the int4 KV build ({bin}-int4): it needs --kv-format int4"));
+            return Err(format!("this engine is the int4 KV build ({bin}-int4): it needs --kv-format int4").into());
         }
         if o.kv_format.is_empty() {
             o.kv_format = built.into();
         }
-        if o.kv_format != "fp8" && o.kv_format != "int4" {
+        if o.kv_format != b"fp8" && o.kv_format != b"int4" {
             return Err("--kv-format fp8 or int4".into());
         }
-        if o.kv_format != built {
-            return Err(format!(
-                "--kv-format {}: this engine is the {built} build ({bin} is fp8, {bin}-int4 is int4)",
-                o.kv_format
-            ));
+        if o.kv_format != built.as_bytes() {
+            return Err(cat(&[
+                b"--kv-format ",
+                &o.kv_format,
+                format!(": this engine is the {built} build ({bin} is fp8, {bin}-int4 is int4)").as_bytes(),
+            ]));
         }
         if o.rank == 0 {
-            eprint!("# rank 0: KV format {} (latent row {} B, {})\n", o.kv_format, m.kv_row_bytes, m.kv_format());
+            eprint!("# rank 0: KV format {built} (latent row {} B, {})\n", m.kv_row_bytes, m.kv_format());
             eprint!(
                 "# rank 0: module {} abi {}: TP{}, {} rows a step, {} session slots, KV {} {} B a row, caps {}\n",
                 m.name(),
@@ -1232,7 +1250,7 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[String]) -> Res
         o.ds_moe_main_topk = main_cut;
         let decode = k.int_opt(kid::DS_MOE_TOPK_DECODE).unwrap_or(main_cut as i64) as i32;
         if decode < 1 || decode > m.topk || decode > main_cut {
-            return Err(format!("GR8_DS_MOE_TOPK_DECODE must be 1..{}", main_cut.min(m.topk)));
+            return Err(format!("GR8_DS_MOE_TOPK_DECODE must be 1..{}", main_cut.min(m.topk)).into());
         }
         o.ds_moe_decode_topk = decode;
         eprint!("# rank {rank} ds41 moe topk main {main_cut} decode {decode}\n");
@@ -1259,7 +1277,7 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[String]) -> Res
         // DSpark (off unless GR8_DS_MTP = 1..5): served only
         if !host.dsk_err.is_null() {
             // SAFETY: the C++ passes a NUL-terminated string that outlives the call
-            let err = unsafe { CStr::from_ptr(host.dsk_err) }.to_string_lossy().into_owned();
+            let err = unsafe { CStr::from_ptr(host.dsk_err) }.to_bytes().to_vec();
             if !err.is_empty() {
                 return Err(err);
             }
@@ -1310,7 +1328,7 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[String]) -> Res
         {
             return Err(format!(
                 "DS41: --s2-sessions x (GR8_DS_MTP + 1) verify rows and --s2-sessions x 5 draft rows must fit G6_MX {mx}"
-            ));
+            ).into());
         }
         // GR8_DS_PARK=1: a parked slot is evicted through the prefix cache; one slot has nothing to park beside
         if k.flag(kid::DS_PARK) && (!s2mode || s2sess < 2 || !reuse_prefix) {
@@ -1443,11 +1461,12 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[String]) -> Res
 }
 
 // ------------------------------------------------------------------------------------------------------ the C ABI
+// scripts/check_options_coverage.py reads the refusals above this banner and finds it by its text
 
 /// The options' strings and lists, which the view points into.
 #[derive(Default)]
 struct Store {
-    strs: Vec<CString>,
+    strs: Vec<std::ffi::CString>,
     lists: Vec<Vec<*const c_char>>,
     ints: Vec<Vec<i32>>,
     f64s: Vec<Vec<f64>>,
@@ -1455,13 +1474,13 @@ struct Store {
 }
 
 impl Store {
-    fn s(&mut self, v: &str) -> *const c_char {
-        let c = CString::new(v.split('\0').next().unwrap_or("")).unwrap_or_default();
+    fn s(&mut self, v: &[u8]) -> *const c_char {
+        let c = cs(v);
         let p = c.as_ptr();
         self.strs.push(c);
         p
     }
-    fn strs(&mut self, v: &[String]) -> Strs {
+    fn strs(&mut self, v: &[Str]) -> Strs {
         let l: Vec<*const c_char> = v.iter().map(|x| self.s(x)).collect();
         let s = Strs { p: l.as_ptr(), n: l.len() };
         self.lists.push(l);
@@ -1639,7 +1658,7 @@ fn view(o: &Opts, st: &mut Store) -> Options {
 
 /// g6opt_parsed: the refusal ("" when the options pass) and, when they pass, the view and its storage
 pub struct Parsed {
-    refusal: CString,
+    refusal: std::ffi::CString,
     view: Option<Box<Options>>,
     _store: Store,
 }
@@ -1657,8 +1676,7 @@ pub unsafe extern "C" fn g6opt_parse(
     argv: *const *const c_char,
 ) -> *mut Parsed {
     let (m, k, h) = (&*m, &*k, &*h);
-    let args: Vec<String> =
-        (0..argc.max(0) as usize).map(|i| CStr::from_ptr(*argv.add(i)).to_string_lossy().into_owned()).collect();
+    let args: Vec<Str> = (0..argc.max(0) as usize).map(|i| CStr::from_ptr(*argv.add(i)).to_bytes().to_vec()).collect();
     let mut store = Store::default();
     let r = if m.abi != MODULE_ABI || k.table_hash != kid::TABLE_HASH {
         Err("scheduler-rs: the module description or the knob table differs from libg6host.a's (rebuild it)".into())
@@ -1666,11 +1684,11 @@ pub unsafe extern "C" fn g6opt_parse(
         parse(m, k, h, &args)
     };
     let (refusal, view) = match r {
-        Ok(o) => (String::new(), Some(Box::new(view(&o, &mut store)))),
+        Ok(o) => (Str::new(), Some(Box::new(view(&o, &mut store)))),
         Err(e) => (e, None),
     };
     Box::into_raw(Box::new(Parsed {
-        refusal: CString::new(refusal.replace('\0', " ")).unwrap_or_default(),
+        refusal: cs(&refusal),
         view,
         _store: store,
     }))
@@ -1797,7 +1815,7 @@ mod tests {
         m
     }
 
-    fn run(args: &[&str]) -> Result<Opts, String> {
+    fn run_bytes(args: &[&[u8]]) -> Result<Opts, Str> {
         *ENV.lock().unwrap() = Some(HashMap::new());
         let api = KnobApi {
             table_hash: kid::TABLE_HASH,
@@ -1817,36 +1835,56 @@ mod tests {
             dsk_relax_topp: 0.0,
             dsk_err: std::ptr::null(),
         };
-        let argv: Vec<String> = std::iter::once("g6m4").chain(args.iter().copied()).map(String::from).collect();
+        let argv: Vec<Str> = std::iter::once(&b"g6m4"[..]).chain(args.iter().copied()).map(<[u8]>::to_vec).collect();
         parse(&glm(), &api, &host, &argv)
     }
 
+    fn run(args: &[&str]) -> Result<Opts, Str> {
+        run_bytes(&args.iter().map(|a| a.as_bytes()).collect::<Vec<_>>())
+    }
+
+    const BASE: [&str; 8] = ["--rank", "1", "--ips", "a,b,c,d", "--manifest", "m", "--pack", "p"];
+
     #[test]
     fn refusals_and_rows() {
-        assert_eq!(run(&["--bogus"]).unwrap_err(), "unknown argument --bogus");
-        assert_eq!(run(&["--rank"]).unwrap_err(), "missing value for --rank");
-        assert!(run(&["--rank", "1"]).unwrap_err().starts_with("usage: g6m4 --rank R --ips NR,addresses (this build: NR = 4)"));
-        let base = ["--rank", "1", "--ips", "a,b,c,d", "--manifest", "m", "--pack", "p"];
-        let o = run(&base).unwrap();
+        assert_eq!(run(&["--bogus"]).unwrap_err(), b"unknown argument --bogus");
+        assert_eq!(run(&["--rank"]).unwrap_err(), b"missing value for --rank");
+        assert!(run(&["--rank", "1"]).unwrap_err().starts_with(b"usage: g6m4 --rank R --ips NR,addresses (this build: NR = 4)"));
+        let o = run(&BASE).unwrap();
         assert_eq!(o.plans.len(), 1);
         assert_eq!(o.plans[0].prompt, vec![154822, 154824, 154826, 25062]);
         assert_eq!(o.row_counts, vec![4, 1]);
-        assert_eq!((o.nl, o.ncoll, o.kv_keep.as_str(), o.kv_format.as_str()), (4, 9, "system", "fp8"));
-        let mut a = base.to_vec();
+        assert_eq!((o.nl, o.ncoll, o.kv_keep.as_slice(), o.kv_format.as_slice()), (4, 9, &b"system"[..], &b"fp8"[..]));
+        let mut a = BASE.to_vec();
         a.extend(["--chunk", "0"]);
-        assert_eq!(run(&a).unwrap_err(), "--chunk must be 1..32");
-        let mut a = base.to_vec();
+        assert_eq!(run(&a).unwrap_err(), b"--chunk must be 1..32");
+        let mut a = BASE.to_vec();
         a.extend(["--set-id", "AB"]);
-        assert_eq!(run(&a).unwrap_err(), "--set-id must be 1..64 lowercase hex digits");
+        assert_eq!(run(&a).unwrap_err(), b"--set-id must be 1..64 lowercase hex digits");
+    }
+
+    // a Latin-1 path and argument reach the options and the refusal byte for byte, as in the C++
+    #[test]
+    fn values_keep_their_bytes() {
+        let path: &[u8] = b"/models/caf\xe9.pack";
+        let mut a: Vec<&[u8]> = BASE.iter().map(|x| x.as_bytes()).collect();
+        a[7] = path;
+        let o = run_bytes(&a).unwrap();
+        assert_eq!(o.packfile, path);
+        let mut st = Store::default();
+        let v = view(&o, &mut st);
+        // SAFETY: the view's strings live in st
+        assert_eq!(unsafe { CStr::from_ptr(v.packfile) }.to_bytes(), path);
+        assert_eq!(run_bytes(&[b"--x\xff"]).unwrap_err(), b"unknown argument --x\xff");
     }
 
     #[test]
     fn helpers() {
-        assert_eq!(split("a,,b,", ','), vec!["a", "", "b"]);
-        assert!(split("", ',').is_empty());
-        assert_eq!(parse_ints("1,,2,", 78), vec![1, 0, 2]);
-        assert_eq!(parse_ints("all", 3), vec![0, 1, 2]);
-        assert_eq!(roll_env_refusal(true, 2, false, 1, "0", false), "GR8_PF_QP_CTX='0': a positive decimal position count");
+        assert_eq!(split(b"a,,b,", b','), vec![b"a".to_vec(), b"".to_vec(), b"b".to_vec()]);
+        assert!(split(b"", b',').is_empty());
+        assert_eq!(parse_ints(b"1,,2,", 78), vec![1, 0, 2]);
+        assert_eq!(parse_ints(b"all", 3), vec![0, 1, 2]);
+        assert_eq!(roll_env_refusal(true, 2, false, 1, "0", false), b"GR8_PF_QP_CTX='0': a positive decimal position count");
         assert_eq!(alt_hex(0x120), "0x120");
         assert_eq!(alt_hex(0), "0");
     }
