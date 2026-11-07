@@ -12,7 +12,7 @@
 // tiles run at small contexts; drop it for the shipped tile):
 //   nvcc -std=c++17 -O3 -gencode=arch=compute_121a,code=sm_121a -DG6_MODEL_FLASH=1 -DG6_KV4=1 -DG6_CP=1 -DDEC_S2 \
 //     -DG6_NR=2 -DKP_TILE_POOLS=1024 -I engine engine/tests/test_flash_cp.cu engine/knobs-rs/target/release/libgr8knobs.a \
-//     -lcuda -lpthread -ldl -o /tmp/test_flash_cp && /tmp/test_flash_cp
+//     -lpthread -ldl -o /tmp/test_flash_cp && /tmp/test_flash_cp
 // Exit code: 0 PASS, 1 FAIL, 2 CUDA error.
 #include "../attn/flash_attn.cu"
 #include "../attn/flash_bind.cu"   // flash_attn.cu calls the binder (g6a_bind_run, g6a_bind_prepare)

@@ -175,7 +175,7 @@ fi
 if [ "$TEST" = all ] || [ "$TEST" = test_flash_cp ]; then
   # Flash context-parallel decode against the replicated path, every rank of TP=2 on this GPU, 4096-token key tiles
   [ "$TEST" = all ] && ARGS=()
-  with_flags "$FLASH_FLAGS -DG6_KV4=1 -DG6_CP=1 -DDEC_S2 -DKP_TILE_POOLS=1024" build_run tests/test_flash_cp -lcuda || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  with_flags "$FLASH_FLAGS -DG6_KV4=1 -DG6_CP=1 -DDEC_S2 -DKP_TILE_POOLS=1024" build_run tests/test_flash_cp || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
 if [ "$rc" = 0 ]; then echo "c1_tests: PASS"; else echo "c1_tests: FAIL (exit $rc)"; fi
 exit "$rc"
