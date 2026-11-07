@@ -26,6 +26,15 @@ pub struct Unit {
     side: Vec<u8>, // the half's 128 per-channel f16 values, then the projection's 48 f16 block scales
 }
 
+impl Unit {
+    pub(crate) fn matches(&self, bytes: &[u8]) -> bool {
+        let mut h = Xxh64::new(0);
+        h.update(bytes);
+        h.update(&self.side);
+        h.digest() == self.checksum
+    }
+}
+
 /// Which widths a rank fetches: a width manifest's choice per unit, or every unit at the listed widths.
 pub enum Choice {
     Manifest(Json),
@@ -187,12 +196,54 @@ pub fn verify(v2_dir: &str, units: &[Unit]) -> Result<Vec<usize>, String> {
             bad.push(i);
             continue;
         }
-        let mut h = Xxh64::new(0);
-        h.update(&buf);
-        h.update(&u.side);
-        if h.digest() != u.checksum {
+        if !u.matches(&buf) {
             bad.push(i);
         }
     }
     Ok(bad)
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+    use crate::compact;
+
+    fn unit(bytes: &[u8], offset: u64, nbytes: u64, k: u8) -> Unit {
+        let mut h = Xxh64::new(0);
+        h.update(&bytes[offset as usize..(offset + nbytes) as usize]);
+        Unit { layer: 3, k, expert: 0, half: 0, proj: 0, offset, nbytes, checksum: h.digest(), side: Vec::new() }
+    }
+
+    #[test]
+    fn compact_writer_reader_round_trip() {
+        let dir = std::env::temp_dir().join(format!("g6compact-roundtrip-{}", std::process::id()));
+        let src = dir.join("source");
+        let dst = dir.join("compact");
+        std::fs::create_dir_all(&src).unwrap();
+        let data: Vec<u8> = (0..32).collect();
+        for k in [2, 3] { std::fs::write(src.join(width_file(3, k)), &data).unwrap(); }
+        // Out of order, with overlapping and adjacent ranges: a range is written only once.
+        let units = vec![unit(&data, 20, 4, 2), unit(&data, 4, 4, 2), unit(&data, 6, 4, 2),
+                         unit(&data, 10, 2, 2), unit(&data, 3, 5, 3)];
+        let (source, out) = (src.to_str().unwrap(), dst.to_str().unwrap());
+        compact::write(source, out, &units).unwrap();
+        compact::verify(source, out, &units).unwrap();
+        let name = width_file(3, 2);
+        assert_eq!(std::fs::read(dst.join(&name)).unwrap(), [&data[4..12], &data[20..24]].concat());
+        assert_eq!(std::fs::read_to_string(dst.join(format!("{name}.g6map"))).unwrap(),
+                   "g6map-v1 32\n4 8 0\n20 4 8\n");
+        assert_eq!(std::fs::read(src.join(&name)).unwrap(), data);
+        // Existing correct copies are reusable; corrupt ones are refused, never silently replaced.
+        compact::write(source, out, &units).unwrap();
+        std::fs::write(dst.join(&name), [0; 12]).unwrap();
+        assert!(compact::write(source, out, &units).unwrap_err().contains("xxhash64"));
+        assert_eq!(std::fs::read(dst.join(&name)).unwrap(), vec![0; 12]);
+        // A bad source is caught by reading back through the compact map before the directory is published.
+        std::fs::write(src.join(&name), [0; 32]).unwrap();
+        let bad = dir.join("bad");
+        assert!(compact::write(source, bad.to_str().unwrap(), &units).is_err());
+        assert!(!bad.exists());
+        assert!(!dir.join(format!(".bad.partial-{}", std::process::id())).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

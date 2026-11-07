@@ -22,6 +22,7 @@
 //! at load (Op::Gen). g6l_plan_load then loads either like a pack.
 
 pub mod codebook;
+pub mod compact;
 pub mod dflash2;
 pub mod ds41;
 pub mod exlr8;
