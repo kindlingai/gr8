@@ -348,6 +348,12 @@ pub unsafe extern "C" fn g6l_v2_plan(base_manifest: *const c_char, base_pack: *c
                                &arg(v2_dir, "v2 dir")?, &arg(slices_dir, "slices dir")?, &arg(widths, "width manifest")?)?;
         let out = arg(out_manifest, "output manifest")?;
         std::fs::write(&out, img.manifest()).map_err(|e| format!("{out}: {e}"))?;
+        // GR8_GEN_CACHE (gencache.rs): the key binds the engine binary, the planned manifest and the plan inputs
+        let mut img = img;
+        let key_text = format!("v2 base={} pack={} v2={} slices={} widths={}\n{}", arg(base_manifest, "base manifest")?,
+                               arg(base_pack, "base pack")?, arg(v2_dir, "v2 dir")?, arg(slices_dir, "slices dir")?,
+                               arg(widths, "width manifest")?, img.manifest());
+        img.cache = gencache::GenCache::from_env(&key_text);
         Ok::<_, String>(img)
     })();
     match r {
@@ -376,6 +382,7 @@ pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *con
     let t0 = Instant::now();
     let arg = |p, what| cstr(p).ok_or(format!("g6l_release_plan: no {what}"));
     let r = (|| {
+        let layout_path = cstr(layout);
         let layout = cstr(layout).map(|p| layout::Layout::read(&p)).transpose()?;
         let (img, table) = release::plan(&arg(dense_dir, "dense dir")?, &arg(v2_dir, "v2 dir")?, &arg(slices_dir, "slices dir")?,
                                          &arg(widths, "width manifest")?, nr as usize, rank as usize, layout.as_ref(),
@@ -388,6 +395,14 @@ pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *con
                 eprintln!("#   {line}");
             }
         }
+        // GR8_GEN_CACHE (gencache.rs): the key binds the engine binary, the planned manifest and the plan inputs
+        // (the release directories, TP, rank, layout and the transform options)
+        let mut img = img;
+        let key_text = format!("release dense={} v2={} slices={} widths={} nr={nr} rank={rank} qo={qo} trellis={trellis} \
+                                kvb_fp8={} layout={:?}\n{}", arg(dense_dir, "dense dir")?, arg(v2_dir, "v2 dir")?,
+                               arg(slices_dir, "slices dir")?, arg(widths, "width manifest")?, kvb_fp8()?, layout_path,
+                               img.manifest());
+        img.cache = gencache::GenCache::from_env(&key_text);
         Ok::<_, String>(img)
     })();
     match r {
