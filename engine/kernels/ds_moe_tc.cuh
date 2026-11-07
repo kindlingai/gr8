@@ -63,6 +63,7 @@ struct Args
     uint8_t* aq;                  // [tile * 8][I / 64][XREC]  act quantized (k_aq)
     uint8_t* as;                  // [tile * 8][ASP]
     __half* ypart;                // [tile][8][NOUT]
+    int col_group = 0;            // v2 only: selected group for k_fc2_tc<..., COL_GROUPS>; stock specialization ignores it
 };
 
 // ---------------------------------------------------------------------------------------------------- operands
@@ -450,7 +451,7 @@ __device__ __forceinline__ void static_for(F&& f)
         f(std::integral_constant<int, N - 1>{});
     }
 }
-template <int I, int NOUT, int WARPS, int TW, int TPC, int ST>
+template <int I, int NOUT, int WARPS, int TW, int TPC, int ST, int COL_GROUPS = 1>
 __global__ void __launch_bounds__(WARPS * 32, 2) k_fc2_tc(Args A)
 {
     constexpr int NG = I / KG, OT = NOUT / 16, NB = OT / TPC, NTG = WARPS * TW, NTH = WARPS * 32, AST = TPC * GR, ACH = GR / 16, NA = (TPC * ACH + NTH - 1) / NTH;
@@ -464,7 +465,11 @@ __global__ void __launch_bounds__(WARPS * 32, 2) k_fc2_tc(Args A)
     if (A.n_slots_dev && slot >= *A.n_slots_dev) return;
     const int nt = A.slot_nt[slot], tile0 = A.slot_tile0[slot], ng = dsr::ro_ngroups(nt, NTG);
     if (gy >= ng) return;
-    const int b0 = os * NB / OS, nb = (os + 1) * NB / OS - b0, nstg = nb * NG;   // this CTA's output tile blocks and stages per group
+    static_assert(NB % COL_GROUPS == 0, "fc2 column groups must contain whole output blocks");
+    constexpr int GNB = NB / COL_GROUPS;
+    const int gb = COL_GROUPS == 1 ? 0 : A.col_group * GNB;
+    const int b0 = gb + os * GNB / OS, nb = (os + 1) * GNB / OS - os * GNB / OS, nstg = nb * NG;
+    if (nb == 0) return;
     const uint8_t* s = A.fc2 + dsr::ro_fc2_rec(A.slot_expert[slot], 0, 0, OT, NG) * GR;   // tile ot record r at s + (ot NG + r) GR
     const uint8_t* srca[NA];
     u32 dsta[NA];

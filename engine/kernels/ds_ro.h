@@ -10,6 +10,7 @@
 
 namespace dsr
 {
+constexpr int RO_PLAN_MAX = 8192;         // v2 planner capacity; stock runtime and expert scratch remain RO_MAX
 constexpr int RO_MAX = 4096;              // rows per call on the read-once path
 
 // Distinct-expert counter: the distinct experts per layer per window. One record per prefill MoE layer call, written by
