@@ -742,6 +742,21 @@ void g6svc_trace_instant(const g6svc_trace* t, const uint8_t* name, size_t name_
                          size_t args_n);
 uint64_t g6svc_trace_now(void);
 
+// s2/admit.h: the head's admission decisions. why: g6sch_status's (0 none, 1 slots, 2 capacity); recall_note: 0 none,
+// 1 begin, 2 done
+uint64_t g6svc_notice_target(uint64_t boundary, uint64_t horizon, bool held, uint64_t held_at, uint32_t notice_max);
+bool g6svc_admit_retry(uint64_t head, uint64_t attempted_head, uint64_t revision, uint64_t attempted_revision);
+uint64_t g6svc_attempted_revision(uint64_t revision);
+bool g6svc_admit_shrink(bool fits, bool can_make_room, uint32_t live, uint32_t limit);
+bool g6svc_admit_grant(uint32_t why, uint32_t short_of);
+bool g6svc_admit_drain(bool admit_hold, uint32_t live, uint32_t limit);
+bool g6svc_admit_hold(bool admit_hold, bool queued, uint32_t live, uint32_t limit);
+bool g6svc_wait_line(uint32_t why, uint64_t last, uint64_t head);
+bool g6svc_refusal_line(uint32_t why, uint64_t last, uint64_t head);
+uint32_t g6svc_recall_note(uint32_t why, uint32_t short_of, uint64_t waiting, uint64_t head);
+bool g6svc_share_idle(uint32_t resident, size_t queued);
+bool g6svc_lend_idle(uint32_t resident, size_t queued, uint32_t retiring);
+
 // The layout digest of every type above (and g6kvman.h's g6kv_tier_totals), computed the way src/layout.rs computes
 // it over the Rust types: per type its size and alignment, per field its offset, size and kind. The C++ compares it
 // with g6sch_layout() once at startup (scheduler.h check_abi).

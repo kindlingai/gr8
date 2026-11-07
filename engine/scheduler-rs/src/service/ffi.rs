@@ -2,6 +2,7 @@
 //! `g6ctl_error`, as the control links' calls do. Bytes go back through a grow callback.
 #![allow(clippy::missing_safety_doc)]
 
+use super::admit;
 use super::files::{self, Boot, Command, Ingress, Profile, Shape, Steering};
 use super::status::{self, Growth, RunUse, Status};
 use super::trace::{self, Trace};
@@ -326,4 +327,56 @@ pub unsafe extern "C" fn g6svc_trace_instant(
 #[no_mangle]
 pub extern "C" fn g6svc_trace_now() -> u64 {
     trace::now()
+}
+
+// --- the admission decisions (admit.h)
+
+/// held: the notice names `held_at`.
+#[no_mangle]
+pub extern "C" fn g6svc_notice_target(boundary: u64, horizon: u64, held: bool, held_at: u64, notice_max: u32) -> u64 {
+    admit::notice_target(boundary, horizon, held.then_some(held_at), notice_max)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_admit_retry(head: u64, attempted_head: u64, revision: u64, attempted_revision: u64) -> bool {
+    admit::retry(head, attempted_head, revision, attempted_revision)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_attempted_revision(revision: u64) -> u64 {
+    admit::attempted_revision(revision)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_admit_shrink(fits: bool, can_make_room: bool, live: u32, limit: u32) -> bool {
+    admit::shrink(fits, can_make_room, live, limit)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_admit_grant(why: u32, short_of: u32) -> bool {
+    admit::grant(why, short_of)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_admit_drain(admit_hold: bool, live: u32, limit: u32) -> bool {
+    admit::drain(admit_hold, live, limit)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_admit_hold(admit_hold: bool, queued: bool, live: u32, limit: u32) -> bool {
+    admit::hold(admit_hold, queued, live, limit)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_wait_line(why: u32, last: u64, head: u64) -> bool {
+    admit::wait_line(why, last, head)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_refusal_line(why: u32, last: u64, head: u64) -> bool {
+    admit::refusal_line(why, last, head)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_recall_note(why: u32, short_of: u32, waiting: u64, head: u64) -> u32 {
+    admit::recall_note(why, short_of, waiting, head)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_share_idle(resident: u32, queued: usize) -> bool {
+    admit::share_idle(resident, queued)
+}
+#[no_mangle]
+pub extern "C" fn g6svc_lend_idle(resident: u32, queued: usize, retiring: u32) -> bool {
+    admit::lend_idle(resident, queued, retiring)
 }
