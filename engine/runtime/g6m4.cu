@@ -415,7 +415,7 @@ int main(int argc, char** argv)
     fpi.head_payload = glue::head_bytes_tk(MX, nc, true);
     fpi.trunk_bytes = sizeof(ds_mhc::trunk_t);
 #endif
-    for (int l : layers) fpi.full_index.push_back(cp_full_index(l));
+    for (int l : layers) { fpi.full_index.push_back(cp_full_index(l)); fpi.attn.push_back(cp_attn_layer(l)); }
 #if defined(G6_CP) && G6_CP
     fpi.cp_build = true;
 #endif
@@ -622,12 +622,9 @@ int main(int argc, char** argv)
 #if G6_MODEL_FLASH
     // Flash prefill (flash_prefill.cuh): the P1 bodies run the decode blocks in MX-row chunks, so the decode bindings
     // stay decode-sized. Combinations the Flash prefill does not support yet stop here.
-    if (MP && (pf_rs || pf_own || !qp_man.empty() || !qo_man.empty() || reuse_prefix
-#if defined(G6_CP) && G6_CP
-               || cp_on
-#endif
-               ))
-        die("Flash --prefill: not with GR8_PF_RS, GR8_PF_OWN, --qo-/--qp- packs, --reuse-prefix or CP (P1)");
+    if (MP && (pf_rs || pf_own || !qp_man.empty() || !qo_man.empty() || reuse_prefix))
+        die("Flash --prefill: not with GR8_PF_RS, GR8_PF_OWN, --qo-/--qp- packs or --reuse-prefix (P1)");
+
     if (two && knob::pf_streams() == 2)
         die("Flash --pf-lanes 2 uses one compute stream; GR8_PF_STREAMS=2 is not supported");
     if (two && knob::resid_dump())
@@ -933,10 +930,14 @@ int main(int argc, char** argv)
         m.s2on = D.d.s2on = false;
     }
 #if G6_MODEL_FLASH
-    // Flash with several sessions: the S2 tables on the --cap pool, main and draft (no S2 below R). The solo graphs below
+    // Flash with several sessions: the S2 tables on the --cap pool, main and draft (S2 below R with GR8_CP). The solo graphs below
     // are captured with s2on off, the batched ones by s2/flash_native.cuh with s2on on
     if (s2mode && s2sess > 1)
     {
+#if defined(G6_CP) && G6_CP
+        // GR8_CP: S2 below R, the pool's page classes (serve_flash): runs below R on the replicated prefix, split runs past it
+        if (cp_on) m.s2_below = D.d.s2_below = cp_R;
+#endif
         s2_init(m, s2sess, st);
         s2_init(D.d, s2sess, st);
         m.s2on = D.d.s2on = false;
@@ -1320,8 +1321,12 @@ int main(int argc, char** argv)
                 for (g6rt::Layer& y : x->layers)
                     if (!y.kda && y.ab.storage)
                     {
+                        int cpb = 0;   // a CP binding keeps this rank's pages only (flash_checkpoint.cuh)
+#if defined(G6_CP) && G6_CP
+                        cpb = y.ab.args.cp_nr ? 1 : 0;
+#endif
                         v.bindings.push_back({static_cast<uint4*>(y.ab.args.mla_cache), static_cast<uint4*>(y.ab.args.index_cache),
-                                              (unsigned long long)(64 * g6kv::ROW / 16), (unsigned long long)(g6kv::IDX_PAGE / 16)});
+                                              (unsigned long long)(64 * g6kv::ROW / 16), (unsigned long long)(g6kv::IDX_PAGE / 16), cpb});
                         v.rings.push_back(static_cast<uint8_t*>(y.ab.args.index_raw));
                     }
             v.ring_bytes = (size_t)g6kv::RAW_RING * g6kv::IDX_RAW;
@@ -1517,6 +1522,9 @@ int main(int argc, char** argv)
                 g6s2::require(k >= 0 && k < D.d.nbk && rows > 0 && rows <= MX && exec_d[k][chain][rows], "Flash draft graph missing");
                 G6RT_CK(cudaGraphLaunch(exec_d[k][chain][rows], st));
             }, gsplit, ckpt.get(), flash_cache == g6s2::FlashCache::Terminal, flash_install};
+#if defined(G6_CP) && G6_CP
+        if (cp_on) { fc.cp_R = cp_R; fc.cp_enqueue = cp_enqueue; fc.cp_pf_error = cp_pf_err; }
+#endif
         try { g6s2::serve_flash(fc, bc, plan.chunk); }
         catch (const std::exception& e) { fprintf(stderr, "g6m4: rank %d Flash serve failed: %s\n", R, e.what()); return 3; }
     }
@@ -3206,9 +3214,18 @@ int main(int argc, char** argv)
                     };
                 }
                 const auto t0 = std::chrono::steady_clock::now();
+                // GR8_CP: a sub-batch past R runs on the staged view (prefill.cuh cp_pf_*); below R on the replicated prefix
+#if defined(G6_CP) && G6_CP
+                const bool staged = cp_pf && a + M + MB > cp_R;
+#else
+                const bool staged = false;
+#endif
+                if (staged) cp_pf_in();
                 if (MB) pf_step2_flash(m, FP, FP2, M, MB, a + M, a + M + MB, ls0, ls0b, st);
                 else pf_step_flash(m, FP, M, a + M, ls0, st, pf_copy);
+                if (staged) cp_pf_out();
                 G6RT_CK(cudaStreamSynchronize(st));
+                if (staged && cp_pf_err()) { fprintf(stderr, "g6m4: rank %d CP staging fabric error word %08x, seq %zu rows %d..\n", R, cp_pf_err(), q, a); return 3; }
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 ls0 += NL;
                 if (MB) ls0b += NL;

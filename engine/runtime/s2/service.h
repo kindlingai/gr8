@@ -69,6 +69,9 @@ struct NativeHooks {
     // must then be empty when it is set
     g6s2_module_ops module{};
     std::function<void(const Grant&)> bind; // native main AND draft binding, no pool mutation
+    // optional, head: why the engine cannot run this request at all (nullptr = it can); a refused request ends with an
+    // error before it is queued, as a grammar that does not compile
+    std::function<const char*(const g6rt::ServeReq&)> refuse;
     // optional, before bind on every rank: the bound request itself (DS41: its image rows, for the Engram ring of the
     // slot's snapshots and parks, s2/ds41_engram_ring.h)
     std::function<void(unsigned slot, const g6rt::ServeReq&)> bind_request;
@@ -165,7 +168,7 @@ class Service {
         static int32_t check(void* x, uint64_t id, const uint8_t* b, size_t n, g6svc_checked* out) noexcept {
             return mod::guard<Host>(x, [&](Host& h) {
                 auto request = parse_request(std::string(reinterpret_cast<const char*>(b), n), h.s.c_.scheduler.steering);
-                out->ok = h.s.grammar_ok(id, request) && h.s.images_ok(id, request);
+                out->ok = h.s.grammar_ok(id, request) && h.s.images_ok(id, request) && h.s.engine_ok(id, request);
                 if (!out->ok) return;
                 h.prompt = std::move(request.prompt);
                 out->prompt = h.prompt.data(); out->n = h.prompt.size();
@@ -318,6 +321,13 @@ class Service {
             atomic_file(c_.directory + "/resp." + std::to_string(id), "end error -1 0\n");
             return false;
         }
+    }
+    bool engine_ok(uint64_t id, const g6rt::ServeReq& r) {
+        const char* why = native_.refuse ? native_.refuse(r) : nullptr;
+        if (!why) return true;
+        fprintf(stderr, "# s2: request %llu refused: %s\n", (unsigned long long)id, why);
+        atomic_file(c_.directory + "/resp." + std::to_string(id), "end error -1 0\n");
+        return false;
     }
     // An image request the engine cannot run (ds41_image.h img::refusal) ends with an error before it is queued, as a
     // grammar that does not compile does. The front end refuses the same cases first.

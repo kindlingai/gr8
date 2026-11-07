@@ -96,8 +96,9 @@ inline uint64_t fnv64(const void* p, size_t n, uint64_t h = 14695981039346656037
 // complete is not a checkpoint (a torn write, a reused range).
 struct FlashManifest {
     static constexpr uint64_t MAGIC = 0x31544b4348534c46ull;   // "FLSHCKT1"
-    static constexpr uint32_t FORMAT = 2;                     // FLASH_RUN_FORMAT: bump when what an entry holds changes
-                                                              // (2: pooled index keys only, the raw rings in the state)
+    static constexpr uint32_t FORMAT = 3;                     // FLASH_RUN_FORMAT: bump when what an entry holds changes
+                                                              // (2: pooled index keys only, the raw rings in the state;
+                                                              // 3: a CP binding keeps only this rank's pages)
     uint64_t magic = 0;
     uint32_t format = 0, complete = 0;
     uint64_t generation = 0;         // the entry's id, the same on every rank

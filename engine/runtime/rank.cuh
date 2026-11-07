@@ -329,8 +329,12 @@ struct CpState
     int* pf_ident = nullptr;
     std::vector<G6Attn> pf_saved;
     bool pf_staged = false;
-    unsigned long long pf_g = 0;      // global pool-use counter: layer i of a sub-batch is use pf_g0 + i, pool (use % 2)
-    unsigned long long pf_g0 = 0;     //   (not i % 2: 79 layers is odd); pf_g0 = pf_g at cp_pf_enter, pf_g += nl at exit
+    unsigned long long pf_g = 0;      // global pool-use counter: layer i of a sub-batch is use pf_g0 + pf_use[i], pool (use % 2)
+    unsigned long long pf_g0 = 0;     //   (not i % 2: 79 layers is odd); pf_g0 = pf_g at cp_pf_enter, pf_g += pf_nuse at exit
+    // the staged layers in order (cp_pf_alloc): pf_use[i] = layer i's place among the layers with a KV binding (GLM: every
+    // layer, so i; Flash: the DSA layers), -1 for one without (a KDA layer)
+    std::vector<int> pf_use;
+    int pf_nuse = 0;
     void* pf_net = nullptr;           // g6m4: CpPfNet (prefill.cuh), the real-fabric gather; null = loopback (m4sim)
     int phys = 0;                     // remote rows release: physical pages of each CP binding (0 = every tail page)
     // remote rows release (rt_rows.cuh): after the real-fabric fill of layer i's pool (the pages below start this rank
@@ -339,6 +343,12 @@ struct CpState
 };
 // binder rule (engine/attn/bind.cu): the layers that run their own indexer
 inline bool cp_full_index(int l) { return geom::full_index(l); }
+// the layers with an attention block, and so with CP collectives (Flash: the DSA layers; the KDA layers carry O(1) state)
+#if G6_MODEL_FLASH
+inline bool cp_attn_layer(int l) { return !geom::is_kda(l); }
+#else
+inline bool cp_attn_layer(int) { return true; }
+#endif
 // floats of one partial block (c [M][H][512], m [M][H], l [M][H]), padded to 16 B as cp_lse (attn.cu) indexes it
 inline size_t cp_blk(int M, int H) { return ((size_t)M * H * 514 + 3) & ~(size_t)3; }
 // heads of rank d's group at model layer l (bind.cu: group (d - l) % NR, larger groups first)
@@ -625,7 +635,7 @@ inline void launch_embed_flash(Model&,int,cudaStream_t);
 inline void launch_consume_flash_draft(Model&,int,int,cudaStream_t);
 inline void launch_consume_mhc(Model&,int,int,cudaStream_t);
 inline void launch_kda_block(Model&,int,int,cudaStream_t);
-inline void launch_dsa_block(Model&,int,int,int,cudaStream_t);
+inline void launch_dsa_block(Model&,int,int,int,cudaStream_t,int phase=-1);
 inline void launch_moe_block(Model&,int,int,cudaStream_t);
 inline void launch_dense_block(Model&,int,int,cudaStream_t);
 inline void launch_step_flash(Model&,int,int,cudaStream_t,int,int,const std::function<void(int,int)>&);

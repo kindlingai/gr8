@@ -37,7 +37,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_ATTN_SEL2` | int | `0` | 0\|8\|16\|32\|64 | Decode index selection runs its final sort as a rank by count over 8, 16, 32 or 64 CTAs per row. Same bits. |
 | `GR8_ATTN_TILE_L` | int | `0` |  | With GR8_ATTN_P11, the context length in tokens used to pick the decode context tile, in place of the captured call's context. 0: the call's context window. |
 | `GR8_AVP1` | flag | `0` |  | Decode absorb and value projection run as one launch for any row count, weights in registers, rows staged 8 at a time. |
-| `GR8_CP` | flag | 1 in a CP build |  | Context-parallel KV: the first GR8_CP_R tokens are replicated and later pages are spread across ranks on a CP fabric of their own. Read only in builds with -DG6_CP=1. |
+| `GR8_CP` | flag | 1 in a CP build, 0 in the Flash build |  | Context-parallel KV: the first GR8_CP_R tokens are replicated and later pages are spread across ranks on a CP fabric of their own. Read only in builds with -DG6_CP=1. |
 | `GR8_CP_MMAX` | int | the most rows of any step |  | Raises the row count the CP fabric is sized for. A value below the computed rows has no effect. |
 | `GR8_CP_ONECHAIN` | flag | `0` | 0\|1 | Past R, the other ranks' head groups run as one attention call instead of one call per group, with partials published in the GR8_CP_S3=0 order. Byte-exact, TP=4 only, not with GR8_ATTN_FLIP. |
 | `GR8_CP_PF_HASH2` | flag | `1` | 0\|1 | The CP prefill page check uses the block-reduced HASH2 page hash. 0 = the older k_cp_pf_hash. Read only in builds with -DG6_CP_PF_HASH2=1. |
