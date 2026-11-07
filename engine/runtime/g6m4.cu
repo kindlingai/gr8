@@ -1137,9 +1137,9 @@ int main(int argc, char** argv)
     // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
     const bool cp_on = knob::cp().value_or(!G6_MODEL_FLASH);   // Flash: off unless asked for
 #if G6_MODEL_FLASH
-    // Flash: one session under --serve, prompts below R, no checkpoints (serve_flash refuses the rest)
-    if (cp_on && s2mode && (s2sess > 1 || flash_cache != g6s2::FlashCache::Off))
-        die("Flash GR8_CP under --serve: one session (--s2-sessions 1) and no GR8_GLM53F_CACHE yet");
+    // Flash under --serve: prompts below R (serve_flash refuses longer ones) and no checkpoints yet
+    if (cp_on && s2mode && flash_cache != g6s2::FlashCache::Off) die("Flash GR8_CP under --serve: not with GR8_GLM53F_CACHE yet");
+    if (cp_on && s2mode && s2sess > 1 && (cp_R < 64 || cp_R >= cap)) die("Flash GR8_CP with several sessions: GR8_CP_R must be 64..--cap - 1");
 #endif
     const int cp_R = (int)knob::cp_r();
     const int cp_s3 = knob::cp_s3() ? 1 : 0;
@@ -1633,10 +1633,14 @@ int main(int argc, char** argv)
         m.s2on = D.d.s2on = false;
     }
 #if G6_MODEL_FLASH
-    // Flash with several sessions: the S2 tables on the --cap pool, main and draft (no S2 below R). The solo graphs below
+    // Flash with several sessions: the S2 tables on the --cap pool, main and draft (S2 below R with GR8_CP). The solo graphs below
     // are captured with s2on off, the batched ones by s2/flash_native.cuh with s2on on
     if (s2mode && s2sess > 1)
     {
+#if defined(G6_CP) && G6_CP
+        // GR8_CP: S2 below R, the pool's page classes (serve_flash): runs below R on the replicated prefix, split runs past it
+        if (cp_on) m.s2_below = D.d.s2_below = cp_R;
+#endif
         s2_init(m, s2sess, st);
         s2_init(D.d, s2sess, st);
         m.s2on = D.d.s2on = false;

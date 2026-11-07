@@ -35,7 +35,10 @@ struct FlashContext {
     // added after serve_flash's; a resize hook chains to the one already set for any other tier
     std::function<void(NativeHooks&)> install;
     // GR8_CP: a main step past cp_R runs the CP block, whose collectives go on the CP fabric before its launch
-    // (cp_enqueue(step, M, context)); 0 = CP off. A prompt longer than cp_R is refused (the prefill runs below R only)
+    // (cp_enqueue(step, M, context)); 0 = CP off. A prompt longer than cp_R is refused (the prefill runs below R only).
+    // Several sessions: S2 below R (the pool's page classes, as the full model's): a run whose worst case passes R is a
+    // split run, its prefix and its shard of the tail below place, the drafter's copy of its tail above it; the tables
+    // of its slot (or, alone, the layers' own) hold its CP map (s2.cuh s2_cp_map)
     int cp_R = 0;
     std::function<void(unsigned long long, int, int)> cp_enqueue;
 };
@@ -51,11 +54,16 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                        sc.pool_rows / PAGE >= unsigned(c.draft.d.s2->pool_pages)),
             "Flash serve of several sessions needs S2 pools, graphs, --mtp and a KDA ring per session");
     const unsigned pages = sc.pool_rows / PAGE;
-    RunPool pool(pages, pages, sc.pool_rows);
+    const bool cp_split = multi && c.cp_R;
+    require(!cp_split || (c.main.s2_below == c.cp_R && c.draft.d.s2_below == c.cp_R), "Flash serve with GR8_CP: the S2 pools are not below R");
+    const unsigned place = cp_split ? unsigned(std::min(c.main.s2->pool_pages, c.draft.d.s2->pool_pages)) : pages;
+    RunPool pool(pages, place, cp_split ? unsigned(c.cp_R) : sc.pool_rows);
+    if (cp_split) pool.tail(unsigned(g6nr::NR), 0);
+    const int rp = c.cp_R / PAGE;   // a split run's prefix pages
     FlashSlots ks(int(sc.limit()), std::max(1, c.main.kda_ring_rest ? c.main.kda_ring_rest : c.main.kda_ring),
                   std::max(1, c.main.kda_ring));
     require(ks.total() <= c.main.kda_st.slots, "Flash serve: the KDA state has fewer slots than the sessions' rings");
-    require(!c.cp_R || (!multi && !c.ckpt && c.cp_enqueue), "Flash serve with GR8_CP: one session, no checkpoints");
+    require(!c.cp_R || (!c.ckpt && c.cp_enqueue), "Flash serve with GR8_CP: no checkpoints");
     u64 pfseq = 1, pfseq2 = 1, dseq = 0;
     LpStep lp{};
     int lp_rows = 0;
@@ -208,9 +216,11 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             // the run's pages into slot q's tables, cleared (not reset(), which clears the whole pool and KDA slot 0);
             // the session's first KDA slot from zero (its other slots are written before they are read)
             const int most = std::max(c.main.s2->pool_pages, c.draft.d.s2->pool_pages);
+            const bool ex = cp_split && pool.exclusive_run(g.run);
             for (Model* x : {&c.main, &c.draft.d}) {
-                s2_set_pages(*x, q, list);
-                s2_reset_pages(*x, x->s2->run[q], c.stream, most);
+                if (ex) s2_set_exclusive(*x, q, list, most, rp);
+                else s2_set_pages(*x, q, list);
+                s2_reset_pages(*x, list, c.stream, most);
                 for (Layer& y : x->layers) if (!y.kda && y.ab.storage) G6RT_CK(g6_attn_bind_raw_reset(&y.ab, q, c.stream));
             }
             if (c.main.kda_st.S) kda::reset(c.main.kda_st, ks.base(q), c.stream);
@@ -240,6 +250,16 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     };
     // a session cancelled at the boundary its capture waits for: its rows are still in place (the next bind resets them)
     h.retire = [&](const Slot&) { fence(); if (ck) take_capture(); };
+    // several sessions: slot q's run alone on the layers' own tables (today's path): its pages, or a split run's CP map
+    auto solo_tables = [&](int q) {
+        const std::vector<int>& run = c.main.s2->run[size_t(q)];
+        require(!run.empty() && run == c.draft.d.s2->run[size_t(q)] && c.main.s2->ex_split[q] == c.draft.d.s2->ex_split[q],
+                "Flash main/draft runs differ");
+        if (c.main.s2->ex_split[q]) {
+            const int most = std::max(c.main.s2->pool_pages, c.draft.d.s2->pool_pages);
+            s2_solo_cp_pages(c.main, run, most, rp); s2_solo_cp_pages(c.draft.d, run, most, rp);
+        } else { s2_solo_pages(c.main, run); s2_solo_pages(c.draft.d, run); }
+    };
     if (ck) h.before_work = take_capture;
     h.fence = fence;
     h.dispatch.bucket = [&](bool d, int ctx) { return bucket_of(d ? c.draft.d : c.main, ctx); };
@@ -254,9 +274,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         // slot, the solo session's pages go into the layers' own tables (no KV moves)
         if (old >= 0) s2_hprev_from_solo(c.draft, old, c.stream);
         if (next >= 0) {
-            const std::vector<int>& run = c.main.s2->run[next];
-            require(!run.empty() && run == c.draft.d.s2->run[next], "Flash main/draft survivor runs differ");
-            s2_solo_pages(c.main, run); s2_solo_pages(c.draft.d, run);
+            solo_tables(next);
             s2_hprev_to_solo(c.draft, next, c.stream);
         }
         c.main.s2on = c.draft.d.s2on = next < 0; fence();
@@ -357,9 +375,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         const int q = int(slot.key.slot), kslot = multi ? ks.base(q) : 0;
         const bool on = multi && c.main.s2on;
         if (multi) {
-            const std::vector<int>& run = c.main.s2->run[q];
-            require(!run.empty() && run == c.draft.d.s2->run[q], "Flash main/draft prefill runs differ");
-            s2_solo_pages(c.main, run); s2_solo_pages(c.draft.d, run);
+            solo_tables(q);
             c.main.s2on = c.draft.d.s2on = false;
         }
         pf_inputs_flash(c.prefill, ma, p.prompt.data() + a, pos.data(), kslot, multi ? q : 0);

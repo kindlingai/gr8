@@ -277,7 +277,7 @@ inline void prepare_dsa_layer(Model& m, int i, int M, cudaStream_t st)
 
 #if defined(G6_CP) && G6_CP
 // The CP attention of DSA layer i: launch_attn_cp's stages and collectives (rank.cuh) at Flash's sizes, one call per
-// layer (no S2 batch view). In launch_attn_cp's phases, so m4sim's loopback can deliver between them (-1 = all, in
+// layer (S2: on the layer's CP batch view, every row's table and bounds in its cell). In launch_attn_cp's phases, so m4sim's loopback can deliver between them (-1 = all, in
 // order, as the real fabric runs it):
 //   0: cp_front (append, absorb my heads) -> q(i) put; cp_index -> cand(i) put
 //   1: wait cand(i), merge; my head group's partial; wait q(i); each other group's partial, put to its owner at once
@@ -288,11 +288,15 @@ inline void launch_dsa_cp(Model& m, int i, int M, int context, int phase, cudaSt
     CpState& C = m.cp;
     const int r = m.rank, nr = g6nr::NR, H = y.ab.args.heads, G = 16, TP = g6kv::TOP_POOLS;
     if (H != cp_heads(r, y.l)) die("GR8_CP: layer " + std::to_string(y.l) + " binding heads disagree with the group rule");
-    if (m.graph && !y.rp_on[m.cur][M]) die("prepare_dsa_layer(m, i, M) was not called before a graph step");
-    G6Attn* a = m.graph ? &y.rp[m.cur][M].fixed : &y.ab.args;
-    const G6AttnStepCell* cell = m.graph ? y.rp[m.cur][M].cell : nullptr;
-    void* scr = y.ab.scratch;
-    const size_t sb = y.ab.scratch_bytes;
+    G6AttnReplay* srp = nullptr;
+#ifdef DEC_S2
+    if (m.s2on) srp = s2_cp_replay(m, i, M);
+#endif
+    if (!srp && m.graph && !y.rp_on[m.cur][M]) die("prepare_dsa_layer(m, i, M) was not called before a graph step");
+    G6Attn* a = srp ? &srp->fixed : m.graph ? &y.rp[m.cur][M].fixed : &y.ab.args;
+    const G6AttnStepCell* cell = srp ? srp->cell : m.graph ? y.rp[m.cur][M].cell : nullptr;
+    void* scr = srp ? srp->scratch : y.ab.scratch;
+    const size_t sb = srp ? srp->scratch_bytes : y.ab.scratch_bytes;
     const int cq = C.colls.q[i], cc = C.colls.cand[i];
     // every collective's wire size is M x its row bytes (CpColls, sized for the widest head group)
     const size_t qn = (size_t)M * H * KVA * 4, cb = (size_t)M * C.colls.cand_row;
@@ -303,7 +307,7 @@ inline void launch_dsa_cp(Model& m, int i, int M, int context, int phase, cudaSt
     const float *q = nullptr, *rope = nullptr;
     if (phase <= 0)
     {
-        if (!m.graph)
+        if (!srp && !m.graph)
         {
             const G6AttnStep s = dsa_step(m, M, context);
             G6RT_CK(g6_attn_bind_prepare(&y.ab, &s, st));
@@ -347,14 +351,8 @@ inline void launch_dsa_cp(Model& m, int i, int M, int context, int phase, cudaSt
     }
     G6RT_CK(g6_attn_cp_finish(a, cell, scr, sb, C.part_all, st));
 }
-// the step takes the CP block for its DSA layers (a graph step: its bucket is past R)
-inline bool dsa_cp(const Model& m, int context)
-{
-#ifdef DEC_S2
-    if (m.s2on) return false;
-#endif
-    return cp_active(m, context);
-}
+// the step takes the CP block for its DSA layers (a graph step: its bucket is past R; S2: the step's bucket, s2_cp_step)
+inline bool dsa_cp(const Model& m, int context) { return cp_block(m, context); }
 #endif
 
 // rows at positions m.pos[0..M-1], context = last position + 1 (plain form; the graph form reads the step cell).
