@@ -724,7 +724,8 @@ cases a shape (options, knobs and build values, valid and refused) in seven shap
 and TP2, DS41 TP4) and hashes each case's inputs and plan. `ds41_prefill_test` checks `l20_tail()` comes from the plan.
 Linux (GCC 12, x86_64): `scripts/host_tests.sh` and `cargo test --release --workspace` pass, the options and signature
 vectors keep their hashes, and the 13,777 round logs the host tests write are byte-identical to R6b's. The GLM, Flash
-and DS41 engines build on a GB10. Boot pending.
+and DS41 engines build on a GB10. Boot: TP4 GLM, R6b then R6c, the round logs byte-identical on all four ranks, the 24 T=0
+replies matching, and the head's log lines equal apart from memory.
 
 ### R7. Step sizes
 
