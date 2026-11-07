@@ -241,6 +241,11 @@ for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 
   g++ -std=c++17 -O2 -Wall -pthread $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/service_vectors_test.cpp" -o "$T/service_vectors_test" "${KVLIB[@]}"
   "$T/service_vectors_test" 2> >(grep -v '^# s2 trace: cannot write ' >&2)
 done
+# the head's admission decisions (s2/admit.h) against transcripts of the C++, in each model's shape
+for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O2 -Wall -Wextra -pthread $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/admit_vectors_test.cpp" -o "$T/admit_vectors_test" "${KVLIB[@]}"
+  "$T/admit_vectors_test"
+done
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/control_wire_test.cpp" -o "$T/control_wire_test" "${KNOBS[@]}"
 "$T/control_wire_test" 2> >(grep -v '^g6ctl: control recv failed: ret=0 ' >&2)
 # DS41 ranks that disagree on an agree-scope knob refuse at bootstrap (knob::signature() in the DS41 runtime signature):
