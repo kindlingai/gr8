@@ -257,6 +257,12 @@ impl Kind for crate::service::control::Host {
 impl Kind for crate::service::control::CControl {
     const K: u64 = 6;
 }
+impl Kind for crate::service::control::Staged {
+    const K: u64 = 6;
+}
+impl Kind for crate::service::compute::CCompute {
+    const K: u64 = 6;
+}
 // g6sched.h counts void as 1 byte, as Rust's c_void
 impl Kind for std::ffi::c_void {
     const K: u64 = 6;
@@ -314,7 +320,13 @@ fn_kinds!(
     crate::service::control::CheckFn,
     crate::service::control::ShareFn,
     crate::service::control::ReasonFn,
-    crate::service::control::TotalsFn
+    crate::service::control::TotalsFn,
+    crate::service::control::BoundaryFn,
+    crate::service::control::StageFn,
+    crate::service::control::DigestFn,
+    crate::service::control::ApplyFn,
+    crate::service::control::StepFn,
+    crate::service::control::CountersFn
 );
 
 /// The digest of every shared type's layout.
@@ -846,7 +858,30 @@ pub fn digest() -> u64 {
     );
     layout!(h, crate::service::control::Checked { prompt, n, sys, plp, n_gen, steering, ok });
     layout!(h, crate::service::control::PoolCall { kind, rows, worst, r, out, run, prompt, n, span, ns });
-    layout!(h, crate::service::control::Host { ctx, check, retire_run, share, refusal, tiers });
+    layout!(h, crate::service::control::Staged { req, prompt, n, sys, plp });
+    layout!(
+        h,
+        crate::service::control::Host {
+            ctx,
+            check,
+            retire_run,
+            share,
+            refusal,
+            tiers,
+            idle_boundary,
+            stage,
+            unstage,
+            digest,
+            abort,
+            apply,
+            mode,
+            step,
+            counters,
+            begin,
+            bound,
+            release
+        }
+    );
     layout!(
         h,
         crate::service::control::CControl {
@@ -868,6 +903,24 @@ pub fn digest() -> u64 {
             head,
             admit_hold,
             elog
+        }
+    );
+    layout!(
+        h,
+        crate::service::compute::CCompute {
+            control,
+            endpoint,
+            ingress,
+            trace,
+            slots,
+            n_slots,
+            state,
+            module,
+            host,
+            rank,
+            elog,
+            dfl_reuse,
+            ngram
         }
     );
     h

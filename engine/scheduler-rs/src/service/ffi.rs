@@ -3,13 +3,15 @@
 #![allow(clippy::missing_safety_doc)]
 
 use super::admit;
+use super::compute::{CCompute, Compute};
 use super::control::{self, CControl, Control, ObserveFn};
 use super::files::{self, Boot, Command, Ingress, Profile, Shape, Steering};
 use super::status::{self, Growth, RunUse, Status};
 use super::trace::{self, Trace};
 use crate::control::ffi::{bytes, code, give, GrowFn};
 use crate::kv_share::Totals;
-use crate::scheduler::{Config, Identity, Request};
+use crate::planner_ffi::CStats;
+use crate::scheduler::{Config, Grant, Identity, Key, Request, Slot};
 use std::ffi::c_void;
 
 /// g6svc_profile: one loaded steering profile.
@@ -472,4 +474,47 @@ pub unsafe extern "C" fn g6svc_control_write_status(c: *const Control, s: *const
 #[no_mangle]
 pub unsafe extern "C" fn g6svc_control_observe(c: *const Control, f: ObserveFn, ctx: *mut c_void) {
     (*c).observe(f, ctx);
+}
+
+// --- every rank's compute thread (compute.rs) and the driver's hooks it answers
+
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_new(c: *const CCompute, out: *mut *mut Compute) -> i32 {
+    *out = std::ptr::null_mut();
+    code(Compute::new(&*c).map(|x| *out = Box::into_raw(Box::new(x))))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_free(c: *mut Compute) {
+    if !c.is_null() {
+        drop(Box::from_raw(c));
+    }
+}
+/// The compute thread: returns once the service stops, or when something failed.
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_run(c: *const Compute) -> i32 {
+    code((*c).run())
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_bind(c: *const Compute, g: *const Grant) -> i32 {
+    code((*c).bind(&*g))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_retire(c: *const Compute, s: *const Slot) -> i32 {
+    code((*c).retire(&*s))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_finished(c: *const Compute, s: *const Slot) -> i32 {
+    code((*c).finished(&*s))
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_first_token(c: *const Compute, k: *const Key) {
+    (*c).first_token(&*k);
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_settle(c: *const Compute) -> i32 {
+    code((*c).settle())
+}
+#[no_mangle]
+pub unsafe extern "C" fn g6svc_compute_terminal(c: *const Compute, slot: u32, s: *const CStats) {
+    (*c).terminal(slot, &*s);
 }
