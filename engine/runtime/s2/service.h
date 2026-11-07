@@ -48,7 +48,8 @@ struct PoolHooks {
     std::function<std::vector<PoolUse>()> runs;
     std::function<g6kv_totals()> stats;
     // optional, prefix reuse (pool.h keep): every rank retires a run with its session's reuse state; the head matches a
-    // new prompt against the retained runs (limit: rows its prefill may skip) and takes a hit
+    // new prompt against the retained runs (limit: rows its prefill may skip) and takes a hit. retain and park are module
+    // calls (ModuleOps); they are here for a table built over these std::functions (NativeHooks::module unset)
     std::function<void(const Run&, const g6rt::PrefixReuse&, const g6rt::CacheNamespace&)> retain;
     std::function<PoolHit(const std::vector<int>& prompt, uint64_t rows, uint64_t worst, int limit,
                           const g6rt::CacheNamespace&, uint32_t r)> match;
@@ -65,6 +66,9 @@ struct PoolHooks {
 };
 struct NativeHooks {
     PoolHooks pool;
+    // the module (ModuleOps). Unset: a table over the std::function members below and pool.retain and pool.park, which
+    // must then be empty when it is set
+    g6s2_module_ops module{};
     std::function<void(const Grant&)> bind; // native main AND draft binding, no pool mutation
     // optional, before bind on every rank: the bound request itself (DS41: its image rows, for the Engram ring of the
     // slot's snapshots and parks, s2/ds41_engram_ring.h)
@@ -121,6 +125,9 @@ struct Progress {
 };
 class Service {
     BootstrapConfig c_; ControlLinks& links_; NativeHooks native_;
+    std::unique_ptr<FnModule<NativeHooks>> fn_;   // the table over native_'s hooks, when native_.module is unset
+    Module mod_;
+    Sessions::Logprob logprob_;                   // the module's logprob, for Sessions
     Sessions sessions_; Dispatch dispatch_; std::unique_ptr<Driver> driver_;
     std::unique_ptr<LeaderChannel> leader_; std::unique_ptr<WorkerChannel> worker_;
     EventEndpoint* endpoint_ = nullptr;
@@ -138,7 +145,7 @@ class Service {
     std::mutex failure_mu_; std::exception_ptr failure_;
     uint64_t attempted_head_ = UINT64_MAX, attempted_revision_ = UINT64_MAX;
     uint64_t event_ = 1;
-    uint64_t sync_ = 0;   // compute thread: barriers passed (native_.drained)
+    uint64_t sync_ = 0;   // compute thread: barriers passed (the module's drained)
     // head: a Resize announced and not yet applied on this rank (no second report until then: it would ask again for
     // segments already granted)
     std::atomic<bool> resizing_{false};
@@ -214,10 +221,10 @@ class Service {
         st.finish(driver_->prompt(s.key.slot), gen, int(gen.size()), true);
         // park: a finished session (not a cancelled one) keeps its slot; the scheduler parks it at the next commit
         if (c_.scheduler.park && s.phase == Phase::Retiring) {
-            native_.pool.park(s.key.slot, s.run, st, g6rt::steering::cache_namespace(s.req.steering));
+            mod_.park(s.key.slot, s.run, st, g6rt::steering::cache_namespace(s.req.steering));
             return;
         }
-        native_.pool.retain(s.run, st, g6rt::steering::cache_namespace(s.req.steering));
+        mod_.retain(s.run, st, g6rt::steering::cache_namespace(s.req.steering));
     }
     void publish_status() { // head CONTROL thread only, on queue/lifecycle revisions
         const uint32_t pages = c_.scheduler.pool_rows / PAGE;
@@ -496,7 +503,7 @@ class Service {
                 const auto n = endpoint_->wait_notice(); driver_->idle_boundary(n.boundary);
             }
             auto cm = endpoint_->boundary(driver_->state().boundary(), [&] {
-                native_.fence(); const auto n = endpoint_->wait_notice(); noticed = n; staged_.reset();
+                mod_.fence(); const auto n = endpoint_->wait_notice(); noticed = n; staged_.reset();
                 if (n.kind == EventKind::Admit) {   // the head reads its own req.<id>; a worker has the bytes from the head
                     const auto bytes = worker_ ? worker_->request(n.request) : ingress_.request({true,n.epoch,n.request,n.payload_hash});
                     require(payload_hash(bytes) == n.payload_hash, "request bytes do not match the ADMIT notice");
@@ -535,7 +542,7 @@ class Service {
                 dispatch_.synchronize_mode(driver_->state()); progress_.publish(driver_->state());
                 staged_.reset(); endpoint_->applied(); continue;
             }
-            if (native_.before_work) native_.before_work();
+            if (mod_.o.before_work) mod_.before_work();
             const auto t0 = trace_ ? Trace::now() : 0;
             const auto work = driver_->step(); require(work.kind != Kind::Idle, "departed idle boundary");
             for (unsigned i = 0; i < work.count; ++i) {   // rank 0: each session's spec counters, once a second
@@ -562,22 +569,34 @@ class Service {
 public:
     unsigned quit_linger_ms = 15000; // orderly-quit linger (monitor); > the time the workers take to see the head's quit
     Service(BootstrapConfig c, ControlLinks& links, NativeHooks hooks, int chunk)
-        : c_(std::move(c)), links_(links), native_(std::move(hooks)), sessions_(c_.scheduler,c_.directory,c_.rank == 0,chunk,c_.prefill_min),
-          dispatch_(sessions_,c_.scheduler.max_rows,native_.dispatch), ingress_(c_.directory,c_.scheduler.epoch), queue_(c_.scheduler) {
+        : c_(std::move(c)), links_(links), native_(std::move(hooks)),
+          fn_(native_.module.ctx ? nullptr : new FnModule<NativeHooks>(native_)), mod_(fn_ ? fn_->ops() : native_.module),
+          sessions_(c_.scheduler,c_.directory,c_.rank == 0,chunk,c_.prefill_min),
+          dispatch_(sessions_,c_.scheduler.max_rows,mod_.o), ingress_(c_.directory,c_.scheduler.epoch), queue_(c_.scheduler) {
         c_.validate();
         trace_.open(knob::s2_trace().value_or(""), c_.rank);
         require(native_.pool.pool, "the service needs the rank's pool");
+        require(!native_.module.ctx || !(native_.bind || native_.bind_request || native_.grown || native_.retire || native_.fence ||
+                                         native_.before_work || native_.drained || native_.resize || native_.shrink ||
+                                         native_.flash_room || native_.pool.retain || native_.pool.park || native_.dispatch.launch ||
+                                         native_.dispatch.bucket || native_.dispatch.mode || native_.dispatch.prefill ||
+                                         native_.dispatch.logprob || native_.dispatch.dfl_ok || native_.dispatch.dfl_start ||
+                                         native_.dispatch.dfl || native_.dispatch.draft_lp || native_.dispatch.prefill_seq ||
+                                         native_.dispatch.prefill_pack_seq || native_.dispatch.gm_on || native_.dispatch.pen_rows),
+                "a module table and module hooks together");
+        const g6s2_module_ops& m = mod_.o;
         require(bool(native_.pool.free_pages) && bool(native_.pool.room) && bool(native_.pool.reserve) && bool(native_.pool.fits) &&
-                bool(native_.bind) && bool(native_.retire) && bool(native_.fence), "incomplete native service hooks");
-        require(!native_.pool.grow || bool(native_.grown), "pool growth needs the native table hook");
-        require(!native_.pool.make_room || bool(native_.shrink), "a shrink needs the native hook");
-        require(!native_.share || bool(native_.resize), "a share report needs the resize hook");
-        require(!native_.flash.chunk_rows || bool(native_.resize), "borrow-idle needs the resize hook");
+                m.bind && m.retire && m.fence, "incomplete native service hooks");
+        require(!native_.pool.grow || m.grown, "pool growth needs the native table hook");
+        require(!native_.pool.make_room || m.shrink, "a shrink needs the native hook");
+        require(!native_.share || m.resize, "a share report needs the resize hook");
+        require(!native_.flash.chunk_rows || m.resize, "borrow-idle needs the resize hook");
+        if (m.logprob) logprob_ = [this](int row, bool target, int k) { return mod_.logprob(row, target, k); };
         DriverHooks h;
-        h.resize = native_.resize;
+        if (m.resize) h.resize = [&](const Resize& r) { mod_.resize(r); };
         h.shrink = [&](const Shrink& k, const Run& was, uint64_t length) {   // a worker's pool changed in the driver first
-            require(bool(native_.shrink), "a shrink commit without the native shrink hook");
-            native_.shrink(k, was, length);
+            require(mod_.o.shrink != nullptr, "a shrink commit without the native shrink hook");
+            mod_.shrink(k, was, length);
         };
         h.bind = [&](const Grant& g) {
             require(staged_.has_value(), "binding without verified payload");
@@ -599,13 +618,13 @@ public:
                 require(mine == g.run, "worker page list differs from the head's grant");
             }
             dispatch_.begin(g.key.slot, int(g.reuse), g6rt::steering::cache_namespace(g.req.steering));
-            if (native_.bind_request) native_.bind_request(g.key.slot, *staged_);
-            native_.bind(g); sessions_.bind(g,*staged_);
+            if (mod_.o.bind_request) mod_.bind_request(g.key.slot, *staged_);
+            mod_.bind(g); sessions_.bind(g,*staged_);
         };
         h.retire = [&](const Slot& old) {
             // a cancelled live session (finished ones: below)
             if (c_.rank && old.phase != Phase::Retiring && reuse()) retire_run(old);
-            native_.retire(old); sessions_.retire(old); dispatch_.release(old.key.slot);
+            mod_.retire(old); sessions_.retire(old); dispatch_.release(old.key.slot);
         };
         h.prefill = [&](const Slot& s,const Payload& p,uint32_t first,uint32_t rows) {
             dispatch_.prefill(s,p,first,rows);
@@ -621,9 +640,9 @@ public:
                 const auto id = driver_->state().slots()[k.slot].req.id;
                 if (first_.insert(id).second) trace_.instant("first token", Trace::STEPS, targ("request", id));
             }
-            return sessions_.emit(k,ids,n,row,native_.dispatch.logprob);
+            return sessions_.emit(k,ids,n,row,logprob_);
         };
-        h.prompt = [&](Key k,int M,int pos0) { sessions_.prompt_rows(k,M,pos0,native_.dispatch.logprob); };
+        h.prompt = [&](Key k,int M,int pos0) { sessions_.prompt_rows(k,M,pos0,logprob_); };
         h.finished = [&](const Slot& s) {
             if (trace_) {
                 trace_.instant("finish", Trace::STEPS, targ("request", s.req.id) + "," + targ("tokens", s.emitted));
@@ -631,9 +650,9 @@ public:
             }
             if (reuse()) retire_run(s);
         };
-        if (native_.drained)   // the copies run at a bind, a growth or a retire: all before the next step's round
+        if (m.drained)   // the copies run at a bind, a growth or a retire: all before the next step's round
             h.settle = [&] {
-                if (!native_.drained()) return;
+                if (!mod_.drained()) return;
                 // the barrier after a drain: every rank waits here for the slowest rank's drain (the drain trace's other
                 // half: the tier io lines carry the same ranks' drains)
                 auto wall = [] { return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); };
@@ -642,7 +661,7 @@ public:
                 fprintf(stderr, "# rank %u: s2 drain barrier %llu: in %lld ms, out %lld ms\n", (unsigned)c_.rank, (unsigned long long)sync_, b0, wall());
             };
         if (native_.pool.grow)
-            h.grown = [&](const Slot& s, const Run& r) { native_.grown(s.key.slot, r); sessions_.grow(s.key.slot, r); };
+            h.grown = [&](const Slot& s, const Run& r) { mod_.grown(s.key.slot, r); sessions_.grow(s.key.slot, r); };
         h.terminal = [&](Key k,const s2::Stats& stats) {
             if (stats.switches || stats.mtp_rounds)
                 fprintf(stderr,"# s2 drafter choice slot %u: %ld of %ld rounds on MTP, %ld switches, %ld tokens\n",unsigned(k.slot),
@@ -656,28 +675,28 @@ public:
                         unsigned(k.slot),stats.ngram_rounds,stats.rounds,stats.ngram_acc,stats.ngram_drafted,stats.tokens);
             sessions_.terminal(k,stats);
         };
-        if (native_.dispatch.dfl) {
-            require(bool(native_.dispatch.dfl_ok) && bool(native_.dispatch.dfl_start), "DFlash2 needs dfl_ok, dfl_start and dfl");
+        if (m.dfl) {
+            require(m.dfl_ok && m.dfl_start, "DFlash2 needs dfl_ok, dfl_start and dfl");
             h.dfl_ok = [&](Key k) { return dispatch_.dfl_ok(k.slot); };
             h.dfl_start = [&](Key k) { return dispatch_.dfl_start(k.slot); };
             h.dfl = [&](Key, const s2::DflReq& r) { return dispatch_.dfl(r); };
-            h.draft_lp = native_.dispatch.draft_lp;
+            if (m.draft_lp) h.draft_lp = [&](int row) { return mod_.draft_lp(row); };
         }
         // MTP only (no drafter): the confidence stops of round_all read the draft log-probabilities too (g6m4 sets kstop)
-        const bool kstop_mtp = !native_.dispatch.dfl && (native_.kstop.mode || native_.kstop.b.mode || native_.kstop.log);
-        if (kstop_mtp) h.draft_lp = native_.dispatch.draft_lp;
+        const bool kstop_mtp = !m.dfl && (native_.kstop.mode || native_.kstop.b.mode || native_.kstop.log);
+        if (kstop_mtp && m.draft_lp) h.draft_lp = [&](int row) { return mod_.draft_lp(row); };
         const DriverPool dp{native_.pool.pool->handle(), native_.pool.grow, bool(native_.pool.make_room), !reuse(),
                             c_.rank == 0};
         driver_ = std::make_unique<Driver>(c_.scheduler,std::move(h),dp);
-        if (native_.dispatch.dfl) {
+        if (m.dfl) {
             driver_->dflash(native_.dfl_kv, native_.dfl_spec); driver_->dsel(native_.dsel); driver_->kstop(native_.kstop);
             driver_->dfl_reuse(native_.dfl_reuse);
             driver_->ngram(native_.ngram);
         }
         else if (kstop_mtp) driver_->kstop(native_.kstop);
-        require(!c_.scheduler.park || (reuse() && bool(native_.pool.park)), "parked slots need prefix reuse and the park hook");
+        require(!c_.scheduler.park || (reuse() && m.park), "parked slots need prefix reuse and the park hook");
         if (reuse()) {
-            require(bool(native_.pool.retain) && bool(native_.pool.take), "prefix reuse needs retain, match and take");
+            require(m.retain && bool(native_.pool.take), "prefix reuse needs retain, match and take");
             dispatch_.track_rows();
         }
         if (!c_.rank) {
@@ -687,7 +706,7 @@ public:
             worker_ = std::make_unique<WorkerChannel>(c_.scheduler.epoch,c_.rank,*links_.links[0]); endpoint_ = worker_.get();
             worker_->on_quit = [this] { atomic_file(c_.directory + "/quit", ""); };
         }
-        endpoint_->room = native_.flash_room;
+        if (m.flash_room) endpoint_->room = [this] { return mod_.flash_room(); };
     }
     // Blocking compute loop, with persistent control + abort/quit monitor threads.
     // Caller must use the runtime's all-rank failure path if this throws.

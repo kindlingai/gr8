@@ -19,6 +19,7 @@ pub mod flash_ring;
 pub mod kv_plan;
 pub mod kv_share;
 pub mod layout;
+pub mod module;
 pub mod ngram;
 pub mod planner;
 pub mod planner_ffi;

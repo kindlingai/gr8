@@ -496,6 +496,59 @@ uint32_t g6s2_driver_emitted(const g6s2_driver* d, uint32_t q);
 bool g6s2_driver_initialized(const g6s2_driver* d, uint32_t q);
 uint64_t g6s2_driver_cp_rounds(const g6s2_driver* d);
 
+// s2/module.h: the service's calls on a model module (ModuleOps). A module fills one table. A null member is a call it
+// does not have. ctx is the module's (in C++ a g6s2::ModuleCtx: it holds the exception a call threw). Each call returns
+// 0, or 1 when the module threw. Calls on one module never overlap: they run on the compute thread, and on the head's
+// control thread only while the compute thread waits at an event. A C caller passes the opaque types through. They are
+// the C++ g6s2::Launch, Payload, std::vector<PrefillPart>, std::vector<int> (launch assigns its output there),
+// g6rt::ServeReq and g6rt::PrefixReuse. ns: G6KV_NAMESPACE_BYTES bytes.
+struct g6s2_launch;
+struct g6s2_payload;
+struct g6s2_parts;
+struct g6s2_ids;
+struct g6s2_serve_req;
+struct g6s2_reuse;
+struct g6s2_sampling;   // sessions.h Sampling, passed through
+struct g6s2_lp_row { float lp; int32_t rank, n; int32_t id[20]; float tlp[20]; };  // serve.h LpRow
+struct g6s2_module_ops {
+    void* ctx;
+    // a session, every rank: bound (its request first), grown, shrunk to the smaller R, retired. When it leaves, the
+    // module keeps its run with its reuse state (retain) or parks its slot (park)
+    int32_t (*bind)(void* ctx, const g6sch_grant* g);
+    int32_t (*bind_request)(void* ctx, uint32_t slot, const g6s2_serve_req* r);
+    int32_t (*grown)(void* ctx, uint32_t slot, const g6sch_run* r);
+    int32_t (*shrink)(void* ctx, const g6sch_shrink* k, const g6sch_run* was, uint64_t length);
+    int32_t (*retire)(void* ctx, const g6sch_slot* s);
+    int32_t (*retain)(void* ctx, const g6sch_run* r, const g6s2_reuse* st, const uint8_t* ns);
+    int32_t (*park)(void* ctx, uint32_t slot, const g6sch_run* r, const g6s2_reuse* st, const uint8_t* ns);
+    // events and boundaries
+    int32_t (*fence)(void* ctx);
+    int32_t (*before_work)(void* ctx);
+    int32_t (*drained)(void* ctx, bool* out);
+    int32_t (*resize)(void* ctx, const g6sch_resize* r);
+    int32_t (*flash_room)(void* ctx, uint32_t* out);
+    // steps (s2/dispatch.h)
+    int32_t (*bucket)(void* ctx, bool draft, int32_t context, int32_t* out);
+    int32_t (*mode)(void* ctx, int32_t old_solo, int32_t new_solo);
+    int32_t (*launch)(void* ctx, const g6s2_launch* l, g6s2_ids* out);
+    int32_t (*prefill)(void* ctx, const g6sch_slot* s, const g6s2_payload* p, uint32_t first, uint32_t rows);
+    int32_t (*prefill_seq)(void* ctx, const g6sch_slot* s, const g6s2_payload* p, uint32_t first, uint32_t rows, uint64_t seq);
+    int32_t (*prefill_pack)(void* ctx, const g6s2_parts* parts, uint64_t seq);
+    int32_t (*logprob)(void* ctx, int32_t row, bool target, int32_t k, g6s2_lp_row* out);
+    int32_t (*draft_lp)(void* ctx, int32_t row, float* out);
+    int32_t (*dfl_ok)(void* ctx, int32_t slot, bool* out);
+    int32_t (*dfl_start)(void* ctx, int32_t slot, int32_t* out);
+    int32_t (*dfl)(void* ctx, const g6s2_dfl_req* r, const g6s2_sampling* s, g6s2_dfl_drafts* out);
+    // grammars: the host side of the mask arena the main head reads (null: none)
+    int32_t* gm_on;
+    uint32_t* gm_bits;
+    int32_t gm_words;
+    // penalties: the host side of the row table and the session table the main head reads (penalty.h PenRow and
+    // PenSess; null: none)
+    void* pen_rows;
+    void* pen_sess;
+};
+
 // s2/bootstrap.h, control_io.h, control_protocol.h, control_channel.h, event_gate.h: the control links between the
 // ranks. Rust owns each link's socket (g6ctl_io, the C++ ControlIO's), the event gate, the head's and workers' event
 // channels (g6ctl_endpoint) and the bootstrap's exchanges. The C++ classes are facades. No call starts a thread. Fallible
@@ -738,6 +791,8 @@ constexpr uint64_t g6sch_layout_cpp() {
     G6SCH_TYPE(g6s2_drv_pool) G6SCH_FIELD(g6s2_drv_pool, grow) G6SCH_FIELD(g6s2_drv_pool, shrink) G6SCH_FIELD(g6s2_drv_pool, release) G6SCH_FIELD(g6s2_drv_pool, head)
     G6SCH_TYPE(g6s2_drv_hooks) G6SCH_FIELD(g6s2_drv_hooks, ctx) G6SCH_FIELD(g6s2_drv_hooks, bind) G6SCH_FIELD(g6s2_drv_hooks, retire) G6SCH_FIELD(g6s2_drv_hooks, prefill) G6SCH_FIELD(g6s2_drv_hooks, prefill_pack) G6SCH_FIELD(g6s2_drv_hooks, dfl_ok) G6SCH_FIELD(g6s2_drv_hooks, terminal) G6SCH_FIELD(g6s2_drv_hooks, grow) G6SCH_FIELD(g6s2_drv_hooks, finished) G6SCH_FIELD(g6s2_drv_hooks, resize) G6SCH_FIELD(g6s2_drv_hooks, shrink) G6SCH_FIELD(g6s2_drv_hooks, settle) G6SCH_FIELD(g6s2_drv_hooks, payload) G6SCH_FIELD(g6s2_drv_hooks, grown) G6SCH_FIELD(g6s2_drv_hooks, has_prefill_pack) G6SCH_FIELD(g6s2_drv_hooks, has_dfl_ok) G6SCH_FIELD(g6s2_drv_hooks, has_terminal) G6SCH_FIELD(g6s2_drv_hooks, has_grow) G6SCH_FIELD(g6s2_drv_hooks, has_finished) G6SCH_FIELD(g6s2_drv_hooks, has_resize) G6SCH_FIELD(g6s2_drv_hooks, has_shrink) G6SCH_FIELD(g6s2_drv_hooks, has_settle) G6SCH_FIELD(g6s2_drv_hooks, has_grown)
     G6SCH_TYPE(g6s2_drv_planner) G6SCH_FIELD(g6s2_drv_planner, ctx) G6SCH_FIELD(g6s2_drv_planner, admit) G6SCH_FIELD(g6s2_drv_planner, admit_pack) G6SCH_FIELD(g6s2_drv_planner, round) G6SCH_FIELD(g6s2_drv_planner, demote) G6SCH_FIELD(g6s2_drv_planner, promote) G6SCH_FIELD(g6s2_drv_planner, release) G6SCH_FIELD(g6s2_drv_planner, length) G6SCH_FIELD(g6s2_drv_planner, finished) G6SCH_FIELD(g6s2_drv_planner, active) G6SCH_FIELD(g6s2_drv_planner, inserted)
+    G6SCH_TYPE(g6s2_lp_row) G6SCH_FIELD(g6s2_lp_row, lp) G6SCH_FIELD(g6s2_lp_row, rank) G6SCH_FIELD(g6s2_lp_row, n) G6SCH_FIELD(g6s2_lp_row, id) G6SCH_FIELD(g6s2_lp_row, tlp)
+    G6SCH_TYPE(g6s2_module_ops) G6SCH_FIELD(g6s2_module_ops, ctx) G6SCH_FIELD(g6s2_module_ops, bind) G6SCH_FIELD(g6s2_module_ops, bind_request) G6SCH_FIELD(g6s2_module_ops, grown) G6SCH_FIELD(g6s2_module_ops, shrink) G6SCH_FIELD(g6s2_module_ops, retire) G6SCH_FIELD(g6s2_module_ops, retain) G6SCH_FIELD(g6s2_module_ops, park) G6SCH_FIELD(g6s2_module_ops, fence) G6SCH_FIELD(g6s2_module_ops, before_work) G6SCH_FIELD(g6s2_module_ops, drained) G6SCH_FIELD(g6s2_module_ops, resize) G6SCH_FIELD(g6s2_module_ops, flash_room) G6SCH_FIELD(g6s2_module_ops, bucket) G6SCH_FIELD(g6s2_module_ops, mode) G6SCH_FIELD(g6s2_module_ops, launch) G6SCH_FIELD(g6s2_module_ops, prefill) G6SCH_FIELD(g6s2_module_ops, prefill_seq) G6SCH_FIELD(g6s2_module_ops, prefill_pack) G6SCH_FIELD(g6s2_module_ops, logprob) G6SCH_FIELD(g6s2_module_ops, draft_lp) G6SCH_FIELD(g6s2_module_ops, dfl_ok) G6SCH_FIELD(g6s2_module_ops, dfl_start) G6SCH_FIELD(g6s2_module_ops, dfl) G6SCH_FIELD(g6s2_module_ops, gm_on) G6SCH_FIELD(g6s2_module_ops, gm_bits) G6SCH_FIELD(g6s2_module_ops, gm_words) G6SCH_FIELD(g6s2_module_ops, pen_rows) G6SCH_FIELD(g6s2_module_ops, pen_sess)
     G6SCH_TYPE(g6ctl_notice) G6SCH_FIELD(g6ctl_notice, epoch) G6SCH_FIELD(g6ctl_notice, event) G6SCH_FIELD(g6ctl_notice, boundary) G6SCH_FIELD(g6ctl_notice, request) G6SCH_FIELD(g6ctl_notice, payload_hash) G6SCH_FIELD(g6ctl_notice, kind)
     G6SCH_TYPE(g6ctl_ack) G6SCH_FIELD(g6ctl_ack, notice) G6SCH_FIELD(g6ctl_ack, rank) G6SCH_FIELD(g6ctl_ack, state_hash) G6SCH_FIELD(g6ctl_ack, room)
     G6SCH_TYPE(g6ctl_commit) G6SCH_FIELD(g6ctl_commit, c) G6SCH_FIELD(g6ctl_commit, hold) G6SCH_FIELD(g6ctl_commit, has_resize) G6SCH_FIELD(g6ctl_commit, resize)

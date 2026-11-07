@@ -2072,7 +2072,7 @@ int main(int argc, char** argv)
         g6s2::FlashDflWindow dwin((int)g6s2::MAX_SESSIONS, dfl::WIN, dfl_reuse);
         u64 s2_dstep = 0;
         cudaStream_t dfl_ds = st;        // GR8_DRAFT_PAR: the stream of the drafter step in flight
-        auto dfl_install = [&](g6s2::NativeHooks& h) {
+        auto dfl_install = [&](g6s2::NativeHooks& h, g6s2::FlashExtras& ext) {
             h.dfl_kv = dfl_k; h.dfl_spec = spec;
             h.dsel.on = s2::dsel_env();
             h.dsel.margin = knob::s2_dsel_margin();
@@ -2085,24 +2085,20 @@ int main(int argc, char** argv)
             h.kstop = kstop;
             h.dfl_reuse.mode = dfl_reuse;
             h.dfl_reuse.min = dfl_reuse_min;
-            auto bind = h.bind;
-            h.bind = [&, bind](const g6s2::Grant& g) {
-                if (bind) bind(g);               // serve_flash's: a checkpoint hit's rows are restored here
+            ext.bind = [&](const g6s2::Grant& g) {   // after serve_flash's bind, which restores a checkpoint hit's rows first
                 dwin.bind((int)g.key.slot, g.req.prompt_tokens, g.reuse);
             };
-            auto prefill = h.dispatch.prefill;
-            h.dispatch.prefill = [&, prefill](const g6s2::Slot& sl, const g6s2::Payload& p, uint32_t first, uint32_t rows) {
+            ext.prefill = [&](const g6s2::Slot& sl) {
                 // a request's first prefill quantum: the window its taps fill
                 if (DF.pf_feat && dwin.quantum((int)sl.key.slot, sl.req.id, sl.req.prompt_tokens, sl.prefilled))
                 {
                     DF.pf_hi = dwin.hi; DF.pf_lo = dwin.lo;
                     if (DF.pf_hi > DF.pf_lo) G6RT_CK(cudaMemsetAsync(DF.pf_feat, 0, (size_t)(DF.pf_hi - DF.pf_lo) * dfl::NT * HID * 2, st));
                 }
-                prefill(sl, p, first, rows);
             };
             // a session alone takes the DFlash2-wide KDA ring at its first round (s2/flash_native.cuh widen)
-            h.dispatch.dfl_ok = [&](int q) { return dwin.ok(q); };
-            h.dispatch.dfl_start = [&](int q) {     // the prefill's taps -> the drafter's context ring, 8 rows a fill step
+            ext.dfl_ok = [&](int q) { return dwin.ok(q); };
+            ext.dfl_start = [&](int q) {     // the prefill's taps -> the drafter's context ring, 8 rows a fill step
                 if (!dwin.fills(q)) return dwin.start(q);
                 for (int c0 = dwin.from; c0 < DF.pf_hi; c0 += dfl::B)
                 {
@@ -2118,7 +2114,7 @@ int main(int argc, char** argv)
                 }
                 return dwin.start(q);
             };
-            h.dispatch.dfl = [&](const s2::DflReq& r, const g6s2::Sampling& smp) {
+            ext.dfl = [&](const s2::DflReq& r, const g6s2::Sampling& smp) {
                 // GR8_DRAFT_PAR: phase 1 launches on the drafter's stream and returns, phase 2 waits for it (s2::DflReq)
                 if (r.phase != 2)
                 {
@@ -2146,8 +2142,8 @@ int main(int argc, char** argv)
                                              " context rows)").c_str() : "");
         };
         // GR8_GLM53F_KV_CHUNKS=1 (borrow-idle): hooks serve_flash adds to its own before the service starts
-        auto flash_install = [&](g6s2::NativeHooks& h) {
-            if (dfl) dfl_install(h);
+        auto flash_install = [&](g6s2::NativeHooks& h, g6s2::FlashExtras& ext) {
+            if (dfl) dfl_install(h, ext);
             // GR8_GLM53F_KV_CHUNKS=1: a Resize event on tier FLASH_KV_TIER takes every model's chunk map to r.segs chunks
             // online, on every rank at the commit (flash_kv.h; with GR8_GLM53F_KV_LEDGER the bytes move through the box's
             // host ledger). The head announces them under FLASH_CAP_POLICY=borrow-idle (GR8_GLM53F_KV_LEND_MS > 0, s2/flash_lend.h):
@@ -2157,7 +2153,7 @@ int main(int argc, char** argv)
             {
                 if (const auto& l = knob::glm53f_kv_ledger()) for (g6rt::Model* x : {&m, &D.d}) x->fkv.ledger = *l;
                 const long lend_ms = (long)knob::glm53f_kv_lend_ms(), keep = (long)knob::glm53f_kv_idle_chunks();   // >= 0, >= 1 (table)
-                h.flash_room = [&] {
+                ext.flash_room = [&] {
                     uint32_t n = UINT32_MAX;
                     for (g6rt::Model* x : {&m, &D.d}) if (x->fkv.pages) n = std::min(n, x->fkv.online);
                     return n;
@@ -2185,9 +2181,8 @@ int main(int argc, char** argv)
                                     "lendable\n", R, m.fkv.chunks - h.flash.keep, m.fkv.chunks, lend_ms,
                             (unsigned long long)lendable);
                 }
-                auto other = h.resize;
-                h.resize = [&, other](const g6s2::Resize& r) {
-                    if (r.tier != g6s2::FLASH_KV_TIER) { if (other) other(r); return; }
+                ext.resize = [&](const g6s2::Resize& r) {
+                    if (r.tier != g6s2::FLASH_KV_TIER) return false;
                     for (g6rt::Model* x : {&m, &D.d})
                     {
                         if (!x->fkv.pages) continue;
@@ -2199,6 +2194,7 @@ int main(int argc, char** argv)
                                     x->fkv.online, x->fkv.chunks, (unsigned long long)x->fkv.tokens(),
                                     (long long)g6s2::s2_wall_ms());
                     }
+                    return true;
                 };
             }
         };
@@ -3208,7 +3204,6 @@ int main(int argc, char** argv)
             h.pool.grow = knob::s2_grow();
             if (pool.keeping())
             {
-                h.pool.retain = [&](const g6s2::Run& r, const PrefixReuse& s, const CacheNamespace& ns) { pool.retain(r, s, ns); };
                 h.pool.match = [&](const std::vector<int>& p, uint64_t rows, uint64_t worst, int limit, const CacheNamespace& ns, uint32_t r) {
                     return pool.match(p, rows, worst, limit, ns, r);
                 };
@@ -3247,168 +3242,262 @@ int main(int argc, char** argv)
             {
                 h.pool.tiers = [&] { return pool.tiers(); };
                 h.pool.count = [&](const std::vector<int>& p, int64_t span, const CacheNamespace& ns) { return pool.count(p, span, ns); };
-                h.pool.retain = [&](const g6s2::Run& r, const PrefixReuse& s, const CacheNamespace& ns) { pool.retain(r, s, ns); kv_drain(); };   // a promoted prefix
             }
-            h.bind = [&](const g6s2::Grant& g) {     // at the admission fence, every rank, main and draft
-                // the store copies the grant queued: evicted runs out before anything writes their pages, a stored run in
-                kv_drain();
-                if (R == bind_delay_rank && bind_delay_ms)
-                {
-                    fprintf(stderr, "# rank %d: GR8_S2_BIND_DELAY: sleeping %d ms after the bind of request %llu at %lld ms\n", R, bind_delay_ms,
-                            (unsigned long long)g.req.id, (long long)g6s2::s2_wall_ms());
-                    std::this_thread::sleep_for(std::chrono::milliseconds(bind_delay_ms));
-                }
-                const int q = (int)g.key.slot;
-                const int rp = int(g.req.r_rows ? g.req.r_rows : uint32_t(m.s2_below)) / 64;   // the run's prefix pages
-                if (rtt && !rtt->local) { rt_drop_slot(*rtt, q, st); rt_drop(*rtt, pool.list(g.run), st); rt_told[q] = false; }   // a new run's pages are local
-                // release: a split run's tail starts unmapped, cycling through its window (list[rp ..], kvman-rs Pool::window)
-                if (rtt && rtt->local)
-                {
-                    if (rt_layers == q) rt_layers = -1;
-                    rt_gen[q] = g.key.generation;
-                    // a hit on a retained window run takes its window pages, and its records come with them: from its
-                    // parked entry, or from its slot when its retirement is at this boundary and not bound yet (the
-                    // slot's own included), so it is found before anything ends that slot
+            // GLM's module (ModuleOps): its hooks as members over references to the locals they use. The locals outlive it and the service
+#define GLM_CAPTURES(X) X(R) X(m) X(D) X(DF) X(st) X(st_par) X(exec_f) X(fabf) X(in_f) X(out_f) X(plan) X(dfl_reuse) \
+    X(rtt) X(pool) X(kvt) X(kv_drained) X(kv_drain) X(bind_delay_rank) X(bind_delay_ms) X(dfl_owner) X(dfl_from) \
+    X(slot_prompt) X(slot_whole) X(s2_dstep) X(dfl_par_st) X(dfl_tl) X(dfl_t0) X(rt_told) X(rt_log) X(rt_layers) \
+    X(rt_gen) X(nd)
+            GLM_CAPTURES(G6S2_CAPTURE_TYPE)
+            struct GlmModule : g6s2::ModuleCtx
+            {
+                GLM_CAPTURES(G6S2_CAPTURE_REF)
+                void on_retain(const g6s2::Run& r, const PrefixReuse& s, const CacheNamespace& ns) { pool.retain(r, s, ns); }
+                void on_retain_drain(const g6s2::Run& r, const PrefixReuse& s, const CacheNamespace& ns) { pool.retain(r, s, ns); kv_drain(); }   // a promoted prefix
+                void on_bind(const g6s2::Grant& g) {     // at the admission fence, every rank, main and draft
+                    // the store copies the grant queued: evicted runs out before anything writes their pages, a stored run in
+                    kv_drain();
+                    if (R == bind_delay_rank && bind_delay_ms)
+                    {
+                        fprintf(stderr, "# rank %d: GR8_S2_BIND_DELAY: sleeping %d ms after the bind of request %llu at %lld ms\n", R, bind_delay_ms,
+                                (unsigned long long)g.req.id, (long long)g6s2::s2_wall_ms());
+                        std::this_thread::sleep_for(std::chrono::milliseconds(bind_delay_ms));
+                    }
+                    const int q = (int)g.key.slot;
+                    const int rp = int(g.req.r_rows ? g.req.r_rows : uint32_t(m.s2_below)) / 64;   // the run's prefix pages
+                    if (rtt && !rtt->local) { rt_drop_slot(*rtt, q, st); rt_drop(*rtt, pool.list(g.run), st); rt_told[q] = false; }   // a new run's pages are local
+                    // release: a split run's tail starts unmapped, cycling through its window (list[rp ..], kvman-rs Pool::window)
+                    if (rtt && rtt->local)
+                    {
+                        if (rt_layers == q) rt_layers = -1;
+                        rt_gen[q] = g.key.generation;
+                        // a hit on a retained window run takes its window pages, and its records come with them: from its
+                        // parked entry, or from its slot when its retirement is at this boundary and not bound yet (the
+                        // slot's own included), so it is found before anything ends that slot
+                        const bool ex = pool.exclusive_run(g.run);
+                        const std::vector<int> l = ex ? pool.list(g.run) : std::vector<int>{};
+                        const std::vector<int> win = ex ? std::vector<int>(l.begin() + rp, l.begin() + rp + rtt->local) : std::vector<int>{};
+                        // only a hit on a run the pool retained brings records, at the grant's own R: a stored hit restores a
+                        // prefix, and a fresh grant can land on the window pages of a parked run the pool already let go
+                        int pk = ex && g.reuse && !g.restored ? rt_parked(*rtt, win) : -1;
+                        if (pk >= 0 && rtt->seq[pk].L != rp * 64) pk = -1;
+                        if (pk != q) rt_end(*rtt, q, st);
+                        // the runs the pool let go (evicted, or adopted only in part below R) free their records first. The
+                        // head's take already moved this grant's run out of the kept list, so its entry stays.
+                        rt_gc(*rtt, [&](const std::vector<int>& kl) { return (pk >= 0 && kl == rtt->seq[pk].list) || pool.is_kept(kl); }, st);
+                        if (ex)
+                        {
+                            if (pk >= 0)
+                            {
+                                rt_adopt(m, *rtt, pk, q, l, (int)g.reuse, st);
+                                if (R == 0) fprintf(stderr, "# rank 0: GR8_RT_LOCAL slot %d adopts a retained run's records at row %u\n", q, g.reuse);
+                            }
+                            else if ((int)g.reuse > rp * 64)   // every rank holds the same entries, so they all stop here alike
+                                die("GR8_RT_LOCAL: a hit past R on a run whose records no slot or parked entry holds");
+                            else rt_begin(*rtt, q, win, l, rp * 64, st);
+                        }
+                    }
+                    slot_prompt[q] = g.req.prompt_tokens;
+                    slot_whole[q] = dfl_reuse && g.reuse + 1 == g.req.prompt_tokens;
+                    if (dfl_owner == q) dfl_owner = -1;     // the slot's previous session owned the taps
                     const bool ex = pool.exclusive_run(g.run);
-                    const std::vector<int> l = ex ? pool.list(g.run) : std::vector<int>{};
-                    const std::vector<int> win = ex ? std::vector<int>(l.begin() + rp, l.begin() + rp + rtt->local) : std::vector<int>{};
-                    // only a hit on a run the pool retained brings records, at the grant's own R: a stored hit restores a
-                    // prefix, and a fresh grant can land on the window pages of a parked run the pool already let go
-                    int pk = ex && g.reuse && !g.restored ? rt_parked(*rtt, win) : -1;
-                    if (pk >= 0 && rtt->seq[pk].L != rp * 64) pk = -1;
-                    if (pk != q) rt_end(*rtt, q, st);
-                    // the runs the pool let go (evicted, or adopted only in part below R) free their records first. The
-                    // head's take already moved this grant's run out of the kept list, so its entry stays.
-                    rt_gc(*rtt, [&](const std::vector<int>& kl) { return (pk >= 0 && kl == rtt->seq[pk].list) || pool.is_kept(kl); }, st);
-                    if (ex)
+                    // a prefix-reuse hit keeps the run's pages: rows below g.reuse are the retained session's, and every row
+                    // past them is written by this request before any step reads it (prefix_reuse.h)
+                    const std::vector<int> run = pool.list(g.run);
+                    const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
+                    for (Model* x : {&m, &D.d})
                     {
-                        if (pk >= 0)
+                        if (ex)
                         {
-                            rt_adopt(m, *rtt, pk, q, l, (int)g.reuse, st);
-                            if (R == 0) fprintf(stderr, "# rank 0: GR8_RT_LOCAL slot %d adopts a retained run's records at row %u\n", q, g.reuse);
+                            if (pool.split()) s2_set_exclusive(*x, q, run, most, rp);   // its own list; the slot view stays unused while solo
+                            else s2_set_exclusive(*x, q);
+                            // alone: the run's pages clear (the whole pool on the identity map, today's reset)
+                            if (!g.reuse)
+                            {
+                                if (pool.split()) s2_reset_pages(*x, run, st, most);
+                                else reset(*x, st);
+                            }
                         }
-                        else if ((int)g.reuse > rp * 64)   // every rank holds the same entries, so they all stop here alike
-                            die("GR8_RT_LOCAL: a hit past R on a run whose records no slot or parked entry holds");
-                        else rt_begin(*rtt, q, win, l, rp * 64, st);
-                    }
-                }
-                slot_prompt[q] = g.req.prompt_tokens;
-                slot_whole[q] = dfl_reuse && g.reuse + 1 == g.req.prompt_tokens;
-                if (dfl_owner == q) dfl_owner = -1;     // the slot's previous session owned the taps
-                const bool ex = pool.exclusive_run(g.run);
-                // a prefix-reuse hit keeps the run's pages: rows below g.reuse are the retained session's, and every row
-                // past them is written by this request before any step reads it (prefix_reuse.h)
-                const std::vector<int> run = pool.list(g.run);
-                const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
-                for (Model* x : {&m, &D.d})
-                {
-                    if (ex)
-                    {
-                        if (pool.split()) s2_set_exclusive(*x, q, run, most, rp);   // its own list; the slot view stays unused while solo
-                        else s2_set_exclusive(*x, q);
-                        // alone: the run's pages clear (the whole pool on the identity map, today's reset)
-                        if (!g.reuse)
+                        else
                         {
-                            if (pool.split()) s2_reset_pages(*x, run, st, most);
-                            else reset(*x, st);
+                            s2_set_pages(*x, q, run);
+                            if (!g.reuse) s2_reset_pages(*x, x->s2->run[q], st, most);
+                        }
+                        for (int l = 0; l < x->nl; ++l)  // slot q's views (s2_reset, one slot)
+                        {
+                            const G6AttnBinding* v = x->s2->sab[l][q];
+                            G6RT_CK(cudaMemsetAsync(v->args.indices, 0xff, (size_t)v->max_rows * 2048 * 4, st));
+                            G6RT_CK(cudaMemsetAsync(v->args.output, 0, (size_t)v->max_rows * v->args.heads * 256 * 2, st));
+                            G6RT_CK(cudaMemsetAsync(v->args.error, 0, 4, st));
                         }
                     }
-                    else
-                    {
-                        s2_set_pages(*x, q, run);
-                        if (!g.reuse) s2_reset_pages(*x, x->s2->run[q], st, most);
-                    }
-                    for (int l = 0; l < x->nl; ++l)  // slot q's views (s2_reset, one slot)
-                    {
-                        const G6AttnBinding* v = x->s2->sab[l][q];
-                        G6RT_CK(cudaMemsetAsync(v->args.indices, 0xff, (size_t)v->max_rows * 2048 * 4, st));
-                        G6RT_CK(cudaMemsetAsync(v->args.output, 0, (size_t)v->max_rows * v->args.heads * 256 * 2, st));
-                        G6RT_CK(cudaMemsetAsync(v->args.error, 0, 4, st));
-                    }
+                    G6RT_CK(cudaStreamSynchronize(st));
                 }
-                G6RT_CK(cudaStreamSynchronize(st));
-            };
             // a run grew between rounds (every rank, same order): the new pages, cleared as a new run's are, into slot q's
             // table, and into the layers' own tables when q runs alone on today's path
             // a session takes GR8_CP_R2 (every rank at the commit, before the bind that may take its pages): the drafter's
             // rows of the pages between the two Rs into its fresh pages above place, this rank's main pages of them into the
             // rows store, then the tables
-            h.shrink = [&](const g6s2::Shrink& k, const g6s2::Run&, uint64_t length) {
-                kv_drain();   // retained runs the shrink evicted, out first
-                if (!rtt || !rtt->local) die("a shrink without GR8_RT_LOCAL");
-                rt_gc(*rtt, [&](const std::vector<int>& l) { return pool.is_kept(l); }, st);
-                const int q = (int)k.key.slot, rp = (int)k.r_rows / 64, was_rp = m.s2->rp[q], win = rtt->local;
-                const std::vector<int> was = m.s2->run[q], list = pool.list(k.run);
-                const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
-                std::vector<std::pair<int, int>> moves;
-                for (int lp = rp; lp < was_rp; ++lp) moves.push_back({was[lp], list[rp + win + (lp - rp)]});
-                s2_copy_pages(D.d, moves, most, st);
-                rt_shrink(m, *rtt, q, was, list, (int)k.r_rows, (int)length - 1, st);
-                for (Model* x : {&m, &D.d}) s2_set_exclusive(*x, q, list, most, rp);
-                if (rt_layers == q)   // it runs alone: the layers' tables hold its run
-                {
-                    s2_solo_cp_pages(m, list, most, rp);
-                    s2_solo_cp_pages(D.d, list, most, rp);
-                }
-                G6RT_CK(cudaStreamSynchronize(st));
-                if (R == 0) fprintf(stderr, "# rank 0: GR8_CP_R2: slot %d takes R %u, %d prefix pages back below place\n", q, k.r_rows, was_rp - rp);
-            };
-            h.grown = [&](unsigned q, const g6s2::Run& r) {
-                kv_drain();   // runs the growth evicted, out before the zeroing below
-                if (rtt && rtt->local) rt_gc(*rtt, [&](const std::vector<int>& l) { return pool.is_kept(l); }, st);
-                const std::vector<int> list = pool.list(r);
-                if (rtt && list.size() > m.s2->run[q].size())   // the new pages are cleared: none may stay flagged
-                    rt_drop(*rtt, std::vector<int>(list.begin() + m.s2->run[q].size(), list.end()), st);
-                for (Model* x : {&m, &D.d})
-                {
-                    const std::vector<int> old = x->s2->run[q];
-                    g6s2::require(list.size() > old.size() && std::equal(old.begin(), old.end(), list.begin()), "grown run does not extend the slot's pages");
-                    s2_zero_pages(*x, std::vector<int>(list.begin() + old.size(), list.end()), st);
-                    s2_set_pages(*x, (int)q, list);
-                    if (!x->s2on) s2_solo_pages(*x, list);
-                }
-                G6RT_CK(cudaStreamSynchronize(st));
-            };
-            h.retire = [&](const g6s2::Slot& old) {
-                // a grant at the same boundary may have bound the slot again (or adopted its records) first: then the
-                // slot is that session's, and the retirement leaves it alone
-                if (rtt && rtt->local && rt_gen[old.key.slot] != old.key.generation)
-                {
-                    if (R == 0) fprintf(stderr, "# rank 0: GR8_RT_LOCAL retire of slot %u after its next grant: nothing to do\n", old.key.slot);
-                }
-                else if (rtt && rtt->local)   // a run with released pages parks its records
-                {
-                    const int q = (int)old.key.slot;
-                    const RtTier::Seq& sq = rtt->seq[q];
-                    if (R == 0 && sq.on)
-                        fprintf(stderr, "# rank 0: GR8_RT_LOCAL retire of slot %d: %llu pages released, at most %d of %d window pages in use; all sessions: "
-                                        "%llu released, peak %d local tail pages; %llu rows fetched, %zu of %d record ids free\n", q,
-                                (unsigned long long)sq.released, sq.peak, sq.window, (unsigned long long)rtt->released, rtt->peak,
-                                (unsigned long long)rt_fetched(*rtt), rtt->vfree.size(), rtt->V);
-                    if (rtt->hold)
-                        fprintf(stderr, "# rank %d: GR8_RT_CHECK: %llu released group pages read back, %llu differed\n", R,
-                                (unsigned long long)rtt->readback, (unsigned long long)rtt->readback_bad);
-                    // records park for the conversation's next turn whether or not the pool kept the run: on the head a
-                    // grant at this boundary has already taken it out of the kept list, on the workers it has not. The
-                    // next bind's rt_gc frees them if no grant adopts them.
-                    if (sq.on)
+                void on_shrink(const g6s2::Shrink& k, const g6s2::Run&, uint64_t length) {
+                    kv_drain();   // retained runs the shrink evicted, out first
+                    if (!rtt || !rtt->local) die("a shrink without GR8_RT_LOCAL");
+                    rt_gc(*rtt, [&](const std::vector<int>& l) { return pool.is_kept(l); }, st);
+                    const int q = (int)k.key.slot, rp = (int)k.r_rows / 64, was_rp = m.s2->rp[q], win = rtt->local;
+                    const std::vector<int> was = m.s2->run[q], list = pool.list(k.run);
+                    const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
+                    std::vector<std::pair<int, int>> moves;
+                    for (int lp = rp; lp < was_rp; ++lp) moves.push_back({was[lp], list[rp + win + (lp - rp)]});
+                    s2_copy_pages(D.d, moves, most, st);
+                    rt_shrink(m, *rtt, q, was, list, (int)k.r_rows, (int)length - 1, st);
+                    for (Model* x : {&m, &D.d}) s2_set_exclusive(*x, q, list, most, rp);
+                    if (rt_layers == q)   // it runs alone: the layers' tables hold its run
                     {
-                        if (R == 0) fprintf(stderr, "# rank 0: GR8_RT_LOCAL slot %d parks its records (kept by the pool: %d)\n", q, (int)pool.is_kept(m.s2->run[q]));
-                        rt_park(*rtt, q);
+                        s2_solo_cp_pages(m, list, most, rp);
+                        s2_solo_cp_pages(D.d, list, most, rp);
                     }
-                    if (rtt->hold && rtt->stage_ck.rows)
-                    {
-                        rt_check_print(("staged prefill rows, rank " + std::to_string(R)).c_str(), rtt->stage_ck);
-                        fprintf(stderr, "# rank %d: GR8_RT_CHECK: %llu staged pages under 10 dB or with a rope byte off\n", R, (unsigned long long)rtt->stage_bad);
-                    }
-                    rt_end(*rtt, q, st);
-                    if (rt_layers == q) rt_layers = -1;
+                    G6RT_CK(cudaStreamSynchronize(st));
+                    if (R == 0) fprintf(stderr, "# rank 0: GR8_CP_R2: slot %d takes R %u, %d prefix pages back below place\n", q, k.r_rows, was_rp - rp);
                 }
-                else if (rtt) { rt_drop_slot(*rtt, (int)old.key.slot, st); rt_log("retire of", (int)old.key.slot); }   // retained runs stay local
-                nd.retire(old);
+                void on_grown(unsigned q, const g6s2::Run& r) {
+                    kv_drain();   // runs the growth evicted, out before the zeroing below
+                    if (rtt && rtt->local) rt_gc(*rtt, [&](const std::vector<int>& l) { return pool.is_kept(l); }, st);
+                    const std::vector<int> list = pool.list(r);
+                    if (rtt && list.size() > m.s2->run[q].size())   // the new pages are cleared: none may stay flagged
+                        rt_drop(*rtt, std::vector<int>(list.begin() + m.s2->run[q].size(), list.end()), st);
+                    for (Model* x : {&m, &D.d})
+                    {
+                        const std::vector<int> old = x->s2->run[q];
+                        g6s2::require(list.size() > old.size() && std::equal(old.begin(), old.end(), list.begin()), "grown run does not extend the slot's pages");
+                        s2_zero_pages(*x, std::vector<int>(list.begin() + old.size(), list.end()), st);
+                        s2_set_pages(*x, (int)q, list);
+                        if (!x->s2on) s2_solo_pages(*x, list);
+                    }
+                    G6RT_CK(cudaStreamSynchronize(st));
+                }
+                void on_retire(const g6s2::Slot& old) {
+                    // a grant at the same boundary may have bound the slot again (or adopted its records) first: then the
+                    // slot is that session's, and the retirement leaves it alone
+                    if (rtt && rtt->local && rt_gen[old.key.slot] != old.key.generation)
+                    {
+                        if (R == 0) fprintf(stderr, "# rank 0: GR8_RT_LOCAL retire of slot %u after its next grant: nothing to do\n", old.key.slot);
+                    }
+                    else if (rtt && rtt->local)   // a run with released pages parks its records
+                    {
+                        const int q = (int)old.key.slot;
+                        const RtTier::Seq& sq = rtt->seq[q];
+                        if (R == 0 && sq.on)
+                            fprintf(stderr, "# rank 0: GR8_RT_LOCAL retire of slot %d: %llu pages released, at most %d of %d window pages in use; all sessions: "
+                                            "%llu released, peak %d local tail pages; %llu rows fetched, %zu of %d record ids free\n", q,
+                                    (unsigned long long)sq.released, sq.peak, sq.window, (unsigned long long)rtt->released, rtt->peak,
+                                    (unsigned long long)rt_fetched(*rtt), rtt->vfree.size(), rtt->V);
+                        if (rtt->hold)
+                            fprintf(stderr, "# rank %d: GR8_RT_CHECK: %llu released group pages read back, %llu differed\n", R,
+                                    (unsigned long long)rtt->readback, (unsigned long long)rtt->readback_bad);
+                        // records park for the conversation's next turn whether or not the pool kept the run: on the head a
+                        // grant at this boundary has already taken it out of the kept list, on the workers it has not. The
+                        // next bind's rt_gc frees them if no grant adopts them.
+                        if (sq.on)
+                        {
+                            if (R == 0) fprintf(stderr, "# rank 0: GR8_RT_LOCAL slot %d parks its records (kept by the pool: %d)\n", q, (int)pool.is_kept(m.s2->run[q]));
+                            rt_park(*rtt, q);
+                        }
+                        if (rtt->hold && rtt->stage_ck.rows)
+                        {
+                            rt_check_print(("staged prefill rows, rank " + std::to_string(R)).c_str(), rtt->stage_ck);
+                            fprintf(stderr, "# rank %d: GR8_RT_CHECK: %llu staged pages under 10 dB or with a rope byte off\n", R, (unsigned long long)rtt->stage_bad);
+                        }
+                        rt_end(*rtt, q, st);
+                        if (rt_layers == q) rt_layers = -1;
+                    }
+                    else if (rtt) { rt_drop_slot(*rtt, (int)old.key.slot, st); rt_log("retire of", (int)old.key.slot); }   // retained runs stay local
+                    nd.retire(old);
+                }
+                void on_fence() { nd.synchronize(); }
+                bool on_drained() { return kv_drained.exchange(false); }
+                void on_resize(const g6s2::Resize& r) {
+                    if (!g6s2::share_apply(pool, kvt->store(r.tier), r, kv_drain))
+                        fprintf(stderr, "# rank %d: s2 share: tier %u to %llu blocks refused (transaction %llu), the lease keeps its size: %s\n", R,
+                                r.tier, (unsigned long long)r.slots, (unsigned long long)r.txn, g6kv_tier_error());
+                    else
+                        fprintf(stderr, "# rank %d: s2 share: tier %u now %llu segments, %llu blocks at %lld ms\n", R, r.tier,
+                                (unsigned long long)r.segs, (unsigned long long)r.slots, (long long)g6s2::s2_wall_ms());
+                }
+                int on_bucket(bool draft, int ctx) { return nd.on_bucket(draft, ctx); }
+                void on_mode(int old, int next) { nd.on_mode(old, next); }
+                std::vector<int> on_launch(const g6s2::Launch& l) { return nd.on_launch(l); }
+                void on_prefill(const g6s2::Slot& s, const g6s2::Payload& p, uint32_t first, uint32_t rows) { nd.on_prefill(s, p, first, rows); }
+                g6rt::LpRow on_logprob(int row, bool target, int k) { return nd.on_logprob(row, target, k); }
+                float on_draft_lp(int row) { return nd.on_draft_lp(row); }
+                bool on_dfl_ok(int q) { return dfl_owner == q || slot_prompt[q] == 1 || slot_whole[q]; }
+                int on_dfl_start(int q) {    // the offline loop's fill steps: Dfl::pf_feat -> the ring
+                    if (dfl_owner != q || DF.pf_hi <= DF.pf_lo) return (int)slot_prompt[q] - 1;
+                    const auto t0 = std::chrono::steady_clock::now();
+                    for (int c0 = dfl_from; c0 < DF.pf_hi; c0 += dfl::B)
+                    {
+                        DflIn di;
+                        memset(&di, 0, sizeof di);
+                        di.step = ++s2_dstep;
+                        di.ctx_rows = std::min(dfl::B, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
+                        *in_f = di;
+                        dfl_enqueue(fabf, di.step, dfl_fill_sizes(), true);
+                        G6RT_CK(cudaGraphLaunch(exec_f[2], st));
+                        G6RT_CK(cudaStreamSynchronize(st));
+                        g6s2::require(!*fabf.dev().error, "S2 DFlash2 fabric error (prompt context)");
+                    }
+                    g6s2::s2_tl().cut();
+                    if (R == 0) fprintf(stderr, "# s2 dflash slot %d prompt context %d..%d: %.1f ms\n", q, dfl_from, DF.pf_hi - 1,
+                                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                    return dfl_from;
+                }
+                s2::DflDrafts on_dfl(const s2::DflReq& r, const g6s2::Sampling& smp) {
+                    // GR8_DRAFT_PAR: phase 1 launches on the drafter's stream and returns, phase 2 waits for it (s2::DflReq).
+                    // The target step before phase 1 was fenced on st, and phase 2 comes before the next one.
+                    // GR8_S2_TIMELINE: phase 0 is a step in the target stream's sequence; phases 1 + 2 are timed apart (par_*)
+                    cudaStream_t& ds = dfl_par_st;
+                    g6s2::S2Timeline& tl = g6s2::s2_tl();
+                    if (r.phase != 2)
+                    {
+                        if (r.phase) tl.par_enter(); else tl.enter();
+                        DflIn di;
+                        memset(&di, 0, sizeof di);
+                        di.step = ++s2_dstep;
+                        di.ctx_rows = r.rows; di.ctx_pos0 = r.pos0; di.q0 = r.pos0 + r.rows; di.lo = r.lo; di.tok0 = r.tok0; di.query = r.query;
+                        const float dtemp = plan.rs ? 0.f : smp.inv_temp;   // rejection sampling: greedy drafts, as dflash_sequence
+                        for (int i = 0; i < dfl::B; ++i) di.srow[i] = glue::SampleRow{dtemp, smp.seed, 0u, di.q0 + i, 0, smp.top_p};
+                        *in_f = di;
+                        dfl_enqueue(fabf, di.step, dfl_sizes(DF, di.query), false);
+                        ds = r.phase ? st_par[di.query ? 1 : 0] : st;
+                        if (dfl_tl) dfl_t0 = std::chrono::steady_clock::now();
+                        if (r.phase) tl.par_pre(ds); else tl.pre(ds);
+                        G6RT_CK(cudaGraphLaunch(exec_f[di.query ? 1 : 0], ds));
+                        if (r.phase) tl.par_post(ds); else tl.post(ds);
+                        if (r.phase == 1) return s2::DflDrafts{};
+                    }
+                    else tl.par_wait();
+                    G6RT_CK(cudaStreamSynchronize(ds));
+                    if (r.phase) tl.par_done(r.query ? g6s2::S2Timeline::DQUERY_PAR : g6s2::S2Timeline::DCTX_PAR, r.rows);
+                    else tl.done(r.query ? g6s2::S2Timeline::DQUERY : g6s2::S2Timeline::DCTX, r.rows, R);
+                    if (dfl_tl)   // GR8_S2_ROUNDLOG: the drafter step's launch to its wait (GR8_DRAFT_PAR: the first form and chain within)
+                        fprintf(stderr, "# s2_dfl step %llu query %d par %d ms %.3f\n", (unsigned long long)s2_dstep, (int)r.query, r.phase ? 1 : 0,
+                                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dfl_t0).count());
+                    g6s2::require(!*fabf.dev().error, "S2 DFlash2 fabric error");
+                    s2::DflDrafts o;
+                    for (int i = 0; i < dfl::B; ++i) { o.tok[i] = out_f->tok[i]; o.lp[i] = out_f->lp[i]; }
+                    return o;
+                }
             };
-            h.fence = [&] { nd.synchronize(); };
-            if (kvt) h.drained = [&] { return kv_drained.exchange(false); };
+            GlmModule gm{{}, GLM_CAPTURES(G6S2_CAPTURE_ARG)};
+#undef GLM_CAPTURES
+            using G = GlmModule;
+            g6s2_module_ops& o = h.module = g6s2::mod::table(gm);
+            if (kvt) o.retain = g6s2::mod::retain<G, &G::on_retain_drain>;
+            else if (pool.keeping()) o.retain = g6s2::mod::retain<G, &G::on_retain>;
+            o.bind = g6s2::mod::bind<G, &G::on_bind>;
+            o.shrink = g6s2::mod::shrink<G, &G::on_shrink>;
+            o.grown = g6s2::mod::grown<G, &G::on_grown>;
+            o.retire = g6s2::mod::retire<G, &G::on_retire>;
+            o.fence = g6s2::mod::call<G, &G::on_fence>;
+            if (kvt) o.drained = g6s2::mod::drained<G, &G::on_drained>;
             // a tier on a group lease (--kv-store group=): every rank resizes it at the Resize commit; the head reports
             // to the node, asking for the segments an oversize entry, the pages the tier pushed out since its last
             // report, or the next spill would need (s2/kv_share.h share_want: ask before the next spill drops an entry),
@@ -3419,14 +3508,7 @@ int main(int argc, char** argv)
             size_t kv_next_group = 0;
             if (!kv_groups.empty())
             {
-                h.resize = [&](const g6s2::Resize& r) {
-                    if (!g6s2::share_apply(pool, kvt->store(r.tier), r, kv_drain))
-                        fprintf(stderr, "# rank %d: s2 share: tier %u to %llu blocks refused (transaction %llu), the lease keeps its size: %s\n", R,
-                                r.tier, (unsigned long long)r.slots, (unsigned long long)r.txn, g6kv_tier_error());
-                    else
-                        fprintf(stderr, "# rank %d: s2 share: tier %u now %llu segments, %llu blocks at %lld ms\n", R, r.tier,
-                                (unsigned long long)r.segs, (unsigned long long)r.slots, (long long)g6s2::s2_wall_ms());
-                };
+                o.resize = g6s2::mod::resize<G, &G::on_resize>;
                 // GR8_KV_SHARE_WHEN=idle (default): the head offers its blocks to other groups only while the engine is
                 // idle, so a give's compaction never pauses a turn; always: whenever the node asks
                 const bool share_always = knob::kv_share_when() == "always";
@@ -3441,7 +3523,13 @@ int main(int argc, char** argv)
                         return g6s2::share_poll(pool, t, kvt->store(t), want, share_always || idle);
                     };
             }
-            h.dispatch = nd.hooks();
+            o.bucket = g6s2::mod::bucket<G, &G::on_bucket>;
+            o.mode = g6s2::mod::mode<G, &G::on_mode>;
+            o.launch = g6s2::mod::launch<G, &G::on_launch>;
+            o.prefill = g6s2::mod::prefill<G, &G::on_prefill>;
+            o.logprob = g6s2::mod::logprob<G, &G::on_logprob>;
+            o.draft_lp = g6s2::mod::draft_lp<G, &G::on_draft_lp>;
+            nd.grammar(o);
             if (dfl)
             {
                 h.dfl_kv = dfl_k; h.dfl_spec = spec;
@@ -3516,63 +3604,9 @@ int main(int argc, char** argv)
                                                  dfl_reuse > 1 ? ", a session alone on MTP takes it" : "", dfl_reuse_min);
                 // a 1-token prompt has no prefill: the drafter starts from its prompt step (dfl_lo = first, as plain)
                 // GR8_DFL_REUSE: also a hit into the window (the fill starts past its rows) and a hit with no prefill at all
-                h.dispatch.dfl_ok = [&](int q) { return dfl_owner == q || slot_prompt[q] == 1 || slot_whole[q]; };
-                h.dispatch.dfl_start = [&](int q) {    // the offline loop's fill steps: Dfl::pf_feat -> the ring
-                    if (dfl_owner != q || DF.pf_hi <= DF.pf_lo) return (int)slot_prompt[q] - 1;
-                    const auto t0 = std::chrono::steady_clock::now();
-                    for (int c0 = dfl_from; c0 < DF.pf_hi; c0 += dfl::B)
-                    {
-                        DflIn di;
-                        memset(&di, 0, sizeof di);
-                        di.step = ++s2_dstep;
-                        di.ctx_rows = std::min(dfl::B, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
-                        *in_f = di;
-                        dfl_enqueue(fabf, di.step, dfl_fill_sizes(), true);
-                        G6RT_CK(cudaGraphLaunch(exec_f[2], st));
-                        G6RT_CK(cudaStreamSynchronize(st));
-                        g6s2::require(!*fabf.dev().error, "S2 DFlash2 fabric error (prompt context)");
-                    }
-                    g6s2::s2_tl().cut();
-                    if (R == 0) fprintf(stderr, "# s2 dflash slot %d prompt context %d..%d: %.1f ms\n", q, dfl_from, DF.pf_hi - 1,
-                                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-                    return dfl_from;
-                };
-                h.dispatch.dfl = [&](const s2::DflReq& r, const g6s2::Sampling& smp) {
-                    // GR8_DRAFT_PAR: phase 1 launches on the drafter's stream and returns, phase 2 waits for it (s2::DflReq).
-                    // The target step before phase 1 was fenced on st, and phase 2 comes before the next one.
-                    // GR8_S2_TIMELINE: phase 0 is a step in the target stream's sequence; phases 1 + 2 are timed apart (par_*)
-                    cudaStream_t& ds = dfl_par_st;
-                    g6s2::S2Timeline& tl = g6s2::s2_tl();
-                    if (r.phase != 2)
-                    {
-                        if (r.phase) tl.par_enter(); else tl.enter();
-                        DflIn di;
-                        memset(&di, 0, sizeof di);
-                        di.step = ++s2_dstep;
-                        di.ctx_rows = r.rows; di.ctx_pos0 = r.pos0; di.q0 = r.pos0 + r.rows; di.lo = r.lo; di.tok0 = r.tok0; di.query = r.query;
-                        const float dtemp = plan.rs ? 0.f : smp.inv_temp;   // rejection sampling: greedy drafts, as dflash_sequence
-                        for (int i = 0; i < dfl::B; ++i) di.srow[i] = glue::SampleRow{dtemp, smp.seed, 0u, di.q0 + i, 0, smp.top_p};
-                        *in_f = di;
-                        dfl_enqueue(fabf, di.step, dfl_sizes(DF, di.query), false);
-                        ds = r.phase ? st_par[di.query ? 1 : 0] : st;
-                        if (dfl_tl) dfl_t0 = std::chrono::steady_clock::now();
-                        if (r.phase) tl.par_pre(ds); else tl.pre(ds);
-                        G6RT_CK(cudaGraphLaunch(exec_f[di.query ? 1 : 0], ds));
-                        if (r.phase) tl.par_post(ds); else tl.post(ds);
-                        if (r.phase == 1) return s2::DflDrafts{};
-                    }
-                    else tl.par_wait();
-                    G6RT_CK(cudaStreamSynchronize(ds));
-                    if (r.phase) tl.par_done(r.query ? g6s2::S2Timeline::DQUERY_PAR : g6s2::S2Timeline::DCTX_PAR, r.rows);
-                    else tl.done(r.query ? g6s2::S2Timeline::DQUERY : g6s2::S2Timeline::DCTX, r.rows, R);
-                    if (dfl_tl)   // GR8_S2_ROUNDLOG: the drafter step's launch to its wait (GR8_DRAFT_PAR: the first form and chain within)
-                        fprintf(stderr, "# s2_dfl step %llu query %d par %d ms %.3f\n", (unsigned long long)s2_dstep, (int)r.query, r.phase ? 1 : 0,
-                                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dfl_t0).count());
-                    g6s2::require(!*fabf.dev().error, "S2 DFlash2 fabric error");
-                    s2::DflDrafts o;
-                    for (int i = 0; i < dfl::B; ++i) { o.tok[i] = out_f->tok[i]; o.lp[i] = out_f->lp[i]; }
-                    return o;
-                };
+                o.dfl_ok = g6s2::mod::dfl_ok<G, &G::on_dfl_ok>;
+                o.dfl_start = g6s2::mod::dfl_start<G, &G::on_dfl_start>;
+                o.dfl = g6s2::mod::dfl<G, &G::on_dfl>;
             }
             else if (kstop.mode || kstop.b.mode || kstop.log)
             {   // MTP only (TP=6 / TP=3): the confidence stops of round_all (KStop::solo, KStopB) and their log (s2/service.h)
