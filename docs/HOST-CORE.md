@@ -727,6 +727,30 @@ vectors keep their hashes, and the 13,777 round logs the host tests write are by
 and DS41 engines build on a GB10. Boot: TP4 GLM, R6b then R6c, the round logs byte-identical on all four ranks, the 24 T=0
 replies matching, and the head's log lines equal apart from memory.
 
+R6d landed. The plan is `engine/scheduler-rs` `src/fabric_plan.rs`, by model and width: `g6plan_in` (the build's
+constants, the main config as the parse left it, the options and knobs the plan reads, `PlanInputs`) in, and a
+`g6plan_plan` out: each fabric as a `#[repr(C)]` `g6plan_entry` (a whole `FabricConfig` without its address lists, and
+whether rail 1 is `--pf-ips2`), the scalars, the CP collectives, the log lines and the refusal, in the Rust's storage until
+`g6plan_free`. `fabric_plan.h` is its facade: it rebuilds `FabricPlan`, so `g6m4.cu`, `describe()` and the dump are
+unchanged, and the three late fabrics keep their init sites. The ports are one table; Flash's pool-ID fabrics and GLM's
+gathers share +64 and +72, and a test checks no model builds two fabrics on the same bootstrap ports. The lane fabrics
+keep their proxy cut-off one core above the prefill fabrics'. The host-only sizing rules the plan calls are
+`src/plan_sizes.rs`, and their headers are facades over `g6plan_*` (g6plan.h, apart from g6sched.h so kernels and tests
+that include them pull in nothing else; the layout digest covers its structs): `pf_slots.h`, `ds41_prefill_capacity.h`,
+`ds41_prefill_fabric.h`, `ds41_pf_split.h`'s tail parse and error, `late_rows` and `late_start`, `ds41_lanes.h`'s
+parse, `ds41_rowshard.h`'s boot check and state sizes, `ds41_rs.h` `main_ncoll`, `qp_wire.h`'s bulk area and partner,
+and `CpColls::make`. The build's constants come in as arguments from the headers. What the kernels share stays C++:
+`ds41_rs.h`'s `quarter` and `slice_stride` (the Rust has copies, which `plan_twins_test` checks), the Flash pool-ID and
+route-table payloads and the DSpark collective sizes (the facade passes their values). `ds41_slots.h` is not read by the
+plan; `ds41_ops.h`, `split_plan` and the lanes schedule, check and fits wait for R8.
+
+Checked on Linux (GCC 12, x86_64, Rust 1.99.1): `fabric_plan_vectors_test` keeps its seven hashes, the options and
+signature vectors theirs, and `test_ds41_lanes`, `test_ds41_pf_split`, `test_ds41_w4096`, `ds41_prefill_test` and the
+DS41 S2 tests pass unchanged. `scripts/host_tests.sh`, `cargo test --release --workspace` and the `engine/tests` unit
+tests pass, and the 13,777 round logs the host tests write are byte-identical to R6c's. On a GB10, `GR8_FABRIC_DUMP` through
+R6c's engines and R6d's over `scripts/check_args.py fabric-cases` and `options_cases.txt`: the 1,579 transcripts are
+byte-identical, 7,178 config lines among them. The GLM, Flash and DS41 engines build. Boot pending.
+
 ### R7. Step sizes
 
 One Rust `step_sizes(kind, M)` per model replaces the four copies of the collective-size code (`g6m4.cu:2214, 2878,
