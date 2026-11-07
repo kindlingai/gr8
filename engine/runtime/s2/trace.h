@@ -35,6 +35,7 @@ public:
     }
 
     explicit operator bool() const { return h_ != nullptr; }
+    const g6svc_trace* handle() const { return h_.get(); }
 
     // A span from t0 to t1. args: the inside of a JSON object, "" for none.
     void span(const char* name, int tid, uint64_t t0, uint64_t t1, const std::string& args) {

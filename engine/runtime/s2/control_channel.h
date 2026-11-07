@@ -30,6 +30,8 @@ public:
     EventEndpoint(const EventEndpoint&) = delete;
     EventEndpoint& operator=(const EventEndpoint&) = delete;
     void fail() { g6ctl_fail(h_.get()); }
+    // the Rust endpoint, for the service's control thread (it outlives no facade)
+    const g6ctl_endpoint* handle() const { return h_.get(); }
     // No digest, lock, allocation or I/O if no event is due. Call before departing
     // a LIVE boundary. Idle engines use wait_notice() instead of departing it.
     template<class Digest> std::optional<Commit> boundary(uint64_t b,Digest&& digest) {

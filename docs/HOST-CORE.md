@@ -562,6 +562,33 @@ round logs the host tests write are byte-identical before and after. `scripts/ho
 --workspace` pass. The GLM, Flash and DS41 engines build on a GB10. Boot: TP4 GLM, the freeze then R5b2a, the round
 logs byte-identical on all four ranks and the 24 T=0 replies matching.
 
+R5b2b landed. The head's control thread is `scheduler-rs` `src/service/control.rs` (`g6svc_control_*` in g6sched.h;
+`g6svc_control_cfg`, `g6svc_host`, `g6svc_checked` and `g6svc_pool_call` in the layout digest): `controller`, `event`
+with its commit, `intake`, `drain_admits` and the watcher's `monitor`, with the request maps, the attempt, event, wait,
+refusal and recall state and the borrow-idle `Lend`. The decisions are `admit.rs`, and `admit.h` is a facade over it.
+`Sessions::request` and the cache namespace moved too. The C++ `Service::run` still starts the threads: the head's
+control thread calls `g6svc_control_run`, every rank's watcher `g6svc_control_monitor`, and workers keep
+`receive_events`. The progress the compute thread publishes, a resize in flight and the stop flag are Rust atomics, which
+the compute thread reaches through C calls. The Rust borrows the Service's endpoint, ingress, queue and trace, the
+driver's slots and counters, and the pool. It makes the plain pool calls itself and the policy calls through
+`g6s2_pool_ops`, in the order the workers replay, and reads the driver's state only inside the commit, while every
+compute thread waits at the event boundary. The host table holds what stays C++, with PoolOps' conventions: `check`
+(the parser's ServeReq, `grammar_ok`, `images_ok`), `retire_run`, `share`, and the policy's `refusal` and `tiers`, which
+return C++ objects. An ADMIT's bytes go out before the commit erases its entry, so the event holds its own reference.
+The head's plain pool calls are now Rust's, so `module_calls_test` reads them from a test observer on the control
+(`g6svc_control_observe`) rather than from its RunPool.
+
+Checked on Linux (GCC 12, x86_64, Rust 1.99.1). `module_calls_test` gained the tight-pool scenario, recorded from the
+C++ first (f8b86e29): a follow-up takes a retained run and decodes, a long prompt waits for room, and it fits and
+reserves from page 0 once the follow-up's cancel retains its run. Every scenario keeps its hashes in every shape, as
+hooks and as tables. `admit_vectors_test`, `service_vectors_test`, `steering_state_test` (which now compares the two
+cache namespaces), the hold, drain and loopback TP1/TP2 tests pass unchanged, and the 13,743 round logs the host tests
+write are byte-identical before and after. `module_calls_test` and `admit_hold_drain_test` pass under ASan and UBSan,
+now in `scripts/host_tests.sh`. Under TSan both report the same races before and after the port: accesses ordered by the
+Rust channel's, pool's and trace's locks, which TSan cannot see in uninstrumented Rust. `scripts/host_tests.sh` and
+`cargo test --release --workspace` pass. The GLM, Flash and DS41 engines build on a GB10. Boot: TP4 GLM, R5b2a then R5b2b, the round logs byte-identical on all four ranks, the 24 T=0
+replies matching and the head's s2 log lines equal apart from times.
+
 ### R6. Options, signatures and the fabric plan to Rust
 
 Moves `g6m4.cu:156-577` (about 20 model `#if`s, spec defaults, `--check-args`), the signature builders (`g6m4.cu:1919`,

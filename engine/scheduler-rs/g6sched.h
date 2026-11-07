@@ -88,7 +88,7 @@ struct g6sch_config {
     // not, and its tail does not ask for a decode round (Scheduler::alternate), so a burst of short prompts reaches its
     // first tokens one tail per step instead of after every prefill and a decode round per tail.
     bool tail_first;
-    // GR8_S2_NOTICE_MAX=<k>: the notice target's cap, NOTICE_MIN..NOTICE_MAX boundaries (horizon(), service.h event).
+    // GR8_S2_NOTICE_MAX=<k>: the notice target's cap, NOTICE_MIN..NOTICE_MAX boundaries (horizon(), control.rs event).
     // Lower only from a measured margin: a notice that lands after its boundary is fatal
     uint32_t notice_max;
     // DS41 only: short fresh prompts prefill together in one ragged pass, then share one prompt-tail step
@@ -742,6 +742,78 @@ void g6svc_trace_instant(const g6svc_trace* t, const uint8_t* name, size_t name_
                          size_t args_n);
 uint64_t g6svc_trace_now(void);
 
+// s2/admit.h: the head's admission decisions. why: g6sch_status's (0 none, 1 slots, 2 capacity); recall_note: 0 none,
+// 1 begin, 2 done
+uint64_t g6svc_notice_target(uint64_t boundary, uint64_t horizon, bool held, uint64_t held_at, uint32_t notice_max);
+bool g6svc_admit_retry(uint64_t head, uint64_t attempted_head, uint64_t revision, uint64_t attempted_revision);
+uint64_t g6svc_attempted_revision(uint64_t revision);
+bool g6svc_admit_shrink(bool fits, bool can_make_room, uint32_t live, uint32_t limit);
+bool g6svc_admit_grant(uint32_t why, uint32_t short_of);
+bool g6svc_admit_drain(bool admit_hold, uint32_t live, uint32_t limit);
+bool g6svc_admit_hold(bool admit_hold, bool queued, uint32_t live, uint32_t limit);
+bool g6svc_wait_line(uint32_t why, uint64_t last, uint64_t head);
+bool g6svc_refusal_line(uint32_t why, uint64_t last, uint64_t head);
+uint32_t g6svc_recall_note(uint32_t why, uint32_t short_of, uint64_t waiting, uint64_t head);
+bool g6svc_share_idle(uint32_t resident, size_t queued);
+bool g6svc_lend_idle(uint32_t resident, size_t queued, uint32_t retiring);
+// Sessions::request, and steering.h's cache namespace (G6KV_NAMESPACE_BYTES into out)
+void g6svc_request(uint64_t id, size_t prompt_tokens, int32_t n_gen, const g6sch_identity* steering,
+                   g6sch_request* out);
+void g6svc_cache_namespace(const g6sch_identity* s, uint8_t* out);
+
+// s2/service.h: the head's control thread (controller, event and its commit, intake, the ADMIT_HOLD drain) and every
+// rank's watcher (monitor) run in Rust; the C++ Service starts the threads and calls in. The Rust borrows the
+// Service's endpoint, ingress, queue, trace, the driver's slots and counters and the rank's pool for its life. What
+// stays C++ is g6svc_host. Fallible calls return 0, 1 when a host or pool-table call threw (the C++ holds the
+// exception), or 2 when refused, with the message in g6ctl_error().
+// a request file the host parsed and checked: ok false = refused and answered, nothing queued. prompt: valid until the
+// next host call
+struct g6svc_checked {
+    const int32_t* prompt; size_t n; int64_t sys; int32_t plp, n_gen; g6sch_identity steering; bool ok;
+};
+// one plain pool call of the control thread, for a test's observer. kind: 0 room, 1 fits, 2 reserve, 3 count; out:
+// room's or count's result, or fits' as 0 or 1; run: reserve's
+struct g6svc_pool_call {
+    uint32_t kind; uint64_t rows, worst; uint32_t r, out; g6sch_run run; const int32_t* prompt; size_t n; int64_t span;
+    const uint8_t* ns;
+};
+// what the control thread calls in C++. Each returns 0, or 1 when the C++ threw. share: null without a KV share.
+// refusal and tiers: the pool policy's, whose bytes and counters stay valid until the next host call
+struct g6svc_host {
+    void* ctx;
+    int32_t (*check)(void* ctx, uint64_t id, const uint8_t* bytes, size_t n, g6svc_checked* out);
+    int32_t (*retire_run)(void* ctx, const g6sch_slot* s);
+    int32_t (*share)(void* ctx, bool idle, bool* has, g6sch_resize* out);
+    int32_t (*refusal)(void* ctx, uint64_t worst, uint32_t r, const uint8_t** bytes, size_t* n);
+    int32_t (*tiers)(void* ctx, const g6kv_tier_totals** out, size_t* n);
+};
+// the control thread's settings, and the Service's objects it borrows (void: the C++ facades' handles, g6ctl_endpoint,
+// g6svc_ingress, g6sch_queue, g6svc_trace or null)
+struct g6svc_control_cfg {
+    const g6sch_config* scheduler; const uint8_t* directory; size_t directory_n;
+    const void* endpoint; const void* ingress; void* queue; const void* trace;
+    const g6sch_slot* slots; size_t n_slots; const g6sch_state* state;
+    g6s2_pool_ops pool; g6svc_host host; g6sch_lend lend;
+    int64_t share_ms; uint32_t rank; bool head, admit_hold, elog;
+};
+struct g6svc_control;
+int32_t g6svc_control_new(const g6svc_control_cfg* c, g6svc_control** out);
+void g6svc_control_free(g6svc_control* c);
+int32_t g6svc_control_run(const g6svc_control* c);                     // the head's control thread, until stopped
+int32_t g6svc_control_monitor(const g6svc_control* c, uint32_t linger_ms);   // every rank's watcher
+// the compute thread: its progress after each commit and step, and a Resize commit applied
+void g6svc_control_publish(const g6svc_control* c, uint64_t boundary, uint64_t revision, uint64_t horizon,
+                           uint32_t resident, uint32_t retiring);
+void g6svc_control_resized(const g6svc_control* c);
+uint32_t g6svc_control_resident(const g6svc_control* c);
+bool g6svc_control_stopping(const g6svc_control* c);
+void g6svc_control_stop(const g6svc_control* c);
+void g6svc_control_shutdown(const g6svc_control* c);   // stop, and fail the channel so every waiter wakes
+// status.s2 from the pool's values in s (free, room, growth, tiers, runs); the service's own fields are not read
+int32_t g6svc_control_write_status(const g6svc_control* c, const g6svc_status* s);
+// tests: an observer of the control thread's plain pool calls, set before it runs
+void g6svc_control_observe(const g6svc_control* c, void (*f)(void* ctx, const g6svc_pool_call* call), void* ctx);
+
 // The layout digest of every type above (and g6kvman.h's g6kv_tier_totals), computed the way src/layout.rs computes
 // it over the Rust types: per type its size and alignment, per field its offset, size and kind. The C++ compares it
 // with g6sch_layout() once at startup (scheduler.h check_abi).
@@ -836,6 +908,10 @@ constexpr uint64_t g6sch_layout_cpp() {
     G6SCH_TYPE(g6svc_steering) G6SCH_FIELD(g6svc_steering, profiles) G6SCH_FIELD(g6svc_steering, n) G6SCH_FIELD(g6svc_steering, scope) G6SCH_FIELD(g6svc_steering, forced_scale_bits) G6SCH_FIELD(g6svc_steering, loaded) G6SCH_FIELD(g6svc_steering, forced)
     G6SCH_TYPE(g6svc_boot) G6SCH_FIELD(g6svc_boot, scheduler) G6SCH_FIELD(g6svc_boot, steering) G6SCH_FIELD(g6svc_boot, max_sessions) G6SCH_FIELD(g6svc_boot, rank) G6SCH_FIELD(g6svc_boot, ranks) G6SCH_FIELD(g6svc_boot, prefill_min) G6SCH_FIELD(g6svc_boot, control_version) G6SCH_FIELD(g6svc_boot, lp_max) G6SCH_FIELD(g6svc_boot, directory) G6SCH_FIELD(g6svc_boot, directory_n) G6SCH_FIELD(g6svc_boot, signature) G6SCH_FIELD(g6svc_boot, signature_n) G6SCH_FIELD(g6svc_boot, mtp0) G6SCH_FIELD(g6svc_boot, pack) G6SCH_FIELD(g6svc_boot, park)
     G6SCH_TYPE(g6svc_status) G6SCH_FIELD(g6svc_status, epoch) G6SCH_FIELD(g6svc_status, queued) G6SCH_FIELD(g6svc_status, stalls) G6SCH_FIELD(g6svc_status, grows) G6SCH_FIELD(g6svc_status, stalled) G6SCH_FIELD(g6svc_status, tiers) G6SCH_FIELD(g6svc_status, n_tiers) G6SCH_FIELD(g6svc_status, runs) G6SCH_FIELD(g6svc_status, n_runs) G6SCH_FIELD(g6svc_status, pool_pages) G6SCH_FIELD(g6svc_status, resident) G6SCH_FIELD(g6svc_status, retiring) G6SCH_FIELD(g6svc_status, free) G6SCH_FIELD(g6svc_status, room) G6SCH_FIELD(g6svc_status, held_pages) G6SCH_FIELD(g6svc_status, worst_pages) G6SCH_FIELD(g6svc_status, has_growth) G6SCH_FIELD(g6svc_status, has_tiers) G6SCH_FIELD(g6svc_status, has_runs)
+    G6SCH_TYPE(g6svc_checked) G6SCH_FIELD(g6svc_checked, prompt) G6SCH_FIELD(g6svc_checked, n) G6SCH_FIELD(g6svc_checked, sys) G6SCH_FIELD(g6svc_checked, plp) G6SCH_FIELD(g6svc_checked, n_gen) G6SCH_FIELD(g6svc_checked, steering) G6SCH_FIELD(g6svc_checked, ok)
+    G6SCH_TYPE(g6svc_pool_call) G6SCH_FIELD(g6svc_pool_call, kind) G6SCH_FIELD(g6svc_pool_call, rows) G6SCH_FIELD(g6svc_pool_call, worst) G6SCH_FIELD(g6svc_pool_call, r) G6SCH_FIELD(g6svc_pool_call, out) G6SCH_FIELD(g6svc_pool_call, run) G6SCH_FIELD(g6svc_pool_call, prompt) G6SCH_FIELD(g6svc_pool_call, n) G6SCH_FIELD(g6svc_pool_call, span) G6SCH_FIELD(g6svc_pool_call, ns)
+    G6SCH_TYPE(g6svc_host) G6SCH_FIELD(g6svc_host, ctx) G6SCH_FIELD(g6svc_host, check) G6SCH_FIELD(g6svc_host, retire_run) G6SCH_FIELD(g6svc_host, share) G6SCH_FIELD(g6svc_host, refusal) G6SCH_FIELD(g6svc_host, tiers)
+    G6SCH_TYPE(g6svc_control_cfg) G6SCH_FIELD(g6svc_control_cfg, scheduler) G6SCH_FIELD(g6svc_control_cfg, directory) G6SCH_FIELD(g6svc_control_cfg, directory_n) G6SCH_FIELD(g6svc_control_cfg, endpoint) G6SCH_FIELD(g6svc_control_cfg, ingress) G6SCH_FIELD(g6svc_control_cfg, queue) G6SCH_FIELD(g6svc_control_cfg, trace) G6SCH_FIELD(g6svc_control_cfg, slots) G6SCH_FIELD(g6svc_control_cfg, n_slots) G6SCH_FIELD(g6svc_control_cfg, state) G6SCH_FIELD(g6svc_control_cfg, pool) G6SCH_FIELD(g6svc_control_cfg, host) G6SCH_FIELD(g6svc_control_cfg, lend) G6SCH_FIELD(g6svc_control_cfg, share_ms) G6SCH_FIELD(g6svc_control_cfg, rank) G6SCH_FIELD(g6svc_control_cfg, head) G6SCH_FIELD(g6svc_control_cfg, admit_hold) G6SCH_FIELD(g6svc_control_cfg, elog)
     return h;
 }
 #undef G6SCH_TYPE
