@@ -328,8 +328,12 @@ struct CpState
     int* pf_ident = nullptr;
     std::vector<G6Attn> pf_saved;
     bool pf_staged = false;
-    unsigned long long pf_g = 0;      // global pool-use counter: layer i of a sub-batch is use pf_g0 + i, pool (use % 2)
-    unsigned long long pf_g0 = 0;     //   (not i % 2: 79 layers is odd); pf_g0 = pf_g at cp_pf_enter, pf_g += nl at exit
+    unsigned long long pf_g = 0;      // global pool-use counter: layer i of a sub-batch is use pf_g0 + pf_use[i], pool (use % 2)
+    unsigned long long pf_g0 = 0;     //   (not i % 2: 79 layers is odd); pf_g0 = pf_g at cp_pf_enter, pf_g += pf_nuse at exit
+    // the staged layers in order (cp_pf_alloc): pf_use[i] = layer i's place among the layers with a KV binding (GLM: every
+    // layer, so i; Flash: the DSA layers), -1 for one without (a KDA layer)
+    std::vector<int> pf_use;
+    int pf_nuse = 0;
     void* pf_net = nullptr;           // g6m4: CpPfNet (prefill.cuh), the real-fabric gather; null = loopback (m4sim)
     int phys = 0;                     // remote rows release: physical pages of each CP binding (0 = every tail page)
     // remote rows release (rt_rows.cuh): after the real-fabric fill of layer i's pool (the pages below start this rank

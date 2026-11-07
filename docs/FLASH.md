@@ -130,8 +130,11 @@ GLM-5.3's does, so T=0 output with CP on is not the same bits as with it off. `e
 
 Limits for now:
 
-- The prefill runs only below R: under `--serve` a prompt longer than R ends with an error, and `--prefill` refuses one
-  offline. A prompt run as decode steps (no `--prefill`) may pass R.
+- A prefill quantum past R runs on GLM-5.3's staged view (`engine/runtime/prefill.cuh` `cp_pf_*`): before each DSA
+  layer's attention, every page below the quantum is gathered from its owner into one of two pools of one layer at
+  `CAP` (pinned, `2 x CAP x (row + 128 B)` a rank: 0.87 GB at `CAP` 1,048,640 with int4), the attention runs unchanged
+  on it, and the rows this rank stores go back. So the prefill is the replicated path's bits; it sends every remote page
+  below the quantum once per DSA layer and quantum. m4sim does not stage, and refuses a prompt past R with `--prefill`.
 - With several sessions the pool takes GLM-5.3's page classes (S2 below R): a request whose `prompt + max_tokens`
   passes R gets its prefix and its share of the tail below `place`, the MTP layer's copy above it.
 - The MTP layer keeps its whole KV (it is the draft model's binding), and the DFlash2 drafter its own window.

@@ -35,12 +35,14 @@ struct FlashContext {
     // added after serve_flash's; a resize hook chains to the one already set for any other tier
     std::function<void(NativeHooks&)> install;
     // GR8_CP: a main step past cp_R runs the CP block, whose collectives go on the CP fabric before its launch
-    // (cp_enqueue(step, M, context)); 0 = CP off. A prompt longer than cp_R is refused (the prefill runs below R only).
+    // (cp_enqueue(step, M, context)); 0 = CP off. A prefill quantum past cp_R runs on the staged view (prefill.cuh cp_pf_*,
+    // the main model's CpPfNet); without one a prompt longer than cp_R is refused.
     // Several sessions: S2 below R (the pool's page classes, as the full model's): a run whose worst case passes R is a
     // split run, its prefix and its shard of the tail below place, the drafter's copy of its tail above it; the tables
     // of its slot (or, alone, the layers' own) hold its CP map (s2.cuh s2_cp_map)
     int cp_R = 0;
     std::function<void(unsigned long long, int, int)> cp_enqueue;
+    std::function<unsigned()> cp_pf_error;   // the staging fabric's error word (0 = clean), when there is one
 };
 inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     using namespace g6rt;
@@ -76,7 +78,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                 (!sc.two_lanes || !owner2 || !*owner2->dev().error), "Flash serve pool-ID fabric error");
         require(!*c.main_fabric.dev().error && !*c.draft_fabric.dev().error &&
                 !*c.prefill_fabric.dev().error && (!sc.two_lanes || !*c.prefill_fabric2.dev().error) &&
-                !attn_errors(c.main) && !attn_errors(c.draft.d), "Flash serve fabric/attention error");
+                !attn_errors(c.main) && !attn_errors(c.draft.d) && !(c.cp_pf_error && c.cp_pf_error()), "Flash serve fabric/attention error");
     };
     // checkpoints: the index is read by the head's admission and written by the prefill, under ck_mu
     FlashCheckpoints* const ck = c.ckpt;
@@ -110,7 +112,15 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         pending.clear();
     };
     NativeHooks h;
-    if (c.cp_R)
+    // GR8_CP: the main model's prefill staging (prefill.cuh CpPfNet), set up by g6m4 with --prefill
+#if defined(G6_CP) && G6_CP
+    const bool cp_staging = c.main.cp.pf_net != nullptr;
+    auto stage = [&](bool in) { if (in) cp_pf_enter(c.main); else cp_pf_exit(c.main); };
+#else
+    const bool cp_staging = false;
+    auto stage = [](bool) {};
+#endif
+    if (c.cp_R && !cp_staging)
         h.refuse = [&](const g6rt::ServeReq& r) -> const char* {
             return r.prompt.size() > size_t(c.cp_R) ? "the prompt is longer than GR8_CP_R (Flash CP prefills below R only)" : nullptr;
         };
@@ -378,6 +388,9 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             solo_tables(q);
             c.main.s2on = c.draft.d.s2on = false;
         }
+        // GR8_CP: a quantum past R runs on the staged view (every page below it gathered into a pool, its rows sent back)
+        const bool staged = c.cp_R && a + int(rows) > c.cp_R && cp_staging;
+        if (staged) stage(true);
         pf_inputs_flash(c.prefill, ma, p.prompt.data() + a, pos.data(), kslot, multi ? q : 0);
         pf_enqueue_flash(c.prefill_fabric, c.main, c.prefill, pfseq, c.main.nl, ma);
         if (mb) {
@@ -386,6 +399,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             pf_step2_flash(c.main, c.prefill, c.prefill2, ma, mb, a + ma, a + ma + mb, pfseq, pfseq2, c.stream);
             pfseq2 += c.main.nl;
         } else pf_step_flash(c.main, c.prefill, ma, a + ma, pfseq, c.stream);
+        if (staged) stage(false);
         pfseq += c.main.nl;
         // The cache fill (the default) touches no fabric and no main layer, and leaves its own error word set, so every
         // word check() reads stays set until the next request's reset: one check after the last chunk sees what one per
