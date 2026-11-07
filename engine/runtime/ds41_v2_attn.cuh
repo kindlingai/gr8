@@ -193,11 +193,15 @@ inline void ds41_v2_attention(::ds41::v2::State& v, Model& m, int i, const __nv_
     ::ds41::v2::all_to_all(v, Coll::AttnOut, &out, 1, v.cs);
     ::ds41::v2::record_received(v, Coll::AttnOut);
     // Local source slice has no dependency on the exchange's receive buffer.
-    ds41_v2_output_b(&x->wob[i][m.rank], x->output_send + size_t(v.g.row0) * stride,
-                     x->parts + size_t(m.rank) * v.g.Q * ds41a::HID, n, a->S.xf_oa, v.st);
+    {
+        ::ds41::v2::TimingSpan timer(v, ::ds41::v2::TimingStage::WoBOwn, v.st, m.rank);
+        ds41_v2_output_b(&x->wob[i][m.rank], x->output_send + size_t(v.g.row0) * stride,
+                         x->parts + size_t(m.rank) * v.g.Q * ds41a::HID, n, a->S.xf_oa, v.st);
+    }
     ::ds41::v2::join(v, Coll::AttnOut);
     for (int p = 0; p < g6nr::NR; ++p) {
         if (p == m.rank) continue;
+        ::ds41::v2::TimingSpan timer(v, ::ds41::v2::TimingStage::WoBRemote, v.st, p);
         ds41_v2_output_b(&x->wob[i][p], x->output_recv + size_t(p) * v.g.Q * stride,
                          x->parts + size_t(p) * v.g.Q * ds41a::HID, n, a->S.xf_oa, v.st);
     }
