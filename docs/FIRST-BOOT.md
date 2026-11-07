@@ -58,6 +58,7 @@ otherwise. "Free memory" is `MemAvailable` a box; a range is the lowest and high
 - 10: `SESS=10`, and `GR8_DS_SESS_DRAFTS=1` in `EXTRA_ENV`. 16: `SESS=16`, and the same word.
   `GR8_DS_SESS_DRAFTS=1` lets every chat keep drafting when more than 5 write at once; it drafts fewer tokens a
   chat as more chats write (5 at 1-5 chats, 2 at 9-10, 1 at 11-16; [ENV.md](ENV.md)).
+- `SESS` takes any count from 1 to 32; 5, 10 and 16 above are the measured setups.
 - Measured on `main` at b10aae4 with Q3's switches on, one boot each, two runs each (the range; the first of the two
   runs is a little slower). Short code prompts. "Each" is the median chat's writing speed once it has a slot;
   "together" is all chats; "first word" is the median wait for the first word, slot wait included.

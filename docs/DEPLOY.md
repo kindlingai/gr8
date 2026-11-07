@@ -32,12 +32,13 @@ downloads anything.
 | name | model | `MODEL` | TP | `DRAFTER` |
 |---|---|---|---|---|
 | `glm53` | GLM-5.3 | `https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4` | 3, 4, 5 or 6 | TP=4: `https://huggingface.co/incoai/GLM-5.3-DFlash2` |
-| `glm53f` | GLM-5.3-Flash ([FLASH.md](FLASH.md)) | `https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4` | 1, 2, 3 or 4 | none |
+| `glm53f` | GLM-5.3-Flash ([FLASH.md](FLASH.md)) | `https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4` | 1, 2, 3 or 4 | TP=1, 2 and 4: `https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2` |
 | `ds41` | DeepSeek-V4.1-Flash-1017 ([DEEPSEEK-BOOT.md](DEEPSEEK-BOOT.md), [FIRST-BOOT.md](FIRST-BOOT.md)) | a local copy of `https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native`, read in place | 4 | none |
 
 `./gr8 models` lists each model's release and the values `--tp` and `--variant` take. For the GLM models each box
 fetches only its own part of the release into its model cache: the first `up` downloads it (about 90 GB at TP=4, 35
-minutes at 40 MB/s), and later boots load from the cache in about a minute. (`ds41` is the exception in the table
+minutes at 40 MB/s), and later boots load from the cache in about 40 s on a DGX Spark's NVMe and about 70 s on
+PCIe Gen4 NVMe. (`ds41` is the exception in the table
 above: it is read in place from a local copy you fetch yourself, and `./gr8 models` leaves it out — see
 [DEEPSEEK-BOOT.md](DEEPSEEK-BOOT.md).) `prepare` with the same options downloads ahead of time, and is never
 required. On bare metal a Hugging Face `MODEL` needs `MODEL_CACHE`, a local directory for this box's part; the container

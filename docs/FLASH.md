@@ -140,7 +140,7 @@ There is no rotation: Flash's latent is NoPE, and every read dequantizes in plac
 
 ## Several sessions
 
-`--sess N` (`SESS`, 1 to 8; 8 at TP=4, 4 at TP=3, 1 at TP=2) serves up to N requests at once on S2, as GLM-5.3 does: their decode
+`--sess N` (`SESS`, 1 to 8; 8 at TP=4, 4 at TP=3, 4 at TP=2) serves up to N requests at once on S2, as GLM-5.3 does: their decode
 rounds share main and draft steps, and their KV runs share the `CAP` pool (`--s2-sessions N` to `g6m4_flash`).
 
 - KDA state: each session holds a region of `MTP + 1` slots (`FlashSlots` in `engine/runtime/s2/flash_ring.h`), reset
