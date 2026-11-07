@@ -83,20 +83,29 @@ __device__ __forceinline__ int kp_visible(const DeviceAttn& a,int r){
 }
 // grid (pools / 32, rows), 256 threads: 32 pools x 32 heads per CTA; thread = (pool t / 8, heads t % 8 + 8 k). Pools
 // from p_off (a key tile, kp_select_tile; 0 = all of them): pool p's score at scores[row * pstride + p - p_off].
-// CP: the pools of this rank only (the others are neither read nor written)
+// CP: the pools this rank owns in the tile [p_off, p_off + nt), 32 a CTA: two of its pages (cp_mine, pages lp % cp_nr ==
+// cp_rank), so the grid is (own pools / 32, rows); a pool's score is the same bits as the replicated call gives it
 template<bool CP=false,class Input>
-__global__ void kp_scores(Input input,int start,float* scores,int pstride,int p_off=0){
+__global__ void kp_scores(Input input,int start,float* scores,int pstride,int p_off=0,int nt=0){
     auto a=resolve(input);if(!a.active)return;
-    const int row=blockIdx.y,r=start+row,p0=p_off+blockIdx.x*32,t=threadIdx.x;FOR_ROW(a,input,r);
+    const int row=blockIdx.y,r=start+row,t=threadIdx.x;FOR_ROW(a,input,r);
     const int nvis=kp_visible(a,r);
-    if(p0>=nvis)return;
-    const int npools=min(32,nvis-p0);
-    if(CP&&!cp_mine(a,p0*KP)&&!cp_mine(a,(p0+npools-1)*KP))return;   // 32 pools span two pages
+    int f=0;   // CP: this rank's first page in the tile
+    if constexpr(CP){const int pg0=p_off/g6kv::PAGE_POOLS;f=pg0+((a.cp_rank-pg0)%a.cp_nr+a.cp_nr)%a.cp_nr;}
+    auto pool=[&](int pp)->int{
+        if constexpr(CP){const int m=blockIdx.x*32+pp;return (f+m/g6kv::PAGE_POOLS*a.cp_nr)*g6kv::PAGE_POOLS+m%g6kv::PAGE_POOLS;}
+        else return p_off+blockIdx.x*32+pp;
+    };
+    const int pend=CP?min(nvis,p_off+nt):nvis,p0=pool(0);
+    if(p0>=pend)return;
+    int npools=min(32,pend-p0);   // the valid pools are a prefix of the CTA's
+    if constexpr(CP){const int q=pool(g6kv::PAGE_POOLS);
+        npools=pend<=p0+g6kv::PAGE_POOLS?pend-p0:pend<=q?g6kv::PAGE_POOLS:g6kv::PAGE_POOLS+min(g6kv::PAGE_POOLS,pend-q);}
     __shared__ float qs[IHEADS][IDIM+1],ks[32][IDIM+1],ws[IHEADS];
     for(int i=t;i<IHEADS*IDIM;i+=256)qs[i/IDIM][i%IDIM]=hfloat(a.index_q,(int64_t)r*IHEADS*IDIM+i);
     if(t<IHEADS)ws[t]=hfloat(a.index_weight,(int64_t)r*IHEADS+t);
-    for(int i=t;i<npools*IDIM;i+=256){const int pp=i/IDIM,d=i%IDIM,p=p0+pp;float v=0;
-        const uint8_t* b=(!CP||cp_mine(a,p*KP))?ix_page(a,p*KP):nullptr;if(b)v=__ldg(((const float*)b)+((p%g6kv::PAGE_POOLS)*IDIM+d));
+    for(int i=t;i<npools*IDIM;i+=256){const int pp=i/IDIM,d=i%IDIM,p=pool(pp);float v=0;
+        const uint8_t* b=ix_page(a,p*KP);if(b)v=__ldg(((const float*)b)+((p%g6kv::PAGE_POOLS)*IDIM+d));
         ks[pp][d]=v;}
     __syncthreads();
     const int pp=t>>3,hl=t&7;
@@ -110,10 +119,10 @@ __global__ void kp_scores(Input input,int start,float* scores,int pstride,int p_
             sum=fmaf(fmaxf(dot,0.f),ws[h],sum);}
     }
     sum+=__shfl_xor_sync(0xffffffff,sum,1);sum+=__shfl_xor_sync(0xffffffff,sum,2);sum+=__shfl_xor_sync(0xffffffff,sum,4);
-    if(hl==0&&pp<npools&&(!CP||cp_mine(a,(p0+pp)*KP))){
+    if(hl==0&&pp<npools){
         float s=sum*(1.f/64)+0.f;   // + 0: -0 (all relu 0, negative weights) ties with +0, as in the reference
         if(!isfinite(s)){error(a,4);s=-INFINITY;}
-        scores[(int64_t)row*pstride+p0-p_off+pp]=s;}
+        scores[(int64_t)row*pstride+pool(pp)-p_off]=s;}
 }
 // descending float order as unsigned (larger float -> larger key)
 __device__ __forceinline__ unsigned kp_key(float f){const unsigned u=__float_as_uint(f);return (u&0x80000000u)?~u:(u|0x80000000u);}

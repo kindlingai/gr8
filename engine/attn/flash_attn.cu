@@ -658,7 +658,8 @@ static cudaError_t cp_index_body(const G6Attn& a,Input input,Work& w,uint64_t* c
     if(a.reuse_indices){reuse<<<n,256,0,stream>>>(input,0);return cudaGetLastError();}
     for(int t0=0;t0<w.pstride;t0+=w.tstride){
         const int nt=std::min(w.tstride,w.pstride-t0);
-        kp_scores<true><<<dim3(nt/32,n),256,0,stream>>>(input,0,w.ps,w.tstride,t0);
+        const int own=(nt/g6kv::PAGE_POOLS+a.cp_nr-1)/a.cp_nr*g6kv::PAGE_POOLS;   // at most this rank's pools in the tile
+        kp_scores<true><<<dim3((own+31)/32,n),256,0,stream>>>(input,0,w.ps,w.tstride,t0,nt);
         cp_local<<<n,CPT,0,stream>>>(input,0,w.ps,w.tstride,cand,t0,nt);
     }
     return cudaGetLastError();
