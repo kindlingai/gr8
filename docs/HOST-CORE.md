@@ -589,6 +589,31 @@ Rust channel's, pool's and trace's locks, which TSan cannot see in uninstrumente
 `cargo test --release --workspace` pass. The GLM, Flash and DS41 engines build on a GB10. Boot: TP4 GLM, R5b2a then R5b2b, the round logs byte-identical on all four ranks, the 24 T=0
 replies matching and the head's s2 log lines equal apart from times.
 
+R5b2c landed. Every rank's compute thread is `scheduler-rs` `src/service/compute.rs` (`g6svc_compute_*` in g6sched.h;
+`g6svc_compute_cfg` and `g6svc_staged` in the layout digest): the idle wait, the event boundary (the module's fence,
+the staged request checked against the notice's hash, the pool's and the scheduler's digests, once per event), the
+commit's application (the cancel's terminal lines, the payload, the driver's apply, the trace and eventlog commit
+lines, a worker's `admitted`, the resize flag, `synchronize_mode`, the progress) and the step loop. `Service::run` still
+starts the threads and calls `g6svc_compute_run`. The `DriverHooks` with service logic call into it: `bind` (a worker
+makes the head's `count`, `match`, `take` or `reserve` on its own pool and checks the run), `retire`, `finished`,
+`settle` (the drain barrier), `terminal`'s drafter lines and `emit`'s first-token trace. The hooks that only forward to
+`Dispatch`, `Sessions` or the module stay C++ lambdas. `Sessions` and `Dispatch` stay C++ behind `g6svc_host`, which
+gains the compute thread's calls: the driver facade (`idle_boundary`, `digest`, `apply`, `step`), the staged request
+(`stage`, `unstage`: the parser's ServeReq), `abort`, `mode`, `counters`, `begin`, `bound` and `release`. Each thread
+has its own host context, so their exceptions stay apart. The Driver facade, which keeps the payloads and the planner,
+is not ported: the Rust reaches it only through the host. A worker's plain pool calls go through the control, so the
+test observer now sees them there.
+
+Checked on Linux (GCC 12, x86_64, Rust 1.99.1). `module_calls_test` gained a `cancel_prefill` scenario, recorded from
+the C++ first (e0ee311f): a cancel lands while its session is 384 rows into a 1,500-row prefill, beside a session that
+decodes on, and the head's last resp lines join its transcript. Every scenario keeps its hashes in every shape, as
+hooks and as tables. `admit_vectors_test`, `service_vectors_test`, the hold, drain and loopback TP1/TP2 tests and the
+driver, scheduler and DS41 host tests pass unchanged, and the 13,777 round logs the host tests write are byte-identical
+before and after. In the default and DS41 shapes, each scenario's eventlog lines and both ranks' traces, times
+masked, equal the C++'s. `module_calls_test`
+and `admit_hold_drain_test` pass under ASan and UBSan. `scripts/host_tests.sh` and `cargo test --release --workspace`
+pass. The GLM, Flash and DS41 engines build on a GB10. Boot pending.
+
 ### R6. Options, signatures and the fabric plan to Rust
 
 Moves `g6m4.cu:156-577` (about 20 model `#if`s, spec defaults, `--check-args`), the signature builders (`g6m4.cu:1919`,
