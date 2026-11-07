@@ -47,6 +47,38 @@ fn is_key_name(n: &str) -> bool {
     b.len() == 33 && b[16] == b'-' && b.iter().enumerate().all(|(i, c)| i == 16 || c.is_ascii_hexdigit())
 }
 
+/// The identity of the source files a plan reads: one line per file (path, size, mtime in ns, inode), directories
+/// walked recursively in name order. Part of the key text, so a release replaced at the same path (new files: a new
+/// mtime or inode) is a miss. Not a content hash (the releases are hundreds of GB): a rewrite in place that keeps
+/// size and mtime is not seen. An unreadable path gives a line that says so (a key that changes when it heals).
+pub fn source_identity(paths: &[&str]) -> String {
+    use std::os::unix::fs::MetadataExt;
+    fn walk(p: &std::path::Path, out: &mut String) {
+        match std::fs::metadata(p) {
+            Ok(m) if m.is_dir() => {
+                let mut es: Vec<PathBuf> = match std::fs::read_dir(p) {
+                    Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
+                    Err(e) => {
+                        out.push_str(&format!("{} unreadable {e}\n", p.display()));
+                        return;
+                    }
+                };
+                es.sort();
+                for e in es {
+                    walk(&e, out);
+                }
+            }
+            Ok(m) => out.push_str(&format!("{} {} {} {}\n", p.display(), m.len(), m.mtime() as i128 * 1_000_000_000 + m.mtime_nsec() as i128, m.ino())),
+            Err(e) => out.push_str(&format!("{} missing {e}\n", p.display())),
+        }
+    }
+    let mut out = String::new();
+    for p in paths.iter().filter(|p| !p.is_empty()) {
+        walk(std::path::Path::new(p), &mut out);
+    }
+    out
+}
+
 impl GenCache {
     /// From GR8_GEN_CACHE plus the planned manifest (the key text). None when the env is unset or empty: cache off.
     /// Old key dirs of other builds are pruned to the newest two (each rebuild makes a new ~17 GB dir).
@@ -66,12 +98,15 @@ impl GenCache {
         Some(c)
     }
 
-    /// Keep only the `keep` newest key dirs under the cache dir (by mtime); errors are ignored (worst case:
-    /// old dirs linger and a later write fails, which only costs a slow boot).
+    /// Keep this load's key dir and the `keep - 1` newest other key dirs under the cache dir (by mtime), so after
+    /// this load's writes at most `keep` remain; errors are ignored (worst case: old dirs linger and a later write
+    /// fails, which only costs a slow boot).
     fn prune_old(&self, keep: usize) {
         let Ok(rd) = std::fs::read_dir(&self.dir) else { return };
+        let keep = keep.saturating_sub(1);
         let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = rd
             .flatten()
+            .filter(|e| e.file_name().to_string_lossy() != self.key)
             .filter(|e| e.path().is_dir() && is_key_name(&e.file_name().to_string_lossy()))
             .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
             .collect();
@@ -154,6 +189,42 @@ impl GenCache {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_source_replaced_at_the_same_path_changes_the_identity() {
+        let d = std::env::temp_dir().join(format!("gencache-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub/w.bin"), b"old weights").unwrap();
+        let p = d.to_string_lossy().to_string();
+        let a = super::source_identity(&[&p]);
+        assert!(a.contains("w.bin"), "{a}");
+        std::fs::remove_file(d.join("sub/w.bin")).unwrap();
+        std::fs::write(d.join("sub/w.bin"), b"new weights").unwrap();   // same path, same size
+        assert_ne!(a, super::source_identity(&[&p]));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn three_keys_leave_two_dirs() {
+        let d = std::env::temp_dir().join(format!("gencache-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        for (i, k) in ["0000000000000000-000000000000000a", "0000000000000000-000000000000000b",
+                       "0000000000000000-000000000000000c"].iter().enumerate() {
+            let c = super::GenCache { dir: d.clone(), key: k.to_string(), hits: Default::default(),
+                                      misses: Default::default(), hit_bytes: Default::default(),
+                                      written: Default::default(), written_bytes: Default::default() };
+            c.prune_old(2);
+            c.write("@0-t", &[i as u8; 8]);
+            std::thread::sleep(std::time::Duration::from_millis(20));   // distinct mtimes
+        }
+        let mut left: Vec<String> = std::fs::read_dir(&d).unwrap().flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        left.sort();
+        assert_eq!(left, ["0000000000000000-000000000000000b", "0000000000000000-000000000000000c"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn prune_touches_key_dirs_only() {
         assert!(super::is_key_name("0123456789abcdef-fedcba9876543210"));

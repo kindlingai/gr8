@@ -1356,9 +1356,11 @@ pub unsafe extern "C" fn g6l_ds41_plan(release_dir: *const c_char, nr: u32, rank
         // GR8_GEN_CACHE (gencache.rs): the key binds the engine binary, the planned manifest (tensor names, offsets,
         // sizes), the plan options and the release directory (its name carries the release revision).
         let mut img = p.img;
-        let key_text = format!("ds41 release={} nr={nr} rank={rank} head_mx={} manifest={:?}\n{}",
-                               arg(release_dir, "release dir")?, opts.head_mx, opts.manifest,
-                               manifest_json(&img, &zeros, nr as usize));
+        let rd = arg(release_dir, "release dir")?;
+        let mf = opts.manifest.clone().unwrap_or_default();
+        let key_text = format!("ds41 release={rd} nr={nr} rank={rank} head_mx={} manifest={:?}\n{}\n{}",
+                               opts.head_mx, opts.manifest, manifest_json(&img, &zeros, nr as usize),
+                               crate::gencache::source_identity(&[&rd, &mf]));
         img.cache = crate::gencache::GenCache::from_env(&key_text);
         Ok::<_, String>(img)
     })();
