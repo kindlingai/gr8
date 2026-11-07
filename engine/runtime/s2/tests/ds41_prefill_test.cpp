@@ -10,6 +10,7 @@
 //  g. Dispatch + Sessions + Driver: one main sequence id per chunk, the next MAIN step has sequence + 1, draft sequence separate, the
 //     chunks cover rows 0 .. n - 2, the last token is the first MAIN row; prefill_min 0 and plp / steering requests never prefill
 //  h. BootstrapConfig::agreement(): a rank with another prefill_min is refused; the default string is unchanged
+//  i. GR8_DS_PF_L20_TAIL reaches ds41::br::l20_tail(), which the step-time split reads, through the fabric plan
 #include "s2/driver.h"
 #include "s2/sessions.h"
 #include "s2/dispatch.h"
@@ -19,6 +20,7 @@
 #include "ds41_pf_split.h"
 #include "ds41_rs.h"
 #include "fabric_order.h"
+#include "fabric_plan.h"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -640,6 +642,38 @@ static void check_single_lane_config()
     CHECK(throws([&] { ds41_prefill_single_lane(prefill, 0); }));
 }
 
+// i. the boot sets l20_tail() from the plan (fabric_bring_up calls fabric_plan_apply), and the plan's split agrees
+static void check_plan_l20_tail()
+{
+    g6rt::EngineOptions o;
+    o.cfg.rank = 0;
+    for (int i = 0; i < g6nr::NR; ++i) o.cfg.ips.push_back("10.0.0." + std::to_string(i + 1));
+    o.s2mode = true;
+    o.layers = iota(geom::L_MAIN);
+    o.NL = geom::L_MAIN;
+    o.NC = 2 * o.NL + 1;
+    o.s2sess = 8;
+    g6rt::PlanInputs in;
+    in.k.ds_prefill_w = "4096";
+    in.k.ds_pf_tail = "128";
+    in.k.ds_pf_l20_tail = true;
+    const g6rt::FabricPlan on = g6rt::fabric_plan(o, in);
+    CHECK(on.refusal.empty() && on.l20_tail && on.i_late == ds41::br::late_start(o.layers, true) && on.i_late == geom::CAND_SOURCE);
+    g6rt::fabric_plan_apply(on);
+    CHECK(ds41::br::l20_tail() && ds41::br::late_layer_start() == geom::CAND_SOURCE && ds41::br::late_start(o.layers) == on.i_late);
+    in.k.ds_pf_l20_tail = false;
+    const g6rt::FabricPlan off = g6rt::fabric_plan(o, in);
+    g6rt::fabric_plan_apply(off);
+    CHECK(off.refusal.empty() && !off.l20_tail && !ds41::br::l20_tail() && ds41::br::late_layer_start() == geom::LATE_LAYER_START);
+    CHECK(off.i_late == geom::LATE_LAYER_START);
+    in.k.ds_pf_tail = "0";
+    in.k.ds_pf_l20_tail = true;
+    CHECK(g6rt::fabric_plan(o, in).refusal == "GR8_DS_PF_L20_TAIL=1 needs GR8_DS_PF_TAIL (layer 20 joins the bounded replay)");
+    o.s2mode = false;                   // offline DS41 never sets it
+    g6rt::fabric_plan_apply(g6rt::fabric_plan(o, in));
+    CHECK(!ds41::br::l20_tail());
+}
+
 int main()
 {
     check_single_lane_config();
@@ -655,6 +689,7 @@ int main()
     check_dispatch();
     check_path();
     check_agreement();
+    check_plan_l20_tail();
     if (fails) { std::fprintf(stderr, "ds41_prefill_test: %d FAILED\n", fails); return 1; }
     std::printf("ds41_prefill_test: PASS\n");
     return 0;
