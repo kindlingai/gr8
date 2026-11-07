@@ -466,6 +466,10 @@ class Supervisor:
         self.locked = True
         with open(os.path.join(self.out, 'supervisor.pid'), 'w') as f:
             f.write(f'{os.getpid()}\n')
+        # gr8 down reads this box's quit wait here: a store given only on the up command line is in self.o, not in
+        # the environment down parses
+        with open(os.path.join(self.out, 'quit_wait'), 'w') as f:
+            f.write(f'{quit_wait(self.o)}\n')
         for p in ('handshake.json', 'gr8.state'):
             try:
                 os.unlink(os.path.join(self.out, p))
@@ -1130,7 +1134,7 @@ class Supervisor:
                            timeout=60, stdin=subprocess.DEVNULL)
             self.donor = False
         if self.started:
-            stop_local(self.home, log)
+            stop_local(self.home, log, quit_wait(self.o))
         self.release_claim()
         if self.agent:
             self.agent.stop()
@@ -1282,8 +1286,30 @@ def signal_pid(pid, sig, name, log=log):
         log(f'{name} (pid {pid}) belongs to another account: not stopped')
 
 
-def stop_local(home, log=log):
-    """Stop this box: shim and front end, then quit files, then the engine."""
+def quit_wait(o):
+    """Seconds an engine gets for its orderly quit before SIGTERM: 120 with a persist=on ssd store that keeps sessions
+    (KV_STORE keep=sessions or all, or KV_KEEP): the quit stores the pool's runs there for the next boot. Else 10.
+    The engine also needs --set-id for that store's index; the launcher always passes one (modelset.py set_id)."""
+    try:
+        stores = opt.kv_stores(o)
+    except Exception:
+        return 10
+    keep = o.get('KV_KEEP') or 'system'
+    whole = any(t['kind'] == 'ssd' and t.get('persist') and (t.get('keep') or keep) != 'system' for t in stores)
+    return 120 if whole else 10
+
+
+def recorded_quit_wait(out, o):
+    """The quit wait the running supervisor recorded at its start (out/quit_wait), else quit_wait(o)."""
+    try:
+        with open(os.path.join(out, 'quit_wait')) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return quit_wait(o)
+
+
+def stop_local(home, log=log, quit_s=10):
+    """Stop this box: shim and front end, then quit files, then the engine (quit_s seconds for an orderly quit)."""
     out = os.path.join(home, 'out')
     for p in ('front', 'shim'):
         pid = recorded(os.path.join(out, f'{p}.pid'))
@@ -1294,7 +1320,7 @@ def stop_local(home, log=log):
         return False
     if os.path.isdir(os.path.join(home, 's2')):
         open(os.path.join(home, 's2', 'quit'), 'w').close()
-    for _ in range(100):
+    for _ in range(int(quit_s * 10)):
         if not alive(pid):
             break
         try:

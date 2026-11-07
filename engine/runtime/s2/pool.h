@@ -113,6 +113,8 @@ public:
         require(g6kv_add_tier(p_, slots, keep, index_dir.empty() ? nullptr : index_dir.c_str(), compat.c_str()) == 0,
                 g6kv_tier_error());
     }
+    // after the last add_tier: drops the index runs whose base came back in no tier; returns how many
+    uint64_t tiers_loaded() { return g6kv_tiers_loaded(p_); }
     // at admission, before the grant, on every rank. span: the prompt's system span in tokens, -1 = none
     uint32_t count(const std::vector<int>& prompt, int64_t span, const g6rt::CacheNamespace& ns = {}) {
         uint32_t out;
