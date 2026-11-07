@@ -1303,6 +1303,19 @@ int main(int argc, char** argv)
         sc.max_rows = std::min(MX, std::max({s2sess * (mtp + 1), plan.chunk, dfl ? dfl_k + 1 : 0}));   // a round of every session, a prompt chunk, a DFlash2 round
         sc.max_sessions = s2sess; sc.mtp = mtp; sc.prefill_rows = MP; sc.two_lanes = two;
         if (dfl) sc.guard_tokens = 2 * dfl::K;     // a DFlash2 verify writes up to 7 rows past the last token
+        // the prefill/decode interleave, as the GLM block reads it: while sessions decode, prefill quanta of at most
+        // GR8_S2_DECODE_PF rows on one lane and GR8_S2_DECODE_ROUNDS decode rounds per quantum (scheduler.h Config).
+        // Unset, a long prompt runs its quanta with one decode round between them, so the other sessions wait it out
+        {
+            const int v = (int)knob::s2_decode_pf();
+            if (v < 0 || v % 64 || v > MP) die("S2: GR8_S2_DECODE_PF must be 0 or a multiple of 64 no larger than --prefill");
+            sc.decode_prefill_rows = (uint32_t)v;
+        }
+        sc.decode_rounds = (uint32_t)knob::s2_decode_rounds();
+        sc.tail_first = knob::s2_tail_first();
+        sc.notice_max = (uint32_t)knob::s2_notice_max();
+        if (R == 0) fprintf(stderr, "# flash s2 interleave: decode_pf %u rows, decode_rounds %u, tail_first %d, notice_max %u\n",
+                            sc.decode_prefill_rows, sc.decode_rounds, sc.tail_first ? 1 : 0, sc.notice_max);
         bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = cfg.ips[0];
         bc.directory = s2dir; bc.port = s2port;
         bc.timeout = (unsigned)knob::s2_timeout();
