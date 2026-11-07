@@ -586,7 +586,8 @@ cache namespaces), the hold, drain and loopback TP1/TP2 tests pass unchanged, an
 write are byte-identical before and after. `module_calls_test` and `admit_hold_drain_test` pass under ASan and UBSan,
 now in `scripts/host_tests.sh`. Under TSan both report the same races before and after the port: accesses ordered by the
 Rust channel's, pool's and trace's locks, which TSan cannot see in uninstrumented Rust. `scripts/host_tests.sh` and
-`cargo test --release --workspace` pass. The GLM, Flash and DS41 engines build on a GB10. Boot pending.
+`cargo test --release --workspace` pass. The GLM, Flash and DS41 engines build on a GB10. Boot: TP4 GLM, R5b2a then R5b2b, the round logs byte-identical on all four ranks, the 24 T=0
+replies matching and the head's s2 log lines equal apart from times.
 
 ### R6. Options, signatures and the fabric plan to Rust
 

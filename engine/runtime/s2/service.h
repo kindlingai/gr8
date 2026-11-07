@@ -235,7 +235,7 @@ class Service {
         }
         mod_.retain(s.run, st, g6rt::steering::cache_namespace(s.req.steering));
     }
-    // status.s2 from these pool values (the control thread's publish reads them from the pool itself)
+    // status.s2 from these pool values. Only service_vectors_test calls it: the control thread's publish reads the pool itself
     void write_status(const PoolStatus& p) {
         g6svc_status st{};
         st.free = p.free; st.room = p.room;
