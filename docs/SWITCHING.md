@@ -102,11 +102,9 @@ engine the recipe pins after its gr8 bump). Same columns as above; "Down" here i
 - The pair's stop-and-remove on this engine build took 3.1-4.3 s. On the recipe's engine 32 commits back
   (gr8 `16351164`), the same phase took about 13-14 s, most of it the fixed quit wait that gr8 #429 removed.
 - The pair's boot is loading its about 86 GB of weights and starting the engines: the pack loads 21.2 s into the
-  boot, the graphs capture at 22.1 s, and the engines report ready 23 s in. The first boot after the weights are
-  in place cost the same as the warm restart (24.8 s after `up -d` returned, both; the first boot's whole-run
-  total, with nothing to stop first, was 26.5 s), so the Flash side gains nothing from
-  `GR8_GEN_CACHE`: its generated-tensor build is not a boot cost. The runs kept the recipe's published setting,
-  gen cache off.
+  boot, the graphs capture at 22.1 s, and the engines report ready 23 s in. The first boot after the weights were
+  in place and the warm restart both waited 24.8 s (rounded) after `up -d` returned; the first boot's whole-run
+  total, with nothing to stop first, was 26.5 s. The runs kept the recipe's published setting, gen cache off.
 - Chats survive the pair's round trip. Four Flash chats, their next turn replayed after a full round trip to the
   TP=4 model and back, answered in 3.1-5.9 s (time to first token), all four with their context intact. These
   test prompts are short, and the prompt cache's checkpoints land at 4,096-token multiples, so the replays read
