@@ -612,7 +612,9 @@ driver, scheduler and DS41 host tests pass unchanged, and the 13,777 round logs 
 before and after. In the default and DS41 shapes, each scenario's eventlog lines and both ranks' traces, times
 masked, equal the C++'s. `module_calls_test`
 and `admit_hold_drain_test` pass under ASan and UBSan. `scripts/host_tests.sh` and `cargo test --release --workspace`
-pass. The GLM, Flash and DS41 engines build on a GB10. Boot pending.
+pass. The GLM, Flash and DS41 engines build on a GB10. TSan on `module_calls_test` and `admit_hold_drain_test` reports the same places as before the port, under the
+Rust names they moved to: each handoff is ordered by a Rust lock TSan does not see. Boot: TP4 GLM, R5b2b then R5b2c, the
+round logs byte-identical on all four ranks, the 24 T=0 replies matching and the head's s2 log lines equal.
 
 ### R6. Options, signatures and the fabric plan to Rust
 
