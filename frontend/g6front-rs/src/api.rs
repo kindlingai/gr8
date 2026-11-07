@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 
 use crate::dialect::{self, AnyParser, Dialect};
 use crate::gen::{think_open, Budget, Generation, Res, Step, StepStats, StopReason};
+use crate::guard;
 use crate::jsonmode;
 use crate::parser::Delta;
 use crate::pyjson::{self, truthy};
@@ -319,6 +320,44 @@ async fn read_json_raw(req: Request<Incoming>) -> Result<(Map<String, Value>, By
     }
 }
 
+/// A nonzero penalty needs an engine whose hello says `"penalties": true`, a think-end boost one that says
+/// `"think_end_boost": true` (PROTOCOL.md). The thinking penalties and the boost apply inside the think block the prompt
+/// leaves open, so the frame names its close (`think_end`) when there is one. A boost with no open block is dropped.
+fn check_penalties(st: &State, prompt: &[u32], g: &mut crate::wire::GenParams) -> Result<(), ApiError> {
+    if g.think_end_boost.is_some() && !st.engine.think_end_boost() {
+        return Err(ApiError::bad("think_end_boost is not supported by this engine", Some("think_end_boost")));
+    }
+    if (g.seq_thinking.is_some() || g.seq_answer.is_some() || g.seq_guard.is_some()) && !st.engine.sequence_penalty() {
+        return Err(ApiError::bad("sequence_penalty is not supported by this engine", Some("sequence_penalty")));
+    }
+    let named = [
+        ("presence_penalty", g.presence_penalty),
+        ("frequency_penalty", g.frequency_penalty),
+        ("thinking_presence_penalty", g.thinking_presence_penalty),
+        ("thinking_frequency_penalty", g.thinking_frequency_penalty),
+    ];
+    if let Some((k, _)) = named.iter().find(|(_, v)| *v != 0.0) {
+        if !st.engine.penalties() {
+            return Err(ApiError::bad(format!("{k} is not supported by this engine"), Some(k)));
+        }
+    }
+    if g.thinking_presence_penalty != 0.0
+        || g.thinking_frequency_penalty != 0.0
+        || g.think_end_boost.is_some()
+        || g.seq_thinking.is_some()
+    {
+        g.think_end = match (st.tok.think_start, st.tok.think_end) {
+            (Some(s), Some(e)) if think_open(prompt, s, e) => Some(e),
+            _ => None,
+        };
+        if g.think_end.is_none() {
+            g.think_end_boost = None;
+            g.seq_thinking = None;
+        }
+    }
+    Ok(())
+}
+
 impl State {
     /// The jinja chat template, which only the glm dialect has.
     fn tpl(&self) -> &crate::template::ChatTemplate {
@@ -492,6 +531,9 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         &st.tok.eos_ids,
         st.tok.vocab_size,
         &st.tok.gen_defaults,
+        &st.penalties,
+        st.boost.as_ref(),
+        st.sequence.as_ref(),
         st.chat_default_max_tokens(prompt.len()),
         st.max_logprobs(),
         true,
@@ -519,6 +561,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     if choice.is_forced() && !st.engine.inserts() {
         return Err(ApiError::bad("the engine does not support a forced tool_choice", Some("tool_choice")));
     }
+    check_penalties(st, &prompt, &mut params.gen)?;
     // The template leaves `<think>` open at the end of a chat prompt, so the reply's first token sits in the reasoning
     // span: the forced opener has to follow the close, or the call it opens is reasoning and the parser reads prose.
     let close = match (st.tok.think_start, st.tok.think_end) {
@@ -573,12 +616,11 @@ async fn with_images(
     let b64: Vec<String> =
         images.iter().map(|b| vision::block_b64(b).map(str::to_string)).collect::<Result<_, _>>().map_err(image_err)?;
     vision::check_budget(&b64).map_err(image_err)?;
-    let prepared = tokio::task::spawn_blocking(move || {
-        b64.iter().map(|s| vision::prepare_b64(s)).collect::<Result<Vec<_>, _>>()
-    })
-    .await
-    .map_err(|e| ApiError::new(500, &e.to_string(), None))?
-    .map_err(image_err)?;
+    let prepared =
+        tokio::task::spawn_blocking(move || b64.iter().map(|s| vision::prepare_b64(s)).collect::<Result<Vec<_>, _>>())
+            .await
+            .map_err(|e| ApiError::new(500, &e.to_string(), None))?
+            .map_err(image_err)?;
     let n_spans: Vec<usize> = prepared.iter().map(|p| p.plan.n_span()).collect();
     let (ids, pos) = vision::expand(prompt, &n_spans).map_err(image_err)?;
     let spans = prepared
@@ -694,9 +736,16 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
         (Some(start), Some(end)) => !think_open(&cr.prompt, start, end),
         _ => false,
     };
+    // the repeated-tool-call guard (guard.rs): GLM's parser, tools offered, no forced call (that is the client's own)
+    let guard_on = body.get("tool_repeat_guard").filter(|v| !v.is_null()).map_or(st.guard.on, |v| truthy(Some(v)));
+    let mut guard = (st.dialect == Dialect::Glm && cr.tools.is_some() && cr.force.is_empty())
+        .then(|| guard::Guard::new(st.guard, guard_on, body.get("messages")))
+        .flatten();
+    let guard_names = guard.as_ref().map(guard::Guard::names).unwrap_or_default();
     let new_parser = || {
         let p = AnyParser::new(st.dialect, cr.tools.as_ref(), &choice_value, include_reasoning)
-            .emit_undeclared(st.emit_undeclared);
+            .emit_undeclared(st.emit_undeclared)
+            .guard_names(guard_names.clone());
         if content_first {
             p.content_first()
         } else {
@@ -709,6 +758,9 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     let mut gen = Generation::new(&st.tok, rid, cr.prompt, cr.params, false, !stream);
     if truthy(body.get("return_step_stats")) {
         gen.want_step_stats();
+    }
+    if guard.is_some() {
+        gen.keep_reply();
     }
     let rf = cr.rf;
     if let (Some(start), Some(end)) = (st.tok.think_start, st.tok.think_end) {
@@ -736,24 +788,39 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     }
     if stream {
         let (sse, resp) = Sse::open();
-        tokio::spawn(async move { chat_stream(st, body, gen, parser, rf, sse).await });
+        tokio::spawn(async move { chat_stream(st, body, gen, parser, guard, rf, sse).await });
         return resp;
     }
     let created = now_secs();
     // a second parser watches the reply as it arrives, so a closed call block ends the generation (chat_full parses the
-    // whole text afterwards, which reads the same call)
-    let mut watch = (st.dialect == Dialect::Ds41).then(new_parser);
-    if let Err(e) = run_to_end(st, &mut gen, watch.as_mut()).await {
+    // whole text afterwards, which reads the same call), and the guard reads a held call before the reply ends
+    let mut watch = (st.dialect == Dialect::Ds41 || guard.is_some()).then(new_parser);
+    if let Err(e) = run_to_end(st, &mut gen, watch.as_mut(), guard.as_mut()).await {
         return e.response();
     }
     chat_full(st, &body, &gen, parser, &rf, created)
 }
 
-async fn run_to_end(st: &State, gen: &mut Generation, mut watch: Option<&mut AnyParser>) -> Result<(), ApiError> {
+async fn run_to_end(
+    st: &State,
+    gen: &mut Generation,
+    mut watch: Option<&mut AnyParser>,
+    mut guard: Option<&mut guard::Guard>,
+) -> Result<(), ApiError> {
     gen.start(&st.engine)?;
     while let Some(step) = gen.next().await? {
         if let Some(w) = watch.as_deref_mut() {
             let finished = step.finish_reason.is_some();
+            if finished {
+                if let (Some(g), Some(p)) = (guard.as_deref_mut(), w.glm_mut()) {
+                    p.delta(&step.text, false);
+                    if guard::take_back(gen, p, g).await? {
+                        continue; // the reply goes on from before the call
+                    }
+                    p.delta("", true);
+                    continue;
+                }
+            }
             w.delta(&step.text, finished);
             if !finished && w.call_closed() {
                 gen.end_now();
@@ -925,6 +992,7 @@ async fn chat_stream(
     body: Map<String, Value>,
     mut gen: Generation,
     mut parser: AnyParser,
+    mut guard: Option<guard::Guard>,
     rf: jsonmode::Rf,
     sse: Sse,
 ) {
@@ -969,6 +1037,25 @@ async fn chat_stream(
                 }
             }
             let last = step.finish_reason.is_some();
+            // the guard: the final text goes to the parser short of `finished`, so a held call stays held while the
+            // guard reads it. Taken back, the reply goes on. Otherwise an empty final step lets the call out
+            let step = match (last, guard.as_mut(), parser.glm_mut()) {
+                (true, Some(g), Some(_)) => {
+                    let pre = Step { text: step.text.clone(), ids: step.ids.clone(), logprobs: step.logprobs.clone(), ..Default::default() };
+                    if chat_step(st, &gen, &mut parser, &pre, &sse, created, lp_k, ret_ids, as_ids, continuous,
+                                 &mut tools_streamed, json_mode, &mut held_content, &rf)
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                    if guard::take_back(&mut gen, parser.glm_mut().unwrap(), g).await? {
+                        continue;
+                    }
+                    Step { finish_reason: step.finish_reason, stop_reason: step.stop_reason, ..Default::default() }
+                }
+                _ => step,
+            };
             if chat_step(st, &gen, &mut parser, &step, &sse, created, lp_k, ret_ids, as_ids, continuous,
                          &mut tools_streamed, json_mode, &mut held_content, &rf)
                 .await
@@ -1183,11 +1270,15 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
             &st.tok.eos_ids,
             st.tok.vocab_size,
             &st.tok.gen_defaults,
+            &st.penalties,
+            st.boost.as_ref(),
+            st.sequence.as_ref(),
             Some(16),
             st.max_logprobs(),
             false,
         )?;
         (params.gen.steering_profile, params.gen.steering_scale) = sampling::steering(&body, st.steering().as_ref())?;
+        check_penalties(st, &prompt, &mut params.gen)?;
         Ok((prompt, params))
     };
     let (prompt, params) = match prep.await {
@@ -1207,7 +1298,7 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
         return resp;
     }
     let created = now_secs();
-    if let Err(e) = run_to_end(st, &mut gen, None).await {
+    if let Err(e) = run_to_end(st, &mut gen, None, None).await {
         return e.response();
     }
     completions_full(st, &body, &gen, created)
@@ -1596,7 +1687,13 @@ async fn ask_supervisor(addr: &str, msg: &str) -> Result<Value, String> {
 
 async fn metrics_route(st: &State) -> Response<HttpBody> {
     match st.engine.metrics(Duration::from_secs(5)).await {
-        Ok(snap) => response(200, "text/plain; charset=utf-8", metrics::render(&snap, &st.model_name).into_bytes()),
+        Ok(snap) => {
+            let front = metrics::Front {
+                guard_retries: guard::RETRIES.load(std::sync::atomic::Ordering::Relaxed),
+                guard_given_up: guard::GIVEN_UP.load(std::sync::atomic::Ordering::Relaxed),
+            };
+            response(200, "text/plain; charset=utf-8", metrics::render(&snap, &st.model_name, front).into_bytes())
+        }
         Err(e) => {
             response(503, "text/plain; charset=utf-8", format!("engine metrics unavailable: {}\n", e.0).into_bytes())
         }

@@ -34,6 +34,7 @@
 #include "../attn/kvfmt.h"
 #include "draft_shape.h"
 #include "serve.h"
+#include "penalty.h"
 #include "spec_len.h"
 #include "../knobs-rs/gr8_knobs.h"
 #include "../h2d.h"
@@ -561,6 +562,14 @@ struct Model
     int gm_words = 0;
     int* gm_on_host = nullptr;
     uint32_t* gm_bits_host = nullptr;
+    // presence / frequency penalties (penalty.h), the main model only, set before any capture as the grammar masks are.
+    // s2/dispatch.h rewrites the row and session tables (mapped host memory) before each main step. pen_counts holds
+    // every slot's counts of its generated ids over this rank's vocab slice ([S2N][vn])
+    const PenRow* pen_rows = nullptr;
+    const PenSess* pen_sess = nullptr;
+    int* pen_counts = nullptr;
+    PenRow* pen_rows_host = nullptr;
+    PenSess* pen_sess_host = nullptr;
     glue::TkRes* tk = nullptr;        // top lists of the step's rows with SampleRow::topk > 0 (main model only; null = none)
     int *tok = nullptr, *pos = nullptr, *tok_out = nullptr, *tgt = nullptr;
     void* scratch = nullptr;
@@ -2064,6 +2073,66 @@ __global__ void __launch_bounds__(256) k_grammar_mask(float* logits, int ldl, in
     }
 }
 
+// grid M, block 256: the penalties and the think-end boost of row m (penalty.h). From the session's sampling row on,
+// every generated id loses presence + frequency * count from its logit, the thinking coefficients added while the row
+// is inside the think block (no draft before it in this step is the close). The count adds the slot's device counts,
+// the tokens committed since their last update (PenSess::news) and the drafts the rows before m in this step carry
+// (tok). Pass 2 writes each pending id from its raw logit, so a penalized logit is one subtraction either way. Inside
+// the block the close's logit then gains pen_boost at n = the thinking tokens committed plus the drafts before the
+// row, and the sequence penalty's tokens (found on the host, PenRow::seq_tok) lose theirs. A row with none of these
+// returns at once.
+__global__ void __launch_bounds__(256) k_penalty(float* logits, int ldl, int vlo, int vn, const int* tok, const PenRow* rows,
+                                                 const PenSess* sess, const int* counts)
+{
+    const int m = blockIdx.x;
+    const PenRow pr = rows[m];
+    if (pr.slot < 0 || m < pr.first) return;
+    __shared__ int s_tok[PEN_NEW_MAX + MX];
+    __shared__ float s_raw[PEN_NEW_MAX + MX];
+    const PenSess& ps = sess[pr.slot];
+    const int nnew = ps.nnew, n = nnew + (m - pr.first);
+    const int* cnt = ps.reset ? nullptr : counts + (size_t)pr.slot * vn;
+    float* row = logits + (size_t)m * ldl;
+    for (int t = threadIdx.x; t < n; t += 256) s_tok[t] = t < nnew ? ps.news[t] : tok[pr.first + 1 + t - nnew];
+    __syncthreads();
+    const bool think = pen_in_think(pr.think_end, s_tok + nnew, n - nnew);
+    const float presence = think ? pr.presence + pr.tpresence : pr.presence;
+    const float frequency = think ? pr.frequency + pr.tfrequency : pr.frequency;
+    const float boost = think ? pen_boost(pr.think_n + (m - pr.first), pr.boost_start, pr.boost_per1k, pr.boost_max) : 0.f;
+    if (presence == 0.f && frequency == 0.f && boost == 0.f && pr.seq_tok[0] < 0 && pr.seq_tok[1] < 0 && pr.seq_tok[2] < 0) return;
+    if (presence != 0.f || frequency != 0.f)
+    {
+        pen_pass0(row, vlo, vn, s_tok, n, s_raw, threadIdx.x, 256);
+        __syncthreads();
+        pen_pass1(row, vn, cnt, presence, frequency, threadIdx.x, 256);
+        __syncthreads();
+        pen_pass2(row, vlo, vn, cnt, s_tok, n, s_raw, presence, frequency, threadIdx.x, 256);
+        __syncthreads();
+    }
+    if (threadIdx.x != 0) return;
+    if (boost != 0.f && pr.think_end >= vlo && pr.think_end < vlo + vn) row[pr.think_end - vlo] += boost;
+    for (int e = 0; e < PEN_SEQ; ++e)
+        if (pr.seq_tok[e] >= vlo && pr.seq_tok[e] < vlo + vn) row[pr.seq_tok[e] - vlo] -= pr.seq_pen[e];
+}
+// grid M, block 256, after k_penalty read the counts: on the one row of each session that carries commit, the slot's
+// counts take the tokens committed since the last update, from zero for a new request on the slot
+__global__ void __launch_bounds__(256) k_penalty_commit(int vlo, int vn, const PenRow* rows, const PenSess* sess, int* counts)
+{
+    const PenRow pr = rows[blockIdx.x];
+    if (pr.slot < 0 || !pr.commit) return;
+    const PenSess& ps = sess[pr.slot];
+    int* cnt = counts + (size_t)pr.slot * vn;
+    if (ps.reset)
+        for (int i = threadIdx.x; i < vn; i += 256) cnt[i] = 0;
+    __syncthreads();
+    if (threadIdx.x == 0)
+        for (int t = 0; t < ps.nnew; ++t)
+        {
+            const int v = ps.news[t];
+            if (v >= vlo && v < vlo + vn) ++cnt[v - vlo];
+        }
+}
+
 // m.x holds the final-norm output of the last layer's second consume
 inline void launch_head_local(Model& m, int M, cudaStream_t st)
 {
@@ -2094,6 +2163,11 @@ inline void launch_head_local(Model& m, int M, cudaStream_t st)
 #endif
     bind::launch(H.xf_h, st);
     bind::launch(H.lm_head, st);
+    if (m.pen_rows)
+    {
+        k_penalty<<<M, 256, 0, st>>>(m.hlog, m.vn, m.vlo, m.vn, m.tok, m.pen_rows, m.pen_sess, m.pen_counts);
+        k_penalty_commit<<<M, 256, 0, st>>>(m.vlo, m.vn, m.pen_rows, m.pen_sess, m.pen_counts);
+    }
     if (m.gm_on) k_grammar_mask<<<M, 256, 0, st>>>(m.hlog, m.vn, m.vlo, m.vn, m.gm_on, m.gm_bits, m.gm_words);
     if (m.rx.on) glue::k_head_local_rx<<<M, 1024, 0, st>>>(head_args(m, M), m.tok, m.rx);
     else if (m.rs) glue::k_head_local_rs<<<M, 1024, 0, st>>>(head_args(m, M), m.tok);

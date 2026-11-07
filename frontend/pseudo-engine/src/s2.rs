@@ -117,6 +117,8 @@ impl<'a> Server<'a> {
             }
         }
         // mtp 0, so the guard is 0 too
+        // the pen field is taken (g6m4 writes penalty.s2 before ready.s2 the same way)
+        publish(&d.join("penalty.s2"), "presence frequency boost seq\n").map_err(Fail)?;
         let ready = format!("G6S2 3 {} {} {} 0 0 {MAX_ROWS} {MAX_LOGPROBS}\n", self.c.epoch, self.c.ranks, self.c.cap);
         publish(&d.join("ready.s2"), &ready).map_err(Fail)?;
         eprintln!("g6pseudo: serving {} (epoch {}, {} sessions)", d.display(), self.c.epoch, self.c.sessions);
@@ -325,15 +327,14 @@ fn lp_fields(v: &Value) -> String {
     s
 }
 
-/// req.<id>: `n_gen N temp F seed U min M stop ids|- [top_p F] [lp K] [plp K] [sys N] [ins A:U:ids]`, then the prompt.
+/// req.<id>: `n_gen N temp F seed U min M stop ids|- [top_p F] [pen F F F F N] [boost N F F] [seqt F:F:N:F]
+/// [seqa F:F:N:F] [seqg F:F:N:F:ids] [lp K] [plp K] [sys N] [ins A:U:ids]`, then the prompt. The penalties, the boost
+/// and the sequence penalty are read and ignored (the replies come from the rules).
 fn parse_request(data: &[u8], vocab: u32) -> Result<Request, String> {
     let text = std::str::from_utf8(data).map_err(|_| "not UTF-8")?;
     let (head, prompt) = text.split_once('\n').ok_or("no prompt line")?;
     let w: Vec<&str> = head.split_whitespace().collect();
-    if w.len() < 10
-        || !w.len().is_multiple_of(2)
-        || [w[0], w[2], w[4], w[6], w[8]] != ["n_gen", "temp", "seed", "min", "stop"]
-    {
+    if w.len() < 10 || [w[0], w[2], w[4], w[6], w[8]] != ["n_gen", "temp", "seed", "min", "stop"] {
         return Err(format!("invalid request header {head:?}"));
     }
     let num = |s: &str| s.parse::<usize>().map_err(|_| format!("bad number {s:?}"));
@@ -348,19 +349,53 @@ fn parse_request(data: &[u8], vocab: u32) -> Result<Request, String> {
         ins: None,
         prompt: ids(prompt.trim())?,
     };
-    for kv in w[10..].chunks(2) {
-        match kv[0] {
+    let mut i = 10;
+    while i < w.len() {
+        let (k, n) = (w[i], match w[i] { "pen" => 6, "boost" => 4, _ => 2 });
+        if i + n > w.len() {
+            return Err(format!("invalid request header {head:?}"));
+        }
+        let v = w[i + 1];
+        match k {
             "top_p" | "sys" => {}
-            "lp" => r.lp = Some(num(kv[1])?.min(MAX_LOGPROBS)),
-            "plp" => r.plp = Some(num(kv[1])?.min(MAX_LOGPROBS)),
+            "seqt" | "seqa" | "seqg" => {
+                let n = v.split(':').count();
+                if n != if k == "seqg" { 5 } else { 4 } {
+                    return Err(format!("{k}: want mult:base:min:cap{}", if k == "seqg" { ":ids" } else { "" }));
+                }
+            }
+            "pen" => {
+                for x in &w[i + 1..i + 5] {
+                    let f: f32 = x.parse().map_err(|_| format!("bad pen {x:?}"))?;
+                    if !(-2.0..=2.0).contains(&f) {
+                        return Err(format!("pen {x}: outside [-2, 2]"));
+                    }
+                }
+                let end: i64 = w[i + 5].parse().map_err(|_| format!("bad pen think_end {:?}", w[i + 5]))?;
+                if end < -1 || end >= i64::from(vocab) {
+                    return Err(format!("pen think_end {end}: outside -1..{vocab}"));
+                }
+            }
+            "boost" => {
+                num(v)?;
+                for x in &w[i + 2..i + 4] {
+                    let f: f32 = x.parse().map_err(|_| format!("bad boost {x:?}"))?;
+                    if !(0.0..=20.0).contains(&f) {
+                        return Err(format!("boost {x}: outside [0, 20]"));
+                    }
+                }
+            }
+            "lp" => r.lp = Some(num(v)?.min(MAX_LOGPROBS)),
+            "plp" => r.plp = Some(num(v)?.min(MAX_LOGPROBS)),
             "ins" => {
-                let mut f = kv[1].splitn(3, ':');
+                let mut f = v.splitn(3, ':');
                 let (a, u, t) = (f.next().unwrap_or(""), f.next().unwrap_or(""), f.next().unwrap_or(""));
                 let unless = if u == "-1" { -1 } else { num(u)? as i64 };
                 r.ins = Some((num(a)?, unless, ids(t)?));
             }
             k => return Err(format!("{k}: the pseudo engine has no such request field")),
         }
+        i += n;
     }
     if r.n_gen == 0 || r.min > r.n_gen || r.prompt.is_empty() || r.prompt.iter().any(|&t| t >= vocab) {
         return Err("invalid sampling, length or prompt".into());
@@ -385,6 +420,17 @@ mod tests {
         assert_eq!(r.ins, Some((4, -1, vec![7, 8])));
         assert_eq!(r.prompt, vec![1, 2, 3]);
         assert!(parse_request(b"n_gen 64 temp 0 seed 0 min 0 stop - gram 1:0:-1:\n1\n", 100).is_err());
+        let r = parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - top_p 0.9 pen 1.5 -0.5 0 1 7 lp 2\n1\n", 100).unwrap();
+        assert_eq!(r.lp, Some(2));
+        assert!(parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - pen 2.5 0 0 0 -1\n1\n", 100).is_err());
+        assert!(parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - pen 1 0 0 0\n1\n", 100).is_err());
+        assert!(parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - pen 1 0 0 0 100\n1\n", 100).is_err());
+        let r = parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - pen 0 0 0 0 7 boost 4096 2 10 lp 1\n1\n", 100).unwrap();
+        assert_eq!(r.lp, Some(1));
+        assert!(parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - boost 1 2\n1\n", 100).is_err());
+        assert!(parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - boost 1 2 21\n1\n", 100).is_err());
+        assert!(parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - seqt 0.8:1.75:4:6 seqa 1:1.75:12:6 seqg 1:2:1:8:3,4 lp 1\n1\n", 100).is_ok());
+        assert!(parse_request(b"n_gen 64 temp 1 seed 0 min 0 stop - seqg 1:2:1:8\n1\n", 100).is_err());
         assert!(parse_request(b"n_gen 64 temp 0 seed 0 min 0 stop -\n1,200\n", 100).is_err());
     }
 }

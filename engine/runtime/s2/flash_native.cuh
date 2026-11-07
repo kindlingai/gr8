@@ -236,6 +236,8 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     h.dispatch.bucket = [&](bool d, int ctx) { return bucket_of(d ? c.draft.d : c.main, ctx); };
     // request grammars (grammar.h): the masks the main head reads (rank.cuh k_grammar_mask), set before every main step
     h.dispatch.gm_on = c.main.gm_on_host; h.dispatch.gm_bits = c.main.gm_bits_host; h.dispatch.gm_words = c.main.gm_words;
+    // penalties (penalty.h): Dispatch writes these tables before every main step and rank.cuh k_penalty reads them
+    h.dispatch.pen_rows = c.main.pen_rows_host; h.dispatch.pen_sess = c.main.pen_sess_host;
     h.dispatch.mode = [&](int old, int next) {
         fence();
         if (!multi) { require(next == -1 || next == 0, "Flash non-solo mode"); return; }

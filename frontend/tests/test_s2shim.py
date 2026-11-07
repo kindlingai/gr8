@@ -202,6 +202,56 @@ class UnitTests(unittest.TestCase):
                     {'prompt': [1], 'max_tokens': 4, 'temperature': float('nan')}):
             self.assertIsNotNone(g6s2shim.build_request(bad, 0)[1], bad)
 
+    def test_build_request_penalties(self):
+        body, err = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'presence_penalty': 1.5, 'frequency_penalty': -0.5}, 0)
+        self.assertIsNone(err)
+        self.assertIn(b' top_p 1.0 pen 1.5 -0.5 0.0 0.0 -1\n', body)
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'frequency_penalty': 2, 'logprobs': 1}, 0)
+        self.assertIn(b' top_p 1.0 pen 0.0 2.0 0.0 0.0 -1 lp 1\n', body)
+        # the thinking penalties, with the think block's close
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'thinking_presence_penalty': 1.5,
+                                          'thinking_frequency_penalty': -0.25, 'think_end': 154842}, 0)
+        self.assertIn(b' top_p 1.0 pen 0.0 0.0 1.5 -0.25 154842\n', body)
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'thinking_presence_penalty': 1.5, 'think_end': None}, 0)
+        self.assertIn(b' pen 0.0 0.0 1.5 0.0 -1\n', body)
+        # the think-end boost: after pen, which carries the close even with every penalty 0
+        body, err = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'think_end': 154842,
+                                            'think_end_boost': {'start': 4096, 'per1k': 2, 'max': 10}}, 0)
+        self.assertIsNone(err)
+        self.assertIn(b' top_p 1.0 pen 0.0 0.0 0.0 0.0 154842 boost 4096 2.0 10.0\n', body)
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'presence_penalty': 1, 'think_end': 5,
+                                          'think_end_boost': {'start': 0, 'per1k': 0.5, 'max': 1.5}, 'logprobs': 1}, 0)
+        self.assertIn(b' pen 1.0 0.0 0.0 0.0 5 boost 0 0.5 1.5 lp 1\n', body)
+        self.assertNotIn(b' boost ', g6s2shim.build_request({'prompt': [1], 'max_tokens': 4,
+                                                              'think_end_boost': {'start': 1, 'per1k': 0, 'max': 10}}, 0)[0])
+        for bad in ({'start': -1, 'per1k': 2, 'max': 10}, {'start': 1, 'per1k': -1, 'max': 10}, {'start': 1, 'per1k': 1, 'max': 21},
+                    {'start': 'x', 'per1k': 1, 'max': 1}, {'per1k': 1, 'max': 1}, 'start=1', {'start': True, 'per1k': 1, 'max': 1}):
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'think_end_boost': bad}, 0)[1], bad)
+        # the sequence penalty's scopes, after boost
+        sp = {'thinking': {'mult': 0.8, 'base': 1.75, 'min': 4, 'cap': 6}, 'answer': {'mult': 1, 'base': 1.75, 'min': 12, 'cap': 6},
+              'guard': {'mult': 1, 'base': 2, 'min': 1, 'cap': 8, 'avoid': [154822, 3, 4]}}
+        body, err = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': sp, 'logprobs': 0}, 0)
+        self.assertIsNone(err)
+        self.assertIn(b' top_p 1.0 seqt 0.8:1.75:4:6.0 seqa 1.0:1.75:12:6.0 seqg 1.0:2.0:1:8.0:154822,3,4 lp 0\n', body)
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': {'thinking': sp['thinking']}}, 0)
+        self.assertIn(b' seqt 0.8:1.75:4:6.0\n', body)
+        self.assertNotIn(b'seqg', body)
+        self.assertNotIn(b'seq', g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': {
+            'thinking': dict(sp['thinking'], mult=0)}}, 0)[0])
+        for bad in ('x', {'thinking': dict(sp['thinking'], base=0.5)}, {'thinking': dict(sp['thinking'], min=0)},
+                    {'thinking': dict(sp['thinking'], cap=21)}, {'guard': dict(sp['guard'], avoid=[])},
+                    {'guard': dict(sp['guard'], avoid=[g6s2shim.VOCAB])}, {'guard': {'mult': 1, 'base': 2, 'min': 1, 'cap': 8}}):
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': bad}, 0)[1], bad)
+        # all zero, null or absent: no field
+        for kw in ({}, {'presence_penalty': 0, 'frequency_penalty': 0.0}, {'presence_penalty': None},
+                   {'thinking_presence_penalty': 0, 'think_end': 5}):
+            self.assertNotIn(b' pen ', g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, **kw}, 0)[0], kw)
+        for kw in ({'presence_penalty': 2.5}, {'frequency_penalty': -2.01}, {'presence_penalty': 'x'},
+                   {'presence_penalty': float('nan')}, {'thinking_frequency_penalty': 2.5},
+                   {'thinking_presence_penalty': 1, 'think_end': -1}, {'thinking_presence_penalty': 1, 'think_end': 'x'},
+                   {'thinking_presence_penalty': 1, 'think_end': g6s2shim.VOCAB}):
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, **kw}, 0)[1], kw)
+
     def test_build_request_insert(self):
         rule = {'after_tokens': 7, 'unless_emitted': 154842, 'tokens': [198, 154842, 271]}
         body, err = g6s2shim.build_request({'prompt': [1], 'max_tokens': 9, 'prompt_logprobs': 1, 'insert': [rule]}, 0)

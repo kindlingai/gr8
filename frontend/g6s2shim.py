@@ -11,7 +11,15 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
                                        Version 5 has several profiles: <scope> <n>, then n x <profile> <digest> <layers>.
   engine rank 0 -> DIR/status.s2       JSON (resident, queued, free_pages, ...), rewritten on queue/lifecycle changes
   shim -> DIR/req.<id>                 written as req.<id>.tmp, then renamed. Two lines:
-        n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float> [lp <k>] [plp <k>]
+        n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,... or -> top_p <float>
+        [pen <presence> <frequency> <thinking presence> <thinking frequency> <think_end or -1>]
+        [boost <start> <per1k> <max>] [seqt <mult>:<base>:<min>:<cap>] [seqa <mult>:<base>:<min>:<cap>]
+        [seqg <mult>:<base>:<min>:<cap>:<id,id,...>] [lp <k>] [plp <k>]
+                                                            (pen: the generate frame's penalties, each in [-2, 2], and the
+                                                             think block's close, when one is nonzero or a boost is on;
+                                                             boost: the frame's think_end_boost; seqt / seqa / seqg: the
+                                                             frame's sequence_penalty scopes; all only when the head wrote
+                                                             DIR/penalty.s2, boost and seq when that file names them)
         [sys <system_tokens>] [ins <after>:<unless or -1>:<id,id,...>]      (version 3: the generate frame's insert rule, never with lp)
         [img <pos>:<vit_h>:<vit_w>:<key>:<rgb base64>] ...    (one per image, last; only when the head wrote DIR/vision.s2)
         <prompt id,id,...>
@@ -306,6 +314,53 @@ def build_request(f: dict, ordinal: int, steering: dict | None = None):
         return None, 'bad temperature'
     if not (math.isfinite(top_p) and 0 < top_p <= 1):
         return None, 'top_p must be in (0, 1]'
+    pen = ''
+    try:
+        pens = [float(f.get(k) or 0.0) for k in ('presence_penalty', 'frequency_penalty',
+                                                 'thinking_presence_penalty', 'thinking_frequency_penalty')]
+    except (TypeError, ValueError, OverflowError):
+        return None, 'bad presence_penalty/frequency_penalty'
+    if not all(math.isfinite(x) and -2 <= x <= 2 for x in pens):
+        return None, 'presence_penalty and frequency_penalty must be in [-2, 2]'
+    think_end = f.get('think_end')
+    if think_end is not None and (not isinstance(think_end, int) or isinstance(think_end, bool) or not 0 <= think_end < VOCAB):
+        return None, f'bad think_end (must be 0..{VOCAB - 1})'
+    boost = ''
+    tb = f.get('think_end_boost')
+    if tb is not None:
+        try:
+            start, per1k, mx = int(tb['start']), float(tb['per1k']), float(tb['max'])
+        except (TypeError, ValueError, KeyError, OverflowError):
+            return None, 'bad think_end_boost'
+        if isinstance(tb['start'], bool) or not 0 <= start <= INT32_MAX or not (math.isfinite(per1k) and per1k >= 0) \
+                or not (math.isfinite(mx) and 0 <= mx <= 20):
+            return None, 'think_end_boost: start must be 0 or more, per1k 0 or more and max 0..20'
+        if per1k > 0 and mx > 0:
+            boost = f' boost {start} {per1k!r} {mx!r}'
+    seq = ''
+    sp = f.get('sequence_penalty')
+    if sp is not None:
+        if not isinstance(sp, dict):
+            return None, 'bad sequence_penalty'
+        for scope, word in (('thinking', 'seqt'), ('answer', 'seqa'), ('guard', 'seqg')):
+            v = sp.get(scope)
+            if v is None:
+                continue
+            try:
+                mult, base, mn, cap = float(v['mult']), float(v['base']), int(v['min']), float(v['cap'])
+                avoid = list(v['avoid']) if scope == 'guard' else []
+            except (TypeError, ValueError, KeyError, OverflowError):
+                return None, f'bad sequence_penalty.{scope}'
+            if isinstance(v['min'], bool) or not (math.isfinite(mult) and mult >= 0 and math.isfinite(base) and base >= 1
+                                                 and mn >= 1 and math.isfinite(cap) and 0 <= cap <= 20):
+                return None, f'sequence_penalty.{scope}: want mult >= 0, base >= 1, min >= 1 and cap 0..20'
+            if scope == 'guard' and (not 1 <= len(avoid) <= 4096 or any(
+                    not isinstance(i, int) or isinstance(i, bool) or not 0 <= i < VOCAB for i in avoid)):
+                return None, 'sequence_penalty.guard.avoid: 1 to 4096 token ids'
+            if mult > 0 and cap > 0:
+                seq += f' {word} {mult!r}:{base!r}:{mn}:{cap!r}' + (':' + ','.join(map(str, avoid)) if avoid else '')
+    if any(pens) or boost:
+        pen = ' pen ' + ' '.join(repr(x) for x in pens) + f" {-1 if think_end is None else think_end}"
     lps = {}
     for key, word in (('logprobs', 'lp'), ('prompt_logprobs', 'plp')):
         v = f.get(key)
@@ -337,7 +392,7 @@ def build_request(f: dict, ordinal: int, steering: dict | None = None):
         return None, 'images cannot be combined with prompt_logprobs or steering'
 
     body = (f"n_gen {mt} temp {temp!r} seed {seed} min {max(mn, 0)} stop {','.join(map(str, stops)) or '-'} top_p {top_p!r}"
-            + ''.join(f' {w} {v}' for w, v in lps.items()) + ins + gram + steer + img + '\n' + ','.join(map(str, prompt))
+            + pen + boost + seq + ''.join(f' {w} {v}' for w, v in lps.items()) + ins + gram + steer + img + '\n' + ','.join(map(str, prompt))
             + '\n').encode()
     return body, None
 
@@ -520,6 +575,12 @@ class Shim:
             hello['grammar'] = True
         if self.cfg.get('vision'):
             hello['vision'] = True
+        if self.cfg.get('penalty'):
+            hello['penalties'] = True
+        if self.cfg.get('boost'):
+            hello['think_end_boost'] = True
+        if self.cfg.get('seq'):
+            hello['sequence_penalty'] = True
         if self.cfg['steering']:
             hello['steering'] = self.cfg['steering']
         wire.write_frame(writer, hello)
@@ -576,6 +637,13 @@ class Shim:
             return self.finish(r, 'error', message='not supported by this engine: grammar')
         if f.get('images') not in (None, []) and not self.cfg.get('vision'):   # the engine would refuse the img field
             return self.finish(r, 'error', message='not supported by this engine: images')
+        if any(f.get(k) for k in ('presence_penalty', 'frequency_penalty', 'thinking_presence_penalty',
+                                  'thinking_frequency_penalty')) and not self.cfg.get('penalty'):   # the pen field
+            return self.finish(r, 'error', message='not supported by this engine: penalties')
+        if f.get('think_end_boost') is not None and not self.cfg.get('boost'):   # the boost field
+            return self.finish(r, 'error', message='not supported by this engine: think_end_boost')
+        if f.get('sequence_penalty') is not None and not self.cfg.get('seq'):   # the seqt / seqg fields
+            return self.finish(r, 'error', message='not supported by this engine: sequence_penalty')
         if f.get('prompt_logprobs') is not None and len(prompt) > self.a.max_plp_prompt:
             return self.finish(r, 'error', message=f'prompt too long for prompt_logprobs (max {self.a.max_plp_prompt})')
         if not isinstance(mt, int) or not prompt or mt < 1 or len(prompt) + mt > self.max_model_len():
@@ -802,6 +870,12 @@ class Shim:
                         self.cfg['grammar'] = os.path.exists(f'{self.a.dir}/grammar.s2')
                         # a DS41 engine with its vision tower loaded: the head writes vision.s2 before ready.s2
                         self.cfg['vision'] = os.path.exists(f'{self.a.dir}/vision.s2')
+                        # presence / frequency penalties (engine/runtime/penalty.h): the head writes penalty.s2 before
+                        # ready.s2; one that names boost takes the think-end boost too
+                        self.cfg['penalty'] = os.path.exists(f'{self.a.dir}/penalty.s2')
+                        marker = open(f'{self.a.dir}/penalty.s2').read().split() if self.cfg['penalty'] else []
+                        self.cfg['boost'] = 'boost' in marker
+                        self.cfg['seq'] = 'seq' in marker
                         break
                 except ValueError as e:
                     log.error('%s', e)

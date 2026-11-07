@@ -95,6 +95,22 @@ impl AnyParser {
         }
     }
 
+    /// The repeated-tool-call guard's held names (guard.rs). GLM only: the DSML parser ends the reply at a call's
+    /// closer and streams it, so it has no held run to take back.
+    pub fn guard_names(self, names: Vec<String>) -> AnyParser {
+        match self {
+            AnyParser::Glm(p) => AnyParser::Glm(p.guard_names(names)),
+            p => p,
+        }
+    }
+
+    pub fn glm_mut(&mut self) -> Option<&mut GlmParser> {
+        match self {
+            AnyParser::Glm(p) => Some(p),
+            AnyParser::Ds(_) => None,
+        }
+    }
+
     pub fn parse_full(&mut self, text: &str) -> FullParse {
         match self {
             AnyParser::Glm(p) => p.parse_full(text),

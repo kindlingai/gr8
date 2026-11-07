@@ -9,6 +9,8 @@
 //! - A call in the answer, outside a code fence, that follows text directly or starts the answer is live: once its
 //!   name is read and names a tool, its name and then its arguments stream as they are generated. Any other call is
 //!   held until the reply ends.
+//! - With the repeated-tool-call guard (guard.rs) a call whose name is one of `guard_names` never goes live: it is
+//!   held until the reply ends, when `pending_calls` lets the guard read it before the client does.
 //! - A call to a name the request did not declare is prose by default, tags and all. `emit_undeclared`
 //!   (`--undeclared-tool-calls emit`) takes it as a call when the name looks like a function name (`plausible_name`),
 //!   so the client sees the call and can answer it with its own "unknown tool" error. Such a call is never live: it is
@@ -55,16 +57,18 @@ enum Step {
 /// with no space between (the chat template writes a call straight after the content) is taken at its word once it
 /// names a tool. Prose about a call almost always follows a space or a newline, sits in a fence or in the reasoning;
 /// a live call's tokens reach the client as the model writes them, and text after it is ordinary content.
+#[derive(Clone)]
 struct Region {
-    state: State, // the state at the opener: where the raw text goes if the run is not a call
-    text: String, // the raw reply text from the opener on
-    at: usize,    // how much of `text` the scan has consumed
-    slot0: usize, // the first slot this run pushed
-    open: bool,   // an opener whose closer has not been seen
-    live: bool,   // the opener may start a live call
+    state: State,            // the state at the opener: where the raw text goes if the run is not a call
+    text: String,            // the raw reply text from the opener on
+    at: usize,               // how much of `text` the scan has consumed
+    slot0: usize,            // the first slot this run pushed
+    open: bool,              // an opener whose closer has not been seen
+    live: bool,              // the opener may start a live call
+    prev_last: Option<char>, // `last` before the opener, for `drop_pending`
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Slot {
     body: String,
     name: Option<String>,
@@ -75,13 +79,14 @@ struct Slot {
 }
 
 /// How far a live call's arguments have streamed, in bytes of its body.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ArgStream {
     at: usize, // the end of the last complete pair
     keys: usize,
     value: Option<OpenValue>,
 }
 
+#[derive(Clone)]
 struct OpenValue {
     start: usize,
     types: Option<Vec<String>>, // None: a JSON string, streamed as it arrives; else coerced once it ends
@@ -114,6 +119,7 @@ pub fn tool_call_id() -> String {
     format!("chatcmpl-tool-{}", crate::util::hex_id())
 }
 
+#[derive(Clone)]
 pub struct GlmParser {
     tools: Map<String, Value>, // name -> function object
     parse_tools: bool,
@@ -127,10 +133,12 @@ pub struct GlmParser {
     deferred_reasoning: String,
     deferred_content: String,
     content_has_nonws: bool,
-    fresh: bool,      // only whitespace since the reply start, a think tag or a live call
-    fence: bool,      // the answer is inside a ``` fence
-    ticks: usize,     // backticks in a row
-    undeclared: bool, // a call may name a tool the request did not declare (`emit_undeclared`)
+    fresh: bool,        // only whitespace since the reply start, a think tag or a live call
+    fence: bool,        // the answer is inside a ``` fence
+    ticks: usize,       // backticks in a row
+    undeclared: bool,   // a call may name a tool the request did not declare (`emit_undeclared`)
+    guard: Vec<String>, // names whose calls are held until the reply ends (the repeated-tool-call guard)
+    fed: usize,         // bytes fed so far, a position in the reply's text
 }
 
 impl GlmParser {
@@ -164,7 +172,57 @@ impl GlmParser {
             fence: false,
             ticks: 0,
             undeclared: false,
+            guard: Vec::new(),
+            fed: 0,
         }
+    }
+
+    /// The repeated-tool-call guard (guard.rs): a call to one of `names` is never live, so the reply ends before the
+    /// client sees any of it and `pending_calls` can read it first.
+    pub fn guard_names(mut self, names: Vec<String>) -> GlmParser {
+        self.guard = names;
+        self
+    }
+
+    /// Bytes of reply text fed so far.
+    pub fn fed_bytes(&self) -> usize {
+        self.fed
+    }
+
+    /// The bytes of the pending run (from its first opener on), or None without one.
+    pub fn pending_bytes(&self) -> Option<usize> {
+        self.region.as_ref().map(|r| r.text.len())
+    }
+
+    /// The calls the pending run would resolve to if the reply ended here, as (name, arguments JSON), or None when it
+    /// would be prose, there is none, or the reply already streamed a call (that one cannot be taken back, and the
+    /// reply's calls are more than the pending ones).
+    pub fn pending_calls(&self) -> Option<Vec<(String, String)>> {
+        let reg = self.region.as_ref()?;
+        if self.slots.iter().enumerate().any(|(i, s)| s.args.is_some() || (i < reg.slot0 && s.valid)) {
+            return None;
+        }
+        let mut probe = self.clone();
+        probe.feed("", true);
+        if probe.region.is_some() || probe.slots.len() <= reg.slot0 {
+            return None;
+        }
+        let calls: Vec<(String, String)> = probe.slots[reg.slot0..]
+            .iter()
+            .filter(|s| s.valid)
+            .map(|s| (s.name.clone().unwrap_or_default(), s.streamed.clone()))
+            .collect();
+        (!calls.is_empty()).then_some(calls)
+    }
+
+    /// Drop the pending run as if its text had never arrived: the reply goes on from just before its opener.
+    pub fn drop_pending(&mut self) {
+        let Some(reg) = self.region.take() else { return };
+        self.slots.truncate(reg.slot0);
+        self.state = reg.state;
+        self.buf.clear();
+        self.last = reg.prev_last;
+        self.fed -= reg.text.len();
     }
 
     /// A call may name a function the request did not declare (`--undeclared-tool-calls emit`): such a call is read
@@ -217,6 +275,7 @@ impl GlmParser {
     fn feed(&mut self, text: &str, final_: bool) -> (String, String, Vec<ToolDelta>) {
         let (mut reasoning, mut content, mut tools) = (String::new(), String::new(), Vec::new());
         self.buf.push_str(text);
+        self.fed += text.len();
         let mut pos = 0;
         loop {
             if let Some(mut reg) = self.region.take() {
@@ -297,6 +356,7 @@ impl GlmParser {
                             live: self.state == State::Content
                                 && !self.fence
                                 && (self.fresh || !self.last.is_some_and(is_py_space)),
+                            prev_last: self.last,
                         });
                         self.last = Some('>');
                     }
@@ -419,7 +479,11 @@ impl GlmParser {
         let name = py_strip(&body[..end]);
         // only a declared name goes live: an undeclared one (`emit_undeclared`) is held, so prose after it still proves
         // the run was prose -- a client answering it with an unknown-tool error gains nothing from streaming it
-        if name.contains(THINK_START) || name.contains(THINK_END) || !self.declared(name) {
+        if name.contains(THINK_START)
+            || name.contains(THINK_END)
+            || !self.declared(name)
+            || self.guard.iter().any(|g| g == name)
+        {
             return; // the held rules decide it
         }
         let id = tool_call_id();
@@ -1364,6 +1428,43 @@ mod tests {
         assert_eq!(step("is \"x\"</arg_val"), (None, Some(r#"is \"x\""#.into()), None));
         assert_eq!(step("ue><arg_key>days</arg_key><arg_value>3"), (None, Some(r#"", "days": "#.into()), None));
         assert_eq!(step("</arg_value></tool_call>"), (None, Some("3}".into()), None));
+    }
+
+    /// The repeated-tool-call guard: a guarded name never streams, the guard reads the held call, and dropping it
+    /// leaves the parser where it was before the opener.
+    #[test]
+    fn a_guarded_call_is_held_and_can_be_taken_back() {
+        let mut p = GlmParser::new(Some(&tools()), &json!("auto"), true).guard_names(vec!["get_weather".into()]);
+        let d = p.delta("Checking.</think>Sure.", false).unwrap();
+        assert_eq!(d.content.as_deref(), Some("Sure."));
+        let fed = p.fed_bytes();
+        assert_eq!(p.pending_calls(), None);
+        assert!(p.delta("<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par", false).is_none());
+        assert_eq!(p.pending_calls(), None); // unfinished: prose if the reply ended here
+        assert!(p.delta("is</arg_value></tool_call>", false).is_none());
+        assert_eq!(p.pending_calls(), Some(vec![("get_weather".into(), r#"{"city": "Paris"}"#.into())]));
+        let block = p.pending_bytes().unwrap();
+        assert_eq!(p.fed_bytes() - block, fed);
+        p.drop_pending();
+        assert_eq!((p.fed_bytes(), p.pending_calls(), p.pending_bytes()), (fed, None, None));
+        // the reply goes on from before the opener: an unguarded call streams live as before
+        let d = p.delta("<tool_call>get_current_date</tool_call>", false).unwrap();
+        assert_eq!(d.tool_calls[0].name.as_deref(), Some("get_current_date"));
+        // the guarded call left alone goes out at the end, as a held call does
+        let mut p = GlmParser::new(Some(&tools()), &json!("auto"), true).guard_names(vec!["get_weather".into()]);
+        assert!(p
+            .delta(
+                "</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+                false
+            )
+            .is_none());
+        let d = p.delta("", true).unwrap();
+        assert_eq!((d.tool_calls.len(), d.tool_calls[0].name.as_deref()), (1, Some("get_weather")));
+        // a live call already streamed cannot be taken back, even with a guarded call after it
+        let mut p = GlmParser::new(Some(&tools()), &json!("auto"), true).guard_names(vec!["get_weather".into()]);
+        let d = p.delta("</think><tool_call>get_current_date</tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>", false).unwrap();
+        assert_eq!(d.tool_calls[0].name.as_deref(), Some("get_current_date"));
+        assert_eq!(p.pending_calls(), None);
     }
 
     /// Calls after a space or newline in the answer, in reasoning or in a fence are held until the reply ends.

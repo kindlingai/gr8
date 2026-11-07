@@ -10,6 +10,7 @@ mod dsparser;
 mod engine;
 mod gen;
 mod grammar;
+mod guard;
 mod jsonmode;
 mod logprobs;
 mod metrics;
@@ -61,6 +62,14 @@ pub struct State {
     pub grammars: grammar::Grammars,
     /// `--undeclared-tool-calls emit`: a call to a tool the request did not declare comes back as a call, not text
     pub emit_undeclared: bool,
+    /// the repeated-tool-call guard's settings (`--tool-repeat-guard*`; a request's `tool_repeat_guard` wins)
+    pub guard: guard::Config,
+    /// the server-default penalties (`--default-presence-penalty`, `--default-frequency-penalty`)
+    pub penalties: sampling::Penalties,
+    /// the server-default think-end boost (`--default-think-end-boost`); None = off
+    pub boost: Option<sampling::BoostSpec>,
+    /// the server-default sequence penalty (`--default-sequence-penalty`); None = off
+    pub sequence: Option<sampling::SeqSpec>,
     pub started: u64,
     /// HOST:PORT of the head's supervisor, which runs the cluster's self-checks for /health?deep
     pub supervisor: Option<String>,
@@ -87,6 +96,10 @@ struct Args {
     allow_thinking_off: bool,
     emit_undeclared: bool,
     supervisor: Option<String>,
+    penalties: sampling::Penalties,
+    boost: Option<sampling::BoostSpec>,
+    sequence: Option<sampling::SeqSpec>,
+    guard: guard::Config,
 }
 
 const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--host H] [--port N]
@@ -97,6 +110,10 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--share-tokens N] [--max-connections N]
                   [--default-reasoning-effort minimal|low|medium|high|xhigh|max (ds41: or an integer 1-100)]
                   [--default-thinking-budget N] [--allow-thinking-off]
+                  [--default-presence-penalty SPEC] [--default-frequency-penalty SPEC]
+                  [--default-think-end-boost start=S,per1k=P,max=M] [--default-sequence-penalty SPEC]
+                  [--tool-repeat-guard 0|1] [--tool-repeat-guard-repeats N] [--tool-repeat-guard-temperature F]
+                  [--tool-repeat-guard-retries N]
                   [--undeclared-tool-calls text|emit] [--supervisor HOST:PORT]";
 
 fn parse_args() -> Result<Args, String> {
@@ -121,6 +138,10 @@ fn parse_args() -> Result<Args, String> {
         allow_thinking_off: false,
         emit_undeclared: false,
         supervisor: None,
+        penalties: sampling::Penalties::default(),
+        boost: None,
+        sequence: None,
+        guard: guard::Config::default(),
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -169,6 +190,49 @@ fn parse_args() -> Result<Args, String> {
                     next(&mut i, &flag, inline)?.parse().map_err(|_| "--default-thinking-budget: not a number")?
             }
             "--allow-thinking-off" => a.allow_thinking_off = true,
+            "--tool-repeat-guard" => {
+                a.guard.on = match next(&mut i, &flag, inline)?.as_str() {
+                    "1" => true,
+                    "0" => false,
+                    _ => return Err("--tool-repeat-guard: want 0 or 1".into()),
+                }
+            }
+            "--tool-repeat-guard-repeats" | "--tool-repeat-guard-retries" => {
+                let v: u32 = next(&mut i, &flag, inline)?.parse().map_err(|_| format!("{flag}: not a whole number"))?;
+                if flag == "--tool-repeat-guard-repeats" {
+                    if v == 0 {
+                        return Err("--tool-repeat-guard-repeats: want 1 or more".into());
+                    }
+                    a.guard.repeats = v
+                } else {
+                    a.guard.retries = v
+                }
+            }
+            "--tool-repeat-guard-temperature" => {
+                let v: f64 = next(&mut i, &flag, inline)?.parse().map_err(|_| format!("{flag}: not a number"))?;
+                if !v.is_finite() || !(0.0..=2.0).contains(&v) {
+                    return Err(format!("{flag}: want a number in [0, 2]"));
+                }
+                a.guard.temperature = v
+            }
+            "--default-sequence-penalty" => {
+                a.sequence =
+                    Some(sampling::SeqSpec::parse(&next(&mut i, &flag, inline)?).map_err(|e| format!("{flag}: {e}"))?)
+            }
+            "--default-think-end-boost" => {
+                a.boost = Some(
+                    sampling::BoostSpec::parse(&next(&mut i, &flag, inline)?).map_err(|e| format!("{flag}: {e}"))?,
+                )
+            }
+            "--default-presence-penalty" | "--default-frequency-penalty" => {
+                let spec =
+                    sampling::PenaltySpec::parse(&next(&mut i, &flag, inline)?).map_err(|e| format!("{flag}: {e}"))?;
+                if flag == "--default-presence-penalty" {
+                    a.penalties.presence = spec
+                } else {
+                    a.penalties.frequency = spec
+                }
+            }
             "--undeclared-tool-calls" => {
                 a.emit_undeclared = match next(&mut i, &flag, inline)?.as_str() {
                     "text" => false,
@@ -305,6 +369,13 @@ async fn serve(args: Args) -> Result<(), String> {
             (None, d, effort)
         }
     };
+    if args.penalties != sampling::Penalties::default() {
+        log::info!(
+            "default penalties: presence {:?}, frequency {:?}",
+            args.penalties.presence,
+            args.penalties.frequency
+        );
+    }
     let served = args.served.unwrap_or_else(|| match dialect {
         dialect::Dialect::Glm => vec!["glm-5.3".into(), "glm53".into()],
         dialect::Dialect::Ds41 => vec!["deepseek-v4.1-flash".into()],
@@ -331,6 +402,10 @@ async fn serve(args: Args) -> Result<(), String> {
         thinking: thinking_defaults,
         grammars,
         emit_undeclared: args.emit_undeclared,
+        guard: args.guard,
+        penalties: args.penalties,
+        boost: args.boost,
+        sequence: args.sequence,
         started: util::now_secs(),
         supervisor: args.supervisor,
     }));

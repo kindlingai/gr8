@@ -168,6 +168,76 @@ options:
       the head's front end: thinking_budget for a chat request that names none, or names 0 or null (TensorFold's rule).
       The front end closes the think block at the reply's Nth token. 0 = no limit. A request with logprobs gets no
       default budget
+  DEFAULT_PRESENCE_PENALTY:
+    scope: box
+    default: "0"
+    doc: >-
+      the head's front end: the presence_penalty spec for requests (OpenAI's penalty: the engine lowers the logit of
+      every token the reply already holds by it, before temperature and top_p; the prompt does not count). One part,
+      or a comma list of base=, thinking=, greedy=, nongreedy=, greedy.thinking=, nongreedy.thinking= and temperature=
+      parts; a part is [+]A[*M], an amount added and a multiplier (base=0.2 adds 0.2; thinking=*1.1 boosts by 10%;
+      thinking=+0.1*1.1 both). The whole reply's total adds base and the condition the request's temperature picks
+      (greedy when it is exactly 0, else nongreedy), their multipliers compounding; the think block adds thinking and
+      that condition's thinking part the same way. A temperature=[[+]A][*B] part is a last stage over those totals,
+      (total + A*T) * (B*T) at the request's temperature T, the factor only when *B is written, so temperature=*1
+      makes the operator's penalty zero under greedy. The request's own presence_penalty replaces base's amount and
+      is added after all of that, unscaled (0 included: the conditions still apply); its thinking_presence_penalty
+      replaces thinking's amount the same way, the condition's thinking part staying. No multiplier reaches a value the client set. A spec any combination of which resolves outside -2..2 at any T from 0 to 2 is refused at boot;
+      a request's valid value over the operator's parts is held to -2..2 (the think block's total also to within 2 of
+      the reply's), never refused. "greedy only": greedy=0.2,greedy.thinking=0.5. 0 = off
+  DEFAULT_FREQUENCY_PENALTY:
+    scope: box
+    default: "0"
+    doc: >-
+      the head's front end: the frequency_penalty spec, in DEFAULT_PRESENCE_PENALTY's form (the logit drops by the value
+      times the number of times the reply already holds the token). 0 = off
+  DEFAULT_THINK_END_BOOST:
+    scope: box
+    doc: >-
+      the head's front end: the think-end boost, a soft thinking budget, as start=S,per1k=P,max=M; unset = no boost. Inside the think
+      block the </think> logit gains min(M, P * (n - S) / 1000) at the reply's n-th thinking token, before temperature
+      and top_p, so the model ends its reasoning where it was closest to ending anyway. S is a token count or a
+      fraction of the request's max_tokens written 0.5x (the front end resolves it per request); P is logits per
+      thousand tokens past S (0 or more); M is the cap, 0 to 20. P or M 0 = off. A request's think_end_boost (the same
+      string, "off" or false) wins. A thinking_budget still closes the block at its token. Drafts are not boosted, so
+      acceptance drops near the close
+  DEFAULT_SEQUENCE_PENALTY:
+    scope: box
+    doc: >-
+      the head's front end: the sequence penalty, DRY's form, as thinking=M:B:N:C,answer=M:B:N:C,guard=M:B:N:C
+      (mult:base:min:cap), any of the scopes; unset = off. When the reply's last tokens repeat an earlier run of L >= N
+      tokens verbatim, the token that continued that run loses min(C, M * B^(L - N)) before temperature and top_p. The
+      thinking scope applies inside the think block and the answer scope outside it, both against the prompt, the tool
+      results and the reply (a model transcribing a tool result stops; give the answer a longer min so short quotes
+      such as a timestamp stay free). The guard scope applies only in the repeated-tool-call guard's retry, against
+      the call it took back, so a retry cannot reproduce it. M or C 0 = the scope off. A request's sequence_penalty
+      (the same string, "off" or false) wins
+  TOOL_REPEAT_GUARD:
+    scope: box
+    default: "0"
+    doc: >-
+      the head's front end: 1 = a reply that makes the same tool call the last TOOL_REPEAT_GUARD_REPEATS assistant
+      turns made, with identical tool results each time, is taken back before the client sees it and resampled from
+      just before the call at temperature max(the request's, TOOL_REPEAT_GUARD_TEMPERATURE) and top_p min(the
+      request's, 0.95). A changed result or another call in between resets the count. After TOOL_REPEAT_GUARD_RETRIES
+      resamples the call goes out as sampled. A request's tool_repeat_guard field wins. GLM only
+      (frontend/README.md, "Repeated tool calls")
+  TOOL_REPEAT_GUARD_REPEATS:
+    scope: box
+    default: "2"
+    doc: >-
+      the head's front end: turns in a row, ending the conversation, that must already have made the same call with the
+      same result before the guard takes a repeat back (1 or more)
+  TOOL_REPEAT_GUARD_TEMPERATURE:
+    scope: box
+    default: "0.7"
+    doc: >-
+      the head's front end: the resample's temperature floor, 0 to 2
+  TOOL_REPEAT_GUARD_RETRIES:
+    scope: box
+    default: "2"
+    doc: >-
+      the head's front end: resamples per request before the repeated call goes out as sampled
   ALLOW_THINKING_OFF:
     scope: box
     default: "0"

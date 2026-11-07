@@ -369,6 +369,37 @@ class FrontTests(unittest.TestCase):
         self.assertEqual(a[a.index('--default-max-tokens') + 1], '16384')
         self.assertNotIn('--share-tokens', a)
 
+    def test_the_penalty_defaults_reach_the_front_end_only_when_set(self):
+        a = self.front_argv()
+        self.assertNotIn('--default-presence-penalty', a)
+        self.assertNotIn('--default-frequency-penalty', a)
+        a = self.front_argv('--default-presence-penalty', 'thinking=0.5,greedy=0.2,nongreedy=0',
+                            '--default-frequency-penalty', '-0.5')
+        self.assertEqual(a[a.index('--default-presence-penalty') + 1], 'thinking=0.5,greedy=0.2,nongreedy=0')
+        self.assertEqual(a[a.index('--default-frequency-penalty') + 1], '-0.5')
+
+    def test_the_think_end_boost_reaches_the_front_end_when_set(self):
+        self.assertNotIn('--default-think-end-boost', self.front_argv())
+        a = self.front_argv('--default-think-end-boost', 'start=0.5x,per1k=2,max=10')
+        self.assertEqual(a[a.index('--default-think-end-boost') + 1], 'start=0.5x,per1k=2,max=10')
+
+    def test_the_sequence_penalty_reaches_the_front_end_when_set(self):
+        self.assertNotIn('--default-sequence-penalty', self.front_argv())
+        a = self.front_argv('--default-sequence-penalty', 'thinking=0.8:1.75:4:6,guard=1:2:1:8')
+        self.assertEqual(a[a.index('--default-sequence-penalty') + 1], 'thinking=0.8:1.75:4:6,guard=1:2:1:8')
+
+    def test_the_tool_repeat_guard_reaches_the_front_end_when_on(self):
+        a = self.front_argv()
+        self.assertNotIn('--tool-repeat-guard', a)
+        a = self.front_argv('--tool-repeat-guard', '1')
+        self.assertEqual(a[a.index('--tool-repeat-guard') + 1], '1')
+        self.assertNotIn('--tool-repeat-guard-repeats', a)   # the defaults stay the front end's own
+        a = self.front_argv('--tool-repeat-guard', '1', '--tool-repeat-guard-repeats', '3',
+                            '--tool-repeat-guard-temperature', '1', '--tool-repeat-guard-retries', '1')
+        self.assertEqual(a[a.index('--tool-repeat-guard-repeats') + 1], '3')
+        self.assertEqual(a[a.index('--tool-repeat-guard-temperature') + 1], '1')
+        self.assertEqual(a[a.index('--tool-repeat-guard-retries') + 1], '1')
+
     def test_the_thinking_defaults_reach_the_front_end_only_when_set(self):
         a = self.front_argv()
         self.assertNotIn('--default-reasoning-effort', a)

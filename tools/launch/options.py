@@ -11,6 +11,7 @@ how this launcher waits or checks.
 """
 import hashlib
 import ipaddress
+import math
 import os
 import re
 import socket
@@ -256,6 +257,128 @@ def mode(o):
     return 'peers' if o.get('PEERS') else 'mentat'
 
 
+def penalty_spec_error(spec):
+    """Why `spec` is not a penalty spec (the front end's sampling.rs PenaltySpec::parse), or None. A part is
+    `[+]A[*M]`, an amount and a multiplier; the spec is one part (the base) or a comma list of base=, thinking=,
+    greedy=, nongreedy=, greedy.thinking=, nongreedy.thinking= and temperature= parts, each once (greedy.base= is
+    greedy=). Every combination of the operator's parts must resolve within -2..2 at every temperature from 0 to 2."""
+    def part(v):
+        v = v.strip()
+        add, star, mul = v.partition('*')
+        add, mul = add.strip(), mul.strip()
+        a, m = 0.0, None
+        if add or not star:
+            try:
+                a = float(add)
+            except ValueError:
+                return None, f'{add!r} is not a number'
+            if math.isnan(a) or math.isinf(a):
+                return None, f'{add!r} is not a number'
+        if star:
+            try:
+                m = float(mul)
+            except ValueError:
+                return None, f'{mul!r} is not a multiplier'
+            if math.isnan(m) or math.isinf(m) or m < 0:
+                return None, f'multiplier {mul!r}: want a finite number, 0 or more'
+        return (a, m), None
+    names = {'base': 'base', 'thinking': 'thinking', 'greedy': 'greedy', 'greedy.base': 'greedy', 'nongreedy': 'nongreedy',
+             'nongreedy.base': 'nongreedy', 'greedy.thinking': 'greedy.thinking', 'nongreedy.thinking': 'nongreedy.thinking',
+             'temperature': 'temperature'}
+    parts = {k: (0.0, None) for k in set(names.values())}
+    if '=' not in spec:
+        parts['base'], err = part(spec)
+        if err:
+            return err
+    else:
+        seen = set()
+        for item in spec.split(','):
+            key, sep, value = item.partition('=')
+            key = names.get(key.strip())
+            if not sep or key is None:
+                return (f'{item.strip()!r}: want base=, thinking=, greedy=, nongreedy=, greedy.thinking=, '
+                        'nongreedy.thinking= or temperature=')
+            if key in seen:
+                return f'{key} is given twice'
+            seen.add(key)
+            parts[key], err = part(value)
+            if err:
+                return err
+    def factor(k):
+        return 1.0 if parts[k][1] is None else parts[k][1]
+    (ba, _), (ta, _), (xa, xb) = parts['base'], parts['thinking'], parts['temperature']
+    for cond in ('greedy', 'nongreedy'):
+        ga, gta = parts[cond][0], parts[cond + '.thinking'][0]
+        rest_out = (ba + ga) * factor('base') * factor(cond)
+        rest_in = rest_out + (ta + gta) * factor('thinking') * factor(cond + '.thinking')
+        # (rest + A T) * (B T) is a quadratic in T: its extremes on 0..2 are at the ends or at its vertex
+        ts = [0.0, 2.0]
+        if xb is not None and xb and xa:
+            ts += [-r / (2 * xa) for r in (rest_out, rest_in, rest_in - rest_out)]
+        for t in (t for t in ts if 0 <= t <= 2):
+            def stage(rest):
+                return (rest + xa * t) * (1.0 if xb is None else xb * t)
+            out, inside = stage(rest_out), stage(rest_in)
+            if not all(-2 <= x <= 2 for x in (out, inside, inside - out)):
+                return (f'resolves to {out:g} outside the think block and {inside:g} inside for a {cond} request at '
+                        f'temperature {t:g}; every total and the difference must be in -2..2')
+    return None
+
+
+def boost_spec_error(spec):
+    """Why `spec` is not a think-end boost spec (the front end's sampling.rs BoostSpec::parse), or None:
+    start=S,per1k=P,max=M, S a token count or a fraction like 0.5x, P 0 or more, M 0 to 20, each key once."""
+    seen = set()
+    for part in spec.split(','):
+        key, sep, value = part.partition('=')
+        key, value = key.strip(), value.strip()
+        if not sep or key not in ('start', 'per1k', 'max'):
+            return f'{part.strip()!r}: want start=, per1k= or max='
+        if key in seen:
+            return f'{key} is given twice'
+        seen.add(key)
+        if key == 'start' and value.endswith('x'):
+            value = value[:-1]
+            lo, hi = 0, 1
+        elif key == 'start':
+            if not value.isdigit():
+                return f'start={value!r}: want a token count or a fraction like 0.5x'
+            continue
+        else:
+            lo, hi = (0, math.inf) if key == 'per1k' else (0, 20)
+        try:
+            v = float(value)
+        except ValueError:
+            return f'{key}={value!r} is not a number'
+        if math.isnan(v) or not lo <= v <= hi:
+            return f'{key}={value}: want {lo} to {hi}'
+    return None
+
+
+def seq_spec_error(spec):
+    """Why `spec` is not a sequence penalty spec (the front end's sampling.rs SeqSpec::parse), or None:
+    thinking=M:B:N:C,answer=M:B:N:C,guard=M:B:N:C, M 0 or more, B 1 or more, N 1 or more, C 0 to 20, each scope once."""
+    seen = set()
+    for part in spec.split(','):
+        key, sep, value = part.partition('=')
+        key = key.strip()
+        if not sep or key not in ('thinking', 'answer', 'guard'):
+            return f'{part.strip()!r}: want thinking=, answer= or guard='
+        if key in seen:
+            return f'{key} is given twice'
+        seen.add(key)
+        v = [x.strip() for x in value.split(':')]
+        if len(v) != 4:
+            return f'{key}={value.strip()!r}: want mult:base:min:cap'
+        try:
+            m, b, c = float(v[0]), float(v[1]), float(v[3])
+        except ValueError:
+            return f'{key}: a value is not a number'
+        if not v[2].isdigit() or not (m >= 0 and b >= 1 and int(v[2]) >= 1 and 0 <= c <= 20):
+            return f'{key}={value.strip()}: want mult >= 0, base >= 1, min >= 1 and cap 0 to 20'
+    return None
+
+
 def validate(o):
     """Refuse what this version cannot boot, with the reason."""
     if not o.get('GR8_MODEL'):
@@ -317,6 +440,30 @@ def validate(o):
         raise OptionError(f'--allow-thinking-off {o.get("ALLOW_THINKING_OFF")}: want 0 or 1')
     if o.get('UNDECLARED_TOOL_CALLS') not in ('text', 'emit'):
         raise OptionError(f'--undeclared-tool-calls {o.get("UNDECLARED_TOOL_CALLS")}: want text or emit')
+    for k in ('DEFAULT_PRESENCE_PENALTY', 'DEFAULT_FREQUENCY_PENALTY'):
+        err = penalty_spec_error(str(o.get(k)))
+        if err:
+            raise OptionError(f'--{k.lower().replace("_", "-")} {o.get(k)}: {err}')
+    if o.get('DEFAULT_THINK_END_BOOST') is not None:
+        err = boost_spec_error(o.get('DEFAULT_THINK_END_BOOST'))
+        if err:
+            raise OptionError(f'--default-think-end-boost {o.get("DEFAULT_THINK_END_BOOST")}: {err}')
+    if o.get('DEFAULT_SEQUENCE_PENALTY') is not None:
+        err = seq_spec_error(o.get('DEFAULT_SEQUENCE_PENALTY'))
+        if err:
+            raise OptionError(f'--default-sequence-penalty {o.get("DEFAULT_SEQUENCE_PENALTY")}: {err}')
+    if o.get('TOOL_REPEAT_GUARD') not in ('0', '1'):
+        raise OptionError(f'--tool-repeat-guard {o.get("TOOL_REPEAT_GUARD")}: want 0 or 1')
+    if not (str(o.get('TOOL_REPEAT_GUARD_REPEATS')).isdigit() and int(o.get('TOOL_REPEAT_GUARD_REPEATS')) >= 1):
+        raise OptionError(f'--tool-repeat-guard-repeats {o.get("TOOL_REPEAT_GUARD_REPEATS")}: want a whole number from 1')
+    if not str(o.get('TOOL_REPEAT_GUARD_RETRIES')).isdigit():
+        raise OptionError(f'--tool-repeat-guard-retries {o.get("TOOL_REPEAT_GUARD_RETRIES")}: want a whole number')
+    try:
+        gt = float(o.get('TOOL_REPEAT_GUARD_TEMPERATURE'))
+    except (TypeError, ValueError):
+        gt = math.nan
+    if not 0 <= gt <= 2:
+        raise OptionError(f'--tool-repeat-guard-temperature {o.get("TOOL_REPEAT_GUARD_TEMPERATURE")}: want a number from 0 to 2')
     if not str(o.get('DEFAULT_THINKING_BUDGET')).isdigit():
         raise OptionError(f'--default-thinking-budget {o.get("DEFAULT_THINKING_BUDGET")}: want a whole number '
                           '(0 = no limit)')

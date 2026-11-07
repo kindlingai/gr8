@@ -968,6 +968,19 @@ class Supervisor:
             front += ['--default-reasoning-effort', o.get('DEFAULT_REASONING_EFFORT')]
         if o.get('DEFAULT_THINKING_BUDGET') != '0':
             front += ['--default-thinking-budget', o.get('DEFAULT_THINKING_BUDGET')]
+        for k in ('DEFAULT_PRESENCE_PENALTY', 'DEFAULT_FREQUENCY_PENALTY'):
+            if o.get(k) != '0':
+                front += ['--' + k.lower().replace('_', '-'), o.get(k)]
+        if o.get('DEFAULT_THINK_END_BOOST'):
+            front += ['--default-think-end-boost', o.get('DEFAULT_THINK_END_BOOST')]
+        if o.get('DEFAULT_SEQUENCE_PENALTY'):
+            front += ['--default-sequence-penalty', o.get('DEFAULT_SEQUENCE_PENALTY')]
+        if o.get('TOOL_REPEAT_GUARD') == '1':
+            front += ['--tool-repeat-guard', '1']
+            for k, dflt in (('TOOL_REPEAT_GUARD_REPEATS', '2'), ('TOOL_REPEAT_GUARD_TEMPERATURE', '0.7'),
+                            ('TOOL_REPEAT_GUARD_RETRIES', '2')):
+                if o.get(k) != dflt:
+                    front += ['--' + k.lower().replace('_', '-'), o.get(k)]
         if o.get('ALLOW_THINKING_OFF') == '1' and model.dialect == 'glm':   # ds41 turns thinking off by itself
             front += ['--allow-thinking-off']
         if o.get('UNDECLARED_TOOL_CALLS') != 'text':

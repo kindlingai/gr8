@@ -63,6 +63,10 @@ On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 
 | `--max-connections` | 512 | Connections served at once; more wait in the listen backlog. Request headers must arrive within 30 s and a body within 120 s. |
 | `--default-reasoning-effort` | none | `reasoning_effort` for a chat request that names none: `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, heard as the nearest level the template names. `./gr8 glm53 up` passes `DEFAULT_REASONING_EFFORT` when it is set. |
 | `--default-thinking-budget` | 0 | `thinking_budget` for a chat request that names none, 0 or null (0 = no limit). A request with `logprobs` gets none. `./gr8 glm53 up` passes `DEFAULT_THINKING_BUDGET` when it is set. |
+| `--default-presence-penalty` / `--default-frequency-penalty` | 0 | The server's `presence_penalty` / `frequency_penalty` spec (OpenAI's penalties: the engine lowers the logit of every token the reply already holds by `presence_penalty` + `frequency_penalty` x its count, before temperature and top-p; the prompt does not count, vLLM's semantics). One part, or a comma list of `base=`, `thinking=`, `greedy=`, `nongreedy=`, `greedy.thinking=`, `nongreedy.thinking=` and `temperature=` parts, each once (`greedy.base=` is `greedy=`). A part is `[+]A[*M]`: an amount added and a multiplier (`base=0.2` adds 0.2 at multiplier 1; `thinking=*1.1` adds nothing and boosts by 10%; `thinking=+0.1*1.1` both; `-0.1*0.5` is fine). The operator's parts resolve first. The whole reply's total: out = (base.A + gn.A) x base.M x gn.M, gn the condition the request's temperature after defaults picks (`greedy` when it is exactly 0, else `nongreedy`; any other temperature, however small, is sampling). The think block (a chat prompt's, until `</think>`; a `thinking_budget` continuation has none) adds (thinking.A + gn.thinking.A) x thinking.M x gn.thinking.M. A `temperature=[[+]A][*B]` part is a last stage over each total at the request's effective temperature T (a guard retry keeps the request's T): total' = (total + A x T) x (B x T), the factor only when `*B` is written, so `temperature=*1` makes the operator's penalty proportional to the temperature and zero under greedy. (A multiplier of B^T, 1 at T = 0, would keep a greedy penalty while scaling with temperature; not implemented.) Then the request's own values: `presence_penalty` replaces `base`'s amount and is added after the stage, unscaled, 0 included (so a client that sends `presence_penalty: 0` by habit still gets the conditions), and `thinking_presence_penalty` replaces `thinking`'s amount the same way (the condition's thinking part stays). No condition multiplier, `*0` included, reaches a value the client set: under `greedy=0.2,greedy.thinking=0.5` a sampling client that sends 1.5 gets 1.5, a greedy one 1.7 outside the block and 2.0 inside. That last number is the clamp: a client's own value in -2..2 is valid as such (OpenAI's rule; outside it is a 400), and when the operator's parts take a total past the engine's -2..2 the total is held to the range, the block's total also to within 2 of the reply's, since the engine takes the difference (in - out). A spec any combination of which resolves outside -2..2 (either total, or their difference) at any T in 0..2 on its own is still refused at boot. The guard's resamples keep the request's resolved values. A nonzero penalty needs an engine whose hello says `penalties` (g6m4 with the `pen` field, the pseudo engine), else 400. The TP=1 Flash recipe, greedy requests only: `greedy=0.2,greedy.thinking=0.5` for presence. `./gr8 glm53 up` passes `DEFAULT_PRESENCE_PENALTY` / `DEFAULT_FREQUENCY_PENALTY` when they are set. |
+| `--default-think-end-boost` | off | The think-end boost, a soft thinking budget, below. `./gr8 glm53 up` passes `DEFAULT_THINK_END_BOOST` when it is set. |
+| `--default-sequence-penalty` | off | The sequence penalty, below. `./gr8 glm53 up` passes `DEFAULT_SEQUENCE_PENALTY` when it is set. |
+| `--tool-repeat-guard` | 0 | 1 = the repeated-tool-call guard, below. `./gr8 glm53 up` passes `TOOL_REPEAT_GUARD` and, when they differ from these defaults, `--tool-repeat-guard-repeats` (2), `--tool-repeat-guard-temperature` (0.7) and `--tool-repeat-guard-retries` (2). |
 | `--undeclared-tool-calls` | `text` | A call to a tool name the request did not declare. `text`: the call's text stays in `content` and the reply finishes `stop` (vLLM's glm47 parser). `emit`: it is a tool call like any other (`tool_calls`, `finish_reason: tool_calls`, streamed or not), so the client can answer it with its own unknown-tool error; the name must be an identifier (1-128 ASCII letters, digits, `_`, `-`, `.` or `:`, starting with a letter or `_`), the call arrives when the reply ends with it rather than as it is written (so prose after it keeps it prose), and the arguments are strings, having no schema. The rules that tell a call from prose about one are unchanged. `./gr8 glm53 up` passes `UNDECLARED_TOOL_CALLS` when it is `emit`. |
 | `--log-level` | `INFO` | |
 
@@ -114,6 +118,63 @@ mock engine with S2's reuse rule, TP=4's cold prefill rate (1,374 tokens/s) and 
 
 The front end logs each continuation's cached tokens (`thinking budget: the continuation took N of its M prompt
 tokens from the cache`).
+
+## Soft thinking budget (`--default-think-end-boost`)
+
+A reply that spends its whole `max_tokens` thinking never answers. On the TP=1 Flash recipe the greedy log-report task
+failed 5 of 5 that way, re-listing log lines until the cap. A `thinking_budget` cuts mid-thought. The boost instead
+raises the `</think>` logit a little more with every thinking token, so the model ends its reasoning where it was
+closest to ending anyway. The spec is `start=S,per1k=P,max=M`: inside the think block, at the reply's n-th thinking
+token, `</think>` gains min(M, P x (n - S) / 1000) logits once n is past S, before temperature and top-p. S is a token
+count or a fraction of the request's `max_tokens` written `0.5x` (resolved per request: the request's `max_tokens`,
+else the server default, else the room the context leaves); P is logits per thousand tokens past S; M the cap (0 to
+20). P or M 0 = off. A request's `think_end_boost` (the same string, `"off"` or `false`) wins over the server default.
+The engine counts the drafts before a verify row, so the boost is exact at any draft length. A drafted `</think>` takes
+it off the rows after it, and the committed one ends it. A `thinking_budget` stays the hard backstop. After its close the
+continuation has no open block, so no boost. Drafts are not boosted: around the close, where the boost flips the
+argmax to `</think>`, the drafter's continuation is rejected and that round commits one token. Elsewhere the ramp (2
+logits per thousand tokens) rarely changes the argmax, so the cost is a few short rounds near the close. The first
+recipe value: `start=0.5x,per1k=2,max=10`.
+
+## Sequence penalty (`--default-sequence-penalty`)
+
+On greedy log-report every failed reply read one log file and transcribed it into its thinking line by line. In one
+reply 274 of 362 log-format lines were verbatim copies of the tool result, and with a hard `thinking_budget` the
+transcription moved into the visible answer after the close. The presence penalty barely touches that (every line has
+a new timestamp, and the prompt is not counted). The sequence penalty is DRY's form, prompt-aware: when the reply's
+last tokens repeat an earlier run of L >= `min` tokens verbatim, the token that continued that run loses min(`cap`,
+`mult` x `base`^(L - `min`)) before temperature and top-p, so a copy gets harder to extend the longer it runs while
+short repeats stay free. The spec is `thinking=M:B:N:C,answer=M:B:N:C,guard=M:B:N:C` (mult:base:min:cap), any of the
+scopes, each off by default. M or C 0 = off. `thinking` applies inside the think block and `answer` outside it, both
+against the whole context (prompt, tool results, reply so far); give `answer` a longer `min`, so a timestamp or an
+error code quoted in the report stays free while a run of whole copied lines is penalized. `guard` applies only in the
+repeated-tool-call guard's retry run, against the token sequence of the call it took back: a confident loop that
+resamples the same call at 0.7 (46 retries and 22 give-ups in one run) is pushed off that sequence from its first
+tokens. A request's `sequence_penalty` (the same string, `"off"` or `false`) wins over the server default. The engine
+finds the longest earlier occurrence on the host before each step (a bigram index over the request, the drafts before a
+verify row included, so it is exact at any draft length; a drafted `</think>` moves the rows after it from the
+thinking scope to the answer scope). Drafters are not penalized. A starting value:
+`thinking=0.8:1.75:4:6,answer=1:1.75:12:6,guard=1:2:1:8`.
+
+## Repeated tool calls (`--tool-repeat-guard`)
+
+An agent loop can make the model repeat one tool call turn after turn: at temperature 0 the same 35-token reply with
+the same call came 26 turns in a row, and at temperature 1.0 `run_tests({})` three times with the identical result. With
+the guard on, a chat reply whose tool calls equal the previous assistant turn's (name plus arguments as canonical JSON,
+the set of them when a turn has several) is taken back when that same set already ended the conversation
+`--tool-repeat-guard-repeats` turns in a row with identical tool results (the `tool` messages' content). A changed
+result or another call in between resets the count, so running the tests again after an edit is never blocked.
+
+The reply is cut back to just before the call block's `<tool_call>` and continued in a new engine run, the way a
+thinking budget continues after its close: temperature max(the request's, `--tool-repeat-guard-temperature`), top_p
+min(the request's, 0.95), a request seed moved by the attempt number. Text the client already received is never
+regenerated: while the guard is armed a call whose name is one of the previous turn's never streams live but is held
+until the reply ends, where the guard reads it first (other calls stream as always). After
+`--tool-repeat-guard-retries` resamples the call goes out as sampled, so the guard cannot loop. A request's
+`tool_repeat_guard: true|false` wins over the server default. A forced `tool_choice` is never guarded. GLM only: the
+DSML parser ends the reply at a call's closer and streams it, so it has nothing held to take back. One log line per
+resample names the call and the attempt; `/metrics` counts `gr8:tool_repeat_retries_total` and
+`gr8:tool_repeat_given_up_total`.
 
 ## Per-request step counters (`return_step_stats`)
 
@@ -234,7 +295,7 @@ weights in `tests/api_responses.toml`.
 `g6s2shim.py` is the engine-side shim for `g6m4 --serve DIR`, on the head: it listens on the PROTOCOL.md socket, and up to `--s2-sessions` requests decode in one step. Stdlib only. The engine side of the file protocol is `engine/runtime/s2/{ingress.h,sessions.h,service.h,scheduler.h}`; the shim docstring has the summary:
 
 - The engine writes `DIR/ready.s2` (`G6S2 3 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows> <max_lp>`) when every rank has booted. Version 1 (no `<max_lp>`) has no logprobs, version 2 no insert rule: the shim's hello says `"insert": true` from version 3, and refuses `insert` before it. The shim sends `hello` only after that, with `max_model_len = pool_rows / capacity_slots - guard` (lower it with `--max-model-len`). `capacity_slots` is 1 for the shared GLM pool; the DS41 launcher passes its `SESS` because each session has a fixed `CAP` slab. `DIR/status.s2` (queue, free pages, the pages sessions hold and could grow to) goes into the `metrics` frame as an extra `s2` field.
-- A request is written as `req.<id>` (two lines: `n_gen .. temp .. seed .. min .. stop .. top_p .. [lp <k>] [plp <k>] [ins <after>:<unless or -1>:<ids>]`, then the prompt ids) to the head's DIR, then `cmd.<k>` = `ADMIT <epoch> <id> <fnv1a64 of the req bytes>`. Ids increase; command numbers have no gap. The head engine sends each request's bytes to the other ranks with its ADMIT, over the control links, so the shim needs no access to them. The engine queues a request FIFO until a session slot and a KV run are free.
+- A request is written as `req.<id>` (two lines: `n_gen .. temp .. seed .. min .. stop .. top_p .. [pen <presence> <frequency> <thinking presence> <thinking frequency> <think_end or -1>] [lp <k>] [plp <k>] [ins <after>:<unless or -1>:<ids>]`, then the prompt ids) to the head's DIR, then `cmd.<k>` = `ADMIT <epoch> <id> <fnv1a64 of the req bytes>`. Ids increase; command numbers have no gap. The head engine sends each request's bytes to the other ranks with its ADMIT, over the control links, so the shim needs no access to them. The engine queues a request FIFO until a session slot and a KV run are free.
 - Rank 0 answers in `resp.<id>`: `a` (admitted), `p` (prompt logprobs, before the first `t`), `l` (one per token of the next `t` line, requests with `lp`; both in `engine/runtime/serve.h`), `f <rows>` (prompt rows prefilled so far, after each prefill quantum: life for the stall timeout, no text), `t <ids>` (tokens frame), `m <rounds> <drafts> <accepted> <per-position>` (spec counters, summed into `metrics`), `end <reason> <stop_id> <n>` (finish frame).
 - `cancel` (and a closed front-end connection) is a real `CANCEL <epoch> <id> 0`: a queued request ends `abort` with 0 tokens, a resident one frees its slot and KV run at once. The other sessions do not notice. The same CANCEL goes out when the shim gives up on a request itself (engine silent past `--stall-timeout`, an unreadable or unusable resp file): the client gets its `error` finish at once, and the shim keeps tracking the request until the engine's `end` line (or `--cancel-timeout`), so its slot and pages are known to be free. A CANCEL lands at the second event boundary after the head reads it (`NOTICE_MIN` = 2, `engine/runtime/s2/scheduler.h`): during a long prefill each quantum is a boundary, so the request runs at most about two more quanta. One boundary would race the quantum in flight, whose end no rank can know in advance, so it stays at two.
 - Rank 0 answers in `resp.<id>`: `a` (admitted), `p` (prompt logprobs, before the first `t`), `l` (one per token of the next `t` line, requests with `lp`; both in `engine/runtime/serve.h`), `t <ids>` (tokens frame), `m <rounds> <drafts> <accepted> <per-position>` (spec counters, summed into `metrics` and sent with the request's `finish` frame), `end <reason> <stop_id> <n>` (finish frame).
@@ -283,7 +344,7 @@ URL=http://127.0.0.1:8100 SUP_PORT=8198 python3 -m unittest tests.test_api   # f
 
 ## Deviations from vLLM
 
-- These return 400: `n>1`, batched prompts, `echo`, `suffix`, presence/frequency/repetition penalties, a custom `chat_template`, a `response_format` type other than text, `json_object` and `json_schema`, a schema the grammar compiler cannot take, and a request to turn thinking off without `--allow-thinking-off` (above).
+- These return 400: `n>1`, batched prompts, `echo`, `suffix`, `repetition_penalty` other than 1 (`presence_penalty` and `frequency_penalty` work, above), a custom `chat_template`, a `response_format` type other than text, `json_object` and `json_schema`, a schema the grammar compiler cannot take, and a request to turn thinking off without `--allow-thinking-off` (above).
 - A tool call streams as it is written when it sits in the answer outside a code fence and either starts the answer or
   follows text with no space between (the chat template writes a call straight after the content): its name goes out
   once read, string arguments as they arrive, other arguments once each value ends. Any other call (after a space or a
