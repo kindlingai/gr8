@@ -434,8 +434,8 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
 #endif
         }
     }
-    for (const G6AttnBinding* c : s->cbv)
-        if (!c) die("s2: CP and non-CP layers in one model");
+    for (size_t i = 0; i < s->cbv.size(); ++i)   // (Flash: a KDA layer has no binding, so no view)
+        if (!s->cbv[i] && m.layers[i].ab.storage) die("s2: CP and non-CP layers in one model");
     if (s->batch)
     {
         s->rowcells = dmalloc<G6AttnRow>((size_t)m.nl * MX);
