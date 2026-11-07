@@ -34,8 +34,10 @@ constexpr int TAIL_MAX = 4096;   // the largest GR8_DS_PREFILL_W (ds41_prefill_r
 inline bool tail_valid(int tail) { return tail == TAIL_OFF || (tail >= geom::WINDOW && tail <= TAIL_MAX); }
 // GR8_DS_PF_L20_TAIL: the host switch the boot sets once (g6m4.cu, m4sim.cu) and tests set directly. false = the boundary at LATE_LAYER_START.
 inline bool& l20_tail() { static bool on = false; return on; }
-// the first layer id of range B: 21, or 20 with GR8_DS_PF_L20_TAIL=1
-inline int late_layer_start() { return l20_tail() ? geom::CAND_SOURCE : geom::LATE_LAYER_START; }
+// the first layer id of range B: 21, or 20 with GR8_DS_PF_L20_TAIL=1. The bool forms are for the fabric plan
+// (fabric_plan.h), which runs before the boot sets l20_tail().
+inline int late_layer_start(bool l20) { return l20 ? geom::CAND_SOURCE : geom::LATE_LAYER_START; }
+inline int late_layer_start() { return late_layer_start(l20_tail()); }
 static_assert(geom::CAND_SOURCE + 1 == geom::LATE_LAYER_START, "L1 moves the boundary one layer: layer 20 is the last kv source and the candidate source");
 // GR8_DS_PF_TAIL: -1 = not a valid value (the caller dies with tail_error())
 inline int parse_tail(const char* v)
@@ -46,22 +48,24 @@ inline int parse_tail(const char* v)
     if (*end || t < 0 || t > TAIL_MAX || !tail_valid((int)t)) return -1;
     return (int)t;
 }
-inline std::string tail_error(const char* v)
+inline std::string tail_error(const char* v, bool l20)
 {
     return std::string("GR8_DS_PF_TAIL=") + (v ? v : "") + ": must be 0 (bounded replay off) or " + std::to_string(geom::WINDOW) + ".." +
-           std::to_string(TAIL_MAX) + " (rows of each prefill chunk that run the layers >= " + std::to_string(late_layer_start()) + ")";
+           std::to_string(TAIL_MAX) + " (rows of each prefill chunk that run the layers >= " + std::to_string(late_layer_start(l20)) + ")";
 }
+inline std::string tail_error(const char* v) { return tail_error(v, l20_tail()); }
 // rows of range B for a chunk of `rows` rows
 inline int late_rows(int rows, int tail) { return tail == TAIL_OFF || tail >= rows ? rows : tail; }
 // rows range B leaves out (the compaction shift): 0 = no compaction
 inline int shift_rows(int rows, int tail) { return rows - late_rows(rows, tail); }
 // first position i in Model::layers with ids[i] >= late_layer_start(), -1 when there is none or it is position 0 (nothing to run full-row)
-inline int late_start(const std::vector<int>& ids)
+inline int late_start(const std::vector<int>& ids, bool l20)
 {
     for (int i = 0; i < (int)ids.size(); ++i)
-        if (ids[i] >= late_layer_start()) return i > 0 ? i : -1;
+        if (ids[i] >= late_layer_start(l20)) return i > 0 ? i : -1;
     return -1;
 }
+inline int late_start(const std::vector<int>& ids) { return late_start(ids, l20_tail()); }
 // A non-final chunk's window floor for range B: positions below it were not written to the layers' rings this chunk and are masked
 // (attention core). 0 = no floor (no compaction).
 inline int win_floor(int context, int rows, int tail) { return shift_rows(rows, tail) ? context - late_rows(rows, tail) : 0; }

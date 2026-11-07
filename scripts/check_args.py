@@ -3,6 +3,8 @@
 
     scripts/check_args.py cases > engine/runtime/s2/tests/options_cases.txt
     scripts/check_args.py run --model glm53|glm53f|ds41 --bin BIN [--nr 4] [--lib DIR] [--cases FILE] --out FILE
+    scripts/check_args.py fabric-cases > FILE
+    scripts/check_args.py run --fabric-dump --model ... --cases FILE --out FILE
 
 `cases` writes one line per case: MODEL, NAME, ENV and ARGS, tab separated (ENV and ARGS space separated); MODEL@NR
 limits a case to builds of that width. The lists come from tools/launch/options.py engine_plan, run as the supervisor
@@ -16,6 +18,10 @@ engine/runtime/s2/tests/options_vectors_test.cpp parses the same cases without C
 case's exit code, stdout and stderr to FILE. The lib folder beside BIN, then each --lib (bin/lib holds a build's cuBLAS
 for every model), is the library path. --check-args stops before any CUDA work, so it runs anywhere the binary runs.
 Two transcripts (an old and a new build) compare with diff.
+
+`fabric-cases` writes the launcher's lists, then each with one edit from FABRIC_EDITS: the options and knobs the
+fabric bring-up reads. `run --fabric-dump` starts BIN with GR8_FABRIC_DUMP=1 and no --check-args: the engine prints
+every fabric's config and exits before the first (R6c compared the inline bring-up and fabric_plan.h this way).
 
 R6a's comparison: before R6a only DS41 took --check-args. check_args_base.patch adds it to GLM and Flash at R6a's exit
 point (DS41 keeps its own), for the comparison only. Apply it to a checkout of the base commit (74d62d56, `git apply
@@ -338,6 +344,73 @@ def cases():
     return out
 
 
+# ---- fabric edits: the options and knobs the fabric bring-up reads, applied to every launcher list of a model
+IPS2 = {m: arg_del(IPS2_FLAG[m]) for m in MODELS}
+ROW_SHARD = env_set('GR8_DS_PREFILL_W=4096', 'GR8_DS_PF_TAIL=128', 'GR8_DS_PF_RS=1', 'GR8_DS_MHC_FUSE=1', 'GR8_DS_MHC_ROW_SHARD=1')
+FABRIC_EDITS = [
+    (ALL, 'proxy-none', arg_del('--proxy-cpu')),
+    (ALL, 'proxy-0', arg_set('--proxy-cpu', '0')),
+    (ALL, 'proxy-6', arg_set('--proxy-cpu', '6')),
+    (ALL, 'proxy-9', arg_set('--proxy-cpu', '9')),
+    (ALL, 'proxy-13', arg_set('--proxy-cpu', '13')),
+    (ALL, 'rank-2', arg_set('--rank', '2')),
+    (ALL, 'ring', chain(arg_add('--ring'), arg_del('--ips2'), arg_del('--pf-ips2'))),
+    (ALL, 'no-ips2', chain(arg_del('--ips2'), arg_del('--pf-ips2'))),
+    (ALL, 'xtrace-pf', env_set('GR8_XTRACE_PF=1')),
+    (ALL, 'cp-on', env_set('GR8_CP=1')),
+    (ALL, 'cp-off', env_set('GR8_CP=0')),
+    (ALL, 'cp-r', env_set('GR8_CP=1', 'GR8_CP_R=65536', 'GR8_CP_MMAX=512')),
+    (ALL, 'cp-step', env_set('GR8_CP=1', 'GR8_CP_STEP_ROWS=24')),
+    (GF, 'stripe-0', env_set('GR8_PF_STRIPE=0')),
+    (GF, 'stripe-1', env_set('GR8_PF_STRIPE=1', 'GR8_PF_STRIPE_MIN=65536')),
+    (GF, 'pf-rs', env_set('GR8_PF_RS=1')),
+    (GF, 'pf-rs-0', env_set('GR8_PF_RS=0')),
+    (GF, 'lanes1', arg_set('--pf-lanes', '1')),
+    (GF, 'prefill-8192', arg_set('--prefill', '8192')),
+    (GF, 'mtp0', arg_set('--mtp', '0')),
+    (GF, 'mtp3', arg_set('--mtp', '3')),
+    (GF, 'dflash-off', arg_del_prefix('--dflash-')),
+    (G, 'pf-ips2', chain(arg_del('--ips2'), arg_add('--pf-ips2', '@IPS2'))),
+    (G, 'qa-split-cpu', env_set('GR8_QA_SPLIT_CPU=7')),
+    (G, 'qa-split-off', env_set('GR8_QA_SPLIT=0', 'GR8_IDXQ_SPLIT=0', 'GR8_MTP_SPLIT=0')),
+    (G, 'qp-roll-3', env_set('GR8_PF_QP_ROLL=3', 'GR8_PF_QP_WIRE_E=2')),
+    (G, 'qp-roll-off', env_del('GR8_PF_QP_ROLL')),
+    (F, 'pf-sp-0', env_set('GR8_GLM53F_PF_SP=0')),
+    (F, 'router-split', env_set('GR8_PF_ROUTER_SPLIT=1')),
+    (F, 'pool-owner-auto', env_del('GR8_GLM53F_PF_POOL_OWNER')),
+    (D, 'w2048', env_set('GR8_DS_PREFILL_W=2048')),
+    (D, 'w-unset', env_del('GR8_DS_PREFILL_W', 'GR8_DS_PF_LANES', 'GR8_DS_PF_RS', 'GR8_DS_PF_DIRECT', 'GR8_DS_PF_POOL')),
+    (D, 'tail-256', env_set('GR8_DS_PF_TAIL=256')),
+    (D, 'l20-tail', env_set('GR8_DS_PF_L20_TAIL=1')),
+    (D, 'row-shard', ROW_SHARD),
+    (D, 'row-shard-y8', chain(ROW_SHARD, env_set('GR8_DS_MHC_Y_MXFP8=1'))),
+    (D, 'pool-0', env_set('GR8_DS_PF_POOL=0')),
+    (D, 'pool-2', env_set('GR8_DS_PF_POOL=2')),
+    (D, 'lanes-1', env_set('GR8_DS_PF_LANES=1')),
+    (D, 'rs-0', env_set('GR8_DS_PF_RS=0')),
+    (D, 'direct-0', env_set('GR8_DS_PF_DIRECT=0')),
+    (D, 'c8pack', env_set('GR8_DS_C8PACK=1')),
+    (D, 'engram', env_set('GR8_DS_ENGRAM=1')),
+    (D, 'stripe', env_set('GR8_DS_STRIPE=1')),
+    (D, 'ds-xtrace', env_set('GR8_DS_XTRACE=1')),
+    (D, 'dspark-off', env_set('GR8_DS_MTP=0')),
+    (D, 'dspark-2', env_set('GR8_DS_MTP=2')),
+]
+
+
+def fabric_cases():
+    out = []
+    for model in MODELS:
+        lists = [(name, *p) for name, flags in VARIANTS[model] for p in [plan(model, flags)] if p]
+        for name, env, args in lists:
+            out.append((model, name, env, args))
+            for models, edit_name, edit in FABRIC_EDITS:
+                if model in models:
+                    e, a = edit(env, args)
+                    out.append((model, f'{name}+{edit_name}', e, a))
+    return out
+
+
 def expand(args, nr):
     sub = {'@IPS': ','.join(f'10.0.0.{i + 1}' for i in range(nr)), '@IPS2': ','.join(f'10.1.0.{i + 1}' for i in range(nr)),
            '@EMPTY': ''}
@@ -367,8 +440,11 @@ def run(a):
             if libs:
                 e['LD_LIBRARY_PATH'] = ':'.join(os.path.abspath(d) for d in libs)
             e.update(x.split('=', 1) for x in env)
-            r = subprocess.run([bin_, '--check-args'] + expand(args, a.nr), env=e, cwd=cwd, capture_output=True,
-                               text=True, timeout=60)
+            if a.fabric_dump:
+                e['GR8_FABRIC_DUMP'] = '1'
+            first = [] if a.fabric_dump else ['--check-args']
+            r = subprocess.run([bin_] + first + expand(args, a.nr), env=e, cwd=cwd, capture_output=True, text=True,
+                               timeout=60)
             out.write(f'== {name}\nrc {r.returncode}\n')
             out.writelines(f'! {x}\n' for x in r.stderr.splitlines())
             out.writelines(f'> {x}\n' for x in r.stdout.splitlines())
@@ -378,6 +454,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='cmd', required=True)
     sub.add_parser('cases')
+    sub.add_parser('fabric-cases')
     r = sub.add_parser('run')
     r.add_argument('--model', choices=MODELS, required=True)
     r.add_argument('--bin', required=True)
@@ -385,10 +462,11 @@ def main():
     r.add_argument('--lib', action='append', default=[])
     r.add_argument('--cases', default=os.path.join(REPO, 'engine', 'runtime', 's2', 'tests', 'options_cases.txt'))
     r.add_argument('--out', required=True)
+    r.add_argument('--fabric-dump', action='store_true')
     a = p.parse_args()
-    if a.cmd == 'cases':
-        print('# scripts/check_args.py cases: MODEL, NAME, ENV, ARGS (tab separated); @IPS, @IPS2, @EMPTY are filled in')
-        for model, name, env, args in cases():
+    if a.cmd in ('cases', 'fabric-cases'):
+        print(f'# scripts/check_args.py {a.cmd}: MODEL, NAME, ENV, ARGS (tab separated); @IPS, @IPS2, @EMPTY are filled in')
+        for model, name, env, args in (cases() if a.cmd == 'cases' else fabric_cases()):
             print(f'{model}\t{name}\t{" ".join(env)}\t{" ".join(args)}')
     else:
         run(a)

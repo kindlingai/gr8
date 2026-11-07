@@ -348,6 +348,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_DS_SUBDUMP` | path | off |  | Debug: a directory where each step's sub-layer partials are written. |
 | `GR8_DS_XTRACE` | flag | `0` | 0\|1 | With GR8_XTRACE=1 and DSpark, also trace the DSpark draft fabric. |
 | `GR8_FABRIC_CONNECT_TRIES` | int | `1200` |  | Fabric TCP connect attempts, 100 ms apart. Raise it when ranks load at different speeds. |
+| `GR8_FABRIC_DUMP` | flag | `0` |  | 1 = g6m4 prints every fabric's config (one line each, every field) where it would create it, then exits with code 4 before the first: no file, fabric, network or GPU work. The fabrics the built model completes show what the options set. Compares the fabric bring-up of two builds (docs/HOST-CORE.md, R6c). |
 | `GR8_GEN_CACHE` | path | no cache: every boot computes the loader's generated tensors |  | A directory where the Rust loader keeps the tensors it computes at load (Op::Gen), read back on the next boot instead of computed. The key binds the engine binary and the planned image, so a rebuild or another plan is a miss; every read is checked (key, size, xxh64), and any miss or error computes as before. The first boot writes them. |
 | `GR8_GLM53F_DRAFT_CACHE_DUMP` | path | unset |  | Flash with --mtp: each rank writes its draft cache pages before the first live draft to this path plus .s<seq>.r<rank>.bin. |
 | `GR8_GLM53F_KDA_STATE_DUMP` | path | unset |  | After each offline sequence, each rank writes the KDA S state and conv state of every layer to PATH.rank<R>. |
