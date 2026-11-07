@@ -1,11 +1,11 @@
 // g6m4's option parse (engine_options.h) over the cases scripts/check_args.py writes (options_cases.txt): the launcher's
-// argument lists per model and variant, and one mutation per refusal. The knob table is read once a process, so each
-// case runs in a child with its environment alone, as g6m4's main runs it: knob::init, then the parse. The child's exit
-// code, its stderr and either the refusal or describe() make the case's transcript; each shape's hash must equal the
-// recorded one. Recorded from the parse as R6a moved it out of main; scripts/check_args.py shows the old and new engines
-// give the same --check-args transcripts. Rerecord only for a change meant to alter a check, and say so in the commit.
+// argument lists per model and variant, and one mutation per refusal (a MODEL@NR case runs only at that width). The
+// knob table is read once a process, so each case runs in a child with its environment alone, as g6m4's main runs it:
+// knob::init, then the parse. The child's exit code, its stderr and either the refusal or describe() make the case's
+// transcript; each shape's hash must equal the recorded one. Rerecord only for a change meant to alter a check, and say
+// so in the commit. scripts/check_options_coverage.py reads the --dump of every shape and checks each refusal is reached.
 //   options_vectors_test CASES [--dump]   --dump prints every case's transcript
-// Host only.
+// Host only, Linux only (clearenv; scripts/host_tests.sh runs it there).
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -44,7 +44,7 @@ std::vector<Case> read_cases(const char* path, const char* model)
         if (t3 == std::string::npos) { fprintf(stderr, "bad case line: %s\n", line.c_str()); exit(2); }
         Case c{line.substr(0, t1), line.substr(t1 + 1, t2 - t1 - 1), words(line.substr(t2 + 1, t3 - t2 - 1)),
                words(line.substr(t3 + 1))};
-        if (c.model == model) v.push_back(c);
+        if (c.model == model || c.model == std::string(model) + "@" + std::to_string(g6nr::NR)) v.push_back(c);
     }
     return v;
 }
@@ -120,10 +120,10 @@ int main(int argc, char** argv)
     const std::string shape = std::string(model) + " nr" + std::to_string(g6nr::NR) + " mx" + std::to_string(g6mx::MX);
     struct Want { const char* shape; size_t n; uint64_t hash; };
     const Want wants[] = {
-        {"glm53 nr6 mx8", 119, 0xd216ec4c27da726cull},
-        {"glm53 nr4 mx32", 119, 0x7332b17e3fdb6d10ull},
-        {"glm53f nr4 mx32", 115, 0x7c178750f48261b0ull},
-        {"ds41 nr4 mx48", 114, 0x4e275f9e4043dfe4ull},
+        {"glm53 nr6 mx8", 121, 0xfdeec43d855c05b1ull},
+        {"glm53 nr4 mx32", 121, 0x57e0759ff4e7392cull},
+        {"glm53f nr4 mx32", 116, 0x3e8aa3240185ddddull},
+        {"ds41 nr4 mx48", 115, 0xca182dc088257d58ull},
     };
     const std::vector<Case> cs = read_cases(argv[1], model);
     uint64_t h = 14695981039346656037ull;

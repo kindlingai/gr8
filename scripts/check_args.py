@@ -4,9 +4,10 @@
     scripts/check_args.py cases > engine/runtime/s2/tests/options_cases.txt
     scripts/check_args.py run --model glm53|glm53f|ds41 --bin BIN [--nr 4] [--lib DIR] [--cases FILE] --out FILE
 
-`cases` writes one line per case: MODEL, NAME, ENV and ARGS, tab separated (ENV and ARGS space separated). The lists
-come from tools/launch/options.py engine_plan, run as the supervisor runs it for rank 0, with fixture paths for every
-file (the checks open none of them), for each model and launcher variant. Then one mutation of a model's default list
+`cases` writes one line per case: MODEL, NAME, ENV and ARGS, tab separated (ENV and ARGS space separated); MODEL@NR
+limits a case to builds of that width. The lists come from tools/launch/options.py engine_plan, run as the supervisor
+runs it for rank 0, with fixture paths for every file (the checks open none of them), for each model and launcher
+variant. Then one mutation of a model's default list
 per refusal in engine/runtime/engine_options.h, and a few the engine makes after the parse (steering, grammar).
 In ARGS, @IPS and @IPS2 stand for the build's NR rail addresses and @EMPTY for an empty argument.
 engine/runtime/s2/tests/options_vectors_test.cpp parses the same cases without CUDA.
@@ -207,6 +208,7 @@ MUTATIONS = [
     (ALL, 'test-knob', env_set('GR8_TEST_S2_RUNS=0:4')),
     (ALL, 'rt-store-offline', chain(OFFLINE, env_set('GR8_RT_STORE=mem:'))),
     (ALL, 'rt-poison', env_set('GR8_TEST_RT_POISON=1')),
+    (ALL, 'rt-poison-offline', chain(OFFLINE, env_del('GR8_DS_MTP'), env_set('GR8_TEST_RT_POISON=1'))),
     (ALL, 'rt-local-no-store', env_set('GR8_RT_LOCAL=4')),
     (ALL, 'rt-place-no-local', env_set('GR8_RT_PLACE=8')),
     (ALL, 'rt-local-l', env_set('GR8_RT_STORE=mem:', 'GR8_RT_LOCAL=4', 'GR8_RT_L=1024')),
@@ -296,6 +298,7 @@ MUTATIONS = [
     (G, 'qp-roll-wire-e', env_set('GR8_PF_QP_WIRE_E=99')),
     (G, 'own4-no-roll', env_set('GR8_PF_QP_ROLL=0')),
     (G, 'own4-packs', chain(env_set('GR8_PF_QP_ROLL=0'), arg_add('--qp-manifest', FX + '/qp.json', '--qp-pack', FX + '/qp.pack'))),
+    (G, 'own4-tp6', env_set('GR8_PF_OWN=4', 'GR8_PF_QP_ROLL=2', 'GR8_PF_QP_CTX=65536')),
     (ALL, 'qp-no-own4', chain(env_set('GR8_PF_OWN=2', 'GR8_PF_QP_ROLL=0'), arg_add('--qp-manifest', FX + '/qp.json'))),
     (F + D, 'qp-roll', env_set('GR8_PF_QP_ROLL=2', 'GR8_PF_QP_CTX=65536')),
     # after the parse, in main: the steering profile and the grammar are files
@@ -317,10 +320,16 @@ def cases():
             if p:
                 out.append((model, name, *p))
         base[model] = plan(model, [])
+    # GLM's default list carries GR8_PF_OWN=4, which a TP6 build refuses before most checks: the TP6 shape's mutations
+    # start from it with GR8_PF_OWN=3 (TP6's own) and no pair-owner knobs
+    env, args = base['glm53']
+    base['glm53@4'] = base['glm53']
+    base['glm53@6'] = ([e for e in env if not e.startswith(('GR8_PF_OWN=', 'GR8_PF_QP_'))] + ['GR8_PF_OWN=3'], args)
     for models, name, edit in MUTATIONS:
         for model in models:
-            env, args = edit(*base[model])
-            out.append((model, 'mut-' + name, env, args))
+            for tag in ('glm53@4', 'glm53@6') if model == 'glm53' else (model,):
+                env, args = edit(*base[tag])
+                out.append((tag, 'mut-' + name, env, args))
     return out
 
 
@@ -346,7 +355,7 @@ def run(a):
     lib = os.path.join(os.path.dirname(bin_), 'lib')
     with open(a.out, 'w') as out, tempfile.TemporaryDirectory() as cwd:
         for model, name, env, args in read_cases(a.cases):
-            if model != a.model:
+            if model not in (a.model, f'{a.model}@{a.nr}'):
                 continue
             e = {'PATH': '/usr/bin:/bin'}
             libs = [d for d in [lib] + a.lib if os.path.isdir(d)]

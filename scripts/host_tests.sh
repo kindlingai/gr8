@@ -247,11 +247,15 @@ for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 
   "$T/admit_vectors_test"
 done
 # g6m4's option parse (engine_options.h) over the launcher's lists and one mutation per refusal (scripts/check_args.py
-# writes the cases), in each model's shape and GLM's serving one
+# writes the cases), in each model's shape and GLM's serving one; then every refusal reached in some shape
+i=0
 for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
   g++ -std=c++17 -O2 -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/options_vectors_test.cpp" -o "$T/options_vectors_test" "${KVLIB[@]}"
-  "$T/options_vectors_test" "$REPO/engine/runtime/s2/tests/options_cases.txt"
+  "$T/options_vectors_test" "$REPO/engine/runtime/s2/tests/options_cases.txt" --dump > "$T/options_$i.txt" || { tail -1 "$T/options_$i.txt"; exit 1; }
+  tail -1 "$T/options_$i.txt"
+  i=$((i + 1))
 done
+python3 "$REPO/scripts/check_options_coverage.py" "$REPO/engine/runtime/engine_options.h" "$T"/options_*.txt
 # the S2 runtime signatures over a seeded sweep of their inputs, against transcripts of g6m4.cu's builders
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/signature_vectors_test.cpp" -o "$T/signature_vectors_test"
 "$T/signature_vectors_test"
