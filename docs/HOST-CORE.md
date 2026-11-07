@@ -559,7 +559,8 @@ Checked on Linux (GCC 12, x86_64). `module_calls_test` logs the service's plain 
 hides the real one's methods, so production has no hook for it. Its hashes were recorded from the service before the
 change (51569016) and hold after it, in every shape, with the pool policy as std::functions and as a table. The 13,731
 round logs the host tests write are byte-identical before and after. `scripts/host_tests.sh` and `cargo test --release
---workspace` pass. The GLM, Flash and DS41 engines build on a GB10. Boot pending.
+--workspace` pass. The GLM, Flash and DS41 engines build on a GB10. Boot: TP4 GLM, the freeze then R5b2a, the round
+logs byte-identical on all four ranks and the 24 T=0 replies matching.
 
 ### R6. Options, signatures and the fabric plan to Rust
 
