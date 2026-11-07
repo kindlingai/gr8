@@ -504,8 +504,9 @@ step, and the step waits for its notice in the head's trace. Its transcripts mat
 2ecb4b43 in every shape, as std::function hooks and as a table, under clang and GCC 15, and its round logs equal the
 old build's. The 10,936 round logs the driver, scheduler, service and DS41 host tests write in the three shapes are
 byte-identical to the build before. The control, hold, drain, steering, image, grammar, pool and Flash checkpoint tests
-pass unchanged. The CUDA files are not compiled here: a script compared every moved body with its lambda. Linux not
-run (d800 and a6e2 were booked). Boot pending.
+pass unchanged. The CUDA files are not compiled here: a script compared every moved body with its lambda. Linux:
+`scripts/host_tests.sh` passes, and GLM, Flash and DS41 build. Boot: TP4 GLM on the stock pool, main then R5c, the
+round logs byte-identical on all four ranks and the 24 T=0 replies matching.
 
 ### R6. Options, signatures and the fabric plan to Rust
 
