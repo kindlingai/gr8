@@ -133,6 +133,7 @@ bool ds41_c2_trace_on();
 #include "s2/flash_checkpoint.h"   // GR8_GLM53F_CACHE parsed in every build, refused outside Flash
 #include "s2/flash_dfl_window.h"   // the Flash serve's DFlash2 prompt context (with GR8_GLM53F_CACHE hits)
 #include "s2/cp_rows.h"
+#include "s2/signature.h"
 #include "s2/pool.h"
 #include "s2/kv_tier.cuh"
 #include "rt_rows.cuh"
@@ -1566,15 +1567,13 @@ int main(int argc, char** argv)
         bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = cfg.ips[0];
         bc.directory = s2dir; bc.port = s2port;
         bc.timeout = (unsigned)knob::s2_timeout();
-        bc.runtime_signature = "flash solo cap " + std::to_string(cap) + " layers " + layers_s +
-            " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " mtp " + std::to_string(mtp) +
-            " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id +
-            (dfl ? " dflash k " + std::to_string(dfl_k) : std::string()) +
-            (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : std::string()) +
-            (s2sess > 1 ? " sessions " + std::to_string(s2sess) + " split " + std::to_string(gsplit) : std::string()) +
-            knob::signature();
-        // GR8_GLM53F_CACHE: the checkpoint store of this rank. Every rank must keep the same entries, so the mode, the
-        // store's blocks and the grid join the signature
+        g6s2::SigInputs sig;               // s2/signature.h
+        sig.model = g6s2::SigModel::Flash;
+        sig.cap = cap; sig.layers_s = layers_s; sig.MP = MP; sig.lanes = lanes; sig.mtp = mtp; sig.chunk = plan.chunk; sig.nc = nc;
+        sig.set_id = set_id; sig.dfl = dfl; sig.dfl_k = dfl_k; sig.dfl_reuse = dfl_reuse; sig.dfl_reuse_min = dfl_reuse_min;
+        sig.s2sess = s2sess; sig.gsplit = gsplit; sig.knobs = knob::signature();
+        // GR8_GLM53F_CACHE: the checkpoint store of this rank. Every rank must keep the same entries, so the mode and
+        // the store's blocks join the signature
         std::unique_ptr<g6s2::FlashCheckpoints> ckpt;
         if (flash_cache != g6s2::FlashCache::Off)
         {
@@ -1634,9 +1633,11 @@ int main(int argc, char** argv)
                     group ? (", group " + group->group + " lease, " + std::to_string(ckpt->segments()) + " segments to start").c_str() : "");
             // persist: every rank joins the agreement on persisted entries (serve_flash), or none does. The index itself is
             // not here: the agreement makes it the same on every rank, and the pool digest compares it at every event
-            bc.runtime_signature += std::string(" ckpt ") + g6s2::flash_cache_name(flash_cache) + " blocks " + std::to_string(ckpt->blocks()) +
-                (index_path.empty() ? "" : " persist");
+            sig.ckpt = g6s2::flash_cache_name(flash_cache);
+            sig.ckpt_blocks = ckpt->blocks();
+            sig.ckpt_persist = !index_path.empty();
         }
+        bc.runtime_signature = g6s2::runtime_signature(sig);
         // DFlash2 (--dflash-manifest): a session alone drafts with the drafter, as on GLM-5.3 (s2_batch.h Batch::dflash);
         // Dfl::pf_feat holds the prefill taps of the session whose prefill started last (s2/flash_dfl_window.h: with
         // GR8_GLM53F_CACHE, a checkpoint hit inside the window keeps the drafter through GR8_DFL_REUSE)
@@ -1831,30 +1832,17 @@ int main(int argc, char** argv)
         bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = cfg.ips[0];
         bc.directory = s2dir; bc.port = s2port;
         bc.timeout = (unsigned)knob::s2_timeout();
-        bc.runtime_signature = std::string(s2sess > 1 ? "ds41 sessions " + std::to_string(s2sess) : std::string("ds41 solo")) + " cap " + std::to_string(cap) + " layers " + layers_s + " mtp " + std::to_string(dsk.mtp) +
-            " chunk " + std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " set " + set_id +
-            (dfl ? " dflash k " + std::to_string(dfl_k) : std::string()) +
-            " shtc " + std::to_string(ds41moe::sh_tc_on() ? 1 : 0) +   // GR8_DS_SH_TC: ranks must agree (W8A8 shared expert, not bit-identical to 0)
-            (ds41moe::ro_l2hint() ? " l2h " + std::to_string(ds41moe::ro_l2hint()) : std::string()) +   // GR8_DS_MOE_L2HINT: 0 adds nothing; ranks that disagree on 1 / 2 refuse to join
-            (ds41moe::ro_fc2stg() ? std::string(" stg 1") : std::string()) +   // GR8_DS_MOE_FC2STG: 0 adds nothing; ranks that disagree refuse to join
-            (ds41moe::ro_fc1bstg() ? std::string(" fc1bstg 1") : std::string()); // off adds nothing; ranks with the staged B arm must agree
-        if (sc.c8_pack) bc.runtime_signature += " c8pack 1";
-        if (ds_sess_drafts) bc.runtime_signature += " sessdrafts 1";   // off adds nothing; ranks that disagree refuse to join
-        if (pf_lanes == 2) bc.runtime_signature += " pflanes 2";   // unset / 1 adds nothing; ranks that disagree refuse to join
-        if (ds_moe_decode_topk != ds_moe_main_topk)
-            bc.runtime_signature += " tkmain " + std::to_string(ds_moe_main_topk) +
-                                    " tkdecode " + std::to_string(ds_moe_decode_topk);
-        if (ds_idx_pipe_b) bc.runtime_signature += " idxpipeb 1";
-        if (ds_idx_q_trig) bc.runtime_signature += " idxqtrig 1";
-        if (ds_idx_pipe_qr) bc.runtime_signature += " idxpipeqr 1";
-        if (reuse_prefix) bc.runtime_signature += " reuse 1";
-        // DS41 image input: the effective capability, not the knob (a rank without the tower file boots text-only). With the
-        // tower, " vision <file id>" (header length + header bytes + file size: header/layout/size agreement, not tensor data);
-        // without, nothing. A rank that differs (no file, another header or size) refuses at bootstrap
-        bc.runtime_signature += ds41v::signature(vis_on, vis_id);
-        // the agree-scope knobs that are not at their default (knob::signature(), as Flash and GLM add): a rank whose value
-        // differs (GR8_DS_COMP_FP4 on three ranks and off on one) refuses at bootstrap instead of diverging later
-        bc.runtime_signature += knob::signature();
+        g6s2::SigInputs sig;               // s2/signature.h
+        sig.model = g6s2::SigModel::Ds41;
+        sig.s2sess = s2sess; sig.cap = cap; sig.layers_s = layers_s; sig.ds_mtp = dsk.mtp; sig.chunk = plan.chunk; sig.nc = nc;
+        sig.set_id = set_id; sig.dfl = dfl; sig.dfl_k = dfl_k;
+        sig.sh_tc = ds41moe::sh_tc_on(); sig.l2hint = ds41moe::ro_l2hint(); sig.fc2stg = ds41moe::ro_fc2stg(); sig.fc1bstg = ds41moe::ro_fc1bstg();
+        sig.c8_pack = sc.c8_pack; sig.sess_drafts = ds_sess_drafts; sig.pf_lanes = pf_lanes;
+        sig.tk_main = ds_moe_main_topk; sig.tk_decode = ds_moe_decode_topk;
+        sig.idx_pipe_b = ds_idx_pipe_b; sig.idx_q_trig = ds_idx_q_trig; sig.idx_pipe_qr = ds_idx_pipe_qr; sig.reuse = reuse_prefix;
+        sig.vis_on = vis_on; sig.vis_id = vis_id;
+        sig.knobs = knob::signature();
+        bc.runtime_signature = g6s2::runtime_signature(sig);
         // DSpark (GR8_DS_MTP): the draft Model, its fabric, the 5-row draft graph (or the eager step) and the compressor commit of the main Model
         g6s2::Ds41Dspark ds{DS, in_ds, out_ds,
             [&](const StepIn& si) {     // 11 collectives: 6 layer exchanges of the 5 block rows, then the 5 markov merges of one row each (x DS.ds_ns sessions)
@@ -3227,29 +3215,21 @@ int main(int argc, char** argv)
             bc.port = (uint16_t)s2port;
             if (g6_attn_ctx_sp() || g6_attn_posidx())   // round 10 E1 attention flags (attn.cu), read once before the bindings
                 fprintf(stderr, "# rank %d: decode attention E1: GR8_ATTN_CTX3_SP %d GR8_ATTN_POSIDX %d\n", R, g6_attn_ctx_sp(), g6_attn_posidx());
-            bc.runtime_signature = "g6m4 s2 below " + std::to_string(s2_below) + " cap " + std::to_string(cap) + " layers " + layers_s +
-                " mp " + std::to_string(MP) + " lanes " + std::to_string(two ? 2 : 1) + " mtp " + std::to_string(mtp) + " chunk " +
-                std::to_string(plan.chunk) + " cands " + std::to_string(nc) + " split 3 own " + std::to_string(pf_own) +
-                " qpctx " + std::to_string(pf_qp ? P.qp_ctx : 0) + " qpmin " + std::to_string(pf_qp ? pf_qp_min() : 0) +
-                (set_id.empty() ? "" : " set " + set_id) + (g6rt::grammar_ready() ? " grammar" : "") +
-                (dfl_reuse ? " dflreuse " + std::to_string(dfl_reuse) + "/" + std::to_string(dfl_reuse_min) : "") + s2::ngram_sig(ngram) +
-                (kstop.mode ? " kstop " + std::to_string(kstop.mode) + " kmax " + std::to_string(kstop.kmax) + " tau " + std::to_string(kstop.tau[1]) + "," +
-                              std::to_string(kstop.tau[2]) + "," + std::to_string(kstop.tau[3]) + " seed3 " + std::to_string(kstop.seed3) : "") +
-                (draft_par ? " draftpar " + std::to_string(draft_par) : "") +
-                (qs_mode ? " qasplit " + std::to_string(qs_mode) : "") +
-                (iq_split ? " idxqsplit 1" : "") + (mtp_split ? " mtpsplit 1" : "") +
-                (dhead.on ? " dheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
-                (mtp_last ? " mtplast 1" : "") + (dhead2 ? " dhead2 " + std::to_string(dhead2) : "") +
-                (dfl_i4 ? " dflheadi4 " + std::to_string(dhead.tpc) + "x" + std::to_string(dhead.ks) : "") +
-                (dfl_body_i4_on ? " dflbodyi4 1" : "") +
-                (dfl_alpha != 1.f ? " dflalpha " + std::to_string(dfl_alpha) : "") +
-                (dsel_model ? " dselmodel " + std::to_string(dsel_model) + " " + dsel_tab.str() : "") + s2::kstopb_sig(kstop.b) +
-                (cp_step ? " cpsr " + std::to_string(cp_step) + (sc.cp_seg ? " seg" : "") : "") +
-                (g6_attn_ctx_sp() ? " ctxsp " + std::to_string(g6_attn_ctx_sp()) : "") + (g6_attn_posidx() ? " posidx 1" : "") +
-                // the S2 layers carry the shared-scope MoE finalize steering; every rank must (a rank without it would
-                // leave its share of the shared-expert correction out of batched steps)
-                (steering_boot.loaded && steering_boot.scope == steering::Scope::Shared ? " s2steer 1" : "") +
-                knob::signature();
+            g6s2::SigInputs sig;           // s2/signature.h
+            sig.model = g6s2::SigModel::Glm;
+            sig.s2_below = s2_below; sig.cap = cap; sig.layers_s = layers_s; sig.MP = MP; sig.two = two; sig.mtp = mtp;
+            sig.chunk = plan.chunk; sig.nc = nc; sig.pf_own = pf_own; sig.pf_qp = pf_qp; sig.qp_ctx = P.qp_ctx; sig.qp_min = pf_qp_min();
+            sig.set_id = set_id; sig.grammar = g6rt::grammar_ready(); sig.dfl_reuse = dfl_reuse; sig.dfl_reuse_min = dfl_reuse_min;
+            sig.ngram = s2::ngram_sig(ngram);
+            sig.kstop_mode = kstop.mode; sig.kstop_kmax = kstop.kmax; std::copy(kstop.tau, kstop.tau + 4, sig.kstop_tau); sig.kstop_seed3 = kstop.seed3;
+            sig.draft_par = draft_par; sig.qs_mode = qs_mode; sig.iq_split = iq_split; sig.mtp_split = mtp_split;
+            sig.dhead_on = dhead.on; sig.dhead_tpc = dhead.tpc; sig.dhead_ks = dhead.ks; sig.mtp_last = mtp_last; sig.dhead2 = dhead2;
+            sig.dfl_i4 = dfl_i4; sig.dfl_body_i4 = dfl_body_i4_on; sig.dfl_alpha = dfl_alpha;
+            sig.dsel_model = dsel_model; sig.dsel_tab = dsel_tab.str(); sig.kstopb = s2::kstopb_sig(kstop.b);
+            sig.cp_step = cp_step; sig.cp_seg = sc.cp_seg; sig.ctx_sp = g6_attn_ctx_sp(); sig.posidx = g6_attn_posidx();
+            sig.steer_shared = steering_boot.loaded && steering_boot.scope == steering::Scope::Shared;
+            sig.knobs = knob::signature();
+            bc.runtime_signature = g6s2::runtime_signature(sig);
             fprintf(stderr, "# rank %d: s2 below R %d rows, pool %u logical / %d physical pages, %d sessions, epoch %llu, control %s:%d\n", R,
                     s2_below, sc.pool_rows / 64, place, s2sess, s2epoch, bc.head_ip.c_str(), s2port);
             g6s2::ControlLinks links = g6s2::bootstrap(bc);

@@ -1,11 +1,12 @@
-// DS41 ranks that disagree on an agree-scope knob refuse at bootstrap: the DS41 runtime signature in g6m4.cu ends with
-// knob::signature() (as Flash and GLM do), and four ranks on loopback with GR8_DS_COMP_FP4 [1,1,0,1] refuse with
+// DS41 ranks that disagree on an agree-scope knob refuse at bootstrap: the DS41 runtime signature (s2/signature.h) ends
+// with knob::signature(), which g6m4.cu passes (as for Flash and GLM), and four ranks on loopback with GR8_DS_COMP_FP4 [1,1,0,1] refuse with
 // "bootstrap config mismatch" while [1,1,1,1] and [0,0,0,0] boot. Each rank is its own process (the knob table reads
 // the environment once) with the caller's environment cleared. Host only.
 // Build: g++ -std=c++17 -O2 -pthread -I engine/runtime engine/runtime/s2/tests/ds41_agree_knobs_test.cpp
 //          engine/knobs-rs/target/release/libgr8knobs.a -ldl -lm -o /tmp/ds41_agree_knobs_test
 // Run:   /tmp/ds41_agree_knobs_test engine/runtime/g6m4.cu
 #include "s2/bootstrap.h"
+#include "s2/signature.h"
 #include "../knobs-rs/gr8_knobs.h"
 #include <cstdio>
 #include <cstdlib>
@@ -21,10 +22,10 @@ using namespace g6s2;
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); ++fails; } } while (0)
 
-// the DS41 signature block of g6m4.cu, from its first line to the serve_ds41 call that sends it, without comments
+// the DS41 signature inputs of g6m4.cu, from their first line to the serve_ds41 call that sends them, without comments
 static std::string ds41_block(const char* path) {
     std::ifstream f(path); std::stringstream ss; ss << f.rdbuf(); const std::string s = ss.str();
-    const size_t a = s.find("bc.runtime_signature = std::string(s2sess > 1 ? \"ds41 sessions ");
+    const size_t a = s.find("sig.model = g6s2::SigModel::Ds41;");
     if (a == std::string::npos) return "";
     const size_t b = s.find("g6s2::serve_ds41(dc, bc", a);
     if (b == std::string::npos) return "";
@@ -47,7 +48,9 @@ static std::string ds41_block(const char* path) {
     if (knob::init()) std::_Exit(2);
     BootstrapConfig c; c.rank = r; c.ranks = 4; c.timeout = 3; c.head_ip = "127.0.0.1"; c.port = port;
     c.directory = dir + "/r" + std::to_string(r); ::mkdir(c.directory.c_str(), 0700);
-    c.runtime_signature = "ds41 solo cap 262144 layers all mtp 0" + knob::signature();
+    SigInputs s;
+    s.model = SigModel::Ds41; s.cap = 262144; s.layers_s = "all"; s.set_id = "ab12"; s.knobs = knob::signature();
+    c.runtime_signature = runtime_signature(s);
     try { auto links = bootstrap(c); std::_Exit(0); }
     catch (const std::exception& e) {
         if (r == 0) { std::ofstream(why) << e.what(); }
@@ -78,7 +81,8 @@ int main(int argc, char** argv) {
     if (argc != 2) { std::fprintf(stderr, "usage: %s engine/runtime/g6m4.cu\n", argv[0]); return 2; }
     const std::string blk = ds41_block(argv[1]);
     CHECK(!blk.empty());
-    CHECK(blk.find("bc.runtime_signature += knob::signature();") != std::string::npos);
+    CHECK(blk.find("sig.knobs = knob::signature();") != std::string::npos);
+    CHECK(blk.find("bc.runtime_signature = g6s2::runtime_signature(sig);") != std::string::npos);
 
     char tmpl[] = "/tmp/ds41agreeXXXXXX"; const std::string dir = mkdtemp(tmpl);
     const uint16_t port = uint16_t(20000 + getpid() % 20000);
