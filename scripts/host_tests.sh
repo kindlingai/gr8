@@ -256,8 +256,9 @@ for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_M
   i=$((i + 1))
 done
 python3 "$REPO/scripts/check_options_coverage.py" "$REPO/engine/runtime/engine_options.h" "$T"/options_*.txt
-# the S2 runtime signatures over a seeded sweep of their inputs, against transcripts of g6m4.cu's builders
-g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/signature_vectors_test.cpp" -o "$T/signature_vectors_test"
+# the S2 runtime signatures (scheduler-rs signature.rs) over a seeded sweep of their inputs, against transcripts of
+# g6m4.cu's builders
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/signature_vectors_test.cpp" -o "$T/signature_vectors_test" "${KVLIB[@]}"
 "$T/signature_vectors_test"
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/control_wire_test.cpp" -o "$T/control_wire_test" "${KNOBS[@]}"
 "$T/control_wire_test" 2> >(grep -v '^g6ctl: control recv failed: ret=0 ' >&2)

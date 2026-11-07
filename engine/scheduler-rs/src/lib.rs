@@ -12,6 +12,7 @@
 pub mod admission;
 pub mod control;
 pub mod cp_rows;
+pub mod cstd;
 pub mod driver;
 pub mod ffi;
 pub mod flash_lend;
@@ -27,4 +28,5 @@ pub mod pool_ops;
 pub mod request;
 pub mod scheduler;
 pub mod service;
+pub mod signature;
 pub mod spec_len;
