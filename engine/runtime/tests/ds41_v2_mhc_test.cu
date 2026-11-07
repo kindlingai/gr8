@@ -37,7 +37,7 @@ template<class TT> void owner_case(int M) {
         ds_mhc::consume(own.b,out,g.owned,H,0);
         ds_mhc::prepare<float>(own.b,w,g.owned,H,1.e-6f,own.y,0);
         CK(cudaDeviceSynchronize());
-        const auto oy=down(own.y,size_t(g.owned)*H),ot=down_wide(own.b.streams,size_t(g.owned)*4*H);
+        const auto oy=down(own.y,size_t(g.owned)*H); const auto ot=down_wide(own.b.streams,size_t(g.owned)*4*H);
         for(size_t j=0;j<oy.size();++j)bad+=std::memcmp(&oy[j],&fy[size_t(g.row0)*H+j],2)!=0;
         for(size_t j=0;j<ot.size();++j)bad+=ot[j]!=ft[size_t(g.row0)*4*H+j];
         const auto done=down(own.b.done,ds_mhc::done_words(g.Q)); for(auto x:done)assert(x==0);
