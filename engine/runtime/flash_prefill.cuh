@@ -27,6 +27,7 @@
 #include "flash_dsa_pf.cuh"
 #include "flash_pool_owner.cuh"
 #include "flash_route_split.cuh"
+#include "pf_slots.h"
 
 namespace g6rt
 {
@@ -75,10 +76,6 @@ inline bool pf_sp_agk()
 inline int pf_sp_put_cta()
 {
     return (int)knob::glm53f_pf_sp_put_cta();
-}
-inline size_t pf_sp_slot_bytes(int MP, int nr)
-{
-    return std::max(pf_slot_bytes(MP, true, nr), ((size_t)(MP + nr - 1) / nr * HID * 4 + 8 + 255) & ~size_t(255));
 }
 struct FlashPrefill
 {

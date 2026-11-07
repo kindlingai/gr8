@@ -102,6 +102,7 @@
 #include <algorithm>
 #include <chrono>
 #include "engine_options.h"
+#include "fabric_plan.h"
 #include "../knobs-rs/gr8_knobs.h"
 #include "packfind.h"
 #include "weight_check.cuh"
@@ -166,7 +167,7 @@ int main(int argc, char** argv)
     pf_env_check();                    // strict GR8_PF_* choices: a bad value exits before any work
     EngineOptions eo;                  // engine_options.h: argv and the knob table, every parse-time check
     if (const std::string e = parse_engine_options(argc, argv, eo); !e.empty()) die(e);
-    g6::FabricConfig& cfg = eo.cfg;
+    const g6::FabricConfig& cfg = eo.cfg;
     const std::vector<std::string>& pf_ips2 = eo.pf_ips2;
     const std::string &manifest = eo.manifest, &packfile = eo.packfile;
     V2Src& v2src = eo.v2src;
@@ -261,155 +262,17 @@ int main(int argc, char** argv)
     }
     // --check-args: every check a boot makes before CUDA passed; stop before any CUDA, fabric or weight work
     if (eo.check_args) { fprintf(stderr, "g6m4: --check-args: the arguments pass the parse-time checks (no CUDA, no weights)\n"); return 0; }
-    if (!grammar_dir.empty() && R == 0)
+    // GR8_FABRIC_DUMP=1: every planned fabric's config on stdout, then exit; no file, CUDA, fabric or network work
+    const bool fabric_dump = knob::fabric_dump();
+    if (!fabric_dump && !grammar_dir.empty() && R == 0)
         if (FILE* f = fopen((s2dir + "/grammar.s2").c_str(), "w")) { fputs("json json_schema\n", f); fclose(f); }
 
-    G6RT_CK(cudaSetDeviceFlags(cudaDeviceMapHost));
-    cfg.slot_bytes = NX ? (size_t)MX * 6144 * 2 : (size_t)MX * HID * 2;   // Engram: [rows][6144] BF16 slots (ds41_engram_ops.cuh)
-    const size_t dec_slot_bytes = cfg.slot_bytes;   // the decode slot: every decode collective (layer, head, Engram) of MX rows fits it
-    g6::FabricConfig cm;                            // the main fabric's own runs (DS41 serve), set below; run1 = 0 = uniform
-    bool pf_direct = false;                         // GR8_DS_PF_DIRECT=1: prefill producers write the pinned send slots (ds41_step.cuh ds41_op_direct)
-    int rs_k = 0;                                   // GR8_DS_PF_RS=1 (ds41_rs.h): the RS layer exchanges 0..rs_k-1, AG collectives NC..NC+rs_k-1; 0 = off
-    bool rowshard = false;                          // GR8_DS_MHC_ROW_SHARD=1 (default off): local-Q mHC + AG(y) + one boundary-state collective
-    bool y_mxfp8 = false;                           // default-off lossy MXFP8 AG(y), requires rowshard
-#if G6_MODEL_DS41
-    g6::FabricConfig cmB;                           // GR8_DS_PF_LANES=2: lane B's fabric runs (ds41::lanes::fabric_runs_b), set below
-    int pf_lanes_fab = 1;                           // GR8_DS_PF_LANES, read here for the lane-B fabric (the serve setup reads it again)
-    // A W-row headless prefill chunk uses the same fabric as decode. Unset, the
-    // slot holds MX rows; Fabric::init adds the 8-byte tail and alignment to
-    // this payload capacity.
-    if (s2mode) {
-        const int pf_rows = ds41_prefill_rowcap(DS41_TEXT(knob::ds_prefill_w()), MX);
-        if (!pf_rows) die("DS41 serve: GR8_DS_PREFILL_W must be MX..4096");
-        cfg.slot_bytes = ds41_prefill_fabric_payload(pf_rows, HID, NX ? 6144 : 0);
-        // the main fabric's slots sized per collective (FabricConfig::run1) as a W chunk sends them (s2/ds41_prefill.h
-        // ds41_chunk_collectives): [0, c1) layer exchanges of W rows; [c1, 2 NL + 1) the bounded-replay layers (late rows,
-        // GR8_DS_PF_TAIL) and the head (0 B in prefill); [2 NL + 1, NC) the Engram reduces of W rows. Every run also holds the
-        // decode slot. Fabric::enqueue_step still checks each collective against its own slot.
-        const int tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
-        if (tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
-        ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1): before late_start() sizes the fabric runs below
-        if (ds41::br::l20_tail() && !tail) die("GR8_DS_PF_L20_TAIL=1 needs GR8_DS_PF_TAIL (layer 20 joins the bounded replay)");
-        const int i_late = tail ? ds41::br::late_start(layers) : -1;
-        bool pf_rs_on = false;
-        // GR8_DS_PF_RS=1: layer exchanges c < 2 i_late of a prefill chunk run as reduce-scatter + all-gather (ds41_rs.h). Run 0 holds NR
-        // slices of ss each (+256 B a slot at W2048), and a 4th run [NC, NC + rs_k) holds the AG collectives (one slice payload each).
-        // Mesh and ring take the same proxy path (send / recv by offset; the ring relays the diagonal by that offset).
-        if (knob::ds_pf_rs()) {
-            if (i_late < 0) die("GR8_DS_PF_RS=1 needs GR8_DS_PF_TAIL (the RS collectives are the layer exchanges before the bounded-replay split)");
-            if (pf_rows <= MX || pf_rows < g6nr::NR) die("GR8_DS_PF_RS=1 needs GR8_DS_PREFILL_W > MX");
-            pf_rs_on = true;
-            if (NC + 2 * i_late > (int)g6::CollMask::kBits) die("GR8_DS_PF_RS=1: more than 128 collectives (NC + 2 i_late)");
-        }
-        if (knob::ds_mhc_row_shard()) {
-            const bool fuse = knob::ds_mhc_fuse();
-            if (!ds41::rowshard::boot_ok(pf_rows,tail,g6nr::NR,pf_rs_on,fuse))
-                die("GR8_DS_MHC_ROW_SHARD=1 needs W=4096, tail=128, TP4, PF_RS=1, MHC_FUSE=1");
-            if (NC + 2*i_late + 1 > (int)g6::CollMask::kBits) die("GR8_DS_MHC_ROW_SHARD: more than 128 collectives");
-            const size_t state=ds41::rowshard::state_bytes(tail,HID,sizeof(ds_mhc::trunk_t));
-            if (state > (size_t)1024*HID*2) die("GR8_DS_MHC_ROW_SHARD: late state exceeds an AG slot");
-            rowshard = true;
-            fprintf(stderr,"# rank %d: GR8_DS_MHC_ROW_SHARD=1 Q=1024 late=128 state_bytes=%zu\n",cfg.rank,state);
-        }
-        if (knob::ds_mhc_y_mxfp8()) {
-            if (!rowshard) die("GR8_DS_MHC_Y_MXFP8=1 needs GR8_DS_MHC_ROW_SHARD=1");
-            y_mxfp8 = true;
-            fprintf(stderr,"# rank %d: GR8_DS_MHC_Y_MXFP8=1 lossy y all-gather\n",cfg.rank);
-        }
-        const auto runs = ds41::pf::fabric_runs(pf_rows, tail, i_late, NL, NX, MX, HID, g6nr::NR,
-                                                glue::head_bytes_tk(MX, nc, true), pf_rs_on, c8_pack_env == 1, rowshard);
-        cm = runs.cfg;
-        rs_k = runs.rs_k;
-        // GR8_DS_PF_POOL=P: run 0 (the layer exchanges before the late split) and run 3 (the AG collectives) keep P slots each,
-        // collective c in slot c mod P (comms/fabric.h FabricConfig::pool; the proxy posts a reused slot after the peer's credit tail).
-        if (const char* pv = DS41_TEXT(knob::ds_pf_pool()); pv && *pv && strcmp(pv, "0") != 0) {
-            char* end = nullptr;
-            const long P = strtol(pv, &end, 10);
-            if (!end || *end || P < 2 || P > cm.run1) die("GR8_DS_PF_POOL must be 0 (off) or 2..the run 0 collectives (2 i_late with GR8_DS_PF_TAIL, else 2 NL)");
-            cm.pool = (int)P;
-            fprintf(stderr, "# rank %d DS41 fabric slot pool: GR8_DS_PF_POOL=%d (run 0: %d collectives, %s)\n", cfg.rank, cm.pool, cm.run1,
-                    rs_k ? "run 3 AG pooled too" : "no run 3");
-        }
-        // GR8_DS_PF_LANES=2 (ds41_lanes.h): lane B's slot table = the main one without the C8-pack late slots (a ragged pack is never a
-        // lane-B chunk); the same pool. Unset / 1: nothing here.
-        pf_lanes_fab = ds41::lanes::parse(DS41_TEXT(knob::ds_pf_lanes()));
-        if (!pf_lanes_fab) die(ds41::lanes::kParseError);
-        if (pf_lanes_fab == 2) {
-            const auto rb = ds41::lanes::fabric_runs_b(pf_rows, tail, i_late, NL, NX, MX, HID, g6nr::NR, glue::head_bytes_tk(MX, nc, true), pf_rs_on, rowshard);
-            if (rb.rs_k != rs_k || rb.cfg.run1 != cm.run1 || rb.cfg.ncoll != cm.ncoll)
-                die("DS41 lane B fabric: its runs or row-shard state collective differ from the main fabric's");
-            cmB = rb.cfg;
-            cmB.pool = cm.pool;
-        }
-        if (pf_rs_on) {
-            fprintf(stderr, "# rank %d DS41 prefill RS+AG: GR8_DS_PF_RS=1 (c < %d; Q %d rows, slice stride %zu B; AG collectives %d..%d, %zu B each)\n",
-                    cfg.rank, rs_k, runs.quarter, runs.slice_stride, NC, NC + rs_k - 1, cm.slot_bytes3);
-        }
-        // GR8_DS_PF_DIRECT=1: on an eager W-row prefill chunk the attention output and the MoE combine write the pinned send slot of
-        // their collective (flat [rows][HID]); the publish only rings. RS collectives of such a chunk go as flat slices (payload + tail-word
-        // SGEs, Fabric::Rs::flat), so the fabric QPs take 2 send SGEs (FabricConfig::sge2). Decode graphs do not use it.
-        if (knob::ds_pf_direct()) {
-            if (pf_rows <= MX) die("GR8_DS_PF_DIRECT=1 needs GR8_DS_PREFILL_W > MX");
-            if (knob::ds_subdump()) die("GR8_DS_PF_DIRECT=1: GR8_DS_SUBDUMP reads Model::sc.part after the publish (not supported)");
-            pf_direct = true;
-            fprintf(stderr, "# rank %d DS41 prefill direct publish: GR8_DS_PF_DIRECT=1 (send slots written by the producers; RS slices flat: %s)\n",
-                    cfg.rank, rs_k ? "yes" : "no RS");
-        }
-    }
-    // DS41 W-prefill uses this main, uniform-layout fabric (not the Flash MP prefill fabrics below).
-    // The two --ips2 rails alone do not stripe: Fabric::init requires stripe_min > 0.
-    {
-        if (knob::ds_stripe()) {
-            if (cfg.ips2.size() != cfg.ips.size()) die("GR8_DS_STRIPE=1 needs --ips2 with one address per rank");
-            if (cfg.ring || !cfg.vcap.empty() || cfg.bulk_bytes) die("GR8_DS_STRIPE=1 needs a uniform, non-bulk mesh fabric");
-            cfg.stripe_min = (size_t)knob::ds_stripe_min();
-        }
-    }
-    // no recv slot for a rank's own contribution: DS41 reads it from the send slot, and a W-row prefill fabric's slots are large
-    cfg.compact = true;
-#endif
-    cfg.ncoll = NC;
-    cfg.relay_cpu = cfg.proxy_cpu > 7 ? cfg.proxy_cpu - 8 : -1;   // --ring: the relay thread's own core (N-1..N-7 are proxies)
-    g6::Fabric fab;
+    if (!fabric_dump) G6RT_CK(cudaSetDeviceFlags(cudaDeviceMapHost));
+    // every fabric main creates, in creation order (fabric_plan.h); the plan below sets them up
+    g6::Fabric fab, fabB, fabp, fabp2, fabix, fabix2, fabrs, fabrs2, fabd, fabds, fabf, fabq, fabc, fabg, fabs, fabdg;
     boot_rank = cfg.rank;
     mem_min_gib();                      // a bad GR8_MEM_MIN stops the boot here, not after the weights have loaded
     boot("start");
-    // GR8_XTRACE=1: stage-0 trace (xtrace.h, default off) on the decode fabric, or with GR8_XTRACE_PF=1 on the two prefill
-    // fabrics instead
-    const bool xtrace_pf = knob::xtrace_pf();
-    cfg.xtrace = xtrace_pf ? 0 : 1;
-    {
-        g6::FabricConfig mc = cfg;
-        if (cm.run1) { mc.slot_bytes = cm.slot_bytes; mc.run1 = cm.run1; mc.run2 = cm.run2; mc.slot_bytes1 = cm.slot_bytes1; mc.slot_bytes2 = cm.slot_bytes2; mc.pool = cm.pool; }
-#if G6_MODEL_DS41
-        if (rs_k) { mc.run3 = cm.run3; mc.slot_bytes3 = cm.slot_bytes3; mc.ncoll = ds41::rs::main_ncoll(NC, rs_k, rowshard); }   // the RS AG collectives plus the row-shard state collective
-#endif
-        mc.sge2 = pf_direct;                                                                     // GR8_DS_PF_DIRECT: flat RS slices = 2 SGEs
-        fab.init(mc);
-    }
-    cfg.xtrace = 0;
-    const g6::FabricDev f = fab.dev();
-    fab.start_proxy();
-#if G6_MODEL_DS41
-    // GR8_DS_PF_LANES=2: lane B's own fabric (own QPs, proxy thread and sequence), as Flash's fabp2: port + 96, proxy core N-2 (DS41 builds no
-    // fabp / fabp2: --prefill is refused for DS41). Same rails, ring / mesh and stripe as the main fabric. Unset / 1: not built.
-    g6::Fabric fabB;
-    if (pf_lanes_fab == 2) {
-        if (!s2mode || !cmB.run1) die("GR8_DS_PF_LANES=2 needs --serve with W-row prefill (GR8_DS_PREFILL_W > MX)");
-        g6::FabricConfig mc = cfg;
-        mc.slot_bytes = cmB.slot_bytes; mc.run1 = cmB.run1; mc.run2 = cmB.run2; mc.slot_bytes1 = cmB.slot_bytes1; mc.slot_bytes2 = cmB.slot_bytes2;
-        mc.pool = cmB.pool;
-        if (rs_k) { mc.run3 = cmB.run3; mc.slot_bytes3 = cmB.slot_bytes3; mc.ncoll = ds41::rs::main_ncoll(NC, rs_k, rowshard); }
-        mc.sge2 = pf_direct;
-        mc.port = cfg.port + 96;
-        mc.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
-        mc.xtrace = 0;
-        fabB.init(mc);
-        fabB.start_proxy();
-        fprintf(stderr, "# rank %d DS41 two-lane prefill: lane B fabric port %d proxy cpu %d, slot table without the C8-pack late slots (run1 %d)\n",
-                cfg.rank, mc.port, mc.proxy_cpu, mc.run1);
-    }
-#endif
     // DS41 with Engram: the step rings each Engram reduce (c = 2*nl+1+e) mid-step, not after the head, so the proxy must wait for the collectives in
     // the step's own order (ds41_coll_order.h, Fabric::Rs::order). Every rank builds the same vector. Empty (Engram off, every other model): the
     // plain enqueue_step(step, sizes) call in the proxy's numeric order.
@@ -419,7 +282,6 @@ int main(int argc, char** argv)
         rs.order = fab_order;
         fab.enqueue_step(step, sizes, rs);
     };
-    g6::Fabric fabp;                    // prefill region
     const bool pf_rs = knob::pf_rs();                                            // reduce-scatter form (prefill.cuh)
     const int pf_own = (int)knob::pf_own();                                      // 1: row-owner projections, 2: + index (prefill.cuh)
     const bool pf_qo = MP && pf_own == 3;                                        // 3: row-owner QO attention (QO-INTEGRATION.md)
@@ -427,154 +289,8 @@ int main(int argc, char** argv)
     if (pf_qo && !release && (qo_man.empty() || qo_file.empty())) die("GR8_PF_OWN=3 needs --qo-manifest and --qo-pack");
     if (release && (!qo_man.empty() || !qp_man.empty())) die("--v2-dense: the QO weights come from the release (no --qo- / --qp- packs)");
     v2src.qo = pf_qo;
-    // GR8_PF_STRIPE=1 (needs --pf-ips2 or --ips2, or a three-rank --ring): prefill payload writes >= GR8_PF_STRIPE_MIN
-    // bytes (default 1 MiB) go out half on each rail (FabricConfig::stripe_min). At a three-rank ring the second half
-    // takes the same port's device on the other PCIe root. Unset = on when --pf-ips2 is given or at a three-rank ring,
-    // else one rail as before; 0 = one rail.
-    auto pf_stripe_cfg = [&](g6::FabricConfig& cp, const std::vector<std::string>& ips2) {
-        const bool ring3 = cp.ring && cp.ips.size() == 3;   // three-rank ring: stripes over the other PCIe root, no ips2
-        const bool on = knob::pf_stripe().value_or(!ips2.empty() || ring3);
-        if (!ips2.empty()) cp.ips2 = ips2;
-        if (!on) return;
-        if (!ring3 && cp.ips2.size() != cp.ips.size()) die("GR8_PF_STRIPE=1 needs --pf-ips2 (or --ips2) with one address per rank");
-        cp.stripe_min = (size_t)knob::pf_stripe_min();
-    };
-    if (MP)
-    {
-        g6::FabricConfig cp = cfg;
-        cp.slot_bytes = pf_slot_bytes(MP, pf_rs, (int)cfg.ips.size());
-        cp.ncoll = pf_rs ? 5 : 2;
-#if G6_MODEL_FLASH
-        if (pf_sp()) { cp.slot_bytes = pf_sp_slot_bytes(MP, (int)cfg.ips.size()); cp.ncoll = 4; }
-#endif
-        cp.port = cfg.port + 8;
-        pf_stripe_cfg(cp, pf_ips2);
-        cp.proxy_cpu = cfg.proxy_cpu > 0 ? cfg.proxy_cpu - 1 : -1;
-        cp.xtrace = xtrace_pf ? 1 : 0;
-        fabp.init(cp);
-        fabp.start_proxy();
-    }
-    if (lanes != 1 && lanes != 2) die("--pf-lanes must be 1 or 2");
-    const bool two = MP && lanes == 2;
-    g6::Fabric fabp2;                   // prefill region of the second lane (--pf-lanes 2)
-    if (two)
-    {
-        g6::FabricConfig cp = cfg;
-        cp.slot_bytes = pf_slot_bytes(MP, pf_rs, (int)cfg.ips.size());
-        cp.ncoll = pf_rs ? 5 : 2;
-#if G6_MODEL_FLASH
-        if (pf_sp()) { cp.slot_bytes = pf_sp_slot_bytes(MP, (int)cfg.ips.size()); cp.ncoll = 4; }
-#endif
-        cp.port = cfg.port + 24;
-        pf_stripe_cfg(cp, pf_ips2);
-        cp.proxy_cpu = cfg.proxy_cpu > 1 ? cfg.proxy_cpu - 2 : -1;
-        cp.xtrace = xtrace_pf ? 1 : 0;
-        fabp2.init(cp);
-        fabp2.start_proxy();
-    }
-#if G6_MODEL_FLASH
-    // Independent pool-ID exchange: default on for TP2 Flash prefill (GR8_GLM53F_PF_POOL_OWNER unset = auto, 0 = off,
-    // 1 = on and die if unsupported). Existing fabp/fabp2 are unchanged.
-    g6::Fabric fabix, fabix2;
-    const int pool_mode = flash_pool_owner_mode();
-    const bool pool_fits = MP && g6nr::NR == 2 && cfg.ips.size() == 2 && !cfg.ring;
-    const char* pool_conflict = knob::fpf_attn_p1() ? "GR8_FPF_ATTN_P1" : knob::fpf_dsa_p1() ? "GR8_FPF_DSA_P1"
-                              : knob::fpf_p1() ? "GR8_FPF_P1" : nullptr;
-    if (pool_mode == 1 && !pool_fits) die("GR8_GLM53F_PF_POOL_OWNER=1 needs TP2 Flash prefill (not ring)");
-    if (pool_mode == 1 && pool_conflict) die(std::string("GR8_GLM53F_PF_POOL_OWNER=1 conflicts with ") + pool_conflict);
-    const bool pool_owner = pool_mode == 1 || (pool_mode == 2 && pool_fits && !pool_conflict);
-    if (pool_owner)
-    {
-        auto init_ids = [&](g6::Fabric& ids, int port, int cpu_offset) {
-            g6::FabricConfig cp = cfg;
-            cp.ncoll = 1; cp.slot_bytes = flash_pool_owner::payload(MP);
-            cp.port = cfg.port + port;
-            cp.proxy_cpu = cfg.proxy_cpu > cpu_offset ? cfg.proxy_cpu - cpu_offset : -1;
-            pf_stripe_cfg(cp, pf_ips2);
-            ids.init(cp); ids.start_proxy();
-        };
-        init_ids(fabix, 64, 9);
-        if (two) init_ids(fabix2, 72, 10);
-    }
-    // GR8_PF_ROUTER_SPLIT=1 (opt-in): one ncoll = 1 route-table fabric per prefill lane, at any rank count and on a
-    // switched mesh or the switchless ring (the fabric relays the diagonal, as it does for the prefill fabric).
-    // Ports +80 / +88 and proxy CPU offsets 11 / 12 (taken: ports 8 16 24 32 40 48 56 64 72, offsets 1..10).
-    g6::Fabric fabrs, fabrs2;
-    const bool route_split = route_split_mode == 1;
-    if (route_split)
-    {
-        if (!(MP && g6nr::NR >= 2 && g6nr::NR <= flash_route_split::MAX_NR && cfg.ips.size() == (size_t)g6nr::NR))
-            die("GR8_PF_ROUTER_SPLIT=1 needs Flash prefill (--prefill) on 2 to 8 ranks");
-        auto init_rs = [&](g6::Fabric& rs, int port, int cpu_offset) {
-            g6::FabricConfig cp = cfg;
-            cp.ncoll = 1; cp.slot_bytes = flash_route_split::payload(MP, (int)cfg.ips.size());
-            cp.port = cfg.port + port;
-            cp.proxy_cpu = cfg.proxy_cpu > cpu_offset ? cfg.proxy_cpu - cpu_offset : -1;
-            pf_stripe_cfg(cp, pf_ips2);
-            rs.init(cp); rs.start_proxy();
-        };
-        init_rs(fabrs, 80, 11);
-        if (two) init_rs(fabrs2, 88, 12);
-        fprintf(stderr, "# rank %d: GR8_PF_ROUTER_SPLIT=1: prefill MoE router row-split, route tables over a dedicated fabric%s\n",
-                cfg.rank, two ? " per lane" : "");
-    }
-#endif
-    g6::Fabric fabd;                    // MTP draft region: 3 collectives, decode-sized slots
-    if (mtp)
-    {
-        g6::FabricConfig cd = cfg;
-        cd.ncoll = 3;
-        cd.port = cfg.port + 16;
-        cd.proxy_cpu = cfg.proxy_cpu > 5 ? cfg.proxy_cpu - 6 : -1;   // own core: fabp2 (prefill lane 2) has N-2
-        fabd.init(cd);
-        fabd.start_proxy();
-    }
-#if G6_MODEL_DS41
-    g6::Fabric fabds;                   // DSpark draft block: its own region of DRAFT_NCOLL collectives (6 layer exchanges + 5 markov merges)
-    if (dsk.on())
-    {
-        g6::FabricConfig cd = cfg;
-        cd.ncoll = ds41::dsp::DRAFT_NCOLL;
-        // the draft block sends 5 rows a session, never W rows: decode-sized slots (the W-sized cfg.slot_bytes is the main fabric's)
-        cd.slot_bytes = dec_slot_bytes;
-        for (int c = 0; c < cd.ncoll; ++c)
-            if (ds41::dsp::coll_bytes(c, HID, std::min(s2sess, ds_draft_cap)) > cd.slot_bytes) die("DSpark draft fabric: a collective is larger than the decode slot");
-        cd.port = cfg.port + 16;        // the MTP draft region's port (--mtp is refused with DSpark)
-        cd.proxy_cpu = cfg.proxy_cpu > 5 ? cfg.proxy_cpu - 6 : -1;
-        // GR8_XTRACE=1 with GR8_DS_XTRACE=1: stage-0 trace (xtrace.h) on this draft fabric too; default off
-        cd.xtrace = knob::ds_xtrace() ? 1 : 0;
-        fabds.init(cd);
-        fabds.start_proxy();
-    }
-#endif
-    g6::Fabric fabf;                    // --dflash: the drafter's region, dfl::NC collectives, decode-sized slots
-    if (dfl)
-    {
-        g6::FabricConfig cd = cfg;
-        cd.ncoll = dfl::NC;
-        cd.port = cfg.port + 40;
-        cd.proxy_cpu = cfg.proxy_cpu > 6 ? cfg.proxy_cpu - 7 : -1;   // own core: not N-2 (fabp2) or N-6 (fabd)
-        fabf.init(cd);
-        fabf.start_proxy();
-    }
 #if G6_NR == 4
-    g6::Fabric fabq;                    // GR8_PF_QP_ROLL: ring of [lo | hi] pair half images, one-peer jobs (qp_wire.h)
-    QpWire qp_wire;
-    if (qp_roll_s)
-    {
-        g6::FabricConfig qc = cfg;
-        qc.vcap.clear(); qc.vdst_k.clear();
-        qc.bulk_bytes = qw::bulk_bytes(qp_wire_e);
-        qc.bulk_flags = qw::bulk_flags(qp_wire_e);
-        qc.port = cfg.port + 56;
-        qc.proxy_cpu = cfg.proxy_cpu > 4 ? cfg.proxy_cpu - 5 : -1;
-        fabq.init(qc);
-        fabq.start_proxy();
-        qp_wire.bd = fabq.bulk_dev(); qp_wire.E = qp_wire_e; qp_wire.peer = qw::partner(cfg.rank);
-        qp_wire.enqueue = [&fabq](g6::Fabric::BulkJob j) { fabq.enqueue_bulk(std::move(j)); };
-        fprintf(stderr, "# rank %d: GR8_PF_QP_ROLL=%d wire fabric: %d entr%s x [lo | hi] %.2f MB = %.3f GB pinned + registered, partner rank %d\n",
-                cfg.rank, qp_roll_s, qp_wire_e, qp_wire_e == 1 ? "y" : "ies", qw::HALF / 1e6, qw::bulk_bytes(qp_wire_e) / 1e9, qp_wire.peer);
-    }
+    QpWire qp_wire;                     // GR8_PF_QP_ROLL: the wire over fabq (qp_wire.h), set up after its init
     auto qp_err = [&]() -> unsigned { return qp_roll_s ? *fabq.bulk_dev().error : 0u; };
 #else
     auto qp_err = [&]() -> unsigned { return 0u; };
@@ -666,22 +382,6 @@ int main(int argc, char** argv)
     const float dfl_alpha = (float)knob::dfl_sel_alpha();
     if (!std::isfinite(dfl_alpha)) die("GR8_DFL_SEL_ALPHA: not a finite float");
     if (dfl_alpha != 1.f && !dfl) die("GR8_DFL_SEL_ALPHA needs --dflash-manifest");
-    g6::Fabric fabg, fabdg;
-    bool fabg_on = false, fabdg_on = false;
-    auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, int port_off, const char* what) {
-        g6::FabricConfig gc = cfg;
-        gc.vcap.clear(); gc.vdst_k.clear();
-        gc.ncoll = mm.qs.ncoll();
-        gc.slot_bytes = qs_slot_bytes(mm);
-        gc.port = cfg.port + port_off;
-        // GR8_QA_SPLIT_CPU: its proxy's core (-1 = unpinned); A/B of the placement
-        gc.proxy_cpu = (int)knob::qa_split_cpu().value_or(cfg.proxy_cpu > 8 ? cfg.proxy_cpu - 9 : -1);
-        fb.init(gc);
-        fb.start_proxy();
-        fprintf(stderr, "# rank %d: %s gather fabric: %d collectives of up to %zu B, %.1f MB pinned, proxy CPU %d\n", cfg.rank, what,
-                gc.ncoll, gc.slot_bytes, 2.0 * gc.ncoll * (1 + cfg.ips.size()) * ((gc.slot_bytes + 8 + 255) & ~size_t(255)) / 1e6, gc.proxy_cpu);
-    };
-    auto qs_err = [&]() -> unsigned { return (fabg_on ? *fabg.dev().error : 0u) | (fabdg_on ? *fabdg.dev().error : 0u); };   // the gather proxies' own error words
     // GR8_DRAFT_HEAD_I4=1 (rank.cuh build_draft_head_i4; default 0): the MTP draft's head reads INT4 g32 records of the
     // rank's vocab slice; the target's head is unchanged. In the S2 runtime signature.
     const DraftHeadI4 dhead = draft_head_i4_env();
@@ -703,53 +403,96 @@ int main(int argc, char** argv)
     // MXFP8 records. Drafts only; +382 MB per rank. In the S2 runtime signature
     const bool dfl_body_i4_on = knob::dfl_body_i4();
     if (dfl_body_i4_on && !dfl) die("GR8_DFL_BODY_I4=1 needs --dflash-manifest");
-    int cp_step = 0;                    // GR8_CP_STEP_ROWS (s2/cp_rows.h): the rows a step past R may carry; 0 = off
+    // the fabric plan (fabric_plan.h): every fabric's config, and the bring-up's refusals, before the first fabric
+    PlanInputs fpi;
+    fpi.k = plan_knobs();
+#if G6_MODEL_FLASH
+    fpi.pf_sp = pf_sp();
+    fpi.pool_owner_mode = flash_pool_owner_mode();
+#endif
+    fpi.dfl_ncoll = dfl::NC;
+#if G6_MODEL_DS41
+    fpi.head_payload = glue::head_bytes_tk(MX, nc, true);
+    fpi.trunk_bytes = sizeof(ds_mhc::trunk_t);
+#endif
+    for (int l : layers) fpi.full_index.push_back(cp_full_index(l));
 #if defined(G6_CP) && G6_CP
-    // CP: env as m4sim (GR8_CP, GR8_CP_R, GR8_CP_S3, GR8_CP_MMAX). Own fabric `fabc` (cplayout.h variable
-    // layout: per-collective slots, single-destination partials), port + 32, its own proxy CPU.
-    const bool cp_on = knob::cp().value_or(true);
-    const int cp_R = (int)knob::cp_r();
-    const int cp_s3 = knob::cp_s3() ? 1 : 0;
-    int cp_mmax = K + 1;
-    for (int M : row_counts) cp_mmax = std::max(cp_mmax, M);
-    // S2: a split run past R shares batched steps, so any S2 step (sc.max_rows below) may run the CP block.
-    // GR8_CP_STEP_ROWS=n: S2 steps past R carry at most n rows (Driver::step caps their rounds, cp_rows.h), so the fabric
-    // is sized for n: at least the rows before #94 (cp_mmax here), at most the widest S2 step
-    if (s2mode)
+    fpi.cp_build = true;
+#endif
+    fpi.gather = qs_mode || iq_split;
+    fpi.draft_gather = mtp_split;
+    const FabricPlan fplan = fabric_plan(eo, fpi);
+    for (const std::string& l : fplan.log) fputs(l.c_str(), stderr);
+    if (!fplan.refusal.empty()) die(fplan.refusal);
+    const bool& two = fplan.two;
+#if G6_MODEL_DS41
+    const bool &rowshard = fplan.rowshard, &y_mxfp8 = fplan.y_mxfp8, &pf_direct = fplan.pf_direct;
+    const int &rs_k = fplan.rs_k, &pf_lanes_fab = fplan.pf_lanes_fab;
+#endif
+#if G6_MODEL_FLASH
+    const bool &pool_owner = fplan.pool_owner, &route_split = fplan.route_split;
+#endif
+    [[maybe_unused]] const int& cp_step = fplan.cp_step;   // GR8_CP_STEP_ROWS (s2/cp_rows.h): the rows a step past R may carry; 0 = off
+    g6::Fabric* const fabrics[kFabKinds] = {&fab, &fabB, &fabp, &fabp2, &fabix, &fabix2, &fabrs, &fabrs2,
+                                            &fabd, &fabds, &fabf, &fabq, &fabc, &fabg, &fabs, &fabdg};
+    fabric_bring_up(fplan, fabrics, fabric_dump, [&](const PlannedFabric& e, g6::Fabric& fb) {
+        switch (e.kind)
+        {
+        case FabKind::LaneB:
+            fprintf(stderr, "# rank %d DS41 two-lane prefill: lane B fabric port %d proxy cpu %d, slot table without the C8-pack late slots (run1 %d)\n",
+                    cfg.rank, e.cfg.port, e.cfg.proxy_cpu, e.cfg.run1);
+            break;
+        case FabKind::RouteSplit:
+        case FabKind::RouteSplit2:
+            if (e.kind == FabKind::RouteSplit2 || !two)
+                fprintf(stderr, "# rank %d: GR8_PF_ROUTER_SPLIT=1: prefill MoE router row-split, route tables over a dedicated fabric%s\n",
+                        cfg.rank, two ? " per lane" : "");
+            break;
+#if G6_NR == 4
+        case FabKind::QpWire:
+            qp_wire.bd = fb.bulk_dev(); qp_wire.E = qp_wire_e; qp_wire.peer = qw::partner(cfg.rank);
+            qp_wire.enqueue = [&fabq](g6::Fabric::BulkJob j) { fabq.enqueue_bulk(std::move(j)); };
+            fprintf(stderr, "# rank %d: GR8_PF_QP_ROLL=%d wire fabric: %d entr%s x [lo | hi] %.2f MB = %.3f GB pinned + registered, partner rank %d\n",
+                    cfg.rank, qp_roll_s, qp_wire_e, qp_wire_e == 1 ? "y" : "ies", qw::HALF / 1e6, qw::bulk_bytes(qp_wire_e) / 1e9, qp_wire.peer);
+            break;
+#endif
+        case FabKind::Cp:
+            fprintf(stderr, "# rank %d: GR8_CP fabric %d collectives, mmax %d, %.3f GB pinned + registered\n", cfg.rank,
+                    fplan.cp_colls.ncoll(), fplan.cp_mmax, (fb.vlayout().send_bytes() + fb.vlayout().recv_bytes()) / 1e9);
+            break;
+        default:
+            break;
+        }
+    });
+    if (fabric_dump)
     {
-        const int full = std::min(MX, std::max(s2sess * (mtp + 1), plan.chunk));
-        std::string ce;
-        cp_step = g6s2::cp_step_rows(knob::cp_step_rows(), cp_mmax, full, &ce);
-        if (cp_step < 0) die(ce);
-        cp_mmax = std::max(cp_mmax, cp_step ? cp_step : full);
+        fprintf(stderr, "g6m4: GR8_FABRIC_DUMP: stopping before the first fabric\n");
+        return 4;                       // not a clean stop, should the knob be left set
     }
-    else if (knob::cp_step_rows()) die("GR8_CP_STEP_ROWS needs --serve");
-    if (const auto v = knob::cp_mmax()) cp_mmax = std::max(cp_mmax, (int)*v);
-    if (cp_R < 0 || cp_R % 64) die("GR8_CP_R must be a multiple of 64");
-    // GR8_CP_R2: a session may take a smaller R; every step past it runs the CP block (CpState::step_R)
-    const int cp_R2 = (int)knob::cp_r2().value_or(0);
-    if (cp_R2 && (cp_R2 < 64 || cp_R2 % 64 || cp_R2 >= cp_R || !cp_on || !s2mode || !rt_win))
-        die("GR8_CP_R2 must be a multiple of 64 below GR8_CP_R, with GR8_CP on, --serve and GR8_RT_LOCAL");
-    const int cp_step_R = cp_R2 ? cp_R2 : cp_R;
-    g6::CpColls cp_colls;
-    {
-        std::vector<bool> full;
-        for (int l : layers) full.push_back(cp_full_index(l));
-        cp_colls.make(full, (int)cfg.ips.size(), cp_mmax);
-    }
-    g6::Fabric fabc;
-    if (cp_on)
-    {
-        g6::FabricConfig cc = cfg;
-        cc.vcap = cp_colls.cap;
-        cc.vdst_k = cp_colls.dst_k;
-        cc.port = cfg.port + 32;
-        cc.proxy_cpu = cfg.proxy_cpu > 2 ? cfg.proxy_cpu - 3 : -1;
-        fabc.init(cc);
-        fabc.start_proxy();
-        fprintf(stderr, "# rank %d: GR8_CP fabric %d collectives, mmax %d, %.3f GB pinned + registered\n", cfg.rank, cp_colls.ncoll(),
-                cp_mmax, (fabc.vlayout().send_bytes() + fabc.vlayout().recv_bytes()) / 1e9);
-    }
+    const g6::FabricDev f = fab.dev();
+    // a late fabric's planned config; its init site sets what the built model decides
+    auto late_fabric = [&](FabKind k) -> g6::FabricConfig {
+        const PlannedFabric* e = fplan.find(k);
+        if (!e) die(std::string("the fabric plan has no ") + fab_name(k));
+        return e->cfg;
+    };
+    bool fabg_on = false, fabdg_on = false;
+    auto qs_fabric = [&](g6::Fabric& fb, const Model& mm, FabKind kind, const char* what) {
+        g6::FabricConfig gc = late_fabric(kind);
+        gc.ncoll = mm.qs.ncoll();
+        gc.slot_bytes = qs_slot_bytes(mm);
+        fb.init(gc);
+        fb.start_proxy();
+        fprintf(stderr, "# rank %d: %s gather fabric: %d collectives of up to %zu B, %.1f MB pinned, proxy CPU %d\n", cfg.rank, what,
+                gc.ncoll, gc.slot_bytes, 2.0 * gc.ncoll * (1 + cfg.ips.size()) * ((gc.slot_bytes + 8 + 255) & ~size_t(255)) / 1e6, gc.proxy_cpu);
+    };
+    auto qs_err = [&]() -> unsigned { return (fabg_on ? *fabg.dev().error : 0u) | (fabdg_on ? *fabdg.dev().error : 0u); };   // the gather proxies' own error words
+#if defined(G6_CP) && G6_CP
+    // CP: env as m4sim (GR8_CP, GR8_CP_R, GR8_CP_S3, GR8_CP_MMAX). Own fabric `fabc` (cplayout.h variable layout:
+    // per-collective slots, single-destination partials), sized in the plan
+    const bool& cp_on = fplan.cp_on;
+    const int &cp_R = fplan.cp_R, &cp_R2 = fplan.cp_R2, &cp_s3 = fplan.cp_s3, &cp_step_R = fplan.cp_step_R;
+    const g6::CpColls& cp_colls = fplan.cp_colls;
     // enqueue the CP collectives of a step that runs the CP block (context > CpState::step_R), before its GPU work
     auto cp_enqueue = [&](unsigned long long step, int M, int context) { if (cp_on && context > cp_step_R) fabc.enqueue_step(step, cp_colls.sizes(M)); };
     auto cp_error = [&]() -> unsigned { return (cp_on ? *fabc.dev().error : 0u) | qs_err(); };   // + the GR8_QA_SPLIT proxy
@@ -970,7 +713,7 @@ int main(int argc, char** argv)
 #endif
     if (m.qs.on())                      // every rank, at the same point: its TCP bootstrap is a barrier
     {
-        qs_fabric(fabg, m, 64, "GR8_QA_SPLIT / GR8_IDXQ_SPLIT");
+        qs_fabric(fabg, m, FabKind::Gather, "GR8_QA_SPLIT / GR8_IDXQ_SPLIT");
         fabg_on = true;
         qs_attach(m, fabg.dev(), f.error);   // GPU-side gather wait timeouts land in the error word the step loop checks
     }
@@ -988,16 +731,11 @@ int main(int argc, char** argv)
             m.cp.vs.push_back(v);
         }
     // step 4d: CP prefill staging pools = the registered area of a bulk-mode fabric (prefill.cuh CpPfNet)
-    g6::Fabric fabs;
     const bool cp_pf = cp_on && MP;
     if (cp_pf)
     {
-        g6::FabricConfig sc = cfg;
-        sc.vcap.clear(); sc.vdst_k.clear();
+        g6::FabricConfig sc = late_fabric(FabKind::CpStage);
         sc.bulk_bytes = 2 * cp_pf_pool_bytes(m);
-        sc.bulk_flags = 4;
-        sc.port = cfg.port + 48;
-        sc.proxy_cpu = cfg.proxy_cpu > 3 ? cfg.proxy_cpu - 4 : -1;
         fabs.init(sc);
         fabs.start_proxy();
         cp_pf_net_init(m, fabs, st);
@@ -1080,7 +818,7 @@ int main(int argc, char** argv)
         build_draft(D, m, find, cap, fd, dmalloc<u64>(1), st, MP ? pf_attn_rows(MP) : MX);
         if (D.d.qs.on())
         {
-            qs_fabric(fabdg, D.d, 72, "GR8_MTP_SPLIT");
+            qs_fabric(fabdg, D.d, FabKind::DraftGather, "GR8_MTP_SPLIT");
             fabdg_on = true;
             qs_attach(D.d, fabdg.dev(), fd.error);   // the draft fabric's error word, which the draft step checks
         }
@@ -1897,7 +1635,7 @@ int main(int argc, char** argv)
         // bounded replay (ds41_pf_split.h): GR8_DS_PF_TAIL, read once; 0 = off (the unsplit non-final plan)
         const int pf_tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
         if (pf_tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
-        ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1); the same value the fabric block set
+        ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1); the value the fabric plan set
         if (ds41::br::l20_tail() && !pf_tail) die("GR8_DS_PF_L20_TAIL=1 needs GR8_DS_PF_TAIL (layer 20 joins the bounded replay)");
         if (pf_min) fprintf(stderr, "# rank %d DS41 prefill bounded replay tail %d (layers >= %d)\n", R, pf_tail, ds41::br::late_layer_start());
         if (pf_min && ds41::br::l20_tail())

@@ -7,6 +7,14 @@ knobs:
     default: "1200"
     doc: >-
       Fabric TCP connect attempts, 100 ms apart. Raise it when ranks load at different speeds.
+  GR8_FABRIC_DUMP:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = g6m4 prints every fabric's config (one line each, every field) where it would create it, then exits with code
+      4 before the first: no file, fabric, network or GPU work. The fabrics the built model completes show what the options set.
+      Compares the fabric bring-up of two builds (docs/HOST-CORE.md, R6c).
   GR8_GEN_CACHE:
     scope: local
     kind: path

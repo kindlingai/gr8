@@ -261,6 +261,13 @@ python3 "$REPO/scripts/check_options_coverage.py" "$REPO/engine/scheduler-rs/src
 # g6m4.cu's builders
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/signature_vectors_test.cpp" -o "$T/signature_vectors_test" "${KVLIB[@]}"
 "$T/signature_vectors_test"
+# the fabric plan (fabric_plan.h) over a seeded sweep of its inputs, in each model's shape, GLM's serving one, and the
+# widths only some paths take (the Flash pool owner at TP2, the three-rank ring's stripe at TP3)
+for f in "" "-DDEC_S2 -DG6_NR=4" "-DDEC_S2 -DG6_NR=3" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=3" \
+         "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=2" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O2 -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/fabric_plan_vectors_test.cpp" -o "$T/fabric_plan_vectors_test" "${KVLIB[@]}"
+  "$T/fabric_plan_vectors_test"
+done
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/control_wire_test.cpp" -o "$T/control_wire_test" "${KNOBS[@]}"
 "$T/control_wire_test" 2> >(grep -v '^g6ctl: control recv failed: ret=0 ' >&2)
 # DS41 ranks that disagree on an agree-scope knob refuse at bootstrap (knob::signature() in the DS41 runtime signature):

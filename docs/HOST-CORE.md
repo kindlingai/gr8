@@ -695,6 +695,38 @@ number. `scripts/host_tests.sh` and `cargo test --release --workspace` pass, and
 write are byte-identical to R6a's. The GLM, Flash and DS41 engines build on a GB10. Boot: TP4 GLM, R6a then R6b, the round logs byte-identical on all four ranks, the 24 T=0
 replies matching, and the head's log lines equal apart from the module line's ABI, times and memory.
 
+R6c landed. `fabric_plan.h` `fabric_plan(EngineOptions, PlanInputs)` returns every fabric `main()` creates, in creation
+order (`fab`, `fabB`, `fabp`, `fabp2`, `fabix`, `fabix2`, `fabrs`, `fabrs2`, `fabd`, `fabds`, `fabf`, `fabq`, `fabc`, then
+`fabg`, `fabs`, `fabdg`), each as a whole `FabricConfig` with its kind and port offset. A fabric's config starts as a
+copy of the main one as the bring-up has changed it (compact, xtrace set and reset, DS41's W slots), so the plan carries
+every inherited field. It also returns the scalars the boot reads afterwards (DS41's W, tail, split, `l20_tail`, RS
+`rs_k`, quarter and slice stride, row shard, y MXFP8, direct publish, lanes; Flash's pool owner and router split; the
+CP sizes and `CpColls`), the lines the planning logs, and the refusal. `PlanInputs` holds what is not an option: the
+knobs (`plan_knobs`), the lazy helpers other code also reads (`pf_sp`, `flash_pool_owner_mode`), `dfl::NC`, DS41's head
+payload and trunk size, the full-index bits, and whether the model will build the gathers. `fabric_bring_up` creates the
+thirteen fabrics planned from the options, a hook after each keeping what followed its init (the QP wire's setup, four
+log lines); `fabg`, `fabs` and `fabdg` keep their init sites, where the built model sets ncoll and the slot or bulk
+bytes over the planned config. `fabric_plan_apply` sets DS41's `l20_tail()`, which the step-time split reads. The plan
+runs after the option checks that touch no fabric, so the refusals that fired between inits (and those checks) now fire
+before the first `Fabric::init`; the commit lists them. `pf_slots.h` and bool forms of `ds41_pf_split.h`'s
+`late_start` and `tail_error` moved out of CUDA headers for it. `GR8_FABRIC_DUMP=1` (a local knob, kept for R6d) prints
+every planned config, one line each, and exits with code 4 before the first fabric, file write, CUDA call or connection;
+it was added to the inline bring-up first, as the record of what it built. The fields the built model fills in (`fabg`'s
+and `fabdg`'s ncoll and slot bytes, `fabs`'s bulk bytes) are not in the dump; their init sites set them as before, by
+inspection.
+
+Checked on a GB10: `GR8_FABRIC_DUMP` through the inline bring-up's engines and R6c's (TP4 GLM, Flash and DS41; no TP6
+build there), over `scripts/check_args.py fabric-cases` (the launcher's lists, each with one fabric edit: proxy CPUs,
+ring, rails, stripe, xtrace, CP, lanes, prefill rows, MTP, the gathers, the QP wire, the router split, every DS41
+prefill knob) and `options_cases.txt`: of 1,579 transcripts, 1,572 are byte-identical apart from the boot's time lines,
+7,198 config lines among them, and the other 7 are moved refusals. `fabric_plan_vectors_test` sweeps 20,000 seeded
+cases a shape (options, knobs and build values, valid and refused) in seven shapes (GLM TP6, TP4 and TP3, Flash TP4, TP3
+and TP2, DS41 TP4) and hashes each case's inputs and plan. `ds41_prefill_test` checks `l20_tail()` comes from the plan.
+Linux (GCC 12, x86_64): `scripts/host_tests.sh` and `cargo test --release --workspace` pass, the options and signature
+vectors keep their hashes, and the 13,777 round logs the host tests write are byte-identical to R6b's. The GLM, Flash
+and DS41 engines build on a GB10. Boot: TP4 GLM, R6b then R6c, the round logs byte-identical on all four ranks, the 24 T=0
+replies matching, and the head's log lines equal apart from memory.
+
 ### R7. Step sizes
 
 One Rust `step_sizes(kind, M)` per model replaces the four copies of the collective-size code (`g6m4.cu:2214, 2878,

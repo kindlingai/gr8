@@ -55,6 +55,7 @@
 #include "qo_weights.cuh"
 #include "dtr_find.h"
 #include "cp_pf_tail.h"
+#include "pf_slots.h"
 
 namespace g6rt
 {
@@ -103,13 +104,6 @@ inline int pf_draft_share()
 __host__ __device__ inline int pf_r0(int M, int p, int nr) { return p * M / nr; }          // first row of rank p
 __host__ __device__ inline int pf_rows(int M, int p, int nr) { return pf_r0(M, p + 1, nr) - pf_r0(M, p, nr); }
 __host__ __device__ inline size_t pf_ss(const g6::FabricDev& f) { return (f.stride / f.nr) & ~size_t(255); }
-inline size_t pf_ss_min(int Mmax, int nr) { return ((size_t)(Mmax + nr - 1) / nr * HID * 2 + 8 + 255) & ~size_t(255); }
-// FabricConfig::slot_bytes of a prefill region
-inline size_t pf_slot_bytes(int Mmax, bool rs, int nr = g6nr::NR)
-{
-    const size_t ar = (size_t)Mmax * HID * 2;
-    return rs ? std::max(ar, nr * pf_ss_min(Mmax, nr)) : ar;
-}
 
 // partial [M][6144] BF16 -> slice p of the send slot of collective c (rows of rank p at p * ss), then the doorbell.
 // grid PF_PUT, block 128.
