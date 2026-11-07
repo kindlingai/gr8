@@ -127,6 +127,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_DS_PF_POOL` | text | off |  | 0, or 2..the run-0 collectives: the prefill fabric's layer exchanges and all-gathers reuse this many slots each (FabricConfig::pool). |
 | `GR8_DS_PF_RS` | flag | `0` | 0\|1 | W-row prefill: the layer exchanges before the late split run as reduce-scatter plus all-gather. Needs GR8_DS_PF_TAIL and GR8_DS_PREFILL_W above MX. |
 | `GR8_DS_PF_TAIL` | text | the model's tail rows |  | Rows of each prefill chunk that run the late layers (bounded replay): 0 (off) or the attention window..4096. |
+| `GR8_DS_PF_V2` | flag | `0` | 0\|1 | Experimental sequence-parallel prefill conductor for layers 0..20. Own-row residual state, a dedicated fabric and high-priority communication stream; late layers remain on the stock path. Needs TP4, one prefill lane and a 128-row late tail. Off leaves the stock path unchanged. |
 | `GR8_DS_PREFILL_KEEP` | text | 0, every prompt row |  | 0, or 128 and more: only the last N prompt positions enter the DSpark draft's key rings. |
 | `GR8_DS_PREFILL_MIN` | int | `0` | 0.. | Prompts of at least this many tokens prefill in W-row chunks (GR8_DS_PREFILL_W); shorter ones, and every prompt at 0, run as decode steps. Several sessions (--s2-sessions > 1) need 2 or more. |
 | `GR8_DS_PREFILL_W` | text | MX: no W-row prefill |  | Rows of one prefill chunk, MX..4096. GR8_DS_ATTN_PW and GR8_DS41_IDX_PW must name the same width. |

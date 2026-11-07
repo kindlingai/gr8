@@ -140,6 +140,15 @@ knobs:
     unset: "0, no drafts"
     doc: >-
       DSpark drafts verified a round, 1..5 (the checkpoint's three draft layers, block of 5). Served only.
+  GR8_DS_PF_V2:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      Experimental sequence-parallel prefill conductor for layers 0..20. Own-row residual state,
+      a dedicated fabric and high-priority communication stream; late layers remain on the stock path.
+      Needs TP4, one prefill lane and a 128-row late tail. Off leaves the stock path unchanged.
   GR8_DS_PF_DIRECT:
     scope: agree
     kind: flag
