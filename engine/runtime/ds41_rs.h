@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include "../scheduler-rs/g6plan.h"
 
 #ifdef __CUDACC__
 #define DS41_RS_HD __host__ __device__
@@ -27,6 +28,8 @@
 
 namespace ds41 { namespace rs {
 
+// quarter and slice_stride are the kernels' too, so they stay here; engine/scheduler-rs src/plan_sizes.rs has copies for
+// the fabric plan (s2/tests/plan_twins_test.cpp)
 // rows each rank owns (and the rows of every RS slice / AG payload)
 DS41_RS_HD inline int quarter(int rows, int nr) { return (rows + nr - 1) / nr; }
 // the RS slice stride in the send slot: Q rows + the 8-byte tail, 256-aligned (fabric slot alignment)
@@ -39,7 +42,7 @@ DS41_RS_HD inline size_t pub_off(int m, int q, size_t ss, size_t row_bytes) { re
 DS41_RS_HD inline int c_ag(int nc, int c) { return nc + c; }
 // Main fabric: decode collectives + k prefill AG collectives + the optional row-shard
 // tail-state collective. The lossy MXFP8 y wire form changes payload bytes, not this count.
-inline int main_ncoll(int nc, int k, bool rowshard = false) { return nc + k + (rowshard ? 1 : 0); }
+inline int main_ncoll(int nc, int k, bool rowshard = false) { return g6plan_ds41_main_ncoll(nc, k, rowshard); }
 // build_ds41's fabric check: f_ncoll = the fabric's count, model_ncoll = Model::ncoll() (2 nl + 1 + Engram 2, or the draft's DRAFT_NCOLL),
 // ag = the AG collectives (main Model only), rowshard = one tail-state collective.
 // nullptr = fine; else the engine dies with the text.

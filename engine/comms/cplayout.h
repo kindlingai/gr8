@@ -10,8 +10,10 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 #include "../model_geom.h"
+#include "../scheduler-rs/g6plan.h"
 
 namespace g6 {
 
@@ -92,25 +94,19 @@ struct CpColls
     std::vector<uint32_t> cap;
     std::vector<uint8_t> dst_k;
 
+    // the rule is engine/scheduler-rs src/plan_sizes.rs cp_colls, which the fabric plan calls too
     void make(const std::vector<bool>& full, int nr_, int mmax_)
     {
         nr = nr_; nl = (int)full.size(); mmax = mmax_;
-        // rows sized for the WIDEST head group (NR=6: 11 of 11/11/11/11/10/10; NR=4: 16), rounded to 16 B so
-        // every M x row is a whole number of uint4 (k_vdeliver / k_vput); a group with fewer heads sends fewer bytes,
-        // the tail stays at M x row (the wire size)
-        const int hpr = (HEADS + nr - 1) / nr;
-        q_row = (uint32_t)hpr * QK_DIM * 4;
-        cand_row = (uint32_t)TOPK * 8;
-        part_row = ((uint32_t)hpr * (KV_RANK + 2) * 4 + 15) & ~15u;
+        const std::unique_ptr<bool[]> f(new bool[full.size() + 1]);
+        for (size_t i = 0; i < full.size(); ++i) f[i] = full[i];
         q.assign(nl, -1); cand.assign(nl, -1); part.assign((size_t)nl * (nr - 1), -1);
-        cap.clear(); dst_k.clear();
-        auto add = [&](uint32_t row, int k) { cap.push_back(row * (uint32_t)mmax); dst_k.push_back((uint8_t)k); return (int)cap.size() - 1; };
-        for (int i = 0; i < nl; ++i)
-        {
-            q[i] = add(q_row, 0);
-            if (full[i]) cand[i] = add(cand_row, 0);
-            for (int k = 1; k < nr; ++k) part[(size_t)i * (nr - 1) + k - 1] = add(part_row, k);
-        }
+        cap.assign((size_t)nl * (nr + 1), 0); dst_k.assign(cap.size(), 0);
+        uint32_t rows[3];
+        const size_t n = g6plan_cp_colls(f.get(), full.size(), nr, mmax, {HEADS, KV_RANK, QK_DIM, TOPK}, rows, q.data(), cand.data(),
+                                         part.data(), cap.data(), dst_k.data());
+        cap.resize(n); dst_k.resize(n);
+        q_row = rows[0]; cand_row = rows[1]; part_row = rows[2];
     }
     int ncoll() const { return (int)cap.size(); }
     // proxy sizes of one step with M rows (every collective of the step)

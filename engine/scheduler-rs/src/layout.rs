@@ -269,6 +269,24 @@ impl Kind for crate::service::control::Staged {
 impl Kind for crate::service::compute::CCompute {
     const K: u64 = 6;
 }
+impl Kind for crate::fabric_plan::Cfg {
+    const K: u64 = 6;
+}
+impl Kind for crate::fabric_plan::Entry {
+    const K: u64 = 6;
+}
+impl Kind for crate::fabric_plan::Knobs {
+    const K: u64 = 6;
+}
+impl Kind for crate::fabric_plan::Build {
+    const K: u64 = 6;
+}
+impl Kind for crate::fabric_plan::CCp {
+    const K: u64 = 6;
+}
+impl Kind for crate::plan_sizes::CpDims {
+    const K: u64 = 6;
+}
 // g6sched.h counts void as 1 byte, as Rust's c_void
 impl Kind for std::ffi::c_void {
     const K: u64 = 6;
@@ -1225,6 +1243,192 @@ pub fn digest() -> u64 {
             qp_roll_s,
             qp_roll_ser,
             qp_wire_e
+        }
+    );
+    layout!(h, crate::plan_sizes::Runs { run1, run2, run3, ncoll, slot_bytes, slot_bytes1, slot_bytes2, slot_bytes3, rs_k, quarter, slice_stride });
+    layout!(h, crate::plan_sizes::CpDims { heads, kv_rank, qk_dim, topk });
+    layout!(
+        h,
+        crate::fabric_plan::Cfg {
+            rank,
+            stripe_min,
+            slot_bytes,
+            run1,
+            run2,
+            slot_bytes1,
+            slot_bytes2,
+            run3,
+            slot_bytes3,
+            pool,
+            sge2,
+            compact,
+            ncoll,
+            port,
+            proxy_cpu,
+            vcap,
+            n_vcap,
+            vdst_k,
+            n_vdst_k,
+            bulk_bytes,
+            bulk_flags,
+            xtrace,
+            ring,
+            relay_cpu
+        }
+    );
+    layout!(h, crate::fabric_plan::Entry { kind, late, use_pf_ips2, port_off, cfg });
+    layout!(
+        h,
+        crate::fabric_plan::Knobs {
+            xtrace_pf,
+            pf_stripe,
+            pf_stripe_min,
+            pf_rs,
+            fpf_attn_p1,
+            fpf_dsa_p1,
+            fpf_p1,
+            has_qa_split_cpu,
+            qa_split_cpu,
+            cp,
+            cp_r,
+            cp_step_rows,
+            cp_s3,
+            has_cp_mmax,
+            cp_mmax,
+            has_cp_r2,
+            cp_r2,
+            ds_prefill_w,
+            ds_pf_tail,
+            ds_pf_pool,
+            ds_pf_lanes,
+            ds_pf_l20_tail,
+            ds_pf_rs,
+            ds_mhc_row_shard,
+            ds_mhc_fuse,
+            ds_mhc_y_mxfp8,
+            ds_pf_direct,
+            ds_subdump,
+            ds_stripe,
+            ds_xtrace,
+            ds_stripe_min
+        }
+    );
+    layout!(
+        h,
+        crate::fabric_plan::Build {
+            model,
+            nr,
+            mx,
+            hid,
+            ds_window,
+            ds_tail_rows,
+            ds_cand_source,
+            ds_late_start,
+            ds_pack_rows,
+            ds_draft_ncoll,
+            coll_bits,
+            cp,
+            qw_half,
+            route_max_nr
+        }
+    );
+    layout!(
+        h,
+        crate::fabric_plan::In {
+            b,
+            cfg,
+            n_ips,
+            n_ips2,
+            n_pf_ips2,
+            nc,
+            nx,
+            nl,
+            mp,
+            mtp,
+            lanes,
+            drafts,
+            chunk,
+            s2sess,
+            rt_win,
+            route_split_mode,
+            c8_pack_env,
+            ds_draft_cap,
+            qp_roll_s,
+            qp_wire_e,
+            s2mode,
+            dfl,
+            dsk_on,
+            layers,
+            n_layers,
+            row_counts,
+            n_row_counts,
+            knobs,
+            pf_sp,
+            pool_owner_mode,
+            dfl_ncoll,
+            head_payload,
+            trunk_bytes,
+            full_index,
+            n_full_index,
+            cp_build,
+            gather,
+            draft_gather,
+            pool_payload,
+            route_payload,
+            dsp_coll_max
+        }
+    );
+    layout!(
+        h,
+        crate::fabric_plan::CCp {
+            nr,
+            nl,
+            mmax,
+            q_row,
+            cand_row,
+            part_row,
+            q,
+            n_q,
+            cand,
+            n_cand,
+            part,
+            n_part,
+            cap,
+            dst_k,
+            ncoll
+        }
+    );
+    layout!(
+        h,
+        crate::fabric_plan::CPlan {
+            refusal,
+            log,
+            n_log,
+            n,
+            entries,
+            dec_slot_bytes,
+            pf_rows,
+            tail,
+            i_late,
+            l20_tail,
+            rs_k,
+            quarter,
+            slice_stride,
+            rowshard,
+            y_mxfp8,
+            pf_direct,
+            pf_lanes_fab,
+            two,
+            pool_owner,
+            route_split,
+            cp_on,
+            cp_r,
+            cp_r2,
+            cp_s3,
+            cp_mmax,
+            cp_step,
+            cp_step_r,
+            cp
         }
     );
     h

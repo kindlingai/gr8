@@ -32,6 +32,7 @@
 #include <cstdlib>
 #include <string>
 #include "../model_geom.h"
+#include "../scheduler-rs/g6plan.h"
 
 namespace g6rt
 {
@@ -55,8 +56,9 @@ constexpr unsigned ERR_TAG = 0x65000300u;            // | entry << 4 | peer: p's
 
 inline int max_entries() { return 4; }
 inline size_t entry_bytes() { return 2 * HALF; }
-inline size_t bulk_bytes(int E) { return (size_t)E * entry_bytes(); }
-inline int bulk_flags(int E) { return 2 * E; }
+// the fabric plan sizes the wire with these (engine/scheduler-rs src/plan_sizes.rs)
+inline size_t bulk_bytes(int E) { return g6plan_qw_bulk_bytes(E, HALF); }
+inline int bulk_flags(int E) { return g6plan_qw_bulk_flags(E); }
 inline int entry(long n, int E) { return (int)(n % E); }
 inline int f_ready(int e) { return 2 * e; }
 inline int f_consumed(int e) { return 2 * e + 1; }
@@ -64,7 +66,7 @@ inline size_t pos_off(int e, int h) { return (size_t)e * entry_bytes() + (size_t
 inline unsigned long long val(long n) { return (unsigned long long)n + 1; }
 // consumed value p must have posted before build n may write entry e (0 = no wait)
 inline unsigned long long consumed_min(long n, int E) { return n >= E ? (unsigned long long)(n + 1 - E) : 0ull; }
-inline int partner(int r) { return r ^ 1; }
+inline int partner(int r) { return g6plan_qw_partner(r); }
 // ready aux tag: p posts it with ready(n) (BulkJob post_flag aux = aux_out[ready e]); I compare it to mine for the same
 // build. Equal only if both members build the same model layer with the same S, E, QO table (GR8_PF_QP_CTX) and weight
 // form (trellis: the layer's q_b / o_proj are dense trellis): a pair whose GR8_PF_QP_LAYERS / ROLL / WIRE_E / QP_CTX or
