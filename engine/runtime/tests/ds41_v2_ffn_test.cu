@@ -23,6 +23,8 @@ void mx4fill(Dev<uint8_t>& d){std::vector<uint8_t> v(d.n);for(size_t j=0;j<v.siz
 int main(){
     constexpr int H=f::H, I=f::I, NE=f::NE, TK=f::TK, MM=f::MM, E=32, CAP=97;
     f::Scratch q;CK(f::prepare(q,CAP));
+    printf("FFN resident_fc2=%d (V2=%d FC2=%d)\n",int(q.resident_fc2),int(knob::ds_pf_v2()),int(knob::ds_pf_v2_fc2()));
+    CHECK(q.resident_fc2==(knob::ds_pf_v2()&&knob::ds_pf_v2_fc2()));
     Dev<__nv_bfloat16> gate(NE*H),x(CAP*H),out(CAP*H);
     Dev<float> bias(NE),vl(NE);Dev<uint8_t> flags(CAP);
     std::vector<__nv_bfloat16> hg(gate.n),hx(x.n);std::vector<float> hb(NE),hv(NE);

@@ -149,6 +149,16 @@ knobs:
       Experimental sequence-parallel prefill conductor for layers 0..20. Own-row residual state,
       a dedicated fabric and high-priority communication stream; late layers remain on the stock path.
       Needs TP4, one prefill lane and a 128-row late tail. Off leaves the stock path unchanged.
+  GR8_DS_PF_V2_FC2:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_PF_V2=1, use the experimental resident-weight routed-expert down kernel:
+      each CTA holds one 128-column weight slab across all bucketed rows, with heavy experts first.
+      Default 0 retains the grouped stock tensor-core kernel. Has no effect when V2 is off.
+
   GR8_DS_PF_DIRECT:
     scope: agree
     kind: flag

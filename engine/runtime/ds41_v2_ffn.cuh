@@ -3,6 +3,8 @@
 #pragma once
 #include "ds41_v2.h"
 #include "../kernels/ds41_v2_moe.cuh"
+#include "../kernels/ds41_v2_fc2.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 #include "../kernels/ds_ro_cfg.h"
 #include <vector>
 
@@ -34,6 +36,8 @@ inline bool supported(const Layer& w) {
 }
 struct Scratch {
     int capacity = 0, own_capacity = 0, tiles = 0;
+    bool resident_fc2 = false;
+    int* order = nullptr;
     std::vector<void*> allocations;
     Plan* plan = nullptr;
     unsigned* masks = nullptr;
@@ -59,11 +63,13 @@ template<class T> inline cudaError_t alloc(Scratch& q, T*& p, size_t n) {
 }
 inline cudaError_t prepare(Scratch& q, int capacity) {
     if (capacity < 1 || capacity > MM || q.capacity || !q.allocations.empty()) return cudaErrorInvalidValue;
+    q.resident_fc2 = knob::ds_pf_v2() && knob::ds_pf_v2_fc2();
     q.own_capacity = (capacity + 3) / 4;
     q.capacity = q.own_capacity * 4;
     q.tiles = dsr::pw_tile_bound(q.capacity * TK, NE);
     const size_t M = q.capacity, Q = q.own_capacity, R = size_t(q.tiles) * 8;
 #define DS41_V2_ALLOC(p,n) do { cudaError_t e=alloc(q,q.p,n); if(e!=cudaSuccess){release(q);return e;} } while(0)
+    if(q.resident_fc2) { DS41_V2_ALLOC(order,NE); }
     DS41_V2_ALLOC(plan,1); DS41_V2_ALLOC(masks,NE*(MM/32)); DS41_V2_ALLOC(tile0,NE); DS41_V2_ALLOC(logits,Q*NE);
     DS41_V2_ALLOC(own_q,Q*H); DS41_V2_ALLOC(own_s,Q*(H/32)); DS41_V2_ALLOC(own_idx,Q*TK); DS41_V2_ALLOC(own_wt,Q*TK);
     DS41_V2_ALLOC(all_q,M*H); DS41_V2_ALLOC(all_s,M*(H/32)); DS41_V2_ALLOC(all_idx,M*TK); DS41_V2_ALLOC(all_wt,M*TK);
@@ -75,6 +81,7 @@ inline cudaError_t prepare(Scratch& q, int capacity) {
     constexpr size_t S2=mxtc::fc2_smem<DS41_TC_W2,DS41_TC_TPC,DS41_TC_ST2>();
     cudaError_t e=cudaFuncSetAttribute(mxtc::k_fc1_tc<H,I,DS41_TC_CW,DS41_TC_NTG1,DS41_TC_ST1,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,S1);
     if(e==cudaSuccess)e=cudaFuncSetAttribute(mxtc::k_fc2_tc<I,H,DS41_TC_W2,DS41_TC_WT,DS41_TC_TPC,DS41_TC_ST2,COLUMN_GROUPS>,cudaFuncAttributeMaxDynamicSharedMemorySize,S2);
+    if(e==cudaSuccess && q.resident_fc2)e=cudaFuncSetAttribute(ds41v2moe::k_fc2_resident<I,H>,cudaFuncAttributeMaxDynamicSharedMemorySize,ds41v2moe::resident_smem<4,8,I>());
     if(e!=cudaSuccess)release(q);
     return e;
 }
@@ -113,6 +120,7 @@ inline cudaError_t up(const Geometry& g,const Layer& w,Scratch& q,cudaStream_t s
     ds41v2moe::k_import_routes<NE,TK,MM><<<(g.M*8+255)/256,256,0,st>>>(q.all_idx,q.all_wt,g.M,q.plan,q.masks);
     dsr::k_scan_ro<NE,TK,MM><<<1,NE,0,st>>>(q.plan,q.masks,q.tile0);
     ds41v2moe::k_place_routes<TK,MM><<<(g.M*TK+255)/256,256,0,st>>>(q.plan,q.masks,q.tile0,g.M);
+    if(q.resident_fc2)ds41v2moe::k_order_desc<NE,TK,MM><<<1,NE,0,st>>>(q.plan,q.order);
     ds41v2moe::k_relayout<true><<<(size_t(g.M)*H+255)/256,256,0,st>>>(q.all_q,q.record_q,g.M,H);
     if((e=cudaGetLastError())!=cudaSuccess)return e;
     if(ds41_gemm_mx_tc(q.all_q,H,q.all_s,H/32,w.w13,w.sw13,q.sh13,2*I,g.M,2*I,H,st))return cudaErrorInvalidValue;
@@ -128,7 +136,10 @@ inline cudaError_t down_group(const Geometry& g,const Layer& w,Scratch& q,int c,
     if(ds41_gemm_mx_tc(q.sh_q,KP,q.sh_s,KP/32,w.w2+size_t(col0)*KP,w.sw2+size_t(col0)*(KP/32),q.shared,COLS,g.M,COLS,KP,st))return cudaErrorInvalidValue;
     auto a=args(w,q,g.M); a.col_group=c;
     constexpr size_t SM=mxtc::fc2_smem<DS41_TC_W2,DS41_TC_TPC,DS41_TC_ST2>();
-    mxtc::k_fc2_tc<I,H,DS41_TC_W2,DS41_TC_WT,DS41_TC_TPC,DS41_TC_ST2,COLUMN_GROUPS><<<a.n_slots*a.gy2*a.os2,DS41_TC_W2*32,SM,st>>>(a);
+    if(q.resident_fc2) {
+        constexpr size_t RS=ds41v2moe::resident_smem<4,8,I>();
+        ds41v2moe::k_fc2_resident<I,H><<<a.n_slots*(COLS/128),128,RS,st>>>(a,q.order);
+    } else mxtc::k_fc2_tc<I,H,DS41_TC_W2,DS41_TC_WT,DS41_TC_TPC,DS41_TC_ST2,COLUMN_GROUPS><<<a.n_slots*a.gy2*a.os2,DS41_TC_W2*32,SM,st>>>(a);
     ds41v2moe::k_combine_group<H,TK,MM,__nv_bfloat16><<<(size_t(g.padded())*COLS+255)/256,256,0,st>>>(q.plan,q.partial,q.shared,q.send[c],g.M,g.padded(),col0,COLS);
     return cudaGetLastError();
 }
