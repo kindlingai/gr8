@@ -160,6 +160,13 @@ pub struct Runs {
     pub quarter: i32,
     pub slice_stride: usize,
 }
+// g6plan.h pins the same layout on the C++ side
+const _: () = assert!(
+    std::mem::size_of::<Runs>() == 64
+        && std::mem::offset_of!(Runs, slot_bytes) == 16
+        && std::mem::offset_of!(Runs, rs_k) == 48
+        && std::mem::offset_of!(Runs, slice_stride) == 56
+);
 
 /// The main fabric's slot runs for W-row prefill chunks
 #[allow(clippy::too_many_arguments)]
@@ -428,6 +435,7 @@ pub struct CpDims {
     pub qk_dim: i32,
     pub topk: i32,
 }
+const _: () = assert!(std::mem::size_of::<CpDims>() == 16 && std::mem::offset_of!(CpDims, topk) == 12);
 
 /// CpColls::make into the caller's buffers: rows[3] = q, cand and part row bytes; q and cand hold nl entries, part
 /// nl (nr - 1), cap and dst_k nl (nr + 1). Returns the collectives.

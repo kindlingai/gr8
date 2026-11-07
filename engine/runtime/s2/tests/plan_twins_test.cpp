@@ -1,6 +1,7 @@
 // ds41_rs.h's quarter and slice_stride stay C++ for the kernels, and ds41_pf_split.h keeps TAIL_MAX for its static
 // checks; engine/scheduler-rs src/plan_sizes.rs has copies for the fabric plan. They agree over every row count of a
-// prefill chunk, each width and the row sizes of the three models.
+// prefill chunk, each width and the row sizes of the three models. ds41_pf_split.h's late_layer_start is not copied: the
+// plan takes its two layer numbers from the header as inputs.
 #include <cstdio>
 #include "../../ds41_pf_split.h"
 #include "../../ds41_rs.h"

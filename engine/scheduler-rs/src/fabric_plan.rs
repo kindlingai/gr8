@@ -883,6 +883,7 @@ pub unsafe extern "C" fn g6plan_run(i: *const In) -> *mut PlanResult {
     let (mut vcaps, mut vdsts) = (Vec::new(), Vec::new());
     // SAFETY: zero is a valid Entry (integers, false, null pointers)
     let mut entries: [Entry; KINDS] = std::mem::zeroed();
+    debug_assert!(p.fabrics.len() <= KINDS, "more fabrics than entries");
     for (e, f) in entries.iter_mut().zip(&p.fabrics) {
         *e = entry(f, &mut vcaps, &mut vdsts);
     }
@@ -978,6 +979,17 @@ mod tests {
             _ => unreachable!(),
         }
         v
+    }
+
+    #[test]
+    fn every_kind_belongs_to_a_model() {
+        let mut seen = [false; KINDS];
+        for model in [MODEL_GLM53, MODEL_GLM53F, MODEL_DS41] {
+            for k in kinds_of(model) {
+                seen[k as usize] = true;
+            }
+        }
+        assert!(seen.iter().all(|&s| s), "a Kind missing from kinds_of: {seen:?}");
     }
 
     #[test]

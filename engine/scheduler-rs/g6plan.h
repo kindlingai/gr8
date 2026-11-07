@@ -18,6 +18,12 @@ struct g6plan_runs {
 };
 // cplayout.h CpColls's HEADS, KV_RANK, QK_DIM and TOPK
 struct g6plan_cp_dims { int32_t heads, kv_rank, qk_dim, topk; };
+#ifdef __cplusplus
+// ds41_lanes.h, m4sim and the DS41 unit tests reach these two without fabric_plan()'s layout digest check
+static_assert(sizeof(g6plan_runs) == 64 && offsetof(g6plan_runs, slot_bytes) == 16 && offsetof(g6plan_runs, rs_k) == 48 &&
+              offsetof(g6plan_runs, slice_stride) == 56, "g6plan_runs layout (plan_sizes.rs Runs)");
+static_assert(sizeof(g6plan_cp_dims) == 16 && offsetof(g6plan_cp_dims, topk) == 12, "g6plan_cp_dims layout (plan_sizes.rs CpDims)");
+#endif
 
 size_t g6plan_pf_ss_min(int32_t mmax, int32_t nr, int32_t hid);
 size_t g6plan_pf_slot_bytes(int32_t mmax, bool rs, int32_t nr, int32_t hid);

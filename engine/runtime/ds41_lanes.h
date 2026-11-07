@@ -29,7 +29,7 @@ namespace ds41::lanes
 // GR8_DS_PF_LANES: unset / "" / "1" -> 1, "2" -> 2, anything else -> 0 (the caller dies with kParseError). The fabric
 // plan reads it too: engine/scheduler-rs src/plan_sizes.rs.
 inline int parse(const char* v) { return g6plan_ds41_lanes(v); }
-inline const char* const kParseError = g6plan_ds41_lanes_error();
+inline const char* const kParseError = g6plan_ds41_lanes_error();   // set at load, so not constexpr
 
 // The rows of one quantum: lane A = the first min(rows, W), lane B = the rest (0 = one lane). rows must be 1..2W.
 struct Split { uint32_t a = 0, b = 0; };
