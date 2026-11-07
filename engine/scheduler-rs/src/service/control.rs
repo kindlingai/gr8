@@ -388,7 +388,8 @@ impl Control {
         self.stop();
         self.endpoint().fail();
     }
-    /// A test's observer of the control thread's plain pool calls; set before the control thread starts.
+    /// A test's observer of the plain pool calls (the head's control thread and a worker's binds); set before the threads
+    /// start.
     pub fn observe(&self, f: ObserveFn, ctx: *mut c_void) {
         *self.observe.lock().unwrap_or_else(|e| e.into_inner()) = Some((f, ctx));
     }

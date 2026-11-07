@@ -1,4 +1,4 @@
-//! Every rank's compute thread (was service.h's compute and the service's DriverHooks bodies). It waits for a notice
+//! Every rank's compute thread and the driver hooks that carry service logic. It waits for a notice
 //! while idle, stops at each event boundary for the commit (the module's fence, the staged request, the pool's and the
 //! scheduler's digests), applies the commit, and runs the driver's steps between events. No thread is started here: the
 //! C++ Service's compute thread calls `run`, and the driver's hooks call back in on that thread.
