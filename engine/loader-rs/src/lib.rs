@@ -10,6 +10,9 @@
 //!                       (the base for serving from resident pages; slower: 2.2-2.5 GB/s against 3.3 at TP4)
 //!   GR8_LOAD_THREADS=8   worker threads (8 and 16 read equally fast at TP4: the NVMe is the limit)
 //!   GR8_LOAD_CHUNK_MB=32 bytes of image per chunk (each worker holds one staging buffer of this size)
+//!   GR8_LOAD_MERGE_KB=0  0 = one read per range. N > 0 (read mode): each chunk's file ranges sorted by file offset,
+//!                       ranges of one file at most N KB apart read with one pread into a scratch buffer and copied
+//!                       out (fill_merged). Same bytes; the gaps are read too.
 //!
 //! g6l_v2_plan plans an image without a v2 pack: the base pack's tensors, with the v2 experts read from the raw width
 //! files at the offsets of the index slices (src/v2plan.rs). g6l_release_plan plans one from the exlr8 release alone,
@@ -87,6 +90,16 @@ struct Loader<'a> {
     mode: Mode,
     sink: &'a G6lSink,
     cache: Option<&'a gencache::GenCache>,
+    /// GR8_LOAD_MERGE_KB in bytes; None = one read per range
+    merge: Option<u64>,
+}
+
+/// One worker's buffers: Item128 halves (`half`, `perm`) and the merged reads (`scratch`, empty when merging is off).
+struct Bufs {
+    half: sys::AlignedBuf,
+    perm: sys::AlignedBuf,
+    scratch: Option<sys::AlignedBuf>,
+    scratch_len: usize,
 }
 
 unsafe impl Sync for Loader<'_> {}
@@ -94,13 +107,13 @@ unsafe impl Sync for Loader<'_> {}
 // Per-op profiling of the load, GR8_LOAD_PROF=1 (cu-fastboot arm A, ported to DS41): ns/bytes/count triplets printed at
 // the end of run(). Off = one relaxed atomic load per op, no accumulation.
 // bases: 0 zero | 3 pack | 6 copy | 9 O_DIRECT head | 12 buffered tail | 15 mem | 18 gen
-//        21 i128_read | 24 i128_geom | 27 segs iterated | 28 segs <= 64KB
+//        21 i128_read | 24 i128_geom | 27 segs iterated | 28 segs <= 64KB | 29 merged preads (bytes read)
 fn prof_on() -> bool {
     gr8knobs::LOAD_PROF.get()
 }
 #[allow(clippy::declare_interior_mutable_const)]
 const PROF0: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static PROF: [std::sync::atomic::AtomicU64; 29] = [PROF0; 29];
+pub static PROF: [std::sync::atomic::AtomicU64; 32] = [PROF0; 32];
 #[inline]
 fn prof_op<F: FnOnce() -> R, R>(base: usize, bytes: u64, f: F) -> R {
     use std::sync::atomic::Ordering::Relaxed;
@@ -144,7 +157,7 @@ impl Loader<'_> {
     }
 
     /// Fills image bytes `a..a + buf.len()`: pack-file data first, then the source ranges over it.
-    fn fill(&self, a: u64, buf: &mut [u8], half: &mut sys::AlignedBuf, perm: &mut sys::AlignedBuf) -> Result<u64, String> {
+    fn fill(&self, a: u64, buf: &mut [u8], bufs: &mut Bufs) -> Result<u64, String> {
         let b = a + buf.len() as u64;
         prof_op(0, buf.len() as u64, || buf.fill(0));
         let mut read = 0u64;
@@ -153,7 +166,15 @@ impl Loader<'_> {
             prof_op(3, y - x, || self.read(0, x, &mut buf[(x - a) as usize..(y - a) as usize]))?;
             read += y - x;
         }
+        let merged = self.merge.is_some() && bufs.scratch.is_some();
+        if merged {
+            read += self.fill_merged(a, buf, bufs)?;
+        }
+        let Bufs { half, perm, .. } = bufs;
         for s in self.plan.sources(a, b) {
+            if merged && matches!(s.op, Op::Copy | Op::Item128 { .. }) {
+                continue;
+            }
             if prof_on() {
                 use std::sync::atomic::Ordering::Relaxed;
                 PROF[27].fetch_add(1, Relaxed);
@@ -193,6 +214,67 @@ impl Loader<'_> {
                     read += s.nbytes;
                 }
             }
+        }
+        Ok(read)
+    }
+
+    /// The Copy and Item128 ranges of image bytes `a..a + buf.len()`, read in file order: ranges of one file whose gap
+    /// is at most `self.merge` bytes share one pread into `bufs.scratch` (up to its size), then each is copied to its
+    /// place in `buf` (an Item128 range through its permutation). Returns the bytes read, gaps included.
+    fn fill_merged(&self, a: u64, buf: &mut [u8], bufs: &mut Bufs) -> Result<u64, String> {
+        let b = a + buf.len() as u64;
+        let gap = self.merge.unwrap_or(0);
+        let cap = bufs.scratch_len as u64;
+        // (file, first file byte, end file byte, seg): an Item128 range is read whole, a Copy range only inside a..b
+        let mut v: Vec<(usize, u64, u64, &plan::Seg)> = Vec::new();
+        for s in self.plan.sources(a, b) {
+            match s.op {
+                Op::Copy => {
+                    let (x, y) = (s.pack_off.max(a), (s.pack_off + s.nbytes).min(b));
+                    let off = s.file_off + (x - s.pack_off);
+                    v.push((s.file, off, off + (y - x), s));
+                }
+                Op::Item128 { .. } => v.push((s.file, s.file_off, s.file_off + s.nbytes, s)),
+                _ => {}
+            }
+        }
+        v.sort_unstable_by_key(|e| (e.0, e.1));
+        let scratch = bufs.scratch.as_mut().unwrap();
+        let mut read = 0u64;
+        let mut i = 0;
+        while i < v.len() {
+            let (f, lo) = (v[i].0, v[i].1 / ALIGN * ALIGN);
+            let mut hi = v[i].2;
+            let mut j = i + 1;
+            while j < v.len() && v[j].0 == f && v[j].1 <= hi.saturating_add(gap) && v[j].2.max(hi) - lo <= cap {
+                hi = hi.max(v[j].2);
+                j += 1;
+            }
+            if hi - lo > cap {
+                return Err(format!("{}: range of {} bytes past the merge buffer of {cap}", self.plan.files[f], hi - lo));
+            }
+            let run = scratch.slice((hi - lo) as usize);
+            prof_op(29, hi - lo, || self.read(f, lo, run))?;
+            read += hi - lo;
+            for &(_, x0, x1, s) in &v[i..j] {
+                let src = &run[(x0 - lo) as usize..(x1 - lo) as usize];
+                match s.op {
+                    Op::Copy => {
+                        let x = s.pack_off.max(a);
+                        buf[(x - a) as usize..(x - a) as usize + src.len()].copy_from_slice(src);
+                    }
+                    Op::Item128 { hidden } => {
+                        let n = s.nbytes as usize;
+                        let perm = bufs.perm.slice(n);
+                        prof_op(24, n as u64, || plan::item128_to_g6_geometry(src, perm, hidden));
+                        let (x, y) = (s.pack_off.max(a), (s.pack_off + s.nbytes).min(b));
+                        buf[(x - a) as usize..(y - a) as usize]
+                            .copy_from_slice(&perm[(x - s.pack_off) as usize..(y - s.pack_off) as usize]);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            i = j;
         }
         Ok(read)
     }
@@ -240,8 +322,19 @@ fn run(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant, cache: Option<&
     let mode = if gr8knobs::LOAD_MODE.get() == "mmap" { Mode::Mmap } else { Mode::Read };
     let threads = gr8knobs::LOAD_THREADS.get() as usize;
     let chunk = (gr8knobs::LOAD_CHUNK_MB.get() as u64) << 20;
+    let merge = match gr8knobs::LOAD_MERGE_KB.get() {
+        0 => None,
+        kb => Some(kb as u64 * 1024),
+    };
+    run_cfg(plan, pack_bytes, sink, t0, cache, mode, threads, chunk, merge)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_cfg(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant, cache: Option<&gencache::GenCache>, mode: Mode,
+           threads: usize, chunk: u64, merge: Option<u64>) -> Result<G6lStats, String> {
+    let merge = merge.filter(|_| mode == Mode::Read);
     let files = plan.files.iter().map(|p| open_src(p, mode)).collect::<Result<Vec<_>, _>>()?;
-    let l = Loader { plan, files, mode, sink, cache };
+    let l = Loader { plan, files, mode, sink, cache, merge };
     let nchunks = pack_bytes.div_ceil(chunk);
     let next = AtomicU64::new(0);
     let read_total = AtomicU64::new(0);
@@ -260,8 +353,26 @@ fn run(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant, cache: Option<&
                     error.lock().unwrap().get_or_insert(format!("worker {w}: no staging buffer of {chunk} bytes"));
                     return;
                 }
-                let mut half = sys::AlignedBuf::new(max_half.max(1));
-                let mut perm = sys::AlignedBuf::new(max_half.max(1));
+                // a merged pread holds a chunk's ranges and the gaps between them: twice the chunk, plus one
+                // Item128 range that starts before the chunk
+                let scratch_len = (2 * chunk as usize + max_half).div_ceil(ALIGN as usize) * ALIGN as usize;
+                let scratch = match l.merge.map(|_| sys::AlignedBuf::try_new(scratch_len)) {
+                    Some(None) => {
+                        failed.store(true, Ordering::Relaxed);
+                        error.lock().unwrap().get_or_insert(format!(
+                            "worker {w}: no merge scratch buffer of {scratch_len} bytes (GR8_LOAD_MERGE_KB; a smaller \
+                             GR8_LOAD_CHUNK_MB or GR8_LOAD_THREADS needs less)"));
+                        (l.sink.free_staging)(l.sink.ctx, p as *mut c_void);
+                        return;
+                    }
+                    s => s.flatten(),
+                };
+                let mut bufs = Bufs {
+                    half: sys::AlignedBuf::new(max_half.max(1)),
+                    perm: sys::AlignedBuf::new(max_half.max(1)),
+                    scratch,
+                    scratch_len,
+                };
                 while !failed.load(Ordering::Relaxed) {
                     let c = next.fetch_add(1, Ordering::Relaxed);
                     if c >= nchunks {
@@ -270,7 +381,7 @@ fn run(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant, cache: Option<&
                     let a = c * chunk;
                     let n = chunk.min(pack_bytes - a) as usize;
                     let buf = unsafe { std::slice::from_raw_parts_mut(p, n) };
-                    let r = l.fill(a, buf, &mut half, &mut perm).and_then(|read| {
+                    let r = l.fill(a, buf, &mut bufs).and_then(|read| {
                         read_total.fetch_add(read, Ordering::Relaxed);
                         match (l.sink.copy)(l.sink.ctx, w as i32, a, p as *const c_void, n) {
                             0 => Ok(()),
@@ -290,8 +401,8 @@ fn run(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant, cache: Option<&
         use std::sync::atomic::Ordering::Relaxed;
         let g = |i: usize| PROF[i].load(Relaxed);
         let trip = |b: usize| format!("{:.2}s/{:.2}GB/{}", g(b) as f64 / 1e9, g(b + 1) as f64 / 1e9, g(b + 2));
-        eprintln!("# load-prof zero={} pack={} copy={} direct={} buffered={} mem={} gen={} i128read={} i128geom={} segs={} small={}",
-                  trip(0), trip(3), trip(6), trip(9), trip(12), trip(15), trip(18), trip(21), trip(24), g(27), g(28));
+        eprintln!("# load-prof zero={} pack={} copy={} direct={} buffered={} mem={} gen={} i128read={} i128geom={} segs={} small={} merged={}",
+                  trip(0), trip(3), trip(6), trip(9), trip(12), trip(15), trip(18), trip(21), trip(24), g(27), g(28), trip(29));
     }
     if let Some(c) = cache {
         eprintln!("# gen-cache: {}", c.summary());
@@ -497,4 +608,100 @@ unsafe fn write_err(err: *mut c_char, errlen: usize, msg: &str) -> i32 {
         *err.add(n) = 0;
     }
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use plan::Seg;
+
+    struct Img {
+        bytes: Mutex<Vec<u8>>,
+        staging: usize,
+    }
+    extern "C" fn alloc(ctx: *mut c_void, n: usize) -> *mut c_void {
+        let img = unsafe { &*(ctx as *const Img) };
+        assert_eq!(n, img.staging);
+        unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(n, 4096).unwrap()) as *mut c_void }
+    }
+    extern "C" fn free(ctx: *mut c_void, p: *mut c_void) {
+        let img = unsafe { &*(ctx as *const Img) };
+        unsafe { std::alloc::dealloc(p as *mut u8, std::alloc::Layout::from_size_align(img.staging, 4096).unwrap()) }
+    }
+    extern "C" fn copy(ctx: *mut c_void, _w: i32, dst: u64, src: *const c_void, n: usize) -> i32 {
+        let img = unsafe { &*(ctx as *const Img) };
+        let s = unsafe { std::slice::from_raw_parts(src as *const u8, n) };
+        img.bytes.lock().unwrap()[dst as usize..dst as usize + n].copy_from_slice(s);
+        0
+    }
+
+    /// Two source files; Copy and Item128 ranges at shuffled file offsets with gaps, of aligned and odd sizes, laid
+    /// out in the image across chunk boundaries. Returns the files and the segments (image order).
+    fn fixture(dir: &std::path::Path) -> (Vec<String>, Vec<(u64, u64, Op, usize, u64)>, u64) {
+        let mut x = 0x9e3779b97f4a7c15u64;
+        let mut rnd = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let mut files = Vec::new();
+        for f in 0..2 {
+            let p = dir.join(format!("src{f}"));
+            let data: Vec<u8> = (0..4u64 << 20).map(|i| (i.wrapping_mul(2654435761) >> 7) as u8 ^ f as u8).collect();
+            std::fs::write(&p, data).unwrap();
+            files.push(p.to_str().unwrap().to_string());
+        }
+        // file pieces: slots of 64 KB in each file, handed out in a shuffled order
+        let mut slots: Vec<(usize, u64)> = (0..2).flat_map(|f| (0..64u64).map(move |k| (f, k * 65536))).collect();
+        for i in (1..slots.len()).rev() {
+            slots.swap(i, rnd(i as u64 + 1) as usize);
+        }
+        let mut segs = Vec::new();
+        let mut at = 0u64;
+        for (f, slot) in slots {
+            at += [0, 4096, 1000, 0][rnd(4) as usize];
+            let (n, op) = if rnd(3) == 0 { (3072 * (1 + rnd(4)), Op::Item128 { hidden: 128 }) } else {
+                ([4096, 65536, 12345, 40000][rnd(4) as usize], Op::Copy) };
+            let off = slot + [0, 512, 4096][rnd(3) as usize];
+            segs.push((at, n, op, f, off));
+            at += n;
+        }
+        (files, segs, at + 777)
+    }
+
+    fn plan_of(files: &[String], segs: &[(u64, u64, Op, usize, u64)], bytes: u64) -> Plan {
+        let s = segs.iter().map(|&(pack_off, nbytes, op, file, file_off)| Seg { pack_off, nbytes, op, file_off, file }).collect();
+        Plan::from_segs(files.to_vec(), s, Vec::new(), Vec::new(), bytes).unwrap()
+    }
+
+    #[test]
+    fn aligned_buf_try_new_reports_a_failed_allocation() {
+        assert!(sys::AlignedBuf::try_new(isize::MAX as usize).is_none());
+        assert!(sys::AlignedBuf::try_new(usize::MAX).is_none());
+        let mut b = sys::AlignedBuf::try_new(5000).unwrap();
+        assert_eq!(b.slice(8192).len(), 8192);
+    }
+
+    #[test]
+    fn merged_reads_load_the_same_image() {
+        let dir = std::env::temp_dir().join(format!("g6load-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (files, segs, bytes) = fixture(&dir);
+        let mut want = vec![0u8; bytes as usize];
+        read_range(&plan_of(&files, &segs, bytes), 0, &mut want).unwrap();
+        for (merge, threads, chunk) in [(None, 3, 65536), (Some(0), 3, 65536), (Some(4096), 2, 65536),
+                                        (Some(1 << 20), 4, 65536), (Some(1 << 20), 1, 1 << 20), (Some(0), 3, 4096)] {
+            let img = Img { bytes: Mutex::new(vec![0xAA; bytes as usize]), staging: chunk as usize };
+            let sink = G6lSink { ctx: &img as *const Img as *mut c_void, alloc_staging: alloc, free_staging: free, copy };
+            let st = run_cfg(plan_of(&files, &segs, bytes), bytes, &sink, Instant::now(), None, Mode::Read, threads,
+                             chunk, merge).unwrap();
+            let got = img.bytes.into_inner().unwrap();
+            assert!(got == want, "merge {merge:?} threads {threads} chunk {chunk}: image differs");
+            let need: u64 = segs.iter().map(|s| s.1).sum();
+            // an Item128 range is read whole in each chunk it crosses, so both ways read at least the ranges' bytes
+            assert!(st.read_bytes >= need, "merge {merge:?}: read {} of {need}", st.read_bytes);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
