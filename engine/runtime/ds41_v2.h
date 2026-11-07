@@ -87,6 +87,23 @@ inline TailSlice tail_slice(const Geometry& g, int tail = 128) {
     return hi > lo ? TailSlice{lo - g.row0, hi - lo, lo - first} : TailSlice{};
 }
 
+// A separate uniform-layout fabric retains the existing ring/doorbell/proxy
+// implementation. All three runs retain two epoch parities. Capacity inputs
+// are maxima across layers, not a requirement that their actual wires match.
+inline g6::FabricConfig fabric_config(g6::FabricConfig base,int width,int hidden,
+                                      size_t tail_row_bytes,size_t engram_row_bytes) {
+    const int Q=(width+3)/4;
+    base.ncoll=int(Coll::Count); base.compact=true; base.pool=0;
+    base.bulk_bytes=0; base.bulk_flags=0; base.vcap.clear(); base.vdst_k.clear();
+    base.run1=int(Coll::Engram); base.run2=int(Coll::Ffn0); base.run3=0;
+    base.slot_bytes=std::max({size_t(Q)*8192, size_t(128)*tail_row_bytes, size_t(1)<<20});
+    const size_t a2a=std::max(size_t(Q)*2112,size_t(Q)*engram_row_bytes);
+    base.slot_bytes1=4*aligned(a2a+8,256)-8;
+    base.slot_bytes2=4*aligned(size_t(Q)*(hidden/COLUMN_GROUPS)*2+8,256)-8;
+    base.slot_bytes3=0; base.sge2=false;
+    return base;
+}
+
 // Each enqueue is one collective job with its own Rs::ss/bytes (the old fabric
 // Rs descriptor has one stride for a job). The proxy consumes jobs in enqueue
 // order. begin_layer + order cursor enforce identical dependency order on all
