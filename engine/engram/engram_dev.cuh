@@ -213,6 +213,7 @@ struct Config
 {
     std::string prefix;              // weights PREFIX (PREFIX.engram.json, .cmap, .L###.w8/.s8)
     int rank = 0, nr = 1;
+    bool prefill_v2 = false;         // stock admission remains <= 4096
     int max_rows = 8;                // MX; a prefill build (GR8_DS_PREFILL_W) sets its W, up to 4096
     Knobs knobs;                     // read_knobs()
     const __nv_bfloat16* q_w[kNE] = {};   // device [4][5120] bf16: layer e's engram.q_weight / engram.k_weight (the image)
@@ -233,7 +234,7 @@ public:
     bool init(const Config& c, std::string* err)
     {
         cfg_ = c;
-        if (c.max_rows < 1 || c.max_rows > kWideMaxRows) { *err = "engram: max_rows outside 1.." + std::to_string(kWideMaxRows); return false; }
+        if (c.max_rows < 1 || c.max_rows > (c.prefill_v2 ? 8192 : kWideMaxRows)) { *err = "engram: max_rows outside 1.." + std::to_string(kWideMaxRows); return false; }
         if (!load_sidecar(c.prefix, c.rank, c.nr, &sc_, err)) return false;
         for (int e = 0; e < kNE; ++e)
             if (!c.q_w[e] || !c.k_w[e]) { *err = "engram: q_weight / k_weight pointers of layer " + std::to_string(kLayerIds[e]) + " missing"; return false; }
@@ -387,6 +388,25 @@ public:
             if (int x = hooks_.project(model, e, rows, main, emb_d_[e], kv_d_)) return x;
         if (dead_) k_gate_dead<<<dim3(rows, kStreams), kGateThreads, 0, main>>>(T, kv_d_, wgt_d_[e], rows, dead_);
         else k_gate<<<dim3(rows, kStreams), kGateThreads, 0, main>>>(T, kv_d_, wgt_d_[e], rows);
+        return cudaGetLastError();
+    }
+
+    // v2: preserve begin_step's early fetch and wait only on its device event.
+    // exchange(ids,stage,scales,first,valid,emb) assembles only the row owner's
+    // cells into emb[owned][6144]. No host count readback or fence here.
+    template <class TT, class Exchange>
+    int op_owned(void* model,int e,int rows,int row0,int owned,TT* T,cudaStream_t main,Exchange&& exchange) {
+        if (!hooks_.project) return kNotSup;
+        if (!ready_ || e<0 || e>=kNE || rows<1 || rows>cfg_.max_rows || row0<0 || owned<0 ||
+            (owned && row0+owned>rows)) return cudaErrorInvalidValue;
+        cudaError_t rc=cudaStreamWaitEvent(main,done_[e],0);
+        if(rc!=cudaSuccess)return rc;
+        if(int x=exchange(ids_d_+size_t(e)*rows*kIds,stage_d_[e],s8_d_[e],sc_.t[e].first,sc_.t[e].valid,emb_d_[e]))return x;
+        if(!owned)return 0;
+        if(!(tc_ && owned>kDecodeRows && project_wide(e,owned,main)))
+            if(int x=hooks_.project(model,e,owned,main,emb_d_[e],kv_d_))return x;
+        if(dead_)k_gate_dead<<<dim3(owned,kStreams),kGateThreads,0,main>>>(T,kv_d_,wgt_d_[e],owned,dead_+row0);
+        else k_gate<<<dim3(owned,kStreams),kGateThreads,0,main>>>(T,kv_d_,wgt_d_[e],owned);
         return cudaGetLastError();
     }
 
