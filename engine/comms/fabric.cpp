@@ -767,7 +767,9 @@ void Fabric::enqueue_step(unsigned long long step, const std::vector<uint32_t>& 
   FCHECK(!(rs.flat & ~rs.mask) && (!rs.flat || cfg_.sge2));   // flat slices are RS slices, and need the 2-SGE QPs
   if (rs.mask) {
     FCHECK((int)rs.bytes.size() == nranks() && rs.ss % 8 == 0);
-    for (uint32_t b : rs.bytes) FCHECK(b % 8 == 0 && (rs.flat ? b <= rs.ss : b + 8 <= rs.ss) && rs.ss * nranks() <= dev_.stride);
+    // dev_.stride is RUN 0 only; later runs may be wider (v2's A2A/RS).
+    // Bound every slice by its real collective slot in the checks below.
+    for (uint32_t b : rs.bytes) FCHECK(b % 8 == 0 && (rs.flat ? b <= rs.ss : b + 8 <= rs.ss));
     // flat: NR slices of ss, then NR tail words
     for (size_t c = 0; c < sizes.size(); c++) if (mask_bit(rs.flat, c)) FCHECK(rs.ss * nranks() + 8 * (size_t)nranks() <= fab_slot_stride(dev_, (int)c));
     for (size_t c = 0; c < sizes.size(); c++) if (mask_bit(rs.mask, c) && !mask_bit(rs.flat, c)) FCHECK(rs.ss * nranks() <= fab_slot_stride(dev_, (int)c));
