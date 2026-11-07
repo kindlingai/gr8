@@ -427,7 +427,9 @@ impl Pool {
         Ok(())
     }
 
-    /// After the last add_tier(): drops the index runs whose base came back in no tier (stash.rs Stash::loaded).
+    /// After the last add_tier(): drops the index runs whose base came back in no tier, and the session runs of a
+    /// whole index reopened with keep=system, plus the records add_tier dropped for slots past the tier or taken twice
+    /// (stash.rs Stash::loaded). Returns how many.
     pub fn tiers_loaded(&mut self) -> usize {
         self.stash.as_mut().map_or(0, |s| s.loaded())
     }

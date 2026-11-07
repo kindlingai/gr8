@@ -1285,3 +1285,37 @@ fn a_whole_index_reopened_with_keep_system_drops_its_runs() {
     assert!(left.iter().all(|e| e.kind.prefix()) && !left.is_empty(), "the runs' records are gone, the prefixes stay");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// add_tier drops a record whose slots are past the tier or already claimed (record and all); loaded() counts it, so
+// the boot line shows it
+#[test]
+fn records_with_slots_past_the_tier_or_taken_twice_are_dropped_and_counted() {
+    use g6kvman::stash::{Entry, Index, Stash};
+    let dir = std::env::temp_dir().join(format!("g6kv-badslots-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let entry = |id: u64, slots: Vec<u64>| Entry {
+        id,
+        kind: Kind::Prefix,
+        key: id,
+        st: Finished { history: toks(id as i32, 64), valid: 64, written_end: 64, pf_end: 64 },
+        slots,
+        base: None,
+        hits: 1,
+        tail: None,
+        namespace: g6kvman::pool::STOCK_NAMESPACE,
+    };
+    {
+        let (mut ix, _) = Index::open(&dir, "bad").unwrap();
+        ix.add(&entry(1, vec![0, 1])).unwrap();
+        ix.add(&entry(2, vec![1, 2])).unwrap(); // slot 1 taken twice
+        ix.add(&entry(3, vec![20, 21])).unwrap(); // past a 16-slot tier
+    }
+    let mut s = Stash::new(2, 64);
+    s.add_tier(16, Keep::All, Some(Index::open(&dir, "bad").unwrap()));
+    assert_eq!(s.loaded(), 2, "both bad records are counted");
+    assert_eq!(s.entries(0).iter().map(|e| e.id).collect::<Vec<_>>(), vec![1]);
+    assert_eq!(s.loaded(), 0, "counted once");
+    let left: Vec<u64> = Index::open(&dir, "bad").unwrap().1.iter().map(|e| e.id).collect();
+    assert_eq!(left, vec![1], "their records are gone");
+    let _ = std::fs::remove_dir_all(&dir);
+}

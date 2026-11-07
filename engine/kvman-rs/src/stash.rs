@@ -232,6 +232,8 @@ pub struct Stash {
     // index runs whose base is not loaded yet (tier, entry): their slots stay claimed until a later tier brings the
     // base (evict() moves an entry on to a later tier) or loaded() drops them
     waiting: Vec<(usize, Entry)>,
+    // index records add_tier dropped (slots past the tier or taken twice); loaded() reports them
+    bad_records: usize,
     pub index_errors: u64,
     // the write limit: blocks per 1000 pages computed (0 = none), and the credit in thousandths of a block
     limit_milli: u64,
@@ -270,6 +272,7 @@ impl Stash {
             next_id: 1,
             pin: Vec::new(),
             waiting: Vec::new(),
+            bad_records: 0,
             index_errors: 0,
             limit_milli: 0,
             credit: 0,
@@ -303,9 +306,12 @@ impl Stash {
                 if e.slots.iter().all(|&s| s < slots) && t.alloc.claim(&e.slots) {
                     self.next_id = self.next_id.max(e.id + 1);
                     wait.push(e);
-                } else if ix.drop(e.id).is_err() {
+                } else {
                     // slots past the tier or taken twice: its record goes, so no later boot reads blocks reused since
-                    self.index_errors += 1;
+                    self.bad_records += 1;
+                    if ix.drop(e.id).is_err() {
+                        self.index_errors += 1;
+                    }
                 }
             }
             loop {
@@ -361,8 +367,8 @@ impl Stash {
     /// After the last add_tier: the index runs whose base came back in no tier are dropped (slots freed, records
     /// gone), so no later boot reads blocks reused since.
     /// A tier whose index is not whole (keep=system now) drops the runs an earlier whole index recorded: it never
-    /// journals their lifecycle, so a kept one could later point at reused blocks. Returns how many runs both rules
-    /// dropped.
+    /// journals their lifecycle, so a kept one could later point at reused blocks. Returns how many records were
+    /// dropped: by these two rules, plus the ones add_tier dropped for slots past the tier or taken twice.
     pub fn loaded(&mut self) -> usize {
         let mut unjournaled = 0;
         for t in self.tiers.iter_mut().filter(|t| t.index.is_some() && !t.whole) {
@@ -386,7 +392,7 @@ impl Stash {
                 }
             }
         }
-        gone.len() + unjournaled
+        gone.len() + unjournaled + std::mem::take(&mut self.bad_records)
     }
 
     pub fn tiers(&self) -> usize {
