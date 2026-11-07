@@ -692,7 +692,8 @@ R6a's with "abi 2" read as "abi 3". The Rust parse keeps those hashes in all fou
 93 of 93 refusals (7 unreachable). `signature_vectors_test` keeps its three hashes. `scripts/check_args.py` on a GB10:
 the 352 transcripts of R6a's engines and R6b's (121 GLM, 116 Flash, 115 DS41) are byte-identical apart from the ABI
 number. `scripts/host_tests.sh` and `cargo test --release --workspace` pass, and the 13,777 round logs the host tests
-write are byte-identical to R6a's. The GLM, Flash and DS41 engines build on a GB10. Boot pending.
+write are byte-identical to R6a's. The GLM, Flash and DS41 engines build on a GB10. Boot: TP4 GLM, R6a then R6b, the round logs byte-identical on all four ranks, the 24 T=0
+replies matching, and the head's log lines equal apart from the module line's ABI, times and memory.
 
 ### R7. Step sizes
 
