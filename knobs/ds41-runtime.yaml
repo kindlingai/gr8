@@ -149,6 +149,28 @@ knobs:
       Experimental sequence-parallel prefill conductor for layers 0..20. Own-row residual state,
       a dedicated fabric and high-priority communication stream; late layers remain on the stock path.
       Needs TP4, one prefill lane and a 128-row late tail. Off leaves the stock path unchanged.
+  GR8_DS_PF_V2_RS_BLOCKS:
+    scope: local
+    kind: ints
+    default: "0"
+    doc: >-
+      V2 FFN reduce-scatter only: 0 retains the eight-block scalar reduce kernel.
+      Otherwise a comma list of positive block counts (e.g. 48,192,1024);
+      request ID r selects list[r % length], logged once per request per rank.
+      Uses aligned 16-byte cache-volatile loads and 16-byte stores with a scalar tail,
+      preserving the original FP32 rank summation order. Mixed zero/nonzero lists
+      are invalid. Boot gathers and non-v2 paths are unchanged.
+  GR8_DS_PF_V2_PACK_BLOCKS:
+    scope: local
+    kind: ints
+    default: "0"
+    doc: >-
+      V2 wire pack/unpack only (AG, A2A and RS): 0 retains eight blocks.
+      Otherwise a comma list of positive block counts (e.g. 48,192,1024);
+      request ID r selects list[r % length], logged once per request per rank.
+      Retains the existing aligned 16-byte copies and scalar ragged/unaligned
+      fallback, without changing kernels. Mixed zero/nonzero lists are invalid.
+      Boot gathers retain eight blocks. Independent of GR8_DS_PF_V2_RS_BLOCKS.
   GR8_DS_PF_V2_XTRACE:
     scope: local
     kind: flag

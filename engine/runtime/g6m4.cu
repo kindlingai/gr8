@@ -1787,6 +1787,7 @@ int main(int argc, char** argv)
                 const size_t range_a_end = skip_late ? split.b - 1 : split.b;
                 ds41::Stop stop;
                 if (pf_v2) {
+                    v2engine.v.widths.select(c.request,c.slot,R);
                     ds41::v2::timing_begin_chunk(v2engine.v,c.request,c.first,c.rows);
                     v2engine.run(m,(int)c.rows,split.i_late,skip_late);
                     ds41::v2::timing_end_chunk(v2engine.v);

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <vector>
 #include "../comms/fabric.h"
+#include "ds41_v2_width.h"
 
 namespace ds41::v2 {
 constexpr int MAX_ROWS = 8192;
@@ -129,6 +130,7 @@ namespace ds41::v2 {
 struct Timing;
 struct State {
     Timing* timing = nullptr;
+    CommWidths widths;
     cudaStream_t st = nullptr, cs = nullptr;
     cudaEvent_t produced[int(Coll::Count)] = {}, received[int(Coll::Count)] = {};
     g6::Fabric* fabric = nullptr;

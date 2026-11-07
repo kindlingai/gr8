@@ -138,6 +138,46 @@ __global__ void reduce(g6::FabricDev f,Seq epoch,int c,Geometry g,size_t stride,
     }
     if constexpr(Trace)trace_done(f,epoch,c);
 }
+// The opt-in path retains reduce<> above verbatim. __ldcv(uint4*) emits
+// ld.global.cv.v4.u32, the same cache policy as the scalar bf16 __ldcv:
+// peer/fabric data is not read through a stale cached global-load path.
+// Publication/wait ordering remains the original separate kernel chain.
+template<bool Trace=false>
+__global__ void reduce_vector(g6::FabricDev f,Seq epoch,int c,Geometry g,size_t stride,int cols,__nv_bfloat16* out) {
+    const size_t tid=size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    const size_t step=size_t(gridDim.x)*blockDim.x, n=size_t(g.owned)*cols;
+    uintptr_t alignment=reinterpret_cast<uintptr_t>(out);
+    for(int p=0;p<g.nr;++p)
+        alignment|=reinterpret_cast<uintptr_t>(peer(f,epoch,c,p)+(p==g.rank?size_t(g.rank)*stride:0));
+    const size_t full=(alignment&15)?0:n/8*8;
+    for(size_t i=tid*8;i<full;i+=step*8) {
+        float sums[8]={};
+        for(int p=0;p<g.nr;++p) {
+            const char* base=peer(f,epoch,c,p)+(p==g.rank?size_t(g.rank)*stride:0);
+            const uint4 v=__ldcv(reinterpret_cast<const uint4*>(base+i*2));
+            const unsigned words[4]={v.x,v.y,v.z,v.w};
+            #pragma unroll
+            for(int j=0;j<8;++j)
+                sums[j]+=__bfloat162float(__ushort_as_bfloat16(static_cast<unsigned short>(words[j/2]>>(16*(j%2)))));
+        }
+        unsigned words[4];
+        #pragma unroll
+        for(int j=0;j<4;++j)
+            words[j]=unsigned(__bfloat16_as_ushort(__float2bfloat16_rn(sums[2*j]))) |
+                (unsigned(__bfloat16_as_ushort(__float2bfloat16_rn(sums[2*j+1])))<<16);
+        *reinterpret_cast<uint4*>(out+i)=make_uint4(words[0],words[1],words[2],words[3]);
+    }
+    // Usually fewer than eight elements; also the safe unaligned fallback.
+    for(size_t i=full+tid;i<n;i+=step) {
+        float sum=0.f;
+        for(int p=0;p<g.nr;++p) {
+            const char* base=peer(f,epoch,c,p)+(p==g.rank?size_t(g.rank)*stride:0);
+            sum+=__bfloat162float(__ldcv(reinterpret_cast<const __nv_bfloat16*>(base)+i));
+        }
+        out[i]=__float2bfloat16_rn(sum);
+    }
+    if constexpr(Trace)trace_done(f,epoch,c);
+}
 inline Segments segments(const Geometry& g,const Segment* src,int count) {
     Segments p{}; p.w=wire_layout(g.Q,src,count);
     require(p.w.count>0,"invalid segment layout");
@@ -160,6 +200,11 @@ inline void enqueue(State& s,Coll coll,const WireLayout& w,bool scatter) {
 inline void init(State& s,g6::Fabric& f,cudaStream_t st) {
     require(!s.live,"state initialized twice");
     s.fabric=&f; s.wire=f.dev(); s.st=st;
+    s.widths=CommWidths{};
+    require(CommWidths::decode(knob::ds_pf_v2_rs_blocks(),s.widths.rs),
+        "GR8_DS_PF_V2_RS_BLOCKS needs 0 or positive int block counts");
+    require(CommWidths::decode(knob::ds_pf_v2_pack_blocks(),s.widths.pack),
+        "GR8_DS_PF_V2_PACK_BLOCKS needs 0 or positive int block counts");
     require(s.wire.ncoll==int(Coll::Count),"v2 fabric collective count");
     int lo=0,hi=0; check(cudaDeviceGetStreamPriorityRange(&lo,&hi));
     check(cudaStreamCreateWithPriority(&s.cs,cudaStreamNonBlocking,hi));
@@ -208,19 +253,19 @@ inline void all_gather(State& s,Coll c,const Segment* segments,int count,cudaStr
     if(s.wire.xt) {
         detail::trace_produced<<<1,32,0,st>>>(s.wire,s.epoch,int(c));
         TimingDetailSpan packed(s,TimingStage::PackPublish,st,int(c));
-        detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,false);
+        detail::pack<<<s.widths.pack_blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,false);
         detail::publish<true><<<1,32,0,st>>>(s.wire,s.epoch,int(c));
         packed.finish();
         TimingDetailSpan waited(s,TimingStage::Wait,st,int(c));
         detail::wait<true><<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
         waited.finish();
         TimingDetailSpan consumed(s,TimingStage::Unpack,st,int(c));
-        detail::unpack<true><<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,false);
+        detail::unpack<true><<<s.widths.pack_blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,false);
     } else {
-        detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,false);
+        detail::pack<<<s.widths.pack_blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,false);
         detail::publish<<<1,32,0,st>>>(s.wire,s.epoch,int(c));
         detail::wait<<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
-        detail::unpack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,false);
+        detail::unpack<<<s.widths.pack_blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,false);
     }
     check(cudaPeekAtLastError());
 }
@@ -229,19 +274,19 @@ inline void all_to_all(State& s,Coll c,const Segment* segments,int count,cudaStr
     TimingSpan timer(s,c==Coll::AttnOut?TimingStage::AttnA2A:TimingStage::EngramA2A,st);
     if(s.wire.xt) {
         TimingDetailSpan packed(s,TimingStage::PackPublish,st,int(c));
-        detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
+        detail::pack<<<s.widths.pack_blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
         detail::publish<true><<<1,32,0,st>>>(s.wire,s.epoch,int(c));
         packed.finish();
         TimingDetailSpan waited(s,TimingStage::Wait,st,int(c));
         detail::wait<true><<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
         waited.finish();
         TimingDetailSpan consumed(s,TimingStage::Unpack,st,int(c));
-        detail::unpack<true><<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
+        detail::unpack<true><<<s.widths.pack_blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
     } else {
-        detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
+        detail::pack<<<s.widths.pack_blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
         detail::publish<<<1,32,0,st>>>(s.wire,s.epoch,int(c));
         detail::wait<<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
-        detail::unpack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
+        detail::unpack<<<s.widths.pack_blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
     }
     check(cudaPeekAtLastError());
 }
@@ -252,19 +297,25 @@ inline void reduce_scatter(State& s,int group,const __nv_bfloat16* all,__nv_bflo
     TimingSpan timer(s,TimingStage::Rs,st,group);
     if(s.wire.xt) {
         TimingDetailSpan packed(s,TimingStage::PackPublish,st,int(c));
-        detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
+        detail::pack<<<s.widths.pack_blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
         detail::publish<true><<<1,32,0,st>>>(s.wire,s.epoch,int(c));
         packed.finish();
         TimingDetailSpan waited(s,TimingStage::Wait,st,int(c));
         detail::wait<true><<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
         waited.finish();
         TimingDetailSpan consumed(s,TimingStage::Reduce,st,int(c));
-        detail::reduce<true><<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p.w.stride,cols,own);
+        if(s.widths.rs_blocks)
+            detail::reduce_vector<true><<<s.widths.rs_blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p.w.stride,cols,own);
+        else
+            detail::reduce<true><<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p.w.stride,cols,own);
     } else {
-        detail::pack<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
+        detail::pack<<<s.widths.pack_blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p,true);
         detail::publish<<<1,32,0,st>>>(s.wire,s.epoch,int(c));
         detail::wait<<<1,32,0,st>>>(s.wire,s.epoch,int(c),p.w.payload);
-        detail::reduce<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p.w.stride,cols,own);
+        if(s.widths.rs_blocks)
+            detail::reduce_vector<<<s.widths.rs_blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p.w.stride,cols,own);
+        else
+            detail::reduce<<<COMM_BLOCKS,COMM_THREADS,0,st>>>(s.wire,s.epoch,int(c),s.g,p.w.stride,cols,own);
     }
     check(cudaPeekAtLastError());
 }
