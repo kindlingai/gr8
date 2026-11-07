@@ -83,6 +83,19 @@ impl Io {
         Ok(())
     }
     /// Wakes both directions on an epoch's failure.
+    /// Closes the send side only: the peer reads EOF after the frames already sent, and this end still receives.
+    pub fn close_send(&self) {
+        // SAFETY: shutdown(2) on this link's own descriptor
+        unsafe { sys::shutdown(self.fd, sys::SHUT_WR) };
+    }
+    /// True once the peer closed its send side or the link failed: a non-blocking peek reads EOF or an error. False
+    /// while the link is open, also with a frame waiting (the peek leaves it in place).
+    pub fn peer_closed(&self) -> bool {
+        let mut b = 0u8;
+        // SAFETY: a 1-byte buffer that outlives the call
+        let k = unsafe { sys::recv(self.fd, (&mut b as *mut u8).cast(), 1, sys::MSG_PEEK | sys::MSG_DONTWAIT) };
+        k == 0 || (k < 0 && !matches!(sys::errno(), sys::EAGAIN | sys::EINTR))
+    }
     pub fn shutdown(&self) {
         // SAFETY: plain syscall on the owned descriptor
         unsafe { sys::shutdown(self.fd, sys::SHUT_RDWR) };

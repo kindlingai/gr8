@@ -14,7 +14,7 @@ use super::io::Io;
 use super::wire::{self, Ack, Commit, Notice, ADMIT};
 use super::{refused, require, R};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -73,6 +73,8 @@ pub struct Endpoint {
     role: Role,
     // head: the least room of the last event's ACKs, read inside make_commit
     agreed_room: AtomicU32,
+    // worker: the head's orderly quit arrived
+    quit_received: AtomicBool,
 }
 
 impl Endpoint {
@@ -98,6 +100,7 @@ impl Endpoint {
             cv: Condvar::new(),
             role,
             agreed_room: AtomicU32::new(u32::MAX),
+            quit_received: AtomicBool::new(false),
         })
     }
     /// The head over its links to ranks 1.. (none at TP1: it agrees with itself).
@@ -336,6 +339,25 @@ impl Endpoint {
             }
         }
     }
+    /// Worker: the head's orderly quit arrived on the link.
+    pub fn quit_received(&self) -> bool {
+        self.quit_received.load(Ordering::SeqCst)
+    }
+    /// Worker, once it is stopping after the head's quit: closes its send side, which tells the head this rank stops.
+    /// The head's frames are still read until the head closes the link.
+    pub fn close_send(&self) {
+        if let Role::Worker { io, .. } = &self.role {
+            io.io().close_send();
+        }
+    }
+    /// After an orderly quit, true once no rank needs this one's links open any more. Head: every worker closed its
+    /// send side (close_send) or its link failed. Worker: the head closed the link, which failed the epoch.
+    pub fn quit_settled(&self) -> bool {
+        match &self.role {
+            Role::Head { peers, .. } => peers.iter().all(|p| p.io().peer_closed()),
+            Role::Worker { .. } => self.state().failed,
+        }
+    }
     /// A worker's control thread on its one link: reads the head's frames until the link fails or closes, idle
     /// between events. `on_quit` runs on the head's orderly quit.
     pub fn receive_events(&self, mut on_quit: impl FnMut() -> R<()>) -> R<()> {
@@ -359,6 +381,7 @@ impl Endpoint {
                     }
                     wire::QUIT => {
                         require(wire::decode_quit(&b)? == self.epoch, "quit from another epoch")?;
+                        self.quit_received.store(true, Ordering::SeqCst);
                         on_quit()?;
                     }
                     wire::GO => {
@@ -473,6 +496,53 @@ mod tests {
             head.fail();
             assert!(reader.join().unwrap().is_err());
         });
+    }
+
+    // the orderly quit settles both ways: the head waits for every worker's close_send, a worker for the head's close
+    #[test]
+    fn an_orderly_quit_settles_on_both_sides() {
+        let ((h1, w1), (h2, w2)) = (pair(), pair());
+        let head = Endpoint::head(1, vec![Link::new(&h1), Link::new(&h2)]).unwrap();
+        let workers =
+            [Endpoint::worker(1, 1, Link::new(&w1)).unwrap(), Endpoint::worker(1, 2, Link::new(&w2)).unwrap()];
+        std::thread::scope(|s| {
+            let readers: Vec<_> = workers.iter().map(|w| s.spawn(move || w.receive_events(|| Ok(())))).collect();
+            assert!(!head.quit_settled() && workers.iter().all(|w| !w.quit_received() && !w.quit_settled()));
+            head.quit();
+            while !workers.iter().all(|w| w.quit_received()) {
+                std::thread::yield_now();
+            }
+            // one worker closed: the head still waits for the other
+            workers[0].close_send();
+            let t = std::time::Instant::now();
+            while t.elapsed() < std::time::Duration::from_millis(50) {
+                assert!(!head.quit_settled());
+            }
+            workers[1].close_send();
+            while !head.quit_settled() {
+                std::thread::yield_now();
+            }
+            // the workers still read the open link until the head closes it
+            assert!(workers.iter().all(|w| !w.quit_settled()));
+            head.fail();
+            for r in readers {
+                assert!(r.join().unwrap().is_err());
+            }
+            assert!(workers.iter().all(|w| w.quit_settled()));
+        });
+    }
+
+    // an unread frame hides the worker's close (the monitor's linger bounds that case); once read, the close shows
+    #[test]
+    fn a_waiting_frame_hides_the_close() {
+        let (h, w) = pair();
+        let head = Endpoint::head(1, vec![Link::new(&h)]).unwrap();
+        w.send(b"x").unwrap();
+        assert!(!head.quit_settled());
+        drop(w);
+        assert!(!head.quit_settled());
+        assert_eq!(h.receive(false).unwrap(), b"x");
+        assert!(head.quit_settled());
     }
 
     // a callback that fails ends the epoch: the gate refuses afterwards and the links are shut down

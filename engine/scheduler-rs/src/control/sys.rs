@@ -68,7 +68,9 @@ pub const AF_INET: c_int = 2;
 pub const SOCK_STREAM: c_int = 1;
 pub const IPPROTO_TCP: c_int = 6;
 pub const TCP_NODELAY: c_int = 1;
+pub const SHUT_WR: c_int = 1;
 pub const SHUT_RDWR: c_int = 2;
+pub const MSG_PEEK: c_int = 2;
 pub const F_GETFL: c_int = 3;
 pub const F_SETFL: c_int = 4;
 pub const F_SETFD: c_int = 2;
@@ -93,6 +95,7 @@ mod os {
     pub const TCP_KEEPCNT: c_int = 6;
     pub const TCP_USER_TIMEOUT: c_int = 18;
     pub const MSG_NOSIGNAL: c_int = 0x4000;
+    pub const MSG_DONTWAIT: c_int = 0x40;
     pub const SOCK_CLOEXEC: c_int = 0x80000;
     pub const SOCK_NONBLOCK: c_int = 0x800;
     pub const O_NONBLOCK: c_int = 0x800;
@@ -116,6 +119,7 @@ mod os {
     pub const TCP_KEEPCNT: c_int = 0x102;
     pub const TCP_USER_TIMEOUT: c_int = -1;
     pub const MSG_NOSIGNAL: c_int = 0;
+    pub const MSG_DONTWAIT: c_int = 0x80;
     pub const SOCK_CLOEXEC: c_int = 0;
     pub const SOCK_NONBLOCK: c_int = 0;
     pub const O_NONBLOCK: c_int = 0x4;
