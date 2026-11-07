@@ -120,8 +120,8 @@ pools of the indexer, so a pool and its key live on one rank. Decode past R runs
 1. append the rows this rank stores (every rank writes the raw index ring, which stays replicated), absorb its heads;
 2. score the pools this rank owns, the prefix's too, and keep a top 512 per row;
 3. all-gather the candidates (512 x 8 B a row) and merge them into the replicated path's list, bit for bit;
-4. all-gather the absorbed queries, and for every head group a partial attention over this rank's selected keys, each
-   sent to the group's rank;
+4. all-gather the absorbed queries, and for every head group a partial attention over this rank's selected keys (with
+   equal head groups, TP=2 and TP=4, all of them in one call), each sent to the group's rank;
 5. merge the partials in rank order (log-sum-exp), then the value projection.
 
 The lists and the cache bytes equal the replicated path's. The output does not: the merge sums in another order, as

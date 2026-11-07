@@ -8,6 +8,7 @@
 //   output  every rank's head group within the LSE merge's rounding of the replicated output (the partials are summed
 //           in another order, so not the same bits), and the same bits in the plain and the graph form
 //   below R a CP binding takes the replicated path: the same output bits as the replicated binding
+//   groups  g6a_cp_groups (every head group in one call, equal groups) gives each group's g6a_cp_group partial, bit for bit
 // Build & run on a Spark (sm_121a), in the toolchain container (KP_TILE_POOLS=1024 makes 4096-token key tiles, so the
 // tiles run at small contexts; drop it for the shipped tile):
 //   nvcc -std=c++17 -O3 -gencode=arch=compute_121a,code=sm_121a -DG6_MODEL_FLASH=1 -DG6_KV4=1 -DG6_CP=1 -DDEC_S2 \
@@ -235,6 +236,29 @@ int main() {
                 }
             for (int d = 0; d < NR; ++d) CKI(g6a_cp_finish(&a[d], cell(d), rk[d].cp.scratch, rk[d].cp.scratch_bytes, rk[d].part, st));
             CK(cudaStreamSynchronize(st));
+            if (g6nr::HMIN == g6nr::HMAX && g6a_cp_groups_ok(rk[0].heads)) {
+                // every group's partial over rank s's keys in one call: group d at heads d H..
+                const int H = rk[0].heads;
+                const size_t gb = blk(M, H), fb = (size_t)M * H * (fa::LAT + 2) * 4;
+                float* qall = dalloc<float>((size_t)M * NR * H * fa::LAT);
+                float* fused = dalloc<float>(NR * gb);
+                const size_t bytes = g6a_cp_groups_bytes(NR * H, M);
+                char* buf = dalloc<char>(bytes);
+                bool same = true;
+                for (int s = 0; s < NR; ++s) {
+                    for (int d = 0; d < NR; ++d)
+                        CK(cudaMemcpy2DAsync(qall + (size_t)d * H * fa::LAT, (size_t)NR * H * fa::LAT * 4, rk[d].q, (size_t)H * fa::LAT * 4,
+                                             (size_t)H * fa::LAT * 4, M, cudaMemcpyDeviceToDevice, st));
+                    G6Attn ad = a[s];
+                    ad.heads = NR * H;
+                    CKI(g6a_cp_groups(&ad, cell(s), buf, bytes, qall, nullptr, fused, H, (int64_t)gb, st));
+                    CK(cudaStreamSynchronize(st));
+                    for (int d = 0; d < NR; ++d)
+                        same &= d2h((const uint8_t*)(fused + d * gb), fb) == d2h((const uint8_t*)(rk[d].part + s * blk(M, H)), fb);
+                }
+                report(same, tag + " " + (form ? "graph" : "plain") + ": g6a_cp_groups gives every group's g6a_cp_group partial");
+                cudaFree(qall); cudaFree(fused); cudaFree(buf);
+            }
             const char* fn = form ? "graph" : "plain";
             bool ix_ok = true, err_ok = true, out_ok = true, same = true;
             double maxd = 0, maxr = 0;

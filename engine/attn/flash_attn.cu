@@ -503,8 +503,8 @@ static bool run_ok(const G6Attn& a){
 // pool; 0 = none. Every pool has one owner, so keys are distinct and the order is total.
 constexpr int CPT=g6kv::TOP_POOLS;   // threads of cp_local / cp_merge, and the candidates of a rank a row
 __device__ __forceinline__ uint64_t cp_key(float s,int p){return ((uint64_t)kp_key(s)<<32)|(0xffffffffu-(uint32_t)p);}
-// warp 0: kp_pick on 64-bit keys
-__device__ __forceinline__ void cp_pick(const int* hist,int k,uint64_t prefix,int shift,uint64_t* prefix_s,int* need_s){
+// warp 0: kp_pick on 64-bit keys; *all_s = the chosen bin holds exactly the keys still needed
+__device__ __forceinline__ void cp_pick(const int* hist,int k,uint64_t prefix,int shift,uint64_t* prefix_s,int* need_s,int* all_s){
     const int lane=threadIdx.x&31;
     int h[8],loc=0;
     #pragma unroll
@@ -517,22 +517,26 @@ __device__ __forceinline__ void cp_pick(const int* hist,int k,uint64_t prefix,in
     for(int j=0;j<8;j++)if(jb<0&&255-8*lane-j>0){if(acc+h[j]>=k)jb=j;else acc+=h[j];}
     const unsigned found=__ballot_sync(0xffffffffu,jb>=0);
     const int src=found?__ffs(found)-1:31;
-    if(lane==src){*prefix_s=prefix|((uint64_t)(found?255-8*lane-jb:0)<<shift);*need_s=k-acc;}
+    if(lane==src){const int b=found?255-8*lane-jb:0;*prefix_s=prefix|((uint64_t)b<<shift);*need_s=k-acc;*all_s=hist[b]==k-acc;}
 }
-// CPT threads: the k-th largest of the keys key(0..n-1) (distinct where nonzero; k <= the nonzero ones), 8 radix passes
+// CPT threads: a threshold thr such that exactly k of the keys key(0..n-1) are >= thr (keys distinct where nonzero; k <= the
+// nonzero ones): radix passes of 8 bits from the top, until the boundary bin holds exactly the keys still needed (its
+// lower bits then 0); at most 8 passes, about 3 for float scores
 template<class F>
 __device__ uint64_t cp_kth(F key,int n,int k){
-    __shared__ int hist[256],need_s;__shared__ uint64_t prefix_s;
+    __shared__ int hist[256],need_s,all_s;__shared__ uint64_t prefix_s;
     const int t=threadIdx.x;uint64_t prefix=0,mask=0;
     for(int pass=0;pass<8;pass++){const int shift=56-8*pass;
         for(int i=t;i<256;i+=CPT)hist[i]=0;
         __syncthreads();
         for(int i=t;i<n;i+=CPT){const uint64_t x=key(i);if((x&mask)==prefix)atomicAdd(&hist[(x>>shift)&255],1);}
         __syncthreads();
-        if(t<32)cp_pick(hist,k,prefix,shift,&prefix_s,&need_s);
+        if(t<32)cp_pick(hist,k,prefix,shift,&prefix_s,&need_s,&all_s);
         __syncthreads();
         prefix=prefix_s;k=need_s;mask|=(uint64_t)255<<shift;
+        const bool done=all_s;
         __syncthreads();
+        if(done)break;
     }
     return prefix;
 }
@@ -668,6 +672,34 @@ static cudaError_t cp_group_body(const G6Attn& a,Input input,Work& w,const float
     merge_parts<<<nh,256,0,stream>>>(input,w.parts,part);
     return cudaGetLastError();
 }
+// g6a_cp_groups: G head groups of gh heads (a.heads = G gh, gh a multiple of HC) in one call. A CTA of mla_scores and
+// context_parts never spans two groups, and every (row, head) runs the operations of its own group's call in the same
+// order, so each group's partial is the bits cp_group_body gives it. Group g's partial into part + g gblk: c [n][gh][512],
+// m [n][gh], l [n][gh]; m / l come from cp_softmax's ml [2][n heads]
+template<class Input>
+__global__ void merge_parts_g(Input input,const float* parts,const float* ml,float* part,int gh,int64_t gblk){
+    auto a=resolve(input);if(!a.active)return;
+    const int rh=blockIdx.x,t=threadIdx.x,row=rh/a.heads,h=rh%a.heads,j=row*gh+h%gh;
+    const int64_t nb=(int64_t)a.rows*gh;float* b=part+(int64_t)(h/gh)*gblk;
+    #pragma unroll
+    for(int d=t;d<LAT;d+=256){
+        float s=0;
+        #pragma unroll
+        for(int p=0;p<PART;p++)s+=__ldg(parts+((int64_t)rh*PART+p)*LAT+d);
+        b[(int64_t)j*LAT+d]=s;
+    }
+    if(t==0){const int64_t nh=(int64_t)a.rows*a.heads;b[nb*LAT+j]=ml[rh];b[nb*(LAT+1)+j]=ml[nh+rh];}
+}
+template<class Input>
+static cudaError_t cp_groups_body(const G6Attn& a,Input input,float* prob,float* parts,float* ml,const float* q,float* part,int gh,
+                                  int64_t gblk,cudaStream_t stream){
+    const int n=a.rows,nh=n*a.heads,hch=(a.heads+HC-1)/HC;
+    mla_scores<true><<<dim3(TOP/32,hch,n),256,0,stream>>>(input,0,q,prob);
+    cp_softmax<<<nh,256,0,stream>>>(input,prob,ml,ml+nh);
+    context_parts<<<dim3(PART,hch,n),256,0,stream>>>(input,0,prob,parts);
+    merge_parts_g<<<nh,256,0,stream>>>(input,parts,ml,part,gh,gblk);
+    return cudaGetLastError();
+}
 template<class Input>
 static cudaError_t cp_finish_body(const G6Attn& a,Input input,Work& w,const float* part_all,cudaStream_t stream){
     const int n=a.rows;
@@ -764,6 +796,26 @@ extern "C" int g6a_cp_finish(const G6Attn* a,const G6AttnStepCell* cell,void* sc
     if(!a||!a->uv||!a->output||!part_all)return INVAL;
     cudaStream_t stream=(cudaStream_t)s;
     return cp_call(a,cell,scratch,bytes,[&](auto in,fa::Work& w){return fa::cp_finish_body(*a,in,w,part_all,stream);});
+}
+extern "C" int g6a_cp_groups_ok(int gh){return gh>0&&gh%fa::HC==0;}
+// prob, parts, ml of cp_groups_body, each 256-B aligned
+static size_t cp_groups_at(int heads,int rows,int k){
+    const size_t nh=(size_t)heads*rows,b[3]={nh*fa::TOP*4,nh*fa::PART*fa::LAT*4,nh*2*4};
+    size_t o=0;for(int i=0;i<k;i++)o+=(b[i]+255)&~size_t(255);return o;
+}
+extern "C" size_t g6a_cp_groups_bytes(int heads,int rows){return heads>0&&rows>0?cp_groups_at(heads,rows,3):0;}
+extern "C" int g6a_cp_groups(const G6Attn* a,const G6AttnStepCell* cell,void* buf,size_t bytes,const float* q,const float*,
+                             float* part,int gh,int64_t gblk,void* s){
+    if(!a||!a->indices||!a->mla_cache||!a->block_table||!buf||!q||!part||!g6a_cp_groups_ok(gh)||a->heads%gh||a->heads/gh>8)
+        return INVAL;
+    G6Attn one=*a;one.heads=gh;   // each group's call shape
+    if(!fa::cp_ok(&one)||bytes<g6a_cp_groups_bytes(a->heads,a->rows)||gblk<(int64_t)a->rows*gh*(fa::LAT+2))return INVAL;
+    char* b=(char*)buf;
+    float* prob=(float*)(b+cp_groups_at(a->heads,a->rows,0));float* parts=(float*)(b+cp_groups_at(a->heads,a->rows,1));
+    float* ml=(float*)(b+cp_groups_at(a->heads,a->rows,2));
+    cudaStream_t stream=(cudaStream_t)s;
+    if(cell)return (int)fa::cp_groups_body(*a,fa::ReplayInput{*a,cell},prob,parts,ml,q,part,gh,gblk,stream);
+    return (int)fa::cp_groups_body(*a,*a,prob,parts,ml,q,part,gh,gblk,stream);
 }
 extern "C" int g6a_cp_qabs(const G6Attn* a,void* scratch,const float** q,const float** rope){
     if(!fa::cp_ok(a)||!scratch||!q||!rope)return INVAL;

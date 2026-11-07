@@ -276,12 +276,32 @@ inline void prepare_dsa_layer(Model& m, int i, int M, cudaStream_t st)
 }
 
 #if defined(G6_CP) && G6_CP
+// grid (16, M), 256 threads: row m's hd heads of absorbed q (src [M][hd][512], or source j's slot of the q all-gather v)
+// -> heads off.. of dst [M][ht][512]
+__global__ void k_cp_qheads(const float* src, float* dst, int hd, int ht, int off)
+{
+    const size_t n = (size_t)hd * KVA / 4, m = blockIdx.y;
+    const float4* a = reinterpret_cast<const float4*>(src) + m * n;
+    float4* d = reinterpret_cast<float4*>(dst) + ((size_t)m * ht + off) * KVA / 4;
+    for (size_t i = blockIdx.x * 256 + threadIdx.x; i < n; i += (size_t)gridDim.x * 256) d[i] = a[i];
+}
+__global__ void k_cp_vqheads(g6::VSlotDev v, int j, const u64* stepp, float* dst, int hd, int ht, int off)
+{
+    const size_t n = (size_t)hd * KVA / 4, m = blockIdx.y;
+    const float4* a = reinterpret_cast<const float4*>(cpglue::vrecv(v, *stepp, j)) + m * n;
+    float4* d = reinterpret_cast<float4*>(dst) + ((size_t)m * ht + off) * KVA / 4;
+    for (size_t i = blockIdx.x * 256 + threadIdx.x; i < n; i += (size_t)gridDim.x * 256) d[i] = __ldcv(a + i);
+}
 // The CP attention of DSA layer i: launch_attn_cp's stages and collectives (rank.cuh) at Flash's sizes, one call per
 // layer (S2: on the layer's CP batch view, every row's table and bounds in its cell). In launch_attn_cp's phases, so m4sim's loopback can deliver between them (-1 = all, in
 // order, as the real fabric runs it):
 //   0: cp_front (append, absorb my heads) -> q(i) put; cp_index -> cand(i) put
 //   1: wait cand(i), merge; my head group's partial; wait q(i); each other group's partial, put to its owner at once
+//      (CpState::one, equal head groups: wait q(i), then every group's partial in one g6a_cp_groups call)
 //   2: wait the nr - 1 partials of my heads, LSE merge in shard order, value_project into the binding's output
+// GR8_DEC_EVPROF: the replicated attention's nine marks (DP_A_*, the same sequence in every main-step graph) end, in order:
+// front, index + puts, candidate wait + merge, my group's partial, q wait, the other groups' partials + puts, partial
+// waits, finish (twice)
 inline void launch_dsa_cp(Model& m, int i, int M, int context, int phase, cudaStream_t st)
 {
     Layer& y = m.layers[i];
@@ -313,10 +333,12 @@ inline void launch_dsa_cp(Model& m, int i, int M, int context, int phase, cudaSt
             G6RT_CK(g6_attn_bind_prepare(&y.ab, &s, st));
         }
         G6RT_CK(g6_attn_cp_front(a, cell, scr, sb, st));
+        dmark(DP_A_APPEND, st);
         G6RT_CK(g6_attn_cp_qabs(a, scr, &q, &rope));
         cpglue::k_vput<<<G, 256, 0, st>>>(q, qn, nullptr, 0, C.vs[cq], m.stepp, C.tickets + cq);
         G6RT_CK(g6_attn_cp_index(a, cell, scr, sb, C.cand, st));
         cpglue::k_vput<<<G, 256, 0, st>>>(C.cand + (size_t)r * M * TP, cb, nullptr, 0, C.vs[cc], m.stepp, C.tickets + cc);
+        dmark(DP_A_INDEX, st);
     }
     if (phase == 0) return;
     if (phase <= 1)
@@ -327,19 +349,51 @@ inline void launch_dsa_cp(Model& m, int i, int M, int context, int phase, cudaSt
         for (int j = 0; j < v.nsrc; ++j)
             cpglue::k_vget<<<G, 256, 0, st>>>(v, j, m.stepp, C.cand + (size_t)v.src[j] * M * TP, cb);
         G6RT_CK(g6_attn_cp_merge_index(a, cell, C.cand, st));
-        G6RT_CK(g6_attn_cp_group(a, cell, scr, sb, q, nullptr, part_of(r), st));
-        const g6::VSlotDev& vq = C.vs[cq];
-        cpglue::k_vwait<<<1, 32, 0, st>>>(vq, m.stepp, qw, -1, cpglue::ERR_CP);
-        for (int k = 1; k < nr; ++k)
+        dmark(DP_A_SELECT, st);
+        if (C.one)
         {
-            const int d = (r + k) % nr, j = cpglue::vsrc_index(vq, d), hd = cp_heads(d, y.l);
-            if (j < 0) die("GR8_CP: q all-gather has no slot for rank " + std::to_string(d));
-            G6Attn ad = *a;   // d's head group: hd heads of its absorbed q over MY keys
-            ad.heads = hd;
-            cpglue::k_vget<<<G, 256, 0, st>>>(vq, j, m.stepp, C.qbuf, (size_t)M * hd * KVA * 4);
-            G6RT_CK(g6_attn_cp_group(&ad, cell, scr, sb, C.qbuf, nullptr, C.part_tmp, st));
-            cpglue::k_vput<<<G, 256, 0, st>>>(C.part_tmp, (size_t)M * hd * (KVA + 2) * 4, nullptr, 0, C.vs[cpart(k)], m.stepp,
-                                               C.tickets + cpart(k));
+            // my group at heads 0.., group k (rank (r + k) % nr) at heads k H..; one call; my partial to part_all[r], the
+            // others published from part_tmp block k
+            const int ht = nr * H;
+            const size_t tblk = cp_blk(M, H), pb = (size_t)M * H * (KVA + 2) * 4;
+            k_cp_qheads<<<dim3(16, M), 256, 0, st>>>(q, C.qall, H, ht, 0);
+            dmark(DP_A_ABSORB, st);
+            const g6::VSlotDev& vq = C.vs[cq];
+            cpglue::k_vwait<<<1, 32, 0, st>>>(vq, m.stepp, qw, -1, cpglue::ERR_CP);
+            for (int k = 1; k < nr; ++k)
+            {
+                const int j = cpglue::vsrc_index(vq, (r + k) % nr);
+                if (j < 0 || cp_heads((r + k) % nr, y.l) != H) die("GR8_CP: q all-gather slot or head group");
+                k_cp_vqheads<<<dim3(16, M), 256, 0, st>>>(vq, j, m.stepp, C.qall, H, ht, k * H);
+            }
+            dmark(DP_A_SCORES, st);
+            G6Attn ad = *a;
+            ad.heads = ht;
+            G6RT_CK(g6_attn_cp_groups(&ad, cell, C.one_buf, C.one_bytes, C.qall, nullptr, C.part_tmp, H, (int64_t)tblk, st));
+            G6RT_CK(cudaMemcpyAsync(part_of(r), C.part_tmp, pb, cudaMemcpyDeviceToDevice, st));
+            for (int k = 1; k < nr; ++k)
+                cpglue::k_vput<<<G, 256, 0, st>>>(C.part_tmp + k * tblk, pb, nullptr, 0, C.vs[cpart(k)], m.stepp, C.tickets + cpart(k));
+            dmark(DP_A_NORMALIZE, st);
+        }
+        else
+        {
+            G6RT_CK(g6_attn_cp_group(a, cell, scr, sb, q, nullptr, part_of(r), st));
+            dmark(DP_A_ABSORB, st);
+            const g6::VSlotDev& vq = C.vs[cq];
+            cpglue::k_vwait<<<1, 32, 0, st>>>(vq, m.stepp, qw, -1, cpglue::ERR_CP);
+            dmark(DP_A_SCORES, st);
+            for (int k = 1; k < nr; ++k)
+            {
+                const int d = (r + k) % nr, j = cpglue::vsrc_index(vq, d), hd = cp_heads(d, y.l);
+                if (j < 0) die("GR8_CP: q all-gather has no slot for rank " + std::to_string(d));
+                G6Attn ad = *a;   // d's head group: hd heads of its absorbed q over MY keys
+                ad.heads = hd;
+                cpglue::k_vget<<<G, 256, 0, st>>>(vq, j, m.stepp, C.qbuf, (size_t)M * hd * KVA * 4);
+                G6RT_CK(g6_attn_cp_group(&ad, cell, scr, sb, C.qbuf, nullptr, C.part_tmp, st));
+                cpglue::k_vput<<<G, 256, 0, st>>>(C.part_tmp, (size_t)M * hd * (KVA + 2) * 4, nullptr, 0, C.vs[cpart(k)], m.stepp,
+                                                   C.tickets + cpart(k));
+            }
+            dmark(DP_A_NORMALIZE, st);
         }
     }
     if (phase == 1) return;
@@ -349,7 +403,10 @@ inline void launch_dsa_cp(Model& m, int i, int M, int context, int phase, cudaSt
         cpglue::k_vwait<<<1, 32, 0, st>>>(v, m.stepp, pw, -1, cpglue::ERR_CP);
         cpglue::k_vget<<<G, 256, 0, st>>>(v, 0, m.stepp, part_of(v.src[0]), (size_t)M * H * (KVA + 2) * 4);   // partials of MY heads
     }
+    dmark(DP_A_CONTEXT, st);
     G6RT_CK(g6_attn_cp_finish(a, cell, scr, sb, C.part_all, st));
+    dmark(DP_A_MERGE, st);
+    dmark(DP_A_VPROJ, st);
 }
 // the step takes the CP block for its DSA layers (a graph step: its bucket is past R; S2: the step's bucket, s2_cp_step)
 inline bool dsa_cp(const Model& m, int context) { return cp_block(m, context); }

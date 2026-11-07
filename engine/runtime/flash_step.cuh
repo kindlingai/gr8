@@ -112,7 +112,15 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
         m.cp.cand=dmalloc<uint64_t>((size_t)NR*MX*g6kv::TOP_POOLS);
         m.cp.qbuf=dmalloc<float>((size_t)MX*H*KVA);
         m.cp.part_all=dmalloc<float>((size_t)NR*cp_blk(MX,H));
-        m.cp.part_tmp=dmalloc<float>(cp_blk(MX,H));
+        m.cp.part_tmp=dmalloc<float>((size_t)NR*cp_blk(MX,H));
+        // equal head groups (TP=2, TP=4): every group's partial in one call (g6a_cp_groups, the same bits)
+        m.cp.one=g6nr::HMIN==g6nr::HMAX && g6_attn_cp_groups_ok(H);
+        if(m.cp.one) {
+            m.cp.one_rows=MX;
+            m.cp.qall=dmalloc<float>((size_t)MX*NR*H*KVA);
+            m.cp.one_bytes=g6_attn_cp_groups_bytes(NR*H,MX);
+            m.cp.one_buf=dmalloc<char>(m.cp.one_bytes);
+        }
         size_t held=0,full=0;
         for(const Layer& y:m.layers) if(!y.kda) { held+=(size_t)y.ab.args.page_count; full+=(size_t)y.ab.args.table_size; }
         fprintf(stderr,"# rank %d: GR8_CP on (Flash), R %d, %d CP collectives (mmax %d); the DSA layers hold %zu of %zu pages\n",
