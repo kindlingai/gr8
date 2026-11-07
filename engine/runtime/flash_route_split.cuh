@@ -11,11 +11,6 @@
 #include "../knobs-rs/gr8_knobs.h"
 
 namespace g6rt {
-// GR8_PF_ROUTER_SPLIT: unset = 0, 1 = on (g6m4 dies if the build or topology cannot run it).
-inline int flash_route_split_mode()
-{
-    return knob::pf_router_split() ? 1 : 0;
-}
 struct FlashRouteSplit {
     g6::Fabric* fabric = nullptr;
     g6::FabricDev f{};

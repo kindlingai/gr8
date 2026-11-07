@@ -246,6 +246,12 @@ for f in "" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 
   g++ -std=c++17 -O2 -Wall -Wextra -pthread $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/admit_vectors_test.cpp" -o "$T/admit_vectors_test" "${KVLIB[@]}"
   "$T/admit_vectors_test"
 done
+# g6m4's option parse (engine_options.h) over the launcher's lists and one mutation per refusal (scripts/check_args.py
+# writes the cases), in each model's shape and GLM's serving one
+for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+  g++ -std=c++17 -O2 -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/options_vectors_test.cpp" -o "$T/options_vectors_test" "${KVLIB[@]}"
+  "$T/options_vectors_test" "$REPO/engine/runtime/s2/tests/options_cases.txt"
+done
 # the S2 runtime signatures over a seeded sweep of their inputs, against transcripts of g6m4.cu's builders
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/signature_vectors_test.cpp" -o "$T/signature_vectors_test"
 "$T/signature_vectors_test"

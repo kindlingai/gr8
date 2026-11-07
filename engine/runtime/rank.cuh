@@ -36,6 +36,7 @@
 #include "serve.h"
 #include "penalty.h"
 #include "spec_len.h"
+#include "rank_host.h"
 #include "../knobs-rs/gr8_knobs.h"
 #include "../h2d.h"
 #include "host_reclaim.h"
@@ -50,6 +51,7 @@
 #include "ds41_ops.h"          // host-only (the step plan and op table); must stay outside namespace g6rt
 #include "ds41_pack_layout.h"   // the ragged W segment table (C8 pack), host-only; decode keeps uniform ds_ns
 #include "ds41_coll_order.h"   // host-only: the order the step rings its collectives in (the fabric proxy order vector)
+#include "ds41_engram_boot.h"  // host-only: the GR8_DS_ENGRAM boot reads (the decode fabric's Engram collectives)
 #include "ds41_wait.h"         // host-only: who waits for the peers before a consume kernel (GR8_DS_WAIT_K); outside namespace g6rt
 #include "ds41_rs.h"           // host + device rules of the prefill RS+AG (GR8_DS_PF_RS); outside namespace g6rt (ds41_rs.cuh uses ::ds41::rs)
 #include "ds41_rowshard.h"     // default-off row-sharded mHC host geometry and boundary-state size
@@ -86,7 +88,6 @@ namespace g6rt
 {
 
 #define G6RT_CK(x) do { cudaError_t e_ = (cudaError_t)(x); if (e_ != cudaSuccess) { fprintf(stderr, "CUDA %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); exit(99); } } while (0)
-[[noreturn]] inline void die(const std::string& m) { fprintf(stderr, "g6: %s\n", m.c_str()); exit(2); }
 
 // GB10 memory is the host's: a boot that runs it out is killed by the OOM killer, along with whatever else it picks.
 // After the weights and the KV pool, the rest of the boot (CUDA graphs, prefill staging, the drafter) took 4-5 GiB at
@@ -2572,45 +2573,7 @@ inline StepIn draft_inputs(u64 step, int M, int pos0, const int* next, float inv
     return in;
 }
 
-// ---------------------------------------------------------------- the M4 test sequence, shared by both drivers
-// The prompt goes in first, `chunk` rows per step at consecutive positions (the last prompt step may be shorter);
-// then n_gen single-row steps, each feeding the token sampled from the previous step's last row.
-struct Plan
-{
-    std::vector<int> prompt;
-    int first = 0;                    // prompt tokens before this index were taken by the prefill path
-    int chunk = 4;                    // rows per prompt step, 1..MX
-    int n_gen = 16;
-    float inv_temp = 0.f;             // 0 = greedy
-    uint32_t seed = 1234u;
-    float top_p = 0.f;                // (0,1) = nucleus sampling (needs Model::nc > 0); else off
-    int lp = -1, plp = -1;            // --serve: top-k logprobs of the generated / the prompt tokens (k > 0 = top lists; 0 = only
-                                      // the token's own logprob; -1 = off). Rows of a step with k > 0 carry SampleRow::topk.
-    bool rs = false;                  // --spec-accept rejection: drafts are greedy, the target accepts them by rejection sampling
-    float steering_scale = 0.f;       // target model only; exact canonical bits from the effective request identity
-    int steering_slot = 0;            // steering.slot
-    steering::Identity steering{};    // full cache identity (profile/scope/schedule/exact scale)
-};
-inline int prompt_steps(const Plan& p) { return ((int)p.prompt.size() - p.first + p.chunk - 1) / p.chunk; }
-inline int total_steps(const Plan& p) { return prompt_steps(p) + p.n_gen; }
-inline int step_rows(const Plan& p, int s)
-{
-    const int left = (int)p.prompt.size() - p.first - s * p.chunk;
-    return s >= prompt_steps(p) ? 1 : left < p.chunk ? left : p.chunk;
-}
-// the distinct row counts of the plan (each needs prepare() and, in the graph form, its own graph)
-inline std::vector<int> plan_rows(const Plan& p)
-{
-    std::vector<int> v;
-    for (int s = 0; s < total_steps(p); ++s)
-    {
-        const int M = step_rows(p, s);
-        bool seen = false;
-        for (int x : v) seen |= x == M;
-        if (!seen) v.push_back(M);
-    }
-    return v;
-}
+// ---------------------------------------------------------------- the M4 test sequence (Plan: rank_host.h)
 // step0: fabric steps used before this sequence (the fabric step counter never repeats within a process)
 inline StepIn step_inputs(const Plan& p, int s, int last_tok, u64 step0 = 0)
 {
