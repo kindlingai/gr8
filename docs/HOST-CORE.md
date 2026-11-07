@@ -513,7 +513,8 @@ the shrink, the grant, the recall and refusal lines, the ADMIT_HOLD drain and ho
 calls them where the expressions were. `admit_vectors_test` records each over seeded inputs, and records the control
 loop's admission path over the Rust `AdmissionQueue` with scripted pool answers. That path covers grants, both stalls,
 shrinks, recalls, held chains, commands landing during a chain and resizes in flight. Its hashes match under GCC on
-x86_64 and clang on arm64.
+x86_64 and clang on arm64. `scripts/host_tests.sh` passes on Linux, and GLM, Flash and DS41 build. Boot: TP4 GLM, R5c
+then this, the round logs byte-identical on all four ranks and the 24 T=0 replies matching.
 
 The loops call four kinds of C++ that stay C++ past R5: the pool policy (`PoolHooks`, until R8), `Sessions` (the
 emitters, the resp files, the terminal lines and the counters), the request checks that compile a grammar or read
