@@ -24,6 +24,16 @@ For `ds41`, also set Engram on every box: `GR8_DS_ENGRAM=1` and `GR8_DS_ENGRAM_P
 nor the release, so write it before the first `up`: [DEEPSEEK-BOOT.md](DEEPSEEK-BOOT.md) is the whole ds41 boot in
 order.
 
+Optional, every model: faster restarts. Put `GR8_GEN_CACHE=<dir>` in `EXTRA_ENV` on every box, a directory on a local
+disk ([ENV.md](ENV.md)). The loader then keeps the tensors it computes at load and reads them back on the next boot
+instead of computing them again. The first boot of an engine build writes them; a rebuild is a miss and writes them
+again, and the loader keeps the two newest builds' entries. The served bytes are the same. Measured: GLM-5.3 at TP=6
+(on the GLM TP6 team's cu-fastboot build, arms A+B, before this port), 17.4 GB a rank, "engines ready" 93-96 s
+without it, 97 s on the boot that writes it, 20-21 s after.
+DeepSeek-V4.1-Flash at TP=4, 79.6 GB a rank: 84 s without it, 110 s on the boot that writes it, 16 s after.
+GLM-5.3 at TP=4 (ring, the docker image built from this change): 4.8 GB a rank, "engines ready" 71 s without it
+(stock image), 71 s on the boot that writes it, 68 s after. At TP=4 the computed tensors are a small part of the boot.
+
 ## 2. DeepSeek-V4.1-Flash (`ds41`): how many chats, and how long
 
 Ask these two first: they decide how the memory is split, and the later answers depend on them. Start with what the

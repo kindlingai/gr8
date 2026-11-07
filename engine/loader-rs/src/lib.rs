@@ -21,6 +21,7 @@ pub mod dflash2;
 pub mod ds41;
 pub mod exlr8;
 pub mod fetch;
+pub mod gencache;
 pub mod json;
 pub mod layout;
 mod plan;
@@ -85,9 +86,34 @@ struct Loader<'a> {
     files: Vec<Src>,
     mode: Mode,
     sink: &'a G6lSink,
+    cache: Option<&'a gencache::GenCache>,
 }
 
 unsafe impl Sync for Loader<'_> {}
+
+// Per-op profiling of the load, GR8_LOAD_PROF=1 (cu-fastboot arm A, ported to DS41): ns/bytes/count triplets printed at
+// the end of run(). Off = one relaxed atomic load per op, no accumulation.
+// bases: 0 zero | 3 pack | 6 copy | 9 O_DIRECT head | 12 buffered tail | 15 mem | 18 gen
+//        21 i128_read | 24 i128_geom | 27 segs iterated | 28 segs <= 64KB
+fn prof_on() -> bool {
+    gr8knobs::LOAD_PROF.get()
+}
+#[allow(clippy::declare_interior_mutable_const)]
+const PROF0: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PROF: [std::sync::atomic::AtomicU64; 29] = [PROF0; 29];
+#[inline]
+fn prof_op<F: FnOnce() -> R, R>(base: usize, bytes: u64, f: F) -> R {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !prof_on() {
+        return f();
+    }
+    let t = std::time::Instant::now();
+    let r = f();
+    PROF[base].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    PROF[base + 1].fetch_add(bytes, Relaxed);
+    PROF[base + 2].fetch_add(1, Relaxed);
+    r
+}
 
 impl Loader<'_> {
     /// Copies file bytes `off..off + dst.len()` of file `f` into `dst`.
@@ -103,13 +129,15 @@ impl Loader<'_> {
             if off.is_multiple_of(ALIGN) && (dst.as_ptr() as u64).is_multiple_of(ALIGN) {
                 let head = dst.len() / ALIGN as usize * ALIGN as usize;
                 if head > 0 {
-                    read_exact_at(d, &mut dst[..head], off).map_err(|e| format!("{name}: {e} (O_DIRECT)"))?;
+                    prof_op(9, head as u64, ||
+                        read_exact_at(d, &mut dst[..head], off).map_err(|e| format!("{name}: {e} (O_DIRECT)")))?;
                     done = head;
                 }
             }
         }
         if done < dst.len() {
-            read_exact_at(&s.buffered, &mut dst[done..], off + done as u64).map_err(|e| format!("{name}: {e}"))?;
+            prof_op(12, (dst.len() - done) as u64, ||
+                read_exact_at(&s.buffered, &mut dst[done..], off + done as u64).map_err(|e| format!("{name}: {e}")))?;
             sys::fadvise_dontneed(&s.buffered, off + done as u64, (dst.len() - done) as u64);
         }
         Ok(())
@@ -118,37 +146,48 @@ impl Loader<'_> {
     /// Fills image bytes `a..a + buf.len()`: pack-file data first, then the source ranges over it.
     fn fill(&self, a: u64, buf: &mut [u8], half: &mut sys::AlignedBuf, perm: &mut sys::AlignedBuf) -> Result<u64, String> {
         let b = a + buf.len() as u64;
-        buf.fill(0);
+        prof_op(0, buf.len() as u64, || buf.fill(0));
         let mut read = 0u64;
         for &(x, y) in self.plan.pack_data(a, b) {
             let (x, y) = (x.max(a), y.min(b));
-            self.read(0, x, &mut buf[(x - a) as usize..(y - a) as usize])?;
+            prof_op(3, y - x, || self.read(0, x, &mut buf[(x - a) as usize..(y - a) as usize]))?;
             read += y - x;
         }
         for s in self.plan.sources(a, b) {
+            if prof_on() {
+                use std::sync::atomic::Ordering::Relaxed;
+                PROF[27].fetch_add(1, Relaxed);
+                if s.nbytes <= 65536 {
+                    PROF[28].fetch_add(1, Relaxed);
+                }
+            }
             let (x, y) = (s.pack_off.max(a), (s.pack_off + s.nbytes).min(b));
             match s.op {
                 Op::Copy => {
                     let off = s.file_off + (x - s.pack_off);
-                    self.read(s.file, off, &mut buf[(x - a) as usize..(y - a) as usize])?;
+                    prof_op(6, y - x, || self.read(s.file, off, &mut buf[(x - a) as usize..(y - a) as usize]))?;
                     read += y - x;
                 }
                 Op::Mem => {
                     let m = &self.plan.mems[s.file];
-                    buf[(x - a) as usize..(y - a) as usize]
-                        .copy_from_slice(&m[(x - s.pack_off) as usize..(y - s.pack_off) as usize]);
+                    prof_op(15, y - x, || {
+                        buf[(x - a) as usize..(y - a) as usize]
+                            .copy_from_slice(&m[(x - s.pack_off) as usize..(y - s.pack_off) as usize])
+                    });
                 }
                 Op::Gen => {
                     let g = &self.plan.gens[s.file];
-                    let m = g.get()?;
-                    buf[(x - a) as usize..(y - a) as usize]
-                        .copy_from_slice(&m[(x - s.pack_off) as usize..(y - s.pack_off) as usize]);
+                    let m = prof_op(18, y - x, || g.get(self.cache, s.pack_off))?;
+                    prof_op(18, 0, || {
+                        buf[(x - a) as usize..(y - a) as usize]
+                            .copy_from_slice(&m[(x - s.pack_off) as usize..(y - s.pack_off) as usize])
+                    });
                     g.used(y - x);
                 }
                 Op::Item128 { hidden } => {
                     let n = s.nbytes as usize;
-                    self.read(s.file, s.file_off, half.slice(n))?;
-                    plan::item128_to_g6_geometry(half.slice(n), perm.slice(n), hidden);
+                    prof_op(21, n as u64, || self.read(s.file, s.file_off, half.slice(n)))?;
+                    prof_op(24, n as u64, || plan::item128_to_g6_geometry(half.slice(n), perm.slice(n), hidden));
                     buf[(x - a) as usize..(y - a) as usize]
                         .copy_from_slice(&perm.slice(n)[(x - s.pack_off) as usize..(y - s.pack_off) as usize]);
                     read += s.nbytes;
@@ -192,16 +231,17 @@ fn open_src(path: &str, mode: Mode) -> Result<Src, String> {
 pub fn load(pack: &str, pack_bytes: u64, tensors: &[G6lExtent], sources: Option<&str>, root: Option<&str>,
             sink: &G6lSink) -> Result<G6lStats, String> {
     let t0 = Instant::now();
-    run(Plan::new(pack, pack_bytes, tensors, sources, root)?, pack_bytes, sink, t0)
+    run(Plan::new(pack, pack_bytes, tensors, sources, root)?, pack_bytes, sink, t0, None)
 }
 
 /// Fills image bytes 0..pack_bytes from `plan` through `sink`. The stats count time from `t0`.
-fn run(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant) -> Result<G6lStats, String> {
+fn run(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant, cache: Option<&gencache::GenCache>)
+    -> Result<G6lStats, String> {
     let mode = if gr8knobs::LOAD_MODE.get() == "mmap" { Mode::Mmap } else { Mode::Read };
     let threads = gr8knobs::LOAD_THREADS.get() as usize;
     let chunk = (gr8knobs::LOAD_CHUNK_MB.get() as u64) << 20;
     let files = plan.files.iter().map(|p| open_src(p, mode)).collect::<Result<Vec<_>, _>>()?;
-    let l = Loader { plan, files, mode, sink };
+    let l = Loader { plan, files, mode, sink, cache };
     let nchunks = pack_bytes.div_ceil(chunk);
     let next = AtomicU64::new(0);
     let read_total = AtomicU64::new(0);
@@ -246,6 +286,16 @@ fn run(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant) -> Result<G6lSt
             });
         }
     });
+    if prof_on() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let g = |i: usize| PROF[i].load(Relaxed);
+        let trip = |b: usize| format!("{:.2}s/{:.2}GB/{}", g(b) as f64 / 1e9, g(b + 1) as f64 / 1e9, g(b + 2));
+        eprintln!("# load-prof zero={} pack={} copy={} direct={} buffered={} mem={} gen={} i128read={} i128geom={} segs={} small={}",
+                  trip(0), trip(3), trip(6), trip(9), trip(12), trip(15), trip(18), trip(21), trip(24), g(27), g(28));
+    }
+    if let Some(c) = cache {
+        eprintln!("# gen-cache: {}", c.summary());
+    }
     if let Some(e) = error.into_inner().unwrap() {
         return Err(e);
     }
@@ -298,6 +348,13 @@ pub unsafe extern "C" fn g6l_v2_plan(base_manifest: *const c_char, base_pack: *c
                                &arg(v2_dir, "v2 dir")?, &arg(slices_dir, "slices dir")?, &arg(widths, "width manifest")?)?;
         let out = arg(out_manifest, "output manifest")?;
         std::fs::write(&out, img.manifest()).map_err(|e| format!("{out}: {e}"))?;
+        // GR8_GEN_CACHE (gencache.rs): the key binds the engine binary, the planned manifest and the plan inputs
+        let mut img = img;
+        let (bm, bp, v2, sl, wd) = (arg(base_manifest, "base manifest")?, arg(base_pack, "base pack")?, arg(v2_dir, "v2 dir")?,
+                                    arg(slices_dir, "slices dir")?, arg(widths, "width manifest")?);
+        let key_text = format!("v2 base={bm} pack={bp} v2={v2} slices={sl} widths={wd}\n{}\n{}", img.manifest(),
+                               gencache::source_identity(&[&bm, &bp, &v2, &sl, &wd]));
+        img.cache = gencache::GenCache::from_env(&key_text);
         Ok::<_, String>(img)
     })();
     match r {
@@ -326,6 +383,7 @@ pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *con
     let t0 = Instant::now();
     let arg = |p, what| cstr(p).ok_or(format!("g6l_release_plan: no {what}"));
     let r = (|| {
+        let layout_path: Option<String> = cstr(layout);
         let layout = cstr(layout).map(|p| layout::Layout::read(&p)).transpose()?;
         let (img, table) = release::plan(&arg(dense_dir, "dense dir")?, &arg(v2_dir, "v2 dir")?, &arg(slices_dir, "slices dir")?,
                                          &arg(widths, "width manifest")?, nr as usize, rank as usize, layout.as_ref(),
@@ -338,6 +396,16 @@ pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *con
                 eprintln!("#   {line}");
             }
         }
+        // GR8_GEN_CACHE (gencache.rs): the key binds the engine binary, the planned manifest and the plan inputs
+        // (the release directories, TP, rank, layout and the transform options)
+        let mut img = img;
+        let (de, v2, sl, wd) = (arg(dense_dir, "dense dir")?, arg(v2_dir, "v2 dir")?, arg(slices_dir, "slices dir")?,
+                                arg(widths, "width manifest")?);
+        let lp = layout_path.clone().unwrap_or_default();
+        let key_text = format!("release dense={de} v2={v2} slices={sl} widths={wd} nr={nr} rank={rank} qo={qo} trellis={trellis} \
+                                kvb_fp8={} layout={lp:?}\n{}\n{}", kvb_fp8()?, img.manifest(),
+                               gencache::source_identity(&[&de, &v2, &sl, &wd, &lp]));
+        img.cache = gencache::GenCache::from_env(&key_text);
         Ok::<_, String>(img)
     })();
     match r {
@@ -359,7 +427,8 @@ pub unsafe extern "C" fn g6l_plan_load(h: *mut c_void, sink: *const G6lSink, sta
                                        errlen: usize) -> i32 {
     let (img, t0) = &mut *(h as *mut (v2plan::V2Image, Instant));
     let plan = std::mem::replace(&mut img.plan, Plan::empty());
-    match run(plan, img.bytes, &*sink, *t0) {
+    let cache = img.cache.as_ref();
+    match run(plan, img.bytes, &*sink, *t0, cache) {
         Ok(s) => {
             *stats = s;
             0
