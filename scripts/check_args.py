@@ -16,6 +16,11 @@ engine/runtime/s2/tests/options_vectors_test.cpp parses the same cases without C
 case's exit code, stdout and stderr to FILE. The lib folder beside BIN, then each --lib (bin/lib holds a build's cuBLAS
 for every model), is the library path. --check-args stops before any CUDA work, so it runs anywhere the binary runs.
 Two transcripts (an old and a new build) compare with diff.
+
+R6a's comparison: before R6a only DS41 took --check-args. check_args_base.patch adds it to GLM and Flash at R6a's exit
+point (DS41 keeps its own), for the comparison only. Apply it to a checkout of the base commit (74d62d56, `git apply
+scripts/check_args_base.patch` from this tree), build both trees' engines, run `run` once per model with each build's
+binary and the same --cases file, and diff each pair of transcripts.
 """
 import argparse
 import os
