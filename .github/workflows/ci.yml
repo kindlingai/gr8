@@ -237,7 +237,7 @@ jobs:
     timeout-minutes: 120
     env:
       # the compile cache is saved by main only, as the layer cache is
-      NVCC_SAVE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      NVCC_SAVE: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'pull_request' }}
     strategy:
       fail-fast: false
       matrix:
