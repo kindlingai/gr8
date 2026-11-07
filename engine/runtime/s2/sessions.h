@@ -150,7 +150,9 @@ public:
     ~Sessions() { for (auto& s : sessions_) if (s.emitter.f) fclose(s.emitter.f); }
     Sessions(const Sessions&) = delete; Sessions& operator=(const Sessions&) = delete;
     static Request request(uint64_t id, const g6rt::ServeReq& r) {
-        return {id, uint32_t(r.prompt.size()), uint32_t(r.n_gen), r.steering};
+        Request q;
+        g6svc_request(id, r.prompt.size(), r.n_gen, reinterpret_cast<const g6sch_identity*>(&r.steering), sch::m<g6sch_request>(&q));
+        return q;
     }
     // G6_CAP_PROMPT_DECODE (DS41): no tensor prefill by default, every prompt runs as decode steps from position 0
     // (Driver decode_prompt) unless prefill_min admits it (ds41_prefill.h); otherwise only prompt logprobs keep a prompt

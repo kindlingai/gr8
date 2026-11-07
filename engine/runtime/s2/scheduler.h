@@ -41,7 +41,7 @@ constexpr uint32_t MAX_DECODE_ROUNDS = 64;   // Config::decode_rounds bound
 // prompt always makes progress. 1 is one-for-one, i.e. round-robin; raise it for a more aggressive shortest-first. The
 // cost is only how long a long prompt may wait, never correctness.
 constexpr uint32_t PREFILL_DEFER_MAX = 3;
-// A notice's target boundary (service.h event) is the first boundary whose work after the one in flight covers
+// A notice's target boundary (control.rs event) is the first boundary whose work after the one in flight covers
 // NOTICE_ROWS prefill rows, floored at NOTICE_MIN and capped at NOTICE_MAX. The constant this replaces was LOOKAHEAD = 8
 // boundaries, the margin a decode round needs — and, during a prefill, eight ~6 s quanta for a propagation that takes
 // milliseconds (#61), which is why a cancel could not land inside any below-R prefill: R is exactly eight 8,192-row
@@ -297,6 +297,9 @@ public:
     SchedulerView(const Config* c, const g6sch_slot* s, const g6sch_state* st) : vc_(c), vs_(s), vst_(st) {}
     const Config& config() const { return *vc_; }
     const std::array<Slot, MAX_SESSIONS>& slots() const { return *reinterpret_cast<const std::array<Slot, MAX_SESSIONS>*>(vs_); }
+    // where the slots and counters live, for the service's control thread (it reads them inside an event's pause)
+    const g6sch_slot* slot_data() const { return vs_; }
+    const g6sch_state* counters() const { return vst_; }
     uint64_t boundary() const { return vst_->boundary; }
     uint64_t next_event() const { return vst_->event + 1; }
     uint64_t revision() const { return vst_->revision; }
@@ -332,7 +335,7 @@ public:
         out.resize(g6sch_decoding(vs_, MAX_SESSIONS, sch::m<g6sch_key>(out.data())));
         return out;
     }
-    // The boundary a notice anchored now should target (service.h event): the first boundary whose work after the one
+    // The boundary a notice anchored now should target (control.rs event): the first boundary whose work after the one
     // in flight covers NOTICE_ROWS prefill rows, within [boundary + NOTICE_MIN, boundary + notice_max]. A pure function
     // of the slots and the alternation flag, so every rank names the same boundary.
     uint64_t horizon() const { return g6sch_horizon(vc_, vs_, MAX_SESSIONS, vst_); }
@@ -431,6 +434,7 @@ public:
     const Request* front() const { return sch::c<Request>(g6sch_queue_front(q_.get())); }
     size_t size() const { return g6sch_queue_size(q_.get()); }
     uint64_t stalls() const { return g6sch_queue_stalls(q_.get()); }
+    g6sch_queue* handle() { return q_.get(); }
     void admitted(uint64_t id) { g6s2::check(g6sch_queue_admitted(q_.get(), id)); }
     // fits: the pool can admit the head (RunPool::fits); room: the pages one reservation can take now (RunPool::room)
     std::optional<AdmissionStatus> check(uint64_t revision, bool slot, bool fits, uint32_t room) {

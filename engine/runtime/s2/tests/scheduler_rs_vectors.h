@@ -779,7 +779,7 @@ inline uint64_t driver(uint64_t seed, std::vector<std::string>* lines = nullptr)
 
 // the driver's own pool calls (driver.h DriverPool): a head and a worker, each a Driver over its own pool, take the
 // same commits. The head reserves a grant's run, gives a cancelled session's run back and shrinks a session to the
-// smaller R as it builds the commit (service.h event); the worker reserves at its bind. Runs grow before each round and
+// smaller R as it builds the commit (control.rs); the worker reserves at its bind. Runs grow before each round and
 // go back when a session finishes, or on the worker when it is cancelled; the worker makes the head's shrink. Every
 // hook call, step and both pools' digests go in.
 inline uint64_t driver_pool(uint64_t seed, std::vector<std::string>* lines = nullptr)
@@ -874,7 +874,7 @@ inline uint64_t driver_pool(uint64_t seed, std::vector<std::string>* lines = nul
                 std::optional<Payload> pay;
                 const int kind = U(0, 9);
                 if (kind <= 2)
-                {   // the head gives a cancelled live session's run back now (service.h event)
+                {   // the head gives a cancelled live session's run back now (control.rs event)
                     const auto& s = sl[unsigned(U(0, int(MAX_SESSIONS) - 1))];
                     if (s.phase != Phase::Free)
                     {

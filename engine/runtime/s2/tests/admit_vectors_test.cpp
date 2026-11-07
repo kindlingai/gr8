@@ -86,7 +86,7 @@ void gates(Tx& tx) {
     }
 }
 
-// service.h's controller() and event() over a scripted pool: every pool answer is a draw, so the transcript is the
+// control.rs's controller and event over a scripted pool: every pool answer is a draw, so the transcript is the
 // decision sequence alone
 struct Loop {
     Rng& r; Tx& tx;

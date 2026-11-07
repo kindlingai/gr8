@@ -81,6 +81,7 @@ public:
         const int32_t rc = g6svc_ingress_peek(h_.get(), &has, &c);
         return got(rc, has, c);
     }
+    const g6svc_ingress* handle() const { return h_.get(); }
     std::string request(const Command& c) const {
         const g6svc_command x = svc::command(c);
         std::string out;

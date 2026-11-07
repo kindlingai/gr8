@@ -245,6 +245,18 @@ impl Kind for crate::service::ffi::CBoot {
 impl Kind for crate::service::ffi::CStatus {
     const K: u64 = 6;
 }
+impl Kind for crate::service::control::Checked {
+    const K: u64 = 6;
+}
+impl Kind for crate::service::control::PoolCall {
+    const K: u64 = 6;
+}
+impl Kind for crate::service::control::Host {
+    const K: u64 = 6;
+}
+impl Kind for crate::service::control::CControl {
+    const K: u64 = 6;
+}
 // g6sched.h counts void as 1 byte, as Rust's c_void
 impl Kind for std::ffi::c_void {
     const K: u64 = 6;
@@ -298,7 +310,11 @@ fn_kinds!(
     crate::pool_ops::TiersFn,
     crate::pool_ops::RefusalFn,
     crate::pool_ops::RRowsFn,
-    crate::pool_ops::MakeRoomFn
+    crate::pool_ops::MakeRoomFn,
+    crate::service::control::CheckFn,
+    crate::service::control::ShareFn,
+    crate::service::control::ReasonFn,
+    crate::service::control::TotalsFn
 );
 
 /// The digest of every shared type's layout.
@@ -826,6 +842,32 @@ pub fn digest() -> u64 {
             has_growth,
             has_tiers,
             has_runs
+        }
+    );
+    layout!(h, crate::service::control::Checked { prompt, n, sys, plp, n_gen, steering, ok });
+    layout!(h, crate::service::control::PoolCall { kind, rows, worst, r, out, run, prompt, n, span, ns });
+    layout!(h, crate::service::control::Host { ctx, check, retire_run, share, refusal, tiers });
+    layout!(
+        h,
+        crate::service::control::CControl {
+            scheduler,
+            directory,
+            directory_n,
+            endpoint,
+            ingress,
+            queue,
+            trace,
+            slots,
+            n_slots,
+            state,
+            pool,
+            host,
+            lend,
+            share_ms,
+            rank,
+            head,
+            admit_hold,
+            elog
         }
     );
     h
