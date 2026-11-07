@@ -222,11 +222,16 @@ impl Builder {
     }
 }
 
-fn kmix_word(gw: &[u8; NH_MAX], uw: &[u8; NH_MAX], dk: u8, hs: &[usize]) -> i64 {
+/// The tr3.kmix word packs 8 bits per block in one i64, so mixed widths fit at most 8 blocks of an expert on a rank:
+/// None past that (all 16 blocks at TP=1, for one).
+fn kmix_word(gw: &[u8; NH_MAX], uw: &[u8; NH_MAX], dk: u8, hs: &[usize]) -> Option<i64> {
     if hs.iter().all(|&h| gw[h] == dk && uw[h] == dk) {
-        return 0;
+        return Some(0);
     }
-    hs.iter().enumerate().fold(0i64, |v, (b, &h)| v | (gw[h] as i64) << (8 * b) | (uw[h] as i64) << (8 * b + 4))
+    if hs.len() > 8 {
+        return None;
+    }
+    Some(hs.iter().enumerate().fold(0i64, |v, (b, &h)| v | (gw[h] as i64) << (8 * b) | (uw[h] as i64) << (8 * b + 4)))
 }
 
 fn f16_signed(scale: [u8; 2], sign: i8) -> [u8; 2] {
@@ -472,7 +477,9 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, w
         let (gw, uw, dk) = of(e);
         let hs = &own[i];
         table[i] = [off as i64, 0, row as i64, hs.len() as i64, dk as i64, *hs.first().unwrap_or(&0) as i64];
-        kmix[i] = kmix_word(&gw, &uw, dk, hs);
+        kmix[i] = kmix_word(&gw, &uw, dk, hs).ok_or_else(|| format!(
+            "layer {l}: expert {e} has {} blocks on this rank with mixed widths; tr3.kmix holds at most 8 (a \
+             uniform-width manifest or a larger TP avoids it)", hs.len()))?;
         for &h in hs {
             for (proj, k) in [(0usize, gw[h]), (1, uw[h])] {
                 let s = get(k, e, h)?;
@@ -680,5 +687,18 @@ mod tests {
         std::fs::remove_file(d.join("exlr8-layer-004.k3.safetensors")).unwrap();
         assert_eq!(plan_layers(&d).unwrap(), ["exlr8-e4m3-pmcgx", codebook::UNCHECKED]);
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn kmix_holds_mixed_widths_of_at_most_8_blocks() {
+        let all: Vec<usize> = (0..16).collect();
+        let (mut gw, uw) = ([3u8; NH_MAX], [3u8; NH_MAX]);
+        // uniform widths need no word at any block count
+        assert_eq!(kmix_word(&gw, &uw, 3, &all), Some(0));
+        gw[1] = 4;
+        assert_eq!(kmix_word(&gw, &uw, 3, &all[..2]), Some(0x3433));
+        assert!(kmix_word(&gw, &uw, 3, &all[..8]).is_some());
+        assert_eq!(kmix_word(&gw, &uw, 3, &all[..9]), None);
+        assert_eq!(kmix_word(&gw, &uw, 3, &all), None);
     }
 }

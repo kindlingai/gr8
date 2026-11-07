@@ -79,7 +79,7 @@ struct K1Args
     float steer_alpha = 0.f;
     const int* steer_slot = nullptr;   // several profiles: [G6_MX] row profile; steer_dir is [profiles][HID]
     const float* steer_slot_alpha = nullptr;
-    float* steer_part = nullptr;       // [G6_MX][48]
+    float* steer_part = nullptr;       // [G6_MX][HB]
     unsigned* steer_count = nullptr;   // [G6_MX], zero between finalize launches
 #ifdef DEC_SLOT
     dslot::Slot slot;          // send = nullptr: out as above; else out is this rank's send slot of slot.c (decslot.cuh)

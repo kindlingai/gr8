@@ -783,7 +783,7 @@ __device__ __forceinline__ bool tr3_fin_body(const K1Args& A, int plan)
 
         // Project only the shared expert contribution. The routed sum in `o` never participates in the dot. One fixed
         // partial per 128-column CTA avoids nondeterministic floating-point atomics; whichever CTA arrives last sums
-        // the 48 partials in column order. All five resident warps then share the correction instead of serializing it
+        // the HB partials in column order. All five resident warps then share the correction instead of serializing it
         // through warp 0; the existing finalize launch and slot publish remain unchanged.
         if (steer)
         {
@@ -792,19 +792,19 @@ __device__ __forceinline__ bool tr3_fin_body(const K1Args& A, int plan)
             #pragma unroll
             for (int d = 16; d > 0; d >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, d);
             // Bypass stale per-SM cache lines when this scratch is reused by the next layer/step.
-            volatile float* partial = A.steer_part + (size_t)m * 48;
-            if (lane == 0) partial[blockIdx.x % 48] = dot;
+            volatile float* partial = A.steer_part + (size_t)m * geom::HB;
+            if (lane == 0) partial[hb] = dot;
             // Every output-writing lane fences its stores before lane 0 signals this CTA's arrival.
             __threadfence();
             __syncwarp();
             if (lane == 0)
             {
-                steer_last = atomicAdd(A.steer_count + m, 1u) == 47u;
+                steer_last = atomicAdd(A.steer_count + m, 1u) == geom::HB - 1u;
                 if (steer_last)
                 {
                     float total = 0.f;
                     #pragma unroll
-                    for (int j = 0; j < 48; ++j) total += partial[j];
+                    for (int j = 0; j < geom::HB; ++j) total += partial[j];
                     steer_kappa = (scale * alpha) * total;
                 }
             }

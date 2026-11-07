@@ -38,7 +38,7 @@ inline void materialize_steering(Model& m, const std::vector<steering::Profile>&
     G6RT_CK(cudaMemsetAsync(m.steering_scale, 0, MX * sizeof(float), st));
     G6RT_CK(cudaMemsetAsync(m.steering_slot, 0, MX * sizeof(int), st));
     if (m.steering_scope == steering::Scope::Shared) {
-        m.steering_part = dmalloc<float>(size_t(MX) * 48);
+        m.steering_part = dmalloc<float>(size_t(MX) * geom::HB);
         m.steering_count = dmalloc<unsigned>(MX);
         G6RT_CK(cudaMemsetAsync(m.steering_count, 0, MX * sizeof(unsigned), st));
     }

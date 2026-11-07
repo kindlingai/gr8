@@ -510,6 +510,49 @@ class NoNumpyFetchTests(unittest.TestCase):
         same_halves(self.root, r.v2, 3, 4, 0, lambda p: 3)
 
 
+class StaleJournalTests(unittest.TestCase):
+    """A width file deleted by hand while its .fetch journal stays: the next fetch writes its header and halves again.
+    A stub hub and fetch plan, so neither numpy nor bin/g6load is needed."""
+    NAME = 'exlr8-layer-003.k3.safetensors'
+
+    class Hub:
+        repo, rev = 'o/r', 'main'
+
+        def __init__(self, data):
+            self.data, self.gets = data, []
+
+        def tree(self):
+            return {'experts/' + StaleJournalTests.NAME: len(self.data)}
+
+        def get(self, path, lo, n):
+            self.gets.append((lo, n))
+            return self.data[lo:lo + n]
+
+    def test_a_deleted_width_file_is_fetched_again(self):
+        fr = hfsource.fetch_ranks()
+        hn = 40
+        data = hn.to_bytes(8, 'little') + b'{"__metadata__": {}}'.ljust(hn) + bytes(range(256)) * 4
+        hub = self.Hub(data)
+        plan = {'files': [{'name': self.NAME, 'ranges': [[200, 64]]}]}
+        out = tempfile.mkdtemp(prefix='gr8sj-')
+        local = os.path.join(out, self.NAME)
+        with mock.patch.object(fr, 'g6load_run', return_value=plan):
+            fr.fetch_layers(hub, out, 4, [0], 'slices', allk=[3], log=lambda m: None)
+            self.assertEqual(open(local, 'rb').read(264), data[:264])
+            os.unlink(local)                   # the journal in out/.fetch still lists the ranges
+            self.assertGreater(fr.fetch_layers(hub, out, 4, [0], 'slices', allk=[3], plan_only=True), 0)
+            fr.fetch_layers(hub, out, 4, [0], 'slices', allk=[3], log=lambda m: None)
+            with open(local, 'rb') as f:
+                self.assertEqual(f.read(8 + hn), data[:8 + hn])
+                f.seek(200)
+                self.assertEqual(f.read(64), data[200:264])
+            # a rerun with the file in place fetches nothing but the 8-byte header length
+            n = len(hub.gets)
+            self.assertEqual(fr.fetch_layers(hub, out, 4, [0], 'slices', allk=[3], log=lambda m: None), 0)
+            self.assertEqual(hub.gets[n:], [(0, 8)])
+        shutil.rmtree(out)
+
+
 class KeepAliveTests(unittest.TestCase):
     """Hub.get's range GETs reuse kept-alive connections (#147): one connection for many ranges, a redirect to another
     host followed on that host's connection, an idle connection the server closed (in clear or over TLS) replaced

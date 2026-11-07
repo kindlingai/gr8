@@ -82,7 +82,7 @@ struct Planner
 };
 
 // Binds layer l's attention weights into out.W. compressor: the layer has the compressor gate (ratio-2 KV sources). "" = ok, else the message
-// to die with. The rank's heads come from q_b (the pack slices q_b, attn_sink, o_a and o_b by o group); heads % 16 == 0 is q_b's GEMV tile rule.
+// to die with. The rank's heads come from q_b (the pack slices q_b, attn_sink, o_a and o_b by o group); heads % 16 == 0 is the attention kernels' 16-head CTA tile.
 template <class Find>
 std::string plan_attn(Find&& find, int l, bool compressor, Plan& out)
 {
