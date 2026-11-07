@@ -91,7 +91,22 @@ int main(int argc,char**) {
     assert(occurrences(multi,"stage=ffn_down")==2 && multi.find("request=6 ")==std::string::npos);
     assert(other.find("chunks=1 measured=2 pending=0 dropped=0")!=std::string::npos);
     assert(report(s,5).empty() && report(s,6).empty());
-    std::puts("PASS interleaved multi-chunk requests report exactly once per request");
+    std::puts("PASS optional interleaved multi-chunk aggregation reports each sample once");
+    timing_release(s);
+
+    timing_init(s,true,8);
+    for(uint32_t c=0;c<32;++c) {
+        timing_begin_chunk(s,8,c*4096,4096); timing_layer(s,20);
+        { TimingSpan span(s,TimingStage::AttnInAg,s.st); }
+        { TimingSpan span(s,TimingStage::FfnAg,s.st); }
+        timing_end_chunk(s); CK(cudaStreamSynchronize(s.st)); // harness fence only
+        const auto chunk_report=report(s,8);
+        assert(chunk_report.find("request=8 ")!=std::string::npos);
+        assert(chunk_report.find("chunks=1 measured=3 pending=0 dropped=0")!=std::string::npos);
+        assert(chunk_report.find("first_chunk="+std::to_string(c*4096)+" last_chunk="+std::to_string(c*4096))!=std::string::npos);
+        assert(report(s,8).empty());
+    }
+    std::puts("PASS 32 per-chunk reports reuse one request id and bounded ring without loss (synthetic metadata)");
     timing_release(s);
 
     timing_init(s,true,8);

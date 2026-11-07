@@ -47,7 +47,7 @@ struct Timing {
         TimingStage stage=TimingStage::Chunk;
         bool used=false,ended=false,reported=false,comm=false;
     };
-    struct Request { size_t chunks=0,dropped=0; };
+    struct Request { size_t chunks=0,dropped=0; uint32_t first_chunk=0,last_chunk=0; };
     std::vector<Entry> ring;
     std::map<uint64_t,Request> requests;
     size_t cursor=0;
@@ -96,15 +96,20 @@ struct Timing {
     void begin_chunk(uint64_t req,uint32_t first,uint32_t n,cudaStream_t st) {
         if(active) { std::fprintf(stderr,"DS41 v2 timing: nested chunk\n"); std::abort(); }
         request=req; chunk=first; rows=n; layer=-1; active=true; anchor=-1;
-        ++requests[request].chunks;
+        auto& r=requests[request];
+        if(!r.chunks)r.first_chunk=first;
+        r.last_chunk=first; ++r.chunks;
         anchor=begin(TimingStage::Chunk,st,false);
     }
     void end_chunk() { if(active)end(anchor); active=false; anchor=-1; }
-    // Call once after the request's final v2 chunk has ended, preferably at the
-    // caller's EXISTING completion fence. Query only: pending entries are
+    // Call after each chunk at the caller's EXISTING completion fence. Chunk
+    // labels are first-token offsets, not ordinal counters. Query only: pending entries are
     // labelled, not waited for or presented as measurements. Both streams use
     // the SAME chunk-begin event as origin; no profiling dependency is added.
     // A join interval measures the compute stream's wait, not CPU enqueue time.
+    // Retiring each chunk lets arbitrarily long requests reuse the fixed ring;
+    // a later begin_chunk with the same request id starts fresh stats. Multiple
+    // chunks can still be aggregated if a caller elects to report less often.
     void report(uint64_t req,FILE* out=stderr) {
         const auto it=requests.find(req);
         if(it==requests.end())return; // idempotent, including default-off callers
@@ -136,8 +141,8 @@ struct Timing {
             // Do not free anchors until EVERY interval has been read. Marking
             // reported preserves event objects and prevents duplicate output.
         }
-        const int n=std::snprintf(line,sizeof(line),"# ds41_v2_timing_summary rank=%d request=%llu chunks=%zu measured=%zu pending=%zu dropped=%zu origin=chunk_begin\n",
-            rank,(unsigned long long)req,it->second.chunks,measured,pending,it->second.dropped);
+        const int n=std::snprintf(line,sizeof(line),"# ds41_v2_timing_summary rank=%d request=%llu chunks=%zu measured=%zu pending=%zu dropped=%zu first_chunk=%u last_chunk=%u origin=chunk_begin\n",
+            rank,(unsigned long long)req,it->second.chunks,measured,pending,it->second.dropped,it->second.first_chunk,it->second.last_chunk);
         body.append(line,size_t(n));
         std::fwrite(body.data(),1,body.size(),out);
         requests.erase(it);

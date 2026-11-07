@@ -156,8 +156,10 @@ knobs:
     values: "0|1"
     doc: >-
       With GR8_DS_PF_V2=1, record per-layer compute/communication CUDA-event pairs
-      into a bounded ring and print once per request after its final v2 chunk.
-      Reports intervals relative to each chunk's start to expose stream overlap.
+      into a bounded ring and print per chunk at the existing completion fence.
+      Reports request id and chunk first-token offset, with intervals relative to
+      that chunk's start to expose stream overlap. Retires each chunk's samples so
+      long requests can reuse the ring without accumulating events.
       Never synchronizes the GPU; not-ready or overflow samples are labelled.
       Default 0 allocates no timing events and leaves the stock path unchanged.
   GR8_DS_PF_V2_FC2:
