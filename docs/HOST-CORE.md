@@ -749,7 +749,8 @@ signature vectors theirs, and `test_ds41_lanes`, `test_ds41_pf_split`, `test_ds4
 DS41 S2 tests pass unchanged. `scripts/host_tests.sh`, `cargo test --release --workspace` and the `engine/tests` unit
 tests pass, and the 13,777 round logs the host tests write are byte-identical to R6c's. On a GB10, `GR8_FABRIC_DUMP` through
 R6c's engines and R6d's over `scripts/check_args.py fabric-cases` and `options_cases.txt`: the 1,579 transcripts are
-byte-identical, 7,178 config lines among them. The GLM, Flash and DS41 engines build. Boot pending.
+byte-identical, 7,178 config lines among them. The GLM, Flash and DS41 engines build. Boot: TP4 GLM, R6c then R6d, the round logs byte-identical on all four ranks, the 24 T=0
+replies matching, and the head's log lines equal apart from times and memory.
 
 ### R7. Step sizes
 
