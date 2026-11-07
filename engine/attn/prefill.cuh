@@ -354,7 +354,8 @@ extern "C" int g6a_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,const G6
         const bool mapped=dense&&a.context>0&&D<=8192&&H*ga::TOP>=a.context;
         if(dense){GP_BLAS(cublasGemmEx(p->blas,CUBLAS_OP_T,CUBLAS_OP_N,D,H*R,576,&scale,p->cache,CUDA_R_16F,576,p->q,CUDA_R_16F,576,&zero,p->dense,CUDA_R_32F,D,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));
             if(!mapped)gp::dense_gather<<<(n*H*ga::TOP+255)/256,256,0,st>>>(a,start,n,R,p->dense,p->prob);
-        }else {if(a.heads>16)gp::sparse_qk<2><<<dim3(ga::TOP/64,n),128,0,st>>>(a,start,R,p->q,p->cache,p->prob);else gp::sparse_qk<1><<<dim3(ga::TOP/64,n),128,0,st>>>(a,start,R,p->q,p->cache,p->prob);}
+        }else {if(a.heads>32)return int(cudaErrorNotSupported);   // sparse_qk / sparse_pv cover 32 heads a block
+            if(a.heads>16)gp::sparse_qk<2><<<dim3(ga::TOP/64,n),128,0,st>>>(a,start,R,p->q,p->cache,p->prob);else gp::sparse_qk<1><<<dim3(ga::TOP/64,n),128,0,st>>>(a,start,R,p->q,p->cache,p->prob);}
         G6_PF_MARK(7,st);if(mapped){
             cudaMemsetAsync(p->prob,0xff,(size_t)R*a.context*4,st);
             gp::dense_links<<<(n*ga::TOP+255)/256,256,0,st>>>(a,start,n,(int*)p->prob,p->next);
