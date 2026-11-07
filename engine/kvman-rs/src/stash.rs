@@ -359,13 +359,16 @@ impl Stash {
     }
 
     /// After the last add_tier: the index runs whose base came back in no tier are dropped (slots freed, records
-    /// gone), so no later boot reads blocks reused since. Returns how many.
+    /// gone), so no later boot reads blocks reused since.
     /// A tier whose index is not whole (keep=system now) drops the runs an earlier whole index recorded: it never
-    /// journals their lifecycle, so a kept one could later point at reused blocks.
+    /// journals their lifecycle, so a kept one could later point at reused blocks. Returns how many runs both rules
+    /// dropped.
     pub fn loaded(&mut self) -> usize {
+        let mut unjournaled = 0;
         for t in self.tiers.iter_mut().filter(|t| t.index.is_some() && !t.whole) {
             let (gone, keep): (Vec<Entry>, Vec<Entry>) = std::mem::take(&mut t.entries).into_iter().partition(|e| !e.kind.prefix());
             t.entries = keep;
+            unjournaled += gone.len();
             for e in gone {
                 t.alloc.release(&e.slots);
                 if t.index.as_mut().is_some_and(|ix| ix.drop(e.id).is_err()) {
@@ -383,7 +386,7 @@ impl Stash {
                 }
             }
         }
-        gone.len()
+        gone.len() + unjournaled
     }
 
     pub fn tiers(&self) -> usize {

@@ -1277,7 +1277,8 @@ fn a_whole_index_reopened_with_keep_system_drops_its_runs() {
     assert!(recorded.iter().any(|e| !e.kind.prefix()), "the whole index recorded runs");
     let mut p = pool(12, 12, 12 * 64, 2);
     p.add_tier(64, Keep::Shared, Some((dir.as_path(), "to-system"))).unwrap();
-    p.tiers_loaded();
+    let runs = recorded.iter().filter(|e| !e.kind.prefix()).count();
+    assert_eq!(p.tiers_loaded(), runs, "every dropped run is counted (the boot line prints it)");
     assert!(p.stash().unwrap().entries(0).iter().all(|e| e.kind.prefix()), "only prefixes load");
     drop(p);
     let left = g6kvman::stash::Index::open(&dir, "to-system").unwrap().1;
