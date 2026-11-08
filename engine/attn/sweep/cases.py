@@ -15,6 +15,10 @@ def cases(suite="all", late_final=False):
                                        "input_provenance": "synthetic_source_derived_shape",
                                        "topk_pattern": "uniform_without_replacement",
                                        "operands": "synthetic", "decision_rows": False,
+                                       "dispatch_phase": "main" if n == 1 else "late_replay" if floor else "prefill_v2",
+                                       "session_form": "implicit_single",
+                                       "format": "fp4_e2m1_e4m3_288" if ratio else "window_only",
+                                       "ring_rows": None, "geometry_source": "adapter_fixture_not_captured",
                                        "geometry": {"ring_rows": 8319, "slot_count": 1,
                                            "dispatch_phase": "late_replay" if floor else "main" if n == 1 else "prefill_v2",
                                            "key_capacity_source": "synthetic_not_boot_manifest",
@@ -52,7 +56,9 @@ def cases(suite="all", late_final=False):
                 result[ident] = dict(id=ident, args=args + ["--topk-pattern", pattern],
                     weights={"32K": 0, "128K": 0},
                     input_provenance="synthetic_source_derived_shape", operands="synthetic",
-                    topk_pattern=pattern, decision_rows=False)
+                    topk_pattern=pattern, decision_rows=False, dispatch_phase="synthetic_stress",
+                    session_form="implicit_single", format="fp4_e2m1_e4m3_288",
+                    ring_rows=None, geometry_source="adapter_fixture_not_captured")
     return list(result.values())
 
 
