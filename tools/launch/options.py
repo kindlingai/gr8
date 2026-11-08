@@ -248,6 +248,17 @@ def parse(argv, environ=None):
     return opts
 
 
+def extra_env_value(o, name):
+    """name's value in --extra-env, '' when it is not set there. engine_args.sh applies the last assignment, so this
+    does too."""
+    value = ''
+    for word in (o.get('EXTRA_ENV') or '').split():
+        key, sep, v = word.partition('=')
+        if sep and key == name:
+            value = v
+    return value
+
+
 def looks_remote(model):
     """A Hugging Face source is an https:// URL. Anything else is a local path."""
     return model.startswith('https://')
