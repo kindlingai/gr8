@@ -194,7 +194,47 @@ def pair_record(before, candidate, after):
     return record
 
 
-def aggregate_runs(raw, pairs, cases, variants, reference):
+def adaptive_decision(raw, pairs, case_id, variant, target):
+    """Repeated-look heuristic, not a sequentially valid confidence guarantee.
+
+    Any observed out-of-band null is sticky: it prevents early stopping even
+    if later controls settle. Missing nulls or invalid pairs also fail closed.
+    """
+    ps = [p for p in pairs if p["case"] == case_id and p["variant"] == variant]
+    used = len({p["round_id"] for p in ps})
+    good = [p for p in ps if p["status"] == "EXACT"]
+    stats = uncertainty([p["delta_pct"] for p in good])
+    half = None if stats["ci95_high"] is None else (stats["ci95_high"] - stats["ci95_low"]) / 2
+    ids = {rid for p in ps for rid in p.get("run_ids", [])}
+    runs = [r for r in raw if r.get("final_attempt") and r.get("run_id") in ids]
+    null_ok, outside = bool(runs), False
+    for r in runs:
+        value, band = r.get("null_delta_pct_mean"), r.get("null_band_pct")
+        valid = all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in (value, band)) and band >= 0
+        null_ok &= valid
+        outside |= valid and abs(value) > band
+    valid = len(good) == len(ps) and len({p.get("estimator") for p in good}) == 1 and len({p.get("regime") for p in good}) == 1
+    precise = valid and used >= 3 and half is not None and half < target
+    stop = precise and null_ok and not outside
+    if stop:
+        reason = "CI_REACHED" if used < 6 else "CI_REACHED_AT_CAP"
+    elif used < 6:
+        reason = "CONTINUE"
+    elif outside:
+        reason = "MAX_ROUNDS_NULL_OUTSIDE"
+    elif not null_ok:
+        reason = "MAX_ROUNDS_NULL_UNAVAILABLE"
+    elif not valid:
+        reason = "MAX_ROUNDS_INVALID"
+    else:
+        reason = "MAX_ROUNDS_CI_WIDE"
+    return dict(rounds_used=used, final_ci95_half_width_pct=half,
+                adaptive_stop_reason=reason, adaptive_ci_target_pct=target,
+                adaptive_null_verdict="OUTSIDE_BAND" if outside else "WITHIN_BAND" if null_ok else "UNAVAILABLE",
+                stop=stop or used >= 6)
+
+
+def aggregate_runs(raw, pairs, cases, variants, reference, adaptive_ci=0):
     """Only complete requested runs yield valid totals; retain failed pairs separately."""
     final = [r for r in raw if r["final_attempt"]]
     summaries = []
@@ -239,6 +279,14 @@ def aggregate_runs(raw, pairs, cases, variants, reference):
                                paired_ci95_high_pct=stats["ci95_high"], pairing_estimator=next(iter(estimators)),
                                paired_reference_us=statistics.mean(r["reference_us"] for r in good),
                                paired_delta_us=statistics.mean(r["delta_us"] for r in good))
+            row["rounds_used"] = len({r.get("round_id") for r in runs})
+            low, high = row.get("paired_ci95_low_pct"), row.get("paired_ci95_high_pct")
+            row["final_ci95_half_width_pct"] = None if low is None or high is None else (high-low)/2
+            if adaptive_ci and ps:
+                decision = adaptive_decision(raw, pairs, case["id"], v, adaptive_ci)
+                row.update({k: value for k, value in decision.items() if k != "stop"})
+            else:
+                row["adaptive_stop_reason"] = "REFERENCE_CONTROLS" if adaptive_ci else "DISABLED"
             summaries.append(row)
     return summaries
 
@@ -252,7 +300,8 @@ def write_tables(out, rows, cases, variants, reference, kernel):
               "regime", "n_runs", "n_valid_runs", "n_pairs", "n_pairs_requested", "between_run_sd_us",
               "pairing_estimator", "paired_delta_us", "paired_delta_pct", "paired_sd_pct",
               "paired_ci95_low_pct", "paired_ci95_high_pct", "null_delta_pct_mean",
-              "null_max_abs_delta_pct", "null_band_pct", "null_band_verdict"]
+              "null_max_abs_delta_pct", "null_band_pct", "null_band_verdict",
+              "rounds_used", "final_ci95_half_width_pct", "adaptive_ci_target_pct", "adaptive_stop_reason", "adaptive_null_verdict"]
     for label in labels:
         fields.extend([f"calls_{label}", f"contribution_{label}_ms"])
     for r in rows:
@@ -295,6 +344,7 @@ def write_tables(out, rows, cases, variants, reference, kernel):
           "paired_sd_pct and paired_ci95_* are BETWEEN-process/pair SD and Student-t 95% CI; n_pairs is the independent observation count, not CUDA repetitions.",
           "null_band_verdict compares every process off/off null mean to the common reported band; a grand-mean cancellation cannot pass. Missing null data is UNAVAILABLE, failed rows INCOMPLETE; this is not a model keep/drop verdict.",
           "CI assumes independent pair observations; autocorrelation may understate uncertainty. See raw telemetry and controls for drift/competition.",
+          "Adaptive stopping, when enabled, uses repeated nominal CI95 looks (min3/max6); not a sequentially valid coverage guarantee. Candidate dropout truncates position balance; fixed mode is unchanged.",
           "Prompt totals are weighted kernel-only estimates, NOT TTFT. No rank multiplier. Total percentage is an aggregate ratio, not paired uncertainty.",
           "Cold/rotating synthetic inputs are not an engine predecessor replay; captured regime is unavailable unless explicitly reported by the adapter.",
           "Resource columns describe the main kernel; timing includes every kernel in launch().", "",
@@ -354,6 +404,7 @@ def main(argv=None):
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--seed", type=int, default=12345)
     p.add_argument("--rounds", type=int, default=3, help="minimum process rounds (>=3), rounded up to complete balanced blocks")
+    p.add_argument("--adaptive-ci", type=float, default=0, help="CI95 half-width target in percentage points; default off; min3/max6 rounds")
     p.add_argument("--flush-mb", type=int, default=0)
     p.add_argument("--pools", type=int, default=3)
     p.add_argument("--amortize", type=int, default=1)
@@ -366,6 +417,8 @@ def main(argv=None):
     a = p.parse_args(argv)
     if a.build_only and a.run_only:
         p.error("build-only and run-only are mutually exclusive")
+    if not math.isfinite(a.adaptive_ci) or a.adaptive_ci < 0:
+        p.error("adaptive-ci must be finite and nonnegative")
     if a.rounds < 3 or a.flush_mb < 0 or min(a.pools, a.amortize, a.reps-1, a.iters, a.jobs, a.retries) < 1 or a.warmup < 0 or not math.isfinite(a.retry_delay) or a.retry_delay < 0 or not math.isfinite(a.timeout) or a.timeout <= 0:
         p.error("invalid repetitions/jobs/retries/warmup/delay")
     out = a.out.resolve()
@@ -413,7 +466,9 @@ def main(argv=None):
     out.mkdir(parents=True, exist_ok=True)
     manifest = {"kernel": name, "adapter": config, "reference": a.reference, "variants": variants,
                 "argv": list(sys.argv if argv is None else [str(HERE / "run.py")] + argv), "arch": a.arch, "seed": a.seed, "warmup": a.warmup, "reps": a.reps, "iters": a.iters,
-                "rounds_requested": a.rounds, "orders": list(balanced_orders(variants, a.reference, a.rounds)),
+                "rounds_requested": a.rounds, "adaptive_ci": a.adaptive_ci,
+                "adaptive_max_rounds": 6 if a.adaptive_ci else None,
+                "orders": list(balanced_orders(variants, a.reference, 6 if a.adaptive_ci else a.rounds))[:6 if a.adaptive_ci else None],
                 "flush_mb": a.flush_mb, "pools": a.pools, "amortize": a.amortize,
                 "regime_note": "binary-reported; cold is not engine replay; captured/predecessor unavailable unless explicitly reported",
                 "telemetry_note": "pre/post child-process snapshots only, no in-interval observation or clock control",
@@ -546,8 +601,11 @@ def main(argv=None):
             time.sleep(a.retry_delay)
 
     for case in cases:
+        stopped = set()
         for r, order in enumerate(manifest["orders"]):
             for position, v in enumerate(order):
+                if v in stopped:
+                    continue
                 pair_id = f"{case['id']}.r{r+1}.p{position+1}"
                 before = run_one(case, a.reference, r+1, pair_id, "off_before")
                 candidate = run_one(case, v, r+1, pair_id, "candidate")
@@ -556,7 +614,13 @@ def main(argv=None):
                 pairs.append(pair)
                 with (out / "pairs.jsonl").open("a") as f:
                     f.write(json.dumps(pair) + "\n")
-        summary = aggregate_runs(rows, pairs, cases, variants, a.reference)
+                if a.adaptive_ci:
+                    decision = adaptive_decision(rows, pairs, case["id"], v, a.adaptive_ci)
+                    with (out / "adaptive-decisions.jsonl").open("a") as f:
+                        f.write(json.dumps(dict(case=case["id"], variant=v, **decision)) + "\n")
+                    if decision["stop"]:
+                        stopped.add(v)
+        summary = aggregate_runs(rows, pairs, cases, variants, a.reference, a.adaptive_ci)
         write_tables(out, summary, cases, variants, a.reference, name)
     manifest["finished_unix"] = time.time()
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

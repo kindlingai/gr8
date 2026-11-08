@@ -115,3 +115,22 @@ preserved verbatim in raw records, including diagnostic timings and integrity /
 launch metadata on nonzero exit codes. Only EXACT with exit code zero and valid
 finite timing values is eligible for a pair or complete total. A timeout or
 low-memory retry is never promoted by a partial JSON payload.
+
+## Optional adaptive stopping
+
+`--adaptive-ci 1.0` enables per-(candidate,case) stopping after at least3 rounds
+when the between-process paired-delta nominal CI95 half-width is **strictly less
+than1.0 percentage point**. The cap is6 rounds, not rounded up to candidate count;
+`--rounds` still controls only fixed mode. Default0 preserves fixed mode unchanged.
+Every observed off/off process null in that candidate's brackets (before,
+candidate and after) must be present and inside its reported band. An outside
+null is sticky: continue through6 and label `MAX_ROUNDS_NULL_OUTSIDE`, even if
+later nulls settle. Missing nulls/invalid pairs also prevent early stopping.
+`adaptive-decisions.jsonl` preserves every look; summaries include rounds_used,
+final_ci95_half_width_pct, target, stop reason and the bracket null verdict.
+Reference-only rows summarize controls, rather than independently stopping them.
+
+These are repeated looks at ordinary Student-t intervals, **not** a sequentially
+valid95% coverage guarantee. Adaptive dropout and the6-round cap truncate complete
+Latin position balance (especially with >6 candidates). This is an optional
+screening time-saving rule, not stronger statistical or model evidence.
