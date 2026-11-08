@@ -134,3 +134,17 @@ These are repeated looks at ordinary Student-t intervals, **not** a sequentially
 valid95% coverage guarantee. Adaptive dropout and the6-round cap truncate complete
 Latin position balance (especially with >6 candidates). This is an optional
 screening time-saving rule, not stronger statistical or model evidence.
+
+## Reduced attention list
+
+`--cases engine/attn/sweep/cases_reduced_r2.json` selects the union17 source-derived
+CQ-r2 shapes:16 full/tail chunks for128K plus the true32K last chunk
+n8191_p24576 (the128K n8192_p24576 is not interchangeable). All4 real32K CQ-r2
+chunks are included. Original suite-all weights/key capacities are unchanged.
+Coverage is **90.2698% of32K /90.4781% of128K historical OFF-time contribution**,
+not fraction of call counts. The JSON carries archived baseline CSV SHA256,
+per-case OFF means and full OFF-time denominators. This is the old synthetic
+screening baseline, not a measured coverage fraction under new inputs/captures.
+Tables explicitly label reduced-set kernel-only totals and coverage provenance;
+subsets/shards report only their own portion of those denominators. No full
+prompt/TTFT claim or rescaling of omitted work is made.

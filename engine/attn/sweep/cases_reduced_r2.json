@@ -1,0 +1,716 @@
+[
+  {
+    "id": "n8192_p0_r2_f0_w128_k32768",
+    "args": [
+      8192,
+      0,
+      2,
+      0,
+      128,
+      32768
+    ],
+    "weights": {
+      "32K": 18,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6453.880768,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8192_p8192_r2_f0_w128_k32768",
+    "args": [
+      8192,
+      8192,
+      2,
+      0,
+      128,
+      32768
+    ],
+    "weights": {
+      "32K": 18,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6776.11969,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8192_p16384_r2_f0_w128_k32768",
+    "args": [
+      8192,
+      16384,
+      2,
+      0,
+      128,
+      32768
+    ],
+    "weights": {
+      "32K": 18,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6784.615784,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8191_p24576_r2_f0_w128_k32768",
+    "args": [
+      8191,
+      24576,
+      2,
+      0,
+      128,
+      32768
+    ],
+    "weights": {
+      "32K": 18,
+      "128K": 0
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6799.309082,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8192_p24576_r2_f0_w128_k32768",
+    "args": [
+      8192,
+      24576,
+      2,
+      0,
+      128,
+      32768
+    ],
+    "weights": {
+      "32K": 0,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6801.349792,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8192_p32768_r2_f0_w128_k40960",
+    "args": [
+      8192,
+      32768,
+      2,
+      0,
+      128,
+      40960
+    ],
+    "weights": {
+      "32K": 0,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6800.532837,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8192_p40960_r2_f0_w128_k49152",
+    "args": [
+      8192,
+      40960,
+      2,
+      0,
+      128,
+      49152
+    ],
+    "weights": {
+      "32K": 0,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6807.176666,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8192_p49152_r2_f0_w128_k57344",
+    "args": [
+      8192,
+      49152,
+      2,
+      0,
+      128,
+      57344
+    ],
+    "weights": {
+      "32K": 0,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6803.573303,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8192_p57344_r2_f0_w128_k65536",
+    "args": [
+      8192,
+      57344,
+      2,
+      0,
+      128,
+      65536
+    ],
+    "weights": {
+      "32K": 0,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6827.522125,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8192_p65536_r2_f0_w128_k73728",
+    "args": [
+      8192,
+      65536,
+      2,
+      0,
+      128,
+      73728
+    ],
+    "weights": {
+      "32K": 0,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6845.58075,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8192_p73728_r2_f0_w128_k81920",
+    "args": [
+      8192,
+      73728,
+      2,
+      0,
+      128,
+      81920
+    ],
+    "weights": {
+      "32K": 0,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6857.761536,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8192_p81920_r2_f0_w128_k90112",
+    "args": [
+      8192,
+      81920,
+      2,
+      0,
+      128,
+      90112
+    ],
+    "weights": {
+      "32K": 0,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6854.356842,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8192_p90112_r2_f0_w128_k98304",
+    "args": [
+      8192,
+      90112,
+      2,
+      0,
+      128,
+      98304
+    ],
+    "weights": {
+      "32K": 0,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6859.730377,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8192_p98304_r2_f0_w128_k106496",
+    "args": [
+      8192,
+      98304,
+      2,
+      0,
+      128,
+      106496
+    ],
+    "weights": {
+      "32K": 0,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6864.470215,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8192_p106496_r2_f0_w128_k114688",
+    "args": [
+      8192,
+      106496,
+      2,
+      0,
+      128,
+      114688
+    ],
+    "weights": {
+      "32K": 0,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6867.277374,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8192_p114688_r2_f0_w128_k122880",
+    "args": [
+      8192,
+      114688,
+      2,
+      0,
+      128,
+      122880
+    ],
+    "weights": {
+      "32K": 0,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6893.620453,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  },
+  {
+    "id": "n8191_p122880_r2_f0_w128_k131071",
+    "args": [
+      8191,
+      122880,
+      2,
+      0,
+      128,
+      131071
+    ],
+    "weights": {
+      "32K": 0,
+      "128K": 18
+    },
+    "input_provenance": "synthetic_source_derived_shape",
+    "topk_pattern": "uniform_without_replacement",
+    "operands": "synthetic",
+    "decision_rows": false,
+    "dispatch_phase": "prefill_v2",
+    "session_form": "implicit_single",
+    "format": "fp4_e2m1_e4m3_288",
+    "ring_rows": null,
+    "geometry_source": "adapter_fixture_not_captured",
+    "geometry": {
+      "ring_rows": 8319,
+      "slot_count": 1,
+      "dispatch_phase": "prefill_v2",
+      "key_capacity_source": "synthetic_not_boot_manifest",
+      "configuration": "single_slot_rowcap8192_not_captured"
+    },
+    "baseline_off_mean_us": 6878.33725,
+    "reduced_set": {
+      "baseline_source": "reports/attn-sweep-bench-evidence/gb10-all/summary.csv",
+      "baseline_sha256": "d5cd8e91590c42e82a7165d84b76f4490a879fd50d4e8a26c7e7ecbcd9062648",
+      "baseline_build_commit": "72c5e43b99b782d3a3821e656af758ae93a2f5f7",
+      "baseline_regime": "historical synthetic screening only; not current fresh/captured regime",
+      "full_off_ms": {
+        "32K": 534.675651809,
+        "128K": 2168.002124955
+      }
+    }
+  }
+]

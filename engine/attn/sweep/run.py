@@ -291,7 +291,24 @@ def aggregate_runs(raw, pairs, cases, variants, reference, adaptive_ci=0):
     return summaries
 
 
+def reduced_coverage(cases):
+    tagged = [c for c in cases if "reduced_set" in c]
+    if not tagged:
+        return None
+    metadata = tagged[0]["reduced_set"]
+    if len(tagged) != len(cases) or any(c["reduced_set"] != metadata for c in cases):
+        raise ValueError("reduced cases must share one baseline coverage definition")
+    totals = metadata.get("full_off_ms", {})
+    if not totals or any(not isinstance(v, (float, int)) or not math.isfinite(v) or v <= 0 for v in totals.values()):
+        raise ValueError("invalid reduced full baseline denominator")
+    if any(not isinstance(c.get("baseline_off_mean_us"), (float, int)) or not math.isfinite(c["baseline_off_mean_us"]) or c["baseline_off_mean_us"] <= 0 for c in cases):
+        raise ValueError("missing reduced baseline case timing")
+    return {label:100*sum(c["baseline_off_mean_us"]*c.get("weights", {}).get(label, 0)/1000 for c in cases)/full
+            for label, full in totals.items()}
+
+
 def write_tables(out, rows, cases, variants, reference, kernel):
+    coverage = reduced_coverage(cases)
     baseline = {r["case"]: r for r in rows if r["variant"] == reference and "mean_us" in r}
     weights = {c["id"]: c.get("weights", {}) for c in cases}
     labels = sorted({k for c in cases for k in c.get("weights", {})}, key=lambda x: sum(c.get("weights", {}).get(x, 0) for c in cases))
@@ -301,9 +318,11 @@ def write_tables(out, rows, cases, variants, reference, kernel):
               "pairing_estimator", "paired_delta_us", "paired_delta_pct", "paired_sd_pct",
               "paired_ci95_low_pct", "paired_ci95_high_pct", "null_delta_pct_mean",
               "null_max_abs_delta_pct", "null_band_pct", "null_band_verdict",
-              "rounds_used", "final_ci95_half_width_pct", "adaptive_ci_target_pct", "adaptive_stop_reason", "adaptive_null_verdict"]
+              "rounds_used", "final_ci95_half_width_pct", "adaptive_ci_target_pct", "adaptive_stop_reason", "adaptive_null_verdict", "scope"]
     for label in labels:
         fields.extend([f"calls_{label}", f"contribution_{label}_ms"])
+        if coverage is not None:
+            fields.append(f"off_weight_coverage_{label}_pct")
     for r in rows:
         base = baseline.get(r["case"])
         if "vs_reference_pct" not in r and "mean_us" in r and base and base["mean_us"] > 0:
@@ -321,15 +340,18 @@ def write_tables(out, rows, cases, variants, reference, kernel):
             needed = [c for c in cases if c.get("weights", {}).get(label, 0)]
             if not needed:
                 continue
-            total = {"kernel": kernel, "variant": variant, "case": f"TOTAL_{label}_kernel_only",
+            total = {"kernel": kernel, "variant": variant, "case": f"TOTAL_{label}_" + ("reduced_set_" if coverage is not None else "") + "kernel_only",
+                     "prompt_label": label, "scope": "reduced_set_kernel_only" if coverage is not None else "kernel_only",
                      "status": "INCOMPLETE", f"calls_{label}": sum(c["weights"][label] for c in needed)}
             if all(c["id"] in vr and "mean_us" in vr[c["id"]] for c in needed):
                 total[f"contribution_{label}_ms"] = sum(vr[c["id"]]["mean_us"] * c["weights"][label] / 1000 for c in needed)
                 total["status"] = "EXACT" if all(vr[c["id"]]["status"] == "EXACT" for c in needed) else "MISMATCH"
                 totals[(variant, label)] = total[f"contribution_{label}_ms"]
+            if coverage is not None:
+                total[f"off_weight_coverage_{label}_pct"] = coverage.get(label)
             output_rows.append(total)
     for r in output_rows[len(rows):]:
-        label = r["case"].removeprefix("TOTAL_").removesuffix("_kernel_only")
+        label = r["prompt_label"]
         if (r["variant"], label) in totals and (reference, label) in totals:
             r["vs_reference_pct"] = 100 * (totals[r["variant"], label] / totals[reference, label] - 1)
     with (out / "summary.csv").open("w", newline="") as f:
@@ -349,6 +371,11 @@ def write_tables(out, rows, cases, variants, reference, kernel):
           "Cold/rotating synthetic inputs are not an engine predecessor replay; captured regime is unavailable unless explicitly reported by the adapter.",
           "Resource columns describe the main kernel; timing includes every kernel in launch().", "",
           "| " + " | ".join(fields) + " |", "| " + " | ".join(["---"] * len(fields)) + " |"]
+    if coverage is not None:
+        note = "reduced set: " + " / ".join(f"{pct:.4f} % of {label}" for label, pct in coverage.items()) + " off weight"
+        metadata = cases[0]["reduced_set"]
+        md[2:2] = [note + ". Archived OFF-time contribution, NOT raw call fraction; NOT full prompt/TTFT.",
+                   "Coverage provenance: " + json.dumps(metadata, sort_keys=True), ""]
     md.extend("| " + " | ".join(cell(r.get(k)) for k in fields) + " |" for r in output_rows)
     (out / "summary.md").write_text("\n".join(md) + "\n")
     return output_rows

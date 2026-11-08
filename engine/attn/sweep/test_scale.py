@@ -81,4 +81,25 @@ class AdaptiveTests(unittest.TestCase):
             self.assertEqual(len(pairs),8) # two candidates, complete balanced four rounds
             self.assertFalse((bundle/'adaptive-decisions.jsonl').exists())
 
+class ReducedTests(unittest.TestCase):
+    def test_union17_and_coverage_is_archived_time_not_call_count(self):
+        cases=runner.validate_cases(json.loads((HERE/'cases_reduced_r2.json').read_text()))
+        self.assertEqual(len(cases),17)
+        self.assertEqual(sum(bool(c['weights']['32K']) for c in cases),4)
+        self.assertEqual(sum(bool(c['weights']['128K']) for c in cases),16)
+        self.assertTrue(all(c['args'][2]==2 and c['args'][0] in (8191,8192) for c in cases))
+        self.assertTrue(any(c['args'][:3]==[8191,24576,2] for c in cases))
+        coverage=runner.reduced_coverage(cases)
+        self.assertAlmostEqual(coverage['32K'],90.26980267364321)
+        self.assertAlmostEqual(coverage['128K'],90.47806185875925)
+        rows=[dict(kernel='attention_cq',variant='off',case=c['id'],status='EXACT',mean_us=c['baseline_off_mean_us'],sd_us=0) for c in cases]
+        with tempfile.TemporaryDirectory() as tmp:
+            out=Path(tmp);tables=runner.write_tables(out,rows,cases,['off'],'off','attention_cq')
+            totals=[r for r in tables if r['case'].startswith('TOTAL')]
+            self.assertTrue(all(r['scope']=='reduced_set_kernel_only' for r in totals))
+            self.assertIn('reduced set: 90.2698 % of 32K / 90.4781 % of 128K off weight',(out/'summary.md').read_text())
+            self.assertIn('NOT full prompt/TTFT',(out/'summary.md').read_text())
+        bad=[dict(cases[0]),dict(cases[1])];bad[1].pop('reduced_set')
+        with self.assertRaises(ValueError):runner.reduced_coverage(bad)
+
 if __name__=='__main__':unittest.main()
