@@ -63,3 +63,49 @@ keep/drop decisions. No live GPU benchmark is needed for the CPU driver tests:
 ```
 python3 -m unittest discover -s engine/attn/sweep -p 'test_*.py' -v
 ```
+
+## Portable builds, provenance, and archives
+
+`--ccbin PATH` forwards nvcc's host compiler selection; `--build-cmd 'PREFIX'`
+prepends `shlex.split(PREFIX)` to compiler calls (including `--version`). It is
+an argv prefix, **never shell-evaluated**. A container wrapper must expose the
+same source/output paths to the compiler. Its exact argv is recorded.
+
+A build directory contains an immutable `build-manifest.json`: original git
+commit/status, compiler identity, exact commands, binary hashes, explicit
+source/header hashes and nvcc `-MD` dependency hashes. Dependency files are kept;
+a missing depfile is explicitly unavailable, not claimed complete. Hashes are
+captured after compilation (do not edit sources while building). Missing files
+have null hashes, not fabricated identities. Failed builds remain recorded.
+A build is never overwritten: choose a new output directory for another build.
+
+`--build-only` also bundles `run.py` and `build-cases.json`. Copy the **entire**
+directory to another host and run, without its source checkout, gcc or nvcc:
+
+```
+python3 /path/to/bundle/run.py --run-only --arch 121a --out /path/to/bundle
+```
+
+The target still needs Python, the matching GPU/driver/runtime, and any runtime
+files referenced by opaque case arguments (e.g. external captures; this generic
+driver does not discover or copy them). The binary's libraries must be compatible.
+The build's adapter, variants, reference and cases are defaults in run-only;
+`--cases` can supply a new workload. Explicit incompatible architecture, adapter,
+reference or variants are rejected. `--ccbin`, `--build-cmd`, and `--variants-dir`
+are refused with run-only: it runs the recorded binaries, not requested sources.
+
+Before running, every successful binary's SHA-256 must match the immutable build
+record. `run-manifest.json` links that record by SHA-256, stores run settings and
+separate `run_checkout` information, and preserves original build identity.
+Current checkout sources and compiler are neither consulted nor relabelled as
+the provenance of reused binaries. `manifest.json` is a compatibility view of
+the build-only or latest run manifest, **not** the immutable build record.
+The run manifest gains `finished_unix` at completion; the build manifest does not
+change. Legacy directories without the immutable build record must be rebuilt.
+
+`--archive-to NEW_DIRECTORY` copies the complete finished directory, including
+binaries, build/run manifests, raw samples, stdout/stderr, telemetry, logs,
+depfiles and tables. It also supports build-only bundles. It never merges,
+overwrites or deletes; destination must not exist and must be outside the run
+directory. Completed runs that report failures are archived too; an interrupted
+process has not completed this final archive step.

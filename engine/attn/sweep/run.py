@@ -7,6 +7,8 @@ import hashlib
 import json
 import math
 import statistics
+import shlex
+import shutil
 import xml.etree.ElementTree as ET
 import os
 from pathlib import Path
@@ -16,7 +18,7 @@ import sys
 import time
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[2]
+REPO = HERE.parents[2] if len(HERE.parents) > 2 else HERE
 VALID_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 
 
@@ -292,16 +294,48 @@ def write_tables(out, rows, cases, variants, reference, kernel):
     return output_rows
 
 
+def sha256_file(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def source_hashes(paths):
+    """Keep original absolute names: run-only never reattributes these to its checkout."""
+    return {str(p.resolve()): sha256_file(p) if p.is_file() else None for p in sorted(set(paths))}
+
+
+def build_dependencies(depfile):
+    """Read nvcc's one-target make depfile (escaped spaces and line continuations)."""
+    if not depfile.is_file():
+        return []
+    value = depfile.read_text().replace("\\\n", " ")
+    if ":" not in value:
+        return []
+    return [Path(p) for p in shlex.split(value.split(":", 1)[1])]
+
+
+def archive_run(out, destination):
+    if destination is not None:
+        # Never merge into an old archive, recurse into ourselves or remove files.
+        target = destination.resolve()
+        if target == out or target.is_relative_to(out):
+            raise ValueError("archive destination must be outside the run directory")
+        shutil.copytree(out, target)
+        print(f"ARCHIVE {target}", flush=True)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--kernel", type=Path, default=HERE / "attention.json", help="adapter JSON")
+    p.add_argument("--kernel", type=Path, help="adapter JSON (default attention.json; run-only uses the build bundle)")
     p.add_argument("--kernel-name")
     p.add_argument("--cases", type=Path, help="opaque adapter case-list JSON")
     p.add_argument("--variants-dir", type=Path)
-    p.add_argument("--reference", default="off")
+    p.add_argument("--reference", help="reference variant (default off, or bundle reference for run-only)")
     p.add_argument("--variants", nargs="+")
     p.add_argument("--arch", choices=("120a", "121a"), required=True)
     p.add_argument("--nvcc", default="/usr/local/cuda/bin/nvcc")
+    p.add_argument("--ccbin", help="nvcc host compiler executable or directory")
+    p.add_argument("--build-cmd", default="", help="shlex-split command prefix, e.g. a compiler container wrapper; never a shell")
+    p.add_argument("--archive-to", type=Path, help="copy the COMPLETE bundle/run to a new directory, without deletion")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--suite", default="all")
     p.add_argument("--late-final", action="store_true")
@@ -324,30 +358,51 @@ def main(argv=None):
         p.error("build-only and run-only are mutually exclusive")
     if a.rounds < 3 or a.flush_mb < 0 or min(a.pools, a.amortize, a.reps-1, a.iters, a.jobs, a.retries) < 1 or a.warmup < 0 or not math.isfinite(a.retry_delay) or a.retry_delay < 0 or not math.isfinite(a.timeout) or a.timeout <= 0:
         p.error("invalid repetitions/jobs/retries/warmup/delay")
-    config = json.loads(a.kernel.read_text())
-    base = a.kernel.resolve().parent
+    out = a.out.resolve()
+    if (out / "results.jsonl").exists() or (out / "run-manifest.json").exists():
+        p.error("output already has measurements; choose a new directory")
+    if a.archive_to and (a.archive_to.exists() or a.archive_to.resolve() == out or a.archive_to.resolve().is_relative_to(out)):
+        p.error("archive destination must be new and outside the run directory")
+    try:
+        build_prefix = shlex.split(a.build_cmd)
+    except ValueError as e:
+        p.error(f"invalid build-cmd: {e}")
+    prior = None
+    if a.run_only:
+        try:
+            prior = json.loads((out / "build-manifest.json").read_text())
+        except (OSError, ValueError) as e:
+            p.error(f"run-only requires an immutable build-manifest.json: {e}")
+    elif (out / "build-manifest.json").exists() or (out / "manifest.json").exists():
+        p.error("output already has a build; use --run-only or choose a new directory")
+    a.reference = a.reference or (prior["reference"] if prior else "off")
+    if a.run_only and (a.variants_dir or a.ccbin or a.build_cmd):
+        p.error("variants-dir/ccbin/build-cmd are build-only options; run-only uses the immutable bundle")
+    kernel_path = a.kernel or HERE / "attention.json"
+    config = json.loads(kernel_path.read_text()) if a.kernel or prior is None else prior["adapter"]
+    base = kernel_path.resolve().parent
     name = a.kernel_name or config["name"]
     header = (base / config["header"]).resolve()
     variants_dir = (a.variants_dir or base / config["variants_dir"]).resolve()
-    variants = a.variants or sorted(d.name for d in variants_dir.iterdir() if (d / "variant.cuh").is_file())
+    variants = a.variants or (prior["variants"] if prior else sorted(d.name for d in variants_dir.iterdir() if (d / "variant.cuh").is_file()))
     variants = list(dict.fromkeys([a.reference] + variants))
     if any(not VALID_NAME.fullmatch(v) for v in variants):
         p.error("unsafe variant name")
+    if prior and (prior["arch"] != a.arch or prior["reference"] != a.reference or prior["adapter"] != config or
+                  any(v not in prior["variants"] for v in variants)):
+        p.error("build manifest differs from requested architecture/reference/adapter/variants")
     if a.cases:
         cases = validate_cases(json.loads(a.cases.read_text()))
+    elif prior:
+        cases = validate_cases(json.loads((out / "build-cases.json").read_text()))
     else:
         gen = [sys.executable, str(base / config["case_generator"]), "--suite", a.suite]
         if a.late_final:
             gen.append("--late-final")
         cases = validate_cases(json.loads(subprocess.check_output(gen, text=True)))
-    out = a.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
-    # Refuse to silently overwrite an earlier measurement.
-    if (out / "results.jsonl").exists():
-        p.error("output already has measurements; choose a new directory")
-    (out / "cases.json").write_text(json.dumps(cases, indent=2) + "\n")
     manifest = {"kernel": name, "adapter": config, "reference": a.reference, "variants": variants,
-                "argv": sys.argv, "arch": a.arch, "seed": a.seed, "warmup": a.warmup, "reps": a.reps, "iters": a.iters,
+                "argv": list(sys.argv if argv is None else [str(HERE / "run.py")] + argv), "arch": a.arch, "seed": a.seed, "warmup": a.warmup, "reps": a.reps, "iters": a.iters,
                 "rounds_requested": a.rounds, "orders": list(balanced_orders(variants, a.reference, a.rounds)),
                 "flush_mb": a.flush_mb, "pools": a.pools, "amortize": a.amortize,
                 "regime_note": "binary-reported; cold is not engine replay; captured/predecessor unavailable unless explicitly reported",
@@ -355,12 +410,15 @@ def main(argv=None):
                 "case_sha256": hashlib.sha256(json.dumps(cases, sort_keys=True).encode()).hexdigest(),
                 "git_commit": command(["git", "-C", str(REPO), "rev-parse", "HEAD"], 10)[1].strip(),
                 "git_status": command(["git", "-C", str(REPO), "status", "--short"], 10)[1],
-                "nvcc_version": command([a.nvcc, "--version"], 10)[1], "started_unix": time.time()}
+                "started_unix": time.time()}
     builds = {}
 
     def build(v):
-        cmd = [a.nvcc, "-std=c++17", "-O3", "-gencode", f"arch=compute_{a.arch},code=sm_{a.arch}",
+        cmd = build_prefix + [a.nvcc, "-std=c++17", "-O3", "-gencode", f"arch=compute_{a.arch},code=sm_{a.arch}",
                "-I", str(REPO / "engine"), "-Xptxas", "-v", f"-DSWEEP_SAME_VARIANT={int(v == a.reference)}"]
+        if a.ccbin:
+            cmd += ["-ccbin", a.ccbin]
+        cmd += ["-MD", "-MF", str(out / f"{v}.deps.d")]
         cmd += ["-D" + d for d in config.get("defines", [])]
         cmd += [f'-DSWEEP_ADAPTER_HEADER="{header}"',
                 f'-DSWEEP_REFERENCE_HEADER="{variants_dir / a.reference / "variant.cuh"}"',
@@ -368,25 +426,54 @@ def main(argv=None):
         rc, stdout, stderr = command(cmd, 900)
         (out / f"{v}.build.log").write_text(stdout + stderr)
         print(f"BUILD {v}: {'OK' if rc == 0 else 'FAIL'} rc={rc}", flush=True)
-        return v, {"returncode": rc, "command": cmd}
+        deps = build_dependencies(out / f"{v}.deps.d")
+        explicit = [HERE / "bench.cu", header, variants_dir / a.reference / "variant.cuh", variants_dir / v / "variant.cuh"]
+        return v, {"returncode": rc, "command": cmd,
+                   "dependency_capture": "nvcc depfile" if deps else "UNAVAILABLE; explicit inputs only",
+                   "source_sha256": source_hashes(explicit + deps),
+                   "binary_sha256": sha256_file(out / v) if rc == 0 and (out / v).is_file() else None}
 
     if not a.run_only:
+        compiler = command(build_prefix + [a.nvcc, "--version"], 10)
+        manifest.update(nvcc_version=compiler[1], compiler_identity={"command": build_prefix + [a.nvcc, "--version"],
+                        "returncode": compiler[0], "stdout": compiler[1], "stderr": compiler[2], "ccbin": a.ccbin})
         with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as pool:
             for v, data in pool.map(build, variants):
                 builds[v] = data
         (out / "builds.json").write_text(json.dumps(builds, indent=2) + "\n")
+        manifest.update(builds=builds, binary_sha256={v: data["binary_sha256"] for v, data in builds.items() if data["returncode"] == 0},
+                        source_sha256=source_hashes([kernel_path, HERE / "run.py"]),
+                        source_hash_note="explicit sources plus nvcc dependencies hashed after compile; null means unavailable",
+                        build_finished_unix=time.time())
+        with (out / "build-manifest.json").open("x") as f:
+            f.write(json.dumps(manifest, indent=2) + "\n")
+        (out / "build-cases.json").write_text(json.dumps(cases, indent=2) + "\n")
+        # Portable bundle: no checkout, Python module imports, gcc or nvcc needed to run.
+        shutil.copy2(HERE / "run.py", out / "run.py")
+        prior = json.loads((out / "build-manifest.json").read_text())
     else:
-        builds = json.loads((out / "builds.json").read_text())
-        # Reject stale architecture/config when reusing native binaries.
-        prior = json.loads((out / "manifest.json").read_text())
-        if prior["arch"] != a.arch or prior["reference"] != a.reference or prior["adapter"] != config:
-            p.error("build manifest differs from requested architecture/reference/adapter")
-    manifest["builds"] = builds
-    manifest["binary_sha256"] = {v: hashlib.sha256((out / v).read_bytes()).hexdigest()
-                                  for v in variants if builds.get(v, {}).get("returncode") == 0}
-    (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        builds = prior["builds"]
+    for v in variants:
+        if builds.get(v, {}).get("returncode") == 0:
+            expected = prior["binary_sha256"].get(v)
+            if not expected or not (out / v).is_file() or sha256_file(out / v) != expected:
+                p.error(f"binary hash mismatch or missing binary: {v}; refusing stale/tampered build")
     if a.build_only:
+        (out / "manifest.json").write_text(json.dumps(prior, indent=2) + "\n")
+        archive_run(out, a.archive_to)
         return int(any(x["returncode"] for x in builds.values()))
+    # Build identity remains the immutable original, even from another checkout/host.
+    run_git = {"commit": manifest["git_commit"], "status": manifest["git_status"]}
+    manifest.update(git_commit=prior["git_commit"], git_status=prior["git_status"],
+                    nvcc_version=prior["nvcc_version"], builds=builds,
+                    binary_sha256={v: prior["binary_sha256"].get(v) for v in variants},
+                    run_checkout=run_git, build_manifest="build-manifest.json",
+                    build_manifest_sha256=sha256_file(out / "build-manifest.json"),
+                    source_identity="original immutable build record; run checkout is NOT binary provenance")
+    (out / "cases.json").write_text(json.dumps(cases, indent=2) + "\n")
+    with (out / "run-manifest.json").open("x") as f:
+        f.write(json.dumps(manifest, indent=2) + "\n")
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     rows, pairs = [], []
     first_logs = set()
 
@@ -463,6 +550,8 @@ def main(argv=None):
         write_tables(out, summary, cases, variants, a.reference, name)
     manifest["finished_unix"] = time.time()
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    (out / "run-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    archive_run(out, a.archive_to)
     print(f"TABLE {out / 'summary.md'}\nCSV {out / 'summary.csv'}", flush=True)
     return int(any(r["status"] != "EXACT" for r in summary) or any(r["status"] != "EXACT" for r in pairs))
 

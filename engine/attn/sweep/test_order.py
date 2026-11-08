@@ -4,6 +4,10 @@ import importlib.util
 import io
 import json
 import math
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 import statistics
 import tempfile
@@ -167,6 +171,118 @@ out.chmod(0o755)
             self.assertEqual(fast["n_pairs"],4)
             self.assertEqual(fast["paired_delta_pct"],-5)
             self.assertEqual(fast["paired_sd_pct"],0)
+
+
+class ProvenanceTests(unittest.TestCase):
+    def fixture(self, root):
+        for v in ("off", "fast"):
+            (root / "variants" / v).mkdir(parents=True)
+            (root / "variants" / v / "variant.cuh").write_text("// fixture " + v)
+        (root / "fixture.h").write_text("// adapter header")
+        (root / "extra header.h").write_text("// dependency with a space")
+        (root / "adapter.json").write_text(json.dumps(dict(name="toy", header="fixture.h", variants_dir="variants")))
+        (root / "cases.json").write_text(json.dumps([dict(id="x", args=["opaque"], weights={"toy":2})]))
+        return ["--kernel", str(root / "adapter.json"), "--cases", str(root / "cases.json"),
+                "--nvcc", "fake-nvcc", "--arch", "121a", "--out", str(root / "bundle")]
+
+    def fake_build(self, root, commands):
+        original = runner.command
+        def command(cmd, timeout):
+            if "fake-nvcc" not in cmd:
+                return original(cmd, timeout)
+            commands.append(cmd)
+            if "--version" in cmd:
+                return 0, "immutable fake compiler version", ""
+            out = Path(cmd[cmd.index("-o")+1])
+            out.write_text("#!/usr/bin/env python3\nimport json\nprint(json.dumps(dict(status='EXACT', mean_us=10, sd_us=1, samples_us=[9,11])))\n")
+            out.chmod(0o755)
+            dep = Path(cmd[cmd.index("-MF")+1])
+            dep.write_text(str(out) + ": " + str(root / "extra header.h").replace(" ", "\\ ") + "\n")
+            return 0, "", ""
+        return command
+
+    def test_immutable_build_portable_run_without_compiler_or_source_and_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = self.fixture(root)
+            commands = []
+            prefix = 'wrapper --label "a b; touch NEVER"'
+            with patch.object(runner, "command", side_effect=self.fake_build(root, commands)), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main(args + ["--build-only", "--ccbin", "/compiler/g++", "--build-cmd", prefix,
+                                                    "--archive-to", str(root / "build-copy")]), 0)
+            bundle = root / "bundle"
+            before = (bundle / "build-manifest.json").read_bytes()
+            build = json.loads(before)
+            self.assertEqual(build["nvcc_version"], "immutable fake compiler version")
+            self.assertEqual(build["compiler_identity"]["ccbin"], "/compiler/g++")
+            for cmd in commands:
+                self.assertEqual(cmd[:3], ["wrapper", "--label", "a b; touch NEVER"])
+            for v in ("off", "fast"):
+                cmd = build["builds"][v]["command"]
+                self.assertIn("-ccbin", cmd)
+                self.assertEqual(cmd[cmd.index("-ccbin")+1], "/compiler/g++")
+                self.assertEqual(build["builds"][v]["dependency_capture"], "nvcc depfile")
+                self.assertEqual(build["builds"][v]["source_sha256"][str(root / "extra header.h")],
+                                 runner.sha256_file(root / "extra header.h"))
+            self.assertEqual((root / "build-copy/build-manifest.json").read_bytes(), before)
+            # Move the standalone bundle; the source/compiler need not be available.
+            moved = root / "portable"
+            shutil.copytree(bundle, moved)
+            (root / "fixture.h").write_text("// changed source must NOT become binary provenance")
+            fake_smi = root / "nvidia-smi"
+            fake_smi.write_text("#!/bin/sh\nprintf '<nvidia_smi_log/>'\n")
+            fake_smi.chmod(0o755)
+            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"])
+            completed = subprocess.run([sys.executable, str(moved / "run.py"), "--run-only", "--arch", "121a",
+                                        "--out", str(moved), "--nvcc", "/does/not/exist", "--archive-to", str(root / "archive")],
+                                       env=env, text=True, capture_output=True)
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertEqual((moved / "build-manifest.json").read_bytes(), before)
+            run = json.loads((moved / "run-manifest.json").read_text())
+            self.assertEqual(run["git_commit"], build["git_commit"])
+            self.assertEqual(run["nvcc_version"], build["nvcc_version"])
+            self.assertEqual(run["build_manifest_sha256"], runner.sha256_file(moved / "build-manifest.json"))
+            self.assertIn("run_checkout", run)
+            original_files = {p.relative_to(moved):p.read_bytes() for p in moved.rglob("*") if p.is_file()}
+            archived_files = {p.relative_to(root / "archive"):p.read_bytes() for p in (root / "archive").rglob("*") if p.is_file()}
+            self.assertEqual(original_files, archived_files)
+            self.assertIn(Path("results.jsonl"), archived_files)
+            self.assertIn(Path("fast"), archived_files)
+            self.assertIn(Path("fast.build.log"), archived_files)
+            self.assertIn(Path("run-manifest.json"), archived_files)
+
+    def test_tampered_missing_binary_mismatched_arch_and_overwrite_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = self.fixture(root)
+            with patch.object(runner, "command", side_effect=self.fake_build(root, [])), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main(args + ["--build-only"]), 0)
+            bundle = root / "bundle"
+            before = (bundle / "build-manifest.json").read_bytes()
+            # Existing build cannot be overwritten (including no compiler invocation).
+            for more in (["--build-only"], ["--run-only", "--arch", "120a"],
+                         ["--run-only", "--archive-to", str(bundle / "nested")],
+                         ["--run-only", "--variants-dir", str(root / "variants")]):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                    runner.main(args + more)
+                self.assertEqual(raised.exception.code, 2)
+            (bundle / "fast").write_text("tampered")
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                runner.main(args + ["--run-only"])
+            self.assertEqual(raised.exception.code, 2)
+            self.assertEqual((bundle / "build-manifest.json").read_bytes(), before)
+            self.assertFalse((bundle / "results.jsonl").exists())
+            self.assertFalse((bundle / "run-manifest.json").exists())
+            # Missing binary is also a hash failure, not silently skipped.
+            (bundle / "fast").rename(bundle / "fast.moved")
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                runner.main(args + ["--run-only"])
+
+    def test_depfile_escaped_spaces_and_continuations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "deps.d"
+            path.write_text("target: /one/file.h \\\n /two/with\\ space.h\n")
+            self.assertEqual(runner.build_dependencies(path), [Path("/one/file.h"), Path("/two/with space.h")])
 
 
 if __name__ == "__main__":
