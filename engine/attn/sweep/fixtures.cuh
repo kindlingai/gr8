@@ -1,6 +1,7 @@
 // Fixture helpers reused from our ds41_comp_fp4_test.cu at 1ed4501c.
 #pragma once
 #include "../ds41_attn.cuh"
+#include "memory_guard.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,10 +31,9 @@ static std::mt19937_64 rng(12345);
 
 template <class T> static T* dalloc(size_t n)
 {
-    T* p;
-    CK(cudaMalloc(&p, n * sizeof(T) + 16));
-    CK(cudaMemset(p, 0, n * sizeof(T) + 16));
-    return p;
+    if (n > std::numeric_limits<size_t>::max() / sizeof(T))
+        throw std::overflow_error("fixture element count overflow");
+    return static_cast<T*>(sweep_memory::allocate(n * sizeof(T)));
 }
 template <class T> static T* dup(const std::vector<T>& h)
 {
@@ -131,8 +131,10 @@ static Keys make_keys(size_t rows, size_t slots)
 }
 static void free_keys(Keys& k)
 {
-    CK(cudaFree(k.bf));
-    CK(cudaFree(k.pk));
+    sweep_memory::deallocate(k.bf);
+    k.bf = nullptr;
+    sweep_memory::deallocate(k.pk);
+    k.pk = nullptr;
 }
 
 struct Case
@@ -225,5 +227,6 @@ static void free_built(Built& b)
 {
     for (void* x : {(void*)b.d_pos, (void*)b.d_sess, (void*)b.d_topk, (void*)b.q, (void*)b.kvw, (void*)b.out_a, (void*)b.out_b, (void*)b.sink,
                     (void*)b.split})
-        if (x) CK(cudaFree(x));
+        sweep_memory::deallocate(x);
+    b = Built{};
 }
