@@ -47,7 +47,7 @@ def run(output):
             expect(page.get_by_text("SYNTHETIC FIXTURE", exact=False).first).to_be_visible()
             expect(page.locator(".pb.on")).to_contain_text("Speed")
             expect(page.get_by_role("button", name="Knobs")).to_have_count(0)
-            expect(page.get_by_text("VARIANT=bit325")).to_be_visible()
+            expect(page.get_by_text("same 3.25 bpw size, bits placed differently")).to_be_visible()
             for width in (1366, 390):
                 page.set_viewport_size({"width": width, "height": 844 if width == 390 else 768})
                 page.screenshot(path=str(output / f"page-{width}.png"), full_page=True)

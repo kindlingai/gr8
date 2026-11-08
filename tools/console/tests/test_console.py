@@ -67,6 +67,10 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(presets.classify("ds41", {"TUNE": "speed", "VARIANT": "home"}), "custom")
         self.assertEqual(presets.classify("glm53f", {"TUNE": "quality"}), "quality")
         self.assertEqual(presets.changes_for("glm53", "quality"), {"TUNE": None, "VARIANT": "bit325", "KV_FORMAT": None})
+        quality = next(item for item in presets.CATALOG["glm53"] if item["id"] == "quality")
+        self.assertIn("same 3.25 bpw size", quality["summary"])
+        self.assertIn("bits placed differently", quality["summary"])
+        self.assertIsNone(presets.changes_for("glm53", "speed")["VARIANT"])
         self.assertEqual(presets.changes_for("ds41", "speed")["TUNE"], "speed")
         with self.assertRaises(ValueError):
             presets.changes_for("glm53", "fast")

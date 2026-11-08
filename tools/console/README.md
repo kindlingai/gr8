@@ -93,7 +93,7 @@ stay as they are.
 |---|---|---|
 | DeepSeek-V4.1-Flash | `TUNE=speed`, `quality`, or `context` | the recipe `knobs.sh` / “Pick what to prioritize” |
 | GLM-5.3-Flash | the same three `TUNE` values | the recipe `knobs.sh` / “Pick what to prioritize” |
-| GLM-5.3 | Speed clears `TUNE`, `VARIANT`, and `KV_FORMAT`. Quality sets `VARIANT=bit325`. Context sets `KV_FORMAT=int4`. | launcher options in [docs/GLM-5.3.md](../../docs/GLM-5.3.md) |
+| GLM-5.3 | Speed clears `TUNE`, `VARIANT`, and `KV_FORMAT` (launcher home, 3.25 bpw). Quality sets `VARIANT=bit325`, the same 3.25 bpw size with the bits placed differently. Context sets `KV_FORMAT=int4`. | launcher options in [docs/GLM-5.3.md](../../docs/GLM-5.3.md) |
 
 The current preset is read from those three keys. Any other combination,
 including mixed boxes, shows **custom**. Unset `TUNE` on a recipe model is
