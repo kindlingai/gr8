@@ -151,28 +151,29 @@ configurations, not an isolated compact-only A/B.
   same text and total token counts as the stock image, 8 of 8.
 - The copies match the release, rank, TP size and layout they were prepared for. A new release or layout needs a new
   `prepare` into a new directory.
-- Prepare on a disk with room. On a Gen4 box, the same copies written onto a disk that was 96% full lay in 86,287
-  pieces (extents) instead of 27,855 and took 30.6-32.6 s to read instead of 27.5-28.0 s.
+- Prepare on a disk with room. On one Gen4 box, the same build's 151 copy files lay in 24,032 pieces (extents) when
+  `prepare` wrote them onto a disk that was 92% full (96% after), and in 4,306 pieces when it wrote them again onto the
+  same disk at 58% full.
 
 ### Fast quit: `GR8_QUIT_FAST`
 
-Measured on 2026-11-08 on the same four boxes, GLM-5.3 at TP=4, the stock SSD KV store (`persist=on,keep=sessions`).
-One local build of gr8 (`632bf295` with the change merged as #440) in both arms; the only difference was
-`GR8_QUIT_FAST=1` in `EXTRA_ENV`. Three stops with the flag off and three with it on, alternated. Each stop was timed
-on every box from the start of its `docker compose down` until the engine process was gone:
+Measured on 2026-11-07 (Pacific time) on the same four boxes, GLM-5.3 at TP=4, the stock SSD KV store
+(`persist=on,keep=sessions`). One local build of gr8 (`632bf295` with the change merged as #440) in both arms; the
+only difference was `GR8_QUIT_FAST=1` in `EXTRA_ENV`. Three stops with the flag off and three with it on, alternated.
+Each stop was timed on every box from the start of its `docker compose down` until the engine process was gone. The
+per-rank rows pool two ranks over the same three stops:
 
 | Stop of GLM-5.3 | Flag off | Flag on |
 |---|---|---|
-| All four engines gone | 4.41-5.83 s, mean 5.22 s | 2.43-3.20 s, mean 2.76 s |
-| One DGX Spark rank (2 ranks x 3 stops) | 3.89-5.73 s, mean 5.02 s | 2.18-3.10 s, mean 2.53 s |
-| One Gen4 rank (2 ranks x 3 stops) | 4.15-5.73 s, mean 5.05 s | 2.33-3.09 s, mean 2.67 s |
+| All four engines gone (n=3) | 4.41-5.83 s, mean 5.22 s | 2.43-3.20 s, mean 2.76 s |
+| A DGX Spark rank (n=6) | 3.89-5.73 s, mean 5.02 s | 2.18-3.10 s, mean 2.53 s |
+| A Gen4 rank (n=6) | 4.15-5.73 s, mean 5.05 s | 2.33-3.09 s, mean 2.67 s |
 
-- The drive class made no difference to the stop: the two kinds of box are within 0.15 s of each other in each arm.
 - Chats survive a fast quit. In a second run each arm first served six new two-turn chats of about 8,200 tokens,
   then stopped. Every stop stored all the chats the engine held (6, 12, 18 and 24 entries over four stops, the same
   on all four ranks), the next boot loaded the same count, and every chat's next turn was read from the store, 6 of
-  6 each time. Those stops took 5.33 / 6.77 s with the flag off and 4.47 / 4.59 s with it on (two each): storing the
-  chats adds the same time to both arms.
+  6 each time. Those stops took 5.33 / 6.77 s with the flag off and 4.47 / 4.59 s with it on (all four engines
+  gone, two stops each).
 - Output after a fast quit: 8 fixed prompts at temperature 0 (`max_tokens=512`) on the next boot gave the same text and
   total token counts as before, 8 of 8.
 
@@ -205,15 +206,16 @@ engine the recipe pins after its gr8 bump). Same columns as above; "Down" here i
 
 ### Compact copies on the pair
 
-Measured on 2026-11-08 on the two DGX Sparks, GLM-5.3-Flash at TP=2, a local build of its recipe on gr8 `d21ddaa`,
-copies written by `prepare` on both boxes (73 GiB in 86 files a box). On GLM-5.3-Flash the copies pay only together
-with `GR8_LOAD_MERGE_KB=1`:
+Measured on 2026-11-07 (Pacific time) on the two DGX Sparks, GLM-5.3-Flash at TP=2, a local build of its recipe on
+gr8 `d21ddaa`, copies written by `prepare` on both boxes (73 GiB a box: 43 copy files and their maps). On
+GLM-5.3-Flash the copies pay only together with `GR8_LOAD_MERGE_KB=1`. Two experiments, each with its own stock runs,
+each in the order stock, knob, knob, stock. The total is the whole switch from GLM-5.3 to GLM-5.3-Flash, until
+`/health` reports ready; the read time is the loader's own for one rank:
 
-| Start of GLM-5.3-Flash, two runs each | Total | A rank's read |
-|---|---|---|
-| Stock | 32.8-34.2 s | 19.5-19.9 s (4.54-4.64 GB/s) |
-| `GR8_LOAD_COMPACT` alone | 31.4 / 33.0 s | 19.4-19.7 s (4.58-4.66 GB/s) |
-| `GR8_LOAD_COMPACT` with `GR8_LOAD_MERGE_KB=1` | 26.9 / 25.2 s | 12.6-12.9 s (6.99-7.17 GB/s) |
+| Switch GLM-5.3 to GLM-5.3-Flash | Stock, total (n=2) | With the knob, total (n=2) | A rank's read, stock / knob |
+|---|---|---|---|
+| `GR8_LOAD_COMPACT` alone | 34.2 / 32.8 s | 31.4 / 33.0 s | 19.6-19.9 s / 19.4-19.7 s |
+| `GR8_LOAD_COMPACT` with `GR8_LOAD_MERGE_KB=1` | 33.5 / 33.5 s | 26.9 / 25.2 s | 19.5-19.9 s / 12.6-12.9 s |
 
 - Without `GR8_LOAD_MERGE_KB`, each rank still read its about 298,000 ranges one read each; with it, ranges close
   together in one copy are read with one read.
