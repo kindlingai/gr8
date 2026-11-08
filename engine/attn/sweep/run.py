@@ -126,7 +126,10 @@ def timing_regime(data):
     reported = data.get("timing_regime", data.get("regime"))
     if reported is not None:
         return str(reported)
-    if data.get("input_slots", 1) > 1:
+    slots = data.get("input_slots", 1)
+    if not isinstance(slots, int) or isinstance(slots, bool) or slots < 1:
+        return "unavailable (invalid input_slots)"
+    if slots > 1:
         return "rotating-input-refresh (coldness/predecessor unverified)"
     return "warm/repeated-address (cache residency unverified)"
 
@@ -154,10 +157,12 @@ def uncertainty(values):
 
 
 def valid_measurement(row):
-    return row.get("status") == "EXACT" and row.get("returncode", 0) == 0 and all(
+    return (row.get("status") == "EXACT" and row.get("returncode", 0) == 0 and
+            row.get("launch_valid", True) in (True, 1) and row.get("integrity_errors", 0) == 0 and
+            row.get("mismatch_bytes", 0) == 0 and all(
         isinstance(row.get(k), (int, float)) and not isinstance(row[k], bool) and
         math.isfinite(row[k]) and row[k] >= (0 if k == "sd_us" else 1e-300)
-        for k in ("mean_us", "sd_us"))
+        for k in ("mean_us", "sd_us")))
 
 
 def pair_record(before, candidate, after):
@@ -509,10 +514,10 @@ def main(argv=None):
             current.update(command=cmd, returncode=rc, stdout_file=prefix.name + ".stdout",
                            stderr_file=prefix.name + ".stderr",
                            status="LOW_MEMORY" if rc == 77 else "TIMEOUT" if rc == 124 else "RUN_FAILED")
-            if rc in (0, 1):
+            if rc in (0, 1) or (rc not in (77, 124) and stdout.strip().endswith("}")):
                 try:
                     data = json.loads(stdout.strip().splitlines()[-1])
-                    if not isinstance(data, dict) or data.get("status") not in ("EXACT", "MISMATCH"):
+                    if not isinstance(data, dict) or data.get("status") not in ("EXACT", "MISMATCH", "MEMORY_CORRUPTION", "INVALID_LAUNCH"):
                         raise ValueError("bad status")
                     # Binary output cannot overwrite driver provenance, telemetry or pairing IDs.
                     current["binary_output"] = data

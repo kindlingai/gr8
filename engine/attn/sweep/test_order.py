@@ -59,7 +59,8 @@ class OrderTests(unittest.TestCase):
 
     def test_failures_and_mixed_regimes_do_not_contribute_totals(self):
         for change in ({"status":"MISMATCH"}, {"status":"TIMEOUT"}, {"returncode":1},
-                       {"mean_us":float("nan")}, {"mean_us":0},
+                       {"mean_us":float("nan")}, {"mean_us":0}, {"launch_valid":False},
+                       {"integrity_errors":1}, {"mismatch_bytes":1},
                        {"input_slots":3}, {"paired_delta_pct_mean":float("nan"), "reference_mean_us":100}):
             before, candidate, after = row("off",100), row(), row("off",100)
             candidate.update(change)
@@ -87,6 +88,7 @@ class OrderTests(unittest.TestCase):
 
     def test_regime_labels_do_not_invent_cold_or_engine(self):
         self.assertIn("warm/repeated-address",runner.timing_regime({}))
+        self.assertIn("unavailable",runner.timing_regime({"input_slots":"bad"}))
         self.assertIn("coldness/predecessor unverified",runner.timing_regime({"input_slots":3}))
         self.assertEqual(runner.timing_regime({"timing_regime":"flush-rotate"}),"flush-rotate")
 
@@ -185,7 +187,7 @@ class ProvenanceTests(unittest.TestCase):
         return ["--kernel", str(root / "adapter.json"), "--cases", str(root / "cases.json"),
                 "--nvcc", "fake-nvcc", "--arch", "121a", "--out", str(root / "bundle")]
 
-    def fake_build(self, root, commands):
+    def fake_build(self, root, commands, status="EXACT", returncode=0):
         original = runner.command
         def command(cmd, timeout):
             if "fake-nvcc" not in cmd:
@@ -194,7 +196,7 @@ class ProvenanceTests(unittest.TestCase):
             if "--version" in cmd:
                 return 0, "immutable fake compiler version", ""
             out = Path(cmd[cmd.index("-o")+1])
-            out.write_text("#!/usr/bin/env python3\nimport json\nprint(json.dumps(dict(status='EXACT', mean_us=10, sd_us=1, samples_us=[9,11])))\n")
+            out.write_text(f"#!/usr/bin/env python3\nimport json,sys\nstatus='EXACT' if sys.argv[0].endswith('off') else {status!r}\nprint(json.dumps(dict(status=status, mean_us=10, sd_us=1, samples_us=[9,11], integrity_errors=0 if status=='EXACT' else 2, launch_valid=status=='EXACT')))\nsys.exit(0 if status=='EXACT' else {returncode})\n")
             out.chmod(0o755)
             dep = Path(cmd[cmd.index("-MF")+1])
             dep.write_text(str(out) + ": " + str(root / "extra header.h").replace(" ", "\\ ") + "\n")
@@ -277,6 +279,30 @@ class ProvenanceTests(unittest.TestCase):
             (bundle / "fast").rename(bundle / "fast.moved")
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 runner.main(args + ["--run-only"])
+
+    def test_diagnostic_failure_statuses_preserve_numbers_but_not_valid_totals(self):
+        for status, rc in [("MISMATCH",1), ("MEMORY_CORRUPTION",3), ("INVALID_LAUNCH",4)]:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp)
+                args=self.fixture(root)
+                with patch.object(runner,"command",side_effect=self.fake_build(root,[],status,rc)), patch.object(runner,"telemetry_snapshot",return_value={"status":"UNAVAILABLE"}), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(runner.main(args+["--archive-to",str(root/"failed-archive")]),1)
+                raw=[json.loads(line) for line in (root/"bundle/results.jsonl").read_text().splitlines()]
+                candidates=[r for r in raw if r["variant"]=="fast"]
+                self.assertEqual(len(candidates),3)
+                for r in candidates:
+                    self.assertEqual(r["status"],status)
+                    self.assertEqual(r["mean_us"],10)
+                    self.assertEqual(r["returncode"],rc)
+                    self.assertEqual(r["binary_output"]["samples_us"],[9,11])
+                pairs=[json.loads(line) for line in (root/"bundle/pairs.jsonl").read_text().splitlines()]
+                self.assertTrue(all(r["status"]=="INVALID_PAIR" for r in pairs))
+                self.assertTrue((root/"failed-archive/results.jsonl").exists())
+                with (root/"bundle/summary.csv").open() as f:
+                    tables=list(runner.csv.DictReader(f))
+                total=next(r for r in tables if r["variant"]=="fast" and r["case"].startswith("TOTAL"))
+                self.assertEqual(total["status"],"INCOMPLETE")
+                self.assertEqual(total["contribution_toy_ms"],"")
 
     def test_depfile_escaped_spaces_and_continuations(self):
         with tempfile.TemporaryDirectory() as tmp:

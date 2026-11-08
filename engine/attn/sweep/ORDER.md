@@ -109,3 +109,9 @@ depfiles and tables. It also supports build-only bundles. It never merges,
 overwrites or deletes; destination must not exist and must be outside the run
 directory. Completed runs that report failures are archived too; an interrupted
 process has not completed this final archive step.
+
+Binary statuses EXACT, MISMATCH, MEMORY_CORRUPTION and INVALID_LAUNCH are
+preserved verbatim in raw records, including diagnostic timings and integrity /
+launch metadata on nonzero exit codes. Only EXACT with exit code zero and valid
+finite timing values is eligible for a pair or complete total. A timeout or
+low-memory retry is never promoted by a partial JSON payload.
