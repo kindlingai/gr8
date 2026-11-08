@@ -57,7 +57,7 @@ Sources at baseline commit:
   heads, 512 dims, window 128; layers 0..1 window, 2..19 ratio 2,
   20..39 ratio 1. `engine/attn/ds41_attn_plan.h:85-102`: local head binding.
 - `engine/runtime/ds41_v2.h:14-15,30-32`: W=8192, late boundary=21,
-  tail=128. `engine/runtime/ds41_v2_attn.cuh:187`: core uses ALL chunk
+  tail=128. `engine/runtime/ds41_v2_attn.cuh:191`: core uses ALL chunk
   rows, not only a rank's owned rows.
 - `engine/runtime/s2/ds41_prefill.h:5-7,71-80`: first N-1 tokens are
   headless prefill; last token is a MAIN row. Thus final chunk is **8191**,
@@ -180,3 +180,7 @@ that stream; CUDA events cover BOTH. `kernel()`/`ptxas_key()` describe the
 main kernel. The variant's report must separately list pre-pass regs, STACK,
 spills from its ptxas entry and scratch bytes. On allocation failure return
 cudaErrorMemoryAllocation from init, so the generic runner retries.
+
+For the reference binary itself the harness aliases sweep_variant to
+sweep_reference instead of including the same header twice, so variant headers
+may use `#pragma once`. The runner sets `SWEEP_SAME_VARIANT` automatically.

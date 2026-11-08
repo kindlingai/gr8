@@ -89,7 +89,7 @@ def write_tables(out, rows, cases, variants, reference, kernel):
             needed = [c for c in cases if c.get("weights", {}).get(label, 0)]
             if not needed:
                 continue
-            total = {"kernel": kernel, "variant": variant, "case": f"TOTAL_{label}_attention_only",
+            total = {"kernel": kernel, "variant": variant, "case": f"TOTAL_{label}_kernel_only",
                      "status": "INCOMPLETE", f"calls_{label}": sum(c["weights"][label] for c in needed)}
             if all(c["id"] in vr and "mean_us" in vr[c["id"]] for c in needed):
                 total[f"contribution_{label}_ms"] = sum(vr[c["id"]]["mean_us"] * c["weights"][label] / 1000 for c in needed)
@@ -97,7 +97,7 @@ def write_tables(out, rows, cases, variants, reference, kernel):
                 totals[(variant, label)] = total[f"contribution_{label}_ms"]
             output_rows.append(total)
     for r in output_rows[len(rows):]:
-        label = r["case"].removeprefix("TOTAL_").removesuffix("_attention_only")
+        label = r["case"].removeprefix("TOTAL_").removesuffix("_kernel_only")
         if (r["variant"], label) in totals and (reference, label) in totals:
             r["vs_reference_pct"] = 100 * (totals[r["variant"], label] / totals[reference, label] - 1)
     with (out / "summary.csv").open("w", newline="") as f:
@@ -109,7 +109,7 @@ def write_tables(out, rows, cases, variants, reference, kernel):
             return f"{v:.4f}"
         return str(v) if v is not None else "UNKNOWN"
     md = [f"# {kernel} kernel sweep", "", f"Reference: `{reference}`. CUDA event batch means; SD is sample SD across repetitions.",
-          "Prompt totals are weighted attention-core estimates, NOT TTFT. No rank multiplier.",
+          "Prompt totals are weighted kernel-only estimates, NOT TTFT. No rank multiplier.",
           "Resource columns describe the main kernel; timing includes every kernel in launch().", "",
           "| " + " | ".join(fields) + " |", "| " + " | ".join(["---"] * len(fields)) + " |"]
     md.extend("| " + " | ".join(cell(r.get(k)) for k in fields) + " |" for r in output_rows)
@@ -177,7 +177,7 @@ def main(argv=None):
 
     def build(v):
         cmd = [a.nvcc, "-std=c++17", "-O3", "-gencode", f"arch=compute_{a.arch},code=sm_{a.arch}",
-               "-I", str(REPO / "engine"), "-Xptxas", "-v"]
+               "-I", str(REPO / "engine"), "-Xptxas", "-v", f"-DSWEEP_SAME_VARIANT={int(v == a.reference)}"]
         cmd += ["-D" + d for d in config.get("defines", [])]
         cmd += [f'-DSWEEP_ADAPTER_HEADER="{header}"',
                 f'-DSWEEP_REFERENCE_HEADER="{variants_dir / a.reference / "variant.cuh"}"',

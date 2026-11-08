@@ -12,7 +12,11 @@
 #define sweep_variant sweep_reference
 #include SWEEP_REFERENCE_HEADER
 #undef sweep_variant
+#if SWEEP_SAME_VARIANT
+namespace sweep_variant = sweep_reference;
+#else
 #include SWEEP_VARIANT_HEADER
+#endif
 static void check(cudaError_t e) {
     if(e!=cudaSuccess) { fprintf(stderr,"CUDA_ERROR: %s\n",cudaGetErrorString(e)); exit(e==cudaErrorMemoryAllocation?77:2); }
 }
