@@ -95,6 +95,7 @@ int main(int argc, char** argv)
     }
 
     StoreOpts o;
+    o.io_uring = 0; // Keep the original pread-pool regression coverage.
     o.cache_bytes = 256ull << 20;   // 1M rows: holds everything the checks below touch
     o.io_threads = 96;
     RowStore rs;

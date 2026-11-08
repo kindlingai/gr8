@@ -35,7 +35,7 @@ one to choose its settings.
   holding only some of the parts computes the wrong shard and reads the wrong rows. **Do not delete, skip or truncate
   part files to save space.**
 
-  With TP=4 each rank only reads the rows in about 6 of the 23 parts, which is worth knowing when you are reading
+  With `GR8_DS_ENGRAM_COL_SHARD=0` (the legacy layout), each TP=4 rank only reads the rows in about 6 of the 23 parts, which is worth knowing when you are reading
   logs or sizing a cache — it is *not* a download list:
 
   | rank | parts holding its rows |
@@ -54,7 +54,8 @@ one to choose its settings.
   sparse-staged copy**, not what downloading gives you: every one of the 46 part files is there with its real header
   and logical size, and only the byte ranges that rank reads were ever written, so `du` reads 143 GB where
   `du --apparent-size` reads 510 GB. We have no public tool that stages a copy that way, so treat 143 GB as our
-  number and 510.6 GB as yours.
+  number and 510.6 GB as yours. **Those old contiguous-rank sparse copies are not compatible with the new
+  column-sharded default.** Use a complete release copy, or explicitly keep `GR8_DS_ENGRAM_COL_SHARD=0` on all ranks.
 - **No drafter.** `ds41` drafts with the checkpoint's own MTP layers (DSpark), so leave `DRAFTER` out of the config.
   The check refuses a boot that names one.
 - **The DeepSeek binary, built on every box.** `up` does not build it for you:
@@ -78,12 +79,35 @@ Two files sit at that prefix:
 
 | file | who writes it |
 |---|---|
-| `PREFIX.engram.json` | the loader, at every boot: this rank's runs of the release's split table files (`g6engram-v2`) |
+| `PREFIX.engram.json` | the loader, at every boot: this rank's runs of the release's split table files (`g6engram-v3-col` by default) |
 | `PREFIX.engram.cmap` | **you, once** — it is in neither the repo nor the release |
 
-So the prefix only needs a writable directory: with `g6engram-v2` the table rows are read straight out of the
+So the prefix only needs a writable directory: with either layout the table rows are read straight out of the
 release's `dense/exlr8-split-001.engram.embed.p0NN.safetensors` and `exlr8-split-014.…` files, and no sidecar copy of
 the tables is made.
+
+`GR8_DS_ENGRAM_COL_SHARD=1` (the default; all ranks must agree) assigns hash column `j` to rank `j % TP`
+for both layers. Each rank must have the **complete** release table locally, not the old rank-only sparse ranges.
+The loader then writes `g6engram-v3-col`: the same table fields, but `part = valid` is the sum of the owned column
+lengths, `first` is the lowest owned global row, and `segs` tiles each owned column consecutively in ascending
+column order (gaps between columns are intentional). Scales are concatenated in that order, with no padding;
+row IDs and cache tags remain global. The engine checks this layout against its hash constants and refuses a
+sidecar whose ownership mode disagrees with the knob. Non-divisors of 24 get unequal column counts, not dropped
+columns. The loader's existing TP limits still apply. With 0, v1/v2 loading and emitted v2 JSON are unchanged.
+
+On a complete release copy, the next boot regenerates the manifest in the new format; the cmap does not change.
+Directly loaded legacy v1/v2 sidecars require `GR8_DS_ENGRAM_COL_SHARD=0`, or replanning from the complete release.
+Replanning metadata does **not** fill missing bytes in an old sparse-staged copy: restore the complete release
+before using the column-sharded default, or retain the explicit legacy setting. Boot checks owned weight and
+scale ranges using the local filesystem's `SEEK_HOLE` support before reading tables; a reported hole, truncated
+range or unsupported check stops boot with both fixes named. Holes outside this rank's owned ranges do not
+trigger the check. This checks allocation coverage, not a content checksum, and never restages files automatically.
+
+`GR8_DS_ENGRAM_IO_URING=128` is the default row reader queue depth. It uses aligned block reads on the fetching
+thread without pread-pool workers. `GR8_DS_ENGRAM_IO_URING=0` selects the original pread pool. If ring setup is
+unavailable (including a container denying the syscall), the engine logs the errno once and falls back to that
+pool, sized by `GR8_DS_ENGRAM_IO_THREADS`; the boot log identifies the selected reader. No container security
+change is required for the fallback.
 
 The cmap is the compressed token map, 517,144 bytes. It is rank-independent: write it once and copy the same file to
 every box. Its sha256 must equal `kCmapSha256` in `engine/engram/hash_consts.h`, so a wrong or stale file fails the

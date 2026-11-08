@@ -19,14 +19,32 @@ knobs:
     doc: >-
       Size in MiB of the host cache of Engram table rows, shared by both layers. It holds 256-byte rows, so 4096 MiB
       holds 16 M rows.
+  GR8_DS_ENGRAM_COL_SHARD:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    doc: >-
+      1 assigns Engram hash column j to rank j modulo TP at both layers (1 and 14), balancing n-gram orders.
+      The release loader writes g6engram-v3-col runs and packs only owned scales in column order. Requires a
+      complete release table on every rank; all ranks must agree. 0 keeps contiguous rows and g6engram-v2 unchanged.
   GR8_DS_ENGRAM_IO_THREADS:
     scope: local
     kind: int
     default: "32"
     values: "1..1024"
     doc: >-
-      Threads that read Engram table rows from NVMe. A decode step needs about 20 reads and a prefill chunk thousands;
+      Fallback pread-pool threads (also used when GR8_DS_ENGRAM_IO_URING=0) that read Engram rows from NVMe. A decode step needs about 20 reads and a prefill chunk thousands;
       64 reads a prefill chunk fastest.
+  GR8_DS_ENGRAM_IO_URING:
+    scope: local
+    kind: int
+    default: "128"
+    values: "0..32768"
+    doc: >-
+      Queue depth for the raw io_uring Engram row reader on the calling fetch thread. 0 keeps the pread pool
+      unchanged; positive values use aligned block reads without pool workers. If ring setup is unavailable,
+      logs once and falls back to the pread pool sized by GR8_DS_ENGRAM_IO_THREADS.
   GR8_DS_ENGRAM_LOOKAHEAD:
     scope: local
     kind: flag
@@ -40,9 +58,9 @@ knobs:
     kind: path
     unset: "no Engram tables; GR8_DS_ENGRAM=1 then stops the boot"
     doc: >-
-      The path prefix of this rank's Engram files. The loader writes PREFIX.engram.json at boot (g6engram-v2: the rank's
+      The path prefix of this rank's Engram files. The loader writes PREFIX.engram.json at boot (g6engram-v3-col by default; g6engram-v2 with COL_SHARD=0: the rank's
       runs of the release's split table files); PREFIX.engram.cmap is the token map (engine/engram/gen_engram.py
-      --out-cmap, from the release's tokenizer). A g6engram-v1 sidecar (PREFIX.engram.L001.w8 / .s8, L014) also loads.
+      --out-cmap, from the release's tokenizer). A g6engram-v1 sidecar (PREFIX.engram.L001.w8 / .s8, L014) loads with GR8_DS_ENGRAM_COL_SHARD=0.
   GR8_DS_ENGRAM_VERBOSE:
     scope: local
     kind: flag
