@@ -4,8 +4,12 @@ A box runs one gr8 model at a time. To move four boxes between GLM-5.3 at TP=4 a
 ([the DeepSeek recipe](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)), stop one model and start
 the other on every box. A two-box pair can also switch with GLM-5.3-Flash at TP=2;
 [the pair's numbers](#the-glm-53-flash-pair-tp2) are at the bottom of this page. Both models keep their files on
-the boxes, so a switch fetches nothing. Three settings make the switch fast. All three keep their data on each
-box's local disk.
+the boxes, so a switch fetches nothing. The settings below make the switch fast; each one keeps its data on the
+box's local disk. [docker/.env.example](../docker/.env.example) has the GLM-5.3 ones on.
+
+## One command: `./gr8 switch`
+
+<!-- This section describes ./gr8 switch once that command is merged. -->
 
 ## The settings
 
@@ -31,6 +35,16 @@ At an orderly stop the engine writes the chats it still holds to the store. The 
 back, so a chat's next turn restores its KV instead of a prefill. `GR8_STOP_GRACE` gives docker's stop the time the
 engine needs for that write; without it, docker kills the engine mid-store
 ([docker/compose.yaml](../docker/compose.yaml)). `./gr8 knobs KV_STORE` describes every field.
+
+**GLM-5.3: compact expert copies.** `GR8_LOAD_COMPACT=<dir> GR8_LOAD_MERGE_KB=1` in `EXTRA_ENV`, then
+`docker compose run --rm gr8 prepare` once on every box to write the copies.
+[The measured section](#compact-expert-copies-gr8_load_compact) has the numbers and the disk space they take.
+GLM-5.3-Flash uses the same two knobs ([below](#compact-copies-on-the-pair)).
+
+**GLM-5.3: `GR8_QUIT_FAST=1`.** In `EXTRA_ENV`. At an orderly stop, once the KV store has stored the pool's runs and
+the links have closed, the engine ends right after the ranks meet at the quit barrier: the process exit frees its
+memory, instead of the engine freeing the CUDA graphs, buffers and runtime one by one. GLM-5.3-Flash and DeepSeek
+ignore it. [Measured below](#fast-quit-gr8_quit_fast). The default is 0 (off).
 
 **DeepSeek: the release check.** The recipe checks its release at every start, but it hashes only the files that
 changed since the last check, so a start after the first one spends about 1 s on it.
@@ -107,6 +121,30 @@ configurations, not an isolated compact-only A/B.
   same text and total token counts as the stock image, 8 of 8.
 - The copies match the release, rank, TP size and layout they were prepared for. A new release or layout needs a new
   `prepare` into a new directory.
+- Prepare on a disk with room. On a Gen4 box, the same copies written onto a disk that was 96% full lay in 86,287
+  pieces (extents) instead of 27,855 and took 30.6-32.6 s to read instead of 27.5-28.0 s.
+
+### Fast quit: `GR8_QUIT_FAST`
+
+Measured on 2026-11-08 on the same four boxes, GLM-5.3 at TP=4, the stock SSD KV store (`persist=on,keep=sessions`).
+One local build of gr8 (`632bf295` with the change merged as #440) in both arms; the only difference was
+`GR8_QUIT_FAST=1` in `EXTRA_ENV`. Three stops with the flag off and three with it on, alternated. Each stop was timed
+on every box from the start of its `docker compose down` until the engine process was gone:
+
+| Stop of GLM-5.3 | Flag off | Flag on |
+|---|---|---|
+| All four engines gone | 4.41-5.83 s, mean 5.22 s | 2.43-3.20 s, mean 2.76 s |
+| One DGX Spark rank (2 ranks x 3 stops) | 3.89-5.73 s, mean 5.02 s | 2.18-3.10 s, mean 2.53 s |
+| One Gen4 rank (2 ranks x 3 stops) | 4.15-5.73 s, mean 5.05 s | 2.33-3.09 s, mean 2.67 s |
+
+- The drive class made no difference to the stop: the two kinds of box are within 0.15 s of each other in each arm.
+- Chats survive a fast quit. In a second run each arm first served six new two-turn chats of about 8,200 tokens,
+  then stopped. Every stop stored all the chats the engine held (6, 12, 18 and 24 entries over four stops, the same
+  on all four ranks), the next boot loaded the same count, and every chat's next turn was read from the store, 6 of
+  6 each time. Those stops took 5.33 / 6.77 s with the flag off and 4.47 / 4.59 s with it on (two each): storing the
+  chats adds the same time to both arms.
+- Output after a fast quit: 8 fixed prompts at temperature 0 (`max_tokens=512`) on the next boot gave the same text and
+  total token counts as before, 8 of 8.
 
 ## The GLM-5.3-Flash pair (TP=2)
 
@@ -134,3 +172,22 @@ engine the recipe pins after its gr8 bump). Same columns as above; "Down" here i
   TP=4 model and back, answered in 3.1-5.9 s (total response time), all four with their context intact. These
   test prompts are short, and the prompt cache's checkpoints land at 4,096-token multiples, so the replays read
   their prompts fresh.
+
+### Compact copies on the pair
+
+Measured on 2026-11-08 on the two DGX Sparks, GLM-5.3-Flash at TP=2, a local build of its recipe on gr8 `d21ddaa`,
+copies written by `prepare` on both boxes (73 GiB in 86 files a box). On GLM-5.3-Flash the copies pay only together
+with `GR8_LOAD_MERGE_KB=1`:
+
+| Start of GLM-5.3-Flash, two runs each | Total | A rank's read |
+|---|---|---|
+| Stock | 32.8-34.2 s | 19.5-19.9 s (4.54-4.64 GB/s) |
+| `GR8_LOAD_COMPACT` alone | 31.4 / 33.0 s | 19.4-19.7 s (4.58-4.66 GB/s) |
+| `GR8_LOAD_COMPACT` with `GR8_LOAD_MERGE_KB=1` | 26.9 / 25.2 s | 12.6-12.9 s (6.99-7.17 GB/s) |
+
+- Without `GR8_LOAD_MERGE_KB`, each rank still read its about 298,000 ranges one read each; with it, ranges close
+  together in one copy are read with one read.
+- With both knobs, the switches into the pair (two runs each): from GLM-5.3 25.8 / 25.5 s, from DeepSeek-V4.1-Flash
+  22.9 / 24.1 s. Earlier the same day, without the copies and on the recipe's previous build, the same switches took
+  33.4 / 33.5 s and 30.7 / 29.5 s.
+- Output: the same 8 fixed prompts gave the same text and token counts as the stock arm, 8 of 8.
