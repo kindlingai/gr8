@@ -2,6 +2,7 @@
 // O_DIRECT behind a set-associative row cache. Contract: docs/DEEPSEEK-ENGRAM.md section 3 step 2 and section 4.
 //
 //   file      PREFIX.engram.L###.w8, u8 [part][256], rank r serves global rows [first, first+valid), file row = id - first.
+//   columns   opt-in: ids stay global, files carry disjoint column runs; foreign check uses the same ColShard as device dequant.
 //   request   O_DIRECT needs an aligned offset, length and buffer. The store asks statx for the file's dio_offset_align / dio_mem_align,
 //             reads the aligned block (default 4096 B = 16 rows) that holds the row and copies the 256 B out of it. A row never
 //             straddles a block. Rows of one fetch that share a block share one read; the same row asked twice is read once.
@@ -33,6 +34,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "hash.h"
+#include "col_shard.h"
 
 namespace ds41 { namespace engram {
 
@@ -49,7 +51,8 @@ struct TableFile
     std::string path;       // a file of rows [first, first + valid) from byte 0, when `runs` is empty
     int64_t first = 0;      // first global row this rank serves
     int64_t valid = 0;      // rows it serves (the file may hold more: pad rows up to `part`)
-    std::vector<TableRun> runs;   // the rows in several files (ascending, consecutive from `first`)
+    std::vector<TableRun> runs;   // ascending, consecutive within each owned range
+    ColShard columns{};            // disabled: contiguous; enabled: only these column ranges
 };
 
 struct StoreOpts
@@ -230,13 +233,14 @@ public:
             Tab t;
             t.first = f.first;
             t.valid = f.valid;
-            if (f.first < 0 || f.valid < 0 || f.first + f.valid >= (1ll << 30) - 1) { *err = f.path + ": row range outside the 30-bit tag space"; return false; }
+            t.columns = f.columns;
+            if (f.first < 0 || f.valid < 0 || (f.columns.enabled ? f.columns.rows != f.valid : f.first + f.valid >= (1ll << 30) - 1)) { *err = f.path + ": row range outside the 30-bit tag space"; return false; }
             std::vector<TableRun> runs = f.runs;
-            if (runs.empty()) runs.push_back({f.path, f.first, f.valid, 0});
-            int64_t next = f.first;
+            if (runs.empty() && !f.columns.enabled) runs.push_back({f.path, f.first, f.valid, 0});
+            int64_t next = f.columns.enabled ? 0 : f.first;
             for (const TableRun& tr : runs)
             {
-                if (tr.row0 != next || tr.rows < 0) { *err = tr.path + ": runs are not consecutive from the first row"; return false; }
+                if (f.columns.enabled ? !f.columns.run(tr.row0, tr.rows, next) : (tr.row0 != next || tr.rows < 0)) { *err = tr.path + ": runs are not consecutive from the first row"; return false; }
                 next += tr.rows;
                 Run r;
                 r.row0 = tr.row0; r.rows = tr.rows; r.off = tr.off;
@@ -265,7 +269,7 @@ public:
                 }
                 t.runs.push_back(r);
             }
-            if (next != f.first + f.valid) { *err = f.path + ": runs do not cover the valid rows"; return false; }
+            if (next != (f.columns.enabled ? f.valid : f.first + f.valid)) { *err = f.path + ": runs do not cover the valid rows"; return false; }
             tab_.push_back(t);
         }
         size_t b = 256;
@@ -298,7 +302,7 @@ public:
         for (size_t i = 0; i < n; ++i)
         {
             const int64_t id = ids[i];
-            if (id < T.first || id >= T.first + T.valid) { ++st.foreign; continue; }
+            if (T.columns.enabled ? T.columns.at((uint32_t)id) < 0 : (id < T.first || id >= T.first + T.valid)) { ++st.foreign; continue; }
             const uint8_t* row = cache_.find(row_tag(table, (uint32_t)id));
             if (row)
             {
@@ -328,7 +332,7 @@ public:
             int ri = 0;
             for (size_t u = 0; u < nu; ++u)
             {
-                while (uid[u] >= T.runs[ri].row0 + T.runs[ri].rows) ++ri;   // ids ascend; every id is in [first, first + valid)
+                while (uid[u] >= T.runs[ri].row0 + T.runs[ri].rows) ++ri;   // ids ascend; foreign check admitted only rows in the validated runs
                 const Run& R = T.runs[ri];
                 uoff[u] = R.off + (uint64_t)(uid[u] - R.row0) * kRowBytes;
                 const uint64_t blk = uoff[u] & ~(uint64_t)(block_ - 1);
@@ -394,6 +398,7 @@ private:
     {
         std::vector<Run> runs;
         int64_t first = 0, valid = 0;
+        ColShard columns{};
         bool direct = true;
     };
     StoreOpts opts_;

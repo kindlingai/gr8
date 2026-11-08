@@ -19,6 +19,15 @@ knobs:
     doc: >-
       Size in MiB of the host cache of Engram table rows, shared by both layers. It holds 256-byte rows, so 4096 MiB
       holds 16 M rows.
+  GR8_DS_ENGRAM_COL_SHARD:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      1 assigns Engram hash column j to rank j modulo TP at both layers (1 and 14), balancing n-gram orders.
+      The release loader writes g6engram-v3-col runs and packs only owned scales in column order. Requires a
+      complete release table on every rank; all ranks must agree. 0 keeps contiguous rows and g6engram-v2 unchanged.
   GR8_DS_ENGRAM_IO_THREADS:
     scope: local
     kind: int

@@ -85,6 +85,15 @@ So the prefix only needs a writable directory: with `g6engram-v2` the table rows
 release's `dense/exlr8-split-001.engram.embed.p0NN.safetensors` and `exlr8-split-014.…` files, and no sidecar copy of
 the tables is made.
 
+`GR8_DS_ENGRAM_COL_SHARD=1` (default 0, all ranks must agree) instead assigns hash column `j` to rank `j % TP`
+for both layers. Each rank must have the **complete** release table locally, not the old rank-only sparse ranges.
+The loader then writes `g6engram-v3-col`: the same table fields, but `part = valid` is the sum of the owned column
+lengths, `first` is the lowest owned global row, and `segs` tiles each owned column consecutively in ascending
+column order (gaps between columns are intentional). Scales are concatenated in that order, with no padding;
+row IDs and cache tags remain global. The engine checks this layout against its hash constants and refuses a
+sidecar whose ownership mode disagrees with the knob. Non-divisors of 24 get unequal column counts, not dropped
+columns. The loader's existing TP limits still apply. With 0, v1/v2 loading and emitted v2 JSON are unchanged.
+
 The cmap is the compressed token map, 517,144 bytes. It is rank-independent: write it once and copy the same file to
 every box. Its sha256 must equal `kCmapSha256` in `engine/engram/hash_consts.h`, so a wrong or stale file fails the
 boot closed instead of serving wrong logits. That constant is checked in, so you can check your own file before you

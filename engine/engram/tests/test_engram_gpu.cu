@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "engram/engram_dev.cuh"
+#include "test_col_shard_gpu.cuh"
 using namespace ds41::engram;
 
 static int fails = 0;
@@ -267,6 +268,7 @@ static float rnd_bf16_val(std::mt19937& rng, float scale)
 
 int main(int argc, char** argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--col-shard") == 0) return col_shard_test::run();
     if (argc != 4 && argc != 5) { printf("usage: %s PREFIX.engram.cmap vectors.bin scratchdir [rank 0..15, default 1]\n", argv[0]); return 2; }
     cmap_path = argv[1]; vec_path = argv[2]; dir = argv[3];
     if (argc == 5) kRank = atoi(argv[4]);

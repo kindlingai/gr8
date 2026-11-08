@@ -73,7 +73,9 @@ struct Ds41V2Engine {
         const int e=m.layers[i].l==geom::ENGRAM_L0?0:1;
         const int rc=m.engram->op_owned(&m,e,v.g.M,v.g.row0,v.g.owned,b.streams,v.st,
             [&](const uint32_t* ids,const uint8_t* stage,const uint8_t* scales,int64_t first,int64_t valid,__nv_bfloat16* emb) {
-                engram_wire::pack<<<v.g.M,256,0,v.st>>>(ids,stage,scales,first,valid,v.g.M,eng_send);
+                const auto& columns = m.engram->columns(e);
+                if (columns.enabled) engram_wire::pack_col<<<v.g.M,256,0,v.st>>>(ids,stage,scales,columns,v.g.M,eng_send);
+                else engram_wire::pack<<<v.g.M,256,0,v.st>>>(ids,stage,scales,first,valid,v.g.M,eng_send);
                 const Segment seg{eng_send,eng_recv,engram_wire::ROW_BYTES};
                 fork(v,Coll::Engram); all_to_all(v,Coll::Engram,&seg,1,v.cs); record_received(v,Coll::Engram); join(v,Coll::Engram);
                 if(v.g.owned)engram_wire::unpack<<<dim3(v.g.owned,24),256,0,v.st>>>(eng_recv,v.g.Q,v.g.owned,v.g.nr,emb);

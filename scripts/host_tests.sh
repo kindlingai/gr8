@@ -377,6 +377,9 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/engram" "$REPO/engine
 "$T/engram_rowstore_test" "$T/engram_rowstore" 262144
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/engram/tests/test_boot.cpp" -o "$T/engram_boot_test" "${KNOBS[@]}"
 "$T/engram_boot_test"
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine" "$REPO/engine/engram/tests/test_col_shard.cpp" -o "$T/engram_col_shard_test" "${KNOBS[@]}"
+mkdir -p "$T/engram_col_shard"
+"$T/engram_col_shard_test" "$T/engram_col_shard"
 # the W-row wkv's activation quantizer needs cuda_fp8.h, so it runs where the CUDA headers are
 if [ -f /usr/local/cuda/include/cuda_fp8.h ]; then
   g++ -std=c++17 -O2 -ffp-contract=off -Wall -Wextra -I "$REPO/engine/engram" -I /usr/local/cuda/include \

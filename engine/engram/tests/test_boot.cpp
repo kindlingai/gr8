@@ -81,7 +81,7 @@ static void expect_fail(const char* name, const std::string& dir, const std::str
 // read_knobs in a child with the GR8_DS_ENGRAM knobs set to env (name, value pairs; the rest unset): 0 when check(k) holds,
 // 1 when it does not, 2 when the knob table refuses a value. A knob is read once per process, so each case runs in its own child.
 static const char* const kKnobNames[] = {"GR8_DS_ENGRAM", "GR8_DS_ENGRAM_CACHE_MIB", "GR8_DS_ENGRAM_WAYS", "GR8_DS_ENGRAM_IO_THREADS",
-                                         "GR8_DS_ENGRAM_VERBOSE", "GR8_DS_ENGRAM_LOOKAHEAD", "GR8_DS_ENGRAM_PREFIX"};
+                                         "GR8_DS_ENGRAM_COL_SHARD", "GR8_DS_ENGRAM_VERBOSE", "GR8_DS_ENGRAM_LOOKAHEAD", "GR8_DS_ENGRAM_PREFIX"};
 static int knob_case(std::initializer_list<std::pair<const char*, const char*>> env, bool (*check)(const Knobs&))
 {
     fflush(stdout);
@@ -121,9 +121,11 @@ int main(int argc, char** argv)
                          {"GR8_DS_ENGRAM_LOOKAHEAD", "1"}, {"GR8_DS_ENGRAM_PREFIX", "/x/p"}},
                         [](const Knobs& k) { return k.on && k.lookahead && k.store.cache_bytes == (512ull << 20) && k.store.ways == 8 && k.store.io_threads == 32 && k.prefix == "/x/p"; }) == 0,
               "knobs set");
+        CHECK(knob_case({{"GR8_DS_ENGRAM_COL_SHARD", "1"}}, [](const Knobs& k) { return k.col_shard && knob::signature().find("DS_ENGRAM_COL_SHARD=1") != std::string::npos; }) == 0, "col shard on and in rank agreement");
+        CHECK(knob_case({{"GR8_DS_ENGRAM_COL_SHARD", "2"}}, [](const Knobs&) { return true; }) == 2, "col shard 2 refused");
         CHECK(knob_case({{"GR8_DS_ENGRAM_LOOKAHEAD", "2"}}, [](const Knobs&) { return true; }) == 2, "lookahead 2 refused");
         CHECK(knob_case({{"GR8_DS_ENGRAM_WAYS", "17"}}, [](const Knobs&) { return true; }) == 2, "ways 17 refused");
-        CHECK(knob_case({}, [](const Knobs& k) { return !k.on && !k.lookahead && !k.verbose && k.store.cache_bytes == (4ull << 30) && k.store.ways == 16 &&
+        CHECK(knob_case({}, [](const Knobs& k) { return !k.on && !k.col_shard && !k.lookahead && !k.verbose && k.store.cache_bytes == (4ull << 30) && k.store.ways == 16 &&
                                                         k.store.io_threads == 32 && k.prefix.empty(); }) == 0,
               "knob defaults (off, lookahead off, 4 GiB, 16 ways, 32 threads, no prefix)");
     }
