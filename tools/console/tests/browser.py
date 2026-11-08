@@ -45,7 +45,8 @@ def run(output):
             expect(page.locator(".name")).to_have_text("GLM-5.3")
             expect(page.get_by_role("row").filter(has_text="Decode").locator(".v")).not_to_contain_text("—", timeout=10000)
             expect(page.get_by_text("SYNTHETIC FIXTURE", exact=False).first).to_be_visible()
-            expect(page.locator(".pb.on")).to_contain_text("Speed")
+            expect(page.locator(".pill.preset")).to_have_text("custom", timeout=10000)
+            expect(page.locator(".pb.on")).to_have_count(0)
             expect(page.get_by_role("button", name="Knobs")).to_have_count(0)
             expect(page.get_by_text("same 3.25 bpw size, bits placed differently")).to_be_visible()
             for width in (1366, 390):
@@ -56,42 +57,53 @@ def run(output):
 
             page.set_viewport_size({"width": 390, "height": 844})
             page.get_by_role("button", name="Speed").click()
-            expect(page.get_by_role("dialog")).to_have_count(0)
-            assert fixture.calls == []
-            page.get_by_role("button", name="Quality").click()
             expect(page.get_by_role("dialog")).to_be_visible()
+            expect(page.get_by_role("dialog")).to_contain_text("SESS=4")
+            expect(page.get_by_role("dialog")).to_contain_text("SESS removed")
             expect(page.get_by_role("dialog")).to_contain_text("launcher defaults")
-            expect(page.get_by_role("dialog")).to_contain_text("VARIANT=bit325")
-            page.screenshot(path=str(output / "review-390.png"), full_page=True)
             page.get_by_role("button", name="Cancel", exact=True).click()
             assert fixture.calls == []
             page.get_by_role("button", name="Quality").click()
+            expect(page.get_by_role("dialog")).to_contain_text("VARIANT=bit325")
+            expect(page.get_by_role("dialog")).to_contain_text("SESS removed")
             page.keyboard.press("Escape")
             expect(page.get_by_role("dialog")).not_to_be_visible()
             assert fixture.calls == []
-            print("PASS preset cancel/Escape and current preset: no backend write or restart")
+            print("PASS preset cancel/Escape: leftover SESS is listed and nothing is written")
 
             saved = {box: fixture.texts["glm53"][box] for box in fixture.texts["glm53"]}
             for box in fixture.texts["glm53"]:
                 fixture.texts["glm53"][box] += "CAP=1000\n"
-            expect(page.locator(".pill.preset")).to_have_text("custom", timeout=10000)
+
+            def presets_body(response):
+                return "/api/presets/glm53" in response.url and response.status == 200
+
+            with page.expect_response(lambda response: presets_body(response) and "CAP=1000" in response.text(), timeout=10000):
+                pass
             page.get_by_role("button", name="Quality").click()
             expect(page.get_by_role("dialog")).to_contain_text("CAP=1000")
             expect(page.get_by_role("dialog")).to_contain_text("CAP removed")
             page.get_by_role("button", name="Cancel", exact=True).click()
             for box, text in saved.items():
                 fixture.texts["glm53"][box] = text
-            expect(page.locator(".pill.preset")).to_have_text("Speed", timeout=10000)
+            with page.expect_response(lambda response: presets_body(response) and "CAP=1000" not in response.text(), timeout=10000):
+                pass
+            expect(page.locator(".pill.preset")).to_have_text("custom")
             assert fixture.calls == []
             print("PASS explicit CAP is custom and the confirm dialog shows its removal")
 
             page.get_by_role("button", name="Quality").click()
+            expect(page.get_by_role("dialog")).to_contain_text("SESS=4")
+            expect(page.get_by_role("dialog")).to_contain_text("SESS removed")
+            page.screenshot(path=str(output / "review-390.png"), full_page=True)
             page.get_by_role("button", name="Restart now", exact=True).click()
             expect(page.get_by_label("Operation status")).to_contain_text("succeeded", timeout=15000)
             expect(page.locator(".pb.on")).to_contain_text("Quality", timeout=15000)
             assert [x[0] for x in fixture.calls] == ["write"] * 4 + ["stop", "switch"]
-            assert all("VARIANT=bit325" in t and "KEEP_ME=1" in t and "SESS=4" in t for t in fixture.texts["glm53"].values())
-            print("PASS confirmed preset: writes all four envs, stops, calls switch, verifies ready identity")
+            assert all("VARIANT=bit325" in t and "KEEP_ME=1" in t and "SESS=" not in t for t in fixture.texts["glm53"].values())
+            page.get_by_role("button", name="Quality").click()
+            expect(page.get_by_role("dialog")).to_have_count(0)
+            print("PASS confirmed preset: writes all four envs, drops SESS, stops, calls switch, verifies ready identity")
 
             row = page.get_by_role("row").filter(has_text="DeepSeek-V4.1-Flash")
             row.get_by_role("button", name="Switch", exact=True).click()

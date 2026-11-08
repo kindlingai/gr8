@@ -25,7 +25,23 @@ class EnvironmentTests(unittest.TestCase):
         self.assertIn("MODEL=unchanged # comment", changed)
         self.assertIn("KEEP=42", changed)
         self.assertNotIn("SESS=", changed)
+        again = envfile.engine_env(envfile.parse(changed))
+        self.assertEqual(again["KEEP"], "42")
+        self.assertEqual(again["GR8_QUIT_FAST"], "1")
         self.assertEqual(envfile.read_values(changed, {"GR8_QUIT_FAST", "REUSE", "SESS"}, engine)["GR8_QUIT_FAST"], "1")
+
+    def test_patch_strips_only_named_extra_env_words(self):
+        text = "EXTRA_ENV='KEEP_ME=1 GR8_DS_ENGRAM=1 GR8_DS_ENGRAM_PREFIX=/opt/engram GR8_DS_MOE_TOPK_DECODE=4 GR8_DS_RELAXED_ACCEPT=topp:0.9,ratio:0.1'\nEXACT=1\n"
+        changed = envfile.patch(text, {"GR8_DS_MOE_TOPK_DECODE": None, "GR8_DS_RELAXED_ACCEPT": None, "EXACT": None, "TUNE": "quality"},
+                                 {"GR8_DS_MOE_TOPK_DECODE", "GR8_DS_RELAXED_ACCEPT"})
+        self.assertNotIn("EXACT=", changed)
+        self.assertNotIn("MOE_TOPK_DECODE", changed)
+        self.assertNotIn("RELAXED_ACCEPT", changed)
+        self.assertIn("TUNE=quality", changed)
+        extra = envfile.engine_env(envfile.parse(changed))
+        self.assertEqual(extra, {"KEEP_ME": "1", "GR8_DS_ENGRAM": "1", "GR8_DS_ENGRAM_PREFIX": "/opt/engram"})
+        untouched = "EXTRA_ENV='KEEP_ME=1'\n"
+        self.assertEqual(envfile.patch(untouched, {"GR8_CP": None, "TUNE": "speed"}, {"GR8_CP"}), "EXTRA_ENV='KEEP_ME=1'\nTUNE=speed\n")
 
     def test_duplicate_and_ambiguous_rejected(self):
         with self.assertRaises(ValueError):
@@ -62,22 +78,52 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(presets.classify("glm53", {"KV_FORMAT": "int4"}), "context")
         self.assertEqual(presets.classify("glm53", {"VARIANT": "bit325", "KV_FORMAT": "int4"}), "custom")
         self.assertEqual(presets.classify("glm53", {"TUNE": "speed"}), "custom")
-        self.assertEqual(presets.classify("ds41", {}), "custom")
+        self.assertEqual(presets.classify("ds41", {}), "speed")
+        self.assertEqual(presets.classify("glm53f", {}), "speed")
         self.assertEqual(presets.classify("ds41", {"TUNE": "context"}), "context")
         self.assertEqual(presets.classify("ds41", {"TUNE": "speed", "VARIANT": "home"}), "custom")
         self.assertEqual(presets.classify("glm53f", {"TUNE": "quality"}), "quality")
+        self.assertEqual(presets.classify("ds41", {"SESS": "4"}), "custom")
+        self.assertEqual(presets.classify("glm53f", {"CAP": "9"}), "custom")
+        self.assertEqual(presets.classify("glm53", {"SESS": "4"}), "custom")
+        self.assertEqual(presets.classify("glm53", {"MAX_MODEL_LEN": "100"}), "custom")
         overrides = {"TUNE": "speed", "SESS": "8", "CAP": "1", "MAX_MODEL_LEN": "9", "VARIANT": "home"}
         self.assertEqual(presets.classify("ds41", overrides), "custom")
         self.assertEqual(presets.classify("glm53f", overrides), "custom")
         self.assertIn("SESS=8", presets.describe("ds41", overrides, False, "custom"))
         self.assertEqual(presets.classify("glm53", {"KV_FORMAT": "int4", "CAP": "100"}), "custom")
         self.assertEqual(presets.classify("glm53", {"VARIANT": "bit325", "KV_FORMAT": "int4", "CAP": "999", "TUNE": "speed"}), "custom")
-        self.assertEqual(presets.changes_for("glm53", "speed"), {"TUNE": None, "VARIANT": None, "KV_FORMAT": None, "CAP": None})
-        self.assertEqual(presets.changes_for("glm53", "quality"), {"TUNE": None, "VARIANT": "bit325", "KV_FORMAT": None, "CAP": None})
-        self.assertEqual(presets.changes_for("glm53", "context"), {"TUNE": None, "VARIANT": None, "KV_FORMAT": "int4", "CAP": None})
+        blank = {"TUNE": None, "VARIANT": None, "KV_FORMAT": None, "SESS": None, "CAP": None, "MAX_MODEL_LEN": None}
+        self.assertEqual(presets.changes_for("glm53", "speed"), blank)
+        self.assertEqual(presets.changes_for("glm53", "quality"), {**blank, "VARIANT": "bit325"})
+        self.assertEqual(presets.changes_for("glm53", "context"), {**blank, "KV_FORMAT": "int4"})
         quality = next(item for item in presets.CATALOG["glm53"] if item["id"] == "quality")
         self.assertIn("same 3.25 bpw size", quality["summary"])
         self.assertIn("bits placed differently", quality["summary"])
+        self.assertEqual(quality["caption"], "8 slots · same size as home")
+        speed = next(item for item in presets.CATALOG["glm53"] if item["id"] == "speed")
+        self.assertIn("DFlash2 or MTP drafts", speed["summary"])
+        self.assertNotIn("DFlash2 + MTP", speed["summary"])
+        context = next(item for item in presets.CATALOG["glm53"] if item["id"] == "context")
+        self.assertEqual(context["caption"], "8 slots · pool 513,536 (int4 not re-measured)")
+        self.assertEqual(presets.classify("ds41", {"GR8_DS_MOE_TOPK_DECODE": "4"}), "custom")
+        self.assertEqual(presets.classify("ds41", {"EXACT": "1"}), "custom")
+        self.assertEqual(presets.classify("ds41", {"GR8_DS_ENGRAM": "1"}), "speed")
+        self.assertEqual(presets.classify("glm53f", {"GR8_CP": "0"}), "custom")
+        self.assertEqual(presets.classify("glm53f", {"GR8_CP": "1"}), "custom")
+        watched = {"GR8_DS_MOE_TOPK_DECODE": "4", "EXACT": "1", "GR8_CP": "1"}
+        deep = {row["key"]: row for row in presets.diff_for("ds41", watched, (), "quality")}
+        self.assertEqual(deep["GR8_DS_MOE_TOPK_DECODE"], {"key": "GR8_DS_MOE_TOPK_DECODE", "before": "4", "after": None})
+        self.assertEqual(deep["EXACT"], {"key": "EXACT", "before": "1", "after": None})
+        self.assertNotIn("GR8_CP", deep)
+        self.assertNotIn("GR8_DS_ENGRAM", deep)
+        flash = {row["key"]: row for row in presets.diff_for("glm53f", watched, (), "speed")}
+        self.assertEqual(flash["GR8_CP"], {"key": "GR8_CP", "before": "1", "after": None})
+        for model in presets.CATALOG:
+            for name in ("speed", "quality", "context"):
+                assign = presets.changes_for(model, name)
+                for key in ("SESS", "CAP", "MAX_MODEL_LEN"):
+                    self.assertIsNone(assign[key])
         cleared = ("SESS", "CAP", "MAX_MODEL_LEN", "VARIANT", "KV_FORMAT")
         for model in ("ds41", "glm53f"):
             for name in ("speed", "quality", "context"):
@@ -195,6 +241,15 @@ class ServiceTests(unittest.TestCase):
         deep = self.console.read_presets("ds41")
         self.assertEqual(deep["current"], "custom")
 
+    def test_unset_recipe_tune_reads_as_speed_until_sess_is_set(self):
+        for model in ("ds41", "glm53f"):
+            for box in self.fake.texts[model]:
+                self.fake.texts[model][box] = self.fake.texts[model][box].replace("SESS=4\n", "")
+            self.assertEqual(self.console.read_presets(model)["current"], "speed")
+            for box in self.fake.texts[model]:
+                self.fake.texts[model][box] += "SESS=4\n"
+            self.assertEqual(self.console.read_presets(model)["current"], "custom")
+
     def test_recipe_preset_removes_explicit_overrides(self):
         extra = "TUNE=speed\nSESS=8\nCAP=100\nMAX_MODEL_LEN=9\nVARIANT=home\n"
         for model in ("ds41", "glm53f"):
@@ -226,16 +281,60 @@ class ServiceTests(unittest.TestCase):
                 self.assertNotIn(key + "=", text)
         self.assertEqual(self.console.read_presets("glm53f")["current"], "speed")
 
+    def test_ds41_preset_strips_fast_words_and_exact(self):
+        words = " ".join([
+            "KEEP_ME=1", "GR8_DS_ENGRAM=1", "GR8_DS_ENGRAM_PREFIX=/opt/engram",
+            "GR8_DS_RELAXED_ACCEPT=topp:0.9,ratio:0.1", "GR8_DS_MOE_TOPK_DECODE=4", "GR8_DS41_HEAD_MX=1",
+            "GR8_DS_ATTN_TC_MF=2", "GR8_DS_ATTN_TC_TILE=1", "GR8_DS_MHC_ROW_SHARD=1", "GR8_DS_MHC_Y_MXFP8=1",
+            "GR8_DS_CACHE_MIB=2048", "GR8_DS_SESS_DRAFTS=1",
+        ])
+        for box in self.fake.texts["ds41"]:
+            text = self.fake.texts["ds41"][box].replace("EXTRA_ENV='KEEP_ME=1'", f"EXTRA_ENV='{words}'")
+            self.assertNotEqual(text, self.fake.texts["ds41"][box])
+            self.fake.texts["ds41"][box] = text + "EXACT=1\n"
+        row = self.console.read_presets("ds41")
+        self.assertEqual(row["current"], "custom")
+        diff = {item["key"]: item for item in next(p for p in row["presets"] if p["id"] == "quality")["diff"]}
+        self.assertEqual(diff["GR8_DS_MOE_TOPK_DECODE"], {"key": "GR8_DS_MOE_TOPK_DECODE", "before": "4", "after": None})
+        self.assertEqual(diff["EXACT"], {"key": "EXACT", "before": "1", "after": None})
+        self.assertEqual(diff["GR8_DS_RELAXED_ACCEPT"]["before"], "topp:0.9,ratio:0.1")
+        self.assertNotIn("GR8_DS_ENGRAM", diff)
+        self.console.submit(dict(action="restart", model="ds41", confirm=True, expect_active="glm53", preset="quality", revision=row["revision"]))
+        self.assertEqual(self.done()["status"], "succeeded")
+        for text in self.fake.texts["ds41"].values():
+            self.assertIn("TUNE=quality", text)
+            self.assertNotIn("EXACT=", text)
+            extra = envfile.engine_env(envfile.parse(text))
+            self.assertEqual(extra, {"KEEP_ME": "1", "GR8_DS_ENGRAM": "1", "GR8_DS_ENGRAM_PREFIX": "/opt/engram"})
+        self.assertEqual(self.console.read_presets("ds41")["current"], "quality")
+
+    def test_flash_preset_strips_gr8_cp(self):
+        for box in self.fake.texts["glm53f"]:
+            text = self.fake.texts["glm53f"][box].replace("EXTRA_ENV='KEEP_ME=1'", "EXTRA_ENV='KEEP_ME=1 GR8_CP=0'")
+            self.fake.texts["glm53f"][box] = text.replace("SESS=4\n", "")
+        row = self.console.read_presets("glm53f")
+        self.assertEqual(row["current"], "custom")
+        diff = {item["key"]: item for item in next(p for p in row["presets"] if p["id"] == "context")["diff"]}
+        self.assertEqual(diff["GR8_CP"], {"key": "GR8_CP", "before": "0", "after": None})
+        self.console.submit(dict(action="restart", model="glm53f", confirm=True, expect_active="glm53", preset="speed", revision=row["revision"]))
+        self.assertEqual(self.done()["status"], "succeeded")
+        for text in self.fake.texts["glm53f"].values():
+            self.assertIn("TUNE=speed", text)
+            extra = envfile.engine_env(envfile.parse(text))
+            self.assertEqual(extra, {"KEEP_ME": "1"})
+            self.assertNotIn("GR8_CP", text)
+        self.assertEqual(self.console.read_presets("glm53f")["current"], "speed")
+
     def test_glm_presets_clear_the_other_format_and_cap(self):
         for box in self.fake.texts["glm53"]:
-            self.fake.texts["glm53"][box] += "TUNE=speed\nVARIANT=bit325\nKV_FORMAT=int4\nCAP=999\n"
+            self.fake.texts["glm53"][box] += "TUNE=speed\nVARIANT=bit325\nKV_FORMAT=int4\nCAP=999\nMAX_MODEL_LEN=777\n"
         row = self.console.read_presets("glm53")
         self.assertEqual(row["current"], "custom")
         self.assertIn("CAP=999", row["current_setting"])
         for preset, present, absent in (
-            ("speed", (), ("TUNE=", "VARIANT=", "KV_FORMAT=", "CAP=")),
-            ("quality", ("VARIANT=bit325",), ("KV_FORMAT=", "CAP=", "TUNE=")),
-            ("context", ("KV_FORMAT=int4",), ("VARIANT=", "CAP=", "TUNE=")),
+            ("speed", (), ("TUNE=", "VARIANT=", "KV_FORMAT=", "CAP=", "SESS=", "MAX_MODEL_LEN=")),
+            ("quality", ("VARIANT=bit325",), ("KV_FORMAT=", "CAP=", "TUNE=", "SESS=", "MAX_MODEL_LEN=")),
+            ("context", ("KV_FORMAT=int4",), ("VARIANT=", "CAP=", "TUNE=", "SESS=", "MAX_MODEL_LEN=")),
         ):
             row = self.console.read_presets("glm53")
             self.console.submit(self.request(preset=preset, revision=row["revision"]))
@@ -245,18 +344,19 @@ class ServiceTests(unittest.TestCase):
                     self.assertIn(needle, text)
                 for needle in absent:
                     self.assertNotIn(needle, text)
-                self.assertIn("SESS=4", text)
                 self.assertIn("KEEP_ME=1", text)
             self.assertEqual(self.console.read_presets("glm53")["current"], preset)
 
     def test_confirmed_preset_writes_all_boxes_then_restart(self):
         row = self.console.read_presets("glm53")
-        self.assertEqual(row["current"], "speed")
+        self.assertEqual(row["current"], "custom")
+        removal = next(item for item in next(p for p in row["presets"] if p["id"] == "quality")["diff"] if item["key"] == "SESS")
+        self.assertEqual(removal, {"key": "SESS", "before": "4", "after": None})
         self.console.submit(self.request(preset="quality", revision=row["revision"]))
         job = self.done()
         self.assertEqual(job["status"], "succeeded", job)
         self.assertEqual([c[0] for c in self.fake.calls], ["write"] * 4 + ["stop", "switch"])
-        self.assertTrue(all("VARIANT=bit325" in t and "KEEP_ME=1" in t and "SESS=4" in t for t in self.fake.texts["glm53"].values()))
+        self.assertTrue(all("VARIANT=bit325" in t and "KEEP_ME=1" in t and "SESS=" not in t for t in self.fake.texts["glm53"].values()))
         self.assertEqual(self.console.read_presets("glm53")["current"], "quality")
         backups = list(self.console.state.glob("*.backup.json"))
         self.assertEqual(len(backups), 1)

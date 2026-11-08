@@ -49,13 +49,19 @@ def patch(text, changes, engine_keys):
     direct = parse(text)
     extra = engine_env(direct)
     updates = {k: v for k, v in changes.items() if k not in engine_keys}
-    if any(k in engine_keys for k in changes):
-        for key, value in changes.items():
-            if key in engine_keys:
-                if value is None:
-                    extra.pop(key, None)
-                else:
-                    extra[key] = value
+    extra_changed = False
+    for key, value in changes.items():
+        if key not in engine_keys:
+            continue
+        if value is None:
+            if key in extra:
+                extra.pop(key)
+                extra_changed = True
+        elif extra.get(key) != value:
+            extra[key] = value
+            extra_changed = True
+    # Leave EXTRA_ENV byte-for-byte alone when none of its watched words changed.
+    if extra_changed:
         updates["EXTRA_ENV"] = shlex.join(f"{k}={v}" for k, v in extra.items()) or None
     result, seen = [], set()
     for line in text.splitlines(keepends=True):

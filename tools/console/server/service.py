@@ -211,7 +211,7 @@ class Console:
             raise ValueError("model is not configured")
         records = self.control.read_all(model) if self.control else {}
         watched = presets.keys_for(model)
-        rows = [envfile.read_values(r["text"], watched, set()) for r in records.values()]
+        rows = [envfile.read_values(r["text"], watched, presets.engine_keys(model)) for r in records.values()]
         values, mixed_keys = {}, []
         for key in watched:
             variants = {row[key] for row in rows}
@@ -297,7 +297,7 @@ class Console:
                 records = self.control.read_all(model)
                 if revision(records) != reviewed:
                     raise ValueError("dotenv changed since review; refresh presets")
-                updated = {b: envfile.patch(r["text"], changes, set()) for b, r in records.items()}
+                updated = {b: envfile.patch(r["text"], changes, presets.engine_keys(model)) for b, r in records.items()}
                 backup = self.state / (self.job["id"] + ".backup.json")
                 backup.write_text(json.dumps({"model": model, "records": records, "written": {b: envfile.digest(t) for b, t in updated.items()}}, indent=2))
                 os.chmod(backup, 0o600)

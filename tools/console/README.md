@@ -87,27 +87,31 @@ line the preset removes) and applied only by
 **Restart now**. That writes the model’s `.env` on every target box, stops the
 target, invokes `gr8 switch`, and waits for readiness plus the requested model
 identity. Running chats end. The same compare-and-swap, backup, and rollback
-path used for any dotenv edit applies. Unrelated lines, including `EXTRA_ENV`,
-stay as they are.
+path used for any dotenv edit applies. Unrelated lines stay as they are.
+A DeepSeek or GLM-5.3-Flash preset rewrites `EXTRA_ENV` only to drop the
+recipe words named below.
 
 | Model | What a preset writes | Source of the one-line description |
 |---|---|---|
-| DeepSeek-V4.1-Flash | `TUNE=speed`, `quality`, or `context`, and removes explicit `SESS`, `CAP`, `MAX_MODEL_LEN`, and `VARIANT` | the recipe `knobs.sh` / “Pick what to prioritize” |
-| GLM-5.3-Flash | the same three `TUNE` values and the same removals | the recipe `knobs.sh` / “Pick what to prioritize” |
-| GLM-5.3 | Speed clears `TUNE`, `VARIANT`, `KV_FORMAT`, and `CAP` (launcher home, 3.25 bpw). Quality sets `VARIANT=bit325`, the same 3.25 bpw size with the bits placed differently, and clears `KV_FORMAT` and `CAP`. Context sets `KV_FORMAT=int4` and clears `VARIANT` and `CAP`. | launcher options in [docs/GLM-5.3.md](../../docs/GLM-5.3.md) |
+| DeepSeek-V4.1-Flash | `TUNE=speed`, `quality`, or `context`. Removes explicit `SESS`, `CAP`, `MAX_MODEL_LEN`, `VARIANT`, and `EXACT`. Removes the recipe fast words from `EXTRA_ENV` (`GR8_DS_RELAXED_ACCEPT`, `GR8_DS_MOE_TOPK_DECODE`, `GR8_DS41_HEAD_MX`, `GR8_DS_ATTN_TC_MF`, `GR8_DS_ATTN_TC_TILE`, `GR8_DS_MHC_ROW_SHARD`, `GR8_DS_MHC_Y_MXFP8`, `GR8_DS_CACHE_MIB`, `GR8_DS_SESS_DRAFTS`). Keeps `GR8_DS_ENGRAM*`. | the recipe `knobs.sh` / “Pick what to prioritize” |
+| GLM-5.3-Flash | the same three `TUNE` values and the same `SESS` / `CAP` / `MAX_MODEL_LEN` / `VARIANT` removals, and removes `GR8_CP` from `EXTRA_ENV` | the recipe `knobs.sh` / “Pick what to prioritize” |
+| GLM-5.3 | Speed clears `TUNE`, `VARIANT`, `KV_FORMAT`, `SESS`, `CAP`, and `MAX_MODEL_LEN` (launcher home, 3.25 bpw). Quality sets `VARIANT=bit325`, the same 3.25 bpw size with the bits placed differently, and clears `KV_FORMAT`, `SESS`, `CAP`, and `MAX_MODEL_LEN`. Context sets `KV_FORMAT=int4` and clears `VARIANT`, `SESS`, `CAP`, and `MAX_MODEL_LEN`. | launcher options in [docs/GLM-5.3.md](../../docs/GLM-5.3.md) |
 
 The current preset is read from the keys that preset writes. An explicit
-`SESS`, `CAP`, `MAX_MODEL_LEN`, or `VARIANT` on DeepSeek or GLM-5.3-Flash
-shows **custom**, and so does any other combination, including mixed boxes.
-The confirm dialog lists each removal (`KEY=old`, then `KEY removed`). On
-GLM-5.3 the three presets are exclusive: Quality removes `KV_FORMAT`,
-Context removes `VARIANT`, and Speed removes both. An explicit `CAP` shows
-**custom** and is removed, because it would limit the context pool. Unset
-`TUNE` on a recipe model is custom, not an implied speed. On GLM-5.3, the
-watched keys unset is Speed, because that is the launcher default. The
-console does not guess other defaults, does not write engine cache paths,
-and leaves a GLM-5.3 `SESS` line unchanged. Recipe `knobs.sh` applies
-`SESS`, `CAP`, `MAX_MODEL_LEN`, and `VARIANT` only when they are unset.
+`SESS`, `CAP`, or `MAX_MODEL_LEN` on any of the three models shows
+**custom**, and so does any other combination, including mixed boxes.
+On DeepSeek, `EXACT` or one of the fast words above also shows **custom**.
+On GLM-5.3-Flash, `GR8_CP` in `EXTRA_ENV` shows **custom**. The confirm
+dialog lists each removal (`KEY=old`, then `KEY removed`). Every preset
+removes those keys. On GLM-5.3 the three presets are exclusive: Quality
+removes `KV_FORMAT`, Context removes `VARIANT`, and Speed removes both.
+Unset `TUNE` on DeepSeek or GLM-5.3-Flash is Speed, the recipe default.
+On GLM-5.3, the watched keys unset is Speed, because that is the launcher
+default. The console does not guess other defaults and does not write
+engine cache paths. Other `EXTRA_ENV` words, including `GR8_DS_ENGRAM*`,
+stay as they are. Recipe `knobs.sh` applies `SESS`, `CAP`,
+`MAX_MODEL_LEN`, and `VARIANT` only when they are unset, and it appends
+the user's `EXTRA_ENV` after its own words.
 No performance claim is made here.
 
 The backend pins the switch configuration at startup and refuses operations
