@@ -134,6 +134,15 @@ knobs:
     values: "0|1"
     doc: >-
       Prints one stderr line per S2 pool claim with its first page, page count and the retained runs it evicted.
+  GR8_QUIT_FAST:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      At an orderly quit of a served engine, after the KV store keeps the pool's runs and the links close, the ranks
+      meet at the fabric barrier and the process ends at once: the CUDA graphs, buffers and the CUDA runtime are not
+      freed one by one, process exit releases them.
   GR8_REUSE_ALIGN:
     scope: agree
     kind: flag
