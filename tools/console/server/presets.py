@@ -1,16 +1,23 @@
 """Three boot presets. Numbers are copied from the named docs, not measured here.
 
-DeepSeek and GLM-5.3-Flash write only TUNE. Their recipe knobs.sh expands it.
-GLM-5.3 on gr8 main has no TUNE: Speed clears VARIANT and KV_FORMAT (launcher
-defaults), Quality sets VARIANT=bit325, Context sets KV_FORMAT=int4.
+DeepSeek and GLM-5.3-Flash write TUNE and remove explicit SESS, CAP,
+MAX_MODEL_LEN, and VARIANT. Their knobs.sh applies those only when unset
+(${KEY:-default}); a leftover would keep the old preset. GLM-5.3 has no TUNE.
+Speed clears VARIANT, KV_FORMAT, and CAP. Quality sets VARIANT=bit325 and
+clears KV_FORMAT and CAP. Context sets KV_FORMAT=int4 and clears VARIANT and
+CAP, because an explicit CAP limits that larger pool.
 """
 
 MODELS = {"ds41": "DeepSeek-V4.1-Flash", "glm53": "GLM-5.3", "glm53f": "GLM-5.3-Flash"}
-KEYS = ("TUNE", "VARIANT", "KV_FORMAT")
 
 
 def _tune(value):
-    return {"TUNE": value, "VARIANT": None, "KV_FORMAT": None}
+    # None removes an explicit override so the recipe default can apply.
+    return {"TUNE": value, "VARIANT": None, "KV_FORMAT": None, "SESS": None, "CAP": None, "MAX_MODEL_LEN": None}
+
+
+def _glm(variant, kv_format):
+    return {"TUNE": None, "VARIANT": variant, "KV_FORMAT": kv_format, "CAP": None}
 
 
 def _row(preset_id, label, setting, summary, caption, assign):
@@ -36,13 +43,13 @@ CATALOG = {
     "glm53": [
         _row("speed", "Speed", "launcher defaults (VARIANT home)",
              "Experts home, 3.25 bpw: the 64 experts per layer with the highest K3 error at K4, the rest K3. DFlash2 + MTP, 8 at once, pool 485,376.",
-             "8 slots · pool 485,376", {"TUNE": None, "VARIANT": None, "KV_FORMAT": None}),
+             "8 slots · pool 485,376", _glm(None, None)),
         _row("quality", "Quality", "VARIANT=bit325",
              "Experts bit325, same 3.25 bpw size, bits placed differently: down projections at K4 in the layers where bits lower KL most, the rest K3. KL 1.5-7% lower than home, decode about 2.5% slower.",
-             "8 slots · pool 485,376", {"TUNE": None, "VARIANT": "bit325", "KV_FORMAT": None}),
+             "8 slots · pool 485,376", _glm("bit325", None)),
         _row("context", "Context", "KV_FORMAT=int4",
              "Experimental 4-bit KV: about 1.26x the context, decode about 3% slower.",
-             "8 slots · larger pool", {"TUNE": None, "VARIANT": None, "KV_FORMAT": "int4"}),
+             "8 slots · larger pool", _glm(None, "int4")),
     ],
     "glm53f": [
         _row("speed", "Speed", "TUNE=speed",
@@ -72,8 +79,12 @@ def _norm(value):
     return value or None
 
 
+def keys_for(model):
+    return tuple(CATALOG[model][0]["assign"])
+
+
 def classify(model, values):
-    got = {key: _norm(values.get(key)) for key in KEYS}
+    got = {key: _norm(values.get(key)) for key in keys_for(model)}
     for item in CATALOG[model]:
         if got == item["assign"]:
             return item["id"]
@@ -87,15 +98,26 @@ def changes_for(model, preset_id):
     raise ValueError("unknown preset")
 
 
+def diff_for(model, values, mixed, preset_id):
+    rows = []
+    for key, after in changes_for(model, preset_id).items():
+        before = "mixed" if key in mixed else _norm(values.get(key))
+        if before != after:
+            rows.append({"key": key, "before": before, "after": after})
+    return rows
+
+
 def describe(model, values, mixed, current):
     if mixed:
         return "mixed across boxes"
     if current in ("speed", "quality", "context"):
         return next(item["setting"] for item in CATALOG[model] if item["id"] == current)
-    parts = [f"{key}={values[key]}" for key in KEYS if _norm(values.get(key)) is not None]
+    parts = [f"{key}={values[key]}" for key in keys_for(model) if _norm(values.get(key)) is not None]
     return " ".join(parts) if parts else "unset"
 
 
-def public(model):
-    return [dict(id=item["id"], label=item["label"], setting=item["setting"], summary=item["summary"], caption=item["caption"])
+def public(model, values=None, mixed=()):
+    values = values or {}
+    return [dict(id=item["id"], label=item["label"], setting=item["setting"], summary=item["summary"], caption=item["caption"],
+                 diff=diff_for(model, values, mixed, item["id"]))
             for item in CATALOG[model]]

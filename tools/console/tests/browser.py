@@ -71,6 +71,20 @@ def run(output):
             assert fixture.calls == []
             print("PASS preset cancel/Escape and current preset: no backend write or restart")
 
+            saved = {box: fixture.texts["glm53"][box] for box in fixture.texts["glm53"]}
+            for box in fixture.texts["glm53"]:
+                fixture.texts["glm53"][box] += "CAP=1000\n"
+            expect(page.locator(".pill.preset")).to_have_text("custom", timeout=10000)
+            page.get_by_role("button", name="Quality").click()
+            expect(page.get_by_role("dialog")).to_contain_text("CAP=1000")
+            expect(page.get_by_role("dialog")).to_contain_text("CAP removed")
+            page.get_by_role("button", name="Cancel", exact=True).click()
+            for box, text in saved.items():
+                fixture.texts["glm53"][box] = text
+            expect(page.locator(".pill.preset")).to_have_text("Speed", timeout=10000)
+            assert fixture.calls == []
+            print("PASS explicit CAP is custom and the confirm dialog shows its removal")
+
             page.get_by_role("button", name="Quality").click()
             page.get_by_role("button", name="Restart now", exact=True).click()
             expect(page.get_by_label("Operation status")).to_contain_text("succeeded", timeout=15000)

@@ -82,7 +82,8 @@ at most once every two seconds after the previous poll completes.
 ## Presets
 
 The page offers three presets and no other knob controls. A choice is reviewed
-in a confirm dialog (previous setting, then the new one) and applied only by
+in a confirm dialog (previous setting, then the new one, plus each override
+line the preset removes) and applied only by
 **Restart now**. That writes the model’s `.env` on every target box, stops the
 target, invokes `gr8 switch`, and waits for readiness plus the requested model
 identity. Running chats end. The same compare-and-swap, backup, and rollback
@@ -91,16 +92,23 @@ stay as they are.
 
 | Model | What a preset writes | Source of the one-line description |
 |---|---|---|
-| DeepSeek-V4.1-Flash | `TUNE=speed`, `quality`, or `context` | the recipe `knobs.sh` / “Pick what to prioritize” |
-| GLM-5.3-Flash | the same three `TUNE` values | the recipe `knobs.sh` / “Pick what to prioritize” |
-| GLM-5.3 | Speed clears `TUNE`, `VARIANT`, and `KV_FORMAT` (launcher home, 3.25 bpw). Quality sets `VARIANT=bit325`, the same 3.25 bpw size with the bits placed differently. Context sets `KV_FORMAT=int4`. | launcher options in [docs/GLM-5.3.md](../../docs/GLM-5.3.md) |
+| DeepSeek-V4.1-Flash | `TUNE=speed`, `quality`, or `context`, and removes explicit `SESS`, `CAP`, `MAX_MODEL_LEN`, and `VARIANT` | the recipe `knobs.sh` / “Pick what to prioritize” |
+| GLM-5.3-Flash | the same three `TUNE` values and the same removals | the recipe `knobs.sh` / “Pick what to prioritize” |
+| GLM-5.3 | Speed clears `TUNE`, `VARIANT`, `KV_FORMAT`, and `CAP` (launcher home, 3.25 bpw). Quality sets `VARIANT=bit325`, the same 3.25 bpw size with the bits placed differently, and clears `KV_FORMAT` and `CAP`. Context sets `KV_FORMAT=int4` and clears `VARIANT` and `CAP`. | launcher options in [docs/GLM-5.3.md](../../docs/GLM-5.3.md) |
 
-The current preset is read from those three keys. Any other combination,
-including mixed boxes, shows **custom**. Unset `TUNE` on a recipe model is
-custom, not an implied speed. On GLM-5.3, all three keys unset is Speed,
-because that is the launcher default. The console does not guess other
-defaults and does not write `SESS`, `CAP`, or engine cache paths. Recipe
-`knobs.sh` expands `TUNE` at boot. No performance claim is made here.
+The current preset is read from the keys that preset writes. An explicit
+`SESS`, `CAP`, `MAX_MODEL_LEN`, or `VARIANT` on DeepSeek or GLM-5.3-Flash
+shows **custom**, and so does any other combination, including mixed boxes.
+The confirm dialog lists each removal (`KEY=old`, then `KEY removed`). On
+GLM-5.3 the three presets are exclusive: Quality removes `KV_FORMAT`,
+Context removes `VARIANT`, and Speed removes both. An explicit `CAP` shows
+**custom** and is removed, because it would limit the context pool. Unset
+`TUNE` on a recipe model is custom, not an implied speed. On GLM-5.3, the
+watched keys unset is Speed, because that is the launcher default. The
+console does not guess other defaults, does not write engine cache paths,
+and leaves a GLM-5.3 `SESS` line unchanged. Recipe `knobs.sh` applies
+`SESS`, `CAP`, `MAX_MODEL_LEN`, and `VARIANT` only when they are unset.
+No performance claim is made here.
 
 The backend pins the switch configuration at startup and refuses operations
 if that file changes. Restart the console to review new deployment targets.

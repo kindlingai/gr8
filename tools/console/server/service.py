@@ -210,15 +210,16 @@ class Console:
         if model not in self.models:
             raise ValueError("model is not configured")
         records = self.control.read_all(model) if self.control else {}
-        rows = [envfile.read_values(r["text"], presets.KEYS, set()) for r in records.values()]
+        watched = presets.keys_for(model)
+        rows = [envfile.read_values(r["text"], watched, set()) for r in records.values()]
         values, mixed_keys = {}, []
-        for key in presets.KEYS:
+        for key in watched:
             variants = {row[key] for row in rows}
             values[key] = next(iter(variants)) if len(variants) == 1 else None
             if len(variants) > 1:
                 mixed_keys.append(key)
         current = presets.classify(model, values) if rows and not mixed_keys else ("custom" if rows else None)
-        return dict(source=presets.SOURCE[model], presets=presets.public(model), current=current,
+        return dict(source=presets.SOURCE[model], presets=presets.public(model, values, mixed_keys), current=current,
                     current_setting=presets.describe(model, values, bool(mixed_keys), current),
                     values=values, mixed=mixed_keys, revision=revision(records) if records else None,
                     observed=bool(records))
@@ -291,7 +292,7 @@ class Console:
             if action == "restore":
                 self._restore(model, backup_id)
             if changes:
-                if set(changes) - set(presets.KEYS):
+                if set(changes) - set(presets.keys_for(model)):
                     raise ValueError("unsupported setting")
                 records = self.control.read_all(model)
                 if revision(records) != reviewed:

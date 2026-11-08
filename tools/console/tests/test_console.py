@@ -66,17 +66,35 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(presets.classify("ds41", {"TUNE": "context"}), "context")
         self.assertEqual(presets.classify("ds41", {"TUNE": "speed", "VARIANT": "home"}), "custom")
         self.assertEqual(presets.classify("glm53f", {"TUNE": "quality"}), "quality")
-        self.assertEqual(presets.changes_for("glm53", "quality"), {"TUNE": None, "VARIANT": "bit325", "KV_FORMAT": None})
+        overrides = {"TUNE": "speed", "SESS": "8", "CAP": "1", "MAX_MODEL_LEN": "9", "VARIANT": "home"}
+        self.assertEqual(presets.classify("ds41", overrides), "custom")
+        self.assertEqual(presets.classify("glm53f", overrides), "custom")
+        self.assertIn("SESS=8", presets.describe("ds41", overrides, False, "custom"))
+        self.assertEqual(presets.classify("glm53", {"KV_FORMAT": "int4", "CAP": "100"}), "custom")
+        self.assertEqual(presets.classify("glm53", {"VARIANT": "bit325", "KV_FORMAT": "int4", "CAP": "999", "TUNE": "speed"}), "custom")
+        self.assertEqual(presets.changes_for("glm53", "speed"), {"TUNE": None, "VARIANT": None, "KV_FORMAT": None, "CAP": None})
+        self.assertEqual(presets.changes_for("glm53", "quality"), {"TUNE": None, "VARIANT": "bit325", "KV_FORMAT": None, "CAP": None})
+        self.assertEqual(presets.changes_for("glm53", "context"), {"TUNE": None, "VARIANT": None, "KV_FORMAT": "int4", "CAP": None})
         quality = next(item for item in presets.CATALOG["glm53"] if item["id"] == "quality")
         self.assertIn("same 3.25 bpw size", quality["summary"])
         self.assertIn("bits placed differently", quality["summary"])
-        self.assertIsNone(presets.changes_for("glm53", "speed")["VARIANT"])
-        self.assertEqual(presets.changes_for("ds41", "speed")["TUNE"], "speed")
+        cleared = ("SESS", "CAP", "MAX_MODEL_LEN", "VARIANT", "KV_FORMAT")
+        for model in ("ds41", "glm53f"):
+            for name in ("speed", "quality", "context"):
+                assign = presets.changes_for(model, name)
+                self.assertEqual(assign["TUNE"], name)
+                for key in cleared:
+                    self.assertIsNone(assign[key])
+        sess = next(row for row in presets.diff_for("ds41", {"TUNE": "speed", "SESS": "8"}, (), "quality") if row["key"] == "SESS")
+        self.assertEqual(sess, {"key": "SESS", "before": "8", "after": None})
+        mixed = next(row for row in presets.diff_for("ds41", {"SESS": "8"}, {"SESS"}, "quality") if row["key"] == "SESS")
+        self.assertEqual(mixed["before"], "mixed")
         with self.assertRaises(ValueError):
             presets.changes_for("glm53", "fast")
         for model in presets.CATALOG:
+            keys = set(presets.keys_for(model))
             for item in presets.CATALOG[model]:
-                self.assertEqual(set(item["assign"]), set(presets.KEYS))
+                self.assertEqual(set(item["assign"]), keys)
 
 
 class AdapterTests(unittest.TestCase):
@@ -176,6 +194,60 @@ class ServiceTests(unittest.TestCase):
         self.fake.texts["ds41"]["box-0"] += "TUNE=quality\n"
         deep = self.console.read_presets("ds41")
         self.assertEqual(deep["current"], "custom")
+
+    def test_recipe_preset_removes_explicit_overrides(self):
+        extra = "TUNE=speed\nSESS=8\nCAP=100\nMAX_MODEL_LEN=9\nVARIANT=home\n"
+        for model in ("ds41", "glm53f"):
+            for box in self.fake.texts[model]:
+                text = self.fake.texts[model][box].replace("SESS=4\n", extra)
+                self.assertNotEqual(text, self.fake.texts[model][box])
+                self.fake.texts[model][box] = text
+        row = self.console.read_presets("ds41")
+        self.assertEqual(row["current"], "custom")
+        self.assertIn("SESS=8", row["current_setting"])
+        removal = next(item for item in next(p for p in row["presets"] if p["id"] == "quality")["diff"] if item["key"] == "SESS")
+        self.assertEqual(removal, {"key": "SESS", "before": "8", "after": None})
+        self.console.submit(dict(action="restart", model="ds41", confirm=True, expect_active="glm53", preset="quality", revision=row["revision"]))
+        self.assertEqual(self.done()["status"], "succeeded")
+        for text in self.fake.texts["ds41"].values():
+            self.assertIn("TUNE=quality", text)
+            self.assertIn("KEEP_ME=1", text)
+            for key in ("SESS", "CAP", "MAX_MODEL_LEN", "VARIANT"):
+                self.assertNotIn(key + "=", text)
+        self.assertEqual(self.console.read_presets("ds41")["current"], "quality")
+        flash = self.console.read_presets("glm53f")
+        self.assertEqual(flash["current"], "custom")
+        self.console.submit(dict(action="restart", model="glm53f", confirm=True, expect_active="ds41", preset="speed", revision=flash["revision"]))
+        self.assertEqual(self.done()["status"], "succeeded")
+        for text in self.fake.texts["glm53f"].values():
+            self.assertIn("TUNE=speed", text)
+            self.assertIn("KEEP_ME=1", text)
+            for key in ("SESS", "CAP", "MAX_MODEL_LEN", "VARIANT"):
+                self.assertNotIn(key + "=", text)
+        self.assertEqual(self.console.read_presets("glm53f")["current"], "speed")
+
+    def test_glm_presets_clear_the_other_format_and_cap(self):
+        for box in self.fake.texts["glm53"]:
+            self.fake.texts["glm53"][box] += "TUNE=speed\nVARIANT=bit325\nKV_FORMAT=int4\nCAP=999\n"
+        row = self.console.read_presets("glm53")
+        self.assertEqual(row["current"], "custom")
+        self.assertIn("CAP=999", row["current_setting"])
+        for preset, present, absent in (
+            ("speed", (), ("TUNE=", "VARIANT=", "KV_FORMAT=", "CAP=")),
+            ("quality", ("VARIANT=bit325",), ("KV_FORMAT=", "CAP=", "TUNE=")),
+            ("context", ("KV_FORMAT=int4",), ("VARIANT=", "CAP=", "TUNE=")),
+        ):
+            row = self.console.read_presets("glm53")
+            self.console.submit(self.request(preset=preset, revision=row["revision"]))
+            self.assertEqual(self.done()["status"], "succeeded")
+            for text in self.fake.texts["glm53"].values():
+                for needle in present:
+                    self.assertIn(needle, text)
+                for needle in absent:
+                    self.assertNotIn(needle, text)
+                self.assertIn("SESS=4", text)
+                self.assertIn("KEEP_ME=1", text)
+            self.assertEqual(self.console.read_presets("glm53")["current"], preset)
 
     def test_confirmed_preset_writes_all_boxes_then_restart(self):
         row = self.console.read_presets("glm53")
