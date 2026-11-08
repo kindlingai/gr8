@@ -19,12 +19,43 @@ __device__ __forceinline__ void pipe_store(bf16* Ks, const uint8_t* packed, int 
         dst[1] = make_uint4(o[4], o[5], o[6], o[7]);
     }
 }
+// Mode 2 keeps each eight-bf16 vector contiguous and XORs its vector
+// bank with the key row. The map is its own inverse within every 512-value
+// row. Both QK scalar pairs and PV ldmatrix use this same logical->physical map.
+constexpr size_t AT_SMEM_PIPE_SWZ = AT_SMEM_PIPE - 64 * (AT_KLD - HD) * sizeof(bf16);
+template <bool SWZ>
+__host__ __device__ constexpr int pipe_koff(int row, int dim) {
+    return SWZ ? row * HD + (dim ^ ((row & 7) * 8)) : row * AT_KLD + dim;
+}
+// A lane writes one 16-byte vector, not two interleaved vectors. At each
+// instruction eight neighboring lanes cover all 32 banks exactly once.
+// Only ownership/layout changes: cq_dq4 and its bf16 multiply are unchanged.
+__device__ __forceinline__ void pipe_store_swz(bf16* Ks, const uint8_t* packed,
+                                             const bf16* const* rows, int w, int lane) {
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int row = w + 8 * k;
+        if (!packed && !cq_tag(rows[row])) continue;
+        const uint8_t* r = packed ? packed + row * CQ_ROW : cq_row(rows[row]);
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int dim = half * 256 + lane * 8;
+            const uint32_t code = ((const uint32_t*)r)[half * 32 + lane];
+            const __nv_bfloat162 scale = __float2bfloat162_rn(f_e4m3(r[CQ_CODES + dim / 16]));
+            uint32_t v[4];
+            cq_dq4(code, scale, v[0], v[1]);
+            cq_dq4(code >> 16, scale, v[2], v[3]);
+            *(uint4*)(Ks + pipe_koff<true>(row, dim)) = make_uint4(v[0], v[1], v[2], v[3]);
+        }
+    }
+}
+template <bool SWZ>
 __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_pipe_q(AttnP p)
 {
     constexpr bool FL = false, CQ = true;
     extern __shared__ __align__(16) uint8_t smem[];
     bf16* Ks = (bf16*)smem;
-    float* Ss = (float*)(Ks + 64 * AT_KLD);
+    float* Ss = (float*)(Ks + 64 * (SWZ ? HD : AT_KLD));
     bf16* Ps = (bf16*)(Ss + 16 * AT_SLD);
     const bf16** rowp = (const bf16**)(Ps + 16 * AT_PLD);   // two lists of 64 slots: the block in use and the next live one
     float* sc_s = (float*)(rowp + 128);
@@ -118,7 +149,8 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_pipe_q(AttnP p)
             if (!staged) issue(cl);
             cp_async_wait0();
             __syncthreads();
-            pipe_store(Ks, packed, w, lane);
+            if constexpr (SWZ) pipe_store_swz(Ks, packed, nullptr, w, lane);
+            else pipe_store(Ks, packed, w, lane);
             __syncthreads(); // all stage reads finish before issue overwrites it
         } else {
 #pragma unroll
@@ -127,15 +159,18 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_pipe_q(AttnP p)
                 const int c = tid + i * AT_THREADS;
                 const bf16* rp = cl[c >> 6];
                 if (CQ && cq_tag(rp)) continue;   // cq_store below
-                cp_async16(Ks + (c >> 6) * AT_KLD + (c & 63) * 8, rp ? (const void*)((const uint4*)rp + (c & 63)) : (const void*)p.q, rp ? 16 : 0);
+                cp_async16(Ks + pipe_koff<SWZ>(c >> 6, (c & 63) * 8), rp ? (const void*)((const uint4*)rp + (c & 63)) : (const void*)p.q, rp ? 16 : 0);
             }
             cp_async_commit();
             uint2 cd[8];
             uint32_t sb[8];
             const bool cqb = CQ && (cblk + 1) * 64 > p.WL;   // the block holds compressed slots (uniform)
-            if (cqb) cq_load(cl, w, lane, cd, sb);
+            if constexpr (!SWZ) { if (cqb) cq_load(cl, w, lane, cd, sb); }
             cp_async_wait0();
-            if (cqb) cq_store(Ks, AT_KLD, cl, w, lane, cd, sb);
+            if (cqb) {
+                if constexpr (SWZ) pipe_store_swz(Ks, nullptr, cl, w, lane);
+                else cq_store(Ks, AT_KLD, cl, w, lane, cd, sb);
+            }
             __syncthreads();
         }
         int nb = cblk + 1;
@@ -145,13 +180,13 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_pipe_q(AttnP p)
         if (staged) issue(rowp + 64 * nx);
         {   // S[16 heads][8 slots of this warp] = Q . K^T over 512
             float cc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-            const bf16* krow = Ks + (w * 8 + (lane >> 2)) * AT_KLD + 2 * (lane & 3);
+            const int kr = w * 8 + (lane >> 2), kd = 2 * (lane & 3);
 #pragma unroll
             for (int ks = 0; ks < HD / 16; ks++)
             {
                 const uint32_t (&a)[4] = qfrag[ks];
-                const uint32_t b0 = *(const uint32_t*)(krow + ks * 16);
-                const uint32_t b1 = *(const uint32_t*)(krow + ks * 16 + 8);
+                const uint32_t b0 = *(const uint32_t*)(Ks + pipe_koff<SWZ>(kr, kd + ks * 16));
+                const uint32_t b1 = *(const uint32_t*)(Ks + pipe_koff<SWZ>(kr, kd + ks * 16 + 8));
                 mma16816(cc, a, b0, b1);
             }
             const int r0 = lane >> 2, col = w * 8 + 2 * (lane & 3);
@@ -201,7 +236,7 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_pipe_q(AttnP p)
                 {
                     uint32_t b[4];
                     const int mi = lane >> 3, r = lane & 7;
-                    ldsm_x4_t(b, Ks + (kj * 16 + (mi & 1) * 8 + r) * AT_KLD + w * 64 + (np * 2 + (mi >> 1)) * 8);
+                    ldsm_x4_t(b, Ks + pipe_koff<SWZ>(kj * 16 + (mi & 1) * 8 + r, w * 64 + (np * 2 + (mi >> 1)) * 8));
                     mma16816(acc[np * 2], a, b[0], b[1]);
                     mma16816(acc[np * 2 + 1], a, b[2], b[3]);
                 }

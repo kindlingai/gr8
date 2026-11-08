@@ -1703,7 +1703,7 @@ inline bool g_comp_fp8 = false; // GR8_DS_COMP_FP8, default off; lossy, quality 
 inline int g_src_fast = 0;   // GR8_DS_SRC_FAST bits, set by ds41_attn_set_src_fast: 1 = comp_row uses k_f32gemv2 (bit-identical to k_f32gemm2); 2 = the rank TU routes idx wq_b through the GEMV
 inline int g_win_floor = 0;  // ds41_attn_set_win_floor: the window floor attn_core puts in AttnP (bounded replay, eager prefill only); 0 = none
 inline int g_attn_cpa = 0;   // GR8_DS_ATTN_CPA, set by ds41_attn_set_cpasync: 1 = launch_attn runs k_attn_cpa (cp.async K gather, bit-identical to k_attn)
-inline bool g_attn_pipe = false; // enabled only while the v2 prefill conductor enqueues
+inline int g_attn_pipe = 0; // enabled only while the v2 prefill conductor enqueues
 inline int g_attn_split = 0; // GR8_DS_ATTN_SPLIT=1, default off; two CTAs per row/head-group plus online-softmax merge
 inline int g_gv_tpc = 1, g_gv_ks = 0;   // output tiles per CTA; k-parts per tile (0 = the default pick, gv_pick_ks in ds41_attn_gv.cuh)
 inline XfragFn g_fn_xfrag = nullptr;
@@ -1779,10 +1779,12 @@ inline void launch_attn(const AttnP& p, cudaStream_t st)
     } else if (g_attn_pipe && g_attn_cpa && q) {
         static bool pipe_init = false;
         if (!pipe_init) {
-            cudaFuncSetAttribute(k_attn_cpa_pipe_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_PIPE);
+            cudaFuncSetAttribute(k_attn_cpa_pipe_q<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_PIPE);
+            cudaFuncSetAttribute(k_attn_cpa_pipe_q<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_PIPE_SWZ);
             pipe_init = true;
         }
-        k_attn_cpa_pipe_q<<<g, AT_THREADS, AT_SMEM_PIPE, st>>>(p);
+        if (g_attn_pipe == 2) k_attn_cpa_pipe_q<true><<<g, AT_THREADS, AT_SMEM_PIPE_SWZ, st>>>(p);
+        else k_attn_cpa_pipe_q<false><<<g, AT_THREADS, AT_SMEM_PIPE, st>>>(p);
     } else if (g_attn_cpa) (q ? k_attn_cpa_q : k_attn_cpa)<<<g, AT_THREADS, AT_SMEM_CPA, st>>>(p);
     else (q ? k_attn_q : k_attn)<<<g, AT_THREADS, AT_SMEM, st>>>(p);
 }

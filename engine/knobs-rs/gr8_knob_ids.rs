@@ -2,7 +2,7 @@
 // change the table, not this file. Each knob's id in the C API of gr8_knobs.h; a NAME<n> family takes n as well.
 
 /// The hash of the table these ids are from (gr8_knobs.h knob::TABLE_HASH).
-pub const TABLE_HASH: u64 = 0x7a07dc15f2228f72;
+pub const TABLE_HASH: u64 = 0xa0b092a4fcb5ef13;
 pub const ATTN_CTX2: u32 = 0;
 pub const ATTN_CTX3: u32 = 1;
 pub const ATTN_CTX3_HG: u32 = 2;

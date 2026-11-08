@@ -540,6 +540,7 @@ static void time_attention(int heads, int iters)
 
 // Pipeline operand proof: same packed bytes -> original cq_store bf16 tile ->
 // the new packed-stage pipe_store, comparing every expanded bf16 byte.
+template <bool SWZ>
 __global__ void k_pipe_operands(const uint8_t* keys, unsigned* bad)
 {
     extern __shared__ __align__(16) uint8_t operand_sm[];
@@ -564,16 +565,18 @@ __global__ void k_pipe_operands(const uint8_t* keys, unsigned* bad)
     // A missing store must not pass by retaining cq_store's expected bytes.
     for (int i = tid; i < 64 * ds41a::AT_KLD; i += 256) wide[i] = __ushort_as_bfloat16(0xFFFFu);
     __syncthreads();
-    ds41a::pipe_store(wide, tile, w, lane);
+    if constexpr (SWZ) ds41a::pipe_store_swz(wide, tile, nullptr, w, lane);
+    else ds41a::pipe_store(wide, tile, w, lane);
     __syncthreads();
     unsigned n = 0;
 #pragma unroll
     for (int k = 0; k < 64; k++) {
         const int i = tid + k * 256;
-        n += reference[k] != *(const uint32_t*)(wide + (i / (HD / 2)) * ds41a::AT_KLD + (i % (HD / 2)) * 2);
+        n += reference[k] != *(const uint32_t*)(wide + ds41a::pipe_koff<SWZ>(i / (HD / 2), (i % (HD / 2)) * 2));
     }
     if (n) atomicAdd(bad, n);
 }
+template <bool SWZ>
 static void test_pipe_operands()
 {
     // Every code pair and every finite scale, including signed zero and negative
@@ -582,7 +585,7 @@ static void test_pipe_operands()
     auto* pk = dalloc<uint8_t>(bytes.size());
     auto* bad = dalloc<unsigned>(1);
     const int smem = 64 * ds41a::AT_KLD * sizeof(bf16) + 64 * CQ_ROW;
-    CK(cudaFuncSetAttribute(k_pipe_operands, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    CK(cudaFuncSetAttribute(k_pipe_operands<SWZ>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     for (int batch = 0; batch < 32; batch++) {
         for (int row = 0; row < 64; row++) for (int g = 0; g < 32; g++) {
             const int pair = row * 32 + g + batch * 2048;
@@ -592,7 +595,7 @@ static void test_pipe_operands()
             for (int b = 0; b < 8; b++) bytes[row * CQ_ROW + g * 8 + b] = uint8_t(pair % 256);
         }
         CK(cudaMemcpy(pk, bytes.data(), bytes.size(), cudaMemcpyHostToDevice));
-        k_pipe_operands<<<1, 256, smem>>>(pk, bad);
+        k_pipe_operands<SWZ><<<1, 256, smem>>>(pk, bad);
     }
     CK(cudaDeviceSynchronize());
     const unsigned errors = back(bad, 1)[0];
@@ -600,22 +603,28 @@ static void test_pipe_operands()
     if (errors) g_fail = 1;
     CK(cudaFree(pk)); CK(cudaFree(bad));
 }
-static void pipe_launch(ds41a::AttnP p, bool pipe)
+static void pipe_launch(ds41a::AttnP p, int pipe)
 {
     const dim3 grid(p.n, p.heads / 16);
-    if (pipe) ds41a::k_attn_cpa_pipe_q<<<grid, ds41a::AT_THREADS, ds41a::AT_SMEM_PIPE>>>(p);
+    if (pipe == 2) ds41a::k_attn_cpa_pipe_q<true><<<grid, ds41a::AT_THREADS, ds41a::AT_SMEM_PIPE_SWZ>>>(p);
+    else if (pipe) ds41a::k_attn_cpa_pipe_q<false><<<grid, ds41a::AT_THREADS, ds41a::AT_SMEM_PIPE>>>(p);
     else ds41a::k_attn_cpa_t<false, true><<<grid, ds41a::AT_THREADS, ds41a::AT_SMEM_CPA>>>(p);
     CK(cudaGetLastError());
 }
-static void test_pipe(int heads, int iters)
+static void test_pipe(int heads, int iters, int pipe_mode)
 {
-    CK(cudaFuncSetAttribute(ds41a::k_attn_cpa_pipe_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ds41a::AT_SMEM_PIPE));
+    CK(cudaFuncSetAttribute(ds41a::k_attn_cpa_pipe_q<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ds41a::AT_SMEM_PIPE));
     CK(cudaFuncSetAttribute(ds41a::k_attn_cpa_t<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ds41a::AT_SMEM_CPA));
     cudaFuncAttributes a{}, b{};
     CK(cudaFuncGetAttributes(&a, ds41a::k_attn_cpa_t<false, true>));
-    CK(cudaFuncGetAttributes(&b, ds41a::k_attn_cpa_pipe_q));
+    CK(cudaFuncGetAttributes(&b, ds41a::k_attn_cpa_pipe_q<false>));
     printf("pipe resource: dynamic_smem=%zu baseline_regs=%d pipe_regs=%d baseline_local=%zu pipe_local=%zu\n", ds41a::AT_SMEM_PIPE, a.numRegs, b.numRegs, a.localSizeBytes, b.localSizeBytes);
-    test_pipe_operands();
+    CK(cudaFuncSetAttribute(ds41a::k_attn_cpa_pipe_q<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ds41a::AT_SMEM_PIPE_SWZ));
+    CK(cudaFuncGetAttributes(&b, ds41a::k_attn_cpa_pipe_q<true>));
+    printf("swizzle resource: dynamic_smem=%zu regs=%d local=%zu\n", ds41a::AT_SMEM_PIPE_SWZ, b.numRegs, b.localSizeBytes);
+    if (b.localSizeBytes) g_fail = 1;
+    printf("testing pipe mode=%d\n", pipe_mode);
+    if (pipe_mode == 2) test_pipe_operands<true>(); else test_pipe_operands<false>();
     for (int n : {1, 7, 64, 2047, 2048, 8192}) for (int mode = 0; mode < 3; mode++) {
         Case c{"pipe", 2, n, 1, mode ? 16384 : -1, 0};
         if (mode == 2) c.wl = 100; // mixed block, then packed-stage reuse
@@ -633,14 +642,14 @@ static void test_pipe(int heads, int iters)
             CK(cudaMemcpy(x.d_topk, tk.data(), tk.size() * 4, cudaMemcpyHostToDevice));
         }
         set_rows(x.p, K, true, x.out_a); pipe_launch(x.p, false);
-        set_rows(x.p, K, true, x.out_b); poison_smem(); pipe_launch(x.p, true);
+        set_rows(x.p, K, true, x.out_b); poison_smem(); pipe_launch(x.p, pipe_mode);
         CK(cudaDeviceSynchronize());
         const auto ref = back((const uint16_t*)x.out_a, x.out_n), got = back((const uint16_t*)x.out_b, x.out_n);
         const bool equal = memcmp(ref.data(), got.data(), x.out_n * 2) == 0;
         printf("pipe memcmp rows=%d mode=%d WL=%d bytes=%zu %s\n", n, mode, x.p.WL, x.out_n * 2, equal ? "BYTE-EQUAL" : "DIFF");
         if (!equal) { g_fail = 1; for (size_t i = 0; i < x.out_n; i++) if (ref[i] != got[i]) { printf(" first diff %zu: %04x != %04x\n", i, ref[i], got[i]); break; } }
         // Compare through the actual launch selector too (and guard split/floor exclusions separately in the original suite).
-        ds41a::g_attn_cpa = 1; ds41a::g_attn_split = 0; ds41a::g_attn_pipe = true;
+        ds41a::g_attn_cpa = 1; ds41a::g_attn_split = 0; ds41a::g_attn_pipe = pipe_mode;
         ds41a::launch_attn(x.p, 0); ds41a::g_attn_pipe = false;
         CK(cudaDeviceSynchronize());
         const auto selected = back((const uint16_t*)x.out_b, x.out_n);
@@ -652,10 +661,10 @@ static void test_pipe(int heads, int iters)
             cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
             for (int arm = 0; arm < 2; arm++) {
                 std::vector<float> runs;
-                pipe_launch(x.p, arm);
+                pipe_launch(x.p, arm ? pipe_mode : 0);
                 for (int r = 0; r < 3; r++) {
                     CK(cudaEventRecord(e0));
-                    for (int i = 0; i < iters; i++) pipe_launch(x.p, arm);
+                    for (int i = 0; i < iters; i++) pipe_launch(x.p, arm ? pipe_mode : 0);
                     CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1));
                     float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); runs.push_back(ms * 1000 / iters);
                 }
@@ -668,26 +677,102 @@ static void test_pipe(int heads, int iters)
     }
 }
 
+// No operand-proof kernels or poison launch in this path: its first three
+// launches are off, pipe, pipe+swizzle on identical inputs (indices 0, 1, 2).
+// --time N adds one warmup + five batches of N launches per arm afterwards.
+static int profile_pipe(int heads, int iters, int ratio, bool window)
+{
+    if (heads != 16) { fprintf(stderr, "profile uses heads=16\n"); return 2; }
+    size_t free, total; CK(cudaMemGetInfo(&free, &total));
+    printf("profile free_bytes=%zu total_bytes=%zu\n", free, total);
+    if (free < size_t(1536) * 1024 * 1024) return 77;
+    CK(cudaFuncSetAttribute(ds41a::k_attn_cpa_pipe_q<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ds41a::AT_SMEM_PIPE));
+    CK(cudaFuncSetAttribute(ds41a::k_attn_cpa_pipe_q<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ds41a::AT_SMEM_PIPE_SWZ));
+    CK(cudaFuncSetAttribute(ds41a::k_attn_cpa_t<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ds41a::AT_SMEM_CPA));
+    CK(cudaFuncSetAttribute(ds41a::k_attn_cpa_t<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ds41a::AT_SMEM_CPA));
+    for (int mode = 0; mode < 3; ++mode) {
+        auto kernel = window ? ds41a::k_attn_cpa_t<false, false> :
+            mode == 0 ? ds41a::k_attn_cpa_t<false, true> :
+            mode == 1 ? ds41a::k_attn_cpa_pipe_q<false> : ds41a::k_attn_cpa_pipe_q<true>;
+        cudaFuncAttributes attr{}; CK(cudaFuncGetAttributes(&attr, kernel));
+        printf("profile mode=%d regs=%d local=%zu static_smem=%zu dynamic_smem=%zu\n", mode,
+               attr.numRegs, attr.localSizeBytes, attr.sharedSizeBytes,
+               window || mode == 0 ? ds41a::AT_SMEM_CPA : mode == 1 ? ds41a::AT_SMEM_PIPE : ds41a::AT_SMEM_PIPE_SWZ);
+        if (attr.localSizeBytes) g_fail = 1;
+    }
+    Keys keys = make_keys(32768, 1);
+    Case c{"profile", ratio, 8192, 1, 24576, 0};
+    Built x = build(c, heads, keys, false);
+    if (window) x.p.TK = 0;
+    auto launch = [&](int arm) {
+        set_rows(x.p, keys, !window, arm ? x.out_b : x.out_a);
+        if (window) {
+            // Window-only is intentionally unchanged by either pipe mode.
+            ds41a::k_attn_cpa_t<false, false><<<dim3(x.p.n, heads / 16), ds41a::AT_THREADS, ds41a::AT_SMEM_CPA>>>(x.p);
+            CK(cudaGetLastError());
+        } else pipe_launch(x.p, arm);
+    };
+    launch(0); CK(cudaDeviceSynchronize());
+    const auto off = back((const uint16_t*)x.out_a, x.out_n);
+    for (int mode = 1; mode < 3; ++mode) {
+        launch(mode); CK(cudaDeviceSynchronize());
+        const auto on = back((const uint16_t*)x.out_b, x.out_n);
+        const bool equal = memcmp(off.data(), on.data(), x.out_n * 2) == 0;
+        printf("profile rows=8192 pos=24576 ratio=%d window=%d mode=%d bytes=%zu memcmp=%s%s\n",
+               ratio, int(window), mode, x.out_n * 2, equal ? "EXACT" : "DIFF",
+               window ? " (unchanged window kernel)" : "");
+        if (!equal) g_fail = 1;
+    }
+    if (iters > 0) {
+        float us[3]; cudaEvent_t begin, end;
+        CK(cudaEventCreate(&begin)); CK(cudaEventCreate(&end));
+        for (int arm = 0; arm < 3; ++arm) {
+            launch(arm); std::vector<float> samples;
+            for (int r = 0; r < 5; ++r) {
+                CK(cudaEventRecord(begin));
+                for (int i = 0; i < iters; ++i) launch(arm);
+                CK(cudaEventRecord(end)); CK(cudaEventSynchronize(end));
+                float ms; CK(cudaEventElapsedTime(&ms, begin, end));
+                samples.push_back(1000 * ms / iters);
+            }
+            std::sort(samples.begin(), samples.end()); us[arm] = samples[2];
+        }
+        printf("profile time window=%d ratio=%d off_us=%.3f pipe_us=%.3f swizzle_us=%.3f pipe_vs_off_pct=%.3f swizzle_vs_off_pct=%.3f swizzle_vs_pipe_pct=%.3f median=5x%d\n",
+               int(window), ratio, us[0], us[1], us[2], 100 * (us[1] / us[0] - 1),
+               100 * (us[2] / us[0] - 1), 100 * (us[2] / us[1] - 1), iters);
+        CK(cudaEventDestroy(begin)); CK(cudaEventDestroy(end));
+    }
+    free_built(x); free_keys(keys);
+    return g_fail;
+}
+
 int main(int argc, char** argv)
 {
-    int heads = 16, iters = 0, long_keys = 131072;
+    int heads = 16, iters = 0, long_keys = 131072, pipe_mode = 2, ratio = 2;
+    bool profile = false, window = false;
     bool pipe_only = false;
     for (int i = 1; i < argc; i++)
     {
         const std::string a = argv[i];
         if (a == "--pipe-only") pipe_only = true;
+        else if (a == "--profile-only") profile = true;
+        else if (a == "--window") window = true;
+        else if (a == "--ratio" && i + 1 < argc) ratio = atoi(argv[++i]);
+        else if (a == "--pipe-mode" && i + 1 < argc) pipe_mode = atoi(argv[++i]);
         else if (a == "--heads" && i + 1 < argc) heads = atoi(argv[++i]);
         else if (a == "--time" && i + 1 < argc) iters = atoi(argv[++i]);
         else if (a == "--long" && i + 1 < argc) long_keys = atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s [--heads 16] [--time ITERS] [--long KEYS] [--pipe-only]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "usage: %s [--heads 16] [--time ITERS] [--long KEYS] [--pipe-only] [--pipe-mode 1|2] [--profile-only] [--window] [--ratio 1|2]\n", argv[0]); return 2; }
     }
+    if ((pipe_mode != 1 && pipe_mode != 2) || (ratio != 1 && ratio != 2) || iters < 0) return 2;
+    if (profile) return profile_pipe(heads, iters, ratio, window);
     if (heads % 16) { fprintf(stderr, "--heads must be a multiple of 16\n"); return 2; }
     if (pipe_only) {
         if (heads != 16) { fprintf(stderr, "--pipe-only uses heads=16 for bounded memory\n"); return 2; }
         size_t free, total; CK(cudaMemGetInfo(&free, &total));
         printf("GPU free_bytes=%zu total_bytes=%zu; test allocations below 450 MiB\n", free, total);
         if (free < (size_t)1536 * 1024 * 1024) { fprintf(stderr, "SKIP: insufficient free memory\n"); return 77; }
-        test_pipe(heads, iters);
+        test_pipe(heads, iters, pipe_mode);
         printf("%s\n", g_fail ? "FAIL" : "PASS"); return g_fail;
     }
     test_dequant();

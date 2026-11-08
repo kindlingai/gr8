@@ -202,6 +202,7 @@ inline void init(State& s,g6::Fabric& f,cudaStream_t st) {
     s.fabric=&f; s.wire=f.dev(); s.st=st;
     s.attn_pipe=AttnPipe{};
     s.attn_pipe.on=knob::ds_pf_v2_attn_pipe();
+    require(s.attn_pipe.on>=0 && s.attn_pipe.on<=2,"GR8_DS_PF_V2_ATTN_PIPE needs 0, 1 or 2");
     s.widths=CommWidths{};
     require(CommWidths::decode(knob::ds_pf_v2_rs_blocks(),s.widths.rs),
         "GR8_DS_PF_V2_RS_BLOCKS needs 0 or positive int block counts");

@@ -5,7 +5,7 @@
 #include <map>
 namespace ds41::v2 {
 struct AttnPipe {
-    bool on = false;
+    int on = 0;
     std::map<unsigned, uint64_t> seen;
     void select(uint64_t request, unsigned slot, FILE* log = stderr) {
         auto it = seen.find(slot);

@@ -27,7 +27,7 @@ namespace knob
 {
 
 /// The hash of the table this header was written from.
-constexpr uint64_t TABLE_HASH = 0x7a07dc15f2228f72ull;
+constexpr uint64_t TABLE_HASH = 0xa0b092a4fcb5ef13ull;
 
 /// Prints the environment's problems (bad values, unknown GR8_ names, old G6_ names) to stderr and returns the number
 /// of errors. The engine stops when it is not 0.
@@ -971,9 +971,9 @@ inline bool ds_pf_v2()
 }
 
 /// GR8_DS_PF_V2_ATTN_PIPE
-inline bool ds_pf_v2_attn_pipe()
+inline int64_t ds_pf_v2_attn_pipe()
 {
-    static const bool v = *detail::flag(127, 0);
+    static const int64_t v = *detail::int_(127, 0);
     return v;
 }
 
