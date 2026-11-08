@@ -98,9 +98,8 @@ public:
         return true;
     }
 };
-inline std::string config_from_environment() {
-    const char* path=std::getenv("ATTN_SWEEP_CAPTURE_CONFIG");
-    if(!path||!*path)return {};
+inline std::string config_from_file(const std::string& path) {
+    if(path.empty())return {};
     std::ifstream f(path,std::ios::binary|std::ios::ate);require(bool(f),"cannot open capture config");
     auto n=f.tellg();require(n>=0&&uint64_t(n)<=max_metadata,"capture config too large");
     std::string data(size_t(n),'\0');f.seekg(0);f.read(data.data(),data.size());require(bool(f),"short config read");return data;

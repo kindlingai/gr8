@@ -5,3 +5,8 @@
 #ifndef GR8_ATTN_SWEEP_CAPTURE
 #define GR8_ATTN_SWEEP_CAPTURE 0
 #endif
+// Empty = disabled even in a capture-capable build. Dedicated artifact only:
+// set to an absolute path writable/readable inside that deployment container.
+#ifndef GR8_ATTN_SWEEP_CAPTURE_CONFIG_PATH
+#define GR8_ATTN_SWEEP_CAPTURE_CONFIG_PATH ""
+#endif

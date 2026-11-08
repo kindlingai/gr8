@@ -20,7 +20,7 @@ extern "C" void ds41_sweep_capture_indices(int layer, int source, int ratio, int
     const ds41a::Cache* C, const ds41a::Scratch* S, int n, int heads, const int* topk, int ldtk,
     void* st, const int* dstart) {
     try {
-        static sweep_capture::Hook hook(sweep_capture::config_from_environment());
+        static sweep_capture::Hook hook(sweep_capture::config_from_file(GR8_ATTN_SWEEP_CAPTURE_CONFIG_PATH));
         if (!hook.enabled() || sweep_context.phase.empty()) return;
         // Capturing an engine graph would record stale/prelaunch values. Refuse.
         cudaStreamCaptureStatus status;

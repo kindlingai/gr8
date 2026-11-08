@@ -96,13 +96,15 @@ integrity checks, not independent proof of who supplied an artifact.
 Normal source has `capture_build.h` set to **0**. Every engine call site and
 implementation is preprocessor-guarded. An ordinary build has no capture symbols,
 GPU sync, allocation, environment read, or filesystem access from this feature.
-Even a capture-enabled build stays off unless `ATTN_SWEEP_CAPTURE_CONFIG` names
-a config file. Invalid explicit config/data fails loudly; it never drops back to
+Even a capture-enabled build stays off unless compile-time
+`GR8_ATTN_SWEEP_CAPTURE_CONFIG_PATH` names a config file (default empty). No raw
+environment reads bypass the engine knob registry. Invalid explicit config/data fails loudly; it never drops back to
 invented lists. CUDA graph capture is refused for a scoped capture dispatch.
 
 For a dedicated capture build, either pass `-DGR8_ATTN_SWEEP_CAPTURE=1` to all
 relevant TUs, or change the default in `capture_build.h` to 1 in a **separate
-recorded capture-only commit**. A fixed remote build wrapper may not forward
+recorded capture-only commit**. That dedicated commit must also set
+`GR8_ATTN_SWEEP_CAPTURE_CONFIG_PATH` to the absolute config path in the container. A fixed remote build wrapper may not forward
 local `EXTRA`; do not assume that setting it locally enabled the remote artifact.
 After build verify `nm -C <attention object>` contains
 `ds41_sweep_capture_indices`; the normal object must not.
@@ -128,8 +130,9 @@ python3 engine/attn/sweep/capture_plan.py \
   --output-dir /var/lib/m30/attn-capture \
   --engine-revision CAPTURE_BUILD_SHA \
   --knob-manifest ACTUAL_ENGINE_KNOBS.json > capture-plan.json
-# On the booked capture artifact only, propagated to the engine process:
-# ATTN_SWEEP_CAPTURE_CONFIG=/var/lib/m30/attn-capture/plan.json
+# In the separate capture-only source commit, not runtime environment:
+# define GR8_ATTN_SWEEP_CAPTURE 1
+# define GR8_ATTN_SWEEP_CAPTURE_CONFIG_PATH "/var/lib/m30/attn-capture/plan.json"
 ```
 
 The output directory must already exist and be writable by the engine UID.

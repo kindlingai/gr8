@@ -62,9 +62,13 @@ int main(int argc,char** argv) {
     auto sync=[&](){++syncs;};
     Input in;in.metadata=r.metadata;in.topk=r.topk.data();in.positions=r.positions.data();
     Context ctx{32768,24576,0,0,"7","prefill_v2"};
+    assert(config_from_file("").empty());
+    refuses([&]{config_from_file(dir+"/missing-plan.json");});
     Hook off;assert(!off.enabled()&&!off.capture(ctx,in,copy,sync)&&copies==0&&syncs==0);
     std::string config="{\"schema\":1,\"output_dir\":"+quote(dir)+",\"engine_revision\":\"test\",\"knob_manifest\":{\"x\":1},"
         "\"layers\":[8],\"chunk_positions\":[24576],\"prompt_lengths\":[32768],\"ranks\":[0],\"max_records\":1,\"max_bytes\":100000}";
+    {std::ofstream plan(dir+"/plan.json");plan<<config;}
+    assert(config_from_file(dir+"/plan.json")==config);
     Hook on(config);assert(on.enabled());
     auto skip=ctx;skip.rank=1;assert(!on.capture(skip,in,copy,sync)&&copies==0&&syncs==0);
     skip=ctx;skip.phase="";assert(!on.capture(skip,in,copy,sync)&&copies==0&&syncs==0);
