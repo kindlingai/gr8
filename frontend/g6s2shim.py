@@ -21,7 +21,8 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
                                                              frame's sequence_penalty scopes; all only when the head wrote
                                                              DIR/penalty.s2, boost and seq when that file names them)
         [sys <system_tokens>] [ins <after>:<unless or -1>:<id,id,...>]      (version 3: the generate frame's insert rule, never with lp)
-        [img <pos>:<vit_h>:<vit_w>:<key>:<rgb base64>] ...    (one per image, last; only when the head wrote DIR/vision.s2)
+        [img <pos>:<vit_h>:<vit_w>:<key>:<rgb base64>] ...    (one per image, last; only when the head wrote DIR/vision.s2,
+                                                             which names the model's image geometry: glm5v, else DS41's)
         <prompt id,id,...>
       <id> is the request ordinal: unique, strictly increasing in submit order (gaps are fine).
   shim -> rank 0 DIR/cmd.<k>           k = 0, 1, 2, ... with no gap, written the same way, one line:
@@ -77,9 +78,11 @@ READY_FIELDS = {'1': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows')
                 '3': ('epoch', 'ranks', 'pool_rows', 'mtp', 'guard', 'max_rows', 'max_lp')}
 INSERT_MAX = 64   # tokens one insert rule may hold (engine/runtime/insert_rule.h)
 PAGE = 64         # KV rows per page (engine/runtime/s2/scheduler.h); status.s2 counts pages
-# DS41 images (engine/runtime/ds41_vision_plan.h, PROTOCOL.md `images`)
+# images (engine/runtime/image_input.h, PROTOCOL.md `images`). DS41: engine/runtime/ds41_vision_plan.h
 IMAGE_TOKEN = 129264
 IMAGE_PATCH, IMAGE_DOWN, IMAGE_MAX_SPAN = 14, 3, 1024
+# GLM-5.3-Flash (vision.s2 says glm5v): engine/runtime/flash_vision_plan.h
+GLM5V_IMAGE_TOKEN, GLM5V_MERGE, GLM5V_MIN_TOKENS, GLM5V_MAX_TOKENS = 154854, 2, 16, 8000
 IMAGES_MAX = 16
 IMAGES_B64_MAX = 48 << 20
 
@@ -241,8 +244,19 @@ def _steering_header(f: dict, capability: dict | None):
     return f' steer {profile} {bits:08x}', None
 
 
-def image_span(vit_h: int, vit_w: int) -> int | None:
-    """The span of a patch grid, None when plan_image_grid cannot produce it (ds41v::grid_of)."""
+def glm5v_span(vit_h: int, vit_w: int) -> int | None:
+    """The span of a GLM-5.3-Flash patch grid, None when its processor cannot produce it (glm5v::span_of)."""
+    m = GLM5V_MERGE
+    if vit_h < m or vit_w < m or vit_h % m or vit_w % m:
+        return None
+    n = (vit_h // m) * (vit_w // m)
+    return n if GLM5V_MIN_TOKENS <= n <= GLM5V_MAX_TOKENS else None
+
+
+def image_span(vit_h: int, vit_w: int, model: str = 'ds41') -> int | None:
+    """The span of a patch grid, None when the model's processor cannot produce it (ds41v::grid_of, glm5v::span_of)."""
+    if model == 'glm5v':
+        return glm5v_span(vit_h, vit_w)
     lim = IMAGE_DOWN * IMAGE_MAX_SPAN
     if not (1 <= vit_h <= lim and 1 <= vit_w <= lim):
         return None
@@ -251,10 +265,20 @@ def image_span(vit_h: int, vit_w: int) -> int | None:
     return n if n <= IMAGE_MAX_SPAN else None
 
 
-def images_field(images, prompt) -> tuple[str, str | None]:
+def vision_model(path: str) -> str:
+    """The image geometry vision.s2 names: glm5v (GLM-5.3-Flash), else ds41 (its file holds 1)."""
+    try:
+        with open(path) as fh:
+            return 'glm5v' if fh.read().split() == ['glm5v'] else 'ds41'
+    except OSError:
+        return 'ds41'
+
+
+def images_field(images, prompt, model: str = 'ds41') -> tuple[str, str | None]:
     """The generate frame's `images` -> (the request line's img fields or '', error or None). Checks what
     g6s2::parse_request checks (a request it refuses ends the epoch): the grid, the span inside the prompt and made of the
-    image token, ascending spans, the pixel bytes' size."""
+    image token, ascending spans, the pixel bytes' size. model: the engine's image geometry (vision.s2)."""
+    token = GLM5V_IMAGE_TOKEN if model == 'glm5v' else IMAGE_TOKEN
     if images is None or images == []:
         return '', None
     if not isinstance(images, list) or len(images) > IMAGES_MAX:
@@ -266,13 +290,13 @@ def images_field(images, prompt) -> tuple[str, str | None]:
         pos, vh, vw, key, rgb = (im.get(k) for k in ('pos', 'vit_h', 'vit_w', 'key', 'rgb'))
         if not all(isinstance(v, int) and not isinstance(v, bool) for v in (pos, vh, vw)):
             return '', 'image pos/vit_h/vit_w must be integers'
-        span = image_span(vh, vw)
+        span = image_span(vh, vw, model)
         if span is None:
             return '', f'bad image grid {vh}x{vw}'
         if pos < end or pos + span > len(prompt):
             return '', 'image spans must ascend, not overlap and lie inside the prompt'
-        if any(t != IMAGE_TOKEN for t in prompt[pos:pos + span]):
-            return '', f'an image span must be {span} image tokens ({IMAGE_TOKEN})'
+        if any(t != token for t in prompt[pos:pos + span]):
+            return '', f'an image span must be {span} image tokens ({token})'
         if not isinstance(key, str) or not re.fullmatch(r'[0-9a-f]{16}', key):
             return '', 'image key must be 16 lowercase hex digits'
         if not isinstance(rgb, str) or len(rgb) % 4 or not re.fullmatch(r'[A-Za-z0-9+/]*={0,2}', rgb):
@@ -288,7 +312,7 @@ def images_field(images, prompt) -> tuple[str, str | None]:
     return ''.join(out), None
 
 
-def build_request(f: dict, ordinal: int, steering: dict | None = None):
+def build_request(f: dict, ordinal: int, steering: dict | None = None, image_model: str = 'ds41'):
     """-> (req.<id> bytes, error message or None). Validates what g6s2::parse_request / reserve_rows would reject."""
     prompt = f.get('prompt') or []
     mt = f.get('max_tokens')
@@ -386,7 +410,7 @@ def build_request(f: dict, ordinal: int, steering: dict | None = None):
     steer, err = _steering_header(f, steering)
     if err:
         return None, err
-    img, err = images_field(f.get('images'), prompt)
+    img, err = images_field(f.get('images'), prompt, image_model)
     if err:
         return None, err
     if img and ('plp' in lps or steer):
@@ -700,7 +724,7 @@ class Shim:
                     return
                 ordinal = self.next_id
                 self.next_id += 1
-                body, err = build_request(r.f, ordinal, self.cfg['steering'])
+                body, err = build_request(r.f, ordinal, self.cfg['steering'], self.cfg.get('vision_model') or 'ds41')
                 if err:
                     return self.finish(r, 'error', message=err)
                 errs = await self.write_all(f'req.{ordinal}', body)
@@ -872,8 +896,10 @@ class Shim:
                             raise ValueError('ready.s2 pool rows not divisible by --capacity-slots')
                         # g6m4 --grammar-dir: the head writes grammar.s2 before ready.s2
                         self.cfg['grammar'] = os.path.exists(f'{self.a.dir}/grammar.s2')
-                        # a DS41 engine with its vision tower loaded: the head writes vision.s2 before ready.s2
+                        # an engine with its vision tower loaded: the head writes vision.s2 before ready.s2, with the
+                        # model's image geometry (glm5v; DS41 writes 1)
                         self.cfg['vision'] = os.path.exists(f'{self.a.dir}/vision.s2')
+                        self.cfg['vision_model'] = vision_model(f'{self.a.dir}/vision.s2') if self.cfg['vision'] else None
                         # presence / frequency penalties (engine/runtime/penalty.h): the head writes penalty.s2 before
                         # ready.s2; one that names boost takes the think-end boost too
                         self.cfg['penalty'] = os.path.exists(f'{self.a.dir}/penalty.s2')
