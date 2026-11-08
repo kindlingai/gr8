@@ -9,7 +9,37 @@ box's local disk. [docker/.env.example](../docker/.env.example) has the GLM-5.3 
 
 ## One command: `./gr8 switch`
 
-<!-- This section describes ./gr8 switch once that command is merged. -->
+`./gr8 switch <model>` moves the boxes to one model: `glm53` (GLM-5.3), `glm53f` (GLM-5.3-Flash) or `ds41`
+(DeepSeek-V4.1-Flash). Run it on any machine that can reach the boxes over SSH (keys and `known_hosts` must already
+work without a prompt) and the new model's `/health` URL.
+
+1. It runs `docker compose down` for every other model on that model's boxes, all boxes at once. On one box, its
+   compose commands run one after another.
+2. It runs `docker compose up -d` for the new model on its boxes.
+3. It waits until the head's `/health` reports `"ready":true` (it polls every 0.1 s, for `TIMEOUT` seconds at most).
+
+It prints the time of each step: `down: <s>`, `up: <s>`, `health: ready in <s>` and `total: <s>`. The command changes
+no configuration on the boxes: set up each model's compose directory and its `.env` on its boxes first, with the
+settings below. Only one switch may run at a time. A failed step stops the command, names the box, and exits non-zero;
+nothing rolls back, so look at that box before you run the command again.
+
+The config is a file of `KEY=value` lines on the machine that runs the command. Copy
+[config/switch.env.example](../config/switch.env.example) to `switch.env` (the default) or pass `@FILE`:
+
+| Key | Value |
+|---|---|
+| `BOXES` | every box, as SSH targets (`user@host`), comma-separated |
+| `<MODEL>_BOXES` | that model's boxes in rank order, head first (`GLM53_BOXES`, `GLM53F_BOXES`, `DS41_BOXES`) |
+| `<MODEL>_DIR` | that model's compose directory, the same absolute path on each of its boxes |
+| `<MODEL>_HEALTH_URL` | that model's head `/health` URL |
+| `TIMEOUT` | seconds to wait for ready (default 900; `--timeout` overrides it) |
+| `SSH_TIMEOUT` | seconds for each SSH and compose step (default 300); more than the stop grace (`GR8_STOP_GRACE`) |
+
+```bash
+cp config/switch.env.example switch.env    # then set the boxes, directories and URLs
+./gr8 switch ds41                          # GLM-5.3 (or GLM-5.3-Flash) to DeepSeek
+./gr8 switch glm53 @/path/to/switch.env    # back to GLM-5.3, with another config file
+```
 
 ## The settings
 
