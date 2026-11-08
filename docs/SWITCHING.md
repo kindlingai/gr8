@@ -83,6 +83,31 @@ orchestration:
   The gen cache is keyed on the engine binary, so the first start after any image change also writes it. The warm
   numbers on this page are from the second start on.
 
+### Compact expert copies: `GR8_LOAD_COMPACT`
+
+The GLM-5.3 start is set by the slowest boxes reading their weights: at TP=4 each rank reads its experts as many small
+ranges spread through the release files, and the Gen4 boxes read them at about 1.3 GB/s. `prepare` with
+`GR8_LOAD_COMPACT=<dir>` writes each rank's expert ranges once into dense copies, and the loader then reads those
+instead. The bytes loaded are the same ([COMPACT-WEIGHTS.md](COMPACT-WEIGHTS.md)). The copies take about 70 GiB on
+each box, beside the release, which stays.
+
+Measured on 2026-11-07 on the same four boxes, GLM-5.3 at TP=4, two runs each way. Compact: a local build of gr8 at
+`a11ec5ee` (merged unchanged as `3269873`), copies written by `prepare` on every box, with `GR8_LOAD_MERGE_KB=1`
+also set. Stock: the image `sha-4ed9e7b`, earlier the same day. Both set `GR8_GEN_CACHE`. These are two recorded
+configurations, not an isolated compact-only A/B.
+
+| Switch into GLM-5.3 | Stock total | With compact copies, total |
+|---|---|---|
+| from GLM-5.3-Flash (TP=2) | 76.2 / 76.3 s | 47.2 / 47.2 s |
+| from DeepSeek-V4.1-Flash | 75.7 / 77.1 s | 46.8 / 47.2 s |
+
+- The loader's time per rank (one boot each): on the DGX Sparks 18.9 s stock, 9.6-10.2 s with the copies; on the Gen4
+  boxes 62.3-63.6 s stock, 23.5-30.8 s with the copies.
+- Output: 8 fixed prompts at temperature 0 (`max_tokens=512`), replayed once after the four compact runs, gave the
+  same text and total token counts as the stock image, 8 of 8.
+- The copies match the release, rank, TP size and layout they were prepared for. A new release or layout needs a new
+  `prepare` into a new directory.
+
 ## The GLM-5.3-Flash pair (TP=2)
 
 A two-box pair can also switch between GLM-5.3-Flash at TP=2
