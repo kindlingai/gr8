@@ -195,3 +195,66 @@ flock /tmp/attn-sweep-5090.lock python3 engine/attn/sweep/run.py \
 
 Allocation OOM after preflight (another process races the free-memory check)
 also exits 77 and is retried, including adapter fixture allocations.
+
+## Revision 2 hardening (supersedes the repeated-address v1 timing description)
+
+**Synthetic screening only.** No kernel table alone is a model keep/drop gate.
+Locality-sensitive ideas require real index correlation and a validated cache
+regime; 128K totals require same-request per-rank trace calibration. Capture of
+indices alone does not make Q/KV/sink captured operands. No blanket numeric
+"haircut" is inferred from one old pipe run; surrounding work/critical path and
+paired ring row/TTFT gates must be measured separately.
+
+The harness holds at least three independent output slots and `--pools M`
+input pools (default3;1 is allowed). `init` runs only at shape initialization,
+not per invocation. Before each correctness call and each timed pair-group,
+the adapter refreshes synthetic input values and snapshots immutable buffers.
+Every candidate invocation gets freshly poisoned output. Sampled TIMED calls
+are compared to a freshly computed reference on their current inputs. Negative
+controls live outside `variants/`, under `negative_controls/`; compute-once
+must produce timed mismatches, and off-stream launch must fail enqueue proof.
+
+Adapter revision2 adds:
+```cpp
+Params params_with_output(Fixture& inputs, Fixture& output_slot, bool reference);
+void refresh_inputs(Fixture&, uint64_t nonce, cudaStream_t);
+void snapshot_inputs(Fixture&, cudaStream_t);
+size_t check_integrity(Fixture&, cudaStream_t); // nonzero corruption count
+```
+Captured-index cases preserve captured indices; operand freshness remains
+synthetic unless separately captured operands are explicitly provided. Future
+full captured replay must rotate recorded input snapshots, not silently perturb
+them. Integrity errors are separate from output-byte mismatches.
+
+Each process times BOTH reference and candidate, alternating order. It emits
+paired per-repetition deltas and off/off null measurements (nominal ±3% band),
+plus raw candidate/reference samples. The driver separately estimates between-
+process paired uncertainty; a narrow within-process SD does not remove drift.
+Very short kernels can have larger null variation and are not individual speed
+claims. `--flush-mb N` adds explicitly labelled synthetic cache-displacement
+traffic OUTSIDE kernel timing; it does not claim to replay model predecessors.
+`--pools 4` rotates four independent pools; zero flush is not proof of a model
+cache state. Allocation/poison/refresh/check overhead is outside timed kernels.
+
+Launch checks capture the supplied nonblocking CUDA stream, inspect its kernel
+nodes, and require the reported main `kernel(p)` to appear. `cudaStreamQuery`
+is checked for valid success/not-ready states and both are counted: a completed
+short kernel can legitimately return success, so not-ready is not alone an
+enqueue proof. Candidate-private scratch remains the variant author's duty;
+its metadata must list scratch bytes and every pre-pass kernel's resources.
+
+### Explicit per-chunk setup / amortization
+
+Existing launch adapters keep per-call semantics (their pre-pass inside launch
+remains charged EVERY call). An explicitly amortized adapter defines
+`SWEEP_VARIANT_HAS_SETUP 1` and supplies:
+```cpp
+inline void setup_chunk(const sweep_adapter::Params& p, cudaStream_t stream);
+```
+`init` may allocate scratch but must not hide input-derived work. `setup_chunk`
+is timed once per group of `--amortize M` calls on unchanged input; its time is
+charged as setup/M in each call's mean. Every call still has a freshly poisoned,
+rotating output. Input refresh and a new setup occur between groups. A variant
+without this opt-in gets NO implicit amortization of its current launch. Report
+`has_chunk_setup`, M, and the proposed engine reuse unit; synthetic amortization
+is not proof that the model can reuse that state for M calls.
