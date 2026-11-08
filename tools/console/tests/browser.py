@@ -51,6 +51,10 @@ def run(output):
                     page.get_by_role("button", name=tab, exact=True).click()
                     if tab == "Knobs":
                         expect(page.get_by_label("REUSE", exact=True)).to_be_visible()
+                        if width == 390:
+                            table = page.locator("table.knobs").bounding_box()
+                            tag = page.locator("table.knobs tr.fastrow td").nth(2).bounding_box()
+                            assert abs(tag["x"] + tag["width"] - table["x"] - table["width"]) < 2, "hidden description column still consumes mobile width"
                     page.screenshot(path=str(output / f"{tab.lower()}-{width}.png"), full_page=True)
                     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), f"horizontal overflow: {tab}/{width}"
             print("PASS desktop 1366 + mobile 390: three tabs, screenshots, no horizontal overflow")

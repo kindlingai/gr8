@@ -84,6 +84,11 @@ dialog .row { display: flex; gap: 6px; justify-content: flex-end; margin-top: 8p
   header { gap: 6px; }
   td, th { padding-left: 6px; padding-right: 6px; }
   .knobs .input-col { width: 94px; } .knobs .label-col { width: calc(100% - 149px); } .knobs .tag-col { width: 55px; }
+  .knobs, .knobs tbody { display: block; }
+  .knobs colgroup { display: none; }
+  .knobs tr:not(.grp) { display: grid; grid-template-columns: 94px minmax(0, 1fr) 55px; }
+  .knobs td { height: auto; min-height: 22px; }
+  .knobs tr.grp, .knobs tr.grp td { display: block; }
   .search { width: 110px; }
   .model-name { max-width: 140px; overflow-wrap: anywhere; }
 }
