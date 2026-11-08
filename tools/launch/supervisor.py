@@ -893,7 +893,7 @@ class Supervisor:
                 ask_at += 30
             elif time.monotonic() - t0 > tmo + 600:
                 raise Stop(1, 'the head did not report serving')
-            time.sleep(1)
+            time.sleep(0.1 if r == 0 else 1)
         for line in relay.new() if relay else ():
             log(f'{time.monotonic() - t0:6.0f}s {line}')
         if r == 0:
