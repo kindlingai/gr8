@@ -3071,6 +3071,20 @@ int main(int argc, char** argv)
                 catch (const std::exception& e) { fprintf(stderr, "# rank %d: s2 stores: drain at quit failed: %s\n", R, e.what()); }
             }
             links.shutdown();
+            // GR8_QUIT_FAST=1: the stores hold what they keep (their index records are written as each copy commits), so
+            // the ranks meet at the end-of-run barrier here and the process ends. Without it the scope ends first: every
+            // CUDA graph is destroyed one by one (hundreds, each its own driver calls) before that barrier, and the
+            // slowest rank holds the others there. Process exit frees the device memory, the graphs and the context
+            if (knob::quit_fast())
+            {
+                fab.wait_proxy_idle();
+                fab.barrier();
+                fab.stop_proxy();
+                fprintf(stderr, "# rank %d: quit fast: past the barrier, exiting without the teardown\n", R);
+                fflush(stdout);
+                fflush(stderr);
+                _exit(0);
+            }
         }
         catch (const std::exception& e)
         {
