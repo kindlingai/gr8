@@ -81,6 +81,15 @@ int main(int argc,char** argv) {
     for(int i=0;i<4;++i)std::copy_n(r.topk.data()+i*512,512,padded.data()+i*520);
     in.topk=padded.data();assert(strided.capture(ctx,in,copy,sync));
     assert(load(dir+"/r0_q9_c24576_l8_prefill_v2.asw").topk==r.topk);
+    // Per-row session and position maps must not be normalized or sorted.
+    Hook mapped(config);ctx.request_id="10";in.metadata=r.metadata;
+    in.metadata.slot_count=3;in.metadata.session_form="per_row_slots";
+    std::vector<int32_t> mapping={2,1,2,1},positions={24579,1000,24576,1003};
+    auto lists=sweep_topk::make(positions,2,r.metadata.key_rows,"uniform",3);
+    in.topk=lists.data();in.positions=positions.data();in.sessions=mapping.data();
+    assert(mapped.capture(ctx,in,copy,sync));
+    auto got=load(dir+"/r0_q10_c24576_l8_prefill_v2.asw");
+    assert(got.sessions==mapping&&got.positions==positions&&got.topk==lists);
     std::cout<<"capture: SHA256 vectors, roundtrip, corruption, bounds, uniqueness, padding, slots, default-off, filters, budgets, exclusive-write, stride PASS\n";
 }
 '''
@@ -118,6 +127,10 @@ class CaptureTests(unittest.TestCase):
         cases=json.loads(subprocess.check_output([str(self.root/'tool'),'case',str(self.path)]))
         self.assertEqual(cases[0]['args'][-2:],['--capture',str(self.path)])
         self.assertFalse(cases[0]['decision_rows'])
+        mapped=self.root/'r0_q10_c24576_l8_prefill_v2.asw'
+        cases=json.loads(subprocess.check_output([str(self.root/'tool'),'case',str(mapped)]))
+        self.assertEqual(cases[0]['args'][:6],[4,24576,2,0,128,16386])
+
 
     def test_rehashed_invalid_metadata_and_indices(self):
         data=self.path.read_bytes();ml,pl=struct.unpack_from('<II',data,8)

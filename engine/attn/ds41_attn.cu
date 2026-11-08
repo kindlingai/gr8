@@ -8,6 +8,46 @@
 #include "ds41_sh_tc.cuh"   // the shared expert's tensor-core adapters (C entries ds41_sh_* below)
 #include "attn.h"
 
+#include "sweep/capture_build.h"
+#if defined(GR8_ATTN_SWEEP_CAPTURE) && GR8_ATTN_SWEEP_CAPTURE
+#include "sweep/capture_hook.h"
+static thread_local sweep_capture::Context sweep_context;
+extern "C" void ds41_sweep_capture_context(int prompt_tokens, int chunk_position, int slot, int rank,
+                                           unsigned long long request, const char* phase) {
+    sweep_context = {prompt_tokens, chunk_position, slot, rank, std::to_string(request), phase ? phase : ""};
+}
+extern "C" void ds41_sweep_capture_indices(int layer, int source, int ratio, int slots,
+    const ds41a::Cache* C, const ds41a::Scratch* S, int n, int heads, const int* topk, int ldtk,
+    void* st, const int* dstart) {
+    try {
+        static sweep_capture::Hook hook(sweep_capture::config_from_environment());
+        if (!hook.enabled() || sweep_context.phase.empty()) return;
+        // Capturing an engine graph would record stale/prelaunch values. Refuse.
+        cudaStreamCaptureStatus status;
+        if (cudaStreamIsCapturing((cudaStream_t)st, &status) != cudaSuccess || status != cudaStreamCaptureStatusNone)
+            throw std::runtime_error("attention index capture requires non-graph dispatch");
+        sweep_capture::Input in;
+        auto& m = in.metadata;
+        m.n=n; m.layer=layer; m.index_source=source; m.ratio=ratio; m.ring_rows=C->ring_rows;
+        m.ck_stride_bytes=ratio ? C->src_ss * (C->src_q ? 1 : 2) : 0;
+        const size_t rowbytes=C->src_q ? ds41a::CQ_ROW : ds41a::HD*2;
+        if (m.ck_stride_bytes % rowbytes) throw std::runtime_error("capture compressed stride not whole rows");
+        m.key_rows=int(m.ck_stride_bytes/rowbytes); m.slot_count=S->sess ? slots : 1;
+        m.heads=heads; m.wl=ds41a::WIN; m.floor=ds41a::g_win_floor; m.ldtk=ldtk;
+        m.session_form=S->sess ? "per_row_slots" : "implicit_single";
+        m.format=!ratio ? "window_only" : C->src_q ? "fp4_e2m1_e4m3_288" : "bf16_512";
+        in.topk=topk; in.positions=dstart; in.sessions=S->sess;
+        hook.capture(sweep_context,in,[&](void* dst,const void* src,size_t bytes) {
+            if (cudaMemcpyAsync(dst,src,bytes,cudaMemcpyDeviceToHost,(cudaStream_t)st)!=cudaSuccess)
+                throw std::runtime_error("attention capture D2H failed");
+        },[&]() { if(cudaStreamSynchronize((cudaStream_t)st)!=cudaSuccess)
+                throw std::runtime_error("attention capture sync failed"); });
+    } catch(const std::exception& e) {
+        fprintf(stderr,"attention capture failed: %s\n",e.what()); std::abort();
+    }
+}
+#endif
+
 extern "C" { void (*g6_attn_mark)(int stage, void* stream) = nullptr; }
 
 extern "C" {

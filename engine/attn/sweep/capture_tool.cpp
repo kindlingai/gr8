@@ -14,11 +14,11 @@ int main(int argc,char** argv) {
                 <<",\"adjacent_same_slot_overlap_fraction\":"<<r.metrics.adjacent_overlap_fraction
                 <<",\"adjacent_pairs\":"<<r.metrics.adjacent_pairs<<"}\n";
         } else {
-            sweep_capture::require(m.heads==16&&m.session_form=="implicit_single","current sweep adapter needs 16 heads and implicit single slot");
-            for(int row=0;row<m.n;++row)
-                sweep_capture::require(r.positions[row]==r.positions[0]+row,"current sweep adapter needs contiguous positions");
+            sweep_capture::require(m.heads==16,"current sweep adapter needs 16 heads");
+            sweep_capture::require(m.format=="fp4_e2m1_e4m3_288"||m.format=="window_only",
+                                   "current sweep adapter supports packed CQ or window-only captures");
             std::cout<<"[{\"id\":\"capture_"<<r.source_hash.substr(0,16)<<"\",\"args\":["
-                <<m.n<<","<<r.positions[0]<<","<<m.ratio<<","<<m.floor<<","<<m.wl<<","<<std::max(1,m.key_rows)
+                <<m.n<<","<<m.chunk_position<<","<<m.ratio<<","<<m.floor<<","<<m.wl<<","<<m.key_rows
                 <<",\"--capture\","<<sweep_capture::quote(argv[2])<<"],\"weights\":{\"32K\":0,\"128K\":0},"
                 <<"\"input_provenance\":\""<<(r.is_captured?"captured_indices_synthetic_operands":"synthetic_test")
                 <<"\",\"decision_rows\":false,\"source_hash\":"<<sweep_capture::quote(r.source_hash)<<"}]\n";

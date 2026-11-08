@@ -20,11 +20,17 @@
 #pragma once
 #if G6_MODEL_DS41
 #include "ds41_attn_types.h"
+#include "sweep/capture_build.h"
 #include "ds41_attn_plan.h"
 #include "ds41_attn_gv.cuh"   // the decode GEMV kernels live in THIS (rank) TU: densev.cuh is already here; ds41_attn.cu reaches them by hooks
 
 extern "C"
 {
+#if defined(GR8_ATTN_SWEEP_CAPTURE) && GR8_ATTN_SWEEP_CAPTURE
+void ds41_sweep_capture_context(int, int, int, int, unsigned long long, const char*);
+void ds41_sweep_capture_indices(int, int, int, int, const ds41a::Cache*, const ds41a::Scratch*,
+                                int, int, const int*, int, void*, const int*);
+#endif
 void ds41_attn_proj(const ds41a::Weights*, ds41a::Cache*, const ds41a::Scratch*, const void* y, int n, int start, int heads, void* st,
                     const int* dstart);
 void ds41_attn_proj_q(const ds41a::Weights*, ds41a::Cache*, const ds41a::Scratch*, const void* y,
@@ -479,9 +485,17 @@ inline int ds41_attn_op_core(void* model, int i, int rows, void* stream)
         if (comp && a->S.sess)
             comp_pf = a->C.src_q ? (const __nv_bfloat16*)((const uint8_t*)comp + (size_t)m.ds_pf_slot * a->C.src_ss)
                                  : comp + (size_t)m.ds_pf_slot * a->C.src_ss;
+#if defined(GR8_ATTN_SWEEP_CAPTURE) && GR8_ATTN_SWEEP_CAPTURE
+        ds41_sweep_capture_indices(a->l, a->ratio ? geom::index_source(a->l) : -1, a->ratio, m.ds_slots,
+                                   &C_pf, &S_pf, rows, a->heads, a->topk, a->ldtk, stream, m.pos);
+#endif
         ds41_attn_core(&a->W, &C_pf, comp_pf, &S_pf, rows, 0, a->heads, a->topk, a->ldtk, TK, stream, m.pos);
         return 0;
     }
+#if defined(GR8_ATTN_SWEEP_CAPTURE) && GR8_ATTN_SWEEP_CAPTURE
+    ds41_sweep_capture_indices(a->l, a->ratio ? geom::index_source(a->l) : -1, a->ratio, m.ds_slots,
+                               &a->C, &a->S, rows, a->heads, a->topk, a->ldtk, stream, m.pos);
+#endif
     ds41_attn_core(&a->W, &a->C, comp, &a->S, rows, 0, a->heads, a->topk, a->ldtk, TK, stream, m.pos);
     return 0;
 }

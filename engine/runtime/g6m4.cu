@@ -1786,6 +1786,10 @@ int main(int argc, char** argv)
                 Ds41SpanPass span_pass(R, (int)c.rows, st, 0);   // GR8_DS_SPAN: the chunk's ops, a mark each
                 const size_t range_a_end = skip_late ? split.b - 1 : split.b;
                 ds41::Stop stop;
+#if defined(GR8_ATTN_SWEEP_CAPTURE) && GR8_ATTN_SWEEP_CAPTURE
+                ds41_sweep_capture_context(c.prompt_rows, c.first, c.slot, R, c.request,
+                                           pf_v2 ? "prefill_v2" : "prefill_legacy");
+#endif
                 if (pf_v2) {
                     v2engine.v.widths.select(c.request,c.slot,R);
                     v2engine.moe.select_request(c.request,c.slot,R);
@@ -1798,9 +1802,15 @@ int main(int argc, char** argv)
                 } else stop = ds41_run_pass(split.ops, 0, range_a_end, &m, (int)c.rows, st, span_pass);
                 if (!stop.stopped && split.on() && !skip_late) {   // range B: the layers >= 21 over the chunk's last `late` rows (now rows 0 .. late-1)
                     ds41_attn_set_win_floor(ds41::br::win_floor((int)c.context, (int)c.rows, pf_tail));
+#if defined(GR8_ATTN_SWEEP_CAPTURE) && GR8_ATTN_SWEEP_CAPTURE
+                    ds41_sweep_capture_context(c.prompt_rows, c.first, c.slot, R, c.request, "late_replay");
+#endif
                     stop = ds41_run_pass(split.ops, split.b, split.ops.size(), &m, late, st, span_pass);
                     ds41_attn_set_win_floor(0);
                 }
+#if defined(GR8_ATTN_SWEEP_CAPTURE) && GR8_ATTN_SWEEP_CAPTURE
+                ds41_sweep_capture_context(0, 0, 0, 0, 0, nullptr);
+#endif
                 span_pass.close();
                 m.ds41_pf_late = 0;
                 m.ds_pf_slot = 0;
