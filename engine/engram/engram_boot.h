@@ -40,6 +40,7 @@ inline bool read_knobs(Knobs* k, std::string* err)
     k->store.cache_bytes = (size_t)knob::ds_engram_cache_mib() << 20;
     k->store.ways = (int)knob::ds_engram_ways();
     k->store.io_threads = (int)knob::ds_engram_io_threads();
+    k->store.io_uring = (int)knob::ds_engram_io_uring();
     k->verbose = knob::ds_engram_verbose();
     k->lookahead = knob::ds_engram_lookahead();
     k->col_shard = knob::ds_engram_col_shard();

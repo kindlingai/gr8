@@ -36,6 +36,15 @@ knobs:
     doc: >-
       Threads that read Engram table rows from NVMe. A decode step needs about 20 reads and a prefill chunk thousands;
       64 reads a prefill chunk fastest.
+  GR8_DS_ENGRAM_IO_URING:
+    scope: local
+    kind: int
+    default: "0"
+    values: "0..32768"
+    doc: >-
+      Queue depth for the raw io_uring Engram row reader on the calling fetch thread. 0 keeps the pread pool
+      unchanged; positive values use aligned block reads without pool workers. If ring setup is unavailable,
+      logs once and falls back to the pread pool sized by GR8_DS_ENGRAM_IO_THREADS.
   GR8_DS_ENGRAM_LOOKAHEAD:
     scope: local
     kind: flag
