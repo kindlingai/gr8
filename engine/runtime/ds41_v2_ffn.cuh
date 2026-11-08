@@ -8,6 +8,7 @@
 #include "../knobs-rs/gr8_knobs.h"
 #include "../kernels/ds_ro_cfg.h"
 #include <vector>
+#include <map>
 
 // Existing attention-TU shared-expert entries; no replacement GEMM/quantizer.
 extern "C" int ds41_gemm_mx_tc(const uint8_t*,int,const uint8_t*,int,const uint8_t*,const uint8_t*,void*,int,int,int,int,void*);
@@ -37,7 +38,16 @@ inline bool supported(const Layer& w) {
 }
 struct Scratch {
     int capacity = 0, own_capacity = 0, tiles = 0;
-    bool resident_fc2 = false;
+    bool resident_fc2 = false, gate_ro = false;
+    // One entry per scheduler slot, including prefix hits/interleaved chunks.
+    std::map<unsigned,uint64_t> gate_ro_seen;
+    void select_request(uint64_t request,unsigned slot,int rank,FILE* log=stderr) {
+        auto it=gate_ro_seen.find(slot);
+        if(it!=gate_ro_seen.end() && it->second==request)return;
+        gate_ro_seen[slot]=request;
+        std::fprintf(log,"# ds41_v2_gate_ro request=%llu on=%d rank=%d\n",
+            (unsigned long long)request,int(gate_ro),rank);
+    }
     int* order = nullptr;
     std::vector<void*> allocations;
     Plan* plan = nullptr;
@@ -65,6 +75,7 @@ template<class T> inline cudaError_t alloc(Scratch& q, T*& p, size_t n) {
 inline cudaError_t prepare(Scratch& q, int capacity) {
     if (capacity < 1 || capacity > MM || q.capacity || !q.allocations.empty()) return cudaErrorInvalidValue;
     q.resident_fc2 = knob::ds_pf_v2() && knob::ds_pf_v2_fc2();
+    q.gate_ro = knob::ds_pf_v2_gate_ro() && NE == dsr::NEXP;
     q.own_capacity = (capacity + 3) / 4;
     q.capacity = q.own_capacity * 4;
     q.tiles = dsr::pw_tile_bound(q.capacity * TK, NE);
@@ -83,6 +94,7 @@ inline cudaError_t prepare(Scratch& q, int capacity) {
     cudaError_t e=cudaFuncSetAttribute(mxtc::k_fc1_tc<H,I,DS41_TC_CW,DS41_TC_NTG1,DS41_TC_ST1,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,S1);
     if(e==cudaSuccess)e=cudaFuncSetAttribute(mxtc::k_fc2_tc<I,H,DS41_TC_W2,DS41_TC_WT,DS41_TC_TPC,DS41_TC_ST2,COLUMN_GROUPS>,cudaFuncAttributeMaxDynamicSharedMemorySize,S2);
     if(e==cudaSuccess && q.resident_fc2)e=cudaFuncSetAttribute(ds41v2moe::k_fc2_resident<I,H>,cudaFuncAttributeMaxDynamicSharedMemorySize,ds41v2moe::resident_smem<4,8,I>());
+    if(e==cudaSuccess && q.gate_ro)e=cudaFuncSetAttribute(dsr::k_gate_logits_ro<NE>,cudaFuncAttributeMaxDynamicSharedMemorySize,dsr::GRO_SMEM);
     if(e!=cudaSuccess)release(q);
     return e;
 }
@@ -92,7 +104,12 @@ inline cudaError_t router_own(const Geometry& g, const Layer& w, Scratch& q,
     if (!supported(w) || g.M<1 || g.M>q.capacity || g.Q>q.own_capacity || kc<1 || kc>TK || (vflag&&!w.bias_vl)) return cudaErrorInvalidValue;
     cudaError_t e;
     if (g.owned) {
-        dsr::k_gate_logits_mt<NE,0><<<NE/8,256,0,st>>>(w.gate,y,g.owned,q.logits);
+        // RO has no ROMAX-sized storage: it loops over 8-token tiles. The
+        // existing capacity guard bounds owned rows (<=2048 at MAX_ROWS=8192).
+        if (q.gate_ro && NE == dsr::NEXP)
+            dsr::k_gate_logits_ro<NE><<<NE/8,256,dsr::GRO_SMEM,st>>>(w.gate,y,g.owned,q.logits);
+        else
+            dsr::k_gate_logits_mt<NE,0><<<NE/8,256,0,st>>>(w.gate,y,g.owned,q.logits);
         if((e=cudaGetLastError())!=cudaSuccess)return e;
         if((e=cudaMemsetAsync(q.masks,0,NE*(MM/32)*sizeof(unsigned),st))!=cudaSuccess)return e;
 #define DS41_V2_ROUTE(K) case K: dsr::k_route_ro<NE,TK,MM,K><<<(g.owned+7)/8,256,0,st>>>(q.logits,w.bias,g.owned,q.plan,q.masks,w.bias_vl,vflag); break

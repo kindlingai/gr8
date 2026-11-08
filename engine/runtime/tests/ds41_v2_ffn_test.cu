@@ -9,6 +9,7 @@
 #include <cmath>
 #include <vector>
 #include <memory>
+#include <cstring>
 #include "../ds41_v2_ffn.cuh"
 #define CK(x) do { auto e=(x); if(e!=cudaSuccess){fprintf(stderr,"%s:%d %s: %s\n",__FILE__,__LINE__,#x,cudaGetErrorString(e));exit(2);} } while(0)
 #define CHECK(x) do { if(!(x)){fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x);exit(1);} } while(0)
@@ -20,11 +21,58 @@ template<class T> struct Dev {
 };
 uint32_t hash(uint32_t x){x^=x>>16;x*=0x7feb352d;x^=x>>15;x*=0x846ca68b;return x^(x>>16);}
 void mx4fill(Dev<uint8_t>& d){std::vector<uint8_t> v(d.n);for(size_t j=0;j<v.size();++j){uint32_t h=hash(j);v[j]=j%mx4::GR<512?uint8_t((h&0x33)|((h>>6)&0x88)):uint8_t(116+h%4);}d.put(v.data());}
-int main(){
+// Exact gate comparison, independent of routing/FFN tolerances below. Run
+// --gate-only to avoid allocating expert scratch on a shared test GPU.
+void gate_equal() {
+    constexpr int H=f::H, NE=f::NE, GUARD=32;
+    CK(cudaFuncSetAttribute(dsr::k_gate_logits_ro<NE>,cudaFuncAttributeMaxDynamicSharedMemorySize,dsr::GRO_SMEM));
+    Dev<__nv_bfloat16> gate(NE*H);
+    std::vector<__nv_bfloat16> hg(gate.n);
+    for(size_t j=0;j<hg.size();++j)hg[j]=__float2bfloat16(std::ldexp(float(int(hash(j)%511)-255),-10+int(hash(j+7)%5)));
+    gate.put(hg.data());
+    for(int M:{1,7,8,9,2047,2048,2049,4096,8192}) {
+        Dev<__nv_bfloat16> x(size_t(M)*H);
+        std::vector<__nv_bfloat16> hx(x.n);
+        for(size_t j=0;j<hx.size();++j)hx[j]=__float2bfloat16(std::ldexp(float(int(hash(j+31)%511)-255),-8+int(hash(j+53)%5)));
+        x.put(hx.data());
+        Dev<float> mt(size_t(M)*NE+2*GUARD),ro(mt.n);
+        CK(cudaMemset(mt.p,0xa5,mt.n*sizeof(float)));
+        CK(cudaMemset(ro.p,0xa5,ro.n*sizeof(float)));
+        dsr::k_gate_logits_mt<NE,0><<<NE/8,256>>>(gate.p,x.p,M,mt.p+GUARD); CK(cudaGetLastError());
+        dsr::k_gate_logits_ro<NE><<<NE/8,256,dsr::GRO_SMEM>>>(gate.p,x.p,M,ro.p+GUARD); CK(cudaGetLastError());
+        CK(cudaDeviceSynchronize());
+        auto a=mt.get(),b=ro.get();
+        CHECK(std::memcmp(a.data(),b.data(),a.size()*sizeof(float))==0);
+        std::vector<unsigned char> sentinel(GUARD*sizeof(float),0xa5);
+        CHECK(std::memcmp(a.data(),sentinel.data(),sentinel.size())==0);
+        CHECK(std::memcmp(a.data()+GUARD+size_t(M)*NE,sentinel.data(),sentinel.size())==0);
+        for(size_t j=GUARD;j<GUARD+size_t(M)*NE;++j)CHECK(std::isfinite(a[j]));
+        printf("PASS gate M=%d NE=%d logits BYTE-EQUAL (memcmp), guards intact\n",M,NE);
+    }
+    puts("DS41_V2_GATE_RO_PASS");
+}
+void gate_log_test() {
+    f::Scratch q;
+    FILE* log=std::tmpfile(); CHECK(log);
+    q.select_request(7,0,2,log); q.select_request(7,0,2,log);
+    q.select_request(9,1,2,log); q.select_request(7,0,2,log);
+    q.gate_ro=true; q.select_request(10,0,2,log);
+    CHECK(q.gate_ro_seen.size()==2);
+    std::rewind(log); char text[512]={}; CHECK(std::fread(text,1,sizeof(text)-1,log)>0);
+    CHECK(std::strcmp(text,"# ds41_v2_gate_ro request=7 on=0 rank=2\n"
+        "# ds41_v2_gate_ro request=9 on=0 rank=2\n"
+        "# ds41_v2_gate_ro request=10 on=1 rank=2\n")==0);
+    std::fclose(log); puts("PASS gate logging: off/on, repeated/interleaved chunks, slot reuse");
+}
+int main(int argc,char** argv){
+    gate_log_test();
+    gate_equal();
+    if(argc==2 && std::strcmp(argv[1],"--gate-only")==0)return 0;
     constexpr int H=f::H, I=f::I, NE=f::NE, TK=f::TK, MM=f::MM, E=32, CAP=97;
     f::Scratch q;CK(f::prepare(q,CAP));
     printf("FFN resident_fc2=%d (V2=%d FC2=%d)\n",int(q.resident_fc2),int(knob::ds_pf_v2()),int(knob::ds_pf_v2_fc2()));
     CHECK(q.resident_fc2==(knob::ds_pf_v2()&&knob::ds_pf_v2_fc2()));
+    CHECK(q.gate_ro==knob::ds_pf_v2_gate_ro());
     Dev<__nv_bfloat16> gate(NE*H),x(CAP*H),out(CAP*H);
     Dev<float> bias(NE),vl(NE);Dev<uint8_t> flags(CAP);
     std::vector<__nv_bfloat16> hg(gate.n),hx(x.n);std::vector<float> hb(NE),hv(NE);
