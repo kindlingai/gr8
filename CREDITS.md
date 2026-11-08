@@ -11,6 +11,7 @@ KindlingAI is:
     ([#327](https://github.com/kindlingai/gr8/pull/327)-[#333](https://github.com/kindlingai/gr8/pull/333),
     [#335](https://github.com/kindlingai/gr8/pull/335)-[#338](https://github.com/kindlingai/gr8/pull/338)),
     and this boot guide.
+  - Control agreement bool-ABI regression fix and exhaustive ACK-subset coverage.
 - [@coffee-the-dev](https://github.com/coffee-the-dev)
 - [@mmastrac](https://github.com/mmastrac)
 
