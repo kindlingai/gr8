@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "engram/engram_dev.cuh"
+#include "test_col_shard_gpu.cuh"
 using namespace ds41::engram;
 
 static int fails = 0;
@@ -267,6 +268,7 @@ static float rnd_bf16_val(std::mt19937& rng, float scale)
 
 int main(int argc, char** argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--col-shard") == 0) return col_shard_test::run();
     if (argc != 4 && argc != 5) { printf("usage: %s PREFIX.engram.cmap vectors.bin scratchdir [rank 0..15, default 1]\n", argv[0]); return 2; }
     cmap_path = argv[1]; vec_path = argv[2]; dir = argv[3];
     if (argc == 5) kRank = atoi(argv[4]);
@@ -398,7 +400,8 @@ int main(int argc, char** argv)
     {
         Config c;
         c.prefix = prefix; c.rank = kRank; c.nr = kNR; c.max_rows = kMaxRows;
-        c.knobs.on = true; c.knobs.store.cache_bytes = 64ull << 20; c.knobs.store.ways = 16; c.knobs.store.io_threads = 16; c.knobs.verbose = false;
+        c.knobs.on = true; c.knobs.col_shard = false; // These fixtures use legacy contiguous sidecars.
+        c.knobs.store.io_uring = 0; c.knobs.store.cache_bytes = 64ull << 20; c.knobs.store.ways = 16; c.knobs.store.io_threads = 16; c.knobs.verbose = false;
         for (int e = 0; e < kNE; ++e) { c.q_w[e] = q_d + e * kStreams * kHid; c.k_w[e] = k_d + e * kStreams * kHid; }
         c.hooks.reduce = &hook_reduce; c.hooks.project = &hook_project;
         const auto t0 = std::chrono::steady_clock::now();
@@ -619,7 +622,8 @@ int main(int argc, char** argv)
         {
             Config c;
             c.prefix = prefix; c.rank = kRank; c.nr = kNR; c.max_rows = WMAX;
-            c.knobs.on = true; c.knobs.store.cache_bytes = 64ull << 20; c.knobs.store.ways = 16; c.knobs.store.io_threads = 16; c.knobs.verbose = false;
+            c.knobs.on = true; c.knobs.col_shard = false; // These fixtures use legacy contiguous sidecars.
+            c.knobs.store.io_uring = 0; c.knobs.store.cache_bytes = 64ull << 20; c.knobs.store.ways = 16; c.knobs.store.io_threads = 16; c.knobs.verbose = false;
             for (int e = 0; e < kNE; ++e) { c.q_w[e] = q_d + e * kStreams * kHid; c.k_w[e] = k_d + e * kStreams * kHid; }
             c.hooks.reduce = &hook_reduce; c.hooks.project = &hook_project_cheap;   // no wkv tensors: the hook runs (the tensor-core GEMM is not used here)
             if (!engw.init(c, &err)) { printf("FAIL init (W-row engine, max_rows %d): %s\n", WMAX, err.c_str()); return 1; }
@@ -804,7 +808,8 @@ int main(int argc, char** argv)
         {
             Config c;
             c.prefix = prefix; c.rank = kRank; c.nr = kNR; c.max_rows = WMAX;
-            c.knobs.on = true; c.knobs.store.cache_bytes = 64ull << 20; c.knobs.store.ways = 16; c.knobs.store.io_threads = 16; c.knobs.verbose = false;
+            c.knobs.on = true; c.knobs.col_shard = false; // These fixtures use legacy contiguous sidecars.
+            c.knobs.store.io_uring = 0; c.knobs.store.cache_bytes = 64ull << 20; c.knobs.store.ways = 16; c.knobs.store.io_threads = 16; c.knobs.verbose = false;
             for (int e = 0; e < kNE; ++e) { c.q_w[e] = q_d + e * kStreams * kHid; c.k_w[e] = k_d + e * kStreams * kHid; c.wkv_codes[e] = pc[e]; c.wkv_scales[e] = ps[e]; }
             c.hooks.reduce = &hook_reduce; c.hooks.project = &hook_project_cheap;   // must not run for these chunks (rows > 32, tensor cores wired)
             if (!engt.init(c, &err)) { printf("FAIL init (7d engine): %s\n", err.c_str()); return 1; }

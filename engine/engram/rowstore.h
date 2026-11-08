@@ -2,6 +2,7 @@
 // O_DIRECT behind a set-associative row cache. Contract: docs/DEEPSEEK-ENGRAM.md section 3 step 2 and section 4.
 //
 //   file      PREFIX.engram.L###.w8, u8 [part][256], rank r serves global rows [first, first+valid), file row = id - first.
+//   columns   opt-in: ids stay global, files carry disjoint column runs; foreign check uses the same ColShard as device dequant.
 //   request   O_DIRECT needs an aligned offset, length and buffer. The store asks statx for the file's dio_offset_align / dio_mem_align,
 //             reads the aligned block (default 4096 B = 16 rows) that holds the row and copies the 256 B out of it. A row never
 //             straddles a block. Rows of one fetch that share a block share one read; the same row asked twice is read once.
@@ -10,7 +11,8 @@
 //             chunk thousands, and the pool is sized for the latter.
 //   fetch     one call per (table, step or chunk): ids[n] -> dst[n][256]. Rows this rank does not own are skipped (dst untouched, the
 //             caller zeroes or ignores them). dst may be null: the call then only warms the cache (prefetch).
-// A fetch is serialized by a mutex; the reads of one fetch run in parallel on the pool.
+// A fetch is serialized by a mutex; reads run on the pool, or one raw io_uring driven by the fetch thread.
+// The serialized lane owns the ring, shared by exact fetch and cache warm; no extra I/O threads.
 #pragma once
 #include <algorithm>
 #include <atomic>
@@ -33,6 +35,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "hash.h"
+#include "col_shard.h"
+#include "uring_reader.h"
 
 namespace ds41 { namespace engram {
 
@@ -49,7 +53,8 @@ struct TableFile
     std::string path;       // a file of rows [first, first + valid) from byte 0, when `runs` is empty
     int64_t first = 0;      // first global row this rank serves
     int64_t valid = 0;      // rows it serves (the file may hold more: pad rows up to `part`)
-    std::vector<TableRun> runs;   // the rows in several files (ascending, consecutive from `first`)
+    std::vector<TableRun> runs;   // ascending, consecutive within each owned range
+    ColShard columns{};            // disabled: contiguous; enabled: only these column ranges
 };
 
 struct StoreOpts
@@ -57,6 +62,7 @@ struct StoreOpts
     size_t cache_bytes = 4ull << 30;   // GR8_DS_ENGRAM_CACHE_MIB
     int ways = 16;                     // GR8_DS_ENGRAM_WAYS, 1..16
     int io_threads = 32;               // GR8_DS_ENGRAM_IO_THREADS (64 is fastest for prefill)
+    int io_uring = 128;                  // GR8_DS_ENGRAM_IO_URING: 0 = pread pool; positive = queue depth
     size_t block = 4096;               // smallest read; raised to the file's dio_offset_align if that is larger
     bool direct = true;                // false: buffered pread (tmpfs, or a filesystem that refuses O_DIRECT)
 };
@@ -216,6 +222,7 @@ class RowStore
 public:
     ~RowStore()
     {
+        uring_.reset();
         pool_.reset();   // join the workers before the descriptors go
         for (auto& t : tab_) for (auto& r : t.runs) if (r.fd >= 0) close(r.fd);
     }
@@ -230,13 +237,14 @@ public:
             Tab t;
             t.first = f.first;
             t.valid = f.valid;
-            if (f.first < 0 || f.valid < 0 || f.first + f.valid >= (1ll << 30) - 1) { *err = f.path + ": row range outside the 30-bit tag space"; return false; }
+            t.columns = f.columns;
+            if (f.first < 0 || f.valid < 0 || (f.columns.enabled ? f.columns.rows != f.valid : f.first + f.valid >= (1ll << 30) - 1)) { *err = f.path + ": row range outside the 30-bit tag space"; return false; }
             std::vector<TableRun> runs = f.runs;
-            if (runs.empty()) runs.push_back({f.path, f.first, f.valid, 0});
-            int64_t next = f.first;
+            if (runs.empty() && !f.columns.enabled) runs.push_back({f.path, f.first, f.valid, 0});
+            int64_t next = f.columns.enabled ? 0 : f.first;
             for (const TableRun& tr : runs)
             {
-                if (tr.row0 != next || tr.rows < 0) { *err = tr.path + ": runs are not consecutive from the first row"; return false; }
+                if (f.columns.enabled ? !f.columns.run(tr.row0, tr.rows, next) : (tr.row0 != next || tr.rows < 0)) { *err = tr.path + ": runs are not consecutive from the first row"; return false; }
                 next += tr.rows;
                 Run r;
                 r.row0 = tr.row0; r.rows = tr.rows; r.off = tr.off;
@@ -265,7 +273,7 @@ public:
                 }
                 t.runs.push_back(r);
             }
-            if (next != f.first + f.valid) { *err = f.path + ": runs do not cover the valid rows"; return false; }
+            if (next != (f.columns.enabled ? f.valid : f.first + f.valid)) { *err = f.path + ": runs do not cover the valid rows"; return false; }
             tab_.push_back(t);
         }
         size_t b = 256;
@@ -273,11 +281,33 @@ public:
         block_ = b;
         align = std::max(align, block_);
         if (!cache_.init(o.cache_bytes, o.ways, err)) return false;
-        pool_.reset(new IoPool());
-        pool_->start(std::max(1, o.io_threads), block_, align);
+        if (o.io_uring > 0)
+        {
+            uring_.reset(new UringReader());
+            const int e = uring_->start((unsigned)o.io_uring, block_, align);
+            if (e)
+            {
+                uring_.reset();
+                static std::once_flag unavailable;
+                std::call_once(unavailable, [e] {
+                    fprintf(stderr, "# ds41 engram io_uring unavailable errno=%d, using pread pool\n", e);
+                });
+            }
+        }
+        if (!uring_)
+        {
+            pool_.reset(new IoPool());
+            pool_->start(std::max(1, o.io_threads), block_, align);
+        }
+        static std::once_flag reader;
+        std::call_once(reader, [&] {
+            if (uring_) fprintf(stderr, "# ds41 engram reader=uring qd=%d\n", o.io_uring);
+            else fprintf(stderr, "# ds41 engram reader=pread threads=%d\n", std::max(1, o.io_threads));
+        });
         return true;
     }
 
+    bool using_uring() const { return bool(uring_); }
     size_t block() const { return block_; }
     bool direct(int table) const { return tab_[table].direct; }
     const RowCache& cache() const { return cache_; }
@@ -298,7 +328,7 @@ public:
         for (size_t i = 0; i < n; ++i)
         {
             const int64_t id = ids[i];
-            if (id < T.first || id >= T.first + T.valid) { ++st.foreign; continue; }
+            if (T.columns.enabled ? T.columns.at((uint32_t)id) < 0 : (id < T.first || id >= T.first + T.valid)) { ++st.foreign; continue; }
             const uint8_t* row = cache_.find(row_tag(table, (uint32_t)id));
             if (row)
             {
@@ -328,7 +358,7 @@ public:
             int ri = 0;
             for (size_t u = 0; u < nu; ++u)
             {
-                while (uid[u] >= T.runs[ri].row0 + T.runs[ri].rows) ++ri;   // ids ascend; every id is in [first, first + valid)
+                while (uid[u] >= T.runs[ri].row0 + T.runs[ri].rows) ++ri;   // ids ascend; foreign check admitted only rows in the validated runs
                 const Run& R = T.runs[ri];
                 uoff[u] = R.off + (uint64_t)(uid[u] - R.row0) * kRowBytes;
                 const uint64_t blk = uoff[u] & ~(uint64_t)(block_ - 1);
@@ -339,7 +369,25 @@ public:
             std::atomic<int> err{0};
             std::atomic<uint64_t> bytes{0};
             const size_t blk_sz = block_;
-            pool_->run((int)tasks.size(), [&](int ti, uint8_t* buf)
+            if (uring_)
+            {
+                const int rc = uring_->run(tasks.size(), [&](size_t ti, io_uring_sqe& e) {
+                    e.fd = T.runs[tasks[ti].run].fd;
+                    e.off = tasks[ti].off;
+                }, [&](size_t ti, const uint8_t* buf, int r) {
+                    const Task& k = tasks[ti];
+                    if (r < 0) { int z = 0; err.compare_exchange_strong(z, -r); return; }
+                    bytes += (uint64_t)r;
+                    for (uint32_t u = k.u0; u < k.u1; ++u)
+                    {
+                        const uint64_t in = uoff[u] - k.off;
+                        if ((uint64_t)r < in + kRowBytes) { int z = 0; err.compare_exchange_strong(z, EIO); return; }
+                        memcpy(&urow[(size_t)u * kRowBytes], buf + in, kRowBytes);
+                    }
+                });
+                if (rc) { int z = 0; err.compare_exchange_strong(z, rc); }
+            }
+            else pool_->run((int)tasks.size(), [&](int ti, uint8_t* buf)
             {
                 const Task& k = tasks[ti];
                 ssize_t r;
@@ -394,6 +442,7 @@ private:
     {
         std::vector<Run> runs;
         int64_t first = 0, valid = 0;
+        ColShard columns{};
         bool direct = true;
     };
     StoreOpts opts_;
@@ -401,6 +450,7 @@ private:
     std::vector<Tab> tab_;
     RowCache cache_;
     std::unique_ptr<IoPool> pool_;
+    std::unique_ptr<UringReader> uring_;
     std::mutex mu_;
     FetchStats total_;
     uint64_t nfetch_ = 0;
