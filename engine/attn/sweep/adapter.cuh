@@ -1,6 +1,7 @@
 #pragma once
 #include "fixtures.cuh"
 #include "capture_io.h"
+#include "scratch_guard.cuh"
 #define SWEEP_ADAPTER_HAS_METADATA 1
 #include <stdexcept>
 #include <memory>
@@ -170,7 +171,7 @@ inline void refresh_inputs(Fixture& f, uint64_t nonce, cudaStream_t st) {
     CK(cudaGetLastError());
 }
 inline void snapshot_inputs(Fixture& f, cudaStream_t st) { f.memory->snapshot(st); }
-inline size_t check_integrity(Fixture& f, cudaStream_t st) { return f.memory->check(st); }
+inline size_t check_integrity(Fixture& f, cudaStream_t st) { return f.memory->check(st)+sweep_memory::check_private_scratch(st); }
 inline const sweep_memory::Integrity& integrity_counts(const Fixture& f) { return f.memory->last; }
 inline std::string metadata_json(const Fixture& f) {
     const auto& s=f.geometry;
@@ -181,6 +182,7 @@ inline std::string metadata_json(const Fixture& f) {
      <<",\"topk_pattern\":"<<sweep_capture::quote(s.pattern)<<",\"within_row_unique_fraction\":"<<f.metrics.within_row_unique_fraction
      <<",\"adjacent_overlap_fraction\":"<<f.metrics.adjacent_overlap_fraction
      <<",\"capture_sha256\":"<<sweep_capture::quote(s.record?s.record->source_hash:"")
+     <<",\"private_scratch_guarded_device_bytes\":"<<sweep_memory::private_scratch().device_bytes()
      <<",\"operands\":\"synthetic_fp8_valued_window_bf16_q_fp4_keys\",\"bf16_shadow_allocated\":"<<(s.shadow?"true":"false")<<",\"decision_rows\":false}";
     return o.str();
 }

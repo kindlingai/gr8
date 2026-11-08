@@ -1,3 +1,5 @@
+#include "../../scratch_guard.cuh"
+#define SWEEP_VARIANT_HAS_SETUP 1
 // One timed global widening pass; every attention CTA then loads BF16 keys.
 // All arithmetic helpers and the attention kernel are our original ds41a code.
 namespace sweep_variant {
@@ -24,7 +26,7 @@ __global__ void k_prewiden_keys(const uint8_t* packed, bf16* wide, size_t rows) 
 
 struct Scratch {
     bf16* data = nullptr;
-    ~Scratch() { if (data) cudaFree(data); }
+    ~Scratch() { if (data) sweep_memory::scratch_free(data); }
 };
 inline Scratch scratch;
 
@@ -51,23 +53,23 @@ inline const char* ptxas_key(const ds41a::AttnP& p) {
 inline size_t dynamic_smem(const ds41a::AttnP&) { return ds41a::AT_SMEM_CPA; }
 inline cudaError_t init(const ds41a::AttnP& p) {
     if (scratch.data) {
-        const cudaError_t e = cudaFree(scratch.data);
+        const cudaError_t e = sweep_memory::scratch_free(scratch.data);
         if (e != cudaSuccess) return e;
         scratch.data = nullptr;
     }
     cudaError_t e = cudaFuncSetAttribute(kernel(p), cudaFuncAttributeMaxDynamicSharedMemorySize, dynamic_smem(p));
     if (e != cudaSuccess) return e;
-    if (supported(p)) return cudaMalloc(reinterpret_cast<void**>(&scratch.data), scratch_bytes(p));
+    if (supported(p)) return sweep_memory::scratch_alloc(reinterpret_cast<void**>(&scratch.data), scratch_bytes(p));
     return cudaSuccess;
 }
 inline void prepass(const ds41a::AttnP& p, cudaStream_t stream) {
     k_prewiden_keys<<<(key_rows(p) + 7) / 8,256,0,stream>>>(
         reinterpret_cast<const uint8_t*>(p.ck), scratch.data, key_rows(p));
 }
+inline void setup_chunk(const ds41a::AttnP& p, cudaStream_t stream) { if(supported(p))prepass(p,stream); }
 inline void launch(const ds41a::AttnP& p, cudaStream_t stream) {
     const dim3 grid(p.n, p.heads / 16);
     if (supported(p)) {
-        prepass(p, stream);
         auto q = p;
         q.ck = scratch.data;
         q.ckq = 0;

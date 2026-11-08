@@ -50,6 +50,9 @@ class MemoryGuardTests(unittest.TestCase):
     def test_adapter_scratch_overrun_must_fail(self):
         self.negative("scratch-overrun", "name=integrity_hash_scratch side=trailing")
 
+    def test_private_scratch_overrun_must_fail(self):
+        self.negative("private-scratch-overrun", "name=variant_private_scratch side=trailing")
+
     def test_unsnapshotted_check_must_fail(self):
         self.negative("missing-snapshot", "INTEGRITY missing input snapshot")
 

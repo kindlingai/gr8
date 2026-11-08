@@ -299,3 +299,14 @@ captured-test row order and per-row sessions, MAIN/legacy fallback, local-index
 stress, guards and refusal of mismatched capture geometry. The test acquires
 the campaign GPU lock itself. It does not run a served engine or collect real
 model data.
+
+Variant GPU scratch must use `sweep_memory::scratch_alloc(void**, bytes)` and
+`sweep_memory::scratch_free(void*)` from `scratch_guard.cuh` rather than raw
+cudaMalloc/cudaFree, so leading/trailing guard checks include it. Scratch is
+mutable, not immutable-hashed. Reported `private_scratch_guarded_device_bytes`
+includes guards. Allocation OOM still exits77 for retry; candidate-specific
+scratch is allocated at init after fixture preflight. Direct unregistered
+allocation is outside the interface and is not silently claimed guarded.
+The imported prewiden is migrated to this API and explicit `setup_chunk`;
+`--amortize 1` charges a pre-pass every call, M>1 prices one pre-pass per M-call
+group. This is a synthetic reuse experiment until the engine reuse unit is proved.

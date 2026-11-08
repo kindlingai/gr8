@@ -35,7 +35,12 @@ static int negative(const std::string& mode, cudaStream_t st) {
     off_pair(f,f,st);
     require(sweep_adapter::check_integrity(f,st)==0,"negative control baseline not clean");
     auto& allocations=f.memory->allocations;
-    if (mode=="missing-snapshot") f.memory->invalidate_snapshot();
+    void* private_buffer=nullptr;
+    if(mode=="private-scratch-overrun") {
+        CK(sweep_memory::scratch_alloc(&private_buffer,64));
+        flip(static_cast<unsigned char*>(private_buffer)+64,st);
+    }
+    else if (mode=="missing-snapshot") f.memory->invalidate_snapshot();
     else {
         const std::string name=mode=="mutate-input" ? "q" : mode=="scratch-overrun" ? "integrity_hash_scratch" : "candidate_output";
         for (auto& a:allocations) if (a.name==name) {
@@ -47,6 +52,7 @@ static int negative(const std::string& mode, cudaStream_t st) {
     const auto counts=sweep_adapter::integrity_counts(f);
     printf("mode=%s output_status=EXACT status=%s corruption_count=%zu guard_bytes=%zu immutable_chunks=%zu missing_snapshots=%zu\n",
            mode.c_str(),corrupt?"MEMORY_CORRUPTION":"CLEAN",corrupt,counts.guard_bytes,counts.immutable_chunks,counts.missing_snapshots);
+    CK(sweep_memory::scratch_free(private_buffer));
     sweep_adapter::destroy(f);
     return corrupt ? 1 : 0;  // deliberately bad modes MUST return nonzero
 }
@@ -130,7 +136,7 @@ int main(int argc,char** argv) {
     int result=0;
     const std::string mode=argc>1?argv[1]:"sanity";
     if (mode=="sanity") { positive(st); exhaustive(st); }
-    else if (mode=="mutate-input" || mode=="overrun" || mode=="underrun" || mode=="scratch-overrun" || mode=="missing-snapshot") result=negative(mode,st);
+    else if (mode=="mutate-input" || mode=="overrun" || mode=="underrun" || mode=="scratch-overrun" || mode=="missing-snapshot" || mode=="private-scratch-overrun") result=negative(mode,st);
     else { fprintf(stderr,"unknown mode\n"); result=2; }
     CK(cudaStreamDestroy(st));
     return result;
