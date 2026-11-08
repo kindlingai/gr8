@@ -30,6 +30,9 @@
 #   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh (one engine for every TP width) and scripts/build_front.sh; with
 #                                     KV_FORMAT=int4 (or --kv-format int4 in the options) also bin/g6m4-int4
 #
+#   ./gr8 switch <glm53|glm53f|ds41> [@FILE]  switch the configured Compose cluster from one controller
+#                                     config/switch.env.example; defaults to ./switch.env; --timeout SECONDS
+#
 #   ./gr8 knobs [WORD..]              every option of ./gr8 <model> and ./gr8 kv: flag, scope, default and meaning
 #   ./gr8 models                      the models, and for each the name to give, its release and the values --tp and
 #                                     --variant take (tools/launch/models.py)
@@ -80,6 +83,7 @@ case $model in
   glm53f) build_model=flash ;;
   ds41) build_model=ds41 ;;
   pseudo) build_model=pseudo ;;
+  switch) shift; exec python3 "$REPO/tools/switch/switch.py" "$@" ;;
   models) exec python3 "$REPO/tools/launch/models.py" ;;
   knobs) shift; GR8_MODEL='' exec python3 "$REPO/tools/launch/launch.py" knobs "$@" ;;
   kv) shift; exec python3 "$REPO/tools/launch/kvnode.py" "$@" ;;

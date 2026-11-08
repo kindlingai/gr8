@@ -66,6 +66,7 @@ else
 fi
 
 step "Python tests (front end and launcher)"
+python3 -m unittest discover -s tools/switch/tests -v
 # the S2 headers read knobs and call the S2 scheduling logic: link the knob table's C API and the host Rust
 cargo build --release --locked --quiet --features capi --manifest-path engine/knobs-rs/Cargo.toml
 cargo build --release --locked --quiet --manifest-path engine/Cargo.toml
