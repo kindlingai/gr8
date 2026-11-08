@@ -1,8 +1,8 @@
-// DS41 ranks that differ in the vision tower they loaded refuse at bootstrap (vision_id.h; g6m4.cu passes vis_on and
-// vis_id to the DS41 runtime signature, s2/signature.h). Four ranks on loopback, each its own process: every rank
-// with the same tower file boots, every rank without one boots (text-only), a rank without the file among ranks with it
-// refuses, and a rank with another tower file refuses. Host only. Model: ds41_agree_knobs_test.cpp.
-// Run: ds41_agree_vision_test engine/runtime/g6m4.cu
+// Ranks that differ in the vision tower they loaded refuse at bootstrap (vision_id.h). g6m4.cu passes vis_on and vis_id
+// to the DS41 and Flash runtime signatures (s2/signature.h). For each model, four ranks on loopback, each its own
+// process: every rank with the same tower file boots, every rank without one boots (text-only), a rank without the file
+// among ranks with it refuses, and a rank with another tower file refuses. Host only. Model: ds41_agree_knobs_test.cpp.
+// Run: agree_vision_test engine/runtime/g6m4.cu
 #include "s2/bootstrap.h"
 #include "vision_id.h"
 #include "s2/signature.h"
@@ -31,14 +31,15 @@ static void tower(const std::string& path, const std::string& header, size_t bod
 }
 
 // rank `r` of 4 with the tower file `file` ("" = no file); exits 0 when it boots, 3 when it refuses (the head writes `why`)
-[[noreturn]] static void rank(unsigned r, const std::string& file, uint16_t port, const std::string& dir, const std::string& why) {
+[[noreturn]] static void rank(SigModel model, unsigned r, const std::string& file, uint16_t port, const std::string& dir,
+                              const std::string& why) {
     if (r) (void)!std::freopen("/dev/null", "w", stderr);
     const std::string id = file.empty() ? "" : g6vis::file_id(file);
     if (!file.empty() && id.empty()) std::_Exit(2);
     BootstrapConfig c; c.rank = r; c.ranks = 4; c.timeout = 3; c.head_ip = "127.0.0.1"; c.port = port;
     c.directory = dir + "/r" + std::to_string(r); ::mkdir(c.directory.c_str(), 0700);
     SigInputs s;
-    s.model = SigModel::Ds41; s.s2sess = 32; s.cap = 327680; s.layers_s = "all"; s.set_id = "ab12";
+    s.model = model; s.s2sess = 32; s.cap = 327680; s.layers_s = "all"; s.set_id = "ab12";
     s.vis_on = !file.empty(); s.vis_id = id;
     c.runtime_signature = runtime_signature(s);
     try { auto links = bootstrap(c); std::_Exit(0); }
@@ -48,13 +49,13 @@ static void tower(const std::string& path, const std::string& header, size_t bod
     }
 }
 
-static int boot(const std::vector<std::string>& files, uint16_t port, const std::string& dir, std::string& why) {
+static int boot(SigModel model, const std::vector<std::string>& files, uint16_t port, const std::string& dir, std::string& why) {
     ::mkdir(dir.c_str(), 0700);
     const std::string wf = dir + "/why";
     std::vector<pid_t> ps;
     for (unsigned r = 0; r < files.size(); ++r) {
         const pid_t p = ::fork();
-        if (p == 0) rank(r, files[r], port, dir, wf);
+        if (p == 0) rank(model, r, files[r], port, dir, wf);
         ps.push_back(p);
     }
     int head = -1;
@@ -68,14 +69,19 @@ static int boot(const std::vector<std::string>& files, uint16_t port, const std:
 
 int main(int argc, char** argv) {
     if (argc != 2) { std::fprintf(stderr, "usage: %s engine/runtime/g6m4.cu\n", argv[0]); return 2; }
-    // g6m4.cu: the effective vision state and the file id go into the DS41 signature (not the knob)
+    // g6m4.cu: the effective vision state and the file id go into each model's signature (not the knob)
     const std::string src = slurp(argv[1]);
-    const size_t a = src.find("sig.model = g6s2::SigModel::Ds41;");
-    const size_t b = a == std::string::npos ? a : src.find("g6s2::serve_ds41(dc, bc", a);
-    CHECK(a != std::string::npos && b != std::string::npos);
-    if (a != std::string::npos && b != std::string::npos)
-        CHECK(src.substr(a, b - a).find("sig.vis_on = vis_on; sig.vis_id = vis_id;") != std::string::npos);
-    CHECK(src.find("vis_id = g6vis::file_id(vpath);") != std::string::npos);
+    for (const auto& sb : {std::pair<const char*, const char*>{"sig.model = g6s2::SigModel::Ds41;", "g6s2::serve_ds41(dc, bc"},
+                           std::pair<const char*, const char*>{"sig.model = g6s2::SigModel::Flash;", "g6s2::serve_flash(fc, bc"}}) {
+        const size_t a = src.find(sb.first);
+        const size_t b = a == std::string::npos ? a : src.find(sb.second, a);
+        CHECK(a != std::string::npos && b != std::string::npos);
+        if (a != std::string::npos && b != std::string::npos)
+            CHECK(src.substr(a, b - a).find("sig.vis_on = vis_on; sig.vis_id = vis_id;") != std::string::npos);
+    }
+    size_t ids = 0;
+    for (size_t at = src.find("vis_id = g6vis::file_id(vpath);"); at != std::string::npos; at = src.find("vis_id = g6vis::file_id(vpath);", at + 1)) ++ids;
+    CHECK(ids == 2);
 
     char tmpl[] = "/tmp/ds41agreevisXXXXXX"; const std::string dir = mkdtemp(tmpl);
     const std::string t1 = dir + "/t1.safetensors", t1b = dir + "/t1-copy.safetensors", t2 = dir + "/t2.safetensors";
@@ -87,18 +93,23 @@ int main(int argc, char** argv) {
     CHECK(g6vis::file_id(dir + "/none").empty());
     CHECK(g6vis::signature(false, "x").empty());
 
-    const uint16_t port = uint16_t(21000 + getpid() % 20000);
-    std::string why;
-    CHECK(boot({t1, t1b, t1, t1b}, port, dir + "/same", why) == 0);
-    CHECK(boot({"", "", "", ""}, uint16_t(port + 1), dir + "/none", why) == 0);
-    CHECK(boot({t1, t1, "", t1}, uint16_t(port + 2), dir + "/missing", why) == 3);
-    CHECK(why.find("bootstrap config mismatch: rank 2") != std::string::npos);
-    std::printf("ds41_agree_vision_test: rank 2 without the tower file refused: %s\n", why.c_str());
-    CHECK(boot({t1, t1, t1, t2}, uint16_t(port + 3), dir + "/other", why) == 3);
-    CHECK(why.find("bootstrap config mismatch: rank 3") != std::string::npos);
-    std::printf("ds41_agree_vision_test: rank 3 with another tower file refused: %s\n", why.c_str());
+    uint16_t port = uint16_t(21000 + getpid() % 20000);
+    for (const SigModel model : {SigModel::Ds41, SigModel::Flash}) {
+        const char* name = model == SigModel::Ds41 ? "ds41" : "flash";
+        const std::string d = dir + "/" + name;
+        ::mkdir(d.c_str(), 0700);
+        std::string why;
+        CHECK(boot(model, {t1, t1b, t1, t1b}, port++, d + "/same", why) == 0);
+        CHECK(boot(model, {"", "", "", ""}, port++, d + "/none", why) == 0);
+        CHECK(boot(model, {t1, t1, "", t1}, port++, d + "/missing", why) == 3);
+        CHECK(why.find("bootstrap config mismatch: rank 2") != std::string::npos);
+        std::printf("agree_vision_test: %s: rank 2 without the tower file refused: %s\n", name, why.c_str());
+        CHECK(boot(model, {t1, t1, t1, t2}, port++, d + "/other", why) == 3);
+        CHECK(why.find("bootstrap config mismatch: rank 3") != std::string::npos);
+        std::printf("agree_vision_test: %s: rank 3 with another tower file refused: %s\n", name, why.c_str());
+    }
     for (const auto& f : {t1, t1b, t2}) std::remove(f.c_str());
 
-    if (!fails) std::printf("ds41_agree_vision_test: PASS\n");
+    if (!fails) std::printf("agree_vision_test: PASS\n");
     return fails ? 1 : 0;
 }

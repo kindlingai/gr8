@@ -14,6 +14,7 @@
 #include "flash_ring.h"
 #include "flash_checkpoint.cuh"
 #include "../flash_prefill.cuh"
+#include "../flash_vision_stage.cuh"
 #include <map>
 #include <atomic>
 #include <mutex>
@@ -53,6 +54,9 @@ struct FlashContext {
     int cp_R = 0;
     std::function<void(unsigned long long, int, int)> cp_enqueue;
     std::function<unsigned()> cp_pf_error;   // the staging fabric's error word (0 = clean), when there is one
+    // GR8_GLM53F_VISION: the vision tower and its pool (prefill and prefill2 attached), null = text only (the shim refuses
+    // images: no vision.s2)
+    g6rt::FlashVision* vision = nullptr;
 };
 inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     using namespace g6rt;
@@ -472,6 +476,11 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             // GR8_CP: a quantum past R runs on the staged view (every page below it gathered into a pool, its rows sent back)
             const bool staged = c.cp_R && a + int(rows) > c.cp_R && cp_staging;
             if (staged) stage(true);
+            if (c.vision && !p.images.empty()) {   // image input: each lane's image rows, from one pool
+                int pool_row = 0;
+                c.vision->stage(c.prefill, p.images, a, ma, pool_row, c.stream, c.main.rank, slot.req.id);
+                if (mb) c.vision->stage(c.prefill2, p.images, a + ma, mb, pool_row, c.stream, c.main.rank, slot.req.id);
+            }
             pf_inputs_flash(c.prefill, ma, p.prompt.data() + a, pos.data(), kslot, multi ? q : 0);
             pf_enqueue_flash(c.prefill_fabric, c.main, c.prefill, pfseq, c.main.nl, ma);
             if (mb) {
@@ -480,6 +489,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
                 pf_step2_flash(c.main, c.prefill, c.prefill2, ma, mb, a + ma, a + ma + mb, pfseq, pfseq2, c.stream);
                 pfseq2 += c.main.nl;
             } else pf_step_flash(c.main, c.prefill, ma, a + ma, pfseq, c.stream);
+            c.prefill.vis_n = c.prefill2.vis_n = 0;
             if (staged) stage(false);
             pfseq += c.main.nl;
             // The cache fill (the default) touches no fabric and no main layer, and leaves its own error word set, so every

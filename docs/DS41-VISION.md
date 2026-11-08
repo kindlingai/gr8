@@ -66,7 +66,7 @@ live steps leave it (`engine/runtime/s2/ds41_engram_ring.h`).
 - `cargo test --release` in `engine/loader-rs`: `router.bias_vl` bound on the main layers only.
 - `engine/ref/ds41/vision_layout_check.py`: a CPU replay of every cuBLAS call and kernel index of the tower.
 - `scripts/host_tests.sh` also runs `ds41_engram_ring_test` (an image 0..3 tokens before a prompt-end or request-end
-  snapshot: the rebuilt ring equals the live ring) and `ds41_agree_vision_test` (4 ranks on loopback: a rank without
+  snapshot: the rebuilt ring equals the live ring) and `agree_vision_test` (4 ranks on loopback: a rank without
   the tower file, or with another file, refuses).
 
 ## Boot test (GPU; one TP4 `ds41` serve)

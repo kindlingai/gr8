@@ -805,6 +805,39 @@ int main(int argc, char** argv)
         init_flash_route_split(FP.route_split, fabrs, MP);
         if (two) init_flash_route_split(FP2.route_split, fabrs2, MP);
     }
+    // GLM-5.3-Flash image input (GR8_GLM53F_VISION, default 0, opt-in): with --serve, --prefill and the release, the
+    // vision tower loads here, with its workspace and a pool of image rows for one prefill quantum, so the ready memory
+    // counts it. Every rank runs the tower on its own images (each rank embeds every row). The head writes
+    // DIR/vision.s2 ("glm5v"), so the shim's hello offers `vision` and checks the Flash grids.
+    FlashVision fvis;
+    bool vis_on = false;
+    std::string vis_id;   // the loaded tower file's id (vision_id.h: its size and header), in the S2 runtime signature
+    if (s2mode && release && knob::glm53f_vision()) {
+        std::string vpath;
+        for (const char* rel : {"/dense/vision-bf16.safetensors", "/vision-bf16.safetensors"}) {
+            const std::string c = v2src.dense + rel;
+            if (FILE* fv = fopen(c.c_str(), "rb")) { fclose(fv); vpath = c; break; }
+        }
+        if (vpath.empty())
+            fprintf(stderr, "# rank %d: flash vision off: no dense/vision-bf16.safetensors in --v2-dense\n", R);
+        else if (!MP)
+            fprintf(stderr, "# rank %d: flash vision off: image rows reach the model only through the prefill, and --prefill is 0\n", R);
+        else {
+            vis_id = g6vis::file_id(vpath);
+            if (vis_id.empty()) die("Flash vision: cannot read the safetensors header of " + vpath);
+            const int pool_rows = MP * (two ? 2 : 1);
+            fvis.boot(vpath, pool_rows);
+            fvis.attach(FP);
+            if (two) fvis.attach(FP2);
+            vis_on = true;
+            g6rt::vision_flag() = true;
+            fprintf(stderr, "# rank %d: flash vision: tower %s, %.1f MiB on the device (weights, workspace, %d-row pool, staging)\n",
+                    R, vpath.c_str(), fvis.device_bytes() / (1024.0 * 1024.0), pool_rows);
+            if (R == 0)
+                if (FILE* fv = fopen((s2dir + "/vision.s2").c_str(), "w")) { fputs("glm5v\n", fv); fclose(fv); }
+        }
+    }
+    if (s2mode && R == 0 && !vis_on) std::remove((s2dir + "/vision.s2").c_str());   // a stale one from an earlier boot
 #endif
     u64 ls0b = 1;
     DraftPrefill DQ;
@@ -1333,6 +1366,7 @@ int main(int argc, char** argv)
         sig.cap = cap; sig.layers_s = layers_s; sig.MP = MP; sig.lanes = lanes; sig.mtp = mtp; sig.chunk = plan.chunk; sig.nc = nc;
         sig.set_id = set_id; sig.dfl = dfl; sig.dfl_k = dfl_k; sig.dfl_reuse = dfl_reuse; sig.dfl_reuse_min = dfl_reuse_min;
         sig.s2sess = s2sess; sig.gsplit = gsplit; sig.knobs = knob::signature();
+        sig.vis_on = vis_on; sig.vis_id = vis_id;
         // GR8_GLM53F_CACHE: the checkpoint store of this rank. Every rank must keep the same entries, so the mode and
         // the store's blocks join the signature
         std::unique_ptr<g6s2::FlashCheckpoints> ckpt;
@@ -1547,6 +1581,7 @@ int main(int argc, char** argv)
 #if defined(G6_CP) && G6_CP
         if (cp_on) { fc.cp_R = cp_R; fc.cp_enqueue = cp_enqueue; fc.cp_pf_error = cp_pf_err; }
 #endif
+        if (vis_on) fc.vision = &fvis;
         try { g6s2::serve_flash(fc, bc, plan.chunk); }
         catch (const std::exception& e) { fprintf(stderr, "g6m4: rank %d Flash serve failed: %s\n", R, e.what()); return 3; }
     }
