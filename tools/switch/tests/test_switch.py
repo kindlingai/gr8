@@ -1,5 +1,8 @@
 import importlib.util
 import io
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
 import json
 from pathlib import Path
 import subprocess
@@ -25,6 +28,55 @@ class Clock:
 
     def sleep(self, seconds):
         self.now += seconds
+
+
+@contextmanager
+def health_server(mode):
+    class Handler(BaseHTTPRequestHandler):
+        calls = 0
+
+        def log_message(self, *_):
+            pass
+
+        def do_GET(self):
+            type(self).calls += 1
+            try:
+                if mode == "headers":
+                    for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\n\r\n":
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(0.08)
+                elif mode == "trickle":
+                    self.send_response(200)
+                    self.send_header("Content-Length", "15")
+                    self.end_headers()
+                    for byte in b'{"ready": true}':
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                        time.sleep(0.08)
+                elif mode == "truncated" or (mode == "recover" and self.calls == 1):
+                    self.send_response(200)
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    self.wfile.write(b"10\r\nabc")
+                    self.wfile.flush()
+                    self.close_connection = True
+                else:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b'{"ready":true}')
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # The deadline kills the client while a response is in flight.
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/health", Handler
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 class SwitchTests(unittest.TestCase):
@@ -104,10 +156,48 @@ class SwitchTests(unittest.TestCase):
         for payload, expected in (({"ready": True}, True), ({"ready": False}, False),
                                   ({"ready": "true"}, False), ({"ready": 1}, False), ([], False)):
             with patch.object(sw, "urlopen", return_value=io.BytesIO(json.dumps(payload).encode())):
-                self.assertEqual(sw.probe("unused", 1), expected)
+                self.assertEqual(sw.read_health("unused", 1), expected)
         with patch.object(sw, "urlopen", return_value=io.BytesIO(b"invalid")):
             with self.assertRaises(ValueError):
-                sw.probe("unused", 1)
+                sw.read_health("unused", 1)
+
+    def test_overdue_ready_is_rejected(self):
+        clock = Clock()
+        def late_check(*_):
+            clock.sleep(2)
+            return True
+        with self.assertRaisesRegex(RuntimeError, "health timeout"):
+            sw.wait_ready("unused", 1, late_check, clock, clock.sleep)
+
+    def test_real_trickle_has_wall_clock_deadline(self):
+        with health_server("trickle") as (url, handler):
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "health timeout"):
+                sw.wait_ready(url, 0.3)
+            elapsed = time.monotonic() - started
+            self.assertGreaterEqual(handler.calls, 1)
+            self.assertLess(elapsed, 0.8)  # Entire body takes over a second.
+
+    def test_real_header_trickle_has_wall_clock_deadline(self):
+        with health_server("headers") as (url, handler):
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "health timeout"):
+                sw.wait_ready(url, 0.3)
+            self.assertGreaterEqual(handler.calls, 1)
+            self.assertLess(time.monotonic() - started, 0.8)
+
+    def test_real_truncated_then_success(self):
+        with health_server("recover") as (url, handler):
+            sw.wait_ready(url, 2)
+            self.assertEqual(handler.calls, 2)
+
+    def test_real_truncated_until_deadline(self):
+        with health_server("truncated") as (url, handler):
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "health timeout"):
+                sw.wait_ready(url, 0.5)
+            self.assertGreaterEqual(handler.calls, 2)
+            self.assertLess(time.monotonic() - started, 1.0)
 
     def test_ssh_is_batch_and_timeout_bounded(self):
         with patch.object(sw.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:

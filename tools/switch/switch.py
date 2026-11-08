@@ -5,6 +5,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
+from http.client import HTTPException
 import math
 from pathlib import Path
 import re
@@ -134,21 +135,50 @@ def phase(config, actions, runner=ssh, emit=print, clock=time.monotonic):
         raise RuntimeError("\n".join(failures))
 
 
-def probe(url, timeout):
+def read_health(url, timeout):
     with urlopen(url, timeout=timeout) as response:
         payload = json.loads(response.read(65536))
         return isinstance(payload, dict) and payload.get("ready") is True
 
 
+def probe(url, timeout):
+    # A socket timeout is per operation: headers or a body can trickle forever.
+    # Bound the whole fetch (including DNS and TLS) in a disposable child. Unlike
+    # a timed-out thread, the child is killed and reaped before another poll.
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--health-probe", url, str(timeout)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, timeout=timeout, check=True,
+    )
+    payload = json.loads(result.stdout)
+    if "error" in payload:
+        raise HTTPException(payload["error"])
+    return payload["ready"]
+
+
+def health_worker(url, timeout):
+    try:
+        payload = {"ready": read_health(url, timeout)}
+    except (OSError, URLError, HTTPException, ValueError) as exc:
+        payload = {"error": str(exc)}
+    print(json.dumps(payload))
+
+
 def wait_ready(url, timeout, check=probe, clock=time.monotonic, pause=time.sleep):
     deadline = clock() + timeout
     last = "not ready"
-    while clock() < deadline:
+    while True:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            break
         try:
-            if check(url, min(2.0, deadline - clock())):
+            ready = check(url, min(2.0, remaining))
+            if clock() >= deadline:
+                break
+            if ready:
                 return
             last = "ready is not true"
-        except (OSError, URLError, ValueError) as exc:
+        except (OSError, URLError, HTTPException, ValueError, subprocess.TimeoutExpired) as exc:
             last = str(exc)
         remaining = deadline - clock()
         if remaining > 0:
@@ -196,4 +226,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    if len(sys.argv) == 4 and sys.argv[1] == "--health-probe":
+        health_worker(sys.argv[2], positive(sys.argv[3]))
+    else:
+        sys.exit(main())
