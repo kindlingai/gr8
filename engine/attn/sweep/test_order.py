@@ -1,0 +1,173 @@
+"""CPU-only deterministic measurement-order and telemetry regression tests."""
+import contextlib
+import importlib.util
+import io
+import json
+import math
+from pathlib import Path
+import statistics
+import tempfile
+import unittest
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+spec = importlib.util.spec_from_file_location("order_runner", HERE / "run.py")
+runner = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runner)
+
+
+def row(v="fast", mean=90, **kw):
+    return dict(kernel="toy", case="x", variant=v, mean_us=mean, sd_us=1,
+                status="EXACT", returncode=0, round_id=1, pair_id="x.r1.p1",
+                run_id=v, final_attempt=True, **kw)
+
+
+class OrderTests(unittest.TestCase):
+    def test_complete_balanced_blocks(self):
+        for size in (1, 2, 3, 5):
+            names = [f"v{i}" for i in range(size)]
+            orders = list(runner.balanced_orders(["off"] + names, "off", 3))
+            self.assertGreaterEqual(len(orders), 3)
+            for pos in range(size):
+                counts = [sum(order[pos] == v for order in orders) for v in names]
+                self.assertEqual(len(set(counts)), 1)
+            self.assertEqual(orders, list(runner.balanced_orders(["off"]+names, "off", 3)))
+
+    def test_t_ci_is_between_pairs_not_rep_sd(self):
+        stats = runner.uncertainty([-12, -10, -8])
+        self.assertEqual(stats["n"], 3)
+        self.assertEqual(stats["mean"], -10)
+        self.assertEqual(stats["sd"], 2)
+        self.assertAlmostEqual(stats["ci95_high"], -10 + 4.302653*2/math.sqrt(3))
+        self.assertIsNone(runner.uncertainty([1])["sd"])
+        self.assertIsNone(runner.uncertainty([])["mean"])
+
+    def test_in_process_estimator_wins_over_external_controls(self):
+        before, after = row("off", 80), row("off", 120)
+        candidate = row(paired_delta_pct_mean=-5, reference_mean_us=95)
+        pair = runner.pair_record(before, candidate, after)
+        self.assertEqual(pair["delta_pct"], -5)
+        self.assertAlmostEqual(pair["bracket_delta_pct"], -10)
+        self.assertEqual(pair["delta_us"], -5)
+        self.assertIn("in-process", pair["estimator"])
+        candidate.pop("paired_delta_pct_mean")
+        self.assertIn("fallback", runner.pair_record(before, candidate, after)["estimator"])
+
+    def test_failures_and_mixed_regimes_do_not_contribute_totals(self):
+        for change in ({"status":"MISMATCH"}, {"status":"TIMEOUT"}, {"returncode":1},
+                       {"mean_us":float("nan")}, {"mean_us":0},
+                       {"input_slots":3}, {"paired_delta_pct_mean":float("nan"), "reference_mean_us":100}):
+            before, candidate, after = row("off",100), row(), row("off",100)
+            candidate.update(change)
+            pair = runner.pair_record(before,candidate,after)
+            self.assertEqual(pair["status"],"INVALID_PAIR")
+            cases=[dict(id="x",args=[],weights={"toy":2})]
+            summary=runner.aggregate_runs([before,candidate,after],[pair],cases,["off","fast"],"off")
+            with tempfile.TemporaryDirectory() as tmp:
+                tables=runner.write_tables(Path(tmp),summary,cases,["off","fast"],"off","toy")
+            total=next(r for r in tables if r["variant"]=="fast" and r["case"].startswith("TOTAL"))
+            self.assertEqual(total["status"],"INCOMPLETE")
+            self.assertNotIn("contribution_toy_ms",total)
+
+    def test_partial_round_failure_and_mixed_estimators(self):
+        cases=[dict(id="x",args=[],weights={})]
+        before, candidate, after=row("off",100),row(),row("off",100)
+        pair=runner.pair_record(before,candidate,after)
+        failed=dict(pair,status="INVALID_PAIR")
+        summary=runner.aggregate_runs([before,candidate,after],[pair,failed],cases,["fast"],"off")
+        self.assertNotIn("mean_us",summary[0])
+        self.assertEqual(summary[0]["n_pairs"],1)
+        self.assertEqual(summary[0]["n_pairs_requested"],2)
+        mixed=dict(pair,estimator="other")
+        self.assertEqual(runner.aggregate_runs([candidate],[pair,mixed],cases,["fast"],"off")[0]["status"],"INCOMPLETE")
+
+    def test_regime_labels_do_not_invent_cold_or_engine(self):
+        self.assertIn("warm/repeated-address",runner.timing_regime({}))
+        self.assertIn("coldness/predecessor unverified",runner.timing_regime({"input_slots":3}))
+        self.assertEqual(runner.timing_regime({"timing_regime":"flush-rotate"}),"flush-rotate")
+
+    def test_telemetry_complete_partial_unavailable(self):
+        xml='''<nvidia_smi_log><gpu id="1"><uuid>GPU-test</uuid>
+          <clocks><graphics_clock>2600 MHz</graphics_clock></clocks>
+          <temperature><gpu_temp>52 C</gpu_temp></temperature>
+          <gpu_power_readings><power_draw>200 W</power_draw></gpu_power_readings>
+          <clocks_event_reasons><clocks_event_reason_hw_thermal_slowdown>Not Active</clocks_event_reason_hw_thermal_slowdown></clocks_event_reasons>
+          <processes><process_info><pid>123</pid><type>G</type><process_name>competing graphics</process_name></process_info></processes>
+          </gpu></nvidia_smi_log>'''
+        with patch.object(runner,"command",return_value=(0,xml,"")) as cmd:
+            snap=runner.telemetry_snapshot()
+        self.assertEqual(snap["status"],"AVAILABLE")
+        self.assertEqual(snap["gpus"][0]["processes"][0]["pid"],"123")
+        self.assertEqual(snap["gpus"][0]["clocks"]["graphics_clock"],"2600 MHz")
+        self.assertEqual(snap["stdout"],xml)
+        cmd.assert_called_once_with(["nvidia-smi","-q","-x"],5)
+        for result, expected in [((127,"","missing"),"UNAVAILABLE"),((0,"bad xml",""),"UNAVAILABLE"),((0,"<root><gpu/></root>",""),"PARTIAL")]:
+            with patch.object(runner,"command",return_value=result):
+                self.assertEqual(runner.telemetry_snapshot()["status"],expected)
+
+    def test_driver_serial_brackets_raw_attempts_and_telemetry_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            for v in ("off","fast","other"):
+                (root/"variants"/v).mkdir(parents=True)
+                (root/"variants"/v/"variant.cuh").write_text("// test\n")
+            (root/"fixture.h").write_text("// test\n")
+            (root/"adapter.json").write_text(json.dumps(dict(name="toy",header="fixture.h",variants_dir="variants")))
+            (root/"cases.json").write_text(json.dumps([dict(id="x",args=["opaque"],weights={"toy":2})]))
+            # Actual executable CPU fake binaries; no CUDA compiler/device required.
+            fake=root/"nvcc"
+            fake.write_text('''#!/usr/bin/env python3
+import sys,pathlib
+if '--version' in sys.argv: print('test compiler'); sys.exit(0)
+out=pathlib.Path(sys.argv[sys.argv.index('-o')+1])
+out.write_text("""#!/usr/bin/env python3
+import json,pathlib,sys
+me=pathlib.Path(sys.argv[0]); marker=me.with_suffix('.attempt')
+if me.name=='fast' and not marker.exists():
+ marker.write_text('1'); sys.exit(77)
+print(json.dumps(dict(status='EXACT',mean_us=100 if me.name=='off' else 90,sd_us=1,samples_us=[89,91],reference_mean_us=95,paired_delta_pct_mean=-5,paired_delta_pct_samples=[-4,-6],null_delta_pct_samples=[0,1],null_delta_pct_mean=.5,null_band_pct=3,input_slots=3,timed_checks=2,checks=4)))
+""")
+out.chmod(0o755)
+''')
+            fake.chmod(0o755)
+            events=[]
+            real_command=runner.command
+            def command(cmd, timeout):
+                if cmd[0] in [str(root/"out"/v) for v in ("off","fast","other")]:
+                    events.append("run")
+                return real_command(cmd,timeout)
+            def telemetry():
+                events.append("snapshot")
+                return {"status":"AVAILABLE","sequence":len(events)}
+            with patch.object(runner,"command",side_effect=command), patch.object(runner,"telemetry_snapshot",side_effect=telemetry), contextlib.redirect_stdout(io.StringIO()):
+                result=runner.main(["--kernel",str(root/"adapter.json"),"--cases",str(root/"cases.json"),"--nvcc",str(fake),"--arch","120a","--out",str(root/"out"),"--retry-delay","0"])
+            self.assertEqual(result,0)
+            self.assertEqual(events,["snapshot","run","snapshot"]*25)
+            raw=[json.loads(line) for line in (root/"out/results.jsonl").read_text().splitlines()]
+            pairs=[json.loads(line) for line in (root/"out/pairs.jsonl").read_text().splitlines()]
+            self.assertEqual(len(raw),25)  # 4 rounds x 2 candidates x 3 + retry
+            self.assertEqual(len(pairs),8)
+            self.assertEqual(raw[1]["status"],"LOW_MEMORY")
+            self.assertFalse(raw[1]["final_attempt"])
+            self.assertEqual(len({(r["run_id"],r["attempt"]) for r in raw}),25)
+            final=[r for r in raw if r["final_attempt"]]
+            for i in range(0,len(final),3):
+                triplet=final[i:i+3]
+                self.assertEqual([r["role"] for r in triplet],["off_before","candidate","off_after"])
+                self.assertEqual(triplet[0]["variant"],"off")
+                self.assertEqual(triplet[2]["variant"],"off")
+                self.assertEqual(len({r["pair_id"] for r in triplet}),1)
+            self.assertEqual(final[1]["samples_us"],[89,91])
+            self.assertEqual(final[1]["checks"],4)
+            self.assertEqual(final[1]["null_band_pct"],3)
+            self.assertEqual(pairs[0]["delta_pct"],-5)
+            self.assertTrue((root/"out/fast.x.try2.stdout").exists())
+            summary=runner.aggregate_runs(raw,pairs,[dict(id="x")],["off","fast","other"],"off")
+            fast=next(r for r in summary if r["variant"]=="fast")
+            self.assertEqual(fast["n_pairs"],4)
+            self.assertEqual(fast["paired_delta_pct"],-5)
+            self.assertEqual(fast["paired_sd_pct"],0)
+
+
+if __name__ == "__main__":
+    unittest.main()
