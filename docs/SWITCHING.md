@@ -41,6 +41,16 @@ cp config/switch.env.example switch.env    # then set the boxes, directories and
 ./gr8 switch glm53 @/path/to/switch.env    # back to GLM-5.3, with another config file
 ```
 
+Measured on 2026-11-08 (Pacific time) with the command at gr8 `a4cdfd10`, on four boxes (two DGX Sparks, two GB10
+boxes with PCIe Gen4 NVMe), with each model's stock compose `.env` (GLM-5.3 at TP=4 with `GR8_GEN_CACHE` and
+`GR8_QUIT_FAST=1`; DeepSeek-V4.1-Flash at TP=4). Two switches each way (n=2), alternated, starting from GLM-5.3.
+Every run exited 0, and each box's `.env` was byte-identical before and after:
+
+| `./gr8 switch` | down | up | health: ready in | total |
+|---|---|---|---|---|
+| `ds41` (from GLM-5.3) | 2.715 / 4.260 s | 0.610 / 0.777 s | 35.564 / 35.202 s | 38.889 / 40.239 s |
+| `glm53` (from DeepSeek) | 3.744 / 3.537 s | 0.593 / 0.574 s | 69.512 / 69.496 s | 73.848 / 73.607 s |
+
 ## The settings
 
 **Both models: `GR8_GEN_CACHE`.** Put `GR8_GEN_CACHE=<dir>` in `EXTRA_ENV` on every box
