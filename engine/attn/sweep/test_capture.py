@@ -54,6 +54,9 @@ int main(int argc,char** argv) {
     auto window=small;window.metadata.ratio=0;window.metadata.format="window_only";window.metadata.index_source=-1;
     window.metadata.key_rows=0;window.metadata.ck_stride_bytes=0;window.topk.assign(4*512,-1);
     assert(decode(encode(window)).topk==window.topk);
+    {std::ofstream f(dir+"/synthetic-window.asw",std::ios::binary);f<<encode(window);}
+    auto bf=r;bf.metadata.format="bf16_512";bf.metadata.ck_stride_bytes=uint64_t(bf.metadata.key_rows)*1024;
+    {std::ofstream f(dir+"/synthetic-bf16.asw",std::ios::binary);f<<encode(bf);}
     auto slots=r;slots.metadata.slot_count=3;slots.metadata.session_form="per_row_slots";slots.sessions={2,1,2,1};
     assert(decode(encode(slots)).sessions==slots.sessions);
     // Callback counters prove off and budget/filter skips cause no sync/copy.
@@ -134,6 +137,12 @@ class CaptureTests(unittest.TestCase):
         mapped=self.root/'r0_q10_c24576_l8_prefill_v2.asw'
         cases=json.loads(subprocess.check_output([str(self.root/'tool'),'case',str(mapped)]))
         self.assertEqual(cases[0]['args'][:6],[4,24576,2,0,128,16386])
+        cases=json.loads(subprocess.check_output([str(self.root/'tool'),'case',str(self.root/'synthetic-window.asw')]))
+        self.assertEqual(cases[0]['args'][:6],[4,0,0,0,128,0])
+        self.assertEqual(cases[0]['input_provenance'],'synthetic_test')
+        p=subprocess.run([str(self.root/'tool'),'case',str(self.root/'synthetic-bf16.asw')],capture_output=True)
+        self.assertNotEqual(p.returncode,0)
+
 
 
     def test_rehashed_invalid_metadata_and_indices(self):
@@ -150,4 +159,3 @@ class CaptureTests(unittest.TestCase):
         body=data[80:80+ml]+bad_payload
         (self.root/'bad.asw').write_bytes(data[:16]+hashlib.sha256(body).hexdigest().encode()+body)
         self.assertNotEqual(subprocess.run([str(self.root/'tool'),'inspect',str(self.root/'bad.asw')],capture_output=True).returncode,0)
-
