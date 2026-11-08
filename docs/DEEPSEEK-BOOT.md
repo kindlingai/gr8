@@ -19,7 +19,8 @@ one to choose its settings.
 - **Four GB10 boxes**, set up as the README's [What you need](../README.md#what-you-need) and
   [DEPLOY.md](DEPLOY.md#before-you-start) say: a RoCE v2 fabric with two rails (a switch, or four boxes cabled in a
   ring with `SHAPE=ring`), TCP ports 7340 and 7341 open between the boxes, and proactive memory compaction off.
-  `ds41` serves at **TP=4** only.
+  `ds41` serves at **TP=4**. The engine also builds and runs at TP=2 (`--tp 2`, two boxes), but so far that has only
+  been checked on one GPU in m4sim, not booted on two boxes.
 - **The release**: `https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native`, the official weights in the
   exlr8 native layout. Unlike the GLM releases, each box does **not** fetch its own part into a model cache: the
   release is a local copy, read in place ([DEPLOY.md](DEPLOY.md#the-model)). Fetch it to local NVMe on every box

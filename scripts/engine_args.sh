@@ -2,7 +2,7 @@
 # the knobs. docs/SETTINGS.md explains every engine variable and flag.
 #
 # GR8_MODEL picks the model: glm53 (unset), glm53f, GLM-5.3-Flash (bin/g6m4_flash, TP 4 or 2), ds41, DeepSeek-V4.1-Flash-1017
-# (bin/g6m4_ds41, TP 4; docs/DEEPSEEK.md), or pseudo, the pseudo engine (bin/g6pseudo, frontend/pseudo-engine).
+# (bin/g6m4_ds41, TP 4 or 2; docs/DEEPSEEK.md), or pseudo, the pseudo engine (bin/g6pseudo, frontend/pseudo-engine).
 #
 #   engine_defaults          needs TP (4, 6, 3 or 5); sets every knob that is unset to its default for this TP. An unset CAP
 #                            follows SHARE_LIMIT, so the KV pool keeps the same physical pages per rank (share_cap below)
@@ -119,7 +119,7 @@ flash_donor_budget() {
     'BEGIN { b = kib / 1048576 - g - r; if (b > w) b = w; if (b < 0) b = 0; printf "%d\n", b }'
 }
 
-# DeepSeek-V4.1-Flash-1017 (docs/DEEPSEEK.md): TP 4 only; CP, DFlash2 and PF_OWN remain off.
+# DeepSeek-V4.1-Flash-1017 (docs/DEEPSEEK.md): TP 4 or 2; CP, DFlash2 and PF_OWN remain off.
 # REUSE=1 by default: prefix reuse through the DS41 snapshot cache. MTP stays 0: the DSpark drafts are GR8_DS_MTP (DS41_TUNED below).
 # SESS 1..32 sessions, 5 by default: with GR8_DS_MTP=5 a round of 5 x 6 rows fits the default build's 32 rows a step (8 sessions need
 # DS41_MX=48 at build). CAP: the tokens of one session; every session holds its own attention, index and Engram slab of CAP rows, and
@@ -129,7 +129,7 @@ flash_donor_budget() {
 # seen was 807 s, so 1800. Each DeepSeek-only variable is a GR8_DS_* engine variable in EXTRA_ENV (GR8_DS_ENGRAM=0
 # turns Engram off, which gives wrong logits: use it only to diagnose).
 ds41_defaults() {
-  case $TP in 4) ;; *) echo "engine_defaults: TP=$TP; DeepSeek-V4.1-Flash-1017 wants 4" >&2; return 2 ;; esac
+  case $TP in 4|2) ;; *) echo "engine_defaults: TP=$TP; DeepSeek-V4.1-Flash-1017 wants 4 or 2" >&2; return 2 ;; esac
   local k
   for k in DFLASH PF_OWN SPEC_ADAPT; do
     [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: DeepSeek-V4.1-Flash-1017 has no $k" >&2; return 2; }

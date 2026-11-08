@@ -73,8 +73,9 @@ static_assert(ROMAX <= dsr::RO_MAX, "RoScratch bound");
 constexpr int RO_FROM = DS41_MOE_RO_FROM;
 static_assert(RO_FROM > MTMAX && RO_FROM <= ROMAX, "RO_FROM");
 // read-once expert loop shape: DS41_RO_KS/CW/NTG1/W2/D2/NTG2 and the reason for their values are in ds_ro_cfg.h (shared with the GPU test)
-constexpr int IW = geom::EXP_I / g6nr::NR;            // this rank's slice of the expert width (576 at TP4); shared and routed alike
-static_assert(HID == dsr::HIDDEN && geom::SHARED_I == geom::EXP_I && IW == 576, "the verified tiling is hidden 5120, I-slice 576 (TP4)");
+constexpr int IW = geom::EXP_I / g6nr::NR;            // this rank's slice of the expert width (576 at TP4, 1152 at TP2); shared and routed alike
+static_assert(HID == dsr::HIDDEN && geom::SHARED_I == geom::EXP_I && (IW == 576 || IW == 1152),
+              "the verified tilings are hidden 5120 with I-slice 576 (TP4) or 1152 (TP2)");
 constexpr int SMAX = MTMAX * dsr::TOPK;               // routed tiles per step at the main model's top-6 (the largest case; slots <= tiles <= MTMAX * TK)
 
 struct PwScratch                                      // chunked path, M 33..PWMAX; sized for the main model's top-6 / 384 experts (the DSpark layers need less)
@@ -108,7 +109,7 @@ struct RoScratch                                      // read-once path, M RO_FR
     uint8_t* mt_xq = nullptr;     // [ROMAX][HID/64][64] hc_y quantized
     uint8_t* mt_xs = nullptr;     // [ROMAX][HID/32] its E8M0 bytes
     uint8_t* mt_aq = nullptr;     // [tiles*8][IW/64][64] fc1's act quantized
-    uint8_t* mt_as = nullptr;     // [tiles*8][mxtc::ASP]
+    uint8_t* mt_as = nullptr;     // [tiles*8][mxtc::asp(IW)]
     int* mt_cnt = nullptr;        // [ROMAX][moe_tc_os2()] the fused combine's route counts (DS41_TC_COMBINE); null = k_combine_mt runs after fc2
 };
 struct Scratch
@@ -162,9 +163,11 @@ inline bool sh_tc_on() { return knob::ds_sh_tc(); }
 // GR8_DS_MOE_PW_BOUND=1 (default off): the M 33..MMAX planner path (experts_pw) sizes its expert-slot grid from the routes the top-k cut keeps (M * kc) instead of
 // M * TK. Slots only shrink when GR8_DS_MOE_TOPK < TOPK; CTAs of slots >= n_slots exit before any work, so outputs are bit-identical (the bound stays >= the plan's slot count).
 inline bool pw_bound_on() { return knob::ds_moe_pw_bound(); }
-// GR8_DS_MOE_SH_1PASS=1 (default off): the shared expert at M 33..SH1_MAX in one NT = 6 pass instead of the 32-row chunk loop (the 9.12 MB of weights is read once).
-inline bool sh_1pass_on() { return knob::ds_moe_sh_1pass(); }
 constexpr int SH1_NT = 6, SH1_MAX = SH1_NT * 8;   // the one-pass tile count and its row limit (prepare_moe below and shared_pw_1pass read them)
+// GR8_DS_MOE_SH_1PASS=1 (default off): the shared expert at M 33..SH1_MAX in one NT = 6 pass instead of the 32-row chunk loop (the 9.12 MB of weights is read once).
+// TP4 only: at TP2 the 6 fc2 tables are 110592 B, past the 99 KB of dynamic smem, and the knob is ignored.
+constexpr bool SH1_FITS = (size_t)SH1_NT * (IW / 16) * 64 * 4 <= 99 * 1024;
+inline bool sh_1pass_on() { return SH1_FITS && knob::ds_moe_sh_1pass(); }
 inline cudaError_t sh1_attr();                    // defined with shared_pw_1pass; prepare_moe calls it at host init
 // GR8_DS_GATE_RO=1 (default off): the read-once prefill path (M >= RO_FROM) computes the main layers' gate logits with k_gate_logits_ro (8 experts x 8 tokens per warp,
 // ds_router.cuh) instead of k_gate_logits_mt. Same bits (same fma chain per token and expert); the logits buffer is byte-identical. The 128-expert draft layers keep k_gate_logits_mt.
@@ -260,6 +263,59 @@ inline cudaError_t launch(bool pdl, void (*k)(KP...), dim3 grid, dim3 block, cud
     at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; at[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = at; cfg.numAttrs = pdl ? 1 : 0;
     return cudaLaunchKernelEx(&cfg, k, static_cast<KP>(args)...);
+}
+// launch() with `smem` bytes of dynamic shared memory
+template <typename... KP, typename... AP>
+inline cudaError_t launch_dyn(bool pdl, void (*k)(KP...), dim3 grid, dim3 block, size_t smem, cudaStream_t st, AP... args)
+{
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid; cfg.blockDim = block; cfg.dynamicSmemBytes = smem; cfg.stream = st;
+    cudaLaunchAttribute at[1];
+    at[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; at[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = at; cfg.numAttrs = pdl ? 1 : 0;
+    return cudaLaunchKernelEx(&cfg, k, static_cast<KP>(args)...);
+}
+// The multi-tile fc2 kernels (M 9..256) hold NT activation tiles of the I-slice in smem, NT * IW / 16 * 256 B. Static smem stops at 48 KB, so
+// at TP2 (IW 1152) NT 3 and 4 run the dynamic-smem copies (mx4::k_fc2_mt_dyn, dsh::k_sh_fc2_mt_dyn). TP4 (IW 576) keeps the static kernels.
+template <int NT> constexpr size_t fc2_tab_bytes() { return (size_t)NT * (IW / 16) * 64 * sizeof(u32); }
+template <int NT> constexpr bool fc2_dyn() { return fc2_tab_bytes<NT>() > 48 * 1024; }
+static_assert(fc2_tab_bytes<4>() <= 99 * 1024, "the NT = 4 fc2 tables fit the 99 KB dynamic smem of a CTA");
+// The smem attributes of the dynamic copies NT uses: a host call without stream work. bind_moe makes the first call (build, before any capture).
+template <int NT>
+inline cudaError_t fc2_dyn_attr_nt()
+{
+    if constexpr (fc2_dyn<NT>())
+    {
+        const int b = (int)fc2_tab_bytes<NT>();
+        cudaError_t e[4] = {cudaFuncSetAttribute(mx4::k_fc2_mt_dyn<IW, HID, 8, 2, NT, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, b),
+                            cudaFuncSetAttribute(mx4::k_fc2_mt_dyn<IW, HID, 8, 2, NT, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, b),
+                            cudaFuncSetAttribute(dsh::k_sh_fc2_mt_dyn<IW, HID, 8, 3, NT, 0>, cudaFuncAttributeMaxDynamicSharedMemorySize, b),
+                            cudaFuncSetAttribute(dsh::k_sh_fc2_mt_dyn<IW, HID, 8, 3, NT, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, b)};
+        for (cudaError_t x : e)
+            if (x != cudaSuccess) return x;
+    }
+    return cudaSuccess;
+}
+inline cudaError_t fc2_dyn_attr()
+{
+    static const cudaError_t attr = [] {
+        const cudaError_t a = fc2_dyn_attr_nt<3>();
+        return a != cudaSuccess ? a : fc2_dyn_attr_nt<4>();
+    }();
+    return attr;
+}
+// the shared expert's NT-tile fc2 and the routed one, static or dynamic smem by fc2_dyn
+template <int NT, int PD>
+inline void launch_sh_fc2_mt(const dsh::ArgsMT& SA, cudaStream_t st)
+{
+    if constexpr (fc2_dyn<NT>()) launch_dyn(PD, dsh::k_sh_fc2_mt_dyn<IW, HID, 8, 3, NT, PD>, dim3(HID / 16 / 8), dim3(8 * 32), fc2_tab_bytes<NT>(), st, SA);
+    else launch(PD, dsh::k_sh_fc2_mt<IW, HID, 8, 3, NT, PD>, dim3(HID / 16 / 8), dim3(8 * 32), st, SA);
+}
+template <int NT, int PD>
+inline void launch_fc2_mt(const mx4::ArgsMT& RA, int slots, cudaStream_t st)
+{
+    if constexpr (fc2_dyn<NT>()) launch_dyn(PD, mx4::k_fc2_mt_dyn<IW, HID, 8, 2, NT, PD>, dim3(slots * (HID / 16 / 8)), dim3(8 * 32), fc2_tab_bytes<NT>(), st, RA);
+    else launch(PD, mx4::k_fc2_mt<IW, HID, 8, 2, NT, PD>, dim3(slots * (HID / 16 / 8)), dim3(8 * 32), st, RA);
 }
 
 inline Scratch* scratch_of(const Model* m)
@@ -429,6 +485,7 @@ inline int bind_moe(void* model, int i, int, void*)
     if (!y.moe) return 0;
     const Find& find = m.ds41_find;
     const std::string who = "DS41 MoE layer " + std::to_string(y.l) + ": ";
+    if (const cudaError_t e = fc2_dyn_attr(); e != cudaSuccess) die(who + "fc2 dynamic smem attribute: " + cudaGetErrorString(e));
     auto get = [&](const char* n, int nd, std::initializer_list<long long> shape, int dt /*0 u8, 1 bf16, 2 f32*/) {
         const TensorRef t = find(lname(y.l, n));
         if (!t.p) die(who + "the pack has no " + lname(y.l, n));
@@ -569,7 +626,7 @@ inline RoScratch* ro_alloc()
         p->mt_xq = dmalloc<uint8_t>((size_t)ROMAX * HID);
         p->mt_xs = dmalloc<uint8_t>((size_t)ROMAX * (HID / 32));
         p->mt_aq = dmalloc<uint8_t>((size_t)TILES * 8 * IW);
-        p->mt_as = dmalloc<uint8_t>((size_t)TILES * 8 * mxtc::ASP);
+        p->mt_as = dmalloc<uint8_t>((size_t)TILES * 8 * mxtc::asp(IW));
         if (DS41_TC_COMBINE) p->mt_cnt = dmalloc<int>((size_t)ROMAX * moe_tc_os2());
     }
     return p;
@@ -671,7 +728,7 @@ inline int shared_mt_nt(const LayerState& s, int M, cudaStream_t st)
 {
     dsh::ArgsMT SA{s.sh_w1, s.sh_w3, s.sh_w2, s.sc->xfrag, M, geom::SWIGLU_LIMIT, s.sc->sh_act, s.sc->sh_out};
     launch(PD, dsh::k_sh_fc1_mt<HID, IW, 8, 1, 2, NT, PD>, dim3(IW / 16), dim3(8 * 32), st, SA);
-    launch(PD, dsh::k_sh_fc2_mt<IW, HID, 8, 3, NT, PD>, dim3(HID / 16 / 8), dim3(8 * 32), st, SA);
+    launch_sh_fc2_mt<NT, PD>(SA, st);
     return (int)cudaGetLastError();
 }
 template <int PD>
@@ -692,7 +749,7 @@ inline int experts_mt_nt(Model& m, const LayerState& s, int M, cudaStream_t st)
                    s.sc->act, s.sc->ypart};
     launch(PD, mx4::k_fc1_mt<HID, IW, 8, 1, mx4::FC1_MT_DEPTH<NT>, NT, 0, PD>, dim3(M * TK * (IW / 16)), dim3(8 * 32), st, RA);
     ds41_span_mark("fc1_mt", st);
-    launch(PD, mx4::k_fc2_mt<IW, HID, 8, 2, NT, PD>, dim3(M * TK * (HID / 16 / 8)), dim3(8 * 32), st, RA);
+    launch_fc2_mt<NT, PD>(RA, M * TK, st);
     ds41_span_mark("fc2_mt", st);
     dsh::CombineArgsMT<TK, MTMAX> CA{(const P*)p, s.sc->ypart, s.sc->sh_out, (void*)m.sc.part[1], M};
     launch(PD, dsh::k_combine_mt<HID, 128, gv::O_BF16, TK, MTMAX>, dim3(M * HID / (8 * 128)), dim3(128), st, CA);
@@ -753,7 +810,7 @@ inline int shared_pw(const LayerState& s, int M, cudaStream_t st)
         dsh::ArgsMT SA{s.sh_w1, s.sh_w3, s.sh_w2, q.xfrag + (size_t)(r0 / 8) * (HID * 4), mc, geom::SWIGLU_LIMIT,
                        q.sh_act + (size_t)r0 * IW, q.sh_out + (size_t)r0 * HID};
         launch(false, dsh::k_sh_fc1_mt<HID, IW, 8, 1, 2, 4, 0>, dim3(IW / 16), dim3(8 * 32), st, SA);
-        launch(false, dsh::k_sh_fc2_mt<IW, HID, 8, 3, 4, 0>, dim3(HID / 16 / 8), dim3(8 * 32), st, SA);
+        launch_sh_fc2_mt<4, 0>(SA, st);
     }
     return (int)cudaGetLastError();
 }
@@ -769,7 +826,7 @@ inline int experts_pw(Model& m, const LayerState& s, int M, int kc, cudaStream_t
                    (const int*)(p + offsetof(P, tile_mask)), (const float*)(p + offsetof(P, tile_w)), (const int*)(p + offsetof(P, tile_tok)),
                    (const int*)(p + offsetof(P, n_slots)), sb, geom::SWIGLU_LIMIT, q.act, q.ypart};
     launch(false, mx4::k_fc1_mt<HID, IW, 8, 1, mx4::FC1_MT_DEPTH<4>, 4, 0, 0>, dim3(sb * (IW / 16)), dim3(8 * 32), st, RA);
-    launch(false, mx4::k_fc2_mt<IW, HID, 8, 2, 4, 0>, dim3(sb * (HID / 16 / 8)), dim3(8 * 32), st, RA);
+    launch_fc2_mt<4, 0>(RA, sb, st);
     dsh::CombineArgsMT<TK, MM> CA{(const P*)p, q.ypart, q.sh_out, (void*)m.sc.part[1], M};
     launch(false, dsh::k_combine_mt<HID, 128, gv::O_BF16, TK, MM>, dim3(M * HID / (8 * 128)), dim3(128), st, CA);
     return (int)cudaGetLastError();
@@ -837,7 +894,7 @@ inline int shared_ro(const LayerState& s, const void* hc_y, int M, cudaStream_t 
         dsh::ArgsMT SA{s.sh_w1, s.sh_w3, s.sh_w2, q.xfrag + (size_t)(r0 / 8) * (HID * 4), mc, geom::SWIGLU_LIMIT,
                        q.sh_act + (size_t)r0 * IW, q.sh_out + (size_t)r0 * HID};
         launch(false, dsh::k_sh_fc1_mt<HID, IW, 8, 1, 2, 4, 0>, dim3(IW / 16), dim3(8 * 32), st, SA);
-        launch(false, dsh::k_sh_fc2_mt<IW, HID, 8, 3, 4, 0>, dim3(HID / 16 / 8), dim3(8 * 32), st, SA);
+        launch_sh_fc2_mt<4, 0>(SA, st);
     }
     return (int)cudaGetLastError();
 #endif

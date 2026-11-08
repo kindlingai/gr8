@@ -204,14 +204,18 @@ def ds41(*argv, peers=PEERS):
 
 
 class Ds41Tests(unittest.TestCase):
-    """DeepSeek-V4.1-Flash-1017 scaffold (docs/DEEPSEEK.md): TP=4, the engine bin, the refusals."""
+    """DeepSeek-V4.1-Flash-1017 scaffold (docs/DEEPSEEK.md): TP=4 or 2, the engine bin, the refusals."""
     def test_defaults(self):
         o = ds41()
         self.assertEqual((models.of(o), o.get('GROUP'), S.engine_bin(o)), (models.DS41, 'gr8-ds41', 'g6m4_ds41'))
         self.assertEqual(models.DS41.architecture, 'DeepseekV41ForCausalLM')
+        # TP=2: two boxes, the same engine bin and the same engine defaults
+        o2 = ds41('--tp', '2', peers='10.0.0.1,10.0.0.2')
+        self.assertEqual((o2.get('TP'), S.engine_bin(o2)), ('2', 'g6m4_ds41'))
+        self.assertEqual(opt.engine_plan(o2)['knobs'].get('SESS'), opt.engine_plan(o)['knobs'].get('SESS'))
 
     def test_refusals(self):
-        for argv, want in ((['--tp', '3'], 'want 4 (ds41)'), (['--dflash', '1'], 'no DFlash2 drafter'),
+        for argv, want in ((['--tp', '3'], 'want 4 or 2 (ds41)'), (['--dflash', '1'], 'no DFlash2 drafter'),
                            (['--kv-format', 'int4'], 'fp8 KV build only')):
             with self.assertRaises(opt.OptionError) as e:
                 ds41(*argv)

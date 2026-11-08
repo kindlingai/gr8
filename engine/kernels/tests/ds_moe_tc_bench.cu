@@ -253,7 +253,7 @@ int main(int argc, char** argv)
     dal(y_a, static_cast<size_t>(TILES) * 8 * NOUT); dal(y_b, static_cast<size_t>(TILES) * 8 * NOUT);
     uint8_t *xq, *xs, *aq, *as;
     dal(xq, static_cast<size_t>(MM) * K1); dal(xs, static_cast<size_t>(MM) * (K1 / 32));
-    dal(aq, static_cast<size_t>(TILES) * 8 * I); dal(as, static_cast<size_t>(TILES) * 8 * mxtc::ASP);
+    dal(aq, static_cast<size_t>(TILES) * 8 * I); dal(as, static_cast<size_t>(TILES) * 8 * mxtc::asp(I));
     double* dcmp; dal(dcmp, 8);
     float* sh; dal(sh, static_cast<size_t>(MM) * NOUT);
     k_fill_sh<<<4096, 256>>>(sh, static_cast<size_t>(MM) * NOUT, 23u);
@@ -328,7 +328,7 @@ int main(int argc, char** argv)
         mxtc::Args TA{w1, w2, xq, xs,
                       RA.slot_expert, RA.slot_tile0, RA.slot_nt, RA.tile_mask, RA.tile_w, RA.tile_tok, n_slots_dev, n_tiles_dev, sb, MXTC_GY1, MXTC_GY2, MXTC_OS2,
                       nullptr, TK, nullptr, nullptr, nullptr, 0, nullptr, 10.f, act_b, aq, as, y_b};
-        CK(cudaMemset(aq, 0xee, static_cast<size_t>(TILES) * 8 * I)); CK(cudaMemset(as, 0xee, static_cast<size_t>(TILES) * 8 * mxtc::ASP));   // poison: every live byte must be written
+        CK(cudaMemset(aq, 0xee, static_cast<size_t>(TILES) * 8 * I)); CK(cudaMemset(as, 0xee, static_cast<size_t>(TILES) * 8 * mxtc::asp(I)));   // poison: every live byte must be written
         constexpr int CW1 = MXTC_CW, NT1 = MXTC_NTG1, ST1 = MXTC_ST, WW2 = MXTC_W2, WT2 = MXTC_WT, TPC2 = MXTC_TPC, ST2 = MXTC_ST2;
         constexpr size_t S1 = mxtc::fc1_smem<K1, CW1, NT1, ST1>(), S2 = mxtc::fc2_smem<WW2, TPC2, ST2>();
         auto* kt1 = mxtc::k_fc1_tc<K1, I, CW1, NT1, ST1, MXTC_FUSEQ != 0>;

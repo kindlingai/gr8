@@ -74,7 +74,11 @@
 #define DS41_SH_GL 1
 #endif
 #ifndef DS41_SH_NT
+#if defined(G6_NR) && G6_NR <= 2
+#define DS41_SH_NT 4                                  // TP2: the I-slice is 1152, so fc2's dynamic smem is 73728 B at 4 tiles (8 tiles: 147456 B, past 99 KB)
+#else
 #define DS41_SH_NT 8
+#endif
 #endif
 #ifndef DS41_SH_RG
 #define DS41_SH_RG 4

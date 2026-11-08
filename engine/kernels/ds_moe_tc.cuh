@@ -10,7 +10,7 @@
 //   activations MXFP8 (E4M3 per 32 k with one E8M0 scale, the ATTN_TC / SH_TC quantizer's formula: scale = 2^ceil(log2(amax / 448)), amax floored
 //               at 1e-4), written by k_xq (the layer input x) and k_aq (fc1's fp16 act) in XREC records: per row and 64-k record 64 B, lane c of a
 //               quad owns bytes [16 c, 16 c + 16) = {k32 group 0 b0, b1, group 1 b0, b1} in the k order above, so a lane reads one 16-B word per
-//               (row, record). Scales are plain [row][K / 32] bytes (k_aq pads the row to ASP bytes).
+//               (row, record). Scales are plain [row][K / 32] bytes (k_aq pads the row to asp(I) bytes).
 //   fc1         k_fc1_tc: CTA = (expert slot, CW chunks of 16 intermediate rows), a warp per chunk = gate + up (two A tiles) x NTG token tiles;
 //               the expert's tiles are walked in groups of NTG as k_fc1_ro does; K streams through an ST-deep cp.async ring of 128-k stages of the
 //               group's rows (gathered by tile_tok). fp32 accumulate over all of K in one warp (no k split), swiglu_lim, fp16 act as k_fc1_ro.
@@ -30,7 +30,8 @@ using mx4::GR;
 using mx4::KG;
 using mx4::SOFF;
 constexpr int XREC = 64;          // bytes of one row's 64-k activation record
-constexpr int ASP = 32;           // k_aq scale row pitch (I / 32 = 18 bytes used)
+// k_aq scale row pitch: I / 32 bytes used (18 at TP4, 36 at TP2), padded to whole 32-byte pieces
+__host__ __device__ constexpr int asp(int I) { return (I / 32 + 31) / 32 * 32; }
 
 struct Args
 {
@@ -61,7 +62,7 @@ struct Args
     float limit;
     __half* act;                  // [tile][8][I] fp16 (fc1 out)
     uint8_t* aq;                  // [tile * 8][I / 64][XREC]  act quantized (k_aq)
-    uint8_t* as;                  // [tile * 8][ASP]
+    uint8_t* as;                  // [tile * 8][asp(I)]
     __half* ypart;                // [tile][8][NOUT]
 };
 
@@ -173,7 +174,7 @@ __global__ void __launch_bounds__(256) k_xq(const __nv_bfloat16* __restrict__ x,
     store_block(xq + (static_cast<size_t>(row) * (K / 64) + (j >> 1)) * XREC, j & 1, v, inv);
     xs[static_cast<size_t>(row) * kb + j] = static_cast<uint8_t>(code);
 }
-// act [rows][I] fp16 (rows = tiles * 8, cut to the plan's 8 * n_tiles) -> aq [rows][I/64][XREC], as [rows][ASP] (bytes I/32.. of a row are not written).
+// act [rows][I] fp16 (rows = tiles * 8, cut to the plan's 8 * n_tiles) -> aq [rows][I/64][XREC], as [rows][asp(I)] (bytes I/32.. of a row are not written).
 // grid = ceil(rows * I / 32 / 256).
 __global__ void __launch_bounds__(256) k_aq(const __half* __restrict__ act, int rows, const int* __restrict__ n_tiles_dev, int I, uint8_t* __restrict__ aq,
                                             uint8_t* __restrict__ as)
@@ -202,7 +203,7 @@ __global__ void __launch_bounds__(256) k_aq(const __half* __restrict__ act, int 
     float inv;
     const u32 code = mx_scale(amax, inv);
     store_block(aq + (static_cast<size_t>(row) * (I / 64) + (j >> 1)) * XREC, j & 1, v, inv);
-    as[static_cast<size_t>(row) * ASP + j] = static_cast<uint8_t>(code);
+    as[static_cast<size_t>(row) * asp(I) + j] = static_cast<uint8_t>(code);
 }
 
 // ---------------------------------------------------------------------------------------------------- fc1
@@ -357,7 +358,7 @@ __global__ void __launch_bounds__(CW * 32) k_fc1_tc(Args A)
                         const u32 b = e4m3x4(v[t][k] * inv, v[t][2 + k] * inv, 0.f, 0.f);
                         rec[off_g] = static_cast<uint8_t>(b);
                         rec[off_g8] = static_cast<uint8_t>(b >> 8);
-                        if ((warp & 1) == 0 && g == 0) A.as[row * ASP + j] = static_cast<uint8_t>(code);
+                        if ((warp & 1) == 0 && g == 0) A.as[row * asp(I) + j] = static_cast<uint8_t>(code);
                     }
                 }
         }
@@ -455,7 +456,7 @@ __global__ void __launch_bounds__(WARPS * 32, 2) k_fc2_tc(Args A)
 {
     constexpr int NG = I / KG, OT = NOUT / 16, NB = OT / TPC, NTG = WARPS * TW, NTH = WARPS * 32, AST = TPC * GR, ACH = GR / 16, NA = (TPC * ACH + NTH - 1) / NTH;
     constexpr int NSW = (NG + 1) / 2;                                        // scale words per row (2 records each)
-    static_assert(I % KG == 0 && OT % TPC == 0 && I % 16 == 0 && ST >= 2 && ST - 1 <= NG && NSW * 4 <= ASP, "fc2 tc tiling");
+    static_assert(I % KG == 0 && OT % TPC == 0 && I % 16 == 0 && ST >= 2 && ST - 1 <= NG && NSW * 4 <= asp(I), "fc2 tc tiling");
     static_assert(TPC * 16 <= 128 && (TPC * 16) % 64 == 0 && YP % 8 == 0, "fc2 tc output staging: a row of 16-B pieces; a block = whole 128-B slot lines");
     extern __shared__ __align__(16) uint8_t sm[];
     __half* ys = reinterpret_cast<__half*>(sm + ST * AST) + (threadIdx.x >> 5) * 8 * YP;   // the warp's output stage [8 rows][YP]
@@ -503,7 +504,7 @@ __global__ void __launch_bounds__(WARPS * 32, 2) k_fc2_tc(Args A)
             #pragma unroll
             for (int r = 0; r < NG; ++r) bq[tw][r] = live ? __ldg(reinterpret_cast<const uint4*>(A.aq + row * I + r * XREC + c * 16)) : make_uint4(0, 0, 0, 0);
             #pragma unroll
-            for (int k = 0; k < NSW; ++k) sw[tw][k] = live ? __ldg(reinterpret_cast<const u32*>(A.as + row * ASP + k * 4)) : 0u;
+            for (int k = 0; k < NSW; ++k) sw[tw][k] = live ? __ldg(reinterpret_cast<const u32*>(A.as + row * asp(I) + k * 4)) : 0u;
             mask[tw] = live ? A.tile_mask[t0 + t] : 0;
             w0[tw] = live ? A.tile_w[(t0 + t) * 8 + 2 * c] : 0.f;
             w1[tw] = live ? A.tile_w[(t0 + t) * 8 + 2 * c + 1] : 0.f;

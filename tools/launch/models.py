@@ -62,11 +62,11 @@ GLM53F = Model('glm53f', 'GLM-5.3-Flash', 'https://huggingface.co/kindlingai/glm
                {1: ('k2',), 2: ('k4',), 3: ('k4',), 4: ('k4',)}, 'gr8-glm53f', 'Glm5NextForConditionalGeneration', True, True, True,
                served=('glm-5.3-flash', 'glm53f'))   # its own names: a router that lists models by name keeps it apart from GLM-5.3
 # DeepSeek-V4.1-Flash-1017 (docs/DEEPSEEK.md): the official weights in the exlr8 native layout (FP8 trunk, MXFP4 routed
-# experts), no width variants, TP=4. Its drafter is DSpark, the checkpoint's MTP layers (GR8_DS_MTP), not DFlash2. The front
+# experts), no width variants, TP=4 or 2. Its drafter is DSpark, the checkpoint's MTP layers (GR8_DS_MTP), not DFlash2. The front
 # end speaks the ds41 dialect (DSML tool calls, numeric reasoning effort). A request that names no reasoning effort gets
 # low (50), which kept the release's answers at about a quarter of high's thinking tokens.
 DS41 = Model('ds41', 'DeepSeek-V4.1-Flash', 'https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native',
-             'g6m4_ds41', 'ds41', ('4',), {}, {}, 'gr8-ds41', 'DeepseekV41ForCausalLM', False, False, True,
+             'g6m4_ds41', 'ds41', ('4', '2'), {}, {}, 'gr8-ds41', 'DeepseekV41ForCausalLM', False, False, True,
              dialect='ds41', served=('deepseek-v4.1-flash',), vocab=129280, eos_ids=(1,),   # engine/model_geom_ds41.h VOCAB, TOK_EOS
              defaults=(('DEFAULT_MAX_TOKENS', '32768'), ('DEFAULT_REASONING_EFFORT', 'low')))
 # The pseudo engine (frontend/pseudo-engine): GLM-5.3's tokens and chat template, answers from a TOML file of rules, on

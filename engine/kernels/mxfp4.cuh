@@ -606,4 +606,77 @@ __global__ void __launch_bounds__(WARPS * 32) k_fc2_mt(ArgsMT A)
             }
         }
 }
+// k_fc2_mt with the NT smem B tables in DYNAMIC shared memory (launch with NT * KSI * 64 * 4 bytes + cudaFuncSetAttribute
+// MaxDynamicSharedMemorySize): the static limit is 48 KB, and at TP2 (I-slice 1152) NT = 3 needs 55296 B, NT = 4 73728 B. A copy, not an
+// edit, of k_fc2_mt, as dsh::k_sh_fc2_mt_dyn is of k_sh_fc2_mt: the existing instances' SASS stays as it is. Same arithmetic, same order.
+template <int I, int NOUT, int WARPS, int DEPTH, int NT, int PDLM = 0>
+__global__ void __launch_bounds__(WARPS * 32) k_fc2_mt_dyn(ArgsMT A)
+{
+    constexpr int NG = I / KG, OT = NOUT / 16, UPS = OT / WARPS, KSI = I / 16;
+    static_assert(I % KG == 0 && OT % WARPS == 0, "fc2 tiling");
+    extern __shared__ __align__(16) u32 sbd[];
+    if constexpr (PDLM != 0) pdl_trigger();
+    const int slot = blockIdx.x / UPS, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (A.n_slots_dev && slot >= *A.n_slots_dev)
+    {
+        if constexpr (PDLM != 0) pdl_wait();
+        return;
+    }
+    const int ot = (blockIdx.x % UPS) * WARPS + warp;
+    const int nt = A.slot_nt[slot], tile0 = A.slot_tile0[slot];
+    const size_t eb = static_cast<size_t>(A.slot_expert[slot]) * OT * NG * GR;
+    const uint8_t* s = A.fc2 + eb + static_cast<size_t>(ot) * NG * GR;
+    Grp nx[DEPTH];
+    #pragma unroll
+    for (int p = 0; p < DEPTH; ++p)
+        if (p < NG) nx[p].load(s + p * GR, lane);
+    pdl_wait();
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+        if (t < nt)
+            for (int i = threadIdx.x; i < KSI * 64; i += WARPS * 32)
+            {
+                const int ks = i >> 6, l = (i >> 1) & 31, reg = i & 1;
+                sbd[t * (KSI * 64) + i] = __ldcg(reinterpret_cast<const u32*>(A.act + (static_cast<size_t>(tile0 + t) * 8 + (l >> 2)) * I + ks * 16 + reg * 8 + 2 * (l & 3)));
+            }
+    __syncthreads();
+    int boff[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) boff[t] = t * KSI * 64 + lane * 2;
+    float acc[NT][4];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+    const u32* xb = sbd;
+    for (int g = 0; g < NG; g += DEPTH)
+    {
+        Grp cur[DEPTH];
+        #pragma unroll
+        for (int p = 0; p < DEPTH; ++p) cur[p] = nx[p];
+        #pragma unroll
+        for (int p = 0; p < DEPTH; ++p)
+            if (g + DEPTH + p < NG) nx[p].load(s + (g + DEPTH + p) * GR, lane);
+        #pragma unroll
+        for (int p = 0; p < DEPTH; ++p)
+            if (g + p < NG) cur[p].template run_mt<NT>(xb, boff, (g + p) * 4, nt, acc);
+    }
+    const int r = lane >> 2, c = lane & 3, o = ot * 16 + r;
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+        if (t < nt)
+        {
+            const int mask = A.tile_mask[tile0 + t];
+            const float* w = A.tile_w + (tile0 + t) * 8;
+            __half* y = A.ypart + static_cast<size_t>(tile0 + t) * 8 * NOUT;
+            if ((mask >> (2 * c)) & 1)
+            {
+                y[(2 * c) * NOUT + o] = __float2half_rn(w[2 * c] * acc[t][0]);
+                y[(2 * c) * NOUT + o + 8] = __float2half_rn(w[2 * c] * acc[t][2]);
+            }
+            if ((mask >> (2 * c + 1)) & 1)
+            {
+                y[(2 * c + 1) * NOUT + o] = __float2half_rn(w[2 * c + 1] * acc[t][1]);
+                y[(2 * c + 1) * NOUT + o + 8] = __float2half_rn(w[2 * c + 1] * acc[t][3]);
+            }
+        }
+}
 }   // namespace mx4

@@ -14,7 +14,7 @@
 #                                         (-DG6_MODEL_FLASH=1, engine/model_geom.h); TP = 1 to 4 unless GR8_WIDTHS or
 #                                         GR8_NR says otherwise. With KV_FORMAT=int4, only OUT_DIR/g6m4_flash-int4
 #   MODEL=ds41 scripts/build.sh bin       only OUT_DIR/g6m4_ds41 and OUT_DIR/m4sim_ds41: DeepSeek-V4.1-Flash-1017
-#                                         (-DG6_MODEL_DS41=1, engine/model_geom_ds41.h, docs/DEEPSEEK.md), fp8 KV only; TP = 4
+#                                         (-DG6_MODEL_DS41=1, engine/model_geom_ds41.h, docs/DEEPSEEK.md), fp8 KV only; TP = 4 and 2
 #                                         unless GR8_WIDTHS or GR8_NR says otherwise
 #   GR8_DS_TRUNK_BF16=0 MODEL=ds41      the DS41 engine with the FP32 mHC trunk. Unset or 1 (the default): the BF16 trunk
 #                                         (-DDS_MHC_TRUNK_BF16, the same bits, half the trunk traffic and memory;
@@ -136,7 +136,7 @@ case "${MODEL:-glm}" in
     exit 0 ;;
   ds41)    # g6m4 and m4sim in their own object dir, installed as g6m4_ds41 / m4sim_ds41 next to the GLM build
     [ "${KV_FORMAT:-fp8}" = fp8 ] || { echo "MODEL=ds41: KV_FORMAT=fp8 only"; exit 2; }
-    WIDTHS=${GR8_WIDTHS:-${GR8_NR:-4}}
+    WIDTHS=${GR8_WIDTHS:-${GR8_NR:-4 2}}
     # PF_FC2GL must divide HID / 128 = 40 (GLM 48: 6; Flash 32: 4; 4 divides 40); build_m4.sh leaves out PF_F12 for every non-GLM model
     # DS41_WHAT=sim: m4sim only (no g6m4, so no libibverbs and no fabric objects)
     DS41_X=$(bash "$REPO/scripts/ds41_build_flags.sh")   # the DS41 build knobs (GR8_DS_TRUNK_BF16)
