@@ -35,6 +35,7 @@
 #include "ds41_prefill_fabric.h"
 #include "ds41_rowshard.h"
 #include "ds41_rs.h"
+#include "ds41_v2.h"
 #endif
 
 namespace g6rt
@@ -43,14 +44,14 @@ namespace g6rt
 enum class FabKind
 {
     Main, LaneB, Prefill, Prefill2, PoolIds, PoolIds2, RouteSplit, RouteSplit2, Draft, DSpark, Dflash, QpWire, Cp,
-    Gather, CpStage, DraftGather,
+    Gather, CpStage, DraftGather, Ds41V2,
 };
-constexpr int kFabKinds = 16;
+constexpr int kFabKinds = 17;
 // main()'s name for each
 inline const char* fab_name(FabKind k)
 {
     static const char* const n[kFabKinds] = {"fab", "fabB", "fabp", "fabp2", "fabix", "fabix2", "fabrs", "fabrs2", "fabd",
-                                             "fabds", "fabf", "fabq", "fabc", "fabg", "fabs", "fabdg"};
+                                             "fabds", "fabf", "fabq", "fabc", "fabg", "fabs", "fabdg", "fabv2"};
     return n[(int)k];
 }
 
@@ -76,6 +77,7 @@ struct PlanKnobs
     bool cp_s3 = false;
     std::optional<int64_t> cp_mmax, cp_r2;
     std::optional<std::string> ds_prefill_w, ds_pf_tail, ds_pf_pool, ds_pf_lanes;
+    bool ds_pf_v2 = false, ds_pf_v2_xtrace = false;
     bool ds_pf_l20_tail = false, ds_pf_rs = false, ds_mhc_row_shard = false, ds_mhc_fuse = false, ds_mhc_y_mxfp8 = false;
     bool ds_pf_direct = false, ds_subdump = false, ds_stripe = false, ds_xtrace = false;
     int64_t ds_stripe_min = 0;
@@ -93,7 +95,8 @@ inline PlanKnobs plan_knobs()
     k.cp = knob::cp(); k.cp_r = knob::cp_r(); k.cp_step_rows = knob::cp_step_rows(); k.cp_s3 = knob::cp_s3();
     k.cp_mmax = knob::cp_mmax(); k.cp_r2 = knob::cp_r2();
     k.ds_prefill_w = knob::ds_prefill_w(); k.ds_pf_tail = knob::ds_pf_tail(); k.ds_pf_pool = knob::ds_pf_pool();
-    k.ds_pf_lanes = knob::ds_pf_lanes();
+    k.ds_pf_lanes = knob::ds_pf_lanes(); k.ds_pf_v2 = knob::ds_pf_v2();
+    k.ds_pf_v2_xtrace = knob::ds_pf_v2_xtrace();
     k.ds_pf_l20_tail = knob::ds_pf_l20_tail(); k.ds_pf_rs = knob::ds_pf_rs(); k.ds_mhc_row_shard = knob::ds_mhc_row_shard();
     k.ds_mhc_fuse = knob::ds_mhc_fuse(); k.ds_mhc_y_mxfp8 = knob::ds_mhc_y_mxfp8();
     k.ds_pf_direct = knob::ds_pf_direct(); k.ds_subdump = knob::ds_subdump().has_value(); k.ds_stripe = knob::ds_stripe();
@@ -176,8 +179,8 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
     g6::FabricConfig cmB;               // GR8_DS_PF_LANES=2: lane B's runs
     // A W-row headless prefill chunk uses the same fabric as decode; unset, the slot holds MX rows.
     if (s2mode) {
-        const int pf_rows = ds41_prefill_rowcap(txt(k.ds_prefill_w), MX);
-        if (!pf_rows) return "DS41 serve: GR8_DS_PREFILL_W must be MX..4096";
+        const int pf_rows = ds41_prefill_rowcap(txt(k.ds_prefill_w), MX, k.ds_pf_v2);
+        if (!pf_rows) return k.ds_pf_v2 ? "DS41 v2 serve: GR8_DS_PREFILL_W must be MX..8192" : "DS41 serve: GR8_DS_PREFILL_W must be MX..4096";
         p.pf_rows = pf_rows;
         cfg.slot_bytes = ds41_prefill_fabric_payload(pf_rows, HID, NX ? 6144 : 0);
         // the main fabric's slots sized per collective as a W chunk sends them (s2/ds41_prefill.h ds41_chunk_collectives):
@@ -276,6 +279,15 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
     }
     cfg.xtrace = 0;
 #if G6_MODEL_DS41
+    if (k.ds_pf_v2) {
+        if (!s2mode || !ds41::v2::boot_ok(p.pf_rows,p.tail,g6nr::NR,p.pf_lanes_fab,p.l20_tail?20:21))
+            return "GR8_DS_PF_V2 needs serve, TP4, W=256..8192 multiple of 256, one lane, tail128 and layer21 boundary";
+        const size_t state_row=4*HID*in.trunk_bytes+(24+4+4+16)*sizeof(float)+HID*2;
+        auto vc=ds41::v2::fabric_config(cfg,p.pf_rows,HID,state_row,6352);
+        vc.xtrace=k.ds_pf_v2_xtrace ? 1 : 0; // Fabric::init also requires GR8_XTRACE=1
+        vc.port=cfg.port+104; vc.proxy_cpu=cfg.proxy_cpu>1?cfg.proxy_cpu-2:-1;
+        add(FabKind::Ds41V2,104,vc);
+    }
     // GR8_DS_PF_LANES=2: lane B's own fabric, port + 96, proxy core N-2 (DS41 builds no fabp / fabp2)
     if (p.pf_lanes_fab == 2) {
         if (!s2mode || !cmB.run1) return "GR8_DS_PF_LANES=2 needs --serve with W-row prefill (GR8_DS_PREFILL_W > MX)";

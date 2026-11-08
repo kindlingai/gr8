@@ -18,6 +18,8 @@ namespace g6 {
 
 constexpr int XT_STEPS = 64, XT_W = 16;
 enum { XT_PUB = 0, XT_DB = 1, XT_TAIL = 2, XT_RED = 10, XT_SEQ = 11 };
+// Optional v2 extension in the four unused words; legacy G/P lines stay unchanged.
+enum { XT_PRODUCED = 12, XT_WAIT_BEGIN = 13, XT_JOIN_BEGIN = 14, XT_JOIN_END = 15 };
 
 inline bool xtrace_env() { return knob::xtrace(); }
 
@@ -39,6 +41,7 @@ inline void xt_dump_gpu(FILE* o, const unsigned long long* dev, int ncoll, int n
   cudaStream_t s; cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
   cudaMemcpyAsync(h, dev, n * 8, cudaMemcpyDeviceToHost, s); cudaStreamSynchronize(s); cudaStreamDestroy(s);
   fprintf(o, "# G rank %d: step c pub db tail[0..%d] red | d_db_pub d_tail[p]_db.. d_red_lasttail (ns, globaltimer)\n", rank, nr - 1);
+  fprintf(o, "# V step c produced wait_begin join_begin join_end (ns, globaltimer; 0 = absent; v2 G red = unpack/reduce end)\n");
   for (int i = 0; i < XT_STEPS * ncoll; i++) {
     const unsigned long long* r = h + (size_t)i * XT_W;
     if (!r[XT_SEQ]) continue;
@@ -49,6 +52,9 @@ inline void xt_dump_gpu(FILE* o, const unsigned long long* dev, int ncoll, int n
     fprintf(o, " %llu | %lld", r[XT_RED], (long long)(r[XT_DB] - r[XT_PUB]));
     for (int p = 0; p < nr && p < 8; p++) fprintf(o, " %lld", r[XT_TAIL + p] ? (long long)(r[XT_TAIL + p] - r[XT_DB]) : 0LL);
     fprintf(o, " %lld\n", (r[XT_RED] && mx) ? (long long)(r[XT_RED] - mx) : 0LL);
+    if (r[XT_PRODUCED])
+      fprintf(o, "V %llu %d %llu %llu %llu %llu\n", step, c,
+              r[XT_PRODUCED], r[XT_WAIT_BEGIN], r[XT_JOIN_BEGIN], r[XT_JOIN_END]);
   }
   free(h);
 }
