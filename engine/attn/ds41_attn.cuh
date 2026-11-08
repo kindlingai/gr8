@@ -1129,6 +1129,8 @@ __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_t(AttnP p)
         }
     }
 }
+#include "ds41_attn_pipe.cuh"
+
 // Split-key-block variant of the existing cp.async + mma.sync core; default-off. CQ as k_attn_cpa_t.
 template <bool FL, bool CQ = false>
 __global__ void __launch_bounds__(AT_THREADS, 1) k_attn_cpa_split_t(AttnP p)
@@ -1701,6 +1703,7 @@ inline bool g_comp_fp8 = false; // GR8_DS_COMP_FP8, default off; lossy, quality 
 inline int g_src_fast = 0;   // GR8_DS_SRC_FAST bits, set by ds41_attn_set_src_fast: 1 = comp_row uses k_f32gemv2 (bit-identical to k_f32gemm2); 2 = the rank TU routes idx wq_b through the GEMV
 inline int g_win_floor = 0;  // ds41_attn_set_win_floor: the window floor attn_core puts in AttnP (bounded replay, eager prefill only); 0 = none
 inline int g_attn_cpa = 0;   // GR8_DS_ATTN_CPA, set by ds41_attn_set_cpasync: 1 = launch_attn runs k_attn_cpa (cp.async K gather, bit-identical to k_attn)
+inline bool g_attn_pipe = false; // enabled only while the v2 prefill conductor enqueues
 inline int g_attn_split = 0; // GR8_DS_ATTN_SPLIT=1, default off; two CTAs per row/head-group plus online-softmax merge
 inline int g_gv_tpc = 1, g_gv_ks = 0;   // output tiles per CTA; k-parts per tile (0 = the default pick, gv_pick_ks in ds41_attn_gv.cuh)
 inline XfragFn g_fn_xfrag = nullptr;
@@ -1773,6 +1776,13 @@ inline void launch_attn(const AttnP& p, cudaStream_t st)
     if (g_attn_split && g_attn_cpa && p.split && split_eligible(p.n, p.WL, p.TK)) {
         (q ? k_attn_cpa_split_t<false, true> : k_attn_cpa_split_t<false>)<<<dim3(p.n, p.heads / 16, 2), AT_THREADS, AT_SMEM_CPA, st>>>(p);
         k_attn_cpa_split_merge<<<g, AT_THREADS, 0, st>>>(p);
+    } else if (g_attn_pipe && g_attn_cpa && q) {
+        static bool pipe_init = false;
+        if (!pipe_init) {
+            cudaFuncSetAttribute(k_attn_cpa_pipe_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)AT_SMEM_PIPE);
+            pipe_init = true;
+        }
+        k_attn_cpa_pipe_q<<<g, AT_THREADS, AT_SMEM_PIPE, st>>>(p);
     } else if (g_attn_cpa) (q ? k_attn_cpa_q : k_attn_cpa)<<<g, AT_THREADS, AT_SMEM_CPA, st>>>(p);
     else (q ? k_attn_q : k_attn)<<<g, AT_THREADS, AT_SMEM, st>>>(p);
 }
