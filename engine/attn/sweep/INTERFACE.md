@@ -28,8 +28,8 @@ be written. All input buffers, positions, masks, dimensions, sink, scale,
 compressed format and top-k order remain unchanged. No global knob changes,
 allocations, host synchronization, reference reads, or hidden setup per launch.
 Change the implementation and launch geometry inside the variant only; do not
-edit shared engine headers or the bench. One kernel per launch in v1 (resource
-columns refer to that kernel). For unsupported cases, dispatch the original
+edit shared engine headers or the bench. One kernel per launch in v1, except the approved prewiden pre-pass below
+(resource columns refer to the main kernel). For unsupported cases, dispatch the original
 kernel and report its pointer/key/smem. In particular the built-in pipe/swz
 variants fall back to off for window-only and floor>0 cases, as serving does.
 
@@ -169,3 +169,14 @@ shape validation (throw `std::runtime_error` for invalid args). Each variant's
 `kernel`, `ptxas_key`, `dynamic_smem`, `init`, `launch` takes that adapter's Params.
 Selecting another reference changes comparison baseline, clearly named in reports;
 attention's acceptance bar in this campaign remains `--reference off`.
+
+## Approved prewiden exception (tribune ruling)
+
+`init(p)` may allocate variant-owned scratch once per case outside timing,
+using a static/namespace pointer sized from p. Release at process exit or the
+next init; no allocation in launch. Besides p.out, only this scratch may be
+written. `launch(p, stream)` may enqueue the pre-pass then main kernel on
+that stream; CUDA events cover BOTH. `kernel()`/`ptxas_key()` describe the
+main kernel. The variant's report must separately list pre-pass regs, STACK,
+spills from its ptxas entry and scratch bytes. On allocation failure return
+cudaErrorMemoryAllocation from init, so the generic runner retries.

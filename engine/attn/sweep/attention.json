@@ -1,0 +1,7 @@
+{
+  "name": "attention_cq",
+  "header": "adapter.cuh",
+  "variants_dir": "variants",
+  "case_generator": "cases.py",
+  "defines": ["G6_MODEL_DS41=1"]
+}
