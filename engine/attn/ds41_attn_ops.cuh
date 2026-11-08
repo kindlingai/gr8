@@ -39,6 +39,7 @@ void ds41_attn_core(const ds41a::Weights*, const ds41a::Cache*, const void* comp
 void ds41_attn_out(const ds41a::Weights*, const ds41a::Scratch*, int n, int start, int heads, void* out, void* st, const int* dstart, int direct_c2);
 void ds41_attn_inv_freqs(int compressed, float* out32);
 void ds41_attn_set_gv(int on, int tpc, int ks, ds41a::XfragFn fn_xfrag, ds41a::GemvFn fn_gemv);
+void ds41_attn_codes_reserve(size_t bytes);
 void ds41_attn_set_src_fast(int bits);
 void ds41_attn_set_tc(int on);
 void ds41_attn_set_tc_mfast(int on);
@@ -297,6 +298,13 @@ inline int ds41_attn_bind(void* model, int i, int capacity, void* stream)
     }
     a->heads = plan.heads;
     W = plan.W;
+    {   // GR8_DS41_GV_ONLY: projections without codes rebuild them per GEMM into scratch; size it for this layer's largest
+        const int G = a->heads / ds41a::HPG;
+        size_t most = 0;
+        for (const auto& [w, g] : {std::pair<const ds41a::Fp8Mat*, int>{&W.wq_a, 1}, {&W.wq_b, 1}, {&W.wkv, 1}, {&W.wo_a, G}, {&W.wo_b, 1}})
+            if (!w->w) most = std::max(most, (size_t)g * w->N * w->K);
+        if (most) ds41_attn_codes_reserve(most);
+    }
     if (knob::ds41_gv_quad())   // GR8_DS41_GV_QUAD=1: repack this layer's q_b / o_a / o_b GEMV records to quads, in place, before any capture
     {
         const int G = a->heads / ds41a::HPG, tpc = (int)knob::ds_attn_gv_tpc(), ks = (int)knob::ds_attn_gv_ks();

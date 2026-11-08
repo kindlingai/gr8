@@ -52,12 +52,13 @@ struct Planner
         if (!rows) rows = N;
         const std::string p = plan_name(l, nm);
         Fp8Mat w{};
-        w.w = u8(p + ".mx.codes", rows, K);
+        // the pack's GEMV records [rows/16][K/32][528] (densev.cuh Mxfp8), when the pack has them: the decode projections use them
+        const PlanTensor g = find(p + ".mx.gv");
+        // without them the codes must be there; with them a GR8_DS41_GV_ONLY image leaves the codes out (w = null)
+        w.w = g.p && !find(p + ".mx.codes").p ? nullptr : u8(p + ".mx.codes", rows, K);
         w.s = u8(p + ".mx.scales", rows, K / 32);   // the pack's form: [rows][K/32], the block-row scale repeated per row
         w.N = (int)N;
         w.K = (int)K;
-        // the pack's GEMV records [rows/16][K/32][528] (densev.cuh Mxfp8), when the pack has them: the decode projections use them
-        const PlanTensor g = find(p + ".mx.gv");
         if (g.p)
         {
             if (g.nd != 3 || g.shape[0] != rows / 16 || g.shape[1] != K / 32 || g.shape[2] != 528) fail("bad tensor " + p + ".mx.gv");
@@ -87,8 +88,9 @@ template <class Find>
 std::string plan_attn(Find&& find, int l, bool compressor, Plan& out)
 {
     Planner<Find> P{find, l, std::string()};
-    const PlanTensor qb = find(plan_name(l, "q_b.mx.codes"));
-    if (!qb.p || qb.nd != 2 || qb.shape[1] != QA || qb.shape[0] % (16 * HD)) return "DS41 attention bind: bad q_b of layer " + std::to_string(l);
+    // the rows of q_b from its scales [rows][QA/32]: a GR8_DS41_GV_ONLY image has no q_b codes
+    const PlanTensor qb = find(plan_name(l, "q_b.mx.scales"));
+    if (!qb.p || qb.nd != 2 || qb.shape[1] != QA / 32 || qb.shape[0] % (16 * HD)) return "DS41 attention bind: bad q_b of layer " + std::to_string(l);
     out.heads = (int)(qb.shape[0] / HD);
     out.G = out.heads / HPG;
     Weights& W = out.W;

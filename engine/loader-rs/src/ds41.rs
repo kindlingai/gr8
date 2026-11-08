@@ -519,6 +519,23 @@ pub struct Opts {
     pub manifest: Option<String>,
     /// the decode head as MXFP8 records, G.lm_head.mx.gv, in place of the BF16 ones (GR8_DS41_HEAD_MX); false = BF16
     pub head_mx: bool,
+    /// leave out the DSpark layers 40..42 (GR8_DS_MTP unset or 0: the engine builds no draft Model); the release check
+    /// then skips their tensors
+    pub no_dspark: bool,
+    /// GR8_DS41_GV_ONLY: the attention projections without their .mx.codes, the shared experts without .mx.codes and
+    /// .mx.scales, and the BF16 head without its plain rows; only the forms the engine reads stay
+    pub gv_only: bool,
+}
+
+/// Which of the three MXFP8 forms of a matrix the image holds (`Planner::mx`).
+#[derive(Clone, Copy, PartialEq)]
+enum MxForms {
+    /// codes, scales and the GEMV records
+    All,
+    /// scales and records: the engine rebuilds the codes from the records when a GEMM needs them
+    NoCodes,
+    /// the records alone
+    Records,
 }
 
 /// Blocks of 128 in an expert (2304 wide): the exlr8 v2 halves of a DS41 layer.
@@ -632,6 +649,12 @@ impl Planner<'_> {
     /// it, as `P.mx.codes` u8 [n,k], `P.mx.scales` u8 [n,k/32] (each block-row scale repeated over its 32 rows: exact)
     /// and `P.mx.gv`, the decode record.
     fn mx(&mut self, p: &str, native: &str, rows: Option<Range<usize>>, cols: Option<Range<usize>>) -> Result<(), String> {
+        self.mx_forms(p, native, rows, cols, MxForms::All)
+    }
+
+    /// `mx` with only `forms` of the matrix in the image.
+    fn mx_forms(&mut self, p: &str, native: &str, rows: Option<Range<usize>>, cols: Option<Range<usize>>, forms: MxForms)
+                -> Result<(), String> {
         let q = self.rel.qmat(native)?;
         self.used.insert(native.to_string());
         if q.nib || q.sr != BLK {
@@ -647,9 +670,11 @@ impl Planner<'_> {
         self.note(&q.f.clone(), c.into_iter().chain(s));
         let (n, k) = (rows.len(), cols.len());
         let name = |s: &str| format!("{p}.mx.{s}");
+        let keep = [forms == MxForms::All, forms != MxForms::Records, true];
         let specs = vec![(name("codes"), "u8", vec![n as i64, k as i64]),
                          (name("scales"), "u8", vec![n as i64, (k / BLK) as i64]),
                          (name("gv"), "u8", vec![(n / 16) as i64, (k / BLK) as i64, 528])];
+        let specs = specs.into_iter().zip(keep).filter(|(_, k)| *k).map(|(s, _)| s).collect();
         self.gen(p.to_string(), specs, move || {
             let codes = q.codes(&rows, &cols)?;
             let raw = q.scales(&rows, &cols)?;
@@ -660,7 +685,7 @@ impl Planner<'_> {
                 scales.extend_from_slice(&raw[br..br + kc]);
             }
             let gv = records::mxfp8_record(&codes, &scales, k);
-            Ok(vec![codes, scales, gv])
+            Ok([codes, scales, gv].into_iter().zip(keep).filter(|(_, k)| *k).map(|(b, _)| b).collect())
         });
         Ok(())
     }
@@ -668,6 +693,11 @@ impl Planner<'_> {
     /// A bf16 matrix `native` [N,K], rows `rows` of it, as stored, plus its decode record `P.gv` when `gv` and
     /// rows % 16 == 0 and K % 16 == 0.
     fn bf16_mat(&mut self, p: &str, native: &str, rows: Option<Range<usize>>, gv: bool) -> Result<(), String> {
+        self.bf16_mat_forms(p, native, rows, gv, true)
+    }
+
+    /// `bf16_mat` without the plain rows when `plain` is false.
+    fn bf16_mat_forms(&mut self, p: &str, native: &str, rows: Option<Range<usize>>, gv: bool, plain: bool) -> Result<(), String> {
         let native = native.strip_suffix(".weight").unwrap_or(native);
         let (s, nn, k) = self.rel.bf16(native)?;
         self.used.insert(native.to_string());
@@ -676,7 +706,9 @@ impl Planner<'_> {
             return Err(format!("{native}: rows {rows:?} of {nn}"));
         }
         let n = rows.len();
-        self.copy(p.to_string(), "bf16", vec![n as i64, k as i64], &s, (rows.start * k * 2) as u64)?;
+        if plain {
+            self.copy(p.to_string(), "bf16", vec![n as i64, k as i64], &s, (rows.start * k * 2) as u64)?;
+        }
         if gv && n % 16 == 0 && k % 16 == 0 {
             // stripes of whole 16-row tiles, about 16 MB of input each
             let per = ((16usize << 20) / (k * 2) / 16).max(1) * 16;
@@ -779,16 +811,17 @@ impl Planner<'_> {
         let hd = qb[0] / heads;
         let oa = self.rel.dims(&t("attn.wo_a"))?;
         let ob = self.rel.dims(&t("attn.wo_b"))?;
-        self.mx(&format!("{p}.q_a"), &t("attn.wq_a"), None, None)?;
+        let af = if self.opts.gv_only { MxForms::NoCodes } else { MxForms::All };
+        self.mx_forms(&format!("{p}.q_a"), &t("attn.wq_a"), None, None, af)?;
         self.vector(format!("{p}.q_a_norm"), &t("attn.q_norm.weight"))?;
-        self.mx(&format!("{p}.q_b"), &t("attn.wq_b"), Some(g.start * hpg * hd..g.end * hpg * hd), None)?;
-        self.mx(&format!("{p}.kv"), &t("attn.wkv"), None, None)?;
+        self.mx_forms(&format!("{p}.q_b"), &t("attn.wq_b"), Some(g.start * hpg * hd..g.end * hpg * hd), None, af)?;
+        self.mx_forms(&format!("{p}.kv"), &t("attn.wkv"), None, None, af)?;
         self.vector(format!("{p}.kv_norm"), &t("attn.kv_norm.weight"))?;
         self.copy(format!("{p}.attn_sink"), "f32", vec![(g.len() * hpg) as i64], &sink, (g.start * hpg * 4) as u64)?;
         let rpg = oa[0] / O_GROUPS;
-        self.mx(&format!("{p}.o_a"), &t("attn.wo_a"), Some(g.start * rpg..g.end * rpg), None)?;
+        self.mx_forms(&format!("{p}.o_a"), &t("attn.wo_a"), Some(g.start * rpg..g.end * rpg), None, af)?;
         let cpg = ob[1] / O_GROUPS;
-        self.mx(&format!("{p}.o_b"), &t("attn.wo_b"), None, Some(g.start * cpg..g.end * cpg))?;
+        self.mx_forms(&format!("{p}.o_b"), &t("attn.wo_b"), None, Some(g.start * cpg..g.end * cpg), af)?;
         if self.rel.has(&t("attn.compressor.wkv")) {
             self.bf16_mat(&format!("{p}.cmp.wkv"), &t("attn.compressor.wkv"), None, true)?;
         }
@@ -827,9 +860,10 @@ impl Planner<'_> {
         if sl.len() % BLK != 0 {
             return Err(format!("{p}: shared expert slice {sl:?} is not 32-aligned"));
         }
-        self.mx(&format!("{p}.sh.w1"), &t("ffn.shared_experts.w1"), Some(sl.clone()), None)?;
-        self.mx(&format!("{p}.sh.w3"), &t("ffn.shared_experts.w3"), Some(sl.clone()), None)?;
-        self.mx(&format!("{p}.sh.w2"), &t("ffn.shared_experts.w2"), None, Some(sl))?;
+        let sf = if self.opts.gv_only { MxForms::Records } else { MxForms::All };
+        self.mx_forms(&format!("{p}.sh.w1"), &t("ffn.shared_experts.w1"), Some(sl.clone()), None, sf)?;
+        self.mx_forms(&format!("{p}.sh.w3"), &t("ffn.shared_experts.w3"), Some(sl.clone()), None, sf)?;
+        self.mx_forms(&format!("{p}.sh.w2"), &t("ffn.shared_experts.w2"), None, Some(sl), sf)?;
         let n_exp = self.opts.experts.map_or(n_exp, |m| m.min(n_exp));
         self.routed(&p, pre, n_exp)?;
         self.layer_tail(pre, &p)
@@ -895,7 +929,7 @@ impl Planner<'_> {
         // GR8_DS41_HEAD_MX=1: the decode head as MXFP8 records, G.lm_head.mx.gv, which build_ds41 binds ahead of the BF16
         // records. Rounded (records::mxfp8_quantize, round to nearest): the logits change.
         let mx = self.opts.head_mx;
-        self.bf16_mat("G.lm_head", "head", Some(rows.clone()), !mx)?;
+        self.bf16_mat_forms("G.lm_head", "head", Some(rows.clone()), !mx, !self.opts.gv_only)?;
         if mx {
             self.head_mx(rows)?;
         }
@@ -1002,7 +1036,7 @@ pub fn plan_from(rel: &Release, nr: usize, rank: usize, opts: &Opts) -> Result<D
         p.globals()?;
     }
     for l in rel.dense.keys().copied().collect::<Vec<_>>() {
-        if opts.layers.as_ref().is_some_and(|r| !r.contains(&l)) {
+        if opts.layers.as_ref().is_some_and(|r| !r.contains(&l)) || (opts.no_dspark && l >= MTP0) {
             continue;
         }
         let pre = if l < MTP0 { format!("layers.{l}.") } else { format!("mtp.{}.", l - MTP0) };
@@ -1010,7 +1044,8 @@ pub fn plan_from(rel: &Release, nr: usize, rank: usize, opts: &Opts) -> Result<D
     }
     let engram = p.engram()?;
     if opts.layers.is_none() && opts.experts.is_none() && !opts.no_globals {
-        let mut missing: Vec<String> = rel.names().into_iter().filter(|n| !p.used.contains(n) && !skipped(n)).collect();
+        let mut missing: Vec<String> =
+            rel.names().into_iter().filter(|n| !p.used.contains(n) && !skipped(n) && !(opts.no_dspark && n.starts_with("mtp."))).collect();
         if !missing.is_empty() {
             missing.sort();
             return Err(format!("{} release tensors are neither planned nor skipped, e.g. {:?}", missing.len(), &missing[..missing.len().min(8)]));
@@ -1345,6 +1380,8 @@ pub unsafe extern "C" fn g6l_ds41_plan(release_dir: *const c_char, nr: u32, rank
         let opts = Opts {
             manifest: gr8knobs::DS_MANIFEST.get().map(str::to_string),
             head_mx: gr8knobs::DS41_HEAD_MX.get(),
+            no_dspark: gr8knobs::DS_MTP.get().is_none_or(|v| v.trim() == "0"),
+            gv_only: gr8knobs::DS41_GV_ONLY.get(),
             ..Opts::default()
         };
         let p = plan(&arg(release_dir, "release dir")?, nr as usize, rank as usize, &opts)?;
@@ -1358,8 +1395,8 @@ pub unsafe extern "C" fn g6l_ds41_plan(release_dir: *const c_char, nr: u32, rank
         let mut img = p.img;
         let rd = arg(release_dir, "release dir")?;
         let mf = opts.manifest.clone().unwrap_or_default();
-        let key_text = format!("ds41 release={rd} nr={nr} rank={rank} head_mx={} manifest={:?}\n{}\n{}",
-                               opts.head_mx, opts.manifest, manifest_json(&img, &zeros, nr as usize),
+        let key_text = format!("ds41 release={rd} nr={nr} rank={rank} head_mx={} manifest={:?} no_dspark={} gv_only={}\n{}\n{}",
+                               opts.head_mx, opts.manifest, opts.no_dspark, opts.gv_only, manifest_json(&img, &zeros, nr as usize),
                                crate::gencache::source_identity(&[&rd, &mf]));
         img.cache = crate::gencache::GenCache::from_env(&key_text);
         Ok::<_, String>(img)

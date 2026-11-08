@@ -71,7 +71,7 @@ inline bool dsp_tc_on()
 inline bool dsp_try_tc(const ds41a::Fp8Mat& W, const uint8_t* A, int lda, const uint8_t* SA, int lsa, bf16* Y, int ldy, int M, cudaStream_t st)
 {
     if (!dsp_tc_on() || !ds41_gemm_mx_tc) return false;
-    const int rc = ds41_gemm_mx_tc(A, lda, SA, lsa, W.w, W.s, Y, ldy, M, W.N, W.K, st);
+    const int rc = ds41_gemm_mx_tc(A, lda, SA, lsa, ds41a::gemm_codes(W, 1, st), W.s, Y, ldy, M, W.N, W.K, st);
     if (rc >= 0 && rc <= 2) ++g_dsp_tc_rc[rc];
     return rc == 0;
 }

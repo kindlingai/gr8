@@ -430,8 +430,17 @@ fn plan_err(dir: &str, nr: usize, rank: usize) -> String {
 }
 
 fn plan(m: &Mini, nr: usize, rank: usize) -> (g6load::v2plan::V2Image, Vec<ds41::EngramSlice>) {
-    let p = ds41::plan(&m.dir, nr, rank, &Opts::default()).unwrap_or_else(|e| panic!("plan nr {nr} rank {rank}: {e}"));
+    plan_with(m, nr, rank, &Opts::default())
+}
+
+fn plan_with(m: &Mini, nr: usize, rank: usize, o: &Opts) -> (g6load::v2plan::V2Image, Vec<ds41::EngramSlice>) {
+    let p = ds41::plan(&m.dir, nr, rank, o).unwrap_or_else(|e| panic!("plan nr {nr} rank {rank}: {e}"));
     (p.img, p.engram)
+}
+
+/// What g6l_ds41_plan plans with GR8_DS_MTP unset (the tests' environment): no DSpark layers.
+fn plan_engine(m: &Mini, nr: usize, rank: usize) -> (g6load::v2plan::V2Image, Vec<ds41::EngramSlice>) {
+    plan_with(m, nr, rank, &Opts { no_dspark: true, ..Opts::default() })
 }
 
 // ---------------------------------------------------------------------------------------------------- tests
@@ -715,6 +724,7 @@ fn sizes_and_ffi() {
     let eout = CString::new(format!("{}/ffi.engram.json", m.dir)).unwrap();
     let h = unsafe { ds41::g6l_ds41_plan(dir.as_ptr(), 4, 2, out.as_ptr(), eout.as_ptr(), err.as_mut_ptr(), err.len()) };
     assert!(!h.is_null());
+    let (img, _) = plan_engine(&m, 4, 2);   // GR8_DS_MTP is unset here: the engine's plan has no DSpark layers
     let t = img.tensors.iter().find(|t| t.name == "L002.x.fc2").unwrap();
     let mut buf = vec![0u8; t.nbytes as usize];
     let rc = unsafe { g6load::g6l_plan_read(h, t.offset, t.nbytes, buf.as_mut_ptr() as *mut _, err.as_mut_ptr(), err.len()) };
@@ -761,7 +771,7 @@ fn engine_load_path_fills_the_image() {
     let m = mini("load");
     m.write();
     for (nr, rank) in [(4usize, 1usize), (2, 0)] {
-        let (img, _) = plan(&m, nr, rank);
+        let (img, _) = plan_engine(&m, nr, rank);
         let ctx = Ctx { img: Mutex::new(vec![0xAAu8; img.bytes as usize]), staging: Mutex::new(Vec::new()) };
         let sink = g6load::G6lSink { ctx: &ctx as *const Ctx as *mut c_void, alloc_staging: alloc, free_staging: free, copy };
         let dir = CString::new(m.dir.clone()).unwrap();
@@ -851,5 +861,30 @@ fn reads_cover_the_load() {
         let q = ds41::plan(&sparse, nr, rank, &Opts::default()).unwrap();
         assert_eq!(ds41::hash_image(&q.img, 2).unwrap(), ds41::hash_image(&p.img, 2).unwrap(), "nr {nr} rank {rank}");
         assert_eq!(q.reads, p.reads);
+    }
+}
+
+/// no_dspark leaves out exactly the DSpark layers (and still passes the release check); gv_only keeps the attention
+/// projections' scales and records, the shared experts' records, and the head's records.
+#[test]
+fn lean_plans() {
+    let m = mini("lean");
+    m.write();
+    let (all, _) = plan(&m, 2, 0);
+    let (lean, _) = plan_with(&m, 2, 0, &Opts { no_dspark: true, gv_only: true, ..Opts::default() });
+    let names = |img: &g6load::v2plan::V2Image| img.tensors.iter().map(|t| t.name.clone()).collect::<std::collections::BTreeSet<_>>();
+    let (a, l) = (names(&all), names(&lean));
+    assert!(l.is_subset(&a));
+    assert!(a.iter().any(|n| n.starts_with("L040.")) && !l.iter().any(|n| n.starts_with("L04")));
+    for n in ["L000.q_a", "L000.q_b", "L000.kv", "L000.o_a", "L000.o_b"] {
+        assert!(!l.contains(&format!("{n}.mx.codes")) && l.contains(&format!("{n}.mx.scales")) && l.contains(&format!("{n}.mx.gv")), "{n}");
+    }
+    for n in ["L000.sh.w1", "L000.sh.w2", "L000.sh.w3"] {
+        assert!(!l.contains(&format!("{n}.mx.codes")) && !l.contains(&format!("{n}.mx.scales")) && l.contains(&format!("{n}.mx.gv")), "{n}");
+    }
+    assert!(!l.contains("G.lm_head") && l.contains("G.lm_head.gv") && l.contains("L000.idx.wq_b.mx.codes") == a.contains("L000.idx.wq_b.mx.codes"));
+    // what stays is the same bytes
+    for t in &lean.tensors {
+        assert_eq!(tensor(&lean, &t.name), tensor(&all, &t.name), "{}", t.name);
     }
 }

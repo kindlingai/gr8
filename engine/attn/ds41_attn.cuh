@@ -34,6 +34,8 @@
 
 #include "../knobs-rs/gr8_knobs.h"
 #include "ds41_attn_types.h"
+#include "ds41_sh_tc_map.h"
+#include <mutex>
 #include "ds41_ring_keep.h"
 #include "ds41_src_fast.cuh"
 #include "ds41_attn_split_math.h"
@@ -1678,12 +1680,55 @@ inline void launch_act_quant(const bf16* x, int ldx, uint8_t* codes, int ldc, ui
     const long warps = (long)M * (K / 32);
     k_act_quant<<<(unsigned)((warps + 7) / 8), 256, 0, st>>>(x, ldx, codes, ldc, sc, lds, M, K);
 }
+// GR8_DS41_GV_ONLY: a projection whose image has no codes (W.w null) rebuilds them from its GEMV records before each GEMM, into a
+// scratch of the launching stream (the two prefill lanes run GEMMs on two streams at once). ds41_attn_codes_reserve sizes the
+// buffers at bind, before any capture; a stream takes a slot the first time it asks, with no CUDA call.
+constexpr int GC_SLOTS = 4;
+inline uint8_t* g_gc_buf[GC_SLOTS] = {};
+inline cudaStream_t g_gc_st[GC_SLOTS] = {};
+inline int g_gc_n = 0;
+inline size_t g_gc_cap = 0;
+inline std::mutex g_gc_mu;
+// grid = records of [rows/16][K/32], block 256: plain 528 B records, or (quad) four records of a tile row in 2112 B (k_quad_pack's
+// layout, ds41_attn_gv.cuh) -> codes [rows][K]. The index map is mx_rec_rc, the one k_mx_unrecord inverts.
+__global__ void __launch_bounds__(256) k_gv_codes(const uint8_t* __restrict__ gv, int ng, int quad, uint8_t* __restrict__ codes, int K)
+{
+    const size_t r = blockIdx.x;
+    const int t = (int)(r / ng), g = (int)(r % ng), i = threadIdx.x, l = i >> 3, k = i & 7;
+    int row, col;
+    mx_rec_rc(i, row, col);
+    for (int h = 0; h < 2; ++h)
+    {
+        const size_t src = quad ? (r / 4) * 2112 + (r % 4) * 512 + l * 16 + h * 8 + k : r * MX_REC_B + h * 256 + i;
+        codes[(size_t)(16 * t + row) * K + 32 * g + 16 * h + col] = gv[src];
+    }
+}
+// W's codes for a GEMM on st: W.w, or the codes rebuilt from W.gv (groups stacked matrices of N rows) in st's scratch
+inline const uint8_t* gemm_codes(const Fp8Mat& W, int groups, cudaStream_t st)
+{
+    if (W.w) return W.w;
+    const size_t bytes = (size_t)groups * W.N * W.K;
+    int s = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_gc_mu);
+        while (s < g_gc_n && g_gc_st[s] != st) ++s;
+        if (s == g_gc_n && g_gc_n < GC_SLOTS) g_gc_st[g_gc_n++] = st;
+    }
+    if (!W.gv || s == GC_SLOTS || bytes > g_gc_cap)
+    {
+        fprintf(stderr, "DS41 GR8_DS41_GV_ONLY: no codes for a %d x %d x %d GEMM (records %s, stream slot %d of %d, scratch %zu of %zu bytes)\n",
+                groups, W.N, W.K, W.gv ? "yes" : "no", s, GC_SLOTS, bytes, g_gc_cap);
+        abort();
+    }
+    k_gv_codes<<<(unsigned)(bytes / 512), 256, 0, st>>>(W.gv, W.K / 32, W.gvq ? 1 : 0, g_gc_buf[s], W.K);
+    return g_gc_buf[s];
+}
 // Y[M][N] = fp8gemm(act(codes, scales), W): groups > 1 for the block-diagonal o_a (group g reads columns g*K.. of A, rows g*N.. of W)
 inline void launch_gemm(const uint8_t* A, int lda, const uint8_t* SA, int lsa, const Fp8Mat& W, bf16* Y, int ldy, int M, int groups,
                         size_t a_gs, size_t sa_gs, size_t y_gs, cudaStream_t st)
 {
     GemmP p;
-    p.A = A; p.SA = SA; p.W = W.w; p.SW = W.s; p.Y = Y;
+    p.A = A; p.SA = SA; p.W = gemm_codes(W, groups, st); p.SW = W.s; p.Y = Y;
     p.M = M; p.N = W.N; p.K = W.K;
     p.lda = lda; p.lsa = lsa; p.ldy = ldy;
     p.a_gs = a_gs; p.sa_gs = sa_gs; p.y_gs = y_gs;
@@ -2165,7 +2210,7 @@ inline void attn_out(const Weights& W, const Scratch& S, int n, int start, int h
     if (direct_c2 && g_use_tc && n == 4096 && W.wo_b.N == 5120 && W.wo_b.K == 2048 && G * OLORA == 2048 && !use_gv(W.wo_b, n))
     {
         GemmP p{};
-        p.A = S.oaq; p.SA = S.oas; p.W = W.wo_b.w; p.SW = W.wo_b.s; p.Y = out;
+        p.A = S.oaq; p.SA = S.oas; p.W = gemm_codes(W.wo_b, 1, st); p.SW = W.wo_b.s; p.Y = out;
         p.M = n; p.N = W.wo_b.N; p.K = W.wo_b.K;
         p.lda = G * OLORA; p.lsa = G * OLORA / 32; p.ldy = HID;
         p.a_gs = 0; p.sa_gs = 0; p.y_gs = 0;

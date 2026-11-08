@@ -187,9 +187,12 @@ inline bool gv_quad_fits(int K, int tpc, int ks)
     return tpc == 1 && (K / 32) % 4 == 0 && ((K / 32) / ks) % 4 == 0;
 }
 // bind (before any capture): repack W's `groups` record blocks in place on st when the launch shape takes whole quads; 1 = repacked
-inline int gv_quad_bind(const Fp8Mat& W, int groups, int tpc, int ks, cudaStream_t st)
+// W.gvq marks the records repacked (a GR8_DS41_GV_ONLY GEMM rebuilds codes from either layout).
+inline int gv_quad_bind(Fp8Mat& W, int groups, int tpc, int ks, cudaStream_t st)
 {
-    if (!W.gv || g_gv_quad.count(W.gv) || (W.N & 15) || !gv_quad_fits(W.K, tpc, ks)) return 0;
+    if (!W.gv || (W.N & 15) || !gv_quad_fits(W.K, tpc, ks)) return 0;
+    W.gvq = true;
+    if (g_gv_quad.count(W.gv)) return 0;
     const size_t bytes = (size_t)groups * (W.N / 16) * (W.K / 32) * 528;
     k_quad_pack<<<1024, 256, 0, st>>>(const_cast<uint8_t*>(W.gv), bytes / 2112);
     g_gv_quad.insert(W.gv);

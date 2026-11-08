@@ -18,7 +18,9 @@ constexpr float INV448 = 0.002232142857142857f;         // fp32(1/448), the acti
 constexpr float SOFTMAX_SCALE = 0.04419417382415922f;   // 512^-0.5 (fp32 below)
 
 // gv: the matrix as MXFP8 GEMV records [N/16][K/32][528] (the pack's .mx.gv; N, K are one group's, groups are contiguous), or null
-struct Fp8Mat { const uint8_t* w; const uint8_t* s; int N, K; const uint8_t* gv = nullptr; };
+// w = null with gv set (GR8_DS41_GV_ONLY): a GEMM rebuilds the codes from the records first (ds41_attn.cuh gemm_codes); gvq: the records are
+// in the quad layout (GR8_DS41_GV_QUAD, gv_quad_bind)
+struct Fp8Mat { const uint8_t* w; const uint8_t* s; int N, K; const uint8_t* gv = nullptr; bool gvq = false; };
 // Decode GEMV launcher hooks (ds41_attn_gv.cuh defines them; the attention TU cannot include densev.cuh, see ds41_attn.cuh g_fn_xfrag).
 // xfrag: fragment table of `groups` activation blocks; gemv: y = records x table, tpc / ks already resolved (0 = pick).
 typedef void (*XfragFn)(const uint8_t* codes, int ldc, const uint8_t* sc, int lds, int M, int K, int groups, size_t gc, size_t gs, uint32_t* xf,

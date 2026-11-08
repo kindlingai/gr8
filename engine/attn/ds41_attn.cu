@@ -63,6 +63,19 @@ void ds41_attn_set_gv(int on, int tpc, int ks, ds41a::XfragFn fn_xfrag, ds41a::G
     if (tpc > 0) ds41a::g_gv_tpc = tpc;
     ds41a::g_gv_ks = ks > 0 ? ks : 0;
 }
+// GR8_DS41_GV_ONLY: the codes scratch of every stream slot holds at least `bytes` (one projection's codes, all its groups). Bind only,
+// before any capture; growing frees the old buffers.
+void ds41_attn_codes_reserve(size_t bytes)
+{
+    std::lock_guard<std::mutex> lk(ds41a::g_gc_mu);
+    if (bytes <= ds41a::g_gc_cap) return;
+    for (uint8_t*& b : ds41a::g_gc_buf)
+    {
+        if (b) cudaFree(b);
+        if (cudaMalloc(&b, bytes) != cudaSuccess) { fprintf(stderr, "DS41 GR8_DS41_GV_ONLY: codes scratch of %zu bytes\n", bytes); abort(); }
+    }
+    ds41a::g_gc_cap = bytes;
+}
 // GR8_DS_SRC_FAST bits (a process-wide setting): 1 = the ratio-2 compressor projections at <= 8 rows use k_f32gemv2 (bit-identical to k_f32gemm2); 2 is read by the rank TU
 // (idx wq_b through the MXFP8 GEMV). 0 = the generic launches.
 void ds41_attn_set_src_fast(int bits)
