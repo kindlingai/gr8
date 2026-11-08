@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import shutil
 from pathlib import Path
 import tempfile
 import unittest
@@ -101,5 +102,34 @@ class ReducedTests(unittest.TestCase):
             self.assertIn('NOT full prompt/TTFT',(out/'summary.md').read_text())
         bad=[dict(cases[0]),dict(cases[1])];bad[1].pop('reduced_set')
         with self.assertRaises(ValueError):runner.reduced_coverage(bad)
+
+class ShardTests(unittest.TestCase):
+    def test_real_driver_mock_shards_merge_equal_unsharded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);original=fake_bundle(root)
+            copies=[root/'unsharded',root/'s0',root/'s1']
+            for d in copies:shutil.copytree(original,d)
+            self.assertEqual(execute(copies[0],'--adaptive-ci','1'),0)
+            for i in range(2):self.assertEqual(execute(copies[i+1],'--adaptive-ci','1','--shard',f'{i}/2'),0)
+            self.assertEqual(runner.merge_runs(copies[1:],root/'merged'),0)
+            self.assertEqual((root/'merged/summary.csv').read_bytes(),(copies[0]/'summary.csv').read_bytes())
+            self.assertEqual((root/'merged/summary.md').read_bytes(),(copies[0]/'summary.md').read_bytes())
+            self.assertTrue((root/'merged/shards/0/results.jsonl').exists())
+            self.assertTrue((original/'merge.py').exists())
+            with self.assertRaises(ValueError):runner.merge_runs([copies[1]],root/'partial')
+            with self.assertRaises(ValueError):runner.merge_runs([copies[1],copies[1]],root/'duplicate')
+            m=json.loads((copies[2]/'run-manifest.json').read_text());m['seed']+=1
+            (copies[2]/'run-manifest.json').write_text(json.dumps(m))
+            with self.assertRaises(ValueError):runner.merge_runs(copies[1:],root/'wrong-settings')
+            m['seed']-=1;m.pop('finished_unix');(copies[2]/'run-manifest.json').write_text(json.dumps(m))
+            with self.assertRaises(ValueError):runner.merge_runs(copies[1:],root/'unfinished')
+
+    def test_shard_partition_validation(self):
+        cases=[dict(id=str(i),args=[]) for i in range(17)]
+        shards=[runner.shard_cases(cases,f'{i}/4')[0] for i in range(4)]
+        self.assertEqual([len(x) for x in shards],[5,4,4,4])
+        self.assertEqual({c['id'] for s in shards for c in s},{c['id'] for c in cases})
+        for bad in ('1/0','4/4','-1/4','0/18','0','x/4'):
+            with self.assertRaises(ValueError):runner.shard_cases(cases,bad)
 
 if __name__=='__main__':unittest.main()

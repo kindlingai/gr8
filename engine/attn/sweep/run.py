@@ -410,11 +410,112 @@ def archive_run(out, destination):
         print(f"ARCHIVE {target}", flush=True)
 
 
+def shard_cases(cases, specification):
+    if specification is None:
+        return cases, None
+    match = re.fullmatch(r"(\d+)/(\d+)", specification)
+    if not match:
+        raise ValueError("shard must be zero-based i/N")
+    index, count = map(int, match.groups())
+    if not 0 <= index < count or count > len(cases):
+        raise ValueError("shard needs 0<=i<N<=case count (no empty shards)")
+    return cases[index::count], dict(index=index, count=count)
+
+
+def cases_hash(cases):
+    return hashlib.sha256(json.dumps(cases, sort_keys=True).encode()).hexdigest()
+
+
+def merge_runs(directories, out):
+    """Merge DISJOINT case shards; never average duplicate executions or hosts."""
+    directories = [Path(d).resolve() for d in directories]
+    out = Path(out).resolve()
+    if not directories or len(set(directories)) != len(directories):
+        raise ValueError("merge needs distinct run directories")
+    if out.exists() or any(out == d or out.is_relative_to(d) for d in directories):
+        raise ValueError("merge output must be new and outside input directories")
+    records = []
+    compatible = ("kernel", "adapter", "reference", "variants", "arch", "seed", "warmup", "reps", "iters",
+                  "rounds_requested", "orders", "flush_mb", "pools", "amortize", "adaptive_ci", "adaptive_max_rounds", "binary_sha256", "driver_sha256")
+    for directory in directories:
+        manifest = json.loads((directory/"run-manifest.json").read_text())
+        if not manifest.get("finished_unix"):
+            raise ValueError("cannot merge unfinished run: " + str(directory))
+        if sha256_file(directory/"build-manifest.json") != manifest.get("build_manifest_sha256"):
+            raise ValueError("shard build provenance hash mismatch")
+        for v, expected_hash in manifest.get("binary_sha256", {}).items():
+            if expected_hash is not None and (not (directory/v).is_file() or sha256_file(directory/v) != expected_hash):
+                raise ValueError("shard archived binary hash mismatch")
+        cases = validate_cases(json.loads((directory/"cases.json").read_text()))
+        full = validate_cases(json.loads((directory/"all-cases.json").read_text()))
+        shard = manifest.get("shard") or dict(index=0, count=1)
+        expected, _ = shard_cases(full, f"{shard['index']}/{shard['count']}")
+        if cases != expected or manifest.get("case_sha256") != cases_hash(cases) or manifest.get("all_cases_sha256") != cases_hash(full):
+            raise ValueError("shard case identity mismatch")
+        if records and (full != records[0][2] or any(manifest.get(k) != records[0][1].get(k) for k in compatible)):
+            raise ValueError("incompatible shard settings/binaries/case list/driver")
+        raw = [json.loads(line) for line in (directory/"results.jsonl").read_text().splitlines()]
+        pairs = [json.loads(line) for line in (directory/"pairs.jsonl").read_text().splitlines()]
+        ids = {c["id"] for c in cases}
+        variants = manifest["variants"]
+        candidates = [v for v in variants if v != manifest["reference"]] or [manifest["reference"]]
+        if not raw or not pairs or any(r["case"] not in ids or r["variant"] not in variants for r in raw+pairs):
+            raise ValueError("raw records outside shard or empty")
+        if {(r["case"],r["variant"]) for r in pairs} != {(c,v) for c in ids for v in candidates}:
+            raise ValueError("missing case/candidate pairs")
+        for case_id in ids:
+            for v in candidates:
+                cohort = [p for p in pairs if p["case"] == case_id and p["variant"] == v]
+                round_ids = sorted(p["round_id"] for p in cohort)
+                if round_ids != list(range(1,len(cohort)+1)):
+                    raise ValueError("missing/duplicate pair rounds")
+                if manifest.get("adaptive_ci"):
+                    if not 3 <= len(cohort) <= 6 or not adaptive_decision(raw,pairs,case_id,v,manifest["adaptive_ci"])["stop"]:
+                        raise ValueError("incomplete adaptive pair cohort")
+                elif len(cohort) != len(manifest["orders"]):
+                    raise ValueError("incomplete fixed pair cohort")
+        final_ids = {r["run_id"] for r in raw if r["final_attempt"]}
+        if any(rid not in final_ids for pair in pairs for rid in pair["run_ids"]):
+            raise ValueError("pair has missing final raw run")
+        if len(final_ids) != sum(bool(r["final_attempt"]) for r in raw):
+            raise ValueError("duplicate final raw run IDs")
+        records.append((directory, manifest, full, shard, raw, pairs))
+    counts = {r[3]["count"] for r in records}
+    if len(counts) != 1 or len(records) != next(iter(counts)) or {r[3]["index"] for r in records} != set(range(len(records))):
+        raise ValueError("need every shard index exactly once")
+    records.sort(key=lambda r:r[3]["index"])
+    manifest = records[0][1];cases = records[0][2]
+    case_order = {c["id"]:i for i,c in enumerate(cases)}
+    raw = [r for record in records for r in record[4]]
+    pairs = [r for record in records for r in record[5]]
+    # Stable case order makes the reconstructed table identical for identical observations.
+    raw.sort(key=lambda r:case_order[r["case"]]);pairs.sort(key=lambda r:case_order[r["case"]])
+    summary = aggregate_runs(raw,pairs,cases,manifest["variants"],manifest["reference"],manifest.get("adaptive_ci",0))
+    out.mkdir(parents=True)
+    sources=[]
+    for directory, m, full, shard, _, _ in records:
+        dest=out/"shards"/str(shard["index"])
+        shutil.copytree(directory,dest)
+        sources.append(dict(directory=str(directory), archived=str(dest.relative_to(out)), shard=shard,
+                            hashes={name:sha256_file(directory/name) for name in
+                                    ("run-manifest.json","build-manifest.json","cases.json","all-cases.json","results.jsonl","pairs.jsonl")}))
+    for name, data in (("results.jsonl",raw),("pairs.jsonl",pairs)):
+        (out/name).write_text("".join(json.dumps(r)+"\n" for r in data))
+    (out/"cases.json").write_text(json.dumps(cases,indent=2)+"\n")
+    merged=dict(kind="case_shard_merge", sources=sources, all_cases_sha256=cases_hash(cases),
+                settings={k:manifest.get(k) for k in compatible}, merged_unix=time.time(), merger_driver_sha256=sha256_file(HERE/"run.py"),
+                note="Disjoint case observations from multiple hosts; not cross-host replicates or extra independent rounds. Raw file paths resolve within each archived source shard.")
+    (out/"merge-manifest.json").write_text(json.dumps(merged,indent=2)+"\n")
+    write_tables(out,summary,cases,manifest["variants"],manifest["reference"],manifest["kernel"])
+    return int(any(r["status"] != "EXACT" for r in summary) or any(r["status"] != "EXACT" for r in pairs))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--kernel", type=Path, help="adapter JSON (default attention.json; run-only uses the build bundle)")
     p.add_argument("--kernel-name")
     p.add_argument("--cases", type=Path, help="opaque adapter case-list JSON")
+    p.add_argument("--shard", help="zero-based case shard i/N; run stage only; build bundles retain the complete list")
     p.add_argument("--variants-dir", type=Path)
     p.add_argument("--reference", help="reference variant (default off, or bundle reference for run-only)")
     p.add_argument("--variants", nargs="+")
@@ -442,6 +543,8 @@ def main(argv=None):
     p.add_argument("--build-only", action="store_true")
     p.add_argument("--run-only", action="store_true")
     a = p.parse_args(argv)
+    if a.build_only and a.shard:
+        p.error("shard is a run-stage option; build the full case bundle once")
     if a.build_only and a.run_only:
         p.error("build-only and run-only are mutually exclusive")
     if not math.isfinite(a.adaptive_ci) or a.adaptive_ci < 0:
@@ -490,6 +593,12 @@ def main(argv=None):
         if a.late_final:
             gen.append("--late-final")
         cases = validate_cases(json.loads(subprocess.check_output(gen, text=True)))
+    all_cases = cases
+    try:
+        cases, shard = shard_cases(all_cases, a.shard)
+        reduced_coverage(cases)
+    except ValueError as e:
+        p.error(str(e))
     out.mkdir(parents=True, exist_ok=True)
     manifest = {"kernel": name, "adapter": config, "reference": a.reference, "variants": variants,
                 "argv": list(sys.argv if argv is None else [str(HERE / "run.py")] + argv), "arch": a.arch, "seed": a.seed, "warmup": a.warmup, "reps": a.reps, "iters": a.iters,
@@ -499,7 +608,8 @@ def main(argv=None):
                 "flush_mb": a.flush_mb, "pools": a.pools, "amortize": a.amortize,
                 "regime_note": "binary-reported; cold is not engine replay; captured/predecessor unavailable unless explicitly reported",
                 "telemetry_note": "pre/post child-process snapshots only, no in-interval observation or clock control",
-                "case_sha256": hashlib.sha256(json.dumps(cases, sort_keys=True).encode()).hexdigest(),
+                "case_sha256": cases_hash(cases), "all_cases_sha256": cases_hash(all_cases), "shard": shard,
+                "driver_sha256": sha256_file(HERE/"run.py"),
                 "git_commit": command(["git", "-C", str(REPO), "rev-parse", "HEAD"], 10)[1].strip(),
                 "git_status": command(["git", "-C", str(REPO), "status", "--short"], 10)[1],
                 "started_unix": time.time()}
@@ -539,9 +649,11 @@ def main(argv=None):
                         build_finished_unix=time.time())
         with (out / "build-manifest.json").open("x") as f:
             f.write(json.dumps(manifest, indent=2) + "\n")
-        (out / "build-cases.json").write_text(json.dumps(cases, indent=2) + "\n")
+        (out / "build-cases.json").write_text(json.dumps(all_cases, indent=2) + "\n")
         # Portable bundle: no checkout, Python module imports, gcc or nvcc needed to run.
         shutil.copy2(HERE / "run.py", out / "run.py")
+        if (HERE/"merge.py").is_file():
+            shutil.copy2(HERE/"merge.py", out/"merge.py")
         prior = json.loads((out / "build-manifest.json").read_text())
     else:
         builds = prior["builds"]
@@ -563,6 +675,7 @@ def main(argv=None):
                     build_manifest_sha256=sha256_file(out / "build-manifest.json"),
                     source_identity="original immutable build record; run checkout is NOT binary provenance")
     (out / "cases.json").write_text(json.dumps(cases, indent=2) + "\n")
+    (out / "all-cases.json").write_text(json.dumps(all_cases, indent=2) + "\n")
     with (out / "run-manifest.json").open("x") as f:
         f.write(json.dumps(manifest, indent=2) + "\n")
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

@@ -148,3 +148,37 @@ screening baseline, not a measured coverage fraction under new inputs/captures.
 Tables explicitly label reduced-set kernel-only totals and coverage provenance;
 subsets/shards report only their own portion of those denominators. No full
 prompt/TTFT claim or rescaling of omitted work is made.
+
+## Case sharding and merge
+
+`--shard i/N` is **zero-based**, deterministic round-robin over the original case
+list, preserving its order (`cases[i::N]`). Build-only retains the entire list;
+copy the same immutable build bundle to each box, then select the shard during
+run-only. Empty shards are refused. Both selected `cases.json` and full
+`all-cases.json` are retained with hashes. Every candidate for one case remains
+on one box, including its own reference controls and adaptive decisions.
+
+```
+python3 BUNDLE/run.py --arch 121a --run-only --out BUNDLE --shard 0/4 --adaptive-ci 1.0
+# On separate copies/boxes use1/4,2/4,3/4. Do not reuse a completed run directory.
+python3 engine/attn/sweep/merge.py --out NEW_MERGED_DIR RUN0 RUN1 RUN2 RUN3
+# merge.py and run.py also travel in the standalone build bundle.
+```
+
+Merge requires every shard index exactly once, matching full case lists,
+measurement settings, driver identity and binary identities, finished manifests,
+complete per-case candidate/round cohorts, and intact immutable build/binary
+hashes. It refuses overlapping/missing cases and incomplete runs, rather than
+silently shrinking the workload. Failed measurements stay failures; merge does
+not average them away. It rebuilds the summary directly from raw JSONL and pairs,
+not from rounded CSV cells. Whole source directories are archived under
+`NEW_MERGED_DIR/shards/i`; the merge manifest records source hashes/paths and
+merger identity. Raw relative log paths resolve within those source archives.
+
+Shards are **different cases on potentially different hosts**, not extra repeated
+measurements of each case. Cross-host heterogeneity is not an added independent
+sample or guaranteed model calibration. Identical input observations reconstruct
+byte-identical summary tables; separately repeated GPU timings naturally differ.
+`test_scale_gpu.py --out NEW_DIR` checks actual locked GPU unsharded/sharded runs,
+an early adaptive stop, and exact merge equivalence after partitioning the SAME
+measured two-case observations (explicitly labelled derived fixtures).
