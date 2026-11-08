@@ -197,6 +197,33 @@ class MentatRingTests(unittest.TestCase):
 
 class ControlPortTests(unittest.TestCase):
     @mock.patch.object(S, 'log')
+    def test_early_serving_is_applied_when_the_worker_starts_loading(self, logged):
+        s = supervisor(rank=1)
+        self.addCleanup(shutil.rmtree, s.home)
+        s.locked = True
+        s.set_state('handshake')
+        msg = {'t': 'serving', 'url': '<api>'}
+        self.assertEqual(s.on_rpc(msg, MEMBERS[0]), {'t': 'ok'})
+        self.assertEqual(s.state, 'handshake')
+        logged.assert_not_called()
+        s.set_state('loading')
+        self.assertEqual(s.state, 'serving')
+        with open(os.path.join(s.out, 'gr8.state')) as f:
+            self.assertEqual(json.load(f)['state'], 'serving')
+        logged.assert_called_once_with('the head serves <api>')
+        s.on_rpc(msg, MEMBERS[0])
+        logged.assert_called_once_with('the head serves <api>')
+
+    @mock.patch.object(S, 'log')
+    def test_serving_received_while_loading_still_applies_immediately(self, logged):
+        s = supervisor(rank=1)
+        self.addCleanup(shutil.rmtree, s.home)
+        s.set_state('loading')
+        self.assertEqual(s.on_rpc({'t': 'serving', 'url': '<api>'}, MEMBERS[0]), {'t': 'ok'})
+        self.assertEqual(s.state, 'serving')
+        logged.assert_called_once_with('the head serves <api>')
+
+    @mock.patch.object(S, 'log')
     def test_requests_from_non_members_are_ignored(self, logged):
         s = supervisor(rank=1)
         for t in ('down', 'abort', 'serving', 'hello', 'verdict', 'status', 'logs'):

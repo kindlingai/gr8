@@ -292,6 +292,8 @@ class Supervisor:
         self.agent = self.api_agent = None
         self.rank, self.lan, self.members, self.hs = None, None, [], {}
         self.state = 'starting'
+        self.state_lock = threading.RLock()
+        self.serving_url = None       # retain the head's notification until this worker is loading
         self.servers = []
         self.locked = self.started = False
         self.ms, self.model_error, self.rails, self.fabric_error = None, '', ('', ''), ''
@@ -306,15 +308,19 @@ class Supervisor:
 
     # ---- state ----------------------------------------------------------------------------------------------------
     def set_state(self, state, **meta):
-        self.state = state
-        if not self.locked:
-            return
-        tmp = os.path.join(self.out, 'gr8.state.tmp')
-        with open(tmp, 'w') as f:
-            json.dump({'state': state, 'rank': self.rank, 'pid': os.getpid(), 'time': time.time()}, f)
-        os.replace(tmp, os.path.join(self.out, 'gr8.state'))
-        if self.agent:
-            self.agent.set_meta(**{'gr8.state': state[:1024], 'gr8.rank': self.rank}, **meta)
+        with self.state_lock:
+            if state == 'loading' and self.serving_url is not None:
+                state = 'serving'
+                log(f'the head serves {self.serving_url}')
+            self.state = state
+            if not self.locked:
+                return
+            tmp = os.path.join(self.out, 'gr8.state.tmp')
+            with open(tmp, 'w') as f:
+                json.dump({'state': state, 'rank': self.rank, 'pid': os.getpid(), 'time': time.time()}, f)
+            os.replace(tmp, os.path.join(self.out, 'gr8.state'))
+            if self.agent:
+                self.agent.set_meta(**{'gr8.state': state[:1024], 'gr8.rank': self.rank}, **meta)
 
     # ---- the control port -----------------------------------------------------------------------------------------
     def serve(self, addrs):
@@ -365,9 +371,11 @@ class Supervisor:
             self.request_stop(f'rank {m.get("rank")} ({peer}) failed: {m.get("why")}', all_boxes=True)
             return {'t': 'ok'}
         if t == 'serving':
-            if self.state == 'loading':
-                self.set_state('serving')
-                log(f'the head serves {m.get("url")}')
+            with self.state_lock:
+                self.serving_url = m.get('url', '')
+                if self.state == 'loading':
+                    self.set_state('serving')
+                    log(f'the head serves {self.serving_url}')
             return {'t': 'ok'}
         if t == 'logs':
             return self.read_log(m.get('which', 'engine'), int(m.get('offset', -8192)))
