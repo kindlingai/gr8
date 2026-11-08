@@ -43,7 +43,7 @@ cp config/switch.env.example switch.env    # then set the boxes, directories and
 
 Measured on 2026-11-08 (Pacific time) with the command at gr8 `a4cdfd10`, on four boxes (two DGX Sparks, two GB10
 boxes with PCIe Gen4 NVMe), with each model's stock compose `.env` (GLM-5.3 at TP=4 with `GR8_GEN_CACHE` and
-`GR8_QUIT_FAST=1`; DeepSeek-V4.1-Flash at TP=4). Two switches each way (n=2), alternated, starting from GLM-5.3.
+`GR8_QUIT_FAST=1`; DeepSeek-V4.1-Flash on all four boxes). Two switches each way (n=2), alternated, starting from GLM-5.3.
 Every run exited 0, and each box's `.env` was byte-identical before and after:
 
 | `./gr8 switch` | down | up | health: ready in | total |
