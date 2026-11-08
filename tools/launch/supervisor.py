@@ -292,6 +292,8 @@ class Supervisor:
         self.agent = self.api_agent = None
         self.rank, self.lan, self.members, self.hs = None, None, [], {}
         self.state = 'starting'
+        self.state_lock = threading.RLock()
+        self.serving_urls = {}        # retain early notifications by epoch until the handshake chooses a boot
         self.servers = []
         self.locked = self.started = False
         self.ms, self.model_error, self.rails, self.fabric_error = None, '', ('', ''), ''
@@ -306,15 +308,20 @@ class Supervisor:
 
     # ---- state ----------------------------------------------------------------------------------------------------
     def set_state(self, state, **meta):
-        self.state = state
-        if not self.locked:
-            return
-        tmp = os.path.join(self.out, 'gr8.state.tmp')
-        with open(tmp, 'w') as f:
-            json.dump({'state': state, 'rank': self.rank, 'pid': os.getpid(), 'time': time.time()}, f)
-        os.replace(tmp, os.path.join(self.out, 'gr8.state'))
-        if self.agent:
-            self.agent.set_meta(**{'gr8.state': state[:1024], 'gr8.rank': self.rank}, **meta)
+        with self.state_lock:
+            url = self.serving_urls.get(self.hs.get('epoch'))
+            if state == 'loading' and url is not None:
+                state = 'serving'
+                log(f'the head serves {url}')
+            self.state = state
+            if not self.locked:
+                return
+            tmp = os.path.join(self.out, 'gr8.state.tmp')
+            with open(tmp, 'w') as f:
+                json.dump({'state': state, 'rank': self.rank, 'pid': os.getpid(), 'time': time.time()}, f)
+            os.replace(tmp, os.path.join(self.out, 'gr8.state'))
+            if self.agent:
+                self.agent.set_meta(**{'gr8.state': state[:1024], 'gr8.rank': self.rank}, **meta)
 
     # ---- the control port -----------------------------------------------------------------------------------------
     def serve(self, addrs):
@@ -365,9 +372,16 @@ class Supervisor:
             self.request_stop(f'rank {m.get("rank")} ({peer}) failed: {m.get("why")}', all_boxes=True)
             return {'t': 'ok'}
         if t == 'serving':
-            if self.state == 'loading':
-                self.set_state('serving')
-                log(f'the head serves {m.get("url")}')
+            epoch = m.get('epoch')
+            if not isinstance(epoch, int):
+                return {'t': 'ok', 'detail': 'no boot epoch'}
+            with self.state_lock:
+                if self.hs and epoch != self.hs.get('epoch'):
+                    return {'t': 'ok', 'detail': 'not this boot'}
+                self.serving_urls[epoch] = m.get('url', '')
+                if self.state == 'loading' and epoch == self.hs.get('epoch'):
+                    self.set_state('serving')
+                    log(f'the head serves {self.serving_urls[epoch]}')
             return {'t': 'ok'}
         if t == 'logs':
             return self.read_log(m.get('which', 'engine'), int(m.get('offset', -8192)))
@@ -528,7 +542,9 @@ class Supervisor:
             e = Stop(verdict.get('exit', 4), f'handshake refused: {verdict["field"]}')
             e.logged = True
             raise e
-        self.hs = verdict
+        with self.state_lock:
+            self.hs = verdict
+            self.serving_urls = {e: url for e, url in self.serving_urls.items() if e == verdict['epoch']}
         if verdict.get('ips'):     # the head's rails for this box, which may differ from its own election's
             self.rails = (verdict['ips'][self.rank], verdict['ips2'][self.rank])
             if self.agent:
@@ -885,7 +901,7 @@ class Supervisor:
                 ask_at += 30
             elif time.monotonic() - t0 > tmo + 600:
                 raise Stop(1, 'the head did not report serving')
-            time.sleep(1)
+            time.sleep(0.1 if r == 0 else 1)
         for line in relay.new() if relay else ():
             log(f'{time.monotonic() - t0:6.0f}s {line}')
         if r == 0:
@@ -1048,7 +1064,7 @@ class Supervisor:
         self.set_state('serving')
         for r in range(1, len(self.members)):
             for _ in range(10):
-                if self.tell(r, {'t': 'serving', 'url': url}):
+                if self.tell(r, {'t': 'serving', 'url': url, 'epoch': self.hs['epoch']}):
                     break
                 time.sleep(1)
         if self.agent:
