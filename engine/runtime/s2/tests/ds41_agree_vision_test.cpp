@@ -1,10 +1,10 @@
-// DS41 ranks that differ in the vision tower they loaded refuse at bootstrap (ds41_vision_id.h; g6m4.cu passes vis_on and
+// DS41 ranks that differ in the vision tower they loaded refuse at bootstrap (vision_id.h; g6m4.cu passes vis_on and
 // vis_id to the DS41 runtime signature, s2/signature.h). Four ranks on loopback, each its own process: every rank
 // with the same tower file boots, every rank without one boots (text-only), a rank without the file among ranks with it
 // refuses, and a rank with another tower file refuses. Host only. Model: ds41_agree_knobs_test.cpp.
 // Run: ds41_agree_vision_test engine/runtime/g6m4.cu
 #include "s2/bootstrap.h"
-#include "ds41_vision_id.h"
+#include "vision_id.h"
 #include "s2/signature.h"
 #include <cstdio>
 #include <cstdlib>
@@ -33,7 +33,7 @@ static void tower(const std::string& path, const std::string& header, size_t bod
 // rank `r` of 4 with the tower file `file` ("" = no file); exits 0 when it boots, 3 when it refuses (the head writes `why`)
 [[noreturn]] static void rank(unsigned r, const std::string& file, uint16_t port, const std::string& dir, const std::string& why) {
     if (r) (void)!std::freopen("/dev/null", "w", stderr);
-    const std::string id = file.empty() ? "" : ds41v::file_id(file);
+    const std::string id = file.empty() ? "" : g6vis::file_id(file);
     if (!file.empty() && id.empty()) std::_Exit(2);
     BootstrapConfig c; c.rank = r; c.ranks = 4; c.timeout = 3; c.head_ip = "127.0.0.1"; c.port = port;
     c.directory = dir + "/r" + std::to_string(r); ::mkdir(c.directory.c_str(), 0700);
@@ -75,17 +75,17 @@ int main(int argc, char** argv) {
     CHECK(a != std::string::npos && b != std::string::npos);
     if (a != std::string::npos && b != std::string::npos)
         CHECK(src.substr(a, b - a).find("sig.vis_on = vis_on; sig.vis_id = vis_id;") != std::string::npos);
-    CHECK(src.find("vis_id = ds41v::file_id(vpath);") != std::string::npos);
+    CHECK(src.find("vis_id = g6vis::file_id(vpath);") != std::string::npos);
 
     char tmpl[] = "/tmp/ds41agreevisXXXXXX"; const std::string dir = mkdtemp(tmpl);
     const std::string t1 = dir + "/t1.safetensors", t1b = dir + "/t1-copy.safetensors", t2 = dir + "/t2.safetensors";
     const std::string h1 = "{\"vision.blocks.0.norm1.weight\":{\"dtype\":\"BF16\",\"shape\":[1024],\"data_offsets\":[0,2048]}}";
     const std::string h2 = "{\"vision.blocks.0.norm1.weight\":{\"dtype\":\"BF16\",\"shape\":[1024],\"data_offsets\":[0,2049]}}";
     tower(t1, h1, 2048); tower(t1b, h1, 2048); tower(t2, h2, 2049);
-    CHECK(ds41v::file_id(t1) == ds41v::file_id(t1b));            // same bytes on another box: the same id
-    CHECK(!ds41v::file_id(t1).empty() && ds41v::file_id(t1) != ds41v::file_id(t2));
-    CHECK(ds41v::file_id(dir + "/none").empty());
-    CHECK(ds41v::signature(false, "x").empty());
+    CHECK(g6vis::file_id(t1) == g6vis::file_id(t1b));            // same bytes on another box: the same id
+    CHECK(!g6vis::file_id(t1).empty() && g6vis::file_id(t1) != g6vis::file_id(t2));
+    CHECK(g6vis::file_id(dir + "/none").empty());
+    CHECK(g6vis::signature(false, "x").empty());
 
     const uint16_t port = uint16_t(21000 + getpid() % 20000);
     std::string why;

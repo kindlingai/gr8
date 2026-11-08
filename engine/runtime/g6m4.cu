@@ -656,7 +656,7 @@ int main(int argc, char** argv)
     // (each rank embeds every row). The head writes DIR/vision.s2, so the shim's hello offers `vision`.
     Ds41Vision vis;
     bool vis_on = false;
-    std::string vis_id;   // the loaded tower file's id (ds41_vision_id.h: size + header, not tensor data): in the S2 runtime signature
+    std::string vis_id;   // the loaded tower file's id (vision_id.h: size + header, not tensor data): in the S2 runtime signature
     if (s2mode && release && knob::ds41_vision()) {
         std::string vpath;
         for (const char* rel : {"/exlr8-extra-vision.safetensors", "/dense/exlr8-extra-vision.safetensors"}) {
@@ -668,7 +668,7 @@ int main(int argc, char** argv)
         else if (!knob::ds_prefill_min())
             fprintf(stderr, "# rank %d: ds41 vision off: image prompts prefill, and GR8_DS_PREFILL_MIN is 0\n", R);
         else {
-            vis_id = ds41v::file_id(vpath);
+            vis_id = g6vis::file_id(vpath);
             if (vis_id.empty()) die("DS41 vision: cannot read the safetensors header of " + vpath);
             vis.boot(vpath, 2 * m.hc_rows);
             vis.attach(m);

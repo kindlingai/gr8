@@ -92,7 +92,7 @@ struct Identity {
     std::array<uint8_t, 32> schedule_digest{};
     uint32_t scale_bits = 0;
     uint32_t slot = 0;               // index of the profile in the boot's load order; the digest also identifies it
-    // DS41 image prompts (ds41_image.h): not steering, but the same exact prefix-cache identity. A prompt with images
+    // Image prompts (image_input.h): not steering, but the same exact prefix-cache identity. A prompt with images
     // shares cached prefixes only with prompts of the same images at the same positions (image_digest).
     bool images = false;
     std::array<uint8_t, 32> image_digest{};

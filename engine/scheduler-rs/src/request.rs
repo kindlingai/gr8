@@ -3,7 +3,7 @@
 //! `top_p <f>`, `pen <presence> <frequency> <thinking presence> <thinking frequency> <think_end or -1>`,
 //! `boost <start> <per1k> <max>`, `seqt <mult>:<base>:<min>:<cap>`, `seqa <mult>:<base>:<min>:<cap>`,
 //! `seqg <mult>:<base>:<min>:<cap>:<ids>`, `lp <k>`, `plp <k>`, `sys <n>`, `ins <rule>`, `gram <grammar>` and `steer <profile> <hex>`, then any
-//! number of `img <field>` (DS41 images, ds41_image.h), then a line of comma-separated prompt ids. The header is read the way libstdc++'s istringstream read it, so every request
+//! number of `img <field>` (images, image_input.h), then a line of comma-separated prompt ids. The header is read the way libstdc++'s istringstream read it, so every request
 //! the C++ took, and every refusal it gave, is the same here: a number ends at the first character it cannot take, and
 //! the rest of that word is the next word.
 
@@ -330,7 +330,7 @@ pub struct SteerFields<'a> {
 
 /// `grammar_ready`: the engine was started with --grammar-dir. `resolve` turns the steering fields into the request's
 /// identity, or refuses. `image` takes each `img` field's value in order, or refuses it: the caller keeps the images
-/// (ds41_image.h parse_field) and checks them against the prompt after the parse (img::check, img::digest).
+/// (image_input.h parse_field) and checks them against the prompt after the parse (img::check, img::digest).
 pub fn parse(
     bytes: &[u8],
     grammar_ready: bool,
