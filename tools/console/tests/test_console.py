@@ -11,7 +11,7 @@ from tools.console.server.control import ComposeControl
 
 from fastapi.testclient import TestClient
 
-from tools.console.server import envfile, knobs, metrics
+from tools.console.server import envfile, metrics, presets
 from tools.console.server.main import create_app
 from tools.console.server.service import Console, fetch, rpc
 from tools.console.tests.fakes import Fixture
@@ -20,11 +20,12 @@ from tools.console.tests.fakes import Fixture
 class EnvironmentTests(unittest.TestCase):
     def test_patch_preserves_unrelated_lines_and_extra_env(self):
         text = "# note\nMODEL=unchanged # comment\nEXTRA_ENV='KEEP=42 GR8_QUIT_FAST=0'\nSESS=4\n"
-        changed = envfile.patch(text, {"GR8_QUIT_FAST": "1", "REUSE": "1", "SESS": None}, knobs.ENGINE_KEYS)
+        engine = {"GR8_QUIT_FAST"}
+        changed = envfile.patch(text, {"GR8_QUIT_FAST": "1", "REUSE": "1", "SESS": None}, engine)
         self.assertIn("MODEL=unchanged # comment", changed)
         self.assertIn("KEEP=42", changed)
         self.assertNotIn("SESS=", changed)
-        self.assertEqual(envfile.read_values(changed, knobs.KNOBS, knobs.ENGINE_KEYS)["GR8_QUIT_FAST"], "1")
+        self.assertEqual(envfile.read_values(changed, {"GR8_QUIT_FAST", "REUSE", "SESS"}, engine)["GR8_QUIT_FAST"], "1")
 
     def test_duplicate_and_ambiguous_rejected(self):
         with self.assertRaises(ValueError):
@@ -55,16 +56,23 @@ class EnvironmentTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 envfile.transact(link, {"action": "read"})
 
-    def test_scope_validation(self):
-        for bad in ({"SESS": "99"}, {"REUSE": "1\nMODEL=bad"}, {"EXTRA_ENV": "X=1"}):
-            with self.assertRaises(ValueError):
-                knobs.validate(bad, "glm53", 4)
-        for model, key in (("ds41", "GR8_QUIT_FAST"), ("glm53f", "GR8_GEN_CACHE"), ("ds41", "DFLASH")):
-            with self.assertRaises(ValueError):
-                knobs.validate({key: "1"}, model, 4)
+    def test_preset_signatures_match_only_the_documented_keys(self):
+        self.assertEqual(presets.classify("glm53", {}), "speed")
+        self.assertEqual(presets.classify("glm53", {"VARIANT": "bit325"}), "quality")
+        self.assertEqual(presets.classify("glm53", {"KV_FORMAT": "int4"}), "context")
+        self.assertEqual(presets.classify("glm53", {"VARIANT": "bit325", "KV_FORMAT": "int4"}), "custom")
+        self.assertEqual(presets.classify("glm53", {"TUNE": "speed"}), "custom")
+        self.assertEqual(presets.classify("ds41", {}), "custom")
+        self.assertEqual(presets.classify("ds41", {"TUNE": "context"}), "context")
+        self.assertEqual(presets.classify("ds41", {"TUNE": "speed", "VARIANT": "home"}), "custom")
+        self.assertEqual(presets.classify("glm53f", {"TUNE": "quality"}), "quality")
+        self.assertEqual(presets.changes_for("glm53", "quality"), {"TUNE": None, "VARIANT": "bit325", "KV_FORMAT": None})
+        self.assertEqual(presets.changes_for("ds41", "speed")["TUNE"], "speed")
         with self.assertRaises(ValueError):
-            knobs.validate({"GR8_LOAD_COMPACT": "/cache"}, "glm53", 6)
-        knobs.validate({"GR8_QUIT_FAST": "1", "MTP": None}, "glm53", 4)
+            presets.changes_for("glm53", "fast")
+        for model in presets.CATALOG:
+            for item in presets.CATALOG[model]:
+                self.assertEqual(set(item["assign"]), set(presets.KEYS))
 
 
 class AdapterTests(unittest.TestCase):
@@ -154,43 +162,52 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("SYNTHETIC", snap["logs"])
         self.assertEqual([r["state"] for r in snap["models"]].count("ready"), 1)
 
-    def test_read_knobs_does_not_write_and_mixed_detected(self):
-        self.fake.texts["glm53"]["box-1"] = "SESS=8\n"
-        row = self.console.read_knobs("glm53")
-        self.assertIn("SESS", row["mixed"])
+    def test_read_presets_does_not_write_and_mixed_is_custom(self):
+        self.fake.texts["glm53"]["box-1"] += "VARIANT=bit325\n"
+        row = self.console.read_presets("glm53")
+        self.assertEqual(row["current"], "custom")
+        self.assertIn("VARIANT", row["mixed"])
+        self.assertEqual(row["current_setting"], "mixed across boxes")
         self.assertEqual(self.fake.calls, [])
+        self.fake.texts["ds41"]["box-0"] += "TUNE=quality\n"
+        deep = self.console.read_presets("ds41")
+        self.assertEqual(deep["current"], "custom")
 
-    def test_confirmed_changes_all_boxes_then_restart(self):
-        row = self.console.read_knobs("glm53")
-        self.console.submit(self.request(changes={"REUSE": "1"}, revision=row["revision"]))
+    def test_confirmed_preset_writes_all_boxes_then_restart(self):
+        row = self.console.read_presets("glm53")
+        self.assertEqual(row["current"], "speed")
+        self.console.submit(self.request(preset="quality", revision=row["revision"]))
         job = self.done()
         self.assertEqual(job["status"], "succeeded", job)
         self.assertEqual([c[0] for c in self.fake.calls], ["write"] * 4 + ["stop", "switch"])
-        self.assertTrue(all("REUSE=1" in t for t in self.fake.texts["glm53"].values()))
+        self.assertTrue(all("VARIANT=bit325" in t and "KEEP_ME=1" in t and "SESS=4" in t for t in self.fake.texts["glm53"].values()))
+        self.assertEqual(self.console.read_presets("glm53")["current"], "quality")
         backups = list(self.console.state.glob("*.backup.json"))
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600)
 
     def test_stale_revision_cannot_write_or_restart(self):
-        row = self.console.read_knobs("glm53")
-        self.fake.texts["glm53"]["box-0"] += "REUSE=0\n"
-        self.console.submit(self.request(changes={"REUSE": "1"}, revision=row["revision"]))
+        row = self.console.read_presets("glm53")
+        self.fake.texts["glm53"]["box-0"] += "VARIANT=home\n"
+        self.console.submit(self.request(preset="quality", revision=row["revision"]))
         self.assertEqual(self.done()["status"], "failed")
         self.assertEqual(self.fake.calls, [])
 
     def test_partial_write_rolls_back_without_restart(self):
         old = copy.deepcopy(self.fake.texts)
         self.fake.fail_write = "box-2"
-        row = self.console.read_knobs("glm53")
-        self.console.submit(self.request(changes={"REUSE": "1"}, revision=row["revision"]))
+        row = self.console.read_presets("glm53")
+        self.console.submit(self.request(preset="context", revision=row["revision"]))
         self.assertEqual(self.done()["status"], "failed")
         self.assertEqual(self.fake.texts, old)
         self.assertNotIn("stop", [x[0] for x in self.fake.calls])
 
-    def test_persistence_dependency_checked_before_writes(self):
-        row = self.console.read_knobs("glm53")
-        self.console.submit(self.request(changes={"KV_STORE": "ssd:/cache/kv,size=1G,persist=on,keep=sessions"}, revision=row["revision"]))
-        self.assertEqual(self.done()["status"], "failed")
+    def test_raw_knob_map_rejected_before_writes(self):
+        row = self.console.read_presets("glm53")
+        with self.assertRaisesRegex(ValueError, "raw setting"):
+            self.console.submit(self.request(changes={"KV_STORE": "ssd:/cache/kv,size=1G,persist=on,keep=sessions"}, revision=row["revision"]))
+        with self.assertRaisesRegex(ValueError, "unknown preset"):
+            self.console.submit(self.request(preset="fast", revision=row["revision"]))
         self.assertEqual(self.fake.calls, [])
 
     def test_failed_boot_is_not_success(self):
@@ -232,11 +249,11 @@ class ServiceTests(unittest.TestCase):
             self.console.submit(self.request())
         self.assertEqual(self.fake.calls, [])
 
-    def test_restore_after_failed_knob_restart(self):
+    def test_restore_after_failed_preset_restart(self):
         old = copy.deepcopy(self.fake.texts)
-        row = self.console.read_knobs("glm53")
+        row = self.console.read_presets("glm53")
         self.fake.fail_boot = True
-        self.console.submit(self.request(changes={"REUSE": "1"}, revision=row["revision"]))
+        self.console.submit(self.request(preset="quality", revision=row["revision"]))
         job = self.done()
         self.assertEqual(job["status"], "failed")
         self.assertTrue(job["can_restore"])
@@ -249,8 +266,8 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(restored["can_restore"])
 
     def test_restore_refuses_outside_edit(self):
-        row = self.console.read_knobs("glm53")
-        self.console.submit(self.request(changes={"REUSE": "1"}, revision=row["revision"]))
+        row = self.console.read_presets("glm53")
+        self.console.submit(self.request(preset="quality", revision=row["revision"]))
         job = self.done()
         self.fake.texts["glm53"]["box-2"] += "# outside edit\n"
         count = len(self.fake.calls)

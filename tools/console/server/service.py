@@ -14,7 +14,7 @@ import time
 from urllib.request import urlopen
 from urllib.parse import urlsplit
 
-from . import envfile, metrics, knobs
+from . import envfile, metrics, presets
 from .control import ComposeControl
 
 DEFAULT_IDS = {"ds41": "deepseek-v4.1-flash", "glm53": "glm-5.3", "glm53f": "glm-5.3-flash"}
@@ -73,7 +73,7 @@ class Console:
                                             for b in model.boxes])
                 row["width"] = len(model.boxes)
         for name, row in self.models.items():
-            if name not in knobs.MODELS:
+            if name not in presets.MODELS:
                 raise ValueError("unknown configured model")
             url = urlsplit(row.get("head_url", ""))
             if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.query or url.fragment:
@@ -82,11 +82,6 @@ class Console:
             row.setdefault("width", len(row.get("controls", [])))
             if not isinstance(row["width"], int) or not 0 <= row["width"] <= 8 or len(row.get("controls", [])) > 8:
                 raise ValueError("invalid configured width or control count")
-            profile = row.get("fast_values", {})
-            knobs.validate(profile, name, row["width"])
-            required = {k for k in knobs.FAST_KEYS[name] if knobs.supported(k, name, row["width"])}
-            if profile and set(profile) != required:
-                raise ValueError("fast_values must contain exactly the documented fast-switch profile for this model/topology")
         self.csrf = secrets.token_urlsafe(32)
         self.pool = ThreadPoolExecutor(max_workers=1)
         self.lock, self.poll_lock, self.submit_lock = threading.Lock(), threading.Lock(), threading.Lock()
@@ -142,7 +137,7 @@ class Console:
             urls = list(dict.fromkeys(m["head_url"] for m in self.models.values()))
             with ThreadPoolExecutor(max_workers=4) as pool:
                 observations = dict(zip(urls, pool.map(probe, urls)))
-            for name, title in knobs.MODELS.items():
+            for name, title in presets.MODELS.items():
                 config = self.models.get(name)
                 row = dict(id=name, name=title, state="not configured", width=None, last_switch=self.switch_times.get(name))
                 if config:
@@ -211,23 +206,22 @@ class Console:
             self.cache_at = now
             return {**self.cache, "operation": self.operation()}
 
-    def read_knobs(self, model):
+    def read_presets(self, model):
         if model not in self.models:
             raise ValueError("model is not configured")
-        row = self.models[model]
-        spec = knobs.catalog(model, row["width"])
         records = self.control.read_all(model) if self.control else {}
-        values = [envfile.read_values(r["text"], knobs.KNOBS, knobs.ENGINE_KEYS) for r in records.values()]
-        current, mixed = {}, []
-        for item in spec:
-            key = item["key"]
-            variants = {v[key] for v in values}
-            current[key] = next(iter(variants)) if len(variants) == 1 else None
+        rows = [envfile.read_values(r["text"], presets.KEYS, set()) for r in records.values()]
+        values, mixed_keys = {}, []
+        for key in presets.KEYS:
+            variants = {row[key] for row in rows}
+            values[key] = next(iter(variants)) if len(variants) == 1 else None
             if len(variants) > 1:
-                mixed.append(key)
-        return dict(catalog=spec, values=current, mixed=mixed, revision=revision(records) if records else None,
-                    fast_values=row.get("fast_values", {}), observed=bool(records),
-                    note="Configured overrides, not live engine values. Unset uses launcher defaults. All changes need restart.")
+                mixed_keys.append(key)
+        current = presets.classify(model, values) if rows and not mixed_keys else ("custom" if rows else None)
+        return dict(source=presets.SOURCE[model], presets=presets.public(model), current=current,
+                    current_setting=presets.describe(model, values, bool(mixed_keys), current),
+                    values=values, mixed=mixed_keys, revision=revision(records) if records else None,
+                    observed=bool(records))
 
     def submit(self, request):
         with self.submit_lock:
@@ -238,10 +232,14 @@ class Console:
                 raise ValueError("explicit confirmation required")
             if action not in ("switch", "restart", "stop", "restore") or model not in self.models:
                 raise ValueError("invalid action or model")
-            changes = request.get("changes", {})
-            knobs.validate(changes, model, self.models[model]["width"])
-            if changes and (action != "restart" or not request.get("revision")):
-                raise ValueError("knob writes require a reviewed revision and restart")
+            if request.get("changes"):
+                raise ValueError("raw setting maps are not accepted; choose a preset")
+            preset = request.get("preset")
+            changes = {}
+            if preset is not None:
+                if action != "restart" or not request.get("revision"):
+                    raise ValueError("a preset requires a reviewed revision and restart")
+                changes = presets.changes_for(model, preset)
             with self.lock:
                 if self.job and self.job["status"] == "running":
                     raise RuntimeError("another console operation is running")
@@ -293,23 +291,12 @@ class Console:
             if action == "restore":
                 self._restore(model, backup_id)
             if changes:
+                if set(changes) - set(presets.KEYS):
+                    raise ValueError("unsupported setting")
                 records = self.control.read_all(model)
                 if revision(records) != reviewed:
-                    raise ValueError("dotenv changed since review; refresh the knobs")
-                updated = {b: envfile.patch(r["text"], changes, knobs.ENGINE_KEYS) for b, r in records.items()}
-                for text in updated.values():
-                    vals = envfile.read_values(text, knobs.KNOBS, knobs.ENGINE_KEYS)
-                    if model == "ds41" and vals.get("MTP") and vals.get("SESS"):
-                        if int(vals["SESS"]) * (int(vals["MTP"]) + 1) > 32:
-                            raise ValueError("DeepSeek SESS * (MTP + 1) must not exceed 32")
-                    if vals.get("MAX_MODEL_LEN") and vals.get("CAP") and int(vals["MAX_MODEL_LEN"]) > int(vals["CAP"]):
-                        raise ValueError("MAX_MODEL_LEN cannot exceed CAP")
-                    if vals.get("KV_STORE") and "persist=on" in vals["KV_STORE"]:
-                        grace = vals.get("GR8_STOP_GRACE") or "30s"
-                        if not grace.endswith("s") or not grace[:-1].isdecimal() or int(grace[:-1]) < 150:
-                            raise ValueError("persistent KV needs GR8_STOP_GRACE of at least 150s")
-                    if vals.get("GR8_LOAD_COMPACT") and vals.get("GR8_LOAD_MERGE_KB") != "1":
-                        raise ValueError("compact profile needs GR8_LOAD_MERGE_KB=1")
+                    raise ValueError("dotenv changed since review; refresh presets")
+                updated = {b: envfile.patch(r["text"], changes, set()) for b, r in records.items()}
                 backup = self.state / (self.job["id"] + ".backup.json")
                 backup.write_text(json.dumps({"model": model, "records": records, "written": {b: envfile.digest(t) for b, t in updated.items()}}, indent=2))
                 os.chmod(backup, 0o600)

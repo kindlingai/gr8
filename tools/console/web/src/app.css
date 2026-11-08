@@ -16,10 +16,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 header { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px; border-bottom: 1px solid var(--border); background: var(--bg); position: sticky; top: 0; z-index: 5; }
 .brand { font: 700 10px var(--font-mono); letter-spacing: .18em; color: var(--dreamer); margin-right: 4px; }
 .brand b { color: var(--user); }
-nav { display: flex; gap: 2px; }
-nav button { background: none; border: 1px solid transparent; color: var(--ink-dim); padding: 2px 8px; border-radius: 6px; font-size: 11px; }
-nav button.on { color: var(--ink); border-color: var(--border-strong); background: var(--surface); }
-.live { margin-left: auto; display: flex; align-items: center; gap: 6px; font: 10px var(--font-mono); color: var(--ink-dim); white-space: nowrap; }
+.live { margin-left: auto; display: flex; align-items: center; gap: 6px; font: 10px var(--font-mono); color: var(--ink-dim); white-space: nowrap; overflow: hidden; }
 .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--sprite); box-shadow: 0 0 5px var(--sprite); flex-shrink: 0; }
 .dot.off { background: var(--ink-meta); box-shadow: none; }
 main { padding: 8px 10px; }
@@ -29,7 +26,18 @@ main { padding: 8px 10px; }
 .meta { font-family: var(--font-mono); }
 .sub { margin: 0 0 6px; }
 .pill { display: inline-flex; align-items: center; font: 9px/1.6 var(--font-mono); border: 1px solid var(--border-strong); border-radius: 999px; padding: 0 6px; color: var(--ink-dim); }
-.pill.ok { border-color: color-mix(in srgb, var(--sprite) 40%, transparent); }
+.pill.ok { color: var(--sprite); border-color: color-mix(in srgb, var(--sprite) 40%, transparent); }
+.pill.preset { color: var(--user); border-color: color-mix(in srgb, var(--user) 45%, transparent); }
+.presets { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; padding: 6px 8px; }
+.pb { font: inherit; cursor: pointer; text-align: left; border-radius: 6px; padding: 4px 8px; border: 1px solid var(--border-strong); background: var(--surface-warm); color: var(--ink); min-width: 0; }
+.pb b { display: block; font-size: 12px; } .pb span { display: block; font-size: 10px; color: var(--ink-meta); overflow-wrap: anywhere; }
+.pb:hover { border-color: var(--dreamer); }
+.pb.on { border-color: var(--user); background: color-mix(in srgb, var(--user) 10%, var(--surface)); } .pb.on b { color: var(--user); }
+.pb:disabled { cursor: not-allowed; opacity: .5; }
+.psets { padding: 0 8px 6px; font: 10px/1.5 var(--font-mono); color: var(--ink-dim); overflow-wrap: anywhere; }
+.psets b { color: var(--ink); font-weight: 600; }
+.custom { padding: 0 8px 6px; }
+.models { margin-top: 8px; }
 .cols { display: grid; grid-template-columns: minmax(0,1.15fr) minmax(0,1fr); gap: 8px; align-items: start; }
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
 .ph { display: flex; align-items: center; gap: 6px; padding: 5px 8px; border-bottom: 1px solid var(--border); font: 10px var(--font-mono); color: var(--ink-meta); text-transform: uppercase; letter-spacing: .06em; }
@@ -52,20 +60,6 @@ td.v small { color: var(--ink-meta); font-weight: 400; font-size: 10px; }
 .btn.pri { background: color-mix(in srgb, var(--dreamer) 15%, var(--surface)); border-color: color-mix(in srgb, var(--dreamer) 50%, transparent); color: var(--dreamer); }
 .btn.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); }
 select, input { background: var(--surface-warm); color: var(--ink); border: 1px solid var(--border-strong); border-radius: 4px; padding: 1px 5px; font: 10.5px var(--font-mono); min-height: 20px; }
-.knob-input { width: 100%; min-width: 0; }
-.search { width: 150px; }
-.knobs { table-layout: fixed; }
-.knobs td { overflow-wrap: anywhere; }
-.knobs .input-col { width: 150px; } .knobs .label-col { width: 260px; } .knobs .tag-col { width: 64px; }
-.tag { white-space: nowrap; font: 8.5px var(--font-mono); padding: 0 4px; border-radius: 4px; border: 1px solid color-mix(in srgb,var(--matron) 40%,transparent); color: var(--matron); }
-.fastrow .btn { white-space: normal; padding: 2px 4px; }
-.fastrow td { background: color-mix(in srgb,var(--user) 6%,var(--surface)); }
-.fast-label { color: var(--user); font-weight: 700; }
-.chg td { background: color-mix(in srgb,var(--matron) 7%,var(--surface)); }
-.doc { color: var(--ink-dim); font-size: 10.5px; }
-.grp td { font: 9px var(--font-mono); color: var(--ink-meta); text-transform: uppercase; letter-spacing: .06em; padding-top: 5px; height: auto; background: var(--bg); }
-.stagebar { position: sticky; bottom: 6px; margin-top: 6px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 6px; background: color-mix(in srgb,var(--matron) 10%,var(--surface)); border: 1px solid color-mix(in srgb,var(--matron) 40%,transparent); font-size: 11px; }
-.stagebar .msg { color: var(--matron); margin-right: auto; }
 .cur td { background: color-mix(in srgb,var(--sprite) 5%,var(--surface)); }
 .acts { display: flex; gap: 4px; justify-content: flex-end; }
 .notice { padding: 4px 8px; border: 1px solid var(--border); border-radius: 4px; margin: 6px 0; overflow-wrap: anywhere; }
@@ -80,16 +74,9 @@ dialog .row { display: flex; gap: 6px; justify-content: flex-end; margin-top: 8p
 .operation { margin-top: 8px; }
 @media (max-width: 760px) {
   .cols { grid-template-columns: 1fr; }
-  .hide-s, .doc { display: none; }
-  header { gap: 6px; }
+  .hide-s { display: none; }
+  header { gap: 6px; } .brand { letter-spacing: .1em; }
   td, th { padding-left: 6px; padding-right: 6px; }
-  .knobs .input-col { width: 94px; } .knobs .label-col { width: calc(100% - 149px); } .knobs .tag-col { width: 55px; }
-  .knobs, .knobs tbody { display: block; }
-  .knobs colgroup { display: none; }
-  .knobs tr:not(.grp) { display: grid; grid-template-columns: 94px minmax(0, 1fr) 55px; }
-  .knobs td { height: auto; min-height: 22px; }
-  .knobs tr.grp, .knobs tr.grp td { display: block; }
-  .search { width: 110px; }
   .model-name { max-width: 140px; overflow-wrap: anywhere; }
 }
 @media (pointer: coarse) { input, select { font-size: 16px; } }

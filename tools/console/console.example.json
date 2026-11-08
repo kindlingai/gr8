@@ -11,8 +11,7 @@
         {"host": "rank-one.example", "port": 7340},
         {"host": "rank-two.example", "port": 7340},
         {"host": "rank-three.example", "port": 7340}
-      ],
-      "fast_values": {}
+      ]
     }
   }
 }

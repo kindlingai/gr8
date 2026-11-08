@@ -60,10 +60,10 @@ def create_app(config=None, console=None):
     def snapshot():
         return ok(app.state.console.snapshot())
 
-    @app.get("/api/knobs/{model}")
-    def get_knobs(model):
+    @app.get("/api/presets/{model}")
+    def get_presets(model):
         try:
-            return ok(app.state.console.read_knobs(model))
+            return ok(app.state.console.read_presets(model))
         except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 

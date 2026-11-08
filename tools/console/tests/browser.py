@@ -45,48 +45,40 @@ def run(output):
             expect(page.locator(".name")).to_have_text("GLM-5.3")
             expect(page.get_by_role("row").filter(has_text="Decode").locator(".v")).not_to_contain_text("—", timeout=10000)
             expect(page.get_by_text("SYNTHETIC FIXTURE", exact=False).first).to_be_visible()
+            expect(page.locator(".pb.on")).to_contain_text("Speed")
+            expect(page.get_by_role("button", name="Knobs")).to_have_count(0)
+            expect(page.get_by_text("VARIANT=bit325")).to_be_visible()
             for width in (1366, 390):
                 page.set_viewport_size({"width": width, "height": 844 if width == 390 else 768})
-                for tab in ("Overview", "Knobs", "Models"):
-                    page.get_by_role("button", name=tab, exact=True).click()
-                    if tab == "Knobs":
-                        expect(page.get_by_label("REUSE", exact=True)).to_be_visible()
-                        if width == 390:
-                            table = page.locator("table.knobs").bounding_box()
-                            tag = page.locator("table.knobs tr.fastrow td").nth(2).bounding_box()
-                            assert abs(tag["x"] + tag["width"] - table["x"] - table["width"]) < 2, "hidden description column still consumes mobile width"
-                    page.screenshot(path=str(output / f"{tab.lower()}-{width}.png"), full_page=True)
-                    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), f"horizontal overflow: {tab}/{width}"
-            print("PASS desktop 1366 + mobile 390: three tabs, screenshots, no horizontal overflow")
+                page.screenshot(path=str(output / f"page-{width}.png"), full_page=True)
+                assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), f"horizontal overflow: {width}"
+            print("PASS desktop 1366 + mobile 390: one page, three presets, no horizontal overflow")
 
-            page.get_by_role("button", name="Knobs", exact=True).click()
-            page.get_by_label("REUSE", exact=True).select_option("1")
-            expect(page.get_by_text("1 change staged · needs restart")).to_be_visible()
-            assert fixture.calls == [], "staging wrote a file"
-            page.get_by_role("button", name="Discard", exact=True).click()
-            expect(page.get_by_label("REUSE", exact=True)).to_have_value("")
+            page.set_viewport_size({"width": 390, "height": 844})
+            page.get_by_role("button", name="Speed").click()
+            expect(page.get_by_role("dialog")).to_have_count(0)
             assert fixture.calls == []
-            page.get_by_label("REUSE", exact=True).select_option("1")
-            page.get_by_role("button", name="Review + restart…").click()
+            page.get_by_role("button", name="Quality").click()
             expect(page.get_by_role("dialog")).to_be_visible()
+            expect(page.get_by_role("dialog")).to_contain_text("launcher defaults")
+            expect(page.get_by_role("dialog")).to_contain_text("VARIANT=bit325")
             page.screenshot(path=str(output / "review-390.png"), full_page=True)
             page.get_by_role("button", name="Cancel", exact=True).click()
             assert fixture.calls == []
-            page.get_by_role("button", name="Review + restart…").click()
+            page.get_by_role("button", name="Quality").click()
             page.keyboard.press("Escape")
             expect(page.get_by_role("dialog")).not_to_be_visible()
             assert fixture.calls == []
-            print("PASS stage/discard/cancel/Escape: no backend write or restart")
+            print("PASS preset cancel/Escape and current preset: no backend write or restart")
 
-            page.get_by_role("button", name="Review + restart…").click()
+            page.get_by_role("button", name="Quality").click()
             page.get_by_role("button", name="Restart now", exact=True).click()
             expect(page.get_by_label("Operation status")).to_contain_text("succeeded", timeout=15000)
-            expect(page.get_by_text("1 change staged · needs restart")).not_to_be_visible(timeout=15000)
+            expect(page.locator(".pb.on")).to_contain_text("Quality", timeout=15000)
             assert [x[0] for x in fixture.calls] == ["write"] * 4 + ["stop", "switch"]
-            assert all("REUSE=1" in t for t in fixture.texts["glm53"].values())
-            print("PASS confirmed knob edit: writes all four envs, stops, calls switch, verifies ready identity")
+            assert all("VARIANT=bit325" in t and "KEEP_ME=1" in t and "SESS=4" in t for t in fixture.texts["glm53"].values())
+            print("PASS confirmed preset: writes all four envs, stops, calls switch, verifies ready identity")
 
-            page.get_by_role("button", name="Models", exact=True).click()
             row = page.get_by_role("row").filter(has_text="DeepSeek-V4.1-Flash")
             row.get_by_role("button", name="Switch", exact=True).click()
             page.get_by_role("button", name="Switch now", exact=True).click()
@@ -113,25 +105,10 @@ def run(output):
             row.get_by_role("button", name="Switch", exact=True).click()
             page.get_by_role("button", name="Switch now", exact=True).click()
             expect(page.get_by_label("Operation status")).to_contain_text("succeeded", timeout=15000)
-            page.get_by_role("button", name="Knobs", exact=True).click()
-            entered, release = threading.Event(), threading.Event()
-            original_read = fixture.read_all
-            def delayed_read(model):
-                entered.set()
-                release.wait(5)
-                return original_read(model)
-            fixture.read_all = delayed_read
-            page.get_by_role("button", name="Refresh overrides", exact=True).click()
-            assert entered.wait(3)
-            try:
-                expect(page.get_by_label("REUSE", exact=True)).to_be_disabled()
-            finally:
-                release.set()
-                fixture.read_all = original_read
-            expect(page.get_by_role("button", name="Refresh overrides", exact=True)).to_be_enabled()
-            expect(page.get_by_label("REUSE", exact=True)).to_have_value("1")
-            page.get_by_label("REUSE", exact=True).select_option("0")
-            page.get_by_role("button", name="Review + restart…").click()
+            expect(page.locator(".pb.on")).to_contain_text("Quality", timeout=15000)
+            page.get_by_role("button", name="Speed").click()
+            expect(page.get_by_role("dialog")).to_contain_text("VARIANT=bit325")
+            expect(page.get_by_role("dialog")).to_contain_text("launcher defaults")
             fixture.fail_boot = True
             page.get_by_role("button", name="Restart now", exact=True).click()
             expect(page.get_by_label("Operation status")).to_contain_text("failed", timeout=15000)
@@ -140,11 +117,10 @@ def run(output):
             expect(page.get_by_label("Operation status")).to_contain_text("restore · glm53")
             expect(page.get_by_label("Operation status")).to_contain_text("succeeded", timeout=15000)
             assert fixture.active is None
-            assert all("REUSE=1" in text for text in fixture.texts["glm53"].values())
+            assert all("VARIANT=bit325" in text for text in fixture.texts["glm53"].values())
             page.screenshot(path=str(output / "restored-settings-390.png"), full_page=True)
             fixture.fail_boot = False
-            page.get_by_role("button", name="Models", exact=True).click()
-            print("PASS failed knob restart can restore exact prior settings from UI without booting")
+            print("PASS failed preset restart can restore exact prior settings from UI without booting")
 
             page.route("**/api/snapshot", lambda route: route.abort())
             expect(page.get_by_text("Connection lost.", exact=False).first).to_be_visible(timeout=15000)
