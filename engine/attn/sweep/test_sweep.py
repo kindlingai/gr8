@@ -62,6 +62,23 @@ ptxas info : Used 255 registers, used 1 barriers
             self.assertEqual(totals["fast"]["status"],"MISMATCH")
             self.assertEqual(totals["bad"]["status"],"INCOMPLETE")
 
+    def test_fixture_oom_exit_is_retryable(self):
+        # Exercise the actual adapter CK macro with a deterministic allocation
+        # error, without consuming device memory or racing the shared GPU.
+        source=(HERE/"fixtures.cuh").read_text()
+        macro=source[source.index("#define CK(x)"):source.index("static int g_fail")]
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            cpp=root/"oom.cpp"
+            cpp.write_text("#include <cstdio>\n#include <cstdlib>\n"
+                "enum cudaError_t {cudaSuccess=0,cudaErrorMemoryAllocation=2};\n"
+                'const char* cudaGetErrorString(cudaError_t){return "out of memory";}\n'
+                +macro+"\nint main(){CK(cudaErrorMemoryAllocation);return 0;}\n")
+            subprocess.run(["g++",str(cpp),"-o",str(root/"oom")],check=True,capture_output=True)
+            result=subprocess.run([str(root/"oom")],capture_output=True,text=True)
+            self.assertEqual(result.returncode,77)
+            self.assertIn("out of memory",result.stderr)
+
     def test_generic_driver_build_isolation_retry_and_case_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)

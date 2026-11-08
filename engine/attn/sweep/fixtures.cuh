@@ -21,7 +21,7 @@ using ds41a::CQ_CODES;
         if (e_ != cudaSuccess)                                                                                      \
         {                                                                                                           \
             fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__);                \
-            exit(2);                                                                                                \
+            exit(e_ == cudaErrorMemoryAllocation ? 77 : 2);                                                     \
         }                                                                                                           \
     } while (0)
 
