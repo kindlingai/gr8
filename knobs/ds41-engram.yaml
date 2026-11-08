@@ -43,8 +43,10 @@ knobs:
     values: "0..32768"
     doc: >-
       Queue depth for the raw io_uring Engram row reader on the calling fetch thread. 0 keeps the pread pool
-      unchanged; positive values use aligned block reads without pool workers. If ring setup is unavailable,
-      logs once and falls back to the pread pool sized by GR8_DS_ENGRAM_IO_THREADS.
+      unchanged; positive values use aligned block reads without pool workers. The default reader needs a
+      seccomp profile that allows io_uring_setup, io_uring_enter and io_uring_register. The stock Docker
+      profile denies those calls with EPERM. A denied setup logs the errno once and uses the pread pool
+      sized by GR8_DS_ENGRAM_IO_THREADS (engine/engram/rowstore.h; tested with EPERM and ENOSYS).
   GR8_DS_ENGRAM_LOOKAHEAD:
     scope: local
     kind: flag

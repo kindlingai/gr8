@@ -104,10 +104,11 @@ range or unsupported check stops boot with both fixes named. Holes outside this 
 trigger the check. This checks allocation coverage, not a content checksum, and never restages files automatically.
 
 `GR8_DS_ENGRAM_IO_URING=128` is the default row reader queue depth. It uses aligned block reads on the fetching
-thread without pread-pool workers. `GR8_DS_ENGRAM_IO_URING=0` selects the original pread pool. If ring setup is
-unavailable (including a container denying the syscall), the engine logs the errno once and falls back to that
-pool, sized by `GR8_DS_ENGRAM_IO_THREADS`; the boot log identifies the selected reader. No container security
-change is required for the fallback.
+thread without pread-pool workers. That default reader needs a seccomp profile that allows `io_uring_setup`,
+`io_uring_enter` and `io_uring_register`. The stock Docker profile denies those calls with EPERM.
+`GR8_DS_ENGRAM_IO_URING=0` selects the original pread pool. A denied setup logs the errno once and uses that
+pread pool, sized by `GR8_DS_ENGRAM_IO_THREADS` (`engine/engram/rowstore.h`; tested with EPERM and ENOSYS). The
+boot log identifies the selected reader. No container security change is required for the fallback.
 
 The cmap is the compressed token map, 517,144 bytes. It is rank-independent: write it once and copy the same file to
 every box. Its sha256 must equal `kCmapSha256` in `engine/engram/hash_consts.h`, so a wrong or stale file fails the
