@@ -432,7 +432,7 @@ public:
         require(!c_.scheduler.park || (reuse() && m.park), "parked slots need prefix reuse and the park hook");
         if (reuse()) {
             require(m.retain && pol_.o.take, "prefix reuse needs retain, match and take");
-            dispatch_.track_rows();
+            dispatch_.track_rows(c_.scheduler.mtp > 0);
         }
         if (!c_.rank) {
             leader_ = std::make_unique<LeaderChannel>(c_.scheduler.epoch,links_.peers()); endpoint_ = leader_.get();
