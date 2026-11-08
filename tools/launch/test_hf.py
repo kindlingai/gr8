@@ -269,6 +269,40 @@ class HFTests(unittest.TestCase):
     def variant(self, r, name='home'):
         return modelset.resolve_variant(name, r.v2, [r.dir])
 
+    def test_prepare_compact_round_trip(self):
+        import launch
+        dest = os.path.join(self.cache, 'compact-rank1')
+        args = ['prepare', '--no-config', '--model', f'https://huggingface.co/{RELEASE}',
+                '--model-cache', self.cache, '--rank', '1', '--tp', '4', '--variant', 'home',
+                '--extra-env', f'GR8_LOAD_COMPACT={dest}']
+        env = {**os.environ, **GLM, 'G6LOAD': hfsource.fetch_ranks().g6load()}
+        cmd = [sys.executable, launch.__file__, *args]
+        for _ in range(2):  # initial prepare, then verify/reuse with an already-complete fetch
+            r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn('halves verified', r.stdout)
+        release = self.release()
+        variant = self.variant(release)
+        # Each dense copy equals the original ranges, in sorted order without holes. The command above also
+        # read every half through the Rust loader's map and checked its checksum against the index slices.
+        for name in os.listdir(dest):
+            if not name.endswith('.g6map'):
+                continue
+            with open(os.path.join(dest, name)) as f:
+                head, *rows = f.read().splitlines()
+            src = os.path.join(release.v2, name[:-6])
+            self.assertEqual(head, f'g6map-v1 {os.path.getsize(src)}')
+            with open(src, 'rb') as original, open(os.path.join(dest, name[:-6]), 'rb') as copy:
+                packed = 0
+                for row in rows:
+                    start, length, offset = map(int, row.split())
+                    self.assertEqual(offset, packed)
+                    original.seek(start)
+                    self.assertEqual(copy.read(length), original.read(length))
+                    packed += length
+                self.assertEqual(copy.read(), b'')
+        self.assertEqual(release.check(4, 1, variant), [])
+
     def test_parse_url(self):
         P = hfsource.parse_url
         self.assertEqual(P('https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4'), ('kindlingai/glm-5.3-exlr8-k2-k3-k4', 'main'))

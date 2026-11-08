@@ -413,6 +413,24 @@ def cmd_check(argv):
     return 1 if fails else 0
 
 
+def prepare_compact(o, rank, variant):
+    """An opt-in prepare step, never a boot-time rewrite. Use the same local directory assignment as the engine."""
+    directory = os.environ.get('GR8_LOAD_COMPACT', os.environ.get('G6_LOAD_COMPACT', ''))
+    # engine_args.sh splits EXTRA_ENV on whitespace, normalizes legacy names and applies the last assignment.
+    for word in (o.get('EXTRA_ENV') or '').split():
+        key, sep, value = word.partition('=')
+        if sep and key in ('GR8_LOAD_COMPACT', 'G6_LOAD_COMPACT'):
+            directory = value
+    if not directory:
+        return
+    if not variant.path or not o.get('V2_SLICES'):
+        raise modelset.ModelError('GR8_LOAD_COMPACT prepare needs an exlr8 v2 release with index slices and a width manifest')
+    import fetch_ranks
+    result = fetch_ranks.compact_rank(o.get('V2'), directory, o.get('V2_SLICES'), int(o.get('TP')), rank,
+                                      variant.path, o.get('LAYOUT'))
+    print(f'compact copies: {result["checked"]} halves verified in {directory}')
+
+
 def cmd_prepare(argv):
     o = parse(argv)
     rank = int(o.get('RANK')) if o.get('RANK') else next((int(a) for a in o.args if a.isdigit()), None)
@@ -443,6 +461,8 @@ def cmd_prepare(argv):
             if getattr(ms.drafter, 'pins', False) or ms.drafter.check(rank):
                 ms.drafter.fetch_rank(rank)
             bad += ms.drafter.check(rank)
+        if not bad:
+            prepare_compact(o, rank, variant)
     except (modelset.ModelError, OSError, RuntimeError) as e:
         print(f'gr8: {e}', file=sys.stderr)
         return 1

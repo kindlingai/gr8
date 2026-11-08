@@ -9,6 +9,10 @@
 //!       each of those halves' xxhash64 against the index slices: {"checked", "bad": [{"file", "offset", "nbytes",
 //!       "layer", "expert", "half", "proj"}]}. Exit 0 when every half matches, 3 when one does not, 1 on an error.
 //!
+//!   g6load compact --slices DIR --v2 DIR --out DIR --tp N --rank R (--manifest FILE | --widths ...)
+//!       [--layers ...] [--layout FILE]: write dense expert copies and g6map-v1 maps for this rank, verify every
+//!       half through the compact reader, then publish the directory. An existing directory is checked and reused.
+//!
 //! DIR for --slices holds tp<N>/k<K>/rank<R>.safetensors (the release's index-slices/).
 //!
 //!   g6load dflash2 --src DIR --out DIR [--nr 4] [--ranks 0,1,2,3] [--bf16 fc,attn,mlp,conv,sel]
@@ -43,7 +47,7 @@ fn layers(spec: &str) -> Result<Vec<usize>, String> {
 
 fn run() -> Result<i32, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = argv.first().ok_or("usage: g6load fetch-plan|verify|dflash2 (see the source) --slices DIR --tp N --rank R (--manifest F | --widths K,..)")?;
+    let cmd = argv.first().ok_or("usage: g6load fetch-plan|verify|compact|dflash2 (see the source) --slices DIR --tp N --rank R (--manifest F | --widths K,..)")?;
     let mut opt: BTreeMap<&str, &str> = BTreeMap::new();
     let mut it = argv[1..].iter();
     while let Some(k) = it.next() {
@@ -83,6 +87,11 @@ fn run() -> Result<i32, String> {
             println!("{out}\n]}}");
             Ok(0)
         }
+        "compact" => {
+            g6load::compact::write(need("--v2")?, need("--out")?, &units)?;
+            println!("{{\"checked\": {}, \"bad\": []}}", units.len());
+            Ok(0)
+        }
         "verify" => {
             let bad = fetch::verify(need("--v2")?, &units)?;
             let rows: Vec<String> = bad.iter().map(|&i| {
@@ -93,6 +102,6 @@ fn run() -> Result<i32, String> {
             println!("{{\"checked\": {}, \"bad\": [{}]}}", units.len(), rows.join(",\n"));
             Ok(if bad.is_empty() { 0 } else { 3 })
         }
-        _ => Err(format!("unknown command {cmd}: fetch-plan, verify or dflash2")),
+        _ => Err(format!("unknown command {cmd}: fetch-plan, verify, compact or dflash2")),
     }
 }
