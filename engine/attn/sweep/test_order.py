@@ -86,6 +86,37 @@ class OrderTests(unittest.TestCase):
         mixed=dict(pair,estimator="other")
         self.assertEqual(runner.aggregate_runs([candidate],[pair,mixed],cases,["fast"],"off")[0]["status"],"INCOMPLETE")
 
+    def test_null_columns_render_means_band_and_explicit_verdict(self):
+        cases=[dict(id="x",args=[],weights={})]
+        for nulls, bands, expected in [([-3,0,3],[3,3,3],"WITHIN_BAND"),
+                                       ([-4,0,4],[3,3,3],"OUTSIDE_BAND"),
+                                       ([0,0,0],[0,0,0],"WITHIN_BAND"),
+                                       ([None,0,0],[3,3,3],"UNAVAILABLE"),
+                                       ([float("nan"),0,0],[3,3,3],"UNAVAILABLE"),
+                                       ([0,0,0],[None,3,3],"UNAVAILABLE"),
+                                       ([0,0,0],[3,2,3],"UNAVAILABLE"),
+                                       ([0,0,0],[-3,-3,-3],"UNAVAILABLE")]:
+            with self.subTest(nulls=nulls,bands=bands):
+                runs=[row("off",100,null_delta_pct_mean=n,null_band_pct=b) for n,b in zip(nulls,bands)]
+                summaries=runner.aggregate_runs(runs,[],cases,["off"],"off")
+                self.assertEqual(summaries[0]["null_band_verdict"],expected)
+                with tempfile.TemporaryDirectory() as tmp:
+                    out=Path(tmp)
+                    runner.write_tables(out,summaries,cases,["off"],"off","toy")
+                    with (out/"summary.csv").open() as f:
+                        rendered=list(runner.csv.DictReader(f))[0]
+                    self.assertEqual(rendered["null_band_verdict"],expected)
+                    self.assertIn("null_delta_pct_mean",rendered)
+                    self.assertIn("null_band_pct",rendered)
+                    self.assertIn("null_band_verdict",(out/"summary.md").read_text())
+                    self.assertIn(expected,(out/"summary.md").read_text())
+                    if expected in ("WITHIN_BAND","OUTSIDE_BAND"):
+                        self.assertEqual(float(rendered["null_delta_pct_mean"]),statistics.mean(nulls))
+                        self.assertEqual(float(rendered["null_band_pct"]),bands[0])
+        failed=row("off",100,null_delta_pct_mean=0,null_band_pct=3)
+        failed["status"]="MISMATCH"
+        self.assertEqual(runner.aggregate_runs([failed],[],cases,["off"],"off")[0]["null_band_verdict"],"INCOMPLETE")
+
     def test_regime_labels_do_not_invent_cold_or_engine(self):
         self.assertIn("warm/repeated-address",runner.timing_regime({}))
         self.assertIn("unavailable",runner.timing_regime({"input_slots":"bad"}))

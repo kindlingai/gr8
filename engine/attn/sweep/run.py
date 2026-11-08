@@ -204,7 +204,7 @@ def aggregate_runs(raw, pairs, cases, variants, reference):
             if not runs:
                 continue
             row = {"kernel": runs[0]["kernel"], "case": case["id"], "variant": v,
-                   "status": "INCOMPLETE", "n_runs": len(runs),
+                   "status": "INCOMPLETE", "null_band_verdict": "INCOMPLETE", "n_runs": len(runs),
                    "n_valid_runs": sum(valid_measurement(r) for r in runs)}
             if all(r["status"] == "BUILD_FAILED" for r in runs):
                 row["status"] = "BUILD_FAILED"
@@ -221,13 +221,17 @@ def aggregate_runs(raw, pairs, cases, variants, reference):
                 for key in ("regs", "ptxas_regs", "stack_bytes", "spill_store_bytes", "spill_load_bytes", "dynamic_smem", "local_bytes", "mismatch_bytes"):
                     if key in runs[0] and all(r.get(key) == runs[0][key] for r in runs):
                         row[key] = runs[0][key]
+                row["null_band_verdict"] = "UNAVAILABLE"
                 nulls = [r.get("null_delta_pct_mean") for r in runs]
-                if all(isinstance(x, (int, float)) and math.isfinite(x) for x in nulls):
+                if all(isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in nulls):
                     row["null_delta_pct_mean"] = statistics.mean(nulls)
                     row["null_max_abs_delta_pct"] = max(map(abs, nulls))
                 bands = [r.get("null_band_pct") for r in runs]
-                if bands and bands[0] is not None and all(b == bands[0] for b in bands):
+                if all(isinstance(b, (int, float)) and not isinstance(b, bool) and math.isfinite(b) and b >= 0 and b == bands[0] for b in bands):
                     row["null_band_pct"] = bands[0]
+                    if "null_max_abs_delta_pct" in row:
+                        # Compare EVERY process mean, not just their cancellable average.
+                        row["null_band_verdict"] = "WITHIN_BAND" if row["null_max_abs_delta_pct"] <= bands[0] else "OUTSIDE_BAND"
                 if good:
                     stats = uncertainty([r["delta_pct"] for r in good])
                     row.update(vs_reference_pct=stats["mean"], paired_delta_pct=stats["mean"],
@@ -248,7 +252,7 @@ def write_tables(out, rows, cases, variants, reference, kernel):
               "regime", "n_runs", "n_valid_runs", "n_pairs", "n_pairs_requested", "between_run_sd_us",
               "pairing_estimator", "paired_delta_us", "paired_delta_pct", "paired_sd_pct",
               "paired_ci95_low_pct", "paired_ci95_high_pct", "null_delta_pct_mean",
-              "null_max_abs_delta_pct", "null_band_pct"]
+              "null_max_abs_delta_pct", "null_band_pct", "null_band_verdict"]
     for label in labels:
         fields.extend([f"calls_{label}", f"contribution_{label}_ms"])
     for r in rows:
@@ -289,6 +293,7 @@ def write_tables(out, rows, cases, variants, reference, kernel):
         return str(v) if v is not None else "UNKNOWN"
     md = [f"# {kernel} kernel sweep", "", f"Reference: `{reference}`. CUDA event batch means; sd_us is mean within-process repetition SD, NOT uncertainty.",
           "paired_sd_pct and paired_ci95_* are BETWEEN-process/pair SD and Student-t 95% CI; n_pairs is the independent observation count, not CUDA repetitions.",
+          "null_band_verdict compares every process off/off null mean to the common reported band; a grand-mean cancellation cannot pass. Missing null data is UNAVAILABLE, failed rows INCOMPLETE; this is not a model keep/drop verdict.",
           "CI assumes independent pair observations; autocorrelation may understate uncertainty. See raw telemetry and controls for drift/competition.",
           "Prompt totals are weighted kernel-only estimates, NOT TTFT. No rank multiplier. Total percentage is an aggregate ratio, not paired uncertainty.",
           "Cold/rotating synthetic inputs are not an engine predecessor replay; captured regime is unavailable unless explicitly reported by the adapter.",
