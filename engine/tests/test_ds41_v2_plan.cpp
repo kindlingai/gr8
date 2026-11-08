@@ -35,6 +35,42 @@ int main() {
         auto two=fabric_plan(o,in);
         if(v2)assert(!two.refusal.empty()); else assert(two.refusal.empty());
     }
+    // Striping is host-config only. Zero retains inherited DS_STRIPE exactly;
+    // a positive override touches only the dedicated v2 fabric, never main.
+    for(bool v2:{false,true})for(bool dual:{false,true})for(bool inherited:{false,true})
+    for(int64_t threshold:{int64_t(0),int64_t(1),int64_t(8192),int64_t(1048576),INT64_MAX}) {
+        if(inherited&&!dual)continue; // DS_STRIPE's existing two-rail guard
+        EngineOptions o; o.s2mode=true; o.NL=40; o.NX=2; o.NC=83;
+        for(int i=0;i<40;++i)o.layers.push_back(i);
+        o.cfg.ips={"1","2","3","4"}; o.cfg.rank=0;
+        if(dual)o.cfg.ips2={"5","6","7","8"};
+        PlanInputs in; in.trunk_bytes=2; in.head_payload=512;
+        in.k.ds_pf_v2=v2; in.k.ds_prefill_w="4096"; in.k.ds_pf_tail="128";
+        in.k.ds_stripe=inherited; in.k.ds_stripe_min=2097152;
+        const auto baseline=fabric_plan(o,in); assert(baseline.refusal.empty());
+        in.k.ds_pf_v2_stripe_min=threshold;
+        const auto p=fabric_plan(o,in); assert(p.refusal.empty());
+        assert(p.fabrics.size()==baseline.fabrics.size());
+        for(size_t i=0;i<p.fabrics.size();++i) {
+            const auto& f=p.fabrics[i]; const auto& b=baseline.fabrics[i];
+            assert(f.kind==b.kind);
+            auto cfg=f.cfg;
+            assert(cfg.stripe_min==(f.kind==FabKind::Ds41V2&&threshold>0
+                ? size_t(threshold) : b.cfg.stripe_min));
+            cfg.stripe_min=b.cfg.stripe_min;
+            // describe() serializes every FabricConfig field, including slots.
+            assert(describe_fabric("test",cfg)==describe_fabric("test",b.cfg));
+        }
+        int logs=0;
+        for(const auto& line:p.log)if(line.find("# ds41_v2_stripe ")==0) {
+            ++logs;
+            const size_t min=threshold>0 ? size_t(threshold) : inherited ? 2097152 : 0;
+            assert(line==fplan::fmt("# ds41_v2_stripe min=%zu rails=%d effective_min=%zu\n",
+                min,dual?2:1,min&&dual?std::max(min,size_t(8192)):0));
+        }
+        assert(logs==(v2?1:0));
+    }
+    std::cout<<"v2 stripe plan: zero/inherited, thresholds 1/8192/1MiB/INT64_MAX, one/two rails, v2 off, isolated layout and once-per-plan log PASS\n";
     // Actual six-segment tail layout: stage each owner's slice then reconstruct
     // only the final rows. Includes every owner-empty and boundary-crossing case.
     for(int M:{1,2,3,5,17,127,128,129,257,511,4093,4096,8191,8192}) {

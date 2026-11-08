@@ -58,6 +58,10 @@ fi
 [ -f "$KN" ] || { echo "no $KN: cargo build --release --features capi --manifest-path engine/knobs-rs/Cargo.toml"; exit 1; }
 KVLIB=("$HL" "$KN" -lpthread -ldl -lm)
 KNOBS=("$KN" "$HL" -lpthread -ldl -lm)
+# DS41 v2 dedicated fabric: layout, isolated striping threshold, and off inheritance.
+g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -DG6_NR=4 -DDEC_S2 -I "$REPO/engine" \
+  "$REPO/engine/tests/test_ds41_v2_plan.cpp" -o "$T/test_ds41_v2_plan" "${KNOBS[@]}"
+"$T/test_ds41_v2_plan"
 # the knob table: its C++ header over the C API
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/knobs-rs" "$REPO/engine/knobs-rs/tests/header_test.cpp" "${KNOBS[@]}" \
   -o "$T/knobs_header_test"
