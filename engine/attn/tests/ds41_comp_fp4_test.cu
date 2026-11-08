@@ -9,7 +9,7 @@
 //
 //   build: nvcc -std=c++17 -O3 -gencode=arch=compute_121a,code=sm_121a -DG6_MODEL_DS41=1 -I engine -o ds41_comp_fp4_test engine/attn/tests/ds41_comp_fp4_test.cu engine/knobs-rs/target/release/libgr8knobs.a -lpthread -ldl -lm
 //   run:   ds41_comp_fp4_test [--heads 16] [--time 50] [--long 131072]
-//   v2 pipeline: ds41_comp_fp4_test --pipe-only [--time 3] (bounded allocations, heads=16)
+//   v2 pipeline: ds41_comp_fp4_test --pipe-only [--pipe-cap] [--time 3] (bounded allocations, heads=16)
 // Exit code 1 if any comparison differs.
 #include "../ds41_attn.cuh"
 #include "../ds41_idx.cuh"
@@ -600,20 +600,24 @@ static void test_pipe_operands()
     if (errors) g_fail = 1;
     CK(cudaFree(pk)); CK(cudaFree(bad));
 }
+static int pipe_mode = 1;
 static void pipe_launch(ds41a::AttnP p, bool pipe)
 {
     const dim3 grid(p.n, p.heads / 16);
-    if (pipe) ds41a::k_attn_cpa_pipe_q<<<grid, ds41a::AT_THREADS, ds41a::AT_SMEM_PIPE>>>(p);
+    if (pipe && pipe_mode == 2) ds41a::k_attn_cpa_pipe_cap_q<<<grid, ds41a::AT_THREADS, ds41a::AT_SMEM_PIPE>>>(p);
+    else if (pipe) ds41a::k_attn_cpa_pipe_q<<<grid, ds41a::AT_THREADS, ds41a::AT_SMEM_PIPE>>>(p);
     else ds41a::k_attn_cpa_t<false, true><<<grid, ds41a::AT_THREADS, ds41a::AT_SMEM_CPA>>>(p);
     CK(cudaGetLastError());
 }
 static void test_pipe(int heads, int iters)
 {
+    CK(cudaFuncSetAttribute(ds41a::k_attn_cpa_pipe_cap_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ds41a::AT_SMEM_PIPE));
     CK(cudaFuncSetAttribute(ds41a::k_attn_cpa_pipe_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ds41a::AT_SMEM_PIPE));
     CK(cudaFuncSetAttribute(ds41a::k_attn_cpa_t<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ds41a::AT_SMEM_CPA));
     cudaFuncAttributes a{}, b{};
     CK(cudaFuncGetAttributes(&a, ds41a::k_attn_cpa_t<false, true>));
-    CK(cudaFuncGetAttributes(&b, ds41a::k_attn_cpa_pipe_q));
+    CK(cudaFuncGetAttributes(&b, pipe_mode == 2 ? ds41a::k_attn_cpa_pipe_cap_q : ds41a::k_attn_cpa_pipe_q));
+    printf("pipe mode=%d\n", pipe_mode);
     printf("pipe resource: dynamic_smem=%zu baseline_regs=%d pipe_regs=%d baseline_local=%zu pipe_local=%zu\n", ds41a::AT_SMEM_PIPE, a.numRegs, b.numRegs, a.localSizeBytes, b.localSizeBytes);
     test_pipe_operands();
     for (int n : {1, 7, 64, 2047, 2048, 8192}) for (int mode = 0; mode < 3; mode++) {
@@ -640,8 +644,8 @@ static void test_pipe(int heads, int iters)
         printf("pipe memcmp rows=%d mode=%d WL=%d bytes=%zu %s\n", n, mode, x.p.WL, x.out_n * 2, equal ? "BYTE-EQUAL" : "DIFF");
         if (!equal) { g_fail = 1; for (size_t i = 0; i < x.out_n; i++) if (ref[i] != got[i]) { printf(" first diff %zu: %04x != %04x\n", i, ref[i], got[i]); break; } }
         // Compare through the actual launch selector too (and guard split/floor exclusions separately in the original suite).
-        ds41a::g_attn_cpa = 1; ds41a::g_attn_split = 0; ds41a::g_attn_pipe = true;
-        ds41a::launch_attn(x.p, 0); ds41a::g_attn_pipe = false;
+        ds41a::g_attn_cpa = 1; ds41a::g_attn_split = 0; ds41a::g_attn_pipe = pipe_mode;
+        ds41a::launch_attn(x.p, 0); ds41a::g_attn_pipe = 0;
         CK(cudaDeviceSynchronize());
         const auto selected = back((const uint16_t*)x.out_b, x.out_n);
         const bool selected_equal = memcmp(ref.data(), selected.data(), x.out_n * 2) == 0;
@@ -676,11 +680,13 @@ int main(int argc, char** argv)
     {
         const std::string a = argv[i];
         if (a == "--pipe-only") pipe_only = true;
+        else if (a == "--pipe-cap") pipe_mode = 2;
         else if (a == "--heads" && i + 1 < argc) heads = atoi(argv[++i]);
         else if (a == "--time" && i + 1 < argc) iters = atoi(argv[++i]);
         else if (a == "--long" && i + 1 < argc) long_keys = atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s [--heads 16] [--time ITERS] [--long KEYS] [--pipe-only]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "usage: %s [--heads 16] [--time ITERS] [--long KEYS] [--pipe-only [--pipe-cap]]\n", argv[0]); return 2; }
     }
+    if (pipe_mode == 2 && !pipe_only) { fprintf(stderr, "--pipe-cap requires --pipe-only\n"); return 2; }
     if (heads % 16) { fprintf(stderr, "--heads must be a multiple of 16\n"); return 2; }
     if (pipe_only) {
         if (heads != 16) { fprintf(stderr, "--pipe-only uses heads=16 for bounded memory\n"); return 2; }

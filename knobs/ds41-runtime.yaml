@@ -11,6 +11,16 @@ knobs:
       Needs GR8_DS_PF_V2=1, GR8_DS_ATTN_CPA=1 and packed compressed rows (GR8_DS_COMP_FP4=1) to select the new kernel.
       Window-only, bounded replay, decode and eligible split launches stay unchanged. Mixed window/CQ blocks stay serial.
       Logs request/on once per v2 request per rank, including on=0. Default 0 keeps the original kernels.
+  GR8_DS_PF_V2_ATTN_PIPE_CAP:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      V2 attention pipeline register-cap arm: 1 selects a 240-register cap instead of launch_bounds(256,1).
+      Requires GR8_DS_PF_V2_ATTN_PIPE=1 and its prerequisites; alone this knob has no effect.
+      Arithmetic, layout and work order are unchanged. Default 0 retains the original pipeline.
+      Logged as cap alongside request/on; this is the configured flag, not proof that a layer selected the kernel.
   GR8_DS_BLOCK:
     scope: agree
     kind: text
