@@ -258,3 +258,44 @@ rotating output. Input refresh and a new setup occur between groups. A variant
 without this opt-in gets NO implicit amortization of its current launch. Report
 `has_chunk_setup`, M, and the proposed engine reuse unit; synthetic amortization
 is not proof that the model can reuse that state for M calls.
+
+### Attention geometry and captured indices (revision 2)
+
+The six positional shape arguments remain compatible. Optional **pairs** after
+those arguments are `--ring-rows R`, `--slots S`, `--slot I`, `--phase PHASE`,
+and `--topk-pattern uniform|shared|local`. Defaults are a **synthetic single-slot,
+rowcap8192 configuration**: ring8319, slots1, slot0; phase is late_replay for a
+nonzero floor, main for n1, otherwise prefill_v2. Key rows remain the explicit
+sixth argument, not an inferred real cache capacity. Generated weights describe
+that conditional source-derived workload, NOT the running boot manifest.
+
+The capacity no longer shrinks with a tail's n. Actual engine allocation is in
+`engine/attn/ds41_attn_ops.cuh:335-346` (rowcap and shared/per-slot rings),
+`:361-376` (compressed allocation capacity/2+2 and per-slot stride), and
+`:473-481` (shared prefill binding). Multislot boot MAIN uses its actual decode
+ring capacity, not the synthetic default; supply flags or a capture. The served
+pipe enable bracket is `engine/runtime/g6m4.cu:1789-1802`: built-in pipe/swz now
+fall back to the exact off dispatch in MAIN, legacy prefill and late replay.
+They only use the optimized kernel for phase=prefill_v2, TK>0, floor=0.
+
+Alternatively supply **only** `--capture /absolute/path/file.asw` after the six
+arguments. The adapter validates the capture hash/geometry, requires those six
+arguments to match metadata, and preserves original row order, positions,
+per-row slot IDs and top-k. It uses the recorded ring/key capacities and phase;
+packed CQ and window-only records with16 heads are supported. Other formats
+fail closed. Capture flags cannot be mixed with geometry overrides. JSON
+`adapter_metadata` records the file SHA256, provenance, phase, capacities and
+unique/adjacent-overlap metrics. A synthetic-test record stays labelled as such.
+
+These are **index-only captures**. Q, packed KV and sink remain fresh synthetic
+values; window operands are finite FP8-E4M3-valued BF16, still synthetic, not
+learned/captured. The unused BF16 key shadow is omitted by default. Numeric tests may opt in
+with `--shadow-keys 1`; JSON reports it and memory preflight includes it. Capture/locality rows have zero prompt
+weights and `decision_rows=false` until same-request trace and cache-regime
+validation. Index correlation alone is not an end-to-end model decision gate.
+
+`test_adapter_gpu.py --bundle BUILD_DIR --out NEW_DIR` checks noncontiguous
+captured-test row order and per-row sessions, MAIN/legacy fallback, local-index
+stress, guards and refusal of mismatched capture geometry. The test acquires
+the campaign GPU lock itself. It does not run a served engine or collect real
+model data.

@@ -10,7 +10,7 @@ static void require(bool condition, const char* reason) {
     if (!condition) { fprintf(stderr,"TEST_FAILURE: %s\n",reason); std::exit(3); }
 }
 static std::vector<std::string> shape_args(int ratio=2, int floor=0) {
-    return {"3","16",std::to_string(ratio),std::to_string(floor),"16","32"};
+    return {"3","16",std::to_string(ratio),std::to_string(floor),"16","32","--shadow-keys","1"};
 }
 static void flip(unsigned char* pointer, cudaStream_t st) {
     unsigned char x;

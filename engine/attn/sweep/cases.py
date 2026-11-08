@@ -14,7 +14,11 @@ def cases(suite="all", late_final=False):
                                        "weights": {"32K": 0, "128K": 0},
                                        "input_provenance": "synthetic_source_derived_shape",
                                        "topk_pattern": "uniform_without_replacement",
-                                       "operands": "synthetic", "decision_rows": False})
+                                       "operands": "synthetic", "decision_rows": False,
+                                       "geometry": {"ring_rows": 8319, "slot_count": 1,
+                                           "dispatch_phase": "late_replay" if floor else "main" if n == 1 else "prefill_v2",
+                                           "key_capacity_source": "synthetic_not_boot_manifest",
+                                           "configuration": "single_slot_rowcap8192_not_captured"}})
         if weight:
             row["weights"][weight[0]] += weight[1]
 

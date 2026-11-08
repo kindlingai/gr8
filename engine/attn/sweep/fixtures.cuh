@@ -106,7 +106,7 @@ struct Keys
     uint8_t* pk = nullptr;   // [slots][rows][288]
 };
 // random packed rows (every code, scale bytes 0x01 .. 0x47 incl. subnormals, some all-zero groups) and their bf16 values
-static Keys make_keys(size_t rows, size_t slots)
+static Keys make_keys(size_t rows, size_t slots, bool shadow = true)
 {
     Keys k;
     k.rows = rows; k.slots = slots;
@@ -123,10 +123,12 @@ static Keys make_keys(size_t rows, size_t slots)
             if (z(rng) == 0) for (int i = 0; i < 8; i++) row[g * 8 + i] = (i & 1) ? 0x88 : 0x00;   // +0 / -0 group
         }
     }
-    std::vector<uint16_t> bf(n * HD);
-    for (size_t r = 0; r < n; r++) h_decode(&pk[r * CQ_ROW], &bf[r * HD]);
     k.pk = dup(pk);
-    k.bf = (bf16*)dup(bf);
+    if (shadow) {
+        std::vector<uint16_t> bf(n * HD);
+        for (size_t r = 0; r < n; r++) h_decode(&pk[r * CQ_ROW], &bf[r * HD]);
+        k.bf = (bf16*)dup(bf);
+    }
     return k;
 }
 static void free_keys(Keys& k)

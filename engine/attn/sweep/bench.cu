@@ -86,7 +86,10 @@ int main(int argc,char** argv) {
     for(int i=0;i<slots;++i)fixtures.push_back(sweep_adapter::make_case(args,seed+104729ull*i));
     auto p0=sweep_adapter::params(fixtures[0],false),r0=sweep_adapter::params(fixtures[0],true);
     // Exactly once per initialized shape: a stale-input init cache must not be reset by the checker.
-    check(sweep_reference::init(r0));check(sweep_variant::init(p0));
+    check(sweep_reference::init(r0));
+#if !SWEEP_SAME_VARIANT
+    check(sweep_variant::init(p0));
+#endif
     cudaFuncAttributes attr{};check(cudaFuncGetAttributes(&attr,sweep_variant::kernel(p0)));
     cudaStream_t st;check(cudaStreamCreateWithFlags(&st,cudaStreamNonBlocking));
     GuardedScratch bad,flush;bad.alloc(sizeof(unsigned long long));if(flush_bytes)flush.alloc(flush_bytes);
@@ -198,6 +201,9 @@ int main(int argc,char** argv) {
         attr.numRegs,attr.localSizeBytes,attr.sharedSizeBytes,sweep_variant::dynamic_smem(p0),sweep_variant::ptxas_key(p0),prop.name,prop.major,prop.minor,
         pools,slots,checks,timed_checks,stream_ready,stream_pending,launch_valid?"true":"false",kernel_nodes,main_nodes,flush_bytes,prop.l2CacheSize,amortize,
         SWEEP_VARIANT_HAS_SETUP?"true":"false",flush_bytes?"-explicit-flush":"");
+    #if SWEEP_ADAPTER_HAS_METADATA
+    printf(",\"adapter_metadata\":%s",sweep_adapter::metadata_json(fixtures[0]).c_str());
+#endif
     array_json("samples_us",samples);array_json("reference_samples_us",reference_samples);array_json("paired_delta_pct_samples",paired);array_json("null_delta_pct_samples",nulls);printf("}\n");
     check(cudaEventDestroy(begin));check(cudaEventDestroy(end));check(cudaStreamDestroy(st));bad.release();flush.release();
     for(auto& f:fixtures)sweep_adapter::destroy(f);
