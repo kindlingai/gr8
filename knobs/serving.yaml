@@ -140,9 +140,9 @@ knobs:
     default: "0"
     values: "0|1"
     doc: >-
-      At an orderly quit of a served engine, after the KV store keeps the pool's runs and the links close, the ranks
-      meet at the fabric barrier and the process ends at once: the CUDA graphs, buffers and the CUDA runtime are not
-      freed one by one, process exit releases them.
+      At an orderly quit of a served GLM-5.3 engine, after the KV store keeps the pool's runs and the links close, the
+      ranks meet at the fabric barrier and the process ends at once: the CUDA graphs, buffers and the CUDA runtime are
+      not freed one by one, process exit releases them. The Flash and DS41 engines ignore it.
   GR8_REUSE_ALIGN:
     scope: agree
     kind: flag
