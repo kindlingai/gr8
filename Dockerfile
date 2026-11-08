@@ -20,7 +20,8 @@ RUN apt-get update \
 
 FROM toolchain AS rust
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-# The front end pins its compiler in frontend/g6front-rs/rust-toolchain.toml. Keep RUST_VERSION equal to that pin.
+# Pins: rust-toolchain.toml, engine/rust-toolchain.toml, frontend/g6front-rs/rust-toolchain.toml,
+# frontend/pseudo-engine/rust-toolchain.toml. Keep RUST_VERSION equal to those pins.
 ARG RUST_VERSION=1.94.1
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
