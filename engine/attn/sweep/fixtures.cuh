@@ -148,19 +148,14 @@ struct Case
     int wl = 0;     // window list length override (decode form only; 0 = the engine's: WIN, or min(n, WIN) for prefill)
 };
 
-// top-k list of a row at position p: up to 512 random visible rows ((p + 1) / ratio), ascending, -1 tail
+// Unique synthetic top-k; source-derived shapes, NOT captured model lists.
+#include "topk_fixture.h"
 static void fill_topk(int32_t* out, int p, int ratio, size_t rows)
 {
-    const int vis = std::min<long>((p + 1) / ratio, (long)rows);
-    int m = 0;
-    if (vis <= 512) for (; m < vis; m++) out[m] = m;
-    else
-    {
-        std::uniform_int_distribution<int> U(0, vis - 1);
-        for (; m < 512; m++) out[m] = U(rng);
-        std::sort(out, out + 512);
-    }
-    for (; m < 512; m++) out[m] = -1;
+    if (p < 0 || p > 1048576 || ratio < 1 || ratio > 2)
+        throw std::runtime_error("invalid synthetic top-k position/ratio");
+    const int vis = (int)std::min<size_t>((p + 1) / ratio, rows);
+    sweep_topk::uniform(out, vis, rng);
 }
 
 struct Built

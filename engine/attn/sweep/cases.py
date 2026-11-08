@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Engine-derived attention shapes; no dependency on the generic runner."""
+"""Synthetic operands on source-derived shapes, NOT captured decision rows."""
 import argparse
 import json
 
@@ -11,7 +11,10 @@ def cases(suite="all", late_final=False):
         keys = keys or max(32768, pos + n)
         ident = f"n{n}_p{pos}_r{ratio}_f{floor}_w{wl}_k{keys}"
         row = result.setdefault(ident, {"id": ident, "args": [n, pos, ratio, floor, wl, keys],
-                                       "weights": {"32K": 0, "128K": 0}})
+                                       "weights": {"32K": 0, "128K": 0},
+                                       "input_provenance": "synthetic_source_derived_shape",
+                                       "topk_pattern": "uniform_without_replacement",
+                                       "operands": "synthetic", "decision_rows": False})
         if weight:
             row["weights"][weight[0]] += weight[1]
 
@@ -36,12 +39,22 @@ def cases(suite="all", late_final=False):
         for wl in (37, 100):
             for ratio in (2, 1):
                 add(16, 24576, ratio, wl=wl)
+    if suite == "locality":
+        # Explicit opt-in: adapter must implement the extra pattern argument.
+        for pattern in ("uniform", "shared", "local"):
+            for ratio in (1, 2):
+                args = [128, 24576, ratio, 0, 128, 32768]
+                ident = f"locality_{pattern}_r{ratio}"
+                result[ident] = dict(id=ident, args=args + ["--topk-pattern", pattern],
+                    weights={"32K": 0, "128K": 0},
+                    input_provenance="synthetic_source_derived_shape", operands="synthetic",
+                    topk_pattern=pattern, decision_rows=False)
     return list(result.values())
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--suite", choices=("all", "real", "repro", "smoke"), default="all")
+    p.add_argument("--suite", choices=("all", "real", "repro", "smoke", "locality"), default="all")
     p.add_argument("--late-final", action="store_true")
     a = p.parse_args()
     print(json.dumps(cases(a.suite, a.late_final), indent=2))
