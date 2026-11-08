@@ -151,9 +151,10 @@ configurations, not an isolated compact-only A/B.
   same text and total token counts as the stock image, 8 of 8.
 - The copies match the release, rank, TP size and layout they were prepared for. A new release or layout needs a new
   `prepare` into a new directory.
-- Prepare on a disk with room. On one Gen4 box, the same build's 151 copy files lay in 24,032 pieces (extents) when
-  `prepare` wrote them onto a disk that was 92% full (96% after), and in 4,306 pieces when it wrote them again onto the
-  same disk at 58% full.
+- Prepare on a disk with room: a nearly full disk can fragment the copies. On one Gen4 box, the same build's 151 copy
+  files lay in 24,032 pieces (extents) when `prepare` wrote them onto a disk that was 92% full (96% after), and in
+  4,306 pieces when it wrote them again onto the same disk at 58% full. A second Gen4 box, 96% full before the same
+  `prepare` (100% after), got 442 pieces.
 
 ### Fast quit: `GR8_QUIT_FAST`
 
