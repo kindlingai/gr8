@@ -41,6 +41,23 @@ cp config/switch.env.example switch.env    # then set the boxes, directories and
 ./gr8 switch glm53 @/path/to/switch.env    # back to GLM-5.3, with another config file
 ```
 
+Measured on 2026-11-09 (Pacific time) with the command at gr8 `d62cb6b4`, on four DGX Sparks: GLM-5.3 and
+DeepSeek-V4.1-Flash at TP=4 on all four, GLM-5.3-Flash at TP=2 on two of them. DeepSeek ran the recipe image
+`sha-7c2088a`. Warm: each model booted once before the timed runs. Two switches each way (n=2), alternated. All 12
+switches exited 0, and after each one the new model answered a chat. "Total" runs from the switch command to the
+head's `/health` ready. The README's switch card shows the mean total of each row, rounded to whole seconds:
+
+| Switch | down | up | health: ready in | total | mean |
+|---|---|---|---|---|---|
+| GLM-5.3 to DeepSeek-V4.1-Flash | 2.953 / 4.786 s | 0.775 / 0.662 s | 18.500 / 18.647 s | 22.227 / 24.095 s | 23.2 s |
+| DeepSeek-V4.1-Flash to GLM-5.3 | 4.576 / 4.428 s | 0.686 / 0.634 s | 19.548 / 19.628 s | 24.810 / 24.690 s | 24.8 s |
+| GLM-5.3 to GLM-5.3-Flash | 4.743 / 4.204 s | 0.668 / 0.656 s | 24.626 / 24.547 s | 30.037 / 29.408 s | 29.7 s |
+| GLM-5.3-Flash to GLM-5.3 | 4.191 / 3.949 s | 0.651 / 0.610 s | 17.945 / 18.976 s | 22.786 / 23.535 s | 23.2 s |
+| DeepSeek-V4.1-Flash to GLM-5.3-Flash | 4.465 / 4.300 s | 0.660 / 0.648 s | 24.811 / 24.650 s | 29.937 / 29.598 s | 29.8 s |
+| GLM-5.3-Flash to DeepSeek-V4.1-Flash | 4.025 / 4.116 s | 0.645 / 0.605 s | 18.671 / 17.729 s | 23.341 / 22.449 s | 22.9 s |
+
+Cold switches (empty page cache) were not measured.
+
 Measured on 2026-11-08 (Pacific time) with the command at gr8 `a4cdfd10`, on four boxes (two DGX Sparks, two GB10
 boxes with PCIe Gen4 NVMe), with each model's stock compose `.env` (GLM-5.3 at TP=4 with `GR8_GEN_CACHE` and
 `GR8_QUIT_FAST=1`; DeepSeek-V4.1-Flash on all four boxes). Two switches each way (n=2), alternated, starting from
