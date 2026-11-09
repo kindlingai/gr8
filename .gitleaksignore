@@ -1,0 +1,3 @@
+# gitleaks false positives: C++ mangled kernel names (ptxas keys of the sweep variants), not secrets.
+4a3b71fc6cfc5cb5757cfa9c4982cf4bb5f11767:engine/attn/sweep/variants/ctune_off_key2/variant.cuh:generic-api-key:9
+4a3b71fc6cfc5cb5757cfa9c4982cf4bb5f11767:engine/attn/sweep/variants/ctune_off_key4/variant.cuh:generic-api-key:9
