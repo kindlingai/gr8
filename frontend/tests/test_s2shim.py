@@ -586,8 +586,15 @@ class RequestMetrics(S2Base):
         self.assertEqual(lat['itl_count'], n - 1)                    # the tokens after the first
         self.assertGreater(lat['itl_sum'], 0)
         self.assertLessEqual(lat['itl_sum'], lat['decode_sum'] + 1e-6)
-        self.assertEqual(m['kv']['active_tokens'], 0)                # the run is back in the pool
-        self.assertEqual(m['kv']['reserved_tokens'], 0)
+        # The run is back in the pool. The engine rewrites status.s2 after it writes the run's end line, so a
+        # metrics request right after the finish frame can still see the old pages: poll until the pool drains.
+        kv, seq, deadline = m['kv'], 4, time.monotonic() + 2
+        while (kv['active_tokens'] or kv['reserved_tokens']) and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+            kv = (await self.metrics(c, seq))['kv']
+            seq += 1
+        self.assertEqual(kv['active_tokens'], 0)
+        self.assertEqual(kv['reserved_tokens'], 0)
 
     async def test_finish_frames_carry_each_requests_share_of_the_metrics(self):
         c = await self.client()
