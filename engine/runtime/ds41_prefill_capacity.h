@@ -6,13 +6,13 @@
 
 // Caller-side row budget for the DS41 prefill hook. Zero means a bad
 // explicit value; an unset value leaves the decode allocation unchanged.
-inline int ds41_prefill_rowcap(const char* value, int decode_rows) {
+inline int ds41_prefill_rowcap(const char* value, int decode_rows, bool v2 = false) {
     if (!value) return decode_rows;
     if (!*value) return 0;
     errno = 0;
     char* end = nullptr;
     const long n = std::strtol(value, &end, 10);
-    if (errno || end == value || *end || n < decode_rows || n > 4096 || n > INT_MAX) return 0;
+    if (errno || end == value || *end || n < decode_rows || n > (v2 ? 8192 : 4096) || n > INT_MAX) return 0;
     return static_cast<int>(n);
 }
 

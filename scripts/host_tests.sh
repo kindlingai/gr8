@@ -13,6 +13,9 @@ T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 bash "$REPO/engine/runtime/tests/nvcc_cache_test.sh"
 # the DS41 build knobs -> nvcc flags (scripts/ds41_build_flags.sh: GR8_DS_TRUNK_BF16)
 bash "$REPO/engine/runtime/tests/ds41_build_flags_test.sh"
+# v2 communication width sweeps: host-only request selection and validation.
+g++ -std=c++17 -O2 -Wall -Wextra "$REPO/engine/tests/test_ds41_v2_width.cpp" -o "$T/test_ds41_v2_width"
+"$T/test_ds41_v2_width"
 # Inactive steering contracts/profile loader: CPU only, no CUDA or Rust dependencies.
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/steering_test.cpp" \
   "$REPO/engine/loader/g6pack.cpp" -o "$T/steering_test"
@@ -397,6 +400,11 @@ g++ -std=c++17 -O2 -Wall "$REPO/engine/kernels/tests/ds_ro_host_test.cpp" -o "$T
 # DS41 W4096: RO_MAX 4096 is the largest prefill width, and the RoScratch tile capacity holds the 4096-row plan
 g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" -I "$REPO/engine/kernels" "$REPO/engine/tests/test_ds41_w4096.cpp" -o "$T/test_ds41_w4096"
 "$T/test_ds41_w4096"
+# v2 remains opt-in: geometry/order, stock bootstrap coverage and isolated fabric/tail.
+for name in test_ds41_v2 test_ds41_v2_walk test_ds41_v2_plan; do
+  g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -DG6_NR=4 -DDEC_S2 -I "$REPO/engine" "$REPO/engine/tests/$name.cpp" -o "$T/$name" "${KVLIB[@]}"
+  "$T/$name"
+done
 # the bounded-replay split (runtime/ds41_pf_split.h), off and with GR8_DS_PF_L20_TAIL=1 (layer 20 in range B, its ca row hoisted)
 g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/test_ds41_pf_split.cpp" -o "$T/test_ds41_pf_split"
 "$T/test_ds41_pf_split" > "$T/pf_split.log" || { cat "$T/pf_split.log"; exit 1; }
