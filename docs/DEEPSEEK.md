@@ -78,8 +78,9 @@ makes.
 ### Quality and the boxes
 
 - Quality, on the 75-item check of [FIRST-BOOT.md](FIRST-BOOT.md#3-deepseek-v41-flash-ds41-speed-against-exactness)
-  (code, math, JSON, reasoning): fast mode got 73 of 75 on each of two boots (2026-11-08; both missed the same two items, one of them cut off at the length limit). Exact
-  output got 73 of 75 in each of three runs, on serving code equivalent to `main` at b10aae4 (2026-11-03).
+  (code, math, JSON, reasoning): fast mode got 73 of 75 on each of two boots (2026-11-08); both missed the same two
+  items, one of them cut off at the length limit. Exact output got 73 of 75 in each of three runs, on serving code
+  equivalent to `main` at b10aae4 (2026-11-03).
 - Our boxes run with their CPUs kept out of deep idle (PM QoS `cpu_dma_latency` 0) and with memory compacted before
   each boot. Both are box settings outside gr8.
 - These boots went through our own test harness, not the recipe's image and not `./gr8 ds41 up` (see
