@@ -1608,7 +1608,8 @@ inline int g_tc_tile = 0;   // GR8_DS_ATTN_TC_TILE (default 0): 1 = launch_gemm_
                             // the device cannot give a block 3 x 33792 B of smem.
                             // 2 = the same tile as k_gemm_persist_ldm_epi_bid (ds41_gemm_persist.cuh): persistent CTAs, ldmatrix fragments, a staged 16-B epilogue; the same Y bits
                             // (tests/ds41_gemm_persist_test.cu). Takes tile 1 instead (which itself falls back to 0) when the grid order is M-fastest (GR8_DS_ATTN_TC_MF), when
-                            // Y or its strides are not 16-B aligned, or when the 3 x 33792 B of smem cannot be had.
+                            // Y or its strides are not 16-B aligned, when N < TC_PERSIST_MIN_N, or when the 3 x 33792 B of smem cannot be had.
+constexpr int TC_PERSIST_MIN_N = 1024;   // tile 2 is not used below this N: the attention wkv (N = 512, 4 column tiles) ran 3.4 % (M 4096) to 5.4 % (M 8192) slower than tile 1 on the 5090, while N = 1024 and 1280 gain
 inline int g_tc_persist_grid = 0;   // TEST HOOK, not a served knob (no GR8_ name, not in knobs/): > 0 caps the persistent grid at that many CTAs so a test makes each CTA walk several tiles; 0 = the SM count.
 template <int BM, int BN, int ST> inline bool launch_tc_sw(const GemmP& p, int groups, cudaStream_t st)
 {
@@ -1659,7 +1660,7 @@ template <int BM, int BN, int ST> inline bool launch_tc_persist(const GemmP& p, 
     const long nt = p.N / BN, mt = (p.M + BM - 1) / BM;
     // the walk is N tile fastest: M-fastest launch order (GR8_DS_ATTN_TC_MF) goes to tile 1. The 16-B epilogue stores need 16-B aligned chunks of every Y row.
     if (tc_mfast_pick(g_tc_mfast, p.N, p.K, groups, (unsigned)mt)) return false;
-    if (!(p.N % BN == 0 && p.K % 128 == 0 && p.ldy % 8 == 0 && (groups <= 1 || p.y_gs % 8 == 0) && ((uintptr_t)p.Y % 16) == 0)) return false;
+    if (!(p.N >= TC_PERSIST_MIN_N && p.N % BN == 0 && p.K % 128 == 0 && p.ldy % 8 == 0 && (groups <= 1 || p.y_gs % 8 == 0) && ((uintptr_t)p.Y % 16) == 0)) return false;
     GemmP q = p;
     q.mfast = 0;
     const long tiles = nt * mt * groups, cap = g_tc_persist_grid > 0 ? g_tc_persist_grid : tc_sm_count();

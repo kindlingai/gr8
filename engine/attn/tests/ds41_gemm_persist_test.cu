@@ -115,7 +115,7 @@ static void run_case(const Case& c)
     for (size_t i = 0; i < y_bytes; i++) poison += h[0][i] == 0xff;
     // what the launcher must choose for tile 2: the persistent kernel on the 128 x 128 wide tile when the guard passes, else what tile 1 runs
     const long ctas128 = (long)(c.N / 128) * ((c.M + 127) / 128) * c.groups;
-    const bool wide128 = c.M >= 128 && c.N % 128 == 0 && ctas128 >= 96;
+    const bool wide128 = c.M >= 128 && c.N % 128 == 0 && ctas128 >= 96 && c.N >= ds41a::TC_PERSIST_MIN_N;
     const bool guard = c.ldy % 8 == 0 && (c.groups <= 1 || c.y_gs % 8 == 0) && c.y_off % 16 == 0;
     const bool want_persist = wide128 && guard;
     const bool is_persist = ran[2] == (const void*)k_gemm_persist_ldm_epi_bid<128, 128, 3>;
@@ -154,6 +154,10 @@ int main()
         run_case({"wo_a", 8192, 1024, 4096, 2, 8192, 256, 2048, 4096, 128, 1024, false, 0, gc});
         run_case({"wo_b", 2048, 5120, 2048, 1, 2112, 2112, 5120, 0, 0, 0, true, 0, gc});
     }
+    // the two attention projections that are not in the table above: wq_a (N 1280, persistent) and wkv (N 512, below TC_PERSIST_MIN_N: must take tile 1), dense layout
+    run_case({"wq_a", 4096, 1280, 5120, 1, 5120, 160, 1280, 0, 0, 0, false, 0, 0});
+    run_case({"wkv (N < min)", 4096, 512, 5120, 1, 5120, 160, 512, 0, 0, 0, false, 0, 0});
+    run_case({"wkv (N < min) M8192", 8192, 512, 5120, 1, 5120, 160, 512, 0, 0, 0, false, 0, 13});
     run_case({"guard Y+8 bytes", 2048, 5120, 2048, 1, 2112, 2112, 5120, 0, 0, 0, true, 8, 0});
     run_case({"guard ldy % 8 != 0", 1000, 3072, 1024, 2, 1024, 32, 3072 + 2, (size_t)1000 * 1024, (size_t)1000 * 32, (size_t)1000 * (3072 + 2), false, 0, 0});
     printf("%d cases (%d took the persistent kernel, %d the fallback), %d bad\n", g_cases, g_persist, g_fallback, g_bad);
