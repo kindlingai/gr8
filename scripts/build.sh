@@ -258,7 +258,7 @@ else
   echo "tr3_e4m3_test and the steering tests ($STEERING): compiled; no GPU visible, not run"
 fi
 echo "dtr_test_tp4, dtr_test_flash_tp4, l2pf_bench, test_flash_cp: built (they need release files or an idle GPU)"
-echo "the DS41 v2 GPU tests ($(for t in $DS41_V2_TESTS; do printf '%s ' "${t##*/}"; done | sed 's/ $//')): built; TEST=ds41_v2 scripts/c1_tests.sh runs them"
+echo "the DS41 v2 GPU tests ($(for t in $DS41_V2_TESTS; do printf '%s ' "${t##*/}"; done | sed 's/ $//')): built; TEST=ds41_v2 scripts/c1_tests.sh runs the 9 tests (ds41_v2_fc2_profile is a profile, built only)"
 echo "fabric_rs_flat_test: built (a cluster test, not run here)"
 [ -f "$GR8_NVCC_CACHE_LOG" ] && echo "nvcc cache (tests): $(grep -c '^hit' "$GR8_NVCC_CACHE_LOG") hit, $(grep -c '^miss' "$GR8_NVCC_CACHE_LOG") miss"
 exit 0
