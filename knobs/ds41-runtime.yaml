@@ -25,6 +25,16 @@ knobs:
     doc: >-
       Short fresh prompts (up to 64 rows each, up to 8 of them, 512 rows in all) prefill together in one ragged pass and
       share one prompt-tail step. Needs --serve, --s2-sessions >= 2 and GR8_DS_PREFILL_MIN >= 2.
+  GR8_DS_C8PACK_LOG:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      GR8_DS_C8PACK=1 only. 1: after each prefill pack every rank reads the distinct-expert ring back to the host (a
+      copy and a wait) and prints one "ragged member request" line per member and one "ragged pack" line per layer
+      to stderr. 0: no read, no wait and no line, so a pack costs no host stall for the log. Either way the pack
+      leaves the ring empty for the next single-session chunk. Prefill output and every other log line are the same.
   GR8_DS_CACHE_MIB:
     scope: local
     kind: int

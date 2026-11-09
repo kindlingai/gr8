@@ -1018,6 +1018,9 @@ inline std::string elog_csv(const std::vector<dsr::ExpertLogRec>& v)
 // elog_begin(model, first): optional, host-synchronous, before a window's launches: the window's first position, copied into every record of that window.
 inline void elog_begin(const Model* m, int first) { cudaMemcpy((char*)scratch_of(m)->elog + offsetof(dsr::ExpertLog, win_start), &first, sizeof first, cudaMemcpyHostToDevice); }
 inline void elog_reset(const Model* m) { cudaMemset(scratch_of(m)->elog, 0, sizeof(dsr::ExpertLog)); }
+// elog_drop(model, st): empties the ring (cursor -> 0) without reading it: no host copy, no host wait. The reset is queued on st, so it lands after the
+// router calls already on st and before the next ones. For a path whose records nobody prints but whose ring another path reads.
+inline cudaError_t elog_drop(const Model* m, cudaStream_t st) { return cudaMemsetAsync(scratch_of(m)->elog, 0, sizeof(unsigned), st); }
 inline void elog_print(const Model* m, FILE* f)
 {
     std::vector<dsr::ExpertLogRec> v;

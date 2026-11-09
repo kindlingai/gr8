@@ -43,6 +43,35 @@ int main(int argc, char** argv)
         assert(knob::ds_pf_v2_rs_blocks() == (std::vector<int64_t>{48}));
         // the v2 wire pack/unpack width defaults to 48 blocks (0 selects the old eight blocks)
         assert(knob::ds_pf_v2_pack_blocks() == (std::vector<int64_t>{48}));
+        // GR8_DS_C8PACK_LOG (the pack's per-pack expert-ring read-back and stderr lines) is off unless set
+        assert(!knob::ds_c8pack() && !knob::ds_c8pack_log());
+        char* env[] = {(char*)"GR8_DS_C8PACK=1", (char*)"GR8_DS_C8PACK_LOG=1", nullptr};
+        return again(argv[0], "log", env);
+    }
+    if (!strcmp(argv[1], "log"))
+    {
+        // set to 1: read as on; a local knob (logging) stays out of the runtime signature, and GR8_DS_C8PACK (agree) joins it
+        assert(knob::init() == 0);
+        assert(knob::ds_c8pack() && knob::ds_c8pack_log());
+        assert(knob::signature() == " env DS_C8PACK=1");
+        char* env[] = {(char*)"GR8_DS_C8PACK_LOG=0", nullptr};
+        return again(argv[0], "logoff", env);
+    }
+    if (!strcmp(argv[1], "logoff"))
+    {
+        assert(knob::init() == 0);
+        assert(!knob::ds_c8pack_log() && knob::signature().empty());
+        char* env[] = {(char*)"GR8_DS_C8PACK_LOG=2", nullptr};
+        return again(argv[0], "logbad", env);
+    }
+    if (!strcmp(argv[1], "logbad"))
+    {
+        // 0|1 only: 2 is one error and reading it stops the process with status 2
+        assert(knob::init() == 1);
+        if (fork() == 0) knob::ds_c8pack_log();
+        int st;
+        wait(&st);
+        assert(WIFEXITED(st) && WEXITSTATUS(st) == 2);
         char* env[] = {(char*)"GR8_ATTN_CTX2=9", (char*)"GR8_NO_SUCH=1", nullptr};
         return again(argv[0], "bad", env);
     }

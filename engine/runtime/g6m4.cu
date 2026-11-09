@@ -1699,6 +1699,7 @@ int main(int argc, char** argv)
         // The native prefill hook fences that stream before the next chunk can mutate them.
         std::vector<int> pf_pos(pf_min ? m.hc_rows : 0), pf_tgt(pf_min ? m.hc_rows : 0, -1), pf_sess(pf_min && m.ds_slots > 1 ? m.hc_rows : 0);
         std::vector<int> pf_tok(c8_pack_env ? 512 : 0); // GR8_DS_C8PACK=1 only; pageable source lives through native's post-launch fence
+        const bool c8_log = c8_pack_env == 1 && knob::ds_c8pack_log(); // GR8_DS_C8PACK_LOG=1: after each pack, read the expert ring back (a host wait) and print its lines; default 0
         std::vector<G6AttnStepCell> pf_cells(pf_min ? m.nl : 0);
         // bounded replay (ds41_pf_split.h): GR8_DS_PF_TAIL, read once; 0 = off (the unsplit non-final plan)
         const int pf_tail = ds41::br::parse_tail(DS41_TEXT(knob::ds_pf_tail()));
@@ -2093,8 +2094,10 @@ int main(int argc, char** argv)
                 // m.sess and the pack table. Keep a conservative maximum in the unused cells.
                 const int pages = (max_context + 63) / 64;
                 for (int i = 0; i < m.nl; ++i) pf_cells[i] = G6AttnStepCell{max_context, pages, pages, 0};
-                ds41moe::elog_begin(&m, 0); // every eligible segment starts at position zero; rows map back via shape.seg
-                G6RT_CK(cudaStreamSynchronize(0));
+                if (c8_log) {   // the records' start field, read only by after_prefill_pack's lines; a stale start is never printed
+                    ds41moe::elog_begin(&m, 0); // every eligible segment starts at position zero; rows map back via shape.seg
+                    G6RT_CK(cudaStreamSynchronize(0));
+                }
                 G6RT_CK(cudaMemcpyAsync(m.tok, pf_tok.data(), size_t(rows) * sizeof(int), cudaMemcpyHostToDevice, st));
                 G6RT_CK(cudaMemcpyAsync(m.pos, pf_pos.data(), size_t(rows) * sizeof(int), cudaMemcpyHostToDevice, st));
                 G6RT_CK(cudaMemcpyAsync(m.tgt, pf_tgt.data(), size_t(rows) * sizeof(int), cudaMemcpyHostToDevice, st));
@@ -2150,6 +2153,9 @@ int main(int argc, char** argv)
                 if (dsk.on()) { m.dsp.main_lo = 0; m.dsp.main_hi = -1; }
             };
             dc.after_prefill_pack = [&](const g6s2::Ds41PrefillPack& p) {
+                // GR8_DS_C8PACK_LOG=0 (default): no read-back, no host wait, no line. The ring is shared with the single-session chunk
+                // callback above, which prints every record in it, so the pack still empties it (queued on st, after the pack's launches).
+                if (!c8_log) { G6RT_CK(ds41moe::elog_drop(&m, st)); return; }
                 std::vector<dsr::ExpertLogRec> records;
                 const int n = ds41moe::elog_read(&m, records, true);
                 g6s2::require(n >= 0, "DS41 ragged distinct-expert counter read failed");
