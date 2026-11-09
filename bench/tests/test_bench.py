@@ -389,6 +389,17 @@ class Gif(unittest.TestCase):
         self.assertEqual([r[0] for r in rows], ['title', 'section', 'bar'])
         self.assertEqual(rows[2][1:5], ('code', 50.0, 50.0, '50.0'))
 
+    def test_card_rows_show_first_token_and_prompt_lengths(self):
+        sys.path.insert(0, str(GIF.parent))
+        import gif
+        rows = gif.card_rows({'title': 'M'}, {'id': 'x', 'decode': {'code': 50.0}, 'decode_prompt_tokens': [65, 72],
+                                              'concurrency': [{'streams': 16, 'aggregate_tps': 249.2,
+                                                               'ttft_p50_s': 2.48}],
+                                              'concurrency_prompt_tokens': [62, 76]})
+        self.assertEqual(rows[1], ('section', 'Decode · tok/s, one stream, prompts 65-72 tokens'))
+        self.assertEqual(rows[3], ('section', 'Concurrency · total tok/s, prompts 62-76 tokens'))
+        self.assertEqual(rows[4][1:5], ('16 streams', 249.2, 249.2, '249.2  first token 2.48 s'))
+
 
 class Kindling(unittest.TestCase):
     REPORT = {'info': {'model': 'm', 'max_model_len': 262144},
