@@ -24,6 +24,8 @@ struct Fp8Mat { const uint8_t* w; const uint8_t* s; int N, K; const uint8_t* gv 
 typedef void (*XfragFn)(const uint8_t* codes, int ldc, const uint8_t* sc, int lds, int M, int K, int groups, size_t gc, size_t gs, uint32_t* xf,
                         cudaStream_t st);
 typedef void (*GemvFn)(const uint32_t* xf, const Fp8Mat& W, bf16* Y, int ldy, int M, int groups, size_t y_gs, cudaStream_t st, int tpc, int ks);
+// q_a (WA -> YA) and kv (WB -> YB) GEMVs in one launch over the same fragment table (GR8_DS_ATTN_PROJ_FUSE)
+typedef void (*GemvDualFn)(const uint32_t* xf, const Fp8Mat& WA, bf16* YA, int ldya, const Fp8Mat& WB, bf16* YB, int ldyb, int M, cudaStream_t st, int tpc, int ks);
 struct Weights
 {
     Fp8Mat wq_a, wq_b, wkv, wo_a, wo_b;           // wq_b [heads*512][1280]; wo_a N = 1024, K = 4096 (one group; the pointers cover all groups); wo_b [5120][groups*1024]
