@@ -1742,6 +1742,143 @@ inline int project_rows(const Fp8Mat& W, const bf16* x, int rows, bf16* y, int l
     }
     return 0;
 }
+// ------------------------------------------------------------------------------------------------ GR8_DS_ATTN_PROJ_FUSE (decode, 1..8 rows)
+// ST_ATTN_PROJ at the decode GEMV runs 10 launches (act-quant, xfrag, q_a, rmsnorm, act-quant, xfrag, q_b, rope, kv, kv_prep). With the
+// knob on it runs 5: F1 act-quant + xfrag(y); F2 q_a and kv GEMV in one launch (same xf_y, same K); F3 rmsnorm(qa) + act-quant + xfrag(qr);
+// q_b GEMV as before; F5 rope + kv_prep in one launch. Every kernel body below is the stock arithmetic (same helper functions, same
+// reduction shape, same rounding points); only the launch structure changes, so every buffer the stock stage writes (yq ys xf_y qa kv0 qr
+// qrq qrs xf_qr q kvrows ring) is byte-equal. Anything the fused path does not cover keeps the stock launches.
+inline int g_proj_fuse = 0;   // ds41_attn_set_proj_fuse; default 0
+// q_a and kv GEMVs in ONE launch (GemvDualFn, ds41_attn_types.h), both over the same fragment table xf (K = HID); installed by the rank TU / replay
+inline GemvDualFn g_fn_gemv_dual = nullptr;
+
+// k_xfrag_q's value: clamp(e4m3(code) * 2^(ebyte-127), +-65504)
+__device__ __forceinline__ float pf_deq(uint8_t code, uint8_t eb) { return fminf(fmaxf(f_e4m3(code) * f_e8m0(eb), -65504.f), 65504.f); }
+__device__ __forceinline__ uint32_t pf_pack_h2(float a, float b)   // densev.cuh pack_h2
+{
+    const __half2 h = __floats2half2_rn(a, b);
+    return *(const uint32_t*)&h;
+}
+// k_xfrag_q's word of the element pair starting at the even element k of token t (group 0): i = ks * 64 + l * 2 + reg, l = 4 t + c
+__device__ __forceinline__ size_t pf_xf_word(int t, int k) { return (size_t)(k >> 4) * 64 + (size_t)(4 * t + ((k & 7) >> 1)) * 2 + ((k >> 3) & 1); }
+
+// F1: k_act_quant (x bf16 [M][K], ldx -> codes, scales) and k_xfrag_q (the table, zeros for tokens >= M) in one kernel. K % 256 == 0.
+// grid (K / 256, 8 tokens), block 256 = 8 warps = 8 quant groups of 32 (a warp is one group exactly as k_act_quant).
+__global__ void __launch_bounds__(256) k_pf_quant_xfrag(const bf16* __restrict__ x, int ldx, uint8_t* __restrict__ codes, int ldc, uint8_t* __restrict__ sc, int lds,
+                                                       int M, uint32_t* __restrict__ xf)
+{
+    const int t = blockIdx.y, j = threadIdx.x;
+    if (t >= M)
+    {
+        if (j < 128) xf[(size_t)(blockIdx.x * 16 + (j >> 3)) * 64 + (size_t)(4 * t + ((j >> 1) & 3)) * 2 + (j & 1)] = 0u;
+        return;
+    }
+    const int e = blockIdx.x * 256 + j;
+    const float v = __bfloat162float(x[(size_t)t * ldx + e]);
+    uint8_t c, eb;
+    act_quant_lane(v, c, eb);
+    codes[(size_t)t * ldc + e] = c;
+    if ((j & 31) == 0) sc[(size_t)t * lds + (e >> 5)] = eb;
+    const float a = pf_deq(c, eb);
+    const float b = __shfl_xor_sync(0xFFFFFFFFu, a, 1);
+    if ((j & 1) == 0) xf[pf_xf_word(t, e)] = pf_pack_h2(a, b);
+}
+
+// F3: k_rmsnorm (qa -> qr, D = QA, 256 threads: same per-thread strided sum, same block_sum) + k_act_quant on the bf16-rounded qr (what the stock
+// launch reads back from global) + k_xfrag_q (K = D). D == 1280 = 5 x 256 so every thread owns 5 elements in 5 whole warps-groups. grid 8 (token), block 256.
+__global__ void __launch_bounds__(256) k_pf_norm_quant_xfrag(const bf16* __restrict__ qa, const bf16* __restrict__ w, bf16* __restrict__ qr, uint8_t* __restrict__ qrq,
+                                                            uint8_t* __restrict__ qrs, uint32_t* __restrict__ xf, int M, int D, float eps)
+{
+    __shared__ float sh[32];
+    const int t = blockIdx.x, tid = threadIdx.x;
+    if (t >= M)
+    {
+        for (int j = tid; j < D / 16 * 8; j += 256) xf[(size_t)(j >> 3) * 64 + (size_t)(4 * t + ((j >> 1) & 3)) * 2 + (j & 1)] = 0u;
+        return;
+    }
+    const bf16* xr = qa + (size_t)t * D;
+    float ss = 0.0f;
+    for (int i = tid; i < D; i += 256)
+    {
+        const float v = __bfloat162float(xr[i]);
+        ss = fmaf(v, v, ss);
+    }
+    ss = block_sum(ss, sh);
+    const float r = rsqrtf(ss / (float)D + eps);
+    for (int i = tid; i < D; i += 256)
+    {
+        const bf16 o = __float2bfloat16_rn(__bfloat162float(w[i]) * (__bfloat162float(xr[i]) * r));
+        qr[(size_t)t * D + i] = o;
+        uint8_t c, eb;
+        act_quant_lane(__bfloat162float(o), c, eb);
+        qrq[(size_t)t * D + i] = c;
+        if ((tid & 31) == 0) qrs[(size_t)t * (D / 32) + (i >> 5)] = eb;
+        const float a = pf_deq(c, eb);
+        const float b = __shfl_xor_sync(0xFFFFFFFFu, a, 1);
+        if ((tid & 1) == 0) xf[pf_xf_word(t, i)] = pf_pack_h2(a, b);
+    }
+}
+
+// F5: k_kv_prep (blocks 0 .. rows-1, one per row, body copied from k_kv_prep) and k_rope_tail (the rest: thread index (blockIdx.x - rows) * 512 + tid,
+// elementwise body copied from k_rope_tail, forward rotation). Block 512.
+__global__ void __launch_bounds__(512) k_pf_rope_kvprep(bf16* q, long ldq, int heads, const float* __restrict__ inv, int start0, const int* dstart,
+                                                       const bf16* __restrict__ kv0, const bf16* __restrict__ nw, int rows, bf16* kvrows, bf16* ring, int R,
+                                                       const int* dsess)
+{
+    const int start = start_of(start0, dstart);
+    if ((int)blockIdx.x < rows)
+    {
+        __shared__ float sh[32];
+        const int row = blockIdx.x, c = threadIdx.x;
+        const float v = __bfloat162float(kv0[(size_t)row * HD + c]);
+        const float ss = block_sum(v * v, sh);
+        const float r = rsqrtf(ss / (float)HD + EPS);
+        float x = bf16r(__bfloat162float(nw[c]) * (v * r));
+        const float partner = __shfl_xor_sync(0xFFFFFFFFu, x, 1);
+        if (c >= NOPE)
+        {
+            const int i = (c - NOPE) >> 1;
+            const float ang = (float)pos_of(start, dstart, dsess, row) * inv[i];
+            float ra, rb;
+            if ((c & 1) == 0) { rot_pair(x, partner, ang, false, ra, rb); x = bf16r(ra); }
+            else { rot_pair(partner, x, ang, false, ra, rb); x = bf16r(rb); }
+        }
+        uint8_t code, e;
+        const bf16 o = __float2bfloat16_rn(act_quant_lane(x, code, e));
+        if (kvrows) kvrows[(size_t)row * HD + c] = o;
+        const int pos = pos_of(start, dstart, dsess, row);
+        if (ring && ring_keep(row, rows, R, dsess))
+            ring[(dsess ? (size_t)dsess[row] * R * HD : 0) + (size_t)(pos % R) * HD + c] = o;
+        return;
+    }
+    const long t = (long)(blockIdx.x - rows) * blockDim.x + threadIdx.x;
+    if (t >= (long)rows * heads * (ROPE / 2)) return;
+    const int i = (int)(t % (ROPE / 2));
+    const long rh = t / (ROPE / 2);
+    const int h = (int)(rh % heads), r = (int)(rh / heads);
+    bf16* p = q + (size_t)r * ldq + (size_t)h * HD + NOPE + 2 * i;
+    float ra, rb;
+    rot_pair(__bfloat162float(p[0]), __bfloat162float(p[1]), (float)pos_of(start, dstart, dsess, r) * inv[i], false, ra, rb);
+    p[0] = __float2bfloat16_rn(ra);
+    p[1] = __float2bfloat16_rn(rb);
+}
+
+// 1: the fused path applies (decode GEMV on for q_a, q_b, kv; the shapes the kernels above are written for; nothing gathered)
+inline bool proj_fuse_ok(const Weights& W, int n, const uint8_t* gathered_codes)
+{
+    return g_proj_fuse && g_fn_gemv_dual && !gathered_codes && n >= 1 && n <= 8 && use_gv(W.wq_a, n) && use_gv(W.wq_b, n) && use_gv(W.wkv, n) &&
+           W.wq_a.K == HID && W.wkv.K == HID && W.wq_a.N == QA && W.wkv.N == HD && W.wq_b.K == QA && HID % 256 == 0 && QA % 256 == 0;
+}
+inline void attn_proj_fused(const Weights& W, Cache& C, const Scratch& S, const bf16* y, int n, int start, int heads, cudaStream_t st, const int* dstart)
+{
+    k_pf_quant_xfrag<<<dim3(HID / 256, 8), 256, 0, st>>>(y, HID, S.yq, HID, S.ys, HID / 32, n, S.xf_y);                                      // F1
+    g_fn_gemv_dual(S.xf_y, W.wq_a, S.qa, QA, W.wkv, S.kv0, HD, n, st, g_gv_tpc, g_gv_ks);                                                      // F2
+    k_pf_norm_quant_xfrag<<<8, 256, 0, st>>>(S.qa, W.q_norm, S.qr, S.qrq, S.qrs, S.xf_qr, n, QA, EPS);                                         // F3
+    launch_gemv(S.xf_qr, W.wq_b, S.q, heads * HD, n, 1, 0, st);                                                                                // q_b
+    const unsigned rope_blocks = (unsigned)(((long)n * heads * (ROPE / 2) + 511) / 512);
+    k_pf_rope_kvprep<<<n + rope_blocks, 512, 0, st>>>(S.q, (long)heads * HD, heads, W.inv, start, dstart, S.kv0, W.kv_norm, n, S.kvrows, C.ring, C.ring_rows, S.sess);   // F5
+}
+
 inline void launch_attn(const AttnP& p, cudaStream_t st)
 {
     static bool init = false;
@@ -1796,6 +1933,7 @@ inline void launch_attn(const AttnP& p, cudaStream_t st)
 inline void attn_proj(const Weights& W, Cache& C, const Scratch& S, const bf16* y, int n, int start, int heads, cudaStream_t st,
                       const int* dstart = nullptr, const uint8_t* gathered_codes = nullptr, const uint8_t* gathered_scales = nullptr)
 {
+    if (proj_fuse_ok(W, n, gathered_codes)) { attn_proj_fused(W, C, S, y, n, start, heads, st, dstart); return; }   // GR8_DS_ATTN_PROJ_FUSE=1
     if (!gathered_codes) launch_act_quant(y, HID, S.yq, HID, S.ys, HID / 32, n, HID, st);
     const uint8_t* yq = gathered_codes ? gathered_codes : S.yq;
     const uint8_t* ys = gathered_scales ? gathered_scales : S.ys;

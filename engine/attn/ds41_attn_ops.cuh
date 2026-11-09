@@ -39,6 +39,7 @@ void ds41_attn_core(const ds41a::Weights*, const ds41a::Cache*, const void* comp
 void ds41_attn_out(const ds41a::Weights*, const ds41a::Scratch*, int n, int start, int heads, void* out, void* st, const int* dstart, int direct_c2);
 void ds41_attn_inv_freqs(int compressed, float* out32);
 void ds41_attn_set_gv(int on, int tpc, int ks, ds41a::XfragFn fn_xfrag, ds41a::GemvFn fn_gemv);
+void ds41_attn_set_proj_fuse(int on, ds41a::GemvDualFn fn_dual);
 void ds41_attn_set_src_fast(int bits);
 void ds41_attn_set_tc(int on);
 void ds41_attn_set_tc_mfast(int on);
@@ -269,6 +270,7 @@ inline int ds41_attn_bind(void* model, int i, int capacity, void* stream)
             gv_set = true;
             ds41_attn_set_gv(knob::ds_attn_gv(), (int)knob::ds_attn_gv_tpc(), (int)knob::ds_attn_gv_ks(), ds41a::gv_xfrag_launch,
                              knob::ds41_gv_quad() ? ds41a::gv_gemv_launch_q : ds41a::gv_gemv_launch);   // GR8_DS41_GV_QUAD=1: q_b / o_a / o_b in quad records (default off)
+            ds41_attn_set_proj_fuse(knob::ds_attn_proj_fuse(), ds41a::gv_gemv_dual_launch);   // GR8_DS_ATTN_PROJ_FUSE=1: the proj stage in 5 launches, byte-equal (default off)
             const bool tc = knob::ds_attn_tc();   // 1 = the five projections at M >= 9 run on the block-scaled tensor-core GEMM (default 0)
             ds41_attn_set_tc(tc);
             if (tc) fprintf(stderr, "DS41 attention tensor-core GEMM: GR8_DS_ATTN_TC=1 (M >= 9)\n");

@@ -218,4 +218,30 @@ inline void gv_gemv_launch_q(const uint32_t* xf, const Fp8Mat& W, bf16* Y, int l
     }
     k_gv_mx_q<<<dim3(ot, groups), ks * 32, 0, st>>>(W.gv, xf, K, ot, ks, M, Y, ldy, y_gs);
 }
+// ------------------------------------------------------------------------------------------------ q_a + kv in one launch (GR8_DS_ATTN_PROJ_FUSE)
+// GemvDualFn: matrix A (q_a, N = 1280) and matrix B (kv, N = 512) over the SAME fragment table (K = 5120). One grid: CTAs [0, gA) run A's tiles, the rest
+// run B's, each through gv_gemv_body<Mxfp8, 1> exactly as k_gv_mx does (same tpc / ks, same body, B's tile index = blockIdx.x - gA), so both outputs are
+// bit-identical to two k_gv_mx launches. The CTA shape (tpc x ks warps) is gv_gemv_launch's rule. Quad-layout records or different K: two stock launches.
+__global__ void __launch_bounds__(512) k_gv_mx_dual(const uint8_t* __restrict__ sa, const uint8_t* __restrict__ sb, const uint32_t* __restrict__ xf, int K, int otA,
+                                                    int otB, int gA, int tpc, int ks, int M, bf16* ya, int ldya, bf16* yb, int ldyb)
+{
+    if ((int)blockIdx.x < gA) gv_gemv_body<Mxfp8, 1>(sa, xf, K, otA, tpc, ks, M, ya, ldya, gv::O_BF16, (int)blockIdx.x);
+    else gv_gemv_body<Mxfp8, 1>(sb, xf, K, otB, tpc, ks, M, yb, ldyb, gv::O_BF16, (int)blockIdx.x - gA);
+}
+inline void gv_gemv_dual_launch(const uint32_t* xf, const Fp8Mat& WA, bf16* YA, int ldya, const Fp8Mat& WB, bf16* YB, int ldyb, int M, cudaStream_t st, int tpc,
+                                int ks)
+{
+    if (WA.K != WB.K || g_gv_quad.count(WA.gv) || g_gv_quad.count(WB.gv))
+    {
+        gv_gemv_launch_q(xf, WA, YA, ldya, M, 1, 0, st, tpc, ks);
+        gv_gemv_launch_q(xf, WB, YB, ldyb, M, 1, 0, st, tpc, ks);
+        return;
+    }
+    const int K = WA.K, otA = WA.N / 16, otB = WB.N / 16;
+    if (!ks || (K / 32) % ks) ks = gv_pick_ks(K);
+    if (tpc < 1) tpc = 1;
+    if (tpc * ks > 16) tpc = 16 / ks > 0 ? 16 / ks : 1;
+    const int gA = (otA + tpc - 1) / tpc, gB = (otB + tpc - 1) / tpc;
+    k_gv_mx_dual<<<gA + gB, tpc * ks * 32, 0, st>>>(WA.gv, WB.gv, xf, K, otA, otB, gA, tpc, ks, M, YA, ldya, YB, ldyb);
+}
 }   // namespace ds41a

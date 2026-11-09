@@ -65,6 +65,13 @@ void ds41_attn_set_gv(int on, int tpc, int ks, ds41a::XfragFn fn_xfrag, ds41a::G
     if (tpc > 0) ds41a::g_gv_tpc = tpc;
     ds41a::g_gv_ks = ks > 0 ? ks : 0;
 }
+// GR8_DS_ATTN_PROJ_FUSE (a process-wide setting, default 0): 1 = ST_ATTN_PROJ at 1..8 rows with the decode GEMV runs 5 fused launches instead of 10
+// (ds41_attn.cuh attn_proj_fused). fn_dual: the q_a + kv one-launch GEMV of ds41_attn_gv.cuh (gv_gemv_dual_launch); without it the knob stays off.
+void ds41_attn_set_proj_fuse(int on, ds41a::GemvDualFn fn_dual)
+{
+    ds41a::g_fn_gemv_dual = fn_dual;
+    ds41a::g_proj_fuse = on != 0 && fn_dual ? 1 : 0;
+}
 // GR8_DS_SRC_FAST bits (a process-wide setting): 1 = the ratio-2 compressor projections at <= 8 rows use k_f32gemv2 (bit-identical to k_f32gemm2); 2 is read by the rank TU
 // (idx wq_b through the MXFP8 GEMV). 0 = the generic launches.
 void ds41_attn_set_src_fast(int bits)
