@@ -184,9 +184,10 @@ knobs:
   GR8_DS_PF_V2_PACK_BLOCKS:
     scope: local
     kind: ints
-    default: "0"
+    default: "48"
     doc: >-
-      V2 wire pack/unpack only (AG, A2A and RS): 0 retains eight blocks.
+      V2 wire pack/unpack only (AG, A2A and RS). The default, 48, packs with 48 blocks;
+      0 selects the old eight blocks.
       Otherwise a comma list of positive block counts (e.g. 48,192,1024);
       request ID r selects list[r % length], logged once per request per rank.
       Retains the existing aligned 16-byte copies and scalar ragged/unaligned
