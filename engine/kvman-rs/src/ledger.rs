@@ -1,4 +1,4 @@
-//! The host ledger of a box that runs a Flash rank and a co-located KV node (D-331 M7): who may count each exchangeable
+//! The host ledger of a box that runs a Flash rank and a co-located KV node: who may count each exchangeable
 //! byte of the box's memory. One small file per box, read and written under flock, every change one atomic rename.
 //!
 //! `total` bytes are exchangeable. Each is counted in exactly one place: `gpu` (backing the rank's KV pool above what

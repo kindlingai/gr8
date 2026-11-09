@@ -1,4 +1,4 @@
-// GR8_GLM53F_KV_CHUNKS=1 (D-331 M7 part B; 0, the default, keeps one cudaMalloc per binding as before): a Flash rank's
+// GR8_GLM53F_KV_CHUNKS=1 (0, the default, keeps one cudaMalloc per binding as before): a Flash rank's
 // MLA and index caches, every DSA binding's, in kvchunks regions (attn/kvchunks.h) under one chunk map. Chunk k is
 // pages [k * chunk_pages, (k + 1) * chunk_pages) of every binding (the last may be shorter), online in all of them or
 // in none. The Flash session's block table is the identity (flash_bind.cu), so its context fills pages from 0 up and

@@ -2,6 +2,16 @@
 
 Bugs we are still working out, by model. The PR that fixes one removes its entry.
 
+## All models
+
+### 1. `gr8 <model> bench` inside a recipe image stops: no `ssh` - Open ([#413](https://github.com/kindlingai/gr8/issues/413))
+
+- In a recipe image with `PEERS` set, the bench stops before its first stage with `FileNotFoundError: ... 'ssh'`, and
+  no report is written. The `gr8` wrapper passes `--hosts` with the `PEERS` list to `bench/bench.py`, and
+  `bench/gr8bench/thermal.py` reaches every host but `local` through `ssh`, which the image does not have.
+- Workaround: add `--hosts ''` after the command (`bench.py` keeps the last `--hosts`). The run then has no cooldown
+  between stages and no heat samples.
+
 ## GLM-5.3
 
 ### 1. Prefix-reuse miss near 786K tokens (TP=6, six Sparks) - Open

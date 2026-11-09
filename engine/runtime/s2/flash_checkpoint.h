@@ -32,7 +32,7 @@
 // pages and KDA state still match its manifest's checksums (flash_entry_check, FlashCheckpoints::settle) and that every
 // other rank kept too (the bootstrap's agreement, flash_keep_agreed).
 //
-// A group lease (--kv-store ...,group=, s2/kv_share.h, D-331 M8 (c)): the store shares its KV node with other clusters
+// A group lease (--kv-store ...,group=, s2/kv_share.h): the store shares its KV node with other clusters
 // (the full model's pool) and changes size by whole segments at a Resize event. The index reports what the pool stash
 // reports: its counters as g6kv_tier_totals (share_want asks from them) and the ages of what a give would drop
 // (coldest). A shrink drops the least recently used entries until the rest fit, then packs them below the new end:
