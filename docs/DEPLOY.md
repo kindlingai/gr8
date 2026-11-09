@@ -37,7 +37,7 @@ downloads anything.
 
 `./gr8 models` lists each model's release and the values `--tp` and `--variant` take. For the GLM models each box
 fetches only its own part of the release into its model cache: the first `up` downloads it (about 90 GB at TP=4, 35
-minutes at 40 MB/s), and GLM-5.3's later boots load from its cache in about 40 s (measured 2026-10-10, gr8 36e5f70), as the README says.
+minutes at 40 MB/s), and GLM-5.3's later boots at TP=4 have their engines ready in about 68 s (measured 2026-11-06, [FIRST-BOOT.md](FIRST-BOOT.md)).
 [SWITCHING.md](SWITCHING.md) records warm-start waits and per-rank load times for a mixed TP=4 ring with DGX Spark
 and PCIe Gen4 NVMe boxes. (`ds41` is the exception in the table
 above: it is read in place from a local copy you fetch yourself, and it has no variants — see

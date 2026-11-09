@@ -2,7 +2,7 @@
 // matches a prompt-end snapshot PE (claimed by its grant) but not the parked chat's request-end tokens RE, all slots full, so
 // the bind evicts that parked slot: the capture of RE must not evict PE, which the bind restores next. Before the fix the
 // capture only moved PE to the back of the LRU (touch), so a budget that fits PE or RE but not both evicted PE and the
-// bind aborted ("the evicted chat's capture evicted the grant's own snapshot"). the reviewer's fixture (review of 70b7282):
+// bind aborted ("the evicted chat's capture evicted the grant's own snapshot"). The reviewer's fixture (review of 70b7282):
 // 1 MiB budget, one attention layer of 256 ring rows; BF16 PE 774144 + RE 876544 B, FP4 PE 521344 + RE 550144 B.
 // Host only: the CUDA calls are stubs over host memory with an optional allocation limit.
 // Build (one line): g++ -std=c++17 -O1 -g -fsanitize=address,undefined -DG6_MODEL_DS41=1 -I engine/runtime engine/runtime/s2/tests/ds41_park_evict_test.cpp -o /tmp/ds41_park_evict_test <knobs lib>
