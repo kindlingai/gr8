@@ -663,7 +663,7 @@ pub type ResolveFn = unsafe extern "C" fn(
 /// requires through g6sch_abi in scheduler.h check_abi): no compiler checks them across the C ABI, so change any -> bump both. 2: `image`.
 pub const PARSE_FN: u64 = 2;
 
-/// The caller's `img` field (DS41, ds41_image.h parse_field): null when it kept the image, or its refusal message
+/// The caller's `img` field (images, image_input.h parse_field): null when it kept the image, or its refusal message
 /// (valid until the caller's next call). Called once per field, in order, at the point the C++ parser read them.
 pub type ImageFn = unsafe extern "C" fn(ctx: *mut std::ffi::c_void, field: *const u8, field_n: usize) -> *const c_char;
 

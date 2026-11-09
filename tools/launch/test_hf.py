@@ -124,6 +124,7 @@ def make_release(root):
     rnd = numpy.random.default_rng(7)
     for name in ('exlr8-dense-003', 'exlr8-dense-004', 'exlr8-vocab'):
         put(f'dense/{name}.safetensors', rnd.bytes(300_000))
+    put('dense/vision-bf16.safetensors', rnd.bytes(50_000))   # fetched only with image input (GR8_GLM53F_VISION=1)
     for name in hfsource.META_FILES:
         put(name, f'{{"{name}": 1}}'.encode())
     put('README.md', b'fake release\n')
@@ -332,6 +333,19 @@ class HFTests(unittest.TestCase):
         self.assertLess(got, size * 0.4)
         self.assertEqual(self.hub.requests(r'exlr8-layer-00\d\.k2'), [])            # home uses K3 only
         self.assertTrue(any('GB to fetch' in m for m in self.logs))
+
+    def test_the_vision_tower_only_with_image_input(self):
+        r = self.release()
+        v = self.variant(r)
+        r.fetch_rank(4, 1, v)
+        self.assertEqual(self.hub.requests(r'dense/vision-'), [])
+        r.vision = True       # GR8_GLM53F_VISION=1 after a text-only fetch: the rank is not ready until it has the tower
+        self.assertEqual(r.check(4, 1, v), ['dense/vision-bf16.safetensors: not fetched yet (GR8_GLM53F_VISION=1)'])
+        r.fetch_rank(4, 1, v)
+        self.assertEqual(r.check(4, 1, v), [])
+        with open(os.path.join(self.r1, 'dense', 'vision-bf16.safetensors'), 'rb') as a, \
+                open(os.path.join(r.dir, 'dense', 'vision-bf16.safetensors'), 'rb') as b:
+            self.assertEqual(a.read(), b.read())
 
     def test_a_rerun_fetches_nothing_and_a_variant_adds_its_widths(self):
         r = self.release()

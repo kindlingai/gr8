@@ -7,7 +7,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
-#include "../ds41_vision_id.h"
+#include "../vision_id.h"
 #include "../../scheduler-rs/g6sched.h"
 
 namespace g6s2
@@ -64,7 +64,7 @@ struct SigInputs
     int idx_pipe_b = 0, idx_q_trig = 0, idx_pipe_qr = 0;
     bool reuse = false;
     bool vis_on = false;                // the vision tower loaded (the capability, not the knob)
-    std::string vis_id;                 // ds41v::file_id of the tower file
+    std::string vis_id;                 // g6vis::file_id of the tower file
 };
 
 inline std::string runtime_signature(const SigInputs& in)

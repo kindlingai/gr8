@@ -1,15 +1,16 @@
-// DS41 image input in the rank agreement (g6m4.cu, the DS41 S2 runtime signature). Each rank looks for the tower file on its
-// own, and a rank without it boots text-only, so the ranks agree on the effective capability, not on the GR8_DS41_VISION
-// knob: a rank with the tower adds " vision <id>", a rank without it adds nothing. The id is the file's byte size and the
-// FNV-1a of its safetensors header length + header bytes, so it checks header, layout and size agreement, NOT the tensor
-// data. Ranks that differ (one without the file, or a file whose header or size differs) refuse at bootstrap. No CUDA types.
+// Image input in the rank agreement (g6m4.cu, the DS41 and Flash S2 runtime signatures). Each rank looks for the tower
+// file on its own, and a rank without it boots text-only, so the ranks agree on the capability each one loaded. A rank
+// with the tower adds " vision <id>" (whatever GR8_DS41_VISION / GR8_GLM53F_VISION says), a rank without it adds
+// nothing. The id is the file's byte size and the FNV-1a of its safetensors header length + header bytes: it checks the
+// header, layout and size, and the tensor data goes unchecked. Ranks that differ (one without the file, or a file whose
+// header or size differs) refuse at bootstrap. No CUDA types.
 #pragma once
 #include <cstdint>
 #include <cstdio>
 #include <string>
 #include <vector>
 
-namespace ds41v {
+namespace g6vis {
 
 // "<bytes>-<fnv1a64 hex of the 8-byte header length + the header>"; "" when the file cannot be read or has no header
 inline std::string file_id(const std::string& path) {
@@ -36,4 +37,4 @@ inline std::string file_id(const std::string& path) {
 // the runtime signature's vision words: " vision <id>" with the tower loaded, nothing without
 inline std::string signature(bool loaded, const std::string& id) { return loaded ? " vision " + id : std::string(); }
 
-} // namespace ds41v
+} // namespace g6vis

@@ -268,9 +268,16 @@ class Release:
             json.dump({'release': f'{self.repo.repo}@{self.commit}', 'files': list(META_FILES)}, f, indent=1)
         os.replace(done + '.tmp', done)
 
+    # GLM-5.3-Flash image input (GR8_GLM53F_VISION=1, supervisor.resolve_model): the rank also fetches the vision tower
+    vision = False
+
+    def vision_files(self):
+        """The release's vision tower files (dense/vision-*)."""
+        return sorted(p for p in self.repo.tree() if p.startswith('dense/vision-') and p.endswith('.safetensors'))
+
     def whole_files(self, tp, rank):
         """The release files this rank loads whole: its index slices (a layout's halves are listed in every rank's), and
-        the dense and vocab files. The vision tower (dense/vision-*) stays on the hub: the engine serves text."""
+        the dense and vocab files. The vision tower (dense/vision-*) stays on the hub unless image input is on."""
         t = self.repo.tree()
         r = r'\d+' if self.layout else rank
         slices = sorted(p for p in t if re.fullmatch(rf'index-slices/tp{tp}/k\d/rank{r}\.safetensors', p))
@@ -280,7 +287,7 @@ class Release:
         # sharding units a rank reads, fetch only those byte ranges here.
         dense = sorted(p for p in t if p.startswith('dense/') and p.endswith('.safetensors')
                        and not p.startswith('dense/vision-'))
-        return slices + dense
+        return slices + dense + (self.vision_files() if self.vision else [])
 
     def reuse(self):
         """Hard-link the files an older commit of this release left in the cache, where the hub gives the file the same
@@ -338,6 +345,8 @@ class Release:
             return [f'{self} rank {rank} of TP={tp}, variant {variant.name}{lay}, is not in the cache yet']
         bad = [f'{p}: missing or not {n} bytes' for p, n in sorted(c['files'].items())
                if not os.path.isfile(os.path.join(self.dir, p)) or os.path.getsize(os.path.join(self.dir, p)) != n]
+        if self.vision:   # a rank fetched before image input was turned on lacks the tower
+            bad += [f'{p}: not fetched yet (GR8_GLM53F_VISION=1)' for p in self.vision_files() if p not in c['files']]
         return bad
 
     def fetch_rank(self, tp, rank, variant, workers=None):

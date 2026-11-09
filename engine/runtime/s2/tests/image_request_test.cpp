@@ -1,5 +1,6 @@
-// DS41 image requests, host side: the img header fields of an S2 request (s2/sessions.h parse_request, ds41_image.h), the
-// prompt checks, the image digest in the prefix-cache namespace and the control protocol, and the refusals (Service::images_ok).
+// Image requests, host side: the img header fields of an S2 request (s2/sessions.h parse_request, image_input.h), the
+// prompt checks, the image digest in the prefix-cache namespace and the control protocol, and the refusals
+// (Service::images_ok). The DS41 geometry first, then GLM-5.3-Flash's (image_model() set to GLM5V_IMAGES).
 #include "s2/dispatch.h"
 #include "s2/control_protocol.h"
 #include <cstdio>
@@ -80,6 +81,29 @@ int main() {
     auto end = parse_request(head + " " + field(1, 7) + "\n" + prompt({5, T, T, T, T}) + "\n");
     CHECK(*g6rt::img::refusal(end.prompt, end.images, false));
     CHECK(!*g6rt::img::refusal(t.prompt, t.images, true));
+    // GLM-5.3-Flash: <|image|> rows, one per 2 x 2 patches, 16 to 8000 tokens
+    g6rt::image_model() = g6rt::GLM5V_IMAGES;
+    {
+        constexpr int G = g6rt::TOK_IMAGE_GLM5V;
+        std::vector<int> ids{5, 154830};
+        ids.insert(ids.end(), 16, G);
+        ids.insert(ids.end(), {154831, 6, 7});
+        std::string p;
+        for (int i : ids) p += (p.empty() ? "" : ",") + std::to_string(i);
+        auto f = parse_request(head + " " + field(2, 9, 8, 8) + "\n" + p + "\n");
+        CHECK(f.images.size() == 1 && f.images[0].span == 16 && f.images[0].rgb->size() == size_t(8 * 8 * 14 * 14 * 3));
+        CHECK(f.steering.images && !*g6rt::img::refusal(f.prompt, f.images, false));
+        CHECK(*g6rt::img::refusal(f.prompt, f.images, true));
+        for (const std::string& bad : {
+                 head + " " + field(1, 9, 8, 8) + "\n" + p + "\n",            // the span starts on <|begin_of_image|>
+                 head + " " + field(2, 9, 6, 6) + "\n" + p + "\n",            // 9 tokens: below the floor of 16
+                 head + " " + field(2, 9, 7, 8) + "\n" + p + "\n",            // an odd side
+                 head + " " + field(2, 9, 2, 16002) + "\n" + p + "\n",        // past 8000 tokens
+                 head + " " + field(1, 7) + "\n" + p6 + "\n",                 // DS41's token and grid
+             })
+            CHECK(refused(bad));
+    }
+    g6rt::image_model() = g6rt::DS41_IMAGES;
     if (fails) { std::printf("%d FAILED\n", fails); return 1; }
     std::printf("image_request_test OK\n");
     return 0;

@@ -68,8 +68,8 @@ redraws them). The model pages give each benchmark and its date.</sub>
   checkpoints in the same kinds of store
   ([experimental](docs/FLASH.md#session-checkpoints-gr8_glm53f_cachealigned-experimental)). DeepSeek-V4.1-Flash has no
   store below the device.
-- **Image input.** DeepSeek-V4.1-Flash takes images in chat requests (opt-in, `GR8_DS41_VISION=1`,
-  [docs/DS41-VISION.md](docs/DS41-VISION.md)).
+- **Image input.** DeepSeek-V4.1-Flash and GLM-5.3-Flash take images in chat requests (opt-in, `GR8_DS41_VISION=1`,
+  [docs/DS41-VISION.md](docs/DS41-VISION.md); `GR8_GLM53F_VISION=1`, [docs/FLASH-VISION.md](docs/FLASH-VISION.md)).
 - **A Docker image.** `ghcr.io/kindlingai/gr8` has the engine for every TP width and all three models, so GLM-5.3 on
   three to six boxes needs no build ([Docker Compose](docs/DEPLOY.md#docker-compose)). The one-box and two-box recipes publish their
   own images.

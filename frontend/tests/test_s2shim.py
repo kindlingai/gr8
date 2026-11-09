@@ -144,6 +144,24 @@ class UnitTests(unittest.TestCase):
         self.assertIsNotNone(g6s2shim.build_request({'prompt': prompt, 'max_tokens': 4, 'images': [im] * 17}, 0)[1])
         self.assertIsNotNone(g6s2shim.build_request({'prompt': prompt, 'max_tokens': 4, 'images': [im],
                                                      'prompt_logprobs': 0}, 0)[1])
+        # GLM-5.3-Flash geometry (vision.s2 says glm5v): <|image|> rows, one per 2 x 2 patches, 16 to 8000
+        G = g6s2shim.GLM5V_IMAGE_TOKEN
+        g = {'pos': 2, 'vit_h': 8, 'vit_w': 8, 'key': '0123456789abcdef',
+             'rgb': base64.b64encode(bytes(8 * 8 * 14 * 14 * 3)).decode()}
+        gp = [5, 154830] + [G] * 16 + [154831, 6]
+        body, err = g6s2shim.build_request({'prompt': gp, 'max_tokens': 4, 'images': [g]}, 0, None, 'glm5v')
+        self.assertIsNone(err)
+        self.assertTrue(body.split(b'\n')[0].endswith(b' img 2:8:8:0123456789abcdef:' + g['rgb'].encode()))
+        self.assertIsNotNone(g6s2shim.build_request({'prompt': gp, 'max_tokens': 4, 'images': [g]}, 0)[1])   # DS41's token
+        for b in ({**g, 'pos': 1}, {**g, 'vit_h': 6, 'vit_w': 6}, {**g, 'vit_h': 7}, {**g, 'vit_h': 2, 'vit_w': 16002}):
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': gp, 'max_tokens': 4, 'images': [b]}, 0, None, 'glm5v')[1], b)
+        self.assertEqual(g6s2shim.image_span(178, 178, 'glm5v'), 7921)
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            for text, want in (('glm5v\n', 'glm5v'), ('1\n', 'ds41')):
+                with open(f'{d}/vision.s2', 'w') as fh:
+                    fh.write(text)
+                self.assertEqual(g6s2shim.vision_model(f'{d}/vision.s2'), want)
 
     def test_build_request(self):
         body, err = g6s2shim.build_request({'prompt': [5, 6, 7], 'max_tokens': 9, 'temperature': 0.5, 'top_p': 0.9,

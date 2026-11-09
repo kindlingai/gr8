@@ -277,9 +277,9 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engin
 # GR8_DS_COMP_FP4 [1,1,0,1] refuses, [1,1,1,1] and [0,0,0,0] boot
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/ds41_agree_knobs_test.cpp" -o "$T/ds41_agree_knobs_test" "${KNOBS[@]}"
 "$T/ds41_agree_knobs_test" "$REPO/engine/runtime/g6m4.cu"
-# DS41 ranks that loaded different vision towers (one without the file, or another file) refuse at bootstrap
-g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/ds41_agree_vision_test.cpp" -o "$T/ds41_agree_vision_test" "${KNOBS[@]}"
-"$T/ds41_agree_vision_test" "$REPO/engine/runtime/g6m4.cu"
+# DS41 and Flash ranks that loaded different vision towers (one without the file, or another file) refuse at bootstrap
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/agree_vision_test.cpp" -o "$T/agree_vision_test" "${KNOBS[@]}"
+"$T/agree_vision_test" "$REPO/engine/runtime/g6m4.cu"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/steering_state_test.cpp" "${KVLIB[@]}" -o "$T/steering_state_test"
 "$T/steering_state_test"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/steering_transport_test.cpp" -o "$T/steering_transport_test" "${KNOBS[@]}"

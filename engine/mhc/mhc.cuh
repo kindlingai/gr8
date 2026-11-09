@@ -134,6 +134,22 @@ __global__ void k_mhc_embed(Buffers b, const int* tok, const __nv_bfloat16* embe
     const float inv=rsqrtf(sum_block(sq)/H+eps);
     if (!threadIdx.x) b.inv[m]=inv;
 }
+// k_mhc_embed with image rows (image input, runtime/flash_vision_stage.cuh): row m with row_of[m] >= 0 takes the vision
+// tower's row rows[row_of[m]] in place of its token's embedding row.
+__global__ void k_mhc_embed_rows(Buffers b, const int* tok, const __nv_bfloat16* embed, int H, float eps,
+                                 const __nv_bfloat16* rows, const int* row_of) {
+    const int m=blockIdx.x;
+    const int r=row_of[m];
+    const __nv_bfloat16* src=r>=0 ? rows+(size_t)r*H : embed+(size_t)tok[m]*H;
+    float sq=0.f;
+    for (int h=threadIdx.x; h<H; h+=THREADS) {
+        const float v=__bfloat162float(src[h]);
+        for (int j=0; j<4; ++j) b.streams[((size_t)m*4+j)*H+h]=v;
+        sq += v*v;
+    }
+    const float inv=rsqrtf(sum_block(sq)/H+eps);
+    if (!threadIdx.x) b.inv[m]=inv;
+}
 // Standalone entry for golden vectors and residual restores.
 __global__ void k_mhc_flat_inv(Buffers b, int H, float eps) {
     float sq=0.f;
