@@ -766,7 +766,8 @@ class Supervisor:
             # say why now, not after the extra wait: with a box down that wait is up to JOIN_TIMEOUT
             log(handshake.describe(v))
             self.refusal_logged = True
-            log(self.linger_plan())
+            if not self.stop_ev.is_set():   # a stopped head does not linger: no wait to announce
+                log(self.linger_plan())
             self.linger()
         return v
 

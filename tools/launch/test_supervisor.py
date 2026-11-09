@@ -353,6 +353,16 @@ class ControlPortTests(unittest.TestCase):
             head.untold.return_value, head.gave_up = untold, gave_up
             with mock.patch.object(S, 'opt_timeout', return_value=more):
                 self.assertEqual(s.linger_plan(), 'head: answering late hellos with the refusal for 15 s')
+        # a head stopped while it waits for hellos (down, Ctrl-C) says so and announces no wait: linger() returns at once
+        head.verdict, head.wait_all.return_value, head.untold.return_value, head.gave_up = None, False, [1, 2, 3], False
+        s.stop_ev.set()
+        s.stop_why, s.refusal_logged, lines[:] = 'SIGTERM', False, []
+        with mock.patch.object(S.handshake, 'Head', return_value=head), mock.patch.object(S, 'log', side_effect=lines.append), \
+                mock.patch.object(s, 'linger', side_effect=lambda: lines.append('LINGER')):
+            v = s.handshake_head(hello(0, lan=MEMBERS[0]))
+        self.assertEqual(v['field'], 'stopped')
+        self.assertTrue(any(x.startswith('handshake refused: stopped: SIGTERM') for x in lines), lines)
+        self.assertFalse([x for x in lines if x.startswith('head: answering')], lines)
 
     def test_hello_before_the_head_is_ready(self):
         s = supervisor()
