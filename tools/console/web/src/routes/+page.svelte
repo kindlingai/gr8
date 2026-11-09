@@ -63,7 +63,7 @@
     const choice = presets.presets.find(item => item.id === id);
     review = {action: 'restart', model: snapshot.active, preset: id, label: choice.label,
       expect_active: snapshot.active ?? null, revision: presets.revision, before: presets.current_setting, after: choice.setting,
-      diff: choice.diff || []};
+      diff: choice.diff || [], download: choice.download || null};
     await tick(); dialog.showModal();
   }
   function closeReview() { if (!sending) { dialog.close(); review = null; } }
@@ -73,7 +73,8 @@
     try {
       job = await api('operations', { method: 'POST', headers: {'Content-Type':'application/json', 'X-Console-Token':snapshot.csrf},
         body: JSON.stringify({action: review.action, model: review.model, preset: review.preset,
-          revision: review.revision, expect_active: review.expect_active, backup_id: review.backup_id, confirm: true}) });
+          revision: review.revision, expect_active: review.expect_active, backup_id: review.backup_id, confirm: true,
+          accept_download: review.download ? true : undefined}) });
       dialog.close(); review = null;
     } catch(e) { error = e.message; }
     finally { sending = false; }
@@ -171,6 +172,7 @@
     {#if review.action !== 'restore' && review.expect_active && review.expect_active !== review.model}<p class="warn">{snapshot?.models.find(m => m.id === review.expect_active)?.name} stops on its configured boxes.</p>{/if}
     <p>{review.action === 'restore' ? 'Restores the saved previous dotenv files only if nobody has edited them since. Does not restart the current engine. Then use Restart or Switch to apply.' : review.action === 'stop' ? 'Stops the target on every configured box. No replacement starts.' : 'Stops and starts the configured boxes. Chats in progress end. Completion waits for a ready model.'}</p>
     {#if review.after}<div class="diff"><div class="error">− {review.before}</div><div class="ok">+ {review.after}</div>{#each (review.diff || []).filter(row => row.after == null && row.before != null) as row}<div class="error">− {row.key}={row.before}</div><div class="ok">+ {row.key} removed</div>{/each}</div>{/if}
+    {#if review.download}<p class="warn">{review.download}</p>{/if}
     {#if error}<p class="error" role="alert">{error}</p>{/if}
     <div class="row"><button class="btn" disabled={sending} onclick={closeReview}>Cancel</button><button class="btn pri" disabled={sending || busy || stale} onclick={submit}>{sending ? 'Submitting…' : review.action === 'restore' ? 'Restore settings now' : review.action === 'restart' ? 'Restart now' : review.action === 'stop' ? 'Stop now' : 'Switch now'}</button></div>
   {/if}

@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import uvicorn
 from playwright.sync_api import sync_playwright, expect
 
+from tools.console.server import weights
 from tools.console.server.main import create_app
 from tools.console.server.service import Console
 from tools.console.tests.fakes import Fixture
@@ -104,6 +105,29 @@ def run(output):
             page.get_by_role("button", name="Quality").click()
             expect(page.get_by_role("dialog")).to_have_count(0)
             print("PASS confirmed preset: writes all four envs, drops SESS, stops, calls switch, verifies ready identity")
+
+            fixture.missing_weights = {"variant": "home", "size_gb": 29.7, "rate_mb_s": 28}
+            with page.expect_response(lambda response: presets_body(response) and "needs a ~30 GB download per box (~18 min)" in response.text(), timeout=10000):
+                pass
+            page.get_by_role("button", name="Speed").click()
+            expect(page.get_by_role("dialog")).to_contain_text("needs a ~30 GB download per box (~18 min)")
+            expect(page.get_by_role("button", name="Restart now", exact=True)).to_be_enabled()
+            page.screenshot(path=str(output / "download-390.png"), full_page=True)
+            page.get_by_role("button", name="Restart now", exact=True).click()
+            expect(page.get_by_label("Operation status")).to_contain_text("succeeded", timeout=15000)
+            expect(page.get_by_label("Operation status")).to_contain_text("downloading")
+            expect(page.get_by_label("Operation status")).to_contain_text("needs a ~30 GB download per box (~18 min)")
+            assert fixture.last_health_timeout == 900 + weights.extra_seconds(29.7, 28)
+            assert fixture.last_health_timeout > 900
+            page.get_by_role("button", name="Restore previous settings", exact=True).click()
+            page.get_by_role("button", name="Restore settings now", exact=True).click()
+            expect(page.get_by_label("Operation status")).to_contain_text("restore · glm53")
+            expect(page.get_by_label("Operation status")).to_contain_text("succeeded", timeout=15000)
+            assert all("VARIANT=bit325" in text for text in fixture.texts["glm53"].values())
+            fixture.missing_weights = None
+            with page.expect_response(lambda response: presets_body(response) and "needs a ~30 GB" not in response.text(), timeout=10000):
+                pass
+            print("PASS missing variant weights ask for the download and extend the health wait")
 
             row = page.get_by_role("row").filter(has_text="DeepSeek-V4.1-Flash")
             row.get_by_role("button", name="Switch", exact=True).click()

@@ -11,7 +11,7 @@ from tools.console.server.control import ComposeControl
 
 from fastapi.testclient import TestClient
 
-from tools.console.server import envfile, metrics, presets
+from tools.console.server import envfile, metrics, presets, weights
 from tools.console.server.main import create_app
 from tools.console.server.service import Console, fetch, rpc
 from tools.console.tests.fakes import Fixture
@@ -166,9 +166,26 @@ class AdapterTests(unittest.TestCase):
             args, _ = calls[-1]
             self.assertEqual(args[1:3], ["switch", "glm53"])
             self.assertTrue(args[3].startswith("@"))
+            self.assertNotIn("--timeout", args)
             config_bytes.return_value = b"changed config"
             with self.assertRaisesRegex(ValueError, "configuration changed"):
                 adapter.activate("glm53", lambda _: None)
+
+    def test_download_extends_the_switch_health_timeout(self):
+        calls = []
+        def runner(args, **kwargs):
+            calls.append((args, kwargs))
+            return SimpleNamespace(returncode=0, stdout="health: ready")
+        cfg = SimpleNamespace(models={"glm53": SimpleNamespace(directory="/configured compose", boxes=("operator@box.example",))}, timeout=900, ssh_timeout=5)
+        module = SimpleNamespace(read_config=lambda _: cfg, phase=lambda *args, **kwargs: None)
+        with patch("tools.console.server.control.load_switch", return_value=module), patch.object(Path, "read_bytes", return_value=b"config"):
+            adapter = ComposeControl("switch.env", runner=runner)
+            adapter.activate("glm53", lambda _: None, health_timeout=1961)
+        args, kwargs = calls[-1]
+        self.assertEqual(args[1:6], ["switch", "--timeout", "1961", "glm53", args[5]])
+        self.assertTrue(args[5].startswith("@"))
+        self.assertGreaterEqual(kwargs["timeout"], 1961)
+        self.assertEqual(kwargs["timeout"], 1961 + 5 * 4 + 30)
 
     def test_nonzero_switch_is_failure(self):
         cfg = SimpleNamespace(timeout=10, ssh_timeout=5)
@@ -401,6 +418,40 @@ class ServiceTests(unittest.TestCase):
             self.console.submit(self.request())
         self.assertEqual(self.fake.calls, [])
 
+    def test_missing_variant_weights_are_confirmed_and_wait_past_900s(self):
+        self.fake.missing_weights = {"variant": "bit325", "size_gb": 29.7, "rate_mb_s": 28}
+        row = self.console.read_presets("glm53")
+        by_id = {item["id"]: item for item in row["presets"]}
+        self.assertEqual(by_id["quality"]["download"], "needs a ~30 GB download per box (~18 min)")
+        self.assertIsNone(by_id["speed"]["download"])
+        self.assertIsNone(by_id["context"]["download"])
+        self.console.submit(self.request(preset="quality", revision=row["revision"]))
+        refused = self.done()
+        self.assertEqual(refused["status"], "failed", refused)
+        self.assertIn("confirm the download", refused["error"])
+        self.assertEqual(self.fake.calls, [])
+        self.console.submit(self.request(preset="quality", revision=row["revision"], accept_download=True))
+        job = self.done()
+        self.assertEqual(job["status"], "succeeded", job)
+        self.assertTrue(any(step.startswith("downloading needs a ~30 GB download per box (~18 min)") for step in job["steps"]))
+        switch = next(call for call in self.fake.calls if call[0] == "switch")
+        self.assertEqual(switch[2], self.console._health_budget() + weights.extra_seconds(29.7, 28))
+        self.assertGreater(switch[2], 900)
+        self.assertEqual(self.console.read_presets("glm53")["current"], "quality")
+        self.assertIsNone(next(item for item in self.console.read_presets("glm53")["presets"] if item["id"] == "quality")["download"])
+
+    def test_unmeasured_rate_omits_minutes_and_still_extends_the_wait(self):
+        self.fake.missing_weights = {"variant": "bit325", "size_gb": 29.7, "rate_mb_s": None}
+        row = self.console.read_presets("glm53")
+        quality = next(item for item in row["presets"] if item["id"] == "quality")
+        self.assertEqual(quality["download"], "needs a ~30 GB download per box")
+        self.console.submit(self.request(preset="quality", revision=row["revision"], accept_download=True))
+        job = self.done()
+        self.assertEqual(job["status"], "succeeded", job)
+        switch = next(call for call in self.fake.calls if call[0] == "switch")
+        self.assertEqual(switch[2], 900 + weights.extra_seconds(29.7, None))
+        self.assertGreater(switch[2], 900)
+
     def test_operation_serialization(self):
         release, started = threading.Event(), threading.Event()
         original = self.fake.stop
@@ -485,6 +536,59 @@ class ServiceTests(unittest.TestCase):
         snap = self.console.snapshot()
         self.assertIsNone(snap["active"])
         self.assertEqual(snap["stats"], {})
+
+
+class WeightTests(unittest.TestCase):
+    def test_sentence_uses_size_over_measured_rate(self):
+        self.assertEqual(weights.download_text(29.7, 28), "needs a ~30 GB download per box (~18 min)")
+        self.assertEqual(weights.download_text(29.7, None), "needs a ~30 GB download per box")
+        self.assertEqual(weights.extra_seconds(29.7, 28), 1061)
+        self.assertGreater(weights.extra_seconds(29.7, None), 900)
+        self.assertIsNone(weights.changed_variant({}, {"VARIANT": None}))
+        self.assertEqual(weights.changed_variant({}, {"VARIANT": "bit325"}), "bit325")
+        self.assertEqual(weights.changed_variant({"VARIANT": "bit325"}, {"VARIANT": None}), "home")
+        self.assertEqual(weights.changed_variant({"VARIANT": None}, {"VARIANT": "bit325"}, mixed=("VARIANT",)), "bit325")
+
+    def test_complete_marker_is_weights_and_manifest_alone_is_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            commit = "a" * 40
+            release = root / "cache" / "hf" / "org--repo" / commit
+            (release / "manifests").mkdir(parents=True)
+            (release / "complete").mkdir()
+            manifest = {"hidden_size": 32, "layers": {"0": {"gate": [[2] * 16], "up": [[2] * 16], "down": [2], "shared": 0}}}
+            (release / "manifests" / "exlr8-manifest-bit325.json").write_text(json.dumps(manifest))
+            home = root / "home" / "out"
+            home.mkdir(parents=True)
+            (home / "fetch.log").write_text("fetching rank 0 of org/repo: 1.0 of 2.0 GB (28 MB/s)\n")
+            request = {"cache": str(root / "cache"), "model": "https://huggingface.co/org/repo@" + commit,
+                       "tp": 4, "rank": 0, "variant": "bit325", "home": str(root / "home"), "peers": []}
+            missing = weights.probe(request)
+            self.assertFalse(missing["present"])
+            self.assertGreater(missing["size_gb"], 0)
+            self.assertEqual(missing["rate_mb_s"], 28.0)
+            blob = release / "experts" / "one.safetensors"
+            blob.parent.mkdir()
+            blob.write_bytes(b"abc")
+            marker = release / "complete" / "tp4.rank0.bit325-0123456789ab.json"
+            marker.write_text(json.dumps({"files": {"experts/one.safetensors": 3}}))
+            self.assertTrue(weights.probe(request)["present"])
+            request["rank"] = 1
+            self.assertFalse(weights.probe(request)["present"])
+            request["rank"] = 0
+            blob.write_bytes(b"ab")
+            self.assertFalse(weights.probe(request)["present"])
+
+    def test_expert_gb_matches_the_launcher(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "launch"))
+        import modelset
+        manifest = {"hidden_size": 32, "layers": {"0": {"gate": [[2] * 16, [4] * 16], "up": [[3] * 16, [2] * 16], "down": [4, 3], "shared": 0},
+                                                   "1": {"gate": [[2] * 16], "up": [[2] * 16], "down": [2], "shared": {"gate": [3] * 16, "up": [3] * 16, "down": 4}}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "exlr8-manifest-bit325.json"
+            path.write_text(json.dumps(manifest))
+            self.assertEqual(weights.expert_gb(manifest, 4, 32), modelset.expert_gb(str(path), 4))
 
 
 if __name__ == "__main__":

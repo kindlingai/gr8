@@ -21,6 +21,8 @@ class Fixture:
         self.active = "glm53"
         self.fail_write = None
         self.fail_boot = False
+        self.missing_weights = None
+        self.last_health_timeout = None
         self.refuse_supervisor = False
         self.not_ready = False
         self.calls = []
@@ -114,8 +116,15 @@ class Fixture:
         self.active = None
         emit("fixture: down returned on all boxes")
 
-    def activate(self, model, emit):
-        self.calls.append(("switch", model))
+    def variant_cache(self, model, variant, records, refresh=False):
+        spec = self.missing_weights or {}
+        if spec.get("variant") != variant:
+            return {"present": True, "size_gb": None, "rate_mb_s": None}
+        return {"present": False, "size_gb": spec.get("size_gb"), "rate_mb_s": spec.get("rate_mb_s")}
+
+    def activate(self, model, emit, health_timeout=None):
+        self.calls.append(("switch", model, health_timeout))
+        self.last_health_timeout = health_timeout
         if self.fail_boot:
             raise RuntimeError("fixture readiness timeout")
         self.active = model

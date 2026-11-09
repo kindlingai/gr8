@@ -11,7 +11,8 @@ GLM-5.3-Flash removes GR8_CP from EXTRA_ENV for the same reason. GLM-5.3
 has no TUNE. Speed clears VARIANT and KV_FORMAT. Quality sets
 VARIANT=bit325 and clears KV_FORMAT. Context sets KV_FORMAT=int4 and
 clears VARIANT. Any explicit SESS, CAP, MAX_MODEL_LEN, or one of those
-recipe leftovers reads as custom.
+recipe leftovers reads as custom. A preset that changes VARIANT (unset means
+home) is checked against each box's verified weight marker before restart.
 """
 
 MODELS = {"ds41": "DeepSeek-V4.1-Flash", "glm53": "GLM-5.3", "glm53f": "GLM-5.3-Flash"}

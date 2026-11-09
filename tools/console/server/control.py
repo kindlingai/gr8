@@ -2,16 +2,19 @@
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import json
+import math
 import os
 import signal
 import threading
+import time
 from collections import deque
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
 
-from . import envfile
+from . import envfile, weights
 
 REPO = Path(__file__).resolve().parents[3]
 
@@ -35,6 +38,8 @@ class ComposeControl:
         self.ensure_config()
         self.runner = runner
         self.remote_source = Path(envfile.__file__).read_text()
+        self.weight_source = Path(weights.__file__).read_text()
+        self._variant_cache = {}
 
     def ensure_config(self):
         if self.file.read_bytes() != self.config_bytes:
@@ -63,18 +68,67 @@ class ComposeControl:
         with ThreadPoolExecutor(max_workers=min(4, len(boxes))) as pool:
             return dict(zip(boxes, pool.map(lambda box: self.environment(model, box), boxes)))
 
+    def variant_cache(self, model, variant, records, refresh=False):
+        """On-disk check for one variant. present is true only when every box has it."""
+        if not re.fullmatch(r"[A-Za-z0-9_]+", variant or ""):
+            raise ValueError("unsupported variant")
+        boxes = list(records)
+        key = (model, variant, tuple((box, records[box].get("revision")) for box in boxes))
+        now = time.monotonic()
+        cached = self._variant_cache.get(key)
+        if cached and not refresh and now - cached[0] < 5:
+            return cached[1]
+        width = len(boxes)
+
+        def one(pair):
+            index, box = pair
+            values = envfile.parse(records[box]["text"])
+            peers = [part.strip() for part in (values.get("PEERS") or "").split(",") if part.strip()]
+            try:
+                tp = int(values["TP"]) if values.get("TP") else (len(peers) or width)
+            except ValueError:
+                tp = len(peers) or width
+            payload = {
+                "cache": values.get("GR8_CACHE") or "",
+                "model": values.get("MODEL") or "",
+                "tp": tp,
+                "rank": index,
+                "variant": variant,
+                "home": values.get("GR8_HOME") or "",
+                "peers": peers,
+                "node_ip": values.get("NODE_IP") or "",
+            }
+            try:
+                raw = self.remote(box, "python3 -c " + shlex.quote(self.weight_source), json.dumps(payload))
+                row = json.loads(raw)
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+                row = {"present": False, "size_gb": None, "rate_mb_s": None}
+            if not isinstance(row, dict):
+                row = {"present": False, "size_gb": None, "rate_mb_s": None}
+            return row
+
+        with ThreadPoolExecutor(max_workers=min(4, max(1, width))) as pool:
+            status = weights.aggregate(list(pool.map(one, enumerate(boxes))))
+        self._variant_cache[key] = (now, status)
+        return status
+
     def stop(self, model, emit):
         self.ensure_config()
         # Use the existing switch command's phase runner, not a second switch.
         actions = {box: [(model, "down")] for box in self.config.models[model].boxes}
         self.module.phase(self.config, actions, emit=emit)
 
-    def activate(self, model, emit):
+    def activate(self, model, emit, health_timeout=None):
         self.ensure_config()
         # Its exit status includes all-box start AND ready:true. Never claim ready from `up -d` alone.
         emit("gr8 switch: stop other deployments, start target, wait for health")
         args = [str(REPO / "gr8"), "switch", model, "@" + str(self.file)]
-        timeout = self.config.timeout + self.config.ssh_timeout * 4 + 30
+        health = float(self.config.timeout)
+        if health_timeout is not None:
+            # A confirmed variant download must outlive the stock health timeout.
+            health = max(health, float(health_timeout))
+            args = [str(REPO / "gr8"), "switch", "--timeout", str(int(math.ceil(health))), model, "@" + str(self.file)]
+        timeout = health + self.config.ssh_timeout * 4 + 30
         if self.runner is not subprocess.run:  # injectable offline adapter tests
             emit(self._run(args, timeout)[-16384:])
             return

@@ -102,8 +102,19 @@ The current preset is read from the keys that preset writes. An explicit
 **custom**, and so does any other combination, including mixed boxes.
 On DeepSeek, `EXACT` or one of the fast words above also shows **custom**.
 On GLM-5.3-Flash, `GR8_CP` in `EXTRA_ENV` shows **custom**. The confirm
-dialog lists each removal (`KEY=old`, then `KEY removed`). Every preset
-removes those keys. On GLM-5.3 the three presets are exclusive: Quality
+dialog lists each removal (`KEY=old`, then `KEY removed`). A preset that
+changes `VARIANT` (an unset `VARIANT` means home) first checks every box
+for that variant’s verified weight marker, the `complete/` file written
+after the rank’s weights are checked. A manifest alone does not count. If
+any box is missing them, the dialog says `needs a ~N GB download per box
+(~M min)` and **Restart now** confirms it. N is the variant size rounded
+to a gigabyte. M is that size divided by a measured fetch rate from the
+box logs; without a measured rate the minutes are omitted. A confirmed
+download extends the `gr8 switch` health wait by the download time, so
+the restart does not stop at the stock 900s timeout, and the operation
+log reports `downloading`.
+
+Every preset removes those keys. On GLM-5.3 the three presets are exclusive: Quality
 removes `KV_FORMAT`, Context removes `VARIANT`, and Speed removes both.
 Unset `TUNE` on DeepSeek or GLM-5.3-Flash is Speed, the recipe default.
 On GLM-5.3, the watched keys unset is Speed, because that is the launcher

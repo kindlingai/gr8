@@ -14,7 +14,7 @@ import time
 from urllib.request import urlopen
 from urllib.parse import urlsplit
 
-from . import envfile, metrics, presets
+from . import envfile, metrics, presets, weights
 from .control import ComposeControl
 
 DEFAULT_IDS = {"ds41": "deepseek-v4.1-flash", "glm53": "glm-5.3", "glm53f": "glm-5.3-flash"}
@@ -219,7 +219,23 @@ class Console:
             if len(variants) > 1:
                 mixed_keys.append(key)
         current = presets.classify(model, values) if rows and not mixed_keys else ("custom" if rows else None)
-        return dict(source=presets.SOURCE[model], presets=presets.public(model, values, mixed_keys), current=current,
+        shown = presets.public(model, values, mixed_keys)
+        if records and self.control:
+            seen = {}
+            for item in shown:
+                variant = weights.changed_variant(values, presets.changes_for(model, item["id"]), mixed_keys)
+                item["download"] = None
+                if not variant:
+                    continue
+                if variant not in seen:
+                    seen[variant] = self.control.variant_cache(model, variant, records)
+                status = seen[variant]
+                if not status.get("present"):
+                    item["download"] = weights.download_text(status.get("size_gb"), status.get("rate_mb_s"))
+        else:
+            for item in shown:
+                item["download"] = None
+        return dict(source=presets.SOURCE[model], presets=shown, current=current,
                     current_setting=presets.describe(model, values, bool(mixed_keys), current),
                     values=values, mixed=mixed_keys, revision=revision(records) if records else None,
                     observed=bool(records))
@@ -259,7 +275,8 @@ class Console:
                 self.job = dict(id=secrets.token_hex(8), action=action, model=model, status="running",
                                 started=time.time(), steps=[], error=None, can_restore=bool(backup_id), backup_id=backup_id)
                 self._save_job()
-                self.pool.submit(self._operate, action, model, changes, request.get("revision"), backup_id)
+                self.pool.submit(self._operate, action, model, changes, request.get("revision"), backup_id,
+                                 request.get("accept_download") is True)
                 return copy.deepcopy(self.job)
 
     def _restore(self, model, backup_id):
@@ -287,16 +304,56 @@ class Console:
             self.job["steps"] = self.job["steps"][-80:]
             self._save_job()
 
-    def _operate(self, action, model, changes, reviewed, backup_id=None):
+    def _health_budget(self):
+        config = getattr(self.control, "config", None)
+        timeout = getattr(config, "timeout", None) if config is not None else None
+        return float(timeout) if timeout else 900.0
+
+    def _watch_download(self, model, stop):
+        seen = set()
+        while not stop.wait(5):
+            controls = self.models.get(model, {}).get("controls") or []
+            if not controls:
+                continue
+            target = controls[0]
+            try:
+                data = self.call(target["host"], int(target.get("port", 7340)),
+                                 {"t": "logs", "which": "supervisor", "offset": -8192}).get("data") or ""
+            except (OSError, ValueError, TypeError):
+                continue
+            for line in data.splitlines():
+                if "MB/s" not in line or line in seen:
+                    continue
+                seen.add(line)
+                self._emit("downloading " + line[-500:])
+
+    def _operate(self, action, model, changes, reviewed, backup_id=None, accept_download=False):
         try:
             if action == "restore":
                 self._restore(model, backup_id)
+            download = None
             if changes:
                 if set(changes) - set(presets.keys_for(model)):
                     raise ValueError("unsupported setting")
                 records = self.control.read_all(model)
                 if revision(records) != reviewed:
                     raise ValueError("dotenv changed since review; refresh presets")
+                watched = presets.keys_for(model)
+                rows = [envfile.read_values(record["text"], watched, presets.engine_keys(model)) for record in records.values()]
+                merged, mixed = {}, []
+                for key in watched:
+                    variants = {row[key] for row in rows}
+                    merged[key] = next(iter(variants)) if len(variants) == 1 else None
+                    if len(variants) > 1:
+                        mixed.append(key)
+                variant = weights.changed_variant(merged, changes, mixed)
+                if variant:
+                    status = self.control.variant_cache(model, variant, records, refresh=True)
+                    if not status.get("present"):
+                        if not accept_download:
+                            raise ValueError("variant weights are not on every box; confirm the download")
+                        text = weights.download_text(status.get("size_gb"), status.get("rate_mb_s"))
+                        download = {"text": text, "health": self._health_budget() + weights.extra_seconds(status.get("size_gb"), status.get("rate_mb_s"))}
                 updated = {b: envfile.patch(r["text"], changes, presets.engine_keys(model)) for b, r in records.items()}
                 backup = self.state / (self.job["id"] + ".backup.json")
                 backup.write_text(json.dumps({"model": model, "records": records, "written": {b: envfile.digest(t) for b, t in updated.items()}}, indent=2))
@@ -328,7 +385,22 @@ class Console:
                 self._emit("Stopping target on every configured box")
                 self.control.stop(model, self._emit)
             if action in ("switch", "restart"):
-                self.control.activate(model, self._emit)
+                stop_watch = threading.Event()
+                watcher = None
+                if download:
+                    self._emit("downloading " + download["text"])
+                    self._emit(f"health wait extended to {download['health']:.0f}s for the download")
+                    watcher = threading.Thread(target=self._watch_download, args=(model, stop_watch), daemon=True)
+                    watcher.start()
+                try:
+                    if download:
+                        self.control.activate(model, self._emit, health_timeout=download["health"])
+                    else:
+                        self.control.activate(model, self._emit)
+                finally:
+                    if watcher:
+                        stop_watch.set()
+                        watcher.join(5)
                 # CLI checks ready; also ensure the endpoint is serving the selected identity.
                 row = self.models[model]
                 models = json.loads(self.get(row["head_url"] + "/v1/models"))
