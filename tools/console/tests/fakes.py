@@ -28,6 +28,11 @@ class Fixture:
         self.supervisor_log = ""   # the head log while gr8 switch runs (the boot of this operation)
         self.old_log = ""          # the head log before it: the old deployment's boot
         self.switching = False
+        self.new_up = True         # while switching: the target's supervisor answers (else the old deployment still does)
+        self.old_phase = 0         # seconds the old deployment keeps the control port after gr8 switch starts
+        self.race_log = ""         # lines the old deployment logs when gr8 switch starts (a crash-looping boot)
+        self.on_stop = None        # called inside stop(): the old deployment logs something before it goes down
+        self.live_id = None        # the model_id the head supervisor reports while switching
         self.activate_wait = 0
         self.calls = []
         self.texts = {m: {f"box-{i}": "# fixture dotenv\nSESS=4\nEXTRA_ENV='KEEP_ME=1'\n"
@@ -94,9 +99,11 @@ class Fixture:
             return {"t": "error", "error": "caller is not a member of this cluster"}
         if message["t"] == "status":
             return {"t": "status", "rank": 0, "state": "serving" if self.active else "stopped",
-                    "mem_gib": 20, "engine": bool(self.active), "model_id": self.active}
+                    "mem_gib": 20, "engine": bool(self.active), "model_id": self.live_id if self.switching else self.active}
         if message["t"] == "logs":
-            return {"t": "log", "data": "SYNTHETIC FIXTURE · not live measurements\nhealth ready · all ranks joined\n" + (self.supervisor_log if self.switching else self.old_log), "offset": 100}
+            # "@ID@" in a log is the model_id of the deployment that answers.
+            text = self.supervisor_log if self.switching and self.new_up else self.old_log
+            return {"t": "log", "data": "SYNTHETIC FIXTURE · not live measurements\nhealth ready · all ranks joined\n" + text.replace("@ID@", self.live_id or ""), "offset": 100}
         raise ValueError("unknown RPC")
 
     def read_all(self, model):
@@ -117,6 +124,8 @@ class Fixture:
 
     def stop(self, model, emit):
         self.calls.append(("stop", model))
+        if self.on_stop:
+            self.on_stop()
         self.active = None
         emit("fixture: down returned on all boxes")
 
@@ -134,9 +143,17 @@ class Fixture:
         self.calls.append(("switch", model, health_timeout))
         self.last_health_timeout = health_timeout
         self.switching = True
+        self.live_id, self.new_up = self.active, not self.old_phase
+        self.old_log += self.race_log
         try:
             if self.fail_boot:
                 raise RuntimeError("fixture readiness timeout")
+            if self.old_phase:
+                if abort is not None and abort.wait(self.old_phase):
+                    raise RuntimeError("switch command stopped: the engine failed to boot")
+                self.live_id, self.new_up = model, True
+            else:
+                self.live_id = model
             # A switch that is still waiting for health; the console ends it when it sees the engine fail.
             if self.activate_wait and abort is not None and abort.wait(self.activate_wait):
                 raise RuntimeError("switch command stopped: the engine failed to boot")

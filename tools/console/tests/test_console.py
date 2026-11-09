@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 
 from tools.console.server import envfile, metrics, presets, weights
 from tools.console.server.main import create_app
-from tools.console.server.service import Console, boot_failure, fetch, latest_epoch, rpc
+from tools.console.server.service import Console, boot_failure, fetch, latest_epoch, rpc, since_model_set
 from tools.console.tests.fakes import Fixture
 
 
@@ -683,8 +683,12 @@ class ServiceTests(unittest.TestCase):
 
     FAILED = "rank 1 (box2.example) failed: engine exited (2): g6: rank 1: 7.1 GiB left after the weights; lower --cap"
 
-    def supervisor_log(self, epoch, *lines):
-        return ("12:00:00 head: waiting for 3 hellos\n12:00:01 engine started (epoch %d); waiting for it to load (up to 1800s)\n" % epoch
+    MODEL_SET = "12:00:00 model set 0123456789abcdef from /models, variant home, id @ID@\n"
+
+    def supervisor_log(self, epoch, *lines, model_set=True):
+        # A boot of the deployment that answers: its model line, then the engine start and what followed.
+        return ("12:00:00 head: waiting for 3 hellos\n" + (self.MODEL_SET if model_set else "")
+                + "12:00:01 engine started (epoch %d); waiting for it to load (up to 1800s)\n" % epoch
                 + "".join("12:01:30 " + line + "\n" for line in lines))
 
     def test_engine_exit_ends_the_health_wait_and_shows_the_reason(self):
@@ -762,6 +766,69 @@ class ServiceTests(unittest.TestCase):
         job = self.done()
         self.assertEqual(job["status"], "failed")
         self.assertIn(self.FAILED, job["error"])
+
+    def test_restart_reads_the_baseline_after_the_stop(self):
+        # The old deployment crash-loops. It starts a boot while the stop runs and logs that boot's exit.
+        # That boot is older than the restart, so it must not end the health wait of the new one.
+        self.console.watch_interval = 0.02
+        self.fake.activate_wait = 0.6
+        now = int(time.time())
+        self.fake.old_log = self.supervisor_log(now - 600)
+
+        def old_boot_starts():
+            self.fake.old_log += self.supervisor_log(now - 3, "engine exited (1): peer closed", model_set=False)
+            self.fake.supervisor_log = self.fake.old_log   # what the head log holds when the restart begins
+
+        self.fake.on_stop = old_boot_starts
+        self.console.submit(self.request())
+        job = self.done()
+        self.assertEqual(job["status"], "succeeded", job)
+        self.assertFalse([step for step in job["steps"] if step.startswith("Boot failed")])
+        # A boot that starts after the stop and fails is still reported.
+        self.fake.activate_wait = 30
+        self.fake.on_stop = None
+        self.fake.old_log = self.supervisor_log(now - 600)
+        self.fake.supervisor_log = self.fake.old_log + self.supervisor_log(int(time.time()) + 1, self.FAILED, model_set=False)
+        self.console.submit(self.request())
+        job = self.done()
+        self.assertEqual(job["status"], "failed")
+        self.assertIn(self.FAILED, job["error"])
+
+    def test_switch_trusts_the_log_only_after_the_target_answers(self):
+        # The control port is shared. For the first 0.4 s the old deployment (glm53) still answers, and its
+        # crash-looping boot (epoch after the baseline) exits. That is not the target's boot.
+        self.console.watch_interval = 0.02
+        now = int(time.time())
+        self.fake.old_log = self.supervisor_log(now - 600)
+        self.fake.race_log = self.supervisor_log(now + 1, "engine exited (1): peer closed", model_set=False)
+        self.fake.old_phase = 0.4
+        # After the target's supervisor answers, its log has the old lines, then its own model line and nothing else yet.
+        self.fake.supervisor_log = self.fake.old_log + self.fake.race_log + "12:05:00 model set fedcba9876543210 from /models, variant home, id @ID@\n"
+        self.fake.activate_wait = 0.6
+        self.console.submit(dict(action="switch", model="ds41", confirm=True, expect_active="glm53"))
+        job = self.done()
+        self.assertEqual(job["status"], "succeeded", job)
+        self.assertFalse([step for step in job["steps"] if step.startswith("Boot failed")], job["steps"])
+        # The target's own boot fails: reported, with its reason.
+        self.fake.active = "glm53"
+        self.fake.old_log, self.fake.race_log, self.fake.activate_wait = self.supervisor_log(now - 600), "", 30
+        self.fake.supervisor_log = (self.fake.old_log + self.supervisor_log(now + 1, "engine exited (1): peer closed", model_set=False)
+                                    + self.supervisor_log(int(time.time()) + 2, self.FAILED))
+        self.console.submit(dict(action="switch", model="ds41", confirm=True, expect_active="glm53"))
+        job = self.done()
+        self.assertEqual(job["status"], "failed")
+        self.assertIn(self.FAILED, job["error"])
+        self.assertNotIn("peer closed", job["error"])
+
+    def test_log_lines_before_the_targets_model_line_are_not_its_boot(self):
+        model_set = "12:05:00 model set fedcba9876543210 from /models, variant home, id aaaabbbbccccdddd\n"
+        old = "12:00:00 model set 0123456789abcdef from /models, variant home, id 1111222233334444\n12:00:01 engine started (epoch 5)\n"
+        self.assertEqual(since_model_set(old + model_set + "12:05:01 engine started (epoch 9)\n", "aaaabbbbccccdddd-more-id"),
+                         "12:05:01 engine started (epoch 9)\n")
+        self.assertEqual(since_model_set(old + model_set, "aaaabbbbccccdddd"), "")
+        self.assertIsNone(since_model_set(old, "aaaabbbbccccdddd"))
+        self.assertIsNone(since_model_set(old + model_set, "9999999999999999"))
+        self.assertEqual(since_model_set(old + model_set + old, "1111222233334444"), "12:00:01 engine started (epoch 5)\n")
 
     def test_controls_disabled_and_confirmation_required(self):
         with self.assertRaises(ValueError):

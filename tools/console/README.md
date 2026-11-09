@@ -150,9 +150,16 @@ later retry: the supervisor stops the whole cluster on the first exit, and
 the boxes may keep restarting the engine, so inspect them before you try
 again. A failure line counts only for a boot whose `engine started (epoch E)` line
 is newer than the last one in the log before the operation stopped anything,
-so lines left by an earlier boot never stop a new one. If no supervisor
-answered before the stop, a boot counts when it began in the second the
-operation began or later.
+so lines left by an earlier boot never stop a new one. The console reads
+that last epoch after the stop, because an old deployment that crash-loops can
+start a boot before it is stopped. If no supervisor answered, a boot counts
+when it began in the second the operation began or later. All models share one
+control port, so until `gr8 switch` downs the old deployment, the log is its
+log. The console counts a failure only once the supervisor status shows a
+`model_id` other than the old deployment's, and only for boots after the log
+line `model set ... id <model_id>` of that deployment. If the old deployment
+still answers with the same `model_id` (a restart whose stop left it up), no
+failure ends the wait early and the health timeout applies.
 
 Every preset removes the keys it lists. On GLM-5.3 the three presets are exclusive: Quality
 removes `KV_FORMAT`, Context removes `VARIANT`, and Speed removes both.

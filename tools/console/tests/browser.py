@@ -171,8 +171,9 @@ def run(output):
             reason = "rank 1 (box2.example) failed: engine exited (2): g6: rank 1: 7.1 GiB left after the weights; lower --cap"
             console.watch_interval = 0.1
             fixture.activate_wait = 60
-            fixture.old_log = f"12:00:01 engine started (epoch {int(time.time()) - 600}); waiting for it to load (up to 1800s)\n"
-            fixture.supervisor_log = (f"12:00:01 engine started (epoch {int(time.time())}); waiting for it to load (up to 1800s)\n"
+            model_set = "12:00:00 model set 0123456789abcdef from /models, variant home, id @ID@\n"
+            fixture.old_log = model_set + f"12:00:01 engine started (epoch {int(time.time()) - 600}); waiting for it to load (up to 1800s)\n"
+            fixture.supervisor_log = (model_set + f"12:00:01 engine started (epoch {int(time.time())}); waiting for it to load (up to 1800s)\n"
                                       f"12:01:09 {reason}\n")
             row.get_by_role("button", name="Switch", exact=True).click()
             page.get_by_role("button", name="Switch now", exact=True).click()

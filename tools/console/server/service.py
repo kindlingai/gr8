@@ -46,6 +46,8 @@ STARTED = re.compile(r"engine started \(epoch (\d+)\)")
 # Supervisor log lines are "HH:MM:SS text". The head logs these when an engine, its front end, or its
 # shim exits; a worker rank's exit reaches the head as "rank N (peer) failed: ...".
 FAILED = re.compile(r"^\d\d:\d\d:\d\d (rank \d+ \([^)]*\) failed: .+|(?:engine|front end|shim) exited \(.+)$")
+# supervisor.py logs this line when it resolves the model of a boot; status model_id starts with the same 16 characters.
+MODEL_SET = re.compile(r"^\d\d:\d\d:\d\d model set \S+ from .*, variant .*, id (\S+)\s*$")
 WATCH_WINDOW = 262144  # bytes read from the end of the head supervisor log
 CAP_KEYS = ("KV_FORMAT", "CAP", "TP")  # read for the GLM-5.3 CAP rescale; CAP is not a preset key
 
@@ -54,6 +56,19 @@ def latest_epoch(text):
     """The epoch of the last "engine started" line in this log text, or None."""
     found = STARTED.findall(text)
     return int(found[-1]) if found else None
+
+
+def since_model_set(text, model_id):
+    """The log text after the last "model set ... id <model_id[:16]>" line, or None when that line is not in it.
+
+    The head log holds lines of the deployment that was running before this operation. Those come before the
+    line the target's supervisor writes when it resolves its model, so only the text after it is the target's."""
+    lines = text.splitlines(keepends=True)
+    for index in range(len(lines) - 1, -1, -1):
+        found = MODEL_SET.match(lines[index])
+        if found and found.group(1) == model_id[:16]:
+            return "".join(lines[index + 1:])
+    return None
 
 
 def boot_failure(text, after):
@@ -359,22 +374,40 @@ class Console:
             return None
         return data if isinstance(data, str) else None
 
+    def _head_model_id(self, model):
+        """The model_id the head supervisor reports in its status, or None when none answers or it has none yet."""
+        controls = self.models.get(model, {}).get("controls") or []
+        if not controls:
+            return None
+        target = controls[0]
+        try:
+            value = self.call(target["host"], int(target.get("port", 7340)), {"t": "status"}).get("model_id")
+        except (OSError, ValueError, TypeError):
+            return None
+        return value if isinstance(value, str) and value else None
+
     def _boot_baseline(self, model):
         """The epoch of the latest engine start already in the head log, read before this operation stops
         anything. Only a later epoch is a boot of this operation."""
         data = self._head_log(model)
         return latest_epoch(data) if data else None
 
-    def _watch_boot(self, model, stop, abort, failure, after, download):
+    def _watch_boot(self, model, stop, abort, failure, after, download, old_id=None):
         """While a switch waits for health: log fetch-rate lines (a download), and stop the wait when the
         head supervisor reports that the engine of this boot exited. The boxes then keep restarting it, and
-        the health wait would only run out its full timeout."""
+        the health wait would only run out its full timeout.
+
+        The control port is shared by all models, so until gr8 switch downs the old deployment, the log and
+        the status are its. A failure counts only when the status model_id is not the old deployment's (old_id,
+        read before the switch) and the failing boot follows the target's own "model set" line in the log."""
         seen = set()
         while not stop.wait(self.watch_interval):
+            current = self._head_model_id(model)
             data = self._head_log(model)
             if not data:
                 continue
-            reason = boot_failure(data, after)
+            mine = since_model_set(data, current) if current and current != old_id else None
+            reason = boot_failure(mine, after) if mine else None
             if reason:
                 failure.append(reason)
                 self._emit("Boot failed: " + reason)
@@ -450,13 +483,17 @@ class Console:
                 with self.lock:
                     self.job.update(can_restore=True, backup_id=self.job["id"])
                     self._save_job()
-            # The log still holds the boot of the old deployment. Read its last epoch before the stop.
-            baseline = self._boot_baseline(model) if action in ("switch", "restart") else None
             if action in ("stop", "restart"):
                 self._emit("Stopping target on every configured box")
                 self.control.stop(model, self._emit)
             if action in ("switch", "restart"):
                 stop_watch, abort, failure = threading.Event(), threading.Event(), []
+                # Read after the stop: an old deployment that crash-loops can start a boot between an earlier
+                # read and its stop. The log still holds its boots; only a later epoch is a boot of this operation.
+                # The status model_id is the deployment that answers now: a switch trusts the log only once another
+                # one answers. Nothing answering (the usual case after a stop) gives no baseline and no old id.
+                baseline = self._boot_baseline(model)
+                old_id = self._head_model_id(model)
                 # No baseline (no supervisor answered): count a boot only if it began in this second or later.
                 after = baseline if baseline is not None else int(time.time()) - 1
                 if download:
@@ -464,7 +501,7 @@ class Console:
                     self._emit(f"health wait extended to {download['health']:.0f}s for the download")
                 elif notice:
                     self._emit(notice)
-                watcher = threading.Thread(target=self._watch_boot, args=(model, stop_watch, abort, failure, after, bool(download)), daemon=True)
+                watcher = threading.Thread(target=self._watch_boot, args=(model, stop_watch, abort, failure, after, bool(download), old_id), daemon=True)
                 watcher.start()
                 try:
                     self.control.activate(model, self._emit, health_timeout=download["health"] if download else None, abort=abort)
