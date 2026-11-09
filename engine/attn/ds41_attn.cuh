@@ -1602,9 +1602,14 @@ inline int g_tc_mfast = 0;   // launch order (GR8_DS_ATTN_TC_MF, default 0 = N t
 constexpr size_t TC_MF_AUTO_BYTES = (size_t)100 << 20;   // fp8 weight bytes N * K * groups; between the largest attention weight (10.5 MB) and the Engram wkv (157 MB), clear of the 78.6 MB DSpark main_proj that nobody has timed at M > 128
 inline bool tc_mfast_pick(int mode, int N, int K, int groups, unsigned mt) { return mode == 1 || (mode == 2 && mt >= 2 && (size_t)N * K * groups >= TC_MF_AUTO_BYTES); }
 inline bool tc_ok(const GemmP& p) { return p.K % 128 == 0 && p.N % 64 == 0 && p.lda % 16 == 0 && p.lsa % 4 == 0 && p.M >= 1; }
+#include "ds41_gemm_persist.cuh"
 inline int g_tc_tile = 0;   // GR8_DS_ATTN_TC_TILE (default 0): 1 = launch_gemm_tc's 128 x 128 tile runs as k_gemm_mx8t_sw <128,128,3> (swizzled 128-B rows, a 3-deep ring)
                             // in place of k_gemm_mx8t <128,128,2>. The same Y bits (same mma, same K order per output; tests/ds41_gemm_tc_bench.cu). Falls back to 0 when
                             // the device cannot give a block 3 x 33792 B of smem.
+                            // 2 = the same tile as k_gemm_persist_ldm_epi_bid (ds41_gemm_persist.cuh): persistent CTAs, ldmatrix fragments, a staged 16-B epilogue; the same Y bits
+                            // (tests/ds41_gemm_persist_test.cu). Takes tile 1 instead (which itself falls back to 0) when the grid order is M-fastest (GR8_DS_ATTN_TC_MF), when
+                            // Y or its strides are not 16-B aligned, or when the 3 x 33792 B of smem cannot be had.
+inline int g_tc_persist_grid = 0;   // TEST HOOK, not a served knob (no GR8_ name, not in knobs/): > 0 caps the persistent grid at that many CTAs so a test makes each CTA walk several tiles; 0 = the SM count.
 template <int BM, int BN, int ST> inline bool launch_tc_sw(const GemmP& p, int groups, cudaStream_t st)
 {
     static const bool ok = []
@@ -1623,6 +1628,42 @@ template <int BM, int BN, int ST> inline bool launch_tc_sw(const GemmP& p, int g
     const unsigned nt = p.N / BN, mt = (p.M + BM - 1) / BM;
     q.mfast = tc_mfast_pick(g_tc_mfast, p.N, p.K, groups, mt) ? 1 : 0;
     k_gemm_mx8t_sw<BM, BN, ST><<<q.mfast ? dim3(mt, nt, groups) : dim3(nt, mt, groups), 256, TcCfgSw<BM, BN, ST>::SMEM, st>>>(q);
+    return true;
+}
+// SM count of the current device, queried once a device (host only, no sync, legal while a stream is captured).
+inline int tc_sm_count()
+{
+    static int cache[16];   // 0 = not queried yet; a benign race: every writer stores the same value
+    int dev = 0, n = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void)cudaGetLastError(); return 1; }
+    if (dev >= 0 && dev < 16 && cache[dev] > 0) return cache[dev];
+    if (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || n < 1) { (void)cudaGetLastError(); return 1; }
+    if (dev >= 0 && dev < 16) cache[dev] = n;
+    return n;
+}
+// GR8_DS_ATTN_TC_TILE=2: k_gemm_persist_ldm_epi_bid. false = nothing was launched (the caller takes tile 1).
+template <int BM, int BN, int ST> inline bool launch_tc_persist(const GemmP& p, int groups, cudaStream_t st)
+{
+    static const bool ok = []
+    {   // first use, host only (no sync): one line a rank so a boot check can see the tile ran or fell back
+        const cudaError_t e = cudaFuncSetAttribute(k_gemm_persist_ldm_epi_bid<BM, BN, ST>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)TcCfgSw<BM, BN, ST>::SMEM);
+        if (e == cudaSuccess) fprintf(stderr, "# DS41 GR8_DS_ATTN_TC_TILE=2: persistent tile active\n");
+        else
+        {
+            (void)cudaGetLastError();
+            fprintf(stderr, "# DS41 GR8_DS_ATTN_TC_TILE=2: FELL BACK to tile 1 (cudaFuncSetAttribute %zu B smem: rc %d %s)\n", TcCfgSw<BM, BN, ST>::SMEM, (int)e, cudaGetErrorString(e));
+        }
+        return e == cudaSuccess;
+    }();
+    if (!ok) return false;
+    const long nt = p.N / BN, mt = (p.M + BM - 1) / BM;
+    // the walk is N tile fastest: M-fastest launch order (GR8_DS_ATTN_TC_MF) goes to tile 1. The 16-B epilogue stores need 16-B aligned chunks of every Y row.
+    if (tc_mfast_pick(g_tc_mfast, p.N, p.K, groups, (unsigned)mt)) return false;
+    if (!(p.N % BN == 0 && p.K % 128 == 0 && p.ldy % 8 == 0 && (groups <= 1 || p.y_gs % 8 == 0) && ((uintptr_t)p.Y % 16) == 0)) return false;
+    GemmP q = p;
+    q.mfast = 0;
+    const long tiles = nt * mt * groups, cap = g_tc_persist_grid > 0 ? g_tc_persist_grid : tc_sm_count();
+    k_gemm_persist_ldm_epi_bid<BM, BN, ST><<<(unsigned)(tiles < cap ? tiles : cap), 256, TcCfgSw<BM, BN, ST>::SMEM, st>>>(q, groups);
     return true;
 }
 template <int BM, int BN, int ST> inline void launch_tc_t(const GemmP& p, int groups, cudaStream_t st)
@@ -1649,7 +1690,7 @@ inline void launch_gemm_tc(const GemmP& p, int groups, cudaStream_t st)
     if (BM == 128)
     {
         if (!wide) launch_tc_t<128, 64, 3>(p, groups, st);
-        else if (!(g_tc_tile == 1 && launch_tc_sw<128, 128, 3>(p, groups, st))) launch_tc_t<128, 128, 2>(p, groups, st);
+        else if (!(g_tc_tile == 2 && launch_tc_persist<128, 128, 3>(p, groups, st)) && !(g_tc_tile >= 1 && launch_tc_sw<128, 128, 3>(p, groups, st))) launch_tc_t<128, 128, 2>(p, groups, st);
     }
     else if (BM == 64) { if (wide) launch_tc_t<64, 128, 3>(p, groups, st); else launch_tc_t<64, 64, 3>(p, groups, st); }
     else launch_tc_t<32, 64, 3>(p, groups, st);

@@ -272,7 +272,7 @@ inline int ds41_attn_bind(void* model, int i, int capacity, void* stream)
             ds41_attn_set_tc(tc);
             if (tc) fprintf(stderr, "DS41 attention tensor-core GEMM: GR8_DS_ATTN_TC=1 (M >= 9)\n");
             ds41_attn_set_tc_mfast((int)knob::ds_attn_tc_mf());   // that GEMM's launch order: 0 = N tile fastest (default), 1 = M tile fastest, 2 = auto (M tile fastest only for a weight >= 100 MB)
-            ds41_attn_set_tc_tile((int)knob::ds_attn_tc_tile());   // that GEMM's 128 x 128 tile: 0 = 2-deep ring (default), 1 = 3-deep swizzled ring; the same bits
+            ds41_attn_set_tc_tile((int)knob::ds_attn_tc_tile());   // that GEMM's 128 x 128 tile: 0 = 2-deep ring (default), 1 = 3-deep swizzled ring, 2 = its persistent form; the same bits
             ds41_attn_set_comp_fp8(knob::ds_comp_fp8());   // default off; BF16 compressor weight prepack, lossy
             if (!g_ds41_attn_pw) ds41_attn_set_prefill_rows((int)knob::ds_attn_pw());
             g_ds41_src_fast = (int)knob::ds_src_fast();
