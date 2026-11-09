@@ -200,6 +200,8 @@ inline void enqueue(State& s,Coll coll,const WireLayout& w,bool scatter) {
 inline void init(State& s,g6::Fabric& f,cudaStream_t st) {
     require(!s.live,"state initialized twice");
     s.fabric=&f; s.wire=f.dev(); s.st=st;
+    s.attn_pipe=AttnPipe{};
+    s.attn_pipe.on=knob::ds_pf_v2_attn_pipe();
     s.widths=CommWidths{};
     require(CommWidths::decode(knob::ds_pf_v2_rs_blocks(),s.widths.rs),
         "GR8_DS_PF_V2_RS_BLOCKS needs 0 or positive int block counts");

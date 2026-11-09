@@ -193,3 +193,6 @@ void ds41_v2_output_sum(const void* parts, void* out, int n, int q, int nr, void
     ds41a::v2::sum_output((const ds41a::bf16*)parts, (ds41a::bf16*)out, n, q, nr, (cudaStream_t)st);
 }
 }
+
+// Request-scoped, v2 prefill only; the caller resets this before stock replay/decode.
+extern "C" void ds41_attn_set_pipe(int on) { ds41a::g_attn_pipe = on != 0; }
