@@ -285,6 +285,8 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
         || p.thinking_presence_penalty != 0.0
         || p.thinking_frequency_penalty != 0.0
         || p.think_end_boost.is_some()
+        || p.seq_thinking.is_some()
+        || p.seq_answer.is_some()
     {
         b.extend_from_slice(b",\"presence_penalty\":");
         pyjson::float(b, p.presence_penalty);
@@ -511,6 +513,9 @@ mod tests {
             v["sequence_penalty"],
             serde_json::json!({"thinking": {"mult": 0.8, "base": 1.75, "min": 4, "cap": 6.0}})
         ); // the guard waits for a retry
+        let sp = GenParams { seq_thinking: Some(t), think_end: Some(154842), ..p.clone() };
+        let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &sp)[4..]).unwrap();
+        assert_eq!((v["presence_penalty"].as_f64(), v["think_end"].as_u64()), (Some(0.0), Some(154842)));
         let sp = GenParams { seq_guard: Some(g), seq_avoid: vec![5, 6], ..p.clone() };
         let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &sp)[4..]).unwrap();
         assert_eq!(

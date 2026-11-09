@@ -254,6 +254,12 @@ class UnitTests(unittest.TestCase):
         body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': {'thinking': sp['thinking']}}, 0)
         self.assertIn(b' seqt 0.8:1.75:4:6.0\n', body)
         self.assertNotIn(b'seqg', body)
+        # with the think block's close, pen carries it for the scopes even with every penalty 0; the scopes' min stays
+        # out of min_tokens
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'think_end': 154842,
+                                          'sequence_penalty': {'thinking': sp['thinking']}}, 0)
+        self.assertIn(b' min 0 ', body)
+        self.assertIn(b' top_p 1.0 pen 0.0 0.0 0.0 0.0 154842 seqt 0.8:1.75:4:6.0\n', body)
         self.assertNotIn(b'seq', g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': {
             'thinking': dict(sp['thinking'], mult=0)}}, 0)[0])
         for bad in ('x', {'thinking': dict(sp['thinking'], base=0.5)}, {'thinking': dict(sp['thinking'], min=0)},
