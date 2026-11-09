@@ -1,0 +1,7 @@
+{
+  "name": "fc2_down_tc",
+  "header": "adapter.cuh",
+  "variants_dir": "variants",
+  "case_generator": "cases.py",
+  "defines": []
+}

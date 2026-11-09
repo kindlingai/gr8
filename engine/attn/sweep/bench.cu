@@ -19,15 +19,32 @@
 #define SWEEP_REFERENCE_HAS_SETUP 0
 #endif
 #undef SWEEP_VARIANT_HAS_SETUP
+// Opt-in occupancy columns: a variant header defines SWEEP_VARIANT_HAS_BLOCK_THREADS 1 and
+// `inline int block_threads(const sweep_adapter::Params&)`. Captured per header exactly like SETUP.
+#if defined(SWEEP_VARIANT_HAS_BLOCK_THREADS) && SWEEP_VARIANT_HAS_BLOCK_THREADS
+#define SWEEP_REFERENCE_HAS_BLOCK_THREADS 1
+#else
+#define SWEEP_REFERENCE_HAS_BLOCK_THREADS 0
+#endif
+#undef SWEEP_VARIANT_HAS_BLOCK_THREADS
 #if SWEEP_SAME_VARIANT
 namespace sweep_variant = sweep_reference;
 #define SWEEP_VARIANT_HAS_SETUP SWEEP_REFERENCE_HAS_SETUP
+#define SWEEP_VARIANT_HAS_BLOCK_THREADS SWEEP_REFERENCE_HAS_BLOCK_THREADS
 #else
 #include SWEEP_VARIANT_HEADER
 #endif
 #ifndef SWEEP_VARIANT_HAS_SETUP
 #define SWEEP_VARIANT_HAS_SETUP 0
 #endif
+#ifndef SWEEP_VARIANT_HAS_BLOCK_THREADS
+#define SWEEP_VARIANT_HAS_BLOCK_THREADS 0
+#endif
+#ifndef SWEEP_ADAPTER_HAS_ROW_MASK
+#define SWEEP_ADAPTER_HAS_ROW_MASK 0
+#endif
+// Output poison patterns. Written by this file only; the row-mask compare below relies on them.
+constexpr unsigned char SWEEP_POISON_REF=0xA5,SWEEP_POISON_CAND=0x5A;
 static void check(cudaError_t e) {
     if(e!=cudaSuccess) {
         fprintf(stderr,"%s: %s\n",e==cudaErrorMemoryAllocation?"LOW_MEMORY":"CUDA_ERROR",cudaGetErrorString(e));
@@ -53,6 +70,22 @@ __global__ void sweep_count_bytes(const unsigned char* a,const unsigned char* b,
     for(int step=128;step;step>>=1){if(threadIdx.x<step)sums[threadIdx.x]+=sums[threadIdx.x+step];__syncthreads();}
     if(!threadIdx.x && sums[0])atomicAdd(bad,sums[0]);
 }
+#if SWEEP_ADAPTER_HAS_ROW_MASK
+// Opt-in compare for kernels that legitimately leave rows unwritten (masked-out rows). Live rows (live[r]!=0)
+// must match byte for byte. Dead rows must still hold the harness poison in BOTH buffers: a write to a row the
+// reference never writes is a mismatch, never silently ignored.
+__global__ void sweep_count_rows(const unsigned char* a,const unsigned char* b,const unsigned char* live,size_t rows,size_t row_bytes,unsigned long long* bad) {
+    unsigned long long count=0;__shared__ unsigned long long sums[256];
+    for(size_t r=blockIdx.x;r<rows;r+=gridDim.x) {
+        const unsigned char* x=a+r*row_bytes;const unsigned char* y=b+r*row_bytes;
+        if(live[r]){for(size_t i=threadIdx.x;i<row_bytes;i+=blockDim.x)count+=x[i]!=y[i];}
+        else{for(size_t i=threadIdx.x;i<row_bytes;i+=blockDim.x)count+=(x[i]!=SWEEP_POISON_REF)+(y[i]!=SWEEP_POISON_CAND);}
+    }
+    sums[threadIdx.x]=count;__syncthreads();
+    for(int step=128;step;step>>=1){if(threadIdx.x<step)sums[threadIdx.x]+=sums[threadIdx.x+step];__syncthreads();}
+    if(!threadIdx.x && sums[0])atomicAdd(bad,sums[0]);
+}
+#endif
 static double avg(const std::vector<double>& x) { double s=0;for(double v:x)s+=v;return s/x.size(); }
 static double sd(const std::vector<double>& x) { if(x.size()<2)return 0;double m=avg(x),s=0;for(double v:x)s+=(v-m)*(v-m);return sqrt(s/(x.size()-1)); }
 static void array_json(const char* name,const std::vector<double>& a) {
@@ -91,11 +124,21 @@ int main(int argc,char** argv) {
     check(sweep_variant::init(p0));
 #endif
     cudaFuncAttributes attr{};check(cudaFuncGetAttributes(&attr,sweep_variant::kernel(p0)));
+    int occupancy_blocks=-1,occupancy_threads=0;
+#if SWEEP_VARIANT_HAS_BLOCK_THREADS
+    occupancy_threads=sweep_variant::block_threads(p0);
+    check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy_blocks,sweep_variant::kernel(p0),occupancy_threads,sweep_variant::dynamic_smem(p0)));
+#endif
     cudaStream_t st;check(cudaStreamCreateWithFlags(&st,cudaStreamNonBlocking));
     GuardedScratch bad,flush;bad.alloc(sizeof(unsigned long long));if(flush_bytes)flush.alloc(flush_bytes);
     cudaEvent_t begin,end;check(cudaEventCreate(&begin));check(cudaEventCreate(&end));
     size_t mismatch=0,timed_mismatch=0,integrity_errors=0,checks=0,timed_checks=0,stream_ready=0,stream_pending=0;
     const size_t bytes=sweep_adapter::output_bytes(fixtures[0]);
+#if SWEEP_ADAPTER_HAS_ROW_MASK
+    const size_t row_bytes=sweep_adapter::row_bytes(fixtures[0]);
+    if(!row_bytes||bytes%row_bytes)throw std::runtime_error("row-mask adapter: output_bytes must be a nonzero multiple of row_bytes");
+    for(auto& f:fixtures)if(sweep_adapter::output_bytes(f)!=bytes)throw std::runtime_error("row-mask adapter: every fixture must have equal output_bytes");
+#endif
     auto query=[&] {
         const cudaError_t q=cudaStreamQuery(st);
         // A short kernel can legitimately finish before the host queries it. Enqueue proof is graph validation below.
@@ -123,11 +166,17 @@ int main(int argc,char** argv) {
     auto verify=[&](int input,int output,bool timed) {
         auto& f=fixtures[input];auto& dst=fixtures[output];
         auto ref=sweep_adapter::params_with_output(f,dst,true);
-        check(cudaMemsetAsync(sweep_adapter::output(dst,true),0xA5,bytes,st));
+        check(cudaMemsetAsync(sweep_adapter::output(dst,true),SWEEP_POISON_REF,bytes,st));
         setup(true,ref);launch(true,ref); // Fresh reference on the current immutable inputs, never a saved first result.
         check(cudaMemsetAsync(bad.data(),0,sizeof(unsigned long long),st));
+#if SWEEP_ADAPTER_HAS_ROW_MASK
+        // Live mask belongs to the INPUT fixture's routing; both poisoned outputs belong to the output slot.
+        sweep_count_rows<<<256,256,0,st>>>((const unsigned char*)sweep_adapter::output(dst,true),
+            (const unsigned char*)sweep_adapter::output(dst,false),sweep_adapter::row_live(f),bytes/row_bytes,row_bytes,(unsigned long long*)bad.data());
+#else
         sweep_count_bytes<<<256,256,0,st>>>((const unsigned char*)sweep_adapter::output(dst,true),
             (const unsigned char*)sweep_adapter::output(dst,false),bytes,(unsigned long long*)bad.data());
+#endif
         check(cudaGetLastError());check(cudaStreamSynchronize(st));
         unsigned long long n=0;check(cudaMemcpy(&n,bad.data(),sizeof(n),cudaMemcpyDeviceToHost));
         mismatch=std::max(mismatch,size_t(n));if(timed)timed_mismatch=std::max(timed_mismatch,size_t(n));
@@ -140,7 +189,7 @@ int main(int argc,char** argv) {
     for(int call=0;call<2*slots;++call) {
         int in=call%pools,out=(call+1)%slots;prepare(in,seed+call+1);
         auto p=sweep_adapter::params_with_output(fixtures[in],fixtures[out],false);
-        check(cudaMemsetAsync(sweep_adapter::output(fixtures[out],false),0x5A,bytes,st));
+        check(cudaMemsetAsync(sweep_adapter::output(fixtures[out],false),SWEEP_POISON_CAND,bytes,st));
         setup(false,p);launch(false,p);verify(in,out,false);
     }
     // Validate actual enqueued kernel identity on the supplied nonblocking stream.
@@ -171,14 +220,14 @@ int main(int argc,char** argv) {
             check(cudaEventRecord(begin,st));setup(reference,p);us+=elapsed();
         }
         for(int j=0;j<amortize;++j){int out=(out0+j)%slots;p=sweep_adapter::params_with_output(fixtures[in],fixtures[out],reference);
-            check(cudaMemsetAsync(sweep_adapter::output(fixtures[out],reference),reference?0xA5:0x5A,bytes,st));
+            check(cudaMemsetAsync(sweep_adapter::output(fixtures[out],reference),reference?SWEEP_POISON_REF:SWEEP_POISON_CAND,bytes,st));
             flush_cache();check(cudaEventRecord(begin,st));launch(reference,p);us+=elapsed();
             if(!reference && sample)verify(in,out,true);
         }
         return us/amortize;
     };
     for(int i=0;i<warmup;++i){int in=i%pools;prepare(in,seed+(++sequence));auto p=sweep_adapter::params(fixtures[in],false);
-        check(cudaMemsetAsync(sweep_adapter::output(fixtures[in],false),0x5A,bytes,st));setup(false,p);launch(false,p);}
+        check(cudaMemsetAsync(sweep_adapter::output(fixtures[in],false),SWEEP_POISON_CAND,bytes,st));setup(false,p);launch(false,p);}
     check(cudaStreamSynchronize(st));
     std::vector<double> samples,reference_samples,paired,nulls;
     for(int r=0;r<reps;++r){double cand=0,ref=0;
@@ -201,6 +250,10 @@ int main(int argc,char** argv) {
         attr.numRegs,attr.localSizeBytes,attr.sharedSizeBytes,sweep_variant::dynamic_smem(p0),sweep_variant::ptxas_key(p0),prop.name,prop.major,prop.minor,
         pools,slots,checks,timed_checks,stream_ready,stream_pending,launch_valid?"true":"false",kernel_nodes,main_nodes,flush_bytes,prop.l2CacheSize,amortize,
         SWEEP_VARIANT_HAS_SETUP?"true":"false",flush_bytes?"-explicit-flush":"");
+    printf(",\"compare_mode\":\"%s\"",SWEEP_ADAPTER_HAS_ROW_MASK?"live-rows-exact-dead-rows-pristine":"full-output-memcmp");
+    if(SWEEP_VARIANT_HAS_BLOCK_THREADS)
+        printf(",\"block_threads\":%d,\"max_active_blocks_per_sm\":%d,\"max_threads_per_sm\":%d,\"occupancy_pct\":%.4f",
+            occupancy_threads,occupancy_blocks,prop.maxThreadsPerMultiProcessor,100.0*occupancy_blocks*occupancy_threads/prop.maxThreadsPerMultiProcessor);
     #if SWEEP_ADAPTER_HAS_METADATA
     printf(",\"adapter_metadata\":%s",sweep_adapter::metadata_json(fixtures[0]).c_str());
 #endif

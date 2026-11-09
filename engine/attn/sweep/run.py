@@ -258,7 +258,9 @@ def aggregate_runs(raw, pairs, cases, variants, reference, adaptive_ci=0):
                            # Preserve sd_us as mean within-process rep SD, clearly labelled.
                            sd_us=statistics.mean(r["sd_us"] for r in runs), regime=regimes.pop(),
                            between_run_sd_us=statistics.stdev(r["mean_us"] for r in runs) if len(runs)>1 else None)
-                for key in ("regs", "ptxas_regs", "stack_bytes", "spill_store_bytes", "spill_load_bytes", "dynamic_smem", "local_bytes", "mismatch_bytes"):
+                for key in ("regs", "ptxas_regs", "stack_bytes", "spill_store_bytes", "spill_load_bytes", "dynamic_smem", "local_bytes", "mismatch_bytes",
+                            # static_smem and the occupancy block are emitted only when the variant opts in (SWEEP_VARIANT_HAS_BLOCK_THREADS)
+                            "static_smem", "block_threads", "max_active_blocks_per_sm", "occupancy_pct", "compare_mode"):
                     if key in runs[0] and all(r.get(key) == runs[0][key] for r in runs):
                         row[key] = runs[0][key]
                 row["null_band_verdict"] = "UNAVAILABLE"
@@ -314,6 +316,7 @@ def write_tables(out, rows, cases, variants, reference, kernel):
     labels = sorted({k for c in cases for k in c.get("weights", {})}, key=lambda x: sum(c.get("weights", {}).get(x, 0) for c in cases))
     fields = ["kernel", "variant", "case", "status", "mean_us", "sd_us", "vs_reference_pct", "mismatch_bytes", "regs", "ptxas_regs",
               "stack_bytes", "spill_store_bytes", "spill_load_bytes", "dynamic_smem", "local_bytes",
+              "static_smem", "block_threads", "max_active_blocks_per_sm", "occupancy_pct", "compare_mode",
               "regime", "n_runs", "n_valid_runs", "n_pairs", "n_pairs_requested", "between_run_sd_us",
               "pairing_estimator", "paired_delta_us", "paired_delta_pct", "paired_sd_pct",
               "paired_ci95_low_pct", "paired_ci95_high_pct", "null_delta_pct_mean",
