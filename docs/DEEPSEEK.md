@@ -15,8 +15,9 @@ Fast mode, the default of the Docker recipe
 the recipe's published image `sha-7c2088a` (gr8 `main` at
 [`43cad38`](https://github.com/kindlingai/gr8/commit/43cad388ec8b7026b4feed2190fc5ce5a90c0c6d), engine built with
 `DS41_MX=48`), Engram on, 32 chat slots, `CAP` 327,680, the recipe's release settings (its `knobs.sh`), on four GB10
-boxes cabled in a ring (set A), on 2026-11-09. Rows marked "release 1 settings" are older numbers: gr8 `0015fd0` and
-the recipe's settings before this release, on 2026-11-08, on a second set of four GB10 boxes (set B). Fast mode's
+boxes cabled in a ring (set A), on 2026-11-09. Rows and columns marked "release 1 settings" are older numbers: gr8
+`0015fd0` and the recipe's settings before this release, on 2026-11-08. The decode right after each prefill is from set
+A; the many-stream rows are from a second set of four GB10 boxes (set B). Fast mode's
 output is not bit-identical to the exact model's: the same prompt can get a different reply.
 
 Prefill, cold prompt (set A):
