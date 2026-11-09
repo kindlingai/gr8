@@ -140,6 +140,75 @@ knobs:
     unset: "0, no drafts"
     doc: >-
       DSpark drafts verified a round, 1..5 (the checkpoint's three draft layers, block of 5). Served only.
+  GR8_DS_PF_V2:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      Experimental sequence-parallel prefill conductor for layers 0..20. Own-row residual state,
+      a dedicated fabric and high-priority communication stream; late layers remain on the stock path.
+      Needs TP4, one prefill lane and a 128-row late tail. Off leaves the stock path unchanged.
+  GR8_DS_PF_V2_RS_BLOCKS:
+    scope: local
+    kind: ints
+    default: "0"
+    doc: >-
+      V2 FFN reduce-scatter only: 0 retains the eight-block scalar reduce kernel.
+      Otherwise a comma list of positive block counts (e.g. 48,192,1024);
+      request ID r selects list[r % length], logged once per request per rank.
+      Uses aligned 16-byte cache-volatile loads and 16-byte stores with a scalar tail,
+      preserving the original FP32 rank summation order. Mixed zero/nonzero lists
+      are invalid. Boot gathers and non-v2 paths are unchanged.
+  GR8_DS_PF_V2_PACK_BLOCKS:
+    scope: local
+    kind: ints
+    default: "0"
+    doc: >-
+      V2 wire pack/unpack only (AG, A2A and RS): 0 retains eight blocks.
+      Otherwise a comma list of positive block counts (e.g. 48,192,1024);
+      request ID r selects list[r % length], logged once per request per rank.
+      Retains the existing aligned 16-byte copies and scalar ragged/unaligned
+      fallback, without changing kernels. Mixed zero/nonzero lists are invalid.
+      Boot gathers retain eight blocks. Independent of GR8_DS_PF_V2_RS_BLOCKS.
+  GR8_DS_PF_V2_XTRACE:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_XTRACE=1 and GR8_DS_PF_V2=1, trace the dedicated v2 fabric,
+      independently of GR8_XTRACE_PF. GPU producer, publish, peer-tail,
+      consume and join stamps accompany the existing proxy doorbell/post stamps.
+      Also enables v2 per-chunk timing and epoch/request/layer correlation on stderr,
+      with layer/attention/Engram/dispatch/FC1/FC2/combine/assemble boundaries and
+      separate pack-publication, peer wait, unpack and reduce event intervals.
+      Uses GR8_XTRACE_OUT/QUIT; retains the last 64 fabric epochs (one per v2
+      layer, including boot gathers), not a complete long request. Default 0
+      leaves v2's kernels, launches and timing setting unchanged.
+  GR8_DS_PF_V2_TIMING:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_PF_V2=1, record per-layer compute/communication CUDA-event pairs
+      into a bounded ring and print per chunk at the existing completion fence.
+      Reports request id and chunk first-token offset, with intervals relative to
+      that chunk's start to expose stream overlap. Retires each chunk's samples so
+      long requests can reuse the ring without accumulating events.
+      Never synchronizes the GPU; not-ready or overflow samples are labelled.
+      Default 0 allocates no timing events and leaves the stock path unchanged.
+  GR8_DS_PF_V2_FC2:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_PF_V2=1, use the experimental resident-weight routed-expert down kernel:
+      each CTA holds one 128-column weight slab across all bucketed rows, with heavy experts first.
+      Default 0 retains the grouped stock tensor-core kernel. Has no effect when V2 is off.
+
   GR8_DS_PF_DIRECT:
     scope: agree
     kind: flag

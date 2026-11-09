@@ -28,7 +28,7 @@ __global__ void __launch_bounds__(256) k_route_ro(const float* __restrict__ logi
                                                  const unsigned char* __restrict__ vflag = nullptr)
 {
     constexpr int RW = NE / 32, MW = MM / 32;
-    static_assert(NE % 32 == 0 && MM % 32 == 0 && MM <= RO_MAX && TK <= 8 && TK <= NE, "k_route_ro tiling");
+    static_assert(NE % 32 == 0 && MM % 32 == 0 && MM <= RO_PLAN_MAX && TK <= 8 && TK <= NE, "k_route_ro tiling");
     static_assert(KC >= 1 && KC <= TK, "k_route_ro: kept routes");
     const int w = threadIdx.x >> 5, l = threadIdx.x & 31, m = blockIdx.x * 8 + w;
     if (m >= M) return;
@@ -95,7 +95,7 @@ template <int NE = NEXP, int TK = TOPK, int MM = 1024>
 __global__ void __launch_bounds__(NE) k_scan_ro(PlanMT<TK, MM>* __restrict__ P, const unsigned* __restrict__ emask, int* __restrict__ tile0_of)
 {
     constexpr int RW = NE / 32, MW = MM / 32;
-    static_assert(NE % 32 == 0 && NE <= 1024 && MM % 32 == 0 && MM <= RO_MAX, "k_scan_ro tiling");
+    static_assert(NE % 32 == 0 && NE <= 1024 && MM % 32 == 0 && MM <= RO_PLAN_MAX, "k_scan_ro tiling");
     __shared__ int wcount[RW], wtiles[RW];
     const int t = threadIdx.x, w = t >> 5, l = t & 31;
     int n = 0;
