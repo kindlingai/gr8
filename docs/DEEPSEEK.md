@@ -11,22 +11,34 @@ the DeepSeek dialect (DSML tool calls, numeric reasoning effort). It serves text
 ## Results
 
 Fast mode, the default of the Docker recipe
-[deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark): Engram on,
-32 chat slots, `CAP` 327,680, the six fast-mode switches of [Settings](#settings), and an engine built with
-`DS41_MX=48`. Four GB10 boxes on one switch. Fast mode's output is not bit-identical to the exact model's: the same
-prompt can get a different reply.
+[deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark) (`TUNE=speed`):
+its image `{{IMAGE_TAG}}`, gr8 `main` at [`{{GR8_SHA7}}`](https://github.com/kindlingai/gr8/commit/{{GR8_SHA}}),
+Engram on, 32 chat slots, `CAP` 327,680, the fast-mode settings of [Settings](#settings), and an engine built with
+`DS41_MX=48`. Four GB10 boxes {{TOPOLOGY: on one 200G switch | in a ring}}, on {{DATE}}. Fast mode's output is not
+bit-identical to the exact model's: the same prompt can get a different reply.
 
 | | tok/s |
 |---|---|
-| decode, one stream: code / prose / structured | 142.4-145.6 / 83.5-84.6 / 159.5-161.6 |
-| prefill, cold: 8K / 32K / 128K prompt | 3,655-4,463 / 4,453-4,903 / 4,449-4,612 |
-| aggregate decode: 1 / 2 / 4 / 8 streams | 105.7-109.1 / 142.5-150.4 / 161.3-175.4 / 210.7-228.3 |
+| prefill: 32K / 128K prompt | {{PF_32K}} / {{PF_128K}} |
+| decode, one stream: {{SHORT_PROMPT}}-token / {{LONG_PROMPT}}-token prompt | {{DEC1_SHORT}} / {{DEC1_LONG}} |
+| total decode: 4 / 8 / 16 / 32 streams ({{CONC_PROMPT}}-token prompts) | {{AGG_4}} / {{AGG_8}} / {{AGG_16}} / {{AGG_32}} |
 
-`bench/bench.py` (gr8's own benchmark), four runs on two boots on 2026-11-05, two runs a boot. The engine was `main`
-at [`35a8f1c`](https://github.com/kindlingai/gr8/commit/35a8f1c771991a87b0c6308006b74ce70faf0378) with the change
-that became #359, built with `DS41_MX=48`, through our own test harness, not the recipe's image. A range is the four
-runs. The first word after a 128K prompt came in 28.5-29.5 s, and a fact hidden in a 128K prompt was found in each
-run. These boots had 32 chat slots, and a request could hold up to 327,670 tokens, prompt and reply.
+| | |
+|---|---|
+| first token after a 32K / 128K prompt | {{TTFT_32K}} s / {{TTFT_128K}} s |
+| longest chat (prompt and reply) | {{MAX_CTX}} tokens |
+| ready after `up -d` (gen cache written) | {{BOOT_S}} s |
+
+{{RAW_RUNS: where the raw runs are, one sentence}}
+
+### How we measure
+
+- The recipe's image, started as its README shows, with no other settings unless the row says so.
+- No tracing or per-stage timing on the measured requests.
+- A number that compares two settings comes from paired runs: both settings on the same boxes, each on a fresh boot,
+  in both orders.
+- Every speed is tok/s. Every decode number gives its prompt length.
+- Each number is {{STAT: the mean | the range}} of {{N}} runs on {{BOOTS}} boots.
 
 ### Exact output
 
@@ -44,13 +56,13 @@ boot of serving code equivalent to `main` at 40a91f5, with the launcher's defaul
 runs. The first word after a 128K prompt came in 34.3-35.1 s. Both runs passed smoke (11/11) and gave the same
 temperature-0 replies. The longest request on that boot was 163,830 tokens; `main` now allows 262,134 (#325).
 
-The two tables come from different builds and boots, so they do not show how much of the difference fast mode alone
-makes.
+{{COMPARE: either "The two tables come from different builds and boots, so they do not show how much of the
+difference fast mode alone makes." or the paired fast-vs-exact numbers}}
 
 ### Quality and the boxes
 
 - Quality, on the 75-item check of [FIRST-BOOT.md](FIRST-BOOT.md#3-deepseek-v41-flash-ds41-speed-against-exactness)
-  (code, math, JSON, reasoning): fast mode got 72 of 75, in one run on each of its two boots (2026-11-05). Exact
+  (code, math, JSON, reasoning): fast mode got {{QEVAL}} of 75 ({{QEVAL_RUNS}}, {{DATE}}). Exact
   output got 73 of 75 in each of three runs, on serving code equivalent to `main` at b10aae4 (2026-11-03).
 - Our boxes run with their CPUs kept out of deep idle (PM QoS `cpu_dma_latency` 0) and with memory compacted before
   each boot. Both are box settings outside gr8.
@@ -63,8 +75,8 @@ The quickest way is the recipe
 [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark): the same
 Docker image on all four boxes, in fast mode. On every box, fetch the release (510.6 GB) with the image, then start
 the image. Its README has the commands (`docker run` or Docker Compose), the cabling and the settings, and shows how to
-get the exact model instead. We booted the recipe's image on four boxes on 2026-11-06 (ready in 104 s, smoke test 11
-of 11, 72 of 75 on the 75-item check in fast mode): if a step fails, tell us.
+get the exact model instead. We booted the recipe's image on four boxes on {{DATE}} (ready in {{BOOT_S}} s, smoke test
+{{SMOKE}}, {{QEVAL}} of 75 on the 75-item check in fast mode): if a step fails, tell us.
 
 With gr8's own launcher, which gives exact output by default:
 
@@ -79,12 +91,20 @@ With gr8's own launcher, which gives exact output by default:
 
 The recipe boots in fast mode by default: 32 chats at once, `CAP` 327,680 (a request holds at most 327,670 tokens,
 prompt and reply), and an engine built with `DS41_MX=48`: a decode step holds 48 rows instead of 32, so one step can
-check 6 rows for each of 8 chats. It turns on six switches. Three change the output:
-`GR8_DS_RELAXED_ACCEPT=topp:0.9,ratio:0.1` and `GR8_DS_MOE_TOPK_DECODE=4`
-([FIRST-BOOT.md](FIRST-BOOT.md#q3-faster-writing-for-a-small-quality-loss) Q3), and `GR8_DS41_HEAD_MX=1`
-([Q4](FIRST-BOOT.md#q4-a-smaller-output-head)). Three speed up prefill: `GR8_DS_ATTN_TC_MF=2`,
-`GR8_DS_ATTN_TC_TILE=1` and `GR8_DS_MHC_ROW_SHARD=1` ([ENV.md](ENV.md)). With more than 5 chats it also sets
-`GR8_DS_SESS_DRAFTS=1`: each chat drafts fewer tokens as more chats write, and none when more than 24 write at once.
+check 6 rows for each of 8 chats. Its settings come in three groups, each set in the recipe's `knobs.sh`:
+
+- Three change the output: `GR8_DS_RELAXED_ACCEPT=topp:0.9,ratio:0.1` and `GR8_DS_MOE_TOPK_DECODE=4`
+  ([FIRST-BOOT.md](FIRST-BOOT.md#q3-faster-writing-for-a-small-quality-loss) Q3), and `GR8_DS41_HEAD_MX=1`
+  ([Q4](FIRST-BOOT.md#q4-a-smaller-output-head)).
+- Two speed up prefill with the same output bits: `GR8_DS_ATTN_TC_MF=2` and `GR8_DS_ATTN_TC_TILE=1` ([ENV.md](ENV.md)).
+- The release stack: the v2 prefill path (`GR8_DS_PF_V2=1`) with 8,192-row chunks, its wire settings, the two-rail
+  split, and Engram reads with io_uring. One of them, `GR8_DS_SH_TC=1`, changes the output. The recipe README's
+  [What `TUNE=speed` sets](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark#what-tunespeed-sets) has
+  one line for each. Engram's io_uring reads need the recipe's seccomp profile; without it, Engram reads with threads
+  and gives the same output.
+
+With more than 5 chats it also sets `GR8_DS_SESS_DRAFTS=1`: each chat drafts fewer tokens as more chats write, and
+none when more than 24 write at once.
 
 gr8's own launcher (`./gr8 ds41 up`) still defaults to exact output: 5 chats at once and `CAP` 262,144 (a request
 holds at most 262,134 tokens).
