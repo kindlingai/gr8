@@ -42,8 +42,10 @@ cp config/switch.env.example switch.env    # then set the boxes, directories and
 ```
 
 Measured on 2026-11-09 (Pacific time) with the command at gr8 `d62cb6b4`, on four DGX Sparks: GLM-5.3 and
-DeepSeek-V4.1-Flash at TP=4 on all four, GLM-5.3-Flash at TP=2 on two of them. DeepSeek ran the recipe image
-`sha-7c2088a`. Warm: each model booted once before the timed runs. Two switches each way (n=2), alternated. All 12
+DeepSeek-V4.1-Flash at TP=4 on all four, GLM-5.3-Flash at TP=2 on two of them. Settings: GLM-5.3 with
+`GR8_GEN_CACHE`, `GR8_QUIT_FAST=1` and compact expert copies (`GR8_LOAD_COMPACT`, `GR8_LOAD_MERGE_KB=1`) in
+`EXTRA_ENV`; DeepSeek-V4.1-Flash from the recipe image `sha-7c2088a` with its stock `.env` (fast mode) plus
+`GR8_GEN_CACHE`; GLM-5.3-Flash from its two-box recipe with the stock `.env` (no compact copies). Warm: each model booted once before the timed runs. Two switches each way (n=2), alternated. All 12
 switches exited 0, and after each one the new model answered a chat. "Total" runs from the switch command to the
 head's `/health` ready. The README's switch card shows the mean total of each row, rounded to whole seconds:
 
