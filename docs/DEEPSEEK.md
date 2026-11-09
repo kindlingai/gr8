@@ -39,7 +39,7 @@ Many streams at once (set B, short mixed prompts, up to 512 tokens out per strea
 | first token, median | 2.5-2.7 s | 6.2-6.4 s | 14.2-14.6 s |
 
 At 32 streams the requests wait for prefill slots, so the first token comes later as the queue grows. The longest
-prompt we measured in fast mode is 262,219 tokens; `CAP` allows 327,680. `TUNE=context` (16 chat slots, `CAP`
+prompt we measured with `TUNE=speed` is 262,219 tokens; `CAP` allows 327,680. `TUNE=context` (16 chat slots, `CAP`
 1,048,576, not the release settings) prefilled a 1,000,660-token prompt at 2,689 tok/s (two runs, first token in
 372 s).
 
@@ -51,7 +51,7 @@ prompt we measured in fast mode is 262,219 tokens; `CAP` allows 327,680. `TUNE=c
 - No tracing or per-stage timing on the measured requests.
 - A number that compares two settings comes from paired runs: both settings on the same boxes, each on a fresh boot,
   in both orders.
-- Every speed is tok/s. Every decode number gives its prompt length.
+- Every speed is tok/s. Every one-stream decode number gives its prompt length.
 - A single number is the mean of the runs in its row; a range is the lowest and highest series. Many-stream totals:
   two series of two batches per level, the total of each series' tokens over its decode time, then the mean of the
   two series. One boot per set of boxes.
