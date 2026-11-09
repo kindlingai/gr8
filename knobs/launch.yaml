@@ -166,8 +166,10 @@ options:
     default: "0"
     doc: >-
       the head's front end: thinking_budget for a chat request that names none, or names 0 or null (TensorFold's rule).
-      The front end closes the think block at the reply's Nth token. 0 = no limit. A request with logprobs gets no
-      default budget
+      The front end closes the think block at the reply's Nth token. N is a token count, a fraction of the request's
+      max_tokens written 0.8x, or both written 32768|0.8x, which takes the smaller. The front end resolves it per
+      request; a fraction gives at least 1 token. 0 = no limit. A request's own thinking_budget is a token count. A
+      request with logprobs gets no default budget
   DEFAULT_PRESENCE_PENALTY:
     scope: box
     default: "0"
@@ -196,8 +198,9 @@ options:
     doc: >-
       the head's front end: the think-end boost, a soft thinking budget, as start=S,per1k=P,max=M; unset = no boost. Inside the think
       block the </think> logit gains min(M, P * (n - S) / 1000) at the reply's n-th thinking token, before temperature
-      and top_p, so the model ends its reasoning where it was closest to ending anyway. S is a token count or a
-      fraction of the request's max_tokens written 0.5x (the front end resolves it per request); P is logits per
+      and top_p, so the model ends its reasoning where it was closest to ending anyway. S is a token count, a
+      fraction of the request's max_tokens written 0.5x, or both written 16384|0.5x, which takes the smaller (the
+      front end resolves it per request); P is logits per
       thousand tokens past S (0 or more); M is the cap, 0 to 20. P or M 0 = off. A request's think_end_boost (the same
       string, "off" or false) wins. A thinking_budget still closes the block at its token. Drafts are not boosted, so
       acceptance drops near the close

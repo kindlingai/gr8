@@ -336,9 +336,37 @@ def penalty_spec_error(spec):
     return None
 
 
+def limit_error(value):
+    """Why `value` is not a token limit (the front end's sampling.rs Limit::parse), or None: N tokens, Fx a fraction
+    0 to 1 of the request's max_tokens, or N|Fx, whichever comes first."""
+    want = f'{value!r}: want a token count, a fraction like 0.5x, or both like 16384|0.5x'
+    n, sep, f = value.partition('|')
+    if sep:
+        if not re.fullmatch(r'[0-9]+', n.strip()):
+            return want
+        if int(n) == 0:
+            return f'{value!r}: a pair needs a token count above 0'
+    elif value.strip().endswith('x'):
+        f = value
+    elif re.fullmatch(r'[0-9]+', value.strip()):
+        return None
+    else:
+        return want
+    f = f.strip()
+    if not f.endswith('x'):
+        return want
+    try:
+        v = float(f[:-1])
+    except ValueError:
+        return want
+    if not 0 <= v <= 1:
+        return f'{value!r}: want a fraction from 0x to 1x'
+    return None
+
+
 def boost_spec_error(spec):
     """Why `spec` is not a think-end boost spec (the front end's sampling.rs BoostSpec::parse), or None:
-    start=S,per1k=P,max=M, S a token count or a fraction like 0.5x, P 0 or more, M 0 to 20, each key once."""
+    start=S,per1k=P,max=M, S a limit_error() limit (16384, 0.5x or 16384|0.5x), P 0 or more, M 0 to 20, each key once."""
     seen = set()
     for part in spec.split(','):
         key, sep, value = part.partition('=')
@@ -348,15 +376,12 @@ def boost_spec_error(spec):
         if key in seen:
             return f'{key} is given twice'
         seen.add(key)
-        if key == 'start' and value.endswith('x'):
-            value = value[:-1]
-            lo, hi = 0, 1
-        elif key == 'start':
-            if not value.isdigit():
-                return f'start={value!r}: want a token count or a fraction like 0.5x'
+        if key == 'start':
+            err = limit_error(value)
+            if err:
+                return f'start={err}'
             continue
-        else:
-            lo, hi = (0, math.inf) if key == 'per1k' else (0, 20)
+        lo, hi = (0, math.inf) if key == 'per1k' else (0, 20)
         try:
             v = float(value)
         except ValueError:
@@ -475,9 +500,9 @@ def validate(o):
         gt = math.nan
     if not 0 <= gt <= 2:
         raise OptionError(f'--tool-repeat-guard-temperature {o.get("TOOL_REPEAT_GUARD_TEMPERATURE")}: want a number from 0 to 2')
-    if not str(o.get('DEFAULT_THINKING_BUDGET')).isdigit():
-        raise OptionError(f'--default-thinking-budget {o.get("DEFAULT_THINKING_BUDGET")}: want a whole number '
-                          '(0 = no limit)')
+    err = limit_error(str(o.get('DEFAULT_THINKING_BUDGET')))
+    if err:
+        raise OptionError(f'--default-thinking-budget {err} (0 = no limit)')
     share = o.get('SHARE_LIMIT')
     if share is not None and not (str(share).isdigit() and int(share) >= 4096 and int(share) % 64 == 0):
         # the engine takes any multiple of a KV page (64 tokens) and makes it a decode bucket boundary (context_buckets.h)

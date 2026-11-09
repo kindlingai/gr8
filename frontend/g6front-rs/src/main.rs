@@ -92,7 +92,7 @@ struct Args {
     share_tokens: u64,
     max_connections: usize,
     default_effort: Option<String>,
-    default_budget: u64,
+    default_budget: sampling::Limit,
     allow_thinking_off: bool,
     emit_undeclared: bool,
     supervisor: Option<String>,
@@ -109,7 +109,7 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--workers N] [--encode-threads N] [--default-max-tokens N]
                   [--share-tokens N] [--max-connections N]
                   [--default-reasoning-effort minimal|low|medium|high|xhigh|max (ds41: or an integer 1-100)]
-                  [--default-thinking-budget N] [--allow-thinking-off]
+                  [--default-thinking-budget N, Fx or N|Fx] [--allow-thinking-off]
                   [--default-presence-penalty SPEC] [--default-frequency-penalty SPEC]
                   [--default-think-end-boost start=S,per1k=P,max=M] [--default-sequence-penalty SPEC]
                   [--tool-repeat-guard 0|1] [--tool-repeat-guard-repeats N] [--tool-repeat-guard-temperature F]
@@ -134,7 +134,7 @@ fn parse_args() -> Result<Args, String> {
         share_tokens: 0,
         max_connections: 512,
         default_effort: None,
-        default_budget: 0,
+        default_budget: sampling::Limit::Tokens(0),
         allow_thinking_off: false,
         emit_undeclared: false,
         supervisor: None,
@@ -187,7 +187,7 @@ fn parse_args() -> Result<Args, String> {
             "--dialect" => a.dialect = dialect::Dialect::parse_flag(&next(&mut i, &flag, inline)?)?,
             "--default-thinking-budget" => {
                 a.default_budget =
-                    next(&mut i, &flag, inline)?.parse().map_err(|_| "--default-thinking-budget: not a number")?
+                    sampling::Limit::parse(&next(&mut i, &flag, inline)?).map_err(|e| format!("{flag}: {e}"))?
             }
             "--allow-thinking-off" => a.allow_thinking_off = true,
             "--tool-repeat-guard" => {
