@@ -17,15 +17,17 @@ one model at a time: stop the running recipe's container on every box before you
 
 [![GLM-5.3-Flash on one GB10: decode, prefill and concurrency](docs/cards/glm-5.3-flash-exlr8-1x-spark.png)](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark)
 
-54.3 tok/s for one request writing code · 1,214 tok/s prefill on an 8K prompt · 4 requests at once from a 700,032-token KV
+53.8 tok/s for one request writing code · 995 tok/s prefill on an 8K prompt · 4 requests at once from a 700,032-token KV
 pool · one `docker run`
 
 **[Recipe](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark)** · [Model page](docs/FLASH.md)
 
 ### GLM-5.3-Flash on 2 Sparks
 
-71.1 tok/s for one request writing code · 1,698 tok/s prefill on an 8K prompt · 4 requests at once · first run, work in
-progress
+[![GLM-5.3-Flash on two GB10s: decode, prefill and concurrency](docs/cards/glm-5.3-flash-exlr8-2x-spark.png)](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark)
+
+74.5 tok/s for one request writing code · 1,675 tok/s prefill on an 8K prompt · 8 requests at once from a
+2,097,152-token KV pool · the same image on both boxes
 
 **[Recipe](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark)** · [Model page](docs/FLASH.md)
 
@@ -79,7 +81,7 @@ redraws them). The model pages give each benchmark and its date.</sub>
 | model | boxes | start here | download | weights on Hugging Face |
 |---|---|---|---|---|
 | [GLM-5.3-Flash](docs/FLASH.md) | 1 | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark): one `docker run` | 87 GB | [kindlingai/glm-5.3-flash-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4) |
-| GLM-5.3-Flash | 2 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark): the same image on both boxes | about 86 GB a box | |
+| GLM-5.3-Flash | 2 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark): the same image on both boxes | about 76 GB a box (86 GB with `TUNE=quality`) | |
 | GLM-5.3-Flash | 3 or 4 | [docs/FLASH.md](docs/FLASH.md) | see the page | |
 | [GLM-5.3](docs/GLM-5.3.md) | 3 to 6 | Docker Compose (below), or [docs/DEPLOY.md](docs/DEPLOY.md) for bare metal and Kubernetes | about 90 GB a box with 4 boxes (TP=4) | [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) |
 | [DeepSeek-V4.1-Flash](docs/DEEPSEEK.md) | 4 | [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark): the same image on all four boxes, fast mode by default; or [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) with gr8's own launcher, exact output by default | 510.6 GB a box, fetched before the first boot | [kindlingai/deepseek-v4.1-flash-exlr8-native](https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native) |

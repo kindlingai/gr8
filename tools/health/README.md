@@ -9,7 +9,7 @@ recovery is out of scope: the probe says what is wrong, a person fixes it.
 scripts/rank_health.sh [OUT_JSON] [OPTIONS]   # on the head, no model booted; ./gr8's options; exit 0 admitted, 3 refused
 ./gr8 glm53 up                         # after the probe
 ./gr8 glm53 bench --health $GR8_WORK_DIR/out/rank_health.json     # keeps the result in the report
-python3 tools/health/rank_probe.py local --proxy-cpu 19 --rail-ips 10.0.1.1,10.0.2.1    # one node, JSON
+python3 tools/health/rank_probe.py local --proxy-cpu 19 --rail-ips 192.0.2.1,198.51.100.1    # one node, JSON
 ```
 
 `scripts/build.sh` builds `bin/gpuprobe`; every box needs it in `$GR8_WORK_DIR/bin`, as `./gr8 glm53 build` leaves it. The

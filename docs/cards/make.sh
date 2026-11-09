@@ -4,10 +4,9 @@
 #   KINDLING_DIR=DIR docs/cards/make.sh        read DIR/<recipe>/kindling.json instead (local clones)
 #   FONT_DIR=DIR docs/cards/make.sh            draw with DIR/JetBrainsMono-Regular.ttf and DIR/SpaceGrotesk-Bold.ttf
 # Without FONT_DIR, gif.py uses JetBrains Mono and Space Grotesk if they are installed, else its fallback fonts.
-# The GLM-5.3-Flash 2x recipe has no kindling.json yet, so it has no card.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-RECIPES="glm-5.3-flash-exlr8-1x-spark deepseek-v4.1-flash-exlr8-4x-spark"
+RECIPES="glm-5.3-flash-exlr8-1x-spark glm-5.3-flash-exlr8-2x-spark deepseek-v4.1-flash-exlr8-4x-spark"
 fonts=()
 [ -n "${FONT_DIR:-}" ] && fonts=(--font "$FONT_DIR/JetBrainsMono-Regular.ttf" --display-font "$FONT_DIR/SpaceGrotesk-Bold.ttf")
 tmp=$(mktemp -d)

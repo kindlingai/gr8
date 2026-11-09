@@ -149,8 +149,9 @@ knobs:
     unset: "1 with --serve, 0 offline"
     values: "0|1"
     doc: >-
-      With --reuse-prefix, a hit keeps only whole cold-prefill grid cells (--prefill rows), so the result equals a cold
-      prefill bit for bit. 0 keeps the whole matched prefix. 1 needs --prefill.
+      With --reuse-prefix, a hit keeps only whole cold-prefill grid cells (--prefill rows), so the result should equal a
+      cold prefill. Open issue #412 reports a hit that differs from a cold prefill at temperature 0 (GLM-5.3, TP=4).
+      0 keeps the whole matched prefix. 1 needs --prefill.
   GR8_REUSE_HDUMP:
     scope: local
     kind: path

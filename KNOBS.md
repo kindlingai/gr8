@@ -44,7 +44,7 @@ sha256 of the file.
 `scripts/engine_args.sh`, [docs/FLASH.md](docs/FLASH.md)). `SESS` defaults to 1 there; 2 to 8 share decode steps and
 the `CAP` pool, each session with its own KDA state slots, while `SESS` x (`MTP` + 1) is at most 32.
 
-A Flash box can lend what its serve leaves to a KV node beside it (D-331 M7; `donate` in `tools/launch/supervisor.py`):
+A Flash box can lend what its serve leaves to a KV node beside it (`donate` in `tools/launch/supervisor.py`):
 the `FLASH_KV_*` and `FLASH_CAP_POLICY` options (`./gr8 knobs FLASH_`).
 
 ## Rank health

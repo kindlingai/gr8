@@ -764,7 +764,7 @@ can follow; `engine_build` then hashes every module file.
 `kvman-rs/src/remote/verbs.rs` shows Rust verbs are possible later), `devimage.cpp`, `grammar.cc` (XGrammar), and the
 byte movers in `kv_tier.cuh` and `flash_checkpoint.cuh`.
 
-### R11. DS41's KV on the shared paged pool (with Chuck)
+### R11. DS41's KV on the shared paged pool
 
 A DS41 slot reserves a whole slab (`--capacity-slots`) whatever its request's length, and its prefix snapshots and park
 duplicate what the pool already has (paged stores, the spare-RAM cache, prefix reuse and stash, checkpoints). GLM and
@@ -779,8 +779,8 @@ section: ca/ica rows, ratio-2 and ratio-1 layers). The work:
 - per-session state that is not KV stays per session (the 128-token windows, Engram, DSpark), as Flash keeps its KDA
   slots (`FlashSlots`).
 
-It is DS41's owner's area, so it waits for him. Nothing in R4 to R10 depends on it: until it lands, those steps move
-DS41's slab path beside the pool's callers.
+It is DS41's maintainers' area, so it waits for that work. Nothing in R4 to R10 depends on it: until it lands, those
+steps move DS41's slab path beside the pool's callers.
 
 ### How much moves
 
