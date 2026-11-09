@@ -28,7 +28,7 @@ knobs:
   GR8_DS_CACHE_MIB:
     scope: local
     kind: int
-    unset: "the prefix cache's own size"
+    unset: "4096 MiB per rank"
     values: "1.."
     legacy: ["G6_DS41_CACHE_MIB"]
     doc: >-

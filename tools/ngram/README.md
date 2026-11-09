@@ -43,7 +43,8 @@ table's chain instead of the drafter's drafts in rounds where the chain promises
 
 `import-kl-ref` turns a KL reference (`bench/bench.py kl-ref`) (16 greedy continuations of 256 tokens, top 20) into traces, which
 checks the tools but is too little and too varied to judge the table. Its top lists come from a separate scoring pass:
-in `refs/tp4.json` 108 of 4,096 positions have the generated token outside first place.
+in the reference file `refs/tp4.json` (not in this repo) 108 of 4,096 positions have the generated token outside first
+place.
 
 `sizes` sweeps the confidence floor (`--floors`), and at `--floor` the width (`--widths 2,3,4`) and the context lengths
 (`--ns-list "8,6,4,3;4,3;3"`).

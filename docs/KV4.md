@@ -103,6 +103,9 @@ costs 2.3 MB of int4 pool and 2.9 MB of them.
 | TP=6 (32,768) | 2,026, CAP 614,400 | 2,440, CAP 773,120 | 1.26x | estimate |
 | TP=6 (131,072, the default) | 3,307, CAP 614,400 | 3,940, CAP 857,600 | 1.40x | estimate |
 
+Table figures are at the `SHARE_LIMIT` shown. The fp8 default is now 2,280 pages (CAP 387,072 at `SHARE_LIMIT` 65,536),
+so the TP=4 gain is about 1.07x at that limit.
+
 - **TP=4 rests on two boots.** At 1,920 pages the int4 row leaves 2.31 GiB more free than fp8 (the model says 2.34).
   At 2,876 pages it leaves 2.39 GiB less (model 2.23). Interpolating gives equal headroom at about 2,390 pages a rank.
   The model alone says 2,409. The fp8 default then moved from 1,920 to 1,981 pages a rank (the same model's

@@ -183,8 +183,8 @@ There is no rotation: Flash's latent is NoPE, and every read dequantizes in plac
 
 `--sess N` (`SESS`, 1 to 8; 8 at TP=4, 4 at TP=3, 1 at TP=2) serves up to N requests at once on S2, as GLM-5.3 does: their decode
 rounds share main and draft steps, and their KV runs share the `CAP` pool (`--s2-sessions N` to `g6m4_flash`). Those per-TP
-counts are the launcher's defaults (`scripts/engine_args.sh`); the two-box recipe overrides `SESS` to 4 at TP=2 and serves
-four requests at once.
+counts are the launcher's defaults (`scripts/engine_args.sh`); the two-box recipe sets `SESS` to 8 (4 with
+`TUNE=quality`) and serves that many requests at once.
 
 - KDA state: each session holds a region of `MTP + 1` slots (`FlashSlots` in `engine/runtime/s2/flash_ring.h`), reset
   when a request starts on it. With the drafter, region 0 is 8 slots wide (below). In a main step each session's first

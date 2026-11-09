@@ -47,7 +47,7 @@ are estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [KV4
   verification, with steering identity included in prefix reuse. The fused operator adds no CUDA launches to the
   production path. See [STEERING.md](STEERING.md).
 - Prefill attention split by query and head owner across ranks ([DESIGN-QO-PAIR.md](DESIGN-QO-PAIR.md)).
-- Context-parallel KV: the first `SHARE_LIMIT` tokens (32,768 at TP=4, 65,536 at TP=3) are on every rank, later pages (their
+- Context-parallel KV: the first `SHARE_LIMIT` tokens (32,768 at TP=4 and TP=3) are on every rank, later pages (their
   latent and their indexer keys) are spread across ranks, so the pools above fit. Requests up to that size share decode steps.
 
 ## What you need

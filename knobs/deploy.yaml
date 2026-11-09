@@ -60,7 +60,7 @@ knobs:
     unset: "unset"
     legacy: []
     doc: >-
-      The model the launcher and the Helm chart serve: glm53 or glm53f.
+      The model the launcher and the Helm chart serve: glm53, glm53f or ds41.
   GR8_PSEUDO_TOKENIZER:
     kind: path
     unset: "unset"
@@ -73,6 +73,14 @@ knobs:
     legacy: []
     doc: >-
       Seconds the supervisor keeps a refused boot's status up, 15 when unset.
+  GR8_STOP_GRACE:
+    kind: text
+    unset: "30s"
+    legacy: []
+    doc: >-
+      docker/compose.yaml: how long docker waits for the container to stop before it kills it, 30s when unset. A KV_STORE
+      ssd store with persist=on that keeps sessions (keep=sessions or all, or KV_KEEP) makes the engine's quit take up
+      to 120 s, so set 150s with one; else the quit takes 10 s.
   GR8_WORK_DIR:
     kind: path
     unset: "the repository"
