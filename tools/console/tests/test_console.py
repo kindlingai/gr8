@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -721,6 +722,38 @@ class WeightTests(unittest.TestCase):
             mounted.assert_called_with("gr8_home")
             self.assertEqual(row["state"], "present")
             self.assertIsNone(row["rate_mb_s"])
+
+    def test_unreadable_cache_is_unknown_not_missing(self):
+        # A docker-group SSH user resolves the volume mountpoint under /var/lib/docker (710 root) but cannot read it.
+        commit = "c" * 40
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "cache"
+            release = cache / "hf" / "org--repo" / commit
+            (release / "complete").mkdir(parents=True)
+            request = {"cache": str(cache), "model": "https://huggingface.co/org/repo@" + commit,
+                       "tp": 4, "rank": 0, "variant": "bit325", "home": "", "peers": []}
+            self.assertEqual(weights.probe(request)["state"], "missing")
+            with patch.object(weights.os, "access", return_value=False):
+                denied = weights.probe(request)
+            self.assertEqual(denied["state"], "unknown")
+            self.assertIsNone(denied["size_gb"])
+            with patch.object(weights.os, "listdir", side_effect=PermissionError("denied")):
+                self.assertEqual(weights.probe(request)["state"], "unknown")
+            request["model"] = "https://huggingface.co/org/repo"
+            with patch("builtins.open", side_effect=PermissionError("denied")):
+                self.assertEqual(weights.probe(request)["state"], "unknown")
+            if os.geteuid() != 0:
+                cache.chmod(0)
+                try:
+                    self.assertEqual(weights.probe(request)["state"], "unknown")
+                    request["model"] = "https://huggingface.co/org/repo@" + commit
+                    self.assertEqual(weights.probe(request)["state"], "unknown")
+                finally:
+                    cache.chmod(0o755)
+            denied["box"] = 2
+            text, health = weights.preset_notice(weights.aggregate([denied]), 900)
+            self.assertEqual(text, "Cannot check the weights on box 2.")
+            self.assertIsNone(health)
 
     def test_expert_gb_matches_the_launcher(self):
         import sys

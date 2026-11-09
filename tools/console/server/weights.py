@@ -3,14 +3,16 @@
 tools/launch/hfsource.py writes complete/tp<N>.rank<R>.<variant>-<sha>.json
 last, after that rank's files are verified. A manifest alone is not weights
 on disk. Unset GR8_CACHE and GR8_HOME are the Docker named volumes from
-docker/compose.yaml (project name gr8). A path that cannot be resolved, or
-a probe that cannot run, is unknown, not missing. This module is also the
-script sent over SSH: it uses the standard library only.
+docker/compose.yaml (project name gr8). A path that cannot be resolved, a
+probe that cannot run, or a cache that exists but this user cannot read is
+unknown, not missing. This module is also the script sent over SSH: it uses the
+standard library only.
 """
 import json
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 
@@ -216,6 +218,31 @@ def resolve_dir(value, short_name):
     return volume_mountpoint(COMPOSE_PROJECT + "_" + short)
 
 
+class Unreadable(Exception):
+    """A path exists but this user cannot read it, so what it holds is not known."""
+
+
+def _absent(exc):
+    return isinstance(exc, (FileNotFoundError, NotADirectoryError))
+
+
+def check_readable(path):
+    """True when path can be read and traversed, False when it is absent.
+
+    Raises Unreadable on a permission or other read error: a Docker volume mountpoint
+    under /var/lib/docker (mode 710 root) resolves for a docker-group user but does not read.
+    """
+    try:
+        os.stat(path)
+    except OSError as exc:
+        if _absent(exc):
+            return False
+        raise Unreadable(path) from exc
+    if not os.access(path, os.R_OK | os.X_OK):
+        raise Unreadable(path)
+    return True
+
+
 def release_dir(cache, model):
     match = MODEL_URL.fullmatch(model or "")
     if not match or not cache:
@@ -228,11 +255,26 @@ def release_dir(cache, model):
         try:
             with open(os.path.join(root, "refs", rev)) as handle:
                 commit = handle.read().strip()
-        except OSError:
-            return None
+        except OSError as exc:
+            if _absent(exc):
+                return None
+            raise Unreadable(root) from exc
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         return None
     return os.path.join(root, commit)
+
+
+def _listed_files_match(release, listed):
+    for rel, size in listed.items():
+        try:
+            info = os.stat(os.path.join(release, rel))
+        except OSError as exc:
+            if _absent(exc):
+                return False
+            raise Unreadable(rel) from exc
+        if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+            return False
+    return True
 
 
 def weights_ready(release, tp, rank, variant):
@@ -241,21 +283,29 @@ def weights_ready(release, tp, rank, variant):
     )
     try:
         names = os.listdir(os.path.join(release, "complete"))
-    except OSError:
-        return False
+    except OSError as exc:
+        if _absent(exc):
+            return False
+        raise Unreadable(release) from exc
+    denied = None
     for name in names:
         if not pattern.fullmatch(name):
             continue
         try:
             with open(os.path.join(release, "complete", name)) as handle:
                 listed = json.load(handle).get("files") or {}
-            if listed and all(
-                os.path.isfile(os.path.join(release, rel)) and os.path.getsize(os.path.join(release, rel)) == size
-                for rel, size in listed.items()
-            ):
+            if listed and _listed_files_match(release, listed):
                 return True
-        except (OSError, ValueError):
+        except Unreadable as exc:
+            denied = exc
+        except ValueError:
             continue
+        except OSError as exc:
+            if not _absent(exc):
+                denied = Unreadable(name)
+                denied.__cause__ = exc
+    if denied:
+        raise denied
     return False
 
 
@@ -341,8 +391,13 @@ def probe(request):
     unknown = {"state": "unknown", "present": False, "size_gb": None, "rate_mb_s": None}
     if not cache or not MODEL_URL.fullmatch(request.get("model") or ""):
         return unknown
-    release = release_dir(cache, request.get("model") or "")
-    present = bool(release and tp > 0 and rank >= 0 and weights_ready(release, tp, rank, variant))
+    try:
+        # Absent is missing. Present but unreadable is unknown, never a download claim.
+        check_readable(cache)
+        release = release_dir(cache, request.get("model") or "")
+        present = bool(release and tp > 0 and rank >= 0 and weights_ready(release, tp, rank, variant))
+    except Unreadable:
+        return unknown
     size = None
     if release and tp > 0:
         size = manifest_gb(os.path.join(release, "manifests", f"exlr8-manifest-{variant}.json"), tp)

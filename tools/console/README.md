@@ -108,8 +108,9 @@ for that variant’s verified weight marker, the `complete/` file written
 after the rank’s weights are checked. A manifest alone does not count.
 Unset `GR8_CACHE` and `GR8_HOME` are the Docker named volumes `gr8_cache`
 and `gr8_home`; the check uses each volume’s mountpoint. If a mountpoint
-cannot be resolved, or a box cannot be checked, the dialog says it cannot
-check that box. That is not a download, and the health wait stays at the
+cannot be resolved, a box cannot be checked, or the cache exists but the
+SSH user cannot read it (a named volume under a root-only Docker directory),
+the dialog says it cannot check that box. That is not a download, and the health wait stays at the
 stock timeout. If a box is missing the marker, the dialog says this preset
 downloads up to about N GB to each box. N is a rounded upper bound, because
 expert halves already fetched for another variant are not fetched again.
