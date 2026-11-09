@@ -1,0 +1,9 @@
+.state/
+__pycache__/
+*.pyc
+.venv/
+console.json
+web/node_modules/
+web/.svelte-kit/
+web/build/
+web/test-results/

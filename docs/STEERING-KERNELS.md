@@ -44,7 +44,7 @@ GR8_NR=4 EXTRA=-DDEC_S2 TEST=steering_cuda_test scripts/c1_tests.sh <test-bin-di
 GR8_NR=4 EXTRA=-DDEC_S2 TEST=steering_consume_test scripts/c1_tests.sh <test-bin-dir>
 ```
 
-`steering_cuda_test` retains Jake's helper fixture and adds the near-cancellation regression. It covers
+`steering_cuda_test` retains the original helper fixture and adds the near-cancellation regression. It covers
 all-off, all-on and alternating rows, exact zero-row identity, projected residual and FP16 normalization.
 CUDA API failures and nonfinite outputs fail the test.
 
@@ -67,8 +67,8 @@ AG payloads, doorbell state and AR FP16/BF16 fragment tables. The parent must be
 The baseline build is a test-only mode; it is not a production fallback.
 
 `scripts/build.sh` compiles both fixtures in CI without a GPU and runs them when a GPU is visible. The
-normal engine CI still builds every TP width. Cluster output/performance gates are separate; the user's
-current instruction limits this extraction to direct unit testing.
+normal engine CI still builds every TP width. Cluster output/performance gates are separate; this change is
+limited to direct unit testing.
 
 ## Boundary for later slices
 
