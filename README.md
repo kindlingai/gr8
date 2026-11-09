@@ -14,6 +14,16 @@ vLLM, PyTorch or NCCL at serve time. *Beta release. If you run it, please tell u
 The same boxes serve one model at a time; `./gr8 switch <model>` stops the running one and starts the other.
 [docs/SWITCHING.md](docs/SWITCHING.md) has the setup and every measured step.
 
+### Kindling dash
+
+[![Kindling dash: one page with the loaded model's speeds, the presets, the boxes, the head log and the models table](docs/kindling-dash.png)](tools/console/README.md)
+
+Kindling dash is a small web page for a gr8 cluster. It shows the loaded model's decode and prefill speed, the KV cache,
+the boxes and the head log. With `allow_control` set, it also switches, restarts and stops models. It runs apart from the
+engine, so it stays up while models restart. [tools/console/README.md](tools/console/README.md) has the setup.
+
+<sub>The screenshot shows the dash on its test fixture. Its numbers are synthetic, not measurements.</sub>
+
 ## Recipes
 
 Each recipe is one Docker image, set up for one model on a fixed number of boxes. For other box counts (GLM-5.3 on
