@@ -55,7 +55,7 @@ tok/s (two runs, first token in 372 s).
 ### How we measure
 
 - gr8's own benchmark (`bench/bench.py`) against the running server, with the recipe's settings. For the set A rows
-  we used `bench.py` with the prompt-length output and the closed-loop mode of gr8 PR ⟨BENCHPR⟩.
+  we used `bench.py` with the prompt-length output and the closed-loop mode of PR #471.
 - The set A rows used the recipe's published image `sha-7c2088a` on one boot, between two boots of the release 1
   image `sha-ad3efdf` on the same boxes. No first-token, prefill, one-stream, many-stream or closed-loop number of the
   new image was more than 1% worse than the mean of the two release 1 boots. The "decode after it"
