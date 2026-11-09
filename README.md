@@ -43,9 +43,10 @@ once · recipes coming soon. Until then, start it on three to six boxes with Doc
 
 [![DeepSeek-V4.1-Flash on four GB10s in fast mode: decode, prefill and concurrency](docs/cards/deepseek-v4.1-flash-exlr8-4x-spark.png)](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)
 
-142.9 tok/s for one request writing code · 3,655 tok/s prefill on an 8K prompt · 32 requests at once (the recipe's
-setting) · fast mode by default (`TUNE=speed`), so the output is not identical to the exact model's; `TUNE=quality`
-gives the exact model's output · booted on four boxes from the recipe's image: ready in 104 s
+One request: 83-86 tok/s on prose and 144-145 tok/s on code (65-72-token prompts) · 7,950 tok/s prefill on a 32K prompt
+· 226.4 tok/s in total for 32 requests at once (the recipe's setting) · fast mode by default (`TUNE=speed`), so the
+output is not identical to the exact model's; `TUNE=quality` gives the exact model's output · the recipe's image on four
+boxes: first boot (cold disk) 212.7 s, a switch from GLM-5.3 after that 37-39 s
 
 **[Recipe](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)** · [Model page](docs/DEEPSEEK.md)
 
@@ -105,8 +106,9 @@ setting, and has bare metal and Kubernetes. An agent that starts gr8 for someone
 
 **DeepSeek-V4.1-Flash** (four boxes): the recipe
 [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)
-is the quickest way: the same image on every box, in fast mode by default. We booted that image on four boxes on
-2026-11-06: ready in 104 s, smoke test 11 of 11, 72 of 75 on the 75-item check.
+is the quickest way: the same image on every box, in fast mode by default. We booted that image (`sha-ad3efdf`) on four
+boxes on 2026-11-09: first boot (cold disk) 212.7 s to `serving:`, a switch from GLM-5.3 after that 37-39 s, a chat
+answered after each boot, and 73 of 75 on the 75-item check.
 [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is the boot with gr8's own launcher, which gives exact output by default,
 in order, from the four boxes to a passing `./gr8 ds41 smoke`.
 
