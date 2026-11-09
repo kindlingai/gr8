@@ -39,6 +39,8 @@ int main(int argc, char** argv)
         assert(knob::test_s2_gen() == (std::vector<int64_t>{4, 5}) && !knob::dfl_reuse() && !knob::rt_store());
         assert(knob::signature() == " env ATTN_CTX2=3 ATTN_CTX3=1 KVB=fp8 MTP_KSTOPB_TAU_S2=0.5,0.75");
         assert(knob::tests_set() == "GR8_TEST_S2_GEN");
+        // the v2 reduce-scatter width defaults to 48 blocks (0 selects the old eight-block kernel)
+        assert(knob::ds_pf_v2_rs_blocks() == (std::vector<int64_t>{48}));
         char* env[] = {(char*)"GR8_ATTN_CTX2=9", (char*)"GR8_NO_SUCH=1", nullptr};
         return again(argv[0], "bad", env);
     }
