@@ -5,7 +5,7 @@ One to four DGX Spark (GB10) boxes (TP=1 to TP=4). Weights: the exlr8 release on
 
 gr8 serves [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) from its exlr8 release
 ([kindlingai/glm-5.3-flash-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4)) at TP=4,
-TP=3 (a three-box ring, variant k4), TP=2 or TP=1 (one box, variant k2, the one width whose weights fit). The engine is `bin/g6m4_flash`, a build of the same `g6m4` source with `-DG6_MODEL_FLASH=1`
+TP=3 (a three-box ring, variant k4), TP=2 (two boxes) or TP=1 (one box, variant k2, the one width whose weights fit). The engine is `bin/g6m4_flash`, a build of the same `g6m4` source with `-DG6_MODEL_FLASH=1`
 (`engine/model_geom.h` holds the geometry).
 
 ## Results
@@ -21,6 +21,10 @@ defaults):
 | aggregate decode, 1 / 2 / 4 / 8 streams | 43.5 / 41.3 / 53.4 / 57.5 tok/s | 54.0 / 62.5 / 75.5 / 98.2 tok/s |
 | KV pool | 700,032 tokens, up to 4 requests at once | 2,097,152 tokens, up to 8 requests at once |
 | from | [glm-5.3-flash-exlr8-1x-spark `kindling.json`](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark/blob/3e9754c5/kindling.json) | [glm-5.3-flash-exlr8-2x-spark `kindling.json`](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark/blob/81c29ca3/kindling.json) |
+
+The recipes use two other manifests of the same release. `bit201` (one box) is K2, with the 124 routed experts that
+carry the most routing weight at tool-call positions at K3. `bit349` (two boxes) is K3, with K4 where it lowers KL most,
+about 3.49 bits a routed weight.
 
 At TP=3 and TP=4 the sections below have what is measured so far. Open bugs: [KNOWN-ISSUES.md](../KNOWN-ISSUES.md#glm-53-flash).
 
@@ -38,7 +42,7 @@ segments as for GLM-5.3. GLM-5.3 and Flash then share one store and its disk bud
 `./gr8 glm53f` takes the options of `./gr8 glm53` (KNOBS.md). Each box fetches its rank's part of the release and loads
 it through the same release planner as GLM-5.3 (`engine/loader-rs`): `release::plan` reads the model from the release's
 own metadata (`hidden_size` 4096) and maps Flash's tensors with `engine/loader-rs/src/flash.rs`. The width manifests are
-`k2`, `k3` and `k4` (the default).
+`k2`, `k3` and `k4` (the default); the recipes use `bit201` (one box) and `bit349` (two boxes), see [Results](#results).
 
 The front end serves the model as `glm-5.3-flash` (`/v1/models` lists it first) and also answers to `glm53f`. A request
 that names `glm-5.3` gets a 404 (one that names no model is served), so a router that picks backends by model name
