@@ -21,11 +21,11 @@ output is not bit-identical to the exact model's: the same prompt can get a diff
 
 Prefill, cold prompt (set A):
 
-| prompt | runs | first token | prefill tok/s | decode tok/s after it, same request (256 tokens out) |
+| prompt | runs | first token | prefill tok/s | decode tok/s after it, same request (release 1 settings) |
 |---|---|---|---|---|
-| 32K tokens | 8 | 4.19 s | 7,835 | 95.6 |
-| 128K tokens | 4 | 16.5 s | 7,940 | 98.5 |
-| 256K tokens | 4 | 34.5 s | 7,590 | 90.9 |
+| 32K tokens | 8 | 4.19 s | 7,835 | 103.5 |
+| 128K tokens | 4 | 16.5 s | 7,940 | 98.2 |
+| 256K tokens | 4 | 34.5 s | 7,590 | 101.0 |
 
 One-stream decode on short prompts (65-72 tokens, up to 512 tokens out; set A, two series of 6 runs each):
 
@@ -55,12 +55,11 @@ tok/s (two runs, first token in 372 s).
 ### How we measure
 
 - gr8's own benchmark (`bench/bench.py`) against the running server, with the recipe's settings. For the set A rows
-  we used a local copy that also records each prompt's length and adds the closed-loop mode; neither is in `main` yet.
+  we used `bench.py` with the prompt-length output and the closed-loop mode of gr8 PR ⟨BENCHPR⟩.
 - The set A rows used the recipe's published image `sha-7c2088a` on one boot, between two boots of the release 1
   image `sha-ad3efdf` on the same boxes. No first-token, prefill, one-stream, many-stream or closed-loop number of the
-  new image was more than 1% worse than the mean of the two release 1 boots. The "decode after it" column was not
-  part of that test: it varies a lot from run to run (256 tokens out; single runs of 84-123 tok/s across the three
-  boots).
+  new image was more than 1% worse than the mean of the two release 1 boots. The "decode after it"
+  column is not from this image: it keeps the release 1 numbers (gr8 `0015fd0`, set A, 2026-11-08; 16, 8 and 2 runs).
 - The rows marked "release 1 settings" used an image with the engine built from `0015fd0`.
 - No tracing or per-stage timing on the measured requests.
 - A number that compares two settings comes from paired runs: both settings on the same boxes, each on a fresh boot,
