@@ -1,9 +1,11 @@
 # `--reuse-prefix`: the GPU check to run in a window
 
-The port (`engine/runtime/prefix_reuse.h` + the `g6m4.cu` hooks) is desk-verified only: it compiles and its CPU state
-machine passes `engine/tests/test_prefix_reuse.{cpp,py}`. Nothing here has run on a GPU in this lineage. This is the
-W44-style check that proves the two claims the old line measured: **a hit's output is the cold run's bit for bit**, and
-**a hit's TTFT is far below cold's**.
+The port (`engine/runtime/prefix_reuse.h` + the `g6m4.cu` hooks) compiles and its CPU state machine passes
+`engine/tests/test_prefix_reuse.{cpp,py}`. A GPU result at TP=4 is in [SETTINGS.md](SETTINGS.md) (`GR8_REUSE_ALIGN`).
+This page is the GPU check for two claims: **a hit's output equals the cold run's, bit for bit**, and **a hit's TTFT is
+far below cold's**. Open issue [#412](https://github.com/kindlingai/gr8/issues/412) reports the first claim failing at
+temperature 0 (GLM-5.3, TP=4), so read it as what this check tests, not as a result. See also
+[KNOWN-ISSUES.md](../KNOWN-ISSUES.md).
 
 ## One run, four prompts
 
@@ -20,8 +22,8 @@ and keep `--prefill 4096 --pf-lanes 2 --mtp K --graph`. `--cap` must hold `20001
 # reuse grid 4096 rows (--prefill 4096, lanes 2)
 ```
 
-Build one id corpus `P` of 20001 ids (any text; the old line used 8 seeded head ids + the KAT corpus, cycled). The four
-prompts:
+Build one id corpus `P` of 20001 ids (any text; an earlier engine used 8 seeded head ids + the KAT corpus, cycled). The
+four prompts:
 
 | n | arm | prompt ids | what it is |
 |---|-----|-----------|------------|
@@ -47,7 +49,7 @@ Read rank 0's stderr for the four `# reuse seq ...` lines and the ranks' stdout 
    - every `prefill rows a..b resid X` line with `a >= 12288` is identical between the two seqs, and
    - the two seqs have the same number of `step ...` lines (and `draft` / `chain` lines) and each one is identical.
    Seq 1 has `reuse rows 0..12287` and no prefill lines below 12288; that is the only allowed difference.
-5. **TTFT.** H's time to first token must be far below C's. The old line measured -65% over 14 requests
+5. **TTFT.** H's time to first token must be far below C's. An earlier engine measured -65% over 14 requests
    (53.8 s vs 155.6 s at `--prefill 4096 --pf-lanes 2`). Add up rank 0's `# seq 1 prefill ...` times and compare
    them with seq 3's.
 6. **No fabric or attention error words** on any rank, and `rc 0` on all six.
@@ -57,12 +59,11 @@ testing this feature.
 
 ## Deeper: every cache row
 
-Criteria 3 and 4 are the output-level proof. The old line also compared every cache row of the hit against the cold
-run with `GR8_REUSE_HDUMP=<dir> GR8_REUSE_HDUMP_SEQ=1` on a hit boot and `=3` on a cold boot (`reuse_hdump.cuh`, ported
-here; the dump format is documented at the top of that header). The reader that merges the six ranks' dumps by global
-row, `tools/reuse/hdump.py`, is NOT ported — it is at
-the hdump reader on the old line.
+Criteria 3 and 4 are the output-level proof. An earlier engine also compared every cache row of the hit against the cold
+run with `GR8_REUSE_HDUMP=<dir> GR8_REUSE_HDUMP_SEQ=1` on a hit boot and `=3` on a cold boot (`reuse_hdump.cuh`; the dump
+format is documented at the top of that header). The reader that merges the six ranks' dumps by global row is not in
+this repo.
 
-The gate arm `GR8_REUSE_POISON=1` (`reuse_poison.cuh`, ported) sets the stale rows to NaN on a hit, so a read of a row
+The gate arm `GR8_REUSE_POISON=1` (`reuse_poison.cuh`) sets the stale rows to NaN on a hit, so a read of a row
 the hit should not have retained shows up as an attention error word 4 or as different lines. A poisoned run must print
 the same lines as the same run without poison.

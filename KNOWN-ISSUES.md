@@ -31,6 +31,19 @@ Bugs we are still working out, by model. The PR that fixes one removes its entry
 - **If it happens again:** keep the rank logs of that boot (each rank's first three `prefill rows` residual lines), note which binary and
   arguments ran, and repeat the check on a fresh boot of main.
 
+### 4. A prefix-reuse hit can differ from a cold prefill at temperature 0 (TP=4, four Sparks) - Open
+
+- **Symptom:** with the default reuse rules (`GR8_REUSE_ALIGN=1`), turn 2 of a chat that reuses turn 1's KV from the pool
+  returns different text at temperature 0 than the same request on a freshly booted engine. In the report, 4 chats of two
+  turns each (a system prompt of about 3,000 tokens each; turn 1 5,334 tokens, turn 2 5,408 tokens): turn 2 after a hit
+  differed from a cold boot on 2 of 4 chats. Two cold boots agreed with each other on 4 of 4, so the cold side is
+  deterministic.
+- **Docs:** until this is fixed, read "a hit equals a cold prefill" in [docs/SETTINGS.md](docs/SETTINGS.md) and
+  [docs/REUSE-GPU-TEST.md](docs/REUSE-GPU-TEST.md) as the intended behaviour, not a measured one.
+- **Not narrowed down:** whether the difference comes from the retained rows [0, 4096) or from the re-prefilled suffix
+  [4096, 5408) (for example the drafter state, or a suffix chunk shape that differs from the cold one).
+- Tracking: [#412](https://github.com/kindlingai/gr8/issues/412).
+
 ## GLM-5.3-Flash
 
 No open bugs recorded. [docs/FLASH.md](docs/FLASH.md#not-yet) lists what Flash does not do yet.
