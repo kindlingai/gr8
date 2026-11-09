@@ -2,7 +2,7 @@
 //!
 //! Two layers:
 //! - `normalize_messages()`: vLLM's message parsing for an "openai"-content-format template (string content -> text
-//!   parts, tool results -> one string, assistant `reasoning` -> `reasoning_content`, tool-call `arguments` JSON
+//!   parts, tool results -> one string, assistant `reasoning_content` or `reasoning` -> both, tool-call `arguments` JSON
 //!   strings -> objects, `developer` -> merged `system`).
 //! - `ChatTemplate::render()`: minijinja configured like transformers' jinja environment (trim_blocks,
 //!   lstrip_blocks, loop controls, Python string/dict methods, `tojson` as `json.dumps(ensure_ascii=False)`,
@@ -628,7 +628,10 @@ pub fn normalize_messages(messages: Option<&Value>, supports_developer: bool) ->
                         }
                     }
                 }
-                if let Some(r) = m.get("reasoning").filter(|r| !r.is_null()) {
+                // Clients send back whichever field the server wrote (`--reasoning-fields`). Dropping one renders
+                // the turn as an empty think block, which GLM 5.3's template keeps on every turn by default.
+                let r = m.get("reasoning_content").filter(|r| !r.is_null());
+                if let Some(r) = r.or_else(|| m.get("reasoning").filter(|r| !r.is_null())) {
                     c.insert("reasoning".into(), r.clone());
                     c.insert("reasoning_content".into(), r.clone());
                 }
@@ -822,6 +825,19 @@ mod tests {
     }
     use crate::thinking::{resolve, Defaults};
     use serde_json::json;
+
+    #[test]
+    fn assistant_reasoning_content_is_kept() {
+        let r = |m: Value| normalize_messages(Some(&json!([m])), false).unwrap()[0].clone();
+        let m = r(json!({"role": "assistant", "content": "a", "reasoning_content": "rc"}));
+        assert_eq!((&m["reasoning"], &m["reasoning_content"]), (&json!("rc"), &json!("rc")));
+        let m = r(json!({"role": "assistant", "content": "a", "reasoning": "r"}));
+        assert_eq!(m["reasoning_content"], json!("r"));
+        let m = r(json!({"role": "assistant", "content": "a", "reasoning_content": "rc", "reasoning": "r"}));
+        assert_eq!(m["reasoning_content"], json!("rc"));
+        let m = r(json!({"role": "assistant", "content": "a", "reasoning_content": null, "reasoning": "r"}));
+        assert_eq!(m["reasoning_content"], json!("r"));
+    }
 
     /// GLM 5.3's effort lines and generation prompt, with a minimal message loop.
     const GLM_HEAD: &str = r#"[gMASK]<sop>
