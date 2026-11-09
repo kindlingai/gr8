@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Redraw the README's recipe cards: docs/cards/<recipe>.png from each recipe's kindling.json, with bench/gif.py card.
+# Redraw the README's recipe cards: docs/cards/<recipe>.png from each recipe's kindling.json, with bench/gif.py card,
+# and the switch card docs/cards/switching.png from docs/cards/switching.json with docs/cards/switch_card.py.
 #   docs/cards/make.sh                         fetch each kindling.json from the recipe's main branch on GitHub
 #   KINDLING_DIR=DIR docs/cards/make.sh        read DIR/<recipe>/kindling.json instead (local clones)
 #   FONT_DIR=DIR docs/cards/make.sh            draw with DIR/JetBrainsMono-Regular.ttf and DIR/SpaceGrotesk-Bold.ttf
@@ -20,3 +21,4 @@ for r in $RECIPES; do
   fi
   python3 bench/gif.py card "$src" --out "docs/cards/$r.png" "${fonts[@]}"
 done
+python3 docs/cards/switch_card.py docs/cards/switching.json --out docs/cards/switching.png "${fonts[@]}"
