@@ -224,6 +224,8 @@ impl Limit {
             _ => Err(want()),
         };
         match s.split_once('|') {
+            // 0 tokens would win every request, so the fraction would never count
+            Some((n, _)) if tokens(n)? == 0 => Err(format!("{s:?}: a pair needs a token count above 0")),
             Some((n, f)) => Ok(Limit::Either(tokens(n)?, fraction(f)?)),
             None if s.trim().ends_with('x') => Ok(Limit::Fraction(fraction(s)?)),
             None => Ok(Limit::Tokens(tokens(s)?)),
@@ -1208,6 +1210,7 @@ mod tests {
             "|0.5x",
             "16384|0.5",
             "0.5x|16384",
+            "0|0.5x",
             "1|2|0.5x",
         ] {
             assert!(Limit::parse(bad).is_err(), "{bad}");

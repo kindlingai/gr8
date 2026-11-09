@@ -161,7 +161,7 @@ class ValidateTests(unittest.TestCase):
         self.check(['--peers', PEERS, '--default-max-tokens', '4k'], 'want a whole number')
         self.check(['--peers', PEERS, '--default-reasoning-effort', 'none'], 'cannot turn thinking off')
         self.check(['--peers', PEERS, '--default-reasoning-effort', 'auto'], 'want minimal, low, medium')
-        for bad in ('-1', '4k', '1.5x', '0.5', '16384|', '16384|0.5', '0.5x|16384', '16384|1.5x', '1|2|0.5x'):
+        for bad in ('-1', '4k', '1.5x', '0.5', '16384|', '16384|0.5', '0.5x|16384', '16384|1.5x', '1|2|0.5x', '0|0.5x'):
             self.check(['--peers', PEERS, '--default-thinking-budget', bad], '--default-thinking-budget')
         self.check(['--peers', PEERS, '--default-thinking-budget', '-1'], 'want a token count')
         self.check(['--peers', PEERS, '--default-thinking-budget', '1.5x'], 'want a fraction from 0x to 1x')

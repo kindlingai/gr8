@@ -344,6 +344,8 @@ def limit_error(value):
     if sep:
         if not re.fullmatch(r'[0-9]+', n.strip()):
             return want
+        if int(n) == 0:
+            return f'{value!r}: a pair needs a token count above 0'
     elif value.strip().endswith('x'):
         f = value
     elif re.fullmatch(r'[0-9]+', value.strip()):
