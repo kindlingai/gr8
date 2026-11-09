@@ -72,7 +72,9 @@ knobs:
     unset: "unset"
     legacy: []
     doc: >-
-      Seconds the supervisor keeps a refused boot's status up, 15 when unset.
+      Seconds the head keeps a refused boot's status up, 15 when unset. It then keeps answering until every worker has
+      the refusal (a box still fetching says hello late), at most JOIN_TIMEOUT seconds more; not when the refusal is the
+      head's own join timeout or a rank that stopped asking. GR8_JOIN_TIMEOUT=0 adds no extra wait here.
   GR8_WORK_DIR:
     kind: path
     unset: "the repository"

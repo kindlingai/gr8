@@ -523,7 +523,7 @@ Read by the build or the launcher, never by the engine.
 | `GR8_NVCC_CACHE_DIR` | path | ~/.cache/gr8-nvcc |  | Where the compile cache keeps outputs. |
 | `GR8_NVCC_CACHE_LOG` | path | unset |  | A file that gets one hit, miss or pass line per compile. |
 | `GR8_PSEUDO_TOKENIZER` | path | unset |  | CI: a tokenizer directory that turns on the pseudo engine's smoke and API tests. |
-| `GR8_REFUSAL_LINGER` | float | unset |  | Seconds the supervisor keeps a refused boot's status up, 15 when unset. |
+| `GR8_REFUSAL_LINGER` | float | unset |  | Seconds the head keeps a refused boot's status up, 15 when unset. It then keeps answering until every worker has the refusal (a box still fetching says hello late), at most JOIN_TIMEOUT seconds more; not when the refusal is the head's own join timeout or a rank that stopped asking. GR8_JOIN_TIMEOUT=0 adds no extra wait here. |
 | `GR8_TESTS` | text | `1` | 0\|1\|only | Whether scripts/build.sh builds the test binaries: 0 skips them, only builds them alone. |
 | `GR8_WIDTHS` | text | unset |  | The tensor-parallel widths scripts/build.sh builds, "3 4" for example. |
 | `GR8_WORK_DIR` | path | the repository |  | The working directory of a bare-metal install: bin/, out/, s2/, run/. |
