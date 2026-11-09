@@ -206,7 +206,8 @@ engine the recipe pins after its gr8 bump). Same columns as above; "Down" here i
 
 - The pair's stop-and-remove on this engine build took 3.1-4.3 s. On the recipe's engine 32 commits back
   (gr8 `16351164`), the same phase took about 13-14 s, most of it the fixed quit wait that gr8 #429 removed.
-- The pair's boot is loading its about 86 GB of weights and starting the engines: the pack loads 21.2 s into the
+- The pair's boot is loading its about 86 GB of weights (K4, the recipe's default at `319ed60`; the default since
+  recipe `8f1992b` is bit349, about 76 GB) and starting the engines: the pack loads 21.2 s into the
   boot, the graphs capture at 22.1 s, and the engines report ready 23 s in. The first boot after the weights were
   in place and the warm restart both waited 24.8 s (rounded) after `up -d` returned; the first boot's whole-run
   total, with nothing to stop first, was 26.5 s. The runs kept the recipe's published setting, gen cache off.

@@ -588,7 +588,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     };
     FlashModule fm{{}, FLASH_CAPTURES(G6S2_CAPTURE_ARG)};
 #undef FLASH_CAPTURES
-    // the checkpoint store on a group lease (D-331 M8 (c)): it shares its KV node with the full model's pool. Every rank
+    // the checkpoint store on a group lease: it shares its KV node with the full model's pool. Every rank
     // resizes it at the Resize commit; the head reports to the node every GR8_S2_SHARE_MS, offering what it holds only
     // while idle (GR8_KV_SHARE_WHEN=idle, default) or whenever the node asks (always), as the full model's pool does
     if (ck && ck->group()) {
