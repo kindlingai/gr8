@@ -105,7 +105,8 @@ knobs:
     unset: "native"
     doc: >-
       The release manifest the loader plans from, manifests/exlr8-manifest-NAME.json. A layer whose widths are numbers
-      loads its experts as exlr8 trellis (pmcgx-k4: layers 0-7 at K4); the other layers keep the native experts.
+      loads its experts as exlr8 trellis (k4: layers 0-7 and 38-39 at K4; k3: layers 0-39 at K3); the other layers keep
+      the native experts.
   GR8_DS_MHC_DECOMP:
     scope: agree
     kind: flag
