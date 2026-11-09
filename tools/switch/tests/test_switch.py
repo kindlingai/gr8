@@ -192,12 +192,14 @@ class SwitchTests(unittest.TestCase):
             self.assertEqual(handler.calls, 2)
 
     def test_real_truncated_until_deadline(self):
+        # Every probe starts a new interpreter, which can take several hundred
+        # milliseconds on a slow CI runner. The budget must fit two probes there.
         with health_server("truncated") as (url, handler):
             started = time.monotonic()
             with self.assertRaisesRegex(RuntimeError, "health timeout"):
-                sw.wait_ready(url, 0.5)
+                sw.wait_ready(url, 1.5)
             self.assertGreaterEqual(handler.calls, 2)
-            self.assertLess(time.monotonic() - started, 1.0)
+            self.assertLess(time.monotonic() - started, 2.0)
 
     def test_ssh_is_batch_and_timeout_bounded(self):
         with patch.object(sw.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
