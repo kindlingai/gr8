@@ -7,7 +7,7 @@ an earlier report. It talks to the front end over HTTP and to the boxes over ssh
 ./gr8 glm53 bench                      # the default level, about 20 minutes; PEERS from ./gr8's options are the boxes
 ./gr8 glm53 bench --quick              # prefill, code and prose decode, concurrent streams
 ./gr8 glm53 bench --full               # everything, with GSM8K and HumanEval
-python3 bench/bench.py --url http://HEAD:8100 --hosts 10.0.0.1,10.0.0.2 --cap 10.0.0.2=2200 --json main.json
+python3 bench/bench.py --url http://HEAD:8100 --hosts 192.0.2.1,192.0.2.2 --cap 192.0.2.2=2200 --json main.json
 python3 bench/bench.py --baseline main.json                  # this build against main's report: gates the speed
 python3 bench/bench.py compare main.json pr.json             # two reports, after the fact
 ```
