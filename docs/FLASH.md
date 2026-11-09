@@ -263,7 +263,7 @@ positions it runs, and the drafter takes its context from those (`engine/runtime
 
 The ring's rows below `p` came from the previous turn's prefill and decode taps, not from a cold prefill of this prompt,
 so drafts may differ from a cold boot's. The target verifies every draft: the output is the same as without the drafter
-(aligned is bit-exact against no cache by design; the end-to-end check on a cluster has not run, see #340). Not measured on a cluster yet: smoke, bench's `TTFT cached` with the
+(aligned is bit-exact against no cache by design; the end-to-end check on a cluster has not run). Not measured on a cluster yet: smoke, bench's `TTFT cached` with the
 drafter, and decode after a restore against a cold-prefilled request's are open on #340.
 
 Why the output should be bit-exact against no cache (by design; not yet checked end to end on a cluster): a cold prefill runs its quanta as `[kG, (k+1)G)`, and the KDA prefill is

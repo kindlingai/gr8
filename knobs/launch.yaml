@@ -368,7 +368,7 @@ options:
       glm53f, experimental: terminal = aligned plus a checkpoint at the end of every request, NOT cold-exact
       (docs/FLASH.md). aligned = session checkpoints, so a prompt that starts with an earlier prompt's tokens is
       prefilled from that prompt's last 8,192-row grid point, bit-exact by design (the end-to-end check on a cluster has
-      not run, #340; GR8_FLASH_CACHE, docs/FLASH.md). The store is the one KV_STORE (no persist=on), else memory. On
+      not run; GR8_FLASH_CACHE, docs/FLASH.md). The store is the one KV_STORE (no persist=on), else memory. On
       glm53f, KV_STORE needs it. The prefill checkpoint is taken at the boundary after the quantum that reaches the grid
       point, once that boundary's events have committed, so a store Resize that lands there comes first. Default: off.
   FLASH_STATE_BUDGET_MIB:
