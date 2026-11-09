@@ -306,6 +306,7 @@ class Supervisor:
         self.ring, self.ring_devs, self.ring_ports, self.claim_link = '', None, {}, None
         self.offers = self.variant = self.model_id = None
         self.lingered = False
+        self.refusal_logged = False   # the head printed its refusal before the extra wait
         self.check_n, self.check_lock = 0, threading.Lock()   # the engine's DIR/check.<n>, numbered per boot
 
     # ---- state ----------------------------------------------------------------------------------------------------
@@ -540,7 +541,8 @@ class Supervisor:
         if verdict.get('t') == 'ok' and fails:   # never boot past a failed check, whatever the verdict
             verdict = {'t': 'refused', 'field': 'checks', 'values': {}, 'detail': '; '.join(fails), 'exit': 4}
         if verdict.get('t') != 'ok':
-            log(handshake.describe(verdict))
+            if not self.refusal_logged:
+                log(handshake.describe(verdict))
             e = Stop(verdict.get('exit', 4), f'handshake refused: {verdict["field"]}')
             e.logged = True
             raise e
@@ -761,14 +763,34 @@ class Supervisor:
             self.head.decide({'t': 'refused', 'field': 'stopped', 'values': {}, 'detail': self.stop_why, 'exit': 1})
         v = self.head.verdict
         if v['t'] != 'ok':
+            # say why now, not after the extra wait: with a box down that wait is up to JOIN_TIMEOUT
+            log(handshake.describe(v))
+            self.refusal_logged = True
+            if not self.stop_ev.is_set():   # a stopped head does not linger: no wait to announce
+                log(self.linger_plan())
             self.linger()
         return v
 
+    def linger_plan(self):
+        """The head's line before linger(): how long it keeps answering, and for which ranks."""
+        stay = float(os.environ.get('GR8_REFUSAL_LINGER', '15'))
+        more = opt_timeout(self.o)
+        waiting = self.head.untold() if self.head is not None else []
+        if not waiting or more <= 0 or self.head.gave_up:   # JOIN_TIMEOUT 0 here: no extra wait (wait_told(0))
+            return f'head: answering late hellos with the refusal for {stay:.0f} s'
+        ranks = ', '.join(str(r) for r in waiting)
+        return (f'head: answering late hellos with the refusal for {stay:.0f} s, then up to {more:.0f} s more '
+                f'until rank{"s" if len(waiting) > 1 else ""} {ranks} {"have" if len(waiting) > 1 else "has"} it')
+
     def linger(self):
-        """Answer late hellos and polls with the head's refusal for a while before leaving."""
+        """Answer late hellos and polls with the head's refusal for GR8_REFUSAL_LINGER seconds, then on until every
+        worker has it (a box still fetching says hello late), at most JOIN_TIMEOUT more, before leaving."""
         if not self.lingered:
             self.lingered = True
-            self.stop_ev.wait(float(os.environ.get('GR8_REFUSAL_LINGER', '15')))
+            if self.stop_ev.wait(float(os.environ.get('GR8_REFUSAL_LINGER', '15'))):
+                return
+            if self.head is not None:
+                self.head.wait_told(opt_timeout(self.o), self.stop_ev)
 
     def rail_check(self, rails):
         """From each of the head's rails to the same rail of every worker (rails: every rank's pair): the control port
