@@ -60,7 +60,7 @@ prompt we measured with `TUNE=speed` is 262,219 tokens; `CAP` allows 327,680. `T
 ### Exact output
 
 The exact model: none of the speed-for-exactness switches in [FIRST-BOOT.md](FIRST-BOOT.md#3-deepseek-v41-flash-ds41-speed-against-exactness),
-Engram on, 5 chat slots, four GB10 boxes on one 200G switch. gr8's own launcher gives exact output by default.
+Engram on, 5 chat slots, four GB10 boxes on one 200G switch. gr8's own launcher gives exact output with `EXACT=1`.
 
 | | tok/s |
 |---|---|
@@ -97,7 +97,7 @@ exact model instead. We booted the recipe's image `sha-ad3efdf` on four boxes on
 212.7 s to `serving:`, a switch from GLM-5.3 after that 37-39 s, a chat answered after each boot, 73 of 75 on the
 75-item check in fast mode): if a step fails, tell us.
 
-With gr8's own launcher, which gives exact output by default:
+With gr8's own launcher, which runs the release stack's v2 prefill by default (`EXACT=1` for exact output):
 
 1. Fetch the whole release to local NVMe on every box (510.6 GB a box).
 2. Write the Engram token map once.
@@ -117,7 +117,8 @@ check 6 rows for each of 8 chats. Its settings come in three groups, each set in
   ([Q4](FIRST-BOOT.md#q4-a-smaller-output-head)).
 - Two speed up prefill with the same output bits: `GR8_DS_ATTN_TC_MF=2` and `GR8_DS_ATTN_TC_TILE=1` ([ENV.md](ENV.md)).
 - The release stack: the v2 prefill path (`GR8_DS_PF_V2=1`) with 8,192-row chunks, its wire settings, the two-rail
-  split, and Engram reads with io_uring. One of them, `GR8_DS_SH_TC=1`, changes the output. The recipe README's
+  split, and Engram reads with io_uring. One of them, `GR8_DS_SH_TC=1`, changes the output. gr8's launcher sets the
+  same stack by default ([The prefill path](#the-prefill-path)). The recipe README's
   [What `TUNE=speed` sets](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark#what-tunespeed-sets) has
   one line for each. Engram's io_uring reads need the recipe's seccomp profile; without it, Engram reads with threads
   and gives the same output.
@@ -125,8 +126,23 @@ check 6 rows for each of 8 chats. Its settings come in three groups, each set in
 With more than 5 chats it also sets `GR8_DS_SESS_DRAFTS=1`: each chat drafts fewer tokens as more chats write, and
 none when more than 24 write at once.
 
-gr8's own launcher (`./gr8 ds41 up`) still defaults to exact output: 5 chats at once and `CAP` 262,144 (a request
-holds at most 262,134 tokens).
+gr8's own launcher (`./gr8 ds41 up`) defaults to 5 chats at once and `CAP` 262,144 (a request holds at most 262,134
+tokens). It sets the release stack's prefill words, and not the fast decode words above.
+
+### The prefill path
+
+- Default: the v2 prefill (`GR8_DS_PF_V2=1`) for layers 0..20 of each prompt chunk. The launcher also sets 8,192-row
+  chunks, one prefill lane, the 128-row late tail, `GR8_DS_SH_TC=1`, v2's own-row gate, its 1 MiB two-rail stripe and
+  pipelined attention, 64 Engram read threads, `GR8_DS_ATTN_TC_TILE=2`, `GR8_S2_ADMIT_HOLD=1` and `GR8_S2_TAIL_FIRST=1`.
+  `GR8_DS_SH_TC=1` changes the output bits.
+- Exact output: `EXACT=1` in `cluster.env` (or `--exact 1`). The launcher then sets the old prefill stack: two lanes,
+  4,096-row chunks, `GR8_DS_SH_TC` unset (0). This is the same word list as before v2 became the default.
+- The 1M-token context with `GR8_DS_MHC_ROW_SHARD=1` in `EXTRA_ENV`, and `GR8_DS_PF_V2=0` in `EXTRA_ENV`, also select
+  the old stack.
+- The engine never stops for v2. Where v2's conditions fail (a trellis release, two lanes, a tail other than 128,
+  `GR8_DS_SH_TC=0`, the row split, an offline run), each rank logs one line and runs the old path, for example:
+  `# rank 0 DS41 prefill: GR8_DS_PF_V2=1 not used: GR8_DS_SH_TC=0 (exact output); the old range-A path runs`.
+  With W above 4,096 the line adds `W-row chunks of 4096 rows (not 8192)`.
 
 With either, a request that names no reasoning effort gets low (50), one that names no `max_tokens` gets 32,768
 (`DEFAULT_MAX_TOKENS`), and one that names no `top_p` samples with 0.95.

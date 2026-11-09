@@ -62,8 +62,9 @@ redraws them). The model pages give each benchmark and its date.</sub>
   (measured 2026-11-05, gr8 94a3823).
 - **Many chats at once, and long ones.** GLM-5.3 decodes 8 requests at once from a KV pool of up to 614,400 tokens
   (TP=6). GLM-5.3-Flash on one box decodes 4 at once from a 700,032-token pool. DeepSeek-V4.1-Flash runs 32 chats
-  at once in fast mode, its recipe's default, each up to 327,670 tokens; `./gr8 ds41 up` defaults to exact output and
-  5 chats. With `CAP=1048576` and 16 chats, one request can hold up to 1,048,566 tokens, prompt and reply
+  at once in fast mode, its recipe's default, each up to 327,670 tokens; `./gr8 ds41 up` defaults to the release
+  stack's v2 prefill and 5 chats (`EXACT=1` for exact output). With `CAP=1048576` and 16 chats, one request can hold
+  up to 1,048,566 tokens, prompt and reply
   ([docs/FIRST-BOOT.md](docs/FIRST-BOOT.md#2-deepseek-v41-flash-ds41-how-many-chats-and-how-long)).
 - **Prefix reuse and KV below the pool.** A request that continues a conversation prefills only its new part: a
   continued 20K-token conversation takes 7.1 s instead of 17.3 s (GLM-5.3, TP=4). On GLM-5.3, evicted prefixes can go
@@ -110,8 +111,8 @@ setting, and has bare metal and Kubernetes. An agent that starts gr8 for someone
 is the quickest way: the same image on every box, in fast mode by default. We booted that image (`sha-ad3efdf`) on four
 boxes on 2026-11-09: first boot (cold disk) 212.7 s to `serving:`, a switch from GLM-5.3 after that 37-39 s, a chat
 answered after each boot, and 73 of 75 on the 75-item check.
-[docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is the boot with gr8's own launcher, which gives exact output by default,
-in order, from the four boxes to a passing `./gr8 ds41 smoke`.
+[docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is the boot with gr8's own launcher (the v2 prefill by default, `EXACT=1`
+for exact output), in order, from the four boxes to a passing `./gr8 ds41 smoke`.
 
 ### With model-loader
 

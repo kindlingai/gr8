@@ -156,9 +156,13 @@ knobs:
     default: "0"
     values: "0|1"
     doc: >-
-      Experimental sequence-parallel prefill conductor for layers 0..20. Own-row residual state,
+      The v2 sequence-parallel prefill for layers 0..20 of a W-row chunk. Own-row residual state,
       a dedicated fabric and high-priority communication stream; late layers remain on the stock path.
-      Needs TP4, one prefill lane and a 128-row late tail. Off leaves the stock path unchanged.
+      The launcher sets 1 for DS41 (the release stack); EXACT=1 leaves it unset. It runs where these hold:
+      serve, W-row prefill, TP4, W 256..8192 in steps of 256, GR8_DS_PF_TAIL 128, one lane, no
+      GR8_DS_PF_L20_TAIL, GR8_DS_SH_TC=1, no GR8_DS_MHC_ROW_SHARD, and native MXFP4 experts in layers 0..20.
+      Elsewhere the boot logs one line naming the failed condition and runs the old range-A path, with
+      W-row chunks of at most 4096 rows. 0 runs the old path.
   GR8_DS_PF_V2_GATE_RO:
     scope: local
     kind: flag
@@ -266,6 +270,7 @@ knobs:
     unset: "1, one lane"
     doc: >-
       1 or 2. 2 runs W-row prefill quanta of up to 2W rows of one session on two lanes with their own streams and fabric.
+      The launcher sets 1 for DS41 (v2 needs one lane) and 2 with EXACT=1.
   GR8_DS_PF_LATE_FINAL:
     scope: agree
     kind: flag
