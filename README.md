@@ -58,7 +58,7 @@ redraws them). The model pages give each benchmark and its date.</sub>
 - **Three models, one to six boxes.** GLM-5.3 on three to six boxes, GLM-5.3-Flash on one to four, DeepSeek-V4.1-Flash
   on four ([Models and install](#models-and-install)).
 - **Boots from its own cache.** On GLM-5.3 each box fetches only its own part of the release, once. After that, GLM-5.3 boots in
-  about 40 s and GLM-5.3-Flash on one box in 45 s.
+  about 40 s (measured 2026-10-10, gr8 36e5f70) and GLM-5.3-Flash on one box in 45 s (measured 2026-11-05, gr8 94a3823).
 - **Many chats at once, and long ones.** GLM-5.3 decodes 8 requests at once from a KV pool of up to 614,400 tokens
   (TP=6). GLM-5.3-Flash on one box decodes 4 at once from a 700,032-token pool. DeepSeek-V4.1-Flash runs 32 chats
   at once in fast mode, its recipe's default, each up to 327,670 tokens; `./gr8 ds41 up` defaults to exact output and
