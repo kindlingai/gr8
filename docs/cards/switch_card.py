@@ -16,8 +16,9 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 W, H, S = 800, 600, 2                   # drawn at S times the size, then scaled down: smooth lines
-BG, PANEL, LINE = '#1E1A15', '#29241D', '#3D352B'   # the warm charcoal of the results cards (bench/gif.py)
-TEXT, MUTED, ORANGE, CREAM = '#F2EDE4', '#A39A8C', '#FF6B1A', '#F6E7C8'
+BG_TOP, BG_BOTTOM, PANEL, LINE = '#2A160C', '#120A06', '#361E11', '#5A3218'   # ember: dark brown to near black
+TEXT, MUTED, CHIP = '#FFF1E2', '#C49A7A', '#FFA23A'
+ORANGE, AMBER = '#FF6B1A', '#FFC24A'    # Kindling orange and amber, as in bench/gif.py
 BOW_OUT, BOW_IN = 0.16, 0.048           # curve depth as a share of the chip distance; inner arrows bow less
 MONO = ['JetBrainsMono-Regular.ttf', 'JetBrainsMono[wght].ttf', 'DejaVuSansMono.ttf']
 DISPLAY = ['SpaceGrotesk-Bold.ttf', 'SpaceGrotesk[wght].ttf', 'DejaVuSans-Bold.ttf']
@@ -60,9 +61,23 @@ def bezier(p0, c, p1, t):
             (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * c[1] + t * t * p1[1])
 
 
-def curved_arrow(dr, p0, ctrl, p1, width, color):
+def rgb(h):
+    return tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def mix(a, b, t):
+    return tuple(round(x + (y - x) * t) for x, y in zip(rgb(a), rgb(b)))
+
+
+def curved_arrow(dr, p0, ctrl, p1, width):
+    """orange where the switch starts, amber at the head"""
     pts = [bezier(p0, ctrl, p1, i / 40) for i in range(41)]
-    dr.line(pts, fill=color, width=width, joint='curve')
+    for i in range(40):
+        c = mix(ORANGE, AMBER, i / 39)
+        dr.line(pts[i:i + 2], fill=c, width=width)
+        x, y = pts[i + 1]
+        dr.ellipse([x - width / 2, y - width / 2, x + width / 2, y + width / 2], fill=c)
+    color = AMBER
     b, a = pts[-1], pts[-3]
     ang = math.atan2(b[1] - a[1], b[0] - a[0])
     L, sp = 12 * S, 0.45
@@ -83,7 +98,7 @@ def label(dr, anchor, nrm, gap, text, f):
     x = anchor[0] + nrm[0] * (gap + reach) - w / 2
     y = anchor[1] + nrm[1] * (gap + reach) - h / 2
     dr.rounded_rectangle([x - pad, y - pad, x + w + pad, y + h + pad], radius=6 * S, fill=PANEL)
-    dr.text((x - l, y - t), text, font=f, fill=CREAM)
+    dr.text((x - l, y - t), text, font=f, fill=AMBER)
 
 
 def draw(doc, out, mono_path=None, display_path=None):
@@ -92,8 +107,10 @@ def draw(doc, out, mono_path=None, display_path=None):
         sys.exit('switch_card.py: the card draws exactly three models')
     title_f, chip_f = font(display_path, DISPLAY, 24), font(display_path, DISPLAY, 17)
     small_f, num_f, note_f = font(mono_path, MONO, 12), font(mono_path, MONO, 14), font(mono_path, MONO, 11)
-    im = Image.new('RGB', (W * S, H * S), BG)
+    im = Image.new('RGB', (W * S, H * S))
     dr = ImageDraw.Draw(im)
+    for y in range(H * S):
+        dr.line([(0, y), (W * S, y)], fill=mix(BG_TOP, BG_BOTTOM, y / (H * S)))
     dr.rounded_rectangle([1 * S, 1 * S, (W - 2) * S, (H - 2) * S], radius=14 * S, outline=LINE, width=2 * S)
     dr.text((28 * S, 22 * S), doc['title'].upper(), font=title_f, fill=TEXT)
     dr.text((28 * S, 56 * S), doc['subtitle'], font=small_f, fill=MUTED)
@@ -102,7 +119,7 @@ def draw(doc, out, mono_path=None, display_path=None):
     x, y = (W - 30) * S - w, 30 * S
     dr.rounded_rectangle([x - 14 * S, y - 8 * S, x + w + 14 * S, y + h + 8 * S], radius=8 * S,
                          fill=PANEL, outline=LINE, width=S)
-    dr.text((x - l, y - t), doc['command'], font=num_f, fill=ORANGE)
+    dr.text((x - l, y - t), doc['command'], font=num_f, fill=AMBER)
 
     ids = [m['id'] for m in doc['models']]
     centre = {ids[0]: (400 * S, 135 * S), ids[1]: (165 * S, 392 * S), ids[2]: (635 * S, 392 * S)}
@@ -125,12 +142,12 @@ def draw(doc, out, mono_path=None, display_path=None):
         ctrl = (m0[0] + nrm[0] * k, m0[1] + nrm[1] * k)
         p0 = edge_point(a, (half[sw['from']][0] + 8 * S, half[sw['from']][1] + 8 * S), (ctrl[0] - a[0], ctrl[1] - a[1]))
         p1 = edge_point(b, (half[sw['to']][0] + 8 * S, half[sw['to']][1] + 8 * S), (ctrl[0] - b[0], ctrl[1] - b[1]))
-        curved_arrow(dr, p0, ctrl, p1, 3 * S, ORANGE)
+        curved_arrow(dr, p0, ctrl, p1, 3 * S)
         label(dr, bezier(p0, ctrl, p1, 0.5), nrm, 10 * S, glyph(u) + ' ' + seconds(sw['seconds']), num_f)
 
     for i in ids:
         (cx, cy), (hw, hh) = centre[i], half[i]
-        dr.rounded_rectangle([cx - hw, cy - hh, cx + hw, cy + hh], radius=6 * S, fill=PANEL, outline=ORANGE,
+        dr.rounded_rectangle([cx - hw, cy - hh, cx + hw, cy + hh], radius=6 * S, fill=PANEL, outline=CHIP,
                              width=2 * S)
         m = models[i]
         for text, f, color, dy in ((m['name'], chip_f, TEXT, -9 * S), (m['detail'], small_f, MUTED, 13 * S)):
