@@ -409,8 +409,9 @@ class Console:
             mine = since_model_set(data, current) if current and current != old_id else None
             reason = boot_failure(mine, after) if mine else None
             if reason:
+                # Record only. The operation thread reports it if the switch then fails: a reading taken just
+                # as the switch succeeds must not leave a "Boot failed" step on a job that succeeded.
                 failure.append(reason)
-                self._emit("Boot failed: " + reason)
                 abort.set()
                 return
             for line in data.splitlines() if download else ():
@@ -507,6 +508,7 @@ class Console:
                     self.control.activate(model, self._emit, health_timeout=download["health"] if download else None, abort=abort)
                 except Exception:
                     if failure:
+                        self._emit("Boot failed: " + failure[0])
                         raise RuntimeError(f"Boot failed: {failure[0]}. The boxes may keep restarting the engine; "
                                            "inspect them before you try again.") from None
                     raise

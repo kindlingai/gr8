@@ -34,6 +34,7 @@ class Fixture:
         self.on_stop = None        # called inside stop(): the old deployment logs something before it goes down
         self.live_id = None        # the model_id the head supervisor reports while switching
         self.activate_wait = 0
+        self.exit_wait = 0         # seconds gr8 switch takes to exit after health ready (it does not abort then)
         self.calls = []
         self.texts = {m: {f"box-{i}": "# fixture dotenv\nSESS=4\nEXTRA_ENV='KEEP_ME=1'\n"
                           for i in range(2 if m == "glm53f" else 4)} for m in DEFAULT_IDS}
@@ -159,6 +160,8 @@ class Fixture:
                 raise RuntimeError("switch command stopped: the engine failed to boot")
             self.active = model
             emit("fixture: gr8 switch completed; health ready")
+            if self.exit_wait:
+                time.sleep(self.exit_wait)
         finally:
             self.switching = False
 

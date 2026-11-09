@@ -752,6 +752,18 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("Boot failed: " + self.FAILED, job["steps"])
         self.assertNotIn("peer closed", job["error"])
 
+    def test_a_failure_seen_as_the_switch_succeeds_leaves_no_boot_failed_step(self):
+        # Health is ready, but gr8 switch has not exited yet when the watcher reads an exit in the log.
+        # The switch succeeded, so the job must not show "Boot failed".
+        self.console.watch_interval = 0.02
+        self.fake.old_log = self.supervisor_log(int(time.time()) - 600)
+        self.fake.supervisor_log = self.supervisor_log(int(time.time()) + 1, self.FAILED)
+        self.fake.exit_wait = 0.3
+        self.console.submit(self.request())
+        job = self.done()
+        self.assertEqual(job["status"], "succeeded", job)
+        self.assertFalse([step for step in job["steps"] if step.startswith("Boot failed")], job["steps"])
+
     def test_without_a_baseline_only_a_boot_from_this_second_on_counts(self):
         # No supervisor answered before the operation, so the console has no epoch to compare.
         self.console.watch_interval = 0.02
