@@ -31,6 +31,33 @@ inline bool boot_ok(int width, int tail, int nr, int lanes, int late_layer) {
     return nr == 4 && width >= 256 && width <= MAX_ROWS && width % 256 == 0 &&
            tail == 128 && lanes == 1 && late_layer == FIRST_LATE;
 }
+// GR8_DS_PF_V2=1 asks for v2; the boot runs it only where these hold. Anything else is not an error:
+// layers 0..20 then run the old range-A path (the stock ops), and the boot logs one line with the reason.
+// Knob-time inputs (the fabric plan sees them); the release's experts are checked after the weights bind.
+struct BootIn {
+    bool serve = false;       // g6m4 --serve (offline g6m4 and m4sim are not)
+    bool prefill = false;     // W-row prefill admitted (GR8_DS_PREFILL_MIN > 0)
+    int width = 0, tail = 0, nr = 0, lanes = 1, late_layer = FIRST_LATE;
+    bool sh_tc = false;       // GR8_DS_SH_TC=1: v2's FFN reads the tensor-core shared weights
+    bool row_shard = false;   // GR8_DS_MHC_ROW_SHARD=1, the 1M-context setup
+};
+// nullptr = v2 can run. Otherwise the failed condition, for the boot's one log line.
+inline const char* fallback_reason(const BootIn& b) {
+    if (!b.serve) return "not a serve run (offline or simulator)";
+    if (!b.prefill) return "no W-row prefill (GR8_DS_PREFILL_MIN=0)";
+    if (b.nr != 4) return "TP is not 4";
+    if (b.width < 256 || b.width > MAX_ROWS || b.width % 256) return "GR8_DS_PREFILL_W is not 256..8192 in steps of 256";
+    if (b.tail != 128) return "GR8_DS_PF_TAIL is not 128";
+    if (b.lanes != 1) return "GR8_DS_PF_LANES is not 1";
+    if (b.late_layer != FIRST_LATE) return "GR8_DS_PF_L20_TAIL=1 moves the late range to layer 20";
+    if (!b.sh_tc) return "GR8_DS_SH_TC=0 (exact output)";
+    if (b.row_shard) return "GR8_DS_MHC_ROW_SHARD=1 (the 1M-context setup)";
+    return nullptr;
+}
+// The rows a W-row chunk may take on the old path (the read-once MoE plan, ds41moe::ROMAX). A fallback from a
+// larger v2 width runs chunks of this many rows; the buffers sized for the larger width stay.
+constexpr int OLD_MAX_ROWS = 4096;
+inline int fallback_width(int width) { return width > OLD_MAX_ROWS ? OLD_MAX_ROWS : width; }
 inline size_t aligned(size_t n, size_t a = 16) { return (n + a - 1) / a * a; }
 
 // Physical ids group similar capacities into the fabric's three slot runs.
