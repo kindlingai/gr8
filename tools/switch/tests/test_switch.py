@@ -53,7 +53,7 @@ def health_server(mode):
                     for byte in b'{"ready": true}':
                         self.wfile.write(bytes([byte]))
                         self.wfile.flush()
-                        time.sleep(0.08)
+                        time.sleep(0.2)
                 elif mode == "truncated" or (mode == "recover" and self.calls == 1):
                     self.send_response(200)
                     self.send_header("Transfer-Encoding", "chunked")
@@ -173,18 +173,18 @@ class SwitchTests(unittest.TestCase):
         with health_server("trickle") as (url, handler):
             started = time.monotonic()
             with self.assertRaisesRegex(RuntimeError, "health timeout"):
-                sw.wait_ready(url, 0.3)
+                sw.wait_ready(url, 1.0)
             elapsed = time.monotonic() - started
             self.assertGreaterEqual(handler.calls, 1)
-            self.assertLess(elapsed, 0.8)  # Entire body takes over a second.
+            self.assertLess(elapsed, 1.5)  # The entire body takes 3 s.
 
     def test_real_header_trickle_has_wall_clock_deadline(self):
         with health_server("headers") as (url, handler):
             started = time.monotonic()
             with self.assertRaisesRegex(RuntimeError, "health timeout"):
-                sw.wait_ready(url, 0.3)
+                sw.wait_ready(url, 1.0)
             self.assertGreaterEqual(handler.calls, 1)
-            self.assertLess(time.monotonic() - started, 0.8)
+            self.assertLess(time.monotonic() - started, 1.5)
 
     def test_real_truncated_then_success(self):
         with health_server("recover") as (url, handler):
