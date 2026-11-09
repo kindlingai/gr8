@@ -13,8 +13,6 @@ import math
 import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
-
 W, H, S = 800, 600, 2                   # drawn at S times the size, then scaled down: smooth lines
 BG_TOP, BG_BOTTOM, PANEL, LINE = '#2A160C', '#120A06', '#361E11', '#5A3218'   # ember: dark brown to near black
 TEXT, MUTED, CHIP = '#FFF1E2', '#C49A7A', '#FFA23A'
@@ -25,6 +23,7 @@ DISPLAY = ['SpaceGrotesk-Bold.ttf', 'SpaceGrotesk[wght].ttf', 'DejaVuSans-Bold.t
 
 
 def font(path, names, size):
+    from PIL import ImageFont
     for p in ([path] if path else names):
         try:
             return ImageFont.truetype(p, size * S)
@@ -102,6 +101,7 @@ def label(dr, anchor, nrm, gap, text, f):
 
 
 def draw(doc, out, mono_path=None, display_path=None):
+    from PIL import Image, ImageDraw   # here, not at the top: the tests of seconds() and glyph() run without Pillow
     models = {m['id']: m for m in doc['models']}
     if len(models) != 3:
         sys.exit('switch_card.py: the card draws exactly three models')

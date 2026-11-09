@@ -529,6 +529,10 @@ class SwitchCard(unittest.TestCase):
     CARD = Path(__file__).resolve().parents[2] / 'docs' / 'cards' / 'switch_card.py'
 
     def test_draws_the_repo_card(self):
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest('Pillow is not installed')
         with tempfile.TemporaryDirectory() as t:
             out = Path(t) / 'switching.png'
             p = subprocess.run([sys.executable, str(self.CARD), str(self.CARD.parent / 'switching.json'),
