@@ -322,7 +322,8 @@ async fn read_json_raw(req: Request<Incoming>) -> Result<(Map<String, Value>, By
 
 /// A nonzero penalty needs an engine whose hello says `"penalties": true`, a think-end boost one that says
 /// `"think_end_boost": true` (PROTOCOL.md). The thinking penalties and the boost apply inside the think block the prompt
-/// leaves open, so the frame names its close (`think_end`) when there is one. A boost with no open block is dropped.
+/// leaves open, and the sequence penalty's answer scope outside it, so the frame names its close (`think_end`) when
+/// there is one. A boost or a thinking scope with no open block is dropped.
 fn check_penalties(st: &State, prompt: &[u32], g: &mut crate::wire::GenParams) -> Result<(), ApiError> {
     if g.think_end_boost.is_some() && !st.engine.think_end_boost() {
         return Err(ApiError::bad("think_end_boost is not supported by this engine", Some("think_end_boost")));
@@ -345,6 +346,7 @@ fn check_penalties(st: &State, prompt: &[u32], g: &mut crate::wire::GenParams) -
         || g.thinking_frequency_penalty != 0.0
         || g.think_end_boost.is_some()
         || g.seq_thinking.is_some()
+        || g.seq_answer.is_some()
     {
         g.think_end = match (st.tok.think_start, st.tok.think_end) {
             (Some(s), Some(e)) if think_open(prompt, s, e) => Some(e),

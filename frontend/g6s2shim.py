@@ -16,7 +16,8 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
         [boost <start> <per1k> <max>] [seqt <mult>:<base>:<min>:<cap>] [seqa <mult>:<base>:<min>:<cap>]
         [seqg <mult>:<base>:<min>:<cap>:<id,id,...>] [lp <k>] [plp <k>]
                                                             (pen: the generate frame's penalties, each in [-2, 2], and the
-                                                             think block's close, when one is nonzero or a boost is on;
+                                                             think block's close, when one is nonzero, a boost is on,
+                                                             or a seq scope is on and the close is known;
                                                              boost: the frame's think_end_boost; seqt / seqa / seqg: the
                                                              frame's sequence_penalty scopes; all only when the head wrote
                                                              DIR/penalty.s2, boost and seq when that file names them)
@@ -347,19 +348,20 @@ def build_request(f: dict, ordinal: int, steering: dict | None = None):
             if v is None:
                 continue
             try:
-                mult, base, mn, cap = float(v['mult']), float(v['base']), int(v['min']), float(v['cap'])
+                mult, base, smin, cap = float(v['mult']), float(v['base']), int(v['min']), float(v['cap'])
                 avoid = list(v['avoid']) if scope == 'guard' else []
             except (TypeError, ValueError, KeyError, OverflowError):
                 return None, f'bad sequence_penalty.{scope}'
             if isinstance(v['min'], bool) or not (math.isfinite(mult) and mult >= 0 and math.isfinite(base) and base >= 1
-                                                 and mn >= 1 and math.isfinite(cap) and 0 <= cap <= 20):
+                                                 and smin >= 1 and math.isfinite(cap) and 0 <= cap <= 20):
                 return None, f'sequence_penalty.{scope}: want mult >= 0, base >= 1, min >= 1 and cap 0..20'
             if scope == 'guard' and (not 1 <= len(avoid) <= 4096 or any(
                     not isinstance(i, int) or isinstance(i, bool) or not 0 <= i < VOCAB for i in avoid)):
                 return None, 'sequence_penalty.guard.avoid: 1 to 4096 token ids'
             if mult > 0 and cap > 0:
-                seq += f' {word} {mult!r}:{base!r}:{mn}:{cap!r}' + (':' + ','.join(map(str, avoid)) if avoid else '')
-    if any(pens) or boost:
+                seq += f' {word} {mult!r}:{base!r}:{smin}:{cap!r}' + (':' + ','.join(map(str, avoid)) if avoid else '')
+    # pen carries think_end, which the engine needs to tell thinking from the answer for boost and seqt/seqa
+    if any(pens) or boost or (seq and think_end is not None):
         pen = ' pen ' + ' '.join(repr(x) for x in pens) + f" {-1 if think_end is None else think_end}"
     lps = {}
     for key, word in (('logprobs', 'lp'), ('prompt_logprobs', 'plp')):
