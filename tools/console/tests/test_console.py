@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 
 from tools.console.server import envfile, metrics, presets, weights
 from tools.console.server.main import create_app
-from tools.console.server.service import Console, boot_failure, fetch, rpc
+from tools.console.server.service import Console, boot_failure, fetch, latest_epoch, rpc
 from tools.console.tests.fakes import Fixture
 
 
@@ -306,6 +306,14 @@ class BootFailureTests(unittest.TestCase):
         self.assertIsNone(boot_failure(old + self.START % 5000, 4990))
         self.assertIsNotNone(boot_failure(old + self.START % 5000 + self.RANK, 4990))
 
+    def test_a_boot_counts_only_when_its_epoch_is_after_the_baseline(self):
+        text = self.START % 5000 + self.RANK
+        self.assertIsNotNone(boot_failure(text, 4999))
+        self.assertIsNone(boot_failure(text, 5000))
+        self.assertIsNone(boot_failure(text, 5001))
+        self.assertEqual(latest_epoch(self.START % 4000 + self.START % 5000 + self.RANK), 5000)
+        self.assertIsNone(latest_epoch("12:00:00 head: waiting for 3 hellos\n"))
+
     def test_failure_line_before_any_start_line_is_ignored(self):
         self.assertIsNone(boot_failure(self.RANK, 0))
 
@@ -550,6 +558,7 @@ class ServiceTests(unittest.TestCase):
     def test_engine_exit_ends_the_health_wait_and_shows_the_reason(self):
         self.console.watch_interval = 0.02
         self.fake.activate_wait = 30
+        self.fake.old_log = self.supervisor_log(int(time.time()) - 600)
         self.fake.supervisor_log = self.supervisor_log(int(time.time()), self.FAILED)
         start = time.monotonic()
         self.console.submit(self.request())
@@ -565,6 +574,7 @@ class ServiceTests(unittest.TestCase):
         self.console.watch_interval = 0.02
         self.fake.activate_wait = 30
         self.fake.missing_weights = {"variant": "bit325", "size_gb": 29.7, "rate_mb_s": 28}
+        self.fake.old_log = self.supervisor_log(int(time.time()) - 600)
         self.fake.supervisor_log = self.supervisor_log(int(time.time()), self.FAILED)
         row = self.console.read_presets("glm53")
         self.console.submit(self.request(preset="quality", revision=row["revision"], accept_download=True))
@@ -576,11 +586,50 @@ class ServiceTests(unittest.TestCase):
     def test_failure_left_by_an_earlier_boot_does_not_stop_the_switch(self):
         self.console.watch_interval = 0.02
         self.fake.activate_wait = 0.6
-        self.fake.supervisor_log = self.supervisor_log(int(time.time()) - 600, self.FAILED)
+        self.fake.old_log = self.fake.supervisor_log = self.supervisor_log(int(time.time()) - 600, self.FAILED)
         self.console.submit(self.request())
         job = self.done()
         self.assertEqual(job["status"], "succeeded", job)
         self.assertFalse([step for step in job["steps"] if step.startswith("Boot failed")])
+
+    def test_crash_loop_boot_that_began_20_seconds_before_the_operation_is_not_this_boot(self):
+        # The old deployment still answers on the same control port while the switch runs. Its boot began
+        # 20 s before the operation and its head engine exits when the peers go down. That is not our boot.
+        self.console.watch_interval = 0.02
+        self.fake.activate_wait = 0.6
+        self.fake.old_log = self.fake.supervisor_log = self.supervisor_log(int(time.time()) - 20, "engine exited (1): peer closed")
+        row = self.console.read_presets("glm53")
+        self.console.submit(self.request(preset="context", revision=row["revision"]))
+        job = self.done()
+        self.assertEqual(job["status"], "succeeded", job)
+        self.assertFalse([step for step in job["steps"] if step.startswith("Boot failed")])
+
+    def test_a_new_boot_after_the_baseline_epoch_is_reported(self):
+        self.console.watch_interval = 0.02
+        self.fake.activate_wait = 30
+        before = self.supervisor_log(int(time.time()) - 20, "engine exited (1): peer closed")
+        self.fake.old_log = before
+        self.fake.supervisor_log = before + self.supervisor_log(int(time.time()) + 1, self.FAILED)
+        self.console.submit(self.request())
+        job = self.done()
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("Boot failed: " + self.FAILED, job["steps"])
+        self.assertNotIn("peer closed", job["error"])
+
+    def test_without_a_baseline_only_a_boot_from_this_second_on_counts(self):
+        # No supervisor answered before the operation, so the console has no epoch to compare.
+        self.console.watch_interval = 0.02
+        self.fake.activate_wait = 0.6
+        self.fake.old_log = ""
+        self.fake.supervisor_log = self.supervisor_log(int(time.time()) - 20, "engine exited (1): peer closed")
+        self.console.submit(self.request())
+        self.assertEqual(self.done()["status"], "succeeded")
+        self.fake.activate_wait = 30
+        self.fake.supervisor_log = self.supervisor_log(int(time.time()) + 1, self.FAILED)
+        self.console.submit(self.request())
+        job = self.done()
+        self.assertEqual(job["status"], "failed")
+        self.assertIn(self.FAILED, job["error"])
 
     def test_controls_disabled_and_confirmation_required(self):
         with self.assertRaises(ValueError):

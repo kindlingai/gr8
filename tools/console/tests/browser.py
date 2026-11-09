@@ -153,6 +153,7 @@ def run(output):
             reason = "rank 1 (box2.example) failed: engine exited (2): g6: rank 1: 7.1 GiB left after the weights; lower --cap"
             console.watch_interval = 0.1
             fixture.activate_wait = 60
+            fixture.old_log = f"12:00:01 engine started (epoch {int(time.time()) - 600}); waiting for it to load (up to 1800s)\n"
             fixture.supervisor_log = (f"12:00:01 engine started (epoch {int(time.time())}); waiting for it to load (up to 1800s)\n"
                                       f"12:01:09 {reason}\n")
             row.get_by_role("button", name="Switch", exact=True).click()
@@ -160,7 +161,7 @@ def run(output):
             expect(page.get_by_label("Operation status")).to_contain_text("failed", timeout=15000)
             expect(page.get_by_label("Operation status")).to_contain_text("Boot failed: " + reason)
             page.screenshot(path=str(output / "boot-failed-390.png"), full_page=True)
-            fixture.activate_wait, fixture.supervisor_log = 0, ""
+            fixture.activate_wait, fixture.supervisor_log, fixture.old_log = 0, "", ""
             print("PASS engine exit ends the health wait at once and shows the supervisor reason")
 
             row.get_by_role("button", name="Switch", exact=True).click()

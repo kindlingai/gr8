@@ -46,15 +46,21 @@ STARTED = re.compile(r"engine started \(epoch (\d+)\)")
 # Supervisor log lines are "HH:MM:SS text". The head logs these when an engine, its front end, or its
 # shim exits; a worker rank's exit reaches the head as "rank N (peer) failed: ...".
 FAILED = re.compile(r"^\d\d:\d\d:\d\d (rank \d+ \([^)]*\) failed: .+|(?:engine|front end|shim) exited \(.+)$")
-BOOT_SLACK = 30  # seconds of clock difference allowed between this host and a box
 WATCH_WINDOW = 262144  # bytes read from the end of the head supervisor log
 
 
-def boot_failure(text, not_before):
+def latest_epoch(text):
+    """The epoch of the last "engine started" line in this log text, or None."""
+    found = STARTED.findall(text)
+    return int(found[-1]) if found else None
+
+
+def boot_failure(text, after):
     """The supervisor's first failure line of the latest boot in this log text, or None.
 
-    A boot counts only when its "engine started (epoch E)" line has E >= not_before, so a failure line
-    left by a boot that began before this operation is not mistaken for this one."""
+    A boot counts only when its "engine started (epoch E)" line has E > after, so a failure line left
+    by a boot that began before this operation (or an old deployment that still answers) is not mistaken
+    for this one."""
     epoch, reason = None, None
     for line in text.splitlines():
         started = STARTED.search(line)
@@ -62,7 +68,7 @@ def boot_failure(text, not_before):
             epoch, reason = int(started.group(1)), None
             continue
         found = FAILED.match(line)
-        if found and reason is None and epoch is not None and epoch >= not_before:
+        if found and reason is None and epoch is not None and epoch > after:
             reason = found.group(1)[:500]
     return reason
 
@@ -334,24 +340,35 @@ class Console:
         timeout = getattr(config, "timeout", None) if config is not None else None
         return float(timeout) if timeout else 900.0
 
-    def _watch_boot(self, model, stop, abort, failure, since, download):
+    def _head_log(self, model):
+        """The tail of the head supervisor log as text, or None when no supervisor answers."""
+        controls = self.models.get(model, {}).get("controls") or []
+        if not controls:
+            return None
+        target = controls[0]
+        try:
+            data = self.call(target["host"], int(target.get("port", 7340)),
+                             {"t": "logs", "which": "supervisor", "offset": -WATCH_WINDOW}).get("data")
+        except (OSError, ValueError, TypeError):
+            return None
+        return data if isinstance(data, str) else None
+
+    def _boot_baseline(self, model):
+        """The epoch of the latest engine start already in the head log, read before this operation stops
+        anything. Only a later epoch is a boot of this operation."""
+        data = self._head_log(model)
+        return latest_epoch(data) if data else None
+
+    def _watch_boot(self, model, stop, abort, failure, after, download):
         """While a switch waits for health: log fetch-rate lines (a download), and stop the wait when the
         head supervisor reports that the engine of this boot exited. The boxes then keep restarting it, and
         the health wait would only run out its full timeout."""
         seen = set()
         while not stop.wait(self.watch_interval):
-            controls = self.models.get(model, {}).get("controls") or []
-            if not controls:
+            data = self._head_log(model)
+            if not data:
                 continue
-            target = controls[0]
-            try:
-                data = self.call(target["host"], int(target.get("port", 7340)),
-                                 {"t": "logs", "which": "supervisor", "offset": -WATCH_WINDOW}).get("data") or ""
-            except (OSError, ValueError, TypeError):
-                continue
-            if not isinstance(data, str):
-                continue
-            reason = boot_failure(data, since - BOOT_SLACK)
+            reason = boot_failure(data, after)
             if reason:
                 failure.append(reason)
                 self._emit("Boot failed: " + reason)
@@ -420,18 +437,21 @@ class Console:
                 with self.lock:
                     self.job.update(can_restore=True, backup_id=self.job["id"])
                     self._save_job()
+            # The log still holds the boot of the old deployment. Read its last epoch before the stop.
+            baseline = self._boot_baseline(model) if action in ("switch", "restart") else None
             if action in ("stop", "restart"):
                 self._emit("Stopping target on every configured box")
                 self.control.stop(model, self._emit)
             if action in ("switch", "restart"):
                 stop_watch, abort, failure = threading.Event(), threading.Event(), []
-                since = time.time()
+                # No baseline (no supervisor answered): count a boot only if it began in this second or later.
+                after = baseline if baseline is not None else int(time.time()) - 1
                 if download:
                     self._emit("downloading " + download["text"])
                     self._emit(f"health wait extended to {download['health']:.0f}s for the download")
                 elif notice:
                     self._emit(notice)
-                watcher = threading.Thread(target=self._watch_boot, args=(model, stop_watch, abort, failure, since, bool(download)), daemon=True)
+                watcher = threading.Thread(target=self._watch_boot, args=(model, stop_watch, abort, failure, after, bool(download)), daemon=True)
                 watcher.start()
                 try:
                     self.control.activate(model, self._emit, health_timeout=download["health"] if download else None, abort=abort)
