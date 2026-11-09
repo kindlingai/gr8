@@ -172,9 +172,10 @@ knobs:
   GR8_DS_PF_V2_RS_BLOCKS:
     scope: local
     kind: ints
-    default: "0"
+    default: "48"
     doc: >-
-      V2 FFN reduce-scatter only: 0 retains the eight-block scalar reduce kernel.
+      V2 FFN reduce-scatter only. The default, 48, runs the reduce with 48 blocks;
+      0 selects the eight-block scalar reduce kernel.
       Otherwise a comma list of positive block counts (e.g. 48,192,1024);
       request ID r selects list[r % length], logged once per request per rank.
       Uses aligned 16-byte cache-volatile loads and 16-byte stores with a scalar tail,
