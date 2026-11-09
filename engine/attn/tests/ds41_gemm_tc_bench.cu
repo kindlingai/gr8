@@ -1,7 +1,8 @@
 // One-GPU bench + bit gate of GR8_DS_ATTN_TC_TILE: the 128-row tile choices of launch_gemm_tc (ds41_attn.cuh) on random MXFP8 operands.
-// For each shape it runs tile 0 (k_gemm_mx8t <128,128,2>, today) and tile 1 (k_gemm_mx8t_sw <128,128,3>), compares tile 1's Y with tile 0's bit for bit
-// (memcmp of the bf16 output) and prints the time of each (cudaEvent, REPS reps after a warm-up). The shapes are the DS41 TP4 attention projections at
-// M = 4096 (q_a, kv, q_b, o_a in 4 groups, o_b). Exit 1 if any output differs.
+// For each shape it runs tile 0 (k_gemm_mx8t <128,128,2>, today), tile 1 (k_gemm_mx8t_sw <128,128,3>) and tile 2 (k_gemm_persist_ldm_epi_bid <128,128,3>,
+// persistent blocks), compares tile 1's and tile 2's Y with tile 0's bit for bit (memcmp of the bf16 output) and prints the time of each (cudaEvent,
+// REPS reps after a warm-up). The shapes are the DS41 TP4 attention projections at M = 4096 by default (q_a, kv, q_b, o_a in 4 groups, o_b); pass M
+// to change it. A shape where tile 2 fell back to tile 1 (guard failed) is flagged "persist no". Exit 1 if any output differs.
 // Build: nvcc -O3 -std=c++17 -gencode=arch=compute_121a,code=sm_121a -DG6_MODEL_DS41=1 -I engine -o ds41_gemm_tc_bench engine/attn/tests/ds41_gemm_tc_bench.cu
 // Run:   ds41_gemm_tc_bench [M]   (default 4096)
 #include "../ds41_attn.cuh"
@@ -29,8 +30,8 @@ int main(int argc, char** argv)
     const Shape shapes[] = {{"q_a", 1280, 5120, 1}, {"kv", 512, 5120, 1}, {"q_b", 8192, 1280, 1}, {"o_a", 1024, 4096, 4}, {"o_b", 5120, 4096, 1}};
     int optin = 0;
     CK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
-    printf("M %d; smem opt-in per block %d B; tile 0 <128,128,2> %zu B, tile 1 sw <128,128,3> %zu B\n", M, optin,
-           ds41a::TcCfg<128, 128, 2>::SMEM, ds41a::TcCfgSw<128, 128, 3>::SMEM);
+    printf("M %d; smem opt-in per block %d B; tile 0 <128,128,2> %zu B, tile 1 sw <128,128,3> %zu B, tile 2 persistent <128,128,3> same smem; %d SMs\n", M, optin,
+           ds41a::TcCfg<128, 128, 2>::SMEM, ds41a::TcCfgSw<128, 128, 3>::SMEM, ds41a::tc_sm_count());
     if ((size_t)optin < ds41a::TcCfgSw<128, 128, 3>::SMEM) { printf("SKIP: this device cannot run tile 1 (launch_gemm_tc falls back to tile 0)\n"); return 0; }
     bool all = true;
     cudaEvent_t e0, e1;
@@ -39,7 +40,7 @@ int main(int argc, char** argv)
     {
         const size_t na = (size_t)s.groups * M * s.K, nw = (size_t)s.groups * s.N * s.K, ny = (size_t)s.groups * M * s.N;
         uint8_t *A, *SA, *W, *SW;
-        ds41a::bf16* Y[2];
+        ds41a::bf16* Y[3];
         CK(cudaMalloc(&A, na)); CK(cudaMalloc(&SA, na / 32)); CK(cudaMalloc(&W, nw)); CK(cudaMalloc(&SW, nw / 32));
         for (auto& y : Y) CK(cudaMalloc(&y, ny * 2));
         k_fill<<<1024, 256>>>(A, na, 1u, 0); k_fill<<<256, 256>>>(SA, na / 32, 2u, 1);
@@ -47,10 +48,10 @@ int main(int argc, char** argv)
         ds41a::GemmP p{};
         p.A = A; p.SA = SA; p.W = W; p.SW = SW; p.M = M; p.N = s.N; p.K = s.K; p.lda = s.K; p.lsa = s.K / 32; p.ldy = s.N;
         p.a_gs = (size_t)M * s.K; p.sa_gs = (size_t)M * s.K / 32; p.w_gs = (size_t)s.N * s.K; p.sw_gs = (size_t)s.N * s.K / 32; p.y_gs = (size_t)M * s.N;
-        float us[2];
+        float us[3];
         std::vector<uint16_t> h0(ny), h(ny);
-        bool eq[2] = {true, true};
-        for (int tile = 0; tile < 2; ++tile)
+        bool eq[3] = {true, true, true};
+        for (int tile = 0; tile < 3; ++tile)
         {
             p.Y = Y[tile];
             CK(cudaMemset(Y[tile], 0xff, ny * 2));
@@ -66,9 +67,13 @@ int main(int argc, char** argv)
             if (tile) eq[tile] = memcmp(h.data(), h0.data(), ny * 2) == 0;
             all = all && eq[tile];
         }
+        p.Y = Y[2];
+        const bool persist = ds41a::launch_tc_persist<128, 128, 3>(p, s.groups, 0);   // does tile 2 take the persistent kernel on this shape?
+        CK(cudaDeviceSynchronize());
         const double tf = 2.0 * M * s.N * s.K * s.groups / 1e12;
-        printf("%-4s N %5d K %5d g %d | tile0 %8.1f us %6.1f TF/s | tile1 %8.1f us %6.1f TF/s (%+.1f%%) bitEq %s\n", s.name, s.N, s.K, s.groups,
-               us[0], tf / us[0] * 1e6, us[1], tf / us[1] * 1e6, (us[0] / us[1] - 1.0) * 100.0, eq[1] ? "yes" : "NO");
+        printf("%-4s N %5d K %5d g %d | tile0 %8.1f us %6.1f TF/s | tile1 %8.1f us %6.1f TF/s (%+.1f%%) bitEq %s | tile2 %8.1f us %6.1f TF/s (%+.1f%%) bitEq %s persist %s\n",
+               s.name, s.N, s.K, s.groups, us[0], tf / us[0] * 1e6, us[1], tf / us[1] * 1e6, (us[0] / us[1] - 1.0) * 100.0, eq[1] ? "yes" : "NO",
+               us[2], tf / us[2] * 1e6, (us[0] / us[2] - 1.0) * 100.0, eq[2] ? "yes" : "NO", persist ? "yes" : "no");
         CK(cudaFree(A)); CK(cudaFree(SA)); CK(cudaFree(W)); CK(cudaFree(SW));
         for (auto& y : Y) CK(cudaFree(y));
     }
