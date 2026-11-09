@@ -29,6 +29,16 @@ knobs:
     values: "0.."
     doc: >-
       Output tiles per CTA of the attention GEMV. 0 keeps the built-in 1.
+  GR8_DS_ATTN_PROJ_FUSE:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      1 = the attention projection stage (ST_ATTN_PROJ) at 1 to 8 rows runs in 5 launches instead of 10: act-quant and
+      the GEMV fragment table in one kernel; q_a and kv GEMVs in one launch; q_a norm, act-quant and fragment table in
+      one kernel; the q_b GEMV as before; rope and the window-KV prep in one kernel. Every kernel body is the stock
+      arithmetic, so every output and scratch buffer is byte-equal to 0. Needs the decode GEMV (GR8_DS_ATTN_GV=1) for
+      q_a, q_b and kv; any other case keeps the stock launches. 0 = the stock launches.
   GR8_DS_ATTN_PW:
     scope: agree
     kind: int
