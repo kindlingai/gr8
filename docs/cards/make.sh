@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Redraw the README's recipe cards: docs/cards/<recipe>.png from each recipe's kindling.json, with bench/gif.py card.
+# Redraw the README's recipe cards: docs/cards/<recipe>.png from each recipe's kindling.json, with bench/gif.py card,
+# and the GLM-5.3 card docs/cards/glm-5.3-4x-spark.png from docs/cards/glm-5.3-4x-spark.json (no recipe repo yet).
 #   docs/cards/make.sh                         fetch each kindling.json from the recipe's main branch on GitHub
 #   KINDLING_DIR=DIR docs/cards/make.sh        read DIR/<recipe>/kindling.json instead (local clones)
 #   FONT_DIR=DIR docs/cards/make.sh            draw with DIR/JetBrainsMono-Regular.ttf and DIR/SpaceGrotesk-Bold.ttf
@@ -11,6 +12,7 @@ fonts=()
 [ -n "${FONT_DIR:-}" ] && fonts=(--font "$FONT_DIR/JetBrainsMono-Regular.ttf" --display-font "$FONT_DIR/SpaceGrotesk-Bold.ttf")
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+python3 bench/gif.py card docs/cards/glm-5.3-4x-spark.json --out docs/cards/glm-5.3-4x-spark.png "${fonts[@]}"
 for r in $RECIPES; do
   if [ -n "${KINDLING_DIR:-}" ]; then
     src="$KINDLING_DIR/$r/kindling.json"
