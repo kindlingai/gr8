@@ -70,7 +70,41 @@ int main() {
         }
         assert(logs==(v2?1:0));
     }
-    std::cout<<"v2 stripe plan: zero/inherited, thresholds 1/8192/1MiB/INT64_MAX, one/two rails, v2 off, isolated layout and once-per-plan log PASS\n";
+    // TP4 ring (cfg.ring): the dedicated fabric never stripes. The plan logs rails=3 and
+    // effective_min=0, keeps the ring layout, and passes a positive threshold through
+    // unchanged on the dedicated fabric only (the proxy ignores it at four ranks).
+    for(bool dual:{false,true})
+    for(int64_t threshold:{int64_t(0),int64_t(1),int64_t(8192),int64_t(1048576),INT64_MAX}) {
+        EngineOptions o; o.s2mode=true; o.NL=40; o.NX=2; o.NC=83;
+        for(int i=0;i<40;++i)o.layers.push_back(i);
+        o.cfg.ips={"1","2","3","4"}; o.cfg.rank=0; o.cfg.ring=true;
+        if(dual)o.cfg.ips2={"5","6","7","8"};
+        PlanInputs in; in.trunk_bytes=2; in.head_payload=512;
+        in.k.ds_pf_v2=true; in.k.ds_prefill_w="4096"; in.k.ds_pf_tail="128";
+        const auto baseline=fabric_plan(o,in); assert(baseline.refusal.empty());
+        in.k.ds_pf_v2_stripe_min=threshold;
+        const auto p=fabric_plan(o,in); assert(p.refusal.empty());
+        assert(p.fabrics.size()==baseline.fabrics.size());
+        for(size_t i=0;i<p.fabrics.size();++i) {
+            const auto& f=p.fabrics[i]; const auto& b=baseline.fabrics[i];
+            assert(f.kind==b.kind);
+            assert(f.cfg.ring==b.cfg.ring);
+            if(f.kind==FabKind::Ds41V2)assert(f.cfg.ring);
+            auto cfg=f.cfg;
+            assert(cfg.stripe_min==(f.kind==FabKind::Ds41V2&&threshold>0
+                ? size_t(threshold) : b.cfg.stripe_min));
+            cfg.stripe_min=b.cfg.stripe_min;
+            assert(describe_fabric("test",cfg)==describe_fabric("test",b.cfg));
+        }
+        int logs=0;
+        for(const auto& line:p.log)if(line.find("# ds41_v2_stripe ")==0) {
+            ++logs;
+            assert(line==fplan::fmt("# ds41_v2_stripe min=%zu rails=3 effective_min=0\n",
+                threshold>0 ? size_t(threshold) : size_t(0)));
+        }
+        assert(logs==1);
+    }
+    std::cout<<"v2 stripe plan: zero/inherited, thresholds 1/8192/1MiB/INT64_MAX, one/two rails, TP4 ring (rails=3, never striped), v2 off, isolated layout and once-per-plan log PASS\n";
     // Actual six-segment tail layout: stage each owner's slice then reconstruct
     // only the final rows. Includes every owner-empty and boundary-crossing case.
     for(int M:{1,2,3,5,17,127,128,129,257,511,4093,4096,8191,8192}) {
