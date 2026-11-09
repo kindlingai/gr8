@@ -33,7 +33,7 @@ are estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [KV4
 ## How it works
 
 - One model: the [exlr8 release](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) on Hugging Face. Each box
-  fetches only its own part, once, and boots from its cache (at TP=4, engines ready in 68 s: [FIRST-BOOT.md](FIRST-BOOT.md)). Each rank plans its weights from the
+  fetches only its own part, once, and boots from its cache (at TP=4, engines ready in 71 s: [FIRST-BOOT.md](FIRST-BOOT.md)). Each rank plans its weights from the
   release's files at load. The routed experts and the dense trellis matrices are decoded inside the kernels.
 - Several requests at once: up to 8 sessions share each decode step. Each request's output is a valid continuation at
   its sampling settings, but when requests share decode steps its tokens and logprobs can differ slightly from running
