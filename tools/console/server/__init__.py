@@ -1,1 +1,1 @@
-"""gr8 console backend."""
+"""Kindling dash backend (formerly gr8 console)."""

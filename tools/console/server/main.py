@@ -27,7 +27,7 @@ def create_app(config=None, console=None):
         yield
         await run_in_threadpool(console.close)
 
-    app = FastAPI(title="gr8 console", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app = FastAPI(title="Kindling dash", lifespan=lifespan, docs_url=None, redoc_url=None)
 
     hosts = (config or (console.config if console else {})).get("allowed_hosts", ["localhost"])
     if config is None and console is None and os.environ.get("GR8_CONSOLE_CONFIG"):
@@ -44,7 +44,7 @@ def create_app(config=None, console=None):
             expected = str(request.base_url).rstrip("/")
             # CSRF token is read same-origin from snapshot; there is no permissive CORS.
             if (origin and origin != expected) or request.headers.get("x-console-token") != app.state.console.csrf:
-                return JSONResponse({"ok": False, "error": "same-origin console token required"}, status_code=403)
+                return JSONResponse({"ok": False, "error": "same-origin Kindling dash token required"}, status_code=403)
             if "application/json" not in request.headers.get("content-type", ""):
                 return JSONResponse({"ok": False, "error": "JSON required"}, status_code=415)
         response = await next_call(request)
