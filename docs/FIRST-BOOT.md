@@ -28,7 +28,7 @@ Optional, every model: faster restarts. Put `GR8_GEN_CACHE=<dir>` in `EXTRA_ENV`
 disk ([ENV.md](ENV.md)). The loader then keeps the tensors it computes at load and reads them back on the next boot
 instead of computing them again. The first boot of an engine build writes them; a rebuild is a miss and writes them
 again, and the loader keeps the two newest builds' entries. The served bytes are the same. Measured: GLM-5.3 at TP=6
-(on the GLM TP6 team's cu-fastboot build, arms A+B, before this port), 17.4 GB a rank, "engines ready" 93-96 s
+(on an earlier build, before this port), 17.4 GB a rank, "engines ready" 93-96 s
 without it, 97 s on the boot that writes it, 20-21 s after.
 DeepSeek-V4.1-Flash at TP=4, 79.6 GB a rank: 84 s without it, 110 s on the boot that writes it, 16 s after.
 GLM-5.3 at TP=4 (ring, the docker image built from this change): 4.8 GB a rank, "engines ready" 71 s without it
@@ -59,9 +59,9 @@ otherwise. "Free memory" is `MemAvailable` a box; a range is the lowest and high
   `GR8_DS_SESS_DRAFTS=1` lets every chat keep drafting when more than 5 write at once; it drafts fewer tokens a
   chat as more chats write (5 at 1-5 chats, 2 at 9-10, 1 at 11-16; [ENV.md](ENV.md)).
 - `SESS` takes any count from 1 to 32; 5, 10 and 16 above are the measured setups.
-- Measured on `main` at b10aae4 with Q3's switches on, one boot each, two runs each (the range; the first of the two
-  runs is a little slower). Short code prompts. "Each" is the median chat's writing speed once it has a slot;
-  "together" is all chats; "first word" is the median wait for the first word, slot wait included.
+- Measured on `main` at b10aae4 (2026-11-03) with Q3's switches on, one boot each, two runs each (the range; the first
+  of the two runs is a little slower). Short code prompts. "Each" is the median chat's writing speed once it has a
+  slot; "together" is all chats; "first word" is the median wait for the first word, slot wait included.
 
   | chat slots | 1 chat, tokens/s | 8 chats: each / together | 16 chats: each / together | 16 chats: first word | free memory at ready |
   |---:|---:|---:|---:|---:|---:|
@@ -116,7 +116,8 @@ words to `EXTRA_ENV` (`"A=1 B=2"`, every rank).
 
 - Default: no.
 - Yes: `GR8_DS_RELAXED_ACCEPT=topp:0.9,ratio:0.1 GR8_DS_MOE_TOPK_DECODE=4`.
-- Measured against `main` at ca24fdd0 (two boots), and again on `main` at b10aae4 (one boot each way). Long replies:
+- Measured against `main` at ca24fdd0 (2026-11-01; two boots), and again on `main` at b10aae4 (2026-11-03; one boot each
+  way). Long replies:
   code +41-42%, prose +50-52%, structured output +23-25%. Short 256-token replies: code +21-23%, prose +51%,
   structured +14% (b10aae4). Prompt reading (prefill) stays inside the run-to-run spread (b10aae4: one benchmark
   +1-2%, another 3% lower). Quality 73 -> 71 of 75 both times.
