@@ -2,6 +2,7 @@
 """gr8's benchmark and gate: speed and correctness of a serving cluster, measured the same way on every build.
 
   bench.py [--quick | --full] [--url U] [--hosts H1,H2,...] [--cap HOST=MHZ] [--baseline OLD.json] [--json OUT.json]
+  bench.py --closed-loop [--streams N] [--warmup S] [--duration S]
   bench.py compare OLD.json NEW.json
   bench.py kl-ref --out FILE [--url U]
   bench.py kindling REPORT.json --out kindling.json --config-id ID [--label L] [--nodes N] [--default]
@@ -10,7 +11,7 @@ Levels (README.md has the table): --quick is prefill, code and prose decode, and
 the smoke test, the correctness checks and structured and counting decode, in about 20 minutes; --full adds more runs,
 needles to 480K, the agentic checks, GSM8K and HumanEval.
 
-The timed stages (decode, concurrency, prefill) run uncapped, except a box with --cap, which stays at its cap. Before
+The timed stages (decode, concurrency, prefill, closed loop) run uncapped, except a box with --cap, which stays at its cap. Before
 each one every box is locked at --cool-mhz, and it starts once the server is idle and every box is at or under
 --cool-temp or has stopped cooling. A box that reaches --guard-temp in a timed stage is held at --cool-mhz for the
 rest of it, and the stage's numbers are marked. The other stages run at --cool-mhz with no wait. A service that moves the clocks
@@ -41,7 +42,7 @@ LEVELS = {
              'works': ['code', 'prose', 'structured', 'counting'], 'runs': 16, 'warmup': 2,
              'streams': [1, 2, 4, 8, 16], 'batches': 4, 'prefill': [8192, 32768, 131072], 'reps': 2},
 }
-TIMED = {'decode', 'concurrency', 'prefill'}
+TIMED = {'decode', 'concurrency', 'prefill', 'closed'}
 
 
 def log(msg):
@@ -51,7 +52,9 @@ def log(msg):
 def run(a):
     level = 'quick' if a.quick else 'full' if a.full else 'default'
     L = LEVELS[level]
-    plan = a.stages.split(',') if a.stages else L['stages']
+    plan = a.stages.split(',') if a.stages else (['info'] if a.closed_loop else L['stages'])
+    if a.closed_loop and 'closed' not in plan:
+        plan = plan + ['closed']
     cl = C.Client(a.url, a.model, timeout=7200)
     ctx = S.Ctx(cl, a, log)
     caps = dict(c.split('=') for c in a.cap)
@@ -124,6 +127,9 @@ def run(a):
             elif st == 'concurrency':
                 ns = [int(x) for x in a.streams.split(',')] if a.streams else L['streams']
                 rep['concurrency'] = S.concurrency(ctx, ns, L['batches'])
+            elif st == 'closed':
+                ns = [int(x) for x in a.streams.split(',')] if a.streams else [16]
+                rep['closed'] = S.closed_loop(ctx, ns, a.warmup, a.duration)
             elif st == 'prefill':
                 sizes = [int(x) for x in a.prefill_sizes.split(',')] if a.prefill_sizes else L['prefill']
                 rep['prefill'] = S.prefill(ctx, sizes, L['reps'], max_len)
@@ -132,7 +138,7 @@ def run(a):
             elif st == 'quality':
                 rep['quality'] = S.quality_stage(ctx)
             else:
-                sys.exit(f'unknown stage {st}; stages: {", ".join(LEVELS["full"]["stages"])}')
+                sys.exit(f'unknown stage {st}; stages: {", ".join(LEVELS["full"]["stages"] + ["closed"])}')
             if th.hosts and st != 'info':
                 rep['heat'][st] = {'cooldown': cool, 'seconds': round(time.time() - t0, 1),
                                    'boxes': th.window_stats(t0, time.time()),
@@ -185,6 +191,11 @@ def main():
     ap.add_argument('--stages', help='comma-separated stages to run instead of the level\'s')
     ap.add_argument('--runs', type=int, help="decode runs per workload (the level's by default)")
     ap.add_argument('--streams', help="concurrent stream counts, e.g. 1,4,8 (the level's by default)")
+    ap.add_argument('--closed-loop', action='store_true',
+                    help="add the closed-loop stage (with no --stages the plan is info,closed); --streams sets the "
+                         "stream counts (16 by default), each run in turn")
+    ap.add_argument('--warmup', type=float, default=60, help='closed loop: seconds before the measured window starts')
+    ap.add_argument('--duration', type=float, default=300, help='closed loop: seconds of the measured window')
     ap.add_argument('--prefill-sizes', help="prompt sizes in tokens, e.g. 8192,32768 (the level's by default)")
     ap.add_argument('--hosts', default='', help='boxes to cool and sample: ssh destinations, or "local"')
     ap.add_argument('--cap', action='append', default=[], metavar='HOST=MHZ',

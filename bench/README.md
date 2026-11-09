@@ -38,6 +38,13 @@ clocks per stage, and every single-stream request in send order. It goes to `--j
 `--stages`, `--runs`, `--streams` and `--prefill-sizes` change a level's plan. Sizes over the server's
 `max_model_len` are skipped and say so.
 
+`--closed-loop` adds the closed-loop stage (with no `--stages` the plan is `info,closed`): each of `--streams` (16 by
+default) sends its next 256-token request the moment its last one ends, for `--warmup` seconds (60) and then a
+measured window of `--duration` seconds (300). A request counts in the window when it ends there, and none is sent
+after the window. The report gives tok/s for the window and for each tenth of it, TTFT p50 and p90, and the requests
+that failed. The decode, concurrency and closed-loop tables also show each request's prompt length in tokens as the
+server counted it (min/median/max), and the JSON keeps every run's `prompt_tokens`.
+
 Requests use `reasoning_effort` low (`--effort`) and temperature 0. A decode run's prompt carries a run tag fixed by
 `--series`, the workload and the run number, so run 5 of `code` sends the same bytes on every build and never hits the
 prefix cache. Two reports pair only within one series. The decode prompts are the
@@ -48,7 +55,7 @@ statistics, the tool-call, agent and long-reply checks, and the GSM8K and HumanE
 
 A GB10 that has run for a few minutes is hotter and slower than a cool one: under a full bench, uncapped boxes drop
 from about 2,450 MHz to 2,050-2,370 MHz on average at 80-84 C, and a run's numbers depend on what ran before it. So
-the timed stages (decode, concurrency, prefill) run first, and each starts from the same state:
+the timed stages (decode, concurrency, prefill, closed loop) run first, and each starts from the same state:
 
 1. the server has no request in flight, and every box is locked at `--cool-mhz` (1,800);
 2. every box's GPU temperature is sampled each second; the stage waits until every GPU is idle and every box is
