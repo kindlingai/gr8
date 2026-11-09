@@ -508,7 +508,7 @@ class ServiceTests(unittest.TestCase):
     def test_cap_rescale_keeps_the_same_kv_memory(self):
         env = lambda cap, fmt=None, **more: {"CAP": cap, "KV_FORMAT": fmt, **more}
         cap_for = lambda preset, env, boxes=4: presets.cap_for("glm53", preset, env, boxes)
-        # Ring B stock: 409,600 at TP4. 64-token pages x TP4 = 256-token steps. 513,536 / 408,832 is the documented pair.
+        # Stock box: 409,600 at TP4. 64-token pages x TP4 = 256-token steps. 513,536 / 408,832 is the documented pair.
         self.assertEqual(presets.SAME_MEMORY_CAP, {"fp8": 408832, "int4": 513536})
         self.assertEqual(cap_for("context", env("409600")), "514304")
         self.assertEqual(cap_for("context", env("409600", "fp8")), "514304")
