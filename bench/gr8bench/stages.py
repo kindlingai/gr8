@@ -24,6 +24,7 @@ REPO = Path(__file__).resolve().parents[2]
 class Ctx:
     def __init__(self, cl, a, log):
         self.cl, self.a, self.log = cl, a, log
+        self.now, self.sleep = time.time, time.sleep   # the closed-loop stage reads these (a test swaps them)
         self.requests = []     # single-stream requests in send order (route_bytes.py --drive reads them)
         self.suspect = []      # replies with suspect characters: (stage, what, excerpt)
         self.recorder = None   # a record.Recorder with --record
@@ -155,6 +156,14 @@ def correctness(ctx, level, max_len):
 # ---------------------------------------------------------------- decode
 
 
+def pt_summary(vals):
+    """min/median/max of prompt_tokens over the streams that returned a usage count."""
+    v = sorted(x for x in vals if x is not None)
+    if not v:
+        return {'min': None, 'median': None, 'max': None, 'n': 0}
+    return {'min': v[0], 'median': statistics.median(v), 'max': v[-1], 'n': len(v)}
+
+
 def decode_run(ctx, work, i, warm=False):
     tag = P.run_tag(ctx.a.series, work, f'warm{i}' if warm else i)
     s0 = C.spec_snapshot(ctx.cl.metrics())
@@ -162,7 +171,8 @@ def decode_run(ctx, work, i, warm=False):
     s1 = C.spec_snapshot(ctx.cl.metrics())
     d = C.spec_delta(s0, s1)
     steps = d['drafts'] or max(r['tokens'] - 1, 1)   # no drafter: one token a step
-    return {'work': work, 'i': i, 'tag': tag, 'tokens': r['tokens'], 'ttft': r['ttft'], 'decode_s': r['decode_s'],
+    return {'work': work, 'i': i, 'tag': tag, 'prompt_tokens': r['prompt_tokens'], 'tokens': r['tokens'],
+            'ttft': r['ttft'], 'decode_s': r['decode_s'],
             'tps': rate(r) or 0.0, 'tok_per_step': d['tokens_per_step'] or 1.0,
             'ms_per_step': 1000 * r['decode_s'] / steps, 'accept': d['acceptance'], 'problem': _problem(work, r)}
 
@@ -175,7 +185,8 @@ def decode(ctx, works, runs, warmup):
         rs = [decode_run(ctx, w, i) for i in range(runs)]
         good = [r for r in rs if not r['problem']]
         out[w] = {'runs': rs, 'problems': [f"run {r['i']}: {r['problem']}" for r in rs if r['problem']],
-                  'summary': stats.summarize(good) if good else None}
+                  'summary': stats.summarize(good) if good else None,
+                  'prompt_tokens': pt_summary(r['prompt_tokens'] for r in rs)}
         s = out[w]['summary']
         ctx.log(f"  decode {w}: {s['tps']:.1f} tok/s" if s else f'  decode {w}: every run failed')
     return out
@@ -196,10 +207,11 @@ def conc_batch(ctx, n, b):
             r = ctx.cl.chat(P.tagged(*jobs[s]), 512, effort=ctx.a.effort, events=events)
             sent = r['t0']   # the events' times count from here
             res[s] = {'sent': t, 'first': t + r['ttft'], 'end': t + r['total_s'], 'tokens': r['tokens'],
+                      'prompt_tokens': r['prompt_tokens'],
                       'tps': rate(r), 'ttft': r['ttft'], 'problem': _problem('mixed', r)}
         except Exception as e:   # the other streams keep their numbers; this batch is marked failed
-            res[s] = {'sent': t, 'first': None, 'end': time.time(), 'tokens': 0, 'tps': None, 'ttft': None,
-                      'problem': repr(e)}
+            res[s] = {'sent': t, 'first': None, 'end': time.time(), 'tokens': 0, 'prompt_tokens': None,
+                      'tps': None, 'ttft': None, 'problem': repr(e)}
         if rec is not None:
             rec[s] = {'i': s, 't0': round(sent - start, 3), 'messages': P.tagged(*jobs[s]), 'max_tokens': 512,
                       'tokens': res[s]['tokens'], 'problem': res[s]['problem'], 'events': events}
@@ -217,7 +229,8 @@ def conc_batch(ctx, n, b):
            'tps': sum(x['tokens'] for x in ok) / (t1 - t0) if ok and t1 > t0 else None,
            'tokens': sum(x['tokens'] for x in ok), 'decode_s': (t1 - t0) if ok else None,
            'per_stream': statistics.median(x['tps'] for x in ok if x['tps']) if ok else None,
-           'ttft': [x['ttft'] for x in ok], 'tok_per_step': d['tokens_per_step']}
+           'ttft': [x['ttft'] for x in ok], 'tok_per_step': d['tokens_per_step'],
+           'prompt_tokens': [x['prompt_tokens'] for x in res]}
     if rec is not None:
         out['recorded'] = {'i': b, 'start': start, 'tps': out['tps'], 'streams': rec}
     return out
@@ -240,8 +253,111 @@ def concurrency(ctx, ns, batches):
                        'ttft_p50': ttft[len(ttft) // 2] if ttft else None,
                        'ttft_p90': ttft[min(len(ttft) - 1, int(0.9 * len(ttft)))] if ttft else None,
                        'tok_per_step': statistics.median(b['tok_per_step'] for b in good if b['tok_per_step'])
-                       if any(b['tok_per_step'] for b in good) else None}
+                       if any(b['tok_per_step'] for b in good) else None,
+                       'prompt_tokens': pt_summary(x['prompt_tokens'] for b in bs for x in b['streams'])}
         ctx.log(f"  {n} streams: {out[str(n)]['tps']:.1f} tok/s" if out[str(n)]['tps'] else f'  {n} streams: failed')
+    return out
+
+
+# ---------------------------------------------------------------- closed loop
+
+CLOSED_MAX_TOKENS = 256    # reply cap of every closed-loop request
+CLOSED_SLICES = 10         # equal slices of the measured window, for the per-slice tok/s
+CLOSED_BACKOFF = 1.0       # s a stream waits after a failed request, so a dead server is not hammered
+
+
+def closed_summary(recs, w0, w1):
+    """Numbers of one closed-loop run from its request records. Rule (also in the report): a request counts in the
+    measured window [w0, w1) when its END time is in the window; its tokens count in full. -> dict"""
+    dur = w1 - w0
+    inwin = [r for r in recs if w0 <= r['end'] < w1]
+    ok = [r for r in inwin if not r['problem']]
+    toks = sum(r['tokens'] for r in ok)
+    slice_tokens = [0] * CLOSED_SLICES
+    for r in ok:
+        slice_tokens[min(CLOSED_SLICES - 1, int((r['end'] - w0) / dur * CLOSED_SLICES))] += r['tokens']
+    ttft = sorted(r['ttft'] for r in ok)
+    return {'window_s': dur, 'tokens': toks, 'tps': toks / dur,
+            'windows': [t / (dur / CLOSED_SLICES) for t in slice_tokens], 'window_tokens': slice_tokens,
+            'completed': len(ok), 'failed': len(inwin) - len(ok),
+            'warmup_ended': sum(1 for r in recs if r['end'] < w0), 'after_window': sum(1 for r in recs if r['end'] >= w1),
+            'ttft_p50': ttft[len(ttft) // 2] if ttft else None,
+            'ttft_p90': ttft[min(len(ttft) - 1, int(0.9 * len(ttft)))] if ttft else None,
+            'prompt_tokens': pt_summary(r['prompt_tokens'] for r in ok)}
+
+
+def closed_one(ctx, n, warmup_s, duration_s):
+    """n streams, each sends its next request the moment its last one ends (closed loop) for warmup_s + duration_s.
+    The window starts after the warm-up; no request is sent after the window ends. Requests still running at the end
+    finish and are kept, but are outside the window."""
+    now, sleep = ctx.now, ctx.sleep
+    t0 = now()
+    w0, w1 = t0 + warmup_s, t0 + warmup_s + duration_s
+    lock = threading.Lock()
+    st = {'k': 0, 'stop': False}
+    recs = []
+
+    def take():
+        with lock:
+            if st['stop'] or now() >= w1:   # the clock check keeps a late stream from sending past the window
+                return None
+            st['k'] += 1
+            return st['k'] - 1
+
+    def go(s):
+        while True:
+            k = take()
+            if k is None:
+                return
+            msgs = P.tagged(P.prompt_for('mixed', k), P.run_tag(ctx.a.series, f'closed{n}', k))
+            t = now()
+            try:
+                r = ctx.cl.chat(msgs, CLOSED_MAX_TOKENS, effort=ctx.a.effort)
+                rec = {'k': k, 'stream': s, 'sent': t, 'end': now(), 'ttft': r['ttft'], 'tokens': r['tokens'],
+                       'prompt_tokens': r['prompt_tokens'], 'tps': rate(r), 'problem': _problem('mixed', r)}
+            except Exception as e:   # this request is marked failed; the stream goes on
+                rec = {'k': k, 'stream': s, 'sent': t, 'end': now(), 'ttft': None, 'tokens': 0, 'prompt_tokens': None,
+                       'tps': None, 'problem': repr(e)}
+            with lock:
+                recs.append(rec)
+            if rec['problem'] and rec['ttft'] is None:
+                sleep(CLOSED_BACKOFF)
+
+    def until(t):
+        if t - now() > 0:
+            sleep(t - now())
+
+    ths = [threading.Thread(target=go, args=(s,)) for s in range(n)]
+    [t.start() for t in ths]
+    until(w0)
+    s0 = C.spec_snapshot(ctx.cl.metrics())
+    until(w1)
+    s1 = C.spec_snapshot(ctx.cl.metrics())
+    with lock:
+        st['stop'] = True
+    [t.join() for t in ths]
+    d = C.spec_delta(s0, s1)
+    out = closed_summary(recs, w0, w1)
+    out.update({'streams': n, 'warmup_s': warmup_s, 'max_tokens': CLOSED_MAX_TOKENS,
+                'tok_per_step': d['tokens_per_step'], 'acceptance': d['acceptance'],
+                'rule': 'a request counts in the window when it ENDS in the window (tokens in full); '
+                        'none is sent after the window ends',
+                'requests': [{**{k: r[k] for k in ('k', 'stream', 'tokens', 'prompt_tokens', 'tps', 'problem')},
+                              'sent': round(r['sent'] - t0, 3), 'end': round(r['end'] - t0, 3),
+                              'ttft': r['ttft']} for r in sorted(recs, key=lambda r: r['sent'])]})
+    return out
+
+
+def closed_loop(ctx, ns, warmup_s, duration_s):
+    """The closed-loop stage: one run per stream count in ns, one after the other."""
+    if duration_s <= 0 or warmup_s < 0:
+        raise ValueError(f'closed loop needs duration > 0 and warmup >= 0, got {duration_s} and {warmup_s}')
+    out = {}
+    for n in ns:
+        out[str(n)] = closed_one(ctx, n, warmup_s, duration_s)
+        o = out[str(n)]
+        ctx.log(f"  closed loop {n} streams: {o['tps']:.1f} tok/s over {duration_s:g} s, "
+                f"{o['completed']} done, {o['failed']} failed")
     return out
 
 

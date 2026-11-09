@@ -17,6 +17,14 @@ def table(title, head, rows):
                      [line, ''])
 
 
+def pt_cell(p):
+    """'min/median/max' of the prompt tokens the server counted (usage.prompt_tokens); blank when not recorded."""
+    if not p or not p.get('n'):
+        return None
+    g = lambda x: f'{x:,.0f}'
+    return f"{g(p['min'])}/{g(p['median'])}/{g(p['max'])}"
+
+
 def f1(x, d=1):
     return None if x is None else f'{x:,.{d}f}'
 
@@ -125,6 +133,9 @@ def verdicts(rep, cmp, kl_max, base=None):
         r = cmp['concurrency'].get(n)
         if r:
             add(f'{n} streams vs baseline', 'WARN' if r['ratio'] < 1 - NOISE else 'PASS', ratio(r))
+    for n, d in (rep.get('closed') or {}).items():
+        if d['failed']:
+            add(f'{n} closed-loop streams', 'WARN', f"{d['failed']} requests failed in the window")
     for k, r in cmp['prefill'].items():
         add(f'prefill {k} vs baseline', 'FAIL' if r['ratio'] < 1 - NOISE else 'PASS', ratio(r))
     return out
@@ -148,16 +159,29 @@ def render(rep, cmp, checks):
             rows.append([w, f"{f1(s.get('tps'))} ({f1(ci[0])}-{f1(ci[1])})" if ci[0] else f1(s.get('tps')),
                          f"{100 * s['cv']:.0f}%" if s.get('cv') is not None else None, f1(s.get('tok_per_step'), 2),
                          f1(s.get('ms_per_step')), f1(s.get('accept'), 2), f1(s.get('ttft_ms'), 0),
-                         f"{len(d['runs'])}", ratio(cmp['decode'].get(w))])
+                         f"{len(d['runs'])}", ratio(cmp['decode'].get(w)), pt_cell(d.get('prompt_tokens'))])
         out.append(table('Decode, one stream', ['workload', 'tok/s (95% CI)', 'spread', 'tok/step', 'ms/step',
-                                                 'accept', 'TTFT ms', 'runs', 'vs baseline'], rows))
+                                                 'accept', 'TTFT ms', 'runs', 'vs baseline',
+                                                 'prompt tok min/med/max'], rows))
     con = rep.get('concurrency') or {}
     if con:
         rows = [[n, f1(d['tps']), f1(d['per_stream']), f1(d['ttft_p50'] and 1000 * d['ttft_p50'], 0),
                  f1(d['ttft_p90'] and 1000 * d['ttft_p90'], 0), f1(d['tok_per_step'], 2), d['failed'] or '',
-                 ratio(cmp['concurrency'].get(n))] for n, d in con.items()]
+                 ratio(cmp['concurrency'].get(n)), pt_cell(d.get('prompt_tokens'))] for n, d in con.items()]
         out.append(table('Concurrent streams (mixed prompts)', ['streams', 'total tok/s', 'per stream', 'TTFT p50 ms',
-                                                                'TTFT p90 ms', 'tok/step', 'failed', 'vs baseline'], rows))
+                                                                'TTFT p90 ms', 'tok/step', 'failed', 'vs baseline',
+                                                                'prompt tok min/med/max'], rows))
+    clo = rep.get('closed') or {}
+    if clo:
+        first = next(iter(clo.values()))
+        rows = [[n, f1(d['tps']), ' '.join(f1(x, 0) for x in d['windows']), f1(d['ttft_p50'] and 1000 * d['ttft_p50'], 0),
+                 f1(d['ttft_p90'] and 1000 * d['ttft_p90'], 0), f1(d['tok_per_step'], 2), d['completed'],
+                 d['failed'] or '', f"{d['warmup_ended']}/{d['after_window']}", pt_cell(d.get('prompt_tokens'))]
+                for n, d in clo.items()]
+        out.append(table(f"Closed loop (mixed prompts, max_tokens {first['max_tokens']}, warm-up {first['warmup_s']:g} s, "
+                         f"window {first['window_s']:g} s; a request counts when it ends in the window)",
+                         ['streams', 'tok/s', 'tok/s per tenth of the window', 'TTFT p50 ms', 'TTFT p90 ms', 'tok/step',
+                          'done', 'failed', 'ended in warm-up / after', 'prompt tok min/med/max'], rows))
     pf = rep.get('prefill') or {}
     if pf:
         rows = []

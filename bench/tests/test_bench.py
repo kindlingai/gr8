@@ -1,12 +1,15 @@
 """bench.py against the fake server: python3 -m unittest discover -s bench/tests (no GPU, no model)."""
+import importlib.util
 import json
 import math
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -238,6 +241,137 @@ class Stages(Base):
     def test_cached_tokens(self):
         self.srv.st.cache_hit = 100
         self.assertEqual(S.cached(self.ctx())['second'], 100)
+
+
+class PromptTokens(Base):
+    def ctx(self):
+        class A:
+            series, effort, kl_ref = 'test', 'low', None
+        return S.Ctx(self.cl, A(), lambda m: None)
+
+    def test_pt_summary(self):
+        self.assertEqual(S.pt_summary([30, None, 10, 20]), {'min': 10, 'median': 20, 'max': 30, 'n': 3})
+        self.assertEqual(S.pt_summary([]), {'min': None, 'median': None, 'max': None, 'n': 0})
+        self.assertIsNone(report.pt_cell({'min': None, 'median': None, 'max': None, 'n': 0}))
+        self.assertEqual(report.pt_cell({'min': 1000, 'median': 1500.0, 'max': 12345, 'n': 3}), '1,000/1,500/12,345')
+
+    def test_decode_records_each_runs_prompt_length(self):
+        d = S.decode(self.ctx(), ['code'], 3, 0)['code']
+        lens = [r['prompt_tokens'] for r in d['runs']]
+        self.assertTrue(all(n > 0 for n in lens), lens)
+        self.assertEqual(d['prompt_tokens'], {'min': min(lens), 'median': sorted(lens)[1], 'max': max(lens), 'n': 3})
+
+    def test_concurrency_records_each_streams_prompt_length(self):
+        c = S.concurrency(self.ctx(), [2], 2)['2']
+        lens = [x['prompt_tokens'] for b in c['batches'] for x in b['streams']]
+        self.assertEqual(len(lens), 4)
+        self.assertTrue(all(n > 0 for n in lens), lens)
+        self.assertEqual((c['prompt_tokens']['min'], c['prompt_tokens']['max'], c['prompt_tokens']['n']),
+                         (min(lens), max(lens), 4))
+
+    def test_a_failed_stream_has_no_prompt_length(self):
+        self.srv.st.fail_nth = 2
+        b = S.concurrency(self.ctx(), [2], 1)['2']['batches'][0]
+        self.assertEqual(len(b['prompt_tokens']), 2)
+
+    def test_report_table_has_the_column(self):
+        p, a = self.bench('--quick', '--runs', '2', '--streams', '2', '--prefill-sizes', '2048')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(p.stdout.count('prompt tok min/med/max'), 2)    # the decode and the concurrency table
+        self.assertEqual(a['decode']['code']['prompt_tokens']['n'], 2)
+
+
+class ClosedLoop(Base):
+    def ctx(self):
+        class A:
+            series, effort, kl_ref = 'test', 'low', None
+        return S.Ctx(self.cl, A(), lambda m: None)
+
+    def test_summary_counts_a_request_when_it_ends_in_the_window(self):
+        def rec(end, tokens, ttft=0.1, pt=1000, problem=''):
+            return {'end': end, 'tokens': tokens, 'ttft': ttft, 'prompt_tokens': pt, 'problem': problem}
+        recs = [rec(95.0, 256), rec(99.999, 256),                                  # ended in the warm-up
+                rec(100.0, 256, 0.1, 900),                                        # ends at w0: in the window
+                rec(100.9, 256, 0.2, 1000), rec(101.0, 200, 0.3, 1100),           # slice 0, slice 1
+                rec(105.5, 256, 0.4, 1200), rec(105.5, 256, 0.5, 1300),           # slice 5, twice
+                rec(107.0, 256, 0.6, 1400), rec(108.0, 256, 0.7, 1500),
+                rec(109.0, 256, 0.8, 1600), rec(109.999, 256, 0.9, 1700),         # the last slice
+                rec(107.3, 0, None, None, "RuntimeError('x')"),                   # failed in the window
+                rec(110.0, 256, 5.0), rec(112.0, 256, 5.0)]                       # at w1 and after: outside
+        o = S.closed_summary(recs, 100.0, 110.0)
+        tokens = 256 * 8 + 200
+        self.assertEqual((o['tokens'], o['tps']), (tokens, tokens / 10))
+        self.assertEqual((o['completed'], o['failed'], o['warmup_ended'], o['after_window']), (9, 1, 2, 2))
+        self.assertEqual(o['window_tokens'], [512, 200, 0, 0, 0, 512, 0, 256, 256, 512])
+        self.assertAlmostEqual(sum(o['windows']), tokens / 10 * S.CLOSED_SLICES)
+        self.assertEqual((o['ttft_p50'], o['ttft_p90']), (0.5, 0.9))
+        self.assertEqual(o['prompt_tokens'], {'min': 900, 'median': 1300, 'max': 1700, 'n': 9})
+
+    def test_stage_against_the_fake_server(self):
+        res = S.closed_loop(self.ctx(), [3], 0.3, 1.0)
+        self.assertEqual(list(res), ['3'])
+        o = res['3']
+        self.assertGreater(o['completed'], 3)
+        self.assertEqual(o['failed'], 0)
+        self.assertEqual(o['tokens'], S.CLOSED_MAX_TOKENS * o['completed'])
+        self.assertAlmostEqual(o['tps'], o['tokens'] / 1.0)
+        self.assertGreater(o['prompt_tokens']['min'], 0)
+        self.assertGreater(o['tok_per_step'], 1)
+        reqs = o['requests']
+        self.assertEqual(sorted(r['k'] for r in reqs), list(range(len(reqs))))     # one prompt per request
+        self.assertLess(max(r['sent'] for r in reqs), 0.3 + 1.0)                   # none sent after the window
+        self.assertTrue(all(a['sent'] <= b['sent'] for a, b in zip(reqs, reqs[1:])))
+        self.assertEqual((o['max_tokens'], o['warmup_s'], o['window_s']), (S.CLOSED_MAX_TOKENS, 0.3, 1.0))
+        self.assertGreater(o['warmup_ended'], 0)
+        self.assertLessEqual(o['after_window'], 3)                                 # at most one in flight a stream
+        json.dumps(res)
+
+    def test_a_dead_request_is_a_failure_and_the_stream_backs_off(self):
+        cl, lock, calls, sleeps = self.cl, threading.Lock(), [0], []
+
+        class Flaky:
+            def chat(self, *a, **kw):
+                with lock:
+                    calls[0] += 1
+                    if calls[0] % 4 == 0:
+                        raise RuntimeError('connection refused')
+                return cl.chat(*a, **kw)
+
+            def metrics(self):
+                return cl.metrics()
+        ctx = self.ctx()
+        ctx.cl = Flaky()
+        ctx.sleep = lambda t: (sleeps.append(t), time.sleep(t))[1]
+        with mock.patch.object(S, 'CLOSED_BACKOFF', 0.05):
+            o = S.closed_loop(ctx, [2], 0.2, 0.8)['2']
+        self.assertGreater(o['failed'], 0)
+        self.assertEqual(o['tokens'], S.CLOSED_MAX_TOKENS * o['completed'])
+        self.assertIn(0.05, sleeps)
+        rep = {'closed': {'2': o}}
+        checks = {c: v for c, v, d in report.verdicts(rep, report.compare(rep, None), None)}
+        self.assertEqual(checks['2 closed-loop streams'], 'WARN')
+
+    def test_a_window_that_cannot_run_is_refused(self):
+        for warmup, duration in ((1.0, 0.0), (-1.0, 5.0), (0.0, -3.0)):
+            with self.assertRaises(ValueError):
+                S.closed_loop(self.ctx(), [2], warmup, duration)
+
+    def test_bench_closed_loop_runs_info_then_closed(self):
+        flags = ('--streams', '2', '--warmup', '0.2', '--duration', '0.6')
+        p, a = self.bench('--closed-loop', *flags)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(a['meta']['stages'], ['info', 'closed'])
+        self.assertEqual(list(a['closed']), ['2'])
+        self.assertIn('Closed loop (mixed prompts', p.stdout)
+        self.assertIn('RESULT: PASS', p.stdout)
+        p, a = self.bench('--stages', 'info,closed', '--closed-loop', *flags)     # the stage is not added twice
+        self.assertEqual(a['meta']['stages'], ['info', 'closed'])
+
+    def test_closed_is_a_timed_stage(self):
+        spec = importlib.util.spec_from_file_location('bench_main', BENCH)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertIn('closed', mod.TIMED)
 
 
 class EndToEnd(Base):
