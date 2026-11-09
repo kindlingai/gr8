@@ -178,7 +178,7 @@ those four off. The measured set is `GR8_ATTN_SC2=4 GR8_ATTN_SC2_TR=2 GR8_ATTN_C
 GR8_IDX_GRP=16 GR8_ATTN_QT=1 GR8_ATTN_FRONT=1` (measured 2026-10-16). "Same bits" is by construction for every value.
 
 `EXTRA_ENV="NAME=value ..."` adds more variables on every rank. The engine rejects bad `GR8_PF_*` values at startup
-(`engine/runtime/envparse.h`).
+(`pf_env_check` in `engine/runtime/prefill.cuh`).
 
 ## The head's shim and front end
 
@@ -194,7 +194,7 @@ The shim and the front end run under `taskset` on CPUs `0..PROXY_CPU-8`, away fr
 | `--guard-every-s S` | 1 (`KV_GUARD_EVERY_S`) | with `--lazy-lock`: how often the node reads MemAvailable. While it is under `--min-free-gb` the node refuses new leases, and it logs each change. Leases it already granted stay. 0 = only at each lease. Not measured |
 | `--ledger FILE` | none (`KV_LEDGER`) | with `--lazy-lock`: the host ledger (below). A lease is refused (E_NOROOM, "the host ledger credits the node ...") when the bytes held would pass what the ledger credits to the node |
 
-### The host ledger (`kvman-ledger`, D-331 M7)
+### The host ledger (`kvman-ledger`)
 
 One file per box that runs a Flash rank and a KV node (`out/kv/ledger` when `FLASH_KV_DONATE_GIB` starts the node).
 It says who may count each exchangeable byte: `gpu` (the rank's KV pool above what `FLASH_CAP_POLICY` protects),

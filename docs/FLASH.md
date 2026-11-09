@@ -313,7 +313,7 @@ stops the engine.
 A full store drops the least recently used checkpoints. Every rank keeps the same index, and its digest joins the pool
 digest the ranks compare.
 
-`group=` on the store (`remote:HOST:PORT,size=N,group=G[,cap=,weight=]`, experimental, D-331 M8 (c)): the lease is a
+`group=` on the store (`remote:HOST:PORT,size=N,group=G[,cap=,weight=]`, experimental): the lease is a
 member of group `G` on the KV node, the way a full model's `--kv-store group=` tier is, so the two models share the
 node's memory. It starts at `size=`; the head reports to the node every `GR8_S2_SHARE_MS` and asks for segments when
 captures drop entries, an entry does not fit at all, or the next capture would drop one (after a capture, or at any

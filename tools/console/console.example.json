@@ -1,0 +1,17 @@
+{
+  "allow_control": false,
+  "allowed_hosts": ["localhost"],
+  "switch_file": "config/switch.env",
+  "models": {
+    "glm53": {
+      "head_url": "http://head.example:8100",
+      "width": 4,
+      "controls": [
+        {"host": "head.example", "port": 7340},
+        {"host": "rank-one.example", "port": 7340},
+        {"host": "rank-two.example", "port": 7340},
+        {"host": "rank-three.example", "port": 7340}
+      ]
+    }
+  }
+}
