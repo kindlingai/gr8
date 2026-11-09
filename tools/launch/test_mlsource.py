@@ -260,6 +260,17 @@ class ModelLoaderTests(unittest.TestCase):
         self.assertEqual(ms.release.check(4, 1, v), [])
         self.assertTrue(any('downloading' in m for m in self.logs), self.logs)
 
+    def test_the_vision_tower_only_with_image_input(self):
+        o, ms, v = self.resolve()
+        ms.release.fetch_rank(4, 1, v)
+        self.assertNotIn('dense/vision-bf16.safetensors', self.ml.puts[-1][1]['include'])
+        o, ms, v = self.resolve('--extra-env', 'GR8_GLM53F_VISION=1')
+        self.assertFalse(ms.release.vision)                       # GLM-5.3 has no tower: GLM-5.3-Flash only
+        ms.release.vision = True
+        ms.release.fetch_rank(4, 1, v)
+        self.assertIn('dense/vision-bf16.safetensors', self.ml.puts[-1][1]['include'])
+        self.assertEqual(ms.release.check(4, 1, v), [])
+
     def test_a_layout_requests_its_halves(self):
         o, ms, v = self.resolve()
         g6layout = os.path.join(os.path.dirname(T.hfsource.fetch_ranks().g6load()), 'g6layout')

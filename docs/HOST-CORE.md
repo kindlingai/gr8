@@ -251,7 +251,7 @@ R2 lands in four parts:
 3. R2c: the request file's parser (`sessions.h` `parse_request`, read the way libstdc++'s `istringstream` read it, so
    the same requests pass and fail), `kv_share.h`'s `share_want` and grant/give rule, and the admission FIFO, now a
    Rust-owned queue. `Sessions` itself stays C++ glue over the `Emitter` (`serve.h`) and the grammar state, which the
-   non-S2 path shares. DS41 `img` fields go back to C++ (`ds41_image.h`) through a callback, as steering resolution
+   non-S2 path shares. DS41 `img` fields go back to C++ (`image_input.h`) through a callback, as steering resolution
    does, so their refusals keep their place in the order of checks.
 4. R2d: the reference copies go. The differential test became `scheduler_rs_vectors_test`: the same seeded streams
    (a portable generator, `s2/tests/scheduler_rs_vectors.h`) write every result, refusal and state to a transcript,

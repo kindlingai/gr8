@@ -62,7 +62,7 @@
 #if G6_MODEL_DS41
 #include "ds41_vision.cuh"      // DS41 image input: the vision tower + aligner (ds41v::Tower), outside namespace g6rt
 #include <chrono>
-#include "ds41_image.h"         // DS41 image input, host side: g6rt::ImageIn (a request's spans)
+#include "image_input.h"         // image input, host side: g6rt::ImageIn (a request's spans)
 #endif
 #include "../mhc/ds_mhc_decomp.cuh" // the two-stage mHC k_step; the ds_mhc wrappers stay the base path
 #include "ds41_dspark.h"        // host rules of DSpark (ds41::dsp); like ds41_ops.h it must stay outside namespace g6rt

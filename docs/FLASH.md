@@ -60,6 +60,11 @@ keeps Flash and GLM-5.3 apart (`served` in `tools/launch/models.py`). `./gr8 glm
 - At TP=4, TP=2 and TP=1 a session that runs alone drafts with the DFlash2 drafter when the boot has one: `--drafter https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2` (below).
 - `response_format` `json_object` and `json_schema` replies are masked to their XGrammar grammar, as on GLM-5.3 (`GRAMMAR`).
 
+## Image input (`GR8_GLM53F_VISION=1`, opt-in)
+
+The engine takes images in chat requests with the vision tower loaded ([FLASH-VISION.md](FLASH-VISION.md)). Without
+the knob it serves text, and the fetch skips `dense/vision-*`.
+
 ## Context
 
 `CAP` defaults to 262208: a request of 262,144 tokens (prompt + `max_tokens`) plus a page for the guard rows the
@@ -349,5 +354,4 @@ Limits:
   experimental Flash form of prefix reuse, with or without DFlash2. The DFlash2 drafter's taps are the mean of the four
   mHC streams after each tapped layer, in decode steps and in the prefill, which keeps the last 2,048 prompt positions
   for the drafter's prompt context. DFlash2 at TP=3 runs offline only.
-- The vision tower: the engine serves text, and the fetch skips `dense/vision-*`.
 - A 262K prefill's time and memory headroom on a GB10: the `CAP` above is computed, not measured.

@@ -169,6 +169,8 @@ def resolve_model(o, refresh=False, log=log):
             else:
                 release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log,
                                            layout=o.get('LAYOUT'))
+            # GLM-5.3-Flash image input: each rank fetches the vision tower too
+            release.vision = models.of(o) is models.GLM53F and opt.extra_env_value(o, 'GR8_GLM53F_VISION') == '1'
             release.fetch_meta(steering[0] if steering else None)
             o.values['V2'], o.values['V2_SLICES'] = release.v2, release.slices
             model = release.dir

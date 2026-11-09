@@ -493,7 +493,14 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         images = im;
         text
     } else {
-        let mut text = st.tpl().render(Some(&messages), tools.as_ref(), kw)?;
+        // image parts: the template's placeholders and the parts in their order (GLM-5.3-Flash image input)
+        let mut text = if crate::template::has_images(&messages) {
+            let (text, im) = st.tpl().render_images(Some(&messages), tools.as_ref(), kw)?;
+            images = im;
+            text
+        } else {
+            st.tpl().render(Some(&messages), tools.as_ref(), kw)?
+        };
         if th.off {
             text = st.tpl().thinking_off(text, body.get("add_generation_prompt").is_none_or(|v| truthy(Some(v))));
         }
@@ -512,8 +519,9 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     let (prompt, system, spans) = if images.is_empty() {
         (prompt, system, Vec::new())
     } else {
-        let (ids, spans, n_spans) = with_images(st, &images, &prompt).await?;
-        let system = system.map(|n| crate::vision::expanded_index(&prompt, n as usize, &n_spans) as u64);
+        let model = image_model(st);
+        let (ids, spans, n_spans) = with_images(st, model, &images, &prompt).await?;
+        let system = system.map(|n| crate::vision::expanded_index(&prompt, n as usize, &n_spans, model.token()) as u64);
         (ids, system, spans)
     };
     log::debug!(
@@ -602,10 +610,21 @@ fn image_err(e: crate::vision::VisionError) -> ApiError {
     ApiError::bad(e.0, Some("messages"))
 }
 
+/// The image processor and image token of the served model: DeepSeek-V4.1's, else GLM-5.3-Flash's (an engine without
+/// a vision tower refuses images before either is used).
+fn image_model(st: &State) -> crate::vision::Model {
+    if st.dialect == Dialect::Ds41 {
+        crate::vision::Model::Ds41
+    } else {
+        crate::vision::Model::Glm5v
+    }
+}
+
 /// The request's images (blocks in prompt order) -> the prompt with each placeholder token grown to its span, the
 /// spans for the engine, and each span's length. Decoding and resizing run off the async threads.
 async fn with_images(
     st: &'static State,
+    model: crate::vision::Model,
     images: &[Value],
     prompt: &[u32],
 ) -> Result<(Vec<u32>, Vec<crate::vision::Span>, Vec<usize>), ApiError> {
@@ -617,19 +636,19 @@ async fn with_images(
         images.iter().map(|b| vision::block_b64(b).map(str::to_string)).collect::<Result<_, _>>().map_err(image_err)?;
     vision::check_budget(&b64).map_err(image_err)?;
     let prepared =
-        tokio::task::spawn_blocking(move || b64.iter().map(|s| vision::prepare_b64(s)).collect::<Result<Vec<_>, _>>())
+        tokio::task::spawn_blocking(move || b64.iter().map(|s| model.prepare_b64(s)).collect::<Result<Vec<_>, _>>())
             .await
             .map_err(|e| ApiError::new(500, &e.to_string(), None))?
             .map_err(image_err)?;
-    let n_spans: Vec<usize> = prepared.iter().map(|p| p.plan.n_span()).collect();
-    let (ids, pos) = vision::expand(prompt, &n_spans).map_err(image_err)?;
+    let n_spans: Vec<usize> = prepared.iter().map(|p| p.n_span).collect();
+    let (ids, pos) = vision::expand(prompt, &n_spans, model.token()).map_err(image_err)?;
     let spans = prepared
         .into_iter()
         .zip(pos)
         .map(|(p, pos)| vision::Span {
             pos,
-            vit_h: p.vit_h(),
-            vit_w: p.vit_w(),
+            vit_h: p.vit_h,
+            vit_w: p.vit_w,
             rgb_b64: vision::b64_encode(&p.rgb),
             key: p.key,
         })
@@ -1502,10 +1521,10 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                     vision::check_budget(&b64).map_err(image_err)?;
                     let n_spans: Vec<usize> = b64
                         .iter()
-                        .map(|s| vision::plan_b64(s).map(|p| p.n_span()))
+                        .map(|s| vision::Model::Ds41.n_span_b64(s))
                         .collect::<Result<_, _>>()
                         .map_err(image_err)?;
-                    vision::expand(&ids, &n_spans).map_err(image_err)?.0
+                    vision::expand(&ids, &n_spans, vision::IMAGE_TOKEN_ID).map_err(image_err)?.0
                 }
             } else {
                 // the same effort and the same refusals as a chat request, so the counts agree
@@ -1513,14 +1532,33 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                 let agp_on = truthy(Some(&agp));
                 let kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, th.effort, None)?;
                 let tools = normalize_tools(body.get("tools"))?;
-                let mut text = st.tpl().render(body.get("messages"), tools.as_ref(), kw)?;
+                let msgs = body.get("messages").cloned().unwrap_or(Value::Null);
+                let (mut text, images) = if crate::template::has_images(&msgs) {
+                    st.tpl().render_images(Some(&msgs), tools.as_ref(), kw)?
+                } else {
+                    (st.tpl().render(Some(&msgs), tools.as_ref(), kw)?, Vec::new())
+                };
                 if th.off {
                     text = st.tpl().thinking_off(text, agp_on);
                 }
-                st.tok
+                let ids = st
+                    .tok
                     .aencode(text, truthy(body.get("add_special_tokens")))
                     .await
-                    .map_err(|e| ApiError::new(500, &e, None))?
+                    .map_err(|e| ApiError::new(500, &e, None))?;
+                if images.is_empty() {
+                    ids
+                } else {
+                    // the span lengths come from the images' headers, without building the pixels
+                    use crate::vision;
+                    let b64: Vec<&str> =
+                        images.iter().map(vision::block_b64).collect::<Result<_, _>>().map_err(image_err)?;
+                    vision::check_budget(&b64).map_err(image_err)?;
+                    let model = vision::Model::Glm5v;
+                    let n_spans: Vec<usize> =
+                        b64.iter().map(|s| model.n_span_b64(s)).collect::<Result<_, _>>().map_err(image_err)?;
+                    vision::expand(&ids, &n_spans, model.token()).map_err(image_err)?.0
+                }
             }
         } else if let Some(Value::String(p)) = body.get("prompt") {
             let add_special = body.get("add_special_tokens").is_none_or(|v| truthy(Some(v)));

@@ -130,7 +130,7 @@ constexpr int DS_CONF_IN = HID + 256;        // [shape] confidence_head.proj [1,
 
 // --- tokens ---
 constexpr int TOK_BOS = 0, TOK_EOS = 1, TOK_PAD = 2;   // [cfg]
-constexpr int TOK_IMAGE = 129264;    // [cfg] image_token_id: every row of an image span (runtime/ds41_image.h, GR8_DS41_VISION)
+constexpr int TOK_IMAGE = 129264;    // [cfg] image_token_id: every row of an image span (runtime/image_input.h, GR8_DS41_VISION)
 constexpr int TOK_THINK_END = 128822;    // [tok] </think> (<think> 128821), checked against the DeepSeek tokenizer
 
 // --- compile-time checks: the tensor shapes of the checkpoint ---

@@ -329,14 +329,16 @@ class Service {
         atomic_file(c_.directory + "/resp." + std::to_string(id), "end error -1 0\n");
         return false;
     }
-    // An image request the engine cannot run (ds41_image.h img::refusal) ends with an error before it is queued, as a
+    // An image request the engine cannot run (image_input.h img::refusal) ends with an error before it is queued, as a
     // grammar that does not compile does. The front end refuses the same cases first.
     bool images_ok(uint64_t id, const g6rt::ServeReq& r) {
         if (r.images.empty()) return true;
 #if G6_MODEL_DS41
         const bool decode_prompt = ds41_decode_prompt(c_.prefill_min, r.prompt.size(), r.plp, r.steering.enabled);
+#elif G6_MODEL_FLASH
+        const bool decode_prompt = r.plp >= 0 || r.steering.enabled;   // as Sessions::payload: only prompt logprobs decode
 #else
-        const bool decode_prompt = true;
+        const bool decode_prompt = true;   // GLM-5.3 has no vision tower
 #endif
         const char* why = g6rt::img::refusal(r.prompt, r.images, decode_prompt);
         if (!*why) return true;

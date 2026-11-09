@@ -7,7 +7,7 @@
 // hooks (run, emit, prompt, round, dfl, dfl_start) must not call stats() or emitted(), which read the Batch; the other
 // hooks may call any getter. No hook may call apply() or step(): the Rust refuses them.
 #pragma once
-#include "../ds41_image.h"
+#include "../image_input.h"
 #include "scheduler.h"
 #include "cp_rows.h"
 #include "../s2_batch.h"
@@ -20,7 +20,7 @@ struct Payload {
     g6rt::InsertRule ins;
     g6rt::steering::Identity steering{};
     g6rt::GrammarSpec gram;
-    std::vector<g6rt::ImageIn> images;   // DS41 image spans (ds41_image.h); only on prefilled prompts (Service::images_ok)
+    std::vector<g6rt::ImageIn> images;   // image spans (image_input.h); only on prefilled prompts (Service::images_ok)
 };
 // One member of a single bounded W pass. Pointers remain valid for Driver::step's synchronous callback.
 struct PrefillPart { const Slot* slot = nullptr; const Payload* payload = nullptr; uint32_t first = 0, rows = 0; };

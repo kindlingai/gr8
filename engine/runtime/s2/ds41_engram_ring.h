@@ -4,7 +4,7 @@
 // that ring from the chat's tokens, so they take the request's image rows too: an image that ends within 3 tokens of the
 // snapshot position gives the same n-grams after the reuse as in the live run. No CUDA types.
 #pragma once
-#include "../ds41_image.h"
+#include "../image_input.h"
 #include "../../engram/engram_ring.h"
 
 #include <algorithm>

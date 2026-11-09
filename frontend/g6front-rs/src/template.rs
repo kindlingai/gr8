@@ -171,6 +171,124 @@ impl ChatTemplate {
     }
 }
 
+// ---- image blocks in the rendered prompt (GLM-5.3-Flash image input) ----------------------------------------------
+
+/// The marker tokens the template writes for an image and for a video part (`<|image|>`, `<|video|>`).
+const IMAGE_MARK: &str = "<|image|>";
+const VIDEO_MARK: &str = "<|video|>";
+
+/// f on each image part (`image`, `image_url`, `input_image`) in the messages' content and tool outputs, in a fixed walk
+/// order.
+fn for_each_image(v: &mut Value, f: &mut dyn FnMut(&mut Map<String, Value>)) {
+    match v {
+        Value::Array(a) => a.iter_mut().for_each(|x| for_each_image(x, f)),
+        Value::Object(o) => {
+            if matches!(o.get("type").and_then(Value::as_str), Some("image" | "image_url" | "input_image")) {
+                f(o);
+            } else {
+                for k in ["content", "output"] {
+                    if let Some(x) = o.get_mut(k) {
+                        for_each_image(x, f);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether the messages hold an image part (the walk of for_each_image).
+pub fn has_images(v: &Value) -> bool {
+    match v {
+        Value::Array(a) => a.iter().any(has_images),
+        Value::Object(o) => {
+            matches!(o.get("type").and_then(Value::as_str), Some("image" | "image_url" | "input_image"))
+                || ["content", "output"].iter().any(|k| o.get(*k).is_some_and(has_images))
+        }
+        _ => false,
+    }
+}
+
+/// The marker tokens of a rendered prompt, in order: true for an image, false for a video.
+fn marks(text: &str) -> Vec<bool> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Some(i) = text[at..].find("<|") {
+        let rest = &text[at + i..];
+        if rest.starts_with(IMAGE_MARK) {
+            out.push(true);
+        } else if rest.starts_with(VIDEO_MARK) {
+            out.push(false);
+        }
+        at += i + 2;
+    }
+    out
+}
+
+impl ChatTemplate {
+    /// `render()`, and the image parts in the order the prompt holds their `<|image|>` placeholders. An `input_image`
+    /// part renders as an `image` part. The template places each part where it likes (it can sort tool results), so the
+    /// order comes from the template itself: with n parts, ceil(log2 n) more renders each mark part i as an image when
+    /// bit b of i is set and as a video otherwise, and the bits read off each placeholder name its part. One more render
+    /// marks every part as a video, to find a literal `<|image|>` in the text, which is refused, as is a template that
+    /// places a different number of parts between those renders.
+    pub fn render_images(
+        &self,
+        messages: Option<&Value>,
+        tools: Option<&Value>,
+        kw: Map<String, Value>,
+    ) -> Result<(String, Vec<Value>), TemplateError> {
+        let mut msgs = messages.cloned().unwrap_or(Value::Null);
+        let mut blocks = Vec::new();
+        for_each_image(&mut msgs, &mut |p| {
+            if p.get("type").and_then(Value::as_str) == Some("input_image") {
+                p.insert("type".into(), Value::from("image"));
+            }
+            blocks.push(Value::Object(p.clone()));
+        });
+        let n = blocks.len();
+        let text = self.render(Some(&msgs), tools, kw.clone())?;
+        let placed = marks(&text);
+        if placed.iter().any(|&m| !m) {
+            return Err("the prompt holds a video placeholder; videos are not supported".into());
+        }
+        if n == 0 {
+            return if placed.is_empty() { Ok((text, Vec::new())) } else { Err(LITERAL.into()) };
+        }
+        // Probe 0 renders every part as a video, so a placeholder still there is the text's own. Probe b + 1 renders
+        // part i as an image when bit b of i is set.
+        let bits = usize::BITS - (n - 1).leading_zeros();
+        let mut index = vec![0usize; placed.len()];
+        for probe in 0..=bits {
+            let mut i = 0usize;
+            let mut m = msgs.clone();
+            for_each_image(&mut m, &mut |p| {
+                let image = probe > 0 && (i >> (probe - 1)) & 1 == 1;
+                p.insert("type".into(), Value::from(if image { "image" } else { "video" }));
+                i += 1;
+            });
+            let got = marks(&self.render(Some(&m), tools, kw.clone())?);
+            if got.len() != placed.len() {
+                return Err("the chat template places the images inconsistently".into());
+            }
+            for (k, &m) in got.iter().enumerate() {
+                if probe == 0 && m {
+                    return Err(LITERAL.into());
+                }
+                if probe > 0 {
+                    index[k] |= (m as usize) << (probe - 1);
+                }
+            }
+        }
+        if index.iter().any(|&i| i >= n) {
+            return Err("the chat template places the images inconsistently".into());
+        }
+        Ok((text, index.into_iter().map(|i| blocks[i].clone()).collect()))
+    }
+}
+
+const LITERAL: &str = "the prompt text holds an image placeholder (<|image|>)";
+
 fn strftime_now(fmt: &str) -> String {
     let Ok(cfmt) = std::ffi::CString::new(fmt) else { return String::new() };
     unsafe {
@@ -765,6 +883,63 @@ mod tests {
         let t = ChatTemplate::from_source(GLM_HEAD.into(), Value::Null, Value::Null).unwrap();
         assert_eq!(t.levels, vec!["max", "high", "low"]);
         effort_lines(&t);
+    }
+
+    /// A template that writes the messages in reverse, with GLM-5.3-Flash's media macros: the image parts come back in
+    /// the order of their placeholders in the prompt.
+    #[test]
+    fn render_images_follows_the_template() {
+        let src = r#"{%- macro v(c) -%}{%- for i in c -%}{%- if i.type == 'text' -%}{{ i.text }}{%- elif i.type in ['image', 'image_url'] -%}<|begin_of_image|><|image|><|end_of_image|>{%- elif i.type in ['video', 'video_url'] -%}<|begin_of_video|><|video|><|end_of_video|>{%- endif -%}{%- endfor -%}{%- endmacro -%}{%- for m in messages | reverse -%}<|{{ m.role }}|>{{ v(m.content) }}{%- endfor -%}"#;
+        let t = ChatTemplate::from_source(src.into(), Value::Null, Value::Null).unwrap();
+        let img = |k: u32| json!({"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{k}")}});
+        let msgs = json!([
+            {"role": "user", "content": [img(0), {"type": "text", "text": "a"}, img(1)]},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": [{"type": "text", "text": "c"}, img(2), {"type": "input_image", "image_url": "data:image/png;base64,3"}]},
+        ]);
+        let (text, blocks) = t.render_images(Some(&msgs), None, Map::new()).unwrap();
+        let im = "<|begin_of_image|><|image|><|end_of_image|>";
+        assert_eq!(text, format!("<|user|>c{im}{im}<|assistant|>b<|user|>{im}a{im}"));
+        let urls: Vec<String> = blocks.iter().map(|b| crate::vision::block_b64(b).unwrap().to_string()).collect();
+        assert_eq!(urls, ["2", "3", "0", "1"]);
+        // one image takes the literal probe alone, and no image gives the text render() makes
+        let one = json!([{"role": "user", "content": [img(7)]}]);
+        assert_eq!(t.render_images(Some(&one), None, Map::new()).unwrap().1.len(), 1);
+        let none = json!([{"role": "user", "content": "hi"}]);
+        assert_eq!(t.render_images(Some(&none), None, Map::new()).unwrap(), ("<|user|>hi".to_string(), vec![]));
+        // a literal placeholder in the text is refused, with or without images
+        let lit = json!([{"role": "user", "content": [img(0), {"type": "text", "text": "<|image|>"}]}]);
+        assert!(t.render_images(Some(&lit), None, Map::new()).is_err());
+        let lit = json!([{"role": "user", "content": "<|image|>"}]);
+        assert!(t.render_images(Some(&lit), None, Map::new()).is_err());
+    }
+
+    /// The real GLM-5.3-Flash template (GR8_TEST_TOKENIZER_DIR, as below): images in a user message, a system message and
+    /// two tool results that the template sorts into its tool calls' order.
+    #[test]
+    fn render_images_in_the_flash_template() {
+        let Some(dir) = gr8knobs::TEST_TOKENIZER_DIR.get() else {
+            eprintln!("GR8_TEST_TOKENIZER_DIR not set; skipping");
+            return;
+        };
+        let t = ChatTemplate::load(Path::new(&dir), Value::Null, Value::Null).unwrap();
+        if !t.flash_thinking_off {
+            eprintln!("GR8_TEST_TOKENIZER_DIR is not GLM-5.3-Flash; skipping");
+            return;
+        }
+        let img = |k: u32| json!({"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{k}")}});
+        let call = |id: &str| json!({"id": id, "type": "function", "function": {"name": "f", "arguments": "{}"}});
+        let msgs = json!([
+            {"role": "system", "content": [{"type": "text", "text": "s"}, img(0)]},
+            {"role": "user", "content": [img(1), {"type": "text", "text": "what is this?"}]},
+            {"role": "assistant", "content": "", "tool_calls": [call("a"), call("b")]},
+            {"role": "tool", "tool_call_id": "b", "content": [img(3)]},
+            {"role": "tool", "tool_call_id": "a", "content": [img(2)]},
+        ]);
+        let (text, blocks) = t.render_images(Some(&msgs), None, Map::new()).unwrap();
+        assert_eq!(text.matches("<|begin_of_image|><|image|><|end_of_image|>").count(), 4, "{text}");
+        let urls: Vec<String> = blocks.iter().map(|b| crate::vision::block_b64(b).unwrap().to_string()).collect();
+        assert_eq!(urls, ["0", "1", "2", "3"], "{text}");
     }
 
     /// The real template: GR8_TEST_TOKENIZER_DIR=<dir with chat_template.jinja ...> cargo test --release

@@ -113,6 +113,12 @@ struct FlashPrefill
     u64 cur_step = 0;                            // host copy of the layer step pf_step_flash set (for the staging copy)
     void (*dfl_tap)(Model&, FlashPrefill&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, keep the prompt rows the
                                                                                  //   drafter reads (dflash.cuh dfl_pf_tap_flash)
+    // image input (GR8_GLM53F_VISION, flash_vision_stage.cuh): a launch with image rows (vis_n > 0) embeds row r from
+    // vis_pool[vis_row[r]] (the vision tower's row) where vis_row[r] >= 0, else from the token. With vis_n = 0 the
+    // launch runs the text-only embed.
+    int* vis_row = nullptr;                      // [MP] device
+    const __nv_bfloat16* vis_pool = nullptr;     // [pool rows][HID] device
+    int vis_n = 0;
 };
 inline bool pf_mhc_stage()
 {
@@ -1198,6 +1204,14 @@ inline void pf_cp_pre(Model&, int, int, cudaStream_t) {}
 inline void pf_cp_prefetch(Model&, int, int, cudaStream_t) {}
 inline void pf_cp_post(Model&, int, int, int, int, int, cudaStream_t) {}
 #endif
+// The prefill embed: each row's embedding into the 4 mHC streams (the vision tower's row on an image row)
+inline void pf_embed_flash(Model& m, FlashPrefill& P, int M, cudaStream_t st)
+{
+    if (P.vis_n > 0)
+        flash_mhc::k_mhc_embed_rows<<<M, flash_mhc::THREADS, 0, st>>>(mhc_buffers(P), P.tok, m.emb, HID, geom::RMS_EPS_FLASH,
+                                                                      P.vis_pool, P.vis_row);
+    else flash_mhc::k_mhc_embed<<<M, flash_mhc::THREADS, 0, st>>>(mhc_buffers(P), P.tok, m.emb, HID, geom::RMS_EPS_FLASH);
+}
 inline void pf_step_flash(Model& m, FlashPrefill& P, int M, int context, u64 ls0, cudaStream_t st,
                           const std::function<void(int, int)>& residual_copy = {})
 {
@@ -1206,7 +1220,7 @@ inline void pf_step_flash(Model& m, FlashPrefill& P, int M, int context, u64 ls0
     pr.last = 0;
     pr.mark(-1, st);
     P.sp_agk[1] = P.sp_agk[3] = pf_sp() && pf_sp_agk();   // single lane: every gather directly follows its owner pass
-    flash_mhc::k_mhc_embed<<<M, flash_mhc::THREADS, 0, st>>>(mhc_buffers(P), P.tok, m.emb, HID, geom::RMS_EPS_FLASH);
+    pf_embed_flash(m, P, M, st);
     pf_mhc_input(m, P, 0, false, M, st);
     if (residual_copy) residual_copy(0, M);
     pr.mark(10, st);
@@ -1256,7 +1270,7 @@ inline void pf_step2_flash(Model& m, FlashPrefill& A, FlashPrefill& B, int MA, i
     pr.last = 0;
     pr.mark(-1, st);
     auto embed = [&](FlashPrefill& P, int M) {
-        flash_mhc::k_mhc_embed<<<M, flash_mhc::THREADS, 0, st>>>(mhc_buffers(P), P.tok, m.emb, HID, geom::RMS_EPS_FLASH);
+        pf_embed_flash(m, P, M, st);
         pf_mhc_input(m, P, 0, false, M, st);
         pr.mark(10, st);
     };
