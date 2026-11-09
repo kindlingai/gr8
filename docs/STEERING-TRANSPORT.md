@@ -1,5 +1,8 @@
 # Steering request and row transport
 
+> Historical note: this page describes the change that introduced the request and row transport. Profile loading and
+> request selection are live; see [STEERING.md](STEERING.md).
+
 This is the inactive transport foundation extracted from #45. Real `g6m4` boots have no loaded steering
 profile and publish the existing `G6S2 3` readiness line. No profile-loading or force CLI/config switches
 are introduced here. Named HTTP requests fail with a clear 400, including named scale-zero requests.

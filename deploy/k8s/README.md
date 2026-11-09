@@ -65,12 +65,13 @@ supervisor, and `./gr8 glm53 logs` the rest, as on bare metal.
 
 ### Options
 
-`options` becomes the ConfigMap the pods read, the same on every pod. The chart sets only `MODEL`; the launcher keeps
-every default, so set only what this cluster needs. A change of options rolls the group onto pods that read them. The
-chart refuses `TP` and `HEAD` (it sets them) and `PEERS` (with a peer list the first address is the head, and the leader
-need not be on it). `PORT`, `CONTROL_PORT` and `S2PORT` move the pod's ports with them. `HF_TOKEN`, for a gated repo,
-belongs in a Secret: `extraEnvFrom: [{secretRef: {name: <secret>}}]`. A second group on the same mentat network is a
-second release with its own `GROUP`.
+`options` becomes the ConfigMap the pods read, the same on every pod. The chart sets `TP` and `HEAD`; `GR8_MODEL` and
+`MODEL` are required, and the launcher keeps every other default, so set only what this cluster needs. A change of
+options rolls the group onto pods that read them. The chart refuses `TP` and `HEAD` (it sets them) and `PEERS` (with a
+peer list the first address is the head, and the leader need not be on it). `PORT`, `CONTROL_PORT` and `S2PORT` move the
+pod's ports with them. `HF_TOKEN`, for a gated repo, belongs in a Secret:
+`extraEnvFrom: [{secretRef: {name: <secret>}}]`. A second group on the same mentat network is a second release with its
+own `GROUP`.
 
 ### Storage
 

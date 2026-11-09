@@ -298,7 +298,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_QA_SPLIT_TPC` | int | `1` |  | Sets the output tiles per CTA of the GEMVs that GR8_QA_SPLIT, GR8_IDXQ_SPLIT and GR8_MTP_SPLIT narrow. It only lowers a GEMV's own count and keeps the output bits (rank.cuh qs_narrow). |
 | `GR8_QO_NANINJ` | flag | `0` |  | Writes an FP16 NaN into q[0] of the prefill attention on every call, a fault injection for the error checks. |
 | `GR8_QUIT_FAST` | flag | `0` | 0\|1 | At an orderly quit of a served GLM-5.3 engine, after the KV store keeps the pool's runs and the links close, the ranks meet at the fabric barrier and the process ends at once: the CUDA graphs, buffers and the CUDA runtime are not freed one by one, process exit releases them. The Flash and DS41 engines ignore it. |
-| `GR8_REUSE_ALIGN` | flag | 1 with --serve, 0 offline | 0\|1 | With --reuse-prefix, a hit keeps only whole cold-prefill grid cells (--prefill rows), so the result equals a cold prefill bit for bit. 0 keeps the whole matched prefix. 1 needs --prefill. |
+| `GR8_REUSE_ALIGN` | flag | 1 with --serve, 0 offline | 0\|1 | With --reuse-prefix, a hit keeps only whole cold-prefill grid cells (--prefill rows), so the result should equal a cold prefill. Open issue #412 reports a hit that differs from a cold prefill at temperature 0 (GLM-5.3, TP=4). 0 keeps the whole matched prefix. 1 needs --prefill. |
 | `GR8_REUSE_NOEND` | flag | 1 with --serve, 0 offline | 0\|1 | With --reuse-prefix, a hit no longer needs the new prompt to reach the end of what the last sequence wrote, so a prompt can be replayed as it is. 0 restores that rule (prefix_reuse.h). |
 | `GR8_REUSE_STRICT` | flag | `0` | 0\|1 | With --reuse-prefix, a hit needs the new prompt to extend the previous sequence exactly, the strict append rule (prefix_reuse.h). |
 | `GR8_ROUTER_TPC` | int | `2` | 1\|2 | Sets the router GEMV's output tiles per CTA: 1 = 16 CTAs of 512 threads instead of 8 of 1024. Same tiles, k parts and reduction order, so the same bits (bind.cuh). |
@@ -341,7 +341,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_DFL_DUMP` | path | unset |  | With --dflash, rank 0 writes every draft step's context features, drafts and committed tokens to this file, for engine/ref/dflash2_replay.py. |
 | `GR8_DRAFT_IN_DUMP` | path | unset |  | Rank 0 writes the inputs of every MTP first draft pass to this file. Needs --mtp and no --serve. |
 | `GR8_DS_C2_TRACE` | flag | `0` |  | 1 = count every launch of the coalesced-epilogue wo_b GEMM (k_gemm_mx8t_c2), so a run can print ds41a::c2_dispatch_count() at stop. |
-| `GR8_DS_CACHE_MIB` | int | the prefix cache's own size | 1.. | Size in MiB of the host prefix cache of DS41 session snapshots (--reuse-prefix). |
+| `GR8_DS_CACHE_MIB` | int | 4096 MiB per rank | 1.. | Size in MiB of the host prefix cache of DS41 session snapshots (--reuse-prefix). |
 | `GR8_DS_ENGRAM_CACHE_MIB` | int | `4096` | 1..1048576 | Size in MiB of the host cache of Engram table rows, shared by both layers. It holds 256-byte rows, so 4096 MiB holds 16 M rows. |
 | `GR8_DS_ENGRAM_IO_THREADS` | int | `32` | 1..1024 | Fallback pread-pool threads (also used when GR8_DS_ENGRAM_IO_URING=0) that read Engram rows from NVMe. A decode step needs about 20 reads and a prefill chunk thousands; 64 reads a prefill chunk fastest. |
 | `GR8_DS_ENGRAM_IO_URING` | int | `128` | 0..32768 | Queue depth for the raw io_uring Engram row reader on the calling fetch thread. 0 keeps the pread pool unchanged; positive values use aligned block reads without pool workers. The default reader needs a seccomp profile that allows io_uring_setup, io_uring_enter and io_uring_register. The stock Docker profile denies those calls with EPERM. A denied setup logs the errno once and uses the pread pool sized by GR8_DS_ENGRAM_IO_THREADS (engine/engram/rowstore.h; tested with EPERM and ENOSYS). |
@@ -517,13 +517,14 @@ Read by the build or the launcher, never by the engine.
 | `GR8_HOME` | path | unset |  | docker/compose.yaml: a host directory for the home volume (logs and state). Not the bare-metal GR8_WORK_DIR. |
 | `GR8_IMAGE` | text | unset |  | docker/compose.yaml: the gr8 image to run. |
 | `GR8_KNOBS_LIB` | path | the crate's build, else bin/lib/libgr8knobs.so |  | The knob table library the launcher loads (tools/launch/knobs.py). |
-| `GR8_MODEL` | text | unset |  | The model the launcher and the Helm chart serve: glm53 or glm53f. |
+| `GR8_MODEL` | text | unset |  | The model the launcher and the Helm chart serve: glm53, glm53f or ds41. |
 | `GR8_NR` | text | unset |  | The tensor-parallel widths scripts/build.sh builds, the same as GR8_WIDTHS. |
 | `GR8_NVCC_CACHE` | flag | `1` | 0\|1 | 0 turns off the compile cache in front of nvcc and g++. |
 | `GR8_NVCC_CACHE_DIR` | path | ~/.cache/gr8-nvcc |  | Where the compile cache keeps outputs. |
 | `GR8_NVCC_CACHE_LOG` | path | unset |  | A file that gets one hit, miss or pass line per compile. |
 | `GR8_PSEUDO_TOKENIZER` | path | unset |  | CI: a tokenizer directory that turns on the pseudo engine's smoke and API tests. |
-| `GR8_REFUSAL_LINGER` | float | unset |  | Seconds the head keeps a refused boot's status up, 15 when unset. It then keeps answering until every worker has the refusal (a box still fetching says hello late), at most JOIN_TIMEOUT seconds more; not when the refusal is the head's own join timeout or a rank that stopped asking. GR8_JOIN_TIMEOUT=0 adds no extra wait here. |
+| `GR8_REFUSAL_LINGER` | float | unset |  | Seconds the head keeps a refused boot's status up, 15 when unset. It then keeps answering until every worker has the refusal (a box still fetching says hello late), at most JOIN_TIMEOUT seconds more; not when the refusal is the head's own join timeout or a rank that stopped asking. |
+| `GR8_STOP_GRACE` | text | 30s |  | docker/compose.yaml: how long docker waits for the container to stop before it kills it, 30s when unset. A KV_STORE ssd store with persist=on that keeps sessions (keep=sessions or all, or KV_KEEP) makes the engine's quit take up to 120 s, so set 150s with one; else the quit takes 10 s. |
 | `GR8_TESTS` | text | `1` | 0\|1\|only | Whether scripts/build.sh builds the test binaries: 0 skips them, only builds them alone. |
 | `GR8_WIDTHS` | text | unset |  | The tensor-parallel widths scripts/build.sh builds, "3 4" for example. |
 | `GR8_WORK_DIR` | path | the repository |  | The working directory of a bare-metal install: bin/, out/, s2/, run/. |
