@@ -92,7 +92,7 @@ inline cudaError_t prepare(Scratch& q, int capacity) {
     constexpr size_t S1=mxtc::fc1_smem<H,DS41_TC_CW,DS41_TC_NTG1,DS41_TC_ST1>();
     constexpr size_t S2=mxtc::fc2_smem<DS41_TC_W2,DS41_TC_TPC,DS41_TC_ST2>();
     cudaError_t e=cudaFuncSetAttribute(mxtc::k_fc1_tc<H,I,DS41_TC_CW,DS41_TC_NTG1,DS41_TC_ST1,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,S1);
-    if(e==cudaSuccess)e=cudaFuncSetAttribute(ds41v2moe::k_fc2_columns<I,H,DS41_TC_W2,DS41_TC_WT,DS41_TC_TPC,DS41_TC_ST2,COLUMN_GROUPS>,cudaFuncAttributeMaxDynamicSharedMemorySize,S2);
+    if(e==cudaSuccess)e=cudaFuncSetAttribute(mxtc::k_fc2_tc<I,H,DS41_TC_W2,DS41_TC_WT,DS41_TC_TPC,DS41_TC_ST2,COLUMN_GROUPS,ds41v2moe::Args>,cudaFuncAttributeMaxDynamicSharedMemorySize,S2);
     if(e==cudaSuccess && q.resident_fc2)e=cudaFuncSetAttribute(ds41v2moe::k_fc2_resident<I,H>,cudaFuncAttributeMaxDynamicSharedMemorySize,ds41v2moe::resident_smem<4,8,I>());
     if(e==cudaSuccess && q.gate_ro)e=cudaFuncSetAttribute(dsr::k_gate_logits_ro<NE>,cudaFuncAttributeMaxDynamicSharedMemorySize,dsr::GRO_SMEM);
     if(e!=cudaSuccess)release(q);
@@ -161,7 +161,7 @@ inline cudaError_t down_group(const Geometry& g,const Layer& w,Scratch& q,int c,
     if(q.resident_fc2) {
         constexpr size_t RS=ds41v2moe::resident_smem<4,8,I>();
         ds41v2moe::k_fc2_resident<I,H><<<a.n_slots*(COLS/128),128,RS,st>>>(a,q.order);
-    } else ds41v2moe::k_fc2_columns<I,H,DS41_TC_W2,DS41_TC_WT,DS41_TC_TPC,DS41_TC_ST2,COLUMN_GROUPS><<<a.n_slots*a.gy2*a.os2,DS41_TC_W2*32,SM,st>>>(a);
+    } else mxtc::k_fc2_tc<I,H,DS41_TC_W2,DS41_TC_WT,DS41_TC_TPC,DS41_TC_ST2,COLUMN_GROUPS,ds41v2moe::Args><<<a.n_slots*a.gy2*a.os2,DS41_TC_W2*32,SM,st>>>(a);
     compute.finish();
     TimingDetailSpan combine(trace,TimingStage::Combine,st,c);
     ds41v2moe::k_combine_group<H,TK,MM,__nv_bfloat16><<<(size_t(g.padded())*COLS+255)/256,256,0,st>>>(q.plan,q.partial,q.shared,q.send[c],g.M,g.padded(),col0,COLS);

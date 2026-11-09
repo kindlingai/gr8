@@ -65,7 +65,7 @@ void run(int M, int cut)
     args.tile_mask=p.p->tile_mask;args.tile_w=&p.p->tile_w[0][0];args.tile_tok=&p.p->tile_tok[0][0];args.n_slots_dev=&p.p->n_slots;args.n_slots=got.n_slots;
     args.gy2=4;args.os2=16;args.aq=aq.p;args.as=as.p;args.ypart=full.p;
     constexpr size_t SM=mxtc::fc2_smem<4,8,8>();
-    auto kfull=mxtc::k_fc2_tc<I,H,4,2,8,8>;auto kgroup=ds41v2moe::k_fc2_columns<I,H,4,2,8,8,4>;
+    auto kfull=mxtc::k_fc2_tc<I,H,4,2,8,8>;auto kgroup=mxtc::k_fc2_tc<I,H,4,2,8,8,4,ds41v2moe::Args>;
     CK(cudaFuncSetAttribute(kfull,cudaFuncAttributeMaxDynamicSharedMemorySize,SM));
     CK(cudaFuncSetAttribute(kgroup,cudaFuncAttributeMaxDynamicSharedMemorySize,SM));
     kfull<<<args.n_slots*args.gy2*args.os2,128,SM>>>(args);CK(cudaGetLastError());

@@ -2,9 +2,15 @@
 // expert's 128-column weight slab ONCE, then walks every bucketed row group.
 // Reuses gr8 record/MMA/quantized activation formats and weighted-half epilogue.
 #pragma once
-#include "ds41_v2_fc2_columns.cuh"
+#include "ds_moe_tc.cuh"
 
 namespace ds41v2moe {
+using namespace mxtc;
+// The stock routed-expert down arguments plus the output column group of a v2
+// launch: mxtc::k_fc2_tc<..., COLUMN_GROUPS, Args> covers that group's blocks.
+struct Args : mxtc::Args {
+    int col_group = 0;
+};
 template<int WARPS,int TPC,int I>
 constexpr size_t resident_smem() {
     return size_t(TPC)*(I/mx4::KG)*mx4::GR + size_t(WARPS)*8*mxtc::YP*sizeof(__half);
