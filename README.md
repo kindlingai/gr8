@@ -7,6 +7,13 @@ the model, see below), with an OpenAI-compatible API on the first box. gr8 is wr
 vLLM, PyTorch or NCCL at serve time. *Beta release. If you run it, please tell us what breaks:
 [issues](https://github.com/kindlingai/gr8/issues) and PRs are welcome.*
 
+### Switch between the models
+
+[![Switch between GLM-5.3, DeepSeek-V4.1-Flash and GLM-5.3-Flash: seconds for each direction](docs/cards/switching.png)](docs/SWITCHING.md)
+
+The same boxes serve one model at a time; `./gr8 switch <model>` stops the running one and starts the other.
+[docs/SWITCHING.md](docs/SWITCHING.md) has the setup and every measured step.
+
 ## Recipes
 
 Each recipe is one Docker image, set up for one model on a fixed number of boxes. For other box counts (GLM-5.3 on

@@ -1,0 +1,24 @@
+{
+  "title": "Switch models",
+  "subtitle": "seconds from the switch to the new model's /health ready, warm",
+  "models": [
+    {"id": "glm53", "name": "GLM-5.3", "detail": "TP=4 · four boxes"},
+    {"id": "ds41", "name": "DeepSeek-V4.1-Flash", "detail": "TP=4 · four boxes"},
+    {"id": "glm53f", "name": "GLM-5.3-Flash", "detail": "TP=2 · two boxes"}
+  ],
+  "switches": [
+    {"from": "glm53", "to": "ds41", "seconds": [37.1, 39.2]},
+    {"from": "ds41", "to": "glm53", "seconds": [76.0, 74.1]},
+    {"from": "glm53", "to": "glm53f", "seconds": [31.3]},
+    {"from": "glm53f", "to": "glm53", "seconds": [75.8, 75.8]},
+    {"from": "ds41", "to": "glm53f", "seconds": [28.5, 29.3]},
+    {"from": "glm53f", "to": "ds41", "seconds": [39.7, 40.2]}
+  ],
+  "command": "./gr8 switch glm53 | ds41 | glm53f",
+  "notes": [
+    "Mean of two warm runs each way (GLM-5.3 -> GLM-5.3-Flash: one warm run).",
+    "Four GB10 boxes; GLM-5.3-Flash on two of them (DGX Sparks).",
+    "GLM-5.3 <-> DeepSeek: ./gr8 switch, DeepSeek recipe image sha-ad3efdf, 2026-11-09.",
+    "With GLM-5.3-Flash: compose down, up -d, 2026-11-07, local build of its two-box recipe, gr8 4ed9e7b."
+  ]
+}
