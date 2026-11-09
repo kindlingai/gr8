@@ -10,20 +10,19 @@ TP=3 (a three-box ring, variant k4), TP=2 or TP=1 (one box, variant k2, the one 
 
 ## Results
 
-On one and two boxes, from the recipe repos (the one-box numbers are the image's defaults, also in its
-[kindling.json](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark/blob/main/kindling.json)):
+On one and two boxes, from each recipe's `kindling.json` as of 2026-11-08 (the numbers on its card, with the image's
+defaults):
 
-| | one box (TP=1) | two boxes (TP=2), first run |
+| | one box (TP=1) | two boxes (TP=2) |
 |---|---|---|
-| width, KV, drafting | K2, int4 KV, DFlash2 | K4, int4 KV, DFlash2 |
-| decode, code / prose / structured | 54.3 / 29.1 / 66.0 tok/s | 71.1 / 41.5 / 90.0 tok/s |
-| prefill, 8K / 32K / 128K prompt | 1,214 / 1,224 / 1,048 tok/s | 1,698 / 1,694 / 1,404 tok/s |
-| aggregate decode, 1 / 2 / 4 / 8 streams | 40.8 / 44.1 / 58.0 / 59.2 tok/s | not measured yet |
-| KV pool | 700,032 tokens, up to 4 requests at once | `CAP` 262,208 |
-| from | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark), `gr8 glm53f bench`, 2026-11-06 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark), "First numbers" in its README of 2026-11-06 |
+| manifest, KV, drafting | `bit201`, int4 KV, DFlash2 | `bit349`, int4 KV, DFlash2 |
+| decode, code / prose / structured | 53.8 / 28.2 / 65.1 tok/s | 74.5 / 41.9 / 94.6 tok/s |
+| prefill, 8K / 32K / 128K prompt | 995 / 1,024 / 916 tok/s | 1,675 / 1,676 / 1,354 tok/s |
+| aggregate decode, 1 / 2 / 4 / 8 streams | 43.5 / 41.3 / 53.4 / 57.5 tok/s | 54.0 / 62.5 / 75.5 / 98.2 tok/s |
+| KV pool | 700,032 tokens, up to 4 requests at once | 2,097,152 tokens, up to 8 requests at once |
+| from | [glm-5.3-flash-exlr8-1x-spark `kindling.json`](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark/blob/3e9754c5/kindling.json) | [glm-5.3-flash-exlr8-2x-spark `kindling.json`](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark/blob/81c29ca3/kindling.json) |
 
-The two-box numbers are from a first run and are not yet in a kindling.json. At TP=3 and TP=4 the sections below have
-what is measured so far. Open bugs: [KNOWN-ISSUES.md](../KNOWN-ISSUES.md#glm-53-flash).
+At TP=3 and TP=4 the sections below have what is measured so far. Open bugs: [KNOWN-ISSUES.md](../KNOWN-ISSUES.md#glm-53-flash).
 
 ## Build and run
 
