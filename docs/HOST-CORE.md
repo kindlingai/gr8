@@ -1,8 +1,9 @@
 # One host core, per-model GPU modules
 
-Status: R0 to R6c landed (R0 #343, R1 #344, R2 #345, #346, #351, #353, R3a #361, R3b #365, R6a #421, R6b #422, R6c #423;
-the step sections below say what each did). R6d to R11 are the plan. Inventory taken at 35a8f1c; reviewed against the
-code by a second pass.
+Status: R0 to R6c landed (R0 #343, R1 #344, R2 #345, #346, #351, #353, R3a #361, R3b #365, R4a #369, R4b #370,
+R4b2 #372, R4c #377, R5a #383, R5b1 #387, R5c #390, R5b2 #415, R5b2a #416, R5b2b #419, R5b2c #420, R6a #421, R6b #422,
+R6c #423; the step sections below say what each did). R6d to R11 are the plan. Inventory taken at 35a8f1c; reviewed
+against the code by a second pass.
 
 ## Why
 
