@@ -77,8 +77,8 @@ MODELS = {m.name: m for m in (GLM53, GLM53F, DS41, PSEUDO)}
 
 
 # The models a runner names. pseudo, the test engine, is served when named but left out of the lists.
-SERVED = (GLM53, GLM53F)
-CHOICES = ' or '.join(f'{m.name} ({m.title})' for m in SERVED)
+SERVED = (GLM53, GLM53F, DS41)
+CHOICES = ', '.join(f'{m.name} ({m.title})' for m in SERVED[:-1]) + f' or {SERVED[-1].name} ({SERVED[-1].title})'
 
 
 def of(o):
@@ -105,12 +105,15 @@ def describe(m):
     defaults = ', '.join(f'TP={tp} ' + ' else '.join(m.default_variant.get(int(tp), ('home',))) for tp in m.tp)
     extra = [o for o, on in (('--drafter URL (DFlash2)', m.drafter), ('--kv-format int4', m.int4_kv),
                              ('--default-reasoning-effort none', m.thinking_off)) if on]
+    # A model without variants (ds41) reads its release in place, from a local copy fetched beforehand.
+    copy = '' if m.variants else 'a local copy of '
+    variant = ([f'        --variant  {", ".join(m.variants)}', f'                   by default {defaults}'] if m.variants
+               else ['        --variant  none: the release is read in place (docs/DEEPSEEK-BOOT.md)'])
     return '\n'.join([f'{m.name:7} {m.title}: ./gr8 {m.name} <command>, or GR8_MODEL={m.name}',
-                      f'        --model    an exlr8 release of {m.architecture} (config.json `architectures`), such as',
+                      f'        --model    {copy}an exlr8 release of {m.architecture} (config.json `architectures`), such as',
                       f'                   {m.release}',
                       f'        --tp       {m.tp_sizes}',
-                      f'        --variant  {", ".join(m.variants)}',
-                      f'                   by default {defaults}',
+                      *variant,
                       *([f'        also       {", ".join(extra)}'] if extra else [])])
 
 

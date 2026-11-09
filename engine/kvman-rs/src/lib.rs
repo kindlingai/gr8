@@ -41,11 +41,11 @@
 //!
 //! The C interface (g6kvman.h, src/ffi.rs) is what engine/runtime/s2/pool.h wraps for g6m4 and m4sim.
 //!
-//! src/tier.rs is a proof of concept of an SSD store for retained runs (SSD-TIER.md), and src/remote a KV node that
-//! serves the same blocks from another box's locked memory over RDMA or TCP (REMOTE-TIER.md). The engine uses
-//! neither.
+//! src/tier.rs is an SSD store for retained runs (SSD-TIER.md), and src/remote a KV node that serves the same blocks
+//! from another box's locked memory over RDMA or TCP (REMOTE-TIER.md). The engine uses them through src/blocks.rs and
+//! src/stash.rs behind --kv-store ssd:... and --kv-store remote:... (experimental).
 //!
-//! src/ledger.rs is the host ledger of a box shared by a Flash rank and a KV node (D-331 M7): who may count each
+//! src/ledger.rs is the host ledger of a box shared by a Flash rank and a KV node: who may count each
 //! exchangeable byte, and GPU <-> node transfers as transactions (kvman-ledger is its command line).
 //!
 //! src/rows.rs is the remote attention rows tier (the engine's GR8_RT_STORE): a group's latent rows past L in a

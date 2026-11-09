@@ -936,7 +936,7 @@ class Supervisor:
 
     def donate(self, knobs):
         """GLM-5.3-Flash with FLASH_KV_DONATE_GIB > 0: lend this box's spare memory, measured now that the serve has
-        booted, to a KV node beside it (D-331 M7): flash_donor_budget GiB, a host ledger crediting them to the node,
+        booted, to a KV node beside it: flash_donor_budget GiB, a host ledger crediting them to the node,
         and ./gr8 kv up --lazy-lock --ledger. The node is its own supervisor: its failure, or no budget, leaves the
         serve as it is."""
         if models.of(self.o).name != 'glm53f' or float(knobs.get('FLASH_KV_DONATE_GIB') or 0) <= 0:

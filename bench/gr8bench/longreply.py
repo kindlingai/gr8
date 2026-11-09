@@ -119,7 +119,7 @@ def selftest():
     assert verdict([[(0, 0.1, 0, 300), (2000, 0.1, 0, 1)]])[0] == "FAIL"     # a loop
     assert verdict([w(0.1)])[0] == "INCONCLUSIVE"                            # 2,000 tokens only
     assert verdict([w(0.30, 0.29, 0.06, 0.05, 0.07, 0.12, 0.05, 0.06)]) == ("PASS", [])  # high first, falls (main)
-    # Matt's false FAIL (2026-10-12): a 16-token run 9 times in a window, apart (code boilerplate): now passes.
+    # a false FAIL (2026-10-12): a 16-token run 9 times in a window, apart (code boilerplate): now passes.
     run, filler = list(range(1000, 1016)), lambda k: list(range(5000 + 150 * k, 5150 + 150 * k))
     ids = [t for k in range(9) for t in run + filler(k)] + list(range(9000, 9000 + 2000 - 9 * 166))
     toks = [(t, -0.5) for t in ids] * 2

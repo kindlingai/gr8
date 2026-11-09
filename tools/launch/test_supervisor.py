@@ -648,7 +648,7 @@ def donor_budget(kib, **env):
 
 
 class DonorTests(unittest.TestCase):
-    """D-331 M7: a Flash box lends what its serve leaves to a KV node beside it."""
+    """A Flash box lends what its serve leaves to a KV node beside it."""
 
     def test_the_budget_is_memavailable_less_growth_and_reserve_capped_by_the_ask(self):
         w = {'FLASH_KV_GROWTH_GIB': '8', 'KV_MIN_FREE_GB': '10'}

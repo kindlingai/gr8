@@ -299,7 +299,7 @@ int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     if (knob::init()) return 2;        // every bad GR8_ value and unknown name at once (docs/ENV.md)
-    pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
+    pf_env_check();                    // strict GR8_PF_* choices (pf_env_check, prefill.cuh): a bad value exits before any work
 #if G6_MODEL_FLASH
     {   // GR8_MOE_TOPK (model change, screen arm): unset = the model's top-k
         const int tk = (int)knob::moe_topk();

@@ -37,10 +37,10 @@ downloads anything.
 
 `./gr8 models` lists each model's release and the values `--tp` and `--variant` take. For the GLM models each box
 fetches only its own part of the release into its model cache: the first `up` downloads it (about 90 GB at TP=4, 35
-minutes at 40 MB/s), and GLM-5.3's later boots load from its cache in about 40 s, as the README says.
+minutes at 40 MB/s), and GLM-5.3's later boots at TP=4 have their engines ready in about 71 s (measured 2026-11-06, [FIRST-BOOT.md](FIRST-BOOT.md)).
 [SWITCHING.md](SWITCHING.md) records warm-start waits and per-rank load times for a mixed TP=4 ring with DGX Spark
 and PCIe Gen4 NVMe boxes. (`ds41` is the exception in the table
-above: it is read in place from a local copy you fetch yourself, and `./gr8 models` leaves it out — see
+above: it is read in place from a local copy you fetch yourself, and it has no variants — see
 [DEEPSEEK-BOOT.md](DEEPSEEK-BOOT.md).) `prepare` with the same options downloads ahead of time, and is never
 required. On bare metal a Hugging Face `MODEL` needs `MODEL_CACHE`, a local directory for this box's part; the container
 sets its own. `MODEL` may also be a local copy of the release, used in place.

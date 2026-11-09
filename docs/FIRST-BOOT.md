@@ -11,7 +11,7 @@ exact model.
 These have no default ([DEPLOY.md](DEPLOY.md), "The two settings"):
 
 1. **Which model?** `glm53` (GLM-5.3), `glm53f` (GLM-5.3-Flash) or `ds41` (DeepSeek-V4.1-Flash-1017). `./gr8 models`
-   lists each GLM model's release and the TP values it takes. It does not list `ds41`: its release is
+   lists each model's release and the TP values it takes. `ds41`'s release is
    `https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native`, with `TP=4`. For `ds41`, remove the example's
    `DRAFTER=` line (GLM's DFlash2 drafter): `ds41` drafts with its own MTP layers, and the check refuses a drafter.
 2. **Which boxes?** Their addresses in the same order on every box (`PEERS`; the first one is the head and serves the
@@ -31,8 +31,8 @@ again, and the loader keeps the two newest builds' entries. The served bytes are
 (on an earlier build, before this port), 17.4 GB a rank, "engines ready" 93-96 s
 without it, 97 s on the boot that writes it, 20-21 s after.
 DeepSeek-V4.1-Flash at TP=4, 79.6 GB a rank: 84 s without it, 110 s on the boot that writes it, 16 s after.
-GLM-5.3 at TP=4 (ring, the docker image built from this change): 4.8 GB a rank, "engines ready" 71 s without it
-(stock image), 71 s on the boot that writes it, 68 s after. At TP=4 the computed tensors are a small part of the boot.
+GLM-5.3 at TP=4 (ring, 2026-11-06, an image built from the change that added the cache, #382): 4.8 GB a rank,
+"engines ready" 71 s without it (the image before that change), 71 s on the boot that writes it, 68 s after. At TP=4 the computed tensors are a small part of the boot.
 
 ## 2. DeepSeek-V4.1-Flash (`ds41`): how many chats, and how long
 

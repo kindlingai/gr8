@@ -84,7 +84,7 @@ flash_defaults() {
   flash_donor_defaults
 }
 
-# A KV node next to the Flash serve (D-331 M7): FLASH_KV_DONATE_GIB > 0 lends at most that many GiB of this box to a
+# A KV node next to the Flash serve: FLASH_KV_DONATE_GIB > 0 lends at most that many GiB of this box to a
 # ./gr8 kv up --lazy-lock node once the serve has booted. FLASH_KV_GROWTH_GIB is what the serve may still allocate after
 # boot; it has no default because it is not measured yet. FLASH_KV_GROUP is the mentat group the node serves (the cluster
 # that borrows from it, not this serve's), also without a default. FLASH_CAP_POLICY=protected: the configured CAP's memory is
