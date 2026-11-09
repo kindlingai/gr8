@@ -80,7 +80,7 @@ struct PlanKnobs
     bool ds_pf_v2 = false, ds_pf_v2_xtrace = false;
     bool ds_pf_l20_tail = false, ds_pf_rs = false, ds_mhc_row_shard = false, ds_mhc_fuse = false, ds_mhc_y_mxfp8 = false;
     bool ds_pf_direct = false, ds_subdump = false, ds_stripe = false, ds_xtrace = false;
-    int64_t ds_stripe_min = 0;
+    int64_t ds_stripe_min = 0, ds_pf_v2_stripe_min = 0;
 };
 
 inline PlanKnobs plan_knobs()
@@ -97,6 +97,7 @@ inline PlanKnobs plan_knobs()
     k.ds_prefill_w = knob::ds_prefill_w(); k.ds_pf_tail = knob::ds_pf_tail(); k.ds_pf_pool = knob::ds_pf_pool();
     k.ds_pf_lanes = knob::ds_pf_lanes(); k.ds_pf_v2 = knob::ds_pf_v2();
     k.ds_pf_v2_xtrace = knob::ds_pf_v2_xtrace();
+    k.ds_pf_v2_stripe_min = knob::ds_pf_v2_stripe_min();
     k.ds_pf_l20_tail = knob::ds_pf_l20_tail(); k.ds_pf_rs = knob::ds_pf_rs(); k.ds_mhc_row_shard = knob::ds_mhc_row_shard();
     k.ds_mhc_fuse = knob::ds_mhc_fuse(); k.ds_mhc_y_mxfp8 = knob::ds_mhc_y_mxfp8();
     k.ds_pf_direct = knob::ds_pf_direct(); k.ds_subdump = knob::ds_subdump().has_value(); k.ds_stripe = knob::ds_stripe();
@@ -286,6 +287,14 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
         auto vc=ds41::v2::fabric_config(cfg,p.pf_rows,HID,state_row,6352);
         vc.xtrace=k.ds_pf_v2_xtrace ? 1 : 0; // Fabric::init also requires GR8_XTRACE=1
         vc.port=cfg.port+104; vc.proxy_cpu=cfg.proxy_cpu>1?cfg.proxy_cpu-2:-1;
+        // Zero preserves the inherited config, including an existing DS_STRIPE.
+        // The proxy already handles compact runs, RS slices and ordered tails.
+        if (k.ds_pf_v2_stripe_min > 0) vc.stripe_min=size_t(k.ds_pf_v2_stripe_min);
+        const int rails=vc.ring ? 3 : (vc.ips2.empty() ? 1 : 2); // v2 is TP4
+        const size_t effective=vc.stripe_min && !vc.ring && rails==2
+            ? std::max(vc.stripe_min,size_t(8192)) : 0;
+        p.log.push_back(fmt("# ds41_v2_stripe min=%zu rails=%d effective_min=%zu\n",
+                            vc.stripe_min,rails,effective));
         add(FabKind::Ds41V2,104,vc);
     }
     // GR8_DS_PF_LANES=2: lane B's own fabric, port + 96, proxy core N-2 (DS41 builds no fabp / fabp2)
