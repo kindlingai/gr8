@@ -86,6 +86,7 @@ one GPU and makes its own synthetic weights.
 | `headgroup_test` | sparse prefill attention for more than 16 heads, against a CPU reference |
 | `kda_g9_det` | the G9 ON kernels give the same bits run to run |
 | `test_flash_cp` | Flash context-parallel decode at TP=2: the caches each rank holds, the merged index lists and the outputs against the replicated path (the lists and caches bit for bit, the outputs within the LSE merge's rounding) |
+| `ds41_v2_attn_test`, `ds41_v2_index_test`, `ds41_v2_moe_test`, `ds41_v2_engram_test`, `ds41_v2_ffn_test`, `ds41_v2_mhc_test`, `ds41_v2_timing_test`, `test_ds41_v2_width`, `test_ds41_v2_wire` | the DS41 v2 prefill (`GR8_DS_PF_V2`): its attention, indexer, MoE, Engram, FFN and mHC kernels against the stock ones, its event timing, and its wire (pack, publish, wait, reduce) over mapped slots, all on synthetic data. `TEST=ds41_v2` runs these alone, each in the one configuration its header names |
 
 `scripts/build.sh` runs `tr3_e4m3_test` (the trellis codebook decode, when a GPU is visible: every state of the mcg,
 mul1 and pmcgx codebooks against a host reference and the hashes the Rust and Python references check, and every lane
@@ -98,6 +99,7 @@ against its own decoded values), `l2pf_queue_test`, `k1_split_test` and
 | `l2pf_bench` | `GR8_L2PF` prefetch: speed, and exactness against no prefetch |
 | `gpuprobe` | the GPU half of the rank health probe (`tools/health/rank_probe.py` runs it) |
 | `dtr_test_tp4`, `dtr_test_flash_tp4` | dense trellis matrices, at TP4: dumps for `engine/ref/dtr_ref.py`, and decode timing (needs release entries) |
+| the DS41 v2 tests above, and `ds41_v2_fc2_profile` | the v2 down kernels' occupancy on this GPU (a profile, not a test) |
 
 `engine/runtime/build_m4.sh` builds these, by mode:
 
