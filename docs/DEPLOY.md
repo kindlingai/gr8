@@ -40,7 +40,7 @@ fetches only its own part of the release into its model cache: the first `up` do
 minutes at 40 MB/s), and GLM-5.3's later boots load from its cache in about 40 s, as the README says.
 [SWITCHING.md](SWITCHING.md) records warm-start waits and per-rank load times for a mixed TP=4 ring with DGX Spark
 and PCIe Gen4 NVMe boxes. (`ds41` is the exception in the table
-above: it is read in place from a local copy you fetch yourself, and `./gr8 models` leaves it out — see
+above: it is read in place from a local copy you fetch yourself, and it has no variants — see
 [DEEPSEEK-BOOT.md](DEEPSEEK-BOOT.md).) `prepare` with the same options downloads ahead of time, and is never
 required. On bare metal a Hugging Face `MODEL` needs `MODEL_CACHE`, a local directory for this box's part; the container
 sets its own. `MODEL` may also be a local copy of the release, used in place.

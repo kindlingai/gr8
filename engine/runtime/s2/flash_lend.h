@@ -1,4 +1,4 @@
-// FLASH_CAP_POLICY=borrow-idle (D-331 M7 B-2): the head's rule for lending the Flash rank's KV chunks inside CAP
+// FLASH_CAP_POLICY=borrow-idle: the head's rule for lending the Flash rank's KV chunks inside CAP
 // (runtime/flash_kv.h) to the KV node beside it while the serve is idle, and recalling them before a request that needs
 // them is admitted; the rule is engine/scheduler-rs/src/flash_lend.rs. The head drives both as Resize events on tier
 // FLASH_KV_TIER (scheduler.h), so every rank applies them at the same commit. Each rank's ACK carries its chunks online

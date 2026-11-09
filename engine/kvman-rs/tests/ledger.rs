@@ -1,4 +1,4 @@
-//! The host ledger (src/ledger.rs, D-331 M7): a crash at every write of every ownership phase leaves a book that
+//! The host ledger (src/ledger.rs): a crash at every write of every ownership phase leaves a book that
 //! balances and recovers; a stalled borrower is fenced off; many parties at once never credit a byte twice.
 
 use g6kvman::ledger::{Book, Ledger, Phase, Side};

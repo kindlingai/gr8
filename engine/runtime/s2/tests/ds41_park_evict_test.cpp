@@ -2,7 +2,7 @@
 // matches a prompt-end snapshot PE (claimed by its grant) but not the parked chat's request-end tokens RE, all slots full, so
 // the bind evicts that parked slot: the capture of RE must not evict PE, which the bind restores next. Before the fix the
 // capture only moved PE to the back of the LRU (touch), so a budget that fits PE or RE but not both evicted PE and the
-// bind aborted ("the evicted chat's capture evicted the grant's own snapshot"). Astra's fixture (review of 70b7282):
+// bind aborted ("the evicted chat's capture evicted the grant's own snapshot"). the reviewer's fixture (review of 70b7282):
 // 1 MiB budget, one attention layer of 256 ring rows; BF16 PE 774144 + RE 876544 B, FP4 PE 521344 + RE 550144 B.
 // Host only: the CUDA calls are stubs over host memory with an optional allocation limit.
 // Build (one line): g++ -std=c++17 -O1 -g -fsanitize=address,undefined -DG6_MODEL_DS41=1 -I engine/runtime engine/runtime/s2/tests/ds41_park_evict_test.cpp -o /tmp/ds41_park_evict_test <knobs lib>
@@ -131,7 +131,7 @@ static void others_evicted(bool fp4) {
 }
 
 
-// The same through admission (Astra's regression): Driver + Scheduler with GR8_DS_PARK on and 2 slots, a test native layer
+// The same through admission (the reviewer's regression): Driver + Scheduler with GR8_DS_PARK on and 2 slots, a test native layer
 // that plays ds41_native.cuh (prompt-end capture, park at finish, the bind's eviction of a parked slot and the restore of
 // the grant's hit). Chats A and B finish and park, so both slots are occupied; chat C's prompt matches A's prompt-end
 // snapshot PE but not A's parked tokens (thinking on, no tools); the grant lands on A's parked slot (the oldest), whose
@@ -383,7 +383,7 @@ static void lifecycle() {
 }
 
 
-// Astra's review of a2d4ace (GR8_DS_CACHE_REPLACE=1 only; the knob off links nothing):
+// The reviewer's review of a2d4ace (GR8_DS_CACHE_REPLACE=1 only; the knob off links nothing):
 // P2 #1: chats A and A' with the same prompt share A's prompt-end entry PE. A' parks on q1, A on q0 (PE links to A's park);
 // A' is evicted (RE), then A resumes RE or is evicted into that exact entry. A's park must leave no placeholder behind: an
 // unrelated chat B parked later on q0 is not freed by a restore of A's PE, and B's eviction captures B's request end.
@@ -455,7 +455,7 @@ static void park_digest_link() {
 #endif
 }
 
-// DS41 image input (Astra, review of 4b7ef70): a prefix-cache entry captured after an image (0..3 text tokens before the
+// DS41 image input (the reviewer, review of 4b7ef70): a prefix-cache entry captured after an image (0..3 text tokens before the
 // snapshot) restores the Engram ring the live steps left, -1 at the image rows, not the image token. The prompt-end entry
 // (capture_prompt_end) and a request-end entry captured by a park eviction (evict_parked), each restored on slot 0.
 static void image_ring() {
