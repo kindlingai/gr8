@@ -198,22 +198,70 @@ pub struct Penalties {
     pub frequency: PenaltySpec,
 }
 
-/// The think-end boost, a soft thinking budget (`--default-think-end-boost SPEC`, a request's `think_end_boost`):
-/// inside the think block the `</think>` logit gains min(max, per1k * (n - start) / 1000) at the reply's n-th thinking
-/// token. SPEC is `start=S,per1k=P,max=M`: S a token count or a fraction of the request's max_tokens written `0.5x`,
-/// P logits per thousand tokens past S, M the cap (0 to 20). per1k or max 0 = off.
+/// A token limit that may scale with the request: `N` tokens, `Fx` a fraction (0 to 1) of the request's effective
+/// max_tokens, or `N|Fx`, whichever comes first. The boost's start and `--default-thinking-budget` take this form.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct BoostSpec {
-    pub start: Start,
-    pub per1k: f64,
-    pub max: f64,
+pub enum Limit {
+    Tokens(u64),
+    Fraction(f64),
+    /// the smaller of the two
+    Either(u64, f64),
 }
 
+impl Default for Limit {
+    fn default() -> Limit {
+        Limit::Tokens(0)
+    }
+}
+
+impl Limit {
+    pub fn parse(s: &str) -> Result<Limit, String> {
+        let want = || format!("{s:?}: want a token count, a fraction like 0.5x, or both like 16384|0.5x");
+        let tokens = |t: &str| t.trim().parse::<u64>().map_err(|_| want());
+        let fraction = |t: &str| match t.trim().strip_suffix('x').map(str::parse::<f64>) {
+            Some(Ok(f)) if (0.0..=1.0).contains(&f) => Ok(f),
+            Some(Ok(_)) => Err(format!("{s:?}: want a fraction from 0x to 1x")),
+            _ => Err(want()),
+        };
+        match s.split_once('|') {
+            // 0 tokens would win every request, so the fraction would never count
+            Some((n, _)) if tokens(n)? == 0 => Err(format!("{s:?}: a pair needs a token count above 0")),
+            Some((n, f)) => Ok(Limit::Either(tokens(n)?, fraction(f)?)),
+            None if s.trim().ends_with('x') => Ok(Limit::Fraction(fraction(s)?)),
+            None => Ok(Limit::Tokens(tokens(s)?)),
+        }
+    }
+
+    /// The limit in tokens for a request of `max_tokens`.
+    pub fn resolve(&self, max_tokens: u64) -> u64 {
+        let part = |f: f64| (f * max_tokens as f64).round() as u64;
+        match *self {
+            Limit::Tokens(n) => n,
+            Limit::Fraction(f) => part(f),
+            Limit::Either(n, f) => n.min(part(f)),
+        }
+    }
+}
+
+impl std::fmt::Display for Limit {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Limit::Tokens(n) => write!(f, "{n}"),
+            Limit::Fraction(x) => write!(f, "{x}x"),
+            Limit::Either(n, x) => write!(f, "{n}|{x}x"),
+        }
+    }
+}
+
+/// The think-end boost, a soft thinking budget (`--default-think-end-boost SPEC`, a request's `think_end_boost`):
+/// inside the think block the `</think>` logit gains min(max, per1k * (n - start) / 1000) at the reply's n-th thinking
+/// token. SPEC is `start=S,per1k=P,max=M`: S a Limit (`16384`, `0.5x` or `16384|0.5x`), P logits per thousand tokens
+/// past S, M the cap (0 to 20). per1k or max 0 = off.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Start {
-    Tokens(u64),
-    /// of the request's max_tokens
-    Fraction(f64),
+pub struct BoostSpec {
+    pub start: Limit,
+    pub per1k: f64,
+    pub max: f64,
 }
 
 /// The boost as the engine takes it (PROTOCOL.md `think_end_boost`).
@@ -297,16 +345,7 @@ impl BoostSpec {
             };
             match key {
                 "start" if start.is_some() => return Err("start is given twice".into()),
-                "start" => {
-                    start = Some(match value.strip_suffix('x') {
-                        Some(f) => Start::Fraction(num(f, 0.0, 1.0)?),
-                        None => Start::Tokens(
-                            value
-                                .parse()
-                                .map_err(|_| format!("start={value:?}: want a token count or a fraction like 0.5x"))?,
-                        ),
-                    })
-                }
+                "start" => start = Some(Limit::parse(value).map_err(|e| format!("start={e}"))?),
                 "per1k" if per1k.is_some() => return Err("per1k is given twice".into()),
                 "per1k" => per1k = Some(num(value, 0.0, f64::MAX)?),
                 "max" if max.is_some() => return Err("max is given twice".into()),
@@ -314,7 +353,7 @@ impl BoostSpec {
                 _ => return Err(format!("{key:?}: want start, per1k or max")),
             }
         }
-        Ok(BoostSpec { start: start.unwrap_or(Start::Tokens(0)), per1k: per1k.unwrap_or(0.0), max: max.unwrap_or(0.0) })
+        Ok(BoostSpec { start: start.unwrap_or_default(), per1k: per1k.unwrap_or(0.0), max: max.unwrap_or(0.0) })
     }
 
     /// The boost for a request of `max_tokens`, or None when off.
@@ -322,11 +361,7 @@ impl BoostSpec {
         if self.per1k <= 0.0 || self.max <= 0.0 {
             return None;
         }
-        let start = match self.start {
-            Start::Tokens(n) => n,
-            Start::Fraction(f) => (f * max_tokens as f64).round() as u64,
-        };
-        Some(Boost { start, per1k: self.per1k, max: self.max })
+        Some(Boost { start: self.start.resolve(max_tokens), per1k: self.per1k, max: self.max })
     }
 }
 
@@ -1155,15 +1190,91 @@ mod tests {
     }
 
     #[test]
+    fn a_limit_is_tokens_a_fraction_or_the_smaller_of_both() {
+        assert_eq!(Limit::parse("16384"), Ok(Limit::Tokens(16384)));
+        assert_eq!(Limit::parse("0.5x"), Ok(Limit::Fraction(0.5)));
+        assert_eq!(Limit::parse(" 16384 | 0.5x "), Ok(Limit::Either(16384, 0.5)));
+        assert_eq!(Limit::parse("0x"), Ok(Limit::Fraction(0.0)));
+        assert_eq!(Limit::parse("1x"), Ok(Limit::Fraction(1.0)));
+        assert_eq!(Limit::default(), Limit::Tokens(0));
+        for bad in [
+            "",
+            "x",
+            "-1",
+            "1.5",
+            "abc",
+            "1.5x",
+            "-0.1x",
+            "nanx",
+            "16384|",
+            "|0.5x",
+            "16384|0.5",
+            "0.5x|16384",
+            "0|0.5x",
+            "1|2|0.5x",
+        ] {
+            assert!(Limit::parse(bad).is_err(), "{bad}");
+        }
+        // N stays N, Fx is the rounded fraction of max_tokens, N|Fx the smaller
+        assert_eq!(Limit::Tokens(16384).resolve(100), 16384);
+        assert_eq!(Limit::Fraction(0.5).resolve(8192), 4096);
+        assert_eq!(Limit::Fraction(0.8).resolve(8192), 6554); // 6553.6
+        let both = Limit::parse("16384|0.5x").unwrap();
+        assert_eq!(both.resolve(8192), 4096);
+        assert_eq!(both.resolve(40000), 16384);
+        assert_eq!(both.resolve(200000), 16384);
+        for s in ["16384", "0.5x", "16384|0.5x"] {
+            assert_eq!(Limit::parse(s).unwrap().to_string(), s);
+        }
+    }
+
+    #[test]
+    fn a_boost_start_of_n_or_fx_follows_a_share_default_max_tokens() {
+        // TP=1 Flash: share 32704, a 34,426-token agent prompt that names no max_tokens gets 8192
+        let prompt = 34426;
+        let default_max = chat_default_max_tokens(0, 32704, prompt);
+        assert_eq!(default_max, Some(8192));
+        let start = |body: &str, spec: &str| {
+            let m: Map<String, Value> = serde_json::from_str(body).unwrap();
+            let spec = BoostSpec::parse(spec).unwrap();
+            let p = build(
+                &m,
+                body.as_bytes(),
+                prompt,
+                262144,
+                &[],
+                VOCAB,
+                &Map::new(),
+                &Penalties::default(),
+                Some(&spec),
+                None,
+                default_max,
+                20,
+                true,
+            )
+            .unwrap();
+            p.gen.think_end_boost.unwrap().start
+        };
+        let spec = "start=16384|0.5x,per1k=2,max=10";
+        assert_eq!(start("{}", spec), 4096);
+        assert_eq!(start(r#"{"max_tokens": 40000}"#, spec), 16384);
+        assert_eq!(start(r#"{"max_tokens": 200000}"#, spec), 16384);
+        // the old forms: a token count never acts under an 8192 cap, a fraction alone runs away on a big max_tokens
+        assert_eq!(start("{}", "start=16384,per1k=2,max=10"), 16384);
+        assert_eq!(start(r#"{"max_tokens": 200000}"#, "start=0.5x,per1k=2,max=10"), 100000);
+    }
+
+    #[test]
     fn a_boost_spec_names_start_per1k_and_max() {
         let s = BoostSpec::parse("start=0.5x,per1k=2,max=10").unwrap();
-        assert_eq!(s, BoostSpec { start: Start::Fraction(0.5), per1k: 2.0, max: 10.0 });
+        assert_eq!(s, BoostSpec { start: Limit::Fraction(0.5), per1k: 2.0, max: 10.0 });
         assert_eq!(
             BoostSpec::parse(" start = 4096 , per1k=0.5,max=1.5").unwrap(),
-            BoostSpec { start: Start::Tokens(4096), per1k: 0.5, max: 1.5 }
+            BoostSpec { start: Limit::Tokens(4096), per1k: 0.5, max: 1.5 }
         );
-        assert_eq!(BoostSpec::parse("per1k=1,max=1").unwrap().start, Start::Tokens(0));
-        assert_eq!(BoostSpec::parse("start=1x,per1k=1,max=20").unwrap().start, Start::Fraction(1.0));
+        assert_eq!(BoostSpec::parse("per1k=1,max=1").unwrap().start, Limit::Tokens(0));
+        assert_eq!(BoostSpec::parse("start=1x,per1k=1,max=20").unwrap().start, Limit::Fraction(1.0));
+        assert_eq!(BoostSpec::parse("start=16384|0.5x,per1k=2,max=10").unwrap().start, Limit::Either(16384, 0.5));
         for bad in [
             "",
             "x",
@@ -1174,6 +1285,8 @@ mod tests {
             "start=1,per1k=1,max=1,max=2",
             "start=1,ramp=1,max=1",
             "start=abc,per1k=1,max=1",
+            "start=16384|1.5x,per1k=1,max=1",
+            "start=0.5x|16384,per1k=1,max=1",
         ] {
             assert!(BoostSpec::parse(bad).is_err(), "{bad}");
         }

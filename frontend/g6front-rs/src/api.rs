@@ -546,7 +546,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     }
     // the close a budget puts in is an insert rule too, and a request carries at most one: one that asks for both is
     // refused, while the server's default budget steps aside, as it does for logprobs
-    let budget = match (th.budget, params.gen.logprobs.is_some() || choice.is_forced()) {
+    let budget = match (th.budget_tokens(params.gen.max_tokens), params.gen.logprobs.is_some() || choice.is_forced()) {
         (b, true) if b > 0 && th.budget_explicit => {
             return Err(ApiError::bad(
                 if choice.is_forced() {
