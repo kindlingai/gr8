@@ -93,6 +93,7 @@ class Head:
         self.own, self.have, self.verdict = own, {0: own}, None
         self.seen, self.first, self.drop_s, self.clock = {}, None, drop_s, clock
         self.told = set()   # the ranks that got a refusal
+        self.gave_up = False   # the head stopped waiting for ranks: join timeout, or a rank stopped asking
         self.cv = threading.Condition()
         self.tp = int(own['opts']['tp']) if own else 0
 
@@ -156,11 +157,13 @@ class Head:
                            f'{self.drop_s:.0f}s')
                     self.verdict = self.failed_checks(why) or refusal(
                         'join', {r: self.have[r] for r in gone}, lambda x: 'stopped asking', why)
+                    self.gave_up = True
                 elif timeout and self.first is not None and now - self.first >= timeout:
                     missing = [f'rank {r} ({self.own["members"][r]})' for r in range(self.tp) if r not in self.have]
                     why = f'no hello within {timeout:.0f}s from {", ".join(missing)}'
                     self.verdict = self.failed_checks(why) or refusal('join', self.have, lambda x: 'said hello', why,
                                                                       code=1)
+                    self.gave_up = True
                 else:
                     self.cv.wait(0.5)
             if self.verdict is None:
@@ -170,11 +173,12 @@ class Head:
 
     def wait_told(self, timeout, stop=None):
         """Wait until every worker rank has got the refusal, a stop, or the timeout. True when all were told (or
-        there are no ranks to tell: a head that refused before it read its own options)."""
+        there are no ranks to tell: a head that refused before it read its own options). No wait when the head
+        already gave up on a rank (its join timeout, or a rank that stopped asking): that rank is not coming."""
         end = self.clock() + timeout
         with self.cv:
             while not set(range(1, self.tp)) <= self.told:
-                if (stop is not None and stop.is_set()) or self.clock() >= end:
+                if self.gave_up or (stop is not None and stop.is_set()) or self.clock() >= end:
                     return False
                 self.cv.wait(min(0.5, max(0.0, end - self.clock())))
             return True

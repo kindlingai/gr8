@@ -180,6 +180,34 @@ class HandshakeTests(unittest.TestCase):
         finally:
             f.close()
 
+    def test_wait_told_does_not_wait_for_a_rank_the_join_timeout_gave_up_on(self):
+        f = Fixture()
+        try:
+            ts, out = f.send_all([hello(1), hello(2)])
+            time.sleep(0.5)
+            self.assertFalse(f.head.wait_all(1.0))
+            for t in ts:
+                t.join(20)
+            self.assertEqual(out[1]['field'], 'join')
+            t0 = time.monotonic()
+            self.assertFalse(f.head.wait_told(30))     # rank 3 never said hello: no extra wait
+            self.assertLess(time.monotonic() - t0, 1.0)
+        finally:
+            f.close()
+
+    def test_wait_told_does_not_wait_for_a_rank_that_stopped_asking(self):
+        f = Fixture(drop_s=1.0)
+        try:
+            self.assertEqual(f.head.rpc(hello(1), LAN), {'t': 'wait'})     # a hello, then silence
+            ts, out = f.send_all([hello(2)])
+            self.assertFalse(f.head.wait_all(20))
+            ts[0].join(20)
+            t0 = time.monotonic()
+            self.assertFalse(f.head.wait_told(30))
+            self.assertLess(time.monotonic() - t0, 1.0)
+        finally:
+            f.close()
+
     def test_wait_told_with_no_ranks_returns_at_once(self):
         self.assertTrue(H.Head.refusing({'t': 'refused', 'field': 'head', 'values': {}}).wait_told(60))
 
