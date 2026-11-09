@@ -12,7 +12,7 @@ the DeepSeek dialect (DSML tool calls, numeric reasoning effort). It serves text
 
 Fast mode, the default of the Docker recipe
 [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark) (`TUNE=speed`):
-its image `{{IMAGE_TAG}}`, gr8 `main` at [`{{GR8_SHA7}}`](https://github.com/kindlingai/gr8/commit/{{GR8_SHA}}),
+its image `{{IMAGE_TAG}}`, gr8 `main` at [`0015fd0`](https://github.com/kindlingai/gr8/commit/0015fd04512ebc38e369475a1ce7dee76d445d77),
 Engram on, 32 chat slots, `CAP` 327,680, the fast-mode settings of [Settings](#settings), and an engine built with
 `DS41_MX=48`. Four GB10 boxes {{TOPOLOGY: on one 200G switch | in a ring}}, on {{DATE}}. Fast mode's output is not
 bit-identical to the exact model's: the same prompt can get a different reply.
