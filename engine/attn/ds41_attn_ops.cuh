@@ -46,6 +46,7 @@ void ds41_attn_set_tc_tile(int mode);
 void ds41_attn_set_comp_fp8(int on);
 void ds41_attn_comp_prepack(const ds41a::bf16* src, uint8_t* codes, uint8_t* scales, void* st);
 void ds41_attn_set_cpasync(int on);
+void ds41_attn_set_pipe(int on);
 void ds41_attn_set_split(int on);
 void ds41_attn_set_win_floor(int pos);
 int ds41_attn_gv_ready(const ds41a::Weights*, int rows);
