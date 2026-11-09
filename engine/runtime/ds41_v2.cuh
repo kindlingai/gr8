@@ -3,6 +3,7 @@
 #include "ds41_v2.h"
 #include "ds41_v2_timing.cuh"
 #include "../comms/xtrace.h"
+#include "../kernels/glue.cuh"
 #include "../knobs-rs/gr8_knobs.h"
 #include <cstdio>
 #include <cstdlib>
@@ -18,23 +19,16 @@ inline void check(cudaError_t e) {
 namespace detail {
 using Seq = unsigned long long;
 struct Segments { Segment s[MAX_SEGMENTS]; WireLayout w; };
-__device__ inline char* send(g6::FabricDev f, Seq epoch, int c) {
-    return f.send + g6::fab_send_off(f,epoch&1,c);
-}
+// The slot and doorbell helpers are the shared fabric ones (kernels/glue.cuh).
+__device__ inline char* send(g6::FabricDev f, Seq epoch, int c) { return glue::send_slot(f,epoch,c); }
 __device__ inline const char* peer(g6::FabricDev f, Seq epoch, int c, int rank) {
-    return rank == f.rank ? send(f,epoch,c) : f.recv + g6::fab_recv_off(f,epoch&1,c,rank);
+    return glue::peer_slot(f,epoch,c,rank);
 }
-__device__ inline Seq acquire(const Seq* p) {
-    Seq x; asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(x) : "l"(p) : "memory"); return x;
-}
-// Only the traced specialization reads clocks or writes trace storage. The
-// default specialization retains the original kernels; no device-side branch.
-__device__ inline Seq trace_now() {
-    Seq t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t;
-}
-__device__ inline Seq* trace_record(g6::FabricDev f,Seq epoch,int c) {
-    return f.xt+((epoch%g6::XT_STEPS)*f.ncoll+c)*g6::XT_W;
-}
+// Trace stamps: the shared xtrace record of (epoch, c) (glue::xt_rec). Only the
+// traced specializations stamp from here; the shared publish/wait stamp
+// wherever the fabric has xtrace storage (f.xt), which is the traced case.
+__device__ inline Seq trace_now() { return glue::xt_now(); }
+__device__ inline Seq* trace_record(g6::FabricDev f,Seq epoch,int c) { return reinterpret_cast<Seq*>(glue::xt_rec(f,epoch,c)); }
 __global__ void trace_produced(g6::FabricDev f,Seq epoch,int c) {
     if(threadIdx.x)return;
     auto* r=trace_record(f,epoch,c);
@@ -48,36 +42,19 @@ __device__ inline void trace_done(g6::FabricDev f,Seq epoch,int c) {
     __syncthreads(); // traced only: last writer in every CTA, not only thread 0
     if(!threadIdx.x)atomicMax(trace_record(f,epoch,c)+g6::XT_RED,trace_now());
 }
+// Separate stream-ordered launches: publish after every pack CTA has exited,
+// wait on one CTA. Trace=true runs where the fabric was built with xtrace
+// (f.xt set), which is where the shared helpers stamp.
 template<bool Trace=false>
 __global__ void publish(g6::FabricDev f, Seq epoch, int c) {
-    // Separate stream-ordered launch after every pack CTA has exited.
-    if (!threadIdx.x) {
-        if constexpr(Trace)trace_record(f,epoch,c)[g6::XT_PUB]=trace_now();
-        __threadfence_system();
-        Seq* p = f.doorbell+c; const Seq v=g6::coll_seq(epoch,c,f.ncoll);
-        asm volatile("st.release.sys.global.u64 [%0], %1;" :: "l"(p), "l"(v) : "memory");
-        if constexpr(Trace) {
-            auto* r=trace_record(f,epoch,c); r[g6::XT_DB]=trace_now(); r[g6::XT_SEQ]=v;
-        }
-    }
+    glue::publish_after(f,c,g6::coll_seq(epoch,c,f.ncoll));
 }
 template<bool Trace=false>
 __global__ void wait(g6::FabricDev f, Seq epoch, int c, size_t bytes) {
     if constexpr(Trace) {
         if(!threadIdx.x)trace_record(f,epoch,c)[g6::XT_WAIT_BEGIN]=trace_now();
     }
-    const int p=threadIdx.x;
-    if (p >= f.nr || p == f.rank) return;
-    const Seq seq=g6::coll_seq(epoch,c,f.ncoll);
-    const auto* tail=reinterpret_cast<const Seq*>(peer(f,epoch,c,p)+bytes);
-    const long long start=clock64();
-    unsigned it=0;
-    while (acquire(tail)!=seq) {
-        if ((++it&1023u)==0 && (*reinterpret_cast<volatile unsigned*>(f.error) || clock64()-start>20000000000LL)) {
-            atomicCAS(f.error,0u,0x79000000u | (unsigned(c)<<8) | unsigned(p)); return;
-        }
-    }
-    if constexpr(Trace)trace_record(f,epoch,c)[g6::XT_TAIL+p]=trace_now();
+    glue::wait_peers(f,epoch,c,g6::coll_seq(epoch,c,f.ncoll),bytes,0x79000000u);
 }
 // Copies one 16-byte wire unit, zero filling the part outside the valid rows.
 // Irregular rows (e.g. Q odd with 24-byte routing entries) use the byte path
