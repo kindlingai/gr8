@@ -149,6 +149,16 @@ knobs:
       Experimental sequence-parallel prefill conductor for layers 0..20. Own-row residual state,
       a dedicated fabric and high-priority communication stream; late layers remain on the stock path.
       Needs TP4, one prefill lane and a 128-row late tail. Off leaves the stock path unchanged.
+  GR8_DS_PF_V2_GATE_RO:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      V2 FFN own-row gate only: use the existing read-once register-tile gate
+      for 384 experts. Default 0 retains k_gate_logits_mt; other expert counts
+      retain that kernel. Independent of GR8_DS_GATE_RO. Logs on/off once per
+      request per rank; shared-memory opt-in is set at scratch initialization.
   GR8_DS_PF_V2_RS_BLOCKS:
     scope: local
     kind: ints
