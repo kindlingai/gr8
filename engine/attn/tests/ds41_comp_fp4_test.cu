@@ -9,6 +9,7 @@
 //
 //   build: nvcc -std=c++17 -O3 -gencode=arch=compute_121a,code=sm_121a -DG6_MODEL_DS41=1 -I engine -o ds41_comp_fp4_test engine/attn/tests/ds41_comp_fp4_test.cu engine/knobs-rs/target/release/libgr8knobs.a -lpthread -ldl -lm
 //   run:   ds41_comp_fp4_test [--heads 16] [--time 50] [--long 131072]
+//   v2 pipeline: ds41_comp_fp4_test --pipe-only [--time 3] (bounded allocations, heads=16)
 // Exit code 1 if any comparison differs.
 #include "../ds41_attn.cuh"
 #include "../ds41_idx.cuh"
@@ -107,7 +108,7 @@ __global__ void k_smem_poison(int words)
 static void poison_smem()
 {
     static int sms = 0;
-    const int bytes = (int)ds41a::AT_SMEM_CPA;
+    const int bytes = (int)ds41a::AT_SMEM_PIPE;
     if (!sms)
     {
         CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
@@ -335,7 +336,7 @@ struct Built
     float *sink = nullptr, *split = nullptr;
     size_t out_n = 0;
 };
-static Built build(const Case& c, int heads, const Keys& K)
+static Built build(const Case& c, int heads, const Keys& K, bool split = true)
 {
     Built b;
     ds41a::AttnP& p = b.p;
@@ -346,7 +347,7 @@ static Built build(const Case& c, int heads, const Keys& K)
     b.out_n = (size_t)n * heads * HD;
     b.out_a = dalloc<bf16>(b.out_n);
     b.out_b = dalloc<bf16>(b.out_n);
-    b.split = dalloc<float>((size_t)n * heads * 2 * (HD + 2));
+    if (split) b.split = dalloc<float>((size_t)n * heads * 2 * (HD + 2));
     std::vector<int32_t> tk((size_t)n * 512);
     std::vector<int> pos(n), sess(n);
     const int rps = n / c.ns;
@@ -536,18 +537,159 @@ static void time_attention(int heads, int iters)
     }
 }
 
+
+// Pipeline operand proof: same packed bytes -> original cq_store bf16 tile ->
+// the new packed-stage pipe_store, comparing every expanded bf16 byte.
+__global__ void k_pipe_operands(const uint8_t* keys, unsigned* bad)
+{
+    extern __shared__ __align__(16) uint8_t operand_sm[];
+    bf16* wide = (bf16*)operand_sm;
+    uint8_t* tile = operand_sm + 64 * ds41a::AT_KLD * sizeof(bf16);
+    __shared__ const bf16* rows[64];
+    const int tid = threadIdx.x, w = tid / 32, lane = tid % 32;
+    if (tid < 64) rows[tid] = (const bf16*)(keys + tid * CQ_ROW + 1);
+    for (int i = tid; i < 64 * CQ_ROW; i += 256) tile[i] = keys[i];
+    __syncthreads();
+    uint2 cd[8]; uint32_t sb[8];
+    ds41a::cq_load(rows, w, lane, cd, sb);
+    ds41a::cq_store(wide, ds41a::AT_KLD, rows, w, lane, cd, sb);
+    __syncthreads();
+    uint32_t reference[64];
+#pragma unroll
+    for (int k = 0; k < 64; k++) {
+        const int i = tid + k * 256;
+        reference[k] = *(const uint32_t*)(wide + (i / (HD / 2)) * ds41a::AT_KLD + (i % (HD / 2)) * 2);
+    }
+    __syncthreads();
+    // A missing store must not pass by retaining cq_store's expected bytes.
+    for (int i = tid; i < 64 * ds41a::AT_KLD; i += 256) wide[i] = __ushort_as_bfloat16(0xFFFFu);
+    __syncthreads();
+    ds41a::pipe_store(wide, tile, w, lane);
+    __syncthreads();
+    unsigned n = 0;
+#pragma unroll
+    for (int k = 0; k < 64; k++) {
+        const int i = tid + k * 256;
+        n += reference[k] != *(const uint32_t*)(wide + (i / (HD / 2)) * ds41a::AT_KLD + (i % (HD / 2)) * 2);
+    }
+    if (n) atomicAdd(bad, n);
+}
+static void test_pipe_operands()
+{
+    // Every code pair and every finite scale, including signed zero and negative
+    // scales. 64 rows * 32 groups * 32 batches covers all 256 x 254 pairs.
+    std::vector<uint8_t> bytes(64 * CQ_ROW);
+    auto* pk = dalloc<uint8_t>(bytes.size());
+    auto* bad = dalloc<unsigned>(1);
+    const int smem = 64 * ds41a::AT_KLD * sizeof(bf16) + 64 * CQ_ROW;
+    CK(cudaFuncSetAttribute(k_pipe_operands, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    for (int batch = 0; batch < 32; batch++) {
+        for (int row = 0; row < 64; row++) for (int g = 0; g < 32; g++) {
+            const int pair = row * 32 + g + batch * 2048;
+            int scale = (pair / 256) % 254;
+            if (scale >= 127) scale++;
+            bytes[row * CQ_ROW + CQ_CODES + g] = (uint8_t)scale;
+            for (int b = 0; b < 8; b++) bytes[row * CQ_ROW + g * 8 + b] = uint8_t(pair % 256);
+        }
+        CK(cudaMemcpy(pk, bytes.data(), bytes.size(), cudaMemcpyHostToDevice));
+        k_pipe_operands<<<1, 256, smem>>>(pk, bad);
+    }
+    CK(cudaDeviceSynchronize());
+    const unsigned errors = back(bad, 1)[0];
+    printf("pipe operands: cq_store vs packed-stage pipe_store bf16 bits: %u mismatches\n", errors);
+    if (errors) g_fail = 1;
+    CK(cudaFree(pk)); CK(cudaFree(bad));
+}
+static void pipe_launch(ds41a::AttnP p, bool pipe)
+{
+    const dim3 grid(p.n, p.heads / 16);
+    if (pipe) ds41a::k_attn_cpa_pipe_q<<<grid, ds41a::AT_THREADS, ds41a::AT_SMEM_PIPE>>>(p);
+    else ds41a::k_attn_cpa_t<false, true><<<grid, ds41a::AT_THREADS, ds41a::AT_SMEM_CPA>>>(p);
+    CK(cudaGetLastError());
+}
+static void test_pipe(int heads, int iters)
+{
+    CK(cudaFuncSetAttribute(ds41a::k_attn_cpa_pipe_q, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ds41a::AT_SMEM_PIPE));
+    CK(cudaFuncSetAttribute(ds41a::k_attn_cpa_t<false, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)ds41a::AT_SMEM_CPA));
+    cudaFuncAttributes a{}, b{};
+    CK(cudaFuncGetAttributes(&a, ds41a::k_attn_cpa_t<false, true>));
+    CK(cudaFuncGetAttributes(&b, ds41a::k_attn_cpa_pipe_q));
+    printf("pipe resource: dynamic_smem=%zu baseline_regs=%d pipe_regs=%d baseline_local=%zu pipe_local=%zu\n", ds41a::AT_SMEM_PIPE, a.numRegs, b.numRegs, a.localSizeBytes, b.localSizeBytes);
+    test_pipe_operands();
+    for (int n : {1, 7, 64, 2047, 2048, 8192}) for (int mode = 0; mode < 3; mode++) {
+        Case c{"pipe", 2, n, 1, mode ? 16384 : -1, 0};
+        if (mode == 2) c.wl = 100; // mixed block, then packed-stage reuse
+        Keys K = make_keys(16384, 1);
+        Built x = build(c, heads, K, false); // no unused split scratch: < 450 MiB at 8192x16
+        if (mode == 2) {
+            auto tk = back(x.d_topk, (size_t)n * 512);
+            const int lengths[] = {0, 1, 63, 64, 65, 129, 511, 512};
+            for (int t = 0; t < n; t++) {
+                const int len = lengths[t % 8];
+                for (int j = len; j < 512; j++) tk[(size_t)t * 512 + j] = -1;
+                // Include an empty interior block followed by live blocks.
+                if (t % 8 == 7) for (int j = 64; j < 192; j++) tk[(size_t)t * 512 + j] = -1;
+            }
+            CK(cudaMemcpy(x.d_topk, tk.data(), tk.size() * 4, cudaMemcpyHostToDevice));
+        }
+        set_rows(x.p, K, true, x.out_a); pipe_launch(x.p, false);
+        set_rows(x.p, K, true, x.out_b); poison_smem(); pipe_launch(x.p, true);
+        CK(cudaDeviceSynchronize());
+        const auto ref = back((const uint16_t*)x.out_a, x.out_n), got = back((const uint16_t*)x.out_b, x.out_n);
+        const bool equal = memcmp(ref.data(), got.data(), x.out_n * 2) == 0;
+        printf("pipe memcmp rows=%d mode=%d WL=%d bytes=%zu %s\n", n, mode, x.p.WL, x.out_n * 2, equal ? "BYTE-EQUAL" : "DIFF");
+        if (!equal) { g_fail = 1; for (size_t i = 0; i < x.out_n; i++) if (ref[i] != got[i]) { printf(" first diff %zu: %04x != %04x\n", i, ref[i], got[i]); break; } }
+        // Compare through the actual launch selector too (and guard split/floor exclusions separately in the original suite).
+        ds41a::g_attn_cpa = 1; ds41a::g_attn_split = 0; ds41a::g_attn_pipe = true;
+        ds41a::launch_attn(x.p, 0); ds41a::g_attn_pipe = false;
+        CK(cudaDeviceSynchronize());
+        const auto selected = back((const uint16_t*)x.out_b, x.out_n);
+        const bool selected_equal = memcmp(ref.data(), selected.data(), x.out_n * 2) == 0;
+        printf("pipe selector rows=%d mode=%d %s\n", n, mode, selected_equal ? "BYTE-EQUAL" : "DIFF");
+        if (!selected_equal) g_fail = 1;
+        if (iters > 0 && mode == 1) {
+            float us[2];
+            cudaEvent_t e0, e1; CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+            for (int arm = 0; arm < 2; arm++) {
+                std::vector<float> runs;
+                pipe_launch(x.p, arm);
+                for (int r = 0; r < 3; r++) {
+                    CK(cudaEventRecord(e0));
+                    for (int i = 0; i < iters; i++) pipe_launch(x.p, arm);
+                    CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1));
+                    float ms; CK(cudaEventElapsedTime(&ms, e0, e1)); runs.push_back(ms * 1000 / iters);
+                }
+                std::sort(runs.begin(), runs.end()); us[arm] = runs[1];
+            }
+            printf("pipe time rows=%d baseline_us=%.3f pipe_us=%.3f (median 3 x %d iterations)\n", n, us[0], us[1], iters);
+            CK(cudaEventDestroy(e0)); CK(cudaEventDestroy(e1));
+        }
+        free_built(x); free_keys(K);
+    }
+}
+
 int main(int argc, char** argv)
 {
     int heads = 16, iters = 0, long_keys = 131072;
+    bool pipe_only = false;
     for (int i = 1; i < argc; i++)
     {
         const std::string a = argv[i];
-        if (a == "--heads" && i + 1 < argc) heads = atoi(argv[++i]);
+        if (a == "--pipe-only") pipe_only = true;
+        else if (a == "--heads" && i + 1 < argc) heads = atoi(argv[++i]);
         else if (a == "--time" && i + 1 < argc) iters = atoi(argv[++i]);
         else if (a == "--long" && i + 1 < argc) long_keys = atoi(argv[++i]);
-        else { fprintf(stderr, "usage: %s [--heads 16] [--time ITERS] [--long KEYS]\n", argv[0]); return 2; }
+        else { fprintf(stderr, "usage: %s [--heads 16] [--time ITERS] [--long KEYS] [--pipe-only]\n", argv[0]); return 2; }
     }
     if (heads % 16) { fprintf(stderr, "--heads must be a multiple of 16\n"); return 2; }
+    if (pipe_only) {
+        if (heads != 16) { fprintf(stderr, "--pipe-only uses heads=16 for bounded memory\n"); return 2; }
+        size_t free, total; CK(cudaMemGetInfo(&free, &total));
+        printf("GPU free_bytes=%zu total_bytes=%zu; test allocations below 450 MiB\n", free, total);
+        if (free < (size_t)1536 * 1024 * 1024) { fprintf(stderr, "SKIP: insufficient free memory\n"); return 77; }
+        test_pipe(heads, iters);
+        printf("%s\n", g_fail ? "FAIL" : "PASS"); return g_fail;
+    }
     test_dequant();
     test_writers();
     test_attention(heads, long_keys);

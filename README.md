@@ -228,6 +228,7 @@ another model.
 KindlingAI is:
 
 - [@adapt-ai-systems](https://github.com/adapt-ai-systems)
+  - Opt-in packed-key attention pipeline for sequence-parallel DeepSeek prefill, with exactness tests.
   - Opt-in sequence-parallel DeepSeek prefill: owned-row attention, expert groups, collectives and timing tests.
   - Prefill optimization, TP=6 S2 serving and context-budget improvements
     ([#7](https://github.com/kindlingai/gr8/pull/7), [#9](https://github.com/kindlingai/gr8/pull/9),

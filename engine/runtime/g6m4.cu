@@ -1809,8 +1809,11 @@ int main(int argc, char** argv)
                 ds41::Stop stop;
                 if (pf_v2) {
                     v2engine.v.widths.select(c.request,c.slot,R);
+                    v2engine.v.attn_pipe.select(c.request,c.slot);
+                    if (v2engine.v.attn_pipe.on) ds41_attn_set_pipe(1);
                     ds41::v2::timing_begin_chunk(v2engine.v,c.request,c.first,c.rows);
                     v2engine.run(m,(int)c.rows,split.i_late,skip_late);
+                    if (v2engine.v.attn_pipe.on) ds41_attn_set_pipe(0);
                     ds41::v2::timing_end_chunk(v2engine.v);
                 } else stop = ds41_run_pass(split.ops, 0, range_a_end, &m, (int)c.rows, st, span_pass);
                 if (!stop.stopped && split.on() && !skip_late) {   // range B: the layers >= 21 over the chunk's last `late` rows (now rows 0 .. late-1)

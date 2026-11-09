@@ -1,6 +1,16 @@
 # DeepSeek-V4.1-Flash (MODEL=ds41) step driver, prefill and serving. Read only by a DS41 build.
 prefix: "GR8_DS"
 knobs:
+  GR8_DS_PF_V2_ATTN_PIPE:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      V2 prefill only: pipeline two packed K stages in the cp.async CQ attention core, preserving bf16 operands and arithmetic order.
+      Needs GR8_DS_PF_V2=1, GR8_DS_ATTN_CPA=1 and packed compressed rows (GR8_DS_COMP_FP4=1) to select the new kernel.
+      Window-only, bounded replay, decode and eligible split launches stay unchanged. Mixed window/CQ blocks stay serial.
+      Logs request/on once per v2 request per rank, including on=0. Default 0 keeps the original kernels.
   GR8_DS_BLOCK:
     scope: agree
     kind: text
