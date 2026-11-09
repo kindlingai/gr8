@@ -12,33 +12,49 @@ the DeepSeek dialect (DSML tool calls, numeric reasoning effort). It serves text
 
 Fast mode, the default of the Docker recipe
 [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark) (`TUNE=speed`):
-its image `{{IMAGE_TAG}}`, gr8 `main` at [`0015fd0`](https://github.com/kindlingai/gr8/commit/0015fd04512ebc38e369475a1ce7dee76d445d77),
-Engram on, 32 chat slots, `CAP` 327,680, the fast-mode settings of [Settings](#settings), and an engine built with
-`DS41_MX=48`. Four GB10 boxes {{TOPOLOGY: on one 200G switch | in a ring}}, on {{DATE}}. Fast mode's output is not
-bit-identical to the exact model's: the same prompt can get a different reply.
+gr8 `main` at [`0015fd0`](https://github.com/kindlingai/gr8/commit/0015fd04512ebc38e369475a1ce7dee76d445d77), engine
+built with `DS41_MX=48`, Engram on, 32 chat slots, `CAP` 327,680, the recipe's release settings (its `knobs.sh`). Two
+sets of four GB10 boxes, each set cabled in a ring, on 2026-11-08: set A for prefill and one-stream decode, set B for
+many streams. Fast mode's output is not bit-identical to the exact model's: the same prompt can get a different reply.
 
-| | tok/s |
-|---|---|
-| prefill: 32K / 128K prompt | {{PF_32K}} / {{PF_128K}} |
-| decode, one stream: {{SHORT_PROMPT}}-token / {{LONG_PROMPT}}-token prompt | {{DEC1_SHORT}} / {{DEC1_LONG}} |
-| total decode: 4 / 8 / 16 / 32 streams ({{CONC_PROMPT}}-token prompts) | {{AGG_4}} / {{AGG_8}} / {{AGG_16}} / {{AGG_32}} |
+Prefill, cold prompt (set A):
 
-| | |
-|---|---|
-| first token after a 32K / 128K prompt | {{TTFT_32K}} s / {{TTFT_128K}} s |
-| longest chat (prompt and reply) | {{MAX_CTX}} tokens |
-| ready after `up -d` (gen cache written) | {{BOOT_S}} s |
+| prompt | runs | first token | prefill tok/s | decode tok/s after it, same request |
+|---|---|---|---|---|
+| 32K tokens | 16 | 4.12 s | 7,950 | 103.5 |
+| 128K tokens | 8 | 16.6 s | 7,887 | 98.2 |
+| 256K tokens | 2 | 34.7 s | 7,548 | 101.0 |
 
-{{RAW_RUNS: where the raw runs are, one sentence}}
+One-stream decode on short prompts (64-72 tokens, up to 512 tokens out; set A, two series of 6 runs each):
+
+| work | code | prose | structured | counting |
+|---|---|---|---|---|
+| tok/s | 143.5-145.0 | 83.4-86.0 | 160.4-160.9 | 162.1-162.4 |
+
+Many streams at once (set B, short mixed prompts, up to 512 tokens out per stream):
+
+| streams | 8 | 16 | 32 |
+|---|---|---|---|
+| total decode tok/s | 200.3 | 221.3 | 226.4 |
+| first token, median | 2.5-2.7 s | 6.2-6.4 s | 14.2-14.6 s |
+
+At 32 streams the requests wait for prefill slots, so the first token comes later as the queue grows. The longest
+prompt we measured in fast mode is 262,219 tokens; `CAP` allows 327,680. `TUNE=context` (16 chat slots, `CAP`
+1,048,576, not the release settings) prefilled a 1,000,660-token prompt at 2,689 tok/s (two runs, first token in
+372 s).
 
 ### How we measure
 
-- The recipe's image, started as its README shows, with no other settings unless the row says so.
+- gr8's own benchmark (`bench/bench.py`) against the running server, with the recipe's settings. These runs used an
+  image with the engine built from `0015fd0`, not yet the recipe's published image; a run on the published image
+  follows.
 - No tracing or per-stage timing on the measured requests.
 - A number that compares two settings comes from paired runs: both settings on the same boxes, each on a fresh boot,
   in both orders.
 - Every speed is tok/s. Every decode number gives its prompt length.
-- Each number is {{STAT: the mean | the range}} of {{N}} runs on {{BOOTS}} boots.
+- A single number is the mean of the runs in its row; a range is the lowest and highest series. Many-stream totals:
+  two series of two batches per level, the total of each series' tokens over its decode time, then the mean of the
+  two series. One boot per set of boxes.
 
 ### Exact output
 
@@ -56,13 +72,13 @@ boot of serving code equivalent to `main` at 40a91f5, with the launcher's defaul
 runs. The first word after a 128K prompt came in 34.3-35.1 s. Both runs passed smoke (11/11) and gave the same
 temperature-0 replies. The longest request on that boot was 163,830 tokens; `main` now allows 262,134 (#325).
 
-{{COMPARE: either "The two tables come from different builds and boots, so they do not show how much of the
-difference fast mode alone makes." or the paired fast-vs-exact numbers}}
+The two tables come from different builds and boots, so they do not show how much of the difference fast mode alone
+makes.
 
 ### Quality and the boxes
 
 - Quality, on the 75-item check of [FIRST-BOOT.md](FIRST-BOOT.md#3-deepseek-v41-flash-ds41-speed-against-exactness)
-  (code, math, JSON, reasoning): fast mode got {{QEVAL}} of 75 ({{QEVAL_RUNS}}, {{DATE}}). Exact
+  (code, math, JSON, reasoning): fast mode got 73 of 75 on each of two boots (2026-11-08; both missed the same two items, one of them cut off at the length limit). Exact
   output got 73 of 75 in each of three runs, on serving code equivalent to `main` at b10aae4 (2026-11-03).
 - Our boxes run with their CPUs kept out of deep idle (PM QoS `cpu_dma_latency` 0) and with memory compacted before
   each boot. Both are box settings outside gr8.
