@@ -192,6 +192,20 @@ knobs:
       Retains the existing aligned 16-byte copies and scalar ragged/unaligned
       fallback, without changing kernels. Mixed zero/nonzero lists are invalid.
       Boot gathers retain eight blocks. Independent of GR8_DS_PF_V2_RS_BLOCKS.
+  GR8_DS_PF_V2_STRIPE_MIN:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0.."
+    doc: >-
+      Dedicated v2 fabric only: positive N sets the dual-rail payload striping
+      threshold in bytes. The existing proxy keeps its 8192-byte floor, so the
+      effective threshold is max(N, 8192); the first half is rounded down to
+      4096 bytes. Needs two mesh rails (--ips2) to stripe; one rail or a TP4
+      ring keeps the existing transport. Logs min, rails and effective_min once
+      per boot per rank. 0 leaves the inherited fabric configuration unchanged
+      (normally no striping; an existing GR8_DS_STRIPE setting is preserved).
+      No effect when GR8_DS_PF_V2=0. Wire bytes and tail ordering are unchanged.
   GR8_DS_PF_V2_XTRACE:
     scope: local
     kind: flag
