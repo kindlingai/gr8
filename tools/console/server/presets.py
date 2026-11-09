@@ -1,8 +1,12 @@
 """Three boot presets. Numbers are copied from the named docs, not measured here.
 
-Every preset removes explicit SESS, CAP, and MAX_MODEL_LEN. Recipe knobs.sh
+Every preset removes explicit SESS and MAX_MODEL_LEN. Recipe knobs.sh
 applies those, and VARIANT, only when unset (${KEY:-default}); a leftover
-would keep the old slot count or pool, so the card text would be false.
+would keep the old slot count or length, so the card text would be false.
+No preset touches CAP. CAP is the box's own limit on the KV pool, set to fit
+that ring; a preset that removed it let the pool grow past what the ring
+holds, and the engine failed to boot. CAP is not a preset key, so a stock
+CAP, or any other CAP value, never makes a box read as custom.
 DeepSeek and GLM-5.3-Flash also write TUNE and remove VARIANT. Unset TUNE
 on those models is Speed, the recipe default. DeepSeek also removes EXACT
 and the fast words knobs.sh writes ahead of the user's EXTRA_ENV, because
@@ -10,7 +14,7 @@ that file appends EXTRA_ENV last and a leftover wins. GR8_DS_ENGRAM* stays.
 GLM-5.3-Flash removes GR8_CP from EXTRA_ENV for the same reason. GLM-5.3
 has no TUNE. Speed clears VARIANT and KV_FORMAT. Quality sets
 VARIANT=bit325 and clears KV_FORMAT. Context sets KV_FORMAT=int4 and
-clears VARIANT. Any explicit SESS, CAP, MAX_MODEL_LEN, or one of those
+clears VARIANT. Any explicit SESS, MAX_MODEL_LEN, or one of those
 recipe leftovers reads as custom. A preset that changes VARIANT (unset means
 home) is checked against each box's verified weight marker before restart.
 An unresolved or unreadable cache, or a failed check, is unknown, not a missing download.
@@ -38,11 +42,11 @@ FLASH_EXTRA = ("GR8_CP",)
 
 def _tune(value):
     # None removes an explicit override so the recipe default can apply.
-    return {"TUNE": value, "VARIANT": None, "KV_FORMAT": None, "SESS": None, "CAP": None, "MAX_MODEL_LEN": None}
+    return {"TUNE": value, "VARIANT": None, "KV_FORMAT": None, "SESS": None, "MAX_MODEL_LEN": None}
 
 
 def _glm(variant, kv_format):
-    return {"TUNE": None, "VARIANT": variant, "KV_FORMAT": kv_format, "SESS": None, "CAP": None, "MAX_MODEL_LEN": None}
+    return {"TUNE": None, "VARIANT": variant, "KV_FORMAT": kv_format, "SESS": None, "MAX_MODEL_LEN": None}
 
 
 def _ds(value):
@@ -63,7 +67,7 @@ def _row(preset_id, label, setting, summary, caption, assign):
     return dict(id=preset_id, label=label, setting=setting, summary=summary, caption=caption, assign=assign)
 
 
-# DS41: recipes' knobs.sh / README "Pick what to prioritize" (SESS/CAP and the 327,670,
+# DS41: recipes' knobs.sh / README "Pick what to prioritize" (SESS and the 327,670,
 # 262,134, and 1,048,566 token request limits). GLM-5.3: docs/GLM-5.3.md TP=4 table,
 # the bit325 variant row, and the --kv-format int4 option. Flash: that recipe's
 # knobs.sh and the same README section (bit349 / k4, pools, request limits).
@@ -81,14 +85,14 @@ CATALOG = {
     ],
     "glm53": [
         _row("speed", "Speed", "launcher defaults (VARIANT home)",
-             "Experts home, 3.25 bpw: the 64 experts per layer with the highest K3 error at K4, the rest K3. DFlash2 or MTP drafts, 8 at once, pool 485,376.",
-             "8 slots · pool 485,376", _glm(None, None)),
+             "Experts home, 3.25 bpw: the 64 experts per layer with the highest K3 error at K4, the rest K3. DFlash2 or MTP drafts, 8 at once.",
+             "8 slots · launcher defaults", _glm(None, None)),
         _row("quality", "Quality", "VARIANT=bit325",
              "Experts bit325, same 3.25 bpw size, bits placed differently: down projections at K4 in the layers where bits lower KL most, the rest K3. KL 1.5-7% lower than home, decode about 2.5% slower.",
              "8 slots · same size as home", _glm("bit325", None)),
         _row("context", "Context", "KV_FORMAT=int4",
-             "Experimental 4-bit KV: about 1.26x the context, decode about 3% slower.",
-             "8 slots · pool 513,536 (int4 not re-measured)", _glm(None, "int4")),
+             "Experimental 4-bit KV: about 1.26x the pool when no CAP limits it, decode about 3% slower.",
+             "8 slots · int4 KV (not re-measured)", _glm(None, "int4")),
     ],
     "glm53f": [
         _row("speed", "Speed", "TUNE=speed",

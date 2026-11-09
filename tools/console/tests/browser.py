@@ -72,26 +72,22 @@ def run(output):
             assert fixture.calls == []
             print("PASS preset cancel/Escape: leftover SESS is listed and nothing is written")
 
-            saved = {box: fixture.texts["glm53"][box] for box in fixture.texts["glm53"]}
-            for box in fixture.texts["glm53"]:
-                fixture.texts["glm53"][box] += "CAP=1000\n"
-
             def presets_body(response):
                 return "/api/presets/glm53" in response.url and response.status == 200
 
-            with page.expect_response(lambda response: presets_body(response) and "CAP=1000" in response.text(), timeout=10000):
-                pass
+            saved = {box: fixture.texts["glm53"][box] for box in fixture.texts["glm53"]}
+            for box in fixture.texts["glm53"]:
+                fixture.texts["glm53"][box] = saved[box].replace("SESS=4\n", "") + "CAP=1000\n"
+            expect(page.locator(".pill.preset")).to_have_text("Speed", timeout=10000)
             page.get_by_role("button", name="Quality").click()
-            expect(page.get_by_role("dialog")).to_contain_text("CAP=1000")
-            expect(page.get_by_role("dialog")).to_contain_text("CAP removed")
+            expect(page.get_by_role("dialog")).to_contain_text("VARIANT=bit325")
+            expect(page.get_by_role("dialog")).not_to_contain_text("CAP")
             page.get_by_role("button", name="Cancel", exact=True).click()
             for box, text in saved.items():
                 fixture.texts["glm53"][box] = text
-            with page.expect_response(lambda response: presets_body(response) and "CAP=1000" not in response.text(), timeout=10000):
-                pass
-            expect(page.locator(".pill.preset")).to_have_text("custom")
+            expect(page.locator(".pill.preset")).to_have_text("custom", timeout=10000)
             assert fixture.calls == []
-            print("PASS explicit CAP is custom and the confirm dialog shows its removal")
+            print("PASS explicit CAP still reads as its preset and the confirm dialog never lists CAP")
 
             page.get_by_role("button", name="Quality").click()
             expect(page.get_by_role("dialog")).to_contain_text("SESS=4")

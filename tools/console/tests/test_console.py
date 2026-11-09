@@ -85,16 +85,21 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(presets.classify("ds41", {"TUNE": "speed", "VARIANT": "home"}), "custom")
         self.assertEqual(presets.classify("glm53f", {"TUNE": "quality"}), "quality")
         self.assertEqual(presets.classify("ds41", {"SESS": "4"}), "custom")
-        self.assertEqual(presets.classify("glm53f", {"CAP": "9"}), "custom")
+        self.assertEqual(presets.classify("glm53f", {"CAP": "9"}), "speed")
         self.assertEqual(presets.classify("glm53", {"SESS": "4"}), "custom")
         self.assertEqual(presets.classify("glm53", {"MAX_MODEL_LEN": "100"}), "custom")
         overrides = {"TUNE": "speed", "SESS": "8", "CAP": "1", "MAX_MODEL_LEN": "9", "VARIANT": "home"}
         self.assertEqual(presets.classify("ds41", overrides), "custom")
         self.assertEqual(presets.classify("glm53f", overrides), "custom")
         self.assertIn("SESS=8", presets.describe("ds41", overrides, False, "custom"))
-        self.assertEqual(presets.classify("glm53", {"KV_FORMAT": "int4", "CAP": "100"}), "custom")
+        self.assertEqual(presets.classify("glm53", {"KV_FORMAT": "int4", "CAP": "100"}), "context")
+        self.assertEqual(presets.classify("glm53", {"CAP": "409600"}), "speed")
+        self.assertEqual(presets.classify("glm53", {"VARIANT": "bit325", "CAP": "409600"}), "quality")
+        self.assertEqual(presets.classify("ds41", {"TUNE": "context", "CAP": "409600"}), "context")
+        self.assertEqual(presets.classify("ds41", {"TUNE": "context", "CAP": "409600", "SESS": "4"}), "custom")
+        self.assertNotIn("CAP", presets.describe("glm53", {"KV_FORMAT": "int4", "CAP": "100", "SESS": "4"}, False, "custom"))
         self.assertEqual(presets.classify("glm53", {"VARIANT": "bit325", "KV_FORMAT": "int4", "CAP": "999", "TUNE": "speed"}), "custom")
-        blank = {"TUNE": None, "VARIANT": None, "KV_FORMAT": None, "SESS": None, "CAP": None, "MAX_MODEL_LEN": None}
+        blank = {"TUNE": None, "VARIANT": None, "KV_FORMAT": None, "SESS": None, "MAX_MODEL_LEN": None}
         self.assertEqual(presets.changes_for("glm53", "speed"), blank)
         self.assertEqual(presets.changes_for("glm53", "quality"), {**blank, "VARIANT": "bit325"})
         self.assertEqual(presets.changes_for("glm53", "context"), {**blank, "KV_FORMAT": "int4"})
@@ -106,7 +111,10 @@ class EnvironmentTests(unittest.TestCase):
         self.assertIn("DFlash2 or MTP drafts", speed["summary"])
         self.assertNotIn("DFlash2 + MTP", speed["summary"])
         context = next(item for item in presets.CATALOG["glm53"] if item["id"] == "context")
-        self.assertEqual(context["caption"], "8 slots · pool 513,536 (int4 not re-measured)")
+        self.assertEqual(context["caption"], "8 slots · int4 KV (not re-measured)")
+        for item in presets.CATALOG["glm53"]:
+            self.assertNotIn("485,376", item["summary"] + item["caption"])
+            self.assertNotIn("513,536", item["summary"] + item["caption"])
         self.assertEqual(presets.classify("ds41", {"GR8_DS_MOE_TOPK_DECODE": "4"}), "custom")
         self.assertEqual(presets.classify("ds41", {"EXACT": "1"}), "custom")
         self.assertEqual(presets.classify("ds41", {"GR8_DS_ENGRAM": "1"}), "speed")
@@ -123,9 +131,13 @@ class EnvironmentTests(unittest.TestCase):
         for model in presets.CATALOG:
             for name in ("speed", "quality", "context"):
                 assign = presets.changes_for(model, name)
-                for key in ("SESS", "CAP", "MAX_MODEL_LEN"):
+                for key in ("SESS", "MAX_MODEL_LEN"):
                     self.assertIsNone(assign[key])
-        cleared = ("SESS", "CAP", "MAX_MODEL_LEN", "VARIANT", "KV_FORMAT")
+                self.assertNotIn("CAP", assign)
+                self.assertNotIn("CAP", presets.keys_for(model))
+                for values in ({"CAP": "409600"}, {"CAP": "1", "SESS": "3"}):
+                    self.assertNotIn("CAP", [row["key"] for row in presets.diff_for(model, values, ("CAP",), name)])
+        cleared = ("SESS", "MAX_MODEL_LEN", "VARIANT", "KV_FORMAT")
         for model in ("ds41", "glm53f"):
             for name in ("speed", "quality", "context"):
                 assign = presets.changes_for(model, name)
@@ -299,7 +311,7 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(self.console.read_presets(model)["current"], "custom")
 
     def test_recipe_preset_removes_explicit_overrides(self):
-        extra = "TUNE=speed\nSESS=8\nCAP=100\nMAX_MODEL_LEN=9\nVARIANT=home\n"
+        extra = "TUNE=speed\nSESS=8\nCAP=409600\nMAX_MODEL_LEN=9\nVARIANT=home\n"
         for model in ("ds41", "glm53f"):
             for box in self.fake.texts[model]:
                 text = self.fake.texts[model][box].replace("SESS=4\n", extra)
@@ -310,12 +322,16 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("SESS=8", row["current_setting"])
         removal = next(item for item in next(p for p in row["presets"] if p["id"] == "quality")["diff"] if item["key"] == "SESS")
         self.assertEqual(removal, {"key": "SESS", "before": "8", "after": None})
+        for item in row["presets"]:
+            self.assertNotIn("CAP", [change["key"] for change in item["diff"]])
+        self.assertNotIn("CAP", row["current_setting"])
         self.console.submit(dict(action="restart", model="ds41", confirm=True, expect_active="glm53", preset="quality", revision=row["revision"]))
         self.assertEqual(self.done()["status"], "succeeded")
         for text in self.fake.texts["ds41"].values():
             self.assertIn("TUNE=quality", text)
             self.assertIn("KEEP_ME=1", text)
-            for key in ("SESS", "CAP", "MAX_MODEL_LEN", "VARIANT"):
+            self.assertIn("CAP=409600", text)
+            for key in ("SESS", "MAX_MODEL_LEN", "VARIANT"):
                 self.assertNotIn(key + "=", text)
         self.assertEqual(self.console.read_presets("ds41")["current"], "quality")
         flash = self.console.read_presets("glm53f")
@@ -325,7 +341,8 @@ class ServiceTests(unittest.TestCase):
         for text in self.fake.texts["glm53f"].values():
             self.assertIn("TUNE=speed", text)
             self.assertIn("KEEP_ME=1", text)
-            for key in ("SESS", "CAP", "MAX_MODEL_LEN", "VARIANT"):
+            self.assertIn("CAP=409600", text)
+            for key in ("SESS", "MAX_MODEL_LEN", "VARIANT"):
                 self.assertNotIn(key + "=", text)
         self.assertEqual(self.console.read_presets("glm53f")["current"], "speed")
 
@@ -373,16 +390,16 @@ class ServiceTests(unittest.TestCase):
             self.assertNotIn("GR8_CP", text)
         self.assertEqual(self.console.read_presets("glm53f")["current"], "speed")
 
-    def test_glm_presets_clear_the_other_format_and_cap(self):
+    def test_glm_presets_clear_the_other_format_and_keep_cap(self):
         for box in self.fake.texts["glm53"]:
             self.fake.texts["glm53"][box] += "TUNE=speed\nVARIANT=bit325\nKV_FORMAT=int4\nCAP=999\nMAX_MODEL_LEN=777\n"
         row = self.console.read_presets("glm53")
         self.assertEqual(row["current"], "custom")
-        self.assertIn("CAP=999", row["current_setting"])
+        self.assertNotIn("CAP", row["current_setting"])
         for preset, present, absent in (
-            ("speed", (), ("TUNE=", "VARIANT=", "KV_FORMAT=", "CAP=", "SESS=", "MAX_MODEL_LEN=")),
-            ("quality", ("VARIANT=bit325",), ("KV_FORMAT=", "CAP=", "TUNE=", "SESS=", "MAX_MODEL_LEN=")),
-            ("context", ("KV_FORMAT=int4",), ("VARIANT=", "CAP=", "TUNE=", "SESS=", "MAX_MODEL_LEN=")),
+            ("speed", ("CAP=999",), ("TUNE=", "VARIANT=", "KV_FORMAT=", "SESS=", "MAX_MODEL_LEN=")),
+            ("quality", ("VARIANT=bit325", "CAP=999"), ("KV_FORMAT=", "TUNE=", "SESS=", "MAX_MODEL_LEN=")),
+            ("context", ("KV_FORMAT=int4", "CAP=999"), ("VARIANT=", "TUNE=", "SESS=", "MAX_MODEL_LEN=")),
         ):
             row = self.console.read_presets("glm53")
             self.console.submit(self.request(preset=preset, revision=row["revision"]))
