@@ -100,13 +100,26 @@ recipe words named below.
 The current preset is read from the keys that preset writes. An explicit
 `SESS` or `MAX_MODEL_LEN` on any of the three models shows
 **custom**, and so does any other combination, including mixed boxes.
-No preset reads, writes, or removes `CAP`. `CAP` is the box's own limit on
-the KV pool, set to fit that ring. A box with `CAP` set reads as its preset
-when the other keys match, and the confirm dialog never lists `CAP`. A
-preset that removed `CAP` let the pool grow past what the ring holds, and the
-engine failed to boot. With an explicit `CAP`, the pool stays at `CAP`, so a
-preset that would grow the pool (GLM-5.3 Context, `int4` KV) does not grow it
-until `CAP` is raised by hand.
+No preset removes `CAP`. `CAP` is the box's own limit on the KV pool, set to
+fit that ring. A box with `CAP` set reads as its preset when the other keys
+match. A preset that removed `CAP` let the pool grow past what the ring holds,
+and the engine failed to boot.
+On GLM-5.3 only, a preset that moves a box between the fp8 KV rows (Speed,
+Quality) and the int4 KV row (Context) rescales an explicit `CAP` so the pool
+keeps the same KV memory. The ratio is the `CAP` pair that
+[docs/GLM-5.3.md](../../docs/GLM-5.3.md) quotes for TP=4 (fp8 408,832, int4
+513,536, about 1.26x); the table in [docs/KV4.md](../../docs/KV4.md) gives a
+larger ratio, so this one asks for less memory. The change moves in steps of 64 tokens times `TP`
+(`TP` in the box's dotenv, else the number of boxes), counted from that box's
+own `CAP`, and rounds down. A box with `CAP` 409,600 at TP4 gets 514,304 on
+Context. Speed or Quality takes it back to 409,600: the console picks the
+largest whole-step fp8 `CAP` whose int4 image does not pass the current one.
+The card, the confirm dialog (`CAP=409600`, then `CAP=514304`), and the step
+list show the new value. Boxes with different `CAP` values each scale from
+their own, and the dialog says so. Unset `CAP` stays unset. DeepSeek and
+GLM-5.3-Flash presets do not set `KV_FORMAT` (the recipe picks it), so their
+`CAP` stays as the dotenv has it, and an explicit `CAP` there overrides the
+`TUNE` default.
 On DeepSeek, `EXACT` or one of the fast words above also shows **custom**.
 On GLM-5.3-Flash, `GR8_CP` in `EXTRA_ENV` shows **custom**. The confirm
 dialog lists each removal (`KEY=old`, then `KEY removed`). A preset that
@@ -135,9 +148,11 @@ once, stops the `gr8 switch` command, and fails the operation. The job error
 and the progress steps carry the supervisor's reason. It does not wait for a
 later retry: the supervisor stops the whole cluster on the first exit, and
 the boxes may keep restarting the engine, so inspect them before you try
-again. A failure line counts only when the boot's `engine started (epoch E)`
-line is not older than this operation (30 seconds of clock difference
-allowed), so lines left by an earlier boot never stop a new one.
+again. A failure line counts only for a boot whose `engine started (epoch E)` line
+is newer than the last one in the log before the operation stopped anything,
+so lines left by an earlier boot never stop a new one. If no supervisor
+answered before the stop, a boot counts when it began in the second the
+operation began or later.
 
 Every preset removes the keys it lists. On GLM-5.3 the three presets are exclusive: Quality
 removes `KV_FORMAT`, Context removes `VARIANT`, and Speed removes both.
@@ -146,7 +161,7 @@ On GLM-5.3, the watched keys unset is Speed, because that is the launcher
 default. The console does not guess other defaults and does not write
 engine cache paths. Other `EXTRA_ENV` words, including `GR8_DS_ENGRAM*`,
 stay as they are. Recipe `knobs.sh` applies `SESS`,
-`MAX_MODEL_LEN`, and `VARIANT` (and `CAP`, which a preset leaves alone) only when they are unset, and it appends
+`MAX_MODEL_LEN`, and `VARIANT` (and `CAP`, which a preset never removes) only when they are unset, and it appends
 the user's `EXTRA_ENV` after its own words.
 No performance claim is made here.
 

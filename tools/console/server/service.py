@@ -47,6 +47,7 @@ STARTED = re.compile(r"engine started \(epoch (\d+)\)")
 # shim exits; a worker rank's exit reaches the head as "rank N (peer) failed: ...".
 FAILED = re.compile(r"^\d\d:\d\d:\d\d (rank \d+ \([^)]*\) failed: .+|(?:engine|front end|shim) exited \(.+)$")
 WATCH_WINDOW = 262144  # bytes read from the end of the head supervisor log
+CAP_KEYS = ("KV_FORMAT", "CAP", "TP")  # read for the GLM-5.3 CAP rescale; CAP is not a preset key
 
 
 def latest_epoch(text):
@@ -252,7 +253,12 @@ class Console:
             if len(variants) > 1:
                 mixed_keys.append(key)
         current = presets.classify(model, values) if rows and not mixed_keys else ("custom" if rows else None)
-        shown = presets.public(model, values, mixed_keys)
+        caps = {}
+        if records:
+            cap_rows = [envfile.read_values(r["text"], CAP_KEYS, frozenset()) for r in records.values()]
+            for item in presets.CATALOG[model]:
+                caps[item["id"]] = presets.cap_diff(model, item["id"], cap_rows)
+        shown = presets.public(model, values, mixed_keys, caps)
         if records and self.control:
             seen = {}
             for item in shown:
@@ -307,7 +313,7 @@ class Console:
                                 started=time.time(), steps=[], error=None, can_restore=bool(backup_id), backup_id=backup_id)
                 self._save_job()
                 self.pool.submit(self._operate, action, model, changes, request.get("revision"), backup_id,
-                                 request.get("accept_download") is True)
+                                 request.get("accept_download") is True, preset)
                 return copy.deepcopy(self.job)
 
     def _restore(self, model, backup_id):
@@ -380,7 +386,7 @@ class Console:
                 seen.add(line)
                 self._emit("downloading " + line[-500:])
 
-    def _operate(self, action, model, changes, reviewed, backup_id=None, accept_download=False):
+    def _operate(self, action, model, changes, reviewed, backup_id=None, accept_download=False, preset=None):
         try:
             if action == "restore":
                 self._restore(model, backup_id)
@@ -410,11 +416,18 @@ class Console:
                         download = {"text": text, "health": health}
                     elif text:
                         notice = text
-                updated = {b: envfile.patch(r["text"], changes, presets.engine_keys(model)) for b, r in records.items()}
+                # GLM-5.3 only: moving between the fp8 and int4 KV rows rescales an explicit CAP, per box.
+                cap_envs = {b: envfile.read_values(r["text"], CAP_KEYS, frozenset()) for b, r in records.items()}
+                new_caps = {b: presets.cap_for(model, preset, env, len(records)) for b, env in cap_envs.items()} if preset else {}
+                updated = {b: envfile.patch(r["text"], {**changes, "CAP": new_caps[b]} if new_caps.get(b) else changes, presets.engine_keys(model))
+                           for b, r in records.items()}
                 backup = self.state / (self.job["id"] + ".backup.json")
                 backup.write_text(json.dumps({"model": model, "records": records, "written": {b: envfile.digest(t) for b, t in updated.items()}}, indent=2))
                 os.chmod(backup, 0o600)
                 self._emit("Saved exact dotenv backups; writing reviewed overrides on every target box")
+                if any(new_caps.values()):
+                    self._emit("CAP: " + "; ".join(f"{cap_envs[b]['CAP']} to {cap}" for b, cap in new_caps.items() if cap)
+                               + " tokens, the same KV memory")
                 written = []
                 try:
                     for box, old in records.items():

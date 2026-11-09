@@ -90,6 +90,24 @@ def run(output):
             assert fixture.calls == []
             print("PASS explicit CAP still reads as its preset and the confirm dialog never lists CAP")
 
+            for box in fixture.texts["glm53"]:
+                fixture.texts["glm53"][box] = saved[box].replace("SESS=4\n", "") + "CAP=409600\n"
+            expect(page.locator(".pill.preset")).to_have_text("Speed", timeout=10000)
+            expect(page.locator(".pb", has_text="Context")).to_contain_text("CAP 514,304", timeout=10000)
+            page.get_by_role("button", name="Context").click()
+            expect(page.get_by_role("dialog")).to_contain_text("CAP=409600")
+            expect(page.get_by_role("dialog")).to_contain_text("CAP=514304")
+            page.screenshot(path=str(output / "context-cap-390.png"))
+            page.get_by_role("button", name="Cancel", exact=True).click()
+            page.get_by_role("button", name="Quality").click()
+            expect(page.get_by_role("dialog")).not_to_contain_text("CAP")
+            page.get_by_role("button", name="Cancel", exact=True).click()
+            for box, text in saved.items():
+                fixture.texts["glm53"][box] = text
+            expect(page.locator(".pill.preset")).to_have_text("custom", timeout=10000)
+            assert fixture.calls == []
+            print("PASS Context dialog shows CAP 409600 -> 514304 and the card caption says so; Quality shows no CAP change")
+
             page.get_by_role("button", name="Quality").click()
             expect(page.get_by_role("dialog")).to_contain_text("SESS=4")
             expect(page.get_by_role("dialog")).to_contain_text("SESS removed")

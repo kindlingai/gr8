@@ -481,16 +481,18 @@ class ServiceTests(unittest.TestCase):
             self.assertNotIn("GR8_CP", text)
         self.assertEqual(self.console.read_presets("glm53f")["current"], "speed")
 
-    def test_glm_presets_clear_the_other_format_and_keep_cap(self):
+    def test_glm_presets_clear_the_other_format_and_scale_cap_with_it(self):
         for box in self.fake.texts["glm53"]:
-            self.fake.texts["glm53"][box] += "TUNE=speed\nVARIANT=bit325\nKV_FORMAT=int4\nCAP=999\nMAX_MODEL_LEN=777\n"
+            self.fake.texts["glm53"][box] += "TUNE=speed\nVARIANT=bit325\nKV_FORMAT=int4\nCAP=514304\nMAX_MODEL_LEN=777\n"
         row = self.console.read_presets("glm53")
         self.assertEqual(row["current"], "custom")
         self.assertNotIn("CAP", row["current_setting"])
+        # int4 -> fp8 (Speed), fp8 -> fp8 (Quality), fp8 -> int4 (Context), int4 -> fp8 (Quality)
         for preset, present, absent in (
-            ("speed", ("CAP=999",), ("TUNE=", "VARIANT=", "KV_FORMAT=", "SESS=", "MAX_MODEL_LEN=")),
-            ("quality", ("VARIANT=bit325", "CAP=999"), ("KV_FORMAT=", "TUNE=", "SESS=", "MAX_MODEL_LEN=")),
-            ("context", ("KV_FORMAT=int4", "CAP=999"), ("VARIANT=", "TUNE=", "SESS=", "MAX_MODEL_LEN=")),
+            ("speed", ("CAP=409600",), ("TUNE=", "VARIANT=", "KV_FORMAT=", "SESS=", "MAX_MODEL_LEN=")),
+            ("quality", ("VARIANT=bit325", "CAP=409600"), ("KV_FORMAT=", "TUNE=", "SESS=", "MAX_MODEL_LEN=")),
+            ("context", ("KV_FORMAT=int4", "CAP=514304"), ("VARIANT=", "TUNE=", "SESS=", "MAX_MODEL_LEN=")),
+            ("quality", ("VARIANT=bit325", "CAP=409600"), ("KV_FORMAT=", "TUNE=", "SESS=", "MAX_MODEL_LEN=")),
         ):
             row = self.console.read_presets("glm53")
             self.console.submit(self.request(preset=preset, revision=row["revision"]))
@@ -502,6 +504,136 @@ class ServiceTests(unittest.TestCase):
                     self.assertNotIn(needle, text)
                 self.assertIn("KEEP_ME=1", text)
             self.assertEqual(self.console.read_presets("glm53")["current"], preset)
+
+    def test_cap_rescale_keeps_the_same_kv_memory(self):
+        env = lambda cap, fmt=None, **more: {"CAP": cap, "KV_FORMAT": fmt, **more}
+        cap_for = lambda preset, env, boxes=4: presets.cap_for("glm53", preset, env, boxes)
+        # Ring B stock: 409,600 at TP4. 64-token pages x TP4 = 256-token steps. 513,536 / 408,832 is the documented pair.
+        self.assertEqual(presets.SAME_MEMORY_CAP, {"fp8": 408832, "int4": 513536})
+        self.assertEqual(cap_for("context", env("409600")), "514304")
+        self.assertEqual(cap_for("context", env("409600", "fp8")), "514304")
+        self.assertEqual(cap_for("speed", env("514304", "int4")), "409600")
+        self.assertEqual(cap_for("quality", env("514304", "int4")), "409600")
+        self.assertEqual(cap_for("quality", env("514304", "int4", VARIANT="bit325")), "409600")
+        # Rounds down to whole steps from the box's own CAP, so the pool never holds more memory than it did.
+        self.assertEqual(cap_for("context", env("409700")), "514404")
+        self.assertEqual(cap_for("speed", env("514404", "int4")), "409600")
+        self.assertEqual(cap_for("speed", env("514303", "int4")), "409344")
+        self.assertEqual(cap_for("context", env("409856")), "514816")
+        self.assertEqual(cap_for("speed", env("514816", "int4")), "409856")
+        # Round trip is exact for a CAP that is a whole number of steps.
+        for cap in (409600, 409856, 512000, 204800):
+            there = cap_for("context", env(str(cap)))
+            self.assertEqual(cap_for("speed", env(there, "int4")), str(cap))
+        # TP from the box's env when it is a positive integer, else the number of boxes.
+        self.assertEqual(cap_for("context", env("409600", TP="8")), "514048")
+        self.assertEqual(cap_for("context", env("409600", TP="x")), "514304")
+        self.assertEqual(cap_for("context", env("409600", TP="0"), boxes=2), "514432")
+        # No change: CAP unset or not a number, same format, other models, an unknown format.
+        for none in (env(None), env(""), env("auto"), env("0"), env("-5"), env("409600", "int4"), env("409600", "int8"), env("409600", "bf16")):
+            self.assertIsNone(cap_for("context", none), none)
+        self.assertIsNone(cap_for("speed", env("409600")))
+        self.assertIsNone(cap_for("quality", env("409600")))
+        self.assertIsNone(cap_for("speed", env("1", "int4")))
+        for model in ("ds41", "glm53f"):
+            for name in ("speed", "quality", "context"):
+                self.assertIsNone(presets.cap_for(model, name, env("409600", "int4"), 4))
+                self.assertIsNone(presets.cap_for(model, name, env("409600"), 4))
+        # The diff: one pair when every box agrees, "mixed" when they differ, None when no CAP changes.
+        four = [env("409600")] * 4
+        self.assertEqual(presets.cap_diff("glm53", "context", four), {"before": "409600", "after": "514304"})
+        self.assertIsNone(presets.cap_diff("glm53", "speed", four))
+        self.assertIsNone(presets.cap_diff("glm53", "context", [env(None)] * 4))
+        self.assertEqual(presets.cap_diff("glm53", "speed", [env("514304", "int4")] * 4), {"before": "514304", "after": "409600"})
+        mixed = {"before": "mixed", "after": "scaled on each box"}
+        self.assertEqual(presets.cap_diff("glm53", "context", [env("409600"), env("409856")]), mixed)
+        self.assertEqual(presets.cap_diff("glm53", "context", [env("409600"), env(None)]), mixed)
+        self.assertIsNone(presets.cap_diff("ds41", "context", four))
+
+    def test_context_card_shows_the_cap_change_only_when_cap_is_set(self):
+        plain = self.console.read_presets("glm53")
+        for item in plain["presets"]:
+            self.assertNotIn("CAP", [row["key"] for row in item["diff"]])
+            self.assertNotIn("KV pool", item["summary"])
+            self.assertNotIn("CAP", item["caption"])
+        for box in self.fake.texts["glm53"]:
+            self.fake.texts["glm53"][box] += "CAP=409600\n"
+        row = self.console.read_presets("glm53")
+        self.assertEqual(row["current"], "custom")
+        by_id = {item["id"]: item for item in row["presets"]}
+        context = by_id["context"]
+        self.assertEqual([r for r in context["diff"] if r["key"] == "CAP"], [{"key": "CAP", "before": "409600", "after": "514304"}])
+        self.assertIn("KV pool: CAP 409,600 to 514,304 tokens, the same KV memory.", context["summary"])
+        self.assertEqual(context["caption"], "8 slots · int4 KV (not re-measured) · CAP 514,304")
+        for name in ("speed", "quality"):
+            self.assertNotIn("CAP", [r["key"] for r in by_id[name]["diff"]])
+            self.assertNotIn("CAP", by_id[name]["caption"])
+            self.assertNotIn("KV pool", by_id[name]["summary"])
+        self.assertNotIn("CAP", row["current_setting"])
+        # Leaving Context (int4 boxes) shows the way back to the stock CAP.
+        for box in self.fake.texts["glm53"]:
+            self.fake.texts["glm53"][box] += "KV_FORMAT=int4\n"
+        self.fake.texts["glm53"] = {b: t.replace("CAP=409600", "CAP=514304") for b, t in self.fake.texts["glm53"].items()}
+        row = self.console.read_presets("glm53")
+        by_id = {item["id"]: item for item in row["presets"]}
+        self.assertEqual(row["current"], "custom")
+        for name in ("speed", "quality"):
+            self.assertIn({"key": "CAP", "before": "514304", "after": "409600"}, by_id[name]["diff"])
+            self.assertIn("KV pool: CAP 514,304 to 409,600 tokens", by_id[name]["summary"])
+            self.assertTrue(by_id[name]["caption"].endswith(" · CAP 409,600"))
+        self.assertNotIn("CAP", [r["key"] for r in by_id["context"]["diff"]])
+        # DeepSeek and GLM-5.3-Flash presets do not set KV_FORMAT, so CAP stays as the dotenv has it.
+        for model in ("ds41", "glm53f"):
+            for box in self.fake.texts[model]:
+                self.fake.texts[model][box] += "CAP=409600\nKV_FORMAT=int4\n"
+            for item in self.console.read_presets(model)["presets"]:
+                self.assertNotIn("CAP", [r["key"] for r in item["diff"]])
+                self.assertNotIn("KV pool", item["summary"])
+
+    def test_boxes_with_different_caps_are_scaled_each_on_its_own(self):
+        caps = {"box-0": "409600", "box-1": "409856", "box-2": "409700", "box-3": None}
+        for box, cap in caps.items():
+            if cap:
+                self.fake.texts["glm53"][box] += f"CAP={cap}\n"
+        row = self.console.read_presets("glm53")
+        context = next(item for item in row["presets"] if item["id"] == "context")
+        cap = next(r for r in context["diff"] if r["key"] == "CAP")
+        self.assertEqual(cap, {"key": "CAP", "before": "mixed", "after": "scaled on each box"})
+        self.assertIn("CAP is scaled on each box", context["summary"])
+        self.assertNotIn("CAP", context["caption"])
+        self.console.submit(self.request(preset="context", revision=row["revision"]))
+        job = self.done()
+        self.assertEqual(job["status"], "succeeded", job)
+        self.assertTrue(any(step.startswith("CAP: ") and "409600 to 514304" in step for step in job["steps"]), job["steps"])
+        texts = self.fake.texts["glm53"]
+        self.assertIn("CAP=514304\n", texts["box-0"])
+        self.assertIn("CAP=514816\n", texts["box-1"])
+        self.assertIn("CAP=514404\n", texts["box-2"])
+        self.assertNotIn("CAP", texts["box-3"])
+        for text in texts.values():
+            self.assertIn("KV_FORMAT=int4", text)
+        # Back to Speed: each box returns to its own aligned CAP, an unset one stays unset.
+        row = self.console.read_presets("glm53")
+        self.console.submit(self.request(preset="speed", revision=row["revision"]))
+        self.assertEqual(self.done()["status"], "succeeded")
+        texts = self.fake.texts["glm53"]
+        self.assertIn("CAP=409600\n", texts["box-0"])
+        self.assertIn("CAP=409856\n", texts["box-1"])
+        self.assertIn("CAP=409600\n", texts["box-2"])
+        self.assertNotIn("CAP", texts["box-3"])
+        for text in texts.values():
+            self.assertNotIn("KV_FORMAT", text)
+
+    def test_cap_does_not_change_for_a_preset_that_keeps_the_kv_format(self):
+        for box in self.fake.texts["glm53"]:
+            self.fake.texts["glm53"][box] += "CAP=409600\n"
+        row = self.console.read_presets("glm53")
+        self.console.submit(self.request(preset="quality", revision=row["revision"]))
+        job = self.done()
+        self.assertEqual(job["status"], "succeeded", job)
+        self.assertFalse(any(step.startswith("CAP: ") for step in job["steps"]))
+        for text in self.fake.texts["glm53"].values():
+            self.assertIn("CAP=409600\n", text)
 
     def test_confirmed_preset_writes_all_boxes_then_restart(self):
         row = self.console.read_presets("glm53")

@@ -3,10 +3,14 @@
 Every preset removes explicit SESS and MAX_MODEL_LEN. Recipe knobs.sh
 applies those, and VARIANT, only when unset (${KEY:-default}); a leftover
 would keep the old slot count or length, so the card text would be false.
-No preset touches CAP. CAP is the box's own limit on the KV pool, set to fit
+No preset removes CAP. CAP is the box's own limit on the KV pool, set to fit
 that ring; a preset that removed it let the pool grow past what the ring
 holds, and the engine failed to boot. CAP is not a preset key, so a stock
 CAP, or any other CAP value, never makes a box read as custom.
+On GLM-5.3 only, a preset that moves a box between the fp8 KV row (Speed,
+Quality) and the int4 KV row (Context) rescales an explicit CAP to the same
+KV memory (cap_for); an unset CAP stays unset. DeepSeek and GLM-5.3-Flash
+presets do not set KV_FORMAT (the recipe picks it), so their CAP stays.
 DeepSeek and GLM-5.3-Flash also write TUNE and remove VARIANT. Unset TUNE
 on those models is Speed, the recipe default. DeepSeek also removes EXACT
 and the fast words knobs.sh writes ahead of the user's EXTRA_ENV, because
@@ -113,6 +117,16 @@ SOURCE = {
 }
 
 
+# GLM-5.3 CAP pair at TP=4, as docs/GLM-5.3.md:107-108 quotes it: int4 CAP 513,536 against
+# fp8 CAP 408,832, about 1.26x. A CAP-sized buffer does not shrink with the row (docs/KV4.md:96),
+# so the 656/416 page ratio is not used. The KV4.md:101 table gives a larger ratio
+# (310,528 -> 415,232, 1.34x); this one is smaller, so it asks for less memory.
+SAME_MEMORY_CAP = {"fp8": 408832, "int4": 513536}
+# One page is 64 tokens (scripts/engine_args.sh:18-23, share_cap), and a page adds 64 x TP tokens
+# to CAP (docs/KV4.md:96-97, 256 at TP4), so CAP moves in steps of 64 x TP.
+PAGE_TOKENS = 64
+
+
 def _norm(value):
     if value is None:
         return None
@@ -170,8 +184,81 @@ def describe(model, values, mixed, current):
     return " ".join(parts) if parts else "unset"
 
 
-def public(model, values=None, mixed=()):
-    values = values or {}
-    return [dict(id=item["id"], label=item["label"], setting=item["setting"], summary=item["summary"], caption=item["caption"],
-                 diff=diff_for(model, values, mixed, item["id"]))
-            for item in CATALOG[model]]
+def _pool(cap):
+    """Dialog and card text for a CAP change, or ("", "") when there is none."""
+    if not cap:
+        return "", ""
+    if cap["before"] == "mixed":
+        return " KV pool: CAP is scaled on each box to hold the same KV memory.", ""
+    return (f" KV pool: CAP {int(cap['before']):,} to {int(cap['after']):,} tokens, the same KV memory.",
+            f" \u00b7 CAP {int(cap['after']):,}")
+
+
+def public(model, values=None, mixed=(), caps=None):
+    """The cards. caps maps a preset id to its cap_diff, when CAP changes."""
+    values, caps = values or {}, caps or {}
+    cards = []
+    for item in CATALOG[model]:
+        diff = diff_for(model, values, mixed, item["id"])
+        cap = caps.get(item["id"])
+        summary, caption = _pool(cap)
+        if cap:
+            diff.append({"key": "CAP", **cap})
+        cards.append(dict(id=item["id"], label=item["label"], setting=item["setting"], summary=item["summary"] + summary,
+                          caption=item["caption"] + caption, diff=diff))
+    return cards
+
+
+def _kv(value):
+    """fp8 for unset or fp8, int4 for int4, None for any other value."""
+    value = _norm(value)
+    return "fp8" if value in (None, "fp8") else "int4" if value == "int4" else None
+
+
+def _block(env, boxes):
+    tp = _norm(env.get("TP"))
+    tp = int(tp) if tp and tp.isdigit() and int(tp) > 0 else max(boxes, 1)
+    return PAGE_TOKENS * tp
+
+
+def _grow(cap, block):
+    """The int4 CAP that holds the memory of this fp8 CAP, aligned to the box's own CAP."""
+    return cap + (cap * SAME_MEMORY_CAP["int4"] // SAME_MEMORY_CAP["fp8"] - cap) // block * block
+
+
+def _shrink(cap, block):
+    """The largest aligned fp8 CAP whose int4 image is not above this CAP; 514,304 gives 409,600."""
+    low = cap * SAME_MEMORY_CAP["fp8"] // SAME_MEMORY_CAP["int4"] // block * block
+    if low <= 0:
+        return None
+    while _grow(low + block, block) <= cap:
+        low += block
+    return low
+
+
+def cap_for(model, preset_id, env, boxes):
+    """The CAP text one box needs for this preset, or None when its CAP stays as it is.
+    env holds the box's KV_FORMAT, CAP and TP. Only GLM-5.3 changes CAP, and only when the
+    preset moves the box between the fp8 and int4 KV rows and CAP is an explicit integer."""
+    if model != "glm53":
+        return None
+    cap = _norm(env.get("CAP"))
+    if not cap or not cap.isdigit() or int(cap) <= 0:
+        return None
+    source, target = _kv(env.get("KV_FORMAT")), _kv(changes_for(model, preset_id).get("KV_FORMAT"))
+    if source is None or target is None or source == target:
+        return None
+    block = _block(env, boxes)
+    new = _grow(int(cap), block) if target == "int4" else _shrink(int(cap), block)
+    return str(new) if new else None
+
+
+def cap_diff(model, preset_id, envs):
+    """The CAP change a preset makes on all boxes: {before, after}, the same text on every box;
+    {before: "mixed", after: "scaled on each box"} when boxes differ; None when no CAP changes."""
+    pairs = [(_norm(env.get("CAP")), cap_for(model, preset_id, env, len(envs))) for env in envs]
+    if not any(after for _, after in pairs):
+        return None
+    if len(set(pairs)) == 1 and pairs[0][1]:
+        return {"before": pairs[0][0], "after": pairs[0][1]}
+    return {"before": "mixed", "after": "scaled on each box"}
