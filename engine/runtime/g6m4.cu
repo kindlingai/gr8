@@ -1809,6 +1809,7 @@ int main(int argc, char** argv)
                 ds41::Stop stop;
                 if (pf_v2) {
                     v2engine.v.widths.select(c.request,c.slot,R);
+                    v2engine.moe.select_request(c.request,c.slot,R);
                     v2engine.v.attn_pipe.select(c.request,c.slot);
                     if (v2engine.v.attn_pipe.on) ds41_attn_set_pipe(1);
                     ds41::v2::timing_begin_chunk(v2engine.v,c.request,c.first,c.rows);
