@@ -2,8 +2,10 @@
 
 tools/launch/hfsource.py writes complete/tp<N>.rank<R>.<variant>-<sha>.json
 last, after that rank's files are verified. A manifest alone is not weights
-on disk. This module is also the script sent over SSH: it uses the standard
-library only.
+on disk. Unset GR8_CACHE and GR8_HOME are the Docker named volumes from
+docker/compose.yaml (project name gr8). A path that cannot be resolved, or
+a probe that cannot run, is unknown, not missing. This module is also the
+script sent over SSH: it uses the standard library only.
 """
 import json
 import math
@@ -14,7 +16,10 @@ import sys
 
 # Wait ceiling when no fetch log has a rate. Not a measured rate and not shown.
 UNMEASURED_RATE_MB_S = 1
+# docker/compose.yaml pins `name: gr8`. Unset GR8_CACHE/GR8_HOME select volumes gr8_cache and gr8_home.
+COMPOSE_PROJECT = "gr8"
 RATE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*MB/s")
+VOLUME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 MODEL_URL = re.compile(
     r"https://huggingface\.co/([\w.-]+/[\w.-]+?)(?:@([\w.-]+)|/tree/([\w.-]+))?/?"
 )
@@ -40,15 +45,62 @@ def changed_variant(values, changes, mixed=()):
     return None
 
 
-def download_text(size_gb, rate_mb_s):
-    """Dialog sentence. Minutes only when a fetch log supplied a rate."""
+def _span(count, unit):
+    return f"{count} {unit}" if count == 1 else f"{count} {unit}s"
+
+
+def health_sentence(seconds):
+    """Dialog clause for the health wait the restart will use."""
+    total = max(0, int(math.ceil(float(seconds))))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = []
+    if hours:
+        parts.append(_span(hours, "hour"))
+    if minutes:
+        parts.append(_span(minutes, "minute"))
+    if secs or not parts:
+        parts.append(_span(secs if parts else total, "second"))
+    return "The health wait is extended to " + " ".join(parts) + "."
+
+
+def download_text(size_gb, rate_mb_s, health_seconds=None):
+    """Dialog sentences. Minutes only when a fetch log supplied a rate.
+
+    The size counts every expert half on the busiest rank, so it is an upper
+    bound: halves the current variant already fetched are not fetched again.
+    """
     if size_gb is None or size_gb <= 0:
-        return "needs a download of this variant on every box that does not have it"
-    gb = max(1, int(round(size_gb)))
-    if rate_mb_s is None or rate_mb_s <= 0:
-        return f"needs a ~{gb} GB download per box"
-    minutes = max(1, int(round(size_gb * 1000.0 / rate_mb_s / 60.0)))
-    return f"needs a ~{gb} GB download per box (~{minutes} min)"
+        sentence = "This preset downloads the variant weights to each box that does not have them."
+    else:
+        gb = max(1, int(round(size_gb)))
+        sentence = f"This preset downloads up to about {gb} GB to each box."
+        if rate_mb_s is not None and rate_mb_s > 0:
+            minutes = max(1, int(round(size_gb * 1000.0 / rate_mb_s / 60.0)))
+            sentence += f" At the last measured rate this takes about {minutes} minutes."
+    if health_seconds is not None:
+        sentence += " " + health_sentence(health_seconds)
+    return sentence
+
+
+def unchecked_text(boxes):
+    """Name the boxes whose weight check did not run."""
+    numbers = []
+    for box in boxes or []:
+        try:
+            number = int(box)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            numbers.append(number)
+    if not numbers:
+        return "Cannot check the weights on every box."
+    labels = [f"box {number}" for number in numbers]
+    if len(labels) == 1:
+        return f"Cannot check the weights on {labels[0]}."
+    if len(labels) == 2:
+        return f"Cannot check the weights on {labels[0]} and {labels[1]}."
+    return "Cannot check the weights on " + ", ".join(labels[:-1]) + f", and {labels[-1]}."
 
 
 def extra_seconds(size_gb, rate_mb_s):
@@ -57,6 +109,23 @@ def extra_seconds(size_gb, rate_mb_s):
         return 3600
     rate = rate_mb_s if rate_mb_s and rate_mb_s > 0 else UNMEASURED_RATE_MB_S
     return max(1, math.ceil(size_gb * 1e9 / (rate * 1e6)))
+
+
+def preset_notice(status, health_budget):
+    """Dialog text and the extended health wait, or (None, None) when every box has the marker.
+
+    Unknown is not a download: no size claim and no extended wait. A confirmed
+    miss includes the wait, which can be hours when no fetch rate was measured.
+    """
+    state = status.get("state")
+    if state not in ("present", "missing", "unknown"):
+        state = "present" if status.get("present") is True else "missing"
+    if state == "present":
+        return None, None
+    if state == "unknown":
+        return unchecked_text(status.get("unchecked")), None
+    health = float(health_budget) + extra_seconds(status.get("size_gb"), status.get("rate_mb_s"))
+    return download_text(status.get("size_gb"), status.get("rate_mb_s"), health), health
 
 
 def last_rate(text):
@@ -108,6 +177,43 @@ def manifest_gb(path, tp):
         return expert_gb(manifest, tp, _hidden(manifest, os.path.dirname(os.path.dirname(path))))
     except (OSError, ValueError, KeyError, IndexError, ZeroDivisionError):
         return None
+
+
+def volume_mountpoint(name):
+    """Mountpoint of one Docker named volume, or None when it cannot be inspected."""
+    if not VOLUME.fullmatch(name or ""):
+        return None
+    try:
+        out = subprocess.check_output(
+            ["docker", "volume", "inspect", name],
+            text=True, timeout=10, stderr=subprocess.DEVNULL)
+        data = json.loads(out)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        return None
+    point = data[0].get("Mountpoint") or ""
+    if os.path.isabs(point):
+        return point
+    return None
+
+
+def resolve_dir(value, short_name):
+    """Absolute host path, or the named volume's mountpoint.
+
+    docker/compose.yaml binds ${GR8_CACHE:-cache} and ${GR8_HOME:-home}. An
+    empty value or a volume short name is <project>_<name>. None means the
+    directory could not be resolved, which the caller reports as unknown.
+    """
+    value = (value or "").strip()
+    if os.path.isabs(value):
+        return value
+    short = value or short_name
+    if not VOLUME.fullmatch(short):
+        return None
+    return volume_mountpoint(COMPOSE_PROJECT + "_" + short)
 
 
 def release_dir(cache, model):
@@ -215,27 +321,63 @@ def measured_rate(home):
     return rate
 
 
+def _state(row):
+    state = row.get("state")
+    if state in ("present", "missing", "unknown"):
+        return state
+    if row.get("present") is True:
+        return "present"
+    return "unknown" if row.get("present") is None else "missing"
+
+
 def probe(request):
     variant = request.get("variant") or ""
     if not re.fullmatch(r"[A-Za-z0-9_]+", variant):
         raise ValueError("unsupported variant")
     tp = int(request.get("tp") or 0)
     rank = box_rank(request.get("peers") or [], request.get("node_ip") or "", int(request.get("rank") or 0))
-    release = release_dir(request.get("cache") or "", request.get("model") or "")
+    cache = resolve_dir(request.get("cache") or "", "cache")
+    home = resolve_dir(request.get("home") or "", "home")
+    unknown = {"state": "unknown", "present": False, "size_gb": None, "rate_mb_s": None}
+    if not cache or not MODEL_URL.fullmatch(request.get("model") or ""):
+        return unknown
+    release = release_dir(cache, request.get("model") or "")
     present = bool(release and tp > 0 and rank >= 0 and weights_ready(release, tp, rank, variant))
     size = None
     if release and tp > 0:
         size = manifest_gb(os.path.join(release, "manifests", f"exlr8-manifest-{variant}.json"), tp)
-    return {"present": present, "size_gb": size, "rate_mb_s": measured_rate(request.get("home") or "")}
+    return {
+        "state": "present" if present else "missing",
+        "present": present,
+        "size_gb": size,
+        "rate_mb_s": measured_rate(home) if home else None,
+    }
 
 
 def aggregate(rows):
-    sizes = [row["size_gb"] for row in rows if row.get("size_gb")]
-    rates = [row["rate_mb_s"] for row in rows if row.get("rate_mb_s")]
+    states = [_state(row) for row in rows]
+    if not rows or any(state == "unknown" for state in states):
+        overall = "unknown"
+    elif all(state == "present" for state in states):
+        overall = "present"
+    else:
+        overall = "missing"
+    sizes = [row["size_gb"] for row, state in zip(rows, states) if state != "unknown" and row.get("size_gb")]
+    rates = [row["rate_mb_s"] for row, state in zip(rows, states) if state != "unknown" and row.get("rate_mb_s")]
+    unchecked = []
+    for row, state in zip(rows, states):
+        if state != "unknown" or not row.get("box"):
+            continue
+        try:
+            unchecked.append(int(row["box"]))
+        except (TypeError, ValueError):
+            continue
     return {
-        "present": bool(rows) and all(row.get("present") for row in rows),
+        "state": overall,
+        "present": overall == "present",
         "size_gb": max(sizes) if sizes else None,
         "rate_mb_s": min(rates) if rates else None,
+        "unchecked": unchecked,
     }
 
 

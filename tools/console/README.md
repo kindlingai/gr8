@@ -105,13 +105,18 @@ On GLM-5.3-Flash, `GR8_CP` in `EXTRA_ENV` shows **custom**. The confirm
 dialog lists each removal (`KEY=old`, then `KEY removed`). A preset that
 changes `VARIANT` (an unset `VARIANT` means home) first checks every box
 for that variant’s verified weight marker, the `complete/` file written
-after the rank’s weights are checked. A manifest alone does not count. If
-any box is missing them, the dialog says `needs a ~N GB download per box
-(~M min)` and **Restart now** confirms it. N is the variant size rounded
-to a gigabyte. M is that size divided by a measured fetch rate from the
-box logs; without a measured rate the minutes are omitted. A confirmed
-download extends the `gr8 switch` health wait by the download time, so
-the restart does not stop at the stock 900s timeout, and the operation
+after the rank’s weights are checked. A manifest alone does not count.
+Unset `GR8_CACHE` and `GR8_HOME` are the Docker named volumes `gr8_cache`
+and `gr8_home`; the check uses each volume’s mountpoint. If a mountpoint
+cannot be resolved, or a box cannot be checked, the dialog says it cannot
+check that box. That is not a download, and the health wait stays at the
+stock timeout. If a box is missing the marker, the dialog says this preset
+downloads up to about N GB to each box. N is a rounded upper bound, because
+expert halves already fetched for another variant are not fetched again.
+When a fetch log has a measured rate, a second sentence gives the minutes.
+The dialog also states the extended health wait, which can be hours when
+no rate was measured. **Restart now** confirms a missing download. The
+`gr8 switch` health wait becomes that extended wait, and the operation
 log reports `downloading`.
 
 Every preset removes those keys. On GLM-5.3 the three presets are exclusive: Quality

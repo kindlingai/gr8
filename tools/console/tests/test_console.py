@@ -187,6 +187,36 @@ class AdapterTests(unittest.TestCase):
         self.assertGreaterEqual(kwargs["timeout"], 1961)
         self.assertEqual(kwargs["timeout"], 1961 + 5 * 4 + 30)
 
+    def test_probe_error_is_unknown_not_a_download(self):
+        def runner(args, **kwargs):
+            if args[0] != "ssh":
+                return SimpleNamespace(returncode=0, stdout="ok")
+            box = args[-2]
+            if box.endswith("down.example"):
+                raise OSError("ssh failed")
+            if box.endswith("exit.example"):
+                return SimpleNamespace(returncode=1, stdout="probe failed")
+            return SimpleNamespace(returncode=0, stdout="not-json")
+
+        boxes = ("op@down.example", "op@exit.example", "op@bad.example")
+        cfg = SimpleNamespace(models={"glm53": SimpleNamespace(directory="/configured compose", boxes=boxes)}, timeout=900, ssh_timeout=5)
+        module = SimpleNamespace(read_config=lambda _: cfg, phase=lambda *args, **kwargs: None)
+        records = {box: {"text": "MODEL=https://huggingface.co/org/repo\nTP=4\n", "revision": "r"} for box in boxes}
+        with patch("tools.console.server.control.load_switch", return_value=module), patch.object(Path, "read_bytes", return_value=b"config"):
+            adapter = ComposeControl("switch.env", runner=runner)
+            one = adapter.variant_cache("glm53", "bit325", {boxes[0]: records[boxes[0]]}, refresh=True)
+            status = adapter.variant_cache("glm53", "bit325", records, refresh=True)
+        self.assertEqual(one["state"], "unknown")
+        self.assertEqual(one["unchecked"], [1])
+        self.assertEqual(weights.preset_notice(one, 900), ("Cannot check the weights on box 1.", None))
+        self.assertEqual(status["state"], "unknown")
+        self.assertFalse(status["present"])
+        self.assertEqual(status["unchecked"], [1, 2, 3])
+        text, health = weights.preset_notice(status, 900)
+        self.assertIsNone(health)
+        self.assertEqual(text, "Cannot check the weights on box 1, box 2, and box 3.")
+        self.assertNotIn("download", text)
+
     def test_nonzero_switch_is_failure(self):
         cfg = SimpleNamespace(timeout=10, ssh_timeout=5)
         with patch("tools.console.server.control.load_switch", return_value=SimpleNamespace(read_config=lambda _: cfg)), patch.object(Path, "read_bytes", return_value=b"config"):
@@ -422,7 +452,9 @@ class ServiceTests(unittest.TestCase):
         self.fake.missing_weights = {"variant": "bit325", "size_gb": 29.7, "rate_mb_s": 28}
         row = self.console.read_presets("glm53")
         by_id = {item["id"]: item for item in row["presets"]}
-        self.assertEqual(by_id["quality"]["download"], "needs a ~30 GB download per box (~18 min)")
+        sentence = weights.download_text(29.7, 28, self.console._health_budget() + weights.extra_seconds(29.7, 28))
+        self.assertEqual(by_id["quality"]["download"], sentence)
+        self.assertIn("The health wait is extended to", sentence)
         self.assertIsNone(by_id["speed"]["download"])
         self.assertIsNone(by_id["context"]["download"])
         self.console.submit(self.request(preset="quality", revision=row["revision"]))
@@ -433,7 +465,7 @@ class ServiceTests(unittest.TestCase):
         self.console.submit(self.request(preset="quality", revision=row["revision"], accept_download=True))
         job = self.done()
         self.assertEqual(job["status"], "succeeded", job)
-        self.assertTrue(any(step.startswith("downloading needs a ~30 GB download per box (~18 min)") for step in job["steps"]))
+        self.assertTrue(any(step.startswith("downloading " + sentence) for step in job["steps"]))
         switch = next(call for call in self.fake.calls if call[0] == "switch")
         self.assertEqual(switch[2], self.console._health_budget() + weights.extra_seconds(29.7, 28))
         self.assertGreater(switch[2], 900)
@@ -444,13 +476,46 @@ class ServiceTests(unittest.TestCase):
         self.fake.missing_weights = {"variant": "bit325", "size_gb": 29.7, "rate_mb_s": None}
         row = self.console.read_presets("glm53")
         quality = next(item for item in row["presets"] if item["id"] == "quality")
-        self.assertEqual(quality["download"], "needs a ~30 GB download per box")
+        health = self.console._health_budget() + weights.extra_seconds(29.7, None)
+        self.assertEqual(quality["download"], weights.download_text(29.7, None, health))
+        self.assertIn("hours", quality["download"])
+        self.assertNotIn("measured rate", quality["download"])
         self.console.submit(self.request(preset="quality", revision=row["revision"], accept_download=True))
         job = self.done()
         self.assertEqual(job["status"], "succeeded", job)
         switch = next(call for call in self.fake.calls if call[0] == "switch")
         self.assertEqual(switch[2], 900 + weights.extra_seconds(29.7, None))
         self.assertGreater(switch[2], 900)
+
+    def test_unknown_check_names_the_box_and_does_not_extend_the_wait(self):
+        self.fake.missing_weights = {"unknown": True, "unchecked": [2]}
+        row = self.console.read_presets("glm53")
+        quality = next(item for item in row["presets"] if item["id"] == "quality")
+        self.assertEqual(quality["download"], "Cannot check the weights on box 2.")
+        self.console.submit(self.request(preset="quality", revision=row["revision"]))
+        job = self.done()
+        self.assertEqual(job["status"], "succeeded", job)
+        self.assertTrue(any(step == "Cannot check the weights on box 2." for step in job["steps"]))
+        self.assertFalse(any("health wait extended" in step for step in job["steps"]))
+        self.assertFalse(any("download" in step.lower() for step in job["steps"]))
+        switch = next(call for call in self.fake.calls if call[0] == "switch")
+        self.assertIsNone(switch[2])
+
+    def test_dialog_shows_the_extended_health_wait(self):
+        self.fake.missing_weights = {"variant": "bit325", "size_gb": 29.7, "rate_mb_s": None}
+        row = self.console.read_presets("glm53")
+        quality = next(item for item in row["presets"] if item["id"] == "quality")
+        health = self.console._health_budget() + weights.extra_seconds(29.7, None)
+        text = weights.download_text(29.7, None, health)
+        self.assertEqual(quality["download"], text)
+        self.assertIn("8 hours 30 minutes", text)
+        self.assertNotIn("measured rate", text)
+        self.console.submit(self.request(preset="quality", revision=row["revision"], accept_download=True))
+        job = self.done()
+        self.assertEqual(job["status"], "succeeded", job)
+        self.assertTrue(any("The health wait is extended to 8 hours 30 minutes." in step for step in job["steps"]))
+        switch = next(call for call in self.fake.calls if call[0] == "switch")
+        self.assertEqual(switch[2], health)
 
     def test_operation_serialization(self):
         release, started = threading.Event(), threading.Event()
@@ -540,8 +605,13 @@ class ServiceTests(unittest.TestCase):
 
 class WeightTests(unittest.TestCase):
     def test_sentence_uses_size_over_measured_rate(self):
-        self.assertEqual(weights.download_text(29.7, 28), "needs a ~30 GB download per box (~18 min)")
-        self.assertEqual(weights.download_text(29.7, None), "needs a ~30 GB download per box")
+        self.assertEqual(weights.download_text(29.7, 28),
+                         "This preset downloads up to about 30 GB to each box. At the last measured rate this takes about 18 minutes.")
+        self.assertEqual(weights.download_text(29.7, None), "This preset downloads up to about 30 GB to each box.")
+        self.assertEqual(weights.download_text(None, None),
+                         "This preset downloads the variant weights to each box that does not have them.")
+        self.assertEqual(weights.health_sentence(1961), "The health wait is extended to 32 minutes 41 seconds.")
+        self.assertIn("8 hours 30 minutes", weights.download_text(29.7, None, 900 + weights.extra_seconds(29.7, None)))
         self.assertEqual(weights.extra_seconds(29.7, 28), 1061)
         self.assertGreater(weights.extra_seconds(29.7, None), 900)
         self.assertIsNone(weights.changed_variant({}, {"VARIANT": None}))
@@ -578,6 +648,79 @@ class WeightTests(unittest.TestCase):
             request["rank"] = 0
             blob.write_bytes(b"ab")
             self.assertFalse(weights.probe(request)["present"])
+
+    def test_unset_cache_resolves_the_named_volume_or_is_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mount = root / "vol"
+            commit = "b" * 40
+            release = mount / "hf" / "org--repo" / commit
+            (release / "manifests").mkdir(parents=True)
+            (release / "complete").mkdir()
+            manifest = {"hidden_size": 32, "layers": {"0": {"gate": [[2] * 16], "up": [[2] * 16], "down": [2], "shared": 0}}}
+            (release / "manifests" / "exlr8-manifest-bit325.json").write_text(json.dumps(manifest))
+            blob = release / "experts" / "one.safetensors"
+            blob.parent.mkdir()
+            blob.write_bytes(b"abc")
+            for rank in range(4):
+                (release / "complete" / f"tp4.rank{rank}.bit325-0123456789ab.json").write_text(
+                    json.dumps({"files": {"experts/one.safetensors": 3}}))
+            home = root / "home"
+            (home / "out").mkdir(parents=True)
+            request = {"cache": "", "model": "https://huggingface.co/org/repo@" + commit,
+                       "tp": 4, "rank": 0, "variant": "bit325", "home": str(home), "peers": []}
+
+            def inspect(name):
+                called.append(name)
+                return str(mount) if name == "gr8_cache" else None
+
+            called = []
+            with patch.object(weights, "volume_mountpoint", side_effect=inspect):
+                found = weights.probe(request)
+            self.assertEqual(called, ["gr8_cache"])
+            self.assertEqual(found["state"], "present")
+            rows = []
+            for rank in range(4):
+                request["rank"] = rank
+                with patch.object(weights, "volume_mountpoint", return_value=str(mount)):
+                    probed = weights.probe(request)
+                probed["box"] = rank + 1
+                rows.append(probed)
+            self.assertEqual(weights.aggregate(rows)["state"], "present")
+            self.assertEqual(weights.preset_notice(weights.aggregate(rows), 900), (None, None))
+            (release / "complete" / "tp4.rank2.bit325-0123456789ab.json").unlink()
+            rows = []
+            for rank in range(4):
+                request["rank"] = rank
+                with patch.object(weights, "volume_mountpoint", return_value=str(mount)):
+                    probed = weights.probe(request)
+                probed["box"] = rank + 1
+                rows.append(probed)
+            status = weights.aggregate(rows)
+            self.assertEqual([row["state"] for row in rows], ["present", "present", "missing", "present"])
+            self.assertEqual(status["state"], "missing")
+            text, health = weights.preset_notice(status, 900)
+            self.assertIn("up to about", text)
+            self.assertGreater(health, 900)
+            request["rank"] = 0
+            with patch.object(weights, "volume_mountpoint", return_value=None):
+                unknown = weights.probe(request)
+            self.assertEqual(unknown["state"], "unknown")
+            unknown["box"] = 1
+            text, health = weights.preset_notice(weights.aggregate([unknown]), 900)
+            self.assertIsNone(health)
+            self.assertEqual(text, "Cannot check the weights on box 1.")
+            self.assertNotIn("GB", text)
+            request["cache"] = "rel/cache"
+            with patch.object(weights, "volume_mountpoint", side_effect=AssertionError("docker")):
+                self.assertEqual(weights.probe(request)["state"], "unknown")
+            request["cache"] = str(mount)
+            request["home"] = ""
+            with patch.object(weights, "volume_mountpoint", return_value=None) as mounted:
+                row = weights.probe(request)
+            mounted.assert_called_with("gr8_home")
+            self.assertEqual(row["state"], "present")
+            self.assertIsNone(row["rate_mb_s"])
 
     def test_expert_gb_matches_the_launcher(self):
         import sys

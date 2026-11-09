@@ -107,16 +107,17 @@ def run(output):
             print("PASS confirmed preset: writes all four envs, drops SESS, stops, calls switch, verifies ready identity")
 
             fixture.missing_weights = {"variant": "home", "size_gb": 29.7, "rate_mb_s": 28}
-            with page.expect_response(lambda response: presets_body(response) and "needs a ~30 GB download per box (~18 min)" in response.text(), timeout=10000):
+            sentence = weights.download_text(29.7, 28, 900 + weights.extra_seconds(29.7, 28))
+            with page.expect_response(lambda response: presets_body(response) and sentence in response.text(), timeout=10000):
                 pass
             page.get_by_role("button", name="Speed").click()
-            expect(page.get_by_role("dialog")).to_contain_text("needs a ~30 GB download per box (~18 min)")
+            expect(page.get_by_role("dialog")).to_contain_text(sentence)
             expect(page.get_by_role("button", name="Restart now", exact=True)).to_be_enabled()
             page.screenshot(path=str(output / "download-390.png"), full_page=True)
             page.get_by_role("button", name="Restart now", exact=True).click()
             expect(page.get_by_label("Operation status")).to_contain_text("succeeded", timeout=15000)
             expect(page.get_by_label("Operation status")).to_contain_text("downloading")
-            expect(page.get_by_label("Operation status")).to_contain_text("needs a ~30 GB download per box (~18 min)")
+            expect(page.get_by_label("Operation status")).to_contain_text(sentence)
             assert fixture.last_health_timeout == 900 + weights.extra_seconds(29.7, 28)
             assert fixture.last_health_timeout > 900
             page.get_by_role("button", name="Restore previous settings", exact=True).click()
@@ -125,7 +126,7 @@ def run(output):
             expect(page.get_by_label("Operation status")).to_contain_text("succeeded", timeout=15000)
             assert all("VARIANT=bit325" in text for text in fixture.texts["glm53"].values())
             fixture.missing_weights = None
-            with page.expect_response(lambda response: presets_body(response) and "needs a ~30 GB" not in response.text(), timeout=10000):
+            with page.expect_response(lambda response: presets_body(response) and "downloads up to about" not in response.text(), timeout=10000):
                 pass
             print("PASS missing variant weights ask for the download and extend the health wait")
 

@@ -102,9 +102,13 @@ class ComposeControl:
                 raw = self.remote(box, "python3 -c " + shlex.quote(self.weight_source), json.dumps(payload))
                 row = json.loads(raw)
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
-                row = {"present": False, "size_gb": None, "rate_mb_s": None}
+                row = None
+            # A failed probe is unknown. It is not evidence that the weights are missing.
             if not isinstance(row, dict):
-                row = {"present": False, "size_gb": None, "rate_mb_s": None}
+                row = {"state": "unknown", "present": False, "size_gb": None, "rate_mb_s": None}
+            elif row.get("state") not in ("present", "missing", "unknown"):
+                row["state"] = "present" if row.get("present") is True else "missing"
+            row["box"] = index + 1
             return row
 
         with ThreadPoolExecutor(max_workers=min(4, max(1, width))) as pool:

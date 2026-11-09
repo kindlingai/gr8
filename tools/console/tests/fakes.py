@@ -118,9 +118,13 @@ class Fixture:
 
     def variant_cache(self, model, variant, records, refresh=False):
         spec = self.missing_weights or {}
+        if spec.get("unknown"):
+            return {"state": "unknown", "present": False, "size_gb": None, "rate_mb_s": None,
+                    "unchecked": list(spec.get("unchecked") or [1])}
         if spec.get("variant") != variant:
-            return {"present": True, "size_gb": None, "rate_mb_s": None}
-        return {"present": False, "size_gb": spec.get("size_gb"), "rate_mb_s": spec.get("rate_mb_s")}
+            return {"state": "present", "present": True, "size_gb": None, "rate_mb_s": None, "unchecked": []}
+        return {"state": "missing", "present": False, "size_gb": spec.get("size_gb"),
+                "rate_mb_s": spec.get("rate_mb_s"), "unchecked": []}
 
     def activate(self, model, emit, health_timeout=None):
         self.calls.append(("switch", model, health_timeout))

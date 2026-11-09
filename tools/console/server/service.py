@@ -229,9 +229,7 @@ class Console:
                     continue
                 if variant not in seen:
                     seen[variant] = self.control.variant_cache(model, variant, records)
-                status = seen[variant]
-                if not status.get("present"):
-                    item["download"] = weights.download_text(status.get("size_gb"), status.get("rate_mb_s"))
+                item["download"] = weights.preset_notice(seen[variant], self._health_budget())[0]
         else:
             for item in shown:
                 item["download"] = None
@@ -332,6 +330,7 @@ class Console:
             if action == "restore":
                 self._restore(model, backup_id)
             download = None
+            notice = None
             if changes:
                 if set(changes) - set(presets.keys_for(model)):
                     raise ValueError("unsupported setting")
@@ -349,11 +348,13 @@ class Console:
                 variant = weights.changed_variant(merged, changes, mixed)
                 if variant:
                     status = self.control.variant_cache(model, variant, records, refresh=True)
-                    if not status.get("present"):
+                    text, health = weights.preset_notice(status, self._health_budget())
+                    if health is not None:
                         if not accept_download:
                             raise ValueError("variant weights are not on every box; confirm the download")
-                        text = weights.download_text(status.get("size_gb"), status.get("rate_mb_s"))
-                        download = {"text": text, "health": self._health_budget() + weights.extra_seconds(status.get("size_gb"), status.get("rate_mb_s"))}
+                        download = {"text": text, "health": health}
+                    elif text:
+                        notice = text
                 updated = {b: envfile.patch(r["text"], changes, presets.engine_keys(model)) for b, r in records.items()}
                 backup = self.state / (self.job["id"] + ".backup.json")
                 backup.write_text(json.dumps({"model": model, "records": records, "written": {b: envfile.digest(t) for b, t in updated.items()}}, indent=2))
@@ -392,6 +393,8 @@ class Console:
                     self._emit(f"health wait extended to {download['health']:.0f}s for the download")
                     watcher = threading.Thread(target=self._watch_download, args=(model, stop_watch), daemon=True)
                     watcher.start()
+                elif notice:
+                    self._emit(notice)
                 try:
                     if download:
                         self.control.activate(model, self._emit, health_timeout=download["health"])
