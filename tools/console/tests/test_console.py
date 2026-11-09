@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,7 +15,7 @@ from fastapi.testclient import TestClient
 
 from tools.console.server import envfile, metrics, presets, weights
 from tools.console.server.main import create_app
-from tools.console.server.service import Console, fetch, rpc
+from tools.console.server.service import Console, boot_failure, fetch, rpc
 from tools.console.tests.fakes import Fixture
 
 
@@ -238,6 +239,88 @@ class AdapterTests(unittest.TestCase):
                 adapter.activate("glm53", lambda _: None)
 
 
+class SwitchProcessTests(unittest.TestCase):
+    """The real subprocess branch of activate(), with a stand-in gr8 script."""
+
+    def adapter(self, script_body):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        script = Path(tmp.name) / "gr8"
+        script.write_text("#!/bin/sh\n" + script_body)
+        script.chmod(0o755)
+        cfg = SimpleNamespace(models={}, timeout=900, ssh_timeout=5)
+        module = SimpleNamespace(read_config=lambda _: cfg, phase=lambda *a, **k: None)
+        for patcher in (patch("tools.console.server.control.load_switch", return_value=module),
+                        patch.object(Path, "read_bytes", return_value=b"config"),
+                        patch("tools.console.server.control.REPO", Path(tmp.name))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return ComposeControl("switch.env")
+
+    def test_abort_kills_the_switch_command_and_its_children(self):
+        adapter = self.adapter("echo switching\nsleep 60\n")
+        abort, lines = threading.Event(), []
+        threading.Timer(0.5, abort.set).start()
+        start = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "engine failed to boot"):
+            adapter.activate("glm53", lines.append, abort=abort)
+        self.assertLess(time.monotonic() - start, 8)
+        self.assertIn("switching", lines)
+
+    def test_command_that_ignores_sigterm_is_killed(self):
+        adapter = self.adapter("trap '' TERM\necho stubborn\nwhile :; do sleep 1; done\n")
+        abort = threading.Event()
+        threading.Timer(0.5, abort.set).start()
+        start = time.monotonic()
+        with self.assertRaisesRegex(RuntimeError, "engine failed to boot"):
+            adapter.activate("glm53", lambda _: None, abort=abort)
+        self.assertLess(time.monotonic() - start, 20)
+
+    def test_exit_status_still_decides_without_abort(self):
+        ok = self.adapter("echo ready\n")
+        lines = []
+        ok.activate("glm53", lines.append, abort=threading.Event())
+        self.assertIn("ready", lines)
+        bad = self.adapter("echo not ready\nexit 3\n")
+        with self.assertRaisesRegex(RuntimeError, "switch exited 3"):
+            bad.activate("glm53", lambda _: None, abort=threading.Event())
+
+
+class BootFailureTests(unittest.TestCase):
+    START = "12:00:01 engine started (epoch %d); waiting for it to load (up to 1800s)\n"
+    RANK = "12:01:09 rank 1 (box2.example) failed: engine exited (2): g6: rank 1: 7.0 GiB left after the weights; lower --cap\n"
+
+    def test_failure_of_this_boot_is_reported_without_the_time_prefix(self):
+        text = "12:00:00 head: waiting for 3 hellos\n" + self.START % 5000 + self.RANK
+        self.assertEqual(boot_failure(text, 4990), "rank 1 (box2.example) failed: engine exited (2): g6: rank 1: 7.0 GiB left after the weights; lower --cap")
+
+    def test_head_engine_front_end_and_shim_exits_count(self):
+        for line in ("engine exited (1): g6: weight check; last lines of g6m4.r0.err:",
+                     "front end exited (1); last lines of front.log:", "shim exited (1); last lines of shim.log:"):
+            self.assertEqual(boot_failure(self.START % 5000 + "12:01:09 " + line + "\n", 4990), line)
+
+    def test_old_boot_failure_is_not_this_boot(self):
+        old = self.START % 1000 + self.RANK
+        self.assertIsNone(boot_failure(old, 4990))
+        # A new boot after it resets the search.
+        self.assertIsNone(boot_failure(old + self.START % 5000, 4990))
+        self.assertIsNotNone(boot_failure(old + self.START % 5000 + self.RANK, 4990))
+
+    def test_failure_line_before_any_start_line_is_ignored(self):
+        self.assertIsNone(boot_failure(self.RANK, 0))
+
+    def test_other_lines_are_not_failures(self):
+        text = self.START % 5000 + "12:01:00 down from 10.0.0.1\n12:01:01 check failed: nothing\n12:01:02 engine started late\n"
+        self.assertIsNone(boot_failure(text, 0))
+        self.assertIsNone(boot_failure("", 0))
+
+    def test_first_failure_wins_and_the_reason_is_capped(self):
+        text = self.START % 5000 + "12:01:09 rank 1 (b) failed: " + "x" * 900 + "\n12:01:10 engine exited (1): later\n"
+        reason = boot_failure(text, 0)
+        self.assertEqual(len(reason), 500)
+        self.assertTrue(reason.startswith("rank 1 (b) failed: xxx"))
+
+
 class MetricTests(unittest.TestCase):
     def test_exact_names_labels_and_denominators(self):
         values, info = metrics.parse('''# comment
@@ -457,6 +540,47 @@ class ServiceTests(unittest.TestCase):
         job = self.done()
         self.assertEqual(job["status"], "failed")
         self.assertIn("timeout", job["error"])
+
+    FAILED = "rank 1 (box2.example) failed: engine exited (2): g6: rank 1: 7.1 GiB left after the weights; lower --cap"
+
+    def supervisor_log(self, epoch, *lines):
+        return ("12:00:00 head: waiting for 3 hellos\n12:00:01 engine started (epoch %d); waiting for it to load (up to 1800s)\n" % epoch
+                + "".join("12:01:30 " + line + "\n" for line in lines))
+
+    def test_engine_exit_ends_the_health_wait_and_shows_the_reason(self):
+        self.console.watch_interval = 0.02
+        self.fake.activate_wait = 30
+        self.fake.supervisor_log = self.supervisor_log(int(time.time()), self.FAILED)
+        start = time.monotonic()
+        self.console.submit(self.request())
+        job = self.done()
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("Boot failed: " + self.FAILED, job["error"])
+        self.assertIn("Boot failed: " + self.FAILED, job["steps"])
+        self.assertNotIn("Health ready; target model identity verified", job["steps"])
+        self.assertEqual([x[0] for x in self.fake.calls], ["stop", "switch"])
+
+    def test_engine_exit_in_a_confirmed_download_wait_also_ends_it(self):
+        self.console.watch_interval = 0.02
+        self.fake.activate_wait = 30
+        self.fake.missing_weights = {"variant": "bit325", "size_gb": 29.7, "rate_mb_s": 28}
+        self.fake.supervisor_log = self.supervisor_log(int(time.time()), self.FAILED)
+        row = self.console.read_presets("glm53")
+        self.console.submit(self.request(preset="quality", revision=row["revision"], accept_download=True))
+        job = self.done()
+        self.assertEqual(job["status"], "failed")
+        self.assertIn(self.FAILED, job["error"])
+        self.assertTrue(job["can_restore"])
+
+    def test_failure_left_by_an_earlier_boot_does_not_stop_the_switch(self):
+        self.console.watch_interval = 0.02
+        self.fake.activate_wait = 0.6
+        self.fake.supervisor_log = self.supervisor_log(int(time.time()) - 600, self.FAILED)
+        self.console.submit(self.request())
+        job = self.done()
+        self.assertEqual(job["status"], "succeeded", job)
+        self.assertFalse([step for step in job["steps"] if step.startswith("Boot failed")])
 
     def test_controls_disabled_and_confirmation_required(self):
         with self.assertRaises(ValueError):

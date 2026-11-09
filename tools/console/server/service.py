@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 import threading
@@ -39,6 +40,31 @@ def rpc(host, port, message):
         if not isinstance(value, dict) or value.get("t") == "error":
             raise ValueError("supervisor refused: " + str(value))
         return value
+
+
+STARTED = re.compile(r"engine started \(epoch (\d+)\)")
+# Supervisor log lines are "HH:MM:SS text". The head logs these when an engine, its front end, or its
+# shim exits; a worker rank's exit reaches the head as "rank N (peer) failed: ...".
+FAILED = re.compile(r"^\d\d:\d\d:\d\d (rank \d+ \([^)]*\) failed: .+|(?:engine|front end|shim) exited \(.+)$")
+BOOT_SLACK = 30  # seconds of clock difference allowed between this host and a box
+WATCH_WINDOW = 262144  # bytes read from the end of the head supervisor log
+
+
+def boot_failure(text, not_before):
+    """The supervisor's first failure line of the latest boot in this log text, or None.
+
+    A boot counts only when its "engine started (epoch E)" line has E >= not_before, so a failure line
+    left by a boot that began before this operation is not mistaken for this one."""
+    epoch, reason = None, None
+    for line in text.splitlines():
+        started = STARTED.search(line)
+        if started:
+            epoch, reason = int(started.group(1)), None
+            continue
+        found = FAILED.match(line)
+        if found and reason is None and epoch is not None and epoch >= not_before:
+            reason = found.group(1)[:500]
+    return reason
 
 
 def revision(records):
@@ -96,6 +122,7 @@ class Console:
         self.switch_times = json.loads(history.read_text()) if history.exists() else {}
         self.samples, self.cache, self.cache_at = {}, None, 0
         self.last_boot = None
+        self.watch_interval = 5  # seconds between supervisor log reads while a switch waits for health
 
     def close(self):
         self.pool.shutdown(wait=True)
@@ -307,19 +334,30 @@ class Console:
         timeout = getattr(config, "timeout", None) if config is not None else None
         return float(timeout) if timeout else 900.0
 
-    def _watch_download(self, model, stop):
+    def _watch_boot(self, model, stop, abort, failure, since, download):
+        """While a switch waits for health: log fetch-rate lines (a download), and stop the wait when the
+        head supervisor reports that the engine of this boot exited. The boxes then keep restarting it, and
+        the health wait would only run out its full timeout."""
         seen = set()
-        while not stop.wait(5):
+        while not stop.wait(self.watch_interval):
             controls = self.models.get(model, {}).get("controls") or []
             if not controls:
                 continue
             target = controls[0]
             try:
                 data = self.call(target["host"], int(target.get("port", 7340)),
-                                 {"t": "logs", "which": "supervisor", "offset": -8192}).get("data") or ""
+                                 {"t": "logs", "which": "supervisor", "offset": -WATCH_WINDOW}).get("data") or ""
             except (OSError, ValueError, TypeError):
                 continue
-            for line in data.splitlines():
+            if not isinstance(data, str):
+                continue
+            reason = boot_failure(data, since - BOOT_SLACK)
+            if reason:
+                failure.append(reason)
+                self._emit("Boot failed: " + reason)
+                abort.set()
+                return
+            for line in data.splitlines() if download else ():
                 if "MB/s" not in line or line in seen:
                     continue
                 seen.add(line)
@@ -386,24 +424,25 @@ class Console:
                 self._emit("Stopping target on every configured box")
                 self.control.stop(model, self._emit)
             if action in ("switch", "restart"):
-                stop_watch = threading.Event()
-                watcher = None
+                stop_watch, abort, failure = threading.Event(), threading.Event(), []
+                since = time.time()
                 if download:
                     self._emit("downloading " + download["text"])
                     self._emit(f"health wait extended to {download['health']:.0f}s for the download")
-                    watcher = threading.Thread(target=self._watch_download, args=(model, stop_watch), daemon=True)
-                    watcher.start()
                 elif notice:
                     self._emit(notice)
+                watcher = threading.Thread(target=self._watch_boot, args=(model, stop_watch, abort, failure, since, bool(download)), daemon=True)
+                watcher.start()
                 try:
-                    if download:
-                        self.control.activate(model, self._emit, health_timeout=download["health"])
-                    else:
-                        self.control.activate(model, self._emit)
+                    self.control.activate(model, self._emit, health_timeout=download["health"] if download else None, abort=abort)
+                except Exception:
+                    if failure:
+                        raise RuntimeError(f"Boot failed: {failure[0]}. The boxes may keep restarting the engine; "
+                                           "inspect them before you try again.") from None
+                    raise
                 finally:
-                    if watcher:
-                        stop_watch.set()
-                        watcher.join(5)
+                    stop_watch.set()
+                    watcher.join(5)
                 # CLI checks ready; also ensure the endpoint is serving the selected identity.
                 row = self.models[model]
                 models = json.loads(self.get(row["head_url"] + "/v1/models"))

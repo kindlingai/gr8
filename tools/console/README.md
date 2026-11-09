@@ -127,6 +127,18 @@ no rate was measured. **Restart now** confirms a missing download. The
 `gr8 switch` health wait becomes that extended wait, and the operation
 log reports `downloading`.
 
+While `gr8 switch` waits for health, on every switch or restart, the console
+reads the head supervisor log every 5 seconds. When the engine of this boot
+exits (a line such as `rank 1 (...) failed: engine exited (2): ...`, or the
+head's own engine, front end, or shim exit), the console ends the wait at
+once, stops the `gr8 switch` command, and fails the operation. The job error
+and the progress steps carry the supervisor's reason. It does not wait for a
+later retry: the supervisor stops the whole cluster on the first exit, and
+the boxes may keep restarting the engine, so inspect them before you try
+again. A failure line counts only when the boot's `engine started (epoch E)`
+line is not older than this operation (30 seconds of clock difference
+allowed), so lines left by an earlier boot never stop a new one.
+
 Every preset removes the keys it lists. On GLM-5.3 the three presets are exclusive: Quality
 removes `KV_FORMAT`, Context removes `VARIANT`, and Speed removes both.
 Unset `TUNE` on DeepSeek or GLM-5.3-Flash is Speed, the recipe default.

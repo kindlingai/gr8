@@ -5,6 +5,7 @@ from pathlib import Path
 import socket
 import sys
 import threading
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 import uvicorn
@@ -148,6 +149,19 @@ def run(output):
             page.screenshot(path=str(output / "failure-390.png"), full_page=True)
             fixture.fail_boot = False
             print("PASS failed boot remains failed, not success")
+
+            reason = "rank 1 (box2.example) failed: engine exited (2): g6: rank 1: 7.1 GiB left after the weights; lower --cap"
+            console.watch_interval = 0.1
+            fixture.activate_wait = 60
+            fixture.supervisor_log = (f"12:00:01 engine started (epoch {int(time.time())}); waiting for it to load (up to 1800s)\n"
+                                      f"12:01:09 {reason}\n")
+            row.get_by_role("button", name="Switch", exact=True).click()
+            page.get_by_role("button", name="Switch now", exact=True).click()
+            expect(page.get_by_label("Operation status")).to_contain_text("failed", timeout=15000)
+            expect(page.get_by_label("Operation status")).to_contain_text("Boot failed: " + reason)
+            page.screenshot(path=str(output / "boot-failed-390.png"), full_page=True)
+            fixture.activate_wait, fixture.supervisor_log = 0, ""
+            print("PASS engine exit ends the health wait at once and shows the supervisor reason")
 
             row.get_by_role("button", name="Switch", exact=True).click()
             page.get_by_role("button", name="Switch now", exact=True).click()

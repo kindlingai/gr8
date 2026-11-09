@@ -122,7 +122,23 @@ class ComposeControl:
         actions = {box: [(model, "down")] for box in self.config.models[model].boxes}
         self.module.phase(self.config, actions, emit=emit)
 
-    def activate(self, model, emit, health_timeout=None):
+    @staticmethod
+    def _end(process, reader, gently):
+        """Stop the switch command and its children. gently: SIGTERM first, SIGKILL after 10 s."""
+        for sig, wait in (((signal.SIGTERM, 10),) if gently else ()) + ((signal.SIGKILL, None),):
+            try:
+                os.killpg(process.pid, sig)
+            except ProcessLookupError:
+                break
+            try:
+                process.wait(timeout=wait)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+        reader.join(5)
+
+    def activate(self, model, emit, health_timeout=None, abort=None):
+        """Run gr8 switch. abort, a threading.Event, ends it early when set (the caller saw the engine fail)."""
         self.ensure_config()
         # Its exit status includes all-box start AND ready:true. Never claim ready from `up -d` alone.
         emit("gr8 switch: stop other deployments, start target, wait for health")
@@ -145,13 +161,19 @@ class ComposeControl:
                     emit(line.rstrip())
             reader = threading.Thread(target=read_lines, daemon=True)
             reader.start()
-            try:
-                code = process.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-                reader.join(5)
-                raise RuntimeError("switch command timed out; inspect remote deployment state")
+            end = time.monotonic() + timeout
+            while True:
+                try:
+                    code = process.wait(timeout=1)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if abort is not None and abort.is_set():
+                    self._end(process, reader, True)
+                    raise RuntimeError("switch command stopped: the engine failed to boot")
+                if time.monotonic() >= end:
+                    self._end(process, reader, False)
+                    raise RuntimeError("switch command timed out; inspect remote deployment state")
             reader.join(5)
             if code:
                 raise RuntimeError(f"switch exited {code}: {''.join(tail)[-8192:]}")

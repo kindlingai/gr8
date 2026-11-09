@@ -25,6 +25,8 @@ class Fixture:
         self.last_health_timeout = None
         self.refuse_supervisor = False
         self.not_ready = False
+        self.supervisor_log = ""
+        self.activate_wait = 0
         self.calls = []
         self.texts = {m: {f"box-{i}": "# fixture dotenv\nSESS=4\nEXTRA_ENV='KEEP_ME=1'\n"
                           for i in range(2 if m == "glm53f" else 4)} for m in DEFAULT_IDS}
@@ -92,7 +94,7 @@ class Fixture:
             return {"t": "status", "rank": 0, "state": "serving" if self.active else "stopped",
                     "mem_gib": 20, "engine": bool(self.active), "model_id": self.active}
         if message["t"] == "logs":
-            return {"t": "log", "data": "SYNTHETIC FIXTURE · not live measurements\nhealth ready · all ranks joined\n", "offset": 100}
+            return {"t": "log", "data": "SYNTHETIC FIXTURE · not live measurements\nhealth ready · all ranks joined\n" + self.supervisor_log, "offset": 100}
         raise ValueError("unknown RPC")
 
     def read_all(self, model):
@@ -126,11 +128,14 @@ class Fixture:
         return {"state": "missing", "present": False, "size_gb": spec.get("size_gb"),
                 "rate_mb_s": spec.get("rate_mb_s"), "unchecked": []}
 
-    def activate(self, model, emit, health_timeout=None):
+    def activate(self, model, emit, health_timeout=None, abort=None):
         self.calls.append(("switch", model, health_timeout))
         self.last_health_timeout = health_timeout
         if self.fail_boot:
             raise RuntimeError("fixture readiness timeout")
+        # A switch that is still waiting for health; the console ends it when it sees the engine fail.
+        if self.activate_wait and abort is not None and abort.wait(self.activate_wait):
+            raise RuntimeError("switch command stopped: the engine failed to boot")
         self.active = model
         emit("fixture: gr8 switch completed; health ready")
 
