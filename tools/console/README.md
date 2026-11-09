@@ -1,7 +1,7 @@
 # gr8 console
 
 A small FastAPI + SvelteKit console, separate from the engine so it stays up
-while models restart. One compact Pulsar Nightfall page: stats, three presets,
+while models restart. One compact dark-theme page: stats, three presets,
 boxes, the head log, and the models table. No inference traffic is generated
 by the console.
 
