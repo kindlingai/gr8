@@ -43,9 +43,10 @@ once · recipes coming soon. Until then, start it on three to six boxes with Doc
 
 [![DeepSeek-V4.1-Flash on four GB10s in fast mode: decode, prefill and concurrency](docs/cards/deepseek-v4.1-flash-exlr8-4x-spark.png)](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)
 
-142.9 tok/s for one request writing code · 3,655 tok/s prefill on an 8K prompt · 32 requests at once (the recipe's
-setting) · fast mode by default (`TUNE=speed`), so the output is not identical to the exact model's; `TUNE=quality`
-gives the exact model's output · booted on four boxes from the recipe's image: ready in 104 s
+{{DEC1_SHORT}} tok/s for one request ({{SHORT_PROMPT}}-token prompt) · {{PF_32K}} tok/s prefill on a 32K prompt ·
+{{AGG_32}} tok/s in total for 32 requests at once (the recipe's setting) · fast mode by default (`TUNE=speed`), so the
+output is not identical to the exact model's; `TUNE=quality` gives the exact model's output · booted on four boxes from
+the recipe's image: ready in {{BOOT_S}} s
 
 **[Recipe](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)** · [Model page](docs/DEEPSEEK.md)
 
