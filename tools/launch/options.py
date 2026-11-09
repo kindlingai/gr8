@@ -472,8 +472,9 @@ def validate(o):
                           f'./gr8 {model.name} serves another model')
     if o.get('GRAMMAR') not in ('0', '1'):
         raise OptionError(f'--grammar {o.get("GRAMMAR")}: want 0 or 1')
-    if o.get('ALLOW_THINKING_OFF') not in ('0', '1'):
-        raise OptionError(f'--allow-thinking-off {o.get("ALLOW_THINKING_OFF")}: want 0 or 1')
+    for k in ('ALLOW_THINKING_OFF', 'CLAMP_MAX_TOKENS'):
+        if o.get(k) not in ('0', '1'):
+            raise OptionError(f'--{k.lower().replace("_", "-")} {o.get(k)}: want 0 or 1')
     if o.get('UNDECLARED_TOOL_CALLS') not in ('text', 'emit'):
         raise OptionError(f'--undeclared-tool-calls {o.get("UNDECLARED_TOOL_CALLS")}: want text or emit')
     for k in ('DEFAULT_PRESENCE_PENALTY', 'DEFAULT_FREQUENCY_PENALTY'):

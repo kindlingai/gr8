@@ -225,6 +225,8 @@ class ValidateTests(unittest.TestCase):
         self.assertEqual((o.get('TOOL_REPEAT_GUARD'), o.get('TOOL_REPEAT_GUARD_REPEATS'), o.get('TOOL_REPEAT_GUARD_TEMPERATURE'),
                           o.get('TOOL_REPEAT_GUARD_RETRIES')), ('1', '2', '0.7', '3'))
         self.check(['--peers', PEERS, '--allow-thinking-off', 'yes'], 'want 0 or 1')
+        self.check(['--peers', PEERS, '--clamp-max-tokens', 'on'], '--clamp-max-tokens on: want 0 or 1')
+        self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('CLAMP_MAX_TOKENS'), '0')
         self.check(['--peers', PEERS, '--undeclared-tool-calls', 'on'], 'want text or emit')
         self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('UNDECLARED_TOOL_CALLS'), 'text')
         self.check(['--peers', PEERS, '--grammar', '2'], 'want 0 or 1')
