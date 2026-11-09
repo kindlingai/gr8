@@ -12,43 +12,56 @@ the DeepSeek dialect (DSML tool calls, numeric reasoning effort). It serves text
 
 Fast mode, the default of the Docker recipe
 [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark) (`TUNE=speed`):
-gr8 `main` at [`0015fd0`](https://github.com/kindlingai/gr8/commit/0015fd04512ebc38e369475a1ce7dee76d445d77), engine
-built with `DS41_MX=48`, Engram on, 32 chat slots, `CAP` 327,680, the recipe's release settings (its `knobs.sh`). Two
-sets of four GB10 boxes, each set cabled in a ring, on 2026-11-08: set A for prefill and one-stream decode, set B for
-many streams. Fast mode's output is not bit-identical to the exact model's: the same prompt can get a different reply.
+the recipe's published image `sha-7c2088a` (gr8 `main` at
+[`43cad38`](https://github.com/kindlingai/gr8/commit/43cad388ec8b7026b4feed2190fc5ce5a90c0c6d), engine built with
+`DS41_MX=48`), Engram on, 32 chat slots, `CAP` 327,680, the recipe's release settings (its `knobs.sh`), on four GB10
+boxes cabled in a ring (set A), on 2026-11-09. Rows and columns marked "release 1 settings" are older numbers: gr8
+`0015fd0` and the recipe's settings before this release, on 2026-11-08. The decode right after each prefill is from set
+A; the many-stream rows are from a second set of four GB10 boxes (set B). Fast mode's
+output is not bit-identical to the exact model's: the same prompt can get a different reply.
 
 Prefill, cold prompt (set A):
 
-| prompt | runs | first token | prefill tok/s | decode tok/s after it, same request |
+| prompt | runs | first token | prefill tok/s | decode tok/s after it, same request (release 1 settings) |
 |---|---|---|---|---|
-| 32K tokens | 16 | 4.12 s | 7,950 | 103.5 |
-| 128K tokens | 8 | 16.6 s | 7,887 | 98.2 |
-| 256K tokens | 2 | 34.7 s | 7,548 | 101.0 |
+| 32K tokens | 8 | 4.19 s | 7,835 | 103.5 |
+| 128K tokens | 4 | 16.5 s | 7,940 | 98.2 |
+| 256K tokens | 4 | 34.5 s | 7,590 | 101.0 |
 
-One-stream decode on short prompts (64-72 tokens, up to 512 tokens out; set A, two series of 6 runs each):
+One-stream decode on short prompts (65-72 tokens, up to 512 tokens out; set A, two series of 6 runs each):
 
 | work | code | prose | structured | counting |
 |---|---|---|---|---|
-| tok/s | 143.5-145.0 | 83.4-86.0 | 160.4-160.9 | 162.1-162.4 |
+| tok/s | 142.8-144.2 | 83.3-85.8 | 159.7-160.1 | 161.5-162.2 |
 
-Many streams at once (set B, short mixed prompts, up to 512 tokens out per stream):
+Many streams at once (short mixed prompts, up to 512 tokens out per stream):
 
 | streams | 8 | 16 | 32 |
 |---|---|---|---|
-| total decode tok/s | 200.3 | 221.3 | 226.4 |
-| first token, median | 2.5-2.7 s | 6.2-6.4 s | 14.2-14.6 s |
+| total decode tok/s (set A, prompts 62-76 tokens) | 217.4 | 249.2 | 242.8 |
+| first token, median (set A) | 1.39 s | 2.48 s | 5.04 s |
+| total decode tok/s (set B, release 1 settings) | 200.3 | 221.3 | 226.4 |
+| first token, median (set B, release 1 settings) | 2.5-2.7 s | 6.2-6.4 s | 14.2-14.6 s |
 
-At 32 streams the requests wait for prefill slots, so the first token comes later as the queue grows. The longest
-prompt we measured with `TUNE=speed` is 262,219 tokens; `CAP` allows 327,680. `TUNE=context` (16 chat slots, `CAP`
-1,048,576, not the release settings) prefilled a 1,000,660-token prompt at 2,689 tok/s (two runs, first token in
-372 s).
+Sixteen streams in a closed loop (each stream sends its next request when its last one ends; prompts 61-78 tokens, up
+to 256 tokens out, 180 s window; set A): 236.0 tok/s total, first token median 1.47 s.
+
+The release settings `GR8_S2_ADMIT_HOLD=1` and `GR8_S2_TAIL_FIRST=1` ([ENV.md](ENV.md)) bring the first token sooner
+when many requests arrive at once: at 16 streams the median went from 5.96 s on the release 1 image to 2.48 s, on the
+same boxes on the same day. At 32 streams the requests still wait for prefill slots, so the first token comes later as
+the queue grows. The longest prompt we measured with `TUNE=speed` is 262,420 tokens; `CAP` allows 327,680.
+`TUNE=context` (16 chat slots, `CAP` 1,048,576, not the release settings) prefilled a 1,000,660-token prompt at 2,689
+tok/s (two runs, first token in 372 s).
 
 ### How we measure
 
-- gr8's own benchmark (`bench/bench.py`) against the running server, with the recipe's settings. These runs used an
-  image with the engine built from `0015fd0`. A check run of the recipe's published image `sha-ad3efdf` on set B
-  (2026-11-09) was within 2.1% of the same build's 32K prefill and many-stream numbers on set B, and scored 73
-  of 75.
+- gr8's own benchmark (`bench/bench.py`) against the running server, with the recipe's settings. For the set A rows
+  we used `bench.py` with the prompt-length output and the closed-loop mode of PR #471.
+- The set A rows used the recipe's published image `sha-7c2088a` on one boot, between two boots of the release 1
+  image `sha-ad3efdf` on the same boxes. No first-token, prefill, one-stream, many-stream or closed-loop number of the
+  new image was more than 1% worse than the mean of the two release 1 boots. The "decode after it"
+  column is not from this image: it keeps the release 1 numbers (gr8 `0015fd0`, set A, 2026-11-08; 16, 8 and 2 runs).
+- The rows marked "release 1 settings" used an image with the engine built from `0015fd0`.
 - No tracing or per-stage timing on the measured requests.
 - A number that compares two settings comes from paired runs: both settings on the same boxes, each on a fresh boot,
   in both orders.
@@ -95,7 +108,8 @@ image on all four boxes, in fast mode. On every box, fetch the release (510.6 GB
 Its README has the commands (`docker run` or Docker Compose), the cabling and the settings, and shows how to get the
 exact model instead. We booted the recipe's image `sha-ad3efdf` on four boxes on 2026-11-09 (first boot, cold disk,
 212.7 s to `serving:`, a switch from GLM-5.3 after that 37-39 s, a chat answered after each boot, 73 of 75 on the
-75-item check in fast mode): if a step fails, tell us.
+75-item check in fast mode). The current image `sha-7c2088a` started in 93.3 s from container recreate to the first chat
+answer, with the release already in the OS page cache, and scored 73 of 75. If a step fails, tell us.
 
 With gr8's own launcher, which gives exact output by default:
 

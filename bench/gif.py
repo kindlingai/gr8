@@ -397,7 +397,9 @@ def context_label(n):
 def card_rows(doc, c):
     """A config of a kindling.json as rows to draw, in theme color names. A row is ('title', text, right text),
     ('text', color, text), ('section', heading) or
-    ('bar', label, value, section maximum, value text, section). Only fields present show."""
+    ('bar', label, value, section maximum, value text, section). Only fields present show. Optional: a concurrency
+    entry's ttft_p50_s (median first token, seconds) and the config's decode_prompt_tokens and
+    concurrency_prompt_tokens ([min, max] prompt length) add to the bar text and the section headings."""
     nodes = c.get('nodes')
     right = ' · '.join(x for x in (c.get('label'), nodes and f"{nodes} node{'s' if nodes != 1 else ''}") if x)
     rows = [('title', ' · '.join(str(doc[k]) for k in ('title', 'variant') if doc.get(k)), right)]
@@ -413,17 +415,24 @@ def card_rows(doc, c):
             top = max(v for _, v, _ in items) or 1
             rows.extend(('bar', label, v, top, text, heading) for label, v, text in items)
 
+    def prompts(key):
+        r = c.get(key)
+        return f', prompts {r[0]}-{r[1]} tokens' if isinstance(r, list) and len(r) == 2 else ''
+
     dec = c.get('decode') or {}
-    bars('Decode · tok/s, one stream', [(w, v, num(v)) for w, v in dec.items() if isinstance(v, (int, float))])
+    bars('Decode · tok/s, one stream' + prompts('decode_prompt_tokens'),
+         [(w, v, num(v)) for w, v in dec.items() if isinstance(v, (int, float))])
     bars('Prefill · tok/s, cold prompt', [(context_label(x['context']), x['tps'], num(x['tps']))
                                           for x in c.get('prefill') or [] if 'tps' in x])
 
     def per_stream(x):
         v = next((x[k] for k in ('per_stream_tps', 'per_stream') if k in x), None)
-        return f'  {num(v)} each' if v is not None else ''
-    bars('Concurrency · total tok/s', [(f"{x['streams']} stream{'s' if x['streams'] != 1 else ''}",
-                                        x['aggregate_tps'], num(x['aggregate_tps']) + per_stream(x))
-                                       for x in c.get('concurrency') or [] if 'aggregate_tps' in x])
+        each = f'  {num(v)} each' if v is not None else ''
+        t = x.get('ttft_p50_s')
+        return each + (f'  first token {t:.2f} s' if isinstance(t, (int, float)) else '')
+    bars('Concurrency · total tok/s' + prompts('concurrency_prompt_tokens'),
+         [(f"{x['streams']} stream{'s' if x['streams'] != 1 else ''}", x['aggregate_tps'],
+           num(x['aggregate_tps']) + per_stream(x)) for x in c.get('concurrency') or [] if 'aggregate_tps' in x])
     limits = [f'{name} {num(c[k])}' for k, name in (('max_context', 'max context'), ('kv_pool_tokens', 'KV pool'),
                                                        ('max_concurrent', 'max concurrent')) if k in c]
     quality = [f"{q['name']}: {q['value']}" for q in c.get('quality') or [] if 'name' in q and 'value' in q]
