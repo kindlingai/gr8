@@ -105,7 +105,7 @@ class Console:
             fcntl.flock(self.instance, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             self.instance.close()
-            raise ValueError("one console process per state directory; use one server worker")
+            raise ValueError("one Kindling dash process per state directory; use one server worker")
         self.control, self.control_error = control, None
         if self.control is None and config.get("switch_file"):
             try:
@@ -138,7 +138,7 @@ class Console:
         if saved.exists():
             self.job = json.loads(saved.read_text())
             if self.job.get("status") == "running":
-                self.job.update(status="interrupted", error="Console stopped mid-operation. Inspect every box and saved dotenv backups before retrying.")
+                self.job.update(status="interrupted", error="Kindling dash stopped mid-operation. Inspect every box and saved dotenv backups before retrying.")
                 self._save_job()
         history = self.state / "switch-times.json"
         self.switch_times = json.loads(history.read_text()) if history.exists() else {}
@@ -311,7 +311,7 @@ class Console:
                 changes = presets.changes_for(model, preset)
             with self.lock:
                 if self.job and self.job["status"] == "running":
-                    raise RuntimeError("another console operation is running")
+                    raise RuntimeError("another Kindling dash operation is running")
                 prior = copy.deepcopy(self.job)
             if "expect_active" not in request:
                 raise ValueError("reviewed active model is required")

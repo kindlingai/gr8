@@ -43,7 +43,7 @@ class ComposeControl:
 
     def ensure_config(self):
         if self.file.read_bytes() != self.config_bytes:
-            raise ValueError("switch configuration changed; restart the console and review its targets")
+            raise ValueError("switch configuration changed; restart Kindling dash and review its targets")
 
     def _run(self, args, timeout, input=None):
         result = self.runner(args, input=input, text=True, stdout=subprocess.PIPE,

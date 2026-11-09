@@ -89,13 +89,13 @@
 
 {#if snapshot?.fixture}<div class="fixture">SYNTHETIC FIXTURE · not live model measurements · controls affect only the fake deployment</div>{/if}
 <header>
-  <div class="brand">GR<b>8</b></div>
+  <div class="brand">KINDLING <b>DASH</b></div>
   <div class="live"><span class="dot" class:off={!current || stale}></span><span class="hide-s" id="hstate">{stale ? 'disconnected' : current ? current.name + ' · ready' : 'no verified ready model'}</span></div>
 </header>
 <main>
   {#if error}<div class="notice error" role="alert">{error} {#if !stale}<button class="btn" onclick={() => error = ''}>Dismiss</button>{/if}</div>{/if}
   {#if snapshot?.error}<div class="notice warn" role="status">{snapshot.error}</div>{/if}
-  {#if snapshot && !snapshot.can_control}<div class="notice off">Read-only · {snapshot.control_error || 'control is disabled in console configuration'}</div>{/if}
+  {#if snapshot && !snapshot.can_control}<div class="notice off">Read-only · {snapshot.control_error || 'control is disabled in the Kindling dash configuration'}</div>{/if}
   {#if !snapshot}<p class="sub">Connecting to gr8…</p>{/if}
 
   {#if snapshot}
