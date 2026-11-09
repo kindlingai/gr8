@@ -1,7 +1,7 @@
-// C interface of the Rust S2 page allocator (engine/kvman-rs). Built as libg6kvman.a with cargo. g6m4 links it, and
+// C interface of the Rust S2 page allocator (engine/kvman-rs). Built into libg6host.a (engine/Cargo.toml). g6m4 links it, and
 // engine/runtime/s2/pool.h (RunPool) wraps it. See src/lib.rs for the allocation rules.
 // Calls that can fail return 0 or an error code, which g6kv_error names (the C++ pool's messages). An error leaves the
-// pool unchanged.
+// pool unchanged. Each call on a g6kv_pool locks it for that call, so two threads may call at once.
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -62,8 +62,9 @@ int g6kv_reserve(g6kv_pool* p, uint64_t rows, uint64_t worst, g6kv_run* out);
 // the pages would leave the pool unsafe
 int g6kv_grow(g6kv_pool* p, const g6kv_run* r, uint64_t rows, g6kv_run* out, int* granted);
 int g6kv_release(g6kv_pool* p, const g6kv_run* r);
-// a live run's pages in table order, valid until the next call that changes the pool, and whether it is exclusive
-int g6kv_list(const g6kv_pool* p, const g6kv_run* r, const uint32_t** pages, size_t* n, int* exclusive);
+// a live run's pages in table order, up to cap of them copied into pages (NULL with cap 0), n = the run's length (may
+// exceed cap), and whether it is exclusive
+int g6kv_list(const g6kv_pool* p, const g6kv_run* r, uint32_t* pages, size_t cap, size_t* n, int* exclusive);
 
 // prefix reuse on, with PrefixReuse's strict / noend / grid rules
 void g6kv_keep(g6kv_pool* p, int strict, int noend, int32_t grid);
@@ -82,9 +83,19 @@ int g6kv_match_namespaced(const g6kv_pool* p, const int32_t* prompt, size_t n, u
                           int32_t limit, const uint8_t* namespace_, size_t namespace_bytes, g6kv_hit* out);
 // from: -1 for a pool hit, else the tier of a stored one
 int g6kv_take(g6kv_pool* p, int32_t skip, uint64_t age, int32_t from, uint64_t rows, uint64_t worst, g6kv_run* out);
+// R per grant: the calls above at R = r rows (0 = the pool's R). With g6kv_window on, r may be a smaller multiple of 64.
+// Any other r gives -1 (exclusive_r), 0 (admissible_r, fits_r) or BadArgument
+int g6kv_exclusive_r(const g6kv_pool* p, uint64_t rows, uint32_t r);
+int g6kv_admissible_r(const g6kv_pool* p, uint64_t worst, uint32_t r);
+int g6kv_fits_r(const g6kv_pool* p, uint64_t rows, uint64_t worst, uint32_t r);
+int g6kv_reserve_r(g6kv_pool* p, uint64_t rows, uint64_t worst, uint32_t r, g6kv_run* out);
+int g6kv_match_r(const g6kv_pool* p, const int32_t* prompt, size_t n, uint64_t rows, uint64_t worst, int32_t limit,
+                 const uint8_t* namespace_, size_t namespace_bytes, uint32_t r, g6kv_hit* out);
+int g6kv_take_r(g6kv_pool* p, int32_t skip, uint64_t age, int32_t from, uint64_t rows, uint64_t worst, uint32_t r,
+                g6kv_run* out);
 
 uint64_t g6kv_digest(const g6kv_pool* p);
-// one stderr line per claim (g6m4: G6_POOL_LOG=1)
+// one stderr line per claim (g6m4: GR8_POOL_LOG=1)
 void g6kv_log(g6kv_pool* p, int on);
 uint32_t g6kv_kept_runs(const g6kv_pool* p);
 int g6kv_stats(const g6kv_pool* p, g6kv_totals* out);
@@ -96,9 +107,14 @@ size_t g6kv_runs(const g6kv_pool* p, g6kv_use* out, size_t cap);
 // flag order. Each reserve, take, grow or retain may queue copies. The engine takes the copies (g6kv_io_take), runs
 // them in order before anything writes those pages, then calls g6kv_io_done. Until then reserve, take and grow fail.
 void g6kv_stores(g6kv_pool* p, uint32_t shared_after);
-// keep: 0 = evicted runs, 1 = shared prefixes, 2 = both. index_dir (or NULL): the tier's shared prefixes survive
+// keep: 0 = evicted runs, 1 = shared prefixes, 2 = both; + 4 = the index records every entry (evicted runs too, so a
+// quit that stores the pool brings sessions back). index_dir (or NULL): the tier's shared prefixes survive
 // restarts while `compat` stays the same. 0, or -1 with g6kv_tier_error.
 int g6kv_add_tier(g6kv_pool* p, uint64_t slots, int32_t keep, const char* index_dir, const char* compat);
+// after the last g6kv_add_tier: an index run waits (slots held) for a base a later tier may bring back; this drops
+// the runs whose base came back in no tier, records and all. Returns how many. + 4 needs index_dir: without it the
+// tier keeps a prefixes-only index
+uint64_t g6kv_tiers_loaded(g6kv_pool* p);
 // at admission, before the grant, on every rank: counts the prompt toward its prefixes and returns how many
 // span: the prompt's system span in tokens (the system message and tool definitions as templated), or -1 when the
 // front end sent none
@@ -162,18 +178,28 @@ struct g6kv_tier_totals
     uint64_t full;                       // times the tier had to make room
     uint64_t block_bytes;
     int64_t credit;                      // write limit credit left, blocks (0 without a limit)
+    uint64_t oversize, oversize_last;    // entries bigger than the whole tier, and the last one's pages
 };
 // tier t's counters, or an error when there is no such tier
 int g6kv_tier_stats(const g6kv_pool* p, uint32_t t, g6kv_tier_totals* out);
 // writes into buf the entries loaded from indexes, one line each. The ranks compare these lines at boot. Returns the
 // length of the whole text plus its NUL.
 size_t g6kv_stored_summary(const g6kv_pool* p, char* buf, size_t cap);
+// A tier whose store is a group lease on a KV node (g6kv_tier_open_group) changes size at a point every rank sees:
+// grow = g6kv_store_grow, then g6kv_tier_resize to its blocks, then run the copies; shrink = g6kv_tier_resize to the
+// kept segments' blocks, run the copies (g6kv_io_take, g6kv_io_done), then g6kv_store_shrink. resized = 0: the tier
+// refuses (an indexed tier, or entries it may not evict).
+int g6kv_tier_resize(g6kv_pool* p, uint32_t t, uint64_t slots, int32_t* resized);
+// the ages in ms of tier t's coldest blocks, one per per_seg blocks, coldest first (what a head reports). Returns how
+// many it wrote, at most cap.
+size_t g6kv_tier_coldest(g6kv_pool* p, uint32_t t, uint64_t per_seg, uint64_t* out, size_t cap);
 // keeps the entries the agreed text lists (the head's intersection of every rank's summary), in its order
 void g6kv_keep_agreed(g6kv_pool* p, const char* agreed);
 
 // A block store for those copies (src/blocks.rs): "ssd:PATH", "remote:HOST:PORT" (a lease named `name` on a KV node,
-// kvman-remote) or "mem:". Blocks are block_bytes rounded up to 4 KiB (g6kv_tier_block_bytes), and every read and
-// write moves one whole block. Calls return 0, or -1 with the reason in g6kv_tier_error (this thread's last).
+// kvman-remote) or "mem:", any of them behind "ram:FLOOR+" (a RAM cache the kernel may take back, src/ram.rs).
+// Blocks are block_bytes rounded up to 4 KiB (g6kv_tier_block_bytes), and every read and write moves one whole block.
+// Calls return 0, or -1 with the reason in g6kv_tier_error (this thread's last).
 struct g6kv_tier;
 int g6kv_tier_open(const char* spec, const char* name, uint64_t block_bytes, uint64_t blocks, g6kv_tier** out);
 void g6kv_tier_free(g6kv_tier* t);
@@ -187,7 +213,10 @@ int g6kv_tier_write_many(const g6kv_tier* t, size_t n, const uint64_t* blocks, v
 int g6kv_tier_read_many(const g6kv_tier* t, size_t n, const uint64_t* blocks, void* const* bufs);
 // staging memory a KV node's RDMA device may read and write directly (a no-op for the other stores)
 int g6kv_tier_register(const g6kv_tier* t, void* buf, size_t len);
-// Remote attention rows (src/rows.rs, the engine's G6_RT_STORE tier): a store of `bytes` ("mem:" or "remote:HOST:PORT",
+// a RAM cache's counters ("ram:FLOOR+STORE"): out[0] reads from RAM, out[1] reads that went to the store, out[2]
+// writes not cached for lack of free memory. 0, or -1 for a store without a RAM cache.
+int g6kv_tier_ram_stats(const g6kv_tier* t, uint64_t* out);
+// Remote attention rows (src/rows.rs, the engine's GR8_RT_STORE tier): a store of `bytes` ("mem:" or "remote:HOST:PORT",
 // a lease named `name`), and a helper thread that serves each group's request ring. Its first G6KV_ROWS_HEADER bytes
 // hold the layout the records were written under: open writes `layout` into an empty store and refuses a store that
 // names another one. The GPU fills a ring's entries, then stores seq (system-scope release); the thread reads each
@@ -202,12 +231,21 @@ struct g6kv_rows_req { uint64_t seq; uint32_t n, pad; };   // cap g6kv_rows_ent 
 // runs: the most window runs live at once (0 = no limit): the engine's slot pool covers that many sessions past R
 int g6kv_window(g6kv_pool* p, uint32_t pages, uint32_t ids, uint32_t runs);
 uint32_t g6kv_window_runs(const g6kv_pool* p);
+// (pool) the window runs live now at R = r rows (0 = the pool's R)
+uint32_t g6kv_window_runs_r(const g6kv_pool* p, uint32_t r);
+// (pool) a live window run takes the smaller R = r2 rows: its pages between the Rs leave its prefix and join its tail
+// (fresh pages above place hold the drafter's copy of them). shrinkable: whether it can (a larger R now, and room)
+int g6kv_shrinkable(const g6kv_pool* p, const g6kv_run* r, uint32_t r2);
+int g6kv_shrink_run(g6kv_pool* p, const g6kv_run* r, uint32_t r2, g6kv_run* out);
 // (pool) whether a retained run holds exactly these pages (a window run's records live while it does)
 int g6kv_is_kept(const g6kv_pool* p, const uint32_t* pages, size_t n);
 // (pool) a window request of `worst` rows with a record limit: 1 and {records per rank it needs, free, in all} in out
 int g6kv_ids_view(const g6kv_pool* p, uint64_t worst, uint64_t* out);
 // (pool) a request of `worst` rows past R: 1 and {pages below place, pages above, free below, free above} in out
 int g6kv_split_view(const g6kv_pool* p, uint64_t worst, uint64_t* out);
+// (pool) the two views for a grant at R = r rows (0 = the pool's R): 0 for an R the pool refuses
+int g6kv_ids_view_r(const g6kv_pool* p, uint64_t worst, uint32_t r, uint64_t* out);
+int g6kv_split_view_r(const g6kv_pool* p, uint64_t worst, uint32_t r, uint64_t* out);
 int g6kv_rows_open(const char* spec, const char* name, const char* layout, uint64_t bytes, g6kv_rows** out);
 void g6kv_rows_free(g6kv_rows* r);
 int g6kv_rows_write(const g6kv_rows* r, uint64_t off, const void* buf, size_t len);
@@ -223,6 +261,29 @@ int g6kv_rows_group(g6kv_rows* r, g6kv_rows_req* req, uint64_t* done, void* slot
 void g6kv_rows_start(g6kv_rows* r);
 uint64_t g6kv_rows_fetched(const g6kv_rows* r);
 void g6kv_rows_describe(const g6kv_rows* r, char* buf, size_t cap);
+// This rank's lease in a group on a KV node (spec remote:HOST:PORT): clusters share the node and capacity moves
+// between them by whole segments. Every rank of a cluster gives the same group, nr, floor, cap and weight (1000 = 1x,
+// 0 = 1000). The lease starts at the floor.
+int g6kv_tier_open_group(const char* spec, const char* name, const char* group, uint32_t nr, uint32_t rank,
+                         uint64_t floor_bytes, uint64_t cap_bytes, uint32_t weight, uint64_t block_bytes, g6kv_tier** out);
+uint64_t g6kv_store_blocks(const g6kv_tier* t);
+// a group lease's blocks per segment and segments now; 0 for any other store
+uint64_t g6kv_store_seg_blocks(const g6kv_tier* t);
+uint64_t g6kv_store_segs(const g6kv_tier* t);
+// the node's answer to a report, in segments per rank: every rank grows by grant, or shrinks by give, under txn
+struct g6kv_report
+{
+    uint64_t grant, give, unclaimed;
+    uint64_t txn;   // the transaction every rank names in g6kv_store_grow / g6kv_store_shrink; 0 = nothing to do
+};
+// rank 0 only: want = segments more per rank (0 = none), ages = g6kv_tier_coldest's
+int g6kv_store_report(const g6kv_tier* t, uint64_t want, const uint64_t* ages, size_t n, g6kv_report* out);
+// grow to segs segments / shrink to segs segments, under the report's transaction txn; the store's blocks after it in
+// *blocks (or NULL). 0; G6KV_STORE_REFUSED: the node refused (a transaction no longer open, or no room), every rank
+// alike, and the store keeps its size; -1 with g6kv_tier_error: a fault
+#define G6KV_STORE_REFUSED 1
+int g6kv_store_grow(const g6kv_tier* t, uint64_t segs, uint64_t txn, uint64_t* blocks);
+int g6kv_store_shrink(const g6kv_tier* t, uint64_t segs, uint64_t txn, uint64_t* blocks);
 // A session's KV in a form independent of the layout (src/canon.rs, #152): per binding and token, in order, the MLA
 // latent row and, on full-index layers, the indexer key row (128 codes, then its FP32 scale). Host memory only: the
 // caller copies the pages between the device and the buffers. flags[b]: 1 = binding b has index keys, 2 = its cache is
@@ -243,4 +304,14 @@ int g6kv_canon_import(const uint8_t* blob, size_t n, uint32_t mla_row, uint32_t 
                       uint32_t below_rows, const uint32_t* list, size_t n_list, uint32_t place, uint32_t rank,
                       uint8_t* const* mla, const size_t* mla_bytes, uint8_t* const* idx, const size_t* idx_bytes,
                       uint64_t* written);
+// The host ledger of a box a Flash rank shares with a KV node (src/ledger.rs, kvman-ledger): bytes move between the
+// GPU (side 0), the node (1) and free (2) as one transfer at a time, begin -> released (the giver let go) -> commit
+// (the taker holds them) or abort. Each call is one locked, durable step. 0, or -1 with g6kv_tier_error.
+int g6kv_ledger_begin(const char* path, uint32_t from, uint32_t to, uint64_t bytes, uint64_t* gen);
+int g6kv_ledger_released(const char* path, uint64_t gen, uint64_t bytes);
+int g6kv_ledger_commit(const char* path, uint64_t gen, uint64_t bytes);
+int g6kv_ledger_abort(const char* path, uint64_t gen);
+// out[0..6]: gen, total, gpu, node, free, floor; out[6..9]: the pending transfer's gen (0: none), phase (1 begun,
+// 2 released), bytes
+int g6kv_ledger_show(const char* path, uint64_t* out);
 }

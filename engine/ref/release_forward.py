@@ -1,7 +1,7 @@
 """m4sim from the exlr8 release (--v2-dense) against a PyTorch forward of the same weights: Hugging Face's GlmMoeDsa
 model, cut to the first --layers layers, in fp32, with every matrix set to the values the engine's decode path reads.
 
-    G6_CP=0 G6_RESID_DUMP=resid.bin G6_LOGIT_DUMP=logits.bin m4sim --v2 .. --v2-dense REL --layers 0,1,2,3 --gen 12 \
+    G6_CP=0 GR8_RESID_DUMP=resid.bin GR8_LOGIT_DUMP=logits.bin m4sim --v2 .. --v2-dense REL --layers 0,1,2,3 --gen 12 \
         --temp 0 > out.txt
     python3 engine/ref/release_forward.py --release REL --widths FILE --ref EXLR8_REPO --layers 4 --form rounded \
         --m4 out.txt --resid resid.bin --logits logits.bin
@@ -49,7 +49,7 @@ def int4_values(w):
 
 
 def read_steps(path, per_rank=False):
-    """G6_RESID_DUMP / G6_LOGIT_DUMP records, rows of every step in order."""
+    """GR8_RESID_DUMP / GR8_LOGIT_DUMP records, rows of every step in order."""
     out = []
     with open(path, 'rb') as f:
         while True:

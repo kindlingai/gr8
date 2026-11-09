@@ -1,4 +1,4 @@
-"""Check a Flash m4sim G6_RESID_DUMP against the layers 0-3 prompt goldens.
+"""Check a Flash m4sim GR8_RESID_DUMP against the layers 0-3 prompt goldens.
 
 Run m4sim with exactly the golden metadata's tokens, --gen 0 and --layers 0,1,2,3.
 Pass --layer3 for matching exlr8 expert weights (for example layer3-K4.safetensors).

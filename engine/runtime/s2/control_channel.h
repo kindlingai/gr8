@@ -1,168 +1,106 @@
 // Persistent event-only host links, used by a native adapter with connected TCP
 // sockets. CPU tests use connected local sockets. No socket activity per round.
+// The channels are Rust (engine/scheduler-rs src/control/channel.rs): these classes are facades over one handle, and
+// the ControlIO links they are given must outlive them. A callback's exception (the digest, room, make_commit,
+// on_quit) fails the epoch and is rethrown here once the Rust returns.
 #pragma once
 #include "control_io.h"
 #include "control_protocol.h"
+#include <chrono>
 #include <functional>
 #include <map>
+#include <utility>
 
 namespace g6s2 {
+// wall clock in microseconds, for GR8_S2_EVENTLOG lines only (comparable across ranks up to their clock skew)
+inline long long wall_us() {
+    return (long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
 // Shared event latch: computation only takes a mutex after before_work says due.
 // A caller MUST apply the returned commit, then applied(); exceptions fail epoch.
 class EventEndpoint {
 protected:
-    EventGate gate_;
-    std::mutex mu_;std::condition_variable cv_;
-    std::optional<Notice> notice_;
-    std::optional<Commit> commit_;
-    std::optional<Ack> ack_;
-    bool failed_=false;
-    void install(const Notice& n) {
-        std::unique_lock<std::mutex> l(mu_);
-        cv_.wait(l,[&]{return !notice_ || failed_;});
-        require(!failed_,"control epoch failed");
-        gate_.announce(n);notice_=n;commit_.reset();ack_.reset();cv_.notify_all();
-    }
-    void deliver(const EventCommit& e) {
-        std::lock_guard<std::mutex> l(mu_);
-        require(!failed_ && notice_ && *notice_==e.notice,"unexpected event commit");match(e);
-        commit_=e.commit;gate_.commit(e.notice);
-    }
-    virtual void send_ack(const Ack&)=0;
+    struct Free { void operator()(g6ctl_endpoint* e) const { g6ctl_endpoint_free(e); } };
+    std::unique_ptr<g6ctl_endpoint, Free> h_;
+    explicit EventEndpoint(g6ctl_endpoint* h) : h_(h) { if (!h_) throw std::runtime_error(g6ctl_error()); }
 public:
-    EventEndpoint(uint64_t epoch,unsigned rank):gate_(epoch,rank){}
-    virtual ~EventEndpoint()=default;
-    virtual void fail() {
-        {std::lock_guard<std::mutex> l(mu_);failed_=true;}
-        gate_.fail();cv_.notify_all();
-    }
+    // optional, set before the first event: this rank's room for its ACKs (Ack::room), read on the compute thread
+    std::function<uint32_t()> room;
+    virtual ~EventEndpoint() = default;
+    EventEndpoint(const EventEndpoint&) = delete;
+    EventEndpoint& operator=(const EventEndpoint&) = delete;
+    void fail() { g6ctl_fail(h_.get()); }
+    // the Rust endpoint, for the service's control thread (it outlives no facade)
+    const g6ctl_endpoint* handle() const { return h_.get(); }
     // No digest, lock, allocation or I/O if no event is due. Call before departing
     // a LIVE boundary. Idle engines use wait_notice() instead of departing it.
     template<class Digest> std::optional<Commit> boundary(uint64_t b,Digest&& digest) {
-        try {
-            if(!gate_.before_work(b))return {};
-            auto a=gate_.arrive(b,digest());send_ack(a);gate_.wait_commit();
-            std::lock_guard<std::mutex> l(mu_);require(commit_.has_value(),"missing commit payload");return commit_;
-        }catch(...){fail();throw;}
+        struct Ctx { Digest& digest; const std::function<uint32_t()>& room; std::exception_ptr err; } ctx{digest, room, nullptr};
+        auto fn = [](void* p, uint64_t* d, uint32_t* r) -> int32_t {
+            auto& c = *static_cast<Ctx*>(p);
+            // digest before room: both only read the engine (flash_room), so the order does not matter today
+            try { *d = c.digest(); *r = c.room ? c.room() : UINT32_MAX; return 0; }
+            catch (...) { c.err = std::current_exception(); return 1; }
+        };
+        bool due = false; g6ctl_commit out;
+        ctl::check(g6ctl_boundary(h_.get(), b, fn, &ctx, &due, &out), &ctx.err);
+        if (!due) return {};
+        return ctl::from_ctl(out);
     }
-    Notice wait_notice() {
-        std::unique_lock<std::mutex> l(mu_);cv_.wait(l,[&]{return notice_.has_value() || failed_;});
-        require(!failed_,"control epoch failed");return *notice_;
-    }
-    void applied() {
-        std::lock_guard<std::mutex> l(mu_);require(notice_ && commit_ && !failed_,"apply without event commit");
-        gate_.applied(*notice_,commit_->hold);notice_.reset();commit_.reset();ack_.reset();cv_.notify_all();
-    }
+    Notice wait_notice() { g6ctl_notice n; ctl::check(g6ctl_wait_notice(h_.get(), &n)); return ctl::notice(n); }
+    // the current event's installed/arrived stamps (wall_us); call between boundary() and applied()
+    std::pair<long long,long long> stamps() { int64_t i = 0, a = 0; g6ctl_stamps(h_.get(), &i, &a); return {i, a}; }
+    void applied() { ctl::check(g6ctl_applied(h_.get())); }
     // Compute thread, every rank at the same point with the same seq (1, 2, ...): return once every rank has arrived. For
     // host work whose time differs by rank (a tier's copies) before GPU work that waits for peers with a timeout.
-    virtual void sync(uint64_t seq)=0;
+    void sync(uint64_t seq) { ctl::check(g6ctl_sync(h_.get(), seq)); }
 };
 class WorkerChannel : public EventEndpoint {
-    ControlIO& io_;
-    const uint64_t epoch_;
-    const unsigned rank_;
-    std::map<uint64_t,std::string> requests_; // the latest bytes of each request the head has announced, under mu_
-    uint64_t go_=0; // the last barrier the head released, under mu_
-    void send_ack(const Ack& a) override {io_.send(encode(a));}
 public:
     std::function<void()> on_quit; // the head quit in order; set before receive_events starts
-    WorkerChannel(uint64_t epoch,unsigned rank,ControlIO& io):EventEndpoint(epoch,rank),io_(io),epoch_(epoch),rank_(rank){require(rank>0,"worker rank zero");}
-    void fail() override {EventEndpoint::fail();io_.shutdown();}
+    WorkerChannel(uint64_t epoch,unsigned rank,ControlIO& io)
+        : EventEndpoint((sch::check_abi(), g6ctl_worker_new(epoch, rank, io.handle()))) {}
     void receive_events() { // background control thread, one persistent connection
-        try {
-            for(;;){auto b=io_.receive(true);Decoder d(b); // idle between events: no timeout
-                if(d.tag==Tag::Notice)install(decode_notice(b));
-                else if(d.tag==Tag::Commit)deliver(decode_commit(b));
-                else if(d.tag==Tag::Request){auto r=decode_request(b);require(r.epoch==epoch_,"request from another epoch");
-                    std::lock_guard<std::mutex> l(mu_);requests_[r.request]=std::move(r.bytes);}
-                else if(d.tag==Tag::Quit){require(decode_quit(b)==epoch_,"quit from another epoch");if(on_quit)on_quit();}
-                else if(d.tag==Tag::Go){auto g=decode_go(b);require(g.first==epoch_,"barrier from another epoch");
-                    std::lock_guard<std::mutex> l(mu_);require(g.second==go_+1,"barrier release out of order");go_=g.second;cv_.notify_all();}
-                else throw std::runtime_error("worker received non-event frame");}
-        }catch(...){fail();throw;}
+        struct Ctx { WorkerChannel& w; std::exception_ptr err; } ctx{*this, nullptr};
+        auto fn = [](void* p) -> int32_t {
+            auto& c = *static_cast<Ctx*>(p);
+            try { if (c.w.on_quit) c.w.on_quit(); return 0; }
+            catch (...) { c.err = std::current_exception(); return 1; }
+        };
+        ctl::check(g6ctl_receive_events(h_.get(), fn, &ctx), &ctx.err);
     }
     // The bytes the head sent for this request with its latest ADMIT notice (the caller checks their hash)
-    std::string request(uint64_t id) {
-        std::lock_guard<std::mutex> l(mu_);const auto it=requests_.find(id);
-        require(it!=requests_.end(),"ADMIT notice without its request bytes");return it->second;
-    }
-    // compute sends (ACKs and these) are all on the compute thread
-    void sync(uint64_t seq) override {
-        try {
-            io_.send(encode(SyncFrame{epoch_,rank_,seq}));
-            std::unique_lock<std::mutex> l(mu_);cv_.wait(l,[&]{return go_>=seq||failed_;});
-            require(!failed_,"control epoch failed");require(go_==seq,"barrier release out of order");
-        }catch(...){fail();throw;}
-    }
+    std::string request(uint64_t id) { std::string s; ctl::check(g6ctl_request(h_.get(), id, ctl::grow_string, &s)); return s; }
     // Admission is FIFO: once a request is admitted, it and every earlier one (admitted, or cancelled while queued)
     // are done with
-    void admitted(uint64_t id) {std::lock_guard<std::mutex> l(mu_);requests_.erase(requests_.begin(),requests_.upper_bound(id));}
+    void admitted(uint64_t id) { g6ctl_admitted(h_.get(), id); }
 };
 class LeaderChannel : public EventEndpoint {
-    std::vector<ControlIO*> peers_; // order = ranks 1..NR-1
-    const uint64_t epoch_;
-    std::mutex send_mu_; // the control thread's event frames and the monitor's quit share each peer link
-    // A worker's frames are ACKs (the control thread waits for them in event()) and barrier arrivals (compute waits in
-    // sync()), in the worker's order on one link. Whichever thread waits reads the link and files what it gets, under mu_.
-    std::vector<std::optional<Ack>> acks_;
-    std::vector<uint64_t> synced_;
-    std::vector<char> reading_;
-    template<class Done> void await(unsigned i,Done&& done) {
-        std::unique_lock<std::mutex> l(mu_);
-        for(;;){
-            cv_.wait(l,[&]{return failed_||done()||!reading_[i];});
-            require(!failed_,"control epoch failed");if(done())return;
-            reading_[i]=1;l.unlock();
-            std::vector<uint8_t> b;
-            try{b=peers_[i]->receive();}catch(...){l.lock();reading_[i]=0;cv_.notify_all();throw;}
-            l.lock();reading_[i]=0;cv_.notify_all();
-            Decoder d(b);
-            if(d.tag==Tag::Ack){auto a=decode_ack(b);require(a.rank==i+1,"ACK on wrong rank link");require(!acks_[i],"second ACK before the commit");acks_[i]=a;}
-            else if(d.tag==Tag::Sync){auto s=decode_sync(b);require(s.epoch==epoch_&&s.rank==i+1&&s.seq==synced_[i]+1,"barrier arrival out of order");synced_[i]=s.seq;}
-            else throw std::runtime_error("head received a frame that is not an ACK or a barrier arrival");
-        }
+    static g6ctl_endpoint* make(uint64_t epoch, const std::vector<ControlIO*>& peers) {
+        sch::check_abi();
+        std::vector<const g6ctl_io*> h;
+        for (auto* p : peers) h.push_back(p ? p->handle() : nullptr);
+        return g6ctl_head_new(epoch, h.data(), h.size());
     }
-    void send_ack(const Ack& a) override {std::lock_guard<std::mutex> l(mu_);ack_=a;cv_.notify_all();}
-    void send_all(const std::vector<uint8_t>& frame) {std::lock_guard<std::mutex> l(send_mu_);for(auto p:peers_)p->send(frame);}
 public:
-    LeaderChannel(uint64_t epoch,const std::vector<ControlIO*>& peers):EventEndpoint(epoch,0),peers_(peers),epoch_(epoch),
-        acks_(peers.size()),synced_(peers.size(),0),reading_(peers.size(),0){require(peers.size()==1||peers.size()==2||peers.size()==3||peers.size()==5,"expected TP2/TP3/TP4/TP6 peers");}
-    void fail() override {EventEndpoint::fail();for(auto p:peers_)p->shutdown();}
+    LeaderChannel(uint64_t epoch,const std::vector<ControlIO*>& peers) : EventEndpoint(make(epoch, peers)) {}   // none at TP1: the head agrees with itself
     // Control thread: announce caller-chosen FUTURE boundary, collect event ACKs,
     // then make one canonical allocator/scheduler commit while compute is paused.
     // Ordinary EOS, decode and prefill steps never call this function.
     // payload: an ADMIT's request bytes, sent to every worker just before the notice
     void event(const Notice& n,const std::function<Commit(uint64_t)>& make_commit,const std::string* payload=nullptr) {
-        try {
-            require((n.kind==EventKind::Admit)==(payload!=nullptr),"an ADMIT notice carries its request bytes");
-            install(n);
-            if(payload)send_all(encode(RequestBytes{n.epoch,n.request,*payload}));
-            send_all(encode(n));
-            Agreement proof(unsigned(peers_.size()+1),n);
-            {std::unique_lock<std::mutex> l(mu_);cv_.wait(l,[&]{return ack_.has_value()||failed_;});require(!failed_,"failed while waiting local ACK");proof.ack(*ack_);}
-            for(unsigned i=0;i<peers_.size();++i){
-                await(i,[&]{return acks_[i].has_value();});
-                Ack a;{std::lock_guard<std::mutex> l(mu_);a=*acks_[i];acks_[i].reset();}
-                proof.ack(a);
-            }
-            EventCommit e{n,make_commit(proof.agreed_hash())};match(e);
-            require(e.commit.before_hash==proof.agreed_hash(),"commit not based on all-rank state");
-            send_all(encode(e));
-            deliver(e);
-            std::unique_lock<std::mutex> l(mu_);cv_.wait(l,[&]{return !notice_||failed_;});require(!failed_,"event apply failed");
-        }catch(...){fail();throw;}
+        struct Ctx { const std::function<Commit(uint64_t)>& f; std::exception_ptr err; } ctx{make_commit, nullptr};
+        auto fn = [](void* p, uint64_t hash, g6ctl_commit* out) -> int32_t {
+            auto& c = *static_cast<Ctx*>(p);
+            try { *out = ctl::to_ctl(c.f(hash)); return 0; }
+            catch (...) { c.err = std::current_exception(); return 1; }
+        };
+        ctl::check(g6ctl_event(h_.get(), sch::c<g6ctl_notice>(&n), fn, &ctx, payload != nullptr,
+                               payload ? ctl::bytes(*payload) : nullptr, payload ? payload->size() : 0), &ctx.err);
     }
-    void sync(uint64_t seq) override {
-        try {
-            for(unsigned i=0;i<peers_.size();++i)await(i,[&]{return synced_[i]>=seq;});
-            {std::lock_guard<std::mutex> l(mu_);for(auto s:synced_)require(s==seq,"barrier arrival out of order");}
-            send_all(encode_go(epoch_,seq));
-        }catch(...){fail();throw;}
-    }
+    // inside make_commit: the least room every rank's ACK of this event reported (UINT32_MAX: no rank has a chunk map)
+    uint32_t agreed_room() const {return g6ctl_agreed_room(h_.get());}
     // Pass the head's orderly quit to every worker. A worker already gone is not an error here.
-    void quit() {
-        std::lock_guard<std::mutex> l(send_mu_);const auto q=encode_quit(epoch_);
-        for(auto p:peers_)try{p->send(q);}catch(...){}
-    }
+    void quit() { g6ctl_quit(h_.get()); }
 };
 } // namespace g6s2

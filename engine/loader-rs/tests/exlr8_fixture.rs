@@ -105,7 +105,7 @@ fn int4_codes_come_back_in_the_hf_orientation() {
 
 #[test]
 fn fp8_rows_give_what_decode_gives() {
-    // #50: the block-FP8 bytes and per-row scales the loader stores for G6_KVB=fp8 (fb: 200 x 160, scale blocks 2 x 2,
+    // #50: the block-FP8 bytes and per-row scales the loader stores for GR8_KVB=fp8 (fb: 200 x 160, scale blocks 2 x 2,
     // so the rows and the inputs both end inside a partial block)
     let f = fixture();
     let m = Matrix::open(&f, "fb").unwrap();

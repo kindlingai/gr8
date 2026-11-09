@@ -1,7 +1,7 @@
-"""HTTP-level tests against a running front end + mock engine (tests/serve_mock.sh start).
+"""HTTP-level tests against a running front end and the pseudo engine with tests/api_responses.toml (tests/api.sh).
 Run: URL=http://127.0.0.1:8100 python -m unittest tests.test_api -v
-/health?deep needs the front end started with FRONT_ARGS='--supervisor 127.0.0.1:8198' (SUP_PORT): the test plays the
-supervisor there."""
+/health?deep needs the front end started with --supervisor 127.0.0.1:8198 (SUP_PORT): the test plays the supervisor
+there."""
 import http.client
 import json
 import os
@@ -14,6 +14,10 @@ import urllib.parse
 import urllib.request
 
 URL = os.environ.get('URL', 'http://127.0.0.1:8100')
+# the front end runs with --allow-thinking-off: the thinking-off tests run, and the refusals of thinking off skip
+THINKING_OFF = os.environ.get('ALLOW_THINKING_OFF') == '1'
+# the front end runs with --undeclared-tool-calls emit
+EMIT_UNDECLARED = os.environ.get('UNDECLARED_TOOL_CALLS') == 'emit'
 
 
 def post(path, body, raw=False):
@@ -102,6 +106,37 @@ class Chat(unittest.TestCase):
         self.assertIn('<tool_call>get_weather', msg['content'])
         self.assertIn('in your code.', msg['content'])
         self.assertEqual(r['choices'][0]['finish_reason'], 'stop')
+
+    def test_undeclared_tool_call(self):
+        # the reply calls web_search, which the request does not declare: text by default, a call with
+        # --undeclared-tool-calls emit (its arguments are strings: there is no schema to coerce them by)
+        body = {'model': 'glm-5.3', 'messages': [{'role': 'user', 'content': 'call-an-undeclared-tool'}],
+                'tools': TOOLS, 'max_tokens': 200}
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        chunks = sse('/v1/chat/completions', body)
+        deltas = [c['choices'][0]['delta'] for c in chunks if c['choices']]
+        content = ''.join(d.get('content') or '' for d in deltas)
+        calls = [tc for d in deltas for tc in d.get('tool_calls', [])]
+        if not EMIT_UNDECLARED:
+            self.assertNotIn('tool_calls', msg)
+            self.assertTrue(msg['content'].startswith('Checking.<tool_call>web_search<arg_key>'), msg['content'])
+            self.assertTrue(msg['content'].endswith('</tool_call>'), msg['content'])
+            self.assertEqual(r['choices'][0]['finish_reason'], 'stop')
+            self.assertEqual((content, calls), (msg['content'], []))
+            self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'stop')
+            return
+        self.assertEqual(msg['content'], 'Checking.')
+        self.assertEqual(len(msg['tool_calls']), 1)
+        call = msg['tool_calls'][0]['function']
+        self.assertEqual(call['name'], 'web_search')
+        self.assertEqual(json.loads(call['arguments']), {'query': 'harbors', 'limit': '3'})
+        self.assertEqual(r['choices'][0]['finish_reason'], 'tool_calls')
+        self.assertEqual(content, 'Checking.')
+        self.assertEqual([tc['function']['name'] for tc in calls if 'name' in tc['function']], ['web_search'])
+        self.assertEqual(''.join(tc['function'].get('arguments', '') for tc in calls), call['arguments'])
+        self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'tool_calls')
 
     def test_tool_choice_required_forces_a_call(self):
         # `required` and a named function force the opener with the engine's insert rule, so the reply is a call even
@@ -196,7 +231,7 @@ class Thinking(unittest.TestCase):
         s, r = post('/v1/chat/completions', CHAT)
         n = post('/tokenize', {'model': 'glm-5.3', 'prompt': r['choices'][0]['message']['reasoning'],
                                'add_special_tokens': False})[1]['count']
-        self.assertEqual(reasoning_tokens(r), n + 1)    # the mock's reasoning, then </think>
+        self.assertEqual(reasoning_tokens(r), n + 1)    # the engine's reasoning, then </think>
 
     def test_budget_closes_the_think_block_and_the_answer_follows(self):
         body = dict(CHAT, messages=[{'role': 'user', 'content': "Solve. Answer as '#### <number>'."}],
@@ -248,10 +283,12 @@ class Thinking(unittest.TestCase):
 
     def test_refusals(self):
         for path in ('/v1/chat/completions', '/tokenize'):
-            m = bad(path, dict(CHAT, chat_template_kwargs={'enable_thinking': False}))
-            self.assertIn('thinking cannot be disabled', m)
-            self.assertIn('reasoning_effort "low"', m)
-            self.assertIn('"none"', bad(path, dict(CHAT, reasoning_effort='none')))
+            if not THINKING_OFF:
+                m = bad(path, dict(CHAT, chat_template_kwargs={'enable_thinking': False}))
+                self.assertIn('thinking cannot be disabled', m)
+                self.assertIn('reasoning_effort "low"', m)
+                self.assertIn('--allow-thinking-off', m)
+                self.assertIn('"none"', bad(path, dict(CHAT, reasoning_effort='none')))
             for e in ('auto', 'LOW', 3):
                 self.assertEqual(bad(path, dict(CHAT, reasoning_effort=e)),
                                  'reasoning_effort must be none, minimal, low, medium, high, xhigh or max')
@@ -260,12 +297,111 @@ class Thinking(unittest.TestCase):
                              'thinking_budget must be an integer or null')
         self.assertIn('logprobs', bad('/v1/chat/completions', dict(CHAT, thinking_budget=5, logprobs=True)))
 
-    def test_response_format(self):
+    @unittest.skipUnless(THINKING_OFF, 'needs the front end with --allow-thinking-off (ALLOW_THINKING_OFF=1)')
+    def test_thinking_off(self):
+        """enable_thinking false and reasoning_effort "none" render one prompt: no Reasoning Effort turn, and the
+        generation prompt ends on a closed think block. The reply is content only, whole or streamed."""
+        def ids(**kw):
+            return post('/tokenize', dict({'model': 'glm-5.3', 'messages': CHAT['messages']}, **kw))[1]['tokens']
+        off = ids(chat_template_kwargs={'enable_thinking': False})
+        self.assertEqual(ids(reasoning_effort='none'), off)
+        text = post('/detokenize', {'tokens': off})[1]['prompt']
+        self.assertNotIn('Reasoning Effort:', text)
+        self.assertTrue(text.endswith('<think></think>'), text[-80:])
+        # an explicit enable_thinking true wins over "none" (TensorFold): the prompt is the default one
+        self.assertEqual(ids(reasoning_effort='none', chat_template_kwargs={'enable_thinking': True}), ids())
+        body = dict(CHAT, chat_template_kwargs={'enable_thinking': False})
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        self.assertIsNone(msg.get('reasoning'))
+        self.assertTrue(msg['content'])
+        self.assertEqual(r['usage']['completion_tokens_details']['reasoning_tokens'], 0)
+        deltas = [c['choices'][0]['delta'] for c in sse('/v1/chat/completions', body) if c['choices']]
+        self.assertFalse(any(d.get('reasoning') for d in deltas))
+        self.assertEqual(''.join(d.get('content') or '' for d in deltas), msg['content'])
+
+    def test_response_format_json_object_extracts(self):
+        body = dict(CHAT, messages=[{'role': 'user', 'content': 'Give me JSON.'}],
+                    response_format={'type': 'json_object'})
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        self.assertEqual(json.loads(msg['content']), {'city': 'Paris', 'days': 3})
+        self.assertNotIn('warnings', r)
+        chunks = sse('/v1/chat/completions', body)
+        contents = ''.join(c['choices'][0]['delta'].get('content') or '' for c in chunks if c['choices'])
+        self.assertEqual(json.loads(contents), {'city': 'Paris', 'days': 3})
+        self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'stop')
+
+    def test_response_format_json_schema_rejects_invalid(self):
+        schema = {'type': 'object', 'required': ['a'], 'properties': {'a': {'type': 'integer'}}}
+        body = dict(CHAT, messages=[{'role': 'user', 'content': 'emit invalid-json-please'}],
+                    response_format={'type': 'json_schema', 'json_schema': {'name': 'x', 'schema': schema}})
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        # policy: a schema violation returns the content unchanged with a warning, never a 500
+        self.assertIn('{"a": "x"}', msg['content'])
+        self.assertEqual(len(r['warnings']), 1)
+        self.assertIn('does not match the schema', r['warnings'][0])
+        chunks = sse('/v1/chat/completions', body)
+        # stream warnings ride on the final choice, matching the Python front end
+        warned = [c['choices'][0] for c in chunks if c['choices'] and c['choices'][0].get('warnings')]
+        self.assertEqual(len(warned), 1)
+        self.assertIn('does not match the schema', warned[0]['warnings'][0])
+
+    def test_response_format_json_schema_accepts_valid(self):
+        schema = {'type': 'object', 'required': ['city', 'days'],
+                  'properties': {'city': {'type': 'string'}, 'days': {'type': 'integer'}}}
+        body = dict(CHAT, messages=[{'role': 'user', 'content': 'Give me JSON.'}],
+                    response_format={'type': 'json_schema', 'json_schema': {'name': 'x', 'schema': schema}})
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        self.assertEqual(json.loads(msg['content']), {'city': 'Paris', 'days': 3})
+        self.assertNotIn('warnings', r)
+        chunks = sse('/v1/chat/completions', body)
+        contents = ''.join(c['choices'][0]['delta'].get('content') or '' for c in chunks if c['choices'])
+        self.assertEqual(json.loads(contents), {'city': 'Paris', 'days': 3})
+
+    def test_response_format_null_is_text(self):
+        self.assertEqual(post('/v1/chat/completions', dict(CHAT, response_format=None))[0], 200)
+        self.assertEqual(post('/v1/completions', {'model': 'glm-5.3', 'prompt': 'x', 'max_tokens': 4,
+                                                  'response_format': None})[0], 200)
+
+    def test_json_mode_stream_keeps_the_text_before_a_tool_call(self):
+        tools = [{'type': 'function', 'function': {'name': 'get_weather', 'parameters': {
+            'type': 'object', 'properties': {'city': {'type': 'string'}}}}}]
+        body = dict(CHAT, messages=[{'role': 'user', 'content': 'use-a-tool-please'}], tools=tools,
+                    response_format={'type': 'json_object'})
+        s, r = post('/v1/chat/completions', body)
+        self.assertEqual(s, 200, r)
+        msg = r['choices'][0]['message']
+        self.assertEqual(msg['tool_calls'][0]['function']['name'], 'get_weather')
+        self.assertNotIn('warnings', r)
+        chunks = sse('/v1/chat/completions', body)
+        content = ''.join(c['choices'][0]['delta'].get('content') or '' for c in chunks if c['choices'])
+        calls = [t for c in chunks if c['choices'] for t in c['choices'][0]['delta'].get('tool_calls') or []]
+        self.assertEqual(content, msg['content'] or '')
+        self.assertEqual(calls[0]['function']['name'], 'get_weather')
+        self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'tool_calls')
+
+    def test_response_format_ignored_when_absent(self):
+        s, r = post('/v1/chat/completions', CHAT)
+        self.assertEqual(s, 200)
+        self.assertNotIn('warnings', r)
+        self.assertEqual(r['choices'][0]['message']['content'], post('/v1/chat/completions', CHAT)[1]['choices'][0]['message']['content'])
+
+    def test_response_format_errors(self):
         self.assertEqual(post('/v1/chat/completions', dict(CHAT, response_format={'type': 'text'}))[0], 200)
+        for rf in ({'type': 'nope'}, {'type': 'json_schema', 'json_schema': {'name': 'x'}}, 'json_object'):
+            self.assertIn('response_format', bad('/v1/chat/completions', dict(CHAT, response_format=rf)))
+        # completions still refuses JSON modes (no constrained decoding)
         for rf in ({'type': 'json_object'}, {'type': 'json_schema', 'json_schema': {'name': 'x', 'schema': {}}}):
-            for path, body in (('/v1/chat/completions', CHAT),
-                               ('/v1/completions', {'model': 'glm-5.3', 'prompt': 'x', 'max_tokens': 4})):
-                self.assertIn('is not supported by the gr8 front end yet', bad(path, dict(body, response_format=rf)))
+            self.assertIn('is not supported by the gr8 front end yet',
+                          bad('/v1/completions', {'model': 'glm-5.3', 'prompt': 'x', 'max_tokens': 4,
+                                                  'response_format': rf}))
 
 
 class Completions(unittest.TestCase):
@@ -299,7 +435,7 @@ class Completions(unittest.TestCase):
             actual = pl[j][str(ids[j])]  # vLLM: the scored token first, then the top-k
             self.assertEqual(next(iter(pl[j])), str(ids[j]))
             others = sorted(v['rank'] for k, v in pl[j].items() if k != str(ids[j]))
-            if actual['rank'] <= 20:
+            if actual['rank'] is not None and actual['rank'] <= 20:   # null: below the engine's top 20 (PROTOCOL.md)
                 self.assertEqual(len(pl[j]), 20)
                 self.assertEqual(others, [r for r in range(1, 21) if r != actual['rank']])
             else:

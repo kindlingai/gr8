@@ -67,7 +67,8 @@ static void chain_three_ranks() {
 
     // the service compute loop (service.h compute), cut down: depart boundaries until one is due, apply its commit, and
     // re-enter the SAME boundary (the loop's continue); the first boundary departed after a commit ends the run
-    struct Seen { std::vector<uint64_t> requests, boundaries; std::vector<bool> holds; uint64_t departed = 0; };
+    struct Seen { std::vector<uint64_t> requests, boundaries; std::vector<bool> holds; uint64_t departed = 0;
+                 std::vector<std::pair<long long, long long>> stamps; };   // GR8_S2_EVENTLOG installed/arrived
     Seen seen[3];
     auto compute = [&](EventEndpoint& ep, WorkerChannel* w, Seen& out) {
         (void)ep.wait_notice();
@@ -76,6 +77,7 @@ static void chain_three_ranks() {
             auto cm = ep.boundary(b, [&] { noticed = ep.wait_notice(); return uint64_t(42); });
             if (cm) {
                 out.requests.push_back(noticed.request); out.boundaries.push_back(cm->boundary); out.holds.push_back(cm->hold);
+                out.stamps.push_back(ep.stamps());
                 if (w) w->admitted(noticed.request);
                 ep.applied();
                 continue;                             // same boundary again
@@ -101,6 +103,8 @@ static void chain_three_ranks() {
         CHECK((s.boundaries == std::vector<uint64_t>{B, B, B}));
         CHECK((s.holds == std::vector<bool>{true, true, false}));
         CHECK(s.departed == B);                       // departed only after the release
+        CHECK(s.stamps.size() == 3);
+        for (const auto& t : s.stamps) CHECK(t.first > 0 && t.second >= t.first);   // installed, then arrived at B
     }
     h1.reset(); h2.reset();
     r1.join(); r2.join();

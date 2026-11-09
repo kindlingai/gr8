@@ -11,7 +11,7 @@ Run `g6m4` on the six ranks with the TP6 engine line but without `--serve` (the 
 in order, and exits), with these additions:
 
 - the flag `--reuse-prefix`
-- the env `G6_REUSE_ALIGN=1`
+- the env `GR8_REUSE_ALIGN=1`
 - `--gen 32 --temp 0` and four `--prompt @<file>` arguments, the prompts below in order
 
 and keep `--prefill 4096 --pf-lanes 2 --mtp K --graph`. `--cap` must hold `20001 + 32 + 2K`. Rank 0 must print at start
@@ -58,11 +58,11 @@ testing this feature.
 ## Deeper: every cache row
 
 Criteria 3 and 4 are the output-level proof. The old line also compared every cache row of the hit against the cold
-run with `G6_REUSE_HDUMP=<dir> G6_REUSE_HDUMP_SEQ=1` on a hit boot and `=3` on a cold boot (`reuse_hdump.cuh`, ported
+run with `GR8_REUSE_HDUMP=<dir> GR8_REUSE_HDUMP_SEQ=1` on a hit boot and `=3` on a cold boot (`reuse_hdump.cuh`, ported
 here; the dump format is documented at the top of that header). The reader that merges the six ranks' dumps by global
 row, `tools/reuse/hdump.py`, is NOT ported — it is at
 the hdump reader on the old line.
 
-The gate arm `G6_REUSE_POISON=1` (`reuse_poison.cuh`, ported) sets the stale rows to NaN on a hit, so a read of a row
+The gate arm `GR8_REUSE_POISON=1` (`reuse_poison.cuh`, ported) sets the stale rows to NaN on a hit, so a read of a row
 the hit should not have retained shows up as an attention error word 4 or as different lines. A poisoned run must print
 the same lines as the same run without poison.

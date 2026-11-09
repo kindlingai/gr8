@@ -1,7 +1,15 @@
-"""The models ./gr8 serves, and what the launcher does differently for each. GR8_MODEL picks one; ./gr8 <name> sets it."""
+"""The models ./gr8 serves, and what the launcher does differently for each. GR8_MODEL picks one; ./gr8 <name> sets it.
+Nothing picks one for the runner. `./gr8 models` (this file run) lists each model and the values its options take."""
 import json
 import os
+import sys
 from dataclasses import dataclass
+
+
+# The files the front end and the boxes' set id read from the tokenizer directory. GLM's release also carries the chat template
+# and generation config; DeepSeek's does not (its prompt comes from encoding.py, ported in frontend/g6front-rs/src/dschat.rs).
+TOKENIZER_GLM = ('chat_template.jinja', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json')
+TOKENIZER_DS = ('tokenizer.json', 'tokenizer_config.json')
 
 
 class ModelMismatch(Exception):
@@ -11,6 +19,8 @@ class ModelMismatch(Exception):
 @dataclass(frozen=True)
 class Model:
     name: str
+    title: str                  # the model's own name, for messages and ./gr8 models
+    release: str                # its published exlr8 release, for help text only: --model always names the release
     engine: str                 # bin/<engine>, built by `./gr8 <name> build` (scripts/build.sh MODEL=<build>)
     build: str
     tp: tuple                   # the TP sizes the engine is built for
@@ -21,10 +31,18 @@ class Model:
     drafter: bool               # DFlash2 drafter (--drafter, DFLASH=1)
     int4_kv: bool               # KV_FORMAT=int4 (bin/<engine>-int4)
     thinking_off: bool          # the chat template can turn thinking off (reasoning_effort none)
+    fabric: bool = True         # the ranks talk over RDMA: rails and /dev/infiniband
+    dialect: str = 'glm'        # the front end's --dialect: glm (GLM chat template and <tool_call>) or ds41 (DeepSeek DSML)
+    served: tuple = ()          # the front end's --served-model-name: /v1/models lists the first first, a request may
+                                # name any (empty: the dialect's own, glm-5.3 and glm53 for GLM)
+    defaults: tuple = ()        # (KEY, value) option defaults for this model, over the table's: origin '<name> default'
+    vocab: int = 0              # the shim's --vocab-size: the ids the engine's embedding table takes (0: the shim's own, GLM-5.3's)
+    eos_ids: tuple = ()         # the shim's --eos-ids (empty: the shim's own, GLM-5.3's)
+    max_positions: int = 1048576   # config.json max_position_embeddings: the longest request MAX_MODEL_LEN allows
 
     @property
     def tp_sizes(self):
-        return ', '.join(self.tp[:-1]) + ' or ' + self.tp[-1]
+        return ', '.join(self.tp[:-1]) + ' or ' + self.tp[-1] if len(self.tp) > 1 else self.tp[0]
 
 
 # GLM-5.3 variants: home, down1 and up1 follow the TR3 checkpoint's per-expert widths. The bitNNN profiles spend their
@@ -33,22 +51,39 @@ class Model:
 # release from before it boots down1. home's experts take 99.8 GB of a rank at TP=3, which leaves no room for the KV
 # pool on a 128 GB box. At TP=4 home stays: bit325 lowers KL by 1.5-7% at home's size but decoded ~2.5% slower in
 # three boots each.
-GLM53 = Model('glm53', 'g6m4', 'glm', ('4', '6', '3'),
+GLM53 = Model('glm53', 'GLM-5.3', 'https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4', 'g6m4', 'glm',
+              ('4', '6', '3', '5'),
               {'home': 3.25, 'down1': 2.25, 'up1': 4.0,
                'bit225': 2.25, 'bit243': 2.43, 'bit260': 2.60, 'bit325': 3.25, 'bit338': 3.38},
               {3: ('bit225', 'down1')}, 'gr8-glm53', 'GlmMoeDsaForCausalLM', True, True, False)
-# GLM-5.3-Flash: uniform-width releases, K4 by default.
-GLM53F = Model('glm53f', 'g6m4_flash', 'flash', ('4', '2'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},
-               {2: ('k4',), 4: ('k4',)}, 'gr8-glm53f', 'Glm5NextForConditionalGeneration', False, False, True)
-MODELS = {m.name: m for m in (GLM53, GLM53F)}
+# GLM-5.3-Flash: uniform-width releases, K4 by default. K2 is the width whose experts fit one box (TP=1).
+GLM53F = Model('glm53f', 'GLM-5.3-Flash', 'https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4',
+               'g6m4_flash', 'flash', ('4', '3', '2', '1'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},
+               {1: ('k2',), 2: ('k4',), 3: ('k4',), 4: ('k4',)}, 'gr8-glm53f', 'Glm5NextForConditionalGeneration', True, True, True,
+               served=('glm-5.3-flash', 'glm53f'))   # its own names: a router that lists models by name keeps it apart from GLM-5.3
+# DeepSeek-V4.1-Flash-1017 (docs/DEEPSEEK.md): the official weights in the exlr8 native layout (FP8 trunk, MXFP4 routed
+# experts), no width variants, TP=4. Its drafter is DSpark, the checkpoint's MTP layers (GR8_DS_MTP), not DFlash2. The front
+# end speaks the ds41 dialect (DSML tool calls, numeric reasoning effort). A request that names no reasoning effort gets
+# low (50), which kept the release's answers at about a quarter of high's thinking tokens.
+DS41 = Model('ds41', 'DeepSeek-V4.1-Flash', 'https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native',
+             'g6m4_ds41', 'ds41', ('4',), {}, {}, 'gr8-ds41', 'DeepseekV41ForCausalLM', False, False, True,
+             dialect='ds41', served=('deepseek-v4.1-flash',), vocab=129280, eos_ids=(1,),   # engine/model_geom_ds41.h VOCAB, TOK_EOS
+             defaults=(('DEFAULT_MAX_TOKENS', '32768'), ('DEFAULT_REASONING_EFFORT', 'low')))
+# The pseudo engine (frontend/pseudo-engine): GLM-5.3's tokens and chat template, answers from a TOML file of rules, on
+# a CPU. Its release is a directory with responses.toml and the tokenizer files.
+PSEUDO = Model('pseudo', 'the pseudo engine', '', 'g6pseudo', 'pseudo', ('1', '2', '3', '4'), {}, {}, 'gr8-pseudo',
+               'GlmMoeDsaForCausalLM', False, False, False, fabric=False)
+MODELS = {m.name: m for m in (GLM53, GLM53F, DS41, PSEUDO)}
+
+
+# The models a runner names. pseudo, the test engine, is served when named but left out of the lists.
+SERVED = (GLM53, GLM53F)
+CHOICES = ' or '.join(f'{m.name} ({m.title})' for m in SERVED)
 
 
 def of(o):
-    """The Model the options select (GR8_MODEL, default glm53)."""
-    name = o.get('GR8_MODEL') or GLM53.name
-    if name not in MODELS:
-        raise KeyError(name)
-    return MODELS[name]
+    """The Model the options select: GR8_MODEL, which has no default (options.validate refuses a boot without it)."""
+    return MODELS[o.get('GR8_MODEL')]
 
 
 def check_config(model, directory):
@@ -63,3 +98,26 @@ def check_config(model, directory):
         want = next((m.name for m in MODELS.values() if m.architecture == arch), None)
         hint = f': ./gr8 {want} serves it' if want else ''
         raise ModelMismatch(f'{path} is {arch}, and ./gr8 {model.name} serves {model.architecture}{hint}')
+
+
+def describe(m):
+    """What `./gr8 models` prints for m: the name to give and the values the model's options take."""
+    defaults = ', '.join(f'TP={tp} ' + ' else '.join(m.default_variant.get(int(tp), ('home',))) for tp in m.tp)
+    extra = [o for o, on in (('--drafter URL (DFlash2)', m.drafter), ('--kv-format int4', m.int4_kv),
+                             ('--default-reasoning-effort none', m.thinking_off)) if on]
+    return '\n'.join([f'{m.name:7} {m.title}: ./gr8 {m.name} <command>, or GR8_MODEL={m.name}',
+                      f'        --model    an exlr8 release of {m.architecture} (config.json `architectures`), such as',
+                      f'                   {m.release}',
+                      f'        --tp       {m.tp_sizes}',
+                      f'        --variant  {", ".join(m.variants)}',
+                      f'                   by default {defaults}',
+                      *([f'        also       {", ".join(extra)}'] if extra else [])])
+
+
+if __name__ == '__main__':
+    if sys.argv[1:2] == ['served']:   # ./gr8 <name> smoke: the name its requests send
+        print(MODELS[sys.argv[2]].served[0] if MODELS[sys.argv[2]].served else '')
+        sys.exit()
+    print('\n\n'.join(describe(m) for m in SERVED))
+    print('\n./gr8 knobs lists every option. The pseudo engine (./gr8 pseudo, no GPU) is for tests: '
+          'frontend/pseudo-engine.')

@@ -238,5 +238,103 @@ class V2(unittest.TestCase):
         self.assertEqual(v2.parse_experts('0-2,7,9-10'), [0, 1, 2, 7, 9, 10])
 
 
+def patch_header(path, fn):
+    """Rewrite a safetensors header in place (fn(header dict) edits it); the header keeps its padded size."""
+    import struct
+    with open(path, 'r+b') as f:
+        n, = struct.unpack('<Q', f.read(8))
+        h = json.loads(f.read(n))
+        fn(h)
+        b = json.dumps(h, separators=(',', ':')).encode()
+        assert len(b) <= n
+        f.seek(8)
+        f.write(b + b' ' * (n - len(b)))
+
+
+class Codebooks(unittest.TestCase):
+    """The codebook reaches the pack from the width files, and a file gr8 cannot decode is refused."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._ne = v2.N_EXP
+        v2.N_EXP = NE
+        cls.tmp = tempfile.TemporaryDirectory()
+
+    @classmethod
+    def tearDownClass(cls):
+        v2.N_EXP = cls._ne
+        cls.tmp.cleanup()
+
+    def layer(self, cb, seed=7, **kw):
+        d = tempfile.mkdtemp(dir=self.tmp.name)
+        v2synth.make_layer(d, L, (3, 4), NE, seed=seed, codebook=cb, **kw)
+        return d
+
+    def convert(self, src, info=None):
+        out = tempfile.mkdtemp(dir=self.tmp.name)
+        ws = {0: PackWriter(os.path.join(out, 'rank0.pack'), 0, False, {})}
+        lay = v2.V2Layer(src, L)
+        wd = v2.Widths([3] * NE, [4] * NE, [3] * NE, shared=3, name='k3 down and up, k4 gate')   # both width files
+        v2.convert_experts_v2(L, lay, wd, ws, 4, info=info)
+        lay.close()
+        ws[0].close()
+        return read_pack(out, 0)
+
+    def test_each_codebook_names_its_format(self):
+        mcg, _ = self.convert(self.layer('mcg'))
+        for cb in ('mcg', 'mul1', 'pmcgx'):
+            t, m = self.convert(self.layer(cb), info=dict(expert_format='exlr8-e4m3'))
+            self.assertEqual({e.get('expert_format') for e in m['tensors']}, {v2.EXPERT_FORMAT[cb]}, cb)
+            # the codebook changes the names, not the bytes or their places
+            for name in mcg:
+                self.assertTrue(np.array_equal(t[name], mcg[name]), (cb, name))
+        # without an expert_format given, an mcg layer stays unlabelled (TR3 tests) but no other codebook does
+        _, m = self.convert(self.layer('mcg'))
+        self.assertFalse(any('expert_format' in e for e in m['tensors']))
+        _, m = self.convert(self.layer('pmcgx'))
+        self.assertEqual({e.get('expert_format') for e in m['tensors']}, {'exlr8-e4m3-pmcgx'})
+
+    def test_refusals(self):
+        def refused(edit, k, want):
+            d = self.layer('mcg')
+            patch_header(os.path.join(d, v2.WIDTH_FILE.format(l=L, k=k)), edit)
+            with self.assertRaises(ValueError) as c:
+                self.convert(d)
+            self.assertIn(want, str(c.exception))
+
+        def rename(suffix):
+            def f(h):
+                for n in [n for n in h if 'trellis.' in n]:
+                    h[n + suffix] = h.pop(n)
+            return f
+
+        def meta(cb):
+            def f(h):
+                h['__metadata__']['codebook'] = cb
+            return f
+
+        refused(rename('.gauss'), 4, "codebook 'gauss'")
+        refused(meta('gauss 0x12345678, E4M3'), 3, 'gauss')
+        refused(meta('pmcgx V2 L20 0xCBAC1FED/0xBCA14C51'), 3, 'but trellis tensors in mcg')
+        refused(rename('.mul1'), 3, 'no metadata codebook')
+        refused(lambda h: (rename('.mul1')(h), meta('mul1 0xCBAC1FED')(h)), 3, 'without its multiplier 0x83DCD12D')
+        refused(lambda h: (rename('.pmcgx')(h), meta('pmcgx V2 L22 0xCBAC1FED/0xBCA14C51')(h)), 3, 'V2 L20')
+        # one layer, two codebooks: K3 in mul1, K4 in mcg
+        refused(lambda h: (rename('.mul1')(h), meta('mul1 0x83DCD12D, E4M3')(h)), 3, 'one codebook per layer')
+
+        # a half the index places outside its trellis tensor
+        def shrink(h):
+            t = h['trellis.down']
+            t['data_offsets'][1] -= 16 * v2.half_bytes(3)
+            t['shape'] = [t['data_offsets'][1] - t['data_offsets'][0]]
+        refused(shrink, 3, 'not inside its trellis tensor')
+
+    def test_index_metadata_names_the_codebook(self):
+        for cb in ('mcg', 'mul1', 'pmcgx'):
+            s = ST(os.path.join(self.layer(cb), v2.INDEX_FILE.format(l=L)))
+            self.assertEqual(v2.codebook_of_metadata(s.meta['codebook']), cb)
+            s.close()
+
+
 if __name__ == '__main__':
     unittest.main()

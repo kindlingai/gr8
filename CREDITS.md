@@ -1,12 +1,20 @@
 KindlingAI is:
 
 - [@adapt-ai-systems](https://github.com/adapt-ai-systems)
+  - Opt-in packed-key attention pipeline for sequence-parallel DeepSeek prefill, with exactness tests.
+  - Opt-in sequence-parallel DeepSeek prefill: owned-row attention, expert groups, collectives and timing tests.
   - Prefill optimization, TP=6 S2 serving and context-budget improvements
     ([#7](https://github.com/kindlingai/gr8/pull/7), [#9](https://github.com/kindlingai/gr8/pull/9),
     [#27](https://github.com/kindlingai/gr8/pull/27), [#29](https://github.com/kindlingai/gr8/pull/29)).
   - Earlier engine, TP=3 conversion and gate foundations preserved in the Git history
     ([range fetching and manifests](https://github.com/kindlingai/gr8/commit/2d88926cb08bec602ba6382ccf10d90e1a735841),
     [gate harness](https://github.com/kindlingai/gr8/commit/3d6116f084b86aa96d4be47b253e223ef7a5dcea)).
+  - DeepSeek-V4.1-Flash on four boxes: the `ds41` tuning knobs and served defaults
+    ([#327](https://github.com/kindlingai/gr8/pull/327)-[#333](https://github.com/kindlingai/gr8/pull/333),
+    [#335](https://github.com/kindlingai/gr8/pull/335)-[#338](https://github.com/kindlingai/gr8/pull/338)),
+    and this boot guide.
+  - Control agreement bool-ABI regression fix and exhaustive ACK-subset coverage.
+  - Engine Rust pinned to 1.94.1, the compiler the images ship, and the CI engine job prints that compiler.
 - [@coffee-the-dev](https://github.com/coffee-the-dev)
 - [@mmastrac](https://github.com/mmastrac)
 
@@ -36,6 +44,8 @@ Thanks to:
     ([#82](https://github.com/kindlingai/gr8/pull/82), [#84](https://github.com/kindlingai/gr8/pull/84),
     [#86](https://github.com/kindlingai/gr8/pull/86), [#87](https://github.com/kindlingai/gr8/pull/87),
     [#90](https://github.com/kindlingai/gr8/pull/90)).
+  - Shared-scope steering in S2 batched decode (the MoE shared-expert finalize of shared steps,
+    [#209](https://github.com/kindlingai/gr8/pull/209)).
 - [@eqvse](https://github.com/eqvse) and [@cl83](https://github.com/cl83)
   - TP=3/TP=4 ring fabric and relay support ([#4](https://github.com/kindlingai/gr8/pull/4)).
 - [@chuck-ads](https://github.com/chuck-ads)
@@ -47,9 +57,19 @@ Thanks to:
   - Host-memory reclamation and canonical session KV export/import
     ([#60](https://github.com/kindlingai/gr8/pull/60), [#65](https://github.com/kindlingai/gr8/pull/65)).
 - [@unsaltedbutter-ai](https://github.com/unsaltedbutter-ai)
-  - API compatibility and structured-output proposals ([#71](https://github.com/kindlingai/gr8/pull/71)).
+  - Structured responses (`response_format` `json_object` and `json_schema`, checked with XGrammar) and thinking off
+    (`--allow-thinking-off`), with the count-to-200 gate
+    ([#71](https://github.com/kindlingai/gr8/pull/71), landed in [#186](https://github.com/kindlingai/gr8/pull/186)
+    and [#189](https://github.com/kindlingai/gr8/pull/189)).
+- [@msuiche](https://github.com/msuiche)
+  - Native GLP (GGUF) steering input: [weightless](https://weightle.ss/) GLP vectors load as steering
+    profiles through the schema-v1 validation path ([GLP spec](https://github.com/msuiche/weightless/blob/main/docs/spec/GLP.md)).
 - [@alexellis](https://github.com/alexellis)
   - [RigMark](https://github.com/alexellis/rigmark), used for decode and concurrency benchmarking.
+- [@0xr3ngar](https://github.com/0xr3ngar)
+  - Usage cache reporting for the glm dialect: the launcher now passes
+    `--enable-prompt-tokens-details` to the front end, so
+    `usage.prompt_tokens_details.cached_tokens` reaches clients on glm clusters.
 
 ## Upstream projects and research
 
@@ -60,4 +80,7 @@ Thanks to:
 - [davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw](https://huggingface.co/davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw), whose
   per-expert bit distribution `home` keeps expert for expert.
 - [RigMark](https://github.com/alexellis/rigmark) by [@alexellis](https://github.com/alexellis), for decode and concurrency benchmarking.
+- [weightless](https://github.com/msuiche/weightless) by [@msuiche](https://github.com/msuiche): the GLP
+  vector format ([spec](https://github.com/msuiche/weightless/blob/main/docs/spec/GLP.md)) and its
+  reader-conformance contract, which the native steering input implements.
 - The tool-call cases in `frontend/g6front-rs/src/parser.rs` are ported from vLLM's GLM tool-parser tests (Apache-2.0).

@@ -140,10 +140,38 @@ what it was. #37 shipped this as `--kv-tier STORE,size=N,keep=evicted|shared|all
     --kv-write-limit 0.25                      # optional cap, off by default
 
 The launcher's `KV_STORE` holds the stores separated by `;`, with `KV_KEEP`, `KV_SYSTEM_AFTER` and `KV_WRITE_LIMIT`
-(KNOBS.md). A store is `ssd:PATH` (a folder: rank r keeps `PATH/r<r>/blocks` and `PATH/r<r>/index`) or
+(`./gr8 knobs KV_`). A store is `ssd:PATH` (a folder: rank r keeps `PATH/r<r>/blocks` and `PATH/r<r>/index`) or
 `remote:HOST:PORT`. `remote:auto` is the launcher's: each box's supervisor names the KV node mentat announces, with an
 RDMA address on one of the box's rails first. `size` is per rank, binary (G = 2^30, T = 2^40). An SSD store is cleared
 at every boot unless it has `persist=on` (below, Persistence).
+
+A cache in spare RAM (src/ram.rs) is an entry of its own, and stores name it:
+
+    cache:spare,kind=spare_ram,floor=2G;ssd:/nvme/gr8kv,size=4G,persist=on,keep=system,cache=spare;remote:auto,size=8G,keep=all,cache=spare
+
+`KV_STORE=@FILE` reads the same settings from a YAML file, relative to the config file that names it:
+
+```yaml
+caches:
+  spare: {kind: spare_ram, floor: 2G}   # memory the kernel may take back (src/ram.rs)
+tiers:                                  # tried in order: a full tier passes entries to the next
+  - keep: system
+    cache: spare
+    store:
+      ssd: {path: /nvme/gr8kv, size_per_rank: 4G, persist: true}
+  - keep: all
+    cache: spare
+    store:
+      remote: {address: auto, size_per_rank: 8G}
+```
+
+The two forms accept and refuse the same stores: the launcher turns the file into the one-line form and checks that
+with the one-line parser (tools/launch/test_options.py fuzzes both). The boot log prints both forms. A store's `name`
+defaults to its kind, or kind-N when the kind repeats. A `remote` store also takes `group`, `cap_per_rank` and
+`weight`. Keys from the design that are not built yet (`transforms`, `takes`, `runs`) are refused by name.
+
+The engine takes each store with its cache spelled out, `spare_ram_cache=on,spare_ram_floor=2G`, so each store that
+names a cache gets its own copy of it today, with the cache's floor.
 
 ### What the stores keep
 
@@ -250,7 +278,7 @@ keys, in the page block's layout), and the T logical pages' replicated parts pac
 GLM 5.3: 41,984 B of the MTP layer each). Before the indexer keys were sharded with the latent (#44) every rank held
 every page's keys, and the replicated part carried them too (15 a block); that is block format 2. Every rank queues the same copies and the same slots; the bytes in them are each rank's own. A tail
 goes back only into a run past R, whole, before the prefill writes the rows past the hit. It is on when the pool's R is
-the CP map's (`G6_S2_BELOW` = `G6_CP_R`, the default). The blocks of a tail differ by rank by design, so a store shared
+the CP map's (`GR8_S2_BELOW` = `GR8_CP_R`, the default). The blocks of a tail differ by rank by design, so a store shared
 by the ranks would have to leave tails out.
 
 ### Lock-step
@@ -314,16 +342,15 @@ are KV node leases.
 |---|---|
 | `cargo test` (`tests/stash.rs`) | two ranks on 60 random traces with two tiers, growth and runs past R: each grant's reused rows hold its prompt's tokens after the copies (spills, moves, restores), the ranks queue the same copies and agree on the digest, no slot is held twice or lost. A five-turn chat counts once, and the third conversation stores the shared prefix and a fourth reads it back. A full tier moves its oldest entry on. A committed prefix survives a reopen. One whose copies were never reported done does not come back, and a torn record and another model's index are ignored |
 | `pool_stash_test` (host_tests.sh) | the same through the C interface, with the copies run through `mem:`, an `ssd:` file and a loopback KV node over TCP |
-| `control_protocol_test` | the grant's `restored` and `counted` fields round trip in `G6S2E5` |
-| m4sim (`G6_KV_TIER_CHECK`), layers 0 and 3 + MTP, four simulated ranks | a reuse hit's pages sent through `mem:`, `ssd:` and a loopback KV node, poisoned on the device, and read back: the printed lines equal the plain run's |
-| m4sim (`G6_KV_RANKS_CMP=1`) | below R (G6_CP_R covering the context) every simulated rank's page blocks equal rank 0's, byte for byte. Without that setting each rank holds other pages (the CP map), as expected |
+| m4sim (`GR8_TEST_KV_TIER_CHECK`), layers 0 and 3 + MTP, four simulated ranks | a reuse hit's pages sent through `mem:`, `ssd:` and a loopback KV node, poisoned on the device, and read back: the printed lines equal the plain run's |
+| m4sim (`GR8_TEST_KV_RANKS_CMP=1`) | below R (GR8_CP_R covering the context) every simulated rank's page blocks equal rank 0's, byte for byte. Without that setting each rank holds other pages (the CP map), as expected |
 
 TP=4, TP=3 and TP=6 build. The served path (Service with stored hits, counting in the grant, the boot agreement) has not
 run on the cluster: it needs four boxes.
 
 ### On the cluster (TP=4, 2026-10-12)
 
-The four GLM boxes, TP=4 home, the release from Hugging Face with the DFlash2 drafter, `--g6env-x G6_POOL_LOG=1`.
+The four GLM boxes, TP=4 home, the release from Hugging Face with the DFlash2 drafter, `--extra-env GR8_POOL_LOG=1`.
 Requests went one at a time at temperature 0 with logprobs, unless stated. The replays are the opencode captures in the
 agent capture set. Boot-to-boot byte equality is not a check under the default config (the DFlash2 verify shape varies),
 so the check of output identity is the first token and its logprob: prefill is deterministic for the same reused rows.
@@ -373,7 +400,7 @@ ranks' drain ends spread by up to 2.6, 3.8 and 4.4 s, with the slow rank changin
 writes are what vary: four ranks write into the KV node box's one 100G port with no PFC, and the switch dropped 23-27 million
 packets on that port in each 8-agent run (90-190 thousand on each GLM box's port).
 
-`G6_KV_DRAIN_DELAY=<rank>:<ms>[:<every>]` (test only: that rank sleeps inside every `every`th drain that copies
+`GR8_KV_DRAIN_DELAY=<rank>:<ms>[:<every>]` (test only: that rank sleeps inside every `every`th drain that copies
 anything) makes it deterministic. Without the barrier, 12 s on rank 2's first drain failed the epoch at the next prefill
 with the crashes' text on every rank. Ranks 0, 1 and 3 printed `extra 63000c02`, a CP staging wait (`k_cp_pf_wait`,
 `0x63000c00 | flag << 8 | peer`) for peer 2 that timed out 25 s into the quantum; rank 2 was still asleep. With the
@@ -431,6 +458,49 @@ rank could reuse a slot (a spill at its next growth) that a slow rank has yet to
 would wait one event fence, when the head has every rank's ACK, before reuse. That needs a pool call at each event,
 deterministic like the others. The writes could be split across ranks (page i by rank i mod TP), and every rank would
 read the whole run. Until the cluster check, each rank keeps its own store.
+
+### Sharing a node: group leases
+
+Two clusters (GLM and Flash, say) can share one KV node. Each store opened with `group=NAME[,cap=N][,weight=N]`
+(`--kv-store remote:...,size=FLOOR,group=glm,cap=32G`) is one rank's lease in group NAME. A group lease holds whole
+segments (`kvman-remote --seg-mb`, 1 GiB by default), starts at its floor (`size=`), and grows up to `cap=` (no `cap=`: as far as the node has room). Capacity
+moves between groups by whole segments (server.rs):
+
+- The head (rank 0) REPORTs to the node now and then (`GR8_S2_SHARE_MS`, 1000 ms): the segments a rank it wants more
+  (s2/kv_share.h `share_want`: room for an entry too big for the tier, the pages the tier pushed out since the last
+  report, or the next spill) and the ages of its coldest blocks, one per segment, in the order a shrink evicts
+  (`coldest_ages`). A segment the tier holds empty reports as u64::MAX, so the node takes empty segments first and at
+  once.
+- The node answers with a grant or a give, as a transaction: an id and an absolute target in segments a rank. The head
+  announces it as a Resize event, and every rank applies it at that one point of the call sequence with the id
+  (`GROW target txn`, `SHRINK target txn`). A GROW or SHRINK under any id but the group's open one is refused
+  (`E_STALE`); the same one again is a no-op. A rank may give on its own (`SHRINK target 0`): the first rank opens the
+  give, the others join it.
+- A grant is held for each rank until it grows. One no rank took goes back after `grant_ttl` (30 s); once one rank took
+  its part, the rest stay held for the others.
+- A rank's given segments go free only once every rank of its group gave. Until then the slower ranks may still write
+  them.
+- A group short of room asks the group whose coldest blocks are older than its own by `--margin-s` (60 s), weighted by
+  `weight=` (2000 counts the blocks half as old), never below that group's floor and not within `--cooldown-s` (10 s)
+  of its last give. A give no rank started within `--stall-s` (10 s) marks the group stalled until it shrinks. A give
+  frees whole segments on each of the giver's ranks; what that frees past the asker's need, the asker takes with its
+  next grant (a group of 4 ranks giving to one of 2 strands nothing).
+- An ask that made the node ask another group to give is held for the asker (`owed` in the node's stats, segments a
+  rank): that room is reserved for it, as a grant is (no other group's grant and no plain lease takes it), and its next
+  reports are granted it even when they ask for nothing more. A grant smaller than what is owed takes its part off and
+  the rest stays owed; what is owed lapses `grant_ttl` after the last ask. A head asks once
+  for what changed since its last report (one entry ahead of a drop), and a give takes a report or more, so without
+  this the given segments sat free until the asker dropped an entry and asked again. A report asks another group to
+  give only for what no give asked already brings.
+- A group that opens on a full node asks the others down toward their floors (the margin and the cooldown do not apply)
+  and waits up to `--stall-s` for them. `kvman-remote --group-plan FILE` (lines `NAME nr=RANKS floor=SEGS`) keeps a
+  planned group's floors free from the start, however full the node is; the floors must fit the node.
+- `KV_SHARE_WHEN=idle` (the default, engine `GR8_KV_SHARE_WHEN`): the head offers its blocks to other groups only while
+  the engine is idle, so a give's compaction never pauses a turn. A group starting below its floor is still served.
+  `always`: whenever the node asks.
+
+`tests/share.rs` drives each of these over TCP on loopback; `s2/tests/kv_share_test.cpp` runs two ranks of a pool
+through a grant, a give and a voluntary give to the floor.
 
 ### Still to do
 

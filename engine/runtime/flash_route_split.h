@@ -1,11 +1,12 @@
-// G6_PF_ROUTER_SPLIT layout and row partition; shared by the CPU test and CUDA (flash_route_split.cuh).
+// GR8_PF_ROUTER_SPLIT layout and row partition; shared by the CPU test and CUDA (flash_route_split.cuh).
 // Each rank routes rows [r0(M, rank), r0(M, rank + 1)) and sends them as 64-byte records: the 8 tok_e ints (selection order,
-// -1 = dropped route of a G6_MOE_TOPK cut) then the 8 tok_w floats, raw bits. All 8 slots travel, so a dropped slot reaches the
+// -1 = dropped route of a GR8_MOE_TOPK cut) then the 8 tok_w floats, raw bits. All 8 slots travel, so a dropped slot reaches the
 // peer as the -1 / 0 its owner's k_pf_route wrote and every rank ends with byte-equal tables.
 #pragma once
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include "../knobs-rs/gr8_knobs.h"
 #ifdef __CUDACC__
 #define G6_RS_HD __host__ __device__
 #else
@@ -13,6 +14,7 @@
 #endif
 namespace flash_route_split {
 constexpr int SLOTS = 8, ROW_BYTES = SLOTS * 8;                 // 8 x int32 + 8 x float32
+constexpr int MAX_NR = 8;                                       // ranks of one g6::Fabric (fabric.cpp), any count 2..8
 G6_RS_HD inline int r0(int M, int p, int nr) { return p * M / nr; }          // = g6rt::pf_r0 (the GLM prefill all-gather split)
 G6_RS_HD inline int rows(int M, int p, int nr) { return r0(M, p + 1, nr) - r0(M, p, nr); }
 G6_RS_HD inline int padded_rows(int M, int nr) { return (M + nr - 1) / nr; }   // >= rows(M, p, nr) for every p
@@ -37,3 +39,11 @@ inline void unpack(const uint8_t* slot, int M, int nr, int p, int32_t* tok_e, fl
 }
 } // namespace flash_route_split
 #undef G6_RS_HD
+
+namespace g6rt {
+// GR8_PF_ROUTER_SPLIT: unset = 0, 1 = on (g6m4 dies if the build or topology cannot run it).
+inline int flash_route_split_mode()
+{
+    return knob::pf_router_split() ? 1 : 0;
+}
+}

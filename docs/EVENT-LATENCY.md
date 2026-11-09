@@ -15,16 +15,16 @@ that shape, and both are now fixed:
   (8)` (`s2/scheduler.h`, `Scheduler::horizon`; `s2/service.h`, `event`). During a prefill that is the floor; in pure
   decode it is the cap, which is exactly the old constant's behaviour.
 
-This run attributes what is left, and verifies the sizing on the hardware. It needs `G6_S2_EVENTLOG=1`, because nothing
+This run attributes what is left, and verifies the sizing on the hardware. It needs `GR8_S2_EVENTLOG=1`, because nothing
 else prints the boundary a notice was anchored to.
 
 ## What gets logged
 
 Start the cluster with the diagnostic in the engine environment:
 
-    G6ENV_X="G6_S2_EVENTLOG=1" ./gr8 glm53 up
+    EXTRA_ENV="GR8_S2_EVENTLOG=1" ./gr8 glm53 up
 
-`G6ENV_X` is the launch knob for extra engine environment on every rank. Do **not** export `G6_S2_EVENTLOG` directly:
+`EXTRA_ENV` is the launch knob for extra engine environment on every rank. Do **not** export `GR8_S2_EVENTLOG` directly:
 the engine does not inherit `G6_*` from the environment, and `./gr8 glm53 up` refuses to start while one is set
 ([KNOBS.md](../KNOBS.md)). As a cluster-scope knob it goes into the pre-boot handshake, so either every box runs with it
 or none does.
@@ -96,7 +96,7 @@ the kind of work in each. If TTFT instead tracks `L`, the abort is waiting for t
 
 ## What this run does not settle
 
-- It says nothing about the **3% no-lost-wins rule**. That is the usual gate (`bench/gate/gate.py`), run alongside.
+- It says nothing about the **3% no-lost-wins rule**. That is the usual gate (`./gr8 glm53 bench --baseline`), run alongside.
 - `SESS` at 2 and 4 changes who competes for prefill quanta; if the two disagree about the lookahead, say so rather
   than picking one — that means a third term is in play.
 - The 1.5 ms disconnect is a reproduction of the report, not a specification. The mechanism is the same for any cancel

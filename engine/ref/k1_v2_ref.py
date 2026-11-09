@@ -7,7 +7,7 @@ expert is in the output) + sum over the expert's blocks on this rank of
     svh_d[row] * H128(z),  z = f16(H128(f16(silu(g) * u) * suh_d) @ Wd_block)          (fp16 operands, fp32 sums)
     g, u = f16(f16(H128(f16(f16(H128(x * suh)) @ W_block))) * svh)                       (per matrix)
 with the pack's tr3.table / tr3.kmix / tr3.v1 / v2 / v3 and tile layouts (convert.py, tools/convert/v2.py), the
-codebook rounded to E4M3 for exlr8 layers. It follows the kernel's rounding points; sums differ in order, so the
+layer's codebook (expert_format exlr8-e4m3 = mcg, exlr8-e4m3-mul1, exlr8-e4m3-pmcgx), rounded to E4M3 for exlr8 layers. It follows the kernel's rounding points; sums differ in order, so the
 check is relative: max |out - ref| / max |ref| per token.
 """
 import argparse
@@ -36,10 +36,15 @@ def e4m3_round(v):
     return (np.sign(f) * r).astype(np.float16)
 
 
-def unpack(tiles, k, e4):
+# expert_format -> (E4M3 rounding, codebook)
+FORMATS = {None: (False, 'mcg'), 'tr3': (False, 'mcg'), 'exlr8-e4m3': (True, 'mcg'),
+           'exlr8-e4m3-mul1': (True, 'mul1'), 'exlr8-e4m3-pmcgx': (True, 'pmcgx')}
+
+
+def unpack(tiles, k, e4, cb='mcg'):
     """[kt][nt][32k] uint8 -> W [kt*16][nt*16] fp32."""
     t16 = np.ascontiguousarray(tiles).view(np.int16)
-    w = g6ref.tr3_unpack(t16)
+    w = g6ref.tr3_unpack(t16, cb)
     if e4:
         w = e4m3_round(w)
     return w.astype(np.float32)
@@ -56,10 +61,13 @@ def load(base, layer):
         dt = {'u8': np.uint8, 'f16': np.float16, 'i64': np.int64}[t['dtype']]
         T[n.split('.tr3.', 1)[1]] = np.frombuffer(raw[t['offset']:t['offset'] + t['nbytes']], dt).reshape(t['shape'])
         fmt = t.get('expert_format', fmt)
-    return T, fmt == 'exlr8-e4m3'
+    if fmt not in FORMATS:
+        raise SystemExit(f'layer {layer}: expert_format {fmt!r} is not one this reference decodes')
+    return T, FORMATS[fmt]
 
 
-def expert_partial(T, e, x, e4):
+def expert_partial(T, e, x, fmt):
+    e4, cb = fmt
     tr = T['table'][e]
     o1, o2, row, nb, dk = (int(v) for v in tr[:5])
     km = int(T['kmix'][e]) if 'kmix' in T else 0
@@ -70,7 +78,7 @@ def expert_partial(T, e, x, e4):
         gu = []
         for mat in range(2):
             k = (km >> (4 * (2 * b + mat))) & 15 if km else dk
-            w = unpack(T['fc1'][off:off + k * TB1].reshape(384, 8, 32 * k), k, e4)      # [6144][128]
+            w = unpack(T['fc1'][off:off + k * TB1].reshape(384, 8, 32 * k), k, e4, cb)      # [6144][128]
             off += k * TB1
             suh = (T['sg'][0].astype(np.float32) * np.repeat(T['v1b'][r, mat].astype(np.float32), 128) if 'v1b' in T
                    else T['v1'][r, mat].astype(np.float32))
@@ -80,7 +88,7 @@ def expert_partial(T, e, x, e4):
         act = g6ref.f16(g6ref.silu(gu[0]) * gu[1]).astype(np.float32) * T['v2'][r, 2].astype(np.float32)
         h2 = g6ref.f16(g6ref.had128(act)).astype(np.float32)
         d = T['fc2'][o2 + b * dk * TB1:o2 + (b + 1) * dk * TB1].reshape(384, 8, 32 * dk).transpose(1, 0, 2)
-        wd = unpack(d, dk, e4)                                                              # [128][6144]
+        wd = unpack(d, dk, e4, cb)                                                              # [128][6144]
         z = g6ref.f16(h2 @ wd).astype(np.float32)
         svd = (T['sg'][1].astype(np.float32) * np.repeat(T['v3b'][r].astype(np.float32), 128) if 'v3b' in T
                else T['v3'][r].astype(np.float32))
@@ -95,7 +103,7 @@ def main():
     ap.add_argument('dump')
     ap.add_argument('--tol', type=float, default=0.02)
     a = ap.parse_args()
-    T, e4 = load(a.pack, a.layer)
+    T, fmt = load(a.pack, a.layer)
     raw = open(a.dump, 'rb').read()
     M, flags = np.frombuffer(raw[:8], np.int32)
     o = 8
@@ -109,15 +117,15 @@ def main():
         for k in range(8):
             e = int(te[m, k])
             if (e, m) not in cache:
-                cache[(e, m)] = expert_partial(T, e, x[m:m + 1], e4)[0]
+                cache[(e, m)] = expert_partial(T, e, x[m:m + 1], fmt)[0]
             ref[m] += tw[m, k] * cache[(e, m)]
         if flags & 2:                         # the trellis shared expert, row 256, weight 1
-            ref[m] += expert_partial(T, 256, x[m:m + 1], e4)[0]
+            ref[m] += expert_partial(T, 256, x[m:m + 1], fmt)[0]
     rel = np.abs(out - ref).max(1) / np.maximum(np.abs(ref).max(1), 1e-30)
     cos = (out * ref).sum(1) / np.maximum(np.linalg.norm(out, axis=1) * np.linalg.norm(ref, axis=1), 1e-30)
     ok = bool((rel < a.tol).all())
     print(json.dumps(dict(M=int(M), shared=bool(flags & 2), max_rel=float(rel.max()), min_cos=float(cos.min()), ref_absmax=float(np.abs(ref).max()),
-                          e4m3=e4, kmix=bool('kmix' in T and T['kmix'].any()), ok=ok)))
+                          e4m3=fmt[0], codebook=fmt[1], kmix=bool('kmix' in T and T['kmix'].any()), ok=ok)))
     sys.exit(0 if ok else 1)
 
 

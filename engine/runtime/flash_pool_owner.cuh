@@ -2,18 +2,12 @@
 #pragma once
 #include "../attn/flash_pool_owner.h"
 #include "../comms/fabric.h"
+#include "../knobs-rs/gr8_knobs.h"
 
 namespace g6rt {
-// G6_PF_POOL_OWNER: unset/empty = auto (on for TP2 Flash prefill, off elsewhere), 0 = off, 1 = on (dies if unsupported).
+// GR8_GLM53F_PF_POOL_OWNER: unset = auto (2: on for TP2 Flash prefill, off elsewhere), 0 = off, 1 = on (dies if unsupported).
 inline int flash_pool_owner_mode() {
-    static const int mode = [] {
-        const char* s = getenv("G6_PF_POOL_OWNER");
-        if (!s || !*s) return 2;
-        if (!strcmp(s, "0")) return 0;
-        if (strcmp(s, "1")) die("G6_PF_POOL_OWNER must be 0 or 1");
-        return 1;
-    }();
-    return mode;
+    return (int)knob::glm53f_pf_pool_owner().value_or(2);
 }
 struct FlashPoolTransport {
     g6::Fabric* fabric = nullptr;
@@ -75,7 +69,7 @@ inline int flash_pool_receive(void* opaque, int* indices, const int* positions, 
     const auto st = static_cast<cudaStream_t>(stream);
     const size_t bytes = flash_pool_owner::payload(rows);
     glue::k_wait_peers<<<1, 32, 0, st>>>(p.f, p.step, 0, bytes, glue::ERR_AR);
-    const char* src = p.f.recv + (((p.flow.current & 1) * p.f.ncoll) * p.f.nr + (1 - p.f.rank)) * p.f.stride;
+    const char* src = p.f.recv + g6::fab_recv_off(p.f, (int)(p.flow.current & 1), 0, 1 - p.f.rank);
     const auto e = cudaMemcpyAsync(p.received, src, bytes, cudaMemcpyDefault, st);
     if (e != cudaSuccess) return int(e);
     k_pool_unpack<<<96, 256, 0, st>>>(p.received, indices, positions, rows, p.f.rank, p.f.error);

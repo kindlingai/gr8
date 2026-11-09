@@ -1,14 +1,14 @@
 #pragma once
 // CPU-only state for g6m4's opt-in, one-conversation prefix cache (--reuse-prefix). Ports K2 13e0825 + 18318ee to the
 // K1/CP lineage with one change: the retained prefix is the longest common prefix (LCP) of the new prompt and the
-// previous sequence (prompt + ACTUALLY emitted ids), not only a strict append (strict = G6_REUSE_STRICT=1, the K2 rule).
+// previous sequence (prompt + ACTUALLY emitted ids), not only a strict append (strict = GR8_REUSE_STRICT=1, the K2 rule).
 // Ends are exclusive absolute positions. First-form draft rows alone are valid; chain writes use speculative hidden
 // states and must never advance draft_end. Main row j depends on tokens 0..j; the MTP layer's row j also on token j + 1,
 // so with MTP the retained prefix stops one row before the first differing token.
 // Hit = skip > 0 and (noend or prompt.size() >= written_end): every row the old sequence wrote past the new context is
 // rewritten by this request before any step reads it (kernels read only positions <= the row's own position; the rule
-// is redundant under that, G6_REUSE_NOEND=1 drops it). Miss = reset + full prefill (the switch-off path).
-// The grid (G6_REUSE_ALIGN=1, g6m4 sets grid = the cold prefill grid: --prefill MP, one sub-batch; the lane pairing does
+// is redundant under that, GR8_REUSE_NOEND=1 drops it). Miss = reset + full prefill (the switch-off path).
+// The grid (GR8_REUSE_ALIGN=1, g6m4 sets grid = the cold prefill grid: --prefill MP, one sub-batch; the lane pairing does
 // not change a row): a hit retains
 // only [0, floor(min(skip, pf_end) / grid) * grid), pf_end = the rows prefilled contiguously from 0 in the current sequence
 // (decode-written rows never count). The re-prefill then starts on a cold grid point, and every retained grid cell was one
@@ -24,8 +24,8 @@
 namespace g6rt {
 struct PrefixReuse
 {
-    bool strict = false, noend = false;   // G6_REUSE_STRICT=1 / G6_REUSE_NOEND=1 (g6m4 sets them once)
-    int grid = 0;                       // G6_REUSE_ALIGN=1 -> the cold prefill grid (rows); 0 = off (the old rule)
+    bool strict = false, noend = false;   // GR8_REUSE_STRICT=1 / GR8_REUSE_NOEND=1 (g6m4 sets them once)
+    int grid = 0;                       // GR8_REUSE_ALIGN=1 -> the cold prefill grid (rows); 0 = off (the old rule)
     int pf_end = 0;                     // rows [0, pf_end) of the current sequence were written by prefill, contiguously
     int raw = 0;                        // the last begin()'s skip before the grid rule (log only)
     std::vector<int> history;           // previous full prompt + ACTUALLY emitted outputs

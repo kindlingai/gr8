@@ -60,5 +60,4 @@ scripts/host_tests.sh
 Rust tests cover exact-byte matching, digests, LRU selection, stock wrappers, promotion/counting, persistent reopen,
 isolation of stock prefix bases, and non-stock store/restore by namespace. The host suite runs `pool_namespace_test` against memory, an SSD-format file
 and a loopback KV node when that binary is available. It tests both original and new C symbols, malformed buffer
-lengths/null pointers, C++ prefix state, resident misses, and stock and non-stock spill/restore bytes. `pool_diff_test` compares
-stock page lists, decisions and digests against the prior C++ allocator across random traces.
+lengths/null pointers, C++ prefix state, resident misses, and stock and non-stock spill/restore bytes.

@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -23,6 +24,8 @@ import urllib.request
 import fabric
 import handshake
 import hfsource
+import kvnode
+import mlsource
 import mentat
 import models
 import modelset
@@ -137,7 +140,7 @@ def resolve_model(o, refresh=False, log=log):
     copy used in place. The release is the whole model (V2_DENSE: the engine plans every weight from its files).
     refresh: ask the hub what the revision is now (prepare), instead of the commit recorded at the last resolve."""
     ms = variant = release = None
-    g6load = os.path.join(os.path.abspath(o.get('G6_HOME')), 'bin', 'g6load')   # plans and checks a Hugging Face fetch
+    g6load = os.path.join(os.path.abspath(o.get('GR8_WORK_DIR')), 'bin', 'g6load')   # plans and checks a Hugging Face fetch
     if os.access(g6load, os.X_OK):
         os.environ.setdefault('G6LOAD', g6load)
     try:
@@ -146,11 +149,28 @@ def resolve_model(o, refresh=False, log=log):
         steering = steering_hf.request(o)
         if steering and not hf:
             raise modelset.ModelError('--steering-profile hf:... requires an HF release (--model https://...)')
-        if hf:
+        if models.of(o) is models.PSEUDO:
+            if not modelset.is_pseudo(model):
+                raise modelset.ModelError(f'--model {model}: want a pseudo engine release, a directory with '
+                                          'responses.toml and the tokenizer files')
+            ms = modelset.pseudo_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
+        elif models.of(o) is models.DS41:   # the exlr8 native release, read in place: no index slices, no variants
+            if not modelset.is_release(model):
+                raise modelset.ModelError(f'--model {model}: want a local copy of the DeepSeek-V4.1-Flash exlr8 native '
+                                          'release (dense/, experts/, manifests/, tokenizer.json and tokenizer_config.json)'
+                                          if model else 'no model: pass --model <DeepSeek-V4.1-Flash release directory>')
+            ms = modelset.ds_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
+        elif hf:
             if not o.get('MODEL_CACHE'):
                 raise modelset.ModelError(f'--model {model} needs --model-cache <local dir>: each box fetches its part '
                                           'there')
-            release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log)
+            if o.get('FETCH') == 'model-loader':
+                release = mlsource.of(o, *hf, log=log)
+            else:
+                release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log,
+                                           layout=o.get('LAYOUT'))
+            # GLM-5.3-Flash image input: each rank fetches the vision tower too
+            release.vision = models.of(o) is models.GLM53F and opt.extra_env_value(o, 'GR8_GLM53F_VISION') == '1'
             release.fetch_meta(steering[0] if steering else None)
             o.values['V2'], o.values['V2_SLICES'] = release.v2, release.slices
             model = release.dir
@@ -164,6 +184,8 @@ def resolve_model(o, refresh=False, log=log):
             raise modelset.ModelError(f'--model {model}: want an exlr8 release, https://huggingface.co/<org>/<repo>[@rev] '
                                       'or a local copy of one (dense/, experts/, index-slices/, manifests/)'
                                       if model else 'no model: pass --model <exlr8 release URL or directory>')
+        # a release for the other model is refused here, by name, before the variant, the drafter or any weights
+        models.check_config(models.of(o), ms.tokenizer)
         o.values['V2_DENSE'] = model
         ms.release = release
         search = [model]
@@ -171,7 +193,10 @@ def resolve_model(o, refresh=False, log=log):
         variant = modelset.resolve_variant(spec, o.get('V2'), search, int(o.get('TP')), models.of(o))
         if variant.path:
             o.values['V2_WIDTHS'] = variant.path
-        models.check_config(models.of(o), ms.tokenizer)
+        if o.get('GRAMMAR') == '1' and not o.get('GRAMMAR_DIR'):
+            o.values['GRAMMAR_DIR'] = ms.tokenizer
+        if o.get('GRAMMAR') != '1' or models.of(o) not in (models.GLM53, models.GLM53F):   # g6m4_ds41 takes no grammars
+            o.values['GRAMMAR_DIR'] = None
         steering_hf.bind(o, release)
         steering_local.prepare(o, ms)
         ms.drafter = drafter_of(o, ms, refresh, log)
@@ -181,21 +206,31 @@ def resolve_model(o, refresh=False, log=log):
 
 
 def drafter_of(o, ms, refresh, log):
-    """The DFlash2 drafter for this boot: hfsource.Drafter for --drafter, else None. At TP=4 with no drafter (no
-    --drafter, no DFLASH_DIR), DFLASH defaults to 0 with a notice, and an explicit --dflash 1 is refused."""
-    if o.get('TP') != '4' or not models.of(o).drafter:
+    """The DFlash2 drafter for this boot: hfsource.Drafter for --drafter, else None. At TP=4, TP=2 and TP=1 with no drafter
+    (no --drafter, no DFLASH_DIR), DFLASH defaults to 0 with a notice, and an explicit --dflash 1 is refused. TP=6 (the
+    drafter's body replicated on every rank) the same, except that DFLASH defaults to 0 there: --dflash 1 turns it on."""
+    if o.get('TP') not in ('4', '6', '2', '1') or not models.of(o).drafter:
+        return None
+    if o.get('TP') == '6' and o.get('DFLASH') != '1':
+        if o.get('DRAFTER'):
+            log('--drafter at TP=6 is used with --dflash 1 only: MTP only')
         return None
     if o.get('DRAFTER'):
         if not o.get('MODEL_CACHE'):
             raise modelset.ModelError('--drafter needs --model-cache <local dir>: each box converts its rank there')
         if o.get('DFLASH') == '0':
             return None
-        d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(o.get('DRAFTER')), refresh=refresh, log=log)
+        if o.get('FETCH') == 'model-loader':
+            d = mlsource.drafter_of(o, *hfsource.parse_url(o.get('DRAFTER')), log=log)
+        else:
+            d = hfsource.Drafter(o.get('MODEL_CACHE'), *hfsource.parse_url(o.get('DRAFTER')), refresh=refresh,
+                                 log=log, tp=int(o.get('TP')))
         o.values['DFLASH_DIR'] = d.out
         return d
     if o.get('DFLASH') == '0' or o.get('DFLASH_DIR'):
         return None
-    hint = f'--drafter {hfsource.DRAFTER_URL} (CC BY-NC-ND 4.0: each box fetches and converts it)'
+    url = hfsource.FLASH_DRAFTER_URL if models.of(o) is models.GLM53F else hfsource.DRAFTER_URL
+    hint = f'--drafter {url} (CC BY-NC-ND 4.0: each box fetches and converts it)'
     if o.get('DFLASH') == '1':
         raise modelset.ModelError(f'--dflash 1, but there is no DFlash2 drafter: add {hint}')
     log(f'no DFlash2 drafter: MTP only. For DFlash2, add {hint}')
@@ -244,7 +279,7 @@ class Handler(socketserver.StreamRequestHandler):
 class Supervisor:
     def __init__(self, o):
         self.o = o
-        self.home = os.path.abspath(o.get('G6_HOME'))
+        self.home = os.path.abspath(o.get('GR8_WORK_DIR'))
         self.out = os.path.join(self.home, 'out')
         self.port = o.int('CONTROL_PORT')
         self.stop_ev = threading.Event()
@@ -255,27 +290,40 @@ class Supervisor:
         self.head_ready = threading.Event()
         self.engine = None
         self.helpers = {}             # the head's front end and shim: name -> Popen
+        self.donor = False            # a KV node beside a Flash serve runs (donate)
         self.agent = self.api_agent = None
         self.rank, self.lan, self.members, self.hs = None, None, [], {}
         self.state = 'starting'
+        self.state_lock = threading.RLock()
+        self.serving_urls = {}        # retain early notifications by epoch until the handshake chooses a boot
         self.servers = []
         self.locked = self.started = False
         self.ms, self.model_error, self.rails, self.fabric_error = None, '', ('', ''), ''
+        # with mentat: every rank's rails as this box's election chose them (the head's choice is the one used), and
+        # this box's rdma addresses, any of which the head may choose for it
+        self.elected, self.rdma = None, []
+        # --shape ring with mentat: the plan, this box's devices, and the client link that holds the ring claim
+        self.ring, self.ring_devs, self.ring_ports, self.claim_link = '', None, {}, None
         self.offers = self.variant = self.model_id = None
         self.lingered = False
         self.check_n, self.check_lock = 0, threading.Lock()   # the engine's DIR/check.<n>, numbered per boot
 
     # ---- state ----------------------------------------------------------------------------------------------------
     def set_state(self, state, **meta):
-        self.state = state
-        if not self.locked:
-            return
-        tmp = os.path.join(self.out, 'gr8.state.tmp')
-        with open(tmp, 'w') as f:
-            json.dump({'state': state, 'rank': self.rank, 'pid': os.getpid(), 'time': time.time()}, f)
-        os.replace(tmp, os.path.join(self.out, 'gr8.state'))
-        if self.agent:
-            self.agent.set_meta(**{'gr8.state': state[:1024], 'gr8.rank': self.rank}, **meta)
+        with self.state_lock:
+            url = self.serving_urls.get(self.hs.get('epoch'))
+            if state == 'loading' and url is not None:
+                state = 'serving'
+                log(f'the head serves {url}')
+            self.state = state
+            if not self.locked:
+                return
+            tmp = os.path.join(self.out, 'gr8.state.tmp')
+            with open(tmp, 'w') as f:
+                json.dump({'state': state, 'rank': self.rank, 'pid': os.getpid(), 'time': time.time()}, f)
+            os.replace(tmp, os.path.join(self.out, 'gr8.state'))
+            if self.agent:
+                self.agent.set_meta(**{'gr8.state': state[:1024], 'gr8.rank': self.rank}, **meta)
 
     # ---- the control port -----------------------------------------------------------------------------------------
     def serve(self, addrs):
@@ -292,6 +340,7 @@ class Supervisor:
     def allowed(self, peer):
         """The members' LAN and fabric addresses, and this box's own. Known once the members are."""
         known = set(self.members) | set(self.rails) | set(self.hs.get('ips', [])) | set(self.hs.get('ips2', []))
+        known |= {a for r in self.elected or [] for a in r}
         if self.head:
             known |= {a for h in self.head.have.values() for a in h['rails']}
         return peer in known or fabric.is_local(peer)
@@ -325,9 +374,16 @@ class Supervisor:
             self.request_stop(f'rank {m.get("rank")} ({peer}) failed: {m.get("why")}', all_boxes=True)
             return {'t': 'ok'}
         if t == 'serving':
-            if self.state == 'loading':
-                self.set_state('serving')
-                log(f'the head serves {m.get("url")}')
+            epoch = m.get('epoch')
+            if not isinstance(epoch, int):
+                return {'t': 'ok', 'detail': 'no boot epoch'}
+            with self.state_lock:
+                if self.hs and epoch != self.hs.get('epoch'):
+                    return {'t': 'ok', 'detail': 'not this boot'}
+                self.serving_urls[epoch] = m.get('url', '')
+                if self.state == 'loading' and epoch == self.hs.get('epoch'):
+                    self.set_state('serving')
+                    log(f'the head serves {self.serving_urls[epoch]}')
             return {'t': 'ok'}
         if t == 'logs':
             return self.read_log(m.get('which', 'engine'), int(m.get('offset', -8192)))
@@ -426,6 +482,10 @@ class Supervisor:
         self.locked = True
         with open(os.path.join(self.out, 'supervisor.pid'), 'w') as f:
             f.write(f'{os.getpid()}\n')
+        # gr8 down reads this box's quit wait here: a store given only on the up command line is in self.o, not in
+        # the environment down parses
+        with open(os.path.join(self.out, 'quit_wait'), 'w') as f:
+            f.write(f'{quit_wait(self.o)}\n')
         for p in ('handshake.json', 'gr8.state'):
             try:
                 os.unlink(os.path.join(self.out, p))
@@ -436,6 +496,8 @@ class Supervisor:
             log(f'warning: {w}')
         log(f'gr8 {version(self.home)}, options ({o.file or "no config file"}; command line > file > environment > default):')
         log(opt.summary(o))
+        for line in opt.kv_describe(o):
+            log(line)
         tp = int(o.get('TP'))
         # a box that cannot resolve its model still joins, so every box hears why the boot stops
         self.ms, self.variant, self.model_error = resolve_model(o)
@@ -453,7 +515,8 @@ class Supervisor:
         self.offers = None if self.ms else []     # a release serves any rank; a box without a model serves none
         log(f'this box can serve rank {mentat.format_offers(self.offers) or "none"} of the model set')
         self.rendezvous(tp)
-        c, text, digest = opt.canonical(o, self.tmpl, self.members if opt.mode(o) == 'peers' else None, self.variant)
+        c, text, digest = opt.canonical(o, self.tmpl, self.members if opt.mode(o) == 'peers' else None, self.variant,
+                                        ring=self.ring)
         self.opts, self.digest = c, digest
         log(f'rank {self.rank} of {tp} ({self.lan}, rails {self.rails[0]} {self.rails[1]}), cluster options '
             f'{digest[:16]}, engine {self.build[:16]}')
@@ -461,7 +524,7 @@ class Supervisor:
             self.agent.set_meta(**{'gr8.set': self.model_id or 'none', 'gr8.variant': str(self.variant or ''),
                                    'gr8.opts': digest,
                                    'gr8.ips': ','.join(self.rails)})
-        self.serve([a for a in (self.lan, *self.rails) if a])
+        self.serve([a for a in (self.lan, *self.rails, *self.rdma) if a])
         self.set_state('preparing')
         fails = self.checks()
         for f in fails:
@@ -473,7 +536,7 @@ class Supervisor:
                  'engine_build': self.build, 'fails': fails, 'version': version(self.home),
                  'offers': mentat.format_offers(self.offers)}
         self.set_state('handshake')
-        verdict = self.handshake_head(hello) if self.rank == 0 else self.handshake_worker(hello)
+        verdict = self.handshake(hello)
         if verdict.get('t') == 'ok' and fails:   # never boot past a failed check, whatever the verdict
             verdict = {'t': 'refused', 'field': 'checks', 'values': {}, 'detail': '; '.join(fails), 'exit': 4}
         if verdict.get('t') != 'ok':
@@ -481,7 +544,13 @@ class Supervisor:
             e = Stop(verdict.get('exit', 4), f'handshake refused: {verdict["field"]}')
             e.logged = True
             raise e
-        self.hs = verdict
+        with self.state_lock:
+            self.hs = verdict
+            self.serving_urls = {e: url for e, url in self.serving_urls.items() if e == verdict['epoch']}
+        if verdict.get('ips'):     # the head's rails for this box, which may differ from its own election's
+            self.rails = (verdict['ips'][self.rank], verdict['ips2'][self.rank])
+            if self.agent:
+                self.agent.set_meta(**{'gr8.ips': ','.join(self.rails)})
         with open(os.path.join(self.out, 'handshake.json'), 'w') as f:
             json.dump({**verdict, 'rank': self.rank, 'control_port': self.port}, f, indent=1)
         self.boot()
@@ -507,10 +576,14 @@ class Supervisor:
             self.agent = mentat.Agent(self.daemon, group, f'{group}@gr8@{node_ip}', node_ip, log=log)
             self.agent.set_meta(**{'gr8.version': version(self.home), 'gr8.tp': tp, 'gr8.shape': o.get('SHAPE'),
                                    'gr8.state': 'joining', 'gr8.offers': mentat.format_offers(self.offers)})
+            publish = self.ring_publisher() if o.get('SHAPE') == 'ring' else None
+            if publish:
+                self.claim_link = mentat.ClaimLink(self.daemon, group, f'{group}@gr8-ring@{node_ip}')
             self.agent.start()
             self.set_state('joining')
             try:
-                ranks, _ = mentat.elect(self.daemon, group, tp, o.get('HEAD'), o.int('JOIN_TIMEOUT'), log=log)
+                ranks, _ = mentat.elect(self.daemon, group, tp, o.get('HEAD'), o.int('JOIN_TIMEOUT'), log=log,
+                                        ring=self.claim_link, publish=publish)
             except mentat.NoAssignment as e:
                 raise Stop(4, str(e))
             except RuntimeError as e:
@@ -520,11 +593,15 @@ class Supervisor:
                 raise Stop(1, f'this box ({node_ip}) is not among the members {",".join(self.members)}')
             self.rank, self.lan = self.members.index(node_ip), node_ip
             log(f'mentat group {group}: {",".join(self.members)}; this box is rank {self.rank}')
+            if publish:
+                self.ring_from(ranks)
             if not o.get('IPS') and o.get('SHAPE') != 'ring':
                 self.rails = ranks[self.rank][2]
+                self.elected = [r[2] for r in ranks]
+                self.rdma = mentat.node_view(local)[2]
                 for p in mentat.probe_problems(local, ranks, node_ip, self.rails):
                     log(f'warning: {p}')
-        if o.get('SHAPE') == 'ring':    # no switch: the engine bootstraps over the LAN and finds its devices by name
+        if o.get('SHAPE') == 'ring' or not fabric_needed(o):   # no switch, or one box: the engine bootstraps over the LAN
             self.rails = (self.lan, self.lan)
         elif o.get('IPS'):
             self.rails = (opt.split_list(o.get('IPS'))[self.rank], opt.split_list(o.get('IPS2'))[self.rank])
@@ -535,6 +612,69 @@ class Supervisor:
                 self.fabric_error = f'fabric: {e}'
                 log(self.fabric_error)
 
+    def ring_publisher(self):
+        """--shape ring in mentat mode: a callable that publishes this box's gr8.roots meta (its RoCE v2 addresses and
+        their PCIe root) when it changes. Stop(1) when this box has no RoCE v2 address."""
+        def read_ports():
+            try:
+                return fabric.ring_ports()
+            except OSError as e:
+                raise Stop(1, f'--shape ring: cannot read /sys/class/infiniband ({e})')
+        self.ring_ports = read_ports()
+        if not self.ring_ports:
+            raise Stop(1, '--shape ring: no ACTIVE RoCE v2 address under /sys/class/infiniband: are the ring cables '
+                          'in and addressed?')
+        said = [None]
+
+        def publish():
+            # read again each time: a port that finishes link training during the wait joins the ring
+            self.ring_ports = read_ports()
+            text = mentat.format_roots({a: r for a, (_, r) in self.ring_ports.items()})
+            if text != said[0]:
+                said[0] = text
+                self.agent.set_meta(**{mentat.ROOTS_META: text})
+        return publish
+
+    def handshake(self, hello):
+        """The handshake's verdict, after which the ring claim is let go: every box that passed it has the view, and
+        one that failed claims afresh on its next boot."""
+        try:
+            return self.handshake_head(hello) if self.rank == 0 else self.handshake_worker(hello)
+        finally:
+            self.release_claim()
+
+    def release_claim(self):
+        """Close the ring claim's link: once every box has, mentat drops the claim and the next boot solves afresh."""
+        if self.claim_link:
+            self.claim_link.close()
+
+    def ring_from(self, ranks):
+        """This box's --ring-devs from the ring mentat's probes form: its four addresses, mapped to device names. An
+        explicit --ring-devs wins."""
+        ports = ranks[self.rank][2]
+        self.ring = mentat.ring_text([lan for lan, _, _ in ranks], [p for _, _, p in ranks], self.claim_link.tag)
+        log(f'ring (mentat claim {self.claim_link.tag}): {" -> ".join(lan for lan, _, _ in ranks)} -> {ranks[0][0]}; '
+            f'this box\'s relay-out, next, relay-in, prev: {",".join(ports)}')
+        devs = [self.ring_ports[a][0] for a in ports]
+        for a, d in zip(ports, devs):
+            others = sorted(x for x, (dd, _) in self.ring_ports.items() if dd == d and x != a)
+            if others:   # the engine takes the device's first RoCE v2 IPv4 GID (fabric.cpp ring_gid_index)
+                log(f'warning: --shape ring: {d} carries {a} and {", ".join(others)}; the engine uses its first RoCE '
+                    'v2 address, which may not be the one on the cable')
+        if self.o.get('RING_DEVS'):
+            if opt.split_list(self.o.get('RING_DEVS')) != devs:
+                log(f'warning: --ring-devs {self.o.get("RING_DEVS")} overrides the cabling mentat found '
+                    f'({",".join(devs)})')
+        else:
+            self.ring_devs = ','.join(devs)
+
+    def ring_args(self):
+        """The engine's ring flags: --ring, and --ring-devs from the option or else from mentat's probes."""
+        if self.o.get('SHAPE') != 'ring':
+            return []
+        devs = self.o.get('RING_DEVS') or self.ring_devs
+        return ['--ring', *(['--ring-devs', devs] if devs else [])]
+
     def checks(self, copy=True):
         """What would stop this box's boot, as text. copy: fetch this rank's model files first. The rank's files are
         checked only once the rank is known, and the front end only on rank 0."""
@@ -544,9 +684,9 @@ class Supervisor:
                 pass
             elif copy:
                 rel = self.ms.release
-                if rel and rel.check(int(o.get('TP')), self.rank, self.variant):
+                if rel and (getattr(rel, 'pins', False) or rel.check(int(o.get('TP')), self.rank, self.variant)):
                     rel.fetch_rank(int(o.get('TP')), self.rank, self.variant)
-                if self.ms.drafter and self.ms.drafter.check(self.rank):
+                if self.ms.drafter and (getattr(self.ms.drafter, 'pins', False) or self.ms.drafter.check(self.rank)):
                     self.ms.drafter.fetch_rank(self.rank)
             if self.ms and self.rank is not None:
                 if self.ms.release:
@@ -569,7 +709,7 @@ class Supervisor:
             name = engine_bin(o)
             fails.append(f'no {self.home}/bin/{name}: ' + ('KV_FORMAT=int4 ' if name.endswith('-int4') else '') +
                          f'./gr8 {models.of(o).name} build')
-        if not os.path.isdir('/dev/infiniband'):
+        if fabric_needed(o) and not os.path.isdir('/dev/infiniband'):
             fails.append('no /dev/infiniband')
         if self.rank == 0:
             if not os.access(self.front_bin(), os.X_OK):
@@ -579,7 +719,10 @@ class Supervisor:
                              f'{self.home}/venv/bin/pip install -r frontend/requirements.txt')
         m = mem_available_gib()
         log(f'MemAvailable {m} GiB' if m is not None else 'MemAvailable unknown')
-        if m is not None and m < 8:
+        if m is not None and m < 8 and models.of(o).dialect == 'ds41':
+            fails.append(f'MemAvailable is {m} GiB: the engine stops a boot under GR8_MEM_MIN (8 GiB), so something else '
+                         'holds this box\'s memory; free it first')
+        elif m is not None and m < 8:
             need = (f'about {modelset.expert_gb(self.variant.path, int(o.get("TP"))):.0f} GB of experts'
                     if self.variant and self.variant.path else 'most of the box')
             log(f'warning: MemAvailable is {m} GiB before boot: something else holds memory (a rank at '
@@ -596,14 +739,20 @@ class Supervisor:
         tp = len(self.members)
         log(f'head: waiting for {tp - 1} hellos on {self.lan}:{self.port}')
         if self.head.wait_all(opt_timeout(self.o), self.stop_ev):
-            bad = self.rail_check()
+            have = self.head.have
+            # with mentat the head's election decides every rank's rails: each box chose from its own probe table,
+            # and two tables can disagree during a boot
+            rails = self.elected or [tuple(have[r]['rails']) for r in range(tp)]
+            for r in range(1, tp):
+                if tuple(have[r]['rails']) != tuple(rails[r]):
+                    log(f'head: rank {r} proposed rails {" ".join(have[r]["rails"])}; using {" ".join(rails[r])}')
+            bad = self.rail_check(rails)
             if bad:
-                self.head.decide(handshake.refusal('fabric', self.head.have, lambda x: ','.join(x['rails']), bad))
+                self.head.decide(handshake.refusal('fabric', have, lambda x: ','.join(rails[x['rank']]), bad))
             else:
-                have = self.head.have
                 self.head.decide({'t': 'ok', 'epoch': int(time.time()), 'members': self.members,
-                                  'ips': [have[r]['rails'][0] for r in range(tp)],
-                                  'ips2': [have[r]['rails'][1] for r in range(tp)],
+                                  'ips': [rails[r][0] for r in range(tp)],
+                                  'ips2': [rails[r][1] for r in range(tp)],
                                   'homes': {str(r): have[r]['home'] for r in range(tp)}, 'set_id': self.model_id,
                                   'variant': self.variant.name,
                                   'opts_digest': self.digest, 's2port': self.tmpl['knobs'].get('S2PORT'),
@@ -625,18 +774,19 @@ class Supervisor:
             if self.head is not None:
                 self.head.wait_told(opt_timeout(self.o), self.stop_ev)
 
-    def rail_check(self):
-        """From each of the head's rails to the same rail of every worker: the control port must answer."""
+    def rail_check(self, rails):
+        """From each of the head's rails to the same rail of every worker (rails: every rank's pair): the control port
+        must answer."""
         bad = []
         for r, h in sorted(self.head.have.items()):
             if r == 0:
                 continue
             for k in range(2):
                 try:
-                    handshake.call(h['rails'][k], self.port, {'t': 'ping'}, timeout=3, bind=self.rails[k])
+                    handshake.call(rails[r][k], self.port, {'t': 'ping'}, timeout=3, bind=rails[0][k])
                 except OSError as e:
-                    bad.append(f'rank {r} ({h["lan"]}) does not answer on rail {k} at {h["rails"][k]} from '
-                               f'{self.rails[k]} ({e})')
+                    bad.append(f'rank {r} ({h["lan"]}) does not answer on rail {k} at {rails[r][k]} from '
+                               f'{rails[0][k]} ({e})')
         return '; '.join(bad)
 
     def handshake_worker(self, hello):
@@ -650,7 +800,15 @@ class Supervisor:
         lib = os.path.join(self.home, 'bin', 'lib')
         if os.path.isdir(lib):        # cuBLAS from build.sh BUNDLE_LIBS=1, at any TP
             env['LD_LIBRARY_PATH'] = lib
+        if self.borrow_idle(plan.get('knobs') or {}):
+            # this box's host ledger (donate() creates it); the engine writes the bytes it may lend next to it (.gpu)
+            out = kvnode.out_dir(kvnode.parse(['--work-dir', self.home], dict(os.environ)))
+            os.makedirs(out, exist_ok=True)
+            env['GR8_GLM53F_KV_LEDGER'] = os.path.join(out, 'ledger')
         return env
+
+    def borrow_idle(self, knobs):
+        return models.of(self.o).name == 'glm53f' and knobs.get('FLASH_CAP_POLICY') == 'borrow-idle'
 
     # ---- after the handshake --------------------------------------------------------------------------------------
     def front_bin(self):
@@ -676,7 +834,7 @@ class Supervisor:
             nodes = mentat.kv_nodes(self.daemon.group_status(g), g)
         except (OSError, RuntimeError, ValueError) as e:
             raise Stop(1, f'{flag} remote:auto: mentat: {e}')
-        target = mentat.kv_target(nodes, self.rails, self.rank)
+        target = mentat.kv_target(nodes, self.rails, self.rank, mentat.local_nets())
         if not target:
             raise Stop(1, f'{flag} remote:auto: no KV node in group {g} (./gr8 kv up on a box with spare memory)')
         return target
@@ -688,8 +846,7 @@ class Supervisor:
             return None
         target = self.kv_node('--kv-store')
         log(f'KV store: the KV node at {target}')
-        return ';'.join(t['text'].replace('remote:auto', f'remote:{target}', 1) if t['host'] == 'auto' else t['text']
-                        for t in stores)
+        return opt.kv_store_with(self.o, target)
 
     def kv_rows(self):
         """KV_ROWS for this box's engine: remote:auto becomes the KV node by this box's rails, as for KV_STORE (odd ranks
@@ -712,11 +869,10 @@ class Supervisor:
         self.check_n = 0
         env = self.engine_env(plan)
         # Flash takes the second rail for prefill only
-        ips2 = '--ips2' if models.of(o).name == 'glm53' else '--pf-ips2'
+        ips2 = '--ips2' if models.of(o).name in ('glm53', 'ds41') else '--pf-ips2'
         argv = ['./bin/' + engine_bin(o), '--rank', str(r), '--ips', ','.join(hs['ips']), ips2, ','.join(hs['ips2']),
                 '--proxy-cpu', o.get('PROXY_CPU'), *plan['args']]
-        if o.get('SHAPE') == 'ring':
-            argv[1:1] = ['--ring', *(['--ring-devs', o.get('RING_DEVS')] if o.get('RING_DEVS') else [])]
+        argv[1:1] = self.ring_args()
         log(f'engine: {" ".join(plan["env"])} {" ".join(argv)}')
         rotate_logs(self.out, [f'g6m4.r{r}.txt', f'g6m4.r{r}.err'])
         with open(os.path.join(self.out, f'g6m4.r{r}.txt'), 'wb') as so, \
@@ -733,8 +889,11 @@ class Supervisor:
         tmo = float(plan['knobs'].get('READY_TMO') or 1800)
         t0, ask_at = time.monotonic(), tmo
         log(f'engine started (epoch {hs["epoch"]}); waiting for it to load (up to {tmo:.0f}s)')
+        relay = StageRelay(os.path.join(self.out, f'g6m4.r{r}.err')) if models.of(o).dialect == 'ds41' else None
         while True:
             self.watch()
+            for line in relay.new() if relay else ():
+                log(f'{time.monotonic() - t0:6.0f}s {line}')
             if r == 0:
                 if os.path.exists(ready):
                     break
@@ -748,11 +907,65 @@ class Supervisor:
                 ask_at += 30
             elif time.monotonic() - t0 > tmo + 600:
                 raise Stop(1, 'the head did not report serving')
-            time.sleep(1)
+            time.sleep(0.1 if r == 0 else 1)
+        for line in relay.new() if relay else ():
+            log(f'{time.monotonic() - t0:6.0f}s {line}')
         if r == 0:
             log(f'engines ready after {time.monotonic() - t0:.0f}s')
             self.start_shim(work)
+        self.donate(plan['knobs'])
         self.run_forever()
+
+    def donate(self, knobs):
+        """GLM-5.3-Flash with FLASH_KV_DONATE_GIB > 0: lend this box's spare memory, measured now that the serve has
+        booted, to a KV node beside it (D-331 M7): flash_donor_budget GiB, a host ledger crediting them to the node,
+        and ./gr8 kv up --lazy-lock --ledger. The node is its own supervisor: its failure, or no budget, leaves the
+        serve as it is."""
+        if models.of(self.o).name != 'glm53f' or float(knobs.get('FLASH_KV_DONATE_GIB') or 0) <= 0:
+            return
+        ko = kvnode.parse(['--work-dir', self.home], dict(os.environ))
+        env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'KV_MIN_FREE_GB': ko.get('KV_MIN_FREE_GB'),
+               **{k: knobs.get(k) or '' for k in ('FLASH_KV_DONATE_GIB', 'FLASH_KV_GROWTH_GIB')}}
+        script = os.path.join(opt.REPO, 'scripts', 'engine_args.sh')
+        r = subprocess.run(['bash', '-c', '. "$0"; flash_donor_budget', script], env=env, capture_output=True,
+                           text=True)
+        gib = int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else 0
+        if gib <= 0:
+            why = r.stderr.strip() or 'MemAvailable leaves nothing above FLASH_KV_GROWTH_GIB + KV_MIN_FREE_GB'
+            log(f'KV donation: none ({why})')
+            return
+        out = kvnode.out_dir(ko)
+        os.makedirs(out, exist_ok=True)
+        ledger = os.path.join(out, 'ledger')
+        # FLASH_CAP_POLICY=borrow-idle: the GPU's lendable KV chunks (the engine wrote their bytes at boot) are booked
+        # as the GPU's, and the node may grow into them once lent
+        gpu = gpu_lendable(ledger) if self.borrow_idle(knobs) else 0
+        if self.borrow_idle(knobs) and not gpu:
+            log(f'KV donation: no {ledger}.gpu from the engine; it lends no GPU chunks')
+        lb = ledger_bin(self.home)
+        try:
+            if not lb:
+                raise RuntimeError('no kvman-ledger: ./gr8 glm53 build')
+            # a transfer left pending by a node or rank that died with its memory: its bytes go to free
+            subprocess.run([lb, ledger, 'recover', '--stale-s', '0'], capture_output=True, text=True)
+            n = str(gib << 30)
+            for argv in ([lb, ledger, 'init', '--total', str((gib << 30) + gpu), '--node', n, '--gpu', str(gpu)],
+                         [sys.executable, kvnode.HERE, 'up', '--work-dir', self.home, '--gb', str(gib + (gpu >> 30)),
+                          '--lazy-lock',
+                          '--ledger', ledger, '--group', knobs['FLASH_KV_GROUP'],
+                          # this serve's mentat, or none when it finds its boxes by PEERS (kv up announces through
+                          # localhost otherwise, and fails on a box without mentatd)
+                          '--mentat', self.o.get('MENTAT') or 'none']):
+                p = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                if p.returncode:
+                    raise RuntimeError(f'{os.path.basename(argv[1] if argv[0] == sys.executable else argv[0])}: '
+                                       f'{(p.stderr or p.stdout).strip()[-400:]}')
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+            log(f'KV donation of {gib} GiB failed; the serve goes on without it: {e}')
+            return
+        self.donor = True
+        log(f'KV donation: a KV node beside the serve for group {knobs["FLASH_KV_GROUP"]}, {gib} GiB, locked lease '
+            f'by lease (ledger {ledger})' + (f', and {gpu} bytes of GPU KV chunks lent while idle' if gpu else ''))
 
     def start_front(self, plan):
         o = self.o
@@ -762,7 +975,17 @@ class Supervisor:
             os.unlink(sock)
         except FileNotFoundError:
             pass
+        model = models.of(o)
         front = [self.front_bin()]
+        if model.dialect != 'glm':
+            front += ['--dialect', model.dialect]
+        if model.served:
+            front += ['--served-model-name', *model.served]
+        if model is models.DS41 and plan['knobs'].get('REUSE') == '1':
+            front += ['--enable-prompt-tokens-details']
+        elif model.dialect == 'glm':
+            # glm keeps prefix reuse on and the engine reports reused rows in the a line, so report them
+            front += ['--enable-prompt-tokens-details']
         if o.get('DEFAULT_MAX_TOKENS') != '0':
             front += ['--default-max-tokens', o.get('DEFAULT_MAX_TOKENS')]
         else:   # a request within the limit, guard rows included, shares decode steps: keep a page in hand for the guard
@@ -771,6 +994,23 @@ class Supervisor:
             front += ['--default-reasoning-effort', o.get('DEFAULT_REASONING_EFFORT')]
         if o.get('DEFAULT_THINKING_BUDGET') != '0':
             front += ['--default-thinking-budget', o.get('DEFAULT_THINKING_BUDGET')]
+        for k in ('DEFAULT_PRESENCE_PENALTY', 'DEFAULT_FREQUENCY_PENALTY'):
+            if o.get(k) != '0':
+                front += ['--' + k.lower().replace('_', '-'), o.get(k)]
+        if o.get('DEFAULT_THINK_END_BOOST'):
+            front += ['--default-think-end-boost', o.get('DEFAULT_THINK_END_BOOST')]
+        if o.get('DEFAULT_SEQUENCE_PENALTY'):
+            front += ['--default-sequence-penalty', o.get('DEFAULT_SEQUENCE_PENALTY')]
+        if o.get('TOOL_REPEAT_GUARD') == '1':
+            front += ['--tool-repeat-guard', '1']
+            for k, dflt in (('TOOL_REPEAT_GUARD_REPEATS', '2'), ('TOOL_REPEAT_GUARD_TEMPERATURE', '0.7'),
+                            ('TOOL_REPEAT_GUARD_RETRIES', '2')):
+                if o.get(k) != dflt:
+                    front += ['--' + k.lower().replace('_', '-'), o.get(k)]
+        if o.get('ALLOW_THINKING_OFF') == '1' and model.dialect == 'glm':   # ds41 turns thinking off by itself
+            front += ['--allow-thinking-off']
+        if o.get('UNDECLARED_TOOL_CALLS') != 'text':
+            front += ['--undeclared-tool-calls', o.get('UNDECLARED_TOOL_CALLS')]
         self.spawn('front', self.pin() + front + ['--model-dir', self.ms.tokenizer, '--engine-sock', sock,
                                                   '--port', o.get('PORT'), '--supervisor', f'{self.lan}:{self.port}'],
                    os.path.join(REPO, 'frontend'))
@@ -786,10 +1026,24 @@ class Supervisor:
         """The shim drives the head's engine directory. The head engine passes requests to the other ranks itself, over
         its control links."""
         sock = os.path.join(self.home, 'run', 'engine.sock')
+        # the sessions the engine runs: --sess, else the model's default from scripts/engine_args.sh (DS41 5; GLM-5.3 8;
+        # GLM-5.3-Flash 8, 4 or 1 at TP 4, 3 or 2), never a fixed 8 (a DS41 shim that divided the 5 slabs by 8 capped a
+        # request at 163,830 tokens)
+        sess = opt.engine_plan(self.o)['knobs'].get('SESS') or self.o.get('SESS') or '8'
         argv = [self.py(), os.path.join(REPO, 'frontend', 'g6s2shim.py'), '--dir', work, '--sock', sock,
-                '--sessions', self.o.get('SESS') or '8']
+                '--sessions', sess]
+        model = models.of(self.o)
+        if model is models.DS41:  # DS41 pool_rows = SESS * per-session CAP, unlike the shared GLM pool
+            argv += ['--capacity-slots', sess]
+        if model.vocab:     # the shim's hello and id bound default to GLM-5.3's: a DeepSeek engine takes ids 0..129279 only
+            argv += ['--model-name', (model.served or (model.name,))[0], '--vocab-size', str(model.vocab),
+                     '--eos-ids', ','.join(map(str, model.eos_ids))]
         if self.o.get('TP') == '6':
             argv += ['--stall-timeout', '2400']
+        # the longest request (prompt + max_tokens): MAX_MODEL_LEN, else the model's max positions. The shim takes the
+        # smaller of it and the pool's room (pool_rows / capacity_slots - guard), and the front end reads the result from
+        # the shim's hello, so the two never disagree
+        argv += ['--max-model-len', str(self.o.get('MAX_MODEL_LEN') or model.max_positions)]
         self.spawn('shim', self.pin() + argv, REPO, env={**os.environ, 'PYTHONPATH': os.path.join(REPO, 'frontend')})
         for _ in range(150):
             if os.path.exists(sock):
@@ -816,7 +1070,7 @@ class Supervisor:
         self.set_state('serving')
         for r in range(1, len(self.members)):
             for _ in range(10):
-                if self.tell(r, {'t': 'serving', 'url': url}):
+                if self.tell(r, {'t': 'serving', 'url': url, 'epoch': self.hs['epoch']}):
                     break
                 time.sleep(1)
         if self.agent:
@@ -897,8 +1151,13 @@ class Supervisor:
                               'epoch': self.hs['epoch']})
         elif self.hs and self.rank and code and not self.stop_failed:
             self.tell_head({'t': 'abort', 'rank': self.rank, 'why': first})
+        if self.donor:
+            subprocess.run([sys.executable, kvnode.HERE, 'down', '--work-dir', self.home], capture_output=True,
+                           timeout=60, stdin=subprocess.DEVNULL)
+            self.donor = False
         if self.started:
-            stop_local(self.home, log)
+            stop_local(self.home, log, quit_wait(self.o))
+        self.release_claim()
         if self.agent:
             self.agent.stop()
         if self.api_agent:
@@ -907,6 +1166,29 @@ class Supervisor:
             self.set_state('stopped')
         for s in self.servers:
             s.shutdown()
+
+
+def gpu_lendable(ledger):
+    """The bytes of KV chunks the Flash engine may lend (it writes LEDGER.gpu at boot under borrow-idle), or 0."""
+    try:
+        with open(ledger + '.gpu') as f:
+            v = f.read().strip()
+    except OSError:
+        return 0
+    return int(v) if v.isdigit() else 0
+
+
+def ledger_bin(home):
+    for p in (os.path.join(home, 'bin', 'kvman-ledger'),
+              os.path.join(opt.REPO, 'engine', 'target', 'release', 'kvman-ledger')):
+        if os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def fabric_needed(o):
+    """Whether the ranks talk over RDMA: a model with a fabric, on more than one box."""
+    return models.of(o).fabric and int(o.get('TP') or 0) > 1
 
 
 def engine_bin(o):
@@ -933,6 +1215,30 @@ def engine_build(home, name='g6m4'):
 
 def opt_timeout(o):
     return float(o.int('JOIN_TIMEOUT'))
+
+
+# The engine's boot-stage lines on stderr: "# rank R: boot 41.3 s <phase>" at each phase of the boot (connect, weights, graph
+# capture), and the loader's "# rank R: pack 72.1 GB loaded + sha256-checked in 190.2 s (0.38 GB/s)" / "... -> device image".
+BOOT_STAGE = re.compile(r'^# rank (\d+): (boot \d+(?:\.\d+)? s .*|pack \d.*|.* -> device image .*)$')
+
+
+class StageRelay:
+    """Reads a rank's engine stderr as it grows and returns the boot-stage lines, so the supervisor log shows each rank's
+    breakdown while the engine loads (startup first: where the minutes go, per rank)."""
+
+    def __init__(self, path):
+        self.path, self.pos, self.partial = path, 0, b''
+
+    def new(self):
+        try:
+            with open(self.path, 'rb') as f:
+                f.seek(self.pos)
+                data = f.read()
+        except OSError:
+            return []
+        self.pos += len(data)
+        *whole, self.partial = (self.partial + data).split(b'\n')
+        return [m.group(0)[2:] for m in (BOOT_STAGE.match(ln.decode(errors='replace')) for ln in whole) if m]
 
 
 def tail(path, n, nbytes=65536):
@@ -1002,8 +1308,30 @@ def signal_pid(pid, sig, name, log=log):
         log(f'{name} (pid {pid}) belongs to another account: not stopped')
 
 
-def stop_local(home, log=log):
-    """Stop this box: shim and front end, then quit files, then the engine."""
+def quit_wait(o):
+    """Seconds an engine gets for its orderly quit before SIGTERM: 120 with a persist=on ssd store that keeps sessions
+    (KV_STORE keep=sessions or all, or KV_KEEP): the quit stores the pool's runs there for the next boot. Else 10.
+    The engine also needs --set-id for that store's index; the launcher always passes one (modelset.py set_id)."""
+    try:
+        stores = opt.kv_stores(o)
+    except Exception:
+        return 10
+    keep = o.get('KV_KEEP') or 'system'
+    whole = any(t['kind'] == 'ssd' and t.get('persist') and (t.get('keep') or keep) != 'system' for t in stores)
+    return 120 if whole else 10
+
+
+def recorded_quit_wait(out, o):
+    """The quit wait the running supervisor recorded at its start (out/quit_wait), else quit_wait(o)."""
+    try:
+        with open(os.path.join(out, 'quit_wait')) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return quit_wait(o)
+
+
+def stop_local(home, log=log, quit_s=10):
+    """Stop this box: shim and front end, then quit files, then the engine (quit_s seconds for an orderly quit)."""
     out = os.path.join(home, 'out')
     for p in ('front', 'shim'):
         pid = recorded(os.path.join(out, f'{p}.pid'))
@@ -1014,7 +1342,7 @@ def stop_local(home, log=log):
         return False
     if os.path.isdir(os.path.join(home, 's2')):
         open(os.path.join(home, 's2', 'quit'), 'w').close()
-    for _ in range(100):
+    for _ in range(int(quit_s * 10)):
         if not alive(pid):
             break
         try:

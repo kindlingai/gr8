@@ -2,8 +2,15 @@
 // (g6m4 --serve, s2/sessions.h) parses the same request format itself and writes the same response lines through
 // Emitter, plus its own `a` line (frontend/g6s2shim.py describes the S2 files).
 //   DIR/req.<n>  (written atomically: req.<n>.tmp then rename), two lines:
-//       n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,..|-> [top_p <float>] [lp <k>] [plp <k>]
-//       (lp: logprobs of the generated tokens with their top k, 0..20; plp: the same for the prompt tokens; absent = off.
+//       n_gen <max_tokens> temp <float> seed <uint32> min <min_tokens> stop <id,id,..|-> [top_p <float>]
+//       [pen <presence> <frequency> <thinking presence> <thinking frequency> <think_end id or -1>]
+//       [boost <start> <per1k> <max>] [seqt <mult>:<base>:<min>:<cap>] [seqa <mult>:<base>:<min>:<cap>]
+//       [seqg <mult>:<base>:<min>:<cap>:<id,id,..>] [lp <k>] [plp <k>]
+//       (pen: presence / frequency penalties, each in [-2, 2], the thinking ones inside the think block that the id
+//        closes. boost: the think-end boost past thinking token <start>. seqt / seqa / seqg: the sequence penalty's
+//        thinking, answer and guard scopes, the guard's against the ids (penalty.h). S2 applies them, m4sim reads and
+//        ignores them.
+//        lp: logprobs of the generated tokens with their top k, 0..20; plp: the same for the prompt tokens; absent = off.
 //        A request with plp is run as decode steps from its first token, no prefill path: the shim limits its length.)
 //       <prompt ids, comma-separated>
 //   DIR/quit     ends the loop
@@ -19,7 +26,9 @@
 //       m <rounds> <draft_tokens> <accepted> <acc_pos0> ..   cumulative MTP counters since start
 //       end <stop|length|error> <stop_id|-1> <completion_tokens>
 #pragma once
+#include "grammar.h"
 #include "steering.h"
+#include "image_input.h"
 #include <sys/stat.h>
 #include <chrono>
 #include <ctime>
@@ -40,11 +49,19 @@ struct ServeReq
     std::vector<int> prompt, stop;
     int n_gen = 0, min_tokens = 0;
     float temp = 0.f, top_p = 0.f;
+    float presence = 0.f, frequency = 0.f;   // penalties (penalty.h); 0 = off
+    float tpresence = 0.f, tfrequency = 0.f; // the thinking penalties, while the block think_end closes is open
+    int think_end = -1;                      // the </think> id when the prompt left a think block open, else -1
+    int boost_start = 0; float boost_per1k = 0.f, boost_max = 0.f;   // the think-end boost (penalty.h); per1k 0 = off
+    struct Seq { float mult = 0.f, base = 1.f, cap = 0.f; int min = 1; } seq[3];   // the sequence penalty's scopes (penalty.h PEN_SEQ)
+    std::vector<int> avoid;                  // the guard scope's reference: the call a retry must not repeat
     uint32_t seed = 1234u;
     int lp = -1, plp = -1;        // logprobs / prompt_logprobs: k (0..LP_MAX) or -1 = off
     int64_t sys = -1;             // the system span: the prompt's first tokens that are system message and tools (-1 = unknown)
     steering::Identity steering{};
     InsertRule ins;               // S2 only (s2/sessions.h parse_request)
+    GrammarSpec gram;             // S2 only: the reply's grammar (grammar.h), off unless the request has one
+    std::vector<ImageIn> images;  // S2 only, DS41 and Flash: the prompt's image spans (image_input.h), ascending
 };
 
 constexpr int LP_MAX = 20;       // = glue::LP_K (rank.cuh checks)
@@ -118,6 +135,24 @@ inline void serve_parse(const std::string& text, int vocab, ServeReq& r)
     {
         long k;
         if (w[i] == "top_p") { if (!real(w[i + 1], &r.top_p)) r.top_p = 0.f; }
+        else if (w[i] == "pen" && i + 5 < w.size())
+        {
+            long end;
+            if (!real(w[i + 1], &r.presence) || !real(w[i + 2], &r.frequency) || !real(w[i + 3], &r.tpresence) ||
+                !real(w[i + 4], &r.tfrequency) || !(w[i + 5] == "-1" || num(w[i + 5], 0, vocab - 1, &end)))
+                r.presence = r.frequency = r.tpresence = r.tfrequency = 0.f;
+            else r.think_end = w[i + 5] == "-1" ? -1 : (int)end;
+            i += 4;
+        }
+        else if (w[i] == "boost" && i + 3 < w.size())
+        {
+            long start;
+            if (!num(w[i + 1], 0, 1 << 30, &start) || !real(w[i + 2], &r.boost_per1k) || !real(w[i + 3], &r.boost_max))
+                r.boost_per1k = r.boost_max = 0.f;
+            else r.boost_start = (int)start;
+            i += 2;
+        }
+        else if (w[i] == "seqt" || w[i] == "seqa" || w[i] == "seqg") {}   // S2 only (s2/sessions.h): m4sim does not apply the sequence penalty
         // the shim never sends k > LP_MAX; clamping is a backstop
         else if (w[i] == "lp") r.lp = num(w[i + 1], 0, 1 << 30, &k) ? (int)std::min<long>(k, LP_MAX) : -1;
         else if (w[i] == "plp") r.plp = num(w[i + 1], 0, 1 << 30, &k) ? (int)std::min<long>(k, LP_MAX) : -1;
@@ -145,12 +180,12 @@ inline bool serve_next(const std::string& dir, size_t n, int vocab, ServeReq& r)
     return true;
 }
 
-// G6_PF_TIMES=1 (measurement only, default off; host clock only, no extra syncs): wall-clock laps of one request on this
-// process, from the request file's mtime to the first committed token; one stderr line per request:
+// GR8_TEST_PF_TIMES=1 (measurement only, default off; host clock only, no extra syncs): wall-clock laps of one request on
+// this process, from the request file's mtime to the first committed token; one stderr line per request:
 //   # times seq <n> <item>=<ms> .. total=<ms>
 struct PfTimes
 {
-    bool on = getenv("G6_PF_TIMES") && atoi(getenv("G6_PF_TIMES")) == 1;
+    bool on = false;   // m4sim sets it from GR8_TEST_PF_TIMES
     std::chrono::steady_clock::time_point t;
     std::string s;
     double tot = 0;
@@ -165,7 +200,12 @@ struct PfTimes
         {
             timespec now;
             clock_gettime(CLOCK_REALTIME, &now);
-            const double ms = (now.tv_sec - st.st_mtim.tv_sec) * 1e3 + (now.tv_nsec - st.st_mtim.tv_nsec) * 1e-6;
+#ifdef __APPLE__
+            const timespec& m = st.st_mtimespec;
+#else
+            const timespec& m = st.st_mtim;
+#endif
+            const double ms = (now.tv_sec - m.tv_sec) * 1e3 + (now.tv_nsec - m.tv_nsec) * 1e-6;
             add("poll", ms);
         }
     }

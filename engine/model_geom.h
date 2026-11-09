@@ -3,11 +3,22 @@
 // (H4096, 288 experts, MTP layer 45; scripts/build.sh MODEL=flash installs m4sim_flash / g6m4_flash).
 // The GLM values equal the literals they replace, so the default build is SASS-identical to the tree before this header.
 // A Flash build compiles; the Flash-only blocks (KDA, mHC, NoPE MLA, kpool indexer, 288-expert router) are not here yet.
+// -DG6_MODEL_DS41=1 builds DeepSeek-V4.1-Flash-1017 (H5120, 384 experts top-6, MTP = 3 DSpark layers after layer 39):
+// its whole geometry is model_geom_ds41.h, and the GLM / Flash text below is left out of that build (docs/DEEPSEEK.md).
 #pragma once
 #ifndef G6_MODEL_FLASH
 #define G6_MODEL_FLASH 0
 #endif
+#ifndef G6_MODEL_DS41
+#define G6_MODEL_DS41 0
+#endif
+#if G6_MODEL_DS41 && G6_MODEL_FLASH
+#error "G6_MODEL_DS41 and G6_MODEL_FLASH name two different models: build one"
+#endif
 
+#if G6_MODEL_DS41
+#include "model_geom_ds41.h"
+#else
 namespace geom
 {
 #if G6_MODEL_FLASH
@@ -17,6 +28,7 @@ constexpr int QK_NOPE = 256, QK_ROPE = 0;   // per-head q/k dims: no RoPE part
 constexpr int NEXP = 288;            // routed experts
 constexpr int L_MAIN = 45;           // decoder layers 0..44; the MTP layer is 45
 #define G6_MTP_L "L045"              // pack tensor prefix of the MTP layer (string literal, for concatenation)
+constexpr int DFL_L = 5, DFL_NT = 5, DFL_NH = 32;   // DFlash2 drafter (runtime/dflash.cuh): layers, taps, q heads
 #else
 constexpr int HID = 6144;
 constexpr int QA = 2048;
@@ -24,6 +36,7 @@ constexpr int QK_NOPE = 192, QK_ROPE = 64;
 constexpr int NEXP = 256;
 constexpr int L_MAIN = 78;
 #define G6_MTP_L "L078"
+constexpr int DFL_L = 6, DFL_NT = 6, DFL_NH = 64;
 #endif
 constexpr int HEADS = 64;            // attention heads
 constexpr int KV_LORA = 512;         // MLA latent
@@ -77,3 +90,4 @@ constexpr bool full_index(int l)
 #endif
 }
 }
+#endif   // !G6_MODEL_DS41

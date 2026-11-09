@@ -15,13 +15,14 @@ int g6w1_main(int, char**) __attribute__((weak));
 int g6w2_main(int, char**) __attribute__((weak));
 int g6w3_main(int, char**) __attribute__((weak));
 int g6w4_main(int, char**) __attribute__((weak));
+int g6w5_main(int, char**) __attribute__((weak));
 int g6w6_main(int, char**) __attribute__((weak));
 int g6w8_main(int, char**) __attribute__((weak));
 }
 
 using Main = int (*)(int, char**);
 static const struct { int nr; Main main; } WIDTHS[] = {
-    {1, g6w1_main}, {2, g6w2_main}, {3, g6w3_main}, {4, g6w4_main}, {6, g6w6_main}, {8, g6w8_main}};
+    {1, g6w1_main}, {2, g6w2_main}, {3, g6w3_main}, {4, g6w4_main}, {5, g6w5_main}, {6, g6w6_main}, {8, g6w8_main}};
 
 [[noreturn]] static void die(const std::string& m) { fprintf(stderr, "g6: %s\n", m.c_str()); exit(2); }
 

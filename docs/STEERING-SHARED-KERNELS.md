@@ -40,7 +40,7 @@ to use the general consumes; MoE shared scope selects these finalizers instead.
 On a CUDA 13 GB10 development environment:
 
 ```sh
-G6_NR=4 EXTRA=-DDEC_S2 TEST=steering_shared_test scripts/c1_tests.sh /tmp/shared-tests
+GR8_NR=4 EXTRA=-DDEC_S2 TEST=steering_shared_test scripts/c1_tests.sh /tmp/shared-tests
 # Or compile just the fixture, without a model:
 nvcc -O2 -std=c++17 -gencode=arch=compute_121a,code=sm_121a \
   -DG6_NR=4 -DDEC_S2 -DDEC_SLOT=2 -DPF_RNWIDE=1 -DG6_CP=1 \

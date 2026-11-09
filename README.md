@@ -1,145 +1,165 @@
-# gr8: a super-fast local AI engine
+# gr8: a CUDA inference engine for DGX Spark
 
-Need help? Join us on discord: https://discord.gg/M7XTrRJW3
+Need help? Join us on Discord: https://discord.gg/8EAvYPV2rE
 
-Full GLM-5.3 on DGX Spark (GB10). *Beta release. If you run it, please tell us what breaks: issues and PRs are welcome.*
+gr8 serves GLM-5.3, GLM-5.3-Flash and DeepSeek-V4.1-Flash on one to six DGX Spark (GB10) boxes (the count depends on
+the model, see below), with an OpenAI-compatible API on the first box. gr8 is written from scratch in CUDA and uses no
+vLLM, PyTorch or NCCL at serve time. *Beta release. If you run it, please tell us what breaks:
+[issues](https://github.com/kindlingai/gr8/issues) and PRs are welcome.*
 
-gr8 is a from-scratch CUDA inference engine for the full GLM 5.3 model (MoE with 256 experts, MLA attention with the
-sparse indexer, one MTP layer) on three, four or six DGX Spark (GB10) boxes, tensor-parallel across all of them. It
-uses no vLLM, PyTorch or NCCL at serve time. Each box runs one `g6m4` process, the ranks talk over RoCE v2 through
-their own verbs fabric, and an OpenAI-compatible API runs on the first box.
+## Recipes
 
-## Results
+Each recipe is one Docker image, set up for one model on a fixed number of boxes. For other box counts (GLM-5.3 on
+three to six boxes, GLM-5.3-Flash on three or four), start from [Models and install](#models-and-install). A box runs
+one model at a time: stop the running recipe's container on every box before you start another.
 
-| | TP=4 | TP=3 | TP=6 |
-|---|---|---|---|
-| experts | `home`, 3.25 bpw | `bit225`, 2.25 bpw | `home`, 3.25 bpw |
-| drafting | DFlash2 or MTP | MTP | MTP |
-| decode\*, code / prose | 51.7 / 32.5 tok/s | 40.3 / 30.2 tok/s | 54.6 / 40.9 tok/s‖ |
-| aggregate\*, 2 / 4 streams | 53.7 / 67.8 tok/s | 47.9 / 62.2 tok/s | 57.6 / 79.0 tok/s‡ |
-| prefill, 8K prompt, cold | 1,315 tok/s | 654 tok/s | 1,953 tok/s‡ |
-| prefill, 8K prompt, cached | 60,006 tok/s | 57,086 tok/s | – |
-| KV pool (longest context) | 485,376 tokens (513,536 with int4§) | 307,136 tokens (410,624 with int4§) | 614,400 tokens (857,600 with int4§) |
-| requests that share decode steps | up to 32,768 tokens | up to 32,768 tokens | up to 32,768 tokens |
-| requests decoding at once | 8 | 8 | 8 |
+### GLM-5.3-Flash on 1 Spark
 
-\* [RigMark](https://github.com/alexellis/rigmark) 1.0.0 (`reasoning_effort` low), GPU clocks uncapped (the full
-application clock; the 2200 MHz cap is only for PR-to-PR gate comparisons), booted from the Hugging Face release
-with `./gr8 glm53 up` and its defaults, which turn the faster decode options on (`DRAFT_PAR`, `QA_SPLIT` /
-`IDXQ_SPLIT` / `MTP_SPLIT`, `MTP_KSTOP` at TP=4). One run per fresh boot (a second run on the same boot replays
-RigMark's prompts from the retained prefix), the mean of two boots. RigMark's structured row is left out: it
-measures predictable output, not agent speed. TP=4 code varies between boots (51.2 to 52.2 on one build),
-because which requests get DFlash2 depends on timing. The TP=3 column is still the earlier measurement at the 2200 MHz
-cap on an older build; its re-measurement is pending.
-‡ TP=6, MTP only (the DFlash2 drafter's 8 KV heads do not split six ways), on an earlier build. Decode is a
-concurrency test with code prompts, MTP k=2 at temperature 0.7, one request alone and 2 and 4 at once; it is not
-RigMark. One test window on one cluster.
-‖ TP=6 decode: RigMark 1.0.0 (`reasoning_effort` low), MTP only, booted at c53b5b8 with the launcher's defaults
-(`home`), GPU clocks capped at 2200 MHz, unlike the other columns, so this cell is lower than an uncapped run would be.
-One run per fresh boot, the mean of two boots (prose 40.5 / 41.3, code 54.4 / 54.7 tok/s); six boxes on one switch.
-§ `--kv-format int4` (experimental): 4-bit KV latent, about 3% slower decode at TP=4; TP=3 and TP=6 int4 figures are
-estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [docs/KV4.md](docs/KV4.md)
+[![GLM-5.3-Flash on one GB10: decode, prefill and concurrency](docs/cards/glm-5.3-flash-exlr8-1x-spark.png)](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark)
 
-[kindling.json](kindling.json) has this table in a form a program can read. A PR that changes one changes the other.
+54.3 tok/s for one request writing code · 1,214 tok/s prefill on an 8K prompt · 4 requests at once from a 700,032-token KV
+pool · one `docker run`
 
-## How it works
+**[Recipe](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark)** · [Model page](docs/FLASH.md)
 
-- One model: the [exlr8 release](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) on Hugging Face. Each box
-  fetches only its own part, once, and boots from its cache in about 40 s. Each rank plans its weights from the
-  release's files at load. The routed experts and the dense trellis matrices are decoded inside the kernels.
-- Several requests at once: up to 8 sessions share each decode step. Each request's output is a valid continuation at
-  its sampling settings, but when requests share decode steps its tokens and logprobs can differ slightly from running
-  it alone.
-- Speculative decoding: every round drafts with the MTP layer, or at TP=4, for a request that runs alone, with the
-  DFlash2 drafter when that is expected to commit more tokens per ms (DFlash2 wins on code, MTP on prose). The draft
-  count comes from a live model of step cost and acceptance.
-- Prefix reuse: a request that continues an earlier conversation re-prefills only the new part. A continued 20K
-  conversation takes 7.1 s instead of 17.3 s at TP=4.
-- Opt-in runtime steering: one validated rank-one profile can be selected per request across decode, prefill and target
-  verification, with steering identity included in prefix reuse. The fused operator adds no CUDA launches to the
-  production path. See [docs/STEERING.md](docs/STEERING.md).
-- Prefill attention split by query and head owner across ranks ([docs/DESIGN-QO-PAIR.md](docs/DESIGN-QO-PAIR.md)).
-- Context-parallel KV: the first `SHARE_LIMIT` tokens (32,768 at TP=4, 65,536 at TP=3) are on every rank, later pages (their
-  latent and their indexer keys) are spread across ranks, so the pools above fit. Requests up to that size share decode steps.
+### GLM-5.3-Flash on 2 Sparks
+
+71.1 tok/s for one request writing code · 1,698 tok/s prefill on an 8K prompt · 4 requests at once · first run, work in
+progress
+
+**[Recipe](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark)** · [Model page](docs/FLASH.md)
+
+### GLM-5.3 on 4 or 6 Sparks
+
+52.1 tok/s for one request writing code on four boxes, 57.4 on six (one of the six clock-capped) · up to 8 requests at
+once · recipes coming soon. Until then, start it on three to six boxes with Docker Compose, from the
+[Models and install](#models-and-install) table.
+
+[Model page](docs/GLM-5.3.md)
+
+### DeepSeek-V4.1-Flash on 4 Sparks
+
+[![DeepSeek-V4.1-Flash on four GB10s in fast mode: decode, prefill and concurrency](docs/cards/deepseek-v4.1-flash-exlr8-4x-spark.png)](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)
+
+142.9 tok/s for one request writing code · 3,655 tok/s prefill on an 8K prompt · 32 requests at once (the recipe's
+setting) · fast mode by default (`TUNE=speed`), so the output is not identical to the exact model's; `TUNE=quality`
+gives the exact model's output · booted on four boxes from the recipe's image: ready in 104 s
+
+**[Recipe](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)** · [Model page](docs/DEEPSEEK.md)
+
+<sub>Each card is drawn by `bench/gif.py card` from the recipe's `kindling.json` ([docs/cards/make.sh](docs/cards/make.sh)
+redraws them). The model pages give each benchmark and its date.</sub>
+
+## What gr8 does today
+
+- **Three models, one to six boxes.** GLM-5.3 on three to six boxes, GLM-5.3-Flash on one to four, DeepSeek-V4.1-Flash
+  on four ([Models and install](#models-and-install)).
+- **Boots from its own cache.** On GLM-5.3 each box fetches only its own part of the release, once. After that, GLM-5.3 boots in
+  about 40 s and GLM-5.3-Flash on one box in 45 s.
+- **Many chats at once, and long ones.** GLM-5.3 decodes 8 requests at once from a KV pool of up to 614,400 tokens
+  (TP=6). GLM-5.3-Flash on one box decodes 4 at once from a 700,032-token pool. DeepSeek-V4.1-Flash runs 32 chats
+  at once in fast mode, its recipe's default, each up to 327,670 tokens; `./gr8 ds41 up` defaults to exact output and
+  5 chats. With `CAP=1048576` and 16 chats, one request can hold up to 1,048,566 tokens, prompt and reply
+  ([docs/FIRST-BOOT.md](docs/FIRST-BOOT.md#2-deepseek-v41-flash-ds41-how-many-chats-and-how-long)).
+- **Prefix reuse and KV below the pool.** A request that continues a conversation prefills only its new part: a
+  continued 20K-token conversation takes 7.1 s instead of 17.3 s (GLM-5.3, TP=4). On GLM-5.3, evicted prefixes can go
+  to an SSD or to a KV node with spare memory, over RDMA. From a KV node, the next turn of a 445,855-token prompt
+  answered in 11.4 s (experimental, [Remote KV](docs/GLM-5.3.md#remote-kv)). GLM-5.3-Flash can keep its session
+  checkpoints in the same kinds of store
+  ([experimental](docs/FLASH.md#session-checkpoints-gr8_glm53f_cachealigned-experimental)). DeepSeek-V4.1-Flash has no
+  store below the device.
+- **Image input.** DeepSeek-V4.1-Flash and GLM-5.3-Flash take images in chat requests (opt-in, `GR8_DS41_VISION=1`,
+  [docs/DS41-VISION.md](docs/DS41-VISION.md); `GR8_GLM53F_VISION=1`, [docs/FLASH-VISION.md](docs/FLASH-VISION.md)).
+- **A Docker image.** `ghcr.io/kindlingai/gr8` has the engine for every TP width and all three models, so GLM-5.3 on
+  three to six boxes needs no build ([Docker Compose](docs/DEPLOY.md#docker-compose)). The one-box and two-box recipes publish their
+  own images.
+
+## Models and install
+
+| model | boxes | start here | download | weights on Hugging Face |
+|---|---|---|---|---|
+| [GLM-5.3-Flash](docs/FLASH.md) | 1 | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark): one `docker run` | 87 GB | [kindlingai/glm-5.3-flash-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4) |
+| GLM-5.3-Flash | 2 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark): the same image on both boxes | about 86 GB a box | |
+| GLM-5.3-Flash | 3 or 4 | [docs/FLASH.md](docs/FLASH.md) | see the page | |
+| [GLM-5.3](docs/GLM-5.3.md) | 3 to 6 | Docker Compose (below), or [docs/DEPLOY.md](docs/DEPLOY.md) for bare metal and Kubernetes | about 90 GB a box with 4 boxes (TP=4) | [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4) |
+| [DeepSeek-V4.1-Flash](docs/DEEPSEEK.md) | 4 | [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark): the same image on all four boxes, fast mode by default; or [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) with gr8's own launcher, exact output by default | 510.6 GB a box, fetched before the first boot | [kindlingai/deepseek-v4.1-flash-exlr8-native](https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native) |
+
+Each model's page has its results, how to start it and its known issues.
+
+**Three to six boxes** (GLM-5.3), with Docker Compose. First, on every box, turn off proactive memory compaction and
+open TCP ports 7340 and 7341 between the boxes ([What you need](#what-you-need)). Then, on every box:
+
+```bash
+mkdir -p ~/gr8 && cd ~/gr8
+curl -fsSLO https://raw.githubusercontent.com/kindlingai/gr8/main/docker/compose.yaml
+curl -fsSL https://raw.githubusercontent.com/kindlingai/gr8/main/docker/.env.example -o .env
+nano .env                          # GR8_MODEL, MODEL, PEERS and (glm53 at TP=4) DRAFTER: the same file on every box
+docker compose up -d
+```
+
+Then `docker compose exec gr8 /opt/gr8/gr8 glm53 smoke` on the head. [docs/DEPLOY.md](docs/DEPLOY.md) explains each
+setting, and has bare metal and Kubernetes. An agent that starts gr8 for someone asks them the questions in
+[docs/FIRST-BOOT.md](docs/FIRST-BOOT.md) first.
+
+**DeepSeek-V4.1-Flash** (four boxes): the recipe
+[deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)
+is the quickest way: the same image on every box, in fast mode by default. We booted that image on four boxes on
+2026-11-06: ready in 104 s, smoke test 11 of 11, 72 of 75 on the 75-item check.
+[docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is the boot with gr8's own launcher, which gives exact output by default,
+in order, from the four boxes to a passing `./gr8 ds41 smoke`.
+
+### With model-loader
+
+[model-loader](https://github.com/kindlingai/model-loader) can fetch the weights instead of gr8: the boxes copy the
+pieces between them over the LAN, from one Hugging Face fetch or a NAS. Each surface takes it with one more file or
+value: [docs/DEPLOY.md](docs/DEPLOY.md#with-model-loader).
 
 ## What you need
 
-- Three, four or six DGX Spark or other GB10 boxes (sm_121a, 128 GB unified memory), one rank per box, with nothing
-  else holding much memory. A rank's weights take about 83 GB at TP=4 and 78 GB at TP=3. The KV pool and the step
-  graphs need most of the rest.
-- A RoCE v2 fabric with two rails: each box's ConnectX-7 has one address on each PCIe root. We use one 200G switch.
-  At TP=3 or 4, `--shape ring` runs without one: each box's f0 port is cabled to the next box's f1 port, and at TP=4
-  the diagonal's writes are relayed by the box between, through a 32 MB ring per fabric (about 0.25 GB pinned per
-  rank). It costs about 10% of single-stream decode (4-5% at 4 streams). memlock must be unlimited.
-- A LAN between the boxes with TCP ports 7340 and 7341 open. The boxes need no ssh between them: the head engine
-  passes each request to the other ranks over its control links.
-- Disk per box: about 90 GB at TP=4 (its experts, the 11 GB of dense and vocab files, the drafter) and about 85 GB at
-  TP=3. One cache holds both, because their parts share the sparse expert files.
-- Proactive memory compaction off on every box. A rank fills the box to about 2 GB under its limit, and at that level
-  the kernel's background compaction moves pages under the engine in bursts that delay every collective. As root,
-  once (it holds across reboots; `vm.compaction_proactiveness=20` undoes it):
+Each model's page gives its box count. [docs/GLM-5.3.md](docs/GLM-5.3.md#what-you-need) and
+[docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md#1-what-you-need) add memory and disk.
 
-      echo 'vm.compaction_proactiveness = 0' > /etc/sysctl.d/90-gr8-no-proactive-compaction.conf
-      sysctl -w vm.compaction_proactiveness=0
-
-- To build: CUDA 13 (`nvcc` with `sm_121a`), g++ with C++20, rdma-core / libibverbs-dev, Rust through
+- DGX Spark or other GB10 boxes (sm_121a, 128 GB unified memory), one rank per box, with nothing else holding much
+  memory.
+- One box needs no fabric and no LAN: at TP=1 the launcher skips the RDMA checks
+  ([docs/FLASH.md](docs/FLASH.md#one-box-tp1)).
+- Two or more boxes need a RoCE v2 fabric with two rails: each box's ConnectX-7 has one address on each PCIe root. Two
+  boxes need no switch: one 200G cable joins their ConnectX ports, as in the
+  [two-box recipe](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark#clustering). For three or more we use one
+  200G switch. At TP=3 or 4, `--shape ring` runs without one: each box's f0 port is cabled to the next box's f1 port, and
+  at TP=4 the diagonal's writes are relayed by the box between, through a 32 MB ring per fabric (about 0.25 GB pinned
+  per rank). It costs about 10% of single-stream decode (4-5% at 4 streams). memlock must be unlimited. With mentat
+  (`--mentat localhost --tp 3 --shape ring`, mentatd 0.24.0 or later on every box), the cabling can be any ring: the
+  boxes claim a ring from mentat and take their rank order and RDMA devices from its one answer, so a scheduler such
+  as a Kubernetes LeaderWorkerSet can place them in any order. Tag both addresses of each ConnectX port `rdma` in
+  mentat (`MENTAT_ANNOUNCE_IFACES`).
+- Two or more boxes also need a LAN between them with TCP ports 7340 and 7341 open. The boxes need no ssh between
+  them: the head engine passes each request to the other ranks over its control links.
+- Proactive memory compaction off on every box ([docs/DEPLOY.md](docs/DEPLOY.md#before-you-start) has the commands).
+  A rank fills the box to about 2 GB under its limit, and at that level the kernel's background compaction moves pages
+  under the engine in bursts that delay every collective.
+- To build: CUDA 13 (`nvcc` with `sm_121a`), g++ with C++20, CMake, clang and libclang-dev (the front end builds XGrammar), rdma-core / libibverbs-dev, Rust through
   [rustup](https://rustup.rs) (the front end needs Rust 1.85 or later; Ubuntu 24.04's `cargo` package is 1.75), and
   Python 3 with venv. The stock DGX OS (Ubuntu 24.04) has all of them except Rust. Or, in place of all of these, Docker
-  with the NVIDIA container toolkit (DGX OS has both): see [In Docker](#in-docker).
-
-## Quick start
-
-On every box:
-
-    git clone https://github.com/kindlingai/gr8 && cd gr8
-    TP=4 BUNDLE_LIBS=1 ./gr8 glm53 build
-    python3 -m venv venv && venv/bin/pip install -r frontend/requirements.txt    # the python the head runs the shim on
-    ./gr8 glm53 up --tp 4 --peers 10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4 \
-        --model https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4 --model-cache /opt/gr8/cache \
-        --drafter https://huggingface.co/incoai/GLM-5.3-DFlash2
-
-`--model-cache` must be a directory you can create or write (here, `sudo mkdir -p /opt/gr8/cache && sudo chown $USER
-/opt/gr8/cache` first). Then `./gr8 glm53 status` from any box, and on the head (the first address in `--peers`):
-
-    ./gr8 glm53 status        # every box, the front end, /health
-    ./gr8 glm53 smoke         # questions with answers that can be checked (from another box: smoke http://10.0.0.1:8100)
-    curl http://10.0.0.1:8100/v1/chat/completions -H 'Content-Type: application/json' \
-      -d '{"model":"glm-5.3","messages":[{"role":"user","content":"Hello"}],"max_tokens":64}'
-
-For three or six boxes, build with `TP=3` or `TP=6`, pass `--tp 3` or `--tp 6` with as many peers, and leave out
-`--drafter`: the DFlash2 drafter's 8 KV heads do not split three or six ways. `BUNDLE_LIBS=1` copies cuBLAS next to the
-engine, for boxes without the CUDA toolkit. Every box must run the same build: build on one and copy `bin/`, or build
-on each.
-
-The first `up` downloads this box's part: about 35 minutes at 40 MB/s. To download ahead of time, run `./gr8 glm53
-prepare` with the same options. The drafter's licence (CC BY-NC-ND 4.0) forbids sharing a converted copy, so each box
-downloads the drafter and converts its own rank.
-
-### In Docker
-
-Nothing to build: CI publishes the image, `ghcr.io/kindlingai/gr8`. On every box, with the NVIDIA container toolkit:
-
-    git clone https://github.com/kindlingai/gr8 && cd gr8
-    cp docker/.env.example docker/.env        # set MODEL, PEERS and (TP=4 only) DRAFTER: the same file on every box
-    docker compose -f docker/compose.yaml pull
-    docker compose -f docker/compose.yaml run --rm gr8 prepare
-    docker compose -f docker/compose.yaml up -d
-
-Then `docker compose -f docker/compose.yaml exec gr8 /opt/gr8/gr8 glm53 status` (or `smoke`, or `down` to stop every
-box). [docker/README.md](docker/README.md) has the settings, how to update, and what the container gets.
+  with the NVIDIA container toolkit (DGX OS has both): see [Docker Compose](docs/DEPLOY.md#docker-compose).
 
 ## Running it
 
-Every box runs the same `./gr8 glm53 up`. The first address in `--peers` is the head: it runs the API on port 8100.
-Before any engine starts, the boxes compare their options, model and engine build, and if one box differs, every box
-stops and prints the difference. Without `--peers`, the boxes find each other through a local
-mentat daemon (`--mentat localhost`, the default).
+The model is split across all the boxes (tensor parallel, TP). Each box runs one engine process (`g6m4`) and is one
+rank. The ranks talk over RoCE v2 through gr8's own RDMA code.
+
+Every box runs the same `./gr8 <model> up`, where the model is `glm53`, `glm53f` or `ds41`
+([docs/DEPLOY.md](docs/DEPLOY.md)). The first address in `--peers` is the
+head: it runs the API on port 8100. Before any engine starts, the boxes compare their options, model and engine build,
+and if one box differs, every box stops and prints the difference. Without `--peers`, the boxes find each other through
+a local mentat daemon (`--mentat localhost`, the default).
 
 | command | what it does |
 |---|---|
 | `up [OPTIONS]` | start this box's supervisor and follow it until the cluster serves |
 | `down`, `restart` | stop every box, or stop and boot again (in Docker: `down`, then `up -d` on every box) |
 | `status` | every box's state, engine and free memory, and the head's front end and `/health` |
+| `health` | this box alone, in one line: exit 0 when it serves (on the head, also its API's `/health`), else 1. The compose healthcheck, and a Kubernetes `exec` readiness probe on any rank |
 | `logs [rank\|shim\|front\|supervisor] [-f]` | a log from any box |
 | `prepare [OPTIONS]` | fill `--model-cache` with this box's part, without booting |
 | `check`, `show-config` | what would stop this box's boot; every option and where it came from |
@@ -147,133 +167,13 @@ mentat daemon (`--mentat localhost`, the default).
 | `build` | the engine and the Rust front end, into `bin/` |
 
 Options come from the command line, then a config file (`@FILE`, else `./cluster.env`; see
-`config/cluster.env.tp4.example`, `.tp3.example`, or `cluster.env.example` for TP=6), then the environment. With the
-options in `cluster.env`, `./gr8 glm53 up` alone is enough. [KNOBS.md](KNOBS.md) lists every option.
+[config/cluster.env.example](config/cluster.env.example)), then the environment. With the options in `cluster.env`,
+`./gr8 glm53 up` alone is enough. `./gr8 knobs` lists every option, and [KNOBS.md](KNOBS.md) says how they combine.
 
 When a rank's engine exits, the head stops every box: `status` names the rank and shows its last log line, and the
 supervisor log names the line that says why. Logs are in `out/` on each box (`supervisor.log`, `g6m4.r<r>.err`, and
 `shim.log` and `front.log` on the head). Each boot moves the previous engine logs to `out/prev1`, and keeps the three
 boots before it (`prev1` is the newest), so a restart does not overwrite the boot you want to look at.
-
-### The model cache
-
-`--model https://huggingface.co/<org>/<repo>[@rev]` fetches into `--model-cache` only what this box's rank needs: its
-expert halves (sparse files, with every half checked against its xxhash64), its index slices, the manifests, the dense
-and vocab files and the tokenizer. A fetch resumes where it stopped. A boot uses the commit recorded at the last fetch,
-so it works offline once the cache is full, and boxes on different commits refuse to boot together. `HF_TOKEN` is sent
-only when it is set. `--model DIR` boots from a local copy of the release instead.
-
-`--variant` picks the expert widths:
-
-| variant | routed experts | default at |
-|---|---|---|
-| `home` | 3.25 bpw: in each layer, the 64 experts with the highest K3 error at K4 and the rest at K3 | TP=4, TP=6 |
-| `bit225` | about 2.25 bpw, down1's size: down projections at K3 in the layers where bits lower KL the most, the rest at K2 | TP=3 |
-| `bit325` | 3.25 bpw, home's size: down projections at K4 in the layers where bits lower KL the most, the rest at K3 (KL 1.5-7% lower than home, decode ~2.5% slower) | |
-| `bit243`, `bit260`, `bit338` | about 2.43, 2.60 and 3.38 bpw, built the same way | |
-| `down1` | about 2.25 bpw | |
-| `up1` | about 4.0 bpw (lower `--cap`) | |
-
-The release's model card has each variant's size and its KL against bf16. A release from before the `bit` variants
-boots `down1` at TP=3. `home` and `bit325` do not fit at TP=3: they put 108.7 GB of weights on
-each rank. A boot that would run a box out of memory stops
-while it allocates the KV pool, and names `--cap` and `--variant`.
-
-### Options worth knowing
-
-![KV tiers](docs/kv-tiers.svg)
-
-The first `SHARE_LIMIT` tokens of a session are on every rank and later pages are spread across the ranks; below that
-pool, block stores keep evicted prefixes. With `--kv-rows` the rows past `SHARE_LIMIT` can also live in a rows store,
-read back as decode selects them ([Remote KV](#remote-kv)).
-
-- `--cap` is the KV pool in tokens, and so the longest context. Lower it first when a box runs short of memory.
-- `--sess` is how many requests decode at once (1-8). Each one adds step graphs: about 2.5 GiB at 8.
-- `--reuse 0` turns prefix reuse off.
-- `--kv-store` and `--kv-rows` (experimental, off by default) put KV below the pool, on an SSD or a KV node: see
-  [Remote KV](#remote-kv) below.
-- `--kv-format int4` (experimental) caches the KV latent in 4 bits: about 1.34x the context at TP=4 (CAP 513,536 against
-  408,832; the fp8 default has since grown to 485,376 and int4 is not re-measured) for about 3% slower decode, with needles found as with the default fp8 row ([docs/KV4.md](docs/KV4.md)).
-- `--dflash 0` runs MTP only at TP=4. `--mtp` is the MTP draft count (2).
-- `--steering-profile DIR` loads a local schema-v1 profile; with an HF model, `hf:default` or `hf:NAME` explicitly
-  selects a bundled profile. Without the flag, bundled profiles are ignored. Requests select the loaded profile with
-  `steering_profile` and `steering_scale`; `--steering-force SCALE` is the process-wide qualification mode.
-- `--g6env-x "NAME=value ..."` passes engine settings to every rank ([docs/SETTINGS.md](docs/SETTINGS.md)). The
-  boxes compare them, and a `G6_*` variable in the environment is refused for that reason.
-
-### Remote KV
-
-A KV node is a box with spare memory that serves it to the cluster over RDMA: `./gr8 kv up --gb N` on that box, and
-`remote:auto` in the options below finds it through the mentat group. The cluster can use it in two ways. Both are
-experimental and off by default.
-
-| | block stores (`--kv-store`) | rows store (`--kv-rows`) |
-|---|---|---|
-| holds | sessions and prefixes the pool evicted | a live session's rows past `SHARE_LIMIT` |
-| gives | a later turn or a shared prefix reads its KV back instead of prefilling it | with `local=`, one request can run past what local memory holds |
-| longest context | unchanged (`--cap`) | about 600K tokens at TP=4 (`--cap 655360`) |
-| stores | `ssd:PATH`, `remote:auto`, `remote:HOST:PORT` | `remote:auto`, `remote:HOST:PORT`, `mem:` |
-
-Block stores alone do not extend a single request: a request still needs local pages for all of its context. They
-keep the KV of finished turns, so an agent's next turn after its session left the pool costs a read instead of a
-prefill. `--kv-keep` (or `keep=` per store) picks what they keep: `system` prompts, `sessions`, or `all`.
-
-The rows store does extend it. Each session's first `SHARE_LIMIT` tokens stay on every rank. The rows past that are
-spread across the ranks, and the rows store puts each rank's share on the KV node as its pages fill. With `local=PAGES`
-a rank keeps only the last PAGES pages of each long session's tail and gives the rest back to the pool. After each
-indexer selection, decode reads the rows it picked from the node. `place=PAGES` caps the pages a rank holds, so
-`--cap` may pass what local memory holds. A finished session keeps its records on the node, and its next turn
-prefills only the new tokens.
-
-The TP=4 long-context setup, in `cluster.env`:
-
-```
-KV_STORE=ssd:/data/gr8kv,size=4G,persist=on,keep=system;remote:auto,size=4G,keep=all
-KV_ROWS=remote:auto,size=12G,local=40,place=1600
-CAP=655360
-```
-
-The SSD store sits on each box (`KV_OFFLOAD=/data/gr8kv,size=4G,persist=on,keep=system` is the same store under its own
-key: local SSD offload, not a remote store). The KV node needs at least every rank's `remote:` sizes together: here 4 x (4G + 12G) = 64G.
-
-Measured on four GB10 boxes and a KV node on 200G RoCE:
-
-- A 445,855-token prompt prefilled in 613 s, and the next turn answered in 11.4 s from the records the node kept.
-- With `fmt=int4` (416-byte rows instead of 656), a 445,255-token prompt prefilled in 581 s and its next turn took 8.8 s.
-- RigMark decode is the same with the rows store on as off.
-
-The limits:
-
-- With the rows store, a session past `SHARE_LIMIT` runs alone and other long requests wait for it. Without it, two or
-  three such requests can share decode steps.
-- Buffers that grow with `--cap` (prefill staging, attention states, drafter caches: about 2.6 GB a rank at 655,360)
-  take memory that would otherwise be KV pages. At `place=1600` a 4-agent replay took 1,408-1,691 s against about
-  1,060 s with the rows store off. Choose `--cap` for the longest session you need.
-- Without `local=`, the rows store keeps a copy of the tail and every local page stays in use, so the longest
-  context is still `--cap`.
-
-[engine/kvman-rs/REMOTE-TIER.md](engine/kvman-rs/REMOTE-TIER.md) covers the block stores, their transports and
-measurements. [KNOBS.md](KNOBS.md) lists every `KV_STORE` and `KV_ROWS` field, and
-[docs/SETTINGS.md](docs/SETTINGS.md) the engine's `G6_RT_*` settings.
-
-### Thinking
-
-GLM 5.3 always thinks: its chat template has no switch to turn thinking off. A chat request controls how much it thinks
-with these fields:
-
-| field | values | on GLM 5.3 |
-|---|---|---|
-| `reasoning_effort` (top level, or in `chat_template_kwargs`) | `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | The template names `low`, `high` and `max`. Another value becomes the nearest of those, ties going higher: `minimal` is `low`, `medium` is `high`, `xhigh` is `max`. Unset is `max`. `none` and any other value are a 400 |
-| `thinking_budget` | an integer, or null | While the think block is open, the front end puts `\n</think>\n\n` in place of the reply's Nth token (so N-1 reasoning tokens come first), and the answer follows. 0, null or unset takes the server default, as in TensorFold. A negative number is no limit |
-| `chat_template_kwargs.enable_thinking` | `true` | `false` is a 400 that names `reasoning_effort` `low` and `thinking_budget` instead |
-| `response_format` | `{"type": "text"}` | `json_object` and `json_schema` are a 400 for now |
-
-`usage.completion_tokens_details.reasoning_tokens` counts the reply's tokens through its `</think>`.
-`--default-reasoning-effort` and `--default-thinking-budget` set the defaults for requests that name none (KNOBS.md).
-The engine puts the close in place of the token itself (an insert rule, PROTOCOL.md), so a cut costs one more main step.
-With an engine from before that, the front end ends the run and continues from the prompt, the reply and the close,
-which prefills the prompt's last partial 4,096-token cell and the reasoning again: 2.5 to 4.2 s at TP=4's cold prefill
-rate (frontend/README.md). A request that uses `logprobs` cannot have a budget.
 
 ## Troubleshooting
 
@@ -282,23 +182,16 @@ rate (frontend/README.md). A request that uses `logprobs` cannot have a budget.
 - The boot stops with "GiB left after the weights and part of a KV pool": lower `--cap`, or use a smaller `--variant`.
 - A box waits for the others: with mentat, check that every box's daemon sees the rest (`mentatd status`); with
   `--peers`, the workers wait for the head.
-- Decode slows past `SHARE_LIMIT` tokens of context: from there the KV is spread across ranks, and every step gathers from
-  all of them.
-- A request past `SHARE_LIMIT` holds its first `SHARE_LIMIT` tokens on every rank, so it needs that many pages free on
-  each. Its size is the prompt plus `max_tokens`; a chat request without `max_tokens` gets what keeps it within the
-  limit, but at least 8,192 tokens, so a prompt past about 57,000 tokens is such a request. Several of them share
-  decode steps when the pool has room for each one's replicated prefix: at TP=4's default `SHARE_LIMIT` (32,768 tokens,
-  512 of a rank's 2,280 pages each) two or three stay resident together; `--share-limit 65536` replicates more per
-  session (one resident, faster 32K-64K-context decode) at a shorter longest context (387,072 at TP=4) and shares the replicated
-  prefix only up to 32,768 tokens.
-- A request with `prompt_logprobs` runs its prompt as decode steps (about 13 ms a token at TP=4) and holds the others
-  meanwhile. The shim caps those prompts at 1,024 tokens.
 - Each rank checks its weights at boot: the GPU sums what it holds and compares with the bytes the loader read. A
   difference stops the boot with exit 3 and names the rank and the chunk ("g6: weight check: ..."). Once serving,
   `curl localhost:8100/health?deep` on the head checks every rank again ([frontend/README.md](frontend/README.md)).
-  `G6ENV_X=G6_WEIGHT_CHECK=0` turns both off.
-- `top_k` and `min_p` are ignored with a warning. `logprobs` and `prompt_logprobs` work up to k = 20.
-  [frontend/README.md](frontend/README.md) has the full API.
+  `EXTRA_ENV=GR8_WEIGHT_CHECK=0` turns both off.
+- GLM-5.3 troubleshooting is in [docs/GLM-5.3.md](docs/GLM-5.3.md#troubleshooting). Open bugs for every model are in
+  [KNOWN-ISSUES.md](KNOWN-ISSUES.md).
+
+## API and ports
+
+The head serves the OpenAI API on port 8100. [frontend/README.md](frontend/README.md) has the full API.
 
 | port | what | where |
 |---|---|---|
@@ -311,7 +204,7 @@ rate (frontend/README.md). A request that uses `logprobs` cannot have a budget.
 
 | path | what |
 |---|---|
-| `gr8` | the entry point: `./gr8 glm53 <command>` |
+| `gr8` | the entry point: `./gr8 <model> <command>` |
 | `tools/launch/` | the per-box supervisor behind `up`: options, the model and its cache, the handshake, mentat |
 | `engine/runtime/` | `g6m4.cu` (one rank), `m4sim.cu` (one GPU simulating every rank), the step, prefill and the multi-session scheduler (`s2/`) |
 | `engine/kernels/` | experts and dense trellis matrices, GEMV/GEMM, router, norms, sampling |
@@ -323,23 +216,32 @@ rate (frontend/README.md). A request that uses `logprobs` cannot have a budget.
 | `scripts/` | build, tests and `engine_args.sh` (the engine command line) |
 | `tools/convert/` | the readers, writers and test fixtures behind the exlr8 release |
 | `smoketest/`, `bench/` | the smoke test, benchmarks and the quality gate |
-| `docs/` | engine settings, the prefill attention design, the model-specific parts |
-| [KNOBS.md](KNOBS.md), [CHANGELOG.md](CHANGELOG.md), [KNOWN-ISSUES.md](KNOWN-ISSUES.md), [PROTOCOL.md](PROTOCOL.md), [AGENTS.md](AGENTS.md) | every option; what changed and the measurements behind it; open bugs; the front end to engine protocol; how to build, test and land a change |
+| `docs/` | one page per model, deploy and boot guides, engine settings, the prefill attention design, the model-specific parts |
+| [KNOBS.md](KNOBS.md), [KNOWN-ISSUES.md](KNOWN-ISSUES.md), [PROTOCOL.md](PROTOCOL.md), [AGENTS.md](AGENTS.md) | how the options combine (`./gr8 knobs` lists them); open bugs; the front end to engine protocol; how to build, test and land a change |
 
-gr8 is written for GLM 5.3's shapes, not as a general engine. [docs/MODEL-SPECIFIC.md](docs/MODEL-SPECIFIC.md) lists every
-place the model is built in, and what would carry over to another model.
+gr8 is not a general engine: it is written for the shapes of the three models above.
+[docs/MODEL-SPECIFIC.md](docs/MODEL-SPECIFIC.md) lists every place GLM 5.3 is built in, and what would carry over to
+another model.
 
 ## Credits
 
 KindlingAI is:
 
 - [@adapt-ai-systems](https://github.com/adapt-ai-systems)
+  - Opt-in packed-key attention pipeline for sequence-parallel DeepSeek prefill, with exactness tests.
+  - Opt-in sequence-parallel DeepSeek prefill: owned-row attention, expert groups, collectives and timing tests.
   - Prefill optimization, TP=6 S2 serving and context-budget improvements
     ([#7](https://github.com/kindlingai/gr8/pull/7), [#9](https://github.com/kindlingai/gr8/pull/9),
     [#27](https://github.com/kindlingai/gr8/pull/27), [#29](https://github.com/kindlingai/gr8/pull/29)).
   - Earlier engine, TP=3 conversion and gate foundations preserved in the Git history
     ([range fetching and manifests](https://github.com/kindlingai/gr8/commit/2d88926cb08bec602ba6382ccf10d90e1a735841),
     [gate harness](https://github.com/kindlingai/gr8/commit/3d6116f084b86aa96d4be47b253e223ef7a5dcea)).
+  - DeepSeek-V4.1-Flash on four boxes: the `ds41` tuning knobs and served defaults
+    ([#327](https://github.com/kindlingai/gr8/pull/327)-[#333](https://github.com/kindlingai/gr8/pull/333),
+    [#335](https://github.com/kindlingai/gr8/pull/335)-[#338](https://github.com/kindlingai/gr8/pull/338)),
+    and this boot guide.
+  - Control agreement bool-ABI regression fix and exhaustive ACK-subset coverage.
+  - Engine Rust pinned to 1.94.1, the compiler the images ship, and the CI engine job prints that compiler.
 - [@coffee-the-dev](https://github.com/coffee-the-dev)
 - [@mmastrac](https://github.com/mmastrac)
 
@@ -369,6 +271,8 @@ Thanks to:
     ([#82](https://github.com/kindlingai/gr8/pull/82), [#84](https://github.com/kindlingai/gr8/pull/84),
     [#86](https://github.com/kindlingai/gr8/pull/86), [#87](https://github.com/kindlingai/gr8/pull/87),
     [#90](https://github.com/kindlingai/gr8/pull/90)).
+  - Shared-scope steering in S2 batched decode (the MoE shared-expert finalize of shared steps,
+    [#209](https://github.com/kindlingai/gr8/pull/209)).
 - [@eqvse](https://github.com/eqvse) and [@cl83](https://github.com/cl83)
   - TP=3/TP=4 ring fabric and relay support ([#4](https://github.com/kindlingai/gr8/pull/4)).
 - [@chuck-ads](https://github.com/chuck-ads)
@@ -381,8 +285,15 @@ Thanks to:
     ([#60](https://github.com/kindlingai/gr8/pull/60), [#65](https://github.com/kindlingai/gr8/pull/65)).
 - [@unsaltedbutter-ai](https://github.com/unsaltedbutter-ai)
   - API compatibility and structured-output proposals ([#71](https://github.com/kindlingai/gr8/pull/71)).
+- [@msuiche](https://github.com/msuiche)
+  - Native GLP (GGUF) steering input: [weightless](https://weightle.ss/) GLP vectors load as steering
+    profiles through the schema-v1 validation path ([GLP spec](https://github.com/msuiche/weightless/blob/main/docs/spec/GLP.md)).
 - [@alexellis](https://github.com/alexellis)
   - [RigMark](https://github.com/alexellis/rigmark), used for decode and concurrency benchmarking.
+- [@0xr3ngar](https://github.com/0xr3ngar)
+  - Usage cache reporting for the glm dialect: the launcher now passes
+    `--enable-prompt-tokens-details` to the front end, so
+    `usage.prompt_tokens_details.cached_tokens` reaches clients on glm clusters.
 
 ### Upstream projects and research
 
@@ -393,6 +304,9 @@ Thanks to:
 - [davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw](https://huggingface.co/davidsyoung/GLM-5.3-EXL3-TR3-3.25bpw), whose
   per-expert bit distribution `home` keeps expert for expert.
 - [RigMark](https://github.com/alexellis/rigmark) by [@alexellis](https://github.com/alexellis), for decode and concurrency benchmarking.
+- [weightless](https://github.com/msuiche/weightless) by [@msuiche](https://github.com/msuiche): the GLP
+  vector format ([spec](https://github.com/msuiche/weightless/blob/main/docs/spec/GLP.md)) and its
+  reader-conformance contract, which the native steering input implements.
 - The tool-call cases in `frontend/g6front-rs/src/parser.rs` are ported from vLLM's GLM tool-parser tests (Apache-2.0).
 
 Credits are also maintained in [CREDITS.md](CREDITS.md).

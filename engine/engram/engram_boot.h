@@ -1,0 +1,223 @@
+// Engram boot checks (host only, no CUDA): the GR8_DS_ENGRAM knobs, and the sidecar of one rank loaded fail-closed.
+//   PREFIX.engram.json        the manifest: g6engram-v2 (the release's split files, written by the loader at boot: per table
+//                             layer/rows/part/first/valid/dim/sdim and its runs path/row0/rows/w_off/s_off), or g6engram-v1 (a
+//                             sidecar: per table layer/rows/part/first/valid/dim/sdim/w_bytes/s_bytes and the two files below)
+//   g6engram-v3-col uses the v2 fields but consecutive runs within columns j % tp == rank; scales pack those columns, part = valid.
+//   PREFIX.engram.L###.w8     E4M3 rows [part][256]   (size only)
+//   PREFIX.engram.L###.s8     E8M0 scales [part][8]   (size only here; the whole file is read to the device at boot)
+//   PREFIX.engram.cmap        "G6ECMAP1" token map written by gen_engram.py; sha256 of the file must equal kCmapSha256 (hash_consts.h)
+// Anything missing, the wrong size, from another rank / tp / table shape, or a cmap that is not the one the constants were generated
+// from, is an error string and no Engram: GR8_DS_ENGRAM=1 then stops the boot (docs/DEEPSEEK-ENGRAM.md "Boot and knobs").
+#pragma once
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <sys/stat.h>
+#include "hash_consts.h"
+#include "rowstore.h"
+#include "sha256.h"
+#include "../runtime/json.h"
+#include "../knobs-rs/gr8_knobs.h"
+
+namespace ds41 { namespace engram {
+
+struct Knobs
+{
+    bool on = false;          // GR8_DS_ENGRAM
+    StoreOpts store;          // GR8_DS_ENGRAM_CACHE_MIB / _WAYS / _IO_THREADS
+    bool verbose = false;     // GR8_DS_ENGRAM_VERBOSE: one stats line per fetch on stderr
+    bool col_shard = true;   // GR8_DS_ENGRAM_COL_SHARD: column j belongs to j % nr
+    bool lookahead = false;   // GR8_DS_ENGRAM_LOOKAHEAD: inter-chunk L001 cache warm into shared RowStore; default off
+    std::string prefix;       // GR8_DS_ENGRAM_PREFIX: the sidecar PREFIX (PREFIX.engram.json / .cmap / .L###.w8 / .s8); the step driver requires it when on
+};
+
+// The knob table stops the process on a value outside its range, so this returns true; err stays for the callers.
+inline bool read_knobs(Knobs* k, std::string* err)
+{
+    (void)err;
+    k->on = knob::ds_engram();
+    k->store.cache_bytes = (size_t)knob::ds_engram_cache_mib() << 20;
+    k->store.ways = (int)knob::ds_engram_ways();
+    k->store.io_threads = (int)knob::ds_engram_io_threads();
+    k->store.io_uring = (int)knob::ds_engram_io_uring();
+    k->verbose = knob::ds_engram_verbose();
+    k->lookahead = knob::ds_engram_lookahead();
+    k->col_shard = knob::ds_engram_col_shard();
+    if (const auto& pf = knob::ds_engram_prefix()) k->prefix = *pf;
+    return true;
+}
+
+struct TableInfo
+{
+    int64_t rows = 0, part = 0, first = 0, valid = 0;
+    ColShard columns;         // v3-col: global column ranges, packed scale bases
+    std::string w8, s8;       // v1: the sidecar files
+    std::vector<TableRun> runs, sruns;   // v2: the rows' and the scales' runs in the release's files (TableRun::off: their first byte)
+};
+
+struct Sidecar
+{
+    TableInfo t[kNE];
+    std::vector<uint32_t> cmap;   // kVocab entries
+};
+
+inline bool slurp(const std::string& path, std::string* out, std::string* err)
+{
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { *err = path + ": cannot open"; return false; }
+    char buf[1 << 16];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) out->append(buf, n);
+    const bool bad = ferror(f);
+    fclose(f);
+    if (bad) { *err = path + ": read error"; return false; }
+    return true;
+}
+
+inline bool file_size(const std::string& path, uint64_t* n, std::string* err)
+{
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) { *err = path + ": missing"; return false; }
+    *n = (uint64_t)st.st_size;
+    return true;
+}
+
+inline std::string table_path(const std::string& prefix, int layer, const char* ext)
+{
+    char b[32];
+    snprintf(b, sizeof b, ".engram.L%03d.%s", layer, ext);
+    return prefix + b;
+}
+
+// Metadata regeneration cannot restore bytes omitted by old contiguous-rank staging.
+// Check only owned weight/scale ranges, without reading the multi-GB table bodies.
+inline bool check_column_data(const Sidecar& sc, std::string* err)
+{
+    for (const auto& t : sc.t)
+    {
+        if (!t.columns.enabled) continue; // COL_SHARD=0 retains the legacy path.
+        for (int scales = 0; scales < 2; ++scales)
+            for (const auto& r : (scales ? t.sruns : t.runs))
+            {
+                const uint64_t width = scales ? kScaleBytes : kRowBytes;
+                const std::string at = r.path + ": column-sharded Engram " + (scales ? "scale" : "weight") +
+                                       " range at " + std::to_string(r.off);
+                auto fail = [&](const std::string& why) {
+                    *err = at + ": " + why + "; restage full release files, or set GR8_DS_ENGRAM_COL_SHARD=0 on all ranks";
+                    return false;
+                };
+                const int fd = ::open(r.path.c_str(), O_RDONLY | O_CLOEXEC);
+                if (fd < 0) return fail(std::string("cannot open: ") + strerror(errno));
+                struct stat st{};
+                const int rc = fstat(fd, &st), stat_errno = errno;
+                if (rc != 0) { close(fd); return fail(std::string("cannot stat: ") + strerror(stat_errno)); }
+                if (!S_ISREG(st.st_mode) || st.st_size < 0 || r.rows <= 0 || r.off > (uint64_t)st.st_size ||
+                    (uint64_t)r.rows > ((uint64_t)st.st_size - r.off) / width)
+                { close(fd); return fail("missing or truncated owned data"); }
+                const uint64_t end = r.off + (uint64_t)r.rows * width;
+                off_t hole;
+                do hole = lseek(fd, (off_t)r.off, SEEK_HOLE); while (hole < 0 && errno == EINTR);
+                const int seek_errno = errno;
+                close(fd);
+                if (hole < 0) return fail(std::string("cannot verify owned data with SEEK_HOLE: ") + strerror(seek_errno));
+                if ((uint64_t)hole < end) return fail("sparse/hole in owned data at " + std::to_string(hole));
+            }
+    }
+    return true;
+}
+
+// Loads and checks everything the engine needs from disk except the table bytes. rank/nr: this rank and the TP width the image was planned for.
+inline bool load_sidecar(const std::string& prefix, int rank, int nr, Sidecar* sc, std::string* err, bool col_shard = false)
+{
+    if (nr < 1 || rank < 0 || rank >= nr) { *err = "engram: bad rank/tp " + std::to_string(rank) + "/" + std::to_string(nr); return false; }
+    const std::string mp = prefix + ".engram.json";
+    std::string text;
+    if (!slurp(mp, &text, err)) return false;
+    try
+    {
+        const g6v::Json man = g6v::Json::parse(text);
+        const std::string format = man.at("format").str();
+        const bool col = format == "g6engram-v3-col";
+        if (format != "g6engram-v1" && format != "g6engram-v2" && !col) { *err = mp + ": format is not g6engram-v1, v2 or v3-col"; return false; }
+        if (col != col_shard) { *err = mp + ": sidecar column ownership disagrees with GR8_DS_ENGRAM_COL_SHARD"; return false; }
+        const bool v2 = format == "g6engram-v2" || col;
+        if (man.at("rank").i64() != rank || man.at("tp").i64() != nr)
+        {
+            *err = mp + ": planned for rank " + std::to_string(man.at("rank").i64()) + " of " + std::to_string(man.at("tp").i64()) +
+                   ", this process is rank " + std::to_string(rank) + " of " + std::to_string(nr);
+            return false;
+        }
+        const g6v::Json& tabs = man.at("tables");
+        for (int e = 0; e < kNE; ++e)
+        {
+            const g6v::Json* mine = nullptr;
+            for (size_t i = 0; i < tabs.size(); ++i)
+                if (tabs.at(i).at("layer").i64() == kLayerIds[e]) mine = &tabs.at(i);
+            if (!mine) { *err = mp + ": no table for layer " + std::to_string(kLayerIds[e]); return false; }
+            TableInfo& t = sc->t[e];
+            t.rows = mine->at("rows").i64(); t.part = mine->at("part").i64(); t.first = mine->at("first").i64(); t.valid = mine->at("valid").i64();
+            const int64_t dim = mine->at("dim").i64(), sdim = mine->at("sdim").i64();
+            const int64_t wb = v2 ? t.part * kRowBytes : mine->at("w_bytes").i64(), sb = v2 ? t.part * kScaleBytes : mine->at("s_bytes").i64();
+            if (col) t.columns = ColShard::make(kHashParams, e, rank, nr);
+            const int64_t part = col ? t.columns.rows : (kRows[e] + nr - 1) / nr;
+            const int64_t first = col ? (rank < kIds ? kHashParams.offset[e][rank] : kRows[e]) : std::min<int64_t>(rank * part, kRows[e]);
+            const int64_t valid = col ? part : std::min<int64_t>(part, kRows[e] - first);
+            const std::string tag = mp + " layer " + std::to_string(kLayerIds[e]) + ": ";
+            if (t.rows != kRows[e]) { *err = tag + "rows " + std::to_string(t.rows) + " != " + std::to_string(kRows[e]) + " (engram_num_embeddings)"; return false; }
+            if (t.part != part || t.first != first || t.valid != valid)
+            {
+                *err = tag + "part/first/valid " + std::to_string(t.part) + "/" + std::to_string(t.first) + "/" + std::to_string(t.valid) +
+                       " != " + std::to_string(part) + "/" + std::to_string(first) + "/" + std::to_string(valid) + " for rank " + std::to_string(rank) + " of " + std::to_string(nr);
+                return false;
+            }
+            if (dim != kRowBytes || sdim != kScaleBytes || wb != part * kRowBytes || sb != part * kScaleBytes) { *err = tag + "row shape or byte counts are not [part][256] / [part][8]"; return false; }
+            if (v2)
+            {
+                const g6v::Json& segs = mine->at("segs");
+                int64_t next = col ? 0 : first;
+                for (size_t i = 0; i < segs.size(); ++i)
+                {
+                    const g6v::Json& g = segs.at(i);
+                    const TableRun r{g.at("path").str(), g.at("row0").i64(), g.at("rows").i64(), (uint64_t)g.at("w_off").i64()};
+                    if (col ? !t.columns.run(r.row0, r.rows, next) : (r.row0 != next || r.rows <= 0))
+                    { *err = tag + "the runs are not consecutive over the owned rows"; return false; }
+                    next += r.rows;
+                    t.runs.push_back(r);
+                    t.sruns.push_back({r.path, r.row0, r.rows, (uint64_t)g.at("s_off").i64()});
+                }
+                if (next != (col ? valid : first + valid)) { *err = tag + "the runs do not cover the rank's rows"; return false; }
+                continue;
+            }
+            t.w8 = table_path(prefix, kLayerIds[e], "w8");
+            t.s8 = table_path(prefix, kLayerIds[e], "s8");
+            uint64_t n;
+            if (!file_size(t.w8, &n, err)) return false;
+            if ((int64_t)n != wb) { *err = t.w8 + ": " + std::to_string(n) + " bytes, the manifest says " + std::to_string(wb); return false; }
+            if (!file_size(t.s8, &n, err)) return false;
+            if ((int64_t)n != sb) { *err = t.s8 + ": " + std::to_string(n) + " bytes, the manifest says " + std::to_string(sb); return false; }
+        }
+    }
+    catch (const std::exception& ex) { *err = mp + ": " + ex.what(); return false; }
+
+    if (!check_column_data(*sc, err)) return false;
+
+    const std::string cp = prefix + ".engram.cmap";
+    std::string cm;
+    if (!slurp(cp, &cm, err)) { *err += " (write it with engine/engram/gen_engram.py --out-cmap)"; return false; }
+    Sha256 h;
+    h.update(cm.data(), cm.size());
+    const std::string sha = h.hex();
+    if (sha != kCmapSha256) { *err = cp + ": sha256 " + sha + " is not the " + kCmapSha256 + " the hash constants were generated from"; return false; }
+    uint32_t hdr[4];
+    if (cm.size() != 24 + 4ull * kVocab || memcmp(cm.data(), "G6ECMAP1", 8) != 0) { *err = cp + ": bad header or size"; return false; }
+    memcpy(hdr, cm.data() + 8, 16);
+    if (hdr[0] != kVocab || hdr[1] != kCVocab || hdr[2] != kPadId) { *err = cp + ": vocab/cvocab/pad fields differ from the constants"; return false; }
+    sc->cmap.resize(kVocab);
+    memcpy(sc->cmap.data(), cm.data() + 24, 4ull * kVocab);
+    for (uint32_t v : sc->cmap) if (v >= kCVocab) { *err = cp + ": an id is outside the compressed vocabulary"; return false; }
+    if (sc->cmap[kPadTok] != kPadId) { *err = cp + ": the pad token does not map to the pad id"; return false; }
+    return true;
+}
+
+}}  // namespace ds41::engram

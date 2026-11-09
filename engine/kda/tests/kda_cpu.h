@@ -50,6 +50,46 @@ inline void step(const Args& a)
         }
 }
 
+// the fused core kernel (k_kda_core, kda.cuh) with its M == 1, M <= 4 and general phase orders; core_row_67 is the CPU
+// half of core_row_5 (RMSNorm and the gated output)
+template <int M_MODE>
+inline void core_mode(const Args& a)
+{
+    std::vector<CoreThread> th(CORE_T);
+    CoreSmem* s = new CoreSmem;
+    auto phase = [&](auto&& f) { for (int t = 0; t < CORE_T; ++t) f(t); };
+    for (int h = 0; h < a.nh; ++h)
+    {
+        for (auto& x : th) x = CoreThread();
+        auto row = [&](int m, bool head) {
+            if (head)
+            {
+                phase([&](int t) { core_row_0<true, M_MODE>(a, *s, th[t], m, h, t); });
+                phase([&](int t) { core_row_1<true, M_MODE>(a, *s, th[t], m, h, t); });
+            }
+            phase([&](int t) { core_row_23<M_MODE>(a, *s, th[t], m, h, t); });
+            phase([&](int t) { core_row_4<M_MODE>(a, *s, th[t], m, h, t); });
+            phase([&](int t) { core_row_5<true, M_MODE>(a, *s, m, h, t); });
+            phase([&](int t) { core_row_67<true>(a, *s, m, h, t); });
+        };
+        if (M_MODE == 1) row(0, true);
+        else if (M_MODE == 4)
+        {
+            phase([&](int t) { core_row_0<true, 4>(a, *s, th[t], 0, h, t); });
+            phase([&](int t) { core_row_1<true, 4>(a, *s, th[t], 0, h, t); });
+            for (int m = 0; m < a.M; ++m) row(m, false);
+        }
+        else for (int m = 0; m < a.M; ++m) row(m, true);
+    }
+    delete s;
+}
+inline void core(const Args& a)
+{
+    if (a.M == 1) core_mode<1>(a);
+    else if (a.M <= 4) core_mode<4>(a);
+    else core_mode<0>(a);
+}
+
 inline void out(const Args& a)
 {
     OutSmem s;

@@ -45,6 +45,7 @@ int main()
 }
 #else
 #include "../../attn/bind.h"
+#include "../../attn/ops.h"
 #include "../../attn/kvfmt.h"
 #include "../../g6nr.h"
 #include "../s2_cells.cuh"

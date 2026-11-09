@@ -4,6 +4,7 @@
 //   kda::build_state / build_scratch      build: fp32 state S [N_KDA][slots][nhmax][128][128] + conv history
 //                                         [N_KDA][slots][3][3][nhmax*128]; scratch for `rows` rows
 //   kda::reset(state, slot, st)           zero one slot's state, every KDA layer (session start)
+//   kda::copy(state, dst, src, n, st)     slots [src, src + n) to [dst, dst + n), disjoint ranges, every KDA layer
 //   kda::launch(w, state, scratch, xb, row_slot, M, partial, st)
 //       xb: BF16 fragment table of the fp32 block input (K = HID); row_slot: device [M]; partial: BF16 [M][HID], this
 //       rank's heads through its o_proj shard. Rows of one slot must be consecutive and in position order.
@@ -11,12 +12,15 @@
 //       step (fp32 state recurrence) -> out (o_norm * sigmoid gate, BF16 fragments) -> o_proj.
 // Graph-capturable: no host sync, no allocation in reset/launch.
 #pragma once
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <cuda_runtime.h>
 #include "math.h"
 #include "../kernels/densev.cuh"
 #include "../kernels/dtr.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 #include "../runtime/flash_mark.h"
 
 namespace kda
@@ -42,6 +46,8 @@ struct KdaLayer
     const uint8_t *o = nullptr;                               // o_proj shard .gv [HID/16][nh*8][512]
     dtr::Mat qt, kt, vt, ot;                                  // W8 trellis q, k, v (SIDE_OUT) and o_proj (SIDE_IN)
     const uint8_t *mxc[3] = {}, *mxs[3] = {};                 // q, k, v own rows as MXFP8 (prefill GEMM): [nh*128][HID], [..][HID/32]
+    uint8_t *mxgv[3] = {};                                    // q, k, v own rows as MXFP8 decode records [nh*8][HID/32][528],
+                                                              // built from mxc / mxs at bind (GR8_GLM53F_KDA_MX=0: decode reads q / k / v)
     const uint16_t *conv[3] = {};                             // [own ch][4]
     const uint16_t *fb = nullptr, *gb = nullptr;              // [own ch][128]
     const float *A_log = nullptr, *dt_bias = nullptr;         // [own heads], [own ch]
@@ -52,7 +58,7 @@ struct KdaState
 {
     float *S = nullptr, *conv = nullptr;
     int slots = 0, nhmax = 0;
-    const int* src = nullptr;           // device [1]: carry-mode source slot (Args::src), nullptr = off
+    const int* src = nullptr;           // device [MX]: carry-mode source slot per row (Args::src), nullptr = off
     size_t s_layer() const { return static_cast<size_t>(slots) * nhmax * DK * DV; }
     size_t c_layer() const { return static_cast<size_t>(slots) * NHIST * 3 * nhmax * DK; }
 };
@@ -74,6 +80,24 @@ template <class T> inline const char* kda_get(const T& r, const char* what, std:
     if (n != want) return what;
     p = r.p;
     return nullptr;
+}
+
+// MXFP8 decode record of codes [16T][K] + E8M0 scales [16T][K/32] -> [T][K/32][528], as loader-rs records::mxfp8_record:
+// two 16x16 tiles in GV lane order (lane l = (r, c), r = l / 4, c = l % 4: (r,2c) (r,2c+1) (r+8,2c) (r+8,2c+1)
+// (r,2c+8) (r,2c+9) (r+8,2c+8) (r+8,2c+9)), then the 8 scale pairs {s[i], s[i+8]}. One CTA of 256 threads per record.
+__global__ void __launch_bounds__(256) k_kda_mx_record(const uint8_t* codes, const uint8_t* scales, int K, uint8_t* out)
+{
+    const int ng = K / 32, t = blockIdx.x / ng, g = blockIdx.x % ng, i = threadIdx.x;
+    uint8_t* rec = out + static_cast<size_t>(blockIdx.x) * 528;
+    const int l = i >> 3, e = i & 7, r = l >> 2, c = l & 3;
+    const int row = r + ((e & 2) ? 8 : 0), col = 2 * c + (e & 1) + ((e & 4) ? 8 : 0);
+    for (int h = 0; h < 2; ++h)
+        rec[h * 256 + i] = codes[static_cast<size_t>(16 * t + row) * K + 32 * g + 16 * h + col];
+    if (i < 8)
+    {
+        rec[512 + 2 * i] = scales[static_cast<size_t>(16 * t + i) * ng + g];
+        rec[512 + 2 * i + 1] = scales[static_cast<size_t>(16 * t + i + 8) * ng + g];
+    }
 }
 
 // find(name) -> {p, nd, shape[]} (rank.cuh TensorRef). Names: loader-rs FLASH.md. Returns nullptr or the missing name.
@@ -122,6 +146,17 @@ template <class FindT> inline const char* bind_kda(KdaLayer& w, int l, const Fin
         {
             w.mxc[i] = static_cast<const uint8_t*>(get(A + qkv[i] + ".weight.mx.codes", {dl, HID}));
             w.mxs[i] = static_cast<const uint8_t*>(get(A + qkv[i] + ".weight.mx.scales", {dl, HID / 32}));
+        }
+    // GR8_GLM53F_KDA_MX (default on, =0 off): decode q / k / v read MXFP8 records with FP16 activations instead of the BF16
+    // weights. Not byte-exact, and a third copy of q / k / v per rank (dl / 16 x HID / 32 x 528 B per matrix) outside the
+    // loader's accounting.
+    if (knob::glm53f_kda_mx() && !w.qt.w && w.mxc[0] && w.mxc[1] && w.mxc[2] && w.mxs[0] && w.mxs[1] && w.mxs[2] && dl % 16 == 0)
+        for (int i = 0; i < 3; ++i)
+        {
+            const size_t recs = static_cast<size_t>(dl / 16) * (HID / 32);
+            if (cudaMalloc(&w.mxgv[i], recs * 528) != cudaSuccess) return "KDA: cudaMalloc mx decode record";
+            k_kda_mx_record<<<static_cast<unsigned>(recs), 256>>>(w.mxc[i], w.mxs[i], HID, w.mxgv[i]);
+            if (cudaDeviceSynchronize() != cudaSuccess) return "KDA: mx decode record build";
         }
     if (find(A + "f_a_proj.weight.mx.gv").p)
         w.fa_mx = static_cast<const uint8_t*>(get(A + "f_a_proj.weight.mx.gv", {DK / 16, HID / 32, 528}));
@@ -344,6 +379,16 @@ inline void reset(const KdaState& s, int slot, cudaStream_t st)
     k_kda_reset<<<dim3(32, N_KDA), 256, 0, st>>>(s.S, s.conv, s.s_layer(), s.c_layer(), s.s_layer() / s.slots, s.c_layer() / s.slots, slot);
 }
 
+inline cudaError_t copy(const KdaState& s, int dst, int src, int n, cudaStream_t st)
+{
+    const size_t ss = s.s_layer() / s.slots, cs = s.c_layer() / s.slots;
+    cudaError_t e = cudaMemcpy2DAsync(s.S + dst * ss, s.s_layer() * sizeof(float), s.S + src * ss, s.s_layer() * sizeof(float),
+                                      n * ss * sizeof(float), N_KDA, cudaMemcpyDeviceToDevice, st);
+    if (e != cudaSuccess) return e;
+    return cudaMemcpy2DAsync(s.conv + dst * cs, s.c_layer() * sizeof(float), s.conv + src * cs, s.c_layer() * sizeof(float),
+                             n * cs * sizeof(float), N_KDA, cudaMemcpyDeviceToDevice, st);
+}
+
 inline Args make_args(const KdaLayer& w, const KdaState& s, const KdaScratch& sc, const int* row_slot, int M)
 {
     Args a;
@@ -395,7 +440,11 @@ inline void launch_oproj(const KdaLayer& w, const uint16_t* OF, int M, void* par
     {
         dtr::Gemv g;
         const int dodt = odt == gv::O_BF16 ? dtr::O_BF16 : dtr::O_F32;
-        dtr::make_out(w.ot, M, reinterpret_cast<const __half*>(OH), w.nh * DK, nullptr, partial, HID, dodt, *dt, 192, 0, 1, g);
+        if (const char* e = dtr::make_out(w.ot, M, reinterpret_cast<const __half*>(OH), w.nh * DK, nullptr, partial, HID, dodt, *dt, 192, 0, 1, g))
+        {
+            fprintf(stderr, "kda o_proj trellis, %d rows: %s\n", M, e);
+            abort();
+        }
 #ifdef DEC_SLOT
         if (slot) g.a.slot = *slot;
 #endif
@@ -809,9 +858,16 @@ inline void launch_proj_in(const KdaLayer& w, const Args& a, float* P, const u32
     pa.xfrag = xb; pa.M = M; pa.ld = pl.ld(); pa.odt = gv::O_F32;
     if (!w.qt.w)
     {
-        pa.add(w.q, P + pl.q(), HID, dl, 4, 8);
-        pa.add(w.k, P + pl.q() + dl, HID, dl, 4, 8);
-        pa.add(w.v, P + pl.q() + 2 * dl, HID, dl, 4, 8);
+        if (w.mxgv[0] && xf)   // MXFP8 records (half the bytes of BF16), fp16 activations like f_a / g_a
+        {
+            for (int s = 0; s < 3; ++s) pa.add(w.mxgv[s], P + pl.q() + s * dl, HID, dl, 4, 8, xf, 1);
+        }
+        else
+        {
+            pa.add(w.q, P + pl.q(), HID, dl, 4, 8);
+            pa.add(w.k, P + pl.q() + dl, HID, dl, 4, 8);
+            pa.add(w.v, P + pl.q() + 2 * dl, HID, dl, 4, 8);
+        }
     }
     if (w.fa_mx) pa.add(w.fa_mx, P + pl.fa(), HID, DK, 1, 32, xf, 1);
     else         pa.add(w.fa,    P + pl.fa(), HID, DK, 1, 32);
@@ -820,9 +876,8 @@ inline void launch_proj_in(const KdaLayer& w, const Args& a, float* P, const u32
     pa.add(w.b, P + pl.b(), HID, HEADS, 1, 32);
     if (w.qt.w)
     {
-        static const int ks_env = getenv("G6_KDA_PROJ_KS") ? atoi(getenv("G6_KDA_PROJ_KS")) : 16;
-        static const int mode_env = !getenv("G6_KDA_PROJ_MODE") ? 0 : atoi(getenv("G6_KDA_PROJ_MODE"));
-        const int KS = (ks_env == 8 || ks_env == 16 || ks_env == 32) ? ks_env : 16;
+        const int KS = static_cast<int>(knob::glm53f_kda_proj_ks());
+        const int64_t mode = knob::glm53f_kda_proj_mode();
         const int nblk = dl / 128;
         if (dt && dtr::part_floats(dl, 3, KS, M) <= dt->part_n && 3 * nblk <= dt->cnt_n)
         {
@@ -841,14 +896,20 @@ inline void launch_proj_in(const KdaLayer& w, const Args& a, float* P, const u32
             ta.part = dt->part; ta.cnt = dt->cnt; ta.ldy = pl.ld();
             ta.dtr_ctas = nblk * 3 * KS;
             ta.pa = pa;
+            // k_kda_proj_trellis stages its rotated x slice, tiles(M) x (HID / 16 / KS) x 64 words, in sm[4096]
+            if (!(xa && (mode == 1 || mode == 2)) && static_cast<long>(g6mx::tiles(M)) * (HID / 16 / KS) * 64 > 4096)
+            {
+                fprintf(stderr, "kda: GR8_GLM53F_KDA_PROJ_KS=%d at %d rows overflows the projection kernel's shared x table\n", KS, M);
+                abort();
+            }
             g6mx::nt_dispatch(g6mx::tiles(M), [&](auto N) {
                 constexpr int NTv = decltype(N)::value;
-                if (xa && mode_env == 1)
+                if (xa && mode == 1)
                 {
                     k_kda_rot_pa<NTv><<<12 + ta.pa.ctas, 256, 0, st>>>(ta);
                     k_kda_proj_trellis_norot<NTv><<<ta.dtr_ctas, 256, 0, st>>>(ta);
                 }
-                else if (xa && mode_env == 2)
+                else if (xa && mode == 2)
                 {
                     k_kda_rot_pa<NTv><<<12, 256, 0, st>>>(ta);
                     k_kda_proj_trellis_norot<NTv><<<ta.dtr_ctas + ta.pa.ctas, 256, 0, st>>>(ta);
@@ -864,7 +925,11 @@ inline void launch_proj_in(const KdaLayer& w, const Args& a, float* P, const u32
         for (int s = 0; s < 3; ++s)
         {
             dtr::Gemv g;
-            dtr::make_out(*m3[s], M, x, HID, nullptr, P + pl.q() + s * dl, pl.ld(), dtr::O_F32, *dt, s * 64, 0, 1, g);
+            if (const char* e = dtr::make_out(*m3[s], M, x, HID, nullptr, P + pl.q() + s * dl, pl.ld(), dtr::O_F32, *dt, s * 64, 0, 1, g))
+            {
+                fprintf(stderr, "kda %c projection trellis, %d rows: %s\n", "qkv"[s], M, e);
+                abort();
+            }
             dtr::launch(g, st);
         }
     }

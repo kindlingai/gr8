@@ -1,0 +1,32 @@
+{
+ "image": "red_disc_150x150.png",
+ "ppm": "red_disc_150x150.ppm",
+ "w": 150,
+ "h": 150,
+ "vit_h": 12,
+ "vit_w": 12,
+ "tokens": 36,
+ "dim": 4096,
+ "nproj": 64,
+ "rows": [
+  0,
+  1,
+  5,
+  6,
+  18,
+  30,
+  34,
+  35
+ ],
+ "rgb_sha256": "1de72dd5f291d91648fcf7a0e80cd3704ab1b85932a56de9869d807cf779c443",
+ "patches_bf16_sha256": "1819009f4c77be64513ae1278abd789e6267a165a4ef949b6d17eef9a0dbc966",
+ "torchvision_patches_match_formula": true,
+ "pil_backend_patch_maxdiff": 2.384185791015625e-07,
+ "bf16_vs_f32": {
+  "rel_fro": 0.052650075405836105,
+  "row_rel_max": 0.1907568722963333,
+  "row_rel_mean": 0.0629630982875824,
+  "row_rel_median": 0.05233330279588699
+ },
+ "rms": 0.019945812579883142
+}

@@ -193,6 +193,23 @@ pub struct GenParams {
     pub top_p: f64,
     pub top_k: i64,
     pub min_p: f64,
+    /// OpenAI's penalties, in [-2, 2]. With all four at 0 the fields are not sent, so an engine without them keeps its
+    /// frame bytes
+    pub presence_penalty: f64,
+    pub frequency_penalty: f64,
+    /// added inside the think block the prompt leaves open, whose close is `think_end` (None: no open block, so they
+    /// never apply)
+    pub thinking_presence_penalty: f64,
+    pub thinking_frequency_penalty: f64,
+    pub think_end: Option<u32>,
+    /// the think-end boost (PROTOCOL.md), sent when set, with `think_end`
+    pub think_end_boost: Option<crate::sampling::Boost>,
+    /// the sequence penalty's scopes (PROTOCOL.md): thinking (with `think_end`) and answer sent when set, guard only
+    /// once a retry filled `seq_avoid` with the call it must not repeat
+    pub seq_thinking: Option<crate::sampling::Seq>,
+    pub seq_answer: Option<crate::sampling::Seq>,
+    pub seq_guard: Option<crate::sampling::Seq>,
+    pub seq_avoid: Vec<u32>,
     pub seed: Option<i64>,
     pub stop_ids: Vec<i64>,
     pub logprobs: Option<i64>,
@@ -201,10 +218,14 @@ pub struct GenParams {
     pub system_tokens: Option<u64>,
     /// the engine's insert rule (PROTOCOL.md `insert`); only sent when set
     pub insert: Option<InsertRule>,
+    /// the reply's grammar (PROTOCOL.md `grammar`); only sent when set, to an engine whose hello says `"grammar": true`
+    pub grammar: Option<GrammarReq>,
     /// Only sent after validation against hello.steering. None preserves stock frame bytes.
     pub steering_profile: Option<String>,
     /// Canonical FP32 widened to f64 for lossless JSON serialization.
     pub steering_scale: Option<f64>,
+    /// the prompt's image spans (PROTOCOL.md `images`); empty: the field is not sent
+    pub images: std::sync::Arc<Vec<crate::vision::Span>>,
 }
 
 /// Once the reply holds `after_tokens` tokens and none of them is `unless_emitted`, the engine puts `tokens` in place of
@@ -216,6 +237,17 @@ pub struct InsertRule {
     pub tokens: Vec<u32>,
 }
 
+/// The engine masks the reply's tokens with this grammar from the token after `after_token` (the think close) on, or
+/// from the first when it is None.
+#[derive(Clone, Debug)]
+pub struct GrammarReq {
+    /// `json` (any JSON value) or `json_schema`
+    pub kind: &'static str,
+    pub schema: Option<String>,
+    pub strict: bool,
+    pub after_token: Option<u32>,
+}
+
 fn opt_int(b: &mut Vec<u8>, v: Option<i64>) {
     match v {
         Some(i) => pyjson::int(b, i),
@@ -224,7 +256,8 @@ fn opt_int(b: &mut Vec<u8>, v: Option<i64>) {
 }
 
 pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
-    let mut w = FrameWriter::with_capacity(256 + prompt.len() * 7 + p.stop_ids.len() * 8);
+    let img: usize = p.images.iter().map(|i| i.rgb_b64.len() + 96).sum();
+    let mut w = FrameWriter::with_capacity(256 + prompt.len() * 7 + p.stop_ids.len() * 8 + img);
     let b = &mut w.b;
     b.extend_from_slice(b"{\"id\":");
     pyjson::string(b, id);
@@ -247,6 +280,67 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
     pyjson::int(b, p.top_k);
     b.extend_from_slice(b",\"min_p\":");
     pyjson::float(b, p.min_p);
+    if p.presence_penalty != 0.0
+        || p.frequency_penalty != 0.0
+        || p.thinking_presence_penalty != 0.0
+        || p.thinking_frequency_penalty != 0.0
+        || p.think_end_boost.is_some()
+    {
+        b.extend_from_slice(b",\"presence_penalty\":");
+        pyjson::float(b, p.presence_penalty);
+        b.extend_from_slice(b",\"frequency_penalty\":");
+        pyjson::float(b, p.frequency_penalty);
+        b.extend_from_slice(b",\"thinking_presence_penalty\":");
+        pyjson::float(b, p.thinking_presence_penalty);
+        b.extend_from_slice(b",\"thinking_frequency_penalty\":");
+        pyjson::float(b, p.thinking_frequency_penalty);
+        b.extend_from_slice(b",\"think_end\":");
+        opt_int(b, p.think_end.map(i64::from));
+    }
+    if let Some(t) = &p.think_end_boost {
+        b.extend_from_slice(b",\"think_end_boost\":{\"start\":");
+        pyjson::int(b, t.start);
+        b.extend_from_slice(b",\"per1k\":");
+        pyjson::float(b, t.per1k);
+        b.extend_from_slice(b",\"max\":");
+        pyjson::float(b, t.max);
+        b.push(b'}');
+    }
+    let guard = p.seq_guard.filter(|_| !p.seq_avoid.is_empty());
+    let scopes: Vec<(&str, &crate::sampling::Seq, bool)> =
+        [("thinking", &p.seq_thinking, false), ("answer", &p.seq_answer, false), ("guard", &guard, true)]
+            .into_iter()
+            .filter_map(|(k, s, g)| s.as_ref().map(|s| (k, s, g)))
+            .collect();
+    if !scopes.is_empty() {
+        b.extend_from_slice(b",\"sequence_penalty\":{");
+        for (i, (k, s, is_guard)) in scopes.iter().enumerate() {
+            if i > 0 {
+                b.push(b',');
+            }
+            pyjson::string(b, k);
+            b.extend_from_slice(b":{\"mult\":");
+            pyjson::float(b, s.mult);
+            b.extend_from_slice(b",\"base\":");
+            pyjson::float(b, s.base);
+            b.extend_from_slice(b",\"min\":");
+            pyjson::int(b, s.min);
+            b.extend_from_slice(b",\"cap\":");
+            pyjson::float(b, s.cap);
+            if *is_guard {
+                b.extend_from_slice(b",\"avoid\":[");
+                for (i, t) in p.seq_avoid.iter().enumerate() {
+                    if i > 0 {
+                        b.push(b',');
+                    }
+                    pyjson::int(b, *t);
+                }
+                b.push(b']');
+            }
+            b.push(b'}');
+        }
+        b.push(b'}');
+    }
     b.extend_from_slice(b",\"seed\":");
     opt_int(b, p.seed);
     b.extend_from_slice(b",\"stop_ids\":[");
@@ -263,6 +357,21 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
     if let Some(n) = p.system_tokens {
         b.extend_from_slice(b",\"system_tokens\":");
         pyjson::int(b, n);
+    }
+    if let Some(g) = &p.grammar {
+        b.extend_from_slice(b",\"grammar\":{\"kind\":");
+        pyjson::string(b, g.kind);
+        if let Some(s) = &g.schema {
+            b.extend_from_slice(b",\"schema\":");
+            pyjson::string(b, s);
+        }
+        b.extend_from_slice(if g.strict {
+            b",\"strict\":true,\"after_token\":"
+        } else {
+            b",\"strict\":false,\"after_token\":"
+        });
+        opt_int(b, g.after_token.map(i64::from));
+        b.push(b'}');
     }
     if let Some(r) = &p.insert {
         b.extend_from_slice(b",\"insert\":[{\"after_tokens\":");
@@ -283,6 +392,26 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
         pyjson::string(b, profile);
         b.extend_from_slice(b",\"steering_scale\":");
         pyjson::float(b, p.steering_scale.unwrap_or(1.0));
+    }
+    if !p.images.is_empty() {
+        b.extend_from_slice(b",\"images\":[");
+        for (i, im) in p.images.iter().enumerate() {
+            if i > 0 {
+                b.push(b',');
+            }
+            b.extend_from_slice(b"{\"pos\":");
+            pyjson::int(b, im.pos as u64);
+            b.extend_from_slice(b",\"vit_h\":");
+            pyjson::int(b, im.vit_h as u64);
+            b.extend_from_slice(b",\"vit_w\":");
+            pyjson::int(b, im.vit_w as u64);
+            b.extend_from_slice(b",\"key\":");
+            pyjson::string(b, &im.key);
+            b.extend_from_slice(b",\"rgb\":\"");
+            b.extend_from_slice(im.rgb_b64.as_bytes()); // the base64 alphabet needs no JSON escape
+            b.extend_from_slice(b"\"}");
+        }
+        b.push(b']');
     }
     b.extend_from_slice(b",\"type\":\"generate\"}");
     w.finish()
@@ -317,14 +446,26 @@ mod tests {
             top_p: 1.0,
             top_k: 0,
             min_p: 0.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            thinking_presence_penalty: 0.0,
+            thinking_frequency_penalty: 0.0,
+            think_end: None,
+            think_end_boost: None,
+            seq_thinking: None,
+            seq_answer: None,
+            seq_guard: None,
+            seq_avoid: Vec::new(),
             seed: None,
             stop_ids: vec![1, 2],
             logprobs: Some(3),
             prompt_logprobs: None,
             system_tokens: Some(2),
             insert: None,
+            grammar: None,
             steering_profile: None,
             steering_scale: None,
+            images: Default::default(),
         };
         let mut all = Vec::new();
         all.extend_from_slice(&generate("cmpl-1", &[10, 20, 30], &p));
@@ -343,11 +484,50 @@ mod tests {
         assert!(!String::from_utf8_lossy(&generate("x", &[1], &p)[4..]).contains("insert"));
         assert!(!v.as_object().unwrap().contains_key("steering_profile"));
         assert!(!v.as_object().unwrap().contains_key("steering_scale"));
+        assert!(!v.as_object().unwrap().contains_key("presence_penalty"));
+        let pen = GenParams { presence_penalty: 1.5, ..p.clone() };
+        let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &pen)[4..]).unwrap();
+        assert_eq!((v["presence_penalty"].as_f64(), v["frequency_penalty"].as_f64()), (Some(1.5), Some(0.0)));
+        assert_eq!(
+            (v["thinking_presence_penalty"].as_f64(), v["think_end"].clone()),
+            (Some(0.0), serde_json::Value::Null)
+        );
+        let pen = GenParams { thinking_frequency_penalty: -0.5, think_end: Some(154842), ..p.clone() };
+        let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &pen)[4..]).unwrap();
+        assert_eq!((v["presence_penalty"].as_f64(), v["thinking_frequency_penalty"].as_f64()), (Some(0.0), Some(-0.5)));
+        assert_eq!(v["think_end"], serde_json::json!(154842));
+        assert!(!v.as_object().unwrap().contains_key("think_end_boost"));
+        let boost = crate::sampling::Boost { start: 4096, per1k: 2.0, max: 10.0 };
+        let pen = GenParams { think_end: Some(154842), think_end_boost: Some(boost), ..p.clone() };
+        let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &pen)[4..]).unwrap();
+        assert_eq!(v["think_end_boost"], serde_json::json!({"start": 4096, "per1k": 2.0, "max": 10.0}));
+        assert_eq!((v["presence_penalty"].as_f64(), v["think_end"].as_u64()), (Some(0.0), Some(154842)));
+        assert!(!v.as_object().unwrap().contains_key("sequence_penalty"));
+        let t = crate::sampling::Seq { mult: 0.8, base: 1.75, min: 4, cap: 6.0 };
+        let g = crate::sampling::Seq { mult: 1.0, base: 2.0, min: 1, cap: 8.0 };
+        let sp = GenParams { seq_thinking: Some(t), seq_guard: Some(g), ..p.clone() };
+        let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &sp)[4..]).unwrap();
+        assert_eq!(
+            v["sequence_penalty"],
+            serde_json::json!({"thinking": {"mult": 0.8, "base": 1.75, "min": 4, "cap": 6.0}})
+        ); // the guard waits for a retry
+        let sp = GenParams { seq_guard: Some(g), seq_avoid: vec![5, 6], ..p.clone() };
+        let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &sp)[4..]).unwrap();
+        assert_eq!(
+            v["sequence_penalty"],
+            serde_json::json!({"guard": {"mult": 1.0, "base": 2.0, "min": 1, "cap": 8.0, "avoid": [5, 6]}})
+        );
         let selected =
             GenParams { steering_profile: Some("example".into()), steering_scale: Some(1.1f32 as f64), ..p.clone() };
         let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1], &selected)[4..]).unwrap();
         assert_eq!(v["steering_profile"], "example");
         assert_eq!((v["steering_scale"].as_f64().unwrap() as f32).to_bits(), 0x3f8ccccd);
+        assert!(!v.as_object().unwrap().contains_key("images"));
+        let span = crate::vision::Span { pos: 1, vit_h: 2, vit_w: 3, key: "00ff".into(), rgb_b64: "QUJD".into() };
+        let withimg = GenParams { images: std::sync::Arc::new(vec![span]), ..p.clone() };
+        let v: serde_json::Value = serde_json::from_slice(&generate("x", &[1, 129264], &withimg)[4..]).unwrap();
+        assert_eq!(v["images"], serde_json::json!([{"pos": 1, "vit_h": 2, "vit_w": 3, "key": "00ff", "rgb": "QUJD"}]));
+        assert_eq!(v["type"], "generate");
         let p = GenParams {
             logprobs: None,
             insert: Some(InsertRule { after_tokens: 31, unless_emitted: Some(154842), tokens: vec![198, 154842, 271] }),

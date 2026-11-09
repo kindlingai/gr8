@@ -4,78 +4,135 @@
 #include "driver.h"
 #include "ingress.h"
 #include "../serve.h"
+#include "../penalty.h"
+#include <chrono>
 #include <cmath>
+#include <cstring>
 #include <functional>
+#include <memory>
+#include "prompt_rule.h"
 
 namespace g6s2 {
-inline std::vector<int> request_ids(const std::string& s) {
-    std::vector<int> out; size_t a = 0;
-    do {
-        auto b = s.find(',', a); auto n = number(s.substr(a, b == std::string::npos ? b : b - a));
-        require(n <= INT32_MAX, "request token integer overflow"); out.push_back(int(n));
-        if (b == std::string::npos) break;
-        a = b + 1;
-    } while (true);
-    return out;
+// The request file's parser is engine/scheduler-rs/src/request.rs. A request is the header line
+// `n_gen <n> temp <f> seed <n> min <n> stop <ids|->`, then optionally and in this order `top_p <f>`,
+// `pen <presence> <frequency> <thinking presence> <thinking frequency> <think_end or -1>`, `boost <start> <per1k> <max>`,
+// `seqt <mult>:<base>:<min>:<cap>`, `seqa <mult>:<base>:<min>:<cap>`, `seqg <mult>:<base>:<min>:<cap>:<ids>`
+// (penalty.h), `lp <k>`, `plp <k>`, `sys <n>`, `ins <rule>`, `gram <grammar>` and
+// `steer <profile> <canonical-fp32-hex>`, then any number of
+// `img <field>` (images, image_input.h: parsed here through parse::image, checked after the prompt), then the
+// prompt ids.
+namespace parse {
+using Handle = std::unique_ptr<g6sch_parsed, void (*)(g6sch_parsed*)>;
+inline std::vector<int> ints(const g6sch_ints& v) { return std::vector<int>(v.p, v.p + v.n); }
+// the steering fields to the request's identity (BootConfig::resolve), its refusal kept for the parser to return;
+// images: the request's `img` fields (parse::image), in order
+struct Resolve { const g6rt::steering::BootConfig* boot; std::string error; std::vector<g6rt::ImageIn> images; };
+inline const char* resolve(void* ctx, bool has_profile, const uint8_t* profile, size_t n, uint32_t bits, g6sch_identity* out) {
+    auto& r = *static_cast<Resolve*>(ctx);
+    try {
+        g6rt::steering::RequestFields f;
+        if (has_profile) {
+            f.has_profile = f.has_scale = true;
+            f.profile.assign(reinterpret_cast<const char*>(profile), n);
+            f.scale = g6rt::steering::bits_float(bits);
+        }
+        const g6rt::steering::Identity id = r.boot->resolve(f);
+        std::memcpy(out, &id, sizeof *out);
+        return nullptr;
+    } catch (const std::exception& e) {
+        r.error = e.what();
+        return r.error.c_str();
+    } catch (...) {   // nothing may unwind into the Rust caller
+        r.error = "steering resolve failed";
+        return r.error.c_str();
+    }
 }
-// `ins <after>:<unless or -1>:<id,id,..>` (insert_rule.h)
-inline g6rt::InsertRule parse_insert(const std::string& s) {
-    const auto a = s.find(':'), b = a == std::string::npos ? a : s.find(':', a + 1);
-    require(b != std::string::npos, "invalid ins header");
-    g6rt::InsertRule r;
-    const auto after = number(s.substr(0, a));
-    require(after <= INT32_MAX, "invalid ins after");
-    r.after = int(after);
-    const auto unless = s.substr(a + 1, b - a - 1);
-    r.unless = unless == "-1" ? -1 : int(std::min<uint64_t>(number(unless), INT32_MAX));
-    r.tokens = request_ids(s.substr(b + 1));
-    require(!r.tokens.empty() && r.tokens.size() <= size_t(g6rt::INSERT_MAX), "invalid ins token count");
+// one `img` field (image_input.h parse_field), kept in the context with its refusal for the parser to return
+inline const char* image(void* ctx, const uint8_t* field, size_t n) {
+    auto& r = *static_cast<Resolve*>(ctx);
+    try {
+        r.images.push_back(g6rt::img::parse_field(std::string(reinterpret_cast<const char*>(field), n)));
+        return nullptr;
+    } catch (const std::exception& e) {
+        r.error = e.what();
+        return r.error.c_str();
+    } catch (...) {   // nothing may unwind into the Rust caller
+        r.error = "img field failed";
+        return r.error.c_str();
+    }
+}
+} // namespace parse
+// `gram <kind>:<strict>:<arm or -1>:<hex>` (grammar.h): kind 1 = JSON, 2 = the JSON schema whose UTF-8 bytes are <hex>
+inline g6rt::GrammarSpec parse_grammar(const std::string& s) {
+    uint32_t kind = 0; bool strict = false; int32_t arm = -1; const uint8_t* schema = nullptr; size_t n = 0;
+    g6sch_parsed* h = nullptr;
+    check(g6sch_parse_grammar(reinterpret_cast<const uint8_t*>(s.data()), s.size(), &kind, &strict, &arm, &schema, &n, &h));
+    const parse::Handle own(h, g6sch_parsed_free);
+    g6rt::GrammarSpec g;
+    g.kind = g6rt::GrammarSpec::Kind(kind); g.strict = strict; g.arm = arm;
+    g.schema.assign(reinterpret_cast<const char*>(schema), n);
+    return g;
+}
+// grammar_ready: the engine was started with --grammar-dir (a test passes true to reach the grammar path)
+inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steering::BootConfig& steering = {},
+                                    bool grammar_ready = g6rt::grammar_ready()) {
+    static_assert(sizeof(g6rt::steering::Identity) == sizeof(g6sch_identity), "scheduler-rs Identity layout");
+    sch::check_abi();
+    parse::Resolve ctx{&steering, {}, {}};
+    g6sch_parsed_req p{};
+    g6sch_parsed* h = nullptr;
+    check(g6sch_parse_request(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), grammar_ready,
+                              parse::resolve, parse::image, &ctx, &p, &h));
+    const parse::Handle own(h, g6sch_parsed_free);
+    g6rt::ServeReq r;
+    r.prompt = parse::ints(p.prompt); r.stop = parse::ints(p.stop);
+    r.n_gen = p.n_gen; r.min_tokens = p.min_tokens; r.temp = p.temp; r.top_p = p.top_p; r.seed = p.seed;
+    r.presence = p.presence; r.frequency = p.frequency;
+    r.tpresence = p.tpresence; r.tfrequency = p.tfrequency; r.think_end = p.think_end;
+    r.boost_start = p.boost_start; r.boost_per1k = p.boost_per1k; r.boost_max = p.boost_max;
+    for (int i = 0; i < g6rt::PEN_SEQ; ++i) r.seq[i] = {p.seq_mult[i], p.seq_base[i], p.seq_cap[i], p.seq_min[i]};
+    r.avoid = parse::ints(p.avoid);
+    r.lp = p.lp; r.plp = p.plp; r.sys = p.sys;
+    std::memcpy(static_cast<void*>(&r.steering), &p.steering, sizeof r.steering);
+    r.ins.after = p.ins_after; r.ins.unless = p.ins_unless; r.ins.tokens = parse::ints(p.ins_tokens);
+    r.gram.kind = g6rt::GrammarSpec::Kind(p.gram_kind); r.gram.strict = p.gram_strict; r.gram.arm = p.gram_arm;
+    r.gram.schema.assign(reinterpret_cast<const char*>(p.schema), p.schema_n);
+    // the C++ parser's last step, after the prompt line: the images against the prompt, and their cache identity
+    r.images = std::move(ctx.images);
+    if (!r.images.empty()) {
+        try { g6rt::img::check(r.prompt, r.images); } catch (const std::exception& e) { require(false, e.what()); }
+        r.steering.images = true; r.steering.image_digest = g6rt::img::digest(r.images);
+    }
     return r;
 }
-inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steering::BootConfig& steering = {}) {
-    const auto line = bytes.find('\n'); require(line != std::string::npos, "request missing prompt line");
-    std::istringstream in(bytes.substr(0, line));
-    g6rt::ServeReq r; std::string k, gen, seed, min, stop, extra;
-    require(bool(in >> k) && k == "n_gen" && bool(in >> gen >> k) && k == "temp" &&
-            bool(in >> r.temp >> k) && k == "seed" && bool(in >> seed >> k) && k == "min" &&
-            bool(in >> min >> k) && k == "stop" && bool(in >> stop), "invalid request header");
-    // optional, in this order: top_p <float>, lp <k>, plp <k>, sys <tokens>, ins <rule>, steer <profile> <canonical-fp32-hex>
-    auto next = [&] { if (!(in >> k)) k.clear(); };
-    next();
-    if (k == "top_p") { require(bool(in >> r.top_p), "invalid top_p header"); next(); }
-    if (k == "lp") { require(bool(in >> r.lp) && r.lp >= 0 && r.lp <= g6rt::LP_MAX, "invalid lp header"); next(); }
-    if (k == "plp") { require(bool(in >> r.plp) && r.plp >= 0 && r.plp <= g6rt::LP_MAX, "invalid plp header"); next(); }
-    if (k == "sys") { require(bool(in >> r.sys) && r.sys >= 0 && r.sys <= INT32_MAX, "invalid sys header"); next(); }
-    if (k == "ins") { std::string v; require(bool(in >> v), "invalid ins header"); r.ins = parse_insert(v); next(); }
-    g6rt::steering::RequestFields sf;
-    if (k == "steer") {
-        std::string name, bits; require(bool(in >> name >> bits), "invalid steering header"); next();
-        require(g6rt::steering::valid_profile_name(name), "invalid steering profile name");
-        const uint32_t scale = g6rt::steering::parse_scale_bits(bits);
-        sf.has_profile = sf.has_scale = true; sf.profile = std::move(name);
-        sf.scale = g6rt::steering::bits_float(scale);
-    }
-    require(k.empty(), "invalid request header tail (S2 accepts top_p, lp, plp, sys, ins and steer)");
-    require(!r.ins.on() || r.lp < 0, "ins with lp");
-    r.steering = steering.resolve(sf);
-    auto g = number(gen), sd = number(seed), mn = number(min);
-    require(g > 0 && g <= INT32_MAX && sd <= UINT32_MAX && mn <= g &&
-            std::isfinite(r.temp) && r.temp >= 0 && std::isfinite(r.top_p) && r.top_p >= 0 && r.top_p <= 1,
-            "invalid request sampling/length");
-    r.n_gen = int(g); r.seed = uint32_t(sd); r.min_tokens = int(mn);
-    if (stop != "-") r.stop = request_ids(stop);
-    std::istringstream ids(bytes.substr(line + 1)); std::string prompt;
-    require(bool(ids >> prompt) && !(ids >> extra), "invalid prompt line");
-    r.prompt = request_ids(prompt); return r;
-}
-struct Sampling { float inv_temp = 0, top_p = 0; uint32_t seed = 1234; int lp = -1, plp = -1; };   // lp, plp: g6rt::ServeReq
+struct Sampling {
+    float inv_temp = 0, top_p = 0; uint32_t seed = 1234; int lp = -1, plp = -1;   // lp, plp: g6rt::ServeReq
+    float presence = 0, frequency = 0;                                            // penalties (penalty.h); 0 = off
+    float tpresence = 0, tfrequency = 0; int think_end = -1;                      // the thinking penalties and the block's close
+    int boost_start = 0; float boost_per1k = 0, boost_max = 0;                    // the think-end boost (penalty.h pen_boost)
+    g6rt::ServeReq::Seq seq[g6rt::PEN_SEQ]; std::vector<int> avoid;               // the sequence penalty's scopes (penalty.h pen_seq)
+    bool penalty() const { return presence != 0.f || frequency != 0.f || tpresence != 0.f || tfrequency != 0.f; }
+    bool boost() const { return boost_per1k > 0.f && boost_max > 0.f && think_end >= 0; }
+    // the sequence penalty's scopes: thinking (inside the block), answer (outside it) and guard (against the avoided ids)
+    bool seq_on(int i) const { return seq[i].mult > 0.f && seq[i].cap > 0.f; }
+    bool seq_thinking() const { return seq_on(0) && think_end >= 0; }
+    bool seq_answer() const { return seq_on(1); }
+    bool seq_guard() const { return seq_on(2) && !avoid.empty(); }
+    // the head's row table carries the session (Dispatch::penalty_rows)
+    bool tracked() const { return penalty() || boost() || seq_thinking() || seq_answer() || seq_guard(); }
+};
 struct Session {
     Key key; uint64_t request = 0;
     Run run; Payload payload; Sampling sampling; g6rt::Emitter emitter;
+    g6rt::GrammarRef grammar;         // the reply's grammar (Payload::gram), on every rank; null = none
+    std::vector<int> out;             // the tokens emitted so far, kept only when tracked (Dispatch::penalty_rows counts them)
+    bool think_open = false;          // when tracked: the prompt's think block is open and the reply has not emitted its close
+    int think_tokens = 0;             // when tracked: thinking tokens emitted (through the close), the boost's n
     bool bound = false, ended = false;
+    std::chrono::steady_clock::time_point m_at{};   // when the head last wrote this session's "m" line
 };
 class Sessions {
-    Config config_; std::string directory_; bool head_; int chunk_;
+    Config config_; std::string directory_; bool head_; int chunk_; [[maybe_unused]] uint32_t prefill_min_;
     std::array<Session, MAX_SESSIONS> sessions_{};
     Session& get(Key k) {
         require(k.slot < MAX_SESSIONS && sessions_[k.slot].bound && sessions_[k.slot].key == k, "stale emitter session");
@@ -85,15 +142,27 @@ class Sessions {
         require(!e.f || !ferror(e.f), "S2 response output failed");
     }
 public:
-    Sessions(Config c, std::string directory, bool head, int chunk) : config_(c), directory_(std::move(directory)), head_(head), chunk_(chunk) {
+    // prefill_min: DS41 only (ds41_prefill.h); 0 = every prompt runs as decode steps
+    Sessions(Config c, std::string directory, bool head, int chunk, uint32_t prefill_min = 0)
+        : config_(c), directory_(std::move(directory)), head_(head), chunk_(chunk), prefill_min_(prefill_min) {
         c.validate(); require(chunk > 0 && unsigned(chunk) <= c.max_rows, "invalid session chunk");
     }
     ~Sessions() { for (auto& s : sessions_) if (s.emitter.f) fclose(s.emitter.f); }
     Sessions(const Sessions&) = delete; Sessions& operator=(const Sessions&) = delete;
     static Request request(uint64_t id, const g6rt::ServeReq& r) {
-        return {id, uint32_t(r.prompt.size()), uint32_t(r.n_gen), r.steering};
+        Request q;
+        g6svc_request(id, r.prompt.size(), r.n_gen, reinterpret_cast<const g6sch_identity*>(&r.steering), sch::m<g6sch_request>(&q));
+        return q;
     }
-    Payload payload(const g6rt::ServeReq& r) const { return {r.prompt, chunk_, r.plp >= 0, r.ins, r.steering}; }
+    // G6_CAP_PROMPT_DECODE (DS41): no tensor prefill by default, every prompt runs as decode steps from position 0
+    // (Driver decode_prompt) unless prefill_min admits it (ds41_prefill.h); otherwise only prompt logprobs keep a prompt
+    // on the decode path
+    Payload payload(const g6rt::ServeReq& r) const {
+        const bool decode = g6mod::has(G6_CAP_PROMPT_DECODE) ? ds41_decode_prompt(prefill_min_, r.prompt.size(), r.plp, r.steering.enabled)
+                                                             : r.plp >= 0;
+        // r.images is empty outside DS41 and Flash: Service::images_ok refuses an image request there before it is queued
+        return {r.prompt, chunk_, decode, r.ins, r.steering, r.gram, r.images};
+    }
     // (row, target, k) -> a row's logprob entry in the last main step (DispatchHooks::logprob)
     using Logprob = std::function<g6rt::LpRow(int, bool, int)>;
     void bind(const Grant& g, const g6rt::ServeReq& r) {
@@ -103,8 +172,18 @@ public:
         require(req.prompt_tokens == g.req.prompt_tokens && req.max_tokens == g.req.max_tokens &&
                 req.steering == g.req.steering &&
                 grant_pages_ok(config_, req, g.run.pages), "session payload/grant mismatch");
+        // the kernels index the profile tables by this slot
+        require(!req.steering.enabled || (req.steering.slot < config_.steering.profiles.size() &&
+                req.steering == config_.steering.selected(req.steering.scale_bits, req.steering.slot)),
+                "session steering is not a loaded profile");
         s = Session{}; s.key = g.key; s.request = g.req.id; s.run = g.run;
-        s.payload = payload(r); s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed, r.lp, r.plp};
+        s.payload = payload(r);
+        s.sampling = {r.temp > 0 ? 1.f / r.temp : 0.f, r.top_p, r.seed, r.lp, r.plp, r.presence, r.frequency, r.tpresence, r.tfrequency, r.think_end,
+                      r.boost_start, r.boost_per1k, r.boost_max, {r.seq[0], r.seq[1], r.seq[2]}, r.avoid};
+        s.think_open = s.sampling.tracked() && r.think_end >= 0;
+        // the head compiled this grammar before queueing the request (Service::controller), so a failure here means
+        // the ranks disagree, and the epoch ends
+        if (r.gram.on()) s.grammar = g6rt::GrammarRef(g6rt::grammar_open(r.gram).release(), g6rt::GrammarDeleter{});
         s.emitter.open(directory_, g.req.id, head_, r); s.bound = true;
         require(!head_ || s.emitter.f, "cannot open S2 response");
         if (s.emitter.f) {
@@ -146,30 +225,58 @@ public:
             for (int i = 0; i < count; ++i) lps.push_back(logprob(row + i, false, s.sampling.lp));
         }
         const int before = s.emitter.emitted;
+        if (s.grammar) g6rt::grammar_commit(*s.grammar, ids, count);
         const bool done = s.emitter.push(ids, count, lps.empty() ? nullptr : lps.data()); output_ok(s.emitter);
+        // the penalty's output: the tokens counted (a stop id ends the count), and how many were thinking
+        if (s.sampling.tracked()) {
+            s.out.insert(s.out.end(), ids, ids + (s.emitter.emitted - before));
+            for (int i = 0; s.think_open && i < s.emitter.emitted - before; ++i) {
+                ++s.think_tokens;
+                s.think_open = ids[i] != s.sampling.think_end;
+            }
+        }
         return {uint32_t(s.emitter.emitted - before), done};
+    }
+    // rank 0: whether a live session's "m" line is due (a second since its last one); counters() then writes it, so
+    // /metrics moves while a request decodes. The Batch's stats are read only for a session that is due.
+    bool counters_due(Key k) const {
+        if (k.slot >= MAX_SESSIONS) return false;
+        const auto& s = sessions_[k.slot];
+        return s.bound && s.key == k && !s.ended && s.emitter.f &&
+               std::chrono::steady_clock::now() - s.m_at >= std::chrono::seconds(1);
+    }
+    void counters(Key k, const s2::Stats& stats) {
+        auto& s = get(k);
+        write_m(s.emitter, stats);
+        require(!fflush(s.emitter.f), "S2 counters output failed");
+        s.m_at = std::chrono::steady_clock::now();
     }
     void terminal(Key k, const s2::Stats& stats, const char* reason = nullptr) {
         auto& s = get(k); if (s.ended) return;
-        // Emitter::end uses per-request counters here, never process-wide totals.
-        // K + 1 bins: K = the MTP draft count, or 7 for a session that started on DFlash2 (s2_batch.h)
-        require(stats.acc.empty() || (stats.acc.size() >= config_.mtp + 1 && stats.acc.size() <= 16), "bad per-request acceptance histogram");
-        std::array<long, 8> zero{};
         auto& em = s.emitter;
         if (em.f) {
-            const long* acc = stats.acc.empty() ? zero.data() : stats.acc.data();
-            const unsigned K = stats.acc.empty() ? config_.mtp : unsigned(stats.acc.size() - 1);
-            fprintf(em.f, "m %ld %ld %ld", stats.rounds, stats.drafted, stats.tokens - stats.rounds);
-            for (unsigned i = 0; i < K; ++i) {
-                long accepted = 0; for (unsigned a = i + 1; a <= K; ++a) accepted += acc[a];
-                fprintf(em.f, " %ld", accepted);
-            }
-            fprintf(em.f, "\nend %s %d %d\n", reason ? reason : em.stop_id >= 0 ? "stop" : "length", em.stop_id, em.emitted);
+            write_m(em, stats);
+            fprintf(em.f, "end %s %d %d\n", reason ? reason : em.stop_id >= 0 ? "stop" : "length", em.stop_id, em.emitted);
             const bool ok = !ferror(em.f); const int rc = fclose(em.f); em.f = nullptr;
             require(ok && !rc, "S2 terminal output failed");
         }
         em.on = false;
         s.ended = true;
+    }
+    // "m <rounds> <drafted> <accepted> <accepted at draft position 0> ...": this request's counters to date. The shim
+    // sums the requests' lines into the process totals. K + 1 acceptance bins: K = the MTP draft count, or 7 for a
+    // session that started on DFlash2 (s2_batch.h).
+    void write_m(g6rt::Emitter& em, const s2::Stats& stats) const {
+        require(stats.acc.empty() || (stats.acc.size() >= config_.mtp + 1 && stats.acc.size() <= 16), "bad per-request acceptance histogram");
+        std::array<long, 8> zero{};
+        const long* acc = stats.acc.empty() ? zero.data() : stats.acc.data();
+        const unsigned K = stats.acc.empty() ? config_.mtp : unsigned(stats.acc.size() - 1);
+        fprintf(em.f, "m %ld %ld %ld", stats.rounds, stats.drafted, stats.tokens - stats.rounds);
+        for (unsigned i = 0; i < K; ++i) {
+            long accepted = 0; for (unsigned a = i + 1; a <= K; ++a) accepted += acc[a];
+            fprintf(em.f, " %ld", accepted);
+        }
+        fputc('\n', em.f);
     }
     void retire(const Slot& old) {
         auto& s = get(old.key);

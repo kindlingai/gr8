@@ -4,7 +4,7 @@
   rank_probe.py cluster --hosts h0,h1,.. --ips a,b,.. [--ips2 a,b,..] --home DIR --proxy-cpu N [--out FILE]
       Run from the head BEFORE a boot. Probes every rank (over ssh), measures the ring of RDMA write rates, compares
       the ranks with each other and prints one line per refused rank with a named reason. Exit 0 = admitted,
-      3 = refused. --out writes the full result (the record `gate.py run --health` attaches to a run record).
+      3 = refused. --out writes the full result (what `bench.py --health` keeps in its report).
   rank_probe.py local --proxy-cpu N [--gpu-tool PATH] [--ips a,b,..] [--ips2 ..]
       One node's measurements as JSON (what `cluster` runs on each rank; it ships this file over ssh).
 
@@ -629,7 +629,7 @@ def main():
     p.add_argument('--hosts', required=True, help='ssh names in rank order, comma separated')
     p.add_argument('--ips', required=True, help='rail 1 address of each rank')
     p.add_argument('--ips2', default='', help='rail 2 address of each rank')
-    p.add_argument('--home', required=True, help='G6_HOME on the nodes (bin/gpuprobe lives there)')
+    p.add_argument('--home', required=True, help='GR8_WORK_DIR on the nodes (bin/gpuprobe lives there)')
     p.add_argument('--proxy-cpu', type=int, required=True)
     p.add_argument('--out')
     for k, v in asdict(Thresholds()).items():

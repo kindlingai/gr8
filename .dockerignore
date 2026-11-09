@@ -12,7 +12,7 @@ config/cluster.env
 frontend/tests/work
 docker/.env
 # A checkout used on bare metal: its cluster.env (the launcher in /opt/gr8 would read it, over docker/.env), and the
-# state of a G6_HOME left at the checkout (out/ is also what `docker build --target dist -o out` writes).
+# state of a GR8_WORK_DIR left at the checkout (out/ is also what `docker build --target dist -o out` writes).
 cluster.env
 out
 run

@@ -1,4 +1,4 @@
-"""Expert bytes per decode step from a G6_ROUTE_LOG file, under exlr8 v2 width manifests and the half rule.
+"""Expert bytes per decode step from a GR8_ROUTE_LOG file, under exlr8 v2 width manifests and the half rule.
 
 python3 bench/route_bytes.py LOG.jsonl --manifest home=DIR/exlr8-manifest-home.json --manifest down1=... \
         [--cold-k2 0.5] [--tp 3,4,5,6,7] [--side full|block] [--drive DRIVE.json] [--per-m]
@@ -10,7 +10,7 @@ plus the hidden-side vectors (full: 36 KB per block row, as tr3.v1 + tr3.v3 toda
 of block scales + 768 B of per-channel vectors per half). It prints the mean bytes per step per rank (the mean over
 ranks, which sets the bandwidth cost when ranks are balanced) and the busiest rank's mean (which sets the step time
 when they are not), and the busiest rank's time at 220 GB/s.
---drive names each request q (route_drive.py's request list, in q order) so the steps group by workload; without it
+--drive names each request q (a bench.py report's requests, in send order: run --stages decode) so the steps group by workload; without it
 they group by M. --per-m splits each workload by M as well.
 --cold-k2 F adds a manifest "coldK2" built from the first manifest: the fraction F of each layer's experts least
 routed over the whole log go to K2 (gate, up and down); the rest keep the first manifest's widths.
@@ -55,7 +55,7 @@ def main():
     ap.add_argument('--cold-k2', type=float, default=0.0)
     ap.add_argument('--tp', default='4')
     ap.add_argument('--side', default='full', choices=('full', 'block'))
-    ap.add_argument('--drive', help="route_drive.py's request list: names each q")
+    ap.add_argument('--drive', help="a bench.py report of the same boot: names each q")
     ap.add_argument('--per-m', action='store_true')
     a = ap.parse_args()
     steps = []

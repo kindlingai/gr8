@@ -1,14 +1,19 @@
 // The attention binder (bind.h) for the G6_MODEL_FLASH build: flash_attn.cu's caches and scratch. Same contract as
 // bind.cu; the differences: every DSA layer has its own kpool indexer (geom::full_index), UK is bound as stored
-// [H,256,512] (no transpose), the pack adds index_ape, a step adds index_gate, the index cache uses the kvfmt.h kpool
-// page (IDX_PAGE per 64 rows) and indices are [max_rows][g6kv::SEL]. No context-parallel binding.
+// [H,256,512] (no transpose), the pack adds index_ape, a step adds index_gate and raw_sess, the index cache uses the
+// kvfmt.h kpool page (IDX_PAGE per 64 rows), the binding owns the raw index ring (g6kv::RAW_BYTES) and indices are
+// [max_rows][g6kv::SEL]. A context-parallel binding (g6a_bind_create_cp) holds the replicated prefix and this rank's pages
+// past it; its index pages follow its latent pages, and its raw ring is replicated.
 #include "bind.h"
+#include "../h2d.h"
 #include "../g6nr.h"
 #include "../model_geom.h"
 #include "kvfmt.h"
+#include "kvchunks.h"
 #include <cuda_runtime.h>
 #include <climits>
 #include <initializer_list>
+#include <vector>
 #if !G6_MODEL_FLASH
 #error "flash_bind.cu is the G6_MODEL_FLASH binder; the GLM build compiles bind.cu"
 #endif
@@ -28,25 +33,21 @@ constexpr int invalid = (int)cudaErrorInvalidValue;
 constexpr int SEL = g6kv::SEL, PAGE = g6kv::PAGE;
 }
 
-extern "C" size_t g6_attn_bind_scratch_need(int heads, int capacity, int max_rows, int query_tile) {
+extern "C" size_t g6a_bind_scratch_need(int heads, int capacity, int max_rows, int query_tile) {
     if (capacity <= 0 || max_rows <= 0 || query_tile <= 0 || query_tile > 64 || capacity > INT_MAX / query_tile) return 0;
     G6Attn a{};
     a.rows = max_rows; a.context = capacity; a.heads = heads; a.page_size = PAGE;
     a.page_count = a.table_size = (int)(((int64_t)capacity + PAGE - 1) / PAGE);
     a.query_tile = query_tile;
-    return g6_attn_scratch_bytes(&a);
+    return g6a_scratch_bytes(&a);
 }
-extern "C" int g6_attn_bind_create(G6AttnBinding* out, const G6AttnPack* p,
+extern "C" int g6a_bind_create(G6AttnBinding* out, const G6AttnPack* p,
     int rank, int layer, int capacity, int max_rows, int query_tile, void* s) {
-    return g6_attn_bind_create_ext(out, p, rank, layer, capacity, max_rows, query_tile, s, nullptr, 0);
+    return g6a_bind_create_ext(out, p, rank, layer, capacity, max_rows, query_tile, s, nullptr, 0);
 }
-#if defined(G6_CP) && G6_CP
-extern "C" int g6_attn_bind_create_cp(G6AttnBinding*, const G6AttnPack*, int, int, int, int, int, int, int, void*, void*, size_t) {
-    return (int)cudaErrorNotSupported;
-}
-#endif
-extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
-    int rank, int layer, int capacity, int max_rows, int query_tile, void* s, void* ext_scratch, size_t ext_bytes) {
+namespace {
+int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int capacity, int max_rows, int query_tile,
+    void* s, void* ext_scratch, size_t ext_bytes, G6KvChunks* mla, G6KvChunks* idx, int cp_R = 0, int cp_nr = 0) {
     if (!out || out->storage || !p || rank < 0 || rank >= g6nr::NR || layer < 0 || layer > geom::MTP_LAYER ||
         !geom::full_index(layer) || capacity <= 0 || max_rows <= 0 || max_rows > capacity || query_tile <= 0 ||
         query_tile > 64 || capacity > INT_MAX / query_tile) return invalid;
@@ -63,15 +64,37 @@ extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     G6Attn& a = b.args;
     a.rows = max_rows; a.context = capacity; a.heads = h; a.page_size = PAGE;
     a.page_count = a.table_size = (int)(((int64_t)capacity + PAGE - 1) / PAGE);
+#if defined(G6_CP) && G6_CP
+    // CP page map: logical pages below cp_R / 64 on every rank, the others on rank page % cp_nr. Physical pages: the
+    // prefix, then this rank's tail pages in logical order (bind.cu's rule)
+    std::vector<int> cp_table;
+    a.cp_nr = cp_nr; a.cp_rank = cp_nr ? rank : 0;
+    if (cp_nr) {
+        cp_table.resize(a.table_size);
+        int phys = 0;
+        for (int lp = 0; lp < a.table_size; ++lp) cp_table[lp] = (lp < cp_R / PAGE || lp % cp_nr == rank) ? phys++ : G6_CP_REMOTE;
+        a.page_count = phys;
+    }
+#else
+    (void)cp_R;
+#endif
     a.query_tile = query_tile;
     a.kv_norm = p->kv_norm.data; a.uk = p->uk.data; a.uv = p->uv.data;
     a.index_norm = p->index_norm.data; a.index_bias = p->index_bias.data; a.index_ape = p->index_ape.data;
-    b.scratch_bytes = g6_attn_scratch_bytes(&a);
+    {   // CP: g6a_cp_group runs every rank's head group on this scratch, so it is sized for the widest
+        G6Attn w = a; if (cp_nr) w.heads = g6nr::HMAX;
+        b.scratch_bytes = g6a_scratch_bytes(&w);
+    }
     if (!b.scratch_bytes || (ext_scratch && ext_bytes < b.scratch_bytes)) return invalid;
     size_t used = 0;
     auto take = [&](size_t n) { size_t at = used; used = (used + n + 255) & ~size_t(255); return at; };
-    const size_t kv = take((size_t)a.page_count * PAGE * g6kv::ROW);
-    const size_t ix = take((size_t)a.page_count * g6kv::IDX_PAGE);
+    // GR8_GLM53F_KV_CHUNKS: the caches are the regions' (kvchunks.h), not slices of storage
+    const size_t kv_bytes = (size_t)a.page_count * PAGE * g6kv::ROW, ix_bytes = (size_t)a.page_count * g6kv::IDX_PAGE;
+    const bool chunked = mla && idx;
+    if ((mla || idx) && !chunked) return invalid;
+    const size_t kv = take(chunked ? 0 : kv_bytes);
+    const size_t ix = take(chunked ? 0 : ix_bytes);
+    const size_t raw = take(g6kv::RAW_BYTES);
     const size_t table = take((size_t)a.table_size * sizeof(int));
     const size_t ids = take((size_t)max_rows * SEL * sizeof(int));
     const size_t output = take((size_t)max_rows * h * geom::V_HEAD * 2);
@@ -81,23 +104,57 @@ extern "C" int g6_attn_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     cudaError_t e = cudaMalloc(&b.storage, used);
     if (e != cudaSuccess) return (int)e;
     char* base = (char*)b.storage;
-    a.mla_cache = base + kv; a.index_cache = base + ix;
+    a.mla_cache = chunked ? g6_kvc_ptr(mla) : base + kv; a.index_cache = chunked ? g6_kvc_ptr(idx) : base + ix;
+    a.index_raw = base + raw;
+    b.kv_chunks[0] = mla; b.kv_chunks[1] = idx;
     a.block_table = (int*)(base + table); a.indices = (int*)(base + ids);
     a.output = base + output; a.error = (unsigned*)(base + error);
     b.scratch = ext_scratch ? ext_scratch : base + scratch;
     cudaStream_t stream = (cudaStream_t)s;
     e = cudaMemsetAsync(b.storage, 0, used, stream);
     if (e == cudaSuccess) {
+#if defined(G6_CP) && G6_CP
+        if (cp_nr) e = g6h2d::copy((void*)a.block_table, cp_table.data(), cp_table.size() * sizeof(int), stream);
+        else
+#endif
         identity_pages<<<(a.page_count + 255) / 256, 256, 0, stream>>>((int*)const_cast<int*>(a.block_table), a.page_count);
-        e = cudaGetLastError();
+        if (e == cudaSuccess) e = cudaGetLastError();
     }
     if (e == cudaSuccess) e = cudaMemsetAsync(a.indices, 0xff, (size_t)max_rows * SEL * 4, stream);
     if (e != cudaSuccess) { cudaFree(b.storage); return (int)e; }
     *out = b;
     return (int)cudaSuccess;
 }
+}
 
-extern "C" int g6_attn_bind_prepare(G6AttnBinding* b, const G6AttnStep* step, void* s) {
+extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
+    int rank, int layer, int capacity, int max_rows, int query_tile, void* s, void* ext_scratch, size_t ext_bytes) {
+    return create(out, p, rank, layer, capacity, max_rows, query_tile, s, ext_scratch, ext_bytes, nullptr, nullptr);
+}
+#if defined(G6_CP) && G6_CP
+extern "C" int g6a_bind_create_cp(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int capacity,
+    int max_rows, int query_tile, int cp_R, int cp_nr, void* s, void* ext_scratch, size_t ext_bytes) {
+    if (cp_nr < 2 || cp_nr > 8 || rank >= cp_nr || cp_R < 0 || cp_R % PAGE) return invalid;
+    return create(out, p, rank, layer, capacity, max_rows, query_tile, s, ext_scratch, ext_bytes, nullptr, nullptr, cp_R, cp_nr);
+}
+#endif
+extern "C" int g6_attn_bind_create_chunked(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int capacity,
+    int max_rows, int query_tile, void* s, G6KvChunks* mla, G6KvChunks* idx) {
+    const size_t pages = capacity > 0 ? ((size_t)capacity + PAGE - 1) / PAGE : 0;
+    if (!mla || !idx || pages * PAGE * g6kv::ROW > g6_kvc_bytes(mla) || pages * g6kv::IDX_PAGE > g6_kvc_bytes(idx))
+        return invalid;
+    return create(out, p, rank, layer, capacity, max_rows, query_tile, s, nullptr, 0, mla, idx);
+}
+extern "C" uint32_t g6_flash_kv_chunk_pages(size_t granule) {
+    if (!granule) return 0;
+    auto gcd = [](size_t x, size_t y) { while (y) { size_t t = x % y; x = y; y = t; } return x; };
+    // the fewest pages whose MLA and index bytes are both whole granules: a chunk offline gives back all its bytes
+    const size_t m = granule / gcd(granule, (size_t)PAGE * g6kv::ROW), i = granule / gcd(granule, (size_t)g6kv::IDX_PAGE);
+    const size_t p = m / gcd(m, i) * i;
+    return p > UINT32_MAX ? 0 : (uint32_t)p;
+}
+
+extern "C" int g6a_bind_prepare(G6AttnBinding* b, const G6AttnStep* step, void* s) {
     if (!b || !b->storage || !step || step->rows <= 0 || step->rows > b->max_rows ||
         step->context <= 0 || step->context > b->capacity || step->rows > step->context ||
         !step->q_b || !step->kv_a || !step->positions) return invalid;
@@ -110,7 +167,7 @@ extern "C" int g6_attn_bind_prepare(G6AttnBinding* b, const G6AttnStep* step, vo
     a.rows = step->rows; a.context = step->context;
     a.q_b = step->q_b; a.kv_a = step->kv_a; a.positions = step->positions;
     a.index_q = step->index_q; a.index_k = step->index_k; a.index_weight = step->index_weight;
-    a.index_gate = step->index_gate;
+    a.index_gate = step->index_gate; a.raw_sess = step->raw_sess;
     a.reuse_indices = step->reuse_indices; a.reuse_row_map = step->reuse_row_map;
     a.reuse_rows = step->reuse_rows;
 #ifdef DEC_S2
@@ -118,11 +175,11 @@ extern "C" int g6_attn_bind_prepare(G6AttnBinding* b, const G6AttnStep* step, vo
 #endif
     return (int)cudaMemsetAsync(a.error, 0, sizeof(unsigned), (cudaStream_t)s);
 }
-extern "C" int g6_attn_bind_run(G6AttnBinding* b, const G6AttnStep* step, void* s) {
-    int e = g6_attn_bind_prepare(b, step, s);
-    return e ? e : g6_attn_run(&b->args, b->scratch, b->scratch_bytes, s);
+extern "C" int g6a_bind_run(G6AttnBinding* b, const G6AttnStep* step, void* s) {
+    int e = g6a_bind_prepare(b, step, s);
+    return e ? e : g6a_run(&b->args, b->scratch, b->scratch_bytes, s);
 }
-extern "C" int g6_attn_bind_replay_init(G6AttnBinding* b, const G6AttnStep* step,
+extern "C" int g6a_bind_replay_init(G6AttnBinding* b, const G6AttnStep* step,
     G6AttnStepCell* cell, int captured_capacity, G6AttnReplay* out, void* s) {
     if (!b || !step || !cell || !out || captured_capacity < step->context ||
         captured_capacity <= 0 || captured_capacity > b->capacity) return invalid;
@@ -130,7 +187,7 @@ extern "C" int g6_attn_bind_replay_init(G6AttnBinding* b, const G6AttnStep* step
     cudaError_t e = cudaPointerGetAttributes(&attr, cell);
     if (e != cudaSuccess) return (int)e;
     if (attr.type != cudaMemoryTypeDevice) return invalid;
-    int code = g6_attn_bind_prepare(b, step, s);
+    int code = g6a_bind_prepare(b, step, s);
     if (code) return code;
     G6AttnReplay r{};
     r.fixed = b->args;
@@ -139,18 +196,74 @@ extern "C" int g6_attn_bind_replay_init(G6AttnBinding* b, const G6AttnStep* step
     *out = r;
     return 0;
 }
-extern "C" int g6_attn_bind_reset(G6AttnBinding* b, void* s) {
+extern "C" int g6a_bind_reset(G6AttnBinding* b, void* s) {
     if (!b || !b->storage) return invalid;
     const G6Attn& a = b->args;
     cudaStream_t stream = (cudaStream_t)s;
-    cudaError_t e = cudaMemsetAsync(a.mla_cache, 0, (size_t)a.page_count * PAGE * g6kv::ROW, stream);
-    if (e == cudaSuccess) e = cudaMemsetAsync(a.index_cache, 0, (size_t)a.page_count * g6kv::IDX_PAGE, stream);
+    cudaError_t e = cudaSuccess;
+    if (b->kv_chunks[0]) {
+        // chunked caches: only what is backed (an offline chunk reads as zero when it comes back)
+        int r = g6_kvc_zero((G6KvChunks*)b->kv_chunks[0], stream);
+        if (!r) r = g6_kvc_zero((G6KvChunks*)b->kv_chunks[1], stream);
+        if (r) return r;
+    } else {
+        e = cudaMemsetAsync(a.mla_cache, 0, (size_t)a.page_count * PAGE * g6kv::ROW, stream);
+        if (e == cudaSuccess) e = cudaMemsetAsync(a.index_cache, 0, (size_t)a.page_count * g6kv::IDX_PAGE, stream);
+    }
+    if (e == cudaSuccess) e = cudaMemsetAsync(a.index_raw, 0, g6kv::RAW_BYTES, stream);
     if (e == cudaSuccess) e = cudaMemsetAsync(a.indices, 0xff, (size_t)b->max_rows * SEL * 4, stream);
     if (e == cudaSuccess) e = cudaMemsetAsync(a.output, 0, (size_t)b->max_rows * a.heads * geom::V_HEAD * 2, stream);
     if (e == cudaSuccess) e = cudaMemsetAsync(a.error, 0, sizeof(unsigned), stream);
     return (int)e;
 }
-extern "C" int g6_attn_bind_release(G6AttnBinding* b) {
+// g6a_bind_reset with the latent and index caches cleared on pages [0, pages) only (the identity table: rows
+// [0, pages * PAGE)) and the raw ring cleared; the caller keeps every later page zero (Flash serve: the pages no step
+// wrote since a clear)
+extern "C" int g6a_bind_reset_pages(G6AttnBinding* b, int pages, void* s) {
+    if (!b || !b->storage || pages < 0) return invalid;
+    // chunked caches (GR8_GLM53F_KV_CHUNKS): every backed granule, as g6a_bind_reset (a chunk that comes back reads as zero)
+    if (b->kv_chunks[0]) return g6a_bind_reset(b, s);
+    const G6Attn& a = b->args;
+    cudaStream_t stream = (cudaStream_t)s;
+    const size_t n = (size_t)(pages < a.page_count ? pages : a.page_count);
+    cudaError_t e = cudaMemsetAsync(a.mla_cache, 0, n * PAGE * g6kv::ROW, stream);
+    if (e == cudaSuccess) e = cudaMemsetAsync(a.index_cache, 0, n * g6kv::IDX_PAGE, stream);
+    if (e == cudaSuccess) e = cudaMemsetAsync(a.index_raw, 0, g6kv::RAW_BYTES, stream);
+    if (e == cudaSuccess) e = cudaMemsetAsync(a.indices, 0xff, (size_t)b->max_rows * SEL * 4, stream);
+    if (e == cudaSuccess) e = cudaMemsetAsync(a.output, 0, (size_t)b->max_rows * a.heads * geom::V_HEAD * 2, stream);
+    if (e == cudaSuccess) e = cudaMemsetAsync(a.error, 0, sizeof(unsigned), stream);
+    return (int)e;
+}
+extern "C" int g6_attn_bind_raw_reset(G6AttnBinding* b, int sess, void* s) {
+    if (!b || !b->storage || sess < 0 || sess >= g6kv::RAW_SESS) return invalid;
+    const size_t per = (size_t)g6kv::RAW_RING * g6kv::IDX_RAW;
+    return (int)cudaMemsetAsync((char*)b->args.index_raw + (size_t)sess * per, 0, per, (cudaStream_t)s);
+}
+namespace {
+__global__ void k_nonzero16(const uint4* p, size_t n, unsigned* flag) {
+    unsigned v = 0;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
+        const uint4 x = p[i];
+        v |= x.x | x.y | x.z | x.w;
+    }
+    if (__syncthreads_or(v != 0) && threadIdx.x == 0) atomicOr(flag, 1u);
+}
+}
+// *flag |= 1 if any byte of the latent or index cache on pages [from, page_count) is not zero (a check, not a hot path)
+extern "C" int g6a_bind_check_clear(G6AttnBinding* b, int from, unsigned* flag, void* s) {
+    if (!b || !b->storage || from < 0 || !flag) return invalid;
+    if (b->kv_chunks[0]) return 0;   // chunked: reset_pages cleared every backed granule, and offline pages are not readable
+    const G6Attn& a = b->args;
+    cudaStream_t stream = (cudaStream_t)s;
+    if (from >= a.page_count) return 0;
+    const size_t pages = (size_t)(a.page_count - from);
+    k_nonzero16<<<1024, 256, 0, stream>>>((const uint4*)((const char*)a.mla_cache + (size_t)from * PAGE * g6kv::ROW),
+                                          pages * PAGE * g6kv::ROW / 16, flag);
+    k_nonzero16<<<1024, 256, 0, stream>>>((const uint4*)((const char*)a.index_cache + (size_t)from * g6kv::IDX_PAGE),
+                                          pages * g6kv::IDX_PAGE / 16, flag);
+    return (int)cudaGetLastError();
+}
+extern "C" int g6a_bind_release(G6AttnBinding* b) {
     if (!b) return invalid;
     cudaError_t e = b->storage ? cudaFree(b->storage) : cudaSuccess;
     if (e == cudaSuccess) *b = G6AttnBinding{};

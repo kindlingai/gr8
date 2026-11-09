@@ -12,6 +12,8 @@ import json
 import os
 import re
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -35,6 +37,7 @@ except ImportError:
     HAVE = False
 
 RELEASE = 'fakeorg/glm-exlr8'
+GLM = {'GR8_MODEL': 'glm53'}   # the model: a boot names it (no default)
 LAYERS = (3, 4)
 NE = 2                  # experts per layer in the synthetic files: small files, the same layout
 LFS_MIN = 4096          # files at least this big are served as LFS files: a redirect to the "CDN"
@@ -49,6 +52,28 @@ def manifest(width_of):
         str(l): {'gate': [[width_of('gate', e, h) for h in range(16)] for e in range(NE)],
                  'up': [[width_of('up', e, h) for h in range(16)] for e in range(NE)],
                  'down': [width_of('down', e, 0) for e in range(NE)], 'shared': 0} for l in LAYERS}}
+
+
+def half_spans(l, width, owned):
+    """{(width file, offset, nbytes)} of layer l's halves owned(e) gives. width(proj) -> k."""
+    keep, v2.N_EXP = v2.N_EXP, NE
+    try:
+        with tempfile.TemporaryDirectory() as d:     # the release's index file says where each half sits
+            v2synth.make_layer(d, l, (2, 3), NE, seed=l, shared=False)
+            L = v2.V2Layer(d, l)
+            out = {(v2.WIDTH_FILE.format(l=l, k=width(p)),) + tuple(L.loc(e, p, h, width(p))[1:])
+                   for e in range(NE) for h in owned(e) for p in v2.PROJ}
+            L.close()
+            return out
+    finally:
+        v2.N_EXP = keep
+
+
+def layout_halves(path, rank, l):
+    """owned(e) for a layout file: the halves of layer l's expert e it gives rank."""
+    with open(path) as f:
+        g = json.load(f)['groups']
+    return lambda e: [h for h, r in enumerate(g[f'halves {l} {e}']) if r == rank]
 
 
 def same_halves(release, v2_dir, l, tp, rank, width):
@@ -99,6 +124,7 @@ def make_release(root):
     rnd = numpy.random.default_rng(7)
     for name in ('exlr8-dense-003', 'exlr8-dense-004', 'exlr8-vocab'):
         put(f'dense/{name}.safetensors', rnd.bytes(300_000))
+    put('dense/vision-bf16.safetensors', rnd.bytes(50_000))   # fetched only with image input (GR8_GLM53F_VISION=1)
     for name in hfsource.META_FILES:
         put(name, f'{{"{name}": 1}}'.encode())
     put('README.md', b'fake release\n')
@@ -244,6 +270,40 @@ class HFTests(unittest.TestCase):
     def variant(self, r, name='home'):
         return modelset.resolve_variant(name, r.v2, [r.dir])
 
+    def test_prepare_compact_round_trip(self):
+        import launch
+        dest = os.path.join(self.cache, 'compact-rank1')
+        args = ['prepare', '--no-config', '--model', f'https://huggingface.co/{RELEASE}',
+                '--model-cache', self.cache, '--rank', '1', '--tp', '4', '--variant', 'home',
+                '--extra-env', f'GR8_LOAD_COMPACT={dest}']
+        env = {**os.environ, **GLM, 'G6LOAD': hfsource.fetch_ranks().g6load()}
+        cmd = [sys.executable, launch.__file__, *args]
+        for _ in range(2):  # initial prepare, then verify/reuse with an already-complete fetch
+            r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn('halves verified', r.stdout)
+        release = self.release()
+        variant = self.variant(release)
+        # Each dense copy equals the original ranges, in sorted order without holes. The command above also
+        # read every half through the Rust loader's map and checked its checksum against the index slices.
+        for name in os.listdir(dest):
+            if not name.endswith('.g6map'):
+                continue
+            with open(os.path.join(dest, name)) as f:
+                head, *rows = f.read().splitlines()
+            src = os.path.join(release.v2, name[:-6])
+            self.assertEqual(head, f'g6map-v1 {os.path.getsize(src)}')
+            with open(src, 'rb') as original, open(os.path.join(dest, name[:-6]), 'rb') as copy:
+                packed = 0
+                for row in rows:
+                    start, length, offset = map(int, row.split())
+                    self.assertEqual(offset, packed)
+                    original.seek(start)
+                    self.assertEqual(copy.read(length), original.read(length))
+                    packed += length
+                self.assertEqual(copy.read(), b'')
+        self.assertEqual(release.check(4, 1, variant), [])
+
     def test_parse_url(self):
         P = hfsource.parse_url
         self.assertEqual(P('https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4'), ('kindlingai/glm-5.3-exlr8-k2-k3-k4', 'main'))
@@ -273,6 +333,19 @@ class HFTests(unittest.TestCase):
         self.assertLess(got, size * 0.4)
         self.assertEqual(self.hub.requests(r'exlr8-layer-00\d\.k2'), [])            # home uses K3 only
         self.assertTrue(any('GB to fetch' in m for m in self.logs))
+
+    def test_the_vision_tower_only_with_image_input(self):
+        r = self.release()
+        v = self.variant(r)
+        r.fetch_rank(4, 1, v)
+        self.assertEqual(self.hub.requests(r'dense/vision-'), [])
+        r.vision = True       # GR8_GLM53F_VISION=1 after a text-only fetch: the rank is not ready until it has the tower
+        self.assertEqual(r.check(4, 1, v), ['dense/vision-bf16.safetensors: not fetched yet (GR8_GLM53F_VISION=1)'])
+        r.fetch_rank(4, 1, v)
+        self.assertEqual(r.check(4, 1, v), [])
+        with open(os.path.join(self.r1, 'dense', 'vision-bf16.safetensors'), 'rb') as a, \
+                open(os.path.join(r.dir, 'dense', 'vision-bf16.safetensors'), 'rb') as b:
+            self.assertEqual(a.read(), b.read())
 
     def test_a_rerun_fetches_nothing_and_a_variant_adds_its_widths(self):
         r = self.release()
@@ -314,11 +387,48 @@ class HFTests(unittest.TestCase):
         self.assertFalse(os.path.samefile(os.path.join(r.dir, 'dense', dense), os.path.join(r1.dir, 'dense', dense)))
         same_halves(r3, r.v2, 3, 4, 1, lambda p: 3)
 
+    def test_a_layout_fetches_only_the_halves_the_box_lacks(self):
+        # a box that holds rank 1 of a TP=4 formula cache (b of a, b, c, d) goes to TP=3 with a planned layout (a, b, d)
+        r = self.release()
+        v = self.variant(r)
+        r.fetch_rank(4, 1, v)
+        g6layout = os.path.join(os.path.dirname(hfsource.fetch_ranks().g6load()), 'g6layout')
+        t4, p3 = os.path.join(self.cache, 't4.json'), os.path.join(self.cache, 'p3.json')
+        for argv in (['formula', '--members', 'a,b,c,d', '--out', t4],
+                     ['plan', '--from', t4, '--members', 'a,b,d', '--out', p3]):
+            subprocess.run([g6layout] + argv + ['--widths', v.path], check=True, capture_output=True)
+        lr = hfsource.Release(self.cache, RELEASE, 'main', log=self.logs.append, layout=p3)
+        self.assertEqual(lr.check(3, 1, v), [f'{RELEASE}@{C1[:12]} rank 1 of TP=3, variant home, layout '
+                                             f'{modelset.sha256_file(p3)[:12]}, is not in the cache yet'])
+        n = len(self.hub.log)
+        lr.fetch_rank(3, 1, v)
+        self.assertEqual(lr.check(3, 1, v), [])
+        self.assertEqual(r.check(4, 1, v), [])                    # the formula's marker stands
+        self.assertIn('.layout-', os.path.basename(lr.marker(3, 1, v)))
+        self.assertEqual(sorted(os.listdir(os.path.join(r.slices, 'tp3', 'k3'))),
+                         [f'rank{i}.safetensors' for i in range(3)])   # every rank's slices list the layout's halves
+        got = [(re.sub(r'.*/', '', x[1]), *map(int, x[2].split('=')[1].split('-')))
+               for x in self.hub.log[n:] if x[2] and 'exlr8-layer-' in x[1] and not x[2].startswith('bytes=0-7')]
+        for l in LAYERS:
+            held = half_spans(l, lambda p: 3, lambda e: v2.owned_halves(e, l, 4, 1))
+            want = half_spans(l, lambda p: 3, layout_halves(p3, 1, l))
+            self.assertTrue(want - held, f'layer {l}: the layout gives the box nothing new')
+            # the new halves came from the hub, and none it held already
+            for name, off, nb in want - held:
+                self.assertTrue(any(f == name and a <= off and off + nb - 1 <= b for f, a, b in got), (name, off))
+            for name, off, nb in held:
+                self.assertFalse(any(f == name and a <= off and off + nb - 1 <= b for f, a, b in got), (name, off))
+            for name, off, nb in want:
+                with open(os.path.join(self.r1, 'experts', name), 'rb') as a, open(os.path.join(r.v2, name), 'rb') as b:
+                    a.seek(off)
+                    b.seek(off)
+                    self.assertEqual(a.read(nb), b.read(nb), (name, off))
+
     def test_the_release_alone_is_the_model(self):
         import options as opt
         import supervisor as S
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--model',
-                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0'], {})
+                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0'], GLM)
         opt.validate(o)
         ms, v, err = S.resolve_model(o, log=self.logs.append)
         self.assertEqual(err, '')
@@ -334,12 +444,12 @@ class HFTests(unittest.TestCase):
         import options as opt
         import supervisor as S
         o = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--model',
-                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0', '--kvb', 'fp8'], {})
+                       f'https://huggingface.co/{RELEASE}', '--model-cache', self.cache, '--dflash', '0', '--kvb', 'fp8'], GLM)
         opt.validate(o)                                          # V2_DENSE is set later, by resolve_model
         ms, v, err = S.resolve_model(o, log=self.logs.append)
         self.assertEqual(err, '')
         plan = opt.engine_plan(o, rank=2, rank_dir=ms.dir, aux_dir=ms.dir, home='/h')
-        self.assertIn('G6_KVB=fp8', plan['env'])
+        self.assertIn('GR8_KVB=fp8', plan['env'])
         self.assertIn('--v2-dense', plan['args'])
 
     def test_commit_is_recorded_and_refreshed(self):
@@ -448,11 +558,182 @@ class NoNumpyFetchTests(unittest.TestCase):
         same_halves(self.root, r.v2, 3, 4, 0, lambda p: 3)
 
 
+class StaleJournalTests(unittest.TestCase):
+    """A width file deleted by hand while its .fetch journal stays: the next fetch writes its header and halves again.
+    A stub hub and fetch plan, so neither numpy nor bin/g6load is needed."""
+    NAME = 'exlr8-layer-003.k3.safetensors'
+
+    class Hub:
+        repo, rev = 'o/r', 'main'
+
+        def __init__(self, data):
+            self.data, self.gets = data, []
+
+        def tree(self):
+            return {'experts/' + StaleJournalTests.NAME: len(self.data)}
+
+        def get(self, path, lo, n):
+            self.gets.append((lo, n))
+            return self.data[lo:lo + n]
+
+    def test_a_deleted_width_file_is_fetched_again(self):
+        fr = hfsource.fetch_ranks()
+        hn = 40
+        data = hn.to_bytes(8, 'little') + b'{"__metadata__": {}}'.ljust(hn) + bytes(range(256)) * 4
+        hub = self.Hub(data)
+        plan = {'files': [{'name': self.NAME, 'ranges': [[200, 64]]}]}
+        out = tempfile.mkdtemp(prefix='gr8sj-')
+        local = os.path.join(out, self.NAME)
+        with mock.patch.object(fr, 'g6load_run', return_value=plan):
+            fr.fetch_layers(hub, out, 4, [0], 'slices', allk=[3], log=lambda m: None)
+            self.assertEqual(open(local, 'rb').read(264), data[:264])
+            os.unlink(local)                   # the journal in out/.fetch still lists the ranges
+            self.assertGreater(fr.fetch_layers(hub, out, 4, [0], 'slices', allk=[3], plan_only=True), 0)
+            fr.fetch_layers(hub, out, 4, [0], 'slices', allk=[3], log=lambda m: None)
+            with open(local, 'rb') as f:
+                self.assertEqual(f.read(8 + hn), data[:8 + hn])
+                f.seek(200)
+                self.assertEqual(f.read(64), data[200:264])
+            # a rerun with the file in place fetches nothing but the 8-byte header length
+            n = len(hub.gets)
+            self.assertEqual(fr.fetch_layers(hub, out, 4, [0], 'slices', allk=[3], log=lambda m: None), 0)
+            self.assertEqual(hub.gets[n:], [(0, 8)])
+        shutil.rmtree(out)
+
+
+class KeepAliveTests(unittest.TestCase):
+    """Hub.get's range GETs reuse kept-alive connections (#147): one connection for many ranges, a redirect to another
+    host followed on that host's connection, an idle connection the server closed (in clear or over TLS) replaced
+    without a retry, and the token sent only to the hub's own scheme and host."""
+
+    def setUp(self):
+        self.data, self.conns, self.close_next, self.auth = bytes(range(256)) * 64, [], [False], []
+        t = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def log_message(self, *_):
+                pass
+
+            def setup(self):
+                super().setup()
+                t.conns.append(self.client_address)
+
+            def do_GET(self):
+                t.auth.append(self.headers.get('Authorization'))
+                if self.path.startswith('/hop/'):
+                    self.send_response(302)
+                    self.send_header('Location', f'http://localhost:{t.port}/f/{self.path[5:]}')
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    return
+                a, b = (int(x) for x in self.headers['Range'].split('=')[1].split('-'))
+                body = t.data[a:b + 1]
+                self.send_response(206)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                if t.close_next[0]:
+                    t.close_next[0], self.close_connection = False, True
+
+        self.srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), H)
+        self.srv.daemon_threads = True
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.hub = hfsource.fetch_ranks().Hub('o/r', base=f'http://127.0.0.1:{self.port}')
+        self.hub.proxies = {}
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+    def test_one_connection_for_many_ranges(self):
+        self.hub.urls['x'] = f'http://127.0.0.1:{self.port}/f/x'
+        for i in range(50):
+            self.assertEqual(self.hub.get('x', i * 100, 100), self.data[i * 100:i * 100 + 100])
+        self.assertEqual(len(self.conns), 1)
+
+    def test_a_redirect_and_a_closed_idle_connection(self):
+        self.hub.urls['x'] = f'http://127.0.0.1:{self.port}/hop/x'
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            for i in range(10):
+                self.close_next[0] = i == 4      # the server drops the connection after the fifth range
+                self.assertEqual(self.hub.get('x', i * 7, 7), self.data[i * 7:i * 7 + 7])
+        self.assertEqual(err.getvalue(), '')
+        self.assertEqual(len(self.conns), 3)    # 127.0.0.1 and localhost, then localhost again after the close
+
+    def test_the_token_goes_to_the_hub_host_only(self):
+        here = f'http://127.0.0.1:{self.port}'
+        with mock.patch.dict(os.environ, {'HF_TOKEN': 'tok'}):
+            lookalike = hfsource.fetch_ranks().Hub('o/r', base=here[:-1])     # the same URL prefix, another port
+            hub = hfsource.fetch_ranks().Hub('o/r', base=here)
+        for h in (lookalike, hub):
+            h.proxies, h.urls['x'] = {}, f'{here}/f/x'
+            h.get('x', 0, 10)
+        self.assertEqual(self.auth, [None, 'Bearer tok'])
+
+    @unittest.skipUnless(shutil.which('openssl'), 'needs openssl to make a test certificate')
+    def test_a_tls_connection_dropped_without_close_notify(self):
+        d = tempfile.mkdtemp(prefix='gr8tls-')
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', f'{d}/k.pem', '-out',
+                        f'{d}/c.pem', '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost'],
+                       check=True, capture_output=True)
+        sc = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        sc.load_cert_chain(f'{d}/c.pem', f'{d}/k.pem')
+        ls, conns = socket.create_server(('127.0.0.1', 0)), []
+        self.addCleanup(lambda: [c.close() for c in [ls] + conns])
+
+        def one(c, drop):
+            buf = b''
+            try:
+                while True:
+                    while b'\r\n\r\n' not in buf:
+                        chunk = c.recv(65536)
+                        if not chunk:
+                            return
+                        buf += chunk
+                    head, buf = buf.split(b'\r\n\r\n', 1)
+                    if drop is None:                # FIN without close_notify after the first range, no RST
+                        continue
+                    a, b = (int(x) for x in re.search(rb'bytes=(\d+)-(\d+)', head).groups())
+                    body = self.data[a:b + 1]
+                    c.sendall(b'HTTP/1.1 206 Partial Content\r\nContent-Length: %d\r\n\r\n' % len(body) + body)
+                    if drop:
+                        socket.socket.shutdown(c, socket.SHUT_WR)
+                        drop = None
+            except OSError:
+                return
+
+        def serve():
+            while True:
+                try:
+                    s, _ = ls.accept()
+                    c = sc.wrap_socket(s, server_side=True)
+                except OSError:
+                    return
+                conns.append(c)
+                threading.Thread(target=one, args=(c, len(conns) == 1), daemon=True).start()
+        threading.Thread(target=serve, daemon=True).start()
+        hub = hfsource.fetch_ranks().Hub('o/r', base=f'https://localhost:{ls.getsockname()[1]}')
+        hub.proxies, hub.urls['x'] = {}, f'https://localhost:{ls.getsockname()[1]}/f/x'
+        err = io.StringIO()
+        with mock.patch('ssl._create_default_https_context', lambda: ssl.create_default_context(cafile=f'{d}/c.pem')), \
+                contextlib.redirect_stderr(err):
+            for i in range(4):
+                self.assertEqual(hub.get('x', i * 9, 9), self.data[i * 9:i * 9 + 9])
+        self.assertEqual(err.getvalue(), '')
+        self.assertEqual(len(conns), 2)
+
+
 STUB_CONVERT = """import json, os, sys
 a = sys.argv[1:]
 out, r = a[a.index('--out') + 1], int(a[a.index('--ranks') + 1])
 if os.environ.get('STUB_CONVERT_FAIL'):
     sys.exit('config hidden_size = 1, this converter is written for 6144')
+if a[a.index('--nr') + 1] != os.environ.get('STUB_WANT_NR', '4'):
+    sys.exit('stub: --nr ' + a[a.index('--nr') + 1])
 open(os.path.join(out, 'args.json'), 'w').write(json.dumps(a))
 open(os.path.join(out, f'dflash.r{r}.pack'), 'wb').write(bytes(1000 + r))
 json.dump({'pack_bytes': 1000 + r}, open(os.path.join(out, f'dflash.r{r}.manifest.json'), 'w'))
@@ -497,6 +778,14 @@ class DrafterTests(unittest.TestCase):
                          modelset.sha256_file(os.path.join(self.t, 'drafter', 'model.safetensors')))
         self.assertFalse([n for n in os.listdir(d.dir) if n.startswith('tmp.')])
 
+    def test_tp6_converts_the_replicated_layout(self):
+        d = hfsource.Drafter(self.cache, 'fakeorg/drafter', 'main', log=lambda m: None, tp=6)
+        self.assertEqual(d.out, os.path.join(d.dir, 'tp6'))
+        with mock.patch.dict(os.environ, {'STUB_WANT_NR': '6'}):
+            d.fetch_rank(5)
+        self.assertEqual(d.check(5), [])
+        self.assertEqual(sorted(os.listdir(d.out)), ['dflash.r5.manifest.json', 'dflash.r5.pack', 'rank5.COMPLETE'])
+
     def test_the_real_converter_runs(self):
         """bin/g6load dflash2 itself, on the small test drafter: it refuses the dimensions, and the error comes back."""
         src = os.path.join(REPO, 'engine', 'loader-rs', 'tests', 'data', 'dflash2', 'src')
@@ -535,7 +824,7 @@ class DrafterTests(unittest.TestCase):
         logs = []
 
         def boot(*argv):
-            o = opt.parse([*base, *argv], {})
+            o = opt.parse([*base, *argv], GLM)
             opt.validate(o)
             return o, S.resolve_model(o, log=logs.append)
         o, (ms, v, err) = boot()
@@ -552,7 +841,36 @@ class DrafterTests(unittest.TestCase):
         self.assertNotEqual(modelset.model_id(ms, v), ms.id)
         with self.assertRaises(opt.OptionError):
             opt.validate(opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3', '--drafter',
-                                    'https://huggingface.co/fakeorg/drafter'], {}))
+                                    'https://huggingface.co/fakeorg/drafter'], GLM))
+
+    def test_the_tp6_boot(self):
+        """TP=6: MTP only unless --dflash 1; with it, the drafter is converted in the replicated layout (--nr 6)."""
+        import options as opt
+        import supervisor as S
+        from test_modelset import make_release as local_release
+        rel = local_release(os.path.join(self.t, 'local6'))
+        base = ['--no-config', '--peers', ','.join(f'10.0.0.{i}' for i in range(1, 7)), '--model', rel]
+        logs = []
+
+        def boot(*argv):
+            o = opt.parse([*base, *argv], GLM)
+            opt.validate(o)
+            return o, S.resolve_model(o, log=logs.append)
+        o, (ms, v, err) = boot()
+        self.assertEqual((err, ms.drafter), ('', None))
+        self.assertFalse(any('DFlash2' in m for m in logs), logs)                # the TP=6 default boot says nothing new
+        self.assertFalse(any(a.startswith('--dflash') for a in opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')['args']))
+        o, (ms, v, err) = boot('--dflash', '1')
+        self.assertIn(f'add --drafter {hfsource.DRAFTER_URL}', err)
+        o, (ms, v, err) = boot('--drafter', 'https://huggingface.co/fakeorg/drafter', '--model-cache', self.cache)
+        self.assertEqual((err, ms.drafter), ('', None))
+        self.assertIn('--drafter at TP=6 is used with --dflash 1 only: MTP only', logs[-1])
+        o, (ms, v, err) = boot('--drafter', 'https://huggingface.co/fakeorg/drafter', '--model-cache', self.cache, '--dflash', '1')
+        self.assertEqual(err, '')
+        self.assertEqual(ms.drafter.out, os.path.join(ms.drafter.dir, 'tp6'))
+        plan = opt.engine_plan(o, rank=5, rank_dir='/r', aux_dir='/a', home='/h', epoch=1)
+        self.assertIn(os.path.join(ms.drafter.out, 'dflash.r5.pack'), plan['args'])
+        self.assertIn('--spec-adaptive', plan['args'])
 
 
 if __name__ == '__main__':

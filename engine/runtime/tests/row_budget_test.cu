@@ -152,7 +152,7 @@ static bind::Tensor mk(const void* p, int nd, long long a, long long b = 0, long
 
 static std::vector<int> row_list()
 {
-    const int all[] = {1, 2, 3, 5, 7, 8, 9, 12, 16, 17, 24, 31, 32};
+    const int all[] = {1, 2, 3, 5, 7, 8, 9, 12, 16, 17, 24, 31, 32, 33, 40, 41, 47, 48};   // 33..48: DS41_MX 40 / 48 (n=8 tiles 5 and 6)
     std::vector<int> v;
     for (int m : all)
         if (m <= G6_MX) v.push_back(m);
@@ -662,14 +662,18 @@ static void test_k1(const std::vector<int>& Ms)
                        true, fuse, 1, E2, false, Ms2, sr, true);
             }
     }
+    // both dense widths: when 96 blocks do not divide by NR (TP5: 20 and 19 blocks) the narrower ranks run too
+    const int nch_dense_lo = 96 / g6nr::NR * 128 / 16;
+    for (const int nd : {nch_dense, nch_dense_lo})
     {
+        if (nd == nch_dense_lo && nd == nch_dense) continue;
         Arena A;
-        const ShW d = build_shared(A, nch_dense, 0, 300u);
+        const ShW d = build_shared(A, nd, 0, 300u);
         Env E = make_env(A, false);
         const bind::LayerTensors T = make_T(nullptr, d);
         for (int fuse = 0; fuse < 3; ++fuse)
             for (int bf = 0; bf < 2; ++bf)
-                run_k1(fmt_s("dense fuse=%d out_bf16=%d", fuse, bf), T, false, fuse, bf, E, false, Ms);
+                run_k1(fmt_s("dense ch=%d fuse=%d out_bf16=%d", nd * 16, fuse, bf), T, false, fuse, bf, E, false, Ms);
     }
 }
 
@@ -929,7 +933,12 @@ int main(int argc, char** argv)
     }
     const std::vector<int> Ms = row_list();
     if (do_gv) test_gv(Ms);
-    if (do_k1) test_k1(Ms);
+    if (do_k1)                                       // the K1 stream (glue plan) stays at <= 32 rows; DS41 runs 33..48 through ds41_moe_ops (ds41_moe_pw_test)
+    {
+        std::vector<int> Mk;
+        for (int m : Ms) if (m <= 32) Mk.push_back(m);
+        test_k1(Mk);
+    }
     printf("%s: %d passed, %d failed\n", g_fail ? "FAILED" : "OK", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

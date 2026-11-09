@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include "../model_geom.h"
 #include "math.h"
+#include "../knobs-rs/gr8_knobs.h"
 namespace flash_mhc {
 constexpr int THREADS = 256;
 struct Weights {
@@ -21,17 +22,14 @@ struct Buffers {
     float* post;   // [max_rows,4]
     float* comb;   // [max_rows,4,4], source then destination
     unsigned* done = nullptr; // [max_rows], zeroed retirement counter for fused prepare
-    int bf16 = 0;             // test (G6_MHC_BF16): this launch rounds every stream write to BF16 (= BF16 storage, FP32 math)
+    int bf16 = 0;             // test (GR8_MHC_BF16): this launch rounds every stream write to BF16 (= BF16 storage, FP32 math)
 };
-// G6_MHC_BF16: quality test of BF16 residual streams. The buffer stays FP32; each written value is rounded to BF16, so
+// GR8_MHC_BF16: quality test of BF16 residual streams. The buffer stays FP32; each written value is rounded to BF16, so
 // every later read, sum of squares and register copy sees exactly what a BF16 buffer would hold. 1 = the writes after
 // both blocks, 2 = only the write after the MLP block (attention-side write stays FP32). Default 0 = unchanged.
 inline int bf16_env() {   // bit 0 = attention-side write, bit 1 = MLP-side write
-    static const int mask = [] {
-        const int v = getenv("G6_MHC_BF16") ? atoi(getenv("G6_MHC_BF16")) : 0;
-        return v == 1 ? 3 : v == 2 ? 2 : 0;
-    }();
-    return mask;
+    const int64_t v = knob::mhc_bf16();
+    return v == 1 ? 3 : v == 2 ? 2 : 0;
 }
 // The buffers for the stream write after block mlp (0 = attention, 1 = MLP).
 inline Buffers side(Buffers b, int mlp) {
@@ -130,6 +128,22 @@ __global__ void k_mhc_embed(Buffers b, const int* tok, const __nv_bfloat16* embe
     float sq=0.f;
     for (int h=threadIdx.x; h<H; h+=THREADS) {
         const float v=__bfloat162float(embed[(size_t)tok[m]*H+h]);
+        for (int j=0; j<4; ++j) b.streams[((size_t)m*4+j)*H+h]=v;
+        sq += v*v;
+    }
+    const float inv=rsqrtf(sum_block(sq)/H+eps);
+    if (!threadIdx.x) b.inv[m]=inv;
+}
+// k_mhc_embed with image rows (image input, runtime/flash_vision_stage.cuh): row m with row_of[m] >= 0 takes the vision
+// tower's row rows[row_of[m]] in place of its token's embedding row.
+__global__ void k_mhc_embed_rows(Buffers b, const int* tok, const __nv_bfloat16* embed, int H, float eps,
+                                 const __nv_bfloat16* rows, const int* row_of) {
+    const int m=blockIdx.x;
+    const int r=row_of[m];
+    const __nv_bfloat16* src=r>=0 ? rows+(size_t)r*H : embed+(size_t)tok[m]*H;
+    float sq=0.f;
+    for (int h=threadIdx.x; h<H; h+=THREADS) {
+        const float v=__bfloat162float(src[h]);
         for (int j=0; j<4; ++j) b.streams[((size_t)m*4+j)*H+h]=v;
         sq += v*v;
     }
@@ -626,10 +640,13 @@ __global__ void __launch_bounds__(THREADS, 1) k_mhc_out_inv_prepare_pk(
 // from L2. Same values, same order per thread, same reduction trees -> bit-identical. Low register use lets MINB
 // CTAs share an SM, so the DRAM phase of one row overlaps the L2/FMA phase of another. f16 / bf16: optional
 // fragment tables (bind::Xfrag layout, rows 0..M) of the normalized rows, as k_mhc_fragments would build them.
+// out2 / normalized2 (optional): a second copy of the out / normalized rows, e.g. straight into a fabric send slot.
 template<class Block, int R, int MINB>
 __global__ void __launch_bounds__(THREADS, MINB) k_mhc_out_inv_prepare_rr(
     Buffers b, Block block, Weights w, const uint4* __restrict__ fnp, int M, float eps,
-    __half* out, float* normalized=nullptr, unsigned* f16=nullptr, unsigned* bf16=nullptr) {
+    __half* out, float* normalized=nullptr, unsigned* f16=nullptr, unsigned* bf16=nullptr,
+    __half* out2=nullptr, float* normalized2=nullptr, int fm0=0, int fM=0) {
+    // fm0 / fM (GR8_GLM53F_PF_SP_XFRAG): the rows are rows fm0.. of an fM-row batch; the fragment tables are the batch's
     __shared__ float sh_sums[R][24][8];
     __shared__ float sh_mix[R][24];
     __shared__ float sh_pre[R][4];
@@ -756,9 +773,11 @@ __global__ void __launch_bounds__(THREADS, MINB) k_mhc_out_inv_prepare_rr(
             const float val = rv[idx] * rinv * __bfloat162float(__ldg(w.norm + h));
             if (out) out[(size_t)m * 4096 + h] = __float2half_rn(val);
             if (normalized) normalized[(size_t)m * 4096 + h] = val;
+            if (out2) out2[(size_t)m * 4096 + h] = __float2half_rn(val);
+            if (normalized2) normalized2[(size_t)m * 4096 + h] = val;
             if (f16 || bf16) {   // fragment tables of all M rows (zero pad rows after the last), as k_mhc_fragments
                 const float b_val = __shfl_xor_sync(0xffffffffu, val, 1);
-                if (!(threadIdx.x & 1)) write_frag_pair(m, M, 4096, h, val, b_val, f16, bf16);
+                if (!(threadIdx.x & 1)) write_frag_pair(m + fm0, fM ? fM : M, 4096, h, val, b_val, f16, bf16);
             }
         }
     }
@@ -769,7 +788,8 @@ __global__ void __launch_bounds__(THREADS, 2) k_mhc_consume_fused(
     __half* out, float* normalized=nullptr, unsigned* f16=nullptr, unsigned* bf16=nullptr) {
     __shared__ float sh_pre[4];
     __shared__ int sh_last;
-    const int o=blockIdx.x, m=blockIdx.y, M=gridDim.y;
+    // grid (rows, 24): every row's CTA 0 (the one the other 23 of its row wait for) is in the first wave
+    const int m=blockIdx.x, o=blockIdx.y, M=gridDim.x;
     const unsigned long long step = block.init();
     const unsigned seq32 = block.seq32(step);
     float* __restrict__ s = b.streams + (size_t)m*4*H;

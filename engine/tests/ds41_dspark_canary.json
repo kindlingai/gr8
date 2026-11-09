@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "doc": "DSpark canary fixture. 4 classes x 3 prompts. Every run (MTP=0 twice, MTP=1, MTP=5) uses the same chat template, temperature 0, thinking off, and cuts the output at max_tokens (a speculative round may not emit past it). Compare with engine/tests/ds41_dspark_canary.py.",
+  "settings": {
+    "max_tokens": 256,
+    "temperature": 0,
+    "thinking": false
+  },
+  "classes": ["prose", "code", "json", "arith"],
+  "prompts": [
+    {
+      "id": "prose-1",
+      "class": "prose",
+      "messages": [{"role": "user", "content": "Write an essay of about 400 words on how the printing press changed European society."}]
+    },
+    {
+      "id": "prose-2",
+      "class": "prose",
+      "messages": [{"role": "user", "content": "Explain in plain language, for a curious teenager, how a refrigerator keeps food cold. Use several paragraphs."}]
+    },
+    {
+      "id": "prose-3",
+      "class": "prose",
+      "messages": [{"role": "user", "content": "Write a short story of about 400 words about a lighthouse keeper who finds a message in a bottle."}]
+    },
+    {
+      "id": "code-1",
+      "class": "code",
+      "messages": [{"role": "user", "content": "Write a Python module that implements an LRU cache class with get, put and a size limit. Add docstrings and a few unit tests with unittest."}]
+    },
+    {
+      "id": "code-2",
+      "class": "code",
+      "messages": [{"role": "user", "content": "Write a C function that reverses a singly linked list in place, and a main() that builds a list of 10 nodes, reverses it and prints it. Explain each step in comments."}]
+    },
+    {
+      "id": "code-3",
+      "class": "code",
+      "messages": [{"role": "user", "content": "Write a TypeScript function debounce(fn, ms) with correct generic typing, and an example of how to use it. Add a short explanation."}]
+    },
+    {
+      "id": "json-1",
+      "class": "json",
+      "messages": [{"role": "user", "content": "Output a JSON array of 12 objects that describe fictional employees. Each object has the keys id (integer), name, department, salary (integer), skills (array of 3 strings) and active (boolean). Output only the JSON."}]
+    },
+    {
+      "id": "json-2",
+      "class": "json",
+      "messages": [{"role": "user", "content": "Produce a JSON document with the weekly schedule of a small bakery. For each day of the week give an object with open, close and a list of the products baked that day, each with a quantity. Output only the JSON."}]
+    },
+    {
+      "id": "json-3",
+      "class": "json",
+      "messages": [{"role": "user", "content": "Convert this CSV to a JSON array of records and add a field total = qty * price to each record. Output only the JSON.\n\nsku,name,qty,price\nA100,bolt,40,0.25\nA101,nut,75,0.1\nB200,washer,120,0.05\nC300,screw,60,0.15\nC301,anchor,15,1.2\nD400,bracket,22,2.75\nD401,hinge,18,3.4\nE500,spring,33,0.8"}]
+    },
+    {
+      "id": "arith-1",
+      "class": "arith",
+      "messages": [{"role": "user", "content": "Compute step by step and show each intermediate result: 347 * 289, then 9876 + 5432 - 1234, then 1024 / 16, then 17 squared."}]
+    },
+    {
+      "id": "arith-2",
+      "class": "arith",
+      "messages": [{"role": "user", "content": "A train leaves city A at 60 km/h. Another train leaves city B, 450 km away, at 90 km/h toward A at the same moment. When and where do they meet? Then say when and where they meet if the first train left 30 minutes earlier. Show your work."}]
+    },
+    {
+      "id": "arith-3",
+      "class": "arith",
+      "messages": [{"role": "user", "content": "List the first 20 terms of the Fibonacci sequence. Then compute the sum of those 20 terms and check that it equals F(22) - 1. Show the arithmetic."}]
+    }
+  ]
+}

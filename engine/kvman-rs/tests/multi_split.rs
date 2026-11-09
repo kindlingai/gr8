@@ -162,10 +162,13 @@ fn growth_below_r_counts_split_runs_low_pages() {
     assert_eq!((low_high(&p, &s), p.room()), ((50, 54), 26));
     let a = p.grow(&a, 12 * PAGE).unwrap().unwrap(); // +10: 16 free
     let b = p.grow(&b, 12 * PAGE).unwrap().unwrap(); // +10: 6 free (safe: the split run finishes first)
-    // +8 more for b: 8 > 6 low pages free: a stall. Without the split run's 50 low pages it would be granted
+                                                     // +8 more for b: 8 > 6 low pages free: a stall. Without the split run's 50 low pages it would be granted
     assert_eq!(p.grow(&b, 20 * PAGE).unwrap(), None);
     assert_eq!(p.stats().stalls, 1);
-    check(&p, &[Live { run: a, worst: 20 * PAGE }, Live { run: b, worst: 20 * PAGE }, Live { run: s, worst: 104 * PAGE }]);
+    check(
+        &p,
+        &[Live { run: a, worst: 20 * PAGE }, Live { run: b, worst: 20 * PAGE }, Live { run: s, worst: 104 * PAGE }],
+    );
     p.release(&s).unwrap();
     assert!(p.grow(&b, 20 * PAGE).unwrap().is_some(), "the split run's low pages are back");
 }

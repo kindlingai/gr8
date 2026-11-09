@@ -3,7 +3,6 @@
 #include <cublas_v2.h>
 #include <cstdio>
 #include <atomic>
-#include <cerrno>
 #include <climits>
 #include <cstdlib>
 #include "prefill-index-team-profile.cuh"
@@ -28,12 +27,6 @@ struct G6AttnPrefill {
 };
 namespace gp {
 using ga::half;using ga::bf16;constexpr int TOP=ga::TOP;
-// At modest context, shared dense tensor GEMMs win despite extra masked FLOPs.
-// Selection and softmax still use precisely the supplied TOP list.
-constexpr int DEFAULT_DENSE_LIMIT=8192;
-// Bound all prefill scratch and GEMM widths at creation, independent of tails.
-// Larger batches reduce launch overhead and improve selector/WMMA occupancy.
-constexpr int DEFAULT_QUERY_TILE=256;
 static int blas_status(cublasStatus_t s){if(s==CUBLAS_STATUS_SUCCESS)return 0;fprintf(stderr,"gr8 prefill cuBLAS status %d\n",int(s));return int(cudaErrorUnknown);}
 __global__ void weight_half(const void* src,half* dst,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)dst[i]=__float2half_rn(ga::bfloat(src,i));}
 // #50: the FP16 UK / UV copies from a binding's E4M3 weights (attn.h uks / uvs): each FP16 value is weight_half's of the BF16
@@ -141,8 +134,8 @@ __global__ void __launch_bounds__(256,2) index_scores_rg8(G6Attn a,int start,int
  }
 }
 template<int BL,int OL> constexpr int isg_rg8_smem(){return 64*BL*2+4*32*OL*4;}
-// Rows per CTA: G6_PF_ISGRT_RG (multiple of 8) overrides the default 8.
-static inline int isgrt_rg(){static const int env=[]{const char* s=getenv("G6_PF_ISGRT_RG");return s?atoi(s)&~7:0;}();return env>=8?env:8;}
+// Rows per CTA: GR8_PF_ISGRT_RG (multiple of 8) overrides the default 8.
+static inline int isgrt_rg(){return int(knob::pf_isgrt_rg())&~7;}
 static inline void launch_index_scores_rg(G6Attn a,int start,int n,const half* q,const float* weight,const half* keys,const float* scales,float* scores,int* ids,cudaStream_t st){
  constexpr int SMEM=isg_rg8_smem<136,64>();static const bool once=cudaFuncSetAttribute(index_scores_rg8<136,64>,cudaFuncAttributeMaxDynamicSharedMemorySize,SMEM)==cudaSuccess;(void)once;
  int RG=isgrt_rg();index_scores_rg8<136,64><<<dim3((a.context+63)/64,(n+RG-1)/RG),256,SMEM,st>>>(a,start,n,RG,q,weight,keys,scales,scores,ids);
@@ -245,16 +238,15 @@ static ga::Work index_workspace(const G6Attn& a,void* base,bool full){
         w.temp_bytes=std::max(bytes,single);w.temp=take(w.temp_bytes);}
     w.total=used;return w;
 }
-// G6_PF_SELX_CTX (selx.cuh = tp6-spare 446fa62, shared with TP4 verbatim): prefill index tiles with n >= SELX_MINN rows and context
+// GR8_PF_SELX_CTX (selx.cuh = tp6-spare 446fa62, shared with TP4 verbatim): prefill index tiles with n >= SELX_MINN rows and context
 // >= this select with selx (one CTA per row, sample bound + filter + radix + sort) instead of SEL32: the same ids in the same
 // order (score desc, then id asc, -1 fill). Unset = SEL32 for every tile (today). Strict: an integer 32769..1048576, else exit 2.
 // cand scratch = w.so .. w.io (2 * R * T * 4 B, present for T > 32768, used by SEL32 only as its histogram) -> min(CAPG, T) keys/row.
 static constexpr int SELX_MINN=32;   // our gate: selx 1.6-2.0x SEL32 from 53K at n >= 33
 static int selx_ctx(){
-    static const int v=[]{const char* s=getenv("G6_PF_SELX_CTX");if(!s)return 0;
-        char* e=nullptr;errno=0;const long x=strtol(s,&e,10);
-        if(!*s||*e||errno||x<=32768||x>1048576){fprintf(stderr,"G6_PF_SELX_CTX='%s': need an integer 32769..1048576 (unset = SEL32)\n",s);exit(2);}
-        fprintf(stderr,"# G6_PF_SELX_CTX %ld: prefill index tiles with n >= %d and context >= %ld select with selx\n",x,SELX_MINN,x);return (int)x;}();
+    static const int v=[]{const int x=int(knob::pf_selx_ctx());   // default: SELX at 53248 context (v0.7)
+        if(x!=53248)fprintf(stderr,"# GR8_PF_SELX_CTX %d: prefill index tiles with n >= %d and context >= %d select with selx\n",x,SELX_MINN,x);
+        return x;}();
     return v;
 }
 static cudaError_t select_prefill(const G6Attn& a,ga::Work& w,int start,int n,cudaStream_t st){
@@ -282,15 +274,9 @@ static cudaError_t release_scratch(G6AttnPrefillScratch* w){
     if(!w||w->refs.fetch_sub(1,std::memory_order_acq_rel)!=1)return cudaSuccess;
     auto bs=cublasDestroy(w->blas);auto e=cudaFree(w->data);delete w;return e!=cudaSuccess?e:cudaError_t(blas_status(bs));
 }
-static bool env_int(const char* name,int fallback,int& out){
-    const char* v=std::getenv(name);if(!v||!*v){out=fallback;return true;}
-    char* end=nullptr;errno=0;long x=std::strtol(v,&end,10);
-    if(errno||end==v||*end||x<0||x>INT_MAX-31)return false;out=int(x);return true;
-}
 static int create_state(G6AttnPrefill** out,G6AttnBinding* b,void* s,G6AttnPrefill* owner,bool shared){
     if(!out||*out||!b||!b->storage)return int(cudaErrorInvalidValue);
-    int tile=0,dense=0,events=0;
-    if(!env_int("G6_PF_TILE",DEFAULT_QUERY_TILE,tile)||(tile!=64&&tile!=128&&tile!=256)||!env_int("G6_PF_DENSE",DEFAULT_DENSE_LIMIT,dense)||!env_int("G6_PF_EVENTS",0,events)||events>1)return int(cudaErrorInvalidValue);
+    const int tile=int(knob::pf_tile()),dense=int(knob::pf_dense()),events=knob::pf_events();
     auto p=new G6AttnPrefill;p->dense_limit=dense;p->owner=b;p->full_index=b->full_index;p->H=b->args.heads;p->cap=b->capacity;p->maxrows=b->max_rows;p->R=std::min(tile,p->maxrows);p->C=(p->cap+31)&~31;
     const size_t need=scratch_layout(*p,b->args,nullptr);p->weight_bytes=weight_layout(*p,nullptr);
     int device=0;auto e=cudaGetDevice(&device);if(e!=cudaSuccess){delete p;return int(e);}
@@ -325,26 +311,26 @@ static int create_state(G6AttnPrefill** out,G6AttnBinding* b,void* s,G6AttnPrefi
     if(e!=cudaSuccess){profile_release(p->profile);cudaFree(p->storage);release_scratch(p->workspace);delete p;return int(e);}*out=p;return 0;
 }
 }
-extern "C" int g6_attn_bind_prefill_create(G6AttnPrefill** out,G6AttnBinding* b,void* s){return gp::create_state(out,b,s,nullptr,false);}
-extern "C" int g6_attn_bind_prefill_create_shared(G6AttnPrefill** out,G6AttnBinding* b,void* s,G6AttnPrefill* owner){return gp::create_state(out,b,s,owner,true);}
-extern "C" int g6_attn_bind_prefill_release(G6AttnPrefill* p){
+extern "C" int g6a_bind_prefill_create(G6AttnPrefill** out,G6AttnBinding* b,void* s){return gp::create_state(out,b,s,nullptr,false);}
+extern "C" int g6a_bind_prefill_create_shared(G6AttnPrefill** out,G6AttnBinding* b,void* s,G6AttnPrefill* owner){return gp::create_state(out,b,s,owner,true);}
+extern "C" int g6a_bind_prefill_release(G6AttnPrefill* p){
     if(!p)return 0;auto pe=gp::profile_release(p->profile);auto e=cudaFree(p->storage);auto w=gp::release_scratch(p->workspace);delete p;
     return pe!=cudaSuccess?int(pe):(e!=cudaSuccess?int(e):int(w));
 }
-extern "C" int g6_attn_bind_prefill_get_config(const G6AttnPrefill* p,int* tile,int* dense_limit){
+extern "C" int g6a_bind_prefill_get_config(const G6AttnPrefill* p,int* tile,int* dense_limit){
     if(!p)return int(cudaErrorInvalidValue);if(tile)*tile=p->R;if(dense_limit)*dense_limit=p->dense_limit;return 0;
 }
-extern "C" int g6_attn_bind_prefill_profile_read(G6AttnPrefill* p,G6AttnPrefillProfile* out){
+extern "C" int g6a_bind_prefill_profile_read(G6AttnPrefill* p,G6AttnPrefillProfile* out){
     if(!p||!out)return int(cudaErrorInvalidValue);return int(gp::profile_read(p->profile,*out));
 }
-extern "C" size_t g6_attn_bind_prefill_bytes(const G6AttnPrefill* p){return p?p->bytes:0;}
-extern "C" int g6_attn_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,const G6AttnTrace* trace,void* s){
+extern "C" size_t g6a_bind_prefill_bytes(const G6AttnPrefill* p){return p?p->bytes:0;}
+extern "C" int g6a_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,const G6AttnTrace* trace,void* s){
     if(!p)return int(cudaErrorInvalidValue);gp::profile_reset(p->profile);
-    if(p->owner!=b||!step)return int(cudaErrorInvalidValue);int rc=g6_attn_bind_prepare(b,step,s);if(rc)return rc;G6Attn a=b->args;if(a.rows>p->maxrows||a.context>p->cap)return int(cudaErrorInvalidValue);
+    if(p->owner!=b||!step)return int(cudaErrorInvalidValue);int rc=g6a_bind_prepare(b,step,s);if(rc)return rc;G6Attn a=b->args;if(a.rows>p->maxrows||a.context>p->cap)return int(cudaErrorInvalidValue);
     cudaStream_t st=(cudaStream_t)s;rc=gp::blas_status(cublasSetStream(p->blas,st));if(rc)return rc;
     bool profiling=false;rc=int(gp::profile_begin(p->profile,st,a.rows,a.context,a.heads,p->R,!a.reuse_indices,trace!=nullptr,profiling));if(rc)return rc;
 #define GP_PROFILE() do{if(profiling){rc=int(gp::profile_mark(p->profile,st));if(rc)return rc;}}while(0)
-    G6_PF_MARK(0,st);rc=g6_attn_append(&a,s);if(rc)return rc;
+    G6_PF_MARK(0,st);rc=g6a_append(&a,s);if(rc)return rc;
     // Append validates the public <=64 decode scratch tile. Only the private
     // prefill workspace below uses the larger tile; no decode ABI is widened.
     a.query_tile=p->R;int expanded=(a.context+31)&~31;
@@ -368,7 +354,8 @@ extern "C" int g6_attn_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,cons
         const bool mapped=dense&&a.context>0&&D<=8192&&H*ga::TOP>=a.context;
         if(dense){GP_BLAS(cublasGemmEx(p->blas,CUBLAS_OP_T,CUBLAS_OP_N,D,H*R,576,&scale,p->cache,CUDA_R_16F,576,p->q,CUDA_R_16F,576,&zero,p->dense,CUDA_R_32F,D,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));
             if(!mapped)gp::dense_gather<<<(n*H*ga::TOP+255)/256,256,0,st>>>(a,start,n,R,p->dense,p->prob);
-        }else {if(a.heads>16)gp::sparse_qk<2><<<dim3(ga::TOP/64,n),128,0,st>>>(a,start,R,p->q,p->cache,p->prob);else gp::sparse_qk<1><<<dim3(ga::TOP/64,n),128,0,st>>>(a,start,R,p->q,p->cache,p->prob);}
+        }else {if(a.heads>32)return int(cudaErrorNotSupported);   // sparse_qk / sparse_pv cover 32 heads a block
+            if(a.heads>16)gp::sparse_qk<2><<<dim3(ga::TOP/64,n),128,0,st>>>(a,start,R,p->q,p->cache,p->prob);else gp::sparse_qk<1><<<dim3(ga::TOP/64,n),128,0,st>>>(a,start,R,p->q,p->cache,p->prob);}
         G6_PF_MARK(7,st);if(mapped){
             cudaMemsetAsync(p->prob,0xff,(size_t)R*a.context*4,st);
             gp::dense_links<<<(n*ga::TOP+255)/256,256,0,st>>>(a,start,n,(int*)p->prob,p->next);
@@ -386,8 +373,8 @@ extern "C" int g6_attn_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,cons
 #undef GP_PROFILE
     rc=int(cudaGetLastError());if(!rc&&profiling)p->profile.report.status=G6_PF_PROFILE_READY;return rc;
 }
-extern "C" int g6_attn_bind_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,void* s){return g6_attn_bind_prefill_trace(p,b,step,nullptr,s);}
-extern "C" int g6_attn_bind_baseline_trace(G6AttnBinding* b,const G6AttnStep* step,const G6AttnTrace* trace,void* s){int rc=g6_attn_bind_prepare(b,step,s);if(rc)return rc;auto a=b->args;auto st=(cudaStream_t)s;auto w=ga::workspace(a,b->scratch);rc=g6_attn_append(&a,s);if(rc)return rc;G6AttnTrace tr=trace?*trace:G6AttnTrace{};
+extern "C" int g6a_bind_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,void* s){return g6a_bind_prefill_trace(p,b,step,nullptr,s);}
+extern "C" int g6a_bind_baseline_trace(G6AttnBinding* b,const G6AttnStep* step,const G6AttnTrace* trace,void* s){int rc=g6a_bind_prepare(b,step,s);if(rc)return rc;auto a=b->args;auto st=(cudaStream_t)s;auto w=ga::workspace(a,b->scratch);rc=g6a_append(&a,s);if(rc)return rc;G6AttnTrace tr=trace?*trace:G6AttnTrace{};
     for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile),H=a.heads;
         if(a.reuse_indices)ga::reuse<<<n,256,0,st>>>(a,start);else{ga::prep_index<<<dim3(n,32),128,0,st>>>(a,start,w.iq,w.weights);ga::launch_index_scores(a,a,w,start,n,st);if(tr.index_scores)cudaMemcpyAsync(tr.index_scores+(int64_t)start*a.context,w.si,(size_t)n*a.context*4,cudaMemcpyDeviceToDevice,st);auto e=ga::select_index(a,w,start,n,st);if(e!=cudaSuccess)return int(e);}
         ga::launch_absorb(a,a,w,start,n,st);gp::trace_copy(tr.q,w.q,start,n,H,512,st);ga::launch_mla_scores(a,a,w,start,n,st);gp::trace_copy(tr.scores,w.prob,start,n,H,ga::TOP,st);

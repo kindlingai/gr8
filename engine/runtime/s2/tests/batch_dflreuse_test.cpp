@@ -1,7 +1,7 @@
-// G6_DFL_REUSE (s2_batch.h Batch::dfl_reuse): a DFlash2 session whose prefill a prefix-reuse hit cut into the drafter's
+// GR8_DFL_REUSE (s2_batch.h Batch::dfl_reuse): a DFlash2 session whose prefill a prefix-reuse hit cut into the drafter's
 // window keeps the drafter, with the ring's rows of the last DFlash2 session when its tokens are this prompt's; a short
 // context warms up on MTP rounds; mode 2 promotes a session alone on MTP. Mode 0 plans the steps as before. Every
-// committed token is the target's. With G6_MTP_KSTOP (Batch::kstop) the warm-up and promoted MTP rounds verify the
+// committed token is the target's. With GR8_MTP_KSTOP (Batch::kstop) the warm-up and promoted MTP rounds verify the
 // confidence stop's 1..kmax drafts while the drafter's context stays contiguous. Host only, a fake engine.
 #include "s2_batch.h"
 #include <algorithm>
@@ -63,7 +63,7 @@ static bool exact(const std::vector<int>& got, int n)
 }
 static void run(Batch& b, int q) { while (b.round({q})) {} }
 
-// G6_MTP_KSTOP with the reuse: MTP drafts right where good(), with the MTP head's probability p() (batch_kstop_test's)
+// GR8_MTP_KSTOP with the reuse: MTP drafts right where good(), with the MTP head's probability p() (batch_kstop_test's)
 static bool good(int spos) { return (spos * 2654435761u >> 7) % 4 != 0; }
 static float prob(int spos) { return !good(spos) ? 0.15f : spos % 4 ? 0.97f : 0.8f; }
 struct FakeK
@@ -256,8 +256,8 @@ int main()
             CHECK(f.rounds.back() == 'd' && b.stats(0).dfl_rounds > 0);
         }
     }
-    {   // G6_MTP_KSTOP=1 (kmax 3, K 2) with the reuse. Warm-up: the MTP rounds verify the rule's 1..3 drafts, the drafter
-        // takes each round's accepted rows as context (contiguous), DFlash2 starts once it holds G6_DFL_REUSE_MIN rows.
+    {   // GR8_MTP_KSTOP=1 (kmax 3, K 2) with the reuse. Warm-up: the MTP rounds verify the rule's 1..3 drafts, the drafter
+        // takes each round's accepted rows as context (contiguous), DFlash2 starts once it holds GR8_DFL_REUSE_MIN rows.
         // The next turn's hit finds those rows in the ring
         std::vector<int> p3(8300);
         for (int i = 0; i < 8300; ++i) p3[i] = (i * 11 + 5) % 983;
@@ -297,7 +297,7 @@ int main()
         CHECK(exact(f.got, (int)p4.size()) && f.bad == 0);
     }
     for (int pre = 3; pre <= 12; ++pre)
-    {   // G6_DFL_REUSE=2 promotes a shared-path session after `pre` rounds: its first MTP verify takes the rule's k of the K
+    {   // GR8_DFL_REUSE=2 promotes a shared-path session after `pre` rounds: its first MTP verify takes the rule's k of the K
         // drafts the shared chain left (their log-probabilities from that round's steps), the later ones the rule's chain
         std::vector<int> p1(5000);
         for (int i = 0; i < 5000; ++i) p1[i] = (i * 13 + 7) % 991;

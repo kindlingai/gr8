@@ -1,4 +1,4 @@
-// G6_DRAFT_HEAD_I4: the MTP draft's lm_head as INT4 g32 GEMV records (densev.cuh Int4v, 288 B per 16 rows x 32 inputs),
+// GR8_DRAFT_HEAD_I4: the MTP draft's lm_head as INT4 g32 GEMV records (densev.cuh Int4v, 288 B per 16 rows x 32 inputs),
 // made on the GPU at boot from this rank's MXFP8 records of the same rows (G.lm_head.mx.gv, densev.cuh Mxfp8, 528 B).
 // The target's head keeps the MXFP8 records; only the draft reads these. 3456 B per vocab row instead of 6336: the draft
 // head reads 45% fewer bytes, on the same vocab slice, with the same head kernels (full-vocab argmax and log-probability).

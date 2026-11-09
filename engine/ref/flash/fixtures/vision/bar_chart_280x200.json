@@ -1,0 +1,32 @@
+{
+ "image": "bar_chart_280x200.png",
+ "ppm": "bar_chart_280x200.ppm",
+ "w": 280,
+ "h": 200,
+ "vit_h": 16,
+ "vit_w": 20,
+ "tokens": 80,
+ "dim": 4096,
+ "nproj": 64,
+ "rows": [
+  0,
+  1,
+  9,
+  10,
+  40,
+  70,
+  78,
+  79
+ ],
+ "rgb_sha256": "69fa5df83255bd8bfe016142ad90af5af36a3263acdd061de43fceb7fe8d2dbc",
+ "patches_bf16_sha256": "e5b1393dd2db558eb3bf2342b4260341134489cfd78d98677de4eaeca547aba2",
+ "torchvision_patches_match_formula": true,
+ "pil_backend_patch_maxdiff": 2.384185791015625e-07,
+ "bf16_vs_f32": {
+  "rel_fro": 0.1010574996471405,
+  "row_rel_max": 0.6805362105369568,
+  "row_rel_mean": 0.0783805176615715,
+  "row_rel_median": 0.03104223683476448
+ },
+ "rms": 0.01873023339908538
+}

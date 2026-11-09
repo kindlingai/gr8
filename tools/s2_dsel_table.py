@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Write the drafter choice's cost table (G6_S2_DSEL_TABLE, engine/runtime/s2_batch.h DSelTable) from one boot's logs.
+"""Write the drafter choice's cost table (GR8_S2_DSEL_TABLE, engine/runtime/s2_batch.h DSelTable) from one boot's logs.
 
-Input: rank logs (stderr) of a boot with G6_S2_TIMELINE=N on every rank, and on rank 0 G6_MTP_LPLOG=1 (the "# kstop"
+Input: rank logs (stderr) of a boot with GR8_S2_TIMELINE=N on every rank, and on rank 0 GR8_MTP_LPLOG=1 (the "# kstop"
 lines). Every "# s2_tl" block is cumulative, so the last one of each rank counts; the ranks are averaged. Lines used:
   # s2_tl rank R step <kind> n N rows X span S prep P launch L wait W ms      per step kind, mean GPU span
   # s2_tl rank R rows <kind> M <rows> n N span S ms                          per step kind and row count
   # s2_tl rank R trans <a>><b> n N idle I host H ms                          GPU idle between two steps
   # kstop round .. slot .. n .. <mtp|dfl> base B k K nd ND a A ...            one per solo round (rank 0)
-Optionally (--roundlog) "# s2_round" lines (G6_S2_ROUNDLOG=1) give the verify ms by rows where no "rows main" line does.
+Optionally (--roundlog) "# s2_round" lines (GR8_S2_ROUNDLOG=1) give the verify ms by rows where no "rows main" line does.
 
 A step costs its GPU span plus the mean GPU idle before a step of its kind (the host's accept, emit and planning):
   v<M> = main span at M rows + idle before main                 (rows with at least --min-n steps)
@@ -16,11 +16,11 @@ A step costs its GPU span plus the mean GPU idle before a step of its kind (the 
   d    = f(DFlash2 rounds) + dfl_query          m = f(MTP rounds) + dfl_ctx          e = chain
   p    = dfl_query - dfl_ctx (a probe is a query in place of a context-only step)
   g k n from the MTP rounds (at least --min-n): drafts accepted after the first when the first is, verified, drafted.
-The table goes to stdout (one line, for G6ENV_X), the derivation to stderr.
+The table goes to stdout (one line, for EXTRA_ENV), the derivation to stderr.
 
 Measurement boot: the serving configuration being priced (its K-stop policy, DSel settings and kernels) with the model
-off (no G6_S2_DSEL_MODEL / G6_S2_DSEL_TABLE), DRAFT_PAR=0 (main defaults it on; the table was measured without it), and
-G6_S2_TIMELINE=200 G6_MTP_LPLOG=1 appended to its G6ENV_X (no G6_S2_ROUNDLOG: its route copies lengthen the main steps). Run
+off (no GR8_S2_DSEL_MODEL / GR8_S2_DSEL_TABLE), DRAFT_PAR=0 (main defaults it on; the table was measured without it), and
+GR8_S2_TIMELINE=200 GR8_MTP_LPLOG=1 appended to its EXTRA_ENV (no GR8_S2_ROUNDLOG: its route copies lengthen the main steps). Run
 solo decode that visits both drafters (RigMark c1 prose, code and structured), then pass every rank's log. Check the
 derivation: each v<M> the drafters reach (2..4 MTP, 2..8 DFlash2) from enough steps, and enough MTP rounds for g k n.
 
@@ -95,7 +95,7 @@ def first_form(lg, kind_rounds, min_n):
     mean over all first forms when there are no accept counts or a row count was never seen"""
     pooled = rank_mean(lg['step'], 'draft')
     if pooled is None:
-        raise SystemExit('no "# s2_tl ... step draft" line: was G6_S2_TIMELINE set?')
+        raise SystemExit('no "# s2_tl ... step draft" line: was GR8_S2_TIMELINE set?')
     if not kind_rounds:
         return pooled[1], 'pooled'
     w = {}
@@ -114,7 +114,7 @@ def table(lg, min_n=30, prior=True, log=sys.stderr):
     """-> (canonical-order dict of the table's keys, list of derivation lines)"""
     t, why = {}, []
     if any(k.endswith('_par') for d in lg['step'].values() for k in d):
-        raise SystemExit('"dfl_*_par" steps: under G6_DRAFT_PAR the drafter step overlaps the first form; measure with it off')
+        raise SystemExit('"dfl_*_par" steps: under GR8_DRAFT_PAR the drafter step overlaps the first form; measure with it off')
     im = idle_before(lg['trans'], 'main')
     for M in range(1, VX + 1):
         r = rank_mean(lg['rows'], ('main', M), min_n)
@@ -150,7 +150,7 @@ def table(lg, min_n=30, prior=True, log=sys.stderr):
         why.append('MTP rounds %d (%d with d1 accepted): g %.4f, k %.4f, n %.4f; first-position rate %.4f' %
                    (len(mtp), len(acc), t['g'], t['k'], t['n'], len(acc) / len(mtp)))
     elif prior:
-        why.append('MTP prior left out: %d MTP "# kstop" lines < %d (G6_MTP_LPLOG=1 on rank 0)' % (len(mtp), min_n))
+        why.append('MTP prior left out: %d MTP "# kstop" lines < %d (GR8_MTP_LPLOG=1 on rank 0)' % (len(mtp), min_n))
     return t, why
 
 
@@ -253,7 +253,7 @@ class Test(unittest.TestCase):
         s = fmt({'v2': 49.6, 'v3': 57.0, 'd': 6.9, 'm': 2.0, 'e': 1.17, 'p': 4.9})
         self.assertEqual(s, 'v2:49.6,v3:57,d:6.9,m:2,e:1.17,p:4.9')
         self.assertNotIn(' ', s)
-        self.assertNotIn(';', s)                    # it travels through G6ENV_X and a shell command line
+        self.assertNotIn(';', s)                    # it travels through EXTRA_ENV and a shell command line
 
 
 if __name__ == '__main__':

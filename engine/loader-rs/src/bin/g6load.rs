@@ -1,11 +1,17 @@
 //! The exlr8 v2 fetch helper for ./gr8 glm53 up --model https://... (tools/launch/hfsource.py and
 //! tools/launch/fetch_ranks.py keep the HTTP; this plans and checks). JSON on stdout.
 //!
-//!   g6load fetch-plan --slices DIR --tp N --rank R (--manifest FILE | --widths 2,3,4) [--layers 3-40,78]
-//!       the byte ranges of each width file rank R loads: {"units", "bytes", "files": [{"name", "ranges": [[off, n]]}]}
-//!   g6load verify --slices DIR --v2 DIR --tp N --rank R (--manifest FILE | --widths ...) [--layers ...]
+//!   g6load fetch-plan --slices DIR --tp N --rank R (--manifest FILE | --widths 2,3,4) [--layers 3-40,78] [--layout FILE]
+//!       the byte ranges of each width file rank R loads: {"units", "bytes", "files": [{"name", "ranges": [[off, n]]}]}.
+//!       With --layout (bin/g6layout, src/layout.rs) the halves the layout gives rank R, which reads every rank's
+//!       index slices at TP N.
+//!   g6load verify --slices DIR --v2 DIR --tp N --rank R (--manifest FILE | --widths ...) [--layers ...] [--layout FILE]
 //!       each of those halves' xxhash64 against the index slices: {"checked", "bad": [{"file", "offset", "nbytes",
 //!       "layer", "expert", "half", "proj"}]}. Exit 0 when every half matches, 3 when one does not, 1 on an error.
+//!
+//!   g6load compact --slices DIR --v2 DIR --out DIR --tp N --rank R (--manifest FILE | --widths ...)
+//!       [--layers ...] [--layout FILE]: write dense expert copies and g6map-v1 maps for this rank, verify every
+//!       half through the compact reader, then publish the directory. An existing directory is checked and reused.
 //!
 //! DIR for --slices holds tp<N>/k<K>/rank<R>.safetensors (the release's index-slices/).
 //!
@@ -16,6 +22,7 @@
 
 use g6load::dflash2;
 use g6load::fetch::{self, Choice};
+use g6load::layout::Layout;
 use std::collections::BTreeMap;
 
 fn main() {
@@ -40,7 +47,7 @@ fn layers(spec: &str) -> Result<Vec<usize>, String> {
 
 fn run() -> Result<i32, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = argv.first().ok_or("usage: g6load fetch-plan|verify|dflash2 (see the source) --slices DIR --tp N --rank R (--manifest F | --widths K,..)")?;
+    let cmd = argv.first().ok_or("usage: g6load fetch-plan|verify|compact|dflash2 (see the source) --slices DIR --tp N --rank R (--manifest F | --widths K,..)")?;
     let mut opt: BTreeMap<&str, &str> = BTreeMap::new();
     let mut it = argv[1..].iter();
     while let Some(k) = it.next() {
@@ -51,8 +58,8 @@ fn run() -> Result<i32, String> {
     let num = |k: &str| need(k)?.parse::<usize>().map_err(|_| format!("{k}: not a number"));
     if cmd == "dflash2" {
         let nr = opt.get("--nr").map_or(Ok(4), |_| num("--nr"))?;
-        dflash2::main(need("--src")?, need("--out")?, nr, opt.get("--ranks").copied(), opt.get("--bf16").copied().unwrap_or(""),
-                      &dflash2::GLM53)?;
+        dflash2::main(need("--src")?, need("--out")?, nr, opt.get("--ranks").copied(),
+                      opt.get("--bf16").copied().unwrap_or(""))?;
         return Ok(0);
     }
     let choice = match (opt.get("--manifest"), opt.get("--widths")) {
@@ -62,7 +69,8 @@ fn run() -> Result<i32, String> {
         _ => return Err("give one of --manifest and --widths".into()),
     };
     let ls = opt.get("--layers").map(|s| layers(s)).transpose()?;
-    let units = fetch::units(need("--slices")?, num("--tp")?, num("--rank")?, &choice, ls.as_deref())?;
+    let layout = opt.get("--layout").map(|p| Layout::read(p)).transpose()?;
+    let units = fetch::units(need("--slices")?, num("--tp")?, num("--rank")?, &choice, ls.as_deref(), layout.as_ref())?;
     match cmd.as_str() {
         "fetch-plan" => {
             let mut files: BTreeMap<String, Vec<(u64, u64)>> = BTreeMap::new();
@@ -79,6 +87,11 @@ fn run() -> Result<i32, String> {
             println!("{out}\n]}}");
             Ok(0)
         }
+        "compact" => {
+            g6load::compact::write(need("--v2")?, need("--out")?, &units)?;
+            println!("{{\"checked\": {}, \"bad\": []}}", units.len());
+            Ok(0)
+        }
         "verify" => {
             let bad = fetch::verify(need("--v2")?, &units)?;
             let rows: Vec<String> = bad.iter().map(|&i| {
@@ -89,6 +102,6 @@ fn run() -> Result<i32, String> {
             println!("{{\"checked\": {}, \"bad\": [{}]}}", units.len(), rows.join(",\n"));
             Ok(if bad.is_empty() { 0 } else { 3 })
         }
-        _ => Err(format!("unknown command {cmd}: fetch-plan, verify or dflash2")),
+        _ => Err(format!("unknown command {cmd}: fetch-plan, verify, compact or dflash2")),
     }
 }

@@ -1,11 +1,11 @@
-// G6_DRAFT_PAR (s2_batch.h draft_par_env): a solo DFlash2 round launches the drafter step (phase 1) before the MTP first
+// GR8_DRAFT_PAR (s2_batch.h Batch::draft_par): a solo DFlash2 round launches the drafter step (phase 1) before the MTP first
 // form and waits for it (phase 2) at the end of the round. Against the serial batch, every scenario must give the same
 // committed tokens, the same drafter requests, the same target / first-form / chain steps and the same stats; and no
 // target step or other drafter step may start while one is in flight. Host only, a fake engine.
-// Build: g++ -std=c++17 -O2 -I engine/runtime engine/runtime/s2/tests/batch_draftpar_test.cpp -o /tmp/batch_draftpar_test
+// Build: g++ -std=c++17 -O2 -I engine/runtime engine/runtime/s2/tests/batch_draftpar_test.cpp \
+//          engine/knobs-rs/target/release/libgr8knobs.a -lpthread -ldl -lm -o /tmp/batch_draftpar_test
 #include "s2_batch.h"
 #include <cstdio>
-#include <cstdlib>
 #include <string>
 using namespace s2;
 
@@ -83,10 +83,9 @@ struct Run
 // one scenario: dsel on, kstop mode km; phases of (mtp, dfl) quality, n rounds each
 static Run scenario(bool par, int km, bool insert, int reuse)
 {
-    if (par) setenv("G6_DRAFT_PAR", "1", 1);
-    else unsetenv("G6_DRAFT_PAR");
     Fake f;
     Batch b(2, 32, f.hooks());
+    b.draft_par(par);
     b.dflash(7, g6rt::SpecLen());
     DSel sel;
     sel.on = true;

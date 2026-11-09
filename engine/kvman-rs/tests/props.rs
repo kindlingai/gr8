@@ -1,8 +1,7 @@
 //! Properties of random traces: no page is held twice, no page is lost (live + retained + free = the pool), a live
 //! run's list never changes until it leaves, runs below R stay below place, an exclusive run is pages 0.. (or, with
 //! the page classes on, holds its prefix and shard below place and the drafter's tail above it), and two ranks given
-//! the same calls grant the same runs and agree on the digest. The bit-for-bit match with the C++ pool is
-//! engine/runtime/s2/tests/pool_diff_test.cpp.
+//! the same calls grant the same runs and agree on the digest.
 
 use g6kvman::stash::{Io, Keep, Part};
 use g6kvman::{Finished, Pool, Rules, Run, PAGE};
@@ -69,10 +68,7 @@ fn check(p: &Pool, live: &[Live], nr: u32, below: u32) {
             let main = rp + (n - rp).div_ceil(nr as u64).min(n - rp);
             let low = l.list.iter().filter(|&&q| q < p.place_pages()).count() as u64;
             assert!(low >= main, "the run holds {low} pages below place, wants {main}");
-            assert!(
-                l.list.iter().take(rp as usize).all(|&q| q < p.place_pages()),
-                "the prefix pages are below place"
-            );
+            assert!(l.list.iter().take(rp as usize).all(|&q| q < p.place_pages()), "the prefix pages are below place");
         }
         live_pages += l.list.len();
     }
@@ -267,11 +263,8 @@ fn a_past_r_run_leaves_the_short_runs_retained() {
     p.tail(2, 0);
     let short = p.reserve(4 * PAGE, 4 * PAGE).unwrap();
     let prompt: Vec<i32> = (0..4 * 64 - 1).map(|i| i as i32).collect();
-    p.retain(
-        &short,
-        Finished { history: prompt, valid: 4 * 64 - 2, written_end: 4 * 64 - 1, pf_end: 4 * 64 - 2 },
-    )
-    .unwrap();
+    p.retain(&short, Finished { history: prompt, valid: 4 * 64 - 2, written_end: 4 * 64 - 1, pf_end: 4 * 64 - 2 })
+        .unwrap();
     // 1,024 rows: 16 pages, its tail 8 logical pages, its shard 4: 12 pages below place, 4 above
     let big = p.reserve(1024, 1024).unwrap();
     assert!(p.exclusive_run(&big).unwrap());

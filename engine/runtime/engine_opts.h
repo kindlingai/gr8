@@ -3,7 +3,7 @@
 // flag means, because m4sim's output is the oracle g6m4 is held to (g6m4.cu: "all six (NR) must equal m4sim's on the
 // same packs"), and until now they agreed by holding the same 29 parse lines twice.
 //
-// Host only, no CUDA, so tests/engine_opts_test.cpp builds it with g++ (scripts/host_tests.sh). Two consequences:
+// Host only, no CUDA. Two consequences:
 // the flags that land in rank.cuh's Plan are optionals here, so Plan keeps its own defaults and a caller applies only
 // what the command line set; and a bad value comes back as a message instead of calling die(), which lives in rank.cuh.
 #include <algorithm>
@@ -23,6 +23,7 @@ inline const char* const DEFAULT_PROMPT = "154822,154824,154826,25062";
 struct CommonOpts
 {
     std::string v2_dir, v2_slices, v2_widths, v2_dense;   // --v2, --v2-slices, --v2-widths, --v2-dense
+    std::string v2_layout;                                // --layout: which pieces each rank holds (loader-rs layout.rs)
     bool v2_trellis = true;                               // --v2-dense-form
     std::string qo_man, qo_file;                          // --qo-manifest, --qo-pack
     std::string layers_s = "0,3,40,77";                   // --layers: the mini model both mains default to
@@ -47,6 +48,7 @@ bool common_arg(const std::string& a, Next&& next, CommonOpts& o, std::string& e
     else if (a == "--v2-slices") o.v2_slices = next();
     else if (a == "--v2-widths") o.v2_widths = next();
     else if (a == "--v2-dense") o.v2_dense = next();
+    else if (a == "--layout") o.v2_layout = next();
     else if (a == "--v2-dense-form")
     {
         const std::string f = next();

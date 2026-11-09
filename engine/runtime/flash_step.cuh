@@ -23,6 +23,11 @@ inline flash_mhc::Weights mhc_weights(const Find& find,int layer,const char* blo
 }
 // W3/W4/W5 allocate and bind outside graph capture. Every main-model layer
 // owns an attention error word, including KDA layers (which leave it zero).
+// KDA state slots: session 0's ring (kda_ring) and the other sessions' (kda_ring_rest, else kda_ring); s2/flash_ring.h
+inline int flash_kda_slots(const Model& m){
+    const int r=std::max(1,m.kda_ring),s=std::max(1,m.kda_sessions);
+    return r+(s-1)*(m.kda_ring_rest?m.kda_ring_rest:r);
+}
 inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find& find,int capacity,
                          const g6::FabricDev& f,u64* stepp,cudaStream_t st,int max_rows) {
     if(ids.empty() || capacity<1 || rank<0 || rank>=g6nr::NR || f.nr!=g6nr::NR)
@@ -30,13 +35,18 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
     m.flash_draft=ids.size()==1 && ids[0]==geom::MTP_LAYER;
     for(int l:ids) if(!m.flash_draft && (l<0 || l>=geom::L_MAIN)) die("Flash main model layer outside 0..44");
 #if defined(G6_CP) && G6_CP
-    if(m.cp.on) die("Flash CP is not implemented");
+    // GR8_CP: the main model's DSA layers (flash_dsa.cuh launch_dsa_cp); the MTP draft keeps its whole KV
+    if(m.cp.on && m.flash_draft) die("Flash CP: the MTP draft model has no CP binding");
+    if(m.cp.on && (m.cp.R2 || m.cp.R<64)) die("Flash CP: GR8_CP_R must be at least 64, and GR8_CP_R2 is not supported");
 #endif
     if(max_rows>MX) die("Flash main model currently supports decode rows only (no prefill)");
     m.rank=rank; m.nl=(int)ids.size(); m.f=f; m.stepp=stepp;
     if(f.ncoll!=m.ncoll()) die("Flash fabric ncoll must be 2 * layers + 1");
-    const char* be=getenv("G6_DEC_BK");
-    m.nbk=context_buckets(m.bk,be?atoi(be):2048,capacity,0);
+    int cp_r=0;
+#if defined(G6_CP) && G6_CP
+    if(m.cp.on) cp_r=m.cp.step_R();   // R is a bucket boundary: a graph step runs the CP block exactly past R
+#endif
+    m.nbk=context_buckets(m.bk,(int)knob::dec_bk(),capacity,cp_r);
 #ifdef DEC_S2
     m.s2_run_pages=(capacity+63)/64;
 #endif
@@ -50,7 +60,7 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
     G6RT_CK(cudaMemsetAsync(m.hc_done,0,64*sizeof(unsigned),st));
     m.x=dmalloc<__half>((size_t)MX*HID); m.x2=dmalloc<__half>((size_t)MX*HID);
     m.xn=dmalloc<float>((size_t)MX*HID); m.xn2=dmalloc<float>((size_t)MX*HID);
-    m.row_slot=dmalloc<int>(MX); m.kda_src=dmalloc<int>(1);
+    m.row_slot=dmalloc<int>(MX); m.kda_src=dmalloc<int>(MX); m.rsess=dmalloc<int>(MX);
     m.q_a=dmalloc<__half>((size_t)MX*QA); m.q_a_n=dmalloc<__half>((size_t)MX*QA);
     m.kv_a=dmalloc<__half>((size_t)MX*KVA); m.q_b=dmalloc<__half>((size_t)MX*g6nr::QBW);
     m.idx_q=dmalloc<__half>((size_t)MX*IDXQ); m.idx_k=dmalloc<__half>((size_t)MX*IDXK);
@@ -59,13 +69,14 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
     m.srow=dmalloc<glue::SampleRow>(MX); m.tk=dmalloc<glue::TkRes>(1); m.topp_miss=dmalloc<unsigned>(1);
     m.tok=dmalloc<int>(MX); m.pos=dmalloc<int>(MX); m.tok_out=dmalloc<int>(MX); m.tgt=dmalloc<int>(MX);
     m.steering_scale=dmalloc<float>(MX);   // k_step_in copies StepIn::steering_scale here every step
+    m.steering_slot=dmalloc<int>(MX);
     m.lp=dmalloc<float>(MX); m.lpt=dmalloc<float>(MX);
     m.scratch=dmalloc<char>(bind::scratch_bytes()); m.sc=bind::scratch_at(m.scratch);
     m.flash_mlp_sc=flash_mlp::workspace_at(dmalloc<char>(flash_mlp::workspace_bytes(MX)),MX);
     bool any_kda=false;
     for(int l:ids) any_kda|=geom::is_kda(l);
     if(any_kda) {
-        if(const char* e=kda::build_state(m.kda_st,std::max(1,m.kda_ring),g6nr::NR)) die(e);
+        if(const char* e=kda::build_state(m.kda_st,flash_kda_slots(m),g6nr::NR)) die(e);
         if(m.kda_ring>1) m.kda_st.src=m.kda_src;
         if(const char* e=kda::build_scratch(m.kda_sc,MX,g6nr::NR)) die(e);
     }
@@ -93,6 +104,29 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
     }
     G6RT_CK(bind::init());
     G6RT_CK(g6h2d::copy(m.errs,errors.data(),errors.size()*sizeof(unsigned*)));
+#if defined(G6_CP) && G6_CP
+    if(m.cp.on) {
+        // the exchange buffers of launch_dsa_cp, for MX rows and the widest head group
+        const int H=g6nr::HMAX,NR=g6nr::NR;
+        m.cp.tickets=dmalloc<unsigned>(m.cp.colls.ncoll());
+        m.cp.cand=dmalloc<uint64_t>((size_t)NR*MX*g6kv::TOP_POOLS);
+        m.cp.qbuf=dmalloc<float>((size_t)MX*H*KVA);
+        m.cp.part_all=dmalloc<float>((size_t)NR*cp_blk(MX,H));
+        m.cp.part_tmp=dmalloc<float>((size_t)NR*cp_blk(MX,H));
+        // equal head groups (TP=2, TP=4): every group's partial in one call (g6a_cp_groups, the same bits)
+        m.cp.one=g6nr::HMIN==g6nr::HMAX && g6_attn_cp_groups_ok(H);
+        if(m.cp.one) {
+            m.cp.one_rows=MX;
+            m.cp.qall=dmalloc<float>((size_t)MX*NR*H*KVA);
+            m.cp.one_bytes=g6_attn_cp_groups_bytes(NR*H,MX);
+            m.cp.one_buf=dmalloc<char>(m.cp.one_bytes);
+        }
+        size_t held=0,full=0;
+        for(const Layer& y:m.layers) if(!y.kda) { held+=(size_t)y.ab.args.page_count; full+=(size_t)y.ab.args.table_size; }
+        fprintf(stderr,"# rank %d: GR8_CP on (Flash), R %d, %d CP collectives (mmax %d); the DSA layers hold %zu of %zu pages\n",
+                rank,m.cp.R,m.cp.colls.ncoll(),m.cp.colls.mmax,held,full);
+    }
+#endif
     auto emb=find("G.embed"),norm=find("G.final_norm"),head=find("G.lm_head.r8.gv"),hscale=find("G.lm_head.scale");
     if(!head.p) head=find("G.lm_head.mx.gv");
     if(!head.p) head=find("G.lm_head.gv");
@@ -114,7 +148,7 @@ inline void prepare_flash(Model& m,int M,cudaStream_t st) {
         if(!y.kda) prepare_dsa_layer(m,i,M,st);
         if(!y.flash_mlp[M].M) {
             if(const char* e=flash_mlp::make(y.flash_mlp_w,M,m.xn2,m.sc.part[1],m.plan,m.flash_mlp_sc,m.sc,y.flash_mlp[M],-1,m.x2)) die(e);
-            y.flash_mlp[M].topk=m.flash_draft ? geom::TOPK : moe_topk_cut(geom::TOPK);   // G6_MOE_TOPK: main model only, the drafter keeps the model's top-k
+            y.flash_mlp[M].topk=m.flash_draft ? geom::TOPK : (int)knob::moe_topk();   // GR8_MOE_TOPK: main model only, the drafter keeps the model's top-k
 #ifdef DEC_SLOT
             const dslot::Slot mlp_slot=make_flash_slot(m,2*i+1);
             y.flash_mlp[M].k1.a.slot=mlp_slot;
@@ -132,7 +166,7 @@ inline void launch_embed_flash(Model& m,int M,cudaStream_t st) {
     flash_mhc::k_mhc_embed<<<M,flash_mhc::THREADS,0,st>>>(mhc_buffers(m),m.tok,m.emb,HID,geom::RMS_EPS_FLASH);
     launch_mhc_input(m,0,false,M,st);
 }
-// G6_PF_XTRACE=1 (prefill measurement only): one record of PX_W u64 per (step % PX_STEPS, collective) in device memory.
+// GR8_GLM53F_PF_XTRACE=1 (prefill measurement only): one record of PX_W u64 per (step % PX_STEPS, collective) in device memory.
 // globaltimer ns: [PX_PROD] producer end (before the put), [PX_PUT] put + doorbell done, [PX_ENTRY] first consumer CTA
 // entry, [PX_WMIN]/[PX_WMAX] first/last consumer CTA past the wait, [PX_END] mHC end; [PX_M] rows, [PX_STEP] step + 1.
 namespace pxt {
@@ -153,7 +187,7 @@ struct MhcFabricBlock {
     int c;
     size_t wait_payload=0;
     const __nv_bfloat16* local_part=nullptr;
-    unsigned long long* pxt=nullptr;      // G6_PF_XTRACE records (prefill), null = off
+    unsigned long long* pxt=nullptr;      // GR8_GLM53F_PF_XTRACE records (prefill), null = off
     const __nv_bfloat16* peer_part=nullptr; // NR == 2 prefill: the peer's partial already copied to device memory
     unsigned long long* xr=nullptr;
     const unsigned short* base[g6nr::NR]={};
@@ -224,7 +258,7 @@ struct MhcFabricStagedBlock : MhcFabricBlock {
     __device__ __forceinline__ void wait(u64 step) {
         MhcFabricBlock::wait(step);
         __shared__ uint4 slots[g6nr::NR][512];
-        const int m=blockIdx.y;
+        const int m=blockIdx.x;
         #pragma unroll
         for(int p=0;p<g6nr::NR;++p) {
             const uint4* src=reinterpret_cast<const uint4*>(base[p]+(size_t)m*4096);
@@ -254,11 +288,8 @@ inline void flash_mark(int fmk,void* p) {
     dmark(dp[fmk],(cudaStream_t)p);
 }
 inline void launch_consume_mhc(Model& m,int c,int M,cudaStream_t st) {
-    static const int mhc_fuse_m1 = getenv("G6_MHC_FUSE_M1") ? atoi(getenv("G6_MHC_FUSE_M1")) : (getenv("G6_MHC_FUSE") ? atoi(getenv("G6_MHC_FUSE")) : 2);
-    static const int mhc_fuse_m4 = getenv("G6_MHC_FUSE_M4") ? atoi(getenv("G6_MHC_FUSE_M4")) : (getenv("G6_MHC_FUSE") ? atoi(getenv("G6_MHC_FUSE")) : 2);
-    const int mhc_fuse = M == 1 ? mhc_fuse_m1 : mhc_fuse_m4;
-    static const bool stage_on = !getenv("G6_DEC_MHC_STAGE") || atoi(getenv("G6_DEC_MHC_STAGE"));
-    const bool stage = stage_on && (M == 1 || M == 4);
+    const int mhc_fuse = (int)(M == 1 ? knob::glm53f_mhc_fuse_m1() : knob::glm53f_mhc_fuse_m4()).value_or(knob::glm53f_mhc_fuse());
+    const bool stage = knob::glm53f_dec_mhc_stage() && (M == 1 || M == 4);
     const size_t payload = (size_t)M*HID*2;
     dmark(DP_OTHER,st);
     if (mhc_fuse == 0)
@@ -270,11 +301,11 @@ inline void launch_consume_mhc(Model& m,int c,int M,cudaStream_t st) {
         if (mhc_fuse == 2 && HID == 4096) {
             dmark(DP_MHC_OI,st);
             if(stage) {
-            flash_mhc::k_mhc_consume_fused<<<dim3(geom::HC_MIX,M),flash_mhc::THREADS,0,st>>>(
+            flash_mhc::k_mhc_consume_fused<<<dim3(M,geom::HC_MIX),flash_mhc::THREADS,0,st>>>(
                 flash_mhc::side(mhc_buffers(m),c&1),MhcFabricStagedBlock{MhcFabricBlock{m.f,m.stepp,c,wp}},m.layers[i].hc[1],HID,geom::RMS_EPS_FLASH,
                 m.x2,m.xn2,m.sc.xf_x2,m.sc.xb_x2);
             } else {
-            flash_mhc::k_mhc_consume_fused<<<dim3(geom::HC_MIX,M),flash_mhc::THREADS,0,st>>>(
+            flash_mhc::k_mhc_consume_fused<<<dim3(M,geom::HC_MIX),flash_mhc::THREADS,0,st>>>(
                 flash_mhc::side(mhc_buffers(m),c&1),MhcFabricBlock{m.f,m.stepp,c,wp},m.layers[i].hc[1],HID,geom::RMS_EPS_FLASH,
                 m.x2,m.xn2,m.sc.xf_x2,m.sc.xb_x2);
             }
@@ -287,11 +318,11 @@ inline void launch_consume_mhc(Model& m,int c,int M,cudaStream_t st) {
         if (mhc_fuse == 2 && HID == 4096) {
             dmark(DP_MHC_OI,st);
             if(stage) {
-            flash_mhc::k_mhc_consume_fused<<<dim3(geom::HC_MIX,M),flash_mhc::THREADS,0,st>>>(
+            flash_mhc::k_mhc_consume_fused<<<dim3(M,geom::HC_MIX),flash_mhc::THREADS,0,st>>>(
                 flash_mhc::side(mhc_buffers(m),c&1),MhcFabricStagedBlock{MhcFabricBlock{m.f,m.stepp,c,wp}},m.layers[i+1].hc[0],HID,geom::RMS_EPS_FLASH,
                 m.x,m.xn,m.sc.xf_x,m.sc.xb_x);
             } else {
-            flash_mhc::k_mhc_consume_fused<<<dim3(geom::HC_MIX,M),flash_mhc::THREADS,0,st>>>(
+            flash_mhc::k_mhc_consume_fused<<<dim3(M,geom::HC_MIX),flash_mhc::THREADS,0,st>>>(
                 flash_mhc::side(mhc_buffers(m),c&1),MhcFabricBlock{m.f,m.stepp,c,wp},m.layers[i+1].hc[0],HID,geom::RMS_EPS_FLASH,
                 m.x,m.xn,m.sc.xf_x,m.sc.xb_x);
             }
@@ -354,7 +385,7 @@ inline void launch_step_flash(Model& m,int M,int context,cudaStream_t st,int par
     EvProf& ep=ev_prof();
     if(part!=1) ep.n=0;
     ep.rec=ep.every>0;
-    if(ep.rec || getenv("G6_DEC_PROF")) { g6_attn_mark=attn_mark; g6_flash_mark=flash_mark; }
+    if(ep.rec || knob::dec_prof()) { g6_attn_mark=attn_mark; g6_flash_mark=flash_mark; }
     if(part!=1) { dmark(DP_OTHER,st); launch_step_in(m,st); launch_embed_flash(m,M,st); if(residual_copy) residual_copy(0,M); dmark(DP_STEP,st); }
     for(int i=part==1?ls:0;i<(part==0?ls:m.nl);++i) {
         if(geom::is_kda(m.layers[i].l)) launch_kda_block(m,i,M,st);
@@ -365,6 +396,7 @@ inline void launch_step_flash(Model& m,int M,int context,cudaStream_t st,int par
         else launch_dense_block(m,i,M,st);
         launch_consume_mhc(m,2*i+1,M,st);
         if(residual_copy) residual_copy(2*i+2,M);
+        if(m.dfl_tap) m.dfl_tap(m,i,M,st);
     }
     if(part!=0) { launch_head_local(m,M,st); launch_head_merge(m,M,st); launch_step_out(m,M,st); dmark(DP_STEP,st); }
     ep.rec=false;

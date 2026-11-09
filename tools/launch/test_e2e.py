@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""End to end: four supervisors on this machine, each `./gr8 glm53 up` with its own G6_HOME and model cache, the
+"""End to end: four supervisors on this machine, each `./gr8 glm53 up` with its own GR8_WORK_DIR and model cache, the
 stub engine (stubs/g6m4, which plays each rank with frontend/tests/fake_s2_engine.py), the real shim and a stub front
-end. The boxes are 127.0.0.1-4 on the LAN and 127.0.1.x / 127.0.2.x on the rails, so it needs
-Linux (every 127/8 address is local there). Every box boots one local fake release in place.
+end. The boxes are 127.0.0.1-4 on the LAN and 127.0.1.x / 127.0.2.x on the rails: Linux answers on all of them, and
+macOS after the aliases in loopback_aliases. Every box boots one local fake release in place.
     python3 -m unittest discover -s tools/launch -p 'test_e2e.py'"""
 import asyncio
 import json
@@ -31,9 +31,13 @@ LAN = [f'127.0.0.{i + 1}' for i in range(TP)]
 
 
 def loopback_aliases():
+    """Whether this box answers on every address the boxes use. Linux answers on all of 127/8. macOS needs an alias
+    for each: for a in 127.0.0.{2,3,4} 127.0.{1,2}.{1,2,3,4}; do sudo ifconfig lo0 alias $a up; done"""
+    addrs = LAN + [f'127.0.{rail}.{r + 1}' for rail in (1, 2) for r in range(TP)]
     try:
-        with socket.socket() as s:
-            s.bind(('127.0.0.2', 0))
+        for a in addrs:
+            with socket.socket() as s:
+                s.bind((a, 0))
         return True
     except OSError:
         return False
@@ -46,6 +50,9 @@ def read(path):
 
 def running(pid):
     """Alive and not a zombie."""
+    if not os.path.isdir('/proc'):           # macOS
+        st = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+        return bool(st) and not st.startswith('Z')
     try:
         with open(f'/proc/{pid}/stat') as f:
             return f.read().rsplit(')', 1)[1].split()[0] != 'Z'
@@ -59,7 +66,7 @@ def free_port():
         return s.getsockname()[1]
 
 
-@unittest.skipUnless(loopback_aliases(), 'needs 127.0.0.2..4 (Linux)')
+@unittest.skipUnless(loopback_aliases(), 'needs 127.0.0.1-4, 127.0.1.1-4 and 127.0.2.1-4 (macOS: see loopback_aliases)')
 class EndToEnd(unittest.TestCase):
     def setUp(self):
         self.t = tempfile.mkdtemp(prefix='gr8e2e-')
@@ -78,8 +85,8 @@ class EndToEnd(unittest.TestCase):
             os.symlink(os.path.join(HERE, 'stubs', 'g6m4'), os.path.join(h, 'bin', 'g6m4'))
             self.homes.append(h)
         self.env = {**os.environ, 'PATH': os.path.join(HERE, 'stubs') + os.pathsep + os.environ['PATH'],
-                    'GR8_REFUSAL_LINGER': '3'}   # three polls' worth
-        for k in ('CAP', 'SESS', 'PEERS', 'G6_CLUSTER'):
+                    'GR8_REFUSAL_LINGER': '3', 'GR8_MODEL': 'glm53'}   # three polls' worth; ./gr8 glm53 sets the model
+        for k in ('CAP', 'SESS', 'PEERS', 'GR8_CLUSTER'):
             self.env.pop(k, None)
 
     def tearDown(self):
@@ -92,12 +99,12 @@ class EndToEnd(unittest.TestCase):
             ['--peers', ','.join(LAN), '--node-ip', LAN[i], '--ips', ','.join(f'127.0.1.{r + 1}' for r in range(TP)),
              '--ips2', ','.join(f'127.0.2.{r + 1}' for r in range(TP))]
         return ['--no-config', '--no-check', *where,
-                '--model', self.rel, '--g6-home', self.homes[i],
+                '--model', self.rel, '--work-dir', self.homes[i],
                 '--control-port', str(self.port), '--port', str(self.api), '--py', sys.executable,
                 '--front-bin', os.path.join(HERE, 'stubs', 'front'), '--join-timeout', '60', '--ready-tmo', '60', *extra]
 
     def gr8(self, i, cmd, *extra, timeout=120, env=None):
-        args = self.argv(i, *extra) if cmd in ('up', 'show-config') else ['--g6-home', self.homes[i], *extra]
+        args = self.argv(i, *extra) if cmd in ('up', 'show-config') else ['--work-dir', self.homes[i], *extra]
         return subprocess.run([sys.executable, os.path.join(HERE, 'launch.py'), cmd, *args], env=env or self.env,
                               capture_output=True, text=True, timeout=timeout)
 
@@ -134,10 +141,12 @@ class EndToEnd(unittest.TestCase):
             self.assertNotIn('--manifest', a)
             self.assertNotIn('--dflash-pack', a)         # no --drafter: MTP only
             self.assertEqual(val('--serve'), os.path.join(self.homes[i], 's2'))
-            self.assertEqual(self.stub(i)['env']['G6_PF_OWN'], '4')
+            self.assertEqual(self.stub(i)['env']['GR8_PF_OWN'], '4')
         # no --default-max-tokens unless DEFAULT_MAX_TOKENS is set: the front end keeps all the room
         front = json.loads(read(os.path.join(self.homes[0], 'out', 'front.json')))
         self.assertIsNone(front['default_max_tokens'])
+        self.assertFalse(front['allow_thinking_off'])   # thinking off stays refused unless ALLOW_THINKING_OFF=1
+        self.assertIsNone(front['undeclared_tool_calls'])   # undeclared calls stay text unless UNDECLARED_TOOL_CALLS=emit
         # a request through the shim: req.<id> lands in the head's directory only (the head engine sends the bytes on)
         self.assertEqual(self.request(), 6)
         self.assertTrue(any(n.startswith('req.') for n in os.listdir(os.path.join(self.homes[0], 's2'))))
@@ -146,6 +155,10 @@ class EndToEnd(unittest.TestCase):
         st = self.gr8(2, 'status')
         self.assertEqual(st.stdout.count(': serving, engine running'), TP, st.stdout)
         self.assertIn('answers (/health 200)', st.stdout)
+        for i in range(TP):     # every rank's readiness probe passes once `up` has returned on it
+            hl = self.gr8(i, 'health', '--port', str(self.api))
+            self.assertEqual(hl.returncode, 0, f'box {i}: {hl.stdout}{hl.stderr}')
+            self.assertTrue(hl.stdout.startswith(f'rank {i}: serving'), hl.stdout)
         lg = self.gr8(1, 'logs', 'supervisor')
         self.assertIn('the head serves', lg.stdout)
         lg = self.gr8(1, 'logs', '0')
@@ -161,15 +174,20 @@ class EndToEnd(unittest.TestCase):
         self.assertIn('this box  rank 1 of 127.0.0.1', sc.stdout)
         dn = self.gr8(3, 'down', timeout=60)
         self.assertIn('rank 0 (127.0.0.1): stopping', dn.stdout)
-        for i in range(TP):
-            pid = int(read(os.path.join(self.homes[i], 'out', 'g6m4.pid')))
-            for _ in range(200):
-                if not running(pid):
-                    break
-                time.sleep(0.1)
-            self.assertFalse(running(pid), f'box {i} engine {pid} runs')
+        for i in range(TP):     # down returns before the supervisors finish stopping, which on macOS takes seconds
+            for name in ('g6m4', 'supervisor'):
+                pid = int(read(os.path.join(self.homes[i], 'out', f'{name}.pid')))
+                for _ in range(200):
+                    if not running(pid):
+                        break
+                    time.sleep(0.1)
+                self.assertFalse(running(pid), f'box {i} {name} {pid} runs')
         st = self.gr8(0, 'status')
         self.assertIn('no supervisor answers', st.stdout)
+        for i in range(TP):     # down: no box is ready, and each says why in its one line
+            hl = self.gr8(i, 'health')
+            self.assertEqual(hl.returncode, 1, f'box {i}: {hl.stdout}{hl.stderr}')
+            self.assertRegex(hl.stdout, r'^rank \d: not serving, no supervisor runs \(last state stopped\)\n$')
 
     def request(self):
         from fake_s2_engine import token_at
@@ -237,6 +255,30 @@ class EndToEnd(unittest.TestCase):
                          (os.path.join(rel, 'experts'), os.path.join(rel, 'index-slices'),
                           os.path.join(rel, 'manifests', 'exlr8-manifest-home.json')))
         self.assertEqual(os.listdir(os.path.join(rel, 'index-slices', 'tp4', 'k3')), ['rank2.safetensors'])
+        self.assertEqual(len({self.stub(i)['argv'][self.stub(i)['argv'].index('--set-id') + 1] for i in range(TP)}), 1)
+        self.assertIn(f'{T.RELEASE}@{T.C1[:12]}', res[0][1])
+
+    def test_boot_through_model_loader(self):
+        """--fetch model-loader: each box's (fake) model-loader holds its rank's pieces; no hub at all."""
+        import fake_model_loader
+        _, env, T = self.release()
+        env = {**env, 'GR8_HF_ENDPOINT': 'http://127.0.0.1:9'}       # nothing answers: gr8 must not fetch itself
+        root = os.path.join(self.t, 'release')
+        stores = [os.path.join(self.homes[i], 'store') for i in range(TP)]
+        for s in stores:
+            ml = fake_model_loader.FakeModelLoader(s, {'glm-exlr8': {'main': (root, T.C1)}})
+            self.addCleanup(ml.close)
+        url = f'https://huggingface.co/{T.RELEASE}'
+        res = self.up_all(extra={i: ['--model', url, '--model-cache', stores[i], '--fetch', 'model-loader']
+                                 for i in range(TP)}, env=env)
+        for i, (rc, out) in enumerate(res):
+            self.assertEqual(rc, 0, f'box {i}:\n{out}')
+        rel = os.path.join(stores[2], 'models', 'glm-exlr8', 'main')
+        a = self.stub(2)['argv']
+        val = lambda f: a[a.index(f) + 1]   # noqa: E731
+        self.assertEqual((val('--v2'), val('--v2-slices'), val('--v2-widths')),
+                         (os.path.join(rel, 'experts'), os.path.join(rel, 'index-slices'),
+                          os.path.join(rel, 'manifests', 'exlr8-manifest-home.json')))
         self.assertEqual(len({self.stub(i)['argv'][self.stub(i)['argv'].index('--set-id') + 1] for i in range(TP)}), 1)
         self.assertIn(f'{T.RELEASE}@{T.C1[:12]}', res[0][1])
 

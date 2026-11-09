@@ -4,6 +4,9 @@ This change provides host-only types, validation and a CPU reference operator. S
 cache integration and GPU kernels do not consume them yet. `load_profile` compares the manifest to a caller-provided
 `ExpectedModel`; verifying that identity against the actual served files belongs to boot integration.
 
+Profiles load from this directory format or natively from GLP (GGUF) control vectors — see
+[STEERING-GLP.md](STEERING-GLP.md) for the GLP input's conformance gates and identity mapping.
+
 A profile is a non-executable directory with exactly the two runtime inputs below. Extra files are ignored.
 
 ```text

@@ -18,7 +18,7 @@ def val(flag, default=None):
 rank = int(val('--rank'))
 os.makedirs('out', exist_ok=True)
 with open('out/stub.json', 'w') as f:
-    json.dump({'argv': argv, 'env': {k: v for k, v in os.environ.items() if k.startswith('G6_')},
+    json.dump({'argv': argv, 'env': {k: v for k, v in os.environ.items() if k.startswith(('GR8_', 'G6_'))},
                'ld': os.environ.get('LD_LIBRARY_PATH'), 'cwd': os.getcwd()}, f)
 d = val('--serve')
 if rank == 0:

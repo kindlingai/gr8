@@ -6,30 +6,41 @@ absolute offset the index gives, so a file that holds only those byte ranges (pl
 same as the full file.
 
 python3 fetch_ranks.py --out DIR --nr 6 --ranks 0,1,2 --widths MANIFEST.json|all|k2,k3 \
-        [--layers all|3-40,78] [--workers 16] [--verify] [--repo REPO] [--revision REV]
+        [--layers all|3-40,78] [--layout FILE] [--workers 16] [--verify] [--repo REPO] [--revision REV]
 
 - The manifests, this TP's index slices for the ranks (index-slices/tp<N>/k<K>/rank<r>.safetensors) and the
   safetensors header of every width file are fetched whole. bin/g6load fetch-plan (engine/loader-rs) works out each
   file's ranges from the slices, so neither numpy nor the layer index files are needed.
-- Progress is kept in DIR/.fetch/<file>.json (done ranges); a rerun skips them.
+- With --layout (bin/g6layout) the ranks fetch the halves the layout gives them, and every rank's index slices at
+  the TP, which list them.
+- Progress is kept in DIR/.fetch/<file>.json (done ranges). A half inside a done range is not fetched again, so a
+  rerun, or a fetch for another TP or layout into the same DIR, takes only the halves DIR does not hold yet. A width
+  file that is missing or has the wrong size loses its journal, so all of its wanted ranges are fetched again.
 - --verify checks the xxhash64 of every wanted half once all are fetched (bin/g6load verify), and fetches the bad ones
   again once.
 - Each file's wanted ranges are allocated in offset order before the parallel fetch writes them, so a rank's halves
   sit on disk in file order. Written in arrival order they scatter, and a loader reading them in order gets about
   3.3 GB/s from a GB10 node's NVMe instead of about 4.1.
 - HF_TOKEN is sent when set (a private repo needs it); the published repo is public.
+- The range GETs reuse kept-alive connections (Hub.send), so a fetch makes about one DNS lookup and TLS handshake
+  per worker, not one per range: a connection a range, with 64 workers, flooded a Kubernetes cluster's DNS and the
+  nodes' conntrack tables (#147).
 
 fetch_layers() is the same fetch as a function: tools/launch (./gr8 glm53 up --model <hf url>) calls it.
 """
 import argparse
+import bisect
+import http.client
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -56,6 +67,9 @@ class Hub:
         self.urls, self.lock = {}, threading.Lock()
         self.noredir = urllib.request.build_opener(NoRedirect)
         self.entries = {}                   # path -> the tree entry (size, oid, lfs), filled by tree()
+        self.idle, self.idle_lock = {}, threading.Lock()   # (scheme, host) -> kept-alive connections not in use
+        self.proxies = urllib.request.getproxies()
+        self.hub_at = urllib.parse.urlsplit(base)[:2]      # (scheme, host[:port]): the only place the token goes
 
     def tree(self):
         out, url = {}, f'{self.base}/api/models/{self.repo}/tree/{self.rev}?recursive=true'
@@ -90,19 +104,55 @@ class Hub:
                 self.urls[path] = loc
             return self.urls[path]
 
+    def send(self, u, h):
+        """(response, body) of a GET of u, on a kept-alive connection to its host that goes back to the pool once the
+        body is read. Through urllib, which opens a connection a request, when a proxy is set for the host."""
+        p = urllib.parse.urlsplit(u)
+        if self.proxies.get(p.scheme) and not urllib.request.proxy_bypass(p.hostname):
+            with urllib.request.urlopen(urllib.request.Request(u, headers=h), timeout=120) as r:
+                return r, r.read()
+        key, target = (p.scheme, p.netloc), p.path + ('?' + p.query if p.query else '')
+        with self.idle_lock:
+            conn = self.idle[key].pop() if self.idle.get(key) else None
+        for fresh in (conn is None, True):
+            if fresh:
+                conn = (http.client.HTTPSConnection if p.scheme == 'https' else http.client.HTTPConnection)(
+                    p.netloc, timeout=120)
+            try:
+                conn.request('GET', target, headers=h)
+                r = conn.getresponse()
+                b = r.read()
+                break
+            except (ConnectionError, ssl.SSLError):
+                conn.close()
+                if fresh:
+                    raise                       # a new connection failed: a real error, get() retries it
+                # else an idle connection the server closed: once more on a new one
+            except BaseException:
+                conn.close()
+                raise
+        if r.will_close:
+            conn.close()
+        else:
+            with self.idle_lock:
+                self.idle.setdefault(key, []).append(conn)
+        return r, b
+
     def get(self, path, lo, n):
         """Bytes [lo, lo + n) of a repo file, with retries."""
         for attempt in range(8):
             try:
                 u = self.url(path, fresh=attempt > 0)
-                h = {'Range': f'bytes={lo}-{lo + n - 1}'}
-                if u.startswith(self.base):
-                    h.update(self.auth())                          # direct hub URL (non-LFS): the token, if any
-                req = urllib.request.Request(u, headers=h)
-                with urllib.request.urlopen(req, timeout=120) as r:
-                    if r.status != 206 and not (lo == 0 and r.status == 200):
-                        raise RuntimeError(f'{path}: HTTP {r.status} for a range')
-                    b = r.read()
+                for _ in range(5):                                 # up to 5 redirects
+                    h = {'Range': f'bytes={lo}-{lo + n - 1}'}
+                    if urllib.parse.urlsplit(u)[:2] == self.hub_at:
+                        h.update(self.auth())                      # direct hub URL (non-LFS): the token, if any
+                    r, b = self.send(u, h)
+                    if r.status not in (301, 302, 303, 307, 308):
+                        break
+                    u = urllib.parse.urljoin(u, r.headers['Location'])
+                if r.status != 206 and not (lo == 0 and r.status == 200):
+                    raise RuntimeError(f'{path}: HTTP {r.status} for a range')
                 if len(b) != n:
                     raise RuntimeError(f'{path} [{lo}, +{n}): got {len(b)} bytes')
                 return b
@@ -147,18 +197,31 @@ class Progress:
             os.replace(tmp, self.p)
 
 
+def drop_stale(out, name, size):
+    """Forget out's journal of width file `name` when the local file is missing or not `size` bytes (deleted or cut
+    by hand): the journal's ranges, the header's too, are not on disk then."""
+    local = os.path.join(out, name)
+    if not (os.path.isfile(local) and os.path.getsize(local) == size):
+        try:
+            os.remove(os.path.join(out, '.fetch', name + '.json'))
+        except FileNotFoundError:
+            pass
+
+
 def fetch_ranges(hub, out, path, size, ranges, workers, on_bytes=None):
     """Write the ranges of repo file `path` into the sparse local file of the same name. Returns bytes fetched.
     on_bytes(n) is called after each range lands."""
     local = os.path.join(out, os.path.basename(path))
+    drop_stale(out, os.path.basename(path), size)
     fd = os.open(local, os.O_RDWR | os.O_CREAT, 0o644)
     if os.fstat(fd).st_size != size:
         os.ftruncate(fd, size)
     prog = Progress(out, os.path.basename(path))
     todo = [r for r in ranges if tuple(r) not in prog.done]
     got = 0
-    for r in sorted(todo):              # blocks in file order (see the module docstring)
-        os.posix_fallocate(fd, r[0], r[1])
+    if hasattr(os, 'posix_fallocate'):  # macOS has none: the file stays sparse there
+        for r in sorted(todo):          # blocks in file order (see the module docstring)
+            os.posix_fallocate(fd, r[0], r[1])
 
     def one(r):
         b = hub.get(path, r[0], r[1])
@@ -190,12 +253,15 @@ def g6load():
                        '--manifest-path engine/loader-rs/Cargo.toml')
 
 
-def g6load_run(cmd, slices, nr, rank, man=None, allk=None, layers=None, v2_dir=None):
-    """g6load's JSON for one rank: fetch-plan, or verify of the halves already in v2_dir."""
+def g6load_run(cmd, slices, nr, rank, man=None, allk=None, layers=None, v2_dir=None, layout=None):
+    """g6load's JSON for one rank: fetch-plan, or verify of the halves already in v2_dir. layout: a layout file, whose
+    halves for the rank replace the formula's."""
     argv = [g6load(), cmd, '--slices', slices, '--tp', str(nr), '--rank', str(rank)]
     argv += ['--manifest', man] if man else ['--widths', ','.join(map(str, allk))]
     if layers:
         argv += ['--layers', ','.join(map(str, layers))]
+    if layout:
+        argv += ['--layout', layout]
     if v2_dir:
         argv += ['--v2', v2_dir]
     r = subprocess.run(argv, capture_output=True, text=True)
@@ -204,21 +270,56 @@ def g6load_run(cmd, slices, nr, rank, man=None, allk=None, layers=None, v2_dir=N
     return json.loads(r.stdout)
 
 
-def plan_files(hub, nr, ranks, slices, man=None, allk=None, layers=None):
+def compact_rank(source, out, slices, nr, rank, manifest, layout=None):
+    """Write this rank's dense expert copies and maps; g6load verifies them through the loader before publishing."""
+    argv = [g6load(), 'compact', '--v2', source, '--out', out, '--slices', slices,
+            '--tp', str(nr), '--rank', str(rank), '--manifest', manifest]
+    if layout:
+        argv += ['--layout', layout]
+    r = subprocess.run(argv, capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(f'g6load compact: {r.stderr.strip() or r.returncode}')
+    return json.loads(r.stdout)
+
+
+def covered(done):
+    """f(a, n): did the done ranges (joined where they touch, as a merged range's pieces do) fetch [a, a + n)?"""
+    runs = []
+    for a, n in sorted(done):
+        if runs and a <= runs[-1][1]:
+            runs[-1][1] = max(runs[-1][1], a + n)
+        else:
+            runs.append([a, a + n])
+    starts = [a for a, _ in runs]
+
+    def f(a, n):
+        i = bisect.bisect_right(starts, a) - 1
+        return i >= 0 and runs[i][1] >= a + n
+    return f
+
+
+def plan_files(hub, nr, ranks, slices, man=None, allk=None, layers=None, layout=None, out=None):
     """[(repo path, size, merged ranges)] of the width files ranks own: each file's safetensors header and the halves
-    g6load fetch-plan names (from the ranks' index slices, at the manifest's widths or every unit at allk)."""
+    g6load fetch-plan names (from the index slices, at the manifest's widths or every unit at allk; with layout, the
+    halves it gives the ranks). out: leave out what out's journal has fetched already."""
     tree = hub.tree()
     where = {os.path.basename(p): p for p in tree}     # layer files live under experts/ on the hub
     want = {}
     for r in ranks:
-        for f in g6load_run('fetch-plan', slices, nr, r, man, allk, layers)['files']:
+        for f in g6load_run('fetch-plan', slices, nr, r, man, allk, layers, layout=layout)['files']:
             want.setdefault(f['name'], []).extend(tuple(x) for x in f['ranges'])
     jobs = []
     for name, rng in sorted(want.items()):
         if name not in where:
             raise RuntimeError(f'{name}: not in {hub.repo}@{hub.rev}')
         hn = int.from_bytes(hub.get(where[name], 0, 8), 'little')
-        jobs.append((where[name], tree[where[name]], merge([(0, 8 + hn)] + rng)))
+        rng = [(0, 8 + hn)] + rng
+        if out:
+            drop_stale(out, name, tree[where[name]])
+            have = covered(Progress(out, name).done)
+            rng = [r for r in rng if not have(*r)]
+        if rng:
+            jobs.append((where[name], tree[where[name]], merge(rng)))
     return jobs
 
 
@@ -231,44 +332,45 @@ def todo_bytes(out, jobs):
     return n
 
 
-def forget(out, jobs, bad):
-    """Drop the journal entries of the ranges that hold a bad half, so the next fetch_ranges takes them again."""
-    for path, _, ranges in jobs:
-        name = os.path.basename(path)
+def forget(out, bad):
+    """Drop the journal entries that hold a bad half, so the next plan takes it again."""
+    for name in {b['file'] for b in bad}:
         hit = [b for b in bad if b['file'] == name]
-        if not hit:
-            continue
         prog = Progress(out, name)
-        for r in ranges:
-            if any(r[0] < b['offset'] + b['nbytes'] and b['offset'] < r[0] + r[1] for b in hit):
-                prog.done.discard(tuple(r))
+        prog.done = {r for r in prog.done
+                     if not any(r[0] < b['offset'] + b['nbytes'] and b['offset'] < r[0] + r[1] for b in hit)}
         with open(prog.p, 'w') as f:
             json.dump(sorted(prog.done), f)
 
 
 def fetch_layers(hub, out, nr, ranks, slices, man=None, allk=None, layers=None, workers=16, verify=False, log=print,
-                 on_bytes=None, plan_only=False):
+                 on_bytes=None, plan_only=False, layout=None):
     """Fetch the expert halves `ranks` own (of nr) into out, as sparse files at their offsets. slices: the index slices
-    directory (tp<N>/k<K>/rank<r>.safetensors) for those ranks. man: a width manifest file, or allk: widths to fetch
-    every unit at. verify checks every half's xxhash64 (g6load verify), fetches the bad ones again once, and raises if
-    one is still bad. Returns the bytes fetched, or with plan_only the bytes still to fetch."""
-    jobs = plan_files(hub, nr, ranks, slices, man, allk, layers)
+    directory (tp<N>/k<K>/rank<r>.safetensors) for those ranks, or for every rank with layout (a layout file: the
+    halves it gives the ranks). man: a width manifest file, or allk: widths to fetch every unit at. Halves out's journal
+    has fetched already are not fetched again. verify checks every half's xxhash64 (g6load verify), fetches the bad
+    ones again once, and raises if one is still bad. Returns the bytes fetched, or with plan_only the bytes still to
+    fetch."""
+    jobs = plan_files(hub, nr, ranks, slices, man, allk, layers, layout, out)
     if plan_only:
         return todo_bytes(out, jobs)
     t0, total = time.time(), 0
     for attempt in range(2):
+        if attempt:
+            jobs = plan_files(hub, nr, ranks, slices, man, allk, layers, layout, out)
         for wp, size, rng in jobs:
             total += fetch_ranges(hub, out, wp, size, rng, workers, on_bytes)
         if not verify:
             break
-        bad = [b for r in ranks for b in g6load_run('verify', slices, nr, r, man, allk, layers, v2_dir=out)['bad']]
+        bad = [b for r in ranks
+               for b in g6load_run('verify', slices, nr, r, man, allk, layers, v2_dir=out, layout=layout)['bad']]
         if not bad:
             log(f'verified the halves of rank{"s" if len(ranks) > 1 else ""} {",".join(map(str, sorted(ranks)))}')
             break
         if attempt:
             raise RuntimeError(f'{len(bad)} halves still fail their xxhash64 after a second fetch, e.g. {bad[0]}')
         log(f'{len(bad)} halves failed their xxhash64: fetching them again')
-        forget(out, jobs, bad)
+        forget(out, bad)
     log(f'DONE {total / 1e9:.1f} GB in {time.time() - t0:.0f} s')
     return total
 
@@ -290,6 +392,7 @@ def main():
     ap.add_argument('--ranks', required=True)
     ap.add_argument('--widths', required=True, help='a v2 manifest file (fetch its widths), all, or e.g. k2,k3')
     ap.add_argument('--layers', default='all')
+    ap.add_argument('--layout', help='a layout file (bin/g6layout): fetch the halves it gives the ranks')
     ap.add_argument('--workers', type=int, default=16)
     ap.add_argument('--verify', action='store_true')
     ap.add_argument('--repo', default=REPO)
@@ -301,7 +404,7 @@ def main():
     tree = hub.tree()
     for p, n in tree.items():                      # manifests and this TP's index slices for the ranks: whole
         m = re.fullmatch(rf'index-slices/tp{a.nr}/k\d/rank(\d+)\.safetensors', p)
-        if p.startswith('manifests/') or (m and int(m.group(1)) in ranks):
+        if p.startswith('manifests/') or (m and (a.layout or int(m.group(1)) in ranks)):
             local = os.path.join(a.out, p if m else os.path.basename(p))
             if not os.path.exists(local) or os.path.getsize(local) != n:
                 os.makedirs(os.path.dirname(local), exist_ok=True)
@@ -311,7 +414,7 @@ def main():
     allk = None if man else [2, 3, 4] if a.widths == 'all' else [int(x.strip('k')) for x in a.widths.split(',')]
     fetch_layers(hub, a.out, a.nr, ranks, os.path.join(a.out, 'index-slices'), man=man, allk=allk,
                  layers=None if a.layers == 'all' else parse_layers(a.layers), workers=a.workers, verify=a.verify,
-                 log=lambda m: print(m, flush=True))
+                 log=lambda m: print(m, flush=True), layout=a.layout)
 
 
 if __name__ == '__main__':

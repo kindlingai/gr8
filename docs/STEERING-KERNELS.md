@@ -37,8 +37,8 @@ shared-memory and branch effects still require performance measurement before an
 ## Direct fixtures
 
 ```bash
-G6_NR=4 EXTRA=-DDEC_S2 TEST=steering_cuda_test scripts/c1_tests.sh <test-bin-dir>
-G6_NR=4 EXTRA=-DDEC_S2 TEST=steering_consume_test scripts/c1_tests.sh <test-bin-dir>
+GR8_NR=4 EXTRA=-DDEC_S2 TEST=steering_cuda_test scripts/c1_tests.sh <test-bin-dir>
+GR8_NR=4 EXTRA=-DDEC_S2 TEST=steering_consume_test scripts/c1_tests.sh <test-bin-dir>
 ```
 
 `steering_cuda_test` retains Jake's helper fixture and adds the near-cancellation regression. It covers

@@ -1,4 +1,4 @@
-// Config::decode_rounds (s2/scheduler.h, Scheduler::alternate; G6_S2_DECODE_ROUNDS): while a prefill waits and sessions
+// Config::decode_rounds (s2/scheduler.h, Scheduler::alternate; GR8_S2_DECODE_ROUNDS): while a prefill waits and sessions
 // decode, K decode rounds run per prefill quantum instead of one. The properties here: the step pattern is exactly K
 // rounds between quanta (one with the knob 0 or 1, as before); pure decode never idles and a lone prefill is never
 // delayed; the notice target (horizon) matches an independent re-derivation at every step and two schedulers driven by
@@ -108,6 +108,27 @@ static void pattern()
     }
 }
 
+// with the knob on, a request that has not started prefilling is not held behind the rounds: chats arriving while
+// another decodes are each prefilled at the next boundary (a burst is admitted at once, not one per K rounds), while a
+// long prompt's later quanta still wait K rounds
+static void fresh_not_held()
+{
+    for (uint32_t K : {2u, 8u, 32u}) {
+        Scheduler s(cfg(K));
+        admit(s, 1, 64, 100000);
+        for (unsigned i = 0; i < 3; ++i) (void)step(s);         // prefill, tail, first round: session 1 decodes
+        for (uint64_t id = 2; id <= 5; ++id) admit(s, id, 200, 100000);
+        unsigned prefills = 0;
+        for (unsigned i = 0; i < 8 && prefills < 4; ++i) {      // each new chat's prefill and tail, no decode rounds between
+            const Quantum q = step(s);
+            CHECK(q.kind != Kind::Decode);
+            prefills += q.kind == Kind::PromptTail;
+        }
+        CHECK(prefills == 4);
+        std::printf("scheduler_rounds_test: K=%u: four new chats admitted with no decode round between them\n", K);
+    }
+}
+
 // pure decode with the knob on never idles; a prefill admitted after many rounds goes at once (the count is past K)
 static void pure_decode_then_prefill()
 {
@@ -183,6 +204,7 @@ int main()
 {
     pattern();
     pure_decode_then_prefill();
+    fresh_not_held();
     randomized_agrees();
     validate_and_agreement();
     if (fails) { std::fprintf(stderr, "scheduler_rounds_test: %d failure(s)\n", fails); return 1; }

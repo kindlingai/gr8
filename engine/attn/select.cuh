@@ -93,7 +93,7 @@ __global__ void sort_selected(Input input,int start,const float* scores,const ui
     #pragma unroll
     for(int j=0;j<ITEMS;j++)a.indices[(int64_t)(start+row)*TOP+t*ITEMS+j]=keys[j]?int(0xffffu-uint32_t(keys[j]&0xffffu)):-1;
 }
-// G6_ATTN_SEL2=<CH> (attn_sel2; decode run_body): the selector's final sort (sort_selected<false> / <true>, sort_selected32)
+// GR8_ATTN_SEL2=<CH> (attn_sel2; decode run_body): the selector's final sort (sort_selected<false> / <true>, sort_selected32)
 // as a rank by count over CH CTAs per row. The nonzero keys of a row are distinct (their low bits hold the token id), so a
 // nonzero key's place in the descending sort is the number of larger keys of the row, and the nonzero keys fill places
 // 0 .. nnz - 1; zero keys (nonfinite / past the context / unfilled) sort below them and all map to -1. Every CTA stages the

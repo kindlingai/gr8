@@ -8,7 +8,15 @@ fn num(v: Option<&Value>) -> f64 {
     v.and_then(Value::as_f64).unwrap_or(0.0)
 }
 
-pub fn render(m: &Value, model_name: &str) -> String {
+/// The front end's own counters, beside the engine's snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Front {
+    /// replies the repeated-tool-call guard resampled, and replies it let through after its last retry
+    pub guard_retries: u64,
+    pub guard_given_up: u64,
+}
+
+pub fn render(m: &Value, model_name: &str, front: Front) -> String {
     let lab = format!("engine=\"0\",model_name=\"{model_name}\"");
     let mut out = String::with_capacity(4096);
     let mut metric = |name: &str, kind: &str, help: &str, samples: &[(String, f64)]| {
@@ -33,6 +41,18 @@ pub fn render(m: &Value, model_name: &str) -> String {
         "gauge",
         "Number of requests waiting to be processed.",
         &one(rq.get("waiting")),
+    );
+    metric(
+        "gr8:tool_repeat_retries_total",
+        "counter",
+        "Replies the repeated-tool-call guard took back and resampled.",
+        &[(String::new(), front.guard_retries as f64)],
+    );
+    metric(
+        "gr8:tool_repeat_given_up_total",
+        "counter",
+        "Repeated tool calls the guard sent after its last retry.",
+        &[(String::new(), front.guard_given_up as f64)],
     );
     // measured prefix-cache counters only: an engine that does not report them leaves the series out (not a 0)
     for (key, name, help) in [
@@ -86,7 +106,11 @@ pub fn render(m: &Value, model_name: &str) -> String {
         for (key, name, help) in [
             ("size_tokens", "vllm:kv_cache_size_tokens", "KV cache pool capacity, in tokens."),
             ("active_tokens", "vllm:kv_active_tokens", "KV cache tokens held by running requests (page-rounded)."),
-            ("reserved_tokens", "g6:s2_reserved_tokens", "KV cache tokens reserved for running requests, including unfilled room."),
+            (
+                "reserved_tokens",
+                "g6:s2_reserved_tokens",
+                "KV cache tokens reserved for running requests, including unfilled room.",
+            ),
         ] {
             if let Some(value) = kv.get(key).and_then(Value::as_f64) {
                 metric(name, "gauge", help, &[(String::new(), value)]);
@@ -205,7 +229,12 @@ pub fn render(m: &Value, model_name: &str) -> String {
         let has = |key: &str| stores.first().is_some_and(|t| t.get(key).is_some());
         for key in KV_STORE_GAUGES {
             if has(key) {
-                metric(&format!("g6:kv_store_{key}"), "gauge", &format!("KV store {}.", key.replace('_', " ")), &per(key));
+                metric(
+                    &format!("g6:kv_store_{key}"),
+                    "gauge",
+                    &format!("KV store {}.", key.replace('_', " ")),
+                    &per(key),
+                );
             }
         }
         for key in KV_STORE_COUNTERS {
@@ -238,8 +267,11 @@ const KV_STORE_COUNTERS: [&str; 10] = [
 
 #[cfg(test)]
 mod tests {
-    use super::render;
     use serde_json::json;
+
+    fn render(m: &serde_json::Value, model_name: &str) -> String {
+        super::render(m, model_name, super::Front { guard_retries: 3, guard_given_up: 1 })
+    }
 
     fn base() -> serde_json::Value {
         json!({"spec": {"drafts": 0, "draft_tokens": 0, "accepted": 0, "accepted_per_pos": []},
@@ -249,6 +281,13 @@ mod tests {
     }
 
     const LAB: &str = "engine=\"0\",model_name=\"test-model\"";
+
+    #[test]
+    fn the_guard_counters_are_rendered() {
+        let t = render(&base(), "test-model");
+        assert!(t.contains(&format!("gr8:tool_repeat_retries_total{{{LAB}}} 3.0\n")));
+        assert!(t.contains(&format!("gr8:tool_repeat_given_up_total{{{LAB}}} 1.0\n")));
+    }
 
     #[test]
     fn legacy_snapshot_has_no_new_metrics() {

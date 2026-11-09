@@ -25,6 +25,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <cuda_bf16.h>
 #include "../bind.cuh"
 #include "../../h2d.h"
 #include "../../loader/devimage.h"

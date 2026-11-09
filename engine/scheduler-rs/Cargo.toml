@@ -1,0 +1,11 @@
+[package]
+name = "g6sched"
+version = "0.1.0"
+edition = "2021"
+description = "gr8's host-side S2 scheduling logic in Rust (docs/HOST-CORE.md, R2), called from C++ through g6sched.h"
+
+[lib]
+crate-type = ["rlib"]        # the C library is libg6host.a (engine/hostcore-rs)
+
+[dependencies]
+g6kvman = { path = "../kvman-rs" }   # the driver calls the pool Rust to Rust

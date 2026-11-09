@@ -1,6 +1,6 @@
 # What is GLM 5.3-specific, and what is not
 
-gr8 was written for one model, GLM 5.3 (full), on GB10 boxes: three, four or six ranks. Nothing here is a plug-in model
+gr8 was written for one model, GLM 5.3 (full), on GB10 boxes: three to six ranks. Nothing here is a plug-in model
 interface. This page is a map for porting: it lists every place the model is baked in, roughly in the order you would
 meet them. It also lists the parts that do not depend on the model.
 
@@ -13,8 +13,9 @@ the full-index layers; vocab 154,880.
 
 | layer | where | what is fixed |
 |---|---|---|
-| weight format | `engine/kernels/tr3.cuh`, `tr3_gemm.cuh`, `tr3_wide.cuh` | routed experts are EXL3 trellis codes (3.25 bpw, Hadamard-128 rotations, K3/K4 per-expert bit widths), decoded inside the expert kernels. Two encodes with one layout: TR3, and exlr8-e4m3, whose codebook values are rounded to FP8 E4M3 (decode rounds them too, chosen per layer from the pack manifest) |
-| | `engine/kernels/dtr.cuh`, `densev.cuh`, `gemm_x.cuh`, `rowtile.cuh` | dense weights as the exlr8 release stores them: trellis q_b, o_proj and the MLP of layers 0-2 (decoded in `dtr.cuh`), int4 g32 and MXFP8 records for the rest, lm_head in MXFP8 |
+| weight format | `engine/kernels/tr3.cuh`, `tr3_gemm.cuh`, `tr3_wide.cuh` | routed experts are EXL3 trellis codes (3.25 bpw, Hadamard-128 rotations, K3/K4 per-expert bit widths), decoded inside the expert kernels. Two encodes with one layout: TR3, and exlr8-e4m3, whose codebook values are rounded to FP8 E4M3 (decode rounds them too, chosen per layer from the pack manifest). exlr8-e4m3 layers use one of three codebooks, also per layer: mcg (the default, and TR3's), mul1 (byte sum of the product, one fp16 fma) and pmcgx (a pair trellis: one 20-bit state per two weights). The width files name it (`trellis.gate.mul1`; mcg keeps `trellis.gate`) and the manifest's expert_format carries it (`exlr8-e4m3`, `exlr8-e4m3-mul1`, `exlr8-e4m3-pmcgx`; `engine/loader-rs/src/codebook.rs`). mul1 and pmcgx run on exlr8 v2 layers with the trellis shared expert |
+| | `engine/loader-rs/src/codebook.rs`, `v2plan.rs` | the codebook of each layer, read from its width files' headers (tensor names and metadata) and checked against the halves the index slices place; any other codebook stops the boot |
+| | `engine/kernels/dtr.cuh`, `densev.cuh`, `gemm_x.cuh`, `rowtile.cuh` | dense weights as the exlr8 release stores them: trellis q_b, o_proj and the MLP of layers 0-2 (decoded in `dtr.cuh`, mcg only: a dense file in another codebook is refused), int4 g32 and MXFP8 records for the rest, lm_head in MXFP8 |
 | loader | `engine/loader-rs/src/release.rs`, `records.rs` | the release's file names and forms, and how each rank's image is planned from them |
 | rank map | `tools/convert/plan.py` | `H = 6144`, 78 + 1 layers, 256 experts, the rank map: TP6 head groups `(11,11,11,11,10,10)`, expert 128-column blocks `(3,3,3,3,2,2)`, vocab tiles, rotated per layer (TP4: 16 heads, 4 blocks, dense 3072 channels, vocab tiles `(303,303,302,302)`) |
 | | `engine/ref/g6ref.py` | record layouts the kernels read (rt_record, GEMV records) |
@@ -24,19 +25,19 @@ the full-index layers; vocab 154,880.
 | attention | `engine/attn/` | MLA latent attention (kv_a 576 = 512 + 64 rope, UK/UV absorb), the DSA-style sparse indexer and its exact top-2048 selector (`select.cuh`), value head dim 256 in decode (`decode-small.cuh`) |
 | | `engine/runtime/rank.cuh` | `QA = 2048`, `KVA = 576`, `IDXQ = 4096`, `IDXK = 128`, `IDXW = 32`; the layer sequence (dense / MoE / MTP) |
 | | `engine/runtime/qo_weights.cuh`, `attn/prefill-qo-*` | full-head QO attention shapes |
-| drafter | `engine/runtime/dflash.cuh`, `engine/loader-rs/src/dflash2.rs` | the GLM 5.3 DFlash2 drafter: 6 layers, 64 q / 8 KV heads of 128, MLP 12288, block 8, window 2048, two-tap grouped convs (group 16), target layers 5..75 (from the pack), selector rank 256 / top 16; TP must divide the 8 KV heads |
+| drafter | `engine/runtime/dflash.cuh`, `engine/loader-rs/src/dflash2.rs`, `engine/model_geom.h` | the DFlash2 drafter: layers, tapped target layers and q heads per model (`DFL_L`, `DFL_NT`, `DFL_NH`: GLM 5.3 6, 6, 64; Flash 5, 5, 32; the converter's `Dims`); both have 8 KV heads of 128, MLP 12288, block 8, window 2048, two-tap grouped convs (group 16), selector rank 256 / top 16; target layers and rope theta from the pack; TP must divide the 8 KV heads |
 | front end | `frontend/g6s2shim.py` | `EOS_IDS = [154820, 154827, 154829]`, `VOCAB = 154880` |
 | | `frontend/g6front-rs/src/{parser,template,tok}.rs` | GLM's `<think>` reasoning and `<tool_call>NAME<arg_key>..</arg_key><arg_value>..</arg_value></tool_call>` format, and it reads `chat_template.jinja` / `tokenizer.json` from `--model-dir`, so those follow the model directory |
 
 ## Topology-specific (TP6, TP4, TP3)
 
-- `engine/g6nr.h`: the rank count `G6_NR`. Default 6; `-DG6_NR=4` builds TP4. `scripts/build.sh` compiles the engine
+- `engine/g6nr.h`: the rank count `GR8_NR`. Default 6; `-DG6_NR=4` builds TP4. `scripts/build.sh` compiles the engine
   once per width into one binary (`engine/runtime/build_m4.sh`). Every
   per-rank width the engine uses (heads, expert blocks, dense channels, vocab slice, scratch sizes) comes from it;
   the NR=6 values equal the old TP6 literals, so the TP6 build is SASS-identical. The engine also compiles for other
   divisors of 64; 6, 4 and 3 have been run.
 - `tools/convert/plan.py`: `set_nr(n)` picks the widths; they split n units the way `g6nr.h` does (larger chunks first).
-- `G6_PF_OWN=4` (`engine/runtime/qp.cuh`, `qp_wire.h`, the pair code in `qo_weights.cuh`):
+- `GR8_PF_OWN=4` (`engine/runtime/qp.cuh`, `qp_wire.h`, the pair code in `qo_weights.cuh`):
   TP4 only. It assumes four ranks in two head pairs of 16 heads each (64 heads, head group of rank m in layer l =
   (m - l) mod 4) and the q_b / o_proj / kv_b shapes of GLM 5.3.
 - `tools/launch/options.py` and `scripts/engine_args.sh`: the per-TP defaults (the KV pool, the prefill attention

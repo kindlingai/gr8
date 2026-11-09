@@ -4,6 +4,7 @@
 #include "../g6nr.h"
 #include "../g6mx.h"
 #include "../h2d.h"
+#include "../knobs-rs/gr8_knobs.h"
 #include "kvfmt.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -18,7 +19,7 @@
 #include <limits.h>
 #include <algorithm>
 #include <cmath>
-// profile hook (g6m4 G6_DEC_EVPROF / G6_DEC_PROF): called between the decode attention kernels with the stage just ended
+// profile hook (g6m4 GR8_DEC_EVPROF / GR8_DEC_PROF): called between the decode attention kernels with the stage just ended
 extern "C" { void (*g6_attn_mark)(int stage,void* stream)=nullptr; }
 #define AMARK(k) do{if(g6_attn_mark)g6_attn_mark((k),(void*)stream);}while(0)
 namespace ga {
@@ -254,7 +255,7 @@ __device__ float latent(const uint8_t* v,int d){return e4(v[d])*((const float*)(
 #endif
 
 // The bodies of append_kv / append_index / prep_index / reuse take their row (and head, thread, shared slot) as arguments so
-// attn_front (G6_ATTN_FRONT) can run them in one launch; the kernels below call them with the launch indices.
+// attn_front (GR8_ATTN_FRONT) can run them in one launch; the kernels below call them with the launch indices.
 template<class Input>
 __device__ __forceinline__ void append_kv_row(Input input,int row){
     auto a=resolve(input);if(!a.active)return;
@@ -328,7 +329,7 @@ __device__ __forceinline__ void prep_index_row(Input input,int start,half* q,flo
 template<class Input>
 __global__ void prep_index(Input input,int start,half* q,float* w){prep_index_row<1>(input,start,q,w,blockIdx.x,blockIdx.y,threadIdx.x,0);}
 // Four warps: two 16-head tiles x two 16-key tiles; no approximate candidate reduction.
-// VEC=1 (G6_IDX_VEC=1): when page_size >= 32 and the tile is this CP rank's, the tile's
+// VEC=1 (GR8_IDX_VEC=1): when page_size >= 32 and the tile is this CP rank's, the tile's
 // 32 keys are one contiguous 4 KB run of one page -> 16 B vector loads + fp8x2 -> half2 (index_scores_m's load). Same fp16
 // key values (every e4m3 value is exact in fp16), same scales, same arithmetic below -> scores/ids/selection bit-identical (diff 0 every row). Otherwise (VEC=0, small pages, foreign tile) the scalar byte loop, unchanged.
 template<int VEC=0,class Input>
@@ -380,7 +381,19 @@ __device__ __forceinline__ void reuse_row(Input input,int start,int row){
 }
 template<class Input>
 __global__ void reuse(Input input,int start){reuse_row(input,start,blockIdx.x);}
-// G6_ATTN_FRONT=1 (attn_front_on; g6_attn_replay_run with one query tile): the step's front kernels in one launch of
+// GR8_ATTN_POSIDX (use_posidx, E1): a full-index call whose capacity is <= TOP selects every key with a finite indexer
+// score, i.e. every key at a position <= the row's own, so the indexer only sets the slots' order (the fp32 order of
+// normalize and context). The positional index lists the row's keys in position order instead: slot j = key j for
+// j <= the row's position, -1 after (the selector's padding). No indexer query, scores or selection.
+template<class Input>
+__device__ __forceinline__ void pos_index_row(Input input,int start,int row){
+    auto a=resolve(input);if(!a.active)return;const int r=start+row;FOR_ROW(a,input,r);
+    const int p=min(a.positions[r],a.live_context-1);
+    for(int j=threadIdx.x;j<TOP;j+=blockDim.x)a.indices[(int64_t)r*TOP+j]=j<=p?j:-1;
+}
+template<class Input>
+__global__ void pos_index(Input input,int start){pos_index_row(input,start,blockIdx.x);}
+// GR8_ATTN_FRONT=1 (attn_front_on; g6_attn_replay_run with one query tile): the step's front kernels in one launch of
 // 256-thread blocks: [0, n) append_kv rows; then a full-index layer's append_index rows, one per block, the row run twice
 // (threads 0-127 and 128-255, each on its own shared slot: the same bytes stored twice, the same error bits), and its
 // prep_index rows two heads per block (threads 0-127 head 2y, 128-255 head 2y + 1); or a shared layer's reuse rows. Each
@@ -394,6 +407,15 @@ __global__ void __launch_bounds__(256) attn_front(Input input,int n,half* iq,flo
     if(!iq){reuse_row(input,0,b-n);return;}
     if(b<2*n){append_index_row<2>(input,b-n,t&127,t>>7);return;}
     const int k=b-2*n;prep_index_row<2>(input,0,iq,iw,k/16,2*(k%16)+(t>>7),t&127,t>>7);
+}
+// GR8_ATTN_POSIDX (use_posidx) on a full-index layer: attn_front with its prep_index rows replaced by the pos_index rows,
+// one per block (they write only the indices). grid n * 3, block 256.
+template<class Input>
+__global__ void __launch_bounds__(256) attn_front_pos(Input input,int n){
+    const int b=blockIdx.x,t=threadIdx.x;
+    if(b<n){append_kv_row(input,b);return;}
+    if(b<2*n){append_index_row<2>(input,b-n,t&127,t>>7);return;}
+    pos_index_row(input,0,b-2*n);
 }
 template<bool F8=false,class Input>
 __global__ void absorb(Input input,int start,float* q,float* rope){
@@ -459,10 +481,11 @@ __global__ void context_parts(Input input,int start,const float* probs,float* pa
 #endif
     float* dst=parts+(((int64_t)row*a.heads+h)*PART+part)*512;dst[t]=lo;dst[t+256]=hi;
 }
-template<class Input>
+// P = TOP/SP partials (GR8_ATTN_CTX3_SP, run_body: 16 or 32), summed in partition order
+template<class Input,int P=PART>
 __global__ void merge_parts(Input input,const float* parts,float* out){
     auto a=resolve(input);if(!a.active)return;
-    int rowhead=blockIdx.x,t=threadIdx.x;for(int d=t;d<512;d+=256){float s=0;for(int part=0;part<PART;part++)s+=parts[((int64_t)rowhead*PART+part)*512+d];out[(int64_t)rowhead*512+d]=s;}
+    int rowhead=blockIdx.x,t=threadIdx.x;for(int d=t;d<512;d+=256){float s=0;for(int part=0;part<P;part++)s+=parts[((int64_t)rowhead*P+part)*512+d];out[(int64_t)rowhead*512+d]=s;}
 }
 template<bool F8=false,class Input>
 __global__ void value_project(Input input,int start,const float* context){
@@ -519,10 +542,10 @@ __global__ void value_project_m(Input input,int start,int n,const float* context
 // a chunk of <= AVP_ROWS q_b rows is staged with 16 B loads, each half converted by __half2float (= hfloat; absorb_m's
 // loop was one 2 B load and store per round trip); per row each of the R sums is absorb_m's: the same fmaf chain over
 // k = lane + 32m, m = 0..5, from 0, the same warp_sum, lane 0 stores. Rope: the last block column (no weights), warp w
-// rows w, w + 8, ..: absorb_m's formula and stores (absorb_m ran every row in block 0). QT (G6_ATTN_QT, attn_qt): q and
+// rows w, w + 8, ..: absorb_m's formula and stores (absorb_m ran every row in block 0). QT (GR8_ATTN_QT, attn_qt): q and
 // rope stored lane-transposed for scores_sc<S,TR,true> (decode-small.cuh): q of (row, head) at float (c*32 + l)*4 + e
 // for d = l + 32(4c + e), rope at l*2 + k for j = l + 32k; the same values. Needs q_b 16 B aligned (dispatch).
-// Launched with R = 1, QT = true only (launch_absorb_m2, under G6_ATTN_QT).
+// Launched with R = 1, QT = true only (launch_absorb_m2, under GR8_ATTN_QT).
 // grid (64/R + 1, heads), block 256; registers capped for one wave (R <= 4: 6 blocks / SM, 64/R + 1 blocks per head; R = 8: 3).
 template<int R,bool QT,bool F8=false,class Input>
 __global__ void __launch_bounds__(256,R==8?3:6) absorb_m2(Input input,int start,int n,float* q,float* rope){
@@ -561,7 +584,7 @@ __global__ void __launch_bounds__(256,R==8?3:6) absorb_m2(Input input,int start,
                 #pragma unroll
                 for(int i=0;i<R;i++){const int d=d0+8*i;if(QT)o[((d>>7)*32+(d&31))*4+((d>>5)&3)]=s[i];else o[d]=s[i];}}}}
 }
-// G6_AVP1=1 (default off; tp3-avp-onelaunch): one launch for any n, weights in registers, rows staged AVP_STAGE at a time.
+// GR8_AVP1=1 (default off; tp3-avp-onelaunch): one launch for any n, weights in registers, rows staged AVP_STAGE at a time.
 constexpr int AVP_STAGE=8;
 template<bool F8=false,class Input>
 __global__ void absorb_m1(Input input,int start,int n,float* q,float* rope){
@@ -620,45 +643,61 @@ __global__ void value_project_m1(Input input,int start,int n,const float* contex
     }
 }
 // Host-side, read once (first decode call precedes graph capture). Tests may assign it.
-static int& avp1_on(){static int v=[]{const char* e=getenv("G6_AVP1");return e&&atoi(e)?1:0;}();return v;}
-// G6_ATTN_CTX2 (default 0 = off; decode-small.cuh): replaces context_parts_heads on its own calls. 1 / 2 = context_parts_heads
+static int& avp1_on(){static int v=knob::avp1();return v;}
+// GR8_ATTN_CTX2 (default 0 = off; decode-small.cuh): replaces context_parts_heads on its own calls. 1 / 2 = context_parts_heads
 // with 32 / 64 gathered pairs per batch, 3 / 4 = context_pk with 16 / 32 (two batches in flight): bit-identical parts.
 // FP8 KV only. Host-side, read once (before graph capture); tests may assign it.
 static int& attn_ctx2(){static int v=[]{
 #if G6_KV4
     return 0;
 #else
-    const char* e=getenv("G6_ATTN_CTX2");const int x=e?atoi(e):0;return x>=1&&x<=4?x:0;
+    return int(knob::attn_ctx2());
 #endif
     }();return v;}
-// G6_ATTN_CTX3 (default 0 = off; decode-small.cuh context_pk3): replaces context_parts_heads / G6_ATTN_CTX2 on their calls.
-// 1 / 2 = PB 16 / 32 gathered pairs per batch over D = 256 dims per CTA, 3 / 4 = the same over D = 512. G6_ATTN_CTX3_HG =
+// GR8_ATTN_CTX3 (default 0 = off; decode-small.cuh context_pk3): replaces context_parts_heads / GR8_ATTN_CTX2 on their calls.
+// 1 / 2 = PB 16 / 32 gathered pairs per batch over D = 256 dims per CTA, 3 / 4 = the same over D = 512. GR8_ATTN_CTX3_HG =
 // 2 / 4 / 8 forces the head group (default: 4 up to 4 rows, then 8, as context_parts_heads). Bit-identical parts. FP8 KV only.
-// G6_ATTN_SEL2=<CH> (8 / 16 / 32 / 64, default 0 = off; select.cuh rank_selected): the decode selector's final sort as a
-// rank by count over CH CTAs per row. G6_IDX_GRP=<G> (1..64, default 0 = off; idx31.cuh index_scores_g): the decode
+// GR8_ATTN_SEL2=<CH> (8 / 16 / 32 / 64, default 0 = off; select.cuh rank_selected): the decode selector's final sort as a
+// rank by count over CH CTAs per row. GR8_IDX_GRP=<G> (1..64, default 0 = off; idx31.cuh index_scores_g): the decode
 // per-row indexer reads each key tile once for up to G rows of one session. Both bit-identical, decode run_body only.
 // Host-side, read once (before graph capture); tests may assign them.
 static int& attn_ctx3(){static int v=[]{
 #if G6_KV4
     return 0;
 #else
-    const char* e=getenv("G6_ATTN_CTX3");const int x=e?atoi(e):0;return x>=1&&x<=4?x:0;
+    return int(knob::attn_ctx3());
 #endif
     }();return v;}
-static int& attn_ctx3_hg(){static int v=[]{const char* e=getenv("G6_ATTN_CTX3_HG");const int x=e?atoi(e):0;return x==2||x==4||x==8?x:0;}();return v;}
-static int& attn_sel2(){static int v=[]{const char* e=getenv("G6_ATTN_SEL2");const int x=e?atoi(e):0;return x==8||x==16||x==32||x==64?x:0;}();return v;}
-static int& attn_idx_grp(){static int v=[]{const char* e=getenv("G6_IDX_GRP");const int x=e?atoi(e):0;return x>=1&&x<=64?x:0;}();return v;}
+static int& attn_ctx3_hg(){static int v=int(knob::attn_ctx3_hg());return v;}
+static int& attn_sel2(){static int v=int(knob::attn_sel2());return v;}
+static int& attn_idx_grp(){static int v=int(knob::idx_grp());return v;}
 // Round 3 (default 0 = off, bit-identical, host-side, read once before graph capture; tests may assign them):
-// G6_ATTN_QT=1 (run_body, use_qt: absorb_m2 above stores q / rope lane-transposed and scores_sc reads them with 16 B loads;
-// FP8 KV only), G6_ATTN_FRONT=1 (g6_attn_replay_run: attn_front).
+// GR8_ATTN_QT=1 (run_body, use_qt: absorb_m2 above stores q / rope lane-transposed and scores_sc reads them with 16 B loads;
+// FP8 KV only), GR8_ATTN_FRONT=1 (g6_attn_replay_run: attn_front).
 static int& attn_qt(){static int v=[]{
 #if G6_KV4
     return 0;
 #else
-    const char* e=getenv("G6_ATTN_QT");return e&&atoi(e)==1?1:0;
+    return knob::attn_qt()?1:0;
 #endif
     }();return v;}
-static int& attn_front_on(){static int v=[]{const char* e=getenv("G6_ATTN_FRONT");return e&&atoi(e)==1?1:0;}();return v;}
+static int& attn_front_on(){static int v=knob::attn_front();return v;}
+// Round 10 (E1: deterministic fp-order changes, default 0 = off; host-side, read once, before the bindings size their
+// scratch and before graph capture; in the S2 runtime signature, g6m4; tests may assign them, before sizing the scratch):
+// GR8_ATTN_CTX3_SP=64 / 128 (decode-small.cuh ctx_sp): run_body's context_pk3 calls over partitions of 64 / 128 slots (32 /
+// 16 partials, merge_parts over them in order) instead of 256 (8): 4x / 2x the CTAs, each a 4x / 2x shorter slot chain.
+// FP8 KV only. GR8_ATTN_POSIDX=1 (use_posidx): a full-index call of capacity <= TOP (the decode buckets up to 2048) takes
+// the positional index (pos_index) instead of prep_index + index_scores + the selector; larger capacities, shared layers
+// and the CP entry points are unchanged.
+static int& attn_ctx3_sp(){static int v=[]{
+#if G6_KV4
+    return 0;
+#else
+    return int(knob::attn_ctx3_sp());
+#endif
+    }();return v;}
+static int& attn_posidx(){static int v=knob::attn_posidx();return v;}
+static bool use_posidx(const G6Attn& a){return attn_posidx()&&!a.reuse_indices&&a.context<=TOP;}
 static bool al16(const void* p){return ((uintptr_t)p&15)==0;}
 struct Work {
     float *q,*rope,*weights,*si,*so,*prob,*parts,*context;
@@ -672,7 +711,7 @@ static Work workspace(const G6Attn& a,void* base){
     w.si=(float*)alloc(R*T*4);w.so=(float*)alloc(R*T*4);w.ii=(int*)alloc(R*T*4);w.io=(int*)alloc(R*T*4);w.offsets=(int*)alloc((R+1)*4);
     w.selected=(uint64_t*)alloc(R*TOP*8);w.selection=(SelectionState*)alloc(R*sizeof(SelectionState));
     w.histogram=(int*)alloc(R*((std::min(T,size_t(32768))+RADIX_CHUNK-1)/RADIX_CHUNK)*256*4);
-    w.prob=(float*)alloc(R*H*TOP*4);w.parts=(float*)alloc(R*H*PART*512*4);w.context=(float*)alloc(R*H*512*4);
+    w.prob=(float*)alloc(R*H*TOP*4);w.parts=(float*)alloc(R*H*(attn_ctx3_sp()?TOP/attn_ctx3_sp():PART)*512*4);w.context=(float*)alloc(R*H*512*4);
     size_t b=0;cudaError_t e=cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr,b,w.si,w.so,w.ii,w.io,(int)(R*T),(int)R,w.offsets,w.offsets+1);
     if(e!=cudaSuccess)return Work{};
     // The last query tile can contain one row even when the workspace has R>1.
@@ -703,7 +742,7 @@ static void threshold_compact32(const G6Attn& a,Input input,Work& w,int count,cu
 }
 #endif
 static void threshold_compact(const G6Attn& a,Work& w,int count,cudaStream_t stream){threshold_compact(a,a,w,count,stream);}
-// rank = G6_ATTN_SEL2 (attn_sel2, decode run_body): rank_selected<MODE> with rank CTAs per row in place of the sort
+// rank = GR8_ATTN_SEL2 (attn_sel2, decode run_body): rank_selected<MODE> with rank CTAs per row in place of the sort
 template<int MODE,class Input>
 static void launch_rank_selected(int rank,Input input,int start,const float* scores,const uint64_t* selected,int count,cudaStream_t st){
     switch(rank){
@@ -791,7 +830,7 @@ static void launch_absorb_m(const G6Attn& a,Input input,Work& w,int start,int n,
 template<class Input>
 static void launch_value_project_m(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
     if(a.uvs)value_project_m<true><<<dim3(32,a.heads),256,0,st>>>(input,start,n,w.context);else value_project_m<<<dim3(32,a.heads),256,0,st>>>(input,start,n,w.context);}
-template<class Input>   // G6_ATTN_QT (tests call it regardless of the build flag); q_b 16 B aligned
+template<class Input>   // GR8_ATTN_QT (tests call it regardless of the build flag); q_b 16 B aligned
 static void launch_absorb_m2(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
     if(a.uks)absorb_m2<1,true,true><<<dim3(64+1,a.heads),256,0,st>>>(input,start,n,w.q,w.rope);
     else absorb_m2<1,true><<<dim3(64+1,a.heads),256,0,st>>>(input,start,n,w.q,w.rope);
@@ -819,12 +858,12 @@ static void launch_absorb_m1(const G6Attn& a,Input input,Work& w,int start,int n
 template<class Input>
 static void launch_value_project_m1(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
     if(a.uvs)value_project_m1<true><<<dim3(32,a.heads),256,0,st>>>(input,start,n,w.context);else value_project_m1<<<dim3(32,a.heads),256,0,st>>>(input,start,n,w.context);}
-// G6_ATTN_QT (attn_qt): run_body's absorb stores q / rope lane-transposed exactly when its scores launch reads them so:
-// launch_mla_scores' scores_sc branch with S = 2 / 4 (no FLIP, no P11), absorb_m2 (DEC_AVP without G6_AVP1), q_b, the
+// GR8_ATTN_QT (attn_qt): run_body's absorb stores q / rope lane-transposed exactly when its scores launch reads them so:
+// launch_mla_scores' scores_sc branch with S = 2 / 4 (no FLIP, no P11), absorb_m2 (DEC_AVP without GR8_AVP1), q_b, the
 // scratch q / rope and the KV rows 16 B aligned. The CP paths never pass qt.
 static bool use_qt(const G6Attn& a,const Work& w,int n){
 #if defined(DEC_AVP) && DEC_AVP
-    return attn_qt()&&!avp1_on()&&!use_attn_flip(a,n)&&attn_heads()&&!attn_p11()&&(attn_sc2()==2||attn_sc2()==4)&&a.heads%16==0&&
+    return attn_qt()&&!avp1_on()&&!use_attn_flip(a,n)&&attn_heads()&&!attn_p11()&&(attn_sc2()==2||attn_sc2()==4)&&sc2_heads_ok(a)&&
         al16(a.q_b)&&al16(w.q)&&al16(w.rope)&&al16(a.mla_cache);
 #else
     (void)a;(void)w;(void)n;return false;
@@ -833,9 +872,10 @@ static bool use_qt(const G6Attn& a,const Work& w,int n){
 // front: attn_front already ran the first query tile's reuse / prep_index (g6_attn_replay_run, rows <= query_tile)
 template<class Input>
 static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t stream,bool front=false){
-    cudaError_t e;
+    cudaError_t e;const bool pos=use_posidx(a);
     for(int start=0;start<a.rows;start+=a.query_tile){int n=std::min(a.rows-start,a.query_tile);const bool fr=front&&start==0;
         if(a.reuse_indices){AMARK(1);if(!fr)ga::reuse<<<n,256,0,stream>>>(input,start);}
+        else if(pos){if(!fr)ga::pos_index<<<n,256,0,stream>>>(input,start);AMARK(1);}
         else{if(!fr)prep_index<<<dim3(n,32),128,0,stream>>>(input,start,w.iq,w.weights);
             if(attn_idx_grp()&&!idx_keys_shared(a,n))launch_index_scores_g(a,input,w,start,n,attn_idx_grp(),stream);
             else LAUNCH_INDEX_SCORES(a,input,w,start,n,stream);
@@ -853,9 +893,12 @@ static cudaError_t run_body(const G6Attn& a,Input input,Work& w,cudaStream_t str
         AMARK(4);
         ga::normalize<<<n*a.heads,256,0,stream>>>(input,w.prob);
         AMARK(5);
-        ga::launch_context_parts(a,input,w,start,n,stream);
+        const int sp=ctx_sp(a,n);
+        ga::launch_context_parts(a,input,w,start,n,stream,sp);
         AMARK(6);
-        ga::merge_parts<<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
+        if(sp==64)ga::merge_parts<Input,TOP/64><<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
+        else if(sp==128)ga::merge_parts<Input,TOP/128><<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
+        else ga::merge_parts<<<n*a.heads,256,0,stream>>>(input,w.parts,w.context);
         KV4_ROTATE(w.context,n*a.heads,stream);
         AMARK(7);
 #if defined(DEC_AVP) && DEC_AVP
@@ -907,7 +950,7 @@ __global__ void cp_softmax(Input input,float* scores,float* m_out,float* l_out){
     float s=0;for(int j=t;j<TOP;j+=256){float v=isfinite(mx)?expf(p[j]-mx):0;p[j]=v;s+=v;}s=warp_sum(s);if((t&31)==0)tmp[t/32]=s;__syncthreads();
     if(t==0){den=0;for(int j=0;j<8;j++)den+=tmp[j];m_out[i]=mx;l_out[i]=den;}
 }
-// G6_CP_ONECHAIN (cp_groups_body): merge_parts over a call of G head groups of gh heads (a.heads = G gh), each group's
+// GR8_CP_ONECHAIN (cp_groups_body): merge_parts over a call of G head groups of gh heads (a.heads = G gh), each group's
 // (row, head) written into its own partial block as cp_group_body writes it: (row, head h) of the call is (row, h % gh) of
 // group g = h / gh, block g at part + g gblk = c [n][gh][512], m [n][gh], l [n][gh]; m / l come from cp_softmax's
 // [n x heads] outputs ml (m) and ml + n heads (l). The sum is merge_parts' (parts 0..P-1 in order).
@@ -976,7 +1019,7 @@ static cudaError_t cp_group_body(const G6Attn& a,Input input,Work w,const float*
     merge_parts<<<nh,256,0,stream>>>(input,w.parts,part);
     return cudaGetLastError();
 }
-// G6_CP_ONECHAIN: cp_group_body over G head groups at once (a.heads = G gh; q / rope [n][G gh][512] / [64], the groups'
+// GR8_CP_ONECHAIN: cp_group_body over G head groups at once (a.heads = G gh; q / rope [n][G gh][512] / [64], the groups'
 // heads side by side), each group's partial into its block (merge_parts_g). The scores / context kernels index every
 // (row, head) by row * a.heads + h and batch heads in groups of 16 (scores) or 2..16 (context), which divide gh
 // (g6_attn_cp_groups_ok), so each head runs the H-head call's kernel with its operands in the same order: the same bits.
@@ -1006,18 +1049,21 @@ static cudaError_t cp_finish_body(const G6Attn& a,Input input,Work& w,const floa
 static bool cp_ok(const G6Attn* a){return a&&valid(*a)&&a->cp_nr>=2&&a->cp_nr<=8&&a->cp_rank>=0&&a->cp_rank<a->cp_nr&&a->rows<=a->query_tile;}
 #endif
 }
-extern "C" size_t g6_attn_scratch_bytes(const G6Attn* a){if(!a||!ga::valid(*a))return 0;return ga::workspace(*a,nullptr).total;}
-extern "C" int g6_attn_append(const G6Attn* a,void* s){
+extern "C" size_t g6a_scratch_bytes(const G6Attn* a){if(!a||!ga::valid(*a))return 0;return ga::workspace(*a,nullptr).total;}
+extern "C" int g6a_ctx_sp(void){return ga::attn_ctx3_sp();}
+extern "C" int g6a_posidx(void){return ga::attn_posidx();}
+extern "C" int g6a_posidx_takes(const G6Attn* a){return a&&ga::use_posidx(*a)?1:0;}
+extern "C" int g6a_append(const G6Attn* a,void* s){
     if(!a||!ga::valid(*a)||!a->kv_a||!a->kv_norm||!a->mla_cache||!a->positions||!a->block_table||!a->error)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;ga::append_kv<<<a->rows,256,0,stream>>>(*a);
     if(!a->reuse_indices){if(!a->index_k||!a->index_norm||!a->index_bias||!a->index_cache)return (int)cudaErrorInvalidValue;ga::append_index<<<a->rows,128,0,stream>>>(*a);}
     return (int)cudaGetLastError();
 }
-extern "C" int g6_attn_index_scores(const G6Attn* a,void* scratch,size_t bytes,float* scores,void* s){
+extern "C" int g6a_index_scores(const G6Attn* a,void* scratch,size_t bytes,float* scores,void* s){
     if(!a||!ga::valid(*a)||!scratch||!scores)return (int)cudaErrorInvalidValue;auto w=ga::workspace(*a,scratch);if(!w.total||bytes<w.total)return (int)cudaErrorInvalidValue;
     for(int start=0;start<a->rows;start+=a->query_tile){auto e=ga::make_index(*a,w,start,std::min(a->rows-start,a->query_tile),(cudaStream_t)s,scores);if(e!=cudaSuccess)return (int)e;}return (int)cudaGetLastError();
 }
-extern "C" int g6_attn_run(const G6Attn* a_in,void* scratch,size_t bytes,void* s){
+extern "C" int g6a_run(const G6Attn* a_in,void* scratch,size_t bytes,void* s){
 #if defined(G6_CP) && G6_CP
     // a CP binding at context <= R (every page replicated, physical == logical on the prefix): today's replicated path
     G6Attn rep;if(a_in){rep=*a_in;rep.cp_nr=0;rep.cp_rank=0;}const G6Attn* a=a_in?&rep:nullptr;
@@ -1027,10 +1073,10 @@ extern "C" int g6_attn_run(const G6Attn* a_in,void* scratch,size_t bytes,void* s
     if(!a||!ga::valid(*a)||!scratch||!a->q_b||!a->uk||!a->uv||!a->indices||!a->output)return (int)cudaErrorInvalidValue;
     if(!a->reuse_indices&&(!a->index_q||!a->index_weight))return (int)cudaErrorInvalidValue;
     if(a->reuse_row_map&&a->reuse_indices==a->indices)return (int)cudaErrorInvalidValue;
-    auto w=ga::workspace(*a,scratch);if(!w.total||bytes<w.total)return (int)cudaErrorInvalidValue;auto e=(cudaError_t)g6_attn_append(a,s);if(e!=cudaSuccess)return (int)e;
+    auto w=ga::workspace(*a,scratch);if(!w.total||bytes<w.total)return (int)cudaErrorInvalidValue;auto e=(cudaError_t)g6a_append(a,s);if(e!=cudaSuccess)return (int)e;
     return (int)ga::run_body(*a,*a,w,(cudaStream_t)s);
 }
-extern "C" int g6_attn_replay_run(const G6AttnReplay* r,void* s){
+extern "C" int g6a_replay_run(const G6AttnReplay* r,void* s){
     if(!r||!r->cell)return (int)cudaErrorInvalidValue;
 #if defined(G6_CP) && G6_CP
     G6Attn rep=r->fixed;rep.cp_nr=0;rep.cp_rank=0;const G6Attn& a=rep;   // CP binding below R: replicated, as g6_attn_run
@@ -1047,8 +1093,9 @@ extern "C" int g6_attn_replay_run(const G6AttnReplay* r,void* s){
     cudaStream_t stream=(cudaStream_t)s;
     ga::validate_replay<<<1,256,0,stream>>>(a,r->cell);
     ga::ReplayInput input{a,r->cell};
-    const bool front=ga::attn_front_on()&&a.rows<=a.query_tile;   // G6_ATTN_FRONT: one query tile
-    if(front)ga::attn_front<<<a.rows*(a.reuse_indices?2:18),256,0,stream>>>(input,a.rows,a.reuse_indices?nullptr:w.iq,w.weights);
+    const bool front=ga::attn_front_on()&&a.rows<=a.query_tile;   // GR8_ATTN_FRONT: one query tile
+    if(front&&ga::use_posidx(a))ga::attn_front_pos<<<a.rows*3,256,0,stream>>>(input,a.rows);
+    else if(front)ga::attn_front<<<a.rows*(a.reuse_indices?2:18),256,0,stream>>>(input,a.rows,a.reuse_indices?nullptr:w.iq,w.weights);
     else{ga::append_kv<<<a.rows,256,0,stream>>>(input);
         if(!a.reuse_indices)ga::append_index<<<a.rows,128,0,stream>>>(input);}
     AMARK(0);
@@ -1060,7 +1107,7 @@ extern "C" int g6_attn_replay_run(const G6AttnReplay* r,void* s){
 
 // The decode RoPE table (ga::cs_t) for boots without QO attention, where g6_attn_qo_create never builds it: the same
 // {cos, sin} per (pos, j) from ga::cs (rope_table), so decode output is unchanged and absorb skips the FP64 sincos.
-extern "C" int g6_attn_rope_init(int cap,void* s){
+extern "C" int g6a_rope_init(int cap,void* s){
 #if PF_QOROPE && PF_ROPE2
     cudaStream_t st=(cudaStream_t)s;float2* t=nullptr;
     cudaError_t e=cudaMalloc(&t,(size_t)cap*32*sizeof(float2));if(e!=cudaSuccess)return (int)e;
@@ -1083,7 +1130,7 @@ static int cp_call(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size
     if(cell){ga::ReplayInput in{*a,cell};return (int)body(in,w);}
     return (int)body(*a,w);
 }
-extern "C" int g6_attn_cp_front(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,void* s){
+extern "C" int g6a_cp_front(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,void* s){
     if(!a||!a->q_b||!a->uk||!a->kv_a||!a->kv_norm||!a->mla_cache||!a->positions||!a->block_table||!a->error||!a->indices)return (int)cudaErrorInvalidValue;
     if(!a->reuse_indices&&(!a->index_q||!a->index_weight||!a->index_k||!a->index_norm||!a->index_bias||!a->index_cache))return (int)cudaErrorInvalidValue;
     if(a->reuse_row_map&&a->reuse_indices==a->indices)return (int)cudaErrorInvalidValue;
@@ -1094,12 +1141,12 @@ extern "C" int g6_attn_cp_front(const G6Attn* a,const G6AttnStepCell* cell,void*
         if(!a->reuse_indices)ga::append_index<<<a->rows,128,0,stream>>>(in);
         return ga::cp_front_body(*a,in,w,stream);});
 }
-extern "C" int g6_attn_cp_index(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,uint64_t* cand_all,void* s){
+extern "C" int g6a_cp_index(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,uint64_t* cand_all,void* s){
     if(!a||(!a->reuse_indices&&!cand_all))return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;
     return cp_call(a,cell,scratch,bytes,[&](auto in,ga::Work& w){return ga::cp_index_body(*a,in,w,cand_all,stream);});
 }
-extern "C" int g6_attn_cp_merge_index(const G6Attn* a,const G6AttnStepCell* cell,const uint64_t* cand_all,void* s){
+extern "C" int g6a_cp_merge_index(const G6Attn* a,const G6AttnStepCell* cell,const uint64_t* cand_all,void* s){
     if(!ga::cp_ok(a)||!cand_all||a->reuse_indices)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;
     if(a->rt_group)ga::rt_wait<<<1,32,0,stream>>>(a->rt_group,a->error);   // every scores launch of the layer follows
@@ -1110,29 +1157,29 @@ extern "C" int g6_attn_cp_merge_index(const G6Attn* a,const G6AttnStepCell* cell
     else ga::cp_merge<<<a->rows,256,0,stream>>>(*a,0,cand_all);
     return (int)cudaGetLastError();
 }
-extern "C" int g6_attn_cp_group(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* q,const float* rope,float* part,void* s){
+extern "C" int g6a_cp_group(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* q,const float* rope,float* part,void* s){
     if(!a||!a->indices||!a->mla_cache||!a->block_table||!q||!rope||!part)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;
     return cp_call(a,cell,scratch,bytes,[&](auto in,ga::Work& w){return ga::cp_group_body(*a,in,w,q,rope,part,stream);});
 }
-extern "C" int g6_attn_cp_finish(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* part_all,void* s){
+extern "C" int g6a_cp_finish(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* part_all,void* s){
     if(!a||!a->uv||!a->output||!part_all)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;
     return cp_call(a,cell,scratch,bytes,[&](auto in,ga::Work& w){return ga::cp_finish_body(*a,in,w,part_all,stream);});
 }
-extern "C" int g6_attn_cp_groups_ok(int gh){return gh>0&&gh%16==0&&ga::attn_flip_min()<0;}
+extern "C" int g6a_cp_groups_ok(int gh){return gh>0&&gh%16==0&&ga::attn_flip_min()<0;}
 // prob, parts, ml of cp_groups_body, each 256-B aligned
 static size_t cp_groups_at(int heads,int rows,int k){
     const size_t nh=(size_t)heads*rows,b[3]={nh*ga::TOP*4,nh*ga::PART*512*4,nh*2*4};
     size_t o=0;for(int i=0;i<k;i++)o+=(b[i]+255)&~size_t(255);return o;
 }
-extern "C" size_t g6_attn_cp_groups_bytes(int heads,int rows){return heads>0&&rows>0?cp_groups_at(heads,rows,3):0;}
-extern "C" int g6_attn_cp_groups(const G6Attn* a,const G6AttnStepCell* cell,void* buf,size_t bytes,const float* q,const float* rope,
+extern "C" size_t g6a_cp_groups_bytes(int heads,int rows){return heads>0&&rows>0?cp_groups_at(heads,rows,3):0;}
+extern "C" int g6a_cp_groups(const G6Attn* a,const G6AttnStepCell* cell,void* buf,size_t bytes,const float* q,const float* rope,
                                  float* part,int gh,int64_t gblk,void* s){
-    if(!a||!a->indices||!a->mla_cache||!a->block_table||!buf||!q||!rope||!part||!g6_attn_cp_groups_ok(gh)||a->heads%gh||
+    if(!a||!a->indices||!a->mla_cache||!a->block_table||!buf||!q||!rope||!part||!g6a_cp_groups_ok(gh)||a->heads%gh||
        a->heads/gh>7)return (int)cudaErrorInvalidValue;
     G6Attn one=*a;one.heads=gh;   // the call's shape is that of each group's call
-    if(!ga::cp_ok(&one)||bytes<g6_attn_cp_groups_bytes(a->heads,a->rows)||gblk<(int64_t)a->rows*gh*514)return (int)cudaErrorInvalidValue;
+    if(!ga::cp_ok(&one)||bytes<g6a_cp_groups_bytes(a->heads,a->rows)||gblk<(int64_t)a->rows*gh*514)return (int)cudaErrorInvalidValue;
     cudaStream_t stream=(cudaStream_t)s;
     ga::Work w{};char* b=(char*)buf;
     w.prob=(float*)(b+cp_groups_at(a->heads,a->rows,0));w.parts=(float*)(b+cp_groups_at(a->heads,a->rows,1));
@@ -1140,13 +1187,13 @@ extern "C" int g6_attn_cp_groups(const G6Attn* a,const G6AttnStepCell* cell,void
     if(cell)return (int)ga::cp_groups_body(*a,ga::ReplayInput{*a,cell},w,ml,q,rope,part,gh,gblk,stream);
     return (int)ga::cp_groups_body(*a,*a,w,ml,q,rope,part,gh,gblk,stream);
 }
-extern "C" int g6_attn_cp_qabs(const G6Attn* a,void* scratch,const float** q,const float** rope){
+extern "C" int g6a_cp_qabs(const G6Attn* a,void* scratch,const float** q,const float** rope){
     if(!ga::cp_ok(a)||!scratch||!q||!rope)return (int)cudaErrorInvalidValue;
     auto w=ga::workspace(*a,scratch);if(!w.total)return (int)cudaErrorInvalidValue;
     *q=w.q;*rope=w.rope;return 0;
 }
 #endif
-extern "C" int g6_rt_pack_int4(const void* src,size_t ss,void* dst,size_t ds,int n,void* s){
+extern "C" int g6a_rt_pack_int4(const void* src,size_t ss,void* dst,size_t ds,int n,void* s){
 #if G6_KV4
     (void)src;(void)ss;(void)dst;(void)ds;(void)n;(void)s;return (int)cudaErrorNotSupported;
 #else
@@ -1154,7 +1201,7 @@ extern "C" int g6_rt_pack_int4(const void* src,size_t ss,void* dst,size_t ds,int
     ga::rt_convert<true><<<(n+7)/8,256,0,(cudaStream_t)s>>>((const uint8_t*)src,ss,(uint8_t*)dst,ds,n);return (int)cudaGetLastError();
 #endif
 }
-extern "C" int g6_rt_unpack_int4(const void* src,size_t ss,void* dst,size_t ds,int n,void* s){
+extern "C" int g6a_rt_unpack_int4(const void* src,size_t ss,void* dst,size_t ds,int n,void* s){
 #if G6_KV4
     (void)src;(void)ss;(void)dst;(void)ds;(void)n;(void)s;return (int)cudaErrorNotSupported;
 #else

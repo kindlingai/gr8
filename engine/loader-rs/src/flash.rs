@@ -153,7 +153,7 @@ fn kda_bf16(p: &mut Planner, l: usize, label: String, f: &Arc<StFile>, local: &s
         if o % 16 != 0 || k % 16 != 0 { return Err(format!("{local}: {o}x{k} is not in 16-row tiles")); }
         if !name.ends_with("b_proj.weight") {
             // q / k / v: also this rank's heads as MXFP8 as stored, for the prefill GEMM (flash_prefill.cuh pf_kda_proj_gemm)
-            let (h0, nh) = p.shard.heads(l);
+            let (h0, nh) = p.chunk(Group::Heads(l))?;
             let rows = h0 * 128..(h0 + nh) * 128;
             let (n, f2, local2) = (rows.len() as i64, f.clone(), local.to_string());
             p.gen(format!("{label}.mx.codes"), vec![(format!("{label}.mx.codes"), "u8", vec![n, k as i64]),
@@ -172,7 +172,7 @@ fn kda_bf16(p: &mut Planner, l: usize, label: String, f: &Arc<StFile>, local: &s
 
 fn quant_layer(p: &mut Planner, l: usize, f: Arc<StFile>) -> Result<(), String> {
     let prefix = format!("model.language_model.layers.{l}.");
-    let (h0, nh) = p.shard.heads(l);
+    let (h0, nh) = p.chunk(Group::Heads(l))?;
     for (local, full, shape) in quant_entries(&f)? {
         let hf = full.strip_prefix(&prefix).ok_or(format!("unexpected source {full}"))?;
         let name = alias(hf);
@@ -194,8 +194,10 @@ fn quant_layer(p: &mut Planner, l: usize, f: Arc<StFile>) -> Result<(), String> 
                         if ![128,256].contains(&head) || m.rec.inp%64!=0 { return Err("invalid Flash o_proj head geometry".into()); }
                         (h0*head..(h0+nh)*head, exlr8::SIDE_IN, head)
                     },
-                    "dense.gate" | "dense.up" => (p.shard.dense(l), exlr8::SIDE_OUT, 128),
-                    "dense.down" => (p.shard.dense(l), exlr8::SIDE_IN, 128),
+                    "dense.gate" | "dense.up" | "dense.down" => {
+                        let (d0, nd) = p.chunk(Group::Dense(l))?;
+                        (d0 * 128..(d0 + nd) * 128, if name == "dense.down" { exlr8::SIDE_IN } else { exlr8::SIDE_OUT }, 128)
+                    },
                     _ => return Err(format!("{local}: unsupported Flash trellis matrix")),
                 };
                 let rotation = match name {
@@ -206,7 +208,7 @@ fn quant_layer(p: &mut Planner, l: usize, f: Arc<StFile>) -> Result<(), String> 
                 if m.rec.k != 4 || m.rec.side != side || m.rec.unit != unit || m.rec.rotation != rotation {
                     return Err(format!("{local}: invalid Flash trellis K/side/unit/rotation"));
                 }
-                p.trellis(l, name, &format!("L{l:03}"), &m, ch)?;
+                p.trellis(l, name, &format!("L{l:03}"), &m, &[ch])?;
             },
             MXFP8 if KDA_BF16.contains(&name) => kda_bf16(p, l, label, &f, &local, name)?,
             MXFP8 => p.mxfp8(l, "Flash MXFP8", &label, &f, &local, false)?,
@@ -253,7 +255,8 @@ fn quant_globals(p: &mut Planner, f: Arc<StFile>) -> Result<(), String> {
             }
             p.gen_striped(name, name.into(), "bf16", vec![VOCAB as i64, 4096], stripes);
         } else {
-            let rows = p.shard.vocab();
+            let (t0, nt) = p.chunk(Group::Vocab)?;
+            let rows = t0 * 128..(t0 + nt) * 128;
             let n = rows.len();
             p.copy("G.lm_head.scale".into(), "f32", vec![n as i64], &f, &format!("{local}.scale"), (rows.start * 4) as u64)?;
             let mut stripes: Vec<(u64, Box<dyn Fn() -> Result<Vec<u8>, String> + Send + Sync>)> = Vec::new();

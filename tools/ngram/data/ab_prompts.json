@@ -1,0 +1,893 @@
+[
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Add a CONTRIBUTING.md that explains how to run the tests."
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "The tests in tests/test_money.py fail. Find out why and fix it."
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Replace print statements with logging calls in src/worker.py."
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Make parse_duration in src/time_utils.py accept a trailing 'ms' unit."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "read_file",
+       "arguments": "{\"path\": \"src/time_utils.py\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "UNITS = {'s': 1, 'm': 60, 'h': 3600}\n\n\ndef parse_duration(s):\n    s = s.strip()\n    unit = s[-1]\n    if unit not in UNITS:\n        raise ValueError(f'unknown unit in {s!r}')\n    return float(s[:-1]) * UNITS[unit]\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Run the tests and fix the first failure."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "run_command",
+       "arguments": "{\"command\": \"pytest -x -q\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "F\n=================================== FAILURES ===================================\n___________________________ test_slug ___________________________\n\n    def test_slug():\n>       assert slug('Hello World') == 'hello-world'\nE       AssertionError: assert 'hello world' == 'hello-world'\n\ntests/test_text.py:4: AssertionError\n1 failed in 0.02s\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "description": "Read a file from the repository.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "description": "Write a whole file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "description": "Run a shell command in the repository and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       },
+       "timeout_s": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "description": "Search the repository for a regular expression.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "glob": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "pattern"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a coding agent working in a git repository. Use the tools to inspect and change files. Make one tool call at a time."
+   },
+   {
+    "role": "user",
+    "content": "Find where the database URL is read and make it come from the DATABASE_URL environment variable."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": "{\"pattern\": \"postgres://|DATABASE\", \"glob\": \"**/*.py\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "src/db.py:5:URL = 'postgres://app:app@localhost/app'\n"
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "kubectl",
+     "description": "Run a read-only kubectl command and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "args": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "args"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "get_ticket",
+     "description": "Fetch a ticket by its key.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "key": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "key"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "add_comment",
+     "description": "Add a comment to a ticket.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "key": {
+        "type": "string"
+       },
+       "body": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "key",
+       "body"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are an operations assistant with access to a Kubernetes cluster and a ticket tracker. Call a tool when you need data; answer briefly when you have it."
+   },
+   {
+    "role": "user",
+    "content": "Ticket OPS-412 says the checkout service keeps restarting. Find out why and note it on the ticket."
+   }
+  ]
+ },
+ {
+  "workload": "tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "kubectl",
+     "description": "Run a read-only kubectl command and return its output.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "args": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      },
+      "required": [
+       "args"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "get_ticket",
+     "description": "Fetch a ticket by its key.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "key": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "key"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "add_comment",
+     "description": "Add a comment to a ticket.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "key": {
+        "type": "string"
+       },
+       "body": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "key",
+       "body"
+      ]
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are an operations assistant with access to a Kubernetes cluster and a ticket tracker. Call a tool when you need data; answer briefly when you have it."
+   },
+   {
+    "role": "user",
+    "content": "Why are the pods of deployment search-api not ready?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "kubectl",
+       "arguments": "{\"args\": [\"get\", \"pods\", \"-l\", \"app=search-api\", \"-o\", \"wide\"]}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "NAME                          READY   STATUS             RESTARTS   AGE\nsearch-api-7d9f8c6b5-2xkqp    0/1     CrashLoopBackOff   14         52m\nsearch-api-7d9f8c6b5-r8tlm    0/1     CrashLoopBackOff   14         52m\n"
+   }
+  ]
+ },
+ {
+  "workload": "edit",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Add type hints and a docstring to this function. Return the whole function.\n\n```\ndef chunk(xs, n):\n    out = []\n    for i in range(0, len(xs), n):\n        out.append(xs[i:i + n])\n    return out\n```"
+   }
+  ]
+ },
+ {
+  "workload": "edit",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Convert this class to a dataclass. Return the whole file.\n\n```\nclass Point:\n    def __init__(self, x, y, label=None):\n        self.x = x\n        self.y = y\n        self.label = label\n\n    def __repr__(self):\n        return f'Point({self.x}, {self.y}, {self.label!r})'\n\n    def __eq__(self, other):\n        return (self.x, self.y, self.label) == (other.x, other.y, other.label)\n```"
+   }
+  ]
+ },
+ {
+  "workload": "edit",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Make this Express handler return 404 when the item is missing. Return the whole handler.\n\n```\napp.get('/items/:id', async (req, res) => {\n  const item = await db.items.findOne({ id: req.params.id });\n  res.json(item);\n});\n```"
+   }
+  ]
+ },
+ {
+  "workload": "json",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Return a JSON object describing a Kubernetes Deployment for nginx with 3 replicas, resource limits and a readiness probe. JSON only."
+   }
+  ]
+ },
+ {
+  "workload": "json",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Return a JSON array of 4 GitHub pull requests, each with number, title, author, state, draft, labels and requested_reviewers. JSON only."
+   }
+  ]
+ },
+ {
+  "workload": "json",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Return a .eslintrc.json for a TypeScript React project with the recommended rule sets and three custom rules. JSON only."
+   }
+  ]
+ },
+ {
+  "workload": "code",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a Python function that retries a callable with exponential backoff and jitter, with type hints and a docstring."
+   }
+  ]
+ },
+ {
+  "workload": "code",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a GitHub Actions workflow that builds a Docker image on tag push and pushes it to GHCR."
+   }
+  ]
+ },
+ {
+  "workload": "prose",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a pull request description for a change that adds request timeouts to every outgoing HTTP call."
+   }
+  ]
+ }
+]

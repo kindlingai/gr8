@@ -10,6 +10,11 @@
 //! | WRITE | a = offset, b = bytes, then the data | status |
 //! | GATHER | a = ranges, then (offset, bytes) per range as two u64 | a = total bytes, then each range's data in order |
 //! | STATS | (any connection, with or without a lease) | a = bytes of JSON, then the JSON |
+//! | GOPEN | a = bytes that follow: block bytes, floor bytes, cap bytes (u64 each), ranks, rank, weight (1000 = 1x), 0 (u32 each), then "<group> <lease>" | a = lease id, b = segments, c = blocks a segment, then the token |
+//! | REPORT | a = segments a rank wants, b = ages, then each age (u64, ms since the use of the coldest block of each segment's worth, coldest first) | a = segments a rank was granted now, b = segments a rank is asked to give back, c = segments nobody holds or was promised, then the transaction (u64; 0 = none) every rank names in its GROW or SHRINK |
+//! | GROW | a = segments the lease grows to (the grant's target), b = the transaction | a = the lease's segments |
+//! | SHRINK | a = segments to keep (the last ones go; nothing may use them after this), b = the transaction | a = the lease's segments |
+//! | SEGS | (after RDMA on this connection) | a = segments, b = lease bytes a segment, then each segment's (remote address, rkey) as two u64 |
 //!
 //! A failed request replies with a nonzero status and c = the length of a message that follows. A lease ends when the
 //! last connection that opened or attached it closes.
@@ -25,6 +30,13 @@ pub const READ: u32 = 4;
 pub const WRITE: u32 = 5;
 pub const GATHER: u32 = 6;
 pub const STATS: u32 = 7;
+pub const GOPEN: u32 = 8;
+pub const REPORT: u32 = 9;
+pub const GROW: u32 = 10;
+pub const SHRINK: u32 = 11;
+pub const SEGS: u32 = 12;
+/// GOPEN's fixed part before the names.
+pub const GOPEN_FIXED: usize = 40;
 pub const HEADER: usize = 32;
 pub const NAME_MAX: usize = 128;
 pub const MAX_QPS: u64 = 256;
@@ -40,6 +52,8 @@ pub const E_NOROOM: u32 = 4;
 pub const E_BUSY: u32 = 5;
 pub const E_TOKEN: u32 = 6;
 pub const E_RDMA: u32 = 7;
+/// A GROW or SHRINK that names a transaction the group no longer (or never) had open.
+pub const E_STALE: u32 = 8;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Header {
@@ -92,6 +106,7 @@ pub fn reply(r: &mut impl Read) -> io::Result<Header> {
             E_BUSY => io::ErrorKind::AddrInUse,
             E_TOKEN | E_NOLEASE => io::ErrorKind::PermissionDenied,
             E_RDMA => io::ErrorKind::Unsupported,
+            E_STALE => io::ErrorKind::StaleNetworkFileHandle,
             _ => io::ErrorKind::InvalidData,
         };
         return Err(io::Error::new(kind, format!("KV node: {}", String::from_utf8_lossy(&m))));

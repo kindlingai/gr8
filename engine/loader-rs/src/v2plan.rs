@@ -3,6 +3,8 @@
 //! (tools/convert/v2slices.py) and the raw width files, at the widths a manifest picks. The tensors, their order and
 //! their bytes are those tools/convert/v2pack.py writes (and tools/convert/v2.py convert_experts_v2 for one rank).
 
+use crate::codebook::{self, Codebook, TrellisRanges};
+use crate::exlr8::StFile;
 use crate::json::{self, Json};
 use crate::plan::{Gen, Op, Plan, Seg};
 use std::collections::HashMap;
@@ -11,7 +13,8 @@ use std::os::unix::fs::FileExt;
 
 const ALIGN: u64 = 4096;
 pub(crate) const NH: usize = 16;
-const XF_EXLR8: &str = "exlr8-e4m3";
+/// The most 128-blocks an expert of any model has: DeepSeek-V4.1-Flash, 2304 wide.
+pub(crate) const NH_MAX: usize = 18;
 
 /// A manifest entry (tools/convert/pack.py): dtype is the manifest label (u8, f16, i64, ...).
 #[derive(Clone, Debug, PartialEq)]
@@ -29,6 +32,8 @@ pub struct V2Image {
     pub tensors: Vec<Tensor>,
     pub bytes: u64,
     pub plan: Plan,
+    /// GR8_GEN_CACHE (loader-rs/gencache.rs): set by the C entry point after planning; None = cache off.
+    pub cache: Option<crate::gencache::GenCache>,
 }
 
 impl V2Image {
@@ -117,28 +122,36 @@ fn layer_slice(s: &Slice, l: usize) -> Result<Option<LayerSlice>, String> {
 }
 
 /// Widths of one layer from a width manifest: gate[e][h], up[e][h], down[e], and the shared expert's (down 0: none).
+/// Rows hold `nh` blocks (16 for GLM, 18 for DeepSeek-V4.1-Flash); entries from nh on are 0.
 pub(crate) struct Widths {
-    pub(crate) gate: Vec<[u8; NH]>,
-    pub(crate) up: Vec<[u8; NH]>,
+    pub(crate) gate: Vec<[u8; NH_MAX]>,
+    pub(crate) up: Vec<[u8; NH_MAX]>,
     pub(crate) down: Vec<u8>,
-    pub(crate) sgate: [u8; NH],
-    pub(crate) sup: [u8; NH],
+    pub(crate) sgate: [u8; NH_MAX],
+    pub(crate) sup: [u8; NH_MAX],
     pub(crate) sdown: u8,
+    pub(crate) nh: usize,
 }
 
 pub(crate) fn widths(m: &Json, l: usize) -> Result<Option<Widths>, String> {
+    widths_nh(m, l, NH)
+}
+
+/// widths() for a model whose experts have `nh` 128-blocks.
+pub(crate) fn widths_nh(m: &Json, l: usize, nh: usize) -> Result<Option<Widths>, String> {
     let Some(e) = m.get("layers").and_then(|x| x.get(&l.to_string())) else { return Ok(None) };
-    let row16 = |v: &Json| -> Result<[u8; NH], String> {
+    let row16 = |v: &Json| -> Result<[u8; NH_MAX], String> {
         let a = v.arr().ok_or("width row is not a list")?;
-        if a.len() != NH {
-            return Err("width row is not 16 halves".into());
+        if a.len() != nh {
+            return Err(format!("width row is not {nh} halves"));
         }
-        let mut r = [0u8; NH];
+        let mut r = [0u8; NH_MAX];
         for (i, x) in a.iter().enumerate() {
             r[i] = x.int().ok_or("width is not an integer")? as u8;
         }
         Ok(r)
     };
+    let full = |w: u8| { let mut r = [0u8; NH_MAX]; r[..nh].fill(w); r };
     let list = |k: &str| e.get(k).and_then(Json::arr).ok_or(format!("layer {l}: no {k} widths"));
     let gate = list("gate")?.iter().map(row16).collect::<Result<Vec<_>, _>>()?;
     let up = list("up")?.iter().map(row16).collect::<Result<Vec<_>, _>>()?;
@@ -146,10 +159,10 @@ pub(crate) fn widths(m: &Json, l: usize) -> Result<Option<Widths>, String> {
     let (sgate, sup, sdown) = match e.get("shared") {
         Some(Json::Obj(_)) => {
             let s = e.get("shared").unwrap();
-            let b = |k| -> Result<[u8; NH], String> {
+            let b = |k| -> Result<[u8; NH_MAX], String> {
                 match s.get(k) {
                     Some(Json::Arr(_)) => row16(s.get(k).unwrap()),
-                    Some(v) => Ok([v.int().ok_or("bad shared width")? as u8; NH]),
+                    Some(v) => Ok(full(v.int().ok_or("bad shared width")? as u8)),
                     None => Err(format!("layer {l}: shared has no {k}")),
                 }
             };
@@ -157,11 +170,11 @@ pub(crate) fn widths(m: &Json, l: usize) -> Result<Option<Widths>, String> {
         }
         Some(v) => {
             let w = v.int().unwrap_or(0) as u8;
-            ([w; NH], [w; NH], w)
+            (full(w), full(w), w)
         }
-        None => ([0; NH], [0; NH], 0),
+        None => ([0; NH_MAX], [0; NH_MAX], 0),
     };
-    Ok(Some(Widths { gate, up, down, sgate, sup, sdown }))
+    Ok(Some(Widths { gate, up, down, sgate, sup, sdown, nh }))
 }
 
 pub(crate) struct Builder {
@@ -202,8 +215,8 @@ impl Builder {
         }
         self.segs.push(Seg { pack_off, nbytes, op, file_off, file });
     }
-    fn mem(&mut self, name: String, dtype: &str, shape: Vec<i64>, bytes: Vec<u8>) {
-        let off = self.begin(name, dtype, shape, bytes.len() as u64, Some(XF_EXLR8));
+    fn mem(&mut self, name: String, dtype: &str, shape: Vec<i64>, bytes: Vec<u8>, xf: &str) {
+        let off = self.begin(name, dtype, shape, bytes.len() as u64, Some(xf));
         if !bytes.is_empty() {
             self.segs.push(Seg { pack_off: off, nbytes: bytes.len() as u64, op: Op::Mem, file_off: 0, file: self.mems.len() });
             self.mems.push(bytes);
@@ -211,11 +224,16 @@ impl Builder {
     }
 }
 
-fn kmix_word(gw: &[u8; NH], uw: &[u8; NH], dk: u8, hs: &[usize]) -> i64 {
+/// The tr3.kmix word packs 8 bits per block in one i64, so mixed widths fit at most 8 blocks of an expert on a rank:
+/// None past that (all 16 blocks at TP=1, for one).
+fn kmix_word(gw: &[u8; NH_MAX], uw: &[u8; NH_MAX], dk: u8, hs: &[usize]) -> Option<i64> {
     if hs.iter().all(|&h| gw[h] == dk && uw[h] == dk) {
-        return 0;
+        return Some(0);
     }
-    hs.iter().enumerate().fold(0i64, |v, (b, &h)| v | (gw[h] as i64) << (8 * b) | (uw[h] as i64) << (8 * b + 4))
+    if hs.len() > 8 {
+        return None;
+    }
+    Some(hs.iter().enumerate().fold(0i64, |v, (b, &h)| v | (gw[h] as i64) << (8 * b) | (uw[h] as i64) << (8 * b + 4)))
 }
 
 fn f16_signed(scale: [u8; 2], sign: i8) -> [u8; 2] {
@@ -235,7 +253,7 @@ pub fn plan(base_manifest: &str, base_pack: &str, v2_dir: &str, slices_dir: &str
         .iter().map(base_tensor).collect::<Result<Vec<_>, _>>()?;
     base.sort_by_key(|t| t.offset);
     let man = width_manifest(widths_path)?;
-    let slices = open_slices(slices_dir, nr, rank)?;
+    let slices = Slices::open(slices_dir, nr, &[rank])?;
     let wfile = |l: usize, k: u8| width_file(v2_dir, l, k);
     let mut b = Builder::new();
     let base_file = b.file(base_pack.to_string());
@@ -248,7 +266,7 @@ pub fn plan(base_manifest: &str, base_pack: &str, v2_dir: &str, slices_dir: &str
         if let Some(l) = layer.filter(|_| rest.starts_with("tr3.") || rest.starts_with("shared.")) {
             if let Some(w) = widths(&man, l)? {
                 if !done.contains(&l) {
-                    v2_layer(&mut b, l, &w, &slices, &wfile, nr, rank)?;
+                    v2_layer(&mut b, l, &w, &slices, &wfile, &|e| Ok(formula_halves(e, l, nr, rank)))?;
                     done.push(l);
                 }
                 continue;
@@ -265,7 +283,7 @@ pub fn plan(base_manifest: &str, base_pack: &str, v2_dir: &str, slices_dir: &str
     }
     let bytes = b.cur.div_ceil(ALIGN) * ALIGN;
     let plan = Plan::from_segs(b.files, b.segs, b.mems, b.gens, bytes)?;
-    Ok(V2Image { rank, tensors: b.tensors, bytes, plan })
+    Ok(V2Image { rank, tensors: b.tensors, bytes, plan, cache: None })
 }
 
 /// A width manifest (exlr8-v2-manifest).
@@ -277,22 +295,46 @@ pub(crate) fn width_manifest(path: &str) -> Result<Json, String> {
     Ok(man)
 }
 
-/// Rank `rank`'s index slices at TP `nr`, one per width present: SLICES/tp<N>/k<K>/rank<r>.safetensors, SLICES being
-/// the index-slices dir itself or a release dir that holds index-slices/.
-pub(crate) fn open_slices(slices_dir: &str, nr: usize, rank: usize) -> Result<HashMap<u8, Slice>, String> {
-    let mut slices: HashMap<u8, Slice> = HashMap::new();
-    for root in [slices_dir.to_string(), format!("{slices_dir}/index-slices")] {
-        for k in [2u8, 3, 4] {
-            let p = format!("{root}/tp{nr}/k{k}/rank{rank}.safetensors");
-            if !slices.contains_key(&k) && std::path::Path::new(&p).exists() {
-                slices.insert(k, Slice::open(&p)?);
+/// The halves of expert e in layer l that rank `rank` of TP `nr` owns under the formula, which the index slices of
+/// TP `nr` follow too (tools/convert/v2.py owner).
+pub(crate) fn formula_halves(e: usize, l: usize, nr: usize, rank: usize) -> Vec<usize> {
+    formula_halves_nh(e, l, nr, rank, NH)
+}
+
+/// formula_halves() for experts of `nh` 128-blocks: block h of expert e is rank (nh e + h + l) % nr's.
+pub(crate) fn formula_halves_nh(e: usize, l: usize, nr: usize, rank: usize, nh: usize) -> Vec<usize> {
+    (0..nh).filter(|&h| (nh * e + h + l) % nr == rank).collect()
+}
+
+/// Index slices at TP `nr` of some of its ranks, by (width, rank): unit (e, h) of layer l is in rank
+/// (16 e + h + l) % nr's slice.
+pub(crate) struct Slices {
+    nr: usize,
+    by: HashMap<(u8, usize), Slice>,
+}
+
+impl Slices {
+    /// The slices of `ranks` at TP `nr`, one per width present: SLICES/tp<N>/k<K>/rank<r>.safetensors, SLICES being
+    /// the index-slices dir itself or a release dir that holds index-slices/.
+    pub(crate) fn open(slices_dir: &str, nr: usize, ranks: &[usize]) -> Result<Slices, String> {
+        let mut by: HashMap<(u8, usize), Slice> = HashMap::new();
+        for &rank in ranks {
+            for root in [slices_dir.to_string(), format!("{slices_dir}/index-slices")] {
+                for k in [2u8, 3, 4] {
+                    let p = format!("{root}/tp{nr}/k{k}/rank{rank}.safetensors");
+                    if !by.contains_key(&(k, rank)) && std::path::Path::new(&p).exists() {
+                        by.insert((k, rank), Slice::open(&p)?);
+                    }
+                }
+            }
+            if !by.keys().any(|&(_, r)| r == rank) {
+                // a layout's halves are listed in other ranks' slices, which a box's cache does not hold
+                let why = if ranks.len() > 1 { " (a layout reads every rank's slices at its TP)" } else { "" };
+                return Err(format!("no index slices for TP {nr} rank {rank} under {slices_dir}{why}"));
             }
         }
+        Ok(Slices { nr, by })
     }
-    if slices.is_empty() {
-        return Err(format!("no index slices for TP {nr} rank {rank} under {slices_dir}"));
-    }
-    Ok(slices)
 }
 
 /// The width file of layer l at width k: DIR/exlr8-layer-LLL.kK.safetensors, or under DIR/experts/.
@@ -313,11 +355,39 @@ fn base_tensor(t: &Json) -> Result<Tensor, String> {
     })
 }
 
-pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u8, Slice>, wfile: &dyn Fn(usize, u8) -> String,
-            nr: usize, rank: usize) -> Result<(), String> {
+/// The codebook of layer l's width files at the widths `ks` (None when one of them is not there), and each file's
+/// trellis tensor ranges by width. Every width file of a layer must use the same codebook: the kernels take it per
+/// layer (bind::LayerTensors::cb).
+fn layer_codebook(l: usize, ks: &[u8], wfile: &dyn Fn(usize, u8) -> String)
+                  -> Result<(Option<Codebook>, HashMap<u8, TrellisRanges>), String> {
+    let mut cb: Option<(Codebook, u8)> = None;
+    let mut ranges = HashMap::new();
+    let mut missing = false;
+    for &k in ks {
+        let path = wfile(l, k);
+        if !std::path::Path::new(&path).exists() {
+            missing = true;
+            continue;
+        }
+        let f = StFile::open(&path).map_err(|e| format!("layer {l}: the K{k} width file's header: {e}"))?;
+        let (c, r) = codebook::width_file_codebook(&f).map_err(|e| format!("layer {l}: {e}"))?;
+        if let Some((c0, k0)) = cb.filter(|&(c0, _)| c0 != c) {
+            return Err(format!("layer {l}: the K{k0} width file is in codebook {} and the K{k} one in {}; gr8 takes one \
+                                codebook per layer", c0.name(), c.name()));
+        }
+        cb = Some((c, k));
+        ranges.insert(k, r);
+    }
+    Ok((if missing { None } else { Some(cb.map_or(Codebook::Mcg, |c| c.0)) }, ranges))
+}
+
+/// Layer l's v2 expert tensors for the halves `own` gives for each expert (256: the shared expert), in ascending order.
+/// Their expert_format names the layer's codebook (src/codebook.rs), read from its width files' headers.
+pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &Slices, wfile: &dyn Fn(usize, u8) -> String,
+            own: &dyn Fn(usize) -> Result<Vec<usize>, String>) -> Result<(), String> {
     let p = format!("L{l:03}");
-    let mut ls: HashMap<u8, LayerSlice> = HashMap::new();
-    for (&k, s) in slices {
+    let mut ls: HashMap<(u8, usize), LayerSlice> = HashMap::new();
+    for (&k, s) in &slices.by {
         if let Some(x) = layer_slice(s, l)? {
             ls.insert(k, x);
         }
@@ -325,7 +395,13 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u
     let nroute = w.down.len();
     let shared = nroute;
     let hidden = ls.values().next().ok_or("no layer slices")?.hidden;
-    if ![4096, 6144].contains(&hidden) || (hidden == 4096 && nroute != 288) || w.gate.len() != nroute || w.up.len() != nroute {
+    let geometry = match (hidden, w.nh) {
+        (6144, NH) => true,
+        (4096, NH) => nroute == 288,
+        (5120, 18) => nroute == 384,
+        _ => false,
+    };
+    if !geometry || w.gate.len() != nroute || w.up.len() != nroute {
         return Err(format!("layer {l}: invalid geometry or widths"));
     }
     let blocks = hidden / 128;
@@ -337,21 +413,41 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u
             return Err(format!("layer {l}: inconsistent slice shapes"));
         }
     }
-    if w.down.iter().chain(w.gate.iter().flatten()).chain(w.up.iter().flatten()).any(|k| !(2..=4).contains(k))
-        || (w.sdown > 0 && (!(2..=4).contains(&w.sdown) || w.sgate.iter().chain(&w.sup).any(|k| !(2..=4).contains(k)))) {
+    let nh = w.nh;
+    let rows = w.gate.iter().chain(&w.up).flat_map(|r| &r[..nh]);
+    if w.down.iter().chain(rows).any(|k| !(2..=4).contains(k))
+        || (w.sdown > 0 && (!(2..=4).contains(&w.sdown) || w.sgate[..nh].iter().chain(&w.sup[..nh]).any(|k| !(2..=4).contains(k)))) {
         return Err(format!("layer {l}: invalid width"));
     }
     let mut experts: Vec<usize> = (0..nroute).collect();
     if w.sdown > 0 {
         experts.push(shared);
     }
-    let of = |e: usize| -> ([u8; NH], [u8; NH], u8) {
+    let of = |e: usize| -> ([u8; NH_MAX], [u8; NH_MAX], u8) {
         if e == shared { (w.sgate, w.sup, w.sdown) } else { (w.gate[e], w.up[e], w.down[e]) }
     };
-    let own: Vec<Vec<usize>> = experts.iter().map(|&e| (0..NH).filter(|&h| (16 * e + h + l) % nr == rank).collect()).collect();
+    let own: Vec<Vec<usize>> = experts.iter().map(|&e| own(e)).collect::<Result<_, _>>()?;
     let nblk: usize = own.iter().map(Vec::len).sum();
+    // the widths this rank reads, their files' codebook, and the trellis tensor each half must lie in
+    let mut ks: Vec<u8> = experts.iter().zip(&own)
+        .flat_map(|(&e, hs)| { let (g, u, d) = of(e); hs.iter().flat_map(move |&h| [g[h], u[h], d]).collect::<Vec<_>>() })
+        .collect();
+    ks.sort_unstable();
+    ks.dedup();
+    let (cb, tranges) = layer_codebook(l, &ks, wfile)?;
+    let xf = cb.map_or(codebook::UNCHECKED, Codebook::expert_format);
+    let inside = |k: u8, e: usize, proj: usize, off: u64| -> Result<(), String> {
+        match tranges.get(&k) {
+            None => return Ok(()),         // a missing file: the layer is UNCHECKED, and its bytes cannot load
+            Some(r) if r.holds(e == shared, proj, off, hidden as u64 * 16 * k as u64) => return Ok(()),
+            Some(_) => {}
+        }
+        Err(format!("layer {l}: expert {e} {} half at offset {off} of the K{k} width file is not inside its trellis \
+                     tensor (the index slices and the width file disagree)", ["gate", "up", "down"][proj]))
+    };
     let bs = w.sdown > 0;
-    let get = |k: u8| ls.get(&k).ok_or(format!("layer {l}: no index slice at K{k}"));
+    // the slice that holds unit (e, h) at width k
+    let get = |k: u8, e: usize, h: usize| ls.get(&(k, (w.nh * e + h + l) % slices.nr)).ok_or(format!("layer {l}: no index slice at K{k}"));
     let row_of = |s: &LayerSlice, e: usize, h: usize| s.row.get(&(e, h)).copied().ok_or(format!("layer {l}: expert {e} half {h} not in the slice"));
     // block row of expert e: routed e, the shared expert after the routed ones
     let brow = |e: usize| if e == shared { nroute } else { e };
@@ -377,17 +473,20 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u
     };
     // pass 1: fc1 (gate, up halves), v1, v2[0:2]
     let fc1_bytes: u64 = experts.iter().zip(&own).map(|(&e, hs)| hs.iter().map(|&h| hb(of(e).0[h]) + hb(of(e).1[h])).sum::<u64>()).sum();
-    let fc1 = b.begin(format!("{p}.tr3.fc1"), "u8", vec![fc1_bytes as i64], fc1_bytes, Some(XF_EXLR8));
+    let fc1 = b.begin(format!("{p}.tr3.fc1"), "u8", vec![fc1_bytes as i64], fc1_bytes, Some(xf));
     let (mut off, mut row) = (0u64, 0usize);
     for (i, &e) in experts.iter().enumerate() {
         let (gw, uw, dk) = of(e);
         let hs = &own[i];
         table[i] = [off as i64, 0, row as i64, hs.len() as i64, dk as i64, *hs.first().unwrap_or(&0) as i64];
-        kmix[i] = kmix_word(&gw, &uw, dk, hs);
+        kmix[i] = kmix_word(&gw, &uw, dk, hs).ok_or_else(|| format!(
+            "layer {l}: expert {e} has {} blocks on this rank with mixed widths; tr3.kmix holds at most 8 (a \
+             uniform-width manifest or a larger TP avoids it)", hs.len()))?;
         for &h in hs {
             for (proj, k) in [(0usize, gw[h]), (1, uw[h])] {
-                let s = get(k)?;
+                let s = get(k, e, h)?;
                 let j = row_of(s, e, h)?;
+                inside(k, e, proj, s.offset[j * 3 + proj] as u64)?;
                 let f = b.file(wfile(l, k));
                 b.seg(fc1 + off, hb(k), Op::Copy, f, s.offset[j * 3 + proj] as u64);
                 off += hb(k);
@@ -399,14 +498,15 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u
     }
     // pass 2: fc2 (down halves, item128 -> gr8 order), v2[2], v3
     let fc2_bytes: u64 = experts.iter().zip(&own).map(|(&e, hs)| hs.len() as u64 * hb(of(e).2)).sum();
-    let fc2 = b.begin(format!("{p}.tr3.fc2"), "u8", vec![fc2_bytes as i64], fc2_bytes, Some(XF_EXLR8));
+    let fc2 = b.begin(format!("{p}.tr3.fc2"), "u8", vec![fc2_bytes as i64], fc2_bytes, Some(xf));
     let (mut off, mut row) = (0u64, 0usize);
     for (i, &e) in experts.iter().enumerate() {
         let dk = of(e).2;
         table[i][1] = off as i64;
         for &h in &own[i] {
-            let s = get(dk)?;
+            let s = get(dk, e, h)?;
             let j = row_of(s, e, h)?;
+            inside(dk, e, 2, s.offset[j * 3 + 2] as u64)?;
             let f = b.file(wfile(l, dk));
             b.seg(fc2 + off, hb(dk), Op::Item128 { hidden }, f, s.offset[j * 3 + 2] as u64);
             off += hb(dk);
@@ -419,18 +519,188 @@ pub(crate) fn v2_layer(b: &mut Builder, l: usize, w: &Widths, slices: &HashMap<u
     if bs {
         let s = ls.values().next().ok_or(format!("layer {l}: no index slice"))?;
         let sg: Vec<u8> = s.signs.iter().flat_map(|&x| if (x as i8) < 0 { [0x00, 0xBC] } else { [0x00, 0x3C] }).collect();
-        b.mem(format!("{p}.tr3.sg"), "f16", vec![2, hidden as i64], sg);
-        b.mem(format!("{p}.tr3.v1b"), "f16", vec![n, 2, blocks as i64], v1);
+        b.mem(format!("{p}.tr3.sg"), "f16", vec![2, hidden as i64], sg, xf);
+        b.mem(format!("{p}.tr3.v1b"), "f16", vec![n, 2, blocks as i64], v1, xf);
     } else {
-        b.mem(format!("{p}.tr3.v1"), "f16", vec![n, 2, hidden as i64], v1);
+        b.mem(format!("{p}.tr3.v1"), "f16", vec![n, 2, hidden as i64], v1, xf);
     }
-    b.mem(format!("{p}.tr3.v2"), "f16", vec![n, 3, 128], v2);
+    b.mem(format!("{p}.tr3.v2"), "f16", vec![n, 3, 128], v2, xf);
     if bs {
-        b.mem(format!("{p}.tr3.v3b"), "f16", vec![n, blocks as i64], v3);
+        b.mem(format!("{p}.tr3.v3b"), "f16", vec![n, blocks as i64], v3, xf);
     } else {
-        b.mem(format!("{p}.tr3.v3"), "f16", vec![n, hidden as i64], v3);
+        b.mem(format!("{p}.tr3.v3"), "f16", vec![n, hidden as i64], v3, xf);
     }
-    b.mem(format!("{p}.tr3.table"), "i64", vec![ne as i64, 6], table.iter().flatten().flat_map(|v| v.to_le_bytes()).collect());
-    b.mem(format!("{p}.tr3.kmix"), "i64", vec![ne as i64], kmix.iter().flat_map(|v| v.to_le_bytes()).collect());
+    b.mem(format!("{p}.tr3.table"), "i64", vec![ne as i64, 6], table.iter().flatten().flat_map(|v| v.to_le_bytes()).collect(), xf);
+    b.mem(format!("{p}.tr3.kmix"), "i64", vec![ne as i64], kmix.iter().flat_map(|v| v.to_le_bytes()).collect(), xf);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const D: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/v2fetch");
+    const NE: u64 = 2;     // the fixture's routed experts (tests/make_v2fetch_fixture.py)
+
+    /// A width file header of the fixture's layout (gate, up, down tensors of NE x 16 halves from file offset 65536):
+    /// trellis tensors named with `suffix`, metadata codebook `meta`, the tensors `short` bytes shorter than the halves.
+    fn width_file(dir: &std::path::Path, l: usize, k: u8, suffix: &str, meta: Option<&str>, short: u64) {
+        let hb = 98304 * k as u64;
+        let n = NE * 16 * hb;
+        let mut h = String::from("{");
+        let mut m = String::from("\"format\":\"exlr8-v2\",\"contents\":\"trellis\"");
+        if let Some(c) = meta {
+            m += &format!(",\"codebook\":\"{c}\"");
+        }
+        h += &format!("\"__metadata__\":{{{m}}}");
+        for (p, proj) in ["gate", "up", "down"].iter().enumerate() {
+            let a = p as u64 * n;
+            h += &format!(",\"trellis.{proj}{suffix}\":{{\"dtype\":\"U8\",\"shape\":[{}],\"data_offsets\":[{a},{}]}}", n - short, a + n - short);
+        }
+        h += "}";
+        let mut b = h.into_bytes();
+        b.resize(65536 - 8, b' ');
+        let mut out = (b.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(&b);
+        let path = dir.join(format!("exlr8-layer-{l:03}.k{k}.safetensors"));
+        std::fs::write(&path, &out).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(65536 + 3 * n).unwrap();
+    }
+
+    /// Plans the fixture's layers at TP4 rank 1 against width files in `dir`: each layer's expert_format.
+    fn plan_layers(dir: &std::path::Path) -> Result<Vec<String>, String> {
+        let man = width_manifest(&format!("{D}/manifest.json"))?;
+        let slices = Slices::open(&format!("{D}/slices"), 4, &[1])?;
+        let d = dir.to_str().unwrap().to_string();
+        let wfile = move |l: usize, k: u8| width_file_path(&d, l, k);
+        let mut b = Builder::new();
+        let mut out = Vec::new();
+        for l in [3, 4] {
+            let w = widths(&man, l)?.unwrap();
+            v2_layer(&mut b, l, &w, &slices, &wfile, &|e| Ok(formula_halves(e, l, 4, 1)))?;
+            let xf: Vec<&str> = b.tensors.iter().filter(|t| t.name.starts_with(&format!("L{l:03}.")))
+                .map(|t| t.expert_format.as_deref().unwrap_or("")).collect();
+            assert!(xf.iter().all(|x| *x == xf[0]), "layer {l}: tensors with different expert formats {xf:?}");
+            out.push(xf[0].to_string());
+        }
+        Ok(out)
+    }
+
+    fn width_file_path(dir: &str, l: usize, k: u8) -> String {
+        super::width_file(dir, l, k)
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("v2plan-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// (suffix, metadata) of each codebook as the exlr8 writer names them
+    fn named(cb: &str) -> (String, Option<String>) {
+        match cb {
+            "mcg" => (String::new(), None),
+            "mul1" => (".mul1".into(), Some("mul1 0x83DCD12D, every value rounded to E4M3".into())),
+            _ => (".pmcgx".into(), Some("pmcgx V2 L20 0xCBAC1FED/0xBCA14C51, every value rounded to E4M3".into())),
+        }
+    }
+
+    fn files(dir: &std::path::Path, l: usize, cb: &str) {
+        let (s, m) = named(cb);
+        for k in [2, 3, 4] {
+            width_file(dir, l, k, &s, m.as_deref(), 0);
+        }
+    }
+
+    #[test]
+    fn each_layer_takes_its_files_codebook() {
+        let d = tmp("cb");
+        // mcg as published (no metadata), and the mcg metadata string the index files carry
+        files(&d, 3, "mcg");
+        width_file(&d, 4, 2, "", Some("mcg 0xCBAC1FED, every value rounded to E4M3"), 0);
+        width_file(&d, 4, 3, "", None, 0);
+        width_file(&d, 4, 4, "", None, 0);
+        assert_eq!(plan_layers(&d).unwrap(), ["exlr8-e4m3", "exlr8-e4m3"]);
+        // a model whose layers differ: each layer's tensors carry its own codebook
+        files(&d, 3, "mul1");
+        files(&d, 4, "pmcgx");
+        assert_eq!(plan_layers(&d).unwrap(), ["exlr8-e4m3-mul1", "exlr8-e4m3-pmcgx"]);
+        files(&d, 3, "pmcgx");
+        files(&d, 4, "mcg");
+        assert_eq!(plan_layers(&d).unwrap(), ["exlr8-e4m3-pmcgx", "exlr8-e4m3"]);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_wrong_or_unknown_codebook_stops_the_plan() {
+        let d = tmp("bad");
+        files(&d, 4, "mcg");
+        let refused = |what: &str, want: &[&str]| {
+            let e = plan_layers(&d).err().unwrap_or_else(|| panic!("{what}: planned"));
+            for w in want {
+                assert!(e.contains(w), "{what}: {e}");
+            }
+        };
+        // one layer's widths in two codebooks
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 3, ".mul1", Some("mul1 0x83DCD12D, E4M3"), 0);
+        refused("mixed widths", &["layer 3", "mcg", "mul1"]);
+        // a codebook gr8 does not know, by name or by metadata
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 2, ".gauss", Some("gauss 0x12345678, E4M3"), 0);
+        refused("unknown suffix", &["layer 3", "gauss"]);
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 4, "", Some("gauss 0x12345678, E4M3"), 0);
+        refused("unknown metadata", &["layer 3", "gauss"]);
+        // name and metadata disagree, or a suffixed name has no metadata
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 4, "", Some("pmcgx V2 L20 0xCBAC1FED/0xBCA14C51, E4M3"), 0);
+        refused("pmcgx metadata on mcg names", &["layer 3", "pmcgx"]);
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 4, ".mul1", Some("mcg 0xCBAC1FED, E4M3"), 0);
+        refused("mcg metadata on mul1 names", &["layer 3", "mul1"]);
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 4, ".mul1", None, 0);
+        refused("mul1 names without metadata", &["layer 3", "mul1"]);
+        // a pair trellis of another shape, and a multiplier that contradicts the name
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 4, ".pmcgx", Some("pmcgx V2 L22 0xCBAC1FED/0xBCA14C51, E4M3"), 0);
+        refused("pmcgx L22", &["layer 3", "L20"]);
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 4, ".mul1", Some("mul1 0xCBAC1FED, E4M3"), 0);
+        refused("mul1 with mcg's multiplier", &["layer 3", "0x83DCD12D"]);
+        // halves the slices place outside the trellis tensors
+        files(&d, 3, "mcg");
+        width_file(&d, 3, 4, "", None, 16 * 98304 * 4);       // expert 1 is past the end
+        refused("short tensors", &["layer 3", "not inside"]);
+        // no header at all (a sparse cache file without its header range)
+        files(&d, 3, "mcg");
+        std::fs::write(d.join("exlr8-layer-003.k2.safetensors"), [0u8; 16]).unwrap();
+        refused("no header", &["layer 3", "K2"]);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_layer_without_its_width_files_is_unchecked() {
+        let d = tmp("missing");
+        files(&d, 3, "pmcgx");
+        // layer 4's K3 file is not there (a partial copy of the release): its codebook is unknown, never mcg
+        files(&d, 4, "mul1");
+        std::fs::remove_file(d.join("exlr8-layer-004.k3.safetensors")).unwrap();
+        assert_eq!(plan_layers(&d).unwrap(), ["exlr8-e4m3-pmcgx", codebook::UNCHECKED]);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn kmix_holds_mixed_widths_of_at_most_8_blocks() {
+        let all: Vec<usize> = (0..16).collect();
+        let (mut gw, uw) = ([3u8; NH_MAX], [3u8; NH_MAX]);
+        // uniform widths need no word at any block count
+        assert_eq!(kmix_word(&gw, &uw, 3, &all), Some(0));
+        gw[1] = 4;
+        assert_eq!(kmix_word(&gw, &uw, 3, &all[..2]), Some(0x3433));
+        assert!(kmix_word(&gw, &uw, 3, &all[..8]).is_some());
+        assert_eq!(kmix_word(&gw, &uw, 3, &all[..9]), None);
+        assert_eq!(kmix_word(&gw, &uw, 3, &all), None);
+    }
 }

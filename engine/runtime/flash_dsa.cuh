@@ -17,6 +17,8 @@
 //                                              the GEMV bindings for every M = 1..MX (needs m.sc and the step buffers)
 //   prepare_dsa_layer(m, i, M, st)             outside capture: graph form, the attention replay entries for M rows
 //   launch_dsa_block(m, i, M, context, st)     the step: projections, attention, o_proj, publish of collective 2i
+//                                              (S2 with several sessions: s2_attention on the layer's batch view, s2.cuh;
+//                                              past R with GR8_CP: launch_dsa_cp on the CP fabric)
 #pragma once
 #if G6_MODEL_FLASH
 
@@ -24,7 +26,7 @@
 inline dslot::Slot make_flash_slot(const Model& m, int c)
 {
     dslot::Slot q;
-    q.send = m.f.send; q.bell = m.f.doorbell; q.stepp = m.stepp; q.stride = m.f.stride;
+    q.send = m.f.send; q.bell = m.f.doorbell; q.stepp = m.stepp; q.half = g6::fab_slot_base(m.f, m.f.ncoll); q.off = g6::fab_slot_base(m.f, c);
     q.ncoll = m.f.ncoll; q.c = c; q.ticket = m.tickets + c; q.xt = m.f.xt;
     return q;
 }
@@ -48,9 +50,37 @@ inline void bind_dsa_layer(Model& m, int i, const Find& find, int capacity, cuda
     };
     y.ap = G6AttnPack{at("kv_b.uk"), at("kv_b.uv"), at("kv_a_norm"), at("idx.k_norm.w"), at("idx.k_norm.b")};
     y.ap.index_ape = at("self_attn.indexer.index_kpool_compress_ape");
-    // decode only (build_flash: max_rows <= MX); the GLM attention scratch sharing (G6_DEC_SHARED_SCRATCH) is not wired here
-    if (int e = g6_attn_bind_create_ext(&y.ab, &y.ap, m.rank, y.l, capacity, MX, ATT_QT, st, nullptr, 0))
-        die("Flash DSA layer " + std::to_string(y.l) + ": attention binding failed (" + std::to_string(e) + ")");
+    // decode only (build_flash: max_rows <= MX); the GLM attention scratch sharing (GR8_DEC_SHARED_SCRATCH) is not wired here
+    // GR8_GLM53F_KV_CHUNKS=1: the MLA and index caches in kvchunks regions under the model's chunk map (flash_kv.h), every
+    // chunk online at boot (FLASH_CAP_POLICY=protected: the capacity is never lent); 0 (default): one cudaMalloc
+    const int chunked = flashkv::env_mode();
+    if (chunked < 0) die("GR8_GLM53F_KV_CHUNKS is 0 or 1");
+#if defined(G6_CP) && G6_CP
+    if (chunked && m.cp.on) die("GR8_GLM53F_KV_CHUNKS=1 is not with GR8_CP");
+#endif
+    int e = 0;
+    if (chunked)
+    {
+        const uint32_t pages = (uint32_t)((capacity + g6kv::PAGE - 1) / g6kv::PAGE);
+        int dev = 0;
+        G6RT_CK(cudaGetDevice(&dev));
+        if (!m.fkv.pages && m.fkv.init(pages, UINT32_MAX, dev)) die("GR8_GLM53F_KV_CHUNKS: " + m.fkv.err);
+        if (m.fkv.pages != pages) die("GR8_GLM53F_KV_CHUNKS: the DSA layers' capacities differ");
+        G6KvChunks *mla = nullptr, *idx = nullptr;
+        if (m.fkv.add(&mla, &idx)) die("GR8_GLM53F_KV_CHUNKS layer " + std::to_string(y.l) + ": " + m.fkv.err);
+        e = g6_attn_bind_create_chunked(&y.ab, &y.ap, m.rank, y.l, capacity, MX, ATT_QT, st, mla, idx);
+    }
+#if defined(G6_CP) && G6_CP
+    // GR8_CP: the replicated prefix and this rank's pages past R (flash_bind.cu)
+    else if (m.cp.on)
+    {
+        if (m.cp.colls.q.size() != (size_t)m.nl || m.cp.colls.q[i] < 0 || m.cp.colls.cand[i] < 0)
+            die("GR8_CP: the CP collectives do not match the Flash layer list");
+        e = g6_attn_bind_create_cp(&y.ab, &y.ap, m.rank, y.l, capacity, MX, ATT_QT, m.cp.R, g6nr::NR, st, nullptr, 0);
+    }
+#endif
+    else e = g6_attn_bind_create_ext(&y.ab, &y.ap, m.rank, y.l, capacity, MX, ATT_QT, st, nullptr, 0);
+    if (e) die("Flash DSA layer " + std::to_string(y.l) + ": attention binding failed (" + std::to_string(e) + ")");
     y.q_a_norm = (const __nv_bfloat16*)need(find, lname(y.l, "q_a_norm"));
     const TensorRef qn = find(lname(y.l, "q_a_norm"));
     if (!qn.bf16 || qn.nd != 1 || qn.shape[0] != QA) die("Flash DSA: q_a_norm must be BF16 [1536]");
@@ -82,11 +112,10 @@ inline const char* make_dsa(Model& m, int i, int M, const Find& find, bind::Laye
     if ((e = dtr::make_mat(T("o_proj.trellis"), T("o_proj.suh"), T("o_proj.svh"), dtr::SIDE_IN, opm))) return e;
     const bool qa_mx = T("q_a.mx.gv").p != nullptr, kva_mx = T("kv_a.mx.gv").p != nullptr;
     const bool wk_mx = T("idx.wk.mx.gv").p != nullptr, wqb_mx = T("idx.wq_b.mx.gv").p != nullptr;
-    static const int xin_ord = getenv("G6_DSA_XIN_ORDER") ? atoi(getenv("G6_DSA_XIN_ORDER")) : 0;
-    static const int qb_rot  = !getenv("G6_DSA_QB_ROT") || atoi(getenv("G6_DSA_QB_ROT"));
-    static const int op_rot_env = getenv("G6_DSA_OPROJ_ROT") ? atoi(getenv("G6_DSA_OPROJ_ROT")) : -1;
-    const bool op_rot = op_rot_env >= 0 ? (op_rot_env != 0) : (M > 1);
-    static const int iq_tpc  = getenv("G6_DSA_IDXQ_TPC") ? atoi(getenv("G6_DSA_IDXQ_TPC")) : 1;
+    const bool xin_ord = knob::glm53f_dsa_xin_order();
+    const bool qb_rot  = knob::glm53f_dsa_qb_rot();
+    const bool op_rot  = knob::glm53f_dsa_oproj_rot().value_or(M > 1);
+    const int iq_tpc   = (int)knob::glm53f_dsa_idxq_tpc();
     //                       tensor                                                 codec  tpc ks  M  fragments  output          dtype
     if ((e = bind::make_gv(T(qa_mx ? "q_a.mx.gv" : "q_a.gv"),                       qa_mx ? MXFP8 : BF16W,  2, 16, M, qa_mx ? sc.xf_x : sc.xb_x,  m.q_a,   gv::O_F16, L.q_a))) return e;
     if ((e = bind::make_gv(T(kva_mx ? "kv_a.mx.gv" : "kv_a.gv"),                    kva_mx ? MXFP8 : BF16W, 1, 32, M, kva_mx ? sc.xf_x : sc.xb_x, m.kv_a,  gv::O_F16, L.kv_a))) return e;
@@ -125,7 +154,7 @@ inline const char* make_dsa(Model& m, int i, int M, const Find& find, bind::Laye
         qbK != QA || qbO != h * 256 || L.idx_q.K != QA || L.idx_q.O != IDXQ || opK != h * 256 || opO != HID)
         return "Flash DSA: projection shapes do not match the geometry and the attention binding's head count";
     L.heads = h;
-    static const bool multi = !getenv("G6_GV_MULTI") || atoi(getenv("G6_GV_MULTI"));
+    const bool multi = knob::gv_multi();
     if (multi)
     {
         if (xin_ord) bind::make_gv_multi({&L.idx_k, &L.q_a, &L.idx_w, &L.idx_g, &L.kv_a}, M, L.x_in);
@@ -227,6 +256,7 @@ inline G6AttnStep dsa_step(Model& m, int M, int context)
     s.rows = M; s.context = context;
     s.q_b = m.q_b; s.kv_a = m.kv_a; s.positions = m.pos;
     s.index_q = m.idx_q; s.index_k = m.idx_k; s.index_weight = m.idx_w; s.index_gate = m.idx_g;
+    s.raw_sess = m.rsess;
     return s;
 }
 
@@ -245,35 +275,195 @@ inline void prepare_dsa_layer(Model& m, int i, int M, cudaStream_t st)
     }
 }
 
-// rows at positions m.pos[0..M-1], context = last position + 1 (plain form; the graph form reads the step cell)
-inline void launch_dsa_block(Model& m, int i, int M, int context, cudaStream_t st)
+#if defined(G6_CP) && G6_CP
+// grid (16, M), 256 threads: row m's hd heads of absorbed q (src [M][hd][512], or source j's slot of the q all-gather v)
+// -> heads off.. of dst [M][ht][512]
+__global__ void k_cp_qheads(const float* src, float* dst, int hd, int ht, int off)
+{
+    const size_t n = (size_t)hd * KVA / 4, m = blockIdx.y;
+    const float4* a = reinterpret_cast<const float4*>(src) + m * n;
+    float4* d = reinterpret_cast<float4*>(dst) + ((size_t)m * ht + off) * KVA / 4;
+    for (size_t i = blockIdx.x * 256 + threadIdx.x; i < n; i += (size_t)gridDim.x * 256) d[i] = a[i];
+}
+__global__ void k_cp_vqheads(g6::VSlotDev v, int j, const u64* stepp, float* dst, int hd, int ht, int off)
+{
+    const size_t n = (size_t)hd * KVA / 4, m = blockIdx.y;
+    const float4* a = reinterpret_cast<const float4*>(cpglue::vrecv(v, *stepp, j)) + m * n;
+    float4* d = reinterpret_cast<float4*>(dst) + ((size_t)m * ht + off) * KVA / 4;
+    for (size_t i = blockIdx.x * 256 + threadIdx.x; i < n; i += (size_t)gridDim.x * 256) d[i] = __ldcv(a + i);
+}
+// The CP attention of DSA layer i: launch_attn_cp's stages and collectives (rank.cuh) at Flash's sizes, one call per
+// layer (S2: on the layer's CP batch view, every row's table and bounds in its cell). In launch_attn_cp's phases, so m4sim's loopback can deliver between them (-1 = all, in
+// order, as the real fabric runs it):
+//   0: cp_front (append, absorb my heads) -> q(i) put; cp_index -> cand(i) put
+//   1: wait cand(i), merge; my head group's partial; wait q(i); each other group's partial, put to its owner at once
+//      (CpState::one, equal head groups: wait q(i), then every group's partial in one g6a_cp_groups call)
+//   2: wait the nr - 1 partials of my heads, LSE merge in shard order, value_project into the binding's output
+// GR8_DEC_EVPROF: the replicated attention's nine marks (DP_A_*, the same sequence in every main-step graph) end, in order:
+// front, index + puts, candidate wait + merge, my group's partial, q wait, the other groups' partials + puts, partial
+// waits, finish (twice)
+inline void launch_dsa_cp(Model& m, int i, int M, int context, int phase, cudaStream_t st)
+{
+    Layer& y = m.layers[i];
+    CpState& C = m.cp;
+    const int r = m.rank, nr = g6nr::NR, H = y.ab.args.heads, G = 16, TP = g6kv::TOP_POOLS;
+    if (H != cp_heads(r, y.l)) die("GR8_CP: layer " + std::to_string(y.l) + " binding heads disagree with the group rule");
+    G6AttnReplay* srp = nullptr;
+#ifdef DEC_S2
+    if (m.s2on) srp = s2_cp_replay(m, i, M);
+#endif
+    if (!srp && m.graph && !y.rp_on[m.cur][M]) die("prepare_dsa_layer(m, i, M) was not called before a graph step");
+    G6Attn* a = srp ? &srp->fixed : m.graph ? &y.rp[m.cur][M].fixed : &y.ab.args;
+    const G6AttnStepCell* cell = srp ? srp->cell : m.graph ? y.rp[m.cur][M].cell : nullptr;
+    void* scr = srp ? srp->scratch : y.ab.scratch;
+    const size_t sb = srp ? srp->scratch_bytes : y.ab.scratch_bytes;
+    const int cq = C.colls.q[i], cc = C.colls.cand[i];
+    // every collective's wire size is M x its row bytes (CpColls, sized for the widest head group)
+    const size_t qn = (size_t)M * H * KVA * 4, cb = (size_t)M * C.colls.cand_row;
+    const size_t qw = (size_t)M * C.colls.q_row, pw = (size_t)M * C.colls.part_row;
+    const size_t blk = cp_blk(M, H);
+    auto part_of = [&](int s) { return C.part_all + s * blk; };
+    auto cpart = [&](int k) { return C.colls.part[(size_t)i * (nr - 1) + k - 1]; };
+    const float *q = nullptr, *rope = nullptr;
+    if (phase <= 0)
+    {
+        if (!srp && !m.graph)
+        {
+            const G6AttnStep s = dsa_step(m, M, context);
+            G6RT_CK(g6_attn_bind_prepare(&y.ab, &s, st));
+        }
+        G6RT_CK(g6_attn_cp_front(a, cell, scr, sb, st));
+        dmark(DP_A_APPEND, st);
+        G6RT_CK(g6_attn_cp_qabs(a, scr, &q, &rope));
+        cpglue::k_vput<<<G, 256, 0, st>>>(q, qn, nullptr, 0, C.vs[cq], m.stepp, C.tickets + cq);
+        G6RT_CK(g6_attn_cp_index(a, cell, scr, sb, C.cand, st));
+        cpglue::k_vput<<<G, 256, 0, st>>>(C.cand + (size_t)r * M * TP, cb, nullptr, 0, C.vs[cc], m.stepp, C.tickets + cc);
+        dmark(DP_A_INDEX, st);
+    }
+    if (phase == 0) return;
+    if (phase <= 1)
+    {
+        if (!q) G6RT_CK(g6_attn_cp_qabs(a, scr, &q, &rope));
+        const g6::VSlotDev& v = C.vs[cc];
+        cpglue::k_vwait<<<1, 32, 0, st>>>(v, m.stepp, cb, -1, cpglue::ERR_CP);
+        for (int j = 0; j < v.nsrc; ++j)
+            cpglue::k_vget<<<G, 256, 0, st>>>(v, j, m.stepp, C.cand + (size_t)v.src[j] * M * TP, cb);
+        G6RT_CK(g6_attn_cp_merge_index(a, cell, C.cand, st));
+        dmark(DP_A_SELECT, st);
+        if (C.one)
+        {
+            // my group at heads 0.., group k (rank (r + k) % nr) at heads k H..; one call; my partial to part_all[r], the
+            // others published from part_tmp block k
+            const int ht = nr * H;
+            const size_t tblk = cp_blk(M, H), pb = (size_t)M * H * (KVA + 2) * 4;
+            k_cp_qheads<<<dim3(16, M), 256, 0, st>>>(q, C.qall, H, ht, 0);
+            dmark(DP_A_ABSORB, st);
+            const g6::VSlotDev& vq = C.vs[cq];
+            cpglue::k_vwait<<<1, 32, 0, st>>>(vq, m.stepp, qw, -1, cpglue::ERR_CP);
+            for (int k = 1; k < nr; ++k)
+            {
+                const int j = cpglue::vsrc_index(vq, (r + k) % nr);
+                if (j < 0 || cp_heads((r + k) % nr, y.l) != H) die("GR8_CP: q all-gather slot or head group");
+                k_cp_vqheads<<<dim3(16, M), 256, 0, st>>>(vq, j, m.stepp, C.qall, H, ht, k * H);
+            }
+            dmark(DP_A_SCORES, st);
+            G6Attn ad = *a;
+            ad.heads = ht;
+            G6RT_CK(g6_attn_cp_groups(&ad, cell, C.one_buf, C.one_bytes, C.qall, nullptr, C.part_tmp, H, (int64_t)tblk, st));
+            G6RT_CK(cudaMemcpyAsync(part_of(r), C.part_tmp, pb, cudaMemcpyDeviceToDevice, st));
+            for (int k = 1; k < nr; ++k)
+                cpglue::k_vput<<<G, 256, 0, st>>>(C.part_tmp + k * tblk, pb, nullptr, 0, C.vs[cpart(k)], m.stepp, C.tickets + cpart(k));
+            dmark(DP_A_NORMALIZE, st);
+        }
+        else
+        {
+            G6RT_CK(g6_attn_cp_group(a, cell, scr, sb, q, nullptr, part_of(r), st));
+            dmark(DP_A_ABSORB, st);
+            const g6::VSlotDev& vq = C.vs[cq];
+            cpglue::k_vwait<<<1, 32, 0, st>>>(vq, m.stepp, qw, -1, cpglue::ERR_CP);
+            dmark(DP_A_SCORES, st);
+            for (int k = 1; k < nr; ++k)
+            {
+                const int d = (r + k) % nr, j = cpglue::vsrc_index(vq, d), hd = cp_heads(d, y.l);
+                if (j < 0) die("GR8_CP: q all-gather has no slot for rank " + std::to_string(d));
+                G6Attn ad = *a;   // d's head group: hd heads of its absorbed q over MY keys
+                ad.heads = hd;
+                cpglue::k_vget<<<G, 256, 0, st>>>(vq, j, m.stepp, C.qbuf, (size_t)M * hd * KVA * 4);
+                G6RT_CK(g6_attn_cp_group(&ad, cell, scr, sb, C.qbuf, nullptr, C.part_tmp, st));
+                cpglue::k_vput<<<G, 256, 0, st>>>(C.part_tmp, (size_t)M * hd * (KVA + 2) * 4, nullptr, 0, C.vs[cpart(k)], m.stepp,
+                                                   C.tickets + cpart(k));
+            }
+            dmark(DP_A_NORMALIZE, st);
+        }
+    }
+    if (phase == 1) return;
+    for (int k = 1; k < nr; ++k)
+    {
+        const g6::VSlotDev& v = C.vs[cpart(k)];
+        cpglue::k_vwait<<<1, 32, 0, st>>>(v, m.stepp, pw, -1, cpglue::ERR_CP);
+        cpglue::k_vget<<<G, 256, 0, st>>>(v, 0, m.stepp, part_of(v.src[0]), (size_t)M * H * (KVA + 2) * 4);   // partials of MY heads
+    }
+    dmark(DP_A_CONTEXT, st);
+    G6RT_CK(g6_attn_cp_finish(a, cell, scr, sb, C.part_all, st));
+    dmark(DP_A_MERGE, st);
+    dmark(DP_A_VPROJ, st);
+}
+// the step takes the CP block for its DSA layers (a graph step: its bucket is past R; S2: the step's bucket, s2_cp_step)
+inline bool dsa_cp(const Model& m, int context) { return cp_block(m, context); }
+#endif
+
+// rows at positions m.pos[0..M-1], context = last position + 1 (plain form; the graph form reads the step cell).
+// phase (a step past R with GR8_CP, m4sim's loopback): launch_dsa_cp's phase; 0 also runs the projections, 2 o_proj and the
+// publish. -1 = the whole block
+inline void launch_dsa_block(Model& m, int i, int M, int context, cudaStream_t st, int phase)
 {
     Layer& y = m.layers[i];
     if (!y.built[M]) die("launch_dsa_block: bind_dsa_layer did not run for layer " + std::to_string(y.l));
     const bind::Layer& b = y.L[M];
-    static const int qb_fuse = !getenv("G6_DSA_QB_FUSE") ? 1 : atoi(getenv("G6_DSA_QB_FUSE"));
-    const bool use_qb_rot = b.q_b_t.on && !b.q_b_t.rot;
-    dmark(DP_OTHER, st);
-    if (b.x_in.n) bind::launch(b.x_in, st);
-    else { bind::launch(b.q_a, st); bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); bind::launch(b.idx_g, st); }
-    glue::k_rmsnorm_rows<__half><<<M, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, geom::RMS_EPS_FLASH, m.q_a_n, QA,
-                                                    b.xf_qa.on ? b.xf_qa.f16 : nullptr, b.xf_qa.on ? b.xf_qa.bf16 : nullptr,
-                                                    use_qb_rot ? b.q_b_t.a.suh[0] : nullptr,
-                                                    use_qb_rot ? const_cast<u32*>(b.q_b_t.a.xa) : nullptr);
-    dmark(DP_QA, st);
-    if (qb_fuse && use_qb_rot && b.q_b_t.a.K == 1536 && b.q_b_t.a.N == 8192 && b.q_b_t.a.ks == 12 && b.q_b_t.sub == 1 &&
-        b.idx_q.on && b.idx_q.codec == bind::MXFP8 && b.idx_q.tpc == 1 && b.idx_q.ks == 16 && b.idx_q.O == 4096)
+#if defined(G6_CP) && G6_CP
+    const bool cp = dsa_cp(m, context);
+#else
+    const bool cp = false;
+#endif
+    if (phase >= 0 && !cp) die("launch_dsa_block: a phase belongs to a CP step");
+    if (phase <= 0)
     {
-        g6mx::nt_dispatch(b.q_b_t.nt, [&](auto N) {
-            k_dsa_qb_idxq<decltype(N)::value><<<640, 512, 0, st>>>(b.q_b_t.a, b.idx_q, qb_fuse == 2 ? 1 : 0);
-        });
+        const int qb_fuse = (int)knob::glm53f_dsa_qb_fuse();
+        const bool use_qb_rot = b.q_b_t.on && !b.q_b_t.rot;
+        dmark(DP_OTHER, st);
+        if (b.x_in.n) bind::launch(b.x_in, st);
+        else { bind::launch(b.q_a, st); bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); bind::launch(b.idx_g, st); }
+        glue::k_rmsnorm_rows<__half><<<M, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, geom::RMS_EPS_FLASH, m.q_a_n, QA,
+                                                        b.xf_qa.on ? b.xf_qa.f16 : nullptr, b.xf_qa.on ? b.xf_qa.bf16 : nullptr,
+                                                        use_qb_rot ? b.q_b_t.a.suh[0] : nullptr,
+                                                        use_qb_rot ? const_cast<u32*>(b.q_b_t.a.xa) : nullptr);
+        dmark(DP_QA, st);
+        if (qb_fuse && use_qb_rot && b.q_b_t.a.K == 1536 && b.q_b_t.a.N == 8192 && b.q_b_t.a.ks == 12 && b.q_b_t.sub == 1 &&
+            b.idx_q.on && b.idx_q.codec == bind::MXFP8 && b.idx_q.tpc == 1 && b.idx_q.ks == 16 && b.idx_q.O == 4096)
+        {
+            g6mx::nt_dispatch(b.q_b_t.nt, [&](auto N) {
+                k_dsa_qb_idxq<decltype(N)::value><<<640, 512, 0, st>>>(b.q_b_t.a, b.idx_q, qb_fuse == 2 ? 1 : 0);
+            });
+        }
+        else
+        {
+            bind::launch_q_b(b, st);
+            bind::launch(b.idx_q, st);
+        }
+        dmark(DP_QB, st);
+    }
+#if defined(G6_CP) && G6_CP
+    if (cp)
+    {
+        launch_dsa_cp(m, i, M, context, phase, st);
+        if (phase == 0 || phase == 1) return;
     }
     else
-    {
-        bind::launch_q_b(b, st);
-        bind::launch(b.idx_q, st);
-    }
-    dmark(DP_QB, st);
+#endif
+#ifdef DEC_S2
+    if (m.s2on) s2_attention(m, i, M, st);   // the step's rows of every session on the batch view (s2.cuh)
+    else
+#endif
     if (m.graph)
     {
         if (!y.rp_on[m.cur][M]) die("prepare_dsa_layer(m, i, M) was not called before a graph step");
@@ -281,6 +471,10 @@ inline void launch_dsa_block(Model& m, int i, int M, int context, cudaStream_t s
     }
     else
     {
+        // GR8_GLM53F_KV_CHUNKS: no step reaches a page whose chunk is offline (admission keeps contexts inside)
+        if (m.fkv.pages && (uint64_t)context > m.fkv.tokens())
+            die("Flash DSA: context " + std::to_string(context) + " passes the " + std::to_string(m.fkv.tokens()) +
+                " tokens online (GR8_GLM53F_KV_CHUNKS)");
         const G6AttnStep s = dsa_step(m, M, context);
         G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
     }

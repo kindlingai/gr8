@@ -3,7 +3,7 @@
 //
 // Two forms of the cells of a step (the same S2In, one kernel):
 //  - per session: cells[session slot][layer] = the session's bounds (context, page_count = the pool's pages, table_size =
-//    pages, reuse_rows = rows of a shared-index layer). One attention call per session and layer (G6_S2_ATTN_PERSESSION=1).
+//    pages, reuse_rows = rows of a shared-index layer). One attention call per session and layer (GR8_TEST_S2_ATTN_PERSESSION=1).
 //    page_count only bounds a table entry. The slot's pages may sit anywhere in the pool, and its table holds -1 past them.
 //  - batched: one cell per layer for ALL rows of the step (bcells[layer], its `rows` pointer fixed at init) and, per layer,
 //    one G6AttnRow per step row (rows[layer][row]): the bounds and the block table of the session the row belongs to. Cell
@@ -14,20 +14,10 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include "../attn/replay.h"
+#include "s2_in.h"                    // S2N, S2In, s2in_copy
 
 namespace g6rt
 {
-
-constexpr int S2N = 8;                // session slots
-
-// per-step session layout. ns sessions in the step; j-th: slot sess[j], rows row0[j]..row0[j]+rows[j]-1, context ctx[j]
-// (sessions in ascending slot order, rows contiguous, row0[0] = 0)
-struct S2In
-{
-    int ns, cls;                      // cls: the step's k1 row class (1 / 3 / 5)
-    int sess[S2N], row0[S2N], rows[S2N], ctx[S2N];
-    int src0[S2N];                    // draft model, first form: the j-th session's first row in the main model's x
-};
 
 struct S2Cells
 {
@@ -47,7 +37,7 @@ __global__ void __launch_bounds__(128) k_s2_cells(S2Cells c)
 {
     __shared__ S2In sh;
     const int t = threadIdx.x;
-    if (t < (int)(sizeof(S2In) / 4)) reinterpret_cast<uint32_t*>(&sh)[t] = __ldcv(c.in + t);
+    s2in_copy(reinterpret_cast<uint32_t*>(&sh), c.in, t, 128);
     __syncthreads();
     for (int k = t; k < sh.ns * c.nl; k += 128)
     {

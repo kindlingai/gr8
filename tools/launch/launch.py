@@ -5,6 +5,9 @@
     down                       stop every box of the last boot (or this box alone)
     restart [OPTIONS]          down, then up
     status                     every box: its state, the engine, MemAvailable; the head's shim, front end and /health
+    health                     this box alone, in one line: exit 0 when its supervisor reports the cluster serving
+                               (and, on the head, the front end's /health answers 200), else 1. A readiness check for
+                               a compose healthcheck or a Kubernetes exec probe, on every rank
     logs [RANK|shim|front|supervisor] [-f]   a log, from any box
     check [OPTIONS]            this box's checks
     show-config [OPTIONS]      the effective options, the cluster options the handshake compares, their digest, the
@@ -12,23 +15,29 @@
     prepare [--rank R] [OPTIONS]   fill --model-cache with this box's part of the model, without booting: with an
                                https:// --model the release's files for this rank (it asks the hub for the
                                revision's commit again), and the drafter
+    knobs [WORD..] [OPTIONS]   every option: its flag, scope and meaning, and with GR8_MODEL set the value each TP
+                               runs with these options. WORDs keep the options whose name holds one of them
 
 OPTIONS are --key value (or KEY=value lines in a config file, or KEY in the environment); options.py lists them.
 --foreground runs the supervisor in this process. Exit status: 0 serving (or done), 1 failed, 2 bad options, 4 the
 handshake refused the boot.
 """
 import fcntl
+import http.client
 import json
 import os
 import signal
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import handshake  # noqa: E402
+import kvnode  # noqa: E402
+import models  # noqa: E402
 import modelset  # noqa: E402
 import options as opt  # noqa: E402
 import supervisor as sv  # noqa: E402
@@ -48,7 +57,7 @@ def parse(argv, check=True):
 
 
 def out_dir(o):
-    return os.path.join(os.path.abspath(o.get('G6_HOME')), 'out')
+    return os.path.join(os.path.abspath(o.get('GR8_WORK_DIR')), 'out')
 
 
 def supervisor_running(out):
@@ -134,7 +143,7 @@ def rpc(m, addr, msg, timeout=5):
 
 def cmd_down(argv):
     o = parse(argv, check=False)
-    out, home = out_dir(o), os.path.abspath(o.get('G6_HOME'))
+    out, home = out_dir(o), os.path.abspath(o.get('GR8_WORK_DIR'))
     m = members_of(o)
     if m:
         members, _, me = m
@@ -156,16 +165,19 @@ def cmd_down(argv):
     else:
         print('no handshake on this box: stopping this box only')
     pid = supervisor_running(out)
+    # the supervisor gives its engine quit_wait for an orderly quit (120 s when the quit stores the pool), as it
+    # recorded at its start (a store given only on the up command line)
+    qw = sv.recorded_quit_wait(out, o) if pid else sv.quit_wait(o)   # a dead supervisor's file is stale
     if pid and pid > 0:
         os.kill(pid, signal.SIGTERM)
-        for _ in range(300):
+        for _ in range(300 + 10 * qw):
             if not supervisor_running(out):
                 break
             time.sleep(0.1)
         else:
             print(f'the supervisor (pid {pid}) did not stop; killing it')
             os.kill(pid, signal.SIGKILL)
-    stopped = sv.stop_local(home, lambda s: print(s))
+    stopped = sv.stop_local(home, lambda s: print(s), qw)
     print(f'this box: {"stopped" if pid or stopped else "nothing was running"}')
     return 0
 
@@ -202,6 +214,85 @@ def cmd_status(argv):
     print(f'API     {url}/v1 ' + ('answers (/health 200)' if code == 200 else
                                   f'/health {code}: not ready' if code else 'answers nothing'))
     return 0
+
+
+def cmdline(pid, proc='/proc'):
+    """pid's command line as its words, or None where neither /proc nor ps can say. /proc/<pid>/cmdline on Linux;
+    elsewhere (macOS) `ps -o command=`, whose words split at spaces, so a path with a space in it reads as two."""
+    try:
+        with open(os.path.join(proc, str(pid), 'cmdline'), 'rb') as f:
+            return [a.decode(errors='replace') for a in f.read().split(b'\0') if a]
+    except OSError:
+        if os.path.isdir(os.path.join(proc, 'self')):
+            return None     # a /proc that does not show this pid: gone, or hidden
+    try:
+        r = subprocess.run(['ps', '-ww', '-o', 'command=', '-p', str(pid)], capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.split() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def is_supervisor(pid, proc='/proc', script='launch.py'):
+    """Whether pid runs a gr8 supervisor (`launch.py supervise` or `launch.py up --foreground`; a KV node's is
+    kvnode.py's), from its command line. A probe cannot use sv.recorded(): its start time against the pid file's mtime
+    moves when NTP steps the clock after boot, and the probe would call a serving box unready for the rest of that
+    boot. Where neither /proc nor ps can say, a live pid is taken as the supervisor."""
+    if not pid or not sv.alive(pid):
+        return False
+    argv = cmdline(pid, proc)
+    if argv is None:
+        return not os.path.isdir(os.path.join(proc, 'self'))
+    return any(os.path.basename(a) == script for a in argv) and ('supervise' in argv or '--foreground' in argv)
+
+
+# The probe asks 127.0.0.1 directly: an HTTP_PROXY that docker or a cluster sets in the container must not take it.
+NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def health(out, port, timeout=2, proc='/proc'):
+    """(ok, line): whether this box's part of the cluster serves, read from this box alone, so the same command is a
+    readiness check on every rank. Serving means out/gr8.state says `serving`, the supervisor that wrote it still runs,
+    and on the head (rank 0) the front end's /health answers 200. It takes no lock: a probe must not make a supervisor
+    that starts beside it think another one runs. Under load the front end can answer /health late: a probe that
+    times out (2 s) calls the head unready while it serves."""
+    st = read_state(out)
+    state, rank = st.get('state') or 'none', st.get('rank')
+    who = f'rank {rank}' if rank is not None else 'this box'
+    pid = sv.read_pid(os.path.join(out, 'supervisor.pid'))
+    if not pid or pid != st.get('pid') or not is_supervisor(pid, proc):
+        return False, f'{who}: not serving, no supervisor runs (last state {state})'
+    if state != 'serving':
+        return False, f'{who}: {state}, supervisor pid {pid}'
+    if rank != 0:
+        return True, f'{who}: serving, supervisor pid {pid}'
+    try:
+        with NO_PROXY.open(f'http://127.0.0.1:{port}/health', timeout=timeout) as r:
+            code = r.status
+    except OSError as e:
+        code = getattr(e, 'code', 0)
+        if hasattr(e, 'close'):
+            e.close()
+    except (http.client.HTTPException, ValueError) as e:     # a bad answer, or a PORT that makes no URL
+        return False, f'{who}: serving, supervisor pid {pid}, but the API /health on port {port} failed: ' \
+            f'{type(e).__name__}: {e}'.splitlines()[0]
+    if code != 200:
+        return False, f'{who}: serving, supervisor pid {pid}, but the API /health ' + \
+            (f'answers {code}' if code else f'on port {port} answers nothing')
+    return True, f'{who}: serving, supervisor pid {pid}, API /health 200'
+
+
+def cmd_health(argv):
+    """Exit 0 or 1 only: docker reserves a healthcheck's exit 2, which bad options would otherwise give."""
+    try:
+        o = opt.parse(argv)
+    except opt.OptionError as e:
+        print(f'gr8: {e}')    # stdout, not stderr: docker keeps a healthcheck's stdout in `docker inspect`
+        return 1
+    out = out_dir(o)
+    # the head's API port as the boot agreed it (the handshake), so a probe without the boot's options still finds it
+    ok, line = health(out, (read_handshake(out) or {}).get('port') or o.get('PORT'))
+    print(line)
+    return 0 if ok else 1
 
 
 def cmd_logs(argv):
@@ -266,25 +357,29 @@ def cmd_show_config(argv):
     c, text, digest = opt.canonical(o, plan, members, variant)
     print(f'options ({o.file or "no config file"}; command line > file > environment > default):')
     print(opt.summary(o))
+    for line in opt.kv_describe(o):
+        print(line)
     for w in o.warnings:
         print(f'warning: {w}')
     print('\ncluster options (the handshake compares these):')
     sys.stdout.write(''.join(f'  {line}\n' for line in text.splitlines()))
     print(f'digest    {digest}')
+    if o.get('SHAPE') == 'ring' and opt.mode(o) == 'mentat':
+        print('          (with --shape ring, each box adds ring=<the ring it found> when it joins, so the boot digest differs)')
     if err:
         print(f'model set none: {err}')
     else:
         print(f'model set {ms.id} ({ms.source})')
         if ms.release:
-            print(f'release   {ms.release.repo.repo} at commit {ms.release.commit}, in {ms.release.dir}')
+            print(f'release   {ms.release.label} at commit {ms.release.commit}, in {ms.release.dir}')
         if ms.drafter:
-            print(f'drafter   {ms.drafter.repo.repo} at commit {ms.drafter.commit}, converted in {ms.drafter.out}')
+            print(f'drafter   {ms.drafter.label} at commit {ms.drafter.commit}, converted in {ms.drafter.out}')
         print(f'variant   {variant}')
         if variant.path:
             print(f'          about {modelset.expert_gb(variant.path, int(o.get("TP"))):.1f} GB of experts on the busiest '
                   f'rank at TP={o.get("TP")}')
         print(f'model id  {modelset.model_id(ms, variant)} (the handshake and the engine compare this)')
-    print(f'engine    {sv.engine_build(os.path.abspath(o.get("G6_HOME")), sv.engine_bin(o))} (bin/{sv.engine_bin(o)} and bin/lib)')
+    print(f'engine    {sv.engine_build(os.path.abspath(o.get("GR8_WORK_DIR")), sv.engine_bin(o))} (bin/{sv.engine_bin(o)} and bin/lib)')
     if members:
         try:
             r = local_rank(o)
@@ -318,6 +413,24 @@ def cmd_check(argv):
     return 1 if fails else 0
 
 
+def prepare_compact(o, rank, variant):
+    """An opt-in prepare step, never a boot-time rewrite. Use the same local directory assignment as the engine."""
+    directory = os.environ.get('GR8_LOAD_COMPACT', os.environ.get('G6_LOAD_COMPACT', ''))
+    # engine_args.sh splits EXTRA_ENV on whitespace, normalizes legacy names and applies the last assignment.
+    for word in (o.get('EXTRA_ENV') or '').split():
+        key, sep, value = word.partition('=')
+        if sep and key in ('GR8_LOAD_COMPACT', 'G6_LOAD_COMPACT'):
+            directory = value
+    if not directory:
+        return
+    if not variant.path or not o.get('V2_SLICES'):
+        raise modelset.ModelError('GR8_LOAD_COMPACT prepare needs an exlr8 v2 release with index slices and a width manifest')
+    import fetch_ranks
+    result = fetch_ranks.compact_rank(o.get('V2'), directory, o.get('V2_SLICES'), int(o.get('TP')), rank,
+                                      variant.path, o.get('LAYOUT'))
+    print(f'compact copies: {result["checked"]} halves verified in {directory}')
+
+
 def cmd_prepare(argv):
     o = parse(argv)
     rank = int(o.get('RANK')) if o.get('RANK') else next((int(a) for a in o.args if a.isdigit()), None)
@@ -341,19 +454,91 @@ def cmd_prepare(argv):
     tp, bad = int(o.get('TP')), []
     try:
         if ms.release:
-            if ms.release.check(tp, rank, variant):
+            if getattr(ms.release, 'pins', False) or ms.release.check(tp, rank, variant):
                 ms.release.fetch_rank(tp, rank, variant)
             bad += ms.release.check(tp, rank, variant)
         if ms.drafter:
-            if ms.drafter.check(rank):
+            if getattr(ms.drafter, 'pins', False) or ms.drafter.check(rank):
                 ms.drafter.fetch_rank(rank)
             bad += ms.drafter.check(rank)
+        if not bad:
+            prepare_compact(o, rank, variant)
     except (modelset.ModelError, OSError, RuntimeError) as e:
         print(f'gr8: {e}', file=sys.stderr)
         return 1
     print('\n'.join(bad) or f'rank {rank} of model {modelset.model_id(ms, variant)[:16]} is ready '
           f'({ms.source}, variant {variant.name})')
     return 1 if bad else 0
+
+
+def knob_lines(key, flag, scope, values, meaning):
+    head = f'{key}  {flag}' + (f'  {scope}' if scope else '')
+    return [head, *(['    ' + values] if values else []),
+            *textwrap.wrap(meaning, 116, initial_indent='    ', subsequent_indent='    '), '']
+
+
+def default_text(default, meaning, engine=False):
+    """The default line, or '' when the meaning says it ('Default: ...')."""
+    if default:
+        return f'default: {default}'
+    if 'Default: ' in meaning:
+        return ''
+    return 'default: per model and TP (scripts/engine_args.sh)' if engine else 'default: unset'
+
+
+def engine_value(plan, key):
+    """KEY's value in a plan: the option's, else GR8_KEY's in the engine environment (EXTRA_ENV can set it)."""
+    if plan['knobs'].get(key):
+        return plan['knobs'][key]
+    return next((e.partition('=')[2] for e in reversed(plan['env']) if e.startswith(f'GR8_{key}=')), '')
+
+
+def cmd_knobs(argv):
+    """Without GR8_MODEL: every option of ./gr8 <model> and ./gr8 kv with its default. With it: the value each of the
+    model's TPs (or --tp's alone) runs with, from scripts/engine_args.sh and these options."""
+    o = parse(argv, check=False)
+    words = [w.upper() for w in o.args]
+
+    def wanted(k):
+        return not words or any(w in k for w in words)
+    model = models.of(o) if o.get('GR8_MODEL') else None
+    tps = [o.get('TP')] if o.origin['TP'] != 'default' else list(model.tp) if model else []
+    plans = {}
+    for tp in tps:
+        try:
+            plans[tp] = opt.engine_plan(opt.parse(argv + ['--tp', tp]))
+        except opt.OptionError as e:
+            print(f'gr8: TP={tp}: {e}', file=sys.stderr)
+            return 2
+    intro = [f'./gr8 {model.name} options, and the value each TP runs with: ./gr8 {model.name} up --<flag> VALUE, '
+             f'a config file or the environment ({o.file or "no config file"}). - = unset: the engine\'s own default '
+             '(docs/ENV.md)' if model else
+             './gr8 <model> options: --<flag> VALUE, KEY=value in a config file, or KEY in the environment. '
+             './gr8 glm53 knobs shows what each TP runs with']
+    lines = textwrap.wrap(intro[0], 120) + ['']
+    for k, (scope, default, meaning) in opt.KEYS.items():
+        if not wanted(k):
+            continue
+        if k == opt.ENGINE_KNOBS[0]:
+            lines += ['-- engine knobs: scripts/engine_args.sh turns these into the engine\'s environment and flags', '']
+        set_by = '' if o.origin[k] == 'default' else f' (set by the {o.origin[k]})'
+        if model and k in opt.ENGINE_KNOBS:
+            values = '  '.join(f'TP={tp} {engine_value(plans[tp], k) or "-"}' for tp in tps) + set_by
+        elif model:
+            values = (o.get(k) or 'unset') + set_by
+        else:
+            values = default_text(default, meaning, k in opt.ENGINE_KNOBS)
+        lines += knob_lines(k, opt.flag_of(k), scope, values, meaning)
+    if not model:
+        kv = [k for k in kvnode.KEYS if wanted(k)]
+        if kv:
+            lines += ['-- ./gr8 kv up options (a KV node)', '']
+        for k in kv:
+            default, meaning = kvnode.KEYS[k]
+            lines += knob_lines(k, kvnode.flag_of(k), '', default_text(default, meaning), meaning)
+    lines.append('docs/ENV.md lists the engine\'s own GR8_ variables. Pass one with --extra-env "NAME=value ...".')
+    print('\n'.join(lines))
+    return 0
 
 
 def main(argv):
@@ -375,12 +560,17 @@ def main(argv):
             return 2
         cmd_down(rest)
         return cmd_up(rest)
-    f = {'up': cmd_up, 'down': cmd_down, 'status': cmd_status, 'logs': cmd_logs, 'show-config': cmd_show_config,
-         'check': cmd_check, 'prepare': cmd_prepare}.get(cmd)
+    f = {'up': cmd_up, 'down': cmd_down, 'status': cmd_status, 'health': cmd_health, 'logs': cmd_logs,
+         'show-config': cmd_show_config,
+         'check': cmd_check, 'prepare': cmd_prepare, 'knobs': cmd_knobs}.get(cmd)
     if not f:
         print(f'gr8: unknown command {cmd}\n{__doc__}', file=sys.stderr)
         return 2
-    return f(rest)
+    try:
+        return f(rest)
+    except opt.OptionError as e:    # show-config and check plan the engine line outside parse(): a refusal is a message, not a traceback
+        print(f'gr8: {e}', file=sys.stderr)
+        return 2
 
 
 if __name__ == '__main__':

@@ -1,0 +1,18 @@
+[package]
+name = "g6pseudo"
+version = "0.1.0"
+edition = "2021"
+description = "A pseudo engine: speaks PROTOCOL.md in GLM-5.3 tokens, answers from a rules file of regexes"
+publish = false
+
+[[bin]]
+name = "g6pseudo"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
+regex = "1"
+toml = "0.8"

@@ -10,17 +10,17 @@
 //   - q_a, kv_a, idx.wk, idx.weights_proj, index_kpool_compress_gate, q_a_norm, idx.wq_b run in 32-row (NT=4)
 //     multi-tile GEMV launches on the exact decode records (0-ULP bit-identical to pf_dsa_block_p1, so the persistent
 //     KV cache, kpool cache and top-512 pool selection match decode bit-for-bit). By default the six input
-//     projections run as one full-M grid launch each, with the same 32-row CTA math and reduction (G6_PF_DSA_FULL_GV=0:
+//     projections run as one full-M grid launch each, with the same 32-row CTA math and reduction (GR8_GLM53F_PF_DSA_FULL_GV=0:
 //     one launch per 32 rows).
-//     G6_PF_DSA_F16GEMM=1 (opt-in, needs full-GV): q_a, kv_a, idx_k, idx_q (MXFP8) run as cuBLAS fp16 GEMMs and
+//     GR8_GLM53F_PF_DSA_F16GEMM=1 (opt-in, needs full-GV): q_a, kv_a, idx_k, idx_q (MXFP8) run as cuBLAS fp16 GEMMs and
 //     idx_w + idx_g (BF16W) as one bf16 GEMM, on matrices decoded at load (build_flash_prefill -> f16_prepare,
 //     flash_dsa_f16.cuh); same operands, fp32 summation order differs (near-byte).
 //   - W8d q_b.trellis and o_proj.trellis run k_gemm_tr_h16 (fp16-MMA on raw K4 tiles, pure-fp32 Hadamard epilogue)
-//     across all M rows in a single launch (override G6_PF_DSA_PROJ_P1=1 to force 32-row GEMVs everywhere).
+//     across all M rows in a single launch (override GR8_GLM53F_PF_DSA_PROJ_P1=1 to force 32-row GEMVs everywhere).
 //   - Lossless BF16 q_b.gv and o_proj.gv run 32-row (NT=4) multi-tile GEMV launches (0-ULP bit-identical to decode).
 // Attention:
 //   - Tensor-Core G6AttnPrefill (g6_attn_bind_prefill_run) over all M rows in a single call, sharing one
-//     G6AttnPrefillScratch workspace across all DSA layers (override G6_FPF_ATTN_P1=1 to force per-MX-chunk decode).
+//     G6AttnPrefillScratch workspace across all DSA layers (override GR8_FPF_ATTN_P1=1 to force per-MX-chunk decode).
 #pragma once
 #if G6_MODEL_FLASH
 #include <map>
@@ -29,10 +29,12 @@
 #include <vector>
 #include "rank.cuh"
 #include "../attn/prefill.h"
+#include "../attn/ops.h"
 #include "flash_pool_owner.cuh"
 #include "flash_dsa_full_schedule.h"
 #include "../kernels/bind_prefill.cuh"
 #include "flash_dsa_f16.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 
 extern "C" void* g6_attn_bind_prefill_output(const G6AttnPrefill*, const G6AttnBinding*, int rows);
 extern "C" int* g6_attn_bind_prefill_indices(const G6AttnPrefill*, const G6AttnBinding*, int rows);
@@ -48,9 +50,8 @@ constexpr int GV_ROWS = GV_NT * 8;
 
 inline bool full_gv_on()
 {
-    // default ON (byte-equal to the 32-row launches, 8L and 45L TP2); G6_PF_DSA_FULL_GV=0 restores the per-32-row launches
-    static const bool on = !getenv("G6_PF_DSA_FULL_GV") || atoi(getenv("G6_PF_DSA_FULL_GV")) != 0;
-    return on;
+    // default ON (byte-equal to the 32-row launches, 8L and 45L TP2); GR8_GLM53F_PF_DSA_FULL_GV=0 restores the per-32-row launches
+    return knob::glm53f_pf_dsa_full_gv();
 }
 
 // One grid row reproduces one old 32-row launch: same GV decoder, MMA,
@@ -172,7 +173,7 @@ struct State
     }
 };
 
-// G6_PF_DSA_F16GEMM: the decoded matrices of one model (shared by its prefill lanes) and, per prefill (lane), a
+// GR8_GLM53F_PF_DSA_F16GEMM: the decoded matrices of one model (shared by its prefill lanes) and, per prefill (lane), a
 // cuBLAS handle with its own workspace plus the bf path's rows / fp32 out. A null Mat::w keeps that projection on GV.
 struct F16Layer
 {
@@ -211,6 +212,7 @@ inline std::map<const Model*, F16Set>& f16_sets()
     return s;
 }
 constexpr size_t F16_WS = size_t(32) << 20;   // cuBLAS workspace per lane handle
+static_assert(F16_WS == flash_dsa_f16::GEMMEX_WS, "the GR8_GLM53F_PF_DSA_LT heuristic query assumes the GemmEx workspace");
 
 // load time (build_flash_prefill), and a no-op check per DSA block after that: decode every bound DSA layer's
 // projections once per model, then the lane's handle and buffers for MP rows. Logs the device-memory delta.
@@ -262,6 +264,7 @@ inline F16Set* f16_prepare(Model& m, const void* lane, int MP, cudaStream_t st)
         ln.y32 = dmalloc<float>(static_cast<size_t>(MP) * o32);
     }
     ln.MP = std::max(ln.MP, MP);
+    flash_dsa_f16::lt_prepare(MP);   // GR8_GLM53F_PF_DSA_LT: every row-count plan now, none on the serve path
     G6RT_CK(cudaStreamSynchronize(st));
     G6RT_CK(cudaMemGetInfo(&free1, &total));
     std::fprintf(stderr, "# DSA f16 gemm: %d of %d projections on cuBLAS; lane %d MP %d; device memory +%.1f MiB\n", f.on,
@@ -334,10 +337,12 @@ inline void bind_dsa_prefill(Model& m, Prefill& P, cudaStream_t st)
 
 // xf_all / xb_all: f16 / bf16 fragment tables of all M input rows (bind::Xfrag layout) already built by the mHC
 // consume; null = build each chunk's tables from P.xn here.
+// rs.base set (GR8_GLM53F_PF_SP_ATTD): the GEMM-path o_proj writes its rows to that RS send slot instead of P.part[0]; returns
+// whether it did (false: the chunked o_proj paths, P.part[0] as usual).
 template <class Prefill, class Mark>
-inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, cudaStream_t st, Mark mark,
+inline bool pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, cudaStream_t st, Mark mark,
                               const u32* xf_all = nullptr, const u32* xb_all = nullptr,
-                              FlashPoolTransport* transport = nullptr)
+                              FlashPoolTransport* transport = nullptr, const bindp::RsOut& ors = bindp::RsOut())
 {
     if (M < 1 || M > P.MP) die("pf_dsa_block_gemm: M outside 1..MP");
     flash_dsa_pf::State& S = flash_dsa_pf::ensure_state(m, P, st);
@@ -345,9 +350,9 @@ inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
     if (!y.built[1]) die("pf_dsa_block_gemm: bind_dsa_layer did not run");
     const bind::Layer& b1 = y.L[1];
     const int h = y.ab.args.heads;
-    static const bool proj_p1 = getenv("G6_PF_DSA_PROJ_P1") && atoi(getenv("G6_PF_DSA_PROJ_P1")) == 1;
+    const bool proj_p1 = knob::glm53f_pf_dsa_proj_p1();
     const bool full_gv = flash_dsa_pf::full_gv_on();
-    // G6_PF_DSA_F16GEMM: prepared at load by build_flash_prefill; this call only finds it (or prepares a test's P)
+    // GR8_GLM53F_PF_DSA_F16GEMM: prepared at load by build_flash_prefill; this call only finds it (or prepares a test's P)
     flash_dsa_pf::F16Set* f16 = full_gv ? flash_dsa_pf::f16_prepare(m, &P, P.MP, st) : nullptr;
     static const flash_dsa_pf::F16Layer f16_none;
     const flash_dsa_pf::F16Layer& fl = f16 ? f16->L[i] : f16_none;
@@ -438,7 +443,10 @@ inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
                 gv.a.slot = dslot::Slot{};
 #endif
                 gv.a.x = S.q_a_n + static_cast<size_t>(m0 + c0) * QA;
+                gv.a.ldx = QA;
                 gv.a.y = S.q_b + static_cast<size_t>(m0 + c0) * (h * 256);
+                // a GEMV bound for pre-rotated input (GR8_GLM53F_DSA_QB_ROT) reads xa, not x
+                if (!gv.rot) dtr::launch_rot(gv.a.x, gv.a.ldx, gv.a.suh[0], const_cast<u32*>(gv.a.xa), gv.a.K, cr, st);
                 dtr::launch(gv, st);
             }
         }
@@ -447,12 +455,12 @@ inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
     }
     mark(3, st);
 
-    // 4. Tensor-Core DSA prefill attention over all M rows (or G6_FPF_ATTN_P1=1 per-MX-chunk decode fallback)
+    // 4. Tensor-Core DSA prefill attention over all M rows (or GR8_FPF_ATTN_P1=1 per-MX-chunk decode fallback)
     const __half* attn_out = nullptr;
-    static const bool attn_p1 = getenv("G6_FPF_ATTN_P1") && atoi(getenv("G6_FPF_ATTN_P1")) == 1;
+    const bool attn_p1 = knob::fpf_attn_p1();
     if (attn_p1)
     {
-        if (const char* prefix = getenv("G6_PF_POOL_CAPTURE"); prefix && *prefix)
+        if (knob::glm53f_pf_pool_capture())
             die("Flash pool capture requires the prefill attention path");
         if (!S.attn_p1) S.attn_p1 = dmalloc<__half>(static_cast<size_t>(P.MP) * g6nr::QBW);
         for (int m0 = 0; m0 < M; m0 += MX)
@@ -467,6 +475,7 @@ inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
             s.index_k = S.idx_k + static_cast<size_t>(m0) * IDXK;
             s.index_weight = S.idx_w + static_cast<size_t>(m0) * IDXW;
             s.index_gate = S.idx_g + static_cast<size_t>(m0) * geom::IDX_DIM;
+            s.raw_sess = P.rsess + m0;
             G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
             G6RT_CK(cudaMemcpyAsync(S.attn_p1 + static_cast<size_t>(m0) * (h * 256), y.ab.args.output,
                                     static_cast<size_t>(r) * h * 256 * sizeof(__half), cudaMemcpyDeviceToDevice, st));
@@ -479,6 +488,7 @@ inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
         s.rows = M; s.context = context;
         s.q_b = S.q_b; s.kv_a = S.kv_a; s.positions = P.pos;
         s.index_q = S.idx_q; s.index_k = S.idx_k; s.index_weight = S.idx_w; s.index_gate = S.idx_g;
+        s.raw_sess = P.rsess;
         if (transport) {
             G6FlashPoolOwner owner{m.rank, transport, flash_pool_publish, flash_pool_receive};
             G6RT_CK(g6_attn_bind_prefill_run_owned(S.pf[i], &y.ab, &s, st, &owner));
@@ -487,7 +497,8 @@ inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
     }
     mark(4, st);
 
-    // 5. o_proj -> P.part[0] [M][HID] BF16
+    // 5. o_proj -> P.part[0] [M][HID] BF16 (or the RS send slot ors)
+    bool used_rs = false;
     if (b1.o_proj_t.on && !proj_p1)
     {
         const dtr::Mat opm = flash_dsa_pf::mat_from_gemv(b1.o_proj_t);
@@ -497,7 +508,8 @@ inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
         g_o.pre.on = 1; g_o.pre.src = attn_out; g_o.pre.ld = h * 256; g_o.pre.K = h * 256; g_o.pre.M = M;
         g_o.pre.dst = S.x8_attn; g_o.pre.suh = opm.suh; g_o.pre.h16 = g_o.h16;
         g_o.osvh = opm.svh;
-        bindp::launch(g_o, st);
+        bindp::launch(g_o, st, ors);
+        used_rs = ors.base != nullptr;
     }
     else if (b1.o_proj.on)
     {
@@ -518,11 +530,15 @@ inline void pf_dsa_block_gemm(Model& m, Prefill& P, int i, int M, int context, c
             gv.a.slot = dslot::Slot{};
 #endif
             gv.a.x = attn_out + static_cast<size_t>(m0) * (h * 256);
+            gv.a.ldx = h * 256;
             gv.a.y = P.part[0] + static_cast<size_t>(m0) * HID;
+            // a GEMV bound for pre-rotated input (GR8_GLM53F_DSA_OPROJ_ROT, the default at 2+ rows) reads xa, not x
+            if (!gv.rot) dtr::launch_rot(gv.a.x, gv.a.ldx, gv.a.suh[0], const_cast<u32*>(gv.a.xa), gv.a.K, r, st);
             dtr::launch(gv, st);
         }
     }
     mark(5, st);
+    return used_rs;
 }
 
 template <class Prefill>

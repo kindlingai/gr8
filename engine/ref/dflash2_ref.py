@@ -11,8 +11,8 @@ The drafter, as its config and the public DFlash2 description define it:
            conv: per row r of the block, two taps over rows r and r-1 (r = 0 has no r-1), per channel
            (base[tap][c] + delta_r[tap][c // group]); delta from kernel_projection of the prepare input (side 0 for the
            prepare conv, side 1 for the finish conv)
-  attn     64 q heads over 8 KV heads (GQA), q_norm / k_norm per head, NeoX RoPE; a query at position q sees every key k
-           of the block and every context key with q - k < window; not causal inside the block
+  attn     64 q heads (Flash: 32) over 8 KV heads (GQA), q_norm / k_norm per head, NeoX RoPE; a query at position q sees
+           every key k of the block and every context key with q - k < window; not causal inside the block
   head     norm, the target's lm_head; row r (1..7) predicts position q0 + r
   selector top-16 per row, then a walk: score(c) = logit(c) + <pred[prev] * hproj(h_r), succ[c]>, prev starts at the bonus
 """
@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from tools.convert import mxfp8  # noqa: E402
 from tools.convert.st import ST  # noqa: E402
 
-HID, HD, NH, NKV, INTER = 6144, 128, 64, 8, 12288
+HD = 128                              # head dim; the other sizes come from the drafter's config (GLM 5.3 or Flash)
 
 
 def bf(u16):
@@ -67,6 +67,8 @@ class Drafter:
         self.win = self.cfg.get('sliding_window') or 1 << 30
         self.G = self.d['conv_group_size']
         self.L = self.cfg['num_hidden_layers']
+        c = self.cfg
+        self.hid, self.nh, self.nkv = c['hidden_size'], c['num_attention_heads'], c['num_key_value_heads']
         self._w = {}
 
     def w(self, name):
@@ -79,7 +81,7 @@ class Drafter:
             v = mx_round(a)
         else:
             v = bf(a)
-        if a.ndim == 1 or a.size <= 4 * HID:
+        if a.ndim == 1 or a.size <= 4 * self.hid:
             self._w[name] = v
         return v
 
@@ -88,13 +90,13 @@ class Drafter:
 
     # ---------------------------------------------------------------- context
     def context_kv(self, feat, pos):
-        """feat [n, 6 * 6144] (target residual rows), pos [n] -> per layer (K [n, 8, 128], V [n, 8, 128]), and ctx."""
+        """feat [n, taps * hid] (target residual rows), pos [n] -> per layer (K [n, 8, 128], V [n, 8, 128]), and ctx."""
         ctx = rms(self.lin(feat, 'fc.weight'), self.w('hidden_norm.weight'), self.eps)
         out = []
         for j in range(self.L):
             p = f'layers.{j}.self_attn.'
-            k = self.lin(ctx, p + 'k_proj.weight').reshape(-1, NKV, HD)
-            v = self.lin(ctx, p + 'v_proj.weight').reshape(-1, NKV, HD)
+            k = self.lin(ctx, p + 'k_proj.weight').reshape(-1, self.nkv, HD)
+            v = self.lin(ctx, p + 'v_proj.weight').reshape(-1, self.nkv, HD)
             k = rms(k, self.w(p + 'k_norm.weight'), self.eps)
             k = rope_neox(k.transpose(1, 0, 2), pos, self.theta).transpose(1, 0, 2)
             out.append((k, v))
@@ -102,22 +104,22 @@ class Drafter:
 
     # ---------------------------------------------------------------- block
     def conv(self, x, delta, base):
-        """x [8, 6144], delta [8, 2 taps, 384 groups], base [2 taps, 6144] -> two-tap grouped conv over the block rows."""
-        g = np.repeat(delta, self.G, axis=-1)                               # [8, 2, 6144]
+        """x [8, hid], delta [8, 2 taps, hid / 16], base [2 taps, hid] -> two-tap grouped conv over the block rows."""
+        g = np.repeat(delta, self.G, axis=-1)                               # [8, 2, hid]
         y = (base[0] + g[:, 0]) * x
         y[1:] += (base[1] + g[1:, 1]) * x[:-1]
         return y
 
     def conv_prepare(self, x, j, which):
         p = f'layers.{j}.{which}.'
-        dl = self.lin(x, p + 'kernel_projection.weight').reshape(-1, 2, 2, HID // self.G)
+        dl = self.lin(x, p + 'kernel_projection.weight').reshape(-1, 2, 2, self.hid // self.G)
         base = self.w(p + 'base_kernel')
         return self.conv(x, dl[:, 0], base[0]), (dl[:, 1], base[1])
 
     def attn(self, x, j, qpos, cache):
         """cache: list of (positions [n], K [n, 8, 128], V [n, 8, 128]) for layer j, block keys appended here."""
         p = f'layers.{j}.self_attn.'
-        n = x.shape[0]
+        n, NH, NKV = x.shape[0], self.nh, self.nkv
         q = rms(self.lin(x, p + 'q_proj.weight').reshape(n, NH, HD), self.w(p + 'q_norm.weight'), self.eps)
         k = rms(self.lin(x, p + 'k_proj.weight').reshape(n, NKV, HD), self.w(p + 'k_norm.weight'), self.eps)
         v = self.lin(x, p + 'v_proj.weight').reshape(n, NKV, HD)
@@ -143,7 +145,7 @@ class Drafter:
         return self.lin(g / (1 + np.exp(-g)) * u, p + 'down_proj.weight')
 
     def block(self, emb, qpos, caches, trace=None):
-        """emb [8, 6144] target embedding rows of [bonus, mask x 7]; caches[j] = (pos, K, V) -> normed hidden [8, 6144]."""
+        """emb [8, hid]: target embedding rows of [bonus, mask x 7]; caches[j] = (pos, K, V) -> normed hidden [8, hid]"""
         h = emb.astype(np.float32).copy()
         for j in range(self.L):
             x = rms(h, self.w(f'layers.{j}.input_layernorm.weight'), self.eps)
@@ -159,7 +161,7 @@ class Drafter:
 
     # ---------------------------------------------------------------- head
     def top(self, hidden, lm_head, k=16, chunk=16384):
-        """hidden [n, 6144] -> top-k (logit desc, id asc) of hidden @ lm_head^T: (ids [n, k], logits [n, k]).
+        """hidden [n, hid] -> top-k (logit desc, id asc) of hidden @ lm_head^T: (ids [n, k], logits [n, k]).
         lm_head: an ST holding lm_head.weight (BF16); MXFP8-rounded when quant == 'mxfp8', as the engine's records."""
         V = lm_head.shape('lm_head.weight')[0]
         best_l = np.full((len(hidden), 0), -np.inf, np.float32)
@@ -175,7 +177,7 @@ class Drafter:
         return best_i, best_l
 
     def select(self, hidden, cand, logit, bonus):
-        """hidden [7, 6144] (rows 1..7), the top-k ids / logits per row -> the walk's tokens [7] and scores [7]."""
+        """hidden [7, hid] (rows 1..7), the top-k ids / logits per row -> the walk's tokens [7] and scores [7]."""
         hp = self.lin(hidden, 'candidate_selector.hidden_projection.weight')
         pred, succ = self.st.get('candidate_selector.predecessor_codebook'), self.st.get('candidate_selector.successor_codebook')
         prev, path, scores = bonus, [], []

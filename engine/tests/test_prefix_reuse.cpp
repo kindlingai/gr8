@@ -1,6 +1,6 @@
 // PrefixReuse unit cases (port of 18318ee's regression test to the K1/CP lineage: g6m4.cu has no PF_TAIL tail
-// lane, so the replayed prefill loop is two lanes + a single-lane remainder). LCP (default), G6_REUSE_STRICT=1 (K2 rule),
-// G6_REUSE_NOEND=1 (no prompt >= written_end rule), the miss reasons, MTP's one-row margin, chain rows, stops.
+// lane, so the replayed prefill loop is two lanes + a single-lane remainder). LCP (default), GR8_REUSE_STRICT=1 (K2 rule),
+// GR8_REUSE_NOEND=1 (no prompt >= written_end rule), the miss reasons, MTP's one-row margin, chain rows, stops.
 // build and run:  g++ -O2 -std=c++17 -I engine/runtime engine/tests/test_prefix_reuse.cpp -o /tmp/test_prefix_reuse \
 //                 && /tmp/test_prefix_reuse        (scripts/build.sh builds and runs it; engine/tests/test_prefix_reuse.py
 //                 runs it under ASan/UBSan and pins the g6m4.cu hook order)
@@ -101,7 +101,7 @@ int main()
             CHECK(v.main_end == sk && v.draft_end == sk && v.written_end == sk);
         }
         // ---- a prompt SHORTER than the history (a prefix of it): miss "short" under the written_end rule (default),
-        // HIT under G6_REUSE_NOEND=1 (skip = the safe LCP, here the prompt's p.first)
+        // HIT under GR8_REUSE_NOEND=1 (skip = the safe LCP, here the prompt's p.first)
         {
             const std::vector<int> p = head(r.history, (int)r.history.size() - 5);
             PrefixReuse s = r;
@@ -245,7 +245,7 @@ int main()
             prev = p;
         }
     }
-    // grid rule (G6_REUSE_ALIGN=1): served shape MP 4096 x two lanes -> grid 8192; the request shapes
+    // grid rule (GR8_REUSE_ALIGN=1): served shape MP 4096 x two lanes -> grid 8192; the request shapes
     for (int K : {0, 4})
     {
         PrefixReuse r; r.grid = 8192;

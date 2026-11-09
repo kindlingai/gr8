@@ -1,17 +1,19 @@
 #!/bin/bash
-# Build (if needed) and run the unit tests on ONE GPU node (a GB10 Spark with CUDA 13): row_budget_test (dense GEMVs and K1
-# against chunks of 8 rows), s2_attn_test (batched attention over several sessions against the per-session calls;
-# needs EXTRA=-DDEC_S2, else it only prints SKIP), dec_heads_test (the decode attention kernels against the ones they
-# replaced) and kv4_test (the KV latent row: append round trip, and decode / prefill / row-owner attention against a host
-# reference; EXTRA=-DG6_KV4=1 tests the INT4 row, docs/KV4.md) and weight_check_test (the weight check's GPU sums
-# against the CPU's, and one changed byte caught in its own chunk) and canon_test (a session's KV exported and imported
-# across page lists and layouts, then a decode step on it; #152) and kv_resize_test (the KV pool's chunks shrunk and grown
-# under live sessions, on caches in virtual memory, against caches that never resized; #153) and dhead_i4_test
-# (G6_DRAFT_HEAD_I4: the MXFP8 -> INT4 head records against a host derivation, the INT4 head GEMV against a host dot;
-# --time: MXFP8 vs INT4 head GEMV) and kvb8_test (kv_b in FP8: decode and prefill against the BF16 form of the same
-# weights, byte for byte; --bench times absorb / value_project; #50).
+# Build (if needed) and run the unit tests on ONE GPU node (a GB10 Spark with CUDA 13): row_budget_test (dense GEMVs and
+# K1 against chunks of 8 rows), s2_attn_test (batched attention over several sessions against the per-session calls;
+# needs EXTRA=-DDEC_S2, else it only prints SKIP) and kv4_test (the KV latent row: append round trip, and decode /
+# prefill / row-owner attention against a host reference; EXTRA=-DG6_KV4=1 tests the INT4 row, docs/KV4.md) and
+# weight_check_test (the weight check's GPU sums against the CPU's, and one changed byte caught in its own chunk) and
+# canon_test (a session's KV exported and imported across page lists and layouts, then a decode step on it; #152) and
+# kv_resize_test (the KV pool's chunks shrunk and grown under live sessions, on caches in virtual memory, against caches
+# that never resized; #153) and kvb8_test (kv_b in FP8: decode and prefill against the BF16 form of the same weights,
+# byte for byte; --bench times absorb / value_project; #50) and s2_steer_test (S2 batched decode steers each row as solo
+# decode does: the S2 and solo layer bindings, the shared-expert finalize and the attention consume per row against each
+# session's and each row's own launch; needs EXTRA=-DDEC_S2, else it only prints SKIP) and test_flash_cp (Flash
+# context-parallel decode against the replicated path). headgroup_test, kda_g9_det and test_flash_cp build in one fixed
+# configuration each, whatever GR8_NR and EXTRA say (docs/TESTING.md).
 #   scripts/c1_tests.sh <bin_dir> [test args]       default bin_dir = ./bin; TEST=row_budget_test|s2_attn_test runs one
-#   G6_NR=4 scripts/c1_tests.sh bin4                the TP4 build of the test
+#   GR8_NR=4 scripts/c1_tests.sh bin4               the TP4 build of the test
 #   EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2       the 32-row build: M = 1..32 against chunks of 8 (without it: M <= 8)
 #   ARCH=120a ...                                   RTX 50xx instead of the GB10 (default 121a)
 # Compiles engine/runtime/tests/<test>.cu with the K1H2 flags of scripts/build.sh into <bin_dir>/<test> (s2_attn_test also
@@ -22,6 +24,7 @@
 #   row_budget_test: --only gv|k1, --time [reps] (K1 timing over M = 6..24)
 #   s2_attn_test:    --only rep|cp, --seeds N, --no-long (skips the cases above 32768 tokens: two replicated, two CP)
 set -eu
+[ -n "${G6_NR:-}" ] && [ -z "${GR8_NR:-}" ] && GR8_NR=$G6_NR   # the old name still works
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 OUT=$(mkdir -p "${1:-$REPO/bin}" && cd "${1:-$REPO/bin}" && pwd)
 shift || true
@@ -31,19 +34,28 @@ A=${ARCH:-121a}
 K1H2_FLAGS="-DPF_FC2GL=6 -DPF_GEMMF=1 -DPF_XQ8C=1 -DPF_RNWIDE=1 -DPF_GEMMR=1 -DPF_DRAFTKV -DPF_GEMMRF=1 -DPF_QOBH=1 \
 -DDEC_SLOT=2 -DDEC_CPB=1 -DDEC_AVP=1 -DPF_QOROPE=1 -DPF_ISGRT=1 -DPF_ROPE2=1 -DDEC_CPB2=64 -DDEC_I4PAIR=1 -DSEL32 \
 -DG6_CP=1 -DG6_CP_PF_HASH2=1 -DDEC_IDX31=1 -DPF_QO_DEDUP=1"
-FLAGS="-gencode=arch=compute_$A,code=sm_$A $K1H2_FLAGS ${G6_NR:+-DG6_NR=$G6_NR} ${EXTRA:-}"
-build_run() {   # build_run <test> <extra sources...>  (test args in ARGS)
-  local name=$1; shift
-  local SRC="$REPO/engine/runtime/tests/$name.cu" BIN="$OUT/$name"
+FLAGS="-gencode=arch=compute_$A,code=sm_$A $K1H2_FLAGS ${GR8_NR:+-DG6_NR=$GR8_NR} ${EXTRA:-}"
+# every test links the knob table (engine/knobs-rs): the engine headers read their settings through it
+KNOBLIB="$REPO/engine/knobs-rs/target/release/libgr8knobs.a"
+[ -f "$KNOBLIB" ] || cargo build --quiet --release --features capi --manifest-path "$REPO/engine/knobs-rs/Cargo.toml"
+# and the host Rust (engine/Cargo.toml): the S2 scheduling logic and the S2 page allocator
+HOSTLIB="$REPO/engine/target/release/libg6host.a"
+[ -f "$HOSTLIB" ] || cargo build --quiet --release --manifest-path "$REPO/engine/Cargo.toml"
+build_run() {   # build_run <test> <extra sources...>  (test args in ARGS); a test outside runtime/tests is a path under engine/
+  local src=$1; shift
+  case "$src" in */*) ;; *) src=runtime/tests/$src ;; esac
+  local name=${src##*/}
+  local SRC="$REPO/engine/$src.cu" BIN="$OUT/$name"
   local stale=0
   [ -x "$BIN" ] || stale=1
   [ "$(cat "$BIN.flags" 2>/dev/null)" = "$FLAGS" ] || stale=1
   if [ "$stale" = 0 ] && [ -n "$(find "$REPO/engine" -type f \( -name '*.cu' -o -name '*.cuh' -o -name '*.h' \) -newer "$BIN" -print -quit)" ]; then stale=1; fi
+  local a; for a in "$@" "$KNOBLIB" "$HOSTLIB"; do [ -f "$a" ] && [ "$a" -nt "$BIN" ] && stale=1; done   # e.g. a rebuilt libg6host.a
   if [ "$stale" = 1 ]; then
     echo "building $BIN ($FLAGS)"
     rm -f "$BIN" "$BIN.flags"
     # shellcheck disable=SC2086
-    nvcc -O2 -std=c++17 $FLAGS -o "$BIN" "$SRC" "$@"
+    nvcc -O2 -std=c++17 $FLAGS -o "$BIN" "$SRC" "$@" "$KNOBLIB" "$HOSTLIB" -lpthread -ldl -lm
     echo "$FLAGS" > "$BIN.flags"
   else
     echo "up to date: $BIN"
@@ -51,6 +63,30 @@ build_run() {   # build_run <test> <extra sources...>  (test args in ARGS)
   local rc=0
   "$BIN" ${ARGS[@]+"${ARGS[@]}"} || rc=$?
   return $rc
+}
+# with_flags <flags> <command...>: the command with FLAGS = the arch and <flags> alone, for a test built in one fixed
+# configuration whatever GR8_NR and EXTRA say
+with_flags() {
+  local saved=$FLAGS r=0
+  FLAGS="-gencode=arch=compute_$A,code=sm_$A $1"; shift
+  "$@" || r=$?
+  FLAGS=$saved
+  return $r
+}
+FLASH_FLAGS="-DG6_MODEL_FLASH=1 -DG6_NR=2"
+# kvlib_ready: a current libg6host.a for the tests that use the page allocator, built first when cargo is on PATH; 1
+# (with the reason) when it is missing or older than the crates' sources
+kvlib_ready() {
+  local e="$REPO/engine"
+  if command -v cargo > /dev/null; then
+    cargo build --release -q --manifest-path "$e/Cargo.toml" || { echo "cargo build --release failed"; return 1; }
+  fi
+  [ -f "$HOSTLIB" ] || { echo "no $HOSTLIB (cargo build --release --manifest-path engine/Cargo.toml)"; return 1; }
+  if [ -n "$(find "$e/Cargo.toml" "$e/hostcore-rs" "$e/kvman-rs/src" "$e/kvman-rs/Cargo.toml" "$e/scheduler-rs/src" \
+      "$e/scheduler-rs/Cargo.toml" -newer "$HOSTLIB" -print -quit)" ]; then
+    echo "$HOSTLIB is older than its sources (cargo build --release --manifest-path engine/Cargo.toml)"
+    return 1
+  fi
 }
 TEST=${TEST:-all}
 ARGS=("$@")
@@ -61,20 +97,13 @@ fi
 if [ "$TEST" = all ] || [ "$TEST" = s2_attn_test ]; then
   [ "$TEST" = all ] && ARGS=()
   case "$FLAGS" in
-    *-DDEC_S2*) build_run s2_attn_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
+    *-DDEC_S2*) build_run s2_attn_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
     *) build_run s2_attn_test || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
-  esac
-fi
-if [ "$TEST" = all ] || [ "$TEST" = dec_heads_test ]; then
-  [ "$TEST" = all ] && ARGS=()
-  case "$FLAGS" in
-    *-DG6_KV4=1*) echo "SKIP dec_heads_test: it checks the FP8-row kernels, which a G6_KV4 build does not run" ;;
-    *) build_run dec_heads_test "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; } ;;
   esac
 fi
 if [ "$TEST" = all ] || [ "$TEST" = kv4_test ]; then
   [ "$TEST" = all ] && ARGS=()
-  build_run kv4_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  build_run kv4_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
 if [ "$TEST" = all ] || [ "$TEST" = kvb8_test ]; then
   # kv_b (UK / UV) in FP8 (#50): decode and prefill outputs against the BF16 form of the same weights, byte for byte
@@ -85,23 +114,32 @@ if [ "$TEST" = all ] || [ "$TEST" = kvb8_test ]; then
   esac
 fi
 if [ "$TEST" = all ] || [ "$TEST" = canon_test ]; then
-  # a session's KV across page lists and layouts (#152): links the S2 page allocator's library (engine/kvman-rs)
+  # a session's KV across page lists and layouts (#152): needs the S2 page allocator (engine/kvman-rs)
   [ "$TEST" = all ] && ARGS=()
-  KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
-  if [ -f "$KVLIB" ]; then
-    build_run canon_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$KVLIB" -lcublas -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  if why=$(kvlib_ready); then
+    build_run canon_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" -lcublas -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   else
-    echo "SKIP canon_test: no $KVLIB (cargo build --release --manifest-path engine/kvman-rs/Cargo.toml)"
+    echo "SKIP canon_test: $why"
   fi
 fi
 if [ "$TEST" = all ] || [ "$TEST" = kv_resize_test ]; then
   # the KV pool's chunks shrunk and grown under live sessions (#153): the allocator's library and the driver API
   [ "$TEST" = all ] && ARGS=()
-  KVLIB="$REPO/engine/kvman-rs/target/release/libg6kvman.a"
-  if [ -f "$KVLIB" ]; then
-    build_run kv_resize_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/kvchunks.cu" "$KVLIB" -lcublas -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  if why=$(kvlib_ready); then
+    build_run kv_resize_test "$REPO/engine/attn/attn.cu" "$REPO/engine/attn/bind.cu" "$REPO/engine/attn/ops_glm.cu" "$REPO/engine/attn/kvchunks.cu" -lcublas -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   else
-    echo "SKIP kv_resize_test: no $KVLIB (cargo build --release --manifest-path engine/kvman-rs/Cargo.toml)"
+    echo "SKIP kv_resize_test: $why"
+  fi
+fi
+if [ "$TEST" = all ] || [ "$TEST" = flash_kv_chunks_test ]; then
+  # the Flash KV caches in chunks (GR8_GLM53F_KV_CHUNKS, runtime/flash_kv.h): the Flash attention, the ledger's library
+  [ "$TEST" = all ] && ARGS=()
+  if why=$(kvlib_ready); then
+    GLM_FLAGS="$FLAGS"; FLAGS="$FLAGS -DG6_MODEL_FLASH=1"
+    GR8_TEST_KVMAN_LEDGER="$REPO/engine/target/release/kvman-ledger" build_run flash_kv_chunks_test "$REPO/engine/attn/flash_attn.cu" "$REPO/engine/attn/flash_bind.cu" "$REPO/engine/attn/ops_flash.cu" "$REPO/engine/attn/kvchunks.cu" -lcuda -lpthread -ldl || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+    FLAGS="$GLM_FLAGS"
+  else
+    echo "SKIP flash_kv_chunks_test: $why"
   fi
 fi
 if [ "$TEST" = all ] || [ "$TEST" = weight_check_test ]; then
@@ -114,6 +152,10 @@ fi
 if [ "$TEST" = all ] || [ "$TEST" = steering_shared_test ]; then
   build_run steering_shared_test -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
+if [ "$TEST" = all ] || [ "$TEST" = s2_steer_test ]; then
+  [ "$TEST" = all ] && ARGS=()
+  build_run s2_steer_test -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
 if [ "$TEST" = all ] || [ "$TEST" = steering_consume_test ]; then
   [ "$TEST" = all ] && ARGS=()
   build_run steering_consume_test -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
@@ -122,9 +164,18 @@ if [ "$TEST" = all ] || [ "$TEST" = steering_cuda_test ]; then
   [ "$TEST" = all ] && ARGS=()
   build_run steering_cuda_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
-if [ "$TEST" = all ] || [ "$TEST" = dhead_i4_test ]; then
+if [ "$TEST" = all ] || [ "$TEST" = headgroup_test ]; then
   [ "$TEST" = all ] && ARGS=()
-  build_run dhead_i4_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  with_flags "$K1H2_FLAGS -DG6_NR=3" build_run attn/tests/headgroup_test "$REPO/engine/attn/bind.cu" -lcublas || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
+if [ "$TEST" = all ] || [ "$TEST" = kda_g9_det ]; then
+  [ "$TEST" = all ] && ARGS=()
+  with_flags "$FLASH_FLAGS -DG9_CONV_DBG=1" build_run kda/tests/kda_g9_det || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
+if [ "$TEST" = all ] || [ "$TEST" = test_flash_cp ]; then
+  # Flash context-parallel decode against the replicated path, every rank of TP=2 on this GPU, 4096-token key tiles
+  [ "$TEST" = all ] && ARGS=()
+  with_flags "$FLASH_FLAGS -DG6_KV4=1 -DG6_CP=1 -DDEC_S2 -DKP_TILE_POOLS=1024" build_run tests/test_flash_cp || { r=$?; [ "$rc" = 0 ] && rc=$r; }
 fi
 if [ "$rc" = 0 ]; then echo "c1_tests: PASS"; else echo "c1_tests: FAIL (exit $rc)"; fi
 exit "$rc"

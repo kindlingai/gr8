@@ -1,11 +1,28 @@
 //! The C entry points (g6kvman.h). Each returns 0 or an error code that g6kv_error names, and an error leaves the pool
-//! unchanged. Release builds abort on a panic, so none unwinds into C++.
+//! unchanged. Release builds abort on a panic, so none unwinds into C++. Each call on a pool locks it for that call
+//! only, so two threads may call at once. A call never calls out to C++ while it holds the lock.
 
 use crate::pool::{Error, Namespace, Pool, Run, Stats, NAMESPACE_BYTES, STOCK_NAMESPACE};
 use crate::reuse::{Finished, Rules};
 use crate::stash::{Io, Keep, Part, Policy, TierStats};
 use std::ffi::c_char;
 use std::ffi::CStr;
+use std::sync::{Mutex, MutexGuard};
+
+/// The pool behind its lock: what g6kv_new hands out as a g6kv_pool.
+pub struct Handle(Mutex<Pool>);
+
+impl Handle {
+    pub fn new(p: Pool) -> Self {
+        Handle(Mutex::new(p))
+    }
+
+    /// The pool for one call. Where a panic unwinds (dev and test builds), it poisons the lock, and the next call takes
+    /// the pool as it is. Release builds abort.
+    pub fn lock(&self) -> MutexGuard<'_, Pool> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 /// g6kv_hit: match's result. `why` points at a static string. stored: the run is in the store.
 #[repr(C)]
@@ -57,13 +74,13 @@ pub extern "C" fn g6kv_error(code: i32) -> *const c_char {
 /// # Safety
 /// `out` must be valid for a write.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_new(pool_pages: u32, place_pages: u32, below_rows: u32, out: *mut *mut Pool) -> i32 {
+pub unsafe extern "C" fn g6kv_new(pool_pages: u32, place_pages: u32, below_rows: u32, out: *mut *mut Handle) -> i32 {
     if out.is_null() {
         return Error::BadArgument.code();
     }
     match Pool::new(pool_pages, place_pages, below_rows) {
         Ok(p) => {
-            *out = Box::into_raw(Box::new(p));
+            *out = Box::into_raw(Box::new(Handle::new(p)));
             0
         }
         Err(e) => e.code(),
@@ -73,7 +90,7 @@ pub unsafe extern "C" fn g6kv_new(pool_pages: u32, place_pages: u32, below_rows:
 /// # Safety
 /// `p` must come from g6kv_new (or be NULL) and must not be used again.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_free(p: *mut Pool) {
+pub unsafe extern "C" fn g6kv_free(p: *mut Handle) {
     if !p.is_null() {
         drop(Box::from_raw(p));
     }
@@ -82,46 +99,76 @@ pub unsafe extern "C" fn g6kv_free(p: *mut Pool) {
 /// # Safety
 /// `p` must be a live pool from g6kv_new (as for every call below).
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_exclusive(p: *const Pool, rows: u64) -> i32 {
-    (*p).exclusive(rows) as i32
+pub unsafe extern "C" fn g6kv_exclusive(p: *const Handle, rows: u64) -> i32 {
+    (*p).lock().exclusive(rows) as i32
+}
+
+/// g6kv_exclusive at R = r rows (0 = the pool's R): -1 for an R the pool refuses.
+///
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_exclusive_r(p: *const Handle, rows: u64, r: u32) -> i32 {
+    (*p).lock().exclusive_r(rows, r).map_or(-1, |x| x as i32)
 }
 
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_free_pages(p: *const Pool) -> u32 {
-    (*p).free_pages()
+pub unsafe extern "C" fn g6kv_free_pages(p: *const Handle) -> u32 {
+    (*p).lock().free_pages()
 }
 
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_room(p: *const Pool) -> u32 {
-    (*p).room()
+pub unsafe extern "C" fn g6kv_room(p: *const Handle) -> u32 {
+    (*p).lock().room()
 }
 
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_admissible(p: *const Pool, worst: u64) -> i32 {
-    (*p).admissible(worst) as i32
+pub unsafe extern "C" fn g6kv_admissible(p: *const Handle, worst: u64) -> i32 {
+    g6kv_admissible_r(p, worst, 0)
 }
 
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_fits(p: *const Pool, rows: u64, worst: u64) -> i32 {
-    (*p).fits(rows, worst) as i32
+pub unsafe extern "C" fn g6kv_admissible_r(p: *const Handle, worst: u64, r: u32) -> i32 {
+    (*p).lock().admissible_r(worst, r) as i32
+}
+
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_fits(p: *const Handle, rows: u64, worst: u64) -> i32 {
+    g6kv_fits_r(p, rows, worst, 0)
+}
+
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_fits_r(p: *const Handle, rows: u64, worst: u64, r: u32) -> i32 {
+    (*p).lock().fits_r(rows, worst, r) as i32
 }
 
 /// # Safety
 /// As g6kv_exclusive, and `out` must be valid for a write.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_reserve(p: *mut Pool, rows: u64, worst: u64, out: *mut Run) -> i32 {
+pub unsafe extern "C" fn g6kv_reserve(p: *mut Handle, rows: u64, worst: u64, out: *mut Run) -> i32 {
+    g6kv_reserve_r(p, rows, worst, 0, out)
+}
+
+/// # Safety
+/// As g6kv_reserve.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_reserve_r(p: *mut Handle, rows: u64, worst: u64, r: u32, out: *mut Run) -> i32 {
     if out.is_null() {
         return Error::BadArgument.code();
     }
-    match (*p).reserve(rows, worst) {
+    match (*p).lock().reserve_r(rows, worst, r) {
         Ok(r) => {
             *out = r;
             0
@@ -133,33 +180,38 @@ pub unsafe extern "C" fn g6kv_reserve(p: *mut Pool, rows: u64, worst: u64, out: 
 /// # Safety
 /// As g6kv_exclusive, and `r` must be valid for a read.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_release(p: *mut Pool, r: *const Run) -> i32 {
+pub unsafe extern "C" fn g6kv_release(p: *mut Handle, r: *const Run) -> i32 {
     if r.is_null() {
         return Error::BadArgument.code();
     }
-    code((*p).release(&*r))
+    code((*p).lock().release(&*r))
 }
 
-/// A live run's pages in table order (borrowed: valid until the next call that changes the pool) and whether it is
-/// exclusive.
+/// A live run's pages in table order and whether it is exclusive: copies up to `cap` pages into `pages` and sets `*n`
+/// to the run's length, which may be more than cap.
 ///
 /// # Safety
-/// As g6kv_exclusive. `r` must be valid for a read, `pages`, `n` and `exclusive` for a write.
+/// As g6kv_exclusive. `r` must be valid for a read, `pages` for cap writes (or NULL with cap 0), `n` and `exclusive`
+/// for a write.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_list(
-    p: *const Pool,
+    p: *const Handle,
     r: *const Run,
-    pages: *mut *const u32,
+    pages: *mut u32,
+    cap: usize,
     n: *mut usize,
     exclusive: *mut i32,
 ) -> i32 {
-    if r.is_null() || pages.is_null() || n.is_null() || exclusive.is_null() {
+    if r.is_null() || (pages.is_null() && cap > 0) || n.is_null() || exclusive.is_null() {
         return Error::BadArgument.code();
     }
-    let p = &*p;
+    let p = (*p).lock();
     match (p.list(&*r), p.exclusive_run(&*r)) {
         (Ok(l), Ok(x)) => {
-            *pages = l.as_ptr();
+            let k = l.len().min(cap);
+            if k > 0 {
+                std::ptr::copy_nonoverlapping(l.as_ptr(), pages, k);
+            }
             *n = l.len();
             *exclusive = x as i32;
             0
@@ -173,15 +225,15 @@ pub unsafe extern "C" fn g6kv_list(
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_keep(p: *mut Pool, strict: i32, noend: i32, grid: i32) {
-    (*p).keep(Rules { strict: strict != 0, noend: noend != 0, grid });
+pub unsafe extern "C" fn g6kv_keep(p: *mut Handle, strict: i32, noend: i32, grid: i32) {
+    (*p).lock().keep(Rules { strict: strict != 0, noend: noend != 0, grid });
 }
 
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_keeping(p: *const Pool) -> i32 {
-    (*p).keeping() as i32
+pub unsafe extern "C" fn g6kv_keeping(p: *const Handle) -> i32 {
+    (*p).lock().keeping() as i32
 }
 
 /// Retires a run with its session's finished PrefixReuse state (history, valid, written_end, pf_end).
@@ -190,7 +242,7 @@ pub unsafe extern "C" fn g6kv_keeping(p: *const Pool) -> i32 {
 /// As g6kv_exclusive. `r` must be valid for a read and `history` must point at `n` ints.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_retain(
-    p: *mut Pool,
+    p: *mut Handle,
     r: *const Run,
     history: *const i32,
     n: usize,
@@ -207,7 +259,7 @@ pub unsafe extern "C" fn g6kv_retain(
 /// As g6kv_retain. A nonnull namespace of the required size must point to that many readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_retain_namespaced(
-    p: *mut Pool,
+    p: *mut Handle,
     r: *const Run,
     history: *const i32,
     n: usize,
@@ -222,14 +274,18 @@ pub unsafe extern "C" fn g6kv_retain_namespaced(
     if p.is_null() || r.is_null() {
         return Error::BadArgument.code();
     }
-    code((*p).retain_namespaced(&*r, Finished { history: history.to_vec(), valid, written_end, pf_end }, namespace))
+    code((*p).lock().retain_namespaced(
+        &*r,
+        Finished { history: history.to_vec(), valid, written_end, pf_end },
+        namespace,
+    ))
 }
 
 /// # Safety
 /// As g6kv_exclusive. `prompt` must point at `n` ints and `out` must be valid for a write.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_match(
-    p: *const Pool,
+    p: *const Handle,
     prompt: *const i32,
     n: usize,
     rows: u64,
@@ -246,7 +302,7 @@ pub unsafe extern "C" fn g6kv_match(
 /// As g6kv_match. A nonnull namespace of the required size must point to that many readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_match_namespaced(
-    p: *const Pool,
+    p: *const Handle,
     prompt: *const i32,
     n: usize,
     rows: u64,
@@ -256,12 +312,36 @@ pub unsafe extern "C" fn g6kv_match_namespaced(
     namespace_bytes: usize,
     out: *mut G6kvHit,
 ) -> i32 {
+    g6kv_match_r(p, prompt, n, rows, worst, limit, namespace_, namespace_bytes, 0, out)
+}
+
+/// g6kv_match_namespaced for a grant at R = r rows (0 = the pool's R). BadArgument for an R the pool refuses.
+///
+/// # Safety
+/// As g6kv_match_namespaced.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_match_r(
+    p: *const Handle,
+    prompt: *const i32,
+    n: usize,
+    rows: u64,
+    worst: u64,
+    limit: i32,
+    namespace_: *const u8,
+    namespace_bytes: usize,
+    r: u32,
+    out: *mut G6kvHit,
+) -> i32 {
     let Some(namespace) = namespace(namespace_, namespace_bytes) else { return Error::BadArgument.code() };
     let Some(prompt) = slice(prompt, n) else { return Error::BadArgument.code() };
     if p.is_null() || out.is_null() {
         return Error::BadArgument.code();
     }
-    let h = (*p).match_prefix_namespaced(prompt, rows, worst, limit, namespace);
+    let p = (*p).lock();
+    if p.exclusive_r(0, r).is_err() {
+        return Error::BadArgument.code();
+    }
+    let h = p.match_prefix_r(prompt, rows, worst, limit, namespace, r);
     *out = G6kvHit {
         skip: h.skip,
         lcp: h.lcp,
@@ -279,7 +359,7 @@ pub unsafe extern "C" fn g6kv_match_namespaced(
 /// As g6kv_exclusive, and `out` must be valid for a write.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_take(
-    p: *mut Pool,
+    p: *mut Handle,
     skip: i32,
     age: u64,
     from: i32,
@@ -287,10 +367,29 @@ pub unsafe extern "C" fn g6kv_take(
     worst: u64,
     out: *mut Run,
 ) -> i32 {
+    g6kv_take_r(p, skip, age, from, rows, worst, 0, out)
+}
+
+/// g6kv_take for a g6kv_match_r hit at R = r rows (0 = the pool's R).
+///
+/// # Safety
+/// As g6kv_take.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn g6kv_take_r(
+    p: *mut Handle,
+    skip: i32,
+    age: u64,
+    from: i32,
+    rows: u64,
+    worst: u64,
+    r: u32,
+    out: *mut Run,
+) -> i32 {
     if out.is_null() {
         return Error::BadArgument.code();
     }
-    match (*p).take_hit(skip, age, (from >= 0).then_some(from as u32), rows, worst) {
+    match (*p).lock().take_hit_r(skip, age, (from >= 0).then_some(from as u32), rows, worst, r) {
         Ok(r) => {
             *out = r;
             0
@@ -305,11 +404,11 @@ pub unsafe extern "C" fn g6kv_take(
 /// # Safety
 /// As g6kv_exclusive. `r` must be valid for a read, `out` and `granted` for a write.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_grow(p: *mut Pool, r: *const Run, rows: u64, out: *mut Run, granted: *mut i32) -> i32 {
+pub unsafe extern "C" fn g6kv_grow(p: *mut Handle, r: *const Run, rows: u64, out: *mut Run, granted: *mut i32) -> i32 {
     if r.is_null() || out.is_null() || granted.is_null() {
         return Error::BadArgument.code();
     }
-    match (*p).grow(&*r, rows) {
+    match (*p).lock().grow(&*r, rows) {
         Ok(g) => {
             *granted = g.is_some() as i32;
             *out = g.unwrap_or(*r);
@@ -324,8 +423,8 @@ pub unsafe extern "C" fn g6kv_grow(p: *mut Pool, r: *const Run, rows: u64, out: 
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_chunks(p: *mut Pool, pages_per_chunk: u32) -> i32 {
-    code((*p).chunks(pages_per_chunk))
+pub unsafe extern "C" fn g6kv_chunks(p: *mut Handle, pages_per_chunk: u32) -> i32 {
+    code((*p).lock().chunks(pages_per_chunk))
 }
 
 /// Chunks (0 when resize is off), and whether chunk k is online.
@@ -333,15 +432,15 @@ pub unsafe extern "C" fn g6kv_chunks(p: *mut Pool, pages_per_chunk: u32) -> i32 
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_chunk_count(p: *const Pool) -> u32 {
-    (*p).chunk_count()
+pub unsafe extern "C" fn g6kv_chunk_count(p: *const Handle) -> u32 {
+    (*p).lock().chunk_count()
 }
 
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_chunk_online(p: *const Pool, k: u32) -> i32 {
-    (*p).chunk_online(k) as i32
+pub unsafe extern "C" fn g6kv_chunk_online(p: *const Handle, k: u32) -> i32 {
+    (*p).lock().chunk_online(k) as i32
 }
 
 /// The online pages below place.
@@ -349,8 +448,8 @@ pub unsafe extern "C" fn g6kv_chunk_online(p: *const Pool, k: u32) -> i32 {
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_place_online(p: *const Pool) -> u32 {
-    (*p).place_online()
+pub unsafe extern "C" fn g6kv_place_online(p: *const Handle) -> u32 {
+    (*p).lock().place_online()
 }
 
 /// Takes `n` chunks offline (Pool::shrink): `*done` = 1 and the chunks in out[0..*got], ascending, or `*done` = 0 when
@@ -360,7 +459,7 @@ pub unsafe extern "C" fn g6kv_place_online(p: *const Pool) -> u32 {
 /// As g6kv_exclusive. `out` must be valid for cap writes, `got` and `done` for a write.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_shrink(
-    p: *mut Pool,
+    p: *mut Handle,
     n: u32,
     out: *mut u32,
     cap: usize,
@@ -370,7 +469,7 @@ pub unsafe extern "C" fn g6kv_shrink(
     if (out.is_null() && n > 0) || got.is_null() || done.is_null() || cap < n as usize {
         return Error::BadArgument.code();
     }
-    match (*p).shrink(n) {
+    match (*p).lock().shrink(n) {
         Ok(Some(v)) => {
             for (i, &k) in v.iter().enumerate() {
                 *out.add(i) = k;
@@ -394,11 +493,11 @@ pub unsafe extern "C" fn g6kv_shrink(
 /// # Safety
 /// As g6kv_exclusive. `out` must be valid for cap writes.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_grow_pool(p: *mut Pool, n: u32, out: *mut u32, cap: usize) -> i32 {
+pub unsafe extern "C" fn g6kv_grow_pool(p: *mut Handle, n: u32, out: *mut u32, cap: usize) -> i32 {
     if (out.is_null() && n > 0) || cap < n as usize {
         return Error::BadArgument.code();
     }
-    match (*p).grow_pool(n) {
+    match (*p).lock().grow_pool(n) {
         Ok(v) => {
             for (i, &k) in v.iter().enumerate() {
                 *out.add(i) = k;
@@ -412,11 +511,11 @@ pub unsafe extern "C" fn g6kv_grow_pool(p: *mut Pool, n: u32, out: *mut u32, cap
 /// # Safety
 /// As g6kv_exclusive, and `out` must be valid for a write.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_stats(p: *const Pool, out: *mut Stats) -> i32 {
+pub unsafe extern "C" fn g6kv_stats(p: *const Handle, out: *mut Stats) -> i32 {
     if out.is_null() {
         return Error::BadArgument.code();
     }
-    *out = (*p).stats();
+    *out = (*p).lock().stats();
     0
 }
 
@@ -433,9 +532,9 @@ pub struct G6kvUse {
 /// # Safety
 /// As g6kv_exclusive, and `out` must hold `cap` entries (or be NULL with cap 0).
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_runs(p: *const Pool, out: *mut G6kvUse, cap: usize) -> usize {
+pub unsafe extern "C" fn g6kv_runs(p: *const Handle, out: *mut G6kvUse, cap: usize) -> usize {
     let mut n = 0;
-    for (v, held, worst) in (*p).runs() {
+    for (v, held, worst) in (*p).lock().runs() {
         if n < cap && !out.is_null() {
             *out.add(n) = G6kvUse { table_version: v, held, worst };
         }
@@ -447,22 +546,22 @@ pub unsafe extern "C" fn g6kv_runs(p: *const Pool, out: *mut G6kvUse, cap: usize
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_digest(p: *const Pool) -> u64 {
-    (*p).digest()
+pub unsafe extern "C" fn g6kv_digest(p: *const Handle) -> u64 {
+    (*p).lock().digest()
 }
 
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_log(p: *mut Pool, on: i32) {
-    (*p).log(on != 0);
+pub unsafe extern "C" fn g6kv_log(p: *mut Handle, on: i32) {
+    (*p).lock().log(on != 0);
 }
 
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_kept_runs(p: *const Pool) -> u32 {
-    (*p).kept_runs()
+pub unsafe extern "C" fn g6kv_kept_runs(p: *const Handle) -> u32 {
+    (*p).lock().kept_runs()
 }
 
 /// Block stores below the pool (src/stash.rs), after g6kv_keep. Then g6kv_add_tier per tier, in flag order.
@@ -470,8 +569,8 @@ pub unsafe extern "C" fn g6kv_kept_runs(p: *const Pool) -> u32 {
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_stores(p: *mut Pool, shared_after: u32) {
-    (*p).stores(shared_after);
+pub unsafe extern "C" fn g6kv_stores(p: *mut Handle, shared_after: u32) {
+    (*p).lock().stores(shared_after);
 }
 
 /// A tier of `slots` blocks: keep 0 = evicted runs, 1 = shared prefixes, 2 = both. index_dir (or NULL) keeps its
@@ -481,24 +580,38 @@ pub unsafe extern "C" fn g6kv_stores(p: *mut Pool, shared_after: u32) {
 /// As g6kv_exclusive. index_dir and compat are NULL or NUL-terminated.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_add_tier(
-    p: *mut Pool,
+    p: *mut Handle,
     slots: u64,
     keep: i32,
     index_dir: *const c_char,
     compat: *const c_char,
 ) -> i32 {
-    let keep = match keep {
+    // + 4: the index records every entry, evicted runs too (a persist=on ssd store with keep=sessions, whose runs the
+    // quit stores so the next boot brings the sessions back)
+    let whole = keep & 4 != 0 && !index_dir.is_null();
+    let keep = match keep & !4 {
         0 => Keep::Evicted,
         1 => Keep::Shared,
         2 => Keep::All,
-        _ => return crate::blocks::fail(std::io::Error::other("keep: 0, 1 or 2")),
+        _ => return crate::blocks::fail(std::io::Error::other("keep: 0, 1 or 2, + 4 for a whole index")),
     };
     let text = |c: *const c_char| (!c.is_null()).then(|| CStr::from_ptr(c).to_string_lossy().into_owned());
     let (dir, compat) = (text(index_dir), text(compat).unwrap_or_default());
-    match (*p).add_tier(slots, keep, dir.as_deref().map(|d| (std::path::Path::new(d), compat.as_str()))) {
+    let mut pool = (*p).lock();
+    let r = pool.add_tier(slots, keep, dir.as_deref().map(|d| (std::path::Path::new(d), compat.as_str())));
+    if let (true, Ok(()), Some(st)) = (whole, &r, pool.stash_mut()) {
+        st.index_whole(st.tiers() - 1);
+    }
+    match r {
         Ok(()) => 0,
         Err(e) => crate::blocks::fail(e),
     }
+}
+
+/// After the last g6kv_add_tier: drops the index runs whose base came back in no tier. Returns how many.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tiers_loaded(p: *mut Handle) -> u64 {
+    (*p).lock().tiers_loaded() as u64
 }
 
 /// At admission, before the grant, on every rank: counts the prompt toward the prefixes it starts. Returns how many.
@@ -507,9 +620,9 @@ pub unsafe extern "C" fn g6kv_add_tier(
 /// # Safety
 /// As g6kv_exclusive; `prompt` points at `n` ints.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_count(p: *mut Pool, prompt: *const i32, n: usize, span: i64) -> u32 {
+pub unsafe extern "C" fn g6kv_count(p: *mut Handle, prompt: *const i32, n: usize, span: i64) -> u32 {
     let span = u32::try_from(span).ok();
-    slice(prompt, n).map_or(0, |pr| (*p).count(pr, span))
+    slice(prompt, n).map_or(0, |pr| (*p).lock().count(pr, span))
 }
 
 /// Prepare a namespace-aware admission. Non-stock prompts are excluded from stock counting/promotion.
@@ -518,7 +631,7 @@ pub unsafe extern "C" fn g6kv_count(p: *mut Pool, prompt: *const i32, n: usize, 
 /// As g6kv_match, with `out` valid for a u32 write and a readable namespace buffer of the required size.
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_count_namespaced(
-    p: *mut Pool,
+    p: *mut Handle,
     prompt: *const i32,
     n: usize,
     span: i64,
@@ -531,7 +644,7 @@ pub unsafe extern "C" fn g6kv_count_namespaced(
     if p.is_null() || out.is_null() {
         return Error::BadArgument.code();
     }
-    *out = (*p).count_namespaced(prompt, u32::try_from(span).ok(), namespace);
+    *out = (*p).lock().count_namespaced(prompt, u32::try_from(span).ok(), namespace);
     0
 }
 
@@ -540,8 +653,14 @@ pub unsafe extern "C" fn g6kv_count_namespaced(
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_tier_policy(p: *mut Pool, t: u32, min_rows: u64, min_hits: u32, block_bytes: u64) -> i32 {
-    match (*p).set_policy(t as usize, Policy { min_rows, min_hits, block_bytes }) {
+pub unsafe extern "C" fn g6kv_tier_policy(
+    p: *mut Handle,
+    t: u32,
+    min_rows: u64,
+    min_hits: u32,
+    block_bytes: u64,
+) -> i32 {
+    match (*p).lock().set_policy(t as usize, Policy { min_rows, min_hits, block_bytes }) {
         Ok(()) => 0,
         Err(e) => e.code(),
     }
@@ -552,8 +671,8 @@ pub unsafe extern "C" fn g6kv_tier_policy(p: *mut Pool, t: u32, min_rows: u64, m
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_write_limit(p: *mut Pool, milli: u64) {
-    (*p).write_limit(milli);
+pub unsafe extern "C" fn g6kv_write_limit(p: *mut Handle, milli: u64) {
+    (*p).lock().write_limit(milli);
 }
 
 /// g6kv_io: one copy. kind 0 = spill (page -> tier's slot), 1 = move (tier's slot -> to's to_slot), 2 = restore (tier's
@@ -586,8 +705,8 @@ fn part_code(p: Part) -> (u32, u32) {
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_tail(p: *mut Pool, nr: u32, per_slot: u32) {
-    (*p).tail(nr, per_slot);
+pub unsafe extern "C" fn g6kv_tail(p: *mut Handle, nr: u32, per_slot: u32) {
+    (*p).lock().tail(nr, per_slot);
 }
 
 /// Remote rows release: a split run's main pages past its prefix, the records of each rank's rows store and the most
@@ -596,8 +715,8 @@ pub unsafe extern "C" fn g6kv_tail(p: *mut Pool, nr: u32, per_slot: u32) {
 /// # Safety
 /// `p` must be live.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_window(p: *mut Pool, pages: u32, ids: u32, runs: u32) -> i32 {
-    match (*p).window(pages, ids, runs) {
+pub unsafe extern "C" fn g6kv_window(p: *mut Handle, pages: u32, ids: u32, runs: u32) -> i32 {
+    match (*p).lock().window(pages, ids, runs) {
         Ok(()) => 0,
         Err(e) => e.code(),
     }
@@ -608,8 +727,8 @@ pub unsafe extern "C" fn g6kv_window(p: *mut Pool, pages: u32, ids: u32, runs: u
 /// # Safety
 /// `p` must be live, `pages` valid for `n` reads.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_is_kept(p: *const Pool, pages: *const u32, n: usize) -> i32 {
-    (*p).is_kept(std::slice::from_raw_parts(pages, n)) as i32
+pub unsafe extern "C" fn g6kv_is_kept(p: *const Handle, pages: *const u32, n: usize) -> i32 {
+    (*p).lock().is_kept(std::slice::from_raw_parts(pages, n)) as i32
 }
 
 /// The window runs live now.
@@ -617,8 +736,42 @@ pub unsafe extern "C" fn g6kv_is_kept(p: *const Pool, pages: *const u32, n: usiz
 /// # Safety
 /// `p` must be live.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_window_runs(p: *const Pool) -> u32 {
-    (*p).window_runs()
+pub unsafe extern "C" fn g6kv_window_runs(p: *const Handle) -> u32 {
+    (*p).lock().window_runs()
+}
+
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_window_runs_r(p: *const Handle, r: u32) -> u32 {
+    (*p).lock().window_runs_r(r)
+}
+
+/// Whether live window run `*r` can shrink to R = r2 rows (Pool::shrinkable).
+///
+/// # Safety
+/// As g6kv_exclusive, and `r` must be valid for a read.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_shrinkable(p: *const Handle, r: *const Run, r2: u32) -> i32 {
+    (!r.is_null() && (*p).lock().shrinkable(&*r, r2)) as i32
+}
+
+/// Live window run `*r` takes R = r2 rows (Pool::shrink_run); the run it becomes in `*out`.
+///
+/// # Safety
+/// As g6kv_exclusive. `r` must be valid for a read, `out` for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_shrink_run(p: *mut Handle, r: *const Run, r2: u32, out: *mut Run) -> i32 {
+    if r.is_null() || out.is_null() {
+        return Error::BadArgument.code();
+    }
+    match (*p).lock().shrink_run(&*r, r2) {
+        Ok(x) => {
+            *out = x;
+            0
+        }
+        Err(e) => e.code(),
+    }
 }
 
 /// For a window request of `worst` rows past R with a lease limit: 1 and {records its tail needs per rank, records
@@ -627,8 +780,17 @@ pub unsafe extern "C" fn g6kv_window_runs(p: *const Pool) -> u32 {
 /// # Safety
 /// `p` must be live, `out` valid for 3 writes.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_ids_view(p: *const Pool, worst: u64, out: *mut u64) -> i32 {
-    match (*p).ids_view(worst) {
+pub unsafe extern "C" fn g6kv_ids_view(p: *const Handle, worst: u64, out: *mut u64) -> i32 {
+    g6kv_ids_view_r(p, worst, 0, out)
+}
+
+/// g6kv_ids_view for a grant at R = r rows (0 = the pool's R): 0 for an R the pool refuses.
+///
+/// # Safety
+/// As g6kv_ids_view.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_ids_view_r(p: *const Handle, worst: u64, r: u32, out: *mut u64) -> i32 {
+    match (*p).lock().ids_view_r(worst, r) {
         Some((a, b, c)) => {
             for (k, v) in [a, b, c].into_iter().enumerate() {
                 *out.add(k) = v;
@@ -645,8 +807,17 @@ pub unsafe extern "C" fn g6kv_ids_view(p: *const Pool, worst: u64, out: *mut u64
 /// # Safety
 /// `p` must be live, `out` valid for 4 writes.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_split_view(p: *const Pool, worst: u64, out: *mut u64) -> i32 {
-    match (*p).split_view(worst) {
+pub unsafe extern "C" fn g6kv_split_view(p: *const Handle, worst: u64, out: *mut u64) -> i32 {
+    g6kv_split_view_r(p, worst, 0, out)
+}
+
+/// g6kv_split_view for a grant at R = r rows (0 = the pool's R): 0 for an R the pool refuses.
+///
+/// # Safety
+/// As g6kv_split_view.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_split_view_r(p: *const Handle, worst: u64, r: u32, out: *mut u64) -> i32 {
+    match (*p).lock().split_view_r(worst, r) {
         Some((a, b, c, d)) => {
             for (k, v) in [a, b, c as u64, d as u64].into_iter().enumerate() {
                 *out.add(k) = v;
@@ -663,8 +834,8 @@ pub unsafe extern "C" fn g6kv_split_view(p: *const Pool, worst: u64, out: *mut u
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_split(p: *const Pool) -> i32 {
-    (*p).split() as i32
+pub unsafe extern "C" fn g6kv_split(p: *const Handle) -> i32 {
+    (*p).lock().split() as i32
 }
 
 /// Copies queued since the last g6kv_io_take.
@@ -672,8 +843,8 @@ pub unsafe extern "C" fn g6kv_split(p: *const Pool) -> i32 {
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_io_pending(p: *const Pool) -> usize {
-    (*p).io_pending()
+pub unsafe extern "C" fn g6kv_io_pending(p: *const Handle) -> usize {
+    (*p).lock().io_pending()
 }
 
 /// Takes the queued copies into `out`, in the order to run them. `cap` must hold them all (g6kv_io_pending). Then
@@ -682,8 +853,8 @@ pub unsafe extern "C" fn g6kv_io_pending(p: *const Pool) -> usize {
 /// # Safety
 /// As g6kv_exclusive, and `out` must hold `cap` entries.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_io_take(p: *mut Pool, out: *mut G6kvIo, cap: usize) -> i32 {
-    let p = &mut *p;
+pub unsafe extern "C" fn g6kv_io_take(p: *mut Handle, out: *mut G6kvIo, cap: usize) -> i32 {
+    let mut p = (*p).lock();
     if p.io_pending() > cap || (cap > 0 && out.is_null()) {
         return Error::BadArgument.code();
     }
@@ -711,8 +882,9 @@ pub unsafe extern "C" fn g6kv_io_take(p: *mut Pool, out: *mut G6kvIo, cap: usize
 /// # Safety
 /// As g6kv_exclusive.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_io_done(p: *mut Pool) -> i32 {
-    match (*p).io_done() {
+pub unsafe extern "C" fn g6kv_io_done(p: *mut Handle) -> i32 {
+    let r = (*p).lock().io_done();
+    match r {
         Ok(()) => 0,
         Err(e) => crate::blocks::fail(e),
     }
@@ -723,8 +895,8 @@ pub unsafe extern "C" fn g6kv_io_done(p: *mut Pool) -> i32 {
 /// # Safety
 /// As g6kv_exclusive, and `out` must be valid for a write.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_tier_stats(p: *const Pool, t: u32, out: *mut TierStats) -> i32 {
-    match ((*p).tier_stats(t as usize), out.is_null()) {
+pub unsafe extern "C" fn g6kv_tier_stats(p: *const Handle, t: u32, out: *mut TierStats) -> i32 {
+    match ((*p).lock().tier_stats(t as usize), out.is_null()) {
         (Some(s), false) => {
             *out = s;
             0
@@ -739,8 +911,8 @@ pub unsafe extern "C" fn g6kv_tier_stats(p: *const Pool, t: u32, out: *mut TierS
 /// # Safety
 /// As g6kv_exclusive; `buf` holds `cap` bytes (or is NULL with cap 0).
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_stored_summary(p: *const Pool, buf: *mut c_char, cap: usize) -> usize {
-    let s = (*p).stored_summary();
+pub unsafe extern "C" fn g6kv_stored_summary(p: *const Handle, buf: *mut c_char, cap: usize) -> usize {
+    let s = (*p).lock().stored_summary();
     if !buf.is_null() && cap > 0 {
         let n = s.len().min(cap - 1);
         std::ptr::copy_nonoverlapping(s.as_ptr() as *const c_char, buf, n);
@@ -754,9 +926,9 @@ pub unsafe extern "C" fn g6kv_stored_summary(p: *const Pool, buf: *mut c_char, c
 /// # Safety
 /// As g6kv_exclusive; `agreed` NUL-terminated.
 #[no_mangle]
-pub unsafe extern "C" fn g6kv_keep_agreed(p: *mut Pool, agreed: *const c_char) {
+pub unsafe extern "C" fn g6kv_keep_agreed(p: *mut Handle, agreed: *const c_char) {
     if !agreed.is_null() {
-        (*p).keep_agreed(&CStr::from_ptr(agreed).to_string_lossy());
+        (*p).lock().keep_agreed(&CStr::from_ptr(agreed).to_string_lossy());
     }
 }
 
@@ -900,4 +1072,40 @@ pub unsafe extern "C" fn g6kv_rows_describe(r: *const crate::rows::Rows, buf: *m
     let n = d.len().min(cap - 1);
     std::ptr::copy_nonoverlapping(d.as_ptr() as *const c_char, buf, n);
     *buf.add(n) = 0;
+}
+
+/// Resizes tier t to `slots` (its store grew, or is about to shrink; stash.rs resize_tier) at a point every rank
+/// sees: *resized = 1, or 0 when the tier refuses (an indexed tier, or entries it may not evict). A shrink evicts the
+/// least recently used entries and queues the moves into the slots that stay: run them (g6kv_io_take, g6kv_io_done)
+/// before the store gives its top back (g6kv_store_shrink).
+///
+/// # Safety
+/// `p` must be a live pool, `resized` valid for a write (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_resize(p: *mut Handle, t: u32, slots: u64, resized: *mut i32) -> i32 {
+    match (*p).lock().resize_tier(t as usize, slots) {
+        Ok(ok) => {
+            if !resized.is_null() {
+                *resized = ok as i32;
+            }
+            0
+        }
+        Err(e) => e.code(),
+    }
+}
+
+/// The ages in ms a head reports (g6kv_store_report): ages[i] is that of the entry holding tier t's (i x per_seg)-th
+/// coldest block, coldest first. Writes up to `cap` and returns how many.
+///
+/// # Safety
+/// `p` must be a live pool and `out` hold `cap` values.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_tier_coldest(p: *mut Handle, t: u32, per_seg: u64, out: *mut u64, cap: usize) -> usize {
+    if out.is_null() || cap == 0 {
+        return 0;
+    }
+    let a = (*p).lock().coldest_ages(t as usize, per_seg, cap);
+    let n = a.len().min(cap);
+    std::ptr::copy_nonoverlapping(a.as_ptr(), out, n);
+    n
 }

@@ -1,0 +1,215 @@
+{
+ "version": 1,
+ "doc": "make_manifest.py: write fixtures/manifest.json, the one tolerance table every engine check gates against.\nUse:  python3 ds41_compare.py ENGINE_DUMP ORACLE_DUMP --tol fixtures/manifest.json [--names L0.resid_attn,...]\nKeys without a layer prefix apply to every layer (L<n>.<key>); `embed_T` / `final.*` are exact names.\nEvery tolerance cites its evidence (measured on L0, p128, oracle faithful flow).  PROVISIONAL = not measured on\nlayers 2/20/39 or on the 40-layer chain.",
+ "dumps": {
+  "p6": "ds41_oracle.py --prompt prompts/p6.json --quant faithful",
+  "p128": "ds41_oracle.py --prompt prompts/p128.json --quant faithful",
+  "p6_w4a16": "ds41_oracle.py --prompt prompts/p6.json --shadow --w4a16",
+  "p6_w4a16_chain4": "ds41_oracle.py --prompt prompts/p6.json --main-w4a16 (W4A16 MoE on the main chain, synthetic 0,2,20,39, each layer chained on the oracle's own output)",
+  "p6_w4a16_enginetf": "ds41_oracle.py --prompt prompts/p6.json --main-w4a16 --engine-trunk ENGINE_DUMP (same chain, trunk forced to the engine's dump after every layer)"
+ },
+ "arms": {
+  "faithful": "<stage>.bin: official fp8/fp4 act-quant in the loop (primary flow, chained)",
+  "none": "<stage>@none.bin: same stage recomputed teacher-forced on the same inputs with GEMM-operand act-quant off (kv/latent/index storage quant stays; it is cache format)",
+  "w4a16": "<stage>@w4a16.bin (moe_routed, shared_out, ffn_out, resid; run with --shadow --w4a16): the engine's MoE math on the same inputs, fp16 activations, swiglu stored fp16, fc2 output fp16, route weight applied after fc2, shared expert fp32, one bf16 round"
+ },
+ "tolerances": {
+  "embed_T": {
+   "bit_equal": true,
+   "evidence": "embedding lookup + 4-way repeat, exact"
+  },
+  "resid_attn": {
+   "rel_l2": 0.005,
+   "cos": 0.9999,
+   "evidence": "L0: official model.py vs oracle 1.1e-4 (xcheck); x45 margin for GPU order; PROVISIONAL deeper layers"
+  },
+  "resid": {
+   "rel_l2": 0.05,
+   "cos": 0.999,
+   "evidence": "w4a16-vs-faithful trunk distance 1.6e-2..2.3e-2 on p6 L0/2/20/39 (one layer, teacher-forced; a chained act-quant-free engine drifts further with depth: the 40-layer prefix run measures it); xcheck official-vs-oracle 4.3e-4; PROVISIONAL deeper layers"
+  },
+  "attn_pre": {
+   "rel_l2": 0.001,
+   "cos": 0.99999
+  },
+  "attn_post": {
+   "rel_l2": 0.001,
+   "cos": 0.99999
+  },
+  "attn_comb": {
+   "rel_l2": 0.001,
+   "cos": 0.99999
+  },
+  "ffn_pre": {
+   "rel_l2": 0.001,
+   "cos": 0.99999
+  },
+  "ffn_post": {
+   "rel_l2": 0.001,
+   "cos": 0.99999
+  },
+  "ffn_comb": {
+   "rel_l2": 0.001,
+   "cos": 0.99999
+  },
+  "attn_in": {
+   "rel_l2": 0.001,
+   "cos": 0.99999,
+   "evidence": "L0 xcheck 2.6e-5"
+  },
+  "ffn_in": {
+   "rel_l2": 0.001,
+   "cos": 0.99999,
+   "evidence": "L0 xcheck 1.5e-4"
+  },
+  "router_w": {
+   "rel_l2": 0.001,
+   "cos": 0.99999,
+   "evidence": "L0 xcheck 2.6e-5"
+  },
+  "router_idx": {
+   "row_set_equal_frac": 0.99,
+   "evidence": "L0 xcheck 1.0; a route flips only when two keys are within fp32 order noise (min gap 2.5e-5)"
+  },
+  "lat_pre": {
+   "rel_l2": 0.001,
+   "cos": 0.99999
+  },
+  "o_sparse": {
+   "rel_l2": 0.001,
+   "cos": 0.99999,
+   "evidence": "L0 xcheck bit-equal (shared sparse_attn semantics)"
+  },
+  "qr": {
+   "rel_l2": 0.002,
+   "cos": 0.99999,
+   "evidence": "L0 xcheck 2.2e-6; faithful-vs-none 1.2e-2 (so a no-act-quant engine FAILS)"
+  },
+  "q": {
+   "rel_l2": 0.002,
+   "cos": 0.99999,
+   "evidence": "L0 xcheck 1.5e-8; faithful-vs-none 1.3e-2"
+  },
+  "kv": {
+   "rel_l2": 0.002,
+   "cos": 0.99999,
+   "evidence": "L0 xcheck bit-equal; faithful-vs-none 2.5e-2"
+  },
+  "lat": {
+   "rel_l2": 0.002,
+   "cos": 0.99999
+  },
+  "idx_q": {
+   "rel_l2": 0.002,
+   "cos": 0.99999
+  },
+  "idx_k": {
+   "rel_l2": 0.002,
+   "cos": 0.99999
+  },
+  "wo_a_out": {
+   "rel_l2": 0.002,
+   "cos": 0.99999,
+   "evidence": "L0 xcheck 9.8e-6; faithful-vs-none 3.3e-2"
+  },
+  "attn_out": {
+   "rel_l2": 0.002,
+   "cos": 0.99999,
+   "evidence": "L0 xcheck 1.3e-4; faithful-vs-none 1.5e-2"
+  },
+  "shared_out": {
+   "rel_l2": 0.002,
+   "cos": 0.99999,
+   "evidence": "L0 xcheck 1.2e-3 (chained, amplified by fp8 block flips); faithful-vs-none 2.2e-2"
+  },
+  "ffn_out": {
+   "rel_l2": 0.06,
+   "cos": 0.998,
+   "evidence": "act-quant-free MoE vs faithful (sanity only): w4a16 emulation is 1.6e-2..3.1e-2 away on p6 L0/2/20/39; L0 xcheck official-vs-oracle 6.9e-4. A W4A16 engine gates on ffn_out@w4a16"
+  },
+  "moe_routed": {
+   "rel_l2": 0.08,
+   "cos": 0.995,
+   "evidence": "act-quant-free engine vs faithful (sanity only): the exact w4a16 emulation sits 1.7e-2..3.4e-2 from faithful on p6 L0/2/20/39 (faithful-vs-none 1.8e-2..3.3e-2); x2.3 margin. A W4A16 engine gates on moe_routed@w4a16 (--arm w4a16), not here"
+  },
+  "moe_routed@none": {
+   "rel_l2": 0.008,
+   "cos": 0.99997,
+   "evidence": "act-quant-free engine vs the oracle's none arm (bf16 gate/up): the w4a16 emulation is 1.8e-3..3.9e-3 away on p6 (fp16 acts + fp16 ypart); x2 margin"
+  },
+  "moe_routed@w4a16": {
+   "rel_l2": 0.002,
+   "cos": 0.999998,
+   "evidence": "engine W4A16 MoE measured 2.5e-4..2.8e-4 on p6 L0/2/20/39 (emulation includes the fp16 roundings; only accumulation order remains); x7 margin"
+  },
+  "shared_out@w4a16": {
+   "rel_l2": 0.002,
+   "cos": 0.999998,
+   "evidence": "engine W4A16 MoE measured 3e-7..1.3e-5 on p6 L0/2/20/39 (shared out fp32, fp16 acts)"
+  },
+  "ffn_out@w4a16": {
+   "rel_l2": 0.005,
+   "cos": 0.99999,
+   "evidence": "engine W4A16 MoE measured on p6 L0/2/20/39: 1e-3 with an fp32 TP reduce, 2.0e-3..2.6e-3 with a bf16 all-reduce of the 4 rank partials; x2 margin over the bf16-reduce case"
+  },
+  "resid_attn@tf": {
+   "rel_l2": 0.015,
+   "cos": 0.9995,
+   "evidence": "first full-engine run (p6 M=6 W4A16 engine): 1.69e-3 (L0) 1.75e-3 (L2) 5.2e-3 (L20) 1.77e-3 (L39); official model.py teacher-forced vs oracle p128: 9.3e-3 (L20) 5.3e-3 (L39); x1.6-3 margin"
+  },
+  "resid@tf": {
+   "rel_l2": 0.015,
+   "cos": 0.9995,
+   "evidence": "first full-engine run vs W4A16-main oracle fed the engine's trunk: 3.0e-3 (L0) 6.4e-3 (L2) 5.5e-3 (L20) 4.4e-3 (L39); official teacher-forced p128 8.8e-3 (L20); x2.3 margin"
+  },
+  "resid_attn@chained": {
+   "rel_l2": 0.04,
+   "cos": 0.998,
+   "evidence": "40-layer chain, official model.py vs oracle, p6: median 5.5e-3, p90 1.4e-2, max 1.44e-2 (L36); x2.8"
+  },
+  "resid@chained": {
+   "rel_l2": 0.04,
+   "cos": 0.998,
+   "evidence": "40-layer chain, official model.py vs oracle, p6: median 5.6e-3, p90 1.4e-2, max 1.45e-2 (L39), min cos 0.99993; x2.8"
+  },
+  "attn_in@chained": {
+   "rel_l2": 0.35,
+   "cos": 0.9,
+   "evidence": "40-layer chain p6: median 1.0e-1, max 1.7e-1 (L39)"
+  },
+  "ffn_in@chained": {
+   "rel_l2": 0.35,
+   "cos": 0.9,
+   "evidence": "40-layer chain p6: median 9.8e-2, max 1.65e-1 (L39)"
+  },
+  "attn_out@chained": {
+   "rel_l2": 0.45,
+   "cos": 0.8,
+   "evidence": "40-layer chain p6: median 1.2e-1, max 2.2e-1 (L37)"
+  },
+  "ffn_out@chained": {
+   "rel_l2": 0.4,
+   "cos": 0.9,
+   "evidence": "40-layer chain p6: median 9.4e-3, p90 3.7e-2, max 1.9e-1 (L33)"
+  },
+  "shared_out@chained": {
+   "rel_l2": 0.35,
+   "cos": 0.9,
+   "evidence": "40-layer chain p6: median 1.9e-2, p90 1.3e-1, max 1.6e-1 (L15)"
+  },
+  "router_w@chained": {
+   "rel_l2": 0.3,
+   "cos": 0.9,
+   "evidence": "40-layer chain p6: median 3.1e-2, max 1.3e-1 (L33)"
+  },
+  "router_idx@chained": {
+   "row_set_equal_frac": 0.2,
+   "evidence": "40-layer chain p6 (only 6 rows per layer): row-set agreement 0.33..1.0, mean 0.68 over layers; a layer-wise gate only catches garbage, compare the mean over layers instead"
+  },
+  "resid@w4a16": {
+   "rel_l2": 0.006,
+   "cos": 0.99998,
+   "evidence": "first full-engine run (p6 L0, engine W4A16): 3.02e-3 vs resid@w4a16 with resid_attn 1.69e-3 feeding hc_post; x2 margin. Teacher-forced per layer, not chained"
+  }
+ }
+}

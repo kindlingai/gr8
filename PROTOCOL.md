@@ -30,11 +30,13 @@ Every message in both directions is one frame:
 
 The front end refuses to serve if `version` != 1. `max_model_len` bounds prompt + max_tokens. `max_logprobs` is
 the largest k the engine accepts for `logprobs` and `prompt_logprobs`. `"insert": true` (absent = false) says the
-engine applies `generate`'s `insert` rule.
+engine applies `generate`'s `insert` rule. `"grammar": true` (absent = false) says it masks a reply with `generate`'s
+`grammar`. `"vision": true` (absent = false) says it takes `generate`'s `images` (DeepSeek-V4.1 or GLM-5.3-Flash with its vision tower). `"penalties": true` (absent = false) says it applies `generate`'s `presence_penalty` and `frequency_penalty`, `"think_end_boost": true` its `think_end_boost`, `"sequence_penalty": true` its `sequence_penalty`.
 
 An optional `steering` object advertises a loaded profile: `profile` (name), `digest` (64 lowercase hex
 manifest SHA-256), `scope` (`shared` or `full`), `layers` (positive active-layer count), `forced` (boolean),
-and `forced_scale` (canonical FP32 number; zero unless forced). Absent/null means unavailable. Current real
+and `forced_scale` (canonical FP32 number; zero unless forced). With several loaded profiles these fields describe the
+first, and `profiles` lists every one as `{profile, digest, layers}`. Absent/null means unavailable. Current real
 engines advertise no loaded profile; the synthetic mock's `--steering` option exercises transport only.
 See [request transport](docs/STEERING-TRANSPORT.md).
 
@@ -60,14 +62,20 @@ See [request transport](docs/STEERING-TRANSPORT.md).
 | `top_p` | nucleus mass, 1.0 = off |
 | `top_k` | 0 = off (the front end maps OpenAI/vLLM `-1` to 0) |
 | `min_p` | 0.0 = off; keep tokens with p >= min_p * p_max |
+| `presence_penalty`, `frequency_penalty` | optional, each in [-2, 2], 0 = off. Sent when one of the four penalties is nonzero, and only to an engine whose hello says `"penalties": true`. OpenAI's penalties with vLLM's semantics: before a position samples, the logit of every id the reply has generated so far drops by `presence_penalty` plus `frequency_penalty` times the number of times it was generated, before temperature and top-p. The prompt does not count, so a reply the front end continues after a `thinking_budget` close (below) counts from that continuation. Logprobs see the penalized distribution. Exact under speculative decoding: a row that checks a draft counts the drafts before it. The shim passes all five penalty fields on as `pen <presence> <frequency> <thinking_presence> <thinking_frequency> <think_end or -1>` after `top_p` |
+| `think_end_boost` | optional, only to an engine whose hello says `"think_end_boost": true`, and only with `think_end`: `{"start": tokens, "per1k": logits, "max": logits}`. Inside the think block, at the reply's n-th thinking token (the drafts before a verify row count, as for the penalties), the `think_end` logit gains min(max, per1k x (n - start) / 1000) once n is past start, before temperature and top-p: a soft thinking budget. A drafted close takes it off the rows after it. The shim passes it on as `boost <start> <per1k> <max>` after `pen` |
+| `sequence_penalty` | optional, only to an engine whose hello says `"sequence_penalty": true`: `{"thinking": {"mult", "base", "min", "cap"}, "answer": {...}, "guard": {..., "avoid": [ids]}}`, any of the scopes. DRY's form: when the sequence ending at a row repeats an earlier run of L >= `min` tokens verbatim (the drafts before a verify row count), the token that continued that run loses min(`cap`, `mult` x `base`^(L - `min`)) before temperature and top-p. `thinking`: rows inside the think block (with `think_end`); `answer`: rows outside it; both against the prompt and the reply so far. `guard`: the reply so far against `avoid`, the token sequence of a call the front end took back (the repeated-tool-call guard's retry). The shim passes them on as `seqt`, `seqa` and `seqg <mult>:<base>:<min>:<cap>[:<ids>]` after `boost` |
+| `thinking_presence_penalty`, `thinking_frequency_penalty`, `think_end` | optional, with the two above. The thinking penalties are added to `presence_penalty` and `frequency_penalty` on the positions inside the think block the prompt leaves open, over the same counts (everything before the close is thinking), until the reply generates `think_end`, the close's id. `think_end` null: the prompt left no block open, so they never apply. A drafted close takes them off the rows after it in the same step, at any draft length. After a `thinking_budget` close the continuation's prompt holds the close, so they never apply to it |
 | `seed` | integer or null. With a seed the sampled sequence is a pure function of (seed, logits) |
 | `stop_ids` | generation stops after emitting any of these ids. The front end always sends the full list (EOS ids from `generation_config.json` + request `stop_token_ids`), empty if `ignore_eos` |
 | `logprobs` | null = none. k >= 0: for every generated token return its logprob and rank plus the top-k (k = 0 means the sampled token only) |
 | `prompt_logprobs` | null = none. k >= 0: for every prompt position j >= 1 return the logprob and rank of `prompt[j]` under the distribution predicted at j-1, plus the top-k |
 | `system_tokens` | optional (chat requests). How many of the prompt's first tokens are its system span: the leading system messages and the tool definitions as the chat template renders them, up to where the first other message begins. The engine's KV stores (`--kv-keep system`) keep system prefixes by it. Absent (completions): the engine counts every prefix of the prompt instead |
-| `steering_profile` | optional profile name; must match the engine's loaded capability, even when scale is zero. Missing/null selects stock unless the engine is in forced mode |
+| `steering_profile` | optional profile name; must name one of the engine's loaded profiles, even when scale is zero. Missing/null selects stock unless the engine is in forced mode |
 | `steering_scale` | optional finite number in [0,4], default 1 with a profile. Converted to FP32 once, negative zero normalized to positive zero. A nonzero scale requires a profile; zero selects the stock identity |
 | `insert` | optional, only to an engine whose hello says `"insert": true`. A list of at most one rule `{"after_tokens": N, "unless_emitted": X or null, "tokens": [ids]}` (1 to 64 ids): once the reply holds N tokens and none of them is X, the engine puts `tokens` in place of the reply's next token, even when that token is X. The tokens count as generated tokens, toward `max_tokens` (which cuts them short) and `completion_tokens`, and stop ids among them stop the request. The reply goes on from them as from a prompt that ended with them. Not with `logprobs`: an inserted token has none |
+| `grammar` | optional, only to an engine whose hello says `"grammar": true`. `{"kind": "json" or "json_schema", "schema": the JSON schema as a string (json_schema), "strict": bool, "after_token": id or null}`: from the token after `after_token` (the think close; null = from the first) the engine samples only tokens its XGrammar grammar allows, so the reply's content is one JSON object (`json`) or one value of the schema (`json_schema`; `strict` refuses properties and items the schema does not name), then a stop id. Logprobs and the rejection sampling of drafts see the masked distribution. The shim passes it on as `gram <kind>:<strict>:<arm>:<schema hex>` in the request header |
+| `images` | optional, only to an engine whose hello says `"vision": true`; absent when the prompt has no image. A list, in prompt order, of `{"pos": first prompt index of the span, "vit_h": patch rows, "vit_w": patch columns, "key": 16 hex digits, "rgb": base64}`. Every prompt id in `[pos, pos + span)` is the image token; spans ascend and do not overlap. DeepSeek-V4.1: token 129264, span = `ceil(vit_h/3) * (ceil(vit_w/3) + 1) + 2`, `rgb` as the release's `load_image` builds it before it normalises (padded grey). GLM-5.3-Flash: token 154854 (`<|image|>`), span = `vit_h/2 * vit_w/2` (both even, 16 to 8000), `rgb` as `Glm5NextImageProcessor` builds it before it rescales (padded black on the right and the bottom, docs/FLASH-VISION.md). `rgb` is `vit_h*14` rows of `vit_w*14` RGB pixels, uint8. `key` is the first 8 bytes of sha256(vit_h u32 LE, vit_w u32 LE, rgb) in hex (for logs; the engine digests the pixels itself). The engine runs the vision tower on the image and puts its rows in the span's embeddings. Not with `prompt_logprobs` or a steering profile. The shim passes each on as `img <pos>:<vit_h>:<vit_w>:<key>:<rgb>` after the other header fields |
 
 Logprobs are of the distribution the token was sampled from **before** temperature/top-p/top-k/min-p are applied
 (vLLM's default `logprobs_mode=raw_logprobs`), log-softmax over the full vocab. Rank is 1-based over that same
@@ -146,7 +154,7 @@ The last frame for a request; the id may be reused after it.
 | `cached_tokens` | prompt tokens served from the prefix cache (0 if none) |
 | `completion_tokens` | ids emitted in `tokens` frames for this request |
 | `message` | only with `reason: error`: human-readable cause (e.g. `"prompt too long"`, `"KV cache full"`) |
-| `spec` | optional: this request's share of the `metrics` frame's `spec` counters, the same numbers added there when it ended: `{"drafts", "draft_tokens", "accepted", "accepted_per_pos"}` (verify rounds, draft tokens, accepted draft tokens, accepted per draft position) |
+| `spec` | optional: this request's share of the `metrics` frame's `spec` counters, all of what it added there by the time it ended: `{"drafts", "draft_tokens", "accepted", "accepted_per_pos"}` (verify rounds, draft tokens, accepted draft tokens, accepted per draft position) |
 | `timing` | optional: this request's share of the `metrics` frame's `latency` times, in seconds: `{"prefill_s", "decode_s"}` (added to `prefill_sum` / `decode_sum`) |
 
 A request that fails validation in the engine gets `finish` with `reason: error` directly (no `tokens`).
@@ -171,7 +179,8 @@ All values are monotonically increasing counters since engine start, except `req
 - `spec.drafts`: number of verify rounds that had at least one draft token;
   `draft_tokens`: total draft tokens proposed; `accepted`: total draft tokens accepted;
   `accepted_per_pos[i]`: rounds whose draft token at position i (0-based) was accepted. The array length is the
-  max draft depth (k); positions the engine never drafts are 0.
+  max draft depth (k); positions the engine never drafts are 0. The counters grow while a request decodes: the S2
+  engine reports a request's counters about once a second.
 - `prefix_cache.queries` / `hits` count **tokens** (prompt tokens looked up / found), like vLLM.
 - `tokens.generation` counts generated tokens. When `tokens.cached` is present, `tokens.prompt` must count the whole
   prompt, including cached tokens, so the front end can derive computed tokens as `prompt - cached`. Without
@@ -202,3 +211,7 @@ The front end maps these to vLLM's Prometheus names on `/metrics` (see frontend/
   passes it on as `sys <n>` in the request header.
 - v1 (2026-10-12): `generate` `insert` and hello `insert`. An engine without them leaves the hello key out, and the
   front end then sends no `insert`, so the version stays 1.
+- v1 (2026-10-24): `generate` `grammar` and hello `grammar`, the same way: an engine started without `--grammar-dir`
+  leaves the hello key out and the front end sends no `grammar`.
+- v1 (2026-11-04): `generate` `images` and hello `vision`, the same way: an engine without the vision tower leaves the
+  hello key out and the front end refuses a request with images (400).

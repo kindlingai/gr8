@@ -1,0 +1,11 @@
+prefix: "GR8_TEST_"
+scope: test
+knobs:
+  GR8_TEST_DS41_M4_PFW:
+    kind: int
+    default: "0"
+    values: "0.."
+    legacy: ["G6_DS_M4_PFW"]
+    doc: >-
+      m4sim: the prompt runs in W-row chunks of this many rows (it must equal GR8_DS_PREFILL_W and exceed MX); 0 runs it
+      as decode steps.

@@ -138,10 +138,10 @@ class HandshakeTests(unittest.TestCase):
             f.close()
 
     def test_unusable_home_is_refused(self):
-        v = self.assert_refused([hello(1), hello(2, home='relative/g6'), hello(3)], 'G6_HOME')
+        v = self.assert_refused([hello(1), hello(2, home='relative/g6'), hello(3)], 'GR8_WORK_DIR')
         self.assertEqual(v['values']['rank 2 (127.0.0.1)'], "'relative/g6'")
-        self.assert_refused([hello(1, home='/g6\ntouch x'), hello(2), hello(3)], 'G6_HOME')
-        self.assert_refused([hello(1, home=None), hello(2), hello(3)], 'G6_HOME')
+        self.assert_refused([hello(1, home='/g6\ntouch x'), hello(2), hello(3)], 'GR8_WORK_DIR')
+        self.assert_refused([hello(1, home=None), hello(2), hello(3)], 'GR8_WORK_DIR')
 
     def test_any_absolute_home_is_accepted(self):
         # the shim shell-quotes the path, so a space, a quote or a non-ASCII letter is fine

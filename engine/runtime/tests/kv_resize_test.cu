@@ -9,7 +9,7 @@
 //   3. the live sessions' pages are byte-identical before and after the shrink and the grow, and pages that come back
 //      read as zero;
 //   4. a shrink while a live session holds a page in every chunk it could take waits (nothing unmapped).
-// Build and run: TEST=kv_resize_test scripts/c1_tests.sh <bin_dir> (links engine/kvman-rs's libg6kvman.a and -lcuda)
+// Build and run: TEST=kv_resize_test scripts/c1_tests.sh <bin_dir> (links libg6host.a, which holds engine/kvman-rs, and -lcuda)
 // Exit code: 0 PASS, 1 FAIL, 2 CUDA error.
 #include <algorithm>
 #include <cstdint>
@@ -22,6 +22,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include "../../attn/bind.h"
+#include "../../attn/ops.h"
 #include "../../attn/kvchunks.h"
 #include "../../attn/kvfmt.h"
 #include "../../g6nr.h"
@@ -257,9 +258,10 @@ static void run(uint64_t seed)
     g6kv_keep(pool, 0, 1, 0);
     CKI(g6kv_chunks(pool, CHUNK));
     auto list = [&](const g6kv_run& r) {
-        const uint32_t* p; size_t n; int ex;
-        CKI(g6kv_list(pool, &r, &p, &n, &ex));
-        return std::vector<uint32_t>(p, p + n);
+        std::vector<uint32_t> v(r.pages); size_t n; int ex;
+        CKI(g6kv_list(pool, &r, v.data(), v.size(), &n, &ex));
+        if (n != v.size()) { fprintf(stderr, "g6kv_list: %zu pages, run says %zu\n", n, v.size()); exit(1); }
+        return v;
     };
     // session a: 2,600 tokens + room for 3 steps of 8 (pages 0..40); a filler to page 229; session b in chunk 2
     // (230..253); a filler to 299; a retained run in chunk 3 (300..339); then the fillers go, so chunk 1 is free

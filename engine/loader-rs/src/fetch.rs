@@ -1,9 +1,11 @@
 //! The fetch side of the exlr8 v2 release: which byte ranges of the width files one rank loads, and the check
 //! of each half once it has landed. Both read only the rank's index slices (tools/convert/v2slices.py: per owned unit
 //! its offsets, checksums and per-channel values, and every expert's block scales) and the width manifest, the same
-//! inputs src/v2plan.rs builds the rank's image from.
+//! inputs src/v2plan.rs builds the rank's image from. Under a layout (src/layout.rs) the rank's halves are the ones the
+//! layout gives it, each read from the slice that lists it, so it reads every rank's slices at the layout's TP.
 
 use crate::json::{self, Json};
+use crate::layout::{Group, Layout};
 use crate::v2plan::{widths, Slice};
 use crate::xxh64::Xxh64;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -22,6 +24,15 @@ pub struct Unit {
     pub nbytes: u64,
     pub checksum: u64,
     side: Vec<u8>, // the half's 128 per-channel f16 values, then the projection's 48 f16 block scales
+}
+
+impl Unit {
+    pub(crate) fn matches(&self, bytes: &[u8]) -> bool {
+        let mut h = Xxh64::new(0);
+        h.update(bytes);
+        h.update(&self.side);
+        h.digest() == self.checksum
+    }
 }
 
 /// Which widths a rank fetches: a width manifest's choice per unit, or every unit at the listed widths.
@@ -82,19 +93,28 @@ fn unit(r: &Rows, l: usize, k: u8, e: usize, h: usize, p: usize) -> Option<Unit>
                 checksum: r.checksum[i], side })
 }
 
-/// The units rank `rank` of `tp` loads, layer by layer. layers: all the manifest lists (or, with Widths, all the
-/// slices hold) when None. A unit the manifest wants at a width with no slice row is an error.
-pub fn units(slices_dir: &str, tp: usize, rank: usize, choice: &Choice, layers: Option<&[usize]>)
-             -> Result<Vec<Unit>, String> {
-    let mut slices: BTreeMap<u8, Slice> = BTreeMap::new();
-    for k in [2u8, 3, 4] {
-        let p = format!("{slices_dir}/tp{tp}/k{k}/rank{rank}.safetensors");
-        if std::path::Path::new(&p).exists() {
-            slices.insert(k, Slice::open(&p)?);
-        }
+/// The units rank `rank` of `tp` loads, layer by layer: the halves its index slices list, or with `layout` the halves
+/// the layout gives it. layers: all the manifest lists (or, with Widths, all the slices hold) when None. A unit the
+/// manifest wants at a width with no slice row is an error.
+pub fn units(slices_dir: &str, tp: usize, rank: usize, choice: &Choice, layers: Option<&[usize]>,
+             layout: Option<&Layout>) -> Result<Vec<Unit>, String> {
+    if let Some(lo) = layout.filter(|lo| lo.nr() != tp || rank >= tp) {
+        return Err(format!("rank {rank} of TP {tp} with a layout of {} members", lo.nr()));
     }
-    if slices.is_empty() {
-        return Err(format!("no index slices for TP {tp} rank {rank} under {slices_dir}"));
+    // unit (e, h) of layer l is listed in the slice of rank (16 e + h + l) % tp
+    let ranks: Vec<usize> = if layout.is_some() { (0..tp).collect() } else { vec![rank] };
+    let mut slices: BTreeMap<(u8, usize), Slice> = BTreeMap::new();
+    for &r in &ranks {
+        for k in [2u8, 3, 4] {
+            let p = format!("{slices_dir}/tp{tp}/k{k}/rank{r}.safetensors");
+            if std::path::Path::new(&p).exists() {
+                slices.insert((k, r), Slice::open(&p)?);
+            }
+        }
+        if !slices.keys().any(|&(_, x)| x == r) {
+            let why = if layout.is_some() { " (a layout reads every rank's slices at its TP)" } else { "" };
+            return Err(format!("no index slices for TP {tp} rank {r} under {slices_dir}{why}"));
+        }
     }
     let all: Vec<usize> = match (layers, choice) {
         (Some(ls), _) => ls.to_vec(),
@@ -108,35 +128,41 @@ pub fn units(slices_dir: &str, tp: usize, rank: usize, choice: &Choice, layers: 
     };
     let mut out = Vec::new();
     for l in all {
-        let mut at: BTreeMap<u8, Rows> = BTreeMap::new();
-        for (&k, s) in &slices {
+        let mut at: BTreeMap<(u8, usize), Rows> = BTreeMap::new();
+        for (&kr, s) in &slices {
             if let Some(r) = rows(s, l)? {
-                at.insert(k, r);
+                at.insert(kr, r);
             }
         }
         if at.is_empty() {
             return Err(format!("layer {l}: no index slice holds it"));
         }
+        let src = |e: usize, h: usize| if layout.is_some() { (16 * e + h + l) % tp } else { rank };
+        let held = |e: usize, h: usize| layout.map_or(Ok(true), |lo| lo.held(Group::Halves(l, e), rank).map(|hs| hs.contains(&h)));
+        // every (expert, half) the slices list
+        let listed: BTreeSet<(usize, usize)> = at.values().flat_map(|r| r.row.keys().copied()).collect();
         match choice {
             Choice::Widths(ks) => {
-                for (&k, r) in &at {
-                    if !ks.contains(&k) {
-                        continue;
-                    }
-                    let owned: BTreeSet<(usize, usize)> = r.row.keys().copied().collect();
-                    for &(e, h) in &owned {
-                        for p in 0..3 {
-                            out.extend(unit(r, l, k, e, h, p));
+                let have: BTreeSet<u8> = at.keys().map(|&(k, _)| k).collect();
+                for k in have.into_iter().filter(|k| ks.contains(k)) {
+                    for &(e, h) in &listed {
+                        let Some(r) = at.get(&(k, src(e, h))).filter(|r| r.row.contains_key(&(e, h))) else { continue };
+                        if held(e, h)? {
+                            for p in 0..3 {
+                                out.extend(unit(r, l, k, e, h, p));
+                            }
                         }
                     }
                 }
             }
             Choice::Manifest(m) => {
                 let w = widths(m, l)?.ok_or(format!("layer {l}: the manifest has no widths for it"))?;
-                let owned: BTreeSet<(usize, usize)> = at.values().flat_map(|r| r.row.keys().copied()).collect();
-                for &(e, h) in &owned {
+                for &(e, h) in &listed {
                     if e == w.down.len() && w.sdown == 0 {
                         continue; // the manifest leaves the shared expert to the base pack
+                    }
+                    if !held(e, h)? {
+                        continue;
                     }
                     let ks = if e == w.down.len() {
                         [w.sgate[h], w.sup[h], w.sdown]
@@ -144,7 +170,7 @@ pub fn units(slices_dir: &str, tp: usize, rank: usize, choice: &Choice, layers: 
                         [w.gate.get(e).ok_or(format!("layer {l}: no widths for expert {e}"))?[h], w.up[e][h], w.down[e]]
                     };
                     for (p, &k) in ks.iter().enumerate() {
-                        let r = at.get(&k).ok_or(format!("layer {l}: width {k} wanted, no index slice at k{k}"))?;
+                        let r = at.get(&(k, src(e, h))).ok_or(format!("layer {l}: width {k} wanted, no index slice at k{k}"))?;
                         out.push(unit(r, l, k, e, h, p)
                             .ok_or(format!("layer {l}: expert {e} half {h} has no row in the k{k} slice"))?);
                     }
@@ -170,12 +196,54 @@ pub fn verify(v2_dir: &str, units: &[Unit]) -> Result<Vec<usize>, String> {
             bad.push(i);
             continue;
         }
-        let mut h = Xxh64::new(0);
-        h.update(&buf);
-        h.update(&u.side);
-        if h.digest() != u.checksum {
+        if !u.matches(&buf) {
             bad.push(i);
         }
     }
     Ok(bad)
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+    use crate::compact;
+
+    fn unit(bytes: &[u8], offset: u64, nbytes: u64, k: u8) -> Unit {
+        let mut h = Xxh64::new(0);
+        h.update(&bytes[offset as usize..(offset + nbytes) as usize]);
+        Unit { layer: 3, k, expert: 0, half: 0, proj: 0, offset, nbytes, checksum: h.digest(), side: Vec::new() }
+    }
+
+    #[test]
+    fn compact_writer_reader_round_trip() {
+        let dir = std::env::temp_dir().join(format!("g6compact-roundtrip-{}", std::process::id()));
+        let src = dir.join("source");
+        let dst = dir.join("compact");
+        std::fs::create_dir_all(&src).unwrap();
+        let data: Vec<u8> = (0..32).collect();
+        for k in [2, 3] { std::fs::write(src.join(width_file(3, k)), &data).unwrap(); }
+        // Out of order, with overlapping and adjacent ranges: a range is written only once.
+        let units = vec![unit(&data, 20, 4, 2), unit(&data, 4, 4, 2), unit(&data, 6, 4, 2),
+                         unit(&data, 10, 2, 2), unit(&data, 3, 5, 3)];
+        let (source, out) = (src.to_str().unwrap(), dst.to_str().unwrap());
+        compact::write(source, out, &units).unwrap();
+        compact::verify(source, out, &units).unwrap();
+        let name = width_file(3, 2);
+        assert_eq!(std::fs::read(dst.join(&name)).unwrap(), [&data[4..12], &data[20..24]].concat());
+        assert_eq!(std::fs::read_to_string(dst.join(format!("{name}.g6map"))).unwrap(),
+                   "g6map-v1 32\n4 8 0\n20 4 8\n");
+        assert_eq!(std::fs::read(src.join(&name)).unwrap(), data);
+        // Existing correct copies are reusable; corrupt ones are refused, never silently replaced.
+        compact::write(source, out, &units).unwrap();
+        std::fs::write(dst.join(&name), [0; 12]).unwrap();
+        assert!(compact::write(source, out, &units).unwrap_err().contains("xxhash64"));
+        assert_eq!(std::fs::read(dst.join(&name)).unwrap(), vec![0; 12]);
+        // A bad source is caught by reading back through the compact map before the directory is published.
+        std::fs::write(src.join(&name), [0; 32]).unwrap();
+        let bad = dir.join("bad");
+        assert!(compact::write(source, bad.to_str().unwrap(), &units).is_err());
+        assert!(!bad.exists());
+        assert!(!dir.join(format!(".bad.partial-{}", std::process::id())).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

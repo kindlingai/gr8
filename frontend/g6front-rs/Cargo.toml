@@ -29,8 +29,17 @@ libc = "0.2"
 mimalloc = { version = "0.1", default-features = false }
 libmimalloc-sys = { version = "0.1", default-features = false, features = ["extended"] }
 rayon = "1"
+xgrammar = { version = "0.6.0", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+base64 = "0.22"
+sha2 = "0.10"
+gif = { version = "0.14", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+
+[dev-dependencies]
+gr8-knobs = { path = "../../engine/knobs-rs" }
+tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }

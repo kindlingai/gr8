@@ -72,18 +72,21 @@ struct Checker
 
 DevImage::~DevImage() { reset(); }
 
-void DevImage::adopt(const Pack& pack, uint8_t* dev, uint64_t bytes)
+void DevImage::adopt(const Pack& pack, uint8_t* dev, uint64_t bytes, void (*release)(void*))
 {
     reset();
     base_ = dev;
     bytes_ = bytes;
     pack_ = &pack;
+    release_ = release;
 }
 
 void DevImage::reset()
 {
-    if (base_) cudaFree(base_);
+    if (base_ && release_) release_(base_);
+    else if (base_) cudaFree(base_);
     base_ = nullptr;
+    release_ = nullptr;
     bytes_ = 0;
     pack_ = nullptr;
 }

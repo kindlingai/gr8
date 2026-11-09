@@ -1,5 +1,5 @@
 // The DEC_IDX31 decode indexer, exact variants. Included inside ga after select.cuh. Build flag DEC_IDX31=1 routes decode
-// make_index through them; tests and tools/idxbench call them regardless of the flag.
+// make_index through them; tests call them regardless of the flag.
 // - index_scores_m: one CTA per 32-key tile scores ALL n rows of the query tile, so each key is read and converted once
 //   per step instead of once per row. Per row the arithmetic is index_scores' (same fp16 key values, same wmma tiles,
 //   same head-order ReLU-weighted sum, same scale), so every score is bit-identical. A tile no row can see (t0 > every
@@ -53,7 +53,7 @@ template<class Input>
 static void launch_index_scores_m(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
     index_scores_m<<<(a.context+31)/32,128,0,st>>>(input,start,n,w.iq,w.weights,w.si);
 }
-// G6_IDX_GRP=<G> (attn_idx_grp; decode run_body, the per-row indexer calls, i.e. S2 batched steps): index_scores with the
+// GR8_IDX_GRP=<G> (attn_idx_grp; decode run_body, the per-row indexer calls, i.e. S2 batched steps): index_scores with the
 // key tile read once for a group of rows of ONE session (rows bound to the same G6AttnRow bounds and table; step rows of a
 // session are contiguous), at most G rows: the groups are the session runs cut at rows that are multiples of G, and the CTA
 // of a group's first row runs the group (the others return). Tile load as index_scores<1> (16 B loads when page_size >= 32

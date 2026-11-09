@@ -61,9 +61,29 @@ impl Engine {
         self.conn.lock().unwrap().hello.clone()
     }
 
+    /// The engine masks a reply with `generate`'s grammar (its hello says `"grammar": true`).
+    pub fn grammars(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("grammar") == Some(&Value::Bool(true)))
+    }
+    /// The engine takes `generate`'s images (its hello says `"vision": true`).
+    pub fn vision(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("vision") == Some(&Value::Bool(true)))
+    }
     /// The engine applies `generate`'s insert rule (its hello says `"insert": true`).
     pub fn inserts(&self) -> bool {
         self.hello().is_some_and(|h| h.get("insert") == Some(&Value::Bool(true)))
+    }
+    /// The engine applies `generate`'s presence / frequency penalties (its hello says `"penalties": true`).
+    pub fn penalties(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("penalties") == Some(&Value::Bool(true)))
+    }
+    /// The engine applies `generate`'s think-end boost (its hello says `"think_end_boost": true`).
+    pub fn think_end_boost(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("think_end_boost") == Some(&Value::Bool(true)))
+    }
+    /// The engine applies `generate`'s sequence penalty (its hello says `"sequence_penalty": true`).
+    pub fn sequence_penalty(&self) -> bool {
+        self.hello().is_some_and(|h| h.get("sequence_penalty") == Some(&Value::Bool(true)))
     }
 
     pub fn start(self: &Arc<Self>) {

@@ -14,7 +14,7 @@ import os
 import models
 
 FORMAT = 'gr8-set-1'
-TOKENIZER = ('chat_template.jinja', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json')
+TOKENIZER = models.TOKENIZER_GLM
 
 
 class ModelError(Exception):
@@ -34,12 +34,12 @@ def compute_id(setj):
     return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
-def tokenizer_dir(model, model_dir):
-    """Where the four tokenizer files are: <model>/tokenizer, <model>, or MODEL_DIR."""
+def tokenizer_dir(model, model_dir, files=TOKENIZER):
+    """Where the tokenizer files are (the four of GLM's, or files): <model>/tokenizer, <model>, or MODEL_DIR."""
     for d in (os.path.join(model, 'tokenizer'), model, model_dir):
-        if d and all(os.path.isfile(os.path.join(d, f)) for f in TOKENIZER):
+        if d and all(os.path.isfile(os.path.join(d, f)) for f in files):
             return d
-    raise ModelError(f'no tokenizer files ({", ".join(TOKENIZER)}) in {model}/tokenizer, {model}'
+    raise ModelError(f'no tokenizer files ({", ".join(files)}) in {model}/tokenizer, {model}'
                      + (f' or {model_dir}' if model_dir else ' (MODEL_DIR names a directory that has them)'))
 
 
@@ -48,7 +48,7 @@ def is_release(d):
     return bool(d) and os.path.isfile(os.path.join(d, 'dense', 'exlr8-vocab.safetensors'))
 
 
-def describe_release(d, tp, tok):
+def describe_release(d, tp, tok, files=TOKENIZER):
     """set.json for an exlr8 release at this TP: no rank packs. The weights are named by the release's weight set id
     (every width manifest carries it), else by the sha256 of its dense hashes."""
     weights = None
@@ -61,10 +61,35 @@ def describe_release(d, tp, tok):
     if not weights:
         raise ModelError(f'{d}: no width manifest with a set_id under manifests/ (release v0.3 or later)')
     s = {'format': FORMAT, 'tp': tp, 'ranks': [], 'dflash': [], 'qo': None,
-         'tokenizer': {f: sha256_file(os.path.join(tok, f)) for f in TOKENIZER},
+         'tokenizer': {f: sha256_file(os.path.join(tok, f)) for f in files},
          'source': {'kind': 'exlr8-release', 'weights': weights}}
     s['set_id'] = compute_id(s)
     return s
+
+
+def is_pseudo(d):
+    """A pseudo engine release: responses.toml, the rules the engine answers from (frontend/pseudo-engine)."""
+    return bool(d) and os.path.isfile(os.path.join(d, 'responses.toml'))
+
+
+def pseudo_set(d, tp, model_dir=None):
+    """The model set of a pseudo engine release, used in place: its weights are named by the sha256 of responses.toml.
+    The engine reads the tokenizer from the release alone, so MODEL_DIR is refused."""
+    tok = tokenizer_dir(d, None)
+    if model_dir and os.path.abspath(model_dir) != os.path.abspath(tok):
+        raise ModelError(f'--model-dir {model_dir}: g6pseudo reads the tokenizer files from the release ({tok})')
+    s = {'format': FORMAT, 'tp': tp, 'ranks': [], 'dflash': [], 'qo': None,
+         'tokenizer': {f: sha256_file(os.path.join(tok, f)) for f in TOKENIZER},
+         'source': {'kind': 'pseudo', 'weights': sha256_file(os.path.join(d, 'responses.toml'))}}
+    s['set_id'] = compute_id(s)
+    return ModelSet(s, f'{d} (pseudo engine rules)', tok, d)
+
+
+def ds_set(d, tp, model_dir=None):
+    """The model set of the DeepSeek-V4.1-Flash exlr8 native release, used in place: no width variants, and the
+    tokenizer is two files."""
+    tok = tokenizer_dir(d, model_dir, models.TOKENIZER_DS)
+    return ModelSet(describe_release(d, tp, tok, models.TOKENIZER_DS), f'{d} (exlr8 native release)', tok, d)
 
 
 def release_set(d, tp, model_dir=None, label=None):
@@ -145,13 +170,30 @@ def model_id(ms, variant):
     return hashlib.sha256(f'{ms.id} {variant.name} {variant.sha256}{src}'.encode()).hexdigest()
 
 
+def release_hidden(manifest_path):
+    """hidden_size from the config.json of the release a manifest belongs to (manifests/ sits in the release root, and
+    config.json in it or in tokenizer/; a multimodal config keeps it in text_config), or None. Flash's manifests do not
+    carry it."""
+    root = os.path.dirname(os.path.dirname(manifest_path))
+    for path in (os.path.join(root, 'config.json'), os.path.join(root, 'tokenizer', 'config.json')):
+        try:
+            with open(path) as f:
+                c = json.load(f)
+        except (OSError, ValueError):
+            continue
+        h = c.get('hidden_size') or (c.get('text_config') or {}).get('hidden_size')
+        if h:
+            return h
+    return None
+
+
 def expert_gb(path, tp):
     """GB of routed and shared expert weights on the busiest rank at this TP, under the manifest's widths (half h of
     expert e in layer l belongs to rank (16e + h + l) mod tp)."""
     with open(path) as f:
         manifest = json.load(f)
         layers = manifest['layers']
-    hidden = int(manifest.get('hidden_size', 6144))
+    hidden = int(manifest.get('hidden_size') or release_hidden(path) or 6144)
     half_bytes = {k: hidden * 16 * k for k in (2, 3, 4)}
     per = [0] * tp
     for key, e in layers.items():

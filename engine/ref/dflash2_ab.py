@@ -4,7 +4,7 @@ python3 engine/ref/dflash2_ab.py --src DRAFTER --glm GLM_DIR --tokens T --a A [-
 
 A and B are the six target taps (residual after layers 5, 19, 33, 47, 61, 75) at every position of the sequence:
   .npy / .safetensors   [N, 6, 6144] (or [N, 36864]) float32, float16 or bfloat16 (bfloat16 as uint16 in .npy)
-  DUMP[:i]              a G6_DFL_DUMP, request i (default 0); a request ends at its token record
+  DUMP[:i]              a GR8_DFL_DUMP, request i (default 0); a request ends at its token record
 T is a .npy / .json list of token ids, or DUMP[:i] (that request's token record). --start: the first generated
 position (the prompt length); the comparison covers positions from there on.
 
@@ -29,7 +29,7 @@ from dflash2_replay import B, HID, NT, accept, ref_drafts  # noqa: E402
 
 
 def dump_requests(path):
-    """G6_DFL_DUMP -> [(feats {pos: float32 row}, tokens)] per request (the engine stores residual / 64 as fp16)."""
+    """GR8_DFL_DUMP -> [(feats {pos: float32 row}, tokens)] per request (the engine stores residual / 64 as fp16)."""
     raw = open(path, 'rb').read()
     off, out, feats = 0, [], {}
     while off < len(raw):

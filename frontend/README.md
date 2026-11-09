@@ -3,7 +3,7 @@
 An OpenAI/vLLM-compatible HTTP server in front of the gr8 engine. It talks to the engine's shim over a Unix socket using
 the protocol in `../PROTOCOL.md`, and handles tokenization, the chat template, the GLM reasoning and tool parser,
 streaming and `/metrics`. It is one static Rust binary, `g6front-rs/`, which `./gr8 glm53 up` runs. The Python code
-under `frontend/` is the shim and the mock engine (and the frame codec they share, `wire.py`), not a second front end.
+under `frontend/` is the shim (and its frame codec, `wire.py`), not a second front end.
 
 ## Endpoints
 
@@ -42,7 +42,7 @@ A rank whose weights changed has `"changed": N` and, for the first chunk that di
 ```bash
 scripts/build_front.sh                 # -> bin/g6front-rs (rustup fetches the pinned toolchain on first build)
 bin/g6front-rs --model-dir <dir with tokenizer.json, tokenizer_config.json, chat_template.jinja, generation_config.json> \
-  --engine-sock $G6_HOME/run/engine.sock --port 8100
+  --engine-sock $GR8_WORK_DIR/run/engine.sock --port 8100
 ```
 
 On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 ms at 32K tokens.
@@ -51,7 +51,7 @@ On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 
 
 | flag | default | meaning |
 |---|---|---|
-| `--model-dir` | required | Directory holding `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json`. |
+| `--model-dir` | required | Directory holding `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json`. Its `temperature` and `top_p` are the defaults for a request that names none. DeepSeek-V4.1-Flash: with no `top_p` there, a request without one samples at 0.95. DeepSeek's V4.1-Flash README recommends 0.95 or 1.0 and evaluates at 0.95; the 1017 README recommends 1.0 (send `top_p: 1.0` for it). At temperature 1.0 on 4 Sparks, 0.95 decoded 7-13% faster with the same sampled quality. |
 | `--engine-sock` | `/run/g6/engine.sock` | Engine Unix socket. |
 | `--host` / `--port` | `0.0.0.0` / `8100` | Listen address. |
 | `--served-model-name` | `glm-5.3 glm53` | Accepted `model` values. The first one is reported in responses. |
@@ -63,6 +63,11 @@ On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 
 | `--max-connections` | 512 | Connections served at once; more wait in the listen backlog. Request headers must arrive within 30 s and a body within 120 s. |
 | `--default-reasoning-effort` | none | `reasoning_effort` for a chat request that names none: `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, heard as the nearest level the template names. `./gr8 glm53 up` passes `DEFAULT_REASONING_EFFORT` when it is set. |
 | `--default-thinking-budget` | 0 | `thinking_budget` for a chat request that names none, 0 or null (0 = no limit). A request with `logprobs` gets none. `./gr8 glm53 up` passes `DEFAULT_THINKING_BUDGET` when it is set. |
+| `--default-presence-penalty` / `--default-frequency-penalty` | 0 | The server's `presence_penalty` / `frequency_penalty` spec (OpenAI's penalties: the engine lowers the logit of every token the reply already holds by `presence_penalty` + `frequency_penalty` x its count, before temperature and top-p; the prompt does not count, vLLM's semantics). One part, or a comma list of `base=`, `thinking=`, `greedy=`, `nongreedy=`, `greedy.thinking=`, `nongreedy.thinking=` and `temperature=` parts, each once (`greedy.base=` is `greedy=`). A part is `[+]A[*M]`: an amount added and a multiplier (`base=0.2` adds 0.2 at multiplier 1; `thinking=*1.1` adds nothing and boosts by 10%; `thinking=+0.1*1.1` both; `-0.1*0.5` is fine). The operator's parts resolve first. The whole reply's total: out = (base.A + gn.A) x base.M x gn.M, gn the condition the request's temperature after defaults picks (`greedy` when it is exactly 0, else `nongreedy`; any other temperature, however small, is sampling). The think block (a chat prompt's, until `</think>`; a `thinking_budget` continuation has none) adds (thinking.A + gn.thinking.A) x thinking.M x gn.thinking.M. A `temperature=[[+]A][*B]` part is a last stage over each total at the request's effective temperature T (a guard retry keeps the request's T): total' = (total + A x T) x (B x T), the factor only when `*B` is written, so `temperature=*1` makes the operator's penalty proportional to the temperature and zero under greedy. (A multiplier of B^T, 1 at T = 0, would keep a greedy penalty while scaling with temperature; not implemented.) Then the request's own values: `presence_penalty` replaces `base`'s amount and is added after the stage, unscaled, 0 included (so a client that sends `presence_penalty: 0` by habit still gets the conditions), and `thinking_presence_penalty` replaces `thinking`'s amount the same way (the condition's thinking part stays). No condition multiplier, `*0` included, reaches a value the client set: under `greedy=0.2,greedy.thinking=0.5` a sampling client that sends 1.5 gets 1.5, a greedy one 1.7 outside the block and 2.0 inside. That last number is the clamp: a client's own value in -2..2 is valid as such (OpenAI's rule; outside it is a 400), and when the operator's parts take a total past the engine's -2..2 the total is held to the range, the block's total also to within 2 of the reply's, since the engine takes the difference (in - out). A spec any combination of which resolves outside -2..2 (either total, or their difference) at any T in 0..2 on its own is still refused at boot. The guard's resamples keep the request's resolved values. A nonzero penalty needs an engine whose hello says `penalties` (g6m4 with the `pen` field, the pseudo engine), else 400. The TP=1 Flash recipe, greedy requests only: `greedy=0.2,greedy.thinking=0.5` for presence. `./gr8 glm53 up` passes `DEFAULT_PRESENCE_PENALTY` / `DEFAULT_FREQUENCY_PENALTY` when they are set. |
+| `--default-think-end-boost` | off | The think-end boost, a soft thinking budget, below. `./gr8 glm53 up` passes `DEFAULT_THINK_END_BOOST` when it is set. |
+| `--default-sequence-penalty` | off | The sequence penalty, below. `./gr8 glm53 up` passes `DEFAULT_SEQUENCE_PENALTY` when it is set. |
+| `--tool-repeat-guard` | 0 | 1 = the repeated-tool-call guard, below. `./gr8 glm53 up` passes `TOOL_REPEAT_GUARD` and, when they differ from these defaults, `--tool-repeat-guard-repeats` (2), `--tool-repeat-guard-temperature` (0.7) and `--tool-repeat-guard-retries` (2). |
+| `--undeclared-tool-calls` | `text` | A call to a tool name the request did not declare. `text`: the call's text stays in `content` and the reply finishes `stop` (vLLM's glm47 parser). `emit`: it is a tool call like any other (`tool_calls`, `finish_reason: tool_calls`, streamed or not), so the client can answer it with its own unknown-tool error; the name must be an identifier (1-128 ASCII letters, digits, `_`, `-`, `.` or `:`, starting with a letter or `_`), the call arrives when the reply ends with it rather than as it is written (so prose after it keeps it prose), and the arguments are strings, having no schema. The rules that tell a call from prose about one are unchanged. `./gr8 glm53 up` passes `UNDECLARED_TOOL_CALLS` when it is `emit`. |
 | `--log-level` | `INFO` | |
 
 ## Thinking controls (Rust front end)
@@ -72,17 +77,27 @@ Read as TensorFold 0.6.1 reads them (`server/request_options.py`). The code is `
 
 | field | accepted | effect |
 |---|---|---|
-| `reasoning_effort`, top level or `chat_template_kwargs.reasoning_effort` (top level wins) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; anything else is a 400 | The template gets the nearest level it names, on the ladder max > xhigh > high > medium > low > minimal, ties going higher. The names come from the template's text (a quoted `minimal`, `low`, `medium`, `high`, `xhigh` or `max`): GLM 5.3's are low, high and max. A template that names none gets the value as sent. `none` is a 400, unless `enable_thinking` is `true`, which wins and leaves the effort unset (as in TensorFold) |
-| `chat_template_kwargs.enable_thinking` | `true`, or unset | `false` (or another false value) is a 400: GLM 5.3's template cannot turn thinking off. The front end adds no `enable_thinking` kwarg of its own |
+| `reasoning_effort`, top level or `chat_template_kwargs.reasoning_effort` (top level wins) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; anything else is a 400 | The template gets the nearest level it names, on the ladder max > xhigh > high > medium > low > minimal, ties going higher. The names come from the template's text (a quoted `minimal`, `low`, `medium`, `high`, `xhigh` or `max`): GLM 5.3's are low, high and max. A template that names none gets the value as sent. `none` is a 400, unless `enable_thinking` is `true`, which wins and leaves the effort unset (as in TensorFold), or the front end runs with `--allow-thinking-off` (Thinking off, below) |
+| `chat_template_kwargs.enable_thinking` | `true`, or unset; `false` with `--allow-thinking-off` | `false` (or another false value) is a 400: GLM 5.3's template cannot turn thinking off. With `--allow-thinking-off` it turns thinking off (below). The front end adds no `enable_thinking` kwarg of its own |
 | `thinking_budget` (top level) | an integer, an integral float, a string holding an integer, or null. Anything else is a 400 | 0, null or unset: `--default-thinking-budget` (TensorFold's `int(budget or default)`). Negative: no limit. N: while the think block is open, the reply's Nth token is replaced by `\n</think>\n\n`, even when it is `</think>` itself, so N-1 reasoning tokens come first (TensorFold's ThinkBudget). `max_tokens` may cut the close short. It applies to a chat prompt that leaves a think block open. The close has no logprobs, so naming both `thinking_budget` and `logprobs` is a 400 |
-| `response_format` (chat and completions) | absent, null, `{"type": "text"}` | `json_object`, `json_schema` and any other type are a 400 until the engine has constrained decoding |
+| `response_format` (chat) | absent, null, `{"type": "text"}`, `{"type": "json_object"}`, `{"type": "json_schema", "json_schema": {"name": str, "schema": object}}` | `json_object`/`json_schema`: the engine constrains decoding to the grammar where it can (`GRAMMAR=1`, no tools), and the front end checks after generation (below): a prompt hint asks for JSON, content is withheld in the stream until the end, the first JSON value in the reply is extracted, and `json_schema` is checked against the schema. No JSON found, or a schema mismatch: the reply is returned unchanged with a `warnings` entry (stream: on the last choice). Anything else is a 400 |
+| `response_format` (`/v1/completions`) | absent, null, `{"type": "text"}` | any other type is a 400: the legacy route has no JSON handling |
+
+### Thinking off
+
+GLM 5.3's chat template always opens a think block. `--allow-thinking-off` (`./gr8 glm53 up --allow-thinking-off 1`)
+takes `enable_thinking: false` and `reasoning_effort: "none"` anyway: the prompt drops the template's
+`<|system|>Reasoning Effort: ...` turn and ends `<think></think>`, so the reply starts on content and carries no
+reasoning. The thinking budget does not apply. It is off by default. Rendering a closed think block gave degenerate
+output on this model on an earlier serving stack: counting to 200 with thinking off repeated and skipped numbers in 3 to
+8 of 8 runs there. `scripts/count200_probe.sh` runs that probe against a head, and must pass before you rely on the flag.
 
 `/tokenize` with `messages` applies the same effort and refusals, so its count matches the chat request's prompt.
 Chat usage carries `completion_tokens_details.reasoning_tokens`: the reply's tokens through its `</think>`, or all of
 them when the reply never closes its think block (TensorFold counts the same way). The response and the last stream
 chunk carry the count. The `continuous_usage_stats` chunks leave the count out.
 
-How a budget cuts. When the engine's hello says `"insert": true` (g6m4 since ready.s2 version 3, and the mock), the
+How a budget cuts. When the engine's hello says `"insert": true` (g6m4 since ready.s2 version 3, and g6pseudo), the
 front end sends the budget as `generate`'s insert rule (PROTOCOL.md): after N - 1 reply tokens without `</think>`, the
 close takes the next token's place. The engine applies it at the token itself, on every rank, and the reply goes on in
 the same run (engine/runtime/s2_batch.h). The close's three tokens cost one more main step and its draft.
@@ -92,8 +107,8 @@ on in a new `generate` whose prompt is the prompt, the reply so far and the clos
 less the reply's length. The client sees one response or one SSE stream either way. Usage counts every reply token
 once: the close counts, and tokens the cut run made past the cut do not. `cached_tokens` is the first run's. The
 continuation is a second request to the engine, and S2's prefix reuse keeps only the prompt's whole 4,096-row prefill
-cells (decoded rows never count), so it prefills the prompt's last partial cell, the reasoning and the close again. On
-the mock with S2's reuse rule and TP=4's cold prefill rate (`--reuse-block 4096 --prefill-tps 1374 --no-insert`):
+cells (decoded rows never count), so it prefills the prompt's last partial cell, the reasoning and the close again. On a
+mock engine with S2's reuse rule, TP=4's cold prefill rate (1,374 tokens/s) and no insert rule:
 
 | prompt | budget | rows prefilled again | added time |
 |---|---|---|---|
@@ -103,6 +118,63 @@ the mock with S2's reuse rule and TP=4's cold prefill rate (`--reuse-block 4096 
 
 The front end logs each continuation's cached tokens (`thinking budget: the continuation took N of its M prompt
 tokens from the cache`).
+
+## Soft thinking budget (`--default-think-end-boost`)
+
+A reply that spends its whole `max_tokens` thinking never answers. On the TP=1 Flash recipe the greedy log-report task
+failed 5 of 5 that way, re-listing log lines until the cap. A `thinking_budget` cuts mid-thought. The boost instead
+raises the `</think>` logit a little more with every thinking token, so the model ends its reasoning where it was
+closest to ending anyway. The spec is `start=S,per1k=P,max=M`: inside the think block, at the reply's n-th thinking
+token, `</think>` gains min(M, P x (n - S) / 1000) logits once n is past S, before temperature and top-p. S is a token
+count or a fraction of the request's `max_tokens` written `0.5x` (resolved per request: the request's `max_tokens`,
+else the server default, else the room the context leaves); P is logits per thousand tokens past S; M the cap (0 to
+20). P or M 0 = off. A request's `think_end_boost` (the same string, `"off"` or `false`) wins over the server default.
+The engine counts the drafts before a verify row, so the boost is exact at any draft length. A drafted `</think>` takes
+it off the rows after it, and the committed one ends it. A `thinking_budget` stays the hard backstop. After its close the
+continuation has no open block, so no boost. Drafts are not boosted: around the close, where the boost flips the
+argmax to `</think>`, the drafter's continuation is rejected and that round commits one token. Elsewhere the ramp (2
+logits per thousand tokens) rarely changes the argmax, so the cost is a few short rounds near the close. The first
+recipe value: `start=0.5x,per1k=2,max=10`.
+
+## Sequence penalty (`--default-sequence-penalty`)
+
+On greedy log-report every failed reply read one log file and transcribed it into its thinking line by line. In one
+reply 274 of 362 log-format lines were verbatim copies of the tool result, and with a hard `thinking_budget` the
+transcription moved into the visible answer after the close. The presence penalty barely touches that (every line has
+a new timestamp, and the prompt is not counted). The sequence penalty is DRY's form, prompt-aware: when the reply's
+last tokens repeat an earlier run of L >= `min` tokens verbatim, the token that continued that run loses min(`cap`,
+`mult` x `base`^(L - `min`)) before temperature and top-p, so a copy gets harder to extend the longer it runs while
+short repeats stay free. The spec is `thinking=M:B:N:C,answer=M:B:N:C,guard=M:B:N:C` (mult:base:min:cap), any of the
+scopes, each off by default. M or C 0 = off. `thinking` applies inside the think block and `answer` outside it, both
+against the whole context (prompt, tool results, reply so far); give `answer` a longer `min`, so a timestamp or an
+error code quoted in the report stays free while a run of whole copied lines is penalized. `guard` applies only in the
+repeated-tool-call guard's retry run, against the token sequence of the call it took back: a confident loop that
+resamples the same call at 0.7 (46 retries and 22 give-ups in one run) is pushed off that sequence from its first
+tokens. A request's `sequence_penalty` (the same string, `"off"` or `false`) wins over the server default. The engine
+finds the longest earlier occurrence on the host before each step (a bigram index over the request, the drafts before a
+verify row included, so it is exact at any draft length; a drafted `</think>` moves the rows after it from the
+thinking scope to the answer scope). Drafters are not penalized. A starting value:
+`thinking=0.8:1.75:4:6,answer=1:1.75:12:6,guard=1:2:1:8`.
+
+## Repeated tool calls (`--tool-repeat-guard`)
+
+An agent loop can make the model repeat one tool call turn after turn: at temperature 0 the same 35-token reply with
+the same call came 26 turns in a row, and at temperature 1.0 `run_tests({})` three times with the identical result. With
+the guard on, a chat reply whose tool calls equal the previous assistant turn's (name plus arguments as canonical JSON,
+the set of them when a turn has several) is taken back when that same set already ended the conversation
+`--tool-repeat-guard-repeats` turns in a row with identical tool results (the `tool` messages' content). A changed
+result or another call in between resets the count, so running the tests again after an edit is never blocked.
+
+The reply is cut back to just before the call block's `<tool_call>` and continued in a new engine run, the way a
+thinking budget continues after its close: temperature max(the request's, `--tool-repeat-guard-temperature`), top_p
+min(the request's, 0.95), a request seed moved by the attempt number. Text the client already received is never
+regenerated: while the guard is armed a call whose name is one of the previous turn's never streams live but is held
+until the reply ends, where the guard reads it first (other calls stream as always). After
+`--tool-repeat-guard-retries` resamples the call goes out as sampled, so the guard cannot loop. A request's
+`tool_repeat_guard: true|false` wins over the server default. A forced `tool_choice` is never guarded. GLM only: the
+DSML parser ends the reply at a call's closer and streams it, so it has nothing held to take back. One log line per
+resample names the call and the attempt; `/metrics` counts `gr8:tool_repeat_retries_total` and
+`gr8:tool_repeat_given_up_total`.
 
 ## Per-request step counters (`return_step_stats`)
 
@@ -133,7 +205,7 @@ the request's step time. `generated_tokens` exceeds `completion_tokens` when a s
 engine stops: the front end then cancels the run and, for a request with the field, waits for its `finish` (about one
 engine step) before it writes the usage. With a thinking budget on an engine without insert rules, the counters are
 the sum of both runs. The times are left out when the engine does not report them, and `step_stats` is left out when a
-run did not report its counters (the mock engine reports both).
+run did not report its counters (g6pseudo reports both when its weights set `draft_k`).
 
 ## Metrics mapping
 
@@ -184,13 +256,13 @@ How it differs inside (not in its output):
   backpressure.
 - **Long prompts are encoded in parallel.** The text is cut only where GLM's pre-tokenizer regex always ends a token:
   after `\n` + ASCII letter, or before a space that follows an ASCII letter. Concatenated ids are identical to one
-  encode; `src/tok.rs` gives the argument. A start-up self-check and a fuzz test (`G6_TOKENIZER_DIR=<dir> cargo test
+  encode; `src/tok.rs` gives the argument. A start-up self-check and a fuzz test (`GR8_TEST_TOKENIZER_DIR=<dir> cargo test
   --release`) confirm it. The self-check turns the parallel path off for a tokenizer whose shape the argument does not
   cover.
 - **Memory goes back to the OS.** It uses mimalloc. Loading `tokenizer.json` peaks at ~280 MB, and it is collected
   after load and after each long encode, off the request path, instead of staying resident.
 
-Measured in a linux/aarch64 container (12 CPUs, so 6 encode threads; mock engine with instant prefill), beside the
+Measured in a linux/aarch64 container (12 CPUs, so 6 encode threads; a mock engine with instant prefill), beside the
 Python implementation it replaced:
 
 | | Python | this one |
@@ -214,24 +286,25 @@ Known rough edges, outside what the clients send:
 - `top_k` beyond 64 bits is sent to the engine as 0 (off) instead of the exact integer.
 - Templates using transformers' `{% generation %}` tag are not supported. GLM's template does not use it.
 
-Tests: `cargo test --release` (unit tests); `python -m unittest tests.test_api` with `tests/serve_mock.sh` up (HTTP,
-streaming, tools, thinking); and `bench/pbench.py` runs against it unchanged.
+Tests: `cargo test --release` (unit tests), and `tests/api.sh TOKENIZER_DIR` (HTTP, streaming, tools, thinking,
+`return_step_stats`): `tests/test_api.py` against the front end and the pseudo engine (`pseudo-engine/`), with the
+weights in `tests/api_responses.toml`.
 
 ## Real engine through files: g6s2shim.py
 
 `g6s2shim.py` is the engine-side shim for `g6m4 --serve DIR`, on the head: it listens on the PROTOCOL.md socket, and up to `--s2-sessions` requests decode in one step. Stdlib only. The engine side of the file protocol is `engine/runtime/s2/{ingress.h,sessions.h,service.h,scheduler.h}`; the shim docstring has the summary:
 
-- The engine writes `DIR/ready.s2` (`G6S2 3 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows> <max_lp>`) when every rank has booted. Version 1 (no `<max_lp>`) has no logprobs, version 2 no insert rule: the shim's hello says `"insert": true` from version 3, and refuses `insert` before it. The shim sends `hello` only after that, with `max_model_len = pool_rows - guard` (lower it with `--max-model-len`). `DIR/status.s2` (queue, free pages, the pages sessions hold and could grow to) goes into the `metrics` frame as an extra `s2` field.
-- A request is written as `req.<id>` (two lines: `n_gen .. temp .. seed .. min .. stop .. top_p .. [lp <k>] [plp <k>] [ins <after>:<unless or -1>:<ids>]`, then the prompt ids) to the head's DIR, then `cmd.<k>` = `ADMIT <epoch> <id> <fnv1a64 of the req bytes>`. Ids increase; command numbers have no gap. The head engine sends each request's bytes to the other ranks with its ADMIT, over the control links, so the shim needs no access to them. The engine queues a request FIFO until a session slot and a KV run are free.
+- The engine writes `DIR/ready.s2` (`G6S2 3 <epoch> <ranks> <pool_rows> <mtp> <guard> <max_rows> <max_lp>`) when every rank has booted. Version 1 (no `<max_lp>`) has no logprobs, version 2 no insert rule: the shim's hello says `"insert": true` from version 3, and refuses `insert` before it. The shim sends `hello` only after that, with `max_model_len = pool_rows / capacity_slots - guard` (lower it with `--max-model-len`). `capacity_slots` is 1 for the shared GLM pool; the DS41 launcher passes its `SESS` because each session has a fixed `CAP` slab. `DIR/status.s2` (queue, free pages, the pages sessions hold and could grow to) goes into the `metrics` frame as an extra `s2` field.
+- A request is written as `req.<id>` (two lines: `n_gen .. temp .. seed .. min .. stop .. top_p .. [pen <presence> <frequency> <thinking presence> <thinking frequency> <think_end or -1>] [lp <k>] [plp <k>] [ins <after>:<unless or -1>:<ids>]`, then the prompt ids) to the head's DIR, then `cmd.<k>` = `ADMIT <epoch> <id> <fnv1a64 of the req bytes>`. Ids increase; command numbers have no gap. The head engine sends each request's bytes to the other ranks with its ADMIT, over the control links, so the shim needs no access to them. The engine queues a request FIFO until a session slot and a KV run are free.
 - Rank 0 answers in `resp.<id>`: `a` (admitted), `p` (prompt logprobs, before the first `t`), `l` (one per token of the next `t` line, requests with `lp`; both in `engine/runtime/serve.h`), `f <rows>` (prompt rows prefilled so far, after each prefill quantum: life for the stall timeout, no text), `t <ids>` (tokens frame), `m <rounds> <drafts> <accepted> <per-position>` (spec counters, summed into `metrics`), `end <reason> <stop_id> <n>` (finish frame).
 - `cancel` (and a closed front-end connection) is a real `CANCEL <epoch> <id> 0`: a queued request ends `abort` with 0 tokens, a resident one frees its slot and KV run at once. The other sessions do not notice. The same CANCEL goes out when the shim gives up on a request itself (engine silent past `--stall-timeout`, an unreadable or unusable resp file): the client gets its `error` finish at once, and the shim keeps tracking the request until the engine's `end` line (or `--cancel-timeout`), so its slot and pages are known to be free. A CANCEL lands at the second event boundary after the head reads it (`NOTICE_MIN` = 2, `engine/runtime/s2/scheduler.h`): during a long prefill each quantum is a boundary, so the request runs at most about two more quanta. One boundary would race the quantum in flight, whose end no rank can know in advance, so it stays at two.
 - Rank 0 answers in `resp.<id>`: `a` (admitted), `p` (prompt logprobs, before the first `t`), `l` (one per token of the next `t` line, requests with `lp`; both in `engine/runtime/serve.h`), `t <ids>` (tokens frame), `m <rounds> <drafts> <accepted> <per-position>` (spec counters, summed into `metrics` and sent with the request's `finish` frame), `end <reason> <stop_id> <n>` (finish frame).
 - `cancel` (and a closed front-end connection) is a real `CANCEL <epoch> <id> 0`: a queued request ends `abort` with 0 tokens, a resident one frees its slot and KV run at once. The other sessions do not notice.
-- The engine ends the whole epoch on a request it cannot parse or fit, so the shim checks prompt, ids (0 to 154879: the engine does not bound-check the embedding index), `max_tokens`, `top_p` (must be in (0, 1]; 0 is an error, not off), and the length first and answers `error` itself. `logprobs` / `prompt_logprobs` (k = 0..min(`--max-logprobs`, the ready line's `<max_lp>`)) go to the engine as `lp <k>` / `plp <k>`. A `prompt_logprobs` request runs its whole prompt as 8-row decode steps, and every other session waits until that is done: an 813-token prompt held a decoding session for 10.9 s (TP4, about 13.4 ms per prompt token). `--max-plp-prompt` defaults to 1,024 tokens here (about 14 s). `top_k`/`min_p` are ignored with a warning (`top_p` and `min_tokens` go to the engine).
+- The engine ends the whole epoch on a request it cannot parse or fit, so the shim checks prompt, ids (0 to 154879 for GLM-5.3, or 0 to N-1 for the shim's `--vocab-size N`; the launcher passes DeepSeek-V4.1-Flash-1017's 129279: the engine does not bound-check the embedding index; the hello reports `--model-name`, `--vocab-size` and `--eos-ids`, GLM-5.3's by default), `max_tokens`, `top_p` (must be in (0, 1]; 0 is an error, not off), and the length first and answers `error` itself. `logprobs` / `prompt_logprobs` (k = 0..min(`--max-logprobs`, the ready line's `<max_lp>`)) go to the engine as `lp <k>` / `plp <k>`. A `prompt_logprobs` request runs its whole prompt as 8-row decode steps, and every other session waits until that is done: an 813-token prompt held a decoding session for 10.9 s (TP4, about 13.4 ms per prompt token). `--max-plp-prompt` defaults to 1,024 tokens here (about 14 s). `top_k`/`min_p` are ignored with a warning (`top_p` and `min_tokens` go to the engine).
 - `DIR/abort.s2` (epoch lost) turns every open request into `error` and every later request too; restart the engine and the shim. SIGTERM writes `DIR/quit`, and the head engine passes it to the other ranks. A restarted shim continues the `req`/`cmd` numbers from the files in DIR. Every rank's DIR must be fresh for a new engine start.
 
 ```bash
-# engine (every rank; fresh DIR each start): --graph --mtp --prefill, G6_DEC_SPLIT=3, a G6_CP build
+# engine (every rank; fresh DIR each start): --graph --mtp --prefill, GR8_DEC_SPLIT=3, a G6_CP build
 g6m4 ... --serve /run/g6/s2 --s2-port N --s2-sessions 4 --s2-epoch 7
 python3 g6s2shim.py --dir /run/g6/s2 --sock /run/g6/engine.sock      # on the head only
 bin/g6front-rs --engine-sock /run/g6/engine.sock ...
@@ -247,43 +320,52 @@ It covers 4 concurrent streams (exact tokens, wall clock under 2x one stream, 4 
 
 ### Round log and cost fit
 
-`G6_S2_ROUNDLOG=1 g6m4 ... --serve ...` makes rank 0 print one line per decode step on stderr: `# s2_round step N <main|draft|chain> round R active A S <sessions in this step> M <rows> ms <launch+fence> path <solo|reuse|capture>` (a round with more sessions than fit one step of `max_rows` runs in groups: `S` is the group's share, `A` the whole round's session count, `R` the `Batch::round` id; -1 / 0 outside a round), and on main steps `ex_mean`, `ex_sum`, `ex <per-layer distinct experts>` (from the route log; the main model's route copies are allocated only with this flag). Off, it costs nothing. Fit it:
+`GR8_S2_ROUNDLOG=1 g6m4 ... --serve ...` makes rank 0 print one line per decode step on stderr: `# s2_round step N <main|draft|chain> round R active A S <sessions in this step> M <rows> ms <launch+fence> path <solo|reuse|capture>` (a round with more sessions than fit one step of `max_rows` runs in groups: `S` is the group's share, `A` the whole round's session count, `R` the `Batch::round` id; -1 / 0 outside a round), and on main steps `ex_mean`, `ex_sum`, `ex <per-layer distinct experts>` (from the route log; the main model's route copies are allocated only with this flag). Off, it costs nothing. Fit it:
 
 ```bash
 tools/s2_costfit.py engine_rank0.log [--residuals] [--json]   # also ms per whole round by active sessions; step_ms = base + per_expert * experts(d*rows) + per_token * rows
-tools/s2_costfit.py --selftest
 ```
 
-`G6_S2_TIMELINE=N` (every rank, through `G6ENV_X`) splits the time between decode steps into main-stream work and host round trip. Every N main steps each rank prints `# s2_tl rank R mains N: per main step: main-stream gap <ms> (host between steps <ms>), drafting GPU span <ms>`, then per step kind (`main`, `draft`, `chain`, `dfl_ctx`, `dfl_query`) the mean GPU span (CUDA events around the graph launch), host input prep, launch call and fence wait, and per transition (`main>draft`, `draft>dfl_ctx`, ...) the mean main-stream gap from one step's end to the next step's start and the host time from the fence to the next launch. The gap is bounded by events on the main stream only: it is not total GPU idle time — with `G6_DRAFT_PAR` the drafter's side stream can execute inside it. The `drafting GPU span` figure includes side-stream spans alongside all other non-main spans; `dfl_ctx_par` / `dfl_query_par` report mean side-stream spans per step. Gaps over 20 ms (event fences, an idle engine) count as `breaks`, not transitions. With `G6_DRAFT_PAR` a solo DFlash2 round's drafter step on its own stream is `dfl_ctx_par` / `dfl_query_par`: span = its GPU start to end on that stream (overlapping the first form and chain), wait = the wait at the end of the round alone (the tail they did not hide); it is in no transition. Off, it costs nothing. It also prints the mean GPU span per step kind and row count (`# s2_tl rank R rows <kind> M <rows> n <steps> span <ms> ms`). `tools/s2_dsel_table.py rank*.log` turns a boot's lines (with `G6_MTP_LPLOG=1` on rank 0 for the MTP rounds' accept counts) into the drafter choice's cost table, `G6_S2_DSEL_TABLE`; `--selftest` runs its tests.
+`GR8_S2_TIMELINE=N` (every rank, through `EXTRA_ENV`) splits the time between decode steps into main-stream work and host round trip. Every N main steps each rank prints `# s2_tl rank R mains N: per main step: main-stream gap <ms> (host between steps <ms>), drafting GPU span <ms>`, then per step kind (`main`, `draft`, `chain`, `dfl_ctx`, `dfl_query`) the mean GPU span (CUDA events around the graph launch), host input prep, launch call and fence wait, and per transition (`main>draft`, `draft>dfl_ctx`, ...) the mean main-stream gap from one step's end to the next step's start and the host time from the fence to the next launch. The gap is bounded by events on the main stream only: it is not total GPU idle time — with `GR8_DRAFT_PAR` the drafter's side stream can execute inside it. The `drafting GPU span` figure includes side-stream spans alongside all other non-main spans; `dfl_ctx_par` / `dfl_query_par` report mean side-stream spans per step. Gaps over 20 ms (event fences, an idle engine) count as `breaks`, not transitions. With `GR8_DRAFT_PAR` a solo DFlash2 round's drafter step on its own stream is `dfl_ctx_par` / `dfl_query_par`: span = its GPU start to end on that stream (overlapping the first form and chain), wait = the wait at the end of the round alone (the tail they did not hide); it is in no transition. Off, it costs nothing. It also prints the mean GPU span per step kind and row count (`# s2_tl rank R rows <kind> M <rows> n <steps> span <ms> ms`). `tools/s2_dsel_table.py rank*.log` turns a boot's lines (with `GR8_MTP_LPLOG=1` on rank 0 for the MTP rounds' accept counts) into the drafter choice's cost table, `GR8_S2_DSEL_TABLE`; `--selftest` runs its tests.
 
-## Mock engine and tests
+## Tests against the pseudo engine
 
-`mock_engine.py` speaks PROTOCOL.md with no model, so the front end and the old benchmark tools can run anywhere:
+`pseudo-engine/` (g6pseudo) speaks PROTOCOL.md with no model, from a TOML file of rules, so the front end runs end to
+end anywhere. `tests/api.sh TOKENIZER_DIR` boots it with `tests/api_responses.toml`, then runs `tests/test_api.py`
+against two front ends: one with the defaults, one with `--allow-thinking-off` and `--undeclared-tool-calls emit`. To run the tests against a front end
+you started yourself:
 
 ```bash
-python mock_engine.py --model-dir <tokenizer dir> --sock /tmp/g6-mock.sock \
-  [--prefill-tps 50000] [--rounds-per-s 100] [--max-model-len 200000] [--reuse-block 64] [--reasoning-repeat 1]
-tests/serve_mock.sh start|stop      # mock + front end on :8100 (env PY, MODEL_DIR, PORT, ROUNDS, FRONT, FRONT_ARGS, MOCK_ARGS)
-python -m unittest tests.test_api                     # with the mock + front end running
+URL=http://127.0.0.1:8100 SUP_PORT=8198 python3 -m unittest tests.test_api   # front end with --supervisor 127.0.0.1:8198
 ```
 
-`--reuse-block 4096` reuses prefixes as S2 does, in whole 4,096-row prefill cells. `--reasoning-repeat N` makes the
-canned reasoning N times longer, for thinking budgets past its 17 tokens. `serve_mock.sh` runs `../bin/g6front-rs`
-(`FRONT` names another binary), which is the front end.
+`[engine] draft_k = 3` in those weights makes g6pseudo report speculative-decoding counters, which
+`return_step_stats` tests read.
 
 ## Deviations from vLLM
 
-- These return 400: `n>1`, batched prompts, `echo`, `suffix`, presence/frequency/repetition penalties, a custom `chat_template`, `response_format` other than text, and a request to turn thinking off (above).
+- These return 400: `n>1`, batched prompts, `echo`, `suffix`, `repetition_penalty` other than 1 (`presence_penalty` and `frequency_penalty` work, above), a custom `chat_template`, a `response_format` type other than text, `json_object` and `json_schema`, a schema the grammar compiler cannot take, and a request to turn thinking off without `--allow-thinking-off` (above).
 - A tool call streams as it is written when it sits in the answer outside a code fence and either starts the answer or
   follows text with no space between (the chat template writes a call straight after the content): its name goes out
   once read, string arguments as they arrive, other arguments once each value ends. Any other call (after a space or a
   newline, in reasoning, in a fence) arrives only when the reply ends with it, because nothing in the text says whether
   the model is making a call or writing about one (`g6front-rs/src/parser.rs`). A streamed call stays a call if prose
   follows it, and a streamed call cut off by `max_tokens` is closed with the arguments it had.
+- `response_format` `json_object` / `json_schema` are enforced after generation. With an engine whose hello says
+  `"grammar": true` (`GRAMMAR=1`) and no tools in the request, the engine also constrains decoding to the grammar, with
+  an object's keys in the schema's order (PROTOCOL.md `grammar`), so the check below finds what it asked for. The reply's JSON object or array is extracted:
+  inside a ```` ```json ```` fence if it has one, else the first top-level value. A value cut off by `max_tokens` yields nothing, rather than a complete value nested inside it. For
+  `json_schema` the value is checked with the schema's XGrammar grammar, keys in any order. Required and duplicate
+  keys are checked on the parsed value, because XGrammar does not check them in any order. Undeclared keys pass unless
+  `json_schema.strict` is `true`. A schema whose root type is neither object nor array is a 400. No JSON, or a value
+  that fails, returns the reply unchanged with a `warnings` entry (stream: on the last chunk). `warnings` is not an
+  OpenAI field: a client that asked for JSON and got prose plus a warning still got no JSON. A JSON-mode stream
+  withholds its content until the end, so it has no incremental output. When the reply makes a tool call, the withheld
+  text goes out with the call, unextracted, as the whole reply keeps it.
 - Tool-call tags are parsed only when the request has `tools` and `tool_choice` is not `none`.
-- `tool_choice: "required"` and `tool_choice: {"type": "function", "function": {"name": ...}}` force the reply to be a call: the engine's insert rule puts the thinking close and the tool-call opener in place of the reply's first token, and the name too for a named choice, so the model cannot answer in text. The close leads because the template leaves `<think>` open at the end of a chat prompt, so without it the forced call would be reasoning text and the parser would read the reply as prose. It is a strong nudge rather than a grammar (the engine samples, and the front end cannot mask logits): a call to a name the request did not offer comes back as text, and the arguments are the model's own, coerced by the tool's schema. A forced reply carries no reasoning (the inserted close ends the block before any reasoning is written), its inserted tokens count toward `completion_tokens`, and it needs an engine whose hello says `insert` — the same capability as `thinking_budget`. It is refused with `logprobs` (an inserted token has no logprob) and with an explicit `thinking_budget` (one insert rule per request).
+- `tool_choice: "required"` and `tool_choice: {"type": "function", "function": {"name": ...}}` force the reply to be a call: the engine's insert rule puts the thinking close and the tool-call opener in place of the reply's first token, and the name too for a named choice, so the model cannot answer in text. The close leads because the template leaves `<think>` open at the end of a chat prompt, so without it the forced call would be reasoning text and the parser would read the reply as prose. It is a strong nudge rather than a grammar (the engine samples, and the front end cannot mask logits): a call to a name the request did not offer comes back as text (as a call with `--undeclared-tool-calls emit`), and the arguments are the model's own, coerced by the tool's schema. A forced reply carries no reasoning (the inserted close ends the block before any reasoning is written), its inserted tokens count toward `completion_tokens`, and it needs an engine whose hello says `insert` — the same capability as `thinking_budget`. It is refused with `logprobs` (an inserted token has no logprob) and with an explicit `thinking_budget` (one insert rule per request).
 - `--reasoning-fields both` sends both `reasoning` and `reasoning_content` (the original brief). The harness `common.py` concatenates the two, so `text_head` would show the reasoning twice; the default is therefore `reasoning` (exact vLLM 0.30 parity).
-- The benchmark client is `../bench/pbench.py`.
+- The benchmark client is `../bench/bench.py`.
 
 ## Steering request transport (inactive on real engines)
 

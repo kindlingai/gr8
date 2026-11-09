@@ -51,7 +51,27 @@ fn read_json(p: &Path) -> Result<Value, String> {
     serde_json::from_slice(&s).map_err(|e| format!("{}: {e}", p.display()))
 }
 
+/// The text of a `tokenizer_config.json` special-token entry: a string (GLM), or an AddedToken object whose `content` is
+/// the text (DeepSeek: `{"__type": "AddedToken", "content": "<｜end▁of▁sentence｜>", ...}`).
+pub fn token_text(v: &Value) -> Option<&str> {
+    v.as_str().or_else(|| v.get("content")?.as_str())
+}
+
 impl Tok {
+    /// DeepSeek closes the think block with the single `</think>` token, not GLM's "\n" + `</think>` + "\n\n".
+    pub fn use_single_think_close(&mut self) {
+        self.think_close = self.think_end.into_iter().collect();
+    }
+
+    /// A DeepSeek-V4.1-Flash request that names no top_p samples with top_p 0.95 (the exlr8 release carries no
+    /// generation_config.json, so it was 1.0). DeepSeek's V4.1-Flash README recommends top_p 0.95 or 1.0 and evaluates at
+    /// 0.95; the 1017 README recommends 1.0. At temperature 1.0, 0.95 decoded 12.9% (code) and 6.6% (prose) faster on
+    /// 4 Sparks, as more drafts are accepted, with the same sampled quality.
+    /// A request's own top_p, or one in the directory's generation_config.json, still wins.
+    pub fn use_ds41_sampling_defaults(&mut self) {
+        self.gen_defaults.entry("top_p".to_string()).or_insert(Value::from(0.95));
+    }
+
     pub fn load(dir: &Path) -> Result<Tok, String> {
         let tk = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| format!("tokenizer.json: {e}"))?;
         let tk: &'static Tokenizer = Box::leak(Box::new(tk));
@@ -59,7 +79,7 @@ impl Tok {
         let gp = dir.join("generation_config.json");
         let gen = if gp.exists() { read_json(&gp)? } else { Value::Object(Default::default()) };
         let eos_token = cfg.get("eos_token").cloned().unwrap_or_else(|| Value::from("<|endoftext|>"));
-        let eos_token_id = eos_token.as_str().and_then(|t| tk.token_to_id(t));
+        let eos_token_id = token_text(&eos_token).and_then(|t| tk.token_to_id(t));
         let eos = gen.get("eos_token_id").cloned().unwrap_or_else(|| eos_token_id.map_or(Value::Null, Value::from));
         let eos_ids = match &eos {
             Value::Array(a) => a.iter().filter_map(Value::as_i64).collect(),
@@ -292,12 +312,76 @@ impl Detok {
 mod tests {
     use super::*;
 
+    /// A tokenizer directory like DeepSeek's: the special tokens in tokenizer_config.json are AddedToken objects and
+    /// there is no generation_config.json.
+    fn dict_form_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("g6front-tok-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let added = |id: u32, c: &str, special: bool| {
+            serde_json::json!({"id": id, "content": c, "single_word": false, "lstrip": false, "rstrip": false,
+                               "normalized": false, "special": special})
+        };
+        let tk = serde_json::json!({
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [added(10, "<think>", false), added(11, "</think>", false), added(12, "<|eos|>", true)],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
+            "post_processor": null,
+            "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true},
+            "model": {"type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": null,
+                      "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+                      "vocab": {"a": 0, "b": 1, "c": 2, "Ġ": 3, "Ċ": 4, "ĊĊ": 5, "x": 6, "y": 7, "z": 8, "!": 9},
+                      "merges": ["Ċ Ċ"]}
+        });
+        std::fs::write(dir.join("tokenizer.json"), tk.to_string()).unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"eos_token": {"__type": "AddedToken", "content": "<|eos|>", "lstrip": false, "normalized": true,
+                              "rstrip": false, "single_word": false},
+                "pad_token": {"__type": "AddedToken", "content": "<|eos|>"}}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_added_token_object_names_the_eos_token() {
+        let t = Tok::load(&dict_form_dir("eos")).unwrap();
+        assert_eq!(t.eos_token_id, Some(12));
+        assert_eq!(t.eos_ids, vec![12]);
+        assert_eq!(token_text(&t.eos_token), Some("<|eos|>"));
+        assert_eq!(token_text(&Value::from("x")), Some("x"));
+        assert_eq!(token_text(&Value::Null), None);
+    }
+
+    #[test]
+    fn deepseek_closes_thinking_with_the_one_token() {
+        let mut t = Tok::load(&dict_form_dir("close")).unwrap();
+        assert_eq!(t.think_close, vec![4, 11, 5]); // GLM's close: "\n" + </think> + "\n\n"
+        t.use_single_think_close();
+        assert_eq!(t.think_close, vec![11]);
+    }
+
+    #[test]
+    fn deepseek_samples_with_top_p_095_unless_the_directory_says_otherwise() {
+        let mut t = Tok::load(&dict_form_dir("topp")).unwrap();
+        assert_eq!(t.gen_defaults.get("top_p"), None); // no generation_config.json: the request default would be 1.0
+        t.use_ds41_sampling_defaults();
+        assert_eq!(t.gen_defaults.get("top_p"), Some(&Value::from(0.95)));
+        let dir = dict_form_dir("topp-gen");
+        std::fs::write(dir.join("generation_config.json"), r#"{"top_p": 0.8, "temperature": 0.6}"#).unwrap();
+        let mut t = Tok::load(&dir).unwrap();
+        t.use_ds41_sampling_defaults();
+        assert_eq!(t.gen_defaults.get("top_p"), Some(&Value::from(0.8)));
+        assert_eq!(t.gen_defaults.get("temperature"), Some(&Value::from(0.6)));
+    }
+
     /// Parallel == sequential on random text built from every character class around the cut points.
-    /// Needs the real tokenizer: G6_TOKENIZER_DIR=<dir with tokenizer.json ...> cargo test --release
+    /// Needs the real tokenizer: GR8_TEST_TOKENIZER_DIR=<dir with tokenizer.json ...> cargo test --release
     #[test]
     fn parallel_encode_matches_sequential() {
-        let Ok(dir) = std::env::var("G6_TOKENIZER_DIR") else {
-            eprintln!("G6_TOKENIZER_DIR not set; skipping");
+        let Some(dir) = gr8knobs::TEST_TOKENIZER_DIR.get() else {
+            eprintln!("GR8_TEST_TOKENIZER_DIR not set; skipping");
             return;
         };
         let t = Tok::load(Path::new(&dir)).unwrap();
@@ -362,7 +446,7 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let rounds: usize = std::env::var("G6_FUZZ_ROUNDS").ok().and_then(|r| r.parse().ok()).unwrap_or(40);
+        let rounds = gr8knobs::TEST_FUZZ_ROUNDS.get() as usize;
         for round in 0..rounds {
             let mut s = String::new();
             while s.len() < 60_000 + (round % 40) * 3000 {

@@ -10,8 +10,10 @@
 #include <string>
 #include <unistd.h>
 #include "rank.cuh"
+#include "../knobs-rs/gr8_knobs.h"
 #include "../loader/g6pack.h"
 #include "../loader/devimage.h"
+#include "../vmm.h"
 #ifdef G6_RS_LOADER
 #include "weight_check.cuh"
 #endif
@@ -73,19 +75,13 @@ inline Find image_find(const g6::Pack& pack, const g6::DevImage& img)
         return t;
     };
 }
-// exlr8 v2 experts from the raw width files (--v2 DIR --v2-slices DIR --v2-widths FILE). With dense (--v2-dense DIR),
-// every other tensor comes from the release's dense and vocab files too, with no base pack. trellis keeps the trellis
-// matrices as the release's entries (engine/kernels/dtr.cuh, --v2-dense-form trellis); false rounds them to a
-// converted pack's MXFP8 / int4 forms. qo adds the G6_PF_OWN=3 full-head tensors to the image.
-struct V2Src
-{
-    std::string dir, slices, widths, dense;
-    bool trellis = true, qo = false;
-};
 
 #ifdef G6_RS_LOADER
 #include <mutex>
 #include "../loader-rs/g6load.h"
+#if G6_MODEL_DS41
+#include "../loader-rs/ds41.h"
+#endif
 
 // The Rust loader's sink: pinned staging buffers and one stream per worker into the device image. Each chunk is summed
 // in staging for the weight check (weight_check.cuh).
@@ -128,7 +124,25 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
 {
     RsSink sink;
     void* dev = nullptr;
-    if (cudaMalloc(&dev, pack.bytes()) != cudaSuccess) die("cudaMalloc of " + std::to_string(pack.bytes()) + " bytes failed");
+    // GR8_IMG_VMM=1 (A/B): the image as cuMemCreate chunks of the recommended granularity mapped into one range
+    // (engine/vmm.h), =N: chunks of N MB. Same bytes at the same offsets; only the physical
+    // backing (the GPU's page size) can differ. Falls back to cudaMalloc, with a line saying why.
+    static const long vmm = (long)knob::img_vmm();
+    void (*release)(void*) = nullptr;
+    if (vmm > 0)
+    {
+        int d = 0;
+        size_t gmin = 0, grec = 0;
+        cudaGetDevice(&d);
+        g6vmm::granularity(d, gmin, grec);
+        std::string why;
+        const size_t chunk = vmm > 1 ? (size_t)vmm << 20 : 0;
+        if ((dev = g6vmm::alloc(pack.bytes(), chunk, why))) release = [](void* p) { g6vmm::release(p); };
+        fprintf(stderr, "# rank %d: GR8_IMG_VMM=%ld: %s (granularity min %zu KB, recommended %zu KB)\n", rank, vmm,
+                dev ? ("image in chunks of " + std::to_string((chunk ? (chunk + gmin - 1) / gmin * gmin : grec) >> 20) + " MB").c_str()
+                    : ("cudaMalloc instead: " + why).c_str(), gmin >> 10, grec >> 10);
+    }
+    if (!dev && cudaMalloc(&dev, pack.bytes()) != cudaSuccess) die("cudaMalloc of " + std::to_string(pack.bytes()) + " bytes failed");
     sink.dev = (uint8_t*)dev;
     sink.check = wcheck::enabled();
     if (sink.check) sink.sums.begin(pack.bytes());
@@ -137,7 +151,7 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
     char err[1024] = "";
     if (load(&s, &st, err, sizeof err)) die(std::string("Rust loader: ") + err);
     for (cudaStream_t x : sink.streams) cudaStreamDestroy(x);
-    img.adopt(pack, (uint8_t*)dev, pack.bytes());
+    img.adopt(pack, (uint8_t*)dev, pack.bytes(), release);
     fprintf(stderr, "# rank %d: %s %.2f GB -> device image (Rust loader, %s, %u threads, %llu ranges, %.2f GB read)"
             " in %.1f s (%.2f GB/s)\n", rank, what, st.image_bytes / 1e9, st.mode ? "read" : "mmap", st.threads,
             (unsigned long long)st.ranges, st.read_bytes / 1e9, st.seconds, st.image_bytes / 1e9 / st.seconds);
@@ -145,11 +159,10 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
 }
 
 // The pack -> one device image with the Rust loader: parallel reads, no checksum (the files are checked offline).
-// G6_LOADER=cpp, or a pack streamed on stdin, takes the C++ path instead.
+// GR8_LOADER=cpp, or a pack streamed on stdin, takes the C++ path instead.
 inline bool rs_load_image(g6::Pack& pack, g6::DevImage& img, const std::string& file, int rank)
 {
-    const char* sel = getenv("G6_LOADER");
-    if ((sel && std::string(sel) == "cpp") || file == "-") return false;
+    if (knob::loader() == "cpp" || file == "-") return false;
     std::vector<g6l_extent> ext;
     for (const g6::Entry& e : pack.entries()) ext.push_back({e.offset, e.nbytes});
     rs_fill(pack, img, rank, "pack", [&](const g6l_sink* s, g6l_stats* st, char* err, size_t n) {
@@ -163,9 +176,8 @@ inline bool rs_load_image(g6::Pack& pack, g6::DevImage& img, const std::string& 
 // The caller removes it once it has been read.
 inline std::string planned_manifest(int rank, const char* what)
 {
-    const char* tmp = getenv("TMPDIR");
     const std::string sfx = ".manifest.json";
-    std::string p = std::string(tmp && *tmp ? tmp : "/tmp") + "/g6m4-rank" + std::to_string(rank) + "." + what +
+    std::string p = knob::tmpdir() + "/g6m4-rank" + std::to_string(rank) + "." + what +
                     ".XXXXXX" + sfx;
     const int fd = mkstemps(&p[0], (int)sfx.size());
     if (fd < 0) die(p + ": " + strerror(errno));
@@ -200,8 +212,17 @@ inline void* rs_plan_release(g6::Pack& pack, int rank, const V2Src& v2)
 {
     const std::string planned = planned_manifest(rank, "release");
     char err[1024] = "";
+#if G6_MODEL_DS41
+    // DeepSeek-V4.1-Flash-1017: --v2-dense names the exlr8 native release; the planner also writes the Engram tables'
+    // runs, to GR8_DS_ENGRAM_PREFIX.engram.json for the Engram boot, or to a file it removes again
+    const auto eprefix = knob::ds_engram_prefix();
+    const std::string engram = eprefix ? *eprefix + ".engram.json" : planned_manifest(rank, "engram");
+    void* h = g6l_ds41_plan(v2.dense.c_str(), g6nr::NR, rank, planned.c_str(), engram.c_str(), err, sizeof err);
+    if (!eprefix) unlink(engram.c_str());
+#else
     void* h = g6l_release_plan(v2.dense.c_str(), v2.dir.c_str(), v2.slices.c_str(), v2.widths.c_str(), g6nr::NR, rank,
-                               v2.qo, v2.trellis, planned.c_str(), err, sizeof err);
+                               v2.qo, v2.trellis, v2.layout.c_str(), planned.c_str(), err, sizeof err);
+#endif
     if (!h) { unlink(planned.c_str()); die(std::string("release plan: ") + err); }
     std::string e;
     const bool opened = pack.open_manifest(planned, e);
@@ -274,7 +295,11 @@ inline Find plan_find(const g6::Pack& pack, PlanStore& store, int r)
 inline void load_image(g6::Pack& pack, g6::DevImage& img, const std::string& manifest, const std::string& file, int rank,
                        bool hash = true, const V2Src& v2 = {})
 {
+#if G6_MODEL_DS41
+    if (!v2.dir.empty() || !v2.dense.empty())   // DS41: --v2-dense RELEASE_DIR alone (rs_plan_release -> g6l_ds41_plan)
+#else
     if (!v2.dir.empty())
+#endif
     {
 #ifdef G6_RS_LOADER
         if (!v2.dense.empty()) return rs_load_release(pack, img, rank, v2);
@@ -309,28 +334,5 @@ inline void load_pack(g6::Pack& pack, const std::string& manifest, const std::st
             st.gb_per_s);
 }
 
-// comma-separated integers; "@file" reads them (comma or white space separated) from a file; "all" = 0..77
-inline std::vector<int> parse_ints(std::string s)
-{
-    std::vector<int> v;
-    if (s == "all") { for (int i = 0; i < geom::L_MAIN; ++i) v.push_back(i); return v; }
-    if (!s.empty() && s[0] == '@')
-    {
-        FILE* f = fopen(s.c_str() + 1, "r");
-        if (!f) die("cannot read " + s.substr(1));
-        int x;
-        while (fscanf(f, "%d%*[, \n\t]", &x) == 1) v.push_back(x);
-        fclose(f);
-        return v;
-    }
-    for (size_t p = 0; p < s.size();)
-    {
-        size_t q = s.find(',', p);
-        if (q == std::string::npos) q = s.size();
-        v.push_back(atoi(s.substr(p, q - p).c_str()));
-        p = q + 1;
-    }
-    return v;
-}
 
 }   // namespace g6rt

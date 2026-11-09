@@ -10,7 +10,6 @@
 #undef PF_QOABS16
 #define PF_QOABS16 1                        // PF_QOROPE implies the QOABS16 absorb/pack change
 #endif
-#include <cstring>
 #include <ctime>
 #include "prefill-qo-proto.cuh"
 #include "prefill-qo-b.cuh"
@@ -44,7 +43,7 @@ struct G6AttnQoWork {
 struct G6AttnQo {
     int kernel = 0;                         // 0 = B, 1 = v1, 2 = R1
     int cap = 0, max_rows = 0;
-    int heads = 64;                         // 64 (G6_PF_OWN=3), or 32 (G6_PF_OWN=4 pair-owner, TP4 builds only): uk->shape[0]
+    int heads = 64;                         // 64 (GR8_PF_OWN=3), or 32 (GR8_PF_OWN=4 pair-owner, TP4 builds only): uk->shape[0]
     void* storage = nullptr; size_t weight_bytes = 0, bytes = 0;
     __half *uk = nullptr, *uv = nullptr;    // [heads][512][192], [heads][256][512] FP16
     G6AttnQoWork* w = nullptr;
@@ -60,7 +59,7 @@ __global__ void uk_half_t(const void* src, __half* dst, int n) {      // [h][192
     if (i < n) { int h = i / (512 * 192), k = (i / 192) % 512, d = i % 192; dst[i] = __float2half_rn(ga::bfloat(src, ((int64_t)h * 192 + d) * 512 + k)); }
 }
 // The pack kernels take the head count as a template parameter of an inlined body: the 64-head kernels keep their names
-// and code, and a TP4 build adds the 32-head ones (G6_PF_OWN=4) that a TP6 build never compiles.
+// and code, and a TP4 build adds the 32-head ones (GR8_PF_OWN=4) that a TP6 build never compiles.
 // q[row][h][576] from qf[row][h][512] FP32 and the RoPE half of q_b (same equations as gp::pack_q)
 template <int H>
 __device__ __forceinline__ void pack_q_rows_body(const G6AttnQoStep& s, const float* qf, __half* q, unsigned* error) {
@@ -149,9 +148,9 @@ inline void rope_check(const float2* t, int cap, cudaStream_t st) {
 }
 #endif
 #ifdef PF_QODUMP
-// screen hooks: G6_QO_DUMP=1 prints an FNV64 of q per call; G6_QO_NANINJ=1 writes FP16 NaN into q[0] on every call
+// screen hooks: GR8_QO_DUMP=1 prints an FNV64 of q per call; GR8_QO_NANINJ=1 writes FP16 NaN into q[0] on every call
 inline void qo_dump(const __half* q, int rows, int H, int context, cudaStream_t st) {
-    static const bool dump = std::getenv("G6_QO_DUMP") != nullptr, inj = std::getenv("G6_QO_NANINJ") != nullptr;
+    const bool dump = knob::qo_dump(), inj = knob::qo_naninj();
     static std::atomic<int> injected{0};
     if (inj) {
         static const unsigned short nan = 0x7E00; g6h2d::copy((void*)q, &nan, 2, st);   // pageable source: pinned staging (h2d.h)
@@ -189,14 +188,14 @@ inline int cap_limit = 0;   // g6_attn_qo_cap
 inline bool heads_ok(int h) { return h == 64 || (G6_NR == 4 && h == 32); }
 }   // namespace gqi
 
-extern "C" int g6_attn_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G6AttnTensor* uk, const G6AttnTensor* uv,
+extern "C" int g6a_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G6AttnTensor* uk, const G6AttnTensor* uv,
                                  int max_rows, void* s, G6AttnQo* owner) {
     if (!out || *out || !b || !b->storage || !uk || !uv || max_rows <= 0) return int(cudaErrorInvalidValue);
     auto shape = [](const G6AttnTensor* t, int64_t a, int64_t c, int64_t d) { return t->data && t->ndim == 3 && t->shape[0] == a && t->shape[1] == c && t->shape[2] == d; };
     const int heads = uk->ndim == 3 ? (int)uk->shape[0] : 0;
     if (!gqi::heads_ok(heads) || !shape(uk, heads, 192, 512) || !shape(uv, heads, 256, 512)) return int(cudaErrorInvalidValue);
-    const char* k = std::getenv("G6_PF_QO");
-    int kernel = (!k || !*k || !strcmp(k, "b")) ? 0 : !strcmp(k, "v1") ? 1 : !strcmp(k, "r1") ? 2 : -1;
+    const std::string& k = knob::pf_qo();   // b, v1 or r1
+    int kernel = k == "v1" ? 1 : k == "r1" ? 2 : 0;
 #ifndef G6_QO_HAVE_R1
     if (kernel == 2) kernel = -1;
 #endif
@@ -245,7 +244,7 @@ extern "C" int g6_attn_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G
     }
 #endif
 #ifdef PF_QODUMP
-    if (!owner && std::getenv("G6_QO_ROPECHK")) gqi::rope_check(p->rope, p->cap, st);
+    if (!owner && knob::qo_ropechk()) gqi::rope_check(p->rope, p->cap, st);
 #endif
 #endif
     static bool configured = false;
@@ -278,8 +277,8 @@ inline void prof_tick(cudaStream_t st, int k) {
     prof_last = n;
 }
 }   // namespace gqi
-extern "C" void g6_attn_qo_prof(int on, double* ms) { gqi::prof_ms = on ? ms : nullptr; }
-extern "C" int g6_attn_qo_run(G6AttnQo* p, G6AttnBinding* b, const G6AttnQoStep* s, void* stream) {
+extern "C" void g6a_qo_prof(int on, double* ms) { gqi::prof_ms = on ? ms : nullptr; }
+extern "C" int g6a_qo_run(G6AttnQo* p, G6AttnBinding* b, const G6AttnQoStep* s, void* stream) {
     if (!p || !b || !b->storage || !s) return int(cudaErrorInvalidValue);
     if (s->rows == 0) return 0;
     if (s->rows < 0 || s->rows > p->max_rows || s->context <= 0 || s->context > b->capacity || s->context > p->cap || !s->q_b ||
@@ -369,7 +368,7 @@ extern "C" int g6_attn_qo_run(G6AttnQo* p, G6AttnBinding* b, const G6AttnQoStep*
     gqi::prof_tick(st, 3);
     return int(cudaGetLastError());
 }
-extern "C" int g6_attn_qo_warm(G6AttnQo* p, int rows, void* stream) {
+extern "C" int g6a_qo_warm(G6AttnQo* p, int rows, void* stream) {
     if (!p || rows <= 0 || rows > p->max_rows) return int(cudaErrorInvalidValue);
     cudaStream_t st = (cudaStream_t)stream;
     const int R = rows, H = p->heads;
@@ -393,9 +392,9 @@ extern "C" int g6_attn_qo_warm(G6AttnQo* p, int rows, void* stream) {
     if (rc) return rc;
     return int(cudaStreamSynchronize(st));
 }
-extern "C" size_t g6_attn_qo_bytes(const G6AttnQo* p) { return p ? p->bytes : 0; }
-extern "C" void g6_attn_qo_cap(int cap) { gqi::cap_limit = cap > 0 ? cap : 0; }
-extern "C" int g6_attn_qo_load(G6AttnQo* p, const G6AttnTensor* uk, const G6AttnTensor* uv, void* stream) {
+extern "C" size_t g6a_qo_bytes(const G6AttnQo* p) { return p ? p->bytes : 0; }
+extern "C" void g6a_qo_cap(int cap) { gqi::cap_limit = cap > 0 ? cap : 0; }
+extern "C" int g6a_qo_load(G6AttnQo* p, const G6AttnTensor* uk, const G6AttnTensor* uv, void* stream) {
     if (!p || !p->storage || !uk || !uv) return int(cudaErrorInvalidValue);
     auto shape = [](const G6AttnTensor* t, int64_t a, int64_t c, int64_t d) { return t->data && t->ndim == 3 && t->shape[0] == a && t->shape[1] == c && t->shape[2] == d; };
     const int heads = p->heads;
@@ -406,7 +405,7 @@ extern "C" int g6_attn_qo_load(G6AttnQo* p, const G6AttnTensor* uk, const G6Attn
     gp::weight_half<<<(heads * 256 * 512 + 255) / 256, 256, 0, st>>>(uv->data, p->uv, heads * 256 * 512);
     return int(cudaGetLastError());
 }
-extern "C" int g6_attn_qo_release(G6AttnQo* p) {
+extern "C" int g6a_qo_release(G6AttnQo* p) {
     if (!p) return 0;
     auto e = cudaFree(p->storage); auto w = gqi::release_work(p->w); delete p;
     return e != cudaSuccess ? int(e) : int(w);

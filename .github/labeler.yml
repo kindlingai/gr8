@@ -1,0 +1,52 @@
+# The area labels pr-labels.yml puts on a PR from the files it changes. A PR gets every label one of its files matches;
+# a label no file matches any more comes off. They are for reading the PR list: ci.yml picks its jobs from its own
+# filters, which follow what each job builds and tests.
+area:engine:
+  - changed-files:
+      - any-glob-to-any-file: ['engine/**', 'scripts/**']
+
+area:frontend:
+  - changed-files:
+      - any-glob-to-any-file: ['frontend/**', 'PROTOCOL.md']
+
+# ./gr8, the supervisors and what they read
+area:launch:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'gr8'
+          - 'tools/launch/**'
+          - 'smoketest/**'
+          - 'config/**'
+          - 'recipes/**'
+          - 'model.yaml'
+          - 'KNOBS.md'
+          - 'scripts/engine_args.sh'
+          - 'scripts/rank_health.sh'
+
+area:tools:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'tools/*'
+          - 'tools/convert/**'
+          - 'tools/cp/**'
+          - 'tools/health/**'
+          - 'tools/ngram/**'
+          - 'tools/query/**'
+          - 'tools/steering/**'
+
+area:bench:
+  - changed-files:
+      - any-glob-to-any-file: ['bench/**', 'kindling.json']
+
+# the container image and Kubernetes
+area:deploy:
+  - changed-files:
+      - any-glob-to-any-file: ['Dockerfile', '.dockerignore', 'docker/**', 'deploy/**']
+
+area:docs:
+  - changed-files:
+      - any-glob-to-any-file: ['**/*.md', 'docs/**']
+
+area:ci:
+  - changed-files:
+      - any-glob-to-any-file: ['.github/**']
