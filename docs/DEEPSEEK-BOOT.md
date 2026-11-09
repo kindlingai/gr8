@@ -31,7 +31,7 @@ one to choose its settings.
   (`dense/exlr8-split-001.engram.embed.p000…p022.safetensors`, and the same for `-014`), 46 files in all — 4.43 GB a
   part, except `p022` of each table, which is 3.94 GB. The loader scans them from `p000` and **stops at the first one
   missing**, then adds up the row counts of every part it found to work out the table's size before it splits that by
-  TP (`engine/loader-rs/src/ds41.rs:278-285`, `:930-948`). So a box missing `p000` finds no table at all, and a box
+  TP (`engine/loader-rs/src/ds41.rs:278-285`, `:973-992`). So a box missing `p000` finds no table at all, and a box
   holding only some of the parts computes the wrong shard and reads the wrong rows. **Do not delete, skip or truncate
   part files to save space.**
 
