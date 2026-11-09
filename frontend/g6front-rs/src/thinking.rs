@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::api::ApiError;
 use crate::pyjson;
+use crate::sampling::Limit;
 
 /// The efforts a request may name.
 pub const EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -52,8 +53,8 @@ pub fn parse_default_effort(s: &str) -> Result<&'static str, String> {
 pub struct Thinking {
     /// The effort the template renders, already one of its names; None: the template's own default.
     pub effort: Option<&'static str>,
-    /// The think block's limit in reply tokens, after which the front end closes it. 0: no limit.
-    pub budget: u64,
+    /// The think block's limit in reply tokens, after which the front end closes it (`budget_tokens`). 0: no limit.
+    pub budget: Limit,
     /// The budget is the request's own positive value, not the server default.
     pub budget_explicit: bool,
     /// The request turned thinking off and the server allows it: the prompt has no effort header and its think block
@@ -61,11 +62,24 @@ pub struct Thinking {
     pub off: bool,
 }
 
+impl Thinking {
+    /// The budget in reply tokens for a request whose effective max_tokens is `max_tokens`. 0: no limit. A server
+    /// default that scales with max_tokens gives at least 1 token: a tiny max_tokens makes the budget tighter, never
+    /// unlimited, so the close comes first.
+    pub fn budget_tokens(&self, max_tokens: u64) -> u64 {
+        match self.budget {
+            Limit::Tokens(n) => n,
+            limit => limit.resolve(max_tokens).max(1),
+        }
+    }
+}
+
 /// The server defaults (front-end flags), used where a request names nothing.
 #[derive(Clone, Copy, Default)]
 pub struct Defaults {
     pub effort: Option<&'static str>,
-    pub budget: u64,
+    /// `--default-thinking-budget`: tokens, a fraction of the request's max_tokens, or both (sampling::Limit)
+    pub budget: Limit,
     /// `--allow-thinking-off`: `enable_thinking: false` and `reasoning_effort: "none"` turn thinking off instead of
     /// being refused.
     pub allow_off: bool,
@@ -105,15 +119,15 @@ pub fn resolve(body: &Map<String, Value>, levels: &[&'static str], defaults: Def
     };
     let off = defaults.allow_off && (switch == Some(false) || (switch.is_none() && explicit_none(body, kw)));
     if off {
-        return Ok(Thinking { effort: None, budget: 0, budget_explicit: false, off });
+        return Ok(Thinking { effort: None, budget: Limit::Tokens(0), budget_explicit: false, off });
     }
     let effort = explicit.or(defaults.effort).map(|e| nearest(e, levels));
     // TensorFold: int(budget or default), and a budget <= 0 is no limit. So 0 and null take the server default, and a
     // negative budget is no limit even when the server has a default.
     let (budget, budget_explicit) = match parse_budget(body.get("thinking_budget"))? {
         None | Some(0) => (defaults.budget, false),
-        Some(n) if n < 0 => (0, false),
-        Some(n) => (n as u64, true),
+        Some(n) if n < 0 => (Limit::Tokens(0), false),
+        Some(n) => (Limit::Tokens(n as u64), true),
     };
     Ok(Thinking { effort, budget, budget_explicit, off: false })
 }
@@ -266,9 +280,9 @@ mod tests {
 
     #[test]
     fn allow_off_turns_thinking_off() {
-        let allow = Defaults { effort: Some("high"), budget: 512, allow_off: true };
+        let allow = Defaults { effort: Some("high"), budget: Limit::Tokens(512), allow_off: true };
         let r = |b: Value| resolve(b.as_object().unwrap(), &["max", "high", "low"], allow).unwrap();
-        let off = Thinking { effort: None, budget: 0, budget_explicit: false, off: true };
+        let off = Thinking { effort: None, budget: Limit::Tokens(0), budget_explicit: false, off: true };
         assert_eq!(r(json!({"chat_template_kwargs": {"enable_thinking": false}})), off);
         assert_eq!(r(json!({"reasoning_effort": "none"})), off);
         assert_eq!(r(json!({"chat_template_kwargs": {"reasoning_effort": "none"}})), off);
@@ -276,28 +290,63 @@ mod tests {
         // that names nothing keeps the defaults
         let on_none = r(json!({"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": true}}));
         assert!(!on_none.off && on_none.effort == Some("high"));
-        assert_eq!(r(json!({})), Thinking { effort: Some("high"), budget: 512, budget_explicit: false, off: false });
+        assert_eq!(
+            r(json!({})),
+            Thinking { effort: Some("high"), budget: Limit::Tokens(512), budget_explicit: false, off: false }
+        );
     }
 
     #[test]
     fn the_server_defaults_fill_what_the_request_leaves_out() {
-        let d = Defaults { effort: Some("medium"), budget: 512, allow_off: false };
+        let d = Defaults { effort: Some("medium"), budget: Limit::Tokens(512), allow_off: false };
         let r = resolve(&body(json!({})), &GLM, d).unwrap();
-        assert_eq!(r, Thinking { effort: Some("high"), budget: 512, budget_explicit: false, off: false });
+        assert_eq!(
+            r,
+            Thinking { effort: Some("high"), budget: Limit::Tokens(512), budget_explicit: false, off: false }
+        );
         // 0 and null take the default, as in TensorFold; a negative budget is no limit; a positive one wins
         for b in [json!(0), json!(null), json!("0")] {
             let r = resolve(&body(json!({"reasoning_effort": "low", "thinking_budget": b})), &GLM, d).unwrap();
-            assert_eq!(r, Thinking { effort: Some("low"), budget: 512, budget_explicit: false, off: false }, "{b}");
+            assert_eq!(
+                r,
+                Thinking { effort: Some("low"), budget: Limit::Tokens(512), budget_explicit: false, off: false },
+                "{b}"
+            );
         }
         let r = resolve(&body(json!({"thinking_budget": -1})), &GLM, d).unwrap();
-        assert_eq!((r.budget, r.budget_explicit), (0, false));
+        assert_eq!((r.budget, r.budget_explicit), (Limit::Tokens(0), false));
         let r = resolve(&body(json!({"thinking_budget": 64})), &GLM, d).unwrap();
-        assert_eq!((r.budget, r.budget_explicit), (64, true));
+        assert_eq!((r.budget, r.budget_explicit), (Limit::Tokens(64), true));
         let r = resolve(&body(json!({"thinking_budget": -1})), &GLM, Defaults::default()).unwrap();
-        assert_eq!(r.budget, 0);
+        assert_eq!(r.budget, Limit::Tokens(0));
         assert_eq!(parse_default_effort("xhigh"), Ok("xhigh"));
         assert!(parse_default_effort("none").is_err());
         assert!(parse_default_effort("auto").is_err());
+    }
+
+    #[test]
+    fn a_default_budget_resolves_against_the_request_s_max_tokens() {
+        let limit = Limit::parse("32768|0.8x").unwrap();
+        let d = Defaults { effort: None, budget: limit, allow_off: false };
+        let r = resolve(&body(json!({})), &GLM, d).unwrap();
+        assert_eq!((r.budget, r.budget_explicit), (limit, false));
+        assert_eq!(r.budget_tokens(8192), 6554);
+        assert_eq!(r.budget_tokens(40000), 32000);
+        assert_eq!(r.budget_tokens(200000), 32768);
+        // a request's own budget is a token count whatever max_tokens is
+        let r = resolve(&body(json!({"thinking_budget": 64})), &GLM, d).unwrap();
+        assert_eq!((r.budget_tokens(8192), r.budget_explicit), (64, true));
+        assert_eq!(resolve(&body(json!({"thinking_budget": -1})), &GLM, d).unwrap().budget_tokens(8192), 0);
+        // 0 alone is no limit; a fraction that rounds to 0 is 1 (the close comes first), not no limit
+        let t = |s: &str, max_tokens: u64| {
+            let d = Defaults { effort: None, budget: Limit::parse(s).unwrap(), allow_off: false };
+            resolve(&body(json!({})), &GLM, d).unwrap().budget_tokens(max_tokens)
+        };
+        assert_eq!(t("0", 8192), 0);
+        assert_eq!(t("4096", 100), 4096);
+        assert_eq!(t("0.1x", 4), 1);
+        assert_eq!(t("32768|0.8x", 1), 1);
+        assert_eq!(t("0.5x", 8192), 4096);
     }
 
     #[test]
