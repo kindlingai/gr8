@@ -138,7 +138,7 @@ inline cudaError_t up(const Geometry& g,const Layer& w,Scratch& q,cudaStream_t s
     if(e!=cudaSuccess)return e;
     ds41v2moe::k_import_routes<NE,TK,MM><<<(g.M*8+255)/256,256,0,st>>>(q.all_idx,q.all_wt,g.M,q.plan,q.masks);
     dsr::k_scan_ro<NE,TK,MM><<<1,NE,0,st>>>(q.plan,q.masks,q.tile0);
-    ds41v2moe::k_place_routes<TK,MM><<<(g.M*TK+255)/256,256,0,st>>>(q.plan,q.masks,q.tile0,g.M);
+    dsr::k_place_ro<NE,TK,MM,TK,true><<<(g.M*TK+255)/256,256,0,st>>>(q.plan,q.masks,q.tile0,g.M);
     if(q.resident_fc2)ds41v2moe::k_order_desc<NE,TK,MM><<<1,NE,0,st>>>(q.plan,q.order);
     ds41v2moe::k_relayout<true><<<(size_t(g.M)*H+255)/256,256,0,st>>>(q.all_q,q.record_q,g.M,H);
     if((e=cudaGetLastError())!=cudaSuccess)return e;

@@ -17,7 +17,7 @@ __global__ void k_export_routes(const dsr::PlanMT<TK, MM>* p, int owned, int Q, 
     wt[i] = m < owned ? p->tok_w[m][k] : 0.f;
 }
 // Rebuild token masks from globally gathered routes; zero masks before launch.
-// Cuts remain -1/0. k_scan_ro + k_place_ro consume this in the normal gr8 format.
+// Cuts remain -1/0. k_scan_ro + k_place_ro<..., SKIP_DEAD = true> consume this in the normal gr8 format.
 template <int NE, int TK, int MM>
 __global__ void k_import_routes(const int* idx, const float* wt, int M,
                                 dsr::PlanMT<TK, MM>* p, unsigned* masks)
@@ -31,22 +31,6 @@ __global__ void k_import_routes(const int* idx, const float* wt, int M,
     p->tok_slot[m][k] = -1;
     p->tok_col[m][k] = 0;
     if (e >= 0 && e < NE) atomicOr(masks + e * (MM / 32) + m / 32, 1u << (m & 31));
-}
-// k_place_ro assumes all first TK routes live. This variant imports optional cuts
-// using the same stock rank-in-mask formula, without reading an expert -1.
-template <int TK, int MM>
-__global__ void k_place_routes(dsr::PlanMT<TK, MM>* p, const unsigned* masks, const int* tile0, int M)
-{
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= M * TK) return;
-    const int m = i / TK, k = i % TK, e = p->tok_expert[m][k];
-    if (e < 0) return;
-    int t, c;
-    dsr::mt_route_pos_w(tile0[e], masks + e * (MM / 32), m, t, c);
-    p->tok_slot[m][k] = t;
-    p->tok_col[m][k] = c;
-    p->tile_w[t][c] = p->tok_w[m][k];
-    p->tile_tok[t][c] = m;
 }
 // No quantization: the same E4M3 bytes in two layouts. Scales are already plain.
 template <bool TO_RECORDS>
