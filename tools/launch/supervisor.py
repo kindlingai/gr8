@@ -1027,6 +1027,8 @@ class Supervisor:
                     front += ['--' + k.lower().replace('_', '-'), o.get(k)]
         if o.get('ALLOW_THINKING_OFF') == '1' and model.dialect == 'glm':   # ds41 turns thinking off by itself
             front += ['--allow-thinking-off']
+        if o.get('CLAMP_MAX_TOKENS') == '1':
+            front += ['--clamp-max-tokens']
         if o.get('UNDECLARED_TOOL_CALLS') != 'text':
             front += ['--undeclared-tool-calls', o.get('UNDECLARED_TOOL_CALLS')]
         self.spawn('front', self.pin() + front + ['--model-dir', self.ms.tokenizer, '--engine-sock', sock,
