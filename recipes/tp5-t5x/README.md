@@ -1,6 +1,6 @@
 # TP5 T5X at 617K context (5x DGX Spark, GLM-5.3 full)
 
-This branch is `adapt-ai-systems/gr8-tp5` main `0574fe5`: upstream `3bdd2cb` plus 22 commits (TP5 admission for a
+These numbers come from a TP5 build: upstream `3bdd2cb` plus 22 commits, head `0574fe5` (TP5 admission for a
 five-rank mesh, the QO cache, KVB fp8, K1 split, L2 prefetch, CP_ONECHAIN, CP_STEP_ROWS, KSTOPB, the DSel cost table,
 the T5X example config and `docs/TP5-SERVE.md`); it includes the heads of gr8 PRs #106-#114, merged locally. `git cherry main` marks
 all 22 as missing from `main`. This directory adds the exact serving files we ran on top of it.
@@ -62,11 +62,11 @@ Full clock changes no output (same canary); memory and heat under long load were
 - `KV_FORMAT=int4` with CAP 810,496 (+31% context): -1 to -4% speed, KL 0.0169 against the 0.01 gate. Option only.
 
 ## Option, never run as a serve: T5XR (remote KV store on a sixth Spark)
-`T5XR.env` = `T5X.env` with `GR8_WORK_DIR` pointing at a build of our `rkv` branch and two lines:
+`T5XR.env` = `T5X.env` with `GR8_WORK_DIR` pointing at a build with the `rkv` commits listed below (not on `main`) and two lines:
 `KV_STORE=remote:<node>:7350,size=21G` and `KV_KEEP=sessions`. The sixth Spark runs `./gr8 kv up --gb 106` and
 keeps evicted chats' KV in its RAM; a chat that comes back reads its blocks over RDMA instead of a new prefill.
 The `rkv` commits (stores for steered runs: 864c387, 5c9fdc4, 2c1a4a7; copy-batch fixes 5f5b862; drain trace c5f674d)
-are NOT in this PR. With `STEERING_FORCE=1` and without them, the store holds nothing.
+are not on `main`. With `STEERING_FORCE=1` and without them, the store holds nothing.
 
 Measured on 2026-10-20 only as test arms, never as a serve:
 - Evict/restore A/B (10 chats x ~22K on a reduced pool, 30 requests per arm): restore TTFT p50 2.03 s with the store
@@ -79,7 +79,7 @@ Measured on 2026-10-20 only as test arms, never as a serve:
   after any restart.
 
 ## Sources
-Every number above comes from our run logs and reports: `reports/tp5/SERVE.md` (T5X rows 11:13Z / 11:24Z, the
+Every number above comes from our run logs and reports, which are not published here: `reports/tp5/SERVE.md` (T5X rows 11:13Z / 11:24Z, the
 full-clock row 12:06Z, the mixed / coresident / decode-gate rows), `reports/tp5/t2-t5s2.md` (needles),
 `reports/tp5/kv4.md` (int4), `reports/remote-kv-tp5/RESULTS.md` and `BOOT-OPTION.md` (T5XR), and the raw run logs on our
-head box.
+head box. The scripts `serve-t5x.sh` and `memclean.sh` named above are not published either.

@@ -1,5 +1,8 @@
 # Steering profile schema v1
 
+> Historical note: this page describes the change that introduced the profile schema. Profile loading and request
+> selection are live; see [STEERING.md](STEERING.md).
+
 This change provides host-only types, validation and a CPU reference operator. Serving, launchers, request APIs,
 cache integration and GPU kernels do not consume them yet. `load_profile` compares the manifest to a caller-provided
 `ExpectedModel`; verifying that identity against the actual served files belongs to boot integration.

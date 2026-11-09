@@ -1,5 +1,8 @@
 # General steering projection kernels (inactive serving capability)
 
+> Historical note: this page describes the change that introduced the general projection kernels. Profile loading and
+> request selection are live; see [STEERING.md](STEERING.md).
+
 This slice of #45 adds the general writer projection to the existing consume kernels:
 
 ```text

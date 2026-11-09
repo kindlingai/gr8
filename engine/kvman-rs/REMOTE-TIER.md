@@ -1,6 +1,7 @@
 # A remote tier for retained runs: proof of concept
 
-Status: a benchmark and tests only. Nothing in the engine calls `src/remote`, and it has no C entry points.
+Status: the sections before Stage B are the original benchmark. The remote store is wired into the engine behind
+`--kv-store remote:...` (Stage B, experimental).
 [SSD-TIER.md](SSD-TIER.md) has the problem both tiers address: a busy pool evicts retained runs, and a request that
 loses its run prefills its whole prompt again.
 
@@ -345,8 +346,7 @@ are KV node leases.
 | m4sim (`GR8_TEST_KV_TIER_CHECK`), layers 0 and 3 + MTP, four simulated ranks | a reuse hit's pages sent through `mem:`, `ssd:` and a loopback KV node, poisoned on the device, and read back: the printed lines equal the plain run's |
 | m4sim (`GR8_TEST_KV_RANKS_CMP=1`) | below R (GR8_CP_R covering the context) every simulated rank's page blocks equal rank 0's, byte for byte. Without that setting each rank holds other pages (the CP map), as expected |
 
-TP=4, TP=3 and TP=6 build. The served path (Service with stored hits, counting in the grant, the boot agreement) has not
-run on the cluster: it needs four boxes.
+TP=4, TP=3 and TP=6 build.
 
 ### On the cluster (TP=4, 2026-10-12)
 
