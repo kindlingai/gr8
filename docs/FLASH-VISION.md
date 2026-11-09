@@ -130,12 +130,14 @@ it. 0 never loads the tower and the engine runs the text-only code. A rank that 
 
 - Device memory on every rank: the weights (1,075 MiB), the workspace (473 MiB, sized for the largest image of 8000
   tokens and 32000 patches, with the MLPs in row passes), a pool of one quantum's rows (`MP * lanes * 8 KiB`) and one
-  image's staging (64 MiB): 1,643 MiB at `--prefill 4096` on one lane. The boot counts them before the ready check,
-  so a box at its `GR8_MEM_MIN` floor needs a smaller `CAP` with vision on. On one GB10 with the one-box recipe's
-  settings (int4 KV, `SESS=4`, DFlash2, `GR8_MEM_MIN=5`), `CAP=700032` stops at 4.81 GiB left with vision on;
-  `CAP=524288` boots, with 6.5 GiB available at ready against 8.2 GiB without vision.
+  image's staging (64 MiB): 1,643 MiB at `--prefill 4096` on one lane, 1,675 MiB on two. The boot counts them before
+  the ready check, so a box at its `GR8_MEM_MIN` floor needs a smaller `CAP` with vision on.
+  - One GB10 with the one-box recipe's settings (int4 KV, `SESS=4`, DFlash2, `GR8_MEM_MIN=5`): `CAP=700032` stops at
+    4.81 GiB left with vision on. `CAP=524288` boots.
+  - Two GB10s with the two-box recipe's defaults (bit349, int4 KV, `SESS=8`, `CAP=2097152`, DFlash2): the pair boots
+    with vision on, with 12.9 / 13.8 GiB available at ready against 14.2 / 14.1 GiB with the knob at 0.
 - The tower runs on the serve thread, before the launch: a request with images holds the other sessions' steps for
-  its tower time.
+  its tower time, about 3 s for an 8000-token image.
 - Tower time on one GB10 (fused attention, cuBLAS linears): about 12 ms for a 63-token image, 143 ms for 1024 tokens,
   1.05 s for 4096 tokens and 3.2 s for 8000 tokens. Attention over all of an image's patches grows with the square of
   its size.
@@ -160,6 +162,10 @@ and at 1. With the knob at 1 the model names the red disc, reads the bar chart's
 scene, answers about two images in one request, and describes a 2700 x 2600 image (7,917 tokens, one tower run across
 two prefill quanta), alone and beside four text sessions. Text replies at temperature 0 from fresh boots with the knob at
 0 and at 1 are the same.
+
+Two boxes (TP=2 on one direct 200G cable, the two-box recipe's settings): smoke passes 14 of 14 with the knob at 0 and at
+1, the same image answers come back, and the 7,917-token image runs once across both prefill lanes. A rank whose tower
+file has another header refuses at bootstrap, and the launcher refuses a knob set on one box only.
 
 One GPU: `engine/runtime/tests/flash_vision_test.cu` (its header has the command) on the release's
 `dense/vision-bf16.safetensors` and `engine/ref/flash/fixtures/vision`. Pass = projected error and median row error
