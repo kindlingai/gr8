@@ -326,6 +326,34 @@ class ControlPortTests(unittest.TestCase):
         self.assertIn('10.1.0.4,10.2.0.4', v['values'].values())
         self.assertNotIn('10.110.0.1,10.111.0.1', v['values'].values())
 
+    def test_a_refused_head_says_why_before_the_extra_wait(self):
+        s = supervisor()
+        s.rails, s.tmpl, s.digest, s.model_id, s.variant = ('10.1.0.1', '10.2.0.1'), {'knobs': {}}, 'd', 'm', mock.Mock()
+        head = mock.Mock(verdict=None, gave_up=False)
+        head.have = {r: hello(r, lan=MEMBERS[r]) for r in range(4)}
+        head.wait_all.return_value = True
+        head.decide.side_effect = lambda v: setattr(head, 'verdict', v)
+        head.untold.return_value = [2, 3]
+        lines = []
+        with mock.patch.object(S.handshake, 'Head', return_value=head), \
+                mock.patch.object(s, 'rail_check', return_value='rank 3 does not answer'), \
+                mock.patch.object(S, 'log', side_effect=lines.append), \
+                mock.patch.object(s, 'linger', side_effect=lambda: lines.append('LINGER')), \
+                mock.patch.dict(os.environ, {'GR8_REFUSAL_LINGER': '15'}), \
+                mock.patch.object(S, 'opt_timeout', return_value=600.0):
+            v = s.handshake_head(hello(0, lan=MEMBERS[0]))
+        self.assertEqual(v['field'], 'fabric')
+        i = lines.index('LINGER')
+        self.assertTrue(lines[i - 2].startswith('handshake refused: fabric'), lines)
+        self.assertEqual(lines[i - 1], 'head: answering late hellos with the refusal for 15 s, then up to 600 s more '
+                                       'until ranks 2, 3 have it')
+        self.assertTrue(s.refusal_logged)
+        # no extra wait to announce: every rank has it, the head gave up on one, or JOIN_TIMEOUT is 0
+        for untold, gave_up, more in (([], False, 600.0), ([3], True, 600.0), ([3], False, 0.0)):
+            head.untold.return_value, head.gave_up = untold, gave_up
+            with mock.patch.object(S, 'opt_timeout', return_value=more):
+                self.assertEqual(s.linger_plan(), 'head: answering late hellos with the refusal for 15 s')
+
     def test_hello_before_the_head_is_ready(self):
         s = supervisor()
         s.state = 'preparing'

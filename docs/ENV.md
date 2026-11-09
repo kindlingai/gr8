@@ -523,7 +523,7 @@ Read by the build or the launcher, never by the engine.
 | `GR8_NVCC_CACHE_DIR` | path | ~/.cache/gr8-nvcc |  | Where the compile cache keeps outputs. |
 | `GR8_NVCC_CACHE_LOG` | path | unset |  | A file that gets one hit, miss or pass line per compile. |
 | `GR8_PSEUDO_TOKENIZER` | path | unset |  | CI: a tokenizer directory that turns on the pseudo engine's smoke and API tests. |
-| `GR8_REFUSAL_LINGER` | float | unset |  | Seconds the head keeps a refused boot's status up, 15 when unset. It then keeps answering until every worker has the refusal (a box still fetching says hello late), at most JOIN_TIMEOUT seconds more; not when the refusal is the head's own join timeout or a rank that stopped asking. |
+| `GR8_REFUSAL_LINGER` | float | unset |  | Seconds the head keeps a refused boot's status up, 15 when unset. It then keeps answering until every worker has the refusal (a box still fetching says hello late), at most JOIN_TIMEOUT seconds more; not when the refusal is the head's own join timeout or a rank that stopped asking. JOIN_TIMEOUT 0 here means no extra wait. The head prints the refusal and the ranks it waits for before it waits. |
 | `GR8_STOP_GRACE` | text | 30s |  | docker/compose.yaml: how long docker waits for the container to stop before it kills it, 30s when unset. A KV_STORE ssd store with persist=on that keeps sessions (keep=sessions or all, or KV_KEEP) makes the engine's quit take up to 120 s, so set 150s with one; else the quit takes 10 s. |
 | `GR8_TESTS` | text | `1` | 0\|1\|only | Whether scripts/build.sh builds the test binaries: 0 skips them, only builds them alone. |
 | `GR8_WIDTHS` | text | unset |  | The tensor-parallel widths scripts/build.sh builds, "3 4" for example. |

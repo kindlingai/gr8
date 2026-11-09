@@ -171,6 +171,11 @@ class Head:
             self.cv.notify_all()
             return self.verdict is None
 
+    def untold(self):
+        """The worker ranks that have not got the refusal yet."""
+        with self.cv:
+            return sorted(set(range(1, self.tp)) - self.told)
+
     def wait_told(self, timeout, stop=None):
         """Wait until every worker rank has got the refusal, a stop, or the timeout. True when all were told (or
         there are no ranks to tell: a head that refused before it read its own options). No wait when the head
