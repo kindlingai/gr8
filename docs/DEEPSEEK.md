@@ -46,8 +46,8 @@ prompt we measured with `TUNE=speed` is 262,219 tokens; `CAP` allows 327,680. `T
 ### How we measure
 
 - gr8's own benchmark (`bench/bench.py`) against the running server, with the recipe's settings. These runs used an
-  image with the engine built from `0015fd0`, not yet the recipe's published image; a run on the published image
-  follows.
+  image with the engine built from `0015fd0`. A check run of the recipe's published image `sha-ad3efdf` on set B
+  (2026-11-09) was within 2.1% of the same build's prefill and many-stream numbers, and scored 73 of 75.
 - No tracing or per-stage timing on the measured requests.
 - A number that compares two settings comes from paired runs: both settings on the same boxes, each on a fresh boot,
   in both orders.
@@ -89,11 +89,12 @@ makes.
 ## Start it
 
 The quickest way is the recipe
-[deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark): the same
-Docker image on all four boxes, in fast mode. On every box, fetch the release (510.6 GB) with the image, then start
-the image. Its README has the commands (`docker run` or Docker Compose), the cabling and the settings, and shows how to
-get the exact model instead. We booted the recipe's image on four boxes on {{DATE}} (ready in {{BOOT_S}} s, smoke test
-{{SMOKE}}, {{QEVAL}} of 75 on the 75-item check in fast mode): if a step fails, tell us.
+[deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark): the same Docker
+image on all four boxes, in fast mode. On every box, fetch the release (510.6 GB) with the image, then start the image.
+Its README has the commands (`docker run` or Docker Compose), the cabling and the settings, and shows how to get the
+exact model instead. We booted the recipe's image `sha-ad3efdf` on four boxes on 2026-11-09 (first boot 212.7 s to
+`serving:`, a switch from GLM-5.3 after that 37-39 s, a chat answered after each boot, 73 of 75 on the 75-item check in
+fast mode): if a step fails, tell us.
 
 With gr8's own launcher, which gives exact output by default:
 
