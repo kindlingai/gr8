@@ -415,6 +415,53 @@ def seq_spec_error(spec):
     return None
 
 
+def loop_spec_error(spec):
+    """Why `spec` is not a loop guard spec (the front end's loopguard.rs Spec::parse), or None:
+    mode=M,min=N,copies=C,long=L,max=X,window=W,text=T, each key once, text= last and taking the rest."""
+    head, text = spec, None
+    i = spec.find('text=')
+    if i == 0 or (i > 0 and spec[:i].endswith(',')):
+        head, text = spec[:i].rstrip(','), spec[i + 5:]
+    seen = set()
+    vals = {'min': 64, 'long': 0}
+    ranges = {'min': (4, 4096), 'copies': (2, 1000), 'long': (0, 1 << 20), 'max': (1, 64), 'window': (0, 1 << 20)}
+    for part in (p.strip() for p in head.split(',')):
+        if not part:
+            continue
+        key, sep, value = part.partition('=')
+        key, value = key.strip(), value.strip()
+        if not sep:
+            return f'{part!r}: want key=value'
+        if key in seen:
+            return f'{key} is given twice'
+        seen.add(key)
+        if key == 'mode':
+            if value not in ('log', 'phrase', 'phrase-close', 'close'):
+                return f'mode={value!r}: want log, phrase, phrase-close or close'
+        elif key in ranges:
+            lo, hi = ranges[key]
+            if not (value.isdigit() and lo <= int(value) <= hi):
+                return f'{key}={value!r}: want a whole number from {lo} to {hi}'
+            vals[key] = int(value)
+        else:
+            return f'{key!r}: want mode, min, copies, long, max, window or text'
+    if text is not None:
+        out, it = [], iter(text)
+        for c in it:
+            if c != '\\':
+                out.append(c)
+                continue
+            n = next(it, None)
+            if n not in ('n', 't', '\\'):
+                return 'text: want the escapes \\n, \\t or \\\\'
+            out.append({'n': '\n', 't': '\t'}.get(n, n))
+        if not 1 <= len(out) <= 2000:
+            return 'text: want 1 to 2000 characters'
+    if vals['long'] and vals['long'] < vals['min']:
+        return f'long={vals["long"]}: want 0 (off) or at least min ({vals["min"]})'
+    return None
+
+
 def validate(o):
     """Refuse what this version cannot boot, with the reason."""
     if not o.get('GR8_MODEL'):
@@ -493,6 +540,10 @@ def validate(o):
         err = seq_spec_error(o.get('DEFAULT_SEQUENCE_PENALTY'))
         if err:
             raise OptionError(f'--default-sequence-penalty {o.get("DEFAULT_SEQUENCE_PENALTY")}: {err}')
+    if o.get('DEFAULT_LOOP_GUARD') is not None and o.get('DEFAULT_LOOP_GUARD') != 'off':
+        err = loop_spec_error(o.get('DEFAULT_LOOP_GUARD'))
+        if err:
+            raise OptionError(f'--default-loop-guard {o.get("DEFAULT_LOOP_GUARD")}: {err}')
     if o.get('TOOL_REPEAT_GUARD') not in ('0', '1'):
         raise OptionError(f'--tool-repeat-guard {o.get("TOOL_REPEAT_GUARD")}: want 0 or 1')
     if not (str(o.get('TOOL_REPEAT_GUARD_REPEATS')).isdigit() and int(o.get('TOOL_REPEAT_GUARD_REPEATS')) >= 1):

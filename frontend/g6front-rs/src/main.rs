@@ -13,6 +13,7 @@ mod grammar;
 mod guard;
 mod jsonmode;
 mod logprobs;
+mod loopguard;
 mod metrics;
 mod parser;
 mod pyjson;
@@ -72,6 +73,8 @@ pub struct State {
     pub boost: Option<sampling::BoostSpec>,
     /// the server-default sequence penalty (`--default-sequence-penalty`); None = off
     pub sequence: Option<sampling::SeqSpec>,
+    /// the server-default loop guard (`--default-loop-guard`); None = off
+    pub loop_guard: Option<loopguard::Spec>,
     pub started: u64,
     /// HOST:PORT of the head's supervisor, which runs the cluster's self-checks for /health?deep
     pub supervisor: Option<String>,
@@ -102,6 +105,7 @@ struct Args {
     penalties: sampling::Penalties,
     boost: Option<sampling::BoostSpec>,
     sequence: Option<sampling::SeqSpec>,
+    loop_guard: Option<loopguard::Spec>,
     guard: guard::Config,
 }
 
@@ -115,6 +119,7 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--default-thinking-budget N, Fx or N|Fx] [--allow-thinking-off] [--clamp-max-tokens]
                   [--default-presence-penalty SPEC] [--default-frequency-penalty SPEC]
                   [--default-think-end-boost start=S,per1k=P,max=M] [--default-sequence-penalty SPEC]
+                  [--default-loop-guard SPEC]
                   [--tool-repeat-guard 0|1] [--tool-repeat-guard-repeats N] [--tool-repeat-guard-temperature F]
                   [--tool-repeat-guard-retries N]
                   [--undeclared-tool-calls text|emit] [--supervisor HOST:PORT]";
@@ -145,6 +150,7 @@ fn parse_args() -> Result<Args, String> {
         penalties: sampling::Penalties::default(),
         boost: None,
         sequence: None,
+        loop_guard: None,
         guard: guard::Config::default(),
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -223,6 +229,13 @@ fn parse_args() -> Result<Args, String> {
             "--default-sequence-penalty" => {
                 a.sequence =
                     Some(sampling::SeqSpec::parse(&next(&mut i, &flag, inline)?).map_err(|e| format!("{flag}: {e}"))?)
+            }
+            "--default-loop-guard" => {
+                let v = next(&mut i, &flag, inline)?;
+                a.loop_guard = match v.as_str() {
+                    "off" => None,
+                    _ => Some(loopguard::Spec::parse(&v).map_err(|e| format!("{flag}: {e}"))?),
+                }
             }
             "--default-think-end-boost" => {
                 a.boost = Some(
@@ -412,6 +425,7 @@ async fn serve(args: Args) -> Result<(), String> {
         penalties: args.penalties,
         boost: args.boost,
         sequence: args.sequence,
+        loop_guard: args.loop_guard,
         started: util::now_secs(),
         supervisor: args.supervisor,
     }));

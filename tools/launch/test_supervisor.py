@@ -490,6 +490,11 @@ class FrontTests(unittest.TestCase):
         a = self.front_argv('--default-sequence-penalty', 'thinking=0.8:1.75:4:6,guard=1:2:1:8')
         self.assertEqual(a[a.index('--default-sequence-penalty') + 1], 'thinking=0.8:1.75:4:6,guard=1:2:1:8')
 
+    def test_the_loop_guard_reaches_the_front_end_when_set(self):
+        self.assertNotIn('--default-loop-guard', self.front_argv())
+        a = self.front_argv('--default-loop-guard', 'mode=phrase-close,text=Decide, now.\\n')
+        self.assertEqual(a[a.index('--default-loop-guard') + 1], 'mode=phrase-close,text=Decide, now.\\n')
+
     def test_the_tool_repeat_guard_reaches_the_front_end_when_on(self):
         a = self.front_argv()
         self.assertNotIn('--tool-repeat-guard', a)

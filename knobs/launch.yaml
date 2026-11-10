@@ -215,6 +215,18 @@ options:
       such as a timestamp stay free). The guard scope applies only in the repeated-tool-call guard's retry, against
       the call it took back, so a retry cannot reproduce it. M or C 0 = the scope off. A request's sequence_penalty
       (the same string, "off" or false) wins
+  DEFAULT_LOOP_GUARD:
+    scope: box
+    doc: >-
+      the head's front end: the loop guard, as mode=M,min=N,copies=C,long=L,max=X,window=W,text=T, any of the parts;
+      unset = off. Inside the think block, when one run of N reply tokens (default 64) has occurred C times (default
+      3) without overlapping, or with L set when the reply's tail repeats one earlier stretch for L tokens, the front
+      end cancels the run and goes on in a new one from the reply so far plus a steering phrase. Runs the prompt also
+      holds never count. M: phrase (the phrase, still thinking), phrase-close (the phrase; a trigger again within W
+      thinking tokens of it, default 512, puts the phrase and the think block's close in), close (the phrase and the
+      close at once) or log (only log the trigger). X caps the triggers per request (default 2). text= takes the rest
+      of the spec, commas included, with the escapes \n, \t and \\. A request's loop_guard (the same string, true,
+      "off" or false) wins. No guard with logprobs or a forced tool_choice (frontend/README.md, "Loop guard")
   TOOL_REPEAT_GUARD:
     scope: box
     default: "0"

@@ -8,6 +8,7 @@ use bytes::Bytes;
 
 use crate::api::ApiError;
 use crate::engine::{Engine, Kind, Msg, Stream};
+use crate::loopguard::{Action, LoopGuard};
 use crate::sampling::Params;
 use crate::tok::{Detok, Tok};
 use crate::wire::{self, LpEntry};
@@ -123,6 +124,12 @@ pub struct Generation {
     stats: Option<StepStats>,
     /// with `return_step_stats`, the run a stop string ended: cancelled, its `finish` (and counters) not read yet
     ended: Option<Stream>,
+    /// the loop guard (loopguard.rs), while the think block is open
+    lg: Option<LoopGuard>,
+    /// what the loop guard wants put in after the token just pushed
+    lg_due: Option<Action>,
+    /// pushing tokens the front end put in: the loop guard does not read them
+    lg_quiet: bool,
 }
 
 /// A finish reason PROTOCOL.md does not list, passed through as Python does; each distinct string is stored once.
@@ -190,6 +197,9 @@ impl Generation {
             cont_prompt: 0,
             stats: None,
             ended: None,
+            lg: None,
+            lg_due: None,
+            lg_quiet: false,
         }
     }
 
@@ -255,6 +265,13 @@ impl Generation {
     pub fn thinking(&mut self, think_end: u32, budget: Option<Budget>) {
         self.think_end = Some(think_end);
         self.budget = budget.filter(|b| b.limit > 0 && !b.close.is_empty());
+    }
+
+    /// Watch the think block for verbatim loops (loopguard.rs). Call after `thinking`.
+    pub fn loop_guard(&mut self, g: LoopGuard) {
+        if self.think_end.is_some() {
+            self.lg = Some(g);
+        }
     }
 
     pub fn start(&mut self, engine: &Arc<Engine>) -> Result<(), ApiError> {
@@ -399,8 +416,10 @@ impl Generation {
         loop {
             match old.next().await {
                 Some(Msg::Frame(Kind::Finish, f)) => {
-                    if let Ok(fin) = serde_json::from_slice::<wire::Finish>(&f) {
-                        self.res.cached_tokens = fin.cached_tokens.unwrap_or(0);
+                    if self.runs == 0 {
+                        if let Ok(fin) = serde_json::from_slice::<wire::Finish>(&f) {
+                            self.res.cached_tokens = fin.cached_tokens.unwrap_or(0);
+                        }
                     }
                     self.add_stats(&f);
                     return Ok(());
@@ -437,15 +456,41 @@ impl Generation {
         Ok(())
     }
 
-    /// After a budget cut: end the cut run, then go on from the prompt, the reply and the close.
+    /// The request's sampling for a run that goes on from the reply so far (a budget's close or the loop guard's
+    /// tokens are its last tokens). Inside the think block, the counts that run from the reply's start move by its
+    /// length: the engine's budget insert and the boost's start. Once the block is closed, nothing that needs an open
+    /// block is sent, and a JSON grammar applies from the first token.
+    fn continuation_params(&self) -> wire::GenParams {
+        let mut p = self.params.gen.clone();
+        let n = self.reply.len() as u64;
+        if self.think_end.is_some() {
+            if let Some(b) = p.think_end_boost.as_mut() {
+                b.start = b.start.saturating_sub(n);
+            }
+            if let Some(r) = p.insert.as_mut() {
+                r.after_tokens = r.after_tokens.saturating_sub(n);
+            }
+        } else {
+            p.think_end = None;
+            p.think_end_boost = None;
+            p.seq_thinking = None;
+            p.insert = None;
+            if let Some(g) = p.grammar.as_mut() {
+                g.after_token = None;
+            }
+        }
+        p
+    }
+
+    /// After a budget cut or the loop guard's tokens: end the cut run, then go on from the prompt and the reply.
     async fn continue_after_close(&mut self) -> Result<(), ApiError> {
         if self.stream.is_none() {
             return Ok(());
         }
         self.end_run().await?;
-        self.start_continuation(self.params.gen.clone())?;
-        if !self.keep_reply {
-            self.reply.clear(); // a budget cuts once, and only `resample` needs the reply again
+        self.start_continuation(self.continuation_params())?;
+        if !self.keep_reply && self.lg.is_none() {
+            self.reply.clear(); // a budget cuts once, and only `resample` and the loop guard need the reply again
             self.offsets.clear();
         }
         Ok(())
@@ -478,6 +523,9 @@ impl Generation {
         self.res.text.truncate(cut_bytes);
         if self.think_end.is_some() {
             self.res.reasoning_tokens = cut; // the cut is inside the block: every kept token is reasoning
+            if let Some(lg) = self.lg.as_mut() {
+                lg.rewind(&self.reply, &self.prompt);
+            }
         }
         self.res.completion_tokens = cut;
         if self.keep {
@@ -513,8 +561,14 @@ impl Generation {
             if self.budget_due() {
                 return self.close_think(step);
             }
-            if let Push::StopStr = self.push(tid, lps.next(), &mut step) {
-                return step;
+            match self.push(tid, lps.next(), &mut step) {
+                Push::StopStr => return step,
+                Push::StopId => self.lg_due = None, // the engine ends the run on it
+                Push::Text => {
+                    if let Some(a) = self.lg_due.take() {
+                        return self.loop_insert(step, a);
+                    }
+                }
             }
         }
         step.text = self.release(false);
@@ -527,27 +581,56 @@ impl Generation {
     }
 
     /// Put the budget's close in place of the next token. `max_tokens` may cut the close short.
-    fn close_think(&mut self, mut step: Step) -> Step {
+    fn close_think(&mut self, step: Step) -> Step {
         // the close goes into `reply` (the continuation's prompt) while the budget is still set
         let close = self.budget.as_ref().map_or(&[][..], |b| b.close);
+        let step = match self.put_in(close, step) {
+            Ok(s) => s,
+            Err(s) => return s,
+        };
+        self.budget = None;
+        self.go_on(step)
+    }
+
+    /// Put the loop guard's tokens in after the token that fired it, and go on from them in a new run.
+    fn loop_insert(&mut self, step: Step, a: Action) -> Step {
+        let step = match self.put_in(&a.tokens, step) {
+            Ok(s) => s,
+            Err(s) => return s,
+        };
+        if let Some(lg) = self.lg.as_mut() {
+            lg.inserted(&a.tokens, &self.prompt);
+        }
+        self.go_on(step)
+    }
+
+    /// Push tokens the front end puts in. `max_tokens` may cut them short. Err: the reply ended on one of them (a stop
+    /// string, or a stop id the request named).
+    fn put_in(&mut self, toks: &[u32], mut step: Step) -> Result<Step, Step> {
         let room = (self.params.gen.max_tokens as usize).saturating_sub(self.res.completion_tokens);
-        for &tid in close.iter().take(room) {
-            match self.push(tid, None, &mut step) {
+        for &tid in toks.iter().take(room) {
+            match self.push_quiet(tid, &mut step) {
                 Push::Text => {}
-                Push::StopStr => return step,
+                Push::StopStr => return Err(step),
                 Push::StopId => {
-                    // the request named a token of the close as a stop id: the reply ends on it
                     let reason = self.stop_id_reason(tid as i64);
                     self.res.finish_reason = Some("stop");
                     self.res.stop_reason = Some(reason.clone());
                     step.text = self.release(true);
                     step.finish_reason = Some("stop");
                     step.stop_reason = Some(reason);
-                    return step;
+                    return Err(step);
                 }
             }
         }
-        self.budget = None;
+        Ok(step)
+    }
+
+    /// After put-in tokens: the reply ends at `max_tokens`, else it goes on in a new run at the next `next`.
+    fn go_on(&mut self, mut step: Step) -> Step {
+        if self.think_end.is_none() {
+            self.lg = None; // the block is closed: nothing left to watch
+        }
         if self.res.completion_tokens as u64 >= self.params.gen.max_tokens {
             self.res.finish_reason = Some("length");
             step.text = self.release(true);
@@ -559,6 +642,14 @@ impl Generation {
         step
     }
 
+    /// `push` for a token the front end put in: the loop guard does not see it here (`LoopGuard::inserted` does).
+    fn push_quiet(&mut self, tid: u32, step: &mut Step) -> Push {
+        self.lg_quiet = true;
+        let r = self.push(tid, None, step);
+        self.lg_quiet = false;
+        r
+    }
+
     /// One reply token: counted, kept, detokenized and checked against the stop strings.
     fn push(&mut self, tid: u32, lp: Option<LpEntry>, step: &mut Step) -> Push {
         self.res.completion_tokens += 1;
@@ -566,7 +657,7 @@ impl Generation {
         if self.keep {
             self.res.ids.push(tid);
         }
-        if self.budget.is_some() || self.keep_reply {
+        if self.budget.is_some() || self.keep_reply || self.lg.is_some() {
             self.reply.push(tid);
             self.offsets.push(self.res.text.len());
         }
@@ -580,6 +671,31 @@ impl Generation {
             self.res.reasoning_tokens += 1;
             if tid == end {
                 self.think_end = None;
+                if !self.lg_quiet {
+                    self.lg = None; // the model closed the block (a close put in drops the guard in `go_on`)
+                }
+            } else if let Some(lg) = self.lg.as_mut().filter(|_| !self.lg_quiet) {
+                if let Some((hit, action)) = lg.push(tid, &self.prompt) {
+                    let what = match &action {
+                        None => "logged only",
+                        Some(a) if a.closes => "put in the phrase and the close",
+                        Some(_) => "put in the phrase",
+                    };
+                    log::info!(
+                        "{}: loop guard ({}) trigger {}/{} at reply token {} (thinking token {}): a run of {} tokens \
+                         repeats {} tokens back, {} copies; {what}",
+                        self.id,
+                        lg.spec.mode.name(),
+                        lg.triggers,
+                        lg.spec.max,
+                        self.res.completion_tokens,
+                        hit.at + 1,
+                        hit.run,
+                        hit.period,
+                        hit.copies
+                    );
+                    self.lg_due = action;
+                }
             }
         }
         let min_tokens = self.params.gen.min_tokens as usize;
@@ -1068,6 +1184,154 @@ mod tests {
         let s = g.res.step_stats.unwrap();
         // the engine generated the whole frame the stop string was found in (and ended on its EOS)
         assert_eq!((s.steps, s.generated_tokens, s.accepted_tokens), (2, 6, 4));
+    }
+
+    // ---- the loop guard (loopguard.rs) -------------------------------------------------------------------------
+
+    const C: u32 = 2;
+    const X: u32 = 6;
+    const BANG: u32 = 9;
+    const LOOP: [u32; 4] = [A, B, C, X];
+
+    /// Thinking that loops on "abcx". After the guard's phrase ("z!", the prompt ends with !): `after_phrase`. After a
+    /// close (the prompt ends "\n\n"): two answer tokens and EOS.
+    fn looping(g: &Value, after_phrase: &[u32]) -> Vec<u32> {
+        let last = g["prompt"].as_array().unwrap().last().cloned();
+        if last == Some(json!(NLNL)) {
+            vec![Y, Y, EOS]
+        } else if last == Some(json!(BANG)) {
+            after_phrase.to_vec()
+        } else {
+            LOOP.repeat(50)
+        }
+    }
+    /// after the phrase the reasoning closes on its own
+    fn loops_then_recovers(g: &Value) -> Vec<u32> {
+        looping(g, &[B, END, Y, EOS])
+    }
+    /// after the phrase the loop comes back
+    fn loops_again(g: &Value) -> Vec<u32> {
+        looping(g, &LOOP.repeat(50))
+    }
+
+    async fn run_loop_guard(
+        fake: &FakeEngine,
+        p: Params,
+        budget: usize,
+        spec: &str,
+        keep: bool,
+    ) -> (Vec<Step>, Generation) {
+        let t = tok();
+        let mut g = Generation::new(t, format!("chatcmpl-{}", crate::util::hex_id()), PROMPT.to_vec(), p, false, keep);
+        g.thinking(END, (budget > 0).then_some(Budget { limit: budget, close: &t.think_close }));
+        let spec = crate::loopguard::Spec::parse(spec).unwrap();
+        let phrase = t.encode(&spec.text, false).unwrap();
+        g.loop_guard(LoopGuard::new(spec, phrase, t.think_close.clone()));
+        g.start(&fake.engine).unwrap();
+        let mut steps = Vec::new();
+        while let Some(s) = g.next().await.unwrap() {
+            steps.push(s);
+        }
+        (steps, g)
+    }
+
+    fn cat(parts: &[&[u32]]) -> Vec<u32> {
+        parts.concat()
+    }
+
+    #[tokio::test]
+    async fn the_phrase_goes_in_after_the_third_copy_and_the_reply_goes_on_inside_the_block() {
+        let fake = fake_engine(loops_then_recovers).await;
+        let (steps, g) = run_loop_guard(&fake, params(50, 0), 0, "mode=phrase,min=4,text=z!", true).await;
+        let three = LOOP.repeat(3);
+        let want = cat(&[&three, &[Z, BANG], &[B, END, Y, EOS]]);
+        assert_eq!(g.res.ids, want);
+        assert_eq!(joined(&steps).1, want);
+        assert_eq!(g.res.text, "abcxabcxabcxz!b</think>y");
+        // usage counts each reply token once: the phrase counts, as reasoning; the cut run's tokens past it do not
+        assert_eq!((g.res.completion_tokens, g.res.reasoning_tokens), (want.len(), 16));
+        assert_eq!(g.res.cached_tokens, 200); // the first run's
+        let gens = fake.gens.lock().unwrap().clone();
+        assert_eq!(gens.len(), 2);
+        assert_eq!(gens[1]["prompt"], json!(cat(&[&PROMPT, &three, &[Z, BANG]])));
+        assert_eq!(gens[1]["max_tokens"], json!(50 - 14));
+        // a stream sees the same reply
+        let (steps, g2) = run_loop_guard(&fake, params(50, 0), 0, "mode=phrase,min=4,text=z!", false).await;
+        assert_eq!(joined(&steps), (g.res.text.clone(), want));
+        assert_eq!(g2.res.completion_tokens, g.res.completion_tokens);
+    }
+
+    #[tokio::test]
+    async fn close_puts_the_phrase_and_the_close_in_and_the_answer_follows() {
+        let fake = fake_engine(loops_again).await;
+        let mut p = params(50, 0);
+        p.gen.think_end = Some(END);
+        p.gen.think_end_boost = Some(crate::sampling::Boost { start: 100, per1k: 2.0, max: 10.0 });
+        let (_, g) = run_loop_guard(&fake, p, 0, "mode=close,min=4,text=z!", true).await;
+        let three = LOOP.repeat(3);
+        assert_eq!(g.res.ids, cat(&[&three, &[Z, BANG, NL, END, NLNL], &[Y, Y, EOS]]));
+        assert_eq!(g.res.text, "abcxabcxabcxz!\n</think>\n\nyy");
+        assert_eq!((g.res.completion_tokens, g.res.reasoning_tokens), (20, 16));
+        // the continuation has no open block: no think_end, so no boost
+        let gens = fake.gens.lock().unwrap().clone();
+        assert_eq!(gens.len(), 2);
+        assert_eq!(gens[0]["think_end"], json!(END));
+        assert!(gens[1].get("think_end").is_none() && gens[1].get("think_end_boost").is_none());
+    }
+
+    #[tokio::test]
+    async fn phrase_close_closes_when_the_loop_comes_back_within_the_window() {
+        let fake = fake_engine(loops_again).await;
+        let (_, g) = run_loop_guard(&fake, params(60, 0), 0, "mode=phrase-close,min=4,text=z!", true).await;
+        let three = LOOP.repeat(3);
+        let want = cat(&[&three, &[Z, BANG], &LOOP, &[Z, BANG, NL, END, NLNL], &[Y, Y, EOS]]);
+        assert_eq!(g.res.ids, want);
+        assert_eq!((g.res.completion_tokens, g.res.reasoning_tokens), (want.len(), 22));
+        let gens = fake.gens.lock().unwrap().clone();
+        assert_eq!(gens.len(), 3);
+        assert_eq!(gens[2]["prompt"], json!(cat(&[&PROMPT, &want[..want.len() - 3]])));
+        assert_eq!((gens[1]["max_tokens"].clone(), gens[2]["max_tokens"].clone()), (json!(60 - 14), json!(60 - 23)));
+        // phrase alone puts the phrase in twice (max=2), then the loop runs on to max_tokens
+        let (_, g) = run_loop_guard(&fake, params(60, 0), 0, "mode=phrase,min=4,text=z!", true).await;
+        assert_eq!(&g.res.ids[..24], &cat(&[&three, &[Z, BANG], &LOOP, &[Z, BANG], &LOOP])[..]);
+        assert_eq!((g.res.finish_reason, g.res.completion_tokens), (Some("length"), 60));
+    }
+
+    #[tokio::test]
+    async fn the_engine_budget_and_the_boost_move_by_the_reply_s_length_inside_the_block() {
+        let fake = fake_engine(loops_then_recovers).await;
+        let mut p = params(50, 0);
+        p.gen.think_end = Some(END);
+        p.gen.think_end_boost = Some(crate::sampling::Boost { start: 100, per1k: 2.0, max: 10.0 });
+        p.gen.insert = Some(crate::wire::InsertRule {
+            after_tokens: 39,
+            unless_emitted: Some(END),
+            tokens: tok().think_close.clone(),
+        });
+        run_loop_guard(&fake, p, 0, "mode=phrase,min=4,text=z!", true).await;
+        let gens = fake.gens.lock().unwrap().clone();
+        assert_eq!(gens[1]["think_end"], json!(END));
+        assert_eq!(gens[1]["think_end_boost"]["start"], json!(100 - 14));
+        assert_eq!(gens[1]["insert"][0]["after_tokens"], json!(39 - 14));
+    }
+
+    #[tokio::test]
+    async fn a_front_end_budget_still_closes_after_the_phrase() {
+        let fake = fake_engine(loops_again).await;
+        let (_, g) = run_loop_guard(&fake, params(50, 0), 20, "mode=phrase,min=4,max=1,text=z!", true).await;
+        // 14 tokens, five more of the loop, then the budget's 20th token is the close
+        let want = cat(&[&LOOP.repeat(3), &[Z, BANG], &LOOP, &[A], &[NL, END, NLNL], &[Y, Y, EOS]]);
+        assert_eq!(g.res.ids, want);
+        assert_eq!(g.res.reasoning_tokens, 21);
+        assert_eq!(fake.gens.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn log_mode_changes_nothing() {
+        let fake = fake_engine(loops_again).await;
+        let (_, g) = run_loop_guard(&fake, params(40, 0), 0, "mode=log,min=4", true).await;
+        assert_eq!(g.res.ids, LOOP.repeat(10));
+        assert_eq!(fake.gens.lock().unwrap().len(), 1);
     }
 
     // ---- the repeated-tool-call guard (guard.rs) ---------------------------------------------------------------
