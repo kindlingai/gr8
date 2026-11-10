@@ -185,6 +185,46 @@ class MembershipTests(unittest.TestCase):
             M.member_rails(snap, ['n1', 'n2'], {'n2': '10.0.0.2'})
         self.assertIn('10.0.0.2 has 1 rdma-tagged addresses', str(e.exception))
 
+    def test_rails_come_from_a_member_when_the_mentat_head_is_not_one(self):
+        # two members, each with a switch-side port (10.110.1/10.111.1) and a direct cable between them
+        # (10.110.2/10.111.2); the mentat head is not a member, so its probe table says nothing about them
+        def box(me, ip, peer, peer_ip, sw, cable, peer_sw, peer_cable, probed):
+            tags = {a: ['connectx', 'rdma'] for a in (f'10.110.1.{sw}', f'10.111.1.{sw}', f'10.110.2.{cable}',
+                                                      f'10.111.2.{cable}')}
+            peer_tags = {a: ['connectx', 'rdma'] for a in (f'10.110.1.{peer_sw}', f'10.111.1.{peer_sw}',
+                                                           f'10.110.2.{peer_cable}', f'10.111.2.{peer_cable}')}
+            ok = {'ok': True}
+            probes = {f'10.110.2.{cable}': {f'10.110.2.{peer_cable}': ok},
+                      f'10.111.2.{cable}': {f'10.111.2.{peer_cable}': ok}} if probed else {}
+            return {'node_id': me, 'node_ip': ip, 'addr_tags': tags,
+                    'addr_ifaces': {f'10.110.1.{sw}': 'enp1s0f1np1', f'10.111.1.{sw}': 'enP2p1s0f1np1',
+                                    f'10.110.2.{cable}': 'enp1s0f0np0', f'10.111.2.{cable}': 'enP2p1s0f0np0'},
+                    'peers': {peer: {'node_ip': peer_ip, 'addr_tags': peer_tags, 'probes': probes}}}
+        head = box('h', '10.0.0.9', 'x', '10.0.0.8', 9, 9, 8, 8, False)
+        head['peers'].update({n: {'node_ip': ip, 'addr_tags': {a: ['connectx', 'rdma'] for a in addrs}}
+                              for n, ip, addrs in (('a', '10.0.0.1', ('10.110.1.1', '10.111.1.1', '10.110.2.0',
+                                                                       '10.111.2.0')),
+                                                   ('b', '10.0.0.2', ('10.110.1.2', '10.111.1.2', '10.110.2.1',
+                                                                       '10.111.2.1')))})
+        # the head's view alone: each member's two lowest, on two different cables (the bug)
+        self.assertEqual(M.member_rails(head, ['a', 'b'])['a'], ('10.110.1.1', '10.110.2.0'))
+        local = box('a', '10.0.0.1', 'b', '10.0.0.2', 1, 0, 2, 1, True)
+
+        class D:
+            def local_status(self):
+                return local
+        view = M.rails_view(D(), head, ['a', 'b'])
+        self.assertIs(view, local)
+        self.assertEqual(M.member_rails(view, ['a', 'b']), {'a': ('10.110.2.0', '10.111.2.0'),
+                                                          'b': ('10.110.2.1', '10.111.2.1')})
+        # a member's own group snapshot is used as it is; a daemon that cannot answer leaves the head's
+        self.assertIs(M.rails_view(D(), local, ['a', 'b']), local)
+
+        class Down:
+            def local_status(self):
+                raise OSError('refused')
+        self.assertIs(M.rails_view(Down(), head, ['a', 'b']), head)
+
     def test_probe_problems(self):
         local = {'peers': {'n2': {'probes': {'10.1.0.1': {'10.1.0.2': {'ok': False}, '10.2.0.2': {'ok': True}},
                                              '10.2.0.1': {'10.2.0.2': {'ok': True}}}}}}

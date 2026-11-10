@@ -1,11 +1,13 @@
-// DS41 image input, host side: a request's images (PROTOCOL.md `images`, the shim's `img` header fields), their checks
-// against the prompt, and the digest that keeps image prompts apart in the prefix cache. No CUDA types.
+// Image input, host side (DS41, docs/DS41-VISION.md; GLM-5.3-Flash, docs/FLASH-VISION.md): a request's images
+// (PROTOCOL.md `images`, the shim's `img` header fields), their checks against the prompt, and the digest that keeps
+// image prompts apart in the prefix cache. No CUDA types.
 //
-// `img <pos>:<vit_h>:<vit_w>:<key>:<rgb base64>`: the span starts at prompt index pos and is ds41v::grid_of(vit_h, vit_w)
-// .span() image tokens long; rgb is the padded image, (vit_h * 14) x (vit_w * 14) RGB bytes. key is the front end's
-// (logs only): the engine digests the pixels itself (image_digest).
+// `img <pos>:<vit_h>:<vit_w>:<key>:<rgb base64>`: the span starts at prompt index pos and is image_model().span(vit_h,
+// vit_w) image tokens long. rgb is the padded image, (vit_h * 14) x (vit_w * 14) RGB bytes (both models use 14 px
+// patches). key is the front end's (logs only): the engine digests the pixels itself (image_digest).
 #pragma once
 #include "ds41_vision_plan.h"
+#include "flash_vision_plan.h"
 #include "../engram/sha256.h"
 
 #include <array>
@@ -17,8 +19,28 @@
 
 namespace g6rt {
 
-constexpr int TOK_IMAGE = 129264;    // [cfg] image_token_id: <｜deepseek_image｜>, and every row of an image span
+constexpr int TOK_IMAGE = 129264;    // [cfg] DS41 image_token_id: <｜deepseek_image｜>, and every row of an image span
+constexpr int TOK_IMAGE_GLM5V = 154854;   // [cfg] GLM-5.3-Flash image_token_id: <|image|>, every row of an image span
 constexpr int IMAGES_MAX = 16;       // per request (the front end's limit)
+constexpr int IMAGE_PATCH = 14;      // both models' patch size: the rgb is (vit_h * 14) x (vit_w * 14)
+
+// The image geometry of the engine's model: its image token and the span of a patch grid (0: a grid its processor
+// cannot produce).
+struct ImageModel {
+    const char* name;
+    int token;
+    int (*span)(int vit_h, int vit_w);
+};
+inline int ds41_span(int vit_h, int vit_w) { const ds41v::Grid g = ds41v::grid_of(vit_h, vit_w); return g.ok ? g.span() : 0; }
+inline int glm5v_span(int vit_h, int vit_w) { return glm5v::span_of(vit_h, vit_w); }
+constexpr ImageModel DS41_IMAGES{"ds41", TOK_IMAGE, ds41_span};
+constexpr ImageModel GLM5V_IMAGES{"glm5v", TOK_IMAGE_GLM5V, glm5v_span};
+// the build's model (a host test that runs both models sets it)
+#if defined(G6_MODEL_FLASH) && G6_MODEL_FLASH
+inline ImageModel& image_model() { static ImageModel m = GLM5V_IMAGES; return m; }
+#else
+inline ImageModel& image_model() { static ImageModel m = DS41_IMAGES; return m; }
+#endif
 
 struct ImageIn {
     int pos = 0, vit_h = 0, vit_w = 0, span = 0;
@@ -26,7 +48,7 @@ struct ImageIn {
     std::shared_ptr<const std::vector<uint8_t>> rgb;   // vit_h * 14 * vit_w * 14 * 3 bytes
 };
 
-// The engine runs images only with the vision tower loaded (GR8_DS_VISION, g6m4.cu sets this at boot).
+// The engine runs images only with the vision tower loaded (GR8_DS41_VISION / GR8_GLM53F_VISION, g6m4.cu sets this at boot).
 inline bool& vision_flag() { static bool on = false; return on; }
 inline bool vision_ready() { return vision_flag(); }
 
@@ -80,11 +102,10 @@ inline ImageIn parse_field(const std::string& v) {
     im.key = v.substr(c[2] + 1, c[3] - c[2] - 1);
     if (im.key.size() != 16) fail("key must be 16 hex digits");
     for (char h : im.key) if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f'))) fail("key must be 16 hex digits");
-    const ds41v::Grid g = ds41v::grid_of(im.vit_h, im.vit_w);
-    if (!g.ok) fail("bad patch grid");
-    im.span = g.span();
+    im.span = image_model().span(im.vit_h, im.vit_w);
+    if (!im.span) fail("bad patch grid");
     auto rgb = std::make_shared<std::vector<uint8_t>>(b64_decode(v.substr(c[3] + 1)));
-    if (rgb->size() != size_t(im.vit_h) * im.vit_w * ds41v::PATCH * ds41v::PATCH * 3) fail("rgb size does not match the grid");
+    if (rgb->size() != size_t(im.vit_h) * im.vit_w * IMAGE_PATCH * IMAGE_PATCH * 3) fail("rgb size does not match the grid");
     im.rgb = std::move(rgb);
     return im;
 }
@@ -92,10 +113,11 @@ inline ImageIn parse_field(const std::string& v) {
 // Spans ascend, do not overlap, lie inside the prompt and are all image tokens.
 inline void check(const std::vector<int>& prompt, const std::vector<ImageIn>& images) {
     if (images.size() > size_t(IMAGES_MAX)) fail("too many images");
+    const int tok = image_model().token;
     int64_t end = 0;
     for (const auto& im : images) {
         if (im.pos < end || int64_t(im.pos) + im.span > int64_t(prompt.size())) fail("image spans must ascend inside the prompt");
-        for (int i = im.pos; i < im.pos + im.span; ++i) if (prompt[size_t(i)] != TOK_IMAGE) fail("an image span holds a non-image token");
+        for (int i = im.pos; i < im.pos + im.span; ++i) if (prompt[size_t(i)] != tok) fail("an image span holds a non-image token");
         end = int64_t(im.pos) + im.span;
     }
 }
@@ -122,7 +144,7 @@ inline std::array<uint8_t, 32> digest(const std::vector<ImageIn>& images) {
 inline const char* refusal(const std::vector<int>& prompt, const std::vector<ImageIn>& images, bool decode_prompt) {
     if (images.empty()) return "";
     if (!vision_ready()) return "the engine was started without the vision tower";
-    if (decode_prompt) return "an image prompt must prefill (no prompt_logprobs, no steering, GR8_DS_PREFILL_MIN on)";
+    if (decode_prompt) return "an image prompt must prefill (no prompt_logprobs, no steering; DS41: GR8_DS_PREFILL_MIN on)";
     const auto& last = images.back();
     if (size_t(last.pos) + size_t(last.span) >= prompt.size()) return "the prompt ends inside an image span";
     return "";

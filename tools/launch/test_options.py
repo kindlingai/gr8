@@ -161,11 +161,16 @@ class ValidateTests(unittest.TestCase):
         self.check(['--peers', PEERS, '--default-max-tokens', '4k'], 'want a whole number')
         self.check(['--peers', PEERS, '--default-reasoning-effort', 'none'], 'cannot turn thinking off')
         self.check(['--peers', PEERS, '--default-reasoning-effort', 'auto'], 'want minimal, low, medium')
-        self.check(['--peers', PEERS, '--default-thinking-budget', '-1'], 'want a whole number')
+        for bad in ('-1', '4k', '1.5x', '0.5', '16384|', '16384|0.5', '0.5x|16384', '16384|1.5x', '1|2|0.5x', '0|0.5x'):
+            self.check(['--peers', PEERS, '--default-thinking-budget', bad], '--default-thinking-budget')
+        self.check(['--peers', PEERS, '--default-thinking-budget', '-1'], 'want a token count')
+        self.check(['--peers', PEERS, '--default-thinking-budget', '1.5x'], 'want a fraction from 0x to 1x')
         o = opt.parse(['--no-config', '--peers', PEERS, '--default-reasoning-effort', 'medium',
                        '--default-thinking-budget', '4096'], GLM)
         opt.validate(o)
         self.assertEqual((o.get('DEFAULT_REASONING_EFFORT'), o.get('DEFAULT_THINKING_BUDGET')), ('medium', '4096'))
+        for ok in ('0', '0.8x', '32768|0.8x', ' 32768 | 0.8x '):
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-thinking-budget', ok], GLM))
         self.check(['--peers', PEERS, '--default-presence-penalty', '2.5'], 'must be in -2..2')
         self.check(['--peers', PEERS, '--default-frequency-penalty', 'x'], 'is not a number')
         self.check(['--peers', PEERS, '--default-presence-penalty', 'thinking=0.5,warm=1'], 'want base=')
@@ -192,12 +197,16 @@ class ValidateTests(unittest.TestCase):
         self.assertEqual((o.get('DEFAULT_PRESENCE_PENALTY'), o.get('DEFAULT_FREQUENCY_PENALTY')),
                          ('thinking=0.5, greedy=0.2,nongreedy=0', '-0.5'))
         self.check(['--peers', PEERS, '--default-think-end-boost', 'start=0.5x,ramp=2,max=10'], 'want start=, per1k= or max=')
-        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=1.5x,per1k=2,max=10'], 'want 0 to 1')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=1.5x,per1k=2,max=10'], 'want a fraction from 0x')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=16384|1.5x,per1k=2,max=10'], 'from 0x to 1x')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=0.5x|16384,per1k=2,max=10'], 'want a token count')
+        self.check(['--peers', PEERS, '--default-think-end-boost', 'start=16384|0.5,per1k=2,max=10'], 'want a token count')
         self.check(['--peers', PEERS, '--default-think-end-boost', 'start=-1,per1k=2,max=10'], 'want a token count')
         self.check(['--peers', PEERS, '--default-think-end-boost', 'start=1,per1k=2,max=21'], 'want 0 to 20')
         self.check(['--peers', PEERS, '--default-think-end-boost', 'start=1,per1k=x,max=1'], 'is not a number')
         self.check(['--peers', PEERS, '--default-think-end-boost', 'max=1,max=2'], 'given twice')
-        for ok in ('start=0.5x,per1k=2,max=10', 'start=4096, per1k=0.5, max=1.5', 'per1k=1,max=1'):
+        for ok in ('start=0.5x,per1k=2,max=10', 'start=4096, per1k=0.5, max=1.5', 'per1k=1,max=1',
+                   'start=16384|0.5x,per1k=2,max=10'):
             opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-think-end-boost', ok], GLM))
         self.check(['--peers', PEERS, '--default-sequence-penalty', 'reply=1:1:1:1'], 'want thinking=, answer= or guard=')
         self.check(['--peers', PEERS, '--default-sequence-penalty', 'thinking=1:1:1'], 'want mult:base:min:cap')
@@ -216,6 +225,8 @@ class ValidateTests(unittest.TestCase):
         self.assertEqual((o.get('TOOL_REPEAT_GUARD'), o.get('TOOL_REPEAT_GUARD_REPEATS'), o.get('TOOL_REPEAT_GUARD_TEMPERATURE'),
                           o.get('TOOL_REPEAT_GUARD_RETRIES')), ('1', '2', '0.7', '3'))
         self.check(['--peers', PEERS, '--allow-thinking-off', 'yes'], 'want 0 or 1')
+        self.check(['--peers', PEERS, '--clamp-max-tokens', 'on'], '--clamp-max-tokens on: want 0 or 1')
+        self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('CLAMP_MAX_TOKENS'), '0')
         self.check(['--peers', PEERS, '--undeclared-tool-calls', 'on'], 'want text or emit')
         self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('UNDECLARED_TOOL_CALLS'), 'text')
         self.check(['--peers', PEERS, '--grammar', '2'], 'want 0 or 1')

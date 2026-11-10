@@ -12,6 +12,7 @@ def main():
 #include <cassert>
 #include <cstdio>
 #include <stdexcept>
+#include <functional>
 #include <string>
 struct Dev { unsigned* error; };
 struct Fabric {
@@ -26,6 +27,7 @@ struct Context {
     Fabric main_fabric, draft_fabric, prefill_fabric, prefill_fabric2;
     unsigned main = 0;
     struct Draft { unsigned d = 0; } draft;
+    std::function<unsigned()> cp_pf_error; // the staging fabric's error word, set only with CP prefill staging
 } c;
 struct Config { bool two_lanes = false; } sc;
 unsigned attn_errors(unsigned m) { return m; }
@@ -54,7 +56,11 @@ int main() {
         f->error = 1; expect("Flash serve fabric/attention error"); f->error = 0;
     }
     c.main = 1; expect("Flash serve fabric/attention error"); c.main = 0;
-    c.draft.d = 1; expect("Flash serve fabric/attention error");
+    c.draft.d = 1; expect("Flash serve fabric/attention error"); c.draft.d = 0;
+    unsigned staged_error = 0;
+    c.cp_pf_error = [&] { return staged_error; };
+    expect(""); // CP prefill staging on, no error
+    staged_error = 1; expect("Flash serve fabric/attention error");
     std::printf("flash_serve_check: PASS %d CPU mock cases (actual serve lambda)\n", cases);
 }
 '''

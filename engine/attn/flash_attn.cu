@@ -6,8 +6,10 @@
 //   select   indices[r] = kpool selection (kpool.cuh), or a copy of reuse_indices
 //   attend   q_abs[h] = q_b[h] (256) @ UK[h] (256 x 512); s_j = q_abs . latent[id_j] / 16; p = softmax(s);
 //            ctx = sum_j p_j latent[id_j]; output[h] = UV[h] (256 x 512) @ ctx, FP16 [rows][heads][256]
-// Not in the Flash build: context-parallel decode (the cp entry points return cudaErrorNotSupported), the QO pair
-// prefill and the prefill traces. g6_attn_bind_prefill_run runs the decode path over the rows (same results, query tiles).
+// Context-parallel decode (attn.h G6_CP, a CP binding from flash_bind.cu): the five stages below run_body, over pools in
+// place of keys; the prefill runs on a CP binding only below R (the replicated path). Not in the Flash build: the QO
+// pair prefill and the prefill traces. g6_attn_bind_prefill_run runs the decode path over the rows (same results, query
+// tiles).
 #include "attn.h"
 #include "bind.h"
 #include "replay.h"
@@ -51,7 +53,11 @@ __device__ __forceinline__ DeviceAttn resolve(G6Attn fixed){
 }
 __device__ __forceinline__ DeviceAttn resolve(ReplayInput input){
     DeviceAttn a=resolve(input.fixed);
+#if defined(G6_CP) && G6_CP
+    a.live_context=input.cell->context;if(!a.cp_nr)a.page_count=input.cell->page_count;   // CP: physical pages are fixed
+#else
     a.live_context=input.cell->context;a.page_count=input.cell->page_count;
+#endif
     a.table_size=input.cell->table_size;a.reuse_rows=input.cell->reuse_rows;
     a.active=input.cell->valid!=0;return a;
 }
@@ -61,19 +67,31 @@ __device__ __forceinline__ void for_row(DeviceAttn&,const G6Attn&,int){}
 __device__ __forceinline__ void for_row(DeviceAttn& a,const ReplayInput& in,int r){
     const G6AttnRow* rows=in.cell->rows;if(!rows)return;
     const G6AttnRow x=rows[r];
-    a.block_table=x.table;a.live_context=x.context;a.table_size=x.table_size;a.page_count=x.page_count;
+    a.block_table=x.table;a.live_context=x.context;a.table_size=x.table_size;
+#if defined(G6_CP) && G6_CP
+    if(!a.cp_nr)a.page_count=x.page_count;
+#else
+    a.page_count=x.page_count;
+#endif
 }
 #define FOR_ROW(a,in,r) fa::for_row(a,in,r)
 #else
 #define FOR_ROW(a,in,r)
 #endif
-// the GLM validate_replay without the CP terms (same error bits: 32 bounds, 1 position, 2 page, 8 reuse row)
+// the GLM validate_replay (same error bits: 32 bounds, 1 position, 2 page, 8 reuse row). CP: page_count is the
+// binding's physical pages and a row's page may be G6_CP_REMOTE (another rank stores it)
+#if defined(G6_CP) && G6_CP
+#define CP_PAGES(f,n) ((f).cp_nr||((n)>0&&(n)<=(f).page_count))
+#define CP_PAGE_OK(f,pg,n) (((f).cp_nr&&(pg)==G6_CP_REMOTE)||((pg)>=0&&(pg)<((f).cp_nr?(f).page_count:(n))))
+#else
+#define CP_PAGES(f,n) ((n)>0&&(n)<=(f).page_count)
+#define CP_PAGE_OK(f,pg,n) ((pg)>=0&&(pg)<(n))
+#endif
 __global__ void validate_replay(G6Attn fixed,G6AttnStepCell* cell){
     const int t=threadIdx.x;
     if(t==0)*fixed.error=0;
     __syncthreads();
-    const bool bounds=cell->context>0&&cell->context<=fixed.context&&
-        cell->page_count>0&&cell->page_count<=fixed.page_count&&
+    const bool bounds=cell->context>0&&cell->context<=fixed.context&&CP_PAGES(fixed,cell->page_count)&&
         cell->table_size>0&&cell->table_size<=fixed.table_size&&
         ((int64_t)cell->context+fixed.page_size-1)/fixed.page_size<=cell->table_size&&
         (fixed.reuse_indices?(cell->reuse_rows>0&&cell->reuse_rows<=fixed.reuse_rows&&
@@ -86,14 +104,14 @@ __global__ void validate_replay(G6Attn fixed,G6AttnStepCell* cell){
         int sess=0;
         if(cell->rows){
             const G6AttnRow x=cell->rows[row];
-            const bool ok=x.table&&x.context>0&&x.context<=fixed.context&&x.page_count>0&&x.page_count<=fixed.page_count&&
+            const bool ok=x.table&&x.context>0&&x.context<=fixed.context&&CP_PAGES(fixed,x.page_count)&&
                 x.table_size>0&&x.table_size<=fixed.table_size&&((int64_t)x.context+fixed.page_size-1)/fixed.page_size<=x.table_size;
             if(!ok){atomicOr(fixed.error,32u);continue;}
             ctx=x.context;pages=x.page_count;sess=x.sess;table=x.table;
         }
 #endif
         if(pos<0||pos>=ctx)atomicOr(fixed.error,1u);
-        else{const int pg=table[pos/fixed.page_size];if(pg<0||pg>=pages)atomicOr(fixed.error,2u);}
+        else{const int pg=table[pos/fixed.page_size];if(!CP_PAGE_OK(fixed,pg,pages))atomicOr(fixed.error,2u);}
 #ifdef DEC_S2
         if(cell->rows){for(int j=0;j<row;j++)if(pos==fixed.positions[j]&&cell->rows[j].sess==sess)atomicOr(fixed.error,1u);}
         else
@@ -120,6 +138,18 @@ __device__ int page(const DeviceAttn& a,int pos){
 __device__ __forceinline__ const uint8_t* kv_at(const DeviceAttn& a,int pos){
     const int p=page(a,pos);return p<0?nullptr:(const uint8_t*)a.mla_cache+((int64_t)p*a.page_size+pos%a.page_size)*g6kv::ROW;
 }
+#if defined(G6_CP) && G6_CP
+// CP: the rank that scores position pos (its pool in the indexer, its key in the attention partial); every position is
+// scored by exactly one rank. A pool's 4 positions share a page, so a pool has one owner
+__device__ __forceinline__ bool cp_mine(const G6Attn& a,int pos){return !a.cp_nr||(pos/a.page_size)%a.cp_nr==a.cp_rank;}
+// CP: a row whose page another rank stores appends nothing here (its owner appends it)
+__device__ __forceinline__ bool cp_remote(const G6Attn& a,int pos){
+    return a.cp_nr&&pos>=0&&pos/a.page_size<a.table_size&&a.block_table[pos/a.page_size]==G6_CP_REMOTE;
+}
+#else
+__device__ __forceinline__ bool cp_mine(const G6Attn&,int){return true;}
+__device__ __forceinline__ bool cp_remote(const G6Attn&,int){return false;}
+#endif
 // latent element d of a cached row; lat4: elements d..d+3 (d % 4 == 0)
 #if G6_KV4
 __device__ __forceinline__ float i4(unsigned code){return (float)((int)(code&15)-8);}
@@ -152,6 +182,7 @@ template<class Input>
 __global__ void append_kv(Input input){
     auto a=resolve(input);if(!a.active)return;
     const int row=blockIdx.x,t=threadIdx.x,pos=a.positions[row],w=t>>5,lane=t&31;FOR_ROW(a,input,row);
+    if(cp_remote(a,pos))return;
     const int pg=page(a,pos);if(pg<0)return;
     __shared__ float red[8][2];
     const float x0=hfloat(a.kv_a,(int64_t)row*LAT+t),x1=hfloat(a.kv_a,(int64_t)row*LAT+t+256);
@@ -242,8 +273,8 @@ __global__ void absorb(Input input,int start,int n,float* q){
     }
 }
 // grid (TOP / 32, ceil(heads / HC), rows), 256 threads: warp w scores slots 4w..4w+3 of the CTA's 32 for HC heads; lane
-// holds dims 4 lane + 128 k, k = 0..3
-template<class Input>
+// holds dims 4 lane + 128 k, k = 0..3. CP: only the keys this rank scores (cp_mine); the others score -inf
+template<bool CP=false,class Input>
 __global__ void mla_scores(Input input,int start,const float* q,float* score){
     auto a=resolve(input);if(!a.active)return;
     const int row=blockIdx.z,r=start+row,h0=blockIdx.y*HC,nh=min(HC,a.heads-h0),t=threadIdx.x,w=t>>5,lane=t&31;FOR_ROW(a,input,r);
@@ -251,7 +282,7 @@ __global__ void mla_scores(Input input,int start,const float* q,float* score){
     __shared__ unsigned sh_mask;
     if(w==0){
         const int j=blockIdx.x*32+lane,id=a.indices[(int64_t)r*TOP+j];
-        const uint8_t* v=(id>=0&&id<=a.positions[r])?kv_at(a,id):nullptr;
+        const uint8_t* v=(id>=0&&id<=a.positions[r]&&(!CP||cp_mine(a,id)))?kv_at(a,id):nullptr;
         sh_v[lane]=v;
         const unsigned m=__ballot_sync(0xffffffff,v!=nullptr);
         if(lane==0)sh_mask=m;
@@ -405,9 +436,6 @@ __global__ void value_project(Input input,int start,int n,const float* context){
 struct Work { float *q,*ps,*prob,*parts,*ctx,*cs[2]; int* ci[2]; int pstride,tstride; size_t total; };
 static int pool_stride(int context){return ((context+KP-1)/KP+31)/32*32;}
 static bool valid(const G6Attn& a){
-#if defined(G6_CP) && G6_CP
-    if(a.cp_nr)return false;
-#endif
     return a.rows>0&&(a.heads==g6nr::HMIN||a.heads==g6nr::HMAX)&&a.context>0&&a.page_size==g6kv::PAGE&&a.page_count>0&&
         a.table_size>0&&a.query_tile>0&&a.query_tile<=64&&a.context<=INT_MAX/a.query_tile;
 }
@@ -468,6 +496,220 @@ static bool run_ok(const G6Attn& a){
     return a.q_b&&a.uk&&a.uv&&a.indices&&a.output&&(a.reuse_indices||(a.index_q&&a.index_weight))&&
         !(a.reuse_row_map&&a.reuse_indices==a.indices);
 }
+#if defined(G6_CP) && G6_CP
+// ---- context-parallel decode. Pages past R live on one rank each ((pos / 64) % cp_nr == cp_rank), the first R tokens on
+// every rank; every pool and key is scored by one rank (cp_mine), the prefix too. A candidate is a pool as the key
+// kp_select orders by: kp_key(score) << 32 | (0xffffffff - pool), so a larger key is a higher score, ties to the lower
+// pool; 0 = none. Every pool has one owner, so keys are distinct and the order is total.
+constexpr int CPT=g6kv::TOP_POOLS;   // threads of cp_local / cp_merge, and the candidates of a rank a row
+__device__ __forceinline__ uint64_t cp_key(float s,int p){return ((uint64_t)kp_key(s)<<32)|(0xffffffffu-(uint32_t)p);}
+// warp 0: kp_pick on 64-bit keys; *all_s = the chosen bin holds exactly the keys still needed
+__device__ __forceinline__ void cp_pick(const int* hist,int k,uint64_t prefix,int shift,uint64_t* prefix_s,int* need_s,int* all_s){
+    const int lane=threadIdx.x&31;
+    int h[8],loc=0;
+    #pragma unroll
+    for(int j=0;j<8;j++){h[j]=hist[255-8*lane-j];loc+=h[j];}
+    int inc=loc;
+    #pragma unroll
+    for(int d=1;d<32;d<<=1){const int v=__shfl_up_sync(0xffffffffu,inc,d);if(lane>=d)inc+=v;}
+    int acc=inc-loc,jb=-1;
+    #pragma unroll
+    for(int j=0;j<8;j++)if(jb<0&&255-8*lane-j>0){if(acc+h[j]>=k)jb=j;else acc+=h[j];}
+    const unsigned found=__ballot_sync(0xffffffffu,jb>=0);
+    const int src=found?__ffs(found)-1:31;
+    if(lane==src){const int b=found?255-8*lane-jb:0;*prefix_s=prefix|((uint64_t)b<<shift);*need_s=k-acc;*all_s=hist[b]==k-acc;}
+}
+// CPT threads: a threshold thr such that exactly k of the keys key(0..n-1) are >= thr (keys distinct where nonzero; k <= the
+// nonzero ones): radix passes of 8 bits from the top, until the boundary bin holds exactly the keys still needed (its
+// lower bits then 0); at most 8 passes, about 3 for float scores
+template<class F>
+__device__ uint64_t cp_kth(F key,int n,int k){
+    __shared__ int hist[256],need_s,all_s;__shared__ uint64_t prefix_s;
+    const int t=threadIdx.x;uint64_t prefix=0,mask=0;
+    for(int pass=0;pass<8;pass++){const int shift=56-8*pass;
+        for(int i=t;i<256;i+=CPT)hist[i]=0;
+        __syncthreads();
+        for(int i=t;i<n;i+=CPT){const uint64_t x=key(i);if((x&mask)==prefix)atomicAdd(&hist[(x>>shift)&255],1);}
+        __syncthreads();
+        if(t<32)cp_pick(hist,k,prefix,shift,&prefix_s,&need_s,&all_s);
+        __syncthreads();
+        prefix=prefix_s;k=need_s;mask|=(uint64_t)255<<shift;
+        const bool done=all_s;
+        __syncthreads();
+        if(done)break;
+    }
+    return prefix;
+}
+// CPT threads: the keys key(0..n-1) at least thr (nonzero), in index order -> out[0..), zeros after them up to CPT;
+// returns the count
+template<class F>
+__device__ int cp_keep(F key,int n,uint64_t thr,uint64_t* out){
+    typedef cub::BlockScan<int,CPT> Scan;
+    __shared__ typename Scan::TempStorage ts;__shared__ int base_s;
+    const int t=threadIdx.x;
+    if(t==0)base_s=0;
+    __syncthreads();
+    for(int c=0;c<n;c+=CPT){
+        const int i=c+t;const uint64_t x=i<n?key(i):0;const bool in=x&&x>=thr;
+        int o,tot;Scan(ts).ExclusiveSum(in?1:0,o,tot);
+        if(in)out[base_s+o]=x;
+        __syncthreads();
+        if(t==0)base_s+=tot;
+        __syncthreads();
+    }
+    const int kept=base_s;
+    for(int j=kept+t;j<CPT;j+=CPT)out[j]=0;
+    return kept;
+}
+// grid rows, CPT threads: this rank's running top-512 of row r, cand[cp_rank][r][0..512) (any order, 0 = none), after the
+// pools of tile [t0, t0 + nt) (kp_scores<true> wrote my visible ones at scores[row * tstride + p - t0]). The list before
+// tile 0 is empty. The top 512 of a set is the top 512 of (the top 512 of its first part, the rest), so after the last
+// tile the list is my top 512 of every pool I own. A row with at most 512 visible pools needs none (cp_merge takes them
+// all, as kp_select).
+template<class Input>
+__global__ void __launch_bounds__(CPT) cp_local(Input input,int start,const float* scores,int tstride,uint64_t* cand,int t0,int nt){
+    auto a=resolve(input);if(!a.active)return;
+    const int row=blockIdx.x,r=start+row,t=threadIdx.x;FOR_ROW(a,input,r);
+    uint64_t* L=cand+((int64_t)a.cp_rank*a.rows+r)*CPT;
+    const int nvis=kp_visible(a,r);
+    if(nvis<=g6kv::TOP_POOLS){if(!t0)L[t]=0;return;}
+    __shared__ uint64_t carry[CPT];
+    carry[t]=t0?L[t]:0;
+    __syncthreads();
+    const float* s=scores+(int64_t)row*tstride;
+    const int n=CPT+max(0,min(t0+nt,nvis)-t0);   // the list's slots, then the tile's visible pools
+    auto key=[&](int i)->uint64_t{if(i<CPT)return carry[i];const int p=t0+i-CPT;return cp_mine(a,p*KP)?cp_key(s[p-t0],p):0;};
+    __shared__ int cnt_s;
+    if(t==0)cnt_s=0;
+    __syncthreads();
+    int c=0;for(int i=t;i<n;i+=CPT)c+=key(i)!=0;
+    atomicAdd(&cnt_s,c);
+    __syncthreads();
+    const uint64_t thr=cnt_s<=CPT?1:cp_kth(key,n,CPT);
+    cp_keep(key,n,thr,L);
+}
+// grid rows, CPT threads: the global top-512 of row r from every rank's list (cand [cp_nr][rows][512]) -> indices[r], as
+// kp_select writes it: the selected pools' positions in ascending pool order, then the incomplete tail, -1 after.
+// The top 512 of the union of every rank's top 512 is the top 512 of all pools, and a pool's score is the same bits on
+// its owner as in the replicated kp_scores, so the list is the replicated list. Error 128: fewer than 512 candidates.
+template<class Input>
+__global__ void __launch_bounds__(CPT) cp_merge(Input input,int start,const uint64_t* cand){
+    auto a=resolve(input);if(!a.active)return;
+    const int row=blockIdx.x,r=start+row,t=threadIdx.x;FOR_ROW(a,input,r);
+    const int nvis=kp_visible(a,r),cnt=a.positions[r]+1,tail0=cnt-cnt%KP;
+    int* out=a.indices+(int64_t)r*TOP;
+    int nsel;
+    if(nvis<=g6kv::TOP_POOLS){
+        for(int p=t;p<nvis;p+=CPT){
+            #pragma unroll
+            for(int j=0;j<KP;j++)out[p*KP+j]=p*KP+j;
+        }
+        nsel=nvis*KP;
+    }else{
+        __shared__ uint64_t all[8*CPT];
+        __shared__ uint64_t top[CPT];
+        const int n=a.cp_nr*CPT;
+        for(int i=t;i<n;i+=CPT)all[i]=cand[((int64_t)(i/CPT)*a.rows+r)*CPT+i%CPT];
+        __syncthreads();
+        auto key=[&](int i)->uint64_t{return all[i];};
+        const uint64_t thr=cp_kth(key,n,CPT);
+        const int kept=cp_keep(key,n,thr,top);
+        if(t==0&&kept!=CPT)error(a,128);
+        __syncthreads();
+        // pool ascending: a selected pool's place is the count of selected pools below it
+        const uint64_t x=top[t];
+        if(x){const unsigned p=0xffffffffu-(unsigned)x;int o=0;
+            for(int j=0;j<CPT;j++){const uint64_t y=top[j];o+=y&&(0xffffffffu-(unsigned)y)<p;}
+            #pragma unroll
+            for(int j=0;j<KP;j++)out[o*KP+j]=(int)p*KP+j;}
+        nsel=kept*KP;
+    }
+    for(int j=nsel+t;j<TOP;j+=CPT){const int x=tail0+(j-nsel);out[j]=x<cnt?x:-1;}
+}
+// unnormalized softmax of one head group's scores over my keys: p = exp(s - m) in place, m and l per (row, head), with
+// normalize's reductions. A (row, head) with no key of mine gives m = -inf, p = 0, l = 0 (no error).
+template<class Input>
+__global__ void cp_softmax(Input input,float* scores,float* m_out,float* l_out){
+    auto a=resolve(input);if(!a.active)return;
+    const int i=blockIdx.x,t=threadIdx.x;float* p=scores+(int64_t)i*TOP;__shared__ float tmp[8],mx,den;
+    float m=-INFINITY;for(int j=t;j<TOP;j+=256)m=fmaxf(m,p[j]);m=warp_max(m);if((t&31)==0)tmp[t/32]=m;__syncthreads();
+    if(t==0){mx=-INFINITY;for(int j=0;j<8;j++)mx=fmaxf(mx,tmp[j]);}__syncthreads();
+    float s=0;for(int j=t;j<TOP;j+=256){const float v=isfinite(mx)?expf(p[j]-mx):0;p[j]=v;s+=v;}s=warp_sum(s);if((t&31)==0)tmp[t/32]=s;__syncthreads();
+    if(t==0){den=0;for(int j=0;j<8;j++)den+=tmp[j];m_out[i]=mx;l_out[i]=den;}
+}
+// LSE merge of my head group's partials in shard order 0..cp_nr-1: M = max m_s, w_s = exp(m_s - M), L = sum w_s l_s,
+// ctx = (sum w_s c_s) / L. part_all: [s] blocks of c [n][H][512], m [n][H], l [n][H] (n = a.rows), each block padded to
+// 4 floats. Error 16: no key at all (normalize's)
+template<class Input>
+__global__ void cp_lse(Input input,const float* part_all,float* context){
+    auto a=resolve(input);if(!a.active)return;
+    const int i=blockIdx.x,t=threadIdx.x,nh=a.rows*a.heads;const int64_t blk=((int64_t)nh*(LAT+2)+3)&~(int64_t)3;
+    float M=-INFINITY;for(int sh=0;sh<a.cp_nr;sh++)M=fmaxf(M,part_all[sh*blk+(int64_t)nh*LAT+i]);
+    float w[8],L=0;
+    for(int sh=0;sh<a.cp_nr;sh++){const float m=part_all[sh*blk+(int64_t)nh*LAT+i];w[sh]=isfinite(m)?expf(m-M):0.f;
+        L=fmaf(w[sh],part_all[sh*blk+(int64_t)nh*(LAT+1)+i],L);}
+    if(t==0&&!(L>0))error(a,16);
+    for(int d=t;d<LAT;d+=256){float c=0;for(int sh=0;sh<a.cp_nr;sh++)c=fmaf(w[sh],part_all[sh*blk+(int64_t)i*LAT+d],c);
+        context[(int64_t)i*LAT+d]=L>0?c/L:0.f;}
+}
+template<class Input>
+static cudaError_t cp_index_body(const G6Attn& a,Input input,Work& w,uint64_t* cand,cudaStream_t stream){
+    const int n=a.rows;
+    if(a.reuse_indices){reuse<<<n,256,0,stream>>>(input,0);return cudaGetLastError();}
+    for(int t0=0;t0<w.pstride;t0+=w.tstride){
+        const int nt=std::min(w.tstride,w.pstride-t0);
+        const int own=(nt/g6kv::PAGE_POOLS+a.cp_nr-1)/a.cp_nr*g6kv::PAGE_POOLS;   // at most this rank's pools in the tile
+        kp_scores<true><<<dim3((own+31)/32,n),256,0,stream>>>(input,0,w.ps,w.tstride,t0,nt);
+        cp_local<<<n,CPT,0,stream>>>(input,0,w.ps,w.tstride,cand,t0,nt);
+    }
+    return cudaGetLastError();
+}
+template<class Input>
+static cudaError_t cp_group_body(const G6Attn& a,Input input,Work& w,const float* q,float* part,cudaStream_t stream){
+    const int n=a.rows,nh=n*a.heads,hch=(a.heads+HC-1)/HC;
+    mla_scores<true><<<dim3(TOP/32,hch,n),256,0,stream>>>(input,0,q,w.prob);
+    cp_softmax<<<nh,256,0,stream>>>(input,w.prob,part+(int64_t)nh*LAT,part+(int64_t)nh*(LAT+1));
+    context_parts<<<dim3(PART,hch,n),256,0,stream>>>(input,0,w.prob,w.parts);
+    merge_parts<<<nh,256,0,stream>>>(input,w.parts,part);
+    return cudaGetLastError();
+}
+// g6a_cp_groups: G head groups of gh heads (a.heads = G gh, gh a multiple of HC) in one call. A CTA of mla_scores and
+// context_parts never spans two groups, and every (row, head) runs the operations of its own group's call in the same
+// order, so each group's partial is the bits cp_group_body gives it. Group g's partial into part + g gblk: c [n][gh][512],
+// m [n][gh], l [n][gh]; m / l come from cp_softmax's ml [2][n heads]
+template<class Input>
+__global__ void merge_parts_g(Input input,const float* parts,const float* ml,float* part,int gh,int64_t gblk){
+    auto a=resolve(input);if(!a.active)return;
+    const int rh=blockIdx.x,t=threadIdx.x,row=rh/a.heads,h=rh%a.heads,j=row*gh+h%gh;
+    const int64_t nb=(int64_t)a.rows*gh;float* b=part+(int64_t)(h/gh)*gblk;
+    #pragma unroll
+    for(int d=t;d<LAT;d+=256){
+        float s=0;
+        #pragma unroll
+        for(int p=0;p<PART;p++)s+=__ldg(parts+((int64_t)rh*PART+p)*LAT+d);
+        b[(int64_t)j*LAT+d]=s;
+    }
+    if(t==0){const int64_t nh=(int64_t)a.rows*a.heads;b[nb*LAT+j]=ml[rh];b[nb*(LAT+1)+j]=ml[nh+rh];}
+}
+template<class Input>
+static cudaError_t cp_groups_body(const G6Attn& a,Input input,float* prob,float* parts,float* ml,const float* q,float* part,int gh,
+                                  int64_t gblk,cudaStream_t stream){
+    const int n=a.rows,nh=n*a.heads,hch=(a.heads+HC-1)/HC;
+    mla_scores<true><<<dim3(TOP/32,hch,n),256,0,stream>>>(input,0,q,prob);
+    cp_softmax<<<nh,256,0,stream>>>(input,prob,ml,ml+nh);
+    context_parts<<<dim3(PART,hch,n),256,0,stream>>>(input,0,prob,parts);
+    merge_parts_g<<<nh,256,0,stream>>>(input,parts,ml,part,gh,gblk);
+    return cudaGetLastError();
+}
+template<class Input>
+static cudaError_t cp_finish_body(const G6Attn& a,Input input,Work& w,const float* part_all,cudaStream_t stream){
+    const int n=a.rows;
+    cp_lse<<<n*a.heads,256,0,stream>>>(input,part_all,w.ctx);
+    value_project<<<dim3(VD/8,a.heads,(n+3)/4),256,0,stream>>>(input,0,n,w.ctx);
+    return cudaGetLastError();
+}
+static bool cp_ok(const G6Attn* a){return a&&valid(*a)&&a->cp_nr>=2&&a->cp_nr<=8&&a->cp_rank>=0&&a->cp_rank<a->cp_nr&&a->rows<=a->query_tile;}
+#endif
 }   // namespace fa
 
 constexpr int NOTSUP=(int)cudaErrorNotSupported, INVAL=(int)cudaErrorInvalidValue;
@@ -483,7 +725,16 @@ extern "C" int g6a_index_scores(const G6Attn* a,void* scratch,size_t bytes,float
     fa::kp_scores<<<dim3(w.pstride/32,a->rows),256,0,(cudaStream_t)s>>>(*a,0,scores,w.pstride);
     return (int)cudaGetLastError();
 }
-extern "C" int g6a_run(const G6Attn* a,void* scratch,size_t bytes,void* s){
+// a CP binding at a context <= R (every page it reads is replicated, physical == logical on the prefix): the replicated
+// path, as attn.cu
+static const G6Attn* replicated(const G6Attn* a,G6Attn& rep){
+#if defined(G6_CP) && G6_CP
+    if(a&&a->cp_nr){rep=*a;rep.cp_nr=0;rep.cp_rank=0;return &rep;}
+#endif
+    (void)rep;return a;
+}
+extern "C" int g6a_run(const G6Attn* a_in,void* scratch,size_t bytes,void* s){
+    G6Attn rep;const G6Attn* a=replicated(a_in,rep);
     if(!a||!fa::valid(*a)||!scratch||!fa::append_ok(*a)||!fa::run_ok(*a))return INVAL;
     auto w=fa::workspace(*a,scratch);if(!w.total||bytes<w.total)return INVAL;
     cudaStream_t stream=(cudaStream_t)s;
@@ -492,7 +743,7 @@ extern "C" int g6a_run(const G6Attn* a,void* scratch,size_t bytes,void* s){
 }
 extern "C" int g6a_replay_run(const G6AttnReplay* r,void* s){
     if(!r||!r->cell)return INVAL;
-    const G6Attn& a=r->fixed;
+    G6Attn rep;const G6Attn& a=*replicated(&r->fixed,rep);
     if(!fa::valid(a)||!r->scratch||!fa::append_ok(a)||!fa::run_ok(a))return INVAL;
     auto w=fa::workspace(a,r->scratch);
     if(!w.total||r->scratch_bytes<w.total)return INVAL;
@@ -505,6 +756,73 @@ extern "C" int g6a_replay_run(const G6AttnReplay* r,void* s){
 }
 
 #if defined(G6_CP) && G6_CP
+// ---- CP entry points (attn.h). Flash's sizes: cand_all is u64 [cp_nr][M][g6kv::TOP_POOLS] (pool candidates, any order
+// within a list), q is [M][H][512] and rope is unused (no RoPE part; g6a_cp_qabs returns nullptr for it), a partial is
+// c [M][H][512], m [M][H], l [M][H]. Graph form (cell) as g6a_replay_run: validation and appends in the front stage.
+template<class F>
+static int cp_call(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,F body){
+    if(!fa::cp_ok(a)||!scratch)return INVAL;
+    auto w=fa::workspace(*a,scratch);if(!w.total||bytes<w.total)return INVAL;
+    if(cell){fa::ReplayInput in{*a,cell};return (int)body(in,w);}
+    return (int)body(*a,w);
+}
+extern "C" int g6a_cp_front(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,void* s){
+    if(!a||!fa::append_ok(*a)||!a->q_b||!a->uk||!a->indices)return INVAL;
+    if(a->reuse_row_map&&a->reuse_indices==a->indices)return INVAL;
+    cudaStream_t stream=(cudaStream_t)s;
+    return cp_call(a,cell,scratch,bytes,[&](auto in,fa::Work& w){
+        if(cell)fa::validate_replay<<<1,256,0,stream>>>(*a,const_cast<G6AttnStepCell*>(cell));
+        fa::append(*a,in,stream);
+        fa::absorb<<<dim3(a->heads,fa::LAT/64),64,0,stream>>>(in,0,a->rows,w.q);
+        return cudaGetLastError();});
+}
+extern "C" int g6a_cp_index(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,uint64_t* cand_all,void* s){
+    if(!a||(!a->reuse_indices&&(!cand_all||!a->index_q||!a->index_weight)))return INVAL;
+    cudaStream_t stream=(cudaStream_t)s;
+    return cp_call(a,cell,scratch,bytes,[&](auto in,fa::Work& w){return fa::cp_index_body(*a,in,w,cand_all,stream);});
+}
+extern "C" int g6a_cp_merge_index(const G6Attn* a,const G6AttnStepCell* cell,const uint64_t* cand_all,void* s){
+    if(!fa::cp_ok(a)||!cand_all||a->reuse_indices)return INVAL;
+    cudaStream_t stream=(cudaStream_t)s;
+    if(cell)fa::cp_merge<<<a->rows,fa::CPT,0,stream>>>(fa::ReplayInput{*a,cell},0,cand_all);
+    else fa::cp_merge<<<a->rows,fa::CPT,0,stream>>>(*a,0,cand_all);
+    return (int)cudaGetLastError();
+}
+extern "C" int g6a_cp_group(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* q,const float*,float* part,void* s){
+    if(!a||!a->indices||!a->mla_cache||!a->block_table||!q||!part)return INVAL;
+    cudaStream_t stream=(cudaStream_t)s;
+    return cp_call(a,cell,scratch,bytes,[&](auto in,fa::Work& w){return fa::cp_group_body(*a,in,w,q,part,stream);});
+}
+extern "C" int g6a_cp_finish(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,const float* part_all,void* s){
+    if(!a||!a->uv||!a->output||!part_all)return INVAL;
+    cudaStream_t stream=(cudaStream_t)s;
+    return cp_call(a,cell,scratch,bytes,[&](auto in,fa::Work& w){return fa::cp_finish_body(*a,in,w,part_all,stream);});
+}
+extern "C" int g6a_cp_groups_ok(int gh){return gh>0&&gh%fa::HC==0;}
+// prob, parts, ml of cp_groups_body, each 256-B aligned
+static size_t cp_groups_at(int heads,int rows,int k){
+    const size_t nh=(size_t)heads*rows,b[3]={nh*fa::TOP*4,nh*fa::PART*fa::LAT*4,nh*2*4};
+    size_t o=0;for(int i=0;i<k;i++)o+=(b[i]+255)&~size_t(255);return o;
+}
+extern "C" size_t g6a_cp_groups_bytes(int heads,int rows){return heads>0&&rows>0?cp_groups_at(heads,rows,3):0;}
+extern "C" int g6a_cp_groups(const G6Attn* a,const G6AttnStepCell* cell,void* buf,size_t bytes,const float* q,const float*,
+                             float* part,int gh,int64_t gblk,void* s){
+    if(!a||!a->indices||!a->mla_cache||!a->block_table||!buf||!q||!part||!g6a_cp_groups_ok(gh)||a->heads%gh||a->heads/gh>8)
+        return INVAL;
+    G6Attn one=*a;one.heads=gh;   // each group's call shape
+    if(!fa::cp_ok(&one)||bytes<g6a_cp_groups_bytes(a->heads,a->rows)||gblk<(int64_t)a->rows*gh*(fa::LAT+2))return INVAL;
+    char* b=(char*)buf;
+    float* prob=(float*)(b+cp_groups_at(a->heads,a->rows,0));float* parts=(float*)(b+cp_groups_at(a->heads,a->rows,1));
+    float* ml=(float*)(b+cp_groups_at(a->heads,a->rows,2));
+    cudaStream_t stream=(cudaStream_t)s;
+    if(cell)return (int)fa::cp_groups_body(*a,fa::ReplayInput{*a,cell},prob,parts,ml,q,part,gh,gblk,stream);
+    return (int)fa::cp_groups_body(*a,*a,prob,parts,ml,q,part,gh,gblk,stream);
+}
+extern "C" int g6a_cp_qabs(const G6Attn* a,void* scratch,const float** q,const float** rope){
+    if(!fa::cp_ok(a)||!scratch||!q||!rope)return INVAL;
+    auto w=fa::workspace(*a,scratch);if(!w.total)return INVAL;
+    *q=w.q;*rope=nullptr;return 0;
+}
 #endif
 
 // ---- prefill: Tensor-Core WMMA attention (absorb_tc, sparse_qk_pf, sparse_pv_pf, value_project_tc) + multi-row kpool
@@ -1671,6 +1989,10 @@ static int flash_prefill_run(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep*
              step->reuse_row_map||step->reuse_rows)return INVAL;
     cudaStream_t stream=(cudaStream_t)s;
     G6Attn a=b->args;
+#if defined(G6_CP) && G6_CP
+    // a CP binding: the caller keeps the step's context <= R, where every page is replicated (as g6a_run)
+    a.cp_nr=0;a.cp_rank=0;
+#endif
     a.rows=step->rows;a.context=step->context;
     a.q_b=step->q_b;a.kv_a=step->kv_a;a.positions=step->positions;
     a.index_q=step->index_q;a.index_k=step->index_k;a.index_weight=step->index_weight;

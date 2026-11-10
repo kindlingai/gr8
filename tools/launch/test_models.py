@@ -114,7 +114,7 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], 'ssd:/tmp/fc,size=64G,persist=on')
         plan = opt.engine_plan(flash('--flash-cache', 'terminal'))
         self.assertIn('GR8_GLM53F_CACHE=terminal', plan['env'])
-        # the checkpoint store on a group lease (D-331 M8 (c)): the store as given, KV_SHARE_WHEN reaches the engine
+        # the checkpoint store on a group lease: the store as given, KV_SHARE_WHEN reaches the engine
         g = 'remote:192.0.2.5:7350,size=1G,group=flash'
         plan = opt.engine_plan(flash('--flash-cache', 'aligned', '--kv-store', g, '--kv-share-when', 'always'))
         self.assertEqual(plan['args'][plan['args'].index('--kv-store') + 1], g)
@@ -253,10 +253,54 @@ class Ds41Tests(unittest.TestCase):
             opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--extra-env', 'GR8_DS_ENGRAM=0'], GLM))
         self.assertIn('DeepSeek-V4.1 engine variables', str(e.exception))
 
+    # the release stack's prefill words (docs/DEEPSEEK.md): the plain default; the fast decode words stay out
+    V2 = ('GR8_DS_PF_V2=1', 'GR8_DS_PF_LANES=1', 'GR8_DS_PF_TAIL=128', 'GR8_DS_SH_TC=1', 'GR8_DS_PREFILL_W=8192', 'GR8_DS_ATTN_PW=8192',
+          'GR8_DS41_IDX_PW=8192', 'GR8_DS_PF_V2_GATE_RO=1', 'GR8_DS_PF_V2_STRIPE_MIN=1048576', 'GR8_DS_PF_V2_ATTN_PIPE=1',
+          'GR8_DS_ENGRAM_IO_THREADS=64', 'GR8_DS_ATTN_TC_TILE=2', 'GR8_S2_ADMIT_HOLD=1', 'GR8_S2_TAIL_FIRST=1', 'GR8_S2_DECODE_PF=1024')
+    FAST = ('GR8_DS_RELAXED_ACCEPT', 'GR8_DS_MOE_TOPK_DECODE', 'GR8_DS41_HEAD_MX', 'GR8_DS_ATTN_TC_MF')
+
+    def test_the_default_prefill_is_the_release_stack(self):
+        env = opt.engine_plan(ds41())['env']
+        for e in self.V2:
+            self.assertEqual([w for w in env if w.startswith(e.split('=')[0] + '=')], [e])
+        self.assertFalse([w for w in env if w.startswith(self.FAST)])
+        self.assertFalse([w for w in env if w.startswith(('GR8_DS_MHC_ROW_SHARD=', 'GR8_DS_MHC_Y_MXFP8='))])   # engine defaults: 0
+
+    def test_exact_output_is_the_old_prefill(self):
+        # EXACT=1, EXTRA_ENV GR8_DS_PF_V2=0 and the 1M-context row split: today's stack, two lanes, W 4096, no v2 word
+        for argv in (('--exact', '1'), ('--extra-env', 'GR8_DS_PF_V2=0'), ('--extra-env', 'GR8_DS_MHC_ROW_SHARD=1')):
+            env = opt.engine_plan(ds41(*argv))['env']
+            for e in ('GR8_DS_PF_LANES=2', 'GR8_DS_PREFILL_W=4096', 'GR8_DS_ATTN_PW=4096', 'GR8_DS41_IDX_PW=4096', 'GR8_S2_DECODE_PF=1024'):
+                self.assertIn(e, env)
+            for w in ('GR8_DS_PF_V2=1', 'GR8_DS_SH_TC', 'GR8_DS_PF_TAIL', 'GR8_DS_PF_V2_', 'GR8_S2_TAIL_FIRST', 'GR8_S2_ADMIT_HOLD',
+                      'GR8_DS_ATTN_TC_TILE', 'GR8_DS_ENGRAM_IO_THREADS'):
+                self.assertFalse([e for e in env if e.startswith(w)], (argv, w))
+        # the exact list is the default list less the release words, with two lanes and W 4096
+        exact = [e for e in opt.engine_plan(ds41('--exact', '1'))['env']]
+        default = [e for e in opt.engine_plan(ds41())['env'] if not e.startswith(tuple(v.split('=')[0] + '=' for v in self.V2))]
+        self.assertEqual([e for e in exact if not e.startswith(('GR8_DS_PF_LANES=', 'GR8_DS_PREFILL_W=', 'GR8_DS_ATTN_PW=',
+                                                                'GR8_DS41_IDX_PW=', 'GR8_S2_DECODE_PF='))], default)
+        # an EXTRA_ENV word keeps its value; W follows it on either stack
+        env = opt.engine_plan(ds41('--extra-env', 'GR8_DS_PREFILL_W=4096'))['env']
+        self.assertIn('GR8_DS_PF_V2=1', env)
+        self.assertEqual(sorted(e for e in env if e.startswith(('GR8_DS_PREFILL_W=', 'GR8_DS_ATTN_PW='))),
+                         ['GR8_DS_ATTN_PW=4096', 'GR8_DS_PREFILL_W=4096'])
+        env = opt.engine_plan(ds41('--extra-env', 'GR8_DS_SH_TC=0'))['env']
+        self.assertEqual([e for e in env if e.startswith('GR8_DS_SH_TC=')], ['GR8_DS_SH_TC=0'])   # the engine falls back, one line
+        self.assertIn('GR8_S2_ADMIT_HOLD=0', opt.engine_plan(ds41('--s2-admit-hold', '0'))['env'])
+
+    def test_exact_is_ds41_only_and_0_or_1(self):
+        with self.assertRaises(opt.OptionError) as e:
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--exact', '1'], GLM))
+        self.assertIn('ds41 only', str(e.exception))
+        with self.assertRaises(opt.OptionError) as e:
+            ds41('--exact', '2')
+        self.assertIn('want 0', str(e.exception))
+
     def test_engine_plan(self):
         plan = opt.engine_plan(ds41())
         self.assertEqual((plan['knobs']['MTP'], plan['knobs']['SESS'], plan['knobs']['CAP']), ('0', '5', '262144'))
-        for e in ('GR8_CP=0', 'GR8_DEC_BK=262144', 'GR8_DS_MTP=5', 'GR8_DS_PREFILL_W=4096', 'GR8_DS_ATTN_PW=4096', 'GR8_DS_PF_LANES=2', 'GR8_DS_ATTN_TC=1', 'GR8_DS_MOE_TC=1',
+        for e in ('GR8_CP=0', 'GR8_DEC_BK=262144', 'GR8_DS_MTP=5', 'GR8_DS_PREFILL_W=8192', 'GR8_DS_ATTN_PW=8192', 'GR8_DS_PF_LANES=1', 'GR8_DS_ATTN_TC=1', 'GR8_DS_MOE_TC=1',
                   'GR8_DS_PF_POOL=4', 'GR8_DS_SRC_FAST=3', 'GR8_DS_MOE_PDL=1', 'GR8_DS41_ADMIT_KEEP_SCRATCH=1', 'GR8_DS41_PUB16=1',
                   'GR8_DS41_GV_QUAD=1', 'GR8_S2_DECODE_PF=1024', 'GR8_DS_COMP_FP4=1'):
             self.assertIn(e, plan['env'])
@@ -366,7 +410,7 @@ class RequiredTests(unittest.TestCase):
             o = opt.parse(['--no-config', '--peers', PEERS], env)            # down, status and logs need none
             with self.assertRaises(opt.OptionError) as e:
                 opt.validate(o)                                              # up, check, prepare, show-config
-            self.assertIn('no model: set GR8_MODEL to glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash)', str(e.exception))
+            self.assertIn('no model: set GR8_MODEL to glm53 (GLM-5.3), glm53f (GLM-5.3-Flash) or ds41 (DeepSeek-V4.1-Flash)', str(e.exception))
             self.assertNotIn('pseudo', str(e.exception))
 
     def test_an_unknown_name(self):
@@ -374,7 +418,7 @@ class RequiredTests(unittest.TestCase):
                                ([], {'GR8_MODEL': 'glm53x'}, 'environment')):
             with self.assertRaises(opt.OptionError) as e:
                 opt.parse(['--no-config', *argv], env)
-            self.assertIn(f'from the {src}: not a model gr8 serves. Want glm53 (GLM-5.3) or glm53f (GLM-5.3-Flash)',
+            self.assertIn(f'from the {src}: not a model gr8 serves. Want glm53 (GLM-5.3), glm53f (GLM-5.3-Flash) or ds41 (DeepSeek-V4.1-Flash)',
                           str(e.exception))
             self.assertNotIn('pseudo', str(e.exception))
         self.assertIs(models.of(opt.parse(['--no-config'], {'GR8_MODEL': 'pseudo'})), models.PSEUDO)   # asked for
@@ -405,7 +449,12 @@ class RequiredTests(unittest.TestCase):
         self.assertIn('--tp       4, 3, 2 or 1', flash)
         self.assertIn('TP=1 k2', flash)
         self.assertIn('--drafter URL (DFlash2), --kv-format int4', flash)
-        self.assertEqual(models.SERVED, (models.GLM53, models.GLM53F))
+        self.assertEqual(models.SERVED, (models.GLM53, models.GLM53F, models.DS41))
+        ds = models.describe(models.DS41)
+        self.assertIn('a local copy of an exlr8 release of DeepseekV41ForCausalLM', ds)
+        self.assertIn('--variant  none: the release is read in place', ds)
+        self.assertNotIn('by default', ds)
+        self.assertIn('ds41 (DeepSeek-V4.1-Flash)', models.CHOICES)
 
 
 class PseudoTests(unittest.TestCase):

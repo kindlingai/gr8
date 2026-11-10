@@ -56,6 +56,8 @@ pub struct State {
     pub default_max_tokens: u64,
     /// the tokens (prompt + max_tokens) a request may take and still share decode steps; 0: no such limit
     pub share_tokens: u64,
+    /// a max_tokens past the room the context leaves is cut to that room instead of refused
+    pub clamp_max_tokens: bool,
     /// reasoning_effort and thinking_budget for a request that names none
     pub thinking: thinking::Defaults,
     /// the grammar compiler for response_format json_schema
@@ -92,8 +94,9 @@ struct Args {
     share_tokens: u64,
     max_connections: usize,
     default_effort: Option<String>,
-    default_budget: u64,
+    default_budget: sampling::Limit,
     allow_thinking_off: bool,
+    clamp_max_tokens: bool,
     emit_undeclared: bool,
     supervisor: Option<String>,
     penalties: sampling::Penalties,
@@ -109,7 +112,7 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--workers N] [--encode-threads N] [--default-max-tokens N]
                   [--share-tokens N] [--max-connections N]
                   [--default-reasoning-effort minimal|low|medium|high|xhigh|max (ds41: or an integer 1-100)]
-                  [--default-thinking-budget N] [--allow-thinking-off]
+                  [--default-thinking-budget N, Fx or N|Fx] [--allow-thinking-off] [--clamp-max-tokens]
                   [--default-presence-penalty SPEC] [--default-frequency-penalty SPEC]
                   [--default-think-end-boost start=S,per1k=P,max=M] [--default-sequence-penalty SPEC]
                   [--tool-repeat-guard 0|1] [--tool-repeat-guard-repeats N] [--tool-repeat-guard-temperature F]
@@ -134,8 +137,9 @@ fn parse_args() -> Result<Args, String> {
         share_tokens: 0,
         max_connections: 512,
         default_effort: None,
-        default_budget: 0,
+        default_budget: sampling::Limit::Tokens(0),
         allow_thinking_off: false,
+        clamp_max_tokens: false,
         emit_undeclared: false,
         supervisor: None,
         penalties: sampling::Penalties::default(),
@@ -187,9 +191,10 @@ fn parse_args() -> Result<Args, String> {
             "--dialect" => a.dialect = dialect::Dialect::parse_flag(&next(&mut i, &flag, inline)?)?,
             "--default-thinking-budget" => {
                 a.default_budget =
-                    next(&mut i, &flag, inline)?.parse().map_err(|_| "--default-thinking-budget: not a number")?
+                    sampling::Limit::parse(&next(&mut i, &flag, inline)?).map_err(|e| format!("{flag}: {e}"))?
             }
             "--allow-thinking-off" => a.allow_thinking_off = true,
+            "--clamp-max-tokens" => a.clamp_max_tokens = true,
             "--tool-repeat-guard" => {
                 a.guard.on = match next(&mut i, &flag, inline)?.as_str() {
                     "1" => true,
@@ -399,6 +404,7 @@ async fn serve(args: Args) -> Result<(), String> {
         max_model_len_override: args.max_model_len,
         default_max_tokens: args.default_max_tokens,
         share_tokens: args.share_tokens,
+        clamp_max_tokens: args.clamp_max_tokens,
         thinking: thinking_defaults,
         grammars,
         emit_undeclared: args.emit_undeclared,

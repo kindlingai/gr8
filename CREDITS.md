@@ -1,6 +1,8 @@
 KindlingAI is:
 
 - [@adapt-ai-systems](https://github.com/adapt-ai-systems)
+  - Opt-in packed-key attention pipeline for sequence-parallel DeepSeek prefill, with exactness tests.
+  - Opt-in sequence-parallel DeepSeek prefill: owned-row attention, expert groups, collectives and timing tests.
   - Prefill optimization, TP=6 S2 serving and context-budget improvements
     ([#7](https://github.com/kindlingai/gr8/pull/7), [#9](https://github.com/kindlingai/gr8/pull/9),
     [#27](https://github.com/kindlingai/gr8/pull/27), [#29](https://github.com/kindlingai/gr8/pull/29)).
@@ -11,6 +13,8 @@ KindlingAI is:
     ([#327](https://github.com/kindlingai/gr8/pull/327)-[#333](https://github.com/kindlingai/gr8/pull/333),
     [#335](https://github.com/kindlingai/gr8/pull/335)-[#338](https://github.com/kindlingai/gr8/pull/338)),
     and this boot guide.
+  - Control agreement bool-ABI regression fix and exhaustive ACK-subset coverage.
+  - Engine Rust pinned to 1.94.1, the compiler the images ship, and the CI engine job prints that compiler.
 - [@coffee-the-dev](https://github.com/coffee-the-dev)
 - [@mmastrac](https://github.com/mmastrac)
 

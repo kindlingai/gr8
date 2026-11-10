@@ -69,6 +69,9 @@ struct NativeHooks {
     // must then be empty when it is set
     g6s2_module_ops module{};
     std::function<void(const Grant&)> bind; // native main AND draft binding, no pool mutation
+    // optional, head: why the engine cannot run this request at all (nullptr = it can); a refused request ends with an
+    // error before it is queued, as a grammar that does not compile
+    std::function<const char*(const g6rt::ServeReq&)> refuse;
     // optional, before bind on every rank: the bound request itself (DS41: its image rows, for the Engram ring of the
     // slot's snapshots and parks, s2/ds41_engram_ring.h)
     std::function<void(unsigned slot, const g6rt::ServeReq&)> bind_request;
@@ -165,7 +168,7 @@ class Service {
         static int32_t check(void* x, uint64_t id, const uint8_t* b, size_t n, g6svc_checked* out) noexcept {
             return mod::guard<Host>(x, [&](Host& h) {
                 auto request = parse_request(std::string(reinterpret_cast<const char*>(b), n), h.s.c_.scheduler.steering);
-                out->ok = h.s.grammar_ok(id, request) && h.s.images_ok(id, request);
+                out->ok = h.s.grammar_ok(id, request) && h.s.images_ok(id, request) && h.s.engine_ok(id, request);
                 if (!out->ok) return;
                 h.prompt = std::move(request.prompt);
                 out->prompt = h.prompt.data(); out->n = h.prompt.size();
@@ -319,14 +322,23 @@ class Service {
             return false;
         }
     }
-    // An image request the engine cannot run (ds41_image.h img::refusal) ends with an error before it is queued, as a
+    bool engine_ok(uint64_t id, const g6rt::ServeReq& r) {
+        const char* why = native_.refuse ? native_.refuse(r) : nullptr;
+        if (!why) return true;
+        fprintf(stderr, "# s2: request %llu refused: %s\n", (unsigned long long)id, why);
+        atomic_file(c_.directory + "/resp." + std::to_string(id), "end error -1 0\n");
+        return false;
+    }
+    // An image request the engine cannot run (image_input.h img::refusal) ends with an error before it is queued, as a
     // grammar that does not compile does. The front end refuses the same cases first.
     bool images_ok(uint64_t id, const g6rt::ServeReq& r) {
         if (r.images.empty()) return true;
 #if G6_MODEL_DS41
         const bool decode_prompt = ds41_decode_prompt(c_.prefill_min, r.prompt.size(), r.plp, r.steering.enabled);
+#elif G6_MODEL_FLASH
+        const bool decode_prompt = r.plp >= 0 || r.steering.enabled;   // as Sessions::payload: only prompt logprobs decode
 #else
-        const bool decode_prompt = true;
+        const bool decode_prompt = true;   // GLM-5.3 has no vision tower
 #endif
         const char* why = g6rt::img::refusal(r.prompt, r.images, decode_prompt);
         if (!*why) return true;
@@ -422,7 +434,7 @@ public:
         require(!c_.scheduler.park || (reuse() && m.park), "parked slots need prefix reuse and the park hook");
         if (reuse()) {
             require(m.retain && pol_.o.take, "prefix reuse needs retain, match and take");
-            dispatch_.track_rows();
+            dispatch_.track_rows(c_.scheduler.mtp > 0);
         }
         if (!c_.rank) {
             leader_ = std::make_unique<LeaderChannel>(c_.scheduler.epoch,links_.peers()); endpoint_ = leader_.get();

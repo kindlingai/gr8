@@ -64,11 +64,14 @@ knobs:
     scope: agree
     kind: int
     default: "0"
-    values: "0|1"
+    values: "0|1|2"
     doc: >-
       The 128 x 128 tile of the tensor-core GEMM (GR8_DS_ATTN_TC=1, 128 rows or more). 0 = a 2-deep ring of 144-byte
       rows. 1 = a 3-deep ring of swizzled 128-byte rows (99 KB of shared memory a block; falls back to 0 where the
-      device has less). Only shared-memory addresses change, so every value gives the same output bits.
+      device has less). 2 = tile 1 as persistent blocks (one per SM, the ring runs on across output tiles) with
+      ldmatrix fragment loads and a 16-byte store epilogue; it takes tile 1 where GR8_DS_ATTN_TC_MF puts the M tile
+      first, where N is below 1024, where Y is not 16-byte aligned, or where the device has less shared memory. Only
+      the order of work and the way of loading and storing change, so every value gives the same output bits.
   GR8_DS_C2_TRACE:
     scope: local
     kind: flag

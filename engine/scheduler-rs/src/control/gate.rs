@@ -173,7 +173,9 @@ impl Agreement {
     }
     /// Every rank has acknowledged.
     pub fn ready(&self) -> bool {
-        self.seen[..self.nr as usize].iter().all(|&s| s)
+        // rustc 1.99.0 can lower all() over six bools to a noncanonical true (255), breaking the C bool ABI.
+        // contains() keeps the same predicate and returns 0 or 1 at the control boundary.
+        !self.seen[..self.nr as usize].contains(&false)
     }
     /// The digest every rank reported.
     pub fn agreed_hash(&self) -> R<u64> {

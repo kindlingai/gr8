@@ -129,6 +129,15 @@ bool ds41_c2_trace_on();
 #include "ds41_pf_split.h"
 #include "ds41_rs.h"
 #include "ds41_prefill_fabric.h"
+#include "ds41_v2.h"
+#include "ds41_v2.cuh"
+#include "ds41_v2_ffn.cuh"
+#include "ds41_v2_engram.cuh"
+#include "../attn/ds41_attn_v2_api.h"
+namespace g6rt {
+#include "ds41_v2_attn.cuh"
+#include "ds41_v2_engine.cuh"
+}
 #include "ds41_knobs.h"
 #endif
 #include "s2/flash_checkpoint.h"   // GR8_GLM53F_CACHE parsed in every build, refused outside Flash
@@ -269,7 +278,7 @@ int main(int argc, char** argv)
 
     if (!fabric_dump) G6RT_CK(cudaSetDeviceFlags(cudaDeviceMapHost));
     // every fabric main creates, in creation order (fabric_plan.h); the plan below sets them up
-    g6::Fabric fab, fabB, fabp, fabp2, fabix, fabix2, fabrs, fabrs2, fabd, fabds, fabf, fabq, fabc, fabg, fabs, fabdg;
+    g6::Fabric fab, fabB, fabp, fabp2, fabix, fabix2, fabrs, fabrs2, fabd, fabds, fabf, fabq, fabc, fabg, fabs, fabdg, fabv2;
     boot_rank = cfg.rank;
     mem_min_gib();                      // a bad GR8_MEM_MIN stops the boot here, not after the weights have loaded
     boot("start");
@@ -415,7 +424,7 @@ int main(int argc, char** argv)
     fpi.head_payload = glue::head_bytes_tk(MX, nc, true);
     fpi.trunk_bytes = sizeof(ds_mhc::trunk_t);
 #endif
-    for (int l : layers) fpi.full_index.push_back(cp_full_index(l));
+    for (int l : layers) { fpi.full_index.push_back(cp_full_index(l)); fpi.attn.push_back(cp_attn_layer(l)); }
 #if defined(G6_CP) && G6_CP
     fpi.cp_build = true;
 #endif
@@ -424,6 +433,10 @@ int main(int argc, char** argv)
     const FabricPlan fplan = fabric_plan(eo, fpi);
     for (const std::string& l : fplan.log) fputs(l.c_str(), stderr);
     if (!fplan.refusal.empty()) die(fplan.refusal);
+#if G6_MODEL_DS41
+    if (fplan.v2_fallback && !s2mode)   // the serve logs its own line after the weights bind (ds41 serve, pf_v2)
+        fprintf(stderr, "# rank %d DS41 prefill: GR8_DS_PF_V2=1 not used: %s; the old range-A path runs\n", cfg.rank, fplan.v2_fallback);
+#endif
     const bool& two = fplan.two;
 #if G6_MODEL_DS41
     const bool &rowshard = fplan.rowshard, &y_mxfp8 = fplan.y_mxfp8, &pf_direct = fplan.pf_direct;
@@ -434,7 +447,7 @@ int main(int argc, char** argv)
 #endif
     [[maybe_unused]] const int& cp_step = fplan.cp_step;   // GR8_CP_STEP_ROWS (s2/cp_rows.h): the rows a step past R may carry; 0 = off
     g6::Fabric* const fabrics[kFabKinds] = {&fab, &fabB, &fabp, &fabp2, &fabix, &fabix2, &fabrs, &fabrs2,
-                                            &fabd, &fabds, &fabf, &fabq, &fabc, &fabg, &fabs, &fabdg};
+                                            &fabd, &fabds, &fabf, &fabq, &fabc, &fabg, &fabs, &fabdg, &fabv2};
     fabric_bring_up(fplan, fabrics, fabric_dump, [&](const PlannedFabric& e, g6::Fabric& fb) {
         switch (e.kind)
         {
@@ -622,12 +635,9 @@ int main(int argc, char** argv)
 #if G6_MODEL_FLASH
     // Flash prefill (flash_prefill.cuh): the P1 bodies run the decode blocks in MX-row chunks, so the decode bindings
     // stay decode-sized. Combinations the Flash prefill does not support yet stop here.
-    if (MP && (pf_rs || pf_own || !qp_man.empty() || !qo_man.empty() || reuse_prefix
-#if defined(G6_CP) && G6_CP
-               || cp_on
-#endif
-               ))
-        die("Flash --prefill: not with GR8_PF_RS, GR8_PF_OWN, --qo-/--qp- packs, --reuse-prefix or CP (P1)");
+    if (MP && (pf_rs || pf_own || !qp_man.empty() || !qo_man.empty() || reuse_prefix))
+        die("Flash --prefill: not with GR8_PF_RS, GR8_PF_OWN, --qo-/--qp- packs or --reuse-prefix (P1)");
+
     if (two && knob::pf_streams() == 2)
         die("Flash --pf-lanes 2 uses one compute stream; GR8_PF_STREAMS=2 is not supported");
     if (two && knob::resid_dump())
@@ -650,7 +660,7 @@ int main(int argc, char** argv)
     // (each rank embeds every row). The head writes DIR/vision.s2, so the shim's hello offers `vision`.
     Ds41Vision vis;
     bool vis_on = false;
-    std::string vis_id;   // the loaded tower file's id (ds41_vision_id.h: size + header, not tensor data): in the S2 runtime signature
+    std::string vis_id;   // the loaded tower file's id (vision_id.h: size + header, not tensor data): in the S2 runtime signature
     if (s2mode && release && knob::ds41_vision()) {
         std::string vpath;
         for (const char* rel : {"/exlr8-extra-vision.safetensors", "/dense/exlr8-extra-vision.safetensors"}) {
@@ -662,7 +672,7 @@ int main(int argc, char** argv)
         else if (!knob::ds_prefill_min())
             fprintf(stderr, "# rank %d: ds41 vision off: image prompts prefill, and GR8_DS_PREFILL_MIN is 0\n", R);
         else {
-            vis_id = ds41v::file_id(vpath);
+            vis_id = g6vis::file_id(vpath);
             if (vis_id.empty()) die("DS41 vision: cannot read the safetensors header of " + vpath);
             vis.boot(vpath, 2 * m.hc_rows);
             vis.attach(m);
@@ -799,6 +809,39 @@ int main(int argc, char** argv)
         init_flash_route_split(FP.route_split, fabrs, MP);
         if (two) init_flash_route_split(FP2.route_split, fabrs2, MP);
     }
+    // GLM-5.3-Flash image input (GR8_GLM53F_VISION, default 0, opt-in): with --serve, --prefill and the release, the
+    // vision tower loads here, with its workspace and a pool of image rows for one prefill quantum, so the ready memory
+    // counts it. Every rank runs the tower on its own images (each rank embeds every row). The head writes
+    // DIR/vision.s2 ("glm5v"), so the shim's hello offers `vision` and checks the Flash grids.
+    FlashVision fvis;
+    bool vis_on = false;
+    std::string vis_id;   // the loaded tower file's id (vision_id.h: its size and header), in the S2 runtime signature
+    if (s2mode && release && knob::glm53f_vision()) {
+        std::string vpath;
+        for (const char* rel : {"/dense/vision-bf16.safetensors", "/vision-bf16.safetensors"}) {
+            const std::string c = v2src.dense + rel;
+            if (FILE* fv = fopen(c.c_str(), "rb")) { fclose(fv); vpath = c; break; }
+        }
+        if (vpath.empty())
+            fprintf(stderr, "# rank %d: flash vision off: no dense/vision-bf16.safetensors in --v2-dense\n", R);
+        else if (!MP)
+            fprintf(stderr, "# rank %d: flash vision off: image rows reach the model only through the prefill, and --prefill is 0\n", R);
+        else {
+            vis_id = g6vis::file_id(vpath);
+            if (vis_id.empty()) die("Flash vision: cannot read the safetensors header of " + vpath);
+            const int pool_rows = MP * (two ? 2 : 1);
+            fvis.boot(vpath, pool_rows);
+            fvis.attach(FP);
+            if (two) fvis.attach(FP2);
+            vis_on = true;
+            g6rt::vision_flag() = true;
+            fprintf(stderr, "# rank %d: flash vision: tower %s, %.1f MiB on the device (weights, workspace, %d-row pool, staging)\n",
+                    R, vpath.c_str(), fvis.device_bytes() / (1024.0 * 1024.0), pool_rows);
+            if (R == 0)
+                if (FILE* fv = fopen((s2dir + "/vision.s2").c_str(), "w")) { fputs("glm5v\n", fv); fclose(fv); }
+        }
+    }
+    if (s2mode && R == 0 && !vis_on) std::remove((s2dir + "/vision.s2").c_str());   // a stale one from an earlier boot
 #endif
     u64 ls0b = 1;
     DraftPrefill DQ;
@@ -933,10 +976,14 @@ int main(int argc, char** argv)
         m.s2on = D.d.s2on = false;
     }
 #if G6_MODEL_FLASH
-    // Flash with several sessions: the S2 tables on the --cap pool, main and draft (no S2 below R). The solo graphs below
+    // Flash with several sessions: the S2 tables on the --cap pool, main and draft (S2 below R with GR8_CP). The solo graphs below
     // are captured with s2on off, the batched ones by s2/flash_native.cuh with s2on on
     if (s2mode && s2sess > 1)
     {
+#if defined(G6_CP) && G6_CP
+        // GR8_CP: S2 below R, the pool's page classes (serve_flash): runs below R on the replicated prefix, split runs past it
+        if (cp_on) m.s2_below = D.d.s2_below = cp_R;
+#endif
         s2_init(m, s2sess, st);
         s2_init(D.d, s2sess, st);
         m.s2on = D.d.s2on = false;
@@ -1302,6 +1349,19 @@ int main(int argc, char** argv)
         sc.max_rows = std::min(MX, std::max({s2sess * (mtp + 1), plan.chunk, dfl ? dfl_k + 1 : 0}));   // a round of every session, a prompt chunk, a DFlash2 round
         sc.max_sessions = s2sess; sc.mtp = mtp; sc.prefill_rows = MP; sc.two_lanes = two;
         if (dfl) sc.guard_tokens = 2 * dfl::K;     // a DFlash2 verify writes up to 7 rows past the last token
+        // the prefill/decode interleave, as the GLM block reads it: while sessions decode, prefill quanta of at most
+        // GR8_S2_DECODE_PF rows on one lane and GR8_S2_DECODE_ROUNDS decode rounds per quantum (scheduler.h Config).
+        // Unset, a long prompt runs its quanta with one decode round between them, so the other sessions wait it out
+        {
+            const int v = (int)knob::s2_decode_pf();
+            if (v < 0 || v % 64 || v > MP) die("S2: GR8_S2_DECODE_PF must be 0 or a multiple of 64 no larger than --prefill");
+            sc.decode_prefill_rows = (uint32_t)v;
+        }
+        sc.decode_rounds = (uint32_t)knob::s2_decode_rounds();
+        sc.tail_first = knob::s2_tail_first();
+        sc.notice_max = (uint32_t)knob::s2_notice_max();
+        if (R == 0) fprintf(stderr, "# flash s2 interleave: decode_pf %u rows, decode_rounds %u, tail_first %d, notice_max %u\n",
+                            sc.decode_prefill_rows, sc.decode_rounds, sc.tail_first ? 1 : 0, sc.notice_max);
         bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = cfg.ips[0];
         bc.directory = s2dir; bc.port = s2port;
         bc.timeout = (unsigned)knob::s2_timeout();
@@ -1310,6 +1370,7 @@ int main(int argc, char** argv)
         sig.cap = cap; sig.layers_s = layers_s; sig.MP = MP; sig.lanes = lanes; sig.mtp = mtp; sig.chunk = plan.chunk; sig.nc = nc;
         sig.set_id = set_id; sig.dfl = dfl; sig.dfl_k = dfl_k; sig.dfl_reuse = dfl_reuse; sig.dfl_reuse_min = dfl_reuse_min;
         sig.s2sess = s2sess; sig.gsplit = gsplit; sig.knobs = knob::signature();
+        sig.vis_on = vis_on; sig.vis_id = vis_id;
         // GR8_GLM53F_CACHE: the checkpoint store of this rank. Every rank must keep the same entries, so the mode and
         // the store's blocks join the signature
         std::unique_ptr<g6s2::FlashCheckpoints> ckpt;
@@ -1320,8 +1381,12 @@ int main(int argc, char** argv)
                 for (g6rt::Layer& y : x->layers)
                     if (!y.kda && y.ab.storage)
                     {
+                        int cpb = 0;   // a CP binding keeps this rank's pages only (flash_checkpoint.cuh)
+#if defined(G6_CP) && G6_CP
+                        cpb = y.ab.args.cp_nr ? 1 : 0;
+#endif
                         v.bindings.push_back({static_cast<uint4*>(y.ab.args.mla_cache), static_cast<uint4*>(y.ab.args.index_cache),
-                                              (unsigned long long)(64 * g6kv::ROW / 16), (unsigned long long)(g6kv::IDX_PAGE / 16)});
+                                              (unsigned long long)(64 * g6kv::ROW / 16), (unsigned long long)(g6kv::IDX_PAGE / 16), cpb});
                         v.rings.push_back(static_cast<uint8_t*>(y.ab.args.index_raw));
                     }
             v.ring_bytes = (size_t)g6kv::RAW_RING * g6kv::IDX_RAW;
@@ -1517,6 +1582,10 @@ int main(int argc, char** argv)
                 g6s2::require(k >= 0 && k < D.d.nbk && rows > 0 && rows <= MX && exec_d[k][chain][rows], "Flash draft graph missing");
                 G6RT_CK(cudaGraphLaunch(exec_d[k][chain][rows], st));
             }, gsplit, ckpt.get(), flash_cache == g6s2::FlashCache::Terminal, flash_install};
+#if defined(G6_CP) && G6_CP
+        if (cp_on) { fc.cp_R = cp_R; fc.cp_enqueue = cp_enqueue; fc.cp_pf_error = cp_pf_err; }
+#endif
+        if (vis_on) fc.vision = &fvis;
         try { g6s2::serve_flash(fc, bc, plan.chunk); }
         catch (const std::exception& e) { fprintf(stderr, "g6m4: rank %d Flash serve failed: %s\n", R, e.what()); return 3; }
     }
@@ -1548,9 +1617,25 @@ int main(int argc, char** argv)
         sc.notice_max = (uint32_t)knob::s2_notice_max();
         fprintf(stderr, "# rank %d ds41 s2 scheduler tail_first %d notice_max %u\n", R, sc.tail_first ? 1 : 0, sc.notice_max);
         const int pf_min = (int)knob::ds_prefill_min();
+        // GR8_DS_PF_V2=1 runs v2 where its conditions hold (the fabric plan's knob-time ones, then the release's experts);
+        // elsewhere layers 0..20 run the old range-A path, with one log line naming the failed condition. Every rank
+        // reads the same knobs and the same release, so every rank takes the same path.
+        const char* v2_off = fplan.v2_fallback;
+        if (fplan.ds_pf_v2) v2_off = Ds41V2Engine::model_reason(m);
+        const bool pf_v2 = fplan.ds_pf_v2 && !v2_off;
+        if (knob::ds_pf_v2() && !pf_v2) {
+            const int w = m.hc_rows, fw = ds41::v2::fallback_width(w);
+            if (pf_min && fw != w) {
+                m.hc_rows = fw;   // the old path's chunk rows; the buffers sized for W stay
+                fprintf(stderr, "# rank %d DS41 prefill: GR8_DS_PF_V2=1 not used: %s; the old range-A path runs, W-row chunks of %d rows (not %d)\n",
+                        R, v2_off, fw, w);
+            } else fprintf(stderr, "# rank %d DS41 prefill: GR8_DS_PF_V2=1 not used: %s; the old range-A path runs\n", R, v2_off);
+        }
+        Ds41V2Engine v2engine;
+        const int pf_max = pf_v2 ? ds41::v2::MAX_ROWS : ds41moe::ROMAX;
         // Engram on is allowed with W-row prefill (engine max_rows = W, one chunk in flight -- ds41_prefill_single_lane keeps the engine's one slot safe)
-        if (pf_min && (pf_min < 2 || m.hc_rows <= MX || m.hc_rows > ds41moe::ROMAX || m.qs.on()))
-            die("DS41 W-row prefill needs GR8_DS_PREFILL_MIN>=2, MX<W<=" + std::to_string(ds41moe::ROMAX) + ", and QA/QS split off");
+        if (pf_min && (pf_min < 2 || m.hc_rows <= MX || m.hc_rows > pf_max || m.qs.on()))
+            die("DS41 W-row prefill needs GR8_DS_PREFILL_MIN>=2, MX<W<=" + std::to_string(pf_max) + ", and QA/QS split off");
         if (pf_min && dsk.prefill_keep != 0)
             die("DS41 W-row prefill needs GR8_DS_PREFILL_KEEP=0");
         // GR8_DS_PF_LANES=2 (ds41_lanes.h): two-lane W prefill, quanta of up to 2W rows of one session; unset / 1 = one lane
@@ -1611,7 +1696,7 @@ int main(int argc, char** argv)
                 cp_enqueue(si.step, si.M, si.context);
                 qs_enqueue(si.step, si.M);
             },
-            [&]() -> unsigned { return *f.error | cp_error() | ds41_engram_error(m); },
+            [&]() -> unsigned { return *f.error | cp_error() | ds41_engram_error(m) | (v2engine.v.live ? *v2engine.v.wire.error : 0u); },
             [&](int k, const StepIn& si) {
                 if (!graph) { launch_step(m, si.M, si.context, st, -1, 0, residual_copy); return; }   // eager: the offline loop's launch (rm lambda); reads m.ds_ns
                 g6s2::require(k >= 0 && k < m.nbk && si.M >= 1 && si.M <= MX &&
@@ -1637,6 +1722,13 @@ int main(int argc, char** argv)
         if (pf_tail < 0) die(ds41::br::tail_error(DS41_TEXT(knob::ds_pf_tail())));
         ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1); the value the fabric plan set
         if (ds41::br::l20_tail() && !pf_tail) die("GR8_DS_PF_L20_TAIL=1 needs GR8_DS_PF_TAIL (layer 20 joins the bounded replay)");
+        if (pf_v2 && (!pf_min || !ds41::v2::boot_ok(m.hc_rows, pf_tail, g6nr::NR, pf_lanes,
+                                                    ds41::br::late_layer_start())))
+            die("DS41 v2: the boot's prefill settings differ from the fabric plan's (W, tail, lanes, layer 21)");   // a bug, not a setting
+        if (pf_v2) {
+            v2engine.boot(m,fabv2,st);
+            fprintf(stderr, "# rank %d GR8_DS_PF_V2=1 own-row conductor W=%d, rangeA=0..20, stock tail=128, dedicated port=%d\n", R, m.hc_rows,cfg.port+104);
+        }
         if (pf_min) fprintf(stderr, "# rank %d DS41 prefill bounded replay tail %d (layers >= %d)\n", R, pf_tail, ds41::br::late_layer_start());
         if (pf_min && ds41::br::l20_tail())
             fprintf(stderr, "# rank %d DS41 GR8_DS_PF_L20_TAIL=1: layer 20 in the bounded replay (ca row on every row, the rest of the layer on the tail rows)\n", R);
@@ -1697,12 +1789,32 @@ int main(int argc, char** argv)
                     vis.stage(m, 0, &vc, 1, (int)c.rows, pr, st);
                 }
                 g6s2::require(ds41_idx_set_chunk(&m, c.context) == 0, "DS41 prefill index chunk bound refused");
-                if (skip_late) prepare_ds41_prefill(m, (int)c.rows, st, 0, split.i_late);
+                if (pf_v2) {
+                    const auto& table=ds41_table();
+                    for(int i=0;i<split.i_late;++i)
+                        if(table.prepare_attn && table.prepare_attn(&m,i,(int)c.rows,st))die("DS41 v2 attention prepare failed");
+                    if(!skip_late)prepare_ds41_prefill(m,late,st,split.i_late,m.nl);
+                }
+                else if (skip_late) prepare_ds41_prefill(m, (int)c.rows, st, 0, split.i_late);
                 else if (split.on()) { prepare_ds41_prefill(m, (int)c.rows, st, 0, split.i_late); prepare_ds41_prefill(m, late, st, split.i_late, m.nl); }
                 else prepare_ds41_prefill(m, (int)c.rows, st);
                 if (dsk.on()) { m.dsp.main_lo = 0; m.dsp.main_hi = late; }
                 g6::Fabric::Rs rs; rs.order = coll.order;
-                if (ds41::rs::on(rs_k > 0, 0, rs_k, (int)c.rows, MX, g6nr::NR)) {   // GR8_DS_PF_RS=1: the same rule as the ops' ds41_rs_on
+                if(pf_v2) {
+                    // Range A only rings the dedicated fabric. Main fabric must
+                    // never wait on those old doorbells; keep just stock B.
+                    if(!skip_late) {
+                        auto sizes=coll.sizes; g6::Fabric::Rs late_rs;
+                        for(size_t q=0;q<sizes.size();++q) {
+                            if(q>=size_t(2*split.i_late) && q<size_t(2*m.nl))late_rs.order.push_back(int(q));
+                            else sizes[q]=0;
+                        }
+                        fab.enqueue_step(c.sequence,sizes,late_rs);
+                    }
+                    m.ds41_rowshard_chunk=false; m.ds41_rowshard_state=false;
+                    m.ds41_rowshard_pending_c=-1; m.ds41_y_quant_ready=false;
+                }
+                else if (ds41::rs::on(rs_k > 0, 0, rs_k, (int)c.rows, MX, g6nr::NR)) {   // GR8_DS_PF_RS=1: the same rule as the ops' ds41_rs_on
                     const size_t rb = (size_t)HID * 2;
                     if (const char* e = ds41::rs::job_error(coll.sizes, NC, rs_k, (int)c.rows, g6nr::NR, rb)) g6s2::require(false, e);
                     const bool shard_chunk=ds41::rowshard::chunk_on(rowshard,(int)c.rows,late,g6nr::NR);
@@ -1745,7 +1857,18 @@ int main(int argc, char** argv)
                     fprintf(stderr, "# rank %d request %llu chunk %u rows %u late tail skipped (rows after %d)\n", R, (unsigned long long)c.request, c.first, c.rows, rows_after);
                 // skip_late: range A without its last op ST_PF_COMPACT (split.b - 1, check_split), no range B
                 Ds41SpanPass span_pass(R, (int)c.rows, st, 0);   // GR8_DS_SPAN: the chunk's ops, a mark each
-                ds41::Stop stop = ds41_run_pass(split.ops, 0, skip_late ? split.b - 1 : split.b, &m, (int)c.rows, st, span_pass);
+                const size_t range_a_end = skip_late ? split.b - 1 : split.b;
+                ds41::Stop stop;
+                if (pf_v2) {
+                    v2engine.v.widths.select(c.request,c.slot,R);
+                    v2engine.moe.select_request(c.request,c.slot,R);
+                    v2engine.v.attn_pipe.select(c.request,c.slot);
+                    if (v2engine.v.attn_pipe.on) ds41_attn_set_pipe(1);
+                    ds41::v2::timing_begin_chunk(v2engine.v,c.request,c.first,c.rows);
+                    v2engine.run(m,(int)c.rows,split.i_late,skip_late);
+                    if (v2engine.v.attn_pipe.on) ds41_attn_set_pipe(0);
+                    ds41::v2::timing_end_chunk(v2engine.v);
+                } else stop = ds41_run_pass(split.ops, 0, range_a_end, &m, (int)c.rows, st, span_pass);
                 if (!stop.stopped && split.on() && !skip_late) {   // range B: the layers >= 21 over the chunk's last `late` rows (now rows 0 .. late-1)
                     ds41_attn_set_win_floor(ds41::br::win_floor((int)c.context, (int)c.rows, pf_tail));
                     stop = ds41_run_pass(split.ops, split.b, split.ops.size(), &m, late, st, span_pass);
@@ -1762,6 +1885,10 @@ int main(int argc, char** argv)
                 if (dsk.on()) { m.dsp.main_lo = 0; m.dsp.main_hi = -1; }
             };
             dc.after_prefill = [&](const g6s2::Ds41PrefillChunk& c) {
+                // Native already fenced this chunk. Retire diagnostics here so
+                // long requests retain all spans; request/chunk IDs and drops
+                // remain in the report. No new fence (default-off diagnostic).
+                if(pf_v2)ds41::v2::timing_report(v2engine.v,c.request);
                 std::vector<dsr::ExpertLogRec> records;
                 const int n = ds41moe::elog_read(&m, records, true);
                 g6s2::require(n >= 0, "DS41 prefill distinct-expert counter read failed");
@@ -2058,6 +2185,8 @@ int main(int argc, char** argv)
         }
         try { g6s2::serve_ds41(dc, bc, plan.chunk); }
         catch (const std::exception& e) { fprintf(stderr, "g6m4: rank %d DS41 serve failed: %s\n", R, e.what()); return 3; }
+        if(pf_v2) v2engine.release();
+        if(fplan.find(FabKind::Ds41V2)) fabv2.stop_proxy();   // planned, even where the release's experts kept v2 off
     }
 #else
     if (s2mode)
@@ -3050,6 +3179,20 @@ int main(int argc, char** argv)
                 catch (const std::exception& e) { fprintf(stderr, "# rank %d: s2 stores: drain at quit failed: %s\n", R, e.what()); }
             }
             links.shutdown();
+            // GR8_QUIT_FAST=1: the stores hold what they keep (their index records are written as each copy commits), so
+            // the ranks meet at the end-of-run barrier here and the process ends. Without it the scope ends first: every
+            // CUDA graph is destroyed one by one (hundreds, each its own driver calls) before that barrier, and the
+            // slowest rank holds the others there. Process exit frees the device memory, the graphs and the context
+            if (knob::quit_fast())
+            {
+                fab.wait_proxy_idle();
+                fab.barrier();
+                fab.stop_proxy();
+                fprintf(stderr, "# rank %d: quit fast: past the barrier, exiting without the teardown\n", R);
+                fflush(stdout);
+                fflush(stderr);
+                _exit(0);
+            }
         }
         catch (const std::exception& e)
         {
@@ -3206,9 +3349,18 @@ int main(int argc, char** argv)
                     };
                 }
                 const auto t0 = std::chrono::steady_clock::now();
+                // GR8_CP: a sub-batch past R runs on the staged view (prefill.cuh cp_pf_*); below R on the replicated prefix
+#if defined(G6_CP) && G6_CP
+                const bool staged = cp_pf && a + M + MB > cp_R;
+#else
+                const bool staged = false;
+#endif
+                if (staged) cp_pf_in();
                 if (MB) pf_step2_flash(m, FP, FP2, M, MB, a + M, a + M + MB, ls0, ls0b, st);
                 else pf_step_flash(m, FP, M, a + M, ls0, st, pf_copy);
+                if (staged) cp_pf_out();
                 G6RT_CK(cudaStreamSynchronize(st));
+                if (staged && cp_pf_err()) { fprintf(stderr, "g6m4: rank %d CP staging fabric error word %08x, seq %zu rows %d..\n", R, cp_pf_err(), q, a); return 3; }
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                 ls0 += NL;
                 if (MB) ls0b += NL;

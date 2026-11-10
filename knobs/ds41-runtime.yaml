@@ -1,6 +1,16 @@
 # DeepSeek-V4.1-Flash (MODEL=ds41) step driver, prefill and serving. Read only by a DS41 build.
 prefix: "GR8_DS"
 knobs:
+  GR8_DS_PF_V2_ATTN_PIPE:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      V2 prefill only: pipeline two packed K stages in the cp.async CQ attention core, preserving bf16 operands and arithmetic order.
+      Needs GR8_DS_PF_V2=1, GR8_DS_ATTN_CPA=1 and packed compressed rows (GR8_DS_COMP_FP4=1) to select the new kernel.
+      Window-only, bounded replay, decode and eligible split launches stay unchanged. Mixed window/CQ blocks stay serial.
+      Logs request/on once per v2 request per rank, including on=0. Default 0 keeps the original kernels.
   GR8_DS_BLOCK:
     scope: agree
     kind: text
@@ -18,7 +28,7 @@ knobs:
   GR8_DS_CACHE_MIB:
     scope: local
     kind: int
-    unset: "the prefix cache's own size"
+    unset: "4096 MiB per rank"
     values: "1.."
     legacy: ["G6_DS41_CACHE_MIB"]
     doc: >-
@@ -140,6 +150,105 @@ knobs:
     unset: "0, no drafts"
     doc: >-
       DSpark drafts verified a round, 1..5 (the checkpoint's three draft layers, block of 5). Served only.
+  GR8_DS_PF_V2:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      The v2 sequence-parallel prefill for layers 0..20 of a W-row chunk. Own-row residual state,
+      a dedicated fabric and high-priority communication stream; late layers remain on the stock path.
+      The launcher sets 1 for DS41 (the release stack); EXACT=1 leaves it unset. It runs where these hold:
+      serve, W-row prefill, TP4, W 256..8192 in steps of 256, GR8_DS_PF_TAIL 128, one lane, no
+      GR8_DS_PF_L20_TAIL, GR8_DS_SH_TC=1, no GR8_DS_MHC_ROW_SHARD, and native MXFP4 experts in layers 0..20.
+      Elsewhere the boot logs one line naming the failed condition and runs the old range-A path, with
+      W-row chunks of at most 4096 rows. 0 runs the old path.
+  GR8_DS_PF_V2_GATE_RO:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      V2 FFN own-row gate only: use the existing read-once register-tile gate
+      for 384 experts. Default 0 retains k_gate_logits_mt; other expert counts
+      retain that kernel. Independent of GR8_DS_GATE_RO. Logs on/off once per
+      request per rank; shared-memory opt-in is set at scratch initialization.
+  GR8_DS_PF_V2_RS_BLOCKS:
+    scope: local
+    kind: ints
+    default: "48"
+    doc: >-
+      V2 FFN reduce-scatter only. The default, 48, runs the reduce with 48 blocks;
+      0 selects the eight-block scalar reduce kernel.
+      Otherwise a comma list of positive block counts (e.g. 48,192,1024);
+      request ID r selects list[r % length], logged once per request per rank.
+      Uses aligned 16-byte cache-volatile loads and 16-byte stores with a scalar tail,
+      preserving the original FP32 rank summation order. Mixed zero/nonzero lists
+      are invalid. Boot gathers and non-v2 paths are unchanged.
+  GR8_DS_PF_V2_PACK_BLOCKS:
+    scope: local
+    kind: ints
+    default: "48"
+    doc: >-
+      V2 wire pack/unpack only (AG, A2A and RS). The default, 48, packs with 48 blocks;
+      0 selects the old eight blocks.
+      Otherwise a comma list of positive block counts (e.g. 48,192,1024);
+      request ID r selects list[r % length], logged once per request per rank.
+      Retains the existing aligned 16-byte copies and scalar ragged/unaligned
+      fallback, without changing kernels. Mixed zero/nonzero lists are invalid.
+      Boot gathers retain eight blocks. Independent of GR8_DS_PF_V2_RS_BLOCKS.
+  GR8_DS_PF_V2_STRIPE_MIN:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0.."
+    doc: >-
+      Dedicated v2 fabric only: positive N sets the dual-rail payload striping
+      threshold in bytes. The existing proxy keeps its 8192-byte floor, so the
+      effective threshold is max(N, 8192); the first half is rounded down to
+      4096 bytes. Needs two mesh rails (--ips2) to stripe; one rail or a TP4
+      ring keeps the existing transport. Logs min, rails and effective_min once
+      per boot per rank. 0 leaves the inherited fabric configuration unchanged
+      (normally no striping; an existing GR8_DS_STRIPE setting is preserved).
+      No effect when GR8_DS_PF_V2=0. Wire bytes and tail ordering are unchanged.
+  GR8_DS_PF_V2_XTRACE:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_XTRACE=1 and GR8_DS_PF_V2=1, trace the dedicated v2 fabric,
+      independently of GR8_XTRACE_PF. GPU producer, publish, peer-tail,
+      consume and join stamps accompany the existing proxy doorbell/post stamps.
+      Also enables v2 per-chunk timing and epoch/request/layer correlation on stderr,
+      with layer/attention/Engram/dispatch/FC1/FC2/combine/assemble boundaries and
+      separate pack-publication, peer wait, unpack and reduce event intervals.
+      Uses GR8_XTRACE_OUT/QUIT; retains the last 64 fabric epochs (one per v2
+      layer, including boot gathers), not a complete long request. Default 0
+      leaves v2's kernels, launches and timing setting unchanged.
+  GR8_DS_PF_V2_TIMING:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_PF_V2=1, record per-layer compute/communication CUDA-event pairs
+      into a bounded ring and print per chunk at the existing completion fence.
+      Reports request id and chunk first-token offset, with intervals relative to
+      that chunk's start to expose stream overlap. Retires each chunk's samples so
+      long requests can reuse the ring without accumulating events.
+      Never synchronizes the GPU; not-ready or overflow samples are labelled.
+      Default 0 allocates no timing events and leaves the stock path unchanged.
+  GR8_DS_PF_V2_FC2:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_PF_V2=1, use the experimental resident-weight routed-expert down kernel:
+      each CTA holds one 128-column weight slab across all bucketed rows, with heavy experts first.
+      Default 0 retains the grouped stock tensor-core kernel. Has no effect when V2 is off.
+
   GR8_DS_PF_DIRECT:
     scope: agree
     kind: flag
@@ -161,6 +270,7 @@ knobs:
     unset: "1, one lane"
     doc: >-
       1 or 2. 2 runs W-row prefill quanta of up to 2W rows of one session on two lanes with their own streams and fabric.
+      The launcher sets 1 for DS41 (v2 needs one lane) and 2 with EXACT=1.
   GR8_DS_PF_LATE_FINAL:
     scope: agree
     kind: flag

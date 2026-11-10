@@ -94,6 +94,20 @@ __device__ __forceinline__ void publish(const g6::FabricDev& f, int c, u64 seq, 
     }
 }
 
+// publish without a ticket: for a separate one-CTA launch, stream-ordered after every CTA that stored into the send
+// slot has exited (the DS41 v2 wire, runtime/ds41_v2.cuh). Thread 0 fences and rings doorbell[c] = seq.
+__device__ __forceinline__ void publish_after(const g6::FabricDev& f, int c, u64 seq)
+{
+    if (threadIdx.x == 0)
+    {
+        u64* xr = f.xt ? xt_rec(f, (seq - 1) / f.ncoll, c) : nullptr;
+        if (xr) xr[g6::XT_PUB] = xt_now();
+        __threadfence_system();
+        st_release_sys(reinterpret_cast<u64*>(f.doorbell) + c, seq);
+        if (xr) { xr[g6::XT_DB] = xt_now(); xr[g6::XT_SEQ] = seq; }
+    }
+}
+
 #ifdef PF_RNPUB
 // PF_RNPUB: publish once per cluster instead of once per CTA. Call from all threads of every CTA of a cluster kernel
 // whose cluster ended with a cluster barrier (barrier.cluster arrive.release / wait.acquire) after its last store into

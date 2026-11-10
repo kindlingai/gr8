@@ -1117,8 +1117,11 @@ impl Control {
     // --- every rank's watcher
 
     /// Fails on the shim's abort.s2. On DIR/quit stops at once, the head passes the quit to the workers, and the links
-    /// stay open for linger_ms (so a worker reads EOF only after it is stopping too) before the channel fails. Quit is
-    /// for an idle engine: a rank stopping mid-round leaves its peers' step.
+    /// stay open (so a worker reads EOF only after it is stopping too) before the channel fails. The linger ends early
+    /// once the quit has settled: a worker that is stopping and has the head's quit closes its send side, the head
+    /// fails the channel once every worker did, and a worker once the head's link closed. linger_ms bounds the wait
+    /// (a head that never sends its quit, a worker that never answers). Quit is for an idle engine: a rank stopping
+    /// mid-round leaves its peers' step.
     pub fn monitor(&self, linger_ms: u32) -> R<()> {
         let (abort, quit) = (self.path("abort.s2"), self.path("quit"));
         while !self.stopping() {
@@ -1129,7 +1132,15 @@ impl Control {
                 }
                 self.stop();
                 let end = Instant::now() + Duration::from_millis(u64::from(linger_ms));
+                let e = self.endpoint();
                 while Instant::now() < end && !exists(&abort) {
+                    // stopping (above) before the close, so the head's close cannot reach a rank that is still running
+                    if !self.head && e.quit_received() {
+                        e.close_send();
+                    }
+                    if e.quit_settled() {
+                        break;
+                    }
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 self.shutdown();

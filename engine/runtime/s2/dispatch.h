@@ -80,6 +80,7 @@ class Dispatch {
     std::array<bool, MAX_SESSIONS> have_main_{};
     std::array<g6rt::PrefixReuse, MAX_SESSIONS> rows_;   // prefix reuse: each session's written rows (main, draft, prefill)
     bool track_ = false;
+    bool drafts_ = true;                                  // the sessions run draft steps (MTP > 0)
     int* gm_on_ = nullptr; uint32_t* gm_bits_ = nullptr; int gm_words_ = 0;   // the grammar masks (set_grammar)
     g6rt::PenRow* pen_rows_ = nullptr; g6rt::PenSess* pen_sess_ = nullptr;    // the penalty tables (set_penalty)
     std::array<int, MAX_SESSIONS> pen_synced_{};                              // per slot: Session::out tokens the device counts hold
@@ -107,7 +108,9 @@ public:
         const int next = live == 1 ? q : -1;
         if (next != solo_ || mode_dirty_) { m_.mode(solo_, next); solo_ = next; mode_dirty_ = false; }
     }
-    void track_rows() { track_ = true; }
+    // Prefix reuse on. drafts: the scheduler runs draft steps (Config::mtp > 0). With drafts off no draft step writes
+    // draft rows, so the main step's rows count as both.
+    void track_rows(bool drafts) { track_ = true; drafts_ = drafts; }
     // Grammars (grammar.h): before every step, on[r] = 1 where row r's sample follows its session's grammar, with the
     // row's mask at bits + r * words; the head reads both (rank.cuh launch_head_local). Draft steps are not masked.
     void set_grammar(int* on, uint32_t* bits, int words) { gm_on_ = on; gm_bits_ = bits; gm_words_ = words; }
@@ -176,7 +179,10 @@ public:
             const int first = sp.r[sp.row0[j]].pos, n = sp.rows[j];
             if (!draft) {
                 w.main_rows(first, n);
-                if (g6mod::has(G6_CAP_DSPARK) && (sp.round < 0 || n == 1)) w.draft_rows(first, n, false);   // DSpark keys come from the main step's rows
+                // Draft rows follow the main rows when no draft step writes them. With drafts off no draft step runs,
+                // and a forced (insert rule) step writes several rows inside a round. With DSpark, the main rows of a
+                // prompt step or a one-row step give the DSpark keys.
+                if (!drafts_ || (g6mod::has(G6_CAP_DSPARK) && (sp.round < 0 || n == 1))) w.draft_rows(first, n, false);
             } else w.draft_rows(first, n, sp.kind == s2::Step::CHAIN);
         }
         return ids;

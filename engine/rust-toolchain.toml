@@ -1,0 +1,7 @@
+# One compiler for the image and every pin. Keep this channel equal to
+# Dockerfile ARG RUST_VERSION, rust-toolchain.toml (repo root; host and CI cargo
+# run from there with --manifest-path, so rustup does not read this file then),
+# frontend/g6front-rs/rust-toolchain.toml and frontend/pseudo-engine/rust-toolchain.toml.
+[toolchain]
+channel = "1.94.1"
+profile = "minimal"

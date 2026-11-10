@@ -328,6 +328,27 @@ uint64_t agreement_section(uint64_t seed, std::vector<std::string>* lines) {
     }
     return tx.h;
 }
+// Check every ACK subset through the C ABI, including a complete six-rank set. A Rust optimizer regression can
+// return 255 for true: branching may work, but the bool representation and promotion used by the transcript do not.
+void agreement_ready_test() {
+    for (unsigned nr = 1; nr <= 6; ++nr) {
+        for (unsigned mask = 0; mask < (1u << nr); ++mask) {
+            Notice n;
+            Agreement a(nr, n);
+            for (unsigned rank = 0; rank < nr; ++rank) {
+                if (mask & (1u << rank)) {
+                    Ack k; k.notice = n; k.rank = rank; k.state_hash = 7;
+                    a.ack(k);
+                }
+            }
+            const bool ready = a.ready();
+            unsigned char raw = 0;
+            static_assert(sizeof ready == sizeof raw, "control bool width");
+            std::memcpy(&raw, &ready, sizeof raw);
+            require(raw == unsigned(mask == (1u << nr) - 1), "noncanonical or incorrect agreement readiness");
+        }
+    }
+}
 // the bootstrap's first differing word
 uint64_t difference_section(uint64_t seed, std::vector<std::string>* lines) {
     Tx tx; tx.lines = lines;
@@ -399,6 +420,7 @@ int main(int argc, char** argv) {
             }
         return 2;
     }
+    agreement_ready_test();
     int fails = 0;
     for (const auto& s : sections) {
         const uint64_t h = s.run(s.seed, nullptr);

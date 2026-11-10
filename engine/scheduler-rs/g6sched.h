@@ -239,7 +239,7 @@ struct g6sch_parsed;
 // must not throw.
 typedef const char* (*g6sch_resolve_fn)(void* ctx, bool has_profile, const uint8_t* profile, size_t profile_n,
                                         uint32_t scale_bits, g6sch_identity* out);
-// the caller's `img` field (DS41, ds41_image.h): null when kept, or its refusal (valid until the caller's next call).
+// the caller's `img` field (images, image_input.h): null when kept, or its refusal (valid until the caller's next call).
 // Called once per field, in order. It must not throw. resolve and image share ctx.
 typedef const char* (*g6sch_image_fn)(void* ctx, const uint8_t* field, size_t field_n);
 // The version of g6sch_parse_request's parameters and callback types, which no compiler checks across the C ABI:

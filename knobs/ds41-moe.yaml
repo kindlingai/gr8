@@ -117,4 +117,5 @@ knobs:
       1: the shared expert of the read-once prefill path runs on the tensor-core MXFP8 GEMM (x and act quantized to E4M3
       per 32 with E8M0 scales), and the combine reads its bf16 output. Not bit-identical to 0. Decode and the chunked
       path keep the GEMV. Costs a plain copy of the shared weights per MoE layer (9,461,760 bytes) plus scratch, and
-      needs the attention object's ds41_gemm_mx_tc and ds41_sh_* entries linked.
+      needs the attention object's ds41_gemm_mx_tc and ds41_sh_* entries linked. The v2 prefill (GR8_DS_PF_V2) needs 1.
+      The launcher sets 1 for DS41; EXACT=1 leaves it unset (exact output).

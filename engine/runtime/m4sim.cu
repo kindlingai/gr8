@@ -299,7 +299,7 @@ int main(int argc, char** argv)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     if (knob::init()) return 2;        // every bad GR8_ value and unknown name at once (docs/ENV.md)
-    pf_env_check();                    // strict G6_PF_* choices (envparse.h): a bad value exits before any work
+    pf_env_check();                    // strict GR8_PF_* choices (pf_env_check, prefill.cuh): a bad value exits before any work
 #if G6_MODEL_FLASH
     {   // GR8_MOE_TOPK (model change, screen arm): unset = the model's top-k
         const int tk = (int)knob::moe_topk();
@@ -470,13 +470,22 @@ int main(int argc, char** argv)
     bool cp_seg = false;                //       GR8_CP_STEP_SEG
     (void)cp_step; (void)cp_seg;
 #if defined(G6_CP) && G6_CP
-    // CP: GR8_CP=0|1 (default 1 in a CP build), GR8_CP_R (replicated prefix tokens, multiple of 64, default 0),
+    // CP: GR8_CP=0|1 (default 1 in a CP build, 0 in the Flash build), GR8_CP_R (replicated prefix tokens, multiple of 64, default 0),
     // GR8_CP_S3=0|1 (default 1), GR8_CP_MMAX (CP fabric rows, default = the most rows of any step)
-    const bool cp_on = knob::cp().value_or(true);
+    const bool cp_on = knob::cp().value_or(!G6_MODEL_FLASH);   // Flash: off unless asked for
     const int cp_R = (int)knob::cp_r();
     const int cp_s3 = knob::cp_s3();
+#if G6_MODEL_FLASH
+    if (cp_on && s2mode) die("Flash GR8_CP: not with --s2");
+    if (cp_on && MP)
+        for (const auto& p : plans)
+            if ((int)p.prompt.size() > cp_R) die("Flash --prefill with GR8_CP: a prompt longer than GR8_CP_R (the prefill runs below R only)");
+#endif
     int cp_mmax = mtp + 1;
     for (int M : row_counts) cp_mmax = std::max(cp_mmax, M);
+#if G6_MODEL_FLASH
+    cp_mmax = MX;   // as g6m4: a CP step may carry any decode step's rows
+#endif
 #ifdef DEC_S2
     // --s2 + GR8_CP_STEP_ROWS=n: as g6m4, the rounds whose step runs past R take at most n rows (s2/cp_rows.h) and the CP
     // loopback is sized for n. (An --s2 run's sessions stay below GR8_S2_BELOW <= R, so here the cap never engages.)
@@ -500,9 +509,9 @@ int main(int argc, char** argv)
         die("GR8_CP_R2 must be a multiple of 64 below GR8_CP_R, with GR8_CP on and GR8_TEST_S2_XLIST (the runs it lays out)");
     g6::CpColls cp_colls;
     {
-        std::vector<bool> full;
-        for (int l : layers) full.push_back(cp_full_index(l));
-        cp_colls.make(full, NR, cp_mmax);
+        std::vector<bool> full, attn;   // attn: the layers with an attention block (Flash: not the KDA layers)
+        for (int l : layers) { full.push_back(cp_full_index(l)); attn.push_back(cp_attn_layer(l)); }
+        cp_colls.make(full, NR, cp_mmax, attn);
     }
     g6::VLayout cp_L;
     cp_L.make(NR, cp_colls.cap, cp_colls.dst_k);
@@ -702,7 +711,7 @@ int main(int argc, char** argv)
 #if defined(G6_CP) && G6_CP
         if (cp_on)
             for (int c = 0; c < cp_colls.ncoll(); ++c) R[r].cp.vs.push_back(cp_L.vslot(c, r, cp_send[r], cp_recv[r], cp_bell[r], err));
-        if (cp_on && MP) cp_pf_alloc(R[r], st);     // step 4: prefill staging pools
+        if (cp_on && MP && !G6_MODEL_FLASH) cp_pf_alloc(R[r], st);     // step 4: prefill staging pools (Flash: none, it prefills below R)
 #endif
         R[r].graph = graph; R[r].in = in; R[r].out = out + r;
         loop.send[r] = f.send;
@@ -1141,6 +1150,17 @@ int main(int argc, char** argv)
     // layer i's attention block on every rank: the CP block in its three phases with the loopback between them
     auto attn_all = [&](int i, int M, int context) {
         if (!cp_block(R[0], context)) { attn_qs(rptr, qsl, i, M, context); return; }
+#if G6_MODEL_FLASH
+        // Flash: a KDA layer has no CP block; a DSA layer runs launch_dsa_cp's phases (flash_dsa.cuh)
+        if (R[0].layers[i].kda) { attn_qs(rptr, qsl, i, M, context); return; }
+        for (Model& m : R) launch_dsa_block(m, i, M, context, st, 0);
+        vdeliver(cp_colls.q[i], M);
+        vdeliver(cp_colls.cand[i], M);
+        for (Model& m : R) launch_dsa_block(m, i, M, context, st, 1);
+        for (int k = 1; k < NR; ++k) vdeliver(cp_colls.part[(size_t)i * (NR - 1) + k - 1], M);
+        for (Model& m : R) launch_dsa_block(m, i, M, context, st, 2);
+        return;
+#endif
         {
             const std::vector<int> gs = R[0].qs.layer_gathers(i);     // phase 0 in gather phases
             for (size_t p = 0; p <= gs.size(); ++p)
@@ -1265,7 +1285,7 @@ int main(int argc, char** argv)
 #if defined(G6_CP) && G6_CP
     // step 4 (prefill.cuh cp_pf_*): staged view around a prefill sub-batch; gather layer i before its first attention
     // block, copy the rows back after its last
-    const bool cp_pf = cp_on && MP;
+    const bool cp_pf = cp_on && MP && !G6_MODEL_FLASH;
     // negative control (gate4.sh): GR8_TEST_CP_PF_BREAK=gather|back skips that half of the staging (the gate must then FAIL)
     const std::string cp_break = knob::test_cp_pf_break().value_or("");
     auto cp_enter = [&]() { if (cp_pf) for (Model& m : R) cp_pf_enter(m); };

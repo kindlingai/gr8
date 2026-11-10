@@ -1,5 +1,8 @@
-//! DeepSeek-V4.1 image input: the release's `inference/image_processor.py` (`load_image`) in Rust, up to the uint8 RGB
-//! the vision tower reads, so the engine gets exactly the pixels the official code would build.
+//! Image input: each model's image processor in Rust, up to the uint8 RGB its vision tower reads, so the engine gets
+//! exactly the pixels the reference code would build. `Model` picks the model: DeepSeek-V4.1 (below) or GLM-5.3-Flash
+//! (`glm5v`).
+//!
+//! DeepSeek-V4.1: the release's `inference/image_processor.py` (`load_image`).
 //!
 //! An image is decoded (first frame), converted as PIL's `convert("RGB")` does (alpha dropped, not composited; grey
 //! replicated; no EXIF rotation), planned (`plan_image_grid`: the min_pixels upscale, the patch rounding and the token
@@ -11,6 +14,9 @@
 //!
 //! In the prompt an image is `n_llm_h * (n_llm_w + 1) + 2` copies of the image token (`num_image_tokens`); the engine
 //! gets the padded RGB and the patch grid (`vit_h x vit_w`, 14 px patches) for each span.
+//!
+//! GLM-5.3-Flash: transformers' `Glm5NextImageProcessor` (PIL backend), in `glm5v` (docs/FLASH-VISION.md). An image is
+//! `vit_h * vit_w / 4` copies of `<|image|>` between the template's `<|begin_of_image|>` and `<|end_of_image|>`.
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
@@ -391,19 +397,49 @@ pub fn decode_rgb(bytes: &[u8]) -> Result<Rgb, VisionError> {
 /// An image ready for the engine.
 #[derive(Clone, Debug)]
 pub struct Prepared {
-    pub plan: Plan,
+    /// the patch grid (14 px patches)
+    pub vit_h: usize,
+    pub vit_w: usize,
+    /// the image's span in the prompt, in image tokens
+    pub n_span: usize,
     /// sha256 over (vit_h u32 LE, vit_w u32 LE, rgb), first 16 hex digits
     pub key: String,
-    /// best_h x best_w x 3
+    /// (vit_h * 14) x (vit_w * 14) x 3
     pub rgb: Vec<u8>,
 }
 
-impl Prepared {
-    pub fn vit_h(&self) -> usize {
-        self.plan.vit_h()
+/// The model whose image processor and image token a request's images take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Model {
+    Ds41,
+    Glm5v,
+}
+
+impl Model {
+    /// the image token: the prompt's placeholder, and every token of an image span
+    pub fn token(self) -> u32 {
+        match self {
+            Model::Ds41 => IMAGE_TOKEN_ID,
+            Model::Glm5v => glm5v::IMAGE_TOKEN_ID,
+        }
     }
-    pub fn vit_w(&self) -> usize {
-        self.plan.vit_w()
+    pub fn prepare_rgb(self, im: &Rgb) -> Result<Prepared, VisionError> {
+        match self {
+            Model::Ds41 => prepare_rgb(im),
+            Model::Glm5v => glm5v::prepare_rgb(im),
+        }
+    }
+    /// Base64 image data -> what the engine gets.
+    pub fn prepare_b64(self, b64: &str) -> Result<Prepared, VisionError> {
+        self.prepare_rgb(&decode_rgb(&b64_decode(b64)?)?)
+    }
+    /// The span alone, from the image's header (for /tokenize, which counts the prompt without building the pixels).
+    pub fn n_span_b64(self, b64: &str) -> Result<usize, VisionError> {
+        let (w, h) = dims_b64(b64)?;
+        Ok(match self {
+            Model::Ds41 => plan_image_grid(w, h).n_span(),
+            Model::Glm5v => glm5v::plan(w, h).tokens(),
+        })
     }
 }
 
@@ -421,7 +457,110 @@ pub fn prepare_rgb(im: &Rgb) -> Result<Prepared, VisionError> {
     let plan = plan_image_grid(im.w, im.h);
     let rgb = pad(&im.px, im.w, im.h, plan.best_w, plan.best_h)?;
     let key = content_key(plan.vit_h(), plan.vit_w(), &rgb);
-    Ok(Prepared { plan, key, rgb })
+    Ok(Prepared { vit_h: plan.vit_h(), vit_w: plan.vit_w(), n_span: plan.n_span(), key, rgb })
+}
+
+/// GLM-5.3-Flash: transformers' `Glm5NextImageProcessor` (PIL backend) up to the padded uint8 RGB, with the release's
+/// processor_config.json (patch 14, merge 2, temporal patch 2, 16 to 8000 image tokens). docs/FLASH-VISION.md has the
+/// steps.
+pub mod glm5v {
+    use super::{content_key, resize_bicubic, Prepared, Rgb, VisionError, PATCH};
+
+    /// `image_token_id`: `<|image|>`, the template's placeholder and every token of an image span
+    pub const IMAGE_TOKEN_ID: u32 = 154_854;
+    pub const MERGE: usize = 2;
+    pub const TEMPORAL: usize = 2;
+    pub const MIN_TOKENS: usize = 16;
+    pub const MAX_TOKENS: usize = 8000;
+    /// the canvas is a multiple of this (patch * merge * patch_expand_factor)
+    pub const FACTOR: usize = PATCH * MERGE;
+
+    /// The canvas (target) and the size the image is resized to inside it (content); the rest is zero padding on the
+    /// right and the bottom.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Plan {
+        pub target_h: usize,
+        pub target_w: usize,
+        pub content_h: usize,
+        pub content_w: usize,
+    }
+
+    impl Plan {
+        pub fn vit_h(&self) -> usize {
+            self.target_h / PATCH
+        }
+        pub fn vit_w(&self) -> usize {
+            self.target_w / PATCH
+        }
+        pub fn tokens(&self) -> usize {
+            (self.vit_h() / MERGE) * (self.vit_w() / MERGE)
+        }
+    }
+
+    fn align(v: usize, f: usize) -> usize {
+        v.div_ceil(f) * f
+    }
+
+    /// `smart_resize(num_frames=2, height, width, temporal_factor=2, factor=28, min_pixels=16, max_pixels=8000)`, in
+    /// f64 where Python computes in floats.
+    pub fn smart_resize(height: usize, width: usize) -> (usize, usize) {
+        let (f, frames) = (FACTOR, TEMPORAL);
+        let ppt = TEMPORAL * f * f;
+        let (min_pixels, max_pixels) = (MIN_TOKENS * ppt, MAX_TOKENS * ppt);
+        let (mut ah, mut aw) = (align(height, f), align(width, f));
+        let mut budget = frames * ah * aw;
+        if budget < min_pixels {
+            let scale = (min_pixels as f64 / (frames * height * width) as f64).sqrt();
+            ah = align(((height as f64 * scale).ceil() as usize).max(1), f);
+            aw = align(((width as f64 * scale).ceil() as usize).max(1), f);
+            budget = frames * ah * aw;
+        }
+        if budget > max_pixels {
+            // fit_within_budget: the tallest content height whose aligned canvas fits, by bisection
+            let (mut low, mut high) = (1i64, height as i64);
+            let (mut bh, mut bw) = (f, f);
+            while low <= high {
+                let ch = ((low + high) / 2) as usize;
+                let cw = ((width as f64 * ch as f64 / height as f64).floor() as usize).max(1);
+                let (th, tw) = (align(ch, f), align(cw, f));
+                if frames * th * tw <= max_pixels {
+                    (bh, bw) = (th, tw);
+                    low = ch as i64 + 1;
+                } else {
+                    high = ch as i64 - 1;
+                }
+            }
+            (ah, aw) = (bh, bw);
+        }
+        (ah, aw)
+    }
+
+    /// The processor's `resize`: the canvas, and the content size (the image is not scaled up unless it is below the
+    /// token floor).
+    pub fn plan(width: usize, height: usize) -> Plan {
+        let (th, tw) = smart_resize(height, width);
+        let mut scale = (th as f64 / height as f64).min(tw as f64 / width as f64);
+        if TEMPORAL * height * width >= TEMPORAL * FACTOR * FACTOR * MIN_TOKENS {
+            scale = scale.min(1.0);
+        }
+        let ch = ((height as f64 * scale).floor() as usize).min(th).max(1);
+        let cw = ((width as f64 * scale).floor() as usize).min(tw).max(1);
+        Plan { target_h: th, target_w: tw, content_h: ch, content_w: cw }
+    }
+
+    /// RGB -> the padded RGB the processor builds before it rescales: Pillow's BICUBIC to the content size when that
+    /// differs, then zeros (black) to the canvas on the right and the bottom.
+    pub fn prepare_rgb(im: &Rgb) -> Result<Prepared, VisionError> {
+        let p = plan(im.w, im.h);
+        let content = resize_bicubic(&im.px, im.w, im.h, p.content_w, p.content_h);
+        let mut rgb = vec![0u8; p.target_h * p.target_w * 3];
+        for y in 0..p.content_h {
+            let o = y * p.target_w * 3;
+            rgb[o..o + p.content_w * 3].copy_from_slice(&content[y * p.content_w * 3..(y + 1) * p.content_w * 3]);
+        }
+        let key = content_key(p.vit_h(), p.vit_w(), &rgb);
+        Ok(Prepared { vit_h: p.vit_h(), vit_w: p.vit_w(), n_span: p.tokens(), key, rgb })
+    }
 }
 
 /// Base64 as Python's `base64.b64decode` reads a request's: whitespace is skipped, the padding may be left off.
@@ -485,14 +624,8 @@ pub fn block_b64(b: &serde_json::Value) -> Result<&str, VisionError> {
     }
 }
 
-/// Base64 image data -> what the engine gets.
-pub fn prepare_b64(b64: &str) -> Result<Prepared, VisionError> {
-    let bytes = b64_decode(b64)?;
-    prepare_rgb(&decode_rgb(&bytes)?)
-}
-
-/// The plan alone, from the image's header (for /tokenize, which counts the prompt without building the pixels).
-pub fn plan_b64(b64: &str) -> Result<Plan, VisionError> {
+/// The image's width and height, from its header.
+fn dims_b64(b64: &str) -> Result<(usize, usize), VisionError> {
     let bytes = b64_decode(b64)?;
     let (w, h) = match image::guess_format(&bytes) {
         Ok(image::ImageFormat::Gif) => {
@@ -509,7 +642,7 @@ pub fn plan_b64(b64: &str) -> Result<Plan, VisionError> {
         _ => return verr("unrecognised image data (PNG, JPEG, WebP or GIF)"),
     };
     check_pixels(w as u64, h as u64)?;
-    Ok(plan_image_grid(w as usize, h as usize))
+    Ok((w as usize, h as usize))
 }
 
 /// The per-request limits on the images' base64.
@@ -541,8 +674,8 @@ pub struct Span {
 /// Replace the i-th image token of `ids` (the tokenized prompt, one token a placeholder) with image i's span.
 /// `n_spans[i]` is image i's span length. Returns the new ids and each span's first position. Errors when the number
 /// of image tokens is not the number of images.
-pub fn expand(ids: &[u32], n_spans: &[usize]) -> Result<(Vec<u32>, Vec<usize>), VisionError> {
-    let found = ids.iter().filter(|&&t| t == IMAGE_TOKEN_ID).count();
+pub fn expand(ids: &[u32], n_spans: &[usize], token: u32) -> Result<(Vec<u32>, Vec<usize>), VisionError> {
+    let found = ids.iter().filter(|&&t| t == token).count();
     if found != n_spans.len() {
         return verr(format!("the prompt has {found} image tokens but the request has {} images", n_spans.len()));
     }
@@ -551,10 +684,10 @@ pub fn expand(ids: &[u32], n_spans: &[usize]) -> Result<(Vec<u32>, Vec<usize>), 
     let mut pos = Vec::with_capacity(n_spans.len());
     let mut it = n_spans.iter();
     for &t in ids {
-        if t == IMAGE_TOKEN_ID {
+        if t == token {
             let n = *it.next().unwrap();
             pos.push(out.len());
-            out.resize(out.len() + n, IMAGE_TOKEN_ID);
+            out.resize(out.len() + n, token);
         } else {
             out.push(t);
         }
@@ -564,11 +697,11 @@ pub fn expand(ids: &[u32], n_spans: &[usize]) -> Result<(Vec<u32>, Vec<usize>), 
 
 /// A token count in the unexpanded prompt -> the same point in the expanded one (spans that start before it count in
 /// full).
-pub fn expanded_index(unexpanded_ids: &[u32], n: usize, n_spans: &[usize]) -> usize {
+pub fn expanded_index(unexpanded_ids: &[u32], n: usize, n_spans: &[usize], token: u32) -> usize {
     let mut k = 0;
     let mut out = 0;
     for &t in unexpanded_ids.iter().take(n) {
-        if t == IMAGE_TOKEN_ID {
+        if t == token {
             out += n_spans.get(k).copied().unwrap_or(1);
             k += 1;
         } else {
@@ -635,10 +768,10 @@ mod tests {
                     .unwrap();
             let (w, h, want) = read_ppm(&fixtures().join(format!("{name}.ppm")));
             let p = prepare_rgb(&decode_rgb(&png).unwrap()).unwrap();
-            assert_eq!((p.plan.best_w, p.plan.best_h), (w, h), "{name}");
-            assert_eq!(p.vit_h() as u64, meta["n_vit_h"].as_u64().unwrap());
-            assert_eq!(p.vit_w() as u64, meta["n_vit_w"].as_u64().unwrap());
-            assert_eq!(p.plan.n_span() as u64, meta["n_span_tokens"].as_u64().unwrap());
+            assert_eq!((p.vit_w * PATCH, p.vit_h * PATCH), (w, h), "{name}");
+            assert_eq!(p.vit_h as u64, meta["n_vit_h"].as_u64().unwrap());
+            assert_eq!(p.vit_w as u64, meta["n_vit_w"].as_u64().unwrap());
+            assert_eq!(p.n_span as u64, meta["n_span_tokens"].as_u64().unwrap());
             assert!(p.rgb == want, "{name}: padded RGB differs from the official bytes");
         }
     }
@@ -660,18 +793,18 @@ mod tests {
             let bytes = std::fs::read(dir.join(name)).unwrap();
             let p = prepare_rgb(&decode_rgb(&bytes).unwrap()).unwrap();
             assert_eq!(
-                (p.plan.best_w, p.plan.best_h),
+                (p.vit_w * PATCH, p.vit_h * PATCH),
                 (c["best_w"].as_u64().unwrap() as usize, c["best_h"].as_u64().unwrap() as usize),
                 "{name}"
             );
-            let same = content_key(p.vit_h(), p.vit_w(), &p.rgb) == c["key"].as_str().unwrap();
+            let same = content_key(p.vit_h, p.vit_w, &p.rgb) == c["key"].as_str().unwrap();
             if let Ok(want) = std::fs::read(dir.join(format!("{name}.rgb"))) {
                 let d: Vec<u8> = p.rgb.iter().zip(&want).map(|(a, b)| a.abs_diff(*b)).collect();
                 let n = d.iter().filter(|&&x| x != 0).count();
                 eprintln!(
                     "{name}: {}x{} exact={same} differing bytes {n}/{} max |diff| {}",
-                    p.plan.best_w,
-                    p.plan.best_h,
+                    p.vit_w * PATCH,
+                    p.vit_h * PATCH,
                     d.len(),
                     d.iter().max().unwrap_or(&0)
                 );
@@ -682,16 +815,74 @@ mod tests {
         }
     }
 
+    fn glm_fixtures() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/ref/flash/fixtures/vision")
+    }
+
+    /// The processor's grid for 24 sizes (engine/ref/flash/vision_golden.py: transformers' smart_resize and resize).
+    #[test]
+    fn glm5v_plan_matches_the_processor() {
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(glm_fixtures().join("plan.json")).unwrap()).unwrap();
+        let cases = v.as_array().unwrap();
+        assert!(cases.len() >= 20);
+        for c in cases {
+            let g = |k: &str| c[k].as_u64().unwrap() as usize;
+            let p = glm5v::plan(g("w"), g("h"));
+            assert_eq!(
+                (p.target_h, p.target_w, p.content_h, p.content_w, p.tokens()),
+                (g("target_h"), g("target_w"), g("content_h"), g("content_w"), g("tokens")),
+                "{c}"
+            );
+        }
+    }
+
+    /// The padded RGB of the tower's fixtures (no resize: the pad alone) and of 6 images that the processor resizes
+    /// (below the token floor, above the cap), against the PIL backend's bytes.
+    #[test]
+    fn glm5v_pixels_match_the_processor() {
+        use sha2::{Digest, Sha256};
+        let hex = |b: &[u8]| Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect::<String>();
+        for name in ["red_disc_150x150", "bar_chart_280x200", "photo_scene_250x180"] {
+            let png = std::fs::read(glm_fixtures().join(format!("{name}.png"))).unwrap();
+            let meta: Value =
+                serde_json::from_str(&std::fs::read_to_string(glm_fixtures().join(format!("{name}.json"))).unwrap())
+                    .unwrap();
+            let p = Model::Glm5v.prepare_rgb(&decode_rgb(&png).unwrap()).unwrap();
+            let (w, h, want) = read_ppm(&glm_fixtures().join(format!("{name}.ppm")));
+            assert_eq!((p.vit_w * PATCH, p.vit_h * PATCH), (w, h), "{name}");
+            assert_eq!(p.n_span as u64, meta["tokens"].as_u64().unwrap(), "{name}");
+            assert!(p.rgb == want, "{name}: padded RGB differs from the processor's");
+            assert_eq!(hex(&p.rgb), meta["rgb_sha256"].as_str().unwrap());
+        }
+        let v: Value =
+            serde_json::from_str(&std::fs::read_to_string(glm_fixtures().join("pixels.json")).unwrap()).unwrap();
+        for c in v.as_array().unwrap() {
+            let name = c["image"].as_str().unwrap();
+            let png = std::fs::read(glm_fixtures().join(name)).unwrap();
+            let p = Model::Glm5v.prepare_rgb(&decode_rgb(&png).unwrap()).unwrap();
+            assert_eq!(
+                (p.vit_h * PATCH, p.vit_w * PATCH),
+                (c["target_h"].as_u64().unwrap() as usize, c["target_w"].as_u64().unwrap() as usize),
+                "{name}"
+            );
+            assert_eq!(hex(&p.rgb), c["rgb_sha256"].as_str().unwrap(), "{name}: padded RGB differs from PIL's");
+        }
+    }
+
     #[test]
     fn expand_and_positions() {
-        let t = IMAGE_TOKEN_ID;
-        let (ids, pos) = expand(&[1, t, 2, t], &[3, 2]).unwrap();
-        assert_eq!(ids, vec![1, t, t, t, 2, t, t]);
-        assert_eq!(pos, vec![1, 5]);
-        assert!(expand(&[1, t], &[]).is_err());
-        assert!(expand(&[1], &[3]).is_err());
-        assert_eq!(expanded_index(&[1, t, 2, t], 2, &[3, 2]), 4);
-        assert_eq!(expanded_index(&[1, t, 2, t], 1, &[3, 2]), 1);
+        for t in [IMAGE_TOKEN_ID, glm5v::IMAGE_TOKEN_ID] {
+            let (ids, pos) = expand(&[1, t, 2, t], &[3, 2], t).unwrap();
+            assert_eq!(ids, vec![1, t, t, t, 2, t, t]);
+            assert_eq!(pos, vec![1, 5]);
+            assert!(expand(&[1, t], &[], t).is_err());
+            assert!(expand(&[1], &[3], t).is_err());
+            assert_eq!(expanded_index(&[1, t, 2, t], 2, &[3, 2], t), 4);
+            assert_eq!(expanded_index(&[1, t, 2, t], 1, &[3, 2], t), 1);
+        }
+        // the other model's image token is text
+        assert!(expand(&[1, IMAGE_TOKEN_ID], &[3], glm5v::IMAGE_TOKEN_ID).is_err());
     }
 
     #[test]
@@ -704,7 +895,8 @@ mod tests {
         assert_eq!(b64_decode("aGk").unwrap(), b"hi");
         assert_eq!(b64_decode("aG\nk=").unwrap(), b"hi");
         assert!(b64_decode("a*Gk").is_err());
-        assert!(prepare_b64("aGk=").is_err());
+        assert!(Model::Ds41.prepare_b64("aGk=").is_err());
+        assert!(Model::Glm5v.prepare_b64("aGk=").is_err());
         assert_eq!(content_key(1, 2, b"x").len(), 16);
     }
 

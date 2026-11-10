@@ -1,6 +1,8 @@
 #!/bin/bash
 # CPU-only tests: shell syntax, the host C++ tests, the Python tests and the Rust crates.
-# Linux with g++ (C++20, ASan), Python 3 with numpy, and cargo (rustup reads frontend/g6front-rs/rust-toolchain.toml).
+# Linux with g++ (C++20, ASan), Python 3 with numpy, and cargo. Engine cargo uses --manifest-path from
+# the repo root, so rustup reads rust-toolchain.toml there. The front end cds into its crate and reads that pin.
+# Keep those channels equal to Dockerfile ARG RUST_VERSION.
 #   .github/ci/cpu-tests.sh [frontend|engine|all]     from any directory; all by default. The CI's cpu-frontend and
 #                                                    cpu-engine jobs run one half each.
 # frontend: the front end, the shim, the launcher and the pseudo engine, with the small engine-side checkers their tests
@@ -18,6 +20,10 @@ step "bash -n"
 git ls-files -z '*.sh' | xargs -0 -n1 bash -n
 
 if [ "$PART" != frontend ]; then
+  step "Rust compiler"
+  rustc -V
+  cargo -V
+
   step "scripts/host_tests.sh"
   scripts/host_tests.sh
 
@@ -66,6 +72,7 @@ else
 fi
 
 step "Python tests (front end and launcher)"
+python3 -m unittest discover -s tools/switch/tests -v
 # the S2 headers read knobs and call the S2 scheduling logic: link the knob table's C API and the host Rust
 cargo build --release --locked --quiet --features capi --manifest-path engine/knobs-rs/Cargo.toml
 cargo build --release --locked --quiet --manifest-path engine/Cargo.toml

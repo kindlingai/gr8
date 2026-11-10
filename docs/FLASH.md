@@ -5,25 +5,28 @@ One to four DGX Spark (GB10) boxes (TP=1 to TP=4). Weights: the exlr8 release on
 
 gr8 serves [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) from its exlr8 release
 ([kindlingai/glm-5.3-flash-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4)) at TP=4,
-TP=3 (a three-box ring, variant k4), TP=2 or TP=1 (one box, variant k2, the one width whose weights fit). The engine is `bin/g6m4_flash`, a build of the same `g6m4` source with `-DG6_MODEL_FLASH=1`
+TP=3 (a three-box ring, variant k4), TP=2 (two boxes) or TP=1 (one box, variant k2, the one width whose weights fit). The engine is `bin/g6m4_flash`, a build of the same `g6m4` source with `-DG6_MODEL_FLASH=1`
 (`engine/model_geom.h` holds the geometry).
 
 ## Results
 
-On one and two boxes, from the recipe repos (the one-box numbers are the image's defaults, also in its
-[kindling.json](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark/blob/main/kindling.json)):
+On one and two boxes, from each recipe's `kindling.json` as of 2026-11-08 (the numbers on its card, with the image's
+defaults):
 
-| | one box (TP=1) | two boxes (TP=2), first run |
+| | one box (TP=1) | two boxes (TP=2) |
 |---|---|---|
-| width, KV, drafting | K2, int4 KV, DFlash2 | K4, int4 KV, DFlash2 |
-| decode, code / prose / structured | 54.3 / 29.1 / 66.0 tok/s | 71.1 / 41.5 / 90.0 tok/s |
-| prefill, 8K / 32K / 128K prompt | 1,214 / 1,224 / 1,048 tok/s | 1,698 / 1,694 / 1,404 tok/s |
-| aggregate decode, 1 / 2 / 4 / 8 streams | 40.8 / 44.1 / 58.0 / 59.2 tok/s | not measured yet |
-| KV pool | 700,032 tokens, up to 4 requests at once | `CAP` 262,208 |
-| from | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark), `gr8 glm53f bench`, 2026-11-06 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark), "First numbers" in its README of 2026-11-06 |
+| manifest, KV, drafting | `bit201`, int4 KV, DFlash2 | `bit349`, int4 KV, DFlash2 |
+| decode, code / prose / structured | 53.8 / 28.2 / 65.1 tok/s | 74.5 / 41.9 / 94.6 tok/s |
+| prefill, 8K / 32K / 128K prompt | 995 / 1,024 / 916 tok/s | 1,675 / 1,676 / 1,354 tok/s |
+| aggregate decode, 1 / 2 / 4 / 8 streams | 43.5 / 41.3 / 53.4 / 57.5 tok/s | 54.0 / 62.5 / 75.5 / 98.2 tok/s |
+| KV pool | 700,032 tokens, up to 4 requests at once | 2,097,152 tokens, up to 8 requests at once |
+| from | [glm-5.3-flash-exlr8-1x-spark `kindling.json`](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark/blob/3e9754c5/kindling.json) | [glm-5.3-flash-exlr8-2x-spark `kindling.json`](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark/blob/81c29ca3/kindling.json) |
 
-The two-box numbers are from a first run and are not yet in a kindling.json. At TP=3 and TP=4 the sections below have
-what is measured so far. Open bugs: [KNOWN-ISSUES.md](../KNOWN-ISSUES.md#glm-53-flash).
+The recipes use two other manifests of the same release. `bit201` (one box) is K2, with the 124 routed experts that
+carry the most routing weight at tool-call positions at K3. `bit349` (two boxes) is K3, with K4 where it lowers KL most,
+about 3.49 bits a routed weight.
+
+At TP=3 and TP=4 the sections below have what is measured so far. Open bugs: [KNOWN-ISSUES.md](../KNOWN-ISSUES.md#glm-53-flash).
 
 ## Build and run
 
@@ -39,7 +42,7 @@ segments as for GLM-5.3. GLM-5.3 and Flash then share one store and its disk bud
 `./gr8 glm53f` takes the options of `./gr8 glm53` (KNOBS.md). Each box fetches its rank's part of the release and loads
 it through the same release planner as GLM-5.3 (`engine/loader-rs`): `release::plan` reads the model from the release's
 own metadata (`hidden_size` 4096) and maps Flash's tensors with `engine/loader-rs/src/flash.rs`. The width manifests are
-`k2`, `k3` and `k4` (the default).
+`k2`, `k3` and `k4` (the default); the recipes use `bit201` (one box) and `bit349` (two boxes), see [Results](#results).
 
 The front end serves the model as `glm-5.3-flash` (`/v1/models` lists it first) and also answers to `glm53f`. A request
 that names `glm-5.3` gets a 404 (one that names no model is served), so a router that picks backends by model name
@@ -54,11 +57,17 @@ keeps Flash and GLM-5.3 apart (`served` in `tools/launch/models.py`). `./gr8 glm
 
 ## What works
 
-- `./gr8 glm53f up` boots in about 16 s from a local cache and passes `./gr8 glm53f smoke`.
+- `./gr8 glm53f up` at TP=4 on four GB10s boots in about 18 s from a local cache and passes `./gr8 glm53f smoke`
+  (measured 2026-10-23, gr8 f5fe50f).
 - TP=4 prefill of an 8K prompt: about 3.55 s at 2200 MHz.
 - 8 sessions at TP=4 and 4 at TP=3 share decode steps (below), with MTP=1 (`flash_defaults` in `scripts/engine_args.sh`).
 - At TP=4, TP=2 and TP=1 a session that runs alone drafts with the DFlash2 drafter when the boot has one: `--drafter https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2` (below).
 - `response_format` `json_object` and `json_schema` replies are masked to their XGrammar grammar, as on GLM-5.3 (`GRAMMAR`).
+
+## Image input (`GR8_GLM53F_VISION=1`, opt-in)
+
+The engine takes images in chat requests with the vision tower loaded ([FLASH-VISION.md](FLASH-VISION.md)). Without
+the knob it serves text, and the fetch skips `dense/vision-*`.
 
 ## Context
 
@@ -76,7 +85,7 @@ at any context. A token costs each of them a 1,024 B bf16 latent row and 128 B o
 (`engine/attn/kvfmt.h`; a build with `-DG6_FLASH_KV_FP8=1` makes the row 528 B, the int4 build below 288 B), 13,824 B
 in all (4,992 B with int4). A token's raw indexer row (512 B) feeds only the pool of 4 it belongs to, so it is not in
 the pages: the pool reads it from its own call, or from the binding's raw ring of the last 64 positions of each session
-(256 KB a binding). Flash has no CP, so every rank holds the whole context and the cost is the same at TP=4 and TP=2:
+(256 KB a binding). Without CP (below) every rank holds the whole context, and the cost is the same at TP=4 and TP=2:
 
 | CAP | pages of 64 | KV a rank | with int4 |
 |---|---|---|---|
@@ -108,6 +117,39 @@ Prefill time grows faster than the prompt because the indexer scores every earli
 1,781 MHz). The shim errors a request after 900 s with no output (`--stall-timeout`), but the engine reports each
 quantum to it (an `f` line, `s2/sessions.h progress`), so the timeout bounds one quantum, not the whole prefill: a
 923K-token prompt prefilled in 1,371 s with the default.
+
+## Context-parallel KV (`GR8_CP=1`, experimental)
+
+Off by default in the Flash build (`GR8_CP` unset is 0 here, 1 in GLM-5.3's). With `EXTRA_ENV=GR8_CP=1` (the launcher
+sets `GR8_CP=0` and `GR8_CP_R=$SHARE_LIMIT` before it; add `GR8_CP_R=R` for another R), the 12 attention bindings keep the first `R` tokens on every
+rank, and each later 64-row page on one rank only, `(pos / 64) % TP`, as GLM-5.3's CP does (#384). A page holds 16 whole
+pools of the indexer, so a pool and its key live on one rank. Decode past R runs five stages per DSA layer
+(`engine/attn/flash_attn.cu`, `engine/runtime/flash_dsa.cuh` `launch_dsa_cp`):
+
+1. append the rows this rank stores (every rank writes the raw index ring, which stays replicated), absorb its heads;
+2. score the pools this rank owns, the prefix's too, and keep a top 512 per row;
+3. all-gather the candidates (512 x 8 B a row) and merge them into the replicated path's list, bit for bit;
+4. all-gather the absorbed queries, and for every head group a partial attention over this rank's selected keys (with
+   equal head groups, TP=2 and TP=4, all of them in one call), each sent to the group's rank;
+5. merge the partials in rank order (log-sum-exp), then the value projection.
+
+The lists and the cache bytes equal the replicated path's. The output does not: the merge sums in another order, as
+GLM-5.3's does, so T=0 output with CP on is not the same bits as with it off. `engine/tests/test_flash_cp.cu`
+(`TEST=test_flash_cp scripts/c1_tests.sh`) checks all three against the replicated bindings on one GPU.
+
+Limits for now:
+
+- A prefill quantum past R runs on GLM-5.3's staged view (`engine/runtime/prefill.cuh` `cp_pf_*`): before each DSA
+  layer's attention, every page below the quantum is gathered from its owner into one of two pools of one layer at
+  `CAP` (pinned, `2 x CAP x (row + 128 B)` a rank: 0.87 GB at `CAP` 1,048,640 with int4), the attention runs unchanged
+  on it, and the rows this rank stores go back. So the prefill is the replicated path's bits; it sends every remote page
+  below the quantum once per DSA layer and quantum. m4sim does not stage, and refuses a prompt past R with `--prefill`.
+- With several sessions the pool takes GLM-5.3's page classes (S2 below R): a request whose `prompt + max_tokens`
+  passes R gets its prefix and its share of the tail below `place`, the MTP layer's copy above it.
+- The MTP layer keeps its whole KV (it is the draft model's binding), and the DFlash2 drafter its own window.
+- With `GR8_GLM53F_CACHE`, each rank's checkpoint keeps the pages of the 11 DSA layers it holds (another rank's page
+  is zeros in the entry) and the MTP layer's whole pages. Not with `GR8_GLM53F_KV_CHUNKS`.
+- Not measured on a cluster yet.
 
 ## One box (TP=1)
 
@@ -141,7 +183,9 @@ There is no rotation: Flash's latent is NoPE, and every read dequantizes in plac
 ## Several sessions
 
 `--sess N` (`SESS`, 1 to 8; 8 at TP=4, 4 at TP=3, 1 at TP=2) serves up to N requests at once on S2, as GLM-5.3 does: their decode
-rounds share main and draft steps, and their KV runs share the `CAP` pool (`--s2-sessions N` to `g6m4_flash`).
+rounds share main and draft steps, and their KV runs share the `CAP` pool (`--s2-sessions N` to `g6m4_flash`). Those per-TP
+counts are the launcher's defaults (`scripts/engine_args.sh`); the two-box recipe sets `SESS` to 8 (4 with
+`TUNE=quality`) and serves that many requests at once.
 
 - KDA state: each session holds a region of `MTP + 1` slots (`FlashSlots` in `engine/runtime/s2/flash_ring.h`), reset
   when a request starts on it. With the drafter, region 0 is 8 slots wide (below). In a main step each session's first
@@ -223,10 +267,10 @@ positions it runs, and the drafter takes its context from those (`engine/runtime
 
 The ring's rows below `p` came from the previous turn's prefill and decode taps, not from a cold prefill of this prompt,
 so drafts may differ from a cold boot's. The target verifies every draft: the output is the same as without the drafter
-(aligned is still bit-exact against no cache). Not measured on a cluster yet: smoke, bench's `TTFT cached` with the
+(aligned is bit-exact against no cache by design; the end-to-end check on a cluster has not run). Not measured on a cluster yet: smoke, bench's `TTFT cached` with the
 drafter, and decode after a restore against a cold-prefilled request's are open on #340.
 
-Why the output is bit-exact against no cache: a cold prefill runs its quanta as `[kG, (k+1)G)`, and the KDA prefill is
+Why the output should be bit-exact against no cache (by design; not yet checked end to end on a cluster): a cold prefill runs its quanta as `[kG, (k+1)G)`, and the KDA prefill is
 chunked by quantum, so a warm prefill from `p = kG` runs the same quanta on the same KDA state and the same pages. The
 MTP layer's row `p - 1` reads token `p`, which is why the match runs through token `p`. The indexer's pools are
 recomputed from the raw rows (`engine/attn/kpool.cuh`), so no other state is kept. Rows past `p` and the other KDA slots
@@ -255,7 +299,7 @@ once, in `flash-ckpt.tokens/<generation>`. Every file is written to a temporary 
 synced. A boot with the same compat line (model set, TP, rank, CAP, layout, engine build) and store size reads the
 index, and a helper thread checks every entry's stored manifest, pages and state (the KDA state, then the raw index
 rings) against the manifest's checksums. An entry sealed by another entry format (`FlashManifest::FORMAT`; 2 since the
-raw index rows left the pages) is dropped.
+raw index rows left the pages, 3 since a CP binding keeps only its own pages) is dropped.
 The blocks of an entry are not synced before the index names it, so after a power loss the index can name an entry whose
 blocks never reached the disk: the checks drop it, so the boot loses the entry, never serves its bytes.
 On a GB10's SSD the checks run at about 6 GiB/s, as fast as reading the store alone, so a full 64 GiB store takes
@@ -273,7 +317,7 @@ stops the engine.
 A full store drops the least recently used checkpoints. Every rank keeps the same index, and its digest joins the pool
 digest the ranks compare.
 
-`group=` on the store (`remote:HOST:PORT,size=N,group=G[,cap=,weight=]`, experimental, D-331 M8 (c)): the lease is a
+`group=` on the store (`remote:HOST:PORT,size=N,group=G[,cap=,weight=]`, experimental): the lease is a
 member of group `G` on the KV node, the way a full model's `--kv-store group=` tier is, so the two models share the
 node's memory. It starts at `size=`; the head reports to the node every `GR8_S2_SHARE_MS` and asks for segments when
 captures drop entries, an entry does not fit at all, or the next capture would drop one (after a capture, or at any
@@ -310,9 +354,8 @@ Limits:
 
 ## Not yet
 
-- CP and prefix reuse: the engine refuses them under `--serve`. `GR8_GLM53F_CACHE=aligned` (above) is the
+- Prefix reuse: the engine refuses it under `--serve`, and CP is experimental (above). `GR8_GLM53F_CACHE=aligned` (above) is the
   experimental Flash form of prefix reuse, with or without DFlash2. The DFlash2 drafter's taps are the mean of the four
   mHC streams after each tapped layer, in decode steps and in the prefill, which keeps the last 2,048 prompt positions
   for the drafter's prompt context. DFlash2 at TP=3 runs offline only.
-- The vision tower: the engine serves text, and the fetch skips `dense/vision-*`.
 - A 262K prefill's time and memory headroom on a GB10: the `CAP` above is computed, not measured.

@@ -2,6 +2,16 @@
 
 Bugs we are still working out, by model. The PR that fixes one removes its entry.
 
+## All models
+
+### 1. `gr8 <model> bench` inside a recipe image stops: no `ssh` - Open ([#413](https://github.com/kindlingai/gr8/issues/413))
+
+- In a recipe image with `PEERS` set, the bench stops before its first stage with `FileNotFoundError: ... 'ssh'`, and
+  no report is written. The `gr8` wrapper passes `--hosts` with the `PEERS` list to `bench/bench.py`, and
+  `bench/gr8bench/thermal.py` reaches every host but `local` through `ssh`, which the image does not have.
+- Workaround: add `--hosts ''` after the command (`bench.py` keeps the last `--hosts`). The run then has no cooldown
+  between stages and no heat samples.
+
 ## GLM-5.3
 
 ### 1. Prefix-reuse miss near 786K tokens (TP=6, six Sparks) - Open
@@ -30,6 +40,19 @@ Bugs we are still working out, by model. The PR that fixes one removes its entry
   sub-batch was already wrong, which points at something before or during the first prefill, not at decode). Not proven.
 - **If it happens again:** keep the rank logs of that boot (each rank's first three `prefill rows` residual lines), note which binary and
   arguments ran, and repeat the check on a fresh boot of main.
+
+### 4. A prefix-reuse hit can differ from a cold prefill at temperature 0 (TP=4, four Sparks) - Open
+
+- **Symptom:** with the default reuse rules (`GR8_REUSE_ALIGN=1`), turn 2 of a chat that reuses turn 1's KV from the pool
+  returns different text at temperature 0 than the same request on a freshly booted engine. In the report, 4 chats of two
+  turns each (a system prompt of about 3,000 tokens each; turn 1 5,334 tokens, turn 2 5,408 tokens): turn 2 after a hit
+  differed from a cold boot on 2 of 4 chats. Two cold boots agreed with each other on 4 of 4, so the cold side is
+  deterministic.
+- **Docs:** until this is fixed, read "a hit equals a cold prefill" in [docs/SETTINGS.md](docs/SETTINGS.md) and
+  [docs/REUSE-GPU-TEST.md](docs/REUSE-GPU-TEST.md) as the intended behaviour, not a measured one.
+- **Not narrowed down:** whether the difference comes from the retained rows [0, 4096) or from the re-prefilled suffix
+  [4096, 5408) (for example the drafter state, or a suffix chunk shape that differs from the cold one).
+- Tracking: [#412](https://github.com/kindlingai/gr8/issues/412).
 
 ## GLM-5.3-Flash
 

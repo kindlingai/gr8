@@ -113,6 +113,12 @@ struct FlashPrefill
     u64 cur_step = 0;                            // host copy of the layer step pf_step_flash set (for the staging copy)
     void (*dfl_tap)(Model&, FlashPrefill&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, keep the prompt rows the
                                                                                  //   drafter reads (dflash.cuh dfl_pf_tap_flash)
+    // image input (GR8_GLM53F_VISION, flash_vision_stage.cuh): a launch with image rows (vis_n > 0) embeds row r from
+    // vis_pool[vis_row[r]] (the vision tower's row) where vis_row[r] >= 0, else from the token. With vis_n = 0 the
+    // launch runs the text-only embed.
+    int* vis_row = nullptr;                      // [MP] device
+    const __nv_bfloat16* vis_pool = nullptr;     // [pool rows][HID] device
+    int vis_n = 0;
 };
 inline bool pf_mhc_stage()
 {
@@ -1164,6 +1170,48 @@ inline void pf_consume_flash(Model& m, FlashPrefill& P, int i, int c, int M, cud
 
 // one sub-batch: rows P.pos[0..M), layer i is layer-step ls0 + i of the prefill fabric. residual_copy(slot, M), if set,
 // is called at the decode dump slots (0 = after embed, 2i + 1 = after layer i's attention, 2i + 2 = after its MLP)
+#if defined(G6_CP) && G6_CP
+// GR8_CP past R: the staged view (prefill.cuh cp_pf_*) around the DSA layers while m.cp.pf_staged with a CpPfNet. The first
+// DSA layer begins its pool and every one waits for its pool before its first lane's attention, then begins the next
+// DSA layer's (the other pool); after its last lane's attention the lanes' rows go back to this rank's store. start =
+// the first position of the earliest lane: every row below it is in the pool
+inline int pf_cp_next(const Model& m, int i)
+{
+    for (int j = i + 1; j < m.nl; ++j)
+        if (!m.layers[j].kda) return j;
+    return -1;
+}
+inline void pf_cp_pre(Model& m, int i, int start, cudaStream_t st)
+{
+    if (!cp_pf_live(m)) return;
+    if (i == pf_cp_next(m, -1)) cp_pf_begin(m, i, start, st);
+    cp_pf_wait(m, i, start, st);
+}
+inline void pf_cp_prefetch(Model& m, int i, int start, cudaStream_t st)
+{
+    const int j = pf_cp_next(m, i);
+    if (cp_pf_live(m) && j >= 0) cp_pf_begin(m, j, start, st);
+}
+inline void pf_cp_post(Model& m, int i, int a0, int n0, int a1, int n1, cudaStream_t st)
+{
+    if (!cp_pf_live(m)) return;
+    cp_pf_back(m, i, a0, n0, st);
+    cp_pf_back(m, i, a1, n1, st);
+    cp_pf_end(m, i, st);
+}
+#else
+inline void pf_cp_pre(Model&, int, int, cudaStream_t) {}
+inline void pf_cp_prefetch(Model&, int, int, cudaStream_t) {}
+inline void pf_cp_post(Model&, int, int, int, int, int, cudaStream_t) {}
+#endif
+// The prefill embed: each row's embedding into the 4 mHC streams (the vision tower's row on an image row)
+inline void pf_embed_flash(Model& m, FlashPrefill& P, int M, cudaStream_t st)
+{
+    if (P.vis_n > 0)
+        flash_mhc::k_mhc_embed_rows<<<M, flash_mhc::THREADS, 0, st>>>(mhc_buffers(P), P.tok, m.emb, HID, geom::RMS_EPS_FLASH,
+                                                                      P.vis_pool, P.vis_row);
+    else flash_mhc::k_mhc_embed<<<M, flash_mhc::THREADS, 0, st>>>(mhc_buffers(P), P.tok, m.emb, HID, geom::RMS_EPS_FLASH);
+}
 inline void pf_step_flash(Model& m, FlashPrefill& P, int M, int context, u64 ls0, cudaStream_t st,
                           const std::function<void(int, int)>& residual_copy = {})
 {
@@ -1172,7 +1220,7 @@ inline void pf_step_flash(Model& m, FlashPrefill& P, int M, int context, u64 ls0
     pr.last = 0;
     pr.mark(-1, st);
     P.sp_agk[1] = P.sp_agk[3] = pf_sp() && pf_sp_agk();   // single lane: every gather directly follows its owner pass
-    flash_mhc::k_mhc_embed<<<M, flash_mhc::THREADS, 0, st>>>(mhc_buffers(P), P.tok, m.emb, HID, geom::RMS_EPS_FLASH);
+    pf_embed_flash(m, P, M, st);
     pf_mhc_input(m, P, 0, false, M, st);
     if (residual_copy) residual_copy(0, M);
     pr.mark(10, st);
@@ -1181,7 +1229,13 @@ inline void pf_step_flash(Model& m, FlashPrefill& P, int M, int context, u64 ls0
         k_set_step<<<1, 1, 0, st>>>(P.stepp, ls0 + i);
         P.cur_step = ls0 + i;
         if (geom::is_kda(m.layers[i].l)) pf_kda_block(m, P, i, M, st);
-        else pf_dsa_block(m, P, i, M, context, st);
+        else
+        {
+            pf_cp_pre(m, i, context - M, st);
+            pf_dsa_block(m, P, i, M, context, st);
+            pf_cp_prefetch(m, i, context - M, st);
+            pf_cp_post(m, i, context - M, M, 0, 0, st);
+        }
         pf_xt(P, 0, pxt::PX_PROD, M, st);
         pf_put_flash(P, 0, M, st);
         pf_xt(P, 0, pxt::PX_PUT, M, st);
@@ -1216,7 +1270,7 @@ inline void pf_step2_flash(Model& m, FlashPrefill& A, FlashPrefill& B, int MA, i
     pr.last = 0;
     pr.mark(-1, st);
     auto embed = [&](FlashPrefill& P, int M) {
-        flash_mhc::k_mhc_embed<<<M, flash_mhc::THREADS, 0, st>>>(mhc_buffers(P), P.tok, m.emb, HID, geom::RMS_EPS_FLASH);
+        pf_embed_flash(m, P, M, st);
         pf_mhc_input(m, P, 0, false, M, st);
         pr.mark(10, st);
     };
@@ -1232,11 +1286,19 @@ inline void pf_step2_flash(Model& m, FlashPrefill& A, FlashPrefill& B, int MA, i
         pf_xt(P, c, pxt::PX_END, M, st);
         pr.mark(9, st);
     };
+    // the staged view (GR8_CP past R): lane A's attention of a DSA layer waits for its pool and begins the next DSA
+    // layer's, lane B's sends both lanes' rows back (pf_cp_*)
     auto attn = [&](FlashPrefill& P, int i, int M, int context, u64 step) {
         k_set_step<<<1, 1, 0, st>>>(P.stepp, step);
         P.cur_step = step;
         if (geom::is_kda(m.layers[i].l)) pf_kda_block(m, P, i, M, st);
-        else pf_dsa_block(m, P, i, M, context, st);
+        else
+        {
+            if (&P == &A) pf_cp_pre(m, i, ctxA - MA, st);
+            pf_dsa_block(m, P, i, M, context, st);
+            if (&P == &A) pf_cp_prefetch(m, i, ctxA - MA, st);
+            else pf_cp_post(m, i, ctxA - MA, MA, ctxB - MB, MB, st);
+        }
         put(P, 0, M);
     };
     embed(A, MA);

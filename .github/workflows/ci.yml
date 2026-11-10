@@ -62,6 +62,8 @@ jobs:
               - '.github/ci/**'
               - 'frontend/**'
               - 'tools/launch/**'
+              - 'tools/switch/**'
+              - 'config/switch.env.example'
               - 'tools/steering/**'
               - 'smoketest/**'
               - 'gr8'

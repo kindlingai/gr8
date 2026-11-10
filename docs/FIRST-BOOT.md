@@ -3,15 +3,15 @@
 Most people will have an agent (Claude Code, Codex or another) start gr8 for them the first time. If you are that
 agent, read this file before the first `up`. Ask the person the questions below, one at a time, with the numbers given
 for each. Write the answers into `cluster.env` ([config/cluster.env.example](../config/cluster.env.example)), show the
-person the file, and only then boot. When the person has no preference, keep the default: every default here is the
-exact model.
+person the file, and only then boot. When the person has no preference, keep the default. Every default here is the
+exact model, except DeepSeek-V4.1-Flash's prefill: `./gr8 ds41` runs the faster v2 prefill unless `EXACT=1` (Q2a).
 
 ## 1. The setup (every model)
 
 These have no default ([DEPLOY.md](DEPLOY.md), "The two settings"):
 
 1. **Which model?** `glm53` (GLM-5.3), `glm53f` (GLM-5.3-Flash) or `ds41` (DeepSeek-V4.1-Flash-1017). `./gr8 models`
-   lists each GLM model's release and the TP values it takes. It does not list `ds41`: its release is
+   lists each model's release and the TP values it takes. `ds41`'s release is
    `https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native`, with `TP=4`. For `ds41`, remove the example's
    `DRAFTER=` line (GLM's DFlash2 drafter): `ds41` drafts with its own MTP layers, and the check refuses a drafter.
 2. **Which boxes?** Their addresses in the same order on every box (`PEERS`; the first one is the head and serves the
@@ -28,11 +28,11 @@ Optional, every model: faster restarts. Put `GR8_GEN_CACHE=<dir>` in `EXTRA_ENV`
 disk ([ENV.md](ENV.md)). The loader then keeps the tensors it computes at load and reads them back on the next boot
 instead of computing them again. The first boot of an engine build writes them; a rebuild is a miss and writes them
 again, and the loader keeps the two newest builds' entries. The served bytes are the same. Measured: GLM-5.3 at TP=6
-(on the GLM TP6 team's cu-fastboot build, arms A+B, before this port), 17.4 GB a rank, "engines ready" 93-96 s
+(on an earlier build, before this port), 17.4 GB a rank, "engines ready" 93-96 s
 without it, 97 s on the boot that writes it, 20-21 s after.
 DeepSeek-V4.1-Flash at TP=4, 79.6 GB a rank: 84 s without it, 110 s on the boot that writes it, 16 s after.
-GLM-5.3 at TP=4 (ring, the docker image built from this change): 4.8 GB a rank, "engines ready" 71 s without it
-(stock image), 71 s on the boot that writes it, 68 s after. At TP=4 the computed tensors are a small part of the boot.
+GLM-5.3 at TP=4 (ring, 2026-11-06, an image built from the change that added the cache, #382): 4.8 GB a rank,
+"engines ready" 71 s without it (the image before that change), 71 s on the boot that writes it, 68 s after. At TP=4 the computed tensors are a small part of the boot.
 
 ## 2. DeepSeek-V4.1-Flash (`ds41`): how many chats, and how long
 
@@ -58,9 +58,10 @@ otherwise. "Free memory" is `MemAvailable` a box; a range is the lowest and high
 - 10: `SESS=10`, and `GR8_DS_SESS_DRAFTS=1` in `EXTRA_ENV`. 16: `SESS=16`, and the same word.
   `GR8_DS_SESS_DRAFTS=1` lets every chat keep drafting when more than 5 write at once; it drafts fewer tokens a
   chat as more chats write (5 at 1-5 chats, 2 at 9-10, 1 at 11-16; [ENV.md](ENV.md)).
-- Measured on `main` at b10aae4 with Q3's switches on, one boot each, two runs each (the range; the first of the two
-  runs is a little slower). Short code prompts. "Each" is the median chat's writing speed once it has a slot;
-  "together" is all chats; "first word" is the median wait for the first word, slot wait included.
+- `SESS` takes any count from 1 to 32; 5, 10 and 16 above are the measured setups.
+- Measured on `main` at b10aae4 (2026-11-03) with Q3's switches on, one boot each, two runs each (the range; the first
+  of the two runs is a little slower). Short code prompts. "Each" is the median chat's writing speed once it has a
+  slot; "together" is all chats; "first word" is the median wait for the first word, slot wait included.
 
   | chat slots | 1 chat, tokens/s | 8 chats: each / together | 16 chats: each / together | 16 chats: first word | free memory at ready |
   |---:|---:|---:|---:|---:|---:|
@@ -108,6 +109,15 @@ Measured on four GB10 boxes (TP=4, a switch), the exlr8 release, Engram on. "Spe
 tokens/s. "Quality" is a fixed 75-item check set (code, math, JSON, reasoning), the median of 3 runs. Each answer adds
 words to `EXTRA_ENV` (`"A=1 B=2"`, every rank).
 
+### Q2a. Exact output, or the faster prefill?
+
+> "Do you want the exact model's output? The default reads prompts faster with the v2 prefill, but one of its parts
+> (the shared expert on the tensor cores) changes the output bits, so the same prompt can get a different reply."
+
+- Default: the v2 prefill (the release stack: 8,192-row chunks, one prefill lane).
+- Exact output: `EXACT=1` in `cluster.env`. Prompts then run on the old prefill path (two lanes, 4,096-row chunks).
+- A 1M-token context with `GR8_DS_MHC_ROW_SHARD=1` in `EXTRA_ENV` also runs the old prefill path.
+
 ### Q3. Faster writing for a small quality loss?
 
 > "Do you want DeepSeek to write faster: about 40-50% on long replies, 20% (code) to 50% (prose) on short ones? The
@@ -115,7 +125,8 @@ words to `EXTRA_ENV` (`"A=1 B=2"`, every rank).
 
 - Default: no.
 - Yes: `GR8_DS_RELAXED_ACCEPT=topp:0.9,ratio:0.1 GR8_DS_MOE_TOPK_DECODE=4`.
-- Measured against `main` at ca24fdd0 (two boots), and again on `main` at b10aae4 (one boot each way). Long replies:
+- Measured against `main` at ca24fdd0 (2026-11-01; two boots), and again on `main` at b10aae4 (2026-11-03; one boot each
+  way). Long replies:
   code +41-42%, prose +50-52%, structured output +23-25%. Short 256-token replies: code +21-23%, prose +51%,
   structured +14% (b10aae4). Prompt reading (prefill) stays inside the run-to-run spread (b10aae4: one benchmark
   +1-2%, another 3% lower). Quality 73 -> 71 of 75 both times.
@@ -139,8 +150,8 @@ words to `EXTRA_ENV` (`"A=1 B=2"`, every rank).
 > "When several chats start together, do you want each to show its first word sooner (about 3x with 4 chats, 5x with
 > 8), if with 4 chats each one then writes about 9% slower?"
 
-- Default: no (each chat faster).
-- Yes: `GR8_S2_ADMIT_HOLD=1 GR8_S2_TAIL_FIRST=1`.
+- Default: yes (the release stack sets both). With `EXACT=1`: no.
+- No (each chat faster): `GR8_S2_ADMIT_HOLD=0 GR8_S2_TAIL_FIRST=0`. Yes with `EXACT=1`: `GR8_S2_ADMIT_HOLD=1 GR8_S2_TAIL_FIRST=1`.
 - Measured with 4 chats: median first word 648 -> 209 ms; each chat's median rate 75.7 -> 68.6 tokens/s; all 4 chats
   together +15%. With 8 chats: first word 1,656 -> 310 ms; all 8 together +5.5%. The answers did not change.
   (Measured with Q3's switches on.)

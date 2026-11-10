@@ -13,6 +13,12 @@ T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 bash "$REPO/engine/runtime/tests/nvcc_cache_test.sh"
 # the DS41 build knobs -> nvcc flags (scripts/ds41_build_flags.sh: GR8_DS_TRUNK_BF16)
 bash "$REPO/engine/runtime/tests/ds41_build_flags_test.sh"
+# v2 communication width sweeps: host-only request selection and validation.
+g++ -std=c++17 -O2 -Wall -Wextra "$REPO/engine/tests/test_ds41_v2_width.cpp" -o "$T/test_ds41_v2_width"
+"$T/test_ds41_v2_width"
+# v2 attention pipeline: bounded request diagnostics, including default off.
+g++ -std=c++17 -O2 -Wall -Wextra "$REPO/engine/tests/test_ds41_v2_attn_pipe.cpp" -o "$T/test_ds41_v2_attn_pipe"
+"$T/test_ds41_v2_attn_pipe"
 # Inactive steering contracts/profile loader: CPU only, no CUDA or Rust dependencies.
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/steering_test.cpp" \
   "$REPO/engine/loader/g6pack.cpp" -o "$T/steering_test"
@@ -274,9 +280,9 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engin
 # GR8_DS_COMP_FP4 [1,1,0,1] refuses, [1,1,1,1] and [0,0,0,0] boot
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/ds41_agree_knobs_test.cpp" -o "$T/ds41_agree_knobs_test" "${KNOBS[@]}"
 "$T/ds41_agree_knobs_test" "$REPO/engine/runtime/g6m4.cu"
-# DS41 ranks that loaded different vision towers (one without the file, or another file) refuse at bootstrap
-g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/ds41_agree_vision_test.cpp" -o "$T/ds41_agree_vision_test" "${KNOBS[@]}"
-"$T/ds41_agree_vision_test" "$REPO/engine/runtime/g6m4.cu"
+# DS41 and Flash ranks that loaded different vision towers (one without the file, or another file) refuse at bootstrap
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/agree_vision_test.cpp" -o "$T/agree_vision_test" "${KNOBS[@]}"
+"$T/agree_vision_test" "$REPO/engine/runtime/g6m4.cu"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/steering_state_test.cpp" "${KVLIB[@]}" -o "$T/steering_state_test"
 "$T/steering_state_test"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/steering_transport_test.cpp" -o "$T/steering_transport_test" "${KNOBS[@]}"
@@ -372,8 +378,15 @@ g++ -std=c++17 -O2 -ffp-contract=off -Wall -Wextra -pthread -I "$REPO/engine/eng
 "$T/engram_wide_test" "$T/engram_wide"
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/engram" "$REPO/engine/engram/tests/test_rowstore.cpp" -o "$T/engram_rowstore_test"
 "$T/engram_rowstore_test" "$T/engram_rowstore" 262144
+g++ -std=c++17 -O2 -Wall -Wextra -pthread "$REPO/engine/engram/tests/test_uring.cpp" -o "$T/engram_uring_test"
+"$T/engram_uring_test"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine" "$REPO/engine/engram/tests/test_boot.cpp" -o "$T/engram_boot_test" "${KNOBS[@]}"
 "$T/engram_boot_test"
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine" "$REPO/engine/engram/tests/test_col_shard.cpp" -o "$T/engram_col_shard_test" "${KNOBS[@]}"
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine" "$REPO/engine/engram/tests/test_sparse.cpp" -o "$T/engram_sparse_test" "${KNOBS[@]}"
+"$T/engram_sparse_test" "$T/engram_sparse"
+mkdir -p "$T/engram_col_shard"
+"$T/engram_col_shard_test" "$T/engram_col_shard"
 # the W-row wkv's activation quantizer needs cuda_fp8.h, so it runs where the CUDA headers are
 if [ -f /usr/local/cuda/include/cuda_fp8.h ]; then
   g++ -std=c++17 -O2 -ffp-contract=off -Wall -Wextra -I "$REPO/engine/engram" -I /usr/local/cuda/include \
@@ -390,6 +403,11 @@ g++ -std=c++17 -O2 -Wall "$REPO/engine/kernels/tests/ds_ro_host_test.cpp" -o "$T
 # DS41 W4096: RO_MAX 4096 is the largest prefill width, and the RoScratch tile capacity holds the 4096-row plan
 g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" -I "$REPO/engine/kernels" "$REPO/engine/tests/test_ds41_w4096.cpp" -o "$T/test_ds41_w4096"
 "$T/test_ds41_w4096"
+# v2 (the launcher default): geometry/order, the fallback decision (which settings run v2, which the old range A), stock bootstrap coverage and isolated fabric/tail.
+for name in test_ds41_v2 test_ds41_v2_walk test_ds41_v2_plan; do
+  g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -DG6_NR=4 -DDEC_S2 -I "$REPO/engine" "$REPO/engine/tests/$name.cpp" -o "$T/$name" "${KVLIB[@]}"
+  "$T/$name"
+done
 # the bounded-replay split (runtime/ds41_pf_split.h), off and with GR8_DS_PF_L20_TAIL=1 (layer 20 in range B, its ca row hoisted)
 g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" "$REPO/engine/tests/test_ds41_pf_split.cpp" -o "$T/test_ds41_pf_split"
 "$T/test_ds41_pf_split" > "$T/pf_split.log" || { cat "$T/pf_split.log"; exit 1; }
@@ -415,10 +433,11 @@ g++ -std=c++17 -O2 -Wall "$REPO/engine/runtime/tests/pf_peer_stage_test.cpp" -o 
 "$T/pf_peer_stage_test"
 g++ -std=c++17 -O2 -I "$REPO/engine/kernels" "$REPO/engine/tests/test_topk.cpp" -o "$T/test_topk" "${KNOBS[@]}"
 "$T/test_topk"
-# DS41 S2 host tests: prefill admission, its two lanes, 32-session steps, the 32-session 64K config, the DSpark round
+# DS41 S2 host tests: prefill admission, its two lanes, 32-session steps, the 32-session 64K config, the DSpark round,
+# prefix reuse rows with drafts off (a forced tool call's insert rule at MTP 0)
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" -I "$REPO/engine/comms" "$REPO/engine/runtime/s2/tests/ds41_prefill_test.cpp" -o "$T/ds41_prefill_test" "${KNOBS[@]}"
 "$T/ds41_prefill_test"
-for t in ds41_prefill_lanes_test ds41_s32_step_test s32_64k_mtp8_test batch_ds41_dspark_test; do
+for t in ds41_prefill_lanes_test ds41_s32_step_test s32_64k_mtp8_test batch_ds41_dspark_test ds41_reuse_mtp0_test; do
   g++ -std=c++17 -O2 -Wall -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" -I "$REPO/engine/runtime/s2" -I "$REPO/engine" "$REPO/engine/runtime/s2/tests/$t.cpp" -o "$T/$t" "${KVLIB[@]}"
   "$T/$t" > "$T/$t.out" 2>&1 || { cat "$T/$t.out"; exit 1; }
 done

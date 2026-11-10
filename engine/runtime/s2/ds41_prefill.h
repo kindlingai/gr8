@@ -12,7 +12,7 @@
 #pragma once
 #include "prompt_rule.h"
 #include "scheduler.h"
-#include "../ds41_image.h"
+#include "../image_input.h"
 #include "../ds41_coll_order.h"
 #include "../ds41_pack_layout.h"
 #include <algorithm>

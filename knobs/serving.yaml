@@ -4,7 +4,7 @@ knobs:
   GR8_CP:
     scope: agree
     kind: flag
-    unset: "1 in a CP build"
+    unset: "1 in a CP build, 0 in the Flash build"
     doc: >-
       Context-parallel KV: the first GR8_CP_R tokens are replicated and later pages are spread across ranks on a CP
       fabric of their own. Read only in builds with -DG6_CP=1.
@@ -134,14 +134,24 @@ knobs:
     values: "0|1"
     doc: >-
       Prints one stderr line per S2 pool claim with its first page, page count and the retained runs it evicted.
+  GR8_QUIT_FAST:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      At an orderly quit of a served GLM-5.3 engine, after the KV store keeps the pool's runs and the links close, the
+      ranks meet at the fabric barrier and the process ends at once: the CUDA graphs, buffers and the CUDA runtime are
+      not freed one by one, process exit releases them. The Flash and DS41 engines ignore it.
   GR8_REUSE_ALIGN:
     scope: agree
     kind: flag
     unset: "1 with --serve, 0 offline"
     values: "0|1"
     doc: >-
-      With --reuse-prefix, a hit keeps only whole cold-prefill grid cells (--prefill rows), so the result equals a cold
-      prefill bit for bit. 0 keeps the whole matched prefix. 1 needs --prefill.
+      With --reuse-prefix, a hit keeps only whole cold-prefill grid cells (--prefill rows), so the result should equal a
+      cold prefill. Open issue #412 reports a hit that differs from a cold prefill at temperature 0 (GLM-5.3, TP=4).
+      0 keeps the whole matched prefix. 1 needs --prefill.
   GR8_REUSE_HDUMP:
     scope: local
     kind: path

@@ -169,6 +169,8 @@ def resolve_model(o, refresh=False, log=log):
             else:
                 release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log,
                                            layout=o.get('LAYOUT'))
+            # GLM-5.3-Flash image input: each rank fetches the vision tower too
+            release.vision = models.of(o) is models.GLM53F and opt.extra_env_value(o, 'GR8_GLM53F_VISION') == '1'
             release.fetch_meta(steering[0] if steering else None)
             o.values['V2'], o.values['V2_SLICES'] = release.v2, release.slices
             model = release.dir
@@ -292,6 +294,8 @@ class Supervisor:
         self.agent = self.api_agent = None
         self.rank, self.lan, self.members, self.hs = None, None, [], {}
         self.state = 'starting'
+        self.state_lock = threading.RLock()
+        self.serving_urls = {}        # retain early notifications by epoch until the handshake chooses a boot
         self.servers = []
         self.locked = self.started = False
         self.ms, self.model_error, self.rails, self.fabric_error = None, '', ('', ''), ''
@@ -302,19 +306,25 @@ class Supervisor:
         self.ring, self.ring_devs, self.ring_ports, self.claim_link = '', None, {}, None
         self.offers = self.variant = self.model_id = None
         self.lingered = False
+        self.refusal_logged = False   # the head printed its refusal before the extra wait
         self.check_n, self.check_lock = 0, threading.Lock()   # the engine's DIR/check.<n>, numbered per boot
 
     # ---- state ----------------------------------------------------------------------------------------------------
     def set_state(self, state, **meta):
-        self.state = state
-        if not self.locked:
-            return
-        tmp = os.path.join(self.out, 'gr8.state.tmp')
-        with open(tmp, 'w') as f:
-            json.dump({'state': state, 'rank': self.rank, 'pid': os.getpid(), 'time': time.time()}, f)
-        os.replace(tmp, os.path.join(self.out, 'gr8.state'))
-        if self.agent:
-            self.agent.set_meta(**{'gr8.state': state[:1024], 'gr8.rank': self.rank}, **meta)
+        with self.state_lock:
+            url = self.serving_urls.get(self.hs.get('epoch'))
+            if state == 'loading' and url is not None:
+                state = 'serving'
+                log(f'the head serves {url}')
+            self.state = state
+            if not self.locked:
+                return
+            tmp = os.path.join(self.out, 'gr8.state.tmp')
+            with open(tmp, 'w') as f:
+                json.dump({'state': state, 'rank': self.rank, 'pid': os.getpid(), 'time': time.time()}, f)
+            os.replace(tmp, os.path.join(self.out, 'gr8.state'))
+            if self.agent:
+                self.agent.set_meta(**{'gr8.state': state[:1024], 'gr8.rank': self.rank}, **meta)
 
     # ---- the control port -----------------------------------------------------------------------------------------
     def serve(self, addrs):
@@ -365,9 +375,16 @@ class Supervisor:
             self.request_stop(f'rank {m.get("rank")} ({peer}) failed: {m.get("why")}', all_boxes=True)
             return {'t': 'ok'}
         if t == 'serving':
-            if self.state == 'loading':
-                self.set_state('serving')
-                log(f'the head serves {m.get("url")}')
+            epoch = m.get('epoch')
+            if not isinstance(epoch, int):
+                return {'t': 'ok', 'detail': 'no boot epoch'}
+            with self.state_lock:
+                if self.hs and epoch != self.hs.get('epoch'):
+                    return {'t': 'ok', 'detail': 'not this boot'}
+                self.serving_urls[epoch] = m.get('url', '')
+                if self.state == 'loading' and epoch == self.hs.get('epoch'):
+                    self.set_state('serving')
+                    log(f'the head serves {self.serving_urls[epoch]}')
             return {'t': 'ok'}
         if t == 'logs':
             return self.read_log(m.get('which', 'engine'), int(m.get('offset', -8192)))
@@ -524,11 +541,14 @@ class Supervisor:
         if verdict.get('t') == 'ok' and fails:   # never boot past a failed check, whatever the verdict
             verdict = {'t': 'refused', 'field': 'checks', 'values': {}, 'detail': '; '.join(fails), 'exit': 4}
         if verdict.get('t') != 'ok':
-            log(handshake.describe(verdict))
+            if not self.refusal_logged:
+                log(handshake.describe(verdict))
             e = Stop(verdict.get('exit', 4), f'handshake refused: {verdict["field"]}')
             e.logged = True
             raise e
-        self.hs = verdict
+        with self.state_lock:
+            self.hs = verdict
+            self.serving_urls = {e: url for e, url in self.serving_urls.items() if e == verdict['epoch']}
         if verdict.get('ips'):     # the head's rails for this box, which may differ from its own election's
             self.rails = (verdict['ips'][self.rank], verdict['ips2'][self.rank])
             if self.agent:
@@ -743,14 +763,34 @@ class Supervisor:
             self.head.decide({'t': 'refused', 'field': 'stopped', 'values': {}, 'detail': self.stop_why, 'exit': 1})
         v = self.head.verdict
         if v['t'] != 'ok':
+            # say why now, not after the extra wait: with a box down that wait is up to JOIN_TIMEOUT
+            log(handshake.describe(v))
+            self.refusal_logged = True
+            if not self.stop_ev.is_set():   # a stopped head does not linger: no wait to announce
+                log(self.linger_plan())
             self.linger()
         return v
 
+    def linger_plan(self):
+        """The head's line before linger(): how long it keeps answering, and for which ranks."""
+        stay = float(os.environ.get('GR8_REFUSAL_LINGER', '15'))
+        more = opt_timeout(self.o)
+        waiting = self.head.untold() if self.head is not None else []
+        if not waiting or more <= 0 or self.head.gave_up:   # JOIN_TIMEOUT 0 here: no extra wait (wait_told(0))
+            return f'head: answering late hellos with the refusal for {stay:.0f} s'
+        ranks = ', '.join(str(r) for r in waiting)
+        return (f'head: answering late hellos with the refusal for {stay:.0f} s, then up to {more:.0f} s more '
+                f'until rank{"s" if len(waiting) > 1 else ""} {ranks} {"have" if len(waiting) > 1 else "has"} it')
+
     def linger(self):
-        """Answer late hellos and polls with the head's refusal for a while before leaving."""
+        """Answer late hellos and polls with the head's refusal for GR8_REFUSAL_LINGER seconds, then on until every
+        worker has it (a box still fetching says hello late), at most JOIN_TIMEOUT more, before leaving."""
         if not self.lingered:
             self.lingered = True
-            self.stop_ev.wait(float(os.environ.get('GR8_REFUSAL_LINGER', '15')))
+            if self.stop_ev.wait(float(os.environ.get('GR8_REFUSAL_LINGER', '15'))):
+                return
+            if self.head is not None:
+                self.head.wait_told(opt_timeout(self.o), self.stop_ev)
 
     def rail_check(self, rails):
         """From each of the head's rails to the same rail of every worker (rails: every rank's pair): the control port
@@ -885,7 +925,7 @@ class Supervisor:
                 ask_at += 30
             elif time.monotonic() - t0 > tmo + 600:
                 raise Stop(1, 'the head did not report serving')
-            time.sleep(1)
+            time.sleep(0.1 if r == 0 else 1)
         for line in relay.new() if relay else ():
             log(f'{time.monotonic() - t0:6.0f}s {line}')
         if r == 0:
@@ -896,7 +936,7 @@ class Supervisor:
 
     def donate(self, knobs):
         """GLM-5.3-Flash with FLASH_KV_DONATE_GIB > 0: lend this box's spare memory, measured now that the serve has
-        booted, to a KV node beside it (D-331 M7): flash_donor_budget GiB, a host ledger crediting them to the node,
+        booted, to a KV node beside it: flash_donor_budget GiB, a host ledger crediting them to the node,
         and ./gr8 kv up --lazy-lock --ledger. The node is its own supervisor: its failure, or no budget, leaves the
         serve as it is."""
         if models.of(self.o).name != 'glm53f' or float(knobs.get('FLASH_KV_DONATE_GIB') or 0) <= 0:
@@ -987,6 +1027,8 @@ class Supervisor:
                     front += ['--' + k.lower().replace('_', '-'), o.get(k)]
         if o.get('ALLOW_THINKING_OFF') == '1' and model.dialect == 'glm':   # ds41 turns thinking off by itself
             front += ['--allow-thinking-off']
+        if o.get('CLAMP_MAX_TOKENS') == '1':
+            front += ['--clamp-max-tokens']
         if o.get('UNDECLARED_TOOL_CALLS') != 'text':
             front += ['--undeclared-tool-calls', o.get('UNDECLARED_TOOL_CALLS')]
         self.spawn('front', self.pin() + front + ['--model-dir', self.ms.tokenizer, '--engine-sock', sock,
@@ -1048,7 +1090,7 @@ class Supervisor:
         self.set_state('serving')
         for r in range(1, len(self.members)):
             for _ in range(10):
-                if self.tell(r, {'t': 'serving', 'url': url}):
+                if self.tell(r, {'t': 'serving', 'url': url, 'epoch': self.hs['epoch']}):
                     break
                 time.sleep(1)
         if self.agent:

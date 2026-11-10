@@ -124,7 +124,7 @@ int main(int argc, char** argv)
         {"glm53 nr6 mx8", 121, 0x967129417b716279ull},
         {"glm53 nr4 mx32", 121, 0x69356dc3e99a8ec0ull},
         {"glm53f nr4 mx32", 116, 0x2920b0d6c121e568ull},
-        {"ds41 nr4 mx48", 115, 0x7c3f2cd87cb069d7ull},
+        {"ds41 nr4 mx48", 116, 0x07ec2d75cdd0d055ull},
     };
     const std::vector<Case> cs = read_cases(argv[1], model);
     uint64_t h = 14695981039346656037ull;

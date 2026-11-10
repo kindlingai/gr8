@@ -31,12 +31,12 @@ BOXES="<head> <box2> <box3> <box4> <box5> <box6>" H=/path/to/gr8 bash recipes/tp
 curl -s localhost:8000/v1/models    # max_model_len 612986; boot log line "G6_CP on, R 131072"
 BOXES="..." H=/path/to/gr8 bash recipes/tp6-k3-613k/down.sh /path/to/K3-cap613-sl131k.env
 ```
-The numbers below were measured booting converted rank packs, at tag `tp6-k3-613k-measured` (dd67022). The launcher
-boots only from the exlr8 release now. At TP=6 the release plan gives the same weights a converted pack holds:
-`engine/loader-rs/tests/release_check.py --tp 6 --qo` matches every non-expert tensor of layers 0, 3, 36-38 and 78 on all
-six ranks byte for byte. A release boot of this env file serves, smoke 14/14, from the Hugging Face release, and so does
-one with the launcher's TP=6 defaults. A TP=6 release boot needs `index-slices/tp6` in the release: a release with
-tp4 slices only stops at boot with `no index slices for TP 6`.
+The numbers below were measured booting converted rank packs, at tag `tp6-k3-613k-measured` (dd67022, committed
+2026-10-23). The launcher boots only from the exlr8 release now. At TP=6 the release plan gives the same weights a
+converted pack holds: `engine/loader-rs/tests/release_check.py --tp 6 --qo` matches every non-expert tensor of layers 0,
+3, 36-38 and 78 on all six ranks byte for byte. A release boot of this env file serves, smoke 14/14, from the Hugging
+Face release, and so does one with the launcher's TP=6 defaults. A TP=6 release boot needs `index-slices/tp6` in the
+release: a release with tp4 slices only stops at boot with `no index slices for TP 6`.
 
 ## Numbers (GPU clock capped at 2000 MHz unless noted, MTP=3, one request unless noted)
 | measure | value |

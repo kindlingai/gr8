@@ -6,7 +6,8 @@
 //   base             the manifest (FlashManifest), written last
 //   base + 1 + i     logical page i of the run (the run's i-th pool page) of every binding, main model then draft: per
 //                    binding 64 rows of its latent cache, then its 16 pooled index keys (g6kv::ROW, g6kv::IDX_PAGE),
-//                    the pool's page block layout
+//                    the pool's page block layout. A CP binding (GR8_CP) keeps only the pages this rank holds, at its
+//                    own place for each logical page (the cp list); another rank's page is zeros here
 //   then             the KDA state of one slot, layer by layer: S [nhmax][128][128] fp32, then the conv history; then
 //                    the session's raw index ring of every binding (g6kv::RAW_RING x IDX_RAW, attn/kvfmt.h: the raw
 //                    rows of the pool the position may end inside); all cut into blocks (the last one padded with zeros)
@@ -34,15 +35,22 @@ namespace fck {
 inline void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string("Flash checkpoint ") + what + ": " + cudaGetErrorString(e));
 }
-// one binding's caches: page p of the latent cache at mla + p * mla_page, of the indexer keys at idx + p * idx_page
-struct Binding { uint4* mla; uint4* idx; unsigned long long mla_page16, idx_page16; };
+// one binding's caches: page p of the latent cache at mla + p * mla_page, of the indexer keys at idx + p * idx_page.
+// cp: a CP binding, whose pages are the cp list's (-1: another rank holds the page)
+struct Binding { uint4* mla; uint4* idx; unsigned long long mla_page16, idx_page16; int cp; };
 struct Extent { void* p; size_t bytes; };
-// grid (pages, bindings): pool page pages[i] of binding b <-> host slot i
-__global__ void k_pages(const int* pages, const Binding* b, const unsigned long long* off16, uint4* host,
+// grid (pages, bindings): pool page pages[i] (a CP binding: cps[i]) of binding b <-> host slot i; a page another rank
+// holds is zeros in the slot and is not written back
+__global__ void k_pages(const int* pages, const int* cps, const Binding* b, const unsigned long long* off16, uint4* host,
                         unsigned long long slot16, int out) {
     const Binding x = b[blockIdx.y];
-    const size_t p = (size_t)pages[blockIdx.x];
+    const int pg = x.cp ? cps[blockIdx.x] : pages[blockIdx.x];
     uint4* h = host + (size_t)blockIdx.x * slot16 + off16[blockIdx.y];
+    if (pg < 0) {
+        if (out) for (size_t k = threadIdx.x; k < x.mla_page16 + (x.idx ? x.idx_page16 : 0); k += blockDim.x) h[k] = make_uint4(0, 0, 0, 0);
+        return;
+    }
+    const size_t p = (size_t)pg;
     uint4* m = x.mla + p * x.mla_page16;
     for (size_t k = threadIdx.x; k < x.mla_page16; k += blockDim.x) { if (out) h[k] = m[k]; else m[k] = h[k]; }
     if (!x.idx) return;
@@ -63,13 +71,15 @@ __global__ void k_sum(const uint64_t* p, size_t words, unsigned long long first,
     if ((threadIdx.x & 31) == 0) atomicAdd(out, (unsigned long long)s);
 }
 // the same over n pool pages of one cache (w words a page): word i is word i % w of page pages[i / w], so a run's pages
-// sum as its logical pages [0, n) laid end to end (and the identity run as the contiguous extent)
+// sum as its logical pages [0, n) laid end to end (and the identity run as the contiguous extent). A page -1 (another
+// rank's, a CP binding) sums as zeros, the words its block holds
 __global__ void k_sum_pages(const uint64_t* base, const int* pages, size_t n, size_t w, unsigned long long first,
                             unsigned long long* out) {
     uint64_t s = 0;
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n * w; i += (size_t)gridDim.x * blockDim.x) {
         const size_t j = i / w;
-        s += mix(base[(size_t)pages[j] * w + (i - j * w)], first + i);
+        const int pg = pages[j];
+        s += mix(pg < 0 ? 0 : base[(size_t)pg * w + (i - j * w)], first + i);
     }
     for (int o = 16; o; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
     if ((threadIdx.x & 31) == 0) atomicAdd(out, (unsigned long long)s);
@@ -119,6 +129,7 @@ class FlashCheckpoints {
     bool persist_ = false;      // persist=on at boot
     uint8_t *host_ = nullptr, *host_dev_ = nullptr;   // mapped pinned: batch_ slots, registered with the store
     int* d_list_ = nullptr;                           // the run's pool pages, pool_pages of them at most
+    int* d_cp_ = nullptr;                             // the CP bindings' pages of the run's logical pages (-1: another rank's)
     fck::Binding* d_bind_ = nullptr;
     unsigned long long *d_off_ = nullptr, *d_sum_ = nullptr;
     static void tk(int rc, const char* what) {
@@ -147,26 +158,34 @@ class FlashCheckpoints {
     uint64_t page_sum(uint64_t np, cudaStream_t st) {
         fck::ck(cudaMemsetAsync(d_sum_, 0, 8, st), "sum");
         uint64_t first = 0;
-        auto one = [&](const uint4* p, unsigned long long page16) {
+        auto one = [&](const uint4* p, unsigned long long page16, const int* list) {
             const size_t w = page16 * 2, words = np * w;
             if (words) fck::k_sum_pages<<<(unsigned)std::min<size_t>(1024, (words + 255) / 256), 256, 0, st>>>(
-                reinterpret_cast<const uint64_t*>(p), d_list_, np, w, first, d_sum_);
+                reinterpret_cast<const uint64_t*>(p), list, np, w, first, d_sum_);
             first += words;
         };
-        for (const auto& b : v_.bindings) { one(b.mla, b.mla_page16); if (b.idx) one(b.idx, b.idx_page16); }
+        for (const auto& b : v_.bindings) {
+            const int* list = b.cp ? d_cp_ : d_list_;
+            one(b.mla, b.mla_page16, list);
+            if (b.idx) one(b.idx, b.idx_page16, list);
+        }
         return read_sum(st);
     }
-    // the run's first np pool pages to the device (validated: the copies write device memory at these pages)
-    void set_pages(const std::vector<int>& run, uint64_t np, cudaStream_t st) {
-        if (np > run.size()) throw std::runtime_error("Flash checkpoint: " + std::to_string(np) + " pages from a run of " + std::to_string(run.size()));
+    // the run's first np pool pages to the device (validated: the copies write device memory at these pages); cp: the CP
+    // bindings' pages of the same logical pages (-1: another rank's), nullptr = the run's
+    void set_pages(const std::vector<int>& run, uint64_t np, cudaStream_t st, const std::vector<int>* cp = nullptr) {
+        if (np > run.size() || (cp && np > cp->size()))
+            throw std::runtime_error("Flash checkpoint: " + std::to_string(np) + " pages from a run of " + std::to_string(run.size()));
         for (uint64_t i = 0; i < np; ++i)
-            if (run[i] < 0 || run[i] >= v_.pool_pages) throw std::runtime_error("Flash checkpoint: pool page " + std::to_string(run[i]) + " out of range");
+            if (run[i] < 0 || run[i] >= v_.pool_pages || (cp && ((*cp)[i] < -1 || (*cp)[i] >= v_.pool_pages)))
+                throw std::runtime_error("Flash checkpoint: pool page " + std::to_string(run[i]) + " out of range");
         fck::ck(cudaMemcpyAsync(d_list_, run.data(), np * sizeof(int), cudaMemcpyHostToDevice, st), "pages");
+        fck::ck(cudaMemcpyAsync(d_cp_, (cp ? *cp : run).data(), np * sizeof(int), cudaMemcpyHostToDevice, st), "pages");
         fck::ck(cudaStreamSynchronize(st), "pages");
     }
     // logical pages [first, first + n) (set_pages) <-> host slots 0..n-1 (n <= batch_)
     void pages(uint64_t first, int n, bool out, cudaStream_t st) {
-        fck::k_pages<<<dim3((unsigned)n, (unsigned)v_.bindings.size()), 256, 0, st>>>(d_list_ + first, d_bind_, d_off_,
+        fck::k_pages<<<dim3((unsigned)n, (unsigned)v_.bindings.size()), 256, 0, st>>>(d_list_ + first, d_cp_ + first, d_bind_, d_off_,
             reinterpret_cast<uint4*>(host_dev_), slot_ / 16, out);
         fck::ck(cudaGetLastError(), "pages");
         fck::ck(cudaStreamSynchronize(st), "pages");
@@ -279,6 +298,7 @@ public:
         fck::ck(cudaMemcpy(d_off_, off.data(), off.size() * 8, cudaMemcpyHostToDevice), "alloc");
         fck::ck(cudaMalloc(&d_sum_, 8), "alloc");
         fck::ck(cudaMalloc(&d_list_, sizeof(int) * (size_t)v_.pool_pages), "alloc");
+        fck::ck(cudaMalloc(&d_cp_, sizeof(int) * (size_t)v_.pool_pages), "alloc");
         fck::ck(cudaHostAlloc(reinterpret_cast<void**>(&host_), slot_ * batch_, cudaHostAllocMapped), "alloc");
         fck::ck(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_dev_), host_, 0), "alloc");
         tk(g6kv_tier_register(t_, host_, slot_ * batch_), "register");
@@ -324,7 +344,7 @@ public:
     ~FlashCheckpoints() {
         if (verify_.joinable()) verify_.join();
         if (t_) g6kv_tier_free(t_);
-        cudaFree(d_bind_); cudaFree(d_off_); cudaFree(d_sum_); cudaFree(d_list_); cudaFreeHost(host_);
+        cudaFree(d_bind_); cudaFree(d_off_); cudaFree(d_sum_); cudaFree(d_list_); cudaFree(d_cp_); cudaFreeHost(host_);
     }
     FlashCheckpoints(const FlashCheckpoints&) = delete;
     FlashCheckpoints& operator=(const FlashCheckpoints&) = delete;
@@ -392,8 +412,9 @@ public:
     // and session sess's raw index rings as an entry for `tokens` (position + 1 of them). Returns the entry's generation,
     // or 0: the store cannot hold it. The same tokens already kept: that entry is marked used and nothing is written.
     // terminal: position may end mid-page (the whole last page is kept); otherwise it must be on the page grid.
+    // cp: the CP bindings' pages of the run's logical pages (FlashCheckpoints::set_pages), nullptr = no CP binding
     uint64_t capture(uint32_t position, int slot, int sess, const std::vector<int>& run, const std::vector<int>& tokens,
-                     const g6rt::CacheNamespace& ns, cudaStream_t st, bool terminal = false) {
+                     const g6rt::CacheNamespace& ns, cudaStream_t st, bool terminal = false, const std::vector<int>* cp = nullptr) {
         if (!position || (!terminal && position % 64) || tokens.size() != size_t(position) + 1 || slot < 0 || slot >= v_.slots ||
             sess < 0 || sess >= g6kv::RAW_SESS)
             throw std::runtime_error("Flash checkpoint: capture at " + std::to_string(position) + " with " + std::to_string(tokens.size()) + " tokens");
@@ -411,7 +432,7 @@ public:
         x.tokens = tokens; x.ns = ns;
         x.manifest = flash_manifest(x.generation, compat_, position, tokens, ns, np, block_, v_.state_bytes());
         const auto sx = v_.state(slot, sess);
-        set_pages(run, np, st);
+        set_pages(run, np, st, cp);
         x.manifest.page_sum = page_sum(np, st);
         x.manifest.state_sum = sum(sx, st);
         for (uint64_t p = 0; p < np; p += batch_) {
@@ -441,7 +462,7 @@ public:
     // entry `generation` back into the run's logical rows [0, position), KDA slot `slot` and session sess's raw index
     // rings; throws when the stored bytes are not the entry's (the serve fails: the other ranks restore too, so one rank
     // cannot fall back to a cold prefill alone)
-    void restore(uint64_t generation, int slot, int sess, const std::vector<int>& run, cudaStream_t st) {
+    void restore(uint64_t generation, int slot, int sess, const std::vector<int>& run, cudaStream_t st, const std::vector<int>* cp = nullptr) {
         const FlashEntry* x = index_.find(generation);
         if (!x) throw std::runtime_error("Flash checkpoint: no entry " + std::to_string(generation));
         if (slot < 0 || slot >= v_.slots) throw std::runtime_error("Flash checkpoint: no KDA slot " + std::to_string(slot));
@@ -452,7 +473,7 @@ public:
         std::memcpy(&m, host_, sizeof m);
         if (const char* why = m.differs(x->manifest)) fail(generation, why);
         const uint64_t np = (x->position + 63) / 64;
-        set_pages(run, np, st);
+        set_pages(run, np, st, cp);
         for (uint64_t p = 0; p < np; p += batch_) {
             const int n = (int)std::min<uint64_t>(batch_, np - p);
             io(x->base + 1 + p, n, false);

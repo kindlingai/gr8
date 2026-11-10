@@ -117,6 +117,8 @@ pub fn runtime_signature(i: &SigInputs) -> String {
         if !ckpt.is_empty() {
             s += &format!(" ckpt {ckpt} blocks {}{}", i.ckpt_blocks, if i.ckpt_persist { " persist" } else { "" });
         }
+        // with the tower, " vision <file id>", as DS41's
+        s += &when(i.vis_on, || format!(" vision {}", text(i.vis_id)));
         return s;
     }
     if i.model == SIG_DS41 {

@@ -28,7 +28,7 @@ __global__ void __launch_bounds__(256) k_route_ro(const float* __restrict__ logi
                                                  const unsigned char* __restrict__ vflag = nullptr)
 {
     constexpr int RW = NE / 32, MW = MM / 32;
-    static_assert(NE % 32 == 0 && MM % 32 == 0 && MM <= RO_MAX && TK <= 8 && TK <= NE, "k_route_ro tiling");
+    static_assert(NE % 32 == 0 && MM % 32 == 0 && MM <= RO_PLAN_MAX && TK <= 8 && TK <= NE, "k_route_ro tiling");
     static_assert(KC >= 1 && KC <= TK, "k_route_ro: kept routes");
     const int w = threadIdx.x >> 5, l = threadIdx.x & 31, m = blockIdx.x * 8 + w;
     if (m >= M) return;
@@ -95,7 +95,7 @@ template <int NE = NEXP, int TK = TOPK, int MM = 1024>
 __global__ void __launch_bounds__(NE) k_scan_ro(PlanMT<TK, MM>* __restrict__ P, const unsigned* __restrict__ emask, int* __restrict__ tile0_of)
 {
     constexpr int RW = NE / 32, MW = MM / 32;
-    static_assert(NE % 32 == 0 && NE <= 1024 && MM % 32 == 0 && MM <= RO_MAX, "k_scan_ro tiling");
+    static_assert(NE % 32 == 0 && NE <= 1024 && MM % 32 == 0 && MM <= RO_PLAN_MAX, "k_scan_ro tiling");
     __shared__ int wcount[RW], wtiles[RW];
     const int t = threadIdx.x, w = t >> 5, l = t & 31;
     int n = 0;
@@ -153,7 +153,9 @@ __global__ void __launch_bounds__(NE) k_order_ro(const PlanMT<TK, MM>* __restric
 
 // grid = ceil(M * TK / 256), block 256. Route r = (m, k): rank of token m in the expert's mask -> tile, column; fills the combine's tok_slot / tok_col and the
 // live columns of tile_w / tile_tok. A cut route (k >= KC) gets tok_slot -1, tok_col 0 (what k_combine skips) and places nothing.
-template <int NE = NEXP, int TK = TOPK, int MM = 1024, int KC = TK>
+// SKIP_DEAD (the DS41 v2 prefill's imported routes, ds41_v2_moe.cuh): a route whose tok_expert is -1 places nothing and keeps the
+// tok_slot / tok_col the import wrote (-1, 0).
+template <int NE = NEXP, int TK = TOPK, int MM = 1024, int KC = TK, bool SKIP_DEAD = false>
 __global__ void __launch_bounds__(256) k_place_ro(PlanMT<TK, MM>* __restrict__ P, const unsigned* __restrict__ emask, const int* __restrict__ tile0_of, int M)
 {
     constexpr int MW = MM / 32;
@@ -163,6 +165,8 @@ __global__ void __launch_bounds__(256) k_place_ro(PlanMT<TK, MM>* __restrict__ P
     if constexpr (KC < TK)
         if (k >= KC) { P->tok_slot[m][k] = -1; P->tok_col[m][k] = 0; return; }
     const int e = P->tok_expert[m][k];
+    if constexpr (SKIP_DEAD)
+        if (e < 0) return;
     int tile, col;
     mt_route_pos_w(tile0_of[e], emask + e * MW, m, tile, col);
     P->tok_slot[m][k] = tile;

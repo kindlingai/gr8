@@ -221,9 +221,9 @@ int main(int argc, char** argv)
         {"glm nr6 mx8", 0xee0cd5ef43dd2635ull},
         {"glm nr4 mx32", 0x8f1da8b7421ae74bull},
         {"glm nr3 mx32", 0xc845c7c8c70e40b6ull},
-        {"flash nr4 mx32", 0x2bdfe37e8e3043f8ull},
-        {"flash nr3 mx32", 0xaf3c4c713bceb73dull},
-        {"flash nr2 mx32", 0xe2fb6d468f33f3cdull},
+        {"flash nr4 mx32", 0x623b99a841ce800aull},
+        {"flash nr3 mx32", 0xf9dc44042fc2de31ull},
+        {"flash nr2 mx32", 0x4cf96175c8f81c0eull},
         {"ds41 nr4 mx48", 0xc406a4de0972ea85ull},
     };
     const Want* w = nullptr;

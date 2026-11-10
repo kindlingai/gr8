@@ -19,7 +19,7 @@ namespace g6s2 {
 // `seqt <mult>:<base>:<min>:<cap>`, `seqa <mult>:<base>:<min>:<cap>`, `seqg <mult>:<base>:<min>:<cap>:<ids>`
 // (penalty.h), `lp <k>`, `plp <k>`, `sys <n>`, `ins <rule>`, `gram <grammar>` and
 // `steer <profile> <canonical-fp32-hex>`, then any number of
-// `img <field>` (DS41 images, ds41_image.h: parsed here through parse::image, checked after the prompt), then the
+// `img <field>` (images, image_input.h: parsed here through parse::image, checked after the prompt), then the
 // prompt ids.
 namespace parse {
 using Handle = std::unique_ptr<g6sch_parsed, void (*)(g6sch_parsed*)>;
@@ -47,7 +47,7 @@ inline const char* resolve(void* ctx, bool has_profile, const uint8_t* profile, 
         return r.error.c_str();
     }
 }
-// one `img` field (ds41_image.h parse_field), kept in the context; its refusal kept for the parser to return
+// one `img` field (image_input.h parse_field), kept in the context with its refusal for the parser to return
 inline const char* image(void* ctx, const uint8_t* field, size_t n) {
     auto& r = *static_cast<Resolve*>(ctx);
     try {
@@ -160,7 +160,7 @@ public:
     Payload payload(const g6rt::ServeReq& r) const {
         const bool decode = g6mod::has(G6_CAP_PROMPT_DECODE) ? ds41_decode_prompt(prefill_min_, r.prompt.size(), r.plp, r.steering.enabled)
                                                              : r.plp >= 0;
-        // r.images is empty outside DS41: Service::images_ok refuses an image request there before it is queued
+        // r.images is empty outside DS41 and Flash: Service::images_ok refuses an image request there before it is queued
         return {r.prompt, chunk_, decode, r.ins, r.steering, r.gram, r.images};
     }
     // (row, target, k) -> a row's logprob entry in the last main step (DispatchHooks::logprob)

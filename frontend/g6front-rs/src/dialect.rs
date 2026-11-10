@@ -14,6 +14,7 @@ use crate::api::ApiError;
 use crate::dsparser::DsParser;
 use crate::parser::{Delta, FullParse, GlmParser};
 use crate::pyjson;
+use crate::sampling::Limit;
 use crate::thinking::{self, Thinking};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,12 +219,15 @@ pub fn resolve_ds(
         None => none,
     };
     if off {
-        return Ok((Thinking { effort: None, budget: 0, budget_explicit: false, off: true }, default_effort));
+        return Ok((
+            Thinking { effort: None, budget: Limit::Tokens(0), budget_explicit: false, off: true },
+            default_effort,
+        ));
     }
     let (budget, budget_explicit) = match thinking::parse_budget(body.get("thinking_budget"))? {
         None | Some(0) => (defaults.budget, false),
-        Some(n) if n < 0 => (0, false),
-        Some(n) => (n as u64, true),
+        Some(n) if n < 0 => (Limit::Tokens(0), false),
+        Some(n) => (Limit::Tokens(n as u64), true),
     };
     Ok((Thinking { effort: None, budget, budget_explicit, off: false }, effort.unwrap_or(default_effort)))
 }
@@ -339,7 +343,7 @@ mod tests {
     fn nothing_named_is_thinking_on_at_the_default_effort() {
         let (t, e) = res(json!({})).unwrap();
         assert!(!t.off);
-        assert_eq!((t.budget, t.budget_explicit, e), (0, false, 75));
+        assert_eq!((t.budget, t.budget_explicit, e), (Limit::Tokens(0), false, 75));
     }
 
     #[test]
@@ -402,14 +406,14 @@ mod tests {
 
     #[test]
     fn the_budget_follows_the_glm_rules_and_the_server_default_effort_is_used() {
-        let d = thinking::Defaults { effort: None, budget: 900, allow_off: false };
+        let d = thinking::Defaults { effort: None, budget: Limit::Tokens(900), allow_off: false };
         let r = |v: Value| resolve_ds(&body(v), d, 50).unwrap();
         let (t, e) = r(json!({}));
-        assert_eq!((t.budget, t.budget_explicit, e), (900, false, 50));
+        assert_eq!((t.budget, t.budget_explicit, e), (Limit::Tokens(900), false, 50));
         let (t, _) = r(json!({"thinking_budget": 100}));
-        assert_eq!((t.budget, t.budget_explicit), (100, true));
+        assert_eq!((t.budget, t.budget_explicit), (Limit::Tokens(100), true));
         let (t, _) = r(json!({"thinking_budget": -1}));
-        assert_eq!((t.budget, t.budget_explicit), (0, false));
+        assert_eq!((t.budget, t.budget_explicit), (Limit::Tokens(0), false));
         let e = resolve_ds(&body(json!({"thinking_budget": "x"})), d, 50).err().unwrap();
         assert_eq!(e.status, 400);
     }

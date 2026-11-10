@@ -13,6 +13,8 @@
 //!   GR8_LOAD_MERGE_KB=0  0 = one read per range. N > 0 (read mode): each chunk's file ranges sorted by file offset,
 //!                       ranges of one file at most N KB apart read with one pread into a scratch buffer and copied
 //!                       out (fill_merged). Same bytes; the gaps are read too.
+//!   GR8_LOAD_COMPACT=DIR reads the ranges of a source file from its compacted copy under DIR where DIR holds a map
+//!                       for it (Plan::remap_compact). Same bytes.
 //!
 //! g6l_v2_plan plans an image without a v2 pack: the base pack's tensors, with the v2 experts read from the raw width
 //! files at the offsets of the index slices (src/v2plan.rs). g6l_release_plan plans one from the exlr8 release alone,
@@ -20,6 +22,7 @@
 //! at load (Op::Gen). g6l_plan_load then loads either like a pack.
 
 pub mod codebook;
+pub mod compact;
 pub mod dflash2;
 pub mod ds41;
 pub mod exlr8;
@@ -330,9 +333,14 @@ fn run(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant, cache: Option<&
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_cfg(plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant, cache: Option<&gencache::GenCache>, mode: Mode,
+fn run_cfg(mut plan: Plan, pack_bytes: u64, sink: &G6lSink, t0: Instant, cache: Option<&gencache::GenCache>, mode: Mode,
            threads: usize, chunk: u64, merge: Option<u64>) -> Result<G6lStats, String> {
     let merge = merge.filter(|_| mode == Mode::Read);
+    if let Some(dir) = gr8knobs::LOAD_COMPACT.get() {
+        sys::raise_nofile();
+        let (nf, moved, left) = plan.remap_compact(dir)?;
+        eprintln!("# load-compact: {dir}: {nf} compacted files, {moved} ranges read from them, {left} from the sources");
+    }
     let files = plan.files.iter().map(|p| open_src(p, mode)).collect::<Result<Vec<_>, _>>()?;
     let l = Loader { plan, files, mode, sink, cache, merge };
     let nchunks = pack_bytes.div_ceil(chunk);
@@ -704,4 +712,105 @@ mod tests {
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn compacted_copies_load_the_same_image() {
+        let dir = std::env::temp_dir().join(format!("g6load-compact-{}", std::process::id()));
+        let cdir = dir.join("compact");
+        std::fs::create_dir_all(&cdir).unwrap();
+        let (files, segs, bytes) = fixture(&dir);
+        let mut want = vec![0u8; bytes as usize];
+        read_range(&plan_of(&files, &segs, bytes), 0, &mut want).unwrap();
+        // compact src0 only, and only its ranges in image order 0, 2, 4, ...: the others stay on the source
+        let src = std::fs::read(&files[0]).unwrap();
+        let mut runs: Vec<(u64, u64)> = segs.iter().enumerate().filter(|(i, s)| s.3 == 0 && i % 2 == 0)
+            .map(|(_, s)| (s.4, s.1)).collect();
+        runs.sort_unstable();
+        // overlapping ranges share one run, as a real compaction writes them
+        let mut union: Vec<(u64, u64)> = Vec::new();
+        for (o, n) in runs.iter().copied() {
+            match union.last_mut() {
+                Some(u) if o <= u.0 + u.1 => u.1 = u.1.max(o + n - u.0),
+                _ => union.push((o, n)),
+            }
+        }
+        let nmoved = runs.len();
+        let runs = union;
+        let (mut packed, mut map) = (Vec::new(), format!("g6map-v1 {}\n", src.len()));
+        for (o, n) in &runs {
+            map += &format!("{o} {n} {}\n", packed.len());
+            packed.extend_from_slice(&src[*o as usize..(*o + *n) as usize]);
+        }
+        std::fs::write(cdir.join("src0"), &packed).unwrap();
+        std::fs::write(cdir.join("src0.g6map"), &map).unwrap();
+        for (mode, merge) in [(Mode::Read, None), (Mode::Read, Some(0)), (Mode::Read, Some(1 << 20)),
+                              (Mode::Mmap, None)] {
+            let mut p = plan_of(&files, &segs, bytes);
+            let (nf, moved, left) = p.remap_compact(cdir.to_str().unwrap()).unwrap();
+            assert_eq!((nf, moved, moved + left), (1, nmoved, segs.iter().filter(|s| s.3 == 0).count()));
+            assert!(left > 0);
+            let img = Img { bytes: Mutex::new(vec![0xAA; bytes as usize]), staging: 65536 };
+            let sink = G6lSink { ctx: &img as *const Img as *mut c_void, alloc_staging: alloc, free_staging: free, copy };
+            run_cfg(p, bytes, &sink, Instant::now(), None, mode, 3, 65536, merge).unwrap();
+            assert!(img.bytes.into_inner().unwrap() == want, "merge {merge:?}: image differs");
+        }
+        // Every run is checked, not just the last: overflow, source bounds, copy bounds and overlap.
+        for bad in ["no numbers", "0 1", "0 0 0", "18446744073709551615 2 0",
+                    "0 2 18446744073709551615", "0 1 18446744073709551614\n2 1 0",
+                    "2 2 0\n1 1 2", "0 3 0\n2 1 3"] {
+            std::fs::write(cdir.join("src0.g6map"), format!("g6map-v1 {}\n{bad}\n", src.len())).unwrap();
+            assert!(plan_of(&files, &segs, bytes).remap_compact(cdir.to_str().unwrap()).is_err(), "{bad}");
+        }
+        // a map written for another size of the source is refused
+        std::fs::write(cdir.join("src0.g6map"), format!("g6map-v1 {}\n", src.len() + 1)).unwrap();
+        assert!(plan_of(&files, &segs, bytes).remap_compact(cdir.to_str().unwrap()).unwrap_err().contains("stale"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn compact_knob_subprocesses() {
+        let dir = std::env::temp_dir().join(format!("g6load-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for value in [None, Some(""), Some(dir.to_str().unwrap())] {
+            // The knob table is cached per process. Test the real boot path in fresh processes, including the
+            // usual soft descriptor limit: 300 sources plus their copies need more than 1024 descriptors.
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", "ulimit -Sn 1024; exec \"$@\"", "sh"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::compact_knob_child", "--ignored", "--nocapture"])
+                .env_clear();
+            if let Some(v) = value { cmd.env("GR8_LOAD_COMPACT", v); }
+            assert!(cmd.status().unwrap().success(), "compact knob {value:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "run by compact_knob_subprocesses with a fresh knob table"]
+    fn compact_knob_child() {
+        let dir = std::env::temp_dir().join(format!("g6load-env-child-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let compact = gr8knobs::LOAD_COMPACT.get();
+        let mut files = Vec::new();
+        let mut segs = Vec::new();
+        for i in 0..300 {
+            let name = format!("src{i}");
+            let path = dir.join(&name);
+            std::fs::write(&path, [0u8; 8]).unwrap();
+            files.push(path.to_str().unwrap().to_owned());
+            segs.push(Seg { pack_off: i as u64, nbytes: 1, op: Op::Copy, file: i, file_off: 3 });
+            if let Some(c) = compact {
+                // Deliberately distinguish the copy from the source to prove which descriptor was read.
+                std::fs::write(std::path::Path::new(c).join(&name), [42u8]).unwrap();
+                std::fs::write(std::path::Path::new(c).join(format!("{name}.g6map")), "g6map-v1 8\n3 1 0\n").unwrap();
+            }
+        }
+        let p = Plan::from_segs(files, segs, Vec::new(), Vec::new(), 300).unwrap();
+        let img = Img { bytes: Mutex::new(vec![0xAA; 300]), staging: 4096 };
+        let sink = G6lSink { ctx: &img as *const Img as *mut c_void, alloc_staging: alloc, free_staging: free, copy };
+        run_cfg(p, 300, &sink, Instant::now(), None, Mode::Read, 1, 4096, None).unwrap();
+        assert_eq!(img.bytes.into_inner().unwrap(), vec![if compact.is_some() { 42 } else { 0 }; 300]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
 }

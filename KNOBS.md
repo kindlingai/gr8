@@ -39,12 +39,13 @@ sha256 of the file.
 
 ## `./gr8 glm53f`
 
-`./gr8 glm53f` takes the same options for GLM-5.3-Flash: TP 4 or 2, an fp8 KV build, no drafter, no prefix reuse, and
-`CAP` 262208 at either TP, a 262,144-token request (`tools/launch/models.py`, `flash_defaults` in
-`scripts/engine_args.sh`, [docs/FLASH.md](docs/FLASH.md)). `SESS` defaults to 1 there; 2 to 8 share decode steps and
-the `CAP` pool, each session with its own KDA state slots, while `SESS` x (`MTP` + 1) is at most 32.
+`./gr8 glm53f` takes the same options for GLM-5.3-Flash: TP 4, 3, 2 or 1, an fp8 KV build, the DFlash2 drafter
+at TP 4, 2 and 1 when `--drafter` (or `DFLASH_DIR`) is given, else MTP (MTP at TP 3), no prefix reuse, and `CAP` 262208 at any TP, a 262,144-token request
+(`tools/launch/models.py`, `flash_defaults` in `scripts/engine_args.sh`, [docs/FLASH.md](docs/FLASH.md)). `SESS`
+defaults to 8 at TP=4, 4 at TP=3 and 1 at TP=2 and TP=1; 2 to 8 share decode steps and the `CAP` pool, each session
+with its own KDA state slots, while `SESS` x (`MTP` + 1) is at most 32.
 
-A Flash box can lend what its serve leaves to a KV node beside it (D-331 M7; `donate` in `tools/launch/supervisor.py`):
+A Flash box can lend what its serve leaves to a KV node beside it (`donate` in `tools/launch/supervisor.py`):
 the `FLASH_KV_*` and `FLASH_CAP_POLICY` options (`./gr8 knobs FLASH_`).
 
 ## Rank health

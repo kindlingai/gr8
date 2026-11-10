@@ -105,6 +105,23 @@ __global__ void k_dequant(const uint32_t* ids, const uint8_t* stage, const uint8
     *(uint4*)(emb + (size_t)r * kEmbDim + (size_t)g * kRowBytes + c * 8) = make_uint4(o[0], o[1], o[2], o[3]);
 }
 
+// Opt-in column kernel; keep the original contiguous kernel above unchanged.
+__global__ void k_dequant_col(const uint32_t* ids, const uint8_t* stage, const uint8_t* s8, ColShard columns, int rows, __nv_bfloat16* emb)
+{
+    const int r = blockIdx.x, g = blockIdx.y * 8 + (threadIdx.x >> 5), c = threadIdx.x & 31;
+    const int64_t loc = columns.at(g, ids[(size_t)r * kIds + g]);
+    uint32_t o[4] = {0, 0, 0, 0};
+    if (loc >= 0)
+    {
+        const uint2 w = *(const uint2*)(stage + ((size_t)r * kIds + g) * kRowBytes + c * 8);
+        const uint8_t s = s8[(size_t)loc * kScaleBytes + (c >> 2)];
+        const uint8_t* wb = (const uint8_t*)&w;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) o[k] = (uint32_t)dequant1(wb[2 * k], s) | (uint32_t)dequant1(wb[2 * k + 1], s) << 16;
+    }
+    *(uint4*)(emb + (size_t)r * kEmbDim + (size_t)g * kRowBytes + c * 8) = make_uint4(o[0], o[1], o[2], o[3]);
+}
+
 // The W-row wkv's activation quantizer (act_quant.h): emb bf16 [rows][6144] -> codes u8 [rows][6144], E8M0 bytes [rows][192]. One warp per
 // block of 32 (a lane per element), 8 warps per CTA: grid ceil(rows * 192 / 8).
 __global__ void __launch_bounds__(256) k_act_quant_rows(const __nv_bfloat16* __restrict__ x, int rows, uint8_t* __restrict__ codes, uint8_t* __restrict__ sc)
@@ -213,6 +230,7 @@ struct Config
 {
     std::string prefix;              // weights PREFIX (PREFIX.engram.json, .cmap, .L###.w8/.s8)
     int rank = 0, nr = 1;
+    bool prefill_v2 = false;         // stock admission remains <= 4096
     int max_rows = 8;                // MX; a prefill build (GR8_DS_PREFILL_W) sets its W, up to 4096
     Knobs knobs;                     // read_knobs()
     const __nv_bfloat16* q_w[kNE] = {};   // device [4][5120] bf16: layer e's engram.q_weight / engram.k_weight (the image)
@@ -233,8 +251,8 @@ public:
     bool init(const Config& c, std::string* err)
     {
         cfg_ = c;
-        if (c.max_rows < 1 || c.max_rows > kWideMaxRows) { *err = "engram: max_rows outside 1.." + std::to_string(kWideMaxRows); return false; }
-        if (!load_sidecar(c.prefix, c.rank, c.nr, &sc_, err)) return false;
+        if (c.max_rows < 1 || c.max_rows > (c.prefill_v2 ? 8192 : kWideMaxRows)) { *err = "engram: max_rows outside 1.." + std::to_string(kWideMaxRows); return false; }
+        if (!load_sidecar(c.prefix, c.rank, c.nr, &sc_, err, c.knobs.col_shard)) return false;
         for (int e = 0; e < kNE; ++e)
             if (!c.q_w[e] || !c.k_w[e]) { *err = "engram: q_weight / k_weight pointers of layer " + std::to_string(kLayerIds[e]) + " missing"; return false; }
 
@@ -268,8 +286,8 @@ public:
             EG_CK(cudaHostAlloc(&stage_h_[e], mr * kIds * kRowBytes, cudaHostAllocMapped), err);
             EG_CK(cudaHostGetDevicePointer(&stage_d_[e], stage_h_[e], 0), err);
             const TableInfo& t = sc_.t[e];
-            EG_CK(cudaMalloc(&s8_d_[e], (size_t)t.part * kScaleBytes), err);
-            if (t.sruns.empty() ? !load_file_to_device(t.s8, (uint64_t)t.part * kScaleBytes, s8_d_[e], err)
+            EG_CK(cudaMalloc(&s8_d_[e], (size_t)(t.columns.enabled ? std::max<int64_t>(1, t.part) : t.part) * kScaleBytes), err);
+            if (!t.columns.enabled && t.sruns.empty() ? !load_file_to_device(t.s8, (uint64_t)t.part * kScaleBytes, s8_d_[e], err)
                                 : !load_runs_to_device(t, s8_d_[e], err)) return false;
             k_wprod<<<(kStreams * kHid + 255) / 256, 256>>>(c.q_w[e], c.k_w[e], wgt_d_[e], kStreams * kHid);
         }
@@ -277,12 +295,18 @@ public:
         EG_CK(cudaDeviceSynchronize(), err);
 
         std::vector<TableFile> files;
-        for (int e = 0; e < kNE; ++e) files.push_back({sc_.t[e].w8, sc_.t[e].first, sc_.t[e].valid, sc_.t[e].runs});
+        for (int e = 0; e < kNE; ++e) files.push_back({sc_.t[e].w8, sc_.t[e].first, sc_.t[e].valid, sc_.t[e].runs, sc_.t[e].columns});
         if (!store_.open(files, c.knobs.store, err)) return false;
         for (int e = 0; e < kNE; ++e)
             fprintf(stderr, "# rank %d: engram rowstore layer %03d file %s %s block %zu\n",
                     c.rank, kLayerIds[e], sc_.t[e].runs.empty() ? sc_.t[e].w8.c_str() : (std::to_string(sc_.t[e].runs.size()) + " release runs").c_str(),
                     store_.direct(e) ? "direct=1" : "fallback=buffered", store_.block());
+        if (c.knobs.col_shard)
+        {
+            fprintf(stderr, "# rank %d: engram col_shard=1 columns", c.rank);
+            for (int j = c.rank; j < kIds; j += c.nr) fprintf(stderr, " %d", j);
+            fprintf(stderr, "\n");
+        }
         hooks_ = c.hooks;
         for (int e = 0; e < kNE; ++e) { wkv_codes_[e] = c.wkv_codes[e]; wkv_scales_[e] = c.wkv_scales[e]; }
         verbose_ = c.knobs.verbose;
@@ -380,13 +404,37 @@ public:
         if (!ready_ || e < 0 || e >= kNE || rows < 1 || rows > cfg_.max_rows) return cudaErrorInvalidValue;
         cudaError_t r;
         if ((r = cudaStreamWaitEvent(main, done_[e], 0)) != cudaSuccess) return r;
-        k_dequant<<<dim3(rows, kIds / 8), 256, 0, main>>>(ids_d_ + (size_t)e * rows * kIds, stage_d_[e], s8_d_[e], sc_.t[e].first, sc_.t[e].valid, rows, emb_d_[e]);
+        if (cfg_.knobs.col_shard)
+            k_dequant_col<<<dim3(rows, kIds / 8), 256, 0, main>>>(ids_d_ + (size_t)e * rows * kIds, stage_d_[e], s8_d_[e], sc_.t[e].columns, rows, emb_d_[e]);
+        else k_dequant<<<dim3(rows, kIds / 8), 256, 0, main>>>(ids_d_ + (size_t)e * rows * kIds, stage_d_[e], s8_d_[e], sc_.t[e].first, sc_.t[e].valid, rows, emb_d_[e]);
         if ((r = cudaGetLastError()) != cudaSuccess) return r;
         if (int x = hooks_.reduce(model, e, rows, main, emb_d_[e])) return x;
         if (!(tc_ && rows > kDecodeRows && project_wide(e, rows, main)))   // chunks of <= kDecodeRows rows: the hook, as in the decode build
             if (int x = hooks_.project(model, e, rows, main, emb_d_[e], kv_d_)) return x;
         if (dead_) k_gate_dead<<<dim3(rows, kStreams), kGateThreads, 0, main>>>(T, kv_d_, wgt_d_[e], rows, dead_);
         else k_gate<<<dim3(rows, kStreams), kGateThreads, 0, main>>>(T, kv_d_, wgt_d_[e], rows);
+        return cudaGetLastError();
+    }
+
+    // v2: preserve begin_step's early fetch and wait only on its device event.
+    // exchange(ids,stage,scales,first,valid,emb) assembles only the row owner's
+    // cells into emb[owned][6144]. No host count readback or fence here.
+    template <class TT, class Exchange>
+    int op_owned(void* model,int e,int rows,int row0,int owned,TT* T,cudaStream_t main,Exchange&& exchange) {
+        if (!hooks_.project) return kNotSup;
+        if (!ready_ || e<0 || e>=kNE || rows<1 || rows>cfg_.max_rows || row0<0 || owned<0 ||
+            (owned && row0+owned>rows)) return cudaErrorInvalidValue;
+        cudaError_t rc=cudaStreamWaitEvent(main,done_[e],0);
+        if(rc!=cudaSuccess)return rc;
+        if(int x=exchange(ids_d_+size_t(e)*rows*kIds,stage_d_[e],s8_d_[e],sc_.t[e].first,sc_.t[e].valid,emb_d_[e]))return x;
+        if(!owned)return 0;
+        // Match the STOCK chunk's projection family, not the owner's smaller
+        // row count. A full-row TC chunk must not turn into scalar GEMV merely
+        // because its ragged owner has <=32 rows (different activation quant).
+        if(!(tc_ && rows>kDecodeRows && project_wide(e,owned,main)))
+            if(int x=hooks_.project(model,e,owned,main,emb_d_[e],kv_d_))return x;
+        if(dead_)k_gate_dead<<<dim3(owned,kStreams),kGateThreads,0,main>>>(T,kv_d_,wgt_d_[e],owned,dead_+row0);
+        else k_gate<<<dim3(owned,kStreams),kGateThreads,0,main>>>(T,kv_d_,wgt_d_[e],owned);
         return cudaGetLastError();
     }
 
@@ -543,7 +591,7 @@ private:
         {
             const int fd = ::open(r.path.c_str(), O_RDONLY | O_CLOEXEC);
             if (fd < 0) { *err = r.path + ": open: " + strerror(errno); return false; }
-            const size_t n = (size_t)r.rows * kScaleBytes, at = (size_t)(r.row0 - t.first) * kScaleBytes;
+            const size_t n = (size_t)r.rows * kScaleBytes, at = (size_t)(t.columns.enabled ? t.columns.at((uint32_t)r.row0) : r.row0 - t.first) * kScaleBytes;
             size_t got = 0;
             while (got < n)
             {

@@ -1,4 +1,4 @@
-// GR8_GLM53F_KV_CHUNKS (D-331 M7 part B): a Flash rank's MLA and index caches in kvchunks regions under one chunk map
+// GR8_GLM53F_KV_CHUNKS: a Flash rank's MLA and index caches in kvchunks regions under one chunk map
 // (runtime/flash_kv.h), on the Flash attention's own kernels. One GPU, synthetic weights, two DSA bindings (layers 3
 // and 7) that share the map. Checked here:
 //   1. masked boot: one chunk online backs exactly one chunk's granules in every region;

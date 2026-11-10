@@ -29,9 +29,9 @@
 #include <string>
 #include <vector>
 
-#include "json.h"
+#include "vision_weights.h"
 #include "ds41_vision_plan.h"
-#include "ds41_vision_id.h"
+#include "vision_id.h"
 
 namespace ds41v {
 
@@ -193,37 +193,6 @@ __global__ void k_span(const bf16* __restrict__ al, const bf16* __restrict__ st,
 
 // ------------------------------------------------------------------------------------------------------------ weights
 
-struct StTensor { std::string dtype; std::vector<int64_t> shape; size_t begin = 0, end = 0; };
-
-// The safetensors header of `path`: tensor name -> dtype, shape, byte range inside the data section; data_off = where
-// the data section starts in the file.
-inline std::map<std::string, StTensor> st_header(const std::string& path, size_t& data_off, size_t& file_bytes)
-{
-    FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) throw std::runtime_error("ds41 vision: cannot open " + path);
-    uint64_t n = 0;
-    if (std::fread(&n, 8, 1, f) != 1 || n > (64u << 20)) { std::fclose(f); throw std::runtime_error("ds41 vision: bad safetensors header in " + path); }
-    std::string h(n, '\0');
-    if (std::fread(&h[0], 1, n, f) != n) { std::fclose(f); throw std::runtime_error("ds41 vision: short header in " + path); }
-    std::fseek(f, 0, SEEK_END);
-    file_bytes = (size_t)std::ftell(f);
-    std::fclose(f);
-    data_off = 8 + n;
-    const g6v::Json j = g6v::Json::parse(h);
-    std::map<std::string, StTensor> out;
-    for (const auto& kv : j.o) {
-        if (kv.first == "__metadata__") continue;
-        StTensor t;
-        t.dtype = kv.second.at("dtype").str();
-        for (const auto& d : kv.second.at("shape").a) t.shape.push_back(d.i64());
-        t.begin = (size_t)kv.second.at("data_offsets").at(0).i64();
-        t.end = (size_t)kv.second.at("data_offsets").at(1).i64();
-        if (t.end < t.begin || data_off + t.end > file_bytes) throw std::runtime_error("ds41 vision: tensor " + kv.first + " past the file end");
-        out[kv.first] = t;
-    }
-    return out;
-}
-
 struct Block { const bf16 *n1, *wqkv, *bqkv, *wo, *bo, *n2, *w1, *w2; };
 
 struct Weights {
@@ -238,34 +207,14 @@ struct Weights {
 // Reads the vision file into device memory and checks every tensor's dtype and shape against the official module.
 inline Weights load_weights(const std::string& path)
 {
-    size_t off = 0, fbytes = 0;
-    const auto hdr = st_header(path, off, fbytes);
+    const g6vis::Blob blob = g6vis::load_blob(path, "ds41 vision");
     Weights w;
-    w.bytes = fbytes - off;
-    DS41V_CUDA(cudaMalloc(&w.blob, w.bytes));
-    {
-        FILE* f = std::fopen(path.c_str(), "rb");
-        if (!f) throw std::runtime_error("ds41 vision: cannot open " + path);
-        std::fseek(f, (long)off, SEEK_SET);
-        const size_t CH = 64u << 20;
-        void* host = nullptr;
-        DS41V_CUDA(cudaMallocHost(&host, CH));
-        size_t done = 0;
-        while (done < w.bytes) {
-            const size_t k = std::min(CH, w.bytes - done);
-            if (std::fread(host, 1, k, f) != k) { std::fclose(f); cudaFreeHost(host); throw std::runtime_error("ds41 vision: short read of " + path); }
-            DS41V_CUDA(cudaMemcpy((char*)w.blob + done, host, k, cudaMemcpyHostToDevice));
-            done += k;
-        }
-        std::fclose(f);
-        cudaFreeHost(host);
-    }
+    w.blob = blob.dev;
+    w.bytes = blob.bytes;
     auto get = [&](const std::string& name, std::vector<int64_t> shape) -> const bf16* {
-        auto it = hdr.find(name);
-        if (it == hdr.end()) throw std::runtime_error("ds41 vision: " + path + " has no tensor " + name);
-        if (it->second.dtype != "BF16" || it->second.shape != shape) throw std::runtime_error("ds41 vision: tensor " + name + " has the wrong dtype or shape");
-        return (const bf16*)((const char*)w.blob + it->second.begin);
+        return (const bf16*)blob.get(name, "BF16", shape, path, "ds41 vision");
     };
+    const auto& hdr = blob.hdr;
     w.patch_w = get("vision.patch_embed.proj.weight", {VD, PK});
     w.patch_b = get("vision.patch_embed.proj.bias", {VD});
     for (int l = 0; l < VL; ++l) {

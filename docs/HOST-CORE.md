@@ -1,6 +1,8 @@
 # One host core, per-model GPU modules
 
-Status: R0 (#343), R1 (#344) and R2 (#345, #346, #351, #353) done; R3a in progress. Inventory taken at 35a8f1c; reviewed
+Status: R0 to R6c landed (R0 #343, R1 #344, R2 #345, #346, #351, #353, R3a #361, R3b #365, R4a #369, R4b #370,
+R4b2 #372, R4c #377, R5a #383, R5b1 #387, R5c #390, R5b2 #415, R5b2a #416, R5b2b #419, R5b2c #420, R6a #421, R6b #422,
+R6c #423; the step sections below say what each did). R6d to R11 are the plan. Inventory taken at 35a8f1c; reviewed
 against the code by a second pass.
 
 ## Why
@@ -251,7 +253,7 @@ R2 lands in four parts:
 3. R2c: the request file's parser (`sessions.h` `parse_request`, read the way libstdc++'s `istringstream` read it, so
    the same requests pass and fail), `kv_share.h`'s `share_want` and grant/give rule, and the admission FIFO, now a
    Rust-owned queue. `Sessions` itself stays C++ glue over the `Emitter` (`serve.h`) and the grammar state, which the
-   non-S2 path shares. DS41 `img` fields go back to C++ (`ds41_image.h`) through a callback, as steering resolution
+   non-S2 path shares. DS41 `img` fields go back to C++ (`image_input.h`) through a callback, as steering resolution
    does, so their refusals keep their place in the order of checks.
 4. R2d: the reference copies go. The differential test became `scheduler_rs_vectors_test`: the same seeded streams
    (a portable generator, `s2/tests/scheduler_rs_vectors.h`) write every result, refusal and state to a transcript,
@@ -764,7 +766,7 @@ can follow; `engine_build` then hashes every module file.
 `kvman-rs/src/remote/verbs.rs` shows Rust verbs are possible later), `devimage.cpp`, `grammar.cc` (XGrammar), and the
 byte movers in `kv_tier.cuh` and `flash_checkpoint.cuh`.
 
-### R11. DS41's KV on the shared paged pool (with Chuck)
+### R11. DS41's KV on the shared paged pool
 
 A DS41 slot reserves a whole slab (`--capacity-slots`) whatever its request's length, and its prefix snapshots and park
 duplicate what the pool already has (paged stores, the spare-RAM cache, prefix reuse and stash, checkpoints). GLM and
@@ -779,8 +781,8 @@ section: ca/ica rows, ratio-2 and ratio-1 layers). The work:
 - per-session state that is not KV stays per session (the 128-token windows, Engram, DSpark), as Flash keeps its KDA
   slots (`FlashSlots`).
 
-It is DS41's owner's area, so it waits for him. Nothing in R4 to R10 depends on it: until it lands, those steps move
-DS41's slab path beside the pool's callers.
+It is DS41's maintainers' area, so it waits for that work. Nothing in R4 to R10 depends on it: until it lands, those
+steps move DS41's slab path beside the pool's callers.
 
 ### How much moves
 

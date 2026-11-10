@@ -144,6 +144,24 @@ class UnitTests(unittest.TestCase):
         self.assertIsNotNone(g6s2shim.build_request({'prompt': prompt, 'max_tokens': 4, 'images': [im] * 17}, 0)[1])
         self.assertIsNotNone(g6s2shim.build_request({'prompt': prompt, 'max_tokens': 4, 'images': [im],
                                                      'prompt_logprobs': 0}, 0)[1])
+        # GLM-5.3-Flash geometry (vision.s2 says glm5v): <|image|> rows, one per 2 x 2 patches, 16 to 8000
+        G = g6s2shim.GLM5V_IMAGE_TOKEN
+        g = {'pos': 2, 'vit_h': 8, 'vit_w': 8, 'key': '0123456789abcdef',
+             'rgb': base64.b64encode(bytes(8 * 8 * 14 * 14 * 3)).decode()}
+        gp = [5, 154830] + [G] * 16 + [154831, 6]
+        body, err = g6s2shim.build_request({'prompt': gp, 'max_tokens': 4, 'images': [g]}, 0, None, 'glm5v')
+        self.assertIsNone(err)
+        self.assertTrue(body.split(b'\n')[0].endswith(b' img 2:8:8:0123456789abcdef:' + g['rgb'].encode()))
+        self.assertIsNotNone(g6s2shim.build_request({'prompt': gp, 'max_tokens': 4, 'images': [g]}, 0)[1])   # DS41's token
+        for b in ({**g, 'pos': 1}, {**g, 'vit_h': 6, 'vit_w': 6}, {**g, 'vit_h': 7}, {**g, 'vit_h': 2, 'vit_w': 16002}):
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': gp, 'max_tokens': 4, 'images': [b]}, 0, None, 'glm5v')[1], b)
+        self.assertEqual(g6s2shim.image_span(178, 178, 'glm5v'), 7921)
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            for text, want in (('glm5v\n', 'glm5v'), ('1\n', 'ds41')):
+                with open(f'{d}/vision.s2', 'w') as fh:
+                    fh.write(text)
+                self.assertEqual(g6s2shim.vision_model(f'{d}/vision.s2'), want)
 
     def test_build_request(self):
         body, err = g6s2shim.build_request({'prompt': [5, 6, 7], 'max_tokens': 9, 'temperature': 0.5, 'top_p': 0.9,
@@ -236,6 +254,12 @@ class UnitTests(unittest.TestCase):
         body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': {'thinking': sp['thinking']}}, 0)
         self.assertIn(b' seqt 0.8:1.75:4:6.0\n', body)
         self.assertNotIn(b'seqg', body)
+        # with the think block's close, pen carries it for the scopes even with every penalty 0; the scopes' min stays
+        # out of min_tokens
+        body, _ = g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'think_end': 154842,
+                                          'sequence_penalty': {'thinking': sp['thinking']}}, 0)
+        self.assertIn(b' min 0 ', body)
+        self.assertIn(b' top_p 1.0 pen 0.0 0.0 0.0 0.0 154842 seqt 0.8:1.75:4:6.0\n', body)
         self.assertNotIn(b'seq', g6s2shim.build_request({'prompt': [1], 'max_tokens': 4, 'sequence_penalty': {
             'thinking': dict(sp['thinking'], mult=0)}}, 0)[0])
         for bad in ('x', {'thinking': dict(sp['thinking'], base=0.5)}, {'thinking': dict(sp['thinking'], min=0)},
@@ -586,8 +610,15 @@ class RequestMetrics(S2Base):
         self.assertEqual(lat['itl_count'], n - 1)                    # the tokens after the first
         self.assertGreater(lat['itl_sum'], 0)
         self.assertLessEqual(lat['itl_sum'], lat['decode_sum'] + 1e-6)
-        self.assertEqual(m['kv']['active_tokens'], 0)                # the run is back in the pool
-        self.assertEqual(m['kv']['reserved_tokens'], 0)
+        # The run is back in the pool. The engine rewrites status.s2 after it writes the run's end line, so a
+        # metrics request right after the finish frame can still see the old pages: poll until the pool drains.
+        kv, seq, deadline = m['kv'], 4, time.monotonic() + 2
+        while (kv['active_tokens'] or kv['reserved_tokens']) and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+            kv = (await self.metrics(c, seq))['kv']
+            seq += 1
+        self.assertEqual(kv['active_tokens'], 0)
+        self.assertEqual(kv['reserved_tokens'], 0)
 
     async def test_finish_frames_carry_each_requests_share_of_the_metrics(self):
         c = await self.client()

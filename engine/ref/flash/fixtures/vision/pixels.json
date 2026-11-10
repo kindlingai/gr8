@@ -1,0 +1,74 @@
+[
+ {
+  "image": "resize_50x30.png",
+  "target_h": 112,
+  "target_w": 168,
+  "content_h": 100,
+  "content_w": 168,
+  "rgb_sha256": "e1b5aefc4a6db0f33d108bd0fed1e6d008e8c1f6304ee137416845f040f77ef8",
+  "pil_backend_maxdiff": 2.384185791015625e-07,
+  "torchvision_max_levels_off": 1.9,
+  "torchvision_values_differing": 300,
+  "values": 112896
+ },
+ {
+  "image": "resize_23x61.png",
+  "target_h": 196,
+  "target_w": 84,
+  "content_h": 196,
+  "content_w": 73,
+  "rgb_sha256": "fc1bd1556310bf85edddbfc6395c46166b6902bc1583f16b1b3d59d6984870b8",
+  "pil_backend_maxdiff": 2.384185791015625e-07,
+  "torchvision_max_levels_off": 1.0,
+  "torchvision_values_differing": 152,
+  "values": 98784
+ },
+ {
+  "image": "resize_90x40.png",
+  "target_h": 84,
+  "target_w": 168,
+  "content_h": 74,
+  "content_w": 168,
+  "rgb_sha256": "5c65e42d75f871c375c41f3c449f75e5541143931c1789ca6304ec37bb212af9",
+  "pil_backend_maxdiff": 2.384185791015625e-07,
+  "torchvision_max_levels_off": 1.0,
+  "torchvision_values_differing": 488,
+  "values": 84672
+ },
+ {
+  "image": "resize_2700x2600.png",
+  "target_h": 2436,
+  "target_w": 2548,
+  "content_h": 2436,
+  "content_w": 2529,
+  "rgb_sha256": "119cc30a24bfa729de8115572004f54267a14e3fe3ab577bfbc95860adcd3292",
+  "pil_backend_maxdiff": 2.384185791015625e-07,
+  "torchvision_max_levels_off": 1.95,
+  "torchvision_values_differing": 3290,
+  "values": 37241568
+ },
+ {
+  "image": "resize_4000x3000.png",
+  "target_h": 2156,
+  "target_w": 2884,
+  "content_h": 2156,
+  "content_w": 2874,
+  "rgb_sha256": "cb4fede67d31f844769f2dc509c20062e460bf850bf001013867edaa9fd7ee0e",
+  "pil_backend_maxdiff": 2.384185791015625e-07,
+  "torchvision_max_levels_off": 1.0,
+  "torchvision_values_differing": 2904,
+  "values": 37307424
+ },
+ {
+  "image": "resize_12000x900.png",
+  "target_h": 672,
+  "target_w": 8960,
+  "content_h": 672,
+  "content_w": 8960,
+  "rgb_sha256": "9a1edf62f0baa7eace9b6c2b436cf3f0c722739e64bb7a51677d3ed734393dbd",
+  "pil_backend_maxdiff": 2.384185791015625e-07,
+  "torchvision_max_levels_off": 2.0,
+  "torchvision_values_differing": 4298,
+  "values": 36126720
+ }
+]

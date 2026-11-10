@@ -249,6 +249,13 @@ inline void s2_set_exclusive(Model& m, int q)
     m.s2->exclusive[q] = true;
 }
 
+// the first attention binding's args (Flash: the KDA layers have none)
+inline const G6Attn& s2_args0(const Model& m)
+{
+    for (const Layer& y : m.layers)
+        if (y.ab.storage) return y.ab.args;
+    die("s2: no attention binding");
+}
 // once per model, after build, before any S2 step: nslots session slots (views on the pool). The layers' own bindings
 // stay allocated but unused while s2on.
 inline void s2_init(Model& m, int nslots, cudaStream_t st)
@@ -263,7 +270,6 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
         if (!s->batch && s->graph) die("s2: GR8_TEST_S2_ATTN_PERSESSION=1 bakes the session layout into replay entries; use it without graphs");
 #if G6_MODEL_FLASH
         if (!s->batch) die("s2: Flash runs batched attention only (GR8_TEST_S2_ATTN_PERSESSION=1 is GLM's)");
-        if (m.s2_below) die("s2: Flash has no S2 below R");
 #endif
     }
     s->errs = dmalloc<unsigned*>((size_t)S2N * m.nl);
@@ -290,7 +296,7 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
         // differs by one page across ranks), so every rank grants the same runs.
         if (m.s2_below % 64 || m.s2_below / 64 > m.s2_run_pages) die("s2: s2_below must be a multiple of 64 and <= the capacity");
         s->run_pages = m.s2_below / 64;
-        const G6Attn& a0 = m.layers[0].ab.args;
+        const G6Attn& a0 = s2_args0(m);
         s->pool_pages = a0.page_count;
 #if defined(G6_CP) && G6_CP
         if (a0.cp_nr)
@@ -316,7 +322,7 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
 #endif
     }
     // S2 below R: a slot's table spans the layers' tables (a split run past R holds its CP map there, s2_set_exclusive)
-    s->table_cap = m.s2_below ? m.layers[0].ab.args.table_size : s->run_pages;
+    s->table_cap = m.s2_below ? s2_args0(m).table_size : s->run_pages;
     if (s->table_cap < s->run_pages) die("s2: the layers' tables are shorter than one run");
     size_t bytes = 0, vbytes = (size_t)s->pool_pages * 4;
     s->zero_list = dmalloc<int>(s->pool_pages);
@@ -428,8 +434,8 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
 #endif
         }
     }
-    for (const G6AttnBinding* c : s->cbv)
-        if (!c) die("s2: CP and non-CP layers in one model");
+    for (size_t i = 0; i < s->cbv.size(); ++i)   // (Flash: a KDA layer has no binding, so no view)
+        if (!s->cbv[i] && m.layers[i].ab.storage) die("s2: CP and non-CP layers in one model");
     if (s->batch)
     {
         s->rowcells = dmalloc<G6AttnRow>((size_t)m.nl * MX);
@@ -802,19 +808,25 @@ inline void s2_prepare(Model& m, int M, cudaStream_t st)
 #if G6_MODEL_FLASH
     // Flash: today's bound layers of M rows (no row class) and one replay entry per DSA layer on its batch view; the
     // step's rows and the kpool indexer inputs as dsa_step has them, the rows' bounds and tables in the batched cell
+    // A step whose bucket is past R (s2_cp_step) takes the CP batch view's entry instead (flash_dsa.cuh launch_dsa_cp)
     prepare_flash(m, M, st);
     const int bk = s2_bucket(s);
+    const bool cp = s2_cp_step(m);
+#if defined(G6_CP) && G6_CP
+    if (cp && M > m.cp.colls.mmax) die("s2: a CP step of " + std::to_string(M) + " rows exceeds the CP fabric's mmax " + std::to_string(m.cp.colls.mmax));
+#endif
+    auto& map = cp ? s.cbrp : s.brp;
     for (int i = 0; i < m.nl; ++i)
     {
         if (!s.bv[i]) continue;
         const auto key = std::make_tuple(bk, i, M);
-        if (s.brp.count(key)) continue;
+        if (map.count(key)) continue;
         std::unique_ptr<G6AttnReplay> r(new G6AttnReplay());
         memset(r.get(), 0, sizeof *r);
         G6AttnStep a = dsa_step(m, M, M);
         a.s2_batched = 1;
-        G6RT_CK(g6_attn_bind_replay_init(s.bv[i], &a, s.bcells + i, m.bk[bk], r.get(), st));
-        s.brp[key] = std::move(r);
+        G6RT_CK(g6_attn_bind_replay_init(cp ? s.cbv[i] : s.bv[i], &a, s.bcells + i, m.bk[bk], r.get(), st));
+        map[key] = std::move(r);
     }
 #else
     route_ovl_init(m);

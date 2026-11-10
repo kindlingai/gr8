@@ -124,6 +124,7 @@ def make_release(root):
     rnd = numpy.random.default_rng(7)
     for name in ('exlr8-dense-003', 'exlr8-dense-004', 'exlr8-vocab'):
         put(f'dense/{name}.safetensors', rnd.bytes(300_000))
+    put('dense/vision-bf16.safetensors', rnd.bytes(50_000))   # fetched only with image input (GR8_GLM53F_VISION=1)
     for name in hfsource.META_FILES:
         put(name, f'{{"{name}": 1}}'.encode())
     put('README.md', b'fake release\n')
@@ -269,6 +270,40 @@ class HFTests(unittest.TestCase):
     def variant(self, r, name='home'):
         return modelset.resolve_variant(name, r.v2, [r.dir])
 
+    def test_prepare_compact_round_trip(self):
+        import launch
+        dest = os.path.join(self.cache, 'compact-rank1')
+        args = ['prepare', '--no-config', '--model', f'https://huggingface.co/{RELEASE}',
+                '--model-cache', self.cache, '--rank', '1', '--tp', '4', '--variant', 'home',
+                '--extra-env', f'GR8_LOAD_COMPACT={dest}']
+        env = {**os.environ, **GLM, 'G6LOAD': hfsource.fetch_ranks().g6load()}
+        cmd = [sys.executable, launch.__file__, *args]
+        for _ in range(2):  # initial prepare, then verify/reuse with an already-complete fetch
+            r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn('halves verified', r.stdout)
+        release = self.release()
+        variant = self.variant(release)
+        # Each dense copy equals the original ranges, in sorted order without holes. The command above also
+        # read every half through the Rust loader's map and checked its checksum against the index slices.
+        for name in os.listdir(dest):
+            if not name.endswith('.g6map'):
+                continue
+            with open(os.path.join(dest, name)) as f:
+                head, *rows = f.read().splitlines()
+            src = os.path.join(release.v2, name[:-6])
+            self.assertEqual(head, f'g6map-v1 {os.path.getsize(src)}')
+            with open(src, 'rb') as original, open(os.path.join(dest, name[:-6]), 'rb') as copy:
+                packed = 0
+                for row in rows:
+                    start, length, offset = map(int, row.split())
+                    self.assertEqual(offset, packed)
+                    original.seek(start)
+                    self.assertEqual(copy.read(length), original.read(length))
+                    packed += length
+                self.assertEqual(copy.read(), b'')
+        self.assertEqual(release.check(4, 1, variant), [])
+
     def test_parse_url(self):
         P = hfsource.parse_url
         self.assertEqual(P('https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4'), ('kindlingai/glm-5.3-exlr8-k2-k3-k4', 'main'))
@@ -298,6 +333,19 @@ class HFTests(unittest.TestCase):
         self.assertLess(got, size * 0.4)
         self.assertEqual(self.hub.requests(r'exlr8-layer-00\d\.k2'), [])            # home uses K3 only
         self.assertTrue(any('GB to fetch' in m for m in self.logs))
+
+    def test_the_vision_tower_only_with_image_input(self):
+        r = self.release()
+        v = self.variant(r)
+        r.fetch_rank(4, 1, v)
+        self.assertEqual(self.hub.requests(r'dense/vision-'), [])
+        r.vision = True       # GR8_GLM53F_VISION=1 after a text-only fetch: the rank is not ready until it has the tower
+        self.assertEqual(r.check(4, 1, v), ['dense/vision-bf16.safetensors: not fetched yet (GR8_GLM53F_VISION=1)'])
+        r.fetch_rank(4, 1, v)
+        self.assertEqual(r.check(4, 1, v), [])
+        with open(os.path.join(self.r1, 'dense', 'vision-bf16.safetensors'), 'rb') as a, \
+                open(os.path.join(r.dir, 'dense', 'vision-bf16.safetensors'), 'rb') as b:
+            self.assertEqual(a.read(), b.read())
 
     def test_a_rerun_fetches_nothing_and_a_variant_adds_its_widths(self):
         r = self.release()

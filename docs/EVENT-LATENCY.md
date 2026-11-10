@@ -26,8 +26,8 @@ Start the cluster with the diagnostic in the engine environment:
 
 `EXTRA_ENV` is the launch knob for extra engine environment on every rank. Do **not** export `GR8_S2_EVENTLOG` directly:
 the engine does not inherit `G6_*` from the environment, and `./gr8 glm53 up` refuses to start while one is set
-([KNOBS.md](../KNOBS.md)). As a cluster-scope knob it goes into the pre-boot handshake, so either every box runs with it
-or none does.
+([KNOBS.md](../KNOBS.md)). As a local-scope knob it is not compared at the pre-boot handshake, so any rank may run with
+it.
 
 Three kinds of line then land on stderr, `out/g6m4.r<r>.err`:
 

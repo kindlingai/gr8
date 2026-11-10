@@ -1,6 +1,7 @@
 # An SSD tier for retained runs: proof of concept
 
-Status: measured and simulated only. Nothing in the engine calls `src/tier.rs`, and it has no C entry points.
+Status: the original proof of concept, measured and simulated. The engine now uses `src/tier.rs` through `src/blocks.rs`
+and `src/stash.rs` (`--kv-store ssd:PATH`, experimental; see [REMOTE-TIER.md](REMOTE-TIER.md), Stage B).
 
 ## What it would fix
 

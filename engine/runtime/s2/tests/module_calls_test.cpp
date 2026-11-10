@@ -4,8 +4,9 @@
 // growth, prefix reuse, cancels, a shrink, a resize, DFlash2 and parks where the shape has them, and a tight pool where an
 // admission fits only on the pages a cancelled reused run gives back, and a cancel of a session still in its prefill
 // (the head's resp files' last lines join that transcript). A command meant to land mid-run is written from
-// inside a head step. The step then waits for its notice in the head's trace, so the boundary the notice names, and
-// every call after it, is the same on every run. The ranks' steps meet as a fabric's would.
+// inside a head step. The step waits until that notice is installed on both ranks' gates before either rank leaves
+// the launch, so the boundary the notice names, and every call after it, is the same on every run. The trace line
+// alone is earlier: it is written before either gate is armed. The ranks' steps meet as a fabric's would.
 // The service's plain pool calls (reserve, fits, room, count) are logged by observers: the head's control thread (Rust)
 // reports its own, and a worker's bind calls a RunPool that hides the real one's methods, which every header after
 // pool.h names in its place. Not logged, because how many there are depends on the clock: the pool reads of the head's
@@ -55,6 +56,8 @@ namespace {
 template <class Tag, typename Tag::type M> struct Rob { friend typename Tag::type get(Tag) { return M; } };
 struct ControlOf { using type = ControlHandle Service::*; friend type get(ControlOf); };
 template struct Rob<ControlOf, &Service::ctl_>;
+struct EndpointOf { using type = EventEndpoint* Service::*; friend type get(EndpointOf); };
+template struct Rob<EndpointOf, &Service::endpoint_>;
 
 struct Rng {
     std::mt19937_64 g;
@@ -382,6 +385,9 @@ struct Fake {
             tx("launch " + str(l) + " -> " + ints(v));
             ++launches;
             if (on_launch) on_launch(launches);
+            // the worker stays inside this launch until the head's trigger has finished, so it cannot depart a
+            // boundary the notice has not been installed for yet
+            ls.step(rank);
             return v;
         };
         h.dispatch.logprob = [this](int row, bool target, int k) {
@@ -472,6 +478,7 @@ std::array<std::vector<std::string>, 2> run(const Scenario& sc, bool table, std:
     // a trigger fires at its launch, or at the first after it with no event in flight (each commit is traced by this
     // thread, so the count at a launch does not depend on timing)
     std::set<const Trigger*> fired;
+    std::unique_ptr<Service> s[2];
     f0.on_launch = [&](long n) {
         for (const auto& t : sc.phases[phase].triggers) {
             if (t.at > n || fired.count(&t)) continue;
@@ -486,12 +493,15 @@ std::array<std::vector<std::string>, 2> run(const Scenario& sc, bool table, std:
             const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             while (notices() < want && std::chrono::steady_clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(1));
             require(notices() >= want, "a trigger's notice did not come");
+            // control.rs traces the notice, then channel::event installs it. The worker's gate is armed only once its
+            // control thread has read the frame. Wait for that before this launch returns: the end lockstep above
+            // holds the worker here, and gate.rs refuses a notice whose boundary that rank has already departed.
+            for (auto& x : s) ((*x).*get(EndpointOf{}))->wait_notice();
             f0.tx("trigger " + i(t.at) + " at launch " + i(n));
         }
     };
     for (const auto& q : sc.phases[0].reqs) { send_req(q); admit(q); }
     std::exception_ptr err[2];
-    std::unique_ptr<Service> s[2];
     NativeHooks all[2] = {f0.hooks(), f1.hooks()};
     std::unique_ptr<FnModule<NativeHooks>> mods[2];
     std::unique_ptr<FnPool<PoolHooks>> pools[2];

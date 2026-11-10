@@ -94,13 +94,14 @@ the launcher owns every default. `GR8_MODEL` has none: it names the model, `glm5
 (GLM-5.3-Flash) or `ds41` (DeepSeek-V4.1-Flash-1017), and `MODEL` must be a release of that model. For `ds41`, `MODEL`
 is a local copy of the release mounted into the container ([DEPLOY.md](../docs/DEPLOY.md), "The two settings"). Without
 `GR8_MODEL` the container exits 2 at once, naming the line to add. `docker run --rm --entrypoint /opt/gr8/gr8 ghcr.io/kindlingai/gr8 models` lists each model's release, TP
-sizes and variants. Three more lines are for compose itself:
+sizes and variants. Six more lines are for compose itself (the last two only with `docker/model-loader.yaml`):
 
 | variable | default | |
 |---|---|---|
 | `GR8_IMAGE` | `ghcr.io/kindlingai/gr8:latest` | the image |
 | `GR8_CACHE` | the `cache` volume | this box's part of the model: a host directory instead, owned by uid 1000 |
 | `GR8_HOME` | the `home` volume | logs and state (`out/`, `s2/`, `run/`): a host directory instead, owned by uid 1000, and not a bare-metal `GR8_WORK_DIR` (its `bin/` is a build) |
+| `GR8_STOP_GRACE` | `30s` | how long docker waits for the container to stop before it kills it: `150s` with a `persist=on` ssd `KV_STORE` that keeps sessions ([SWITCHING.md](../docs/SWITCHING.md)) |
 | `MODEL_LOADER_STORE` | `/var/lib/model-loader` | with `docker/model-loader.yaml`: model-loader's store on this box |
 | `MODEL_LOADER_IMAGE` | `ghcr.io/kindlingai/model-loader:latest` | with `docker/model-loader.yaml`: the image whose `model-loader -check` gr8's start waits on |
 

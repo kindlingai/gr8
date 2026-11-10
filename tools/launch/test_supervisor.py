@@ -197,6 +197,70 @@ class MentatRingTests(unittest.TestCase):
 
 class ControlPortTests(unittest.TestCase):
     @mock.patch.object(S, 'log')
+    def test_early_serving_is_applied_when_the_worker_starts_loading(self, logged):
+        s = supervisor(rank=1)
+        self.addCleanup(shutil.rmtree, s.home)
+        s.locked = True
+        s.set_state('handshake')
+        msg = {'t': 'serving', 'url': '<api>', 'epoch': 8}
+        self.assertEqual(s.on_rpc(msg, MEMBERS[0]), {'t': 'ok'})
+        self.assertEqual(s.state, 'handshake')
+        logged.assert_not_called()
+        s.hs = {'epoch': 8}
+        s.set_state('loading')
+        self.assertEqual(s.state, 'serving')
+        with open(os.path.join(s.out, 'gr8.state')) as f:
+            self.assertEqual(json.load(f)['state'], 'serving')
+        logged.assert_called_once_with('the head serves <api>')
+        s.on_rpc(msg, MEMBERS[0])
+        logged.assert_called_once_with('the head serves <api>')
+
+    @mock.patch.object(S, 'log')
+    def test_serving_received_while_loading_still_applies_immediately(self, logged):
+        s = supervisor(rank=1)
+        self.addCleanup(shutil.rmtree, s.home)
+        s.hs = {'epoch': 8}
+        s.set_state('loading')
+        self.assertEqual(s.on_rpc({'t': 'serving', 'url': '<api>', 'epoch': 8}, MEMBERS[0]), {'t': 'ok'})
+        self.assertEqual(s.state, 'serving')
+        logged.assert_called_once_with('the head serves <api>')
+
+    @mock.patch.object(S, 'log')
+    def test_old_serving_cannot_publish_readiness_for_a_new_boot(self, logged):
+        s = supervisor(rank=1)
+        self.addCleanup(shutil.rmtree, s.home)
+        s.locked = True
+        s.set_state('preparing')
+        old = {'t': 'serving', 'url': '<old-api>', 'epoch': 7}
+        s.on_rpc(old, MEMBERS[0])
+        s.on_rpc({'t': 'down', 'epoch': 7}, MEMBERS[0])
+        self.assertFalse(s.stop_ev.is_set())
+        s.hs = {'epoch': 8}
+        s.set_state('loading')
+        self.assertEqual(s.state, 'loading')
+        s.on_rpc(old, MEMBERS[0])
+        s.on_rpc({'t': 'serving', 'url': '<unscoped-api>'}, MEMBERS[0])
+        self.assertEqual(s.state, 'loading')
+        with open(os.path.join(s.out, 'gr8.state')) as f:
+            self.assertEqual(json.load(f)['state'], 'loading')
+        logged.assert_not_called()
+        s.on_rpc({'t': 'serving', 'url': '<new-api>', 'epoch': 8}, MEMBERS[0])
+        self.assertEqual(s.state, 'serving')
+        logged.assert_called_once_with('the head serves <new-api>')
+
+    @mock.patch.object(S, 'log')
+    def test_matching_early_serving_survives_an_old_retry_before_verdict(self, logged):
+        s = supervisor(rank=1)
+        self.addCleanup(shutil.rmtree, s.home)
+        s.set_state('handshake')
+        s.on_rpc({'t': 'serving', 'url': '<new-api>', 'epoch': 8}, MEMBERS[0])
+        s.on_rpc({'t': 'serving', 'url': '<old-api>', 'epoch': 7}, MEMBERS[0])
+        s.hs = {'epoch': 8}
+        s.set_state('loading')
+        self.assertEqual(s.state, 'serving')
+        logged.assert_called_once_with('the head serves <new-api>')
+
+    @mock.patch.object(S, 'log')
     def test_requests_from_non_members_are_ignored(self, logged):
         s = supervisor(rank=1)
         for t in ('down', 'abort', 'serving', 'hello', 'verdict', 'status', 'logs'):
@@ -261,6 +325,44 @@ class ControlPortTests(unittest.TestCase):
         self.assertEqual(v['field'], 'fabric')
         self.assertIn('10.1.0.4,10.2.0.4', v['values'].values())
         self.assertNotIn('10.110.0.1,10.111.0.1', v['values'].values())
+
+    def test_a_refused_head_says_why_before_the_extra_wait(self):
+        s = supervisor()
+        s.rails, s.tmpl, s.digest, s.model_id, s.variant = ('10.1.0.1', '10.2.0.1'), {'knobs': {}}, 'd', 'm', mock.Mock()
+        head = mock.Mock(verdict=None, gave_up=False)
+        head.have = {r: hello(r, lan=MEMBERS[r]) for r in range(4)}
+        head.wait_all.return_value = True
+        head.decide.side_effect = lambda v: setattr(head, 'verdict', v)
+        head.untold.return_value = [2, 3]
+        lines = []
+        with mock.patch.object(S.handshake, 'Head', return_value=head), \
+                mock.patch.object(s, 'rail_check', return_value='rank 3 does not answer'), \
+                mock.patch.object(S, 'log', side_effect=lines.append), \
+                mock.patch.object(s, 'linger', side_effect=lambda: lines.append('LINGER')), \
+                mock.patch.dict(os.environ, {'GR8_REFUSAL_LINGER': '15'}), \
+                mock.patch.object(S, 'opt_timeout', return_value=600.0):
+            v = s.handshake_head(hello(0, lan=MEMBERS[0]))
+        self.assertEqual(v['field'], 'fabric')
+        i = lines.index('LINGER')
+        self.assertTrue(lines[i - 2].startswith('handshake refused: fabric'), lines)
+        self.assertEqual(lines[i - 1], 'head: answering late hellos with the refusal for 15 s, then up to 600 s more '
+                                       'until ranks 2, 3 have it')
+        self.assertTrue(s.refusal_logged)
+        # no extra wait to announce: every rank has it, the head gave up on one, or JOIN_TIMEOUT is 0
+        for untold, gave_up, more in (([], False, 600.0), ([3], True, 600.0), ([3], False, 0.0)):
+            head.untold.return_value, head.gave_up = untold, gave_up
+            with mock.patch.object(S, 'opt_timeout', return_value=more):
+                self.assertEqual(s.linger_plan(), 'head: answering late hellos with the refusal for 15 s')
+        # a head stopped while it waits for hellos (down, Ctrl-C) says so and announces no wait: linger() returns at once
+        head.verdict, head.wait_all.return_value, head.untold.return_value, head.gave_up = None, False, [1, 2, 3], False
+        s.stop_ev.set()
+        s.stop_why, s.refusal_logged, lines[:] = 'SIGTERM', False, []
+        with mock.patch.object(S.handshake, 'Head', return_value=head), mock.patch.object(S, 'log', side_effect=lines.append), \
+                mock.patch.object(s, 'linger', side_effect=lambda: lines.append('LINGER')):
+            v = s.handshake_head(hello(0, lan=MEMBERS[0]))
+        self.assertEqual(v['field'], 'stopped')
+        self.assertTrue(any(x.startswith('handshake refused: stopped: SIGTERM') for x in lines), lines)
+        self.assertFalse([x for x in lines if x.startswith('head: answering')], lines)
 
     def test_hello_before_the_head_is_ready(self):
         s = supervisor()
@@ -546,7 +648,7 @@ def donor_budget(kib, **env):
 
 
 class DonorTests(unittest.TestCase):
-    """D-331 M7: a Flash box lends what its serve leaves to a KV node beside it."""
+    """A Flash box lends what its serve leaves to a KV node beside it."""
 
     def test_the_budget_is_memavailable_less_growth_and_reserve_capped_by_the_ask(self):
         w = {'FLASH_KV_GROWTH_GIB': '8', 'KV_MIN_FREE_GB': '10'}
