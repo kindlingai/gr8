@@ -3,8 +3,8 @@
 Most people will have an agent (Claude Code, Codex or another) start gr8 for them the first time. If you are that
 agent, read this file before the first `up`. Ask the person the questions below, one at a time, with the numbers given
 for each. Write the answers into `cluster.env` ([config/cluster.env.example](../config/cluster.env.example)), show the
-person the file, and only then boot. When the person has no preference, keep the default: every default here is the
-exact model.
+person the file, and only then boot. When the person has no preference, keep the default. Every default here is the
+exact model, except DeepSeek-V4.1-Flash's prefill: `./gr8 ds41` runs the faster v2 prefill unless `EXACT=1` (Q2a).
 
 ## 1. The setup (every model)
 
@@ -109,6 +109,15 @@ Measured on four GB10 boxes (TP=4, a switch), the exlr8 release, Engram on. "Spe
 tokens/s. "Quality" is a fixed 75-item check set (code, math, JSON, reasoning), the median of 3 runs. Each answer adds
 words to `EXTRA_ENV` (`"A=1 B=2"`, every rank).
 
+### Q2a. Exact output, or the faster prefill?
+
+> "Do you want the exact model's output? The default reads prompts faster with the v2 prefill, but one of its parts
+> (the shared expert on the tensor cores) changes the output bits, so the same prompt can get a different reply."
+
+- Default: the v2 prefill (the release stack: 8,192-row chunks, one prefill lane).
+- Exact output: `EXACT=1` in `cluster.env`. Prompts then run on the old prefill path (two lanes, 4,096-row chunks).
+- A 1M-token context with `GR8_DS_MHC_ROW_SHARD=1` in `EXTRA_ENV` also runs the old prefill path.
+
 ### Q3. Faster writing for a small quality loss?
 
 > "Do you want DeepSeek to write faster: about 40-50% on long replies, 20% (code) to 50% (prose) on short ones? The
@@ -141,8 +150,8 @@ words to `EXTRA_ENV` (`"A=1 B=2"`, every rank).
 > "When several chats start together, do you want each to show its first word sooner (about 3x with 4 chats, 5x with
 > 8), if with 4 chats each one then writes about 9% slower?"
 
-- Default: no (each chat faster).
-- Yes: `GR8_S2_ADMIT_HOLD=1 GR8_S2_TAIL_FIRST=1`.
+- Default: yes (the release stack sets both). With `EXACT=1`: no.
+- No (each chat faster): `GR8_S2_ADMIT_HOLD=0 GR8_S2_TAIL_FIRST=0`. Yes with `EXACT=1`: `GR8_S2_ADMIT_HOLD=1 GR8_S2_TAIL_FIRST=1`.
 - Measured with 4 chats: median first word 648 -> 209 ms; each chat's median rate 75.7 -> 68.6 tokens/s; all 4 chats
   together +15%. With 8 chats: first word 1,656 -> 310 ms; all 8 together +5.5%. The answers did not change.
   (Measured with Q3's switches on.)

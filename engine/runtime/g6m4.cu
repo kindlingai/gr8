@@ -433,6 +433,10 @@ int main(int argc, char** argv)
     const FabricPlan fplan = fabric_plan(eo, fpi);
     for (const std::string& l : fplan.log) fputs(l.c_str(), stderr);
     if (!fplan.refusal.empty()) die(fplan.refusal);
+#if G6_MODEL_DS41
+    if (fplan.v2_fallback && !s2mode)   // the serve logs its own line after the weights bind (ds41 serve, pf_v2)
+        fprintf(stderr, "# rank %d DS41 prefill: GR8_DS_PF_V2=1 not used: %s; the old range-A path runs\n", cfg.rank, fplan.v2_fallback);
+#endif
     const bool& two = fplan.two;
 #if G6_MODEL_DS41
     const bool &rowshard = fplan.rowshard, &y_mxfp8 = fplan.y_mxfp8, &pf_direct = fplan.pf_direct;
@@ -1613,7 +1617,20 @@ int main(int argc, char** argv)
         sc.notice_max = (uint32_t)knob::s2_notice_max();
         fprintf(stderr, "# rank %d ds41 s2 scheduler tail_first %d notice_max %u\n", R, sc.tail_first ? 1 : 0, sc.notice_max);
         const int pf_min = (int)knob::ds_prefill_min();
-        const bool pf_v2 = knob::ds_pf_v2(); // boot-once, agreed signature
+        // GR8_DS_PF_V2=1 runs v2 where its conditions hold (the fabric plan's knob-time ones, then the release's experts);
+        // elsewhere layers 0..20 run the old range-A path, with one log line naming the failed condition. Every rank
+        // reads the same knobs and the same release, so every rank takes the same path.
+        const char* v2_off = fplan.v2_fallback;
+        if (fplan.ds_pf_v2) v2_off = Ds41V2Engine::model_reason(m);
+        const bool pf_v2 = fplan.ds_pf_v2 && !v2_off;
+        if (knob::ds_pf_v2() && !pf_v2) {
+            const int w = m.hc_rows, fw = ds41::v2::fallback_width(w);
+            if (pf_min && fw != w) {
+                m.hc_rows = fw;   // the old path's chunk rows; the buffers sized for W stay
+                fprintf(stderr, "# rank %d DS41 prefill: GR8_DS_PF_V2=1 not used: %s; the old range-A path runs, W-row chunks of %d rows (not %d)\n",
+                        R, v2_off, fw, w);
+            } else fprintf(stderr, "# rank %d DS41 prefill: GR8_DS_PF_V2=1 not used: %s; the old range-A path runs\n", R, v2_off);
+        }
         Ds41V2Engine v2engine;
         const int pf_max = pf_v2 ? ds41::v2::MAX_ROWS : ds41moe::ROMAX;
         // Engram on is allowed with W-row prefill (engine max_rows = W, one chunk in flight -- ds41_prefill_single_lane keeps the engine's one slot safe)
@@ -1707,7 +1724,7 @@ int main(int argc, char** argv)
         if (ds41::br::l20_tail() && !pf_tail) die("GR8_DS_PF_L20_TAIL=1 needs GR8_DS_PF_TAIL (layer 20 joins the bounded replay)");
         if (pf_v2 && (!pf_min || !ds41::v2::boot_ok(m.hc_rows, pf_tail, g6nr::NR, pf_lanes,
                                                     ds41::br::late_layer_start())))
-            die("GR8_DS_PF_V2 needs W-row prefill, TP4, one lane, tail 128 and the range boundary at layer 21");
+            die("DS41 v2: the boot's prefill settings differ from the fabric plan's (W, tail, lanes, layer 21)");   // a bug, not a setting
         if (pf_v2) {
             v2engine.boot(m,fabv2,st);
             fprintf(stderr, "# rank %d GR8_DS_PF_V2=1 own-row conductor W=%d, rangeA=0..20, stock tail=128, dedicated port=%d\n", R, m.hc_rows,cfg.port+104);
@@ -2168,7 +2185,8 @@ int main(int argc, char** argv)
         }
         try { g6s2::serve_ds41(dc, bc, plan.chunk); }
         catch (const std::exception& e) { fprintf(stderr, "g6m4: rank %d DS41 serve failed: %s\n", R, e.what()); return 3; }
-        if(pf_v2) { v2engine.release(); fabv2.stop_proxy(); }
+        if(pf_v2) v2engine.release();
+        if(fplan.find(FabKind::Ds41V2)) fabv2.stop_proxy();   // planned, even where the release's experts kept v2 off
     }
 #else
     if (s2mode)

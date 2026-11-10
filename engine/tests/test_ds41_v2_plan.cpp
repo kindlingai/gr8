@@ -2,6 +2,7 @@
 #include <cassert>
 #include <cstring>
 #include <iostream>
+#include <string>
 int main() {
     using namespace g6rt;
     assert(ds41_prefill_rowcap("8192",32,true)==8192);
@@ -11,7 +12,7 @@ int main() {
         for(int i=0;i<40;++i)o.layers.push_back(i);
         o.cfg.ips={"1","2","3","4"}; o.cfg.rank=0; o.cfg.proxy_cpu=13; o.cfg.port=9000;
         PlanInputs in; in.trunk_bytes=2; in.head_payload=512;
-        in.k.ds_pf_v2=v2; in.k.ds_pf_v2_xtrace=xt; in.k.xtrace_pf=pf; in.k.ds_prefill_w=std::to_string(w); in.k.ds_pf_tail="128";
+        in.k.ds_pf_v2=v2; in.k.ds_prefill_min=2; in.k.ds_sh_tc=true; in.k.ds_pf_v2_xtrace=xt; in.k.xtrace_pf=pf; in.k.ds_prefill_w=std::to_string(w); in.k.ds_pf_tail="128";
         auto p=fabric_plan(o,in);
         if(w==8192&&!v2) {assert(!p.refusal.empty());continue;}
         if(!p.refusal.empty())std::cerr<<p.refusal<<'\n';
@@ -32,8 +33,48 @@ int main() {
 
         }
         in.k.ds_pf_lanes="2";
+        // two lanes with v2 asked: no refusal, no v2 fabric, the reason for the boot's one line
         auto two=fabric_plan(o,in);
-        if(v2)assert(!two.refusal.empty()); else assert(two.refusal.empty());
+        assert(two.refusal.empty() && !two.find(FabKind::Ds41V2) && !two.ds_pf_v2);
+        assert(v2 ? two.v2_fallback && std::string(two.v2_fallback)=="GR8_DS_PF_LANES is not 1" : !two.v2_fallback);
+    }
+    // GR8_DS_PF_V2=1 never refuses a plan for its own conditions: each failed one plans no v2 fabric and names itself
+    // (the boot logs it once and runs the old range A). A width the old path cannot take either stays a refusal.
+    {
+        auto plan=[](auto edit) {
+            EngineOptions o; o.s2mode=true; o.NL=40; o.NX=2; o.NC=83;
+            for(int i=0;i<40;++i)o.layers.push_back(i);
+            o.cfg.ips={"1","2","3","4"}; o.cfg.rank=0; o.cfg.proxy_cpu=13; o.cfg.port=9000;
+            PlanInputs in; in.trunk_bytes=2; in.head_payload=512;
+            in.k.ds_pf_v2=true; in.k.ds_prefill_min=2; in.k.ds_sh_tc=true; in.k.ds_prefill_w="8192"; in.k.ds_pf_tail="128";
+            edit(o,in);
+            return fabric_plan(o,in);
+        };
+        auto off=[&](auto edit,const char* why) {
+            const auto p=plan(edit);
+            if(!p.refusal.empty())std::cerr<<p.refusal<<'\n';
+            assert(p.refusal.empty() && !p.ds_pf_v2 && !p.find(FabKind::Ds41V2));
+            assert(p.v2_fallback && std::string(p.v2_fallback)==why);
+        };
+        const auto on=plan([](EngineOptions&,PlanInputs&){});
+        assert(on.refusal.empty() && on.ds_pf_v2 && on.find(FabKind::Ds41V2) && !on.v2_fallback && on.pf_rows==8192);
+        off([](EngineOptions& o,PlanInputs&){o.s2mode=false;},"not a serve run (offline or simulator)");
+        off([](EngineOptions&,PlanInputs& in){in.k.ds_prefill_min=0;},"no W-row prefill (GR8_DS_PREFILL_MIN=0)");
+        off([](EngineOptions&,PlanInputs& in){in.k.ds_sh_tc=false;},"GR8_DS_SH_TC=0 (exact output)");
+        off([](EngineOptions&,PlanInputs& in){in.k.ds_pf_lanes="2";},"GR8_DS_PF_LANES is not 1");
+        off([](EngineOptions&,PlanInputs& in){in.k.ds_pf_tail="256";},"GR8_DS_PF_TAIL is not 128");
+        off([](EngineOptions&,PlanInputs& in){in.k.ds_pf_l20_tail=true;},"GR8_DS_PF_L20_TAIL=1 moves the late range to layer 20");
+        off([](EngineOptions&,PlanInputs& in){in.k.ds_prefill_w="4000";},"GR8_DS_PREFILL_W is not 256..8192 in steps of 256");
+        // the 1M-context setup: W 4096, the late mHC row split
+        off([](EngineOptions&,PlanInputs& in){in.k.ds_prefill_w="4096"; in.k.ds_pf_rs=true; in.k.ds_mhc_fuse=true; in.k.ds_mhc_row_shard=true;},
+            "GR8_DS_MHC_ROW_SHARD=1 (the 1M-context setup)");
+        // the exact-output launcher stack with v2 asked anyway: two lanes and SH_TC=0 at W 4096
+        off([](EngineOptions&,PlanInputs& in){in.k.ds_prefill_w="4096"; in.k.ds_pf_lanes="2"; in.k.ds_sh_tc=false;},"GR8_DS_PF_LANES is not 1");
+        // genuine errors stay errors
+        assert(!plan([](EngineOptions&,PlanInputs& in){in.k.ds_prefill_w="9000";}).refusal.empty());
+        assert(!plan([](EngineOptions&,PlanInputs& in){in.k.ds_pf_v2=false;}).refusal.empty());   // W 8192 without v2
+        assert(!plan([](EngineOptions&,PlanInputs& in){in.k.ds_pf_lanes="3";}).refusal.empty());
+        std::cout<<"v2 fallback plan: serve, prefill, SH_TC, lanes, tail, L20, width, row shard fall back with their reason; bad values still refuse PASS\n";
     }
     // Striping is host-config only. Zero retains inherited DS_STRIPE exactly;
     // a positive override touches only the dedicated v2 fabric, never main.
@@ -45,7 +86,7 @@ int main() {
         o.cfg.ips={"1","2","3","4"}; o.cfg.rank=0;
         if(dual)o.cfg.ips2={"5","6","7","8"};
         PlanInputs in; in.trunk_bytes=2; in.head_payload=512;
-        in.k.ds_pf_v2=v2; in.k.ds_prefill_w="4096"; in.k.ds_pf_tail="128";
+        in.k.ds_pf_v2=v2; in.k.ds_prefill_min=2; in.k.ds_sh_tc=true; in.k.ds_prefill_w="4096"; in.k.ds_pf_tail="128";
         in.k.ds_stripe=inherited; in.k.ds_stripe_min=2097152;
         const auto baseline=fabric_plan(o,in); assert(baseline.refusal.empty());
         in.k.ds_pf_v2_stripe_min=threshold;
@@ -80,7 +121,7 @@ int main() {
         o.cfg.ips={"1","2","3","4"}; o.cfg.rank=0; o.cfg.ring=true;
         if(dual)o.cfg.ips2={"5","6","7","8"};
         PlanInputs in; in.trunk_bytes=2; in.head_payload=512;
-        in.k.ds_pf_v2=true; in.k.ds_prefill_w="4096"; in.k.ds_pf_tail="128";
+        in.k.ds_pf_v2=true; in.k.ds_prefill_min=2; in.k.ds_sh_tc=true; in.k.ds_prefill_w="4096"; in.k.ds_pf_tail="128";
         const auto baseline=fabric_plan(o,in); assert(baseline.refusal.empty());
         in.k.ds_pf_v2_stripe_min=threshold;
         const auto p=fabric_plan(o,in); assert(p.refusal.empty());

@@ -77,7 +77,8 @@ struct PlanKnobs
     bool cp_s3 = false;
     std::optional<int64_t> cp_mmax, cp_r2;
     std::optional<std::string> ds_prefill_w, ds_pf_tail, ds_pf_pool, ds_pf_lanes;
-    bool ds_pf_v2 = false, ds_pf_v2_xtrace = false;
+    bool ds_pf_v2 = false, ds_pf_v2_xtrace = false, ds_sh_tc = false;
+    int64_t ds_prefill_min = 0;
     bool ds_pf_l20_tail = false, ds_pf_rs = false, ds_mhc_row_shard = false, ds_mhc_fuse = false, ds_mhc_y_mxfp8 = false;
     bool ds_pf_direct = false, ds_subdump = false, ds_stripe = false, ds_xtrace = false;
     int64_t ds_stripe_min = 0, ds_pf_v2_stripe_min = 0;
@@ -96,6 +97,7 @@ inline PlanKnobs plan_knobs()
     k.cp_mmax = knob::cp_mmax(); k.cp_r2 = knob::cp_r2();
     k.ds_prefill_w = knob::ds_prefill_w(); k.ds_pf_tail = knob::ds_pf_tail(); k.ds_pf_pool = knob::ds_pf_pool();
     k.ds_pf_lanes = knob::ds_pf_lanes(); k.ds_pf_v2 = knob::ds_pf_v2();
+    k.ds_sh_tc = knob::ds_sh_tc(); k.ds_prefill_min = knob::ds_prefill_min();
     k.ds_pf_v2_xtrace = knob::ds_pf_v2_xtrace();
     k.ds_pf_v2_stripe_min = knob::ds_pf_v2_stripe_min();
     k.ds_pf_l20_tail = knob::ds_pf_l20_tail(); k.ds_pf_rs = knob::ds_pf_rs(); k.ds_mhc_row_shard = knob::ds_mhc_row_shard();
@@ -135,6 +137,8 @@ struct FabricPlan
     size_t slice_stride = 0;
     bool rowshard = false, y_mxfp8 = false, pf_direct = false;
     int pf_lanes_fab = 1;                 // GR8_DS_PF_LANES
+    bool ds_pf_v2 = false;                // GR8_DS_PF_V2=1 asked and its knob-time conditions hold: the v2 fabric is planned
+    const char* v2_fallback = nullptr;    // GR8_DS_PF_V2=1 asked, the failed condition (ds41::v2::fallback_reason): the old range A
     bool two = false, pool_owner = false, route_split = false;
     bool cp_on = false;
     int cp_R = 0, cp_R2 = 0, cp_s3 = 0, cp_mmax = 0, cp_step = 0, cp_step_R = 0;
@@ -280,9 +284,17 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
     }
     cfg.xtrace = 0;
 #if G6_MODEL_DS41
+    // GR8_DS_PF_V2=1 where its conditions fail is not a refusal: no v2 fabric, and the boot logs the reason once
+    // and runs layers 0..20 on the old range-A path.
     if (k.ds_pf_v2) {
-        if (!s2mode || !ds41::v2::boot_ok(p.pf_rows,p.tail,g6nr::NR,p.pf_lanes_fab,p.l20_tail?20:21))
-            return "GR8_DS_PF_V2 needs serve, TP4, W=256..8192 multiple of 256, one lane, tail128 and layer21 boundary";
+        ds41::v2::BootIn b;
+        b.serve = s2mode; b.prefill = k.ds_prefill_min > 0; b.width = p.pf_rows; b.tail = p.tail; b.nr = g6nr::NR;
+        b.lanes = p.pf_lanes_fab; b.late_layer = p.l20_tail ? 20 : ds41::v2::FIRST_LATE;
+        b.sh_tc = k.ds_sh_tc; b.row_shard = k.ds_mhc_row_shard;
+        p.v2_fallback = ds41::v2::fallback_reason(b);
+    }
+    if (k.ds_pf_v2 && !p.v2_fallback) {
+        p.ds_pf_v2 = true;
         const size_t state_row=4*HID*in.trunk_bytes+(24+4+4+16)*sizeof(float)+HID*2;
         auto vc=ds41::v2::fabric_config(cfg,p.pf_rows,HID,state_row,6352);
         vc.xtrace=k.ds_pf_v2_xtrace ? 1 : 0; // Fabric::init also requires GR8_XTRACE=1

@@ -64,7 +64,7 @@ VARIANTS = {
     'ds41': [('tp4', ['--tp', '4']), ('chunk1', ['--chunk', '1']), ('chunk16', ['--chunk', '16']), ('eager', ['--eager', '1']),
              ('mtp1', ['--mtp', '1']), ('sess1', ['--sess', '1']), ('sess8', ['--sess', '8']), ('sess32', ['--sess', '32']),
              ('reuse0', ['--reuse', '0']), ('int4', ['--kv-format', 'int4']), ('nohash', ['--nohash', '1']),
-             ('eager-sess1', ['--eager', '1', '--sess', '1'])],
+             ('eager-sess1', ['--eager', '1', '--sess', '1']), ('exact', ['--exact', '1'])],
 }
 
 
