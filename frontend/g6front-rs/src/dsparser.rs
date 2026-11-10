@@ -571,7 +571,7 @@ mod tests {
     fn an_undeclared_name_stays_text_without_the_flag() {
         let t = tools();
         let text = format!("\n\n{}", block(&[inv("mcp__t3-code__goal_questionnaire", &[("questions", false, "[]")])]));
-        let (r, c, calls) = whole(&mut chat(Some(&t)), &text);
+        let (_, c, calls) = whole(&mut chat(Some(&t)), &text);
         assert!(calls.is_empty());
         assert!(c.contains("mcp__t3-code__goal_questionnaire"));
     }
@@ -592,10 +592,11 @@ mod tests {
         let text = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n\
                    <｜DSML｜ parameter name=\"city\" string=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n\
                    </｜DSML｜ invoke>\n</｜DSML｜ calls>";
-        let want = ("".to_string(), "".to_string(), vec![("get_weather".to_string(), "{\"city\": \"Paris\"}".to_string())]);
-        assert_eq!(whole(&mut chat(Some(&t)), &text), want);
+        let want =
+            ("".to_string(), "".to_string(), vec![("get_weather".to_string(), "{\"city\": \"Paris\"}".to_string())]);
+        assert_eq!(whole(&mut chat(Some(&t)), text), want);
         // streaming meets the doubled attribute in every partial state; each must wait, not abort
-        assert_eq!(streamed(chat(Some(&t)), &text), want);
+        assert_eq!(streamed(chat(Some(&t)), text), want);
     }
 
     #[test]
@@ -606,8 +607,8 @@ mod tests {
                    <｜DSML｜ parameter name=\"questions\" string=\"questions\" string=\"false\">[]</｜DSML｜ parameter>\n\
                    </｜DSML｜ invoke>\n</｜DSML｜ calls>";
         let want = ("".to_string(), "".to_string(), vec![(name.to_string(), "{\"questions\": []}".to_string())]);
-        assert_eq!(whole(&mut chat(Some(&t)).emit_undeclared(true), &text), want);
-        assert_eq!(streamed(chat(Some(&t)).emit_undeclared(true), &text), want);
+        assert_eq!(whole(&mut chat(Some(&t)).emit_undeclared(true), text), want);
+        assert_eq!(streamed(chat(Some(&t)).emit_undeclared(true), text), want);
     }
 
     /// The reply one char at a time, `finished` only on the last: the streaming path's worst case.
