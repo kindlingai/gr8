@@ -2,7 +2,7 @@
   "version": 1,
   "title": "GLM-5.3",
   "variant": "exlr8, DFlash2 drafter",
-  "summary": "GLM-5.3 on four DGX Sparks with gr8 at TP=4, docker/.env.example settings, measured 2026-11-10 on the staged image built from gr8 d62cb6b (one boot).",
+  "summary": "GLM-5.3 on four DGX Sparks with gr8 at TP=4, measured 2026-11-10 on the staged image built from gr8 d62cb6b (one boot).",
   "model": "kindlingai/glm-5.3-exlr8-k2-k3-k4",
   "hardware": "DGX Spark (GB10)",
   "stack": ["gr8", "exlr8", "DFlash2"],
@@ -26,8 +26,10 @@
       ],
       "concurrency_prompt_tokens": [45, 57],
       "max_context": 485362,
-      "max_concurrent": 8,
-      "quality": [{"name": "Needle recall", "value": "found at 128K"}]
+      "quality": [
+        {"name": "Requests at once", "value": "tested up to 8"},
+        {"name": "Needle recall", "value": "found at 128K"}
+      ]
     }
   ]
 }
