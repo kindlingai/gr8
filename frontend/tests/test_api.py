@@ -16,8 +16,8 @@ import urllib.request
 URL = os.environ.get('URL', 'http://127.0.0.1:8100')
 # the front end runs with --allow-thinking-off: the thinking-off tests run, and the refusals of thinking off skip
 THINKING_OFF = os.environ.get('ALLOW_THINKING_OFF') == '1'
-# the front end runs with --undeclared-tool-calls emit
-EMIT_UNDECLARED = os.environ.get('UNDECLARED_TOOL_CALLS') == 'emit'
+# the front end runs with --undeclared-tool-calls text (emit is its default)
+EMIT_UNDECLARED = os.environ.get('UNDECLARED_TOOL_CALLS') != 'text'
 
 
 def post(path, body, raw=False):
@@ -108,8 +108,8 @@ class Chat(unittest.TestCase):
         self.assertEqual(r['choices'][0]['finish_reason'], 'stop')
 
     def test_undeclared_tool_call(self):
-        # the reply calls web_search, which the request does not declare: text by default, a call with
-        # --undeclared-tool-calls emit (its arguments are strings: there is no schema to coerce them by)
+        # the reply calls web_search, which the request does not declare: a call by default (its arguments are strings:
+        # there is no schema to coerce them by), text with --undeclared-tool-calls text
         body = {'model': 'glm-5.3', 'messages': [{'role': 'user', 'content': 'call-an-undeclared-tool'}],
                 'tools': TOOLS, 'max_tokens': 200}
         s, r = post('/v1/chat/completions', body)

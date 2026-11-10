@@ -11,8 +11,8 @@
 //!   held until the reply ends.
 //! - With the repeated-tool-call guard (guard.rs) a call whose name is one of `guard_names` never goes live: it is
 //!   held until the reply ends, when `pending_calls` lets the guard read it before the client does.
-//! - A call to a name the request did not declare is prose by default, tags and all. `emit_undeclared`
-//!   (`--undeclared-tool-calls emit`) takes it as a call when the name looks like a function name (`plausible_name`),
+//! - A call to a name the request did not declare is prose, tags and all, unless `emit_undeclared`
+//!   (`--undeclared-tool-calls emit`, the front end's default) takes it as a call when the name looks like a function name (`plausible_name`),
 //!   so the client sees the call and can answer it with its own "unknown tool" error. Such a call is never live: it is
 //!   held until the reply ends with it.
 //!

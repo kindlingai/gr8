@@ -62,7 +62,8 @@ pub struct State {
     pub thinking: thinking::Defaults,
     /// the grammar compiler for response_format json_schema
     pub grammars: grammar::Grammars,
-    /// `--undeclared-tool-calls emit`: a call to a tool the request did not declare comes back as a call, not text
+    /// `--undeclared-tool-calls emit` (the default): a call to a tool the request did not declare comes back as a call;
+    /// `text` keeps it in the content
     pub emit_undeclared: bool,
     /// the repeated-tool-call guard's settings (`--tool-repeat-guard*`; a request's `tool_repeat_guard` wins)
     pub guard: guard::Config,
@@ -140,7 +141,7 @@ fn parse_args() -> Result<Args, String> {
         default_budget: sampling::Limit::Tokens(0),
         allow_thinking_off: false,
         clamp_max_tokens: false,
-        emit_undeclared: false,
+        emit_undeclared: true,
         supervisor: None,
         penalties: sampling::Penalties::default(),
         boost: None,
@@ -385,8 +386,8 @@ async fn serve(args: Args) -> Result<(), String> {
         dialect::Dialect::Glm => vec!["glm-5.3".into(), "glm53".into()],
         dialect::Dialect::Ds41 => vec!["deepseek-v4.1-flash".into()],
     });
-    if args.emit_undeclared {
-        log::info!("calls to tools a request did not declare come back as tool calls (--undeclared-tool-calls emit)");
+    if !args.emit_undeclared {
+        log::info!("calls to tools a request did not declare stay text (--undeclared-tool-calls text)");
     }
     let engine = engine::Engine::new(args.engine_sock.clone());
     let grammars = grammar::Grammars::load(&PathBuf::from(&args.model_dir), tok.vocab_size)?;

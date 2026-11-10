@@ -46,7 +46,7 @@ specificity = 20
 content = "Call it like <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call> in your code."
 
 # A call to a tool the request did not declare (an agent's deferred tool, called by name instead of through its
-# meta-tool): text by default, a tool call with --undeclared-tool-calls emit.
+# meta-tool): a tool call by default, text with --undeclared-tool-calls text.
 [[rule]]
 name = "undeclared-call"
 match = 'call-an-undeclared-tool'

@@ -228,7 +228,7 @@ class ValidateTests(unittest.TestCase):
         self.check(['--peers', PEERS, '--clamp-max-tokens', 'on'], '--clamp-max-tokens on: want 0 or 1')
         self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('CLAMP_MAX_TOKENS'), '0')
         self.check(['--peers', PEERS, '--undeclared-tool-calls', 'on'], 'want text or emit')
-        self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('UNDECLARED_TOOL_CALLS'), 'text')
+        self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('UNDECLARED_TOOL_CALLS'), 'emit')
         self.check(['--peers', PEERS, '--grammar', '2'], 'want 0 or 1')
         self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], {}).get('GRAMMAR'), '1')
         # a grammar directory reaches the engine as --grammar-dir, a path per box

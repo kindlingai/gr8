@@ -72,9 +72,9 @@ impl AnyParser {
         }
     }
 
-    /// `--undeclared-tool-calls emit`: a call to a tool the request did not declare comes back as a tool call. GLM
-    /// emits it at the end of the reply (so prose can still disprove it); DSML emits an invoke the moment its closer
-    /// arrives, since the closer is unambiguous.
+    /// `--undeclared-tool-calls emit` (the default): a call to a tool the request did not declare comes back as a
+    /// tool call. GLM emits it at the end of the reply (so prose can still disprove it); DSML emits an invoke the moment
+    /// its closer arrives, since the closer is unambiguous.
     pub fn emit_undeclared(self, on: bool) -> AnyParser {
         match self {
             AnyParser::Glm(p) => AnyParser::Glm(p.emit_undeclared(on)),

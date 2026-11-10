@@ -1029,7 +1029,7 @@ class Supervisor:
             front += ['--allow-thinking-off']
         if o.get('CLAMP_MAX_TOKENS') == '1':
             front += ['--clamp-max-tokens']
-        if o.get('UNDECLARED_TOOL_CALLS') != 'text':
+        if o.get('UNDECLARED_TOOL_CALLS') != 'emit':
             front += ['--undeclared-tool-calls', o.get('UNDECLARED_TOOL_CALLS')]
         self.spawn('front', self.pin() + front + ['--model-dir', self.ms.tokenizer, '--engine-sock', sock,
                                                   '--port', o.get('PORT'), '--supervisor', f'{self.lan}:{self.port}'],
