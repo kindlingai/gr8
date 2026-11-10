@@ -8,9 +8,10 @@
 //!
 //! A reply that WRITES ABOUT a call is the same bytes as one that MAKES a call, so a block is taken as a call only if
 //! tools were offered and `tool_choice` is not none, it opens in the answer (not in the reasoning), outside a ``` fence,
-//! right after a blank line (or at the start of the answer), and every invoke is well formed and names an offered tool.
-//! Anything else stays answer text, byte for byte, including a block the model quotes from its own instructions
-//! (`$TOOL_NAME`).
+//! right after a blank line (or at the start of the answer), and every invoke is well formed. An invoke must also name
+//! an offered tool, unless `emit_undeclared` is on and the name looks like a function name: then the call is emitted so
+//! the client sees it and can answer it with its own unknown-tool error. Anything else stays answer text, byte for
+//! byte, including a block the model quotes from its own instructions (`$TOOL_NAME`).
 //!
 //! Streaming: partial tags are held back, trailing newlines of the answer are held until the next text shows they were
 //! not the blank line before a call, and an invoke is emitted whole (id, name, arguments) when its closer arrives.
@@ -55,6 +56,8 @@ enum Parsed<T> {
 pub struct DsParser {
     tools: HashSet<String>,
     parse_tools: bool,
+    /// `--undeclared-tool-calls emit`: a call to a tool the request did not declare comes back as a call, not text.
+    emit_undeclared: bool,
     pub include_reasoning: bool,
     mode: Mode,
     buf: String,
@@ -87,6 +90,7 @@ impl DsParser {
         DsParser {
             tools: names,
             parse_tools: any && tool_choice.as_str() != Some("none"),
+            emit_undeclared: false,
             include_reasoning,
             mode: Mode::Reasoning,
             buf: String::new(),
@@ -103,6 +107,14 @@ impl DsParser {
     /// The reply starts as the answer: its prompt closed the think block (thinking off).
     pub fn content_first(mut self) -> DsParser {
         self.mode = Mode::Content;
+        self
+    }
+
+    /// `--undeclared-tool-calls emit`: a call to a tool the request did not declare comes back as a call, not text,
+    /// when its name looks like a function name (`plausible_name`), so the client can answer it with its own
+    /// unknown-tool error.
+    pub fn emit_undeclared(mut self, on: bool) -> DsParser {
+        self.emit_undeclared = on;
         self
     }
 
@@ -243,7 +255,7 @@ impl DsParser {
                 return true;
             }
             if r.starts_with(INVOKE_NAME) {
-                match parse_invoke(r, &self.tools) {
+                match parse_invoke(r, &self.tools, self.emit_undeclared) {
                     Parsed::Ok((used, name, args)) => {
                         out.calls.push(ToolDelta {
                             index: self.n_calls,
@@ -322,14 +334,43 @@ fn partial_tag(text: &str, tag: &str) -> usize {
     (1..g.len().min(t.len() + 1)).rev().find(|&n| t.ends_with(&g[..n])).unwrap_or(0)
 }
 
+/// A doubled `string` attribute: `string="k" string="true">` — the key repeated as the first value, the real
+/// boolean second. A real session had `name="command" string="command" string="true">`. `after` is what follows
+/// the first `" string="`: value₁ is raw text up to its closing quote, then ` string="true|false">`. Returns Need
+/// while any part is still arriving — the streaming path meets every partial state — and Bad once the input is
+/// committed broken (the first value closed without a boolean attribute following).
+fn doubled_string_attr(after: &str) -> Parsed<(bool, usize)> {
+    let Some(q1) = after.find('"') else {
+        return if after.contains(['\n', '<']) { Parsed::Bad } else { Parsed::Need };
+    };
+    let rest = &after[q1 + 1..];
+    let Some(p) = rest.find(" string=\"") else {
+        // the first value closed but no ` string="` yet: it may still be arriving
+        return if rest.is_empty() || " string=\"".starts_with(rest) { Parsed::Need } else { Parsed::Bad };
+    };
+    let v = &rest[p + " string=\"".len()..];
+    if v.starts_with("true\">") {
+        Parsed::Ok((true, q1 + 1 + p + 9 + 6))
+    } else if v.starts_with("false\">") {
+        Parsed::Ok((false, q1 + 1 + p + 9 + 7))
+    } else if "true\">".starts_with(v) || "false\">".starts_with(v) {
+        Parsed::Need
+    } else {
+        Parsed::Bad
+    }
+}
+
 /// One `<｜DSML｜ invoke name="f">…</｜DSML｜ invoke>` at the start of `s`: (bytes used, name, arguments as JSON text).
-fn parse_invoke(s: &str, known: &HashSet<String>) -> Parsed<(usize, String, String)> {
+/// A name no tool of the request declares is still a call when `emit_undeclared` is on and the name looks like a
+/// function name (`plausible_name`); it stays text otherwise.
+fn parse_invoke(s: &str, known: &HashSet<String>, emit_undeclared: bool) -> Parsed<(usize, String, String)> {
     let rest = &s[INVOKE_NAME.len()..];
     let Some(q) = rest.find("\">") else {
         return if rest.contains(['\n', '<']) { Parsed::Bad } else { Parsed::Need };
     };
     let name = &rest[..q];
-    if name.contains(['\n', '<']) || !known.contains(name) {
+    let name_ok = known.contains(name) || (emit_undeclared && crate::parser::plausible_name(name));
+    if name.contains(['\n', '<']) || !name_ok {
         return Parsed::Bad;
     }
     let mut at = INVOKE_NAME.len() + q + 2;
@@ -364,7 +405,13 @@ fn parse_invoke(s: &str, known: &HashSet<String>) -> Parsed<(usize, String, Stri
         } else if "true\">".starts_with(after) || "false\">".starts_with(after) {
             return Parsed::Need;
         } else {
-            return Parsed::Bad;
+            // the model sometimes repeats the key as the value (`name="k" string="k" string="true">`):
+            // take the second, boolean attribute and read on; Need while it is still arriving
+            match doubled_string_attr(after) {
+                Parsed::Ok((is_str, skip)) => (is_str, skip),
+                Parsed::Need => return Parsed::Need,
+                Parsed::Bad => return Parsed::Bad,
+            }
         };
         let val = &after[skip..];
         let Some(e) = val.find(PARAM_CLOSE) else { return Parsed::Need };
@@ -505,6 +552,76 @@ mod tests {
         let (_, _, calls) = whole(&mut chat(Some(&t)), &text);
         let args: Value = serde_json::from_str(&calls[0].1).unwrap();
         assert_eq!(args["city"], v);
+    }
+
+    #[test]
+    fn emit_undeclared_makes_an_unknown_name_a_call() {
+        let t = tools();
+        let name = "mcp__t3-code__goal_questionnaire";
+        let text = format!("\n\n{}", block(&[inv(name, &[("questions", false, "[]")])]));
+        let (r, c, calls) = whole(&mut chat(Some(&t)).emit_undeclared(true), &text);
+        assert_eq!(r, "");
+        assert_eq!(c, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, name);
+        assert_eq!(calls[0].1, "{\"questions\": []}");
+    }
+
+    #[test]
+    fn an_undeclared_name_stays_text_without_the_flag() {
+        let t = tools();
+        let text = format!("\n\n{}", block(&[inv("mcp__t3-code__goal_questionnaire", &[("questions", false, "[]")])]));
+        let (_, c, calls) = whole(&mut chat(Some(&t)), &text);
+        assert!(calls.is_empty());
+        assert!(c.contains("mcp__t3-code__goal_questionnaire"));
+    }
+
+    #[test]
+    fn emit_undeclared_keeps_an_implausible_name_text() {
+        let t = tools();
+        let text = format!("\n\n{}", block(&[inv("not a tool name", &[("x", true, "1")])]));
+        let (_, c, calls) = whole(&mut chat(Some(&t)).emit_undeclared(true), &text);
+        assert!(calls.is_empty());
+        assert!(c.contains("not a tool name"));
+    }
+
+    #[test]
+    fn a_doubled_string_attribute_still_parses() {
+        let t = tools();
+        // the real session that found this: `name="command" string="command" string="true">ls -la`
+        let text = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n\
+                   <｜DSML｜ parameter name=\"city\" string=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n\
+                   </｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let want =
+            ("".to_string(), "".to_string(), vec![("get_weather".to_string(), "{\"city\": \"Paris\"}".to_string())]);
+        assert_eq!(whole(&mut chat(Some(&t)), text), want);
+        // streaming meets the doubled attribute in every partial state; each must wait, not abort
+        assert_eq!(streamed(chat(Some(&t)), text), want);
+    }
+
+    #[test]
+    fn a_doubled_string_attribute_and_an_undeclared_name_parse_with_emit() {
+        let t = tools();
+        let name = "mcp__t3-code__goal_questionnaire";
+        let text = "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"mcp__t3-code__goal_questionnaire\">\n\
+                   <｜DSML｜ parameter name=\"questions\" string=\"questions\" string=\"false\">[]</｜DSML｜ parameter>\n\
+                   </｜DSML｜ invoke>\n</｜DSML｜ calls>";
+        let want = ("".to_string(), "".to_string(), vec![(name.to_string(), "{\"questions\": []}".to_string())]);
+        assert_eq!(whole(&mut chat(Some(&t)).emit_undeclared(true), text), want);
+        assert_eq!(streamed(chat(Some(&t)).emit_undeclared(true), text), want);
+    }
+
+    /// The reply one char at a time, `finished` only on the last: the streaming path's worst case.
+    fn streamed(mut p: DsParser, text: &str) -> Got {
+        let (mut r, mut c, mut calls) = (String::new(), String::new(), Vec::new());
+        for (i, ch) in text.char_indices() {
+            let end = i + ch.len_utf8();
+            let o = p.feed(&text[i..end], end == text.len());
+            r.push_str(&o.reasoning);
+            c.push_str(&o.content);
+            calls.extend(o.calls.into_iter().map(|call| (call.name.unwrap(), call.arguments.unwrap())));
+        }
+        (r, c, calls)
     }
 
     #[test]
