@@ -72,7 +72,7 @@ impl AnyParser {
         }
     }
 
-    /// `--undeclared-tool-calls emit`: a call to a tool the request did not declare comes back as a tool call. GLM only;
+    /// `--undeclared-tool-calls emit` (the default): a call to a tool the request did not declare comes back as a tool call. GLM only;
     /// the DSML parser keeps such a call as text.
     pub fn emit_undeclared(self, on: bool) -> AnyParser {
         match self {

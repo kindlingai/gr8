@@ -510,11 +510,12 @@ class FrontTests(unittest.TestCase):
         self.assertEqual(a[a.index('--default-reasoning-effort') + 1], 'low')
         self.assertEqual(a[a.index('--default-thinking-budget') + 1], '2048')
 
-    def test_undeclared_tool_calls_reach_the_front_end_only_when_emitted(self):
+    def test_undeclared_tool_calls_reach_the_front_end_only_when_text(self):
+        # emit is the front end's default as well as the launcher's
         self.assertNotIn('--undeclared-tool-calls', self.front_argv())
-        self.assertNotIn('--undeclared-tool-calls', self.front_argv('--undeclared-tool-calls', 'text'))
-        a = self.front_argv('--undeclared-tool-calls', 'emit')
-        self.assertEqual(a[a.index('--undeclared-tool-calls') + 1], 'emit')
+        self.assertNotIn('--undeclared-tool-calls', self.front_argv('--undeclared-tool-calls', 'emit'))
+        a = self.front_argv('--undeclared-tool-calls', 'text')
+        self.assertEqual(a[a.index('--undeclared-tool-calls') + 1], 'text')
 
     def test_ds41_runs_the_front_end_in_its_dialect(self):
         a = self.front_argv('--gr8-model', 'ds41', '--allow-thinking-off', '1')
