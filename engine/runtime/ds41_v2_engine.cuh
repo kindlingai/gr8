@@ -13,6 +13,19 @@ struct Ds41V2Engine {
         T* p=dmalloc<T>(n); allocations.push_back(p); return p;
     }
     static size_t tail_row_bytes() { return 4*HID*sizeof(ds_mhc::trunk_t)+(24+4+4+16)*sizeof(float)+HID*2; }
+    // nullptr = this Model's layers suit v2; otherwise the reason the boot runs the old range-A path instead
+    // (a trellis release, a layer subset). boot() still refuses them: a caller that skips this check is a bug.
+    static const char* model_reason(const Model& m) {
+        if(m.nl<=::ds41::v2::FIRST_LATE)return "the engine does not hold layers 0..21";
+        for(int i=0;i<=::ds41::v2::FIRST_LATE;++i)
+            if(m.layers[i].l!=i)return "the engine does not hold layers 0..21";
+        for(int i=0;i<::ds41::v2::FIRST_LATE;++i) {
+            auto* w=static_cast<ds41moe::LayerState*>(m.layers[i].ds41_moe);
+            if(!w || !::ds41::v2::ffn::supported(::ds41::v2::ffn::layer_view(*w)))
+                return "layers 0..20 hold trellis experts or no SH_TC shared weights (v2 needs native MXFP4 experts)";
+        }
+        return nullptr;
+    }
     void boot(Model& m,g6::Fabric& f,cudaStream_t st) {
         capacity=m.hc_rows;
         // This schedule implements layers 0..20; borrowed index sources of a

@@ -403,7 +403,7 @@ g++ -std=c++17 -O2 -Wall "$REPO/engine/kernels/tests/ds_ro_host_test.cpp" -o "$T
 # DS41 W4096: RO_MAX 4096 is the largest prefill width, and the RoScratch tile capacity holds the 4096-row plan
 g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine" -I "$REPO/engine/kernels" "$REPO/engine/tests/test_ds41_w4096.cpp" -o "$T/test_ds41_w4096"
 "$T/test_ds41_w4096"
-# v2 remains opt-in: geometry/order, stock bootstrap coverage and isolated fabric/tail.
+# v2 (the launcher default): geometry/order, the fallback decision (which settings run v2, which the old range A), stock bootstrap coverage and isolated fabric/tail.
 for name in test_ds41_v2 test_ds41_v2_walk test_ds41_v2_plan; do
   g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_DS41=1 -DG6_NR=4 -DDEC_S2 -I "$REPO/engine" "$REPO/engine/tests/$name.cpp" -o "$T/$name" "${KVLIB[@]}"
   "$T/$name"

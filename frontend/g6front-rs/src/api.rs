@@ -545,6 +545,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         st.boost.as_ref(),
         st.sequence.as_ref(),
         st.chat_default_max_tokens(prompt.len()),
+        st.clamp_max_tokens,
         st.max_logprobs(),
         true,
     )?;
@@ -1295,6 +1296,7 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
             st.boost.as_ref(),
             st.sequence.as_ref(),
             Some(16),
+            st.clamp_max_tokens,
             st.max_logprobs(),
             false,
         )?;

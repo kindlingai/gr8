@@ -249,6 +249,14 @@ options:
       refusing them: the prompt drops its Reasoning Effort turn and closes the think block, so the reply starts on
       content. GLM 5.3's official template always opens <think>; a closed block gave degenerate output on an earlier
       serving stack, so it is off by default (frontend/README.md)
+  CLAMP_MAX_TOKENS:
+    scope: box
+    default: "0"
+    doc: >-
+      1 = the head's front end cuts a request's max_tokens (or max_completion_tokens) to the room the context leaves
+      after the prompt, instead of refusing the request with a 400 as OpenAI and vLLM do. For clients that send a fixed
+      large max_tokens on every turn, such as an agent harness whose history grows. A prompt that fills the context is
+      still refused
   UNDECLARED_TOOL_CALLS:
     scope: box
     default: "text"
@@ -361,6 +369,12 @@ options:
     scope: cluster
     doc: >-
       ds41: 1 = every step runs eagerly, without captured graphs (the engine without --graph); default 0
+  EXACT:
+    scope: cluster
+    doc: >-
+      ds41: 1 = exact output: the old prefill path (two lanes, 4,096-row chunks, the CUDA-core shared expert). Default 0, the
+      release stack: the v2 prefill (GR8_DS_PF_V2=1) with 8,192-row chunks, whose tensor-core shared expert changes the output
+      bits. EXTRA_ENV GR8_DS_MHC_ROW_SHARD=1 (the 1M-context setup) or GR8_DS_PF_V2=0 also selects the old path
   REUSE:
     scope: cluster
     doc: >-

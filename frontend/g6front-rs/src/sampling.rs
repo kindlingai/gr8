@@ -530,6 +530,7 @@ pub fn build(
     boost: Option<&BoostSpec>,
     sequence: Option<&SeqSpec>,
     default_max_tokens: Option<u64>,
+    clamp_max_tokens: bool,
     max_logprobs: i64,
     chat: bool,
 ) -> Result<Params, ApiError> {
@@ -551,6 +552,12 @@ pub fn build(
     };
     let max_tokens = int_num(&f, mt_key, Some(0), None)?;
     let room = max_model_len as i128 - prompt_len as i128;
+    // --clamp-max-tokens: a client that asks for more than the context leaves gets the room left. Without it, or when
+    // the prompt alone fills the context, the request is refused as OpenAI and vLLM refuse it
+    let max_tokens = match max_tokens {
+        Some(m) if clamp_max_tokens && room > 0 && m > room => Some(room),
+        m => m,
+    };
     if room <= 0 || max_tokens.is_some_and(|m| m > room) {
         let mt = max_tokens.unwrap_or(0);
         let want = (prompt_len as i128).saturating_add(mt);
@@ -786,6 +793,7 @@ mod tests {
             None,
             None,
             Some(16),
+            false,
             20,
             false,
         )?;
@@ -829,6 +837,7 @@ mod tests {
             None,
             None,
             default,
+            false,
             20,
             true,
         );
@@ -844,13 +853,32 @@ mod tests {
         // named: kept
     }
 
+    #[test]
+    fn a_max_tokens_past_the_room_is_refused_unless_clamped() {
+        let body = r#"{"max_completion_tokens": 128000}"#;
+        let m: Map<String, Value> = serde_json::from_str(body).unwrap();
+        let mt = |prompt: usize, clamp: bool| {
+            let p = Penalties::default();
+            build(&m, body.as_bytes(), prompt, 262144, &[], VOCAB, &Map::new(), &p, None, None, None, clamp, 20, true)
+                .map(|p| p.gen.max_tokens)
+        };
+        // DSH at a 134,165-token prompt: refused by default, the room left with the flag
+        let e = mt(134165, false).expect_err("a 400");
+        assert!(e.status == 400 && e.message.contains("maximum context length is 262144"), "{}", e.message);
+        assert_eq!(mt(134165, true).unwrap(), 262144 - 134165);
+        // a request that fits is unchanged either way
+        assert_eq!((mt(100000, false).unwrap(), mt(100000, true).unwrap()), (128000, 128000));
+        // a prompt that fills the context is refused even with the flag
+        assert_eq!(mt(262144, true).expect_err("a 400").status, 400);
+    }
+
     /// the four resolved penalties of a request under `spec` (presence and frequency alike), with gen_defaults `defaults`
     fn resolved(body: &str, spec: &str, defaults: &str) -> Result<(f64, f64, f64, f64), ApiError> {
         let m: Map<String, Value> = serde_json::from_str(body).unwrap();
         let d: Map<String, Value> = serde_json::from_str(defaults).unwrap();
         let one = PenaltySpec::parse(spec).unwrap();
         let pen = Penalties { presence: one, frequency: one };
-        let p = build(&m, body.as_bytes(), 10, 4096, &[], VOCAB, &d, &pen, None, None, Some(16), 20, true)?;
+        let p = build(&m, body.as_bytes(), 10, 4096, &[], VOCAB, &d, &pen, None, None, Some(16), false, 20, true)?;
         assert_eq!(p.gen.think_end, None); // api.rs sets it from the prompt
         Ok((
             p.gen.presence_penalty,
@@ -1115,6 +1143,7 @@ mod tests {
             spec.as_ref(),
             None,
             default_max,
+            false,
             20,
             true,
         )?;
@@ -1136,6 +1165,7 @@ mod tests {
             None,
             spec.as_ref(),
             Some(16),
+            false,
             20,
             true,
         )?;
@@ -1249,6 +1279,7 @@ mod tests {
                 Some(&spec),
                 None,
                 default_max,
+                false,
                 20,
                 true,
             )

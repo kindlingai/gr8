@@ -7,6 +7,23 @@ the model, see below), with an OpenAI-compatible API on the first box. gr8 is wr
 vLLM, PyTorch or NCCL at serve time. *Beta release. If you run it, please tell us what breaks:
 [issues](https://github.com/kindlingai/gr8/issues) and PRs are welcome.*
 
+### Switch between the models
+
+[![Switch between GLM-5.3, DeepSeek-V4.1-Flash and GLM-5.3-Flash: seconds for each direction](docs/cards/switching.png)](docs/SWITCHING.md)
+
+The same boxes serve one model at a time; `./gr8 switch <model>` stops the running one and starts the other.
+[docs/SWITCHING.md](docs/SWITCHING.md) has the setup and every measured step.
+
+### Kindling dash
+
+[![Kindling dash: one page with the loaded model's speeds, the presets, the boxes, the head log and the models table](docs/kindling-dash.png)](tools/console/README.md)
+
+Kindling dash is a small web page for a gr8 cluster. It shows the loaded model's decode and prefill speed, the KV cache,
+the boxes and the head log. With `allow_control` set, it also switches, restarts and stops models. It runs apart from the
+engine, so it stays up while models restart. [tools/console/README.md](tools/console/README.md) has the setup.
+
+<sub>The screenshot shows the dash on its test fixture. Its numbers are synthetic, not measurements.</sub>
+
 ## Recipes
 
 Each recipe is one Docker image, set up for one model on a fixed number of boxes. For other box counts (GLM-5.3 on
@@ -35,9 +52,9 @@ pool · one `docker run`
 
 [![GLM-5.3 on four DGX Sparks: decode, prefill and concurrency](docs/cards/glm-5.3-4x-spark.png)](docs/GLM-5.3.md)
 
-64.2 tok/s for one request writing code (48-54-token prompts) · 1,539 tok/s prefill on a 32K prompt · 8 requests at
-once, 85.6 tok/s in total · no recipe yet: start it on three to six boxes with Docker Compose, from the
-[Models and install](#models-and-install) table.
+63.2 tok/s for one request writing code (48-54-token prompts) · 1,513 tok/s prefill on a 32K prompt · 8 requests at
+once, 85.4 tok/s in total · a fact hidden in a 128K prompt found · one boot, measured 2026-11-10 · no recipe yet:
+start it on three to six boxes with Docker Compose, from the [Models and install](#models-and-install) table.
 
 [Model page](docs/GLM-5.3.md)
 
@@ -65,8 +82,9 @@ redraws them). The model pages give each benchmark and its date.</sub>
   (measured 2026-11-05, gr8 94a3823).
 - **Many chats at once, and long ones.** GLM-5.3 decodes 8 requests at once from a KV pool of up to 614,400 tokens
   (TP=6). GLM-5.3-Flash on one box decodes 4 at once from a 700,032-token pool. DeepSeek-V4.1-Flash runs 32 chats
-  at once in fast mode, its recipe's default, each up to 327,670 tokens; `./gr8 ds41 up` defaults to exact output and
-  5 chats. With `CAP=1048576` and 16 chats, one request can hold up to 1,048,566 tokens, prompt and reply
+  at once in fast mode, its recipe's default, each up to 327,670 tokens; `./gr8 ds41 up` defaults to the release
+  stack's v2 prefill and 5 chats (`EXACT=1` for exact output). With `CAP=1048576` and 16 chats, one request can hold
+  up to 1,048,566 tokens, prompt and reply
   ([docs/FIRST-BOOT.md](docs/FIRST-BOOT.md#2-deepseek-v41-flash-ds41-how-many-chats-and-how-long)).
 - **Prefix reuse and KV below the pool.** A request that continues a conversation prefills only its new part: a
   continued 20K-token conversation takes 7.1 s instead of 17.3 s (GLM-5.3, TP=4). On GLM-5.3, evicted prefixes can go
@@ -113,8 +131,8 @@ setting, and has bare metal and Kubernetes. An agent that starts gr8 for someone
 is the quickest way: the same image on every box, in fast mode by default. We booted that image (`sha-ad3efdf`) on four
 boxes on 2026-11-09: first boot (cold disk) 212.7 s to `serving:`, a switch from GLM-5.3 after that 37-39 s, a chat
 answered after each boot, and 73 of 75 on the 75-item check.
-[docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is the boot with gr8's own launcher, which gives exact output by default,
-in order, from the four boxes to a passing `./gr8 ds41 smoke`.
+[docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md) is the boot with gr8's own launcher (the v2 prefill by default, `EXACT=1`
+for exact output), in order, from the four boxes to a passing `./gr8 ds41 smoke`.
 
 ### With model-loader
 

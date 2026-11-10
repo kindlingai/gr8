@@ -535,6 +535,52 @@ class Gif(unittest.TestCase):
         self.assertEqual(rows[4][1:5], ('16 streams', 249.2, 249.2, '249.2  first token 2.48 s'))
 
 
+
+class SwitchCard(unittest.TestCase):
+    CARD = Path(__file__).resolve().parents[2] / 'docs' / 'cards' / 'switch_card.py'
+
+    def test_draws_the_repo_card(self):
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest('Pillow is not installed')
+        with tempfile.TemporaryDirectory() as t:
+            out = Path(t) / 'switching.png'
+            p = subprocess.run([sys.executable, str(self.CARD), str(self.CARD.parent / 'switching.json'),
+                                '--out', str(out)], capture_output=True, text=True, timeout=120)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            from PIL import Image
+            with Image.open(out) as im:
+                self.assertEqual(im.size, (800, 600))
+
+    def test_every_switch_names_two_of_the_three_models(self):
+        doc = json.loads((self.CARD.parent / 'switching.json').read_text())
+        ids = {m['id'] for m in doc['models']}
+        self.assertEqual(len(ids), 3)
+        pairs = {(s['from'], s['to']) for s in doc['switches']}
+        self.assertEqual(pairs, {(a, b) for a in ids for b in ids if a != b})
+        self.assertTrue(all(s['seconds'] for s in doc['switches']))
+
+    def test_arrow_glyph_follows_the_direction(self):
+        spec = importlib.util.spec_from_file_location('switch_card', self.CARD)
+        sc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sc)
+        self.assertEqual(sc.glyph((1, 0)), '→')
+        self.assertEqual(sc.glyph((-1, 0)), '←')
+        self.assertEqual(sc.glyph((0.7, 0.7)), '↘')
+        self.assertEqual(sc.glyph((-0.7, -0.7)), '↖')
+
+    def test_one_number_per_arrow_the_rounded_mean(self):
+        spec = importlib.util.spec_from_file_location('switch_card', self.CARD)
+        sc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sc)
+        self.assertEqual(sc.seconds([37.1, 39.2]), '38 s')
+        self.assertEqual(sc.seconds([76.0, 74.1]), '75 s')
+        self.assertEqual(sc.seconds([31.3]), '31 s')
+        self.assertEqual(sc.seconds([28.5, 29.5]), '29 s')
+        self.assertEqual(sc.seconds([28.5]), '29 s')
+
+
 class Kindling(unittest.TestCase):
     REPORT = {'info': {'model': 'm', 'max_model_len': 262144},
               'decode': {'code': {'summary': {'tps': 61.234}}, 'prose': {'summary': {'tps': 40.06}},

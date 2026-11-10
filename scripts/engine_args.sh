@@ -156,10 +156,18 @@ ds41_defaults() {
   # test_models.py holds the refusals.
   [ "$MTP" = 0 ] || { echo "engine_defaults: MTP=$MTP: DeepSeek-V4.1-Flash-1017 serves with MTP=0 (DSpark serve is not built)" >&2; return 2; }
   case ${KV_STORE:-} in ''|off) ;; *) echo "engine_defaults: KV_STORE=$KV_STORE: DeepSeek-V4.1-Flash-1017 has no KV store" >&2; return 2 ;; esac
-  local kv kvs engram=0 prefix=0 pmin=2 dsmtp=5 pw=4096
+  # EXACT=1 (exact output): the old prefill stack (layers 0..20 on the range-A path, two lanes, W 4096, GR8_DS_SH_TC unset = 0).
+  # The default is the release stack: the v2 sequence-parallel prefill (GR8_DS_PF_V2=1, docs/DEEPSEEK.md), whose tensor-core
+  # shared expert (GR8_DS_SH_TC=1) changes the output bits. EXTRA_ENV GR8_DS_PF_V2=0 or GR8_DS_MHC_ROW_SHARD=1 (the 1M-context
+  # setup) also selects the old stack.
+  EXACT=${EXACT:-0}
+  case $EXACT in 0|1) ;; *) echo "engine_defaults: EXACT=$EXACT: 0 (the release stack, v2 prefill) or 1 (exact output, the old prefill)" >&2; return 2 ;; esac
+  local kv kvs engram=0 prefix=0 pmin=2 dsmtp=5 pw= old=$EXACT
   read -ra kvs <<<"${EXTRA_ENV:-}"
   for kv in ${kvs[@]+"${kvs[@]}"}; do
     case $kv in
+      GR8_DS_PF_V2=0) old=1 ;;
+      GR8_DS_MHC_ROW_SHARD=1) old=1 ;;
       GR8_DS_PREFILL_MIN=[0-9]*) pmin=${kv#*=} ;;
       GR8_DS_MTP=[0-5]) dsmtp=${kv#*=} ;;
       GR8_DS_PREFILL_W=[0-9]*) pw=${kv#*=} ;;
@@ -169,6 +177,8 @@ ds41_defaults() {
       GR8_DS_ENGRAM_PREFIX=?*) prefix=1 ;;
     esac
   done
+  # W: 8192-row chunks on v2, 4096 on the old path (its read-once MoE plan holds 4096 rows); EXTRA_ENV GR8_DS_PREFILL_W wins
+  [ -n "$pw" ] || { [ "$old" = 1 ] && pw=4096 || pw=8192; }
   # Engram ON needs the sidecar PREFIX (the engine dies at parse time without it)
   [ "$engram" = 0 ] || [ "$prefix" = 1 ] ||
     { echo "engine_defaults: GR8_DS_ENGRAM=1 needs GR8_DS_ENGRAM_PREFIX=/path/PREFIX in EXTRA_ENV (the Engram sidecar, PREFIX.engram.*)" >&2; return 2; }
@@ -181,7 +191,7 @@ ds41_defaults() {
   local dsmtp_sess=$(( SESS < 8 ? SESS : 8 ))
   [ "$SESS" = 1 ] || [ "$dsmtp" = 0 ] || { [ $((dsmtp_sess * (dsmtp + 1))) -le 48 ] && [ $((dsmtp_sess * 5)) -le 48 ]; } ||
     { echo "engine_defaults: SESS=$SESS GR8_DS_MTP=$dsmtp: a round of $((dsmtp_sess * (dsmtp + 1))) verify rows; DeepSeek-V4.1-Flash-1017 steps hold 48" >&2; return 2; }
-  # DS41_TUNED: the DSpark drafts with Engram, the W-row prefill on two lanes with its reduce-scatter and direct-send collectives,
+  # DS41_TUNED: the DSpark drafts with Engram, the W-row prefill (the prefill stack below) with its reduce-scatter and direct-send collectives,
   # and the decode and prefill kernel paths that give the same bytes as their defaults. Measured together at TP4 (RigMark, reasoning
   # effort low, thermal-capped clocks): decode code 33.8 -> 77.8 tok/s, prose 33.7 -> 49.7, 8K prefill 149 -> 2,023 tok/s against
   # SESS=1 and none of these. GR8_DS_ATTN_TC=1 puts the attention projections of a prefill chunk on the tensor-core MXFP8 GEMM: 8K
@@ -200,9 +210,20 @@ ds41_defaults() {
   # A 1024-row prefill quantum while another chat decodes keeps those chats writing during a long new prompt.
   # The caller may override it in EXTRA_ENV or with S2_DECODE_PF; do not exceed a smaller requested W.
   local dpf=${S2_DECODE_PF:-$((pmin == 0 ? 0 : (pw < 1024 ? pw : 1024)))}
+  # The prefill stack. The release stack (default): v2 for layers 0..20 of a W-row chunk on one lane with the 128-row late
+  # tail, the tensor-core shared expert v2's FFN reads, v2's own-row gate, its two-rail stripe at 1 MiB and its pipelined
+  # attention core; Engram's pread pool at 64 threads (where io_uring is denied); the persistent attention GEMM tile; S2
+  # admits a queued burst at one boundary and serves a prompt tail first. The old stack (EXACT=1): two lanes, nothing else.
+  # The engine runs the old path, with one log line, where v2's conditions fail (a trellis release, an EXTRA_ENV word).
+  local pfs
+  if [ "$old" = 1 ]; then pfs="GR8_DS_PF_LANES=2"
+  else
+    pfs="GR8_DS_PF_V2=1 GR8_DS_PF_LANES=1 GR8_DS_PF_TAIL=128 GR8_DS_SH_TC=1 GR8_DS_PF_V2_GATE_RO=1 GR8_DS_PF_V2_STRIPE_MIN=1048576"
+    pfs="$pfs GR8_DS_PF_V2_ATTN_PIPE=1 GR8_DS_ENGRAM_IO_THREADS=64 GR8_DS_ATTN_TC_TILE=2 GR8_S2_ADMIT_HOLD=${S2_ADMIT_HOLD:-1} GR8_S2_TAIL_FIRST=1"
+  fi
   DS41_TUNED=
   for kv in GR8_DS_MTP=5 GR8_DS_ENGRAM_MTP=1 GR8_DS_PREFILL_MIN=2 GR8_DS_PREFILL_W=$pw GR8_DS_ATTN_PW=$pw GR8_DS41_IDX_PW=$pw GR8_S2_DECODE_PF=$dpf \
-      GR8_DS_PF_LANES=2 GR8_DS_PF_RS=1 GR8_DS_PF_DIRECT=1 GR8_DS_PF_GATHER=1 GR8_DS_PF_LATE_FINAL=1 GR8_DS_WAIT_K=2 GR8_DS_DEC_STAGE=1 \
+      $pfs GR8_DS_PF_RS=1 GR8_DS_PF_DIRECT=1 GR8_DS_PF_GATHER=1 GR8_DS_PF_LATE_FINAL=1 GR8_DS_WAIT_K=2 GR8_DS_DEC_STAGE=1 \
       GR8_DS_ATTN_CPA=1 GR8_DS_DSP_GV=1 GR8_DS_RO_ORDER=1 GR8_DS_GATE_RO=1 GR8_DS_ENGRAM_LOOKAHEAD=1 GR8_DS_ATTN_TC=1 \
       GR8_DS_MOE_TC=1 GR8_DS_PF_POOL=4 GR8_DS_SRC_FAST=3 GR8_DS_MOE_PDL=1 GR8_DS41_ADMIT_KEEP_SCRATCH=1 GR8_DS41_PUB16=1 \
       GR8_DS41_GV_QUAD=1 GR8_DS_COMP_FP4=1; do

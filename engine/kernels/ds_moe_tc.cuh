@@ -450,8 +450,17 @@ __device__ __forceinline__ void static_for(F&& f)
         f(std::integral_constant<int, N - 1>{});
     }
 }
-template <int I, int NOUT, int WARPS, int TW, int TPC, int ST>
-__global__ void __launch_bounds__(WARPS * 32, 2) k_fc2_tc(Args A)
+// COL_GROUPS > 0 (DS41 v2 prefill, runtime/ds41_v2_ffn.cuh): the launch covers only output column group A.col_group, NB /
+// COL_GROUPS whole blocks of it, split over the OS CTAs as the full width is; ArgsT then carries col_group. 0, the default,
+// is the stock kernel over all NB blocks.
+template <int COL_GROUPS, class ArgsT>
+__device__ __forceinline__ int fc2_group_block0(const ArgsT& A, int gnb)
+{
+    if constexpr (COL_GROUPS > 1) return A.col_group * gnb;
+    else return 0;
+}
+template <int I, int NOUT, int WARPS, int TW, int TPC, int ST, int COL_GROUPS = 0, class ArgsT = Args>
+__global__ void __launch_bounds__(WARPS * 32, 2) k_fc2_tc(ArgsT A)
 {
     constexpr int NG = I / KG, OT = NOUT / 16, NB = OT / TPC, NTG = WARPS * TW, NTH = WARPS * 32, AST = TPC * GR, ACH = GR / 16, NA = (TPC * ACH + NTH - 1) / NTH;
     constexpr int NSW = (NG + 1) / 2;                                        // scale words per row (2 records each)
@@ -464,7 +473,11 @@ __global__ void __launch_bounds__(WARPS * 32, 2) k_fc2_tc(Args A)
     if (A.n_slots_dev && slot >= *A.n_slots_dev) return;
     const int nt = A.slot_nt[slot], tile0 = A.slot_tile0[slot], ng = dsr::ro_ngroups(nt, NTG);
     if (gy >= ng) return;
-    const int b0 = os * NB / OS, nb = (os + 1) * NB / OS - b0, nstg = nb * NG;   // this CTA's output tile blocks and stages per group
+    static_assert(COL_GROUPS >= 0 && (COL_GROUPS == 0 || NB % COL_GROUPS == 0), "fc2 column groups must contain whole output blocks");
+    constexpr int GNB = COL_GROUPS > 0 ? NB / COL_GROUPS : NB;               // the blocks this launch covers
+    const int gb = fc2_group_block0<COL_GROUPS>(A, GNB);
+    const int b0 = gb + os * GNB / OS, nb = (os + 1) * GNB / OS - (b0 - gb), nstg = nb * NG;   // this CTA's output tile blocks and stages per group
+    if constexpr (COL_GROUPS > 0) { if (nb == 0) return; }
     const uint8_t* s = A.fc2 + dsr::ro_fc2_rec(A.slot_expert[slot], 0, 0, OT, NG) * GR;   // tile ot record r at s + (ot NG + r) GR
     const uint8_t* srca[NA];
     u32 dsta[NA];

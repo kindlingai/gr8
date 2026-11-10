@@ -2,7 +2,7 @@
   "version": 1,
   "title": "GLM-5.3",
   "variant": "exlr8, DFlash2 drafter",
-  "summary": "GLM-5.3 on four DGX Sparks with gr8 at TP=4, docker/.env.example settings, measured 2026-11-09 on gr8 d62cb6b (one boot).",
+  "summary": "GLM-5.3 on four DGX Sparks with gr8 at TP=4, docker/.env.example settings, measured 2026-11-10 on the staged image built from gr8 d62cb6b (one boot).",
   "model": "kindlingai/glm-5.3-exlr8-k2-k3-k4",
   "hardware": "DGX Spark (GB10)",
   "stack": ["gr8", "exlr8", "DFlash2"],
@@ -12,21 +12,22 @@
       "id": "tp4",
       "label": "TP=4",
       "nodes": 4,
-      "decode": {"code": 64.2, "prose": 39.2, "structured": 77.5},
+      "decode": {"code": 63.2, "prose": 38.0, "structured": 77.0},
       "decode_prompt_tokens": [48, 54],
       "prefill": [
-        {"context": 32768, "tps": 1539},
-        {"context": 131072, "tps": 1306}
+        {"context": 32768, "tps": 1513},
+        {"context": 131072, "tps": 1268}
       ],
       "concurrency": [
-        {"streams": 2, "aggregate_tps": 61.9, "per_stream_tps": 34.1, "ttft_p50_s": 0.72},
-        {"streams": 4, "aggregate_tps": 69.1, "per_stream_tps": 23.1, "ttft_p50_s": 1.62},
-        {"streams": 8, "aggregate_tps": 85.6, "per_stream_tps": 13.3, "ttft_p50_s": 3.10}
+        {"streams": 1, "aggregate_tps": 48.6, "per_stream_tps": 51.0, "ttft_p50_s": 0.41},
+        {"streams": 2, "aggregate_tps": 62.5, "per_stream_tps": 34.3, "ttft_p50_s": 0.77},
+        {"streams": 4, "aggregate_tps": 68.9, "per_stream_tps": 22.8, "ttft_p50_s": 1.49},
+        {"streams": 8, "aggregate_tps": 85.4, "per_stream_tps": 13.2, "ttft_p50_s": 3.08}
       ],
       "concurrency_prompt_tokens": [45, 57],
       "max_context": 485362,
       "max_concurrent": 8,
-      "quality": [{"name": "75-item check", "value": "TBD of 75"}]
+      "quality": [{"name": "Needle recall", "value": "found at 128K"}]
     }
   ]
 }

@@ -10,7 +10,7 @@
 int main() {
     constexpr int I=576,H=5120,NE=384,TOPK=6;
     constexpr size_t RS=ds41v2moe::resident_smem<4,8,I>(),SS=mxtc::fc2_smem<4,8,8>();
-    auto resident=ds41v2moe::k_fc2_resident<I,H>;auto stock=ds41v2moe::k_fc2_columns<I,H,4,2,8,8,4>;
+    auto resident=ds41v2moe::k_fc2_resident<I,H>;auto stock=mxtc::k_fc2_tc<I,H,4,2,8,8,4,ds41v2moe::Args>;
     CK(cudaFuncSetAttribute(resident,cudaFuncAttributeMaxDynamicSharedMemorySize,RS));
     CK(cudaFuncSetAttribute(stock,cudaFuncAttributeMaxDynamicSharedMemorySize,SS));
     cudaDeviceProp dev{};int device;CK(cudaGetDevice(&device));CK(cudaGetDeviceProperties(&dev,device));

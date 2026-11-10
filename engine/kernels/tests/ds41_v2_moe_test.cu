@@ -35,7 +35,7 @@ void run(int M, int cut)
     di.put(idx.data());dw.put(wt.data()); CK(cudaMemset(p.p,0xa5,sizeof(Plan))); CK(cudaMemset(masks.p,0,masks.n*4));
     ds41v2moe::k_import_routes<NE,TK,MM><<<(M*8+255)/256,256>>>(di.p,dw.p,M,p.p,masks.p);
     dsr::k_scan_ro<NE,TK,MM><<<1,NE>>>(p.p,masks.p,t0.p);
-    ds41v2moe::k_place_routes<TK,MM><<<(M*TK+255)/256,256>>>(p.p,masks.p,t0.p,M);
+    dsr::k_place_ro<NE,TK,MM,TK,true><<<(M*TK+255)/256,256>>>(p.p,masks.p,t0.p,M);
     CK(cudaGetLastError()); auto got=p.get()[0];
     CHECK(got.n_slots==ref->n_slots && got.n_tiles==ref->n_tiles);
     for(int s=0;s<got.n_slots;++s) CHECK(got.slot_expert[s]==ref->slot_expert[s] && got.slot_tile0[s]==ref->slot_tile0[s] && got.slot_nt[s]==ref->slot_nt[s]);
@@ -65,7 +65,7 @@ void run(int M, int cut)
     args.tile_mask=p.p->tile_mask;args.tile_w=&p.p->tile_w[0][0];args.tile_tok=&p.p->tile_tok[0][0];args.n_slots_dev=&p.p->n_slots;args.n_slots=got.n_slots;
     args.gy2=4;args.os2=16;args.aq=aq.p;args.as=as.p;args.ypart=full.p;
     constexpr size_t SM=mxtc::fc2_smem<4,8,8>();
-    auto kfull=mxtc::k_fc2_tc<I,H,4,2,8,8>;auto kgroup=ds41v2moe::k_fc2_columns<I,H,4,2,8,8,4>;
+    auto kfull=mxtc::k_fc2_tc<I,H,4,2,8,8>;auto kgroup=mxtc::k_fc2_tc<I,H,4,2,8,8,4,ds41v2moe::Args>;
     CK(cudaFuncSetAttribute(kfull,cudaFuncAttributeMaxDynamicSharedMemorySize,SM));
     CK(cudaFuncSetAttribute(kgroup,cudaFuncAttributeMaxDynamicSharedMemorySize,SM));
     kfull<<<args.n_slots*args.gy2*args.os2,128,SM>>>(args);CK(cudaGetLastError());
@@ -118,7 +118,7 @@ void large_plan() {
         CK(cudaMemset(masks.p,0,masks.n*sizeof(unsigned)));
         ds41v2moe::k_import_routes<NE,TK,LM><<<(M*8+255)/256,256>>>(idx.p,wt.p,M,p.p,masks.p);
         dsr::k_scan_ro<NE,TK,LM><<<1,NE>>>(p.p,masks.p,off.p);
-        ds41v2moe::k_place_routes<TK,LM><<<(M*TK+255)/256,256>>>(p.p,masks.p,off.p,M);
+        dsr::k_place_ro<NE,TK,LM,TK,true><<<(M*TK+255)/256,256>>>(p.p,masks.p,off.p,M);
         CK(cudaMemcpy(h.get(),p.p,sizeof(LP),cudaMemcpyDeviceToHost));
         const int nt=(M+7)/8;CHECK(h->n_slots==TK&&h->n_tiles==TK*nt);
         for(int m=0;m<M;++m)for(int k=0;k<TK;++k)CHECK(h->tok_slot[m][k]==k*nt+m/8&&h->tok_col[m][k]==m%8);

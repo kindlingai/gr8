@@ -467,13 +467,18 @@ def validate(o):
         raise OptionError(f'--chunk: ds41 only (the prompt rows a step of the DeepSeek serve path); ./gr8 {model.name} sets its own')
     if o.get('EAGER') is not None and model.name != 'ds41':
         raise OptionError(f'--eager: ds41 only (the DeepSeek serve path runs eagerly without --graph); ./gr8 {model.name} always captures')
+    if o.get('EXACT') is not None and model.name != 'ds41':
+        raise OptionError(f'--exact: ds41 only (the DeepSeek prefill path); ./gr8 {model.name} has one')
+    if o.get('EXACT') not in (None, '0', '1'):
+        raise OptionError(f'--exact {o.get("EXACT")}: want 0 (the release stack, v2 prefill) or 1 (exact output)')
     if any(w.startswith(('GR8_DS_', 'GR8_DS41_')) for w in (o.get('EXTRA_ENV') or '').split()) and model.name != 'ds41':
         raise OptionError(f'--extra-env names a GR8_DS_* variable: those are DeepSeek-V4.1 engine variables, and '
                           f'./gr8 {model.name} serves another model')
     if o.get('GRAMMAR') not in ('0', '1'):
         raise OptionError(f'--grammar {o.get("GRAMMAR")}: want 0 or 1')
-    if o.get('ALLOW_THINKING_OFF') not in ('0', '1'):
-        raise OptionError(f'--allow-thinking-off {o.get("ALLOW_THINKING_OFF")}: want 0 or 1')
+    for k in ('ALLOW_THINKING_OFF', 'CLAMP_MAX_TOKENS'):
+        if o.get(k) not in ('0', '1'):
+            raise OptionError(f'--{k.lower().replace("_", "-")} {o.get(k)}: want 0 or 1')
     if o.get('UNDECLARED_TOOL_CALLS') not in ('text', 'emit'):
         raise OptionError(f'--undeclared-tool-calls {o.get("UNDECLARED_TOOL_CALLS")}: want text or emit')
     for k in ('DEFAULT_PRESENCE_PENALTY', 'DEFAULT_FREQUENCY_PENALTY'):

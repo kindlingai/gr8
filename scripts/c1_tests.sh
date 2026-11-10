@@ -11,7 +11,8 @@
 # decode does: the S2 and solo layer bindings, the shared-expert finalize and the attention consume per row against each
 # session's and each row's own launch; needs EXTRA=-DDEC_S2, else it only prints SKIP) and test_flash_cp (Flash
 # context-parallel decode against the replicated path). headgroup_test, kda_g9_det and test_flash_cp build in one fixed
-# configuration each, whatever GR8_NR and EXTRA say (docs/TESTING.md).
+# configuration each, whatever GR8_NR and EXTRA say (docs/TESTING.md). TEST=ds41_v2 runs the DS41 v2 prefill tests (each
+# in the one configuration its header names).
 #   scripts/c1_tests.sh <bin_dir> [test args]       default bin_dir = ./bin; TEST=row_budget_test|s2_attn_test runs one
 #   GR8_NR=4 scripts/c1_tests.sh bin4               the TP4 build of the test
 #   EXTRA=-DDEC_S2 scripts/c1_tests.sh bin_s2       the 32-row build: M = 1..32 against chunks of 8 (without it: M <= 8)
@@ -176,6 +177,18 @@ if [ "$TEST" = all ] || [ "$TEST" = test_flash_cp ]; then
   # Flash context-parallel decode against the replicated path, every rank of TP=2 on this GPU, 4096-token key tiles
   [ "$TEST" = all ] && ARGS=()
   with_flags "$FLASH_FLAGS -DG6_KV4=1 -DG6_CP=1 -DDEC_S2 -DKP_TILE_POOLS=1024" build_run tests/test_flash_cp || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
+if [ "$TEST" = all ] || [ "$TEST" = ds41_v2 ]; then
+  # the DS41 v2 prefill (GR8_DS_PF_V2) kernels against the stock ones, synthetic data (docs/TESTING.md), each in the one
+  # configuration its header names, whatever GR8_NR and EXTRA say; ds41_v2_fc2_profile is a profile, built by scripts/build.sh
+  ARGS=()
+  for t in attn/tests/ds41_v2_attn_test attn/tests/ds41_v2_index_test kernels/tests/ds41_v2_moe_test runtime/tests/ds41_v2_mhc_test \
+      runtime/tests/ds41_v2_timing_test tests/test_ds41_v2_width tests/test_ds41_v2_wire; do
+    with_flags "" build_run "$t" || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  done
+  for t in runtime/tests/ds41_v2_engram_test runtime/tests/ds41_v2_ffn_test; do
+    with_flags "-DG6_MODEL_DS41=1" build_run "$t" "$REPO/engine/attn/ds41_attn.cu" || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+  done
 fi
 if [ "$rc" = 0 ]; then echo "c1_tests: PASS"; else echo "c1_tests: FAIL (exit $rc)"; fi
 exit "$rc"
