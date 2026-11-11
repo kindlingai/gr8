@@ -189,7 +189,7 @@ response or one stream, with the guard's tokens in the reasoning. The spec is
 | `copies` | 3 | occurrences of one window that fire the guard (2 or more) |
 | `long` | 0 | a verbatim repeat of this many tokens fires it too; 0 = off, else at least `min` |
 | `max` | 2 | triggers per request (1 to 64) |
-| `window` | 4096 | `phrase-close`: how close to the phrase a second trigger must come to close the block (in the replays below a loop came back 1,000 to 2,000 tokens after the phrase, so 512 almost never closed). `log`: the least distance between two logged triggers |
+| `window` | 4096 | `phrase-close`: how close to the phrase a second trigger must come to close the block (in the replays below a loop came back 430 to 6,100 tokens after the phrase, most often about 1,500, so 512 almost never closed). `log`: the least distance between two logged triggers |
 | `text` | `\n\nI'm going in circles. I already have enough to act. I'll decide now and stop re-checking.\n\n` | the phrase. It takes the rest of the spec, commas included, so it comes last. Escapes: `\n`, `\t`, `\\`; any other backslash is an error |
 
 A request's `loop_guard` (the same string; `true` for the server's spec, or these defaults when the server has none;
