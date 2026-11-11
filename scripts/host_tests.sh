@@ -27,6 +27,13 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engin
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/steering_glp_test.cpp" \
   "$REPO/engine/loader/g6pack.cpp" -o "$T/steering_glp_test"
 "$T/steering_glp_test"
+# spark-attic's protocol (engine/attic_proto.h, GR8_ATTIC_SOCK): the request bytes, the replies, a fake atticd that
+# passes descriptors, refuses and hangs up
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine" "$REPO/engine/tests/attic_test.cpp" -o "$T/attic_test"
+"$T/attic_test"
+# ... and after a global namespace `bind`, as in g6m4's translation unit (kernels/bind.cuh)
+printf 'namespace bind { int x; }\n#include "attic_proto.h"\nint main() { return 0; }\n' |
+  g++ -std=c++17 -fsyntax-only -Wall -Wextra -I "$REPO/engine" -x c++ -
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/comms" "$REPO/engine/comms/fabric_mtu_test.cpp" -o "$T/fabric_mtu_test"
 "$T/fabric_mtu_test"
 # the proxy's collective order (engine/comms/fabric_order.h): a plan that publishes out of numeric order stalls without

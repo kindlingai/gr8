@@ -1,6 +1,27 @@
 # The engine runtime: loading, checks, tracing and memory. knobs/README.md describes the fields.
 prefix: "GR8_"
 knobs:
+  GR8_ATTIC_KEY_FILE:
+    scope: local
+    kind: path
+    unset: "atticd's own default key, spark-attic-1"
+    legacy: []
+    doc: >-
+      GR8_ATTIC_SOCK: the file holding the key every request to atticd carries, its whitespace trimmed (1 to 127
+      printable bytes, no space, quote or backslash). A file that cannot be read or a key that cannot be sent lends
+      nothing, with one line saying why.
+  GR8_ATTIC_SOCK:
+    scope: local
+    kind: path
+    unset: "no lender: the weight image is built as GR8_IMG_VMM says, and nothing is printed"
+    legacy: []
+    doc: >-
+      spark-attic (github.com/bertholomus/spark-attic) socket (atticd, /run/spark-attic/attic.sock): the rank borrows one
+      slice of its own box's display carveout (the ~2 GiB the driver reserves for a display, unused on a headless GB10)
+      that spans the weight image's G.embed, imports it and maps the image around it through the CUDA VMM API
+      (engine/attic.h, engine/vmm.h), so the image takes that much less ordinary memory and a larger --cap fits. Same
+      bytes at the same offsets. No daemon, a refusal, a short lend or a slice the driver will not map build the image
+      as without it, after one line saying why.
   GR8_FABRIC_CONNECT_TRIES:
     scope: local
     kind: int

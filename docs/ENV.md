@@ -336,6 +336,8 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 
 | variable | type | unset | values | what it does |
 |---|---|---|---|---|
+| `GR8_ATTIC_KEY_FILE` | path | atticd's own default key, spark-attic-1 |  | GR8_ATTIC_SOCK: the file holding the key every request to atticd carries, its whitespace trimmed (1 to 127 printable bytes, no space, quote or backslash). A file that cannot be read or a key that cannot be sent lends nothing, with one line saying why. |
+| `GR8_ATTIC_SOCK` | path | no lender: the weight image is built as GR8_IMG_VMM says, and nothing is printed |  | spark-attic (github.com/bertholomus/spark-attic) socket (atticd, /run/spark-attic/attic.sock): the rank borrows one slice of its own box's display carveout (the ~2 GiB the driver reserves for a display, unused on a headless GB10) that spans the weight image's G.embed, imports it and maps the image around it through the CUDA VMM API (engine/attic.h, engine/vmm.h), so the image takes that much less ordinary memory and a larger --cap fits. Same bytes at the same offsets. No daemon, a refusal, a short lend or a slice the driver will not map build the image as without it, after one line saying why. |
 | `GR8_DEC_EVPROF` | int | `0` |  | Prints per-stage decode step times from event nodes in the captured main-step graphs every N main steps, in the rank logs. 0: off. |
 | `GR8_DEC_PROF` | flag | `0` |  | Measures decode stages with a synchronize at every mark and prints them per rank. Plain launches only, the engine stops with --graph. |
 | `GR8_DFL_DUMP` | path | unset |  | With --dflash, rank 0 writes every draft step's context features, drafts and committed tokens to this file, for engine/ref/dflash2_replay.py. |
