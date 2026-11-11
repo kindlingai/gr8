@@ -168,8 +168,27 @@ static void mutants_on()
     mutant("on-mode split under GR8_DS_PF_L20_TAIL=0", nf, s, ids);
 }
 
+static void explicit_modes() {
+    const auto ids=range(0,40);
+    for(bool global:{false,true})for(bool engram:{false,true})for(bool dspark:{false,true}) {
+        br::l20_tail()=global;
+        const auto nf=nonfinal(ids,engram,dspark);
+        for(bool l20:{false,true}) {
+            const auto s=br::split_plan(nf,ids,l20);
+            CHECK(s.i_late==(l20?20:21));
+            CHECK(br::check_split(nf,s,ids,l20).empty());
+            CHECK(!br::check_split(nf,s,ids,!l20).empty());
+            CHECK(br::l20_tail()==global);
+            const auto wrapper=br::split_plan(nf,ids);
+            const auto explicit_global=br::split_plan(nf,ids,global);
+            CHECK(same(wrapper.ops,explicit_global.ops));
+        }
+    }
+    br::l20_tail()=false;
+}
 int main()
 {
+    explicit_modes();
     off_mode();
     on_mode();
     mutants_on();

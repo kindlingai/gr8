@@ -1632,7 +1632,7 @@ int main(int argc, char** argv)
             } else fprintf(stderr, "# rank %d DS41 prefill: GR8_DS_PF_V2=1 not used: %s; the old range-A path runs\n", R, v2_off);
         }
         Ds41V2Engine v2engine;
-        const int pf_max = pf_v2 ? ds41::v2::MAX_ROWS : ds41moe::ROMAX;
+        const int pf_max = pf_v2 ? ds41::v2::max_rows(knob::ds_pf_v2_w16k()) : ds41moe::ROMAX;
         // Engram on is allowed with W-row prefill (engine max_rows = W, one chunk in flight -- ds41_prefill_single_lane keeps the engine's one slot safe)
         if (pf_min && (pf_min < 2 || m.hc_rows <= MX || m.hc_rows > pf_max || m.qs.on()))
             die("DS41 W-row prefill needs GR8_DS_PREFILL_MIN>=2, MX<W<=" + std::to_string(pf_max) + ", and QA/QS split off");
@@ -1723,7 +1723,7 @@ int main(int argc, char** argv)
         ds41::br::l20_tail() = knob::ds_pf_l20_tail();   // GR8_DS_PF_L20_TAIL (L1); the value the fabric plan set
         if (ds41::br::l20_tail() && !pf_tail) die("GR8_DS_PF_L20_TAIL=1 needs GR8_DS_PF_TAIL (layer 20 joins the bounded replay)");
         if (pf_v2 && (!pf_min || !ds41::v2::boot_ok(m.hc_rows, pf_tail, g6nr::NR, pf_lanes,
-                                                    ds41::br::late_layer_start())))
+                                                    ds41::br::late_layer_start(), knob::ds_pf_v2_w16k())))
             die("DS41 v2: the boot's prefill settings differ from the fabric plan's (W, tail, lanes, layer 21)");   // a bug, not a setting
         if (pf_v2) {
             v2engine.boot(m,fabv2,st);
@@ -1751,19 +1751,22 @@ int main(int argc, char** argv)
             dc.prefill = [&](const g6s2::Ds41PrefillChunk& c) {
                 g6s2::require(c.slot < (uint32_t)m.ds_slots && c.rows <= (uint32_t)m.hc_rows && c.context <= cap,
                               "DS41 prefill chunk outside the session slots / W / capacity");
+                if (pf_v2) v2engine.v.l20_tail.select(c.request, c.slot, R);
+                const bool use_l20 = ds41::br::l20_tail() || (pf_v2 && pf_tail > 0 && v2engine.v.l20_tail.on);
                 const auto nonfinal = ds41::dsp::pf::nonfinal_plan(m.ds41_plan, dsk.on());
                 const std::string check = ds41::dsp::pf::check_nonfinal_plan(m.ds41_plan, nonfinal, dsk.on());
                 g6s2::require(check.empty(), check.c_str());
-                const ds41::br::Split split = pf_tail ? ds41::br::split_plan(nonfinal, layers) : ds41::br::Split{nonfinal, nonfinal.size(), -1};
-                if (pf_tail) { const std::string sc2 = ds41::br::check_split(nonfinal, split, layers); g6s2::require(sc2.empty(), sc2.c_str()); }
+                const ds41::br::Split split = pf_tail ? ds41::br::split_plan(nonfinal, layers, use_l20) : ds41::br::Split{nonfinal, nonfinal.size(), -1};
+                if (pf_tail) { const std::string sc2 = ds41::br::check_split(nonfinal, split, layers, use_l20); g6s2::require(sc2.empty(), sc2.c_str()); }
                 const int late = split.on() ? ds41::br::late_rows((int)c.rows, pf_tail) : (int)c.rows;
                 g6s2::require(c.prompt_rows > (uint32_t)c.context, "DS41 prefill chunk past the prompt");
                 const int rows_after = int(c.prompt_rows - 1 - (uint32_t)c.context);
                 const bool skip_late = pf_late_final && split.on() && ds41::br::late_skip(rows_after, pf_tail);   // GR8_DS_PF_LATE_FINAL: no range B in this chunk
                 const auto coll = g6s2::ds41_chunk_collectives(layers, m.ecoll, c.rows, (size_t)HID * 2, (size_t)6144 * 2,
                                                                split.on() ? split.i_late : -1, (uint32_t)late, skip_late);
-                for (size_t q = 0; q < coll.sizes.size(); ++q)
-                    g6s2::require(coll.sizes[q] + (size_t)8 <= g6::fab_slot_stride(f, (int)q), "DS41 prefill fabric slot smaller than chunk payload + tail");
+                const auto main_coll = g6s2::ds41_main_chunk_collectives(coll, pf_v2, skip_late, split.on() ? split.i_late : -1, m.nl);
+                for (size_t q = 0; q < main_coll.sizes.size(); ++q)
+                    g6s2::require(main_coll.sizes[q] + (size_t)8 <= g6::fab_slot_stride(f, (int)q), "DS41 prefill fabric slot smaller than chunk payload + tail");
                 for (uint32_t r = 0; r < c.rows; ++r) pf_pos[r] = int(c.first + r);
                 for (int i = 0; i < m.nl; ++i) {
                     const auto v = g6s2::ds41_chunk_cell(c, false); // DS41 has no S2 shared-index page mapping.
@@ -1791,7 +1794,8 @@ int main(int argc, char** argv)
                 g6s2::require(ds41_idx_set_chunk(&m, c.context) == 0, "DS41 prefill index chunk bound refused");
                 if (pf_v2) {
                     const auto& table=ds41_table();
-                    for(int i=0;i<split.i_late;++i)
+                    const int prep_end=(v2engine.v.l20_tail.on && split.i_late<m.nl) ? split.i_late+1 : split.i_late;
+                    for(int i=0;i<prep_end;++i)
                         if(table.prepare_attn && table.prepare_attn(&m,i,(int)c.rows,st))die("DS41 v2 attention prepare failed");
                     if(!skip_late)prepare_ds41_prefill(m,late,st,split.i_late,m.nl);
                 }
@@ -1804,12 +1808,9 @@ int main(int argc, char** argv)
                     // Range A only rings the dedicated fabric. Main fabric must
                     // never wait on those old doorbells; keep just stock B.
                     if(!skip_late) {
-                        auto sizes=coll.sizes; g6::Fabric::Rs late_rs;
-                        for(size_t q=0;q<sizes.size();++q) {
-                            if(q>=size_t(2*split.i_late) && q<size_t(2*m.nl))late_rs.order.push_back(int(q));
-                            else sizes[q]=0;
-                        }
-                        fab.enqueue_step(c.sequence,sizes,late_rs);
+                        g6::Fabric::Rs late_rs;
+                        late_rs.order=main_coll.order;
+                        fab.enqueue_step(c.sequence,main_coll.sizes,late_rs);
                     }
                     m.ds41_rowshard_chunk=false; m.ds41_rowshard_state=false;
                     m.ds41_rowshard_pending_c=-1; m.ds41_y_quant_ready=false;
@@ -1865,14 +1866,18 @@ int main(int argc, char** argv)
                     v2engine.v.attn_pipe.select(c.request,c.slot);
                     if (v2engine.v.attn_pipe.on) ds41_attn_set_pipe(1);
                     ds41::v2::timing_begin_chunk(v2engine.v,c.request,c.first,c.rows);
+                    v2engine.v.send_ffn_opt.select(c.request,c.slot,R);
                     v2engine.run(m,(int)c.rows,split.i_late,skip_late);
                     if (v2engine.v.attn_pipe.on) ds41_attn_set_pipe(0);
                     ds41::v2::timing_end_chunk(v2engine.v);
                 } else stop = ds41_run_pass(split.ops, 0, range_a_end, &m, (int)c.rows, st, span_pass);
                 if (!stop.stopped && split.on() && !skip_late) {   // range B: the layers >= 21 over the chunk's last `late` rows (now rows 0 .. late-1)
+                    const int saved_rs_k=m.ds41_rs_k;
+                    if(pf_v2)m.ds41_rs_k=0;
                     ds41_attn_set_win_floor(ds41::br::win_floor((int)c.context, (int)c.rows, pf_tail));
                     stop = ds41_run_pass(split.ops, split.b, split.ops.size(), &m, late, st, span_pass);
                     ds41_attn_set_win_floor(0);
+                    m.ds41_rs_k=saved_rs_k;
                 }
                 span_pass.close();
                 m.ds41_pf_late = 0;

@@ -77,6 +77,7 @@ struct PlanKnobs
     bool cp_s3 = false;
     std::optional<int64_t> cp_mmax, cp_r2;
     std::optional<std::string> ds_prefill_w, ds_pf_tail, ds_pf_pool, ds_pf_lanes;
+    bool ds_pf_v2_w16k = false;
     bool ds_pf_v2 = false, ds_pf_v2_xtrace = false, ds_sh_tc = false;
     int64_t ds_prefill_min = 0;
     bool ds_pf_l20_tail = false, ds_pf_rs = false, ds_mhc_row_shard = false, ds_mhc_fuse = false, ds_mhc_y_mxfp8 = false;
@@ -99,6 +100,7 @@ inline PlanKnobs plan_knobs()
     k.ds_pf_lanes = knob::ds_pf_lanes(); k.ds_pf_v2 = knob::ds_pf_v2();
     k.ds_sh_tc = knob::ds_sh_tc(); k.ds_prefill_min = knob::ds_prefill_min();
     k.ds_pf_v2_xtrace = knob::ds_pf_v2_xtrace();
+    k.ds_pf_v2_w16k = knob::ds_pf_v2_w16k();
     k.ds_pf_v2_stripe_min = knob::ds_pf_v2_stripe_min();
     k.ds_pf_l20_tail = knob::ds_pf_l20_tail(); k.ds_pf_rs = knob::ds_pf_rs(); k.ds_mhc_row_shard = knob::ds_mhc_row_shard();
     k.ds_mhc_fuse = knob::ds_mhc_fuse(); k.ds_mhc_y_mxfp8 = knob::ds_mhc_y_mxfp8();
@@ -184,10 +186,11 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
     g6::FabricConfig cmB;               // GR8_DS_PF_LANES=2: lane B's runs
     // A W-row headless prefill chunk uses the same fabric as decode; unset, the slot holds MX rows.
     if (s2mode) {
-        const int pf_rows = ds41_prefill_rowcap(txt(k.ds_prefill_w), MX, k.ds_pf_v2);
-        if (!pf_rows) return k.ds_pf_v2 ? "DS41 v2 serve: GR8_DS_PREFILL_W must be MX..8192" : "DS41 serve: GR8_DS_PREFILL_W must be MX..4096";
+        const int pf_rows = ds41_prefill_rowcap(txt(k.ds_prefill_w), MX, k.ds_pf_v2, k.ds_pf_v2_w16k);
+        if (!pf_rows) return k.ds_pf_v2 ? (k.ds_pf_v2_w16k ? "DS41 v2 serve: GR8_DS_PREFILL_W must be MX..16384" : "DS41 v2 serve: GR8_DS_PREFILL_W must be MX..8192") : "DS41 serve: GR8_DS_PREFILL_W must be MX..4096";
         p.pf_rows = pf_rows;
-        cfg.slot_bytes = ds41_prefill_fabric_payload(pf_rows, HID, NX ? 6144 : 0);
+        const int main_pf_rows = ds41_prefill_main_fabric_rows(pf_rows, k.ds_pf_v2, k.ds_pf_v2_w16k);
+        cfg.slot_bytes = ds41_prefill_fabric_payload(main_pf_rows, HID, NX ? 6144 : 0);
         // the main fabric's slots sized per collective as a W chunk sends them (s2/ds41_prefill.h ds41_chunk_collectives):
         // [0, c1) layer exchanges of W rows; [c1, 2 NL + 1) the bounded-replay layers and the head; [2 NL + 1, NC) the
         // Engram reduces of W rows. Every run also holds the decode slot.
@@ -221,7 +224,7 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
             p.y_mxfp8 = true;
             p.log.push_back(fmt("# rank %d: GR8_DS_MHC_Y_MXFP8=1 lossy y all-gather\n", cfg.rank));
         }
-        const auto runs = ds41::pf::fabric_runs(pf_rows, tail, i_late, eo.NL, NX, MX, HID, g6nr::NR, in.head_payload, pf_rs_on,
+        const auto runs = ds41::pf::fabric_runs(main_pf_rows, tail, i_late, eo.NL, NX, MX, HID, g6nr::NR, in.head_payload, pf_rs_on,
                                                 eo.c8_pack_env == 1, p.rowshard);
         cm = runs.cfg;
         p.rs_k = runs.rs_k;
@@ -240,7 +243,7 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
         p.pf_lanes_fab = ds41::lanes::parse(txt(k.ds_pf_lanes));
         if (!p.pf_lanes_fab) return ds41::lanes::kParseError;
         if (p.pf_lanes_fab == 2) {
-            const auto rb = ds41::lanes::fabric_runs_b(pf_rows, tail, i_late, eo.NL, NX, MX, HID, g6nr::NR, in.head_payload, pf_rs_on,
+            const auto rb = ds41::lanes::fabric_runs_b(main_pf_rows, tail, i_late, eo.NL, NX, MX, HID, g6nr::NR, in.head_payload, pf_rs_on,
                                                        p.rowshard);
             if (rb.rs_k != p.rs_k || rb.cfg.run1 != cm.run1 || rb.cfg.ncoll != cm.ncoll)
                 return "DS41 lane B fabric: its runs or row-shard state collective differ from the main fabric's";
@@ -288,6 +291,7 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
     // and runs layers 0..20 on the old range-A path.
     if (k.ds_pf_v2) {
         ds41::v2::BootIn b;
+        b.w16k = k.ds_pf_v2_w16k;
         b.serve = s2mode; b.prefill = k.ds_prefill_min > 0; b.width = p.pf_rows; b.tail = p.tail; b.nr = g6nr::NR;
         b.lanes = p.pf_lanes_fab; b.late_layer = p.l20_tail ? 20 : ds41::v2::FIRST_LATE;
         b.sh_tc = k.ds_sh_tc; b.row_shard = k.ds_mhc_row_shard;
@@ -307,6 +311,8 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
             ? std::max(vc.stripe_min,size_t(8192)) : 0;
         p.log.push_back(fmt("# ds41_v2_stripe min=%zu rails=%d effective_min=%zu\n",
                             vc.stripe_min,rails,effective));
+        if (k.ds_pf_v2_w16k)
+            p.log.push_back(fmt("# ds41_v2_w16k on=1 pf_rows=%d main_pf_rows=%d\n", p.pf_rows, ds41_prefill_main_fabric_rows(p.pf_rows, k.ds_pf_v2, k.ds_pf_v2_w16k)));
         add(FabKind::Ds41V2,104,vc);
     }
     // GR8_DS_PF_LANES=2: lane B's own fabric, port + 96, proxy core N-2 (DS41 builds no fabp / fabp2)

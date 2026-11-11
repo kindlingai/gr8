@@ -9,9 +9,13 @@
 #include "../comms/fabric.h"
 #include "ds41_v2_width.h"
 #include "ds41_v2_attn_pipe.h"
+#include "ds41_v2_l20_tail.h"
+#include "ds41_v2_send_ffn_opt.h"
 
 namespace ds41::v2 {
 constexpr int MAX_ROWS = 8192;
+constexpr int MAX_ROWS_W16K = 16384;
+inline int max_rows(bool w16k = false) { return w16k ? MAX_ROWS_W16K : MAX_ROWS; }
 constexpr int FIRST_LATE = 21;
 constexpr int COLUMN_GROUPS = 4;
 constexpr int MAX_SEGMENTS = 8;
@@ -22,19 +26,20 @@ struct Geometry {
     int M = 0, Q = 0, row0 = 0, owned = 0, rank = 0, nr = 0;
     int padded() const { return Q * nr; }
 };
-inline Geometry geometry(int M, int nr, int rank) {
-    if (M < 1 || M > MAX_ROWS || nr < 1 || rank < 0 || rank >= nr) return {};
+inline Geometry geometry(int M, int nr, int rank, int max_m = MAX_ROWS_W16K) {
+    if (M < 1 || M > max_m || nr < 1 || rank < 0 || rank >= nr) return {};
     const int Q = (M + nr - 1) / nr;
     return {M, Q, rank * Q, std::max(0, std::min(Q, M - rank * Q)), rank, nr};
 }
-inline bool boot_ok(int width, int tail, int nr, int lanes, int late_layer) {
-    return nr == 4 && width >= 256 && width <= MAX_ROWS && width % 256 == 0 &&
+inline bool boot_ok(int width, int tail, int nr, int lanes, int late_layer, bool w16k = false) {
+    return nr == 4 && width >= 256 && width <= max_rows(w16k) && width % 256 == 0 &&
            tail == 128 && lanes == 1 && late_layer == FIRST_LATE;
 }
 // GR8_DS_PF_V2=1 asks for v2; the boot runs it only where these hold. Anything else is not an error:
 // layers 0..20 then run the old range-A path (the stock ops), and the boot logs one line with the reason.
 // Knob-time inputs (the fabric plan sees them); the release's experts are checked after the weights bind.
 struct BootIn {
+    bool w16k = false;
     bool serve = false;       // g6m4 --serve (offline g6m4 and m4sim are not)
     bool prefill = false;     // W-row prefill admitted (GR8_DS_PREFILL_MIN > 0)
     int width = 0, tail = 0, nr = 0, lanes = 1, late_layer = FIRST_LATE;
@@ -46,7 +51,8 @@ inline const char* fallback_reason(const BootIn& b) {
     if (!b.serve) return "not a serve run (offline or simulator)";
     if (!b.prefill) return "no W-row prefill (GR8_DS_PREFILL_MIN=0)";
     if (b.nr != 4) return "TP is not 4";
-    if (b.width < 256 || b.width > MAX_ROWS || b.width % 256) return "GR8_DS_PREFILL_W is not 256..8192 in steps of 256";
+    if (b.width < 256 || b.width > max_rows(b.w16k) || b.width % 256)
+        return b.w16k ? "GR8_DS_PREFILL_W is not 256..16384 in steps of 256" : "GR8_DS_PREFILL_W is not 256..8192 in steps of 256";
     if (b.tail != 128) return "GR8_DS_PF_TAIL is not 128";
     if (b.lanes != 1) return "GR8_DS_PF_LANES is not 1";
     if (b.late_layer != FIRST_LATE) return "GR8_DS_PF_L20_TAIL=1 moves the late range to layer 20";
@@ -80,6 +86,11 @@ inline std::vector<int> layer_order(bool engram, bool index, bool tail, bool can
     for (int c = 0; c < COLUMN_GROUPS; ++c) o.push_back(int(ffn_group(c)));
     if (tail) o.push_back(int(Coll::Tail));
     return o;
+}
+
+inline std::vector<int> l20_tail_order(bool tail) {
+    return tail ? std::vector<int>{int(Coll::AttnIn), int(Coll::Tail)}
+                : std::vector<int>{int(Coll::AttnIn)};
 }
 
 // AG: src [owned][row_bytes] -> dst [M][row_bytes]. No reader consumes padding.
@@ -160,6 +171,8 @@ struct State {
     Timing* timing = nullptr;
     CommWidths widths;
     AttnPipe attn_pipe;
+    L20Tail l20_tail;
+    SendFfnOpt send_ffn_opt;
     cudaStream_t st = nullptr, cs = nullptr;
     cudaEvent_t produced[int(Coll::Count)] = {}, received[int(Coll::Count)] = {};
     g6::Fabric* fabric = nullptr;
@@ -183,6 +196,7 @@ struct State {
 void init(State&, g6::Fabric&, cudaStream_t compute);
 void release(State&);
 void begin_layer(State&, Geometry, bool engram, bool index, bool tail = false, bool candidates = false);
+void begin_l20_tail(State&, Geometry, bool tail);
 void end_layer(State&);
 void fork(State&, Coll);               // st producer -> cs
 void record_received(State&, Coll);    // after cs remote work, before local join
@@ -194,6 +208,8 @@ void join(State&, Coll);               // cs -> st at first remote consumer
 // in FP32 and stores bf16, matching the current mHC input representation.
 void all_gather(State&, Coll, const Segment*, int count, cudaStream_t);
 void all_to_all(State&, Coll, const Segment*, int count, cudaStream_t);
+void attn_out_a2a_opt(State&, const uint8_t* oaq, const uint8_t* oas, int K, void* output_recv);
+void all_gather_ffn_in(State&, const Segment*, int count, uint8_t* record_q, int H, cudaStream_t);
 void reduce_scatter(State&, int group, const __nv_bfloat16* all_rows,
                     __nv_bfloat16* own_rows, int columns, cudaStream_t);
 

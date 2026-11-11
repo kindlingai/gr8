@@ -132,8 +132,8 @@ inline void build_ds41(Model& m,int rank,const std::vector<int>& ids,const Find&
     if(max_rows>MX) die("DS41 build: decode rows only (no prefill) -- max_rows above MX");
     // W is the prefill row budget; decode and verify graphs stay at MX (prepare_ds41 refuses M > MX,
     // W-row chunks use prepare_ds41_prefill). The attention and indexer row budgets must equal W.
-    const int prefill_rows=ds41_prefill_rowcap(DS41_TEXT(knob::ds_prefill_w()),MX,knob::ds_pf_v2());
-    if(!prefill_rows) die("DS41 build: GR8_DS_PREFILL_W must be MX..4096 (8192 with PF_V2)");
+    const int prefill_rows=ds41_prefill_rowcap(DS41_TEXT(knob::ds_prefill_w()),MX,knob::ds_pf_v2(),knob::ds_pf_v2_w16k());
+    if(!prefill_rows) die(knob::ds_pf_v2() && knob::ds_pf_v2_w16k() ? "DS41 build: GR8_DS_PREFILL_W must be MX..16384 (PF_V2 + PF_V2_W16K)" : "DS41 build: GR8_DS_PREFILL_W must be MX..4096 (8192 with PF_V2)");
     if(prefill_rows>MX) {
         const int aw=std::max<int>(MX,(int)knob::ds_attn_pw()),iw=std::max<int>(MX,(int)knob::ds41_idx_pw().value_or(MX));
         if(aw!=prefill_rows || iw!=prefill_rows)
@@ -148,7 +148,8 @@ inline void build_ds41(Model& m,int rank,const std::vector<int>& ids,const Find&
     if(const char* e=::ds41::rs::fabric_ncoll_error(f.ncoll,m.ncoll(),ag,draft,rowshard)) die(e);
     // slots of prefill_rows * 6144 * 2 B + the doorbell word: MX rows in the decode build, W rows with GR8_DS_PREFILL_W (the boot's slot_bytes; the engram
     // collective is wider than the hidden one: 12,288 B per row against 10,240)
-    if(engram_on && g6::fab_slot_stride(f,2*m.nl+1)<(size_t)prefill_rows*ds41::engram::kEmbDim*2+8) die("DS41 Engram: the fabric slots are smaller than prefill rows (MX or GR8_DS_PREFILL_W) * 6144 * 2 bytes + 8");
+    const int main_pf_rows=ds41_prefill_main_fabric_rows(prefill_rows,knob::ds_pf_v2(),knob::ds_pf_v2_w16k());
+    if(engram_on && g6::fab_slot_stride(f,2*m.nl+1)<(size_t)main_pf_rows*ds41::engram::kEmbDim*2+8) die("DS41 Engram: the fabric slots are smaller than prefill rows (MX or GR8_DS_PREFILL_W) * 6144 * 2 bytes + 8");
     m.nbk=context_buckets(m.bk,(int)knob::dec_bk(),capacity,0);
 #ifdef DEC_S2
     m.s2_run_pages=(capacity+63)/64;
@@ -253,7 +254,7 @@ inline void build_ds41(Model& m,int rank,const std::vector<int>& ids,const Find&
         // The Engram engine. Fail closed on a missing or corrupt sidecar, a wrong rank/tp or a wrong cmap sha (docs/DEEPSEEK-ENGRAM.md)
         m.win=dmalloc<int32_t>((size_t)prefill_rows*4); m.ehist=dmalloc<int32_t>((size_t)m.ds_slots*ENG_RING);
         ds41::engram::Config ec; std::string eerr;
-        ec.prefix=ek.prefix; ec.rank=rank; ec.nr=g6nr::NR; ec.max_rows=prefill_rows; ec.knobs=ek; ec.prefill_v2=knob::ds_pf_v2();
+        ec.prefix=ek.prefix; ec.rank=rank; ec.nr=g6nr::NR; ec.max_rows=prefill_rows; ec.knobs=ek; ec.prefill_v2=knob::ds_pf_v2(); ec.prefill_v2_w16k=knob::ds_pf_v2_w16k();
         for(int e=0;e<ds41::engram::kNE;++e) {
             const int l=ds41::engram::kLayerIds[e];
             const TensorRef q=find(lname(l,"engram.q_weight")),k=find(lname(l,"engram.k_weight"));

@@ -104,6 +104,11 @@ inline void output_b(const Fp8Mat& W, const uint8_t* wire, bf16* out, int rows, 
     const int stride = W.K * 33 / 32;
     proj_mm(W, wire, stride, wire + W.K, stride, xf, false, out, W.N, rows, 1, 0, 0, 0, st);
 }
+inline void output_b_split(const Fp8Mat& W, const uint8_t* codes, const uint8_t* scales,
+                           bf16* out, int rows, uint32_t* xf, cudaStream_t st) {
+    if (!rows) return;
+    proj_mm(W, codes, W.K, scales, W.K / 32, xf, false, out, W.N, rows, 1, 0, 0, 0, st);
+}
 __global__ void k_sum_output(const bf16* parts, bf16* out, int rows, int q, int nr)
 {
     const size_t x = size_t(blockIdx.x) * blockDim.x + threadIdx.x;

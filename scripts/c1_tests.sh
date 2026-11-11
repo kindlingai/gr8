@@ -182,11 +182,12 @@ if [ "$TEST" = all ] || [ "$TEST" = ds41_v2 ]; then
   # the DS41 v2 prefill (GR8_DS_PF_V2) kernels against the stock ones, synthetic data (docs/TESTING.md), each in the one
   # configuration its header names, whatever GR8_NR and EXTRA say; ds41_v2_fc2_profile is a profile, built by scripts/build.sh
   ARGS=()
+  with_flags "-DG6_MODEL_DS41=1" build_run attn/tests/ds41_v2_l20_tail_test "$REPO/engine/attn/ds41_bind.cu" "$REPO/engine/attn/ds41_attn.cu" || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   for t in attn/tests/ds41_v2_attn_test attn/tests/ds41_v2_index_test kernels/tests/ds41_v2_moe_test runtime/tests/ds41_v2_mhc_test \
       runtime/tests/ds41_v2_timing_test tests/test_ds41_v2_width tests/test_ds41_v2_wire; do
     with_flags "" build_run "$t" || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   done
-  for t in runtime/tests/ds41_v2_engram_test runtime/tests/ds41_v2_ffn_test; do
+  for t in runtime/tests/ds41_v2_w16k_test runtime/tests/ds41_v2_engram_test runtime/tests/ds41_v2_ffn_test tests/test_ds41_v2_send_ffn_opt_gpu tests/test_ds41_v2_s8_combo_gpu; do
     with_flags "-DG6_MODEL_DS41=1" build_run "$t" "$REPO/engine/attn/ds41_attn.cu" || { r=$?; [ "$rc" = 0 ] && rc=$r; }
   done
 fi

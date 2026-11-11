@@ -133,4 +133,19 @@ inline Ds41ChunkColl ds41_chunk_collectives(const std::vector<int>& ids, int eco
     }
     return o;
 }
+// Under v2 the main transport carries only the late replay interval.
+inline Ds41ChunkColl ds41_main_chunk_collectives(const Ds41ChunkColl& coll, bool pf_v2, bool skip_late, int i_late, int nl) {
+    if (!pf_v2) return coll;
+    require(i_late > 0 && i_late < nl, "DS41 v2 main collectives: invalid late split");
+    if (skip_late) return {};
+    require(coll.sizes.size() >= size_t(2 * nl), "DS41 v2 main collectives: missing layer slots");
+    Ds41ChunkColl result;
+    result.sizes = coll.sizes;
+    for (size_t c = 0; c < result.sizes.size(); ++c) {
+        if (c >= size_t(2 * i_late) && c < size_t(2 * nl)) result.order.push_back(int(c));
+        else result.sizes[c] = 0;
+    }
+    return result;
+}
+
 }

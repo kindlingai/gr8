@@ -190,6 +190,10 @@ void ds41_v2_output_pack(const ds41a::Scratch* s, uint8_t* wire, int n, int padd
 void ds41_v2_output_b(const ds41a::Fp8Mat* w, const uint8_t* wire, void* out, int n, uint32_t* xf, void* st) {
     ds41a::v2::output_b(*w, wire, (ds41a::bf16*)out, n, xf, (cudaStream_t)st);
 }
+void ds41_v2_output_b_split(const ds41a::Fp8Mat* W, const uint8_t* codes, const uint8_t* scales,
+                             void* out, int rows, uint32_t* xf, void* st) {
+    ds41a::v2::output_b_split(*W, codes, scales, (ds41a::bf16*)out, rows, xf, (cudaStream_t)st);
+}
 void ds41_v2_output_sum(const void* parts, void* out, int n, int q, int nr, void* st) {
     ds41a::v2::sum_output((const ds41a::bf16*)parts, (ds41a::bf16*)out, n, q, nr, (cudaStream_t)st);
 }

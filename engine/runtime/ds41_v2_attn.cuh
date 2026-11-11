@@ -187,17 +187,28 @@ inline void ds41_v2_attention(::ds41::v2::State& v, Model& m, int i, const __nv_
     ds41_v2_attn_index(v, *x, m, i, own_y);
     if (ds41_attn_op_core(&m, i, v.g.M, v.st)) die("DS41 v2 attention: core failed");
     ds41_v2_output_a(&a->W, &a->S, v.g.M, a->heads, v.st, m.pos);
-    ds41_v2_output_pack(&a->S, x->output_send, v.g.M, v.g.padded(), a->heads, v.st);
     const size_t stride = ds41a::v2::output_stride(a->heads);
-    ::ds41::v2::Segment out{x->output_send, x->output_recv, stride};
-    ::ds41::v2::fork(v, Coll::AttnOut);
-    ::ds41::v2::all_to_all(v, Coll::AttnOut, &out, 1, v.cs);
-    ::ds41::v2::record_received(v, Coll::AttnOut);
-    // Local source slice has no dependency on the exchange's receive buffer.
-    {
-        ::ds41::v2::TimingSpan timer(v, ::ds41::v2::TimingStage::WoBOwn, v.st, m.rank);
-        ds41_v2_output_b(&x->wob[i][m.rank], x->output_send + size_t(v.g.row0) * stride,
-                         x->parts + size_t(m.rank) * v.g.Q * ds41a::HID, n, a->S.xf_oa, v.st);
+    if (v.send_ffn_opt.attn_opt()) {
+        const int K = ds41a::v2::output_width(a->heads);
+        ::ds41::v2::attn_out_a2a_opt(v, a->S.oaq, a->S.oas, K, x->output_recv);
+        {
+            ::ds41::v2::TimingSpan timer(v, ::ds41::v2::TimingStage::WoBOwn, v.st, m.rank);
+            ds41_v2_output_b_split(&x->wob[i][m.rank],
+                a->S.oaq + size_t(v.g.row0) * K, a->S.oas + size_t(v.g.row0) * (K / 32),
+                x->parts + size_t(m.rank) * v.g.Q * ds41a::HID, n, a->S.xf_oa, v.st);
+        }
+    } else {
+        ds41_v2_output_pack(&a->S, x->output_send, v.g.M, v.g.padded(), a->heads, v.st);
+        ::ds41::v2::Segment out{x->output_send, x->output_recv, stride};
+        ::ds41::v2::fork(v, Coll::AttnOut);
+        ::ds41::v2::all_to_all(v, Coll::AttnOut, &out, 1, v.cs);
+        ::ds41::v2::record_received(v, Coll::AttnOut);
+        // Local source slice has no dependency on the exchange's receive buffer.
+        {
+            ::ds41::v2::TimingSpan timer(v, ::ds41::v2::TimingStage::WoBOwn, v.st, m.rank);
+            ds41_v2_output_b(&x->wob[i][m.rank], x->output_send + size_t(v.g.row0) * stride,
+                             x->parts + size_t(m.rank) * v.g.Q * ds41a::HID, n, a->S.xf_oa, v.st);
+        }
     }
     ::ds41::v2::join(v, Coll::AttnOut);
     for (int p = 0; p < g6nr::NR; ++p) {
@@ -207,5 +218,30 @@ inline void ds41_v2_attention(::ds41::v2::State& v, Model& m, int i, const __nv_
                          x->parts + size_t(p) * v.g.Q * ds41a::HID, n, a->S.xf_oa, v.st);
     }
     ds41_v2_output_sum(x->parts, own_out, n, v.g.Q, g6nr::NR, v.st);
+}
+
+inline void ds41_v2_attn_l20_ca_row(::ds41::v2::State& v, Model& m, int i, const __nv_bfloat16* own_y) {
+    ::ds41::v2::TimingDetailSpan timer(v, ::ds41::v2::TimingStage::Attention, v.st);
+    auto* x=static_cast<Ds41V2Attention*>(v.attn);
+    if(!x || i<0 || i>=m.nl || m.layers[i].l!=geom::CAND_SOURCE || v.g.M>x->rows || v.g.Q>x->q ||
+       v.g.nr!=g6nr::NR || v.g.rank!=m.rank || m.ds41_pack || m.ds_ns!=1)
+        die("DS41 v2 l20_ca_row: invalid chunk");
+    auto* a=ds41_attn_state(m,i);
+    if(!a || ds41_attn_sessions(m,a,v.g.M))die("DS41 v2 l20_ca_row: invalid single-session chunk");
+    auto* s=ds41_idx_detail::find(m,false);
+    const int kix=ds41_idx_detail::kvix(geom::CAND_SOURCE);
+    if(!s || kix<0 || v.g.M>s->rcap || !s->ica[kix] || !s->ca[kix] || !s->lay[i].bound || !s->lay[i].cmp_wkv)
+        die("DS41 v2 l20_ca_row: missing layer20 cache binding");
+    s->cand_ready=false;
+    static_assert(ds41a::v2::input_stride(2)>=int(ds41a::HD*sizeof(__nv_bfloat16)),"input_send holds BF16 ckv1");
+    auto* ckv1_own=reinterpret_cast<__nv_bfloat16*>(x->input_send);
+    if(v.g.owned)
+        ds41_idx_gemv(own_y,ds41a::HID,s->lay[i].cmp_wkv,ds41a::HD,ds41a::HID,ckv1_own,ds41a::HD,v.g.owned,v.st);
+    ::ds41::v2::Segment seg{ckv1_own,x->in.ckv1,size_t(ds41a::HD)*sizeof(__nv_bfloat16)};
+    ::ds41::v2::all_gather(v,::ds41::v2::Coll::AttnIn,&seg,1,v.st);
+    const auto& w=s->lay[i];
+    const int* pages=ds41_idx_detail::pages_of(m,*s,0);
+    ds41_idx_ca_row_r1(x->in.ckv1,w.cmp_norm,m.pos,s->ca[kix],pages,s->rows_kv[kix],s->pre,s->shadow,v.g.M,v.st);
+    ds41_idx_ica_row(s->pre,w.idx_wk,w.idx_knorm,m.pos,1,s->ica[kix],pages,s->rows_kv[kix],v.g.M,v.st);
 }
 #endif

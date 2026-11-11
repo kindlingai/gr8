@@ -10,5 +10,6 @@ void ds41_v2_comp_rest(const ds41a::Weights*, ds41a::Cache*, const ds41a::Scratc
 void ds41_v2_output_a(const ds41a::Weights*, const ds41a::Scratch*, int, int, void*, const int*);
 void ds41_v2_output_pack(const ds41a::Scratch*, uint8_t*, int, int, int, void*);
 void ds41_v2_output_b(const ds41a::Fp8Mat*, const uint8_t*, void*, int, uint32_t*, void*);
+void ds41_v2_output_b_split(const ds41a::Fp8Mat*, const uint8_t*, const uint8_t*, void*, int, uint32_t*, void*);
 void ds41_v2_output_sum(const void*, void*, int, int, int, void*);
 }

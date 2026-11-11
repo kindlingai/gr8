@@ -254,8 +254,8 @@ class Ds41Tests(unittest.TestCase):
         self.assertIn('DeepSeek-V4.1 engine variables', str(e.exception))
 
     # the release stack's prefill words (docs/DEEPSEEK.md): the plain default; the fast decode words stay out
-    V2 = ('GR8_DS_PF_V2=1', 'GR8_DS_PF_LANES=1', 'GR8_DS_PF_TAIL=128', 'GR8_DS_SH_TC=1', 'GR8_DS_PREFILL_W=8192', 'GR8_DS_ATTN_PW=8192',
-          'GR8_DS41_IDX_PW=8192', 'GR8_DS_PF_V2_GATE_RO=1', 'GR8_DS_PF_V2_STRIPE_MIN=1048576', 'GR8_DS_PF_V2_ATTN_PIPE=1',
+    V2 = ('GR8_DS_PF_V2_L20_TAIL=1', 'GR8_DS_PF_V2_SEND_FFN_OPT=3', 'GR8_DS_PF_V2_W16K=1', 'GR8_DS_PF_V2=1', 'GR8_DS_PF_LANES=1', 'GR8_DS_PF_TAIL=128', 'GR8_DS_SH_TC=1', 'GR8_DS_PREFILL_W=12288', 'GR8_DS_ATTN_PW=12288',
+          'GR8_DS41_IDX_PW=12288', 'GR8_DS_PF_V2_GATE_RO=1', 'GR8_DS_PF_V2_STRIPE_MIN=1048576', 'GR8_DS_PF_V2_ATTN_PIPE=1',
           'GR8_DS_ENGRAM_IO_THREADS=64', 'GR8_DS_ATTN_TC_TILE=2', 'GR8_S2_ADMIT_HOLD=1', 'GR8_S2_TAIL_FIRST=1', 'GR8_S2_DECODE_PF=1024')
     FAST = ('GR8_DS_RELAXED_ACCEPT', 'GR8_DS_MOE_TOPK_DECODE', 'GR8_DS41_HEAD_MX', 'GR8_DS_ATTN_TC_MF')
 
@@ -265,6 +265,15 @@ class Ds41Tests(unittest.TestCase):
             self.assertEqual([w for w in env if w.startswith(e.split('=')[0] + '=')], [e])
         self.assertFalse([w for w in env if w.startswith(self.FAST)])
         self.assertFalse([w for w in env if w.startswith(('GR8_DS_MHC_ROW_SHARD=', 'GR8_DS_MHC_Y_MXFP8='))])   # engine defaults: 0
+
+    def test_v2_width_overrides(self):
+        for override in ('GR8_DS_PF_V2_W16K=0', 'GR8_DS_PREFILL_W=8192'):
+            env = opt.engine_plan(ds41('--extra-env', override))['env']
+            for key in ('GR8_DS_PREFILL_W', 'GR8_DS_ATTN_PW', 'GR8_DS41_IDX_PW'):
+                self.assertEqual([w for w in env if w.startswith(key + '=')], [key + '=8192'])
+            self.assertNotIn('GR8_DS_PF_V2_W16K=1', env)
+            if override.endswith('W16K=0'):
+                self.assertEqual(env.count(override), 1)
 
     def test_exact_output_is_the_old_prefill(self):
         # EXACT=1, EXTRA_ENV GR8_DS_PF_V2=0 and the 1M-context row split: today's stack, two lanes, W 4096, no v2 word
@@ -300,7 +309,7 @@ class Ds41Tests(unittest.TestCase):
     def test_engine_plan(self):
         plan = opt.engine_plan(ds41())
         self.assertEqual((plan['knobs']['MTP'], plan['knobs']['SESS'], plan['knobs']['CAP']), ('0', '5', '262144'))
-        for e in ('GR8_CP=0', 'GR8_DEC_BK=262144', 'GR8_DS_MTP=5', 'GR8_DS_PREFILL_W=8192', 'GR8_DS_ATTN_PW=8192', 'GR8_DS_PF_LANES=1', 'GR8_DS_ATTN_TC=1', 'GR8_DS_MOE_TC=1',
+        for e in ('GR8_CP=0', 'GR8_DEC_BK=262144', 'GR8_DS_MTP=5', 'GR8_DS_PREFILL_W=12288', 'GR8_DS_ATTN_PW=12288', 'GR8_DS_PF_LANES=1', 'GR8_DS_ATTN_TC=1', 'GR8_DS_MOE_TC=1',
                   'GR8_DS_PF_POOL=4', 'GR8_DS_SRC_FAST=3', 'GR8_DS_MOE_PDL=1', 'GR8_DS41_ADMIT_KEEP_SCRATCH=1', 'GR8_DS41_PUB16=1',
                   'GR8_DS41_GV_QUAD=1', 'GR8_S2_DECODE_PF=1024', 'GR8_DS_COMP_FP4=1'):
             self.assertIn(e, plan['env'])

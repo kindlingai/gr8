@@ -213,10 +213,11 @@ build test_flash_cp $NVCC -O2 -std=c++17 $GEN -DG6_MODEL_FLASH=1 -DG6_KV4=1 -DG6
 # the DS41 v2 prefill (GR8_DS_PF_V2) GPU tests: each against the stock kernels on synthetic data, one GPU, no model or fabric.
 # Built here (CI's tests leg compiles them), run by scripts/c1_tests.sh (TEST=ds41_v2). ds41_v2_fc2_profile is a profile.
 DS41_V2_TESTS="attn/tests/ds41_v2_attn_test attn/tests/ds41_v2_index_test kernels/tests/ds41_v2_moe_test kernels/tests/ds41_v2_fc2_profile
-runtime/tests/ds41_v2_engram_test runtime/tests/ds41_v2_ffn_test runtime/tests/ds41_v2_mhc_test runtime/tests/ds41_v2_timing_test
-tests/test_ds41_v2_width tests/test_ds41_v2_wire"
+runtime/tests/ds41_v2_w16k_test runtime/tests/ds41_v2_engram_test runtime/tests/ds41_v2_ffn_test runtime/tests/ds41_v2_mhc_test runtime/tests/ds41_v2_timing_test
+tests/test_ds41_v2_width tests/test_ds41_v2_wire
+attn/tests/ds41_v2_l20_tail_test tests/test_ds41_v2_send_ffn_opt_gpu tests/test_ds41_v2_s8_combo_gpu"
 for t in $DS41_V2_TESTS; do
-  case $t in *engram_test|*ffn_test) x=(-DG6_MODEL_DS41=1 "$REPO/engine/attn/ds41_attn.cu") ;; *) x=() ;; esac   # the shared-expert entries
+  case $t in *l20_tail_test) x=(-DG6_MODEL_DS41=1 "$REPO/engine/attn/ds41_bind.cu" "$REPO/engine/attn/ds41_attn.cu") ;; *w16k_test|*engram_test|*ffn_test|*send_ffn_opt_gpu|*s8_combo_gpu) x=(-DG6_MODEL_DS41=1 "$REPO/engine/attn/ds41_attn.cu") ;; *) x=() ;; esac   # the shared-expert entries
   # shellcheck disable=SC2086
   build "${t##*/}" $NVCC -O2 -std=c++17 $GEN -o "$OUT/${t##*/}" "$REPO/engine/$t.cu" "${x[@]}" "${KNOBS[@]}"
 done
@@ -258,7 +259,7 @@ else
   echo "tr3_e4m3_test and the steering tests ($STEERING): compiled; no GPU visible, not run"
 fi
 echo "dtr_test_tp4, dtr_test_flash_tp4, l2pf_bench, test_flash_cp: built (they need release files or an idle GPU)"
-echo "the DS41 v2 GPU tests ($(for t in $DS41_V2_TESTS; do printf '%s ' "${t##*/}"; done | sed 's/ $//')): built; TEST=ds41_v2 scripts/c1_tests.sh runs the 9 tests (ds41_v2_fc2_profile is a profile, built only)"
+echo "the DS41 v2 GPU tests ($(for t in $DS41_V2_TESTS; do printf '%s ' "${t##*/}"; done | sed 's/ $//')): built; TEST=ds41_v2 scripts/c1_tests.sh runs the 12 tests (ds41_v2_fc2_profile is a profile, built only)"
 echo "fabric_rs_flat_test: built (a cluster test, not run here)"
 [ -f "$GR8_NVCC_CACHE_LOG" ] && echo "nvcc cache (tests): $(grep -c '^hit' "$GR8_NVCC_CACHE_LOG") hit, $(grep -c '^miss' "$GR8_NVCC_CACHE_LOG") miss"
 exit 0

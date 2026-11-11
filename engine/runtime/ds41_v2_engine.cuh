@@ -123,7 +123,8 @@ struct Ds41V2Engine {
     }
     void run(Model& m,int rows,int late_i,bool skip_late) {
         using namespace ::ds41::v2;
-        if(rows<1 || rows>capacity || late_i!=FIRST_LATE || m.ds41_pack)die("DS41 v2 invalid chunk");
+        const bool l20_hoist=v.l20_tail.on && late_i>0 && late_i<m.nl && m.layers[late_i].l==geom::CAND_SOURCE;
+        if(rows<1 || rows>capacity || (!l20_hoist && late_i!=FIRST_LATE) || m.ds41_pack)die("DS41 v2 invalid chunk");
         const Geometry g=geometry(rows,g6nr::NR,m.rank); v.g=g;
         if(g.owned) {
             ds_mhc::embed(b,m.tok+g.row0,m.emb,g.owned,HID,v.st);
@@ -136,7 +137,7 @@ struct Ds41V2Engine {
             auto* idx=ds41_idx_detail::find(m,false);
             const bool cand=l==geom::CAND_SOURCE && idx && !ds41_idx_detail::cand_skipped(*idx,3);
             timing_layer(v,l);
-            begin_layer(v,g,eg,geom::is_index_source(l),last&&!skip_late,cand);
+            begin_layer(v,g,eg,geom::is_index_source(l),!l20_hoist && last && !skip_late,cand);
             TimingDetailSpan layer_timer(v,TimingStage::Layer,v.st);
             if(eg)engram(m,i);
             if(!prepared)prepare(m,i,false);
@@ -144,9 +145,19 @@ struct Ds41V2Engine {
             prepare(m,i,true,v.attn_out);
             const auto w=ffn::layer_view(*static_cast<ds41moe::LayerState*>(m.layers[i].ds41_moe));
             G6RT_CK(ffn::run(v,w,moe,ds41moe::topk_cut(),m.vis_n>0?m.vis_flag+g.row0:nullptr));
-            prepared=(!last || !skip_late) && !(m.engram && geom::is_engram(m.layers[i+1].l));
+            prepared=(l20_hoist ? true : (!last || !skip_late)) && !(m.engram && geom::is_engram(m.layers[i+1].l));
             if(prepared)prepare(m,i+1,false,v.ffn_out); else consume(m,v.ffn_out);
-            if(last&&!skip_late)tail(m);
+            if(!l20_hoist && last && !skip_late)tail(m);
+            end_layer(v);
+        }
+        if(l20_hoist) {
+            timing_layer(v,m.layers[late_i].l);
+            begin_l20_tail(v,g,!skip_late);
+            {
+                TimingDetailSpan layer_timer(v,TimingStage::Layer,v.st);
+                ds41_v2_attn_l20_ca_row(v,m,late_i,v.y);
+                if(!skip_late)tail(m);
+            }
             end_layer(v);
         }
     }

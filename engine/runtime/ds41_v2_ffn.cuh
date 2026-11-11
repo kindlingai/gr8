@@ -19,6 +19,8 @@ namespace ds41::v2::ffn {
 constexpr int H = 5120, I = 576, NE = 384, TK = 6, COLS = H / COLUMN_GROUPS;
 constexpr int KP = (I + 127) / 128 * 128, MM = MAX_ROWS;
 using Plan = dsr::PlanMT<TK, MM>;
+constexpr int MM_W16K = MAX_ROWS_W16K;
+using PlanW16K = dsr::PlanMT<TK, MM_W16K>;
 struct Layer {
     const __nv_bfloat16* gate = nullptr;  // full [NE][H], already replicated at stock bind
     const float *bias = nullptr, *bias_vl = nullptr;
@@ -51,6 +53,7 @@ struct Scratch {
     int* order = nullptr;
     std::vector<void*> allocations;
     Plan* plan = nullptr;
+    PlanW16K* plan16k = nullptr;
     unsigned* masks = nullptr;
     int* tile0 = nullptr;
     float* logits = nullptr;
@@ -72,8 +75,8 @@ template<class T> inline cudaError_t alloc(Scratch& q, T*& p, size_t n) {
     if (e == cudaSuccess) q.allocations.push_back(p);
     return e;
 }
-inline cudaError_t prepare(Scratch& q, int capacity) {
-    if (capacity < 1 || capacity > MM || q.capacity || !q.allocations.empty()) return cudaErrorInvalidValue;
+inline cudaError_t prepare(Scratch& q, int capacity, bool allow_w16k = knob::ds_pf_v2_w16k()) {
+    if (capacity < 1 || capacity > (allow_w16k ? MM_W16K : MM) || q.capacity || !q.allocations.empty()) return cudaErrorInvalidValue;
     q.resident_fc2 = knob::ds_pf_v2() && knob::ds_pf_v2_fc2();
     q.gate_ro = knob::ds_pf_v2_gate_ro() && NE == dsr::NEXP;
     q.own_capacity = (capacity + 3) / 4;
@@ -82,7 +85,9 @@ inline cudaError_t prepare(Scratch& q, int capacity) {
     const size_t M = q.capacity, Q = q.own_capacity, R = size_t(q.tiles) * 8;
 #define DS41_V2_ALLOC(p,n) do { cudaError_t e=alloc(q,q.p,n); if(e!=cudaSuccess){release(q);return e;} } while(0)
     if(q.resident_fc2) { DS41_V2_ALLOC(order,NE); }
-    DS41_V2_ALLOC(plan,1); DS41_V2_ALLOC(masks,NE*(MM/32)); DS41_V2_ALLOC(tile0,NE); DS41_V2_ALLOC(logits,Q*NE);
+    if(q.capacity <= MM) { DS41_V2_ALLOC(plan,1); DS41_V2_ALLOC(masks,NE*(MM/32)); }
+    else { DS41_V2_ALLOC(plan16k,1); DS41_V2_ALLOC(masks,NE*(MM_W16K/32)); }
+    DS41_V2_ALLOC(tile0,NE); DS41_V2_ALLOC(logits,Q*NE);
     DS41_V2_ALLOC(own_q,Q*H); DS41_V2_ALLOC(own_s,Q*(H/32)); DS41_V2_ALLOC(own_idx,Q*TK); DS41_V2_ALLOC(own_wt,Q*TK);
     DS41_V2_ALLOC(all_q,M*H); DS41_V2_ALLOC(all_s,M*(H/32)); DS41_V2_ALLOC(all_idx,M*TK); DS41_V2_ALLOC(all_wt,M*TK);
     DS41_V2_ALLOC(record_q,M*H); DS41_V2_ALLOC(aq,R*I); DS41_V2_ALLOC(as,R*mxtc::ASP); DS41_V2_ALLOC(partial,R*H);
@@ -99,8 +104,8 @@ inline cudaError_t prepare(Scratch& q, int capacity) {
     return e;
 }
 // Input is only [g.owned][H], never full-row y. vflag, if present, is also own-row.
-inline cudaError_t router_own(const Geometry& g, const Layer& w, Scratch& q,
-                             const __nv_bfloat16* y, const uint8_t* vflag, int kc, cudaStream_t st) {
+template<int MCap> inline cudaError_t router_own_impl(const Geometry& g, const Layer& w, Scratch& q,
+                             const __nv_bfloat16* y, const uint8_t* vflag, int kc, cudaStream_t st, dsr::PlanMT<TK,MCap>* plan) {
     if (!supported(w) || g.M<1 || g.M>q.capacity || g.Q>q.own_capacity || kc<1 || kc>TK || (vflag&&!w.bias_vl)) return cudaErrorInvalidValue;
     cudaError_t e;
     if (g.owned) {
@@ -111,36 +116,43 @@ inline cudaError_t router_own(const Geometry& g, const Layer& w, Scratch& q,
         else
             dsr::k_gate_logits_mt<NE,0><<<NE/8,256,0,st>>>(w.gate,y,g.owned,q.logits);
         if((e=cudaGetLastError())!=cudaSuccess)return e;
-        if((e=cudaMemsetAsync(q.masks,0,NE*(MM/32)*sizeof(unsigned),st))!=cudaSuccess)return e;
-#define DS41_V2_ROUTE(K) case K: dsr::k_route_ro<NE,TK,MM,K><<<(g.owned+7)/8,256,0,st>>>(q.logits,w.bias,g.owned,q.plan,q.masks,w.bias_vl,vflag); break
+        if((e=cudaMemsetAsync(q.masks,0,NE*(MCap/32)*sizeof(unsigned),st))!=cudaSuccess)return e;
+#define DS41_V2_ROUTE(K) case K: dsr::k_route_ro<NE,TK,MCap,K><<<(g.owned+7)/8,256,0,st>>>(q.logits,w.bias,g.owned,plan,q.masks,w.bias_vl,vflag); break
         switch(kc) { DS41_V2_ROUTE(1); DS41_V2_ROUTE(2); DS41_V2_ROUTE(3); DS41_V2_ROUTE(4); DS41_V2_ROUTE(5); DS41_V2_ROUTE(6); }
 #undef DS41_V2_ROUTE
         if((e=cudaGetLastError())!=cudaSuccess)return e;
         if(ds41_sh_act_quant(y,H,q.own_q,H,q.own_s,H/32,g.owned,H,st))return cudaErrorInvalidValue;
         if((e=cudaGetLastError())!=cudaSuccess)return e;
     }
-    ds41v2moe::k_export_routes<TK,MM><<<(g.Q*TK+255)/256,256,0,st>>>(q.plan,g.owned,g.Q,q.own_idx,q.own_wt);
+    ds41v2moe::k_export_routes<TK,MCap><<<(g.Q*TK+255)/256,256,0,st>>>(plan,g.owned,g.Q,q.own_idx,q.own_wt);
     return cudaGetLastError();
 }
-inline ds41v2moe::Args args(const Layer& w, Scratch& q, int M) {
+inline cudaError_t router_own(const Geometry& g,const Layer& w,Scratch& q,const __nv_bfloat16* y,const uint8_t* vflag,int kc,cudaStream_t st) {
+    return q.plan16k ? router_own_impl<MM_W16K>(g,w,q,y,vflag,kc,st,q.plan16k)
+                    : router_own_impl<MM>(g,w,q,y,vflag,kc,st,q.plan);
+}
+template<int MCap> inline ds41v2moe::Args args_impl(const Layer& w, Scratch& q, int M,dsr::PlanMT<TK,MCap>* plan) {
     ds41v2moe::Args a{};
     a.fc1=w.fc1; a.fc2=w.fc2; a.xq=q.record_q; a.xs=q.all_s;
-    a.slot_expert=q.plan->slot_expert; a.slot_tile0=q.plan->slot_tile0; a.slot_nt=q.plan->slot_nt;
-    a.tile_mask=q.plan->tile_mask; a.tile_w=&q.plan->tile_w[0][0]; a.tile_tok=&q.plan->tile_tok[0][0];
-    a.n_slots_dev=&q.plan->n_slots; a.n_tiles_dev=&q.plan->n_tiles; a.n_slots=dsr::ro_slots_bound(M*TK,NE);
+    a.slot_expert=plan->slot_expert; a.slot_tile0=plan->slot_tile0; a.slot_nt=plan->slot_nt;
+    a.tile_mask=plan->tile_mask; a.tile_w=&plan->tile_w[0][0]; a.tile_tok=&plan->tile_tok[0][0];
+    a.n_slots_dev=&plan->n_slots; a.n_tiles_dev=&plan->n_tiles; a.n_slots=dsr::ro_slots_bound(M*TK,NE);
     a.gy1=DS41_TC_GY1; a.gy2=DS41_TC_GY2; a.os2=5; // ten 128-column blocks/group, two blocks per CTA slice
     a.limit=w.limit; a.aq=q.aq; a.as=q.as; a.ypart=q.partial;
     return a;
 }
-inline cudaError_t up(const Geometry& g,const Layer& w,Scratch& q,cudaStream_t st,State* trace=nullptr) {
+inline ds41v2moe::Args args(const Layer& w,Scratch& q,int M) {
+    return q.plan16k ? args_impl<MM_W16K>(w,q,M,q.plan16k) : args_impl<MM>(w,q,M,q.plan);
+}
+template<int MCap> inline cudaError_t up_impl(const Geometry& g,const Layer& w,Scratch& q,cudaStream_t st,State* trace,dsr::PlanMT<TK,MCap>* plan,bool skip_relayout=false) {
     TimingDetailSpan dispatch(trace,TimingStage::Dispatch,st);
-    cudaError_t e=cudaMemsetAsync(q.masks,0,NE*(MM/32)*sizeof(unsigned),st);
+    cudaError_t e=cudaMemsetAsync(q.masks,0,NE*(MCap/32)*sizeof(unsigned),st);
     if(e!=cudaSuccess)return e;
-    ds41v2moe::k_import_routes<NE,TK,MM><<<(g.M*8+255)/256,256,0,st>>>(q.all_idx,q.all_wt,g.M,q.plan,q.masks);
-    dsr::k_scan_ro<NE,TK,MM><<<1,NE,0,st>>>(q.plan,q.masks,q.tile0);
-    dsr::k_place_ro<NE,TK,MM,TK,true><<<(g.M*TK+255)/256,256,0,st>>>(q.plan,q.masks,q.tile0,g.M);
-    if(q.resident_fc2)ds41v2moe::k_order_desc<NE,TK,MM><<<1,NE,0,st>>>(q.plan,q.order);
-    ds41v2moe::k_relayout<true><<<(size_t(g.M)*H+255)/256,256,0,st>>>(q.all_q,q.record_q,g.M,H);
+    ds41v2moe::k_import_routes<NE,TK,MCap><<<(g.M*8+255)/256,256,0,st>>>(q.all_idx,q.all_wt,g.M,plan,q.masks);
+    dsr::k_scan_ro<NE,TK,MCap><<<1,NE,0,st>>>(plan,q.masks,q.tile0);
+    dsr::k_place_ro<NE,TK,MCap,TK,true><<<(g.M*TK+255)/256,256,0,st>>>(plan,q.masks,q.tile0,g.M);
+    if(q.resident_fc2)ds41v2moe::k_order_desc<NE,TK,MCap><<<1,NE,0,st>>>(plan,q.order);
+    if(!skip_relayout)ds41v2moe::k_relayout<true><<<(size_t(g.M)*H+255)/256,256,0,st>>>(q.all_q,q.record_q,g.M,H);
     if((e=cudaGetLastError())!=cudaSuccess)return e;
     dispatch.finish();
     TimingDetailSpan compute(trace,TimingStage::ExpertFc1,st);
@@ -150,6 +162,10 @@ inline cudaError_t up(const Geometry& g,const Layer& w,Scratch& q,cudaStream_t s
     constexpr size_t SM=mxtc::fc1_smem<H,DS41_TC_CW,DS41_TC_NTG1,DS41_TC_ST1>();
     mxtc::k_fc1_tc<H,I,DS41_TC_CW,DS41_TC_NTG1,DS41_TC_ST1,true><<<a.n_slots*(I/16/DS41_TC_CW)*a.gy1,DS41_TC_CW*32,SM,st>>>(a);
     return cudaGetLastError();
+}
+inline cudaError_t up(const Geometry& g,const Layer& w,Scratch& q,cudaStream_t st,State* trace=nullptr,bool skip_relayout=false) {
+    return q.plan16k ? up_impl<MM_W16K>(g,w,q,st,trace,q.plan16k,skip_relayout)
+                    : up_impl<MM>(g,w,q,st,trace,q.plan,skip_relayout);
 }
 inline cudaError_t down_group(const Geometry& g,const Layer& w,Scratch& q,int c,cudaStream_t st,State* trace=nullptr) {
     TimingDetailSpan compute(trace,TimingStage::ExpertFc2,st,c);
@@ -164,7 +180,8 @@ inline cudaError_t down_group(const Geometry& g,const Layer& w,Scratch& q,int c,
     } else mxtc::k_fc2_tc<I,H,DS41_TC_W2,DS41_TC_WT,DS41_TC_TPC,DS41_TC_ST2,COLUMN_GROUPS,ds41v2moe::Args><<<a.n_slots*a.gy2*a.os2,DS41_TC_W2*32,SM,st>>>(a);
     compute.finish();
     TimingDetailSpan combine(trace,TimingStage::Combine,st,c);
-    ds41v2moe::k_combine_group<H,TK,MM,__nv_bfloat16><<<(size_t(g.padded())*COLS+255)/256,256,0,st>>>(q.plan,q.partial,q.shared,q.send[c],g.M,g.padded(),col0,COLS);
+    if(q.plan16k)ds41v2moe::k_combine_group<H,TK,MM_W16K,__nv_bfloat16><<<(size_t(g.padded())*COLS+255)/256,256,0,st>>>(q.plan16k,q.partial,q.shared,q.send[c],g.M,g.padded(),col0,COLS);
+    else ds41v2moe::k_combine_group<H,TK,MM,__nv_bfloat16><<<(size_t(g.padded())*COLS+255)/256,256,0,st>>>(q.plan,q.partial,q.shared,q.send[c],g.M,g.padded(),col0,COLS);
     return cudaGetLastError();
 }
 __global__ void k_assemble(const __nv_bfloat16* a,const __nv_bfloat16* b,const __nv_bfloat16* c,const __nv_bfloat16* d,
@@ -183,11 +200,13 @@ inline cudaError_t run(State& s,const Layer& w,Scratch& q,int kc=TK,const uint8_
     cudaError_t e=router_own(s.g,w,q,s.y,own_vflag,kc,s.st);
     if(e!=cudaSuccess)return e;
     const Segment seg[]={{q.own_q,q.all_q,H},{q.own_s,q.all_s,H/32},{q.own_idx,q.all_idx,TK*sizeof(int)},{q.own_wt,q.all_wt,TK*sizeof(float)}};
-    all_gather(s,Coll::FfnIn,seg,4,s.st);
+    const bool ffn_opt=s.send_ffn_opt.ffn_opt();
+    if(ffn_opt)all_gather_ffn_in(s,seg,4,q.record_q,H,s.st);
+    else all_gather(s,Coll::FfnIn,seg,4,s.st);
     dispatch.finish();
     {
         TimingSpan timer(s,TimingStage::FfnUp,s.st);
-        if((e=up(s.g,w,q,s.st,&s))!=cudaSuccess)return e;
+        if((e=up(s.g,w,q,s.st,&s,ffn_opt))!=cudaSuccess)return e;
     }
     for(int c=0;c<COLUMN_GROUPS;++c) {
         {

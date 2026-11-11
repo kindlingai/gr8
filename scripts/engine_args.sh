@@ -162,11 +162,12 @@ ds41_defaults() {
   # setup) also selects the old stack.
   EXACT=${EXACT:-0}
   case $EXACT in 0|1) ;; *) echo "engine_defaults: EXACT=$EXACT: 0 (the release stack, v2 prefill) or 1 (exact output, the old prefill)" >&2; return 2 ;; esac
-  local kv kvs engram=0 prefix=0 pmin=2 dsmtp=5 pw= old=$EXACT
+  local kv kvs engram=0 prefix=0 pmin=2 dsmtp=5 pw= old=$EXACT w16k=1
   read -ra kvs <<<"${EXTRA_ENV:-}"
   for kv in ${kvs[@]+"${kvs[@]}"}; do
     case $kv in
       GR8_DS_PF_V2=0) old=1 ;;
+      GR8_DS_PF_V2_W16K=0) w16k=0 ;;
       GR8_DS_MHC_ROW_SHARD=1) old=1 ;;
       GR8_DS_PREFILL_MIN=[0-9]*) pmin=${kv#*=} ;;
       GR8_DS_MTP=[0-5]) dsmtp=${kv#*=} ;;
@@ -177,8 +178,8 @@ ds41_defaults() {
       GR8_DS_ENGRAM_PREFIX=?*) prefix=1 ;;
     esac
   done
-  # W: 8192-row chunks on v2, 4096 on the old path (its read-once MoE plan holds 4096 rows); EXTRA_ENV GR8_DS_PREFILL_W wins
-  [ -n "$pw" ] || { [ "$old" = 1 ] && pw=4096 || pw=8192; }
+  # W: 12288-row chunks on v2 (8192 when GR8_DS_PF_V2_W16K=0), 4096 on the old path; EXTRA_ENV GR8_DS_PREFILL_W wins
+  [ -n "$pw" ] || { [ "$old" = 1 ] && pw=4096 || { [ "$w16k" = 1 ] && pw=12288 || pw=8192; }; }
   # Engram ON needs the sidecar PREFIX (the engine dies at parse time without it)
   [ "$engram" = 0 ] || [ "$prefix" = 1 ] ||
     { echo "engine_defaults: GR8_DS_ENGRAM=1 needs GR8_DS_ENGRAM_PREFIX=/path/PREFIX in EXTRA_ENV (the Engram sidecar, PREFIX.engram.*)" >&2; return 2; }
@@ -210,7 +211,8 @@ ds41_defaults() {
   # A 1024-row prefill quantum while another chat decodes keeps those chats writing during a long new prompt.
   # The caller may override it in EXTRA_ENV or with S2_DECODE_PF; do not exceed a smaller requested W.
   local dpf=${S2_DECODE_PF:-$((pmin == 0 ? 0 : (pw < 1024 ? pw : 1024)))}
-  # The prefill stack. The release stack (default): v2 for layers 0..20 of a W-row chunk on one lane with the 128-row late
+  # The prefill stack: 12,288-row v2 default, layer-20 bounded-replay tail hoist, direct quarter publish / dual unpack.
+  # The release stack (default): v2 for layers 0..20 of a W-row chunk on one lane with the 128-row late
   # tail, the tensor-core shared expert v2's FFN reads, v2's own-row gate, its two-rail stripe at 1 MiB and its pipelined
   # attention core; Engram's pread pool at 64 threads (where io_uring is denied); the persistent attention GEMM tile; S2
   # admits a queued burst at one boundary and serves a prompt tail first. The old stack (EXACT=1): two lanes, nothing else.
@@ -220,6 +222,8 @@ ds41_defaults() {
   else
     pfs="GR8_DS_PF_V2=1 GR8_DS_PF_LANES=1 GR8_DS_PF_TAIL=128 GR8_DS_SH_TC=1 GR8_DS_PF_V2_GATE_RO=1 GR8_DS_PF_V2_STRIPE_MIN=1048576"
     pfs="$pfs GR8_DS_PF_V2_ATTN_PIPE=1 GR8_DS_ENGRAM_IO_THREADS=64 GR8_DS_ATTN_TC_TILE=2 GR8_S2_ADMIT_HOLD=${S2_ADMIT_HOLD:-1} GR8_S2_TAIL_FIRST=1"
+    pfs="$pfs GR8_DS_PF_V2_L20_TAIL=1 GR8_DS_PF_V2_SEND_FFN_OPT=3"
+    [ "$pw" -gt 8192 ] && pfs="$pfs GR8_DS_PF_V2_W16K=1"
   fi
   DS41_TUNED=
   for kv in GR8_DS_MTP=5 GR8_DS_ENGRAM_MTP=1 GR8_DS_PREFILL_MIN=2 GR8_DS_PREFILL_W=$pw GR8_DS_ATTN_PW=$pw GR8_DS41_IDX_PW=$pw GR8_S2_DECODE_PF=$dpf \
