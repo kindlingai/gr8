@@ -249,6 +249,42 @@ knobs:
       each CTA holds one 128-column weight slab across all bucketed rows, with heavy experts first.
       Default 0 retains the grouped stock tensor-core kernel. Has no effect when V2 is off.
 
+  GR8_DS_PF_V2_L20_TAIL:
+    scope: agree
+    kind: ints
+    default: "0"
+    doc: >-
+      With GR8_DS_PF_V2=1, select a comma list of 0 or 1 by request modulo list length.
+      1 runs layers 0..19 full-row and hoists layer 20 ST_CA_ROW over all rows using
+      lossless BF16 AttnIn all-gather, even on skip-late chunks; the rest of layer 20
+      joins the 128-row late range. Logs request/on/rank once per active request/slot
+      unless the list is the single default 0. Default 0 retains the existing split.
+  GR8_DS_PF_V2_SEND_FFN_OPT:
+    scope: agree
+    kind: ints
+    default: "0"
+    doc: >-
+      With GR8_DS_PF_V2=1, select comma-list bitmask modes 0..3 by request modulo
+      list length. Bit 1 packs remote AttnOut quarters directly from quantized
+      output codes/scales and publishes on the compute stream before the local
+      output projection; only remote peers unpack on the communication stream.
+      Bit 2 unpacks FfnIn into both ordinary and record activation layouts using
+      warp-quad shuffles, skipping the separate relayout. Logs rank/request/slot/mode
+      once per active request/slot for nonzero modes. Default 0 keeps both paths unchanged.
+
+  GR8_DS_PF_V2_W16K:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_PF_V2=1, allow sequence-parallel prefill and Engram widths
+      through 16384 rows in steps of 256, with matching GR8_DS_ATTN_PW and
+      GR8_DS41_IDX_PW. Use the 16384-row routed-FFN planner only for capacities
+      above 8192 and limit shared main-fabric prefill slots to 4096 rows.
+      Default 0 retains the 8192 cap, planner and main-fabric sizing.
+      Has no effect when GR8_DS_PF_V2=0.
+
   GR8_DS_PF_DIRECT:
     scope: agree
     kind: flag

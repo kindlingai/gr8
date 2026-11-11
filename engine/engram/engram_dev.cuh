@@ -33,6 +33,8 @@ extern "C" int ds41_gemm_mx_tc(const uint8_t* A, int lda, const uint8_t* SA, int
 namespace ds41 { namespace engram {
 
 constexpr int kWideMaxRows = 4096;    // W-row prefill: GR8_DS_PREFILL_W is MX..4096
+constexpr int kV2MaxRows = 8192;
+constexpr int kV2W16KMaxRows = 16384;
 constexpr int kDecodeRows = 32;   // MX: up to this many rows begin_step hashes with the decode launch <<<1, rows>>>
 constexpr int kNotSup = 801;   // ds41::NOTSUP (cudaErrorNotSupported): the hook is not wired
 
@@ -230,6 +232,7 @@ struct Config
 {
     std::string prefix;              // weights PREFIX (PREFIX.engram.json, .cmap, .L###.w8/.s8)
     int rank = 0, nr = 1;
+    bool prefill_v2_w16k = false;
     bool prefill_v2 = false;         // stock admission remains <= 4096
     int max_rows = 8;                // MX; a prefill build (GR8_DS_PREFILL_W) sets its W, up to 4096
     Knobs knobs;                     // read_knobs()
@@ -251,7 +254,8 @@ public:
     bool init(const Config& c, std::string* err)
     {
         cfg_ = c;
-        if (c.max_rows < 1 || c.max_rows > (c.prefill_v2 ? 8192 : kWideMaxRows)) { *err = "engram: max_rows outside 1.." + std::to_string(kWideMaxRows); return false; }
+        const int max_allowed = c.prefill_v2 ? (c.prefill_v2_w16k ? kV2W16KMaxRows : kV2MaxRows) : kWideMaxRows;
+        if (c.max_rows < 1 || c.max_rows > max_allowed) { *err = "engram: max_rows outside 1.." + std::to_string(max_allowed); return false; }
         if (!load_sidecar(c.prefix, c.rank, c.nr, &sc_, err, c.knobs.col_shard)) return false;
         for (int e = 0; e < kNE; ++e)
             if (!c.q_w[e] || !c.k_w[e]) { *err = "engram: q_weight / k_weight pointers of layer " + std::to_string(kLayerIds[e]) + " missing"; return false; }

@@ -130,7 +130,7 @@ check 6 rows for each of 8 chats. Its settings come in three groups, each set in
   ([FIRST-BOOT.md](FIRST-BOOT.md#q3-faster-writing-for-a-small-quality-loss) Q3), and `GR8_DS41_HEAD_MX=1`
   ([Q4](FIRST-BOOT.md#q4-a-smaller-output-head)).
 - Two speed up prefill with the same output bits: `GR8_DS_ATTN_TC_MF=2` and `GR8_DS_ATTN_TC_TILE=1` ([ENV.md](ENV.md)).
-- The release stack: the v2 prefill path (`GR8_DS_PF_V2=1`) with 8,192-row chunks, its wire settings, the two-rail
+- The release stack: the v2 prefill path (`GR8_DS_PF_V2=1`) with 12,288-row chunks, its wire settings, the two-rail
   split, and Engram reads with io_uring. One of them, `GR8_DS_SH_TC=1`, changes the output. gr8's launcher sets the
   same stack by default ([The prefill path](#the-prefill-path)). The recipe README's
   [What `TUNE=speed` sets](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark#what-tunespeed-sets) has
@@ -145,7 +145,16 @@ tokens). It sets the release stack's prefill words, and not the fast decode word
 
 ### The prefill path
 
-- Default: the v2 prefill (`GR8_DS_PF_V2=1`) for layers 0..20 of each prompt chunk. The launcher also sets 8,192-row
+The default 12,288-row v2 stack enables `GR8_DS_PF_V2_L20_TAIL=1`,
+`GR8_DS_PF_V2_SEND_FFN_OPT=3` and `GR8_DS_PF_V2_W16K=1`: layer-20 bounded-replay
+tail hoisting, direct compute-stream quarter publish and dual-row FFN unpack.
+Measured cold TTFT fell 8.25% at 32K, 10.68% at 128K and 12.07% at 256K,
+using about 1.55 GiB/rank more unified memory. `EXACT=1` retains the old two-lane
+4,096-row path; `GR8_DS_PF_V2_W16K=0` in `EXTRA_ENV` steps back to 8,192 rows.
+An explicit `GR8_DS_PREFILL_W` overrides the chunk width. Historical tables below
+retain their original settings and measurements.
+
+- Default: the v2 prefill (`GR8_DS_PF_V2=1`) for layers 0..20 of each prompt chunk. The launcher also sets 12,288-row
   chunks, one prefill lane, the 128-row late tail, `GR8_DS_SH_TC=1`, v2's own-row gate, its 1 MiB two-rail stripe and
   pipelined attention, 64 Engram read threads, `GR8_DS_ATTN_TC_TILE=2`, `GR8_S2_ADMIT_HOLD=1` and `GR8_S2_TAIL_FIRST=1`.
   `GR8_DS_SH_TC=1` changes the output bits.

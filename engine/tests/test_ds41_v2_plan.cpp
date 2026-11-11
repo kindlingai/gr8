@@ -1,9 +1,65 @@
 #include "../runtime/fabric_plan.h"
+#include "../runtime/s2/ds41_prefill.h"
 #include <cassert>
 #include <cstring>
 #include <iostream>
 #include <string>
+static void wide_plan_checks() {
+    using namespace g6rt;
+    assert(ds41_prefill_rowcap("8193",32,true,false)==0);
+    assert(ds41_prefill_rowcap("16385",32,true,true)==0);
+    assert(ds41_prefill_rowcap("12288",32,false,true)==0);
+    std::vector<int> layers; for(int i=0;i<61;++i)layers.push_back(i);
+    auto make=[&](int width,bool wide) {
+        EngineOptions o; o.s2mode=true; o.NL=61; o.NX=2; o.NC=125;
+        o.layers=layers; o.cfg.rank=0; o.cfg.ips={"1","2","3","4"};
+        PlanInputs in; in.trunk_bytes=2; in.head_payload=512;
+        in.k.ds_pf_v2=true; in.k.ds_pf_v2_w16k=wide;
+        in.k.ds_prefill_w=std::to_string(width); in.k.ds_pf_tail="128";
+        in.k.ds_sh_tc=true; in.k.ds_prefill_min=2;
+        return fabric_plan(o,in);
+    };
+    const auto baseline=make(4096,false); assert(baseline.refusal.empty());
+    const auto& base=baseline.find(FabKind::Main)->cfg;
+    for(int width : {12288,16384}) {
+        assert(ds41_prefill_rowcap(std::to_string(width).c_str(),32,true,true)==width);
+        assert(ds41_prefill_main_fabric_rows(width,true,true)==4096);
+        assert(ds41_prefill_main_fabric_rows(width,true,false)==width);
+        assert(!make(width,false).refusal.empty());
+        auto p=make(width,true); assert(p.refusal.empty() && p.ds_pf_v2);
+        assert(p.find(FabKind::Ds41V2));
+        const auto& cfg=p.find(FabKind::Main)->cfg;
+        assert(cfg.slot_bytes==base.slot_bytes && cfg.slot_bytes1==base.slot_bytes1 && cfg.slot_bytes2==base.slot_bytes2);
+        int messages=0;
+        for(const auto& line:p.log)if(line.find("# ds41_v2_w16k ")==0) {
+            assert(line=="# ds41_v2_w16k on=1 pf_rows="+std::to_string(width)+" main_pf_rows=4096\n"); ++messages;
+        }
+        assert(messages==1);
+        for(const auto& line:baseline.log)assert(line.find("# ds41_v2_w16k ")!=0);
+        g6::FabricDev f{};assert(g6::fab_slot_layout(cfg,cfg.ncoll,&f));
+        for(int late : {20,21})for(bool skip : {false,true}) {
+            const auto raw=g6s2::ds41_chunk_collectives(layers,2,width,5120*2,6144*2,late,128,skip);
+            const auto main=g6s2::ds41_main_chunk_collectives(raw,true,skip,late,61);
+            const auto stock=g6s2::ds41_main_chunk_collectives(raw,false,skip,late,61);
+            assert(stock.sizes==raw.sizes && stock.order==raw.order);
+            if(skip)assert(main.sizes.empty() && main.order.empty());
+            else {
+                assert(main.order.size()==size_t(122-2*late));
+                for(size_t j=0;j<main.order.size();++j)assert(main.order[j]==2*late+int(j));
+                for(size_t c=0;c<main.sizes.size();++c) {
+                    if(c<size_t(2*late) || c>=122)assert(main.sizes[c]==0);
+                    else assert(main.sizes[c]==128*5120*2);
+                    assert(main.sizes[c]+8<=g6::fab_slot_stride(f,int(c)));
+                }
+                // Without filtering, full-width Range A exceeds the capped main slots.
+                assert(raw.sizes[0]+8>g6::fab_slot_stride(f,0));
+            }
+        }
+    }
+    std::cout<<"wide plan: main rows4096, late20/21 filtering, default unchanged PASS\n";
+}
 int main() {
+    wide_plan_checks();
     using namespace g6rt;
     assert(ds41_prefill_rowcap("8192",32,true)==8192);
     assert(ds41_prefill_rowcap("8192",32)==0);

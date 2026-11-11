@@ -87,6 +87,9 @@ one GPU and makes its own synthetic weights.
 | `kda_g9_det` | the G9 ON kernels give the same bits run to run |
 | `test_flash_cp` | Flash context-parallel decode at TP=2: the caches each rank holds, the merged index lists and the outputs against the replicated path (the lists and caches bit for bit, the outputs within the LSE merge's rounding) |
 | `ds41_v2_attn_test`, `ds41_v2_index_test`, `ds41_v2_moe_test`, `ds41_v2_engram_test`, `ds41_v2_ffn_test`, `ds41_v2_mhc_test`, `ds41_v2_timing_test`, `test_ds41_v2_width`, `test_ds41_v2_wire` | the DS41 v2 prefill (`GR8_DS_PF_V2`): its attention, indexer, MoE, Engram, FFN and mHC kernels against the stock ones, its event timing, and its wire (pack, publish, wait, reduce) over mapped slots, all on synthetic data. `TEST=ds41_v2` runs these alone, each in the one configuration its header names |
+| `ds41_v2_l20_tail_test` | Synthetic hoisted layer-20 projection, BF16 gather, compressed/index rows and six-segment tail handover against full-row reference; explicit device plus mapped-host allocation budget |
+| `test_ds41_v2_send_ffn_opt_gpu` | Synthetic direct remote attention send, split local projection, dual-layout FFN unpack; byte equality, guards and negative controls |
+| `test_ds41_v2_s8_combo_gpu` | Synthetic four-rank public State API sequence: Range A then hoisted layer 20 on the same fabric/epochs, all send/FFN modes, ragged shapes, skip-late and tracing; bounded test-only proxy, not RDMA or speed evidence |
 
 `scripts/build.sh` runs `tr3_e4m3_test` (the trellis codebook decode, when a GPU is visible: every state of the mcg,
 mul1 and pmcgx codebooks against a host reference and the hashes the Rust and Python references check, and every lane
@@ -150,3 +153,5 @@ On a booted cluster, from the head:
   It passes when the change's planner asks for every step the logged one did and leaves the same sessions active, as
   long and with the same committed tokens after every call; it names the first difference. A Flash log also needs
   `GR8_GLM53F_S2_COST` set as the engine had it and, when that is 1, `-DG6_NR=` the engine's width.
+
+`ds41_v2_w16k_test` exercises wide planner routing/up/down (both relayout modes), capacity admission and Engram wire exactness under an explicit <384 MiB allocation budget. `test_ds41_v2_s8_combo_gpu` also covers compact-width M=8257/12288, all four send/FFN modes, skip-late and tracing. Both are synthetic correctness checks, not speed evidence.

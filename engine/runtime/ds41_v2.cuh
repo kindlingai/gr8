@@ -155,6 +155,113 @@ __global__ void reduce_vector(g6::FabricDev f,Seq epoch,int c,Geometry g,size_t 
     }
     if constexpr(Trace)trace_done(f,epoch,c);
 }
+// Direct remote-quarter packing; the local projection reads codes/scales directly.
+__global__ void __launch_bounds__(COMM_THREADS) pack_attn_out_remote(
+    g6::FabricDev f, Seq epoch, int c, Geometry g,
+    const uint8_t* __restrict__ oaq, const uint8_t* __restrict__ oas, int K, size_t w_stride) {
+    const int ks=K/32, row_bytes=K+ks;
+    const size_t n=size_t(g.Q)*row_bytes;
+    const size_t first=(size_t(blockIdx.x)*blockDim.x+threadIdx.x)*16;
+    const size_t step=size_t(gridDim.x)*blockDim.x*16;
+    const bool aligned16=((K|ks)&15)==0 &&
+        ((reinterpret_cast<uintptr_t>(oaq)|reinterpret_cast<uintptr_t>(oas))&15)==0;
+    for(int p=0;p<g.nr;++p) {
+        if(p==g.rank)continue;
+        const int row0=p*g.Q, valid_rows=max(0,min(g.Q,g.M-row0));
+        char* target=send(f,epoch,c)+size_t(p)*w_stride;
+        if(aligned16 && (reinterpret_cast<uintptr_t>(target)&15)==0) {
+            const size_t row_u4=size_t(row_bytes)/16;
+            for(size_t i=first;i<n;i+=step) {
+                const size_t u=i/16, row=u/row_u4, col=(u%row_u4)*16;
+                uint4 value=make_uint4(0,0,0,0);
+                if(row<size_t(valid_rows)) {
+                    const uint8_t* source=col<size_t(K)
+                        ? oaq+size_t(row0+int(row))*K+col
+                        : oas+size_t(row0+int(row))*ks+col-size_t(K);
+                    value=*reinterpret_cast<const uint4*>(source);
+                }
+                *reinterpret_cast<uint4*>(target+i)=value;
+            }
+        } else {
+            for(size_t i=first;i<n;i+=step)for(int b=0;b<16 && i+b<n;++b) {
+                const size_t offset=i+b,row=offset/size_t(row_bytes),col=offset%size_t(row_bytes);
+                target[offset]=row<size_t(valid_rows)
+                    ? char(col<size_t(K) ? oaq[size_t(row0+int(row))*K+col]
+                                         : oas[size_t(row0+int(row))*ks+col-size_t(K)]) : char(0);
+            }
+        }
+    }
+}
+template<bool Trace=false>
+__global__ void __launch_bounds__(COMM_THREADS) unpack_remote(
+    g6::FabricDev f, Seq epoch, int c, Geometry g, Segments seg) {
+    const size_t first=(size_t(blockIdx.x)*blockDim.x+threadIdx.x)*16;
+    const size_t step=size_t(gridDim.x)*blockDim.x*16;
+    for(int p=0;p<g.nr;++p) {
+        if(p==g.rank)continue;
+        const char* source=peer(f,epoch,c,p);
+        for(int k=0;k<seg.w.count;++k) {
+            const auto& v=seg.s[k];
+            const size_t n=size_t(g.owned)*v.row_bytes;
+            char* dst=static_cast<char*>(v.dst)+size_t(p)*g.Q*v.row_bytes;
+            for(size_t i=first;i<n;i+=step)get16(dst,source+seg.w.offsets[k]+i,i,n);
+        }
+    }
+    if constexpr(Trace)trace_done(f,epoch,c);
+}
+template<bool Trace=false>
+__global__ void __launch_bounds__(COMM_THREADS) unpack_ffn_in(
+    g6::FabricDev f, Seq epoch, int c, Geometry g, Segments seg,
+    uint8_t* __restrict__ record_q, int H) {
+    const int lane_c = threadIdx.x & 3;
+    const size_t quad_id = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) >> 2;
+    const size_t quad_step = (size_t(gridDim.x) * blockDim.x) >> 2;
+    const size_t first = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * 16;
+    const size_t step = size_t(gridDim.x) * blockDim.x * 16;
+    const size_t off0 = seg.w.offsets[0];
+    char* const base_all = static_cast<char*>(seg.s[0].dst);
+    for (int p = 0; p < g.nr; ++p) {
+        const char* source = peer(f, epoch, c, p);
+        const int valid_rows = max(0, min(g.Q, g.M - p * g.Q));
+        {
+            const size_t peer_off = size_t(p) * size_t(g.Q) * size_t(H);
+            const char* src0 = source + off0;
+            char* dst_all = base_all + peer_off;
+            uint8_t* dst_rec = record_q + peer_off;
+            const size_t blocks64 = size_t(valid_rows) * size_t(H) / 64;
+            for (size_t block = quad_id; block < blocks64; block += quad_step) {
+                const uint32_t quad_mask = 0xfu << (threadIdx.x & 28);
+                const size_t off = block * 64 + size_t(lane_c) * 16;
+                const uint4 value = __ldcv(reinterpret_cast<const uint4*>(src0 + off));
+                *reinterpret_cast<uint4*>(dst_all + off) = value;
+                const uint32_t p0 = (value.x & 0xffffu) | ((value.z & 0xffffu) << 16);
+                const uint32_t p1 = (value.x >> 16)     | (value.z & 0xffff0000u);
+                const uint32_t p2 = (value.y & 0xffffu) | ((value.w & 0xffffu) << 16);
+                const uint32_t p3 = (value.y >> 16)     | (value.w & 0xffff0000u);
+                const uint32_t u0 = lane_c == 0 ? p0 : lane_c == 1 ? p1 : lane_c == 2 ? p2 : p3;
+                const uint32_t s1 = lane_c == 0 ? p1 : lane_c == 1 ? p0 : lane_c == 2 ? p3 : p2;
+                const uint32_t s2 = lane_c == 0 ? p2 : lane_c == 1 ? p3 : lane_c == 2 ? p0 : p1;
+                const uint32_t s3 = lane_c == 0 ? p3 : lane_c == 1 ? p2 : lane_c == 2 ? p1 : p0;
+                const uint32_t u1 = __shfl_xor_sync(quad_mask, s1, 1);
+                const uint32_t u2 = __shfl_xor_sync(quad_mask, s2, 2);
+                const uint32_t u3 = __shfl_xor_sync(quad_mask, s3, 3);
+                const uint32_t w0 = lane_c == 0 ? u0 : lane_c == 1 ? u1 : lane_c == 2 ? u2 : u3;
+                const uint32_t w1 = lane_c == 0 ? u1 : lane_c == 1 ? u0 : lane_c == 2 ? u3 : u2;
+                const uint32_t w2 = lane_c == 0 ? u2 : lane_c == 1 ? u3 : lane_c == 2 ? u0 : u1;
+                const uint32_t w3 = lane_c == 0 ? u3 : lane_c == 1 ? u2 : lane_c == 2 ? u1 : u0;
+                *reinterpret_cast<uint4*>(dst_rec + off) = make_uint4(w0, w1, w2, w3);
+            }
+        }
+        for (int k = 1; k < seg.w.count; ++k) {
+            const auto& v = seg.s[k];
+            const size_t n = size_t(valid_rows) * v.row_bytes;
+            char* dst = static_cast<char*>(v.dst) + size_t(p) * g.Q * v.row_bytes;
+            for (size_t i = first; i < n; i += step) get16(dst, source + seg.w.offsets[k] + i, i, n);
+        }
+    }
+    if constexpr (Trace) trace_done(f, epoch, c);
+}
+
 inline Segments segments(const Geometry& g,const Segment* src,int count) {
     Segments p{}; p.w=wire_layout(g.Q,src,count);
     require(p.w.count>0,"invalid segment layout");
@@ -177,6 +284,10 @@ inline void enqueue(State& s,Coll coll,const WireLayout& w,bool scatter) {
 inline void init(State& s,g6::Fabric& f,cudaStream_t st) {
     require(!s.live,"state initialized twice");
     s.fabric=&f; s.wire=f.dev(); s.st=st;
+    s.l20_tail=L20Tail{};
+    require(s.l20_tail.init(knob::ds_pf_v2_l20_tail()), "GR8_DS_PF_V2_L20_TAIL needs 0 or 1 entries");
+    s.send_ffn_opt=SendFfnOpt{};
+    require(s.send_ffn_opt.init(knob::ds_pf_v2_send_ffn_opt()), "GR8_DS_PF_V2_SEND_FFN_OPT needs modes 0..3");
     s.attn_pipe=AttnPipe{};
     s.attn_pipe.on=knob::ds_pf_v2_attn_pipe();
     s.widths=CommWidths{};
@@ -206,6 +317,15 @@ inline void begin_layer(State& s,Geometry g,bool engram,bool index,bool tail,boo
     require(s.live && s.order.complete(),"previous layer has unissued collectives");
     require(g.M>0 && g.nr==s.wire.nr && g.rank==s.wire.rank,"geometry does not match fabric");
     s.g=g; ++s.epoch; s.order={layer_order(engram,index,tail,candidates),0};
+    if(s.wire.xt && s.timing)
+        std::fprintf(stderr,"# ds41_v2_xtrace rank=%d epoch=%llu request=%llu chunk=%u rows=%d layer=%d\n",
+            s.wire.rank,(unsigned long long)s.epoch,(unsigned long long)s.timing->request,
+            s.timing->chunk,g.M,s.timing->layer);
+}
+inline void begin_l20_tail(State& s,Geometry g,bool tail) {
+    require(s.live && s.order.complete(),"previous layer has unissued collectives");
+    require(g.M>0 && g.nr==s.wire.nr && g.rank==s.wire.rank,"geometry does not match fabric");
+    s.g=g; ++s.epoch; s.order={l20_tail_order(tail),0};
     if(s.wire.xt && s.timing)
         std::fprintf(stderr,"# ds41_v2_xtrace rank=%d epoch=%llu request=%llu chunk=%u rows=%d layer=%d\n",
             s.wire.rank,(unsigned long long)s.epoch,(unsigned long long)s.timing->request,
@@ -269,6 +389,69 @@ inline void all_to_all(State& s,Coll c,const Segment* segments,int count,cudaStr
     }
     check(cudaPeekAtLastError());
 }
+inline void all_gather_ffn_in(State& s,const Segment* input,int count,uint8_t* record_q,int H,cudaStream_t st) {
+    require(input && record_q && count>=1 && H>0 && H%64==0 && input[0].row_bytes==size_t(H),
+            "invalid all_gather_ffn_in args");
+    const uintptr_t alignment=reinterpret_cast<uintptr_t>(input[0].dst)|reinterpret_cast<uintptr_t>(record_q)|
+        reinterpret_cast<uintptr_t>(s.wire.send)|reinterpret_cast<uintptr_t>(s.wire.recv);
+    require((alignment&15)==0,"unaligned all_gather_ffn_in buffers");
+    auto p=detail::segments(s.g,input,count);
+    detail::enqueue(s,Coll::FfnIn,p.w,false);
+    const int c=int(Coll::FfnIn), blocks=std::max(s.widths.pack_blocks,32);
+    TimingSpan timer(s,TimingStage::FfnAg,st);
+    if(s.wire.xt) {
+        detail::trace_produced<<<1,32,0,st>>>(s.wire,s.epoch,c);
+        TimingDetailSpan packed(s,TimingStage::PackPublish,st,c);
+        detail::pack<<<s.widths.pack_blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,c,s.g,p,false);
+        detail::publish<true><<<1,32,0,st>>>(s.wire,s.epoch,c);
+        packed.finish();
+        TimingDetailSpan waited(s,TimingStage::Wait,st,c);
+        detail::wait<true><<<1,32,0,st>>>(s.wire,s.epoch,c,p.w.payload);
+        waited.finish();
+        TimingDetailSpan consumed(s,TimingStage::Unpack,st,c);
+        detail::unpack_ffn_in<true><<<blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,c,s.g,p,record_q,H);
+    } else {
+        detail::pack<<<s.widths.pack_blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,c,s.g,p,false);
+        detail::publish<<<1,32,0,st>>>(s.wire,s.epoch,c);
+        detail::wait<<<1,32,0,st>>>(s.wire,s.epoch,c,p.w.payload);
+        detail::unpack_ffn_in<<<blocks,COMM_THREADS,0,st>>>(s.wire,s.epoch,c,s.g,p,record_q,H);
+    }
+    check(cudaPeekAtLastError());
+}
+inline void attn_out_a2a_opt(State& s,const uint8_t* oaq,const uint8_t* oas,int K,void* output_recv) {
+    require(oaq && oas && output_recv && K>0 && K%32==0,"invalid attn_out_a2a_opt args");
+    Segment seg{oaq,output_recv,size_t(K)+size_t(K/32)};
+    auto p=detail::segments(s.g,&seg,1);
+    detail::enqueue(s,Coll::AttnOut,p.w,true);
+    const int c=int(Coll::AttnOut), blocks=std::max(s.widths.pack_blocks,32);
+    if(s.wire.xt) {
+        detail::trace_produced<<<1,32,0,s.st>>>(s.wire,s.epoch,c);
+        TimingDetailSpan packed(s,TimingStage::PackPublish,s.st,c);
+        detail::pack_attn_out_remote<<<blocks,COMM_THREADS,0,s.st>>>(s.wire,s.epoch,c,s.g,oaq,oas,K,p.w.stride);
+        detail::publish<true><<<1,32,0,s.st>>>(s.wire,s.epoch,c);
+    } else {
+        detail::pack_attn_out_remote<<<blocks,COMM_THREADS,0,s.st>>>(s.wire,s.epoch,c,s.g,oaq,oas,K,p.w.stride);
+        detail::publish<<<1,32,0,s.st>>>(s.wire,s.epoch,c);
+    }
+    check(cudaEventRecord(s.produced[c],s.st));
+    check(cudaStreamWaitEvent(s.cs,s.produced[c],0));
+    {
+        TimingSpan timer(s,TimingStage::AttnA2A,s.cs);
+        if(s.wire.xt) {
+            TimingDetailSpan waited(s,TimingStage::Wait,s.cs,c);
+            detail::wait<true><<<1,32,0,s.cs>>>(s.wire,s.epoch,c,p.w.payload);
+            waited.finish();
+            TimingDetailSpan consumed(s,TimingStage::Unpack,s.cs,c);
+            detail::unpack_remote<true><<<blocks,COMM_THREADS,0,s.cs>>>(s.wire,s.epoch,c,s.g,p);
+        } else {
+            detail::wait<<<1,32,0,s.cs>>>(s.wire,s.epoch,c,p.w.payload);
+            detail::unpack_remote<<<blocks,COMM_THREADS,0,s.cs>>>(s.wire,s.epoch,c,s.g,p);
+        }
+    }
+    record_received(s,Coll::AttnOut);
+    check(cudaPeekAtLastError());
+}
+
 inline void reduce_scatter(State& s,int group,const __nv_bfloat16* all,__nv_bfloat16* own,int cols,cudaStream_t st) {
     require(group>=0 && group<COLUMN_GROUPS && cols>0,"invalid reduce-scatter group");
     Segment seg{all,own,size_t(cols)*2}; auto p=detail::segments(s.g,&seg,1); const Coll c=ffn_group(group);

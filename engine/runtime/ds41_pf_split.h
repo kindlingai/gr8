@@ -80,10 +80,10 @@ struct Split
 // An op split_plan hoists out of U_ATTN(i_late) into range A: ST_CA_ROW of the boundary layer (only a kv source has one: layer 20 under L1).
 inline bool hoisted(const Op& o, int i_late) { return o.stage == ST_CA_ROW && o.unit == U_ATTN && o.ui == i_late; }
 // nf = dsp::pf::nonfinal_plan(...) of ids. No layer >= late_layer_start() (or only such layers) -> no split.
-inline Split split_plan(const std::vector<Op>& nf, const std::vector<int>& ids)
+inline Split split_plan(const std::vector<Op>& nf, const std::vector<int>& ids, bool l20)
 {
     Split s;
-    s.i_late = late_start(ids);
+    s.i_late = late_start(ids, l20);
     if (s.i_late < 0) { s.ops = nf; s.b = nf.size(); return s; }
     for (const Op& o : nf)
     {
@@ -101,19 +101,20 @@ inline Split split_plan(const std::vector<Op>& nf, const std::vector<int>& ids)
     if (s.b == 0) { s.ops = nf; s.b = nf.size(); s.i_late = -1; }   // the plan has no layer >= i_late (cannot happen for a nonfinal plan of ids)
     return s;
 }
+inline Split split_plan(const std::vector<Op>& nf, const std::vector<int>& ids) { return split_plan(nf, ids, l20_tail()); }
 // the layer position an op works on for the split rule (hc_attn(i+1) sits in U_CONS_F(i): its ui is i)
 inline int unit_layer(const Op& o) { return o.unit == U_ATTN || o.unit == U_CONS_A || o.unit == U_MLP || o.unit == U_CONS_F ? o.ui : -1; }
 // "" = ok. nf: the non-final plan split_plan got; s: its answer.
-inline std::string check_split(const std::vector<Op>& nf, const Split& s, const std::vector<int>& ids)
+inline std::string check_split(const std::vector<Op>& nf, const Split& s, const std::vector<int>& ids, bool l20)
 {
     if (!s.on())
     {
         for (const Op& o : s.ops) if (o.stage == ST_PF_COMPACT) return "an unsplit plan has ST_PF_COMPACT";
         if (s.ops.size() != nf.size() || s.b != nf.size()) return "an unsplit plan is not the non-final plan";
-        return late_start(ids) < 0 ? "" : "the layers have a late layer but the plan is not split";
+        return late_start(ids, l20) < 0 ? "" : "the layers have a late layer but the plan is not split";
     }
-    const int lls = late_layer_start();
-    if (s.i_late != late_start(ids) || s.i_late <= 0 || ids[s.i_late] < lls || ids[s.i_late - 1] >= lls)
+    const int lls = late_layer_start(l20);
+    if (s.i_late != late_start(ids, l20) || s.i_late <= 0 || ids[s.i_late] < lls || ids[s.i_late - 1] >= lls)
         return "the split does not sit at the first layer id >= the late layer start";
     if (s.b < 1 || s.b >= s.ops.size() || s.ops[s.b - 1].stage != ST_PF_COMPACT) return "range A does not end with ST_PF_COMPACT";
     int compacts = 0;
@@ -176,6 +177,7 @@ inline std::string check_split(const std::vector<Op>& nf, const Split& s, const 
         return "ST_PF_COMPACT does not follow that layer's consume_ffn unit";
     return "";
 }
+inline std::string check_split(const std::vector<Op>& nf, const Split& s, const std::vector<int>& ids) { return check_split(nf, s, ids, l20_tail()); }
 // Late tail on the final chunk only (GR8_DS_PF_LATE_FINAL=1, default off). After a chunk ends at `context`, the readers of the layers
 // >= 21 window state are: the MAIN step at N-1 (reads N-WINDOW .. N-2), and a later chunk's range B, which reads down to its window floor, or
 // WINDOW-1 rows before its first row when it is not compacted (rows <= tail: only the last chunk, since full chunks of W > tail rows compact).
