@@ -6,6 +6,7 @@
 #include "../h2d.h"
 #include "../knobs-rs/gr8_knobs.h"
 #include "kvfmt.h"
+#include "kv4_dispatch.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -25,6 +26,16 @@ extern "C" { void (*g6_attn_mark)(int stage,void* stream)=nullptr; }
 #define AMARK(k) do{if(g6_attn_mark)g6_attn_mark((k),(void*)stream);}while(0)
 namespace ga {
 constexpr int TOP=2048, PART=8;
+#if G6_KV4
+static int& kv4_fold(){static int v=knob::kv4_fold()?1:0;return v;}
+static int& kv4_tc(){static int v=knob::kv4_tc()?1:0;return v;}
+#if GR8_KV4_TEST
+static unsigned long long kv4_test_fwht_calls=0;
+#define KV4_COUNT_ROTATE() (++ga::kv4_test_fwht_calls)
+#else
+#define KV4_COUNT_ROTATE() ((void)0)
+#endif
+#endif
 constexpr int KV_BYTES=g6kv::ROW, IDX_BYTES=g6kv::IDX_ROW;
 using half=__half; using bf16=__nv_bfloat16;
 // The old C ABI remains unchanged. Static launches fold this resolver away;
@@ -270,8 +281,8 @@ __global__ void fwht_rows_qt(float* p,int rows){
         else{const int o=(c*32+lane)*4;r[o]=v0;r[o+1]=v1;r[o+2]=v2;r[o+3]=v3;}
     }
 }
-#define KV4_ROTATE_Q(p,rows,qt,st) do{if((rows)>0){if(qt)ga::fwht_rows_qt<<<((rows)+7)/8,256,0,(st)>>>((p),(rows));else ga::fwht_rows<<<((rows)+7)/8,256,0,(st)>>>((p),(rows));}}while(0)
-#define KV4_ROTATE(p,rows,st) do{if((rows)>0)ga::fwht_rows<<<((rows)+7)/8,256,0,(st)>>>((p),(rows));}while(0)
+#define KV4_ROTATE_Q(p,rows,qt,st) do{if(!ga::kv4_fold()&&(rows)>0){KV4_COUNT_ROTATE();if(qt)ga::fwht_rows_qt<<<((rows)+7)/8,256,0,(st)>>>((p),(rows));else ga::fwht_rows<<<((rows)+7)/8,256,0,(st)>>>((p),(rows));}}while(0)
+#define KV4_ROTATE(p,rows,st) do{if(!ga::kv4_fold()&&(rows)>0){KV4_COUNT_ROTATE();ga::fwht_rows<<<((rows)+7)/8,256,0,(st)>>>((p),(rows));}}while(0)
 #else
 __device__ float latent(const uint8_t* v,int d){return e4(v[d])*((const float*)(v+512))[d/128];}
 #define KV4_ROTATE(p,rows,st) do{}while(0)
@@ -797,14 +808,14 @@ static Work workspace(const G6Attn& a,void* base){
 #include "decode-small.cuh"
 static bool kv4_qt_active(){
 #if G6_KV4
-    return kv4_qt_on()&&attn_heads()&&(kv4_sc()==1||kv4_sc()==2||kv4_sc()==4);
+    return g6kv4_dispatch::qt_enable(kv4_tc()!=0, kv4_fold()!=0, kv4_qt_on()!=0, attn_heads()!=0, kv4_sc());
 #else
     return false;
 #endif
 }
 static bool kv4_fuse_rot_active(){
 #if G6_KV4
-    return kv4_fuse_rot()!=0;
+    return g6kv4_dispatch::fuse_rot_enable(kv4_fold()!=0, kv4_fuse_rot());
 #else
     return false;
 #endif
@@ -1324,3 +1335,20 @@ extern "C" int g6a_rt_unpack_int4(const void* src,size_t ss,void* dst,size_t ds,
     ga::rt_convert<false><<<(n+7)/8,256,0,(cudaStream_t)s>>>((const uint8_t*)src,ss,(uint8_t*)dst,ds,n);return (int)cudaGetLastError();
 #endif
 }
+
+#if GR8_KV4_TEST && G6_KV4
+extern "C" void g6_kv4_test_set(int fold,int tc){ga::kv4_fold()=fold;ga::kv4_tc()=tc;}
+extern "C" unsigned long long g6_kv4_test_fwht_count(int reset){auto n=ga::kv4_test_fwht_calls;if(reset)ga::kv4_test_fwht_calls=0;return n;}
+extern "C" int g6_kv4_test_scores(G6Attn a,int start,int n,const float* q,const float* rope,float* prob,int tc,cudaStream_t st){
+ if(tc)ga::kv4::scores_tc16<<<dim3(ga::TOP/64,(a.heads+15)/16,n),128,0,st>>>(a,start,q,rope,prob);
+ else ga::kv4::scores_heads<16><<<dim3(ga::TOP/8,(a.heads+15)/16,n),256,0,st>>>(a,start,q,rope,prob);
+ return (int)cudaGetLastError();
+}
+extern "C" int g6_kv4_test_parts(G6Attn a,int start,int n,const float* prob,float* parts,int tc,cudaStream_t st){
+ if(tc)ga::kv4::context_parts_tc16<<<dim3(ga::PART*2,(a.heads+15)/16,n),128,0,st>>>(a,start,prob,parts);
+ else if(n>=5)ga::kv4::context_parts_heads<8><<<dim3(ga::PART*2,(a.heads+7)/8,n),128,0,st>>>(a,start,prob,parts);
+ else ga::kv4::context_parts_heads<4><<<dim3(ga::PART*2,(a.heads+3)/4,n),128,0,st>>>(a,start,prob,parts);
+ return (int)cudaGetLastError();
+}
+extern "C" int g6_kv4_test_rotate(float* p,int rows,cudaStream_t st){KV4_ROTATE(p,rows,st);return (int)cudaGetLastError();}
+#endif

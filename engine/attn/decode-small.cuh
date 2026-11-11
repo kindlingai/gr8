@@ -677,7 +677,8 @@ static void launch_ctx_compact(const G6Attn& a,Input input,Work& w,int start,int
 template<class Input>   // qt: run_body only (attn.cu use_qt, which implies the scores_sc branch below)
 static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt=false){
  #if G6_KV4   // the INT4 row has the head-batched kernel and the generic one; the FP8-only variants below are not used
- if(attn_heads()&&(kv4_sc()==1||kv4_sc()==2||kv4_sc()==4))kv4::launch_scores_sc(a,input,w,start,n,st,qt);
+ if(attn_heads()&&kv4_tc())kv4::scores_tc16<<<dim3(TOP/64,(a.heads+15)/16,n),128,0,st>>>(input,start,w.q,w.rope,w.prob);
+ else if(attn_heads()&&(kv4_sc()==1||kv4_sc()==2||kv4_sc()==4))kv4::launch_scores_sc(a,input,w,start,n,st,qt);
  else if(attn_heads()){constexpr int HG=16;kv4::scores_heads<HG><<<dim3(TOP/8,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);}
  else mla_scores<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
  return;
@@ -694,7 +695,8 @@ static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int 
 template<class Input>
 static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,int sp=256){
  #if G6_KV4
- if(attn_heads()&&(kv4_ctx()==1||kv4_ctx()==2))kv4::launch_ctx_compact(a,input,w,start,n,st);
+ if(attn_heads()&&kv4_tc())kv4::context_parts_tc16<<<dim3(PART*2,(a.heads+15)/16,n),128,0,st>>>(input,start,w.prob,w.parts);
+ else if(attn_heads()&&(kv4_ctx()==1||kv4_ctx()==2))kv4::launch_ctx_compact(a,input,w,start,n,st);
  else if(!attn_heads())context_parts<<<dim3(PART,a.heads,n),256,0,st>>>(input,start,w.prob,w.parts);
  else if(n>=5){constexpr int HG=8;kv4::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
  else{constexpr int HG=4;kv4::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}

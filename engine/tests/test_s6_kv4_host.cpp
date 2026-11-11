@@ -1,5 +1,6 @@
 // Host-only checks for the INT4 query permutation, stable compaction and knob contract.
 #include "../knobs-rs/gr8_knobs.h"
+#include "../attn/kv4_dispatch.h"
 #include <array>
 #include <cassert>
 #include <cmath>
@@ -12,15 +13,15 @@
 #include <unistd.h>
 #include <vector>
 
-static const char* names[]={"GR8_KV4_CTX","GR8_KV4_FUSE_ROT","GR8_KV4_QT","GR8_KV4_SC","GR8_KV4_SC_TR"};
-static void knobs(const std::array<int,5>& values,int changed=-1,const char* invalid=nullptr){
+static const char* names[]={"GR8_KV4_CTX","GR8_KV4_FUSE_ROT","GR8_KV4_QT","GR8_KV4_SC","GR8_KV4_SC_TR","GR8_KV4_FOLD","GR8_KV4_TC"};
+static void knobs(const std::array<int,7>& values,int changed=-1,const char* invalid=nullptr){
     const pid_t pid=fork();assert(pid>=0);
     if(!pid){
-        for(int k=0;k<5;k++)unsetenv(names[k]);
+        for(int k=0;k<7;k++)unsetenv(names[k]);
         if(changed>=0){const std::string v=std::to_string(values[changed]);setenv(names[changed],invalid?invalid:v.c_str(),1);}
         const int errors=knob::init();
         if(invalid)_exit(errors>0?0:1);
-        const std::array<int,5> got={int(knob::kv4_ctx()),int(knob::kv4_fuse_rot()),int(knob::kv4_qt()),int(knob::kv4_sc()),int(knob::kv4_sc_tr())};
+        const std::array<int,7> got={int(knob::kv4_ctx()),int(knob::kv4_fuse_rot()),int(knob::kv4_qt()),int(knob::kv4_sc()),int(knob::kv4_sc_tr()),int(knob::kv4_fold()),int(knob::kv4_tc())};
         _exit(!errors&&got==values?0:1);
     }
     int status=0;assert(waitpid(pid,&status,0)==pid);assert(WIFEXITED(status)&&WEXITSTATUS(status)==0);
@@ -89,11 +90,24 @@ static void compaction(){
     float zero=-0.f;const float f=std::fma(0.f,std::numeric_limits<float>::quiet_NaN(),zero);
     const float selected=0.f!=0.f?f:zero;assert(same(selected,zero));
 }
+static void dispatch(){
+    for(bool tc:{false,true})for(bool fold:{false,true})for(bool qt:{false,true})
+    for(bool heads:{false,true})for(int sc:{0,1,2,3,4,8}){
+        const bool expected=!tc&&!fold&&qt&&heads&&(sc==1||sc==2||sc==4);
+        assert(g6kv4_dispatch::qt_enable(tc,fold,qt,heads,sc)==expected);
+        if(tc||fold)assert(!g6kv4_dispatch::qt_enable(tc,fold,qt,heads,sc));
+    }
+    for(bool fold:{false,true})for(int rot:{-1,0,1,2}){
+        assert(g6kv4_dispatch::fuse_rot_enable(fold,rot)==(!fold&&rot!=0));
+        if(fold)assert(!g6kv4_dispatch::fuse_rot_enable(fold,rot));
+    }
+}
 int main(){
-    const std::array<int,5> defaults={0,0,0,0,2};knobs(defaults);
-    const std::vector<int> accepted[]={{0,1,2},{0,1},{0,1},{0,1,2,4},{0,1,2}};
-    for(int k=0;k<5;k++)for(int v:accepted[k]){auto values=defaults;values[k]=v;knobs(values,k);}
+    const std::array<int,7> defaults={0,0,0,0,2,0,0};knobs(defaults);
+    const std::vector<int> accepted[]={{0,1,2},{0,1},{0,1},{0,1,2,4},{0,1,2},{0,1},{0,1}};
+    for(int k=0;k<7;k++)for(int v:accepted[k]){auto values=defaults;values[k]=v;knobs(values,k);}
     knobs(defaults,0,"3");knobs(defaults,1,"2");knobs(defaults,2,"2");knobs(defaults,3,"3");knobs(defaults,3,"8");knobs(defaults,4,"3");
-    permutation();compaction();
-    std::puts("PASS test_s6_kv4_host: knobs, 512-dim bank/permutation map, stable 4/8-warp compaction and float bits");
+    knobs(defaults,5,"2");knobs(defaults,6,"2");
+    dispatch();permutation();compaction();
+    std::puts("PASS test_s6_kv4_host: knobs, exhaustive dispatch, 512-dim bank/permutation map, stable 4/8-warp compaction and float bits");
 }

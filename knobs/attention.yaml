@@ -200,6 +200,13 @@ knobs:
     values: "0|1|2"
     doc: >-
       With GR8_KV4_SC, selects the warp reduction: 0 = per-head warp_sum, 1 = transpose reduction, 2 = eager transpose butterfly. Same bits, G6_KV4 only.
+  GR8_KV4_TC:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0..1"
+    doc: >-
+      Use sixteen-head tensor-core INT4 decode scores and context. 0 selects the non-TC INT4 decode path (GR8_KV4_SC / GR8_KV4_CTX when set, else scalar reference).
   GR8_QO_CACHE:
     scope: local
     kind: path

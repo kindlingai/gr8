@@ -98,6 +98,29 @@ fn le16(v: &[u16]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
+/// Normalized Sylvester transform along each latent row, before weight rounding.
+pub fn fwht512_rows(w: &mut [f32]) {
+    assert_eq!(w.len() % 512, 0);
+    let scale = 1.0_f64 / 512.0_f64.sqrt();
+    for row in w.chunks_exact_mut(512) {
+        let mut buf = [0.0_f64; 512];
+        for (dst, &src) in buf.iter_mut().zip(row.iter()) { *dst = src as f64; }
+        let mut len = 1;
+        while len < 512 {
+            for base in (0..512).step_by(len * 2) {
+                for j in 0..len {
+                    let u = buf[base + j];
+                    let v = buf[base + j + len];
+                    buf[base + j] = u + v;
+                    buf[base + j + len] = u - v;
+                }
+            }
+            len <<= 1;
+        }
+        for (dst, src) in row.iter_mut().zip(buf) { *dst = (src * scale) as f32; }
+    }
+}
+
 fn bf16v(v: &[f32]) -> Vec<u16> {
     v.iter().map(|&x| bf16_bits(x)).collect()
 }
@@ -139,6 +162,7 @@ struct Planner<'a> {
     trellis: bool,
     /// kv_b (UK / UV) as the release's block FP8 bytes and scales (#50); false: BF16
     kvb_fp8: bool,
+    kvb_rot: bool,
 }
 
 /// A tensor of a planned group: name, manifest dtype, shape, bytes.
@@ -321,13 +345,15 @@ impl Planner<'_> {
             }
             self.kv_b_fp8(l, &p, &f, &kvb, h0, nh)?;
         } else {
-            self.note(l, Form { what: "kv_b", src: fmt_name(&kvb), form: "BF16 (UK, UV)",
+            self.note(l, Form { what: "kv_b", src: fmt_name(&kvb), form: if self.kvb_rot { "BF16 (UK H, UV H; GR8_KV4_FOLD)" } else { "BF16 (UK, UV)" },
                                 exact: if kvb.rec.fmt == FP8_BLOCK { BF16_OF } else { ROUNDED } });
-            let (f2, kv_rows) = (f.clone(), runs(&heads, 448));
+            let (f2, kv_rows, kvb_rot) = (f.clone(), runs(&heads, 448), self.kvb_rot);
             self.gen(format!("{p}.kv_b"), vec![
                 (format!("{p}.kv_b.uk"), "bf16", vec![nh as i64, 192, 512]),
                 (format!("{p}.kv_b.uv"), "bf16", vec![nh as i64, 256, 512])], move || {
-                let w = bf16v(&decode_runs(&Matrix::open(&f2, "self_attn.kv_b_proj")?, &kv_rows, &[0..512], t)?);
+                let mut raw = decode_runs(&Matrix::open(&f2, "self_attn.kv_b_proj")?, &kv_rows, &[0..512], t)?;
+                if kvb_rot { fwht512_rows(&mut raw); }
+                let w = bf16v(&raw);
                 let (mut uk, mut uv) = (Vec::new(), Vec::new());
                 for h in 0..nh {
                     uk.extend_from_slice(&w[h * 448 * 512..][..192 * 512]);
@@ -505,6 +531,7 @@ impl Planner<'_> {
         self.note(l, Form { what: "q_b, o_proj all heads (GR8_PF_OWN=3)", src: "as above".into(), form: "MXFP8", exact: ROUNDED });
         let (f2, t) = (f.clone(), self.threads);
         let cache = qo_cache_path(p);
+        let kvb_rot = self.kvb_rot;
         self.gen(format!("{p}.qo"), vec![
             (format!("{p}.qo.q_b.mx.codes"), "u8", vec![16384, 2048]),
             (format!("{p}.qo.q_b.mx.scales"), "u8", vec![16384, 64]),
@@ -512,13 +539,13 @@ impl Planner<'_> {
             (format!("{p}.qo.o_proj.mx.scales"), "u8", vec![H as i64, 512]),
             (format!("{p}.qo.kv_b.uk"), "bf16", vec![64, 192, 512]),
             (format!("{p}.qo.kv_b.uv"), "bf16", vec![64, 256, 512])], move || {
-            let key = qo_cache_key(&f2.path);
+            let key = qo_cache_key(&f2.path, kvb_rot);
             if let (Some(c), Some(k)) = (&cache, &key) {
                 if let Some(parts) = qo_cache_read(c, k, 6) {
                     return Ok(parts);
                 }
             }
-            let parts = full_heads_make(&f2, t)?;
+            let parts = full_heads_make(&f2, t, kvb_rot)?;
             if let (Some(c), Some(k)) = (&cache, &key) {
                 qo_cache_write(c, k, &parts);
             }
@@ -536,10 +563,10 @@ fn qo_cache_path(p: &str) -> Option<String> {
     Some(format!("{d}/{}.qo.bin", p.replace('/', "_")))
 }
 
-fn qo_cache_key(src: &str) -> Option<String> {
+fn qo_cache_key(src: &str, kvb_rot: bool) -> Option<String> {
     let m = std::fs::metadata(src).ok()?;
     let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
-    Some(format!("{src}|{}|{}.{:09}", m.len(), t.as_secs(), t.subsec_nanos()))
+    Some(format!("{src}|{}|{}.{:09}{}", m.len(), t.as_secs(), t.subsec_nanos(), if kvb_rot { "|kv4fold" } else { "" }))
 }
 
 const QO_MAGIC: &[u8; 8] = b"G6QOC001";
@@ -591,7 +618,7 @@ fn qo_cache_write(path: &str, key: &str, parts: &[Vec<u8>]) {
 }
 
 /// GR8_PF_OWN=3's full-head tensors of one layer: [q_b codes, q_b scales, o_proj codes, o_proj scales, UK, UV].
-fn full_heads_make(f2: &StFile, t: usize) -> Result<Vec<Vec<u8>>, String> {
+fn full_heads_make(f2: &StFile, t: usize, kvb_rot: bool) -> Result<Vec<Vec<u8>>, String> {
     {
         {
             let q = exlr8::decode_par(&Matrix::open(f2, "self_attn.q_b_proj")?, 0..16384, 0..2048, t)?;
@@ -600,7 +627,9 @@ fn full_heads_make(f2: &StFile, t: usize) -> Result<Vec<Vec<u8>>, String> {
             let o = exlr8::decode_par(&Matrix::open(f2, "self_attn.o_proj")?, 0..H, 0..16384, t)?;
             let (oc, os) = records::mxfp8_quantize(&o, 16384);
             drop(o);
-            let w = bf16v(&exlr8::decode_par(&Matrix::open(f2, "self_attn.kv_b_proj")?, 0..64 * 448, 0..512, t)?);
+            let mut raw = exlr8::decode_par(&Matrix::open(f2, "self_attn.kv_b_proj")?, 0..64 * 448, 0..512, t)?;
+            if kvb_rot { fwht512_rows(&mut raw); }
+            let w = bf16v(&raw);
             let (mut uk, mut uv) = (Vec::new(), Vec::new());
             for h in 0..64 {
                 uk.extend_from_slice(&w[h * 448 * 512..][..192 * 512]);
@@ -716,6 +745,13 @@ pub struct Opts {
     pub trellis: bool,
     /// kv_b (UK / UV) as the release's block FP8 bytes and scales (#50, GR8_KVB=fp8); false: BF16 of them
     pub kvb_fp8: bool,
+    pub kvb_rot: bool,
+}
+
+fn validate_kvb_opts(opts: Opts, is_flash: bool) -> Result<(), String> {
+    if opts.kvb_fp8 && opts.kvb_rot { return Err("GR8_KV4_FOLD=1 cannot combine with GR8_KVB=fp8".into()); }
+    if is_flash && opts.kvb_rot { return Err("GR8_KV4_FOLD=1 is for GLM-5.3 G6_KV4 only".into()); }
+    Ok(())
 }
 
 /// Plans rank `rank`'s image at TP `nr` from the release: dense and vocabulary files under `dense_dir` (or its
@@ -725,6 +761,7 @@ pub struct Opts {
 #[allow(clippy::too_many_arguments)]
 pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, nr: usize, rank: usize,
             layout: Option<&Layout>, opts: Opts) -> Result<(V2Image, String), String> {
+    validate_kvb_opts(opts, false)?;
     let man: Json = v2plan::width_manifest(widths_path)?;
     let pieces = Model::release(&man)?;
     let formula;
@@ -750,13 +787,14 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
     let workers = gr8knobs::LOAD_THREADS.get() as usize;
     let mut p = Planner { b: Builder::new(), layout, rank, threads: (cores / workers).max(1), forms: BTreeMap::new(),
-                         qo: opts.qo, trellis: opts.trellis, kvb_fp8: opts.kvb_fp8 };
+                         qo: opts.qo, trellis: opts.trellis, kvb_fp8: opts.kvb_fp8, kvb_rot: opts.kvb_rot };
     // the release's files name the model (their metadata); the width manifest has one format for every model
     let model = flash::model_meta(dense_dir)?;
     let is_flash = model.as_ref().and_then(|m| m.get("hidden_size")).and_then(Json::str) == Some("4096");
     if model.is_some() && !is_flash { return Err(format!("{dense_dir}: model metadata of an unsupported model")); }
     let model = model.unwrap_or(Json::Null);
     if is_flash && opts.qo { return Err("Flash full-head QO prefill copies are not implemented".into()); }
+    validate_kvb_opts(opts, is_flash)?;
     if is_flash && opts.kvb_fp8 { return Err("GR8_KVB=fp8: Flash kv_b loads as BF16 only".into()); }
     let last = if is_flash { 45 } else { L_MTP };
     if is_flash { flash::globals(&mut p, dense_dir, &model)?; } else { p.vocab(dense_dir)?; }
@@ -783,6 +821,68 @@ pub fn plan(dense_dir: &str, v2_dir: &str, slices_dir: &str, widths_path: &str, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn folded_latent_invariants() {
+        let u: Vec<f32> = (0..1024).map(|i| ((i * 73 % 1021) as f32 - 510.0) / 512.0).collect();
+        let v: Vec<f32> = (0..1024).map(|i| ((i * 29 % 1009) as f32 - 504.0) / 512.0).collect();
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(&a,&b)| a as f64*b as f64).sum::<f64>();
+        let mut hu=u.clone(); let mut hv=v.clone();
+        super::fwht512_rows(&mut hu); super::fwht512_rows(&mut hv);
+        assert!((dot(&u,&u)-dot(&hu,&hu)).abs()/dot(&u,&u) < 1e-7);
+        assert!((dot(&u,&hv)-dot(&hu,&v)).abs() < 1e-6);
+        super::fwht512_rows(&mut hu);
+        assert!(hu.iter().zip(&u).all(|(a,b)| (a-b).abs()<1e-6));
+    }
+
+    #[test]
+    fn fold_options_fail_closed() {
+        let folded=super::Opts { kvb_rot:true, ..Default::default() };
+        assert!(super::validate_kvb_opts(folded,false).is_ok());
+        assert_eq!(super::validate_kvb_opts(folded,true).unwrap_err(), "GR8_KV4_FOLD=1 is for GLM-5.3 G6_KV4 only");
+        let bad=super::Opts {kvb_fp8:true,..folded};
+        assert_eq!(super::plan("", "", "", "", 4, 0, None, bad).err().unwrap(), "GR8_KV4_FOLD=1 cannot combine with GR8_KVB=fp8");
+    }
+
+    #[test]
+    fn folded_qo_cache_has_distinct_identity() {
+        let path=std::env::temp_dir().join(format!("kv4-key-{}",std::process::id()));
+        std::fs::write(&path,b"fixture").unwrap();
+        let a=super::qo_cache_key(path.to_str().unwrap(),false).unwrap();
+        let b=super::qo_cache_key(path.to_str().unwrap(),true).unwrap();
+        assert_eq!(b,format!("{a}|kv4fold"));
+        assert_ne!(crate::xxh64::xxh64(&[a.as_bytes()],0),crate::xxh64::xxh64(&[b.as_bytes()],0));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fold_knob_fresh_process() {
+        let dir=std::env::temp_dir().join(format!("kv4-gen-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","release::tests::fold_knob_child","--ignored","--nocapture"])
+            .env_clear().env("GR8_KV4_FOLD","1").env("GR8_KVB","fp8").env("GR8_GEN_CACHE",&dir)
+            .status().unwrap().success());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "fresh knob table supplied by fold_knob_fresh_process"]
+    fn fold_knob_child() {
+        assert_eq!(crate::ds41::plan("",4,0,&Default::default()).err().unwrap(),"GR8_KV4_FOLD=1 is for GLM-5.3 G6_KV4 only");
+        let mut err=[0i8;256];
+        let p=std::ptr::null();
+        let handle=unsafe{crate::g6l_release_plan(p,p,p,p,4,0,0,0,p,p,err.as_mut_ptr(),err.len())};
+        assert!(handle.is_null());
+        assert_eq!(unsafe{std::ffi::CStr::from_ptr(err.as_ptr())}.to_str().unwrap(),"GR8_KV4_FOLD=1 cannot combine with GR8_KVB=fp8");
+        let a=crate::gencache::GenCache::from_env("release kvb_rot=false").unwrap();
+        a.write("L000.kv_b", &[1,2,3,4]);
+        let b=crate::gencache::GenCache::from_env("release kvb_rot=true").unwrap();
+        assert!(b.read("L000.kv_b",4).is_none());
+        b.write("L000.kv_b", &[5,6,7,8]);
+        assert_eq!(a.read("L000.kv_b",4).unwrap(),vec![1,2,3,4]);
+        assert_eq!(b.read("L000.kv_b",4).unwrap(),vec![5,6,7,8]);
+    }
+
     #[test]
     fn qo_cache_roundtrip_and_rejects() {
         let d = std::env::temp_dir().join(format!("qoc-test-{}", std::process::id()));

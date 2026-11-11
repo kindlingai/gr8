@@ -1,6 +1,13 @@
 # S2 multi-session serving, context parallelism, the KV pool, its stores and prefix reuse. knobs/README.md describes the fields.
 prefix: "GR8_"
 knobs:
+  GR8_KV4_FOLD:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0..1"
+    doc: >-
+      Fold the normalized latent Hadamard into release UK and UV weights. Requires int4 KV and BF16 kv_b.
   GR8_CP:
     scope: agree
     kind: flag

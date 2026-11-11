@@ -525,6 +525,11 @@ def validate(o):
         raise OptionError('--v2 needs --v2-slices')
     if o.get('V2_DENSE_FORM') not in (None, 'trellis', 'rounded'):
         raise OptionError(f'--v2-dense-form {o.get("V2_DENSE_FORM")}: want trellis or rounded')
+    for key in ('KV4_FOLD', 'KV4_TC'):
+        if o.get(key) not in (None, '0', '1'):
+            raise OptionError(f'--{key.lower().replace("_", "-")} {o.get(key)}: want 0 or 1')
+    if o.get('KV4_FOLD') == '1' and (model.name != 'glm53' or o.get('KV_FORMAT') != 'int4' or o.get('KVB') == 'fp8'):
+        raise OptionError('--kv4-fold 1 requires glm53 with --kv-format int4 and BF16 kv_b')
     if o.get('KVB') not in (None, 'bf16', 'fp8'):
         raise OptionError(f'--kvb {o.get("KVB")}: want bf16 or fp8')
     # a release boot sets V2_DENSE, or --model names a release (resolve_model sets V2_DENSE after this); the engine refuses

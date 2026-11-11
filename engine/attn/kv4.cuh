@@ -296,5 +296,137 @@ __global__ void __launch_bounds__(D/2) context_pk_compact(Input input,int start,
  for(int hh=0;hh<HG;hh++)if(hh<nh){float* dst=parts+(((int64_t)row*a.heads+h0+hh)*ga::PART+part)*512;dst[d]=lo[hh];dst[d+1]=hi[hh];}
 }
 
+// The tile is independent of the total head count, including gathered CP heads.
+__device__ __forceinline__ void tc_store8(float* dst,const float* x){
+ *reinterpret_cast<float4*>(dst)=make_float4(x[0],x[1],x[2],x[3]);
+ *reinterpret_cast<float4*>(dst+4)=make_float4(x[4],x[5],x[6],x[7]);
+}
+// Each packed byte holds the even dimension in its low nibble.
+__device__ __forceinline__ __half2 tc_pair(unsigned byte,half scale){
+ return __hmul2(__floats2half2_rn(float(int(byte&15)-8),float(int((byte>>4)&15)-8)),__halves2half2(scale,scale));
+}
+template<class Input>
+__global__ void __launch_bounds__(128,4) scores_tc16(Input input,int start,const float* __restrict__ q,const float* __restrict__ rope,float* __restrict__ out){
+ using namespace nvcuda;
+ auto a=ga::resolve(input);if(!a.active)return;
+ int row=blockIdx.z,r=start+row,h0=blockIdx.y*16,j0=blockIdx.x*64,w=threadIdx.x>>5,lane=threadIdx.x&31;FOR_ROW(a,input,r);
+ const int nh=min(16,a.heads-h0);
+ __shared__ __align__(32) half sq[16][584];
+ __shared__ float qscale[16];
+ __shared__ const uint8_t* sv[4][16];
+ __shared__ __align__(32) half sk[4][16][40];
+ for(int hh=4*w;hh<4*w+4;hh++){
+  float x[18],am=0;
+  #pragma unroll
+  for(int u=0;u<18;u++){
+   int d=lane+32*u;float v=0;
+   if(hh<nh)v=d<512?q[((int64_t)row*a.heads+h0+hh)*512+d]:rope[((int64_t)row*a.heads+h0+hh)*64+d-512];
+   x[u]=v;am=fmaxf(am,fabsf(v));
+  }
+  am=ga::warp_max(am);int e=0;frexpf(am,&e);
+  const float qs=am>0?ldexpf(1.f,e-8):0.f,inv=am>0?ldexpf(1.f,8-e):0.f;
+  if(!lane)qscale[hh]=qs*(1.f/16.f);
+  #pragma unroll
+  for(int u=0;u<18;u++)sq[hh][lane+32*u]=__float2half_rn(x[u]*inv);
+  if(lane<8)sq[hh][576+lane]=__float2half_rn(0.f);
+ }
+ __syncthreads();
+ if(lane<16){int id=a.indices[(int64_t)r*ga::TOP+j0+w*16+lane];sv[w][lane]=(id>=0&&id<=a.positions[r]&&CP_MINE(a,id))?ga::kv_at(a,id):nullptr;}
+ __syncwarp();
+ const unsigned mask=__ballot_sync(0xffffffffu,lane<16&&sv[w][lane]!=nullptr);
+ const int hh=lane>>1,hs0=(lane&1)*8;
+ if(!mask){if(hh<nh){float x[8];for(int i=0;i<8;i++)x[i]=-INFINITY;tc_store8(out+((int64_t)row*a.heads+h0+hh)*ga::TOP+j0+w*16+hs0,x);}return;}
+ wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major>A;
+ wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major>B;
+ wmma::fragment<wmma::accumulator,16,16,16,float>C;wmma::fill_fragment(C,0.f);
+ const int slot=lane>>1,hl=lane&1;
+ const uint8_t* vp=sv[w][slot];
+ for(int g=0;g<16;g++){
+  __align__(16) half vals[16];
+  uint2 raw=vp?*reinterpret_cast<const uint2*>(vp+g*16+hl*8):make_uint2(0x88888888u,0x88888888u);
+  half scale=vp?reinterpret_cast<const half*>(vp+g6kv::SCALE_OFF)[g]:__float2half_rn(0.f);
+  #pragma unroll
+  for(int i=0;i<8;i++){unsigned word=i<4?raw.x:raw.y;reinterpret_cast<__half2*>(vals)[i]=tc_pair(word>>(8*(i&3)),scale);}
+  reinterpret_cast<uint4*>(&sk[w][slot][hl*16])[0]=reinterpret_cast<uint4*>(vals)[0];
+  reinterpret_cast<uint4*>(&sk[w][slot][hl*16])[1]=reinterpret_cast<uint4*>(vals)[1];
+  __syncwarp();
+  #pragma unroll
+  for(int k=0;k<32;k+=16){wmma::load_matrix_sync(A,&sq[0][g*32+k],584);wmma::load_matrix_sync(B,&sk[w][0][k],40);wmma::mma_sync(C,A,B,C);}
+  __syncwarp();
+ }
+ for(int g=0;g<2;g++){
+  __align__(16) half vals[16];
+  #pragma unroll
+  for(int i=0;i<16;i++)vals[i]=__float2half_rn(vp?__bfloat162float(reinterpret_cast<const bf16*>(vp+g6kv::ROPE_OFF)[g*32+hl*16+i]):0.f);
+  reinterpret_cast<uint4*>(&sk[w][slot][hl*16])[0]=reinterpret_cast<uint4*>(vals)[0];
+  reinterpret_cast<uint4*>(&sk[w][slot][hl*16])[1]=reinterpret_cast<uint4*>(vals)[1];
+  __syncwarp();
+  #pragma unroll
+  for(int k=0;k<32;k+=16){wmma::load_matrix_sync(A,&sq[0][512+g*32+k],584);wmma::load_matrix_sync(B,&sk[w][0][k],40);wmma::mma_sync(C,A,B,C);}
+  __syncwarp();
+ }
+ float* ws=reinterpret_cast<float*>(&sk[w][0][0]);wmma::store_matrix_sync(ws,C,16,wmma::mem_row_major);__syncwarp();
+ if(hh<nh){float x[8];for(int i=0;i<8;i++)x[i]=sv[w][hs0+i]?ws[hh*16+hs0+i]*qscale[hh]:-INFINITY;tc_store8(out+((int64_t)row*a.heads+h0+hh)*ga::TOP+j0+w*16+hs0,x);}
+}
+
+template<class Input>
+__global__ void __launch_bounds__(128,4) context_parts_tc16(Input input,int start,const float* __restrict__ probs,float* __restrict__ parts){
+ using namespace nvcuda;
+ auto a=ga::resolve(input);if(!a.active)return;
+ int row=blockIdx.z,r=start+row,h0=blockIdx.y*16,part=blockIdx.x>>1,d0=(blockIdx.x&1)*256,t=threadIdx.x,w=t>>5,lane=t&31;FOR_ROW(a,input,r);
+ const int nh=min(16,a.heads-h0),dw=d0+w*64,g0=dw>>5;
+ __shared__ const uint8_t* srows[256];
+ __shared__ __align__(32) half sp[16][264];
+ __shared__ float pscale[16];
+ __shared__ __align__(32) half sv[4][16][72];
+ bool active=false;
+ for(int j=t;j<256;j+=128){
+  int slot=part*256+j,id=a.indices[(int64_t)r*ga::TOP+slot];bool live=false;
+  if(id>=0&&id<=a.positions[r])for(int hh=0;hh<nh;hh++)live|=probs[((int64_t)row*a.heads+h0+hh)*ga::TOP+slot]!=0.f;
+  const uint8_t* vp=live?ga::kv_at(a,id):nullptr;srows[j]=vp;active|=vp!=nullptr;
+ }
+ if(!__syncthreads_or(active)){
+  for(int i=t;i<nh*64;i+=128){int hh=i/64,d=(i%64)*4;*reinterpret_cast<float4*>(parts+(((int64_t)row*a.heads+h0+hh)*ga::PART+part)*512+d0+d)=make_float4(0,0,0,0);}return;
+ }
+ for(int hh=4*w;hh<4*w+4;hh++){
+  float x[8],am=0;
+  #pragma unroll
+  for(int u=0;u<8;u++){int j=lane+32*u;float v=hh<nh&&srows[j]?probs[((int64_t)row*a.heads+h0+hh)*ga::TOP+part*256+j]:0.f;x[u]=v;am=fmaxf(am,fabsf(v));}
+  am=ga::warp_max(am);int e=0;frexpf(am,&e);float ps=am>0?ldexpf(1.f,e-8):0.f,inv=am>0?ldexpf(1.f,8-e):0.f;
+  if(!lane)pscale[hh]=ps;
+  #pragma unroll
+  for(int u=0;u<8;u++)sp[hh][lane+32*u]=__float2half_rn(x[u]*inv);
+  if(lane<8)sp[hh][256+lane]=__float2half_rn(0.f);
+ }
+ __syncthreads();
+ wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major>A;
+ wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major>B;
+ wmma::fragment<wmma::accumulator,16,16,16,float>C[4];
+ #pragma unroll
+ for(int c=0;c<4;c++)wmma::fill_fragment(C[c],0.f);
+ for(int j0=0;j0<256;j0+=16){
+  if(!__ballot_sync(0xffffffffu,lane<16&&srows[j0+lane]!=nullptr))continue;
+  int u=lane>>1,grp=lane&1;const uint8_t* vp=srows[j0+u];
+  __align__(16) half vals[32];
+  uint4 raw=vp?*reinterpret_cast<const uint4*>(vp+(g0+grp)*16):make_uint4(0x88888888u,0x88888888u,0x88888888u,0x88888888u);
+  half scale=vp?reinterpret_cast<const half*>(vp+g6kv::SCALE_OFF)[g0+grp]:__float2half_rn(0.f);
+  #pragma unroll
+  for(int i=0;i<16;i++){unsigned word=i<4?raw.x:i<8?raw.y:i<12?raw.z:raw.w;reinterpret_cast<__half2*>(vals)[i]=tc_pair(word>>(8*(i&3)),scale);}
+  #pragma unroll
+  for(int i=0;i<4;i++)reinterpret_cast<uint4*>(&sv[w][u][grp*32])[i]=reinterpret_cast<uint4*>(vals)[i];
+  __syncwarp();wmma::load_matrix_sync(A,&sp[0][j0],264);
+  #pragma unroll
+  for(int c=0;c<4;c++){wmma::load_matrix_sync(B,&sv[w][0][c*16],72);wmma::mma_sync(C[c],A,B,C[c]);}
+  __syncwarp();
+ }
+ float* ws=reinterpret_cast<float*>(&sv[w][0][0]);int hh=lane>>1,hd0=(lane&1)*8;
+ #pragma unroll
+ for(int c=0;c<4;c++){
+  wmma::store_matrix_sync(ws,C[c],16,wmma::mem_row_major);__syncwarp();
+  if(hh<nh){float x[8];for(int i=0;i<8;i++)x[i]=ws[hh*16+hd0+i]*pscale[hh];tc_store8(parts+(((int64_t)row*a.heads+h0+hh)*ga::PART+part)*512+dw+c*16+hd0,x);}
+  __syncwarp();
+ }
+}
+
 }
 #endif
