@@ -223,7 +223,7 @@ options:
       3) without overlapping, or with L set when the reply's tail repeats one earlier stretch for L tokens, the front
       end cancels the run and goes on in a new one from the reply so far plus a steering phrase. Runs the prompt also
       holds never count. M: phrase (the phrase, still thinking), phrase-close (the phrase; a trigger again within W
-      thinking tokens of it, default 512, puts the phrase and the think block's close in), close (the phrase and the
+      thinking tokens of it, default 4096, puts the phrase and the think block's close in), close (the phrase and the
       close at once) or log (only log the trigger). X caps the triggers per request (default 2). text= takes the rest
       of the spec, commas included, with the escapes \n, \t and \\. A request's loop_guard (the same string, true,
       "off" or false) wins. No guard with logprobs or a forced tool_choice (frontend/README.md, "Loop guard")

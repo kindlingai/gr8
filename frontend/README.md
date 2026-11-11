@@ -189,7 +189,7 @@ response or one stream, with the guard's tokens in the reasoning. The spec is
 | `copies` | 3 | occurrences of one window that fire the guard (2 or more) |
 | `long` | 0 | a verbatim repeat of this many tokens fires it too; 0 = off, else at least `min` |
 | `max` | 2 | triggers per request (1 to 64) |
-| `window` | 512 | `phrase-close`: how close to the phrase a second trigger must come to close the block. `log`: the least distance between two logged triggers |
+| `window` | 4096 | `phrase-close`: how close to the phrase a second trigger must come to close the block (in the replays below a loop came back 1,000 to 2,000 tokens after the phrase, so 512 almost never closed). `log`: the least distance between two logged triggers |
 | `text` | `\n\nI'm going in circles. I already have enough to act. I'll decide now and stop re-checking.\n\n` | the phrase. It takes the rest of the spec, commas included, so it comes last. Escapes: `\n`, `\t`, `\\`; any other backslash is an error |
 
 A request's `loop_guard` (the same string; `true` for the server's spec, or these defaults when the server has none;
@@ -201,8 +201,30 @@ logprobs and a forced call leaves no think block, so with `logprobs` or a forced
 aside and a request's own is refused, as for `thinking_budget`. The guard's tokens count once in `completion_tokens`
 and, inside the block, in `reasoning_tokens`; tokens the cancelled run made past the trigger do not. Each trigger logs
 one line: the mode, the trigger count, the reply token and thinking token it fired at, the repeated run's length and
-period, the copies, and what it put in. Each continuation re-prefills the prompt's last partial 4,096-row cell and the
-reasoning (above: a few seconds at 100K).
+period, the copies, and what it put in. On the TP=1 Flash recipe a continuation took 69K to 127K of its 88K to 131K
+prompt tokens from the cache, so it prefilled 1.6K to 29K tokens again.
+
+Replays (2026-11-10, TP=1 Flash recipe stable-1110, T=1, the image's budget 28,672 and boost): the three DeepSeek
+Harness steps that looped (71K, 104K and 108K-token prompts), each with the 4 seeds of 8-12 whose guard-off run
+looped, 12 runs an arm. Seeded runs do not repeat their trajectory exactly under batching, so `ctl` (the same seeds
+run again with the guard off) is the fair comparison. A good answer is a valid call whose edit or write checks
+(old_string found, `node --check` passes).
+
+| arm | loops (window 5+) | runaway (128,000 tokens, no call) | good answer | of them write/edit | mean thinking tokens | mean wall s |
+|---|---|---|---|---|---|---|
+| ctl (off) | 6 | 0 | 11 | 5 | 21,437 | 1,766 |
+| `mode=phrase` | 2 | 1 | 11 | 6 | 19,832 | 1,934 |
+| `mode=phrase-close,window=512` | 1 | 0 | 12 | 8 | 18,370 | 1,643 |
+| `mode=close` | 0 | 1 | 11 | 7 | 14,391 | 1,505 |
+| `mode=phrase-close,min=32,copies=4` | 2 | 1 | 10 | 6 | 18,916 | 2,079 |
+| `mode=phrase-close,window=4096` | 1 | 0 | 12 | 9 | 16,374 | 1,567 |
+
+A phrase alone often lets the loop come back. A close stops it, but a close that lands mid-thought (the guard's or the
+budget's) can move the reasoning into the answer, where it loops with no guard: each runaway was a close followed by
+"let me also reconsider ... fine" until `max_tokens`. `mode=phrase-close,window=4096` did best, so 4096 is the
+default window and `mode=phrase-close` the suggested spec. In the guard-off seed searches (28 runs) the detector
+fired on every run with a 5+ window and on none of the 15 whose window stayed at 3 or less. Of the 13 it fired on, one
+was a code block drafted three times across 25K tokens (in a run the budget cut anyway).
 
 ## Repeated tool calls (`--tool-repeat-guard`)
 

@@ -64,7 +64,7 @@ pub struct Spec {
 
 impl Default for Spec {
     fn default() -> Spec {
-        Spec { mode: Mode::Phrase, min: 64, copies: 3, long: 0, max: 2, window: 512, text: DEFAULT_TEXT.into() }
+        Spec { mode: Mode::Phrase, min: 64, copies: 3, long: 0, max: 2, window: 4096, text: DEFAULT_TEXT.into() }
     }
 }
 
