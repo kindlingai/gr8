@@ -1,5 +1,16 @@
 # 4-bit MLA KV latent (`--kv-format int4`, experimental, off by default)
 
+## Bit-exact decode fast paths
+
+At TP=4, `--kv-format int4` enables multi-slot warp scores (`GR8_KV4_SC=4`,
+`GR8_KV4_SC_TR=2`), lane-transposed query rotation (`GR8_KV4_QT=1`), compacted
+double-buffered context partials (`GR8_KV4_CTX=2`), and fused output rotation
+(`GR8_KV4_FUSE_ROT=1`). These kernels preserve identical output bits. The measured
+decode gains were 6.13% for long-context CP and 1.29% for short decode. Other TP
+widths and FP8 keep their existing defaults. Explicit `EXTRA_ENV` settings override
+each default without duplicate keys.
+
+
 The KV cache spends most of its bytes on the MLA latent: 512 dims per token per layer. `--kv-format int4`
 (`KV_FORMAT=int4`) stores that latent in 4 bits, so the same memory holds more pages. The rope key stays BF16 and the
 indexer keys stay FP8.

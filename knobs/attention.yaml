@@ -165,6 +165,41 @@ knobs:
     doc: >-
       The per-row decode index_scores loads its key tile with 16 B vector loads (page size 32 or more), with the same
       bytes. Read once before graph capture.
+  GR8_KV4_CTX:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0|1|2"
+    doc: >-
+      Decode attention context partials for G6_KV4 with live-slot compaction and double-buffered loads: 1 = 256 dims per CTA (block 128), 2 = 512 dims per CTA (block 256). Respects GR8_ATTN_CTX3_HG when set. Same bits, G6_KV4 only.
+  GR8_KV4_FUSE_ROT:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      Fuses the G6_KV4 output context Hadamard rotation into merge_parts and cp_lse. Same bits, G6_KV4 only.
+  GR8_KV4_QT:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With GR8_KV4_SC, decode query rotation stores each 512-dim query row lane-transposed so scores read 16-byte coalesced vectors. Same bits, G6_KV4 only.
+  GR8_KV4_SC:
+    scope: agree
+    kind: int
+    default: "0"
+    values: "0|1|2|4"
+    doc: >-
+      Decode attention scores for G6_KV4: 1, 2, or 4 key slots per warp over 16-head groups (partial tail group supported). Same bits, G6_KV4 only.
+  GR8_KV4_SC_TR:
+    scope: agree
+    kind: int
+    default: "2"
+    values: "0|1|2"
+    doc: >-
+      With GR8_KV4_SC, selects the warp reduction: 0 = per-head warp_sum, 1 = transpose reduction, 2 = eager transpose butterfly. Same bits, G6_KV4 only.
   GR8_QO_CACHE:
     scope: local
     kind: path

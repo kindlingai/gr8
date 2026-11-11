@@ -258,7 +258,10 @@ engine_defaults() {
        tp4_default ATTN_SC2 4; tp4_default ATTN_SC2_TR 2; tp4_default ATTN_CTX2 4; tp4_default ATTN_CTX3 2
        tp4_default ATTN_SEL2 16; tp4_default IDX_GRP 16; tp4_default ATTN_QT 1; tp4_default ATTN_FRONT 1
        tp4_default IDX_VEC 1; tp4_default DEC_BK 512; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1
-       tp4_default S2_DECODE_PF 4096; tp4_default S2_ADMIT_HOLD 1; tp4_default PF_SELX_CTX 53248 ;;
+       tp4_default S2_DECODE_PF 4096; tp4_default S2_ADMIT_HOLD 1; tp4_default PF_SELX_CTX 53248
+       if [ "${KV_FORMAT:-fp8}" = int4 ]; then
+         tp4_default KV4_SC 4; tp4_default KV4_SC_TR 2; tp4_default KV4_QT 1; tp4_default KV4_CTX 2; tp4_default KV4_FUSE_ROT 1
+       fi ;;
     6) SHARE_LIMIT=${SHARE_LIMIT:-131072}
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then   # 614,400 is 3,307 fp8 pages a rank at 131072 and 2,026 at 32768
          if [ "$SHARE_LIMIT" = 131072 ]; then CAP=${CAP:-$(pool_cap 3307)} || return 2; else CAP=${CAP:-$(pool_cap 2026)} || return 2; fi
@@ -391,6 +394,11 @@ GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   ENGINE_ENV="$ENGINE_ENV${IDX_GRP:+ GR8_IDX_GRP=$IDX_GRP}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_QT:+ GR8_ATTN_QT=$ATTN_QT}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_FRONT:+ GR8_ATTN_FRONT=$ATTN_FRONT}"
+  ENGINE_ENV="$ENGINE_ENV${KV4_SC:+ GR8_KV4_SC=$KV4_SC}"
+  ENGINE_ENV="$ENGINE_ENV${KV4_SC_TR:+ GR8_KV4_SC_TR=$KV4_SC_TR}"
+  ENGINE_ENV="$ENGINE_ENV${KV4_QT:+ GR8_KV4_QT=$KV4_QT}"
+  ENGINE_ENV="$ENGINE_ENV${KV4_CTX:+ GR8_KV4_CTX=$KV4_CTX}"
+  ENGINE_ENV="$ENGINE_ENV${KV4_FUSE_ROT:+ GR8_KV4_FUSE_ROT=$KV4_FUSE_ROT}"
   # the decode indexer's vector loads, the decode context buckets, the S2 MTP draft count from accept rates, S2 prefill
   # quanta and decode rounds while sessions decode, burst admissions, and prefill selx past PF_SELX_CTX (docs/SETTINGS.md):
   # off unless set; on at TP=4. DEC_BK 0 and PF_SELX_CTX 0 leave them to the engine (DEC_BK 2048, selx from 53248)
