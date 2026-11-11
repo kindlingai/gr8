@@ -48,11 +48,13 @@ pool · one `docker run`
 
 **[Recipe](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark)** · [Model page](docs/FLASH.md)
 
-### GLM-5.3 on 4 or 6 Sparks
+### GLM-5.3 on 4 Sparks
 
-52.1 tok/s for one request writing code on four boxes, 57.4 on six (one of the six clock-capped) · up to 8 requests at
-once · recipes coming soon. Until then, start it on three to six boxes with Docker Compose, from the
-[Models and install](#models-and-install) table.
+[![GLM-5.3 on four DGX Sparks: decode, prefill and concurrency](docs/cards/glm-5.3-4x-spark.png)](docs/GLM-5.3.md)
+
+63.2 tok/s for one request writing code (48-54-token prompts) · 1,513 tok/s prefill on a 32K prompt · 8 requests at
+once, 85.4 tok/s in total · a fact hidden in a 128K prompt found · one boot, measured 2026-11-10 · no recipe yet:
+start it on three to six boxes with Docker Compose, from the [Models and install](#models-and-install) table.
 
 [Model page](docs/GLM-5.3.md)
 
@@ -67,7 +69,8 @@ boxes: first boot (cold disk) 212.7 s, a switch from GLM-5.3 after that 37-39 s 
 
 **[Recipe](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)** · [Model page](docs/DEEPSEEK.md)
 
-<sub>Each card is drawn by `bench/gif.py card` from the recipe's `kindling.json` ([docs/cards/make.sh](docs/cards/make.sh)
+<sub>Each card is drawn by `bench/gif.py card` from the recipe's `kindling.json`, and the GLM-5.3 card from
+[docs/cards/glm-5.3-4x-spark.json](docs/cards/glm-5.3-4x-spark.json) ([docs/cards/make.sh](docs/cards/make.sh)
 redraws them). The model pages give each benchmark and its date.</sub>
 
 ## What gr8 does today
