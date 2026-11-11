@@ -299,6 +299,8 @@ fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<
 }
 
 /// GR8_KVB (#50): `fp8` plans kv_b (UK / UV) as the release's block FP8 bytes and scales, `bf16` as BF16.
+fn kvb_rot() -> bool { gr8knobs::KV4_FOLD.get() }
+
 fn kvb_fp8() -> Result<bool, String> {
     Ok(gr8knobs::KVB.get() == "fp8")
 }
@@ -502,11 +504,14 @@ pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *con
     let t0 = Instant::now();
     let arg = |p, what| cstr(p).ok_or(format!("g6l_release_plan: no {what}"));
     let r = (|| {
+        let kvb_fp8 = kvb_fp8()?;
+        let kvb_rot = kvb_rot();
+        if kvb_fp8 && kvb_rot { return Err("GR8_KV4_FOLD=1 cannot combine with GR8_KVB=fp8".into()); }
         let layout_path: Option<String> = cstr(layout);
         let layout = cstr(layout).map(|p| layout::Layout::read(&p)).transpose()?;
         let (img, table) = release::plan(&arg(dense_dir, "dense dir")?, &arg(v2_dir, "v2 dir")?, &arg(slices_dir, "slices dir")?,
                                          &arg(widths, "width manifest")?, nr as usize, rank as usize, layout.as_ref(),
-                                         release::Opts { qo: qo != 0, trellis: trellis != 0, kvb_fp8: kvb_fp8()? })?;
+                                         release::Opts { qo: qo != 0, trellis: trellis != 0, kvb_fp8, kvb_rot })?;
         let out = arg(out_manifest, "output manifest")?;
         std::fs::write(&out, img.manifest()).map_err(|e| format!("{out}: {e}"))?;
         if rank == 0 {
@@ -522,7 +527,7 @@ pub unsafe extern "C" fn g6l_release_plan(dense_dir: *const c_char, v2_dir: *con
                                 arg(widths, "width manifest")?);
         let lp = layout_path.clone().unwrap_or_default();
         let key_text = format!("release dense={de} v2={v2} slices={sl} widths={wd} nr={nr} rank={rank} qo={qo} trellis={trellis} \
-                                kvb_fp8={} layout={lp:?}\n{}\n{}", kvb_fp8()?, img.manifest(),
+                                kvb_fp8={kvb_fp8} kvb_rot={kvb_rot} layout={lp:?}\n{}\n{}", img.manifest(),
                                gencache::source_identity(&[&de, &v2, &sl, &wd, &lp]));
         img.cache = gencache::GenCache::from_env(&key_text);
         Ok::<_, String>(img)

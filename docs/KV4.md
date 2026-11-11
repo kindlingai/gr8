@@ -1,5 +1,30 @@
 # 4-bit MLA KV latent (`--kv-format int4`, experimental, off by default)
 
+## TP=4 INT4 folded decode default
+
+For GLM-5.3 at TP=4, `--kv-format int4` now enables folded Hadamard `UK`/`UV`
+weights (`GR8_KV4_FOLD=1`), 16-head WMMA tensor-core INT4 decode
+(`GR8_KV4_TC=1`), and batched remote CP attention (`GR8_CP_ONECHAIN=1`). The
+five bit-exact INT4 kernel settings remain enabled underneath this stack.
+`GR8_KV4_FOLD=1` requires a `--v2-dense` release boot; the engine refuses
+folded weights for a non-release boot. FP8 `kv_b` skips fold and its implicit
+TC default, retaining the exact INT4 path.
+
+Measured with live settings: long-context CP decode geomean improved 18.57%
+across 32K/64K/120K; short decode geomean improved 3.69%. This is a numerical
+quality trade, not bit-exact against the scalar reference: `mean_kl = 0.015803`,
+`qeval` 72/75 versus 71/75, and needles 40/40. `kv4_test` same-pipeline relative
+error was below `1.5e-3` and cosine above `0.999998`.
+
+Use `--kv4-tc 0 --kv4-fold 0 --cp-onechain 0` for the measured bit-exact INT4
+fast-path rollback. `CP_ONECHAIN=1` is documented bit-exact, but the exact INT4
+fast paths plus `ONECHAIN=1` were not separately boot-measured. Single-flag
+partial overrides (`--kv4-tc 0` or `--kv4-fold 0` alone), and explicit fold/TC
+flags at TP=6/3, preserve single-rotation safety but are unmeasured. TP=6/3 and
+FP8 do not acquire these defaults. `GR8_ATTN_FLIP=1` in `EXTRA_ENV` suppresses
+the implicit `CP_ONECHAIN=1`; explicit settings retain precedence.
+
+
 ## Bit-exact decode fast paths
 
 At TP=4, `--kv-format int4` enables multi-slot warp scores (`GR8_KV4_SC=4`,

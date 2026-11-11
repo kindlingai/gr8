@@ -261,6 +261,13 @@ engine_defaults() {
        tp4_default S2_DECODE_PF 4096; tp4_default S2_ADMIT_HOLD 1; tp4_default PF_SELX_CTX 53248
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then
          tp4_default KV4_SC 4; tp4_default KV4_SC_TR 2; tp4_default KV4_QT 1; tp4_default KV4_CTX 2; tp4_default KV4_FUSE_ROT 1
+         case " ${EXTRA_ENV:-} " in *" GR8_ATTN_FLIP=1 "*) ;; *) tp4_default CP_ONECHAIN 1 ;; esac
+         if [ "${KVB:-bf16}" != fp8 ]; then
+           case " ${EXTRA_ENV:-} " in *" GR8_KVB=fp8 "*) ;; *) tp4_default KV4_FOLD 1 ;; esac
+         fi
+         local _fold_eff=${KV4_FOLD:-0}
+         case " ${EXTRA_ENV:-} " in *" GR8_KV4_FOLD=1 "*) _fold_eff=1 ;; *" GR8_KV4_FOLD=0 "*) _fold_eff=0 ;; esac
+         if [ "$_fold_eff" = 1 ]; then tp4_default KV4_TC 1; fi
        fi ;;
     6) SHARE_LIMIT=${SHARE_LIMIT:-131072}
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then   # 614,400 is 3,307 fp8 pages a rank at 131072 and 2,026 at 32768
@@ -351,6 +358,9 @@ ds41_env() {
 }
 
 engine_env() {
+  if [ "${KV4_FOLD:-0}" = 1 ] && { [ "${GR8_MODEL:-glm53}" != glm53 ] || [ "${KV_FORMAT:-fp8}" != int4 ] || [ "${KVB:-bf16}" = fp8 ]; }; then
+    echo "engine_env: KV4_FOLD=1 requires glm53 int4 KV and BF16 kv_b" >&2; return 2
+  fi
   [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_env; return 0; }
   [ "${GR8_MODEL:-glm53}" = ds41 ] && { ds41_env; return 0; }
   [ "${GR8_MODEL:-glm53}" = pseudo ] && { ENGINE_BIN=g6pseudo; ENGINE_ENV=""; return 0; }
@@ -460,7 +470,7 @@ GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   # CP decode's remote head groups as one attention call (CP_ONECHAIN; docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${CP_ONECHAIN:+ GR8_CP_ONECHAIN=$CP_ONECHAIN}"
   # kv_b (UK / UV) as the release's block FP8 (KVB=fp8, #50; docs/SETTINGS.md): BF16 unless set. Needs V2_DENSE
-  ENGINE_ENV="$ENGINE_ENV${KVB:+ GR8_KVB=$KVB}"
+  ENGINE_ENV="$ENGINE_ENV${KVB:+ GR8_KVB=$KVB}${KV4_FOLD:+ GR8_KV4_FOLD=$KV4_FOLD}${KV4_TC:+ GR8_KV4_TC=$KV4_TC}"
   # deterministic fp-order attention variants (ATTN_CTX3_SP, ATTN_POSIDX; E1, docs/SETTINGS.md): off unless set
   ENGINE_ENV="$ENGINE_ENV${ATTN_CTX3_SP:+ GR8_ATTN_CTX3_SP=$ATTN_CTX3_SP}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_POSIDX:+ GR8_ATTN_POSIDX=$ATTN_POSIDX}"

@@ -270,6 +270,16 @@ int main(int argc, char** argv)
         fprintf(stderr, "# rank %d: request grammars from %s (%d mask words a row)\n", R, grammar_dir.c_str(), g6rt::grammar_words());
     }
     // --check-args: every check a boot makes before CUDA passed; stop before any CUDA, fabric or weight work
+    if (knob::kv4_fold()) {
+#if !G6_KV4
+        fprintf(stderr, "GR8_KV4_FOLD=1 requires a G6_KV4 (int4 KV) engine build\n"); return 2;
+#elif G6_MODEL_FLASH || G6_MODEL_DS41
+        fprintf(stderr, "GR8_KV4_FOLD=1 is supported on GLM-5.3 only\n"); return 2;
+#else
+        if (!release) { fprintf(stderr, "GR8_KV4_FOLD=1 requires --v2-dense (release boot) so loader-rs folds kv_b\n"); return 2; }
+        if (knob::kvb() == "fp8") { fprintf(stderr, "GR8_KV4_FOLD=1 cannot combine with GR8_KVB=fp8\n"); return 2; }
+#endif
+    }
     if (eo.check_args) { fprintf(stderr, "g6m4: --check-args: the arguments pass the parse-time checks (no CUDA, no weights)\n"); return 0; }
     // GR8_FABRIC_DUMP=1: every planned fabric's config on stdout, then exit; no file, CUDA, fabric or network work
     const bool fabric_dump = knob::fabric_dump();

@@ -1018,6 +1018,7 @@ pub struct Ds41Plan {
 /// the plan also checks that every tensor of the release's layer and vocabulary files is either in the plan or
 /// skipped on purpose (the vision routing bias).
 pub fn plan(dir: &str, nr: usize, rank: usize, opts: &Opts) -> Result<Ds41Plan, String> {
+    if gr8knobs::KV4_FOLD.get() { return Err("GR8_KV4_FOLD=1 is for GLM-5.3 G6_KV4 only".into()); }
     plan_from(&Release::open(dir)?, nr, rank, opts)
 }
 

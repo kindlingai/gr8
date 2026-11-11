@@ -292,6 +292,14 @@ options:
       KV pool in tokens, which the sessions share; the longest request is the smaller of it (less the guard rows) and
       MAX_MODEL_LEN. Lower it first when a box runs short of memory. Unset, it follows
       SHARE_LIMIT: each rank keeps the same KV memory (2,280 pages of 64 tokens at TP=4, 2,026 at TP=6, 1,941 at TP=3)
+  KV4_FOLD:
+    scope: cluster
+    doc: >-
+      0 or 1: fold the latent Hadamard into release UK and UV. Unset enables it at TP=4 for GLM int4 KV with BF16 kv_b.
+  KV4_TC:
+    scope: cluster
+    doc: >-
+      0 or 1: use sixteen-head tensor-core INT4 decode attention. Unset enables it at TP=4 when KV4_FOLD resolves to 1, else uses the engine default.
   KV_FORMAT:
     scope: cluster
     doc: >-

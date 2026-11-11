@@ -53,6 +53,59 @@ class Kv4ExactOptionsTests(unittest.TestCase):
             self.assertEqual([w for w in env if w.startswith(key + '=')], [key + '=0'])
 
 
+class Kv4OptionsTests(unittest.TestCase):
+    WORDS = Kv4ExactOptionsTests.WORDS + ('GR8_KV4_FOLD=1', 'GR8_KV4_TC=1', 'GR8_CP_ONECHAIN=1')
+
+    @staticmethod
+    def plan(*argv, tp=4):
+        plan = Kv4ExactOptionsTests.plan('--share-limit', '32768', *argv, tp=tp)
+        if plan['knobs']['SHARE_LIMIT'] != '32768':
+            raise AssertionError('tests require the stock shared prefix')
+        return plan
+
+    def assert_words_once(self, env, words):
+        for word in words:
+            self.assertEqual([w for w in env if w.startswith(word.split('=')[0] + '=')], [word])
+
+    def test_default_stack(self):
+        self.assert_words_once(self.plan('--kv-format', 'int4')['env'], self.WORDS)
+
+    def test_exact_rollback(self):
+        env = self.plan('--kv-format', 'int4', '--kv4-tc', '0', '--kv4-fold', '0', '--cp-onechain', '0')['env']
+        self.assert_words_once(env, Kv4ExactOptionsTests.WORDS +
+                               ('GR8_KV4_TC=0', 'GR8_KV4_FOLD=0', 'GR8_CP_ONECHAIN=0'))
+
+    def test_fp8_weights_keep_exact_path(self):
+        for args in (('--kvb', 'fp8'), ('--extra-env', 'GR8_KVB=fp8')):
+            env = self.plan('--kv-format', 'int4', '--v2-dense', '/release', *args)['env']
+            self.assertNotIn('GR8_KV4_FOLD=1', env)
+            self.assertNotIn('GR8_KV4_TC=1', env)
+            self.assert_words_once(env, Kv4ExactOptionsTests.WORDS)
+
+    def test_fold_override_disables_implicit_tc(self):
+        env = self.plan('--kv-format', 'int4', '--extra-env', 'GR8_KV4_FOLD=0')['env']
+        self.assert_words_once(env, ('GR8_KV4_FOLD=0',))
+        self.assertNotIn('GR8_KV4_FOLD=1', env)
+        self.assertNotIn('GR8_KV4_TC=1', env)
+
+    def test_flip_disables_implicit_onechain(self):
+        env = self.plan('--kv-format', 'int4', '--extra-env', 'GR8_ATTN_FLIP=1')['env']
+        self.assertNotIn('GR8_CP_ONECHAIN=1', env)
+
+    def test_no_defaults_for_other_shapes(self):
+        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'int4')), (4, ())):
+            env = self.plan(*args, tp=tp)['env']
+            self.assertFalse([w for w in env if w.startswith(('GR8_KV4_', 'GR8_CP_ONECHAIN='))])
+
+    def test_refusals(self):
+        for args in (('--kv4-fold', '2'), ('--kv4-tc', 'x'), ('--kv4-fold', '1'),
+                     ('--kv-format', 'int4', '--kv4-fold', '1', '--kvb', 'fp8', '--v2-dense', '/release')):
+            with self.assertRaises(opt.OptionError):
+                self.plan(*args)
+        with self.assertRaises(opt.OptionError):
+            flash('--kv-format', 'int4', '--kv4-fold', '1')
+
+
 class OptionTests(unittest.TestCase):
     def test_defaults(self):
         o = flash()

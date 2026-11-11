@@ -31,7 +31,7 @@ struct Buffer {
     }
 };
 struct Profile {int sc=0,tr=2,qt=0,ctx=0,rot=0,hg=0;};
-static void set(Profile p){ga::kv4_sc()=p.sc;ga::kv4_sc_tr()=p.tr;ga::kv4_qt_on()=p.qt;ga::kv4_ctx()=p.ctx;ga::kv4_fuse_rot()=p.rot;ga::attn_ctx3_hg()=p.hg;}
+static void set(Profile p){ga::kv4_tc()=0;ga::kv4_fold()=0;ga::kv4_sc()=p.sc;ga::kv4_sc_tr()=p.tr;ga::kv4_qt_on()=p.qt;ga::kv4_ctx()=p.ctx;ga::kv4_fuse_rot()=p.rot;ga::attn_ctx3_hg()=p.hg;}
 static std::vector<Profile> profiles(){
     std::vector<Profile> p={{}};
     for(int s:{1,2,4})for(int tr:{0,1,2})for(int qt:{0,1})p.push_back({s,tr,qt,0,0,0});
@@ -223,6 +223,13 @@ static void rotation_parity(){
     }
 }
 static void parity(){
+    for(int fold:{0,1})for(int tc:{0,1})for(int qt:{0,1})for(int rot:{0,1}){
+        ga::kv4_fold()=fold;ga::kv4_tc()=tc;ga::kv4_qt_on()=qt;
+        ga::kv4_fuse_rot()=rot;ga::kv4_sc()=4;require(ga::attn_heads(),"head-batched dispatch required");
+        require(ga::kv4_qt_active()==g6kv4_dispatch::qt_enable(tc!=0,fold!=0,qt!=0,true,4),"query dispatch coexistence");
+        require(ga::kv4_fuse_rot_active()==g6kv4_dispatch::fuse_rot_enable(fold!=0,rot),"rotation dispatch coexistence");
+    }
+    set({});
     rotation_parity();
     for(int H:{10,11,16,21,22,48})for(int M:{1,2,4,5,8,16})for(int L:{37,2048}){
         Fixture f(M,H,L);
