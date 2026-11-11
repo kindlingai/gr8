@@ -73,6 +73,16 @@ See [Shared waterfill](docs/SETTINGS.md#shared-waterfill-speculative-row-allocat
 A Flash box can lend what its serve leaves to a KV node beside it (`donate` in `tools/launch/supervisor.py`):
 the `FLASH_KV_*` and `FLASH_CAP_POLICY` options (`./gr8 knobs FLASH_`).
 
+## SSD session store (`KV_STORE`)
+
+`KV_STORE=ssd:/data/gr8kv,size=200G,persist=on,keep=sessions` keeps committed session KV across restarts.
+Continuing sessions reuse their stored full page blocks and write only new pages when evicted or drained at quit;
+with reuse alignment disabled, the changed partial page is rewritten too. A hit on its own resident run does not
+spill it. Linux SSD stores fully allocate their `size=` budget (rounded down to whole blocks) before opening, and
+fail at boot if the reserve cannot be allocated. No new knob is needed; see
+[SSD session extensions and reserve](engine/kvman-rs/SSD-TIER.md) for behavior, measurements, and limits.
+`./gr8 knobs KV_STORE` lists the existing fields.
+
 ## Rank health
 
 The launcher does not run the rank health probe: run `scripts/rank_health.sh` with the same options before a boot if

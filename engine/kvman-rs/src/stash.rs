@@ -26,8 +26,13 @@
 //!   When a run retires, the longest prefix it holds, within its span, that shared_after conversations started with
 //!   goes to the first tier that keeps shared prefixes, unless a tier has it already. The tier writes that prefix once, every later hit reads it, and it stays until
 //!   its tier needs the room. An SSD tier's index keeps the counts across restarts.
-//! - A hit on an evicted run takes the run out of its tier, a hit on a shared prefix leaves the prefix there. Either way
-//!   the blocks go back into the grant's first pages.
+//! - A hit leaves its entry in its tier, the most recently used, and the blocks go back into the grant's first pages.
+//!   The grant remembers it (pool.rs Kept::from): its pages below the hit's full pages are byte copies of the entry's.
+//! - Write only new blocks (c21, "extend in place"): an evicted run below R is stored up to its storable rows (the
+//!   grid cell below min(valid, pf_end), the most a later hit restores, reuse.rs), and a run that continues the stored
+//!   run it came from, and holds all of it, replaces that entry: the new entry keeps the old one's base and blocks below
+//!   the copied pages and writes only the pages past them. The old entry's drop record is synced first, the new one's
+//!   add record commits at io_done.
 //! - Each call's copies, in order: Moves and Spills as placement made them (a Move reads a slot before a later copy
 //!   reuses the slot), then Restores (a restore writes a page a spill of the same call may still have to read). Until
 //!   the engine has run the copies and called io_done(), the pool refuses reserve, take and grow (Error::PendingIo).
@@ -244,6 +249,8 @@ pub struct Stash {
     // tail_place: the pool's place with it, so a tail's shard pages are read out of a run's list (pool.rs page classes)
     tail: Option<(u32, u32)>,
     tail_place: u32,
+    // the pool's reuse grid (Rules::grid, 0 = none): a hit restores at most min(valid, pf_end) cut to it (storable)
+    reuse_grid: u64,
 }
 
 const FNV: u64 = 14695981039346656037;
@@ -279,7 +286,19 @@ impl Stash {
             dedupe: true,
             tail: None,
             tail_place: 0,
+            reuse_grid: grid,
         }
+    }
+
+    /// The rows of a run's finished state a stored entry can give back to a hit other than an exact replay: with a
+    /// reuse grid, min(valid, pf_end) cut to it (reuse.rs begin), else valid. The pages past them would be computed
+    /// again by the next turn's prefill, so a tier stores no more.
+    pub fn storable(&self, st: &Finished) -> u64 {
+        let valid = st.valid.max(0) as u64;
+        if self.reuse_grid == 0 {
+            return valid;
+        }
+        valid.min(st.pf_end.max(0) as u64) / self.reuse_grid * self.reuse_grid
     }
 
     /// A tier after the others. With an index, its committed shared prefixes come back (in commit order).
@@ -706,10 +725,18 @@ impl Stash {
                 }
                 n = n.min(below_pages);
             }
+            let mut from = None;
+            if tail == 0 {
+                // the rows a later hit can restore (storable): the pages past them are written again by its prefill
+                let cut = self.storable(&st);
+                st.valid = cut as i32;
+                n = n.min(pages(cut));
+                from = k.from;
+            }
             if n == 0 {
                 continue;
             }
-            self.store_tail(Kind::Evicted, 0, st, &k.list[..n], &k.list, k.hits, resident, tail as u32, k.namespace);
+            self.store_tail(Kind::Evicted, 0, st, &k.list[..n], &k.list, k.hits, resident, tail as u32, k.namespace, from);
         }
     }
 
@@ -739,12 +766,13 @@ impl Stash {
     }
 
     fn store(&mut self, kind: Kind, key: u64, st: Finished, pages: &[u32], hits: u32, resident: &[&[i32]]) {
-        self.store_tail(kind, key, st, pages, pages, hits, resident, 0, crate::pool::STOCK_NAMESPACE)
+        self.store_tail(kind, key, st, pages, pages, hits, resident, 0, crate::pool::STOCK_NAMESPACE, None)
     }
 
     // store() for a run past R whose tail is `tail` logical pages after `pages` (the pages below R). `full` is the
     // run's whole list: its tail lives at the list positions past `pages` — the shard pages this rank holds (the
-    // (below + j)-th page of the list below place) and the drafter's pages (one per logical tail page)
+    // (below + j)-th page of the list below place) and the drafter's pages (one per logical tail page). `from`: the
+    // run's provenance (pool.rs Kept::from), so an evicted run extends the entry it came from (extend)
     #[allow(clippy::too_many_arguments)]
     fn store_tail(
         &mut self,
@@ -757,6 +785,7 @@ impl Stash {
         resident: &[&[i32]],
         tail: u32,
         namespace: crate::pool::Namespace,
+        from: Option<(u64, usize)>,
     ) {
         // a run that starts with a stored prefix stores only the pages after it. Else a prefix another run in the pool
         // holds becomes one, stored once, when a tier takes it
@@ -767,6 +796,11 @@ impl Stash {
                 t.stats.refused_pages += pages.len() as u64;
             }
             return;
+        }
+        if let (Kind::Evicted, Some((eid, p)), 0) = (kind, from, tail) {
+            if self.extend(eid, p, key, &st, pages, hits, namespace) {
+                return;
+            }
         }
         let stock = namespace == crate::pool::STOCK_NAMESPACE;
         let mut base = if kind == Kind::Evicted && stock { self.shared_base(&st.history, pages.len()) } else { None };
@@ -833,6 +867,91 @@ impl Stash {
         }
     }
 
+    // Extend in place: the run's pages [0, p) are byte copies of stored run eid's pages [0, p). The run must also
+    // match eid's full history; if eid ends mid-page, the first page past p is rewritten. The run replaces eid in
+    // eid's tier: eid's base and blocks below p, then new blocks for pages [p, n) only. Returns false for the usual way
+    // (eid gone or moved on, pinned by this call's hit, another namespace, a tail, or not covered by the copies). True
+    // also when nothing is written: no page past p (eid stays as it is), or its tier refused or had no room (eid stays).
+    #[allow(clippy::too_many_arguments)]
+    fn extend(
+        &mut self,
+        eid: u64,
+        p: usize,
+        key: u64,
+        st: &Finished,
+        pages: &[u32],
+        hits: u32,
+        namespace: crate::pool::Namespace,
+    ) -> bool {
+        let n = pages.len();
+        let Some(te) = self.tiers.iter().position(|t| t.entries.iter().any(|e| e.id == eid)) else { return false };
+        let e = self.tiers[te].entries.iter().find(|e| e.id == eid).expect("found");
+        let b = e.base.map_or(0, |b| b.1);
+        let cut = self.storable(&e.st) as usize;
+        let m = (cut + 1).min(e.st.history.len());
+        let ok = e.kind == Kind::Evicted
+            && e.tail.is_none()
+            && e.namespace == namespace
+            && !self.pin.contains(&eid)
+            // A grid-off hit may stop mid-page. Its last partial page must be rewritten,
+            // while the full pages before it still come from eid unchanged.
+            && p >= cut / PAGE as usize
+            && p <= e.below()
+            && p >= b
+            && p <= n
+            && st.history.len() >= m
+            && st.history[..m] == e.st.history[..m];
+        if !ok {
+            return false;
+        }
+        if n == p {
+            return true;
+        }
+        let base = e.base;
+        let pinned = self.pin.len();
+        self.pin.push(eid);
+        self.pin.extend(base.map(|b| b.0));
+        let placed = self.try_place(te, Kind::Evicted, n - p, st.valid.max(0) as u64, hits);
+        self.pin.truncate(pinned);
+        let new = match placed {
+            Ok(slots) => slots,
+            Err(refused) => {
+                if refused {
+                    self.tiers[te].stats.refused += 1;
+                    self.tiers[te].stats.refused_pages += (n - p) as u64;
+                }
+                return true;
+            }
+        };
+        // eid leaves: its drop record reaches the disk before any of its slots is reused (its blocks below p are the new
+        // entry's, whose add record commits at io_done; a crash in between loses this session, never names reused blocks)
+        let tier = &mut self.tiers[te];
+        let i = tier.entries.iter().position(|e| e.id == eid).expect("pinned through the placement");
+        let old = tier.entries.remove(i);
+        if let (true, Some(ix)) = (tier.whole, &mut tier.index) {
+            if ix.drop(eid).is_err() {
+                self.index_errors += 1;
+            }
+        }
+        self.commits.retain(|c| *c != (te, eid));
+        let keep = p - b;
+        // an entry stored past its storable rows (an older engine): those blocks go
+        tier.alloc.release(&old.slots[keep..]);
+        let t = te as u32;
+        self.io.extend(pages[p..].iter().zip(&new).map(|(&page, &slot)| Io::Spill { tier: t, page, slot, part: Part::Full }));
+        let mut slots = old.slots[..keep].to_vec();
+        slots.extend(new);
+        let id = self.next_id;
+        self.next_id += 1;
+        let tier = &mut self.tiers[te];
+        tier.stats.spilled_pages += (n - p) as u64;
+        tier.entries.push(Entry { id, kind: Kind::Evicted, key, st: st.clone(), slots, base, hits, tail: None, namespace });
+        if tier.index.is_some() && tier.whole {
+            self.commits.push((te, id));
+        }
+        true
+    }
+
     // a prefix entry of its own (no base): its id, or None when no tier takes it
     fn put(&mut self, kind: Kind, key: u64, st: Finished, pages: &[u32], hits: u32) -> Option<u64> {
         let (t, slots) = self.place(0, kind, pages.len(), st.valid.max(0) as u64, hits)?;
@@ -864,21 +983,12 @@ impl Stash {
     fn place(&mut self, start: usize, kind: Kind, n: usize, rows: u64, hits: u32) -> Option<(usize, Vec<u64>)> {
         let mut refused = None;
         for t in start..self.tiers.len() {
-            if !self.tiers[t].keep.takes(kind) {
-                continue;
-            }
-            if n as u64 > self.tiers[t].slots {
-                self.tiers[t].stats.oversize += 1;
-                self.tiers[t].stats.oversize_last = n as u64;
-                continue;
-            }
-            if !self.tiers[t].admits(kind, rows, hits) || !self.writable() {
-                refused.get_or_insert(t);
-                continue;
-            }
-            if self.make_room(t, n) {
-                self.charge(n);
-                return Some((t, self.tiers[t].alloc.alloc(n).expect("room made")));
+            match self.try_place(t, kind, n, rows, hits) {
+                Ok(slots) => return Some((t, slots)),
+                Err(true) => {
+                    refused.get_or_insert(t);
+                }
+                Err(false) => {}
             }
         }
         if let Some(t) = refused {
@@ -888,12 +998,42 @@ impl Stash {
         None
     }
 
+    // tier t's slots for n blocks, when its keep and policy take the entry and it can make room. Err(true): the policy or
+    // the write limit refused it; Err(false): the tier does not keep the kind, is too small, or is full of pinned entries
+    fn try_place(&mut self, t: usize, kind: Kind, n: usize, rows: u64, hits: u32) -> Result<Vec<u64>, bool> {
+        if !self.tiers[t].keep.takes(kind) {
+            return Err(false);
+        }
+        if n as u64 > self.tiers[t].slots {
+            self.tiers[t].stats.oversize += 1;
+            self.tiers[t].stats.oversize_last = n as u64;
+            return Err(false);
+        }
+        if !self.tiers[t].admits(kind, rows, hits) || !self.writable() {
+            return Err(true);
+        }
+        if self.make_room(t, n) {
+            self.charge(n);
+            return Ok(self.tiers[t].alloc.alloc(n).expect("room made"));
+        }
+        Err(false)
+    }
+
+    // evicts tier t's least recently used unpinned entries until n slots are free. Leaves first: the oldest entry no
+    // entry uses as its base, so a shared base leaves after the runs on it; else the oldest unpinned one
     fn make_room(&mut self, t: usize, n: usize) -> bool {
         if self.tiers[t].alloc.free() < n as u64 {
             self.tiers[t].stats.full += 1;
         }
         while self.tiers[t].alloc.free() < n as u64 {
-            let Some(i) = self.tiers[t].entries.iter().position(|e| !self.pin.contains(&e.id)) else { return false };
+            let bases: HashSet<u64> = self.tiers.iter().flat_map(|x| &x.entries).filter_map(|e| e.base.map(|b| b.0)).collect();
+            let entries = &self.tiers[t].entries;
+            let unpinned = |e: &&Entry| !self.pin.contains(&e.id);
+            let pick = entries
+                .iter()
+                .position(|e| unpinned(&e) && !bases.contains(&e.id))
+                .or_else(|| entries.iter().position(|e| unpinned(&e)));
+            let Some(i) = pick else { return false };
             let e = self.tiers[t].entries.remove(i);
             self.evict(t, e);
         }
@@ -979,23 +1119,16 @@ impl Stash {
         self.tiers.iter().flat_map(|t| &t.entries).find(|e| e.id == id).map(|e| &e.st.history[..])
     }
 
-    /// A hit's entry, for a grant: an evicted run leaves its tier (its slots stay held until restore() queues the
-    /// copies), a shared prefix stays, pinned against this call's placements, and becomes the most recently used.
+    /// A hit's entry, for a grant: it stays in its tier (an evicted run too: the grant's run, stored later, extends it
+    /// in place), pinned with its base against this call's placements, and becomes the most recently used. No index
+    /// record changes, so a crash before the run is stored again still finds the entry.
     pub(crate) fn begin_restore(&mut self, t: usize, id: u64) -> Entry {
         let tier = &mut self.tiers[t];
         let i = tier.entries.iter().position(|e| e.id == id).expect("found by the caller");
         let e = tier.entries.remove(i);
         tier.stats.hits += 1;
-        // an evicted run leaves the store: its record goes before its slots can be reused
-        if let (false, true, Some(ix)) = (e.kind.prefix(), tier.whole, &mut tier.index) {
-            if ix.drop(e.id).is_err() {
-                self.index_errors += 1;
-            }
-        }
-        if e.kind.prefix() {
-            tier.entries.push(e.clone());
-            self.pin.push(id);
-        }
+        tier.entries.push(e.clone());
+        self.pin.push(id);
         self.pin.extend(e.base.map(|b| b.0));
         e
     }
@@ -1055,9 +1188,6 @@ impl Stash {
             restored += shard.len() + cap as usize;
         }
         self.tiers[t].stats.restored_pages += restored as u64;
-        if e.kind == Kind::Evicted {
-            self.tiers[t].alloc.release(&e.slots);
-        }
         self.pin.clear();
     }
 

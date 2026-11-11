@@ -385,8 +385,9 @@ fn a_chat_counts_once_and_a_shared_prefix_is_stored_at_the_third_conversation() 
 fn a_full_tier_moves_its_oldest_entry_on() {
     let mut r = Rank::new(16, 16, 16 * 64, &[(4, Keep::Evicted), (16, Keep::Evicted)], 3);
     let mut runs = Vec::new();
+    // 240 + 30 tokens: a tier stores the 256 rows a hit can restore (two grid cells, 4 pages)
     for c in 0..4 {
-        let (_, _, t) = session(&mut r, &toks(10 + c, 200), 30);
+        let (_, _, t) = session(&mut r, &toks(10 + c, 240), 30);
         runs.push(t);
         flush(&mut r);
     }
@@ -518,7 +519,8 @@ fn a_run_on_a_stored_shared_prefix_spills_only_its_own_pages() {
     let e = r.pool.stash().unwrap().entries(0).iter().find(|e| e.st.history == hist).cloned().unwrap();
     assert_eq!(e.base, Some((shared, 4)));
     assert_eq!(r.pool.tier_stats(0).unwrap().spilled_pages - before, e.slots.len() as u64);
-    assert_eq!(e.pages(), 8);
+    // 449 valid rows: stored up to the 384 a hit can restore (grid 128), 6 pages
+    assert_eq!(e.pages(), 6);
     // and it comes back whole: the shared prefix's blocks, then its own
     let mut p2 = hist.clone();
     p2.extend(toks(10, 5));
@@ -1106,8 +1108,8 @@ fn a_whole_index_brings_back_evicted_runs_after_a_restart() {
     }
     r.pool.io_done().unwrap();
     drop(r);
-    // the hit took the run out of the store, and the index says so
-    assert!(open(true).pool.stash().unwrap().entries(0).len() < before.len());
+    // the hit leaves the run in the store (its next store extends it), and the index still has it
+    assert_eq!(open(true).pool.stash().unwrap().entries(0).len(), before.len());
     // a prefixes-only index (persist=on) never kept the run
     let _ = std::fs::remove_dir_all(&dir);
     {
@@ -1213,15 +1215,20 @@ fn a_run_whose_base_is_in_a_later_tier_comes_back_and_a_lost_base_drops_it() {
 
 // the quit sweep (g6m4.cu): reserve at --cap rows until refused (a live run still holds rows), then
 // halving sizes down to one page, which is always tried last, so a retained one-page run is stored too (pool of 12
-// pages: 768, 384, 192, 96, then 64 rows)
+// pages: 768, 384, 192, 96, then 64 rows). A grid of 64 rows, so a one-page run is storable (one grid cell): 64 rows
+// computed, and its history holds the next token
 #[test]
 fn the_quit_drains_fallback_ends_with_one_page_and_stores_the_last_retained_run() {
-    let mut r = Rank::new(12, 12, 12 * 64, &[(64, Keep::All)], 2);
+    let mut p = Pool::new(12, 12, 12 * 64).unwrap();
+    p.keep(Rules { strict: false, noend: true, grid: 64 });
+    p.stores(2);
+    p.add_tier(64, Keep::All, None).unwrap();
+    let mut r = Rank::with(p, vec![64]);
     let _live = r.pool.reserve(128, 128).unwrap();
     let run = r.pool.reserve(64, 64).unwrap();
-    let tokens = toks(1, 64);
+    let tokens = toks(1, 65);
     let list = r.pool.list(&run).unwrap().to_vec();
-    r.write(&list, 0, &tokens);
+    r.write(&list, 0, &tokens[..64]);
     r.pool.retain(&run, finished(&tokens)).unwrap();
     r.run_io();
     r.pool.write_limit(0);
@@ -1318,4 +1325,250 @@ fn records_with_slots_past_the_tier_or_taken_twice_are_dropped_and_counted() {
     let left: Vec<u64> = Index::open(&dir, "bad").unwrap().1.iter().map(|e| e.id).collect();
     assert_eq!(left, vec![1], "their records are gone");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- c21 step 2 (D2: extend in place): a store writes only new blocks ----
+
+// a whole pool reservation that evicts every retained run: its copies
+fn evict_all(r: &mut Rank) -> Vec<Io> {
+    let n = r.pool.pool_pages() as u64 * PAGE;
+    let all = r.pool.reserve(n, n).unwrap();
+    let io = r.run_io();
+    r.pool.release(&all).unwrap();
+    io
+}
+
+fn spills(io: &[Io]) -> Vec<(u32, u64)> {
+    io.iter().filter_map(|x| if let Io::Spill { page, slot, .. } = *x { Some((page, slot)) } else { None }).collect()
+}
+
+// one turn by hand: count, match, take, copies; checks the restored rows; retires the run after `gen` tokens
+fn turn(r: &mut Rank, prompt: &[i32], gen: usize) -> (g6kvman::Hit, Vec<u32>, Vec<i32>) {
+    r.pool.count(prompt, None);
+    let rows = (prompt.len() + gen + 1) as u64;
+    let h = r.pool.match_prefix(prompt, rows, rows, prompt.len() as i32 - 1);
+    let run = if h.skip > 0 {
+        r.pool.take_hit(h.skip, h.age, h.stored.then_some(h.tier), rows, rows).unwrap()
+    } else {
+        r.pool.reserve(rows, rows).unwrap()
+    };
+    r.run_io();
+    let list = r.pool.list(&run).unwrap().to_vec();
+    for (row, &t) in prompt.iter().enumerate().take(h.skip.max(0) as usize) {
+        assert_eq!(r.dev[list[row / ROWS] as usize][row % ROWS], t, "restored row {row}");
+    }
+    let mut t = prompt.to_vec();
+    t.extend(toks(-1 - prompt.len() as i32, gen));
+    r.write(&list, h.skip.max(0) as usize, &t);
+    r.pool.retain(&run, finished(&t)).unwrap();
+    r.run_io();
+    (h, list, t)
+}
+
+#[test]
+fn a_stored_hit_keeps_its_entry_and_the_next_store_writes_only_new_pages() {
+    let mut r = Rank::new(16, 16, 16 * 64, &[(64, Keep::All)], 3);
+    let (_, _, t1) = session(&mut r, &toks(1, 300), 20);
+    evict_all(&mut r);
+    // 319 valid rows: stored up to the 256 a hit restores (grid 128)
+    let e1 = r.pool.stash().unwrap().entries(0)[0].clone();
+    assert!(r.pool.stash().unwrap().entries(0).len() == 1 && e1.st.valid == 256 && e1.slots.len() == 4, "{e1:?}");
+    let mut p2 = t1.clone();
+    p2.extend(toks(2, 100));
+    r.pool.count(&p2, None);
+    let rows = p2.len() as u64 + 21;
+    let h = r.pool.match_prefix(&p2, rows, rows, p2.len() as i32 - 1);
+    assert!(h.stored && h.age == e1.id && h.skip == 256, "{h:?}");
+    let run = r.pool.take_hit(h.skip, h.age, Some(h.tier), rows, rows).unwrap();
+    let io = r.run_io();
+    assert!(spills(&io).is_empty());
+    assert_eq!(r.pool.stash().unwrap().entries(0), std::slice::from_ref(&e1), "the hit keeps its entry");
+    let list = r.pool.list(&run).unwrap().to_vec();
+    let mut t2 = p2.clone();
+    t2.extend(toks(3, 20));
+    r.write(&list, 256, &t2);
+    r.pool.retain(&run, finished(&t2)).unwrap();
+    r.run_io();
+    // evicted with 439 valid rows, 384 storable: only pages 4 and 5 are written, e1's blocks hold pages 0..4
+    let sp = spills(&evict_all(&mut r));
+    assert_eq!(sp.iter().map(|s| s.0).collect::<Vec<_>>(), list[4..6].to_vec());
+    let e = r.pool.stash().unwrap().entries(0).to_vec();
+    assert_eq!(e.len(), 1, "the extended entry replaces e1");
+    let e2 = e[0].clone();
+    assert!(e2.id != e1.id && e2.st.valid == 384 && e2.st.history == t2 && e2.base == e1.base, "{e2:?}");
+    assert_eq!(e2.slots[..4], e1.slots[..]);
+    assert_eq!(e2.slots[4..], sp.iter().map(|s| s.1).collect::<Vec<_>>()[..]);
+    assert_eq!(r.pool.tier_stats(0).unwrap().spilled_pages, 6, "4 blocks, then 2");
+    r.check_slots();
+    // the next turn gets all 384 rows back (turn checks them), and its store writes the next new page only
+    let mut p3 = t2.clone();
+    p3.extend(toks(4, 60));
+    let (h, _, _) = turn(&mut r, &p3, 20);
+    assert!(h.stored && h.skip == 384, "{h:?}");
+    assert_eq!(spills(&evict_all(&mut r)).len(), 2, "pages 6 and 7 (527 valid rows, 512 storable)");
+    assert_eq!(r.pool.stash().unwrap().entries(0).len(), 1);
+    r.check_slots();
+}
+
+#[test]
+fn a_pool_hit_on_its_own_run_spills_nothing() {
+    let mut r = Rank::new(16, 16, 16 * 64, &[(64, Keep::All)], 3);
+    let (_, _, mut t) = session(&mut r, &toks(1, 300), 20);
+    for c in 2..5 {
+        t.extend(toks(c, 60));
+        let (h, _, t2) = turn(&mut r, &t, 20);
+        assert!(h.skip > 0 && !h.stored, "turn {c} takes its own retained run: {h:?}");
+        t = t2;
+        assert_eq!(r.pool.tier_stats(0).unwrap().spilled_pages, 0, "turn {c}: the grant holds all a tier would store");
+        assert!(r.pool.stash().unwrap().entries(0).is_empty());
+    }
+    // the last run, evicted: stored once, up to its storable rows (559 valid, 512)
+    let n = spills(&evict_all(&mut r)).len();
+    let e = r.pool.stash().unwrap().entries(0).to_vec();
+    assert!(e.len() == 1 && e[0].st.history == t && e[0].st.valid == 512 && e[0].slots.len() == 8 && n == 8, "{e:?}");
+}
+
+// a run a pool hit takes without spilling it (another conversation's hit holds all a tier would store of it) still
+// leaves its head behind: its conversation's next prompt continues it, so min_hits takes the next run
+#[test]
+fn a_run_a_hit_takes_unspilled_still_continues_its_chat() {
+    let mut r = Rank::new(16, 16, 16 * 64, &[(64, Keep::All)], 3);
+    r.pool.set_policy(0, Policy { min_rows: 0, min_hits: 1, block_bytes: 4096 }).unwrap();
+    let system = toks(1, 200);
+    let mut x = system.clone();
+    x.extend(toks(2, 20));
+    let (_, _, xt) = turn(&mut r, &x, 5); // 224 valid rows: 128 storable
+    let mut y = system.clone();
+    y.extend(toks(3, 20));
+    let (h, _, _) = turn(&mut r, &y, 5);
+    assert!(h.skip == 128 && !h.stored, "y takes x's run for the system prompt: {h:?}");
+    assert_eq!(r.pool.tier_stats(0).unwrap().spilled_pages, 0, "x's run holds nothing past it: not spilled");
+    let mut x2 = xt.clone();
+    x2.extend(toks(4, 100));
+    assert_eq!(r.pool.count(&x2, None), 0, "x's next prompt continues x");
+    let (_, _, x2t) = turn(&mut r, &x2, 20);
+    evict_all(&mut r);
+    let e = r.pool.stash().unwrap().entries(0).to_vec();
+    assert!(e.iter().any(|e| e.kind == Kind::Evicted && e.st.history == x2t && e.hits == 1), "{e:?}");
+}
+
+fn whole(dir: &std::path::Path) -> Rank {
+    let mut p = pool(16, 16, 16 * 64, 3);
+    p.add_tier(64, Keep::All, Some((dir, "d2-test"))).unwrap();
+    p.stash_mut().unwrap().index_whole(0);
+    assert_eq!(p.tiers_loaded(), 0);
+    Rank::with(p, vec![64])
+}
+
+// an extended entry's records: the old entry's drop (synced at once) and the new one's add (at io_done). After a
+// restart the committed extension is back; an extension whose add never committed (the engine died before io_done)
+// loses its session and only that one; a torn record at the end of the log changes nothing
+#[test]
+fn an_extended_entry_survives_a_restart_and_an_uncommitted_one_loses_only_its_session() {
+    let dir = std::env::temp_dir().join(format!("g6kv-d2-ext-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (a2, blocks) = {
+        let mut r = whole(&dir);
+        let (_, _, a) = session(&mut r, &toks(1, 300), 20);
+        let (_, _, b) = session(&mut r, &toks(2, 300), 20);
+        evict_all(&mut r);
+        assert_eq!(r.pool.stash().unwrap().entries(0).len(), 2);
+        // a's next turn, evicted: its entry extended in place, committed
+        let mut p = a.clone();
+        p.extend(toks(3, 100));
+        let (h, _, a2) = turn(&mut r, &p, 20);
+        assert!(h.stored && h.skip == 256, "{h:?}");
+        assert_eq!(spills(&evict_all(&mut r)).len(), 2);
+        // b's next turn: its extension is queued, and the engine dies before io_done
+        let mut p = b.clone();
+        p.extend(toks(4, 100));
+        let (h, _, _) = turn(&mut r, &p, 20);
+        assert!(h.stored && h.skip == 256, "{h:?}");
+        let n = r.pool.pool_pages() as u64 * PAGE;
+        r.pool.reserve(n, n).unwrap();
+        let io = r.pool.io();
+        assert_eq!(spills(&io).len(), 2, "b's extension writes its new pages");
+        (a2, r.tiers.clone())
+    };
+    let check = |r: &Rank| {
+        let e = r.pool.stash().unwrap().entries(0).to_vec();
+        assert_eq!(e.len(), 1, "a's extension only: {e:?}");
+        assert!(e[0].st.history == a2 && e[0].st.valid == 384 && e[0].slots.len() == 6, "{e:?}");
+    };
+    let mut r = whole(&dir);
+    check(&r);
+    r.check_slots();
+    // a's blocks hold its rows: the next turn restores all 384 (turn checks them)
+    r.tiers = blocks.clone();
+    let mut p = a2.clone();
+    p.extend(toks(5, 10));
+    let (h, _, _) = turn(&mut r, &p, 5);
+    assert!(h.stored && h.skip == 384, "{h:?}");
+    drop(r);
+    // a torn record at the end of the log
+    let ix = dir.join("index");
+    let mut raw = std::fs::read(&ix).unwrap();
+    raw.extend_from_slice(&[40, 0, 0, 0, 1, 2, 3]);
+    std::fs::write(&ix, raw).unwrap();
+    check(&whole(&dir));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// a hit writes no index record: an engine that dies after a hit, before the run is stored again, finds the entry at
+// the next boot with the same blocks
+#[test]
+fn a_hit_kept_entry_survives_a_crash() {
+    let dir = std::env::temp_dir().join(format!("g6kv-d2-crash-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (a, e1, blocks) = {
+        let mut r = whole(&dir);
+        let (_, _, a) = session(&mut r, &toks(1, 300), 20);
+        evict_all(&mut r);
+        let e1 = r.pool.stash().unwrap().entries(0)[0].clone();
+        (a, e1, r.tiers.clone())
+    };
+    let next = |a: &[i32]| {
+        let mut p = a.to_vec();
+        p.extend(toks(2, 100));
+        p
+    };
+    {
+        let mut r = whole(&dir);
+        r.tiers = blocks.clone();
+        let p = next(&a);
+        r.pool.count(&p, None);
+        let rows = p.len() as u64 + 21;
+        let h = r.pool.match_prefix(&p, rows, rows, p.len() as i32 - 1);
+        assert!(h.stored && h.skip == 256, "{h:?}");
+        r.pool.take_hit(h.skip, h.age, Some(h.tier), rows, rows).unwrap();
+        r.run_io();
+        // the engine dies here, mid-session
+    }
+    let mut r = whole(&dir);
+    assert_eq!(r.pool.stash().unwrap().entries(0), std::slice::from_ref(&e1), "the entry is back as it was");
+    r.tiers = blocks;
+    let (h, _, _) = turn(&mut r, &next(&a), 20);
+    assert!(h.stored && h.age == e1.id && h.skip == 256, "{h:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_grid_off_partial_page_extension_restores_every_row() {
+    let mut p = Pool::new(16, 16, 16 * PAGE as u32).unwrap();
+    p.keep(Rules { strict: false, noend: true, grid: 0 });
+    p.stores(2);
+    p.add_tier(64, Keep::All, None).unwrap();
+    p.set_policy(0, Policy { min_rows: 0, min_hits: 0, block_bytes: 1 }).unwrap();
+    let mut r = Rank::with(p, vec![64]);
+    let (_, _, mut chat) = turn(&mut r, &toks(1, 300), 20);
+    evict_all(&mut r);
+    for i in 2..7 {
+        chat.extend(toks(i, 60));
+        let (h, _, next) = turn(&mut r, &chat, 20);
+        assert!(h.stored && h.skip > 0, "turn {i}: {h:?}");
+        evict_all(&mut r);
+        r.check_slots();
+        assert_eq!(r.pool.stash().unwrap().entries(0).len(), 1, "turn {i}: one extended entry");
+        chat = next;
+    }
 }

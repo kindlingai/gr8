@@ -1,7 +1,98 @@
-# An SSD tier for retained runs: proof of concept
+# SSD KV store: session extensions and reserved space
 
-Status: the original proof of concept, measured and simulated. The engine now uses `src/tier.rs` through `src/blocks.rs`
-and `src/stash.rs` (`--kv-store ssd:PATH`, experimental; see [REMOTE-TIER.md](REMOTE-TIER.md), Stage B).
+The engine uses `src/tier.rs` through `src/blocks.rs` and `src/stash.rs` for `KV_STORE=ssd:PATH` (`--kv-store`,
+experimental). The existing `keep=sessions` (or `all`) policy now reuses stored page blocks when a conversation
+continues; no new option is needed. `persist=on` also keeps committed sessions across a restart.
+
+```text
+KV_STORE=ssd:/data/gr8kv,size=200G,persist=on,keep=sessions
+```
+
+## Write only the new pages
+
+A hit no longer consumes the stored session. It leaves the entry in its tier, most recently used, and the new run
+remembers which full pages came from it. When that run is evicted or drained at orderly shutdown, it extends the
+entry in place: keep the old blocks below that boundary and write only the new pages. A continuing hit on the
+session's own resident run does not spill it just because the conversation grew.
+
+For runs without a stored tail, the stored extent is `min(valid, pf_end)` rounded down to the reuse grid. Pages
+beyond it would be recomputed on the next non-replay hit. With the grid disabled, the extent is `valid`: a hit may
+end inside a page, so the changed partial page is rewritten while earlier full pages are reused. A run shorter than
+one grid cell is not stored. Runs with CP tails past R retain their existing store path.
+
+This is provenance-based reuse, not token-based deduplication across unrelated runs. If the previous entry has
+been evicted, the prompt branches, or the provenance does not cover it, the normal store path applies. Shared
+prefixes can still leave duplicates beyond the aligned prefix boundary. If an extension cannot fit or the write
+policy refuses it, the earlier entry stays available.
+
+A hit writes no index drop. An extension syncs the old entry's drop before its slots can be reused and commits the
+replacement only after its copies complete. A crash between those records can lose that session's cached extent,
+not turn an incomplete replacement into a valid hit. Resident sessions are not checkpointed every turn; a crash
+keeps only previously committed entries, whereas an orderly shutdown drains retained runs. The index format is
+unchanged; the engine's existing build/model compatibility checks still apply.
+
+## Reserve the SSD space before opening the cache
+
+On Linux, opening an SSD block file now uses `fallocate` (mode 0) for its entire slot capacity, rather than merely
+setting a sparse file's length. The `size=` budget is rounded down to whole blocks; those blocks are fully allocated
+before the cache opens. Other files cannot claim that reserved space. Not enough space, or a filesystem that cannot
+preallocate, is an open/boot error rather than a delayed write failure. Reopening also reserves the extent without
+changing existing block contents. Non-Linux platforms retain the existing file-sizing behavior.
+
+The CPU reserve test checks allocated bytes and writes/reads the last slot across reopen in the temporary directory.
+A separate proof was run by hand on an isolated 16 MiB tmpfs: reserving 12 MiB caused a competing 8 MiB allocation
+to fail with ENOSPC. CI cannot mount that isolated filesystem, so this is manual evidence, not a CI assertion.
+That competing-file proof was measured on a dev tmpfs, not on the Spark SSD filesystem; full allocation on the
+Spark filesystem was checked separately below.
+
+## c21 dev measurement
+
+CPU pool harness, not device I/O timing: 64-row pages, reuse grid 4,096, `min_hits=1`, no write limit, one whole-index
+`Keep::All` tier, runs below R, including the quit drain. A block is 3,506,176 B; GB below means 1e9 B. "New" means
+content never written before in that scenario (token history through the page's last valid row plus its next token,
+the MTP dependency); write amplification is written/new. The regression also stamps rows by computing turn and
+checks restores against their originating run, not just token equality.
+
+| Scenario | Before: written / new blocks | Before: rewritten blocks | Before: written / new GB | Before amplification | Extend in place: written / rewritten blocks | After amplification |
+|---|---|---|---|---|---|---|
+| A: one chat, 10 turns, evicted between turns | 3,519 / 555 | 2,964 | 12.34 / 1.95 | 6.34 | 512 / 0 | 1.00 |
+| A0: same chat, no other traffic | 1,983 / 555 | 1,428 | 6.95 / 1.95 | 3.57 | 512 / 0 | 1.00 |
+| B: two chats, 8 turns each, evicting each other | 6,678 / 1,200 | 5,478 | 23.41 / 4.21 | 5.57 | 1,152 / 0 | 1.00 |
+| C: four chats sharing a 10,000-token system prompt | 2,776 / 952 | 1,824 | 9.73 / 3.34 | 2.92 | 896 / 84 | 1.10 |
+
+The after totals store fewer distinct blocks because the trailing incomplete grid cell is no longer written.
+C's remaining 84 rewrites are three copies of 28 system-prompt pages beyond the shared 8,192-row boundary. With an
+8,192-token system prompt (C8), the harness checks zero rewrites. It also checks two ranks' copy lists and digests,
+restart, a full store under eviction pressure, and grid-off partial-page restore contents
+(`tests/c21_write_amp.rs`, `tests/c21_grid_off.rs`, `tests/stash.rs`).
+
+## Historical c21 Spark measurement (not a main+port benchmark)
+
+Measured on a TP6 Spark ring before this port: a five-turn roughly 99K-token chat plus four pressure requests,
+identical requests in both arms. OLD was the S2 TP6 arm `c704bd1d`; NEW was c21 `f0614b1`.
+
+| Check | OLD | NEW |
+|---|---|---|
+| Pool self-hit writes, turns 3 / 4 / 5 (rank 0) | 1,561 / 1,561 / 1,556 pages | 0 / 0 / 0: no rewrites |
+| TTFT, turns 3 / 4 / 5 | 4.26 / 3.29 / 2.09 s | 1.30 / 1.32 / 1.30 s |
+| Output text | reference | byte-exact 9/9 |
+| SSD file at boot, each of 6 ranks | sparse (16.4 GB allocated) | fully allocated: 214,746,267,648 B per rank |
+| Orderly quit | not measured | 1,536 pages, one entry per rank, about 0.5 s |
+
+After NEW quit/restart, turn 6 restored 5.39 GB / 98,304 cached tokens with one store hit and TTFT 1.81 s (cold turn 1:
+53.2 s). That resumed reply had no OLD reference, so its text exactness was not compared.
+
+**Limits:** the chat remained resident; the pressure requests did not force its eviction. Forced/repeated eviction
+and extension are tested on dev only, not on the Sparks. These are historical c21 results, not measurements of this
+port on current main, and not a broad task-quality or topology-performance gate.
+
+---
+
+# Historical SSD tier proof of concept
+
+The original device benchmark and simulator results below predate session extension. Their write volumes describe
+the original policy, not the feature above. The engine now uses `src/tier.rs` through `src/blocks.rs` and
+`src/stash.rs`; see also [REMOTE-TIER.md](REMOTE-TIER.md), Stage B.
 
 ## What it would fix
 

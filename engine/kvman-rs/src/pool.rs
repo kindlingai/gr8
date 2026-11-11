@@ -97,6 +97,7 @@ struct Held {
     exclusive: bool,
     worst: u32, // the most pages the run may grow to
     rp: u32,    // its prefix pages, R / 64 for the R it was granted at (the pool's for a run below R)
+    from: Option<(u64, usize)>, // Kept::from
 }
 
 /// Totals for status.s2: live runs, the pages they hold and could grow to, granted and refused growth.
@@ -123,6 +124,9 @@ pub struct Kept {
     pub namespace: Namespace,
     /// its prefix pages, as Held::rp
     pub rp: u32,
+    /// (stored entry id, n): the run's pages [0, n) are byte copies of that entry's pages [0, n) (it was restored from
+    /// it, or adopted a run that was), so storing the run writes only its pages past n (stash.rs extend)
+    pub from: Option<(u64, usize)>,
 }
 
 /// Opaque cache identity. Only the all-zero namespace participates in stored tiers.
@@ -194,6 +198,7 @@ pub struct Pool {
     next_span: Option<u64>,
     next_continues: bool,    // count() found the next grant continues a conversation
     next_len: Option<usize>, // the next grant's prompt length (any namespace), for the write limit's credit
+    next_from: Option<(u64, usize)>, // the next grant's provenance (Kept::from), set by a hit just before its grant
     // resize (#153): pages [0, place) come in chunks of `chunk` pages (0 = off). An offline chunk's pages hold no live
     // or retained run and are not counted anywhere, so the engine may release their memory.
     chunk: u32,
@@ -243,6 +248,7 @@ impl Pool {
             next_span: None,
             next_continues: false,
             next_len: None,
+            next_from: None,
             chunk: 0,
             offline: Vec::new(),
             seen: HashMap::new(),
@@ -805,10 +811,16 @@ impl Pool {
 
     // hits of a run granted from `src` (its finished state and hits): one more when the prompt continues it
     fn hits_from(&self, st: &Finished, hits: u32) -> u32 {
-        match &self.next_tokens {
-            Some(p) if continues(p, &st.history, st.pf_end.max(0) as usize) => hits.saturating_add(1),
-            _ => 0,
+        if self.next_continues_run(st) {
+            hits.saturating_add(1)
+        } else {
+            0
         }
+    }
+
+    // whether the next grant's (stock) prompt continues the run or stored entry `st`: holds its prompt
+    fn next_continues_run(&self, st: &Finished) -> bool {
+        matches!(&self.next_tokens, Some(p) if continues(p, &st.history, st.pf_end.max(0) as usize))
     }
 
     pub fn exclusive(&self, rows: u64) -> bool {
@@ -1093,7 +1105,7 @@ impl Pool {
     }
 
     pub fn retain_namespaced(&mut self, r: &Run, st: Finished, namespace: Namespace) -> Result<(), Error> {
-        let (exclusive, hits, span, rp) = self.held(r).map(|h| (h.exclusive, h.hits, h.span, h.rp))?;
+        let (exclusive, hits, span, rp, from) = self.held(r).map(|h| (h.exclusive, h.hits, h.span, h.rp, h.from))?;
         let list = self.remove(r)?;
         if !self.keep || st.valid <= 0 {
             return Ok(());
@@ -1108,7 +1120,7 @@ impl Pool {
         // a window run is retained with its list (prefix, window, drafter tail): the engine keeps its rows store records
         // for it, and a hit adopts them with the pages (take_hit), or they go when the pool evicts it
         self.age += 1;
-        self.kept.push(Kept { list, st, age: self.age, exclusive, hits, namespace, rp });
+        self.kept.push(Kept { list, st, age: self.age, exclusive, hits, namespace, rp, from });
         Ok(())
     }
 
@@ -1267,6 +1279,7 @@ impl Pool {
         self.check_version()?;
         let e = self.stash.as_mut().expect("found in it").begin_restore(tier, id);
         let hits = self.hits_from(&e.st, e.hits);
+        let cont = self.next_continues_run(&e.st);
         self.earn(n, a);
         let (list, gone, exclusive, pool_base) = if past(worst, rp) {
             if self.nr == 0 {
@@ -1293,8 +1306,11 @@ impl Pool {
             if let Some(i) = from_pool {
                 let k = self.kept.remove(i);
                 let b = e.base.expect("a pool base is a base").1;
-                if k.st.valid > (b as u64 * PAGE) as i32 {
+                // what of k a tier would store (stash.rs storable) past the pages the grant adopts
+                if self.stored_rows(&k) > b as u64 * PAGE {
                     self.spill(std::slice::from_ref(&k));
+                } else {
+                    self.let_go(&k);
                 }
                 list.extend_from_slice(&k.list[..b]);
             }
@@ -1305,6 +1321,11 @@ impl Pool {
         // a past-R grant restores its tail into pages past the hit's, so it passes its whole list
         let into = if exclusive { &list[..] } else { &list[..a as usize] };
         self.stash.as_mut().expect("found in it").restore(tier, &e, into, pool_base, exclusive);
+        // the grant's pages below the hit's full pages are byte copies of e's (D2: its store extends e in place).
+        // Only for a run that continues e: it then holds all e holds, and replaces it
+        if !exclusive && cont {
+            self.next_from = Some((e.id, ((skip as u64 / PAGE) as usize).min(e.below())));
+        }
         let (rows, how) = (if exclusive { worst } else { rows }, if pool_base { "stored+pool" } else { "stored" });
         Ok(self.grant(list, exclusive, w as u32, rows, how, &gone, hits, rp))
     }
@@ -1325,6 +1346,25 @@ impl Pool {
                 && k.list.len() >= b
                 && k.list[..b].iter().all(|&p| p < self.place)
         })
+    }
+
+    // a retained run leaves the pool unspilled (a hit holds all a tier would store of it): its conversation's head is
+    // remembered, as put_evicted does for a spilled one, so the conversation's next prompt still counts as continuing
+    fn let_go(&mut self, k: &Kept) {
+        if let Some(s) = &mut self.stash {
+            if k.namespace == STOCK_NAMESPACE {
+                s.forget(&k.st);
+            }
+        }
+    }
+
+    // the rows of retained run k a tier would store when the pool evicts it (stash.rs storable; a run past R keeps
+    // its valid rows, its tail is not cut)
+    fn stored_rows(&self, k: &Kept) -> u64 {
+        match &self.stash {
+            Some(s) if !k.exclusive => s.storable(&k.st),
+            _ => k.st.valid.max(0) as u64,
+        }
     }
 
     /// Claims a match_prefix() hit (skip, age) as a new grant: the retained run's first ceil(skip / 64) pages, then
@@ -1399,11 +1439,20 @@ impl Pool {
         self.check_version()?;
         let k = self.kept.remove(i);
         let hits = self.hits_from(&k.st, k.hits);
+        let full = (skip as u64 / PAGE) as usize;
+        // the grant's full pages below the hit are k's: k's provenance carries over to them (Kept::from)
+        let from = k.from.filter(|_| self.next_continues_run(&k.st)).map(|(id, n)| (id, n.min(full)));
         self.earn(n, a);
         // the grant keeps the run's first a pages and writes past its skip: what the run held beyond that goes to a
-        // tier, read before the grant writes
-        if k.st.valid > skip {
+        // tier, read before the grant writes. Below R, only what a tier would store of it (stash.rs storable) counts;
+        // a hit on the run's own conversation has no rows past skip and spills nothing.
+        // With no reuse grid, `skip` may end inside a page. The grant will rewrite that page,
+        // but the retained run has nothing *past* the hit when its valid rows end at `skip`.
+        let spills_past_hit = if k.exclusive { k.st.valid > skip } else { self.stored_rows(&k) > skip as u64 };
+        if spills_past_hit {
             self.spill(std::slice::from_ref(&k));
+        } else {
+            self.let_go(&k);
         }
         if past(worst, rp) && k.exclusive && self.window > 0 {
             // a retained window run: its prefix, window and drafter pages below the hit, then the drafter's fresh ones
@@ -1432,6 +1481,7 @@ impl Pool {
         }
         let gone = self.fill(&mut list, n as usize);
         self.spill(&gone);
+        self.next_from = from;
         Ok(self.grant(list, false, w as u32, rows, "hit", &gone, hits, rp))
     }
 
@@ -1487,9 +1537,15 @@ impl Pool {
             Some(s) => {
                 for x in self.held.values() {
                     h = mix(h, x.hits as u64);
+                    if let Some((id, n)) = x.from {
+                        h = mix(mix(h, id), n as u64);
+                    }
                 }
                 for k in &self.kept {
                     h = mix(h, k.hits as u64);
+                    if let Some((id, n)) = k.from {
+                        h = mix(mix(h, id), n as u64);
+                    }
                 }
                 s.fold(h, mix)
             }
@@ -1748,8 +1804,9 @@ impl Pool {
         let span = self.next_span.take();
         // a run that continues its conversation counts as continued once, even when it found nothing to reuse
         let hits = hits.max(std::mem::take(&mut self.next_continues) as u32);
+        let from = self.next_from.take();
         let rp = if exclusive { rp } else { self.rp0() } as u32;
-        self.held.insert(r.table_version, Held { tokens, hits, span, list, exclusive, worst, rp });
+        self.held.insert(r.table_version, Held { tokens, hits, span, list, exclusive, worst, rp, from });
         // with the page classes on (nr > 0) a split run holds only its own pages; without, the whole pool
         self.exclusive = self.exclusive || (exclusive && self.nr == 0);
         r

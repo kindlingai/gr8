@@ -124,14 +124,14 @@ static void store(const char* spec) {
         for (int i = 0; i < hn.skip; ++i) CHECK(dev[list[i / 64]][i % 64] == p[i] + 10000);
     }
     pool.release(r);
-    CHECK(pool.match(p, 192, 256, 191, ns).skip == 0);
+    CHECK(pool.match(p, 192, 256, 191, ns).stored && pool.match(p, 192, 256, 191, ns).skip == 128);
 
     // Stock spill/restore still works through the same memory/file/remote backend.
     CHECK(pool.count(p, 128) == 1);
     r = pool.reserve(192, 256); write(r, 0); pool.retain(r, finished(p)); copies();
     all = pool.reserve(512); CHECK(copies() > 0); pool.release(all);
     const auto h = pool.match(p, 192, 256, 191); CHECK(h.stored && h.skip == 128);
-    CHECK(pool.match(p, 192, 256, 191, ns).skip == 0);
+    CHECK(pool.match(p, 192, 256, 191, ns).stored && pool.match(p, 192, 256, 191, ns).skip == 128);
     r = pool.take(h, 192, 256); CHECK(copies() > 0);
     const auto list = pool.list(r);
     for (int i = 0; i < h.skip; ++i) CHECK(dev[list[i / 64]][i % 64] == p[i]);

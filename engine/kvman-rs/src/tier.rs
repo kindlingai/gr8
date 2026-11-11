@@ -27,6 +27,8 @@ use crate::reuse::Finished;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -62,6 +64,11 @@ pub const ROW_SLOT: usize = ALIGN;
 const O_DIRECT: i32 = 0o200000;
 #[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
 const O_DIRECT: i32 = 0o40000;
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i32;
+}
 
 /// A zeroed buffer aligned to 4 KiB, as O_DIRECT needs.
 pub struct AlignedBuf {
@@ -106,7 +113,9 @@ pub struct SlotFile {
 }
 
 impl SlotFile {
-    /// Creates (or reuses) the file at its full size. `direct` asks for O_DIRECT, which exists on Linux only.
+    /// Creates (or reuses) the file at its full size. On Linux the whole file is physically allocated before the
+    /// store opens: `set_len` alone makes a sparse file that other writers can still fill around. `direct` asks for
+    /// O_DIRECT, which exists on Linux only.
     pub fn create(path: &Path, slot_bytes: usize, slots: u64, direct: bool) -> io::Result<SlotFile> {
         if slot_bytes == 0 || !slot_bytes.is_multiple_of(ALIGN) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "slot size is not a multiple of 4 KiB"));
@@ -127,7 +136,17 @@ impl SlotFile {
             false
         };
         let file = o.open(path)?;
-        file.set_len(slot_bytes as u64 * slots)?;
+        let len = (slot_bytes as u64).checked_mul(slots).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "store size overflow"))?;
+        #[cfg(target_os = "linux")]
+        if len > 0 {
+            let len_i64 = i64::try_from(len).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "store size exceeds off_t"))?;
+            // Mode 0 allocates every extent without changing existing data, and extends the file if needed. ENOSPC is
+            // a boot failure, not a sparse store that would fail later after another file took its space.
+            if unsafe { fallocate(file.as_raw_fd(), 0, 0, len_i64) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        file.set_len(len)?;
         Ok(SlotFile { file, slot_bytes, slots, direct })
     }
     pub fn slot_bytes(&self) -> usize {
@@ -418,6 +437,7 @@ mod tests {
             hits: 0,
             namespace: crate::pool::STOCK_NAMESPACE,
             rp: 0,
+            from: None,
         };
         let nonstock = Kept {
             list: vec![0],
@@ -427,6 +447,7 @@ mod tests {
             hits: 0,
             namespace: [1; crate::pool::NAMESPACE_BYTES],
             rp: 0,
+            from: None,
         };
         let free = t.free_slots();
         assert!(t.spill(&nonstock, |_, _| panic!("non-stock spill must never read a page")).unwrap().is_none());
@@ -439,6 +460,7 @@ mod tests {
             hits: 0,
             namespace: crate::pool::STOCK_NAMESPACE,
             rp: 0,
+            from: None,
         };
         let ha = t.spill(&a, block).unwrap().unwrap();
         let hb = t.spill(&b, block).unwrap().unwrap();
@@ -454,6 +476,7 @@ mod tests {
                     hits: 0,
                     namespace: crate::pool::STOCK_NAMESPACE,
                     rp: 0,
+                    from: None,
                 },
                 block
             )
@@ -482,6 +505,7 @@ mod tests {
                     hits: 0,
                     namespace: crate::pool::STOCK_NAMESPACE,
                     rp: 0,
+                    from: None,
                 },
                 block,
             )
