@@ -182,7 +182,7 @@ There is no rotation: Flash's latent is NoPE, and every read dequantizes in plac
 
 ## Several sessions
 
-`--sess N` (`SESS`, 1 to 8; 8 at TP=4, 4 at TP=3, 1 at TP=2) serves up to N requests at once on S2, as GLM-5.3 does: their decode
+`--sess N` (`SESS`, 1 to 8; 8 at TP=4, 4 at TP=3 and TP=2 INT4, 1 at TP=2 FP8) serves up to N requests at once on S2, as GLM-5.3 does: their decode
 rounds share main and draft steps, and their KV runs share the `CAP` pool (`--s2-sessions N` to `g6m4_flash`). Those per-TP
 counts are the launcher's defaults (`scripts/engine_args.sh`); the two-box recipe sets `SESS` to 8 (4 with
 `TUNE=quality`) and serves that many requests at once.
@@ -199,8 +199,13 @@ counts are the launcher's defaults (`scripts/engine_args.sh`); the two-box recip
   more.
 - With `SESS=1` the engine runs the one-session path as before.
 
-The memory these take (slots and graphs), the speed of shared steps and the output of sessions sharing steps have not
-been measured on Flash yet.
+At `TP=2` with `KV_FORMAT=int4`, ordinary launches default to `SESS=4`; with `SESS >= 2`, they use `MTP=3`,
+`S2_SHARED_WATERFILL=1` and `S2_SHARED_WF_MARGIN=0.02`. Roll back with `--s2-shared-waterfill 0`.
+Pass `--sess 1` for the prior single-session launch.
+Measured on TP=2 INT4 against `S2_SHARED_WATERFILL=0` at matched `SESS=4`, `MTP=3`: +10.45% pooled concurrent decode throughput (+12.27% at 4 streams, +7.96% at 2 streams),
+20/20 exact solo `T=0`, KL = 0.0 and qeval 73/75 vs 73/75. Additional graph captures can increase boot time and memory
+(wider `SESS=8`, `MTP=3` boot time and memory cost not yet measured).
+See [Shared waterfill](SETTINGS.md#shared-waterfill-speculative-row-allocation).
 
 ## DFlash2
 

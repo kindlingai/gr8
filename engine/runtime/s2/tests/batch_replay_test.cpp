@@ -21,7 +21,7 @@ struct Run
 
 // requests: each a session run to its end in slot 0, one after another. bias[i]: request i's drafter accuracy shift.
 // rec: when set, the Batch logs to it
-static Run run(const std::vector<int>& bias, bool fresh, std::FILE* rec, bool dsel = true, int sessions = 1)
+static Run run(const std::vector<int>& bias, bool fresh, std::FILE* rec, bool dsel = true, int sessions = 1, bool waterfill = false)
 {
     Run o;
     int cur = 0;
@@ -43,6 +43,7 @@ static Run run(const std::vector<int>& bias, bool fresh, std::FILE* rec, bool ds
     h.emit = [&](int, const int* t, int k, int) { o.got.insert(o.got.end(), t, t + k); return false; };
     Batch b(3, 32, h);
     if (rec) b.record(rec);
+    if (waterfill) b.waterfill(true, 0.0, sessions == 4);
     b.fresh_spec(fresh);
     g6rt::SpecLen sl;
     sl.on = true;
@@ -91,6 +92,15 @@ static std::vector<std::string> logged(const std::vector<int>& bias, bool fresh,
 
 int main(int argc, char** argv)
 {
+    for (int sessions : {2, 4, 8}) {
+        std::FILE* f = std::tmpfile(); CHECK(f != nullptr);
+        run({0, -2, 3}, false, f, true, sessions, true);
+        std::rewind(f);
+        const ReplayResult r = replay(read_lines(f));
+        CHECK(r.ok);
+        if (!r.ok) std::printf("shared replay: %s\n", r.error.c_str());
+        std::fclose(f);
+    }
     if (argc > 1)
     {
         std::FILE* f = std::fopen(argv[1], "w");

@@ -27,7 +27,7 @@ namespace knob
 {
 
 /// The hash of the table this header was written from.
-constexpr uint64_t TABLE_HASH = 0x34ce766b570f4412ull;
+constexpr uint64_t TABLE_HASH = 0x17b4cef09f7ef404ull;
 
 /// Prints the environment's problems (bad values, unknown GR8_ names, old G6_ names) to stderr and returns the number
 /// of errors. The engine stops when it is not 0.
@@ -3101,486 +3101,500 @@ inline bool s2_roundlog()
     return v;
 }
 
+/// GR8_S2_SHARED_WATERFILL
+inline bool s2_shared_waterfill()
+{
+    static const bool v = *detail::flag(432, 0);
+    return v;
+}
+
+/// GR8_S2_SHARED_WF_MARGIN
+inline double s2_shared_wf_margin()
+{
+    static const double v = *detail::float_(433, 0);
+    return v;
+}
+
 /// GR8_S2_SHARE_MS
 inline int64_t s2_share_ms()
 {
-    static const int64_t v = *detail::int_(432, 0);
+    static const int64_t v = *detail::int_(434, 0);
     return v;
 }
 
 /// GR8_S2_TAIL_FIRST
 inline bool s2_tail_first()
 {
-    static const bool v = *detail::flag(433, 0);
+    static const bool v = *detail::flag(435, 0);
     return v;
 }
 
 /// GR8_S2_TIMELINE
 inline int64_t s2_timeline()
 {
-    static const int64_t v = *detail::int_(434, 0);
+    static const int64_t v = *detail::int_(436, 0);
     return v;
 }
 
 /// GR8_S2_TIMEOUT
 inline int64_t s2_timeout()
 {
-    static const int64_t v = *detail::int_(435, 0);
+    static const int64_t v = *detail::int_(437, 0);
     return v;
 }
 
 /// GR8_S2_TRACE
 inline const std::optional<std::string>& s2_trace()
 {
-    static const std::optional<std::string> v = detail::text(436, 0);
+    static const std::optional<std::string> v = detail::text(438, 0);
     return v;
 }
 
 /// GR8_SPEC_DRAFT
 inline const std::vector<double>& spec_draft()
 {
-    static const std::vector<double> v = *detail::floats(437, 0);
+    static const std::vector<double> v = *detail::floats(439, 0);
     return v;
 }
 
 /// GR8_SPEC_TABLE
 inline const std::optional<std::vector<double>>& spec_table()
 {
-    static const std::optional<std::vector<double>> v = detail::floats(438, 0);
+    static const std::optional<std::vector<double>> v = detail::floats(440, 0);
     return v;
 }
 
 /// GR8_STEP_TMR
 inline bool step_tmr()
 {
-    static const bool v = *detail::flag(439, 0);
+    static const bool v = *detail::flag(441, 0);
     return v;
 }
 
 /// GR8_STOP_GRACE
 inline const std::optional<std::string>& stop_grace()
 {
-    static const std::optional<std::string> v = detail::text(440, 0);
+    static const std::optional<std::string> v = detail::text(442, 0);
     return v;
 }
 
 /// GR8_TESTS
 inline const std::string& tests()
 {
-    static const std::string v = *detail::text(441, 0);
+    static const std::string v = *detail::text(443, 0);
     return v;
 }
 
 /// GR8_TEST_CP_PF_BREAK
 inline const std::optional<std::string>& test_cp_pf_break()
 {
-    static const std::optional<std::string> v = detail::text(442, 0);
+    static const std::optional<std::string> v = detail::text(444, 0);
     return v;
 }
 
 /// GR8_TEST_CP_PF_NET
 inline bool test_cp_pf_net()
 {
-    static const bool v = *detail::flag(443, 0);
+    static const bool v = *detail::flag(445, 0);
     return v;
 }
 
 /// GR8_TEST_DS41_KERNELS_DIR
 inline const std::optional<std::string>& test_ds41_kernels_dir()
 {
-    static const std::optional<std::string> v = detail::text(444, 0);
+    static const std::optional<std::string> v = detail::text(446, 0);
     return v;
 }
 
 /// GR8_TEST_DS41_M4_PFW
 inline int64_t test_ds41_m4_pfw()
 {
-    static const int64_t v = *detail::int_(445, 0);
+    static const int64_t v = *detail::int_(447, 0);
     return v;
 }
 
 /// GR8_TEST_DS41_MGATE_DIAG
 inline bool test_ds41_mgate_diag()
 {
-    static const bool v = *detail::flag(446, 0);
+    static const bool v = *detail::flag(448, 0);
     return v;
 }
 
 /// GR8_TEST_DS41_TOKENIZER_DIR
 inline const std::optional<std::string>& test_ds41_tokenizer_dir()
 {
-    static const std::optional<std::string> v = detail::text(447, 0);
+    static const std::optional<std::string> v = detail::text(449, 0);
     return v;
 }
 
 /// GR8_TEST_FUZZ_ROUNDS
 inline int64_t test_fuzz_rounds()
 {
-    static const int64_t v = *detail::int_(448, 0);
+    static const int64_t v = *detail::int_(450, 0);
     return v;
 }
 
 /// GR8_TEST_IDX_DUMP
 inline const std::optional<std::string>& test_idx_dump()
 {
-    static const std::optional<std::string> v = detail::text(449, 0);
+    static const std::optional<std::string> v = detail::text(451, 0);
     return v;
 }
 
 /// GR8_TEST_KVMAN_LEDGER
 inline const std::string& test_kvman_ledger()
 {
-    static const std::string v = *detail::text(450, 0);
+    static const std::string v = *detail::text(452, 0);
     return v;
 }
 
 /// GR8_TEST_KVSIM_ENTRIES
 inline bool test_kvsim_entries()
 {
-    static const bool v = *detail::flag(451, 0);
+    static const bool v = *detail::flag(453, 0);
     return v;
 }
 
 /// GR8_TEST_KV_HASH
 inline bool test_kv_hash()
 {
-    static const bool v = *detail::flag(452, 0);
+    static const bool v = *detail::flag(454, 0);
     return v;
 }
 
 /// GR8_TEST_KV_RANKS_CMP
 inline bool test_kv_ranks_cmp()
 {
-    static const bool v = *detail::flag(453, 0);
+    static const bool v = *detail::flag(455, 0);
     return v;
 }
 
 /// GR8_TEST_KV_TIER_CHECK
 inline const std::optional<std::string>& test_kv_tier_check()
 {
-    static const std::optional<std::string> v = detail::text(454, 0);
+    static const std::optional<std::string> v = detail::text(456, 0);
     return v;
 }
 
 /// GR8_TEST_KV_TIER_CHECK_DROP
 inline std::optional<int64_t> test_kv_tier_check_drop()
 {
-    static const std::optional<int64_t> v = detail::int_(455, 0);
+    static const std::optional<int64_t> v = detail::int_(457, 0);
     return v;
 }
 
 /// GR8_TEST_LEDGER_CRASH_AT
 inline const std::optional<std::string>& test_ledger_crash_at()
 {
-    static const std::optional<std::string> v = detail::text(456, 0);
+    static const std::optional<std::string> v = detail::text(458, 0);
     return v;
 }
 
 /// GR8_TEST_MTP_LASTROW_CHECK
 inline bool test_mtp_lastrow_check()
 {
-    static const bool v = *detail::flag(457, 0);
+    static const bool v = *detail::flag(459, 0);
     return v;
 }
 
 /// GR8_TEST_PERTURB
 inline double test_perturb()
 {
-    static const double v = *detail::float_(458, 0);
+    static const double v = *detail::float_(460, 0);
     return v;
 }
 
 /// GR8_TEST_PF_DRAFTDUMP
 inline const std::optional<std::string>& test_pf_draftdump()
 {
-    static const std::optional<std::string> v = detail::text(459, 0);
+    static const std::optional<std::string> v = detail::text(461, 0);
     return v;
 }
 
 /// GR8_TEST_PF_HASH_POKE
 inline const std::optional<std::vector<int64_t>>& test_pf_hash_poke()
 {
-    static const std::optional<std::vector<int64_t>> v = detail::ints(460, 0);
+    static const std::optional<std::vector<int64_t>> v = detail::ints(462, 0);
     return v;
 }
 
 /// GR8_TEST_PF_REPLAY_VERBOSE
 inline bool test_pf_replay_verbose()
 {
-    static const bool v = *detail::flag(461, 0);
+    static const bool v = *detail::flag(463, 0);
     return v;
 }
 
 /// GR8_TEST_PF_RESDUMP
 inline const std::optional<std::string>& test_pf_resdump()
 {
-    static const std::optional<std::string> v = detail::text(462, 0);
+    static const std::optional<std::string> v = detail::text(464, 0);
     return v;
 }
 
 /// GR8_TEST_PF_TIMES
 inline bool test_pf_times()
 {
-    static const bool v = *detail::flag(463, 0);
+    static const bool v = *detail::flag(465, 0);
     return v;
 }
 
 /// GR8_TEST_ROW_LINES
 inline bool test_row_lines()
 {
-    static const bool v = *detail::flag(464, 0);
+    static const bool v = *detail::flag(466, 0);
     return v;
 }
 
 /// GR8_TEST_RT_ADOPT_SLOT
 inline bool test_rt_adopt_slot()
 {
-    static const bool v = *detail::flag(465, 0);
+    static const bool v = *detail::flag(467, 0);
     return v;
 }
 
 /// GR8_TEST_RT_POISON
 inline bool test_rt_poison()
 {
-    static const bool v = *detail::flag(466, 0);
+    static const bool v = *detail::flag(468, 0);
     return v;
 }
 
 /// GR8_TEST_S2_ATTN_PERSESSION
 inline bool test_s2_attn_persession()
 {
-    static const bool v = *detail::flag(467, 0);
+    static const bool v = *detail::flag(469, 0);
     return v;
 }
 
 /// GR8_TEST_S2_CLS
 inline int64_t test_s2_cls()
 {
-    static const int64_t v = *detail::int_(468, 0);
+    static const int64_t v = *detail::int_(470, 0);
     return v;
 }
 
 /// GR8_TEST_S2_GEN
 inline const std::optional<std::vector<int64_t>>& test_s2_gen()
 {
-    static const std::optional<std::vector<int64_t>> v = detail::ints(469, 0);
+    static const std::optional<std::vector<int64_t>> v = detail::ints(471, 0);
     return v;
 }
 
 /// GR8_TEST_S2_GROW_POOL
 inline std::optional<int64_t> test_s2_grow_pool()
 {
-    static const std::optional<int64_t> v = detail::int_(470, 0);
+    static const std::optional<int64_t> v = detail::int_(472, 0);
     return v;
 }
 
 /// GR8_TEST_S2_INSERT
 inline const std::optional<std::string>& test_s2_insert()
 {
-    static const std::optional<std::string> v = detail::text(471, 0);
+    static const std::optional<std::string> v = detail::text(473, 0);
     return v;
 }
 
 /// GR8_TEST_S2_PAGES
 inline const std::optional<std::vector<int64_t>>& test_s2_pages()
 {
-    static const std::optional<std::vector<int64_t>> v = detail::ints(472, 0);
+    static const std::optional<std::vector<int64_t>> v = detail::ints(474, 0);
     return v;
 }
 
 /// GR8_TEST_S2_PFBASE
 inline const std::optional<std::vector<int64_t>>& test_s2_pfbase()
 {
-    static const std::optional<std::vector<int64_t>> v = detail::ints(473, 0);
+    static const std::optional<std::vector<int64_t>> v = detail::ints(475, 0);
     return v;
 }
 
 /// GR8_TEST_S2_PFNOFIX
 inline bool test_s2_pfnofix()
 {
-    static const bool v = *detail::flag(474, 0);
+    static const bool v = *detail::flag(476, 0);
     return v;
 }
 
 /// GR8_TEST_S2_PFPOISON
 inline bool test_s2_pfpoison()
 {
-    static const bool v = *detail::flag(475, 0);
+    static const bool v = *detail::flag(477, 0);
     return v;
 }
 
 /// GR8_TEST_S2_POOL
 inline std::optional<int64_t> test_s2_pool()
 {
-    static const std::optional<int64_t> v = detail::int_(476, 0);
+    static const std::optional<int64_t> v = detail::int_(478, 0);
     return v;
 }
 
 /// GR8_TEST_S2_RELOC
 inline bool test_s2_reloc()
 {
-    static const bool v = *detail::flag(477, 0);
+    static const bool v = *detail::flag(479, 0);
     return v;
 }
 
 /// GR8_TEST_S2_RELOC_PAGES
 inline std::optional<int64_t> test_s2_reloc_pages()
 {
-    static const std::optional<int64_t> v = detail::int_(478, 0);
+    static const std::optional<int64_t> v = detail::int_(480, 0);
     return v;
 }
 
 /// GR8_TEST_S2_ROWHASH
 inline bool test_s2_rowhash()
 {
-    static const bool v = *detail::flag(479, 0);
+    static const bool v = *detail::flag(481, 0);
     return v;
 }
 
 /// GR8_TEST_S2_RUNS
 inline const std::optional<std::string>& test_s2_runs()
 {
-    static const std::optional<std::string> v = detail::text(480, 0);
+    static const std::optional<std::string> v = detail::text(482, 0);
     return v;
 }
 
 /// GR8_TEST_S2_SHRINK_AT
 inline std::optional<int64_t> test_s2_shrink_at()
 {
-    static const std::optional<int64_t> v = detail::int_(481, 0);
+    static const std::optional<int64_t> v = detail::int_(483, 0);
     return v;
 }
 
 /// GR8_TEST_S2_SOLO1
 inline bool test_s2_solo1()
 {
-    static const bool v = *detail::flag(482, 0);
+    static const bool v = *detail::flag(484, 0);
     return v;
 }
 
 /// GR8_TEST_S2_XLIST
 inline const std::optional<std::vector<int64_t>>& test_s2_xlist()
 {
-    static const std::optional<std::vector<int64_t>> v = detail::ints(483, 0);
+    static const std::optional<std::vector<int64_t>> v = detail::ints(485, 0);
     return v;
 }
 
 /// GR8_TEST_TOKENIZER_DIR
 inline const std::optional<std::string>& test_tokenizer_dir()
 {
-    static const std::optional<std::string> v = detail::text(484, 0);
+    static const std::optional<std::string> v = detail::text(486, 0);
     return v;
 }
 
 /// GR8_TEST_VISION_CASES
 inline const std::optional<std::string>& test_vision_cases()
 {
-    static const std::optional<std::string> v = detail::text(485, 0);
+    static const std::optional<std::string> v = detail::text(487, 0);
     return v;
 }
 
 /// GR8_TEST_ZERO_DELAY_MS
 inline int64_t test_zero_delay_ms()
 {
-    static const int64_t v = *detail::int_(486, 0);
+    static const int64_t v = *detail::int_(488, 0);
     return v;
 }
 
 /// TMPDIR
 inline const std::string& tmpdir()
 {
-    static const std::string v = *detail::text(487, 0);
+    static const std::string v = *detail::text(489, 0);
     return v;
 }
 
 /// GR8_TR3_W2ALL
 inline bool tr3_w2all()
 {
-    static const bool v = *detail::flag(488, 0);
+    static const bool v = *detail::flag(490, 0);
     return v;
 }
 
 /// GR8_V2_SHARED
 inline const std::optional<std::string>& v2_shared()
 {
-    static const std::optional<std::string> v = detail::text(489, 0);
+    static const std::optional<std::string> v = detail::text(491, 0);
     return v;
 }
 
 /// GR8_WARM
 inline int64_t warm()
 {
-    static const int64_t v = *detail::int_(490, 0);
+    static const int64_t v = *detail::int_(492, 0);
     return v;
 }
 
 /// GR8_WEIGHT_CHECK
 inline bool weight_check()
 {
-    static const bool v = *detail::flag(491, 0);
+    static const bool v = *detail::flag(493, 0);
     return v;
 }
 
 /// GR8_WEIGHT_CHECK_FLIP
 inline const std::optional<std::string>& weight_check_flip()
 {
-    static const std::optional<std::string> v = detail::text(492, 0);
+    static const std::optional<std::string> v = detail::text(494, 0);
     return v;
 }
 
 /// GR8_WIDTHS
 inline const std::optional<std::string>& widths()
 {
-    static const std::optional<std::string> v = detail::text(493, 0);
+    static const std::optional<std::string> v = detail::text(495, 0);
     return v;
 }
 
 /// GR8_WORK_DIR
 inline const std::optional<std::string>& work_dir()
 {
-    static const std::optional<std::string> v = detail::text(494, 0);
+    static const std::optional<std::string> v = detail::text(496, 0);
     return v;
 }
 
 /// GR8_XGRAMMAR
 inline const std::optional<std::string>& xgrammar()
 {
-    static const std::optional<std::string> v = detail::text(495, 0);
+    static const std::optional<std::string> v = detail::text(497, 0);
     return v;
 }
 
 /// GR8_XGRAMMAR_LIB
 inline const std::optional<std::string>& xgrammar_lib()
 {
-    static const std::optional<std::string> v = detail::text(496, 0);
+    static const std::optional<std::string> v = detail::text(498, 0);
     return v;
 }
 
 /// GR8_XTRACE
 inline bool xtrace()
 {
-    static const bool v = *detail::flag(497, 0);
+    static const bool v = *detail::flag(499, 0);
     return v;
 }
 
 /// GR8_XTRACE_OUT
 inline const std::optional<std::string>& xtrace_out()
 {
-    static const std::optional<std::string> v = detail::text(498, 0);
+    static const std::optional<std::string> v = detail::text(500, 0);
     return v;
 }
 
 /// GR8_XTRACE_PF
 inline bool xtrace_pf()
 {
-    static const bool v = *detail::flag(499, 0);
+    static const bool v = *detail::flag(501, 0);
     return v;
 }
 
 /// GR8_XTRACE_QUIT
 inline const std::optional<std::string>& xtrace_quit()
 {
-    static const std::optional<std::string> v = detail::text(500, 0);
+    static const std::optional<std::string> v = detail::text(502, 0);
     return v;
 }
 

@@ -25,6 +25,61 @@ def flash(*argv, peers=PEERS):
     return o
 
 
+class FlashWaterfillOptionsTests(unittest.TestCase):
+    PEERS2 = '10.0.0.1,10.0.0.2'
+
+    def plan(self, *argv):
+        return opt.engine_plan(flash('--tp', '2', '--kv-format', 'int4', *argv, peers=self.PEERS2))
+
+    def word(self, plan, key, value):
+        self.assertEqual([w for w in plan['env'] if w.startswith(key + '=')],
+                         [] if value is None else [key + '=' + value])
+
+    def test_defaults_and_eight_streams(self):
+        for args, sessions in (((), '4'), (('--sess', '8'), '8')):
+            p = self.plan(*args)
+            self.assertEqual((p['knobs']['SESS'], p['knobs']['MTP']), (sessions, '3'))
+            self.word(p, 'GR8_S2_SHARED_WATERFILL', '1')
+            self.word(p, 'GR8_S2_SHARED_WF_MARGIN', '0.02')
+            for flag, value in (('--mtp', '3'), ('--s2-sessions', sessions)):
+                self.assertEqual(p['args'][p['args'].index(flag) + 1], value)
+
+    def test_rollbacks_and_overrides(self):
+        for args, mtp, wf, margin in (
+            (('--s2-shared-waterfill', '0'), '1', '0', None),
+            (('--extra-env', 'GR8_S2_SHARED_WATERFILL=0'), '1', '0', None),
+            (('--s2-shared-waterfill', '0', '--mtp', '3'), '3', '0', None),
+            (('--mtp', '1'), '1', '1', '0.02'),
+            (('--sess', '1'), '1', None, None),
+        ):
+            with self.subTest(args=args):
+                p = self.plan(*args)
+                self.assertEqual(p['knobs']['MTP'], mtp)
+                self.word(p, 'GR8_S2_SHARED_WATERFILL', wf)
+                self.word(p, 'GR8_S2_SHARED_WF_MARGIN', margin)
+                if args == ('--sess', '1'):
+                    self.assertEqual(p['knobs']['SESS'], '1')
+
+    def test_other_shapes_untouched(self):
+        cases = [flash('--tp', str(tp), *args, peers=','.join('10.0.0.' + str(i + 1) for i in range(tp)))
+                 for tp, args in ((1, ('--kv-format', 'int4', '--sess', '4')), (2, ()), (3, ()),
+                                  (4, ('--kv-format', 'int4')))]
+        cases += [opt.parse(['--no-config', '--peers', PEERS], GLM), ds41()]
+        for o in cases:
+            opt.validate(o)
+            p = opt.engine_plan(o)
+            self.word(p, 'GR8_S2_SHARED_WATERFILL', None)
+            self.word(p, 'GR8_S2_SHARED_WF_MARGIN', None)
+
+    def test_refusals(self):
+        for args in (('--s2-shared-waterfill', '2'), ('--s2-shared-wf-margin', '-1'),
+                     ('--s2-shared-wf-margin', 'nan'), ('--s2-shared-wf-margin', 'inf')):
+            with self.subTest(args=args), self.assertRaises(opt.OptionError):
+                self.plan(*args)
+        with self.assertRaises(opt.OptionError):
+            ds41('--s2-shared-waterfill', '1')
+
+
 class Kv4ExactOptionsTests(unittest.TestCase):
     WORDS = ('GR8_KV4_SC=4', 'GR8_KV4_SC_TR=2', 'GR8_KV4_QT=1',
              'GR8_KV4_CTX=2', 'GR8_KV4_FUSE_ROT=1')

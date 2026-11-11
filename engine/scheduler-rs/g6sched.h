@@ -403,6 +403,8 @@ void g6s2_batch_set_sess_drafts(g6s2_batch* b, bool on);
 void g6s2_batch_adapt(g6s2_batch* b, bool on);
 void g6s2_batch_draft_par(g6s2_batch* b, bool on);
 void g6s2_batch_fresh_spec(g6s2_batch* b, bool on);
+int32_t g6s2_batch_waterfill(g6s2_batch* b, bool on, double margin, bool shared_only);
+void g6s2_batch_waterfill_lp(const g6s2_batch* b, float* out); // 32 x 8 log-probabilities
 void g6s2_batch_dflash(g6s2_batch* b, int32_t kv, const g6s2_spec_len* sl);
 void g6s2_batch_dsel(g6s2_batch* b, const g6s2_dsel* d);
 void g6s2_batch_kstop(g6s2_batch* b, const g6s2_kstop* k);

@@ -658,6 +658,17 @@ options:
     scope: cluster
     doc: >-
       S2: a burst of queued requests is admitted at one boundary instead of one per notice (GR8_S2_ADMIT_HOLD)
+  S2_SHARED_WATERFILL:
+    scope: cluster
+    doc: >-
+      0 or 1: allocate shared S2 verify rows across concurrent sessions by cumulative marginal acceptance per shared
+      round cost (GR8_S2_SHARED_WATERFILL; GLM-5.3 and GLM-5.3-Flash, docs/SETTINGS.md). Unset enables it on
+      GLM-5.3-Flash at TP=2 with KV_FORMAT=int4 when SESS >= 2
+  S2_SHARED_WF_MARGIN:
+    scope: cluster
+    doc: >-
+      S2_SHARED_WATERFILL: finite nonnegative relative utility improvement required to widen a shared waterfill round
+      (GR8_S2_SHARED_WF_MARGIN, docs/SETTINGS.md). Unset uses 0.02 when S2_SHARED_WATERFILL defaults on, else 0.0
   PF_SELX_CTX:
     scope: cluster
     doc: >-

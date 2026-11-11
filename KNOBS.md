@@ -42,8 +42,17 @@ sha256 of the file.
 `./gr8 glm53f` takes the same options for GLM-5.3-Flash: TP 4, 3, 2 or 1, an fp8 KV build, the DFlash2 drafter
 at TP 4, 2 and 1 when `--drafter` (or `DFLASH_DIR`) is given, else MTP (MTP at TP 3), no prefix reuse, and `CAP` 262208 at any TP, a 262,144-token request
 (`tools/launch/models.py`, `flash_defaults` in `scripts/engine_args.sh`, [docs/FLASH.md](docs/FLASH.md)). `SESS`
-defaults to 8 at TP=4, 4 at TP=3 and 1 at TP=2 and TP=1; 2 to 8 share decode steps and the `CAP` pool, each session
+defaults to 8 at TP=4, 4 at TP=3 and TP=2 INT4, and 1 at TP=2 FP8 and TP=1; 2 to 8 share decode steps and the `CAP` pool, each session
 with its own KDA state slots, while `SESS` x (`MTP` + 1) is at most 32.
+
+At `TP=2` with `KV_FORMAT=int4`, ordinary launches use `SESS=4`; when `SESS >= 2`, defaults are `MTP=3`,
+`S2_SHARED_WATERFILL=1` and `S2_SHARED_WF_MARGIN=0.02`. `--s2-shared-waterfill 0` rolls back to uniform shared
+rows and, unless explicitly set, `MTP=1`. Pass `--sess 1` for the prior single-session launch.
+Measured on TP=2 INT4 against `S2_SHARED_WATERFILL=0` at matched `SESS=4`, `MTP=3`: +10.45% pooled concurrent decode throughput
+(+12.27% at 4 streams, +7.96% at 2 streams), 20/20 exact solo `T=0`, KL = 0.0 and qeval 73/75 vs 73/75.
+Additional graph captures can increase boot time and memory
+(wider `SESS=8`, `MTP=3` boot time and memory cost not yet measured).
+See [Shared waterfill](docs/SETTINGS.md#shared-waterfill-speculative-row-allocation).
 
 A Flash box can lend what its serve leaves to a KV node beside it (`donate` in `tools/launch/supervisor.py`):
 the `FLASH_KV_*` and `FLASH_CAP_POLICY` options (`./gr8 knobs FLASH_`).

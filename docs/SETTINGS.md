@@ -276,3 +276,22 @@ See [local steering](STEERING-LOCAL.md) for the complete contract, identity limi
 The launcher also accepts `--steering-profile hf:default` / `hf:NAME` with an HF model release and derives the
 profile's identity assertions before validating the actual model. See [HF steering](STEERING-HF.md) for publication,
 explicit selection and cached offline restart. The engine itself receives only the verified local directory.
+
+## Shared waterfill speculative row allocation
+
+`S2_SHARED_WATERFILL=1` allocates shared S2 verify rows by cumulative marginal acceptance per shared round cost,
+instead of KStopB thresholds and explore rounds. GLM-5.3 and GLM-5.3-Flash support it; DS41 does not support ragged
+shared rows. `S2_SHARED_WF_MARGIN` is the finite nonnegative relative utility improvement required to widen a round.
+Solo rounds and the disabled path are unchanged. All reachable main and draft widths are captured within existing
+admission caps. With `GR8_NGRAM`, the table can supply coherent shared MTP prefixes and tails; Flash uses it only in
+shared rounds.
+
+For GLM-5.3-Flash at `TP=2` with `KV_FORMAT=int4`, the launcher defaults to `SESS=4` and, when `SESS >= 2`,
+`MTP=3`, `S2_SHARED_WATERFILL=1`, `S2_SHARED_WF_MARGIN=0.02`. Explicit MTP and session settings remain authoritative.
+Other topologies and FP8 defaults are unchanged. Roll back with `--s2-shared-waterfill 0` (or
+`EXTRA_ENV=GR8_S2_SHARED_WATERFILL=0`); absent an explicit MTP, this restores `MTP=1`. Pass `--sess 1` for the prior single-session launch.
+
+Measured on TP=2 INT4 against `S2_SHARED_WATERFILL=0` at matched `SESS=4`, `MTP=3`: **+10.45%** pooled concurrent decode throughput, **+12.27%** at 4 streams and
+**+7.96%** at 2 streams; solo `T=0` output was exact on **20/20**, **KL = 0.0**, and qeval was **73/75 vs 73/75**.
+Additional graph captures can increase boot time and memory
+(wider `SESS=8`, `MTP=3` boot time and memory cost not yet measured).

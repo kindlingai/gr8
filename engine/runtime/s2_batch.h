@@ -611,6 +611,11 @@ public:
         const Learned& l = pull();
         v(K_)(max_rows_)(mtp_sessions_)(sess_drafts_)(adapt_)(dkv_)(par_)(fresh_spec_)(l.dsl)(l.sel)(ks_)(reuse_)(ng_)(l.ngd)(l.ngm)
          (l.ring)(cost_)(l.sl)(l.round_no)(l.cur_round)(l.cur_active)(l.st)(l.stats);
+        if (waterfill_) {
+            float lp[32 * 8];
+            g6s2_batch_waterfill_lp(get(), lp);
+            v(waterfill_)(wf_margin_)(wf_ng_shared_only_)(lp);
+        }
     }
     // the session's tokens so far, prompt included: its next round writes rows from length - 1 on
     int length(int q) const { return g6s2_batch_length(get(), q); }
@@ -634,6 +639,11 @@ public:
     void adapt(bool on) { const Api api_(this, "adapt", on); adapt_ = on; g6s2_batch_adapt(b(), on); }
     // a solo DFlash2 round's drafter step runs under the MTP first form (GR8_DRAFT_PAR, which sets the default)
     void draft_par(bool on) { const Api api_(this, "draft_par", on); par_ = on; g6s2_batch_draft_par(b(), on); }
+    void waterfill(bool on, double margin, bool shared_only = false) {
+        const Api api_(this, "waterfill", on, margin, shared_only);
+        check(g6s2_batch_waterfill(b(), on, margin, shared_only));
+        waterfill_ = on; wf_margin_ = margin; wf_ng_shared_only_ = shared_only;
+    }
     void fresh_spec(bool on) { const Api api_(this, "fresh_spec", on); fresh_spec_ = on; g6s2_batch_fresh_spec(b(), on); }
     // DFlash2 sessions verify up to kv of the 7 drafts; sl: the plain build's --spec-adaptive policy (sl.on = false: kv)
     void dflash(int kv, const g6rt::SpecLen& sl)
@@ -992,6 +1002,9 @@ private:
     int mtp_sessions_ = 0;            // Config::mtp_sessions
     bool sess_drafts_ = false;        // Config::sess_drafts (GR8_DS_SESS_DRAFTS)
     bool adapt_ = false;
+    bool waterfill_ = false;
+    double wf_margin_ = 0.0;
+    bool wf_ng_shared_only_ = false;
     int dkv_ = DFL_B - 1;
     bool par_ = knob::draft_par().value_or(0) != 0;
     bool fresh_spec_ = knob::s2_fresh_spec();

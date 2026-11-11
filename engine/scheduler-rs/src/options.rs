@@ -722,7 +722,15 @@ fn alt_hex(v: u32) -> String {
 /// The parse. Err is the message main dies with.
 pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[Str]) -> Result<Opts, Str> {
     let k = Knobs(api);
+    let waterfill = k.flag(kid::S2_SHARED_WATERFILL);
+    let wf_margin = k.float(kid::S2_SHARED_WF_MARGIN);
+    if !wf_margin.is_finite() || wf_margin < 0.0 {
+        return Err("GR8_S2_SHARED_WF_MARGIN: want a finite nonnegative value".into());
+    }
     let (ds41, flash) = (m.model == MODEL_DS41, m.model == MODEL_GLM53F);
+    if waterfill && ds41 {
+        return Err("GR8_S2_SHARED_WATERFILL: DS41 shared steps require uniform rows; ragged rows are unsupported".into());
+    }
     let (nr, mx, s2n) = (m.nr, m.mx, m.s2n);
     let dfl_drafts = m.dfl_drafts;
     let mut o = Opts {
@@ -1107,7 +1115,7 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[Str]) -> Result
         if b.mode != 0 && (!s2mode || b.explore < 0) {
             return Err("GR8_MTP_KSTOPB needs --serve; GR8_MTP_KSTOPB_EXPLORE >= 0".into());
         }
-        if b.mode == 0 {
+        if b.mode == 0 && !waterfill {
             *b = KStopB::new(s2n);
         }
     }
@@ -1338,6 +1346,9 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[Str]) -> Result
     if reuse_prefix && dfl && !s2mode {
         return Err("--reuse-prefix is not supported with --dflash-manifest (the drafter's prompt-context taps come from the prefill)".into());
     }
+    if waterfill && (!s2mode || mtp < 1 || mx > 64) {
+        return Err("GR8_S2_SHARED_WATERFILL needs --serve, --mtp >= 1 and max rows <= 64".into());
+    }
     let mut row_counts: Vec<i32> = Vec::new();
     for ps in &o.co.prompts {
         let mut p = o.plan.clone();
@@ -1388,6 +1399,15 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[Str]) -> Result
     }
     for r in kstop.b.widths_of(1, mtp) {
         add(&mut row_counts, r);
+    }
+    if waterfill {
+        let depth = if k.text(kid::NGRAM).is_empty() { mtp } else { mtp.max(7) };
+        // First-form drafts may accept any subset/prefix; chain steps have one row per survivor.
+        // Every width the allocator prices is therefore captured, without padding fictitious rows.
+        for r in 1..=mx.min(s2sess * (depth + 1)) {
+            add(&mut row_counts, r);
+            add(&mut draft_rows, r);
+        }
     }
     // GR8_S2_ADAPT: a session alone may verify any k <= mtp
     if s2mode && k.flag(kid::S2_ADAPT) {
@@ -1876,6 +1896,52 @@ mod tests {
         // SAFETY: the view's strings live in st
         assert_eq!(unsafe { CStr::from_ptr(v.packfile) }.to_bytes(), path);
         assert_eq!(run_bytes(&[b"--x\xff"]).unwrap_err(), b"unknown argument --x\xff");
+    }
+
+    #[test]
+    fn waterfill_boot_widths_margin_and_model_refusal() {
+        use std::cell::Cell;
+        thread_local! {
+            static NG: Cell<bool> = const { Cell::new(false) };
+            static MARGIN: Cell<f64> = const { Cell::new(0.0) };
+        }
+        unsafe extern "C" fn wf_flag(id: u32, _: u32, out: *mut c_int) -> c_int {
+            *out = (id == kid::S2_SHARED_WATERFILL) as c_int; 1
+        }
+        unsafe extern "C" fn wf_float(id: u32, n: u32, out: *mut f64) -> c_int {
+            if id == kid::S2_SHARED_WF_MARGIN { *out = MARGIN.with(Cell::get); 1 } else { float_(id, n, out) }
+        }
+        unsafe extern "C" fn wf_text(id: u32, n: u32) -> *const c_char {
+            if id == kid::NGRAM && NG.with(Cell::get) { c"table".as_ptr() } else { text(id, n) }
+        }
+        let api = KnobApi { table_hash: kid::TABLE_HASH, flag: Some(wf_flag), int_: Some(int_),
+            float_: Some(wf_float), text: Some(wf_text), ints: Some(ints), floats: Some(floats), tests_set: Some(tests_set) };
+        let host = Host { ctx: std::ptr::null_mut(), engram_colls: None, dsk_mtp: 0,
+            dsk_relaxed: false, dsk_relax_topp: 0.0, dsk_err: std::ptr::null() };
+        for model in [crate::module_info::MODEL_GLM53, MODEL_GLM53F] {
+            let mut m = glm(); m.model = model;
+            for ng in [false, true] {
+                NG.with(|v| v.set(ng));
+                for n in [2, 4, 8] {
+                    let mut args: Vec<Str> = std::iter::once("g6m4").chain(BASE).map(|s| s.as_bytes().to_vec()).collect();
+                    args.extend(["--serve", "session", "--graph", "--mtp", "3", "--prefill", "64", "--s2-port", "1", "--s2-sessions"].map(|s| s.as_bytes().to_vec()));
+                    args.push(n.to_string().into_bytes());
+                    let o = parse(&m, &api, &host, &args).unwrap();
+                    let max_m = 32.min(n * if ng { 8 } else { 4 });
+                    for width in 1..=max_m {
+                        assert!(o.row_counts.contains(&width), "MAIN model={model} c={n} width={width}");
+                        assert!(o.draft_rows.contains(&width), "DRAFT model={model} c={n} width={width}");
+                    }
+                }
+            }
+        }
+        let mut ds = glm(); ds.model = MODEL_DS41;
+        assert!(String::from_utf8(parse(&ds, &api, &host, &[]).unwrap_err()).unwrap().contains("uniform rows"));
+        for margin in [-1.0, f64::NAN, f64::INFINITY] {
+            MARGIN.with(|v| v.set(margin));
+            assert_eq!(parse(&glm(), &api, &host, &[]).unwrap_err(),
+                b"GR8_S2_SHARED_WF_MARGIN: want a finite nonnegative value");
+        }
     }
 
     #[test]

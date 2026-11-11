@@ -92,7 +92,7 @@ pub struct DflDrafts {
 
 /// One engine step as the planner builds it (s2_batch.h Step, less the driver's scheduler_decode). The planner keeps
 /// one per step kind and refills it, so a round allocates nothing once the buffers have grown.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StepBuf {
     pub kind: i32,
     pub event: i32,
@@ -701,6 +701,10 @@ pub struct Batch<E: Engine> {
     mtp_sessions: i32,
     sess_drafts: bool,
     adapt: bool,
+    waterfill: bool,
+    wf_margin: f64,
+    pub wf_ng_shared_only: bool,
+    pub wf_lp: [[f32; DFL_B]; MAX_SLOTS],
     dkv: i32,
     par: bool,
     fresh_spec: bool,
@@ -741,6 +745,10 @@ impl<E: Engine> Batch<E> {
             mtp_sessions: 0,
             sess_drafts: false,
             adapt: false,
+            waterfill: false,
+            wf_margin: 0.0,
+            wf_ng_shared_only: false,
+            wf_lp: [[f32::NAN; DFL_B]; MAX_SLOTS],
             dkv: DFL_B as i32 - 1,
             par,
             fresh_spec,
@@ -778,6 +786,28 @@ impl<E: Engine> Batch<E> {
     pub fn set_sess_drafts(&mut self, on: bool) {
         self.sess_drafts = on;
     }
+    /// Boot captures every width up to max_rows reachable by the shared proposal pool.
+    pub fn set_waterfill(&mut self, on: bool, margin: f64) -> Res<()> {
+        if !margin.is_finite() || margin < 0.0 || (on && (self.max_rows > 64 || self.k > 7)) {
+            return Err(Stop::Refused("shared waterfill: finite nonnegative margin, max rows <= 64, drafts <= 7".into()));
+        }
+        self.waterfill = on;
+        self.wf_margin = margin;
+        if on {
+            // Reserve the widest possible round at boot, not on a later explore/acceptance change.
+            for s in [&mut self.sm, &mut self.sd, &mut self.sc] {
+                s.sess.reserve(self.slots);
+                s.row0.reserve(self.slots);
+                s.rows.reserve(self.slots);
+                s.ctx.reserve(self.slots);
+                s.ev.reserve(self.slots);
+                s.r.reserve(self.max_rows as usize);
+            }
+            for t in [&mut self.tm, &mut self.td, &mut self.tc] { t.reserve(self.max_rows as usize); }
+        }
+        Ok(())
+    }
+
     pub fn set_adapt(&mut self, on: bool) {
         self.adapt = on;
     }
@@ -987,7 +1017,7 @@ impl<E: Engine> Batch<E> {
             run_step(&self.e, &self.sd, &mut self.td)?;
             for (i, &q) in drafted.as_slice().iter().enumerate() {
                 let row = self.sd.row0[i];
-                let lp = self.dlp(row)?;
+                let lp = self.dlp(q as usize, 1, row)?;
                 let x = &mut self.st[q as usize];
                 x.d[1] = self.td[row as usize];
                 x.dlm[1] = lp;
@@ -1085,7 +1115,7 @@ impl<E: Engine> Batch<E> {
             return Ok(false);
         }
         // With a session cap a round past mtp_max_sess() drafts nothing, so it needs one row a session
-        let rows = if self.mtp_sessions > 0 { act.len() as i64 } else { act.len() as i64 * (self.k as i64 + 1) };
+        let rows = if self.mtp_sessions > 0 || (self.waterfill && act.len() >= 2) { act.len() as i64 } else { act.len() as i64 * (self.k as i64 + 1) };
         if rows > self.max_rows as i64 {
             return Err(Stop::Refused(format!(
                 "s2: {} sessions need {} rows > max rows {}",
@@ -1117,7 +1147,7 @@ impl<E: Engine> Batch<E> {
             self.round_dfl(live.v[0])?;
         } else {
             self.demote()?;
-            if self.ks.solo && live.len() > 1 {
+            if self.ks.solo && live.len() > 1 && !self.waterfill {
                 self.complete(live.as_slice())?;
             }
             self.round_all(live.as_slice())?;
@@ -1138,7 +1168,8 @@ impl<E: Engine> Batch<E> {
             }
         }
         let mut base = [0i32; MAX_SLOTS];
-        let mtp_on = self.k > 0 && act.len() as i64 <= self.mtp_max_sess() as i64;
+        let wf = self.waterfill && act.len() >= 2;
+        let mtp_on = self.k > 0 && (wf || act.len() as i64 <= self.mtp_max_sess() as i64);
         let mut k = if mtp_on { self.k } else { 0 };
         if mtp_on && self.sess_drafts {
             k = k.min(sess_drafts_kv(self.k, self.max_rows, act.len() as i32));
@@ -1154,7 +1185,15 @@ impl<E: Engine> Batch<E> {
         let xr = mtp_on && self.ks.b.mode != 0 && self.ks.b.explore != 0 && cur_round % self.ks.b.explore as i64 == 0;
         let solo = mtp_on && self.ksolo(act.len());
         let mut pe = 0.0;
-        if solo {
+        let mut pool = [[0i32; DFL_B]; MAX_SLOTS];
+        let mut prob = [[0.0f64; DFL_B]; MAX_SLOTS];
+        let mut avail = [0i32; MAX_SLOTS];
+        let mut ng_used = [[false; DFL_B]; MAX_SLOTS];
+        if wf {
+            self.shared_pool(act, &mut pool, &mut prob, &mut avail, &mut ng_used);
+            // Waterfill supersedes KStopB's threshold/explore choices: all widths are captured.
+            self.kwaterfill(act, &prob, &avail, &mut kq);
+        } else if solo {
             kq[act[0] as usize] = self.kverify(act[0], &mut pe);
         } else if mtp_on && self.ks.b.mode != 0 {
             self.kshared(act, k, xr, &mut kq);
@@ -1168,7 +1207,8 @@ impl<E: Engine> Batch<E> {
             nd[qu] = x.k;
             self.sm.open(q, if x.rounds == 0 { DECODE1 } else { ROUND });
             for r in 0..=kq[qu] {
-                let tok = if r > 0 { x.d[r as usize] } else { x.tokens[base[qu] as usize] };
+                let tok = if r == 0 { x.tokens[base[qu] as usize] }
+                    else if wf { pool[qu][r as usize] } else { x.d[r as usize] };
                 self.sm.r.push(Row { sess: q, tok, pos: base[qu] + r, spos: base[qu] + r + 1, tgt: -1 });
             }
             self.sm.close();
@@ -1191,7 +1231,7 @@ impl<E: Engine> Batch<E> {
             {
                 let x = &self.st[qu];
                 let so = &self.tm[r0..];
-                while a < kv && x.d[(a + 1) as usize] == so[a as usize] {
+                while a < kv && (if wf { pool[qu][(a + 1) as usize] } else { x.d[(a + 1) as usize] }) == so[a as usize] {
                     a += 1;
                 }
             }
@@ -1206,6 +1246,15 @@ impl<E: Engine> Batch<E> {
             s.tokens += (a + 1) as i64;
             s.acc[a as usize] += 1;
             s.drafted += kv as i64;
+            if wf && ng_used[qu][1..=kv as usize].iter().any(|&v| v) {
+                s.ngram_rounds += 1;
+                for j in 1..=kv as usize {
+                    if ng_used[qu][j] {
+                        s.ngram_drafted += 1;
+                        s.ngram_acc += (j <= a as usize) as i64;
+                    }
+                }
+            }
             self.st[qu].rounds += 1;
             acc[qu] = kept.min(a); // the draft step's rows: those whose input the session committed
             let x = &self.st[qu];
@@ -1225,7 +1274,7 @@ impl<E: Engine> Batch<E> {
         let mut dm = 0;
         let ndraft = self.sm.sess.iter().filter(|&&q| !self.st[q as usize].done).count() as i64;
         let mms = self.mtp_max_sess() as i64;
-        let draft_on = self.k > 0 && ndraft > 0 && ndraft <= mms && on.len() as i64 <= mms;
+        let draft_on = self.k > 0 && ndraft > 0 && (wf || (ndraft <= mms && on.len() as i64 <= mms));
         if draft_on {
             // first-form draft: one step, rows a+1 of each survivor
             self.sd.begin(DRAFT, cur_round, cur_active).event = self.sm.event;
@@ -1247,7 +1296,7 @@ impl<E: Engine> Batch<E> {
                 for i in 0..self.sd.sess.len() {
                     // dlm[1]: KStop's input once GR8_DFL_REUSE=2 promotes the session to the solo path
                     let row = self.sd.row0[i] + self.sd.rows[i] - 1;
-                    let lp = self.dlp(row)?;
+                    let lp = self.dlp(self.sd.sess[i] as usize, 1, row)?;
                     let x = &mut self.st[self.sd.sess[i] as usize];
                     x.d[1] = self.td[row as usize];
                     x.dlm[1] = lp;
@@ -1264,7 +1313,9 @@ impl<E: Engine> Batch<E> {
                 };
             }
             let t2 = if self.ks.log { Some(Instant::now()) } else { None };
-            let kc = if solo && on.len() == 1 { 0 } else { self.choose(on.as_slice()) };
+            let kc = if solo && on.len() == 1 { 0 }
+                else if wf { self.shared_chain_depth(on.as_slice()) }
+                else { self.choose(on.as_slice()) };
             if solo && on.len() == 1 {
                 self.kchain(on.v[0], evs[0])?;
             } else {
@@ -1300,6 +1351,131 @@ impl<E: Engine> Batch<E> {
             }
         }
         Ok(())
+    }
+
+    /// The head supplies a conditional, not kprob's cumulative product. Blend only observed
+    /// evidence, conservatively: unobserved positions retain their head confidence.
+    fn shared_prob(&self, q: usize, j: usize, lp: f32) -> f64 {
+        let sl = &self.sl[q];
+        let p = if lp.is_nan() { sl.rate(j) } else { (lp as f64).exp().clamp(0.0, 1.0) };
+        if sl.pn[j] > 0.0 {
+            p.min((sl.pk[j] + sl.prior * p) / (sl.pn[j] + sl.prior)).clamp(0.0, 1.0)
+        } else { p.clamp(0.0, 1.0) }
+    }
+
+    /// Build a coherent prefix. An n-gram may replace a weaker head proposal or extend its
+    /// tail. Once it diverges, later MTP tokens no longer have this prefix and are unavailable.
+    fn shared_pool(&self, act: &[i32], tok: &mut [[i32; DFL_B]; MAX_SLOTS],
+                   prob: &mut [[f64; DFL_B]; MAX_SLOTS], avail: &mut [i32; MAX_SLOTS],
+                   ng_used: &mut [[bool; DFL_B]; MAX_SLOTS]) {
+        for &q in act {
+            let q = q as usize;
+            let x = &self.st[q];
+            let mtp = x.k.min(self.k).clamp(0, 7) as usize;
+            let cap = if self.ng.t.is_some() { self.ng.kmax.max(mtp as i32).min(7) as usize } else { mtp };
+            let cap = cap.min((self.max_rows - act.len() as i32).max(0) as usize);
+            let mut ctx = [0; crate::ngram::NMAX + DFL_B];
+            let start = x.tokens.len().saturating_sub(crate::ngram::NMAX);
+            let mut len = x.tokens.len() - start;
+            ctx[..len].copy_from_slice(&x.tokens[start..]);
+            let mut same = true;
+            for j in 1..=cap {
+                let mp = if same && j <= mtp { Some((x.d[j], self.shared_prob(q, j, self.wf_lp[q][j]))) } else { None };
+                let np = self.ng.t.as_ref().and_then(|t| {
+                    if j > self.ng.kmax as usize { return None; }
+                    t.next(&ctx[..len]).map(|(v, p)| (v, t.conf(p).clamp(0.0, 1.0)))
+                });
+                let (v, p, ng) = match (mp, np) {
+                    (Some((_, p)), Some((n, c))) if c > p => (n, c, true),
+                    (Some((v, p)), _) => (v, p, false),
+                    (None, Some((n, c))) => (n, c, true),
+                    (None, None) => break,
+                };
+                tok[q][j] = v;
+                prob[q][j] = p;
+                ng_used[q][j] = ng;
+                same = same && j <= mtp && v == x.d[j];
+                ctx[len] = v;
+                len += 1;
+                avail[q] = j as i32;
+            }
+        }
+    }
+
+    fn shared_verify_ms(&self, m: i32) -> f64 { self.cost.main0 + self.cost.main_row * m as f64 }
+
+    fn draft_chain_ms(&self, act: &[i32], k: i32) -> f64 {
+        if self.k == 0 { return 0.0; }
+        self.cost.draft0 + self.cost.draft_sess * act.len() as f64
+            + (k - 1).max(0) as f64 * (self.cost.chain0 + self.cost.chain_sess * act.len() as f64)
+    }
+
+    /// Enumerate the greedy prefix frontier with fixed storage. Every width is boot-captured.
+    /// Strict comparisons retain the earlier act entry on ties and the smaller width on plateaus.
+    fn kwaterfill(&self, act: &[i32], prob: &[[f64; DFL_B]; MAX_SLOTS], avail: &[i32; MAX_SLOTS],
+                  out: &mut [i32; MAX_SLOTS]) -> f64 {
+        let mut kq = [0; MAX_SLOTS];
+        let mut reach = [1.0; MAX_SLOTS];
+        let mut expected = [0.0; 65];
+        let mut m = act.len() as i32;
+        let mut e = m as f64;
+        // Feasibility takes precedence when a session has no drafts or the configured floor cannot fit.
+        let lo = self.ks.b.kmin.clamp(0, self.k).min((self.max_rows / m - 1).max(0));
+        for &q in act {
+            let q = q as usize;
+            for j in 1..=lo.min(avail[q]) as usize {
+                reach[q] *= prob[q][j];
+                e += reach[q];
+                kq[q] += 1;
+                m += 1;
+            }
+        }
+        let mut best = -1.0;
+        loop {
+            expected[m as usize] = e;
+            let depth = act.iter().map(|&q| kq[q as usize].min(self.k)).max().unwrap_or(0).max(1);
+            let ms = self.shared_verify_ms(m) + self.draft_chain_ms(act, depth);
+            let rate = expected[m as usize] / ms;
+            if best < 0.0 || rate > best * (1.0 + self.wf_margin) {
+                best = rate;
+                *out = kq;
+            }
+            if m >= self.max_rows { break; }
+            let mut pick = None;
+            let mut gain = -1.0;
+            for &q in act {
+                let q = q as usize;
+                if kq[q] < avail[q] {
+                    let v = reach[q] * prob[q][kq[q] as usize + 1];
+                    if v > gain { gain = v; pick = Some(q); }
+                }
+            }
+            let Some(q) = pick else { break };
+            kq[q] += 1;
+            reach[q] = gain;
+            e += gain;
+            m += 1;
+        }
+        best
+    }
+
+    /// Reprice the next chain from the new first draft and observed deeper survival. Unlike
+    /// reusing this round's depth this can recover after a short/empty available draft pool.
+    /// Only the first new draft exists; its confidence seeds every depth, blended with that depth's observed survival.
+    fn shared_chain_depth(&self, act: &[i32]) -> i32 {
+        if act.is_empty() { return 0; }
+        let mut prob = [[0.0; DFL_B]; MAX_SLOTS];
+        let mut avail = [0; MAX_SLOTS];
+        for &q in act {
+            let q = q as usize;
+            avail[q] = self.k;
+            for j in 1..=self.k as usize {
+                prob[q][j] = self.shared_prob(q, j, self.wf_lp[q][1]);
+            }
+        }
+        let mut kq = [0; MAX_SLOTS];
+        self.kwaterfill(act, &prob, &avail, &mut kq);
+        act.iter().map(|&q| kq[q as usize]).max().unwrap_or(1).max(1)
     }
 
     /// KStopB: each session's verified drafts kq[q] <= k in a shared round (rank-invariant: the drafts'
@@ -1563,7 +1739,7 @@ impl<E: Engine> Batch<E> {
         self.check(&self.sd)?;
         run_step(&self.e, &self.sd, &mut self.td)?;
         self.st[qu].d[1] = self.td[(dn - 1) as usize];
-        let lp = self.dlp(dn - 1)?;
+        let lp = self.dlp(qu, 1, dn - 1)?;
         self.st[qu].dlm[1] = lp;
         if self.st[qu].force >= 0 {
             // the insert cut this round: the drafter takes the rows as context, forced() drafts
@@ -1674,6 +1850,8 @@ impl<E: Engine> Batch<E> {
     /// drafter's k drafts: its length (0: the drafter's), the chain in nd[1..], the expected tokens of both
     #[allow(clippy::too_many_arguments)]
     fn ngram_pick(&self, q: i32, base: i32, m: bool, k: i32, nd: &mut [i32; DFL_B], ne: &mut f64, de: &mut f64) -> i32 {
+        // Some runtimes only enabled the table for shared rounds; keep their solo behavior.
+        if self.waterfill && self.wf_ng_shared_only { return 0; }
         let x = &self.st[q as usize];
         let Some(t) = &self.ng.t else { return 0 };
         let mut c = [0.0f64; DFL_B];
@@ -1807,12 +1985,12 @@ impl<E: Engine> Batch<E> {
         }
         k.max(1)
     }
-    fn dlp(&self, row: i32) -> Res<f32> {
-        if self.e.has_lp() && (self.ks.mode != 0 || self.ks.b.mode != 0 || self.ks.log) {
-            self.e.lp(row)
-        } else {
-            Ok(f32::NAN)
-        }
+    fn dlp(&mut self, q: usize, j: usize, row: i32) -> Res<f32> {
+        let legacy = self.ks.mode != 0 || self.ks.b.mode != 0 || self.ks.log;
+        let lp = if self.e.has_lp() && (legacy || self.waterfill) { self.e.lp(row)? } else { f32::NAN };
+        if self.waterfill { self.wf_lp[q][j] = lp; }
+        // Extra confidence reads must not change the solo policies' inputs.
+        Ok(if legacy && !(self.waterfill && self.wf_ng_shared_only) { lp } else { f32::NAN })
     }
 
     /// GR8_DFL_REUSE, a DFlash2 session's start: the drafter's context starts at the lowest position the ring still
@@ -2044,7 +2222,7 @@ impl<E: Engine> Batch<E> {
             run_step(&self.e, &self.sc, &mut self.tc)?;
             for i in 0..self.sc.sess.len() {
                 let row = self.sc.row0[i];
-                let lp = self.dlp(row)?;
+                let lp = self.dlp(self.sc.sess[i] as usize, (j + 1) as usize, row)?;
                 let x = &mut self.st[self.sc.sess[i] as usize];
                 x.d[(j + 1) as usize] = self.tc[row as usize];
                 x.dlm[(j + 1) as usize] = lp;
@@ -2068,6 +2246,7 @@ impl<E: Engine> Batch<E> {
         let dsize = self.k.max(self.kmax()).max(1) as usize + 1; // K = 0 (DS41): d[1] still exists and stays unwritten
         let x = &mut self.st[qu];
         x.reset();
+        self.wf_lp[qu] = [f32::NAN; DFL_B];
         x.first = p.first;
         x.chunk = p.chunk;
         x.n_gen = p.n_gen;
@@ -2076,6 +2255,7 @@ impl<E: Engine> Batch<E> {
         x.ins_unless = p.ins_unless;
         x.ins_tokens.extend_from_slice(p.ins_tokens);
         x.on = true;
+        if self.waterfill { x.tokens.reserve(p.prompt.len() + p.n_gen.max(0) as usize + DFL_B); }
         x.tokens.extend_from_slice(p.prompt);
         x.n = p.prompt.len() as i32;
         x.d.resize(dsize, 0);
@@ -2098,7 +2278,7 @@ impl<E: Engine> Batch<E> {
         if dfl && !(self.e.has_dfl() && self.e.has_dfl_start()) {
             return Err(Stop::Refused("s2: DFlash2 session without drafter hooks".into()));
         }
-        let na = self.k.max(if dfl { DFL_B as i32 - 1 } else { 0 }) as usize + 1;
+        let na = self.k.max(if dfl || self.waterfill { DFL_B as i32 - 1 } else { 0 }) as usize + 1;
         self.stats[qu].acc.resize(na, 0);
         self.st[qu].dl = [f32::NAN; DFL_B];
         let lo = if dfl { self.e.dfl_start(q)? } else { 0 };
@@ -2153,7 +2333,7 @@ impl<E: Engine> Batch<E> {
                 self.check(&self.sd)?;
                 run_step(&self.e, &self.sd, &mut self.td)?;
                 self.st[qu].d[1] = self.td[(m - 1) as usize];
-                let lp = self.dlp(m - 1)?;
+                let lp = self.dlp(qu, 1, m - 1)?;
                 self.st[qu].dlm[1] = lp;
             }
             let x = &self.st[qu];
@@ -2221,7 +2401,7 @@ impl<E: Engine> Batch<E> {
                 self.check(&self.sd)?;
                 run_step(&self.e, &self.sd, &mut self.td)?;
                 self.st[qu].d[1] = self.td[mu - 1];
-                let lp = self.dlp(m - 1)?;
+                let lp = self.dlp(qu, 1, m - 1)?;
                 self.st[qu].dlm[1] = lp;
             }
             if self.st[qu].dfl {
@@ -2261,11 +2441,15 @@ pub(crate) mod tests {
     struct Fake {
         steps: RefCell<Vec<(i32, i32, i32)>>, // kind, rows, class
         got: RefCell<Vec<i32>>,
+        wire: RefCell<Vec<StepBuf>>,
+        lp: bool,
+        dfl: bool,
     }
 
     impl Engine for Fake {
         fn run(&self, s: &StepBuf, out: &mut [i32]) -> Res<()> {
             self.steps.borrow_mut().push((s.kind, s.m(), s.cls));
+            self.wire.borrow_mut().push(s.clone());
             for (o, r) in out.iter_mut().zip(&s.r) {
                 *o = target(if s.kind == MAIN { r.pos } else { r.spos - 1 });
             }
@@ -2291,22 +2475,25 @@ pub(crate) mod tests {
             Ok(false)
         }
         fn has_dfl(&self) -> bool {
-            false
+            self.dfl
         }
-        fn dfl(&self, _: &DflReq) -> Res<DflDrafts> {
-            Err(Stop::Hook)
+        fn dfl(&self, r: &DflReq) -> Res<DflDrafts> {
+            assert!(self.dfl);
+            Quiet.dfl(r)
         }
         fn has_dfl_start(&self) -> bool {
-            false
+            self.dfl
         }
         fn dfl_start(&self, _: i32) -> Res<i32> {
-            Err(Stop::Hook)
+            assert!(self.dfl);
+            Ok(0)
         }
         fn has_lp(&self) -> bool {
-            false
+            self.lp
         }
         fn lp(&self, _: i32) -> Res<f32> {
-            Ok(f32::NAN)
+            assert!(self.lp);
+            Ok(-1.0)
         }
     }
 
@@ -2325,6 +2512,10 @@ pub(crate) mod tests {
             mtp_sessions: _,
             sess_drafts: _,
             adapt: _,
+            waterfill: _, // agreed boot settings, recorded by the facade when enabled
+            wf_margin: _,
+            wf_ng_shared_only: _, // agreed setting in optional facade learn record
+            wf_lp: _, // exported by g6s2_batch_waterfill_lp
             dkv: _,
             par: _,
             fresh_spec: _,
@@ -2364,6 +2555,333 @@ pub(crate) mod tests {
             ins_unless: -1,
             ins_tokens: &[],
         }
+    }
+
+    // A wire-field fingerprint, not Rust object bytes (Vec pointers and padding are not wire data).
+    fn wire_hash(h: &mut u64, steps: &[StepBuf]) {
+        let mut word = |v: i64| {
+            for b in v.to_le_bytes() { *h = (*h ^ b as u64).wrapping_mul(1099511628211); }
+        };
+        for s in steps {
+            for v in [s.kind as i64, s.event as i64, s.cls as i64, s.round, s.round_active as i64] { word(v); }
+            for v in [&s.sess, &s.row0, &s.rows, &s.ctx, &s.ev] {
+                word(v.len() as i64);
+                for &x in v { word(x as i64); }
+            }
+            word(s.r.len() as i64);
+            for r in &s.r {
+                for v in [r.sess, r.tok, r.pos, r.spos, r.tgt] { word(v as i64); }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_wire_fingerprint_5000_rounds() {
+        let prompt: Vec<i32> = (0..8).map(|p| target(p - 1)).collect();
+        let mut h = 1469598103934665603;
+        for n in [1, 2, 4, 8] {
+            let mut b = Batch::new(3, 32, 8, false, false, Cost::default(), Fake::default());
+            b.set_adapt(true);
+            let act: Vec<i32> = (0..n).rev().collect();
+            let ss = vec![session(&prompt, 100_000); n as usize];
+            b.admit(&act, &ss).unwrap();
+            b.e.wire.borrow_mut().clear();
+            for _ in 0..5000 {
+                assert!(b.round(&act).unwrap());
+                wire_hash(&mut h, &b.e.wire.borrow());
+                b.e.wire.borrow_mut().clear();
+            }
+        }
+        assert_eq!(h, 0x186c40439fb983ab, "base wire fingerprint over 5000 rounds at each concurrency");
+    }
+
+    #[derive(Default)]
+    struct ProofEngine { hash: std::cell::Cell<u64>, steps: std::cell::Cell<u64> }
+    impl Engine for ProofEngine {
+        fn run(&self, s: &StepBuf, out: &mut [i32]) -> Res<()> {
+            let mut h = self.hash.get(); wire_hash(&mut h, std::slice::from_ref(s));
+            self.hash.set(h); self.steps.set(self.steps.get() + 1);
+            Quiet.run(s, out)
+        }
+        fn has_round(&self) -> bool { false }
+        fn round(&self, _: i32, _: i64, _: i32, _: i32, _: i32) -> Res<()> { Ok(()) }
+        fn has_prompt(&self) -> bool { false }
+        fn prompt(&self, _: i32, _: i32, _: i32) -> Res<()> { Ok(()) }
+        fn has_emit(&self) -> bool { false }
+        fn emit(&self, _: i32, _: &[i32], _: i32) -> Res<bool> { Ok(false) }
+        fn has_dfl(&self) -> bool { true }
+        fn dfl(&self, r: &DflReq) -> Res<DflDrafts> { Quiet.dfl(r) }
+        fn has_dfl_start(&self) -> bool { true }
+        fn dfl_start(&self, _: i32) -> Res<i32> { Ok(0) }
+        fn has_lp(&self) -> bool { true }
+        fn lp(&self, row: i32) -> Res<f32> { Quiet.lp(row) }
+    }
+
+    fn shared_fixture(n: usize, rows: i32) -> (Batch<ProofEngine>, Vec<i32>) {
+        let prompt: Vec<i32> = (0..8).map(|p| target(p - 1)).collect();
+        let mut b = Batch::new(3, rows, n, false, false, Cost::default(), ProofEngine::default());
+        b.set_waterfill(true, 0.0).unwrap();
+        let act: Vec<i32> = (0..n as i32).rev().collect();
+        b.admit(&act, &vec![session(&prompt, 100_000); n]).unwrap();
+        (b, act)
+    }
+
+    fn utility(b: &Batch<ProofEngine>, act: &[i32], kq: &[i32; MAX_SLOTS], p: &[[f64; DFL_B]; MAX_SLOTS]) -> f64 {
+        let mut e = act.len() as f64;
+        let mut m = act.len() as i32;
+        let mut depth = 1;
+        for &q in act {
+            let q = q as usize;
+            let mut reach = 1.0;
+            for j in 1..=kq[q] as usize { reach *= p[q][j]; e += reach; }
+            m += kq[q]; depth = depth.max(kq[q].min(b.k));
+        }
+        e / (b.shared_verify_ms(m) + b.draft_chain_ms(act, depth))
+    }
+
+    #[test]
+    fn shared_waterfill_asymmetric_utility_and_caps() {
+        for n in [2, 4, 8] {
+            let (mut b, act) = shared_fixture(n, (4 * n) as i32);
+            let mut p = [[0.15; DFL_B]; MAX_SLOTS];
+            p[0] = [if n == 8 { 0.97 } else { 0.92 }; DFL_B];
+            let mut avail = [3; MAX_SLOTS];
+            let mut got = [0; MAX_SLOTS];
+            let rate = b.kwaterfill(&act, &p, &avail, &mut got);
+            assert_eq!(got[0], 3);
+            assert!(act.iter().filter(|&&q| q != 0).all(|&q| got[q as usize] < 3));
+            let uniform = [3; MAX_SLOTS];
+            b.ks.b.mode = 1;
+            b.ks.b.tau = vec![[0.0, 0.6, 0.88, 0.95, 0.0, 0.0, 0.0, 0.0]; n + 1];
+            for &q in &act { b.st[q as usize].dlm.fill((p[q as usize][1] as f32).ln()); }
+            let mut threshold = [0; MAX_SLOTS];
+            b.kshared(&act, 3, false, &mut threshold);
+            assert!(rate > utility(&b, &act, &uniform, &p));
+            assert!(rate > utility(&b, &act, &threshold, &p));
+            println!("estimated c={n}: uniform {:.9}, threshold {:.9}, waterfill {rate:.9}",
+                utility(&b, &act, &uniform, &p), utility(&b, &act, &threshold, &p));
+            let m = act.iter().map(|&q| got[q as usize] + 1).sum::<i32>();
+            assert!(m >= n as i32 && m <= b.max_rows);
+            // Unequal available pools must not be clamped to the poorest session.
+            avail[1] = 0;
+            b.kwaterfill(&act, &p, &avail, &mut got);
+            assert_eq!((got[0], got[1]), (3, 0));
+            b.max_rows = n as i32 + 2;
+            b.kwaterfill(&act, &p, &avail, &mut got);
+            assert!(act.iter().map(|&q| got[q as usize] + 1).sum::<i32>() <= b.max_rows);
+        }
+    }
+
+    #[test]
+    fn shared_waterfill_ties_floor_margin_and_chain_recovery() {
+        let (mut b, _) = shared_fixture(4, 16);
+        let act = [3, 1, 2, 0];
+        let p = [[0.9; DFL_B]; MAX_SLOTS];
+        let mut got = [0; MAX_SLOTS];
+        b.max_rows = 5;
+        b.kwaterfill(&act, &p, &[3; MAX_SLOTS], &mut got);
+        assert_eq!(got, { let mut v = [0; MAX_SLOTS]; v[3] = 1; v });
+        b.max_rows = 16;
+        b.ks.b.kmin = 1;
+        let mut available = [3; MAX_SLOTS]; available[2] = 0;
+        b.kwaterfill(&act, &[[0.0; DFL_B]; MAX_SLOTS], &available, &mut got);
+        assert_eq!((got[0], got[1], got[2], got[3]), (1, 1, 0, 1));
+        b.ks.b.kmin = 0;
+        b.wf_margin = 100.0;
+        b.kwaterfill(&act, &p, &available, &mut got);
+        assert_eq!(got, [0; MAX_SLOTS]);
+        b.wf_margin = 0.0;
+        b.wf_lp = [[0.15f32.ln(); DFL_B]; MAX_SLOTS];
+        assert_eq!(b.shared_chain_depth(&act), 1);
+        b.wf_lp[0] = [0.99f32.ln(); DFL_B];
+        for q in 0..4 { b.st[q].k = 1; }
+        assert_eq!(b.shared_chain_depth(&act), 3);
+    }
+
+    #[test]
+    fn local_logging_never_changes_replica_steps() {
+        for (waterfill, n) in [(false, 1), (false, 2), (true, 1), (true, 2)] {
+            let act: Vec<i32> = (0..n).collect();
+            let cost = Cost { flash: n == 1, ..Cost::default() };
+            let prompt: Vec<i32> = (0..8).map(|p| target(p - 1)).collect();
+            let mut a = Batch::new(3, 32, 8, false, false, cost, ProofEngine::default());
+            let mut b = Batch::new(3, 32, 8, false, false, cost, ProofEngine::default());
+            for x in [&mut a, &mut b] {
+                x.set_waterfill(waterfill, 0.0).unwrap();
+                x.set_adapt(true);
+            }
+            a.ks.log = true;
+            for x in [&mut a, &mut b] {
+                x.admit(&act, &vec![session(&prompt, 100_000); n as usize]).unwrap();
+            }
+            for _ in 0..32 {
+                a.round(&act).unwrap(); b.round(&act).unwrap();
+                assert_eq!(a.sm, b.sm, "logging MAIN, waterfill={waterfill}");
+                assert_eq!(a.sd, b.sd, "logging DRAFT, waterfill={waterfill}");
+                assert_eq!(a.sc, b.sc, "logging CHAIN, waterfill={waterfill}");
+                assert_eq!(a.e.hash.get(), b.e.hash.get());
+            }
+        }
+    }
+
+    #[test]
+    fn shared_waterfill_solo_is_untouched() {
+        for dfl in [false, true] {
+            let prompt: Vec<i32> = (0..8).map(|p| target(p - 1)).collect();
+            let mut a = Batch::new(3, 32, 8, false, false, Cost::default(), Quiet);
+            let mut b = Batch::new(3, 32, 8, false, false, Cost::default(), Quiet);
+            b.set_waterfill(true, 0.0).unwrap();
+            let mut ss = session(&prompt, 100_000); ss.dflash = dfl;
+            for x in [&mut a, &mut b] {
+                x.set_adapt(true);
+                x.admit(&[0], &[ss]).unwrap();
+            }
+            for i in 0..5000 {
+                assert_eq!(a.round(&[0]).unwrap(), b.round(&[0]).unwrap());
+                assert_eq!(a.sm, b.sm, "solo MAIN {i}");
+                assert_eq!(a.sd, b.sd, "solo DRAFT {i}");
+                assert_eq!(a.sc, b.sc, "solo CHAIN {i}");
+            }
+            assert_eq!(a.result(0), b.result(0));
+        }
+    }
+
+    #[test]
+    fn shared_only_ngram_keeps_legacy_solo_steps() {
+        let prompt: Vec<i32> = (0..8).map(|p| target(p - 1)).collect();
+        let mut a = Batch::new(3, 32, 8, false, false, Cost::default(), ProofEngine::default());
+        let mut b = Batch::new(3, 32, 8, false, false, Cost::default(), ProofEngine::default());
+        b.set_waterfill(true, 0.0).unwrap();
+        b.wf_ng_shared_only = true;
+        let mut t = NgramTable { ns: vec![1], ..NgramTable::default() };
+        for pos in 0..997 { t.t.insert(NgramTable::key(&[target(pos - 1)]), (target(pos), 0.999)); }
+        b.ngram(NgramSrc { t: Some(t), kmax: 7, ..NgramSrc::default() }).unwrap();
+        let mut ss = session(&prompt, 100_000); ss.dflash = true;
+        for x in [&mut a, &mut b] { x.admit(&[0], &[ss]).unwrap(); }
+        for _ in 0..1000 {
+            a.round(&[0]).unwrap(); b.round(&[0]).unwrap();
+            assert_eq!(a.e.hash.get(), b.e.hash.get());
+        }
+        assert_eq!(b.stats[0].ngram_rounds, 0);
+        let mut tok = [[0; DFL_B]; MAX_SLOTS];
+        let mut prob = [[0.0; DFL_B]; MAX_SLOTS];
+        let mut avail = [0; MAX_SLOTS];
+        let mut ng = [[false; DFL_B]; MAX_SLOTS];
+        b.shared_pool(&[0], &mut tok, &mut prob, &mut avail, &mut ng);
+        assert_eq!(avail[0], 7); // table remains available to shared allocation
+    }
+
+    #[test]
+    fn flash_shared_only_waterfill_keeps_solo_dflash_kstop_mode2_steps() {
+        let prompt: Vec<i32> = (0..8).map(|p| target(p - 1)).collect();
+        let make = |wf: bool, shared_only: bool, lp: bool| {
+            let mut b = Batch::new(3, 32, 8, false, false, Cost::default(), Fake { lp, dfl: true, ..Fake::default() });
+            let mut sl = SpecLen { on: true, ..SpecLen::default() };
+            sl.set_levels(&[1, 2, 3, 4, 5, 6, 7]);
+            b.dflash(7, sl);
+            let mut sel = DSel { on: true, ..DSel::default() };
+            sel.tab.v = [0.0, 40.0, 44.0, 48.0, 52.0, 56.0, 60.0, 64.0, 68.0];
+            sel.tab.d = 1000.0; // make MTP win drafter choice naturally so solo rounds run kmore/kverify(mode=2)
+            sel.tab.m = 2.0;
+            sel.tab.e = 2.0;
+            sel.tab.r = 0.95;
+            b.dsel(sel);
+            let mut ks = KStop::default();
+            ks.mode = 2;
+            ks.kmax = 3;
+            b.kstop(ks);
+            let mut ss = session(&prompt, 100_000);
+            ss.dflash = true;
+            b.admit(&[0], &[ss]).unwrap();
+            b.st[0].warm = 1_000_000; // GR8_DFL_REUSE warm-up switches DFlash2 session onto MTP after round 0
+            // Seed bucketed conditional discrepancies after admit so real lp (-1.0) vs NaN yields distinct mode-2 choices unless masked.
+            for _ in 0..80 {
+                b.sel.m.observe(3, 0, Some(&[0.0, -1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 0.0]), 0.0);
+                b.sel.m.observe(3, 3, Some(&[0.0, -0.01, -0.01, -0.01, 0.0, 0.0, 0.0, 0.0]), 0.0);
+            }
+            if wf {
+                b.set_waterfill(true, 0.0).unwrap();
+                b.wf_ng_shared_only = shared_only;
+            }
+            b.e.wire.borrow_mut().clear();
+            b
+        };
+        let mut base_flash = make(false, false, false);
+        let mut wf_flash = make(true, true, true);
+        let mut wf_glm = make(true, false, true);
+        let mut glm_differs = false;
+        for r in 0..500 {
+            assert_eq!(base_flash.round(&[0]).unwrap(), wf_flash.round(&[0]).unwrap(), "round {r}");
+            assert_eq!(*base_flash.e.wire.borrow(), *wf_flash.e.wire.borrow(), "wire round {r}");
+            let _ = wf_glm.round(&[0]).unwrap();
+            glm_differs |= *base_flash.e.wire.borrow() != *wf_glm.e.wire.borrow();
+            base_flash.e.wire.borrow_mut().clear();
+            wf_flash.e.wire.borrow_mut().clear();
+            wf_glm.e.wire.borrow_mut().clear();
+        }
+        assert!(glm_differs, "negative control: unmasked lp changes mode-2 solo MTP choices");
+        assert!(wf_flash.stats[0].mtp_rounds > 0);
+        assert_eq!(wf_flash.wf_lp[0][1], -1.0); // shared waterfill confidence stays populated
+    }
+
+    #[test]
+    fn shared_waterfill_10000_round_replicas_and_zero_allocations() {
+        for n in [2, 4, 8] {
+            let (mut a, mut act) = shared_fixture(n, 32);
+            let (mut b, _) = shared_fixture(n, 32);
+            for batch in [&mut a, &mut b] {
+                batch.ks.b.explore = 7;
+                batch.ks.b.mode = 1;
+                // Poison threshold settings: WF must not accidentally take the old explore/threshold path.
+                batch.ks.b.tau = vec![[1.0; 8]; n + 1];
+            }
+            counting::ALLOCS.with(|v| v.set(0));
+            counting::COUNTING.with(|v| v.set(true));
+            for i in 0..10_000 {
+                act.rotate_left(1);
+                // Equal and asymmetric head confidences, rejection and changing contexts.
+                for &q in &act {
+                    for batch in [&mut a, &mut b] {
+                        batch.wf_lp[q as usize].fill(if (i + q) % 3 == 0 { -0.02 } else { -2.0 });
+                        if i % 11 == 0 { batch.st[q as usize].d[1] = -1; }
+                    }
+                }
+                assert_eq!(a.round(&act).unwrap(), b.round(&act).unwrap());
+                assert_eq!(a.sm, b.sm);
+                assert_eq!(a.sd, b.sd);
+                assert_eq!(a.sc, b.sc);
+                assert_eq!(a.e.hash.get(), b.e.hash.get(), "every wire field including intermediate chains");
+                assert_eq!(a.e.steps.get(), b.e.steps.get());
+                for &q in &act { assert_eq!(a.st[q as usize].k, b.st[q as usize].k); }
+            }
+            counting::COUNTING.with(|v| v.set(false));
+            assert_eq!(counting::ALLOCS.with(|v| v.get()), 0, "c={n}");
+            for q in 0..n { assert_eq!(a.result(q as i32), b.result(q as i32)); }
+        }
+    }
+
+    #[test]
+    fn shared_waterfill_ngram_tail_is_coherent_and_allocation_free() {
+        let (mut b, act) = shared_fixture(4, 32);
+        let mut t = NgramTable { ns: vec![1], ..NgramTable::default() };
+        // A deterministic cyclic continuation covers every round, including seven-token tails.
+        for pos in 0..997 { t.t.insert(NgramTable::key(&[target(pos - 1)]), (target(pos), 0.999)); }
+        b.ngram(NgramSrc { t: Some(t), kmax: 7, ..NgramSrc::default() }).unwrap();
+        let mut tok = [[0; DFL_B]; MAX_SLOTS];
+        let mut p = [[0.0; DFL_B]; MAX_SLOTS];
+        let mut avail = [0; MAX_SLOTS];
+        let mut ng = [[false; DFL_B]; MAX_SLOTS];
+        b.shared_pool(&act, &mut tok, &mut p, &mut avail, &mut ng);
+        assert_eq!(avail[0], 7);
+        for j in 1..8 { assert_eq!(tok[0][j], target(b.st[0].base() + j as i32 - 1)); }
+        counting::ALLOCS.with(|v| v.set(0));
+        counting::COUNTING.with(|v| v.set(true));
+        for _ in 0..1000 { b.round(&act).unwrap(); }
+        counting::COUNTING.with(|v| v.set(false));
+        assert_eq!(counting::ALLOCS.with(|v| v.get()), 0);
+        assert!(b.stats[0].ngram_drafted > 3 * 1000);
+        assert_eq!(b.stats[0].ngram_drafted, b.stats[0].ngram_acc);
+        assert!(b.sm.rows.iter().any(|&r| r > 4));
     }
 
     #[test]
@@ -2466,22 +2984,27 @@ pub(crate) mod tests {
             Ok(false)
         }
         fn has_dfl(&self) -> bool {
-            false
+            true
         }
-        fn dfl(&self, _: &DflReq) -> Res<DflDrafts> {
-            Err(Stop::Hook)
+        fn dfl(&self, r: &DflReq) -> Res<DflDrafts> {
+            let mut d = DflDrafts::default();
+            for j in 1..DFL_B {
+                d.tok[j] = target(r.pos0 + r.rows + j as i32 - 1);
+                d.lp[j] = -0.1;
+            }
+            Ok(d)
         }
         fn has_dfl_start(&self) -> bool {
-            false
+            true
         }
         fn dfl_start(&self, _: i32) -> Res<i32> {
-            Err(Stop::Hook)
+            Ok(0)
         }
         fn has_lp(&self) -> bool {
-            false
+            true
         }
         fn lp(&self, _: i32) -> Res<f32> {
-            Ok(f32::NAN)
+            Ok(-0.1)
         }
     }
 
