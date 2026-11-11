@@ -59,6 +59,11 @@ checks restores against their originating run, not just token equality.
 | A0: same chat, no other traffic | 1,983 / 555 | 1,428 | 6.95 / 1.95 | 3.57 | 512 / 0 | 1.00 |
 | B: two chats, 8 turns each, evicting each other | 6,678 / 1,200 | 5,478 | 23.41 / 4.21 | 5.57 | 1,152 / 0 | 1.00 |
 | C: four chats sharing a 10,000-token system prompt | 2,776 / 952 | 1,824 | 9.73 / 3.34 | 2.92 | 896 / 84 | 1.10 |
+| D: six chats, store smaller than the working set | 8,360 / 2,042 | 6,318 | 29.31 / 7.16 | 4.09 | 6,400 / 4,736 | 3.85 |
+
+A store smaller than the active sessions still churns: D writes 6,400 blocks, of which 1,664 are new and 4,736
+are rewrites, for amplification 3.85. Source: c21 dev `port-write-amp.log:192,207`, emitted by
+`cargo test --manifest-path engine/kvman-rs/Cargo.toml --test c21_write_amp -- --nocapture`.
 
 The after totals store fewer distinct blocks because the trailing incomplete grid cell is no longer written.
 C's remaining 84 rewrites are three copies of 28 system-prompt pages beyond the shared 8,192-row boundary. With an
@@ -76,7 +81,7 @@ identical requests in both arms. OLD was the S2 TP6 arm `c704bd1d`; NEW was c21 
 | Pool self-hit writes, turns 3 / 4 / 5 (rank 0) | 1,561 / 1,561 / 1,556 pages | 0 / 0 / 0: no rewrites |
 | TTFT, turns 3 / 4 / 5 | 4.26 / 3.29 / 2.09 s | 1.30 / 1.32 / 1.30 s |
 | Output text | reference | byte-exact 9/9 |
-| SSD file at boot, each of 6 ranks | sparse (16.4 GB allocated) | fully allocated: 214,746,267,648 B per rank |
+| SSD file, each of 6 ranks (NEW at boot / OLD after run) | sparse (16.4 GB allocated after the run) | fully allocated: 214,746,267,648 B per rank |
 | Orderly quit | not measured | 1,536 pages, one entry per rank, about 0.5 s |
 
 After NEW quit/restart, turn 6 restored 5.39 GB / 98,304 cached tokens with one store hit and TTFT 1.81 s (cold turn 1:

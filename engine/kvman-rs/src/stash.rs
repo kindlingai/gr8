@@ -946,7 +946,7 @@ impl Stash {
         let tier = &mut self.tiers[te];
         tier.stats.spilled_pages += (n - p) as u64;
         tier.entries.push(Entry { id, kind: Kind::Evicted, key, st: st.clone(), slots, base, hits, tail: None, namespace });
-        if tier.index.is_some() && tier.whole {
+        if tier.index.is_some() && tier.whole && namespace == crate::pool::STOCK_NAMESPACE {
             self.commits.push((te, id));
         }
         true
@@ -1562,5 +1562,47 @@ impl Index {
         self.file = OpenOptions::new().append(true).open(&self.path)?;
         self.records = (self.live.len() + self.counts.len()) as u64;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool::STOCK_NAMESPACE;
+
+    #[test]
+    fn extend_keeps_the_same_stock_only_journal_policy_as_store() {
+        for (case, namespace) in [STOCK_NAMESPACE, [1; crate::pool::NAMESPACE_BYTES]].into_iter().enumerate() {
+            let dir = std::env::temp_dir().join(format!("g6kv-extend-namespace-{}-{case}", std::process::id()));
+            let mut stash = Stash::new(3, PAGE);
+            stash.add_tier(8, Keep::All, Some(Index::open(&dir, "extend-namespace").unwrap()));
+            stash.index_whole(0);
+            let first = Finished { history: (0..65).collect(), valid: 64, written_end: 64, pf_end: 64 };
+            stash.store_tail(Kind::Evicted, 0, first, &[0], &[0], 1, &[], 0, namespace, None);
+            let old = stash.entries(0)[0].clone();
+            let journaled = namespace == STOCK_NAMESPACE;
+            assert_eq!(stash.commits, if journaled { vec![(0, old.id)] } else { vec![] });
+            assert_eq!(stash.take_io().len(), 1);
+            stash.io_done().unwrap();
+            assert_eq!(Index::open(&dir, "extend-namespace").unwrap().1.len(), usize::from(journaled));
+
+            // Call the private path directly: pool grants currently do not give non-stock runs provenance.
+            let next = Finished { history: (0..129).collect(), valid: 128, written_end: 128, pf_end: 128 };
+            assert!(stash.extend(old.id, 1, 0, &next, &[0, 1], 1, namespace));
+            let extended = stash.entries(0)[0].clone();
+            assert_ne!(extended.id, old.id);
+            assert_eq!(extended.namespace, namespace);
+            assert_eq!(extended.slots.len(), 2);
+            assert_eq!(extended.slots[0], old.slots[0]);
+            assert_eq!(stash.commits, if journaled { vec![(0, extended.id)] } else { vec![] });
+            assert_eq!(stash.take_io(), vec![Io::Spill { tier: 0, page: 1, slot: extended.slots[1], part: Part::Full }]);
+            stash.io_done().unwrap();
+            drop(stash);
+            let (index, loaded) = Index::open(&dir, "extend-namespace").unwrap();
+            assert_eq!(loaded, if journaled { vec![extended] } else { vec![] });
+            drop(index);
+            std::fs::remove_file(dir.join("index")).unwrap();
+            std::fs::remove_dir(dir).unwrap();
+        }
     }
 }
