@@ -344,11 +344,49 @@ class GetTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIn('the file is parsed', err)
 
+    def test_kv_format_default_follows_known_tp(self):
+        self.assertEqual(self.get('KV_FORMAT', '--no-config', '--peers', PEERS)[:2], (0, 'int4'))
+        self.assertEqual(self.get('KV_FORMAT', '--no-config', '--peers', PEERS, '--kv-format', 'fp8')[:2], (0, 'fp8'))
+        self.assertEqual(self.get('KV_FORMAT', '--no-config', '--peers', ','.join(PEERS.split(',')[:3]))[:2], (1, ''))
+        self.assertEqual(self.get('KV_FORMAT', '--no-config')[:2], (1, ''))
+
     def test_tp_is_still_validated(self):
         self.assertEqual(self.get('TP', '--no-config', '--peers', PEERS)[:2], (0, '4'))
         rc, _, err = self.get('TP', '--no-config')
         self.assertEqual(rc, 2)
         self.assertIn('--tp is needed', err)
+
+
+class BuildTests(unittest.TestCase):
+    """Exercise the build dispatch only: stub builders do not compile or touch devices."""
+    def test_formats_for_fresh_clone_and_configured_topology(self):
+        for model, env, config, expected in (
+            ('glm53', {}, '', ['glm:fp8', 'glm:int4', 'front']),
+            ('glm53', {'KV_FORMAT': 'fp8'}, '', ['glm:fp8', 'front']),
+            ('glm53', {'TP': '4'}, '', ['glm:fp8', 'glm:int4', 'front']),
+            ('glm53', {'TP': '3'}, '', ['glm:fp8', 'front']),
+            ('glm53', {}, 'PEERS=' + PEERS + '\n', ['glm:fp8', 'glm:int4', 'front']),
+            ('glm53', {}, 'TP=4\nKV_FORMAT=fp8\n', ['glm:fp8', 'front']),
+            ('glm53', {}, 'TP=6\n', ['glm:fp8', 'front']),
+            ('glm53f', {}, '', ['flash:fp8', 'front']),
+            ('glm53f', {'KV_FORMAT': 'int4'}, '', ['flash:fp8', 'flash:int4', 'front']),
+        ):
+            with self.subTest(model=model, env=env, config=config), tempfile.TemporaryDirectory() as d:
+                with open(os.path.join(opt.REPO, 'gr8')) as f:
+                    script = write(d, 'gr8', f.read())
+                os.symlink(os.path.join(opt.REPO, 'tools'), os.path.join(d, 'tools'))
+                scripts = os.path.join(d, 'scripts')
+                os.mkdir(scripts)
+                for name, body in (('build.sh', 'echo "$MODEL:$KV_FORMAT"'), ('build_front.sh', 'echo front')):
+                    os.chmod(write(scripts, name, '#!/bin/bash\n' + body + '\n'), 0o755)
+                if config:
+                    write(d, 'cluster.env', config)
+                r = subprocess.run(['bash', script, model, 'build'], cwd=d,
+                                   env={'PATH': os.environ['PATH'], 'HOME': d, 'CUDA_VISIBLE_DEVICES': '',
+                                        'GR8_KNOBS_LIB': opt.knobs.library(), **env},
+                                   capture_output=True, text=True, timeout=60)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout.splitlines(), expected)
 
 
 class KnobsTests(unittest.TestCase):
@@ -427,10 +465,11 @@ class CanonicalTests(unittest.TestCase):
 
     def test_defaults_resolved_and_equal_to_explicit(self):
         a, text, da = self.digest()
-        self.assertIn('CAP=485376\n', text)
+        self.assertIn('CAP=513536\n', text)
+        self.assertIn('--kv-format int4', text)
         self.assertIn('--s2-sessions 8 ', text)
         self.assertIn(' --reuse-prefix', text)            # prefix reuse is on by default at TP=4
-        self.assertEqual(da, self.digest('--cap', '485376', '--share-limit', '32768', '--sess', '8', '--dflash', '1')[2])
+        self.assertEqual(da, self.digest('--cap', '513536', '--share-limit', '32768', '--sess', '8', '--dflash', '1')[2])
 
     def test_l2pf_reaches_every_rank(self):
         _, text, _ = self.digest()
@@ -451,12 +490,14 @@ class CanonicalTests(unittest.TestCase):
 
     def test_the_share_limit_sets_r_and_an_unset_cap_follows_it(self):
         _, text, _ = self.digest('--share-limit', '32768')
-        self.assertIn('CAP=485376\n', text)              # 2,280 physical pages per rank at TP=4, as at 65536
+        self.assertIn('CAP=513536\n', text)              # 2,390 physical INT4 pages per rank at TP=4
         self.assertIn('GR8_CP_R=32768 ', text)
         _, text, _ = self.digest('--share-limit', '32768', '--cap', '200000')
         self.assertIn('CAP=200000\n', text)
         _, text, _ = self.digest('--share-limit', '98304')
-        self.assertIn('CAP=288768\n', text)              # 98304 + (2280 - 1536) x 64 x 4
+        self.assertIn('CAP=316928\n', text)              # 98304 + (2390 - 1536) x 64 x 4
+        _, fp8, _ = self.digest('--kv-format', 'fp8', '--share-limit', '98304')
+        self.assertIn('CAP=288768\n', fp8)
         self.assertIn('GR8_CP_R=98304 ', text)
         for bad in ('3000', '4095', '4100', '0', 'x'):
             with self.assertRaises(opt.OptionError):
@@ -485,12 +526,16 @@ class CanonicalTests(unittest.TestCase):
         self.assertNotEqual(base, self.digest('--extra-env', 'GR8_DEC_BK=1024')[2])
         self.assertNotEqual(base, self.digest('--port', '8200')[2])
         # a knob set to its default, or one this TP does not read, changes nothing
-        self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '485376', '--reuse', '1', '--extra-args', '--top 5')[2])
+        self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '513536', '--reuse', '1', '--extra-args', '--top 5')[2])
 
     def test_cp_onechain_reaches_every_rank(self):
         _, text, _ = self.digest()
+        self.assertIn(' GR8_CP_ONECHAIN=1', text)
+        _, text, _ = self.digest('--cp-onechain', '0')
+        self.assertIn(' GR8_CP_ONECHAIN=0', text)
+        _, text, _ = self.digest('--kv-format', 'fp8')
         self.assertNotIn('GR8_CP_ONECHAIN', text)
-        _, text, _ = self.digest('--cp-onechain', '1')
+        _, text, _ = self.digest('--kv-format', 'fp8', '--cp-onechain', '1')
         self.assertIn(' GR8_CP_ONECHAIN=1', text)
 
     def test_template_has_no_paths(self):
@@ -967,7 +1012,8 @@ class KvRowsTests(unittest.TestCase):
         self.assertEqual(self.rt(self.plan('--kv-rows', 'off')[1]), {})
 
     def test_every_part_reaches_the_engine(self):
-        o, p = self.plan('--kv-rows', 'remote:192.0.2.5:7350,size=12G,local=40,pool=49152,place=900,fmt=int4')
+        o, p = self.plan('--kv-format', 'fp8', '--kv-rows',
+                         'remote:192.0.2.5:7350,size=12G,local=40,pool=49152,place=900,fmt=int4')
         self.assertEqual(self.rt(p), {'GR8_RT_STORE': 'remote:192.0.2.5:7350', 'GR8_RT_SIZE': str(12 << 30), 'GR8_RT_LOCAL': '40',
                                       'GR8_RT_POOL': '49152', 'GR8_RT_PLACE': '900', 'GR8_RT_FMT': 'int4'})
         t = opt.kv_rows(o)
@@ -996,6 +1042,7 @@ class KvRowsTests(unittest.TestCase):
                            (['--kv-rows', 'mem:,size=8G,place=900'], 'place= needs local='),
                            (['--kv-rows', 'remote:192.0.2.5,size=8G'], 'names the port'),
                            (['--kv-rows', 'remote:auto,size=8G'], 'name it'),
+                           (['--kv-rows', 'mem:,size=8G,fmt=int4'], 'INT4 already'),
                            (['--kv-rows', 'mem:,size=8G,fmt=int4', '--kv-format', 'int4'], 'INT4 already')):
             v.check(['--peers', PEERS, *argv], want)
 
@@ -1007,11 +1054,24 @@ class KvFormatTests(unittest.TestCase):
         opt.validate(o)
         return o, opt.engine_plan(o, rank=1, rank_dir='/r', aux_dir='/a', home='/h')
 
-    def test_fp8_is_the_default_and_unchanged(self):
+    def test_tp4_defaults_to_int4_with_fp8_rollback(self):
         o, p = self.plan()
-        _, p8 = self.plan('--kv-format', 'fp8')
-        self.assertNotIn('--kv-format', p['args'])
-        self.assertEqual((p['args'], p['knobs']['CAP']), (p8['args'], '485376'))
+        self.assertEqual(o.get('KV_FORMAT'), 'int4')
+        self.assertEqual(o.origin['KV_FORMAT'], 'default')
+        self.assertEqual(p['args'][-2:], ['--kv-format', 'int4'])
+        self.assertEqual(p['knobs']['CAP'], '513536')
+        o8, p8 = self.plan('--kv-format', 'fp8')
+        self.assertEqual(o8.get('KV_FORMAT'), 'fp8')
+        self.assertNotIn('--kv-format', p8['args'])
+        self.assertEqual(p8['knobs']['CAP'], '485376')
+        self.assertFalse([w for w in p8['env'] if w.startswith(('GR8_KV4_', 'GR8_CP_ONECHAIN='))])
+
+    def test_other_topologies_keep_fp8(self):
+        for tp, cap in (('3', '307136'), ('6', '614400')):
+            o, p = self.plan(tp=tp)
+            self.assertIsNone(o.get('KV_FORMAT'))
+            self.assertNotIn('--kv-format', p['args'])
+            self.assertEqual(p['knobs']['CAP'], cap)
 
     def test_int4_runs_its_own_engine_with_its_own_pool(self):
         o, p = self.plan('--kv-format', 'int4')

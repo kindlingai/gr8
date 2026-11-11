@@ -2,7 +2,7 @@ KindlingAI is:
 
 - [@adapt-ai-systems](https://github.com/adapt-ai-systems)
   - GLM-5.3-Flash shared-round marginal-utility waterfill speculative row allocation.
-  - GLM-5.3 TP=4 INT4 KV folded Hadamard UK/UV weights and 16-head tensor-core decode attention.
+  - GLM-5.3 TP=4 INT4 KV default with explicit FP8 rollback, folded Hadamard UK/UV weights and 16-head tensor-core decode attention.
   - Bit-exact INT4 decode attention: multi-slot warp scores, lane-transposed query rotation, compacted double-buffered context partials and fused output rotation.
   - Default 12,288-row sequence-parallel DeepSeek v2 prefill with layer-20 tail hoist, direct compute-stream quarter publish and dual-row FFN unpack.
   - Opt-in packed-key attention pipeline for sequence-parallel DeepSeek prefill, with exactness tests.

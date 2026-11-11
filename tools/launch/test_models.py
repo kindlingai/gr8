@@ -92,12 +92,13 @@ class Kv4ExactOptionsTests(unittest.TestCase):
         return opt.engine_plan(o)
 
     def test_int4_defaults(self):
-        env = self.plan('--kv-format', 'int4')['env']
-        for word in self.WORDS:
-            self.assertEqual([w for w in env if w.startswith(word.split('=')[0] + '=')], [word])
+        for args in ((), ('--kv-format', 'int4')):
+            env = self.plan(*args)['env']
+            for word in self.WORDS:
+                self.assertEqual([w for w in env if w.startswith(word.split('=')[0] + '=')], [word])
 
     def test_other_shapes_unchanged(self):
-        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'int4')), (4, ())):
+        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'int4')), (4, ('--kv-format', 'fp8'))):
             env = self.plan(*args, tp=tp)['env']
             self.assertFalse([w for w in env if w.startswith('GR8_KV4_')])
 
@@ -123,7 +124,11 @@ class Kv4OptionsTests(unittest.TestCase):
             self.assertEqual([w for w in env if w.startswith(word.split('=')[0] + '=')], [word])
 
     def test_default_stack(self):
-        self.assert_words_once(self.plan('--kv-format', 'int4')['env'], self.WORDS)
+        for args in ((), ('--kv-format', 'int4')):
+            p = self.plan(*args)
+            self.assertEqual(p['knobs']['CAP'], '513536')
+            self.assertEqual(p['args'][-2:], ['--kv-format', 'int4'])
+            self.assert_words_once(p['env'], self.WORDS)
 
     def test_exact_rollback(self):
         env = self.plan('--kv-format', 'int4', '--kv4-tc', '0', '--kv4-fold', '0', '--cp-onechain', '0')['env']
@@ -148,15 +153,17 @@ class Kv4OptionsTests(unittest.TestCase):
         self.assertNotIn('GR8_CP_ONECHAIN=1', env)
 
     def test_no_defaults_for_other_shapes(self):
-        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'int4')), (4, ())):
+        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'int4')), (4, ('--kv-format', 'fp8'))):
             env = self.plan(*args, tp=tp)['env']
             self.assertFalse([w for w in env if w.startswith(('GR8_KV4_', 'GR8_CP_ONECHAIN='))])
 
     def test_refusals(self):
-        for args in (('--kv4-fold', '2'), ('--kv4-tc', 'x'), ('--kv4-fold', '1'),
+        for args in (('--kv4-fold', '2'), ('--kv4-tc', 'x'), ('--kv-format', 'fp8', '--kv4-fold', '1'),
                      ('--kv-format', 'int4', '--kv4-fold', '1', '--kvb', 'fp8', '--v2-dense', '/release')):
             with self.assertRaises(opt.OptionError):
                 self.plan(*args)
+        with self.assertRaises(opt.OptionError):
+            self.plan('--kv4-fold', '1', tp=6)
         with self.assertRaises(opt.OptionError):
             flash('--kv-format', 'int4', '--kv4-fold', '1')
 
@@ -172,6 +179,9 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(opt.engine_plan(o)['args'][-2:], ['--kv-format', 'int4'])
         glm = opt.parse(['--no-config', '--peers', PEERS], GLM)
         self.assertEqual((models.of(glm), glm.get('GROUP')), (models.GLM53, 'gr8-glm53'))
+        self.assertEqual((glm.get('KV_FORMAT'), S.engine_bin(glm)), ('int4', 'g6m4-int4'))
+        fp8 = opt.parse(['--no-config', '--peers', PEERS, '--kv-format', 'fp8'], GLM)
+        self.assertEqual(S.engine_bin(fp8), 'g6m4')
 
     def test_refusals(self):
         for argv, want in ((['--tp', '6'], 'want 4, 3, 2 or 1 (glm53f)'),

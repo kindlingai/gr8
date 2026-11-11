@@ -37,6 +37,14 @@ The defaults come from `scripts/engine_args.sh`, which the supervisor reads. Eve
 compares the variant's name and the sha256 of its manifest instead. `LAYOUT` is a path too: the handshake compares the
 sha256 of the file.
 
+GLM-5.3 at `TP=4` defaults to `KV_FORMAT=int4`: `bin/g6m4-int4`, `CAP=513536`
+(2,390 pages per rank), the bit-exact INT4 fast paths, folded Hadamard weights,
+tensor-core decode and `CP_ONECHAIN`. Roll back with `--kv-format fp8` or
+`KV_FORMAT=fp8`: `bin/g6m4`, `CAP=485376`, and no implicit `GR8_KV4_*` or
+`GR8_CP_ONECHAIN` settings. Explicit settings still take precedence.
+GLM-5.3 at `TP=3/5/6` and GLM-5.3-Flash retain FP8 unless INT4 is requested;
+DeepSeek and pseudo-engine defaults are unchanged.
+
 ## `./gr8 glm53f`
 
 `./gr8 glm53f` takes the same options for GLM-5.3-Flash: TP 4, 3, 2 or 1, an fp8 KV build, the DFlash2 drafter
@@ -82,7 +90,7 @@ after the model's options.
 | `BUNDLE_LIBS` | `build.sh` | 1 = copy cuBLAS into `bin/lib` for boxes without the CUDA toolkit |
 | `ARCH` | `build.sh`, `c1_tests.sh` | GPU architecture, default `121a` (GB10) |
 | `EXTRA` | `build.sh`, `c1_tests.sh` | more `-D` flags |
-| `KV_FORMAT` | `build.sh`, `./gr8 glm53 build` | `int4` = build `bin/g6m4-int4` (the 4-bit KV latent, `-DG6_KV4=1`) only. `./gr8 glm53 build` builds it after the fp8 engine when `KV_FORMAT=int4` |
+| `KV_FORMAT` | `build.sh`, `./gr8 glm53 build` | `int4` = build `bin/g6m4-int4` (the 4-bit KV latent, `-DG6_KV4=1`) only. `./gr8 glm53 build` builds it after the fp8 engine for TP=4 or an unconfigured clone; explicit `KV_FORMAT=fp8` or another configured TP skips it unless INT4 is requested |
 
 ## Local steering profile
 

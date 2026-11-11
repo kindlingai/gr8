@@ -82,7 +82,8 @@ class EndToEnd(unittest.TestCase):
         for i in range(TP):
             h = os.path.join(self.t, f'box{i}')
             os.makedirs(os.path.join(h, 'bin'))
-            os.symlink(os.path.join(HERE, 'stubs', 'g6m4'), os.path.join(h, 'bin', 'g6m4'))
+            for binary in ('g6m4', 'g6m4-int4'):
+                os.symlink(os.path.join(HERE, 'stubs', 'g6m4'), os.path.join(h, 'bin', binary))
             self.homes.append(h)
         self.env = {**os.environ, 'PATH': os.path.join(HERE, 'stubs') + os.pathsep + os.environ['PATH'],
                     'GR8_REFUSAL_LINGER': '3', 'GR8_MODEL': 'glm53'}   # three polls' worth; ./gr8 glm53 sets the model

@@ -2,7 +2,15 @@
 
 ## TP=4 INT4 folded decode default
 
-For GLM-5.3 at TP=4, `--kv-format int4` now enables folded Hadamard `UK`/`UV`
+GLM-5.3 at `TP=4` defaults to `KV_FORMAT=int4`: `bin/g6m4-int4`, `CAP=513536`
+(2,390 pages per rank), the bit-exact INT4 fast paths, folded Hadamard weights,
+tensor-core decode and `CP_ONECHAIN`. Roll back with `--kv-format fp8` or
+`KV_FORMAT=fp8`: `bin/g6m4`, `CAP=485376`, and no implicit `GR8_KV4_*` or
+`GR8_CP_ONECHAIN` settings. Explicit settings still take precedence.
+GLM-5.3 at `TP=3/5/6` and GLM-5.3-Flash retain FP8 unless INT4 is requested;
+DeepSeek and pseudo-engine defaults are unchanged.
+
+The GLM-5.3 TP=4 INT4 default enables folded Hadamard `UK`/`UV`
 weights (`GR8_KV4_FOLD=1`), 16-head WMMA tensor-core INT4 decode
 (`GR8_KV4_TC=1`), and batched remote CP attention (`GR8_CP_ONECHAIN=1`). The
 five bit-exact INT4 kernel settings remain enabled underneath this stack.
@@ -257,7 +265,7 @@ path. The `#if` blocks and their comments in the source are the reference:
 | `GR8_CP=1`, `GR8_CP_PF_HASH2=1` | context-parallel KV, and its HASH2 staged-page check |
 | `PF_F12` (TP4 build only) | prefill expert fc1: one fat CTA runs `F12_NE` (default 2) adjacent expert blocks on one quantized A record (`kernels/bind_prefill.cuh`, `k_pf_fc1f`). `F12_NE` must divide the expert blocks per rank (4 at TP4, 3 at TP6). `GR8_PF_F12=0` turns it off at run time. Effect not measured on its own |
 | `G6_TR3_CBS=7` (default; not in `K1H2_FLAGS`) | the trellis codebooks the build decodes, a bit mask over mcg (1), mul1 (2) and pmcgx (4) (`kernels/tr3.cuh`). A smaller mask leaves those codebooks' expert kernels out, which only shortens a development build: the binder then refuses a layer in a codebook the build lacks. mcg (bit 0) is always in |
-| `G6_KV4=1` (a build flag; experimental) | the MLA latent cached as INT4 after a Hadamard rotation, 416 B a row instead of 656 B (`attn/kvfmt.h`, [KV4.md](KV4.md)). Changes the outputs. The image ships it as `bin/g6m4-int4`, which `--kv-format int4` (`KV_FORMAT`) runs; `KV_FORMAT=int4 scripts/build.sh` builds it |
+| `G6_KV4=1` (a build flag; GLM-5.3 TP=4 default) | the MLA latent cached as INT4 after a Hadamard rotation, 416 B a row instead of 656 B (`attn/kvfmt.h`, [KV4.md](KV4.md)). Changes the outputs. The image ships it as `bin/g6m4-int4`, which `--kv-format int4` (`KV_FORMAT`) runs; `KV_FORMAT=int4 scripts/build.sh` builds it |
 
 ## Front end and shim
 

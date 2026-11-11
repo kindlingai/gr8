@@ -3,7 +3,17 @@
 Three to six DGX Spark (GB10) boxes, one rank per box (TP=3 to TP=6). Weights: the exlr8 release on Hugging Face,
 [kindlingai/glm-5.3-exlr8-k2-k3-k4](https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4).
 
+GLM-5.3 at `TP=4` defaults to `KV_FORMAT=int4`: `bin/g6m4-int4`, `CAP=513536`
+(2,390 pages per rank), the bit-exact INT4 fast paths, folded Hadamard weights,
+tensor-core decode and `CP_ONECHAIN`. Roll back with `--kv-format fp8` or
+`KV_FORMAT=fp8`: `bin/g6m4`, `CAP=485376`, and no implicit `GR8_KV4_*` or
+`GR8_CP_ONECHAIN` settings. Explicit settings still take precedence.
+GLM-5.3 at `TP=3/5/6` and GLM-5.3-Flash retain FP8 unless INT4 is requested;
+DeepSeek and pseudo-engine defaults are unchanged.
+
 ## Results
+
+The table below records the earlier measured configuration, not a fresh measurement of the current TP=4 INT4 default.
 
 | | TP=3 | TP=4 | TP=5 | TP=6 |
 |---|---|---|---|---|
@@ -25,7 +35,7 @@ structured row is left out: it measures predictable output, not agent speed. TP=
 before it landed, and TP=6 on 8da82ff. Six boxes on one 200G switch.
 ‡ One of the six boxes was capped at 2200 MHz (it powers off under sustained load at its full clock), so the TP=6
 column would be a little higher on six uncapped boxes.
-§ `--kv-format int4` (experimental): 4-bit KV latent, about 3% slower decode at TP=4. The TP=3 and TP=6 int4 figures
+§ Historical `--kv-format int4` row-format measurements, before the fast paths: 4-bit KV latent, about 3% slower decode at TP=4. The TP=3 and TP=6 int4 figures
 are estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [KV4.md](KV4.md)
 
 [kindling.json](../kindling.json) has this table in a form a program can read. A PR that changes one changes the other.
@@ -104,8 +114,9 @@ read back as decode selects them ([Remote KV](#remote-kv)).
 - `--reuse 0` turns prefix reuse off.
 - `--kv-store` and `--kv-rows` (experimental, off by default) put KV below the pool, on an SSD or a KV node: see
   [Remote KV](#remote-kv) below.
-- `--kv-format int4` (experimental) caches the KV latent in 4 bits: about 1.26x the context at TP=4 (CAP 513,536 against
-  408,832; the fp8 default has since grown to 485,376 and int4 is not re-measured) for about 3% slower decode, with needles found as with the default fp8 row ([KV4.md](KV4.md)).
+- `KV_FORMAT=int4` is the TP=4 default: 4-bit KV latent, `CAP=513536`, and `bin/g6m4-int4` with the INT4 fast paths,
+  folded weights, tensor-core decode and `CP_ONECHAIN`. `--kv-format fp8` restores `bin/g6m4` and `CAP=485376`
+  without implicit INT4/one-chain settings. Other TP widths keep FP8. See [KV4.md](KV4.md) for the measured tradeoffs.
 - `--dflash 0` runs MTP only at TP=4. `--mtp` is the MTP draft count (2).
 - `--steering-profile DIR[,DIR...]` loads local schema-v1 profiles; with an HF model, `hf:default` or `hf:NAME`
   explicitly selects a bundled profile. Without the flag, bundled profiles are ignored. Requests select a loaded profile

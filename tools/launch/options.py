@@ -232,6 +232,9 @@ def parse(argv, environ=None):
     for k, v in models.MODELS[model].defaults if model else ():
         if origin[k] == 'default':
             values[k], origin[k] = v, f'{model} default'
+    tp_eff = values.get('TP') or (str(len(split_list(values.get('PEERS')))) if values.get('PEERS') else None)
+    if model == 'glm53' and tp_eff == '4' and origin['KV_FORMAT'] == 'default':
+        values['KV_FORMAT'] = 'int4'
     opts = Options(values, origin, path, args, switches, warnings)
     opts.named, opts.model_conflict = named, conflict
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it

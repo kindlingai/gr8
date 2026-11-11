@@ -1,8 +1,16 @@
-# 4-bit MLA KV latent (`--kv-format int4`, experimental, off by default)
+# 4-bit MLA KV latent (`--kv-format int4`, default for GLM-5.3 TP=4)
 
 ## TP=4 INT4 folded decode default
 
-For GLM-5.3 at TP=4, `--kv-format int4` now enables folded Hadamard `UK`/`UV`
+GLM-5.3 at `TP=4` defaults to `KV_FORMAT=int4`: `bin/g6m4-int4`, `CAP=513536`
+(2,390 pages per rank), the bit-exact INT4 fast paths, folded Hadamard weights,
+tensor-core decode and `CP_ONECHAIN`. Roll back with `--kv-format fp8` or
+`KV_FORMAT=fp8`: `bin/g6m4`, `CAP=485376`, and no implicit `GR8_KV4_*` or
+`GR8_CP_ONECHAIN` settings. Explicit settings still take precedence.
+GLM-5.3 at `TP=3/5/6` and GLM-5.3-Flash retain FP8 unless INT4 is requested;
+DeepSeek and pseudo-engine defaults are unchanged.
+
+The GLM-5.3 TP=4 INT4 default enables folded Hadamard `UK`/`UV`
 weights (`GR8_KV4_FOLD=1`), 16-head WMMA tensor-core INT4 decode
 (`GR8_KV4_TC=1`), and batched remote CP attention (`GR8_CP_ONECHAIN=1`). The
 five bit-exact INT4 kernel settings remain enabled underneath this stack.
@@ -40,20 +48,22 @@ The KV cache spends most of its bytes on the MLA latent: 512 dims per token per 
 (`KV_FORMAT=int4`) stores that latent in 4 bits, so the same memory holds more pages. The rope key stays BF16 and the
 indexer keys stay FP8.
 
-**The trade at TP=4** (measured on the cluster, below): about 1.4x the tokens in the same memory (CAP 415,232, against 294,912 for
+**Historical row-format trade at TP=4** (before the fast paths above; measured on the cluster, below): about 1.4x the tokens in the same memory (CAP 415,232, against 294,912 for
 fp8 at the same 1,920-page memory; the fp8 default has since grown to 2,280 pages, CAP 387,072 at that share limit), decode about 3% slower, 8K prefill about 6% faster, speculative acceptance about 2% lower, and needles found
 12/12 from 32K to 200K tokens (and at 400K with a larger CAP), as with fp8.
 
-The row is fixed when the engine is compiled (`-DG6_KV4=1`, `attn/kvfmt.h`), so there are two engines: `bin/g6m4` (fp8,
-the default, unchanged) and `bin/g6m4-int4`. The image ships both for every TP; `./gr8 glm53 build` builds
-`g6m4-int4` when `KV_FORMAT=int4`. `--kv-format int4` makes the launcher run `g6m4-int4` with its own CAP default
+The row is fixed when the engine is compiled (`-DG6_KV4=1`, `attn/kvfmt.h`), so there are two engines: `bin/g6m4` (FP8)
+and `bin/g6m4-int4` (the GLM-5.3 TP=4 default). The image ships both for every TP; `./gr8 glm53 build` builds both
+at TP=4 and before a fresh clone has a TP configured. Explicit `KV_FORMAT=fp8` or another configured TP skips the
+INT4 build unless INT4 is requested. `./gr8 glm53f build` adds `g6m4_flash-int4` only with `KV_FORMAT=int4`.
+The INT4 default (or explicit `--kv-format int4`) runs `g6m4-int4` with its own CAP default
 (Capacity, below) and pass the engine `--kv-format int4`. Each engine refuses the other's format, and `g6m4-int4`
 refuses to start without the flag. A build without `G6_KV4` has the same row, the same kernels and the same SASS as
 before.
 
 ## The row
 
-| | FP8 row (default) | INT4 row (`G6_KV4=1`) |
+| | FP8 row | INT4 row (`G6_KV4=1`, GLM-5.3 TP=4 default) |
 |---|---|---|
 | latent | 512 x E4M3, one FP32 scale per 128 dims (`amax / 448`) | `H x` (see below), 512 x INT4, one FP16 scale per 32 dims (`amax / 7`), codes -7..7 |
 | bytes | 512 + 16 | 256 + 32 |
@@ -132,7 +142,7 @@ pool or with CAP:
 Those buffers do not shrink with the row, which is why the gain is below 656/416. At TP=4 each added page (256 tokens)
 costs 2.3 MB of int4 pool and 2.9 MB of them.
 
-| TP (SHARE_LIMIT) | fp8 (the default) | int4 (`--kv-format int4`) | gain | |
+| TP (SHARE_LIMIT) | fp8 | int4 (GLM-5.3 TP=4 default) | gain | |
 |---|---|---|---|---|
 | TP=4 (65,536) | 1,981 pages a rank, CAP 310,528 | 2,390 pages, CAP 415,232 | 1.34x | measured |
 | TP=3 (65,536) | 1,941, CAP 241,600 | 2,480, CAP 345,088 | 1.43x | estimate |

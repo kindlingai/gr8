@@ -628,8 +628,10 @@ class EngineTests(unittest.TestCase):
         os.makedirs(os.path.join(home, 'bin'))
         with open(os.path.join(home, 'bin', 'g6m4'), 'w') as f:
             f.write('fp8')
-        o8 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'], GLM)
-        o4 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--kv-format', 'int4'], GLM)
+        o8 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4', '--kv-format', 'fp8'], GLM)
+        o4 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4'], GLM)
+        o3 = opt.parse(['--no-config', '--peers', '10.0.0.1,10.0.0.2,10.0.0.3'], GLM)
+        self.assertEqual(S.engine_bin(o3), 'g6m4')
         self.assertEqual((S.engine_bin(o8), S.engine_bin(o4)), ('g6m4', 'g6m4-int4'))
         self.assertEqual(S.engine_build(home, S.engine_bin(o4)), 'missing', 'an fp8-only bin/ cannot run int4')
         with open(os.path.join(home, 'bin', 'g6m4-int4'), 'w') as f:

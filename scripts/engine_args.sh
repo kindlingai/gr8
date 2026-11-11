@@ -264,7 +264,7 @@ engine_defaults() {
   [ "${GR8_MODEL:-glm53}" = ds41 ] && { ds41_defaults; return; }
   [ "${GR8_MODEL:-glm53}" = pseudo ] && { pseudo_defaults; return; }
   case $TP in
-    4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+    4) KV_FORMAT=${KV_FORMAT:-int4}; SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        DFLASH=${DFLASH:-1}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1}
        # the window-2 fc1 split on every MoE layer at M > 1 (bit-exact, measured at TP=4); 0 turns it off, and
        # GR8_TR3_W2ALL in EXTRA_ENV keeps its own value

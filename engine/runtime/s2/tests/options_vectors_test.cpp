@@ -119,11 +119,17 @@ int main(int argc, char** argv)
 #else
     const char* model = "glm53";
 #endif
-    const std::string shape = std::string(model) + " nr" + std::to_string(g6nr::NR) + " mx" + std::to_string(g6mx::MX);
+#if G6_KV4 && !G6_MODEL_FLASH && !G6_MODEL_DS41
+    const char* model_tag = "glm53-kv4";
+#else
+    const char* model_tag = model;
+#endif
+    const std::string shape = std::string(model_tag) + " nr" + std::to_string(g6nr::NR) + " mx" + std::to_string(g6mx::MX);
     struct Want { const char* shape; size_t n; uint64_t hash; };
     const Want wants[] = {
-        {"glm53 nr6 mx8", 121, 0x967129417b716279ull},
-        {"glm53 nr4 mx32", 121, 0x69356dc3e99a8ec0ull},
+        {"glm53 nr6 mx8", 122, 0xe80ac959f044daf8ull},
+        {"glm53 nr4 mx32", 122, 0x90c53302b108f89cull},
+        {"glm53-kv4 nr4 mx32", 122, 0xeb128b40cbc92c4full},
         {"glm53f nr4 mx32", 116, 0x2920b0d6c121e568ull},
         {"ds41 nr4 mx48", 116, 0x07ec2d75cdd0d055ull},
     };
@@ -134,7 +140,7 @@ int main(int argc, char** argv)
         for (unsigned char ch : t) h = (h ^ ch) * 1099511628211ull;
         if (dump) fputs(t.c_str(), stdout);
     }
-    // New opt-in cases are checked independently: never rerecord the disabled-path goldens.
+    // Waterfill probes are checked independently of the launcher-default transcript goldens.
     bool wf_ok = true;
     auto probe = [&](const char* name, const std::vector<std::string>& env,
                      const std::vector<std::string>& args, const char* expected) {
@@ -142,7 +148,11 @@ int main(int argc, char** argv)
         if (dump) fputs(t.c_str(), stdout);
         if (t.find(expected) == std::string::npos) { fprintf(stderr, "waterfill probe failed: %s", t.c_str()); wf_ok = false; }
     };
-    const std::vector<std::string> plain{"--rank", "0", "--ips", "@IPS", "--manifest", "m", "--pack", "p"};
+    std::vector<std::string> plain{"--rank", "0", "--ips", "@IPS", "--manifest", "m", "--pack", "p"};
+#if G6_KV4
+    // Every INT4-build probe must pass the format check before reaching its intended guard.
+    plain.insert(plain.end(), {"--kv-format", "int4"});
+#endif
     probe("waterfill-margin", {"GR8_S2_SHARED_WF_MARGIN=-1"}, plain,
           "g6: GR8_S2_SHARED_WF_MARGIN: want a finite nonnegative value");
 #if G6_MODEL_DS41
