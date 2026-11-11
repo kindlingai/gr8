@@ -235,6 +235,11 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_K1_SPLIT_M1` | ints | GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (4,1,2) |  | Sets the decode MoE K1 split KS1,WG,NS2 for 1-row steps, over GR8_K1_SPLIT. Another fc1 partial count can change the sums. |
 | `GR8_K1_SPLIT_M2` | ints | GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (1,2,8) |  | Sets the decode MoE K1 split KS1,WG,NS2 for 2- and 3-row steps, over GR8_K1_SPLIT. Another fc1 partial count can change the sums. |
 | `GR8_K1_SPLIT_M4` | ints | GR8_K1_SPLIT's KS1,WG,NS2 triple, else the release split (4,2,2) |  | Sets the decode MoE K1 split KS1,WG,NS2 for steps of 4 or more rows, over GR8_K1_SPLIT. Another fc1 partial count can change the sums. |
+| `GR8_KV4_CTX` | int | `0` | 0\|1\|2 | Decode attention context partials for G6_KV4 with live-slot compaction and double-buffered loads: 1 = 256 dims per CTA (block 128), 2 = 512 dims per CTA (block 256). Respects GR8_ATTN_CTX3_HG when set. Same bits, G6_KV4 only. |
+| `GR8_KV4_FUSE_ROT` | flag | `0` | 0\|1 | Fuses the G6_KV4 output context Hadamard rotation into merge_parts and cp_lse. Same bits, G6_KV4 only. |
+| `GR8_KV4_QT` | flag | `0` | 0\|1 | With GR8_KV4_SC, decode query rotation stores each 512-dim query row lane-transposed so scores read 16-byte coalesced vectors. Same bits, G6_KV4 only. |
+| `GR8_KV4_SC` | int | `0` | 0\|1\|2\|4 | Decode attention scores for G6_KV4: 1, 2, or 4 key slots per warp over 16-head groups (partial tail group supported). Same bits, G6_KV4 only. |
+| `GR8_KV4_SC_TR` | int | `2` | 0\|1\|2 | With GR8_KV4_SC, selects the warp reduction: 0 = per-head warp_sum, 1 = transpose reduction, 2 = eager transpose butterfly. Same bits, G6_KV4 only. |
 | `GR8_KVB` | text | `bf16` | bf16\|fp8 | fp8 loads every layer's kv_b (UK / UV) as the release's block FP8 bytes and scales instead of BF16, with the same output bytes. Needs --v2-dense. |
 | `GR8_MHC_BF16` | int | `0` | 0\|1\|2 | Quality test: rounds mHC residual stream writes to BF16, 1 = after both blocks, 2 = only after the MLP block. |
 | `GR8_MOE_TOPK` | int | `8` | 1..8 | Keeps only this many routed experts per token and renormalizes their weights. A model change for screens. |

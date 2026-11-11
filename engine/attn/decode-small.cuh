@@ -629,10 +629,56 @@ static void launch_context_tile(const G6Attn& a,Input input,Work& w,int start,in
 // The head-batched kernels do the arithmetic of both the fixed-K and the generic kernels (mla_scores, context_parts:
 // the same products, FMA order and skips per (row, head, slot)), so they serve every decode call: verify rows of a fresh
 // index and contexts past 2048 included.
+#if G6_KV4
+namespace kv4 {
+template<int S,int TR,bool PH,class Input>
+static void launch_scores_sc_shape(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt){
+ const dim3 grid(TOP/(4*S),(a.heads+15)/16,n);
+ if(qt)scores_sc_qt<S,TR,Input,PH><<<grid,128,0,st>>>(input,start,w.q,w.rope,w.prob);
+ else scores_sc<S,TR,Input,PH><<<grid,128,0,st>>>(input,start,w.q,w.rope,w.prob);
+}
+template<int S,bool PH,class Input>
+static void launch_scores_sc_slots(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt){
+ switch(kv4_sc_tr()){
+  case 0:launch_scores_sc_shape<S,0,PH>(a,input,w,start,n,st,qt);break;
+  case 1:launch_scores_sc_shape<S,1,PH>(a,input,w,start,n,st,qt);break;
+  default:launch_scores_sc_shape<S,2,PH>(a,input,w,start,n,st,qt);break;
+ }
+}
+template<bool PH,class Input>
+static void launch_scores_sc_heads(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt){
+ switch(kv4_sc()){
+  case 1:launch_scores_sc_slots<1,PH>(a,input,w,start,n,st,qt);break;
+  case 2:launch_scores_sc_slots<2,PH>(a,input,w,start,n,st,qt);break;
+  default:launch_scores_sc_slots<4,PH>(a,input,w,start,n,st,qt);break;
+ }
+}
+template<class Input>
+static void launch_scores_sc(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt){
+ if(a.heads%16)launch_scores_sc_heads<true>(a,input,w,start,n,st,qt);
+ else launch_scores_sc_heads<false>(a,input,w,start,n,st,qt);
+}
+template<int HG,class Input>
+static void launch_ctx_compact_heads(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+ if(kv4_ctx()==1)context_pk_compact<HG,16,256><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);
+ else context_pk_compact<HG,16,512><<<dim3(PART,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.prob,w.parts);
+}
+template<class Input>
+static void launch_ctx_compact(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st){
+ const int hg=(attn_ctx3_hg()==2||attn_ctx3_hg()==4||attn_ctx3_hg()==8)?attn_ctx3_hg():(n>=5?8:4);
+ switch(hg){
+  case 2:launch_ctx_compact_heads<2>(a,input,w,start,n,st);break;
+  case 4:launch_ctx_compact_heads<4>(a,input,w,start,n,st);break;
+  default:launch_ctx_compact_heads<8>(a,input,w,start,n,st);break;
+ }
+}
+}
+#endif
 template<class Input>   // qt: run_body only (attn.cu use_qt, which implies the scores_sc branch below)
 static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt=false){
  #if G6_KV4   // the INT4 row has the head-batched kernel and the generic one; the FP8-only variants below are not used
- if(attn_heads()){constexpr int HG=16;kv4::scores_heads<HG><<<dim3(TOP/8,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);}
+ if(attn_heads()&&(kv4_sc()==1||kv4_sc()==2||kv4_sc()==4))kv4::launch_scores_sc(a,input,w,start,n,st,qt);
+ else if(attn_heads()){constexpr int HG=16;kv4::scores_heads<HG><<<dim3(TOP/8,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);}
  else mla_scores<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
  return;
  #endif
@@ -648,7 +694,8 @@ static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int 
 template<class Input>
 static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,int sp=256){
  #if G6_KV4
- if(!attn_heads())context_parts<<<dim3(PART,a.heads,n),256,0,st>>>(input,start,w.prob,w.parts);
+ if(attn_heads()&&(kv4_ctx()==1||kv4_ctx()==2))kv4::launch_ctx_compact(a,input,w,start,n,st);
+ else if(!attn_heads())context_parts<<<dim3(PART,a.heads,n),256,0,st>>>(input,start,w.prob,w.parts);
  else if(n>=5){constexpr int HG=8;kv4::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
  else{constexpr int HG=4;kv4::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
  return;

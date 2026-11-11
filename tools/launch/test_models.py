@@ -25,6 +25,34 @@ def flash(*argv, peers=PEERS):
     return o
 
 
+class Kv4ExactOptionsTests(unittest.TestCase):
+    WORDS = ('GR8_KV4_SC=4', 'GR8_KV4_SC_TR=2', 'GR8_KV4_QT=1',
+             'GR8_KV4_CTX=2', 'GR8_KV4_FUSE_ROT=1')
+
+    @staticmethod
+    def plan(*argv, tp=4):
+        peers = ','.join('192.0.2.' + str(i + 1) for i in range(tp))
+        o = opt.parse(['--no-config', '--peers', peers, '--tp', str(tp), *argv], GLM)
+        opt.validate(o)
+        return opt.engine_plan(o)
+
+    def test_int4_defaults(self):
+        env = self.plan('--kv-format', 'int4')['env']
+        for word in self.WORDS:
+            self.assertEqual([w for w in env if w.startswith(word.split('=')[0] + '=')], [word])
+
+    def test_other_shapes_unchanged(self):
+        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'int4')), (4, ())):
+            env = self.plan(*args, tp=tp)['env']
+            self.assertFalse([w for w in env if w.startswith('GR8_KV4_')])
+
+    def test_extra_env_wins_once(self):
+        keys = ('GR8_KV4_SC', 'GR8_KV4_CTX', 'GR8_KV4_QT', 'GR8_KV4_FUSE_ROT')
+        env = self.plan('--kv-format', 'int4', '--extra-env', ' '.join(k + '=0' for k in keys))['env']
+        for key in keys:
+            self.assertEqual([w for w in env if w.startswith(key + '=')], [key + '=0'])
+
+
 class OptionTests(unittest.TestCase):
     def test_defaults(self):
         o = flash()
