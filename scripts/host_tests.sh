@@ -198,6 +198,12 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engin
 # batched copies = one at a time: no pool, no CUDA
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/kv_plan_test.cpp" -o "$T/kv_plan_test" "${KNOBS[@]}"
 "$T/kv_plan_test"
+# the page block's sizes from kvman-rs (g6kv_layout_sizes) with each build's rows (attn/kvfmt.h): the blocks the stores
+# and the Flash checkpoints have kept, byte for byte
+for f in "" "-DG6_KV4=1" "-DG6_MODEL_FLASH=1" "-DG6_MODEL_FLASH=1 -DG6_FLASH_KV_FP8=1" "-DG6_MODEL_FLASH=1 -DG6_KV4=1" "-DG6_MODEL_DS41=1"; do
+  g++ -std=c++17 -O2 -Wall -Wextra $f "$REPO/engine/runtime/s2/tests/kv_layout_test.cpp" -o "$T/kv_layout_test" "${KVLIB[@]}"
+  "$T/kv_layout_test" > /dev/null
+done
 # GR8_CP_STEP_ROWS / GR8_CP_STEP_SEG (s2/cp_rows.h, Driver::step): steps past R capped at n rows, solo-exact tokens, fair cycles
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/cp_rows_test.cpp" -o "$T/cp_rows_test" "${KNOBS[@]}"
 "$T/cp_rows_test" 2> >(grep -v '^# s2 GR8_CP_STEP_ROWS=' >&2)   # the driver's cap transition lines, thousands here

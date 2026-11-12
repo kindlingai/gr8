@@ -4,8 +4,9 @@
 //
 // A page block is one pool page of every layer binding, main model then draft: per binding 64 rows of the MLA cache
 // (64 x g6kv::ROW B: 656, or 416 under G6_KV4), then, on full-index layers, 64 rows of the indexer keys (64 x 132 B). The full GLM 5.3 has 79 MLA
-// caches and 22 index caches: 3,502,592 B. Each binding stores page p at p x its page bytes, so one kernel copies a batch
-// of pages between the bindings and mapped pinned host memory, and the store reads and writes that memory.
+// caches and 22 index caches: 3,502,592 B. PageBlocks describes its bindings that way and kvman-rs sizes the block
+// from them (g6kv_layout_sizes, src/layout.rs). Each binding stores page p at p x its page bytes, so one kernel copies
+// a batch of pages between the bindings and mapped pinned host memory, and the store reads and writes that memory.
 // Spills run before restores: a restore may write a page that a spill of the same call still has to read.
 //
 // Past R (a CP binding, cp_nr > 0) a binding's attention cache and its indexer keys hold this rank's every nr-th
@@ -81,6 +82,7 @@ class PageBlocks {
     std::vector<kvt::Piece> pieces_;
     kvt::Piece* d_pieces_ = nullptr;
     size_t block_ = 0, slot_ = 0, rep_ = 0;
+    uint32_t per_slot_ = 0;
     int batch_ = 0, items_cap_ = 0;
     uint8_t* host_ = nullptr;   // mapped pinned: batch_ slots
     uint8_t* host_dev_ = nullptr;
@@ -89,17 +91,18 @@ class PageBlocks {
 public:
     // bindings: every layer binding of the pool, main model then draft, in an order every rank shares
     PageBlocks(const std::vector<const G6AttnBinding*>& bindings, int batch = 32) : batch_(batch) {
-        size_t off = 0, rep = 0;
-        for (const G6AttnBinding* b : bindings) {
-            const bool cp = b->args.cp_nr != 0;
-            pieces_.push_back({static_cast<uint4*>(b->args.mla_cache), static_cast<uint4*>(b->args.index_cache), off / 16, rep / 16,
-                               b->args.page_count, cp});
-            off += 64 * g6kv::ROW + (b->args.index_cache ? 64 * g6kv::IDX_ROW : 0);
-            rep += cp ? 0 : 64 * g6kv::ROW + (b->args.index_cache ? 64 * g6kv::IDX_ROW : 0);
+        std::vector<g6kv_binding> lay;
+        for (const G6AttnBinding* b : bindings)
+            lay.push_back({uint32_t(64 * g6kv::ROW), b->args.index_cache ? uint32_t(64 * g6kv::IDX_ROW) : 0u, uint32_t(b->args.cp_nr != 0)});
+        g6kv_layout s{};
+        std::vector<uint64_t> off(lay.size()), rep(lay.size());
+        g6kv_layout_sizes(lay.data(), lay.size(), &s, off.data(), rep.data());
+        for (size_t i = 0; i < bindings.size(); ++i) {
+            const auto& a = bindings[i]->args;
+            pieces_.push_back({static_cast<uint4*>(a.mla_cache), static_cast<uint4*>(a.index_cache), off[i] / 16, rep[i] / 16,
+                               a.page_count, int(lay[i].cp)});
         }
-        block_ = off;
-        rep_ = rep;
-        slot_ = (block_ + 4095) / 4096 * 4096;
+        block_ = s.block; slot_ = s.slot; rep_ = s.rep; per_slot_ = s.per_slot;
         items_cap_ = batch_ * int(per_slot() ? per_slot() : 1);
         G6RT_CK(cudaMalloc(&d_pieces_, pieces_.size() * sizeof(kvt::Piece)));
         G6RT_CK(cudaMemcpy(d_pieces_, pieces_.data(), pieces_.size() * sizeof(kvt::Piece), cudaMemcpyHostToDevice));
@@ -115,11 +118,7 @@ public:
     size_t slot_bytes() const { return slot_; }
     // a logical page's replicated parts past R, and how many fit a block (0: no binding is CP)
     size_t rep_bytes() const { return rep_; }
-    uint32_t per_slot() const {
-        bool cp = false;
-        for (const auto& p : pieces_) cp = cp || p.cp;
-        return cp && rep_ ? uint32_t(slot_ / rep_) : 0;
-    }
+    uint32_t per_slot() const { return per_slot_; }
     int batch() const { return batch_; }
     int items() const { return items_cap_; }
     uint8_t* host(int i) const { return host_ + (size_t)i * slot_; }

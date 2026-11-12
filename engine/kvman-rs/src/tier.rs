@@ -2,18 +2,10 @@
 //! calls it and it has no C entry points. kvman-ssd-bench measures it, kvman-sim replays agent traces through it.
 //!
 //! The store is one file of fixed-size slots, each a multiple of 4 KiB, read and written with O_DIRECT (Linux) from
-//! 4 KiB-aligned buffers, so the page cache holds nothing. Two shapes of slot:
-//!
-//! - A page block: one logical KV page (64 rows) of every layer, the unit a retained run spills and restores in. Its
-//!   size follows the engine's caches (engine/attn/bind.cu create(), attn.cu KV_BYTES / IDX_BYTES): per layer and page
-//!   the MLA cache holds 64 rows x 656 B (512 FP8 latent + scales + 64 BF16 rope), and the full-index layers also hold
-//!   the indexer's keys, 64 rows x 132 B (128 FP8 + scale). GLM 5.3 has 78 layers plus the MTP layer (79 MLA caches),
-//!   and the full-index layers are 0, 1, 2, 6, 10, .., 74 (rank.cuh cp_full_index) and the MTP layer: 22 index caches.
-//!   One page: 79 x 41,984 + 22 x 8,448 = 3,502,592 B, 856 x 4 KiB = 3,506,176 B on disk. Below R every rank holds a
-//!   session's whole KV, so every rank would spill and restore its own copy.
-//! - A row: one token's MLA rows of one indexer group, 4 layers x 656 B = 2,624 B in one 4 KiB slot. A full-index
-//!   layer's top-2,048 list serves the three layers after it, so a sparse-attention step reads, per selected token and
-//!   group, one row slot.
+//! 4 KiB-aligned buffers, so the page cache holds nothing. A slot holds a page block: one logical KV page (64 rows) of
+//! every layer, the unit a retained run spills and restores in. Its size is the caller's (layout.rs sizes it from the
+//! engine's bindings). Below R every rank holds a session's whole KV, so every rank would spill and restore its own
+//! copy.
 //!
 //! Slots are allocated lowest free first, and spill / restore order is the run's page order, so two ranks given the
 //! same calls use the same slots, as the pool does.
@@ -32,31 +24,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const ALIGN: usize = 4096;
-pub const PAGE_ROWS: usize = 64;
-pub const MLA_ROW: usize = 656;
-/// The MLA row of an engine built with G6_KV4=1 (engine/attn/kvfmt.h): 256 B of INT4 latent, 16 FP16 scales, 64 BF16
-/// rope. The index keys keep their 132 B.
-pub const MLA_ROW_KV4: usize = 416;
-pub const IDX_ROW: usize = 132;
-pub const MLA_LAYERS: usize = 79;
-pub const INDEX_LAYERS: usize = 22;
-pub const GROUP_LAYERS: usize = 4;
-
-/// Bytes of one logical page across every layer's caches for an MLA row of `mla_row` bytes, before rounding to 4 KiB.
-pub const fn page_block_bytes(mla_row: usize) -> usize {
-    MLA_LAYERS * PAGE_ROWS * mla_row + INDEX_LAYERS * PAGE_ROWS * IDX_ROW
-}
-/// One page block's slot for an MLA row of `mla_row` bytes.
-pub const fn page_slot(mla_row: usize) -> usize {
-    page_block_bytes(mla_row).div_ceil(ALIGN) * ALIGN
-}
-/// Bytes of one logical page across every layer's caches (the FP8 row), before rounding to 4 KiB.
-pub const PAGE_BLOCK_BYTES: usize = page_block_bytes(MLA_ROW);
-/// One page block's slot.
-pub const PAGE_SLOT: usize = page_slot(MLA_ROW);
-/// One token's rows of one indexer group, and its slot.
-pub const ROW_BYTES: usize = GROUP_LAYERS * MLA_ROW;
-pub const ROW_SLOT: usize = ALIGN;
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const O_DIRECT: i32 = 0o200000;
@@ -292,7 +259,7 @@ pub struct Tier<S: BlockStore = SlotFile> {
 }
 
 impl Tier<SlotFile> {
-    /// A file of `slots` page blocks of `block_bytes` each (PAGE_BLOCK_BYTES for the engine's layout).
+    /// A file of `slots` page blocks of `block_bytes` each (layout::Sizes::block for the engine's layout).
     pub fn create(path: &Path, block_bytes: usize, slots: u64, threads: usize, direct: bool) -> io::Result<Tier> {
         let file = SlotFile::create(path, block_bytes.div_ceil(ALIGN) * ALIGN, slots, direct)?;
         Ok(Tier::new(file, threads))
@@ -394,16 +361,6 @@ mod tests {
         for (i, b) in buf.iter_mut().enumerate() {
             *b = (p as usize * 31 + i * 7) as u8;
         }
-    }
-
-    #[test]
-    fn layout_sizes() {
-        assert_eq!(PAGE_BLOCK_BYTES, 3_502_592);
-        assert_eq!(PAGE_SLOT, 856 * 4096);
-        assert_eq!(ROW_BYTES, 2_624);
-        // G6_KV4=1: the engine's PageBlocks (s2/kv_tier.cuh) sums the same 79 x 64 x 416 + 22 x 64 x 132
-        assert_eq!(page_block_bytes(MLA_ROW_KV4), 2_289_152);
-        assert_eq!(page_slot(MLA_ROW_KV4), 559 * 4096);
     }
 
     #[test]
