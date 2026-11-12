@@ -17,6 +17,7 @@
 #include "../rank.cuh"
 #include "../../kvman-rs/g6kvman.h"
 #include "kv_plan.h"
+#include "kv_state_desc.h"
 #include <chrono>
 #include <cstdio>
 #include <functional>
@@ -29,20 +30,6 @@ namespace g6s2 {
 // The page block's format: bump it whenever what a block holds, or how, changes (a stored block of another format is
 // not this engine's). Stores keyed on it also carry the engine binary's stamp (exe_stamp).
 constexpr int KV_BLOCK_FORMAT = 4;   // 4: a tail's blocks are a run's own pages (the pool's page classes); 3: a tail's indexer keys moved from the replicated part to the shard
-
-// FNV-1a of this process's executable, hex: two builds that may compute different KV bits get different stamps
-inline std::string exe_stamp() {
-    FILE* f = fopen("/proc/self/exe", "rb");
-    if (!f) return "unknown";
-    uint64_t h = 14695981039346656037ull;
-    std::vector<unsigned char> buf(1 << 20);
-    for (size_t n; (n = fread(buf.data(), 1, buf.size(), f)) > 0;)
-        for (size_t i = 0; i < n; ++i) h = (h ^ buf[i]) * 1099511628211ull;
-    fclose(f);
-    char s[17];
-    snprintf(s, sizeof s, "%016llx", (unsigned long long)h);
-    return s;
-}
 
 namespace kvt {
 constexpr size_t MLA16 = 64 * g6kv::ROW / 16, IDX16 = 64 * g6kv::IDX_ROW / 16;
@@ -269,87 +256,5 @@ public:
         between();
         run(in, st);
     }
-};
-
-// One --kv-store value: STORE,size=N(M|G|T)[,persist=on|off][,keep=system|sessions|all]
-// [,spare_ram_cache=on|off[,spare_ram_floor=N(M|G)]][,group=NAME[,cap=N(M|G|T)][,weight=N]]. STORE is ssd:PATH (a
-// folder) or remote:HOST:PORT (remote:auto is the launcher's to resolve). Sizes are binary: G = 2^30, T = 2^40.
-// persist=on (SSD only) keeps the folder's system prefixes and counts across restarts; off (the default) clears it at
-// boot. keep= is this store's --kv-keep. group= (remote only): the lease joins that group on
-// the node and its size moves between size (the floor) and cap (0 or none: as far as the node gives) by whole segments;
-// weight (1000 = 1x, the default) is its share against the other groups (kvman-rs REMOTE-TIER.md "Sharing a node").
-// The deprecated --kv-tier (old) takes keep=evicted|shared|all instead, which g6m4 maps to --kv-keep.
-struct TierSpec {
-    std::string store;
-    uint64_t bytes = 0;
-    int keep = 0;       // --kv-tier only: 0 evicted, 1 shared, 2 all
-    std::string rule;   // --kv-store keep=: system, sessions or all; empty = --kv-keep
-    bool persist = false;
-    bool spare_ram = false;                   // spare_ram_cache=on: a cache in spare RAM in front of the store (src/ram.rs)
-    uint64_t spare_ram_floor = 2ull << 30;    // spare_ram_floor=: cache only while MemAvailable stays above it
-    std::string group;
-    uint64_t cap = 0;
-    uint32_t weight = 0;
-    static TierSpec parse(const std::string& v, bool old = false) {
-        TierSpec t;
-        size_t at = v.find(',');
-        t.store = v.substr(0, at);
-        while (at != std::string::npos) {
-            const size_t next = v.find(',', at + 1);
-            const std::string kv = v.substr(at + 1, next == std::string::npos ? std::string::npos : next - at - 1);
-            const size_t eq = kv.find('=');
-            const std::string k = kv.substr(0, eq), x = eq == std::string::npos ? "" : kv.substr(eq + 1);
-            auto bytes = [&] {
-                char* end = nullptr;
-                const double n = strtod(x.c_str(), &end);
-                const std::string unit = end ? end : "";
-                const double mul = unit == "T" ? 1099511627776.0 : unit == "G" ? 1073741824.0 : unit == "M" ? 1048576.0 : 0.0;
-                if (!(n > 0) || !mul) throw std::runtime_error("--kv-store " + v + ": " + k + "=N with M, G or T");
-                return uint64_t(n * mul);
-            };
-            if (k == "size") {
-                t.bytes = bytes();
-            } else if (k == "cap") {
-                t.cap = bytes();
-            } else if (k == "group") {
-                if (x.empty()) throw std::runtime_error("--kv-store " + v + ": group=NAME");
-                t.group = x;
-            } else if (k == "weight") {
-                char* end = nullptr;
-                const long w = strtol(x.c_str(), &end, 10);
-                if (x.empty() || *end || w < 1 || w > 1000000) throw std::runtime_error("--kv-store " + v + ": weight=N, 1000 = 1x");
-                t.weight = uint32_t(w);
-            } else if (k == "spare_ram_cache") {
-                if (x != "on" && x != "off") throw std::runtime_error("--kv-store " + v + ": spare_ram_cache=on or off");
-                t.spare_ram = x == "on";
-            } else if (k == "spare_ram_floor") {
-                t.spare_ram_floor = bytes();
-            } else if (k == "persist") {
-                if (x != "on" && x != "off") throw std::runtime_error("--kv-store " + v + ": persist=on or off");
-                t.persist = x == "on";
-            } else if (k == "keep" && !old) {
-                if (x != "system" && x != "sessions" && x != "all")
-                    throw std::runtime_error("--kv-store " + v + ": keep=system, sessions or all");
-                t.rule = x;
-            } else if (k == "keep") {
-                if (x == "evicted") t.keep = 0; else if (x == "shared") t.keep = 1; else if (x == "all") t.keep = 2;
-                else throw std::runtime_error("--kv-tier " + v + ": keep=evicted, shared or all");
-            } else throw std::runtime_error("--kv-store " + v + ": unknown option " + k);
-            at = next;
-        }
-        const bool ssd = t.store.rfind("ssd:", 0) == 0 && t.store.size() > 4;
-        const bool remote = t.store.rfind("remote:", 0) == 0 && t.store.size() > 7 && t.store != "remote:auto";
-        if (!ssd && !remote && t.store != "mem:")
-            throw std::runtime_error("--kv-store " + v + ": the store is ssd:PATH or remote:HOST:PORT (remote:auto needs the launcher)");
-        if (!t.bytes) throw std::runtime_error("--kv-store " + v + ": size=N(G|T) is needed");
-        if (t.persist && !ssd) throw std::runtime_error("--kv-store " + v + ": persist=on is for ssd: stores");
-        if (!t.group.empty() && !remote) throw std::runtime_error("--kv-store " + v + ": group= is for remote: stores");
-        if (t.spare_ram && !t.group.empty())
-            throw std::runtime_error("--kv-store " + v + ": spare_ram_cache=on needs a fixed lease (no group=)");
-        if (t.group.empty() && (t.cap || t.weight)) throw std::runtime_error("--kv-store " + v + ": cap= and weight= need group=");
-        if (t.cap && t.cap < t.bytes) throw std::runtime_error("--kv-store " + v + ": cap= is below size=");
-        return t;
-    }
-    bool ssd() const { return store.rfind("ssd:", 0) == 0; }
 };
 } // namespace g6s2
