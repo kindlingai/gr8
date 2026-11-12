@@ -222,6 +222,9 @@ fi
 "$T/pool_stash_test" "${STORES[@]}"
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/pool_namespace_test.cpp" "${KVLIB[@]}" -o "$T/pool_namespace_test"
 "$T/pool_namespace_test" "${STORES[@]}"
+g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -I "$REPO/engine/runtime" \
+  "$REPO/engine/runtime/s2/tests/kv_state_desc_test.cpp" "${KVLIB[@]}" -o "$T/kv_state_desc_test"
+"$T/kv_state_desc_test"
 [ -n "${NODE_PID:-}" ] && kill "$NODE_PID"
 [ -n "${LAZY_PID:-}" ] && kill "$LAZY_PID"
 # a pool tier on a group lease that grows into the node's grant, gives a segment back when another cluster asks, and

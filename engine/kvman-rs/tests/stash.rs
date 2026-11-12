@@ -795,6 +795,7 @@ impl CpRank {
                         Part::Full => (b.0, b.1) = (self.attn[page as usize], self.idx[page as usize]),
                         Part::Own => b.0 = self.attn[page as usize],
                         Part::Rep(i) => b.2[i as usize] = self.idx[page as usize],
+                        Part::State(_) => unreachable!("Pool never emits Part::State"),
                     }
                 }
                 Io::Move { tier, slot, to, to_slot } => {
@@ -806,6 +807,7 @@ impl CpRank {
                         Part::Full => (self.attn[page as usize], self.idx[page as usize]) = (b.0, b.1),
                         Part::Own => self.attn[page as usize] = b.0,
                         Part::Rep(i) => self.idx[page as usize] = b.2[i as usize],
+                        Part::State(_) => unreachable!("Pool never emits Part::State"),
                     }
                 }
             }
@@ -1187,6 +1189,7 @@ fn a_run_whose_base_is_in_a_later_tier_comes_back_and_a_lost_base_drops_it() {
         base,
         hits: 1,
         tail: None,
+        state: 0,
         namespace: g6kvman::pool::STOCK_NAMESPACE,
     };
     let write = |dir: &std::path::Path, e: &Entry| {
@@ -1309,6 +1312,7 @@ fn records_with_slots_past_the_tier_or_taken_twice_are_dropped_and_counted() {
         base: None,
         hits: 1,
         tail: None,
+        state: 0,
         namespace: g6kvman::pool::STOCK_NAMESPACE,
     };
     {

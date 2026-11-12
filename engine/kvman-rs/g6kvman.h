@@ -131,8 +131,8 @@ void g6kv_write_limit(g6kv_pool* p, uint64_t milli);
 // one copy: kind 0 = spill (page -> tier's slot), 1 = move (tier's slot -> to's to_slot), 2 = restore (tier's slot -> page).
 // part 0: the whole page block of pool page `page`. Past R (g6kv_tail): 1 = this rank's shard of the attention caches at
 // physical page `page`; 2 = logical page `page`'s replicated parts (indexer keys, unsharded bindings), the sub-th of the
-// block's per_slot. An earlier copy of the list can write the block a later one reads: an engine that runs copies
-// together keeps that order.
+// block's per_slot. part 3: the sub-th boundary-state block (`0 .. state_blocks`) for state handle `page` (g6kv_stash).
+// An earlier copy of the list can write the block a later one reads: an engine that runs copies together keeps that order.
 struct g6kv_io
 {
     uint32_t kind, page, tier, to;
@@ -314,4 +314,41 @@ int g6kv_ledger_abort(const char* path, uint64_t gen);
 // out[0..6]: gen, total, gpu, node, free, floor; out[6..9]: the pending transfer's gen (0: none), phase (1 begun,
 // 2 released), bytes
 int g6kv_ledger_show(const char* path, uint64_t* out);
+
+// Standalone tiered store (src/stash.rs) for slot-slab and hybrid boundary-state engines (ds41, Flash, future models).
+// Full 64-token pages use part = 0 (Full) and trailing boundary-state blocks (`state_blocks`) use part = 3, sub = 0..k.
+struct g6kv_stash;
+int g6kv_stash_new(uint32_t shared_after, uint64_t grid, uint32_t state_blocks, int mtp, g6kv_stash** out);
+void g6kv_stash_free(g6kv_stash* s);
+void g6kv_stash_rules(g6kv_stash* s, int strict, int noend, int32_t grid);
+int g6kv_stash_add_tier(g6kv_stash* s, uint64_t slots, int32_t keep, const char* index_dir, const char* compat);
+uint64_t g6kv_stash_tiers_loaded(g6kv_stash* s);
+int g6kv_stash_tier_policy(g6kv_stash* s, uint32_t t, uint64_t min_rows, uint32_t min_hits, uint64_t block_bytes);
+void g6kv_stash_write_limit(g6kv_stash* s, uint64_t milli);
+void g6kv_stash_earn(g6kv_stash* s, uint64_t pages);
+int g6kv_stash_count(g6kv_stash* s, const int32_t* prompt, size_t n, int64_t span, const uint8_t* namespace_,
+                     size_t namespace_bytes, int resident_continuing, uint32_t* out);
+int g6kv_stash_match(const g6kv_stash* s, const int32_t* prompt, size_t n, int32_t limit, const uint8_t* namespace_,
+                     size_t namespace_bytes, g6kv_hit* out);
+int g6kv_stash_restore(g6kv_stash* s, uint32_t tier, uint64_t id, const uint32_t* pages, size_t n_pages,
+                       uint32_t state_handle, int32_t* out_valid, uint32_t* out_hits, size_t* out_pages);
+int g6kv_stash_capture(g6kv_stash* s, const int32_t* history, size_t n_history, int32_t valid, int32_t written_end,
+                       int32_t pf_end, const uint32_t* pages, size_t n_pages, uint32_t state_handle, uint32_t hits,
+                       const uint8_t* namespace_, size_t namespace_bytes, uint64_t from_id, size_t from_pages,
+                       int keep_from, uint64_t keep_id, const int32_t* const* resident, const size_t* resident_lens,
+                       size_t n_resident, uint64_t* out_id);
+int g6kv_stash_promote(g6kv_stash* s, const int32_t* history, size_t n_history, int32_t valid, int32_t written_end,
+                       int32_t pf_end, const uint32_t* pages, size_t n_pages, uint32_t state_handle, uint64_t rows_max,
+                       int64_t span, uint64_t keep_id);
+int g6kv_stash_drop(g6kv_stash* s, uint64_t id, int* dropped);
+int g6kv_stash_has(const g6kv_stash* s, uint64_t id);
+size_t g6kv_stash_io_pending(const g6kv_stash* s);
+int g6kv_stash_io_take(g6kv_stash* s, g6kv_io* out, size_t cap);
+int g6kv_stash_io_done(g6kv_stash* s);
+int g6kv_stash_tier_stats(const g6kv_stash* s, uint32_t t, g6kv_tier_totals* out);
+size_t g6kv_stash_stored_summary(const g6kv_stash* s, char* buf, size_t cap);
+void g6kv_stash_keep_agreed(g6kv_stash* s, const char* agreed);
+int g6kv_stash_tier_resize(g6kv_stash* s, uint32_t t, uint64_t slots, int32_t* resized);
+size_t g6kv_stash_tier_coldest(g6kv_stash* s, uint32_t t, uint64_t per_seg, uint64_t* out, size_t cap);
+uint64_t g6kv_stash_digest(const g6kv_stash* s);
 }

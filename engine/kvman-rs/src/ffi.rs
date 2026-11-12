@@ -695,6 +695,7 @@ fn part_code(p: Part) -> (u32, u32) {
         Part::Full => (0, 0),
         Part::Own => (1, 0),
         Part::Rep(i) => (2, i),
+        Part::State(i) => (3, i),
     }
 }
 
@@ -1108,4 +1109,490 @@ pub unsafe extern "C" fn g6kv_tier_coldest(p: *mut Handle, t: u32, per_seg: u64,
     let n = a.len().min(cap);
     std::ptr::copy_nonoverlapping(a.as_ptr(), out, n);
     n
+}
+
+/// Standalone tiered store behind its lock (`struct g6kv_stash`), for slot-slab and hybrid boundary-state engines.
+pub struct StashHandle(Mutex<crate::stash::Stash>);
+
+impl StashHandle {
+    pub fn new(s: crate::stash::Stash) -> Self {
+        StashHandle(Mutex::new(s))
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, crate::stash::Stash> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Creates a standalone `g6kv_stash` in `*out`.
+///
+/// # Safety
+/// `out` must be valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_new(
+    shared_after: u32,
+    grid: u64,
+    state_blocks: u32,
+    mtp: i32,
+    out: *mut *mut StashHandle,
+) -> i32 {
+    if out.is_null() || (state_blocks > 0 && grid != 0 && !grid.is_multiple_of(crate::pool::PAGE)) {
+        return Error::BadArgument.code();
+    }
+    let mut s = crate::stash::Stash::new(shared_after, grid);
+    s.set_state_mode(state_blocks, mtp != 0);
+    *out = Box::into_raw(Box::new(StashHandle::new(s)));
+    0
+}
+
+/// # Safety
+/// `s` must come from `g6kv_stash_new` (or be NULL) and must not be used again.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_free(s: *mut StashHandle) {
+    if !s.is_null() {
+        drop(Box::from_raw(s));
+    }
+}
+
+/// # Safety
+/// `s` must be a live stash from `g6kv_stash_new`.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_rules(s: *mut StashHandle, strict: i32, noend: i32, grid: i32) {
+    if !s.is_null() {
+        (*s).lock().set_rules(Rules { strict: strict != 0, noend: noend != 0, grid });
+    }
+}
+
+/// # Safety
+/// `s` must be live; `index_dir` and `compat` are NULL or NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_add_tier(
+    s: *mut StashHandle,
+    slots: u64,
+    keep: i32,
+    index_dir: *const c_char,
+    compat: *const c_char,
+) -> i32 {
+    if s.is_null() || slots == 0 {
+        return crate::blocks::fail(std::io::Error::other("stash add_tier: null handle or zero slots"));
+    }
+    let whole = keep & 4 != 0 && !index_dir.is_null();
+    let keep = match keep & !4 {
+        0 => Keep::Evicted,
+        1 => Keep::Shared,
+        2 => Keep::All,
+        _ => return crate::blocks::fail(std::io::Error::other("keep: 0, 1 or 2, + 4 for a whole index")),
+    };
+    let text = |c: *const c_char| (!c.is_null()).then(|| CStr::from_ptr(c).to_string_lossy().into_owned());
+    let (dir, compat) = (text(index_dir), text(compat).unwrap_or_default());
+    let index = match dir {
+        Some(d) => match crate::stash::Index::open(std::path::Path::new(&d), &compat) {
+            Ok(ix) => Some(ix),
+            Err(e) => return crate::blocks::fail(e),
+        },
+        None => None,
+    };
+    let mut st = (*s).lock();
+    st.add_tier(slots, keep, index);
+    if whole {
+        let last = st.tiers() - 1;
+        st.index_whole(last);
+    }
+    0
+}
+
+/// # Safety
+/// `s` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_tiers_loaded(s: *mut StashHandle) -> u64 {
+    if s.is_null() {
+        return 0;
+    }
+    (*s).lock().loaded() as u64
+}
+
+/// # Safety
+/// `s` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_tier_policy(
+    s: *mut StashHandle,
+    t: u32,
+    min_rows: u64,
+    min_hits: u32,
+    block_bytes: u64,
+) -> i32 {
+    if s.is_null() {
+        return Error::BadArgument.code();
+    }
+    let mut st = (*s).lock();
+    if (t as usize) >= st.tiers() {
+        return Error::BadArgument.code();
+    }
+    st.set_policy(t as usize, Policy { min_rows, min_hits, block_bytes });
+    0
+}
+
+/// # Safety
+/// `s` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_write_limit(s: *mut StashHandle, milli: u64) {
+    if !s.is_null() {
+        (*s).lock().set_limit(milli);
+    }
+}
+
+/// # Safety
+/// `s` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_earn(s: *mut StashHandle, pages: u64) {
+    if !s.is_null() {
+        (*s).lock().earn_pages(pages);
+    }
+}
+
+/// # Safety
+/// `s` must be live; `prompt` points at `n` ints, `namespace_` at `namespace_bytes` bytes, `out` valid for a write.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn g6kv_stash_count(
+    s: *mut StashHandle,
+    prompt: *const i32,
+    n: usize,
+    span: i64,
+    namespace_: *const u8,
+    namespace_bytes: usize,
+    resident_continuing: i32,
+    out: *mut u32,
+) -> i32 {
+    let Some(ns) = namespace(namespace_, namespace_bytes) else { return Error::BadArgument.code() };
+    let Some(pr) = slice(prompt, n) else { return Error::BadArgument.code() };
+    if s.is_null() || out.is_null() {
+        return Error::BadArgument.code();
+    }
+    *out = (*s).lock().count_admission(pr, u32::try_from(span).ok(), ns, resident_continuing != 0);
+    0
+}
+
+/// # Safety
+/// `s` must be live; `prompt` points at `n` ints, `namespace_` at `namespace_bytes` bytes, `out` valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_match(
+    s: *const StashHandle,
+    prompt: *const i32,
+    n: usize,
+    limit: i32,
+    namespace_: *const u8,
+    namespace_bytes: usize,
+    out: *mut G6kvHit,
+) -> i32 {
+    let Some(ns) = namespace(namespace_, namespace_bytes) else { return Error::BadArgument.code() };
+    let Some(pr) = slice(prompt, n) else { return Error::BadArgument.code() };
+    if s.is_null() || out.is_null() {
+        return Error::BadArgument.code();
+    }
+    let h = (*s).lock().match_state(pr, limit, ns);
+    *out = G6kvHit {
+        skip: h.skip,
+        lcp: h.lcp,
+        why: h.why.name().as_ptr(),
+        age: h.age,
+        stored: h.stored as i32,
+        tier: h.tier,
+    };
+    0
+}
+
+/// # Safety
+/// `s` must be live; `pages` points at `n_pages` u32s. Output pointers may be NULL.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn g6kv_stash_restore(
+    s: *mut StashHandle,
+    tier: u32,
+    id: u64,
+    pages: *const u32,
+    n_pages: usize,
+    state_handle: u32,
+    out_valid: *mut i32,
+    out_hits: *mut u32,
+    out_pages: *mut usize,
+) -> i32 {
+    let Some(pg) = slice(pages, n_pages) else { return Error::BadArgument.code() };
+    if s.is_null() {
+        return Error::BadArgument.code();
+    }
+    match (*s).lock().restore_entry(tier as usize, id, pg, state_handle) {
+        Ok((valid, hits, full)) => {
+            if !out_valid.is_null() {
+                *out_valid = valid;
+            }
+            if !out_hits.is_null() {
+                *out_hits = hits;
+            }
+            if !out_pages.is_null() {
+                *out_pages = full;
+            }
+            0
+        }
+        Err(e) => e.code(),
+    }
+}
+
+/// # Safety
+/// `s` must be live; `history`, `pages`, `namespace_`, `resident`/`resident_lens`, and `out_id` must be valid.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn g6kv_stash_capture(
+    s: *mut StashHandle,
+    history: *const i32,
+    n_history: usize,
+    valid: i32,
+    written_end: i32,
+    pf_end: i32,
+    pages: *const u32,
+    n_pages: usize,
+    state_handle: u32,
+    hits: u32,
+    namespace_: *const u8,
+    namespace_bytes: usize,
+    from_id: u64,
+    from_pages: usize,
+    keep_from: i32,
+    keep_id: u64,
+    resident: *const *const i32,
+    resident_lens: *const usize,
+    n_resident: usize,
+    out_id: *mut u64,
+) -> i32 {
+    let Some(ns) = namespace(namespace_, namespace_bytes) else { return Error::BadArgument.code() };
+    let Some(hist) = slice(history, n_history) else { return Error::BadArgument.code() };
+    let Some(pg) = slice(pages, n_pages) else { return Error::BadArgument.code() };
+    if s.is_null() || out_id.is_null() {
+        return Error::BadArgument.code();
+    }
+    let mut res_slices: Vec<&[i32]> = Vec::with_capacity(n_resident);
+    if n_resident > 0 {
+        if resident.is_null() || resident_lens.is_null() {
+            return Error::BadArgument.code();
+        }
+        for i in 0..n_resident {
+            let len = *resident_lens.add(i);
+            let ptr = *resident.add(i);
+            let Some(sl) = slice(ptr, len) else { return Error::BadArgument.code() };
+            res_slices.push(sl);
+        }
+    }
+    let from = (from_id != 0).then_some((from_id, from_pages));
+    let keep = (keep_id != 0).then_some(keep_id);
+    let fin = Finished { history: hist.to_vec(), valid, written_end, pf_end };
+    match (*s).lock().capture_entry(fin, pg, state_handle, hits, ns, from, keep_from != 0, keep, &res_slices) {
+        Ok(id) => {
+            *out_id = id.unwrap_or(0);
+            0
+        }
+        Err(e) => e.code(),
+    }
+}
+
+/// # Safety
+/// `s` must be live; `history` and `pages` must point at `n_history` and `n_pages` values.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn g6kv_stash_promote(
+    s: *mut StashHandle,
+    history: *const i32,
+    n_history: usize,
+    valid: i32,
+    written_end: i32,
+    pf_end: i32,
+    pages: *const u32,
+    n_pages: usize,
+    state_handle: u32,
+    rows_max: u64,
+    span: i64,
+    keep_id: u64,
+) -> i32 {
+    let Some(hist) = slice(history, n_history) else { return Error::BadArgument.code() };
+    let Some(pg) = slice(pages, n_pages) else { return Error::BadArgument.code() };
+    if s.is_null() {
+        return Error::BadArgument.code();
+    }
+    let fin = Finished { history: hist.to_vec(), valid, written_end, pf_end };
+    code((*s).lock().promote_state(
+        &fin,
+        pg,
+        state_handle,
+        rows_max,
+        u32::try_from(span).ok(),
+        (keep_id != 0).then_some(keep_id),
+    ))
+}
+
+/// # Safety
+/// `s` must be live; `dropped` may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_drop(s: *mut StashHandle, id: u64, dropped: *mut i32) -> i32 {
+    if s.is_null() {
+        return Error::BadArgument.code();
+    }
+    match (*s).lock().drop_entry(id) {
+        Ok(ok) => {
+            if !dropped.is_null() {
+                *dropped = ok as i32;
+            }
+            0
+        }
+        Err(e) => e.code(),
+    }
+}
+
+/// # Safety
+/// `s` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_has(s: *const StashHandle, id: u64) -> i32 {
+    if s.is_null() || id == 0 {
+        return 0;
+    }
+    (*s).lock().has_entry(id) as i32
+}
+
+/// # Safety
+/// `s` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_io_pending(s: *const StashHandle) -> usize {
+    if s.is_null() {
+        return 0;
+    }
+    (*s).lock().io_pending_count()
+}
+
+/// # Safety
+/// `s` must be live; `out` holds `cap` entries.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_io_take(s: *mut StashHandle, out: *mut G6kvIo, cap: usize) -> i32 {
+    if s.is_null() {
+        return Error::BadArgument.code();
+    }
+    let mut st = (*s).lock();
+    if st.io_pending_count() > cap || (cap > 0 && out.is_null()) {
+        return Error::BadArgument.code();
+    }
+    for (i, x) in st.take_pending_io().into_iter().enumerate() {
+        *out.add(i) = match x {
+            Io::Spill { tier, page, slot, part } => {
+                let (part, sub) = part_code(part);
+                G6kvIo { kind: 0, page, tier, to: 0, slot, to_slot: 0, part, sub }
+            }
+            Io::Move { tier, slot, to, to_slot } => {
+                G6kvIo { kind: 1, page: 0, tier, to, slot, to_slot, part: 0, sub: 0 }
+            }
+            Io::Restore { tier, slot, page, part } => {
+                let (part, sub) = part_code(part);
+                G6kvIo { kind: 2, page, tier, to: 0, slot, to_slot: 0, part, sub }
+            }
+        };
+    }
+    0
+}
+
+/// # Safety
+/// `s` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_io_done(s: *mut StashHandle) -> i32 {
+    if s.is_null() {
+        return Error::BadArgument.code();
+    }
+    let r = (*s).lock().finish_io();
+    match r {
+        Ok(()) => 0,
+        Err(e) => crate::blocks::fail(e),
+    }
+}
+
+/// # Safety
+/// `s` must be live and `out` valid for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_tier_stats(s: *const StashHandle, t: u32, out: *mut TierStats) -> i32 {
+    if s.is_null() || out.is_null() {
+        return Error::BadArgument.code();
+    }
+    match (*s).lock().stats(t as usize) {
+        Some(st) => {
+            *out = st;
+            0
+        }
+        None => Error::BadArgument.code(),
+    }
+}
+
+/// # Safety
+/// `s` must be live; `buf` holds `cap` bytes (or is NULL with cap 0).
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_stored_summary(s: *const StashHandle, buf: *mut c_char, cap: usize) -> usize {
+    if s.is_null() {
+        return 0;
+    }
+    let text = (*s).lock().summary();
+    if !buf.is_null() && cap > 0 {
+        let n = text.len().min(cap - 1);
+        std::ptr::copy_nonoverlapping(text.as_ptr() as *const c_char, buf, n);
+        *buf.add(n) = 0;
+    }
+    text.len() + 1
+}
+
+/// # Safety
+/// `s` must be live; `agreed` NUL-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_keep_agreed(s: *mut StashHandle, agreed: *const c_char) {
+    if !s.is_null() && !agreed.is_null() {
+        (*s).lock().keep_agreed(&CStr::from_ptr(agreed).to_string_lossy());
+    }
+}
+
+/// # Safety
+/// `s` must be live; `resized` may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_tier_resize(s: *mut StashHandle, t: u32, slots: u64, resized: *mut i32) -> i32 {
+    if s.is_null() {
+        return Error::BadArgument.code();
+    }
+    let mut st = (*s).lock();
+    if st.pending() {
+        return Error::PendingIo.code();
+    }
+    let ok = st.resize_tier(t as usize, slots);
+    if !resized.is_null() {
+        *resized = ok as i32;
+    }
+    0
+}
+
+/// # Safety
+/// `s` must be live and `out` hold `cap` values.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_tier_coldest(
+    s: *mut StashHandle,
+    t: u32,
+    per_seg: u64,
+    out: *mut u64,
+    cap: usize,
+) -> usize {
+    if s.is_null() || out.is_null() || cap == 0 {
+        return 0;
+    }
+    let a = (*s).lock().coldest_ages(t as usize, per_seg, cap);
+    let n = a.len().min(cap);
+    std::ptr::copy_nonoverlapping(a.as_ptr(), out, n);
+    n
+}
+
+/// # Safety
+/// `s` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_digest(s: *const StashHandle) -> u64 {
+    if s.is_null() {
+        return 0;
+    }
+    (*s).lock().digest()
 }
