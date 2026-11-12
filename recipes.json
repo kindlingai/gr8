@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "comment": "The recipe repositories. card: true = docs/cards/make.sh draws its card for the README.",
+  "recipes": [
+    {
+      "repo": "kindlingai/glm-5.3-flash-exlr8-1x-spark",
+      "nodes": 1,
+      "card": true
+    },
+    {
+      "repo": "kindlingai/glm-5.3-flash-exlr8-2x-spark",
+      "nodes": 2,
+      "card": true
+    },
+    {
+      "repo": "kindlingai/deepseek-v4.1-flash-exlr8-4x-spark",
+      "nodes": 4,
+      "card": true
+    },
+    {
+      "repo": "kindlingai/glm-5.3-exlr8-4x-spark",
+      "nodes": 4,
+      "card": true
+    },
+    {
+      "repo": "kindlingai/glm-5.3-exlr8-5x-spark",
+      "nodes": 5,
+      "card": false
+    },
+    {
+      "repo": "kindlingai/glm-5.3-exlr8-6x-spark",
+      "nodes": 6,
+      "card": false
+    }
+  ]
+}
