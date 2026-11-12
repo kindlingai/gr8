@@ -559,8 +559,8 @@ impl Planner<'_> {
 /// boots read them back instead of decoding the whole q_b / o_proj / kv_b again. Key = source file path, size and
 /// mtime; a missing, short or mismatched file is ignored (the tensors are made and the file rewritten).
 fn qo_cache_path(p: &str) -> Option<String> {
-    let d = gr8knobs::QO_CACHE.get()?;
-    Some(format!("{d}/{}.qo.bin", p.replace('/', "_")))
+    let d = gr8knobs::QO_CACHE.get().filter(|s| !s.is_empty())?;
+    Some(std::path::Path::new(d).join(format!("{}.qo.bin", p.replace('/', "_"))).to_string_lossy().into_owned())
 }
 
 fn qo_cache_key(src: &str, kvb_rot: bool) -> Option<String> {
@@ -599,6 +599,12 @@ fn qo_cache_read(path: &str, key: &str, nparts: usize) -> Option<Vec<Vec<u8>>> {
 }
 
 fn qo_cache_write(path: &str, key: &str, parts: &[Vec<u8>]) {
+    if let Err(e) = qo_cache_try_write(path, key, parts) {
+        eprintln!("# qo-cache: write {path}: {e} (not cached, continuing)");
+    }
+}
+
+fn qo_cache_try_write(path: &str, key: &str, parts: &[Vec<u8>]) -> std::io::Result<()> {
     let mut b = Vec::with_capacity(16 + key.len() + parts.iter().map(|p| 8 + p.len()).sum::<usize>());
     b.extend_from_slice(QO_MAGIC);
     b.extend_from_slice(&(key.len() as u64).to_le_bytes());
@@ -609,12 +615,17 @@ fn qo_cache_write(path: &str, key: &str, parts: &[Vec<u8>]) {
     for p in parts {
         b.extend_from_slice(p);
     }
-    let tmp = format!("{path}.tmp{}", std::process::id());
-    if std::fs::write(&tmp, &b).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    } else {
-        let _ = std::fs::remove_file(&tmp);
+    if let Some(dir) = std::path::Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
     }
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = format!("{path}.tmp{}.{seq}", std::process::id());
+    if let Err(e) = std::fs::write(&tmp, &b).and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// GR8_PF_OWN=3's full-head tensors of one layer: [q_b codes, q_b scales, o_proj codes, o_proj scales, UK, UV].
@@ -897,6 +908,40 @@ mod tests {
         std::fs::write(&p, &b).unwrap();
         assert_eq!(super::qo_cache_read(&p, "src|1|2.0", 6), None); // short file
         assert_eq!(super::qo_cache_read(&d.join("none").to_string_lossy(), "src|1|2.0", 6), None);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn qo_cache_write_creates_missing_parent_dirs() {
+        let d = std::env::temp_dir().join(format!("qoc-mkdir-test-{}", std::process::id()));
+        assert!(!d.exists());
+        let path = d.join("nested/sub/qocache/L003.qo.bin");
+        let p = path.to_string_lossy().into_owned();
+        let parts = vec![vec![1u8, 2], vec![], vec![3u8; 17], vec![4u8], vec![5u8; 3], vec![6u8; 9]];
+        super::qo_cache_write(&p, "src|1|2.0", &parts);
+        assert!(path.parent().unwrap().is_dir());
+        assert!(path.is_file());
+        assert_eq!(super::qo_cache_read(&p, "src|1|2.0", 6), Some(parts.clone()));
+        assert!(super::qo_cache_try_write(&p, "src|1|2.0", &parts).is_ok());
+        assert_eq!(super::qo_cache_read(&p, "src|1|2.0", 6), Some(parts));
+        assert!(std::fs::read_dir(path.parent().unwrap()).unwrap().all(|entry| {
+            !entry.unwrap().file_name().to_string_lossy().contains(".tmp")
+        }));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn qo_cache_try_write_reports_error_when_parent_blocked_and_cleans_up() {
+        let d = std::env::temp_dir().join(format!("qoc-blocked-test-{}", std::process::id()));
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("blocker"), b"not a directory").unwrap();
+        let p = d.join("blocker/qocache/L003.qo.bin").to_string_lossy().into_owned();
+        let parts = vec![vec![1u8], vec![], vec![2u8; 5], vec![3u8], vec![4u8; 2], vec![5u8; 7]];
+        assert!(super::qo_cache_try_write(&p, "src|1|2.0", &parts).is_err());
+        super::qo_cache_write(&p, "src|1|2.0", &parts);
+        assert_eq!(super::qo_cache_read(&p, "src|1|2.0", 6), None);
+        assert_eq!(std::fs::read(d.join("blocker")).unwrap(), b"not a directory");
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
         std::fs::remove_dir_all(&d).unwrap();
     }
 
