@@ -121,6 +121,7 @@
           "source": "computed"
         }
       ],
+      "max_tokens_per_chat_note": "prompt + max_tokens · 2-chat prompt (measured): 199,410 (max_tokens omitted) · 174,834 (max_tokens 32,768)",
       "quality": [
         {
           "name": "75-item check",

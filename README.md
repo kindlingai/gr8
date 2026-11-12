@@ -62,9 +62,10 @@ computed; 233,458 at 8 with `TUNE=context`, computed) · the same image on both 
 [![GLM-5.3 on four DGX Sparks: decode, prefill and concurrency](docs/cards/glm-5.3-4x-spark.png)](docs/GLM-5.3.md)
 
 63.3 tok/s for one request writing code (46-54-token prompts) · 1,540 tok/s prefill on a 32K prompt · 8 requests at
-once (`SESS=8`), 85.8 tok/s in total · int4 KV default: 513,536-token KV pool, max tokens per active chat 513,522 at 1
-(measured) and 207,602 / 54,514 / 19,058 at 2 / 4 / 8 (computed) · a fact hidden in a 128K prompt found · one boot,
-measured 2026-11-11 · no recipe yet: start it on three to six boxes with Docker Compose, from the
+once (`SESS=8`), 85.8 tok/s in total · int4 KV default: 513,536-token KV pool, max tokens per active chat (prompt +
+max_tokens) 513,522 at 1 (measured) and 207,602 / 54,514 / 19,058 at 2 / 4 / 8 (computed; 2-chat prompt limit
+measured: 199,410 with max_tokens omitted, 174,834 at max_tokens=32,768) · a fact hidden in a 128K prompt found ·
+one boot, measured 2026-11-11 · no recipe yet: start it on three to six boxes with Docker Compose, from the
 [Models and install](#models-and-install) table.
 
 [Model page](docs/GLM-5.3.md)
