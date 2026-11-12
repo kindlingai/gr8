@@ -51,10 +51,11 @@ On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 
 
 | flag | default | meaning |
 |---|---|---|
-| `--model-dir` | required | Directory holding `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` and `generation_config.json`. Its `temperature` and `top_p` are the defaults for a request that names none. DeepSeek-V4.1-Flash: with no `top_p` there, a request without one samples at 0.95. DeepSeek's V4.1-Flash README recommends 0.95 or 1.0 and evaluates at 0.95; the 1017 README recommends 1.0 (send `top_p: 1.0` for it). At temperature 1.0 on 4 Sparks, 0.95 decoded 7-13% faster with the same sampled quality. |
+| `--model-dir` | required | Directory holding `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` (or `chat_template` inside `tokenizer_config.json`) and `generation_config.json`. Its `temperature` and `top_p` are the defaults for a request that names none. DeepSeek-V4.1-Flash: with no `top_p` there, a request without one samples at 0.95. DeepSeek's V4.1-Flash README recommends 0.95 or 1.0 and evaluates at 0.95; the 1017 README recommends 1.0 (send `top_p: 1.0` for it). At temperature 1.0 on 4 Sparks, 0.95 decoded 7-13% faster with the same sampled quality. |
 | `--engine-sock` | `/run/g6/engine.sock` | Engine Unix socket. |
 | `--host` / `--port` | `0.0.0.0` / `8100` | Listen address. |
-| `--served-model-name` | `glm-5.3 glm53` | Accepted `model` values. The first one is reported in responses. |
+| `--dialect` | `auto` | `glm`, `ds41`, `hf`, or `auto` (detects `ds41` on `DeepseekV4` / `｜DSML｜`, `glm` when `config.json` is absent or names a `Glm` / `ChatGLM` architecture, and `hf` on other HuggingFace `architectures[0]` entries such as Qwen, Llama or Mistral). |
+| `--served-model-name` | `glm-5.3 glm53` (`glm`), `deepseek-v4.1-flash` (`ds41`), `--model-dir` basename (`hf`) | Accepted `model` values. The first one is reported in responses. |
 | `--max-model-len` | 0 (use the engine `hello`) | Overrides the context length. |
 | `--reasoning-fields` | `reasoning` | `reasoning`, `reasoning_content` or both. The default matches vLLM 0.30, which sends only `reasoning`. |
 | `--enable-prompt-tokens-details` | off | Adds `usage.prompt_tokens_details.cached_tokens`. |
@@ -375,3 +376,26 @@ matching loaded capability; current real servers return HTTP 400 with `param: "s
 The frontend preserves a selected profile and its exact canonical FP32 scale through budget continuations.
 The shim independently validates the fields before writing any request file. Stock frames omit both fields.
 [Transport details and testing](../docs/STEERING-TRANSPORT.md) describe the reserved loaded receipt and mock fixtures.
+
+
+### Generic Hugging Face chat (`--dialect hf`)
+
+Use `hf` for text models with a Jinja chat template and standard JSON tool calls.
+The server reads `chat_template.jinja`, falling back to `tokenizer_config.json`'s
+`chat_template` string or named `default` entry. Text messages reach the template
+as strings; GLM's content-part rendering is unchanged. EOS comes from
+`generation_config.json`, then `config.json` (including `text_config`), then the tokenizer.
+
+An optional leading `<think>...</think>` is returned as reasoning. A template may
+leave `<think>` open or pre-seed an empty block; both streaming and non-streaming
+replies follow that state. `chat_template_kwargs.enable_thinking: false` (or
+`thinking: false`) and `reasoning_effort: "none"` turn thinking off without
+`--allow-thinking-off`. Budgets require a tokenizer with a single `</think>` token.
+
+With tools offered, `<tool_call>{"name":"f","arguments":{"x":1}}</tool_call>`
+becomes an OpenAI tool call. Stringified JSON arguments and multiple calls work;
+without tools, or with `tool_choice: "none"`, tool markup stays literal text.
+Malformed calls stay text. `auto`, `required` and named-function choices are
+supported; forced choices use token insertion, not schema-constrained generation.
+This dialect does not parse GLM argument tags, DSML, or `[TOOL_CALLS]` syntax.
+A new frontend dialect does not add engine kernels or weight-loader support.

@@ -361,9 +361,9 @@ fn check_penalties(st: &State, prompt: &[u32], g: &mut crate::wire::GenParams) -
 }
 
 impl State {
-    /// The jinja chat template, which only the glm dialect has.
+    /// The jinja chat template (used by the `glm` and `hf` dialects).
     fn tpl(&self) -> &crate::template::ChatTemplate {
-        self.template.as_ref().expect("a glm-dialect State has a chat template")
+        self.template.as_ref().expect("a template-backed State has a chat template")
     }
 
     fn check_model(&self, body: &Map<String, Value>) -> Result<(), ApiError> {
@@ -450,6 +450,10 @@ struct ChatReq {
     budget: u64,
     /// the validated response_format ('text' enforces nothing)
     rf: jsonmode::Rf,
+    /// whether thinking was explicitly turned off for this request
+    thinking_off: bool,
+    /// whether the rendered prompt leaves `<think>` open for the assistant turn
+    prompt_think_open: bool,
 }
 
 async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8]) -> Result<ChatReq, ApiError> {
@@ -462,22 +466,29 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     let choice = ToolChoice::parse(tools.as_ref(), body.get("tool_choice"))?;
     let rf = jsonmode::parse_response_format(body.get("response_format"), &st.grammars)?;
     let ds = st.dialect == Dialect::Ds41;
-    let (th, ds_effort) = if ds {
-        dialect::resolve_ds(body, st.thinking, st.ds_effort)?
-    } else {
-        (st.tpl().resolve_thinking(body, st.thinking)?, st.ds_effort)
+    let (th, ds_effort, hf_enable) = match st.dialect {
+        Dialect::Ds41 => {
+            let (th, e) = dialect::resolve_ds(body, st.thinking, st.ds_effort)?;
+            (th, e, None)
+        }
+        Dialect::Hf => {
+            let (th, en) = dialect::resolve_hf(body, &st.tpl().levels, st.thinking)?;
+            (th, st.ds_effort, en)
+        }
+        Dialect::Glm => (st.tpl().resolve_thinking(body, st.thinking)?, st.ds_effort, None),
     };
-    let kw = if ds {
+    let agp_val = body.get("add_generation_prompt").cloned().unwrap_or(Value::Bool(true));
+    let cfm_val = body.get("continue_final_message").cloned().unwrap_or(Value::Bool(false));
+    let agp_on = truthy(Some(&agp_val));
+    let cfm_on = truthy(Some(&cfm_val));
+    let mut kw = if ds {
         Map::new() // the prompt is rendered by dschat from the messages alone
     } else {
-        build_template_kwargs(
-            body.get("chat_template_kwargs"),
-            body.get("add_generation_prompt").cloned().unwrap_or(Value::Bool(true)),
-            body.get("continue_final_message").cloned().unwrap_or(Value::Bool(false)),
-            th.effort,
-            body.get("documents"),
-        )?
+        build_template_kwargs(body.get("chat_template_kwargs"), agp_val, cfm_val, th.effort, body.get("documents"))?
     };
+    if let Some(en) = hf_enable {
+        kw.insert("enable_thinking".into(), Value::Bool(en));
+    }
     if truthy(body.get("chat_template")) {
         return Err(ApiError::bad("custom chat_template is not supported", Some("chat_template")));
     }
@@ -504,10 +515,15 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
             st.tpl().render(Some(&messages), tools.as_ref(), kw)?
         };
         if th.off {
-            text = st.tpl().thinking_off(text, body.get("add_generation_prompt").is_none_or(|v| truthy(Some(v))));
+            text = match st.dialect {
+                Dialect::Hf => dialect::hf_thinking_off(text, agp_on),
+                _ => st.tpl().thinking_off(text, agp_on),
+            };
         }
         text
     };
+    let hf_prompt_ends_think = st.dialect == Dialect::Hf && !cfm_on && pyjson::py_rstrip(&text).ends_with("<think>");
+    let thinking_off = th.off || (st.dialect == Dialect::Hf && pyjson::py_rstrip(&text).ends_with("</think>"));
     let (t1, chars) = (std::time::Instant::now(), text.len());
     // the DeepSeek prompt text opens with its BOS, so no special tokens are added to it
     let add_special = !ds && truthy(body.get("add_special_tokens"));
@@ -573,21 +589,24 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         return Err(ApiError::bad("the engine does not support a forced tool_choice", Some("tool_choice")));
     }
     check_penalties(st, &prompt, &mut params.gen)?;
+    let tok_think_open = match (st.tok.think_start, st.tok.think_end) {
+        (Some(s), Some(e)) => think_open(&prompt, s, e),
+        _ => false,
+    };
+    let prompt_think_open = if st.dialect == Dialect::Hf && !cfm_on { hf_prompt_ends_think } else { tok_think_open };
     // The template leaves `<think>` open at the end of a chat prompt, so the reply's first token sits in the reasoning
     // span: the forced opener has to follow the close, or the call it opens is reasoning and the parser reads prose.
-    let close = match (st.tok.think_start, st.tok.think_end) {
-        (Some(s), Some(e)) if think_open(&prompt, s, e) => st.tok.think_close.as_slice(),
-        _ => &[],
+    let close = if prompt_think_open { st.tok.think_close.as_slice() } else { &[] };
+    let force = match st.dialect {
+        Dialect::Ds41 => choice.forced_ids_ds(&st.tok, close)?,
+        Dialect::Hf => choice.forced_ids_hf(&st.tok, close)?,
+        Dialect::Glm => choice.forced_ids(&st.tok, close)?,
     };
-    let force = if ds { choice.forced_ids_ds(&st.tok, close)? } else { choice.forced_ids(&st.tok, close)? };
     params.gen.system_tokens = system;
     // a JSON mode with no tools: the engine masks the reply to the grammar (after the think close while the prompt leaves
     // the think block open); the extraction after generation still runs. With tools the grammar would forbid a call
     if rf.kind != "text" && tools.is_none() && st.engine.grammars() {
-        let after_token = match (st.tok.think_start, st.tok.think_end) {
-            (Some(start), Some(end)) if think_open(&prompt, start, end) => Some(end),
-            _ => None,
-        };
+        let after_token = if prompt_think_open { st.tok.think_end } else { None };
         params.gen.grammar = Some(crate::wire::GrammarReq {
             kind: if rf.kind == "json_schema" { "json_schema" } else { "json" },
             schema: rf.schema.as_ref().map(Value::to_string),
@@ -606,7 +625,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         }
         params.gen.images = std::sync::Arc::new(spans);
     }
-    Ok(ChatReq { tools, choice, force, prompt, params, budget, rf })
+    Ok(ChatReq { tools, choice, force, prompt, params, budget, rf, thinking_off, prompt_think_open })
 }
 
 fn image_err(e: crate::vision::VisionError) -> ApiError {
@@ -713,7 +732,7 @@ async fn system_span(
     kw.insert("add_generation_prompt".into(), Value::Bool(false));
     kw.insert("continue_final_message".into(), Value::Bool(false));
     let mut text = st.tpl().render(Some(&Value::Array(lead)), tools, kw).ok()?;
-    if thinking_off {
+    if thinking_off && st.dialect == Dialect::Glm {
         text = st.tpl().thinking_off(text, false);
     }
     let ids = st.tok.aencode(text, add_special).await.ok()?;
@@ -758,6 +777,8 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
         (Some(start), Some(end)) => !think_open(&cr.prompt, start, end),
         _ => false,
     };
+    let prompt_think_open = cr.prompt_think_open;
+    let thinking_off = cr.thinking_off;
     // the repeated-tool-call guard (guard.rs): GLM's parser, tools offered, no forced call (that is the client's own)
     let guard_on = body.get("tool_repeat_guard").filter(|v| !v.is_null()).map_or(st.guard.on, |v| truthy(Some(v)));
     let mut guard = (st.dialect == Dialect::Glm && cr.tools.is_some() && cr.force.is_empty())
@@ -768,7 +789,15 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
         let p = AnyParser::new(st.dialect, cr.tools.as_ref(), &choice_value, include_reasoning)
             .emit_undeclared(st.emit_undeclared)
             .guard_names(guard_names.clone());
-        if content_first {
+        if st.dialect == Dialect::Hf {
+            if prompt_think_open {
+                p.in_think()
+            } else if thinking_off {
+                p.content_first()
+            } else {
+                p
+            }
+        } else if content_first {
             p.content_first()
         } else {
             p
@@ -785,8 +814,8 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
         gen.keep_reply();
     }
     let rf = cr.rf;
-    if let (Some(start), Some(end)) = (st.tok.think_start, st.tok.think_end) {
-        if think_open(&gen.prompt, start, end) {
+    if prompt_think_open {
+        if let Some(end) = st.tok.think_end {
             let limit = usize::try_from(cr.budget).unwrap_or(usize::MAX);
             if limit > 0 && !st.tok.think_close.is_empty() && st.engine.inserts() {
                 // the engine puts the close in place of the budget-th reply token itself: no second run
@@ -1532,9 +1561,16 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                 }
             } else {
                 // the same effort and the same refusals as a chat request, so the counts agree
-                let th = st.tpl().resolve_thinking(&body, st.thinking)?;
+                let (th, hf_enable) = if st.dialect == Dialect::Hf {
+                    dialect::resolve_hf(&body, &st.tpl().levels, st.thinking)?
+                } else {
+                    (st.tpl().resolve_thinking(&body, st.thinking)?, None)
+                };
                 let agp_on = truthy(Some(&agp));
-                let kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, th.effort, None)?;
+                let mut kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, th.effort, None)?;
+                if let Some(en) = hf_enable {
+                    kw.insert("enable_thinking".into(), Value::Bool(en));
+                }
                 let tools = normalize_tools(body.get("tools"))?;
                 let msgs = body.get("messages").cloned().unwrap_or(Value::Null);
                 let (mut text, images) = if crate::template::has_images(&msgs) {
@@ -1543,7 +1579,10 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                     (st.tpl().render(Some(&msgs), tools.as_ref(), kw)?, Vec::new())
                 };
                 if th.off {
-                    text = st.tpl().thinking_off(text, agp_on);
+                    text = match st.dialect {
+                        Dialect::Hf => dialect::hf_thinking_off(text, agp_on),
+                        _ => st.tpl().thinking_off(text, agp_on),
+                    };
                 }
                 let ids = st
                     .tok

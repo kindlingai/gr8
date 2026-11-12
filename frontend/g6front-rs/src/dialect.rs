@@ -1,10 +1,13 @@
-//! The front end speaks two model dialects. `glm` is GLM 5.3: a jinja chat template, `<tool_call>` calls, a thinking
+//! The front end speaks three model dialects. `glm` is GLM 5.3: a jinja chat template, `<tool_call>` calls, a thinking
 //! switch that needs `--allow-thinking-off`. `ds41` is DeepSeek-V4.1 Flash: the prompt comes from `dschat.rs` (a
 //! port of the release's `encoding.py`), calls are DSML blocks (`dsparser.rs`), thinking is a plain on/off switch and
 //! `reasoning_effort` is a number from 1 to 100.
+//! `hf` is generic HuggingFace (Qwen, Llama, Mistral, Hermes and compatible models): `chat_template.jinja` or
+//! `tokenizer_config.json`'s `chat_template`, optional `<think>...</think>` reasoning, and JSON `<tool_call>` calls
+//! (`hfparser.rs`).
 //!
-//! This file holds what the two have in common at the seam: which dialect a model directory is, the parser enum the
-//! handlers call, DeepSeek's thinking and effort controls, and the text a forced `tool_choice` puts in the reply.
+//! This file holds what the dialects share at the seam: which dialect a model directory is, the parser enum the
+//! handlers call, dialect-specific thinking and effort controls, and the text a forced `tool_choice` puts in the reply.
 
 use std::path::Path;
 
@@ -12,6 +15,7 @@ use serde_json::{Map, Value};
 
 use crate::api::ApiError;
 use crate::dsparser::DsParser;
+use crate::hfparser::HfParser;
 use crate::parser::{Delta, FullParse, GlmParser};
 use crate::pyjson;
 use crate::sampling::Limit;
@@ -21,6 +25,7 @@ use crate::thinking::{self, Thinking};
 pub enum Dialect {
     Glm,
     Ds41,
+    Hf,
 }
 
 impl Dialect {
@@ -28,33 +33,49 @@ impl Dialect {
         match self {
             Dialect::Glm => "glm",
             Dialect::Ds41 => "ds41",
+            Dialect::Hf => "hf",
         }
     }
 
-    /// `--dialect`: `glm`, `ds41`, or `auto` (None: look at the model directory).
+    /// `--dialect`: `glm`, `ds41`, `hf`, or `auto` (None: look at the model directory).
     pub fn parse_flag(s: &str) -> Result<Option<Dialect>, String> {
         match s {
             "glm" => Ok(Some(Dialect::Glm)),
             "ds41" => Ok(Some(Dialect::Ds41)),
+            "hf" => Ok(Some(Dialect::Hf)),
             "auto" => Ok(None),
-            other => Err(format!("--dialect {other}: want glm, ds41 or auto")),
+            other => Err(format!("--dialect {other}: want glm, ds41, hf or auto")),
         }
     }
 
-    /// A model directory whose `config.json` names a DeepseekV4 architecture, or whose tokenizer has the `｜DSML｜` token
-    /// (the 1017 release's `config.json` is the inference layout and names no architecture), is DeepSeek; any other is GLM.
+    /// Auto-detect the dialect from `config.json` and the tokenizer:
+    /// - `DeepseekV4` in `architectures[0]` or the `｜DSML｜` token -> `Ds41` (the 1017 release's `config.json` is the
+    ///   inference layout and names no architecture);
+    /// - missing `config.json`, missing/empty `architectures[0]`, or a `Glm` / `ChatGLM` prefix -> `Glm`;
+    /// - any other non-empty `architectures[0]` (e.g. `Qwen3ForCausalLM`, `LlamaForCausalLM`) -> `Hf`.
     pub fn detect(dir: &Path, tokenizer_has_dsml: bool) -> Dialect {
-        let arch_is_ds = std::fs::read(dir.join("config.json"))
+        let arch = std::fs::read(dir.join("config.json"))
             .ok()
             .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .and_then(|c| c.get("architectures")?.as_array()?.first()?.as_str().map(|a| a.contains("DeepseekV4")))
-            .unwrap_or(false);
-        if arch_is_ds || tokenizer_has_dsml {
-            Dialect::Ds41
-        } else {
-            Dialect::Glm
+            .and_then(|c| c.get("architectures")?.as_array()?.first()?.as_str().map(str::to_string));
+        if tokenizer_has_dsml || arch.as_deref().is_some_and(|a| a.contains("DeepseekV4")) {
+            return Dialect::Ds41;
+        }
+        match arch.as_deref() {
+            Some(a) if !a.is_empty() && !is_glm_arch(a) => Dialect::Hf,
+            _ => Dialect::Glm,
         }
     }
+}
+
+fn is_glm_arch(arch: &str) -> bool {
+    let lower = arch.to_ascii_lowercase();
+    lower.starts_with("glm") || lower.starts_with("chatglm")
+}
+
+/// Default `--served-model-name` for `--dialect hf`: the basename of `--model-dir`, or `"hf-model"` when empty.
+pub fn hf_served_name(dir: &Path) -> String {
+    dir.file_name().and_then(|n| n.to_str()).filter(|n| !n.is_empty()).unwrap_or("hf-model").to_string()
 }
 
 // ---- the parser the handlers hold ------------------------------------------------------------------------------------
@@ -62,6 +83,7 @@ impl Dialect {
 pub enum AnyParser {
     Glm(GlmParser),
     Ds(DsParser),
+    Hf(HfParser),
 }
 
 impl AnyParser {
@@ -69,24 +91,36 @@ impl AnyParser {
         match d {
             Dialect::Glm => AnyParser::Glm(GlmParser::new(tools, tool_choice, include_reasoning)),
             Dialect::Ds41 => AnyParser::Ds(DsParser::new(tools, tool_choice, include_reasoning)),
+            Dialect::Hf => AnyParser::Hf(HfParser::new(tools, tool_choice, include_reasoning)),
         }
     }
 
     /// `--undeclared-tool-calls emit` (the default): a call to a tool the request did not declare comes back as a
-    /// tool call. GLM emits it at the end of the reply (so prose can still disprove it); DSML emits an invoke the moment
-    /// its closer arrives, since the closer is unambiguous.
+    /// tool call. GLM emits it at the end of the reply (so prose can still disprove it); DSML and HF emit a call once
+    /// its closer arrives.
     pub fn emit_undeclared(self, on: bool) -> AnyParser {
         match self {
             AnyParser::Glm(p) => AnyParser::Glm(p.emit_undeclared(on)),
             AnyParser::Ds(p) => AnyParser::Ds(p.emit_undeclared(on)),
+            AnyParser::Hf(p) => AnyParser::Hf(p.emit_undeclared(on)),
         }
     }
 
-    /// The reply starts as the answer: the prompt closed the think block.
+    /// The reply starts as the answer: the prompt closed the think block (or thinking was turned off).
     pub fn content_first(self) -> AnyParser {
         match self {
             AnyParser::Glm(p) => AnyParser::Glm(p.content_first()),
             AnyParser::Ds(p) => AnyParser::Ds(p.content_first()),
+            AnyParser::Hf(p) => AnyParser::Hf(p.content_first()),
+        }
+    }
+
+    /// The prompt left `<think>` open: for `Hf`, start inside reasoning up to `</think>` (`Glm` and `Ds` already start
+    /// in reasoning by default).
+    pub fn in_think(self) -> AnyParser {
+        match self {
+            AnyParser::Hf(p) => AnyParser::Hf(p.in_think()),
+            p => p,
         }
     }
 
@@ -94,11 +128,12 @@ impl AnyParser {
         match self {
             AnyParser::Glm(p) => p.delta(text, finished),
             AnyParser::Ds(p) => p.delta(text, finished),
+            AnyParser::Hf(p) => p.delta(text, finished),
         }
     }
 
-    /// The repeated-tool-call guard's held names (guard.rs). GLM only: the DSML parser ends the reply at a call's
-    /// closer and streams it, so it has no held run to take back.
+    /// The repeated-tool-call guard's held names (guard.rs). GLM only: the DSML and HF parsers stream closed calls and
+    /// have no held run to take back.
     pub fn guard_names(self, names: Vec<String>) -> AnyParser {
         match self {
             AnyParser::Glm(p) => AnyParser::Glm(p.guard_names(names)),
@@ -109,7 +144,7 @@ impl AnyParser {
     pub fn glm_mut(&mut self) -> Option<&mut GlmParser> {
         match self {
             AnyParser::Glm(p) => Some(p),
-            AnyParser::Ds(_) => None,
+            AnyParser::Ds(_) | AnyParser::Hf(_) => None,
         }
     }
 
@@ -117,6 +152,7 @@ impl AnyParser {
         match self {
             AnyParser::Glm(p) => p.parse_full(text),
             AnyParser::Ds(p) => p.parse_full(text),
+            AnyParser::Hf(p) => p.parse_full(text),
         }
     }
 
@@ -124,6 +160,7 @@ impl AnyParser {
         match self {
             AnyParser::Glm(p) => p.include_reasoning,
             AnyParser::Ds(p) => p.include_reasoning,
+            AnyParser::Hf(p) => p.include_reasoning,
         }
     }
 
@@ -131,7 +168,7 @@ impl AnyParser {
     /// closer to stop on; the model sometimes goes on writing after it (the 10,559-line `</function>` runaway).
     pub fn call_closed(&self) -> bool {
         match self {
-            AnyParser::Glm(_) => false,
+            AnyParser::Glm(_) | AnyParser::Hf(_) => false,
             AnyParser::Ds(p) => p.call_closed(),
         }
     }
@@ -326,6 +363,80 @@ pub fn ds_forced_text(name: Option<&str>) -> String {
     }
 }
 
+// ---- generic HuggingFace thinking and forced tool_choice ------------------------------------------------------------
+
+/// Generic HuggingFace thinking controls (`--dialect hf`), with native thinking-off support (no `--allow-thinking-off`
+/// required):
+/// * `chat_template_kwargs.enable_thinking` and `thinking` are aliases (`enable_thinking` wins when both are set);
+/// * `reasoning_effort` at top level, else in `chat_template_kwargs`: `none` turns thinking off unless the switch says
+///   on; other valid levels map to the nearest level named in the template (`thinking::nearest`);
+/// * `thinking_budget` follows `thinking::parse_budget`.
+///
+/// Returns `(Thinking, Option<bool>)`, where the second element is the resolved `enable_thinking` value to write into
+/// template kwargs when a switch or `off` state was requested (`None` leaves the template's own default untouched).
+pub fn resolve_hf(
+    body: &Map<String, Value>,
+    levels: &[&'static str],
+    defaults: thinking::Defaults,
+) -> Result<(Thinking, Option<bool>), ApiError> {
+    let kw = body.get("chat_template_kwargs").and_then(Value::as_object);
+    let e = non_null(kw, "enable_thinking").map(|v| pyjson::truthy(Some(v)));
+    let t = non_null(kw, "thinking").map(|v| pyjson::truthy(Some(v)));
+    let switch = e.or(t);
+    let explicit = match non_null(Some(body), "reasoning_effort").or_else(|| non_null(kw, "reasoning_effort")) {
+        None => None,
+        Some(v) => match v.as_str().and_then(|s| thinking::EFFORTS.iter().find(|x| **x == s)) {
+            Some(x) => Some(*x),
+            None => {
+                return Err(ApiError::bad(
+                    "reasoning_effort must be none, minimal, low, medium, high, xhigh or max",
+                    Some("reasoning_effort"),
+                ))
+            }
+        },
+    };
+    let off = match switch {
+        Some(s) => !s,
+        None => explicit == Some("none"),
+    };
+    if off {
+        return Ok((
+            Thinking { effort: None, budget: Limit::Tokens(0), budget_explicit: false, off: true },
+            Some(false),
+        ));
+    }
+    let explicit = if explicit == Some("none") { None } else { explicit };
+    let effort = explicit.or(defaults.effort).map(|x| thinking::nearest(x, levels));
+    let (budget, budget_explicit) = match thinking::parse_budget(body.get("thinking_budget"))? {
+        None | Some(0) => (defaults.budget, false),
+        Some(n) if n < 0 => (Limit::Tokens(0), false),
+        Some(n) => (Limit::Tokens(n as u64), true),
+    };
+    Ok((Thinking { effort, budget, budget_explicit, off: false }, switch))
+}
+
+/// Close an unclosed generation-prompt `<think>` block when thinking was turned off on `--dialect hf` and the template
+/// itself did not close it.
+pub fn hf_thinking_off(mut text: String, add_generation_prompt: bool) -> String {
+    if add_generation_prompt && pyjson::py_rstrip(&text).ends_with("<think>") {
+        text.push_str("</think>\n\n");
+    }
+    text
+}
+
+/// What a forced `tool_choice` puts at the start of the reply on `--dialect hf`: a standard JSON `<tool_call>` block.
+pub fn hf_forced_text(name: Option<&str>) -> String {
+    match name {
+        Some(n) => {
+            let mut q = Vec::with_capacity(n.len() + 2);
+            pyjson::string(&mut q, n);
+            let q = String::from_utf8(q).unwrap();
+            format!("<tool_call>\n{{\"name\": {q}, \"arguments\": ")
+        }
+        None => "<tool_call>\n{\"name\": \"".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,7 +610,113 @@ mod tests {
     fn the_flag_parses() {
         assert_eq!(Dialect::parse_flag("ds41"), Ok(Some(Dialect::Ds41)));
         assert_eq!(Dialect::parse_flag("glm"), Ok(Some(Dialect::Glm)));
+        assert_eq!(Dialect::parse_flag("hf"), Ok(Some(Dialect::Hf)));
         assert_eq!(Dialect::parse_flag("auto"), Ok(None));
         assert!(Dialect::parse_flag("qwen").is_err());
+        assert_eq!((Dialect::Glm.name(), Dialect::Ds41.name(), Dialect::Hf.name()), ("glm", "ds41", "hf"));
+    }
+
+    #[test]
+    fn detect_handles_glm_deepseek_missing_and_hf_architectures() {
+        let dir = std::env::temp_dir().join(format!("g6front-dialect-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Missing config.json -> stays Glm
+        assert_eq!(Dialect::detect(&dir, false), Dialect::Glm);
+        // Missing config.json + DSML token -> Ds41
+        assert_eq!(Dialect::detect(&dir, true), Dialect::Ds41);
+
+        let check = |cfg: Value, has_dsml: bool, want: Dialect| {
+            std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+            assert_eq!(Dialect::detect(&dir, has_dsml), want, "cfg={cfg}");
+        };
+
+        // Empty / missing / empty-array / empty-string architectures -> stays Glm
+        check(json!({}), false, Dialect::Glm);
+        check(json!({"architectures": []}), false, Dialect::Glm);
+        check(json!({"architectures": [""]}), false, Dialect::Glm);
+
+        // GLM / ChatGLM architectures (case-insensitive) -> Glm
+        check(json!({"architectures": ["GlmMoeDsaForCausalLM"]}), false, Dialect::Glm);
+        check(json!({"architectures": ["Glm4ForCausalLM"]}), false, Dialect::Glm);
+        check(json!({"architectures": ["ChatGLMModel"]}), false, Dialect::Glm);
+        check(json!({"architectures": ["glm5_next"]}), false, Dialect::Glm);
+
+        // DeepSeekV4 -> Ds41
+        check(json!({"architectures": ["DeepseekV41ForCausalLM"]}), false, Dialect::Ds41);
+
+        // Generic HuggingFace architectures -> Hf
+        check(json!({"architectures": ["Qwen3ForCausalLM"]}), false, Dialect::Hf);
+        check(json!({"architectures": ["Qwen2ForCausalLM"]}), false, Dialect::Hf);
+        check(json!({"architectures": ["LlamaForCausalLM"]}), false, Dialect::Hf);
+        check(json!({"architectures": ["MistralForCausalLM"]}), false, Dialect::Hf);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hf_served_name_uses_directory_basename_or_fallback() {
+        assert_eq!(hf_served_name(Path::new("/models/Qwen3-8B")), "Qwen3-8B");
+        assert_eq!(hf_served_name(Path::new("/models/Llama-3.1-8B-Instruct/")), "Llama-3.1-8B-Instruct");
+        assert_eq!(hf_served_name(Path::new("")), "hf-model");
+        assert_eq!(hf_served_name(Path::new("/")), "hf-model");
+        assert_eq!(hf_served_name(Path::new(".")), "hf-model");
+    }
+
+    #[test]
+    fn resolve_hf_supports_native_thinking_off_efforts_and_budgets() {
+        let levels = ["high", "medium", "low"];
+        let d = thinking::Defaults { effort: None, budget: Limit::Tokens(256), allow_off: true };
+        let r = |v: Value| resolve_hf(&body(v), &levels, d);
+
+        // Unset: leaves template's own default untouched (None switch)
+        let (th, sw) = r(json!({})).unwrap();
+        assert!(!th.off);
+        assert_eq!((th.effort, th.budget, sw), (None, Limit::Tokens(256), None));
+
+        // enable_thinking / thinking switches work without requiring --allow-thinking-off
+        for kw in [json!({"enable_thinking": false}), json!({"thinking": false})] {
+            let (th, sw) =
+                resolve_hf(&body(json!({"chat_template_kwargs": kw})), &levels, thinking::Defaults::default()).unwrap();
+            assert!(th.off);
+            assert_eq!(sw, Some(false));
+        }
+        let (th, sw) = r(json!({"chat_template_kwargs": {"thinking": true}})).unwrap();
+        assert!(!th.off);
+        assert_eq!(sw, Some(true));
+
+        // reasoning_effort: "none" turns thinking off unless switch is explicitly true
+        let (th, sw) = r(json!({"reasoning_effort": "none"})).unwrap();
+        assert!(th.off);
+        assert_eq!(sw, Some(false));
+        let (th, sw) =
+            r(json!({"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": true}})).unwrap();
+        assert!(!th.off);
+        assert_eq!((th.effort, sw), (None, Some(true)));
+
+        // Named effort maps to nearest template level; invalid effort returns 400
+        let (th, _) = r(json!({"reasoning_effort": "max"})).unwrap();
+        assert_eq!(th.effort, Some("high"));
+        assert_eq!(r(json!({"reasoning_effort": "bogus"})).unwrap_err().status, 400);
+    }
+
+    #[test]
+    fn hf_thinking_off_and_forced_text() {
+        assert_eq!(
+            hf_thinking_off("<|im_start|>assistant\n<think>".into(), true),
+            "<|im_start|>assistant\n<think></think>\n\n"
+        );
+        assert_eq!(
+            hf_thinking_off("<|im_start|>assistant\n<think>\n".into(), true),
+            "<|im_start|>assistant\n<think>\n</think>\n\n"
+        );
+        assert_eq!(
+            hf_thinking_off("<|im_start|>assistant\n<think>\n\n</think>\n\n".into(), true),
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        assert_eq!(hf_thinking_off("<|im_start|>assistant\n<think>".into(), false), "<|im_start|>assistant\n<think>");
+        assert_eq!(hf_forced_text(Some("foo")), "<tool_call>\n{\"name\": \"foo\", \"arguments\": ");
+        assert_eq!(hf_forced_text(None), "<tool_call>\n{\"name\": \"");
     }
 }
