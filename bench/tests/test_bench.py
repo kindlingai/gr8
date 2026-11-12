@@ -523,6 +523,37 @@ class Gif(unittest.TestCase):
         self.assertEqual([r[0] for r in rows], ['title', 'section', 'bar'])
         self.assertEqual(rows[2][1:5], ('code', 50.0, 50.0, '50.0'))
 
+    def test_card_rows_show_max_tokens_per_active_chat(self):
+        sys.path.insert(0, str(GIF.parent))
+        import gif
+        config = {'id': 'tp4', 'max_context': 513522, 'kv_pool_tokens': 513536, 'max_concurrent': 8,
+                  'max_tokens_per_chat': [{'chats': 1, 'tokens': 513522, 'source': 'measured'},
+                                          {'chats': 2, 'tokens': 207602, 'source': 'computed'},
+                                          {'chats': 4, 'tokens': 54514, 'source': 'computed'},
+                                          {'chats': 8, 'tokens': 19058, 'source': 'computed'}],
+                  'quality': [{'name': 'Needle recall', 'value': 'found at 128K'}]}
+        expected = ('Max tokens per active chat: 1 chat 513,522 (measured) · 2 chats 207,602 (computed)'
+                    ' · 4 chats 54,514 (computed) · 8 chats 19,058 (computed)')
+        rows = gif.card_rows({'title': 'M'}, config)
+        self.assertIn(('section', 'Limits'), rows)
+        self.assertNotIn(('section', 'Quality'), rows)
+        self.assertIn(('text', 'muted', 'max context 513,522 · KV pool 513,536 · max concurrent 8'), rows)
+        self.assertIn(('text', 'text', expected), rows)
+        self.assertIn(('text', 'text', 'Needle recall: found at 128K'), rows)
+        for note in (None, 'Shared KV pool (computed)'):
+            with self.subTest(note=note):
+                if note is not None:
+                    config['max_tokens_per_chat_note'] = note
+                rows = gif.card_rows({'title': 'M'}, config)
+                text = expected + (' · ' + note if note else '')
+                self.assertIn(('text', 'text', text), rows)
+                wrapped = [r[2] for r in gif.fit(rows, 89) if r[0] == 'text']
+                self.assertTrue(all(len(line) <= 89 for line in wrapped))
+                for part in text.split(' · '):
+                    self.assertTrue(any(part in line for line in wrapped), part)
+                self.assertEqual(sum(line.count('(measured)') for line in wrapped), 1)
+                self.assertEqual(sum(line.count('(computed)') for line in wrapped), 3 + bool(note))
+
     def test_card_rows_show_first_token_and_prompt_lengths(self):
         sys.path.insert(0, str(GIF.parent))
         import gif

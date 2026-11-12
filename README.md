@@ -13,8 +13,7 @@ concurrent requests), with INT4 fast paths, folded Hadamard weights, tensor-core
 see [KV4.md](docs/KV4.md). GLM-5.3-Flash at TP=2 with `KV_FORMAT=int4` defaults to `SESS=4` (max concurrent 4) and,
 when `SESS >= 2`, `MTP=3`, `S2_SHARED_WATERFILL=1` and `S2_SHARED_WF_MARGIN=0.02`; `--s2-shared-waterfill 0` rolls
 back to uniform shared rows and `MTP=1`, and `--sess 1` restores the single-session launch; see
-[FLASH.md](docs/FLASH.md). Other model/topology defaults are unchanged. The model cards below retain their earlier
-measured configurations.
+[FLASH.md](docs/FLASH.md). Other model/topology defaults are unchanged.
 
 ### Switch between the models
 
@@ -52,8 +51,9 @@ pool · one `docker run`
 
 [![GLM-5.3-Flash on two GB10s: decode, prefill and concurrency](docs/cards/glm-5.3-flash-exlr8-2x-spark.png)](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark)
 
-74.5 tok/s for one request writing code · 1,675 tok/s prefill on an 8K prompt · 8 requests at once from a
-2,097,152-token KV pool · the same image on both boxes
+76.5 tok/s for one request writing code · 1,670 tok/s prefill on an 8K prompt · 4 requests at once (`SESS=4`; 8 with
+`TUNE=context`) from a 2,097,152-token KV pool (max tokens per active chat: 262,144 at 1 measured, 262,144 at 2 and 4
+computed; 233,458 at 8 with `TUNE=context`, computed) · the same image on both boxes
 
 **[Recipe](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark)** · [Model page](docs/FLASH.md)
 
@@ -61,9 +61,12 @@ pool · one `docker run`
 
 [![GLM-5.3 on four DGX Sparks: decode, prefill and concurrency](docs/cards/glm-5.3-4x-spark.png)](docs/GLM-5.3.md)
 
-63.2 tok/s for one request writing code (48-54-token prompts) · 1,513 tok/s prefill on a 32K prompt · 8 requests at
-once, 85.4 tok/s in total · a fact hidden in a 128K prompt found · one boot, measured 2026-11-10 · no recipe yet:
-start it on three to six boxes with Docker Compose, from the [Models and install](#models-and-install) table.
+63.3 tok/s for one request writing code (46-54-token prompts) · 1,540 tok/s prefill on a 32K prompt · 8 requests at
+once (`SESS=8`), 85.8 tok/s in total · int4 KV default: 513,536-token KV pool, max tokens per active chat (prompt +
+max_tokens) 513,522 at 1 (measured) and 207,602 / 54,514 / 19,058 at 2 / 4 / 8 (computed; 2-chat prompt limit
+measured: 199,410 with max_tokens omitted, 174,834 at max_tokens=32,768) · a fact hidden in a 128K prompt found ·
+one boot, measured 2026-11-11 · no recipe yet: start it on three to six boxes with Docker Compose, from the
+[Models and install](#models-and-install) table.
 
 [Model page](docs/GLM-5.3.md)
 
@@ -71,10 +74,12 @@ start it on three to six boxes with Docker Compose, from the [Models and install
 
 [![DeepSeek-V4.1-Flash on four GB10s in fast mode: decode, prefill and concurrency](docs/cards/deepseek-v4.1-flash-exlr8-4x-spark.png)](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)
 
-One request: 83-86 tok/s on prose and 143-144 tok/s on code (65-72-token prompts) · 7,835 tok/s prefill on a 32K prompt
-· 249.2 tok/s in total for 16 requests at once, first token median 2.48 s · fast mode by default (`TUNE=speed`), so the
-output is not identical to the exact model's; `TUNE=quality` gives the exact model's output · the recipe's image on four
-boxes: first boot (cold disk) 212.7 s, a switch from GLM-5.3 after that 37-39 s (release 1 image)
+One request: 83.9 tok/s on prose and 137.5 tok/s on code (65-71-token prompts) · 7,720 tok/s prefill on a 32K prompt
+(8,408 tok/s at 128K, 8,344 tok/s at 256K) · 238.7 tok/s in total for 16 requests at once, first token median 2.56 s
+(32 max concurrent; 10,485,760-token KV pool across 32 dedicated 327,680-token slabs, max tokens per active chat
+327,670 at 1 measured and at 2 / 4 / 8 / 16 / 32 computed) · fast mode by default (`TUNE=speed`), so the output is not
+identical to the exact model's; `TUNE=quality` gives the exact model's output · the recipe's image on four boxes: first
+boot (cold disk) 212.7 s, a switch from GLM-5.3 after that 37-39 s (release 1 image)
 
 **[Recipe](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)** · [Model page](docs/DEEPSEEK.md)
 
