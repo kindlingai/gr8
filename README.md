@@ -59,16 +59,15 @@ computed; 233,458 at 8 with `TUNE=context`, computed) · the same image on both 
 
 ### GLM-5.3 on 4 Sparks
 
-[![GLM-5.3 on four DGX Sparks: decode, prefill and concurrency](docs/cards/glm-5.3-4x-spark.png)](docs/GLM-5.3.md)
+[![GLM-5.3 on four DGX Sparks: decode, prefill and concurrency](docs/cards/glm-5.3-exlr8-4x-spark.png)](https://github.com/kindlingai/glm-5.3-exlr8-4x-spark)
 
 63.3 tok/s for one request writing code (46-54-token prompts) · 1,540 tok/s prefill on a 32K prompt · 8 requests at
 once (`SESS=8`), 85.8 tok/s in total · int4 KV default: 513,536-token KV pool, max tokens per active chat (prompt +
 max_tokens) 513,522 at 1 (measured) and 207,602 / 54,514 / 19,058 at 2 / 4 / 8 (computed; 2-chat prompt limit
 measured: 199,410 with max_tokens omitted, 174,834 at max_tokens=32,768) · a fact hidden in a 128K prompt found ·
-one boot, measured 2026-11-11 · no recipe yet: start it on three to six boxes with Docker Compose, from the
-[Models and install](#models-and-install) table.
+one boot, measured 2026-11-11 · the same recipe serves three to six boxes.
 
-[Model page](docs/GLM-5.3.md)
+**[Recipe](https://github.com/kindlingai/glm-5.3-exlr8-4x-spark)** · [Model page](docs/GLM-5.3.md)
 
 ### DeepSeek-V4.1-Flash on 4 Sparks
 
@@ -83,9 +82,22 @@ boot (cold disk) 212.7 s, a switch from GLM-5.3 after that 37-39 s (release 1 im
 
 **[Recipe](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)** · [Model page](docs/DEEPSEEK.md)
 
-<sub>Each card is drawn by `bench/gif.py card` from the recipe's `kindling.json`, and the GLM-5.3 card from
-[docs/cards/glm-5.3-4x-spark.json](docs/cards/glm-5.3-4x-spark.json) ([docs/cards/make.sh](docs/cards/make.sh)
-redraws them). The model pages give each benchmark and its date.</sub>
+<sub>Each card is drawn by `bench/gif.py card` from the recipe's `kindling.json` ([docs/cards/make.sh](docs/cards/make.sh)
+redraws them from the list in [recipes.json](recipes.json)). The model pages give each benchmark and its date.</sub>
+
+### All recipes
+
+A recipe is its own repository: a `.env` file, a Compose file and measured results, pinned to one gr8 image. gr8 holds
+the engine only.
+
+| Model | Boxes | Recipe |
+|---|---|---|
+| GLM-5.3-Flash | 1 | [glm-5.3-flash-exlr8-1x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark) |
+| GLM-5.3-Flash | 2 | [glm-5.3-flash-exlr8-2x-spark](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark) |
+| DeepSeek-V4.1-Flash | 4 | [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark) |
+| GLM-5.3 | 4 (3 to 6) | [glm-5.3-exlr8-4x-spark](https://github.com/kindlingai/glm-5.3-exlr8-4x-spark) |
+| GLM-5.3, 737K context (T5X) | 5 | [glm-5.3-exlr8-5x-spark](https://github.com/kindlingai/glm-5.3-exlr8-5x-spark) |
+| GLM-5.3, 1M context (K3) | 6 | [glm-5.3-exlr8-6x-spark](https://github.com/kindlingai/glm-5.3-exlr8-6x-spark) |
 
 ## What gr8 does today
 

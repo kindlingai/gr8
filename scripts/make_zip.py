@@ -32,7 +32,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # tests, and tools/convert imports engine/ref/g6ref.py. A tester can rebuild from the zip with the README's own commands.
 SHIP = {'README.md', 'LICENSE', 'KNOWN-ISSUES.md', 'PROTOCOL.md', 'RELEASING.md', 'bench', 'config', 'docs', 'engine',
         'frontend', 'scripts', 'tools', 'Dockerfile', '.dockerignore', 'docker', 'deploy', 'gr8', 'KNOBS.md', 'AGENTS.md',
-        'model.yaml', 'kindling.json', 'smoketest', 'CREDITS.md', 'recipes', 'knobs', 'rust-toolchain.toml'}
+        'model.yaml', 'recipes.json', 'smoketest', 'CREDITS.md', 'knobs', 'rust-toolchain.toml'}
 # Not shipped: repo plumbing.
 SKIP = {'.github', '.gitignore'}
 

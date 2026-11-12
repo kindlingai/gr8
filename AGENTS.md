@@ -105,13 +105,6 @@ Run `main` once on the same boxes with the same options and keep its JSON report
 `--health` keeps the rank health probe's result for this boot in the report: run `scripts/rank_health.sh` with
 `./gr8`'s options before `./gr8 glm53 up` (the probe refuses a box with a model booted).
 
-## kindling.json
-
-`kindling.json` is GLM-5.3's results table ([docs/GLM-5.3.md](docs/GLM-5.3.md#results)) in a form a program can
-read. When a PR changes the table, it changes `kindling.json` in the same PR, with the same numbers and rounding.
-Leave out a number that wasn't measured; don't write 0 or an estimate. Check it parses:
-`python3 -m json.tool kindling.json`.
-
 ## Things worth knowing
 
 - If a rank dies, the whole engine stops. `./gr8 glm53 status` names the rank and its last log line.

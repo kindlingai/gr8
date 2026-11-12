@@ -17,7 +17,6 @@ area:launch:
           - 'tools/launch/**'
           - 'smoketest/**'
           - 'config/**'
-          - 'recipes/**'
           - 'model.yaml'
           - 'KNOBS.md'
           - 'scripts/engine_args.sh'
@@ -36,7 +35,7 @@ area:tools:
 
 area:bench:
   - changed-files:
-      - any-glob-to-any-file: ['bench/**', 'kindling.json']
+      - any-glob-to-any-file: ['bench/**']
 
 # the container image and Kubernetes
 area:deploy:

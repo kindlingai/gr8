@@ -7,7 +7,7 @@
     outside tests. The knobs crate itself is the one exception. Read a setting through its knob: knob::name() in C++,
     gr8knobs::NAME.get() in Rust, or its id (gr8_knob_ids.rs, knob_ids::NAME or kid::NAME) through the C API.
   - every knob the engine, its tests or the front end should read (scope agree, local or test) is read somewhere.
-  - every G6_ or GR8_ assignment in the launcher (scripts/engine_args.sh) and the recipes (recipes/**/*.env) is one the
+  - every G6_ or GR8_ assignment in the launcher (scripts/engine_args.sh) is one the
     engine accepts (`knobs validate`).
   - gr8_knobs.h and docs/ENV.md are what `knobs gen` writes (`knobs check`).
 
@@ -121,10 +121,10 @@ def unread(paths, table):
 
 
 def assignments(paths):
-    """(file, NAME=VALUE) for each literal G6_/GR8_ assignment outside comments in the launcher and the recipes."""
+    """(file, NAME=VALUE) for each literal G6_/GR8_ assignment outside comments in the launcher."""
     out = []
     for f in paths:
-        if f != 'scripts/engine_args.sh' and not (f.startswith('recipes/') and f.endswith('.env')):
+        if f != 'scripts/engine_args.sh':
             continue
         for line in open(os.path.join(REPO, f)):
             line = line.split('#', 1)[0]
