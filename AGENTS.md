@@ -36,6 +36,44 @@ commit SHA by submodule or `ghcr.io/kindlingai/gr8` `@sha256:<digest>` (never a 
 column; a tuned recipe that gets slower on a candidate `stable` commit or `v*` tag does not block it and simply keeps
 its prior pin until re-tuned. Full rules: [RELEASING.md](RELEASING.md).
 
+## Keeping docs and recipes current
+
+Update the matching items in the same PR as a change (or during each `v*` release cycle):
+
+- [ ] **README features in plain language:** When a user-visible capability, default, or workflow lands or changes,
+      update [README.md](README.md) ([What gr8 does today](README.md#what-gr8-does-today),
+      [Models and install](README.md#models-and-install), [Running it](README.md#running-it)) with a short, easy
+      explanation and any rollback flag.
+- [ ] **Instructions for agents building on gr8:** Keep [README.md](README.md#building-on-gr8) (including the current
+      `v*` release and digest example), [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md), [docs/DEPLOY.md](docs/DEPLOY.md),
+      [frontend/README.md](frontend/README.md), and [RELEASING.md](RELEASING.md) accurate whenever flags, endpoints,
+      container paths, or pinning rules change.
+- [ ] **Recipe graphics as recipes improve:** When a recipe's measured numbers or `kindling.json` improve, redraw its
+      speed card (`python3 bench/gif.py card <recipe>/kindling.json --out <recipe>/docs/card.png` from a `gr8` checkout,
+      and [`docs/cards/make.sh`](docs/cards/make.sh) from [`recipes.json`](recipes.json) for `gr8`'s README cards, plus
+      [`docs/cards/switch_card.py`](docs/cards/switch_card.py) from `docs/cards/switching.json` when model-switching
+      times change).
+- [ ] **Release notes on every release:** Publish a GitHub Release for every `v*` tag with highlights and measured
+      numbers, `Breaking changes`, default or cache-key changes, image digest, and toolchain/Dockerfile sync notes
+      ([RELEASING.md](RELEASING.md#required-github-release-sections)).
+- [ ] **Recipe table links and dates:** Keep [`recipes.json`](recipes.json) and the
+      [README.md](README.md#all-recipes) recipe section current — repository links, measurement dates, and each recipe's
+      pinned engine freshness against the newest release and `stable`.
+- [ ] **Recipe pins bumped to the newest release:** After each `v*` tag, test the standalone recipes against the new
+      release and open pin-bump PRs where correctness and speed hold, leaving any recipe that measures slower on its
+      prior pin until re-tuned ([RELEASING.md](RELEASING.md#4-how-recipes-pin-gr8)).
+- [ ] **Model pages' benchmark numbers with dates:** Keep [docs/GLM-5.3.md](docs/GLM-5.3.md),
+      [docs/FLASH.md](docs/FLASH.md), [docs/DEEPSEEK.md](docs/DEEPSEEK.md), and [docs/SWITCHING.md](docs/SWITCHING.md)
+      aligned with measured numbers, exact boot conditions, and measurement dates (`YYYY-MM-DD`).
+- [ ] **KNOBS.md and KNOWN-ISSUES.md:** Update [KNOBS.md](KNOBS.md) (and [docs/ENV.md](docs/ENV.md) or
+      [docs/SETTINGS.md](docs/SETTINGS.md) when engine settings change) whenever options or how they combine change, and
+      add or close entries in [KNOWN-ISSUES.md](KNOWN-ISSUES.md) as bugs are found or fixed.
+- [ ] **Breaking-change list:** Call out any breaking change (CLI/knobs, HTTP API/protocol, weights/steering schema, or
+      128 GB GB10 runtime/numerical contract) with exact before/after migration steps in the PR and in the release's
+      `Breaking changes` section ([RELEASING.md](RELEASING.md#3-breaking-changes-and-release-notes)).
+- [ ] **CREDITS.md:** Add or extend contributor entries in [CREDITS.md](CREDITS.md) and keep
+      [README.md](README.md#credits) in sync whenever contributions land ([Contributor credit](#contributor-credit)).
+
 ## Contributor credit
 
 External contributors should add their GitHub username to [CREDITS.md](CREDITS.md) in their contribution PR, with a

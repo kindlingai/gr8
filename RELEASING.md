@@ -120,8 +120,9 @@ Every tagged release has a matching GitHub Release with four short sections:
 
 1. Confirm the candidate commit is on `stable` (having already passed CI on `main` and the Level-2 nightly gate) and has
    passed the Level-3 full harness gate across the supported `TP=N` model configurations.
-2. Confirm `README.md`, model pages (`docs/GLM-5.3.md`, `docs/FLASH.md`, `docs/DEEPSEEK.md`), `CREDITS.md`, and any root
-   card or recipe manifest (`kindling.json` / `recipes.json`) match on `stable`. (Pushes to `main` that touch only
+2. Walk the keep-current checklist in [AGENTS.md](AGENTS.md#keeping-docs-and-recipes-current) so `README.md`, model
+   pages (`docs/GLM-5.3.md`, `docs/FLASH.md`, `docs/DEEPSEEK.md`, `docs/SWITCHING.md`), `KNOBS.md`, `KNOWN-ISSUES.md`,
+   `CREDITS.md`, `recipes.json`, and `docs/cards/` graphics match on `stable`. (Pushes to `main` that touch only
    `**.md` skip `ci` via `paths-ignore`, whereas pushing the `v*` tag always runs the full `ci` build.)
 3. Create and push an annotated tag on the verified `stable` commit:
    ```bash
@@ -129,8 +130,9 @@ Every tagged release has a matching GitHub Release with four short sections:
    git tag -a v1.1.0 -m "gr8 v1.1.0"
    git push origin v1.1.0
    ```
-4. Wait for the tag's `ci` workflow run to publish `ghcr.io/kindlingai/gr8:<tag>`, then publish the GitHub Release on
-   `<tag>` with the four sections above and the image's `sha256` digest.
+4. Wait for the tag's `ci` workflow run to publish `ghcr.io/kindlingai/gr8:<tag>`, publish the GitHub Release on `<tag>`
+   with the four sections above and the image's `sha256` digest, and update the current release and pin example in
+   [README.md](README.md#building-on-gr8) on `main`.
 5. Check the blessed standalone recipes against `<tag>`: open pin-bump pull requests for the recipes whose correctness
    and speed hold, and leave any recipe that measures slower on its prior pin (reflected in `README.md`'s recipe
    freshness column) until re-tuned.
