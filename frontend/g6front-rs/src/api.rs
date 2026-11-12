@@ -448,6 +448,8 @@ struct ChatReq {
     params: sampling::Params,
     /// the thinking budget in reply tokens; 0: none
     budget: u64,
+    /// the loop guard (the request's `loop_guard`, else the server's)
+    loop_guard: Option<crate::loopguard::Spec>,
     /// the validated response_format ('text' enforces nothing)
     rf: jsonmode::Rf,
 }
@@ -572,6 +574,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     if choice.is_forced() && !st.engine.inserts() {
         return Err(ApiError::bad("the engine does not support a forced tool_choice", Some("tool_choice")));
     }
+    let loop_guard = loop_guard_spec(st, body, params.gen.logprobs.is_some(), choice.is_forced())?;
     check_penalties(st, &prompt, &mut params.gen)?;
     // The template leaves `<think>` open at the end of a chat prompt, so the reply's first token sits in the reasoning
     // span: the forced opener has to follow the close, or the call it opens is reasoning and the parser reads prose.
@@ -606,7 +609,42 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         }
         params.gen.images = std::sync::Arc::new(spans);
     }
-    Ok(ChatReq { tools, choice, force, prompt, params, budget, rf })
+    Ok(ChatReq { tools, choice, force, prompt, params, budget, loop_guard, rf })
+}
+
+/// The request's loop guard: its `loop_guard` (a spec string, `true` for the server's spec or the defaults, `"off"` or
+/// false), else the server's. The guard's tokens have no logprobs and a forced call leaves no think block, so with
+/// either the server's guard steps aside and a request's own is refused, as for a thinking budget.
+fn loop_guard_spec(
+    st: &State,
+    body: &Map<String, Value>,
+    logprobs: bool,
+    forced: bool,
+) -> Result<Option<crate::loopguard::Spec>, ApiError> {
+    let bad = |m: String| ApiError::bad(m, Some("loop_guard"));
+    let (spec, explicit) = match body.get("loop_guard").filter(|v| !v.is_null()) {
+        None => (st.loop_guard.clone(), false),
+        Some(Value::Bool(false)) => (None, false),
+        Some(Value::String(s)) if s == "off" => (None, false),
+        Some(Value::Bool(true)) => (Some(st.loop_guard.clone().unwrap_or_default()), true),
+        Some(Value::String(s)) => {
+            (Some(crate::loopguard::Spec::parse(s).map_err(|e| bad(format!("loop_guard: {e}")))?), true)
+        }
+        Some(_) => {
+            return Err(bad(
+                "loop_guard must be a string like \"mode=phrase,min=64,copies=3\", true, \"off\" or false".into()
+            ))
+        }
+    };
+    match (spec, logprobs || forced) {
+        (Some(_), true) if explicit => Err(bad(if forced {
+            "loop_guard cannot be combined with a forced tool_choice".into()
+        } else {
+            "loop_guard cannot be combined with logprobs".into()
+        })),
+        (_, true) => Ok(None),
+        (spec, false) => Ok(spec),
+    }
 }
 
 fn image_err(e: crate::vision::VisionError) -> ApiError {
@@ -798,6 +836,13 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
                 gen.thinking(end, None);
             } else {
                 gen.thinking(end, (limit > 0).then_some(Budget { limit, close: &st.tok.think_close }));
+            }
+            if let Some(spec) = cr.loop_guard.filter(|_| !st.tok.think_close.is_empty()) {
+                let phrase = match st.tok.encode(&spec.text, false) {
+                    Ok(p) => p,
+                    Err(e) => return ApiError::new(500, &format!("loop guard phrase: {e}"), None).response(),
+                };
+                gen.loop_guard(crate::loopguard::LoopGuard::new(spec, phrase, st.tok.think_close.clone()));
             }
         }
     }

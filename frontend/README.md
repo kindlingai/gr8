@@ -67,6 +67,7 @@ On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 
 | `--default-presence-penalty` / `--default-frequency-penalty` | 0 | The server's `presence_penalty` / `frequency_penalty` spec (OpenAI's penalties: the engine lowers the logit of every token the reply already holds by `presence_penalty` + `frequency_penalty` x its count, before temperature and top-p; the prompt does not count, vLLM's semantics). One part, or a comma list of `base=`, `thinking=`, `greedy=`, `nongreedy=`, `greedy.thinking=`, `nongreedy.thinking=` and `temperature=` parts, each once (`greedy.base=` is `greedy=`). A part is `[+]A[*M]`: an amount added and a multiplier (`base=0.2` adds 0.2 at multiplier 1; `thinking=*1.1` adds nothing and boosts by 10%; `thinking=+0.1*1.1` both; `-0.1*0.5` is fine). The operator's parts resolve first. The whole reply's total: out = (base.A + gn.A) x base.M x gn.M, gn the condition the request's temperature after defaults picks (`greedy` when it is exactly 0, else `nongreedy`; any other temperature, however small, is sampling). The think block (a chat prompt's, until `</think>`; a `thinking_budget` continuation has none) adds (thinking.A + gn.thinking.A) x thinking.M x gn.thinking.M. A `temperature=[[+]A][*B]` part is a last stage over each total at the request's effective temperature T (a guard retry keeps the request's T): total' = (total + A x T) x (B x T), the factor only when `*B` is written, so `temperature=*1` makes the operator's penalty proportional to the temperature and zero under greedy. (A multiplier of B^T, 1 at T = 0, would keep a greedy penalty while scaling with temperature; not implemented.) Then the request's own values: `presence_penalty` replaces `base`'s amount and is added after the stage, unscaled, 0 included (so a client that sends `presence_penalty: 0` by habit still gets the conditions), and `thinking_presence_penalty` replaces `thinking`'s amount the same way (the condition's thinking part stays). No condition multiplier, `*0` included, reaches a value the client set: under `greedy=0.2,greedy.thinking=0.5` a sampling client that sends 1.5 gets 1.5, a greedy one 1.7 outside the block and 2.0 inside. That last number is the clamp: a client's own value in -2..2 is valid as such (OpenAI's rule; outside it is a 400), and when the operator's parts take a total past the engine's -2..2 the total is held to the range, the block's total also to within 2 of the reply's, since the engine takes the difference (in - out). A spec any combination of which resolves outside -2..2 (either total, or their difference) at any T in 0..2 on its own is still refused at boot. The guard's resamples keep the request's resolved values. A nonzero penalty needs an engine whose hello says `penalties` (g6m4 with the `pen` field, the pseudo engine), else 400. The TP=1 Flash recipe, greedy requests only: `greedy=0.2,greedy.thinking=0.5` for presence. `./gr8 glm53 up` passes `DEFAULT_PRESENCE_PENALTY` / `DEFAULT_FREQUENCY_PENALTY` when they are set. |
 | `--default-think-end-boost` | off | The think-end boost, a soft thinking budget, below. `./gr8 glm53 up` passes `DEFAULT_THINK_END_BOOST` when it is set. |
 | `--default-sequence-penalty` | off | The sequence penalty, below. `./gr8 glm53 up` passes `DEFAULT_SEQUENCE_PENALTY` when it is set. |
+| `--default-loop-guard` | off | The loop guard, below. `./gr8 glm53 up` passes `DEFAULT_LOOP_GUARD` when it is set. |
 | `--tool-repeat-guard` | 0 | 1 = the repeated-tool-call guard, below. `./gr8 glm53 up` passes `TOOL_REPEAT_GUARD` and, when they differ from these defaults, `--tool-repeat-guard-repeats` (2), `--tool-repeat-guard-temperature` (0.7) and `--tool-repeat-guard-retries` (2). |
 | `--undeclared-tool-calls` | `emit` | A call to a tool name the request did not declare. `text`: the call's text stays in `content` and the reply finishes `stop` (vLLM's glm47 parser). `emit`: it is a tool call like any other (`tool_calls`, `finish_reason: tool_calls`, streamed or not), so the client can answer it with its own unknown-tool error; the name must be an identifier (1-128 ASCII letters, digits, `_`, `-`, `.` or `:`, starting with a letter or `_`), the call arrives when the reply ends with it rather than as it is written (so prose after it keeps it prose), and the arguments are strings, having no schema. The rules that tell a call from prose about one are unchanged. `./gr8 glm53 up` passes `UNDECLARED_TOOL_CALLS` when it is `text`. |
 | `--log-level` | `INFO` | |
@@ -158,6 +159,72 @@ finds the longest earlier occurrence on the host before each step (a bigram inde
 verify row included, so it is exact at any draft length; a drafted `</think>` moves the rows after it from the
 thinking scope to the answer scope). Drafters are not penalized. A starting value:
 `thinking=0.8:1.75:4:6,answer=1:1.75:12:6,guard=1:2:1:8`.
+
+## Loop guard (`--default-loop-guard`)
+
+At temperature 1 on long agent turns, GLM-5.3-Flash sometimes falls into a verbatim loop inside its thinking, and once
+in one it gives the next copy p ~ 1.0. In DeepSeek Harness runs one step repeated a 200-character stretch 72 times
+until the thinking budget cut it. The sequence penalty stops such loops, but it matches against the whole context, so
+it also breaks code the model copies from a tool result. The loop guard reads only the reply's own thinking, and acts
+once, when a loop is plain.
+
+The detector hashes every window of `min` reply tokens inside the think block (a rolling hash: one multiply-add per
+token, and one table entry per window). It fires when one window has occurred `copies` times without overlapping, or,
+with `long` set, when the reply's tail has repeated one earlier stretch verbatim for `long` tokens. A window the prompt
+also holds never fires, so quoting a file from a tool result, however often, is not a loop. The prompt's windows are
+hashed only when a window first reaches the trigger. Healthy reasoning repeats itself too: in the DeepSeek Harness
+transcripts, healthy steps held some 64-token run at most twice and the looping ones 10 to 72 times, and one healthy
+step redrafted a 600-token stretch of code verbatim. So the default wants a third copy of a 64-token run, and the
+single-repeat trigger is off.
+
+When it fires, the front end cancels the engine run and goes on in a new one from the prompt, the reply so far and the
+guard's tokens, the way a thinking budget continues on an engine without inserts (above). The client sees one
+response or one stream, with the guard's tokens in the reasoning. The spec is
+`mode=M,min=N,copies=C,long=L,max=X,window=W,text=T`, any of the parts, each once:
+
+| part | default | meaning |
+|---|---|---|
+| `mode` | `phrase` | `phrase`: put the steering phrase in, still inside the think block. `phrase-close`: the phrase; a trigger again within `window` thinking tokens of it puts the phrase and the close (`\n</think>\n\n`) in. `close`: the phrase and the close at once. `log`: log the trigger and change nothing |
+| `min` | 64 | the window, in tokens (4 to 4096) |
+| `copies` | 3 | occurrences of one window that fire the guard (2 or more) |
+| `long` | 0 | a verbatim repeat of this many tokens fires it too; 0 = off, else at least `min` |
+| `max` | 2 | triggers per request (1 to 64) |
+| `window` | 4096 | `phrase-close`: how close to the phrase a second trigger must come to close the block (in the replays below a loop came back 430 to 6,100 tokens after the phrase, most often about 1,500, so 512 almost never closed). `log`: the least distance between two logged triggers |
+| `text` | `\n\nI'm going in circles. I already have enough to act. I'll decide now and stop re-checking.\n\n` | the phrase. It takes the rest of the spec, commas included, so it comes last. Escapes: `\n`, `\t`, `\\`; any other backslash is an error |
+
+A request's `loop_guard` (the same string; `true` for the server's spec, or these defaults when the server has none;
+`"off"` or `false`) wins over the server default. The thinking budget and the think-end boost still apply: the
+continuation's budget insert and the boost's start move back by the reply's length, so both stay where they were in
+the reply. The presence penalties count from the continuation, as after a budget's close. After a close there is no
+think block, so the guard stops, and the continuation sends no `think_end` and no boost. The guard's tokens have no
+logprobs and a forced call leaves no think block, so with `logprobs` or a forced `tool_choice` the server's guard steps
+aside and a request's own is refused, as for `thinking_budget`. The guard's tokens count once in `completion_tokens`
+and, inside the block, in `reasoning_tokens`; tokens the cancelled run made past the trigger do not. Each trigger logs
+one line: the mode, the trigger count, the reply token and thinking token it fired at, the repeated run's length and
+period, the copies, and what it put in. On the TP=1 Flash recipe a continuation took 69K to 127K of its 88K to 131K
+prompt tokens from the cache, so it prefilled 1.6K to 29K tokens again.
+
+Replays (2026-11-10, TP=1 Flash recipe stable-1110, T=1, the image's budget 28,672 and boost): the three DeepSeek
+Harness steps that looped (71K, 104K and 108K-token prompts), each with the 4 seeds of 8-12 whose guard-off run
+looped, 12 runs an arm. Seeded runs do not repeat their trajectory exactly under batching, so `ctl` (the same seeds
+run again with the guard off) is the fair comparison. A good answer is a valid call whose edit or write checks
+(old_string found, `node --check` passes).
+
+| arm | loops (window 5+) | runaway (128,000 tokens, no call) | good answer | of them write/edit | mean thinking tokens | mean wall s |
+|---|---|---|---|---|---|---|
+| ctl (off) | 6 | 0 | 11 | 5 | 21,437 | 1,766 |
+| `mode=phrase` | 2 | 1 | 11 | 6 | 19,832 | 1,934 |
+| `mode=phrase-close,window=512` | 1 | 0 | 12 | 8 | 18,370 | 1,643 |
+| `mode=close` | 0 | 1 | 11 | 7 | 14,391 | 1,505 |
+| `mode=phrase-close,min=32,copies=4` | 2 | 1 | 10 | 6 | 18,916 | 2,079 |
+| `mode=phrase-close,window=4096` | 1 | 0 | 12 | 9 | 16,374 | 1,567 |
+
+A phrase alone often lets the loop come back. A close stops it, but a close that lands mid-thought (the guard's or the
+budget's) can move the reasoning into the answer, where it loops with no guard: each runaway was a close followed by
+"let me also reconsider ... fine" until `max_tokens`. `mode=phrase-close,window=4096` did best, so 4096 is the
+default window and `mode=phrase-close` the suggested spec. In the guard-off seed searches (28 runs) the detector
+fired on every run with a 5+ window and on none of the 15 whose window stayed at 3 or less. Of the 13 it fired on, one
+was a code block drafted three times across 25K tokens (in a run the budget cut anyway).
 
 ## Repeated tool calls (`--tool-repeat-guard`)
 

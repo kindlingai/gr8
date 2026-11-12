@@ -216,6 +216,13 @@ class ValidateTests(unittest.TestCase):
         self.check(['--peers', PEERS, '--default-sequence-penalty', 'guard=x:2:1:1'], 'is not a number')
         for ok in ('thinking=0.8:1.75:4:6,answer=1:1.75:12:6,guard=1:2:1:8', 'guard = 1 : 2 : 1 : 8'):
             opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-sequence-penalty', ok], GLM))
+        for bad, why in (('mode=loud', 'want log, phrase'), ('min=2', 'from 4 to 4096'), ('copies=1', 'from 2'),
+                         ('max=0', 'from 1'), ('min=64,min=32', 'given twice'), ('speed=3', 'want mode, min'),
+                         ('text=', '1 to 2000'), ('text=a\\x', 'escapes'), ('long=10', 'at least min')):
+            self.check(['--peers', PEERS, '--default-loop-guard', bad], why)
+        for ok in ('mode=phrase', 'mode=phrase-close,min=64,copies=3,max=2,window=512', 'off',
+                   'mode=close,text=Stop, decide.\\n', 'mode=log,long=256'):
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-loop-guard', ok], GLM))
         self.check(['--peers', PEERS, '--tool-repeat-guard', 'yes'], 'want 0 or 1')
         self.check(['--peers', PEERS, '--tool-repeat-guard-repeats', '0'], 'want a whole number from 1')
         self.check(['--peers', PEERS, '--tool-repeat-guard-temperature', '3'], 'want a number from 0 to 2')
