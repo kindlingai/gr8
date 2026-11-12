@@ -48,29 +48,90 @@
       "label": "TP=4",
       "nodes": 4,
       "decode": {
-        "code": 52.1,
-        "prose": 34.2
+        "code": 63.3,
+        "prose": 37.8,
+        "structured": 78.0
       },
+      "decode_prompt_tokens": [
+        46,
+        54
+      ],
       "prefill": [
         {
-          "context": 8192,
-          "tps": 1357
+          "context": 32768,
+          "tps": 1540
+        },
+        {
+          "context": 131072,
+          "tps": 1361
         }
       ],
       "concurrency": [
         {
+          "streams": 1,
+          "aggregate_tps": 47.7,
+          "per_stream_tps": 50.9,
+          "ttft_p50_s": 0.4
+        },
+        {
           "streams": 2,
-          "aggregate_tps": 54.0
+          "aggregate_tps": 59.8,
+          "per_stream_tps": 36.8,
+          "ttft_p50_s": 0.81
         },
         {
           "streams": 4,
-          "aggregate_tps": 69.0
+          "aggregate_tps": 69.5,
+          "per_stream_tps": 22.8,
+          "ttft_p50_s": 1.51
+        },
+        {
+          "streams": 8,
+          "aggregate_tps": 85.8,
+          "per_stream_tps": 13.2,
+          "ttft_p50_s": 3.43
         }
       ],
-      "max_context": 485376,
-      "kv_pool_tokens": 485376,
+      "concurrency_prompt_tokens": [
+        48,
+        55
+      ],
+      "max_context": 513522,
+      "kv_pool_tokens": 513536,
       "max_concurrent": 8,
-      "notes": "home experts (3.25 bpw), DFlash2 or MTP drafting. RigMark 1.0.0, mean of two fresh boots, GPU clocks uncapped."
+      "max_tokens_per_chat": [
+        {
+          "chats": 1,
+          "tokens": 513522,
+          "source": "measured"
+        },
+        {
+          "chats": 2,
+          "tokens": 207602,
+          "source": "computed"
+        },
+        {
+          "chats": 4,
+          "tokens": 54514,
+          "source": "computed"
+        },
+        {
+          "chats": 8,
+          "tokens": 19058,
+          "source": "computed"
+        }
+      ],
+      "quality": [
+        {
+          "name": "75-item check",
+          "value": "73 of 75"
+        },
+        {
+          "name": "Needle recall",
+          "value": "found at 128K"
+        }
+      ],
+      "notes": "home experts (3.25 bpw), int4 KV default, DFlash2 + MTP drafting. bench/bench.py on 2026-11-11, one fresh boot, GPU clocks uncapped."
     },
     {
       "id": "tp5",

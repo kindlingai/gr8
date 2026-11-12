@@ -6,8 +6,9 @@ import json
 from pathlib import Path
 
 # where a field goes when an entry does not have it yet
-ORDER = ['id', 'label', 'nodes', 'decode', 'prefill', 'concurrency', 'max_context', 'kv_pool_tokens',
-         'max_concurrent', 'quality', 'notes']
+ORDER = ['id', 'label', 'nodes', 'decode', 'decode_prompt_tokens', 'prefill', 'concurrency',
+         'concurrency_prompt_tokens', 'max_context', 'kv_pool_tokens', 'max_concurrent',
+         'max_tokens_per_chat', 'max_tokens_per_chat_note', 'quality', 'notes']
 DECODE = ('code', 'prose', 'structured')
 NEEDLE = 'Needle recall'
 

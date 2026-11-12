@@ -10,17 +10,17 @@ TP=3 (a three-box ring, variant k4), TP=2 (two boxes) or TP=1 (one box, variant 
 
 ## Results
 
-On one and two boxes, from each recipe's `kindling.json` as of 2026-11-08 (the numbers on its card, with the image's
-defaults):
+On one and two boxes, from each recipe's `kindling.json` as of 2026-11-08 (one box) and 2026-11-11 (two boxes), with
+each image's defaults:
 
 | | one box (TP=1) | two boxes (TP=2) |
 |---|---|---|
-| manifest, KV, drafting | `bit201`, int4 KV, DFlash2 | `bit349`, int4 KV, DFlash2 |
-| decode, code / prose / structured | 53.8 / 28.2 / 65.1 tok/s | 74.5 / 41.9 / 94.6 tok/s |
-| prefill, 8K / 32K / 128K prompt | 995 / 1,024 / 916 tok/s | 1,675 / 1,676 / 1,354 tok/s |
-| aggregate decode, 1 / 2 / 4 / 8 streams | 43.5 / 41.3 / 53.4 / 57.5 tok/s | 54.0 / 62.5 / 75.5 / 98.2 tok/s |
-| KV pool | 700,032 tokens, up to 4 requests at once | 2,097,152 tokens, up to 8 requests at once |
-| from | [glm-5.3-flash-exlr8-1x-spark `kindling.json`](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark/blob/3e9754c5/kindling.json) | [glm-5.3-flash-exlr8-2x-spark `kindling.json`](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark/blob/81c29ca3/kindling.json) |
+| manifest, KV, drafting | `bit201`, int4 KV, DFlash2 | `bit349`, int4 KV, DFlash2 + shared waterfill MTP=3 |
+| decode, code / prose / structured | 53.8 / 28.2 / 65.1 tok/s | 76.5 / 41.8 / 93.1 tok/s |
+| prefill, 8K / 32K / 128K prompt | 995 / 1,024 / 916 tok/s | 1,670 / 1,729 / 1,595 tok/s |
+| aggregate decode, 1 / 2 / 4 / 8 streams | 43.5 / 41.3 / 53.4 / 57.5 tok/s | 55.1 / 70.3 / 82.9 tok/s (1 / 2 / 4 streams; 97.4 at 8 with `TUNE=context`) |
+| KV pool | 700,032 tokens, up to 4 requests at once | 2,097,152 tokens, up to 4 requests at once (`SESS=4`; max tokens per active chat: 262,144 at 1 measured, 262,144 at 2 and 4 computed; 8 chats at 233,458 each, computed, with `TUNE=context`) |
+| from | [glm-5.3-flash-exlr8-1x-spark `kindling.json`](https://github.com/kindlingai/glm-5.3-flash-exlr8-1x-spark/blob/3e9754c5/kindling.json) | [glm-5.3-flash-exlr8-2x-spark `kindling.json`](https://github.com/kindlingai/glm-5.3-flash-exlr8-2x-spark/blob/main/kindling.json) |
 
 The recipes use two other manifests of the same release. `bit201` (one box) is K2, with the 124 routed experts that
 carry the most routing weight at tool-call positions at K3. `bit349` (two boxes) is K3, with K4 where it lowers KL most,

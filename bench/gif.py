@@ -399,7 +399,9 @@ def card_rows(doc, c):
     ('text', color, text), ('section', heading) or
     ('bar', label, value, section maximum, value text, section). Only fields present show. Optional: a concurrency
     entry's ttft_p50_s (median first token, seconds) and the config's decode_prompt_tokens and
-    concurrency_prompt_tokens ([min, max] prompt length) add to the bar text and the section headings."""
+    concurrency_prompt_tokens ([min, max] prompt length) add to the bar text and the section headings.
+    Optional max_tokens_per_chat ([{"chats": N, "tokens": T, "source": "measured"|"computed"}]) and
+    max_tokens_per_chat_note appear under Limits."""
     nodes = c.get('nodes')
     right = ' · '.join(x for x in (c.get('label'), nodes and f"{nodes} node{'s' if nodes != 1 else ''}") if x)
     rows = [('title', ' · '.join(str(doc[k]) for k in ('title', 'variant') if doc.get(k)), right)]
@@ -435,11 +437,18 @@ def card_rows(doc, c):
            num(x['aggregate_tps']) + per_stream(x)) for x in c.get('concurrency') or [] if 'aggregate_tps' in x])
     limits = [f'{name} {num(c[k])}' for k, name in (('max_context', 'max context'), ('kv_pool_tokens', 'KV pool'),
                                                        ('max_concurrent', 'max concurrent')) if k in c]
+    per_chat = [f"{x['chats']} {'chat' if x['chats'] == 1 else 'chats'} {num(x['tokens'])}"
+                + (f" ({x['source']})" if x.get('source') else '')
+                for x in c.get('max_tokens_per_chat') or [] if 'chats' in x and 'tokens' in x]
+    if c.get('max_tokens_per_chat_note'):
+        per_chat.append(str(c['max_tokens_per_chat_note']))
     quality = [f"{q['name']}: {q['value']}" for q in c.get('quality') or [] if 'name' in q and 'value' in q]
-    if limits or quality:
-        rows.append(('section', 'Limits' if limits else 'Quality'))
+    if limits or per_chat or quality:
+        rows.append(('section', 'Limits' if (limits or per_chat) else 'Quality'))
         if limits:
             rows.append(('text', 'muted', ' · '.join(limits)))
+        if per_chat:
+            rows.append(('text', 'text', 'Max tokens per active chat: ' + ' · '.join(per_chat)))
         rows.extend(('text', 'text', q) for q in quality)
     return rows
 

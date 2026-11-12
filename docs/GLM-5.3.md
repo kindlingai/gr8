@@ -13,17 +13,18 @@ DeepSeek and pseudo-engine defaults are unchanged.
 
 ## Results
 
-The table below records the earlier measured configuration, not a fresh measurement of the current TP=4 INT4 default.
+TP=4 records the current INT4 KV default (`bench/bench.py` on 2026-11-11, one fresh boot, GPU clocks uncapped); TP=3, TP=5 and TP=6 record the earlier RigMark 1.0.0 runs.
 
 | | TP=3 | TP=4 | TP=5 | TP=6 |
 |---|---|---|---|---|
-| experts | `bit225`, 2.25 bpw | `home`, 3.25 bpw | `home`, 3.25 bpw | `home`, 3.25 bpw |
-| drafting | MTP | DFlash2 or MTP | MTP | MTP |
-| decode\*, code / prose | 41.1 / 31.7 tok/s | 52.1 / 34.2 tok/s | 51.0 / 38.0 tok/s | 57.4 / 43.1 tok/s‡ |
-| aggregate\*, 2 / 4 streams | 50.6 / 63.8 tok/s | 54.0 / 69.0 tok/s | 61.8 / 76.3 tok/s | 67.6 / 85.5 tok/s‡ |
-| prefill, 8K prompt, cold | 635 tok/s | 1,357 tok/s | 1,554 tok/s | 1,808 tok/s‡ |
-| prefill, 8K prompt, cached | 58,655 tok/s | 60,129 tok/s | 60,455 tok/s | 62,337 tok/s |
-| KV pool (longest context) | 307,136 tokens (410,624 with int4§) | 485,376 tokens (513,536 with int4§) | 502,848 tokens | 614,400 tokens (857,600 with int4§) |
+| experts | `bit225`, 2.25 bpw | `home`, 3.25 bpw (`int4` KV default) | `home`, 3.25 bpw | `home`, 3.25 bpw |
+| drafting | MTP | DFlash2 + MTP | MTP | MTP |
+| decode\*, code / prose | 41.1 / 31.7 tok/s | 63.3 / 37.8 tok/s† (structured 78.0) | 51.0 / 38.0 tok/s | 57.4 / 43.1 tok/s‡ |
+| aggregate\*, 2 / 4 streams | 50.6 / 63.8 tok/s | 59.8 / 69.5 tok/s† (1: 47.7, 8: 85.8) | 61.8 / 76.3 tok/s | 67.6 / 85.5 tok/s‡ |
+| prefill, 8K prompt, cold | 635 tok/s | — (32K: 1,540; 128K: 1,361 tok/s†) | 1,554 tok/s | 1,808 tok/s‡ |
+| prefill, 8K prompt, cached | 58,655 tok/s | — | 60,455 tok/s | 62,337 tok/s |
+| KV pool (longest context) | 307,136 tokens (410,624 with int4§) | 513,536 tokens (513,522 max context; 485,376 pool with fp8) | 502,848 tokens | 614,400 tokens (857,600 with int4§) |
+| max tokens per active chat | — | 1: 513,522 (measured); 2: 207,602; 4: 54,514; 8: 19,058 (computed) | — | — |
 | requests that share decode steps | up to 32,768 tokens | up to 32,768 tokens | up to 32,768 tokens | up to 131,072 tokens |
 | requests decoding at once | 8 | 8 | 8 | 8 |
 
@@ -33,10 +34,10 @@ clock; the 2200 MHz cap is only for PR-to-PR gate comparisons). One run per fres
 2026-10-24. Each pair of boots gave identical temperature-0 replies, and smoke passed 14/14 on every boot. RigMark's
 structured row is left out: it measures predictable output, not agent speed. TP=3 to TP=5 ran on a build of #140
 before it landed, and TP=6 on 8da82ff. Six boxes on one 200G switch.
+† TP=4: `bench/bench.py` on 2026-11-11, one fresh boot with `./gr8 glm53 up` defaults (`KV_FORMAT=int4`, `--drafter`), GPU clocks uncapped (decode prompts 46-54 tokens; per-stream concurrency 50.9 / 36.8 / 22.8 / 13.2 tok/s and median first token 0.40 / 0.81 / 1.51 / 3.43 s on 48-55-token prompts; 73 of 75 on the 75-item check; 128K needle found).
 ‡ One of the six boxes was capped at 2200 MHz (it powers off under sustained load at its full clock), so the TP=6
 column would be a little higher on six uncapped boxes.
-§ Historical `--kv-format int4` row-format measurements, before the fast paths: 4-bit KV latent, about 3% slower decode at TP=4. The TP=3 and TP=6 int4 figures
-are estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [KV4.md](KV4.md)
+§ The TP=3 and TP=6 int4 figures are estimates, not yet booted (TP=6 at its default `SHARE_LIMIT`, 131,072). [KV4.md](KV4.md)
 
 [kindling.json](../kindling.json) has this table in a form a program can read. A PR that changes one changes the other.
 
