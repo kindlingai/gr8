@@ -53,13 +53,21 @@ at TP 4, 2 and 1 when `--drafter` (or `DFLASH_DIR`) is given, else MTP (MTP at T
 defaults to 8 at TP=4, 4 at TP=3 and TP=2 INT4, and 1 at TP=2 FP8 and TP=1; 2 to 8 share decode steps and the `CAP` pool, each session
 with its own KDA state slots, while `SESS` x (`MTP` + 1) is at most 32.
 
-At `TP=2` with `KV_FORMAT=int4`, ordinary launches use `SESS=4`; when `SESS >= 2`, defaults are `MTP=3`,
+At `TP=2` with `KV_FORMAT=int4`, ordinary launches use `SESS=4` (max concurrent 4); when `SESS >= 2`, defaults are `MTP=3`,
 `S2_SHARED_WATERFILL=1` and `S2_SHARED_WF_MARGIN=0.02`. `--s2-shared-waterfill 0` rolls back to uniform shared
 rows and, unless explicitly set, `MTP=1`. Pass `--sess 1` for the prior single-session launch.
 Measured on TP=2 INT4 against `S2_SHARED_WATERFILL=0` at matched `SESS=4`, `MTP=3`: +10.45% pooled concurrent decode throughput
 (+12.27% at 4 streams, +7.96% at 2 streams), 20/20 exact solo `T=0`, KL = 0.0 and qeval 73/75 vs 73/75.
-Additional graph captures can increase boot time and memory
-(wider `SESS=8`, `MTP=3` boot time and memory cost not yet measured).
+Additional graph captures can increase boot time and memory.
+Measured on two GB10s at `TP=2` with `KV_FORMAT=int4`, plain `./gr8 glm53f --tp 2 --kv-format int4`
+(`SESS=4`, max concurrent 4, `MTP=3`, `S2_SHARED_WATERFILL=1`, `k4` manifest, `CAP=262208`) against the prior
+`SESS=1`, `MTP=1` default: 51.1 vs 51.9 tok/s at 1 stream (-1.7%), 68.3 vs 61.5 tok/s at 2 streams (+11.0%),
+79.2 vs 59.6 tok/s at 4 streams (+32.9%), 14/14 smoke, and 11.1-11.3 GiB post-capture `MemAvailable` a box
+(11.5-12.2 GiB with `--s2-shared-waterfill 0`, 24 s warm boot; 12.6-12.9 GiB at `SESS=1`, 27 s warm boot).
+With the two-box recipe's `bit349` manifest, `CAP=2097152`, vision tower and aligned SSD prompt cache, `SESS=4`
+(`max_concurrent=4`) leaves 8.9-9.2 GiB post-capture `MemAvailable` (25 s warm boot; 55.1 / 70.3 / 82.9 tok/s
+at 1 / 2 / 4 streams), whereas `SESS=8`, `MTP=3` without `GR8_CP=1` leaves 6.4-6.9 GiB (8.7-9.1 GiB with
+`GR8_CP=1`, 29 s warm boot, 97.4 tok/s at 8 streams).
 See [Shared waterfill](docs/SETTINGS.md#shared-waterfill-speculative-row-allocation).
 
 A Flash box can lend what its serve leaves to a KV node beside it (`donate` in `tools/launch/supervisor.py`):

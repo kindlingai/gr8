@@ -18,11 +18,21 @@ five bit-exact INT4 kernel settings remain enabled underneath this stack.
 folded weights for a non-release boot. FP8 `kv_b` skips fold and its implicit
 TC default, retaining the exact INT4 path.
 
-Measured with live settings: long-context CP decode geomean improved 18.57%
+Measured with live settings for `GR8_KV4_FOLD=1` + `GR8_KV4_TC=1` + `GR8_CP_ONECHAIN=1` against the bit-exact
+`KV_FORMAT=int4` baseline (not against `KV_FORMAT=fp8`): long-context CP decode geomean improved 18.57%
 across 32K/64K/120K; short decode geomean improved 3.69%. This is a numerical
 quality trade, not bit-exact against the scalar reference: `mean_kl = 0.015803`,
 `qeval` 72/75 versus 71/75, and needles 40/40. `kv4_test` same-pipeline relative
 error was below `1.5e-3` and cosine above `0.999998`.
+
+Measured as the four-GB10 `TP=4` `KV_FORMAT=int4` default (`CAP=513536`, `max_model_len` 513,522, +5.8% over
+`fp8`'s 485,362; `SESS=8`, up to 8 concurrent requests) against same-build `KV_FORMAT=fp8`: `KL(fp8 || int4)` mean
+0.01450, p95 0.0707, top-1 agreement 97.0% (n=4,096 tokens), and `qeval` 73/75 (`int4`) vs 74/75 (`fp8`, 1 flip,
+McNemar p=1.0). `bench.py` (n=6 runs): short decode code 63.3 / prose 37.8 / structured 78.0 / counting 81.5 tok/s,
+concurrent decode 47.7 / 59.8 / 69.5 / 85.8 tok/s at 1 / 2 / 4 / 8 streams, cold prefill 1,540 tok/s at 32K and
+1,361 tok/s at 128K, 14/14 smoke, and the 128K needle found. The same-build `fp8` boot ran KL and `qeval` without
+`bench.py`, so no same-build `fp8` speed baseline or decode speed gain is claimed; short decode matches the
+2026-11-10 `fp8` card's 63.2 / 38.0 / 77.0 tok/s.
 
 Use `--kv4-tc 0 --kv4-fold 0 --cp-onechain 0` for the measured bit-exact INT4
 fast-path rollback. `CP_ONECHAIN=1` is documented bit-exact, but the exact INT4

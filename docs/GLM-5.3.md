@@ -114,9 +114,11 @@ read back as decode selects them ([Remote KV](#remote-kv)).
 - `--reuse 0` turns prefix reuse off.
 - `--kv-store` and `--kv-rows` (experimental, off by default) put KV below the pool, on an SSD or a KV node: see
   [Remote KV](#remote-kv) below.
-- `KV_FORMAT=int4` is the TP=4 default: 4-bit KV latent, `CAP=513536`, and `bin/g6m4-int4` with the INT4 fast paths,
-  folded weights, tensor-core decode and `CP_ONECHAIN`. `--kv-format fp8` restores `bin/g6m4` and `CAP=485376`
-  without implicit INT4/one-chain settings. Other TP widths keep FP8. See [KV4.md](KV4.md) for the measured tradeoffs.
+- `KV_FORMAT=int4` is the TP=4 default: 4-bit KV latent, `CAP=513536` (`max_model_len` 513,522, +5.8% over `fp8`'s
+  485,362, up to 8 concurrent requests), and `bin/g6m4-int4` with the INT4 fast paths, folded weights, tensor-core
+  decode and `CP_ONECHAIN`. `--kv-format fp8` restores `bin/g6m4` and `CAP=485376` without implicit INT4/one-chain
+  settings. Other TP widths keep FP8. See [KV4.md](KV4.md) for the measured quality (KL 0.01450, `qeval` 73/75 vs
+  74/75) and `bench.py` throughput (63.3 / 37.8 / 78.0 tok/s short decode; no decode speed gain is claimed over `fp8`).
 - `--dflash 0` runs MTP only at TP=4. `--mtp` is the MTP draft count (2).
 - `--steering-profile DIR[,DIR...]` loads local schema-v1 profiles; with an HF model, `hf:default` or `hf:NAME`
   explicitly selects a bundled profile. Without the flag, bundled profiles are ignored. Requests select a loaded profile

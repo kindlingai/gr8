@@ -7,10 +7,14 @@ the model, see below), with an OpenAI-compatible API on the first box. gr8 is wr
 vLLM, PyTorch or NCCL at serve time. *Beta release. If you run it, please tell us what breaks:
 [issues](https://github.com/kindlingai/gr8/issues) and PRs are welcome.*
 
-GLM-5.3 at TP=4 now defaults to `KV_FORMAT=int4` (`bin/g6m4-int4`, `CAP=513536`), with INT4 fast paths,
-folded Hadamard weights, tensor-core decode and `CP_ONECHAIN`. `--kv-format fp8` / `KV_FORMAT=fp8` restores
-`bin/g6m4` at `CAP=485376` without implicit INT4/one-chain settings. Other model/topology defaults are unchanged;
-see [KV4.md](docs/KV4.md). The model cards below retain their earlier measured configurations.
+GLM-5.3 at TP=4 now defaults to `KV_FORMAT=int4` (`bin/g6m4-int4`, `CAP=513536`, `max_model_len` 513,522, up to 8
+concurrent requests), with INT4 fast paths, folded Hadamard weights, tensor-core decode and `CP_ONECHAIN`.
+`--kv-format fp8` / `KV_FORMAT=fp8` restores `bin/g6m4` at `CAP=485376` without implicit INT4/one-chain settings;
+see [KV4.md](docs/KV4.md). GLM-5.3-Flash at TP=2 with `KV_FORMAT=int4` defaults to `SESS=4` (max concurrent 4) and,
+when `SESS >= 2`, `MTP=3`, `S2_SHARED_WATERFILL=1` and `S2_SHARED_WF_MARGIN=0.02`; `--s2-shared-waterfill 0` rolls
+back to uniform shared rows and `MTP=1`, and `--sess 1` restores the single-session launch; see
+[FLASH.md](docs/FLASH.md). Other model/topology defaults are unchanged. The model cards below retain their earlier
+measured configurations.
 
 ### Switch between the models
 
