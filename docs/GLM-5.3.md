@@ -153,6 +153,12 @@ set `GR8_STOP_GRACE=150s`. A crash or SIGKILL skips the store, and the next boot
 The stored KV belongs to one engine build: after an upgrade or rebuild (or another model, layout or block format) the
 index starts empty, so the saved chats prefill again.
 
+With `keep=sessions` (or `all`), a continuing run reuses the stored full page blocks it came from: eviction or quit
+writes only the new pages (and a changed partial page when reuse alignment is disabled). Pool self-hits no longer
+spill the resident session on each turn. On Linux, the SSD block file is fully allocated before the cache opens,
+reserving the `size=` budget rounded down to whole blocks; insufficient space fails at boot. No new option is needed.
+See [SSD session extensions and reserve](../engine/kvman-rs/SSD-TIER.md) for the measured scope and limits.
+
 The rows store does extend it. Each session's first `SHARE_LIMIT` tokens stay on every rank. The rows past that are
 spread across the ranks, and the rows store puts each rank's share on the KV node as its pages fill. With `local=PAGES`
 a rank keeps only the last PAGES pages of each long session's tail and gives the rest back to the pool. After each
