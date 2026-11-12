@@ -65,6 +65,7 @@ struct PoolHooks {
 };
 struct NativeHooks {
     PoolHooks pool;
+    std::function<uint32_t(const g6rt::ServeReq&)> checkpoint; // optional prefill boundary, broadcast in Request
     // the module (ModuleOps). Unset: a table over the std::function members below and pool.retain and pool.park, which
     // must then be empty when it is set
     g6s2_module_ops module{};
@@ -170,6 +171,7 @@ class Service {
                 auto request = parse_request(std::string(reinterpret_cast<const char*>(b), n), h.s.c_.scheduler.steering);
                 out->ok = h.s.grammar_ok(id, request) && h.s.images_ok(id, request) && h.s.engine_ok(id, request);
                 if (!out->ok) return;
+                out->ckpt_at = h.s.native_.checkpoint ? h.s.native_.checkpoint(request) : 0;
                 h.prompt = std::move(request.prompt);
                 out->prompt = h.prompt.data(); out->n = h.prompt.size();
                 out->sys = request.sys; out->plp = request.plp; out->n_gen = request.n_gen;

@@ -149,8 +149,8 @@ pub struct Entry {
     pub tail: Option<Tail>,
     /// boundary-state blocks at the end of `slots` (0 for page-only entries and Prefix bases)
     pub state: u32,
-    /// the cache identity of the run (pool::Namespace). Prefix kinds and index entries are always stock; an evicted
-    /// non-stock run is stored whole (no base) and matches only its own namespace
+    /// The cache identity of the run. Shared system entries are stock; boundary-state siblings
+    /// may share a private page-only Prefix base within their exact namespace.
     pub namespace: crate::pool::Namespace,
 }
 
@@ -766,7 +766,7 @@ impl Stash {
         self.tiers
             .iter()
             .flat_map(|t| &t.entries)
-            .filter(|e| e.kind.prefix() && e.below() > 0 && e.below() <= max_pages && history.starts_with(&e.st.history))
+            .filter(|e| e.namespace == crate::pool::STOCK_NAMESPACE && e.kind.prefix() && e.below() > 0 && e.below() <= max_pages && history.starts_with(&e.st.history))
             .max_by_key(|e| (e.below(), e.id))
             .map(|e| (e.id, e.below()))
     }
@@ -1268,6 +1268,10 @@ impl Stash {
         self.io_done()
     }
 
+    pub fn entry_info(&self, id: u64) -> Option<(u32, &Entry)> {
+        self.tiers.iter().enumerate().find_map(|(t, tier)| tier.entries.iter().find(|e| e.id == id).map(|e| (t as u32, e)))
+    }
+
     pub fn has_entry(&self, id: u64) -> bool {
         self.tiers.iter().any(|t| t.entries.iter().any(|e| e.id == id))
     }
@@ -1585,6 +1589,7 @@ impl Stash {
         state_handle: u32,
         hits: u32,
         keep_id: Option<u64>,
+        namespace: crate::pool::Namespace,
     ) -> Option<Option<u64>> {
         let n = pages.len();
         if p == 0 {
@@ -1596,7 +1601,7 @@ impl Stash {
         let m = (cut + usize::from(self.state_mtp)).min(e.st.history.len());
         let ok = e.kind == Kind::Evicted
             && e.tail.is_none()
-            && e.namespace == crate::pool::STOCK_NAMESPACE
+            && e.namespace == namespace
             && p == e.below()
             && p <= n
             && st.valid >= e.st.valid
@@ -1606,12 +1611,17 @@ impl Stash {
             return None;
         }
         let existing_base = e.base;
-        // When eid already holds all p full pages in its base, or has no base (all p full pages in eid.slots[..p]),
-        // share all p full pages with zero block copies. When eid has a partial base (b < p), reuse that base.
-        let share_pages = match existing_base {
-            Some((_, b)) if b < p => b,
-            _ => p,
-        };
+        // Moving owned immutable pages into the existing same-tier base avoids rewriting the
+        // intermediate prefix when a prompt boundary already shares an earlier request's pages.
+        // Do not mutate a base with rolling state or divergent tokens.
+        if let Some((bid, b)) = existing_base {
+            let base = self.tiers[te].entries.iter().find(|x| x.id == bid)?;
+            if b < p && (base.state != 0 || base.base.is_some() || base.below() != b
+                || base.namespace != namespace || !st.history.starts_with(&base.st.history)) {
+                return None;
+            }
+        }
+        let share_pages = p;
         let need = (n - share_pages) + self.state_blocks as usize;
         let mut extra = vec![eid];
         if let Some((bid, _)) = existing_base {
@@ -1631,7 +1641,26 @@ impl Stash {
             }
         };
         let base = match existing_base {
-            Some((bid, b)) => Some((bid, b)),
+            Some((bid, b)) => {
+                if b < p {
+                    let tier = &mut self.tiers[te];
+                    let ei = tier.entries.iter().position(|x| x.id == eid).expect("pinned");
+                    let added: Vec<_> = tier.entries[ei].slots.drain(..p - b).collect();
+                    tier.entries[ei].base = Some((bid, p));
+                    let updated_e = tier.entries[ei].clone();
+                    let base = tier.entries.iter_mut().find(|x| x.id == bid).expect("pinned");
+                    base.slots.extend(added);
+                    let rows = p * PAGE as usize;
+                    base.st = Finished { history: st.history[..rows + usize::from(self.state_mtp)].to_vec(),
+                        valid: rows as i32, written_end: rows as i32, pf_end: rows as i32 };
+                    base.key = prefix_key(&base.st.history);
+                    if let Some(ix) = &mut tier.index {
+                        if ix.add(base).is_err() { self.index_errors += 1; }
+                        if tier.whole && ix.add(&updated_e).is_err() { self.index_errors += 1; }
+                    }
+                }
+                Some((bid, p))
+            },
             None => {
                 let s = p as u64 * PAGE;
                 let hlen = (s as usize + usize::from(self.state_mtp)).min(st.history.len());
@@ -1660,7 +1689,7 @@ impl Stash {
                     hits: 0,
                     tail: None,
                     state: 0,
-                    namespace: crate::pool::STOCK_NAMESPACE,
+                    namespace,
                 };
                 tier.entries.insert(ei, b_entry.clone());
                 if let Some(ix) = &mut tier.index {
@@ -1702,7 +1731,7 @@ impl Stash {
             hits,
             tail: None,
             state: self.state_blocks,
-            namespace: crate::pool::STOCK_NAMESPACE,
+            namespace,
         });
         if tier.index.is_some() && tier.whole {
             self.commits.push((te, id));
@@ -1759,8 +1788,8 @@ impl Stash {
             return Ok(None);
         }
         if let Some((eid, p)) = from {
-            if keep_from && stock && self.state_blocks > 0 {
-                if let Some(res) = self.sibling_share_state(eid, p, &st, pages, state_handle, hits, keep_id) {
+            if keep_from && self.state_blocks > 0 {
+                if let Some(res) = self.sibling_share_state(eid, p, &st, pages, state_handle, hits, keep_id, namespace) {
                     return Ok(res);
                 }
             } else if !keep_from {
@@ -1877,7 +1906,7 @@ impl Stash {
             if self.count_of(key) >= self.shared_after {
                 let exact = st.valid as u64 == s;
                 let already = self.tiers.iter().flat_map(|t| &t.entries).any(|e| {
-                    e.kind.prefix() && e.key == key && (!exact || e.state > 0)
+                    e.namespace == crate::pool::STOCK_NAMESPACE && e.kind.prefix() && e.key == key && (!exact || e.state > 0)
                 });
                 if already {
                     return Ok(());

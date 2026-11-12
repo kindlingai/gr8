@@ -330,6 +330,9 @@ int g6kv_stash_count(g6kv_stash* s, const int32_t* prompt, size_t n, int64_t spa
                      size_t namespace_bytes, int resident_continuing, uint32_t* out);
 int g6kv_stash_match(const g6kv_stash* s, const int32_t* prompt, size_t n, int32_t limit, const uint8_t* namespace_,
                      size_t namespace_bytes, g6kv_hit* out);
+// Read-only metadata; absent ids return NotRetained. Metadata is persisted with each entry.
+int g6kv_stash_info(const g6kv_stash* s, uint64_t id, uint32_t* tier, int32_t* valid, int32_t* pf_end,
+                    uint32_t* hits, size_t* full_pages);
 int g6kv_stash_restore(g6kv_stash* s, uint32_t tier, uint64_t id, const uint32_t* pages, size_t n_pages,
                        uint32_t state_handle, int32_t* out_valid, uint32_t* out_hits, size_t* out_pages);
 int g6kv_stash_capture(g6kv_stash* s, const int32_t* history, size_t n_history, int32_t valid, int32_t written_end,

@@ -164,7 +164,7 @@ ds41_defaults() {
   case $SESS in [1-9]|[12][0-9]|3[0-2]) ;; *) echo "engine_defaults: SESS=$SESS: DeepSeek-V4.1-Flash-1017 serves 1 to 32 sessions" >&2; return 2 ;; esac
   [ $((SESS * (MTP + 1))) -le 32 ] ||
     { echo "engine_defaults: SESS=$SESS MTP=$MTP: a round of $((SESS * (MTP + 1))) rows; DeepSeek-V4.1-Flash-1017 steps hold 32" >&2; return 2; }
-  # The DS41 serve path: MTP 0, split 0, no KV store, no --prefill (engine_args() passes none); prompts take the W-row prefill
+  # The DS41 serve path: MTP 0, split 0, no --prefill (engine_args() passes none); prompts take the W-row prefill
   # (GR8_DS_PREFILL_*), which several sessions need (below). Engram is off unless the box sets
   # EXTRA_ENV='GR8_DS_ENGRAM=1 GR8_DS_ENGRAM_PREFIX=/path/PREFIX' (the token ring of ds41_engram_ops.cuh covers one session from position 0,
   # MTP 0; the sidecar PREFIX.engram.* must be on every rank, same path; with GR8_DS_MTP=k also in EXTRA_ENV the engine refuses unless
@@ -172,7 +172,6 @@ ds41_defaults() {
   # saves a boot. Each line below goes when the engine takes the setting (DSpark serve, per-session attention buffers);
   # test_models.py holds the refusals.
   [ "$MTP" = 0 ] || { echo "engine_defaults: MTP=$MTP: DeepSeek-V4.1-Flash-1017 serves with MTP=0 (DSpark serve is not built)" >&2; return 2; }
-  case ${KV_STORE:-} in ''|off) ;; *) echo "engine_defaults: KV_STORE=$KV_STORE: DeepSeek-V4.1-Flash-1017 has no KV store" >&2; return 2 ;; esac
   # EXACT=1 (exact output): the old prefill stack (layers 0..20 on the range-A path, two lanes, W 4096, GR8_DS_SH_TC unset = 0).
   # The default is the release stack: the v2 sequence-parallel prefill (GR8_DS_PF_V2=1, docs/DEEPSEEK.md), whose tensor-core
   # shared expert (GR8_DS_SH_TC=1) changes the output bits. EXTRA_ENV GR8_DS_PF_V2=0 or GR8_DS_MHC_ROW_SHARD=1 (the 1M-context
@@ -560,6 +559,15 @@ engine_args() {
     [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
     [ "${REUSE:-0}" = 1 ] && a="$a --reuse-prefix"
     [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
+    # KV_STORE: one --kv-store per store (stores separated by ;), and what they keep
+    if [ -n "${KV_STORE:-}" ] && [ "$KV_STORE" != off ]; then
+      local t IFS=';'
+      for t in $KV_STORE; do [ -n "$t" ] && a="$a --kv-store $t"; done
+      unset IFS
+      [ -n "${KV_KEEP:-}" ] && a="$a --kv-keep $KV_KEEP"
+      [ -n "${KV_SYSTEM_AFTER:-}" ] && a="$a --kv-system-after $KV_SYSTEM_AFTER"
+      [ -n "${KV_WRITE_LIMIT:-}" ] && a="$a --kv-write-limit $KV_WRITE_LIMIT"
+    fi
     (set -f; echo $a)
     return
   fi

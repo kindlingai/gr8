@@ -84,6 +84,13 @@ fail at boot if the reserve cannot be allocated. No new knob is needed; see
 [SSD session extensions and reserve](engine/kvman-rs/SSD-TIER.md) for behavior, measurements, and limits.
 `./gr8 knobs KV_STORE` lists the existing fields.
 
+DeepSeek uses the same stores and keep policies alongside `GR8_DS_CACHE_MIB` (set to `0` for tier-only snapshots).
+Its immutable full pages are written only once per retained continuation; rolling state and partial-page rows are
+written at each snapshot, so total bytes can exceed the full-page-only `1.00x` ratio. `keep=system` checkpoints
+the exact 64-token boundary within the system span after `KV_SYSTEM_AFTER` conversations; a span shorter than
+64 tokens has no shared system checkpoint. Sessions admission requires a continuation hit. See
+[DS41 session stores](docs/DEEPSEEK.md#tiered-session-stores).
+
 ## Rank health
 
 The launcher does not run the rank health probe: run `scripts/rank_health.sh` with the same options before a boot if

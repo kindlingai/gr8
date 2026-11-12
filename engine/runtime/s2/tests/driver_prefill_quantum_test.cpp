@@ -65,6 +65,7 @@ struct Rank {
     std::map<uint64_t, std::vector<int>> out;   // request id -> emitted tokens
     std::map<uint64_t, int> first_main;         // request id -> position of the first MAIN row it ran
     std::vector<Pf> pf;                         // every prefill hook call
+    std::vector<int> main_ends;
     std::vector<Quantum> q;                     // every quantum step() returned
     std::vector<uint64_t> retired;              // request ids the retire hook saw
     long outside = 0;
@@ -78,6 +79,7 @@ struct Rank {
             if (uint64_t(first) + rows > uint64_t(s.run.pages) * PAGE) ++outside;
         };
         h.run = [this](const s2::Step& st) {
+            if (st.kind == s2::Step::MAIN) for (int end : st.ctx) main_ends.push_back(end);
             std::vector<int> ids;
             for (const auto& r : st.r) {
                 const Slot& s = d->state().slots()[r.sess];
@@ -259,7 +261,8 @@ static void check_replicated(uint32_t mtp, long& cases)
         for (auto& x : rk) x->d->apply(cm, p);
     };
     auto step_all = [&] {
-        std::vector<Quantum> q;
+        std::vector<int> main_ends;
+    std::vector<Quantum> q;
         for (auto& x : rk) q.push_back(step(*x));
         for (size_t i = 1; i < q.size(); ++i) {
             CHECK(q[i].kind == q[0].kind && q[i].count == q[0].count && q[i].first == q[0].first && q[i].rows == q[0].rows &&
@@ -407,8 +410,59 @@ static void check_first_light(uint32_t mtp, long& cases)
     CHECK(b.out[r.id] == a.out[r.id] && e.out[r.id] == a.out[r.id]);
 }
 
+static void checkpoint_boundary() {
+    for (bool two : {false, true}) for (bool decode : {false, true}) {
+        Rank a(cfg(1, 1024, two)), b(cfg(1, 1024, two));
+        const Req r = req(11, 1000, 8);
+        auto grant = grant_for(a, r, a.next_page);
+        grant.req.ckpt_at = 128;
+        Payload payload = payload_of(r, decode);
+        payload.chunk = 7; // not a divisor of 128: decode prompts also stop at the checkpoint
+        for (auto* rank : {&a, &b}) {
+            auto cm = commit_for(rank->s()); cm.admit = grant;
+            rank->d->apply(cm, &payload);
+        }
+        while (a.s().resident()) {
+            const auto qa = step(a), qb = step(b);
+            CHECK(qa.kind == qb.kind && qa.first == qb.first && qa.rows == qb.rows);
+            CHECK(a.s().digest() == b.s().digest());
+        }
+        CHECK(a.out[r.id] == b.out[r.id] && a.out[r.id] == solo(r, 1, decode ? 0 : 999));
+        if (decode) CHECK(std::find(a.main_ends.begin(), a.main_ends.end(), 128) != a.main_ends.end());
+        else CHECK(!a.pf.empty() && a.pf[0].first == 0 && a.pf[0].rows == 128);
+    }
+}
+// With a partially reused prefix, ranks must agree on decode_prompt too.
+static void reused_rank_digest() {
+    for (uint32_t reuse : {2u, 19u}) {
+        Rank a(cfg(1, 64, false)), b(cfg(1, 64, false));
+        const Req r = req(12, 20, 8);
+        auto g = grant_for(a, r, a.next_page);
+        g.reuse = reuse;
+        auto cm = commit_for(a.s()); cm.admit = g;
+        const auto decode = payload_of(r, true), prefill = payload_of(r, false);
+        a.d->apply(cm, &decode);
+        b.d->apply(cm, &prefill);
+        if (reuse < 19) {
+            CHECK(a.s().digest() != b.s().digest());
+            bool refused = false;
+            try { b.d->apply(commit_for(a.s())); }
+            catch (const std::runtime_error&) { refused = true; }
+            CHECK(refused);
+        } else {
+            // Both paths have exactly the same remaining tail at full prefix reuse.
+            CHECK(a.s().digest() == b.s().digest());
+            drain(a); drain(b);
+            CHECK(a.s().digest() == b.s().digest());
+            CHECK(a.out[r.id] == b.out[r.id]);
+            CHECK(a.first_main[r.id] == 19 && b.first_main[r.id] == 19);
+        }
+    }
+}
 int main()
 {
+    checkpoint_boundary();
+    reused_rank_digest();
     std::vector<uint32_t> mtps{2};
 #if G6_MODEL_DS41
     mtps.push_back(0);   // DS41 with no drafter (Config::validate)

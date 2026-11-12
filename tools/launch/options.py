@@ -686,6 +686,7 @@ def deprecated_kv(values, origin, warnings):
 #   remote:HOST:PORT|remote:auto,size=N(M|G|T)[,keep=RULE][,name=NAME][,cache=NAME][,group=NAME[,cap=N(M|G|T)][,weight=N]]
 # A YAML store file says the same things (kv_store_file), with these key names: {kind: {one-line key: YAML key}}
 KV_KEYS = {'cache': {'kind': 'kind', 'floor': 'floor'},
+           'mem': {'size': 'size_per_rank', 'keep': 'keep', 'name': 'name', 'cache': 'cache'},
            'ssd': {'size': 'size_per_rank', 'persist': 'persist', 'keep': 'keep', 'name': 'name', 'cache': 'cache'},
            'remote': {'size': 'size_per_rank', 'keep': 'keep', 'name': 'name', 'cache': 'cache', 'group': 'group',
                       'cap': 'cap_per_rank', 'weight': 'weight'}}
@@ -708,7 +709,7 @@ class KvError(OptionError):
 
 def kv_parse(v):
     """KV_STORE's one-line form parsed and checked: (caches {NAME: {'kind', 'floor'}}, stores in cascade order
-    [{'text', 'store', 'kind': 'ssd' | 'remote', 'path', 'host', 'port', 'size', 'persist', 'keep', 'name', 'cache',
+    [{'text', 'store', 'kind': 'ssd' | 'remote' | 'mem', 'path', 'host', 'port', 'size', 'persist', 'keep', 'name', 'cache',
     'group', 'cap', 'weight', 'settings': [(key, value) as written]}]). keep None = KV_KEEP; name defaults to the kind.
     Raises KvError naming the entry."""
     caches, stores = {}, []
@@ -738,14 +739,14 @@ def kv_parse(v):
             continue
         where = ('tier', len(stores))
         m = re.fullmatch(r'ssd:(.+)', head) or re.fullmatch(r'remote:([^:,]+)(?::(\d+))?', head)
-        if not m or (head.startswith('remote:auto') and m.group(2)):
-            raise KvError(f'--kv-store {text}: the store is ssd:PATH, remote:HOST:PORT or remote:auto', where)
-        t = {'text': text, 'store': head, 'kind': 'ssd' if head.startswith('ssd:') else 'remote', 'path': None,
+        if (not m and head != 'mem:') or (head.startswith('remote:auto') and m.group(2)):
+            raise KvError(f'--kv-store {text}: the store is ssd:PATH, remote:HOST:PORT, remote:auto or mem:', where)
+        t = {'text': text, 'store': head, 'kind': 'mem' if head == 'mem:' else 'ssd' if head.startswith('ssd:') else 'remote', 'path': None,
              'host': None, 'port': None, 'size': None, 'persist': False, 'keep': None, 'name': None, 'cache': None,
              'group': None, 'cap': None, 'weight': None, 'settings': settings}
         if t['kind'] == 'ssd':
             t['path'] = m.group(1)
-        else:
+        elif t['kind'] == 'remote':
             t['host'], t['port'] = m.group(1), m.group(2)
         for k, x in settings:
             if k == 'persist' and t['kind'] != 'ssd':
@@ -776,7 +777,7 @@ def kv_parse(v):
             raise KvError(f'--kv-store {text}: cap= and weight= need group=', where)
         stores.append(t)
     # an unnamed store is named for its kind, or kind-N when its kind repeats
-    unnamed = {k: [t for t in stores if t['kind'] == k and not t['name']] for k in ('ssd', 'remote')}
+    unnamed = {k: [t for t in stores if t['kind'] == k and not t['name']] for k in ('ssd', 'remote', 'mem')}
     for k, ts in unnamed.items():
         for n, t in enumerate(ts, 1):
             t['auto'] = k if len(ts) == 1 else f'{k}-{n}'
@@ -839,7 +840,7 @@ def kv_yaml(caches, stores):
     for t in stores:
         given = dict(t['settings'])
         tier = {KV_KEYS[t['kind']][k]: given[k] for k in ('keep', 'name', 'cache') if k in given}
-        store = {('path' if t['kind'] == 'ssd' else 'address'): t['store'].split(':', 1)[1]}
+        store = {} if t['kind'] == 'mem' else {('path' if t['kind'] == 'ssd' else 'address'): t['store'].split(':', 1)[1]}
         store.update({KV_KEYS[t['kind']][k]: value(k, x) for k, x in t['settings'] if k not in ('keep', 'name', 'cache')})
         head = '- '
         for k, x in tier.items():
@@ -1000,13 +1001,15 @@ def kv_store_text(text, path='-'):
         if 'store' not in t:
             fail(where, 'no store')
         store = want(f'{where}.store', t['store'], dict)
-        if len(store) != 1 or next(iter(store)) not in ('ssd', 'remote'):
-            fail(f'{where}.store', 'want one of ssd: or remote:')
+        if len(store) != 1 or next(iter(store)) not in ('ssd', 'remote', 'mem'):
+            fail(f'{where}.store', 'want one of ssd:, remote: or mem:')
         kind, s = next(iter(store.items()))
         where_s = f'{where}.store.{kind}'
         address = 'path' if kind == 'ssd' else 'address'
         on_store = {y: k for k, y in KV_KEYS[kind].items() if y not in ('keep', 'name', 'cache')}
         keys(where_s, want(where_s, s, dict), (address, *on_store))
+        if kind == 'mem':
+            s = dict(s, address='')
         if address not in s:
             fail(where_s, f'no {address}')
         settings = [(f'{where}.{y}', k, t[y]) if y in ('keep', 'name', 'cache') else (f'{where_s}.{y}', k, s[y])

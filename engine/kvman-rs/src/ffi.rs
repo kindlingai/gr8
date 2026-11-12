@@ -1303,6 +1303,24 @@ pub unsafe extern "C" fn g6kv_stash_match(
 }
 
 /// # Safety
+/// `s` must be live; all outputs are writable or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_stash_info(
+    s: *const StashHandle, id: u64, tier: *mut u32, valid: *mut i32,
+    pf_end: *mut i32, hits: *mut u32, full_pages: *mut usize,
+) -> i32 {
+    if s.is_null() { return Error::BadArgument.code(); }
+    let locked = (*s).lock();
+    let Some((t, e)) = locked.entry_info(id) else { return Error::NotRetained.code(); };
+    if !tier.is_null() { *tier = t; }
+    if !valid.is_null() { *valid = e.st.valid; }
+    if !pf_end.is_null() { *pf_end = e.st.pf_end; }
+    if !hits.is_null() { *hits = e.hits; }
+    if !full_pages.is_null() { *full_pages = e.below(); }
+    0
+}
+
+/// # Safety
 /// `s` must be live; `pages` points at `n_pages` u32s. Output pointers may be NULL.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]

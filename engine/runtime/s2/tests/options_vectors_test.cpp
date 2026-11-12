@@ -127,11 +127,11 @@ int main(int argc, char** argv)
     const std::string shape = std::string(model_tag) + " nr" + std::to_string(g6nr::NR) + " mx" + std::to_string(g6mx::MX);
     struct Want { const char* shape; size_t n; uint64_t hash; };
     const Want wants[] = {
-        {"glm53 nr6 mx8", 122, 0xe80ac959f044daf8ull},
-        {"glm53 nr4 mx32", 122, 0x90c53302b108f89cull},
-        {"glm53-kv4 nr4 mx32", 122, 0xeb128b40cbc92c4full},
+        {"glm53 nr6 mx8", 122, 0xfca3a9ad9ed99a08ull},
+        {"glm53 nr4 mx32", 122, 0xad3df6876333df30ull},
+        {"glm53-kv4 nr4 mx32", 122, 0x0dfa02903a1c7979ull},
         {"glm53f nr4 mx32", 116, 0x2920b0d6c121e568ull},
-        {"ds41 nr4 mx48", 116, 0x07ec2d75cdd0d055ull},
+        {"ds41 nr4 mx48", 118, 0x5e95286ce5c99f40ull},
     };
     const std::vector<Case> cs = read_cases(argv[1], model);
     uint64_t h = 14695981039346656037ull;

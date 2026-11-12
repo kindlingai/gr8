@@ -408,6 +408,17 @@ public:
         return h;
     }
 
+    struct Info {
+        uint32_t tier = 0, hits = 0;
+        int32_t valid = 0, pf_end = 0;
+        size_t pages = 0;
+    };
+    Info info(uint64_t id) const {
+        Info x;
+        ck(g6kv_stash_info(s_, id, &x.tier, &x.valid, &x.pf_end, &x.hits, &x.pages));
+        return x;
+    }
+
     struct Restored {
         int32_t valid = 0;
         uint32_t hits = 0;

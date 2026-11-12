@@ -7,6 +7,7 @@
 // hooks (run, emit, prompt, round, dfl, dfl_start) must not call stats() or emitted(), which read the Batch; the other
 // hooks may call any getter. No hook may call apply() or step(): the Rust refuses them.
 #pragma once
+#include <numeric>
 #include "../image_input.h"
 #include "scheduler.h"
 #include "cp_rows.h"
@@ -196,7 +197,11 @@ class Driver {
             Impl& m = of(c);
             return m.guard([&] {
                 const Payload& p = m.payload[slot];
-                m.batch.admit({int(slot)}, {{p.prompt, first, p.chunk, n_gen, dfl, p.ins}});
+                int chunk = p.chunk;
+                const auto at = m.view.slots()[slot].req.ckpt_at;
+                if (p.decode_prompt && at > uint32_t(first))
+                    chunk = std::gcd(chunk, int(at - uint32_t(first)));
+                m.batch.admit({int(slot)}, {{p.prompt, first, chunk, n_gen, dfl, p.ins}});
             });
         }
         static int32_t t_admit_pack(void* c, const uint32_t* slots, const int32_t* firsts, const int32_t* n_gens, uint32_t n) noexcept {

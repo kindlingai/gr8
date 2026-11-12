@@ -189,16 +189,14 @@ int main(int argc, char** argv)
     const bool &image = eo.image, &hash = eo.hash, &reuse_prefix = eo.reuse_prefix;
     const std::string& s2dir = eo.s2dir;
     const std::string& grammar_dir = eo.grammar_dir;
-#if !G6_MODEL_DS41
     const std::vector<std::string>& kv_tiers = eo.kv_tiers;
-#endif
-#if !G6_MODEL_FLASH && !G6_MODEL_DS41
+#if !G6_MODEL_FLASH
     const std::string& kv_keep = eo.kv_keep;
     const int& kv_system_after = eo.kv_system_after;
     const double& kv_write_limit = eo.kv_write_limit;
 #endif
     const std::string& kv_format = eo.kv_format;
-#if !G6_MODEL_FLASH && !G6_MODEL_DS41
+#if !G6_MODEL_FLASH
     const bool& kv_old = eo.kv_old;
 #endif
     const std::string& set_id = eo.set_id;
@@ -1738,6 +1736,8 @@ int main(int argc, char** argv)
             size_t budget_mib = 4096;
             if (const auto mib = knob::ds_cache_mib()) budget_mib = (size_t)*mib;
             ds41_cache = std::make_unique<g6s2::Ds41PrefixCache>(m, dsk.on() ? &ds : nullptr, budget_mib);
+            ds41_cache->open_stores(kv_tiers, kv_old, kv_keep, kv_system_after, kv_write_limit, set_id,
+                                    g6nr::NR, m.ds_slots, (cap + 63) / 64);
             dc.ckpt = ds41_cache.get();
             fprintf(stderr, "# rank %d ds41 prefix cache budget %zu MiB\n", R, budget_mib);
         }

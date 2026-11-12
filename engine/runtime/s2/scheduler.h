@@ -31,7 +31,8 @@ constexpr unsigned PACK_MAX_MEMBERS = unsigned(g6mod::INFO.pack_members);
 // 6 adds Commit::hold. 7 adds the Resize event (Commit::resize). 9 adds Ack::room (8 is the fail-soft store's, #159).
 // 10 adds the steering profile slot. 11 adds Request::r_rows. 12 adds Commit::shrink. 13 adds 32 session slots and the
 // DS41 prefill packs. 14 adds the image digest to a request's identity (DS41 image input).
-constexpr unsigned CONTROL_VERSION = 14;
+// 15 adds an optional exact prefill checkpoint boundary (zero leaves scheduling unchanged).
+constexpr unsigned CONTROL_VERSION = 15;
 constexpr uint32_t MAX_DECODE_ROUNDS = 64;   // Config::decode_rounds bound
 // Prefill choice (Scheduler::next): of the sessions with prompt rows left, the one with the fewest runs next, so a short
 // request admitted behind a long prefill is served instead of waiting out every quantum of it (#61). Shortest-first
@@ -100,6 +101,7 @@ struct Request {
     uint32_t prompt_tokens = 0, max_tokens = 0;
     g6rt::steering::Identity steering{};
     uint32_t r_rows = 0;   // the R its run takes (pool.h), the head's choice at admission: 0 = the pool's, else Config::r2_rows
+    uint32_t ckpt_at = 0;   // optional exact prefill boundary
 };
 template <class T, class F> inline T sch_out(F f) { T v{}; check(f(&v)); return v; }
 inline uint64_t reserve_rows(const Config& c, const Request& r);
