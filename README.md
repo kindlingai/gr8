@@ -99,6 +99,41 @@ the engine only.
 | GLM-5.3, 737K context (T5X) | 5 | [glm-5.3-exlr8-5x-spark](https://github.com/kindlingai/glm-5.3-exlr8-5x-spark) |
 | GLM-5.3, 1M context (K3) | 6 | [glm-5.3-exlr8-6x-spark](https://github.com/kindlingai/glm-5.3-exlr8-6x-spark) |
 
+## Building on gr8
+
+Current release: **[`v1.0`](https://github.com/kindlingai/gr8/releases/tag/v1.0)** ·
+[All releases](https://github.com/kindlingai/gr8/releases) · [Release and pinning rules](RELEASING.md)
+
+Recipes, tools, and deployments built on gr8 should pin an immutable `v*` release image by tag and `sha256` digest (or
+an exact merged `main` / `stable` commit when tuning ahead of the next tag) — never a moving tag such as `:latest`,
+`:main`, or `:stable`:
+
+```yaml
+# compose.yaml
+services:
+  gr8:
+    image: ${GR8_IMAGE:-ghcr.io/kindlingai/gr8:v1.0@sha256:11ff2823184b0512ae62e0f1c281c46941cfb0fd81096e1dac4c313ad3fe9413}
+```
+
+Use the same `v1.0@sha256:...` reference in `FROM` for a thin wrapper `Dockerfile`, or `git -C gr8 checkout v1.0` when
+pinning gr8 as a submodule.
+
+If you are an agent (or developer) building on gr8, start from the matching entry point:
+
+- **Start a cluster for someone:** Read [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md) and ask its setup questions before the
+  first boot; [docs/DEPLOY.md](docs/DEPLOY.md) covers Docker Compose, bare metal, and Kubernetes.
+- **Package a standalone recipe:** Base `compose.yaml` and `.env.example` on
+  [docker/compose.yaml](docker/compose.yaml) and [docker/.env.example](docker/.env.example) (leave option defaults in
+  the launcher rather than duplicating them in Compose), check valid options with `./gr8 knobs` and
+  [KNOBS.md](KNOBS.md), record the `"engine"` pin and measured results in `kindling.json`
+  ([RELEASING.md](RELEASING.md#4-how-recipes-pin-gr8)), and redraw `docs/card.png` from a gr8 checkout with
+  `python3 bench/gif.py card <recipe>/kindling.json --out <recipe>/docs/card.png`.
+- **Build a client, tool, or dashboard:** Call the OpenAI-compatible HTTP API on head port `8100`
+  ([frontend/README.md](frontend/README.md); internal wire protocol in [PROTOCOL.md](PROTOCOL.md)), poll `/health` and
+  `/metrics` (plus localhost-only `/health?deep`), and use `./gr8 <model> status|smoke|down` or `./gr8 switch`
+  ([docs/SWITCHING.md](docs/SWITCHING.md)) for cluster control.
+- **Change gr8 itself:** Read [AGENTS.md](AGENTS.md) before editing engine, launcher, or front-end code.
+
 ## What gr8 does today
 
 - **Three models, one to six boxes.** GLM-5.3 on three to six boxes, GLM-5.3-Flash on one to four, DeepSeek-V4.1-Flash
