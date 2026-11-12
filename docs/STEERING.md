@@ -71,8 +71,11 @@ requests. It is a qualification mode; without it, loading alone never selects re
 boot flags.
 
 Stock and selected resident prefix caches are separated by exact manifest/scope/schedule/scale identity. Selected
-state is not persisted into stock SSD/remote tiers. Target decode, prefill, prompt tails, teacher-forced scoring and
-speculative target verification carry the selection; draft models and padding remain unselected. Decode carries it
+runs never share or pollute stock prefix entries. Stored SSD/remote session entries carry the exact 70-byte selection
+namespace, invisible to stock or other selections. A `persist=on` SSD session store (`keep=sessions` or `keep=all`)
+preserves them across restarts when the same profile/scale identity is loaded; `keep=system` prefix indexes stay
+stock-only. Target decode, prefill, prompt tails, teacher-forced scoring and speculative target verification carry the
+selection; draft models and padding remain unselected. Decode carries it
 whether a request runs alone or shares S2 batched steps with other sessions: with a `shared` profile every rank prints
 `steering S2: X of Y S2 MoE layer bindings carry the shared-scope finalize steering` after graph capture, and X / Y is
 the profile's MoE layers over all MoE layers. All ranks must run the same engine build and agree on the loaded receipt.

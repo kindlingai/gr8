@@ -75,7 +75,8 @@ the `FLASH_KV_*` and `FLASH_CAP_POLICY` options (`./gr8 knobs FLASH_`).
 
 ## SSD session store (`KV_STORE`)
 
-`KV_STORE=ssd:/data/gr8kv,size=200G,persist=on,keep=sessions` keeps committed session KV across restarts.
+`KV_STORE=ssd:/data/gr8kv,size=200G,persist=on,keep=sessions` keeps committed session KV across restarts,
+both stock and steered chats (also with `keep=all`), each isolated to its exact steering profile and scale.
 Continuing sessions reuse their stored full page blocks and write only new pages when evicted or drained at quit;
 with reuse alignment disabled, the changed partial page is rewritten too. A hit on its own resident run does not
 spill it. Linux SSD stores fully allocate their `size=` budget (rounded down to whole blocks) before opening, and

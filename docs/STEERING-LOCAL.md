@@ -38,7 +38,10 @@ version 4 loaded receipt. All ranks must run the same build. The API/shim expose
 
 With a loaded profile named `example`, request `steering_profile: "example"` and an optional `steering_scale` in
 `[0,4]` (default 1). Omission or selected scale zero runs stock; unknown names fail even at zero. Exact profile/scale
-identity separates stock and selected resident caches. Nonstock cache state is not persisted to stock SSD/remote tiers.
+identity separates stock and selected resident caches. Non-stock runs never share or pollute stock prefix entries.
+Stored SSD/remote session entries carry the exact 70-byte selection namespace, invisible
+to stock or other selections. A `persist=on` SSD session store (`keep=sessions` or `keep=all`) preserves them across
+restarts when the same profile/scale identity is loaded; `keep=system` prefix indexes stay stock-only.
 Target prefill, prompt tails, teacher-forced scoring and speculative target verification carry the request scale;
 draft rows and padding remain zero. MoE shared scope uses the shared finalizers; full scope uses the general consumes.
 

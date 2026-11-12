@@ -146,8 +146,9 @@ Block stores alone do not extend a single request: a request still needs local p
 keep the KV of finished turns, so an agent's next turn after its session left the pool costs a read instead of a
 prefill. `--kv-keep` (or `keep=` per store) picks what they keep: `system` prompts, `sessions`, or `all`.
 
-An `ssd:` store with `persist=on` and `keep=sessions` (or `all`) also keeps open chats across a restart. At an orderly
-`down` the engine stores every run the pool still holds, and the store's index records them, so after the next `up`
+An `ssd:` store with `persist=on` and `keep=sessions` (or `all`) also keeps stock and steered chats across a restart,
+each isolated to its exact steering profile and scale. At an orderly `down` the engine stores every run the pool still
+holds, and the store's index records them, so after the next `up`
 a chat's next turn reads its KV back instead of a prefill. The quit then gets up to 120 s (10 s otherwise); under docker
 set `GR8_STOP_GRACE=150s`. A crash or SIGKILL skips the store, and the next boot keeps only what serving stored.
 The stored KV belongs to one engine build: after an upgrade or rebuild (or another model, layout or block format) the

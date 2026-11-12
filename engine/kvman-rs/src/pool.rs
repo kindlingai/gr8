@@ -129,7 +129,7 @@ pub struct Kept {
     pub from: Option<(u64, usize)>,
 }
 
-/// Opaque cache identity. Only the all-zero namespace participates in stored tiers.
+/// Opaque cache identity. STOCK_NAMESPACE (all zero) selects unsteered stock behavior.
 pub const NAMESPACE_BYTES: usize = 70;
 pub type Namespace = [u8; NAMESPACE_BYTES];
 pub const STOCK_NAMESPACE: Namespace = [0; NAMESPACE_BYTES];
@@ -198,6 +198,7 @@ pub struct Pool {
     next_span: Option<u64>,
     next_continues: bool,    // count() found the next grant continues a conversation
     next_len: Option<usize>, // the next grant's prompt length (any namespace), for the write limit's credit
+    next_prompt: Option<(Namespace, Vec<i32>)>, // the next grant's (namespace, prompt), for next_continues_run
     next_from: Option<(u64, usize)>, // the next grant's provenance (Kept::from), set by a hit just before its grant
     // resize (#153): pages [0, place) come in chunks of `chunk` pages (0 = off). An offline chunk's pages hold no live
     // or retained run and are not counted anywhere, so the engine may release their memory.
@@ -248,6 +249,7 @@ impl Pool {
             next_span: None,
             next_continues: false,
             next_len: None,
+            next_prompt: None,
             next_from: None,
             chunk: 0,
             offline: Vec::new(),
@@ -656,8 +658,10 @@ impl Pool {
     /// `span`: the tokens of the prompt's system span (system message and tool definitions as templated), when the
     /// front end sent it.
     pub fn count(&mut self, prompt: &[i32], span: Option<u32>) -> u32 {
+        self.next_prompt = None;
         let Some(s) = &self.stash else { return 0 };
         self.next_tokens = Some(prompt.to_vec());
+        self.next_prompt = Some((STOCK_NAMESPACE, prompt.to_vec()));
         self.next_len = Some(prompt.len());
         self.next_span = span.map(|x| s.span_rows(x, prompt.len()));
         if !s.counting() {
@@ -734,6 +738,7 @@ impl Pool {
             return self.count(prompt, span);
         }
         self.next_tokens = None;
+        self.next_prompt = self.stash.is_some().then(|| (namespace, prompt.to_vec()));
         self.next_len = Some(prompt.len());
         self.next_span = None;
         // a non-stock prompt that continues a run of its own namespace (retained or stored) counts as continued, so a
@@ -809,18 +814,18 @@ impl Pool {
         s.put_evicted(gone, below, &resident);
     }
 
-    // hits of a run granted from `src` (its finished state and hits): one more when the prompt continues it
-    fn hits_from(&self, st: &Finished, hits: u32) -> u32 {
-        if self.next_continues_run(st) {
+    // hits of a run granted from `src` (its finished state, hits and namespace): one more when the prompt continues it
+    fn hits_from(&self, st: &Finished, hits: u32, namespace: Namespace) -> u32 {
+        if self.next_continues_run(st, namespace) {
             hits.saturating_add(1)
         } else {
             0
         }
     }
 
-    // whether the next grant's (stock) prompt continues the run or stored entry `st`: holds its prompt
-    fn next_continues_run(&self, st: &Finished) -> bool {
-        matches!(&self.next_tokens, Some(p) if continues(p, &st.history, st.pf_end.max(0) as usize))
+    // whether the next grant's prompt continues the run or stored entry `st` in its own namespace
+    fn next_continues_run(&self, st: &Finished, namespace: Namespace) -> bool {
+        matches!(&self.next_prompt, Some((ns, p)) if *ns == namespace && continues(p, &st.history, st.pf_end.max(0) as usize))
     }
 
     pub fn exclusive(&self, rows: u64) -> bool {
@@ -1278,8 +1283,8 @@ impl Pool {
         }
         self.check_version()?;
         let e = self.stash.as_mut().expect("found in it").begin_restore(tier, id);
-        let hits = self.hits_from(&e.st, e.hits);
-        let cont = self.next_continues_run(&e.st);
+        let hits = self.hits_from(&e.st, e.hits, e.namespace);
+        let cont = self.next_continues_run(&e.st, e.namespace);
         self.earn(n, a);
         let (list, gone, exclusive, pool_base) = if past(worst, rp) {
             if self.nr == 0 {
@@ -1438,10 +1443,10 @@ impl Pool {
         }
         self.check_version()?;
         let k = self.kept.remove(i);
-        let hits = self.hits_from(&k.st, k.hits);
+        let hits = self.hits_from(&k.st, k.hits, k.namespace);
         let full = (skip as u64 / PAGE) as usize;
         // the grant's full pages below the hit are k's: k's provenance carries over to them (Kept::from)
-        let from = k.from.filter(|_| self.next_continues_run(&k.st)).map(|(id, n)| (id, n.min(full)));
+        let from = k.from.filter(|_| self.next_continues_run(&k.st, k.namespace)).map(|(id, n)| (id, n.min(full)));
         self.earn(n, a);
         // the grant keeps the run's first a pages and writes past its skip: what the run held beyond that goes to a
         // tier, read before the grant writes. Below R, only what a tier would store of it (stash.rs storable) counts;
@@ -1801,6 +1806,7 @@ impl Pool {
         self.log_claim(how, &r, rows, gone);
         let tokens = self.next_tokens.take().unwrap_or_default();
         self.next_len = None;
+        self.next_prompt = None;
         let span = self.next_span.take();
         // a run that continues its conversation counts as continued once, even when it found nothing to reuse
         let hits = hits.max(std::mem::take(&mut self.next_continues) as u32);

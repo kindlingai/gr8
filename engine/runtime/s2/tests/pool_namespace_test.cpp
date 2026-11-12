@@ -3,6 +3,8 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <filesystem>
 #include <vector>
 using namespace g6s2;
 using g6rt::CacheNamespace;
@@ -138,8 +140,83 @@ static void store(const char* spec) {
     pool.release(r); g6kv_tier_free(tier);
 }
 
+static void whole_index() {
+    char tmp[] = "/tmp/g6kv-namespace-whole-XXXXXX";
+    const char* dir = mkdtemp(tmp); CHECK(dir != nullptr);
+    if (!dir) return;
+    CacheNamespace ns{}; ns[0] = 9;
+    auto other_ns = ns; other_ns.back() = 1;
+    const auto p = prompt();
+    auto p2 = p;
+    for (int i = 192; i < 320; ++i) p2.push_back(i);
+    g6rt::PrefixReuse rules; rules.noend = true; rules.grid = 128;
+    g6kv_tier* tier = nullptr;
+    CHECK(g6kv_tier_open("mem:", "ns-whole", sizeof(Page), 16, &tier) == 0);
+    if (!tier) { std::filesystem::remove_all(dir); return; }
+    std::array<Page, 8> dev{};
+    std::vector<uint8_t> buffer(g6kv_tier_block_bytes(tier));
+    auto copies = [&](RunPool& pool) {
+        const auto io = pool.io();
+        for (const auto& x : io) {
+            CHECK(x.part == 0 && x.tier == 0);
+            if (x.kind == 0) {
+                std::memcpy(buffer.data(), dev[x.page].data(), sizeof(Page));
+                CHECK(g6kv_tier_write(tier, x.slot, buffer.data()) == 0);
+            } else if (x.kind == 2) {
+                CHECK(g6kv_tier_read(tier, x.slot, buffer.data()) == 0);
+                std::memcpy(dev[x.page].data(), buffer.data(), sizeof(Page));
+            } else CHECK(false);
+        }
+        CHECK(pool.io_done() == nullptr);
+        return io.size();
+    };
+    {
+        RunPool pool(8, 8, 512);
+        pool.keep(rules); pool.stores(2); pool.add_tier(16, 2 | 4, dir, "ns-whole");
+        pool.policy(0, 0, 1, 0);
+        CHECK(pool.tiers_loaded() == 0);
+        CHECK(pool.count(p, 128, ns) == 0);
+        auto r = pool.reserve(192, 256);
+        auto list = pool.list(r);
+        for (size_t i = 0; i < p.size(); ++i) dev[list[i / 64]][i % 64] = p[i] + 10000;
+        pool.retain(r, finished(p, ns)); CHECK(copies(pool) == 0);
+        CHECK(pool.count(p2, 128, ns) == 0);
+        const auto h = pool.match(p2, 320, 384, 319, ns);
+        CHECK(!h.stored && h.skip >= 128);
+        r = pool.take(h, 320, 384); CHECK(copies(pool) == 0);
+        list = pool.list(r);
+        for (size_t i = 0; i < p2.size(); ++i) dev[list[i / 64]][i % 64] = p2[i] + 10000;
+        pool.retain(r, finished(p2, ns)); CHECK(copies(pool) == 0);
+        const auto all = pool.reserve(512); CHECK(copies(pool) > 0); pool.release(all);
+    }
+    dev = {}; // the new process has none of the old device bytes
+    {
+        RunPool pool(8, 8, 512);
+        pool.keep(rules); pool.stores(2); pool.add_tier(16, 2 | 4, dir, "ns-whole");
+        CHECK(pool.tiers_loaded() == 0);
+        const auto h = pool.match(p2, 320, 384, 319, ns);
+        CHECK(h.stored && h.skip >= 128);
+        CHECK(pool.match(p2, 320, 384, 319).skip == 0);
+        CHECK(pool.match(p2, 320, 384, 319, other_ns).skip == 0);
+        pool.count(p2, 128, ns);
+        const auto r = pool.take(h, 320, 384); CHECK(copies(pool) > 0);
+        const auto list = pool.list(r);
+        for (int i = 0; i < h.skip; ++i) CHECK(dev[list[i / 64]][i % 64] == p2[i] + 10000);
+        pool.release(r);
+    }
+    {
+        RunPool pool(8, 8, 512);
+        pool.keep(rules); pool.stores(2); pool.add_tier(16, 1, dir, "ns-whole");
+        CHECK(pool.tiers_loaded() >= 1);
+        CHECK(pool.tiers()[0].free_slots == 16);
+        CHECK(pool.match(p2, 320, 384, 319, ns).skip == 0);
+    }
+    g6kv_tier_free(tier);
+    std::filesystem::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
-    prefix(); ffi(); adapter();
+    prefix(); ffi(); adapter(); whole_index();
     if (argc == 1) store("mem:");
     for (int i = 1; i < argc; ++i) store(argv[i]);
     std::printf("pool_namespace_test: %s\n", fails ? "FAIL" : "PASS");
