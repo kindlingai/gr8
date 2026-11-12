@@ -155,3 +155,31 @@ On a booted cluster, from the head:
   `GR8_GLM53F_S2_COST` set as the engine had it and, when that is 1, `-DG6_NR=` the engine's width.
 
 `ds41_v2_w16k_test` exercises wide planner routing/up/down (both relayout modes), capacity admission and Engram wire exactness under an explicit <384 MiB allocation budget. `test_ds41_v2_s8_combo_gpu` also covers compact-width M=8257/12288, all four send/FFN modes, skip-late and tracing. Both are synthetic correctness checks, not speed evidence.
+
+### Bounded expert-log hygiene regression
+
+`engine/tests/test_ds41_elog_hygiene_gpu.cu` calls the production router at 48
+rows with synthetic gate inputs. Eager decode and CUDA graph captures must leave
+no records; eager prefill must record its window start. Both decode-flag-true
+captures and startup decode-flag-false captures are replayed, the latter with
+both flag values (main and verification graph behavior). A stale cursor must survive
+non-reset `elog_begin` calls and be cleared by explicit reset. The test routes
+all device buffers (including the router's base scratch) through `v2test::Arena`
+with a strict 32 MiB cap, verifies allocation guards and immutable input hashes,
+and requires zero live bytes on exit. It does not run the shared/routed experts.
+
+Build and run separately, with output outside the source tree (`OUT` is an
+absolute writable directory; CUDA 13, `sm_120a` below):
+
+```sh
+export CUDA_DEVICE_MAX_CONNECTIONS=32 CUDA_MODULE_LOADING=EAGER
+mkdir -p "$OUT"
+cargo build --release --features capi --manifest-path engine/knobs-rs/Cargo.toml
+nvcc -O2 -std=c++17 -gencode=arch=compute_120a,code=sm_120a \
+  -DG6_MODEL_DS41=1 -DG6_NR=4 -DG6_MX=48 -DPF_FC2GL=4 \
+  engine/tests/test_ds41_elog_hygiene_gpu.cu \
+  engine/knobs-rs/target/release/libgr8knobs.a -lcublas -lpthread -ldl -lm \
+  -o "$OUT/test_ds41_elog_hygiene_gpu"
+"$OUT/test_ds41_elog_hygiene_gpu"
+compute-sanitizer --tool memcheck --error-exitcode 1 "$OUT/test_ds41_elog_hygiene_gpu"
+```

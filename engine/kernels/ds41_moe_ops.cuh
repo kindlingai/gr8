@@ -113,7 +113,7 @@ struct RoScratch                                      // read-once path, M RO_FR
 };
 struct Scratch
 {
-    dsr::ExpertLog* elog = nullptr;   // distinct-expert ring (ds_ro.h), written by every prefill router call (rows > 32); read with elog_read
+    dsr::ExpertLog* elog = nullptr;   // distinct-expert ring (ds_ro.h), written by eager prefill router calls (rows > 32); read with elog_read
     RoScratch* ro = nullptr;   // set by prepare_moe(M >= RO_FROM)
     PwScratch* pw = nullptr;   // set by prepare_moe(M > MTMAX)
     float* logits;          // [32][NE] gate logits
@@ -151,6 +151,14 @@ struct LayerState
 };
 
 inline bool elog_on() { return knob::ds_moe_elog(); }   // the distinct-expert counter (GR8_DS_MOE_ELOG, default on)
+// Log eager prefill only: startup graphs can be captured with the decode flag
+// false, but replay as decode or verification steps. Never bake log nodes in.
+inline bool elog_step_on(const Model& m, cudaStream_t st)
+{
+    if (!elog_on() || m.ds_moe_decode_step) return false;
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    return cudaStreamIsCapturing(st, &cs) == cudaSuccess && cs == cudaStreamCaptureStatusNone;
+}
 inline bool pdl_on() { return knob::ds_moe_pdl(); }
 // GR8_DS_SH_TC=1 (default 0): the shared expert of the read-once path (rows >= RO_FROM) runs
 // act_quant(hc_y) -> TC GEMM fc1 (M x 2IW x HID) -> k_sh_swiglu_q -> TC GEMM fc2 (M x HID x SH_KP) -> bf16 Y, and the combine reads that bf16 Y (k_combine_mt_shb).
@@ -715,7 +723,7 @@ inline int router_pw(Model& m, const LayerState& s, int M, cudaStream_t st)
     mx4::build_xfrag_mt<0><<<(nt * HID * 4 + 255) / 256, 256, 0, st>>>(m.hc_y, M, HID, nt, q.xfrag);
     launch(false, dsr::k_gate_logits_mt<NE, 0>, dim3(NE / 8), dim3(256), st, (const __nv_bfloat16*)s.gate, (const __nv_bfloat16*)m.hc_y, M, q.logits);
     launch(false, dsr::k_plan_pw<NE, TK, MM, KC>, dim3(1), dim3(dsr::PLAN_THREADS), st, (const float*)q.logits, s.bias, M, (dsr::PlanMT<TK, MM>*)q.plan, s.bias_vl && m.vis_n > 0 ? s.bias_vl : nullptr, s.bias_vl && m.vis_n > 0 ? (const unsigned char*)m.vis_flag : nullptr);
-    if (elog_on()) launch(false, dsr::k_expert_log<NE, TK, MM, KC>, dim3(1), dim3(256), st, (const dsr::PlanMT<TK, MM>*)q.plan, M, s.layer, s.sc->elog);
+    if (elog_step_on(m, st)) launch(false, dsr::k_expert_log<NE, TK, MM, KC>, dim3(1), dim3(256), st, (const dsr::PlanMT<TK, MM>*)q.plan, M, s.layer, s.sc->elog);
     return (int)cudaGetLastError();
 }
 // M 33..SH1_MAX: the shared expert in one pass, NT = 6 tiles (the 32-row chunk loop below re-reads the 9.12 MB of weights once per chunk). 6 is the most
@@ -801,7 +809,7 @@ inline int router_ro(Model& m, const LayerState& s, int M, cudaStream_t st)
     launch(false, dsr::k_scan_ro<NE, TK, ROMAX>, dim3(1), dim3(NE), st, (P*)q.plan, (const unsigned*)q.emask, q.tile0_of);
     launch(false, dsr::k_place_ro<NE, TK, ROMAX, KC>, dim3((M * TK + 255) / 256), dim3(256), st, (P*)q.plan, (const unsigned*)q.emask, (const int*)q.tile0_of, M);
     if (ro_order_on()) launch(false, dsr::k_order_ro<NE, TK, ROMAX>, dim3(1), dim3(NE), st, (const P*)q.plan, q.order);
-    if (elog_on()) launch(false, dsr::k_expert_log<NE, TK, ROMAX, KC>, dim3(1), dim3(256), st, (const P*)q.plan, M, s.layer, s.sc->elog);
+    if (elog_step_on(m, st)) launch(false, dsr::k_expert_log<NE, TK, ROMAX, KC>, dim3(1), dim3(256), st, (const P*)q.plan, M, s.layer, s.sc->elog);
     return (int)cudaGetLastError();
 }
 // GR8_DS_SH_TC=1: four launches, all on st (plain): act_quant(hc_y) -> fc1 GEMM -> swiglu + act_quant -> fc2 GEMM. Y bf16 [M][HID] into sh_out (aliased).
@@ -995,7 +1003,7 @@ inline int op_experts(void* model, int i, int rows, void* stream)
 
 // Distinct-expert counter, host side. elog_read copies the device ring (one synchronous cudaMemcpy: call it between windows or at exit, never inside a
 // capture) and returns the records in call order (oldest first; at most ELOG_N, the newest when the ring wrapped). elog_reset zeroes the ring.
-// elog_print: one line per record + the mean distinct experts per (layer, rows). Records exist for prefill calls only (rows > 32).
+// elog_print: one line per record + the mean distinct experts per (layer, rows). Records exist for eager prefill calls only (rows > 32); decode steps and CUDA graph captures are skipped.
 inline int elog_read(const Model* m, std::vector<dsr::ExpertLogRec>& out, bool reset = true)      // reset = true: the next read starts a new chunk (cursor -> 0)
 {
     dsr::ExpertLog* d = scratch_of(m)->elog;
@@ -1015,8 +1023,22 @@ inline std::string elog_csv(const std::vector<dsr::ExpertLogRec>& v)
     for (size_t i = 0; i < v.size(); ++i) s += (i ? "," : "") + std::to_string(v[i].distinct);
     return s;
 }
-// elog_begin(model, first): optional, host-synchronous, before a window's launches: the window's first position, copied into every record of that window.
-inline void elog_begin(const Model* m, int first) { cudaMemcpy((char*)scratch_of(m)->elog + offsetof(dsr::ExpertLog, win_start), &first, sizeof first, cudaMemcpyHostToDevice); }
+// elog_begin(model, first): host-synchronous, before a window's launches. Serve prefill chunks reset the cursor;
+// other callers keep accumulated records unless they explicitly request a reset.
+static_assert(offsetof(dsr::ExpertLog, cursor) == 0 &&
+              offsetof(dsr::ExpertLog, win_start) == sizeof(unsigned),
+              "ExpertLog cursor and win_start must be contiguous at offset 0");
+inline void elog_begin(const Model* m, int first, bool reset_cursor = false)
+{
+    dsr::ExpertLog* d = scratch_of(m)->elog;
+    if (reset_cursor) {
+        const struct { unsigned cursor; int win_start; } hdr{0u, first};
+        static_assert(sizeof(hdr) == 2 * sizeof(unsigned));
+        cudaMemcpy(d, &hdr, sizeof(hdr), cudaMemcpyHostToDevice);
+    } else {
+        cudaMemcpy((char*)d + offsetof(dsr::ExpertLog, win_start), &first, sizeof(first), cudaMemcpyHostToDevice);
+    }
+}
 inline void elog_reset(const Model* m) { cudaMemset(scratch_of(m)->elog, 0, sizeof(dsr::ExpertLog)); }
 inline void elog_print(const Model* m, FILE* f)
 {
