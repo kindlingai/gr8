@@ -2,7 +2,15 @@
 
 ## TP=4 INT4 folded decode default
 
-For GLM-5.3 at TP=4, `--kv-format int4` now enables folded Hadamard `UK`/`UV`
+GLM-5.3 at `TP=4` defaults to `KV_FORMAT=int4`: `bin/g6m4-int4`, `CAP=513536`
+(2,390 pages per rank), the bit-exact INT4 fast paths, folded Hadamard weights,
+tensor-core decode and `CP_ONECHAIN`. Roll back with `--kv-format fp8` or
+`KV_FORMAT=fp8`: `bin/g6m4`, `CAP=485376`, and no implicit `GR8_KV4_*` or
+`GR8_CP_ONECHAIN` settings. Explicit settings still take precedence.
+GLM-5.3 at `TP=3/5/6` and GLM-5.3-Flash retain FP8 unless INT4 is requested;
+DeepSeek and pseudo-engine defaults are unchanged.
+
+The GLM-5.3 TP=4 INT4 default enables folded Hadamard `UK`/`UV`
 weights (`GR8_KV4_FOLD=1`), 16-head WMMA tensor-core INT4 decode
 (`GR8_KV4_TC=1`), and batched remote CP attention (`GR8_CP_ONECHAIN=1`). The
 five bit-exact INT4 kernel settings remain enabled underneath this stack.
@@ -10,11 +18,21 @@ five bit-exact INT4 kernel settings remain enabled underneath this stack.
 folded weights for a non-release boot. FP8 `kv_b` skips fold and its implicit
 TC default, retaining the exact INT4 path.
 
-Measured with live settings: long-context CP decode geomean improved 18.57%
+Measured with live settings for `GR8_KV4_FOLD=1` + `GR8_KV4_TC=1` + `GR8_CP_ONECHAIN=1` against the bit-exact
+`KV_FORMAT=int4` baseline (not against `KV_FORMAT=fp8`): long-context CP decode geomean improved 18.57%
 across 32K/64K/120K; short decode geomean improved 3.69%. This is a numerical
 quality trade, not bit-exact against the scalar reference: `mean_kl = 0.015803`,
 `qeval` 72/75 versus 71/75, and needles 40/40. `kv4_test` same-pipeline relative
 error was below `1.5e-3` and cosine above `0.999998`.
+
+Measured as the four-GB10 `TP=4` `KV_FORMAT=int4` default (`CAP=513536`, `max_model_len` 513,522, +5.8% over
+`fp8`'s 485,362; `SESS=8`, up to 8 concurrent requests) against same-build `KV_FORMAT=fp8`: `KL(fp8 || int4)` mean
+0.01450, p95 0.0707, top-1 agreement 97.0% (n=4,096 tokens), and `qeval` 73/75 (`int4`) vs 74/75 (`fp8`, 1 flip,
+McNemar p=1.0). `bench.py` (n=6 runs): short decode code 63.3 / prose 37.8 / structured 78.0 / counting 81.5 tok/s,
+concurrent decode 47.7 / 59.8 / 69.5 / 85.8 tok/s at 1 / 2 / 4 / 8 streams, cold prefill 1,540 tok/s at 32K and
+1,361 tok/s at 128K, 14/14 smoke, and the 128K needle found. The same-build `fp8` boot ran KL and `qeval` without
+`bench.py`, so no same-build `fp8` speed baseline or decode speed gain is claimed; short decode matches the
+2026-11-10 `fp8` card's 63.2 / 38.0 / 77.0 tok/s.
 
 Use `--kv4-tc 0 --kv4-fold 0 --cp-onechain 0` for the measured bit-exact INT4
 fast-path rollback. `CP_ONECHAIN=1` is documented bit-exact, but the exact INT4
@@ -257,7 +275,7 @@ path. The `#if` blocks and their comments in the source are the reference:
 | `GR8_CP=1`, `GR8_CP_PF_HASH2=1` | context-parallel KV, and its HASH2 staged-page check |
 | `PF_F12` (TP4 build only) | prefill expert fc1: one fat CTA runs `F12_NE` (default 2) adjacent expert blocks on one quantized A record (`kernels/bind_prefill.cuh`, `k_pf_fc1f`). `F12_NE` must divide the expert blocks per rank (4 at TP4, 3 at TP6). `GR8_PF_F12=0` turns it off at run time. Effect not measured on its own |
 | `G6_TR3_CBS=7` (default; not in `K1H2_FLAGS`) | the trellis codebooks the build decodes, a bit mask over mcg (1), mul1 (2) and pmcgx (4) (`kernels/tr3.cuh`). A smaller mask leaves those codebooks' expert kernels out, which only shortens a development build: the binder then refuses a layer in a codebook the build lacks. mcg (bit 0) is always in |
-| `G6_KV4=1` (a build flag; experimental) | the MLA latent cached as INT4 after a Hadamard rotation, 416 B a row instead of 656 B (`attn/kvfmt.h`, [KV4.md](KV4.md)). Changes the outputs. The image ships it as `bin/g6m4-int4`, which `--kv-format int4` (`KV_FORMAT`) runs; `KV_FORMAT=int4 scripts/build.sh` builds it |
+| `G6_KV4=1` (a build flag; GLM-5.3 TP=4 default) | the MLA latent cached as INT4 after a Hadamard rotation, 416 B a row instead of 656 B (`attn/kvfmt.h`, [KV4.md](KV4.md)). Changes the outputs. The image ships it as `bin/g6m4-int4`, which `--kv-format int4` (`KV_FORMAT`) runs; `KV_FORMAT=int4 scripts/build.sh` builds it |
 
 ## Front end and shim
 
@@ -276,3 +294,32 @@ See [local steering](STEERING-LOCAL.md) for the complete contract, identity limi
 The launcher also accepts `--steering-profile hf:default` / `hf:NAME` with an HF model release and derives the
 profile's identity assertions before validating the actual model. See [HF steering](STEERING-HF.md) for publication,
 explicit selection and cached offline restart. The engine itself receives only the verified local directory.
+
+## Shared waterfill speculative row allocation
+
+`S2_SHARED_WATERFILL=1` allocates shared S2 verify rows by cumulative marginal acceptance per shared round cost,
+instead of KStopB thresholds and explore rounds. GLM-5.3 and GLM-5.3-Flash support it; DS41 does not support ragged
+shared rows. `S2_SHARED_WF_MARGIN` is the finite nonnegative relative utility improvement required to widen a round.
+Solo rounds and the disabled path are unchanged. All reachable main and draft widths are captured within existing
+admission caps. With `GR8_NGRAM`, the table can supply coherent shared MTP prefixes and tails; Flash uses it only in
+shared rounds.
+
+For GLM-5.3-Flash at `TP=2` with `KV_FORMAT=int4`, the launcher defaults to `SESS=4` (max concurrent 4) and, when `SESS >= 2`,
+`MTP=3`, `S2_SHARED_WATERFILL=1`, `S2_SHARED_WF_MARGIN=0.02`. Explicit MTP and session settings remain authoritative.
+Other topologies and FP8 defaults are unchanged. Roll back with `--s2-shared-waterfill 0` (or
+`EXTRA_ENV=GR8_S2_SHARED_WATERFILL=0`); absent an explicit MTP, this restores `MTP=1`. Pass `--sess 1` for the prior single-session launch.
+
+Measured on TP=2 INT4 against `S2_SHARED_WATERFILL=0` at matched `SESS=4`, `MTP=3`: **+10.45%** pooled concurrent decode throughput, **+12.27%** at 4 streams and
+**+7.96%** at 2 streams; solo `T=0` output was exact on **20/20**, **KL = 0.0**, and qeval was **73/75 vs 73/75**.
+Additional graph captures can increase boot time and memory.
+Measured on two GB10s at `TP=2` with `KV_FORMAT=int4`, plain `./gr8 glm53f --tp 2 --kv-format int4`
+(`SESS=4`, max concurrent 4, `MTP=3`, `S2_SHARED_WATERFILL=1`, `k4` manifest, `CAP=262208`) against the prior
+`SESS=1`, `MTP=1` default: 51.1 vs 51.9 tok/s at 1 stream (-1.7%), 68.3 vs 61.5 tok/s at 2 streams (+11.0%),
+79.2 vs 59.6 tok/s at 4 streams (+32.9%), 14/14 smoke, and 11.1-11.3 GiB post-capture `MemAvailable` a box
+(11.5-12.2 GiB with `--s2-shared-waterfill 0`, 24 s warm boot; 12.6-12.9 GiB at `SESS=1`, 27 s warm boot).
+The two-box recipe's `TUNE=quality` (`SESS=4`, `MTP=3`) measured 53.3 / 65.3 / 78.3 tok/s at 1 / 2 / 4 streams
+vs 53.1 / 58.7 / 72.4 tok/s with `GR8_S2_SHARED_WATERFILL=0` (+0.4% / +11.3% / +8.0%), with 9.4-9.6 GiB free.
+With the two-box recipe's `bit349` manifest, `CAP=2097152`, vision tower and aligned SSD prompt cache, `SESS=4`
+(`max_concurrent=4`) leaves 8.9-9.2 GiB post-capture `MemAvailable` (25 s warm boot; 55.1 / 70.3 / 82.9 tok/s
+at 1 / 2 / 4 streams), whereas `SESS=8`, `MTP=3` without `GR8_CP=1` leaves 6.4-6.9 GiB (8.7-9.1 GiB with
+`GR8_CP=1`, 29 s warm boot, 97.4 tok/s at 8 streams).

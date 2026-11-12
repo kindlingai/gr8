@@ -417,6 +417,13 @@ public:
         for (int k = 1; k <= solo_kmax; ++k) mains.insert({k + 1, s2::row_class(k + 1)});   // s2_batch.h round_all, KStop::solo
         for (int M = 1; M <= N * (K + 1); ++M) drafts.insert(M);
         if (K >= 2) for (int M = 1; M <= N; ++M) chains.insert(M);
+        if (knob::s2_shared_waterfill()) {
+            const int depth = knob::ngram() ? std::max(K, 7) : K;
+            for (int M = 1; M <= std::min(g6rt::MX, N * (depth + 1)); ++M) {
+                mains.insert({M, s2::row_class(K + 1)});
+                drafts.insert(M);
+            }
+        }
         for (const auto& mc : mains) require(mc.first <= g6rt::MX, "main step rows exceed G6_MX");
         for (int M : drafts) require(M <= g6rt::MX, "draft step rows exceed G6_MX");
         const auto t0 = std::chrono::steady_clock::now();

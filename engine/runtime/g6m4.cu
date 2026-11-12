@@ -335,23 +335,27 @@ int main(int argc, char** argv)
     // instead of the drafter's drafts when it promises more tokens per verify ms. GR8_NGRAM_KMAX (1..dflash-k, default
     // dflash-k): the longest chain; GR8_NGRAM_KMIN (default 2); GR8_NGRAM_MARGIN (default 0.1); GR8_NGRAM_LOG=1: one line per
     // round it takes (rank 0). Drafts only: the target decides every token. In the S2 runtime signature
+    const bool shared_waterfill = knob::s2_shared_waterfill();
     g6rt::NgramTable ngram_tab;
     s2::NgramSrc ngram;
     if (const auto& path = knob::ngram())
     {
-        if (!(dfl && s2mode)) die("GR8_NGRAM needs --dflash-manifest and --serve");
+        if (!shared_waterfill && !(dfl && s2mode)) die("GR8_NGRAM needs --dflash-manifest and --serve");
+        if (shared_waterfill && !s2mode) die("GR8_NGRAM with shared waterfill needs --serve");
         std::ifstream f(*path);
         if (!f) die("GR8_NGRAM: cannot read " + *path);
         const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         std::string err;
         if (!ngram_tab.parse(text, &err, geom::VOCAB)) die("GR8_NGRAM: " + err);
         ngram.t = &ngram_tab;
-        ngram.kmax = (int)knob::ngram_kmax().value_or(dfl_k);
+        ngram.kmax = (int)knob::ngram_kmax().value_or(shared_waterfill && !dfl ? 7 : dfl_k);
         ngram.kmin = (int)knob::ngram_kmin();
         ngram.margin = knob::ngram_margin();
         ngram.log = knob::ngram_log() && cfg.rank == 0;
-        if (ngram.kmax < ngram.kmin || ngram.kmax > dfl_k)
+        if (!shared_waterfill && (ngram.kmax < ngram.kmin || ngram.kmax > dfl_k))
             die("GR8_NGRAM: 1 <= GR8_NGRAM_KMIN <= GR8_NGRAM_KMAX <= --dflash-k");
+        if (shared_waterfill && (ngram.kmin < 1 || ngram.kmax < ngram.kmin || ngram.kmax > 7))
+            die("GR8_NGRAM: 1 <= GR8_NGRAM_KMIN <= GR8_NGRAM_KMAX <= 7");
         fprintf(stderr, "# rank %d: ngram table: %zu entries, ns", cfg.rank, ngram_tab.t.size());
         for (int n : ngram_tab.ns) fprintf(stderr, " %d", n);
         fprintf(stderr, ", %s, digest %016llx; chains %d..%d, margin %.3f\n", ngram_tab.has_cal ? "calibrated" : "raw probabilities",
@@ -359,6 +363,7 @@ int main(int argc, char** argv)
         for (int M = 2; M <= ngram.kmax + 1; ++M)   // a chain's solo verify of k + 1 rows, class row_class(k + 1)
             if (std::find(row_counts.begin(), row_counts.end(), M) == row_counts.end()) row_counts.push_back(M);
     }
+    const int shared_depth = shared_waterfill && ngram.t ? std::max(mtp, 7) : mtp;
     // GR8_DRAFT_PAR=1|2 (s2_batch.h Batch::par_; default 0): a solo DFlash2 round's drafter step runs on its own stream
     // under the MTP first form (and the chain on MTP rounds). 2: a drafting step goes on a high-priority stream (its CTAs
     // are dispatched first while both wait), a context-only step stays at the default priority. Each graph's bytes are as
@@ -641,6 +646,11 @@ int main(int argc, char** argv)
     if (s2mode) m.kda_sessions = s2sess;   // each S2 session its own ring (s2/flash_ring.h FlashSlots)
     // one ring is B wide, for the session drafting with DFlash2 (FlashSlots::take_wide); the others hold an MTP round
     if (s2mode && mtp) m.kda_ring_rest = mtp + 1;
+    if (shared_waterfill && ngram.t && s2mode) {
+        // Shared n-gram tails may use the wide prefix in every session, not only the solo owner.
+        m.kda_ring = std::max(m.kda_ring, shared_depth + 1);
+        m.kda_ring_rest = shared_depth + 1;
+    }
 #endif
 #if G6_MODEL_FLASH
     // Flash prefill (flash_prefill.cuh): the P1 bodies run the decode blocks in MX-row chunks, so the decode bindings
@@ -1356,8 +1366,9 @@ int main(int argc, char** argv)
         g6s2::BootstrapConfig bc;
         auto& sc = bc.scheduler;
         sc.epoch = s2epoch; sc.pool_rows = cap / 64 * 64;
-        sc.max_rows = std::min(MX, std::max({s2sess * (mtp + 1), plan.chunk, dfl ? dfl_k + 1 : 0}));   // a round of every session, a prompt chunk, a DFlash2 round
+        sc.max_rows = std::min(MX, std::max({s2sess * (shared_depth + 1), plan.chunk, dfl ? dfl_k + 1 : 0}));   // a round of every session, a prompt chunk, a DFlash2 round
         sc.max_sessions = s2sess; sc.mtp = mtp; sc.prefill_rows = MP; sc.two_lanes = two;
+        if (shared_waterfill && ngram.t) sc.guard_tokens = 2 * shared_depth;
         if (dfl) sc.guard_tokens = 2 * dfl::K;     // a DFlash2 verify writes up to 7 rows past the last token
         // the prefill/decode interleave, as the GLM block reads it: while sessions decode, prefill quanta of at most
         // GR8_S2_DECODE_PF rows on one lane and GR8_S2_DECODE_ROUNDS decode rounds per quantum (scheduler.h Config).
@@ -1451,6 +1462,7 @@ int main(int argc, char** argv)
             sig.ckpt_persist = !index_path.empty();
         }
         bc.runtime_signature = g6s2::runtime_signature(sig);
+        if (shared_waterfill) bc.runtime_signature += s2::ngram_sig(ngram); // agree on table contents, not just its path
         // DFlash2 (--dflash-manifest): a session alone drafts with the drafter, as on GLM-5.3 (s2_batch.h Batch::dflash);
         // Dfl::pf_feat holds the prefill taps of the session whose prefill started last (s2/flash_dfl_window.h: with
         // GR8_GLM53F_CACHE, a checkpoint hit inside the window keeps the drafter through GR8_DFL_REUSE)
@@ -1529,6 +1541,13 @@ int main(int argc, char** argv)
         // GR8_GLM53F_KV_CHUNKS=1 (borrow-idle): hooks serve_flash adds to its own before the service starts
         auto flash_install = [&](g6s2::NativeHooks& h, g6s2::FlashExtras& ext) {
             if (dfl) dfl_install(h, ext);
+            if (shared_waterfill) {
+                h.ngram = ngram;
+                // Keep Flash MTP-only solo behavior: waterfill needs the shared floor and diagnostics,
+                // not previously inactive KStop modes. DFlash2 retains the configuration installed above.
+                h.kstop.b.kmin = kstop.b.kmin;
+                h.kstop.log = kstop.log;
+            }
             // GR8_GLM53F_KV_CHUNKS=1: a Resize event on tier FLASH_KV_TIER takes every model's chunk map to r.segs chunks
             // online, on every rank at the commit (flash_kv.h; with GR8_GLM53F_KV_LEDGER the bytes move through the box's
             // host ledger). The head announces them under FLASH_CAP_POLICY=borrow-idle (GR8_GLM53F_KV_LEND_MS > 0, s2/flash_lend.h):
@@ -2213,10 +2232,11 @@ int main(int argc, char** argv)
         sc.pool_rows = (uint32_t)(cap / 64 * 64);
         // one step bounds: a round (every session's mtp + 1 rows), a prompt chunk (sessions.h: chunk <= max_rows) and a
         // DFlash2 verify (dfl_k + 1 rows)
-        sc.max_rows = std::min<uint32_t>(MX, std::max<uint32_t>({(uint32_t)s2sess * (uint32_t)(mtp + 1), (uint32_t)plan.chunk,
+        sc.max_rows = std::min<uint32_t>(MX, std::max<uint32_t>({(uint32_t)s2sess * (uint32_t)(shared_depth + 1), (uint32_t)plan.chunk,
                                                                   dfl ? (uint32_t)(dfl_k + 1) : 0u}));
         sc.max_sessions = (uint32_t)s2sess;
         sc.mtp = (uint32_t)mtp;
+        if (shared_waterfill && ngram.t) sc.guard_tokens = 2 * shared_depth;
         if (dfl) sc.guard_tokens = 2 * dfl::K;     // a DFlash2 verify writes up to 7 rows past the last token, as the offline loop's cap rule
         sc.prefill_rows = (uint32_t)MP;
         sc.two_lanes = two;
@@ -2992,6 +3012,7 @@ int main(int argc, char** argv)
             o.logprob = g6s2::mod::logprob<G, &G::on_logprob>;
             o.draft_lp = g6s2::mod::draft_lp<G, &G::on_draft_lp>;
             nd.grammar(o);
+            if (shared_waterfill) { h.ngram = ngram; h.kstop = kstop; }
             if (dfl)
             {
                 h.dfl_kv = dfl_k; h.dfl_spec = spec;

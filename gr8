@@ -27,8 +27,8 @@
 #   ./gr8 glm53 smoke [URL]           smoketest/run.sh, by default against this head's API (./gr8 ds41 smoke: smoketest/ds41.sh)
 #   ./gr8 glm53 bench [ARGS]          bench/bench.py against this head's API, cooling and sampling the PEERS boxes
 #                                     between stages; --quick, --full, --json FILE (bench/README.md)
-#   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh (one engine for every TP width) and scripts/build_front.sh; with
-#                                     KV_FORMAT=int4 (or --kv-format int4 in the options) also bin/g6m4-int4
+#   ./gr8 glm53 build [OUT_DIR]       scripts/build.sh (one engine for every TP width) and scripts/build_front.sh;
+#                                     also bin/g6m4-int4 for TP=4 or an unconfigured clone; KV_FORMAT=fp8 skips it
 #
 #   ./gr8 switch <glm53|glm53f|ds41> [@FILE]  switch the configured Compose cluster from one controller
 #                                     config/switch.env.example; defaults to ./switch.env; --timeout SECONDS
@@ -143,10 +143,15 @@ case $cmd in
       mkdir -p "$out" && cp "$REPO/frontend/pseudo-engine/target/release/g6pseudo" "$out/"
       exec "$SCRIPTS/build_front.sh" "$out"
     fi
-    [ -n "${KV_FORMAT:-}" ] || KV_FORMAT=$(python3 "$REPO/tools/launch/launch.py" get KV_FORMAT "${named[@]}" 2> /dev/null) || KV_FORMAT=""
+    if [ -z "${KV_FORMAT:-}" ]; then
+      KV_FORMAT=$(python3 "$REPO/tools/launch/launch.py" get KV_FORMAT "${named[@]}" 2> /dev/null) || KV_FORMAT=""
+      tp_cfg=$(python3 "$REPO/tools/launch/launch.py" get TP "${named[@]}" 2> /dev/null) || tp_cfg=""
+      if [ -z "$KV_FORMAT" ] && [ "$model" = glm53 ] && [ -z "$tp_cfg" ]; then KV_FORMAT=int4; fi
+    fi
     # MODEL here is scripts/build.sh's (glm or flash), not the launcher's release
     MODEL=$build_model KV_FORMAT=fp8 "$SCRIPTS/build.sh" "$out"
-    # the int4 KV engine (--kv-format int4) only when asked: it is a second full g6m4 build
+    # GLM TP=4 (also before a fresh clone is configured) needs int4; Flash still needs KV_FORMAT=int4.
+    # Keep the fp8 engine too for rollback: int4 is a second full g6m4 build.
     if [ "$KV_FORMAT" = int4 ]; then MODEL=$build_model KV_FORMAT=int4 "$SCRIPTS/build.sh" "$out"; fi
     exec "$SCRIPTS/build_front.sh" "$out" ;;
   *)

@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <vector>
 #include "../../engine_options.h"
+#include "../flash_ring.h"
 
 namespace {
 struct Case { std::string model, name; std::vector<std::string> env, args; };
@@ -118,11 +119,17 @@ int main(int argc, char** argv)
 #else
     const char* model = "glm53";
 #endif
-    const std::string shape = std::string(model) + " nr" + std::to_string(g6nr::NR) + " mx" + std::to_string(g6mx::MX);
+#if G6_KV4 && !G6_MODEL_FLASH && !G6_MODEL_DS41
+    const char* model_tag = "glm53-kv4";
+#else
+    const char* model_tag = model;
+#endif
+    const std::string shape = std::string(model_tag) + " nr" + std::to_string(g6nr::NR) + " mx" + std::to_string(g6mx::MX);
     struct Want { const char* shape; size_t n; uint64_t hash; };
     const Want wants[] = {
-        {"glm53 nr6 mx8", 121, 0x967129417b716279ull},
-        {"glm53 nr4 mx32", 121, 0x69356dc3e99a8ec0ull},
+        {"glm53 nr6 mx8", 122, 0xe80ac959f044daf8ull},
+        {"glm53 nr4 mx32", 122, 0x90c53302b108f89cull},
+        {"glm53-kv4 nr4 mx32", 122, 0xeb128b40cbc92c4full},
         {"glm53f nr4 mx32", 116, 0x2920b0d6c121e568ull},
         {"ds41 nr4 mx48", 116, 0x07ec2d75cdd0d055ull},
     };
@@ -133,9 +140,50 @@ int main(int argc, char** argv)
         for (unsigned char ch : t) h = (h ^ ch) * 1099511628211ull;
         if (dump) fputs(t.c_str(), stdout);
     }
+    // Waterfill probes are checked independently of the launcher-default transcript goldens.
+    bool wf_ok = true;
+    auto probe = [&](const char* name, const std::vector<std::string>& env,
+                     const std::vector<std::string>& args, const char* expected) {
+        const std::string t = run(Case{model, name, env, args});
+        if (dump) fputs(t.c_str(), stdout);
+        if (t.find(expected) == std::string::npos) { fprintf(stderr, "waterfill probe failed: %s", t.c_str()); wf_ok = false; }
+    };
+    std::vector<std::string> plain{"--rank", "0", "--ips", "@IPS", "--manifest", "m", "--pack", "p"};
+#if G6_KV4
+    // Every INT4-build probe must pass the format check before reaching its intended guard.
+    plain.insert(plain.end(), {"--kv-format", "int4"});
+#endif
+    probe("waterfill-margin", {"GR8_S2_SHARED_WF_MARGIN=-1"}, plain,
+          "g6: GR8_S2_SHARED_WF_MARGIN: want a finite nonnegative value");
+#if G6_MODEL_DS41
+    probe("waterfill-uniform-refusal", {"GR8_S2_SHARED_WATERFILL=1"}, plain,
+          "g6: GR8_S2_SHARED_WATERFILL: DS41 shared steps require uniform rows; ragged rows are unsupported");
+#else
+    probe("waterfill-serve-refusal", {"GR8_S2_SHARED_WATERFILL=1"}, plain,
+          "g6: GR8_S2_SHARED_WATERFILL needs --serve, --mtp >= 1 and max rows <= 64");
+    if (g6mx::MX >= 32) {
+        std::vector<std::string> args = plain;
+        for (const char* v : {"--serve", "session", "--graph", "--mtp", "3", "--prefill", "64",
+                              "--s2-sessions", "4", "--s2-port", "1"}) args.push_back(v);
+        probe("waterfill-boot", {"GR8_S2_SHARED_WATERFILL=1"}, args, "rc 0\n");
+        probe("waterfill-ngram-boot", {"GR8_S2_SHARED_WATERFILL=1", "GR8_NGRAM=table"}, args, "rc 0\n");
+    }
+#endif
+    for (int n : {2, 4, 8}) for (bool ng : {false, true}) {
+        const auto f = g6s2::flash_shapes(n, 3, 4, false, 32, true, ng);
+        for (int m = 1; m <= std::min(32, n * (ng ? 8 : 4)); ++m)
+            wf_ok = wf_ok && f.mains.count(m) && f.drafts.count(m);
+        for (int m = 1; m <= n; ++m) wf_ok = wf_ok && f.chains.count(m);
+        // N-gram verify rows fit independently in every Flash session's rollback ring.
+        g6s2::FlashSlots slots(n, ng ? 8 : 4);
+        for (int q = 0; q < n; ++q) {
+            int out[8]{};
+            wf_ok = wf_ok && slots.rows(q, 0, ng ? 8 : 4, true, out) == slots.base(q);
+        }
+    }
     const Want* w = nullptr;
     for (const Want& x : wants) if (shape == x.shape) w = &x;
-    const bool ok = w && w->n == cs.size() && w->hash == h;
+    const bool ok = wf_ok && w && w->n == cs.size() && w->hash == h;
     printf("options %s: %zu cases, hash %016" PRIx64 "%s\n", shape.c_str(), cs.size(), h,
            ok ? "" : w ? " (MISMATCH)" : " (no recorded hash for this shape)");
     return ok ? 0 : 1;

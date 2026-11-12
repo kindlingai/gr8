@@ -232,6 +232,9 @@ def parse(argv, environ=None):
     for k, v in models.MODELS[model].defaults if model else ():
         if origin[k] == 'default':
             values[k], origin[k] = v, f'{model} default'
+    tp_eff = values.get('TP') or (str(len(split_list(values.get('PEERS')))) if values.get('PEERS') else None)
+    if model == 'glm53' and tp_eff == '4' and origin['KV_FORMAT'] == 'default':
+        values['KV_FORMAT'] = 'int4'
     opts = Options(values, origin, path, args, switches, warnings)
     opts.named, opts.model_conflict = named, conflict
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
@@ -525,6 +528,17 @@ def validate(o):
         raise OptionError('--v2 needs --v2-slices')
     if o.get('V2_DENSE_FORM') not in (None, 'trellis', 'rounded'):
         raise OptionError(f'--v2-dense-form {o.get("V2_DENSE_FORM")}: want trellis or rounded')
+    if o.get('S2_SHARED_WATERFILL') not in (None, '0', '1'):
+        raise OptionError(f'--s2-shared-waterfill {o.get("S2_SHARED_WATERFILL")}: want 0 or 1')
+    if o.get('S2_SHARED_WATERFILL') == '1' and model.name == 'ds41':
+        raise OptionError('--s2-shared-waterfill 1: DS41 shared steps require uniform rows (glm53 and glm53f only)')
+    if o.get('S2_SHARED_WF_MARGIN') is not None:
+        try:
+            wfm = float(o.get('S2_SHARED_WF_MARGIN'))
+        except ValueError:
+            wfm = -1.0
+        if not math.isfinite(wfm) or wfm < 0.0:
+            raise OptionError(f'--s2-shared-wf-margin {o.get("S2_SHARED_WF_MARGIN")}: want a finite nonnegative number')
     for key in ('KV4_FOLD', 'KV4_TC'):
         if o.get(key) not in (None, '0', '1'):
             raise OptionError(f'--{key.lower().replace("_", "-")} {o.get(key)}: want 0 or 1')

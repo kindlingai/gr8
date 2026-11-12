@@ -102,6 +102,8 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     u64 pfseq = 1, pfseq2 = 1, dseq = 0;
     LpStep lp{};
     int lp_rows = 0;
+    float dlp[MX] = {};
+    int dlp_rows = 0;
     auto fence = [&] { G6RT_CK(cudaStreamSynchronize(c.stream)); };
     auto check = [&] {
         // Owner OFF leaves these transports unbound; only inspect initialized lanes.
@@ -245,7 +247,8 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     auto capture_all = [&] {
         const int nbk = c.main.nbk;
         require(nbk >= 1 && nbk == c.draft.d.nbk && nbk <= NBK, "Flash main/draft context buckets differ");
-        const FlashShapes f = flash_shapes(int(sc.limit()), int(sc.mtp), chunk, knob::s2_adapt(), MX);
+        const FlashShapes f = flash_shapes(int(sc.limit()), int(sc.mtp), chunk, knob::s2_adapt(), MX,
+                                            knob::s2_shared_waterfill(), bool(knob::ngram()));
         // the batched graphs carry no DFlash2 taps (their rows outnumber Dfl::feat's 8); the solo graphs keep them
         auto* const tap = c.main.dfl_tap;
         c.main.dfl_tap = nullptr;
@@ -305,7 +308,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     FlashExtras extra;   // the engine's additions (FlashContext::install)
     const int rank = c.main.rank;
     // Flash's module (ModuleOps): its hooks as members over references to the locals they use. The locals outlive it and the service
-#define FLASH_CAPTURES(X) X(c) X(sc) X(multi) X(pool) X(ks) X(pfseq) X(pfseq2) X(dseq) X(lp) X(lp_rows) X(fence) \
+#define FLASH_CAPTURES(X) X(c) X(sc) X(multi) X(pool) X(ks) X(pfseq) X(pfseq2) X(dseq) X(lp) X(lp_rows) X(dlp) X(dlp_rows) X(fence) \
     X(check) X(ck) X(ck_mu) X(bound) X(live) X(capture_at) X(pending) X(take_capture) X(reset_all) X(reset_check) \
     X(dirty) X(zflag) X(wrote) X(wrote_step) X(bind_ckpt) X(graphs) X(key) X(layout) X(draft_layout) X(widen) X(rank) \
     X(extra) X(cp_split) X(rp) X(cp_staging) X(stage) X(solo_tables) X(cp_pages)
@@ -445,6 +448,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
             fence(); check();
             const auto& out = *(d ? c.draft_output : c.output);
             require(!out.attn_err, "Flash step attention error");
+            if (d) { std::copy(out.lp, out.lp + si.M, dlp); dlp_rows = si.M; }
             if (!d) {
                 g6rt::evprof_read(si.M, c.stream, c.main.rank);
                 lp_rows = 0;
@@ -457,6 +461,10 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
         g6rt::LpRow on_logprob(int row, bool target, int k) {
             require(row >= 0 && row < lp_rows, "Flash logprob row outside main step");
             return lp_row(lp, row, target, k);
+        }
+        float on_draft_lp(int row) {
+            require(row >= 0 && row < dlp_rows, "draft logprob row outside the last draft step");
+            return dlp[row];
         }
         void on_prefill(const Slot& slot, const Payload& p, uint32_t first, uint32_t rows) {
             const auto start = std::chrono::steady_clock::now();
@@ -617,6 +625,7 @@ inline void serve_flash(FlashContext c, const BootstrapConfig& bc, int chunk) {
     o.mode = mod::mode<M, &M::on_mode>;
     o.launch = mod::launch<M, &M::on_launch>;
     o.logprob = mod::logprob<M, &M::on_logprob>;
+    if (knob::s2_shared_waterfill()) o.draft_lp = mod::draft_lp<M, &M::on_draft_lp>;
     const bool prof = pf_prof().on;
     if (extra.prefill && prof) o.prefill = mod::prefill<M, &M::on_prefill_ext_prof>;
     else if (extra.prefill) o.prefill = mod::prefill<M, &M::on_prefill_ext>;

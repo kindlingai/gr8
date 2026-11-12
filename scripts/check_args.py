@@ -50,7 +50,8 @@ VARIANTS = {
               ('dflash0', ['--dflash', '0']), ('adapt0', ['--spec-adapt', '0']),
               ('dflash0-adapt0', ['--dflash', '0', '--spec-adapt', '0']),
               ('kvstore', ['--kv-store', KV_SSD]), ('kvstore-sessions', ['--kv-store', KV_SSD, '--kv-keep', 'sessions']),
-              ('reuse0', ['--reuse', '0']), ('int4', ['--kv-format', 'int4']), ('mtp1', ['--mtp', '1']),
+              ('reuse0', ['--reuse', '0']), ('int4', ['--kv-format', 'int4']), ('fp8', ['--kv-format', 'fp8']),
+              ('mtp1', ['--mtp', '1']),
               ('mtp3', ['--mtp', '3']), ('sess1', ['--sess', '1']), ('sess4', ['--sess', '4']), ('nohash', ['--nohash', '1']),
               ('rejection', ['--spec-accept', 'rejection']), ('tp6-dflash0', ['--tp', '6', '--dflash', '0']),
               ('tp3-mtp3', ['--tp', '3', '--mtp', '3'])],
@@ -331,6 +332,8 @@ def cases():
             if p:
                 out.append((model, name, *p))
         base[model] = plan(model, [])
+    # Start GLM refusal mutations from FP8 so the FP8 build reaches each check, not just the INT4 format refusal.
+    base['glm53'] = plan('glm53', ['--kv-format', 'fp8'])
     # GLM's default list carries GR8_PF_OWN=4, which a TP6 build refuses before most checks: the TP6 shape's mutations
     # start from it with GR8_PF_OWN=3 (TP6's own) and no pair-owner knobs
     env, args = base['glm53']

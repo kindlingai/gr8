@@ -61,7 +61,8 @@ tp4_default() {
 # GLM-5.3-Flash under --serve takes no CP, prefix reuse or PF_OWN (engine/runtime/g6m4.cu refuses them). DFLASH=1 (TP=4,
 # the default): a session alone drafts with the DFlash2 drafter, SPEC_ADAPT on with it. MTP=1 for sessions sharing steps.
 # SESS: 2..8 share decode steps and the CAP pool, each with its own KDA state slots (docs/FLASH.md, Several sessions);
-# 8 at TP=4, 4 at TP=3, 1 (one request at a time) at TP=2 and TP=1. A round of every session, SESS x (MTP + 1) rows, must fit
+# 8 at TP=4, 4 at TP=3 and TP=2 with KV_FORMAT=int4; otherwise 1 at TP=2 and TP=1. TP=2 INT4 with SESS >= 2
+# defaults to MTP=3, S2_SHARED_WATERFILL=1 and S2_SHARED_WF_MARGIN=0.02. A round of SESS x (MTP + 1) rows must fit
 # the engine's 32. CAP is a 262,144-token request plus a page for the guard rows (2 at MTP=1). Only the 11 DSA layers and
 # the MTP layer keep KV, 1,664 B a token each (928 B with KV_FORMAT=int4), and without CP every rank holds the whole
 # context: about 5.2 GB a rank at any TP (2.9 GB with int4; docs/FLASH.md, Context). With one session SHARE_LIMIT only sets the front end's default max_tokens.
@@ -72,9 +73,25 @@ flash_defaults() {
     [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: GLM-5.3-Flash has no $k" >&2; return 2; }
   done
   [ "${DFLASH:-0}" = 0 ] || [ "$TP" != 3 ] || { echo "engine_defaults: DFLASH=1: GLM-5.3-Flash runs its DFlash2 drafter at TP=4, TP=2 and TP=1" >&2; return 2; }
-  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-262208}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-1}
-  case $TP in 4) SESS=${SESS:-8} ;; 3) SESS=${SESS:-4} ;; *) SESS=${SESS:-1} ;; esac
+  local mtp_set=${MTP:+1}
+  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-262208}; READY_TMO=${READY_TMO:-1800}
+  case $TP in
+    4) SESS=${SESS:-8} ;;
+    3) SESS=${SESS:-4} ;;
+    2) if [ "${KV_FORMAT:-fp8}" = int4 ]; then SESS=${SESS:-4}; else SESS=${SESS:-1}; fi ;;
+    *) SESS=${SESS:-1} ;;
+  esac
   case $SESS in [1-8]) ;; *) echo "engine_defaults: SESS=$SESS: GLM-5.3-Flash serves 1 to 8 sessions" >&2; return 2 ;; esac
+  if [ "$TP" = 2 ] && [ "${KV_FORMAT:-fp8}" = int4 ] && [ "$SESS" -ge 2 ]; then
+    tp4_default S2_SHARED_WATERFILL 1
+    local _wf_eff=${S2_SHARED_WATERFILL:-0}
+    case " ${EXTRA_ENV:-} " in *" GR8_S2_SHARED_WATERFILL=1 "*) _wf_eff=1 ;; *" GR8_S2_SHARED_WATERFILL=0 "*) _wf_eff=0 ;; esac
+    if [ "$_wf_eff" = 1 ]; then
+      tp4_default S2_SHARED_WF_MARGIN 0.02
+      [ -n "$mtp_set" ] || MTP=3
+    fi
+  fi
+  MTP=${MTP:-1}
   [ "$SESS" = 1 ] || [ $((SESS * (MTP + 1))) -le 32 ] ||
     { echo "engine_defaults: SESS=$SESS MTP=$MTP: a round of $((SESS * (MTP + 1))) rows; GLM-5.3-Flash steps hold 32" >&2; return 2; }
   # DFLASH: on at TP=4, TP=2 and TP=1, where the drafter's 8 KV heads split evenly across the ranks (the supervisor
@@ -247,7 +264,7 @@ engine_defaults() {
   [ "${GR8_MODEL:-glm53}" = ds41 ] && { ds41_defaults; return; }
   [ "${GR8_MODEL:-glm53}" = pseudo ] && { pseudo_defaults; return; }
   case $TP in
-    4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+    4) KV_FORMAT=${KV_FORMAT:-int4}; SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        DFLASH=${DFLASH:-1}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1}
        # the window-2 fc1 split on every MoE layer at M > 1 (bit-exact, measured at TP=4); 0 turns it off, and
        # GR8_TR3_W2ALL in EXTRA_ENV keeps its own value
@@ -342,6 +359,7 @@ GR8_GLM53F_PF_STAGE_ASYNC=$stage GR8_GLM53F_PF_SP=$sp GR8_GLM53F_PF_SP_X16=$sp"
   [ "$TP" -le 2 ] && drounds=32 dpf=1024
   dpf=${S2_DECODE_PF:-$dpf}
   ENGINE_ENV="$ENGINE_ENV GR8_S2_DECODE_ROUNDS=${S2_DECODE_ROUNDS:-$drounds}${dpf:+ GR8_S2_DECODE_PF=$dpf}"
+  ENGINE_ENV="$ENGINE_ENV${S2_SHARED_WATERFILL:+ GR8_S2_SHARED_WATERFILL=$S2_SHARED_WATERFILL}${S2_SHARED_WF_MARGIN:+ GR8_S2_SHARED_WF_MARGIN=$S2_SHARED_WF_MARGIN}"
   ENGINE_ENV="$ENGINE_ENV ${EXTRA_ENV:-}"
 }
 
@@ -417,6 +435,7 @@ GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   ENGINE_ENV="$ENGINE_ENV${S2_ADAPT:+ GR8_S2_ADAPT=$S2_ADAPT}"
   ENGINE_ENV="$ENGINE_ENV${S2_DECODE_PF:+ GR8_S2_DECODE_PF=$S2_DECODE_PF}"
   ENGINE_ENV="$ENGINE_ENV${S2_ADMIT_HOLD:+ GR8_S2_ADMIT_HOLD=$S2_ADMIT_HOLD}"
+  ENGINE_ENV="$ENGINE_ENV${S2_SHARED_WATERFILL:+ GR8_S2_SHARED_WATERFILL=$S2_SHARED_WATERFILL}${S2_SHARED_WF_MARGIN:+ GR8_S2_SHARED_WF_MARGIN=$S2_SHARED_WF_MARGIN}"
   [ "${PF_SELX_CTX:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV GR8_PF_SELX_CTX=$PF_SELX_CTX"
   # KV_ROWS (remote attention rows): STORE,size=N(M|G|T)[,local=P][,pool=S][,place=P][,fmt=F] -> the engine's GR8_RT_*
   # (docs/SETTINGS.md). size is each rank's lease in bytes; options.py has checked the form

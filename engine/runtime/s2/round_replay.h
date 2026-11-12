@@ -184,6 +184,7 @@ inline ReplayResult replay(const std::vector<std::string>& lines, const g6rt::Ng
             else if (t == "sess_drafts") { bool v; in(v); b.set_sess_drafts(v); }
             else if (t == "adapt") { bool v; in(v); b.adapt(v); }
             else if (t == "draft_par") { bool v; in(v); b.draft_par(v); }
+            else if (t == "waterfill") { bool on, shared_only; double margin; in(on)(margin)(shared_only); b.waterfill(on, margin, shared_only); }
             else if (t == "fresh_spec") { bool v; in(v); b.fresh_spec(v); }
             else if (t == "dflash") { int kv; g6rt::SpecLen sl; in(kv)(sl); b.dflash(kv, sl); }
             else if (t == "dsel") { DSel d; in(d); b.dsel(d); }

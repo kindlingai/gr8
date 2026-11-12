@@ -37,13 +37,38 @@ The defaults come from `scripts/engine_args.sh`, which the supervisor reads. Eve
 compares the variant's name and the sha256 of its manifest instead. `LAYOUT` is a path too: the handshake compares the
 sha256 of the file.
 
+GLM-5.3 at `TP=4` defaults to `KV_FORMAT=int4`: `bin/g6m4-int4`, `CAP=513536`
+(2,390 pages per rank), the bit-exact INT4 fast paths, folded Hadamard weights,
+tensor-core decode and `CP_ONECHAIN`. Roll back with `--kv-format fp8` or
+`KV_FORMAT=fp8`: `bin/g6m4`, `CAP=485376`, and no implicit `GR8_KV4_*` or
+`GR8_CP_ONECHAIN` settings. Explicit settings still take precedence.
+GLM-5.3 at `TP=3/5/6` and GLM-5.3-Flash retain FP8 unless INT4 is requested;
+DeepSeek and pseudo-engine defaults are unchanged.
+
 ## `./gr8 glm53f`
 
 `./gr8 glm53f` takes the same options for GLM-5.3-Flash: TP 4, 3, 2 or 1, an fp8 KV build, the DFlash2 drafter
 at TP 4, 2 and 1 when `--drafter` (or `DFLASH_DIR`) is given, else MTP (MTP at TP 3), no prefix reuse, and `CAP` 262208 at any TP, a 262,144-token request
 (`tools/launch/models.py`, `flash_defaults` in `scripts/engine_args.sh`, [docs/FLASH.md](docs/FLASH.md)). `SESS`
-defaults to 8 at TP=4, 4 at TP=3 and 1 at TP=2 and TP=1; 2 to 8 share decode steps and the `CAP` pool, each session
+defaults to 8 at TP=4, 4 at TP=3 and TP=2 INT4, and 1 at TP=2 FP8 and TP=1; 2 to 8 share decode steps and the `CAP` pool, each session
 with its own KDA state slots, while `SESS` x (`MTP` + 1) is at most 32.
+
+At `TP=2` with `KV_FORMAT=int4`, ordinary launches use `SESS=4` (max concurrent 4); when `SESS >= 2`, defaults are `MTP=3`,
+`S2_SHARED_WATERFILL=1` and `S2_SHARED_WF_MARGIN=0.02`. `--s2-shared-waterfill 0` rolls back to uniform shared
+rows and, unless explicitly set, `MTP=1`. Pass `--sess 1` for the prior single-session launch.
+Measured on TP=2 INT4 against `S2_SHARED_WATERFILL=0` at matched `SESS=4`, `MTP=3`: +10.45% pooled concurrent decode throughput
+(+12.27% at 4 streams, +7.96% at 2 streams), 20/20 exact solo `T=0`, KL = 0.0 and qeval 73/75 vs 73/75.
+Additional graph captures can increase boot time and memory.
+Measured on two GB10s at `TP=2` with `KV_FORMAT=int4`, plain `./gr8 glm53f --tp 2 --kv-format int4`
+(`SESS=4`, max concurrent 4, `MTP=3`, `S2_SHARED_WATERFILL=1`, `k4` manifest, `CAP=262208`) against the prior
+`SESS=1`, `MTP=1` default: 51.1 vs 51.9 tok/s at 1 stream (-1.7%), 68.3 vs 61.5 tok/s at 2 streams (+11.0%),
+79.2 vs 59.6 tok/s at 4 streams (+32.9%), 14/14 smoke, and 11.1-11.3 GiB post-capture `MemAvailable` a box
+(11.5-12.2 GiB with `--s2-shared-waterfill 0`, 24 s warm boot; 12.6-12.9 GiB at `SESS=1`, 27 s warm boot).
+With the two-box recipe's `bit349` manifest, `CAP=2097152`, vision tower and aligned SSD prompt cache, `SESS=4`
+(`max_concurrent=4`) leaves 8.9-9.2 GiB post-capture `MemAvailable` (25 s warm boot; 55.1 / 70.3 / 82.9 tok/s
+at 1 / 2 / 4 streams), whereas `SESS=8`, `MTP=3` without `GR8_CP=1` leaves 6.4-6.9 GiB (8.7-9.1 GiB with
+`GR8_CP=1`, 29 s warm boot, 97.4 tok/s at 8 streams).
+See [Shared waterfill](docs/SETTINGS.md#shared-waterfill-speculative-row-allocation).
 
 A Flash box can lend what its serve leaves to a KV node beside it (`donate` in `tools/launch/supervisor.py`):
 the `FLASH_KV_*` and `FLASH_CAP_POLICY` options (`./gr8 knobs FLASH_`).
@@ -73,7 +98,7 @@ after the model's options.
 | `BUNDLE_LIBS` | `build.sh` | 1 = copy cuBLAS into `bin/lib` for boxes without the CUDA toolkit |
 | `ARCH` | `build.sh`, `c1_tests.sh` | GPU architecture, default `121a` (GB10) |
 | `EXTRA` | `build.sh`, `c1_tests.sh` | more `-D` flags |
-| `KV_FORMAT` | `build.sh`, `./gr8 glm53 build` | `int4` = build `bin/g6m4-int4` (the 4-bit KV latent, `-DG6_KV4=1`) only. `./gr8 glm53 build` builds it after the fp8 engine when `KV_FORMAT=int4` |
+| `KV_FORMAT` | `build.sh`, `./gr8 glm53 build` | `int4` = build `bin/g6m4-int4` (the 4-bit KV latent, `-DG6_KV4=1`) only. `./gr8 glm53 build` builds it after the fp8 engine for TP=4 or an unconfigured clone; explicit `KV_FORMAT=fp8` or another configured TP skips it unless INT4 is requested |
 
 ## Local steering profile
 

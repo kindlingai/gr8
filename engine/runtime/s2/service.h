@@ -420,7 +420,7 @@ public:
             if (m.draft_lp) h.draft_lp = [&](int row) { return mod_.draft_lp(row); };
         }
         // MTP only (no drafter): the confidence stops of round_all read the draft log-probabilities too (g6m4 sets kstop)
-        const bool kstop_mtp = !m.dfl && (native_.kstop.mode || native_.kstop.b.mode || native_.kstop.log);
+        const bool kstop_mtp = !m.dfl && (native_.kstop.mode || native_.kstop.b.mode || native_.kstop.log || knob::s2_shared_waterfill());
         if (kstop_mtp && m.draft_lp) h.draft_lp = [&](int row) { return mod_.draft_lp(row); };
         const DriverPool dp{pool().handle(), pol_.o.grow, pol_.o.make_room != nullptr, !reuse(),
                             c_.rank == 0};
@@ -430,7 +430,10 @@ public:
             driver_->dfl_reuse(native_.dfl_reuse);
             driver_->ngram(native_.ngram);
         }
-        else if (kstop_mtp) driver_->kstop(native_.kstop);
+        else if (kstop_mtp) {
+            driver_->kstop(native_.kstop);
+            if (knob::s2_shared_waterfill()) driver_->ngram(native_.ngram);
+        }
         require(!c_.scheduler.park || (reuse() && m.park), "parked slots need prefix reuse and the park hook");
         if (reuse()) {
             require(m.retain && pol_.o.take, "prefix reuse needs retain, match and take");

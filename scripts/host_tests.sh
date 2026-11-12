@@ -263,7 +263,7 @@ done
 # refusal (scripts/check_args.py writes the cases), in each model's shape and GLM's serving one; then every refusal
 # reached in some shape
 i=0
-for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_KV4=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
   g++ -std=c++17 -O2 -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/options_vectors_test.cpp" -o "$T/options_vectors_test" "${KVLIB[@]}"
   "$T/options_vectors_test" "$REPO/engine/runtime/s2/tests/options_cases.txt" --dump > "$T/options_$i.txt" || { tail -1 "$T/options_$i.txt"; exit 1; }
   tail -1 "$T/options_$i.txt"
@@ -435,6 +435,7 @@ fi
 python3 "$REPO/engine/tests/test_flash_serve_check.py"
 # Flash serve prefill: the draft cache fill checks the error words once, after its last chunk; every error still fails the request.
 python3 "$REPO/engine/tests/test_flash_serve_prefill_check.py"
+python3 "$REPO/engine/tests/test_flash_serve_waterfill.py"
 # the top-k selection
 g++ -std=c++17 -O2 -Wall "$REPO/engine/runtime/tests/pf_peer_stage_test.cpp" -o "$T/pf_peer_stage_test" "${KNOBS[@]}"
 "$T/pf_peer_stage_test"

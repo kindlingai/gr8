@@ -236,6 +236,11 @@ public:
     Driver(Config c, DriverHooks h, DriverPool pool = {}) : m_(new Impl(c, std::move(h))) {
         Impl& m = *m_;
         m.batch.adapt(s2::adapt_env());
+#if G6_MODEL_FLASH
+        if (knob::s2_shared_waterfill()) m.batch.waterfill(true, knob::s2_shared_wf_margin(), true);
+#else
+        if (knob::s2_shared_waterfill()) m.batch.waterfill(true, knob::s2_shared_wf_margin());
+#endif
         m.batch.set_mtp_sessions(int(c.mtp_sessions));
         m.batch.set_sess_drafts(c.sess_drafts);
         const DriverHooks& k = m.hooks;

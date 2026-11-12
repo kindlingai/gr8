@@ -956,3 +956,20 @@ pub unsafe extern "C" fn g6s2_batch_learn(b: *const Planner, out: *mut CLearn) {
         ring_tok: tok.as_ptr(),
     };
 }
+
+/// Configure deterministic shared allocation before admitting sessions.
+#[no_mangle]
+pub unsafe extern "C" fn g6s2_batch_waterfill(b: *mut Planner, on: bool, margin: f64, shared_only: bool) -> i32 {
+    let p = &mut *b;
+    let result = p.b.set_waterfill(on, margin);
+    if result.is_ok() { p.b.wf_ng_shared_only = shared_only; }
+    rc(p, result)
+}
+
+/// Copy the shared-only confidence state into the round log's learn record.
+#[no_mangle]
+pub unsafe extern "C" fn g6s2_batch_waterfill_lp(b: *const Planner, out: *mut f32) {
+    for (q, row) in (*b).b.wf_lp.iter().enumerate() {
+        std::ptr::copy_nonoverlapping(row.as_ptr(), out.add(q * 8), 8);
+    }
+}

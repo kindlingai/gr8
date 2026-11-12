@@ -103,7 +103,7 @@ private:
 // which Flash's bound layers do not have): main = prompt tails 1..chunk and rounds S x (k + 1), S = 1..sessions, k = 1..K
 // with GR8_S2_ADAPT (else K); draft = 1..chunk and 1..sessions x (K + 1); chain = 1..sessions (K >= 2 only).
 struct FlashShapes { std::set<int> mains, drafts, chains; };
-inline FlashShapes flash_shapes(int sessions, int mtp, int chunk, bool adapt, int mx) {
+inline FlashShapes flash_shapes(int sessions, int mtp, int chunk, bool adapt, int mx, bool waterfill = false, bool ngram = false) {
     std::vector<uint8_t> m(size_t(std::max(mx, 0)) + 1), d(m.size()), c(m.size());
     const int rc = g6sch_flash_shapes(sessions, mtp, chunk, adapt, mx, m.data(), d.data(), c.data());
     if (rc == 1) throw std::runtime_error("Flash capture set: invalid sessions, mtp or chunk");
@@ -113,6 +113,12 @@ inline FlashShapes flash_shapes(int sessions, int mtp, int chunk, bool adapt, in
         if (m[size_t(M)]) f.mains.insert(M);
         if (d[size_t(M)]) f.drafts.insert(M);
         if (c[size_t(M)]) f.chains.insert(M);
+    }
+    if (waterfill) {
+        const int depth = ngram ? std::max(mtp, 7) : mtp;
+        for (int M = 1; M <= std::min(mx, sessions * (depth + 1)); ++M) {
+            f.mains.insert(M); f.drafts.insert(M);
+        }
     }
     return f;
 }
