@@ -20,6 +20,22 @@ The rules, short:
 Before anything leaves your machine, scrub it: no IP addresses, hostnames, box names, usernames, keys or paths from
 your own setup. The config examples use placeholders for a reason.
 
+## Releases
+
+`main` is the single integration branch for pull requests: do not keep long-lived model or topology branches, and do
+not ship recipes as patch stacks on top of an older commit. A protected fast-forward-only `stable` branch tracks the
+newest `main` commit that passes the nightly gate (wrong results anywhere or a speed regression on `gr8`'s default
+`GLM-5.3` `TP=4` setup block `stable`; a failed night rolls forward a fix first, bisecting and reverting only if
+needed, and after two failed nights only fixes for the failure or reverts merge). After `v1.0`, numbered
+`vMAJOR.MINOR.PATCH` releases are immutable annotated tags cut only from `stable` after the full harness gate (`PATCH`
+for compatible fixes, `MINOR` for compatible features and validated default speedups, `MAJOR` for breaking changes),
+and every GitHub Release lists its `Breaking changes` (`None.` when compatible) plus any default or cache-key changes.
+Deployable tuned recipes live in standalone repositories, pin an immutable `v*` tag or an exact merged `main`/`stable`
+commit SHA by submodule or `ghcr.io/kindlingai/gr8` `@sha256:<digest>` (never a moving branch or floating tag such as
+`:latest`, `:main`, or `:stable`), and record their engine pin in `kindling.json` for the `README.md` freshness
+column; a tuned recipe that gets slower on a candidate `stable` commit or `v*` tag does not block it and simply keeps
+its prior pin until re-tuned. Full rules: [RELEASING.md](RELEASING.md).
+
 ## Contributor credit
 
 External contributors should add their GitHub username to [CREDITS.md](CREDITS.md) in their contribution PR, with a
