@@ -1572,3 +1572,221 @@ fn a_grid_off_partial_page_extension_restores_every_row() {
         chat = next;
     }
 }
+
+// A namespace-aware turn, with bytes stamped by the turn that computed them, not just by token identity.
+fn namespaced_turn(
+    r: &mut Rank,
+    prompt: &[i32],
+    namespace: g6kvman::pool::Namespace,
+    stamp: i32,
+    expected: &mut Vec<i32>,
+) -> (g6kvman::Hit, Vec<i32>) {
+    r.pool.count_namespaced(prompt, None, namespace);
+    let rows = (prompt.len() + 21) as u64;
+    let h = r.pool.match_prefix_namespaced(prompt, rows, rows, prompt.len() as i32 - 1, namespace);
+    let run = if h.skip > 0 {
+        r.pool.take_hit(h.skip, h.age, h.stored.then_some(h.tier), rows, rows).unwrap()
+    } else {
+        r.pool.reserve(rows, rows).unwrap()
+    };
+    r.run_io();
+    let list = r.pool.list(&run).unwrap().to_vec();
+    let skip = h.skip.max(0) as usize;
+    for (row, &byte) in expected.iter().enumerate().take(skip) {
+        assert_eq!(r.dev[list[row / ROWS] as usize][row % ROWS], byte, "restored row {row}");
+    }
+    assert!(skip <= expected.len());
+    let mut history = prompt.to_vec();
+    history.extend(toks(-1 - prompt.len() as i32, 20));
+    expected.truncate(skip);
+    expected.extend(history[skip..].iter().map(|t| t + 10000 + stamp * 100000));
+    r.write(&list, skip, expected);
+    r.pool.retain_namespaced(&run, finished(&history), namespace).unwrap();
+    r.run_io();
+    (h, history)
+}
+
+#[test]
+fn a_whole_index_brings_back_a_non_stock_run_only_for_its_own_namespace() {
+    use g6kvman::pool::{NAMESPACE_BYTES, STOCK_NAMESPACE};
+    use g6kvman::stash::Index;
+    let dir = std::env::temp_dir().join(format!("g6kv-whole-namespace-{}", std::process::id()));
+    let ns_a = [1; NAMESPACE_BYTES];
+    let mut ns_b = ns_a;
+    ns_b[NAMESPACE_BYTES - 1] = 2; // exact identity includes the last byte, not just a leading tag
+    let open = |whole: bool| {
+        let mut p = pool(16, 16, 16 * 64, 3);
+        p.add_tier(64, if whole { Keep::Evicted } else { Keep::Shared }, Some((&dir, "namespace-whole"))).unwrap();
+        if whole {
+            p.stash_mut().unwrap().index_whole(0);
+        }
+        Rank::with(p, vec![64])
+    };
+    let mut expected = Vec::new();
+    let (blocks, stock, steered) = {
+        let mut r = open(true);
+        assert_eq!(r.pool.tiers_loaded(), 0);
+        let (_, stock) = namespaced_turn(&mut r, &toks(1, 300), STOCK_NAMESPACE, 0, &mut Vec::new());
+        let (_, steered) = namespaced_turn(&mut r, &toks(2, 300), ns_a, 1, &mut expected);
+        evict_all(&mut r);
+        r.check_slots();
+        (r.tiers.clone(), stock, steered)
+    };
+    let entries = Index::open(&dir, "namespace-whole").unwrap().1;
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().any(|e| e.namespace == ns_a && e.kind == Kind::Evicted));
+    assert!(entries.iter().any(|e| e.namespace == STOCK_NAMESPACE && e.kind == Kind::Evicted));
+    {
+        let mut r = open(true);
+        r.tiers = blocks;
+        assert_eq!(r.pool.tiers_loaded(), 0);
+        let rows = steered.len() as u64 + 1;
+        let limit = steered.len() as i32 - 1;
+        let h = r.pool.match_prefix_namespaced(&steered, rows, rows, limit, ns_a);
+        assert!(h.stored && h.skip >= 128, "{h:?}");
+        let other = r.pool.match_prefix_namespaced(&steered, rows, rows, limit, ns_b);
+        let stock_miss = r.pool.match_prefix(&steered, rows, rows, limit);
+        let steered_miss = r.pool.match_prefix_namespaced(&stock, rows, rows, limit, ns_a);
+        for miss in [other, stock_miss, steered_miss] {
+            assert!(!miss.stored && miss.skip == 0, "{miss:?}");
+        }
+        r.pool.count_namespaced(&steered, None, ns_a);
+        let run = r.pool.take_hit(h.skip, h.age, Some(h.tier), rows, rows).unwrap();
+        r.run_io();
+        let list = r.pool.list(&run).unwrap();
+        for row in 0..h.skip as usize {
+            assert_eq!(r.dev[list[row / ROWS] as usize][row % ROWS], expected[row], "row {row}");
+        }
+        r.pool.release(&run).unwrap();
+        r.check_slots();
+    }
+    // Prefix-only reopen drops both sessions, frees their blocks and durably removes their records.
+    {
+        let mut r = open(false);
+        assert!(r.pool.tier_stats(0).unwrap().free_slots < 64);
+        assert_eq!(r.pool.tiers_loaded(), 2);
+        assert!(r.pool.stash().unwrap().entries(0).is_empty());
+        assert_eq!(r.pool.tier_stats(0).unwrap().free_slots, 64);
+        assert_eq!(r.pool.match_prefix_namespaced(&steered, 400, 400, 319, ns_a).skip, 0);
+        r.check_slots();
+    }
+    assert!(Index::open(&dir, "namespace-whole").unwrap().1.is_empty());
+    std::fs::remove_file(dir.join("index")).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+}
+
+#[test]
+fn steered_session_extends_in_place_across_restarts_writing_only_new_blocks() {
+    use g6kvman::pool::NAMESPACE_BYTES;
+    use g6kvman::stash::Index;
+    let dir = std::env::temp_dir().join(format!("g6kv-steered-extend-{}", std::process::id()));
+    let ns_a = [1; NAMESPACE_BYTES];
+    let mut ns_b = ns_a;
+    ns_b[NAMESPACE_BYTES - 1] = 2;
+    let open = || {
+        let mut p = pool(16, 16, 16 * 64, 3);
+        p.add_tier(64, Keep::Evicted, Some((&dir, "steered-extend"))).unwrap();
+        p.set_policy(0, Policy { min_rows: 0, min_hits: 1, block_bytes: 0 }).unwrap();
+        p.stash_mut().unwrap().index_whole(0);
+        assert_eq!(p.tiers_loaded(), 0);
+        Rank::with(p, vec![64])
+    };
+    let mut expected = Vec::new();
+    let (blocks, mut chat, first) = {
+        let mut r = open();
+        let (_, mut chat) = namespaced_turn(&mut r, &toks(1, 300), ns_a, 1, &mut expected);
+        chat.extend(toks(2, 100));
+        let (hit, chat) = namespaced_turn(&mut r, &chat, ns_a, 2, &mut expected);
+        assert!(!hit.stored && hit.skip >= 128);
+        assert_eq!(r.pool.tier_stats(0).unwrap().spilled_pages, 0);
+        let written = spills(&evict_all(&mut r)).len();
+        let entries = Index::open(&dir, "steered-extend").unwrap().1;
+        assert_eq!(entries.len(), 1);
+        let first = entries[0].clone();
+        assert_eq!(first.namespace, ns_a);
+        assert_eq!(first.slots.len(), 6); // P2 = 384 grid-aligned rows / 64
+        assert_eq!(written, first.slots.len());
+        assert_eq!(r.pool.tier_stats(0).unwrap().spilled_pages, written as u64);
+        r.check_slots();
+        (r.tiers.clone(), chat, first)
+    };
+    let (blocks, fourth) = {
+        let mut r = open();
+        r.tiers = blocks;
+        chat.extend(toks(3, 100));
+        let (hit, mut third) = namespaced_turn(&mut r, &chat, ns_a, 3, &mut expected);
+        assert!(hit.stored && hit.skip == 384, "{hit:?}");
+        third.extend(toks(4, 100));
+        let (hit, fourth) = namespaced_turn(&mut r, &third, ns_a, 4, &mut expected);
+        assert!(!hit.stored && hit.skip == 512, "{hit:?}");
+        assert_eq!(r.pool.tier_stats(0).unwrap().spilled_pages, 0, "both hits leave the SSD untouched");
+        let written = spills(&evict_all(&mut r)).len();
+        let entries = Index::open(&dir, "steered-extend").unwrap().1;
+        assert_eq!(entries.len(), 1);
+        let extended = &entries[0];
+        assert_eq!(extended.namespace, ns_a);
+        assert_ne!(extended.id, first.id);
+        assert_eq!(extended.slots.len(), 10); // P4 = 640 grid-aligned rows / 64
+        assert_eq!(extended.slots[..first.slots.len()], first.slots);
+        let new = extended.slots.len() - first.slots.len();
+        assert_eq!(written, new, "only P4 - P2 new blocks, not P4");
+        assert_eq!(r.pool.tier_stats(0).unwrap().spilled_pages, new as u64);
+        assert_eq!(written as f64 / new as f64, 1.0, "write amplification 1.00");
+        r.check_slots();
+        (r.tiers.clone(), fourth)
+    };
+    {
+        let mut r = open();
+        r.tiers = blocks;
+        let mut fifth = fourth;
+        fifth.extend(toks(5, 100));
+        let rows = fifth.len() as u64 + 21;
+        let stock = r.pool.match_prefix(&fifth, rows, rows, fifth.len() as i32 - 1);
+        let other = r.pool.match_prefix_namespaced(&fifth, rows, rows, fifth.len() as i32 - 1, ns_b);
+        for miss in [stock, other] {
+            assert!(!miss.stored && miss.skip == 0, "{miss:?}");
+        }
+        // The row checks cover both the original six blocks and the four-block extension, with distinct turn stamps.
+        let (hit, _) = namespaced_turn(&mut r, &fifth, ns_a, 5, &mut expected);
+        assert!(hit.stored && hit.skip == 640, "{hit:?}");
+        assert_eq!(r.pool.tier_stats(0).unwrap().spilled_pages, 0);
+        r.check_slots();
+    }
+    std::fs::remove_file(dir.join("index")).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+}
+
+#[test]
+fn non_stock_live_or_pending_prompt_cannot_split_a_stock_prefix_base() {
+    for live in [false, true] {
+        let mut r = Rank::new(24, 24, 24 * 64, &[(64, Keep::Evicted)], 3);
+        let system = toks(1, 300);
+        let mut stock = system.clone();
+        stock.extend(toks(2, 200));
+        let (_, _, history) = session(&mut r, &stock, 20);
+        let mut selected = system;
+        selected.extend(toks(3, 200));
+        let ns = [1; g6kvman::pool::NAMESPACE_BYTES];
+        assert_eq!(r.pool.count_namespaced(&selected, None, ns), 0);
+        let held = if live {
+            let run = r.pool.reserve(550, 550).unwrap();
+            assert!(r.run_io().is_empty());
+            Some(run)
+        } else {
+            None
+        };
+        // Evict the stock run while the matching non-stock prompt is either pending or held live.
+        let rows = if live { 24 * PAGE - 576 } else { 24 * PAGE };
+        let pressure = r.pool.reserve(rows, rows).unwrap();
+        r.run_io();
+        let entries = r.pool.stash().unwrap().entries(0);
+        let stored = entries.iter().find(|e| e.st.history == history).unwrap();
+        assert!(stored.base.is_none(), "non-stock tokens cannot establish a stock base (live={live})");
+        assert!(entries.iter().all(|e| e.kind == Kind::Evicted));
+        r.pool.release(&pressure).unwrap();
+        if let Some(run) = held {
+            r.pool.release(&run).unwrap();
+        }
+        r.check_slots();
+    }
+}

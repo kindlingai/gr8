@@ -39,12 +39,16 @@ must refer to valid objects. The C++ adapter links the new symbols, so build it 
 An evicted non-stock run is stored whole as an evicted entry that carries its namespace (`stash::Entry::namespace`),
 and only a lookup with the same 70 bytes can hit it (memory, file and remote block stores alike). A non-stock run
 never promotes a shared prefix, never gets or becomes a prefix base (no dedupe), and never leaves a stock
-continuation head. Prefix kinds, and so the persistent index, stay stock-only: its format is unchanged, and a
-restart keeps no non-stock entry. The direct prototype `Tier::spill` still refuses non-stock runs. A stock lookup
-never sees a non-stock entry, and a non-stock entry folds all its namespace bytes into the replicated digest.
+continuation head. Prefix kinds and prefix-only persistent indexes (`keep=system`) stay stock-only. A whole index
+(`Stash::index_whole`, or `persist=on` SSD with `keep=sessions` or `keep=all`) journals non-stock evicted entries with
+their exact 70-byte namespace in record 4, so they survive restarts for their own namespace only. Reopening without
+`index_whole` drops these session entries. The direct prototype `Tier::spill` still refuses non-stock runs. A stock
+lookup never sees a non-stock entry, and a non-stock entry folds all its namespace bytes into the replicated digest.
 
 Non-stock requests must use namespace-aware admission counting so their live metadata is excluded from stock
-promotion. The pool never infers a namespace from token IDs. Equal tokens alone do not establish equal cache state.
+promotion. `count_namespaced` preserves continuation provenance within its own namespace, so stored sessions extend
+in place without affecting stock promotion or resident prefix splitting. The pool never infers a namespace from token
+IDs. Equal tokens alone do not establish equal cache state.
 
 Stock retained entries keep the existing replicated-state digest exactly. Nonzero retained namespaces contribute
 all their bytes to that digest. This digest is an agreement check, not a cryptographic authentication mechanism.
