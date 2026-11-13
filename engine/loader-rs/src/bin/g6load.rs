@@ -19,6 +19,11 @@
 //!       converts the DFlash2 drafter (config.json + model.safetensors in --src) into dflash.r<r>.pack and
 //!       dflash.r<r>.manifest.json for each rank (src/dflash2.rs). One JSON line
 //!       per rank: {"rank", "tensors", "bytes", "seconds"}.
+//!
+//!   g6load ink2-plan --src DIR --tp N --rank R [--out-manifest FILE] [--no-gv] [--no-mtp] [--no-vision]
+//!       plans one rank's image of an Inkling-2-Small checkpoint directory (src/ink2.rs) without loading it. One JSON
+//!       line: {"tp", "rank", "tensors", "image_bytes", "read_bytes", "files"}. --out-manifest writes the image
+//!       manifest (sha256 fields zero).
 
 use g6load::dflash2;
 use g6load::fetch::{self, Choice};
@@ -45,9 +50,42 @@ fn layers(spec: &str) -> Result<Vec<usize>, String> {
     Ok(out)
 }
 
+/// `g6load ink2-plan`: its three switches take no value, so it parses its own arguments.
+fn ink2_plan(args: &[String]) -> Result<i32, String> {
+    let mut opts = g6load::ink2::Opts::default();
+    let (mut src, mut tp, mut rank, mut out) = (None, None, None, None);
+    let mut it = args.iter();
+    while let Some(k) = it.next() {
+        let mut val = || it.next().ok_or(format!("{k} needs a value"));
+        match k.as_str() {
+            "--no-gv" => opts.bf16_gv = false,
+            "--no-mtp" => opts.with_mtp = false,
+            "--no-vision" => opts.with_vision = false,
+            "--src" => src = Some(val()?.clone()),
+            "--tp" => tp = Some(val()?.parse::<usize>().map_err(|_| "--tp: not a number")?),
+            "--rank" => rank = Some(val()?.parse::<usize>().map_err(|_| "--rank: not a number")?),
+            "--out-manifest" => out = Some(val()?.clone()),
+            _ => return Err(format!("ink2-plan: unknown option {k}")),
+        }
+    }
+    let (src, tp, rank) = (src.ok_or("ink2-plan: --src is required")?, tp.ok_or("ink2-plan: --tp is required")?,
+                           rank.ok_or("ink2-plan: --rank is required")?);
+    let p = g6load::ink2::plan(&src, tp, rank, &opts)?;
+    if let Some(out) = out {
+        let zeros = vec!["0".repeat(64); p.img.tensors.len()];
+        std::fs::write(&out, p.manifest_json(&zeros, tp)).map_err(|e| format!("{out}: {e}"))?;
+    }
+    println!("{{\"tp\": {tp}, \"rank\": {rank}, \"tensors\": {}, \"image_bytes\": {}, \"read_bytes\": {}, \"files\": {}}}",
+             p.img.tensors.len(), p.img.bytes, p.read_bytes(), p.reads.len());
+    Ok(0)
+}
+
 fn run() -> Result<i32, String> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = argv.first().ok_or("usage: g6load fetch-plan|verify|compact|dflash2 (see the source) --slices DIR --tp N --rank R (--manifest F | --widths K,..)")?;
+    let cmd = argv.first().ok_or("usage: g6load fetch-plan|verify|compact|dflash2|ink2-plan (see the source) --slices DIR --tp N --rank R (--manifest F | --widths K,..)")?;
+    if cmd == "ink2-plan" {
+        return ink2_plan(&argv[1..]);
+    }
     let mut opt: BTreeMap<&str, &str> = BTreeMap::new();
     let mut it = argv[1..].iter();
     while let Some(k) = it.next() {
@@ -102,6 +140,6 @@ fn run() -> Result<i32, String> {
             println!("{{\"checked\": {}, \"bad\": [{}]}}", units.len(), rows.join(",\n"));
             Ok(if bad.is_empty() { 0 } else { 3 })
         }
-        _ => Err(format!("unknown command {cmd}: fetch-plan, verify, compact or dflash2")),
+        _ => Err(format!("unknown command {cmd}: fetch-plan, verify, compact, dflash2 or ink2-plan")),
     }
 }

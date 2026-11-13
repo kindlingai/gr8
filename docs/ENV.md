@@ -476,6 +476,7 @@ Read by test programs, audits and benchmarks. `g6m4 --serve` refuses to start wh
 | `GR8_TEST_DS41_TOKENIZER_DIR` | path | unset |  | The DeepSeek-V4.1-Flash tokenizer directory (tokenizer.json, tokenizer_config.json) the front end's ds41 dialect test reads; unset skips it. |
 | `GR8_TEST_FUZZ_ROUNDS` | int | `40` |  | Rounds of the front end tokenizer fuzz test. |
 | `GR8_TEST_IDX_DUMP` | path | unset |  | m4sim writes rank 0's selected key ids of the first --layers layer to this file for each main step from GR8_LOGIT_DUMP_FROM on. |
+| `GR8_TEST_INK2_METADATA_DIR` | path | unset |  | A directory with the Inkling-2-Small checkpoint's metadata (config.json, hf_quant_config.json, model.safetensors.index.json, _tensor_shapes.json), for the loader test that plans every tensor of the full-size checkpoint from its names, dtypes and shapes; unset skips it. |
 | `GR8_TEST_KVMAN_LEDGER` | path | `kvman-ledger` |  | flash_kv_chunks_test: the kvman-ledger binary. |
 | `GR8_TEST_KVSIM_ENTRIES` | flag | `0` |  | kvman-sim: 1 prints the stash entries at the end. |
 | `GR8_TEST_KV_HASH` | flag | `0` |  | m4sim prints per layer an FNV hash of the stored latent records of the prompt positions, read from every rank that holds them, after the prefill. |

@@ -31,6 +31,14 @@ knobs:
     doc: >-
       The DeepSeek-V4.1-Flash tokenizer directory (tokenizer.json, tokenizer_config.json) the front end's ds41 dialect
       test reads; unset skips it.
+  GR8_TEST_INK2_METADATA_DIR:
+    kind: path
+    unset: "unset"
+    legacy: []
+    doc: >-
+      A directory with the Inkling-2-Small checkpoint's metadata (config.json, hf_quant_config.json,
+      model.safetensors.index.json, _tensor_shapes.json), for the loader test that plans every tensor of the full-size
+      checkpoint from its names, dtypes and shapes; unset skips it.
   GR8_TEST_VISION_CASES:
     kind: path
     unset: "the committed set, frontend/g6front-rs/src/vision_cases"
