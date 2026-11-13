@@ -134,6 +134,12 @@ pub struct Finish {
     pub cached_tokens: Option<u64>,
     #[serde(default)]
     pub message: Option<String>,
+    /// the busy guard's refusal (PROTOCOL.md `finish`): the HTTP status the front end answers with (429) and the
+    /// seconds for its Retry-After header. An engine that does not send them keeps the front end's plain 500.
+    #[serde(default)]
+    pub status: Option<u16>,
+    #[serde(default)]
+    pub retry_after: Option<u32>,
 }
 
 /// A `finish` frame's per-request counters (PROTOCOL.md `spec`, `timing`), read only for a request that asked for
