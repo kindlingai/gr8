@@ -1801,7 +1801,7 @@ int main(int argc, char** argv)
                     const auto v = g6s2::ds41_chunk_cell(c, false); // DS41 has no S2 shared-index page mapping.
                     pf_cells[i] = G6AttnStepCell{v.context, v.page_count, v.table_size, v.reuse_rows};
                 }
-                ds41moe::elog_begin(&m, (int)c.first);
+                ds41moe::elog_begin(&m, (int)c.first, true);
                 G6RT_CK(cudaStreamSynchronize(0)); // elog_begin uses a synchronous legacy-stream copy; order it before router work on st.
                 G6RT_CK(cudaMemcpyAsync(m.tok, c.tok, c.rows * sizeof(int), cudaMemcpyHostToDevice, st));
                 G6RT_CK(cudaMemcpyAsync(m.pos, pf_pos.data(), c.rows * sizeof(int), cudaMemcpyHostToDevice, st));
@@ -1985,7 +1985,7 @@ int main(int argc, char** argv)
                         lane_ev.push_back(e);
                     }
                     // ds41moe::elog_begin is a synchronous legacy-stream copy: both lanes' before any router work (lane B has its own counter)
-                    for (int L = 0; L < 2; ++L) ds41moe::elog_begin(mm[L], (int)ch[L]->first);
+                    for (int L = 0; L < 2; ++L) ds41moe::elog_begin(mm[L], (int)ch[L]->first, true);
                     G6RT_CK(cudaStreamSynchronize(0));
                     // lane L's prologue: dc.prefill's, on its Model, stream and fabric (K_PRO, the first link of the token chain)
                     auto prologue = [&](int L) {
@@ -2144,7 +2144,7 @@ int main(int argc, char** argv)
                 // m.sess and the pack table. Keep a conservative maximum in the unused cells.
                 const int pages = (max_context + 63) / 64;
                 for (int i = 0; i < m.nl; ++i) pf_cells[i] = G6AttnStepCell{max_context, pages, pages, 0};
-                ds41moe::elog_begin(&m, 0); // every eligible segment starts at position zero; rows map back via shape.seg
+                ds41moe::elog_begin(&m, 0, true); // every eligible segment starts at position zero; rows map back via shape.seg
                 G6RT_CK(cudaStreamSynchronize(0));
                 G6RT_CK(cudaMemcpyAsync(m.tok, pf_tok.data(), size_t(rows) * sizeof(int), cudaMemcpyHostToDevice, st));
                 G6RT_CK(cudaMemcpyAsync(m.pos, pf_pos.data(), size_t(rows) * sizeof(int), cudaMemcpyHostToDevice, st));
