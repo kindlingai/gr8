@@ -94,7 +94,7 @@ struct AttnCoreArgs
     Rows rw;
     uint16_t* og;      // [M][nh_q * hd]
     float* part;       // [rows of the launch][nh_q][smax][hd + 2] = maximum, sum of exp, sum of exp * V
-    int m0;            // first row of the launch
+    int m0, rows;      // first row and row count of the launch
     int nh_q, q0, gqa, kv0, nk, hd, rel_dim, rel_win, window, base, global, max_pps, smax;
 };
 
@@ -214,6 +214,278 @@ __global__ void __launch_bounds__(ACT) k_ink2_attn_core(AttnCoreArgs a)
     a.og[qo + t] = attn_out(a2, d2, a.gate[qo + t]);
 }
 
+constexpr int GRP_Q = 32;    // (row, query head) queries sharing one K / V head in a global-attention CTA
+constexpr int GRP_KT = 32;   // keys loaded per shared-memory tile (4 tiles = ACT = 128 keys)
+
+// Grouped global-attention core: up to GRP_Q (row, query head) queries sharing K / V head lkv = blockIdx.z read each K
+// and V page row once together and fold keys in the exact arithmetic order of k_ink2_attn_core.
+// grid (max_ngrp, smax, nh_kv)
+__global__ void __launch_bounds__(ACT) k_ink2_attn_global_grp(AttnCoreArgs a)
+{
+    __shared__ float qs[GRP_Q][ATTN_MAX_HD], rs[GRP_Q][ATTN_MAX_REL], zs[GRP_Q][ACT];
+    __shared__ alignas(8) uint16_t ks[GRP_KT][ATTN_MAX_HD + 2];
+    __shared__ int q_row[GRP_Q], q_lq[GRP_Q], q_pos[GRP_Q], q_ns[GRP_Q], q_sidx[GRP_Q];
+    __shared__ int uniq_slots[GRP_Q], uniq_max_p[GRP_Q], nq_s[GRP_Q];
+    __shared__ float mx_s[GRP_Q], den_s[GRP_Q], sc_s[GRP_Q];
+    __shared__ int num_slots_s;
+
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    const int hd = a.hd, rd = a.rel_dim, sp = static_cast<int>(blockIdx.y), lkv = static_cast<int>(blockIdx.z);
+    const int lq0 = max(0, (a.kv0 + lkv) * a.gqa - a.q0);
+    const int lq1 = min(a.nh_q, (a.kv0 + lkv + 1) * a.gqa - a.q0);
+    const int gq = lq1 - lq0;
+    if (gq <= 0) return;
+    const int qbase = static_cast<int>(blockIdx.x) * GRP_Q;
+    const int total_q = a.rows * gq;
+    if (qbase >= total_q) return;
+    const int qcnt = min(GRP_Q, total_q - qbase);
+    const int k0 = sp * ATTN_SPAN;
+
+    if (t < GRP_Q)
+    {
+        nq_s[t] = 0;
+        if (t < qcnt)
+        {
+            const int qi = qbase + t;
+            const int r_loc = qi / gq, lq = lq0 + (qi % gq);
+            const int row = a.m0 + r_loc, p = a.rw.pos[row];
+            q_row[t] = row;
+            q_lq[t] = lq;
+            q_pos[t] = p;
+            q_ns[t] = attn_splits(true, a.window, p);
+            mx_s[t] = -INFINITY;
+            den_s[t] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    if (t == 0)
+    {
+        int ns_u = 0;
+        for (int q = 0; q < qcnt; ++q)
+        {
+            if (sp >= q_ns[q])
+            {
+                q_sidx[q] = -1;
+                continue;
+            }
+            const int sl = a.rw.slot[q_row[q]], p = q_pos[q];
+            int idx = -1;
+            for (int u = 0; u < ns_u; ++u)
+                if (uniq_slots[u] == sl) { idx = u; break; }
+            if (idx < 0)
+            {
+                idx = ns_u++;
+                uniq_slots[idx] = sl;
+                uniq_max_p[idx] = p;
+            }
+            else if (p > uniq_max_p[idx]) uniq_max_p[idx] = p;
+            q_sidx[q] = idx;
+        }
+        num_slots_s = ns_u;
+    }
+    __syncthreads();
+    const int num_slots = num_slots_s;
+    if (num_slots == 0) return;
+
+    for (int i = t; i < GRP_Q * ATTN_MAX_HD; i += ACT) (&qs[0][0])[i] = 0.0f;
+    __syncthreads();
+
+    for (int q = warp; q < qcnt; q += 4)
+    {
+        if (q_sidx[q] < 0) continue;
+        const int row = q_row[q], lq = q_lq[q], p = q_pos[q];
+        const float tq = attn_tau(p, a.base);
+        const size_t qo = (static_cast<size_t>(row) * a.nh_q + lq) * hd;
+        const int d0 = lane, d1 = lane + 32, d2 = lane + 64, d3 = lane + 96;
+        const float tmp0 = d0 < hd ? mul_rn(bf(a.q_raw[qo + d0]), bf(a.q_clip[lq * hd + d0])) : 0.0f;
+        const float tmp1 = d1 < hd ? mul_rn(bf(a.q_raw[qo + d1]), bf(a.q_clip[lq * hd + d1])) : 0.0f;
+        const float tmp2 = d2 < hd ? mul_rn(bf(a.q_raw[qo + d2]), bf(a.q_clip[lq * hd + d2])) : 0.0f;
+        const float tmp3 = d3 < hd ? mul_rn(bf(a.q_raw[qo + d3]), bf(a.q_clip[lq * hd + d3])) : 0.0f;
+        const float s02 = add_rn(mul_rn(tmp0, tmp0), mul_rn(tmp2, tmp2));
+        const float s13 = add_rn(mul_rn(tmp1, tmp1), mul_rn(tmp3, tmp3));
+        float ss = add_rn(s02, s13);
+        for (int off = 16; off > 0; off >>= 1) ss = add_rn(ss, __shfl_down_sync(0xffffffffu, ss, off));
+        ss = __shfl_sync(0xffffffffu, ss, 0);
+        const float qf = l2_clip(ss, hd);
+        if (d0 < hd) qs[q][d0] = rbf(mul_rn(rbf(mul_rn(tmp0, qf)), tq));
+        if (d1 < hd) qs[q][d1] = rbf(mul_rn(rbf(mul_rn(tmp1, qf)), tq));
+        if (d2 < hd) qs[q][d2] = rbf(mul_rn(rbf(mul_rn(tmp2, qf)), tq));
+        if (d3 < hd) qs[q][d3] = rbf(mul_rn(rbf(mul_rn(tmp3, qf)), tq));
+        if (lane == 0)
+        {
+            const uint16_t* rr = a.r_raw + (static_cast<size_t>(row) * a.nh_q + lq) * rd;
+            float rss = 0.0f;
+            for (int d = 0; d < rd; ++d)
+            {
+                rs[q][d] = mul_rn(bf(rr[d]), bf(a.rel_clip[lq * rd + d]));
+                rss = add_rn(rss, mul_rn(rs[q][d], rs[q][d]));
+            }
+            const float rf = l2_clip(rss, rd);
+            for (int d = 0; d < rd; ++d) rs[q][d] = rbf(mul_rn(rbf(mul_rn(rs[q][d], rf)), tq));
+        }
+    }
+    __syncthreads();
+
+    float acc[GRP_Q];
+    #pragma unroll
+    for (int q = 0; q < GRP_Q; ++q) acc[q] = 0.0f;
+    const float root_hd = sqrtf(static_cast<float>(hd));
+    const size_t nk = static_cast<size_t>(a.nk);
+    const int grp8 = t >> 3, sub8 = t & 7, q0w = warp * 8, qnw = min(8, max(0, qcnt - q0w));
+
+    for (int si = 0; si < num_slots; ++si)
+    {
+        const size_t slot = static_cast<size_t>(uniq_slots[si]);
+        const int k1_slot = min(k0 + ATTN_SPAN, uniq_max_p[si] + 1);
+        for (int kb = k0; kb < k1_slot; kb += ACT)
+        {
+            const int n_slot = min(ACT, k1_slot - kb);
+            for (int kt = 0; kt < n_slot; kt += GRP_KT)
+            {
+                const int nt = min(GRP_KT, n_slot - kt);
+                const size_t pg = static_cast<size_t>(a.page_table[slot * a.max_pps + (kb + kt) / KV_PAGE_TOKENS]);
+                const uint16_t* kbase = a.pages + (pg * 2 * KV_PAGE_TOKENS + (kb + kt) % KV_PAGE_TOKENS) * nk + lkv * hd;
+                for (int key = grp8; key < nt; key += 16)
+                {
+                    const uint32_t* kr32 = reinterpret_cast<const uint32_t*>(kbase + static_cast<size_t>(key) * nk);
+                    uint32_t* ks32 = reinterpret_cast<uint32_t*>(&ks[key][0]);
+                    for (int c2 = sub8; c2 < (hd >> 1); c2 += 8) ks32[c2] = kr32[c2];
+                }
+                __syncthreads();
+
+                if (lane < nt && qnw > 0)
+                {
+                    float s[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                    const uint32_t* ks32 = reinterpret_cast<const uint32_t*>(&ks[lane][0]);
+                    for (int d = 0; d < hd; d += 2)
+                    {
+                        const uint32_t pair = ks32[d >> 1];
+                        const float k0f = bf(static_cast<uint16_t>(pair));
+                        const float k1f = bf(static_cast<uint16_t>(pair >> 16));
+                        #pragma unroll
+                        for (int i = 0; i < 8; ++i)
+                        {
+                            s[i] = add_rn(s[i], mul_rn(qs[q0w + i][d], k0f));
+                            s[i] = add_rn(s[i], mul_rn(qs[q0w + i][d + 1], k1f));
+                        }
+                    }
+                    const int kpos = kb + kt + lane;
+                    for (int i = 0; i < qnw; ++i)
+                    {
+                        const int q = q0w + i;
+                        if (q_sidx[q] != si) continue;
+                        const int p = q_pos[q];
+                        if (kpos > p) continue;
+                        float z = div_rn(s[i], root_hd);
+                        const int dist = p - kpos;
+                        if (dist < a.rel_win)
+                        {
+                            float b = 0.0f;
+                            for (int d = 0; d < rd; ++d)
+                                b = add_rn(b, mul_rn(rs[q][d], bf(a.rel_proj[static_cast<size_t>(d) * a.rel_win + dist])));
+                            z = add_rn(z, b);
+                        }
+                        zs[q][kt + lane] = z;
+                    }
+                }
+                __syncthreads();
+            }
+
+            for (int q = warp; q < qcnt; q += 4)
+            {
+                const int nq = (q_sidx[q] == si && kb <= q_pos[q]) ? min(ACT, q_pos[q] + 1 - kb) : 0;
+                if (lane == 0) nq_s[q] = nq;
+                if (nq <= 0) continue;
+                const int j0 = lane, j1 = lane + 32, j2 = lane + 64, j3 = lane + 96;
+                const float z0 = j0 < nq ? zs[q][j0] : -INFINITY;
+                const float z1 = j1 < nq ? zs[q][j1] : -INFINITY;
+                const float z2 = j2 < nq ? zs[q][j2] : -INFINITY;
+                const float z3 = j3 < nq ? zs[q][j3] : -INFINITY;
+                float m = fmaxf(fmaxf(z0, z2), fmaxf(z1, z3));
+                for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, off));
+                m = __shfl_sync(0xffffffffu, m, 0);
+                const float mx_old = mx_s[q];
+                const float mn = fmaxf(mx_old, m), sc = expf(mx_old - mn);
+                zs[q][j0] = j0 < nq ? expf(z0 - mn) : 0.0f;
+                zs[q][j1] = j1 < nq ? expf(z1 - mn) : 0.0f;
+                zs[q][j2] = j2 < nq ? expf(z2 - mn) : 0.0f;
+                zs[q][j3] = j3 < nq ? expf(z3 - mn) : 0.0f;
+                __syncwarp();
+                if (lane == 0)
+                {
+                    float den = mul_rn(den_s[q], sc);
+                    for (int j = 0; j < nq; ++j) den = add_rn(den, zs[q][j]);
+                    den_s[q] = den;
+                    mx_s[q] = mn;
+                    sc_s[q] = sc;
+                }
+            }
+            __syncthreads();
+
+            if (t < hd)
+            {
+                bool all_full = (qcnt == GRP_Q);
+                for (int q = 0; q < qcnt; ++q)
+                {
+                    if (nq_s[q] > 0) acc[q] = mul_rn(acc[q], sc_s[q]);
+                    if (nq_s[q] != n_slot) all_full = false;
+                }
+                for (int j0 = 0; j0 < n_slot; j0 += KV_PAGE_TOKENS)
+                {
+                    const int j1 = min(n_slot, j0 + KV_PAGE_TOKENS);
+                    const size_t pg = static_cast<size_t>(a.page_table[slot * a.max_pps + (kb + j0) / KV_PAGE_TOKENS]);
+                    const uint16_t* vbase = a.pages + (pg * 2 * KV_PAGE_TOKENS + KV_PAGE_TOKENS + (kb + j0) % KV_PAGE_TOKENS) * nk + lkv * hd;
+                    if (all_full)
+                    {
+                        for (int j = j0; j < j1; ++j, vbase += nk)
+                        {
+                            const float vv = bf(vbase[t]);
+                            #pragma unroll
+                            for (int q = 0; q < GRP_Q; ++q) acc[q] = add_rn(acc[q], mul_rn(zs[q][j], vv));
+                        }
+                    }
+                    else
+                    {
+                        for (int j = j0; j < j1; ++j, vbase += nk)
+                        {
+                            const float vv = bf(vbase[t]);
+                            #pragma unroll
+                            for (int q = 0; q < GRP_Q; ++q)
+                                if (j < nq_s[q]) acc[q] = add_rn(acc[q], mul_rn(zs[q][j], vv));
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    for (int q = 0; q < qcnt; ++q)
+    {
+        if (q_sidx[q] < 0) continue;
+        const int row = q_row[q], lq = q_lq[q], ns = q_ns[q];
+        const size_t b = static_cast<size_t>(row - a.m0) * a.nh_q + lq;
+        if (ns > 1)
+        {
+            float* pt = a.part + (b * a.smax + sp) * (hd + 2);
+            if (t == 0)
+            {
+                pt[0] = mx_s[q];
+                pt[1] = den_s[q];
+            }
+            if (t < hd) pt[2 + t] = acc[q];
+        }
+        else if (t < hd)
+        {
+            const size_t qo = (static_cast<size_t>(row) * a.nh_q + lq) * hd;
+            float m2 = bf(a.sink[static_cast<size_t>(row) * a.nh_q + lq]), d2 = 1.0f, a2 = 0.0f;
+            attn_merge(m2, d2, a2, mx_s[q], den_s[q], acc[q]);
+            a.og[qo + t] = attn_out(a2, d2, a.gate[qo + t]);
+        }
+    }
+}
+
 // The rows with more than one span: the sink, then the partials in span order. grid rows * nh_q.
 __global__ void __launch_bounds__(ACT) k_ink2_attn_merge(AttnCoreArgs a)
 {
@@ -327,15 +599,32 @@ inline void attn_forward(const AttnGeom& g, const AttnWeights& w, const AttnStat
 
     const int smax = attn_splits(g.global, g.window, max_pos);
     const size_t per_row = static_cast<size_t>(g.nh_q) * smax * (hd + 2);
-    const int mb = smax == 1 ? M : static_cast<int>(wk.part_floats / per_row < static_cast<size_t>(M) ? wk.part_floats / per_row : static_cast<size_t>(M));
+    int mb = smax == 1 ? M : static_cast<int>(wk.part_floats / per_row < static_cast<size_t>(M) ? wk.part_floats / per_row : static_cast<size_t>(M));
     if (mb < 1) throw std::runtime_error("ink2::attn_forward: AttnWork::part_floats is too small for one row at this position");
+    if (g.global && mb > 16 && mb < M) mb = mb / 16 * 16;
+    int max_gq = 1;
+    if (g.global)
+    {
+        for (int lkv = 0; lkv < g.nh_kv; ++lkv)
+        {
+            const int lq0 = std::max(0, (g.kv0 + lkv) * g.gqa - g.q0);
+            const int lq1 = std::min(g.nh_q, (g.kv0 + lkv + 1) * g.gqa - g.q0);
+            if (lq1 - lq0 > max_gq) max_gq = lq1 - lq0;
+        }
+    }
     AttnCoreArgs a{wk.q_raw, wk.r_raw, wk.gate, wk.sink, w.q_clip, w.rel_clip, w.rel_proj, wk.kv_new, s.ring, s.pages, s.page_table, rw, wk.og, wk.part,
-                   0, g.nh_q, g.q0, g.gqa, g.kv0, nk, hd, g.rel_dim, g.rel_win, g.window, g.log_scale_base, g.global ? 1 : 0, s.max_pps, smax};
+                   0, 0, g.nh_q, g.q0, g.gqa, g.kv0, nk, hd, g.rel_dim, g.rel_win, g.window, g.log_scale_base, g.global ? 1 : 0, s.max_pps, smax};
     for (int m0 = 0; m0 < M; m0 += mb)
     {
         const int rows = M - m0 < mb ? M - m0 : mb;
         a.m0 = m0;
-        k_ink2_attn_core<<<dim3(rows * g.nh_q, smax), ACT, 0, st>>>(a);
+        a.rows = rows;
+        if (g.global)
+        {
+            const int max_ngrp = (rows * max_gq + GRP_Q - 1) / GRP_Q;
+            k_ink2_attn_global_grp<<<dim3(max_ngrp, smax, g.nh_kv), ACT, 0, st>>>(a);
+        }
+        else k_ink2_attn_core<<<dim3(rows * g.nh_q, smax), ACT, 0, st>>>(a);
         if (smax > 1) k_ink2_attn_merge<<<rows * g.nh_q, ACT, 0, st>>>(a);
     }
     if (out != nullptr) gemm_bf16(wk.og, w.wo, M, nq, H, out, st);

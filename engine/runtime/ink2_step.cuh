@@ -819,9 +819,9 @@ private:
                 x.as.max_pps = max_pps;
                 keys = o.cap;
             }
-            // the split partials of one row over every span of keys; the forward takes as many rows a launch as fit
+            // the split partials over every span of keys; 16 global rows fill 32-query GQA CTAs on both TP=6 and TP=4
             const size_t spans = static_cast<size_t>(keys + ink2::ATTN_SPAN - 1) / ink2::ATTN_SPAN + 1;
-            const size_t rows = s.glob ? 1 : static_cast<size_t>(o.max_rows);
+            const size_t rows = s.glob ? std::min<size_t>(16, static_cast<size_t>(o.max_rows)) : static_cast<size_t>(o.max_rows);
             x.wk.alloc(x.g, o.max_rows, rows * x.g.nh_q * spans * (x.g.hd + 2));
             x.fc1 = im.get<uint8_t>(N("x.fc1"));
             x.fc2 = im.get<uint8_t>(N("x.fc2"));

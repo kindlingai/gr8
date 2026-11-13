@@ -4,7 +4,7 @@
 // m4sim_ink2 (ink2_sim.cu) sums them on one GPU.
 //
 //   g6m4_ink2 --rank R --ips a,b,.. [--ips2 a,b,..] [--proxy-cpu N] --v2-dense DIR [--layers all|0,5,..]
-//             [--top-p-cands 256] [--chunk 8] [--prefill 128] [--cap 262144] [--graph|--no-graph] [--mtp 0]
+//             [--top-p-cands 256] [--chunk 8] [--prefill 512] [--cap 262144] [--graph|--no-graph] [--mtp 0]
 //             [--reuse-prefix] [--kv-store SPEC] [--kv-keep S] [--kv-system-after N] [--kv-write-limit F]
 //             --serve DIR --s2-port PORT --s2-sessions N --s2-epoch E [--set-id ID]
 //   without --serve: --tokens 1,2,3 --gen 16 [--temp 0 --top-p 1 --seed 1234] runs one session, the same on every
@@ -97,7 +97,7 @@ int main(int argc, char** argv)
     using namespace ink2rt;
     std::string dir, layers = "all", tokens, s2dir, set_id, ips, ips2, kv_keep = "all";
     std::vector<std::string> kv_tiers;
-    int rank = -1, proxy_cpu = -1, gen = 16, chunk = 8, prefill = 128, nc = 256, cap = 262144, mtp = 0, s2port = 7341, s2sess = 1, s2epoch = 0, kv_sys_after = 2;
+    int rank = -1, proxy_cpu = -1, gen = 16, chunk = 8, prefill = 512, nc = 256, cap = 262144, mtp = 0, s2port = 7341, s2sess = 1, s2epoch = 0, kv_sys_after = 2;
     double kv_wlim = 0.0;
     bool reuse = false;
     float temp = 0.f, top_p = 1.f;
@@ -148,8 +148,8 @@ int main(int argc, char** argv)
     if (dir.empty()) die("name the checkpoint: --v2-dense DIR");
     if (mtp != 0) die("--mtp " + std::to_string(mtp) + ": Inkling-2-Small serves at MTP 0");
     const int max_chunk = s2dir.empty() ? 256 : 8;
-    if (s2sess < 1 || s2sess > 8 || chunk < 1 || chunk > max_chunk || prefill < 1 || prefill > 256 || cap < 64)
-        die("--s2-sessions 1..8, --chunk 1.." + std::to_string(max_chunk) + ", --prefill 1..256, --cap >= 64");
+    if (s2sess < 1 || s2sess > 8 || chunk < 1 || chunk > max_chunk || prefill < 1 || prefill > 512 || cap < 64)
+        die("--s2-sessions 1..8, --chunk 1.." + std::to_string(max_chunk) + ", --prefill 1..512, --cap >= 64");
     if (kv_keep != "system" && kv_keep != "sessions" && kv_keep != "all") die("--kv-keep must be system, sessions or all");
     if (kv_sys_after < 1 || kv_wlim < 0.0) die("--kv-system-after >= 1, --kv-write-limit >= 0");
     if (!ip2.empty() && ip2.size() != ip.size()) die("--ips2 must name as many addresses as --ips");
