@@ -176,8 +176,38 @@ request of up to 1,048,566 tokens), faster writing for a small quality loss, a s
 sooner with several chats, and long prompts while other chats write. Each one is a config line or an `EXTRA_ENV`
 word, with no rebuild.
 
+## Tiered session stores
+
+With prefix reuse enabled, DS41 accepts the shared `--kv-store` / `KV_STORE` options:
+
+```sh
+./gr8 ds41 up --reuse 1 --kv-store 'ssd:/data/gr8kv,size=200G,persist=on,keep=sessions'
+```
+
+Each rank uses `PATH/r<R>`. `--set-id` identifies the model set; persisted indexes are enabled only with a
+nonempty set id and are invalidated when the executable or state layout changes. At bootstrap ranks retain only
+agreed index records. Version-1 store indexes are rebuilt by the version-2 format.
+
+- `keep=sessions`: store conversations after a continuation hit (device snapshot, tier restore or parked resume).
+- `keep=all`: also store first-turn snapshots.
+- `keep=system`: count independent conversations and save an exact system-prefix boundary after
+  `--kv-system-after` admissions. The boundary is rounded down to 64 tokens; spans shorter than 64 do not qualify.
+  Prefill stops at this boundary before continuing, preserving the scheduler's fabric sequence allocation.
+- `mem:` and `remote:` use the same page/state format. Remote dynamic lending is not covered by these tests.
+- `GR8_DS_CACHE_MIB=0` disables L1 device snapshots, not tier captures. `GR8_DS_PARK` still resumes parked slots
+  without a copy; evicted slots use the tiers. Orderly `quit` drains parked sessions and eligible L1 snapshots before
+  closing peer links, lifting the write limit for persistent session tiers.
+- Steering profiles/scales are separate namespaces, including across restart; shared system entries are stock-only.
+
+Full immutable 64-token pages are reused when a retained session extends. Every new boundary writes rolling
+attention/draft/Engram state plus partial-page rows again: `1.00x` describes full-page writes, not all bytes.
+The descriptor handles planar index codes/scales and FP4 or BF16 compressed attention rows at odd and even positions.
+
+CPU tests exercise real RAM/SSD stores and the cache lifecycle with host device-copy substitutes. CUDA compilation
+does not execute a GPU. Live cold/warm output equality, remote service I/O and performance remain unmeasured.
+
 ## Known issues
 
 [KNOWN-ISSUES.md](../KNOWN-ISSUES.md#deepseek-v41-flash) has the open ones: the `./gr8 ds41` route not yet run from a
-clean machine, no KV store below the device, no JSON-schema masking, recall at 1M tokens, and image requests that hold
+clean machine, live validation of tiered KV stores, no JSON-schema masking, recall at 1M tokens, and image requests that hold
 the other chats.

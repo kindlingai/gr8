@@ -1164,7 +1164,7 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[Str]) -> Result
             return Err("GR8_GLM53F_CACHE is GLM-5.3-Flash only (bin/g6m4_flash)".into());
         }
         // --reuse-prefix: one conversation's caches, or under S2 every retired session's run
-        if !o.kv_tiers.is_empty() && !(s2mode && reuse_prefix) {
+        if !o.kv_tiers.is_empty() && (m.caps & crate::module_info::CAP_KV_STORE == 0 || !(s2mode && reuse_prefix)) {
             return Err("--kv-store needs --serve and --reuse-prefix (it keeps the runs prefix reuse retains)".into());
         }
     }
@@ -1269,12 +1269,9 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[Str]) -> Result
         eprint!("# rank {rank} ds41 idx q trig {} pipe QR {}\n", o.ds_idx_q_trig, o.ds_idx_pipe_qr);
         o.ds_admit_keep_scratch = k.flag(kid::DS41_ADMIT_KEEP_SCRATCH) as i32;
         eprint!("# rank {rank} ds41 idx admit keep scratch {}\n", o.ds_admit_keep_scratch);
-        // prefix reuse is the DS41 snapshot cache; the separate --kv-store tier is not implemented for DS41
+        // Prefix reuse uses device snapshots and optional shared tiered stores.
         if reuse_prefix && !s2mode {
             return Err("DS41: --reuse-prefix needs --serve".into());
-        }
-        if !o.kv_tiers.is_empty() {
-            return Err("DS41: --kv-store is not supported".into());
         }
         if mp > 0 {
             return Err("DS41: --prefill is not supported (there is no DS41 tensor prefill; the prompt runs as decode steps)".into());
@@ -1819,7 +1816,7 @@ mod tests {
             kv_row_bytes: 656,
             kv_page: 64,
             kv_format: [0; 16],
-            caps: 0x120,
+            caps: 0x320,
             dfl_block: 8,
             pack_members: 8,
             dfl_drafts: 7,

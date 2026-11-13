@@ -433,13 +433,14 @@ uint64_t status_section(uint64_t seed, std::vector<std::string>* lines) {
 
 int main(int argc, char** argv) {
     struct Section { const char* name; uint64_t seed; uint64_t (*run)(uint64_t, std::vector<std::string>*); uint64_t want; };
-    // DS41 takes configs the other shapes refuse (mtp 0, park, c8 packs)
+    // DS41 takes configs the other shapes refuse (mtp 0, park, c8 packs).
+    // Capability transcripts re-recorded for control v15 (the optional exact checkpoint).
     const bool ds41 = g6mod::has(G6_CAP_PARK);
     const Section sections[] = {
         {"number", 1, number_section, 0x33740fd68ae4b673ull},
         {"command", 2, command_section, 0x7830189284d224c3ull},
         {"ingress", 3, ingress_section, 0x16ff191341caef03ull},
-        {"capability", 4, capability_section, ds41 ? 0x15bd2028362a5baeull : 0x4aee24eb01c384c0ull},
+        {"capability", 4, capability_section, ds41 ? 0x6e2f7e056f25c4e0ull : 0x0c8bd9e3cf25070cull},
         {"files", 5, files_section, ds41 ? 0x816facccb407eb3cull : 0x41d519b6797d1bdaull},
         {"trace", 6, trace_section, 0x8a798dcc6c22b7adull},
         {"status", 7, status_section, 0x25ab880d0fafd229ull},

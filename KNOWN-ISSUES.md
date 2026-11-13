@@ -67,12 +67,13 @@ No open bugs recorded. [docs/FLASH.md](docs/FLASH.md#not-yet) lists what Flash d
   test harness. So no boot time through `./gr8 ds41 up` is measured yet.
 - Setup has two manual steps GLM does not: the whole 510.6 GB release on every box, and the Engram token map.
 
-### 2. No KV store below the device - Open
+### 2. KV store below the device - Implemented; live validation pending
 
-- `KV_STORE` (`--kv-store`) is refused for `ds41`: the launcher stops ("has no KV store") and so does the engine
-  (`scripts/engine_args.sh`, `engine/runtime/g6m4.cu`). There is no SSD or KV-node tier for DeepSeek.
-- Prefix reuse is the snapshot cache on the device (`GR8_DS_CACHE_MIB`, 4,096 MiB a box by default;
-  [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md#q2-how-long-can-one-chat-be)).
+- DS41 accepts `--kv-store` / `KV_STORE` for SSD, RAM and remote block stores, alongside the device snapshot cache.
+  Full pages are shared across continuation snapshots; each boundary carries its rolling state and partial page.
+- CPU tests cover admission, exact state copies, steering isolation, delta writes and persistent reload. CUDA object
+  compilation is checked without executing a GPU. Cold/warm output equality and performance on the served topology
+  still need a live gate; no speedup is claimed. See [session stores](docs/DEEPSEEK.md#tiered-session-stores).
 
 ### 3. No JSON-schema masking - Open
 

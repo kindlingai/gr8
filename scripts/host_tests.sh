@@ -186,7 +186,7 @@ g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -DG6_MODEL_DS41
 "$T/scheduler_park_test"
 # GR8_DS_PARK: evicting a parked slot never evicts the grant's own cache snapshot (Ds41PrefixCache::capture keep), BF16 and FP4;
 # with GR8_DS_CACHE_REPLACE, PARK=1 frees and keeps the snapshots PARK=0 does (Ds41SnapSlots park, evict_parked, resume)
-g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/ds41_park_evict_test.cpp" -o "$T/ds41_park_evict_test" "${KNOBS[@]}"
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/ds41_park_evict_test.cpp" -o "$T/ds41_park_evict_test" "${KVLIB[@]}"
 "$T/ds41_park_evict_test"
 # and with the sibling rule off (GR8_DS_CACHE_REPLACE=0, both dedup settings): PARK=1 frees and keeps what PARK=0 does
 GR8_DS_CACHE_REPLACE=0 "$T/ds41_park_evict_test"

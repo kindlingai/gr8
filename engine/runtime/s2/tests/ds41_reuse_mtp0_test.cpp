@@ -46,7 +46,7 @@ static g6rt::ServeReq serve_req(uint32_t seed, int plen, int n_gen, const std::v
 
 // 1. A Driver at MTP 0 with a Dispatch that tracks rows, as Service wires them (bind -> Dispatch::begin, run ->
 // Dispatch::run, prefill -> Dispatch::prefill, finished -> the reuse state Service::retire_run retains).
-static void serve_mtp0(bool decode_prompt)
+static std::map<uint64_t, std::vector<int>> serve_mtp0(bool decode_prompt, int reuse_mode = 0)
 {
     const Config c = config(0);
     Sessions ss(c, "", false, 4);
@@ -66,6 +66,8 @@ static void serve_mtp0(bool decode_prompt)
     const g6rt::ServeReq* cur = nullptr;
     std::map<uint64_t, std::vector<int>> out;
     std::map<uint64_t, g6rt::PrefixReuse> kept;
+    std::map<uint64_t, int> first_main;
+    std::map<uint64_t, std::vector<int>> main_ends;
     long forced_steps = 0;   // main steps of several rows inside a round
     std::unique_ptr<Driver> d;
     DriverHooks h;
@@ -73,6 +75,11 @@ static void serve_mtp0(bool decode_prompt)
     h.retire = [&](const Slot& s) { ss.retire(s); dp.release(s.key.slot); };
     h.prefill = [&](const Slot& s, const Payload& p, uint32_t first, uint32_t rows) { dp.prefill(s, p, first, rows); };
     h.run = [&](const s2::Step& st) {
+        if (st.kind == s2::Step::MAIN) {
+            const auto id = d->state().slots()[st.r.front().sess].req.id;
+            if (!first_main.count(id)) first_main[id] = st.r.front().pos;
+            main_ends[id].push_back(st.r.back().pos + 1);
+        }
         if (st.kind == s2::Step::MAIN && st.round >= 0 && st.M() > 1) ++forced_steps;
         return dp.run(st);
     };
@@ -101,19 +108,26 @@ static void serve_mtp0(bool decode_prompt)
         cur = &r;
         Commit cm;
         cm.epoch = c.epoch; cm.event = d->state().next_event(); cm.boundary = d->state().boundary(); cm.before_hash = d->state().digest();
-        const Request rq = Sessions::request(id, r);
+        Request rq = Sessions::request(id, r);
+        const uint32_t reuse = reuse_mode == 2 ? uint32_t(r.prompt.size() - 1) : reuse_mode == 1 ? 2u : 0u;
+        // chunk=4 does not divide the distance from reuse=2 to this checkpoint.
+        if (reuse_mode == 1) rq.ckpt_at = 4;
         Run run;
         run.first_page = page; run.pages = reserve_pages(c, rq); run.table_version = 1; run.list_hash = mix(uint32_t(id), page, 3);
-        cm.admit = Grant{d->state().next_key(), rq, run, 0};
+        cm.admit = Grant{d->state().next_key(), rq, run, reuse};
         Payload p;
         p.prompt = r.prompt; p.chunk = 4; p.decode_prompt = decode_prompt; p.ins = r.ins;
         d->apply(cm, &p);
         for (long g = 0; d->state().resident(); ++g) {
             const Quantum q = d->step();
             CHECK(q.kind != Kind::Idle);
-            if (q.kind == Kind::Idle || g > 10000) { CHECK(!"no progress"); return; }
+            if (decode_prompt) CHECK(q.kind != Kind::Prefill);
+            if (q.kind == Kind::Idle || g > 10000) { CHECK(!"no progress"); return {}; }
         }
         CHECK(kept.count(id));
+        CHECK(first_main[id] == int(decode_prompt ? reuse : r.prompt.size() - 1));
+        if (decode_prompt && rq.ckpt_at > reuse)
+            CHECK(std::find(main_ends[id].begin(), main_ends[id].end(), int(rq.ckpt_at)) != main_ends[id].end());
         const auto& o = out[id];
         const auto& st = kept[id];
         const int n = int(r.prompt.size()), t = int(o.size());
@@ -126,9 +140,10 @@ static void serve_mtp0(bool decode_prompt)
         CHECK(st.valid == n + t - 1 && int(st.history.size()) == n + t);
         page += run.pages;
     }
-    CHECK(forced_steps == 4);   // one each for requests 1 and 2, two for request 3
+    CHECK(forced_steps == (reuse_mode == 1 ? 7 : 4));   // checkpoint alignment reduces chunks from 4 to 2
     std::printf("serve mtp0 (%s prompt): %zu requests, %ld forced steps of several rows\n",
                 decode_prompt ? "decode" : "prefilled", reqs.size(), forced_steps);
+    return out;
 }
 
 // 2. Hand-built steps through a Dispatch on one bound slot
@@ -180,8 +195,10 @@ static void steps(bool drafts)
 
 int main()
 {
-    serve_mtp0(false);
-    serve_mtp0(true);
+    const auto reference = serve_mtp0(false);
+    CHECK(serve_mtp0(true) == reference);
+    CHECK(serve_mtp0(true, 1) == reference);
+    CHECK(serve_mtp0(true, 2) == reference);
     steps(true);
     steps(false);
     if (fails) { std::fprintf(stderr, "ds41_reuse_mtp0_test: %d FAILED\n", fails); return 1; }

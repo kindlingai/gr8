@@ -51,6 +51,7 @@ pub struct Checked {
     pub n_gen: i32,
     pub steering: Identity,
     pub ok: bool,
+    pub ckpt_at: u32,
 }
 
 /// g6svc_pool_call: one plain pool call of the service (the head's control thread, or a worker's bind), for a test's
@@ -187,7 +188,7 @@ pub fn cache_namespace(s: &Identity) -> Namespace {
 
 /// Sessions::request: what the scheduler and the FIFO keep of a request.
 pub fn request(id: u64, prompt_tokens: usize, n_gen: i32, steering: Identity) -> Request {
-    Request { id, prompt_tokens: prompt_tokens as u32, max_tokens: n_gen as u32, steering, r_rows: 0 }
+    Request { id, prompt_tokens: prompt_tokens as u32, max_tokens: n_gen as u32, steering, r_rows: 0, ckpt_at: 0 }
 }
 
 // an event to announce: a shim command, or a Resize the head makes itself
@@ -601,6 +602,7 @@ impl Control {
             n_gen: 0,
             steering: wire::identity_off(),
             ok: false,
+            ckpt_at: 0,
         };
         // SAFETY: the host's context outlives the Control
         hook(unsafe { f(self.host.ctx, id, bytes.as_ptr(), bytes.len(), &mut ck) })?;
@@ -752,7 +754,8 @@ impl Control {
     fn intake(&self, inn: &mut Inner, command: &Command) -> R<()> {
         let bytes = self.ingress().request(command)?;
         let Some(ck) = self.check(command.request, &bytes)? else { return Ok(()) };
-        let queued = request(command.request, ck.n, ck.n_gen, ck.steering);
+        let mut queued = request(command.request, ck.n, ck.n_gen, ck.steering);
+        queued.ckpt_at = ck.ckpt_at;
         if let Some(t) = self.trace() {
             let args = format!(
                 "{},{},{},{}",

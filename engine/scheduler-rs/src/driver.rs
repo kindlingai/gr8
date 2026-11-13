@@ -200,6 +200,7 @@ pub struct Driver {
     initialized: [Cell<bool>; QMAX],
     prompt_len: [Cell<usize>; QMAX],
     decode_prompt: [Cell<bool>; QMAX],
+    reused: [Cell<u32>; QMAX],
     served: RefCell<Vec<u64>>, // GR8_CP_STEP_ROWS: ids served in the current cycle
     cp_capped: Cell<bool>,
     cp_rounds: Cell<u64>,
@@ -288,6 +289,7 @@ impl Driver {
             initialized: Default::default(),
             prompt_len: Default::default(),
             decode_prompt: Default::default(),
+            reused: Default::default(),
             served: RefCell::new(Vec::with_capacity(QMAX)),
             cp_capped: Cell::new(false),
             cp_rounds: Cell::new(0),
@@ -407,6 +409,7 @@ impl Driver {
             self.payload(old.key.slot, false)?;
             self.prompt_len[i].set(0);
             self.decode_prompt[i].set(false);
+            self.reused[i].set(0);
             self.emitted[i].set(0);
         }
         if e.has_shrink {
@@ -429,10 +432,11 @@ impl Driver {
             self.payload(g.key.slot, true)?;
             self.prompt_len[i].set(p.prompt_len);
             self.decode_prompt[i].set(p.decode_prompt);
+            self.reused[i].set(g.reuse);
             // SAFETY: as retire
             ok(unsafe { self.h.bind.ok_or_else(missing)?(self.h.ctx, g) })?;
             if p.decode_prompt {
-                s.with(|_, sl, st| sch::skip_prefill(sl, st, &g.key)).map_err(sch_err)?;
+                s.with(|_, sl, st| sch::skip_prefill_from(sl, st, &g.key, g.reuse)).map_err(sch_err)?;
             }
         }
         if resize {
@@ -593,7 +597,7 @@ impl Driver {
                     // SAFETY: as prefill
                     ok(unsafe { self.h.dfl_ok.ok_or_else(missing)?(self.h.ctx, &k, &mut dfl) })?;
                 }
-                let first = if dp { 0 } else { q.first as i32 };
+                let first = if dp { self.reused[i].get() as i32 } else { q.first as i32 };
                 let n_gen = s.slot(i).req.max_tokens as i32;
                 // SAFETY: the facade's trampoline
                 ok(unsafe { self.p.admit.ok_or_else(missing)?(self.p.ctx, k.slot, first, n_gen, dfl) })?;

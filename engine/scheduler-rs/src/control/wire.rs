@@ -9,7 +9,7 @@ use crate::scheduler::{self as sch, Grant, Identity, Key, Run, Shrink, PAGE};
 
 /// The link's version: a frame of another version is refused, and the bootstrap agreement carries it, so ranks of
 /// different builds refuse each other there (scheduler.h CONTROL_VERSION).
-pub const CONTROL_VERSION: u64 = 14;
+pub const CONTROL_VERSION: u64 = 15;
 /// The first word of every frame.
 pub const MAGIC: u64 = 0x473653324530 + CONTROL_VERSION;
 
@@ -90,7 +90,7 @@ pub fn identity_off() -> Identity {
 fn grant_zero() -> Grant {
     Grant {
         key: Key::default(),
-        req: sch::Request { id: 0, prompt_tokens: 0, max_tokens: 0, steering: identity_off(), r_rows: 0 },
+        req: sch::Request { id: 0, prompt_tokens: 0, max_tokens: 0, steering: identity_off(), r_rows: 0, ckpt_at: 0 },
         run: Run::default(),
         reuse: 0,
         restored: 0,
@@ -338,6 +338,7 @@ pub fn encode_commit(n: &Notice, x: &Commit) -> R<Vec<u8>> {
         e.u64(u64::from(g.restored));
         e.u64(u64::from(g.counted));
         e.u64(u64::from(g.req.r_rows));
+        e.u64(u64::from(g.req.ckpt_at));
     }
     e.u64(u64::from(x.hold));
     e.u64(u64::from(x.has_resize));
@@ -441,6 +442,8 @@ pub fn decode_commit(b: &[u8]) -> R<(Notice, Commit)> {
         g.restored = d.u32()?;
         g.counted = d.u32()?;
         g.req.r_rows = d.u32()?;
+        g.req.ckpt_at = d.u32()?;
+        require(g.req.ckpt_at == 0 || g.req.ckpt_at < g.req.prompt_tokens, "invalid checkpoint boundary")?;
         require(g.restored == 0 || g.reuse != 0, "invalid restored grant")?;
         require(g.req.r_rows.is_multiple_of(PAGE), "invalid grant R")?;
         c.has_admit = true;

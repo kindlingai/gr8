@@ -849,7 +849,7 @@ tiers:                       # tried in order
             ('runs: []\ntiers: []\n', 'the file.runs: not built yet'),
             ('tier: []\n', 'the file.tier: want caches, tiers'),
             (f'tiers:\n- {{keep: all}}\n', 'tiers[0]: no store'),
-            ('tiers:\n- store: {nvme: {path: /x}}\n', 'tiers[0].store: want one of ssd: or remote:'),
+            ('tiers:\n- store: {nvme: {path: /x}}\n', 'tiers[0].store: want one of ssd:, remote: or mem:'),
             ('tiers:\n- store: {ssd: {size_per_rank: 4G}}\n', 'tiers[0].store.ssd: no path'),
             ('tiers:\n- store: {ssd: {path: /x, size: 4G}}\n', 'tiers[0].store.ssd.size: want path, size_per_rank, persist'),
             ('tiers:\n- store: {ssd: {path: /x, size_per_rank: 4G, persist: on}}\n', None),

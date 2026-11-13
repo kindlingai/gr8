@@ -40,13 +40,13 @@ static bool boot(uint16_t port, const std::string& dir, unsigned version, std::s
 }
 
 int main() {
-    CHECK(CONTROL_VERSION == 14);
+    CHECK(CONTROL_VERSION == 15);
     BootstrapConfig c; c.runtime_signature = "x";
-    CHECK(c.agreement().find(" ctl 14\n") != std::string::npos);
+    CHECK(c.agreement().find(" ctl 15\n") != std::string::npos);
     // a smaller R per grant joins the agreement only when set
     CHECK(c.agreement().find(" r2 ") == std::string::npos);
     BootstrapConfig r2 = c; r2.scheduler.window_pages = 40; r2.scheduler.r2_rows = 16384;
-    CHECK(r2.agreement().find(" r2 16384 ctl 14\n") != std::string::npos);
+    CHECK(r2.agreement().find(" r2 16384 ctl 15\n") != std::string::npos);
     CHECK(agreement_difference(1, "a b\nenv G6_X=1", "a b\nenv G6_X=1").empty());
     CHECK(agreement_difference(1, "a b\nenv G6_X=1", "a b\nenv G6_X=2") == "rank 1 has 'G6_X=2', the head has 'G6_X=1'");
     CHECK(agreement_difference(3, "a b", "a b c") == "rank 3 has 'c', the head has ''");
@@ -57,7 +57,7 @@ int main() {
     CHECK(boot(port, dir + "/same", CONTROL_VERSION, why));
     const bool mixed = boot(uint16_t(port + 1), dir + "/mixed", 6, why);
     CHECK(!mixed);
-    CHECK(why.find("bootstrap config mismatch: rank 2 has '6', the head has '14'") != std::string::npos);
+    CHECK(why.find("bootstrap config mismatch: rank 2 has '6', the head has '15'") != std::string::npos);
     std::printf("control_version_test: mixed boot refused: %s\n", why.c_str());
 
     // a frame with the previous numeric magic is refused before any field is read
@@ -65,6 +65,23 @@ int main() {
     b[7] = uint8_t(b[7] - 1);
     bool threw = false;
     try { (void)decode_notice(b); } catch (const std::exception& e) { threw = std::strstr(e.what(), "control version mismatch") != nullptr; }
+    CHECK(threw);
+
+    // The optional exact checkpoint survives a commit frame; zero remains a no-op.
+    EventCommit e;
+    e.notice = Notice{9, 1, 5, 11, 0, EventKind::Admit};
+    e.commit.epoch = 9; e.commit.event = 1; e.commit.boundary = 5;
+    Grant g; g.key = Key{9, 0, 1}; g.req = Request{11, 256, 8};
+    g.run = Run{0, 8, 1, 5};
+    for (uint32_t at : {0u, 128u}) {
+        g.req.ckpt_at = at; e.commit.admit = g;
+        const auto back = decode_commit(encode(e));
+        CHECK(back.commit.admit && back.commit.admit->req.ckpt_at == at);
+    }
+    g.req.ckpt_at = 256; e.commit.admit = g;
+    threw = false;
+    try { (void)decode_commit(encode(e)); }
+    catch (const std::exception& ex) { threw = std::strstr(ex.what(), "invalid checkpoint boundary") != nullptr; }
     CHECK(threw);
 
     if (!fails) std::printf("control_version_test: PASS\n");

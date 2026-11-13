@@ -383,8 +383,9 @@ std::vector<std::vector<uint8_t>> read_frames(const char* path) {
 int main(int argc, char** argv) {
     struct Section { const char* name; uint64_t seed; uint64_t (*run)(uint64_t, std::vector<std::string>*); uint64_t want; };
     const Section sections[] = {
-        {"frames", 1, frames_section, 0xd01c048aedbe0252ull},
-        {"pieces", 2, pieces_section, 0x5c9275c852e19f10ull},
+        // Control v15 adds Request::ckpt_at; re-recorded frame and piece transcripts.
+        {"frames", 1, frames_section, 0x8635e01ab1611e51ull},
+        {"pieces", 2, pieces_section, 0xb60cde07eb13e1f2ull},
         {"match", 3, match_section, 0x060f21b6d71b621eull},
         {"gate", 4, gate_section, 0xf485e0fbea73dd2dull},
         {"agreement", 5, agreement_section, 0x2475fad827f09bfbull},

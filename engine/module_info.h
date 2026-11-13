@@ -24,6 +24,7 @@ enum G6ModuleCap
     G6_CAP_FLASH_COST = 1u << 6,     // the Flash solo cost table (S2Cost, GR8_GLM53F_S2_COST)
     G6_CAP_KDA = 1u << 7,            // linear-attention (KDA) state per session beside the paged KV
     G6_CAP_GRAMMAR = 1u << 8,        // the model's requests may carry grammars (the engine also needs XGrammar: G6_GRAMMAR)
+    G6_CAP_KV_STORE = 1u << 9,       // shared page + boundary-state tiered stores
 };
 
 struct G6ModuleInfo
@@ -109,9 +110,9 @@ constexpr G6ModuleInfo make()
     if (m.model == G6_MODEL_ID_DS41) { m.ds_markov_maxs = 8; m.ds_block = 5; }
     switch (m.model)
     {
-    case G6_MODEL_ID_DS41: m.caps = G6_CAP_MTP0 | G6_CAP_PACK | G6_CAP_PARK | G6_CAP_PROMPT_DECODE | G6_CAP_DSPARK; break;
+    case G6_MODEL_ID_DS41: m.caps = G6_CAP_MTP0 | G6_CAP_PACK | G6_CAP_PARK | G6_CAP_PROMPT_DECODE | G6_CAP_DSPARK | G6_CAP_KV_STORE; break;
     case G6_MODEL_ID_GLM53F: m.caps = G6_CAP_DFLASH2 | G6_CAP_FLASH_COST | G6_CAP_KDA | G6_CAP_GRAMMAR; break;
-    default: m.caps = G6_CAP_DFLASH2 | G6_CAP_GRAMMAR; break;
+    default: m.caps = G6_CAP_DFLASH2 | G6_CAP_GRAMMAR | G6_CAP_KV_STORE; break;
     }
     return m;
 }

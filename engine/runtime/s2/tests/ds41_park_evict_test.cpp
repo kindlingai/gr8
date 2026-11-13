@@ -48,6 +48,7 @@ static Ds41IdxModel* find(Model& m, bool) { return m.idx; }
 }
 }
 namespace g6s2 { struct Ds41Dspark { g6rt::Model draft; }; }
+#include "kv_state_host_tiers.h"
 #define GR8_DS41_PREFIX_CACHE_STANDALONE 1
 #include "s2/ds41_prefix_cache.cuh"
 #include "s2/driver.h"
@@ -507,7 +508,159 @@ static void image_ring() {
     printf("ds41_park_evict_test image ring: %d prompt-end and request-end restores equal the live ring (image 0..3 tokens before)\n", cases);
 }
 
+// End-to-end cache policy + real tier allocator, with only the device copies substituted.
+static void tiered_store(bool fp4, int steering, bool disk) {
+    using namespace g6s2;
+    Fixture f(fp4);
+    g6rt::Ds41IdxModel idx;
+    std::array<std::vector<uint8_t>, 4> ica, ca;
+    std::vector<uint16_t> shadow(3 * (2048 + 8) * 512, 23);
+    std::vector<float> kvs(3 * 1024, 1.25f), scs(3 * 1024, 2.5f);
+    f.m.layers[0].C.kvs = kvs.data(); f.m.layers[0].C.scs = scs.data();
+    for (int k = 0; k < 4; ++k) {
+        idx.rows_kv[k] = k < 3 ? 1025 : 2049; // deliberate 4-byte, not 16-byte slot alignment
+        ica[k].resize(3 * idx.rows_kv[k] * 68);
+        ca[k].resize(3 * idx.rows_kv[k] * 288);
+        for (size_t i = 0; i < ica[k].size(); ++i) ica[k][i] = uint8_t(i * 13 + k);
+        for (size_t i = 0; i < ca[k].size(); ++i) ca[k][i] = uint8_t(i * 7 + k);
+        idx.ica[k] = ica[k].data(); idx.ca[k] = ca[k].data();
+    }
+    idx.shadow = shadow.data(); f.m.idx = &idx;
+    Ds41Dspark dsp;
+    dsp.draft.layers.resize(3);
+    std::array<std::vector<uint16_t>, 3> draft;
+    for (int k = 0; k < 3; ++k) {
+        draft[k].resize(3 * 256 * 512, uint16_t(31 + k));
+        dsp.draft.layers[k].C.ring = draft[k].data();
+    }
+    const Ds41ImageRows images{{250, 2}};
+    char dir[] = "/tmp/kv-state-cache-XXXXXX";
+    CHECK(mkdtemp(dir) != nullptr);
+    const std::string spec = disk ? std::string("ssd:") + dir + ",size=16M,persist=on" : "mem:,size=16M";
+    std::vector<int> tokens(900);
+    for (int i = 0; i < int(tokens.size()); ++i) tokens[i] = 10 + i;
+    const auto space = ns(steering);
+    std::string summary;
+    uint64_t total = 0;
+    {
+        Ds41PrefixCache ck(f.m, &dsp, 0);
+        ck.open_stores({spec}, false, "all", 2, 1.0, "test-set", 1, 3, 32);
+        const auto desc = ck.state_desc(3, 32);
+        const uint64_t state = desc.state_blocks();
+        std::fill_n(f.hist, 64, 999);
+        ck.capture(0, 201, tokens, space, 0, Ds41Snap::PromptEnd);
+        CHECK(std::all_of(f.hist, f.hist + 64, [](int v) { return v == 999; }));
+        CHECK(ck.used_bytes() == 0 && ck.tier_stats()[1].spilled_pages == 3 + state);
+        ck.capture(0, 253, tokens, space, 0, Ds41Snap::RequestEnd, 0, false, 0, images);
+        CHECK(ck.tier_stats()[1].spilled_pages == 3 + 2 * state);
+        const auto hit = ck.match(tokens, 899, space);
+        CHECK(hit.hit && hit.position == 253 && Ds41PrefixCache::stored_hit(hit.generation));
+        CHECK(!ck.match(tokens, 899, ns(steering + 1)).hit);
+        std::fill_n(f.ring.data() + 256 * 512, 256 * 512, 0);
+        CHECK(ck.restore(hit.generation, 1, 0, hit.position) == Ds41Snap::RequestEnd);
+        CHECK(std::equal(f.ring.begin(), f.ring.begin() + 256 * 512, f.ring.begin() + 256 * 512));
+        int want[64]; ds41_engram_ring(want, tokens, 253, images);
+        CHECK(std::equal(want, want + 64, f.hist + 64));
+        for (const auto& pl : desc.page_planes) {
+            const size_t n = size_t(253 / pl.token_ratio) * pl.row_bytes;
+            CHECK(std::equal(pl.base, pl.base + n, pl.base + pl.slot_stride));
+        }
+        for (const auto& tail : desc.tail_extents)
+            CHECK(std::equal(tail.base, tail.base + tail.bytes, tail.base + tail.slot_stride));
+        // The earlier prompt boundary remains available; the new sibling must not rewrite its base pages.
+        ck.capture(1, 389, tokens, space, 0, Ds41Snap::PromptEnd);
+        CHECK(ck.tier_stats()[1].spilled_pages == 6 + 3 * state);
+        ck.capture(1, 450, tokens, space, 0, Ds41Snap::RequestEnd, 0, false, 0, images);
+        total = 7 + 4 * state;
+        CHECK(ck.tier_stats()[1].spilled_pages == total);
+        std::vector<int> stripped = tokens; stripped[201] = -123;
+        CHECK(ck.match(stripped, 899, space).position == 201);
+        summary = ck.stored_summary();
+        if (disk) CHECK(!summary.empty());
+        ck.flush_store(0);
+    }
+    if (disk) {
+        Ds41PrefixCache ck(f.m, &dsp, 0);
+        ck.open_stores({spec}, false, "all", 2, 1.0, "test-set", 1, 3, 32);
+        auto lines = [](const std::string& text) { std::vector<std::string> out; std::istringstream in(text);
+            for (std::string line; std::getline(in, line);) out.push_back(line); std::sort(out.begin(), out.end()); return out; };
+        CHECK(lines(ck.stored_summary()) == lines(summary));
+        ck.keep_agreed(summary);
+        const auto hit = ck.match(tokens, 899, space);
+        CHECK(hit.hit && hit.position == 450);
+        CHECK(ck.restore(hit.generation, 2, 0, hit.position) == Ds41Snap::RequestEnd);
+        ck.capture(2, 520, tokens, space, 0, Ds41Snap::PromptEnd);
+        // After restart old full pages still survive and only one new page is written.
+        CHECK(ck.tier_stats()[1].spilled_pages == 1 + ck.state_desc(3, 32).state_blocks());
+        ck.keep_agreed("");
+        CHECK(!ck.match(tokens, 899, space).hit);
+    }
+    std::filesystem::remove_all(dir);
+    printf("ds41 tier store %s ns%d %s: exact state, delta pages, reload PASS\n", fp4 ? "FP4" : "BF16", steering, disk ? "ssd" : "mem");
+}
+static void store_policies() {
+    using namespace g6s2;
+    Fixture f(true);
+    g6rt::ServeReq r; r.prompt.resize(600); r.sys = 128;
+    for (int i = 0; i < 600; ++i) r.prompt[i] = i;
+    {
+        Ds41PrefixCache ck(f.m, nullptr, 1);
+        ck.open_stores({"mem:,size=16M"}, false, "sessions", 2, 1, "policy", 1, 3, 32);
+        CHECK(ck.system_boundary(r) == 0);
+        ck.admit_store(r, false);
+        const auto gen = ck.capture(0, 201, r.prompt, ns(0), 0, Ds41Snap::PromptEnd);
+        CHECK(gen && ck.tier_stats()[1].entries == 0);
+        ck.restore(gen, 1, 0);
+        ck.admit_store(r, true);
+        ck.capture(1, 389, r.prompt, ns(0), 0, Ds41Snap::PromptEnd);
+        CHECK(ck.tier_stats()[1].entries == 1);
+        ck.resume_store_slot(1);
+        ck.capture(1, 450, r.prompt, ns(0), 0, Ds41Snap::RequestEnd);
+        CHECK(ck.tier_stats()[1].entries >= 1);
+    }
+    {
+        Ds41PrefixCache ck(f.m, nullptr, 0);
+        ck.open_stores({"mem:,size=16M"}, false, "system", 2, 1, "policy", 1, 3, 32);
+        CHECK(ck.system_boundary(r) == 128);
+        ck.store_span(0, r.sys);
+        ck.admit_store(r, false);
+        ck.capture_system(0, 128, r.prompt, 0, {});
+        CHECK(!ck.match(r.prompt, 599, ns(0)).hit);
+        ck.reset_store_slot(0);
+        ck.store_span(0, r.sys);
+        r.prompt[200] = -1;
+        ck.admit_store(r, false);
+        ck.capture_system(0, 128, r.prompt, 0, {});
+        auto hit = ck.match(r.prompt, 599, ns(0));
+        CHECK(hit.hit && hit.position == 128);
+        ck.restore(hit.generation, 1, 0, hit.position);
+        r.steering.enabled = true;
+        CHECK(ck.system_boundary(r) == 0);
+    }
+    printf("ds41 tier store: sessions continuation and exact system admission PASS\n");
+}
+
+static void refused_store_extension() {
+    using namespace g6s2;
+    Fixture f(true);
+    Ds41PrefixCache ck(f.m, nullptr, 4);
+    ck.open_stores({"mem:,size=0.75M"}, false, "all", 2, 1, "small", 1, 3, 32);
+    std::vector<int> tokens(2048); for (int i = 0; i < 2048; ++i) tokens[i] = i;
+    const auto first = ck.capture(0, 201, tokens, ns(0), 0, Ds41Snap::PromptEnd);
+    CHECK(first && ck.find(first)->tier_pages == 3);
+    const auto id = ck.find(first)->tier_id;
+    const auto too_large = ck.capture(0, 1980, tokens, ns(0), 0, Ds41Snap::PromptEnd);
+    CHECK(too_large && ck.find(too_large)->tier_id == id && ck.find(too_large)->tier_pages == 3);
+    CHECK(ck.tier_stats()[1].full > 0);
+    const auto next = ck.capture(0, 389, tokens, ns(0), 0, Ds41Snap::PromptEnd);
+    CHECK(next && ck.find(next)->tier_pages == 6 && ck.find(next)->tier_id != id);
+    printf("ds41 tier store: refused extension keeps actual stored page count PASS\n");
+}
+
 int main() {
+    for (bool fp4 : {false, true}) for (int steering : {0, 1}) for (bool disk : {false, true}) tiered_store(fp4, steering, disk);
+    store_policies();
+    refused_store_extension();
     for (bool fp4 : {false, true}) {
         tight_budget(fp4, false);
         tight_budget(fp4, true);

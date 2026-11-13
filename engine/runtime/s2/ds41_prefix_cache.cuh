@@ -7,7 +7,7 @@
 //     ca[3] (p x 288 B), shadow (p x 512 bf16; none with GR8_DS_COMP_FP4)
 //   - Engram token ring (ehist): 64 int32 entries reconstructed from tokens[0..p)
 //   - DSpark draft model (3 layers, when enabled): C.ring (ring_rows x 512 bf16)
-// No device kernels are added or modified here; all transfers use cudaMemcpyAsync on the session stream.
+// Device snapshots use cudaMemcpyAsync; tiered snapshots use the declarative state mover on the session stream.
 #pragma once
 #if G6_MODEL_DS41
 #include "service.h"
@@ -17,6 +17,14 @@
 #include "../../attn/kvfmt.h"
 #include "../../engram/engram_ring.h"
 #include "ds41_engram_ring.h"
+#include "kv_state_desc.h"
+#if defined(__CUDACC__) || !defined(GR8_DS41_PREFIX_CACHE_STANDALONE)
+#include "kv_state_mover.cuh"
+#endif
+#include <filesystem>
+#include <memory>
+#include <cmath>
+#include <unistd.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -38,6 +46,10 @@ struct Ds41PrefixEntry {
     size_t bytes = 0;
     std::vector<int> tokens;
     g6rt::CacheNamespace ns{};
+    uint32_t continuations = 0, tier_pages = 0;
+    uint64_t tier_id = 0;
+    int pf_end = 0;
+    int64_t system_span = -1;
     void* dev_buf = nullptr;
     int ehist[ds41::engram::kRing] = {};
 };
@@ -77,6 +89,9 @@ public:
     Ds41PrefixCache& operator=(const Ds41PrefixCache&) = delete;
 
     ~Ds41PrefixCache() {
+        tiers_.reset();
+        if (d_ehist_snap_) cudaFree(d_ehist_snap_);
+        if (live() == this) live() = nullptr;
         for (auto& e : entries_) {
             if (e.dev_buf) cudaFree(e.dev_buf);
         }
@@ -99,6 +114,7 @@ public:
             h ^= (e.generation + (uint64_t(e.position) << 32)) * 0xBF58476D1CE4E5B9ull;
             h = (h << 27) | (h >> 37);
         }
+        if (stash_) h ^= stash_->digest() * 0x94D049BB133111EBull;
         return h;
     }
 
@@ -143,6 +159,18 @@ public:
     // Longest stored prefix whose token IDs exactly equal the start of `prompt` (up to `limit` = prompt.size() - 1).
     // Any token mismatch inside [0, e.position) means lcp < e.position, so `e` is not matched.
     Ds41PrefixHit match(const std::vector<int>& prompt, int limit, const g6rt::CacheNamespace& ns) const {
+        auto best = match_l1(prompt, limit, ns);
+        if (stash_) {
+            const auto h = stash_->match(prompt, limit, ns);
+            if (h.stored && h.skip > int(best.position)) {
+                require(h.age <= STORE_ID && h.tier < 128, "DS41 store handle overflow");
+                best = {true, STORE_HIT | (uint64_t(h.tier) << 56) | h.age, uint32_t(h.skip), h.lcp, "stored"};
+            }
+        }
+        return best;
+    }
+
+    Ds41PrefixHit match_l1(const std::vector<int>& prompt, int limit, const g6rt::CacheNamespace& ns) const {
         if (entries_.empty()) return Ds41PrefixHit{false, 0, 0, 0, "first"};
         if (limit <= 0) return Ds41PrefixHit{false, 0, 0, 0, "short"};
         int best_idx = -1;
@@ -182,11 +210,19 @@ public:
                      const Ds41ImageRows& images = {}) {
         const uint64_t replace_gen = replace && prompt_gen != keep ? prompt_gen : 0;
         if (pos == 0 || tokens.size() < size_t(pos)) return 0;
+        capture_store(slot, pos, tokens, ns, st, kind, replace, keep, images);
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].position == pos && entries_[i].ns == ns &&
                 std::equal(entries_[i].tokens.begin(), entries_[i].tokens.end(), tokens.begin())) {
                 const long gone = drop_replaced(replace_gen, pos, tokens, ns);   // index erased, or -1
                 if (gone >= 0 && gone < long(i)) --i;
+                if (stash_) {
+                    const auto& state = store_sessions_.at(slot);
+                    entries_[i].continuations = state.hits;
+                    entries_[i].tier_id = state.id;
+                    entries_[i].tier_pages = state.pages;
+                    entries_[i].pf_end = state.pf_end; entries_[i].system_span = state.sys;
+                }
                 Ds41PrefixEntry hit = std::move(entries_[i]);
                 entries_.erase(entries_.begin() + long(i));
                 const uint64_t gen = hit.generation;
@@ -229,6 +265,11 @@ public:
 
         Ds41PrefixEntry e;
         e.generation = next_gen_++;
+        if (stash_) {
+            const auto& state = store_sessions_.at(slot);
+            e.continuations = state.hits; e.tier_id = state.id; e.tier_pages = state.pages;
+            e.pf_end = state.pf_end; e.system_span = state.sys;
+        }
         e.kind = kind;
         if (!replace && replace_on())
             if (Ds41PrefixEntry* pe = prompt_entry(prompt_gen, pos, tokens, ns); pe && !pe->sibling) {
@@ -253,7 +294,26 @@ public:
     // Returns the restored entry's kind. GR8_DS_CACHE_REPLACE: the follow-up shows which of a request's two entries its chat
     // continues from, so the other one (its sibling) is freed now, if it is still stored. A freed request-end sibling is lost
     // to a later prompt that keeps that reply after all (a tools turn after a thinking turn without them): a re-prefill.
-    Ds41Snap restore(uint64_t gen, int slot, cudaStream_t st) {
+    Ds41Snap restore(uint64_t gen, int slot, cudaStream_t st, uint32_t pos = 0) {
+        if (stored_hit(gen)) {
+            require(stash_ && pos, "DS41 tier restore needs a position");
+            const auto meta = stash_->info(store_id(gen));
+            auto r = stash_->restore(uint32_t((gen >> 56) & 127), store_id(gen),
+                                     state_pages(slot, pos), pack_state_handle(slot, pos));
+            require(r.valid == int(pos), "DS41 tier position differs from granted skip");
+            drain_store(st);
+            if (d_ehist_snap_) {
+                G6RT_CK(cudaMemcpyAsync(main_.ehist + size_t(slot) * g6rt::ENG_RING,
+                    d_ehist_snap_ + size_t(slot) * g6rt::ENG_RING, g6rt::ENG_RING * sizeof(int32_t),
+                    cudaMemcpyDeviceToDevice, st));
+                G6RT_CK(cudaStreamSynchronize(st));
+            }
+            store_sessions_.at(slot) = {r.hits + 1, uint32_t(r.full_pages), pos, store_id(gen), 0, meta.pf_end, -1};
+            ++hits_;
+            last = {(r.full_pages + tiers_->desc().state_blocks()) * tiers_->desc().slot_bytes(), 0};
+            restored_bytes_ += last.bytes;
+            return pos == uint32_t(meta.pf_end) ? Ds41Snap::PromptEnd : Ds41Snap::RequestEnd;
+        }
         int idx = -1;
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].generation == gen) { idx = int(i); break; }
@@ -261,6 +321,8 @@ public:
         require(idx >= 0, "DS41 prefix cache restore: entry not found");
         const auto t0 = std::chrono::steady_clock::now();
         Ds41PrefixEntry& e = entries_[size_t(idx)];
+        if (stash_) store_sessions_.at(slot) =
+            {e.continuations + 1, e.tier_pages, e.position, e.tier_id, 0, e.pf_end, e.system_span};
         copy_state(slot, e.position, e.dev_buf, false, st);
         if (main_.ehist) {
             G6RT_CK(cudaMemcpyAsync(main_.ehist + size_t(slot) * g6rt::ENG_RING, e.ehist, sizeof(e.ehist),
@@ -372,7 +434,236 @@ public:
         return t;
     }
 
+    struct StoreSession {
+        uint32_t hits = 0, pages = 0, earned = 0;
+        uint64_t id = 0, prompt_id = 0;
+        int pf_end = 0;
+        int64_t sys = -1;
+    };
+    static constexpr uint64_t STORE_HIT = 1ull << 63;
+    static constexpr uint64_t STORE_ID = (1ull << 56) - 1;
+    static bool stored_hit(uint64_t gen) { return (gen & STORE_HIT) != 0; }
+    static uint64_t store_id(uint64_t gen) { return gen & STORE_ID; }
+
+    KvStateDesc state_desc(uint32_t slots, uint32_t max_pages) {
+        using namespace g6rt;
+        KvStateDesc d;
+        d.model_tag = "ds41";
+        d.max_slots = slots;
+        d.max_pages_per_slot = max_pages;
+        auto tail = [&](void* p, size_t bytes) {
+            if (p) d.tail_extents.push_back({static_cast<uint8_t*>(p), bytes, bytes});
+        };
+        for (int i = 0; i < int(main_.layers.size()); ++i) {
+            auto* a = ds41_attn_state(main_, i);
+            if (!a) continue;
+            tail(a->C.ring, size_t(a->C.ring_rows) * 512 * sizeof(__nv_bfloat16));
+            if (a->C.compq)
+                d.page_planes.push_back({a->C.compq, size_t(a->C.comp_ss), 32, 288, 2});
+            else if (a->C.comp)
+                d.page_planes.push_back({reinterpret_cast<uint8_t*>(a->C.comp),
+                    size_t(a->C.comp_ss) * sizeof(__nv_bfloat16), 32, 512 * sizeof(__nv_bfloat16), 2});
+            if (a->C.compq || a->C.comp) {
+                tail(a->C.kvs, 2 * 512 * sizeof(float));
+                tail(a->C.scs, 2 * 512 * sizeof(float));
+            }
+        }
+        if (auto* s = ds41_idx_detail::find(main_, false)) {
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t ratio = k < 3 ? 2 : 1, rows = 64 / ratio;
+                const size_t cap = size_t(s->rows_kv[k]);
+                if (s->ica[k]) {
+                    d.page_planes.push_back({s->ica[k], cap * 68, rows, 64, ratio});
+                    d.page_planes.push_back({s->ica[k] + cap * 64, cap * 68, rows, 4, ratio});
+                }
+                if (s->ca[k]) d.page_planes.push_back({s->ca[k], cap * 288, rows, 288, ratio});
+            }
+            if (s->shadow) d.page_planes.push_back({reinterpret_cast<uint8_t*>(s->shadow),
+                size_t(s->cap + s->rcap) * 1024, 64, 1024, 1});
+        }
+        if (dsp_) for (int i = 0; i < int(dsp_->draft.layers.size()); ++i) {
+            auto* a = ds41_attn_state(dsp_->draft, i);
+            if (a) tail(a->C.ring, size_t(a->C.ring_rows) * 1024);
+        }
+        tail(d_ehist_snap_, g6rt::ENG_RING * sizeof(int32_t));
+        d.validate();
+        return d;
+    }
+
+    void open_stores(const std::vector<std::string>& specs, bool old, const std::string& default_keep,
+                     unsigned shared_after, double write_limit, const std::string& set_id,
+                     unsigned nr, unsigned slots, unsigned max_pages) {
+        if (specs.empty()) return;
+        store_sessions_.resize(slots);
+        if (main_.ehist)
+            G6RT_CK(cudaMalloc(reinterpret_cast<void**>(&d_ehist_snap_), slots * g6rt::ENG_RING * sizeof(int32_t)));
+        auto desc = state_desc(slots, max_pages);
+        tiers_ = std::make_unique<KvStateTiers>(desc);
+        stash_ = std::make_unique<StashPool>(shared_after, 64, desc.state_blocks(), false);
+        stash_->set_rules(false, true, 0);
+        const std::string exe = exe_stamp();
+        for (size_t i = 0; i < specs.size(); ++i) {
+            const auto t = TierSpec::parse(specs[i], old);
+            std::string spec = t.store, index;
+            if (t.ssd()) {
+                const auto dir = t.store.substr(4) + "/r" + std::to_string(main_.rank);
+                if (!t.persist && std::filesystem::exists(dir)) std::filesystem::remove_all(dir);
+                std::filesystem::create_directories(dir);
+                spec = "ssd:" + dir + "/blocks";
+                if (t.persist && !set_id.empty()) index = dir;
+            }
+            if (t.spare_ram) spec = "ram:" + std::to_string(t.spare_ram_floor) + "+" + spec;
+            const std::string name = "ds41-" + set_id + "-" + std::to_string(getpid()) +
+                "-r" + std::to_string(main_.rank) + "-t" + std::to_string(i);
+            const auto blocks = t.group.empty() ? tiers_->add(spec, name, t.bytes) :
+                tiers_->add_group(spec, name, t.group, nr, main_.rank, t.bytes, t.cap, t.weight);
+            const std::string keep = t.rule.empty() ? default_keep : t.rule;
+            const bool whole = !index.empty() && keep != "system";
+            store_shared_ |= keep == "system" || keep == "all";
+            kv_index_ |= !index.empty();
+            kv_whole_ |= whole;
+            // Layout hash includes the compression and draft-ring extents, not process pointers.
+            const std::string compat = "ds41 set " + set_id + " nr " + std::to_string(nr) +
+                " slots " + std::to_string(slots) + " pages " + std::to_string(max_pages) +
+                " dspark " + std::to_string(dsp_ != nullptr) +
+                " format " + std::to_string(desc.format_hash()) + " state " + std::to_string(desc.state_blocks()) +
+                " blocks " + std::to_string(blocks) +
+                " engine " + exe;
+            stash_->add_tier(blocks, (keep == "system" ? 1 : 2) | (whole ? 4 : 0),
+                index.empty() ? nullptr : index.c_str(), compat.c_str());
+            stash_->set_policy(i, 0, keep == "sessions" ? 1 : 0, desc.slot_bytes());
+            fprintf(stderr, "# rank %d: s2 store %zu: %s, %llu blocks of %zu B, keep %s%s\n",
+                main_.rank, i, tiers_->describe(i).c_str(), (unsigned long long)blocks, desc.slot_bytes(),
+                keep.c_str(), index.empty() ? "" : ", indexed");
+        }
+        stash_->tiers_loaded();
+        stash_->write_limit(uint64_t(std::llround(write_limit * 1000)));
+    }
+    bool has_stores() const { return bool(stash_); }
+    bool persistent() const { return kv_index_; }
+    bool whole_store() const { return kv_whole_; }
+    std::string stored_summary() const { return stash_ ? stash_->stored_summary() : ""; }
+    void keep_agreed(const std::string& s) { if (stash_) stash_->keep_agreed(s); }
+    std::vector<g6kv_tier_totals> tier_stats() const {
+        std::vector<g6kv_tier_totals> out{tier_stat()};
+        if (stash_) for (size_t i = 0; i < tiers_->size(); ++i) out.push_back(stash_->tier_stats(i));
+        return out;
+    }
+    bool available(uint64_t gen, uint32_t pos = 0) const {
+        if (stored_hit(gen)) return stash_ && stash_->has(store_id(gen)) && (!pos || stash_->info(store_id(gen)).valid == int(pos));
+        auto* e = find(gen);
+        return e && (!pos || e->position == pos);
+    }
+    void reset_store_slot(int q) { if (stash_) store_sessions_.at(q) = StoreSession{}; }
+    void resume_store_slot(int q) { if (stash_) ++store_sessions_.at(q).hits; }
+    void admit_store(const g6rt::ServeReq& r, bool continuing) {
+        if (!stash_) return;
+        stash_->count(r.prompt, r.sys, g6rt::steering::cache_namespace(r.steering), continuing);
+        stash_->io_done();
+    }
+    void store_span(int q, int64_t sys) { if (stash_) store_sessions_.at(q).sys = sys; }
+    void unlimited_store() { if (kv_whole_) stash_->write_limit(0); }
+
+    uint32_t system_boundary(const g6rt::ServeReq& r) const {
+        if (!store_shared_ || r.prompt.empty() || r.steering.enabled) return 0;
+        const uint64_t top = std::min<uint64_t>(r.prompt.size() - 1, r.sys < 0 ? r.prompt.size() - 1 : uint64_t(r.sys));
+        return uint32_t(top / 64 * 64);
+    }
+    void capture_system(int q, uint32_t pos, const std::vector<int>& tokens,
+                        cudaStream_t st, const Ds41ImageRows& images) {
+        if (!stash_ || !store_shared_ || !pos) return;
+        auto& s = store_sessions_.at(q);
+        if (d_ehist_snap_) {
+            int ring[g6rt::ENG_RING]; ds41_engram_ring(ring, tokens, pos, images);
+            G6RT_CK(cudaMemcpyAsync(d_ehist_snap_ + size_t(q) * g6rt::ENG_RING, ring, sizeof(ring),
+                                   cudaMemcpyHostToDevice, st));
+            G6RT_CK(cudaStreamSynchronize(st));
+        }
+        if (pos > s.earned) {
+            stash_->earn(pos / 64 - s.earned / 64 + tiers_->desc().state_blocks());
+            s.earned = pos;
+        }
+        stash_->promote(tokens, pos, pos, pos, state_pages(q, pos), pack_state_handle(q, pos), pos, s.sys);
+        drain_store(st);
+    }
+
+    void flush_store(cudaStream_t st) {
+        if (!kv_whole_) return;
+        stash_->write_limit(0);
+        // Serving has stopped: slot zero is scratch, never a live session.
+        for (const auto& e : entries_) {
+            if (e.tier_id && stash_->has(e.tier_id) && stash_->info(e.tier_id).valid == int(e.position)) continue;
+            copy_state(0, e.position, e.dev_buf, false, st);
+            G6RT_CK(cudaStreamSynchronize(st));
+            store_sessions_[0] = {e.continuations, e.tier_pages, e.tier_pages, e.tier_id, 0, e.pf_end, e.system_span};
+            if (d_ehist_snap_)
+                G6RT_CK(cudaMemcpyAsync(d_ehist_snap_, e.ehist, sizeof(e.ehist), cudaMemcpyHostToDevice, st));
+            capture_store(0, e.position, e.tokens, e.ns, st, e.kind, false, 0, {}, true);
+        }
+        drain_store(st);
+        uint64_t entries = 0, blocks = 0;
+        for (size_t i = 0; i < tiers_->size(); ++i) {
+            auto t = stash_->tier_stats(i); entries += t.entries; blocks += t.spilled_pages;
+        }
+        fprintf(stderr, "# rank %d: s2 stores: quit stored %llu entries, %llu blocks written\n",
+            main_.rank, (unsigned long long)entries, (unsigned long long)blocks);
+    }
+
 private:
+    std::unique_ptr<StashPool> stash_;
+    std::unique_ptr<KvStateTiers> tiers_;
+    std::vector<StoreSession> store_sessions_;
+    int32_t* d_ehist_snap_ = nullptr;
+    bool kv_index_ = false, kv_whole_ = false, store_shared_ = false;
+
+    std::vector<uint32_t> state_pages(unsigned q, unsigned pos) const {
+        std::vector<uint32_t> pages(pos / 64);
+        for (unsigned i = 0; i < pages.size(); ++i)
+            pages[i] = pack_page_handle(q, i, tiers_->desc().max_pages_per_slot);
+        return pages;
+    }
+    void drain_store(cudaStream_t st) {
+        if (!stash_) return;
+        const auto io = stash_->io();
+        // A checksum or I/O error is fatal to this serving instance: never use a partly restored slot.
+        // serve_ds41 unwinds through links.shutdown(); pending uncommitted captures are not published.
+        tiers_->run(io, st);
+        stash_->io_done();
+    }
+    void capture_store(int q, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& ns,
+                       cudaStream_t st, Ds41Snap kind, bool replace, uint64_t keep, const Ds41ImageRows& images,
+                       bool ehist_ready = false) {
+        if (!stash_ || !pos || tokens.size() < pos) return;
+        auto& s = store_sessions_.at(q);
+        if (d_ehist_snap_ && !ehist_ready) {
+            int ring[g6rt::ENG_RING];
+            ds41_engram_ring(ring, tokens, pos, images);
+            // Never overwrite the active ring when capturing a prompt boundary.
+            G6RT_CK(cudaMemcpyAsync(d_ehist_snap_ + size_t(q) * g6rt::ENG_RING, ring, sizeof(ring),
+                                   cudaMemcpyHostToDevice, st));
+            G6RT_CK(cudaStreamSynchronize(st));
+        }
+        const auto pages = state_pages(q, pos);
+        // Full-page credit counts only newly computed rows. Each new boundary also earns its fixed state overhead.
+        if (pos > s.earned) {
+            stash_->earn(pos / 64 - s.earned / 64 + tiers_->desc().state_blocks());
+            s.earned = pos;
+        }
+        if (kind == Ds41Snap::PromptEnd) s.pf_end = pos;
+        uint64_t keep_id = stored_hit(keep) ? store_id(keep) : 0;
+        if (keep && !keep_id) if (auto* e = find(keep)) keep_id = e->tier_id;
+        const bool keep_from = kind == Ds41Snap::RequestEnd && !replace && s.prompt_id == s.id;
+        const uint64_t id = stash_->capture(tokens, pos, pos, s.pf_end, pages, pack_state_handle(q, pos),
+            s.hits, ns, s.id, s.pages, keep_from, keep_id);
+        drain_store(st);
+        if (id) {
+            // A refused extension returns the old id; retain its old page count in that case.
+            s.pages = uint32_t(stash_->info(id).pages);
+            s.id = id;
+            if (kind == Ds41Snap::PromptEnd) s.prompt_id = id;
+        }
+
+    }
     static int dedup_k() {
         static const int k = int(knob::ds_cache_dedup());
         return k;
@@ -542,8 +833,8 @@ class Ds41SnapSlots {
 public:
     explicit Ds41SnapSlots(int slots) : prompt_gen_(size_t(slots), 0), restored_end_(size_t(slots), false), park_id_(size_t(slots), 0) {}
     void reset(int q) { prompt_gen_[size_t(q)] = 0; restored_end_[size_t(q)] = false; park_id_[size_t(q)] = 0; }
-    Ds41Snap restore(Ds41PrefixCache& ck, uint64_t gen, int q, cudaStream_t st) {
-        const Ds41Snap kind = ck.restore(gen, q, st);
+    Ds41Snap restore(Ds41PrefixCache& ck, uint64_t gen, int q, cudaStream_t st, uint32_t pos = 0) {
+        const Ds41Snap kind = ck.restore(gen, q, st, pos);
         restored_end_[size_t(q)] = kind == Ds41Snap::RequestEnd;
         return kind;
     }
@@ -577,6 +868,7 @@ public:
     // GR8_DS_PARK: a follow-up resumes the chat parked on q, as if its request end had been captured and then restored on q
     void resume(Ds41PrefixCache& ck, int q, uint32_t pos, const std::vector<int>& history, const g6rt::CacheNamespace& ns) {
         const Ds41Snap kind = ck.resume_parked(park_id_[size_t(q)], prompt_gen_[size_t(q)], pos, history, ns);
+        ck.resume_store_slot(q);
         reset(q);
         restored_end_[size_t(q)] = kind == Ds41Snap::RequestEnd;
     }

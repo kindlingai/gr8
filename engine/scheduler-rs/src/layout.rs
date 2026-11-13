@@ -430,7 +430,7 @@ pub fn digest() -> u64 {
             image_digest
         }
     );
-    layout!(h, crate::scheduler::Request { id, prompt_tokens, max_tokens, steering, r_rows });
+    layout!(h, crate::scheduler::Request { id, prompt_tokens, max_tokens, steering, r_rows, ckpt_at });
     layout!(h, crate::scheduler::Run { first_page, pages, table_version, list_hash });
     layout!(
         h,
@@ -870,7 +870,7 @@ pub fn digest() -> u64 {
             has_runs
         }
     );
-    layout!(h, crate::service::control::Checked { prompt, n, sys, plp, n_gen, steering, ok });
+    layout!(h, crate::service::control::Checked { prompt, n, sys, plp, n_gen, steering, ok, ckpt_at });
     layout!(h, crate::service::control::PoolCall { kind, rows, worst, r, out, run, prompt, n, span, ns });
     layout!(h, crate::service::control::Staged { req, prompt, n, sys, plp });
     layout!(

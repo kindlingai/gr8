@@ -50,6 +50,7 @@ pub struct Request {
     pub max_tokens: u32,
     pub steering: Identity,
     pub r_rows: u32,
+    pub ckpt_at: u32, // optional exact prefill boundary; zero preserves the normal quantum
 }
 
 #[repr(C)]
@@ -235,6 +236,7 @@ fn require(ok: bool, what: Err) -> Result<(), Err> {
 
 pub fn reserve_rows(c: &Config, r: &Request) -> Result<u64, Err> {
     require(r.prompt_tokens != 0 && r.max_tokens != 0, "empty request")?;
+    require(r.ckpt_at < r.prompt_tokens, "checkpoint boundary past the prompt")?;
     Ok(u64::from(r.prompt_tokens) + u64::from(r.max_tokens) + u64::from(c.guard()))
 }
 pub fn reserve_pages(c: &Config, r: &Request) -> Result<u32, Err> {
@@ -539,6 +541,7 @@ pub fn digest_slots(c: &Config, s: &[Slot], mut h: u64) -> u64 {
         if x.req.r_rows != 0 {
             fnv(&mut h, u64::from(x.req.r_rows));
         }
+        if x.req.ckpt_at != 0 { fnv(&mut h, u64::from(x.req.ckpt_at)); }
         fnv(&mut h, u64::from(x.run.first_page));
         fnv(&mut h, u64::from(x.run.pages));
         fnv(&mut h, u64::from(x.run.table_version));
@@ -781,7 +784,7 @@ pub fn plan(c: &Config, s: &[Slot], want_decode: bool, stalled: &[bool]) -> Quan
     if q.count != 0 && ((want_decode && !fresh) || pf.is_none()) {
         q.kind = K_DECODE;
     } else if let Some(p) = pf {
-        if c.c8_pack && p.packable && p.prefilled == 0 && prefill_left(p) >= 1 && prefill_left(p) <= 64 {
+        if c.c8_pack && p.packable && p.req.ckpt_at == 0 && p.prefilled == 0 && prefill_left(p) >= 1 && prefill_left(p) <= 64 {
             let cap = if decoding_any && c.decode_prefill_rows != 0 {
                 512u32.min(c.prefill_rows).min(c.decode_prefill_rows)
             } else {
@@ -793,7 +796,7 @@ pub fn plan(c: &Config, s: &[Slot], want_decode: bool, stalled: &[bool]) -> Quan
                 if take.len() >= PACK_MAX_MEMBERS {
                     break;
                 }
-                if std::ptr::eq(x, p) || x.phase != PREFILL || !x.packable || x.prefilled != 0 {
+                if std::ptr::eq(x, p) || x.phase != PREFILL || !x.packable || x.req.ckpt_at != 0 || x.prefilled != 0 {
                     continue;
                 }
                 let left = prefill_left(x);
@@ -835,6 +838,9 @@ pub fn plan(c: &Config, s: &[Slot], want_decode: bool, stalled: &[bool]) -> Quan
             u64::from(c.prefill_rows) * if c.two_lanes && left > c.prefill_rows { 2 } else { 1 }
         };
         q.rows = if left != 0 { u64::from(left).min(cap) as u32 } else { 1 };
+        if p.req.ckpt_at > p.prefilled && p.req.ckpt_at < p.prefilled.saturating_add(q.rows) {
+            q.rows = p.req.ckpt_at - p.prefilled;
+        }
     }
     q
 }
@@ -912,8 +918,13 @@ pub fn horizon(c: &Config, s: &[Slot], st: &State) -> u64 {
 }
 
 pub fn skip_prefill(s: &mut [Slot], st: &State, k: &Key) -> Result<(), Err> {
+    skip_prefill_from(s, st, k, 0)
+}
+
+/// Skip the remaining prefill at admission, after restoring `from` prefix rows.
+pub fn skip_prefill_from(s: &mut [Slot], st: &State, k: &Key, from: u32) -> Result<(), Err> {
     let i = slot_index(s, k)?;
-    require(!st.busy && s[i].phase == PREFILL && s[i].prefilled == 0, "skip_prefill outside admission")?;
+    require(!st.busy && s[i].phase == PREFILL && s[i].prefilled == from, "skip_prefill outside admission")?;
     s[i].prefilled = s[i].req.prompt_tokens.wrapping_sub(1);
     Ok(())
 }
@@ -1001,4 +1012,36 @@ pub fn complete_decode(c: &Config, s: &mut [Slot], st: &mut State, r: &[Completi
     }
     completed(c, s, st);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_prefill_restored_admission() {
+        // These C mirrors contain only integers, bools and arrays of those.
+        let mut slots: [Slot; 1] = unsafe { std::mem::zeroed() };
+        let mut state: State = unsafe { std::mem::zeroed() };
+        slots[0].phase = PREFILL;
+        slots[0].req.prompt_tokens = 20;
+        let key = slots[0].key;
+        for from in [0, 2, 19] {
+            slots[0].prefilled = from;
+            if from != 0 {
+                let before = slots;
+                assert_eq!(skip_prefill(&mut slots, &state, &key), Err("skip_prefill outside admission"));
+                assert_eq!(slots, before);
+            }
+            assert!(skip_prefill_from(&mut slots, &state, &key, from + 1).is_err());
+            state.busy = true;
+            assert!(skip_prefill_from(&mut slots, &state, &key, from).is_err());
+            state.busy = false;
+            slots[0].phase = DECODE;
+            assert!(skip_prefill_from(&mut slots, &state, &key, from).is_err());
+            slots[0].phase = PREFILL;
+            skip_prefill_from(&mut slots, &state, &key, from).unwrap();
+            assert_eq!(slots[0].prefilled, 19);
+        }
+    }
 }

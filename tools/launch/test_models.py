@@ -356,6 +356,17 @@ class Ds41Tests(unittest.TestCase):
         self.assertEqual((models.of(o), o.get('GROUP'), S.engine_bin(o)), (models.DS41, 'gr8-ds41', 'g6m4_ds41'))
         self.assertEqual(models.DS41.architecture, 'DeepseekV41ForCausalLM')
 
+    def test_kv_stores(self):
+        for store in ('mem:,size=1G', 'ssd:/tmp/kv,size=8G,persist=on', 'remote:localhost:7349,size=2G'):
+            plan = opt.engine_plan(ds41('--reuse', '1', '--kv-store', store,
+                                       '--kv-keep', 'sessions', '--kv-system-after', '4', '--kv-write-limit', '1'))
+            args = plan['args']
+            parsed = opt.kv_parse(store)
+            self.assertEqual(opt.kv_store_text(opt.kv_yaml(*parsed)), opt.kv_line(*parsed))
+            for key, value in (('--kv-store', store), ('--kv-keep', 'sessions'),
+                               ('--kv-system-after', '4'), ('--kv-write-limit', '1')):
+                self.assertEqual(args[args.index(key) + 1], value)
+
     def test_refusals(self):
         for argv, want in ((['--tp', '3'], 'want 4 (ds41)'), (['--dflash', '1'], 'no DFlash2 drafter'),
                            (['--kv-format', 'int4'], 'fp8 KV build only')):

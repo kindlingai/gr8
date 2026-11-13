@@ -36,7 +36,7 @@ int main()
 #if G6_MODEL_DS41
     CHECK(m.model == G6_MODEL_ID_DS41 && std::strcmp(m.name, "ds41") == 0 && m.max_sessions == 32 && m.mtp_layers == 3);
     CHECK(m.ds_markov_maxs == 8 && m.ds_block == g6s2::Ds41RoundLogic::BLOCK);
-    CHECK(m.caps == (G6_CAP_MTP0 | G6_CAP_PACK | G6_CAP_PARK | G6_CAP_PROMPT_DECODE | G6_CAP_DSPARK));
+    CHECK(m.caps == (G6_CAP_MTP0 | G6_CAP_PACK | G6_CAP_PARK | G6_CAP_PROMPT_DECODE | G6_CAP_DSPARK | G6_CAP_KV_STORE));
 #elif G6_MODEL_FLASH
     CHECK(m.model == G6_MODEL_ID_GLM53F && std::strcmp(m.name, "glm-5.3-flash") == 0 && m.max_sessions == 8);
     CHECK(m.ds_markov_maxs == 0 && m.ds_block == 0);
@@ -44,7 +44,7 @@ int main()
 #else
     CHECK(m.model == G6_MODEL_ID_GLM53 && std::strcmp(m.name, "glm-5.3") == 0 && m.max_sessions == 8 && m.mtp_layers == 1);
     CHECK(m.ds_markov_maxs == 0 && m.ds_block == 0);
-    CHECK(m.caps == (G6_CAP_DFLASH2 | G6_CAP_GRAMMAR));
+    CHECK(m.caps == (G6_CAP_DFLASH2 | G6_CAP_GRAMMAR | G6_CAP_KV_STORE));
 #endif
     // the scheduler's model rules read the capabilities: each refusal by its own message, nothing else refused
     auto refusal = [](const g6s2::Config& c) -> std::string {

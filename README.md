@@ -152,8 +152,8 @@ If you are an agent (or developer) building on gr8, start from the matching entr
   to an SSD or to a KV node with spare memory, over RDMA. From a KV node, the next turn of a 445,855-token prompt
   answered in 11.4 s (experimental, [Remote KV](docs/GLM-5.3.md#remote-kv)). GLM-5.3-Flash can keep its session
   checkpoints in the same kinds of store
-  ([experimental](docs/FLASH.md#session-checkpoints-gr8_glm53f_cachealigned-experimental)). DeepSeek-V4.1-Flash has no
-  store below the device.
+  ([experimental](docs/FLASH.md#session-checkpoints-gr8_glm53f_cachealigned-experimental)). DeepSeek-V4.1-Flash can store full pages plus exact rolling state in the same tiers
+  ([DS41 session stores](docs/DEEPSEEK.md#tiered-session-stores)); live GPU validation is pending.
 - **Image input.** DeepSeek-V4.1-Flash and GLM-5.3-Flash take images in chat requests (opt-in, `GR8_DS41_VISION=1`,
   [docs/DS41-VISION.md](docs/DS41-VISION.md); `GR8_GLM53F_VISION=1`, [docs/FLASH-VISION.md](docs/FLASH-VISION.md)).
 - **A Docker image.** `ghcr.io/kindlingai/gr8` has the engine for every TP width and all three models, so GLM-5.3 on
