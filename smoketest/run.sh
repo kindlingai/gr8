@@ -8,6 +8,7 @@
 #
 #     smoketest/run.sh http://<head>:8100 [served-name]      or ./gr8 glm53 smoke
 source "$(dirname "$0")/lib.sh" "$@"
+THINKING_OFF=$(python3 "$(dirname "$0")/../tools/launch/models.py" get "${GR8_MODEL:-glm53}" thinking_off) || exit 2
 
 get() { # PATH -> STATUS, BODY, SECS
   local out
@@ -55,7 +56,7 @@ t_thinking_on_by_default() {
 # thinking off is taken, the reply has content and no reasoning.
 t_thinking_off_refused() {
   post /v1/chat/completions "$(chat '{"chat_template_kwargs":{"enable_thinking":false}}' 256 'Say hi.')"
-  if [ "${GR8_MODEL:-glm53}" = glm53f ] || [ "$STATUS" = 200 ]; then
+  if [ "$THINKING_OFF" = 1 ] || [ "$STATUS" = 200 ]; then
     [ "$STATUS" = 200 ] || { BODY="{\"status\": $STATUS}"; check "status should be 200" 'false'; return; }
     check "content should be present" '(.choices[0].message.content // "") | length > 0' || return
     check "reasoning should be absent" '(.choices[0].message.reasoning // .choices[0].message.reasoning_content // "") == ""' || return

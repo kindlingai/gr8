@@ -83,6 +83,29 @@ class SwitchTests(unittest.TestCase):
     def setUp(self):
         self.config = sw.read_config(ROOT / "config/switch.env.example")
 
+    def test_two_model_subset_and_incomplete_model(self):
+        text = (ROOT / "config/switch.env.example").read_text()
+        text = "\n".join(l for l in text.splitlines() if not l.startswith("DS41_"))
+        with tempfile.TemporaryDirectory() as t:
+            p = Path(t) / "switch.env"
+            p.write_text(text)
+            config = sw.read_config(p)
+            self.assertEqual(set(config.models), {"glm53", "glm53f"})
+            downs, ups = sw.plan(config, "glm53f")
+            self.assertTrue(ups)
+            self.assertTrue(all(name == "glm53" for actions in downs.values() for name, _ in actions))
+            with self.assertRaisesRegex(ValueError, "not configured"):
+                sw.plan(config, "ds41")
+            p.write_text(text + "\nDS41_DIR=/models/native\n")
+            with self.assertRaisesRegex(ValueError, "missing config keys"):
+                sw.read_config(p)
+            p.write_text("\n".join(l for l in text.splitlines() if not l.startswith("GLM53F_")))
+            with self.assertRaisesRegex(ValueError, "at least two"):
+                sw.read_config(p)
+
+    def test_models_come_from_launcher_registry(self):
+        self.assertEqual(sw.MODELS, tuple(m.name for m in sw.REGISTRY.values() if m.fabric))
+
     def test_plan_all_targets(self):
         for target in sw.MODELS:
             with self.subTest(target=target):

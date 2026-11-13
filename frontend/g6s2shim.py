@@ -961,6 +961,25 @@ def id_list(text):
         raise argparse.ArgumentTypeError(f'want comma-separated token ids: {text!r}')
 
 
+def model_metadata(name, vocab, eos_ids, directory):
+    """CLI overrides release metadata. Only the original no-metadata invocation defaults to GLM."""
+    if directory:
+        from types import SimpleNamespace
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from tools.launch.models import release_metadata
+        meta = release_metadata(SimpleNamespace(vocab=vocab or 0, eos_ids=eos_ids or (), max_positions=0), directory)
+        if vocab is None:
+            vocab = meta['vocab']
+        if eos_ids is None:
+            eos_ids = list(meta['eos_ids'])
+    elif name == 'glm-5.3-g6' and vocab in (None, 154880):
+        vocab = 154880 if vocab is None else vocab
+        eos_ids = [154820, 154827, 154829] if eos_ids is None else eos_ids
+    if not vocab or eos_ids is None or not eos_ids:
+        raise ValueError('model metadata missing: provide --vocab-size and --eos-ids or --model-dir with config.json')
+    return vocab, eos_ids
+
+
 async def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--dir', required=True, help="the head rank's engine --serve DIR (local)")
@@ -981,12 +1000,17 @@ async def main(argv=None):
     ap.add_argument('--cancel-timeout', type=float, default=60.0, help='answer abort if the engine sends no end line this long after CANCEL')
     ap.add_argument('--stall-timeout', type=float, default=900.0, help='error an admitted request after this long with no resp')
     ap.add_argument('--model-name', default=MODEL_NAME, help="the hello's model (default GLM-5.3's)")
-    ap.add_argument('--vocab-size', type=int, default=VOCAB,
+    ap.add_argument('--model-dir', help='release metadata directory (config.json and generation_config.json)')
+    ap.add_argument('--vocab-size', type=int,
                     help='token ids the engine takes (0..N-1): the hello vocab_size and the bound on prompt, insert and grammar ids')
-    ap.add_argument('--eos-ids', type=id_list, default=EOS_IDS, help="the hello's eos_ids, comma-separated")
+    ap.add_argument('--eos-ids', type=id_list, help="the hello's eos_ids, comma-separated")
     a = ap.parse_args(argv)
     if a.capacity_slots < 1:
         ap.error('--capacity-slots must be positive')
+    try:
+        a.vocab_size, a.eos_ids = model_metadata(a.model_name, a.vocab_size, a.eos_ids, a.model_dir)
+    except ValueError as e:
+        ap.error(str(e))
     err = set_model(a.model_name, a.vocab_size, a.eos_ids)
     if err:
         ap.error(err)

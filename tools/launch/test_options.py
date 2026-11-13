@@ -526,7 +526,11 @@ class CanonicalTests(unittest.TestCase):
         self.assertNotEqual(base, self.digest('--extra-env', 'GR8_DEC_BK=1024')[2])
         self.assertNotEqual(base, self.digest('--port', '8200')[2])
         # a knob set to its default, or one this TP does not read, changes nothing
-        self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '513536', '--reuse', '1', '--extra-args', '--top 5')[2])
+        self.assertEqual(base, self.digest('--qp-roll', '2', '--qp-ctx', '513536', '--reuse', '1')[2])
+        # Extra engine arguments now reach TP=4 too and must participate in rank agreement.
+        _, text, extra = self.digest('--extra-args', '--top 5')
+        self.assertIn('--top 5', text)
+        self.assertNotEqual(base, extra)
 
     def test_cp_onechain_reaches_every_rank(self):
         _, text, _ = self.digest()
@@ -1057,7 +1061,7 @@ class KvFormatTests(unittest.TestCase):
     def test_tp4_defaults_to_int4_with_fp8_rollback(self):
         o, p = self.plan()
         self.assertEqual(o.get('KV_FORMAT'), 'int4')
-        self.assertEqual(o.origin['KV_FORMAT'], 'default')
+        self.assertEqual(o.origin['KV_FORMAT'], 'glm53 TP=4 default')
         self.assertEqual(p['args'][-2:], ['--kv-format', 'int4'])
         self.assertEqual(p['knobs']['CAP'], '513536')
         o8, p8 = self.plan('--kv-format', 'fp8')

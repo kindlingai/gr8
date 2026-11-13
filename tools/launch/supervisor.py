@@ -154,11 +154,12 @@ def resolve_model(o, refresh=False, log=log):
                 raise modelset.ModelError(f'--model {model}: want a pseudo engine release, a directory with '
                                           'responses.toml and the tokenizer files')
             ms = modelset.pseudo_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
-        elif models.of(o) is models.DS41:   # the exlr8 native release, read in place: no index slices, no variants
+        elif models.of(o).native_release:   # an exlr8 native release, read in place: no index slices, no variants
+            m = models.of(o)
             if not modelset.is_release(model):
-                raise modelset.ModelError(f'--model {model}: want a local copy of the DeepSeek-V4.1-Flash exlr8 native '
+                raise modelset.ModelError(f'--model {model}: want a local copy of the {m.title} exlr8 native '
                                           'release (dense/, experts/, manifests/, tokenizer.json and tokenizer_config.json)'
-                                          if model else 'no model: pass --model <DeepSeek-V4.1-Flash release directory>')
+                                          if model else f'no model: pass --model <{m.title} release directory>')
             ms = modelset.ds_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
         elif hf:
             if not o.get('MODEL_CACHE'):
@@ -170,7 +171,7 @@ def resolve_model(o, refresh=False, log=log):
                 release = hfsource.Release(o.get('MODEL_CACHE'), *hf, refresh=refresh, log=log,
                                            layout=o.get('LAYOUT'))
             # GLM-5.3-Flash image input: each rank fetches the vision tower too
-            release.vision = models.of(o) is models.GLM53F and opt.extra_env_value(o, 'GR8_GLM53F_VISION') == '1'
+            release.vision = bool(models.of(o).vision_knob) and opt.extra_env_value(o, models.of(o).vision_knob) == '1'
             release.fetch_meta(steering[0] if steering else None)
             o.values['V2'], o.values['V2_SLICES'] = release.v2, release.slices
             model = release.dir
@@ -195,7 +196,7 @@ def resolve_model(o, refresh=False, log=log):
             o.values['V2_WIDTHS'] = variant.path
         if o.get('GRAMMAR') == '1' and not o.get('GRAMMAR_DIR'):
             o.values['GRAMMAR_DIR'] = ms.tokenizer
-        if o.get('GRAMMAR') != '1' or models.of(o) not in (models.GLM53, models.GLM53F):   # g6m4_ds41 takes no grammars
+        if o.get('GRAMMAR') != '1' or not models.of(o).grammar:   # g6m4_ds41 takes no grammars
             o.values['GRAMMAR_DIR'] = None
         steering_hf.bind(o, release)
         steering_local.prepare(o, ms)
@@ -229,7 +230,7 @@ def drafter_of(o, ms, refresh, log):
         return d
     if o.get('DFLASH') == '0' or o.get('DFLASH_DIR'):
         return None
-    url = hfsource.FLASH_DRAFTER_URL if models.of(o) is models.GLM53F else hfsource.DRAFTER_URL
+    url = models.of(o).drafter_url
     hint = f'--drafter {url} (CC BY-NC-ND 4.0: each box fetches and converts it)'
     if o.get('DFLASH') == '1':
         raise modelset.ModelError(f'--dflash 1, but there is no DFlash2 drafter: add {hint}')
@@ -721,7 +722,7 @@ class Supervisor:
                              f'{self.home}/venv/bin/pip install -r frontend/requirements.txt')
         m = mem_available_gib()
         log(f'MemAvailable {m} GiB' if m is not None else 'MemAvailable unknown')
-        if m is not None and m < 8 and models.of(o).dialect == 'ds41':
+        if m is not None and m < models.of(o).min_free_gib:
             fails.append(f'MemAvailable is {m} GiB: the engine stops a boot under GR8_MEM_MIN (8 GiB), so something else '
                          'holds this box\'s memory; free it first')
         elif m is not None and m < 8:
@@ -826,7 +827,7 @@ class Supervisor:
         return env
 
     def borrow_idle(self, knobs):
-        return models.of(self.o).name == 'glm53f' and knobs.get('FLASH_CAP_POLICY') == 'borrow-idle'
+        return models.of(self.o).checkpoint_cache and knobs.get('FLASH_CAP_POLICY') == 'borrow-idle'
 
     # ---- after the handshake --------------------------------------------------------------------------------------
     def front_bin(self):
@@ -886,8 +887,8 @@ class Supervisor:
         os.makedirs(work)
         self.check_n = 0
         env = self.engine_env(plan)
-        # Flash takes the second rail for prefill only
-        ips2 = '--ips2' if models.of(o).name in ('glm53', 'ds41') else '--pf-ips2'
+        # second_rail='prefill' (Flash) takes the second rail for prefill only
+        ips2 = '--ips2' if models.of(o).second_rail == 'all' else '--pf-ips2'
         argv = ['./bin/' + engine_bin(o), '--rank', str(r), '--ips', ','.join(hs['ips']), ips2, ','.join(hs['ips2']),
                 '--proxy-cpu', o.get('PROXY_CPU'), *plan['args']]
         argv[1:1] = self.ring_args()
@@ -907,7 +908,7 @@ class Supervisor:
         tmo = float(plan['knobs'].get('READY_TMO') or 1800)
         t0, ask_at = time.monotonic(), tmo
         log(f'engine started (epoch {hs["epoch"]}); waiting for it to load (up to {tmo:.0f}s)')
-        relay = StageRelay(os.path.join(self.out, f'g6m4.r{r}.err')) if models.of(o).dialect == 'ds41' else None
+        relay = StageRelay(os.path.join(self.out, f'g6m4.r{r}.err')) if models.of(o).stage_relay else None
         while True:
             self.watch()
             for line in relay.new() if relay else ():
@@ -939,7 +940,7 @@ class Supervisor:
         booted, to a KV node beside it: flash_donor_budget GiB, a host ledger crediting them to the node,
         and ./gr8 kv up --lazy-lock --ledger. The node is its own supervisor: its failure, or no budget, leaves the
         serve as it is."""
-        if models.of(self.o).name != 'glm53f' or float(knobs.get('FLASH_KV_DONATE_GIB') or 0) <= 0:
+        if not models.of(self.o).checkpoint_cache or float(knobs.get('FLASH_KV_DONATE_GIB') or 0) <= 0:
             return
         ko = kvnode.parse(['--work-dir', self.home], dict(os.environ))
         env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'KV_MIN_FREE_GB': ko.get('KV_MIN_FREE_GB'),
@@ -999,10 +1000,8 @@ class Supervisor:
             front += ['--dialect', model.dialect]
         if model.served:
             front += ['--served-model-name', *model.served]
-        if model is models.DS41 and plan['knobs'].get('REUSE') == '1':
-            front += ['--enable-prompt-tokens-details']
-        elif model.dialect == 'glm':
-            # glm keeps prefix reuse on and the engine reports reused rows in the a line, so report them
+        if plan['knobs'].get('REUSE') == '1' or model.dialect == 'glm':
+            # glm keeps prefix reuse on; other models report reused rows in the a line when REUSE=1
             front += ['--enable-prompt-tokens-details']
         if o.get('DEFAULT_MAX_TOKENS') != '0':
             front += ['--default-max-tokens', o.get('DEFAULT_MAX_TOKENS')]
@@ -1053,17 +1052,20 @@ class Supervisor:
         argv = [self.py(), os.path.join(REPO, 'frontend', 'g6s2shim.py'), '--dir', work, '--sock', sock,
                 '--sessions', sess]
         model = models.of(self.o)
-        if model is models.DS41:  # DS41 pool_rows = SESS * per-session CAP, unlike the shared GLM pool
+        meta = models.release_metadata(model, self.ms.tokenizer if self.ms else '')
+        if model.per_slot_pool:   # pool_rows = SESS * per-session CAP, unlike a shared pool
             argv += ['--capacity-slots', sess]
-        if model.vocab:     # the shim's hello and id bound default to GLM-5.3's: a DeepSeek engine takes ids 0..129279 only
-            argv += ['--model-name', (model.served or (model.name,))[0], '--vocab-size', str(model.vocab),
-                     '--eos-ids', ','.join(map(str, model.eos_ids))]
+        if not meta['vocab'] or not meta['eos_ids']:
+            raise opt.OptionError(f'{model.name}: set vocab/eos_ids in Model or provide release config.json metadata')
+        if not model.shim_legacy:
+            argv += ['--model-name', (model.served or (model.name,))[0], '--vocab-size', str(meta['vocab']),
+                     '--eos-ids', ','.join(map(str, meta['eos_ids']))]
         if self.o.get('TP') == '6':
             argv += ['--stall-timeout', '2400']
         # the longest request (prompt + max_tokens): MAX_MODEL_LEN, else the model's max positions. The shim takes the
         # smaller of it and the pool's room (pool_rows / capacity_slots - guard), and the front end reads the result from
         # the shim's hello, so the two never disagree
-        argv += ['--max-model-len', str(self.o.get('MAX_MODEL_LEN') or model.max_positions)]
+        argv += ['--max-model-len', str(self.o.get('MAX_MODEL_LEN') or meta['max_positions'])]
         self.spawn('shim', self.pin() + argv, REPO, env={**os.environ, 'PYTHONPATH': os.path.join(REPO, 'frontend')})
         for _ in range(150):
             if os.path.exists(sock):

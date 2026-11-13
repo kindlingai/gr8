@@ -132,6 +132,8 @@ If you are an agent (or developer) building on gr8, start from the matching entr
   ([frontend/README.md](frontend/README.md); internal wire protocol in [PROTOCOL.md](PROTOCOL.md)), poll `/health` and
   `/metrics` (plus localhost-only `/health?deep`), and use `./gr8 <model> status|smoke|down` or `./gr8 switch`
   ([docs/SWITCHING.md](docs/SWITCHING.md)) for cluster control.
+- **Add a model:** Follow [docs/ADDING-A-MODEL.md](docs/ADDING-A-MODEL.md). Launcher metadata,
+  per-TP defaults and image checks share one registry; an unsupported architecture still needs engine work.
 - **Change gr8 itself:** Read [AGENTS.md](AGENTS.md) before editing engine, launcher, or front-end code.
 
 ## What gr8 does today
@@ -308,7 +310,7 @@ The head serves the OpenAI API on port 8100. [frontend/README.md](frontend/READM
 
 gr8 is not a general engine: it is written for the shapes of the three models above.
 [docs/MODEL-SPECIFIC.md](docs/MODEL-SPECIFIC.md) lists every place GLM 5.3 is built in, and what would carry over to
-another model.
+another model. [docs/ADDING-A-MODEL.md](docs/ADDING-A-MODEL.md) is the launcher registration and engine integration checklist.
 
 ## Credits
 

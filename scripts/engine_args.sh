@@ -15,6 +15,15 @@
 #                            (the s2/ directory), EPOCH the S2 epoch. SET_ID, when set, adds --set-id.
 #   flash_donor_budget [KIB] GLM-5.3-Flash: the whole GiB this box lends a KV node next to the serve (below)
 
+# The registry owns dispatch and per-TP metadata; profiles below own geometry-specific tuning.
+_model_registry=$(cd "$(dirname "${BASH_SOURCE[0]}")/../tools/launch" && pwd)/models.py
+model_field() { python3 "$_model_registry" get "${GR8_MODEL:-glm53}" "$@"; }
+_engine_profile=$(model_field engine_profile) || return 2
+_engine_binary=$(model_field engine) || return 2
+case $_engine_profile in glm|flash|ds41|pseudo) ;;
+  *) echo "unknown engine profile: $_engine_profile" >&2; return 2 ;;
+esac
+
 # share_cap P: the CAP that gives P physical KV pages per rank at this SHARE_LIMIT. Each rank holds the first
 # SHARE_LIMIT tokens of a session (64 per page) and 1/TP of the rest.
 share_cap() {
@@ -260,11 +269,17 @@ pseudo_defaults() {
 }
 
 engine_defaults() {
-  [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_defaults; return; }
-  [ "${GR8_MODEL:-glm53}" = ds41 ] && { ds41_defaults; return; }
-  [ "${GR8_MODEL:-glm53}" = pseudo ] && { pseudo_defaults; return; }
+  local _defaults _key _value
+  _defaults=$(model_field tp-defaults "$TP") || return 2
+  while IFS='=' read -r _key _value; do
+    [ -n "$_key" ] || continue
+    [ -n "${!_key:-}" ] || printf -v "$_key" %s "$_value"
+  done <<< "$_defaults"
+  [ "$_engine_profile" = flash ] && { flash_defaults; return; }
+  [ "$_engine_profile" = ds41 ] && { ds41_defaults; return; }
+  [ "$_engine_profile" = pseudo ] && { pseudo_defaults; return; }
   case $TP in
-    4) KV_FORMAT=${KV_FORMAT:-int4}; SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+    4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        DFLASH=${DFLASH:-1}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1}
        # the window-2 fc1 split on every MoE layer at M > 1 (bit-exact, measured at TP=4); 0 turns it off, and
        # GR8_TR3_W2ALL in EXTRA_ENV keeps its own value
@@ -318,7 +333,7 @@ engine_defaults() {
 # GLM-5.3-Flash: the prefill speed stack at top-k 8 (docs/FLASH.md). GR8_PF_RS, GR8_PF_OWN and CP stay off; EXTRA_ENV=GR8_CP=1
 # turns CP on with R = SHARE_LIMIT (docs/FLASH.md).
 flash_env() {
-  ENGINE_BIN=g6m4_flash; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=g6m4_flash-int4
+  ENGINE_BIN=$_engine_binary; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=$_engine_binary-int4
   # TP=4: mHC sequence-parallel (partials reduce-scatter, each owner runs mHC on its rows, the rows all-gather), which
   # sends a quarter of the bytes and replaces the peer-partial staging: 8K prefill 2,151 -> 2,533 tok/s. And the routed
   # experts on the expert tiles (GR8_PF_WT), which need the router unsplit: 8K 2,818 -> 2,963 with the G9 scan below.
@@ -365,7 +380,7 @@ GR8_GLM53F_PF_STAGE_ASYNC=$stage GR8_GLM53F_PF_SP=$sp GR8_GLM53F_PF_SP_X16=$sp"
 
 # DeepSeek-V4.1-Flash-1017: no GLM prefill stack (GR8_PF_*), no CP; the DeepSeek-only GR8_DS_* variables come in EXTRA_ENV.
 ds41_env() {
-  ENGINE_BIN=g6m4_ds41
+  ENGINE_BIN=$_engine_binary
   # g6m4 turns the GLM-5.3 replicated-GEMV splits on at NR > 1 for any build that is not Flash (g6m4.cu: GR8_QA_SPLIT 2, GR8_IDXQ_SPLIT 1,
   # GR8_MTP_SPLIT 1 with --mtp); on DeepSeek TP 4 that asserts in Fabric::init (fabric.cpp) after "layers bound". So all three are 0 unless QA_SPLIT, IDXQ_SPLIT, MTP_SPLIT say otherwise; the plan's env is the same on every rank.
   # DEC_BK defaults to CAP: one decode graph bucket. The DS41 step reads the live context from its step cell at run time and never the
@@ -376,13 +391,13 @@ ds41_env() {
 }
 
 engine_env() {
-  if [ "${KV4_FOLD:-0}" = 1 ] && { [ "${GR8_MODEL:-glm53}" != glm53 ] || [ "${KV_FORMAT:-fp8}" != int4 ] || [ "${KVB:-bf16}" = fp8 ]; }; then
+  if [ "${KV4_FOLD:-0}" = 1 ] && { [ "$(model_field kv4_fold)" != 1 ] || [ "${KV_FORMAT:-fp8}" != int4 ] || [ "${KVB:-bf16}" = fp8 ]; }; then
     echo "engine_env: KV4_FOLD=1 requires glm53 int4 KV and BF16 kv_b" >&2; return 2
   fi
-  [ "${GR8_MODEL:-glm53}" = glm53f ] && { flash_env; return 0; }
-  [ "${GR8_MODEL:-glm53}" = ds41 ] && { ds41_env; return 0; }
-  [ "${GR8_MODEL:-glm53}" = pseudo ] && { ENGINE_BIN=g6pseudo; ENGINE_ENV=""; return 0; }
-  ENGINE_BIN=g6m4; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=g6m4-int4
+  [ "$_engine_profile" = flash ] && { flash_env; return 0; }
+  [ "$_engine_profile" = ds41 ] && { ds41_env; return 0; }
+  [ "$_engine_profile" = pseudo ] && { ENGINE_BIN=$_engine_binary; ENGINE_ENV=""; return 0; }
+  ENGINE_BIN=$_engine_binary; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=$_engine_binary-int4
   ENGINE_ENV="GR8_PF_TILE=64 GR8_PF_DENSE=8192 GR8_PF_RS=1 GR8_PF_STREAMS=2 GR8_PF_ATTN_ROWS=${PF_ATTN_ROWS:-1024} GR8_PF_OWN=$PF_OWN \
 GR8_PF_BLAS_ROWS=1024 GR8_PF_HASH_GPU=1 GR8_PF_RSDIRECT=1 GR8_DEC_SPLIT=3 GR8_DEC_SHARED_SCRATCH=1 \
 GR8_CP=1 GR8_CP_R=$SHARE_LIMIT${SHARE_LIMIT_BUSY:+ GR8_CP_R2=$SHARE_LIMIT_BUSY}${SHARE_BIG:+ GR8_CP_R2_BIG=$SHARE_BIG} \
@@ -526,14 +541,14 @@ engine_args() {
   [ "$PF_OWN" = 3 ] && [ -z "${V2_DENSE:-}" ] && qo="--qo-manifest $ap/qo.manifest.json --qo-pack $ap/qo.pack"
   a="--manifest $rp/rank$r.manifest.json --pack $rp/rank$r.pack --image --layers all"
   [ -n "${V2_DENSE:-}" ] && a="--image --layers all"
-  if [ "${GR8_MODEL:-glm53}" = pseudo ]; then
+  if [ "$_engine_profile" = pseudo ]; then
     a="--model $V2_DENSE --cap $CAP --serve $home/s2 --s2-sessions $SESS --s2-epoch $epoch ${SET_ID:+--set-id $SET_ID}"
-    (set -f; echo $a)
+    (set -f; echo $a ${EXTRA_ARGS:-})
     return
   fi
   # a release only, SESS sessions (flash_defaults). --chunk 1: a prompt tail goes one row a step, and a session's rows
   # in a main step stay within its KDA state ring (MTP + 1)
-  if [ "${GR8_MODEL:-glm53}" = glm53f ]; then
+  if [ "$_engine_profile" = flash ]; then
     a="--image --layers all $src --top-p-cands 256 --chunk 1 --temp 0.7 --cap $CAP --graph --prefill 4096 \
 --pf-lanes 2 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
     [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
@@ -553,12 +568,13 @@ engine_args() {
   fi
   # DeepSeek-V4.1-Flash-1017: a release only, CHUNK rows a step for a prompt tail (8 unless set). No --prefill or --pf-lanes: the
   # DS41 serve path runs the prompt as decode steps and g6m4_ds41 refuses a prefill at parse time.
-  if [ "${GR8_MODEL:-glm53}" = ds41 ]; then
+  if [ "$_engine_profile" = ds41 ]; then
     a="--image --layers all $src --top-p-cands 256 --chunk $CHUNK --temp 0.7 --cap $CAP --graph \
 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
     [ "${EAGER:-0}" = 1 ] && a=${a/ --graph / }
     [ "${NOHASH:-0}" = 1 ] && a="$a --no-hash"
     [ "${REUSE:-0}" = 1 ] && a="$a --reuse-prefix"
+    a="$a ${EXTRA_ARGS:-}"
     [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
     (set -f; echo $a)
     return
@@ -583,7 +599,7 @@ engine_args() {
 --steering-model-revision $STEERING_MODEL_REVISION --steering-tokenizer-revision $STEERING_TOKENIZER_REVISION \
 --steering-chat-template-sha256 $STEERING_CHAT_TEMPLATE_SHA256 --steering-chat-template $STEERING_CHAT_TEMPLATE \
 --steering-weight-set ${STEERING_WEIGHT_SET:-$SET_ID} ${STEERING_FORCE:+--steering-force $STEERING_FORCE}"
-  [ "$TP" = 6 ] && a="$a ${EXTRA_ARGS:-}"
+  a="$a ${EXTRA_ARGS:-}"
 
   [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
   [ "${KV_FORMAT:-fp8}" = int4 ] && a="$a --kv-format int4"   # bin/g6m4-int4 (the supervisor picks it), which needs it
