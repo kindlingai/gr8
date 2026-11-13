@@ -1,6 +1,6 @@
 //! The Inkling-2-Small planner (src/ink2.rs): ownership rules, a miniature synthetic checkpoint planned at TP 1, 4
 //! and 6 and read back tensor by tensor against the checkpoint, the C interface, the reads map, and (when
-//! INK2_METADATA_DIR names a directory with the real checkpoint's config.json, hf_quant_config.json,
+//! GR8_TEST_INK2_METADATA_DIR names a directory with the real checkpoint's config.json, hf_quant_config.json,
 //! model.safetensors.index.json and _tensor_shapes.json) the full-size model planned from header-only sparse files.
 
 use g6load::ds41;
@@ -686,12 +686,12 @@ fn c_interface() {
 }
 
 /// The full-size checkpoint planned from its metadata alone: header-only sparse safetensors files with the real names,
-/// dtypes and shapes. Runs when INK2_METADATA_DIR names a directory holding config.json, hf_quant_config.json,
+/// dtypes and shapes. Runs when GR8_TEST_INK2_METADATA_DIR names a directory holding config.json, hf_quant_config.json,
 /// model.safetensors.index.json and _tensor_shapes.json (name -> {dtype, shape, file}); skipped otherwise.
 #[test]
 fn real_metadata_plans_every_tensor() {
-    let Ok(src) = std::env::var("INK2_METADATA_DIR") else {
-        eprintln!("real_metadata_plans_every_tensor: INK2_METADATA_DIR is not set, skipped");
+    let Some(src) = gr8knobs::TEST_INK2_METADATA_DIR.get() else {
+        eprintln!("real_metadata_plans_every_tensor: GR8_TEST_INK2_METADATA_DIR is not set, skipped");
         return;
     };
     let dir = std::env::temp_dir().join(format!("g6l-ink2-real-{}", std::process::id()));
