@@ -111,11 +111,13 @@ words to `EXTRA_ENV` (`"A=1 B=2"`, every rank).
 
 ### Q2a. Exact output, or the faster prefill?
 
-> "Do you want the exact model's output? The default reads prompts faster with the v2 prefill, but one of its parts
-> (the shared expert on the tensor cores) changes the output bits, so the same prompt can get a different reply."
+> "Do you want the exact model's output? The default reads prompts faster with the v2 prefill, but two of its parts
+> (the shared expert and the v2 BF16 projections on the tensor cores) change the output bits, so the same prompt can get
+> a different reply."
 
-- Default: the v2 prefill (the release stack: 12,288-row chunks, one prefill lane).
-  `GR8_DS_PF_V2_W16K=0` in `EXTRA_ENV` steps back to 8,192 rows; `EXACT=1` keeps the two-lane 4,096-row exact path.
+- Default: the v2 prefill (the release stack: 12,288-row chunks, one prefill lane, `GR8_DS_PF_V2_BF16_TC=7`).
+  `GR8_DS_PF_V2_BF16_TC=0` in `EXTRA_ENV` rolls back the v2 BF16 tensor-core projections; `GR8_DS_PF_V2_W16K=0` in
+  `EXTRA_ENV` steps back to 8,192 rows; `EXACT=1` keeps the two-lane 4,096-row exact path.
 - Exact output: `EXACT=1` in `cluster.env`. Prompts then run on the old prefill path (two lanes, 4,096-row chunks).
 - A 1M-token context with `GR8_DS_MHC_ROW_SHARD=1` in `EXTRA_ENV` also runs the old prefill path.
 

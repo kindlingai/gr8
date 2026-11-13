@@ -5,6 +5,7 @@
 #include "ds41_v2_timing.cuh"
 #include "../kernels/ds41_v2_moe.cuh"
 #include "../kernels/ds41_v2_fc2.cuh"
+#include "../kernels/ds41_v2_bf16_tc.cuh"
 #include "../knobs-rs/gr8_knobs.h"
 #include "../kernels/ds_ro_cfg.h"
 #include <vector>
@@ -100,18 +101,22 @@ inline cudaError_t prepare(Scratch& q, int capacity, bool allow_w16k = knob::ds_
     if(e==cudaSuccess)e=cudaFuncSetAttribute(mxtc::k_fc2_tc<I,H,DS41_TC_W2,DS41_TC_WT,DS41_TC_TPC,DS41_TC_ST2,COLUMN_GROUPS,ds41v2moe::Args>,cudaFuncAttributeMaxDynamicSharedMemorySize,S2);
     if(e==cudaSuccess && q.resident_fc2)e=cudaFuncSetAttribute(ds41v2moe::k_fc2_resident<I,H>,cudaFuncAttributeMaxDynamicSharedMemorySize,ds41v2moe::resident_smem<4,8,I>());
     if(e==cudaSuccess && q.gate_ro)e=cudaFuncSetAttribute(dsr::k_gate_logits_ro<NE>,cudaFuncAttributeMaxDynamicSharedMemorySize,dsr::GRO_SMEM);
+    if(e==cudaSuccess)e=::ds41v2tc::prepare();
     if(e!=cudaSuccess)release(q);
     return e;
 }
 // Input is only [g.owned][H], never full-row y. vflag, if present, is also own-row.
 template<int MCap> inline cudaError_t router_own_impl(const Geometry& g, const Layer& w, Scratch& q,
-                             const __nv_bfloat16* y, const uint8_t* vflag, int kc, cudaStream_t st, dsr::PlanMT<TK,MCap>* plan) {
+                             const __nv_bfloat16* y, const uint8_t* vflag, int kc, cudaStream_t st, dsr::PlanMT<TK,MCap>* plan, const State* trace = nullptr) {
     if (!supported(w) || g.M<1 || g.M>q.capacity || g.Q>q.own_capacity || kc<1 || kc>TK || (vflag&&!w.bias_vl)) return cudaErrorInvalidValue;
     cudaError_t e;
     if (g.owned) {
         // RO has no ROMAX-sized storage: it loops over 8-token tiles. The
         // existing capacity guard bounds owned rows (<=2048 at MAX_ROWS=8192).
-        if (q.gate_ro && NE == dsr::NEXP)
+        if (trace && trace->bf16_tc.gate(g.owned) &&
+            ::ds41v2tc::can_launch_f32(y, H, w.gate, NE, H, q.logits, NE, g.owned)) {
+            if ((e = ::ds41v2tc::launch_gemm_f32(y, H, w.gate, NE, H, q.logits, NE, g.owned, st)) != cudaSuccess) return e;
+        } else if (q.gate_ro && NE == dsr::NEXP)
             dsr::k_gate_logits_ro<NE><<<NE/8,256,dsr::GRO_SMEM,st>>>(w.gate,y,g.owned,q.logits);
         else
             dsr::k_gate_logits_mt<NE,0><<<NE/8,256,0,st>>>(w.gate,y,g.owned,q.logits);
@@ -127,9 +132,9 @@ template<int MCap> inline cudaError_t router_own_impl(const Geometry& g, const L
     ds41v2moe::k_export_routes<TK,MCap><<<(g.Q*TK+255)/256,256,0,st>>>(plan,g.owned,g.Q,q.own_idx,q.own_wt);
     return cudaGetLastError();
 }
-inline cudaError_t router_own(const Geometry& g,const Layer& w,Scratch& q,const __nv_bfloat16* y,const uint8_t* vflag,int kc,cudaStream_t st) {
-    return q.plan16k ? router_own_impl<MM_W16K>(g,w,q,y,vflag,kc,st,q.plan16k)
-                    : router_own_impl<MM>(g,w,q,y,vflag,kc,st,q.plan);
+inline cudaError_t router_own(const Geometry& g,const Layer& w,Scratch& q,const __nv_bfloat16* y,const uint8_t* vflag,int kc,cudaStream_t st,const State* trace = nullptr) {
+    return q.plan16k ? router_own_impl<MM_W16K>(g,w,q,y,vflag,kc,st,q.plan16k,trace)
+                    : router_own_impl<MM>(g,w,q,y,vflag,kc,st,q.plan,trace);
 }
 template<int MCap> inline ds41v2moe::Args args_impl(const Layer& w, Scratch& q, int M,dsr::PlanMT<TK,MCap>* plan) {
     ds41v2moe::Args a{};
@@ -197,7 +202,7 @@ __global__ void k_assemble(const __nv_bfloat16* a,const __nv_bfloat16* b,const _
 inline cudaError_t run(State& s,const Layer& w,Scratch& q,int kc=TK,const uint8_t* own_vflag=nullptr) {
     if(s.g.nr!=4 || !s.ffn_out || !s.y || !supported(w))return cudaErrorInvalidValue;
     TimingDetailSpan dispatch(s,TimingStage::Dispatch,s.st);
-    cudaError_t e=router_own(s.g,w,q,s.y,own_vflag,kc,s.st);
+    cudaError_t e=router_own(s.g,w,q,s.y,own_vflag,kc,s.st,&s);
     if(e!=cudaSuccess)return e;
     const Segment seg[]={{q.own_q,q.all_q,H},{q.own_s,q.all_s,H/32},{q.own_idx,q.all_idx,TK*sizeof(int)},{q.own_wt,q.all_wt,TK*sizeof(float)}};
     const bool ffn_opt=s.send_ffn_opt.ffn_opt();
