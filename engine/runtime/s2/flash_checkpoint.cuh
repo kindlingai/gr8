@@ -106,11 +106,6 @@ struct FlashStateView {
         return v;
     }
     size_t state_bytes() const { return (size_t)layers * (s_slot + c_slot) * 4 + rings.size() * ring_bytes; }
-    size_t page_bytes() const {
-        size_t n = 0;
-        for (const auto& b : bindings) n += (b.mla_page16 + (b.idx ? b.idx_page16 : 0)) * 16;
-        return n;
-    }
 };
 
 // a checkpoint store on a group lease (--kv-store ...,group=): every rank of the cluster gives the same group, ranks,
@@ -275,8 +270,13 @@ public:
                      const std::string& compat, const FlashGroup* group = nullptr, const std::string& index_path = {},
                      int batch = 32) : v_(std::move(v)), batch_(batch), files_(index_path) {
         if (v_.bindings.empty() || !v_.S || !v_.conv || v_.layers <= 0 || v_.slots <= 0 || v_.pool_pages <= 0) throw std::runtime_error("Flash checkpoint: no state to keep");
-        block_ = v_.page_bytes();
-        slot_ = (block_ + 4095) / 4096 * 4096;
+        // the page block's sizes, as the pool's stores take theirs (kvman-rs src/layout.rs)
+        std::vector<g6kv_binding> lay;
+        for (const auto& b : v_.bindings) lay.push_back({uint32_t(b.mla_page16 * 16), b.idx ? uint32_t(b.idx_page16 * 16) : 0u, uint32_t(b.cp != 0)});
+        g6kv_layout s{};
+        std::vector<uint64_t> off(lay.size());
+        g6kv_layout_sizes(lay.data(), lay.size(), &s, off.data(), nullptr);
+        block_ = s.block; slot_ = s.slot;
         state_blocks_ = (v_.state_bytes() + slot_ - 1) / slot_;
         uint64_t n = bytes / slot_;
         if (n < 2 + state_blocks_) throw std::runtime_error("Flash checkpoint store " + spec + " smaller than one entry's state");
@@ -289,9 +289,7 @@ public:
         if (g6kv_tier_block_bytes(t_) != slot_) throw std::runtime_error("Flash checkpoint store block size differs from the page block's");
         index_ = FlashIndex(n);
         compat_ = fnv64(compat.data(), compat.size());
-        std::vector<unsigned long long> off;
-        size_t o = 0;
-        for (const auto& b : v_.bindings) { off.push_back(o / 16); o += (b.mla_page16 + (b.idx ? b.idx_page16 : 0)) * 16; }
+        for (uint64_t& o : off) o /= 16;   // k_pages counts in 16-byte units
         fck::ck(cudaMalloc(&d_bind_, v_.bindings.size() * sizeof(fck::Binding)), "alloc");
         fck::ck(cudaMemcpy(d_bind_, v_.bindings.data(), v_.bindings.size() * sizeof(fck::Binding), cudaMemcpyHostToDevice), "alloc");
         fck::ck(cudaMalloc(&d_off_, off.size() * 8), "alloc");
@@ -303,7 +301,7 @@ public:
         fck::ck(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_dev_), host_, 0), "alloc");
         tk(g6kv_tier_register(t_, host_, slot_ * batch_), "register");
         layout_.slot = slot_; layout_.state_bytes = v_.state_bytes();
-        for (const auto& b : v_.bindings) layout_.parts.push_back({size_t(b.mla_page16) * 16, b.idx ? size_t(b.idx_page16) * 16 : 0});
+        for (const g6kv_binding& b : lay) layout_.parts.push_back({size_t(b.latent), size_t(b.index)});
         persist_ = files_.on();
         if (files_.on()) {
             uint64_t stale = 0;

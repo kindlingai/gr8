@@ -5,7 +5,9 @@
 //! queue depth (one thread per outstanding read, synchronous pread), and 64 KiB random reads for scale. Every access is
 //! O_DIRECT on Linux. The file is deleted at the end unless --keep.
 
-use g6kvman::tier::{par_for, AlignedBuf, SlotFile, ALIGN, PAGE_SLOT};
+mod glm53;
+
+use g6kvman::tier::{par_for, AlignedBuf, SlotFile, ALIGN};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -66,25 +68,26 @@ fn gbs(bytes: u64, t: Duration) -> f64 {
 }
 
 fn run(path: &Path, gb: f64, threads: &[usize], qds: &[usize], dur: Duration) -> std::io::Result<()> {
-    let slots = (gb * 1e9) as u64 / PAGE_SLOT as u64;
-    let f = SlotFile::create(path, PAGE_SLOT, slots, true)?;
+    let page_slot = glm53::page_slot(glm53::MLA_ROW);
+    let slots = (gb * 1e9) as u64 / page_slot as u64;
+    let f = SlotFile::create(path, page_slot, slots, true)?;
     println!(
         "file {} : {} page-block slots of {} B ({:.2} GB), O_DIRECT {}",
         path.display(),
         slots,
-        PAGE_SLOT,
-        (slots * PAGE_SLOT as u64) as f64 / 1e9,
+        page_slot,
+        (slots * page_slot as u64) as f64 / 1e9,
         f.direct()
     );
     let tmax = threads.iter().copied().max().unwrap_or(8);
-    let bufs: Vec<Mutex<AlignedBuf>> = (0..tmax.max(1)).map(|_| Mutex::new(AlignedBuf::new(PAGE_SLOT))).collect();
+    let bufs: Vec<Mutex<AlignedBuf>> = (0..tmax.max(1)).map(|_| Mutex::new(AlignedBuf::new(page_slot))).collect();
     for (i, b) in bufs.iter().enumerate() {
         b.lock().unwrap().as_mut_slice().iter_mut().enumerate().for_each(|(j, x)| *x = (i * 131 + j) as u8);
     }
     // fill the whole file once, so later reads hit written blocks
     let t0 = Instant::now();
     par_for(tmax, slots as usize, |w, i| f.write(i as u64, bufs[w].lock().unwrap().as_slice()))?;
-    println!("fill  {tmax:>3} threads  {:>6.2} GB/s", gbs(slots * PAGE_SLOT as u64, t0.elapsed()));
+    println!("fill  {tmax:>3} threads  {:>6.2} GB/s", gbs(slots * page_slot as u64, t0.elapsed()));
     let mut shuffled: Vec<u64> = (0..slots).collect();
     let mut rng = Rng(1);
     for i in (1..shuffled.len()).rev() {
@@ -106,7 +109,7 @@ fn run(path: &Path, gb: f64, threads: &[usize], qds: &[usize], dur: Duration) ->
                         f.read(order[i], b.as_mut_slice())
                     }
                 })?;
-                row.push(gbs(slots * PAGE_SLOT as u64, t0.elapsed()));
+                row.push(gbs(slots * page_slot as u64, t0.elapsed()));
             }
         }
         println!("{t:>8} {:>10.2} {:>10.2} {:>10.2} {:>10.2}", row[0], row[1], row[2], row[3]);

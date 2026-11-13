@@ -196,6 +196,23 @@ size_t g6kv_tier_coldest(g6kv_pool* p, uint32_t t, uint64_t per_seg, uint64_t* o
 // keeps the entries the agreed text lists (the head's intersection of every rank's summary), in its order
 void g6kv_keep_agreed(g6kv_pool* p, const char* agreed);
 
+// A page block's layout (src/layout.rs): one pool page of every binding, main model then draft. Per binding, the bytes
+// of one page of its latent cache and of its indexer keys (0: none), and whether it is sharded past R (CP).
+struct g6kv_binding
+{
+    uint32_t latent, index, cp;
+};
+// block = every binding's page; slot = the block as a store keeps it (rounded up to 4 KiB); rep = a logical page's
+// replicated record past R (the bindings that are not CP), per_slot of them to a slot (0: no binding is CP)
+struct g6kv_layout
+{
+    uint64_t block, slot, rep;
+    uint32_t per_slot;
+};
+// *out = the sizes of n bindings. off, rep: NULL, or n words for each binding's offset in a page block and in a
+// replicated record.
+void g6kv_layout_sizes(const g6kv_binding* b, size_t n, g6kv_layout* out, uint64_t* off, uint64_t* rep);
+
 // A block store for those copies (src/blocks.rs): "ssd:PATH", "remote:HOST:PORT" (a lease named `name` on a KV node,
 // kvman-remote) or "mem:", any of them behind "ram:FLOOR+" (a RAM cache the kernel may take back, src/ram.rs).
 // Blocks are block_bytes rounded up to 4 KiB (g6kv_tier_block_bytes), and every read and write moves one whole block.
