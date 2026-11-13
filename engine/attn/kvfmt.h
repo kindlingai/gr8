@@ -28,6 +28,16 @@ constexpr int ROW = 288, IDX_ROW = 68, PAGE = 64;   // bytes of one ca row / one
 constexpr int CA_CODES = 256, CA_SF_OFF = 256, ICA_CODES = 64, ICA_SF = 4;
 constexpr int CA_PAGE_R2 = 32 * ROW, ICA_PAGE_R2 = 32 * IDX_ROW, CA_PAGE_R1 = 64 * ROW, ICA_PAGE_R1 = 64 * IDX_ROW;   // 9216, 2176, 18432, 4352
 constexpr const char* NAME = "ds41-fp4";
+#elif G6_MODEL_INK2
+// Inkling-2-Small (attn/ink2_attn.h): a full-attention layer's row on one rank is the K heads then the V heads the
+// rank's query heads read, BF16, after the K / V short convolution: 2 x nh_kv x 128 x 2 B = 1024 B at TP4 and TP6
+// (2 K / V heads a rank), 4096 B at TP1. Only the 8 full-attention layers own paged rows; the 40 sliding-window
+// layers keep a 1024-token ring each, outside the pool. No index rows.
+#ifndef G6_NR
+#define G6_NR 6
+#endif
+constexpr int ROW = 2 * geom::nh_kv(G6_NR, 0) * geom::HEAD_DIM * 2, IDX_ROW = 0, PAGE = geom::KV_PAGE;
+constexpr const char* NAME = "bf16gqa";
 #elif G6_MODEL_FLASH
 // GLM 5.3 Flash (attn/flash_attn.cu): NoPE MLA, the 512-d latent only (kv_a_layernorm applied), selected by G6_KV4
 // (the int4 engine, `--kv-format int4`) and otherwise by G6_FLASH_KV_FP8 (default 0):
@@ -77,7 +87,7 @@ constexpr const char* NAME = "int4g32h";
 constexpr int ROW = 528 + 2 * geom::QK_ROPE, SCALE_OFF = 512, ROPE_OFF = 528;
 constexpr const char* NAME = "fp8";
 #endif
-#if !G6_MODEL_FLASH && !G6_MODEL_DS41
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41 && !G6_MODEL_INK2
 constexpr int IDX_ROW = 132;
 #endif
 // both latent rows by name, whatever the build's row is, for code that converts one to the other (the remote rows

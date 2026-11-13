@@ -1,5 +1,5 @@
 // module_info.h: the build's description matches its constants, and each model has its capabilities. Built once per
-// model flag (none, -DG6_MODEL_FLASH=1, -DG6_MODEL_DS41=1) by scripts/host_tests.sh. Host only.
+// model flag (none, -DG6_MODEL_FLASH=1, -DG6_MODEL_DS41=1, -DG6_MODEL_INK2=1) by scripts/host_tests.sh. Host only.
 #include "../../module_info.h"
 #include "../s2/prompt_rule.h"
 #include "../s2/scheduler.h"
@@ -37,6 +37,11 @@ int main()
     CHECK(m.model == G6_MODEL_ID_DS41 && std::strcmp(m.name, "ds41") == 0 && m.max_sessions == 32 && m.mtp_layers == 3);
     CHECK(m.ds_markov_maxs == 8 && m.ds_block == g6s2::Ds41RoundLogic::BLOCK);
     CHECK(m.caps == (G6_CAP_MTP0 | G6_CAP_PACK | G6_CAP_PARK | G6_CAP_PROMPT_DECODE | G6_CAP_DSPARK | G6_CAP_KV_STORE));
+#elif G6_MODEL_INK2
+    CHECK(m.model == G6_MODEL_ID_INK2 && std::strcmp(m.name, "ink2") == 0 && m.max_sessions == 8 && m.mtp_layers == 5);
+    CHECK(m.ds_markov_maxs == 0 && m.ds_block == 0);
+    CHECK(m.caps == (G6_CAP_MTP0 | G6_CAP_KV_STORE));
+    CHECK(m.kv_row_bytes == (G6_NR == 1 ? 4096 : 1024) && std::strcmp(m.kv_format, "bf16gqa") == 0);
 #elif G6_MODEL_FLASH
     CHECK(m.model == G6_MODEL_ID_GLM53F && std::strcmp(m.name, "glm-5.3-flash") == 0 && m.max_sessions == 8);
     CHECK(m.ds_markov_maxs == 0 && m.ds_block == 0);

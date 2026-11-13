@@ -779,6 +779,23 @@ pub unsafe extern "C" fn g6l_ink2_plan(model_dir: *const c_char, nr: u32, rank: 
     let arg = |p, what| crate::cstr(p).ok_or(format!("g6l_ink2_plan: no {what}"));
     let r = (|| {
         let dir = arg(model_dir, "model dir")?;
+        let d = dir.trim_end_matches('/');
+        let (mpath, ppath) = (format!("{d}/tp{nr}.rank{rank}.manifest.json"), format!("{d}/tp{nr}.rank{rank}.pack"));
+        if std::path::Path::new(&mpath).is_file() && std::path::Path::new(&ppath).is_file() {
+            let manifest = std::fs::read_to_string(&mpath).map_err(|e| format!("{mpath}: {e}"))?;
+            let j = json::parse(&manifest).map_err(|e| format!("{mpath}: {e}"))?;
+            let bytes = j.get("pack_bytes").and_then(Json::int).filter(|&v| v > 0)
+                .ok_or_else(|| format!("{mpath}: no pack_bytes"))? as u64;
+            let flen = std::fs::metadata(&ppath).map_err(|e| format!("{ppath}: {e}"))?.len();
+            if flen != bytes {
+                return Err(format!("{ppath}: file is {flen} bytes, manifest says {bytes}"));
+            }
+            let out = arg(out_manifest, "output manifest")?;
+            std::fs::write(&out, &manifest).map_err(|e| format!("{out}: {e}"))?;
+            let segs = vec![Seg { pack_off: 0, nbytes: bytes, op: Op::Copy, file: 0, file_off: 0 }];
+            let plan = Plan::from_segs(vec![ppath], segs, Vec::new(), Vec::new(), bytes)?;
+            return Ok::<_, String>(V2Image { rank: rank as usize, tensors: Vec::new(), bytes, plan, cache: None });
+        }
         let p = plan(&dir, nr as usize, rank as usize, &Opts::default())?;
         let out = arg(out_manifest, "output manifest")?;
         let zeros = vec!["0".repeat(64); p.img.tensors.len()];

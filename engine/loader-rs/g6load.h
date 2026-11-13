@@ -51,6 +51,9 @@ void* g6l_v2_plan(const char* base_manifest, const char* base_pack, const char* 
 void* g6l_release_plan(const char* dense_dir, const char* v2_dir, const char* slices_dir, const char* widths, uint32_t nr,
                        uint32_t rank, int qo, int trellis, const char* layout, const char* out_manifest, char* err,
                        size_t errlen);
+// Plans rank `rank` of `nr` of an Inkling-2-Small checkpoint directory (config.json + its safetensors shards) as a
+// g6pack-v1 image and writes that image's manifest to out_manifest. NULL with a message in err when the plan fails.
+void* g6l_ink2_plan(const char* model_dir, uint32_t nr, uint32_t rank, const char* out_manifest, char* err, size_t errlen);
 // Fills dst with image bytes off .. off + n of a planned image, without a sink (one tensor at a time, for m4sim).
 // Returns 0, or 1 with a message in err.
 int g6l_plan_read(void* plan, uint64_t off, uint64_t n, void* dst, char* err, size_t errlen);

@@ -348,6 +348,8 @@ bool Pack::open_manifest(const std::string& path, std::string& err)
             else if (xf->s == "exlr8-e4m3-mul1") e.expert_format = 2;
             else if (xf->s == "exlr8-e4m3-pmcgx") e.expert_format = 3;
             else if (xf->s == "exlr8-e4m3-unchecked") e.expert_format = 4;   // the planner found no width file to read
+            else if (xf->s == "nv4g") e.expert_format = 5;    // NVFP4 records, 64-wide groups (loader-rs ink2.rs)
+            else if (xf->s == "mxfp8") e.expert_format = 6;   // MXFP8 records (loader-rs ink2.rs)
             else { err = e.name + ": unknown expert_format " + xf->s; return false; }
         }
         if (!dtype_of(dt->s, e.dtype)) { err = e.name + ": unknown dtype " + dt->s; return false; }

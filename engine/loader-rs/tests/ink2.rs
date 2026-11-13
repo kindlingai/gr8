@@ -683,6 +683,30 @@ fn c_interface() {
     assert!(h.is_null());
     let msg = unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }.to_string_lossy().into_owned();
     assert!(msg.contains("rank 9"), "{msg}");
+
+    // pre-rendered tp<nr>.rank<rank>.{manifest.json,pack}: loads without safetensors shards
+    let h = unsafe { ink2::g6l_ink2_plan(dir.as_ptr(), 6, 4, out.as_ptr(), err.as_mut_ptr(), err.len()) };
+    assert!(!h.is_null());
+    let mut whole = vec![0u8; p.img.bytes as usize];
+    assert_eq!(unsafe { g6load::g6l_plan_read(h, 0, p.img.bytes, whole.as_mut_ptr() as *mut _, err.as_mut_ptr(), err.len()) }, 0);
+    unsafe { g6load::g6l_plan_free(h) };
+    let pre = format!("{}/prerendered", m.dir);
+    std::fs::create_dir_all(&pre).unwrap();
+    let man_bytes = std::fs::read(out.to_str().unwrap()).unwrap();
+    std::fs::write(format!("{pre}/tp6.rank4.manifest.json"), &man_bytes).unwrap();
+    std::fs::write(format!("{pre}/tp6.rank4.pack"), &whole).unwrap();
+    let cpre = CString::new(pre.clone()).unwrap();
+    let cout2 = CString::new(format!("{pre}/out.manifest.json")).unwrap();
+    let hp = unsafe { ink2::g6l_ink2_plan(cpre.as_ptr(), 6, 4, cout2.as_ptr(), err.as_mut_ptr(), err.len()) };
+    assert!(!hp.is_null());
+    assert_eq!(std::fs::read(cout2.to_str().unwrap()).unwrap(), man_bytes);
+    let mut got = vec![0xAAu8; p.img.bytes as usize];
+    assert_eq!(unsafe { g6load::g6l_plan_read(hp, 0, p.img.bytes, got.as_mut_ptr() as *mut _, err.as_mut_ptr(), err.len()) }, 0);
+    assert_eq!(got, whole);
+    unsafe { g6load::g6l_plan_free(hp) };
+    std::fs::write(format!("{pre}/tp6.rank4.pack"), &whole[..64]).unwrap();
+    let bad = unsafe { ink2::g6l_ink2_plan(cpre.as_ptr(), 6, 4, cout2.as_ptr(), err.as_mut_ptr(), err.len()) };
+    assert!(bad.is_null());
 }
 
 /// The full-size checkpoint planned from its metadata alone: header-only sparse safetensors files with the real names,
