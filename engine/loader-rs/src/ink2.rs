@@ -4,7 +4,7 @@
 //!
 //! Tensor-parallel split over `nr` ranks (rank r):
 //!   attention heads   q heads r * H/nr .. (r + 1) * H/nr; the contiguous KV heads those q heads read (head_ranges)
-//!   intermediate dim  inter_slice of every expert: gate rows and up rows of w13 separately, columns of w2
+//!   intermediate dim  inter_slice of every expert: row pairs (gate, up) of w13, columns of w2
 //!   vocabulary        padded to a multiple of 128 * nr, split in equal row ranges (rows past the vocabulary are zero)
 //!   everything else   replicated
 //! Routed experts become decode record streams: NVFP4 layers `nv4g` (src/nvfp4.rs), MXFP8 layers `mxfp8`
@@ -466,16 +466,25 @@ impl Planner<'_> {
         let iw = isl.len();
         let (rec, xf) = if nv { (nvfp4::NV4_GR, "nv4g") } else { (528, "mxfp8") };
         let (per1, per2) = (iw / 16 * (h / kg) * 2 * rec, h / 16 * (iw / kg) * rec);
-        // fc1: gate rows isl and up rows inter + isl of each expert's [2 inter][hidden]
+        // fc1: interleaved row pairs (gate, up) for rows isl of each expert's [2 inter][hidden]
         let (crow, srow) = (cb(h), sb(h));
         let i0 = isl.start;
-        let at = move |e: usize, half: usize, row_bytes: usize| ((e * 2 * i_full + half * i_full + i0) * row_bytes) as u64;
+        let at = move |e: usize, row_bytes: usize| ((e * 2 * i_full + 2 * i0) * row_bytes) as u64;
         for e in 0..e_n {
-            for half in 0..2 {
-                self.note(&w13, [(at(e, half, crow), (iw * crow) as u64)]);
-                self.note(&w13s, [(at(e, half, srow), (iw * srow) as u64)]);
-            }
+            self.note(&w13, [(at(e, crow), (2 * iw * crow) as u64)]);
+            self.note(&w13s, [(at(e, srow), (2 * iw * srow) as u64)]);
         }
+        let deinterleave = move |pair_rows: &[u8], row_bytes: usize| -> (Vec<u8>, Vec<u8>) {
+            let (mut g, mut u) = (Vec::with_capacity(iw * row_bytes), Vec::with_capacity(iw * row_bytes));
+            for (k, row) in pair_rows.chunks_exact(row_bytes).enumerate() {
+                if k % 2 == 0 {
+                    g.extend_from_slice(row);
+                } else {
+                    u.extend_from_slice(row);
+                }
+            }
+            (g, u)
+        };
         let mut stripes: Vec<(u64, Make)> = Vec::new();
         for e0 in (0..e_n).step_by(EXP_GROUP) {
             let ne = EXP_GROUP.min(e_n - e0);
@@ -483,8 +492,8 @@ impl Planner<'_> {
             stripes.push(((ne * per1) as u64, Box::new(move || {
                 let mut out = Vec::with_capacity(ne * per1);
                 for e in e0..e0 + ne {
-                    let (gc, uc) = (c.read(at(e, 0, crow), (iw * crow) as u64)?, c.read(at(e, 1, crow), (iw * crow) as u64)?);
-                    let (gs, us) = (s.read(at(e, 0, srow), (iw * srow) as u64)?, s.read(at(e, 1, srow), (iw * srow) as u64)?);
+                    let (gc, uc) = deinterleave(&c.read(at(e, crow), (2 * iw * crow) as u64)?, crow);
+                    let (gs, us) = deinterleave(&s.read(at(e, srow), (2 * iw * srow) as u64)?, srow);
                     out.extend_from_slice(&if nv { nvfp4::nvfp4_fc1(&gc, &gs, &uc, &us, iw, h) } else { records::mxfp8_fc1(&gc, &gs, &uc, &us, iw, h) });
                 }
                 Ok(out)
@@ -779,6 +788,23 @@ pub unsafe extern "C" fn g6l_ink2_plan(model_dir: *const c_char, nr: u32, rank: 
     let arg = |p, what| crate::cstr(p).ok_or(format!("g6l_ink2_plan: no {what}"));
     let r = (|| {
         let dir = arg(model_dir, "model dir")?;
+        let d = dir.trim_end_matches('/');
+        let (mpath, ppath) = (format!("{d}/tp{nr}.rank{rank}.manifest.json"), format!("{d}/tp{nr}.rank{rank}.pack"));
+        if std::path::Path::new(&mpath).is_file() && std::path::Path::new(&ppath).is_file() {
+            let manifest = std::fs::read_to_string(&mpath).map_err(|e| format!("{mpath}: {e}"))?;
+            let j = json::parse(&manifest).map_err(|e| format!("{mpath}: {e}"))?;
+            let bytes = j.get("pack_bytes").and_then(Json::int).filter(|&v| v > 0)
+                .ok_or_else(|| format!("{mpath}: no pack_bytes"))? as u64;
+            let flen = std::fs::metadata(&ppath).map_err(|e| format!("{ppath}: {e}"))?.len();
+            if flen != bytes {
+                return Err(format!("{ppath}: file is {flen} bytes, manifest says {bytes}"));
+            }
+            let out = arg(out_manifest, "output manifest")?;
+            std::fs::write(&out, &manifest).map_err(|e| format!("{out}: {e}"))?;
+            let segs = vec![Seg { pack_off: 0, nbytes: bytes, op: Op::Copy, file: 0, file_off: 0 }];
+            let plan = Plan::from_segs(vec![ppath], segs, Vec::new(), Vec::new(), bytes)?;
+            return Ok::<_, String>(V2Image { rank: rank as usize, tensors: Vec::new(), bytes, plan, cache: None });
+        }
         let p = plan(&dir, nr as usize, rank as usize, &Opts::default())?;
         let out = arg(out_manifest, "output manifest")?;
         let zeros = vec!["0".repeat(64); p.img.tensors.len()];

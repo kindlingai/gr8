@@ -1307,6 +1307,59 @@ static void test_core_long()
         check_bits("local: commit of 2 of 3 rows", to_host(s.ring, ring.size()).data(), ring2.data(), ring.size() * 2);
         wk.release();
     }
+    // grouped global core vs scalar core: hd = 128, TP=6 rank-0 uneven GQA (gq = 6 and 2), two slots and span boundary 255..260 + 4090..4105
+    {
+        ink2::AttnGeom gg;
+        gg.H = 128;
+        gg.hd = 128;
+        gg.rel_dim = 16;
+        gg.rel_win = 1024;
+        gg.gqa = 6;
+        gg.nh_q = 8;
+        gg.q0 = 0;
+        gg.nh_kv = 2;
+        gg.kv0 = 0;
+        gg.window = 1024;
+        gg.log_scale_base = 4096;
+        gg.global = true;
+        const int Mg = 22, nk2 = gg.nh_kv * gg.hd, nq2 = gg.nh_q * gg.hd;
+        const int slots = 2, pps = 4200 / ink2::KV_PAGE_TOKENS + 2, total = slots * pps;
+        const size_t page_cells = 2 * static_cast<size_t>(ink2::KV_PAGE_TOKENS) * nk2;
+        const std::vector<uint16_t> pages = cells(r.bf(static_cast<size_t>(total) * page_cells, 1.0f));
+        std::vector<int> table(static_cast<size_t>(total));
+        for (int i = 0; i < total; ++i) table[i] = (i * 5 + 1) % total;
+        ink2::RowsHost rh;
+        rh.add(0, 254, 6);     // crosses 255 -> 256 (ns = 1 and ns = 2 in the same CTA)
+        rh.add(1, 4090, 16);   // second slot, crosses page boundary 4095 -> 4096, total 22 rows * 6 = 132 > 4 * GRP_Q
+        DevRows gr;
+        gr.alloc(Mg);
+        gr.set(rh);
+        const int smax = ink2::attn_splits(true, gg.window, rh.max_pos);
+        const uint16_t* q_raw = to_dev(cells(r.bf(static_cast<size_t>(Mg) * nq2, 1.0f)));
+        const uint16_t* r_raw = to_dev(cells(r.bf(static_cast<size_t>(Mg) * gg.nh_q * gg.rel_dim, 1.0f)));
+        const uint16_t* gate2 = to_dev(cells(r.bf(static_cast<size_t>(Mg) * nq2, 1.0f)));
+        const uint16_t* sink2 = to_dev(cells(r.bf(static_cast<size_t>(Mg) * gg.nh_q, 1.0f)));
+        const uint16_t* qc2 = to_dev(cells(r.bf(nq2, 0.5f, 1.0f)));
+        const uint16_t* rc2 = to_dev(cells(r.bf(static_cast<size_t>(gg.nh_q) * gg.rel_dim, 0.5f, 1.0f)));
+        const uint16_t* rp2 = to_dev(cells(r.bf(static_cast<size_t>(gg.rel_dim) * gg.rel_win, 0.3f)));
+        uint16_t* og_ref = dev_alloc<uint16_t>(static_cast<size_t>(Mg) * nq2);
+        uint16_t* og_grp = dev_alloc<uint16_t>(static_cast<size_t>(Mg) * nq2);
+        float* part_buf = dev_alloc<float>(static_cast<size_t>(Mg) * gg.nh_q * smax * (gg.hd + 2));
+        ink2::AttnCoreArgs ca{q_raw, r_raw, gate2, sink2, qc2, rc2, rp2, nullptr, nullptr, to_dev(pages), to_dev(table),
+                              gr.view(), og_ref, part_buf, 0, Mg, gg.nh_q, gg.q0, gg.gqa, gg.kv0, nk2, gg.hd,
+                              gg.rel_dim, gg.rel_win, gg.window, gg.log_scale_base, 1, pps, smax};
+        ink2::k_ink2_attn_core<<<dim3(Mg * gg.nh_q, smax), ink2::ACT>>>(ca);
+        ink2::k_ink2_attn_merge<<<Mg * gg.nh_q, ink2::ACT>>>(ca);
+        CK(cudaMemset(part_buf, 0xff, static_cast<size_t>(Mg) * gg.nh_q * smax * (gg.hd + 2) * sizeof(float)));
+        ca.og = og_grp;
+        const int max_ngrp = (Mg * 6 + ink2::GRP_Q - 1) / ink2::GRP_Q;
+        ink2::k_ink2_attn_global_grp<<<dim3(max_ngrp, smax, gg.nh_kv), ink2::ACT>>>(ca);
+        ink2::k_ink2_attn_merge<<<Mg * gg.nh_q, ink2::ACT>>>(ca);
+        check_bits("global grouped core == scalar core (hd 128, TP=6 GQA, 2 slots, 255/256 + 4096)",
+                   to_host(og_grp, static_cast<size_t>(Mg) * nq2).data(),
+                   to_host(og_ref, static_cast<size_t>(Mg) * nq2).data(),
+                   static_cast<size_t>(Mg) * nq2 * 2);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------- part 2: the model

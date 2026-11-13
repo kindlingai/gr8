@@ -7,6 +7,7 @@ pub const MODULE_ABI: u32 = 3;
 pub const MODEL_GLM53: u32 = 1;
 pub const MODEL_GLM53F: u32 = 2;
 pub const MODEL_DS41: u32 = 3;
+pub const MODEL_INK2: u32 = 4;
 pub const CAP_KV_STORE: u32 = 1 << 9;
 
 #[repr(C)]

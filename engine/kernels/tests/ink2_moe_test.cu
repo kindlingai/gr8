@@ -570,7 +570,7 @@ static std::vector<float> outer_scales(Checkpoint& ck, const std::string& w, int
     return v;
 }
 
-// Layer l of the checkpoint, the first Is intermediate rows (gate rows 0 .., up rows I_full .., fc2 columns 0 ..).
+// Layer l of the checkpoint, the first Is intermediate rows (interleaved (gate, up) rows 0 .. 2*Is, fc2 columns 0 ..).
 static void checkpoint_layer(Checkpoint& ck, int l, int Is, int TK)
 {
     const std::string pre = "layers." + std::to_string(l) + ".mlp.";
@@ -590,14 +590,19 @@ static void checkpoint_layer(Checkpoint& ck, int l, int Is, int TK)
     ink2ref::Weights w;
     w.layers.resize(1);
     ink2ref::Layer& L = w.layers[0];
-    std::vector<uint8_t> gc(Is * cb), gs(Is * sb), uc(Is * cb), us(Is * sb), dc(H * cb2), ds(H * sb2);
+    std::vector<uint8_t> rc(2 * Is * cb), rs(2 * Is * sb), gc(Is * cb), gs(Is * sb), uc(Is * cb), us(Is * sb), dc(H * cb2), ds(H * sb2);
     for (int e = 0; e < NE; ++e)
     {
         const u64 r0 = static_cast<u64>(e) * 2 * If;
-        w13.read(r0 * cb, gc.size(), gc.data());
-        w13.read((r0 + If) * cb, uc.size(), uc.data());
-        w13s.read(r0 * sb, gs.size(), gs.data());
-        w13s.read((r0 + If) * sb, us.size(), us.data());
+        w13.read(r0 * cb, rc.size(), rc.data());
+        w13s.read(r0 * sb, rs.size(), rs.data());
+        for (int i = 0; i < Is; ++i)
+        {
+            std::memcpy(gc.data() + static_cast<size_t>(i) * cb, rc.data() + static_cast<size_t>(2 * i) * cb, cb);
+            std::memcpy(uc.data() + static_cast<size_t>(i) * cb, rc.data() + static_cast<size_t>(2 * i + 1) * cb, cb);
+            std::memcpy(gs.data() + static_cast<size_t>(i) * sb, rs.data() + static_cast<size_t>(2 * i) * sb, sb);
+            std::memcpy(us.data() + static_cast<size_t>(i) * sb, rs.data() + static_cast<size_t>(2 * i + 1) * sb, sb);
+        }
         w2.read(static_cast<u64>(e) * H * cb2, dc.size(), dc.data());
         w2s.read(static_cast<u64>(e) * H * sb2, ds.size(), ds.data());
         const std::vector<uint8_t> r1 = nv ? nv4pack::pack_fc1(gc.data(), gs.data(), uc.data(), us.data(), Is, H)

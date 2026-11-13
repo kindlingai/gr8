@@ -103,7 +103,8 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime
 "$T/planner_facade_test"
 # the build's description (module_info.h) in each model's shape
 # (the serving shapes: build_m4.sh's -DDEC_S2 and widths, DS41 at 48 rows; and a TP6 build's defaults)
-for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48"; do
+for f in "" "-DDEC_S2 -DG6_NR=4" "-DG6_MODEL_FLASH=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_DS41=1 -DDEC_S2 -DG6_NR=4 -DG6_MX=48" \
+         "-DG6_MODEL_INK2=1 -DDEC_S2 -DG6_NR=4" "-DG6_MODEL_INK2=1 -DDEC_S2 -DG6_NR=6" "-DG6_MODEL_INK2=1 -DDEC_S2 -DG6_NR=1"; do
   g++ -std=c++17 -O2 -Wall -Wextra $f -I "$REPO/engine/runtime" "$REPO/engine/runtime/tests/module_info_test.cpp" -o "$T/module_info_test" "${KVLIB[@]}"
   "$T/module_info_test"
 done
@@ -224,6 +225,10 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/runtime" "$REPO/engine/runtime
 "$T/pool_namespace_test" "${STORES[@]}"
 g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -I "$REPO/engine/runtime" \
   "$REPO/engine/runtime/s2/tests/kv_state_desc_test.cpp" "${KVLIB[@]}" -o "$T/kv_state_desc_test"
+# the Inkling-2-Small descriptor: 8 page planes, 40 rings, 192 convolution histories, 8 staging pages; a slot round trip
+g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -I "$REPO/engine/runtime" \
+  "$REPO/engine/runtime/s2/tests/ink2_kv_state_test.cpp" "${KVLIB[@]}" -o "$T/ink2_kv_state_test"
+"$T/ink2_kv_state_test"
 "$T/kv_state_desc_test"
 [ -n "${NODE_PID:-}" ] && kill "$NODE_PID"
 [ -n "${LAZY_PID:-}" ] && kill "$LAZY_PID"
