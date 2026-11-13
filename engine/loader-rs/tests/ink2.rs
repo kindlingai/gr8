@@ -767,3 +767,285 @@ fn real_metadata_plans_every_tensor() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ------------------------------------------------------------------------------- execution over the rank images
+
+/// f32 -> BF16 bits, round to nearest even (finite input).
+fn bf16(x: f32) -> u16 {
+    let u = x.to_bits();
+    ((u + 0x7fff + ((u >> 16) & 1)) >> 16) as u16
+}
+
+fn bf16s(b: &[u8]) -> Vec<f32> {
+    u16s(b).iter().map(|&h| f32::from_bits((h as u32) << 16)).collect()
+}
+
+impl Mini {
+    /// Replace the random bytes by small finite weights, so that sums over them mean something: BF16 values in
+    /// (-0.15, 0.15), NVFP4 block scales in [0.5, 2) under outer scales near 0.005, MXFP8 codes below 1 under scales
+    /// 2^-6 .. 2^-4.
+    fn tame(&mut self) {
+        let mut rng = Rng(99);
+        for (n, d, _, b) in self.shards.iter_mut().flatten() {
+            let scale = n.ends_with("_scale");
+            match *d {
+                "BF16" => {
+                    for c in b.chunks_exact_mut(2) {
+                        let v = ((rng.next() & 0xffff) as f32 / 32768.0 - 1.0) * 0.15;
+                        c.copy_from_slice(&bf16(v).to_le_bytes());
+                    }
+                }
+                "F8_E4M3" if scale => b.iter_mut().for_each(|x| *x = 0x30 + (rng.next() % 16) as u8),
+                "F8_E4M3" => b.iter_mut().for_each(|x| *x = (*x & 0x80) | (rng.next() % 0x38) as u8),
+                "U8" if scale => b.iter_mut().for_each(|x| *x = 121 + (rng.next() % 3) as u8),
+                "F32" if n.ends_with("_amax") || n.ends_with("_scale_2") => {
+                    let mul = if n.ends_with("_amax") { DENOM } else { 1.0 };
+                    for c in b.chunks_exact_mut(4) {
+                        let v = 0.005 * mul * (1.0 + (rng.next() & 0xff) as f32 / 256.0);
+                        c.copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.t.clear();
+        for (n, _, sh, b) in self.shards.iter().flatten() {
+            self.t.insert(n.clone(), (sh.clone(), b.clone()));
+        }
+        for (n, _, sh, b) in &self.mtp {
+            self.t.insert(format!("mtp.{n}"), (sh.clone(), b.clone()));
+        }
+    }
+}
+
+fn dot64(a: &[f32], b: &[f32]) -> f64 {
+    a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum()
+}
+
+fn dot32(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).fold(0f32, |s, (&x, &y)| s + x * y)
+}
+
+fn sigmoid(z: f32) -> f32 {
+    1.0 / (1.0 + (-z).exp())
+}
+
+/// One MXFP8 record -> [16][32] values (the inverse of records::mxfp8_record's lane order).
+fn mx_decode(rec: &[u8]) -> [[f32; 32]; 16] {
+    let mut out = [[0f32; 32]; 16];
+    for h in 0..2 {
+        for i in 0..256 {
+            let (lane, j) = (i / 8, i % 8);
+            let (r, c) = (lane / 4 + ((j >> 1) & 1) * 8, 2 * (lane % 4) + (j & 1) + (j >> 2) * 8);
+            let s = if r < 8 { rec[512 + 2 * r] } else { rec[512 + 2 * (r - 8) + 1] };
+            out[r][16 * h + c] = g6load::exlr8::e4m3_to_f32(rec[h * 256 + i]) * 2f32.powi(s as i32 - 127);
+        }
+    }
+    out
+}
+
+/// Expert `e` of layer `l` from a rank image's records, dequantized: (gate [iw][HID], up [iw][HID], down [HID][iw]).
+fn expert_dense(p: &Ink2Plan, fc1: &[u8], fc2: &[u8], l: usize, e: usize, iw: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let (per1, per2) = (fc1.len() / NEXP, fc2.len() / NEXP);
+    let (fc1, fc2) = (&fc1[e * per1..][..per1], &fc2[e * per2..][..per2]);
+    let (mut gate, mut up, mut down) = (vec![0f32; iw * HID], vec![0f32; iw * HID], vec![0f32; HID * iw]);
+    if KIND[l] < 2 {
+        let s1 = f32s(&tensor(p, &format!("L{l:03}.x.s1")))[e];
+        let s2 = f32s(&tensor(p, &format!("L{l:03}.x.s2")))[e];
+        for (i, rec) in fc1.chunks_exact(576).enumerate() {
+            let (ch, g, dst) = (i / 2 / (HID / 64), i / 2 % (HID / 64), if i % 2 == 0 { &mut gate } else { &mut up });
+            for (r, row) in nvfp4::nvfp4_decode_group(rec.try_into().unwrap(), s1).iter().enumerate() {
+                dst[(ch * 16 + r) * HID + g * 64..][..64].copy_from_slice(row);
+            }
+        }
+        for (i, rec) in fc2.chunks_exact(576).enumerate() {
+            let (ot, g) = (i / (iw / 64), i % (iw / 64));
+            for (r, row) in nvfp4::nvfp4_decode_group(rec.try_into().unwrap(), s2).iter().enumerate() {
+                down[(ot * 16 + r) * iw + g * 64..][..64].copy_from_slice(row);
+            }
+        }
+    } else {
+        for (i, rec) in fc1.chunks_exact(528).enumerate() {
+            let (ch, g, dst) = (i / 2 / (HID / 32), i / 2 % (HID / 32), if i % 2 == 0 { &mut gate } else { &mut up });
+            for (r, row) in mx_decode(rec).iter().enumerate() {
+                dst[(ch * 16 + r) * HID + g * 32..][..32].copy_from_slice(row);
+            }
+        }
+        for (i, rec) in fc2.chunks_exact(528).enumerate() {
+            let (ot, g) = (i / (iw / 32), i % (iw / 32));
+            for (r, row) in mx_decode(rec).iter().enumerate() {
+                down[(ot * 16 + r) * iw + g * 32..][..32].copy_from_slice(row);
+            }
+        }
+    }
+    (gate, up, down)
+}
+
+/// Quantize then dequantize an activation slice in the layer's format.
+fn requantize(l: usize, a: &[f32]) -> Vec<f32> {
+    if KIND[l] < 2 {
+        let (c, s, outer) = nvfp4::nvfp4_quantize(a, a.len(), Nvfp4ScaleRule::FourOverSixMae, None);
+        nvfp4::nvfp4_dequantize(&c, &s, outer)
+    } else {
+        let (c, s) = records::mxfp8_quantize(a, a.len());
+        c.iter().enumerate().map(|(i, &b)| g6load::exlr8::e4m3_to_f32(b) * 2f32.powi(s[i / 32] as i32 - 127)).collect()
+    }
+}
+
+/// The attention of one rank over `x` [T][HID] with the tensors of its image: its q heads over its K / V heads
+/// (causal, with the relative logits, the sink and the output gate), then its columns of wo. The arithmetic of the
+/// reference without the convolutions and the BF16 rounding, which do not depend on the split. Returns [T][HID].
+fn rank_attention(p: &Ink2Plan, l: usize, x: &[f32]) -> Vec<f64> {
+    let w = |n: &str| bf16s(&tensor(p, &format!("L{l:03}.{n}")));
+    let (wq, wr, wg, ws, wk, wv, wo) = (w("wq"), w("wr"), w("gate_attn"), w("attn_sink_proj"), w("wk"), w("wv"), w("wo"));
+    let (qc, rc, proj) = (w("q_l2_clip"), w("rel_l2_clip"), w("rel_logits_proj"));
+    let (nq, nkv, t_n) = (p.q_range.len(), p.kv_range.len(), x.len() / HID);
+    assert_eq!((wq.len(), wk.len(), wo.len(), ws.len()), (nq * HD * HID, nkv * HD * HID, HID * nq * HD, nq * HID));
+    let clip = |v: &mut [f32], max: f32| {
+        let f = (max / (dot32(v, v).sqrt() + 1e-6)).min(1.0);
+        v.iter_mut().for_each(|y| *y *= f);
+    };
+    // K and V of every position and local K / V head
+    let (mut k, mut v) = (vec![0f32; t_n * nkv * HD], vec![0f32; t_n * nkv * HD]);
+    for t in 0..t_n {
+        let xt = &x[t * HID..][..HID];
+        for h in 0..nkv {
+            let (kh, vh) = (&mut k[(t * nkv + h) * HD..][..HD], &mut v[(t * nkv + h) * HD..][..HD]);
+            for d in 0..HD {
+                kh[d] = dot32(&wk[(h * HD + d) * HID..][..HID], xt);
+                vh[d] = dot32(&wv[(h * HD + d) * HID..][..HID], xt);
+            }
+            clip(kh, 2.0 * (HD as f32).sqrt());
+            let r = 1.0 / (dot32(vh, vh) / HD as f32 + 1e-6).sqrt();
+            vh.iter_mut().for_each(|y| *y *= r);
+        }
+    }
+    let mut out = vec![0f64; t_n * HID];
+    for t in 0..t_n {
+        let xt = &x[t * HID..][..HID];
+        let mut og = vec![0f32; nq * HD];
+        for h in 0..nq {
+            let kvh = (p.q_range.start + h) / (HEADS / KV) - p.kv_range.start;
+            let mut q: Vec<f32> = (0..HD).map(|d| dot32(&wq[(h * HD + d) * HID..][..HID], xt) * qc[h * HD + d]).collect();
+            clip(&mut q, 2.0 * (HD as f32).sqrt());
+            let mut r: Vec<f32> = (0..REL).map(|d| dot32(&wr[(h * REL + d) * HID..][..HID], xt) * rc[h * REL + d]).collect();
+            clip(&mut r, 2.0 * (REL as f32).sqrt());
+            let sink = dot32(&ws[h * HID..][..HID], xt);
+            let score: Vec<f32> = (0..=t).map(|kp| {
+                let rel: f32 = (0..REL).map(|d| r[d] * proj[d * RELWIN + (t - kp)]).sum();
+                dot32(&q, &k[(kp * nkv + kvh) * HD..][..HD]) / (HD as f32).sqrt() + rel
+            }).collect();
+            let m = score.iter().fold(sink, |a, &b| a.max(b));
+            let den = (sink - m).exp() + score.iter().map(|s| (s - m).exp()).sum::<f32>();
+            for d in 0..HD {
+                let o: f32 = (0..=t).map(|kp| (score[kp] - m).exp() / den * v[(kp * nkv + kvh) * HD + d]).sum();
+                og[h * HD + d] = o * sigmoid(dot32(&wg[(h * HD + d) * HID..][..HID], xt));
+            }
+        }
+        for c in 0..HID {
+            out[t * HID + c] = dot64(&wo[c * nq * HD..][..nq * HD], &og);
+        }
+    }
+    out
+}
+
+/// The routed experts of one rank for one token: the router on the replicated tensors, fc1 and the activation on the
+/// rank's intermediate slice, fc2 over that slice. `shared` = the whole activation of each picked expert, quantized
+/// once by one rank. Returns (picked experts, the raw activation slices [picked][iw], the output [HID] with the rank's
+/// own quantization of its slice, the output with its slice of `shared`).
+type Moe = (Vec<usize>, Vec<Vec<f32>>, Vec<f64>, Vec<f64>);
+fn rank_moe(p: &Ink2Plan, l: usize, nr: usize, rank: usize, x: &[f32], shared: Option<&[Vec<f32>]>) -> Moe {
+    let (iw, at) = (INTER / nr, rank * (INTER / nr));
+    let (rw, rb) = (bf16s(&tensor(p, &format!("L{l:03}.router.w"))), f32s(&tensor(p, &format!("L{l:03}.router.bias"))));
+    let score: Vec<f32> = (0..NEXP).map(|e| sigmoid(dot32(&rw[e * HID..][..HID], x))).collect();
+    let mut order: Vec<usize> = (0..NEXP).collect();
+    order.sort_by(|&a, &b| (score[b] + rb[b]).total_cmp(&(score[a] + rb[a])).then(a.cmp(&b)));
+    let picked = order[..4].to_vec();
+    let sum: f32 = picked.iter().map(|&e| score[e]).sum();
+    let xq = requantize(l, x);
+    let (mut acts, mut out, mut out_shared) = (Vec::new(), vec![0f64; HID], vec![0f64; HID]);
+    let (fc1, fc2) = (tensor(p, &format!("L{l:03}.x.fc1")), tensor(p, &format!("L{l:03}.x.fc2")));
+    for (k, &e) in picked.iter().enumerate() {
+        let (gate, up, down) = expert_dense(p, &fc1, &fc2, l, e, iw);
+        let a: Vec<f32> = (0..iw).map(|i| {
+            let (g, u) = (dot32(&gate[i * HID..][..HID], &xq), dot32(&up[i * HID..][..HID], &xq));
+            (4.0 * (g / 4.0).tanh()) * sigmoid(g) * (25.0 * (u / 25.0).tanh())
+        }).collect();
+        let (aq, wt) = (requantize(l, &a), (score[e] / (sum + 1e-20)) as f64);
+        for c in 0..HID {
+            out[c] += wt * dot64(&down[c * iw..][..iw], &aq);
+            if let Some(s) = shared {
+                out_shared[c] += wt * dot64(&down[c * iw..][..iw], &s[k][at..at + iw]);
+            }
+        }
+        acts.push(a);
+    }
+    (picked, acts, out, out_shared)
+}
+
+fn max_diff(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).fold(0f64, |m, (x, y)| m.max((x - y).abs()))
+}
+
+fn cosine(a: &[f64], b: &[f64]) -> f64 {
+    let d = |x: &[f64], y: &[f64]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f64>();
+    d(a, b) / (d(a, a) * d(b, b)).sqrt()
+}
+
+/// The checkpoint planned at TP 4 and TP 6, every rank's tensors read back from its image and run: the ranks' attention
+/// and expert outputs add up to the TP 1 image's.
+#[test]
+fn rank_images_add_up_to_one_rank() {
+    let mut m = mini("sum");
+    m.tame();
+    m.write();
+    let mut rng = Rng(7);
+    const T: usize = 4;
+    let x: Vec<f32> = (0..T * HID).map(|_| f32::from_bits((bf16((rng.next() & 0xffff) as f32 / 32768.0 - 1.0) as u32) << 16)).collect();
+    let one = plan(&m, 1, 0);
+    let mut low = 1f64;
+    for (l, &kind) in KIND.iter().enumerate() {
+        let att1 = rank_attention(&one, l, &x);
+        assert!(att1.iter().any(|v| v.abs() > 1e-3) && att1.iter().all(|v| v.is_finite()), "L{l}: attention output");
+        // per token: (picked, activations, output with the rank's own quantization)
+        let moe1: Vec<_> = (0..T).map(|t| rank_moe(&one, l, 1, 0, &x[t * HID..][..HID], None)).collect();
+        for nr in [4usize, 6] {
+            let plans: Vec<Ink2Plan> = (0..nr).map(|r| plan(&m, nr, r)).collect();
+            // attention: the q heads of all ranks cover the heads once, and the wo partial sums add up
+            let mut att = vec![0f64; T * HID];
+            for p in &plans {
+                att.iter_mut().zip(rank_attention(p, l, &x)).for_each(|(a, b)| *a += b);
+            }
+            assert!(max_diff(&att, &att1) < 1e-5, "L{l} TP{nr}: attention differs by {}", max_diff(&att, &att1));
+            for t in 0..T {
+                let xt = &x[t * HID..][..HID];
+                let (picked1, acts1, out1, _) = &moe1[t];
+                assert!(out1.iter().any(|v| v.abs() > 1e-3) && out1.iter().all(|v| v.is_finite()), "L{l}: expert output");
+                // the activation of one rank, quantized once, shared by every rank: the same sum
+                let shared: Vec<Vec<f32>> = acts1.iter().map(|a| requantize(l, a)).collect();
+                let (mut sum_shared, mut sum_own) = (vec![0f64; HID], vec![0f64; HID]);
+                let mut acts: Vec<Vec<f32>> = vec![Vec::new(); 4];
+                for (r, p) in plans.iter().enumerate() {
+                    let (picked, a, own, sh) = rank_moe(p, l, nr, r, xt, Some(&shared));
+                    assert_eq!(&picked, picked1, "L{l} TP{nr} rank {r}: the router");
+                    sum_shared.iter_mut().zip(sh).for_each(|(s, v)| *s += v);
+                    sum_own.iter_mut().zip(own).for_each(|(s, v)| *s += v);
+                    acts.iter_mut().zip(a).for_each(|(all, part)| all.extend(part));
+                }
+                // fc1 and the activation of the slices are those of the whole expert, bit for bit
+                assert!(acts.iter().zip(acts1).all(|(a, b)| a.iter().zip(b).all(|(p, q)| p.to_bits() == q.to_bits())), "L{l} TP{nr}: fc1 slices");
+                assert!(max_diff(&sum_shared, out1) < 1e-5, "L{l} TP{nr} token {t}: fc2 differs by {}", max_diff(&sum_shared, out1));
+                // each rank quantizing its own slice: MXFP8 blocks do not cross a slice, so nothing changes; an NVFP4
+                // slice has its own outer scale, so the block scales and codes move a little
+                let cs = cosine(&sum_own, out1);
+                if kind == 2 {
+                    assert!(max_diff(&sum_own, out1) < 1e-5 && cs > 0.99999, "L{l} TP{nr} token {t}: MXFP8 cosine {cs}");
+                } else {
+                    assert!(cs > 0.99, "L{l} TP{nr} token {t}: NVFP4 cosine {cs}");
+                    low = low.min(cs);
+                }
+            }
+        }
+    }
+    println!("rank_images_add_up_to_one_rank: lowest NVFP4 cosine with per-rank activation scales {low:.6}");
+}
