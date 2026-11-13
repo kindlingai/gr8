@@ -166,6 +166,7 @@ fn same_bits(a: f32, b: f32) -> bool {
 }
 
 /// Every (row, k) of the records of [n][kn] (columns c0.. of the row-major reference `deq` [n][kfull]).
+#[allow(clippy::too_many_arguments)]
 fn check_records(rec: &[u8], stride: usize, at: usize, deq: &[f32], n: usize, kfull: usize, c0: usize, kn: usize, outer: f32) {
     let ng = kn / NV4_KG;
     assert_eq!(rec.len(), n / 16 * ng * stride);

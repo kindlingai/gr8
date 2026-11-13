@@ -28,6 +28,7 @@ pub mod ds41;
 pub mod exlr8;
 pub mod fetch;
 pub mod gencache;
+pub mod ink2;
 pub mod json;
 pub mod layout;
 pub mod nvfp4;
