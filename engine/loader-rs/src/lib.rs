@@ -30,6 +30,7 @@ pub mod fetch;
 pub mod gencache;
 pub mod json;
 pub mod layout;
+pub mod nvfp4;
 mod plan;
 pub mod records;
 pub mod release;
