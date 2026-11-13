@@ -35,13 +35,14 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import modelset
+import models
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # The DFlash2 drafter for GLM 5.3. The drafter's licence (CC BY-NC-ND 4.0) forbids sharing a converted copy, so each box
 # fetches the drafter from its own repo and converts its rank with bin/g6load dflash2
 # (engine/loader-rs/src/dflash2.rs).
-DRAFTER_URL = 'https://huggingface.co/incoai/GLM-5.3-DFlash2'
-FLASH_DRAFTER_URL = 'https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2'
+DRAFTER_URL = models.GLM53.drafter_url
+FLASH_DRAFTER_URL = models.GLM53F.drafter_url
 META_FILES = ('config.json', 'generation_config.json', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja')
 CHUNK = 64 << 20
 

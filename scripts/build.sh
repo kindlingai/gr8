@@ -98,61 +98,68 @@ widths_ok() {   # widths_ok <g6m4> [<m4sim>]
   done
   echo "$(basename "$1")${2:+ and $(basename "$2")} run TP = $WIDTHS"
 }
-case "${MODEL:-glm}:${KV_FORMAT:-fp8}" in
-  *:fp8|flash:int4) ;;
-  *:int4)   # g6m4 alone, in its own object dir, installed as g6m4-int4 next to the fp8 build
-    WIDTHS="$WIDTHS" EXTRA="$K1H2_FLAGS -DG6_KV4=1 ${EXTRA:-}" OUT="$OUT/int4" bash build_m4.sh "${ARCH:-121a}" g6
-    mv "$OUT/int4/g6m4" "$OUT/g6m4-int4" && rm -rf "$OUT/int4"
-    strings "$OUT/g6m4-int4" | grep -q int4g32h || { echo "g6m4-int4: not the int4 build (no int4g32h row name)"; exit 1; }
-    md5sum "$OUT/g6m4-int4"
-    widths_ok "$OUT/g6m4-int4"
+# Shipped image targets stay shell-only: engine-src deliberately excludes the launcher.
+# test_registry.py checks every field against the registry to prevent drift.
+build_meta() {
+  BUILD_ENGINE=g6m4 BUILD_SIM=m4sim BUILD_WIDTHS='1 2 3 4 5 6 8'
+  BUILD_DEFINE= BUILD_FC2GL=6 BUILD_FLAGS_SCRIPT= BUILD_WHAT_ENV=
+  BUILD_INT4=1 BUILD_INT4_ROW=int4g32h BUILD_MARKERS=
+  case "$1" in
+    glm) ;;
+    flash)
+      BUILD_ENGINE=g6m4_flash BUILD_SIM=m4sim_flash BUILD_WIDTHS='1 2 3 4'
+      BUILD_DEFINE=G6_MODEL_FLASH BUILD_FC2GL=4 BUILD_INT4_ROW=int4nope
+      BUILD_MARKERS='flash kv: borrow-idle, %u of
+flash ckpt share: now' ;;
+    ds41)
+      BUILD_ENGINE=g6m4_ds41 BUILD_SIM=m4sim_ds41 BUILD_WIDTHS=4
+      BUILD_DEFINE=G6_MODEL_DS41 BUILD_FC2GL=4 BUILD_INT4=0
+      BUILD_FLAGS_SCRIPT=scripts/ds41_build_flags.sh BUILD_WHAT_ENV=DS41_WHAT ;;
+    *)
+      if command -v python3 >/dev/null 2>&1 && [ -f "$REPO/tools/launch/models.py" ]; then
+        local metadata
+        metadata=$(python3 "$REPO/tools/launch/models.py" get "$1" build-shell) || return 2
+        eval "$metadata" # shell-quoted values from our checked-in registry
+      else
+        echo "MODEL=$MODEL: glm, flash or ds41" >&2
+        return 2
+      fi ;;
+  esac
+}
+build_meta "${MODEL:-glm}" || exit 2
+WIDTHS=${GR8_WIDTHS:-${GR8_NR:-$BUILD_WIDTHS}}
+fx=${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=$BUILD_FC2GL}
+[ -z "$BUILD_DEFINE" ] || fx="$fx -D$BUILD_DEFINE=1"
+if [ -n "$BUILD_FLAGS_SCRIPT" ]; then fx="$fx $(bash "$REPO/$BUILD_FLAGS_SCRIPT")"; fi
+case "${KV_FORMAT:-fp8}" in
+  fp8) ;;
+  int4)
+    [ "$BUILD_INT4" = 1 ] || { echo "MODEL=${MODEL:-glm}: KV_FORMAT=fp8 only"; exit 2; }
+    obj="$OUT/${MODEL:-glm}-int4"
+    WIDTHS="$WIDTHS" EXTRA="$fx -DG6_KV4=1 ${EXTRA:-}" OUT="$obj" bash build_m4.sh "${ARCH:-121a}" g6
+    mv "$obj/g6m4" "$OUT/$BUILD_ENGINE-int4" && rm -rf "$obj"
+    strings "$OUT/$BUILD_ENGINE-int4" | grep -q "$BUILD_INT4_ROW" || { echo "$BUILD_ENGINE-int4: wrong KV row"; exit 1; }
+    md5sum "$OUT/$BUILD_ENGINE-int4"
+    widths_ok "$OUT/$BUILD_ENGINE-int4"
     exit 0 ;;
   *) echo "KV_FORMAT=$KV_FORMAT: fp8 or int4"; exit 2 ;;
 esac
-case "${MODEL:-glm}" in
-  glm) ;;
-  flash)   # g6m4 and m4sim in their own object dir, installed as g6m4_flash / m4sim_flash next to the GLM build;
-           # KV_FORMAT=int4: g6m4 alone with the int4 latent row (-DG6_KV4=1), installed as g6m4_flash-int4
-    WIDTHS=${GR8_WIDTHS:-${GR8_NR:-1 2 3 4}}
-    fx="${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_FLASH=1"
-    if [ "${KV_FORMAT:-fp8}" = int4 ]; then
-      WIDTHS="$WIDTHS" EXTRA="$fx -DG6_KV4=1 ${EXTRA:-}" OUT="$OUT/flash-int4" bash build_m4.sh "${ARCH:-121a}" g6
-      mv "$OUT/flash-int4/g6m4" "$OUT/g6m4_flash-int4" && rm -rf "$OUT/flash-int4"
-      strings "$OUT/g6m4_flash-int4" | grep -q int4nope || { echo "g6m4_flash-int4: not the int4 build (no int4nope row name)"; exit 1; }
-      md5sum "$OUT/g6m4_flash-int4"
-      widths_ok "$OUT/g6m4_flash-int4"
-      exit 0
-    fi
-    # PF_FC2GL must divide HID / 128 = 32 (GLM 48: 6); build_m4.sh leaves out PF_F12, which the Flash fp16 MoE refuses
-    WIDTHS="$WIDTHS" EXTRA="$fx ${EXTRA:-}" OUT="$OUT/flash" bash build_m4.sh "${ARCH:-121a}" all
-    mv "$OUT/flash/m4sim" "$OUT/m4sim_flash" && mv "$OUT/flash/g6m4" "$OUT/g6m4_flash" && rm -rf "$OUT/flash"
-    md5sum "$OUT/m4sim_flash" "$OUT/g6m4_flash"
-    widths_ok "$OUT/g6m4_flash" "$OUT/m4sim_flash"
-    # the Flash serve's own hooks are in the binary (borrow-idle lived in GLM-only code once and no unit test saw it)
-    for m in "flash kv: borrow-idle, %u of" "flash ckpt share: now"; do
-      grep -c -a -F "$m" "$OUT/g6m4_flash" > /dev/null || { echo "$OUT/g6m4_flash lacks '$m'"; exit 1; }
-    done
-    echo "g6m4_flash has its serve hooks"
-    exit 0 ;;
-  ds41)    # g6m4 and m4sim in their own object dir, installed as g6m4_ds41 / m4sim_ds41 next to the GLM build
-    [ "${KV_FORMAT:-fp8}" = fp8 ] || { echo "MODEL=ds41: KV_FORMAT=fp8 only"; exit 2; }
-    WIDTHS=${GR8_WIDTHS:-${GR8_NR:-4}}
-    # PF_FC2GL must divide HID / 128 = 40 (GLM 48: 6; Flash 32: 4; 4 divides 40); build_m4.sh leaves out PF_F12 for every non-GLM model
-    # DS41_WHAT=sim: m4sim only (no g6m4, so no libibverbs and no fabric objects)
-    DS41_X=$(bash "$REPO/scripts/ds41_build_flags.sh")   # the DS41 build knobs (GR8_DS_TRUNK_BF16)
-    WIDTHS="$WIDTHS" EXTRA="${K1H2_FLAGS/-DPF_FC2GL=6/-DPF_FC2GL=4} -DG6_MODEL_DS41=1 $DS41_X ${EXTRA:-}" OUT="$OUT/ds41" \
-      bash build_m4.sh "${ARCH:-121a}" "${DS41_WHAT:-all}"
-    if [ "${DS41_WHAT:-all}" = sim ]; then
-      mv "$OUT/ds41/m4sim" "$OUT/m4sim_ds41" && rm -rf "$OUT/ds41"
-      md5sum "$OUT/m4sim_ds41"
-      exit 0
-    fi
-    mv "$OUT/ds41/m4sim" "$OUT/m4sim_ds41" && mv "$OUT/ds41/g6m4" "$OUT/g6m4_ds41" && rm -rf "$OUT/ds41"
-    md5sum "$OUT/m4sim_ds41" "$OUT/g6m4_ds41"
-    widths_ok "$OUT/g6m4_ds41" "$OUT/m4sim_ds41"
-    exit 0 ;;
-  *) echo "MODEL=$MODEL: glm, flash or ds41"; exit 2 ;;
-esac
+if [ -n "$BUILD_DEFINE" ]; then
+  what=all
+  [ -z "$BUILD_WHAT_ENV" ] || what=${!BUILD_WHAT_ENV:-all}
+  obj="$OUT/$MODEL"
+  WIDTHS="$WIDTHS" EXTRA="$fx ${EXTRA:-}" OUT="$obj" bash build_m4.sh "${ARCH:-121a}" "$what"
+  mv "$obj/m4sim" "$OUT/$BUILD_SIM"
+  if [ "$what" = sim ]; then rm -rf "$obj"; md5sum "$OUT/$BUILD_SIM"; exit 0; fi
+  mv "$obj/g6m4" "$OUT/$BUILD_ENGINE" && rm -rf "$obj"
+  md5sum "$OUT/$BUILD_SIM" "$OUT/$BUILD_ENGINE"
+  widths_ok "$OUT/$BUILD_ENGINE" "$OUT/$BUILD_SIM"
+  while IFS= read -r marker; do
+    [ -n "$marker" ] || continue
+    grep -c -a -F "$marker" "$OUT/$BUILD_ENGINE" > /dev/null || { echo "$BUILD_ENGINE lacks '$marker'"; exit 1; }
+  done <<< "$BUILD_MARKERS"
+  exit 0
+fi
 case "${GR8_TESTS:-1}" in 0|1|only) ;; *) echo "GR8_TESTS=$GR8_TESTS: 0, 1 or only"; exit 2 ;; esac
 if [ "${GR8_TESTS:-1}" != only ]; then
   WIDTHS="$WIDTHS" EXTRA="$K1H2_FLAGS ${EXTRA:-}" OUT="$OUT" bash build_m4.sh "${ARCH:-121a}" all

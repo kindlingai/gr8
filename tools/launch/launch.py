@@ -546,6 +546,13 @@ def main(argv):
         print(__doc__)
         return 0
     cmd, rest = argv[0], argv[1:]
+    if cmd == 'model-get':
+        try:
+            print(models.query(rest))
+            return 0
+        except ValueError as e:
+            print(f'gr8: {e}', file=sys.stderr)
+            return 2
     if cmd == 'supervise':
         sv.main(parse(rest))
     if cmd == 'get':   # one effective option: KV_FORMAT for ./gr8 glm53 build, PORT for smoke and bench

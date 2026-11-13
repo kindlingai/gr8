@@ -17,7 +17,9 @@ from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import urlopen
 
-MODELS = ("glm53", "glm53f", "ds41")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tools.launch.models import MODELS as REGISTRY
+MODELS = tuple(m.name for m in REGISTRY.values() if m.fabric)
 
 
 @dataclass(frozen=True)
@@ -68,13 +70,16 @@ def read_config(path):
         if len(words) != 1:
             raise ValueError(f"{path}:{line_number}: expected one value (quote spaces)")
         values[key] = words[0]
-    required = allowed - {"TIMEOUT", "SSH_TIMEOUT"}
+    configured = [name for name in MODELS if any(k.startswith(name.upper() + "_") for k in values)]
+    required = {"BOXES"} | {f"{name.upper()}_{field}" for name in configured for field in ("BOXES", "DIR", "HEALTH_URL")}
     missing = required - values.keys()
     if missing:
         raise ValueError("missing config keys: " + ", ".join(sorted(missing)))
+    if len(configured) < 2:
+        raise ValueError("configure at least two models")
     boxes = box_list(values["BOXES"])
     models = {}
-    for name in MODELS:
+    for name in configured:
         prefix = name.upper()
         members = box_list(values[prefix + "_BOXES"])
         if not set(members) <= set(boxes):
@@ -93,7 +98,9 @@ def read_config(path):
 
 def plan(config, target):
     """Down all non-target deployments, including boxes unused by the target."""
-    downs = {box: [(name, "down") for name in MODELS
+    if target not in config.models:
+        raise ValueError(f"model {target!r} is not configured")
+    downs = {box: [(name, "down") for name in config.models
                    if name != target and box in config.models[name].boxes] for box in config.boxes}
     return {box: actions for box, actions in downs.items() if actions}, {
         box: [(target, "up")] for box in config.models[target].boxes

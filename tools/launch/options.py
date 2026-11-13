@@ -233,8 +233,11 @@ def parse(argv, environ=None):
         if origin[k] == 'default':
             values[k], origin[k] = v, f'{model} default'
     tp_eff = values.get('TP') or (str(len(split_list(values.get('PEERS')))) if values.get('PEERS') else None)
-    if model == 'glm53' and tp_eff == '4' and origin['KV_FORMAT'] == 'default':
-        values['KV_FORMAT'] = 'int4'
+    for k, v in models.MODELS[model].tp_defaults.get(tp_eff, {}).items() if model else ():
+        if k not in origin:
+            raise OptionError(f'{model} TP={tp_eff} default: unknown option {k}')
+        if origin[k] in ('default', f'{model} default'):
+            values[k], origin[k] = v, f'{model} TP={tp_eff} default'
     opts = Options(values, origin, path, args, switches, warnings)
     opts.named, opts.model_conflict = named, conflict
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
@@ -466,15 +469,17 @@ def validate(o):
                           '--default-thinking-budget)')
     elif effort not in (None, 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
         raise OptionError(f'--default-reasoning-effort {effort}: want minimal, low, medium, high, xhigh or max')
-    if o.get('CHUNK') is not None and model.name != 'ds41':
+    if o.get('CHUNK') is not None and 'CHUNK' not in model.serve_options:
         raise OptionError(f'--chunk: ds41 only (the prompt rows a step of the DeepSeek serve path); ./gr8 {model.name} sets its own')
-    if o.get('EAGER') is not None and model.name != 'ds41':
+    if o.get('EAGER') is not None and 'EAGER' not in model.serve_options:
         raise OptionError(f'--eager: ds41 only (the DeepSeek serve path runs eagerly without --graph); ./gr8 {model.name} always captures')
-    if o.get('EXACT') is not None and model.name != 'ds41':
+    if o.get('EXACT') is not None and 'EXACT' not in model.serve_options:
         raise OptionError(f'--exact: ds41 only (the DeepSeek prefill path); ./gr8 {model.name} has one')
     if o.get('EXACT') not in (None, '0', '1'):
         raise OptionError(f'--exact {o.get("EXACT")}: want 0 (the release stack, v2 prefill) or 1 (exact output)')
-    if any(w.startswith(('GR8_DS_', 'GR8_DS41_')) for w in (o.get('EXTRA_ENV') or '').split()) and model.name != 'ds41':
+    if any(w.startswith(prefix) and prefix not in model.engine_prefixes
+           for w in (o.get('EXTRA_ENV') or '').split()
+           for prefix in {p for m in models.MODELS.values() for p in m.engine_prefixes}):
         raise OptionError(f'--extra-env names a GR8_DS_* variable: those are DeepSeek-V4.1 engine variables, and '
                           f'./gr8 {model.name} serves another model')
     if o.get('GRAMMAR') not in ('0', '1'):
@@ -530,7 +535,7 @@ def validate(o):
         raise OptionError(f'--v2-dense-form {o.get("V2_DENSE_FORM")}: want trellis or rounded')
     if o.get('S2_SHARED_WATERFILL') not in (None, '0', '1'):
         raise OptionError(f'--s2-shared-waterfill {o.get("S2_SHARED_WATERFILL")}: want 0 or 1')
-    if o.get('S2_SHARED_WATERFILL') == '1' and model.name == 'ds41':
+    if o.get('S2_SHARED_WATERFILL') == '1' and model.uniform_rows:
         raise OptionError('--s2-shared-waterfill 1: DS41 shared steps require uniform rows (glm53 and glm53f only)')
     if o.get('S2_SHARED_WF_MARGIN') is not None:
         try:
@@ -542,7 +547,7 @@ def validate(o):
     for key in ('KV4_FOLD', 'KV4_TC'):
         if o.get(key) not in (None, '0', '1'):
             raise OptionError(f'--{key.lower().replace("_", "-")} {o.get(key)}: want 0 or 1')
-    if o.get('KV4_FOLD') == '1' and (model.name != 'glm53' or o.get('KV_FORMAT') != 'int4' or o.get('KVB') == 'fp8'):
+    if o.get('KV4_FOLD') == '1' and (not model.kv4_fold or o.get('KV_FORMAT') != 'int4' or o.get('KVB') == 'fp8'):
         raise OptionError('--kv4-fold 1 requires glm53 with --kv-format int4 and BF16 kv_b')
     if o.get('KVB') not in (None, 'bf16', 'fp8'):
         raise OptionError(f'--kvb {o.get("KVB")}: want bf16 or fp8')
@@ -612,23 +617,24 @@ def validate(o):
         o.int(k)
     if o.get('MAX_MODEL_LEN') is not None:
         n = o.int('MAX_MODEL_LEN')
-        if not 1 <= n <= model.max_positions:
-            raise OptionError(f'--max-model-len {n}: want 1 to {model.max_positions}, the model\'s max positions')
+        max_positions = models.release_metadata(model, o.get('MODEL_DIR') or o.get('MODEL'))['max_positions']
+        if n < 1 or (max_positions and n > max_positions):
+            raise OptionError(f'--max-model-len {n}: want 1 to {max_positions}, the model\'s max positions')
         if o.get('CAP') is not None and n > o.int('CAP'):
             raise OptionError(f'--max-model-len {n}: more than CAP {o.int("CAP")}, the KV pool a request comes from')
     stores = kv_stores(o)
     cache = o.get('FLASH_CACHE')
     if cache not in (None, 'off', 'aligned', 'terminal'):
         raise OptionError(f'--flash-cache {cache}: want off, aligned or terminal')
-    if cache not in (None, 'off') and model.name != 'glm53f':
+    if cache not in (None, 'off') and not model.checkpoint_cache:
         raise OptionError(f'--flash-cache: Flash session checkpoints are glm53f only, not {model.name}')
     budget = o.get('FLASH_STATE_BUDGET_MIB')
     if budget is not None and not (str(budget).isdigit() and int(budget) >= 1):
         raise OptionError(f'--flash-state-budget-mib {budget}: want a whole number of MiB from 1')
-    if model.name == 'glm53f' and cache == 'terminal' and o.get('DFLASH') == '1':
+    if model.checkpoint_cache and cache == 'terminal' and o.get('DFLASH') == '1':
         raise OptionError('--flash-cache terminal with --dflash 1: the drafter takes aligned checkpoints only (a terminal '
                           "checkpoint's KDA state is not cold-exact)")
-    if model.name == 'glm53f' and stores:
+    if model.checkpoint_cache and stores:
         if cache in (None, 'off'):
             raise OptionError('--kv-store on glm53f holds Flash session checkpoints: it needs --flash-cache aligned or terminal')
         if len(stores) > 1:
@@ -1161,7 +1167,7 @@ def canonical(o, plan, members, variant=None, ring=''):
     variant: the resolved exlr8 v2 variant (modelset.Variant), whose name and manifest sha256 count. ring: --shape ring
     with mentat, the ring this box planned from mentat's claim (mentat.ring_text), so every box must have the same."""
     c = {'tp': o.get('TP'), 'shape': o.get('SHAPE'), 'mode': mode(o), 'fabric_port': str(FABRIC_PORT)}
-    if models.of(o) is not models.GLM53:   # GLM-5.3's lines stay as they were, so a mixed upgrade still agrees
+    if not models.of(o).legacy_identity:   # GLM-5.3's lines stay as they were, so a mixed upgrade still agrees
         c['model'] = models.of(o).name
     if members:
         c['peers'] = ','.join(members)

@@ -895,3 +895,24 @@ class SilentEngine(S2Base):
         m = await asyncio.wait_for(c.metrics.get(), 5)
         self.assertEqual(m['requests']['running'], 0)
         self.assertEqual(m['requests']['finished'], {'error': 1})
+
+
+class ModelMetadataTests(unittest.TestCase):
+    def test_no_silent_glm_default_for_new_model(self):
+        self.assertEqual(g6s2shim.model_metadata('glm-5.3-g6', None, None, None),
+                         (154880, [154820, 154827, 154829]))
+        with self.assertRaisesRegex(ValueError, 'metadata missing'):
+            g6s2shim.model_metadata('new-model', None, None, None)
+        with self.assertRaisesRegex(ValueError, 'metadata missing'):
+            g6s2shim.model_metadata('new-model', 32000, None, None)
+        self.assertEqual(g6s2shim.model_metadata('new-model', 32000, [1], None), (32000, [1]))
+
+    def test_release_metadata_and_cli_precedence(self):
+        import json
+        from pathlib import Path
+        import tempfile
+        with tempfile.TemporaryDirectory() as t:
+            Path(t, 'config.json').write_text(json.dumps({'text_config': {'vocab_size': 32000, 'eos_token_id': 1}}))
+            Path(t, 'generation_config.json').write_text(json.dumps({'eos_token_id': [2, 3]}))
+            self.assertEqual(g6s2shim.model_metadata('new-model', None, None, t), (32000, [2, 3]))
+            self.assertEqual(g6s2shim.model_metadata('new-model', 64000, [5], t), (64000, [5]))
