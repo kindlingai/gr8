@@ -1,3 +1,4 @@
+#include "../dispram.h"
 // Flash context-parallel decode (attn/flash_attn.cu, G6_CP) against the replicated path, on random data. One GPU, every
 // rank of TP = G6_NR on it, each with a replicated binding and a CP binding (R below), the exchange in device buffers.
 // Steps at contexts below R, at R and past it (all pools visible to a row at most 512, one key tile, several), 1 to 16
@@ -310,6 +311,16 @@ int main() {
         cache_ok &= d2h((const uint8_t*)c.index_raw, g6kv::RAW_BYTES) == d2h((const uint8_t*)p.index_raw, g6kv::RAW_BYTES);
     }
     report(cache_ok, "every page a CP binding holds, and its raw ring, equal the replicated binding's");
+    if (g6dispram::enabled()) {
+        g6dispram::Client probe;
+        g6dispram::Info dinfo{};
+        const bool has_daemon = probe.open_conn(g6dispram::socket_path()) && probe.query_info(&dinfo);
+        probe.close_conn();
+        if (has_daemon || knob::dispram_min_bytes() > 0)
+            report(g6dispram::claimed_bytes() > 0, "non-chunked Flash bindings claimed live dispramd carveout bytes");
+    } else {
+        report(g6dispram::claimed_bytes() == 0, "non-chunked Flash bindings stay off dispramd by default");
+    }
     for (Rank& x : rk) { g6a_bind_release(&x.rep); g6a_bind_release(&x.cp); }
     printf("%s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;

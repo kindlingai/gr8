@@ -1,3 +1,4 @@
+#include "../dispram.h"
 // gr8 rank step: one rank's decode step over a list of real layers + head, as launch helpers.
 // Used unchanged by the NR-process runtime (engine/runtime/g6m4.cu, real fabric; NR = G6_NR, six or four) and by the
 // one-process NR-simulated-rank driver (engine/runtime/m4sim.cu, loopback fabric), so their outputs must be bit-identical.
@@ -1009,6 +1010,18 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     size_t ab = 0;
     for (const Layer& y : m.layers) ab += y.ab.storage_bytes + y.ab.scratch_bytes;
     fprintf(stderr, "# rank %d: attention caches + scratch for %d layers at capacity %d: %.3f GB\n", rank, m.nl, capacity, ab / 1e9);
+    if (knob::dispram_min_bytes() > 0 && g6dispram::claimed_bytes() < (size_t)knob::dispram_min_bytes())
+    {
+        const size_t have = g6dispram::claimed_bytes(), req = (size_t)knob::dispram_min_bytes();
+        g6dispram::release_all();
+        fprintf(stderr, "g6: dispram shortfall: live mapped %zu bytes < required %zu bytes\n", have, req);
+        fflush(stderr);
+        std::_Exit(75);
+    }
+    if (const size_t db = g6dispram::claimed_bytes())
+        fprintf(stderr, "# rank %d: dispram: %.1f MiB claimed (%.1f MiB VMM mapped) across %zu attention bindings\n",
+                rank, (double)db / (1024.0 * 1024.0), (double)g6dispram::mapped_bytes() / (1024.0 * 1024.0),
+                g6dispram::claimed_spans());
     check_headroom(rank, capacity, true);
     if (m.dscratch)
     {

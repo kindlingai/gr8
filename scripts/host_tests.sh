@@ -68,6 +68,9 @@ g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/knobs-rs" "$REPO/engine/knobs-
 "$T/knobs_header_test"
 # INT4 attention: knob validation, padded query permutation and stable live-slot compaction.
 g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/tests/test_s6_kv4_host.cpp" "${KNOBS[@]}" -o "$T/test_s6_kv4_host"
+g++ -std=c++17 -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-sanitize-recover=undefined -pthread \
+  -I "$REPO/engine" "$REPO/engine/tests/test_dispram_host.cpp" "${KNOBS[@]}" -o "$T/test_dispram_host"
+"$T/test_dispram_host"
 "$T/test_s6_kv4_host"
 g++ -std=c++17 -O2 -Wall -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/grammar_request_test.cpp" -o "$T/grammar_request_test" "${KNOBS[@]}"
 "$T/grammar_request_test"

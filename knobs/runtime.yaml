@@ -161,3 +161,19 @@ knobs:
     unset: "unset"
     doc: >-
       With GR8_XTRACE=1, each fabric dumps its trace once when this file appears.
+  GR8_DISPRAM:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      0 (default) uses cudaMalloc only; 1 leases available 2 MiB physical granules from Kindling OS dispramd
+      (DISPRAM_SOCKET) into GLM-5.3 and non-chunked GLM-5.3-Flash attention KV bindings via CUDA VMM, failing open to
+      cudaMalloc when absent or exhausted (unless GR8_DISPRAM_MIN_BYTES > 0).
+  GR8_DISPRAM_MIN_BYTES:
+    scope: agree
+    kind: int
+    default: "0"
+    doc: >-
+      Minimum live VMM-mapped dispramd carveout bytes each rank must map before allocating host KV memory when CAP was
+      enlarged from the pre-boot dispramd probe; if unmet, the allocator unmaps its spans and exits 75 so the supervisor
+      falls back to baseline CAP.

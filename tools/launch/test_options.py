@@ -1089,5 +1089,46 @@ class KvFormatTests(unittest.TestCase):
         ValidateTests().check(['--peers', PEERS, '--kv-format', 'int8'], 'fp8 or int4')
 
 
+
+class DispramTests(unittest.TestCase):
+    def options(self, *args):
+        o = opt.parse(['--no-config', '--tp', '4', '--peers', PEERS, *args], GLM)
+        opt.validate(o)
+        return o
+
+    def test_flag(self):
+        for value in ('0', '1'):
+            self.assertEqual(self.options('--dispram', value).get('DISPRAM'), value)
+        with self.assertRaisesRegex(opt.OptionError, '--dispram 2: want 0 or 1'):
+            self.options('--dispram', '2')
+
+    def test_capacity_and_minimum(self):
+        for fmt, baseline, boosted, minimum in [('int4', '513536', '611328', '1983905792'),
+                                               ('fp8', '485376', '562688', '1986002944')]:
+            o_def = self.options('--kv-format', fmt)
+            for p in (opt.engine_plan(o_def), opt.engine_plan(o_def, dispram_bytes=2145386496)):
+                self.assertEqual(p['knobs']['CAP'], baseline)
+                self.assertFalse(any(v.startswith(('GR8_DISPRAM=', 'GR8_DISPRAM_MIN_BYTES=')) for v in p['env']))
+            o_on = self.options('--kv-format', fmt, '--dispram', '1')
+            old = opt.engine_plan(o_on)
+            self.assertEqual(old['knobs']['CAP'], baseline)
+            self.assertIn('GR8_DISPRAM=1', old['env'])
+            self.assertFalse(any(v.startswith('GR8_DISPRAM_MIN_BYTES=') for v in old['env']))
+            new = opt.engine_plan(o_on, dispram_bytes=2145386496)
+            self.assertEqual(new['knobs']['CAP'], boosted)
+            self.assertIn('GR8_DISPRAM=1', new['env'])
+            self.assertIn('GR8_DISPRAM_MIN_BYTES=' + minimum, new['env'])
+        for args, cap, setting in [(('--cap', '400000', '--dispram', '1'), '400000', '1'),
+                                   (('--dispram', '0'), '513536', '0')]:
+            p = opt.engine_plan(self.options(*args), dispram_bytes=2145386496)
+            self.assertEqual(p['knobs']['CAP'], cap)
+            self.assertIn('GR8_DISPRAM=' + setting, p['env'])
+            self.assertFalse(any(v.startswith('GR8_DISPRAM_MIN_BYTES=') for v in p['env']))
+        o = opt.parse(['--no-config', '--tp', '6', '--kv-format', 'int4', '--share-limit', '131072', '--dispram', '1'], GLM)
+        p = opt.engine_plan(o, dispram_bytes=4294967296)
+        self.assertEqual(p['knobs']['CAP'], '1048448')
+        self.assertIn('GR8_DISPRAM=1', p['env'])
+        self.assertIn('GR8_DISPRAM_MIN_BYTES=3311403008', p['env'])
+
 if __name__ == '__main__':
     unittest.main()

@@ -1,3 +1,4 @@
+#include "../dispram.h"
 #include "bind.h"
 #include "../g6nr.h"
 #include "../h2d.h"
@@ -151,7 +152,7 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     const size_t error = take(sizeof(unsigned));
     const size_t scratch = take(ext_scratch ? 0 : b.scratch_bytes);   // ext: caller-owned, shared, not freed here
     b.storage_bytes = used;
-    cudaError_t e = cudaMalloc(&b.storage, used);
+    cudaError_t e = g6dispram::alloc_kv(&b.storage, used);
     if (e != cudaSuccess) return (int)e;
     char* base = (char*)b.storage;
     a.uk = base + uk; a.uks = fp8 ? (const float*)(base + uks) : nullptr; a.mla_cache = base + kv;
@@ -181,7 +182,7 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
         if (e == cudaSuccess) e = cudaGetLastError();
     }
     if (e == cudaSuccess) e = cudaMemsetAsync(a.indices, 0xff, (size_t)max_rows * 2048 * 4, stream);
-    if (e != cudaSuccess) { cudaFree(b.storage); return (int)e; }
+    if (e != cudaSuccess) { g6dispram::free_kv(b.storage); return (int)e; }
     *out = b;
     return (int)cudaSuccess;
 }
@@ -247,7 +248,7 @@ extern "C" int g6a_kvb_bf16(const void* fp8, const float* scale, void* bf16, int
 }
 extern "C" int g6a_bind_release(G6AttnBinding* b) {
     if (!b) return invalid;
-    cudaError_t e = b->storage ? cudaFree(b->storage) : cudaSuccess;
+    cudaError_t e = b->storage ? g6dispram::free_kv(b->storage) : cudaSuccess;
     if (e == cudaSuccess) *b = G6AttnBinding{};
     return (int)e;
 }

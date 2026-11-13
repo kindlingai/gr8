@@ -35,7 +35,7 @@ import steering_hf
 
 REPO = opt.REPO
 # What the engine gets from the supervisor's environment, besides the plan's own variables.
-ENGINE_ENV_KEEP = ('PATH', 'HOME', 'USER', 'LANG', 'LD_LIBRARY_PATH')
+ENGINE_ENV_KEEP = ('PATH', 'HOME', 'USER', 'LANG', 'LD_LIBRARY_PATH', 'DISPRAM_DISABLE', 'DISPRAM_SOCKET')
 ENGINE_ENV_PREFIXES = ('CUDA_', 'NVIDIA_')
 
 
@@ -45,6 +45,37 @@ class Stop(Exception):
     def __init__(self, code, why):
         super().__init__(why)
         self.code = code
+
+
+class DispramFallback(Exception):
+    """Retry the cluster once without probed display memory."""
+
+
+def probe_dispram(o, environ=None, timeout=1.0):
+    env = os.environ if environ is None else environ
+    if o.get('DISPRAM') != '1' or str(env.get('DISPRAM_DISABLE', '')).lower() in ('1', 'true', 'yes', 'on'):
+        return 0
+    kind = getattr(socket, 'SOCK_SEQPACKET', None)
+    if kind is None:
+        return 0
+    conn = None
+    try:
+        conn = socket.socket(socket.AF_UNIX, kind)
+        conn.settimeout(timeout)
+        conn.connect(env.get('DISPRAM_SOCKET') or '/run/dispram/dispram.sock')
+        conn.sendall(b'{"key":"kindlingai_1","op":"info"}')
+        d = json.loads(conn.recv(4096))
+        if not isinstance(d, dict):
+            return 0
+        free = d.get('free')
+        if type(free) is not int or free <= 0 or 'error' in d:
+            return 0
+        return free // (2 << 20) * (2 << 20)
+    except (OSError, ValueError, TypeError):
+        return 0
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def log(msg):
@@ -290,6 +321,9 @@ class Supervisor:
         self.home = os.path.abspath(o.get('GR8_WORK_DIR'))
         self.out = os.path.join(self.home, 'out')
         self.port = o.int('CONTROL_PORT')
+        self.boot_attempt = 0
+        self.dispram_off = False
+        self.fallback_by_epoch = {}
         self.stop_ev = threading.Event()
         self.stop_why = ''
         self.stop_all = False         # on the head: stop every box as well
@@ -362,6 +396,13 @@ class Supervisor:
             log(f'ignored {t!r} from {peer}: not a member')
             return {'t': 'error', 'error': f'{peer} is not a member of this cluster'}
         if t in ('hello', 'verdict'):
+            att = int(m.get('attempt') or 0)
+            if att > self.boot_attempt:
+                return {'t': 'retry', 'detail': 'the head is resetting for dispram fallback'}
+            if att < self.boot_attempt:
+                if t == 'verdict' and att == 0 and self.boot_attempt == 1 and self.dispram_off:
+                    return {'t': 'dispram_fallback', 'detail': 'the head fell back to baseline CAP'}
+                return {'t': 'refused', 'field': 'attempt', 'values': {}, 'exit': 4, 'detail': 'stale boot attempt'}
             if self.rank not in (0, None):
                 return {'t': 'refused', 'field': 'rank', 'values': {}, 'exit': 4,
                         'detail': f'{self.lan} is rank {self.rank}, not the head'}
@@ -372,6 +413,22 @@ class Supervisor:
                 # a booted cluster going down: a box that restarted already (a container) waits for the next boot
                 return {'t': 'retry', 'detail': 'the head is stopping its boot'}
             return self.head.rpc(m, peer)
+        if t == 'dispram_fallback':
+            epoch = m.get('epoch')
+            why = m.get('why') or 'dispram shortfall'
+            bcast = False
+            with self.state_lock:
+                if not isinstance(epoch, int) or self.boot_attempt != 0:
+                    return {'t': 'ok', 'detail': 'ignored'}
+                if self.hs and epoch != self.hs.get('epoch'):
+                    return {'t': 'ok', 'detail': 'not this boot'}
+                if epoch not in self.fallback_by_epoch:
+                    self.fallback_by_epoch[epoch] = why
+                    bcast = self.rank == 0
+            if bcast:
+                for r in range(1, len(self.members)):
+                    self.tell(r, {'t': 'dispram_fallback', 'epoch': epoch, 'why': why}, timeout=2)
+            return {'t': 'ok'}
         if t == 'status':
             return self.status()
         if t == 'down':
@@ -538,32 +595,66 @@ class Supervisor:
         fails = self.checks()
         for f in fails:
             log(f'check failed: {f}')
-        hello = {'t': 'hello', 'proto': handshake.PROTO, 'rank': self.rank, 'lan': self.lan, 'members': self.members,
-                 'rails': list(self.rails), 'home': self.home, 'opts': c, 'opts_digest': digest,
-                 'set_id': self.model_id or 'none',
-                 'set_source': f'{self.ms.source}, variant {self.variant}' if self.ms else self.model_error,
-                 'engine_build': self.build, 'fails': fails, 'version': version(self.home),
-                 'offers': mentat.format_offers(self.offers)}
-        self.set_state('handshake')
-        verdict = self.handshake(hello)
-        if verdict.get('t') == 'ok' and fails:   # never boot past a failed check, whatever the verdict
-            verdict = {'t': 'refused', 'field': 'checks', 'values': {}, 'detail': '; '.join(fails), 'exit': 4}
-        if verdict.get('t') != 'ok':
-            if not self.refusal_logged:
-                log(handshake.describe(verdict))
-            e = Stop(verdict.get('exit', 4), f'handshake refused: {verdict["field"]}')
-            e.logged = True
-            raise e
-        with self.state_lock:
-            self.hs = verdict
-            self.serving_urls = {e: url for e, url in self.serving_urls.items() if e == verdict['epoch']}
-        if verdict.get('ips'):     # the head's rails for this box, which may differ from its own election's
-            self.rails = (verdict['ips'][self.rank], verdict['ips2'][self.rank])
-            if self.agent:
-                self.agent.set_meta(**{'gr8.ips': ','.join(self.rails)})
-        with open(os.path.join(self.out, 'handshake.json'), 'w') as f:
-            json.dump({**verdict, 'rank': self.rank, 'control_port': self.port}, f, indent=1)
-        self.boot()
+        while True:
+            dbytes = 0 if self.dispram_off else probe_dispram(self.o)
+            try:
+                hello = {'t': 'hello', 'proto': handshake.PROTO, 'rank': self.rank, 'lan': self.lan, 'members': self.members,
+                         'rails': list(self.rails), 'home': self.home, 'opts': c, 'opts_digest': digest,
+                         'set_id': self.model_id or 'none',
+                         'set_source': f'{self.ms.source}, variant {self.variant}' if self.ms else self.model_error,
+                         'engine_build': self.build, 'fails': fails, 'version': version(self.home),
+                         'offers': mentat.format_offers(self.offers),
+                         'dispram_bytes': dbytes, 'attempt': self.boot_attempt}
+                self.set_state('handshake')
+                verdict = self.handshake(hello)
+                if verdict.get('t') == 'dispram_fallback':
+                    raise DispramFallback(verdict.get('detail') or 'dispram shortfall')
+                if verdict.get('t') == 'ok' and fails:   # never boot past a failed check, whatever the verdict
+                    verdict = {'t': 'refused', 'field': 'checks', 'values': {}, 'detail': '; '.join(fails), 'exit': 4}
+                if verdict.get('t') != 'ok':
+                    if not self.refusal_logged:
+                        log(handshake.describe(verdict))
+                    e = Stop(verdict.get('exit', 4), f'handshake refused: {verdict["field"]}')
+                    e.logged = True
+                    raise e
+                with self.state_lock:
+                    self.hs = verdict
+                    self.fallback_by_epoch = {e: w for e, w in self.fallback_by_epoch.items() if e == verdict['epoch']}
+                    self.serving_urls = {e: url for e, url in self.serving_urls.items() if e == verdict['epoch']}
+                if verdict.get('ips'):     # the head's rails for this box, which may differ from its own election's
+                    self.rails = (verdict['ips'][self.rank], verdict['ips2'][self.rank])
+                    if self.agent:
+                        self.agent.set_meta(**{'gr8.ips': ','.join(self.rails)})
+                with open(os.path.join(self.out, 'handshake.json'), 'w') as f:
+                    json.dump({**verdict, 'rank': self.rank, 'control_port': self.port}, f, indent=1)
+                self.boot()
+                break
+            except DispramFallback as fb:
+                if self.boot_attempt != 0:
+                    raise Stop(1, str(fb))
+                epoch = self.hs.get('epoch')
+                log(f'dispram shortfall on boot attempt 0 ({fb}); falling back to baseline CAP with GR8_DISPRAM=0')
+                self.head_ready.clear()
+                notice = {'t': 'dispram_fallback', 'epoch': epoch, 'why': str(fb)}
+                if self.rank == 0:
+                    for r in range(1, tp):
+                        self.tell(r, notice, timeout=2)
+                else:
+                    self.tell_head({**notice, 'rank': self.rank})
+                stop_local(self.home, log, quit_s=2)
+                for child in [self.engine, *self.helpers.values()]:
+                    if child is not None:
+                        child.wait()
+                self.engine = None
+                self.helpers.clear()
+                self.started = False
+                with self.state_lock:
+                    self.head = None
+                    self.hs = {}
+                    self.fallback_by_epoch.clear()
+                    self.dispram_off = True
+                    self.boot_attempt = 1
+                continue
 
     def rendezvous(self, tp):
         o = self.o
@@ -760,7 +851,13 @@ class Supervisor:
             if bad:
                 self.head.decide(handshake.refusal('fabric', have, lambda x: ','.join(rails[x['rank']]), bad))
             else:
-                self.head.decide({'t': 'ok', 'epoch': int(time.time()), 'members': self.members,
+                dispram_bytes = 0 if self.dispram_off else min(
+                    max(0, int(have[r].get('dispram_bytes') or 0)) // (2 << 20) * (2 << 20) for r in range(tp))
+                if dispram_bytes > 0:
+                    log(f'head: dispram min free across {tp} ranks: {dispram_bytes >> 20} MiB')
+                self.last_epoch = max(int(time.time()), (getattr(self, 'last_epoch', 0) or 0) + 1)
+                self.head.decide({'t': 'ok', 'epoch': self.last_epoch, 'members': self.members,
+                                  'dispram_bytes': dispram_bytes,
                                   'ips': [rails[r][0] for r in range(tp)],
                                   'ips2': [rails[r][1] for r in range(tp)],
                                   'homes': {str(r): have[r]['home'] for r in range(tp)}, 'set_id': self.model_id,
@@ -823,6 +920,9 @@ class Supervisor:
         """The plan's variables over an allowlist of this process's environment."""
         env = {k: v for k, v in os.environ.items() if k in ENGINE_ENV_KEEP or k.startswith(ENGINE_ENV_PREFIXES)}
         env.update(kv.split('=', 1) for kv in plan['env'] if '=' in kv)
+        if self.dispram_off:
+            env['GR8_DISPRAM'] = '0'
+            env.pop('GR8_DISPRAM_MIN_BYTES', None)
         lib = os.path.join(self.home, 'bin', 'lib')
         if os.path.isdir(lib):        # cuBLAS from build.sh BUNDLE_LIBS=1, at any TP
             env['LD_LIBRARY_PATH'] = lib
@@ -888,7 +988,8 @@ class Supervisor:
         o, hs, r = self.o, self.hs, self.rank
         plan = opt.engine_plan(o, rank=r, rank_dir=self.ms.dir, aux_dir=self.ms.dir, home=self.home,
                                epoch=hs['epoch'], set_id=self.model_id, kv_store=self.kv_store(),
-                               kv_rows=self.kv_rows())
+                               kv_rows=self.kv_rows(),
+                               dispram_bytes=0 if self.dispram_off else int(hs.get('dispram_bytes') or 0))
         work = os.path.join(self.home, 's2')
         shutil.rmtree(work, ignore_errors=True)
         os.makedirs(work)
@@ -1132,9 +1233,16 @@ class Supervisor:
         """Raise Stop when this rank's engine has exited or someone asked to stop."""
         if self.stop_ev.is_set():
             raise Stop(1 if self.stop_failed else 0, self.stop_why)
+        can_fallback = self.state == 'loading' and self.boot_attempt == 0 and int(self.hs.get('dispram_bytes') or 0) > 0
+        with self.state_lock:
+            fb_why = self.fallback_by_epoch.get(self.hs.get('epoch'))
+        if can_fallback and fb_why:
+            raise DispramFallback(fb_why)
         if self.engine and self.engine.poll() is not None:
             name = f'g6m4.r{self.rank}'
             reason = exit_reason([os.path.join(self.out, f'{name}.err'), os.path.join(self.out, f'{name}.txt')])
+            if can_fallback and (self.engine.returncode == 75 or reason.startswith('g6: dispram shortfall')):
+                raise DispramFallback(reason or 'engine exited 75 (dispram shortfall)')
             why = f'engine exited ({exit_status(self.engine.returncode)})' + (f': {reason}' if reason else '') + \
                   f'; last lines of {name}.err:\n' + tail(os.path.join(self.out, f'{name}.err'), 20)
             # the weights on the GPU differ from the bytes read (engine/runtime/weight_check.cuh): exit 3, as the rank

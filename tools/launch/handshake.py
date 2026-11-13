@@ -235,7 +235,7 @@ def send_hello(head, port, hello, bind, timeout, log, stop=None, poll_s=POLL_S, 
                         'detail': f'the head {head}:{port} stopped answering for {drop_s:.0f}s'}
             r = {'t': 'retry', 'detail': str(e)}
         if r.get('t') == 'wait':
-            ask = {'t': 'verdict', 'rank': hello['rank']}
+            ask = {'t': 'verdict', 'rank': hello['rank'], **({'attempt': hello['attempt']} if 'attempt' in hello else {})}
         elif r.get('t') == 'retry':
             ask = hello
             if now - t0 - said >= 60:
