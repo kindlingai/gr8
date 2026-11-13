@@ -117,8 +117,16 @@ job() {   # job <log> <command..>: in the background, at most J at once; a failu
   { nice -n 19 "${@:2}" > "$1" 2>&1 || touch "$1.failed"; } &
 }
 if [ "$WHAT" != sim ]; then job $O/fabric.log $NVCC -O2 -std=c++17 $GEN -c ../comms/fabric.cpp -o $O/fabric.o; fi
+INK2=0
+case " $EXTRA " in *" -DG6_MODEL_INK2=1 "*) INK2=1 ;; esac
+if [ "$INK2" = 1 ] && [ -z "$RSDEF" ]; then echo "build_m4.sh: Inkling-2-Small needs the Rust loader ($RSLIB): it plans the image from the checkpoint"; exit 1; fi
 for n in $WIDTHS; do
   F="$GEN $(wflags $n) -Xcompiler -fno-gnu-unique"
+  if [ "$INK2" = 1 ]; then   # Inkling-2-Small: its own drivers (ink2_sim.cu, ink2_m4.cu) hold every kernel; no attn objects
+    if [ "$WHAT" != g6 ]; then job $O/m4sim.w$n.log $NVCC -O2 -std=c++17 $F -Xcompiler -ffp-contract=off $RSDEF -c ink2_sim.cu -o $O/m4sim.w$n.o; fi
+    if [ "$WHAT" != sim ]; then job $O/g6m4.w$n.log $NVCC -O2 -std=c++17 $F -Xcompiler -ffp-contract=off $RSDEF -c ink2_m4.cu -o $O/g6m4.w$n.o; fi
+    continue
+  fi
   job $O/attn.w$n.log $NVCC -O3 -std=c++17 $F -c $ATTN_CU -o $O/attn.w$n.o
   job $O/attn_bind.w$n.log $NVCC -O3 -std=c++17 $F -c $ATTN_BIND_CU -o $O/attn_bind.w$n.o
   job $O/attn_ops.w$n.log $NVCC -O3 -std=c++17 $F -c $ATTN_OPS_CU -o $O/attn_ops.w$n.o
@@ -134,7 +142,9 @@ if [ -n "$RSDEF" ]; then SHARED="$SHARED $RSLIB"; fi
 nm --defined-only -g $SHARED 2> /dev/null | awk 'NF == 3 { print $3 }' | sort -u > $O/shared.syms
 inst() {   # inst <bin> <width>: $O/<bin>.w<width>.i.o, the width's instance of <bin>
   local b=$O/$1.w$2
-  ld -r --force-group-allocation -o $b.r.o $b.o $O/attn.w$2.o $O/attn_bind.w$2.o $O/attn_ops.w$2.o
+  local attn="$O/attn.w$2.o $O/attn_bind.w$2.o $O/attn_ops.w$2.o"
+  [ "$INK2" = 1 ] && attn=""
+  ld -r --force-group-allocation -o $b.r.o $b.o $attn
   objcopy --redefine-sym main=g6w$2_main $b.r.o
   nm --defined-only -g $b.r.o | awk 'NF == 3 { print $3 }' | sort -u | comm -12 - $O/shared.syms > $b.weak
   { echo g6w$2_main; cat $b.weak; } > $b.keep

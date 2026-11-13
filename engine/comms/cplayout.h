@@ -84,6 +84,7 @@ struct VLayout
 // part(i, k) for k = 1..nr-1 = the partial (m, l, c) of head group (rank + k) % nr, single destination.
 // Capacities scale with mmax (the most verify rows a step may carry); a step with M rows sends M x row bytes.
 // Flash: a candidate is a pool (512 a row), and a layer without attention (KDA, attn[i] false) has no collectives.
+#if !G6_MODEL_INK2   // Inkling-2-Small has no CP attention: its collectives are sized in runtime/ink2_step.cuh
 struct CpColls
 {
 #if G6_MODEL_FLASH
@@ -128,5 +129,6 @@ struct CpColls
         return s;
     }
 };
+#endif   // !G6_MODEL_INK2
 
 }  // namespace g6
