@@ -31,7 +31,7 @@ BASELINES = [
     ('glm53f', '2', 'int4', '', '9d164756e667cdfdff7f7184eb7f31b34f80c98931dd2f6b56ff2033e0bbae74'),
     ('glm53f', '1', 'fp8', '', '0fe0f8d5676effcb5d41571becaa710730acb0ae90ecd3d7177d68d922a2a661'),
     ('glm53f', '1', 'int4', '', '60f4509f961494b35ddb0744001c46e99c6c7e929b73bd676962c4a263304b34'),
-    ('ds41', '4', 'fp8', '', '912130929559af68df2e8470aa68b62dde8bd3fa2fbbcb6dc5107f9d0c21010b'),
+    ('ds41', '4', 'fp8', '', '87d29e890f4cd1b40c4bb5972d7aaa603ebbdf8c1b7986a9734b32b6959128fb'),
     ('pseudo', '1', 'fp8', '', '4da55a9cecc1bde601e0afb471417298eabc014fe5e58cd04be2b7838377f50a'),
     ('pseudo', '2', 'fp8', '', '4da55a9cecc1bde601e0afb471417298eabc014fe5e58cd04be2b7838377f50a'),
     ('pseudo', '3', 'fp8', '', '4da55a9cecc1bde601e0afb471417298eabc014fe5e58cd04be2b7838377f50a'),

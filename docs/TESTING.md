@@ -183,3 +183,23 @@ nvcc -O2 -std=c++17 -gencode=arch=compute_120a,code=sm_120a \
 "$OUT/test_ds41_elog_hygiene_gpu"
 compute-sanitizer --tool memcheck --error-exitcode 1 "$OUT/test_ds41_elog_hygiene_gpu"
 ```
+
+### V2 BF16 Tensor Core projections
+
+`test_ds41_v2_bf16_tc` checks masks 0..7, the 16-row threshold, cyclic
+request selection, deduplicated logs, and silent mask 0. The
+`GR8_DS_PF_V2_BF16_TC` bitmask enables router (1), ratio-2 compressor (2),
+and indexer/layer-20 (4) projections independently (engine default 0; launcher
+v2 default 7, `EXTRA_ENV GR8_DS_PF_V2_BF16_TC=0` for stock).
+`test_ds41_v2_bf16_tc_gpu` checks all three output paths against FP64 host
+dots, including N=32, ragged rows, padded strides, sentinel guards, immutable
+inputs, and invalid shape/alignment refusals. FP32 bounds are max absolute
+error <5e-4 and relative L2 <2e-5; BF16 bounds are at most 1 ULP and relative
+L2 <5e-4 against the BF16-rounded reference (<5e-3 against unrounded FP64).
+Four synthetic ranks compare stock and TC router logits and complete FFN
+outputs, including byte-identical small-row fallback and separated routes.
+The guarded allocation arena enforces <384 MiB and zero live bytes at exit.
+Run with `CUDA_DEVICE_MAX_CONNECTIONS=32 CUDA_MODULE_LOADING=EAGER`, also
+under `compute-sanitizer --tool memcheck --error-exitcode 1`. These are
+correctness checks, not speed or served-quality evidence. Inputs are unchanged
+BF16; FP32 accumulation order can change output bits.

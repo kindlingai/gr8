@@ -1,5 +1,6 @@
 // Included inside g6rt after the stock attention/indexer op headers. Include
-// ds41_v2.h and ../attn/ds41_attn_v2_api.h at GLOBAL scope first. This adapter
+// ds41_v2.h, ../attn/ds41_attn_v2_api.h and ../kernels/ds41_v2_bf16_tc.cuh
+// at GLOBAL scope first. This adapter
 // is called only by the v2 conductor; no stock or decode op is modified.
 #pragma once
 #if G6_MODEL_DS41
@@ -72,6 +73,7 @@ inline void ds41_v2_attn_boot(::ds41::v2::State& v, Model& m, int max_rows)
     const size_t output_bytes = size_t(g6nr::NR) * x->q * ds41a::v2::output_stride(x->heads);
     x->output_send = x->alloc<uint8_t>(output_bytes);
     x->output_recv = x->alloc<uint8_t>(output_bytes);
+    G6RT_CK(::ds41v2tc::prepare());
     v.attn = x;
 }
 inline void ds41_v2_attn_release(::ds41::v2::State& v)
@@ -137,7 +139,11 @@ inline void ds41_v2_attn_index(::ds41::v2::State& v, Ds41V2Attention& x, Model& 
                                     geom::IDX_WQB_OUT, ds41a::QA, s->q_b, geom::IDX_WQB_OUT, n, v.st);
         if (rc) ds41_idx_gemm_mx(q, ds41a::QA, qs, ds41a::QA / 32, w.wqb_codes, w.wqb_scales,
                                 geom::IDX_WQB_OUT, ds41a::QA, s->q_b, geom::IDX_WQB_OUT, n, v.st);
-        ds41_idx_gemv(own_y, ds41a::HID, w.wproj, geom::IDX_HEADS, ds41a::HID, s->wproj, geom::IDX_HEADS, n, v.st);
+        if (v.bf16_tc.idx(n) &&
+            ::ds41v2tc::can_launch_bf16(own_y, ds41a::HID, w.wproj, geom::IDX_HEADS, ds41a::HID, s->wproj, geom::IDX_HEADS, n))
+            G6RT_CK(::ds41v2tc::launch_gemm_bf16(own_y, ds41a::HID, w.wproj, geom::IDX_HEADS, ds41a::HID, s->wproj, geom::IDX_HEADS, n, v.st));
+        else
+            ds41_idx_gemv(own_y, ds41a::HID, w.wproj, geom::IDX_HEADS, ds41a::HID, s->wproj, geom::IDX_HEADS, n, v.st);
         Ds41IdxStage t{};
         t.q_b = s->q_b; t.wproj = s->wproj; t.dpos = m.pos + r0; t.klen = s->klen;
         t.max_klen = max_klen(*s, kix); t.R = n;
@@ -173,11 +179,22 @@ inline void ds41_v2_attention(::ds41::v2::State& v, Model& m, int i, const __nv_
     auto* a = ds41_attn_state(m, i);
     const int l = m.layers[i].l, n = v.g.owned;
     const int mode = geom::has_compressor_gate(l) ? 2 : l == geom::CAND_SOURCE ? 1 : 0;
-    ds41_v2_input_project(&a->W, &x->in, own_y, n, mode == 2, v.st);
+    const bool comp_tc = (mode == 2) && !a->W.c_wkv8.w && v.bf16_tc.comp(n) &&
+                         ::ds41v2tc::can_launch_f32_pair(own_y, ds41a::HID, a->W.c_wkv, a->W.c_wgate,
+                                                         ds41a::HD, ds41a::HID, x->in.ckv, x->in.csc, ds41a::HD, n);
+    ds41_v2_input_project(&a->W, &x->in, own_y, n, mode == 2 && !comp_tc, v.st);
+    if (comp_tc) {
+        G6RT_CK(::ds41v2tc::launch_gemm2_f32(own_y, ds41a::HID, a->W.c_wkv, a->W.c_wgate,
+                                             ds41a::HD, ds41a::HID, x->in.ckv, x->in.csc, ds41a::HD, n, v.st));
+    }
     if (mode == 1 && n) {
         const auto* s = ds41_idx_detail::find(m, false);
         if (!s) die("DS41 v2 attention: layer20 index binding missing");
-        ds41_idx_gemv(own_y, ds41a::HID, s->lay[i].cmp_wkv, ds41a::HD, ds41a::HID, x->in.ckv1, ds41a::HD, n, v.st);
+        if (v.bf16_tc.idx(n) &&
+            ::ds41v2tc::can_launch_bf16(own_y, ds41a::HID, s->lay[i].cmp_wkv, ds41a::HD, ds41a::HID, x->in.ckv1, ds41a::HD, n))
+            G6RT_CK(::ds41v2tc::launch_gemm_bf16(own_y, ds41a::HID, s->lay[i].cmp_wkv, ds41a::HD, ds41a::HID, x->in.ckv1, ds41a::HD, n, v.st));
+        else
+            ds41_idx_gemv(own_y, ds41a::HID, s->lay[i].cmp_wkv, ds41a::HD, ds41a::HID, x->in.ckv1, ds41a::HD, n, v.st);
     }
     ds41_v2_input_pack(&x->in, x->input_send, n, v.g.Q, mode, v.st);
     ::ds41::v2::Segment in{x->input_send, x->input_all, size_t(ds41a::v2::input_stride(mode))};
@@ -235,8 +252,13 @@ inline void ds41_v2_attn_l20_ca_row(::ds41::v2::State& v, Model& m, int i, const
     s->cand_ready=false;
     static_assert(ds41a::v2::input_stride(2)>=int(ds41a::HD*sizeof(__nv_bfloat16)),"input_send holds BF16 ckv1");
     auto* ckv1_own=reinterpret_cast<__nv_bfloat16*>(x->input_send);
-    if(v.g.owned)
-        ds41_idx_gemv(own_y,ds41a::HID,s->lay[i].cmp_wkv,ds41a::HD,ds41a::HID,ckv1_own,ds41a::HD,v.g.owned,v.st);
+    if(v.g.owned) {
+        if(v.bf16_tc.idx(v.g.owned) &&
+           ::ds41v2tc::can_launch_bf16(own_y,ds41a::HID,s->lay[i].cmp_wkv,ds41a::HD,ds41a::HID,ckv1_own,ds41a::HD,v.g.owned))
+            G6RT_CK(::ds41v2tc::launch_gemm_bf16(own_y,ds41a::HID,s->lay[i].cmp_wkv,ds41a::HD,ds41a::HID,ckv1_own,ds41a::HD,v.g.owned,v.st));
+        else
+            ds41_idx_gemv(own_y,ds41a::HID,s->lay[i].cmp_wkv,ds41a::HD,ds41a::HID,ckv1_own,ds41a::HD,v.g.owned,v.st);
+    }
     ::ds41::v2::Segment seg{ckv1_own,x->in.ckv1,size_t(ds41a::HD)*sizeof(__nv_bfloat16)};
     ::ds41::v2::all_gather(v,::ds41::v2::Coll::AttnIn,&seg,1,v.st);
     const auto& w=s->lay[i];

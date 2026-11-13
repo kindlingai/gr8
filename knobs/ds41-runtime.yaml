@@ -272,6 +272,20 @@ knobs:
       warp-quad shuffles, skipping the separate relayout. Logs rank/request/slot/mode
       once per active request/slot for nonzero modes. Default 0 keeps both paths unchanged.
 
+  GR8_DS_PF_V2_BF16_TC:
+    scope: agree
+    kind: ints
+    default: "0"
+    doc: >-
+      V2 prefill only (GR8_DS_PF_V2=1): comma list of bitmasks in 0..7 (e.g. 0,
+      1, 2, 4, 7, 0,7), where request ID r selects mask = list[r % length].
+      Default 0 keeps stock projections. When rows >= 16: bit 1 runs V2 router
+      gate logits on BF16 Tensor Cores (FP32 accumulate); bit 2 runs V2 ratio-2
+      compressor paired projections (when GR8_DS_COMP_FP8=0) on BF16 Tensor
+      Cores (FP32 accumulate); bit 4 runs V2 indexer wproj and layer-20 cmp_wkv
+      projections on BF16 Tensor Cores (FP32 accumulate, BF16 round-to-nearest
+      output). Logs "# ds41_v2_bf16_tc rank=<r> request=<id> slot=<s> on=1 mask=<m>"
+      once per active request per rank when mask != 0 (0 lines when mask is 0).
   GR8_DS_PF_V2_W16K:
     scope: agree
     kind: flag

@@ -11,6 +11,7 @@
 #include "ds41_v2_attn_pipe.h"
 #include "ds41_v2_l20_tail.h"
 #include "ds41_v2_send_ffn_opt.h"
+#include "ds41_v2_bf16_tc.h"
 
 namespace ds41::v2 {
 constexpr int MAX_ROWS = 8192;
@@ -173,6 +174,7 @@ struct State {
     AttnPipe attn_pipe;
     L20Tail l20_tail;
     SendFfnOpt send_ffn_opt;
+    Bf16Tc bf16_tc;
     cudaStream_t st = nullptr, cs = nullptr;
     cudaEvent_t produced[int(Coll::Count)] = {}, received[int(Coll::Count)] = {};
     g6::Fabric* fabric = nullptr;

@@ -288,6 +288,8 @@ inline void init(State& s,g6::Fabric& f,cudaStream_t st) {
     require(s.l20_tail.init(knob::ds_pf_v2_l20_tail()), "GR8_DS_PF_V2_L20_TAIL needs 0 or 1 entries");
     s.send_ffn_opt=SendFfnOpt{};
     require(s.send_ffn_opt.init(knob::ds_pf_v2_send_ffn_opt()), "GR8_DS_PF_V2_SEND_FFN_OPT needs modes 0..3");
+    s.bf16_tc = Bf16Tc{};
+    require(s.bf16_tc.init(knob::ds_pf_v2_bf16_tc()), "GR8_DS_PF_V2_BF16_TC needs masks 0..7");
     s.attn_pipe=AttnPipe{};
     s.attn_pipe.on=knob::ds_pf_v2_attn_pipe();
     s.widths=CommWidths{};

@@ -131,6 +131,7 @@ bool ds41_c2_trace_on();
 #include "ds41_prefill_fabric.h"
 #include "ds41_v2.h"
 #include "ds41_v2.cuh"
+#include "../kernels/ds41_v2_bf16_tc.cuh"
 #include "ds41_v2_ffn.cuh"
 #include "ds41_v2_engram.cuh"
 #include "../attn/ds41_attn_v2_api.h"
@@ -1896,6 +1897,7 @@ int main(int argc, char** argv)
                     if (v2engine.v.attn_pipe.on) ds41_attn_set_pipe(1);
                     ds41::v2::timing_begin_chunk(v2engine.v,c.request,c.first,c.rows);
                     v2engine.v.send_ffn_opt.select(c.request,c.slot,R);
+                    v2engine.v.bf16_tc.select(c.request,c.slot,R);
                     v2engine.run(m,(int)c.rows,split.i_late,skip_late);
                     if (v2engine.v.attn_pipe.on) ds41_attn_set_pipe(0);
                     ds41::v2::timing_end_chunk(v2engine.v);

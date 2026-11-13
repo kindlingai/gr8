@@ -1,6 +1,7 @@
 KindlingAI is:
 
 - [@adapt-ai-systems](https://github.com/adapt-ai-systems)
+  - Default BF16 tensor-core router, ratio-2 compressor and indexer/cmp_wkv projections for DeepSeek v2 sequence-parallel prefill, with explicit `=0` rollback.
   - GLM-5.3-Flash shared-round marginal-utility waterfill speculative row allocation.
   - GLM-5.3 TP=4 INT4 KV default with explicit FP8 rollback, folded Hadamard UK/UV weights and 16-head tensor-core decode attention.
   - Bit-exact INT4 decode attention: multi-slot warp scores, lane-transposed query rotation, compacted double-buffered context partials and fused output rotation.

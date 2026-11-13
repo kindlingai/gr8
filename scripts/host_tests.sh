@@ -14,7 +14,7 @@ bash "$REPO/engine/runtime/tests/nvcc_cache_test.sh"
 # the DS41 build knobs -> nvcc flags (scripts/ds41_build_flags.sh: GR8_DS_TRUNK_BF16)
 bash "$REPO/engine/runtime/tests/ds41_build_flags_test.sh"
 # v2 communication width sweeps: host-only request selection and validation.
-for test in test_ds41_v2_l20_tail test_ds41_v2_send_ffn_opt; do
+for test in test_ds41_v2_l20_tail test_ds41_v2_send_ffn_opt test_ds41_v2_bf16_tc; do
   g++ -std=c++17 -O2 -Wall -Wextra "$REPO/engine/tests/$test.cpp" -o "$T/$test"
   "$T/$test"
 done
