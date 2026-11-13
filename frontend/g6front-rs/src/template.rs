@@ -35,6 +35,7 @@ pub struct ChatTemplate {
     env: Environment<'static>,
     special: Vec<(&'static str, Value)>,
     supports_developer: bool,
+    hf_content: bool,
     /// Flash-only explicit empty think block; never changes the full-GLM template.
     pub flash_thinking_off: bool,
     /// the reasoning efforts the template names (`thinking::template_levels`), highest first
@@ -44,11 +45,59 @@ pub struct ChatTemplate {
 /// Keyword args the renderer owns; a request cannot override them through chat_template_kwargs.
 const RESERVED: [&str; 5] = ["messages", "tools", "documents", "chat_template", "tokenize"];
 
+fn normalize_special_token(v: Value) -> Value {
+    match &v {
+        Value::Object(_) => crate::tok::token_text(&v).map_or(Value::Null, Value::from),
+        _ => v,
+    }
+}
+
+fn extract_chat_template(cfg: &Value) -> Option<String> {
+    match cfg.get("chat_template")? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(items) => items
+            .iter()
+            .find(|it| it.get("name").and_then(Value::as_str) == Some("default"))
+            .and_then(|it| it.get("template"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        Value::Object(map) => map.get("default").and_then(Value::as_str).map(str::to_string),
+        _ => None,
+    }
+}
+
 impl ChatTemplate {
     pub fn load(dir: &Path, eos_token: Value, pad_token: Value) -> Result<ChatTemplate, String> {
         let p = dir.join("chat_template.jinja");
-        let source = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let tok_cfg_path = dir.join("tokenizer_config.json");
+        let tok_cfg = std::fs::read_to_string(&tok_cfg_path).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        let source = match std::fs::read_to_string(&p) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match tok_cfg.as_ref().and_then(extract_chat_template) {
+                    Some(s) => s,
+                    None => {
+                        return Err(format!(
+                            "{}: {e} (and no chat_template in {})",
+                            p.display(),
+                            tok_cfg_path.display()
+                        ))
+                    }
+                }
+            }
+            Err(e) => return Err(format!("{}: {e}", p.display())),
+        };
         let mut template = Self::from_source(source, eos_token, pad_token)?;
+        if let Some(cfg) = tok_cfg.as_ref() {
+            for key in ["bos_token", "unk_token"] {
+                if let Some(v) = cfg.get(key).filter(|v| !v.is_null()).cloned() {
+                    let norm = normalize_special_token(v);
+                    if !norm.is_null() {
+                        template.special.push((key, norm));
+                    }
+                }
+            }
+        }
         let config =
             std::fs::read_to_string(dir.join("config.json")).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok());
         template.flash_thinking_off =
@@ -57,6 +106,8 @@ impl ChatTemplate {
     }
 
     pub fn from_source(source: String, eos_token: Value, pad_token: Value) -> Result<ChatTemplate, String> {
+        let eos_token = normalize_special_token(eos_token);
+        let pad_token = normalize_special_token(pad_token);
         let levels = crate::thinking::template_levels(&source);
         let supports_developer = source.contains("\"developer\"") || source.contains("'developer'");
         let mut env = Environment::new();
@@ -76,9 +127,17 @@ impl ChatTemplate {
             env,
             special: vec![("eos_token", eos_token), ("pad_token", pad_token)],
             supports_developer,
+            hf_content: false,
             flash_thinking_off: false,
             levels,
         })
+    }
+
+    /// Standard text HF templates consume strings, not GLM's OpenAI content-part lists.
+    pub fn hf(mut self) -> Self {
+        self.hf_content = true;
+        self.flash_thinking_off = false;
+        self
     }
 
     pub fn resolve_thinking(
@@ -129,7 +188,17 @@ impl ChatTemplate {
         }
         let close_think =
             self.flash_thinking_off && add_generation_prompt && kw.get("enable_thinking") == Some(&Value::Bool(false));
-        let conv = normalize_messages(messages, self.supports_developer)?;
+        let mut conv = normalize_messages(messages, self.supports_developer)?;
+        if self.hf_content {
+            for m in &mut conv {
+                if let Some(parts) = m["content"].as_array() {
+                    if parts.iter().all(|p| p["type"] == "text") {
+                        m["content"] =
+                            Value::from(parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("\n"));
+                    }
+                }
+            }
+        }
         // render(messages=, tools=, documents=, add_generation_prompt=, continue_final_message=, **special, **kw)
         let mut ctx = Map::new();
         ctx.insert("messages".into(), Value::Array(conv));
@@ -968,5 +1037,88 @@ mod tests {
         let t = ChatTemplate::load(Path::new(&dir), Value::Null, Value::Null).unwrap();
         assert_eq!(t.levels, vec!["max", "high", "low"]);
         effort_lines(&t);
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("g6front-tpl-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn load_prefers_chat_template_jinja_then_falls_back_to_tokenizer_config() {
+        // 1. String chat_template in tokenizer_config.json when chat_template.jinja is absent
+        let d_str = temp_dir("str");
+        std::fs::write(
+            d_str.join("tokenizer_config.json"),
+            json!({
+                "chat_template": "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content[0].text }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}{% endif %}",
+                "eos_token": "<|im_end|>"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let t_str = ChatTemplate::load(&d_str, json!("<|im_end|>"), Value::Null).unwrap();
+        let msgs = json!([{"role": "user", "content": "hello"}]);
+        let mut kw_on = Map::new();
+        kw_on.insert("add_generation_prompt".into(), Value::Bool(true));
+        assert_eq!(
+            t_str.render(Some(&msgs), None, kw_on).unwrap(),
+            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n"
+        );
+        let mut kw_off = Map::new();
+        kw_off.insert("add_generation_prompt".into(), Value::Bool(true));
+        kw_off.insert("enable_thinking".into(), Value::Bool(false));
+        assert_eq!(
+            t_str.render(Some(&msgs), None, kw_off).unwrap(),
+            "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+
+        // 2. chat_template.jinja takes priority over tokenizer_config.json when both exist
+        std::fs::write(d_str.join("chat_template.jinja"), "JINJA:{{ messages[0].content[0].text }}").unwrap();
+        let t_jinja = ChatTemplate::load(&d_str, json!("<|im_end|>"), Value::Null).unwrap();
+        assert_eq!(t_jinja.render(Some(&msgs), None, Map::new()).unwrap(), "JINJA:hello");
+        let _ = std::fs::remove_dir_all(&d_str);
+
+        // 3. Array-of-dicts chat_template in tokenizer_config.json picks the "default" entry, and AddedToken objects
+        //    for bos_token / eos_token render as token strings
+        let d_arr = temp_dir("arr");
+        std::fs::write(
+            d_arr.join("tokenizer_config.json"),
+            json!({
+                "bos_token": {"__type": "AddedToken", "content": "<|begin_of_text|>"},
+                "eos_token": {"__type": "AddedToken", "content": "<|eot_id|>"},
+                "chat_template": [
+                    {"name": "rag", "template": "RAG:{{ messages[0].content[0].text }}"},
+                    {"name": "default", "template": "{{ bos_token }}[{{ messages[0].content[0].text }}]{{ eos_token }}"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let eos_obj = json!({"__type": "AddedToken", "content": "<|eot_id|>"});
+        let t_arr = ChatTemplate::load(&d_arr, eos_obj, Value::Null).unwrap();
+        assert_eq!(t_arr.render(Some(&msgs), None, Map::new()).unwrap(), "<|begin_of_text|>[hello]<|eot_id|>");
+        let _ = std::fs::remove_dir_all(&d_arr);
+
+        // 4. Missing both chat_template.jinja and tokenizer_config.json chat_template returns an error
+        let d_empty = temp_dir("empty");
+        std::fs::write(d_empty.join("tokenizer_config.json"), "{}").unwrap();
+        assert!(ChatTemplate::load(&d_empty, Value::Null, Value::Null).is_err());
+        let _ = std::fs::remove_dir_all(&d_empty);
+    }
+    #[test]
+    fn hf_templates_receive_text_and_tool_arguments() {
+        let t = ChatTemplate::from_source(
+            "{% for m in messages %}{{ m.role }}:{{ m.content }}{% if m.tool_calls %}:{{ m.tool_calls[0].function.arguments.x }}{% endif %};{% endfor %}".into(),
+            Value::Null, Value::Null).unwrap().hf();
+        let messages = json!([
+            {"role":"user", "content":[{"type":"text", "text":"Hello"}]},
+            {"role":"assistant", "content":null, "tool_calls":[{"function":{"name":"f", "arguments":"{\"x\":2}"}}]},
+            {"role":"tool", "content":"result", "tool_call_id":"1"}
+        ]);
+        assert_eq!(t.render(Some(&messages), None, Map::new()).unwrap(), "user:Hello;assistant::2;tool:result;");
+        assert!(extract_chat_template(&json!({"chat_template":[{"name":"special", "template":"no"}]})).is_none());
     }
 }

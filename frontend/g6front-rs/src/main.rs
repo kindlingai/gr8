@@ -11,6 +11,7 @@ mod engine;
 mod gen;
 mod grammar;
 mod guard;
+mod hfparser;
 mod jsonmode;
 mod logprobs;
 mod metrics;
@@ -107,7 +108,7 @@ struct Args {
 }
 
 const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--host H] [--port N]
-                  [--dialect glm|ds41|auto] [--served-model-name NAME ...] [--max-model-len N]
+                  [--dialect glm|ds41|hf|auto] [--served-model-name NAME ...] [--max-model-len N]
                   [--reasoning-fields both|reasoning|reasoning_content]
                   [--enable-prompt-tokens-details] [--log-level LEVEL]
                   [--workers N] [--encode-threads N] [--default-max-tokens N]
@@ -374,6 +375,28 @@ async fn serve(args: Args) -> Result<(), String> {
             let d = thinking::Defaults { effort: None, budget: args.default_budget, allow_off: true };
             (None, d, effort)
         }
+        dialect::Dialect::Hf => {
+            let template = template::ChatTemplate::load(
+                &PathBuf::from(&args.model_dir),
+                tok.eos_token.clone(),
+                tok.pad_token.clone(),
+            )?
+            .hf();
+            tok.think_close = tok.encode("</think>", false)?;
+            let effort = args.default_effort.as_deref().map(thinking::parse_default_effort).transpose()?;
+            log::info!(
+                "dialect hf: tokenizer + template loaded in {:.0} ms (vocab {}, eos {:?}); reasoning efforts the \
+                 template names: {:?}; default effort {:?}, default thinking budget {}, thinking off allowed",
+                t0.elapsed().as_secs_f64() * 1e3,
+                tok.vocab_size,
+                tok.eos_ids,
+                template.levels,
+                effort,
+                args.default_budget,
+            );
+            let d = thinking::Defaults { effort, budget: args.default_budget, allow_off: true };
+            (Some(template), d, dialect::DS_DEFAULT_EFFORT)
+        }
     };
     if args.penalties != sampling::Penalties::default() {
         log::info!(
@@ -385,6 +408,7 @@ async fn serve(args: Args) -> Result<(), String> {
     let served = args.served.unwrap_or_else(|| match dialect {
         dialect::Dialect::Glm => vec!["glm-5.3".into(), "glm53".into()],
         dialect::Dialect::Ds41 => vec!["deepseek-v4.1-flash".into()],
+        dialect::Dialect::Hf => vec![dialect::hf_served_name(std::path::Path::new(&args.model_dir))],
     });
     if !args.emit_undeclared {
         log::info!("calls to tools a request did not declare stay text (--undeclared-tool-calls text)");

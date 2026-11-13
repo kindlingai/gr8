@@ -57,6 +57,29 @@ pub fn token_text(v: &Value) -> Option<&str> {
     v.as_str().or_else(|| v.get("content")?.as_str())
 }
 
+fn release_eos<'a>(generation: &'a Value, config: &'a Value) -> Option<&'a Value> {
+    generation
+        .get("eos_token_id")
+        .filter(|v| !v.is_null())
+        .or_else(|| config.get("eos_token_id").filter(|v| !v.is_null()))
+        .or_else(|| config.pointer("/text_config/eos_token_id").filter(|v| !v.is_null()))
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn eos_generation_overrides_config_and_nested_fallback() {
+        let config = json!({"eos_token_id": 1, "text_config": {"eos_token_id": 2}});
+        let generation = json!({"eos_token_id": [3, 4]});
+        assert_eq!(release_eos(&generation, &config), Some(&json!([3, 4])));
+        assert_eq!(release_eos(&Value::Null, &config), Some(&json!(1)));
+        assert_eq!(release_eos(&Value::Null, &json!({"text_config": {"eos_token_id": 2}})), Some(&json!(2)));
+        assert_eq!(release_eos(&Value::Null, &Value::Null), None);
+    }
+}
+
 impl Tok {
     /// DeepSeek closes the think block with the single `</think>` token, not GLM's "\n" + `</think>` + "\n\n".
     pub fn use_single_think_close(&mut self) {
@@ -80,7 +103,13 @@ impl Tok {
         let gen = if gp.exists() { read_json(&gp)? } else { Value::Object(Default::default()) };
         let eos_token = cfg.get("eos_token").cloned().unwrap_or_else(|| Value::from("<|endoftext|>"));
         let eos_token_id = token_text(&eos_token).and_then(|t| tk.token_to_id(t));
-        let eos = gen.get("eos_token_id").cloned().unwrap_or_else(|| eos_token_id.map_or(Value::Null, Value::from));
+        // Standard HF releases may keep EOS only in config.json (including VLM text_config).
+        let model_cfg = std::fs::read(dir.join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .unwrap_or(Value::Null);
+        let eos =
+            release_eos(&gen, &model_cfg).cloned().unwrap_or_else(|| eos_token_id.map_or(Value::Null, Value::from));
         let eos_ids = match &eos {
             Value::Array(a) => a.iter().filter_map(Value::as_i64).collect(),
             v => v.as_i64().into_iter().collect(),

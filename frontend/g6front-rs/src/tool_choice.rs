@@ -130,6 +130,17 @@ impl ToolChoice {
         self.forced_ids_for(text, tok, think_close)
     }
 
+    /// Generic HuggingFace forced reply: the start of a JSON `<tool_call>` block (`dialect::hf_forced_text`), behind
+    /// `think_close`.
+    pub fn forced_ids_hf(&self, tok: &Tok, think_close: &[u32]) -> Result<Vec<u32>, ApiError> {
+        let text = match self {
+            ToolChoice::Required => Some(crate::dialect::hf_forced_text(None)),
+            ToolChoice::Named(name) => Some(crate::dialect::hf_forced_text(Some(name))),
+            ToolChoice::None | ToolChoice::Auto => None,
+        };
+        self.forced_ids_for(text, tok, think_close)
+    }
+
     fn forced_ids_for(&self, text: Option<String>, tok: &Tok, think_close: &[u32]) -> Result<Vec<u32>, ApiError> {
         let Some(text) = text else { return Ok(Vec::new()) };
         let opener = tok.encode(&text, false).map_err(|e| ApiError::new(500, &e, None))?;
@@ -242,5 +253,40 @@ mod tests {
             let e = ToolChoice::parse(Some(&tools()), Some(&raw)).unwrap_err();
             assert_eq!((e.status, e.param.as_deref()), (400, Some("tool_choice")), "{raw}");
         }
+    }
+
+    #[test]
+    fn hf_forced_ids_encode_json_tool_call_opener() {
+        let dir = std::env::temp_dir().join(format!("g6front-tc-hf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let added = |id: u32, c: &str, special: bool| {
+            json!({"id": id, "content": c, "single_word": false, "lstrip": false, "rstrip": false,
+                   "normalized": false, "special": special})
+        };
+        let tk = json!({
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [added(16, "<think>", false), added(17, "</think>", false),
+                             added(18, "<|endoftext|>", true), added(19, "<tool_call>", false)],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
+            "post_processor": null,
+            "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true},
+            "model": {"type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": null,
+                      "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+                      "vocab": {"{": 0, "\"": 1, ":": 2, ",": 3, "Ġ": 4, "Ċ": 5,
+                                "f": 6, "n": 7, "a": 8, "m": 9, "e": 10, "r": 11, "g": 12, "u": 13, "t": 14, "s": 15},
+                      "merges": []}
+        });
+        std::fs::write(dir.join("tokenizer.json"), tk.to_string()).unwrap();
+        std::fs::write(dir.join("tokenizer_config.json"), r#"{"eos_token": "<|endoftext|>"}"#).unwrap();
+        let tok = Tok::load(&dir).unwrap();
+        let named = ToolChoice::Named("f".into());
+        let ids = named.forced_ids_hf(&tok, &[17]).unwrap();
+        assert_eq!(ids[0], 17);
+        assert_eq!(tok.decode(&ids[1..], false), "<tool_call>\n{\"name\": \"f\", \"arguments\": ");
+        let req_ids = ToolChoice::Required.forced_ids_hf(&tok, &[]).unwrap();
+        assert_eq!(tok.decode(&req_ids, false), "<tool_call>\n{\"name\": \"");
+        assert!(ToolChoice::Auto.forced_ids_hf(&tok, &[17]).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
