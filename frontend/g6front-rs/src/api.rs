@@ -454,6 +454,8 @@ struct ChatReq {
     thinking_off: bool,
     /// whether the rendered prompt leaves `<think>` open for the assistant turn
     prompt_think_open: bool,
+    /// `continue_final_message`: the reply goes on from the prompt's last assistant message
+    cfm_on: bool,
 }
 
 async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8]) -> Result<ChatReq, ApiError> {
@@ -466,16 +468,20 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     let choice = ToolChoice::parse(tools.as_ref(), body.get("tool_choice"))?;
     let rf = jsonmode::parse_response_format(body.get("response_format"), &st.grammars)?;
     let ds = st.dialect == Dialect::Ds41;
-    let (th, ds_effort, hf_enable) = match st.dialect {
+    let (th, ds_effort, hf_enable, ink_effort) = match st.dialect {
         Dialect::Ds41 => {
             let (th, e) = dialect::resolve_ds(body, st.thinking, st.ds_effort)?;
-            (th, e, None)
+            (th, e, None, None)
         }
         Dialect::Hf => {
             let (th, en) = dialect::resolve_hf(body, &st.tpl().levels, st.thinking)?;
-            (th, st.ds_effort, en)
+            (th, st.ds_effort, en, None)
         }
-        Dialect::Glm => (st.tpl().resolve_thinking(body, st.thinking)?, st.ds_effort, None),
+        Dialect::Inkling => {
+            let (th, e) = dialect::resolve_inkling(body, st.thinking, st.ink_effort.as_ref())?;
+            (th, st.ds_effort, None, e)
+        }
+        Dialect::Glm => (st.tpl().resolve_thinking(body, st.thinking)?, st.ds_effort, None, None),
     };
     let agp_val = body.get("add_generation_prompt").cloned().unwrap_or(Value::Bool(true));
     let cfm_val = body.get("continue_final_message").cloned().unwrap_or(Value::Bool(false));
@@ -488,6 +494,10 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     };
     if let Some(en) = hf_enable {
         kw.insert("enable_thinking".into(), Value::Bool(en));
+    }
+    // Inkling's template takes the effort as a name or a number, and effort 0 is its thinking off
+    if let Some(e) = ink_effort {
+        kw.insert("reasoning_effort".into(), e);
     }
     if truthy(body.get("chat_template")) {
         return Err(ApiError::bad("custom chat_template is not supported", Some("chat_template")));
@@ -517,6 +527,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         if th.off {
             text = match st.dialect {
                 Dialect::Hf => dialect::hf_thinking_off(text, agp_on),
+                Dialect::Inkling => text, // the effort line says it; the prompt has no think block to close
                 _ => st.tpl().thinking_off(text, agp_on),
             };
         }
@@ -593,13 +604,19 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         (Some(s), Some(e)) => think_open(&prompt, s, e),
         _ => false,
     };
-    let prompt_think_open = if st.dialect == Dialect::Hf && !cfm_on { hf_prompt_ends_think } else { tok_think_open };
+    // An Inkling prompt ends at `<|end_message|>`: the model opens its own thinking block in the reply.
+    let prompt_think_open = match st.dialect {
+        Dialect::Hf if !cfm_on => hf_prompt_ends_think,
+        Dialect::Inkling => false,
+        _ => tok_think_open,
+    };
     // The template leaves `<think>` open at the end of a chat prompt, so the reply's first token sits in the reasoning
     // span: the forced opener has to follow the close, or the call it opens is reasoning and the parser reads prose.
     let close = if prompt_think_open { st.tok.think_close.as_slice() } else { &[] };
     let force = match st.dialect {
         Dialect::Ds41 => choice.forced_ids_ds(&st.tok, close)?,
         Dialect::Hf => choice.forced_ids_hf(&st.tok, close)?,
+        Dialect::Inkling => choice.forced_ids_ink(tools.as_ref(), &st.tok, close)?,
         Dialect::Glm => choice.forced_ids(&st.tok, close)?,
     };
     params.gen.system_tokens = system;
@@ -625,7 +642,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         }
         params.gen.images = std::sync::Arc::new(spans);
     }
-    Ok(ChatReq { tools, choice, force, prompt, params, budget, rf, thinking_off, prompt_think_open })
+    Ok(ChatReq { tools, choice, force, prompt, params, budget, rf, thinking_off, prompt_think_open, cfm_on })
 }
 
 fn image_err(e: crate::vision::VisionError) -> ApiError {
@@ -797,6 +814,13 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
             } else {
                 p
             }
+        } else if st.dialect == Dialect::Inkling {
+            // the reply names its own blocks; only a continued message starts inside one (its text)
+            if cr.cfm_on {
+                p.content_first()
+            } else {
+                p
+            }
         } else if content_first {
             p.content_first()
         } else {
@@ -814,7 +838,26 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
         gen.keep_reply();
     }
     let rf = cr.rf;
-    if prompt_think_open {
+    if st.dialect == Dialect::Inkling {
+        // The model opens its thinking block itself (`<|message_model|><|content_thinking|>`, two tokens), so the
+        // budget counts from the reply's start and is at least 3: the close then lands inside the block. A reply that
+        // ended its thinking earlier has emitted `<|end_message|>`, and the rule does not fire.
+        let limit = usize::try_from(cr.budget).unwrap_or(usize::MAX);
+        let on = !thinking_off && !cr.cfm_on && cr.force.is_empty() && limit > 0 && !st.tok.think_close.is_empty();
+        if let Some(end) = st.tok.think_end.filter(|_| on) {
+            let limit = limit.max(3);
+            if st.engine.inserts() {
+                gen.params.gen.insert = Some(InsertRule {
+                    after_tokens: limit as u64 - 1,
+                    unless_emitted: Some(end),
+                    tokens: st.tok.think_close.clone(),
+                });
+                gen.thinking(end, None);
+            } else {
+                gen.thinking(end, Some(Budget { limit, close: &st.tok.think_close }));
+            }
+        }
+    } else if prompt_think_open {
         if let Some(end) = st.tok.think_end {
             let limit = usize::try_from(cr.budget).unwrap_or(usize::MAX);
             if limit > 0 && !st.tok.think_close.is_empty() && st.engine.inserts() {
@@ -1561,15 +1604,24 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                 }
             } else {
                 // the same effort and the same refusals as a chat request, so the counts agree
-                let (th, hf_enable) = if st.dialect == Dialect::Hf {
-                    dialect::resolve_hf(&body, &st.tpl().levels, st.thinking)?
-                } else {
-                    (st.tpl().resolve_thinking(&body, st.thinking)?, None)
+                let (th, hf_enable, ink_effort) = match st.dialect {
+                    Dialect::Hf => {
+                        let (th, en) = dialect::resolve_hf(&body, &st.tpl().levels, st.thinking)?;
+                        (th, en, None)
+                    }
+                    Dialect::Inkling => {
+                        let (th, e) = dialect::resolve_inkling(&body, st.thinking, st.ink_effort.as_ref())?;
+                        (th, None, e)
+                    }
+                    _ => (st.tpl().resolve_thinking(&body, st.thinking)?, None, None),
                 };
                 let agp_on = truthy(Some(&agp));
                 let mut kw = build_template_kwargs(body.get("chat_template_kwargs"), agp, cfm, th.effort, None)?;
                 if let Some(en) = hf_enable {
                     kw.insert("enable_thinking".into(), Value::Bool(en));
+                }
+                if let Some(e) = ink_effort {
+                    kw.insert("reasoning_effort".into(), e);
                 }
                 let tools = normalize_tools(body.get("tools"))?;
                 let msgs = body.get("messages").cloned().unwrap_or(Value::Null);
@@ -1581,6 +1633,7 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                 if th.off {
                     text = match st.dialect {
                         Dialect::Hf => dialect::hf_thinking_off(text, agp_on),
+                        Dialect::Inkling => text,
                         _ => st.tpl().thinking_off(text, agp_on),
                     };
                 }

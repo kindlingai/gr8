@@ -12,6 +12,7 @@ mod gen;
 mod grammar;
 mod guard;
 mod hfparser;
+mod inkparser;
 mod jsonmode;
 mod logprobs;
 mod metrics;
@@ -46,6 +47,8 @@ pub struct State {
     pub dialect: dialect::Dialect,
     /// ds41: the reasoning effort (1..=100) for a request that names none
     pub ds_effort: u32,
+    /// inkling: `--default-reasoning-effort`, a level name or a number from 0.0 to 0.99; None is the template's 0.9
+    pub ink_effort: Option<serde_json::Value>,
     pub engine: Arc<engine::Engine>,
     pub served: Vec<String>,
     pub model_name: String,
@@ -108,12 +111,13 @@ struct Args {
 }
 
 const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--host H] [--port N]
-                  [--dialect glm|ds41|hf|auto] [--served-model-name NAME ...] [--max-model-len N]
+                  [--dialect glm|ds41|hf|inkling|auto] [--served-model-name NAME ...] [--max-model-len N]
                   [--reasoning-fields both|reasoning|reasoning_content]
                   [--enable-prompt-tokens-details] [--log-level LEVEL]
                   [--workers N] [--encode-threads N] [--default-max-tokens N]
                   [--share-tokens N] [--max-connections N]
-                  [--default-reasoning-effort minimal|low|medium|high|xhigh|max (ds41: or an integer 1-100)]
+                  [--default-reasoning-effort minimal|low|medium|high|xhigh|max (ds41: or an integer 1-100;
+                   inkling: or none, or a number 0.0-0.99)]
                   [--default-thinking-budget N, Fx or N|Fx] [--allow-thinking-off] [--clamp-max-tokens]
                   [--default-presence-penalty SPEC] [--default-frequency-penalty SPEC]
                   [--default-think-end-boost start=S,per1k=P,max=M] [--default-sequence-penalty SPEC]
@@ -333,6 +337,7 @@ async fn serve(args: Args) -> Result<(), String> {
     let dialect = args.dialect.unwrap_or_else(|| {
         dialect::Dialect::detect(&PathBuf::from(&args.model_dir), tok.tk.token_to_id("｜DSML｜").is_some())
     });
+    let mut ink_effort = None;
     let (template, thinking_defaults, ds_effort) = match dialect {
         dialect::Dialect::Glm => {
             let template = template::ChatTemplate::load(
@@ -397,6 +402,31 @@ async fn serve(args: Args) -> Result<(), String> {
             let d = thinking::Defaults { effort, budget: args.default_budget, allow_off: true };
             (Some(template), d, dialect::DS_DEFAULT_EFFORT)
         }
+        dialect::Dialect::Inkling => {
+            // the model's own template reads content-part lists, so no `.hf()`; the reply names its blocks with
+            // control tokens (inkparser.rs); thinking off is the template's effort 0, so it needs no flag
+            let template = template::ChatTemplate::load(
+                &PathBuf::from(&args.model_dir),
+                tok.eos_token.clone(),
+                tok.pad_token.clone(),
+            )?
+            .single_text();
+            tok.use_inkling_thinking()?;
+            tok.add_tokenizer_eos();
+            ink_effort = args.default_effort.as_deref().map(dialect::parse_inkling_default_effort).transpose()?;
+            log::info!(
+                "dialect inkling: tokenizer + template loaded in {:.0} ms (vocab {}, eos {:?}); image placeholder {}; \
+                 default effort {}, default thinking budget {}, thinking off allowed",
+                t0.elapsed().as_secs_f64() * 1e3,
+                tok.vocab_size,
+                tok.eos_ids,
+                template.image_mark,
+                ink_effort.as_ref().map_or("the template's (0.9)".to_string(), |v| v.to_string()),
+                args.default_budget,
+            );
+            let d = thinking::Defaults { effort: None, budget: args.default_budget, allow_off: true };
+            (Some(template), d, dialect::DS_DEFAULT_EFFORT)
+        }
     };
     if args.penalties != sampling::Penalties::default() {
         log::info!(
@@ -409,6 +439,7 @@ async fn serve(args: Args) -> Result<(), String> {
         dialect::Dialect::Glm => vec!["glm-5.3".into(), "glm53".into()],
         dialect::Dialect::Ds41 => vec!["deepseek-v4.1-flash".into()],
         dialect::Dialect::Hf => vec![dialect::hf_served_name(std::path::Path::new(&args.model_dir))],
+        dialect::Dialect::Inkling => dialect::inkling_served_names(std::path::Path::new(&args.model_dir)),
     });
     if !args.emit_undeclared {
         log::info!("calls to tools a request did not declare stay text (--undeclared-tool-calls text)");
@@ -420,6 +451,7 @@ async fn serve(args: Args) -> Result<(), String> {
         template,
         dialect,
         ds_effort,
+        ink_effort,
         engine: engine.clone(),
         model_name: served[0].clone(),
         served,

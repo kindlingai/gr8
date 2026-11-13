@@ -54,8 +54,8 @@ On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 
 | `--model-dir` | required | Directory holding `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja` (or `chat_template` inside `tokenizer_config.json`) and `generation_config.json`. Its `temperature` and `top_p` are the defaults for a request that names none. DeepSeek-V4.1-Flash: with no `top_p` there, a request without one samples at 0.95. DeepSeek's V4.1-Flash README recommends 0.95 or 1.0 and evaluates at 0.95; the 1017 README recommends 1.0 (send `top_p: 1.0` for it). At temperature 1.0 on 4 Sparks, 0.95 decoded 7-13% faster with the same sampled quality. |
 | `--engine-sock` | `/run/g6/engine.sock` | Engine Unix socket. |
 | `--host` / `--port` | `0.0.0.0` / `8100` | Listen address. |
-| `--dialect` | `auto` | `glm`, `ds41`, `hf`, or `auto` (detects `ds41` on `DeepseekV4` / `｜DSML｜`, `glm` when `config.json` is absent or names a `Glm` / `ChatGLM` architecture, and `hf` on other HuggingFace `architectures[0]` entries such as Qwen, Llama or Mistral). |
-| `--served-model-name` | `glm-5.3 glm53` (`glm`), `deepseek-v4.1-flash` (`ds41`), `--model-dir` basename (`hf`) | Accepted `model` values. The first one is reported in responses. |
+| `--dialect` | `auto` | `glm`, `ds41`, `hf`, `inkling`, or `auto` (detects `ds41` on `DeepseekV4` / `｜DSML｜`, `inkling` on an `Inkling...` architecture or `"model_type": "inkling2"`, `glm` when `config.json` is absent or names a `Glm` / `ChatGLM` architecture, and `hf` on other HuggingFace `architectures[0]` entries such as Qwen, Llama or Mistral). |
+| `--served-model-name` | `glm-5.3 glm53` (`glm`), `deepseek-v4.1-flash` (`ds41`), `--model-dir` basename (`hf`), `inkling-2-small ink2` plus the `--model-dir` basename (`inkling`) | Accepted `model` values. The first one is reported in responses. |
 | `--max-model-len` | 0 (use the engine `hello`) | Overrides the context length. |
 | `--reasoning-fields` | `reasoning` | `reasoning`, `reasoning_content` or both. The default matches vLLM 0.30, which sends only `reasoning`. |
 | `--enable-prompt-tokens-details` | off | Adds `usage.prompt_tokens_details.cached_tokens`. |
@@ -63,7 +63,7 @@ On a GB10 (Grace) rank-0 node, tokenizer encode takes 12 ms at 8K tokens and 71 
 | `--share-tokens` | 0 | With `--default-max-tokens 0`: a chat request that names no `max_tokens` gets what keeps prompt + `max_tokens` within N, but at least 8,192 (past the limit it runs alone anyway). 0 = all the room the context leaves. `./gr8 glm53 up` passes `SHARE_LIMIT` less a 64-token page for the engine's guard rows. |
 | `--clamp-max-tokens` | off | A `max_tokens` or `max_completion_tokens` past the room the context leaves after the prompt is cut to that room. Without it the request gets OpenAI's and vLLM's 400. An agent harness that sends a fixed large value on every turn (128,000 from DeepSeek Harness) otherwise fails once its history grows past the context less that value. A prompt that fills the context is refused either way. `./gr8 glm53 up` passes it with `CLAMP_MAX_TOKENS=1`. |
 | `--max-connections` | 512 | Connections served at once; more wait in the listen backlog. Request headers must arrive within 30 s and a body within 120 s. |
-| `--default-reasoning-effort` | none | `reasoning_effort` for a chat request that names none: `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, heard as the nearest level the template names. `./gr8 glm53 up` passes `DEFAULT_REASONING_EFFORT` when it is set. |
+| `--default-reasoning-effort` | none | `reasoning_effort` for a chat request that names none: `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, heard as the nearest level the template names. `ds41` also takes an integer from 1 to 100, and `inkling` also takes `none` or a number from 0.0 to 0.99. `./gr8 glm53 up` passes `DEFAULT_REASONING_EFFORT` when it is set. |
 | `--default-thinking-budget` | 0 | `thinking_budget` for a chat request that names none, 0 or null (0 = no limit). The value is a token count, a fraction of the request's `max_tokens` written `0.8x`, or both written `32768\|0.8x`, which takes the smaller. It is resolved per request against the effective `max_tokens` (the request's, else the default, else the room the context leaves). A fraction gives at least 1 token, so a tiny `max_tokens` never turns it into no limit. A request with `logprobs` gets none. `./gr8 glm53 up` passes `DEFAULT_THINKING_BUDGET` when it is set. |
 | `--default-presence-penalty` / `--default-frequency-penalty` | 0 | The server's `presence_penalty` / `frequency_penalty` spec (OpenAI's penalties: the engine lowers the logit of every token the reply already holds by `presence_penalty` + `frequency_penalty` x its count, before temperature and top-p; the prompt does not count, vLLM's semantics). One part, or a comma list of `base=`, `thinking=`, `greedy=`, `nongreedy=`, `greedy.thinking=`, `nongreedy.thinking=` and `temperature=` parts, each once (`greedy.base=` is `greedy=`). A part is `[+]A[*M]`: an amount added and a multiplier (`base=0.2` adds 0.2 at multiplier 1; `thinking=*1.1` adds nothing and boosts by 10%; `thinking=+0.1*1.1` both; `-0.1*0.5` is fine). The operator's parts resolve first. The whole reply's total: out = (base.A + gn.A) x base.M x gn.M, gn the condition the request's temperature after defaults picks (`greedy` when it is exactly 0, else `nongreedy`; any other temperature, however small, is sampling). The think block (a chat prompt's, until `</think>`; a `thinking_budget` continuation has none) adds (thinking.A + gn.thinking.A) x thinking.M x gn.thinking.M. A `temperature=[[+]A][*B]` part is a last stage over each total at the request's effective temperature T (a guard retry keeps the request's T): total' = (total + A x T) x (B x T), the factor only when `*B` is written, so `temperature=*1` makes the operator's penalty proportional to the temperature and zero under greedy. (A multiplier of B^T, 1 at T = 0, would keep a greedy penalty while scaling with temperature; not implemented.) Then the request's own values: `presence_penalty` replaces `base`'s amount and is added after the stage, unscaled, 0 included (so a client that sends `presence_penalty: 0` by habit still gets the conditions), and `thinking_presence_penalty` replaces `thinking`'s amount the same way (the condition's thinking part stays). No condition multiplier, `*0` included, reaches a value the client set: under `greedy=0.2,greedy.thinking=0.5` a sampling client that sends 1.5 gets 1.5, a greedy one 1.7 outside the block and 2.0 inside. That last number is the clamp: a client's own value in -2..2 is valid as such (OpenAI's rule; outside it is a 400), and when the operator's parts take a total past the engine's -2..2 the total is held to the range, the block's total also to within 2 of the reply's, since the engine takes the difference (in - out). A spec any combination of which resolves outside -2..2 (either total, or their difference) at any T in 0..2 on its own is still refused at boot. The guard's resamples keep the request's resolved values. A nonzero penalty needs an engine whose hello says `penalties` (g6m4 with the `pen` field, the pseudo engine), else 400. The TP=1 Flash recipe, greedy requests only: `greedy=0.2,greedy.thinking=0.5` for presence. `./gr8 glm53 up` passes `DEFAULT_PRESENCE_PENALTY` / `DEFAULT_FREQUENCY_PENALTY` when they are set. |
 | `--default-think-end-boost` | off | The think-end boost, a soft thinking budget, below. `./gr8 glm53 up` passes `DEFAULT_THINK_END_BOOST` when it is set. |
@@ -399,3 +399,37 @@ Malformed calls stay text. `auto`, `required` and named-function choices are
 supported; forced choices use token insertion, not schema-constrained generation.
 This dialect does not parse GLM argument tags, DSML, or `[TOOL_CALLS]` syntax.
 A new frontend dialect does not add engine kernels or weight-loader support.
+
+### Inkling (`--dialect inkling`)
+
+Use `inkling` for Inkling-2. The prompt comes from the model's own
+`chat_template.jinja`; string content reaches it as a string and a list of parts
+as a list. A reply stops on `config.json`'s `eos_token_id`
+(`<|content_model_end_sampling|>`) or on the tokenizer's `eos_token`.
+
+The reply is a run of tagged blocks, each closed by `<|end_message|>`:
+`<|message_model|><|content_thinking|>` blocks are returned as reasoning,
+`<|content_text|>` blocks as content, and, with tools offered,
+`<|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{...}}`
+blocks as OpenAI tool calls (several per turn work). Without tools, with
+`tool_choice: "none"`, or when the JSON does not parse, the block's JSON body
+stays content. The control tags never reach the client.
+
+`reasoning_effort` (top level or in `chat_template_kwargs`) is `none`, `minimal`,
+`low`, `medium`, `high`, `xhigh`, `max`, or a number from 0.0 to 0.99; anything
+else is a 400. The template prints it as a `Thinking effort level` system line
+and uses 0.9 when a request and `--default-reasoning-effort` name none.
+`reasoning_effort: "none"` (or `0`) and `chat_template_kwargs.enable_thinking: false`
+(or `thinking: false`) turn thinking off without `--allow-thinking-off`: the
+prompt then carries effort level 0.
+
+The model opens its own thinking block, so a thinking budget counts from the
+start of the reply (and is at least 3 tokens): when it runs out before the block
+has ended, the server closes the block and opens a text block. `required` and
+named-function choices open the JSON tool-call block by token insertion;
+`required` with one declared tool names that tool.
+
+A model directory's `processor_config.json` `image_token` names the image
+placeholder the template writes, and a prompt whose text holds it is refused.
+This dialect does not serve image input yet, and adds no engine kernels or
+weight-loader support.
