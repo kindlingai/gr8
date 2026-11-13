@@ -113,7 +113,8 @@ constexpr G6ModuleInfo make()
     switch (m.model)
     {
     case G6_MODEL_ID_DS41: m.caps = G6_CAP_MTP0 | G6_CAP_PACK | G6_CAP_PARK | G6_CAP_PROMPT_DECODE | G6_CAP_DSPARK | G6_CAP_KV_STORE; break;
-    case G6_MODEL_ID_INK2: m.caps = G6_CAP_MTP0 | G6_CAP_KV_STORE; break;   // MTP 0 serving; the 5-layer drafter is not wired
+    // MTP 0..7: the drafter's context rows come from the main step's rows, as the DSpark keys do
+    case G6_MODEL_ID_INK2: m.caps = G6_CAP_MTP0 | G6_CAP_DSPARK | G6_CAP_KV_STORE; break;
     case G6_MODEL_ID_GLM53F: m.caps = G6_CAP_DFLASH2 | G6_CAP_FLASH_COST | G6_CAP_KDA | G6_CAP_GRAMMAR; break;
     default: m.caps = G6_CAP_DFLASH2 | G6_CAP_GRAMMAR | G6_CAP_KV_STORE; break;
     }

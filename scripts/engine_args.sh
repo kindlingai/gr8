@@ -262,7 +262,8 @@ ds41_defaults() {
   S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=${REUSE:-1}
 }
 
-# Inkling-2-Small: TP 6 or 4, MTP 0 (the checkpoint's drafter layers are not served), no DFlash2, no prefill stack: a
+# Inkling-2-Small: TP 6 or 4, MTP 0 to 7 drafts a round from the checkpoint's drafter layers (0, the default: no
+# drafter), no DFlash2, no prefill stack: a
 # prompt runs as CHUNK-row steps. CAP: the tokens of one session; every session holds its own pages of the 8
 # full-attention layers. EAGER=1 drops --graph.
 ink2_defaults() {
@@ -277,7 +278,7 @@ ink2_defaults() {
   case $CHUNK in [1-8]) ;; *) echo "engine_defaults: CHUNK=$CHUNK: Inkling-2-Small takes 1 to 8 prompt rows a step" >&2; return 2 ;; esac
   EAGER=${EAGER:-0}
   case $EAGER in 0|1) ;; *) echo "engine_defaults: EAGER=$EAGER: 0 (--graph) or 1 (eager, no --graph)" >&2; return 2 ;; esac
-  [ "$MTP" = 0 ] || { echo "engine_defaults: MTP=$MTP: Inkling-2-Small serves with MTP=0" >&2; return 2; }
+  case $MTP in [0-7]) ;; *) echo "engine_defaults: MTP=$MTP: Inkling-2-Small drafts 0 to 7 tokens a round" >&2; return 2 ;; esac
   case $SESS in [1-8]) ;; *) echo "engine_defaults: SESS=$SESS: Inkling-2-Small serves 1 to 8 sessions" >&2; return 2 ;; esac
   S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=${REUSE:-0}
 }
@@ -574,7 +575,7 @@ engine_args() {
     (set -f; echo $a ${EXTRA_ARGS:-})
     return
   fi
-  # Inkling-2-Small: the checkpoint directory is the model (--v2-dense), CHUNK prompt rows a step, MTP 0
+  # Inkling-2-Small: the checkpoint directory is the model (--v2-dense), CHUNK prompt rows a step, MTP drafts a round
   if [ "$_engine_profile" = ink2 ]; then
     a="--layers all --v2-dense ${V2_DENSE:-$rp} --top-p-cands 256 --chunk $CHUNK --temp 0.7 --cap $CAP --graph \
 --mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
