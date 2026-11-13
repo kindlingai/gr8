@@ -5,6 +5,7 @@
 // A Flash build compiles; the Flash-only blocks (KDA, mHC, NoPE MLA, kpool indexer, 288-expert router) are not here yet.
 // -DG6_MODEL_DS41=1 builds DeepSeek-V4.1-Flash-1017 (H5120, 384 experts top-6, MTP = 3 DSpark layers after layer 39):
 // its whole geometry is model_geom_ds41.h, and the GLM / Flash text below is left out of that build (docs/DEEPSEEK.md).
+// -DG6_MODEL_INK2=1 builds Inkling-2-Small (H4608, 384 experts top-8, 48 layers + 5 drafter layers): model_geom_ink2.h.
 #pragma once
 #ifndef G6_MODEL_FLASH
 #define G6_MODEL_FLASH 0
@@ -12,12 +13,20 @@
 #ifndef G6_MODEL_DS41
 #define G6_MODEL_DS41 0
 #endif
+#ifndef G6_MODEL_INK2
+#define G6_MODEL_INK2 0
+#endif
 #if G6_MODEL_DS41 && G6_MODEL_FLASH
 #error "G6_MODEL_DS41 and G6_MODEL_FLASH name two different models: build one"
+#endif
+#if G6_MODEL_INK2 && (G6_MODEL_DS41 || G6_MODEL_FLASH)
+#error "G6_MODEL_INK2 with G6_MODEL_DS41 or G6_MODEL_FLASH names two different models: build one"
 #endif
 
 #if G6_MODEL_DS41
 #include "model_geom_ds41.h"
+#elif G6_MODEL_INK2
+#include "model_geom_ink2.h"
 #else
 namespace geom
 {
@@ -90,4 +99,4 @@ constexpr bool full_index(int l)
 #endif
 }
 }
-#endif   // !G6_MODEL_DS41
+#endif   // !G6_MODEL_DS41 && !G6_MODEL_INK2

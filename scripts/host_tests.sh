@@ -482,5 +482,8 @@ g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/tests/test_ink2
 # the Inkling-2-Small router, plan, quantizers and tensor-core operand maps on the CPU
 g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/kernels/tests/ink2_moe_host_test.cpp" -o "$T/ink2_moe_host_test"
 "$T/ink2_moe_host_test"
+# the Inkling-2-Small geometry: constants, layer lists, per-rank slices; config.json when GR8_TEST_INK2_METADATA_DIR is set
+g++ -std=c++17 -O2 -Wall -Wextra -DG6_MODEL_INK2=1 -I "$REPO/engine" "$REPO/engine/tests/test_ink2_geom.cpp" -o "$T/test_ink2_geom" "${KNOBS[@]}"
+"$T/test_ink2_geom"
 # the bare environment reads the knob table replaced, and the table against the tree
 python3 "$REPO/tools/env_lint.py"
