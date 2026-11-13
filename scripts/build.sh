@@ -16,6 +16,8 @@
 #   MODEL=ds41 scripts/build.sh bin       only OUT_DIR/g6m4_ds41 and OUT_DIR/m4sim_ds41: DeepSeek-V4.1-Flash-1017
 #                                         (-DG6_MODEL_DS41=1, engine/model_geom_ds41.h, docs/DEEPSEEK.md), fp8 KV only; TP = 4
 #                                         unless GR8_WIDTHS or GR8_NR says otherwise
+#   MODEL=ink2 scripts/build.sh bin       only OUT_DIR/g6m4_ink2 and OUT_DIR/m4sim_ink2: Inkling-2-Small
+#                                         (-DG6_MODEL_INK2=1, engine/model_geom_ink2.h); TP = 1, 4 or 6
 #   GR8_DS_TRUNK_BF16=0 MODEL=ds41      the DS41 engine with the FP32 mHC trunk. Unset or 1 (the default): the BF16 trunk
 #                                         (-DDS_MHC_TRUNK_BF16, the same bits, half the trunk traffic and memory;
 #                                         scripts/ds41_build_flags.sh)
@@ -55,7 +57,7 @@ done
 # GR8_XGRAMMAR=DIR names a source tree instead (the image's engine stages), GR8_XGRAMMAR=0 builds without grammars.
 # Needs cmake; GLM-5.3 and Flash
 GR_OFF=""
-if [ "${MODEL:-glm}" = ds41 ]; then GR_OFF="MODEL=ds41"
+if [ "${MODEL:-glm}" = ds41 ] || [ "${MODEL:-glm}" = ink2 ]; then GR_OFF="MODEL=${MODEL}"
 elif [ "${GR8_TESTS:-1}" = only ]; then GR_OFF="GR8_TESTS=only builds no engine"
 elif [ "${GR8_XGRAMMAR:-}" = 0 ]; then GR_OFF="GR8_XGRAMMAR=0"
 fi
@@ -115,13 +117,17 @@ flash ckpt share: now' ;;
       BUILD_ENGINE=g6m4_ds41 BUILD_SIM=m4sim_ds41 BUILD_WIDTHS=4
       BUILD_DEFINE=G6_MODEL_DS41 BUILD_FC2GL=4 BUILD_INT4=0
       BUILD_FLAGS_SCRIPT=scripts/ds41_build_flags.sh BUILD_WHAT_ENV=DS41_WHAT ;;
+    ink2)
+      BUILD_ENGINE=g6m4_ink2 BUILD_SIM=m4sim_ink2 BUILD_WIDTHS='1 4 6'
+      BUILD_DEFINE=G6_MODEL_INK2 BUILD_FC2GL=4 BUILD_INT4=0
+      BUILD_WHAT_ENV=INK2_WHAT ;;
     *)
       if command -v python3 >/dev/null 2>&1 && [ -f "$REPO/tools/launch/models.py" ]; then
         local metadata
         metadata=$(python3 "$REPO/tools/launch/models.py" get "$1" build-shell) || return 2
         eval "$metadata" # shell-quoted values from our checked-in registry
       else
-        echo "MODEL=$MODEL: glm, flash or ds41" >&2
+        echo "MODEL=$MODEL: glm, flash, ds41 or ink2" >&2
         return 2
       fi ;;
   esac

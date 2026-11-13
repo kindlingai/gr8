@@ -2,7 +2,7 @@
 # the knobs. docs/SETTINGS.md explains every engine variable and flag.
 #
 # GR8_MODEL picks the model: glm53 (unset), glm53f, GLM-5.3-Flash (bin/g6m4_flash, TP 4 or 2), ds41, DeepSeek-V4.1-Flash-1017
-# (bin/g6m4_ds41, TP 4; docs/DEEPSEEK.md), or pseudo, the pseudo engine (bin/g6pseudo, frontend/pseudo-engine).
+# (bin/g6m4_ds41, TP 4; docs/DEEPSEEK.md), ink2, Inkling-2-Small (bin/g6m4_ink2, TP 6 or 4), or pseudo, the pseudo engine (bin/g6pseudo, frontend/pseudo-engine).
 #
 #   engine_defaults          needs TP (4, 6, 3 or 5); sets every knob that is unset to its default for this TP. An unset CAP
 #                            follows SHARE_LIMIT, so the KV pool keeps the same physical pages per rank (share_cap below)
@@ -20,7 +20,7 @@ _model_registry=$(cd "$(dirname "${BASH_SOURCE[0]}")/../tools/launch" && pwd)/mo
 model_field() { python3 "$_model_registry" get "${GR8_MODEL:-glm53}" "$@"; }
 _engine_profile=$(model_field engine_profile) || return 2
 _engine_binary=$(model_field engine) || return 2
-case $_engine_profile in glm|flash|ds41|pseudo) ;;
+case $_engine_profile in glm|flash|ds41|ink2|pseudo) ;;
   *) echo "unknown engine profile: $_engine_profile" >&2; return 2 ;;
 esac
 
@@ -262,6 +262,26 @@ ds41_defaults() {
   S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=${REUSE:-1}
 }
 
+# Inkling-2-Small: TP 6 or 4, MTP 0 (the checkpoint's drafter layers are not served), no DFlash2, no prefill stack: a
+# prompt runs as CHUNK-row steps. CAP: the tokens of one session; every session holds its own pages of the 8
+# full-attention layers. EAGER=1 drops --graph.
+ink2_defaults() {
+  case $TP in 6|4) ;; *) echo "engine_defaults: TP=$TP; Inkling-2-Small wants 6 or 4" >&2; return 2 ;; esac
+  local k
+  for k in DFLASH PF_OWN SPEC_ADAPT; do
+    [ "${!k:-0}" = 0 ] || { echo "engine_defaults: $k=${!k}: Inkling-2-Small has no $k" >&2; return 2; }
+  done
+  case ${REUSE:-0} in 0|1) ;; *) echo "engine_defaults: REUSE=${REUSE}: Inkling-2-Small needs REUSE=0 or 1" >&2; return 2 ;; esac
+  SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-262144}; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-0}; SESS=${SESS:-4}
+  CHUNK=${CHUNK:-8}
+  case $CHUNK in [1-8]) ;; *) echo "engine_defaults: CHUNK=$CHUNK: Inkling-2-Small takes 1 to 8 prompt rows a step" >&2; return 2 ;; esac
+  EAGER=${EAGER:-0}
+  case $EAGER in 0|1) ;; *) echo "engine_defaults: EAGER=$EAGER: 0 (--graph) or 1 (eager, no --graph)" >&2; return 2 ;; esac
+  [ "$MTP" = 0 ] || { echo "engine_defaults: MTP=$MTP: Inkling-2-Small serves with MTP=0" >&2; return 2; }
+  case $SESS in [1-8]) ;; *) echo "engine_defaults: SESS=$SESS: Inkling-2-Small serves 1 to 8 sessions" >&2; return 2 ;; esac
+  S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=${REUSE:-0}
+}
+
 # The pseudo engine: no KV pool to size, MTP, drafter or fabric. CAP bounds a request's prompt plus max_tokens.
 pseudo_defaults() {
   SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-202752}; READY_TMO=${READY_TMO:-60}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
@@ -277,6 +297,7 @@ engine_defaults() {
   done <<< "$_defaults"
   [ "$_engine_profile" = flash ] && { flash_defaults; return; }
   [ "$_engine_profile" = ds41 ] && { ds41_defaults; return; }
+  [ "$_engine_profile" = ink2 ] && { ink2_defaults; return; }
   [ "$_engine_profile" = pseudo ] && { pseudo_defaults; return; }
   case $TP in
     4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
@@ -390,12 +411,19 @@ ds41_env() {
   ENGINE_ENV="GR8_CP=0 GR8_PF_RS=0 GR8_PF_OWN=0 GR8_PF_POOL_OWNER=0 GR8_DEC_BK=${DEC_BK:-$CAP} GR8_QA_SPLIT=${QA_SPLIT:-0} GR8_IDXQ_SPLIT=${IDXQ_SPLIT:-0} GR8_MTP_SPLIT=${MTP_SPLIT:-0} ${KV_SHARE_WHEN:+GR8_KV_SHARE_WHEN=$KV_SHARE_WHEN }${DS41_TUNED:-}${EXTRA_ENV:-}"
 }
 
+# Inkling-2-Small: none of the GLM or DeepSeek engine variables; EXTRA_ENV passes through.
+ink2_env() {
+  ENGINE_BIN=$_engine_binary
+  ENGINE_ENV="${EXTRA_ENV:-}"
+}
+
 engine_env() {
   if [ "${KV4_FOLD:-0}" = 1 ] && { [ "$(model_field kv4_fold)" != 1 ] || [ "${KV_FORMAT:-fp8}" != int4 ] || [ "${KVB:-bf16}" = fp8 ]; }; then
     echo "engine_env: KV4_FOLD=1 requires glm53 int4 KV and BF16 kv_b" >&2; return 2
   fi
   [ "$_engine_profile" = flash ] && { flash_env; return 0; }
   [ "$_engine_profile" = ds41 ] && { ds41_env; return 0; }
+  [ "$_engine_profile" = ink2 ] && { ink2_env; return 0; }
   [ "$_engine_profile" = pseudo ] && { ENGINE_BIN=$_engine_binary; ENGINE_ENV=""; return 0; }
   ENGINE_BIN=$_engine_binary; [ "${KV_FORMAT:-fp8}" = int4 ] && ENGINE_BIN=$_engine_binary-int4
   ENGINE_ENV="GR8_PF_TILE=64 GR8_PF_DENSE=8192 GR8_PF_RS=1 GR8_PF_STREAMS=2 GR8_PF_ATTN_ROWS=${PF_ATTN_ROWS:-1024} GR8_PF_OWN=$PF_OWN \
@@ -544,6 +572,25 @@ engine_args() {
   if [ "$_engine_profile" = pseudo ]; then
     a="--model $V2_DENSE --cap $CAP --serve $home/s2 --s2-sessions $SESS --s2-epoch $epoch ${SET_ID:+--set-id $SET_ID}"
     (set -f; echo $a ${EXTRA_ARGS:-})
+    return
+  fi
+  # Inkling-2-Small: the checkpoint directory is the model (--v2-dense), CHUNK prompt rows a step, MTP 0
+  if [ "$_engine_profile" = ink2 ]; then
+    a="--layers all --v2-dense ${V2_DENSE:-$rp} --top-p-cands 256 --chunk $CHUNK --temp 0.7 --cap $CAP --graph \
+--mtp $MTP --serve $home/s2 --s2-port $S2PORT --s2-sessions $SESS --s2-epoch $epoch"
+    [ "${EAGER:-0}" = 1 ] && a=${a/ --graph / }
+    [ "${REUSE:-0}" = 1 ] && a="$a --reuse-prefix"
+    a="$a ${EXTRA_ARGS:-}"
+    [ -n "${SET_ID:-}" ] && a="$a --set-id $SET_ID"
+    if [ -n "${KV_STORE:-}" ] && [ "$KV_STORE" != off ]; then
+      local t IFS=';'
+      for t in $KV_STORE; do [ -n "$t" ] && a="$a --kv-store $t"; done
+      unset IFS
+      [ -n "${KV_KEEP:-}" ] && a="$a --kv-keep $KV_KEEP"
+      [ -n "${KV_SYSTEM_AFTER:-}" ] && a="$a --kv-system-after $KV_SYSTEM_AFTER"
+      [ -n "${KV_WRITE_LIMIT:-}" ] && a="$a --kv-write-limit $KV_WRITE_LIMIT"
+    fi
+    (set -f; echo $a)
     return
   fi
   # a release only, SESS sessions (flash_defaults). --chunk 1: a prompt tail goes one row a step, and a session's rows

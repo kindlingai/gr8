@@ -282,6 +282,13 @@ jobs:
               type=gha,scope=gr8
               type=gha,scope=gr8-ds41
             cache_to: type=gha,scope=gr8-ds41,mode=max
+          - leg: ink2
+            label: Inkling-2-Small
+            target: dist-ink2
+            cache_from: |
+              type=gha,scope=gr8
+              type=gha,scope=gr8-ink2
+            cache_to: type=gha,scope=gr8-ink2,mode=max
           - leg: tests
             label: tests
             target: dist-tests
@@ -340,6 +347,7 @@ jobs:
             flash) echo "Flash, TP widths 1 2 3 4" ;;
             flash-int4) echo "Flash int4 KV, TP widths 1 2 3 4" ;;
             ds41) echo "DeepSeek-V4.1-Flash, TP width 4" ;;
+            ink2) echo "Inkling-2-Small, TP widths 1 4 6" ;;
             tests) echo "test binaries, dtr_test at TP4" ;;
             *) echo "${{ matrix.label }}, TP widths ${widths:-1 2 3 4 5 6 8}" ;;
           esac >> "$GITHUB_STEP_SUMMARY"

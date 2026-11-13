@@ -154,6 +154,13 @@ def resolve_model(o, refresh=False, log=log):
                 raise modelset.ModelError(f'--model {model}: want a pseudo engine release, a directory with '
                                           'responses.toml and the tokenizer files')
             ms = modelset.pseudo_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
+        elif models.of(o) is models.INK2:   # the published safetensors checkpoint, read in place
+            m = models.of(o)
+            if not modelset.is_ink2(model):
+                raise modelset.ModelError(f'--model {model}: want a local copy of the {m.title} checkpoint (config.json, '
+                                          'model.safetensors.index.json and its shards, and the tokenizer files)'
+                                          if model else f'no model: pass --model <{m.title} checkpoint directory>')
+            ms = modelset.ink2_set(model, int(o.get('TP')), o.get('MODEL_DIR'))
         elif models.of(o).native_release:   # an exlr8 native release, read in place: no index slices, no variants
             m = models.of(o)
             if not modelset.is_release(model):

@@ -585,7 +585,7 @@ class RequiredTests(unittest.TestCase):
             o = opt.parse(['--no-config', '--peers', PEERS], env)            # down, status and logs need none
             with self.assertRaises(opt.OptionError) as e:
                 opt.validate(o)                                              # up, check, prepare, show-config
-            self.assertIn('no model: set GR8_MODEL to glm53 (GLM-5.3), glm53f (GLM-5.3-Flash) or ds41 (DeepSeek-V4.1-Flash)', str(e.exception))
+            self.assertIn('no model: set GR8_MODEL to glm53 (GLM-5.3), glm53f (GLM-5.3-Flash), ds41 (DeepSeek-V4.1-Flash) or ink2 (Inkling-2-Small)', str(e.exception))
             self.assertNotIn('pseudo', str(e.exception))
 
     def test_an_unknown_name(self):
@@ -593,7 +593,7 @@ class RequiredTests(unittest.TestCase):
                                ([], {'GR8_MODEL': 'glm53x'}, 'environment')):
             with self.assertRaises(opt.OptionError) as e:
                 opt.parse(['--no-config', *argv], env)
-            self.assertIn(f'from the {src}: not a model gr8 serves. Want glm53 (GLM-5.3), glm53f (GLM-5.3-Flash) or ds41 (DeepSeek-V4.1-Flash)',
+            self.assertIn(f'from the {src}: not a model gr8 serves. Want glm53 (GLM-5.3), glm53f (GLM-5.3-Flash), ds41 (DeepSeek-V4.1-Flash) or ink2 (Inkling-2-Small)',
                           str(e.exception))
             self.assertNotIn('pseudo', str(e.exception))
         self.assertIs(models.of(opt.parse(['--no-config'], {'GR8_MODEL': 'pseudo'})), models.PSEUDO)   # asked for
@@ -624,7 +624,7 @@ class RequiredTests(unittest.TestCase):
         self.assertIn('--tp       4, 3, 2 or 1', flash)
         self.assertIn('TP=1 k2', flash)
         self.assertIn('--drafter URL (DFlash2), --kv-format int4', flash)
-        self.assertEqual(models.SERVED, (models.GLM53, models.GLM53F, models.DS41))
+        self.assertEqual(models.SERVED, (models.GLM53, models.GLM53F, models.DS41, models.INK2))
         ds = models.describe(models.DS41)
         self.assertIn('a local copy of an exlr8 release of DeepseekV41ForCausalLM', ds)
         self.assertIn('--variant  none: the release is read in place', ds)
