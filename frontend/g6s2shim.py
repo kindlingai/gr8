@@ -39,8 +39,11 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
         t <id> <id> ...                                      newly committed tokens -> tokens frame (+ logprobs)
         m <rounds> <draft_tokens> <accepted> <acc_pos0> ...  this request's spec counters so far: about once a second
                                                              while it decodes, and once just before end
-        end <stop|length|error|abort> <stop_id or -1> <completion_tokens>   -> finish frame (with the request's
+        end <stop|length|error|abort|busy> <stop_id or -1> <completion_tokens>   -> finish frame (with the request's
                                                              `spec` and `timing`: what it added to the metrics frame)
+                                                             busy (the GR8_BUSY_* guard, docs/ENV.md) carries a 4th
+                                                             number, the Retry-After seconds: `end busy -1 0 60`
+                                                             -> an error finish with status 429 + retry_after
       A request cancelled while still queued gets only "end abort -1 0".
 A request the engine cannot parse or fit ends the whole epoch (the engine writes DIR/abort.s2 and exits), so the shim
 checks every field before it writes a file. SIGTERM/SIGINT writes DIR/quit (quit an idle engine).
@@ -491,7 +494,7 @@ class Shim:
         except Exception as e:  # a dead front end must not kill the engine loop
             log.warning('write to front end failed: %r', e)
 
-    def finish(self, r: Req, reason, ct=0, stop_id=None, message=None):
+    def finish(self, r: Req, reason, ct=0, stop_id=None, message=None, status=None, retry_after=None):
         if r.done:
             return
         r.done = True
@@ -500,9 +503,9 @@ class Shim:
         if r.fh:
             r.fh.close()
             r.fh = None
-        self.answer(r, reason, ct, stop_id, message)
+        self.answer(r, reason, ct, stop_id, message, status=status, retry_after=retry_after)
 
-    def answer(self, r: Req, reason, ct=0, stop_id=None, message=None):
+    def answer(self, r: Req, reason, ct=0, stop_id=None, message=None, status=None, retry_after=None):
         """The finish frame, once per request."""
         if r.answered:
             return
@@ -514,6 +517,10 @@ class Shim:
              'prompt_tokens': len(r.f.get('prompt') or []), 'cached_tokens': r.reused or 0, 'completion_tokens': ct}
         if message:
             f['message'] = message
+        if status is not None:
+            f['status'] = status
+        if retry_after is not None:
+            f['retry_after'] = retry_after
         # this request's share of the metrics frame's counters, the same numbers, when it added any
         if r.spec is not None:
             f['spec'] = r.spec
@@ -828,6 +835,14 @@ class Shim:
             if r.m:   # the request's last m line: what it added to the metrics counters
                 v = r.m
                 r.spec = {'drafts': v[0], 'draft_tokens': v[1], 'accepted': v[2], 'accepted_per_pos': v[3:]}
+            if reason == 'busy':
+                # the busy guard's refusal (GR8_BUSY_*): `end busy -1 0 <retry_after>` -> an error finish carrying
+                # the HTTP status and Retry-After, which the front end answers as 429 + Retry-After
+                retry = int(w[4]) if len(w) > 4 else 60
+                self.finish(r, 'error', ct=ct, message=f'busy: the server is at capacity; retry after {retry} s',
+                            status=429, retry_after=retry)
+                log.info('req.%s end busy (retry after %d s)', r.ordinal, retry)
+                return
             if reason not in ('stop', 'length', 'error', 'abort'):
                 reason = 'error'
             self.finish(r, reason, ct=ct, stop_id=sid if sid >= 0 else None,

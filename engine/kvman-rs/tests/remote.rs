@@ -174,6 +174,7 @@ fn a_tier_spills_to_a_remote_store() {
         hits: 0,
         namespace: g6kvman::pool::STOCK_NAMESPACE,
         rp: 0,
+        retired_ns: 0,
     };
     let ha = t.spill(&a, block).unwrap().unwrap();
     assert_eq!(t.spilled()[&ha].slots, vec![0, 1, 2, 3]);

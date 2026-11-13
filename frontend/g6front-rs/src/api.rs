@@ -39,20 +39,28 @@ pub struct ApiError {
     pub status: u16,
     pub message: String,
     pub param: Option<String>,
+    /// seconds for the Retry-After response header (the busy guard's 429; PROTOCOL.md `finish`), None elsewhere
+    pub retry_after: Option<u32>,
 }
 
 impl ApiError {
     pub fn new(status: u16, message: &str, param: Option<&str>) -> ApiError {
-        ApiError { status, message: message.to_string(), param: param.map(str::to_string) }
+        ApiError { status, message: message.to_string(), param: param.map(str::to_string), retry_after: None }
+    }
+
+    /// The busy guard's refusal: an OpenAI-shaped 429 body with Retry-After (docs/ENV.md GR8_BUSY_*).
+    pub fn busy(message: &str, retry_after: u32) -> ApiError {
+        ApiError { status: 429, message: message.to_string(), param: None, retry_after: Some(retry_after) }
     }
 
     pub fn bad(message: impl Into<String>, param: Option<&str>) -> ApiError {
-        ApiError { status: 400, message: message.into(), param: param.map(str::to_string) }
+        ApiError { status: 400, message: message.into(), param: param.map(str::to_string), retry_after: None }
     }
 
     fn body(&self) -> Vec<u8> {
         let ty = match self.status {
             404 => "NotFoundError",
+            429 => "RateLimitError",
             500 => "InternalServerError",
             503 => "ServiceUnavailableError",
             _ => "BadRequestError",
@@ -74,7 +82,13 @@ impl ApiError {
     }
 
     fn response(&self) -> Response<HttpBody> {
-        json_response(self.status, self.body())
+        let mut r = json_response(self.status, self.body());
+        if let Some(secs) = self.retry_after {
+            if let Ok(v) = header::HeaderValue::from_str(&secs.to_string()) {
+                r.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+        }
+        r
     }
 
     fn sse(&self) -> Bytes {
@@ -809,8 +823,18 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
         gen.params.gen.insert = Some(InsertRule { after_tokens: 0, unless_emitted: None, tokens: cr.force.clone() });
     }
     if stream {
+        // the engine's refusal (the busy guard's HTTP 429, PROTOCOL.md finish.status) and any error before the first
+        // streamed event must be an HTTP status, not an SSE event after the 200 is out: the response starts only once
+        // the engine answered something (PROTOCOL.md "the front end fails them with HTTP 500 / a stream error chunk")
+        if let Err(e) = gen.start(&st.engine) {
+            return e.response();
+        }
+        let pre = match gen.next().await {
+            Ok(p) => p,
+            Err(e) => return e.response(),
+        };
         let (sse, resp) = Sse::open();
-        tokio::spawn(async move { chat_stream(st, body, gen, parser, guard, rf, sse).await });
+        tokio::spawn(async move { chat_stream(st, body, gen, parser, guard, rf, sse, pre).await });
         return resp;
     }
     let created = now_secs();
@@ -1017,6 +1041,7 @@ async fn chat_stream(
     mut guard: Option<guard::Guard>,
     rf: jsonmode::Rf,
     sse: Sse,
+    mut pre: Option<Step>,
 ) {
     let created = now_secs();
     let so = body.get("stream_options").and_then(Value::as_object);
@@ -1030,13 +1055,17 @@ async fn chat_stream(
     let json_mode = rf.kind != "text";
     let mut held_content = String::new(); // JSON mode: content is withheld until the end, then extracted
     let r: Result<(), ApiError> = async {
-        gen.start(&st.engine)?;
+        // the engine request is already started and its first frame is `pre` (the handler held the HTTP response back
+        // for it, so a refusal arrives as the status); None = the engine finished without a token
         loop {
             // a client that goes away while nothing is being sent (prefill, held-back text) still cancels at once
-            let step = tokio::select! {
-                biased;
-                _ = sse.0.closed() => return Ok(()),
-                s = gen.next() => s?,
+            let step = match pre.take() {
+                Some(s) => Some(s),
+                None => tokio::select! {
+                    biased;
+                    _ = sse.0.closed() => return Ok(()),
+                    s = gen.next() => s?,
+                },
             };
             let Some(step) = step else { break };
             if first {
@@ -1316,8 +1345,16 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
         gen.want_step_stats();
     }
     if stream {
+        // the busy guard's refusal and any error before the first streamed event must be an HTTP status (see chat)
+        if let Err(e) = gen.start(&st.engine) {
+            return e.response();
+        }
+        let pre = match gen.next().await {
+            Ok(p) => p,
+            Err(e) => return e.response(),
+        };
         let (sse, resp) = Sse::open();
-        tokio::spawn(async move { completions_stream(st, body, gen, sse).await });
+        tokio::spawn(async move { completions_stream(st, body, gen, sse, pre).await });
         return resp;
     }
     let created = now_secs();
@@ -1382,7 +1419,13 @@ fn completions_full(st: &State, body: &Map<String, Value>, gen: &Generation, cre
     json_response(200, o)
 }
 
-async fn completions_stream(st: &'static State, body: Map<String, Value>, mut gen: Generation, sse: Sse) {
+async fn completions_stream(
+    st: &'static State,
+    body: Map<String, Value>,
+    mut gen: Generation,
+    sse: Sse,
+    mut pre: Option<Step>,
+) {
     let created = now_secs();
     let so = body.get("stream_options").and_then(Value::as_object);
     let include_usage = so.is_some_and(|s| truthy(s.get("include_usage")));
@@ -1392,13 +1435,16 @@ async fn completions_stream(st: &'static State, body: Map<String, Value>, mut ge
     let lp_k = gen.params.gen.logprobs;
     let (mut offset, mut first) = (0usize, true);
     let r: Result<(), ApiError> = async {
-        gen.start(&st.engine)?;
+        // the engine request is already started and its first frame is `pre` (see chat_stream)
         loop {
             // a client that goes away while nothing is being sent (prefill, held-back text) still cancels at once
-            let step = tokio::select! {
-                biased;
-                _ = sse.0.closed() => return Ok(()),
-                s = gen.next() => s?,
+            let step = match pre.take() {
+                Some(s) => Some(s),
+                None => tokio::select! {
+                    biased;
+                    _ = sse.0.closed() => return Ok(()),
+                    s = gen.next() => s?,
+                },
             };
             let Some(step) = step else { break };
             let finished = step.finish_reason.is_some();

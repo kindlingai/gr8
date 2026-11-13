@@ -418,6 +418,7 @@ mod tests {
             hits: 0,
             namespace: crate::pool::STOCK_NAMESPACE,
             rp: 0,
+            retired_ns: 0,
         };
         let nonstock = Kept {
             list: vec![0],
@@ -427,6 +428,7 @@ mod tests {
             hits: 0,
             namespace: [1; crate::pool::NAMESPACE_BYTES],
             rp: 0,
+            retired_ns: 0,
         };
         let free = t.free_slots();
         assert!(t.spill(&nonstock, |_, _| panic!("non-stock spill must never read a page")).unwrap().is_none());
@@ -439,6 +441,7 @@ mod tests {
             hits: 0,
             namespace: crate::pool::STOCK_NAMESPACE,
             rp: 0,
+            retired_ns: 0,
         };
         let ha = t.spill(&a, block).unwrap().unwrap();
         let hb = t.spill(&b, block).unwrap().unwrap();
@@ -454,6 +457,7 @@ mod tests {
                     hits: 0,
                     namespace: crate::pool::STOCK_NAMESPACE,
                     rp: 0,
+            retired_ns: 0,
                 },
                 block
             )
@@ -482,6 +486,7 @@ mod tests {
                     hits: 0,
                     namespace: crate::pool::STOCK_NAMESPACE,
                     rp: 0,
+            retired_ns: 0,
                 },
                 block,
             )

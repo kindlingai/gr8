@@ -87,6 +87,34 @@ pub fn lend_idle(resident: u32, queued: usize, retiring: u32) -> bool {
     share_idle(resident, queued) && retiring == 0
 }
 
+/// The busy guard's grant decision (GR8_BUSY_GUARD=1, docs/ENV.md): a fresh grant whose eviction set (the pool's
+/// busy_view) holds a live retained run — its session has no request in flight but its last response ended under the
+/// idle bound ago — refuses the request with HTTP 429 + Retry-After instead of evicting the run. `hit`: the prompt
+/// continues its own retained run, which the guard never refuses (the adoption is not an eviction).
+pub fn busy_refuse(guard_on: bool, hit: bool, live_victims: u32) -> bool {
+    guard_on && !hit && live_victims > 0
+}
+
+/// The busy guard's arrival decision: a request that would join a queue already `queued` deep is refused at once
+/// (it would be left queued past the bound) instead of added. 0 = no bound.
+pub fn busy_queue_full(guard_on: bool, bound: u32, queued: usize) -> bool {
+    guard_on && bound > 0 && queued >= bound as usize
+}
+
+/// The busy refusal's once-per-request trace line, like wait_line.
+pub fn busy_line(last: u64, head: u64) -> bool {
+    last != head
+}
+
+/// The busy guard's intake decision (docs/ENV.md GR8_BUSY_*): with the guard on, a fresh arrival whose
+/// worst-case grant would evict a live retained run — the pool's busy_view at arrival — is refused at intake, before
+/// it queues, instead of being refused at grant time after its queue wait. The same rule as the grant path
+/// (busy_refuse): a hit continuation is never refused, and no live victim never refuses; the grant path keeps the
+/// check as the backstop, because the pool can change between intake and grant.
+pub fn busy_intake_refuse(guard_on: bool, hit: bool, live_victims: u32) -> bool {
+    busy_refuse(guard_on, hit, live_victims)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +126,33 @@ mod tests {
         assert_eq!(notice_target(10, 15, None, 8), 15);
         assert_eq!(notice_target(10, 99, None, 8), 18);
         assert_eq!(notice_target(10, 99, Some(10), 8), 10);
+    }
+
+    #[test]
+    fn busy_decisions() {
+        // the guard off is upstream behaviour: never refuse
+        assert!(!busy_refuse(false, false, 3) && !busy_refuse(false, true, 3));
+        // on: a live victim refuses a fresh grant, never a hit continuation, never an all-idle eviction set
+        assert!(busy_refuse(true, false, 1) && busy_refuse(true, false, 4));
+        assert!(!busy_refuse(true, true, 2));
+        assert!(!busy_refuse(true, false, 0));
+        // the queue bound: full at the bound, off at 0, off with the guard off
+        assert!(busy_queue_full(true, 8, 8) && busy_queue_full(true, 8, 9));
+        assert!(!busy_queue_full(true, 8, 7) && !busy_queue_full(true, 0, 99) && !busy_queue_full(false, 8, 99));
+        assert!(busy_line(1, 2) && !busy_line(2, 2));
+    }
+
+    #[test]
+    fn busy_intake_decides_like_the_grant() {
+        // the intake refusal is the grant rule applied at arrival: a fresh arrival with a live victim refuses, a hit
+        // continuation and an all-idle eviction set never do, and the guard off is upstream behaviour
+        assert!(busy_intake_refuse(true, false, 1) && busy_intake_refuse(true, false, 4));
+        assert!(!busy_intake_refuse(true, true, 2) && !busy_intake_refuse(true, false, 0));
+        assert!(!busy_intake_refuse(false, false, 3) && !busy_intake_refuse(false, true, 3));
+        // and it stays the same decision the grant path makes on the same inputs
+        for &(on, hit, v) in &[(true, false, 1), (true, false, 0), (true, true, 2), (false, false, 3)] {
+            assert_eq!(busy_intake_refuse(on, hit, v), busy_refuse(on, hit, v), "intake and grant decide alike");
+        }
     }
 
     #[test]

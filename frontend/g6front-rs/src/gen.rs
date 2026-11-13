@@ -333,6 +333,11 @@ impl Generation {
                     let reason: &'static str = match fin.reason.as_str() {
                         "error" => {
                             let m = fin.message.as_deref().unwrap_or("unknown");
+                            // the busy guard's refusal (PROTOCOL.md `finish`): the HTTP status and Retry-After the
+                            // frame carries; an engine without them keeps the plain 500
+                            if fin.status == Some(429) {
+                                return Err(ApiError::busy(m, fin.retry_after.unwrap_or(60)));
+                            }
                             return Err(ApiError::new(500, &format!("engine error: {m}"), None));
                         }
                         "abort" => return Err(ApiError::new(500, "request aborted by the engine", None)),

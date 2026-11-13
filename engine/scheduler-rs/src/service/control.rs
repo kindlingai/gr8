@@ -247,6 +247,7 @@ struct Inner {
     event: u64,
     waited: u64,  // the request whose wait the trace has
     refused: u64, // the last request the refusal line named
+    busied: u64,  // the last request the busy guard's refusal line named
     // borrow-idle: the chunks the FIFO head waits for (0 = none), when its first recall went out, the request the
     // wait line named
     recall: u32,
@@ -349,6 +350,7 @@ impl Control {
                 event: 1,
                 waited: 0,
                 refused: u64::MAX,
+                busied: u64::MAX,
                 recall: 0,
                 recall_t0: now,
                 recall_for: u64::MAX,
@@ -471,6 +473,18 @@ impl Control {
     }
     fn now_ns(&self) -> i64 {
         self.start.elapsed().as_nanos() as i64
+    }
+
+    // --- the busy guard's knobs (docs/ENV.md GR8_BUSY_*); read per decision, the way the knobs' accessors work
+
+    fn busy_on(&self) -> bool {
+        gr8knobs::BUSY_GUARD.get()
+    }
+    fn busy_idle_ns(&self) -> i64 {
+        gr8knobs::BUSY_IDLE_SECS.get().saturating_mul(1_000_000_000)
+    }
+    fn busy_queue_max(&self) -> u32 {
+        gr8knobs::BUSY_QUEUE_MAX.get() as u32
     }
 
     // --- the plain pool calls, each run held to the module's max_run_pages
@@ -753,6 +767,27 @@ impl Control {
         let bytes = self.ingress().request(command)?;
         let Some(ck) = self.check(command.request, &bytes)? else { return Ok(()) };
         let queued = request(command.request, ck.n, ck.n_gen, ck.steering);
+        // the busy guard's arrival bound (GR8_BUSY_QUEUE_MAX): a request that would join a too-deep queue is refused
+        // at once with the busy answer instead of waiting in silence past the bound
+        if admit::busy_queue_full(self.busy_on(), self.busy_queue_max(), self.queue_len()) {
+            self.busy_answer(inn, command.request, queued.id, "intake")?;
+            return Ok(());
+        }
+        // the busy guard's intake refusal (docs/ENV.md GR8_BUSY_*): a fresh arrival whose worst-case grant
+        // would evict a live retained run (the pool's busy_view at arrival) is refused here, before it queues,
+        // instead of being refused at grant time after its queue wait. The same rule as the grant path, which keeps
+        // its check as the backstop (the pool can change between intake and grant). A view that cannot be computed
+        // (a hook error) keeps the old behaviour: the request queues.
+        if self.busy_on() {
+            match self.busy_intake(&queued, &ck) {
+                Ok(true) => {
+                    self.busy_answer(inn, command.request, queued.id, "intake")?;
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(e) => eline(format!("# s2: request {}: the intake busy view failed, it queues: {e:?}\n", queued.id)),
+            }
+        }
         if let Some(t) = self.trace() {
             let args = format!(
                 "{},{},{},{}",
@@ -774,6 +809,57 @@ impl Control {
             inn.prompts.entry(command.request).or_insert(prompt);
         }
         Ok(())
+    }
+
+    // the busy guard's answer to a refused request (docs/ENV.md GR8_BUSY_*): resp.<id> carries the busy end line with
+    // the Retry-After seconds (the shim turns it into HTTP 429 + Retry-After on the front end), the request leaves the
+    // queue and the control's maps, and the s2 trace records it once. `path` names where the refusal fired ("intake"
+    // before the queue, "grant" at the admission's commit); the caller has not granted it.
+    fn busy_answer(&self, inn: &mut Inner, file_id: u64, req_id: u64, path: &str) -> R<()> {
+        let retry = gr8knobs::BUSY_RETRY_AFTER.get();
+        atomic_file(&self.path(&format!("resp.{file_id}")), format!("end busy -1 0 {retry}\n").as_bytes())?;
+        self.queue_cancel(req_id);
+        inn.commands.remove(&req_id);
+        inn.prompts.remove(&req_id);
+        inn.spans.remove(&req_id);
+        inn.payloads.remove(&req_id);
+        if let Some(t) = self.trace() {
+            if admit::busy_line(inn.busied, req_id) {
+                inn.busied = req_id;
+                let args = format!(
+                    "{},{},{}",
+                    targ("request", req_id),
+                    targ("retry_after", retry as u64),
+                    tstr("path", path)
+                );
+                t.instant(b"busy", CONTROL, args.as_bytes());
+            }
+        }
+        Ok(())
+    }
+
+    // The intake-time busy view (docs/ENV.md GR8_BUSY_*): the rows, worst case and R the admission would
+    // compute (try_fit, which also matches the prompt against the retained runs), then the pool's dry run of that
+    // reservation. Ok(true) = the arrival is a fresh request whose grant would evict a live retained run: refuse it
+    // here. Ok(false) = a hit continuation or no live victim: queue it as before. The reads are the ones the
+    // admission attempt itself makes; nothing is reserved and no queue state changes.
+    fn busy_intake(&self, queued: &Request, ck: &Checked) -> R<bool> {
+        let worst = sch::reserve_rows(&self.c, queued).map_err(refused)?;
+        let rows = self.admit_rows(queued)?;
+        let ns = cache_namespace(&queued.steering);
+        let prompt: Option<Vec<i32>> = if self.reuse() && ck.plp < 0 {
+            // SAFETY: the request bytes outlive this call (intake holds them), as the prompt copy below
+            Some(if ck.n == 0 { Vec::new() } else { unsafe { std::slice::from_raw_parts(ck.prompt, ck.n) }.to_vec() })
+        } else {
+            None
+        };
+        let mut req = *queued;
+        let (_, pre, _) = self.try_fit(&mut req, rows, worst, prompt.as_deref(), &ns, self.observer())?;
+        if pre.skip > 0 {
+            return Ok(false);   // a turn continuing its own retained run: never refused
+        }
+        let v = self.pool().lock().busy_view(rows, worst, req.r_rows, self.now_ns(), self.busy_idle_ns());
+        Ok(admit::busy_intake_refuse(true, false, v.live_victims))
     }
 
     // inside an admission's commit: queue the ADMITs already written, in cmd order; stop at the first other command (a
@@ -1039,6 +1125,19 @@ impl Control {
                 *recall = short_of;
             }
             if admit::grant(fit.why, short_of) {
+                // the busy guard (GR8_BUSY_GUARD=1): a fresh grant whose eviction set (the pool's busy_view, the dry
+                // run of the reservation it would make) holds a retained run whose session is not idle refuses the
+                // request at once with the busy answer instead of evicting it or leaving it queued in silence. A turn
+                // that continues its own retained run (a hit) is never refused: the adoption is not an eviction.
+                if self.busy_on() && pre.skip == 0 {
+                    let v = self.pool().lock().busy_view(rows, worst, r, self.now_ns(), self.busy_idle_ns());
+                    if admit::busy_refuse(true, false, v.live_victims) {
+                        self.busy_answer(inn, id, id, "grant")?;
+                        inn.attempted_head = id;
+                        inn.attempted_revision = admit::attempted_revision(st.revision);
+                        return Ok(());
+                    }
+                }
                 let (mut run, mut skip, mut restored, mut counted) = (Run::default(), 0u32, 0u32, 0u32);
                 let mut parked = -1i32; // park: the parked slot the prompt extends, which the grant takes
                 if let Some(p) = prompt {

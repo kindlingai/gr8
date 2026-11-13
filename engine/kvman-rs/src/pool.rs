@@ -110,6 +110,14 @@ pub struct Stats {
     pub stalls: u64,
 }
 
+/// busy_view's answer: the retained runs (their ages, oldest first) a reserve on the same state would evict, and how
+/// many of them the caller's clock still counts as live (their last response ended under the guard's idle bound ago).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BusyView {
+    pub victims: Vec<u64>,
+    pub live_victims: u32,
+}
+
 /// A retired run: its pages count as free until a reservation evicts it or a hit adopts its start.
 #[derive(Clone)]
 pub struct Kept {
@@ -123,6 +131,9 @@ pub struct Kept {
     pub namespace: Namespace,
     /// its prefix pages, as Held::rp
     pub rp: u32,
+    /// when this process's clock saw the retire, nanoseconds since the pool was built. Advice to the head's busy
+    /// guard only (busy_view, called with the caller's clock): never in the digest, and no pool decision reads it.
+    pub retired_ns: i64,
 }
 
 /// Opaque cache identity. Only the all-zero namespace participates in stored tiers.
@@ -203,6 +214,8 @@ pub struct Pool {
     // (a group head): a pool that never reports does no work for it and holds nothing
     seen: HashMap<u64, Instant>,
     ages_on: bool,
+    // the pool's build time: the base of the Kept::retired_ns stamps (advisory; see Kept)
+    start: Instant,
 }
 
 impl Pool {
@@ -247,7 +260,13 @@ impl Pool {
             offline: Vec::new(),
             seen: HashMap::new(),
             ages_on: false,
+            start: Instant::now(),
         })
+    }
+
+    /// This process's clock, nanoseconds since the pool was built (the retire stamps and busy_view's caller base).
+    pub fn now_ns(&self) -> i64 {
+        self.start.elapsed().as_nanos() as i64
     }
 
     /// Resize (#153): pages [0, place) in chunks of `pages_per_chunk` (the last one may be shorter). Only while every
@@ -934,6 +953,91 @@ impl Pool {
         n <= self.lo_free() as u64 && w <= self.place_online() as u64 && self.safe(Some((n, w)), None)
     }
 
+    /// The busy guard's read-only view: the retained runs a reserve_r(rows, worst, r) on this state would evict (the
+    /// same selection as fill_range/evict_for_ids, as a dry run over no changes), and how many of them are live —
+    /// their retire is `idle_ns` nanoseconds or less before `now_ns` (0 = none are ever live). The head decides a
+    /// busy refusal from this; the pool's own behaviour never reads a clock, so every rank's pool stays identical.
+    /// Call it only where reserve_r would run (fits passed): reserve skips its evictions when fits_at fails.
+    pub fn busy_view(&self, rows: u64, worst: u64, r: u32, now_ns: i64, idle_ns: i64) -> BusyView {
+        let mut victims: Vec<u64> = Vec::new();
+        if let Some(rp) = self.rp_of(r) {
+            if rows != 0 && self.admissible_at(worst, rp) {
+                if past(worst, rp) {
+                    if self.nr == 0 {
+                        // an exclusive run takes the whole pool: every retained run goes
+                        victims.extend(self.kept.iter().map(|k| k.age));
+                    } else {
+                        let (main, draft) = self.exclusive_pages(worst, rp);
+                        victims.extend(self.evict_view(main as usize, 0, self.place));
+                        victims.extend(self.evict_view(draft as usize, self.place, self.pages));
+                        if self.window > 0 {
+                            let ids = self.evict_ids_view(draft.div_ceil(self.nr as u64), &victims);
+                            victims.extend(ids);
+                        }
+                    }
+                } else {
+                    victims.extend(self.evict_view(pages_for(rows) as usize, 0, self.place));
+                }
+            }
+        }
+        let live = |age: u64| {
+            self.kept.iter().find(|k| k.age == age).is_some_and(|k| idle_ns != 0 && now_ns - k.retired_ns <= idle_ns)
+        };
+        let live_victims = victims.iter().filter(|&&a| live(a)).count() as u32;
+        BusyView { victims, live_victims }
+    }
+
+    /// evict_view: which kept runs a fill_range(need, lo, hi) on this state would evict (its claims walk, oldest
+    /// first), as a dry run. The grant's own adopted pages are the caller's concern (a fresh admission has none).
+    fn evict_view(&self, need: usize, lo: u32, hi: u32) -> Vec<u64> {
+        let (lo, hi) = (lo as usize, hi as usize);
+        let mut claims: Vec<u32> = (lo..hi).map(|p| (self.used[p] || !self.online(p as u32)) as u32).collect();
+        for k in &self.kept {
+            for &p in k.list.iter().filter(|&&p| (p as usize) >= lo && (p as usize) < hi) {
+                claims[p as usize - lo] += 1;
+            }
+        }
+        let mut spare = claims.iter().filter(|&&c| c == 0).count();
+        let mut victims = Vec::new();
+        let mut i = 0;
+        while spare < need && i < self.kept.len() {
+            let k = &self.kept[i];
+            for &p in k.list.iter().filter(|&&p| (p as usize) >= lo && (p as usize) < hi) {
+                claims[p as usize - lo] -= 1;
+                if claims[p as usize - lo] == 0 {
+                    spare += 1;
+                }
+            }
+            victims.push(k.age);
+            i += 1;
+        }
+        victims
+    }
+
+    /// evict_ids_view: the kept runs evict_for_ids(need) would take after `gone` (the fills' victims) left, as a dry
+    /// run. ids_free() over kept minus `gone`, then the oldest runs holding records until the need is met.
+    fn evict_ids_view(&self, need: u64, gone: &[u64]) -> Vec<u64> {
+        let held: u64 = self.held.values().map(|h| self.ids_of(h)).sum();
+        let kept_ids = |ages: &[u64]| {
+            self.kept
+                .iter()
+                .filter(|k| !ages.contains(&k.age))
+                .map(|k| self.kept_ids(k))
+                .sum::<u64>()
+        };
+        let mut victims = Vec::new();
+        let mut gone: Vec<u64> = gone.to_vec();
+        while self.ids > 0 && (self.ids as u64).saturating_sub(held + kept_ids(&gone)) < need {
+            let Some(i) = self.kept.iter().position(|k| !gone.contains(&k.age) && self.kept_ids(k) > 0) else {
+                break;
+            };
+            let k = &self.kept[i];
+            victims.push(k.age);
+            gone.push(k.age);
+        }
+        victims
+    }
+
     /// A run of pages for `rows` now that may grow (grow()) to `worst` rows. An exclusive run holds its worst case.
     pub fn reserve(&mut self, rows: u64, worst: u64) -> Result<Run, Error> {
         self.reserve_r(rows, worst, 0)
@@ -1108,7 +1212,7 @@ impl Pool {
         // a window run is retained with its list (prefix, window, drafter tail): the engine keeps its rows store records
         // for it, and a hit adopts them with the pages (take_hit), or they go when the pool evicts it
         self.age += 1;
-        self.kept.push(Kept { list, st, age: self.age, exclusive, hits, namespace, rp });
+        self.kept.push(Kept { list, st, age: self.age, exclusive, hits, namespace, rp, retired_ns: self.now_ns() });
         Ok(())
     }
 

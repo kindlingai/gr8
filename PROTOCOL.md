@@ -154,6 +154,8 @@ The last frame for a request; the id may be reused after it.
 | `cached_tokens` | prompt tokens served from the prefix cache (0 if none) |
 | `completion_tokens` | ids emitted in `tokens` frames for this request |
 | `message` | only with `reason: error`: human-readable cause (e.g. `"prompt too long"`, `"KV cache full"`) |
+| `status` | optional, only with `reason: error`: the HTTP status the front end answers with instead of 500. The busy guard (`GR8_BUSY_GUARD=1`, docs/ENV.md) sends `429` when it refuses a request whose grant would evict a retained run whose session is not idle (no request in flight and its last response ended under `GR8_BUSY_IDLE_SECS` ago), or that arrived with `GR8_BUSY_QUEUE_MAX` requests already queued. A turn that continues its own retained run is never refused |
+| `retry_after` | optional, only with `status: 429`: the seconds (`GR8_BUSY_RETRY_AFTER`) for the front end's `Retry-After` response header |
 | `spec` | optional: this request's share of the `metrics` frame's `spec` counters, all of what it added there by the time it ended: `{"drafts", "draft_tokens", "accepted", "accepted_per_pos"}` (verify rounds, draft tokens, accepted draft tokens, accepted per draft position) |
 | `timing` | optional: this request's share of the `metrics` frame's `latency` times, in seconds: `{"prefill_s", "decode_s"}` (added to `prefill_sum` / `decode_sum`) |
 

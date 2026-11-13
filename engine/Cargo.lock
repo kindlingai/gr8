@@ -49,6 +49,7 @@ name = "g6sched"
 version = "0.1.0"
 dependencies = [
  "g6kvman",
+ "gr8-knobs",
 ]
 
 [[package]]

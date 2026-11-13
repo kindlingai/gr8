@@ -9,3 +9,4 @@ crate-type = ["rlib"]        # the C library is libg6host.a (engine/hostcore-rs)
 
 [dependencies]
 g6kvman = { path = "../kvman-rs" }   # the driver calls the pool Rust to Rust
+gr8-knobs = { path = "../knobs-rs" } # the busy guard's knobs (GR8_BUSY_*) read through the typed accessors
