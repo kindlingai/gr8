@@ -484,6 +484,15 @@ g++ -std=c++17 -O2 "$REPO/engine/tests/test_flash_pool_owner.cpp" -o "$T/test_fl
 # the Inkling-2-Small CPU reference: state across chunks, speculative rollback, the image token, the rank split
 g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/tests/test_ink2_cpu_ref.cpp" -o "$T/test_ink2_cpu_ref"
 "$T/test_ink2_cpu_ref"
+# the miniature Inkling-2-Small checkpoint of the GPU tests (trunk + MTP drafter) against the loader's plans of 1, 4, 6 ranks
+GL=$REPO/engine/loader-rs/target/release/libg6load.a
+if command -v cargo > /dev/null 2>&1; then
+  cargo build --release --quiet --manifest-path "$REPO/engine/loader-rs/Cargo.toml"
+fi
+[ -f "$GL" ] || { echo "no $GL: cargo build --release --manifest-path engine/loader-rs/Cargo.toml"; exit 1; }
+g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/tests/test_ink2_mini_ckpt.cpp" "$REPO/engine/loader/g6pack.cpp" "$GL" \
+  -lpthread -ldl -lm -o "$T/test_ink2_mini_ckpt"
+"$T/test_ink2_mini_ckpt"
 # the Inkling-2-Small router, plan, quantizers and tensor-core operand maps on the CPU
 g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/kernels/tests/ink2_moe_host_test.cpp" -o "$T/ink2_moe_host_test"
 "$T/ink2_moe_host_test"

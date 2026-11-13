@@ -405,6 +405,23 @@ public:
     std::vector<float>& mtp_ctx_k(int l) { return mst[l].K; }
     std::vector<float>& mtp_ctx_v(int l) { return mst[l].V; }
 
+    // Give the drafter a context of n_ctx positions from outside: every layer's K and V get n_ctx zero rows (fill
+    // them through mtp_ctx_k / mtp_ctx_v) and last_taps [taps][H] becomes the tap row of position n_ctx - 1. The
+    // trunk's own state is not set: after this call only mtp_draft is valid.
+    void mtp_set_state(int n_ctx, const float* last_taps)
+    {
+        if (C.mtp_layers < 1 || n_ctx < 1) throw std::runtime_error("ink2ref: mtp_set_state arguments");
+        const size_t nk = static_cast<size_t>(C.n_kv_heads) * C.head_dim, row = ntaps() * C.hidden;
+        for (MtpState& s : mst)
+        {
+            s.K.assign(static_cast<size_t>(n_ctx) * nk, 0.0f);
+            s.V.assign(static_cast<size_t>(n_ctx) * nk, 0.0f);
+        }
+        taps_.assign(static_cast<size_t>(n_ctx) * row, 0.0f);
+        memcpy(&taps_[static_cast<size_t>(n_ctx - 1) * row], last_taps, row * sizeof(float));
+        pos_ = n_ctx;
+    }
+
     // softmax(fuse_weight[c]) . taps -> weighted RMSNorm, [H] BF16. The softmax weights are BF16.
     void mix_norm(const float* taps, int c, const std::vector<float>& norm_w, float* out) const
     {
