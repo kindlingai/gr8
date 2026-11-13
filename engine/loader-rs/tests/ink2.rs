@@ -458,7 +458,7 @@ fn slices_match_the_checkpoint() {
                             let (ch, g) = (pair / ng1, pair % ng1);
                             let d = nvfp4::nvfp4_decode_group(rec.try_into().unwrap(), s1[e]);
                             for (r, row) in d.iter().enumerate() {
-                                let src = &d1[(half * INTER + isl.start + ch * 16 + r) * HID + g * 64..][..64];
+                                let src = &d1[(2 * (isl.start + ch * 16 + r) + half) * HID + g * 64..][..64];
                                 assert!(row.iter().zip(src).all(|(a, b)| a.to_bits() == b.to_bits()), "{what} L{l} fc1 expert {e} chunk {ch} group {g}");
                             }
                         }
@@ -474,7 +474,9 @@ fn slices_match_the_checkpoint() {
                     // every expert: the records of the copied slices
                     let (mut want1, mut want2) = (Vec::new(), Vec::new());
                     for e in 0..NEXP {
-                        let part = |b: &[u8], row: usize, half: usize| b[(e * 2 * INTER + half * INTER + isl.start) * row..][..iw * row].to_vec();
+                        let part = |b: &[u8], row: usize, half: usize| -> Vec<u8> {
+                            (0..iw).flat_map(|i| b[(e * 2 * INTER + 2 * (isl.start + i) + half) * row..][..row].to_vec()).collect()
+                        };
                         want1.extend(nvfp4::nvfp4_fc1(&part(c13, HID / 2, 0), &part(sc13, HID / 16, 0), &part(c13, HID / 2, 1), &part(sc13, HID / 16, 1), iw, HID));
                         let cols = |b: &[u8], row: usize, c0: usize, cn: usize| -> Vec<u8> {
                             (0..HID).flat_map(|r| b[(e * HID + r) * row + c0..][..cn].to_vec()).collect()
@@ -490,7 +492,9 @@ fn slices_match_the_checkpoint() {
                     let (c13, sc13, c2, sc2) = (m.raw(&x("w13_weight")), m.raw(&x("w13_weight_scale")), m.raw(&x("w2_weight")), m.raw(&x("w2_weight_scale")));
                     let (mut want1, mut want2) = (Vec::new(), Vec::new());
                     for e in 0..NEXP {
-                        let part = |b: &[u8], row: usize, half: usize| b[(e * 2 * INTER + half * INTER + isl.start) * row..][..iw * row].to_vec();
+                        let part = |b: &[u8], row: usize, half: usize| -> Vec<u8> {
+                            (0..iw).flat_map(|i| b[(e * 2 * INTER + 2 * (isl.start + i) + half) * row..][..row].to_vec()).collect()
+                        };
                         let g = records::mxfp8_record(&part(c13, HID, 0), &part(sc13, HID / 32, 0), HID);
                         let u = records::mxfp8_record(&part(c13, HID, 1), &part(sc13, HID / 32, 1), HID);
                         for (a, b) in g.chunks_exact(528).zip(u.chunks_exact(528)) {
