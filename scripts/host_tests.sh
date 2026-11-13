@@ -476,5 +476,8 @@ g++ -std=c++17 -O2 "$REPO/engine/runtime/tests/flash_dsa_full_schedule_test.cpp"
 "$T/flash_dsa_full_schedule_test"
 g++ -std=c++17 -O2 "$REPO/engine/tests/test_flash_pool_owner.cpp" -o "$T/test_flash_pool_owner" "${KNOBS[@]}"
 "$T/test_flash_pool_owner"
+# the Inkling-2-Small CPU reference: state across chunks, speculative rollback, the image token, the rank split
+g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/tests/test_ink2_cpu_ref.cpp" -o "$T/test_ink2_cpu_ref"
+"$T/test_ink2_cpu_ref"
 # the bare environment reads the knob table replaced, and the table against the tree
 python3 "$REPO/tools/env_lint.py"
