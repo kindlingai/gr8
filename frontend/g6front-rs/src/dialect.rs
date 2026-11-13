@@ -1,10 +1,12 @@
-//! The front end speaks three model dialects. `glm` is GLM 5.3: a jinja chat template, `<tool_call>` calls, a thinking
+//! The front end speaks four model dialects. `glm` is GLM 5.3: a jinja chat template, `<tool_call>` calls, a thinking
 //! switch that needs `--allow-thinking-off`. `ds41` is DeepSeek-V4.1 Flash: the prompt comes from `dschat.rs` (a
 //! port of the release's `encoding.py`), calls are DSML blocks (`dsparser.rs`), thinking is a plain on/off switch and
 //! `reasoning_effort` is a number from 1 to 100.
 //! `hf` is generic HuggingFace (Qwen, Llama, Mistral, Hermes and compatible models): `chat_template.jinja` or
 //! `tokenizer_config.json`'s `chat_template`, optional `<think>...</think>` reasoning, and JSON `<tool_call>` calls
 //! (`hfparser.rs`).
+//! `inkling` is Inkling-2: the model's own jinja template, channel-tagged reply blocks (`inkparser.rs`), and a
+//! `reasoning_effort` that is a level name or a number from 0.0 to 0.99.
 //!
 //! This file holds what the dialects share at the seam: which dialect a model directory is, the parser enum the
 //! handlers call, dialect-specific thinking and effort controls, and the text a forced `tool_choice` puts in the reply.
@@ -16,16 +18,19 @@ use serde_json::{Map, Value};
 use crate::api::ApiError;
 use crate::dsparser::DsParser;
 use crate::hfparser::HfParser;
+use crate::inkparser::InkParser;
 use crate::parser::{Delta, FullParse, GlmParser};
 use crate::pyjson;
 use crate::sampling::Limit;
 use crate::thinking::{self, Thinking};
+use crate::tool_choice::ToolChoice;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
     Glm,
     Ds41,
     Hf,
+    Inkling,
 }
 
 impl Dialect {
@@ -34,32 +39,39 @@ impl Dialect {
             Dialect::Glm => "glm",
             Dialect::Ds41 => "ds41",
             Dialect::Hf => "hf",
+            Dialect::Inkling => "inkling",
         }
     }
 
-    /// `--dialect`: `glm`, `ds41`, `hf`, or `auto` (None: look at the model directory).
+    /// `--dialect`: `glm`, `ds41`, `hf`, `inkling`, or `auto` (None: look at the model directory).
     pub fn parse_flag(s: &str) -> Result<Option<Dialect>, String> {
         match s {
             "glm" => Ok(Some(Dialect::Glm)),
             "ds41" => Ok(Some(Dialect::Ds41)),
             "hf" => Ok(Some(Dialect::Hf)),
+            "inkling" => Ok(Some(Dialect::Inkling)),
             "auto" => Ok(None),
-            other => Err(format!("--dialect {other}: want glm, ds41, hf or auto")),
+            other => Err(format!("--dialect {other}: want glm, ds41, hf, inkling or auto")),
         }
     }
 
     /// Auto-detect the dialect from `config.json` and the tokenizer:
     /// - `DeepseekV4` in `architectures[0]` or the `｜DSML｜` token -> `Ds41` (the 1017 release's `config.json` is the
     ///   inference layout and names no architecture);
+    /// - an `architectures[0]` that starts with `Inkling` (any case) or `"model_type": "inkling2"` -> `Inkling`;
     /// - missing `config.json`, missing/empty `architectures[0]`, or a `Glm` / `ChatGLM` prefix -> `Glm`;
     /// - any other non-empty `architectures[0]` (e.g. `Qwen3ForCausalLM`, `LlamaForCausalLM`) -> `Hf`.
     pub fn detect(dir: &Path, tokenizer_has_dsml: bool) -> Dialect {
-        let arch = std::fs::read(dir.join("config.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .and_then(|c| c.get("architectures")?.as_array()?.first()?.as_str().map(str::to_string));
+        let cfg = std::fs::read(dir.join("config.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+        let arch = cfg.as_ref().and_then(|c| c.get("architectures")?.as_array()?.first()?.as_str().map(str::to_string));
         if tokenizer_has_dsml || arch.as_deref().is_some_and(|a| a.contains("DeepseekV4")) {
             return Dialect::Ds41;
+        }
+        let model_type = cfg.as_ref().and_then(|c| c.get("model_type")?.as_str());
+        if model_type == Some("inkling2")
+            || arch.as_deref().is_some_and(|a| a.to_ascii_lowercase().starts_with("inkling"))
+        {
+            return Dialect::Inkling;
         }
         match arch.as_deref() {
             Some(a) if !a.is_empty() && !is_glm_arch(a) => Dialect::Hf,
@@ -78,12 +90,25 @@ pub fn hf_served_name(dir: &Path) -> String {
     dir.file_name().and_then(|n| n.to_str()).filter(|n| !n.is_empty()).unwrap_or("hf-model").to_string()
 }
 
+/// Default `--served-model-name` for `--dialect inkling`: `inkling-2-small`, `ink2`, and the basename of `--model-dir`
+/// when it has one that is not already in the list.
+pub fn inkling_served_names(dir: &Path) -> Vec<String> {
+    let mut names = vec!["inkling-2-small".to_string(), "ink2".to_string()];
+    if let Some(base) = dir.file_name().and_then(|n| n.to_str()).filter(|n| !n.is_empty()) {
+        if !names.iter().any(|n| n == base) {
+            names.push(base.to_string());
+        }
+    }
+    names
+}
+
 // ---- the parser the handlers hold ------------------------------------------------------------------------------------
 
 pub enum AnyParser {
     Glm(GlmParser),
     Ds(DsParser),
     Hf(HfParser),
+    Ink(InkParser),
 }
 
 impl AnyParser {
@@ -92,17 +117,19 @@ impl AnyParser {
             Dialect::Glm => AnyParser::Glm(GlmParser::new(tools, tool_choice, include_reasoning)),
             Dialect::Ds41 => AnyParser::Ds(DsParser::new(tools, tool_choice, include_reasoning)),
             Dialect::Hf => AnyParser::Hf(HfParser::new(tools, tool_choice, include_reasoning)),
+            Dialect::Inkling => AnyParser::Ink(InkParser::new(tools, tool_choice, include_reasoning)),
         }
     }
 
     /// `--undeclared-tool-calls emit` (the default): a call to a tool the request did not declare comes back as a
-    /// tool call. GLM emits it at the end of the reply (so prose can still disprove it); DSML and HF emit a call once
+    /// tool call. GLM emits it at the end of the reply (so prose can still disprove it); the others emit a call once
     /// its closer arrives.
     pub fn emit_undeclared(self, on: bool) -> AnyParser {
         match self {
             AnyParser::Glm(p) => AnyParser::Glm(p.emit_undeclared(on)),
             AnyParser::Ds(p) => AnyParser::Ds(p.emit_undeclared(on)),
             AnyParser::Hf(p) => AnyParser::Hf(p.emit_undeclared(on)),
+            AnyParser::Ink(p) => AnyParser::Ink(p.emit_undeclared(on)),
         }
     }
 
@@ -112,6 +139,7 @@ impl AnyParser {
             AnyParser::Glm(p) => AnyParser::Glm(p.content_first()),
             AnyParser::Ds(p) => AnyParser::Ds(p.content_first()),
             AnyParser::Hf(p) => AnyParser::Hf(p.content_first()),
+            AnyParser::Ink(p) => AnyParser::Ink(p.content_first()),
         }
     }
 
@@ -129,6 +157,7 @@ impl AnyParser {
             AnyParser::Glm(p) => p.delta(text, finished),
             AnyParser::Ds(p) => p.delta(text, finished),
             AnyParser::Hf(p) => p.delta(text, finished),
+            AnyParser::Ink(p) => p.delta(text, finished),
         }
     }
 
@@ -144,7 +173,7 @@ impl AnyParser {
     pub fn glm_mut(&mut self) -> Option<&mut GlmParser> {
         match self {
             AnyParser::Glm(p) => Some(p),
-            AnyParser::Ds(_) | AnyParser::Hf(_) => None,
+            AnyParser::Ds(_) | AnyParser::Hf(_) | AnyParser::Ink(_) => None,
         }
     }
 
@@ -153,6 +182,7 @@ impl AnyParser {
             AnyParser::Glm(p) => p.parse_full(text),
             AnyParser::Ds(p) => p.parse_full(text),
             AnyParser::Hf(p) => p.parse_full(text),
+            AnyParser::Ink(p) => p.parse_full(text),
         }
     }
 
@@ -161,6 +191,7 @@ impl AnyParser {
             AnyParser::Glm(p) => p.include_reasoning,
             AnyParser::Ds(p) => p.include_reasoning,
             AnyParser::Hf(p) => p.include_reasoning,
+            AnyParser::Ink(p) => p.include_reasoning,
         }
     }
 
@@ -168,7 +199,7 @@ impl AnyParser {
     /// closer to stop on; the model sometimes goes on writing after it (the 10,559-line `</function>` runaway).
     pub fn call_closed(&self) -> bool {
         match self {
-            AnyParser::Glm(_) | AnyParser::Hf(_) => false,
+            AnyParser::Glm(_) | AnyParser::Hf(_) | AnyParser::Ink(_) => false,
             AnyParser::Ds(p) => p.call_closed(),
         }
     }
@@ -437,6 +468,113 @@ pub fn hf_forced_text(name: Option<&str>) -> String {
     }
 }
 
+// ---- Inkling thinking, effort and forced calls -----------------------------------------------------------------------
+
+const INK_EFFORT_ERROR: &str =
+    "reasoning_effort must be none, minimal, low, medium, high, xhigh, max or a number from 0.0 to 0.99";
+
+/// An Inkling effort value the template accepts: a level name or a JSON number from 0.0 to 0.99.
+fn ink_effort_ok(v: &Value) -> bool {
+    match v {
+        Value::String(s) => thinking::EFFORTS.contains(&s.as_str()),
+        Value::Number(n) => n.as_f64().is_some_and(|f| (0.0..=0.99).contains(&f)),
+        _ => false,
+    }
+}
+
+/// The effort is the template's "no thinking" level: `none` or the number 0.
+fn ink_effort_zero(v: &Value) -> bool {
+    v.as_str() == Some("none") || (v.is_number() && v.as_f64() == Some(0.0))
+}
+
+/// `--default-reasoning-effort` on `--dialect inkling`: a level name (`none` included) or a number from 0.0 to 0.99.
+pub fn parse_inkling_default_effort(s: &str) -> Result<Value, String> {
+    let t = s.trim();
+    if thinking::EFFORTS.contains(&t) {
+        return Ok(Value::from(t));
+    }
+    match t.parse::<f64>() {
+        Ok(f) if (0.0..=0.99).contains(&f) => Ok(Value::from(f)),
+        _ => Err(format!(
+            "--default-reasoning-effort {s}: want none, minimal, low, medium, high, xhigh, max or a number from 0.0 \
+             to 0.99"
+        )),
+    }
+}
+
+/// A request's thinking on `--dialect inkling`. The template takes `reasoning_effort` as a level name or a number
+/// from 0.0 to 0.99, prints it as a system line, and uses 0.9 when none is given; effort 0 is thinking off.
+///
+/// * `chat_template_kwargs.enable_thinking` and `thinking` are aliases (`enable_thinking` wins when both are set);
+/// * `reasoning_effort` at top level, else in `chat_template_kwargs`, else `default_effort` (the server's
+///   `--default-reasoning-effort`);
+/// * thinking is off when the switch says off, or when no switch is set and the effort is `none` or 0;
+/// * `thinking_budget` follows `thinking::parse_budget`.
+///
+/// The second element is the `reasoning_effort` to hand the template (`None` leaves its own default). Thinking off
+/// always hands it `none` (or the request's numeric 0), so the prompt carries effort level 0.
+pub fn resolve_inkling(
+    body: &Map<String, Value>,
+    defaults: thinking::Defaults,
+    default_effort: Option<&Value>,
+) -> Result<(Thinking, Option<Value>), ApiError> {
+    let kw = body.get("chat_template_kwargs").and_then(Value::as_object);
+    let e = non_null(kw, "enable_thinking").map(|v| pyjson::truthy(Some(v)));
+    let t = non_null(kw, "thinking").map(|v| pyjson::truthy(Some(v)));
+    let switch = e.or(t);
+    let named = non_null(Some(body), "reasoning_effort").or_else(|| non_null(kw, "reasoning_effort"));
+    if named.is_some_and(|v| !ink_effort_ok(v)) {
+        return Err(ApiError::bad(INK_EFFORT_ERROR, Some("reasoning_effort")));
+    }
+    let effective = named.or(default_effort);
+    let zero = effective.is_some_and(ink_effort_zero);
+    let off = match switch {
+        Some(s) => !s,
+        None => zero,
+    };
+    if off {
+        let v = match effective {
+            Some(v) if v.is_number() && zero => v.clone(),
+            _ => Value::from("none"),
+        };
+        return Ok((Thinking { effort: None, budget: Limit::Tokens(0), budget_explicit: false, off: true }, Some(v)));
+    }
+    // The switch says on but the effort says none: fall back to a level that thinks.
+    let effort = match effective {
+        Some(v) if !zero => Some(v.clone()),
+        _ => default_effort.filter(|v| !ink_effort_zero(v)).cloned(),
+    };
+    let (budget, budget_explicit) = match thinking::parse_budget(body.get("thinking_budget"))? {
+        None | Some(0) => (defaults.budget, false),
+        Some(n) if n < 0 => (Limit::Tokens(0), false),
+        Some(n) => (Limit::Tokens(n as u64), true),
+    };
+    Ok((Thinking { effort: None, budget, budget_explicit, off: false }, effort))
+}
+
+/// What a forced `tool_choice` puts at the start of the reply on `--dialect inkling`: the start of a JSON tool-call
+/// block. A named choice, or `required` with one declared tool, carries the name in the header and in the JSON;
+/// `required` with several tools stops inside the name string so the model picks one.
+pub fn ink_forced_text(tools: Option<&Value>, choice: &ToolChoice) -> Option<String> {
+    let named = |name: &str| {
+        let mut q = Vec::with_capacity(name.len() + 2);
+        pyjson::string(&mut q, name);
+        let q = String::from_utf8(q).unwrap();
+        format!("<|message_model|>{name}<|content_invoke_tool_json|>{{\"name\":{q},\"args\":")
+    };
+    match choice {
+        ToolChoice::Named(name) => Some(named(name)),
+        ToolChoice::Required => {
+            let names = crate::tool_choice::tool_names(tools);
+            match names.as_slice() {
+                [one] => Some(named(one)),
+                _ => Some("<|message_model|><|content_invoke_tool_json|>{\"name\":\"".to_string()),
+            }
+        }
+        ToolChoice::None | ToolChoice::Auto => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,7 +751,10 @@ mod tests {
         assert_eq!(Dialect::parse_flag("hf"), Ok(Some(Dialect::Hf)));
         assert_eq!(Dialect::parse_flag("auto"), Ok(None));
         assert!(Dialect::parse_flag("qwen").is_err());
+        assert_eq!(Dialect::parse_flag("inkling"), Ok(Some(Dialect::Inkling)));
+        assert_eq!(Dialect::parse_flag("qwen").unwrap_err(), "--dialect qwen: want glm, ds41, hf, inkling or auto");
         assert_eq!((Dialect::Glm.name(), Dialect::Ds41.name(), Dialect::Hf.name()), ("glm", "ds41", "hf"));
+        assert_eq!(Dialect::Inkling.name(), "inkling");
     }
 
     #[test]
@@ -651,6 +792,19 @@ mod tests {
         check(json!({"architectures": ["Qwen2ForCausalLM"]}), false, Dialect::Hf);
         check(json!({"architectures": ["LlamaForCausalLM"]}), false, Dialect::Hf);
         check(json!({"architectures": ["MistralForCausalLM"]}), false, Dialect::Hf);
+        check(json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3"}), false, Dialect::Hf);
+
+        // Inkling: by architecture (any case) or by model_type alone
+        check(
+            json!({"architectures": ["Inkling2ForConditionalGeneration"], "model_type": "inkling2"}),
+            false,
+            Dialect::Inkling,
+        );
+        check(json!({"architectures": ["inkling2ForConditionalGeneration"]}), false, Dialect::Inkling);
+        check(json!({"model_type": "inkling2"}), false, Dialect::Inkling);
+        check(json!({"architectures": [], "model_type": "inkling2"}), false, Dialect::Inkling);
+        // the DSML token still wins
+        check(json!({"model_type": "inkling2"}), true, Dialect::Ds41);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -662,6 +816,17 @@ mod tests {
         assert_eq!(hf_served_name(Path::new("")), "hf-model");
         assert_eq!(hf_served_name(Path::new("/")), "hf-model");
         assert_eq!(hf_served_name(Path::new(".")), "hf-model");
+    }
+
+    #[test]
+    fn inkling_served_names_add_the_directory_basename_once() {
+        assert_eq!(
+            inkling_served_names(Path::new("/models/Inkling-2-Small")),
+            ["inkling-2-small", "ink2", "Inkling-2-Small"]
+        );
+        assert_eq!(inkling_served_names(Path::new("/models/ink2/")), ["inkling-2-small", "ink2"]);
+        assert_eq!(inkling_served_names(Path::new("/")), ["inkling-2-small", "ink2"]);
+        assert_eq!(inkling_served_names(Path::new("")), ["inkling-2-small", "ink2"]);
     }
 
     #[test]
@@ -718,5 +883,139 @@ mod tests {
         assert_eq!(hf_thinking_off("<|im_start|>assistant\n<think>".into(), false), "<|im_start|>assistant\n<think>");
         assert_eq!(hf_forced_text(Some("foo")), "<tool_call>\n{\"name\": \"foo\", \"arguments\": ");
         assert_eq!(hf_forced_text(None), "<tool_call>\n{\"name\": \"");
+    }
+
+    #[test]
+    fn resolve_inkling_hands_the_template_its_effort_and_turns_thinking_off_at_zero() {
+        let d = thinking::Defaults { effort: None, budget: Limit::Tokens(256), allow_off: true };
+        let r = |v: Value| resolve_inkling(&body(v), d, None);
+
+        // nothing named: thinking on, the template's own default (0.9) stays
+        let (th, e) = r(json!({})).unwrap();
+        assert!(!th.off);
+        assert_eq!((th.effort, th.budget, th.budget_explicit, e), (None, Limit::Tokens(256), false, None));
+        let (th, e) = r(json!({"reasoning_effort": null})).unwrap();
+        assert_eq!((th.off, e), (false, None));
+
+        // off: the template still gets the zero effort
+        for v in [
+            json!({"reasoning_effort": "none"}),
+            json!({"chat_template_kwargs": {"reasoning_effort": "none"}}),
+            json!({"chat_template_kwargs": {"enable_thinking": false}}),
+            json!({"chat_template_kwargs": {"thinking": false}}),
+            json!({"reasoning_effort": "high", "chat_template_kwargs": {"enable_thinking": false}}),
+            json!({"chat_template_kwargs": {"enable_thinking": false, "thinking": true}}),
+        ] {
+            let (th, e) = r(v.clone()).unwrap();
+            assert!(th.off, "{v}");
+            assert_eq!((th.budget, e), (Limit::Tokens(0), Some(json!("none"))), "{v}");
+        }
+        for zero in [json!(0.0), json!(0)] {
+            let (th, e) = r(json!({"reasoning_effort": zero})).unwrap();
+            assert!(th.off);
+            assert_eq!(e, Some(zero));
+        }
+
+        // names and numbers pass through; the top level wins over the kwargs
+        for v in [json!("minimal"), json!("medium"), json!("max"), json!(0.35), json!(0.99), json!(0.9)] {
+            let (th, e) = r(json!({"reasoning_effort": v})).unwrap();
+            assert!(!th.off);
+            assert_eq!((th.effort, e), (None, Some(v)));
+        }
+        let (_, e) =
+            r(json!({"reasoning_effort": "low", "chat_template_kwargs": {"reasoning_effort": "high"}})).unwrap();
+        assert_eq!(e, Some(json!("low")));
+        let (_, e) = r(json!({"chat_template_kwargs": {"reasoning_effort": 0.5}})).unwrap();
+        assert_eq!(e, Some(json!(0.5)));
+
+        // out of range or the wrong kind is a 400 on reasoning_effort
+        for bad in [json!(1.5), json!(1), json!(-0.1), json!("bogus"), json!(true), json!([0.5]), json!("0.5")] {
+            let err = r(json!({"reasoning_effort": bad})).unwrap_err();
+            assert_eq!((err.status, err.param.as_deref()), (400, Some("reasoning_effort")), "{bad}");
+        }
+        assert_eq!(r(json!({"chat_template_kwargs": {"reasoning_effort": 2}})).unwrap_err().status, 400);
+
+        // effort none with the switch on: thinking on at the template default
+        for zero in [json!("none"), json!(0.0)] {
+            let (th, e) =
+                r(json!({"reasoning_effort": zero, "chat_template_kwargs": {"enable_thinking": true}})).unwrap();
+            assert_eq!((th.off, e), (false, None));
+        }
+
+        // thinking_budget follows the shared rules
+        let (th, _) = r(json!({"thinking_budget": 64})).unwrap();
+        assert_eq!((th.budget, th.budget_explicit), (Limit::Tokens(64), true));
+        let (th, _) = r(json!({"thinking_budget": -1})).unwrap();
+        assert_eq!((th.budget, th.budget_explicit), (Limit::Tokens(0), false));
+        assert_eq!(r(json!({"thinking_budget": "x"})).unwrap_err().status, 400);
+    }
+
+    #[test]
+    fn resolve_inkling_uses_the_server_default_effort() {
+        let d = thinking::Defaults { effort: None, budget: Limit::Tokens(0), allow_off: true };
+        let low = json!("low");
+        let (th, e) = resolve_inkling(&body(json!({})), d, Some(&low)).unwrap();
+        assert_eq!((th.off, e), (false, Some(json!("low"))));
+        let (_, e) = resolve_inkling(&body(json!({"reasoning_effort": 0.4})), d, Some(&low)).unwrap();
+        assert_eq!(e, Some(json!(0.4)));
+        // none with the switch on falls back to a default that thinks
+        let (th, e) = resolve_inkling(
+            &body(json!({"reasoning_effort": "none", "chat_template_kwargs": {"thinking": true}})),
+            d,
+            Some(&low),
+        )
+        .unwrap();
+        assert_eq!((th.off, e), (false, Some(json!("low"))));
+
+        // a server default of none (or 0) is thinking off until a request names an effort or the switch
+        for zero in [json!("none"), json!(0.0)] {
+            let (th, e) = resolve_inkling(&body(json!({})), d, Some(&zero)).unwrap();
+            assert!(th.off);
+            assert_eq!(e, Some(zero.clone()));
+            let (th, e) = resolve_inkling(&body(json!({"reasoning_effort": "high"})), d, Some(&zero)).unwrap();
+            assert_eq!((th.off, e), (false, Some(json!("high"))));
+            let (th, e) =
+                resolve_inkling(&body(json!({"chat_template_kwargs": {"enable_thinking": true}})), d, Some(&zero))
+                    .unwrap();
+            assert_eq!((th.off, e), (false, None));
+        }
+    }
+
+    #[test]
+    fn inkling_default_effort_accepts_names_and_numbers_up_to_099() {
+        assert_eq!(parse_inkling_default_effort("none"), Ok(json!("none")));
+        assert_eq!(parse_inkling_default_effort("xhigh"), Ok(json!("xhigh")));
+        assert_eq!(parse_inkling_default_effort("0.35"), Ok(json!(0.35)));
+        assert_eq!(parse_inkling_default_effort("0"), Ok(json!(0.0)));
+        assert_eq!(parse_inkling_default_effort("0.99"), Ok(json!(0.99)));
+        for bad in ["1", "1.5", "-0.1", "bogus", "", "nan", "inf"] {
+            assert!(parse_inkling_default_effort(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn inkling_forced_text_opens_a_json_tool_call_block() {
+        let one = json!([{"type": "function", "function": {"name": "get_weather", "parameters": {}}}]);
+        let two = json!([
+            {"type": "function", "function": {"name": "get_weather", "parameters": {}}},
+            {"type": "function", "function": {"name": "get_time", "parameters": {}}}
+        ]);
+        let named = "<|message_model|>get_time<|content_invoke_tool_json|>{\"name\":\"get_time\",\"args\":";
+        assert_eq!(ink_forced_text(Some(&two), &ToolChoice::Named("get_time".into())).as_deref(), Some(named));
+        assert_eq!(
+            ink_forced_text(Some(&one), &ToolChoice::Required).as_deref(),
+            Some("<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":")
+        );
+        assert_eq!(
+            ink_forced_text(Some(&two), &ToolChoice::Required).as_deref(),
+            Some("<|message_model|><|content_invoke_tool_json|>{\"name\":\"")
+        );
+        assert_eq!(ink_forced_text(Some(&two), &ToolChoice::Auto), None);
+        assert_eq!(ink_forced_text(Some(&two), &ToolChoice::None), None);
+        // the name is a JSON string in the body
+        assert_eq!(
+            ink_forced_text(None, &ToolChoice::Named("a\"b".into())).as_deref(),
+            Some("<|message_model|>a\"b<|content_invoke_tool_json|>{\"name\":\"a\\\"b\",\"args\":")
+        );
     }
 }

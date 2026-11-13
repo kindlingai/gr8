@@ -86,6 +86,30 @@ impl Tok {
         self.think_close = self.think_end.into_iter().collect();
     }
 
+    /// Inkling-2 has no `<think>` tags: reasoning is a `<|content_thinking|>` block that `<|end_message|>` ends, and
+    /// the answer then opens with `<|message_model|><|content_text|>`. `think_close` is that end plus the opener of a
+    /// text block, so a spent thinking budget moves the reply on to its answer. It stays empty when the tokenizer has
+    /// no `<|end_message|>` token.
+    pub fn use_inkling_thinking(&mut self) -> Result<(), String> {
+        self.think_start = self.tk.token_to_id("<|content_thinking|>");
+        self.think_end = self.tk.token_to_id("<|end_message|>");
+        self.think_close = match self.think_end {
+            Some(_) => self.encode("<|end_message|><|message_model|><|content_text|>", false)?,
+            None => Vec::new(),
+        };
+        Ok(())
+    }
+
+    /// Stop on the tokenizer's own `eos_token` too, after the release's `eos_token_id`. Inkling-2's config names
+    /// `<|content_model_end_sampling|>` and its tokenizer `<|endoftext|>`; a reply can end on either.
+    pub fn add_tokenizer_eos(&mut self) {
+        if let Some(id) = self.eos_token_id {
+            if !self.eos_ids.contains(&(id as i64)) {
+                self.eos_ids.push(id as i64);
+            }
+        }
+    }
+
     /// A DeepSeek-V4.1-Flash request that names no top_p samples with top_p 0.95 (the exlr8 release carries no
     /// generation_config.json, so it was 1.0). DeepSeek's V4.1-Flash README recommends top_p 0.95 or 1.0 and evaluates at
     /// 0.95; the 1017 README recommends 1.0. At temperature 1.0, 0.95 decoded 12.9% (code) and 6.6% (prose) faster on

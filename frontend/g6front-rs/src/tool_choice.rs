@@ -141,6 +141,12 @@ impl ToolChoice {
         self.forced_ids_for(text, tok, think_close)
     }
 
+    /// Inkling's forced reply: the start of a JSON tool-call block (`dialect::ink_forced_text`), behind `think_close`.
+    /// `tools` is the request's normalized list: `required` with one declared tool names it.
+    pub fn forced_ids_ink(&self, tools: Option<&Value>, tok: &Tok, think_close: &[u32]) -> Result<Vec<u32>, ApiError> {
+        self.forced_ids_for(crate::dialect::ink_forced_text(tools, self), tok, think_close)
+    }
+
     fn forced_ids_for(&self, text: Option<String>, tok: &Tok, think_close: &[u32]) -> Result<Vec<u32>, ApiError> {
         let Some(text) = text else { return Ok(Vec::new()) };
         let opener = tok.encode(&text, false).map_err(|e| ApiError::new(500, &e, None))?;
@@ -173,7 +179,7 @@ impl ToolChoice {
 }
 
 /// The names in a normalized `tools` list (`template::normalize_tools`), in order.
-fn tool_names(tools: Option<&Value>) -> Vec<&str> {
+pub(crate) fn tool_names(tools: Option<&Value>) -> Vec<&str> {
     let Some(Value::Array(ts)) = tools else { return Vec::new() };
     ts.iter()
         .filter_map(|t| t.get("function").and_then(Value::as_object).and_then(|f| f.get("name")))
@@ -287,6 +293,55 @@ mod tests {
         let req_ids = ToolChoice::Required.forced_ids_hf(&tok, &[]).unwrap();
         assert_eq!(tok.decode(&req_ids, false), "<tool_call>\n{\"name\": \"");
         assert!(ToolChoice::Auto.forced_ids_hf(&tok, &[17]).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ink_forced_ids_encode_the_json_tool_call_opener() {
+        let dir = std::env::temp_dir().join(format!("g6front-tc-ink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let added = |id: u32, c: &str| {
+            json!({"id": id, "content": c, "single_word": false, "lstrip": false, "rstrip": false,
+                   "normalized": false, "special": true})
+        };
+        let tk = json!({
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [added(18, "<|endoftext|>"), added(19, "<|message_model|>"), added(20, "<|content_text|>"),
+                             added(21, "<|content_thinking|>"), added(22, "<|content_invoke_tool_json|>"),
+                             added(23, "<|content_model_end_sampling|>"), added(24, "<|end_message|>")],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
+            "post_processor": null,
+            "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true},
+            "model": {"type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": null,
+                      "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+                      "vocab": {"{": 0, "\"": 1, ":": 2, ",": 3, "Ġ": 4, "Ċ": 5, "f": 6, "n": 7, "a": 8, "m": 9,
+                                "e": 10, "r": 11, "g": 12, "u": 13, "t": 14, "s": 15, "_": 16, "i": 17},
+                      "merges": []}
+        });
+        std::fs::write(dir.join("tokenizer.json"), tk.to_string()).unwrap();
+        std::fs::write(dir.join("tokenizer_config.json"), r#"{"eos_token": "<|endoftext|>"}"#).unwrap();
+        std::fs::write(dir.join("config.json"), r#"{"eos_token_id": 23}"#).unwrap();
+        let mut tok = Tok::load(&dir).unwrap();
+        tok.use_inkling_thinking().unwrap();
+        tok.add_tokenizer_eos();
+        tok.add_tokenizer_eos();
+        assert_eq!((tok.think_start, tok.think_end), (Some(21), Some(24)));
+        assert_eq!(tok.think_close, vec![24, 19, 20]);
+        assert_eq!(tok.eos_ids, vec![23, 18]);
+
+        let one = json!([{"type": "function", "function": {"name": "get_time"}}]);
+        let named = ToolChoice::Named("get_time".into());
+        let ids = named.forced_ids_ink(Some(&tools()), &tok, &[]).unwrap();
+        assert_eq!((ids[0], ids.iter().position(|&i| i == 22)), (19, Some(9)));
+        let want = "<|message_model|>get_time<|content_invoke_tool_json|>{\"name\":\"get_time\",\"args\":";
+        assert_eq!(tok.decode(&ids, false), want);
+        assert_eq!(ToolChoice::Required.forced_ids_ink(Some(&one), &tok, &[]).unwrap(), ids);
+        let ids = ToolChoice::Required.forced_ids_ink(Some(&tools()), &tok, &[]).unwrap();
+        assert_eq!(ids[..2], [19, 22]);
+        assert_eq!(tok.decode(&ids, false), "<|message_model|><|content_invoke_tool_json|>{\"name\":\"");
+        assert!(ToolChoice::Auto.forced_ids_ink(Some(&tools()), &tok, &[]).unwrap().is_empty());
+        assert!(ToolChoice::None.forced_ids_ink(None, &tok, &[]).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
