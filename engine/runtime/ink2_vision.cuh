@@ -392,11 +392,11 @@ public:
         if (d.layers < 1 || d.mlp < 1 || d.grid < 1 || d.proj < 1 || d.H < 1 || pool_rows < 1) fail("dimensions");
         const int64_t VD = d.vd, VI = d.mlp, PJ = d.proj;
         const auto g = [&](const std::string& n, std::vector<int64_t> shape) { return reinterpret_cast<const bf16*>(get(n, shape)); };
-        const std::string e = "backbone.embeddings.", t = "backbone.transformer.";
+        const std::string e = "backbone.embeddings.", t = "backbone.";
         w_.cls = g(e + "class_embedding", {VD});
         w_.cls_pos = g(e + "cls_position_embedding", {VD});
         w_.patch = g(e + "patch_embedding.weight", {VD, vis::PK});
-        w_.pos = g(e + "position_embedding.weight", {static_cast<int64_t>(d.grid) * d.grid, VD});
+        w_.pos = g(e + "position_embedding", {static_cast<int64_t>(d.grid) * d.grid, VD});
         w_.ln_pre_w = g(t + "ln_pre.weight", {VD});
         w_.ln_pre_b = g(t + "ln_pre.bias", {VD});
         w_.layers.resize(static_cast<size_t>(d.layers));

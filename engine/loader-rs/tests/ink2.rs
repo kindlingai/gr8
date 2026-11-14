@@ -780,7 +780,33 @@ fn real_metadata_plans_every_tensor() {
             assert_eq!(p.vocab_padded, 201216);
             assert_eq!(p.reads.len(), files.len(), "every checkpoint file is read");
             let n = |pre: &str| p.img.tensors.iter().filter(|t| t.name.starts_with(pre)).count();
-            assert!(n("V.") > 0 && n("MTP.") == 84 && n("L047.") > 0);
+            assert!(n("V.") == 422 && n("MTP.") == 84 && n("L047.") > 0);
+            let vchk = |name: &str, want: &[i64]| {
+                let m = meta(&p, name);
+                assert_eq!((m.dtype.as_str(), m.shape.as_slice()), ("bf16", want), "{name}");
+            };
+            vchk("V.backbone.embeddings.class_embedding", &[1024]);
+            vchk("V.backbone.embeddings.cls_position_embedding", &[1024]);
+            vchk("V.backbone.embeddings.patch_embedding.weight", &[1024, 1200]);
+            vchk("V.backbone.embeddings.position_embedding", &[1024, 1024]);
+            vchk("V.backbone.ln_pre.weight", &[1024]);
+            vchk("V.backbone.ln_pre.bias", &[1024]);
+            for l in 0..23 {
+                let lp = format!("V.backbone.layers.{l}");
+                for s in ["ln_1.weight", "ln_1.bias", "ln_2.weight", "ln_2.bias", "ls_1.gamma", "ls_2.gamma"] {
+                    vchk(&format!("{lp}.{s}"), &[1024]);
+                }
+                for s in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+                    vchk(&format!("{lp}.self_attn.{s}.weight"), &[1024, 1024]);
+                    vchk(&format!("{lp}.self_attn.{s}.bias"), &[1024]);
+                }
+                vchk(&format!("{lp}.mlp.c_fc.weight"), &[4096, 1024]);
+                vchk(&format!("{lp}.mlp.c_fc.bias"), &[4096]);
+                vchk(&format!("{lp}.mlp.c_proj.weight"), &[1024, 4096]);
+                vchk(&format!("{lp}.mlp.c_proj.bias"), &[1024]);
+            }
+            vchk("V.proj_in.weight", &[4096, 4096]);
+            vchk("V.proj_out.weight", &[4608, 4096]);
             let s1 = f32s(&ds41::read_tensor(&p.img, "L000.x.s1").unwrap());
             assert!(s1.len() == 384 && s1.iter().all(|&v| v == 1.0));
             let iw = 2304 / nr;

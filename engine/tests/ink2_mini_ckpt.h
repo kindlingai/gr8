@@ -380,11 +380,11 @@ inline std::vector<StItem> vision_items(const Mini& mm)
     const auto bf = [&](const std::string& n, std::vector<size_t> shape, const std::vector<float>& v) {
         it.push_back(StItem{"model.visual." + n, "BF16", std::move(shape), bf16_bytes(v)});
     };
-    const std::string e = "backbone.embeddings.", t = "backbone.transformer.";
+    const std::string e = "backbone.embeddings.", t = "backbone.";
     bf(e + "class_embedding", {vd}, x.class_embedding);
     bf(e + "cls_position_embedding", {vd}, x.cls_position_embedding);
     bf(e + "patch_embedding.weight", {vd, pk}, x.patch_embedding);
-    bf(e + "position_embedding.weight", {static_cast<size_t>(VG) * VG, vd}, x.position_embedding);
+    bf(e + "position_embedding", {static_cast<size_t>(VG) * VG, vd}, x.position_embedding);
     for (int l = 0; l < VL; ++l)
     {
         const VisionLayer& y = x.layers[l];
