@@ -297,3 +297,74 @@ fn a_fresh_request_evicts_retained_runs_for_their_records() {
     assert_eq!(p.ids_free(), Some(2343 - (w2.div_ceil(PAGE) - 512).div_ceil(4)));
     p.release(&b).unwrap();
 }
+
+// A pool larger than one session's table (the engine's GR8_CAP_TOTAL): R/64 = 8, nr 4, window 4, one table of 40
+// pages (--cap / 64), so a full run is 8 + 4 below place and 32 tail pages above it, ceil(32 / 4) = 8 records a rank.
+// Four full runs need place 4 * 12 = 48 and 4 * 32 = 128 pages above it.
+fn four_session_pool() -> Pool {
+    let mut p = Pool::new(48 + 128, 48, 8 * 64).unwrap();
+    p.keep(RULES);
+    p.tail(4, 0);
+    p.window(4, 4 * 8, 4).unwrap();
+    p.run_limit(40).unwrap();
+    p
+}
+
+#[test]
+fn four_full_runs_share_a_pool_built_for_four() {
+    let mut p = four_session_pool();
+    let worst = 40 * PAGE;
+    let runs: Vec<_> = (0..4).map(|_| p.reserve(worst, worst).unwrap()).collect();
+    let mut seen = std::collections::HashSet::new();
+    for r in &runs {
+        let l = p.list(r).unwrap();
+        assert!(l[..12].iter().all(|&q| q < 48) && l[12..].iter().all(|&q| q >= 48), "{l:?}");
+        assert!(l.iter().all(|q| seen.insert(*q)), "a page held twice");
+    }
+    assert_eq!(p.window_runs(), 4);
+    // a fifth waits: no pages above place, no records, no slots; a refusal leaves the state as it was
+    let d = p.digest();
+    assert!(!p.fits(worst, worst));
+    assert_eq!(p.reserve(worst, worst), Err(Error::NoRoom));
+    assert_eq!(p.digest(), d);
+}
+
+#[test]
+fn the_run_limit_refuses_a_run_past_one_table() {
+    let mut p = four_session_pool();
+    assert!(p.fits(40 * PAGE, 40 * PAGE), "a run of exactly one table fits");
+    assert!(!p.fits(41 * PAGE, 41 * PAGE), "one page more would get a table that maps only its first 40 pages");
+    assert_eq!(p.reserve(41 * PAGE, 41 * PAGE), Err(Error::NoRoom));
+    assert_eq!(p.run_limit_pages(), 40);
+    // the limit is fixed while runs are live
+    let _r = p.reserve(40 * PAGE, 40 * PAGE).unwrap();
+    assert_eq!(p.run_limit(80), Err(Error::BadArgument));
+}
+
+#[test]
+fn the_digest_is_unchanged_without_a_run_limit() {
+    let a = pool(160, 64, 8, 4, 4);
+    let mut b = pool(160, 64, 8, 4, 4);
+    b.run_limit(0).unwrap();
+    assert_eq!(a.digest(), b.digest(), "no limit hashes as before");
+    b.run_limit(40).unwrap();
+    assert_ne!(a.digest(), b.digest(), "a limit is state every rank must agree on");
+}
+
+#[test]
+fn a_returning_turn_adopts_its_run_while_three_others_are_live() {
+    let mut p = four_session_pool();
+    let worst = 40 * PAGE;
+    let runs: Vec<_> = (0..4).map(|_| p.reserve(worst, worst).unwrap()).collect();
+    let old = p.list(&runs[1]).unwrap().to_vec();
+    p.retain(&runs[1], done(40, 2)).unwrap();
+    // the same conversation, a few tokens more, still within one table
+    let prompt = hist(40 * 64 - 3, 2);
+    let h = p.match_prefix(&prompt, worst, worst, prompt.len() as i32 - 1);
+    assert_eq!(h.why, Why::Hit, "{h:?}");
+    let r = p.take_hit(h.skip, h.age, None, worst, worst).unwrap();
+    let l = p.list(&r).unwrap().to_vec();
+    let d = (h.skip as u64).div_ceil(PAGE) as usize - 8;
+    assert_eq!(&l[..12 + d], &old[..12 + d], "prefix, window and the drafter's pages below the hit adopted");
+    assert_eq!(p.window_runs(), 4);
+}

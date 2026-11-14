@@ -136,6 +136,7 @@ public:
     // ids: the records of each rank's rows store (0 = no limit): a request whose tail needs more waits
     // runs: the most window runs live at once, what the slot pool covers (0 = no limit)
     void window(uint32_t pages, uint32_t ids, uint32_t runs) { check(g6kv_window(p_, pages, ids, runs)); }
+    void run_limit(uint32_t pages) { check(g6kv_run_limit(p_, pages)); }
     uint32_t window_runs() const { return g6kv_window_runs(p_); }
     uint32_t window_runs(uint32_t r) const { return g6kv_window_runs_r(p_, r); }
     // a live window run takes the smaller R = r2 rows (kvman-rs Pool::shrink_run): same table version and length, a new list

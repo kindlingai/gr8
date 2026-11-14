@@ -723,6 +723,18 @@ pub unsafe extern "C" fn g6kv_window(p: *mut Handle, pages: u32, ids: u32, runs:
     }
 }
 
+/// The most pages one run's worst case may take, 0 = no limit (src/pool.rs Pool::run_limit). Before any reservation.
+///
+/// # Safety
+/// `p` must be live.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_run_limit(p: *mut Handle, pages: u32) -> i32 {
+    match (*p).lock().run_limit(pages) {
+        Ok(()) => 0,
+        Err(e) => e.code(),
+    }
+}
+
 /// Whether a retained run holds exactly these `n` pages.
 ///
 /// # Safety

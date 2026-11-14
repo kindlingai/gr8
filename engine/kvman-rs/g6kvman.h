@@ -231,6 +231,9 @@ struct g6kv_rows_req { uint64_t seq; uint32_t n, pad; };   // cap g6kv_rows_ent 
 // runs: the most window runs live at once (0 = no limit): the engine's slot pool covers that many sessions past R
 int g6kv_window(g6kv_pool* p, uint32_t pages, uint32_t ids, uint32_t runs);
 uint32_t g6kv_window_runs(const g6kv_pool* p);
+// (pool) the most pages one run's worst case may take (0 = no limit; before any grant): one session's page table when
+// the pool is larger (GR8_CAP_TOTAL)
+int g6kv_run_limit(g6kv_pool* p, uint32_t pages);
 // (pool) the window runs live now at R = r rows (0 = the pool's R)
 uint32_t g6kv_window_runs_r(const g6kv_pool* p, uint32_t r);
 // (pool) a live window run takes the smaller R = r2 rows: its pages between the Rs leave its prefix and join its tail
