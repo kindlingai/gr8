@@ -2,7 +2,7 @@
 # Smoketests for Inkling-2-Small on gr8 (the inkling front-end dialect). See lib.sh for the conventions.
 #
 # These test what clients rely on: the served name, a one-prompt "42" check, the thinking switch, streaming and a tool
-# call. A wrong weight slice or a broken kernel can load, report healthy and serve fluent nonsense, so every case asks
+# call, and with GR8_INK2_VISION_SMOKE=1 an image. A wrong weight slice or a broken kernel can load, report healthy and serve fluent nonsense, so every case asks
 # for an answer that can be checked.
 #
 #     smoketest/ink2.sh http://<head>:8100 [served-name]      or ./gr8 ink2 smoke
@@ -118,6 +118,21 @@ t_tool_call_parsed() {
   check "arguments should name Paris" '.choices[0].message.tool_calls[0].function.arguments | fromjson | .city | test("Paris")' || return
   check "finish reason should be tool_calls" '.choices[0].finish_reason == "tool_calls"' || return
   ok
+}
+
+# Image input, only with GR8_INK2_VISION_SMOKE=1 (the server must run with GR8_INK2_VISION=1; without the switch the
+# case is skipped and counts for nothing). A 160 x 80 PNG as a data URL: the left half red, the right half blue.
+RED_BLUE_PNG='iVBORw0KGgoAAAANSUhEUgAAAKAAAABQCAIAAAARP+ljAAAAxklEQVR42u3RMQ0AAAzDsPIn3ZHYV0shEDlNphrbbQADBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBvzVASYy0OCwGZT6AAAAAElFTkSuQmCC'
+t_vision_red_blue() {
+  [ "${GR8_INK2_VISION_SMOKE:-0}" = 1 ] || return 0
+  post /v1/chat/completions "$(jq -n --arg m "$NAME" --arg u "data:image/png;base64,$RED_BLUE_PNG" '{
+    model:$m, max_tokens:32, temperature:0, chat_template_kwargs:{thinking:false},
+    messages:[{role:"user", content:[
+      {type:"image_url", image_url:{url:$u}},
+      {type:"text", text:"The image has two halves of one colour each. Name the colour of the left half, then the colour of the right half. Reply with the two words only."}]}]}')"
+  status_is 200 || return
+  check "should say red, then blue" '(.choices[0].message.content // "") | ascii_downcase | test("red[^a-z]+(and[^a-z]+)?blue")' || return
+  ok "$(jqb '.usage.prompt_tokens') prompt tok"
 }
 
 run_all

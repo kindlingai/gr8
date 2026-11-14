@@ -17,6 +17,7 @@
 #include "ink2_step.cuh"
 #include "../comms/fabric.h"
 #include "s2/ink2_native.cuh"
+#include "vision_id.h"
 #include <chrono>
 
 #ifndef G6_NR
@@ -169,8 +170,29 @@ int main(int argc, char** argv)
     o.nc = std::max(nc, 1);
     o.layers = layers;
     o.whole_image = true;
+    // Image input (GR8_INK2_VISION, default 0, opt-in): with --serve the vision tower of the checkpoint is bound here, with
+    // its workspace and a pool of image rows for one prefill step, so the ready memory counts it. Every rank runs the
+    // tower on its own copy of the images. The head writes DIR/vision.s2 ("ink2"), so the shim's hello offers `vision`
+    // and checks the Inkling grids.
+    o.vision = !s2dir.empty() && knob::ink2_vision();
     Engine e;
     e.init(dir, o);
+    if (!s2dir.empty() && knob::ink2_vision())
+    {
+        if (e.vision_ready())
+        {
+            g6rt::vision_flag() = true;
+            fprintf(stderr, "# rank %d: ink2 vision: %.1f MiB workspace/pool, id %s\n", rank, e.vision_device_bytes() / (1024.0 * 1024.0), e.vision_id().c_str());
+            if (rank == 0)
+                if (FILE* fv = fopen((s2dir + "/vision.s2").c_str(), "w"))
+                {
+                    fputs("ink2\n", fv);
+                    fclose(fv);
+                }
+        }
+        else fprintf(stderr, "# rank %d: ink2 vision off: checkpoint has no model.visual.* tensors\n", rank);
+    }
+    if (!s2dir.empty() && rank == 0 && !e.vision_ready()) std::remove((s2dir + "/vision.s2").c_str());   // a stale one from an earlier boot
 
     Wire w;
     w.rank = rank;
@@ -193,8 +215,8 @@ int main(int argc, char** argv)
         e.gather = [&w](int c, float* parts, size_t bytes) { w.exchange_dev(c, parts, bytes); };
         e.gather_head = [&w](int c, uint8_t* parts, size_t bytes) { w.exchange_host(c, parts, bytes); };
     }
-    const auto step = [&](const ink2::RowsHost& rh, const int* tk, const RowSample* sm, std::vector<RowOut>& out) {
-        e.forward(rh, tk, sm, out);
+    const auto step = [&](const ink2::RowsHost& rh, const int* tk, const RowSample* sm, std::vector<RowOut>& out, const uint16_t* vis_rows = nullptr) {
+        e.forward(rh, tk, sm, out, vis_rows);
         e.commit();
     };
 
@@ -215,7 +237,8 @@ int main(int argc, char** argv)
         bc.port = static_cast<uint16_t>(s2port);
         bc.timeout = static_cast<unsigned>(knob::s2_timeout());
         bc.runtime_signature = "ink2|tp" + std::to_string(nr) + "|cap" + std::to_string(o.cap) + "|sess" + std::to_string(s2sess) + "|layers " + layers + "|chunk" + std::to_string(chunk) +
-                               "|pf" + std::to_string(prefill) + "|reuse" + std::to_string(reuse ? 1 : 0) + "|nc" + std::to_string(o.nc) + "|mtp" + std::to_string(mtp) + "|set " + set_id + "|" + knob::signature();
+                               "|pf" + std::to_string(prefill) + "|reuse" + std::to_string(reuse ? 1 : 0) + "|nc" + std::to_string(o.nc) + "|mtp" + std::to_string(mtp) + "|set " + set_id + "|" + knob::signature() +
+                               g6vis::signature(e.vision_ready(), e.vision_id());
         fprintf(stderr, "# rank %d: s2 pool %u logical pages of %d rows, %d sessions, cap %d, max_rows %u, prefill %d\n",
                 rank, sc.pool_rows / 64, 64, s2sess, o.cap, sc.max_rows, o.max_rows);
         try
