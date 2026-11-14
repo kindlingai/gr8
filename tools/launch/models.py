@@ -55,7 +55,7 @@ class Model:
     checkpoint_cache: bool = False
     kv4_fold: bool = False
     uniform_rows: bool = False
-    serve_options: tuple = ()   # optional engine knobs CHUNK, EAGER, EXACT
+    serve_options: tuple = ()   # optional engine knobs MTP, CHUNK, EAGER, EXACT
     engine_prefixes: tuple = () # model-specific EXTRA_ENV prefixes this engine implements
     vision_knob: str = ''
     drafter_url: str = ''
@@ -112,13 +112,14 @@ DS41 = Model('ds41', 'DeepSeek-V4.1-Flash', 'https://huggingface.co/kindlingai/d
              build_fc2gl=4, build_flags_script='scripts/ds41_build_flags.sh', build_what_env='DS41_WHAT')
 # Inkling-2-Small: the published safetensors checkpoint, read in place (config.json and its shards; every rank plans its
 # image from them, engine/loader-rs/src/ink2.rs). NVFP4 and MXFP8 routed experts, no width variants, TP=6 or 4. The engine
-# serves the 48 text layers at MTP 0; the front end speaks the inkling dialect.
+# serves the 48 text layers at MTP 0 (the default) to 7, the drafts of the checkpoint's drafter layers; the front end
+# speaks the inkling dialect.
 INK2 = Model('ink2', 'Inkling-2-Small', 'https://huggingface.co/thinkingmachines/Inkling-2-Small',
              'g6m4_ink2', 'ink2', ('6', '4'), {}, {}, 'gr8-ink2', 'Inkling2ForConditionalGeneration', False, False, True,
              dialect='inkling', served=('inkling-2-small', 'ink2'), vocab=201024, eos_ids=(200006, 199999),   # engine/model_geom_ink2.h
              max_positions=1048576, per_slot_pool=True, stage_relay=True,
              engine_profile='ink2', simulator='m4sim_ink2', smoke_script='smoketest/ink2.sh',
-             serve_options=('CHUNK', 'EAGER'), engine_prefixes=(), min_free_gib=8,
+             serve_options=('MTP', 'CHUNK', 'EAGER'), engine_prefixes=(), min_free_gib=8,
              build_widths=('1', '4', '6'), build_define='G6_MODEL_INK2', build_fc2gl=4, build_what_env='INK2_WHAT')
 # The pseudo engine (frontend/pseudo-engine): GLM-5.3's tokens and chat template, answers from a TOML file of rules, on
 # a CPU. Its release is a directory with responses.toml and the tokenizer files.

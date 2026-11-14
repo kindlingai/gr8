@@ -6,6 +6,19 @@
 // --reuse-prefix / --kv-store, StashPool + KvStateTiers snapshot and restore full 64-token global-attention pages and
 // boundary state (sliding-window rings, short-convolution histories and partial-page staging buffers) across turns and
 // persistent SSD restarts. Every rank runs the same calls in the same order, so the ranks' fabric steps line up.
+//
+// MTP 1..7 (the bundled drafter, Engine::mtp_draft): a round is one MAIN step that verifies each session's drafts
+// (1 + k rows a session), one DRAFT step and CHAIN steps.
+//   MAIN   runs the trunk. The rows of a prompt step, of any step at MTP 0 and of a one-row session are kept, so they
+//          are committed at once. The rows of a longer session in a round wait: only the DRAFT step says how many the
+//          verify accepted, and a rejected row must never reach the session's state.
+//   DRAFT  rows are the accepted rows (Row{tok = next token, pos}); they are committed, then the drafter runs once
+//          for every session of the step from its last row (q = pos, golden = tok). A prompt chunk before the tail
+//          drafts nothing. The step returns the first draft on each session's last row and caches the others.
+//   CHAIN  hands out the cached drafts; nothing is launched.
+// The engine holds the rows of one forward. A session whose rows still wait when the next forward starts has
+// finished (a live session's DRAFT step follows its MAIN step inside the same planner call), and its rows are
+// dropped: its state stays at the last committed row, which is where PrefixReuse::valid puts the retained position.
 #ifndef G6_S2_INK2_NATIVE_CUH
 #define G6_S2_INK2_NATIVE_CUH
 #include "service.h"
@@ -37,8 +50,10 @@ struct Ink2Context {
 inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
     const Config& sc = bc.scheduler;
     const int slots = c.engine.o.slots, max_rows = c.engine.o.max_rows;
-    require(sc.mtp == 0 && sc.max_sessions == unsigned(slots) && sc.max_rows <= unsigned(max_rows),
-            "Inkling-2-Small serves --s2-sessions sessions at MTP 0 in steps of at most the engine's rows");
+    const int K = int(sc.mtp);
+    require(sc.mtp <= unsigned(std::max(0, c.engine.c.mtp_drafts)) && K == c.engine.o.mtp &&
+            sc.max_sessions == unsigned(slots) && sc.max_rows <= unsigned(max_rows),
+            "Inkling-2-Small serves --s2-sessions sessions at the engine's MTP in steps of at most the engine's rows");
     require(sc.pool_rows % (unsigned(slots) * 64u) == 0 && sc.pool_rows / unsigned(slots) <= unsigned(c.engine.o.cap),
             "Inkling-2-Small: the pool is sessions x whole pages within the cap");
     const unsigned pages = sc.pool_rows / 64u;
@@ -66,13 +81,49 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
     std::array<bool, MAX_SESSIONS> bound_live{};
     std::array<int64_t, MAX_SESSIONS> incoming_sys{};
 
+    // MTP > 0: a session's rows of the engine's last forward that are not committed yet, its cached drafts (drafts[i]
+    // is the token at position q + 2 + i) and the end of its committed rows
+    struct Pending { int row0 = 0, rows = 0, pos0 = 0; };
+    struct Drafts { std::array<int, 8> d{}; int q = -1; bool valid = false; };
+    std::array<Pending, MAX_SESSIONS> pend{};
+    std::array<Drafts, MAX_SESSIONS> drafts{};
+    std::array<int, MAX_SESSIONS> done_end{};
+    int fwd_rows = 0;
+    std::vector<uint8_t> acc;
+    require(K < 8, "Inkling-2-Small: at most 7 drafts");
+    // before a forward replaces the engine's rows: a session of the next step `sp` keeps the waiting rows below its
+    // first position; every other session's waiting rows are dropped
+    const auto settle = [&](const s2::Step* sp) {
+        bool any = false;
+        acc.assign(size_t(fwd_rows), 0);
+        for (int q = 0; q < slots; ++q) {
+            Pending& w = pend[size_t(q)];
+            if (w.rows == 0) continue;
+            int kept = 0;
+            for (size_t j = 0; sp && j < sp->sess.size(); ++j)
+                if (sp->sess[j] == q) kept = std::max(0, std::min(w.rows, sp->r[size_t(sp->row0[j])].pos - w.pos0));
+            for (int r = 0; r < kept; ++r) acc[size_t(w.row0 + r)] = 1;
+            any |= kept > 0;
+            done_end[size_t(q)] = w.pos0 + kept;
+            w.rows = 0;
+        }
+        if (any) c.engine.commit(&acc);
+    };
+
     if (c.reuse) {
         std::vector<Ink2KvLayer> kl;
         for (const auto& p : c.engine.kv_ptrs(0)) {
             kl.push_back(Ink2KvLayer{p.global, p.pages, p.staging, p.ring, p.hist_k, p.hist_v, p.hist_a, p.hist_m});
         }
+        std::vector<Ink2KvLayer> ml;
+        if (K > 0)
+            for (const auto& p : c.engine.mtp_kv_ptrs(0)) {
+                ml.push_back(Ink2KvLayer{p.global, p.pages, p.staging, p.ring, nullptr, nullptr, nullptr, nullptr});
+            }
         KvStateDesc desc = ink2_kv_state(kl, uint32_t(slots), max_pps, uint32_t(c.engine.rank_nk(0)),
-                                         uint32_t(c.engine.c.H), uint32_t(c.engine.c.window), uint32_t(c.engine.max_rank_nk()));
+                                         uint32_t(c.engine.c.H), uint32_t(c.engine.c.window), uint32_t(c.engine.max_rank_nk()),
+                                         ml, uint32_t(c.engine.c.mtp_window), K > 0 ? c.engine.mtp_last_taps() : nullptr,
+                                         K > 0 ? uint32_t(c.engine.mtp_taps()) : 0u);
         tiers = std::make_unique<KvStateTiers>(desc);
         stash = std::make_unique<StashPool>(uint32_t(c.kv_sys_after), 64, desc.state_blocks(), false);
         stash->set_rules(false, true, 0);
@@ -102,6 +153,7 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
             const std::string compat = "ink2 set " + c.set_id + " nr " + std::to_string(c.engine.o.nr) +
                                        " slots " + std::to_string(slots) + " pages " + std::to_string(max_pps) +
                                        " layers " + c.engine.o.layers +
+                                       " mtp " + std::to_string(K > 0 ? 1 : 0) +
                                        " format " + std::to_string(desc.format_hash()) +
                                        " state " + std::to_string(desc.state_blocks()) +
                                        " blocks " + std::to_string(blocks) +
@@ -132,7 +184,10 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
     const auto run_rows = [&](int slot, const int* toks, int first, int n, const ink2rt::RowSample* sm) {
         ink2::RowsHost rh;
         rh.add(slot, first, n);
+        settle(nullptr);
         c.step(rh, toks, sm, out);
+        fwd_rows = 0;
+        done_end[size_t(slot)] = first + n;
     };
 
     NativeHooks h;
@@ -183,7 +238,21 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
             for (int i = 0; i < slots; ++i)
                 if (bound_live[size_t(i)] && bound[size_t(i)] == r) { q = i; break; }
             require(q >= 0, "Inkling-2-Small retain: run has no bound slot");
-            const uint32_t p = st.history.empty() ? 0u : uint32_t(std::max(0, std::min<int>(st.main_end, int(st.history.size()) - 1)));
+            // PrefixReuse::valid: the rows the main steps and the first-form draft steps wrote, less the last token
+            const uint32_t p = uint32_t(std::max(0, st.valid));
+            Pending& w = pend[size_t(q)];
+            if (w.rows > 0) {
+                // the session finished on its verify, so no DRAFT step committed its rows: keep those below p
+                const int kept = std::max(0, std::min(w.rows, int(p) - w.pos0));
+                if (kept > 0) {
+                    acc.assign(size_t(fwd_rows), 0);
+                    for (int r = 0; r < kept; ++r) acc[size_t(w.row0 + r)] = 1;
+                    c.engine.commit(&acc);
+                }
+                done_end[size_t(q)] = w.pos0 + kept;
+                w.rows = 0;
+            }
+            require(K == 0 || int(p) <= done_end[size_t(q)], "Inkling-2-Small retain: position past the session's committed rows");
             if (p > 0) {
                 c.engine.stage_partial_page(q, p, true);
                 std::lock_guard<std::mutex> lk(ck_mu);
@@ -228,6 +297,9 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
         require((g.reuse == 0 && g.restored == 0) || stash, "Inkling-2-Small serve: prefix reuse requires --reuse-prefix or --kv-store");
         c.engine.reset_slot(q);
         INK2RT_CK(cudaDeviceSynchronize());
+        pend[size_t(q)] = Pending{};
+        drafts[size_t(q)] = Drafts{};
+        done_end[size_t(q)] = int(g.reuse);
         bound[size_t(q)] = g.run;
         bound_live[size_t(q)] = true;
         if (stash) {
@@ -259,6 +331,7 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
     };
     h.retire = [&](const Slot& s) {
         if (!stash && int(s.key.slot) >= 0 && int(s.key.slot) < slots) bound_live[s.key.slot] = false;
+        if (int(s.key.slot) >= 0 && int(s.key.slot) < slots) { pend[s.key.slot] = Pending{}; drafts[s.key.slot] = Drafts{}; }
         ink2rt::ck(cudaDeviceSynchronize(), "retire");
     };
     h.fence = []() { ink2rt::ck(cudaDeviceSynchronize(), "fence"); };
@@ -267,17 +340,72 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
     h.dispatch.launch = [&](const Launch& l) -> std::vector<int> {
         const s2::Step& sp = l.step;
         const int M = sp.M();
-        if (sp.kind != s2::Step::MAIN) return std::vector<int>(size_t(M), 0);
         require(M >= 1 && M <= max_rows && l.samples.size() >= size_t(M), "Inkling-2-Small launch: rows");
+        for (size_t j = 0; j < sp.sess.size(); ++j)
+            require(sp.sess[j] >= 0 && sp.sess[j] < slots && sp.rows[j] >= 1 && sp.row0[j] >= 0 && sp.row0[j] + sp.rows[j] <= M,
+                    "Inkling-2-Small launch: session outside the slots or the step");
+        if (sp.kind == s2::Step::CHAIN) {
+            // row: pos = q + j, tok = the draft at q + j; the answer is the draft at q + j + 1
+            std::vector<int> u(size_t(M), 0);
+            for (size_t j = 0; j < sp.sess.size(); ++j) {
+                const Drafts& d = drafts[size_t(sp.sess[j])];
+                const s2::Row& x = sp.r[size_t(sp.row0[j])];
+                const int i = x.pos - d.q;
+                require(K > 0 && sp.rows[j] == 1 && d.valid && i >= 1 && i < K && x.tok == d.d[size_t(i - 1)],
+                        "Inkling-2-Small chain step does not continue the cached draft");
+                u[size_t(sp.row0[j])] = d.d[size_t(i)];
+            }
+            return u;
+        }
+        if (sp.kind == s2::Step::DRAFT) {
+            require(K > 0, "Inkling-2-Small draft step at MTP 0");
+            std::vector<int> u(size_t(M), 0), ds, dq, dg, dlast;
+            std::vector<ink2rt::RowSample> dsm;
+            bool any = false;
+            acc.assign(size_t(fwd_rows), 0);
+            for (size_t j = 0; j < sp.sess.size(); ++j) {
+                const int q = sp.sess[j], r0 = sp.row0[j], n = sp.rows[j];
+                for (int i = 1; i < n; ++i)
+                    require(sp.r[size_t(r0 + i)].pos == sp.r[size_t(r0)].pos + i, "Inkling-2-Small draft rows are not consecutive positions");
+                Pending& w = pend[size_t(q)];
+                if (w.rows > 0) {
+                    // the accepted rows of the session's verify (or all the rows of a forced chunk)
+                    require(sp.r[size_t(r0)].pos == w.pos0 && n <= w.rows, "Inkling-2-Small draft rows are not the main step's rows");
+                    for (int i = 0; i < n; ++i) acc[size_t(w.row0 + i)] = 1;
+                    any = true;
+                    done_end[size_t(q)] = w.pos0 + n;
+                    w.rows = 0;
+                }
+                const s2::Row& last = sp.r[size_t(r0 + n - 1)];
+                require(last.pos < done_end[size_t(q)], "Inkling-2-Small draft from a row that is not committed");
+                const int ev = j < sp.ev.size() ? sp.ev[j] : int(sp.event);
+                if (sp.round < 0 && ev != s2::Step::TAIL) continue;   // a prompt chunk before the tail
+                const Sampling& sa = l.samples[size_t(r0 + n - 1)];
+                ds.push_back(q); dq.push_back(last.pos); dg.push_back(last.tok); dlast.push_back(r0 + n - 1);
+                dsm.push_back(ink2rt::RowSample{sa.inv_temp, sa.top_p, sa.seed, 0u});
+            }
+            if (any) c.engine.commit(&acc);
+            if (!ds.empty()) {
+                std::vector<int> dout;
+                c.engine.mtp_draft(ds, dq, dg, dsm, K, dout);
+                require(dout.size() == ds.size() * size_t(K), "Inkling-2-Small draft: tokens");
+                for (size_t i = 0; i < ds.size(); ++i) {
+                    Drafts& d = drafts[size_t(ds[i])];
+                    d = Drafts{};
+                    for (int t = 0; t < K; ++t) d.d[size_t(t)] = dout[i * size_t(K) + size_t(t)];
+                    d.q = dq[i]; d.valid = true;
+                    u[size_t(dlast[i])] = d.d[0];
+                }
+            }
+            return u;
+        }
         ink2::RowsHost rh;
         std::vector<int> toks(static_cast<size_t>(M));
         std::vector<ink2rt::RowSample> sm(static_cast<size_t>(M));
         targets.assign(static_cast<size_t>(M), -1);
         rh.slot.resize(size_t(M)); rh.pos.resize(size_t(M)); rh.run0.resize(size_t(M));
         for (size_t j = 0; j < sp.sess.size(); ++j) {
-            require(sp.sess[j] >= 0 && sp.sess[j] < slots, "Inkling-2-Small launch: session outside the slots");
             for (int r = sp.row0[j]; r < sp.row0[j] + sp.rows[j]; ++r) {
-                require(r >= 0 && r < M, "Inkling-2-Small launch: row outside the step");
                 const s2::Row& x = sp.r[size_t(r)];
                 const bool cont = r > sp.row0[j] && x.pos == sp.r[size_t(r) - 1].pos + 1;
                 rh.slot[size_t(r)] = sp.sess[j]; rh.pos[size_t(r)] = x.pos; rh.run0[size_t(r)] = cont ? rh.run0[size_t(r) - 1] : r;
@@ -287,7 +415,29 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
                 sm[size_t(r)] = ink2rt::RowSample{s.inv_temp, s.top_p, s.seed, uint32_t(x.spos)};
             }
         }
-        c.step(rh, toks.data(), sm.data(), out);
+        if (K == 0) {
+            c.step(rh, toks.data(), sm.data(), out);
+        } else {
+            settle(&sp);
+            c.engine.forward(rh, toks.data(), sm.data(), out);
+            fwd_rows = M;
+            // kept rows are committed now; a session's verify rows (a round, more than one row) wait for its DRAFT step
+            bool wait = false, any = false;
+            acc.assign(size_t(M), 0);
+            for (size_t j = 0; j < sp.sess.size(); ++j) {
+                const int q = sp.sess[j], r0 = sp.row0[j], n = sp.rows[j];
+                if (sp.round < 0 || n == 1) {
+                    for (int i = 0; i < n; ++i) acc[size_t(r0 + i)] = 1;
+                    done_end[size_t(q)] = sp.r[size_t(r0)].pos + n;
+                    any = true;
+                } else {
+                    pend[size_t(q)] = Pending{r0, n, sp.r[size_t(r0)].pos};
+                    wait = true;
+                }
+            }
+            if (!wait) c.engine.commit();
+            else if (any) c.engine.commit(&acc);
+        }
         lp_rows = M;
         std::vector<int> ids(static_cast<size_t>(M));
         for (int r = 0; r < M; ++r) ids[size_t(r)] = out[size_t(r)].tok;

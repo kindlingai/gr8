@@ -7,6 +7,9 @@
 //   * an 8-token speculative step, 3 tokens kept, rollback, then single-token steps: the same bits again
 //   * the image feature row skips embed_norm; the window and the convolutions reach exactly as far as they should
 //   * the MXFP8 helpers against their row-major definition
+//   * the MTP drafter (3 layers, the middle one with the whole context, a window of 5, 4 taps, rank 16) at TP 1, 4
+//     and 6: a draft does not depend on how the context was forwarded, the window and the two-way block attention
+//     reach as far as they should, and speculative decode with 1, 3 and 7 drafts gives the bits of plain decode
 //   g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off engine/tests/test_ink2_cpu_ref.cpp -o /tmp/t && /tmp/t
 #include "../ref/ink2/ink2_cpu_ref.h"
 #include <cstdio>
@@ -42,7 +45,7 @@ struct Rng
     }
 };
 
-constexpr int H = 192, NL = 6, NH = 48, NKV = 8, HD = 16, RD = 4, RW = 8, INTER = 384, NE = 16, VOCAB = 512, VALID = 500, IMG = 7, NT = 12;
+constexpr int H = 192, NL = 6, NH = 48, NKV = 8, HD = 16, RD = 4, RW = 8, INTER0 = 384, NE = 16, VOCAB = 512, VALID = 500, IMG = 7, NT = 12;
 
 Config config(int tp)
 {
@@ -57,7 +60,7 @@ Config config(int tp)
     c.rel_win = RW;
     c.sliding_window = 5;
     c.log_scale_base = 4;
-    c.inter = INTER;
+    c.inter = INTER0;
     c.n_exp = NE;
     c.top_k = 4;
     c.route_scale = 4.0f;
@@ -119,6 +122,7 @@ Weights weights(const Config& c)
         y.mlp_norm = r.bf(H, 0.2f, 1.0f);
         y.router_w = r.bf(static_cast<size_t>(NE) * H, 4.0f * ih);
         y.router_bias = r.f32(NE, 0.1f);
+        const int INTER = c.inter;
         const size_t n = static_cast<size_t>(INTER) * H;
         for (int e = 0; e < NE; ++e)
         {
@@ -412,6 +416,228 @@ double test_moe_split(const Model& m1, const Model& m6)
         }
     return low;
 }
+
+// ---- the MTP drafter
+constexpr int ML = 3, MI = 384, MR = 16, MW = 5, MB = 8, MK = 7, NGEN = 26;
+
+// The drafter's test model: an intermediate size that splits over 4 and 6 ranks, MXFP8 experts on every layer.
+Config mtp_config(int tp)
+{
+    Config c = config(tp);
+    c.inter = 768;
+    c.mxfp8 = {1, 1, 1, 1, 1, 1};
+    c.mtp_layers = ML;
+    c.mtp_inter = MI;
+    c.mtp_window = MW;
+    c.mtp_block = MB;
+    c.mtp_drafts = MK;
+    c.markov_rank = MR;
+    c.mtp_global = {0, 1, 0};
+    c.mtp_target_layers = {1, 3, 5, 6};
+    return c;
+}
+
+Weights mtp_weights(const Config& c)
+{
+    Weights w = weights(c);
+    Rng r{0x6d7470};
+    const float ih = 1.0f / std::sqrt(static_cast<float>(H));
+    const size_t nq = static_cast<size_t>(NH) * HD, nk = static_cast<size_t>(NKV) * HD, nt = c.mtp_target_layers.size();
+    MtpWeights& y = w.mtp;
+    y.fuse_weight = r.bf((ML + 1) * nt, 1.0f);
+    y.mask_embed = r.bf(H, 1.0f);
+    y.norm = r.bf(H, 0.2f, 1.0f);
+    y.layers.resize(ML);
+    for (MtpLayer& l : y.layers)
+    {
+        l.dflare_norm = r.bf(H, 0.2f, 1.0f);
+        l.k_ctx = r.bf(nk * H, 4.0f * ih);
+        l.v_ctx = r.bf(nk * H, 2.0f * ih);
+        l.k_norm_ctx = r.bf(HD, 0.2f, 1.0f);
+        l.input_norm = r.bf(H, 0.2f, 1.0f);
+        l.post_norm = r.bf(H, 0.2f, 1.0f);
+        l.wq = r.bf(nq * H, 4.0f * ih);
+        l.wk = r.bf(nk * H, 4.0f * ih);
+        l.wv = r.bf(nk * H, 2.0f * ih);
+        l.q_norm = r.bf(HD, 0.2f, 1.0f);
+        l.k_norm = r.bf(HD, 0.2f, 1.0f);
+        l.wo = r.bf(H * nq, 0.1f);
+        l.gate = r.bf(static_cast<size_t>(MI) * H, 2.0f * ih);
+        l.up = r.bf(static_cast<size_t>(MI) * H, 2.0f * ih);
+        l.down = r.bf(static_cast<size_t>(H) * MI, 0.1f);
+    }
+    y.head_dflare_norm = r.bf(H, 0.2f, 1.0f);
+    y.markov_w1 = r.bf(static_cast<size_t>(VOCAB) * MR, 1.0f);
+    y.rnn_w = r.bf(static_cast<size_t>(3) * MR * (2 * MR + 2 * H), 2.0f * ih);
+    y.rnn_b = r.bf(3 * MR, 0.5f);
+    y.hidden_out_w = r.bf(static_cast<size_t>(H) * MR, 0.5f);
+    y.hidden_out_b = r.bf(H, 0.5f);
+    return w;
+}
+
+int argmax_text(const float* lg)
+{
+    int best = -1;
+    for (int v = 0; v < VOCAB; ++v)
+        if (v != IMG && (best < 0 || lg[v] > lg[best])) best = v;
+    return best;
+}
+
+void test_rbf_f64()
+{
+    CHECK(rbf_f64(1.0) == 1.0f && rbf_f64(-0.375) == -0.375f);
+    // just above the tie 1 + 2^-8: fp32 would round it onto the tie, and the tie then goes down to 1
+    CHECK(rbf_f64(1.0 + 1.0 / 256.0 + 1e-12) == 1.0f + 1.0f / 128.0f);
+    CHECK(rbf_f64(1.0 + 3.0 / 256.0 - 1e-12) == 1.0f + 1.0f / 128.0f);
+    CHECK(rbf_f64(1.0 + 1.0 / 256.0) == 1.0f && rbf_f64(1.0 + 3.0 / 256.0) == 1.0f + 1.0f / 64.0f);
+    CHECK(rbf_f64(-(1.0 + 1.0 / 256.0 + 1e-12)) == -(1.0f + 1.0f / 128.0f));
+}
+
+// A draft depends on the forwarded positions only, not on the chunks they came in; fewer drafts are a prefix.
+// Returns the 7 step logits.
+std::vector<float> test_mtp_state(Model& m, const Seq& s)
+{
+    std::vector<float> lg, lg2, hid;
+    run(m, s, {12});
+    const std::vector<int> d = m.mtp_draft(20, MK, &lg, &hid);
+    CHECK(d.size() == MK && lg.size() == static_cast<size_t>(MK) * VOCAB && hid.size() == static_cast<size_t>(MB) * H);
+    for (int k = 0; k < MK; ++k)
+        for (int v = 0; v < VOCAB; ++v)
+        {
+            const float z = lg[static_cast<size_t>(k) * VOCAB + v];
+            if (v < VALID) CHECK(std::isfinite(z) && std::fabs(z) <= 30.0f);
+            else CHECK(std::isinf(z) && z < 0.0f);
+        }
+    CHECK(!same(&lg[0], &lg[VOCAB], VOCAB));
+    CHECK(m.pos() == 12 && m.mtp_draft(20, MK, &lg2) == d && same(lg.data(), lg2.data(), lg.size()));   // no state change
+    for (auto chunks : {std::initializer_list<int>{5, 4, 3}, std::initializer_list<int>{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}})
+    {
+        run(m, s, chunks);
+        CHECK(m.mtp_draft(20, MK, &lg2) == d && same(lg.data(), lg2.data(), lg.size()));
+    }
+    const std::vector<int> d3 = m.mtp_draft(20, 3, &lg2);
+    CHECK(d3.size() == 3 && std::equal(d3.begin(), d3.end(), d.begin()) && same(lg.data(), lg2.data(), lg2.size()));
+    // the token before the block and the last token both count
+    CHECK(!same(lg.data(), (m.mtp_draft(21, MK, &lg2), lg2.data()), VOCAB));
+    // a rejected speculative step leaves nothing behind
+    int junk[5] = {30, 31, 32, 33, 34};
+    m.forward(junk, 5);
+    CHECK(!same(lg.data(), (m.mtp_draft(20, MK, &lg2), lg2.data()), VOCAB));
+    m.rollback(12);
+    CHECK(m.mtp_draft(20, MK, &lg2) == d && same(lg.data(), lg2.data(), lg.size()));
+    bool threw = false;
+    try { m.mtp_draft(20, MK + 1); } catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+    return lg;
+}
+
+// With 12 context rows and a window of 5 a local drafter layer reads rows 7 .. 11 for every row of the block; the
+// layer with the whole context reads row 0 too.
+void test_mtp_window(Model& m, const Seq& s)
+{
+    std::vector<float> base, lg;
+    run(m, s, {12});
+    m.mtp_draft(20, MK, &base);
+    const size_t nk = static_cast<size_t>(NKV) * HD;
+    const auto moved = [&](int layer, int row, bool value) {
+        std::vector<float>& kv = value ? m.mtp_ctx_v(layer) : m.mtp_ctx_k(layer);
+        CHECK(kv.size() == 12 * nk);
+        const std::vector<float> keep = kv;
+        for (size_t i = 0; i < nk; ++i) kv[row * nk + i] = rbf(-kv[row * nk + i] + 0.25f);
+        m.mtp_draft(20, MK, &lg);
+        kv = keep;
+        return !same(base.data(), lg.data(), base.size());
+    };
+    for (int layer : {0, 2})
+        for (bool value : {false, true})
+        {
+            for (int row = 0; row < 7; ++row) CHECK(!moved(layer, row, value));
+            for (int row = 7; row < 12; ++row) CHECK(moved(layer, row, value));
+        }
+    for (bool value : {false, true})
+        for (int row : {0, 6, 11}) CHECK(moved(1, row, value));
+    m.mtp_draft(20, MK, &lg);
+    CHECK(same(base.data(), lg.data(), base.size()));
+}
+
+// Row 0 of the block is the last token, the other rows are the mask. A change of the mask moves the final hidden row 0,
+// so a row attends to the rows after it.
+void test_mtp_two_way(const Config& c, const Weights& w, const Seq& s)
+{
+    Weights w2 = w;
+    for (float& x : w2.mtp.mask_embed) x = rbf(0.5f * x - 0.125f);
+    Model a(c, w), b(c, w2);
+    std::vector<float> ha, hb;
+    run(a, s, {12});
+    run(b, s, {12});
+    a.mtp_draft(20, MK, nullptr, &ha);
+    b.mtp_draft(20, MK, nullptr, &hb);
+    CHECK(!same(ha.data(), hb.data(), H));
+    // the mask rows share one input and differ by their position only
+    for (int r = 2; r < MB; ++r) CHECK(!same(&ha[H], &ha[static_cast<size_t>(r) * H], H));
+}
+
+// Plain decode against speculative decode with k drafts per round. A round forwards the last token and the k drafts,
+// keeps the rows whose input was right and rolls the rest back. The drafts of this random model are almost never
+// right, so every third round takes half of the true tokens as its drafts and every third round all of them.
+void test_mtp_decode(Model& m, const Seq& s, int tp)
+{
+    int prompt[4];
+    for (int i = 0; i < 4; ++i) prompt[i] = s.toks[i] == IMG ? 40 : s.toks[i];
+    // plain: tok[i] is the token at position 4 + i, lg[i] the logits it gives, dr[i] / dl[i] the drafts after it
+    m.rollback(0);
+    std::vector<int> tok;
+    std::vector<std::vector<float>> lg, dl;
+    std::vector<std::vector<int>> dr;
+    tok.push_back(argmax_text(&m.forward(prompt, 4)[3 * VOCAB]));
+    std::vector<float> first_dl;
+    const std::vector<int> first_dr = m.mtp_draft(tok[0], MK, &first_dl);
+    for (int i = 0; i < NGEN + MK + 1; ++i)
+    {
+        lg.push_back(m.forward(&tok[i], 1));
+        tok.push_back(argmax_text(lg[i].data()));
+        dl.emplace_back();
+        dr.push_back(m.mtp_draft(tok[i + 1], MK, &dl[i]));
+    }
+    int natural = 0, rounds = 0, kept = 0;
+    for (int k : {1, 3, 7})
+    {
+        m.rollback(0);
+        CHECK(argmax_text(&m.forward(prompt, 4)[3 * VOCAB]) == tok[0]);
+        int i = 0;   // tok[i] is the last token, not forwarded yet
+        for (int round = 0; i < NGEN; ++round)
+        {
+            std::vector<float> l2;
+            std::vector<int> d = m.mtp_draft(tok[i], k, &l2);
+            const std::vector<int>& wd = i ? dr[i - 1] : first_dr;
+            const std::vector<float>& wl = i ? dl[i - 1] : first_dl;
+            CHECK(std::equal(d.begin(), d.end(), wd.begin()) && same(l2.data(), wl.data(), l2.size()));
+            int want = -1;
+            if (round % 3)
+            {
+                want = round % 3 == 1 ? k / 2 : k;
+                for (int j = 0; j < k; ++j) d[j] = j < want ? tok[i + 1 + j] : (tok[i + 1 + j] + 1) % VALID;
+            }
+            std::vector<int> rows(1, tok[i]);
+            for (int t : d) rows.push_back(t == IMG ? 11 : t);
+            const std::vector<float> out = m.forward(rows.data(), k + 1);
+            int a = 0;
+            while (a < k && rows[a + 1] == argmax_text(&out[static_cast<size_t>(a) * VOCAB])) ++a;
+            if (want >= 0) CHECK(a == want);
+            else natural += a;
+            for (int j = 0; j <= a; ++j)
+            {
+                CHECK(same(&out[static_cast<size_t>(j) * VOCAB], lg[i + j].data(), VOCAB));
+                CHECK(argmax_text(&out[static_cast<size_t>(j) * VOCAB]) == tok[i + j + 1]);
+            }
+            m.rollback(4 + i + a + 1);
+            i += a + 1;
+            ++rounds;
+            kept += a;
+        }
+    }
+    printf("  mtp decode, %d rank%s: %d rounds, %d drafts kept (%d of them the drafter's own)\n", tp, tp == 1 ? "" : "s", rounds, kept + natural, natural);
+}
 }   // namespace
 
 int main()
@@ -436,6 +662,29 @@ int main()
     const double cs = cosine(l1.data(), l6.data(), l1.size());
     CHECK(!same(l1.data(), l6.data(), l1.size()));
     CHECK(cs > 0.5);
+    // the drafter at 1, 4 and 6 ranks: each agrees with itself exactly. A sum split over ranks is added in another
+    // order, so between rank counts only the draft tokens and a cosine are required; on this model the BF16 rounding
+    // takes the difference away and the logits come out the same bit for bit (printed).
+    test_rbf_f64();
+    std::vector<float> dl[3];
+    int at = 0;
+    for (int tp : {1, 4, 6})
+    {
+        const Config c = mtp_config(tp);
+        const Weights mw = mtp_weights(c);
+        Model m(c, mw);
+        dl[at++] = test_mtp_state(m, s);
+        test_mtp_window(m, s);
+        if (tp == 1) test_mtp_two_way(c, mw, s);
+        test_mtp_decode(m, s, tp);
+    }
+    const double cs4 = cosine(dl[0].data(), dl[1].data(), dl[0].size()), cs6 = cosine(dl[0].data(), dl[2].data(), dl[0].size());
+    printf("  mtp draft logits against 1 rank: cosine %.6f at 4 ranks, %.6f at 6\n", cs4, cs6);
+    CHECK(cs4 > 0.9999 && cs6 > 0.9999);
+    for (int k = 0; k < MK; ++k)
+        for (int i = 1; i < 3; ++i) CHECK(argmax_text(&dl[i][static_cast<size_t>(k) * VOCAB]) == argmax_text(&dl[0][static_cast<size_t>(k) * VOCAB]));
+    printf("  mtp draft logits bit for bit against 1 rank: %s at 4 ranks, %s at 6\n", same(dl[0].data(), dl[1].data(), dl[0].size()) ? "yes" : "no",
+           same(dl[0].data(), dl[2].data(), dl[0].size()) ? "yes" : "no");
     printf("test_ink2_cpu_ref: ok (6 ranks against 1: NVFP4 expert sum cosine >= %.6f, logits cosine %.6f)\n", moe_nv, cs);
     return 0;
 }
