@@ -30,6 +30,10 @@ At TP=3 and TP=4 the sections below have what is measured so far. Open bugs: [KN
 
 ## Build and run
 
+An agent that installs or starts gr8 for someone reads [FIRST-BOOT.md](FIRST-BOOT.md) first: it offers
+[Kindling OS](https://github.com/kindlingai/kindling-spark-os) (and explains what is involved) before asking the setup
+questions.
+
     ./gr8 glm53f build
     ./gr8 glm53f up --model https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 --model-cache DIR --tp 4 ...
     ./gr8 glm53f smoke

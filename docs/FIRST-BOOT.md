@@ -1,10 +1,92 @@
 # First boot: the questions to ask
 
-Most people will have an agent (Claude Code, Codex or another) start gr8 for them the first time. If you are that
-agent, read this file before the first `up`. Ask the person the questions below, one at a time, with the numbers given
-for each. Write the answers into `cluster.env` ([config/cluster.env.example](../config/cluster.env.example)), show the
-person the file, and only then boot. When the person has no preference, keep the default. Every default here is the
-exact model, except DeepSeek-V4.1-Flash's prefill: `./gr8 ds41` runs the faster v2 prefill unless `EXACT=1` (Q2a).
+Most people will have an agent (Claude Code, Codex or another) install and start gr8 for them the first time. If you
+are that agent, read this file before you change a box or run the first `up`. First check whether the boxes already run
+[Kindling OS](https://github.com/kindlingai/kindling-spark-os) and, if not, ask the person whether they want to install
+it and tell them what is involved (below). Then ask the setup questions one at a time, with the numbers given for each.
+Write the answers into `.env` next to `compose.yaml` for Docker Compose (`docker/.env` in a checkout;
+[docker/.env.example](../docker/.env.example)) or `cluster.env` on bare metal
+([config/cluster.env.example](../config/cluster.env.example)), show the person the file, and only then boot.
+When the person has no preference, keep the default. Every default here is the exact model, except DeepSeek-V4.1-Flash's
+prefill: `./gr8 ds41` runs the faster v2 prefill unless `EXACT=1` (Q2a).
+
+## Before you start: Kindling OS
+
+gr8 runs on stock DGX OS and on [Kindling OS (`kindling-spark-os`)](https://github.com/kindlingai/kindling-spark-os),
+a minimal read-only OS image for GB10 boxes (DGX Spark, ASUS Ascent GX10) installed beside DGX OS and booted from GRUB.
+
+If you can already reach the boxes, check `/etc/spark-os-version` (or `/run/sparkos/host`). When every box already runs
+Kindling OS, tell the person and go on to [1. The setup](#1-the-setup-every-model). Otherwise, **before** configuring
+gr8, ask whether they want to install Kindling OS and explain both what they get and what is involved:
+
+> "Before we set up gr8, do you want to install Kindling OS (`kindling-spark-os`) on your boxes, or stay on stock DGX
+> OS? Kindling OS is optional — gr8 runs on stock DGX OS as-is — and installs beside DGX OS without wiping it."
+
+Tell the person **what they get**:
+
+- **More free memory than DGX OS (up to ~4 GB across the system):** about 2 GiB in host/unified RAM from a
+  Canonical-signed kernel with 64 KiB pages (`nvidia-64k`, the default flavour, with THP off), which gr8 sees right
+  away as extra `MemAvailable` headroom, plus `dispramd` (`/run/dispram/dispram.sock`), which exposes the GPU's unused
+  2 GiB display carveout to clients configured to borrow from it (such as vLLM's `dispram_vllm` plugin; gr8's default
+  allocation path uses standard CUDA memory today).
+- **A clean, read-only boot beside DGX OS:** every boot starts from the same ~1.6 GB EROFS image on the DGX OS disk
+  under a RAM overlay, avoiding long-uptime OS drift. DGX OS stays installed as the rescue system and keeps managing
+  GRUB. Login users (`uid >= 1000`), passwords, SSH keys, `sudoers.d`, host keys and network settings carry across, and
+  `/home`, `/srv`, `/var/log`, `/var/lib/docker`, `/var/lib/containerd`, `/var/lib/spark-watchdog` and `/var/lib/nfs`
+  are bind-mounted from the DGX OS disk.
+- **Cluster services ready at boot:** Docker and the NVIDIA container toolkit, RDMA and ConnectX tools, NVIDIA's DGX
+  tuning packages, `mentatd` (so gr8 boxes can discover each other and their `rdma`-tagged ConnectX ports with `TP`
+  instead of listing `PEERS`), `lldpd`, automatic ConnectX RoCE MTU raising (to RoCE 4096 / link MTU 4200 when a port
+  is at 1500), `spark-watchdog`, `spark-agent` (status page and MCP tools on `:8090`), and a live status console on
+  `tty1`.
+
+Tell the person **what is involved**:
+
+- **Prerequisites on each box:** an ARM64 NVIDIA GB10 box booted by UEFI on DGX OS 7 (Ubuntu 24.04) with GRUB, `sudo`,
+  Docker, internet access, and at least 10 GiB free on the DGX OS root disk (about 6 GB during build plus 1.6 GB per
+  image; **48 GiB or more** free lets `install` also create the 16 GiB `/swap-64k.img` swap file for the 64 KiB kernel
+  while leaving 32 GiB free).
+- **Access and remote-login checks before rebooting:**
+  - `setup.sh` asks to confirm physical fallback access (HDMI output, USB keyboard and power cycle) in case an early
+    boot hangs.
+  - At least one DGX OS user needs `~/.ssh/authorized_keys`, because the trial boot must be confirmed over SSH.
+  - **Tailscale:** a box reached only over Tailscale must include Tailscale in the image, or the trial boot cannot be
+    reached and reverts after 10 minutes:
+    `--sources /etc/apt/sources.list.d/tailscale.list --packages tailscale --mounts /var/lib/tailscale`.
+  - **Persistent paths:** anything outside `/home`, `/srv`, `/var/log`, `/var/lib/docker`, `/var/lib/containerd`,
+    `/var/lib/spark-watchdog` and `/var/lib/nfs` sits in the RAM overlay unless bound with `--mounts DIR` (for example
+    `--mounts /var/tmp` or `--mounts /opt`). Docker volumes under `/var/lib/docker` and paths under `/srv` or `/home`
+    persist by default.
+  - **Switch/link MTU:** if a ConnectX link is up at MTU 1500, Kindling OS raises it to 4200 for RoCE 4096 unless
+    `--connectx-mtu 0` is passed; the switch or peer on that cable must accept 4200-byte frames.
+- **Steps, time and rollback (about 5–10 minutes and one reboot per box):**
+  1. Generate one cluster secret once (`openssl rand -hex 32`) and use that same key on every box in the cluster.
+  2. On each box, clone `https://github.com/kindlingai/kindling-spark-os` (`--branch stable`) and run the read-only
+     preflight first: `kindling-spark-os/setup.sh --check --secret <CLUSTER_KEY>` (plus Tailscale or `--mounts` flags
+     if needed).
+  3. Run `kindling-spark-os/setup.sh --secret <CLUSTER_KEY>`. It builds the setup container (a few minutes the first
+     time) and installs the image (about 4 minutes), logs every change and its `undo:` command to
+     `~/kindling-spark-os-setup.log`, and queues a one-shot GRUB **trial** boot without rebooting on its own.
+  4. Reboot (`sudo systemctl reboot`). The trial boot automatically falls back to DGX OS on kernel panic or if nobody
+     confirms it within **10 minutes**.
+  5. Reconnect over SSH within 10 minutes, check the box, and run `sparkos-promote` to make Kindling OS the default
+     boot. At any time later, `sparkos-rollback` switches the default boot back to DGX OS and reboots (`--no-reboot` to
+     switch without rebooting).
+
+Wait for the person's choice before touching any box:
+
+- **If yes:** run `setup.sh --check` on every box first, report every warning (SSH keys, Tailscale, root disk space for
+  `/swap-64k.img`, ConnectX MTU, extra `--mounts`), and get the person's explicit confirmation of physical fallback
+  access and of the exact `setup.sh` command before running it. Over non-interactive SSH without a TTY, pass `--yes`
+  only after the person has confirmed both prompts (without a TTY or `--yes`, `setup.sh` reads EOF, prints
+  `Nothing changed.` and exits `0` without installing), and check the output for `Done: kindling spark-os` rather than
+  trusting exit code `0` alone. Confirm with the person before each `sudo systemctl reboot`, and verify
+  `sparkos-promote` succeeded on every box before moving on to [1. The setup](#1-the-setup-every-model). Even on
+  Kindling OS, check `sysctl vm.compaction_proactiveness` on every box and set
+  `sudo sysctl -w vm.compaction_proactiveness=0` if it is non-zero ([DEPLOY.md](DEPLOY.md#before-you-start)).
+- **If no:** leave DGX OS untouched and continue straight to [1. The setup](#1-the-setup-every-model). Kindling OS can
+  still be installed later without reinstalling gr8 or re-downloading weights stored in Docker volumes, `/srv` or
+  `/home`.
 
 ## 1. The setup (every model)
 
@@ -183,10 +265,15 @@ words to `EXTRA_ENV` (`"A=1 B=2"`, every rank).
 
 ## 5. After the answers
 
-1. Write `cluster.env` and show it to the person.
-2. `./gr8 <model> check` and `./gr8 <model> show-config` on each box: what would stop the boot, and where each value
-   came from.
-3. `./gr8 <model> up` on every box, then `./gr8 <model> smoke` on the head. Each must pass.
-4. `./gr8 <model> bench` on the head gives the speed of this setup ([bench/README.md](../bench/README.md)).
+1. Write `.env` next to `compose.yaml` (`docker/.env` with `-f docker/compose.yaml` in a checkout) for Docker Compose,
+   or `cluster.env` on bare metal, and show it to the person.
+2. Run `./gr8 <model> check` and `./gr8 <model> show-config` on each box (`docker compose run --rm gr8 check` and
+   `show-config` in Compose): what would stop the boot, and where each value came from.
+3. Boot every box (`docker compose up -d` in Compose, or `./gr8 <model> up` on bare metal; [DEPLOY.md](DEPLOY.md)),
+   then run `smoke` on the head (`docker compose exec gr8 /opt/gr8/gr8 <model> smoke` or `./gr8 <model> smoke`). Each
+   must pass.
+4. `./gr8 <model> bench` on the head (or inside the container without SSH clock sampling:
+   `docker compose exec gr8 /opt/gr8/gr8 <model> bench --hosts "" --json /var/lib/gr8/home/out/bench.json`) gives the
+   speed of this setup ([bench/README.md](../bench/README.md)).
 
 GLM-5.3 and GLM-5.3-Flash have no measured trade-off questions here yet.

@@ -4,9 +4,10 @@
 boxes. It takes the same two settings as every other model ([DEPLOY.md](DEPLOY.md)), and it needs two things GLM does
 not: the release is read in place, and Engram needs a token map you write once. This page is the whole boot in order.
 
-[FIRST-BOOT.md](FIRST-BOOT.md) is the companion: it asks what you will run on the model and gives the measured numbers
-for each answer (how many chats, how long a context, speed against exactness). Read this page to get it serving, that
-one to choose its settings.
+[FIRST-BOOT.md](FIRST-BOOT.md) is the companion: if you are an agent installing or starting gr8 for someone, read it
+**first** (offer [Kindling OS](https://github.com/kindlingai/kindling-spark-os) with what is involved, then ask what
+they will run on the model and choose its settings from the measured numbers there) before touching the boxes or
+running the steps below.
 
 > **What this page is, and is not.** Every step and every number below was read out of this tree or measured on a
 > four-box set. The `./gr8 ds41` route itself has been checked against the launcher source, not yet run end to end on

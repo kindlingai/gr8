@@ -76,8 +76,10 @@ Every box needs what the README's [What you need](../README.md#what-you-need) li
 
 The model is `glm53`, and [DEPLOY.md](DEPLOY.md) is the guide: the model's release, how the boxes find each other, then
 one short section for each way to run it, each ending with a passing `smoke`: [bare metal](DEPLOY.md#bare-metal),
-[Docker Compose](DEPLOY.md#docker-compose) and [Kubernetes](DEPLOY.md#kubernetes). An agent that starts gr8 for
-someone asks them the questions in [FIRST-BOOT.md](FIRST-BOOT.md) first.
+[Docker Compose](DEPLOY.md#docker-compose) and [Kubernetes](DEPLOY.md#kubernetes). An agent that installs or starts gr8
+for someone reads [FIRST-BOOT.md](FIRST-BOOT.md) first: it offers
+[Kindling OS](https://github.com/kindlingai/kindling-spark-os) (and explains what is involved) before asking the setup
+questions.
 
 ## The model cache
 
