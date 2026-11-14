@@ -1,13 +1,16 @@
-// Image input, host side (DS41, docs/DS41-VISION.md; GLM-5.3-Flash, docs/FLASH-VISION.md): a request's images
+// Image input, host side (DS41, docs/DS41-VISION.md; GLM-5.3-Flash, docs/FLASH-VISION.md; Inkling-2-Small,
+// ink2_vision_plan.h): a request's images
 // (PROTOCOL.md `images`, the shim's `img` header fields), their checks against the prompt, and the digest that keeps
 // image prompts apart in the prefix cache. No CUDA types.
 //
 // `img <pos>:<vit_h>:<vit_w>:<key>:<rgb base64>`: the span starts at prompt index pos and is image_model().span(vit_h,
-// vit_w) image tokens long. rgb is the padded image, (vit_h * 14) x (vit_w * 14) RGB bytes (both models use 14 px
-// patches). key is the front end's (logs only): the engine digests the pixels itself (image_digest).
+// vit_w) image tokens long. rgb is the padded image, (vit_h * patch) x (vit_w * patch) RGB bytes (image_model().patch:
+// 14 px for DS41 and GLM-5.3-Flash, 20 px for Inkling-2-Small). key is the front end's (logs only): the engine digests
+// the pixels itself (image_digest).
 #pragma once
 #include "ds41_vision_plan.h"
 #include "flash_vision_plan.h"
+#include "ink2_vision_plan.h"
 #include "../engram/sha256.h"
 
 #include <array>
@@ -21,23 +24,29 @@ namespace g6rt {
 
 constexpr int TOK_IMAGE = 129264;    // [cfg] DS41 image_token_id: <｜deepseek_image｜>, and every row of an image span
 constexpr int TOK_IMAGE_GLM5V = 154854;   // [cfg] GLM-5.3-Flash image_token_id: <|image|>, every row of an image span
+constexpr int TOK_IMAGE_INK2 = 200054;    // [cfg] Inkling-2-Small image_token_id: <|unused_200054|>, every row of an image span
 constexpr int IMAGES_MAX = 16;       // per request (the front end's limit)
-constexpr int IMAGE_PATCH = 14;      // both models' patch size: the rgb is (vit_h * 14) x (vit_w * 14)
+constexpr int IMAGE_PATCH = 14;      // the DS41 and GLM-5.3-Flash patch size: their rgb is (vit_h * 14) x (vit_w * 14)
 
-// The image geometry of the engine's model: its image token and the span of a patch grid (0: a grid its processor
-// cannot produce).
+// The image geometry of the engine's model: its image token, its patch size in pixels and the span of a patch grid (0:
+// a grid its processor cannot produce).
 struct ImageModel {
     const char* name;
     int token;
+    int patch;
     int (*span)(int vit_h, int vit_w);
 };
 inline int ds41_span(int vit_h, int vit_w) { const ds41v::Grid g = ds41v::grid_of(vit_h, vit_w); return g.ok ? g.span() : 0; }
 inline int glm5v_span(int vit_h, int vit_w) { return glm5v::span_of(vit_h, vit_w); }
-constexpr ImageModel DS41_IMAGES{"ds41", TOK_IMAGE, ds41_span};
-constexpr ImageModel GLM5V_IMAGES{"glm5v", TOK_IMAGE_GLM5V, glm5v_span};
+inline int ink2_span(int vit_h, int vit_w) { return ink2v::span_of(vit_h, vit_w); }
+constexpr ImageModel DS41_IMAGES{"ds41", TOK_IMAGE, IMAGE_PATCH, ds41_span};
+constexpr ImageModel GLM5V_IMAGES{"glm5v", TOK_IMAGE_GLM5V, IMAGE_PATCH, glm5v_span};
+constexpr ImageModel INK2_IMAGES{"ink2", TOK_IMAGE_INK2, ink2v::PATCH, ink2_span};
 // the build's model (a host test that runs both models sets it)
 #if defined(G6_MODEL_FLASH) && G6_MODEL_FLASH
 inline ImageModel& image_model() { static ImageModel m = GLM5V_IMAGES; return m; }
+#elif defined(G6_MODEL_INK2) && G6_MODEL_INK2
+inline ImageModel& image_model() { static ImageModel m = INK2_IMAGES; return m; }
 #else
 inline ImageModel& image_model() { static ImageModel m = DS41_IMAGES; return m; }
 #endif
@@ -45,10 +54,11 @@ inline ImageModel& image_model() { static ImageModel m = DS41_IMAGES; return m; 
 struct ImageIn {
     int pos = 0, vit_h = 0, vit_w = 0, span = 0;
     std::string key;
-    std::shared_ptr<const std::vector<uint8_t>> rgb;   // vit_h * 14 * vit_w * 14 * 3 bytes
+    std::shared_ptr<const std::vector<uint8_t>> rgb;   // vit_h * patch * vit_w * patch * 3 bytes
 };
 
-// The engine runs images only with the vision tower loaded (GR8_DS41_VISION / GR8_GLM53F_VISION, g6m4.cu sets this at boot).
+// The engine runs images only with the vision tower loaded (GR8_DS41_VISION / GR8_GLM53F_VISION / GR8_INK2_VISION, the driver sets
+// this at boot).
 inline bool& vision_flag() { static bool on = false; return on; }
 inline bool vision_ready() { return vision_flag(); }
 
@@ -105,7 +115,8 @@ inline ImageIn parse_field(const std::string& v) {
     im.span = image_model().span(im.vit_h, im.vit_w);
     if (!im.span) fail("bad patch grid");
     auto rgb = std::make_shared<std::vector<uint8_t>>(b64_decode(v.substr(c[3] + 1)));
-    if (rgb->size() != size_t(im.vit_h) * im.vit_w * IMAGE_PATCH * IMAGE_PATCH * 3) fail("rgb size does not match the grid");
+    const size_t patch = size_t(image_model().patch);
+    if (rgb->size() != size_t(im.vit_h) * im.vit_w * patch * patch * 3) fail("rgb size does not match the grid");
     im.rgb = std::move(rgb);
     return im;
 }

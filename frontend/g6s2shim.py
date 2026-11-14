@@ -23,7 +23,7 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
                                                              DIR/penalty.s2, boost and seq when that file names them)
         [sys <system_tokens>] [ins <after>:<unless or -1>:<id,id,...>]      (version 3: the generate frame's insert rule, never with lp)
         [img <pos>:<vit_h>:<vit_w>:<key>:<rgb base64>] ...    (one per image, last; only when the head wrote DIR/vision.s2,
-                                                             which names the model's image geometry: glm5v, else DS41's)
+                                                             which names the model's image geometry: glm5v, ink2, else DS41's)
         <prompt id,id,...>
       <id> is the request ordinal: unique, strictly increasing in submit order (gaps are fine).
   shim -> rank 0 DIR/cmd.<k>           k = 0, 1, 2, ... with no gap, written the same way, one line:
@@ -84,6 +84,8 @@ IMAGE_TOKEN = 129264
 IMAGE_PATCH, IMAGE_DOWN, IMAGE_MAX_SPAN = 14, 3, 1024
 # GLM-5.3-Flash (vision.s2 says glm5v): engine/runtime/flash_vision_plan.h
 GLM5V_IMAGE_TOKEN, GLM5V_MERGE, GLM5V_MIN_TOKENS, GLM5V_MAX_TOKENS = 154854, 2, 16, 8000
+# Inkling-2-Small (vision.s2 says ink2): engine/runtime/ink2_vision_plan.h
+INK2_IMAGE_TOKEN, INK2_PATCH, INK2_MERGE, INK2_MIN_TOKENS, INK2_MAX_TOKENS = 200054, 20, 2, 1, 6400
 IMAGES_MAX = 16
 IMAGES_B64_MAX = 48 << 20
 
@@ -254,10 +256,22 @@ def glm5v_span(vit_h: int, vit_w: int) -> int | None:
     return n if GLM5V_MIN_TOKENS <= n <= GLM5V_MAX_TOKENS else None
 
 
+def ink2_span(vit_h: int, vit_w: int) -> int | None:
+    """The span of an Inkling-2-Small patch grid, None when its processor cannot produce it (ink2v::span_of)."""
+    m = INK2_MERGE
+    if vit_h < m or vit_w < m or vit_h % m or vit_w % m:
+        return None
+    n = (vit_h // m) * (vit_w // m)
+    return n if INK2_MIN_TOKENS <= n <= INK2_MAX_TOKENS else None
+
+
 def image_span(vit_h: int, vit_w: int, model: str = 'ds41') -> int | None:
-    """The span of a patch grid, None when the model's processor cannot produce it (ds41v::grid_of, glm5v::span_of)."""
+    """The span of a patch grid, None when the model's processor cannot produce it (ds41v::grid_of, glm5v::span_of,
+    ink2v::span_of)."""
     if model == 'glm5v':
         return glm5v_span(vit_h, vit_w)
+    if model == 'ink2':
+        return ink2_span(vit_h, vit_w)
     lim = IMAGE_DOWN * IMAGE_MAX_SPAN
     if not (1 <= vit_h <= lim and 1 <= vit_w <= lim):
         return None
@@ -267,10 +281,11 @@ def image_span(vit_h: int, vit_w: int, model: str = 'ds41') -> int | None:
 
 
 def vision_model(path: str) -> str:
-    """The image geometry vision.s2 names: glm5v (GLM-5.3-Flash), else ds41 (its file holds 1)."""
+    """The image geometry vision.s2 names: glm5v (GLM-5.3-Flash), ink2 (Inkling-2-Small), else ds41 (its file holds 1)."""
     try:
         with open(path) as fh:
-            return 'glm5v' if fh.read().split() == ['glm5v'] else 'ds41'
+            words = fh.read().split()
+        return words[0] if words in (['glm5v'], ['ink2']) else 'ds41'
     except OSError:
         return 'ds41'
 
@@ -279,7 +294,8 @@ def images_field(images, prompt, model: str = 'ds41') -> tuple[str, str | None]:
     """The generate frame's `images` -> (the request line's img fields or '', error or None). Checks what
     g6s2::parse_request checks (a request it refuses ends the epoch): the grid, the span inside the prompt and made of the
     image token, ascending spans, the pixel bytes' size. model: the engine's image geometry (vision.s2)."""
-    token = GLM5V_IMAGE_TOKEN if model == 'glm5v' else IMAGE_TOKEN
+    token = {'glm5v': GLM5V_IMAGE_TOKEN, 'ink2': INK2_IMAGE_TOKEN}.get(model, IMAGE_TOKEN)
+    patch = INK2_PATCH if model == 'ink2' else IMAGE_PATCH
     if images is None or images == []:
         return '', None
     if not isinstance(images, list) or len(images) > IMAGES_MAX:
@@ -303,8 +319,8 @@ def images_field(images, prompt, model: str = 'ds41') -> tuple[str, str | None]:
         if not isinstance(rgb, str) or len(rgb) % 4 or not re.fullmatch(r'[A-Za-z0-9+/]*={0,2}', rgb):
             return '', 'image rgb must be padded base64'
         n = len(rgb) // 4 * 3 - (len(rgb) - len(rgb.rstrip('=')))
-        if n != vh * vw * IMAGE_PATCH * IMAGE_PATCH * 3:
-            return '', f'image rgb must be {vh * IMAGE_PATCH}x{vw * IMAGE_PATCH} RGB bytes'
+        if n != vh * vw * patch * patch * 3:
+            return '', f'image rgb must be {vh * patch}x{vw * patch} RGB bytes'
         total += len(rgb)
         if total > IMAGES_B64_MAX:
             return '', f'images over {IMAGES_B64_MAX} bytes of base64'
@@ -899,7 +915,7 @@ class Shim:
                         # g6m4 --grammar-dir: the head writes grammar.s2 before ready.s2
                         self.cfg['grammar'] = os.path.exists(f'{self.a.dir}/grammar.s2')
                         # an engine with its vision tower loaded: the head writes vision.s2 before ready.s2, with the
-                        # model's image geometry (glm5v; DS41 writes 1)
+                        # model's image geometry (glm5v, ink2; DS41 writes 1)
                         self.cfg['vision'] = os.path.exists(f'{self.a.dir}/vision.s2')
                         self.cfg['vision_model'] = vision_model(f'{self.a.dir}/vision.s2') if self.cfg['vision'] else None
                         # presence / frequency penalties (engine/runtime/penalty.h): the head writes penalty.s2 before

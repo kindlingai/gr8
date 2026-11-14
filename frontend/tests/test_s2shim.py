@@ -156,9 +156,41 @@ class UnitTests(unittest.TestCase):
         for b in ({**g, 'pos': 1}, {**g, 'vit_h': 6, 'vit_w': 6}, {**g, 'vit_h': 7}, {**g, 'vit_h': 2, 'vit_w': 16002}):
             self.assertIsNotNone(g6s2shim.build_request({'prompt': gp, 'max_tokens': 4, 'images': [b]}, 0, None, 'glm5v')[1], b)
         self.assertEqual(g6s2shim.image_span(178, 178, 'glm5v'), 7921)
+        # Inkling-2-Small geometry (vision.s2 says ink2): <|unused_200054|> rows, one per 2 x 2 patches of 20 px, 1 to 6400
+        K = g6s2shim.INK2_IMAGE_TOKEN
+        self.assertEqual(K, 200054)
+        before = (g6s2shim.MODEL_NAME, g6s2shim.VOCAB, g6s2shim.EOS_IDS)
+        self.assertIsNone(g6s2shim.set_model('inkling-2-small', 201024, (200006, 199999)))   # the launcher's identity
+        self.addCleanup(g6s2shim.set_model, *before)
+        import hashlib
+        b1 = bytes(40 * 40 * 3)                                                     # 40 x 40 px = 4800 B: one token
+        h1 = hashlib.sha256(b1).hexdigest()[:16]
+        k1 = {'pos': 2, 'vit_h': 2, 'vit_w': 2, 'key': h1, 'rgb': base64.b64encode(b1).decode()}
+        kp = [5, 200005, K, 6]
+        body, err = g6s2shim.build_request({'prompt': kp, 'max_tokens': 4, 'images': [k1]}, 0, None, 'ink2')
+        self.assertIsNone(err)
+        self.assertTrue(body.split(b'\n')[0].endswith(f' img 2:2:2:{h1}:'.encode() + k1['rgb'].encode()))
+        b6 = bytes(80 * 120 * 3)                                                    # 80 x 120 px: six tokens
+        h6 = hashlib.sha256(b6).hexdigest()[:16]
+        k6 = {'pos': 2, 'vit_h': 4, 'vit_w': 6, 'key': h6, 'rgb': base64.b64encode(b6).decode()}
+        kp6 = [5, 200005] + [K] * 6 + [6]
+        body, err = g6s2shim.build_request({'prompt': kp6, 'max_tokens': 4, 'images': [k6]}, 0, None, 'ink2')
+        self.assertIsNone(err)
+        self.assertTrue(body.split(b'\n')[0].endswith(f' img 2:4:6:{h6}:'.encode() + k6['rgb'].encode()))
+        rgb14 = base64.b64encode(bytes(4 * 6 * 14 * 14 * 3)).decode()
+        for b in ({**k6, 'vit_h': 3}, {**k6, 'vit_w': 5}, {**k6, 'vit_h': 0}, {**k6, 'rgb': rgb14},   # odd sides, 14 px bytes
+                  {**k6, 'pos': 1},                                                 # <|content_image|> is not an image row
+                  {**k6, 'vit_h': 162, 'vit_w': 160}):                              # over 6400 tokens
+            self.assertIsNotNone(g6s2shim.build_request({'prompt': kp6, 'max_tokens': 4, 'images': [b]}, 0, None, 'ink2')[1], b)
+        wrong = [5, 200005] + [G] * 6 + [6]                                         # another model's image token
+        self.assertIsNotNone(g6s2shim.build_request({'prompt': wrong, 'max_tokens': 4, 'images': [k6]}, 0, None, 'ink2')[1])
+        self.assertIsNotNone(g6s2shim.build_request({'prompt': kp6, 'max_tokens': 4, 'images': [k6]}, 0, None, 'glm5v')[1])
+        self.assertEqual(g6s2shim.image_span(160, 160, 'ink2'), 6400)
+        self.assertEqual(g6s2shim.image_span(108, 192, 'ink2'), 5184)
+        self.assertIsNone(g6s2shim.image_span(2, 12802, 'ink2'))
         import tempfile
         with tempfile.TemporaryDirectory() as d:
-            for text, want in (('glm5v\n', 'glm5v'), ('1\n', 'ds41')):
+            for text, want in (('glm5v\n', 'glm5v'), ('1\n', 'ds41'), ('ink2\n', 'ink2')):
                 with open(f'{d}/vision.s2', 'w') as fh:
                     fh.write(text)
                 self.assertEqual(g6s2shim.vision_model(f'{d}/vision.s2'), want)
