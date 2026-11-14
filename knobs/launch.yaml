@@ -309,6 +309,13 @@ options:
       GR8_KV4_* or GR8_CP_ONECHAIN settings. GLM-5.3 TP=3/5/6 and Flash keep fp8 unless int4 is requested; DeepSeek
       and pseudo defaults are unchanged. ./gr8 glm53 build builds both engines for TP=4 and before a fresh clone is
       configured; explicit fp8 or another configured TP skips the extra build. docs/KV4.md
+  DISPRAM:
+    scope: cluster
+    doc: >-
+      0 or 1: use Kindling OS display memory (dispramd on /run/dispram/dispram.sock) for GLM-5.3 and non-chunked
+      GLM-5.3-Flash attention KV caches when available, and size an unset GLM-5.3 CAP from the minimum free display
+      memory across all ranks. Unset or 0 disables both the CAP bonus and the engine's dispramd client; 1 enables it and
+      fails open when dispramd is absent.
   MAX_MODEL_LEN:
     scope: cluster
     doc: >-

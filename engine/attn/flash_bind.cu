@@ -1,3 +1,4 @@
+#include "../dispram.h"
 // The attention binder (bind.h) for the G6_MODEL_FLASH build: flash_attn.cu's caches and scratch. Same contract as
 // bind.cu; the differences: every DSA layer has its own kpool indexer (geom::full_index), UK is bound as stored
 // [H,256,512] (no transpose), the pack adds index_ape, a step adds index_gate and raw_sess, the index cache uses the
@@ -101,7 +102,7 @@ int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int cap
     const size_t error = take(sizeof(unsigned));
     const size_t scratch = take(ext_scratch ? 0 : b.scratch_bytes);
     b.storage_bytes = used;
-    cudaError_t e = cudaMalloc(&b.storage, used);
+    cudaError_t e = chunked ? cudaMalloc(&b.storage, used) : g6dispram::alloc_kv(&b.storage, used);
     if (e != cudaSuccess) return (int)e;
     char* base = (char*)b.storage;
     a.mla_cache = chunked ? g6_kvc_ptr(mla) : base + kv; a.index_cache = chunked ? g6_kvc_ptr(idx) : base + ix;
@@ -121,7 +122,7 @@ int create(G6AttnBinding* out, const G6AttnPack* p, int rank, int layer, int cap
         if (e == cudaSuccess) e = cudaGetLastError();
     }
     if (e == cudaSuccess) e = cudaMemsetAsync(a.indices, 0xff, (size_t)max_rows * SEL * 4, stream);
-    if (e != cudaSuccess) { cudaFree(b.storage); return (int)e; }
+    if (e != cudaSuccess) { g6dispram::free_kv(b.storage); return (int)e; }
     *out = b;
     return (int)cudaSuccess;
 }
@@ -265,7 +266,7 @@ extern "C" int g6a_bind_check_clear(G6AttnBinding* b, int from, unsigned* flag, 
 }
 extern "C" int g6a_bind_release(G6AttnBinding* b) {
     if (!b) return invalid;
-    cudaError_t e = b->storage ? cudaFree(b->storage) : cudaSuccess;
+    cudaError_t e = b->storage ? g6dispram::free_kv(b->storage) : cudaSuccess;
     if (e == cudaSuccess) *b = G6AttnBinding{};
     return (int)e;
 }

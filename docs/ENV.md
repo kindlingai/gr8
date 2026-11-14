@@ -57,6 +57,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_DFL_REUSE` | int | 2 when serving DFlash2 with MTP, else 0; GLM-5.3-Flash without MTP: 1 with GR8_GLM53F_CACHE, else 0 | 0..2 | With DFlash2 under S2, 1 lets a request whose prefix-reuse hit (on GLM-5.3-Flash, a session checkpoint hit) landed in the drafter's window keep the drafter, and 2 also gives the drafter to a request alone on MTP. |
 | `GR8_DFL_REUSE_MIN` | int | `256` | 0..2048 | With GR8_DFL_REUSE, the context rows the drafter must hold before it drafts. Until then the request runs MTP rounds that feed it. |
 | `GR8_DFL_SEL_ALPHA` | float | `1` |  | The DFlash2 selector walk scores each candidate as logit + a * correction instead of logit + correction. Drafts only. Needs --dflash-manifest and the selector. |
+| `GR8_DISPRAM_MIN_BYTES` | int | `0` |  | Minimum live VMM-mapped dispramd carveout bytes each rank must map before allocating host KV memory when CAP was enlarged from the pre-boot dispramd probe; if unmet, the allocator unmaps its spans and exits 75 so the supervisor falls back to baseline CAP. |
 | `GR8_DRAFT_HEAD2` | int | `0` | 0..2 | Experimental: the MTP draft head runs in two stages, a 2-bit screen then the exact MXFP8 logits of its best 64 rows. 2 also runs the MXFP8 GEMV and counts misses. Needs --mtp. |
 | `GR8_DRAFT_HEAD_I4` | flag | `0` | 0\|1 | The MTP draft's lm_head GEMV reads INT4 g32 records made at boot from the MXFP8 records, +134 MB per rank at TP4. Drafts only. Needs --mtp. |
 | `GR8_DRAFT_HEAD_KS` | int | `32` | 2\|4\|8\|16\|32 | With GR8_DRAFT_HEAD_I4 or GR8_DFL_HEAD_I4, the INT4 head GEMV's k parts per tile. Its product with GR8_DRAFT_HEAD_TPC must be at most 32. |
@@ -352,6 +353,9 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_DEC_EVPROF` | int | `0` |  | Prints per-stage decode step times from event nodes in the captured main-step graphs every N main steps, in the rank logs. 0: off. |
 | `GR8_DEC_PROF` | flag | `0` |  | Measures decode stages with a synchronize at every mark and prints them per rank. Plain launches only, the engine stops with --graph. |
 | `GR8_DFL_DUMP` | path | unset |  | With --dflash, rank 0 writes every draft step's context features, drafts and committed tokens to this file, for engine/ref/dflash2_replay.py. |
+| `GR8_DISPRAM` | flag | `0` |  | 0 (default) uses cudaMalloc only; 1 leases available 2 MiB physical granules from Kindling OS dispramd (DISPRAM_SOCKET) into GLM-5.3 and non-chunked GLM-5.3-Flash attention KV bindings via CUDA VMM, failing open to cudaMalloc when absent or exhausted (unless GR8_DISPRAM_MIN_BYTES > 0). |
+| `DISPRAM_DISABLE` | flag | `0` |  | Standard Kindling OS opt-out: 1 disables dispramd probes and leases in both the launcher and the engine. |
+| `DISPRAM_SOCKET` | path | `/run/dispram/dispram.sock` |  | Unix domain SOCK_SEQPACKET socket path of Kindling OS dispramd. |
 | `GR8_DRAFT_IN_DUMP` | path | unset |  | Rank 0 writes the inputs of every MTP first draft pass to this file. Needs --mtp and no --serve. |
 | `GR8_DS_C2_TRACE` | flag | `0` |  | 1 = count every launch of the coalesced-epilogue wo_b GEMM (k_gemm_mx8t_c2), so a run can print ds41a::c2_dispatch_count() at stop. |
 | `GR8_DS_CACHE_MIB` | int | 4096 MiB per rank | 1.. | Size in MiB of the host prefix cache of DS41 session snapshots (--reuse-prefix). |

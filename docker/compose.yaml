@@ -69,6 +69,7 @@ services:
     # GR8_STOP_GRACE=150s with one, or docker kills the engine mid-store (the next boot then keeps what serving stored).
     stop_grace_period: ${GR8_STOP_GRACE:-30s}
     volumes:
+      - /run/dispram:/run/dispram
       # This box's part of the model (prepare fills it, ~90 GB at TP=4). Unset, a named volume. Set GR8_CACHE to a
       # host directory, owned by uid 1000, to keep it outside docker.
       - ${GR8_CACHE:-cache}:/var/lib/gr8/cache

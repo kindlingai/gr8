@@ -44,11 +44,31 @@ int4_pages() {
     *) echo "engine_defaults: no int4 page count for $1 fp8 pages at TP=$TP: set CAP" >&2; return 2 ;;
   esac
 }
-# pool_cap P: the default CAP from P fp8 pages a rank, or their int4 equivalent
+# dispram_bonus_pages: extra physical KV pages per rank funded by DISPRAM_BYTES (the cluster-wide minimum free bytes
+# probed from Kindling OS dispramd across all ranks), with an 8% safety margin over analytical per-page growth (docs/KV4.md).
+dispram_bonus_pages() {
+  local bytes=${DISPRAM_BYTES:-0}
+  [ "${DISPRAM:-0}" = 1 ] && [[ $bytes =~ ^[0-9]+$ ]] && [ "$bytes" -gt 0 ] || { echo 0; return 0; }
+  local row=656
+  [ "${KV_FORMAT:-fp8}" = int4 ] && row=416
+  local per_page=$(( (78 * 64 * row + 21 * 64 * 132 + 64 * TP * (3 * (row + 132) + 9840)) * 108 / 100 ))
+  echo $(( bytes / per_page ))
+}
+# pool_cap P: the default CAP from P fp8 pages a rank, or their int4 equivalent, plus any dispramd page bonus
 pool_cap() {
-  local p=$1
+  local p=$1 base_cap cap bonus
   if [ "${KV_FORMAT:-fp8}" = int4 ]; then p=$(int4_pages "$1") || return 2; fi
-  share_cap "$p"
+  base_cap=$(share_cap "$p") || return 2
+  bonus=$(dispram_bonus_pages)
+  if [ "$bonus" -gt 0 ]; then
+    cap=$(share_cap $(( p + bonus ))) || return 2
+    if [ "$cap" -gt 1048576 ] && [ "$base_cap" -le 1048576 ]; then
+      cap=$(( SHARE_LIMIT + ((1048576 - SHARE_LIMIT) / (64 * TP)) * 64 * TP ))
+    fi
+    echo "$cap"
+  else
+    echo "$base_cap"
+  fi
 }
 
 # EXTRA_ENV with each old G6_ name as its GR8_ name, so an override under the old name and a default here are one
@@ -299,8 +319,9 @@ engine_defaults() {
   [ "$_engine_profile" = ds41 ] && { ds41_defaults; return; }
   [ "$_engine_profile" = ink2 ] && { ink2_defaults; return; }
   [ "$_engine_profile" = pseudo ] && { pseudo_defaults; return; }
+  local _cap_set=${CAP:+1} _base_p=0; DISPRAM_MIN_BYTES=0
   case $TP in
-    4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+    4) SHARE_LIMIT=${SHARE_LIMIT:-32768}; _base_p=2280; CAP=${CAP:-$(pool_cap 2280)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        DFLASH=${DFLASH:-1}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-4}; REUSE=${REUSE:-1}
        # the window-2 fc1 split on every MoE layer at M > 1 (bit-exact, measured at TP=4); 0 turns it off, and
        # GR8_TR3_W2ALL in EXTRA_ENV keeps its own value
@@ -324,22 +345,32 @@ engine_defaults() {
        fi ;;
     6) SHARE_LIMIT=${SHARE_LIMIT:-131072}
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then   # 614,400 is 3,307 fp8 pages a rank at 131072 and 2,026 at 32768
-         if [ "$SHARE_LIMIT" = 131072 ]; then CAP=${CAP:-$(pool_cap 3307)} || return 2; else CAP=${CAP:-$(pool_cap 2026)} || return 2; fi
-       else [[ "$SHARE_LIMIT" = 32768 || "$SHARE_LIMIT" = 131072 ]] && CAP=${CAP:-614400} || CAP=${CAP:-$(share_cap 2026)} || return 2; fi; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+         if [ "$SHARE_LIMIT" = 131072 ]; then _base_p=3307; CAP=${CAP:-$(pool_cap 3307)} || return 2; else _base_p=2026; CAP=${CAP:-$(pool_cap 2026)} || return 2; fi
+       else [[ "$SHARE_LIMIT" = 32768 || "$SHARE_LIMIT" = 131072 ]] && CAP=${CAP:-614400} || { _base_p=2026; CAP=${CAP:-$(pool_cap 2026)}; } || return 2; fi; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        # DFLASH=1: the DFlash2 drafter with its body replicated on every rank (dflash.cuh dfl::REP; the drafter
        # converted per rank in the replicated layout, --drafter). Off unless set
        DFLASH=${DFLASH:-0}; SPEC_ADAPT=${SPEC_ADAPT:-$DFLASH}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1} ;;
-    3) SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 1941)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+    3) SHARE_LIMIT=${SHARE_LIMIT:-32768}; _base_p=1941; CAP=${CAP:-$(pool_cap 1941)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=3: the drafter's 8 KV heads do not split three ways" >&2; return 2; }
        DFLASH=0; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-1}; REUSE=${REUSE:-1} ;;
     5) [ "${KV_FORMAT:-fp8}" = fp8 ] || [ -n "${CAP:-}" ] || { echo "engine_defaults: KV_FORMAT=$KV_FORMAT at TP=5: no TP5 int4 page count; set CAP" >&2; return 2; }
-       SHARE_LIMIT=${SHARE_LIMIT:-32768}; CAP=${CAP:-$(pool_cap 1981)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
+       SHARE_LIMIT=${SHARE_LIMIT:-32768}; _base_p=1981; CAP=${CAP:-$(pool_cap 1981)} || return 2; READY_TMO=${READY_TMO:-1800}; MTP=${MTP:-2}; SESS=${SESS:-8}; S2PORT=${S2PORT:-7341}
        # 1,981 pages a rank = TP4's default (not boot-proven at TP5; a rank holds about 1/5 of the experts, so more fit)
        [ "${DFLASH:-0}" = 0 ] || { echo "engine_defaults: DFLASH=1 at TP=5: the drafter's 8 KV heads do not split five ways" >&2; return 2; }
        # PF_OWN=3: cold 8K prefill 1,554 tok/s against 935 with 1, at the same CAP; decode within 1 %
        DFLASH=0; SPEC_ADAPT=${SPEC_ADAPT:-0}; PF_OWN=${PF_OWN:-3}; REUSE=${REUSE:-1} ;;
     *) echo "engine_defaults: TP=$TP; want 4, 6, 3 or 5" >&2; return 2 ;;
   esac
+  if [ -z "$_cap_set" ] && [ "$_base_p" -gt 0 ] && [ "${DISPRAM:-0}" = 1 ] && [[ ${DISPRAM_BYTES:-0} =~ ^[0-9]+$ ]] && [ "${DISPRAM_BYTES:-0}" -gt 0 ]; then
+    local _p=$_base_p _base_cap _added _row=656 _analytical
+    if [ "${KV_FORMAT:-fp8}" = int4 ]; then _p=$(int4_pages "$_base_p") || return 2; _row=416; fi
+    _base_cap=$(share_cap "$_p") || return 2
+    _added=$(( (CAP - _base_cap) / (64 * TP) ))
+    if [ "$_added" -gt 0 ]; then
+      _analytical=$(( 78 * 64 * _row + 21 * 64 * 132 + 64 * TP * (3 * (_row + 132) + 9840) ))
+      DISPRAM_MIN_BYTES=$(( ((_added * _analytical) / 2097152) * 2097152 ))
+    fi
+  fi
 }
 
 # The engine environment for every rank (docs/SETTINGS.md has each variable). Prefill: 64-row attention tiles, dense
@@ -396,6 +427,7 @@ GR8_GLM53F_PF_STAGE_ASYNC=$stage GR8_GLM53F_PF_SP=$sp GR8_GLM53F_PF_SP_X16=$sp"
   dpf=${S2_DECODE_PF:-$dpf}
   ENGINE_ENV="$ENGINE_ENV GR8_S2_DECODE_ROUNDS=${S2_DECODE_ROUNDS:-$drounds}${dpf:+ GR8_S2_DECODE_PF=$dpf}"
   ENGINE_ENV="$ENGINE_ENV${S2_SHARED_WATERFILL:+ GR8_S2_SHARED_WATERFILL=$S2_SHARED_WATERFILL}${S2_SHARED_WF_MARGIN:+ GR8_S2_SHARED_WF_MARGIN=$S2_SHARED_WF_MARGIN}"
+  ENGINE_ENV="$ENGINE_ENV${DISPRAM:+ GR8_DISPRAM=$DISPRAM}"
   ENGINE_ENV="$ENGINE_ENV ${EXTRA_ENV:-}"
 }
 
@@ -553,6 +585,8 @@ GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   ENGINE_ENV="$ENGINE_ENV${ATTN_P11:+ GR8_ATTN_P11=$ATTN_P11}"
   ENGINE_ENV="$ENGINE_ENV${DTR:+ GR8_DTR=$DTR}"
   ENGINE_ENV="$ENGINE_ENV${PF_AOP:+ GR8_PF_AOP=$PF_AOP}"
+  ENGINE_ENV="$ENGINE_ENV${DISPRAM:+ GR8_DISPRAM=$DISPRAM}"
+  [ "${DISPRAM_MIN_BYTES:-0}" -gt 0 ] && ENGINE_ENV="$ENGINE_ENV GR8_DISPRAM_MIN_BYTES=$DISPRAM_MIN_BYTES"
   return 0
 }
 

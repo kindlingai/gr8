@@ -1137,5 +1137,199 @@ class QuitWait(unittest.TestCase):
                 f.write('120\n')   # the store was given on the up command line only
             self.assertEqual(S.recorded_quit_wait(out, o), 120)
 
+class DispramTests(unittest.TestCase):
+    def test_probe_fail_open_and_opt_out(self):
+        s_def = supervisor()
+        self.assertEqual(S.probe_dispram(s_def.o, {'DISPRAM_SOCKET': '/tmp/nonexistent-dispram.sock'}), 0)
+        s = supervisor('--dispram', '1')
+        self.assertEqual(S.probe_dispram(s.o, {'DISPRAM_SOCKET': '/tmp/nonexistent-dispram.sock'}), 0)
+        self.assertEqual(S.probe_dispram(supervisor('--dispram', '0').o), 0)
+        self.assertEqual(S.probe_dispram(s.o, {'DISPRAM_DISABLE': '1'}), 0)
+        with mock.patch.object(S.socket, 'SOCK_SEQPACKET', None, create=True):
+            self.assertEqual(S.probe_dispram(s.o, {}), 0)
+
+    @unittest.skipUnless(hasattr(socket, 'SOCK_SEQPACKET'), 'no Unix seqpacket')
+    def test_probe_protocol_and_alignment(self):
+        s = supervisor('--dispram', '1')
+        for free in (2145386496, 2146000000, True, -1, '2048'):
+            with tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, 's')
+                try:
+                    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                except OSError:
+                    self.skipTest('Unix seqpacket unsupported')
+                with listener:
+                    listener.bind(path)
+                    listener.listen()
+                    requests = []
+                    def server():
+                        with listener.accept()[0] as c:
+                            requests.append(json.loads(c.recv(4096)))
+                            c.sendall(json.dumps({'free': free, 'size': 2145386496}).encode())
+                    t = threading.Thread(target=server)
+                    t.start()
+                    self.assertEqual(S.probe_dispram(supervisor().o, {'DISPRAM_SOCKET': path}), 0)
+                    self.assertEqual(requests, [])
+                    got = S.probe_dispram(s.o, {'DISPRAM_SOCKET': path})
+                    t.join(2)
+                    self.assertFalse(t.is_alive())
+                    self.assertEqual(requests, [{'key': 'kindlingai_1', 'op': 'info'}])
+                    self.assertEqual(got, 2145386496 if type(free) is int and free > 0 else 0)
+
+    def test_cluster_minimum(self):
+        for values, expected in [([2145386496]*4, 2145386496), ([2145386496,2145386496,0,2145386496], 0)]:
+            s = supervisor()
+            s.tmpl, s.digest, s.model_id, s.variant = {'knobs': {}}, 'd', 'm', mock.Mock()
+            head = mock.Mock(verdict=None)
+            head.have = {r: hello(r, lan=MEMBERS[r], dispram_bytes=values[r]) for r in range(4)}
+            self.assertEqual(len({h['opts_digest'] for h in head.have.values()}), 1)
+            head.wait_all.return_value = True
+            head.decide.side_effect = lambda v: setattr(head, 'verdict', v)
+            with mock.patch.object(S.handshake, 'Head', return_value=head), mock.patch.object(s, 'rail_check', return_value=''):
+                self.assertEqual(s.handshake_head(hello(0))['dispram_bytes'], expected)
+
+    def test_engine_opt_out_and_attempt_guard(self):
+        s = supervisor()
+        with mock.patch.dict(os.environ, {'DISPRAM_DISABLE': '1', 'DISPRAM_SOCKET': '/tmp/test.sock'}):
+            env = s.engine_env({'env': [], 'knobs': {}})
+            self.assertEqual(env['DISPRAM_DISABLE'], '1')
+            self.assertEqual(env['DISPRAM_SOCKET'], '/tmp/test.sock')
+        s.dispram_off = True
+        env = s.engine_env({'env': ['GR8_DISPRAM_MIN_BYTES=2097152', 'GR8_DISPRAM=1'], 'knobs': {}})
+        self.assertEqual(env['GR8_DISPRAM'], '0')
+        self.assertNotIn('GR8_DISPRAM_MIN_BYTES', env)
+        self.assertEqual(s.on_rpc({'t': 'verdict', 'attempt': 1}, MEMBERS[1])['t'], 'retry')
+        s.boot_attempt = 1
+        self.assertEqual(s.on_rpc({'t': 'hello', 'attempt': 0}, MEMBERS[1])['field'], 'attempt')
+        self.assertEqual(s.on_rpc({'t': 'verdict', 'attempt': 0}, MEMBERS[1])['t'], 'dispram_fallback')
+        s.hs = {'epoch': 22}
+        self.assertEqual(s.on_rpc({'t': 'dispram_fallback', 'epoch': 21}, MEMBERS[1])['detail'], 'ignored')
+
+    def test_cluster_retry_after_worker_exits_75(self):
+        self.cluster_retry_after_worker_exits_75(False)
+
+    def test_slow_worker_verdict_poll_joins_fallback_attempt(self):
+        self.cluster_retry_after_worker_exits_75(True)
+
+    def cluster_retry_after_worker_exits_75(self, slow_poll):
+        # Real run(), handshakes, RPC attempt checks and watch(); mock only model/GPU boot prerequisites.
+        from contextlib import ExitStack
+        from types import SimpleNamespace
+        ranks = [supervisor('--tp', '4', '--join-timeout', '10', '--kv-format', 'int4', '--dispram', '1', rank=r) for r in range(4)]
+        for s in ranks:
+            s.o.values['CONTROL_PORT'] = str(ranks[0].port)
+            s.port = ranks[0].port
+        early_fallback = threading.Event()
+        early_receipts = []
+        slow_replies = []
+        final = threading.Barrier(4, timeout=10)
+        plans, errors, fallbacks = {}, [], []
+        ms = SimpleNamespace(id='a'*64, source='test', dir='/test-model')
+        variant = SimpleNamespace(path='', name='test', sha256='c'*64)
+        def tell(s, r, m, timeout=5):
+            reply = ranks[r].on_rpc(m, s.lan)
+            if r == 3 and m.get('t') == 'dispram_fallback' and not early_fallback.is_set():
+                early_receipts.append((dict(ranks[r].hs), m['epoch'] in ranks[r].fallback_by_epoch))
+                early_fallback.set()
+            return reply
+        def worker_handshake(s, h):
+            ask = h
+            end = time.monotonic() + 10
+            while time.monotonic() < end:
+                if slow_poll and s.rank == 2 and h['attempt'] == 0 and ask['t'] == 'verdict':
+                    if ranks[0].boot_attempt == 0:
+                        time.sleep(.005)
+                        continue
+                v = tell(s, 0, ask)
+                if slow_poll and s.rank == 2 and h['attempt'] == 0 and ask['t'] == 'hello' and v['t'] == 'ok':
+                    v = {'t': 'wait'}  # Exercise a delayed verdict poll even if the hello completed the quorum.
+                if slow_poll and s.rank == 2 and h['attempt'] == 0 and ask['t'] == 'verdict':
+                    slow_replies.append(v['t'])
+                if v['t'] == 'wait':
+                    ask = {'t': 'verdict', 'rank': s.rank, 'attempt': h['attempt']}
+                elif v['t'] == 'retry':
+                    ask = h
+                else:
+                    if s.rank == 3 and h['attempt'] == 0 and v['t'] == 'ok':
+                        # Hold the verdict before run() assigns hs: the notice must survive this ordering.
+                        if not early_fallback.wait(10):
+                            raise AssertionError('no fallback before slow worker installs verdict')
+                    return v
+                time.sleep(.005)
+            raise AssertionError('handshake timeout')
+        def fake_boot(s):
+            p = opt.engine_plan(s.o, dispram_bytes=0 if s.dispram_off else s.hs['dispram_bytes'])
+            env = s.engine_env(p)
+            plans[s.rank, s.boot_attempt] = (p, env, dict(s.hs))
+            s.set_state('loading')
+            if s.boot_attempt == 0:
+                s.started = True
+                if s.rank == 1:
+                    path = os.path.join(s.out, 'g6m4.r1.err')
+                    with open(path, 'w') as f:
+                        f.write('g6: dispram shortfall: live mapped 0 bytes < required 1983905792 bytes\n')
+                    s.engine = subprocess.Popen([sys.executable, '-c', 'raise SystemExit(75)'])
+                    s.engine.wait(timeout=5)
+                end = time.monotonic()+10
+                while time.monotonic() < end:
+                    try:
+                        s.watch()
+                    except S.DispramFallback:
+                        fallbacks.append(s.rank)
+                        raise
+                    time.sleep(.005)
+                raise AssertionError('fallback not propagated')
+            final.wait()
+            s.set_state('serving')
+        def run(s):
+            try:
+                s.run()
+            except Exception as e:
+                errors.append(e)
+        with ExitStack() as stack:
+            for name, value in [('resolve_model', (ms, variant, '')), ('engine_build', 'b'*64),
+                                ('version', 'test'), ('probe_dispram', 2145386496)]:
+                stack.enter_context(mock.patch.object(S, name, return_value=value))
+            stack.enter_context(mock.patch.object(S.modelset, 'model_id', return_value='a'*64))
+            stack.enter_context(mock.patch.object(S, 'stop_local'))
+            for s in ranks:
+                stack.enter_context(mock.patch.object(s, 'rendezvous'))
+                stack.enter_context(mock.patch.object(s, 'serve'))
+                stack.enter_context(mock.patch.object(s, 'checks', return_value=[]))
+                stack.enter_context(mock.patch.object(s, 'rail_check', return_value=''))
+                stack.enter_context(mock.patch.object(s, 'tell', side_effect=lambda r,m,timeout=5,s=s: tell(s,r,m,timeout)))
+                stack.enter_context(mock.patch.object(s, 'tell_head', side_effect=lambda m,s=s: tell(s,0,m)))
+                if s.rank:
+                    stack.enter_context(mock.patch.object(s, 'handshake_worker', side_effect=lambda h,s=s: worker_handshake(s,h)))
+                stack.enter_context(mock.patch.object(s, 'boot', side_effect=lambda s=s: fake_boot(s)))
+            ts = [threading.Thread(target=run, args=(s,), daemon=True) for s in ranks]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(20)
+            self.assertFalse(any(t.is_alive() for t in ts))
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(fallbacks), [0, 1, 3] if slow_poll else list(range(4)))
+        self.assertEqual(slow_replies, ['dispram_fallback'] if slow_poll else [])
+        self.assertEqual(early_receipts, [({}, True)])
+        for s in ranks:
+            second, env1, hs1 = plans[s.rank, 1]
+            if slow_poll and s.rank == 2:
+                self.assertNotIn((s.rank, 0), plans)
+            else:
+                first, env0, hs0 = plans[s.rank, 0]
+                self.assertEqual(first['knobs']['CAP'], '611328')
+                self.assertEqual(env0['GR8_DISPRAM'], '1')
+                self.assertEqual(env0['GR8_DISPRAM_MIN_BYTES'], '1983905792')
+                self.assertGreater(hs1['epoch'], hs0['epoch'])
+            self.assertEqual(second['knobs']['CAP'], '513536')
+            self.assertEqual(env1['GR8_DISPRAM'], '0')
+            self.assertNotIn('GR8_DISPRAM_MIN_BYTES', env1)
+            self.assertEqual(hs1['dispram_bytes'], 0)
+            self.assertEqual(s.boot_attempt, 1)
+            self.assertEqual(s.state, 'serving')
+            s.lock.close()
+
+
 if __name__ == '__main__':
     unittest.main()

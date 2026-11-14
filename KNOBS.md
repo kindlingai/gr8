@@ -45,6 +45,12 @@ tensor-core decode and `CP_ONECHAIN`. Roll back with `--kv-format fp8` or
 GLM-5.3 at `TP=3/5/6` and GLM-5.3-Flash retain FP8 unless INT4 is requested;
 DeepSeek and pseudo-engine defaults are unchanged.
 
+`DISPRAM=1` (`--dispram 1`; unset or `0` is off by default so baseline solo decode speed is unchanged) opts
+into Kindling OS `dispramd` for GLM-5.3 and non-chunked GLM-5.3-Flash KV caches, growing an unset GLM-5.3
+`CAP` from the minimum free display memory across all ranks (for example `513536` to `611328` tokens, `+19.0%`,
+on 4x Spark INT4 with about `4.5%` slower solo decode and flat 8-stream decode). If that memory is no longer
+available at boot, the cluster retries once with baseline `CAP`; `DISPRAM_DISABLE=1` opts out on a box.
+
 ## `./gr8 glm53f`
 
 `./gr8 glm53f` takes the same options for GLM-5.3-Flash: TP 4, 3, 2 or 1, an fp8 KV build, the DFlash2 drafter

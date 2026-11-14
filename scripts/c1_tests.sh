@@ -92,6 +92,10 @@ kvlib_ready() {
 TEST=${TEST:-all}
 ARGS=("$@")
 rc=0
+if [ "$TEST" = all ] || [ "$TEST" = dispram_gpu_test ]; then
+  [ "$TEST" = all ] && ARGS=()
+  build_run dispram_gpu_test || { r=$?; [ "$rc" = 0 ] && rc=$r; }
+fi
 if [ "$TEST" = all ] || [ "$TEST" = row_budget_test ]; then
   build_run row_budget_test || rc=$?
 fi

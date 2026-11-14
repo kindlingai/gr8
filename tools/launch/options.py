@@ -655,6 +655,8 @@ def validate(o):
         raise OptionError(f'--kv-format int4: {model.name} has an fp8 KV build only')
     if o.get('KV_FORMAT') not in (None, 'fp8', 'int4'):
         raise OptionError(f'--kv-format {o.get("KV_FORMAT")}: want fp8 or int4')
+    if o.get("DISPRAM") not in (None, "0", "1"):
+        raise OptionError(f'--dispram {o.get("DISPRAM")}: want 0 or 1')
     if o.get('KV_SHARE_WHEN') not in (None, 'idle', 'always'):
         raise OptionError(f'--kv-share-when {o.get("KV_SHARE_WHEN")}: want idle or always')
     if o.get('KV_KEEP') not in (None, 'system', 'sessions', 'all'):
@@ -1107,12 +1109,14 @@ def resolve_peers(o):
 
 # ---- the engine plan: scripts/engine_args.sh --------------------------------------------------------------------------
 def engine_plan(o, rank='@R', rank_dir='@RANKDIR', aux_dir='@AUXDIR', home='@HOME', epoch='@EPOCH', set_id='',
-                kv_store=None, kv_rows=None):
+                kv_store=None, kv_rows=None, dispram_bytes=0):
     """{'knobs': {K: resolved value}, 'env': [K=V..], 'args': [..]} from scripts/engine_args.sh.
     The defaults give the canonical template, with every per-box value as a placeholder. kv_store, kv_rows: this box's
     KV_STORE and KV_ROWS with the KV node resolved (remote:GB names none)."""
     env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'GR8_MODEL': models.of(o).name, 'TP': o.get('TP'),
            'SET_ID': set_id}
+    if dispram_bytes and int(dispram_bytes) > 0:
+        env['DISPRAM_BYTES'] = str(int(dispram_bytes))
     for k in ENGINE_KNOBS + ['S2PORT', 'READY_TMO']:
         if o.get(k) is not None:
             env[k] = o.get(k)

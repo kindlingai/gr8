@@ -144,6 +144,9 @@ class ChartTests(unittest.TestCase):
         self.assertNotIn('model-loader', out)
         self.assertEqual(self.env(out)['MODEL_CACHE'], '/var/lib/gr8/cache')
         self.assertIn('name: cache', out)
+        self.assertIn('mountPath: /run/dispram', out)
+        self.assertEqual(out.count('mountPath: /run/dispram'), 1)
+        self.assertIn('path: /run/dispram', out)
 
     def test_on(self):
         out = self.render('modelLoader.enabled=true', 'modelLoader.store=/srv/ml')
@@ -154,7 +157,15 @@ class ChartTests(unittest.TestCase):
         self.assertRegex(out, r'- name: model-loader-store\n\s+mountPath: /var/lib/model-loader\n\s+readOnly: true')
         self.assertRegex(out, r'- name: model-loader-store\n\s+hostPath:\n\s+path: /srv/ml')
         self.assertIn("model-loader -check unix:/var/lib/model-loader/model-loader.sock", out)
+        self.assertEqual(out.count('mountPath: /run/dispram'), 1)
+        self.assertIn('path: /run/dispram', out)
         self.assertEqual(out.count('readOnly: true'), 2)             # gr8 and the init container both read-only
+
+
+class DispramMountTests(unittest.TestCase):
+    def test_writable_socket_mount(self):
+        self.assertIn(('/run/dispram', '/run/dispram', False),
+                      [mount(v) for v in services(COMPOSE)['gr8']['volumes']])
 
 
 if __name__ == '__main__':

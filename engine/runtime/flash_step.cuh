@@ -1,3 +1,4 @@
+#include "../dispram.h"
 // Flash-only main-model residual and layer loop. Included by rank.cuh inside g6rt,
 // after its legacy helpers. The MTP model does not use this four-stream path.
 #pragma once
@@ -138,6 +139,10 @@ inline void build_flash(Model& m,int rank,const std::vector<int>& ids,const Find
     m.head_t.lm_head=as_bind(head);
     m.head_t.lm_head_scale=as_bind(hscale);
     m.hlog=dmalloc<float>((size_t)MX*m.vn);
+    if (const size_t db = g6dispram::claimed_bytes())
+        fprintf(stderr, "# rank %d: dispram: %.1f MiB claimed (%.1f MiB VMM mapped) across %zu attention bindings\n",
+                rank, (double)db / (1024.0 * 1024.0), (double)g6dispram::mapped_bytes() / (1024.0 * 1024.0),
+                g6dispram::claimed_spans());
     check_headroom(rank,capacity,true);
 }
 inline void prepare_flash(Model& m,int M,cudaStream_t st) {

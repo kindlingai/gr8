@@ -8,3 +8,17 @@ knobs:
     legacy: []
     doc: >-
       Where the loader writes its planned rank manifests.
+  DISPRAM_DISABLE:
+    scope: local
+    kind: flag
+    default: "0"
+    legacy: []
+    doc: >-
+      Standard Kindling OS opt-out: 1 disables dispramd probes and leases in both the launcher and the engine.
+  DISPRAM_SOCKET:
+    scope: local
+    kind: path
+    default: "/run/dispram/dispram.sock"
+    legacy: []
+    doc: >-
+      Unix domain SOCK_SEQPACKET socket path of Kindling OS dispramd.
