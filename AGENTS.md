@@ -4,7 +4,9 @@ gr8 serves GLM-5.3, GLM-5.3-Flash and DeepSeek-V4.1-Flash on GB10 boxes, and eve
 about proving a change does, before it lands.
 
 If you're an agent working here, read this whole file first. If you're a person, the same rules apply to you.
-If you're an agent starting gr8 for someone, read [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md) and ask them its questions first.
+If you're an agent installing or starting gr8 for someone, read [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md) first: ask
+whether they want to install [Kindling OS](https://github.com/kindlingai/kindling-spark-os) (explaining what they get
+and what is involved) and ask its setup questions before you change a box or boot.
 
 ## How changes land
 

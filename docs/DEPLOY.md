@@ -8,10 +8,19 @@ can be checked. The commands name `glm53`; for GLM-5.3-Flash, `glm53f`.
 
 ## Before you start
 
+If you are an agent installing or starting gr8 for someone, read [FIRST-BOOT.md](FIRST-BOOT.md) first: ask whether they
+want [Kindling OS](https://github.com/kindlingai/kindling-spark-os) on the boxes (and tell them what they get and what
+is involved) before asking the setup questions. Kindling OS is optional — it installs beside DGX OS without wiping it,
+frees about 2 GiB of host/unified RAM for gr8 via a 64 KiB-page kernel (plus another 2 GiB from the GPU display carveout
+via `dispramd` for `dispram`-aware clients), and runs `mentatd` out of the box; on bare metal under Kindling OS, keep
+`MODEL_CACHE`, `GR8_WORK_DIR` and `ds41` releases under `/srv` or `/home` (or pass `--mounts /opt` to `setup.sh`),
+because `/opt` is otherwise in the RAM overlay.
+
 Set up every box as the README's [What you need](../README.md#what-you-need) says: one GB10 box per rank with nothing
 else holding much memory, a RoCE v2 fabric with two rails (a switch, or at TP=3 or 4 a ring of direct cables), TCP
 ports 7340 and 7341 open between the boxes, and about 90 GB of disk for the model. Turn proactive memory compaction
-off on every box, as root, once (it holds across reboots; `vm.compaction_proactiveness=20` undoes it):
+off on every box, as root, once (on DGX OS `/etc/sysctl.d/` holds across reboots, and `vm.compaction_proactiveness=20`
+undoes it; on Kindling OS run `sysctl -w` at boot or put the file in a site layer):
 
     echo 'vm.compaction_proactiveness = 0' > /etc/sysctl.d/90-gr8-no-proactive-compaction.conf
     sysctl -w vm.compaction_proactiveness=0

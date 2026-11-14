@@ -1,5 +1,9 @@
 # gr8: a CUDA inference engine for DGX Spark
 
+If you are an agent installing or starting gr8 for someone, read [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md) first: ask
+whether they want [Kindling OS](https://github.com/kindlingai/kindling-spark-os) on the boxes (and tell them what is
+involved) before asking the setup questions or touching a box.
+
 Need help? Join us on Discord: https://discord.gg/8EAvYPV2rE
 
 gr8 serves GLM-5.3, GLM-5.3-Flash and DeepSeek-V4.1-Flash on one to six DGX Spark (GB10) boxes (the count depends on
@@ -121,8 +125,10 @@ pinning gr8 as a submodule.
 
 If you are an agent (or developer) building on gr8, start from the matching entry point:
 
-- **Start a cluster for someone:** Read [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md) and ask its setup questions before the
-  first boot; [docs/DEPLOY.md](docs/DEPLOY.md) covers Docker Compose, bare metal, and Kubernetes.
+- **Start a cluster for someone:** Read [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md) first — offer
+  [Kindling OS](https://github.com/kindlingai/kindling-spark-os) (explaining what they get and what is involved) and ask
+  the setup questions before the first boot; [docs/DEPLOY.md](docs/DEPLOY.md) covers Docker Compose, bare metal, and
+  Kubernetes.
 - **Package a standalone recipe:** Base `compose.yaml` and `.env.example` on
   [docker/compose.yaml](docker/compose.yaml) and [docker/.env.example](docker/.env.example) (leave option defaults in
   the launcher rather than duplicating them in Compose), check valid options with `./gr8 knobs` and
@@ -187,8 +193,9 @@ docker compose up -d
 ```
 
 Then `docker compose exec gr8 /opt/gr8/gr8 glm53 smoke` on the head. [docs/DEPLOY.md](docs/DEPLOY.md) explains each
-setting, and has bare metal and Kubernetes. An agent that starts gr8 for someone asks them the questions in
-[docs/FIRST-BOOT.md](docs/FIRST-BOOT.md) first.
+setting, and has bare metal and Kubernetes. An agent that installs or starts gr8 for someone reads
+[docs/FIRST-BOOT.md](docs/FIRST-BOOT.md) first: it offers [Kindling OS](https://github.com/kindlingai/kindling-spark-os)
+(and explains what is involved) before asking the setup questions.
 
 **DeepSeek-V4.1-Flash** (four boxes): the recipe
 [deepseek-v4.1-flash-exlr8-4x-spark](https://github.com/kindlingai/deepseek-v4.1-flash-exlr8-4x-spark)
@@ -210,7 +217,10 @@ Each model's page gives its box count. [docs/GLM-5.3.md](docs/GLM-5.3.md#what-yo
 [docs/DEEPSEEK-BOOT.md](docs/DEEPSEEK-BOOT.md#1-what-you-need) add memory and disk.
 
 - DGX Spark or other GB10 boxes (sm_121a, 128 GB unified memory), one rank per box, with nothing else holding much
-  memory.
+  memory, running stock DGX OS or [Kindling OS](https://github.com/kindlingai/kindling-spark-os) (a minimal read-only OS
+  installed beside DGX OS that frees about 2 GiB of host/unified RAM via a 64 KiB-page kernel, plus 2 GiB from the
+  display carveout via `dispramd` for `dispram`-aware clients; see
+  [docs/FIRST-BOOT.md](docs/FIRST-BOOT.md#before-you-start-kindling-os)).
 - One box needs no fabric and no LAN: at TP=1 the launcher skips the RDMA checks
   ([docs/FLASH.md](docs/FLASH.md#one-box-tp1)).
 - Two or more boxes need a RoCE v2 fabric with two rails: each box's ConnectX-7 has one address on each PCIe root. Two
