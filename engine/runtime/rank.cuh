@@ -444,6 +444,8 @@ struct Model
     int s2_pool_slots = 1;            // set before build: > 1 = the layers' own attention bindings hold the S2 pool
     int s2_run_pages = 0;             // build: the MOST pages one session's run can hold (the capacity argument; each view's table)
     int s2_pool_pages = 0;            // set before build: pages of the pool (0 = s2_pool_slots x s2_run_pages); >= s2_run_pages
+    int kv_pages = 0;                 // set before build (GR8_CAP_TOTAL, the drafter): KV pages behind one run's table, the
+                                      // context and scratch kept (s2_pool_pages grows them too); 0 = the table's own
     bool s2_pf_table = false;         // S2 below R: staged prefill reads index keys through the run's table (prefill.cuh
                                       // cp_pf_enter); false = logical pages, as an exclusive run past R
     int s2_below = 0;                 // set before s2_init: S2 below R (CP builds): every session's run <= s2_below rows on the
@@ -845,6 +847,11 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     if (m.cp.on && (m.s2_pool_slots > 1 || m.s2_pool_pages)) die("DEC_S2 + GR8_CP: s2_pool_slots > 1 is not the CP pool (S2 below R uses the CP binding)");
 #endif
     if (m.s2_pool_pages && m.s2_pool_pages < m.s2_run_pages) die("s2: s2_pool_pages < one session's run");
+    if (m.kv_pages && (m.s2_pool_pages || m.s2_pool_slots > 1 || m.kv_pages < m.s2_run_pages))
+        die("s2: kv_pages needs one run's binding and at least its pages");
+#if !(defined(G6_CP) && G6_CP)
+    if (m.kv_pages) die("s2: kv_pages needs a GR8_CP build");
+#endif
     const int cap_ab = m.s2_pool_pages ? m.s2_pool_pages * 64 : m.s2_pool_slots > 1 ? m.s2_pool_slots * m.s2_run_pages * 64 : capacity;
 #else
     const int cap_ab = capacity;
@@ -917,6 +924,10 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
             if (m.cp.colls.q.size() != (size_t)m.nl || (m.cp.colls.cand[i] >= 0) != y.indexer) die("GR8_CP: colls do not match the layer list");
             G6RT_CK(g6_attn_bind_create_cp_phys(&y.ab, &y.ap, rank, y.l, capacity, attn_rows, ATT_QT, m.cp.R, g6nr::NR, m.cp.phys, st, m.dscratch, m.dscratch_bytes));
         }
+#ifdef DEC_S2
+        else if (m.kv_pages)
+            G6RT_CK(g6_attn_bind_create_pages(&y.ab, &y.ap, rank, y.l, cap_ab, m.kv_pages, attn_rows, ATT_QT, st, m.dscratch, m.dscratch_bytes));
+#endif
         else
 #endif
         G6RT_CK(g6_attn_bind_create_ext(&y.ab, &y.ap, rank, y.l, cap_ab, attn_rows, ATT_QT, st, m.dscratch, m.dscratch_bytes));
