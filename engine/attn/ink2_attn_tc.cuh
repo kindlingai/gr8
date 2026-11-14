@@ -83,6 +83,7 @@ __global__ void k_ink2_attn_prefill_tc(AttnCoreArgs a, int gq)
     {
         const uint16_t* qpa = a.q_raw + (static_cast<size_t>(ra) * a.nh_q + lq) * TC_HD;
         const uint16_t* qpb = a.q_raw + (static_cast<size_t>(rb) * a.nh_q + lq) * TC_HD;
+        #pragma unroll
         for (int kk = 0; kk < 8; ++kk)
         {
             const int c = kk * 16 + 2 * t;
@@ -99,6 +100,7 @@ __global__ void k_ink2_attn_prefill_tc(AttnCoreArgs a, int gq)
         rf[3] = vb ? ld32(rpb + 2 * t + 8) : 0u;
     }
     float oc[16][4];
+    #pragma unroll
     for (int j = 0; j < 16; ++j) oc[j][0] = oc[j][1] = oc[j][2] = oc[j][3] = 0.0f;
     // the running maximum starts at the sink, whose weight 1 is in lane t = 0's part of the sum
     float ma = va ? bf(a.sink[static_cast<size_t>(ra) * a.nh_q + lq]) : 0.0f, mb = vb ? bf(a.sink[static_cast<size_t>(rb) * a.nh_q + lq]) : 0.0f;
@@ -152,14 +154,18 @@ __global__ void k_ink2_attn_prefill_tc(AttnCoreArgs a, int gq)
 
         // the scores [16][64] = q k^T: 8 blocks of 8 keys
         float sr[8][4];
+        #pragma unroll
         for (int j = 0; j < 8; ++j)
         {
             sr[j][0] = sr[j][1] = sr[j][2] = sr[j][3] = 0.0f;
             const uint16_t* kr = sK + (j * 8 + g) * TC_KLD + 2 * t;
+            #pragma unroll
             for (int kk = 0; kk < 8; ++kk) tc_mma(sr[j], qf[kk], ld32(kr + kk * 16), ld32(kr + kk * 16 + 8));
         }
         float xa = -INFINITY, xb = -INFINITY;
+        #pragma unroll
         for (int j = 0; j < 8; ++j)
+            #pragma unroll
             for (int e = 0; e < 2; ++e)
             {
                 const int kcol = j * 8 + 2 * t + e, kpos = kb + kcol;
@@ -177,6 +183,7 @@ __global__ void k_ink2_attn_prefill_tc(AttnCoreArgs a, int gq)
                 xa = fmaxf(xa, za);
                 xb = fmaxf(xb, zb);
             }
+        #pragma unroll
         for (int o2 = 1; o2 < 4; o2 <<= 1)
         {
             xa = fmaxf(xa, __shfl_xor_sync(0xffffffffu, xa, o2));
@@ -188,6 +195,7 @@ __global__ void k_ink2_attn_prefill_tc(AttnCoreArgs a, int gq)
         mb = nb;
         la *= aa;
         lb *= ab;
+        #pragma unroll
         for (int j = 0; j < 16; ++j)
         {
             oc[j][0] *= aa;
@@ -196,9 +204,11 @@ __global__ void k_ink2_attn_prefill_tc(AttnCoreArgs a, int gq)
             oc[j][3] *= ab;
         }
         // acc [16][128] += p v, 16 keys a step; p = hi + lo
+        #pragma unroll
         for (int kk = 0; kk < 4; ++kk)
         {
             uint32_t hi[4], lw[4];
+            #pragma unroll
             for (int half = 0; half < 2; ++half)
             {
                 const float* c = sr[2 * kk + half];
@@ -212,6 +222,7 @@ __global__ void k_ink2_attn_prefill_tc(AttnCoreArgs a, int gq)
                 lw[half * 2] = static_cast<uint32_t>(bf16(w0)) | (static_cast<uint32_t>(bf16(w1)) << 16);
                 lw[half * 2 + 1] = static_cast<uint32_t>(bf16(w2)) | (static_cast<uint32_t>(bf16(w3)) << 16);
             }
+            #pragma unroll
             for (int j = 0; j < 16; ++j)
             {
                 const uint16_t* vr = sV + (j * 8 + g) * TC_VLD + 2 * t + kk * 16;
@@ -222,12 +233,14 @@ __global__ void k_ink2_attn_prefill_tc(AttnCoreArgs a, int gq)
         }
     }
     if (!on) return;
+    #pragma unroll
     for (int o2 = 1; o2 < 4; o2 <<= 1)
     {
         la += __shfl_xor_sync(0xffffffffu, la, o2);
         lb += __shfl_xor_sync(0xffffffffu, lb, o2);
     }
     const size_t qa = (static_cast<size_t>(ra) * a.nh_q + lq) * TC_HD, qb = (static_cast<size_t>(rb) * a.nh_q + lq) * TC_HD;
+    #pragma unroll
     for (int j = 0; j < 16; ++j)
     {
         const int c = j * 8 + 2 * t;

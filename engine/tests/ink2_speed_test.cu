@@ -6,20 +6,21 @@
 //   2. The tensor-core attention of a prefill chunk (attn/ink2_attn_tc.cuh) against k_ink2_attn_core at the full
 //      model's head geometry (head_dim 128, rel_dim 16): a local layer whose keys come from the ring and from the
 //      chunk, a rank whose first K / V head has part of its query heads, and a global layer on pages. 40 rows (a
-//      part group of 16). A cell may differ by max(|x|, 1) / 32 (the sums are in another order and BF16 rounds the
-//      output); the largest difference is printed.
-//   3. The engine on a miniature checkpoint (ink2_mini_ckpt.h), 1 and 4 simulated ranks, a 70-token prefill in
-//      chunks of 48 and 22 with every row sampled, then 8 single rows: the device head pack on and off give the
-//      same tokens and candidates, exact. With the cuBLAS projections on as well, a row's token is the stock
-//      row's, or a stock candidate within max(|top|, 1) / 32 of its top (a near tie, counted and printed).
-//      (The miniature's head_dim is 16, so the tensor-core kernel is not on this path; check 2 covers it.)
+//      part group of 16). A cell may differ by max(|x|, 1) / 32 and cosine must be at least 0.9999 (the sums are in
+//      another order and BF16 rounds the output); the largest difference and cosine are printed.
+//   3. The engine on a miniature checkpoint (ink2_mini_ckpt.h), 1, 4 and 6 simulated ranks, a 70-token prefill in
+//      chunks of 48 and 22 with every row sampled, then 8 single rows (plus a 3-draft MTP speculative round on each
+//      rank count): the device head pack on and off give the same tokens, drafted tokens and candidates, exact. With
+//      the cuBLAS projections on as well, a row's token is the stock row's, or a stock candidate within max(|top|, 1) / 32
+//      of its top (a near tie, counted and printed). (The miniature's head_dim is 16, so the tensor-core kernel is not
+//      on this path; check 2 covers it.)
 //   4. The device all-reduce (kernels/ink2_fabric.cuh) as rank 1 of a 4-rank fabric in pinned host memory, the test
 //      playing the peers (before the launches, or after the doorbell while the device spins): 1, 8, 64 and 512 rows
 //      of 2304 and 4096 cells; the sum's bits are the stock sum's. Also the slot offsets and the credits of the pooled
 //      96-collective layout. The proxy and the wire of a real multi-rank run are not on this path.
 //
-// --bench: also times the head pack (8 rows of 50304 logits, 256 candidates) and the two attention kernels
-// (512 rows, a local window of 1024) and prints milliseconds.
+// --bench: also times the head pack (8 rows of 50304 logits, 256 candidates), cuBLAS vs k_ink2_gemm (128 and 512 rows
+// of 4608 -> 6144), and the two attention kernels (512 rows at ctx 2048 local and ctx 8192 global) and prints ms.
 //
 // Build (from engine/runtime, after scripts/build.sh has built the Rust libraries and bin/obj/g6pack.o):
 //   nvcc -O3 -std=c++17 -Xcompiler -ffp-contract=off -gencode=arch=compute_121a,code=sm_121a -DG6_MODEL_INK2=1 -DDEC_S2 \
@@ -178,18 +179,23 @@ static void check_attn_tc(const AttnCase& tc, bool bench)
     CK(cudaDeviceSynchronize());
     const double t_tc = now_ms() - t0;
     CK(cudaMemcpy(got.data(), d_og, ncell * 2, cudaMemcpyDeviceToHost));
-    double worst = 0;
+    double worst = 0, dot = 0, na = 0, nb = 0;
     size_t bad = 0, differ = 0;
     for (size_t i = 0; i < ncell; ++i)
     {
-        const float x = bf2f(ref[i]), y = bf2f(got[i]);
-        const double d = std::fabs(static_cast<double>(x) - y), tol = std::max(1.0, static_cast<double>(std::fabs(x))) / 32;
+        const double x = bf2f(ref[i]), y = bf2f(got[i]);
+        const double d = std::fabs(x - y), tol = std::max(1.0, std::fabs(x)) / 32;
         if (!(d <= tol)) ++bad;   // a NaN is a failure
         if (ref[i] != got[i]) ++differ;
         if (d > worst) worst = d;
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
     }
-    printf("   %s: %zu cells, %zu differ, largest difference %.5f%s\n", tc.name, ncell, differ, worst, bad ? "  <-- FAIL" : "");
+    const double cos = na > 0 && nb > 0 ? dot / std::sqrt(na * nb) : 0.0;
+    printf("   %s: %zu cells, %zu differ, largest difference %.5f, cosine %.6f%s\n", tc.name, ncell, differ, worst, cos, (bad || !(cos >= 0.9999)) ? "  <-- FAIL" : "");
     check(bad == 0, std::string("tensor-core attention, ") + tc.name + ": " + std::to_string(bad) + " cells past the tolerance");
+    check(cos >= 0.9999, std::string("tensor-core attention, ") + tc.name + ": cosine " + std::to_string(cos));
     if (bench) printf("   bench attention %s: %d rows, stock %.3f ms, tensor cores %.3f ms\n", tc.name, M, t_ref, t_tc);
     for (void* p : {static_cast<void*>(d_q), static_cast<void*>(d_r), static_cast<void*>(d_gate), static_cast<void*>(d_sink), static_cast<void*>(d_qc), static_cast<void*>(d_rc),
                     static_cast<void*>(d_rp), static_cast<void*>(d_kv), static_cast<void*>(d_ring), static_cast<void*>(d_pages), static_cast<void*>(d_slot), static_cast<void*>(d_pos),
@@ -200,13 +206,14 @@ static void check_attn_tc(const AttnCase& tc, bool bench)
 // ---------------------------------------------------------------------------------------------- 3. the engine
 constexpr int CAP = 192, ROWS = 48, NCAND = 64, PROMPT = 70, SINGLES = 8;
 
-static std::unique_ptr<Engine> engine(const std::string& dir, int T, int ghp, int blas)
+static std::unique_ptr<Engine> engine(const std::string& dir, int T, int ghp, int blas, int mtp = 0)
 {
     Options o;
     o.nr = T;
     o.rank0 = 0;
     o.nloc = T;
     o.slots = 1;
+    o.mtp = mtp;
     o.max_rows = ROWS;
     o.cap = CAP;
     o.nc = NCAND;
@@ -218,8 +225,32 @@ static std::unique_ptr<Engine> engine(const std::string& dir, int T, int ghp, in
     e->init(dir, o);
     return e;
 }
+static void bench_gemm(int M, int K, int N)
+{
+    Rng r{0x67656d6du + static_cast<uint64_t>(M)};
+    const std::vector<uint16_t> x = rand_bf(r, static_cast<size_t>(M) * K, 1.0f), w = rand_bf(r, static_cast<size_t>(N) * K, 0.2f);
+    uint16_t *dx = to_dev(x), *dw = to_dev(w), *dy = to_dev(std::vector<uint16_t>(static_cast<size_t>(M) * N, 0));
+    cublasHandle_t hd = nullptr;
+    if (cublasCreate(&hd) != CUBLAS_STATUS_SUCCESS) { fprintf(stderr, "FATAL cublasCreate\n"); exit(2); }
+    ink2::gemm(dx, dw, M, K, N, dy, ink2::GEMM_BF16, 0, 0, 0);
+    { ink2rt::BlasScope bs(hd); ink2::gemm(dx, dw, M, K, N, dy, ink2::GEMM_BF16, 0, 0, 0); }
+    CK(cudaDeviceSynchronize());
+    double t0 = now_ms();
+    ink2::gemm(dx, dw, M, K, N, dy, ink2::GEMM_BF16, 0, 0, 0);
+    CK(cudaDeviceSynchronize());
+    const double t_stock = now_ms() - t0;
+    t0 = now_ms();
+    { ink2rt::BlasScope bs(hd); ink2::gemm(dx, dw, M, K, N, dy, ink2::GEMM_BF16, 0, 0, 0); }
+    CK(cudaDeviceSynchronize());
+    const double t_blas = now_ms() - t0;
+    printf("   bench gemm: %d x %d x %d: stock %.3f ms, cuBLAS %.3f ms\n", M, K, N, t_stock, t_blas);
+    cublasDestroy(hd);
+    CK(cudaFree(dx));
+    CK(cudaFree(dw));
+    CK(cudaFree(dy));
+}
 // every row's output of the teacher-forced run: the prompt in chunks of ROWS, then single rows
-static std::vector<RowOut> run(Engine& e, const std::vector<int>& toks)
+static std::vector<RowOut> run(Engine& e, const std::vector<int>& toks, std::vector<int>* drafts = nullptr)
 {
     std::vector<RowOut> all, out;
     e.reset_slot(0);
@@ -236,14 +267,19 @@ static std::vector<RowOut> run(Engine& e, const std::vector<int>& toks)
         e.commit();
         all.insert(all.end(), out.begin(), out.end());
         p += n;
+        if (drafts && p == PROMPT)
+            e.mtp_draft({0}, {p - 1}, {out.back().tok}, {RowSample{0, 0, 0, 0}}, 3, *drafts);
     }
     return all;
 }
 static void check_engine(const std::string& dir, int T, const std::vector<int>& toks)
 {
-    const std::vector<RowOut> off = run(*engine(dir, T, 0, 0), toks), ghp = run(*engine(dir, T, 1, 0), toks), all = run(*engine(dir, T, 1, 1), toks);
+    std::vector<int> d_off, d_ghp;
+    const std::vector<RowOut> off = run(*engine(dir, T, 0, 0, 3), toks, &d_off), ghp = run(*engine(dir, T, 1, 0, 3), toks, &d_ghp),
+                              all = run(*engine(dir, T, 1, 1, 3), toks);
     const std::string w = "engine of " + std::to_string(T) + " rank(s), row ";
     check(off.size() == toks.size() && ghp.size() == off.size() && all.size() == off.size(), w + "count");
+    check(d_off.size() == 3 && d_off == d_ghp, "engine of " + std::to_string(T) + " rank(s): mtp_draft with device head pack");
     if (fails) return;
     int near = 0;
     for (size_t i = 0; i < off.size(); ++i)
@@ -385,7 +421,12 @@ int main(int argc, char** argv)
         check_head_pack(12576, nc, 9, false);
     }
     check_head_pack(255, 256, 5, false);
-    if (bench) check_head_pack(50304, 256, 8, true);
+    if (bench)
+    {
+        check_head_pack(50304, 256, 8, true);
+        bench_gemm(128, 4608, 6144);
+        bench_gemm(512, 4608, 6144);
+    }
 
     printf("2. the tensor-core attention of a prefill chunk\n");
     check_attn_tc({"local, ring and chunk", 40, 200, 12, 0, 0, 2, 96, 0}, false);
@@ -393,7 +434,11 @@ int main(int argc, char** argv)
     check_attn_tc({"local, first positions", 40, 0, 12, 0, 0, 2, 96, 0}, false);
     check_attn_tc({"global, pages", 40, 100, 12, 6, 1, 2, 96, 1}, false);
     check_attn_tc({"global, past the rel window", 24, 1100, 6, 0, 0, 1, 96, 1}, false);
-    if (bench) check_attn_tc({"local, window 1024", 512, 2048, 12, 0, 0, 2, 1024, 0}, true);
+    if (bench)
+    {
+        check_attn_tc({"local, ctx 2048, window 1024", 512, 2048, 12, 0, 0, 2, 1024, 0}, true);
+        check_attn_tc({"global, ctx 8192", 512, 7680, 12, 0, 0, 2, 1024, 1}, true);
+    }
 
     printf("3. the engine with the speed paths on and off\n");
     Mini mm;
@@ -405,7 +450,7 @@ int main(int argc, char** argv)
     Rng r{0x73706565u};
     std::vector<int> toks;
     for (int i = 0; i < PROMPT + SINGLES; ++i) toks.push_back(static_cast<int>(r.next() % VALID));
-    for (int T : {1, 4}) check_engine(dir, T, toks);
+    for (int T : {1, 4, 6}) check_engine(dir, T, toks);
     std::filesystem::remove_all(tmp);
 
     printf("4. the device all-reduce on a fabric in memory\n");

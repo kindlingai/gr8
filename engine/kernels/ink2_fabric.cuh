@@ -46,12 +46,11 @@ __global__ void k_ink2_ar_copy(const uint4* __restrict__ src, uint4* __restrict_
 
 struct ArWait
 {
-    const unsigned long long* tail[INK2_AR_MAX_RANKS];   // the tail word of each peer's receive slot (null: this rank)
-    unsigned long long* doorbell;                        // doorbell[c]
-    unsigned* error;
+    g6::FabricDev f;
+    size_t bytes;
     unsigned long long seq;
-    unsigned code;                                       // INK2_ERR_AR | c << 8
-    int nr;
+    unsigned code;   // INK2_ERR_AR | c << 8
+    int par, c;
 };
 __global__ void k_ink2_ar_ring_wait(ArWait a)
 {
@@ -59,17 +58,18 @@ __global__ void k_ink2_ar_ring_wait(ArWait a)
     if (p == 0)
     {
         __threadfence_system();
-        ar_st_release_sys(a.doorbell, a.seq);
+        ar_st_release_sys(a.f.doorbell + a.c, a.seq);
     }
-    if (p < a.nr && a.tail[p] != nullptr)
+    if (p < a.f.nr && p != a.f.rank)
     {
+        const unsigned long long* tail = reinterpret_cast<const unsigned long long*>(a.f.recv + g6::fab_recv_off(a.f, a.par, a.c, p) + a.bytes);
         const long long t0 = clock64();
         unsigned it = 0;
-        while (ar_ld_acquire_sys(a.tail[p]) != a.seq)
+        while (ar_ld_acquire_sys(tail) != a.seq)
         {
-            if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(a.error) != 0 || clock64() - t0 > INK2_SPIN_TIMEOUT_CYC))
+            if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(a.f.error) != 0 || clock64() - t0 > INK2_SPIN_TIMEOUT_CYC))
             {
-                atomicCAS(a.error, 0u, a.code | static_cast<unsigned>(p));
+                atomicCAS(a.f.error, 0u, a.code | static_cast<unsigned>(p));
                 break;
             }
         }
@@ -86,14 +86,7 @@ inline void ar_exchange(const g6::FabricDev& f, unsigned long long step, int c, 
     const unsigned grid = static_cast<unsigned>((n16 + 255) / 256);
     k_ink2_ar_copy<<<grid, 256, 0, st>>>(reinterpret_cast<const uint4*>(parts + static_cast<size_t>(f.rank) * bytes),
                                          reinterpret_cast<uint4*>(f.send + g6::fab_send_off(f, par, c)), n16);
-    ArWait a{};
-    for (int p = 0; p < f.nr; ++p)
-        a.tail[p] = p == f.rank ? nullptr : reinterpret_cast<const unsigned long long*>(f.recv + g6::fab_recv_off(f, par, c, p) + bytes);
-    a.doorbell = f.doorbell + c;
-    a.error = f.error;
-    a.seq = g6::coll_seq(step, c, f.ncoll);
-    a.code = INK2_ERR_AR | (static_cast<unsigned>(c) << 8);
-    a.nr = f.nr;
+    ArWait a{f, bytes, g6::coll_seq(step, c, f.ncoll), INK2_ERR_AR | (static_cast<unsigned>(c) << 8), par, c};
     k_ink2_ar_ring_wait<<<1, 32, 0, st>>>(a);
     for (int p = 0; p < f.nr; ++p)
         if (p != f.rank)
