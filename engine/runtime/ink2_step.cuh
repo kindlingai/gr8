@@ -22,6 +22,7 @@
 #include "../loader/g6pack.h"
 #include "../loader-rs/g6load.h"
 #include "../knobs-rs/gr8_knobs.h"
+#include "ink2_vision.cuh"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -83,6 +84,10 @@ struct Cfg
     float mtp_theta = 1e6f;
     std::vector<uint8_t> mtp_global;   // [mtp_layers] 1 = the layer reads the whole context
     std::vector<int> mtp_targets;      // the taps: trunk layers whose input is read; n_layers = the final_norm output
+    // the vision tower (vision_config; the defaults are Inkling-2-Small's). has_vision: config.json has a vision_config
+    bool has_vision = false;
+    int vis_hidden = 1024, vis_layers = 23, vis_heads = 16, vis_mlp = 4096, vis_patch = 20, vis_merge = 2, vis_grid = 32, vis_proj = 4096;
+    float vis_eps = 1e-5f, vis_theta = 10000.0f;
 };
 
 inline std::string json_section(const std::string& text, const char* key)
@@ -137,15 +142,22 @@ inline std::vector<int> json_ints(const std::string& text, const char* key)
     return v;
 }
 
-// config.json of the checkpoint: its text_config when it has one, else the top level. The drafter's mtp_config is
-// read apart, so a key of the same name in it never stands in for the trunk's.
+// config.json of the checkpoint: its text_config when it has one, else the top level. The drafter's mtp_config and
+// the tower's vision_config are read apart, so a key of the same name in them never stands in for the trunk's.
 inline Cfg read_config(const std::string& dir)
 {
     std::ifstream f(dir + "/config.json");
     if (!f) die(dir + "/config.json: cannot open");
     std::stringstream ss;
     ss << f.rdbuf();
-    std::string text = ss.str(), mtp;
+    std::string text = ss.str(), mtp, vis;
+    if (text.find("\"vision_config\"") != std::string::npos)
+    {
+        vis = json_section(text, "vision_config");
+        const size_t at = text.find(vis, text.find("\"vision_config\""));
+        if (vis.empty() || vis[0] != '{' || at == std::string::npos) die(dir + "/config.json: vision_config is not an object");
+        text.replace(at, vis.size(), "{}");
+    }
     if (text.find("\"mtp_config\"") != std::string::npos)
     {
         mtp = json_section(text, "mtp_config");
@@ -163,6 +175,22 @@ inline Cfg read_config(const std::string& dir)
         return v;
     };
     Cfg c;
+    c.image_token = static_cast<int>(json_num(text, 0, "image_token_id", geom::TOK_IMAGE));
+    if (!vis.empty())
+    {
+        const auto vi = [&](const char* key, int def) { return static_cast<int>(json_num(vis, 0, key, def)); };
+        c.has_vision = true;
+        c.vis_hidden = vi("hidden_size", c.vis_hidden);
+        c.vis_layers = vi("num_hidden_layers", c.vis_layers);
+        c.vis_heads = vi("num_attention_heads", c.vis_heads);
+        c.vis_mlp = static_cast<int>(std::lround(c.vis_hidden * json_num(vis, 0, "mlp_ratio", 4.0)));
+        c.vis_patch = vi("native_patch_size", c.vis_patch);
+        c.vis_merge = vi("adapter_merge_size", c.vis_merge);
+        c.vis_grid = vi("posemb_grid_size", c.vis_grid);
+        c.vis_proj = vi("projection_hidden_dim", c.vis_proj);
+        c.vis_eps = static_cast<float>(json_num(vis, 0, "layer_norm_eps", c.vis_eps));
+        c.vis_theta = static_cast<float>(json_num(vis, 0, "rope_theta", c.vis_theta));
+    }
     c.H = need("hidden_size");
     c.heads = need("num_attention_heads");
     c.kv_heads = need("num_key_value_heads");
@@ -535,6 +563,7 @@ struct Options
     int mtp = 0;         // drafts of a round (0 = no drafter: no taps, no drafter state)
     std::string layers = "all";
     bool whole_image = false;
+    bool vision = false; // run the vision tower when the checkpoint has one (image input)
 };
 
 class Engine
@@ -607,9 +636,45 @@ public:
         host_logits.resize(static_cast<size_t>(o.max_rows) * vr);
         head_parts.resize(static_cast<size_t>(o.nr) * head_bytes(o.max_rows));
         if (o.mtp > 0) init_mtp();
+        if (o.vision && a.find("V.proj_out.weight")) init_vision();
         INK2RT_CK(cudaDeviceSynchronize());
         fprintf(stderr, "# ink2: ranks %d..%d of %d, %zu layers, H %d, %d experts top %d, vocab %d (%d rows a rank), %d slots, %d rows, cap %d\n", o.rank0,
                 o.rank0 + o.nloc - 1, o.nr, L.size(), c.H, c.NE, c.TK, c.vocab, vr, o.slots, o.max_rows, o.cap);
+    }
+
+    // ---- image input (ink2_vision.cuh). The tower runs on this engine's first rank; every rank computes the same rows.
+    bool vision_ready() const { return vis && vis->ready(); }
+    // 16 hex digits over the tower's tensors as the image plans them (name, dtype, shape, bytes): the ranks compare it
+    const std::string& vision_id() const { return vis_id_; }
+    size_t vision_device_bytes() const { return vis ? vis->device_bytes() : 0; }
+    long vision_encode_calls() const { return vis ? vis->encode_calls : 0; }
+    // The image rows of a launch of `rows` rows at prompt positions first .. (forward's vis_rows), or null when no
+    // image of the request overlaps them. The pointer is valid until the next call.
+    const uint16_t* stage_vision(const std::vector<g6rt::ImageIn>& images, int first, int rows, uint64_t req_id)
+    {
+        if (images.empty()) return nullptr;
+        if (!vision_ready()) die("an image request, and the engine runs no vision tower");
+        try
+        {
+            return vis->stage(images, first, rows, static_cast<unsigned long long>(req_id));
+        }
+        catch (const std::exception& e)
+        {
+            die(e.what());
+        }
+    }
+    // One image through the tower: BF16 [tokens][H] to the device pointer out (a test compares it with the reference).
+    void encode_vision(const uint8_t* rgb, int vit_h, int vit_w, uint16_t* out, int content_h = -1, int content_w = -1)
+    {
+        if (!vision_ready()) die("encode_vision: the engine runs no vision tower");
+        try
+        {
+            vis->encode(rgb, vit_h, vit_w, out, content_h, content_w);
+        }
+        catch (const std::exception& e)
+        {
+            die(e.what());
+        }
     }
 
     // A new run on a slot: its convolution histories and rings read as zeros.
@@ -644,7 +709,8 @@ public:
 
     // One step over the rows of rh. No state changes before commit(). When samples is null (prefill), the head is skipped.
     // With the drafter on, the taps of the rows are kept for commit().
-    void forward(const ink2::RowsHost& rh, const int* tk, const RowSample* samples, std::vector<RowOut>& out)
+    // vis_rows [M][H] (stage_vision) or null: the row of an image token is read from it in place of its embedding.
+    void forward(const ink2::RowsHost& rh, const int* tk, const RowSample* samples, std::vector<RowOut>& out, const uint16_t* vis_rows = nullptr)
     {
         M = rh.rows();
         if (M < 1 || M > o.max_rows) die("step of " + std::to_string(M) + " rows");
@@ -656,7 +722,7 @@ public:
         INK2RT_CK(cudaMemcpy(d_run0, rh.run0.data(), sizeof(int) * M, cudaMemcpyHostToDevice));
         INK2RT_CK(cudaMemcpy(toks, tk, sizeof(int) * M, cudaMemcpyHostToDevice));
         const ink2::Rows rw{d_slot, d_pos, d_run0};
-        ink2::embed_norm(toks, embed, embed_norm, nullptr, c.image_token, h, M, c.H, 0);
+        ink2::embed_norm(toks, embed, embed_norm, vis_rows, c.image_token, h, M, c.H, 0);
         for (size_t j = 0; j < L.size(); ++j)
         {
             Layer& s = L[j];
@@ -1323,6 +1389,55 @@ private:
     }
 
     std::vector<std::unique_ptr<Image>> img;
+    std::unique_ptr<Ink2Vision> vis;
+    std::string vis_id_;
+
+    void init_vision()
+    {
+        Image& a = *img[0];
+        if (!c.has_vision) die("the checkpoint has V.* tensors and its config.json has no vision_config");
+        VisDims vd;
+        vd.vd = c.vis_hidden;
+        vd.layers = c.vis_layers;
+        vd.heads = c.vis_heads;
+        vd.mlp = c.vis_mlp;
+        vd.patch = c.vis_patch;
+        vd.merge = c.vis_merge;
+        vd.grid = c.vis_grid;
+        vd.proj = c.vis_proj;
+        vd.H = c.H;
+        vd.eps = c.vis_eps;
+        vd.theta = c.vis_theta;
+        const auto get = [&](const std::string& name, const std::vector<int64_t>& shape) -> const uint16_t* {
+            const g6::Entry& e = a.entry("V." + name);
+            if (e.dtype != g6::DType::BF16 || e.shape != shape) die("V." + name + ": not the BF16 tensor of the vision_config");
+            return a.get<uint16_t>("V." + name);
+        };
+        // the id: every V.* entry of the image in name order
+        std::vector<const g6::Entry*> ve;
+        for (const g6::Entry& e : a.pack.entries())
+            if (e.name.compare(0, 2, "V.") == 0) ve.push_back(&e);
+        std::sort(ve.begin(), ve.end(), [](const g6::Entry* x, const g6::Entry* y) { return x->name < y->name; });
+        ds41::engram::Sha256 sha;
+        for (const g6::Entry* e : ve)
+        {
+            std::string line = e->name + " " + std::to_string(static_cast<int>(e->dtype)) + " [";
+            for (int64_t s : e->shape) line += std::to_string(s) + ",";
+            line += "] " + std::to_string(e->nbytes) + "\n";
+            sha.update(line.data(), line.size());
+        }
+        vis_id_ = sha.hex().substr(0, 16);
+        vis = std::make_unique<Ink2Vision>();
+        vis->log = o.rank0 == 0;
+        try
+        {
+            vis->init(vd, get, o.max_rows);
+        }
+        catch (const std::exception& e)
+        {
+            die(e.what());
+        }
+    }
     std::vector<Layer> L;
     std::vector<ink2::Work> mw;
     std::vector<const uint16_t*> lm;

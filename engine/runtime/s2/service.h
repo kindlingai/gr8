@@ -337,7 +337,7 @@ class Service {
         if (r.images.empty()) return true;
 #if G6_MODEL_DS41
         const bool decode_prompt = ds41_decode_prompt(c_.prefill_min, r.prompt.size(), r.plp, r.steering.enabled);
-#elif G6_MODEL_FLASH
+#elif G6_MODEL_FLASH || G6_MODEL_INK2
         const bool decode_prompt = r.plp >= 0 || r.steering.enabled;   // as Sessions::payload: only prompt logprobs decode
 #else
         const bool decode_prompt = true;   // GLM-5.3 has no vision tower
