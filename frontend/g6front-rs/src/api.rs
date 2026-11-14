@@ -649,13 +649,13 @@ fn image_err(e: crate::vision::VisionError) -> ApiError {
     ApiError::bad(e.0, Some("messages"))
 }
 
-/// The image processor and image token of the served model: DeepSeek-V4.1's, else GLM-5.3-Flash's (an engine without
-/// a vision tower refuses images before either is used).
+/// The image processor and image token of the served model: DeepSeek-V4.1's, Inkling-2-Small's, else GLM-5.3-Flash's
+/// (an engine without a vision tower refuses images before any is used).
 fn image_model(st: &State) -> crate::vision::Model {
-    if st.dialect == Dialect::Ds41 {
-        crate::vision::Model::Ds41
-    } else {
-        crate::vision::Model::Glm5v
+    match st.dialect {
+        Dialect::Ds41 => crate::vision::Model::Ds41,
+        Dialect::Inkling => crate::vision::Model::Ink2,
+        _ => crate::vision::Model::Glm5v,
     }
 }
 
@@ -1650,7 +1650,7 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                     let b64: Vec<&str> =
                         images.iter().map(vision::block_b64).collect::<Result<_, _>>().map_err(image_err)?;
                     vision::check_budget(&b64).map_err(image_err)?;
-                    let model = vision::Model::Glm5v;
+                    let model = image_model(st);
                     let n_spans: Vec<usize> =
                         b64.iter().map(|s| model.n_span_b64(s)).collect::<Result<_, _>>().map_err(image_err)?;
                     vision::expand(&ids, &n_spans, model.token()).map_err(image_err)?.0

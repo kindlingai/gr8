@@ -1,6 +1,6 @@
 //! Image input: each model's image processor in Rust, up to the uint8 RGB its vision tower reads, so the engine gets
-//! exactly the pixels the reference code would build. `Model` picks the model: DeepSeek-V4.1 (below) or GLM-5.3-Flash
-//! (`glm5v`).
+//! exactly the pixels the reference code would build. `Model` picks the model: DeepSeek-V4.1 (below), GLM-5.3-Flash
+//! (`glm5v`) or Inkling-2-Small (`ink2`).
 //!
 //! DeepSeek-V4.1: the release's `inference/image_processor.py` (`load_image`).
 //!
@@ -17,6 +17,10 @@
 //!
 //! GLM-5.3-Flash: transformers' `Glm5NextImageProcessor` (PIL backend), in `glm5v` (docs/FLASH-VISION.md). An image is
 //! `vit_h * vit_w / 4` copies of `<|image|>` between the template's `<|begin_of_image|>` and `<|end_of_image|>`.
+//!
+//! Inkling-2-Small: the checkpoint's image processor, in `ink2`. No resize: transparency is composited on a grey
+//! checkerboard, the image is padded on the right and the bottom to 40 px multiples, and it is `ceil(h / 40) *
+//! ceil(w / 40)` copies of `<|unused_200054|>` after the template's `<|content_image|>`.
 
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
@@ -308,9 +312,18 @@ fn check_pixels(w: u64, h: u64) -> Result<(), VisionError> {
     Ok(())
 }
 
+/// The first frame of a GIF: the logical screen as palette indices, the palette, and the frame's transparent index.
+struct GifFrame {
+    w: usize,
+    h: usize,
+    idx: Vec<u8>,
+    pal: Vec<u8>,
+    transparent: Option<u8>,
+}
+
 /// The first frame of a GIF as PIL builds it: the logical screen filled with the frame's transparent index (index 0
-/// without one), the frame's indices pasted at its offset, then the palette (the frame's own, else the global one).
-fn decode_gif(bytes: &[u8]) -> Result<Rgb, VisionError> {
+/// without one), the frame's indices pasted at its offset; the palette is the frame's own, else the global one.
+fn gif_frame(bytes: &[u8]) -> Result<GifFrame, VisionError> {
     let mut opts = gif::DecodeOptions::new();
     opts.set_color_output(gif::ColorOutput::Indexed);
     let e = |e: gif::DecodingError| VisionError(format!("cannot decode the GIF image: {e}"));
@@ -333,26 +346,24 @@ fn decode_gif(bytes: &[u8]) -> Result<Rgb, VisionError> {
         }
     }
     let pal = f.palette.clone().or(global).unwrap_or_default();
-    let mut px = vec![0u8; sw * sh * 3];
-    for (i, &c) in idx.iter().enumerate() {
-        let c = c as usize * 3;
-        if c + 3 <= pal.len() {
-            px[i * 3..i * 3 + 3].copy_from_slice(&pal[c..c + 3]);
-        }
-    }
-    Ok(Rgb { w: sw, h: sh, px })
+    Ok(GifFrame { w: sw, h: sh, idx, pal, transparent: f.transparent })
 }
 
-/// Decode PNG / JPEG / WebP / GIF bytes to RGB as PIL's `Image.open(...).convert("RGB")` does.
-pub fn decode_rgb(bytes: &[u8]) -> Result<Rgb, VisionError> {
-    use image::{DynamicImage as D, ImageFormat as F};
-    let fmt = image::guess_format(bytes)
-        .map_err(|_| VisionError("unrecognised image data (PNG, JPEG, WebP or GIF)".into()))?;
-    match fmt {
-        F::Gif => return decode_gif(bytes),
-        F::Png | F::Jpeg | F::WebP => {}
-        other => return verr(format!("unsupported image format {other:?} (PNG, JPEG, WebP or GIF)")),
+/// The first frame of a GIF through its palette, transparency dropped.
+fn decode_gif(bytes: &[u8]) -> Result<Rgb, VisionError> {
+    let g = gif_frame(bytes)?;
+    let mut px = vec![0u8; g.w * g.h * 3];
+    for (i, &c) in g.idx.iter().enumerate() {
+        let c = c as usize * 3;
+        if c + 3 <= g.pal.len() {
+            px[i * 3..i * 3 + 3].copy_from_slice(&g.pal[c..c + 3]);
+        }
     }
+    Ok(Rgb { w: g.w, h: g.h, px })
+}
+
+/// A PNG, JPEG or WebP image decoded by the `image` crate, under the pixel limit.
+fn decode_dynamic(bytes: &[u8], fmt: image::ImageFormat) -> Result<image::DynamicImage, VisionError> {
     let (w, h) = image::ImageReader::with_format(std::io::Cursor::new(bytes), fmt)
         .into_dimensions()
         .map_err(|e| VisionError(format!("cannot read the image: {e}")))?;
@@ -361,7 +372,28 @@ pub fn decode_rgb(bytes: &[u8]) -> Result<Rgb, VisionError> {
     let mut lim = image::Limits::default();
     lim.max_alloc = Some(w as u64 * h as u64 * 8 + (64 << 20));
     r.limits(lim);
-    let im = r.decode().map_err(|e| VisionError(format!("cannot decode the image: {e}")))?;
+    r.decode().map_err(|e| VisionError(format!("cannot decode the image: {e}")))
+}
+
+/// The format of image bytes: PNG, JPEG, WebP or GIF, else an error.
+fn image_format(bytes: &[u8]) -> Result<image::ImageFormat, VisionError> {
+    use image::ImageFormat as F;
+    let fmt = image::guess_format(bytes)
+        .map_err(|_| VisionError("unrecognised image data (PNG, JPEG, WebP or GIF)".into()))?;
+    match fmt {
+        F::Gif | F::Png | F::Jpeg | F::WebP => Ok(fmt),
+        other => verr(format!("unsupported image format {other:?} (PNG, JPEG, WebP or GIF)")),
+    }
+}
+
+/// Decode PNG / JPEG / WebP / GIF bytes to RGB as PIL's `Image.open(...).convert("RGB")` does.
+pub fn decode_rgb(bytes: &[u8]) -> Result<Rgb, VisionError> {
+    use image::DynamicImage as D;
+    let fmt = image_format(bytes)?;
+    if fmt == image::ImageFormat::Gif {
+        return decode_gif(bytes);
+    }
+    let im = decode_dynamic(bytes, fmt)?;
     let (w, h) = (im.width() as usize, im.height() as usize);
     let n = w * h;
     let mut px = Vec::with_capacity(n * 3);
@@ -397,14 +429,14 @@ pub fn decode_rgb(bytes: &[u8]) -> Result<Rgb, VisionError> {
 /// An image ready for the engine.
 #[derive(Clone, Debug)]
 pub struct Prepared {
-    /// the patch grid (14 px patches)
+    /// the patch grid (14 px patches; Inkling-2-Small: 20 px)
     pub vit_h: usize,
     pub vit_w: usize,
     /// the image's span in the prompt, in image tokens
     pub n_span: usize,
     /// sha256 over (vit_h u32 LE, vit_w u32 LE, rgb), first 16 hex digits
     pub key: String,
-    /// (vit_h * 14) x (vit_w * 14) x 3
+    /// (vit_h * patch) x (vit_w * patch) x 3
     pub rgb: Vec<u8>,
 }
 
@@ -413,6 +445,7 @@ pub struct Prepared {
 pub enum Model {
     Ds41,
     Glm5v,
+    Ink2,
 }
 
 impl Model {
@@ -421,17 +454,27 @@ impl Model {
         match self {
             Model::Ds41 => IMAGE_TOKEN_ID,
             Model::Glm5v => glm5v::IMAGE_TOKEN_ID,
+            Model::Ink2 => ink2::IMAGE_TOKEN_ID,
         }
     }
     pub fn prepare_rgb(self, im: &Rgb) -> Result<Prepared, VisionError> {
         match self {
             Model::Ds41 => prepare_rgb(im),
             Model::Glm5v => glm5v::prepare_rgb(im),
+            Model::Ink2 => ink2::prepare_rgb(im),
+        }
+    }
+    /// Image bytes -> RGB as the model's processor reads them: Inkling-2-Small composites transparency on its
+    /// checkerboard, the others drop it.
+    pub fn decode(self, bytes: &[u8]) -> Result<Rgb, VisionError> {
+        match self {
+            Model::Ink2 => ink2::decode_ink2_rgb(bytes),
+            Model::Ds41 | Model::Glm5v => decode_rgb(bytes),
         }
     }
     /// Base64 image data -> what the engine gets.
     pub fn prepare_b64(self, b64: &str) -> Result<Prepared, VisionError> {
-        self.prepare_rgb(&decode_rgb(&b64_decode(b64)?)?)
+        self.prepare_rgb(&self.decode(&b64_decode(b64)?)?)
     }
     /// The span alone, from the image's header (for /tokenize, which counts the prompt without building the pixels).
     pub fn n_span_b64(self, b64: &str) -> Result<usize, VisionError> {
@@ -439,6 +482,7 @@ impl Model {
         Ok(match self {
             Model::Ds41 => plan_image_grid(w, h).n_span(),
             Model::Glm5v => glm5v::plan(w, h).tokens(),
+            Model::Ink2 => ink2::plan(w, h)?.tokens,
         })
     }
 }
@@ -560,6 +604,128 @@ pub mod glm5v {
         }
         let key = content_key(p.vit_h(), p.vit_w(), &rgb);
         Ok(Prepared { vit_h: p.vit_h(), vit_w: p.vit_w(), n_span: p.tokens(), key, rgb })
+    }
+}
+
+/// Inkling-2-Small: the checkpoint's image processor up to the padded uint8 RGB (engine/runtime/ink2_vision_plan.h has
+/// the same geometry). The image is not resized. Transparency is composited on an 8 px grey checkerboard, then the
+/// image is padded with zeros on the right and the bottom to multiples of 40 px: one image token per 40 x 40 px, each a
+/// 2 x 2 block of 20 px patches.
+pub mod ink2 {
+    use super::{content_key, decode_dynamic, decode_rgb, gif_frame, image_format, verr, Prepared, Rgb, VisionError};
+
+    /// `image_token_id`: `<|unused_200054|>`, the template's placeholder and every token of an image span. The
+    /// `<|content_image|>` before it is a text token.
+    pub const IMAGE_TOKEN_ID: u32 = 200_054;
+    pub const PATCH: usize = 20;
+    pub const MERGE: usize = 2;
+    pub const FACTOR: usize = PATCH * MERGE;
+    pub const MIN_TOKENS: usize = 1;
+    /// The engine's budget: 3200 x 3200 px, or 3840 x 2160 (5184 tokens).
+    pub const MAX_TOKENS: usize = 6400;
+    /// The checkerboard under transparency: squares of this many pixels, the two greys.
+    pub const CHECKER: usize = 8;
+    pub const CHECKER_LIGHT: u8 = 204;
+    pub const CHECKER_DARK: u8 = 153;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Plan {
+        /// image tokens down and across
+        pub rows: usize,
+        pub cols: usize,
+        /// patches down and across
+        pub vit_h: usize,
+        pub vit_w: usize,
+        /// the padded canvas, pixels
+        pub pad_h: usize,
+        pub pad_w: usize,
+        pub tokens: usize,
+    }
+
+    /// The grid of a width x height image; an error outside the token budget.
+    pub fn plan(width: usize, height: usize) -> Result<Plan, VisionError> {
+        if width == 0 || height == 0 {
+            return verr("the image is empty");
+        }
+        let (rows, cols) = (height.div_ceil(FACTOR), width.div_ceil(FACTOR));
+        let tokens = rows * cols;
+        if !(MIN_TOKENS..=MAX_TOKENS).contains(&tokens) {
+            return verr(format!(
+                "the image is {width}x{height} pixels, {tokens} image tokens; at most {MAX_TOKENS} (one per {FACTOR}x{FACTOR} pixels)"
+            ));
+        }
+        let (vit_h, vit_w) = (rows * MERGE, cols * MERGE);
+        Ok(Plan { rows, cols, vit_h, vit_w, pad_h: vit_h * PATCH, pad_w: vit_w * PATCH, tokens })
+    }
+
+    /// The checkerboard's grey at (y, x).
+    pub fn checker(y: usize, x: usize) -> u8 {
+        if (y / CHECKER + x / CHECKER) % 2 == 0 {
+            CHECKER_LIGHT
+        } else {
+            CHECKER_DARK
+        }
+    }
+
+    /// One channel over the background at alpha a, rounded to nearest in integers.
+    pub fn over(c: u8, a: u8, bg: u8) -> u8 {
+        ((c as u32 * a as u32 + bg as u32 * (255 - a as u32) + 127) / 255) as u8
+    }
+
+    /// RGBA rows -> RGB over the checkerboard.
+    pub fn composite(rgba: &[u8], w: usize, h: usize) -> Vec<u8> {
+        let mut px = Vec::with_capacity(w * h * 3);
+        for (i, p) in rgba.chunks_exact(4).enumerate() {
+            let bg = checker(i / w, i % w);
+            px.extend_from_slice(&[over(p[0], p[3], bg), over(p[1], p[3], bg), over(p[2], p[3], bg)]);
+        }
+        debug_assert_eq!(px.len(), w * h * 3);
+        px
+    }
+
+    /// Decode PNG / JPEG / WebP / GIF bytes (first frame) to RGB. An image with an alpha channel or a transparent
+    /// palette index is brought to 8-bit RGBA (16-bit samples: the high byte) and composited on the checkerboard; an
+    /// opaque image decodes as `decode_rgb` does.
+    pub fn decode_ink2_rgb(bytes: &[u8]) -> Result<Rgb, VisionError> {
+        use image::DynamicImage as D;
+        let fmt = image_format(bytes)?;
+        if fmt == image::ImageFormat::Gif {
+            let g = gif_frame(bytes)?;
+            let Some(t) = g.transparent else { return decode_rgb(bytes) };
+            let mut rgba = vec![0u8; g.w * g.h * 4];
+            for (i, &c) in g.idx.iter().enumerate() {
+                let at = c as usize * 3;
+                if at + 3 <= g.pal.len() {
+                    rgba[i * 4..i * 4 + 3].copy_from_slice(&g.pal[at..at + 3]);
+                }
+                rgba[i * 4 + 3] = if c == t { 0 } else { 255 };
+            }
+            return Ok(Rgb { w: g.w, h: g.h, px: composite(&rgba, g.w, g.h) });
+        }
+        let im = decode_dynamic(bytes, fmt)?;
+        let (w, h) = (im.width() as usize, im.height() as usize);
+        let hi = |v: u16| (v >> 8) as u8;
+        let rgba: Vec<u8> = match im {
+            D::ImageRgba8(b) => b.into_raw(),
+            D::ImageLumaA8(b) => b.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
+            D::ImageRgba16(b) => b.iter().map(|&v| hi(v)).collect(),
+            D::ImageLumaA16(b) => b.chunks_exact(2).flat_map(|p| [hi(p[0]), hi(p[0]), hi(p[0]), hi(p[1])]).collect(),
+            D::ImageRgba32F(_) => im.to_rgba8().into_raw(),
+            _ => return decode_rgb(bytes),
+        };
+        Ok(Rgb { w, h, px: composite(&rgba, w, h) })
+    }
+
+    /// RGB -> the padded RGB for the engine: the image at the top left, zeros to the canvas on the right and the bottom.
+    pub fn prepare_rgb(im: &Rgb) -> Result<Prepared, VisionError> {
+        let p = plan(im.w, im.h)?;
+        let mut rgb = vec![0u8; p.pad_h * p.pad_w * 3];
+        for y in 0..im.h {
+            let o = y * p.pad_w * 3;
+            rgb[o..o + im.w * 3].copy_from_slice(&im.px[y * im.w * 3..(y + 1) * im.w * 3]);
+        }
+        let key = content_key(p.vit_h, p.vit_w, &rgb);
+        Ok(Prepared { vit_h: p.vit_h, vit_w: p.vit_w, n_span: p.tokens, key, rgb })
     }
 }
 
@@ -868,6 +1034,207 @@ mod tests {
             );
             assert_eq!(hex(&p.rgb), c["rgb_sha256"].as_str().unwrap(), "{name}: padded RGB differs from PIL's");
         }
+    }
+
+    fn png(w: u32, h: u32, color: image::ExtendedColorType, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        image::write_buffer_with_format(
+            &mut std::io::Cursor::new(&mut out),
+            data,
+            w,
+            h,
+            color,
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn ink2_plan_is_the_processor_grid() {
+        let p = ink2::plan(1, 1).unwrap();
+        assert_eq!((p.rows, p.cols, p.vit_h, p.vit_w, p.pad_h, p.pad_w, p.tokens), (1, 1, 2, 2, 40, 40, 1));
+        let p = ink2::plan(120, 80).unwrap(); // width 120, height 80
+        assert_eq!((p.rows, p.cols, p.vit_h, p.vit_w, p.pad_h, p.pad_w, p.tokens), (2, 3, 4, 6, 80, 120, 6));
+        let p = ink2::plan(41, 40).unwrap();
+        assert_eq!((p.rows, p.cols, p.pad_w, p.tokens), (1, 2, 80, 2));
+        assert_eq!(ink2::plan(3840, 2160).unwrap().tokens, 5184);
+        assert_eq!(ink2::plan(3200, 3200).unwrap().tokens, ink2::MAX_TOKENS);
+        assert_eq!(ink2::plan(40 * 6400, 40).unwrap().tokens, ink2::MAX_TOKENS);
+        assert!(ink2::plan(3201, 3200).is_err());
+        assert!(ink2::plan(3200, 3201).is_err());
+        assert!(ink2::plan(40 * 6400 + 1, 1).is_err());
+        assert!(ink2::plan(0, 5).is_err());
+        assert!(ink2::plan(5, 0).is_err());
+        // the padded bytes of the largest image fit the request's base64 budget
+        assert!(
+            (ink2::MAX_TOKENS * ink2::FACTOR * ink2::FACTOR * 3).div_ceil(3) * 4 <= MAX_IMAGE_B64_BYTES_PER_REQUEST
+        );
+        assert_eq!((ink2::PATCH, ink2::MERGE, ink2::FACTOR, ink2::MIN_TOKENS), (20, 2, 40, 1));
+        assert_eq!(Model::Ink2.token(), 200_054);
+    }
+
+    #[test]
+    fn ink2_checkerboard_compositing_is_exact() {
+        // the board: 8 px squares, 204 where the square row and column sum is even
+        for (y, x, want) in
+            [(0, 0, 204), (7, 7, 204), (0, 8, 153), (8, 0, 153), (8, 8, 204), (15, 16, 153), (16, 16, 204)]
+        {
+            assert_eq!(ink2::checker(y, x), want, "({y}, {x})");
+        }
+        // rounding to nearest in integers, every channel value at a few alphas against the formula in f64
+        for a in [0u8, 1, 127, 128, 254, 255] {
+            for c in 0..=255u8 {
+                for bg in [204u8, 153] {
+                    let exact = (c as f64 * a as f64 + bg as f64 * (255.0 - a as f64)) / 255.0;
+                    let got = ink2::over(c, a, bg);
+                    assert!((got as f64 - exact).abs() <= 0.5 + 1e-9, "c {c} a {a} bg {bg}: {got} vs {exact}");
+                }
+            }
+        }
+        assert_eq!((ink2::over(10, 255, 204), ink2::over(10, 0, 204), ink2::over(10, 0, 153)), (10, 204, 153));
+        assert_eq!(ink2::over(255, 128, 153), ((255 * 128 + 153 * 127 + 127) / 255) as u8);
+
+        // an RGBA PNG, 20 x 12: clear on the left half, half red in the middle, opaque blue on the right
+        let (w, h) = (20usize, 12usize);
+        let mut rgba = Vec::new();
+        for _y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(match x {
+                    0..=9 => &[90, 60, 30, 0],
+                    10..=14 => &[255, 0, 0, 128],
+                    _ => &[0, 0, 255, 255],
+                });
+            }
+        }
+        let im = ink2::decode_ink2_rgb(&png(w as u32, h as u32, image::ExtendedColorType::Rgba8, &rgba)).unwrap();
+        assert_eq!((im.w, im.h), (w, h));
+        for y in 0..h {
+            for x in 0..w {
+                let bg = if (y / 8 + x / 8) % 2 == 0 { 204u32 } else { 153 };
+                let want: [u8; 3] = match x {
+                    0..=9 => [bg as u8; 3],
+                    10..=14 => [
+                        ((255 * 128 + bg * 127 + 127) / 255) as u8,
+                        ((bg * 127 + 127) / 255) as u8,
+                        ((bg * 127 + 127) / 255) as u8,
+                    ],
+                    _ => [0, 0, 255],
+                };
+                assert_eq!(im.px[(y * w + x) * 3..(y * w + x) * 3 + 3], want, "({y}, {x})");
+            }
+        }
+        // the other models drop the alpha instead
+        let dropped = decode_rgb(&png(w as u32, h as u32, image::ExtendedColorType::Rgba8, &rgba)).unwrap();
+        assert_eq!(dropped.px[..3], [90, 60, 30]);
+        assert_eq!(
+            Model::Glm5v.decode(&png(w as u32, h as u32, image::ExtendedColorType::Rgba8, &rgba)).unwrap().px,
+            dropped.px
+        );
+
+        // grey + alpha, and 16-bit RGBA (the high byte), composite the same way
+        let la: Vec<u8> = (0..w * h).flat_map(|i| [200u8, if i % 2 == 0 { 0 } else { 255 }]).collect();
+        let im = ink2::decode_ink2_rgb(&png(w as u32, h as u32, image::ExtendedColorType::La8, &la)).unwrap();
+        assert_eq!(im.px[..6], [204, 204, 204, 200, 200, 200]);
+        assert_eq!(im.px[(9 * w) * 3..(9 * w) * 3 + 3], [153, 153, 153]);
+        let mut wide = Vec::new();
+        for _ in 0..w * h {
+            for v in [0x4000u16, 0x80ff, 0xc000, 0x8000] {
+                wide.extend_from_slice(&v.to_ne_bytes()); // the encoder takes native-endian samples
+            }
+        }
+        let im = ink2::decode_ink2_rgb(&png(w as u32, h as u32, image::ExtendedColorType::Rgba16, &wide)).unwrap();
+        assert_eq!(im.px[..3], [ink2::over(0x40, 0x80, 204), ink2::over(0x80, 0x80, 204), ink2::over(0xc0, 0x80, 204)]);
+    }
+
+    #[test]
+    fn ink2_opaque_images_decode_as_rgb() {
+        let (w, h) = (9usize, 5usize);
+        let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i * 7 % 251) as u8).collect();
+        let bytes = png(w as u32, h as u32, image::ExtendedColorType::Rgb8, &rgb);
+        let a = ink2::decode_ink2_rgb(&bytes).unwrap();
+        assert_eq!((a.w, a.h, &a.px), (w, h, &rgb));
+        assert_eq!(a.px, decode_rgb(&bytes).unwrap().px);
+        let grey: Vec<u8> = (0..w * h).map(|i| (i * 5) as u8).collect();
+        let bytes = png(w as u32, h as u32, image::ExtendedColorType::L8, &grey);
+        let a = ink2::decode_ink2_rgb(&bytes).unwrap();
+        assert_eq!(a.px, decode_rgb(&bytes).unwrap().px);
+        assert_eq!(a.px[3..6], [5, 5, 5]);
+        // an RGBA PNG whose alpha is 255 everywhere is its RGB
+        let rgba: Vec<u8> = rgb.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect();
+        let a = ink2::decode_ink2_rgb(&png(w as u32, h as u32, image::ExtendedColorType::Rgba8, &rgba)).unwrap();
+        assert_eq!(a.px, rgb);
+        assert!(ink2::decode_ink2_rgb(b"not an image").is_err());
+    }
+
+    #[test]
+    fn ink2_gif_transparency_shows_the_checkerboard() {
+        // 2 colours, index 1 transparent, a 12 x 10 screen with a 4 x 4 frame of index 0 at (2, 1)
+        let (sw, sh) = (12u16, 10u16);
+        let mut bytes = Vec::new();
+        {
+            let mut e = gif::Encoder::new(&mut bytes, sw, sh, &[10, 20, 30, 250, 250, 250]).unwrap();
+            let mut f = gif::Frame::default();
+            (f.left, f.top, f.width, f.height) = (2, 1, 4, 4);
+            f.buffer = std::borrow::Cow::Owned(vec![0u8; 16]);
+            f.transparent = Some(1);
+            e.write_frame(&f).unwrap();
+        }
+        let im = ink2::decode_ink2_rgb(&bytes).unwrap();
+        assert_eq!((im.w, im.h), (12, 10));
+        for y in 0..10usize {
+            for x in 0..12usize {
+                let inside = (2..6).contains(&x) && (1..5).contains(&y);
+                let want = if inside { [10, 20, 30] } else { [ink2::checker(y, x); 3] };
+                assert_eq!(im.px[(y * 12 + x) * 3..(y * 12 + x) * 3 + 3], want, "({y}, {x})");
+            }
+        }
+        // the other models show the transparent index's palette colour
+        assert_eq!(decode_rgb(&bytes).unwrap().px[..3], [250, 250, 250]);
+    }
+
+    #[test]
+    fn ink2_pads_right_and_bottom_with_zeros() {
+        let (w, h) = (50usize, 41usize);
+        let px: Vec<u8> = (0..w * h * 3).map(|i| (i % 200 + 1) as u8).collect();
+        let p = Model::Ink2.prepare_rgb(&Rgb { w, h, px: px.clone() }).unwrap();
+        assert_eq!((p.vit_h, p.vit_w, p.n_span), (4, 4, 4));
+        assert_eq!(p.rgb.len(), 80 * 80 * 3);
+        for y in 0..80 {
+            for x in 0..80 {
+                let got = &p.rgb[(y * 80 + x) * 3..(y * 80 + x) * 3 + 3];
+                if y < h && x < w {
+                    assert_eq!(got, &px[(y * w + x) * 3..(y * w + x) * 3 + 3], "({y}, {x})");
+                } else {
+                    assert_eq!(got, [0, 0, 0], "({y}, {x})");
+                }
+            }
+        }
+        assert_eq!(p.key, content_key(4, 4, &p.rgb));
+        // an aligned image is passed through
+        let px: Vec<u8> = (0..40 * 80 * 3).map(|i| (i % 251) as u8).collect();
+        let p = ink2::prepare_rgb(&Rgb { w: 80, h: 40, px: px.clone() }).unwrap();
+        assert_eq!((p.vit_h, p.vit_w, p.n_span, &p.rgb), (2, 4, 2, &px));
+        // through base64: the span from the header alone is the prepared span
+        let bytes = png(50, 41, image::ExtendedColorType::Rgb8, &vec![7u8; 50 * 41 * 3]);
+        let b64 = b64_encode(&bytes);
+        assert_eq!(Model::Ink2.n_span_b64(&b64).unwrap(), 4);
+        let p = Model::Ink2.prepare_b64(&b64).unwrap();
+        assert_eq!((p.vit_h, p.vit_w, p.n_span, p.rgb[0], p.rgb[50 * 3]), (4, 4, 4, 7, 0));
+        assert!(Model::Ink2.prepare_b64("aGk=").is_err());
+    }
+
+    #[test]
+    fn ink2_expand_keeps_the_content_marker() {
+        // <|content_image|> (200005) is text; only <|unused_200054|> grows to the span
+        let t = ink2::IMAGE_TOKEN_ID;
+        let (ids, pos) = expand(&[7, 200_005, t, 9, 200_005, t, 8], &[6, 1], t).unwrap();
+        assert_eq!(ids, vec![7, 200_005, t, t, t, t, t, t, 9, 200_005, t, 8]);
+        assert_eq!(pos, vec![2, 10]);
+        assert_eq!(ids.iter().filter(|&&i| i == 200_005).count(), 2);
+        assert_eq!(expanded_index(&[7, 200_005, t, 9, 200_005, t, 8], 4, &[6, 1], t), 9);
+        assert!(expand(&[7, 200_005, 9], &[6], t).is_err());
+        assert!(expand(&[1, t], &[3], glm5v::IMAGE_TOKEN_ID).is_err());
     }
 
     #[test]
