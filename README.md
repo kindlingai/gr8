@@ -102,6 +102,7 @@ the engine only.
 ## Building on gr8
 
 Current release: **[`v1.0.1`](https://github.com/kindlingai/gr8/releases/tag/v1.0.1)** ·
+[Changelog](CHANGELOG.md) · [Version specs](releases/) ·
 [All releases](https://github.com/kindlingai/gr8/releases) · [Release and pinning rules](RELEASING.md)
 
 Recipes, tools, and deployments built on gr8 should pin an immutable `v*` release image by tag and `sha256` digest (or

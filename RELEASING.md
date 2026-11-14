@@ -103,9 +103,15 @@ A change counts as **breaking** (requiring `MAJOR`, plus migration steps) if it 
 upgrade is not a breaking change, provided no manual cleanup is required, though release notes must call out the
 one-time rebuild time and disk use.)*
 
-### Required GitHub Release sections
+### Required GitHub Release sections and in-repo release records
 
-Every tagged release has a matching GitHub Release with four short sections:
+Every tagged `v*` release publishes three matching records:
+
+- a **GitHub Release** on `<tag>`,
+- a `## [<tag>] — YYYY-MM-DD` section in [`CHANGELOG.md`](CHANGELOG.md), and
+- a machine-readable version spec in [`releases/<tag>.json`](releases/README.md) (`schema_version: 1`).
+
+Both the GitHub Release and the [`CHANGELOG.md`](CHANGELOG.md) entry carry four required sections:
 
 1. **Highlights and measured numbers** — what improved or was added, with model, TP width, and boot conditions
    ([AGENTS.md](AGENTS.md#the-gate)).
@@ -115,6 +121,12 @@ Every tagged release has a matching GitHub Release with four short sections:
    any cache key that triggers a one-time rebuild on upgrade.
 4. **Toolchain / Dockerfile sync** — any change to `CUDA_VERSION`, `rust-toolchain.toml` (`RUST_VERSION`), or runtime
    apt packages in `Dockerfile` that downstream recipe Dockerfiles mirror.
+
+[`releases/<tag>.json`](releases/README.md) records the same release facts in structured JSON (`tag`, `version`, `date`,
+40-character `commit`, GHCR `container.image` and `sha256` `digest`, `toolchain`, shipped `binaries`, `api` ports and
+endpoints, served `models` with supported `TP` widths and default settings, `breaking_changes`,
+`default_or_cache_changes`, `prs`, and headline `benchmarks`). `python3 scripts/make_zip.py --check` validates every
+`releases/v*.json` file and checks 1-to-1 parity with [`CHANGELOG.md`](CHANGELOG.md) on every pull request.
 
 ### Cutting a release
 
@@ -130,9 +142,16 @@ Every tagged release has a matching GitHub Release with four short sections:
    git tag -a v1.1.0 -m "gr8 v1.1.0"
    git push origin v1.1.0
    ```
-4. Wait for the tag's `ci` workflow run to publish `ghcr.io/kindlingai/gr8:<tag>`, publish the GitHub Release on `<tag>`
-   with the four sections above and the image's `sha256` digest, and update the current release and pin example in
-   [README.md](README.md#building-on-gr8) on `main`.
+4. Wait for the tag's `ci` workflow run to publish `ghcr.io/kindlingai/gr8:<tag>` and verify its `sha256` manifest
+   digest. Publish the GitHub Release on `<tag>` with the four required sections and the image digest, then open the
+   release-record pull request on `main` updating all three in-repo files together (since the tag's 40-character commit
+   SHA and GHCR `sha256` digest are immutable only once `<tag>`'s build finishes):
+   - [`CHANGELOG.md`](CHANGELOG.md) — add `## [<tag>] — YYYY-MM-DD` with the tag commit, `ghcr.io/kindlingai/gr8:<tag>@sha256:<digest>`, link to `releases/<tag>.json`, and the four required sections;
+   - [`releases/<tag>.json`](releases/README.md) — add the version spec file for `<tag>` with verified `commit`, `container.digest`, `toolchain`, `binaries`, `models`, compatibility/default deltas, `prs`, and `benchmarks`;
+   - [`README.md`](README.md#building-on-gr8) — update the current release link and `compose.yaml` / `Dockerfile` pin example to `<tag>@sha256:<digest>`.
+   Run `python3 -m unittest bench/tests/test_releases.py` on the working tree, commit the release-record branch, and run
+   `python3 scripts/make_zip.py --check` (`make_zip.py` reads `git archive HEAD`, so run it **after** committing) before
+   opening the pull request.
 5. Check the blessed standalone recipes against `<tag>`: open pin-bump pull requests for the recipes whose correctness
    and speed hold, and leave any recipe that measures slower on its prior pin (reflected in `README.md`'s recipe
    freshness column) until re-tuned.
@@ -197,7 +216,8 @@ candidates to update. Recipes hold configuration and packaging only, never engin
   notes so `gr8`'s `README.md` freshness column and the recipe gate know the exact engine build each recipe runs and was
   measured on.
 - **Updating a recipe to a newer `gr8` build:** Bump the `gr8` pin in a dedicated pull request (`Bump gr8 to vX.Y.Z` or
-  `sha-<short>`), review any **`Breaking changes`**, **Default or cache-key changes**, and **Toolchain / Dockerfile
-  sync** notes across the intervening commits, smoke- and bench-test on target hardware, and merge the bump only when
-  correctness and speed hold — otherwise leave the recipe on its faster pin until tuned, and update `kindling.json` /
-  README speed cards only with numbers measured on the pinned build.
+  `sha-<short>`), review [`CHANGELOG.md`](CHANGELOG.md) and [`releases/<tag>.json`](releases/README.md) (specifically
+  **`Breaking changes`**, **Default or cache-key changes**, and **Toolchain / Dockerfile sync**) across the intervening
+  commits, smoke- and bench-test on target hardware, and merge the bump only when correctness and speed hold — otherwise
+  leave the recipe on its faster pin until tuned, and update `kindling.json` / README speed cards only with numbers
+  measured on the pinned build.
