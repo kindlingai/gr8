@@ -18,6 +18,7 @@
 #include "../kernels/ink2_moe.cuh"
 #include "../attn/ink2_attn.cuh"
 #include "../kernels/ink2_mtp.cuh"
+#include "../kernels/ink2_head.cuh"
 #include "../model_geom_ink2.h"
 #include "../loader/g6pack.h"
 #include "../loader-rs/g6load.h"
@@ -551,6 +552,53 @@ struct MtpWork
     size_t part_floats = 0;
 };
 
+// The prefill GEMMs through cuBLAS (Options::cublas_prefill): ink2::gemm's hook while a BlasScope is alive.
+inline cublasHandle_t& blas_cur()
+{
+    static thread_local cublasHandle_t hd = nullptr;
+    return hd;
+}
+inline bool blas_gemm(const uint16_t* x, const uint16_t* w, int M, int K, int N, void* y, int mode, cudaStream_t st)
+{
+    static thread_local bool warned = false;
+    cublasHandle_t hd = blas_cur();
+    if (!hd || M < 1 || N < 16 || (N & 7) != 0 || K < 16 || (K & 15) != 0) return false;
+    if (((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(w) | reinterpret_cast<uintptr_t>(y)) & 15u) != 0) return false;
+    const float one = 1.f, zero = 0.f;
+    cublasStatus_t rc = cublasSetStream(hd, st);
+    if (rc == CUBLAS_STATUS_SUCCESS)
+        rc = cublasGemmEx(hd, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &one, w, CUDA_R_16BF, K, x, CUDA_R_16BF, K, &zero, y, mode == ink2::GEMM_F32 ? CUDA_R_32F : CUDA_R_16BF, N,
+                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (rc == CUBLAS_STATUS_SUCCESS) return true;
+    if (!warned) fprintf(stderr, "# ink2: cuBLAS GEMM failed (%d); the engine's own GEMM runs instead\n", static_cast<int>(rc));
+    warned = true;
+    return false;
+}
+struct BlasScope
+{
+    explicit BlasScope(cublasHandle_t hd)
+    {
+        if (!hd) return;
+        blas_cur() = hd;
+        ink2::gemm_hook() = blas_gemm;
+    }
+    ~BlasScope()
+    {
+        blas_cur() = nullptr;
+        ink2::gemm_hook() = nullptr;
+    }
+    BlasScope(const BlasScope&) = delete;
+    BlasScope& operator=(const BlasScope&) = delete;
+};
+// A prefill chunk: the rows are one run of one slot at consecutive positions.
+inline bool one_run(const ink2::RowsHost& rh)
+{
+    const int M = rh.rows();
+    for (int m = 0; m < M; ++m)
+        if (rh.slot[static_cast<size_t>(m)] != rh.slot[0] || rh.run0[static_cast<size_t>(m)] != 0 || rh.pos[static_cast<size_t>(m)] != rh.pos[0] + m) return false;
+    return M > 0;
+}
+
 struct Options
 {
     int nr = 1;          // ranks of the model
@@ -564,6 +612,8 @@ struct Options
     std::string layers = "all";
     bool whole_image = false;
     bool vision = false; // run the vision tower when the checkpoint has one (image input)
+    // the speed paths: -1 = what the knob says (GR8_INK2_*), 0 = off, 1 = on
+    int fast_allreduce = -1, gpu_head_pack = -1, cublas_prefill = -1, tc_prefill_attn = -1;
 };
 
 class Engine
@@ -576,6 +626,13 @@ public:
     // parts: [nr][bytes] with this rank's share at index rank0; on return every rank's share is in place.
     std::function<void(int coll, float* dev_parts, size_t bytes)> gather;
     std::function<void(int coll, uint8_t* host_parts, size_t bytes)> gather_head;
+    // Options::fast_allreduce (ink2_m4.cu sets both or neither): the collectives of one forward, or of one mtp_draft,
+    // are one fabric step. step_begin gets the bytes of its collectives in order, before the first gather; step_end
+    // runs after the last one. gather then starts the exchange on the stream and does not wait for it.
+    std::function<void(const std::vector<uint32_t>& bytes)> step_begin;
+    std::function<void()> step_end;
+    bool fast_allreduce() const { return use_far; }
+    int max_collectives() const { return std::max(collectives(), o.mtp > 0 ? 2 * static_cast<int>(ML.size()) + o.mtp : 0); }
 
     int collectives() const { return 2 * static_cast<int>(L.size()) + 1; }
     size_t attn_bytes(int M) const { return static_cast<size_t>(M) * c.H * 4; }
@@ -608,6 +665,10 @@ public:
         c.rel_win = static_cast<int>(a.dim(lname(l0, "rel_logits_proj"), 1));
         vr = static_cast<int>(a.dim("G.lm_head", 0));
         max_pps = (o.cap + ink2::KV_PAGE_TOKENS - 1) / ink2::KV_PAGE_TOKENS;
+        use_far = o.fast_allreduce < 0 ? knob::ink2_fast_allreduce() : o.fast_allreduce != 0;
+        use_ghp = (o.gpu_head_pack < 0 ? knob::ink2_gpu_head_pack() : o.gpu_head_pack != 0) && o.nc <= ink2::INK2_HEAD_MAX_NC;
+        use_blas = o.cublas_prefill < 0 ? knob::ink2_cublas_prefill() : o.cublas_prefill != 0;
+        use_tc = o.tc_prefill_attn < 0 ? knob::ink2_tc_prefill_attn() : o.tc_prefill_attn != 0;
         const size_t mh = static_cast<size_t>(o.max_rows) * c.H;
         embed = a.get<uint16_t>("G.embed");
         embed_norm = a.get<uint16_t>("G.embed_norm");
@@ -635,6 +696,8 @@ public:
         parts = dalloc<float>(static_cast<size_t>(o.nr) * part_stride);
         host_logits.resize(static_cast<size_t>(o.max_rows) * vr);
         head_parts.resize(static_cast<size_t>(o.nr) * head_bytes(o.max_rows));
+        if (use_blas && cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) die("cublasCreate failed");
+        if (use_ghp) head_dev = dalloc<uint8_t>(head_bytes(std::max(o.max_rows, o.slots)));
         if (o.mtp > 0) init_mtp();
         if (o.vision && a.find("V.proj_out.weight")) init_vision();
         INK2RT_CK(cudaDeviceSynchronize());
@@ -722,6 +785,20 @@ public:
         INK2RT_CK(cudaMemcpy(d_run0, rh.run0.data(), sizeof(int) * M, cudaMemcpyHostToDevice));
         INK2RT_CK(cudaMemcpy(toks, tk, sizeof(int) * M, cudaMemcpyHostToDevice));
         const ink2::Rows rw{d_slot, d_pos, d_run0};
+        if (T > 1 && step_begin)
+        {
+            std::vector<uint32_t> sz;
+            for (size_t j = 0; j < L.size(); ++j)
+            {
+                sz.push_back(static_cast<uint32_t>(n * 4));
+                sz.push_back(static_cast<uint32_t>(n * c.TK * 4));
+            }
+            if (samples) sz.push_back(static_cast<uint32_t>((head_bytes(M) + 7) / 8 * 8));
+            step_begin(sz);
+        }
+        const bool chunk = one_run(rh);   // a prefill chunk: the speed paths that depend on M are for these rows only
+        const bool tc = use_tc && chunk && M >= 16;
+        const BlasScope blas_scope(use_blas && chunk && M >= 32 ? blas : nullptr);
         ink2::embed_norm(toks, embed, embed_norm, vis_rows, c.image_token, h, M, c.H, 0);
         for (size_t j = 0; j < L.size(); ++j)
         {
@@ -752,7 +829,7 @@ public:
             {
                 RankPart& x = s.rk[i];
                 ink2::attn_forward(x.g, x.aw, x.as, x.wk, rw, rh.max_pos, qi, s.glob ? ki : qi, s.glob ? vi : qi, M, T == 1 ? s.att : nullptr,
-                                   parts + static_cast<size_t>(o.rank0 + i) * n, 0);
+                                   parts + static_cast<size_t>(o.rank0 + i) * n, 0, tc);
             }
             if (T > 1)
             {
@@ -779,6 +856,7 @@ public:
         }
         if (!samples && ntaps == 0)
         {
+            if (T > 1 && step_end) step_end();
             out.clear();
             return;
         }
@@ -797,6 +875,7 @@ public:
             if (c.mtp_targets[static_cast<size_t>(t)] == c.n_layers) ink2::copy_bf16(hf, step_taps + static_cast<size_t>(t) * o.max_rows * c.H, n, 0);
         if (!samples)
         {
+            if (T > 1 && step_end) step_end();
             out.clear();
             return;
         }
@@ -806,10 +885,17 @@ public:
         {
             const int r = o.rank0 + i;
             ink2::lm_head(hf, lm[i], M, c.H, vr, r * vr, c.valid, logits[i], 0);
+            if (use_ghp)
+            {
+                ink2::head_pack_dev(logits[i], M, vr, r * vr, o.nc, head_dev, rb, 0);
+                INK2RT_CK(cudaMemcpy(&head_parts[static_cast<size_t>(r) * hb], head_dev, hb, cudaMemcpyDeviceToHost));
+                continue;
+            }
             INK2RT_CK(cudaMemcpy(host_logits.data(), logits[i], sizeof(float) * static_cast<size_t>(M) * vr, cudaMemcpyDeviceToHost));
             for (int m = 0; m < M; ++m) head_pack(&host_logits[static_cast<size_t>(m) * vr], vr, r * vr, o.nc, &head_parts[static_cast<size_t>(r) * hb + static_cast<size_t>(m) * rb]);
         }
         if (T > 1 && gather_head) gather_head(collectives() - 1, head_parts.data(), hb);
+        if (T > 1 && step_end) step_end();
         out.resize(static_cast<size_t>(M));
         std::vector<uint8_t> row(static_cast<size_t>(T) * rb);
         for (int m = 0; m < M; ++m)
@@ -863,6 +949,12 @@ public:
         INK2RT_CK(cudaMemcpy(m_prev, golden.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
         INK2RT_CK(cudaMemcpy(m_pos, pos.data(), sizeof(int) * MB, cudaMemcpyHostToDevice));
         const size_t n = static_cast<size_t>(MB) * H;
+        if (T > 1 && step_begin)
+        {
+            std::vector<uint32_t> sz(2 * ML.size(), static_cast<uint32_t>(n * 4));
+            sz.insert(sz.end(), static_cast<size_t>(K), static_cast<uint32_t>((head_bytes(S) + 7) / 8 * 8));
+            step_begin(sz);
+        }
         int coll = collectives();
         ink2::k_ink2_mtp_block_init<<<MB, ink2::NRT, 0, 0>>>(m_gold, embed, embed_norm, mask_embed, m_res, B, H);
         for (size_t l = 0; l < ML.size(); ++l)
@@ -953,6 +1045,12 @@ public:
                 MtpWork& w = mwk[static_cast<size_t>(i)];
                 ink2::gemm_f32(m_latent, w.fold_w, S, R, vr, w.lg, 0);
                 ink2::k_ink2_mtp_logits<<<ink2::cells_grid(static_cast<size_t>(S) * vr), 256, 0, 0>>>(w.base, w.fold_b, w.lg, S, K, step, vr, r * vr, c.valid);
+                if (use_ghp)
+                {
+                    ink2::head_pack_dev(w.lg, S, vr, r * vr, o.nc, head_dev, rb, 0);
+                    INK2RT_CK(cudaMemcpy(&mtp_head_parts[static_cast<size_t>(r) * hb], head_dev, hb, cudaMemcpyDeviceToHost));
+                    continue;
+                }
                 INK2RT_CK(cudaMemcpy(mtp_host_logits.data(), w.lg, sizeof(float) * static_cast<size_t>(S) * vr, cudaMemcpyDeviceToHost));
                 for (int s = 0; s < S; ++s)
                     head_pack(&mtp_host_logits[static_cast<size_t>(s) * vr], vr, r * vr, o.nc, &mtp_head_parts[static_cast<size_t>(r) * hb + static_cast<size_t>(s) * rb]);
@@ -968,6 +1066,7 @@ public:
             }
             if (step + 1 < K) INK2RT_CK(cudaMemcpy(m_prev, prev.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
         }
+        if (T > 1 && step_end) step_end();
     }
 
     // The state a KvStateDesc names (s2/kv_state_desc.h ink2_kv_state): bytes of one page row and of a slot's tail.
@@ -979,6 +1078,8 @@ public:
         return m;
     }
     int max_pages_per_slot() const { return max_pps; }
+    bool gpu_head_pack_active() const { return use_ghp; }
+    bool cublas_prefill_active() const { return use_blas && blas != nullptr; }
 
     struct KvPtrs
     {
@@ -1445,6 +1546,9 @@ private:
     std::vector<uint16_t*> states;
     std::vector<float> host_logits;
     std::vector<uint8_t> head_parts;
+    cublasHandle_t blas = nullptr;   // use_blas
+    uint8_t* head_dev = nullptr;   // [rows][head_row_bytes]: the device's packed head rows (use_ghp)
+    bool use_far = false, use_ghp = false, use_blas = false, use_tc = false;
     const uint16_t *embed = nullptr, *embed_norm = nullptr, *final_norm = nullptr;
     const float* output_query = nullptr;
     int *d_slot = nullptr, *d_pos = nullptr, *d_run0 = nullptr, *toks = nullptr;

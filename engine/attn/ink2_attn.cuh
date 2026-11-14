@@ -570,8 +570,12 @@ inline void attn_check(const AttnGeom& g)
 
 // rw: device arrays of the M rows; max_pos = the largest position among them. out [M][H] BF16, or out == nullptr and
 // out_f32 [M][H] = the rank's partial of the wo sum.
+#include "ink2_attn_tc.cuh"   // in this namespace: the tensor-core kernel of a prefill chunk
+
+// tc: the rows are one run of one slot at consecutive positions (a prefill chunk), and the caller wants the
+// tensor-core kernel for them (ink2_attn_tc.cuh). Geometries it does not cover take the stock kernels.
 inline void attn_forward(const AttnGeom& g, const AttnWeights& w, const AttnState& s, AttnWork& wk, const Rows& rw, int max_pos, const uint16_t* qi,
-                         const uint16_t* ki, const uint16_t* vi, int M, uint16_t* out, float* out_f32, cudaStream_t st)
+                         const uint16_t* ki, const uint16_t* vi, int M, uint16_t* out, float* out_f32, cudaStream_t st, bool tc = false)
 {
     attn_check(g);
     if (M < 1 || M > wk.M) throw std::runtime_error("ink2::attn_forward: rows");
@@ -614,7 +618,17 @@ inline void attn_forward(const AttnGeom& g, const AttnWeights& w, const AttnStat
     }
     AttnCoreArgs a{wk.q_raw, wk.r_raw, wk.gate, wk.sink, w.q_clip, w.rel_clip, w.rel_proj, wk.kv_new, s.ring, s.pages, s.page_table, rw, wk.og, wk.part,
                    0, 0, g.nh_q, g.q0, g.gqa, g.kv0, nk, hd, g.rel_dim, g.rel_win, g.window, g.log_scale_base, g.global ? 1 : 0, s.max_pps, smax};
-    for (int m0 = 0; m0 < M; m0 += mb)
+    const bool use_tc = tc && hd == TC_HD && g.rel_dim == TC_RD && g.gqa <= TC_MAX_GQ;
+    if (use_tc)
+    {
+        static const cudaError_t attr = cudaFuncSetAttribute(k_ink2_attn_prefill_tc, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(attn_tc_smem(TC_MAX_GQ)));
+        if (attr != cudaSuccess) throw std::runtime_error("ink2::attn_forward: shared memory of the tensor-core kernel");
+        k_ink2_attn_qr_prep<<<M * g.nh_q, ACT, 0, st>>>(wk.q_raw, wk.r_raw, w.q_clip, w.rel_clip, rw, g.nh_q, hd, g.rel_dim, g.log_scale_base, g.global ? 1 : 0);
+        a.m0 = 0;
+        a.rows = M;
+        k_ink2_attn_prefill_tc<<<dim3((M + 15) / 16, g.nh_kv), g.gqa * 32, attn_tc_smem(g.gqa), st>>>(a, g.gqa);
+    }
+    for (int m0 = 0; m0 < M && !use_tc; m0 += mb)
     {
         const int rows = M - m0 < mb ? M - m0 : mb;
         a.m0 = m0;
