@@ -10,6 +10,9 @@
 //   * the MTP drafter (3 layers, the middle one with the whole context, a window of 5, 4 taps, rank 16) at TP 1, 4
 //     and 6: a draft does not depend on how the context was forwarded, the window and the two-way block attention
 //     reach as far as they should, and speculative decode with 1, 3 and 7 drafts gives the bits of plain decode
+//   * the vision tower (2 layers of 64 wide, 4 heads of 16, 4-pixel patches, a 4 x 4 position table): the position
+//     table read at its own size and at others, the rotary position by column and by row, the patch order of the
+//     2 x 2 merge, the padding value, and an image inside a token sequence in one pass and in chunks
 //   g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off engine/tests/test_ink2_cpu_ref.cpp -o /tmp/t && /tmp/t
 #include "../ref/ink2/ink2_cpu_ref.h"
 #include <cstdio>
@@ -638,6 +641,309 @@ void test_mtp_decode(Model& m, const Seq& s, int tp)
     }
     printf("  mtp decode, %d rank%s: %d rounds, %d drafts kept (%d of them the drafter's own)\n", tp, tp == 1 ? "" : "s", rounds, kept + natural, natural);
 }
+
+// ---- the vision tower
+constexpr int VD = 64, VL = 2, VH = 4, VHD = VD / VH, VI = 128, VP = 4, VM = 2, VG = 4, VPJ = 96;
+
+Config vis_config()
+{
+    Config c = config(1);
+    c.has_vision = true;
+    c.vis_hidden = VD;
+    c.vis_layers = VL;
+    c.vis_heads = VH;
+    c.vis_mlp = VI;
+    c.vis_patch = VP;
+    c.vis_merge = VM;
+    c.vis_grid = VG;
+    c.vis_proj = VPJ;
+    return c;
+}
+
+void vis_weights(Weights& w)
+{
+    Rng r{0x76697331};
+    VisionWeights& x = w.vis;
+    const size_t vd = VD, pk = VP * VP * 3, md = VM * VM * VD;
+    const float iv = 1.0f / std::sqrt(static_cast<float>(VD));
+    x.patch_embedding = r.bf(vd * pk, 2.0f / std::sqrt(static_cast<float>(pk)));
+    x.class_embedding = r.bf(vd, 0.5f);
+    x.cls_position_embedding = r.bf(vd, 0.5f);
+    x.position_embedding = r.bf(static_cast<size_t>(VG) * VG * vd, 0.5f);
+    x.ln_pre_w = r.bf(vd, 0.2f, 1.0f);
+    x.ln_pre_b = r.bf(vd, 0.1f);
+    x.layers.resize(VL);
+    for (VisionLayer& l : x.layers)
+    {
+        l.ln1_w = r.bf(vd, 0.2f, 1.0f);
+        l.ln1_b = r.bf(vd, 0.1f);
+        l.ln2_w = r.bf(vd, 0.2f, 1.0f);
+        l.ln2_b = r.bf(vd, 0.1f);
+        l.q_w = r.bf(vd * vd, 4.0f * iv);
+        l.q_b = r.bf(vd, 0.1f);
+        l.k_w = r.bf(vd * vd, 4.0f * iv);
+        l.k_b = r.bf(vd, 0.1f);
+        l.v_w = r.bf(vd * vd, 2.0f * iv);
+        l.v_b = r.bf(vd, 0.1f);
+        l.o_w = r.bf(vd * vd, 2.0f * iv);
+        l.o_b = r.bf(vd, 0.1f);
+        l.ls1 = r.bf(vd, 0.2f, 0.5f);
+        l.ls2 = r.bf(vd, 0.2f, 0.5f);
+        l.fc_w = r.bf(static_cast<size_t>(VI) * vd, 2.0f * iv);
+        l.fc_b = r.bf(VI, 0.1f);
+        l.proj_w = r.bf(vd * VI, 2.0f / std::sqrt(static_cast<float>(VI)));
+        l.proj_b = r.bf(vd, 0.1f);
+    }
+    x.proj_in = r.bf(static_cast<size_t>(VPJ) * md, 2.0f / std::sqrt(static_cast<float>(md)));
+    x.proj_out = r.bf(static_cast<size_t>(H) * VPJ, 2.0f / std::sqrt(static_cast<float>(VPJ)));
+}
+
+std::vector<uint8_t> pixels(int vit_h, int vit_w, uint64_t seed)
+{
+    Rng r{seed};
+    std::vector<uint8_t> p(static_cast<size_t>(vit_h) * VP * vit_w * VP * 3);
+    for (uint8_t& b : p) b = static_cast<uint8_t>(r.next() & 255);
+    return p;
+}
+
+// The position table: read at its own size it is the table; at another size, half-pixel centres clamped at the border.
+void test_vis_position(const Model& m, const Weights& w)
+{
+    int i0, i1;
+    float w1;
+    for (int i = 0; i < VG; ++i)
+    {
+        Model::vis_lerp(i, VG, VG, i0, i1, w1);
+        CHECK(i0 == i && w1 == 0.0f);
+    }
+    for (int i = 0; i < 32; ++i)   // the full model's table at its own size
+    {
+        Model::vis_lerp(i, 32, 32, i0, i1, w1);
+        CHECK(i0 == i && w1 == 0.0f);
+    }
+    Model::vis_lerp(0, 8, 4, i0, i1, w1);   // centre -0.25: both taps on the border
+    CHECK(i0 == 0 && i1 == 0 && w1 == 0.75f);
+    Model::vis_lerp(1, 8, 4, i0, i1, w1);   // centre 0.25
+    CHECK(i0 == 0 && i1 == 1 && w1 == 0.25f);
+    Model::vis_lerp(7, 8, 4, i0, i1, w1);   // centre 3.25: the second tap clamped
+    CHECK(i0 == 3 && i1 == 3 && w1 == 0.25f);
+    Model::vis_lerp(0, 2, 4, i0, i1, w1);   // a smaller grid: centre 0.5
+    CHECK(i0 == 0 && i1 == 1 && w1 == 0.5f);
+    Model::vis_lerp(1, 2, 4, i0, i1, w1);
+    CHECK(i0 == 2 && i1 == 3 && w1 == 0.5f);
+    const float* t = w.vis.position_embedding.data();
+    std::vector<float> e(VD);
+    for (int r = 0; r < VG; ++r)
+        for (int c = 0; c < VG; ++c)
+        {
+            m.vis_pos_embed(r, c, VG, VG, e.data());
+            CHECK(same(e.data(), t + static_cast<size_t>(r * VG + c) * VD, VD));
+        }
+    // an 8 x 6 grid against the definition in fp64 (the result is rounded once more, so within one BF16 step)
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 6; ++c)
+        {
+            m.vis_pos_embed(r, c, 8, 6, e.data());
+            const double sy = (r + 0.5) * VG / 8.0 - 0.5, sx = (c + 0.5) * VG / 6.0 - 0.5, fy = std::floor(sy), fx = std::floor(sx);
+            const auto cl = [](double v) { return static_cast<int>(v < 0 ? 0 : v > VG - 1 ? VG - 1 : v); };
+            const int y0 = cl(fy), y1 = cl(fy + 1), x0 = cl(fx), x1 = cl(fx + 1);
+            for (int d = 0; d < VD; ++d)
+            {
+                const double want = (1 - (sy - fy)) * ((1 - (sx - fx)) * t[(y0 * VG + x0) * VD + d] + (sx - fx) * t[(y0 * VG + x1) * VD + d]) +
+                                    (sy - fy) * ((1 - (sx - fx)) * t[(y1 * VG + x0) * VD + d] + (sx - fx) * t[(y1 * VG + x1) * VD + d]);
+                CHECK(std::fabs(e[d] - want) <= 1e-5 + std::fabs(want) / 128.0);
+                CHECK(e[d] == rbf(e[d]));
+            }
+        }
+    // a constant column of the table stays that constant at any size (the four weights sum to 1)
+    Weights w2 = w;
+    for (int g = 0; g < VG * VG; ++g) w2.vis.position_embedding[static_cast<size_t>(g) * VD + 3] = 0.75f;
+    Model m2(vis_config(), w2);
+    for (int r = 0; r < 6; ++r)
+    {
+        m2.vis_pos_embed(r, 9, 6, 10, e.data());
+        CHECK(e[3] == 0.75f);
+    }
+}
+
+// The rotary position: the class row at (0, 0) is not turned; the first half of a head turns with the column only,
+// the second half with the row only; pair 0 of each half turns by exactly the position in radians.
+void test_vis_rope(const Model& m)
+{
+    Rng r{611};
+    const std::vector<float> x = r.bf(VD, 1.0f);
+    std::vector<float> a = x, b = x, c = x;
+    m.vis_rope(a.data(), 0, 0);
+    CHECK(same(a.data(), x.data(), VD));
+    a = x;
+    m.vis_rope(a.data(), 3, 5);
+    m.vis_rope(b.data(), 3, 6);   // one column to the right
+    m.vis_rope(c.data(), 4, 5);   // one row down
+    for (int h = 0; h < VH; ++h)
+    {
+        const float *xa = &a[h * VHD], *xb = &b[h * VHD], *xc = &c[h * VHD], *x0 = &x[h * VHD];
+        CHECK(!same(xa, xb, VHD / 2) && same(xa + VHD / 2, xb + VHD / 2, VHD / 2));
+        CHECK(same(xa, xc, VHD / 2) && !same(xa + VHD / 2, xc + VHD / 2, VHD / 2));
+        // pair 0 of the column half: angle = 5; pair 0 of the row half: angle = 3
+        CHECK(xa[0] == rbf(x0[0] * std::cos(5.0f) - x0[1] * std::sin(5.0f)) && xa[1] == rbf(x0[1] * std::cos(5.0f) + x0[0] * std::sin(5.0f)));
+        const int o = VHD / 2;
+        CHECK(xa[o] == rbf(x0[o] * std::cos(3.0f) - x0[o + 1] * std::sin(3.0f)) && xa[o + 1] == rbf(x0[o + 1] * std::cos(3.0f) + x0[o] * std::sin(3.0f)));
+        // the last pair of the column half: angle = 5 / theta^((hd / 2 - 2) / (hd / 2))
+        const float ang = 5.0f * (1.0f / std::pow(10000.0f, static_cast<float>(VHD / 2 - 2) / static_cast<float>(VHD / 2)));
+        CHECK(xa[o - 2] == rbf(x0[o - 2] * std::cos(ang) - x0[o - 1] * std::sin(ang)));
+        // a rotation keeps the length of a pair (to the BF16 rounding)
+        for (int p = 0; p < VHD / 2; ++p)
+            CHECK(std::fabs(std::hypot(xa[2 * p], xa[2 * p + 1]) - std::hypot(x0[2 * p], x0[2 * p + 1])) < 0.02f);
+    }
+}
+
+// The patch order, the 2 x 2 merge, the padding value and the grid checks.
+void test_vis_merge(const Model& m, const Weights& w)
+{
+    // the order: the 4 patches of an image token are consecutive, tokens row by row
+    int row, col;
+    const int want[8][2] = {{0, 0}, {0, 1}, {1, 0}, {1, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}};
+    for (int n = 0; n < 8; ++n)
+    {
+        Model::vis_patch_rc(n, 6, 2, row, col);
+        CHECK(row == want[n][0] && col == want[n][1]);
+    }
+    Model::vis_patch_rc(12, 6, 2, row, col);   // token 3 = the first of the second token row
+    CHECK(row == 2 && col == 0);
+    std::vector<int> seen(4 * 6, 0);
+    for (int n = 0; n < 4 * 6; ++n)
+    {
+        Model::vis_patch_rc(n, 6, 2, row, col);
+        CHECK(row >= 0 && row < 4 && col >= 0 && col < 6 && !seen[row * 6 + col]++);
+    }
+    // pixel values: u = 0 is -1, u = 255 is 1, the padding (u = -1) one BF16 step below -1
+    CHECK(rbf((0.0f * (1.0f / 255.0f) - 0.5f) / 0.5f) == -1.0f && rbf((255.0f * (1.0f / 255.0f) - 0.5f) / 0.5f) == 1.0f);
+    CHECK(f32_to_bf16((-1.0f * (1.0f / 255.0f) - 0.5f) / 0.5f) == 0xbf81);
+
+    const int vh = 4, vw = 6, nt = 6;
+    const std::vector<uint8_t> px = pixels(vh, vw, 91);
+    const std::vector<float> out = m.encode_image(px.data(), vh, vw), hs = m.vision_states(px.data(), vh, vw);
+    CHECK(out.size() == static_cast<size_t>(nt) * H && hs.size() == static_cast<size_t>(1 + vh * vw) * VD);
+    for (float v : out) CHECK(std::isfinite(v) && v == rbf(v));
+    // the projector by hand from the patch rows, each found by its (row, col): token (tr, tc) reads (2tr, 2tc),
+    // (2tr, 2tc + 1), (2tr + 1, 2tc), (2tr + 1, 2tc + 1) in that order
+    std::vector<int> at(static_cast<size_t>(vh * vw));
+    for (int n = 0; n < vh * vw; ++n)
+    {
+        Model::vis_patch_rc(n, vw, 2, row, col);
+        at[row * vw + col] = n;
+    }
+    for (int t = 0; t < nt; ++t)
+    {
+        const int tr = t / (vw / 2), tc = t % (vw / 2);
+        std::vector<float> in;
+        for (int k = 0; k < 4; ++k)
+        {
+            const float* p = &hs[static_cast<size_t>(1 + at[(2 * tr + k / 2) * vw + 2 * tc + k % 2]) * VD];
+            in.insert(in.end(), p, p + VD);
+        }
+        std::vector<float> m1(VPJ);
+        for (int j = 0; j < VPJ; ++j) m1[j] = Model::gelu(rbf(dot(in.data(), &w.vis.proj_in[static_cast<size_t>(j) * 4 * VD], 4 * VD)));
+        for (int d = 0; d < H; ++d) CHECK(out[static_cast<size_t>(t) * H + d] == rbf(dot(m1.data(), &w.vis.proj_out[static_cast<size_t>(d) * VPJ], VPJ)));
+    }
+    CHECK(Model::gelu(0.0f) == 0.0f && Model::gelu(1.0f) == rbf(0.8413447f) && Model::gelu(-1.0f) == rbf(-0.15865525f));
+    // every token sees every patch (the attention has no mask): one changed pixel in the last patch moves token 0
+    std::vector<uint8_t> p2 = px;
+    p2.back() ^= 0x80;
+    const std::vector<float> o2 = m.encode_image(p2.data(), vh, vw);
+    CHECK(!same(o2.data(), out.data(), H) && !same(o2.data() + 5 * H, out.data() + 5 * H, H));
+    // padding: pixels outside the content are not read, and count as u = -1 (not as their bytes, and not as 0)
+    std::vector<uint8_t> pad = px, zero = px;
+    const int ch = vh * VP - 3, cw = vw * VP - 5;
+    for (int y = 0; y < vh * VP; ++y)
+        for (int x = 0; x < vw * VP; ++x)
+            if (y >= ch || x >= cw)
+                for (int k = 0; k < 3; ++k)
+                {
+                    pad[(static_cast<size_t>(y) * vw * VP + x) * 3 + k] = 99;
+                    zero[(static_cast<size_t>(y) * vw * VP + x) * 3 + k] = 0;
+                }
+    const std::vector<float> a = m.encode_image(pad.data(), vh, vw, ch, cw), b = m.encode_image(zero.data(), vh, vw, ch, cw);
+    const std::vector<float> c = m.encode_image(pad.data(), vh, vw), z = m.encode_image(zero.data(), vh, vw);
+    CHECK(same(a.data(), b.data(), a.size()) && !same(a.data(), c.data(), a.size()));
+    const double cz = cosine(a.data(), z.data(), a.size());
+    printf("  vision: padding as -1 against zero bytes: cosine %.6f, %s\n", cz, same(a.data(), z.data(), a.size()) ? "the same bits" : "other bits");
+    CHECK(cz > 0.999);
+    // a grid the merge does not divide, and a model without the tower
+    bool threw = false;
+    try { m.encode_image(px.data(), 3, 6); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+    threw = false;
+    Model plain(config(1), w);
+    try { plain.encode_image(px.data(), vh, vw); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+    // a turn of the image is another image for the tower: a row and a column of the same index turn other pairs
+    const std::vector<float> tall = m.encode_image(px.data(), vw, vh);
+    CHECK(tall.size() == out.size() && !same(tall.data(), out.data(), out.size()));
+}
+
+// An image in a token sequence: its rows stand at its tokens without embed_norm, in one pass and in chunks.
+void test_vis_forward(const Config& c, const Weights& w)
+{
+    Model m(c, w);
+    const int vh = 2, vw = 6, nt = 3;
+    const std::vector<uint8_t> px = pixels(vh, vw, 17), px2 = pixels(2, 2, 18);
+    int toks[NT] = {11, 12, IMG, IMG, IMG, 13, 14, IMG, 15, 16, 17, 18};
+    const std::vector<ImageSpan> images = {{2, vh, vw, px.data(), -1, -1}, {7, 2, 2, px2.data(), 37 % (2 * VP), 5}};
+    const std::vector<float> full = m.forward_with_images(toks, NT, images);
+    // by hand: the rows of both images at their tokens
+    const std::vector<float> r1 = m.encode_image(px.data(), vh, vw), r2 = m.encode_image(px2.data(), 2, 2, 37 % (2 * VP), 5);
+    CHECK(r1.size() == static_cast<size_t>(nt) * H && r2.size() == static_cast<size_t>(H));
+    std::vector<float> vis(static_cast<size_t>(NT) * H, 0.0f);
+    memcpy(&vis[2 * H], r1.data(), r1.size() * sizeof(float));
+    memcpy(&vis[7 * H], r2.data(), r2.size() * sizeof(float));
+    m.rollback(0);
+    const std::vector<float> hand = m.forward(toks, NT, vis.data());
+    CHECK(same(full.data(), hand.data(), full.size()));
+    // chunks that cut the first image in two
+    m.rollback(0);
+    std::vector<float> parts = m.forward(toks, 4, vis.data());
+    const std::vector<float> rest = m.forward(toks + 4, NT - 4, vis.data() + 4 * H);
+    parts.insert(parts.end(), rest.begin(), rest.end());
+    CHECK(same(full.data(), parts.data(), full.size()));
+    // the image rows do not pass embed_norm: a row put through it is another input
+    {
+        std::vector<float> n(static_cast<size_t>(H));
+        m.wnorm(&vis[2 * H], w.embed_norm, n.data());
+        CHECK(!same(n.data(), &vis[2 * H], H));
+        memcpy(&vis[2 * H], n.data(), n.size() * sizeof(float));
+    }
+    m.rollback(0);
+    const std::vector<float> scaled = m.forward(toks, NT, vis.data());
+    CHECK(!same(full.data() + 2 * VOCAB, scaled.data() + 2 * VOCAB, VOCAB));
+    // other pixels: other logits from the first image token on, the same before it
+    std::vector<uint8_t> p3 = px;
+    p3[5] ^= 0x40;
+    m.rollback(0);
+    const std::vector<float> other = m.forward_with_images(toks, NT, {{2, vh, vw, p3.data(), -1, -1}, images[1]});
+    CHECK(same(full.data(), other.data(), 2 * static_cast<size_t>(VOCAB)) && !same(full.data() + 2 * VOCAB, other.data() + 2 * VOCAB, VOCAB));
+    // a span on a text token, and one past the end
+    bool threw = false;
+    m.rollback(0);
+    try { m.forward_with_images(toks, NT, {{3, vh, vw, px.data(), -1, -1}}); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+    threw = false;
+    try { m.forward_with_images(toks, 4, {{2, vh, vw, px.data(), -1, -1}}); } catch (const std::exception&) { threw = true; }
+    CHECK(threw);
+}
+
+void test_vision()
+{
+    const Config c = vis_config();
+    Weights w = weights(c);
+    vis_weights(w);
+    const Model m(c, w);
+    test_vis_position(m, w);
+    test_vis_rope(m);
+    test_vis_merge(m, w);
+    test_vis_forward(c, w);
+    printf("  vision: position table, rotary position, merge order, padding and the image splice ok\n");
+}
 }   // namespace
 
 int main()
@@ -666,6 +972,7 @@ int main()
     // order, so between rank counts only the draft tokens and a cosine are required; on this model the BF16 rounding
     // takes the difference away and the logits come out the same bit for bit (printed).
     test_rbf_f64();
+    test_vision();
     std::vector<float> dl[3];
     int at = 0;
     for (int tp : {1, 4, 6})

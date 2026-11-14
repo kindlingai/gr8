@@ -1,0 +1,14 @@
+# Inkling-2-Small runtime settings. knobs/README.md describes the fields.
+prefix: "GR8_INK2_"
+knobs:
+  GR8_INK2_VISION:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      1 = with --serve, an Inkling-2-Small checkpoint with model.visual.* tensors activates the vision tower at boot,
+      allocating its workspace and prefill staging pool before serving starts, so the engine accepts requests with
+      images (hello `vision`). Without those tensors the engine serves text only. 0 (the default) leaves the vision
+      tower off and allocates no vision workspace.

@@ -7,6 +7,12 @@
 // boundary state (sliding-window rings, short-convolution histories and partial-page staging buffers) across turns and
 // persistent SSD restarts. Every rank runs the same calls in the same order, so the ranks' fabric steps line up.
 //
+// Image input (GR8_INK2_VISION, ../ink2_vision.cuh): the rows of an image reach the model through the prefill only.
+// Before each prefill step the engine stages the image rows of that step (Engine::stage_vision), and the step's embed
+// reads them in place of the image tokens' embeddings. A request with images takes no system checkpoint: the shared
+// system store is keyed by tokens alone. Its prompt-end and request-end entries carry the request's cache namespace
+// (the digest of its images), so only a request with the same images reuses them.
+//
 // MTP 1..7 (the bundled drafter, Engine::mtp_draft): a round is one MAIN step that verifies each session's drafts
 // (1 + k rows a session), one DRAFT step and CHAIN steps.
 //   MAIN   runs the trunk. The rows of a prompt step, of any step at MTP 0 and of a one-row session are kept, so they
@@ -37,7 +43,8 @@
 namespace g6s2 {
 struct Ink2Context {
     ink2rt::Engine& engine;
-    std::function<void(const ink2::RowsHost&, const int* toks, const ink2rt::RowSample*, std::vector<ink2rt::RowOut>&)> step;
+    // vis_rows: the image rows of the step (Engine::stage_vision) or null
+    std::function<void(const ink2::RowsHost&, const int* toks, const ink2rt::RowSample*, std::vector<ink2rt::RowOut>&, const uint16_t* vis_rows)> step;
     int rank = 0;
     bool reuse = false;
     std::vector<std::string> kv_tiers;
@@ -181,11 +188,11 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
         tiers->run(io, 0);
         stash->io_done();
     };
-    const auto run_rows = [&](int slot, const int* toks, int first, int n, const ink2rt::RowSample* sm) {
+    const auto run_rows = [&](int slot, const int* toks, int first, int n, const ink2rt::RowSample* sm, const uint16_t* vis_rows) {
         ink2::RowsHost rh;
         rh.add(slot, first, n);
         settle(nullptr);
-        c.step(rh, toks, sm, out);
+        c.step(rh, toks, sm, out, vis_rows);
         fwd_rows = 0;
         done_end[size_t(slot)] = first + n;
     };
@@ -195,7 +202,7 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
     h.pool.max_run_pages = pages / unsigned(slots);   // one run fits one slot's pages
     if (stash) {
         h.checkpoint = [&](const g6rt::ServeReq& r) -> uint32_t {
-            if (!store_shared || r.prompt.empty() || r.steering.enabled) return 0;
+            if (!store_shared || r.prompt.empty() || r.steering.enabled || !r.images.empty()) return 0;
             const uint64_t top = std::min<uint64_t>(r.prompt.size() - 1, r.sys < 0 ? r.prompt.size() - 1 : uint64_t(r.sys));
             return uint32_t(top / 64u * 64u);
         };
@@ -416,7 +423,7 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
             }
         }
         if (K == 0) {
-            c.step(rh, toks.data(), sm.data(), out);
+            c.step(rh, toks.data(), sm.data(), out, nullptr);
         } else {
             settle(&sp);
             c.engine.forward(rh, toks.data(), sm.data(), out);
@@ -468,9 +475,10 @@ inline void serve_ink2(Ink2Context c, const BootstrapConfig& bc, int chunk) {
                 if (ck > at && ck < step_lim) step_lim = ck;   // stop on the system checkpoint boundary so promote captures exact state
             }
             const int n = int(step_lim - at);
-            run_rows(q, &p.prompt[at], int(at), n, nullptr);
+            const uint16_t* vis_rows = p.images.empty() ? nullptr : c.engine.stage_vision(p.images, int(at), n, s.req.id);
+            run_rows(q, &p.prompt[at], int(at), n, nullptr, vis_rows);
             at = step_lim;
-            if (stash && store_slots[size_t(q)].ckpt && at == store_slots[size_t(q)].ckpt) {
+            if (stash && p.images.empty() && store_slots[size_t(q)].ckpt && at == store_slots[size_t(q)].ckpt) {
                 c.engine.stage_partial_page(q, at, true);
                 std::lock_guard<std::mutex> lk(ck_mu);
                 StoreSlot& ss = store_slots[size_t(q)];
