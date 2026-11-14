@@ -13,7 +13,10 @@
 //      same tokens and candidates, exact. With the cuBLAS projections on as well, a row's token is the stock
 //      row's, or a stock candidate within max(|top|, 1) / 32 of its top (a near tie, counted and printed).
 //      (The miniature's head_dim is 16, so the tensor-core kernel is not on this path; check 2 covers it.)
-//   The device all-reduce (kernels/ink2_fabric.cuh) needs the fabric of a real multi-rank run and is not tested here.
+//   4. The device all-reduce (kernels/ink2_fabric.cuh) as rank 1 of a 4-rank fabric in pinned host memory, the test
+//      playing the peers (before the launches, or after the doorbell while the device spins): 1, 8, 64 and 512 rows
+//      of 2304 and 4096 cells; the sum's bits are the stock sum's. Also the slot offsets and the credits of the pooled
+//      96-collective layout. The proxy and the wire of a real multi-rank run are not on this path.
 //
 // --bench: also times the head pack (8 rows of 50304 logits, 256 candidates) and the two attention kernels
 // (512 rows, a local window of 1024) and prints milliseconds.
@@ -24,6 +27,8 @@
 //     ../../bin/obj/g6pack.o ../loader-rs/target/release/libg6load.a ../knobs-rs/target/release/libgr8knobs.a \
 //     ../target/release/libg6host.a -lcublas -lpthread -ldl -lm
 // Run: bin/ink2_speed_test [--bench]   (one GPU; prints PASS and returns 0)
+#include "../comms/fabric.h"
+#include "../kernels/ink2_fabric.cuh"
 #include "../runtime/ink2_step.cuh"
 #include "ink2_mini_ckpt.h"
 #include <chrono>
@@ -262,6 +267,113 @@ static void check_engine(const std::string& dir, int T, const std::vector<int>& 
     printf("   %d rank(s): %zu rows; device head pack exact; with cuBLAS %d near tie(s)\n", T, off.size(), near);
 }
 
+// ------------------------------------------------------------------------------------- 4. the device all-reduce
+// A fabric of 4 ranks in pinned host memory with no proxy: this test is rank 1 and plays the three peers. Even cases
+// have the peers' shares and tail words in the receive slots before the launches; in odd cases the host waits for the
+// doorbell, then writes the shares and, last, the tail words, while the device spins.
+template <class T> static T* pinned(size_t n)
+{
+    void* p = nullptr;
+    CK(cudaHostAlloc(&p, std::max<size_t>(1, n) * sizeof(T), cudaHostAllocMapped));
+    memset(p, 0, std::max<size_t>(1, n) * sizeof(T));
+    return static_cast<T*>(p);
+}
+static void check_fabric()
+{
+    const int NR = 4, ME = 1, NCOLL = 96;
+    const size_t max_bytes = static_cast<size_t>(512) * 4096 * 4;
+    g6::FabricConfig cfg;
+    cfg.slot_bytes = max_bytes;
+    cfg.pool = 2;
+    cfg.run1 = cfg.run2 = NCOLL;
+    cfg.slot_bytes1 = 8;
+    g6::FabricDev f{};
+    f.rank = ME;
+    f.nr = NR;
+    if (!g6::fab_slot_layout(cfg, NCOLL, &f)) { check(false, "fabric: the pooled layout is refused"); return; }
+    const size_t area = g6::fab_slot_base(f, NCOLL);
+    check(f.pool == 2 && area == 2 * f.stride && g6::fab_recv_bytes(f) == 2 * area * NR, "fabric: the pooled areas");
+    bool lay = true;
+    for (int par = 0; par < 2; ++par)
+        for (int c = 0; c < NCOLL; ++c)
+        {
+            lay = lay && g6::fab_pool_slot(f, c) == c % 2 && g6::fab_send_off(f, par, c) == par * area + (c % 2) * f.stride;
+            for (int p = 0; p < NR; ++p) lay = lay && g6::fab_recv_off(f, par, c, p) == (par * area + (c % 2) * f.stride) * NR + p * f.stride;
+        }
+    check(lay, "fabric: the slot offsets of the pooled layout");
+    std::vector<int> walk(NCOLL), credit;
+    for (int c = 0; c < NCOLL; ++c) walk[c] = c;
+    bool cr = g6::fab_pool_credits(f, walk, &credit) && credit[0] == -1 && credit[1] == -1;
+    for (int c = 2; cr && c < NCOLL; ++c) cr = credit[c] == c - 1;
+    check(cr, "fabric: the pool credits of a step");
+
+    f.send = pinned<char>(2 * area);
+    f.recv = pinned<char>(g6::fab_recv_bytes(f));
+    f.doorbell = pinned<unsigned long long>(NCOLL);
+    f.error = pinned<unsigned>(1);
+    Rng r{0x66616272u};
+    int k = 0;
+    for (int M : {1, 8, 64, 512})
+        for (int cols : {2304, 4096})
+        {
+            const size_t n = static_cast<size_t>(M) * cols, bytes = n * 4;
+            const unsigned long long step = 3 + k;
+            const int c = (k * 13 + 5) % NCOLL, par = static_cast<int>(step & 1);
+            const unsigned long long seq = g6::coll_seq(step, c, NCOLL);
+            const std::string tag = "fabric: M " + std::to_string(M) + " cols " + std::to_string(cols) + ": ";
+            std::vector<float> parts(NR * n), mine(NR * n);
+            for (float& x : parts) x = unit(r) * 3.0f;
+            memset(mine.data(), 0xff, mine.size() * 4);   // the peers' places hold NaN until the exchange fills them
+            memcpy(mine.data() + ME * n, parts.data() + ME * n, bytes);
+            float* d_ref = to_dev(parts);
+            float* d_mine = to_dev(mine);
+            uint16_t *o_ref = nullptr, *o_mine = nullptr;
+            CK(cudaMalloc(&o_ref, n * 2));
+            CK(cudaMalloc(&o_mine, n * 2));
+            ink2::sum_ranks(d_ref, NR, n, o_ref, 0);
+            CK(cudaStreamSynchronize(0));
+            auto peers = [&](bool tails) {
+                for (int p = 0; p < NR; ++p)
+                {
+                    if (p == ME) continue;
+                    char* slot = f.recv + g6::fab_recv_off(f, par, c, p);
+                    if (!tails) memcpy(slot, parts.data() + p * n, bytes);
+                    else __atomic_store_n(reinterpret_cast<unsigned long long*>(slot + bytes), seq, __ATOMIC_SEQ_CST);
+                }
+            };
+            const bool late = k & 1;
+            if (!late) { peers(false); peers(true); }
+            ink2::ar_exchange(f, step, c, reinterpret_cast<char*>(d_mine), bytes, 0);
+            ink2::sum_ranks(d_mine, NR, n, o_mine, 0);
+            if (late)
+            {
+                const double t0 = now_ms();
+                while (__atomic_load_n(f.doorbell + c, __ATOMIC_SEQ_CST) != seq && now_ms() - t0 < 20000.0) {}
+                check(__atomic_load_n(f.doorbell + c, __ATOMIC_SEQ_CST) == seq, tag + "no doorbell in 20 s");
+                peers(false);
+                peers(true);
+            }
+            CK(cudaStreamSynchronize(0));
+            std::vector<uint16_t> a(n), b(n);
+            CK(cudaMemcpy(a.data(), o_ref, n * 2, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(b.data(), o_mine, n * 2, cudaMemcpyDeviceToHost));
+            check(memcmp(a.data(), b.data(), n * 2) == 0, tag + "the sum is not the stock sum's bits");
+            check(f.doorbell[c] == seq, tag + "the doorbell word");
+            check(memcmp(f.send + g6::fab_send_off(f, par, c), parts.data() + ME * n, bytes) == 0, tag + "the send slot");
+            check(*f.error == 0, tag + "the error word is set");
+            CK(cudaFree(d_ref));
+            CK(cudaFree(d_mine));
+            CK(cudaFree(o_ref));
+            CK(cudaFree(o_mine));
+            ++k;
+        }
+    printf("   %d collectives of 4 ranks: the sum's bits are the stock sum's\n", k);
+    CK(cudaFreeHost(f.send));
+    CK(cudaFreeHost(f.recv));
+    CK(cudaFreeHost(f.doorbell));
+    CK(cudaFreeHost(f.error));
+}
+
 int main(int argc, char** argv)
 {
     const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
@@ -295,6 +407,9 @@ int main(int argc, char** argv)
     for (int i = 0; i < PROMPT + SINGLES; ++i) toks.push_back(static_cast<int>(r.next() % VALID));
     for (int T : {1, 4}) check_engine(dir, T, toks);
     std::filesystem::remove_all(tmp);
+
+    printf("4. the device all-reduce on a fabric in memory\n");
+    check_fabric();
 
     if (fails)
     {
