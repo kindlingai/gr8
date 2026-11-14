@@ -471,7 +471,8 @@ pub fn digest() -> u64 {
             c8_pack,
             mtp_sessions,
             sess_drafts,
-            park
+            park,
+            cap_rows
         }
     );
     layout!(h, crate::scheduler::Quantum { kind, boundary, keys, count, first, rows, firsts, row_counts });

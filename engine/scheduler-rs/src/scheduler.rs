@@ -110,6 +110,7 @@ pub struct Config {
     pub mtp_sessions: u32,
     pub sess_drafts: bool,
     pub park: bool,
+    pub cap_rows: u32,
 }
 
 impl Config {
@@ -118,6 +119,14 @@ impl Config {
             self.mtp.wrapping_mul(2)
         } else {
             self.guard_tokens
+        }
+    }
+    /// The most rows one request may reserve: cap_rows, or pool_rows when it is 0 (a pool of one session's length).
+    pub fn cap(&self) -> u32 {
+        if self.cap_rows != 0 {
+            self.cap_rows
+        } else {
+            self.pool_rows
         }
     }
     pub fn limit(&self) -> u32 {
@@ -242,6 +251,7 @@ pub fn reserve_rows(c: &Config, r: &Request) -> Result<u64, Err> {
 pub fn reserve_pages(c: &Config, r: &Request) -> Result<u32, Err> {
     let rows = reserve_rows(c, r)?;
     require(rows <= u64::from(c.pool_rows), "request exceeds pool including guard")?;
+    require(rows <= u64::from(c.cap()), "request exceeds cap including guard")?;
     Ok(rows.wrapping_add(u64::from(PAGE) - 1).wrapping_div(u64::from(PAGE)) as u32)
 }
 pub fn round_rows(c: &Config, length: u64) -> u64 {
@@ -290,6 +300,10 @@ pub fn validate(c: &Config, max_sessions: u32, mtp0: bool, pack: bool, park: boo
     )?;
     require(!c.c8_pack || pack, "c8 prefill pack is DS41 only")?;
     require(!c.park || park, "parked slots are DS41 only")?;
+    require(
+        c.cap_rows == 0 || (c.cap_rows >= PAGE && c.cap_rows.is_multiple_of(PAGE) && c.cap_rows <= c.pool_rows),
+        "cap_rows must be 0 or a multiple of 64 no larger than pool_rows",
+    )?;
     require(c.guard() >= c.mtp.wrapping_mul(2) && c.prefill_rows != 0, "insufficient guard/prefill rows")?;
     require(
         c.decode_prefill_rows == 0
@@ -462,6 +476,10 @@ pub fn digest_head(c: &Config, st: &State) -> u64 {
     add(&mut h, u64::from(c.two_lanes));
     if c.decode_prefill_rows != 0 {
         add(&mut h, u64::from(c.decode_prefill_rows));
+    }
+    // a pool larger than one request (GR8_CAP_TOTAL); a config without it hashes as before
+    if c.cap_rows != 0 && c.cap_rows != c.pool_rows {
+        add(&mut h, 0x6361_7000_0000_0000 | u64::from(c.cap_rows));
     }
     add(&mut h, u64::from(st.have_id));
     add(&mut h, st.last_id);
@@ -1043,5 +1061,45 @@ mod tests {
             skip_prefill_from(&mut slots, &state, &key, from).unwrap();
             assert_eq!(slots[0].prefilled, 19);
         }
+    }
+
+    fn cap_config(pool_rows: u32, cap_rows: u32) -> Config {
+        // a C mirror of integers and bools
+        let mut c: Config = unsafe { std::mem::zeroed() };
+        (c.epoch, c.pool_rows, c.cap_rows, c.max_rows, c.max_sessions, c.mtp) = (1, pool_rows, cap_rows, 24, 4, 2);
+        (c.guard_tokens, c.prefill_rows, c.notice_max) = (u32::MAX, 4096, NOTICE_MIN as u32);
+        c
+    }
+
+    fn request(prompt: u32, max: u32) -> Request {
+        let mut r: Request = unsafe { std::mem::zeroed() };
+        (r.prompt_tokens, r.max_tokens) = (prompt, max);
+        r
+    }
+
+    #[test]
+    fn cap_rows_bounds_one_request_in_a_larger_pool() {
+        // a pool of four 100-page sessions; one request still fits one session's table
+        let c = cap_config(400 * PAGE, 100 * PAGE);
+        validate(&c, 8, false, false, false).unwrap();
+        let guard = c.guard();
+        assert_eq!(reserve_pages(&c, &request(100 * PAGE - guard - 1, 1)), Ok(100));
+        assert_eq!(reserve_pages(&c, &request(100 * PAGE - guard, 1)), Err("request exceeds cap including guard"));
+        // 0 = pool_rows: the old rule
+        let old = cap_config(400 * PAGE, 0);
+        assert_eq!(old.cap(), 400 * PAGE);
+        assert_eq!(reserve_pages(&old, &request(200 * PAGE, 1)), Ok(201));
+        // cap_rows must be whole pages within the pool
+        for bad in [100 * PAGE + 1, 401 * PAGE] {
+            assert!(validate(&cap_config(400 * PAGE, bad), 8, false, false, false).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_digest_names_cap_rows_only_below_the_pool() {
+        let st: State = unsafe { std::mem::zeroed() };
+        let base = digest_head(&cap_config(400 * PAGE, 0), &st);
+        assert_eq!(digest_head(&cap_config(400 * PAGE, 400 * PAGE), &st), base, "cap_rows = pool_rows hashes as unset");
+        assert_ne!(digest_head(&cap_config(400 * PAGE, 100 * PAGE), &st), base);
     }
 }
