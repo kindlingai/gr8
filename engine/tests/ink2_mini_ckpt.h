@@ -5,6 +5,11 @@
 //
 // The trunk is the model of engine/tests/ink2_layers_gpu_test.cu (same generator, same order of draws), without an
 // image token. The intermediate sizes split over 1, 4 and 6 ranks.
+//
+// build_mini(mm, true) adds a vision tower (2 layers of 256 wide, 4 heads of 64, 20-pixel patches, a 4 x 4 position
+// table, 2 x 2 patches per image token, a 384-wide projector) and the image token IMG: config.json then has
+// image_token_id and vision_config, and model.safetensors the model.visual.* tensors. The tower's weights come from
+// their own generator, so the trunk and the drafter are the same with and without it.
 #pragma once
 #include "../ref/ink2/ink2_cpu_ref.h"
 #include <cerrno>
@@ -24,10 +29,13 @@ using ink2ref::Config;
 using ink2ref::Layer;
 using ink2ref::MtpLayer;
 using ink2ref::MtpWeights;
+using ink2ref::VisionLayer;
+using ink2ref::VisionWeights;
 using ink2ref::Weights;
 
 constexpr int H = 256, NL = 6, NH = 48, NKV = 8, HD = 16, RD = 16, RELW = 8, WIN = 8, BASE = 6, INTER = 768, NE = 16, TK = 4, VOCAB = 768, VALID = 750;
 constexpr int ML = 3, MI = 768, MR = 16, MW = 5, MB = 8, MK = 7;
+constexpr int VD = 256, VL = 2, VH = 4, VI = 512, VP = 20, VM = 2, VG = 4, VPJ = 384, IMG = 760;   // the vision tower; IMG = the image token
 
 struct Rng   // the generator of engine/tests/test_ink2_cpu_ref.cpp
 {
@@ -60,7 +68,7 @@ struct Mini
     std::vector<std::vector<Codes>> codes;   // [layer][expert]: the experts' quantized matrices before packing
 };
 
-inline Config mini_config(int tp)
+inline Config mini_config(int tp, bool with_vision = false)
 {
     Config c;
     c.hidden = H;
@@ -91,6 +99,19 @@ inline Config mini_config(int tp)
     c.markov_rank = MR;
     c.mtp_global = {0, 1, 0};
     c.mtp_target_layers = {1, 3, 5, 6};
+    if (with_vision)
+    {
+        c.has_vision = true;
+        c.image_token_id = IMG;
+        c.vis_hidden = VD;
+        c.vis_layers = VL;
+        c.vis_heads = VH;
+        c.vis_mlp = VI;
+        c.vis_patch = VP;
+        c.vis_merge = VM;
+        c.vis_grid = VG;
+        c.vis_proj = VPJ;
+    }
     return c;
 }
 
@@ -120,9 +141,9 @@ inline void pack_experts(const Mini& mm, int l, int T, int r, std::vector<uint8_
     }
 }
 
-inline void build_mini(Mini& mm)
+inline void build_mini(Mini& mm, bool with_vision = false)
 {
-    mm.c = mini_config(1);
+    mm.c = mini_config(1, with_vision);
     const Config& c = mm.c;
     Rng r{0x1ce2b00c};
     Weights& w = mm.w;
@@ -228,6 +249,43 @@ inline void build_mini(Mini& mm)
     y.rnn_b = q.bf(3 * MR, 0.5f);
     y.hidden_out_w = q.bf(static_cast<size_t>(H) * MR, 0.5f);
     y.hidden_out_b = q.bf(H, 0.5f);
+
+    // the vision tower
+    if (!with_vision) return;
+    Rng v{0x76697369};
+    VisionWeights& x = w.vis;
+    const size_t vd = VD, pk = static_cast<size_t>(VP) * VP * 3, md = static_cast<size_t>(VM) * VM * VD;
+    const float iv = 1.0f / std::sqrt(static_cast<float>(VD));
+    x.patch_embedding = v.bf(vd * pk, 2.0f / std::sqrt(static_cast<float>(pk)));
+    x.class_embedding = v.bf(vd, 0.5f);
+    x.cls_position_embedding = v.bf(vd, 0.5f);
+    x.position_embedding = v.bf(static_cast<size_t>(VG) * VG * vd, 0.5f);
+    x.ln_pre_w = v.bf(vd, 0.2f, 1.0f);
+    x.ln_pre_b = v.bf(vd, 0.1f);
+    x.layers.resize(VL);
+    for (VisionLayer& l : x.layers)
+    {
+        l.ln1_w = v.bf(vd, 0.2f, 1.0f);
+        l.ln1_b = v.bf(vd, 0.1f);
+        l.ln2_w = v.bf(vd, 0.2f, 1.0f);
+        l.ln2_b = v.bf(vd, 0.1f);
+        l.q_w = v.bf(vd * vd, 4.0f * iv);
+        l.q_b = v.bf(vd, 0.1f);
+        l.k_w = v.bf(vd * vd, 4.0f * iv);
+        l.k_b = v.bf(vd, 0.1f);
+        l.v_w = v.bf(vd * vd, 2.0f * iv);
+        l.v_b = v.bf(vd, 0.1f);
+        l.o_w = v.bf(vd * vd, 2.0f * iv);
+        l.o_b = v.bf(vd, 0.1f);
+        l.ls1 = v.bf(vd, 0.2f, 0.5f);
+        l.ls2 = v.bf(vd, 0.2f, 0.5f);
+        l.fc_w = v.bf(static_cast<size_t>(VI) * vd, 2.0f * iv);
+        l.fc_b = v.bf(VI, 0.1f);
+        l.proj_w = v.bf(vd * VI, 2.0f / std::sqrt(static_cast<float>(VI)));
+        l.proj_b = v.bf(vd, 0.1f);
+    }
+    x.proj_in = v.bf(static_cast<size_t>(VPJ) * md, 2.0f / std::sqrt(static_cast<float>(md)));
+    x.proj_out = v.bf(static_cast<size_t>(H) * VPJ, 2.0f / std::sqrt(static_cast<float>(VPJ)));
 }
 
 // ------------------------------------------------------------------------------------------- the checkpoint files
@@ -312,6 +370,51 @@ inline std::string int_list(const std::vector<int>& v)
     return s;
 }
 
+// The model.visual.* tensors of the checkpoint, in name order; none without the tower.
+inline std::vector<StItem> vision_items(const Mini& mm)
+{
+    std::vector<StItem> it;
+    if (!mm.c.has_vision) return it;
+    const VisionWeights& x = mm.w.vis;
+    const size_t vd = VD, pk = static_cast<size_t>(VP) * VP * 3, md = static_cast<size_t>(VM) * VM * VD;
+    const auto bf = [&](const std::string& n, std::vector<size_t> shape, const std::vector<float>& v) {
+        it.push_back(StItem{"model.visual." + n, "BF16", std::move(shape), bf16_bytes(v)});
+    };
+    const std::string e = "backbone.embeddings.", t = "backbone.transformer.";
+    bf(e + "class_embedding", {vd}, x.class_embedding);
+    bf(e + "cls_position_embedding", {vd}, x.cls_position_embedding);
+    bf(e + "patch_embedding.weight", {vd, pk}, x.patch_embedding);
+    bf(e + "position_embedding.weight", {static_cast<size_t>(VG) * VG, vd}, x.position_embedding);
+    for (int l = 0; l < VL; ++l)
+    {
+        const VisionLayer& y = x.layers[l];
+        const std::string p = t + "layers." + std::to_string(l) + ".";
+        bf(p + "ln_1.bias", {vd}, y.ln1_b);
+        bf(p + "ln_1.weight", {vd}, y.ln1_w);
+        bf(p + "ln_2.bias", {vd}, y.ln2_b);
+        bf(p + "ln_2.weight", {vd}, y.ln2_w);
+        bf(p + "ls_1.gamma", {vd}, y.ls1);
+        bf(p + "ls_2.gamma", {vd}, y.ls2);
+        bf(p + "mlp.c_fc.bias", {VI}, y.fc_b);
+        bf(p + "mlp.c_fc.weight", {VI, vd}, y.fc_w);
+        bf(p + "mlp.c_proj.bias", {vd}, y.proj_b);
+        bf(p + "mlp.c_proj.weight", {vd, VI}, y.proj_w);
+        bf(p + "self_attn.k_proj.bias", {vd}, y.k_b);
+        bf(p + "self_attn.k_proj.weight", {vd, vd}, y.k_w);
+        bf(p + "self_attn.out_proj.bias", {vd}, y.o_b);
+        bf(p + "self_attn.out_proj.weight", {vd, vd}, y.o_w);
+        bf(p + "self_attn.q_proj.bias", {vd}, y.q_b);
+        bf(p + "self_attn.q_proj.weight", {vd, vd}, y.q_w);
+        bf(p + "self_attn.v_proj.bias", {vd}, y.v_b);
+        bf(p + "self_attn.v_proj.weight", {vd, vd}, y.v_w);
+    }
+    bf(t + "ln_pre.bias", {vd}, x.ln_pre_b);
+    bf(t + "ln_pre.weight", {vd}, x.ln_pre_w);
+    bf("proj_in.weight", {VPJ, md}, x.proj_in);
+    bf("proj_out.weight", {H, VPJ}, x.proj_out);
+    return it;
+}
+
 // Writes the checkpoint directory `dir` (made when absent). Throws std::runtime_error on an I/O error.
 inline void write_ckpt(const Mini& mm, const std::string& dir)
 {
@@ -339,7 +442,15 @@ inline void write_ckpt(const Mini& mm, const std::string& dir)
             "\"mtp_config\": {\"num_hidden_layers\": " + std::to_string(ML) + ", \"intermediate_size\": " + std::to_string(MI) +
             ", \"sliding_window_size\": " + std::to_string(MW) + ", \"block_size\": " + std::to_string(MB) + ", \"num_speculative_tokens\": " +
             std::to_string(MK) + ", \"markov_rank\": " + std::to_string(MR) + ", \"rope_theta\": 1000000.0, \"target_layer_ids\": [" +
-            int_list(c.mtp_target_layers) + "], \"local_layer_ids\": [" + int_list(mlocal) + "]}}\n";
+            int_list(c.mtp_target_layers) + "], \"local_layer_ids\": [" + int_list(mlocal) + "]}" +
+            (c.has_vision ? ", \"image_token_id\": " + std::to_string(c.image_token_id) + ", \"vision_config\": {\"hidden_size\": " +
+                                std::to_string(c.vis_hidden) + ", \"num_hidden_layers\": " + std::to_string(c.vis_layers) +
+                                ", \"num_attention_heads\": " + std::to_string(c.vis_heads) + ", \"mlp_ratio\": " +
+                                std::to_string(c.vis_mlp / c.vis_hidden) + ".0, \"native_patch_size\": " + std::to_string(c.vis_patch) +
+                                ", \"adapter_merge_size\": " + std::to_string(c.vis_merge) + ", \"posemb_grid_size\": " + std::to_string(c.vis_grid) +
+                                ", \"projection_hidden_dim\": " + std::to_string(c.vis_proj) + ", \"projector_bias\": false, \"layer_norm_eps\": 1e-05}"
+                          : std::string()) +
+            "}\n";
         write_file(dir + "/config.json", s.data(), s.size(), "w");
     }
     // hf_quant_config.json
@@ -426,6 +537,7 @@ inline void write_ckpt(const Mini& mm, const std::string& dir)
                 it.push_back(f32(x + "w2_weight_scale_2", {NE}, y.s2));
             }
         }
+        for (StItem& t : vision_items(mm)) it.push_back(std::move(t));
         st_write(dir + "/model.safetensors", it);
     }
     // mtp.safetensors

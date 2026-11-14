@@ -26,6 +26,9 @@
 // K / V row made of the softmax(fuse_weight) mix of its taps; mtp_draft() then runs a block of mtp_block rows (the last
 // token, then mask rows) that attend to those context rows and to each other in both directions, and a recurrent head
 // turns the mask rows into draft tokens one after another. A draft never changes the state of the model.
+//
+// The vision tower (Config::has_vision) turns one image into the feature rows of its image tokens; encode_image() has
+// the steps. It keeps no state, and forward() reads its rows where the token is image_token_id.
 #pragma once
 #include "../../kernels/nvfp4_pack.h"
 #include <cfloat>
@@ -210,6 +213,13 @@ struct Config
     int markov_rank = 256;
     std::vector<uint8_t> mtp_global;      // [mtp_layers] 1 = the whole context
     std::vector<int> mtp_target_layers;   // the taps, each 0 .. n_layers
+    // the vision tower (config.json vision_config; the defaults are Inkling-2-Small's). vis_mlp = hidden * mlp_ratio.
+    bool has_vision = false;
+    int vis_hidden = 1024, vis_layers = 23, vis_heads = 16, vis_mlp = 4096;
+    int vis_patch = 20, vis_merge = 2;    // pixels per patch side; patches per image token side
+    int vis_grid = 32;                    // the learned position table is [vis_grid * vis_grid][vis_hidden]
+    int vis_proj = 4096;                  // the hidden width of the projector to the trunk
+    float vis_eps = 1e-5f, vis_theta = 10000.0f;
 };
 
 struct Layer
@@ -263,11 +273,42 @@ struct MtpWeights
     std::vector<float> hidden_out_w, hidden_out_b;           // [H][R], [H]
 };
 
+struct VisionLayer
+{
+    std::vector<float> ln1_w, ln1_b, ln2_w, ln2_b;           // [VD]
+    std::vector<float> q_w, k_w, v_w, o_w;                   // [VD][VD]
+    std::vector<float> q_b, k_b, v_b, o_b;                   // [VD]
+    std::vector<float> ls1, ls2;                             // [VD]  the scale of each residual branch
+    std::vector<float> fc_w, fc_b;                           // [VI][VD], [VI]
+    std::vector<float> proj_w, proj_b;                       // [VD][VI], [VD]
+};
+
+struct VisionWeights
+{
+    std::vector<float> patch_embedding;                      // [VD][patch * patch * 3], a patch as (y, x, channel)
+    std::vector<float> class_embedding, cls_position_embedding;   // [VD]
+    std::vector<float> position_embedding;                   // [grid * grid][VD], row = gy * grid + gx
+    std::vector<float> ln_pre_w, ln_pre_b;                   // [VD]
+    std::vector<VisionLayer> layers;
+    std::vector<float> proj_in;                              // [vis_proj][merge * merge * VD]
+    std::vector<float> proj_out;                             // [H][vis_proj]
+};
+
 struct Weights
 {
     std::vector<float> embed, embed_norm, final_norm, output_query, lm_head;   // [V][H], [H], [H], [H], [V][H]
     std::vector<Layer> layers;
     MtpWeights mtp;
+    VisionWeights vis;
+};
+
+// One image of a forward_with_images() call: its tokens are toks[pos .. pos + (vit_h / merge) * (vit_w / merge)).
+// rgb = [vit_h * patch][vit_w * patch][3]; pixels at y >= content_h or x >= content_w are padding (-1 = no padding).
+struct ImageSpan
+{
+    int pos = 0, vit_h = 0, vit_w = 0;
+    const uint8_t* rgb = nullptr;
+    int content_h = -1, content_w = -1;
 };
 
 class Model
@@ -282,6 +323,12 @@ public:
         if (C.n_heads % C.n_kv_heads || C.tp < 1 || C.n_heads % C.tp || C.inter % (64 * C.tp) || C.hidden % 64) bad("geometry");
         if (C.top_k < 1 || C.top_k > C.n_exp || C.block < 1) bad("top_k or block");
         if (C.mtp_layers > 0) mtp_init();
+        if (C.has_vision)
+        {
+            if (C.vis_layers < 1 || static_cast<int>(W.vis.layers.size()) != C.vis_layers) bad("vision layer count");
+            if (C.vis_heads < 1 || C.vis_hidden % C.vis_heads || (C.vis_hidden / C.vis_heads) % 4) bad("vision head_dim is not a multiple of 4");
+            if (C.vis_patch < 1 || C.vis_merge < 1 || C.vis_grid < 1 || C.vis_proj < 1 || C.vis_mlp < 1) bad("vision geometry");
+        }
     }
 
     int pos() const { return pos_; }
@@ -395,6 +442,215 @@ public:
         if (C.mtp_layers > 0) mtp_context(taps, M);
         pos_ += M;
         return logits;
+    }
+
+    // ---- the vision tower
+
+    // Patch n of a vit_w wide grid, in the order of the tower: the patches of one image token (a merge x merge block)
+    // are consecutive, blocks row by row, and the patches of a block row by row.
+    static void vis_patch_rc(int n, int vit_w, int merge, int& row, int& col)
+    {
+        const int mm = merge * merge, blk = n / mm, in = n % mm, cols = vit_w / merge;
+        row = (blk / cols) * merge + in / merge;
+        col = (blk % cols) * merge + in % merge;
+    }
+
+    // One side of the position table read at patch i of n: the two table indices and the weight of the second.
+    // Half-pixel centres, clamped at the border (bilinear, align_corners = false).
+    static void vis_lerp(int i, int n, int grid, int& i0, int& i1, float& w1)
+    {
+        const float s = (static_cast<float>(i) + 0.5f) * static_cast<float>(grid) / static_cast<float>(n) - 0.5f, f = std::floor(s);
+        const int a = static_cast<int>(f);
+        i0 = a < 0 ? 0 : a > grid - 1 ? grid - 1 : a;
+        i1 = a + 1 < 0 ? 0 : a + 1 > grid - 1 ? grid - 1 : a + 1;
+        w1 = s - f;
+    }
+
+    // The position embedding of the patch at (row, col) of a vit_h x vit_w grid, [VD] BF16.
+    void vis_pos_embed(int row, int col, int vit_h, int vit_w, float* out) const
+    {
+        const int VD = C.vis_hidden, G = C.vis_grid;
+        int y0, y1, x0, x1;
+        float wy1, wx1;
+        vis_lerp(row, vit_h, G, y0, y1, wy1);
+        vis_lerp(col, vit_w, G, x0, x1, wx1);
+        const float wy0 = 1.0f - wy1, wx0 = 1.0f - wx1;
+        const float* t = W.vis.position_embedding.data();
+        const float *a = t + static_cast<size_t>(y0 * G + x0) * VD, *b = t + static_cast<size_t>(y0 * G + x1) * VD;
+        const float *c = t + static_cast<size_t>(y1 * G + x0) * VD, *d = t + static_cast<size_t>(y1 * G + x1) * VD;
+        const float w00 = wy0 * wx0, w01 = wy0 * wx1, w10 = wy1 * wx0, w11 = wy1 * wx1;
+        for (int i = 0; i < VD; ++i) out[i] = rbf(w00 * a[i] + w01 * b[i] + w10 * c[i] + w11 * d[i]);
+    }
+
+    // LayerNorm over VD: bf16((x - mean) * rsqrt(var + eps) * w + b), the variance over VD (not VD - 1).
+    void vis_layernorm(const float* x, const std::vector<float>& w, const std::vector<float>& b, float* out) const
+    {
+        const int VD = C.vis_hidden;
+        float sum = 0.0f, sq = 0.0f;
+        for (int i = 0; i < VD; ++i) sum += x[i];
+        const float mean = sum / static_cast<float>(VD);
+        for (int i = 0; i < VD; ++i) sq += (x[i] - mean) * (x[i] - mean);
+        const float r = rsqrtf(sq / static_cast<float>(VD) + C.vis_eps);
+        for (int i = 0; i < VD; ++i) out[i] = rbf((x[i] - mean) * r * w[i] + b[i]);
+    }
+
+    // The 2D rotary position of one row, in place on its [heads][hd] query or key: the first hd / 4 pairs turn with
+    // the column (pos_w), the next hd / 4 with the row (pos_h); pair p = elements 2p and 2p + 1.
+    void vis_rope(float* x, int pos_h, int pos_w) const
+    {
+        const int hd = C.vis_hidden / C.vis_heads, nf = hd / 4;
+        for (int p = 0; p < 2 * nf; ++p)
+        {
+            const int m = p < nf ? p : p - nf;
+            const float inv = 1.0f / std::pow(C.vis_theta, static_cast<float>(2 * m) / static_cast<float>(hd / 2));
+            const float ang = static_cast<float>(p < nf ? pos_w : pos_h) * inv, cs = std::cos(ang), sn = std::sin(ang);
+            for (int h = 0; h < C.vis_heads; ++h)
+            {
+                float* v = x + static_cast<size_t>(h) * hd + 2 * p;
+                const float a = v[0], b = v[1];
+                v[0] = rbf(a * cs - b * sn);
+                v[1] = rbf(b * cs + a * sn);
+            }
+        }
+    }
+
+    static float gelu(float x) { return rbf(0.5f * x * (1.0f + std::erf(x * 0.7071067811865475244f))); }
+
+    // The hidden states of the tower after its last layer, [1 + vit_h * vit_w][VD] BF16: row 0 is the class token,
+    // row 1 + n is patch n in the order of vis_patch_rc.
+    //   pixel   bf16((u / 255 - 0.5) / 0.5); padding counts as u = -1
+    //   x       patch n: bf16(bf16(patch_embedding . pixels) + position embedding);  class row: bf16(class + cls position)
+    //   h       ln_pre(x)
+    //   layer   q, k, v = bf16(W ln_1(h) + b); rope on q and k (class row at (0, 0), a patch at (row + 1, col + 1));
+    //           a = bf16(softmax(q . k / sqrt(hd)) v) over every row;  h = bf16(h + bf16(ls_1 * bf16(W_o a + b_o)))
+    //           h = bf16(h + bf16(ls_2 * bf16(W_proj gelu(bf16(W_fc ln_2(h) + b_fc)) + b_proj)))
+    std::vector<float> vision_states(const uint8_t* rgb, int vit_h, int vit_w, int content_h = -1, int content_w = -1) const
+    {
+        if (!C.has_vision) throw std::runtime_error("ink2ref: the model has no vision tower");
+        const int VD = C.vis_hidden, P = C.vis_patch, mg = C.vis_merge, nh = C.vis_heads, hd = VD / nh, VI = C.vis_mlp;
+        if (!rgb || vit_h < mg || vit_w < mg || vit_h % mg || vit_w % mg) throw std::runtime_error("ink2ref: image grid");
+        if (content_h < 0) content_h = vit_h * P;
+        if (content_w < 0) content_w = vit_w * P;
+        const int N = vit_h * vit_w, S = 1 + N, PK = P * P * 3;
+        const VisionWeights& V = W.vis;
+        const size_t pw = static_cast<size_t>(vit_w) * P;
+        std::vector<float> x(static_cast<size_t>(S) * VD), h(x.size()), px(static_cast<size_t>(PK)), pe(static_cast<size_t>(VD));
+        std::vector<int> ph(static_cast<size_t>(S), 0), pwid(static_cast<size_t>(S), 0);   // rotary positions
+        for (int i = 0; i < VD; ++i) x[i] = rbf(V.class_embedding[i] + V.cls_position_embedding[i]);
+        for (int n = 0; n < N; ++n)
+        {
+            int row, col;
+            vis_patch_rc(n, vit_w, mg, row, col);
+            ph[1 + n] = row + 1;
+            pwid[1 + n] = col + 1;
+            for (int py = 0; py < P; ++py)
+                for (int qx = 0; qx < P; ++qx)
+                {
+                    const int gy = row * P + py, gx = col * P + qx;
+                    const bool in = gy < content_h && gx < content_w;
+                    for (int ch = 0; ch < 3; ++ch)
+                    {
+                        const float u = in ? static_cast<float>(rgb[(static_cast<size_t>(gy) * pw + gx) * 3 + ch]) : -1.0f;
+                        px[(py * P + qx) * 3 + ch] = rbf((u * (1.0f / 255.0f) - 0.5f) / 0.5f);
+                    }
+                }
+            vis_pos_embed(row, col, vit_h, vit_w, pe.data());
+            float* o = &x[static_cast<size_t>(1 + n) * VD];
+            for (int d = 0; d < VD; ++d) o[d] = rbf(rbf(dot(px.data(), &V.patch_embedding[static_cast<size_t>(d) * PK], PK)) + pe[d]);
+        }
+        for (int s = 0; s < S; ++s) vis_layernorm(&x[static_cast<size_t>(s) * VD], V.ln_pre_w, V.ln_pre_b, &h[static_cast<size_t>(s) * VD]);
+
+        const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+        const auto linear = [](const float* in, const std::vector<float>& w, const std::vector<float>& b, int rows, int cols, float* out) {
+            for (int r = 0; r < rows; ++r) out[r] = rbf(b[r] + dot(in, &w[static_cast<size_t>(r) * cols], cols));
+        };
+        std::vector<float> u(static_cast<size_t>(VD)), q(x.size()), k(x.size()), v(x.size()), att(x.size()), lg(static_cast<size_t>(S));
+        std::vector<float> f1(static_cast<size_t>(VI)), o(static_cast<size_t>(VD));
+        for (int l = 0; l < C.vis_layers; ++l)
+        {
+            const VisionLayer& y = V.layers[l];
+            for (int s = 0; s < S; ++s)
+            {
+                const size_t at = static_cast<size_t>(s) * VD;
+                vis_layernorm(&h[at], y.ln1_w, y.ln1_b, u.data());
+                linear(u.data(), y.q_w, y.q_b, VD, VD, &q[at]);
+                linear(u.data(), y.k_w, y.k_b, VD, VD, &k[at]);
+                linear(u.data(), y.v_w, y.v_b, VD, VD, &v[at]);
+                vis_rope(&q[at], ph[s], pwid[s]);
+                vis_rope(&k[at], ph[s], pwid[s]);
+            }
+            for (int hh = 0; hh < nh; ++hh)
+                for (int s = 0; s < S; ++s)
+                {
+                    const float* qs = &q[static_cast<size_t>(s) * VD + hh * hd];
+                    float mx = -std::numeric_limits<float>::infinity();
+                    for (int t = 0; t < S; ++t)
+                    {
+                        lg[t] = dot(qs, &k[static_cast<size_t>(t) * VD + hh * hd], hd) * scale;
+                        mx = std::fmax(mx, lg[t]);
+                    }
+                    float den = 0.0f;
+                    for (int t = 0; t < S; ++t)
+                    {
+                        lg[t] = std::exp(lg[t] - mx);
+                        den += lg[t];
+                    }
+                    float* a = &att[static_cast<size_t>(s) * VD + hh * hd];
+                    for (int d = 0; d < hd; ++d)
+                    {
+                        float acc = 0.0f;
+                        for (int t = 0; t < S; ++t) acc += lg[t] * v[static_cast<size_t>(t) * VD + hh * hd + d];
+                        a[d] = rbf(acc / den);
+                    }
+                }
+            for (int s = 0; s < S; ++s)
+            {
+                float* hs = &h[static_cast<size_t>(s) * VD];
+                linear(&att[static_cast<size_t>(s) * VD], y.o_w, y.o_b, VD, VD, o.data());
+                for (int d = 0; d < VD; ++d) hs[d] = rbf(hs[d] + rbf(y.ls1[d] * o[d]));
+                vis_layernorm(hs, y.ln2_w, y.ln2_b, u.data());
+                linear(u.data(), y.fc_w, y.fc_b, VI, VD, f1.data());
+                for (float& z : f1) z = gelu(z);
+                linear(f1.data(), y.proj_w, y.proj_b, VD, VI, o.data());
+                for (int d = 0; d < VD; ++d) hs[d] = rbf(hs[d] + rbf(y.ls2[d] * o[d]));
+            }
+        }
+        return h;
+    }
+
+    // One image -> the feature rows of its tokens, [(vit_h / merge) * (vit_w / merge)][H] BF16, tokens row by row.
+    // The patch rows of vision_states (without the class row) are read merge * merge at a time as one row of
+    // [merge * merge * VD]:  out = bf16(proj_out . gelu(bf16(proj_in . row))), no biases.
+    std::vector<float> encode_image(const uint8_t* rgb, int vit_h, int vit_w, int content_h = -1, int content_w = -1) const
+    {
+        const std::vector<float> h = vision_states(rgb, vit_h, vit_w, content_h, content_w);
+        const int VD = C.vis_hidden, MD = C.vis_merge * C.vis_merge * VD, PJ = C.vis_proj, H = C.hidden;
+        const int nt = (vit_h / C.vis_merge) * (vit_w / C.vis_merge);
+        std::vector<float> out(static_cast<size_t>(nt) * H), m1(static_cast<size_t>(PJ));
+        for (int t = 0; t < nt; ++t)
+        {
+            const float* in = &h[static_cast<size_t>(VD) + static_cast<size_t>(t) * MD];
+            for (int j = 0; j < PJ; ++j) m1[j] = gelu(rbf(dot(in, &W.vis.proj_in[static_cast<size_t>(j) * MD], MD)));
+            for (int d = 0; d < H; ++d) out[static_cast<size_t>(t) * H + d] = rbf(dot(m1.data(), &W.vis.proj_out[static_cast<size_t>(d) * PJ], PJ));
+        }
+        return out;
+    }
+
+    // forward() of M tokens with their images: every image is encoded and its rows stand at its tokens.
+    std::vector<float> forward_with_images(const int* toks, int M, const std::vector<ImageSpan>& images)
+    {
+        const int H = C.hidden;
+        std::vector<float> vis(static_cast<size_t>(M) * H, 0.0f);
+        for (const ImageSpan& im : images)
+        {
+            const std::vector<float> rows = encode_image(im.rgb, im.vit_h, im.vit_w, im.content_h, im.content_w);
+            const int n = static_cast<int>(rows.size() / H);
+            if (im.pos < 0 || im.pos + n > M) throw std::runtime_error("ink2ref: an image span outside the tokens");
+            for (int i = 0; i < n; ++i)
+                if (toks[im.pos + i] != C.image_token_id) throw std::runtime_error("ink2ref: an image span on a text token");
+            memcpy(&vis[static_cast<size_t>(im.pos) * H], rows.data(), rows.size() * sizeof(float));
+        }
+        return forward(toks, M, vis.data());
     }
 
     // ---- the MTP drafter

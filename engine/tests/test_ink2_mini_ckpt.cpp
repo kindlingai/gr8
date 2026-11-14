@@ -1,6 +1,8 @@
 // The miniature checkpoint of ink2_mini_ckpt.h against the loader: write the directory, plan it for every rank of 1,
 // 4 and 6, and compare tensors of the planned image with the in-memory model (the expert records with the packers of
-// the reference, head / intermediate slices of trunk and drafter matrices, replicated tensors). Host only.
+// the reference, head / intermediate slices of trunk and drafter matrices, replicated tensors). Then the same with
+// the vision tower: every model.visual.* tensor is in every rank's image under V., whole, and the trunk is unchanged.
+// Host only.
 //
 //   g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off engine/tests/test_ink2_mini_ckpt.cpp engine/loader/g6pack.cpp
 //       engine/loader-rs/target/release/libg6load.a -lpthread -ldl -lm -o /tmp/test_ink2_mini_ckpt
@@ -56,12 +58,13 @@ static std::vector<uint8_t> cut(const std::vector<float>& m, size_t cols, size_t
     return bf16_bytes(v);
 }
 
-int main()
+// The checkpoint with or without the vision tower, planned for every rank of 1, 4 and 6. Returns the images checked.
+static int run(bool with_vision)
 {
     Mini mm;
-    build_mini(mm);
+    build_mini(mm, with_vision);
     char dir[] = "/tmp/ink2-mini-ckpt.XXXXXX";
-    if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+    if (!mkdtemp(dir)) { perror("mkdtemp"); exit(1); }
     const std::string d = dir;
     write_ckpt(mm, d);
     const Weights& w = mm.w;
@@ -78,13 +81,13 @@ int main()
             if (!im.plan)
             {
                 fprintf(stderr, "FAIL %s: plan: %s\n", im.tag.c_str(), err);
-                return 1;
+                exit(1);
             }
             std::string e;
             if (!im.pack.open_manifest(man, e))
             {
                 fprintf(stderr, "FAIL %s: manifest: %s\n", im.tag.c_str(), e.c_str());
-                return 1;
+                exit(1);
             }
             // the rank's query heads and the KV heads they read
             const size_t nh_q = NH / T, q0 = static_cast<size_t>(r) * nh_q, gqa = NH / NKV, kv0 = q0 / gqa, nh_kv = (q0 + nh_q - 1) / gqa + 1 - kv0;
@@ -171,17 +174,42 @@ int main()
                 im.same(P + "mlp.up_proj.weight", cut(l.up, H, i0, is, 0, H));
                 im.same(P + "mlp.down_proj.weight", cut(l.down, MI, 0, H, i0, is));
             }
+            // the vision tower: every tensor whole on every rank, and none without the tower
+            const std::vector<StItem> vis = vision_items(mm);
+            check(vis.size() == (with_vision ? static_cast<size_t>(8 + 18 * VL) : 0), im.tag + ": vision tensor count");
+            for (const StItem& t : vis)
+            {
+                const std::string name = "V." + t.name.substr(strlen("model.visual."));
+                im.same(name, t.bytes);
+                const g6::Entry* en = im.pack.find(name);
+                check(en && en->dtype == g6::DType::BF16 && en->shape.size() == t.shape.size(), im.tag + ": " + name + " dtype or rank");
+            }
+            check((im.pack.find("V.proj_out.weight") != nullptr) == with_vision, im.tag + ": V.proj_out.weight presence");
             g6l_plan_free(im.plan);
             unlink(man.c_str());
             ++images;
         }
     for (const char* f : {"config.json", "hf_quant_config.json", "model.safetensors", "mtp.safetensors"}) unlink((d + "/" + f).c_str());
     rmdir(dir);
+    return images;
+}
+
+int main()
+{
+    // the tower does not change a trunk or drafter draw
+    {
+        Mini a, b;
+        build_mini(a);
+        build_mini(b, true);
+        check(a.w.embed == b.w.embed && a.w.layers[NL - 1].wo == b.w.layers[NL - 1].wo && a.w.mtp.hidden_out_b == b.w.mtp.hidden_out_b, "trunk draws with vision");
+        check(a.w.vis.layers.empty() && a.c.image_token_id == -1 && b.c.image_token_id == IMG && b.w.vis.layers.size() == VL, "vision config");
+    }
+    const int plain = run(false), vision = run(true);
     if (fails)
     {
         fprintf(stderr, "test_ink2_mini_ckpt: %d FAILED\n", fails);
         return 1;
     }
-    printf("test_ink2_mini_ckpt: ok (%d rank images of 1, 4 and 6 ranks)\n", images);
+    printf("test_ink2_mini_ckpt: ok (%d rank images of 1, 4 and 6 ranks, and %d with the vision tower)\n", plain, vision);
     return 0;
 }

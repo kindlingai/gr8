@@ -481,10 +481,11 @@ g++ -std=c++17 -O2 "$REPO/engine/runtime/tests/flash_dsa_full_schedule_test.cpp"
 "$T/flash_dsa_full_schedule_test"
 g++ -std=c++17 -O2 "$REPO/engine/tests/test_flash_pool_owner.cpp" -o "$T/test_flash_pool_owner" "${KNOBS[@]}"
 "$T/test_flash_pool_owner"
-# the Inkling-2-Small CPU reference: state across chunks, speculative rollback, the image token, the rank split
+# the Inkling-2-Small CPU reference: state across chunks, speculative rollback, the image token, the rank split, the vision tower
 g++ -std=c++17 -O2 -Wall -Wextra -ffp-contract=off "$REPO/engine/tests/test_ink2_cpu_ref.cpp" -o "$T/test_ink2_cpu_ref"
 "$T/test_ink2_cpu_ref"
-# the miniature Inkling-2-Small checkpoint of the GPU tests (trunk + MTP drafter) against the loader's plans of 1, 4, 6 ranks
+# the miniature Inkling-2-Small checkpoint of the GPU tests (trunk + MTP drafter, with and without the vision tower) against the
+# loader's plans of 1, 4, 6 ranks
 GL=$REPO/engine/loader-rs/target/release/libg6load.a
 if command -v cargo > /dev/null 2>&1; then
   cargo build --release --quiet --manifest-path "$REPO/engine/loader-rs/Cargo.toml"
