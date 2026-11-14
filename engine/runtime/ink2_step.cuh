@@ -796,6 +796,7 @@ public:
             step_begin(sz);
         }
         const bool chunk = one_run(rh);   // a prefill chunk: the speed paths that depend on M are for these rows only
+        const bool tc = use_tc && chunk && M >= 16;
         const BlasScope blas_scope(use_blas && chunk && M >= 32 ? blas : nullptr);
         ink2::embed_norm(toks, embed, embed_norm, vis_rows, c.image_token, h, M, c.H, 0);
         for (size_t j = 0; j < L.size(); ++j)
@@ -827,7 +828,7 @@ public:
             {
                 RankPart& x = s.rk[i];
                 ink2::attn_forward(x.g, x.aw, x.as, x.wk, rw, rh.max_pos, qi, s.glob ? ki : qi, s.glob ? vi : qi, M, T == 1 ? s.att : nullptr,
-                                   parts + static_cast<size_t>(o.rank0 + i) * n, 0);
+                                   parts + static_cast<size_t>(o.rank0 + i) * n, 0, tc);
             }
             if (T > 1)
             {
