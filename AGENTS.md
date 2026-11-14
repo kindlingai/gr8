@@ -29,7 +29,9 @@ newest `main` commit that passes the nightly gate (wrong results anywhere or a s
 needed, and after two failed nights only fixes for the failure or reverts merge). After `v1.0`, numbered
 `vMAJOR.MINOR.PATCH` releases are immutable annotated tags cut only from `stable` after the full harness gate (`PATCH`
 for compatible fixes, `MINOR` for compatible features and validated default speedups, `MAJOR` for breaking changes),
-and every GitHub Release lists its `Breaking changes` (`None.` when compatible) plus any default or cache-key changes.
+and every release updates its GitHub Release, [`CHANGELOG.md`](CHANGELOG.md), [`releases/<tag>.json`](releases/README.md),
+and [`README.md#building-on-gr8`](README.md#building-on-gr8) with `Breaking changes` (`None.` when compatible) plus any
+default or cache-key changes.
 Deployable tuned recipes live in standalone repositories, pin an immutable `v*` tag or an exact merged `main`/`stable`
 commit SHA by submodule or `ghcr.io/kindlingai/gr8` `@sha256:<digest>` (never a moving branch or floating tag such as
 `:latest`, `:main`, or `:stable`), and record their engine pin in `kindling.json` for the `README.md` freshness
@@ -53,9 +55,11 @@ Update the matching items in the same PR as a change (or during each `v*` releas
       and [`docs/cards/make.sh`](docs/cards/make.sh) from [`recipes.json`](recipes.json) for `gr8`'s README cards, plus
       [`docs/cards/switch_card.py`](docs/cards/switch_card.py) from `docs/cards/switching.json` when model-switching
       times change).
-- [ ] **Release notes on every release:** Publish a GitHub Release for every `v*` tag with highlights and measured
-      numbers, `Breaking changes`, default or cache-key changes, image digest, and toolchain/Dockerfile sync notes
-      ([RELEASING.md](RELEASING.md#required-github-release-sections)).
+- [ ] **Release notes, changelog, and version spec on every release:** For every `v*` tag, publish the GitHub Release
+      and update [`CHANGELOG.md`](CHANGELOG.md), [`releases/<tag>.json`](releases/README.md), and
+      [`README.md#building-on-gr8`](README.md#building-on-gr8) with highlights and measured numbers, `Breaking changes`,
+      default or cache-key changes, verified commit SHA and image digest, and toolchain/Dockerfile sync notes
+      ([RELEASING.md](RELEASING.md#required-github-release-sections-and-in-repo-release-records)).
 - [ ] **Recipe table links and dates:** Keep [`recipes.json`](recipes.json) and the
       [README.md](README.md#all-recipes) recipe section current — repository links, measurement dates, and each recipe's
       pinned engine freshness against the newest release and `stable`.

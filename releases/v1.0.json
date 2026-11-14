@@ -1,0 +1,370 @@
+{
+  "schema_version": 1,
+  "version": "1.0",
+  "tag": "v1.0",
+  "previous_tag": null,
+  "date": "2026-11-12",
+  "commit": "db6f2c17c7b05303b69ce667e416d10340aeb9b7",
+  "release_url": "https://github.com/kindlingai/gr8/releases/tag/v1.0",
+  "validation_gate": "Multi-boot ABBA hardware and quality gates across GLM-5.3 (TP=4), GLM-5.3-Flash (TP=2), and DeepSeek-V4.1-Flash (TP=4) on GB10 clusters, plus full CPU test and CI image/zip pipeline.",
+  "container": {
+    "image": "ghcr.io/kindlingai/gr8:v1.0",
+    "digest": "sha256:11ff2823184b0512ae62e0f1c281c46941cfb0fd81096e1dac4c313ad3fe9413",
+    "pinned": "ghcr.io/kindlingai/gr8:v1.0@sha256:11ff2823184b0512ae62e0f1c281c46941cfb0fd81096e1dac4c313ad3fe9413",
+    "platforms": [
+      "linux/arm64"
+    ],
+    "target_arch": "sm_121a"
+  },
+  "toolchain": {
+    "cuda": "13.0.1",
+    "base_os": "ubuntu24.04",
+    "rust": "1.94.1",
+    "runtime_apt": [
+      "libibverbs1",
+      "ibverbs-providers",
+      "ibverbs-utils",
+      "python3",
+      "python3-yaml",
+      "curl",
+      "jq"
+    ]
+  },
+  "binaries": [
+    "bin/g6m4",
+    "bin/g6m4-int4",
+    "bin/g6m4_flash",
+    "bin/g6m4_flash-int4",
+    "bin/g6m4_ds41",
+    "bin/m4sim",
+    "bin/m4sim_flash",
+    "bin/m4sim_ds41",
+    "bin/g6front-rs",
+    "bin/g6load",
+    "bin/kvman-remote",
+    "bin/gpuprobe",
+    "bin/tr3_e4m3_test",
+    "bin/lib/libgr8knobs.so"
+  ],
+  "api": {
+    "protocol": "openai",
+    "http_port": 8100,
+    "control_port": 7340,
+    "s2_port": 7341,
+    "endpoints": [
+      "POST /v1/chat/completions",
+      "POST /v1/completions",
+      "POST /tokenize",
+      "POST /detokenize",
+      "GET /v1/models",
+      "GET /health",
+      "GET /health?deep",
+      "GET /metrics"
+    ]
+  },
+  "models": [
+    {
+      "id": "glm53",
+      "title": "GLM-5.3",
+      "architecture": "GlmMoeDsaForCausalLM",
+      "served_names": [
+        "glm-5.3",
+        "glm53"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4",
+      "drafter": "https://huggingface.co/incoai/GLM-5.3-DFlash2",
+      "engine_binaries": [
+        "bin/g6m4",
+        "bin/g6m4-int4"
+      ],
+      "tp_supported": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "variants": [
+        "home",
+        "down1",
+        "up1",
+        "bit225",
+        "bit243",
+        "bit260",
+        "bit325",
+        "bit338"
+      ],
+      "default_variant_by_tp": {
+        "3": "bit225",
+        "4": "home",
+        "5": "home",
+        "6": "home"
+      },
+      "int4_kv": true,
+      "defaults_by_tp": {
+        "3": {
+          "kv_format": "fp8",
+          "cap": 307136,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 0,
+          "share_limit": 32768
+        },
+        "4": {
+          "kv_format": "int4",
+          "cap": 513536,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 1,
+          "share_limit": 32768
+        },
+        "5": {
+          "kv_format": "fp8",
+          "cap": 502848,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 0,
+          "share_limit": 32768
+        },
+        "6": {
+          "kv_format": "fp8",
+          "cap": 614400,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 0,
+          "share_limit": 131072
+        }
+      }
+    },
+    {
+      "id": "glm53f",
+      "title": "GLM-5.3-Flash",
+      "architecture": "Glm5NextForConditionalGeneration",
+      "served_names": [
+        "glm-5.3-flash",
+        "glm53f"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4",
+      "drafter": "https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2",
+      "engine_binaries": [
+        "bin/g6m4_flash",
+        "bin/g6m4_flash-int4"
+      ],
+      "tp_supported": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "variants": [
+        "k2",
+        "k3",
+        "k4"
+      ],
+      "default_variant_by_tp": {
+        "1": "k2",
+        "2": "k4",
+        "3": "k4",
+        "4": "k4"
+      },
+      "int4_kv": true,
+      "defaults_by_tp": {
+        "1": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 1,
+          "mtp": 1,
+          "dflash": 1,
+          "share_limit": 32768
+        },
+        "2": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 1,
+          "mtp": 1,
+          "dflash": 1,
+          "share_limit": 32768,
+          "int4_override_defaults": {
+            "sess": 4,
+            "mtp": 3,
+            "s2_shared_waterfill": 1,
+            "s2_shared_wf_margin": 0.02
+          }
+        },
+        "3": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 4,
+          "mtp": 1,
+          "dflash": 0,
+          "share_limit": 32768
+        },
+        "4": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 8,
+          "mtp": 1,
+          "dflash": 1,
+          "share_limit": 32768
+        }
+      }
+    },
+    {
+      "id": "ds41",
+      "title": "DeepSeek-V4.1-Flash",
+      "architecture": "DeepseekV41ForCausalLM",
+      "served_names": [
+        "deepseek-v4.1-flash"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native",
+      "drafter": null,
+      "engine_binaries": [
+        "bin/g6m4_ds41"
+      ],
+      "tp_supported": [
+        4
+      ],
+      "variants": [],
+      "default_variant_by_tp": {},
+      "int4_kv": false,
+      "defaults_by_tp": {
+        "4": {
+          "kv_format": "fp8",
+          "cap": 262144,
+          "sess": 5,
+          "mtp": 0,
+          "dflash": 0,
+          "share_limit": 32768,
+          "exact": 0,
+          "ds_pf_v2": 1,
+          "ds_prefill_w": 12288,
+          "default_max_tokens": 32768,
+          "default_reasoning_effort": "low"
+        }
+      }
+    }
+  ],
+  "breaking": false,
+  "breaking_changes": [],
+  "default_or_cache_changes": [
+    {
+      "scope": "ds41 TP=4 prefill",
+      "change": "Enables 12,288-row wide v2 prefill (GR8_DS_PF_V2=1, GR8_DS_PF_V2_W16K=1, GR8_DS_PREFILL_W=12288), layer-20 tail hoist (GR8_DS_PF_V2_L20_TAIL=1), and compact send + FFN unpack (GR8_DS_PF_V2_SEND_FFN_OPT=3) by default.",
+      "numerical_note": "Cold 240-position teacher-forced mean_kl = 0.002218 (99.17% top-1 agreement) vs prior 8,192-row path.",
+      "rollback": "--exact 1 (or EXACT=1)"
+    },
+    {
+      "scope": "glm53 TP=4 KV format and INT4 attention",
+      "change": "Defaults ./gr8 glm53 up at TP=4 to KV_FORMAT=int4 (bin/g6m4-int4, CAP=513536) with bit-exact INT4 fast paths (GR8_KV4_SC=4, GR8_KV4_SC_TR=2, GR8_KV4_QT=1, GR8_KV4_CTX=2, GR8_KV4_FUSE_ROT=1), folded Hadamard weights (GR8_KV4_FOLD=1), BF16 wmma tensor-core INT4 decode (GR8_KV4_TC=1), and single-chain CP combine (GR8_CP_ONECHAIN=1).",
+      "numerical_note": "KL(fp8 || int4) mean = 0.01450 (97.0% top-1 agreement); folded/TC vs bit-exact INT4 mean_kl = 0.015803 under live adaptive serving.",
+      "rollback": "--kv-format fp8 (restores bin/g6m4 at CAP=485376), or --kv4-tc 0 --kv4-fold 0 --cp-onechain 0 for bit-exact KV_FORMAT=int4 (KL = 0.0)"
+    },
+    {
+      "scope": "glm53f TP=2 KV_FORMAT=int4 multi-session scheduling",
+      "change": "Defaults ./gr8 glm53f --tp 2 --kv-format int4 to SESS=4, MTP=3, GR8_S2_SHARED_WATERFILL=1, and GR8_S2_SHARED_WF_MARGIN=0.02.",
+      "numerical_note": "Bit-identical solo greedy output (mean_kl = 0.0).",
+      "rollback": "--s2-shared-waterfill 0 (restores MTP=1 when --mtp is unset) or --sess 1"
+    }
+  ],
+  "toolchain_changes": [],
+  "operational_notes": [
+    "Initial v1.0 baseline release for multi-node GB10 clusters (CUDA 13.0.1, Ubuntu 24.04, Rust 1.94.1)."
+  ],
+  "prs": [
+    {
+      "number": 483,
+      "commit": "41b2d070",
+      "summary": "README: add four-box GLM-5.3 benchmark card"
+    },
+    {
+      "number": 486,
+      "commit": "d7dd706e",
+      "summary": "ds41: enable 12288-row v2 prefill, layer-20 tail hoist, and direct publish by default"
+    },
+    {
+      "number": 487,
+      "commit": "49e23dcc",
+      "summary": "glm53: add bit-exact INT4 decode attention fast paths and enable at TP=4"
+    },
+    {
+      "number": 488,
+      "commit": "c2220f2e",
+      "summary": "glm53: enable folded Hadamard weights, tensor-core INT4 decode, and CP_ONECHAIN at TP=4"
+    },
+    {
+      "number": 490,
+      "commit": "a555ee2a",
+      "summary": "Enable TP=2 INT4 Flash shared waterfill and default GLM-5.3 TP=4 to KV_FORMAT=int4"
+    },
+    {
+      "number": 491,
+      "commit": "db6f2c17",
+      "summary": "README: update model cards and TP=4 results with v1.0 numbers and per-chat KV limits"
+    }
+  ],
+  "benchmarks": [
+    {
+      "model": "glm53",
+      "tp": 4,
+      "config": "KV_FORMAT=int4, SESS=8, CAP=513536",
+      "decode_tps": {
+        "code": 63.3,
+        "prose": 37.8,
+        "structured": 78.0,
+        "counting": 81.5
+      },
+      "cold_prefill_tps": {
+        "32768": 1540,
+        "131072": 1361
+      },
+      "concurrent_aggregate_tps": {
+        "1": 47.7,
+        "2": 59.8,
+        "4": 69.5,
+        "8": 85.8
+      },
+      "max_model_len": 513522
+    },
+    {
+      "model": "glm53f",
+      "tp": 2,
+      "config": "recipe TUNE=speed, SESS=4, MTP=3, CAP=2097152",
+      "decode_tps": {
+        "code": 76.5,
+        "prose": 41.8,
+        "structured": 93.1
+      },
+      "cold_prefill_tps": {
+        "8192": 1670,
+        "32768": 1729,
+        "131072": 1595
+      },
+      "concurrent_aggregate_tps": {
+        "1": 55.1,
+        "2": 70.3,
+        "4": 82.9
+      },
+      "max_model_len": 262144
+    },
+    {
+      "model": "ds41",
+      "tp": 4,
+      "config": "recipe TUNE=speed, SESS=32, 32x327680 slabs",
+      "decode_tps": {
+        "code": 137.5,
+        "prose": 83.9,
+        "structured": 157.5
+      },
+      "cold_prefill_tps": {
+        "32768": 7720,
+        "131072": 8408,
+        "262144": 8344
+      },
+      "concurrent_aggregate_tps": {
+        "8": 202.9,
+        "16": 238.7,
+        "32": 233.3
+      },
+      "max_model_len": 327670
+    }
+  ]
+}

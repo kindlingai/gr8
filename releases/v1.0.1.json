@@ -1,0 +1,317 @@
+{
+  "schema_version": 1,
+  "version": "1.0.1",
+  "tag": "v1.0.1",
+  "previous_tag": "v1.0",
+  "date": "2026-11-12",
+  "commit": "6333c78a4ab4cfedc706793d689f54858c576d84",
+  "release_url": "https://github.com/kindlingai/gr8/releases/tag/v1.0.1",
+  "validation_gate": "Full CPU test suite plus live 4x GB10 (TP=4) GLM-5.3 SSD session-store gate covering stock and steered chats (stable branch and multi-model throughput re-sweep waived because zero CUDA kernels, model defaults, or HTTP protocol paths changed since v1.0).",
+  "container": {
+    "image": "ghcr.io/kindlingai/gr8:v1.0.1",
+    "digest": "sha256:02e44b9fc971f2acffe117df50de1be829462453287aab2c1d61a31a55738c0b",
+    "pinned": "ghcr.io/kindlingai/gr8:v1.0.1@sha256:02e44b9fc971f2acffe117df50de1be829462453287aab2c1d61a31a55738c0b",
+    "platforms": [
+      "linux/arm64"
+    ],
+    "target_arch": "sm_121a"
+  },
+  "toolchain": {
+    "cuda": "13.0.1",
+    "base_os": "ubuntu24.04",
+    "rust": "1.94.1",
+    "runtime_apt": [
+      "libibverbs1",
+      "ibverbs-providers",
+      "ibverbs-utils",
+      "python3",
+      "python3-yaml",
+      "curl",
+      "jq"
+    ]
+  },
+  "binaries": [
+    "bin/g6m4",
+    "bin/g6m4-int4",
+    "bin/g6m4_flash",
+    "bin/g6m4_flash-int4",
+    "bin/g6m4_ds41",
+    "bin/m4sim",
+    "bin/m4sim_flash",
+    "bin/m4sim_ds41",
+    "bin/g6front-rs",
+    "bin/g6load",
+    "bin/kvman-remote",
+    "bin/gpuprobe",
+    "bin/tr3_e4m3_test",
+    "bin/lib/libgr8knobs.so"
+  ],
+  "api": {
+    "protocol": "openai",
+    "http_port": 8100,
+    "control_port": 7340,
+    "s2_port": 7341,
+    "endpoints": [
+      "POST /v1/chat/completions",
+      "POST /v1/completions",
+      "POST /tokenize",
+      "POST /detokenize",
+      "GET /v1/models",
+      "GET /health",
+      "GET /health?deep",
+      "GET /metrics"
+    ]
+  },
+  "models": [
+    {
+      "id": "glm53",
+      "title": "GLM-5.3",
+      "architecture": "GlmMoeDsaForCausalLM",
+      "served_names": [
+        "glm-5.3",
+        "glm53"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4",
+      "drafter": "https://huggingface.co/incoai/GLM-5.3-DFlash2",
+      "engine_binaries": [
+        "bin/g6m4",
+        "bin/g6m4-int4"
+      ],
+      "tp_supported": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "variants": [
+        "home",
+        "down1",
+        "up1",
+        "bit225",
+        "bit243",
+        "bit260",
+        "bit325",
+        "bit338"
+      ],
+      "default_variant_by_tp": {
+        "3": "bit225",
+        "4": "home",
+        "5": "home",
+        "6": "home"
+      },
+      "int4_kv": true,
+      "defaults_by_tp": {
+        "3": {
+          "kv_format": "fp8",
+          "cap": 307136,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 0,
+          "share_limit": 32768
+        },
+        "4": {
+          "kv_format": "int4",
+          "cap": 513536,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 1,
+          "share_limit": 32768
+        },
+        "5": {
+          "kv_format": "fp8",
+          "cap": 502848,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 0,
+          "share_limit": 32768
+        },
+        "6": {
+          "kv_format": "fp8",
+          "cap": 614400,
+          "sess": 8,
+          "mtp": 2,
+          "dflash": 0,
+          "share_limit": 131072
+        }
+      }
+    },
+    {
+      "id": "glm53f",
+      "title": "GLM-5.3-Flash",
+      "architecture": "Glm5NextForConditionalGeneration",
+      "served_names": [
+        "glm-5.3-flash",
+        "glm53f"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4",
+      "drafter": "https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2",
+      "engine_binaries": [
+        "bin/g6m4_flash",
+        "bin/g6m4_flash-int4"
+      ],
+      "tp_supported": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "variants": [
+        "k2",
+        "k3",
+        "k4"
+      ],
+      "default_variant_by_tp": {
+        "1": "k2",
+        "2": "k4",
+        "3": "k4",
+        "4": "k4"
+      },
+      "int4_kv": true,
+      "defaults_by_tp": {
+        "1": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 1,
+          "mtp": 1,
+          "dflash": 1,
+          "share_limit": 32768
+        },
+        "2": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 1,
+          "mtp": 1,
+          "dflash": 1,
+          "share_limit": 32768,
+          "int4_override_defaults": {
+            "sess": 4,
+            "mtp": 3,
+            "s2_shared_waterfill": 1,
+            "s2_shared_wf_margin": 0.02
+          }
+        },
+        "3": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 4,
+          "mtp": 1,
+          "dflash": 0,
+          "share_limit": 32768
+        },
+        "4": {
+          "kv_format": "fp8",
+          "cap": 262208,
+          "sess": 8,
+          "mtp": 1,
+          "dflash": 1,
+          "share_limit": 32768
+        }
+      }
+    },
+    {
+      "id": "ds41",
+      "title": "DeepSeek-V4.1-Flash",
+      "architecture": "DeepseekV41ForCausalLM",
+      "served_names": [
+        "deepseek-v4.1-flash"
+      ],
+      "checkpoint": "https://huggingface.co/kindlingai/deepseek-v4.1-flash-exlr8-native",
+      "drafter": null,
+      "engine_binaries": [
+        "bin/g6m4_ds41"
+      ],
+      "tp_supported": [
+        4
+      ],
+      "variants": [],
+      "default_variant_by_tp": {},
+      "int4_kv": false,
+      "defaults_by_tp": {
+        "4": {
+          "kv_format": "fp8",
+          "cap": 262144,
+          "sess": 5,
+          "mtp": 0,
+          "dflash": 0,
+          "share_limit": 32768,
+          "exact": 0,
+          "ds_pf_v2": 1,
+          "ds_prefill_w": 12288,
+          "default_max_tokens": 32768,
+          "default_reasoning_effort": "low"
+        }
+      }
+    }
+  ],
+  "breaking": false,
+  "breaking_changes": [],
+  "default_or_cache_changes": [],
+  "toolchain_changes": [],
+  "operational_notes": [
+    "Linux KV_STORE=ssd:PATH,size=N preallocates the full size= capacity via fallocate at startup (#484); lower size= if startup reports ENOSPC.",
+    "In-tree GLM-5.3 recipe folders moved to standalone kindlingai/glm-5.3-exlr8-{4x,5x,6x}-spark repositories (#494).",
+    "Persistent KV_STORE session index resets once on binary upgrade as usual while keeping the preallocated block file in place."
+  ],
+  "prs": [
+    {
+      "number": 492,
+      "commit": "d73426fd",
+      "summary": "docs: add RELEASING.md and release rules in AGENTS.md"
+    },
+    {
+      "number": 493,
+      "commit": "434ae699",
+      "summary": "loader-rs: create missing QO_CACHE directories in qo_cache_write and log write errors"
+    },
+    {
+      "number": 494,
+      "commit": "dded3a76",
+      "summary": "Move the GLM-5.3 recipes to their own repositories; gr8 holds the engine only"
+    },
+    {
+      "number": 495,
+      "commit": "bb678aff",
+      "summary": "docs: add Building on gr8 section and keep-current checklist"
+    },
+    {
+      "number": 496,
+      "commit": "b727afea",
+      "summary": "README: drop K3 label from the 6-box GLM-5.3 recipe row"
+    },
+    {
+      "number": 497,
+      "commit": "53e265ad",
+      "summary": "README: drop T5X label from the 5-box GLM-5.3 recipe row"
+    },
+    {
+      "number": 484,
+      "commit": "f56657b9",
+      "summary": "kv store: keep=sessions writes only new page blocks; preallocate the SSD reserve"
+    },
+    {
+      "number": 498,
+      "commit": "6333c78a",
+      "summary": "kv store: persist and delta-extend steered sessions across restarts"
+    }
+  ],
+  "benchmarks": [
+    {
+      "model": "glm53",
+      "tp": 4,
+      "config": "KV_FORMAT=int4, KV_STORE=ssd:...,size=16G,persist=on,keep=sessions (19K-token chat across restart)",
+      "ssd_resume": {
+        "plain_cold_ttft_s": 12.75,
+        "plain_warm_ttft_s": 3.04,
+        "plain_speedup_x": 4.2,
+        "steered_cold_ttft_s": 12.99,
+        "steered_warm_ttft_s": 2.99,
+        "steered_speedup_x": 4.3,
+        "restored_tokens": 16384,
+        "restore_ms": 56,
+        "delta_extension_write_amp_x": 1.0,
+        "mid_chat_ssd_bytes_written": 0,
+        "warm_vs_cold_byte_identical": true
+      }
+    }
+  ]
+}
