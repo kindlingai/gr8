@@ -1176,6 +1176,11 @@ class Supervisor:
         # smaller of it and the pool's room (pool_rows / capacity_slots - guard), and the front end reads the result from
         # the shim's hello, so the two never disagree
         argv += ['--max-model-len', str(self.o.get('MAX_MODEL_LEN') or meta['max_positions'])]
+        # one request's rows: the engine's --cap, which GR8_CAP_TOTAL may make smaller than the shared pool (the engine
+        # fails its epoch on a longer request, so the shim must refuse it first)
+        cap = self.o.get('CAP')
+        if cap and not model.per_slot_pool:
+            argv += ['--cap-rows', str(int(cap) // 64 * 64)]
         self.spawn('shim', self.pin() + argv, REPO, env={**os.environ, 'PYTHONPATH': os.path.join(REPO, 'frontend')})
         for _ in range(150):
             if os.path.exists(sock):
