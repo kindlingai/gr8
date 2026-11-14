@@ -611,6 +611,9 @@ struct TierSpec {
 // A page keeps K apart from V, so the rows of an unfinished page are not a prefix of its bytes: allow_partial_pages is
 // off, and the engine copies the unfinished page of each full-attention layer into that layer's staging page before a
 // capture and back after a restore.
+// The MTP drafter (mtp > 0): its layers keep the context K / V of the committed rows in the same shapes (a page plane
+// and a staging page for a full-attention layer, a ring of mtp_window tokens for a sliding-window one; no short
+// convolutions, so no histories), and a slot keeps the trunk taps of its last committed row, [ntaps][H] BF16.
 struct Ink2KvLayer {
     bool global = false;
     uint8_t* pages = nullptr;     // global: [slots][max_pages_per_slot][2][64][nk]
@@ -620,7 +623,9 @@ struct Ink2KvLayer {
     uint8_t *hist_a = nullptr, *hist_m = nullptr;   // [slots][3][H]
 };
 inline KvStateDesc ink2_kv_state(const std::vector<Ink2KvLayer>& layers, uint32_t slots, uint32_t max_pages_per_slot,
-                                 uint32_t nk, uint32_t hidden, uint32_t window, uint32_t max_nk = 0) {
+                                 uint32_t nk, uint32_t hidden, uint32_t window, uint32_t max_nk = 0,
+                                 const std::vector<Ink2KvLayer>& mtp = {}, uint32_t mtp_window = 0,
+                                 uint8_t* last_taps = nullptr, uint32_t ntaps = 0) {
     KvStateDesc d;
     d.model_tag = "ink2";
     d.max_slots = slots;
@@ -643,14 +648,30 @@ inline KvStateDesc ink2_kv_state(const std::vector<Ink2KvLayer>& layers, uint32_
         d.tail_extents.push_back(KvTailExtent{y.hist_a, uint64_t(3) * hidden * cell, uint64_t(3) * hidden * cell});
         d.tail_extents.push_back(KvTailExtent{y.hist_m, uint64_t(3) * hidden * cell, uint64_t(3) * hidden * cell});
     }
+    size_t m_glob = 0, m_loc = 0;
+    for (const auto& y : mtp) {
+        if (y.global) {
+            ++m_glob;
+            d.page_planes.push_back(KvPagePlane{y.pages, uint64_t(max_pages_per_slot) * page, KV_STATE_PAGE_TOKENS, uint32_t(2 * nk * cell), 1});
+            d.tail_extents.push_back(KvTailExtent{y.staging, page, page});
+        } else {
+            ++m_loc;
+            const uint64_t ring = uint64_t(2) * mtp_window * nk * cell;
+            d.tail_extents.push_back(KvTailExtent{y.ring, ring, ring});
+        }
+    }
+    const uint64_t taps = uint64_t(ntaps) * hidden * cell;
+    if (!mtp.empty()) d.tail_extents.push_back(KvTailExtent{last_taps, taps, taps});
     if (max_nk > nk) {
         const size_t max_page = size_t(2) * KV_STATE_PAGE_TOKENS * max_nk * cell;
-        const size_t max_pb = n_glob * max_page;
+        const size_t max_pb = (n_glob + m_glob) * max_page;
         const size_t max_raw = max_pb ? max_pb : size_t(4096);
         const size_t max_slot = (max_raw + 4095u) / 4096u * 4096u;
         const size_t max_cap = max_slot - sizeof(KvStateHeader32);
         const size_t max_tail = n_glob * max_page + n_loc * (size_t(2) * window * max_nk * cell) +
-                                layers.size() * (size_t(6) * max_nk * cell + size_t(6) * hidden * cell);
+                                layers.size() * (size_t(6) * max_nk * cell + size_t(6) * hidden * cell) +
+                                m_glob * max_page + m_loc * (size_t(2) * mtp_window * max_nk * cell) +
+                                (mtp.empty() ? size_t(0) : size_t(taps));
         d.min_block_bytes = max_raw;
         d.min_state_blocks = max_tail ? uint32_t((max_tail + max_cap - 1) / max_cap) : 0u;
     }

@@ -114,6 +114,14 @@ class Ink2EngineArgsTests(unittest.TestCase):
         self.assertEqual(args[args.index('--s2-sessions') + 1], '8')
         self.assertEqual(args[args.index('--chunk') + 1], '4')
 
+    def test_the_drafts_of_a_round(self):
+        for mtp in ('0', '3', '7'):
+            with self.subTest(mtp=mtp):
+                r = self.shell(V2_DENSE='/ckpt', MTP=mtp)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                args = r.stdout.splitlines()[-1].split()
+                self.assertEqual(args[args.index('--mtp') + 1], mtp)
+
     def test_reuse_and_kv_store(self):
         r = self.shell(V2_DENSE='/ckpt', REUSE='1', KV_STORE='ssd:/kv1,size=8G;ssd:/kv2,size=16G',
                        KV_KEEP='all', KV_SYSTEM_AFTER='3', KV_WRITE_LIMIT='2.5')
@@ -127,7 +135,7 @@ class Ink2EngineArgsTests(unittest.TestCase):
         self.assertEqual(args[args.index('--kv-write-limit') + 1], '2.5')
 
     def test_what_it_refuses(self):
-        for env, text in (({'TP': '3'}, 'wants 6 or 4'), ({'MTP': '1'}, 'serves with MTP=0'), ({'SESS': '9'}, '1 to 8 sessions'),
+        for env, text in (({'TP': '3'}, 'wants 6 or 4'), ({'MTP': '8'}, 'drafts 0 to 7 tokens'), ({'SESS': '9'}, '1 to 8 sessions'),
                           ({'DFLASH': '1'}, 'has no DFLASH'), ({'CHUNK': '9'}, '1 to 8 prompt rows')):
             with self.subTest(env=env):
                 r = self.shell(**env)

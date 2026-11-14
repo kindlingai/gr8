@@ -631,8 +631,8 @@ impl Planner<'_> {
         Ok(())
     }
 
-    /// The tensors of mtp.safetensors under `MTP.`: head and intermediate slices like the trunk's, the Markov
-    /// vocabulary matrix split like the lm_head, the rest replicated.
+    /// The tensors of mtp.safetensors under `MTP.`: head and intermediate slices like the trunk's, the rest (the
+    /// Markov token embedding too) replicated.
     fn mtp(&mut self) -> Result<(), String> {
         if !self.ck.t.keys().any(|k| k.starts_with("mtp.")) {
             return Ok(());
@@ -642,8 +642,8 @@ impl Planner<'_> {
                   "markov_head.rnn_proj.bias", "markov_head.hidden_out.weight", "markov_head.hidden_out.bias"] {
             self.whole(format!("MTP.{n}"), &format!("mtp.{n}"), None, None)?;
         }
-        let valid = self.v.start.min(c.vocab)..self.v.end.min(c.vocab);
-        self.mat("MTP.markov_head.markov_w1", "mtp.markov_head.markov_w1.weight", c.vocab, Some(valid), None, Some(self.v.len()), false)?;
+        // an input embedding: every rank looks up the row of any previous token, so it is replicated like G.embed
+        self.whole("MTP.markov_head.markov_w1".into(), "mtp.markov_head.markov_w1.weight", Some("bf16"), None)?;
         let (q, kv) = (self.q.clone(), self.kv.clone());
         let scaled = |r: &Range<usize>, m: usize| Some(r.start * m..r.end * m);
         let rows_of = |me: &Self, n: &str| me.ck.t.get(n).and_then(|s| s.shape.first().copied()).ok_or(format!("no tensor {n}"));

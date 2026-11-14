@@ -17,6 +17,7 @@
 #include "../kernels/nvfp4.cuh"
 #include "../kernels/ink2_moe.cuh"
 #include "../attn/ink2_attn.cuh"
+#include "../kernels/ink2_mtp.cuh"
 #include "../model_geom_ink2.h"
 #include "../loader/g6pack.h"
 #include "../loader-rs/g6load.h"
@@ -76,6 +77,12 @@ struct Cfg
     int H = 0, heads = 0, kv_heads = 0, hd = 0, rel_dim = 0, rel_win = 0, NE = 0, TK = 0, I = 0, vocab = 0, valid = 0, n_layers = 0;
     int window = geom::WINDOW, log_base = geom::LOG_SCALE_BASE, block = geom::ATTN_RES_BLOCK, image_token = geom::TOK_IMAGE;
     float route_scale = geom::ROUTE_SCALE;
+    // the MTP drafter (mtp_config); mtp_layers 0 = the checkpoint has none
+    int mtp_layers = 0, mtp_inter = 0, mtp_window = 0, mtp_block = 8, mtp_drafts = 7, markov_rank = 0;
+    int mtp_H = 0, mtp_heads = 0, mtp_kv_heads = 0, mtp_hd = 0;
+    float mtp_theta = 1e6f;
+    std::vector<uint8_t> mtp_global;   // [mtp_layers] 1 = the layer reads the whole context
+    std::vector<int> mtp_targets;      // the taps: trunk layers whose input is read; n_layers = the final_norm output
 };
 
 inline std::string json_section(const std::string& text, const char* key)
@@ -103,14 +110,50 @@ inline std::string json_section(const std::string& text, const char* key)
     return text.substr(p);
 }
 
-// config.json of the checkpoint: its text_config when it has one, else the top level.
+// The integers of the list after "key" in text; empty when the key is absent or is not a list.
+inline std::vector<int> json_ints(const std::string& text, const char* key)
+{
+    std::vector<int> v;
+    const std::string k = std::string("\"") + key + "\"";
+    size_t p = text.find(k);
+    if (p == std::string::npos) return v;
+    p = text.find_first_not_of(" \t\r\n:", p + k.size());
+    if (p == std::string::npos || text[p] != '[') return v;
+    const size_t end = text.find(']', p);
+    if (end == std::string::npos) return v;
+    const char* s = text.c_str() + p + 1;
+    const char* stop = text.c_str() + end;
+    while (s < stop)
+    {
+        char* e = nullptr;
+        const long x = strtol(s, &e, 10);
+        if (e == s) ++s;
+        else
+        {
+            v.push_back(static_cast<int>(x));
+            s = e;
+        }
+    }
+    return v;
+}
+
+// config.json of the checkpoint: its text_config when it has one, else the top level. The drafter's mtp_config is
+// read apart, so a key of the same name in it never stands in for the trunk's.
 inline Cfg read_config(const std::string& dir)
 {
     std::ifstream f(dir + "/config.json");
     if (!f) die(dir + "/config.json: cannot open");
     std::stringstream ss;
     ss << f.rdbuf();
-    const std::string sc = json_section(ss.str(), "text_config");
+    std::string text = ss.str(), mtp;
+    if (text.find("\"mtp_config\"") != std::string::npos)
+    {
+        mtp = json_section(text, "mtp_config");
+        const size_t at = text.find(mtp, text.find("\"mtp_config\""));
+        if (mtp.empty() || mtp[0] != '{' || at == std::string::npos) die(dir + "/config.json: mtp_config is not an object");
+        text.replace(at, mtp.size(), "{}");
+    }
+    const std::string sc = json_section(text, "text_config");
     const auto opt_int = [&](const char* key, int def) {
         return static_cast<int>(json_num(sc, 0, key, def));
     };
@@ -137,6 +180,26 @@ inline Cfg read_config(const std::string& dir)
     c.valid = opt_int("unpadded_vocab_size", std::min(c.vocab, static_cast<int>(geom::VALID_VOCAB)));
     if (c.valid > c.vocab || c.valid < 1) c.valid = c.vocab;
     if (c.heads % c.kv_heads || c.H % 32 || c.hd % 16 || c.hd > ink2::ATTN_MAX_HD) die(dir + "/config.json: heads, hidden_size or head_dim");
+    if (!mtp.empty())
+    {
+        const auto mi = [&](const char* key, int def) { return static_cast<int>(json_num(mtp, 0, key, def)); };
+        c.mtp_layers = mi("num_hidden_layers", 0);
+        c.mtp_inter = mi("intermediate_size", 0);
+        c.mtp_window = mi("sliding_window_size", mi("sliding_window", c.window));
+        c.mtp_block = mi("block_size", 8);
+        c.mtp_drafts = mi("num_speculative_tokens", c.mtp_block - 1);
+        c.markov_rank = mi("markov_rank", 0);
+        c.mtp_H = mi("hidden_size", c.H);
+        c.mtp_heads = mi("num_attention_heads", c.heads);
+        c.mtp_kv_heads = mi("num_key_value_heads", c.kv_heads);
+        c.mtp_hd = mi("head_dim", c.hd);
+        c.mtp_theta = static_cast<float>(json_num(mtp, 0, "rope_theta", 1e6));
+        c.mtp_targets = json_ints(mtp, "target_layer_ids");
+        const std::vector<int> local = json_ints(mtp, "local_layer_ids");
+        c.mtp_global.assign(static_cast<size_t>(std::max(c.mtp_layers, 0)), 1);
+        for (int l : local)
+            if (l >= 0 && l < c.mtp_layers) c.mtp_global[static_cast<size_t>(l)] = 0;
+    }
     return c;
 }
 
@@ -438,6 +501,28 @@ struct Layer
     std::vector<RankPart> rk;                        // the ranks this engine runs
 };
 
+// The drafter: one rank's slices of a layer and its context rows, a layer, and one rank's work buffers.
+struct MtpRank
+{
+    const uint16_t *wq = nullptr, *wk = nullptr, *wv = nullptr, *wkc = nullptr, *wvc = nullptr, *wo = nullptr, *gate = nullptr, *up = nullptr, *down = nullptr;
+    uint16_t* ring = nullptr;      // [slots][2][window][nk] on a local layer
+    uint16_t* pages = nullptr;     // [slots * max_pps][2][64][nk] on a global layer
+    uint16_t* staging = nullptr;   // [slots][2][64][nk] on a global layer
+};
+struct MtpLayer
+{
+    bool glob = false;
+    const uint16_t *dflare_norm = nullptr, *input_norm = nullptr, *post_norm = nullptr, *q_norm = nullptr, *k_norm = nullptr, *k_norm_ctx = nullptr;
+    std::vector<MtpRank> rk;
+};
+struct MtpWork
+{
+    uint16_t *q = nullptr, *og = nullptr, *kb = nullptr, *vb = nullptr, *gate = nullptr, *up = nullptr, *ck = nullptr, *cv = nullptr, *base = nullptr;
+    uint16_t *fold_w = nullptr, *fold_b = nullptr;   // [vr][R], [vr]: lm_head . hidden_out
+    float *lg = nullptr, *part = nullptr;
+    size_t part_floats = 0;
+};
+
 struct Options
 {
     int nr = 1;          // ranks of the model
@@ -447,6 +532,7 @@ struct Options
     int max_rows = 8;    // rows of a step
     int cap = 4096;      // positions of a session
     int nc = 256;        // candidates of a row's head
+    int mtp = 0;         // drafts of a round (0 = no drafter: no taps, no drafter state)
     std::string layers = "all";
     bool whole_image = false;
 };
@@ -467,7 +553,12 @@ public:
     size_t moe_bytes(int M) const { return static_cast<size_t>(M) * c.TK * c.H * 4; }
     size_t head_bytes(int M) const { return static_cast<size_t>(M) * head_row_bytes(o.nc); }
     // the largest share of one collective, for the fabric's slots
-    size_t max_bytes() const { return std::max(moe_bytes(o.max_rows), head_bytes(o.max_rows)); }
+    size_t max_bytes() const
+    {
+        size_t b = std::max(moe_bytes(o.max_rows), head_bytes(o.max_rows));
+        if (o.mtp > 0) b = std::max(b, std::max(static_cast<size_t>(o.slots) * c.mtp_block * c.H * 4, head_bytes(o.slots)));
+        return b;
+    }
 
     void init(const std::string& dir, const Options& opt)
     {
@@ -515,6 +606,7 @@ public:
         parts = dalloc<float>(static_cast<size_t>(o.nr) * part_stride);
         host_logits.resize(static_cast<size_t>(o.max_rows) * vr);
         head_parts.resize(static_cast<size_t>(o.nr) * head_bytes(o.max_rows));
+        if (o.mtp > 0) init_mtp();
         INK2RT_CK(cudaDeviceSynchronize());
         fprintf(stderr, "# ink2: ranks %d..%d of %d, %zu layers, H %d, %d experts top %d, vocab %d (%d rows a rank), %d slots, %d rows, cap %d\n", o.rank0,
                 o.rank0 + o.nloc - 1, o.nr, L.size(), c.H, c.NE, c.TK, c.vocab, vr, o.slots, o.max_rows, o.cap);
@@ -538,9 +630,20 @@ public:
                 else INK2RT_CK(cudaMemset(x.staging + s * 2 * ink2::KV_PAGE_TOKENS * nk, 0, static_cast<size_t>(2) * ink2::KV_PAGE_TOKENS * nk * 2));
             }
         }
+        if (o.mtp < 1) return;
+        for (MtpLayer& y : ML)
+            for (int i = 0; i < o.nloc; ++i)
+            {
+                MtpRank& x = y.rk[static_cast<size_t>(i)];
+                const size_t nk = static_cast<size_t>(rank_nk(i));
+                if (!y.glob) INK2RT_CK(cudaMemset(x.ring + s * 2 * c.mtp_window * nk, 0, static_cast<size_t>(2) * c.mtp_window * nk * 2));
+                else INK2RT_CK(cudaMemset(x.staging + s * 2 * ink2::KV_PAGE_TOKENS * nk, 0, static_cast<size_t>(2) * ink2::KV_PAGE_TOKENS * nk * 2));
+            }
+        INK2RT_CK(cudaMemset(last_taps + s * ntaps * c.H, 0, static_cast<size_t>(ntaps) * c.H * 2));
     }
 
     // One step over the rows of rh. No state changes before commit(). When samples is null (prefill), the head is skipped.
+    // With the drafter on, the taps of the rows are kept for commit().
     void forward(const ink2::RowsHost& rh, const int* tk, const RowSample* samples, std::vector<RowOut>& out)
     {
         M = rh.rows();
@@ -558,6 +661,8 @@ public:
         {
             Layer& s = L[j];
             const int ji = static_cast<int>(j);
+            for (int t = 0; t < ntaps; ++t)
+                if (c.mtp_targets[static_cast<size_t>(t)] == s.l) ink2::copy_bf16(h, step_taps + static_cast<size_t>(t) * o.max_rows * c.H, n, 0);
             const int done = (ji + c.block - 1) / c.block;   // finished blocks before the attention of this layer
             if (!s.attn_query) ink2::rmsnorm(h, s.attn_norm, qi, M, c.H, 0);
             else
@@ -606,7 +711,7 @@ public:
             ink2::sconv_static(s.mo, s.hist_m, rw, s.mlp_sconv, M, c.H, ms, 0);
             ink2::add_bf16(mid, ms, h, n, 0);
         }
-        if (!samples)
+        if (!samples && ntaps == 0)
         {
             out.clear();
             return;
@@ -622,6 +727,13 @@ public:
         ar.norm[0] = final_norm;
         ar.out[0] = hf;
         ink2::attn_res(ar, M, 0);
+        for (int t = 0; t < ntaps; ++t)
+            if (c.mtp_targets[static_cast<size_t>(t)] == c.n_layers) ink2::copy_bf16(hf, step_taps + static_cast<size_t>(t) * o.max_rows * c.H, n, 0);
+        if (!samples)
+        {
+            out.clear();
+            return;
+        }
         // the head: every rank's rows of lm_head, its candidates on the host, then the merge in rank order
         const size_t hb = head_bytes(M), rb = head_row_bytes(o.nc);
         for (int i = 0; i < o.nloc; ++i)
@@ -654,7 +766,142 @@ public:
             ink2::sconv_advance(s.mo, s.hist_m, rw, am, M, c.H, 0);
             for (RankPart& x : s.rk) ink2::attn_commit(x.g, x.as, x.wk, rw, am, M, 0);
         }
+        if (o.mtp > 0) mtp_commit(rw, am);
         INK2RT_CK(cudaDeviceSynchronize());
+    }
+
+    // K drafts (1 .. Options::mtp) per session: the tokens after `golden`, the token sampled at the session's last
+    // committed position q_pos. out [S][K]. Draft step of a session is sampled like the trunk samples position
+    // q_pos + 1 + step (spos = q_pos + 2 + step), so a draft equals the verified token whenever the logits agree.
+    // Reads the committed context rows and last taps only; changes no state and none of the last forward's rows.
+    void mtp_draft(const std::vector<int>& slots, const std::vector<int>& q_pos, const std::vector<int>& golden, const std::vector<RowSample>& samples, int K,
+                   std::vector<int>& out)
+    {
+        const int S = static_cast<int>(slots.size()), B = c.mtp_block, H = c.H, T = o.nr, R = c.markov_rank, G = 3 * R;
+        if (o.mtp < 1) die("mtp_draft: the drafter is off");
+        if (S < 1 || S > o.slots || K < 1 || K > o.mtp || q_pos.size() != slots.size() || golden.size() != slots.size() || samples.size() != slots.size())
+            die("mtp_draft: sessions or drafts");
+        const int MB = S * B;
+        std::vector<int> nctx(static_cast<size_t>(S)), pos(static_cast<size_t>(MB));
+        int nctx_max = 0;
+        for (int s = 0; s < S; ++s)
+        {
+            if (slots[s] < 0 || slots[s] >= o.slots || q_pos[s] < 0 || q_pos[s] >= o.cap || golden[s] < 0 || golden[s] >= c.vocab) die("mtp_draft: slot, position or token");
+            nctx[s] = q_pos[s] + 1;
+            nctx_max = std::max(nctx_max, nctx[s]);
+            for (int b = 0; b < B; ++b) pos[static_cast<size_t>(s) * B + b] = nctx[s] + b;
+        }
+        INK2RT_CK(cudaMemcpy(m_slot, slots.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
+        INK2RT_CK(cudaMemcpy(m_nctx, nctx.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
+        INK2RT_CK(cudaMemcpy(m_gold, golden.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
+        INK2RT_CK(cudaMemcpy(m_prev, golden.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
+        INK2RT_CK(cudaMemcpy(m_pos, pos.data(), sizeof(int) * MB, cudaMemcpyHostToDevice));
+        const size_t n = static_cast<size_t>(MB) * H;
+        int coll = collectives();
+        ink2::k_ink2_mtp_block_init<<<MB, ink2::NRT, 0, 0>>>(m_gold, embed, embed_norm, mask_embed, m_res, B, H);
+        for (size_t l = 0; l < ML.size(); ++l)
+        {
+            MtpLayer& y = ML[l];
+            ink2::rmsnorm(m_res, y.input_norm, m_x, MB, H, 0);
+            for (int i = 0; i < o.nloc; ++i)
+            {
+                const MtpRank& x = y.rk[static_cast<size_t>(i)];
+                MtpWork& w = mwk[static_cast<size_t>(i)];
+                const ink2::AttnGeom g = rank_geom(o.rank0 + i, false);
+                const int nq = g.nh_q * g.hd, nk = g.nh_kv * g.hd;
+                ink2::gemm_bf16(m_x, x.wq, MB, H, nq, w.q, 0);
+                ink2::gemm_bf16(m_x, x.wk, MB, H, nk, w.kb, 0);
+                ink2::gemm_bf16(m_x, x.wv, MB, H, nk, w.vb, 0);
+                ink2::mtp_head_norm_rope(w.q, y.q_norm, m_pos, inv_freq, MB, g.nh_q, g.hd, 0);
+                ink2::mtp_head_norm_rope(w.kb, y.k_norm, m_pos, inv_freq, MB, g.nh_kv, g.hd, 0);
+                ink2::MtpAttnArgs a{};
+                a.q = w.q;
+                a.kb = w.kb;
+                a.vb = w.vb;
+                a.ring = x.ring;
+                a.pages = x.pages;
+                a.page_table = mtp_page_table;
+                a.slot = m_slot;
+                a.nctx = m_nctx;
+                a.og = w.og;
+                a.B = B;
+                a.nh_q = g.nh_q;
+                a.q0 = g.q0;
+                a.gqa = g.gqa;
+                a.kv0 = g.kv0;
+                a.nk = nk;
+                a.hd = g.hd;
+                a.window = c.mtp_window;
+                a.global = y.glob ? 1 : 0;
+                a.max_pps = max_pps;
+                ink2::mtp_attn(a, MB, nctx_max, w.part, w.part_floats, 0);
+                if (T == 1) ink2::gemm_bf16(w.og, x.wo, MB, nq, H, m_red, 0);
+                else ink2::gemm_f32(w.og, x.wo, MB, nq, H, mtp_parts + static_cast<size_t>(o.rank0 + i) * n, 0);
+            }
+            if (T > 1)
+            {
+                if (gather) gather(coll++, mtp_parts, n * 4);
+                ink2::sum_ranks(mtp_parts, T, n, m_red, 0);
+            }
+            ink2::add_bf16(m_res, m_red, m_res, n, 0);
+            ink2::rmsnorm(m_res, y.post_norm, m_x, MB, H, 0);
+            const int iw = c.mtp_inter / T;
+            for (int i = 0; i < o.nloc; ++i)
+            {
+                const MtpRank& x = y.rk[static_cast<size_t>(i)];
+                MtpWork& w = mwk[static_cast<size_t>(i)];
+                ink2::gemm_bf16(m_x, x.gate, MB, H, iw, w.gate, 0);
+                ink2::gemm_bf16(m_x, x.up, MB, H, iw, w.up, 0);
+                const size_t cells = static_cast<size_t>(MB) * iw;
+                ink2::k_ink2_mtp_swiglu<<<ink2::cells_grid(cells), 256, 0, 0>>>(w.gate, w.up, cells);
+                if (T == 1) ink2::gemm_bf16(w.gate, x.down, MB, iw, H, m_red, 0);
+                else ink2::gemm_f32(w.gate, x.down, MB, iw, H, mtp_parts + static_cast<size_t>(o.rank0 + i) * n, 0);
+            }
+            if (T > 1)
+            {
+                if (gather) gather(coll++, mtp_parts, n * 4);
+                ink2::sum_ranks(mtp_parts, T, n, m_red, 0);
+            }
+            ink2::add_bf16(m_res, m_red, m_res, n, 0);
+        }
+        // the head: block row step + 1 gives draft step
+        ink2::rmsnorm(m_res, mtp_norm, m_x, MB, H, 0);
+        ink2::k_ink2_mtp_pick_rows<<<ink2::cells_grid(static_cast<size_t>(S) * K * H), 256, 0, 0>>>(m_x, m_hid, S, B, K, H);
+        ink2::mtp_mix_norm(last_taps, static_cast<size_t>(ntaps) * H, static_cast<size_t>(H), m_slot, fuse_alpha + ML.size() * ntaps, head_dflare_norm, m_frnn, S, ntaps, H, 0);
+        ink2::gemm_f32(m_hid, w_hid, S * K, H, G, m_hidp, 0);
+        ink2::gemm_f32(m_frnn, w_frnn, S, H, G, m_frp, 0);
+        for (int i = 0; i < o.nloc; ++i) ink2::gemm_bf16(m_hid, lm[i], S * K, H, vr, mwk[static_cast<size_t>(i)].base, 0);
+        INK2RT_CK(cudaMemset(m_state, 0, static_cast<size_t>(S) * R * 2));
+        const size_t hb = head_bytes(S), rb = head_row_bytes(o.nc);
+        std::vector<uint8_t> row(static_cast<size_t>(T) * rb);
+        std::vector<int> prev(static_cast<size_t>(S));
+        out.assign(static_cast<size_t>(S) * K, 0);
+        for (int step = 0; step < K; ++step)
+        {
+            ink2::k_ink2_mtp_inp<<<ink2::cells_grid(static_cast<size_t>(S) * 2 * R), 256, 0, 0>>>(m_state, markov_w1, m_prev, m_inp, S, R);
+            ink2::gemm_f32(m_inp, w_rec, S, 2 * R, G, m_rec, 0);
+            ink2::k_ink2_mtp_gate<<<ink2::cells_grid(static_cast<size_t>(S) * R), 256, 0, 0>>>(rnn_bias, m_hidp, m_frp, m_rec, m_state, m_latent, S, K, step, R);
+            for (int i = 0; i < o.nloc; ++i)
+            {
+                const int r = o.rank0 + i;
+                MtpWork& w = mwk[static_cast<size_t>(i)];
+                ink2::gemm_f32(m_latent, w.fold_w, S, R, vr, w.lg, 0);
+                ink2::k_ink2_mtp_logits<<<ink2::cells_grid(static_cast<size_t>(S) * vr), 256, 0, 0>>>(w.base, w.fold_b, w.lg, S, K, step, vr, r * vr, c.valid);
+                INK2RT_CK(cudaMemcpy(mtp_host_logits.data(), w.lg, sizeof(float) * static_cast<size_t>(S) * vr, cudaMemcpyDeviceToHost));
+                for (int s = 0; s < S; ++s)
+                    head_pack(&mtp_host_logits[static_cast<size_t>(s) * vr], vr, r * vr, o.nc, &mtp_head_parts[static_cast<size_t>(r) * hb + static_cast<size_t>(s) * rb]);
+            }
+            if (T > 1 && gather_head) gather_head(coll++, mtp_head_parts.data(), hb);
+            for (int s = 0; s < S; ++s)
+            {
+                for (int r = 0; r < T; ++r) memcpy(&row[static_cast<size_t>(r) * rb], &mtp_head_parts[static_cast<size_t>(r) * hb + static_cast<size_t>(s) * rb], rb);
+                RowSample sm = samples[static_cast<size_t>(s)];
+                sm.spos = static_cast<uint32_t>(q_pos[s] + 2 + step);
+                prev[s] = sample_row(head_merge(row.data(), rb, T, o.nc).top, sm);
+                out[static_cast<size_t>(s) * K + step] = prev[s];
+            }
+            if (step + 1 < K) INK2RT_CK(cudaMemcpy(m_prev, prev.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
+        }
     }
 
     // The state a KvStateDesc names (s2/kv_state_desc.h ink2_kv_state): bytes of one page row and of a slot's tail.
@@ -715,8 +962,42 @@ public:
             }
             else if (to_staging) INK2RT_CK(cudaMemset(stg, 0, elems * sizeof(uint16_t)));
         }
+        for (MtpLayer& y : ML)
+        {
+            if (!y.glob) continue;
+            MtpRank& x = y.rk[static_cast<size_t>(i)];
+            const size_t elems = static_cast<size_t>(2) * ink2::KV_PAGE_TOKENS * rank_nk(i);
+            uint16_t* stg = x.staging + static_cast<size_t>(slot) * elems;
+            if (rem > 0 && p < static_cast<uint32_t>(max_pps))
+            {
+                uint16_t* pg = x.pages + (static_cast<size_t>(slot) * max_pps + p) * elems;
+                if (to_staging) INK2RT_CK(cudaMemcpy(stg, pg, elems * sizeof(uint16_t), cudaMemcpyDeviceToDevice));
+                else INK2RT_CK(cudaMemcpy(pg, stg, elems * sizeof(uint16_t), cudaMemcpyDeviceToDevice));
+            }
+            else if (to_staging) INK2RT_CK(cudaMemset(stg, 0, elems * sizeof(uint16_t)));
+        }
         INK2RT_CK(cudaDeviceSynchronize());
     }
+
+    // The drafter's state for a KvStateDesc: its layers' context rows (no convolution histories) and, per slot, the
+    // taps of the last committed row [slots][taps * H].
+    std::vector<KvPtrs> mtp_kv_ptrs(int i = 0) const
+    {
+        std::vector<KvPtrs> v;
+        for (const MtpLayer& y : ML)
+        {
+            const MtpRank& x = y.rk[static_cast<size_t>(i)];
+            KvPtrs k;
+            k.global = y.glob;
+            k.pages = reinterpret_cast<uint8_t*>(x.pages);
+            k.staging = reinterpret_cast<uint8_t*>(x.staging);
+            k.ring = reinterpret_cast<uint8_t*>(x.ring);
+            v.push_back(k);
+        }
+        return v;
+    }
+    uint8_t* mtp_last_taps() const { return reinterpret_cast<uint8_t*>(last_taps); }
+    int mtp_taps() const { return ntaps; }
 
 private:
     static std::string lname(int l, const char* what)
@@ -832,6 +1113,194 @@ private:
             }
         }
     }
+    static std::string mname(int l, const char* what)
+    {
+        char b[96];
+        snprintf(b, sizeof b, "MTP.L%02d.%s", l, what);
+        return b;
+    }
+    // The drafter of the checkpoint: its weights, its per-slot context rows and the buffers of a draft.
+    void init_mtp()
+    {
+        Image& a = *img[0];
+        const int H = c.H, R = c.markov_rank, B = c.mtp_block, T = o.nr, nl = c.mtp_layers;
+        ntaps = static_cast<int>(c.mtp_targets.size());
+        if (nl < 1 || !a.find("MTP.fuse_weight")) die("--mtp " + std::to_string(o.mtp) + ": the checkpoint has no MTP drafter");
+        if (o.mtp > c.mtp_drafts) die("--mtp " + std::to_string(o.mtp) + ": the drafter makes at most " + std::to_string(c.mtp_drafts) + " drafts");
+        if (c.mtp_H != H || c.mtp_heads != c.heads || c.mtp_kv_heads != c.kv_heads || c.mtp_hd != c.hd || c.hd % 2) die("mtp_config: hidden_size or heads differ from the trunk's");
+        if (B < 2 || c.mtp_drafts > B - 1 || c.mtp_window < 1 || ntaps < 1) die("mtp_config: block_size, num_speculative_tokens, sliding_window_size or target_layer_ids");
+        if (c.mtp_inter < 1 || c.mtp_inter % T || (c.mtp_inter / T) % 16 || R < 16 || R % 16) die("mtp_config: intermediate_size or markov_rank");
+        if (o.slots > o.max_rows) die("the drafter needs max_rows >= slots");
+        for (int t : c.mtp_targets)
+            if (t != c.n_layers && std::find(layer_ids.begin(), layer_ids.end(), t) == layer_ids.end()) die("mtp_config: target layer " + std::to_string(t) + " is not run");
+        if (a.entry("MTP.fuse_weight").nbytes != static_cast<size_t>(nl + 1) * ntaps * 2) die("MTP.fuse_weight: not [layers + 1][taps]");
+        if (a.dim("MTP.markov_head.rnn_proj.weight", 0) != 3 * R || a.dim("MTP.markov_head.rnn_proj.weight", 1) != 2 * R + 2 * H || a.dim("MTP.markov_head.markov_w1", 1) != R ||
+            a.dim("MTP.markov_head.hidden_out.weight", 0) != H || a.dim("MTP.markov_head.hidden_out.weight", 1) != R)
+            die("MTP.markov_head: shapes differ from mtp_config");
+        const size_t sl = static_cast<size_t>(o.slots), G = static_cast<size_t>(3) * R;
+        // softmax of the fuse weights per consumer, to BF16
+        {
+            const size_t nf = static_cast<size_t>(nl + 1) * ntaps;
+            std::vector<uint16_t> fw(nf), al(nf);
+            INK2RT_CK(cudaMemcpy(fw.data(), a.get<uint16_t>("MTP.fuse_weight"), nf * 2, cudaMemcpyDeviceToHost));
+            for (int k = 0; k <= nl; ++k)
+            {
+                const uint16_t* f = &fw[static_cast<size_t>(k) * ntaps];
+                float mx = ink2::bf(f[0]), sum = 0.0f;
+                for (int t = 1; t < ntaps; ++t) mx = std::fmax(mx, ink2::bf(f[t]));
+                for (int t = 0; t < ntaps; ++t) sum += std::exp(ink2::bf(f[t]) - mx);
+                for (int t = 0; t < ntaps; ++t) al[static_cast<size_t>(k) * ntaps + t] = ink2::bf16(std::exp(ink2::bf(f[t]) - mx) / sum);
+            }
+            fuse_alpha = dalloc<uint16_t>(nf);
+            INK2RT_CK(cudaMemcpy(fuse_alpha, al.data(), nf * 2, cudaMemcpyHostToDevice));
+            std::vector<float> fr(static_cast<size_t>(c.hd / 2));
+            for (int j = 0; j < c.hd / 2; ++j) fr[static_cast<size_t>(j)] = static_cast<float>(std::pow(static_cast<double>(c.mtp_theta), -2.0 * j / c.hd));
+            inv_freq = dalloc<float>(fr.size());
+            INK2RT_CK(cudaMemcpy(inv_freq, fr.data(), fr.size() * 4, cudaMemcpyHostToDevice));
+        }
+        mask_embed = a.get<uint16_t>("MTP.mask_embed");
+        mtp_norm = a.get<uint16_t>("MTP.norm.weight");
+        head_dflare_norm = a.get<uint16_t>("MTP.markov_head.dflare_norm.weight");
+        markov_w1 = a.get<uint16_t>("MTP.markov_head.markov_w1");
+        rnn_bias = a.get<uint16_t>("MTP.markov_head.rnn_proj.bias");
+        // rnn_proj [3 R][2 R + 2 H] by columns: the recurrent input, the block row, the mixed taps
+        {
+            const uint16_t* w = a.get<uint16_t>("MTP.markov_head.rnn_proj.weight");
+            const size_t pitch = (static_cast<size_t>(2) * R + 2 * H) * 2;
+            w_rec = dalloc<uint16_t>(G * 2 * R);
+            w_hid = dalloc<uint16_t>(G * H);
+            w_frnn = dalloc<uint16_t>(G * H);
+            INK2RT_CK(cudaMemcpy2D(w_rec, static_cast<size_t>(2) * R * 2, w, pitch, static_cast<size_t>(2) * R * 2, G, cudaMemcpyDeviceToDevice));
+            INK2RT_CK(cudaMemcpy2D(w_hid, static_cast<size_t>(H) * 2, w + 2 * R, pitch, static_cast<size_t>(H) * 2, G, cudaMemcpyDeviceToDevice));
+            INK2RT_CK(cudaMemcpy2D(w_frnn, static_cast<size_t>(H) * 2, w + 2 * R + H, pitch, static_cast<size_t>(H) * 2, G, cudaMemcpyDeviceToDevice));
+        }
+        // every slot owns max_pps pages, in order, as in the trunk
+        bool any_glob = false;
+        {
+            const int total = o.slots * max_pps;
+            std::vector<int> table(static_cast<size_t>(total));
+            for (int p = 0; p < total; ++p) table[static_cast<size_t>(p)] = p;
+            int* t = dalloc<int>(static_cast<size_t>(total));
+            INK2RT_CK(cudaMemcpy(t, table.data(), sizeof(int) * total, cudaMemcpyHostToDevice));
+            mtp_page_table = t;
+        }
+        ML.resize(static_cast<size_t>(nl));
+        for (int l = 0; l < nl; ++l)
+        {
+            MtpLayer& y = ML[static_cast<size_t>(l)];
+            const auto N = [l](const char* w) { return mname(l, w); };
+            y.glob = c.mtp_global[static_cast<size_t>(l)] != 0;
+            any_glob = any_glob || y.glob;
+            y.dflare_norm = a.get<uint16_t>(N("dflare_norm.weight"));
+            y.input_norm = a.get<uint16_t>(N("input_layernorm.weight"));
+            y.post_norm = a.get<uint16_t>(N("post_attention_layernorm.weight"));
+            y.q_norm = a.get<uint16_t>(N("self_attn.q_norm.weight"));
+            y.k_norm = a.get<uint16_t>(N("self_attn.k_norm.weight"));
+            y.k_norm_ctx = a.get<uint16_t>(N("self_attn.k_norm_ctx.weight"));
+            y.rk.resize(static_cast<size_t>(o.nloc));
+            for (int i = 0; i < o.nloc; ++i)
+            {
+                Image& im = *img[i];
+                MtpRank& x = y.rk[static_cast<size_t>(i)];
+                const ink2::AttnGeom g = rank_geom(o.rank0 + i, false);
+                const int64_t nq = static_cast<int64_t>(g.nh_q) * g.hd, nk = static_cast<int64_t>(g.nh_kv) * g.hd, iw = c.mtp_inter / T;
+                if (im.dim(N("self_attn.q_proj.weight"), 0) != nq || im.dim(N("self_attn.k_proj.weight"), 0) != nk || im.dim(N("self_attn.k_proj_ctx.weight"), 0) != nk ||
+                    im.dim(N("self_attn.o_proj.weight"), 1) != nq || im.dim(N("mlp.gate_proj.weight"), 0) != iw || im.dim(N("mlp.down_proj.weight"), 1) != iw)
+                    die(N("self_attn.q_proj.weight") + ": the rank's slices differ from mtp_config");
+                x.wq = im.get<uint16_t>(N("self_attn.q_proj.weight"));
+                x.wk = im.get<uint16_t>(N("self_attn.k_proj.weight"));
+                x.wv = im.get<uint16_t>(N("self_attn.v_proj.weight"));
+                x.wkc = im.get<uint16_t>(N("self_attn.k_proj_ctx.weight"));
+                x.wvc = im.get<uint16_t>(N("self_attn.v_proj_ctx.weight"));
+                x.wo = im.get<uint16_t>(N("self_attn.o_proj.weight"));
+                x.gate = im.get<uint16_t>(N("mlp.gate_proj.weight"));
+                x.up = im.get<uint16_t>(N("mlp.up_proj.weight"));
+                x.down = im.get<uint16_t>(N("mlp.down_proj.weight"));
+                if (!y.glob) x.ring = dalloc<uint16_t>(sl * 2 * c.mtp_window * static_cast<size_t>(nk));
+                else
+                {
+                    x.pages = dalloc<uint16_t>(sl * max_pps * 2 * ink2::KV_PAGE_TOKENS * static_cast<size_t>(nk));
+                    x.staging = dalloc<uint16_t>(sl * 2 * ink2::KV_PAGE_TOKENS * static_cast<size_t>(nk));
+                }
+            }
+        }
+        const size_t mh = static_cast<size_t>(o.max_rows) * H, MBm = sl * B, km = sl * o.mtp;
+        step_taps = dalloc<uint16_t>(static_cast<size_t>(ntaps) * mh);
+        last_taps = dalloc<uint16_t>(sl * ntaps * H);
+        ctx_x = dalloc<uint16_t>(mh);
+        m_res = dalloc<uint16_t>(MBm * H);
+        m_x = dalloc<uint16_t>(MBm * H);
+        m_red = dalloc<uint16_t>(MBm * H);
+        m_hid = dalloc<uint16_t>(km * H);
+        m_frnn = dalloc<uint16_t>(sl * H);
+        m_hidp = dalloc<float>(km * G);
+        m_frp = dalloc<float>(sl * G);
+        m_rec = dalloc<float>(sl * G);
+        m_state = dalloc<uint16_t>(sl * R);
+        m_latent = dalloc<uint16_t>(sl * R);
+        m_inp = dalloc<uint16_t>(sl * 2 * R);
+        m_slot = dalloc<int>(sl);
+        m_nctx = dalloc<int>(sl);
+        m_gold = dalloc<int>(sl);
+        m_prev = dalloc<int>(sl);
+        m_pos = dalloc<int>(MBm);
+        mtp_parts = T > 1 ? dalloc<float>(static_cast<size_t>(T) * MBm * H) : nullptr;
+        mtp_host_logits.resize(sl * vr);
+        mtp_head_parts.resize(static_cast<size_t>(T) * head_bytes(o.slots));
+        const uint16_t* how = a.get<uint16_t>("MTP.markov_head.hidden_out.weight");
+        const uint16_t* hob = a.get<uint16_t>("MTP.markov_head.hidden_out.bias");
+        mwk.resize(static_cast<size_t>(o.nloc));
+        for (int i = 0; i < o.nloc; ++i)
+        {
+            MtpWork& w = mwk[static_cast<size_t>(i)];
+            const ink2::AttnGeom g = rank_geom(o.rank0 + i, false);
+            const size_t nq = static_cast<size_t>(g.nh_q) * g.hd, nk = static_cast<size_t>(g.nh_kv) * g.hd, iw = static_cast<size_t>(c.mtp_inter / T);
+            w.q = dalloc<uint16_t>(MBm * nq);
+            w.og = dalloc<uint16_t>(MBm * nq);
+            w.kb = dalloc<uint16_t>(MBm * nk);
+            w.vb = dalloc<uint16_t>(MBm * nk);
+            w.gate = dalloc<uint16_t>(MBm * iw);
+            w.up = dalloc<uint16_t>(MBm * iw);
+            w.ck = dalloc<uint16_t>(static_cast<size_t>(o.max_rows) * nk);
+            w.cv = dalloc<uint16_t>(static_cast<size_t>(o.max_rows) * nk);
+            w.base = dalloc<uint16_t>(km * vr);
+            w.lg = dalloc<float>(sl * vr);
+            // the split partials of 16 block rows over every span of keys a row can read
+            const size_t spans = static_cast<size_t>((any_glob ? o.cap : std::min(c.mtp_window, o.cap)) + B + ink2::ATTN_SPAN - 1) / ink2::ATTN_SPAN;
+            w.part_floats = static_cast<size_t>(16) * g.nh_q * spans * (g.hd + 2);
+            w.part = dalloc<float>(w.part_floats);
+            // lm_head . hidden_out, once
+            w.fold_w = dalloc<uint16_t>(static_cast<size_t>(vr) * R);
+            w.fold_b = dalloc<uint16_t>(static_cast<size_t>(vr));
+            ink2::k_ink2_mtp_fold<<<vr, 256, 0, 0>>>(lm[static_cast<size_t>(i)], how, hob, w.fold_w, w.fold_b, H, R);
+        }
+        INK2RT_CK(cudaDeviceSynchronize());
+        fprintf(stderr, "# ink2: drafter of %d layers, %d taps, block %d, %d drafts a round, window %d, rank %d\n", nl, ntaps, B, o.mtp, c.mtp_window, R);
+    }
+    // The context rows of the accepted rows of the last forward, per drafter layer, and the slots' last taps.
+    void mtp_commit(const ink2::Rows& rw, const uint8_t* am)
+    {
+        const int H = c.H;
+        const size_t tap_stride = static_cast<size_t>(o.max_rows) * H;
+        for (size_t l = 0; l < ML.size(); ++l)
+        {
+            MtpLayer& y = ML[l];
+            ink2::mtp_mix_norm(step_taps, static_cast<size_t>(H), tap_stride, nullptr, fuse_alpha + l * ntaps, y.dflare_norm, ctx_x, M, ntaps, H, 0);
+            for (int i = 0; i < o.nloc; ++i)
+            {
+                MtpRank& x = y.rk[static_cast<size_t>(i)];
+                MtpWork& w = mwk[static_cast<size_t>(i)];
+                const ink2::AttnGeom g = rank_geom(o.rank0 + i, false);
+                const int nk = g.nh_kv * g.hd;
+                ink2::gemm_bf16(ctx_x, x.wkc, M, H, nk, w.ck, 0);
+                ink2::gemm_bf16(ctx_x, x.wvc, M, H, nk, w.cv, 0);
+                ink2::mtp_head_norm_rope(w.ck, y.k_norm_ctx, rw.pos, inv_freq, M, g.nh_kv, g.hd, 0);
+                ink2::k_ink2_mtp_ctx_store<<<ink2::cells_grid(static_cast<size_t>(M) * nk), 256, 0, 0>>>(w.ck, w.cv, x.ring, x.pages, mtp_page_table, max_pps, rw, am, M, nk,
+                                                                                                        c.mtp_window);
+            }
+        }
+        ink2::k_ink2_mtp_last_taps<<<ink2::cells_grid(static_cast<size_t>(M) * ntaps * H), 256, 0, 0>>>(step_taps, tap_stride, last_taps, rw, am, M, ntaps, H);
+    }
     template <class F> void moe(Layer& s, int j)
     {
         ink2::Work& w0 = mw[0];
@@ -869,5 +1338,19 @@ private:
     float* parts = nullptr;
     size_t part_stride = 0;
     int M = 0, vr = 0, max_pps = 0;
+    // the drafter (Options::mtp > 0)
+    std::vector<MtpLayer> ML;
+    std::vector<MtpWork> mwk;
+    std::vector<float> mtp_host_logits;
+    std::vector<uint8_t> mtp_head_parts;
+    int ntaps = 0;
+    const uint16_t *mask_embed = nullptr, *mtp_norm = nullptr, *head_dflare_norm = nullptr, *markov_w1 = nullptr, *rnn_bias = nullptr;
+    const int* mtp_page_table = nullptr;
+    uint16_t *fuse_alpha = nullptr, *w_rec = nullptr, *w_hid = nullptr, *w_frnn = nullptr;
+    float* inv_freq = nullptr;
+    uint16_t *step_taps = nullptr, *last_taps = nullptr, *ctx_x = nullptr;   // [taps][max_rows][H], [slots][taps][H], [max_rows][H]
+    uint16_t *m_res = nullptr, *m_x = nullptr, *m_red = nullptr, *m_hid = nullptr, *m_frnn = nullptr, *m_state = nullptr, *m_latent = nullptr, *m_inp = nullptr;
+    float *m_hidp = nullptr, *m_frp = nullptr, *m_rec = nullptr, *mtp_parts = nullptr;
+    int *m_slot = nullptr, *m_nctx = nullptr, *m_gold = nullptr, *m_prev = nullptr, *m_pos = nullptr;
 };
 }   // namespace ink2rt

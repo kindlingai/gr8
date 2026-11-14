@@ -20,9 +20,16 @@
 //   m     = mlp_sconv(moe(mlp_norm(AttnRes(states, res_mid, mlp_query[l]))))
 //   h_out = bf16(res_mid + m)
 // and logits = softcap30(lm_head . final_norm(AttnRes(states, h_last, output_query))).
+//
+// The MTP drafter (Config::mtp_layers > 0) reads taps of the trunk: the hidden state at the entry of each layer of
+// mtp_target_layers (n_layers = the final_norm output). Every forwarded position gets, per drafter layer, one context
+// K / V row made of the softmax(fuse_weight) mix of its taps; mtp_draft() then runs a block of mtp_block rows (the last
+// token, then mask rows) that attend to those context rows and to each other in both directions, and a recurrent head
+// turns the mask rows into draft tokens one after another. A draft never changes the state of the model.
 #pragma once
 #include "../../kernels/nvfp4_pack.h"
 #include <cfloat>
+#include <functional>
 #include <map>
 
 namespace ink2ref
@@ -58,6 +65,22 @@ inline float dot(const float* a, const float* b, int n)
 }
 
 inline float mean_sq(const float* x, int n) { return dot(x, x, n) / static_cast<float>(n); }
+
+// fp64 -> the nearest BF16 value, ties to even, with one rounding (not fp64 -> fp32 -> BF16).
+inline float rbf_f64(double d)
+{
+    float f = static_cast<float>(d);
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    if ((u & 0x7f800000u) != 0x7f800000u && (u & 0xffffu) == 0x8000u && static_cast<double>(f) != d)
+    {
+        // f sits on a BF16 tie that d is not on: step off the tie toward d
+        const bool up = std::fabs(d) > std::fabs(static_cast<double>(f));
+        u = up ? u + 1 : u - 1;
+        memcpy(&f, &u, 4);
+    }
+    return rbf(f);
+}
 inline float l2_norm(const float* x, int n) { return std::sqrt(dot(x, x, n)); }
 
 // ---- MXFP8: E4M3 codes, one E8M0 scale per 32, and the 528-byte decode record (two 16x16 tiles in lane order, then
@@ -179,6 +202,14 @@ struct Config
     int tp = 1;                    // ranks the sharded sums are split over
     std::vector<uint8_t> global;   // [n_layers] 1 = full attention with the dynamic K / V convolution
     std::vector<uint8_t> mxfp8;    // [n_layers] 1 = MXFP8 experts, 0 = NVFP4
+    // the MTP drafter; 0 layers = none. It has the trunk's hidden size, heads and head_dim.
+    int mtp_layers = 0, mtp_inter = 0;
+    int mtp_window = 0;                   // a local drafter layer sees the last mtp_window context rows
+    int mtp_block = 8, mtp_drafts = 7;    // rows of the draft block (row 0 = the last token), and the most drafts
+    float mtp_rope_theta = 1e6f;
+    int markov_rank = 256;
+    std::vector<uint8_t> mtp_global;      // [mtp_layers] 1 = the whole context
+    std::vector<int> mtp_target_layers;   // the taps, each 0 .. n_layers
 };
 
 struct Layer
@@ -207,10 +238,36 @@ struct Layer
     std::vector<float> s1, s2;
 };
 
+struct MtpLayer
+{
+    std::vector<float> dflare_norm;                          // [H]  norm of the tap mix that feeds the context K / V
+    std::vector<float> k_ctx, v_ctx;                         // [nkv * hd][H]
+    std::vector<float> k_norm_ctx;                           // [hd]
+    std::vector<float> input_norm, post_norm;                // [H]
+    std::vector<float> wq;                                   // [nh * hd][H]
+    std::vector<float> wk, wv;                               // [nkv * hd][H]
+    std::vector<float> q_norm, k_norm;                       // [hd]
+    std::vector<float> wo;                                   // [H][nh * hd]
+    std::vector<float> gate, up;                             // [I][H]
+    std::vector<float> down;                                 // [H][I]
+};
+
+struct MtpWeights
+{
+    std::vector<float> fuse_weight;                          // [mtp_layers + 1][taps], the last row for the head
+    std::vector<float> mask_embed, norm;                     // [H]
+    std::vector<MtpLayer> layers;
+    std::vector<float> head_dflare_norm;                     // [H]
+    std::vector<float> markov_w1;                            // [V][R]
+    std::vector<float> rnn_w, rnn_b;                         // [3R][2R + 2H], [3R]; columns = state, token, hidden, tap mix
+    std::vector<float> hidden_out_w, hidden_out_b;           // [H][R], [H]
+};
+
 struct Weights
 {
     std::vector<float> embed, embed_norm, final_norm, output_query, lm_head;   // [V][H], [H], [H], [H], [V][H]
     std::vector<Layer> layers;
+    MtpWeights mtp;
 };
 
 class Model
@@ -224,6 +281,7 @@ public:
         if (C.global[0]) bad("layer 0 must be a local layer");
         if (C.n_heads % C.n_kv_heads || C.tp < 1 || C.n_heads % C.tp || C.inter % (64 * C.tp) || C.hidden % 64) bad("geometry");
         if (C.top_k < 1 || C.top_k > C.n_exp || C.block < 1) bad("top_k or block");
+        if (C.mtp_layers > 0) mtp_init();
     }
 
     int pos() const { return pos_; }
@@ -242,6 +300,12 @@ public:
             s.K.resize(p * nk);
             s.V.resize(p * nk);
         }
+        for (MtpState& s : mst)
+        {
+            s.K.resize(p * nk);
+            s.V.resize(p * nk);
+        }
+        taps_.resize(p * ntaps() * H);
         pos_ = p;
     }
 
@@ -265,9 +329,15 @@ public:
             }
         }
         std::vector<std::vector<float>> states;   // [blocks done][M][H]
+        std::vector<float> taps(static_cast<size_t>(M) * ntaps() * H);   // [M][taps][H]
+        const auto tap = [&](int layer, int m, const float* row) {
+            for (size_t t = 0; t < ntaps(); ++t)
+                if (C.mtp_target_layers[t] == layer) memcpy(&taps[(static_cast<size_t>(m) * ntaps() + t) * H], row, static_cast<size_t>(H) * sizeof(float));
+        };
         for (int l = 0; l < C.n_layers; ++l)
         {
             const Layer& w = W.layers[l];
+            for (int m = 0; m < M && ntaps(); ++m) tap(l, m, &h[static_cast<size_t>(m) * H]);
             const bool glob = C.global[l] != 0;
             std::vector<float> qi(h.size()), ki, vi;
             if (l == 0)
@@ -315,14 +385,213 @@ public:
         for (int m = 0; m < M; ++m)
         {
             wnorm(&xf[static_cast<size_t>(m) * H], W.final_norm, hf.data());
+            if (ntaps()) tap(C.n_layers, m, hf.data());
             for (int v = 0; v < C.vocab; ++v)
             {
                 const float z = dot(hf.data(), &W.lm_head[static_cast<size_t>(v) * H], H);
                 logits[static_cast<size_t>(m) * C.vocab + v] = v < C.valid_vocab ? 30.0f * std::tanh(z / 30.0f) : -std::numeric_limits<float>::infinity();
             }
         }
+        if (C.mtp_layers > 0) mtp_context(taps, M);
         pos_ += M;
         return logits;
+    }
+
+    // ---- the MTP drafter
+
+    size_t ntaps() const { return C.mtp_layers > 0 ? C.mtp_target_layers.size() : 0; }
+
+    // The context K and V of drafter layer l, [pos][nkv * hd]; a test may change a row.
+    std::vector<float>& mtp_ctx_k(int l) { return mst[l].K; }
+    std::vector<float>& mtp_ctx_v(int l) { return mst[l].V; }
+
+    // Give the drafter a context of n_ctx positions from outside: every layer's K and V get n_ctx zero rows (fill
+    // them through mtp_ctx_k / mtp_ctx_v) and last_taps [taps][H] becomes the tap row of position n_ctx - 1. The
+    // trunk's own state is not set: after this call only mtp_draft is valid.
+    void mtp_set_state(int n_ctx, const float* last_taps)
+    {
+        if (C.mtp_layers < 1 || n_ctx < 1) throw std::runtime_error("ink2ref: mtp_set_state arguments");
+        const size_t nk = static_cast<size_t>(C.n_kv_heads) * C.head_dim, row = ntaps() * C.hidden;
+        for (MtpState& s : mst)
+        {
+            s.K.assign(static_cast<size_t>(n_ctx) * nk, 0.0f);
+            s.V.assign(static_cast<size_t>(n_ctx) * nk, 0.0f);
+        }
+        taps_.assign(static_cast<size_t>(n_ctx) * row, 0.0f);
+        memcpy(&taps_[static_cast<size_t>(n_ctx - 1) * row], last_taps, row * sizeof(float));
+        pos_ = n_ctx;
+    }
+
+    // softmax(fuse_weight[c]) . taps -> weighted RMSNorm, [H] BF16. The softmax weights are BF16.
+    void mix_norm(const float* taps, int c, const std::vector<float>& norm_w, float* out) const
+    {
+        const int H = C.hidden, nt = static_cast<int>(ntaps());
+        std::vector<float> mixed(static_cast<size_t>(H), 0.0f);
+        for (int t = 0; t < nt; ++t)
+            for (int i = 0; i < H; ++i) mixed[i] += taps[static_cast<size_t>(t) * H + i] * fuse_alpha[static_cast<size_t>(c) * nt + t];
+        wnorm(mixed.data(), norm_w, out);
+    }
+
+    // Per head of n: bf16(w * (x * rsqrt(mean(x^2) + eps))), then the half-split rotation at position p.
+    void head_norm_rope(float* x, int heads, const std::vector<float>& w, int p) const
+    {
+        const int hd = C.head_dim, half = hd / 2;
+        for (int h = 0; h < heads; ++h)
+        {
+            float* v = x + static_cast<size_t>(h) * hd;
+            const float r = rsqrtf(mean_sq(v, hd) + EPS);
+            for (int d = 0; d < hd; ++d) v[d] = rbf(w[d] * (v[d] * r));
+            for (int j = 0; j < half; ++j)
+            {
+                const float ang = static_cast<float>(p) * inv_freq[j], cs = std::cos(ang), sn = std::sin(ang);
+                const float a = v[j], b = v[j + half];
+                v[j] = rbf(a * cs - b * sn);
+                v[j + half] = rbf(b * cs + a * sn);
+            }
+        }
+    }
+
+    // k drafts (1 .. mtp_drafts) of the tokens after `golden`, the token sampled at the last forwarded position.
+    // step_logits gets [k][vocab]; head_hidden the block's final hidden rows [mtp_block][H]; pick(logits, step)
+    // replaces the argmax (ties to the lower id). Changes no state.
+    std::vector<int> mtp_draft(int golden, int k, std::vector<float>* step_logits = nullptr, std::vector<float>* head_hidden = nullptr,
+                               const std::function<int(const float*, int)>* pick = nullptr) const
+    {
+        if (C.mtp_layers < 1) throw std::runtime_error("ink2ref: no MTP drafter");
+        if (pos_ < 1 || k < 1 || k > C.mtp_drafts || golden < 0 || golden >= C.vocab) throw std::runtime_error("ink2ref: mtp_draft arguments");
+        const MtpWeights& w = W.mtp;
+        const int H = C.hidden, B = C.mtp_block, nh = C.n_heads, nkv = C.n_kv_heads, hd = C.head_dim, nq = nh * hd, nk = nkv * hd, grp = nh / nkv;
+        const int I = C.mtp_inter, R = C.markov_rank, V = C.vocab, nctx = pos_, G = 3 * R, cols = 2 * R + 2 * H;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+        std::vector<float> res(static_cast<size_t>(B) * H);
+        wnorm(&W.embed[static_cast<size_t>(golden) * H], W.embed_norm, res.data());
+        for (int b = 1; b < B; ++b) memcpy(&res[static_cast<size_t>(b) * H], w.mask_embed.data(), static_cast<size_t>(H) * sizeof(float));
+        std::vector<float> x(static_cast<size_t>(H)), q(static_cast<size_t>(B) * nq), kb(static_cast<size_t>(B) * nk), vb(kb.size()), og(static_cast<size_t>(nq)),
+            sc, acc(static_cast<size_t>(hd)), a(static_cast<size_t>(I)), att(res.size());
+        for (int l = 0; l < C.mtp_layers; ++l)
+        {
+            const MtpLayer& y = w.layers[l];
+            const MtpState& s = mst[l];
+            for (int b = 0; b < B; ++b)
+            {
+                wnorm(&res[static_cast<size_t>(b) * H], y.input_norm, x.data());
+                for (int c = 0; c < nq; ++c) q[static_cast<size_t>(b) * nq + c] = rbf(dot(&y.wq[static_cast<size_t>(c) * H], x.data(), H));
+                for (int c = 0; c < nk; ++c)
+                {
+                    kb[static_cast<size_t>(b) * nk + c] = rbf(dot(&y.wk[static_cast<size_t>(c) * H], x.data(), H));
+                    vb[static_cast<size_t>(b) * nk + c] = rbf(dot(&y.wv[static_cast<size_t>(c) * H], x.data(), H));
+                }
+                head_norm_rope(&q[static_cast<size_t>(b) * nq], nh, y.q_norm, nctx + b);
+                head_norm_rope(&kb[static_cast<size_t>(b) * nk], nkv, y.k_norm, nctx + b);
+            }
+            const int lo = C.mtp_global[l] ? 0 : (nctx - C.mtp_window > 0 ? nctx - C.mtp_window : 0), nkeys = nctx - lo + B;
+            for (int b = 0; b < B; ++b)
+            {
+                for (int h = 0; h < nh; ++h)
+                {
+                    const float* qh = &q[static_cast<size_t>(b) * nq + h * hd];
+                    const int kvh = h / grp;
+                    const auto key = [&](int i) { return i < nctx - lo ? &s.K[static_cast<size_t>(lo + i) * nk + kvh * hd] : &kb[static_cast<size_t>(i - (nctx - lo)) * nk + kvh * hd]; };
+                    const auto val = [&](int i) { return i < nctx - lo ? &s.V[static_cast<size_t>(lo + i) * nk + kvh * hd] : &vb[static_cast<size_t>(i - (nctx - lo)) * nk + kvh * hd]; };
+                    sc.assign(static_cast<size_t>(nkeys), 0.0f);
+                    float mx = -std::numeric_limits<float>::infinity(), den = 0.0f;
+                    for (int i = 0; i < nkeys; ++i)
+                    {
+                        sc[i] = dot(qh, key(i), hd) * scale;
+                        mx = std::fmax(mx, sc[i]);
+                    }
+                    std::fill(acc.begin(), acc.end(), 0.0f);
+                    for (int i = 0; i < nkeys; ++i)
+                    {
+                        const float e = std::exp(sc[i] - mx);
+                        const float* v = val(i);
+                        den += e;
+                        for (int d = 0; d < hd; ++d) acc[d] += e * v[d];
+                    }
+                    for (int d = 0; d < hd; ++d) og[static_cast<size_t>(h) * hd + d] = rbf(acc[d] / den);
+                }
+                // wo, then the residual: one partial sum per rank (its heads), added in rank order
+                const int per = nq / C.tp;
+                for (int c = 0; c < H; ++c)
+                {
+                    float o = 0.0f;
+                    for (int rk = 0; rk < C.tp; ++rk)
+                    {
+                        const float part = dot(&y.wo[static_cast<size_t>(c) * nq + rk * per], &og[static_cast<size_t>(rk) * per], per);
+                        o = rk ? o + part : part;
+                    }
+                    att[static_cast<size_t>(b) * H + c] = rbf(o);
+                }
+            }
+            for (size_t i = 0; i < res.size(); ++i) res[i] = rbf(res[i] + att[i]);
+            // SwiGLU without caps; the down projection split over the ranks' slices of the intermediate
+            const int iw = I / C.tp;
+            for (int b = 0; b < B; ++b)
+            {
+                float* rb = &res[static_cast<size_t>(b) * H];
+                wnorm(rb, y.post_norm, x.data());
+                for (int i = 0; i < I; ++i)
+                {
+                    const float g = rbf(dot(&y.gate[static_cast<size_t>(i) * H], x.data(), H)), u = rbf(dot(&y.up[static_cast<size_t>(i) * H], x.data(), H));
+                    a[i] = rbf((g * sigmoidf(g)) * u);
+                }
+                for (int c = 0; c < H; ++c)
+                {
+                    float o = 0.0f;
+                    for (int rk = 0; rk < C.tp; ++rk)
+                    {
+                        const float part = dot(&y.down[static_cast<size_t>(c) * I + rk * iw], &a[static_cast<size_t>(rk) * iw], iw);
+                        o = rk ? o + part : part;
+                    }
+                    rb[c] = rbf(rb[c] + rbf(o));
+                }
+            }
+        }
+        std::vector<float> hh(static_cast<size_t>(B) * H);
+        for (int b = 0; b < B; ++b) wnorm(&res[static_cast<size_t>(b) * H], w.norm, &hh[static_cast<size_t>(b) * H]);
+        if (head_hidden) *head_hidden = hh;
+        // the head: mask row step + 1 gives draft step
+        std::vector<float> frnn(static_cast<size_t>(H)), state(static_cast<size_t>(R), 0.0f), latent(static_cast<size_t>(R)), raw(static_cast<size_t>(G)),
+            inp(static_cast<size_t>(2) * R), lg(static_cast<size_t>(V));
+        mix_norm(&taps_[static_cast<size_t>(pos_ - 1) * ntaps() * H], C.mtp_layers, w.head_dflare_norm, frnn.data());
+        std::vector<int> out;
+        if (step_logits) step_logits->clear();
+        int prev = golden;
+        for (int step = 0; step < k; ++step)
+        {
+            const float* hid = &hh[static_cast<size_t>(step + 1) * H];
+            memcpy(inp.data(), state.data(), static_cast<size_t>(R) * sizeof(float));
+            memcpy(&inp[R], &w.markov_w1[static_cast<size_t>(prev) * R], static_cast<size_t>(R) * sizeof(float));
+            for (int g = 0; g < G; ++g)
+            {
+                const float* row = &w.rnn_w[static_cast<size_t>(g) * cols];
+                const float ctx = w.rnn_b[g] + dot(hid, row + 2 * R, H) + dot(frnn.data(), row + 2 * R + H, H);
+                raw[g] = ctx + dot(inp.data(), row, 2 * R);
+            }
+            for (int r = 0; r < R; ++r)
+            {
+                const float gate = rbf(sigmoidf(rbf(raw[r]))), cand = rbf(std::tanh(rbf(raw[R + r])));
+                state[r] = rbf(rbf(gate * state[r]) + rbf(rbf(1.0f - gate) * cand));
+                latent[r] = rbf(std::tanh(rbf(raw[2 * R + r])));
+            }
+            for (int v = 0; v < V; ++v)
+            {
+                const float base = rbf(dot(hid, &W.lm_head[static_cast<size_t>(v) * H], H));
+                const float bias = rbf(fold_b[v] + dot(latent.data(), &fold_w[static_cast<size_t>(v) * R], R));
+                const float z = rbf(base + bias);
+                lg[v] = v < C.valid_vocab ? 30.0f * std::tanh(z / 30.0f) : -std::numeric_limits<float>::infinity();
+            }
+            int tok = 0;
+            if (pick) tok = (*pick)(lg.data(), step);
+            else
+                for (int v = 1; v < V; ++v)
+                    if (lg[v] > lg[tok]) tok = v;
+            if (tok < 0 || tok >= V) throw std::runtime_error("ink2ref: the picked draft token");
+            out.push_back(tok);
+            if (step_logits) step_logits->insert(step_logits->end(), lg.begin(), lg.end());
+            prev = tok;
+        }
+        return out;
     }
 
     // ---- the pieces, public so a test can call one alone
@@ -604,6 +873,78 @@ private:
     {
         std::vector<float> gate, up, down;   // [I][H], [I][H], [H][I], dequantized
     };
+    struct MtpState
+    {
+        std::vector<float> K, V;             // [pos][nkv * hd]  the context rows of one drafter layer
+    };
+
+    void mtp_init()
+    {
+        const auto bad = [](const char* m) { throw std::runtime_error(std::string("ink2ref: MTP ") + m); };
+        const MtpWeights& w = W.mtp;
+        const int H = C.hidden, R = C.markov_rank, nt = static_cast<int>(C.mtp_target_layers.size()), L = C.mtp_layers;
+        if (static_cast<int>(w.layers.size()) != L || static_cast<int>(C.mtp_global.size()) != L) bad("layer count");
+        if (nt < 1 || static_cast<int>(w.fuse_weight.size()) != (L + 1) * nt) bad("taps");
+        for (int t : C.mtp_target_layers)
+            if (t < 0 || t > C.n_layers) bad("target layer");
+        if (C.mtp_block < 2 || C.mtp_drafts < 1 || C.mtp_drafts > C.mtp_block - 1 || C.mtp_window < 1 || R < 1) bad("block, drafts, window or rank");
+        if (C.mtp_inter < 1 || C.mtp_inter % C.tp || C.head_dim % 2) bad("geometry");
+        if (w.rnn_w.size() != static_cast<size_t>(3) * R * (2 * R + 2 * H) || w.markov_w1.size() != static_cast<size_t>(C.vocab) * R) bad("head sizes");
+        mst.resize(static_cast<size_t>(L));
+        fuse_alpha.resize(static_cast<size_t>(L + 1) * nt);
+        for (int c = 0; c <= L; ++c)
+        {
+            const float* f = &w.fuse_weight[static_cast<size_t>(c) * nt];
+            float mx = f[0], sum = 0.0f;
+            for (int t = 1; t < nt; ++t) mx = std::fmax(mx, f[t]);
+            for (int t = 0; t < nt; ++t) sum += std::exp(f[t] - mx);
+            for (int t = 0; t < nt; ++t) fuse_alpha[static_cast<size_t>(c) * nt + t] = rbf(std::exp(f[t] - mx) / sum);
+        }
+        inv_freq.resize(static_cast<size_t>(C.head_dim / 2));
+        for (int j = 0; j < C.head_dim / 2; ++j)
+            inv_freq[j] = static_cast<float>(std::pow(static_cast<double>(C.mtp_rope_theta), -2.0 * j / C.head_dim));
+        // lm_head . hidden_out folded once, in fp64, to BF16
+        fold_w.resize(static_cast<size_t>(C.vocab) * R);
+        fold_b.resize(static_cast<size_t>(C.vocab));
+        for (int v = 0; v < C.vocab; ++v)
+        {
+            const float* lm = &W.lm_head[static_cast<size_t>(v) * H];
+            double b = 0.0;
+            for (int h = 0; h < H; ++h) b += static_cast<double>(lm[h]) * static_cast<double>(w.hidden_out_b[h]);
+            fold_b[v] = rbf_f64(b);
+            for (int r = 0; r < R; ++r)
+            {
+                double s = 0.0;
+                for (int h = 0; h < H; ++h) s += static_cast<double>(lm[h]) * static_cast<double>(w.hidden_out_w[static_cast<size_t>(h) * R + r]);
+                fold_w[static_cast<size_t>(v) * R + r] = rbf_f64(s);
+            }
+        }
+    }
+
+    // The context K / V rows of the M positions just forwarded, from their taps [M][taps][H]: V has no norm and no
+    // rotation. Keeps the taps too (the head reads the last position's).
+    void mtp_context(const std::vector<float>& taps, int M)
+    {
+        const int H = C.hidden, nk = C.n_kv_heads * C.head_dim;
+        const size_t nt = ntaps();
+        std::vector<float> x(static_cast<size_t>(H)), k(static_cast<size_t>(nk));
+        for (int l = 0; l < C.mtp_layers; ++l)
+        {
+            const MtpLayer& y = W.mtp.layers[l];
+            for (int m = 0; m < M; ++m)
+            {
+                mix_norm(&taps[static_cast<size_t>(m) * nt * H], l, y.dflare_norm, x.data());
+                for (int c = 0; c < nk; ++c)
+                {
+                    k[c] = rbf(dot(&y.k_ctx[static_cast<size_t>(c) * H], x.data(), H));
+                    mst[l].V.push_back(rbf(dot(&y.v_ctx[static_cast<size_t>(c) * H], x.data(), H)));
+                }
+                head_norm_rope(k.data(), C.n_kv_heads, y.k_norm_ctx, pos_ + m);
+                mst[l].K.insert(mst[l].K.end(), k.begin(), k.end());
+            }
+        }
+        taps_.insert(taps_.end(), taps.begin(), taps.end());
+    }
 
     // The records of expert e, decoded once.
     const Dense& expert(int l, int e) const
@@ -664,6 +1005,10 @@ private:
     Config C;
     const Weights& W;
     std::vector<State> st;
+    std::vector<MtpState> mst;
+    std::vector<float> taps_;                        // [pos][taps][H]
+    std::vector<float> fuse_alpha, inv_freq;         // [mtp_layers + 1][taps] BF16, [hd / 2]
+    std::vector<float> fold_w, fold_b;               // [V][R], [V] BF16
     mutable std::map<int, Dense> cache;
     int pos_ = 0;
 };

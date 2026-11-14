@@ -520,7 +520,7 @@ fn slices_match_the_checkpoint() {
                             ("markov_head.hidden_out.weight", vec![MARKOV, MARKOV]), ("markov_head.hidden_out.bias", vec![MARKOV])] {
                 eq(&format!("MTP.{n}"), &sh, m.raw(&format!("mtp.{n}")).to_vec());
             }
-            eq("MTP.markov_head.markov_w1", &[per, MARKOV], vrows("mtp.markov_head.markov_w1.weight", MARKOV));
+            eq("MTP.markov_head.markov_w1", &[VOCAB, MARKOV], m.raw("mtp.markov_head.markov_w1.weight").to_vec());
             let msl = rank * (MTP_INTER / nr)..(rank + 1) * (MTP_INTER / nr);
             for l in 0..2 {
                 let t = |x: &str| format!("mtp.layers.{l}.{x}");

@@ -40,7 +40,7 @@ int main()
 #elif G6_MODEL_INK2
     CHECK(m.model == G6_MODEL_ID_INK2 && std::strcmp(m.name, "ink2") == 0 && m.max_sessions == 8 && m.mtp_layers == 5);
     CHECK(m.ds_markov_maxs == 0 && m.ds_block == 0);
-    CHECK(m.caps == (G6_CAP_MTP0 | G6_CAP_KV_STORE));
+    CHECK(m.caps == (G6_CAP_MTP0 | G6_CAP_DSPARK | G6_CAP_KV_STORE));
     CHECK(m.kv_row_bytes == (G6_NR == 1 ? 4096 : 1024) && std::strcmp(m.kv_format, "bf16gqa") == 0);
 #elif G6_MODEL_FLASH
     CHECK(m.model == G6_MODEL_ID_GLM53F && std::strcmp(m.name, "glm-5.3-flash") == 0 && m.max_sessions == 8);

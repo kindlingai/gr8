@@ -13,6 +13,7 @@ using namespace g6s2;
 
 namespace {
 constexpr uint32_t SLOTS = 3, CAP = 512, MAX_PAGES = CAP / 64, NK = 2 * 128, H = 4608, WINDOW = 1024, LAYERS = 48;
+constexpr uint32_t MTP_LAYERS = 5, MTP_WINDOW = 1024, NTAPS = 8;
 
 struct Buffers {
     std::vector<std::vector<uint8_t>> mem;
@@ -38,6 +39,22 @@ struct Buffers {
             y.hist_m = make(size_t(SLOTS) * 3 * H * 2, l * 8 + 7);
             layers.push_back(y);
         }
+    }
+    // the drafter: layer 2 full attention, the others sliding-window; the taps of a slot's last row
+    std::vector<Ink2KvLayer> mtp;
+    uint8_t* taps = nullptr;
+    void add_mtp(uint32_t nk) {
+        const size_t page = size_t(2) * 64 * nk * 2;
+        for (uint32_t l = 0; l < MTP_LAYERS; ++l) {
+            Ink2KvLayer y;
+            y.global = l == 2;
+            if (y.global) {
+                y.pages = make(size_t(SLOTS) * MAX_PAGES * page, 1000 + l * 8 + 1);
+                y.staging = make(size_t(SLOTS) * page, 1000 + l * 8 + 2);
+            } else y.ring = make(size_t(SLOTS) * 2 * MTP_WINDOW * nk * 2, 1000 + l * 8 + 3);
+            mtp.push_back(y);
+        }
+        taps = make(size_t(SLOTS) * NTAPS * H * 2, 2000);
     }
 };
 
@@ -94,6 +111,33 @@ int main() {
     CHECK(d_small.slot_bytes() == d.slot_bytes() && d_small.state_blocks() == d.state_blocks());
     b2.layers.pop_back();
     CHECK(ink2_kv_state(b2.layers, SLOTS, MAX_PAGES, NK, H, WINDOW).format_hash() != d.format_hash());
+
+    // with the drafter: one more page plane, 4 rings, a staging page and the taps; no histories
+    Buffers bm;
+    bm.add_mtp(NK);
+    const KvStateDesc dm = ink2_kv_state(bm.layers, SLOTS, MAX_PAGES, NK, H, WINDOW, 0, bm.mtp, MTP_WINDOW, bm.taps, NTAPS);
+    CHECK(dm.page_planes.size() == 9 && dm.tail_extents.size() == d.tail_extents.size() + 4 + 1 + 1);
+    CHECK(dm.page_block_bytes() == size_t(9) * 64 * 2 * NK * 2);
+    const size_t mtail = tail + size_t(4) * 2 * MTP_WINDOW * NK * 2 + size_t(2) * 64 * NK * 2 + size_t(NTAPS) * H * 2;
+    CHECK(dm.tail_bytes() == mtail && dm.state_payload_bytes(37) == mtail);
+    CHECK(dm.tail_extents.back().base == bm.taps && dm.tail_extents.back().bytes == uint64_t(NTAPS) * H * 2);
+    CHECK(dm.format_hash() != d.format_hash());
+    CHECK(!same_slot(dm, 0, 2, pages));
+    std::vector<uint8_t> mblock(dm.slot_bytes());
+    for (uint32_t p = 0; p < pages; ++p) {
+        dm.pack_page_host(pack_page_handle(0, p, MAX_PAGES), mblock.data());
+        dm.unpack_page_host(pack_page_handle(2, p, MAX_PAGES), mblock.data());
+    }
+    for (uint32_t sub = 0; sub < dm.state_blocks(); ++sub) {
+        dm.pack_state_block_host(pack_state_handle(0, pos), sub, mblock.data());
+        dm.unpack_state_block_host(pack_state_handle(2, pos), sub, mblock.data());
+    }
+    CHECK(same_slot(dm, 0, 2, pages) && !same_slot(dm, 0, 1, pages));
+    // uneven K / V heads with the drafter: the smaller rank's blocks match the larger rank's
+    Buffers bs;
+    bs.add_mtp(NK / 2);
+    const KvStateDesc dm_small = ink2_kv_state(bs.layers, SLOTS, MAX_PAGES, NK / 2, H, WINDOW, NK, bs.mtp, MTP_WINDOW, bs.taps, NTAPS);
+    CHECK(dm_small.slot_bytes() == dm.slot_bytes() && dm_small.state_blocks() == dm.state_blocks());
     std::printf("ink2_kv_state_test: PASS (%zu page planes, %zu tail extents, %u state blocks of %zu bytes)\n", d.page_planes.size(),
                 d.tail_extents.size(), d.state_blocks(), d.slot_bytes());
     return 0;

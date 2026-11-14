@@ -4,11 +4,13 @@
 // m4sim_ink2 (ink2_sim.cu) sums them on one GPU.
 //
 //   g6m4_ink2 --rank R --ips a,b,.. [--ips2 a,b,..] [--proxy-cpu N] --v2-dense DIR [--layers all|0,5,..]
-//             [--top-p-cands 256] [--chunk 8] [--prefill 512] [--cap 262144] [--graph|--no-graph] [--mtp 0]
+//             [--top-p-cands 256] [--chunk 8] [--prefill 512] [--cap 262144] [--graph|--no-graph] [--mtp 0..7]
 //             [--reuse-prefix] [--kv-store SPEC] [--kv-keep S] [--kv-system-after N] [--kv-write-limit F]
 //             --serve DIR --s2-port PORT --s2-sessions N --s2-epoch E [--set-id ID]
 //   without --serve: --tokens 1,2,3 --gen 16 [--temp 0 --top-p 1 --seed 1234] runs one session, the same on every
 //   rank, and prints its tokens (a cluster check without the service).
+//   --mtp K (1..7): the checkpoint's drafter proposes K tokens a round and one step verifies them; the tokens are those
+//   of --mtp 0. Without --serve the run prints its acceptance to stderr.
 //
 // Each collective runs as one fabric step on a single-slot alternating-parity fabric (dual-rail striped when --ips2 is
 // given), so both 2*L-collective prefill steps (head skipped) and (2*L + 1)-collective decode steps share one slot.
@@ -146,7 +148,7 @@ int main(int argc, char** argv)
     if (nc < 0 || nc > 2048 / G6_NR) die("--top-p-cands must be 0.." + std::to_string(2048 / G6_NR));
     if (rank < 0 || rank >= nr) die("--rank must be 0.." + std::to_string(nr - 1));
     if (dir.empty()) die("name the checkpoint: --v2-dense DIR");
-    if (mtp != 0) die("--mtp " + std::to_string(mtp) + ": Inkling-2-Small serves at MTP 0");
+    if (mtp < 0 || mtp > 7) die("--mtp " + std::to_string(mtp) + ": Inkling-2-Small drafts 0 to 7 tokens a round");
     const int max_chunk = s2dir.empty() ? 256 : 8;
     if (s2sess < 1 || s2sess > 8 || chunk < 1 || chunk > max_chunk || prefill < 1 || prefill > 512 || cap < 64)
         die("--s2-sessions 1..8, --chunk 1.." + std::to_string(max_chunk) + ", --prefill 1..512, --cap >= 64");
@@ -161,7 +163,8 @@ int main(int argc, char** argv)
     o.rank0 = rank;
     o.nloc = 1;
     o.slots = s2dir.empty() ? 1 : s2sess;
-    o.max_rows = std::max(s2dir.empty() ? chunk : std::max(prefill, chunk), o.slots);
+    o.mtp = mtp;
+    o.max_rows = std::max(s2dir.empty() ? std::max(chunk, mtp + 1) : std::max(prefill, chunk), o.slots * (mtp + 1));
     o.cap = cap / 64 * 64;
     o.nc = std::max(nc, 1);
     o.layers = layers;
@@ -201,9 +204,9 @@ int main(int argc, char** argv)
         auto& sc = bc.scheduler;
         sc.epoch = static_cast<uint64_t>(s2epoch);
         sc.pool_rows = static_cast<uint32_t>(s2sess) * static_cast<uint32_t>(o.cap);
-        sc.max_rows = static_cast<uint32_t>(std::max(chunk, s2sess));
+        sc.max_rows = static_cast<uint32_t>(std::max(chunk, s2sess * (mtp + 1)));
         sc.max_sessions = static_cast<uint32_t>(s2sess);
-        sc.mtp = 0;
+        sc.mtp = static_cast<uint32_t>(mtp);
         sc.two_lanes = false;
         bc.rank = static_cast<unsigned>(rank);
         bc.ranks = static_cast<unsigned>(nr);
@@ -212,7 +215,7 @@ int main(int argc, char** argv)
         bc.port = static_cast<uint16_t>(s2port);
         bc.timeout = static_cast<unsigned>(knob::s2_timeout());
         bc.runtime_signature = "ink2|tp" + std::to_string(nr) + "|cap" + std::to_string(o.cap) + "|sess" + std::to_string(s2sess) + "|layers " + layers + "|chunk" + std::to_string(chunk) +
-                               "|pf" + std::to_string(prefill) + "|reuse" + std::to_string(reuse ? 1 : 0) + "|nc" + std::to_string(o.nc) + "|set " + set_id + "|" + knob::signature();
+                               "|pf" + std::to_string(prefill) + "|reuse" + std::to_string(reuse ? 1 : 0) + "|nc" + std::to_string(o.nc) + "|mtp" + std::to_string(mtp) + "|set " + set_id + "|" + knob::signature();
         fprintf(stderr, "# rank %d: s2 pool %u logical pages of %d rows, %d sessions, cap %d, max_rows %u, prefill %d\n",
                 rank, sc.pool_rows / 64, 64, s2sess, o.cap, sc.max_rows, o.max_rows);
         try
@@ -252,7 +255,47 @@ int main(int argc, char** argv)
         step(rh, &prompt[static_cast<size_t>(p)], last ? sm.data() : nullptr, out);
         if (last) next = out[static_cast<size_t>(n) - 1].tok;
     }
-    for (int g = 0; g < gen; ++g)
+    if (mtp > 0 && gen > 0)
+    {
+        // A round: one step verifies the drafts (row 0 is the last token, row i the draft i), the rows up to the first
+        // draft that is not the token sampled before it are committed, and the drafter proposes the tokens after them.
+        const RowSample dsm{inv_temp, top_p, seed, 0};
+        std::vector<int> d, tk;
+        std::vector<RowSample> sm;
+        std::vector<uint8_t> acc;
+        long rounds = 0, drafted = 0, accepted = 0;
+        int pos = P;   // the position of the row that takes `next`
+        said.push_back(next);
+        while (static_cast<int>(said.size()) < gen)
+        {
+            const int k = std::min(mtp, gen - static_cast<int>(said.size()) - 1);
+            if (k > 0) e.mtp_draft({0}, {pos - 1}, {next}, {dsm}, k, d);
+            tk.assign(1, next);
+            tk.insert(tk.end(), d.begin(), d.begin() + k);
+            sm.resize(static_cast<size_t>(k) + 1);
+            for (int i = 0; i <= k; ++i) sm[i] = RowSample{inv_temp, top_p, seed, static_cast<uint32_t>(pos + i + 1)};
+            ink2::RowsHost rh;
+            rh.add(0, pos, k + 1);
+            e.forward(rh, tk.data(), sm.data(), out);
+            int a = 0;
+            while (a < k && d[static_cast<size_t>(a)] == out[static_cast<size_t>(a)].tok) ++a;
+            acc.assign(static_cast<size_t>(k) + 1, 0);
+            for (int i = 0; i <= a; ++i)
+            {
+                acc[i] = 1;
+                said.push_back(out[static_cast<size_t>(i)].tok);
+            }
+            e.commit(&acc);
+            next = out[static_cast<size_t>(a)].tok;
+            pos += a + 1;
+            ++rounds;
+            drafted += k;
+            accepted += a;
+        }
+        fprintf(stderr, "# mtp: rounds %ld, drafted %ld, accepted %ld (%.2f tok/round)\n", rounds, drafted, accepted,
+                rounds ? static_cast<double>(rounds + accepted) / static_cast<double>(rounds) : 0.0);
+    }
+    for (int g = 0; mtp == 0 && g < gen; ++g)
     {
         said.push_back(next);
         if (g + 1 == gen) break;
