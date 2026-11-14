@@ -187,13 +187,46 @@ Measured on four GB10 boxes and a KV node on 200G RoCE:
 
 The limits:
 
-- With the rows store, a session past `SHARE_LIMIT` runs alone and other long requests wait for it. Without it, two or
-  three such requests can share decode steps.
+- With the rows store, sessions past `SHARE_LIMIT` take turns with prefill: the slot pool admits as many as `place`
+  holds (`GR8_RT_POOL`), but while one prefills, the others' decode slows to a few tokens a second. Without the rows
+  store, two or three such requests can share decode steps.
 - Buffers that grow with `--cap` (prefill staging, attention states, drafter caches: about 2.6 GB a rank at 655,360)
   take memory that would otherwise be KV pages. At `place=1600` a 4-agent replay took 1,408-1,691 s against about
   1,060 s with the rows store off. Choose `--cap` for the longest session you need.
 - Without `local=`, the rows store keeps a copy of the tail and every local page stays in use, so the longest
   context is still `--cap`.
+
+### Several long sessions: `GR8_CAP_TOTAL`
+
+`--cap` is both one session's longest context and the S2 pool that every session shares, so by default all sessions
+together hold at most `--cap` tokens. With the rows store (`KV_ROWS` with `local=` and `place=`), `GR8_CAP_TOTAL`
+makes the pool larger while `--cap` stays one session's limit and keeps sizing the per-request buffers. For N sessions
+of `--cap` each:
+
+```
+GR8_CAP_TOTAL >= place x 64 + N x (CAP - SHARE_LIMIT)
+```
+
+Each session's tail needs records on the KV node, so `size=` must cover the pool's tails: the boot prints the record ids
+it needs and stops when `size=` gives fewer. The drafter keeps every token of every session on the boxes (about 1.4 KB
+a token), and the records' index keys stay in GPU memory (about 177 KB per record id a rank), so a larger total costs
+memory beside the weights. The front end still holds one request to `--cap`. Until the launcher has an option for it,
+set it through `EXTRA_ENV`:
+
+```
+KV_FORMAT=int4
+SHARE_LIMIT=16384
+CAP=524288
+KV_ROWS=remote:auto,size=17G,local=40,place=1200
+EXTRA_ENV="GR8_CAP_TOTAL=2108416"
+```
+
+That pool holds four 512K sessions (2.1M tokens) on four GB10 boxes; the KV node needs 4 x 17G. Measured with four
+~504K-token prompts sent at once: every needle was found, the four prefills took turns and each answered after about
+2,500-2,700 s (about 760 tokens a second in all), and the tightest box kept 311 MiB free. At a small `--cap` the same
+setup passed a request at `--cap` and refused one past it, and a session's next turn took 0.2 s from its records. `place` cannot pass one
+table's share of the pages, `SHARE_LIMIT / 64 + (CAP - SHARE_LIMIT) / 64 / 4`: at a small `--cap` it binds, and fewer
+sessions past `SHARE_LIMIT` run at once.
 
 [engine/kvman-rs/REMOTE-TIER.md](../engine/kvman-rs/REMOTE-TIER.md) covers the block stores, their transports and
 measurements. `./gr8 knobs KV_STORE KV_ROWS` describes every `KV_STORE` and `KV_ROWS` field, and
