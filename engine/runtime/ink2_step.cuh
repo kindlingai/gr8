@@ -18,6 +18,7 @@
 #include "../kernels/ink2_moe.cuh"
 #include "../attn/ink2_attn.cuh"
 #include "../kernels/ink2_mtp.cuh"
+#include "../kernels/ink2_head.cuh"
 #include "../model_geom_ink2.h"
 #include "../loader/g6pack.h"
 #include "../loader-rs/g6load.h"
@@ -564,6 +565,8 @@ struct Options
     std::string layers = "all";
     bool whole_image = false;
     bool vision = false; // run the vision tower when the checkpoint has one (image input)
+    // the speed paths: -1 = what the knob says (GR8_INK2_*), 0 = off, 1 = on
+    int fast_allreduce = -1, gpu_head_pack = -1, cublas_prefill = -1, tc_prefill_attn = -1;
 };
 
 class Engine
@@ -608,6 +611,10 @@ public:
         c.rel_win = static_cast<int>(a.dim(lname(l0, "rel_logits_proj"), 1));
         vr = static_cast<int>(a.dim("G.lm_head", 0));
         max_pps = (o.cap + ink2::KV_PAGE_TOKENS - 1) / ink2::KV_PAGE_TOKENS;
+        use_far = o.fast_allreduce < 0 ? knob::ink2_fast_allreduce() : o.fast_allreduce != 0;
+        use_ghp = (o.gpu_head_pack < 0 ? knob::ink2_gpu_head_pack() : o.gpu_head_pack != 0) && o.nc <= ink2::INK2_HEAD_MAX_NC;
+        use_blas = o.cublas_prefill < 0 ? knob::ink2_cublas_prefill() : o.cublas_prefill != 0;
+        use_tc = o.tc_prefill_attn < 0 ? knob::ink2_tc_prefill_attn() : o.tc_prefill_attn != 0;
         const size_t mh = static_cast<size_t>(o.max_rows) * c.H;
         embed = a.get<uint16_t>("G.embed");
         embed_norm = a.get<uint16_t>("G.embed_norm");
@@ -635,6 +642,7 @@ public:
         parts = dalloc<float>(static_cast<size_t>(o.nr) * part_stride);
         host_logits.resize(static_cast<size_t>(o.max_rows) * vr);
         head_parts.resize(static_cast<size_t>(o.nr) * head_bytes(o.max_rows));
+        if (use_ghp) head_dev = dalloc<uint8_t>(head_bytes(std::max(o.max_rows, o.slots)));
         if (o.mtp > 0) init_mtp();
         if (o.vision && a.find("V.proj_out.weight")) init_vision();
         INK2RT_CK(cudaDeviceSynchronize());
@@ -806,6 +814,12 @@ public:
         {
             const int r = o.rank0 + i;
             ink2::lm_head(hf, lm[i], M, c.H, vr, r * vr, c.valid, logits[i], 0);
+            if (use_ghp)
+            {
+                ink2::head_pack_dev(logits[i], M, vr, r * vr, o.nc, head_dev, rb, 0);
+                INK2RT_CK(cudaMemcpy(&head_parts[static_cast<size_t>(r) * hb], head_dev, hb, cudaMemcpyDeviceToHost));
+                continue;
+            }
             INK2RT_CK(cudaMemcpy(host_logits.data(), logits[i], sizeof(float) * static_cast<size_t>(M) * vr, cudaMemcpyDeviceToHost));
             for (int m = 0; m < M; ++m) head_pack(&host_logits[static_cast<size_t>(m) * vr], vr, r * vr, o.nc, &head_parts[static_cast<size_t>(r) * hb + static_cast<size_t>(m) * rb]);
         }
@@ -953,6 +967,12 @@ public:
                 MtpWork& w = mwk[static_cast<size_t>(i)];
                 ink2::gemm_f32(m_latent, w.fold_w, S, R, vr, w.lg, 0);
                 ink2::k_ink2_mtp_logits<<<ink2::cells_grid(static_cast<size_t>(S) * vr), 256, 0, 0>>>(w.base, w.fold_b, w.lg, S, K, step, vr, r * vr, c.valid);
+                if (use_ghp)
+                {
+                    ink2::head_pack_dev(w.lg, S, vr, r * vr, o.nc, head_dev, rb, 0);
+                    INK2RT_CK(cudaMemcpy(&mtp_head_parts[static_cast<size_t>(r) * hb], head_dev, hb, cudaMemcpyDeviceToHost));
+                    continue;
+                }
                 INK2RT_CK(cudaMemcpy(mtp_host_logits.data(), w.lg, sizeof(float) * static_cast<size_t>(S) * vr, cudaMemcpyDeviceToHost));
                 for (int s = 0; s < S; ++s)
                     head_pack(&mtp_host_logits[static_cast<size_t>(s) * vr], vr, r * vr, o.nc, &mtp_head_parts[static_cast<size_t>(r) * hb + static_cast<size_t>(s) * rb]);
@@ -1445,6 +1465,8 @@ private:
     std::vector<uint16_t*> states;
     std::vector<float> host_logits;
     std::vector<uint8_t> head_parts;
+    uint8_t* head_dev = nullptr;   // [rows][head_row_bytes]: the device's packed head rows (use_ghp)
+    bool use_far = false, use_ghp = false, use_blas = false, use_tc = false;
     const uint16_t *embed = nullptr, *embed_norm = nullptr, *final_norm = nullptr;
     const float* output_query = nullptr;
     int *d_slot = nullptr, *d_pos = nullptr, *d_run0 = nullptr, *toks = nullptr;
