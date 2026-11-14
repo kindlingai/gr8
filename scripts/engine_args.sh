@@ -271,15 +271,27 @@ ds41_defaults() {
     pfs="$pfs GR8_DS_PF_V2_L20_TAIL=1 GR8_DS_PF_V2_SEND_FFN_OPT=3 GR8_DS_PF_V2_BF16_TC=7"
     [ "$pw" -gt 8192 ] && pfs="$pfs GR8_DS_PF_V2_W16K=1"
   fi
+  # Park finished chats in their session slots instead of copying their state through the prefix cache.
+  # Explicit park overrides win below. Keep disabled-cache spellings out of the default, including the old alias
+  # after this file's G6_ -> GR8_ normalization.
+  REUSE=${REUSE:-1}
+  local park= cache_mib_zero=0 word
+  for word in ${EXTRA_ENV:-}; do
+    case ${word%%=*} in
+      GR8_DS_CACHE_MIB|G6_DS41_CACHE_MIB|GR8_DS41_CACHE_MIB)
+        [ "${word#*=}" != 0 ] || cache_mib_zero=1 ;;
+    esac
+  done
+  if [ "$REUSE" = 1 ] && [ "$SESS" -ge 2 ] && [ "$cache_mib_zero" = 0 ]; then park=GR8_DS_PARK=1; fi
   DS41_TUNED=
   for kv in GR8_DS_MTP=5 GR8_DS_ENGRAM_MTP=1 GR8_DS_PREFILL_MIN=2 GR8_DS_PREFILL_W=$pw GR8_DS_ATTN_PW=$pw GR8_DS41_IDX_PW=$pw GR8_S2_DECODE_PF=$dpf \
       $pfs GR8_DS_PF_RS=1 GR8_DS_PF_DIRECT=1 GR8_DS_PF_GATHER=1 GR8_DS_PF_LATE_FINAL=1 GR8_DS_WAIT_K=2 GR8_DS_DEC_STAGE=1 \
       GR8_DS_ATTN_CPA=1 GR8_DS_DSP_GV=1 GR8_DS_RO_ORDER=1 GR8_DS_GATE_RO=1 GR8_DS_ENGRAM_LOOKAHEAD=1 GR8_DS_ATTN_TC=1 \
       GR8_DS_MOE_TC=1 GR8_DS_PF_POOL=4 GR8_DS_SRC_FAST=3 GR8_DS_MOE_PDL=1 GR8_DS41_ADMIT_KEEP_SCRATCH=1 GR8_DS41_PUB16=1 \
-      GR8_DS41_GV_QUAD=1 GR8_DS_COMP_FP4=1; do
+      GR8_DS41_GV_QUAD=1 GR8_DS_COMP_FP4=1 $park; do
     case " ${EXTRA_ENV:-} " in *" ${kv%%=*}="*) ;; *) DS41_TUNED="$DS41_TUNED$kv " ;; esac
   done
-  S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0; REUSE=${REUSE:-1}
+  S2PORT=${S2PORT:-7341}; DFLASH=0; SPEC_ADAPT=0; PF_OWN=0
 }
 
 # Inkling-2-Small: TP 6 or 4, MTP 0 to 7 drafts a round from the checkpoint's drafter layers (0, the default: no

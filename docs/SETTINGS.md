@@ -1,5 +1,13 @@
 # Engine settings
 
+## DeepSeek served prefix parking
+
+The ds41 launcher sets `GR8_DS_PARK=1` with `REUSE=1` and `SESS>=2`, unless `EXTRA_ENV` disables the cache.
+It parks completed chats in their slots and snapshots on eviction instead of at every request end. Explicit settings
+win; `--extra-env GR8_DS_PARK=0` or `EXTRA_ENV=GR8_DS_PARK=0` restores request-end snapshots. The raw engine knob
+still defaults to 0. See [DeepSeek](DEEPSEEK.md#forced-tools-and-parked-chats) for the frontend's separate
+`--forced-tool-thinking 1` / `FORCED_TOOL_THINKING=1` prompt rollback and `--default-reasoning-effort none`.
+
 ## TP=4 INT4 folded decode default
 
 GLM-5.3 at `TP=4` defaults to `KV_FORMAT=int4`: `bin/g6m4-int4`, `CAP=513536`

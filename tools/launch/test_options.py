@@ -27,6 +27,20 @@ class FileTests(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()
 
+    def test_forced_tool_thinking_defaults_validation_and_config(self):
+        self.assertEqual(opt.parse(['--no-config', '--peers', PEERS], GLM).get('FORCED_TOOL_THINKING'), '0')
+        for value in ('0', '1'):
+            o = opt.parse(['--no-config', '--peers', PEERS, '--forced-tool-thinking', value], GLM)
+            opt.validate(o)
+            self.assertEqual(o.get('FORCED_TOOL_THINKING'), value)
+        with self.assertRaisesRegex(opt.OptionError, '--forced-tool-thinking yes: want 0 or 1'):
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--forced-tool-thinking', 'yes'], GLM))
+        with tempfile.TemporaryDirectory() as d:
+            config = write(d, 'cluster.env', 'FORCED_TOOL_THINKING=1\n')
+            o = opt.parse(['@' + config, '--peers', PEERS], GLM)
+            opt.validate(o)
+            self.assertEqual(o.get('FORCED_TOOL_THINKING'), '1')
+
     def test_parse(self):
         p = write(self.d, 'c.env', '# comment\n\nexport CAP=262144\nEXTRA_ENV="A=1 B=2"\nSESS=4   # sessions\n'
                                     "MODEL='/data/x y'\nHOSTS=\"n1 n2\"\n")

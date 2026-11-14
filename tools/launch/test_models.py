@@ -356,6 +356,28 @@ class Ds41Tests(unittest.TestCase):
         self.assertEqual((models.of(o), o.get('GROUP'), S.engine_bin(o)), (models.DS41, 'gr8-ds41', 'g6m4_ds41'))
         self.assertEqual(models.DS41.architecture, 'DeepseekV41ForCausalLM')
 
+    def test_slot_parking_default_conditions_and_rollback(self):
+        for args, want in [
+            ((), '1'),
+            (('--reuse', '1', '--sess', '2'), '1'),
+            (('--reuse', '0'), None),
+            (('--sess', '1'), None),
+            (('--extra-env', 'GR8_DS_PARK=0'), '0'),
+            (('--extra-env', 'GR8_DS_PARK=1'), '1'),
+            (('--extra-env', 'G6_DS_PARK=0'), '0'),
+            (('--extra-env', 'GR8_DS_CACHE_MIB=0'), None),
+            (('--extra-env', 'G6_DS41_CACHE_MIB=0'), None),
+            (('--extra-env', 'GR8_DS_CACHE_MIB=1024'), '1'),
+        ]:
+            with self.subTest(args=args):
+                env = opt.engine_plan(ds41(*args))['env']
+                self.assertEqual([e for e in env if e.startswith('GR8_DS_PARK=')],
+                                 [] if want is None else ['GR8_DS_PARK=' + want])
+        # The shell normalizes the legacy cache alias to this spelling. Test default selection without claiming
+        # that the knob validator accepts that intermediate spelling (or a zero cache size).
+        o = opt.parse(['--no-config', '--tp', '4', '--peers', PEERS, '--extra-env', 'GR8_DS41_CACHE_MIB=0'], {'GR8_MODEL': 'ds41'})
+        self.assertNotIn('GR8_DS_PARK=1', opt.engine_plan(o)['env'])
+
     def test_kv_stores(self):
         for store in ('mem:,size=1G', 'ssd:/tmp/kv,size=8G,persist=on', 'remote:localhost:7349,size=2G'):
             plan = opt.engine_plan(ds41('--reuse', '1', '--kv-store', store,

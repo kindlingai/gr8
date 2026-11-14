@@ -1126,6 +1126,8 @@ class Supervisor:
             front += ['--default-think-end-boost', o.get('DEFAULT_THINK_END_BOOST')]
         if o.get('DEFAULT_SEQUENCE_PENALTY'):
             front += ['--default-sequence-penalty', o.get('DEFAULT_SEQUENCE_PENALTY')]
+        if o.get('FORCED_TOOL_THINKING') == '1':
+            front += ['--forced-tool-thinking', '1']
         if o.get('TOOL_REPEAT_GUARD') == '1':
             front += ['--tool-repeat-guard', '1']
             for k, dflt in (('TOOL_REPEAT_GUARD_REPEATS', '2'), ('TOOL_REPEAT_GUARD_TEMPERATURE', '0.7'),

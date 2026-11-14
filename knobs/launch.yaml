@@ -160,7 +160,8 @@ options:
     doc: >-
       the head's front end: reasoning_effort for a chat request that names none: minimal, low, medium, high, xhigh or
       max, which the template hears as the nearest level it names (README, "Thinking"). Unset = the template's default
-      (max on GLM 5.3). none is refused: GLM 5.3 cannot turn thinking off
+      (max on GLM 5.3). ds41 also accepts an integer 1..100; none disables thinking by default on ds41 and
+      inkling, but is refused on GLM 5.3
   DEFAULT_THINKING_BUDGET:
     scope: box
     default: "0"
@@ -215,6 +216,14 @@ options:
       such as a timestamp stay free). The guard scope applies only in the repeated-tool-call guard's retry, against
       the call it took back, so a retry cannot reproduce it. M or C 0 = the scope off. A request's sequence_penalty
       (the same string, "off" or false) wins
+  FORCED_TOOL_THINKING:
+    scope: box
+    default: "0"
+    doc: >-
+      the head's ds41 front end: 0 renders a forced tool_choice (required or a named function) in native non-thinking
+      mode unless the request explicitly enables thinking or its assistant history carries reasoning. 1 keeps the
+      server's default thinking mode and closes the think block in the forced insert (the previous behavior).
+      Explicit thinking switches and efforts still win; other dialects are unchanged
   TOOL_REPEAT_GUARD:
     scope: box
     default: "0"

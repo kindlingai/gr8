@@ -468,9 +468,9 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     let choice = ToolChoice::parse(tools.as_ref(), body.get("tool_choice"))?;
     let rf = jsonmode::parse_response_format(body.get("response_format"), &st.grammars)?;
     let ds = st.dialect == Dialect::Ds41;
-    let (th, ds_effort, hf_enable, ink_effort) = match st.dialect {
+    let (mut th, ds_effort, hf_enable, ink_effort) = match st.dialect {
         Dialect::Ds41 => {
-            let (th, e) = dialect::resolve_ds(body, st.thinking, st.ds_effort)?;
+            let (th, e) = dialect::resolve_ds(body, st.thinking, st.ds_effort, st.ds_thinking_default)?;
             (th, e, None, None)
         }
         Dialect::Hf => {
@@ -507,6 +507,18 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         Some(h) => append_hint(body.get("messages"), &h)?,
         None => body.get("messages").cloned().unwrap_or(Value::Array(Vec::new())),
     };
+    // A forced call cannot generate reasoning before its token-zero insert. Use native chat mode unless the
+    // request or its history needs thinking; keep that history's prompt prefix unchanged.
+    if ds
+        && !st.forced_tool_thinking
+        && choice.is_forced()
+        && !cfm_on
+        && !th.off
+        && !dialect::ds_explicit_thinking_on(body)
+        && !dialect::ds_has_prior_reasoning(Some(&messages))
+    {
+        th.off = true;
+    }
     let t0 = std::time::Instant::now();
     let kw_system = kw.clone();
     let mut images = Vec::new();
@@ -1170,8 +1182,8 @@ async fn chat_stream(
                 break;
             }
         }
+        gen.finish_stats().await;
         if include_usage {
-            gen.finish_stats().await;
             let res = &gen.res;
             let mut o = Vec::with_capacity(256);
             let mut c = head(&mut o, &gen.id, "chat.completion.chunk", created, &st.model_name);
@@ -1528,8 +1540,8 @@ async fn completions_stream(st: &'static State, body: Map<String, Value>, mut ge
                 return Ok(());
             }
         }
+        gen.finish_stats().await;
         if include_usage {
-            gen.finish_stats().await;
             let res = &gen.res;
             let mut o = Vec::with_capacity(256);
             let mut c = head(&mut o, &gen.id, "text_completion", created, &st.model_name);
@@ -1581,9 +1593,21 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
             }
             if st.dialect == Dialect::Ds41 {
                 // the same effort, thinking switch and prompt text as a chat request, so the counts agree
-                let (th, effort) = dialect::resolve_ds(&body, st.thinking, st.ds_effort)?;
+                let (mut th, effort) = dialect::resolve_ds(&body, st.thinking, st.ds_effort, st.ds_thinking_default)?;
                 let tools = normalize_tools(body.get("tools"))?;
                 let (agp, cfm) = dialect::ds_gen_flags(&body)?;
+                if body.contains_key("tool_choice") {
+                    let choice = ToolChoice::parse(tools.as_ref(), body.get("tool_choice"))?;
+                    if !st.forced_tool_thinking
+                        && choice.is_forced()
+                        && !cfm
+                        && !th.off
+                        && !dialect::ds_explicit_thinking_on(&body)
+                        && !dialect::ds_has_prior_reasoning(body.get("messages"))
+                    {
+                        th.off = true;
+                    }
+                }
                 let (text, images) =
                     dialect::ds_prompt(body.get("messages"), tools.as_ref(), !th.off, effort, agp, cfm)?;
                 let ids = st.tok.aencode(text, false).await.map_err(|e| ApiError::new(500, &e, None))?;

@@ -31,7 +31,8 @@ BASELINES = [
     ('glm53f', '2', 'int4', '', '9d164756e667cdfdff7f7184eb7f31b34f80c98931dd2f6b56ff2033e0bbae74'),
     ('glm53f', '1', 'fp8', '', '0fe0f8d5676effcb5d41571becaa710730acb0ae90ecd3d7177d68d922a2a661'),
     ('glm53f', '1', 'int4', '', '60f4509f961494b35ddb0744001c46e99c6c7e929b73bd676962c4a263304b34'),
-    ('ds41', '4', 'fp8', '', '87d29e890f4cd1b40c4bb5972d7aaa603ebbdf8c1b7986a9734b32b6959128fb'),
+    # DS41's served defaults add GR8_DS_PARK=1; every other command word is unchanged.
+    ('ds41', '4', 'fp8', '', 'ac6eb9b54c79e56279316bac02216f22eea5cf5782e6c154eb7b2fc11082ffe0'),
     ('ink2', '6', 'fp8', '', 'a6a6ecc724435d67a8bc23e50ba70154a5fdfdad9ba8adf2e7ee3274f593a7fa'),
     ('ink2', '4', 'fp8', '', 'a6a6ecc724435d67a8bc23e50ba70154a5fdfdad9ba8adf2e7ee3274f593a7fa'),
     ('pseudo', '1', 'fp8', '', '4da55a9cecc1bde601e0afb471417298eabc014fe5e58cd04be2b7838377f50a'),

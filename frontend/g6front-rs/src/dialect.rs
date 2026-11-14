@@ -227,15 +227,17 @@ pub fn ds_effort_name(s: &str) -> Option<u32> {
     })
 }
 
-/// `--default-reasoning-effort` for ds41: a name or an integer 1..=100. `none` is refused, as for GLM: it would turn
-/// thinking off for every request.
-pub fn parse_ds_default_effort(s: &str) -> Result<u32, String> {
+/// `--default-reasoning-effort` for ds41: `none` disables thinking by default; a name or integer 1..=100 enables it.
+pub fn parse_ds_default_effort(s: &str) -> Result<Option<u32>, String> {
+    if s == "none" {
+        return Ok(None);
+    }
     if let Some(n) = ds_effort_name(s) {
-        return Ok(n);
+        return Ok(Some(n));
     }
     match s.parse::<u32>() {
-        Ok(n) if (1..=100).contains(&n) => Ok(n),
-        _ => Err(format!("--default-reasoning-effort {s}: want an integer from 1 to 100, or minimal, low, medium, high, xhigh or max")),
+        Ok(n) if (1..=100).contains(&n) => Ok(Some(n)),
+        _ => Err(format!("--default-reasoning-effort {s}: want an integer from 1 to 100, or none, minimal, low, medium, high, xhigh or max")),
     }
 }
 
@@ -264,11 +266,12 @@ fn read_effort(v: &Value) -> Result<Option<u32>, ApiError> {
 /// * `thinking_budget` as for GLM (`thinking::parse_budget`).
 ///
 /// Returns the common `Thinking` (`effort` unused: DeepSeek's is a number) and the number the prompt writes. Thinking is
-/// on unless a switch or `none` turns it off; the server needs no `--allow-thinking-off` for DeepSeek.
+/// inherited from the server unless a switch or effort overrides it; DeepSeek needs no `--allow-thinking-off`.
 pub fn resolve_ds(
     body: &Map<String, Value>,
     defaults: thinking::Defaults,
     default_effort: u32,
+    default_thinking: bool,
 ) -> Result<(Thinking, u32), ApiError> {
     let kw = body.get("chat_template_kwargs").and_then(Value::as_object);
     let t = non_null(kw, "thinking").map(|v| pyjson::truthy(Some(v)));
@@ -284,7 +287,8 @@ pub fn resolve_ds(
     };
     let off = match switch {
         Some(s) => !s,
-        None => none,
+        None if named.is_some() => none,
+        None => !default_thinking,
     };
     if off {
         return Ok((
@@ -298,6 +302,32 @@ pub fn resolve_ds(
         Some(n) => (Limit::Tokens(n as u64), true),
     };
     Ok((Thinking { effort: None, budget, budget_explicit, off: false }, effort.unwrap_or(default_effort)))
+}
+
+/// Whether the request explicitly enables DeepSeek thinking. Match `resolve_ds`'s non-null alias precedence.
+pub fn ds_explicit_thinking_on(body: &Map<String, Value>) -> bool {
+    let kw = body.get("chat_template_kwargs").and_then(Value::as_object);
+    if let Some(v) = non_null(kw, "thinking").or_else(|| non_null(kw, "enable_thinking")) {
+        return pyjson::truthy(Some(v));
+    }
+    non_null(Some(body), "reasoning_effort")
+        .or_else(|| non_null(kw, "reasoning_effort"))
+        .is_some_and(|v| v.as_str() != Some("none"))
+}
+
+/// Prior reasoning that the DeepSeek renderer will keep. Match `dschat::normalise`: a non-null
+/// `reasoning_content` wins over `reasoning`, even when it is empty or not a string.
+pub fn ds_has_prior_reasoning(messages: Option<&Value>) -> bool {
+    messages.and_then(Value::as_array).is_some_and(|items| {
+        items.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("assistant")
+                && m.get("reasoning_content")
+                    .filter(|v| !v.is_null())
+                    .or_else(|| m.get("reasoning"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+        })
+    })
 }
 
 // ---- the prompt ------------------------------------------------------------------------------------------------------
@@ -585,7 +615,7 @@ mod tests {
     }
 
     fn res(v: Value) -> Result<(Thinking, u32), ApiError> {
-        resolve_ds(&body(v), thinking::Defaults::default(), DS_DEFAULT_EFFORT)
+        resolve_ds(&body(v), thinking::Defaults::default(), DS_DEFAULT_EFFORT, true)
     }
 
     #[test]
@@ -656,24 +686,81 @@ mod tests {
     #[test]
     fn the_budget_follows_the_glm_rules_and_the_server_default_effort_is_used() {
         let d = thinking::Defaults { effort: None, budget: Limit::Tokens(900), allow_off: false };
-        let r = |v: Value| resolve_ds(&body(v), d, 50).unwrap();
+        let r = |v: Value| resolve_ds(&body(v), d, 50, true).unwrap();
         let (t, e) = r(json!({}));
         assert_eq!((t.budget, t.budget_explicit, e), (Limit::Tokens(900), false, 50));
         let (t, _) = r(json!({"thinking_budget": 100}));
         assert_eq!((t.budget, t.budget_explicit), (Limit::Tokens(100), true));
         let (t, _) = r(json!({"thinking_budget": -1}));
         assert_eq!((t.budget, t.budget_explicit), (Limit::Tokens(0), false));
-        let e = resolve_ds(&body(json!({"thinking_budget": "x"})), d, 50).err().unwrap();
+        let e = resolve_ds(&body(json!({"thinking_budget": "x"})), d, 50, true).err().unwrap();
         assert_eq!(e.status, 400);
     }
 
     #[test]
     fn server_default_effort_accepts_names_and_integers() {
-        assert_eq!(parse_ds_default_effort("low"), Ok(50));
-        assert_eq!(parse_ds_default_effort("37"), Ok(37));
-        assert!(parse_ds_default_effort("none").is_err());
+        assert_eq!(parse_ds_default_effort("low"), Ok(Some(50)));
+        assert_eq!(parse_ds_default_effort("37"), Ok(Some(37)));
+        assert_eq!(parse_ds_default_effort("none"), Ok(None));
         assert!(parse_ds_default_effort("0").is_err());
         assert!(parse_ds_default_effort("101").is_err());
+    }
+
+    #[test]
+    fn server_default_thinking_off_can_be_overridden_per_request() {
+        for (v, off, effort) in [
+            (json!({}), true, 75),
+            (json!({"reasoning_effort": null}), true, 75),
+            (json!({"reasoning_effort": "low"}), false, 50),
+            (json!({"chat_template_kwargs": {"thinking": true}}), false, 75),
+            (json!({"chat_template_kwargs": {"thinking": null, "enable_thinking": true}}), false, 75),
+            (json!({"reasoning_effort": "low", "chat_template_kwargs": {"thinking": false}}), true, 75),
+            (json!({"reasoning_effort": null, "chat_template_kwargs": {"reasoning_effort": 37}}), false, 37),
+        ] {
+            let (t, e) = resolve_ds(&body(v.clone()), thinking::Defaults::default(), 75, false).unwrap();
+            assert_eq!((t.off, e), (off, effort), "{v}");
+        }
+    }
+
+    #[test]
+    fn explicit_ds_thinking_uses_the_same_precedence_as_resolution() {
+        for (v, on) in [
+            (json!({}), false),
+            (json!({"reasoning_effort": null}), false),
+            (json!({"reasoning_effort": "none"}), false),
+            (json!({"reasoning_effort": "high"}), true),
+            (json!({"reasoning_effort": 37}), true),
+            (json!({"chat_template_kwargs": {"reasoning_effort": "low"}}), true),
+            (json!({"reasoning_effort": "none", "chat_template_kwargs": {"reasoning_effort": "low"}}), false),
+            (json!({"reasoning_effort": "none", "chat_template_kwargs": {"thinking": true}}), true),
+            (json!({"reasoning_effort": "high", "chat_template_kwargs": {"thinking": false}}), false),
+            (json!({"chat_template_kwargs": {"thinking": null, "enable_thinking": true}}), true),
+            (json!({"chat_template_kwargs": {"thinking": false, "enable_thinking": true}}), false),
+            (json!({"chat_template_kwargs": {"thinking": "yes"}}), true),
+            (json!({"chat_template_kwargs": {"thinking": ""}}), false),
+        ] {
+            assert_eq!(ds_explicit_thinking_on(&body(v.clone())), on, "{v}");
+        }
+    }
+
+    #[test]
+    fn prior_ds_reasoning_matches_the_renderers_alias_rule() {
+        assert!(!ds_has_prior_reasoning(None));
+        for (v, has) in [
+            (json!(null), false),
+            (json!({}), false),
+            (json!([]), false),
+            (json!([{"role": "user", "reasoning": "why"}]), false),
+            (json!([{"role": "assistant", "reasoning": "why"}]), true),
+            (json!([{"role": "assistant", "reasoning_content": "why"}]), true),
+            (json!([{"role": "assistant", "reasoning_content": null, "reasoning": "why"}]), true),
+            (json!([{"role": "assistant", "reasoning_content": "", "reasoning": "why"}]), false),
+            (json!([{"role": "assistant", "reasoning_content": 1, "reasoning": "why"}]), false),
+            (json!([{"role": "assistant", "reasoning": ""}]), false),
+            (json!([{"role": "assistant", "reasoning_content": null}]), false),
+        ] {
+            assert_eq!(ds_has_prior_reasoning(Some(&v)), has, "{v}");
+        }
     }
 
     #[test]

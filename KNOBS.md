@@ -5,6 +5,11 @@ The options of `./gr8 glm53`, the launchers in `scripts/` and the build. Each kn
 `--work-dir` for `GR8_WORK_DIR`. The engine's own environment and flags are in [docs/SETTINGS.md](docs/SETTINGS.md), and
 [docs/ENV.md](docs/ENV.md) lists every `GR8_*` engine variable.
 
+DS41 forced tool calls use native non-thinking mode unless a request or its history requires thinking; roll back
+with `--forced-tool-thinking 1` / `FORCED_TOOL_THINKING=1`. `--default-reasoning-effort none` disables DS41 thinking
+by default. DS41 also parks finished chats with prefix reuse and at least two sessions; roll back with
+`--extra-env GR8_DS_PARK=0` / `EXTRA_ENV=GR8_DS_PARK=0`. See [DeepSeek](docs/DEEPSEEK.md#forced-tools-and-parked-chats).
+
 The launcher prints its options:
 
 - `./gr8 knobs` lists every option of `./gr8 <model>` and `./gr8 kv`: its flag, its scope, its default and what it does.

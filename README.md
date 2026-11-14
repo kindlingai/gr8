@@ -163,6 +163,10 @@ If you are an agent (or developer) building on gr8, start from the matching entr
   checkpoints in the same kinds of store
   ([experimental](docs/FLASH.md#session-checkpoints-gr8_glm53f_cachealigned-experimental)). DeepSeek-V4.1-Flash can store full pages plus exact rolling state in the same tiers
   ([DS41 session stores](docs/DEEPSEEK.md#tiered-session-stores)); live GPU validation is pending.
+- **DeepSeek tool turns.** Forced tools use native non-thinking mode unless thinking is explicitly requested or in
+  the history (`--forced-tool-thinking 1` restores the old prompt). With prefix reuse and two or more sessions,
+  completed chats stay in their slots for follow-ups (`--extra-env GR8_DS_PARK=0` restores snapshot copies).
+  See [DeepSeek defaults and rollbacks](docs/DEEPSEEK.md#forced-tools-and-parked-chats).
 - **Image input.** DeepSeek-V4.1-Flash and GLM-5.3-Flash take images in chat requests (opt-in, `GR8_DS41_VISION=1`,
   [docs/DS41-VISION.md](docs/DS41-VISION.md); `GR8_GLM53F_VISION=1`, [docs/FLASH-VISION.md](docs/FLASH-VISION.md)).
 - **A Docker image.** `ghcr.io/kindlingai/gr8` has the engine for every TP width and all three models, so GLM-5.3 on

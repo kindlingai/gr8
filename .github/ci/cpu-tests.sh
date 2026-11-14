@@ -87,5 +87,7 @@ STEERING_BOOT_CHECK="$T/steering_boot_check" python3 -m unittest discover -s too
 
 step "Rust: frontend/g6front-rs"
 (cd frontend/g6front-rs && cargo test --locked)
+cargo build --release --locked --manifest-path frontend/g6front-rs/Cargo.toml
+python3 -m unittest discover -s frontend/tests -p test_ds41_api.py
 step "Rust: frontend/pseudo-engine (and its weights compile)"
 (cd frontend/pseudo-engine && cargo test --locked && cargo run --locked --quiet -- --weights model/responses.toml --check)
