@@ -16,6 +16,7 @@
 // given), so both 2*L-collective prefill steps (head skipped) and (2*L + 1)-collective decode steps share one slot.
 #include "ink2_step.cuh"
 #include "../comms/fabric.h"
+#include "../kernels/ink2_fabric.cuh"
 #include "s2/ink2_native.cuh"
 #include "vision_id.h"
 #include <chrono>
@@ -67,6 +68,48 @@ struct Wire
         if (!fab.wait_proxy_idle(60.0)) die("rank " + std::to_string(rank) + ": fabric: proxy did not finish exchange " + std::to_string(step));
         for (int p = 0; p < nr; ++p)
             if (p != rank) memcpy(parts + static_cast<size_t>(p) * bytes, f.recv + g6::fab_recv_off(f, par, 0, p), bytes);
+        ++step;
+    }
+    // GR8_INK2_FAST_ALLREDUCE: a forward or an mtp_draft is one fabric step with one doorbell word per collective
+    // (ink2_fabric.cuh). The device runs its collectives; the head's stay on the host, in order with them.
+    int cnext = 0;
+    void fast_begin(const std::vector<uint32_t>& sizes)
+    {
+        fab.enqueue_step(step, sizes);
+        cnext = 0;
+    }
+    void fast_dev(float* parts, size_t bytes) { ink2::ar_exchange(f, step, cnext++, reinterpret_cast<char*>(parts), bytes, 0); }
+    void fast_host(uint8_t* parts, size_t bytes)
+    {
+        INK2RT_CK(cudaStreamSynchronize(0));   // the device's collectives are before this one
+        const int c = cnext++, par = static_cast<int>(step & 1);
+        const size_t wire = (bytes + 7) / 8 * 8;
+        const unsigned long long seq = g6::coll_seq(step, c, f.ncoll);
+        char* dst = f.send + g6::fab_send_off(f, par, c);
+        memcpy(dst, parts + static_cast<size_t>(rank) * bytes, bytes);
+        if (wire > bytes) memset(dst + bytes, 0, wire - bytes);
+        __atomic_store_n(f.doorbell + c, seq, __ATOMIC_RELEASE);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int p = 0; p < nr; ++p)
+        {
+            if (p == rank) continue;
+            const char* slot = f.recv + g6::fab_recv_off(f, par, c, p);
+            const unsigned long long* tail = reinterpret_cast<const unsigned long long*>(slot + wire);
+            unsigned it = 0;
+            while (__atomic_load_n(tail, __ATOMIC_ACQUIRE) != seq)
+            {
+                if ((++it & 0xFFFFu) == 0 && (*f.error || std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)))
+                    die("rank " + std::to_string(rank) + ": fabric: no share from rank " + std::to_string(p) + " at collective " + std::to_string(c) + " of step " +
+                        std::to_string(step) + " (error word " + std::to_string(*f.error) + ")");
+            }
+            memcpy(parts + static_cast<size_t>(p) * bytes, slot, bytes);
+        }
+    }
+    void fast_end()
+    {
+        INK2RT_CK(cudaStreamSynchronize(0));
+        if (!fab.wait_proxy_idle(60.0)) die("rank " + std::to_string(rank) + ": fabric: proxy did not finish step " + std::to_string(step));
+        if (*f.error) die("rank " + std::to_string(rank) + ": fabric: step " + std::to_string(step) + " failed (error word " + std::to_string(*f.error) + ")");
         ++step;
     }
     void exchange_dev(int, float* parts, size_t bytes)
@@ -204,7 +247,16 @@ int main(int argc, char** argv)
         cfg.ips = ip;
         cfg.ips2 = ip2;
         cfg.proxy_cpu = proxy_cpu;
-        cfg.ncoll = 1;
+        const bool fast = e.fast_allreduce();
+        cfg.ncoll = fast ? e.max_collectives() : 1;
+        if (fast)
+        {
+            // Two slots serve every collective. A rank rings collective c + 1 only after it has read every share of
+            // c, so a peer's share of c + 1 here means the peer has all of this rank's c, and slot c % 2 is free at c + 2.
+            cfg.pool = 2;
+            cfg.run1 = cfg.run2 = cfg.ncoll;
+            cfg.slot_bytes1 = 8;
+        }
         cfg.stripe_min = ip2.empty() ? 0 : 65536;
         cfg.slot_bytes = (e.max_bytes() + 7) / 8 * 8;
         w.fab.init(cfg);
@@ -212,8 +264,18 @@ int main(int argc, char** argv)
         w.fab.start_proxy();
         w.fab.barrier();
         fprintf(stderr, "# rank %d: fabric of %d slot(s), %zu bytes, stripe_min %zu\n", rank, cfg.ncoll, cfg.slot_bytes, cfg.stripe_min);
-        e.gather = [&w](int c, float* parts, size_t bytes) { w.exchange_dev(c, parts, bytes); };
-        e.gather_head = [&w](int c, uint8_t* parts, size_t bytes) { w.exchange_host(c, parts, bytes); };
+        if (fast)
+        {
+            e.step_begin = [&w](const std::vector<uint32_t>& sizes) { w.fast_begin(sizes); };
+            e.step_end = [&w]() { w.fast_end(); };
+            e.gather = [&w](int, float* parts, size_t bytes) { w.fast_dev(parts, bytes); };
+            e.gather_head = [&w](int, uint8_t* parts, size_t bytes) { w.fast_host(parts, bytes); };
+        }
+        else
+        {
+            e.gather = [&w](int c, float* parts, size_t bytes) { w.exchange_dev(c, parts, bytes); };
+            e.gather_head = [&w](int c, uint8_t* parts, size_t bytes) { w.exchange_host(c, parts, bytes); };
+        }
     }
     const auto step = [&](const ink2::RowsHost& rh, const int* tk, const RowSample* sm, std::vector<RowOut>& out, const uint16_t* vis_rows = nullptr) {
         e.forward(rh, tk, sm, out, vis_rows);

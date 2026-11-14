@@ -625,6 +625,13 @@ public:
     // parts: [nr][bytes] with this rank's share at index rank0; on return every rank's share is in place.
     std::function<void(int coll, float* dev_parts, size_t bytes)> gather;
     std::function<void(int coll, uint8_t* host_parts, size_t bytes)> gather_head;
+    // Options::fast_allreduce (ink2_m4.cu sets both or neither): the collectives of one forward, or of one mtp_draft,
+    // are one fabric step. step_begin gets the bytes of its collectives in order, before the first gather; step_end
+    // runs after the last one. gather then starts the exchange on the stream and does not wait for it.
+    std::function<void(const std::vector<uint32_t>& bytes)> step_begin;
+    std::function<void()> step_end;
+    bool fast_allreduce() const { return use_far; }
+    int max_collectives() const { return std::max(collectives(), o.mtp > 0 ? 2 * static_cast<int>(ML.size()) + o.mtp : 0); }
 
     int collectives() const { return 2 * static_cast<int>(L.size()) + 1; }
     size_t attn_bytes(int M) const { return static_cast<size_t>(M) * c.H * 4; }
@@ -777,6 +784,17 @@ public:
         INK2RT_CK(cudaMemcpy(d_run0, rh.run0.data(), sizeof(int) * M, cudaMemcpyHostToDevice));
         INK2RT_CK(cudaMemcpy(toks, tk, sizeof(int) * M, cudaMemcpyHostToDevice));
         const ink2::Rows rw{d_slot, d_pos, d_run0};
+        if (T > 1 && step_begin)
+        {
+            std::vector<uint32_t> sz;
+            for (size_t j = 0; j < L.size(); ++j)
+            {
+                sz.push_back(static_cast<uint32_t>(n * 4));
+                sz.push_back(static_cast<uint32_t>(n * c.TK * 4));
+            }
+            if (samples) sz.push_back(static_cast<uint32_t>((head_bytes(M) + 7) / 8 * 8));
+            step_begin(sz);
+        }
         const bool chunk = one_run(rh);   // a prefill chunk: the speed paths that depend on M are for these rows only
         const BlasScope blas_scope(use_blas && chunk && M >= 32 ? blas : nullptr);
         ink2::embed_norm(toks, embed, embed_norm, vis_rows, c.image_token, h, M, c.H, 0);
@@ -836,6 +854,7 @@ public:
         }
         if (!samples && ntaps == 0)
         {
+            if (T > 1 && step_end) step_end();
             out.clear();
             return;
         }
@@ -854,6 +873,7 @@ public:
             if (c.mtp_targets[static_cast<size_t>(t)] == c.n_layers) ink2::copy_bf16(hf, step_taps + static_cast<size_t>(t) * o.max_rows * c.H, n, 0);
         if (!samples)
         {
+            if (T > 1 && step_end) step_end();
             out.clear();
             return;
         }
@@ -873,6 +893,7 @@ public:
             for (int m = 0; m < M; ++m) head_pack(&host_logits[static_cast<size_t>(m) * vr], vr, r * vr, o.nc, &head_parts[static_cast<size_t>(r) * hb + static_cast<size_t>(m) * rb]);
         }
         if (T > 1 && gather_head) gather_head(collectives() - 1, head_parts.data(), hb);
+        if (T > 1 && step_end) step_end();
         out.resize(static_cast<size_t>(M));
         std::vector<uint8_t> row(static_cast<size_t>(T) * rb);
         for (int m = 0; m < M; ++m)
@@ -926,6 +947,12 @@ public:
         INK2RT_CK(cudaMemcpy(m_prev, golden.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
         INK2RT_CK(cudaMemcpy(m_pos, pos.data(), sizeof(int) * MB, cudaMemcpyHostToDevice));
         const size_t n = static_cast<size_t>(MB) * H;
+        if (T > 1 && step_begin)
+        {
+            std::vector<uint32_t> sz(2 * ML.size(), static_cast<uint32_t>(n * 4));
+            sz.insert(sz.end(), static_cast<size_t>(K), static_cast<uint32_t>((head_bytes(S) + 7) / 8 * 8));
+            step_begin(sz);
+        }
         int coll = collectives();
         ink2::k_ink2_mtp_block_init<<<MB, ink2::NRT, 0, 0>>>(m_gold, embed, embed_norm, mask_embed, m_res, B, H);
         for (size_t l = 0; l < ML.size(); ++l)
@@ -1037,6 +1064,7 @@ public:
             }
             if (step + 1 < K) INK2RT_CK(cudaMemcpy(m_prev, prev.data(), sizeof(int) * S, cudaMemcpyHostToDevice));
         }
+        if (T > 1 && step_end) step_end();
     }
 
     // The state a KvStateDesc names (s2/kv_state_desc.h ink2_kv_state): bytes of one page row and of a slot's tail.
