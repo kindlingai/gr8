@@ -175,7 +175,7 @@ settings and measurements.
   `# rank 0 DS41 prefill: GR8_DS_PF_V2=1 not used: GR8_DS_SH_TC=0 (exact output); the old range-A path runs`.
   With W above 4,096 the line adds `W-row chunks of 4096 rows (not 8192)`.
 
-With either, a request that names no reasoning effort gets low (50), one that names no `max_tokens` gets 32,768
+With either, an unforced chat request that names no reasoning effort gets low (50), one that names no `max_tokens` gets 32,768
 (`DEFAULT_MAX_TOKENS`), and one that names no `top_p` samples with 0.95.
 
 [FIRST-BOOT.md](FIRST-BOOT.md#2-deepseek-v41-flash-ds41-how-many-chats-and-how-long) has the measured numbers for each
@@ -183,6 +183,22 @@ choice: how many chats at once (measured at 5, 10 and 16), how long a chat can b
 request of up to 1,048,566 tokens), faster writing for a small quality loss, a smaller output head, the first word
 sooner with several chats, and long prompts while other chats write. Each one is a config line or an `EXTRA_ENV`
 word, with no rebuild.
+
+## Forced tools and parked chats
+
+Forced `tool_choice` (`required` or a named function) uses DeepSeek's native non-thinking prompt by default: no effort
+header or empty reasoning block before the forced call. Explicit request thinking or prior assistant reasoning keeps
+the thinking prompt for prefix continuity. Unforced chat keeps the low (50) default. Roll back with
+`--forced-tool-thinking 1` / `FORCED_TOOL_THINKING=1`. `--default-reasoning-effort none` also works for disabling the
+server's default thinking; individual requests can enable it again.
+
+With `REUSE=1` and `SESS>=2`, the launcher enables `GR8_DS_PARK=1` unless `EXTRA_ENV` disables the cache. Finished
+chats stay in their S2 slots; a matching follow-up resumes without a request-end snapshot copy/restore. Slot eviction
+still captures the parked state into the prefix cache. Roll back with `--extra-env GR8_DS_PARK=0` /
+`EXTRA_ENV=GR8_DS_PARK=0`; explicit values always win. The standalone engine knob remains off by default.
+
+Early tool-call and stop-string completions await the engine's `finish` before completing HTTP or SSE `[DONE]`,
+including streams without usage, and report its cached-token count when usage is requested. Disconnects do not wait.
 
 ## Tiered session stores
 

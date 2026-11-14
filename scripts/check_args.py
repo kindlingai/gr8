@@ -150,7 +150,7 @@ def chain(*fs):
 
 
 SERVE = chain(arg_del('--serve'), arg_del('--s2-port'), arg_del('--s2-sessions'), arg_del('--s2-epoch'))
-OFFLINE = chain(SERVE, arg_del_prefix('--dflash-'), arg_del('--spec-adaptive', 0), arg_del('--reuse-prefix', 0),
+OFFLINE = chain(env_del('GR8_DS_PARK'), SERVE, arg_del_prefix('--dflash-'), arg_del('--spec-adaptive', 0), arg_del('--reuse-prefix', 0),
                 arg_del('--kv-store'))
 PACKS = chain(arg_del('--v2-dense'), arg_add('--manifest', FX + '/rank0.manifest.json', '--pack', FX + '/rank0.pack'))
 DFLASH = arg_add('--dflash-manifest', FX + '/dflash.manifest.json', '--dflash-pack', FX + '/dflash.pack')
@@ -268,7 +268,7 @@ MUTATIONS = [
     (D, 'topk-decode', env_set('GR8_DS_MOE_TOPK=4', 'GR8_DS_MOE_TOPK_DECODE=5')),
     (D, 'topk-decode-ok', env_set('GR8_DS_MOE_TOPK=4', 'GR8_DS_MOE_TOPK_DECODE=3')),
     (D, 'reuse-offline', chain(OFFLINE, env_del('GR8_DS_MTP'), arg_add('--reuse-prefix'))),
-    (D, 'kvstore-no-reuse', chain(arg_del('--reuse-prefix', 0), arg_add('--kv-store', KV_SSD))),
+    (D, 'kvstore-no-reuse', chain(env_del('GR8_DS_PARK'), arg_del('--reuse-prefix', 0), arg_add('--kv-store', KV_SSD))),
     (D, 'prefill', arg_add('--prefill', '4096')),
     (D, 'mtp', arg_set('--mtp', '1')),
     (D, 'dsp-mtp-bad', env_set('GR8_DS_MTP=9')),
@@ -291,11 +291,12 @@ MUTATIONS = [
     (D, 'engram-no-prefix', env_set('GR8_DS_ENGRAM=1')),
     (D, 'engram-layers', chain(env_set('GR8_DS_ENGRAM=1', 'GR8_DS_ENGRAM_PREFIX=' + FX + '/engram'), arg_set('--layers', '0,3'))),
     (D, 'engram-ok', env_set('GR8_DS_ENGRAM=1', 'GR8_DS_ENGRAM_PREFIX=' + FX + '/engram')),
-    (D, 'c8pack-one', chain(env_set('GR8_DS_C8PACK=1'), arg_set('--s2-sessions', '1'))),
+    (D, 'c8pack-one', chain(env_del('GR8_DS_PARK'), env_set('GR8_DS_C8PACK=1'), arg_set('--s2-sessions', '1'))),
     (D, 'c8pack-ok', env_set('GR8_DS_C8PACK=1')),
     (D, 'prefill-min', env_set('GR8_DS_PREFILL_MIN=1')),
     (D, 'park-no-reuse', chain(env_set('GR8_DS_PARK=1'), arg_del('--reuse-prefix', 0))),
     (D, 'park-ok', env_set('GR8_DS_PARK=1')),
+    (D, 'park-off', env_set('GR8_DS_PARK=0')),
     (ALL, 'reuse-dflash-offline', chain(OFFLINE, arg_set('--mtp', '0'), DFLASH, arg_add('--reuse-prefix'))),
     (ALL, 'empty-prompt', arg_add('--prompt', '@EMPTY')),
     (ALL, 'prompt-file', arg_add('--prompt', '@' + FX + '/missing-prompt.txt')),

@@ -121,7 +121,7 @@ pub struct Generation {
     cont_prompt: usize,
     /// `return_step_stats`: the counters of the runs so far (None once a run's `finish` did not carry them)
     stats: Option<StepStats>,
-    /// with `return_step_stats`, the run a stop string ended: cancelled, its `finish` (and counters) not read yet
+    /// A run ended early by the frontend: cancelled, its `finish` (cache hits and optional counters) not read yet.
     ended: Option<Stream>,
 }
 
@@ -224,13 +224,26 @@ impl Generation {
         s.decode_s = s.decode_s.zip(t.and_then(|t| t.decode_s)).map(|(a, b)| a + b);
     }
 
-    /// After the last step: with `return_step_stats`, read the counters into `res.step_stats`. A run a stop string
-    /// ended was cancelled; its `finish` comes once the engine has stopped it, so this waits for that.
+    /// After the last step, await any cancelled run's `finish` before completing the response: the engine must
+    /// retain/park its prefix before the next turn arrives. Always read cache hits; with `return_step_stats`, also
+    /// publish the counters in `res.step_stats`. Client disconnects can still drop the generation without waiting.
     pub async fn finish_stats(&mut self) {
         if let Some(mut s) = self.ended.take() {
             loop {
                 match s.next().await {
                     Some(Msg::Frame(Kind::Finish, f)) => {
+                        if let Ok(fin) = serde_json::from_slice::<wire::Finish>(&f) {
+                            if self.runs == 0 {
+                                self.res.cached_tokens = fin.cached_tokens.unwrap_or(0);
+                            } else {
+                                log::info!(
+                                    "{}: the continuation took {} of its {} prompt tokens from the cache",
+                                    self.id,
+                                    fin.cached_tokens.unwrap_or(0),
+                                    self.cont_prompt
+                                );
+                            }
+                        }
                         self.add_stats(&f);
                         break;
                     }
@@ -299,15 +312,12 @@ impl Generation {
                     let step = self.on_tokens(t);
                     if step.finish_reason.is_some() {
                         // the reply ended here (a stop string, or a budget's close that reached max_tokens):
-                        // dropping the stream cancels the engine request; with step stats it is cancelled and kept,
-                        // so `finish_stats` can read its counters
+                        // cancel and keep the stream so `finish_stats` awaits prefix retention and reads cache hits
+                        // even without step stats
                         self.done = true;
-                        let s = self.stream.take();
-                        if self.stats.is_some() {
-                            if let Some(s) = s {
-                                s.cancel();
-                                self.ended = Some(s);
-                            }
+                        if let Some(s) = self.stream.take() {
+                            s.cancel();
+                            self.ended = Some(s);
                         }
                         return Ok(Some(step));
                     }
@@ -358,17 +368,14 @@ impl Generation {
     }
 
     /// End the reply now: the caller's parser has seen a complete tool-call block, and anything the model writes after
-    /// it is a runaway. The step carries the text still held back and `finish_reason: stop`; dropping the stream
-    /// cancels the engine request (with step stats it is cancelled and kept for `finish_stats`, as a stop string's is).
+    /// it is a runaway. The step carries the text still held back and `finish_reason: stop`; cancel and keep the
+    /// engine stream for `finish_stats` to await prefix retention and read cache hits and any requested counters.
     pub fn end_now(&mut self) -> Step {
         self.done = true;
         self.cut = false;
-        let s = self.stream.take();
-        if self.stats.is_some() {
-            if let Some(s) = s {
-                s.cancel();
-                self.ended = Some(s);
-            }
+        if let Some(s) = self.stream.take() {
+            s.cancel();
+            self.ended = Some(s);
         }
         self.res.finish_reason = Some("stop");
         self.res.stop_reason = Some(StopReason::None);
@@ -1068,6 +1075,37 @@ mod tests {
         let s = g.res.step_stats.unwrap();
         // the engine generated the whole frame the stop string was found in (and ended on its EOS)
         assert_eq!((s.steps, s.generated_tokens, s.accepted_tokens), (2, 6, 4));
+    }
+
+    #[tokio::test]
+    async fn parser_early_stop_reads_cache_hits_with_or_without_stats() {
+        for stats in [false, true] {
+            let fake = fake_engine(endless_thinking).await;
+            let mut g = Generation::new(tok(), crate::util::hex_id(), PROMPT.to_vec(), params(1000, 0), false, true);
+            if stats {
+                g.want_step_stats();
+            }
+            g.start(&fake.engine).unwrap();
+            assert!(g.next().await.unwrap().is_some());
+            assert_eq!(g.end_now().finish_reason, Some("stop"));
+            assert!(g.next().await.unwrap().is_none());
+            g.finish_stats().await;
+            assert_eq!(g.res.cached_tokens, 200);
+            assert_eq!(g.res.step_stats.is_some(), stats);
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_string_reads_cache_hits_with_or_without_stats() {
+        for stats in [false, true] {
+            let fake = fake_engine(endless_thinking).await;
+            let mut p = params(1000, 0);
+            p.stop = vec!["aa".into()];
+            let (steps, g) = run_with(&fake, &PROMPT, p, 0, true, stats).await;
+            assert_eq!(steps.last().unwrap().finish_reason, Some("stop"));
+            assert_eq!(g.res.cached_tokens, 200);
+            assert_eq!(g.res.step_stats.is_some(), stats);
+        }
     }
 
     // ---- the repeated-tool-call guard (guard.rs) ---------------------------------------------------------------

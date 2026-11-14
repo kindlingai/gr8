@@ -69,7 +69,8 @@ knobs:
       slot evicts the oldest parked slot, captured into the prefix cache first. The prompt-end snapshot is captured as
       before. With GR8_DS_CACHE_REPLACE the eviction capture is the request-end snapshot, linked to the prompt-end one as
       at request end, and a resume frees the unused prompt-end snapshot as a request-end restore does. Needs --serve,
-      --s2-sessions >= 2 and --reuse-prefix.
+      --s2-sessions >= 2 and --reuse-prefix. The ds41 launcher sets 1 when REUSE=1 and SESS>=2 unless EXTRA_ENV
+      disables the cache. An explicit EXTRA_ENV GR8_DS_PARK=0 rolls back to copying snapshots at request end.
   GR8_DS_CONF_TEMP:
     scope: agree
     kind: text

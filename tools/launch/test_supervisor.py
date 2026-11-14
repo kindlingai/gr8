@@ -490,6 +490,17 @@ class FrontTests(unittest.TestCase):
         a = self.front_argv('--default-sequence-penalty', 'thinking=0.8:1.75:4:6,guard=1:2:1:8')
         self.assertEqual(a[a.index('--default-sequence-penalty') + 1], 'thinking=0.8:1.75:4:6,guard=1:2:1:8')
 
+    def test_forced_tool_thinking_rollback_reaches_the_front_end(self):
+        for value in (None, '0', '1'):
+            args = [] if value is None else ['--forced-tool-thinking', value]
+            a = self.front_argv('--gr8-model', 'ds41', *args)
+            if value == '1':
+                self.assertEqual(a[a.index('--forced-tool-thinking') + 1], '1')
+            else:
+                self.assertNotIn('--forced-tool-thinking', a)
+        a = self.front_argv('--gr8-model', 'ds41', '--default-reasoning-effort', 'none')
+        self.assertEqual(a[a.index('--default-reasoning-effort') + 1], 'none')
+
     def test_the_tool_repeat_guard_reaches_the_front_end_when_on(self):
         a = self.front_argv()
         self.assertNotIn('--tool-repeat-guard', a)

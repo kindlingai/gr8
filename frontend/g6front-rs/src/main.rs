@@ -47,6 +47,10 @@ pub struct State {
     pub dialect: dialect::Dialect,
     /// ds41: the reasoning effort (1..=100) for a request that names none
     pub ds_effort: u32,
+    /// ds41: thinking for requests with no explicit switch or effort (`none` disables the server default)
+    pub ds_thinking_default: bool,
+    /// Keep the server's thinking mode for forced DeepSeek tool choices (rollback to the old prompt).
+    pub forced_tool_thinking: bool,
     /// inkling: `--default-reasoning-effort`, a level name or a number from 0.0 to 0.99; None is the template's 0.9
     pub ink_effort: Option<serde_json::Value>,
     pub engine: Arc<engine::Engine>,
@@ -101,6 +105,7 @@ struct Args {
     default_effort: Option<String>,
     default_budget: sampling::Limit,
     allow_thinking_off: bool,
+    forced_tool_thinking: bool,
     clamp_max_tokens: bool,
     emit_undeclared: bool,
     supervisor: Option<String>,
@@ -116,11 +121,12 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--enable-prompt-tokens-details] [--log-level LEVEL]
                   [--workers N] [--encode-threads N] [--default-max-tokens N]
                   [--share-tokens N] [--max-connections N]
-                  [--default-reasoning-effort minimal|low|medium|high|xhigh|max (ds41: or an integer 1-100;
+                  [--default-reasoning-effort minimal|low|medium|high|xhigh|max (ds41: or none, or an integer 1-100;
                    inkling: or none, or a number 0.0-0.99)]
                   [--default-thinking-budget N, Fx or N|Fx] [--allow-thinking-off] [--clamp-max-tokens]
                   [--default-presence-penalty SPEC] [--default-frequency-penalty SPEC]
                   [--default-think-end-boost start=S,per1k=P,max=M] [--default-sequence-penalty SPEC]
+                  [--forced-tool-thinking 0|1]
                   [--tool-repeat-guard 0|1] [--tool-repeat-guard-repeats N] [--tool-repeat-guard-temperature F]
                   [--tool-repeat-guard-retries N]
                   [--undeclared-tool-calls text|emit] [--supervisor HOST:PORT]";
@@ -145,6 +151,7 @@ fn parse_args() -> Result<Args, String> {
         default_effort: None,
         default_budget: sampling::Limit::Tokens(0),
         allow_thinking_off: false,
+        forced_tool_thinking: false,
         clamp_max_tokens: false,
         emit_undeclared: true,
         supervisor: None,
@@ -201,6 +208,13 @@ fn parse_args() -> Result<Args, String> {
             }
             "--allow-thinking-off" => a.allow_thinking_off = true,
             "--clamp-max-tokens" => a.clamp_max_tokens = true,
+            "--forced-tool-thinking" => {
+                a.forced_tool_thinking = match next(&mut i, &flag, inline)?.as_str() {
+                    "1" => true,
+                    "0" => false,
+                    _ => return Err("--forced-tool-thinking: want 0 or 1".into()),
+                }
+            }
             "--tool-repeat-guard" => {
                 a.guard.on = match next(&mut i, &flag, inline)?.as_str() {
                     "1" => true,
@@ -338,6 +352,7 @@ async fn serve(args: Args) -> Result<(), String> {
         dialect::Dialect::detect(&PathBuf::from(&args.model_dir), tok.tk.token_to_id("｜DSML｜").is_some())
     });
     let mut ink_effort = None;
+    let mut ds_thinking_default = true;
     let (template, thinking_defaults, ds_effort) = match dialect {
         dialect::Dialect::Glm => {
             let template = template::ChatTemplate::load(
@@ -366,11 +381,13 @@ async fn serve(args: Args) -> Result<(), String> {
             tok.use_ds41_sampling_defaults();
             let effort = match args.default_effort.as_deref() {
                 Some(e) => dialect::parse_ds_default_effort(e)?,
-                None => dialect::DS_DEFAULT_EFFORT,
+                None => Some(dialect::DS_DEFAULT_EFFORT),
             };
+            ds_thinking_default = effort.is_some();
+            let effort = effort.unwrap_or(dialect::DS_DEFAULT_EFFORT);
             log::info!(
                 "dialect ds41: tokenizer loaded in {:.0} ms (vocab {}, eos {:?}); default reasoning effort {effort}, \
-                 default thinking budget {}, thinking off allowed, default top_p {}",
+                 default thinking {ds_thinking_default}, default thinking budget {}, thinking off allowed, default top_p {}",
                 t0.elapsed().as_secs_f64() * 1e3,
                 tok.vocab_size,
                 tok.eos_ids,
@@ -451,6 +468,8 @@ async fn serve(args: Args) -> Result<(), String> {
         template,
         dialect,
         ds_effort,
+        ds_thinking_default,
+        forced_tool_thinking: args.forced_tool_thinking,
         ink_effort,
         engine: engine.clone(),
         model_name: served[0].clone(),
