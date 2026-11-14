@@ -562,7 +562,8 @@ inline bool blas_gemm(const uint16_t* x, const uint16_t* w, int M, int K, int N,
 {
     static thread_local bool warned = false;
     cublasHandle_t hd = blas_cur();
-    if (!hd) return false;
+    if (!hd || M < 1 || N < 16 || (N & 7) != 0 || K < 16 || (K & 15) != 0) return false;
+    if (((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(w) | reinterpret_cast<uintptr_t>(y)) & 15u) != 0) return false;
     const float one = 1.f, zero = 0.f;
     cublasStatus_t rc = cublasSetStream(hd, st);
     if (rc == CUBLAS_STATUS_SUCCESS)
@@ -1077,6 +1078,8 @@ public:
         return m;
     }
     int max_pages_per_slot() const { return max_pps; }
+    bool gpu_head_pack_active() const { return use_ghp; }
+    bool cublas_prefill_active() const { return use_blas && blas != nullptr; }
 
     struct KvPtrs
     {

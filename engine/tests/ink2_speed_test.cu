@@ -3,6 +3,9 @@
 //   1. The head's candidates packed on the device (kernels/ink2_head.cuh) against ink2rt::head_pack on the host:
 //      rows of logits with -inf cells, runs of equal logits, both zeros, fewer finite logits than candidates and
 //      none at all; 16, 256 and 512 candidates. The maximum, the count and every candidate: exact. The sum: to 1e-12.
+//      Also BlasScope / ink2rt::blas_gemm directly against stock k_ink2_gemm on BF16 and fp32 projections (cosine
+//      >= 0.999999, tight cellwise and relative bounds), and bit-exact fallback to k_ink2_gemm for small/odd N
+//      (such as TP=4 sink N = 9) and unaligned pointers.
 //   2. The tensor-core attention of a prefill chunk (attn/ink2_attn_tc.cuh) against k_ink2_attn_core at the full
 //      model's head geometry (head_dim 128, rel_dim 16): a local layer whose keys come from the ring and from the
 //      chunk, a rank whose first K / V head has part of its query heads, and a global layer on pages. 40 rows (a
@@ -10,10 +13,13 @@
 //      another order and BF16 rounds the output); the largest difference and cosine are printed.
 //   3. The engine on a miniature checkpoint (ink2_mini_ckpt.h), 1, 4 and 6 simulated ranks, a 70-token prefill in
 //      chunks of 48 and 22 with every row sampled, then 8 single rows (plus a 3-draft MTP speculative round on each
-//      rank count): the device head pack on and off give the same tokens, drafted tokens and candidates, exact. With
-//      the cuBLAS projections on as well, a row's token is the stock row's, or a stock candidate within max(|top|, 1) / 32
-//      of its top (a near tie, counted and printed). (The miniature's head_dim is 16, so the tensor-core kernel is not
-//      on this path; check 2 covers it.)
+//      rank count): the device head pack on and off give the same tokens, drafted tokens and candidates, exact; a
+//      24-row chunk (M < 32) with all speed paths on is also bit-exact against stock; with cuBLAS on as well, the
+//      device head pack (nc = 64) matches the full-vocab cuBLAS run (nc = 768) bit for bit on top-64 candidates,
+//      tokens and MTP drafts, and all 750 valid vocabulary logits per row satisfy the 6-layer NVFP4/MXFP8 MoE trunk
+//      bounds (cos >= 0.85, rel <= 0.55, per-row cos >= 0.75) separately on the 48-row cuBLAS chunk, the 22-row tail
+//      chunk, and the 8 decode steps. (The miniature's head_dim is 16, so the tensor-core kernel is not on this path;
+//      check 2 covers it.)
 //   4. The device all-reduce (kernels/ink2_fabric.cuh) as rank 1 of a 4-rank fabric in pinned host memory, the test
 //      playing the peers (before the launches, or after the doorbell while the device spins): 1, 8, 64 and 512 rows
 //      of 2304 and 4096 cells; the sum's bits are the stock sum's. Also the slot offsets and the credits of the pooled
@@ -205,8 +211,138 @@ static void check_attn_tc(const AttnCase& tc, bool bench)
 
 // ---------------------------------------------------------------------------------------------- 3. the engine
 constexpr int CAP = 192, ROWS = 48, NCAND = 64, PROMPT = 70, SINGLES = 8;
+constexpr double E2E_SEQ_COS = 0.85, E2E_SEQ_REL = 0.55, E2E_ROW_COS = 0.75;
 
-static std::unique_ptr<Engine> engine(const std::string& dir, int T, int ghp, int blas, int mtp = 0)
+static void check_blas_gemm()
+{
+    cublasHandle_t hd = nullptr;
+    if (cublasCreate(&hd) != CUBLAS_STATUS_SUCCESS) { fprintf(stderr, "FATAL cublasCreate\n"); exit(2); }
+    Rng r{0x626c6173u};
+
+    // 1b-i. Isolated BF16 projections (M = 48 and unaligned M = 37) through BlasScope vs stock k_ink2_gemm:
+    struct Shape { int M, K, N; };
+    for (const Shape& s : {Shape{48, 256, 192}, Shape{37, 256, 144}, Shape{64, 192, 256}})
+    {
+        const size_t n = static_cast<size_t>(s.M) * s.N;
+        const std::vector<uint16_t> x = rand_bf(r, static_cast<size_t>(s.M) * s.K, 1.0f), w = rand_bf(r, static_cast<size_t>(s.N) * s.K, 0.25f);
+        uint16_t *dx = to_dev(x), *dw = to_dev(w), *d_ref = to_dev(std::vector<uint16_t>(n, 0)), *d_got = to_dev(std::vector<uint16_t>(n, 0));
+        ink2::gemm_bf16(dx, dw, s.M, s.K, s.N, d_ref, 0);
+        {
+            ink2rt::BlasScope bs(hd);
+            check(ink2rt::blas_gemm(dx, dw, s.M, s.K, s.N, d_got, ink2::GEMM_BF16, 0),
+                  "blas_gemm BF16 " + std::to_string(s.M) + "x" + std::to_string(s.K) + "x" + std::to_string(s.N) + ": did not take cuBLAS");
+            CK(cudaMemset(d_got, 0, n * 2));
+            ink2::gemm_bf16(dx, dw, s.M, s.K, s.N, d_got, 0);
+        }
+        CK(cudaDeviceSynchronize());
+        std::vector<uint16_t> ref(n), got(n);
+        CK(cudaMemcpy(ref.data(), d_ref, n * 2, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(got.data(), d_got, n * 2, cudaMemcpyDeviceToHost));
+        double dot = 0, na = 0, nb = 0, nd = 0, worst = 0, max_abs = 0;
+        bool fin = true;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const double a = bf2f(ref[i]), b = bf2f(got[i]);
+            if (!std::isfinite(a) || !std::isfinite(b)) { fin = false; continue; }
+            dot += a * b; na += a * a; nb += b * b; nd += (a - b) * (a - b);
+            worst = std::max(worst, std::fabs(a - b));
+            max_abs = std::max(max_abs, std::fabs(a));
+        }
+        const double cos = na > 0 && nb > 0 ? dot / std::sqrt(na * nb) : 0.0;
+        const double rel = nb > 0 ? std::sqrt(nd / nb) : 1.0;
+        const std::string tag = "blas_gemm BF16 " + std::to_string(s.M) + "x" + std::to_string(s.K) + "x" + std::to_string(s.N);
+        check(fin, tag + ": non-finite");
+        check(worst <= std::max(1.0, max_abs) / 128.0, tag + ": worst diff " + std::to_string(worst));
+        check(rel <= 2e-3, tag + ": rel " + std::to_string(rel));
+        check(cos >= 0.999999, tag + ": cos " + std::to_string(cos));
+        CK(cudaFree(dx)); CK(cudaFree(dw)); CK(cudaFree(d_ref)); CK(cudaFree(d_got));
+    }
+
+    // 1b-ii. Isolated FP32 partial-sum projections (T > 1 wo path) through BlasScope vs stock k_ink2_gemm:
+    for (const Shape& s : {Shape{48, 192, 256}, Shape{37, 144, 256}})
+    {
+        const size_t n = static_cast<size_t>(s.M) * s.N;
+        const std::vector<uint16_t> x = rand_bf(r, static_cast<size_t>(s.M) * s.K, 1.0f), w = rand_bf(r, static_cast<size_t>(s.N) * s.K, 0.25f);
+        uint16_t *dx = to_dev(x), *dw = to_dev(w);
+        float *d_ref = to_dev(std::vector<float>(n, 0.0f)), *d_got = to_dev(std::vector<float>(n, 0.0f));
+        ink2::gemm_f32(dx, dw, s.M, s.K, s.N, d_ref, 0);
+        {
+            ink2rt::BlasScope bs(hd);
+            check(ink2rt::blas_gemm(dx, dw, s.M, s.K, s.N, d_got, ink2::GEMM_F32, 0),
+                  "blas_gemm F32 " + std::to_string(s.M) + "x" + std::to_string(s.K) + "x" + std::to_string(s.N) + ": did not take cuBLAS");
+            CK(cudaMemset(d_got, 0, n * 4));
+            ink2::gemm_f32(dx, dw, s.M, s.K, s.N, d_got, 0);
+        }
+        CK(cudaDeviceSynchronize());
+        std::vector<float> ref(n), got(n);
+        CK(cudaMemcpy(ref.data(), d_ref, n * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(got.data(), d_got, n * 4, cudaMemcpyDeviceToHost));
+        double dot = 0, na = 0, nb = 0, nd = 0;
+        bool fin = true;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const double a = ref[i], b = got[i];
+            if (!std::isfinite(a) || !std::isfinite(b)) { fin = false; continue; }
+            dot += a * b; na += a * a; nb += b * b; nd += (a - b) * (a - b);
+        }
+        const double cos = na > 0 && nb > 0 ? dot / std::sqrt(na * nb) : 0.0;
+        const double rel = nb > 0 ? std::sqrt(nd / nb) : 1.0;
+        const std::string tag = "blas_gemm F32 " + std::to_string(s.M) + "x" + std::to_string(s.K) + "x" + std::to_string(s.N);
+        check(fin, tag + ": non-finite");
+        check(rel <= 1e-4, tag + ": rel " + std::to_string(rel));
+        check(cos >= 0.9999999, tag + ": cos " + std::to_string(cos));
+        CK(cudaFree(dx)); CK(cudaFree(dw)); CK(cudaFree(d_ref)); CK(cudaFree(d_got));
+    }
+
+    // 1b-iii. Small / odd N (TP=4 sink N = 9, TP=1 sink N = 36, TP=4 wproj N = 8) and unaligned pointer fallback:
+    for (int badN : {9, 36})
+    {
+        const size_t n = static_cast<size_t>(48) * badN;
+        const std::vector<uint16_t> x = rand_bf(r, 48 * 256, 1.0f), w = rand_bf(r, static_cast<size_t>(badN) * 256, 0.25f);
+        uint16_t *dx = to_dev(x), *dw = to_dev(w), *d_ref = to_dev(std::vector<uint16_t>(n, 0)), *d_got = to_dev(std::vector<uint16_t>(n, 0));
+        ink2::gemm_bf16(dx, dw, 48, 256, badN, d_ref, 0);
+        {
+            ink2rt::BlasScope bs(hd);
+            check(!ink2rt::blas_gemm(dx, dw, 48, 256, badN, d_got, ink2::GEMM_BF16, 0), "blas_gemm N=" + std::to_string(badN) + " did not fall back");
+            ink2::gemm_bf16(dx, dw, 48, 256, badN, d_got, 0);
+        }
+        CK(cudaDeviceSynchronize());
+        std::vector<uint16_t> ref(n), got(n);
+        CK(cudaMemcpy(ref.data(), d_ref, n * 2, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(got.data(), d_got, n * 2, cudaMemcpyDeviceToHost));
+        check(memcmp(ref.data(), got.data(), n * 2) == 0, "blas_gemm fallback N=" + std::to_string(badN) + " not bit-exact");
+        CK(cudaFree(dx)); CK(cudaFree(dw)); CK(cudaFree(d_ref)); CK(cudaFree(d_got));
+    }
+    {
+        const size_t n = 48 * 8;
+        const std::vector<uint16_t> x = rand_bf(r, 48 * 256 + 8, 1.0f), w = rand_bf(r, 64 * 256, 0.25f);
+        uint16_t *dx = to_dev(x), *dw = to_dev(w), *d_bref = to_dev(std::vector<uint16_t>(48 * 64, 0)), *d_bgot = to_dev(std::vector<uint16_t>(48 * 64, 0));
+        float *d_ref = to_dev(std::vector<float>(n, 0.0f)), *d_got = to_dev(std::vector<float>(n, 0.0f));
+        ink2::gemm_f32(dx, dw, 48, 256, 8, d_ref, 0);
+        ink2::gemm_bf16(dx + 2, dw, 48, 256, 64, d_bref, 0);   // +4 bytes (4-byte aligned for ld32, not 16-byte aligned for cuBLAS)
+        {
+            ink2rt::BlasScope bs(hd);
+            check(!ink2rt::blas_gemm(dx, dw, 48, 256, 8, d_got, ink2::GEMM_F32, 0), "blas_gemm F32 N=8 did not fall back");
+            check(!ink2rt::blas_gemm(dx + 2, dw, 48, 256, 64, d_bgot, ink2::GEMM_BF16, 0), "blas_gemm unaligned ptr did not fall back");
+            ink2::gemm_f32(dx, dw, 48, 256, 8, d_got, 0);
+            ink2::gemm_bf16(dx + 2, dw, 48, 256, 64, d_bgot, 0);
+        }
+        check(ink2::gemm_hook() == nullptr && ink2rt::blas_cur() == nullptr, "BlasScope destructor left hook active");
+        CK(cudaDeviceSynchronize());
+        std::vector<float> ref(n), got(n);
+        std::vector<uint16_t> bref(48 * 64), bgot(48 * 64);
+        CK(cudaMemcpy(ref.data(), d_ref, n * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(got.data(), d_got, n * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(bref.data(), d_bref, bref.size() * 2, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(bgot.data(), d_bgot, bgot.size() * 2, cudaMemcpyDeviceToHost));
+        check(memcmp(ref.data(), got.data(), n * 4) == 0, "blas_gemm F32 N=8 fallback not bit-exact");
+        check(memcmp(bref.data(), bgot.data(), bref.size() * 2) == 0, "blas_gemm unaligned ptr fallback not bit-exact");
+        CK(cudaFree(dx)); CK(cudaFree(dw)); CK(cudaFree(d_ref)); CK(cudaFree(d_got)); CK(cudaFree(d_bref)); CK(cudaFree(d_bgot));
+    }
+    cublasDestroy(hd);
+}
+
+static std::unique_ptr<Engine> engine(const std::string& dir, int T, int ghp, int blas, int mtp = 0, int nc = NCAND)
 {
     Options o;
     o.nr = T;
@@ -216,7 +352,7 @@ static std::unique_ptr<Engine> engine(const std::string& dir, int T, int ghp, in
     o.mtp = mtp;
     o.max_rows = ROWS;
     o.cap = CAP;
-    o.nc = NCAND;
+    o.nc = nc;
     o.fast_allreduce = 0;
     o.gpu_head_pack = ghp;
     o.cublas_prefill = blas;
@@ -272,35 +408,145 @@ static std::vector<RowOut> run(Engine& e, const std::vector<int>& toks, std::vec
     }
     return all;
 }
+static std::vector<RowOut> run_chunk(Engine& e, const std::vector<int>& toks, int n)
+{
+    std::vector<RowOut> out;
+    e.reset_slot(0);
+    ink2::RowsHost rh;
+    rh.add(0, 0, n);
+    std::vector<RowSample> sm;
+    for (int i = 0; i < n; ++i) sm.push_back(RowSample{0, 0, 0, static_cast<uint32_t>(i + 1)});
+    e.forward(rh, toks.data(), sm.data(), out);
+    e.commit();
+    return out;
+}
+static bool unpack_valid_logits(const RowOut& r, float* dst, const std::string& what)
+{
+    if (r.top.size() != static_cast<size_t>(VALID))
+    {
+        check(false, what + ": finite candidate count " + std::to_string(r.top.size()) + " (want " + std::to_string(VALID) + ")");
+        return false;
+    }
+    std::vector<uint8_t> seen(static_cast<size_t>(VALID), 0);
+    bool ok = true;
+    float mx = -INFINITY;
+    for (const ink2rt::Cand& c : r.top)
+    {
+        if (c.id < 0 || c.id >= VALID || seen[static_cast<size_t>(c.id)] || !std::isfinite(c.logit) || std::fabs(c.logit) > 30.0f)
+        {
+            ok = false;
+            continue;
+        }
+        seen[static_cast<size_t>(c.id)] = 1;
+        dst[c.id] = c.logit;
+        mx = std::max(mx, c.logit);
+    }
+    check(ok, what + ": invalid candidate id or logit");
+    if (ok)
+    {
+        double sum = 0.0;
+        for (int v = 0; v < VALID; ++v) sum += std::exp(static_cast<double>(dst[v] - mx));
+        const float lse_ref = mx + static_cast<float>(std::log(sum));
+        check(std::isfinite(r.lse) && std::fabs(r.lse - lse_ref) <= 1e-5f * std::max(1.0f, std::fabs(lse_ref)), what + ": lse mismatch");
+    }
+    return ok;
+}
+struct RowAcc
+{
+    double dot = 0, na = 0, nb = 0, nd = 0, min_row_cos = 2.0;
+    size_t rows = 0;
+    void add_row(const float* got, const float* ref, const std::string& what)
+    {
+        ++rows;
+        double rd = 0, ra = 0, rb = 0;
+        for (int v = 0; v < VALID; ++v)
+        {
+            const double a = got[v], b = ref[v];
+            rd += a * b;
+            ra += a * a;
+            rb += b * b;
+            nd += (a - b) * (a - b);
+        }
+        dot += rd;
+        na += ra;
+        nb += rb;
+        if (!(ra > 0 && rb > 0))
+        {
+            check(false, what + ": degenerate all-zero valid logits");
+            return;
+        }
+        const double rc = rd / std::sqrt(ra * rb);
+        min_row_cos = std::min(min_row_cos, rc);
+        check(rc >= E2E_ROW_COS, what + ": row cosine " + std::to_string(rc));
+    }
+    double cos() const { return na > 0 && nb > 0 ? dot / std::sqrt(na * nb) : 0.0; }
+    double rel() const { return nb > 0 ? std::sqrt(nd / nb) : 1.0; }
+};
+static void check_exact_rows(const RowOut& a, const RowOut& b, size_t n_top, const std::string& what)
+{
+    check(a.tok == b.tok, what + ": token " + std::to_string(b.tok) + " vs " + std::to_string(a.tok));
+    check(std::isfinite(a.lse) && std::isfinite(b.lse) && std::fabs(a.lse - b.lse) <= 1e-5f * std::max(1.0f, std::fabs(a.lse)), what + ": lse");
+    check(a.top.size() >= n_top && b.top.size() >= n_top && (n_top == 0 || memcmp(a.top.data(), b.top.data(), n_top * sizeof(ink2rt::Cand)) == 0),
+          what + ": top-" + std::to_string(n_top) + " candidates");
+}
 static void check_engine(const std::string& dir, int T, const std::vector<int>& toks)
 {
-    std::vector<int> d_off, d_ghp;
-    const std::vector<RowOut> off = run(*engine(dir, T, 0, 0, 3), toks, &d_off), ghp = run(*engine(dir, T, 1, 0, 3), toks, &d_ghp),
-                              all = run(*engine(dir, T, 1, 1, 3), toks);
-    const std::string w = "engine of " + std::to_string(T) + " rank(s), row ";
-    check(off.size() == toks.size() && ghp.size() == off.size() && all.size() == off.size(), w + "count");
-    check(d_off.size() == 3 && d_off == d_ghp, "engine of " + std::to_string(T) + " rank(s): mtp_draft with device head pack");
-    if (fails) return;
-    int near = 0;
-    for (size_t i = 0; i < off.size(); ++i)
+    const std::string tag = "engine of " + std::to_string(T) + " rank(s)";
+    std::unique_ptr<Engine> e_off64 = engine(dir, T, 0, 0, 3, NCAND), e_ghp64 = engine(dir, T, 1, 0, 3, NCAND), e_all64 = engine(dir, T, 1, 1, 3, NCAND),
+                            e_off_v = engine(dir, T, 0, 0, 3, VOCAB), e_all_v = engine(dir, T, 0, 1, 3, VOCAB);
+    check(!e_off64->gpu_head_pack_active() && !e_off64->cublas_prefill_active(), tag + ": off64 flags");
+    check(e_ghp64->gpu_head_pack_active() && !e_ghp64->cublas_prefill_active(), tag + ": ghp64 flags");
+    check(e_all64->gpu_head_pack_active() && e_all64->cublas_prefill_active(), tag + ": all64 flags");
+    check(!e_off_v->gpu_head_pack_active() && !e_off_v->cublas_prefill_active(), tag + ": off_v flags");
+    check(!e_all_v->gpu_head_pack_active() && e_all_v->cublas_prefill_active(), tag + ": all_v flags");
+
+    // 3a. M = 24 < 32 prefill chunk: BlasScope stays off, so all64 is bit-exact against stock off64.
+    const std::vector<RowOut> c24_off = run_chunk(*e_off64, toks, 24), c24_all = run_chunk(*e_all64, toks, 24);
+    check(c24_off.size() == 24 && c24_all.size() == 24, tag + ": 24-row count");
+    for (size_t i = 0; i < std::min(c24_off.size(), c24_all.size()); ++i)
+        check_exact_rows(c24_off[i], c24_all[i], static_cast<size_t>(NCAND), tag + ", M=24 row " + std::to_string(i));
+
+    // 3b. Full 48 + 22 + 8x1 = 78 rows + 3-draft MTP round:
+    std::vector<int> d_off64, d_ghp64, d_all64, d_off_v, d_all_v;
+    const std::vector<RowOut> off64 = run(*e_off64, toks, &d_off64), ghp64 = run(*e_ghp64, toks, &d_ghp64), all64 = run(*e_all64, toks, &d_all64),
+                              off_v = run(*e_off_v, toks, &d_off_v), all_v = run(*e_all_v, toks, &d_all_v);
+    const size_t N = toks.size();
+    check(off64.size() == N && ghp64.size() == N && all64.size() == N && off_v.size() == N && all_v.size() == N, tag + ": row count");
+    check(d_off64.size() == 3 && d_off64 == d_ghp64 && d_off64 == d_off_v, tag + ": mtp_draft stock / device head pack / full vocab");
+    check(d_all64.size() == 3 && d_all64 == d_all_v, tag + ": mtp_draft all64 vs all_v");
+    for (int t : d_all64) check(t >= 0 && t < VALID, tag + ": mtp_draft all64 invalid token " + std::to_string(t));
+    if (off64.size() != N || ghp64.size() != N || all64.size() != N || off_v.size() != N || all_v.size() != N) return;
+
+    RowAcc pf_blas, pf_tail, dec_rows;
+    std::vector<float> lg_off(static_cast<size_t>(VALID), 0.0f), lg_all(static_cast<size_t>(VALID), 0.0f);
+    size_t same_tok = 0;
+    for (size_t i = 0; i < N; ++i)
     {
-        const RowOut &a = off[i], &b = ghp[i], &c = all[i];
-        const std::string wi = w + std::to_string(i);
-        check(a.tok == b.tok, wi + ": the device head pack changed the token");
-        check(std::fabs(a.lse - b.lse) <= 1e-5f * std::max(1.0f, std::fabs(a.lse)), wi + ": the device head pack changed the log-sum-exp");
-        check(a.top.size() == b.top.size() && (a.top.empty() || memcmp(a.top.data(), b.top.data(), a.top.size() * sizeof(ink2rt::Cand)) == 0),
-              wi + ": the device head pack changed the candidates");
-        if (a.top.empty() || c.top.empty()) { check(a.top.empty() == c.top.empty(), wi + ": candidates with cuBLAS"); continue; }
-        const float tol = std::max(1.0f, std::fabs(a.top[0].logit)) / 32;
-        check(std::fabs(a.top[0].logit - c.top[0].logit) <= tol, wi + ": top logit with cuBLAS " + std::to_string(c.top[0].logit) + ", stock " + std::to_string(a.top[0].logit));
-        if (c.tok == a.tok) continue;
-        bool tie = false;
-        for (const ink2rt::Cand& x : a.top)
-            if (x.id == c.tok) tie = a.top[0].logit - x.logit <= tol;
-        check(tie, wi + ": token with cuBLAS " + std::to_string(c.tok) + ", stock " + std::to_string(a.tok) + ", not a near tie");
-        near += tie;
+        const std::string wi = tag + ", row " + std::to_string(i);
+        check(off64[i].top.size() == static_cast<size_t>(NCAND) && ghp64[i].top.size() == static_cast<size_t>(NCAND) && all64[i].top.size() == static_cast<size_t>(NCAND),
+              wi + ": top-64 count");
+        check_exact_rows(off64[i], ghp64[i], static_cast<size_t>(NCAND), wi + " (ghp64 vs off64)");
+        check_exact_rows(off_v[i], off64[i], static_cast<size_t>(NCAND), wi + " (off64 vs off_v)");
+        check_exact_rows(all_v[i], all64[i], static_cast<size_t>(NCAND), wi + " (all64 vs all_v)");
+        if (all_v[i].tok == off_v[i].tok) ++same_tok;
+        const bool ok_o = unpack_valid_logits(off_v[i], lg_off.data(), wi + " stock"), ok_a = unpack_valid_logits(all_v[i], lg_all.data(), wi + " cuBLAS");
+        if (!ok_o || !ok_a) continue;
+        if (i < static_cast<size_t>(ROWS)) pf_blas.add_row(lg_all.data(), lg_off.data(), wi + " pf48");
+        else if (i < static_cast<size_t>(PROMPT)) pf_tail.add_row(lg_all.data(), lg_off.data(), wi + " pf22");
+        else dec_rows.add_row(lg_all.data(), lg_off.data(), wi + " dec8");
     }
-    printf("   %d rank(s): %zu rows; device head pack exact; with cuBLAS %d near tie(s)\n", T, off.size(), near);
+    const auto chk_acc = [&](const RowAcc& a, size_t want_rows, const char* seg) {
+        const std::string s = tag + " " + seg;
+        check(a.rows == want_rows, s + ": rows " + std::to_string(a.rows));
+        check(a.cos() >= E2E_SEQ_COS, s + ": cosine " + std::to_string(a.cos()));
+        check(a.rel() <= E2E_SEQ_REL, s + ": relative " + std::to_string(a.rel()));
+    };
+    chk_acc(pf_blas, static_cast<size_t>(ROWS), "pf48");
+    chk_acc(pf_tail, static_cast<size_t>(PROMPT - ROWS), "pf22");
+    chk_acc(dec_rows, static_cast<size_t>(SINGLES), "dec8");
+    const double min_rc = std::min({pf_blas.min_row_cos, pf_tail.min_row_cos, dec_rows.min_row_cos});
+    printf("   %d rank(s): %zu rows; ghp64 & M=24 exact; cuBLAS %zu/%zu same argmax | pf48 cos %.5f rel %.4f | pf22 cos %.5f rel %.4f | dec8 cos %.5f rel %.4f | min row cos %.5f\n",
+           T, N, same_tok, N, pf_blas.cos(), pf_blas.rel(), pf_tail.cos(), pf_tail.rel(), dec_rows.cos(), dec_rows.rel(), min_rc);
 }
 
 // ------------------------------------------------------------------------------------- 4. the device all-reduce
@@ -414,13 +660,14 @@ int main(int argc, char** argv)
 {
     const bool bench = argc > 1 && std::string(argv[1]) == "--bench";
     knob::init();
-    printf("1. the head's candidates packed on the device\n");
+    printf("1. the head's candidates packed on the device, and BlasScope / blas_gemm\n");
     for (int nc : {16, 256, 512})
     {
         check_head_pack(1000, nc, 9, false);
         check_head_pack(12576, nc, 9, false);
     }
     check_head_pack(255, 256, 5, false);
+    check_blas_gemm();
     if (bench)
     {
         check_head_pack(50304, 256, 8, true);
