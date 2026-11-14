@@ -552,6 +552,52 @@ struct MtpWork
     size_t part_floats = 0;
 };
 
+// The prefill GEMMs through cuBLAS (Options::cublas_prefill): ink2::gemm's hook while a BlasScope is alive.
+inline cublasHandle_t& blas_cur()
+{
+    static thread_local cublasHandle_t hd = nullptr;
+    return hd;
+}
+inline bool blas_gemm(const uint16_t* x, const uint16_t* w, int M, int K, int N, void* y, int mode, cudaStream_t st)
+{
+    static thread_local bool warned = false;
+    cublasHandle_t hd = blas_cur();
+    if (!hd) return false;
+    const float one = 1.f, zero = 0.f;
+    cublasStatus_t rc = cublasSetStream(hd, st);
+    if (rc == CUBLAS_STATUS_SUCCESS)
+        rc = cublasGemmEx(hd, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &one, w, CUDA_R_16BF, K, x, CUDA_R_16BF, K, &zero, y, mode == ink2::GEMM_F32 ? CUDA_R_32F : CUDA_R_16BF, N,
+                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (rc == CUBLAS_STATUS_SUCCESS) return true;
+    if (!warned) fprintf(stderr, "# ink2: cuBLAS GEMM failed (%d); the engine's own GEMM runs instead\n", static_cast<int>(rc));
+    warned = true;
+    return false;
+}
+struct BlasScope
+{
+    explicit BlasScope(cublasHandle_t hd)
+    {
+        if (!hd) return;
+        blas_cur() = hd;
+        ink2::gemm_hook() = blas_gemm;
+    }
+    ~BlasScope()
+    {
+        blas_cur() = nullptr;
+        ink2::gemm_hook() = nullptr;
+    }
+    BlasScope(const BlasScope&) = delete;
+    BlasScope& operator=(const BlasScope&) = delete;
+};
+// A prefill chunk: the rows are one run of one slot at consecutive positions.
+inline bool one_run(const ink2::RowsHost& rh)
+{
+    const int M = rh.rows();
+    for (int m = 0; m < M; ++m)
+        if (rh.slot[static_cast<size_t>(m)] != rh.slot[0] || rh.run0[static_cast<size_t>(m)] != 0 || rh.pos[static_cast<size_t>(m)] != rh.pos[0] + m) return false;
+    return M > 0;
+}
+
 struct Options
 {
     int nr = 1;          // ranks of the model
@@ -642,6 +688,7 @@ public:
         parts = dalloc<float>(static_cast<size_t>(o.nr) * part_stride);
         host_logits.resize(static_cast<size_t>(o.max_rows) * vr);
         head_parts.resize(static_cast<size_t>(o.nr) * head_bytes(o.max_rows));
+        if (use_blas && cublasCreate(&blas) != CUBLAS_STATUS_SUCCESS) die("cublasCreate failed");
         if (use_ghp) head_dev = dalloc<uint8_t>(head_bytes(std::max(o.max_rows, o.slots)));
         if (o.mtp > 0) init_mtp();
         if (o.vision && a.find("V.proj_out.weight")) init_vision();
@@ -730,6 +777,8 @@ public:
         INK2RT_CK(cudaMemcpy(d_run0, rh.run0.data(), sizeof(int) * M, cudaMemcpyHostToDevice));
         INK2RT_CK(cudaMemcpy(toks, tk, sizeof(int) * M, cudaMemcpyHostToDevice));
         const ink2::Rows rw{d_slot, d_pos, d_run0};
+        const bool chunk = one_run(rh);   // a prefill chunk: the speed paths that depend on M are for these rows only
+        const BlasScope blas_scope(use_blas && chunk && M >= 32 ? blas : nullptr);
         ink2::embed_norm(toks, embed, embed_norm, vis_rows, c.image_token, h, M, c.H, 0);
         for (size_t j = 0; j < L.size(); ++j)
         {
@@ -1465,6 +1514,7 @@ private:
     std::vector<uint16_t*> states;
     std::vector<float> host_logits;
     std::vector<uint8_t> head_parts;
+    cublasHandle_t blas = nullptr;   // use_blas
     uint8_t* head_dev = nullptr;   // [rows][head_row_bytes]: the device's packed head rows (use_ghp)
     bool use_far = false, use_ghp = false, use_blas = false, use_tc = false;
     const uint16_t *embed = nullptr, *embed_norm = nullptr, *final_norm = nullptr;

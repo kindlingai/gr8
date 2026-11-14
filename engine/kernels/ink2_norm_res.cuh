@@ -320,9 +320,20 @@ inline void attn_block_step(const uint16_t* h, const uint16_t* a, bool block_sta
     }
     else add_bf16(h, a, mid, n, st);
 }
+// A step-scoped replacement for the GEMM_BF16 / GEMM_F32 products (the engine sets it for a prefill chunk and
+// clears it after; null = the kernels of this file). It returns false when it did not do the product.
+using GemmHook = bool (*)(const uint16_t* x, const uint16_t* w, int M, int K, int N, void* y, int mode, cudaStream_t st);
+inline GemmHook& gemm_hook()
+{
+    static thread_local GemmHook hk = nullptr;
+    return hk;
+}
 inline void gemm(const uint16_t* x, const uint16_t* w, int M, int K, int N, void* y, int mode, int v0, int valid, cudaStream_t st)
 {
     if (M < 1 || N < 1 || K < 16 || K % 16) throw std::runtime_error("ink2::gemm: M < 1, N < 1 or K % 16");
+    if (mode != GEMM_SOFTCAP)
+        if (GemmHook hk = gemm_hook())
+            if (hk(x, w, M, K, N, y, mode, st)) return;
     const unsigned gx = static_cast<unsigned>((N + 16 * RW - 1) / (16 * RW));
     if (M <= 8) k_ink2_gemm<1><<<dim3(gx, 1), RW * 32, 0, st>>>(x, w, M, K, N, y, mode, v0, valid);
     else k_ink2_gemm<4><<<dim3(gx, (M + 31) / 32), RW * 32, 0, st>>>(x, w, M, K, N, y, mode, v0, valid);

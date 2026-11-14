@@ -151,8 +151,8 @@ int main(int argc, char** argv)
     if (dir.empty()) die("name the checkpoint: --v2-dense DIR");
     if (mtp < 0 || mtp > 7) die("--mtp " + std::to_string(mtp) + ": Inkling-2-Small drafts 0 to 7 tokens a round");
     const int max_chunk = s2dir.empty() ? 256 : 8;
-    if (s2sess < 1 || s2sess > 8 || chunk < 1 || chunk > max_chunk || prefill < 1 || prefill > 512 || cap < 64)
-        die("--s2-sessions 1..8, --chunk 1.." + std::to_string(max_chunk) + ", --prefill 1..512, --cap >= 64");
+    if (s2sess < 1 || s2sess > 8 || chunk < 1 || chunk > max_chunk || prefill < 1 || prefill > 2048 || cap < 64)
+        die("--s2-sessions 1..8, --chunk 1.." + std::to_string(max_chunk) + ", --prefill 1..2048, --cap >= 64");
     if (kv_keep != "system" && kv_keep != "sessions" && kv_keep != "all") die("--kv-keep must be system, sessions or all");
     if (kv_sys_after < 1 || kv_wlim < 0.0) die("--kv-system-after >= 1, --kv-write-limit >= 0");
     if (!ip2.empty() && ip2.size() != ip.size()) die("--ips2 must name as many addresses as --ips");
