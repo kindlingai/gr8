@@ -1,5 +1,15 @@
 # Engine settings
 
+## DeepSeek prefill diagnostics
+
+`GR8_DS_MOE_ELOG` defaults to `0`: no expert-count record, host readback or diagnostic stream fence.
+Set `GR8_DS_MOE_ELOG=1` to enable these diagnostics explicitly.
+
+DS41 keeps a prompt-end fallback on every turn when prefix reuse and GR8_DS_CACHE_REPLACE=1 are enabled,
+so a re-tokenized reply or dropped reasoning can reuse that prefix. The next restore or parked resume frees
+its unused sibling; the cache budget still applies. Roll back to eager replacement after a request-end hit
+with --extra-env GR8_DS_CACHE_DEFER_REPLACE=0. This engine knob defaults to 1 and every rank must agree.
+
 ## DeepSeek served prefix parking
 
 The ds41 launcher sets `GR8_DS_PARK=1` with `REUSE=1` and `SESS>=2`, unless `EXTRA_ENV` disables the cache.

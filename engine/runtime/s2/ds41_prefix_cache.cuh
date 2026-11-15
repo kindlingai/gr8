@@ -107,6 +107,10 @@ public:
     uint64_t replaced() const { return replaced_; }
     uint64_t siblings() const { return siblings_; }
     uint64_t evictions() const { return evictions_; }
+    static bool defer_replace_on() {
+        static const bool on = knob::ds_cache_defer_replace();
+        return on;
+    }
 
     uint64_t digest() const {
         uint64_t h = 0x9E3779B97F4A7C15ull ^ uint64_t(entries_.size());
@@ -198,10 +202,10 @@ public:
 
     // GR8_DS_CACHE_REPLACE: `kind` is recorded on a new entry. `prompt_gen` is the entry this same request captured at its
     // prompt end (0: none), used when it is still stored, same namespace, shorter and a token prefix of the new entry:
-    //   replace = true (the request restored a request-end entry, so its client sends replies back as generated): it is
-    //     freed before the new buffer is allocated. match() needs an entry's tokens to be a prefix of the new prompt, so it
-    //     is lost only to prompts that share its prefix and leave the reply (a retry, regenerate or edit: a re-prefill).
-    //   replace = false: a new entry is linked to it as its sibling; the first restore of either frees the other (restore()).
+    //   replace = true: the legacy eager policy frees it before allocating the new buffer. A previous request-end hit
+    //     does not guarantee the next reply tokenizes identically: a re-tokenized reply, retry or edit can need prompt end.
+    //   replace = false (GR8_DS_CACHE_DEFER_REPLACE=1): link the two snapshots until the next turn chooses one; the first
+    //     restore of either frees the other (restore()). Normal budget/LRU eviction still bounds the retained snapshots.
     // keep (GR8_DS_PARK: a grant's own hit, restored after this capture) is never freed or evicted here: when only it stands
     // in the way the capture is skipped (returns 0). images: the request's image rows, -1 in the entry's Engram ring as in the
     // live ring (ds41_engram_ring.h)
@@ -216,6 +220,7 @@ public:
                 std::equal(entries_[i].tokens.begin(), entries_[i].tokens.end(), tokens.begin())) {
                 const long gone = drop_replaced(replace_gen, pos, tokens, ns);   // index erased, or -1
                 if (gone >= 0 && gone < long(i)) --i;
+                if (!replace && defer_replace_on()) link_prompt(entries_[i], prompt_gen, pos, tokens, ns);
                 if (stash_) {
                     const auto& state = store_sessions_.at(slot);
                     entries_[i].continuations = state.hits;
@@ -351,7 +356,9 @@ public:
     // GR8_DS_PARK: a chat parked at [0, pos) keeps its request end in its slot; the capture waits for the bind that evicts
     // it. park_end does now the bookkeeping capture(RequestEnd, prompt_gen, replace) does before its copy, so the other
     // entries change when they would without park:
-    //   an equal entry stored: with replace, the request's own prompt-end entry is freed; the equal entry is refreshed
+    //   an equal entry stored: with replace, the request's own prompt-end entry is freed; with deferred replacement,
+    //     link its unpaired prompt to this park's placeholder. The stored equal entry may belong to another request:
+    //     a prompt restore must suppress this park's eviction, not steal that stored entry's sibling. Refresh it either way
     //   the dedup, pos 0 or over the budget: nothing
     //   else: with replace, the prompt-end entry is freed; without, it is linked to a placeholder for this park
     //     (park_mark(id)). A restore of the prompt-end entry then frees the placeholder, as it frees a captured request end
@@ -368,6 +375,9 @@ public:
                 std::equal(entries_[i].tokens.begin(), entries_[i].tokens.end(), tokens.begin())) {   // capture's equal-entry path
                 const long gone = drop_replaced(replace ? prompt_gen : 0, pos, tokens, ns);
                 if (gone >= 0 && gone < long(i)) --i;
+                if (!replace && defer_replace_on() && replace_on())
+                    if (Ds41PrefixEntry* pe = prompt_entry(prompt_gen, pos, tokens, ns); pe && !pe->sibling)
+                        pe->sibling = park_mark(id);
                 Ds41PrefixEntry hit = std::move(entries_[i]);
                 entries_.erase(entries_.begin() + long(i));
                 entries_.push_back(std::move(hit));
@@ -400,6 +410,15 @@ public:
             kind = e->kind;
             e->sibling = 0;
             free_sibling(gen, sib);
+            // An equal entry may have appeared after this park, or already have another request's sibling. It does
+            // not own this park's placeholder. Free our own prompt too, but never the dedup entry itself or a prompt
+            // linked to a different request. Re-query after free_sibling: it can erase and move entries_.
+            if (defer_replace_on() && replace_on() && gen != prompt_gen)
+                if (Ds41PrefixEntry* pe = prompt_entry(prompt_gen, pos, tokens, ns);
+                    pe && (!pe->sibling || pe->sibling == park_mark(id))) {
+                    free_at(size_t(pe - entries_.data()));
+                    ++siblings_;
+                }
         } else if (Ds41PrefixEntry* pe = prompt_entry(prompt_gen, pos, tokens, ns); pe && pe->sibling == park_mark(id)) {
             free_at(size_t(pe - entries_.data()));
             ++siblings_;
@@ -682,6 +701,16 @@ private:
                                                                                                                           : nullptr;
         return nullptr;
     }
+    // Equal request-end captures can reuse an unpaired entry. Do not steal another request's sibling: those entries
+    // remain independently LRU-managed. Only a newly captured prompt generation belongs to this request.
+    void link_prompt(Ds41PrefixEntry& end, uint64_t prompt_gen, uint32_t pos, const std::vector<int>& tokens,
+                     const g6rt::CacheNamespace& ns) {
+        if (!replace_on() || end.sibling) return;
+        if (Ds41PrefixEntry* pe = prompt_entry(prompt_gen, pos, tokens, ns); pe && !pe->sibling) {
+            pe->sibling = end.generation;
+            end.sibling = prompt_gen;
+        }
+    }
     // GR8_DS_PARK: the sibling of a prompt-end entry whose request end is parked under park id (not a generation: next_gen_
     // is far below bit 63)
     static uint64_t park_mark(uint64_t id) { return (1ull << 63) | id; }
@@ -848,12 +877,14 @@ public:
     }
     uint64_t capture_request_end(Ds41PrefixCache& ck, int q, uint32_t pos, const std::vector<int>& history,
                                  const g6rt::CacheNamespace& ns, cudaStream_t st, const Ds41ImageRows& images = {}) {
-        return ck.capture(q, pos, history, ns, st, Ds41Snap::RequestEnd, prompt_gen_[size_t(q)], restored_end_[size_t(q)], 0, images);
+        const bool eager_replace = restored_end_[size_t(q)] && !ck.defer_replace_on();
+        return ck.capture(q, pos, history, ns, st, Ds41Snap::RequestEnd, prompt_gen_[size_t(q)], eager_replace, 0, images);
     }
     // GR8_DS_PARK: a park keeps q's state for the bind that resumes or evicts it; the request-end bookkeeping happens now
     void park(Ds41PrefixCache& ck, int q, uint32_t pos, const std::vector<int>& history, const g6rt::CacheNamespace& ns) {
-        park_id_[size_t(q)] = ck.park_end(prompt_gen_[size_t(q)], pos, history, ns, restored_end_[size_t(q)]);
-        if (restored_end_[size_t(q)]) prompt_gen_[size_t(q)] = 0;   // replaced (freed) or not this request's to link
+        const bool eager_replace = restored_end_[size_t(q)] && !ck.defer_replace_on();
+        park_id_[size_t(q)] = ck.park_end(prompt_gen_[size_t(q)], pos, history, ns, eager_replace);
+        if (eager_replace) prompt_gen_[size_t(q)] = 0;   // deferred mode needs this generation on resume and eviction
     }
     // GR8_DS_PARK eviction of the chat parked on q: its request-end capture, with the kind and sibling link of retain's
     // (keep = the new grant's claimed entry, never freed here; the capture is skipped when only it is in the way). Nothing

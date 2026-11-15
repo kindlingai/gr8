@@ -19,6 +19,8 @@ when `SESS >= 2`, `MTP=3`, `S2_SHARED_WATERFILL=1` and `S2_SHARED_WF_MARGIN=0.02
 back to uniform shared rows and `MTP=1`, and `--sess 1` restores the single-session launch; see
 [FLASH.md](docs/FLASH.md). Other model/topology defaults are unchanged.
 
+DeepSeek expert-count diagnostics are off by default; `GR8_DS_MOE_ELOG=1` enables them.
+
 ### Switch between the models
 
 [![Switch between GLM-5.3, DeepSeek-V4.1-Flash and GLM-5.3-Flash: seconds for each direction](docs/cards/switching.png)](docs/SWITCHING.md)
@@ -166,6 +168,8 @@ If you are an agent (or developer) building on gr8, start from the matching entr
 - **DeepSeek tool turns.** Forced tools use native non-thinking mode unless thinking is explicitly requested or in
   the history (`--forced-tool-thinking 1` restores the old prompt). With prefix reuse and two or more sessions,
   completed chats stay in their slots for follow-ups (`--extra-env GR8_DS_PARK=0` restores snapshot copies).
+  Each turn retains a prompt-end fallback for re-tokenized replies, within the cache budget
+  (`--extra-env GR8_DS_CACHE_DEFER_REPLACE=0` restores eager replacement after a request-end hit).
   See [DeepSeek defaults and rollbacks](docs/DEEPSEEK.md#forced-tools-and-parked-chats).
 - **Image input.** DeepSeek-V4.1-Flash and GLM-5.3-Flash take images in chat requests (opt-in, `GR8_DS41_VISION=1`,
   [docs/DS41-VISION.md](docs/DS41-VISION.md); `GR8_GLM53F_VISION=1`, [docs/FLASH-VISION.md](docs/FLASH-VISION.md)).

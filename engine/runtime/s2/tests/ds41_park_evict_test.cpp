@@ -6,74 +6,7 @@
 // 1 MiB budget, one attention layer of 256 ring rows; BF16 PE 774144 + RE 876544 B, FP4 PE 521344 + RE 550144 B.
 // Host only: the CUDA calls are stubs over host memory with an optional allocation limit.
 // Build (one line): g++ -std=c++17 -O1 -g -fsanitize=address,undefined -DG6_MODEL_DS41=1 -I engine/runtime engine/runtime/s2/tests/ds41_park_evict_test.cpp -o /tmp/ds41_park_evict_test <knobs lib>
-#include <cassert>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <stdexcept>
-#include <unordered_map>
-#include <vector>
-#include "prefix_reuse.h"
-#include "../engram/engram_ring.h"
-#include "../knobs-rs/gr8_knobs.h"
-
-using __nv_bfloat16 = uint16_t;
-using cudaStream_t = int;
-constexpr int cudaSuccess = 0, cudaMemcpyDeviceToDevice = 0, cudaMemcpyHostToDevice = 1;
-static std::unordered_map<void*, size_t> mem;
-static size_t live_bytes = 0, alloc_limit = SIZE_MAX;   // alloc_limit: device memory pressure (cudaMalloc fails above it)
-static int cudaMalloc(void** p, size_t n) {
-    if (n > alloc_limit - live_bytes) return 2;
-    *p = std::malloc(n); mem[*p] = n; live_bytes += n; return cudaSuccess;
-}
-static int cudaFree(void* p) { if (!p) return 0; auto i = mem.find(p); assert(i != mem.end()); live_bytes -= i->second; mem.erase(i); std::free(p); return 0; }
-static int cudaGetLastError() { return 0; }
-static int cudaStreamSynchronize(int) { return 0; }
-static int cudaMemcpyAsync(void* d, const void* s, size_t n, int, int) { std::memcpy(d, s, n); return 0; }
-#define G6RT_CK(x) assert((x) == 0)
-namespace ds41a { constexpr int HD = 512, CQ_ROW = 288; }
-namespace g6rt {
-constexpr size_t DS41_CA_ROW = 288, DS41_ICA_ROW = 68;
-constexpr int ENG_RING = 64;
-struct Cache { uint16_t *ring = nullptr, *comp = nullptr; uint8_t* compq = nullptr; float *kvs = nullptr, *scs = nullptr; int ring_rows = 256; size_t comp_ss = 0; };
-struct Ds41AttnLayer { Cache C; };
-struct Ds41IdxModel { uint8_t *ca[4]{}, *ica[4]{}; uint16_t* shadow = nullptr; int rows_kv[4]{}, cap = 2048, rcap = 8; };
-struct Model { std::vector<Ds41AttnLayer> layers; Ds41IdxModel* idx = nullptr; int* ehist = nullptr; int rank = 0; };
-static Ds41AttnLayer* ds41_attn_state(Model& m, int i) { return &m.layers[size_t(i)]; }
-[[maybe_unused]] static const Ds41AttnLayer* ds41_attn_state(const Model& m, int i) { return &m.layers[size_t(i)]; }
-namespace ds41_idx_detail {
-static Ds41IdxModel* find(Model& m, bool) { return m.idx; }
-[[maybe_unused]] static const Ds41IdxModel* find(const Model& m, bool) { return m.idx; }
-}
-}
-namespace g6s2 { struct Ds41Dspark { g6rt::Model draft; }; }
-#include "kv_state_host_tiers.h"
-#define GR8_DS41_PREFIX_CACHE_STANDALONE 1
-#include "s2/ds41_prefix_cache.cuh"
-#include "s2/driver.h"
-#include <algorithm>
-#include <array>
-#include <map>
-#include <memory>
-#include <tuple>
-
-using g6s2::Ds41PrefixCache;
-static g6rt::CacheNamespace ns(int n) { g6rt::CacheNamespace s{}; s[0] = n; return s; }
-static int fails = 0;
-#define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); ++fails; } } while (0)
-
-struct Fixture {
-    g6rt::Model m;
-    std::vector<uint16_t> ring, comp;
-    std::vector<uint8_t> packed;
-    int hist[3 * 64]{};
-    explicit Fixture(bool fp4) : ring(3 * 256 * 512, 7), comp(3 * 1024 * 512, 7), packed(3 * 1024 * 288, 7) {
-        m.layers.resize(1); m.ehist = hist;
-        auto& c = m.layers[0].C; c.ring = ring.data(); c.comp_ss = 1024 * size_t(fp4 ? 288 : 512);
-        if (fp4) c.compq = packed.data(); else c.comp = comp.data();
-    }
-};
+#include "ds41_prefix_cache_host.h"
 
 // the bind's eviction of a parked slot, as ds41_native.cuh runs it (keep = the grant's claimed generation)
 static uint64_t evict_parked(Ds41PrefixCache* ck, int q, uint32_t pos, const std::vector<int>& tokens, const g6rt::CacheNamespace& n, uint64_t keep) {
@@ -409,8 +342,9 @@ static void stale_placeholder(bool fp4, bool use_resume) {
     const uint64_t bpe = s.capture_prompt_end(c, 0, 100, b, ns(2), 0);
     s.park(c, 0, 200, b, ns(2));
     const uint64_t sib_before = c.siblings();
-    c.restore(pe, 1, 0);                                         // a retry of A
-    CHECK(c.siblings() == sib_before);                           // frees nothing of B's
+    CHECK(bool(c.find(pe)) == !(c.defer_replace_on() && use_resume));
+    if (c.find(pe)) c.restore(pe, 1, 0);   // a retry frees A's captured RE in deferred mode, never B's
+    CHECK(c.siblings() == sib_before + (c.defer_replace_on() && !use_resume ? 1u : 0u));
     const uint64_t bre = s.evict_parked(c, 0, 200, b, ns(2), 0, 0);
     CHECK(bre != 0 && c.find(bpe) && c.find(bpe)->sibling == bre && c.find(bre) && c.find(bre)->sibling == bpe);
     CHECK(!placeholder(c));
@@ -434,11 +368,12 @@ static void exact_park_replace(bool fp4) {
     so.park(on, 0, 300, t, ns(1));
     sf.capture_request_end(off, 0, 300, t, ns(1), 0);
     sf.reset(0);
-    CHECK(off.replaced() == 1 && !off.find(pe_off));
-    CHECK(on.replaced() == off.replaced() && !on.find(pe_on));
+    const bool eager = !off.defer_replace_on();
+    CHECK(off.replaced() == uint64_t(eager) && bool(off.find(pe_off)) == !eager);
+    CHECK(on.replaced() == off.replaced() && bool(on.find(pe_on)) == !eager);
     so.evict_parked(on, 0, 300, t, ns(1), 0, 0);
-    CHECK(!on.find(pe_on) && on.size() == off.size());
-    printf("ds41_park_evict_test exact park replace %s: PARK=1 frees its PE as PARK=0 does (replaced %llu = %llu)\n", fp4 ? "FP4" : "BF16",
+    CHECK(bool(on.find(pe_on)) == !eager && on.size() == off.size());
+    printf("ds41_park_evict_test exact park replace %s: PARK=1 follows the same replacement policy as PARK=0 (replaced %llu = %llu)\n", fp4 ? "FP4" : "BF16",
            (unsigned long long)on.replaced(), (unsigned long long)off.replaced());
 }
 // the digest gap: a park's placeholder link changes park_digest (the park-on pool digest), digest() (off mode) does not change
@@ -481,10 +416,10 @@ static void image_ring() {
         int want[64];
         const uint64_t pe = snaps.capture_prompt_end(cache, 0, pe_pos, t, ns(1), 0, rows);
         CHECK(pe != 0);
-        std::fill_n(f.hist, 64, 12345);
+        std::fill_n(f.hist.data(), 64, 12345);
         cache.restore(pe, 0, 0);
         live(t, pe_pos, want);
-        CHECK(std::equal(want, want + 64, f.hist));
+        CHECK(std::equal(want, want + 64, f.hist.data()));
         CHECK(gap == 3 || f.hist[(pe_pos - 1 - uint32_t(gap)) & 63] == -1);   // the image's last row is in the next n-gram
         ++cases;
         // the request end of the same chat (a park evicted into the cache, in a cache of its own: the dedup would keep the
@@ -498,10 +433,10 @@ static void image_ring() {
             const uint32_t re_pos = pe_pos + g;
             const uint64_t re = s2.evict_parked(c2, 0, re_pos, hh, ns(1), 0, 0, rows);
             CHECK(re != 0);
-            std::fill_n(f2.hist, 64, 12345);
+            std::fill_n(f2.hist.data(), 64, 12345);
             if (re) c2.restore(re, 0, 0);
             live(hh, re_pos, want);
-            CHECK(std::equal(want, want + 64, f2.hist));
+            CHECK(std::equal(want, want + 64, f2.hist.data()));
             ++cases;
         }
     }
@@ -547,9 +482,9 @@ static void tiered_store(bool fp4, int steering, bool disk) {
         ck.open_stores({spec}, false, "all", 2, 1.0, "test-set", 1, 3, 32);
         const auto desc = ck.state_desc(3, 32);
         const uint64_t state = desc.state_blocks();
-        std::fill_n(f.hist, 64, 999);
+        std::fill_n(f.hist.data(), 64, 999);
         ck.capture(0, 201, tokens, space, 0, Ds41Snap::PromptEnd);
-        CHECK(std::all_of(f.hist, f.hist + 64, [](int v) { return v == 999; }));
+        CHECK(std::all_of(f.hist.data(), f.hist.data() + 64, [](int v) { return v == 999; }));
         CHECK(ck.used_bytes() == 0 && ck.tier_stats()[1].spilled_pages == 3 + state);
         ck.capture(0, 253, tokens, space, 0, Ds41Snap::RequestEnd, 0, false, 0, images);
         CHECK(ck.tier_stats()[1].spilled_pages == 3 + 2 * state);
@@ -560,7 +495,7 @@ static void tiered_store(bool fp4, int steering, bool disk) {
         CHECK(ck.restore(hit.generation, 1, 0, hit.position) == Ds41Snap::RequestEnd);
         CHECK(std::equal(f.ring.begin(), f.ring.begin() + 256 * 512, f.ring.begin() + 256 * 512));
         int want[64]; ds41_engram_ring(want, tokens, 253, images);
-        CHECK(std::equal(want, want + 64, f.hist + 64));
+        CHECK(std::equal(want, want + 64, f.hist.data() + 64));
         for (const auto& pl : desc.page_planes) {
             const size_t n = size_t(253 / pl.token_ratio) * pl.row_bytes;
             CHECK(std::equal(pl.base, pl.base + n, pl.base + pl.slot_stride));

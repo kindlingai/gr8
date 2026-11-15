@@ -1650,6 +1650,7 @@ int main(int argc, char** argv)
         catch (const std::exception& e) { fprintf(stderr, "g6m4: rank %d Flash serve failed: %s\n", R, e.what()); return 3; }
     }
 #elif G6_MODEL_DS41
+    std::string ds41_cache_stats;
     if (s2mode)
     {
         // the DS41 serve (s2/ds41_native.cuh), with optional headless W-row prefill. The graphs above (exec[k][M], M = 1..chunk,
@@ -1834,8 +1835,10 @@ int main(int argc, char** argv)
                     const auto v = g6s2::ds41_chunk_cell(c, false); // DS41 has no S2 shared-index page mapping.
                     pf_cells[i] = G6AttnStepCell{v.context, v.page_count, v.table_size, v.reuse_rows};
                 }
-                ds41moe::elog_begin(&m, (int)c.first, true);
-                G6RT_CK(cudaStreamSynchronize(0)); // elog_begin uses a synchronous legacy-stream copy; order it before router work on st.
+                if (ds41moe::elog_on()) {
+                    ds41moe::elog_begin(&m, (int)c.first, true);
+                    G6RT_CK(cudaStreamSynchronize(0)); // order the diagnostic copy before router work
+                }
                 G6RT_CK(cudaMemcpyAsync(m.tok, c.tok, c.rows * sizeof(int), cudaMemcpyHostToDevice, st));
                 G6RT_CK(cudaMemcpyAsync(m.pos, pf_pos.data(), c.rows * sizeof(int), cudaMemcpyHostToDevice, st));
                 G6RT_CK(cudaMemcpyAsync(m.tgt, pf_tgt.data(), c.rows * sizeof(int), cudaMemcpyHostToDevice, st));
@@ -1957,13 +1960,15 @@ int main(int argc, char** argv)
                 // long requests retain all spans; request/chunk IDs and drops
                 // remain in the report. No new fence (default-off diagnostic).
                 if(pf_v2)ds41::v2::timing_report(v2engine.v,c.request);
-                std::vector<dsr::ExpertLogRec> records;
-                const int n = ds41moe::elog_read(&m, records, true);
-                g6s2::require(n >= 0, "DS41 prefill distinct-expert counter read failed");
-                G6RT_CK(cudaStreamSynchronize(0)); // elog_read's cursor reset must land before the next chunk on st.
-                for (const auto& x : records)
-                    fprintf(stderr, "# rank %d request %llu chunk %u rows %u moe layer %d distinct %d routes %d\n",
-                            R, (unsigned long long)c.request, c.first, c.rows, x.layer, x.distinct, x.routes);
+                if (ds41moe::elog_on()) {
+                    std::vector<dsr::ExpertLogRec> records;
+                    const int n = ds41moe::elog_read(&m, records, true);
+                    g6s2::require(n >= 0, "DS41 prefill distinct-expert counter read failed");
+                    G6RT_CK(cudaStreamSynchronize(0)); // elog_read's cursor reset must land before the next chunk on st.
+                    for (const auto& x : records)
+                        fprintf(stderr, "# rank %d request %llu chunk %u rows %u moe layer %d distinct %d routes %d\n",
+                                R, (unsigned long long)c.request, c.first, c.rows, x.layer, x.distinct, x.routes);
+                }
             };
             // GR8_DS_PF_LANES=2 (ds41_lanes.h, the GLM pf_step2s port): one quantum = lane A (chunk a: m, st, the main fabric, Dispatch's id) and
             // lane B (chunk b, the rest of the same session: mB, sb, fabB, lane B's own id). Both walk the same non-final plan; the serial stages
@@ -2019,8 +2024,10 @@ int main(int argc, char** argv)
                         lane_ev.push_back(e);
                     }
                     // ds41moe::elog_begin is a synchronous legacy-stream copy: both lanes' before any router work (lane B has its own counter)
-                    for (int L = 0; L < 2; ++L) ds41moe::elog_begin(mm[L], (int)ch[L]->first, true);
-                    G6RT_CK(cudaStreamSynchronize(0));
+                    if (ds41moe::elog_on()) {
+                        for (int L = 0; L < 2; ++L) ds41moe::elog_begin(mm[L], (int)ch[L]->first, true);
+                        G6RT_CK(cudaStreamSynchronize(0));
+                    }
                     // lane L's prologue: dc.prefill's, on its Model, stream and fabric (K_PRO, the first link of the token chain)
                     auto prologue = [&](int L) {
                         const g6s2::Ds41PrefillChunk& c = *ch[L];
@@ -2135,13 +2142,15 @@ int main(int argc, char** argv)
                 };
                 dc.errors2 = [&]() -> unsigned { return *fabB.dev().error | ds41_engram_error(*mBp); };
                 dc.after_prefill2 = [&](const g6s2::Ds41PrefillChunk& c) {
-                    std::vector<dsr::ExpertLogRec> records;
-                    const int n = ds41moe::elog_read(mBp.get(), records, true);
-                    g6s2::require(n >= 0, "DS41 prefill lane B distinct-expert counter read failed");
-                    G6RT_CK(cudaStreamSynchronize(0));
-                    for (const auto& x : records)
-                        fprintf(stderr, "# rank %d request %llu chunk %u rows %u lane B moe layer %d distinct %d routes %d\n",
-                                R, (unsigned long long)c.request, c.first, c.rows, x.layer, x.distinct, x.routes);
+                    if (ds41moe::elog_on()) {
+                        std::vector<dsr::ExpertLogRec> records;
+                        const int n = ds41moe::elog_read(mBp.get(), records, true);
+                        g6s2::require(n >= 0, "DS41 prefill lane B distinct-expert counter read failed");
+                        G6RT_CK(cudaStreamSynchronize(0));
+                        for (const auto& x : records)
+                            fprintf(stderr, "# rank %d request %llu chunk %u rows %u lane B moe layer %d distinct %d routes %d\n",
+                                    R, (unsigned long long)c.request, c.first, c.rows, x.layer, x.distinct, x.routes);
+                    }
                 };
             }
             // GR8_DS_C8PACK=1: one native W launch over the validated, per-slot ragged table. With the
@@ -2178,8 +2187,10 @@ int main(int argc, char** argv)
                 // m.sess and the pack table. Keep a conservative maximum in the unused cells.
                 const int pages = (max_context + 63) / 64;
                 for (int i = 0; i < m.nl; ++i) pf_cells[i] = G6AttnStepCell{max_context, pages, pages, 0};
-                ds41moe::elog_begin(&m, 0, true); // every eligible segment starts at position zero; rows map back via shape.seg
-                G6RT_CK(cudaStreamSynchronize(0));
+                if (ds41moe::elog_on()) {
+                    ds41moe::elog_begin(&m, 0, true); // packed rows map back via shape.seg
+                    G6RT_CK(cudaStreamSynchronize(0));
+                }
                 G6RT_CK(cudaMemcpyAsync(m.tok, pf_tok.data(), size_t(rows) * sizeof(int), cudaMemcpyHostToDevice, st));
                 G6RT_CK(cudaMemcpyAsync(m.pos, pf_pos.data(), size_t(rows) * sizeof(int), cudaMemcpyHostToDevice, st));
                 G6RT_CK(cudaMemcpyAsync(m.tgt, pf_tgt.data(), size_t(rows) * sizeof(int), cudaMemcpyHostToDevice, st));
@@ -2235,24 +2246,33 @@ int main(int argc, char** argv)
                 if (dsk.on()) { m.dsp.main_lo = 0; m.dsp.main_hi = -1; }
             };
             dc.after_prefill_pack = [&](const g6s2::Ds41PrefillPack& p) {
-                std::vector<dsr::ExpertLogRec> records;
-                const int n = ds41moe::elog_read(&m, records, true);
-                g6s2::require(n >= 0, "DS41 ragged distinct-expert counter read failed");
-                G6RT_CK(cudaStreamSynchronize(0));
-                // The expert counter is one aggregate record per layer; expose its packed-row
-                // origin map rather than misattributing distinct experts to any one request.
-                for (int j = 0; j < p.layout.count; ++j) {
-                    const auto& s = p.layout.seg[j];
-                    fprintf(stderr, "# rank %d ragged member request %llu slot %d row0 %d rows %d first %d context %d\n",
-                            R, (unsigned long long)s.request, s.slot, s.row0, s.rows, s.first, s.context);
+                if (ds41moe::elog_on()) {
+                    std::vector<dsr::ExpertLogRec> records;
+                    const int n = ds41moe::elog_read(&m, records, true);
+                    g6s2::require(n >= 0, "DS41 ragged distinct-expert counter read failed");
+                    G6RT_CK(cudaStreamSynchronize(0));
+                    // The expert counter is one aggregate record per layer; expose its packed-row
+                    // origin map rather than misattributing distinct experts to any one request.
+                    for (int j = 0; j < p.layout.count; ++j) {
+                        const auto& s = p.layout.seg[j];
+                        fprintf(stderr, "# rank %d ragged member request %llu slot %d row0 %d rows %d first %d context %d\n",
+                                R, (unsigned long long)s.request, s.slot, s.row0, s.rows, s.first, s.context);
+                    }
+                    for (const auto& x : records)
+                        fprintf(stderr, "# rank %d ragged pack %d rows %d sessions moe layer %d distinct %d routes %d start %d (aggregate)\n",
+                                R, p.layout.rows, p.layout.count, x.layer, x.distinct, x.routes, x.start);
                 }
-                for (const auto& x : records)
-                    fprintf(stderr, "# rank %d ragged pack %d rows %d sessions moe layer %d distinct %d routes %d start %d (aggregate)\n",
-                            R, p.layout.rows, p.layout.count, x.layer, x.distinct, x.routes, x.start);
             };
         }
+        // After all FFN/fabric/cache allocations, before serving: unified-memory
+        // headroom and the actual scheduler capacity, not a pre-allocation guess.
+        size_t ds_free=0,ds_total=0;
+        G6RT_CK(cudaMemGetInfo(&ds_free,&ds_total));
+        fprintf(stderr,"# ds41_memory rank=%d free_bytes=%zu total_bytes=%zu kv_tokens=%u sessions=%u session_cap=%d\n",
+            R,ds_free,ds_total,sc.pool_rows,sc.max_sessions,cap);
         try { g6s2::serve_ds41(dc, bc, plan.chunk); }
         catch (const std::exception& e) { fprintf(stderr, "g6m4: rank %d DS41 serve failed: %s\n", R, e.what()); return 3; }
+        if (ds41_cache) ds41_cache_stats = ds41_cache->stats_line();
         if(pf_v2) v2engine.release();
         if(fplan.find(FabKind::Ds41V2)) fabv2.stop_proxy();   // planned, even where the release's experts kept v2 off
     }
@@ -3836,11 +3856,9 @@ int main(int argc, char** argv)
     // attn/ds41_attn.cuh and stays 0 unless GR8_DS_C2_TRACE=1 is in the env.
     fprintf(stderr, "# rank %d: ds41 C2 trace count=%llu trace=%d\n", R,
             ds41_c2_dispatch_count(), ds41_c2_trace_on() ? 1 : 0);
-    // Prefix cache counters: the cache object lives in serve_ds41's scope; it self-registers (Ds41PrefixCache::live) so
-    // this stop-time line can report the counters directly instead of deriving them from the HTTP usage field. Absent
-    // without --reuse-prefix (no cache was built).
-    if (auto* pc = g6s2::Ds41PrefixCache::live())
-        fprintf(stderr, "# rank %d: ds41 prefix cache %s\n", R, pc->stats_line().c_str());
+    // Captured before the served cache leaves scope; absent without --reuse-prefix.
+    if (!ds41_cache_stats.empty())
+        fprintf(stderr, "# rank %d: ds41 prefix cache %s\n", R, ds41_cache_stats.c_str());
     // Count kernel enqueue statements actually reached on the two-stage mHC path, not the option value.
     // The W-row prefill is eager; CUDA graph replays, if any, are not counted here.
     fprintf(stderr, "# rank %d: B12_MHC_KERNEL_LAUNCHES=%llu\n", R, m.ds41_b12_kernel_launches);

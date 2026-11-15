@@ -131,3 +131,13 @@ fn yaml_file_rules() {
     yaml::add(&mut out, &mut vec![], "t.yaml", &old).unwrap();
     assert_eq!(out["TEST_X"].legacy, ["G6_X", "ATTNK_X"]);
 }
+
+#[test]
+fn ds41_diagnostics_default_off_and_cache_deferred() {
+    let log = &TABLE[find("DS_MOE_ELOG")];
+    assert_eq!(log.default, Some("0"));
+    assert_eq!(log.scope, Scope::Local);
+    let cache = &TABLE[find("DS_CACHE_DEFER_REPLACE")];
+    assert_eq!(cache.default, Some("1"));
+    assert_eq!(cache.scope, Scope::Agree);
+}
