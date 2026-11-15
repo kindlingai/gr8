@@ -87,6 +87,25 @@ pub fn lend_idle(resident: u32, queued: usize, retiring: u32) -> bool {
     share_idle(resident, queued) && retiring == 0
 }
 
+/// The busy guard's grant decision (GR8_BUSY_GUARD=1, docs/ENV.md): a fresh grant whose eviction set (the pool's
+/// busy_view) holds a live retained run — its session has no request in flight but its last response ended under the
+/// idle bound ago — refuses the request with HTTP 429 + Retry-After instead of evicting the run. `hit`: the prompt
+/// continues its own retained run, which the guard never refuses (the adoption is not an eviction).
+pub fn busy_refuse(guard_on: bool, hit: bool, live_victims: u32) -> bool {
+    guard_on && !hit && live_victims > 0
+}
+
+/// The busy guard's arrival decision: a request is refused at once when `bound` requests already wait past the
+/// `free` session slots (a burst at an idle engine queues every arrival before the first admission). 0 = no bound.
+pub fn busy_queue_full(guard_on: bool, bound: u32, queued: usize, free: usize) -> bool {
+    guard_on && bound > 0 && queued.saturating_sub(free) >= bound as usize
+}
+
+/// The busy refusal's once-per-request trace line, like wait_line.
+pub fn busy_line(last: u64, head: u64) -> bool {
+    last != head
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +117,24 @@ mod tests {
         assert_eq!(notice_target(10, 15, None, 8), 15);
         assert_eq!(notice_target(10, 99, None, 8), 18);
         assert_eq!(notice_target(10, 99, Some(10), 8), 10);
+    }
+
+    #[test]
+    fn busy_decisions() {
+        // the guard off is upstream behaviour: never refuse
+        assert!(!busy_refuse(false, false, 3) && !busy_refuse(false, true, 3));
+        // on: a live victim refuses a fresh grant, never a hit continuation, never an all-idle eviction set
+        assert!(busy_refuse(true, false, 1) && busy_refuse(true, false, 4));
+        assert!(!busy_refuse(true, true, 2));
+        assert!(!busy_refuse(true, false, 0));
+        // the queue bound: full at the bound, off at 0, off with the guard off
+        assert!(busy_queue_full(true, 8, 8, 0) && busy_queue_full(true, 8, 9, 0));
+        assert!(
+            !busy_queue_full(true, 8, 7, 0) && !busy_queue_full(true, 0, 99, 0) && !busy_queue_full(false, 8, 99, 0)
+        );
+        // requests the free slots will take do not count: 2 waiting past 4 free slots fill a bound of 2
+        assert!(!busy_queue_full(true, 2, 5, 4) && busy_queue_full(true, 2, 6, 4));
+        assert!(busy_line(1, 2) && !busy_line(2, 2));
     }
 
     #[test]

@@ -153,6 +153,11 @@ class Fake:
         if rows > self.a.pool_rows:
             self.die('request exceeds pool including guard')
         self.say(f'ADMIT {rid} prompt {len(prompt)} n_gen {req["n_gen"]} min {req["min"]} stop {req["stop"]}')
+        if req['n_gen'] == self.a.busy_max_tokens:   # the busy guard's refusal at intake (GR8_BUSY_*)
+            tmp = os.path.join(self.d0, f'resp.{rid}.tmp')
+            open(tmp, 'w').write(f'end busy -1 0 {self.a.busy_retry}\n')
+            os.rename(tmp, os.path.join(self.d0, f'resp.{rid}'))
+            return
         self.queue.append({'id': rid, 'prompt': prompt, 'req': req, 'pages': (rows + 63) // 64})
         self.dirty = True
 
@@ -310,5 +315,7 @@ if __name__ == '__main__':
     ap.add_argument('--ready-delay', type=float, default=0.0)
     ap.add_argument('--ready-version', type=int, default=3, help='2: an engine without the insert rule')
     ap.add_argument('--report-reuse', type=int, default=None, help='end every "a" line with this many reused prompt rows (an engine that reports its prefix reuse)')
+    ap.add_argument('--busy-max-tokens', type=int, default=0, help='refuse a request with this max_tokens as the busy guard does (0 = never)')
+    ap.add_argument('--busy-retry', type=int, default=60, help="the Retry-After seconds on the busy refusal's end line")
     ap.add_argument('--stop-at', type=int, default=0, help='first stop id is token #N of a request that has stop ids (0 = never)')
     sys.exit(Fake(ap.parse_args()).run())
