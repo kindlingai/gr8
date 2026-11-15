@@ -421,16 +421,17 @@ public:
     }
 
     // v2: preserve begin_step's early fetch and wait only on its device event.
-    // exchange(ids,stage,scales,first,valid,emb) assembles only the row owner's
+    // exchange(ids,stage,scales,first,valid,columns,emb) assembles only the row owner's
     // cells into emb[owned][6144]. No host count readback or fence here.
     template <class TT, class Exchange>
     int op_owned(void* model,int e,int rows,int row0,int owned,TT* T,cudaStream_t main,Exchange&& exchange) {
         if (!hooks_.project) return kNotSup;
         if (!ready_ || e<0 || e>=kNE || rows<1 || rows>cfg_.max_rows || row0<0 || owned<0 ||
             (owned && row0+owned>rows)) return cudaErrorInvalidValue;
+        if (sc_.t[e].columns.enabled != cfg_.knobs.col_shard) return cudaErrorInvalidValue;
         cudaError_t rc=cudaStreamWaitEvent(main,done_[e],0);
         if(rc!=cudaSuccess)return rc;
-        if(int x=exchange(ids_d_+size_t(e)*rows*kIds,stage_d_[e],s8_d_[e],sc_.t[e].first,sc_.t[e].valid,emb_d_[e]))return x;
+        if(int x=exchange(ids_d_+size_t(e)*rows*kIds,stage_d_[e],s8_d_[e],sc_.t[e].first,sc_.t[e].valid,sc_.t[e].columns,emb_d_[e]))return x;
         if(!owned)return 0;
         // Match the STOCK chunk's projection family, not the owner's smaller
         // row count. A full-row TC chunk must not turn into scalar GEMV merely
