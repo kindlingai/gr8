@@ -87,12 +87,11 @@ pub fn lend_idle(resident: u32, queued: usize, retiring: u32) -> bool {
     share_idle(resident, queued) && retiring == 0
 }
 
-/// The busy guard's grant decision (GR8_BUSY_GUARD=1, docs/ENV.md): a fresh grant whose eviction set (the pool's
-/// busy_view) holds a live retained run — its session has no request in flight but its last response ended under the
-/// idle bound ago (pool.rs Idle) — refuses the request with HTTP 429 + Retry-After instead of evicting the run. `hit`: the prompt
-/// continues its own retained run, which the guard never refuses (the adoption is not an eviction).
-pub fn busy_refuse(guard_on: bool, hit: bool, live_victims: u32) -> bool {
-    guard_on && !hit && live_victims > 0
+/// The busy guard's decision on a fresh grant (GR8_BUSY_GUARD=1, docs/ENV.md): when its eviction set (the pool's
+/// busy_view) holds a live retained run, one whose reply ended under its idle bound ago (pool.rs Idle), the request
+/// gets HTTP 429 + Retry-After instead of evicting the run.
+pub fn busy_refuse(guard_on: bool, live_victims: u32) -> bool {
+    guard_on && live_victims > 0
 }
 
 /// The busy guard's arrival decision: a request is refused at once when `bound` requests already wait past the
@@ -127,11 +126,10 @@ mod tests {
     #[test]
     fn busy_decisions() {
         // the guard off is upstream behaviour: never refuse
-        assert!(!busy_refuse(false, false, 3) && !busy_refuse(false, true, 3));
-        // on: a live victim refuses a fresh grant, never a hit continuation, never an all-idle eviction set
-        assert!(busy_refuse(true, false, 1) && busy_refuse(true, false, 4));
-        assert!(!busy_refuse(true, true, 2));
-        assert!(!busy_refuse(true, false, 0));
+        assert!(!busy_refuse(false, 3));
+        // on: a live victim refuses a fresh grant, an all-idle eviction set never does
+        assert!(busy_refuse(true, 1) && busy_refuse(true, 4));
+        assert!(!busy_refuse(true, 0));
         // the queue bound: full at the bound, off at 0, off with the guard off
         assert!(busy_queue_full(true, 8, 8, 0) && busy_queue_full(true, 8, 9, 0));
         assert!(

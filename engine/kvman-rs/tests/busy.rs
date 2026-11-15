@@ -145,3 +145,42 @@ fn a_zero_bound_counts_the_run_idle_at_once() {
     let (p, t) = two_runs(false);
     assert_eq!(live(&p, t, &Idle { finish_ns: 0, ..BOUNDS }), (0, 0));
 }
+
+// One 16-page run retires; `prompt` then matches it. Returns the guard's partial-hit answer `after` ns past the retire,
+// with no run short.
+fn partial(rules: Rules, prompt: &[i32], after: i64) -> Option<i64> {
+    let mut p = Pool::new(64, 64, 64 * 64).unwrap();
+    p.keep(rules);
+    let r = p.reserve(16 * PAGE, 16 * PAGE).unwrap();
+    p.retain(&r, done(16, 0)).unwrap();
+    let rows = prompt.len() as u64 + 64;
+    let hit = p.match_prefix(prompt, rows, rows, prompt.len() as i32 - 1);
+    assert!(hit.skip > 0, "the prompt hits the run");
+    let t = p.kept()[0].retired_ns;
+    p.busy_partial(hit.age, hit.skip, t + after, &Idle { short_rows: 0, ..BOUNDS })
+}
+
+// the run's own next turn: its whole history, then a new message
+fn next_turn() -> Vec<i32> {
+    done(16, 0).history.into_iter().chain(5..70).collect()
+}
+
+// a fork of the conversation halfway through it
+fn fork() -> Vec<i32> {
+    done(16, 0).history[..512].iter().copied().chain(5..70).collect()
+}
+
+#[test]
+fn a_turn_that_continues_the_whole_run_is_no_partial_hit() {
+    assert_eq!(partial(RULES, &next_turn(), 0), None);
+    // with the grid rule the run's own turn skips only to its prefill end, rounded down; still its own turn
+    assert_eq!(partial(Rules { grid: 256, ..RULES }, &next_turn(), 0), None);
+}
+
+#[test]
+fn a_fork_that_leaves_a_live_run_early_is_a_partial_hit_until_the_run_is_idle() {
+    for rules in [RULES, Rules { grid: 256, ..RULES }] {
+        assert_eq!(partial(rules, &fork(), 10), Some(20), "the run takes the finish bound");
+        assert_eq!(partial(rules, &fork(), 31), None);
+    }
+}

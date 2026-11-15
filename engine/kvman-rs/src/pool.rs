@@ -144,6 +144,12 @@ impl Idle {
     }
 }
 
+/// The nanoseconds until retained run `k` goes idle, while its session is live.
+fn live_for(k: &Kept, now_ns: i64, idle: &Idle) -> Option<i64> {
+    let bound = idle.of(k);
+    (bound != 0 && now_ns - k.retired_ns <= bound).then(|| k.retired_ns + bound - now_ns)
+}
+
 /// A retired run: its pages count as free until a reservation evicts it or a hit adopts its start.
 #[derive(Clone)]
 pub struct Kept {
@@ -1044,13 +1050,24 @@ impl Pool {
                 }
             }
         }
-        // each live victim's time left until its session goes idle
-        let left = self.kept.iter().filter(|k| victims.contains(&k.age)).filter_map(|k| {
-            let bound = idle.of(k);
-            (bound != 0 && now_ns - k.retired_ns <= bound).then(|| k.retired_ns + bound - now_ns)
-        });
+        let left = self.kept.iter().filter(|k| victims.contains(&k.age)).filter_map(|k| live_for(k, now_ns, idle));
         let (live_victims, idle_in_ns) = left.fold((0u32, 0i64), |(n, most), ns| (n + 1, most.max(ns)));
         BusyView { victims, live_victims, idle_in_ns }
+    }
+
+    /// The busy guard's view of a hit that adopts retained run `age` and skips `skip` rows. The adoption drops what
+    /// the run holds past the hit, so a hit that reuses less of the run than the run's own next turn would (a fork
+    /// that leaves the conversation early, or another conversation that shares only its start) evicts part of it.
+    /// Returns the nanoseconds until such a run goes idle while its session is live, else None.
+    pub fn busy_partial(&self, age: u64, skip: i32, now_ns: i64, idle: &Idle) -> Option<i64> {
+        let k = self.kept.iter().find(|k| k.age == age)?;
+        // the run's own next turn: a prompt holding its whole history and more (-1 is no token id)
+        let next: Vec<i32> = k.st.history.iter().copied().chain([-1]).collect();
+        let own = reuse::begin(&self.rules, &k.st, &next, i32::MAX, true).skip;
+        if skip >= own {
+            return None;
+        }
+        live_for(k, now_ns, idle)
     }
 
     // fill_range(need, lo, hi) as a dry run, with kept[..gone] already evicted: the ages of the runs it evicts
