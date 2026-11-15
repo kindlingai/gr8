@@ -70,6 +70,7 @@ struct BulkDev {
   unsigned long long* aux_out;   // [bulk_flags] GPU -> proxy (read after the doorbell)
   unsigned int* error;
   int rank, nr, nflags;
+  unsigned long long spin_cyc = G6_SPIN_TIMEOUT_CYC;  // wait cap for the bulk flag waits, cp_pf / qo (GR8_SPIN_TIMEOUT_S)
 };
 
 // Plain-old-data view handed to kernels. All pointers are device-accessible pinned host memory.
@@ -92,7 +93,15 @@ struct FabricDev {
   // p == me and glue::peer_slot reads this rank's contribution from its send slot.
   int compact = 0;
   int pool = 0;                // FabricConfig::pool
+  unsigned long long spin_cyc = G6_SPIN_TIMEOUT_CYC;  // wait cap for glue::wait_peers / the RS waits (GR8_SPIN_TIMEOUT_S)
 };
+
+// GR8_SPIN_TIMEOUT_S (seconds, knobs/runtime.yaml) -> SM cycles at the ~2 GHz GB10 estimate the compile-time
+// G6_SPIN_TIMEOUT_CYC documents; unset (or <= 0) keeps the compile value, so a -D override (tests) is untouched.
+inline unsigned long long spin_timeout_cyc(long long knob_s, unsigned long long compile_cyc)
+{
+    return knob_s > 0 ? (unsigned long long)knob_s * 2000000000ull : compile_cyc;
+}
 
 // A set of collectives (Fabric::Rs mask / skip / p2p / flat): bit c for c in [0, 128). It converts from a 32-bit
 // `unsigned`, so callers that pass 0x5 compile unchanged. DS41's 40 layers need more than 32 collectives.

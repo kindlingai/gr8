@@ -13,7 +13,7 @@
 
 namespace g6s2 {
 // wall clock in ms since the Unix epoch: the ranks' logs carry no timestamps, and the skew between ranks at a bind or a
-// prefill start is what a silent GPU wait timeout (G6_SPIN_TIMEOUT_CYC) turns into an error word
+// prefill start is what a silent GPU wait timeout (G6_SPIN_TIMEOUT_CYC, GR8_SPIN_TIMEOUT_S at runtime) turns into an error word
 inline long long s2_wall_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }

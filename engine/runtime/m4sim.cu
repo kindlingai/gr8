@@ -710,7 +710,12 @@ int main(int argc, char** argv)
         qs_loop_attach(R[r], qsl, stepp);
 #if defined(G6_CP) && G6_CP
         if (cp_on)
-            for (int c = 0; c < cp_colls.ncoll(); ++c) R[r].cp.vs.push_back(cp_L.vslot(c, r, cp_send[r], cp_recv[r], cp_bell[r], err));
+            for (int c = 0; c < cp_colls.ncoll(); ++c)
+            {
+                g6::VSlotDev v = cp_L.vslot(c, r, cp_send[r], cp_recv[r], cp_bell[r], err);
+                v.spin_cyc = g6::spin_timeout_cyc(knob::spin_timeout_s().value_or(0), G6_SPIN_TIMEOUT_CYC);   // GR8_SPIN_TIMEOUT_S honored in the simulator too
+                R[r].cp.vs.push_back(v);
+            }
         if (cp_on && MP && !G6_MODEL_FLASH) cp_pf_alloc(R[r], st);     // step 4: prefill staging pools (Flash: none, it prefills below R)
 #endif
         R[r].graph = graph; R[r].in = in; R[r].out = out + r;

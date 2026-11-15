@@ -62,7 +62,7 @@ __global__ void __launch_bounds__(32) k_wait_rs1(g6::FabricDev f, const u64* ste
     const long long t0 = clock64();
     unsigned it = 0;
     while (glue::ld_acquire_sys(tail) != seq)
-        if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(f.error) != 0 || clock64() - t0 > G6_SPIN_TIMEOUT_CYC))
+        if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(f.error) != 0 || clock64() - t0 > f.spin_cyc))
         {
             atomicCAS(f.error, 0u, glue::ERR_AR | ((unsigned)c << 8) | (unsigned)p);
             break;

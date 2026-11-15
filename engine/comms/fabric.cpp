@@ -737,6 +737,10 @@ void Fabric::init(const FabricConfig& cfg) {
     FCHECK(ibv_modify_qp(q, &as, IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC) == 0);
     check_qp_mtu(q, R, pi, at.path_mtu, cfg.port);
   }
+  // GR8_SPIN_TIMEOUT_S (knobs/runtime.yaml) -> SM cycles (g6::spin_timeout_cyc, fabric.h): one set here covers the
+  // fabric's own waits (dev_.spin_cyc) and the bulk flag waits (bd.spin_cyc); unset keeps the compile default.
+  dev_.spin_cyc = spin_timeout_cyc(knob::spin_timeout_s().value_or(0), G6_SPIN_TIMEOUT_CYC);
+  if (I.bulk) I.bd.spin_cyc = dev_.spin_cyc;
   barrier();
 }
 
@@ -753,7 +757,9 @@ const VLayout& Fabric::vlayout() const { FCHECK(impl_ && impl_->var); return imp
 VSlotDev Fabric::vslot(int c) const {
   const VLayout& L = vlayout();
   FCHECK(c >= 0 && c < L.ncoll);
-  return L.vslot(c, cfg_.rank, dev_.send, dev_.recv, dev_.doorbell, dev_.error);
+  VSlotDev v = L.vslot(c, cfg_.rank, dev_.send, dev_.recv, dev_.doorbell, dev_.error);
+  v.spin_cyc = dev_.spin_cyc;          // the boot's GR8_SPIN_TIMEOUT_S rides with every CP wait
+  return v;
 }
 
 void Fabric::enqueue_step(unsigned long long step, const std::vector<uint32_t>& sizes, const Rs& rs) {
