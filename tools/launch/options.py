@@ -645,6 +645,18 @@ def validate(o):
             raise OptionError('--flash-cache terminal: persist=on keeps cold-exact (aligned) checkpoints only')
     elif stores and o.get('REUSE') == '0':
         raise OptionError('--kv-store keeps the runs prefix reuse retains: it needs REUSE (on by default)')
+    grid = o.get('REUSE_GRID')
+    if grid is not None:
+        # a positive multiple of a KV page; the engine (g6m4.cu) also refuses one larger than --prefill at start
+        if not (str(grid).isdigit() and (grid == '0' or (int(grid) % 64 == 0 and 64 <= int(grid) <= 65536))):
+            raise OptionError(f'--reuse-grid {grid}: want 0, or a multiple of 64 from 64 to 65536 (at most --prefill)')
+        if grid != '0':
+            if model.engine_profile != 'glm':
+                raise OptionError(f'--reuse-grid: the GLM-5.3 prefix-reuse grid; ./gr8 {model.name} has none')
+            if o.get('REUSE') == '0':
+                raise OptionError('--reuse-grid needs REUSE (on by default)')
+            if '0' in (extra_env_value(o, 'GR8_REUSE_ALIGN'), extra_env_value(o, 'G6_REUSE_ALIGN')):
+                raise OptionError('--reuse-grid conflicts with GR8_REUSE_ALIGN=0')
     if stores:
         if any(t['host'] == 'auto' for t in stores) and mode(o) == 'peers':
             raise OptionError('--kv-store remote:auto finds a KV node through mentat: with --peers, name it (remote:HOST:PORT)')

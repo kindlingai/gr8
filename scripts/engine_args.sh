@@ -363,6 +363,12 @@ engine_defaults() {
          local _fold_eff=${KV4_FOLD:-0}
          case " ${EXTRA_ENV:-} " in *" GR8_KV4_FOLD=1 "*) _fold_eff=1 ;; *" GR8_KV4_FOLD=0 "*) _fold_eff=0 ;; esac
          if [ "$_fold_eff" = 1 ]; then tp4_default KV4_TC 1; fi
+         # the prefix-reuse grid: 64-row page hits instead of 4,096-row cold cells (docs/SETTINGS.md), without KV_STORE
+         # (not gated with a store: REUSE_GRID=64 opts in). REUSE_GRID=0 rolls it back; GR8_REUSE_GRID in EXTRA_ENV keeps
+         # its own value, and GR8_REUSE_ALIGN=0 there takes no grid
+         if [ "$REUSE" = 1 ] && { [ -z "${KV_STORE:-}" ] || [ "$KV_STORE" = off ]; }; then
+           case " ${EXTRA_ENV:-} " in *" GR8_REUSE_ALIGN=0 "*|*" G6_REUSE_ALIGN=0 "*) ;; *) tp4_default REUSE_GRID 64 ;; esac
+         fi
        fi ;;
     6) SHARE_LIMIT=${SHARE_LIMIT:-131072}
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then   # 614,400 is 3,307 fp8 pages a rank at 131072 and 2,026 at 32768
@@ -533,6 +539,8 @@ GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   ENGINE_ENV="$ENGINE_ENV${S2_ADMIT_HOLD:+ GR8_S2_ADMIT_HOLD=$S2_ADMIT_HOLD}"
   ENGINE_ENV="$ENGINE_ENV${S2_SHARED_WATERFILL:+ GR8_S2_SHARED_WATERFILL=$S2_SHARED_WATERFILL}${S2_SHARED_WF_MARGIN:+ GR8_S2_SHARED_WF_MARGIN=$S2_SHARED_WF_MARGIN}"
   [ "${PF_SELX_CTX:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV GR8_PF_SELX_CTX=$PF_SELX_CTX"
+  # the prefix-reuse grid (REUSE_GRID; docs/SETTINGS.md): with REUSE only; 0 leaves the engine's --prefill grid
+  [ "${REUSE_GRID:-0}" = 0 ] || [ "${REUSE:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV GR8_REUSE_GRID=$REUSE_GRID"
   # KV_ROWS (remote attention rows): STORE,size=N(M|G|T)[,local=P][,pool=S][,place=P][,fmt=F] -> the engine's GR8_RT_*
   # (docs/SETTINGS.md). size is each rank's lease in bytes; options.py has checked the form
   if [ -n "${KV_ROWS:-}" ] && [ "$KV_ROWS" != off ]; then
