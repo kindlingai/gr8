@@ -52,6 +52,10 @@ Bugs we are still working out, by model. The PR that fixes one removes its entry
   [docs/REUSE-GPU-TEST.md](docs/REUSE-GPU-TEST.md) as the intended behaviour, not a measured one.
 - **Not narrowed down:** whether the difference comes from the retained rows [0, 4096) or from the re-prefilled suffix
   [4096, 5408) (for example the drafter state, or a suffix chunk shape that differs from the cold one).
+- **Default grid:** GLM-5.3 at TP=4 with `KV_FORMAT=int4` and no `--kv-store` now defaults to `REUSE_GRID=64`
+  (`GR8_REUSE_GRID=64`): a hit keeps 64-row pages, not cold-shaped 4,096-row cells, so a warm reply at temperature 0
+  will usually differ in text from a cold one; the measured warm-vs-cold KL bounds and the `--kv-store` caveat are in
+  [docs/SETTINGS.md](docs/SETTINGS.md) (`GR8_REUSE_GRID`). Roll back with `--reuse-grid 0` / `REUSE_GRID=0`.
 - Tracking: [#412](https://github.com/kindlingai/gr8/issues/412).
 
 ## GLM-5.3-Flash

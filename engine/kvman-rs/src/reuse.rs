@@ -94,3 +94,42 @@ pub fn begin(rules: &Rules, st: &Finished, prompt: &[i32], limit: i32, mtp: bool
     }
     Begin { skip: skip as i32, lcp: lcp as i32, why }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grid64_vectors() {
+        // Shared vector table: keep fields and rows identical to tests/test_prefix_reuse.cpp.
+        // grid, strict, noend, mtp, pf_end, valid, written_end, hist_len, prompt_len, lcp, limit,
+        // want_skip, want_why
+        let cases = [
+            (64, false, false, false, 15086, 15150, 15151, 15151, 19668, 15151, 19667, 15040, Why::Hit),
+            (64, false, false, true, 15086, 15150, 15151, 15151, 19668, 15151, 19667, 15040, Why::Hit),
+            (64, false, false, false, 999, 1030, 1031, 1031, 2192, 191, 2191, 128, Why::Hit),
+            (64, false, false, false, 999, 1030, 1031, 1031, 2192, 192, 2191, 192, Why::Hit),
+            (64, false, false, false, 999, 1030, 1031, 1031, 2192, 193, 2191, 192, Why::Hit),
+            (64, false, false, false, 999, 1030, 1031, 1031, 2192, 194, 2191, 192, Why::Hit),
+            (64, false, false, true, 999, 1030, 1031, 1031, 2192, 191, 2191, 128, Why::Hit),
+            (64, false, false, true, 999, 1030, 1031, 1031, 2192, 192, 2191, 128, Why::Hit),
+            (64, false, false, true, 999, 1030, 1031, 1031, 2192, 193, 2191, 192, Why::Hit),
+            (64, false, false, true, 999, 1030, 1031, 1031, 2192, 194, 2191, 192, Why::Hit),
+            (64, false, false, false, 999, 1030, 1031, 1031, 2000, 63, 1999, 0, Why::Grid),
+            (64, false, false, true, 999, 1030, 1031, 1031, 2000, 64, 1999, 0, Why::Grid),
+            (64, false, false, false, 999, 1030, 1031, 1031, 2000, 64, 1999, 64, Why::Hit),
+            (64, false, false, true, 999, 1030, 1031, 1031, 2000, 65, 1999, 64, Why::Hit),
+            (64, false, true, false, 8099, 8162, 8163, 8163, 8100, 8100, 8099, 8099, Why::Hit),
+            (64, false, true, true, 8099, 8162, 8163, 8163, 8100, 8100, 8099, 8099, Why::Hit),
+            (64, false, true, false, 8099, 8162, 8163, 8163, 8090, 8090, 8089, 8064, Why::Hit),
+            (64, false, true, true, 8099, 8162, 8163, 8163, 8090, 8090, 8089, 8064, Why::Hit),
+        ];
+        for (grid, strict, noend, mtp, pf_end, valid, written_end, hist_len, prompt_len, lcp, limit, want_skip, want_why) in cases {
+            let rules = Rules { grid, strict, noend };
+            let st = Finished { history: vec![1; hist_len], valid, written_end, pf_end };
+            let mut prompt = vec![2; prompt_len];
+            prompt[..lcp].fill(1);
+            assert_eq!(begin(&rules, &st, &prompt, limit, mtp), Begin { skip: want_skip, lcp: lcp as i32, why: want_why });
+        }
+    }
+}

@@ -13,7 +13,8 @@ Run `g6m4` on the six ranks with the TP6 engine line but without `--serve` (the 
 in order, and exits), with these additions:
 
 - the flag `--reuse-prefix`
-- the env `GR8_REUSE_ALIGN=1`
+- the env `GR8_REUSE_ALIGN=1` (and no `GR8_REUSE_GRID`: `scripts/engine_args.sh` sets `GR8_REUSE_GRID=64` on GLM-5.3
+  TP=4 with `KV_FORMAT=int4`, which this test does not use)
 - `--gen 32 --temp 0` and four `--prompt @<file>` arguments, the prompts below in order
 
 and keep `--prefill 4096 --pf-lanes 2 --mtp K --graph`. `--cap` must hold `20001 + 32 + 2K`. Rank 0 must print at start

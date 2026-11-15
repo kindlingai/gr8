@@ -116,6 +116,12 @@ read back as decode selects them ([Remote KV](#remote-kv)).
 - `--cap` is the KV pool in tokens, and so the longest context. Lower it first when a box runs short of memory.
 - `--sess` is how many requests decode at once (1-8). Each one adds step graphs: about 2.5 GiB at 8.
 - `--reuse 0` turns prefix reuse off.
+- `--reuse-grid` is the prefix-reuse grid in rows. At TP=4 with `KV_FORMAT=int4` and no `--kv-store` it is `64`: a continued conversation
+  re-prefills only the rows past the last whole 64-row page it already prefilled, instead of the last 4,096-row cell
+  (3-seed RealMark `--lanes 1 2`: median warm TTFT 3.04-3.24 s -> 1.54-1.57 s at C=1). A warm reply at temperature 0
+  will usually differ in text from a cold one (#412, [KNOWN-ISSUES.md](../KNOWN-ISSUES.md)). `--reuse-grid 0` /
+  `REUSE_GRID=0` rolls it back. With `--kv-store` the launcher keeps the 4,096-row `--prefill` grid; `--reuse-grid 64`
+  opts in and is not gated ([SETTINGS.md](SETTINGS.md), `GR8_REUSE_GRID`).
 - `--kv-store` and `--kv-rows` (experimental, off by default) put KV below the pool, on an SSD or a KV node: see
   [Remote KV](#remote-kv) below.
 - `KV_FORMAT=int4` is the TP=4 default: 4-bit KV latent, `CAP=513536` (`max_model_len` 513,522, +5.8% over `fp8`'s

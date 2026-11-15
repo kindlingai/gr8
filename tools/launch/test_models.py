@@ -168,6 +168,46 @@ class Kv4OptionsTests(unittest.TestCase):
             flash('--kv-format', 'int4', '--kv4-fold', '1')
 
 
+class ReuseGridOptionsTests(unittest.TestCase):
+    """REUSE_GRID: 64 at TP=4 with int4 KV (GR8_REUSE_GRID), unchanged elsewhere."""
+
+    @staticmethod
+    def grid(*argv, tp=4):
+        return [w for w in Kv4ExactOptionsTests.plan(*argv, tp=tp)['env'] if w.startswith('GR8_REUSE_GRID=')]
+
+    def test_default_and_rollback(self):
+        for args in ((), ('--kv-format', 'int4')):
+            self.assertEqual(self.grid(*args), ['GR8_REUSE_GRID=64'])
+            self.assertEqual(Kv4ExactOptionsTests.plan(*args)['knobs']['REUSE_GRID'], '64')
+        self.assertEqual(self.grid('--reuse-grid', '0'), [])
+        self.assertEqual(self.grid('--reuse-grid', '4096'), ['GR8_REUSE_GRID=4096'])
+        self.assertEqual(self.grid('--reuse', '0'), [])
+
+    def test_extra_env(self):
+        self.assertEqual(self.grid('--extra-env', 'GR8_REUSE_GRID=256'), ['GR8_REUSE_GRID=256'])
+        for align in ('GR8_REUSE_ALIGN=0', 'G6_REUSE_ALIGN=0'):
+            self.assertEqual(self.grid('--extra-env', align), [])
+
+    def test_kv_store_keeps_the_prefill_grid(self):
+        store = ('--kv-store', 'ssd:/x,size=1G')
+        self.assertEqual(self.grid(*store), [])
+        self.assertEqual(self.grid(*store, '--kv-keep', 'sessions'), [])
+        self.assertEqual(self.grid(*store, '--reuse-grid', '64'), ['GR8_REUSE_GRID=64'])   # opts in, not gated
+        self.assertEqual(self.grid('--kv-store', 'off'), ['GR8_REUSE_GRID=64'])
+
+    def test_other_shapes_unchanged(self):
+        for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'int4')), (5, ()), (4, ('--kv-format', 'fp8'))):
+            self.assertEqual(self.grid(*args, tp=tp), [])
+
+    def test_refusals(self):
+        for args in (('--reuse-grid', '32'), ('--reuse-grid', '100'), ('--reuse', '0', '--reuse-grid', '64'),
+                     ('--extra-env', 'GR8_REUSE_ALIGN=0', '--reuse-grid', '64')):
+            with self.assertRaises(opt.OptionError):
+                self.grid(*args)
+        with self.assertRaises(opt.OptionError):
+            flash('--reuse-grid', '64')
+
+
 class OptionTests(unittest.TestCase):
     def test_defaults(self):
         o = flash()

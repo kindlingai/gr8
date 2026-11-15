@@ -483,7 +483,9 @@ class CanonicalTests(unittest.TestCase):
         self.assertIn('--kv-format int4', text)
         self.assertIn('--s2-sessions 8 ', text)
         self.assertIn(' --reuse-prefix', text)            # prefix reuse is on by default at TP=4
-        self.assertEqual(da, self.digest('--cap', '513536', '--share-limit', '32768', '--sess', '8', '--dflash', '1')[2])
+        self.assertIn(' GR8_REUSE_GRID=64 ', text)        # the 64-row prefix-reuse grid at TP=4 with int4 KV
+        self.assertEqual(da, self.digest('--cap', '513536', '--share-limit', '32768', '--sess', '8', '--dflash', '1',
+                                         '--reuse-grid', '64')[2])
 
     def test_l2pf_reaches_every_rank(self):
         _, text, _ = self.digest()
@@ -672,6 +674,51 @@ class CanonicalTests(unittest.TestCase):
         self.assertEqual([a for a in e if a.startswith(('GR8_ROUTE_OVL=', 'GR8_DEC_BK='))], ['GR8_ROUTE_OVL=0', 'GR8_DEC_BK=2048'])
         e = env('10.0.0.1,10.0.0.2,10.0.0.3')   # TP=3 unchanged
         self.assertFalse(any(a.split('=')[0] in [v.split('=')[0] for v in on] for a in e))
+
+    def test_tp4_int4_reuse_grid_default_and_rollback(self):
+        def grid(peers, *argv, environ=None):
+            o = opt.parse(['--no-config', '--peers', peers, *argv], {**GLM, **(environ or {})})
+            opt.validate(o)
+            return [a for a in opt.engine_plan(o, rank=0, rank_dir='/r', aux_dir='/a', home='/h')['env']
+                    if a.startswith('GR8_REUSE_GRID=')]
+        self.assertEqual(grid(PEERS), ['GR8_REUSE_GRID=64'])                  # TP=4, KV_FORMAT=int4 (the default)
+        self.assertEqual(grid(PEERS, '--reuse-grid', '0'), [])                # the rollback: the --prefill grid
+        self.assertEqual(grid(PEERS, environ={'REUSE_GRID': '0'}), [])
+        self.assertEqual(grid(PEERS, '--reuse-grid', '128'), ['GR8_REUSE_GRID=128'])
+        self.assertEqual(grid(PEERS, '--reuse', '0'), [])
+        self.assertEqual(grid(PEERS, '--extra-env', 'GR8_REUSE_ALIGN=0'), [])
+        self.assertEqual(grid(PEERS, '--extra-env', 'G6_REUSE_ALIGN=0'), [])
+        self.assertEqual(grid(PEERS, '--extra-env', 'GR8_REUSE_GRID=256'), ['GR8_REUSE_GRID=256'])   # no second copy
+        # an explicit option and EXTRA_ENV both: as with DEC_BK and PF_SELX_CTX, both words, the option's last (it wins)
+        self.assertEqual(grid(PEERS, '--reuse-grid', '64', '--extra-env', 'GR8_REUSE_GRID=128'),
+                         ['GR8_REUSE_GRID=128', 'GR8_REUSE_GRID=64'])
+        self.assertEqual(grid(PEERS, '--kv-format', 'fp8'), [])               # not measured: unchanged
+        # a KV store: not gated with grid 64, so the launcher keeps the --prefill grid; an explicit grid still opts in
+        store = ('--kv-store', 'ssd:/x,size=1G')
+        self.assertEqual(grid(PEERS, *store), [])
+        self.assertEqual(grid(PEERS, environ={'KV_STORE': 'ssd:/x,size=1G'}), [])
+        with tempfile.TemporaryDirectory() as d:
+            cfg = os.path.join(d, 'cluster.env')
+            with open(cfg, 'w') as f:
+                f.write('KV_STORE=ssd:/x,size=1G\n')
+            o = opt.parse(['@' + cfg, '--peers', PEERS], GLM)
+            opt.validate(o)
+            self.assertFalse([a for a in opt.engine_plan(o)['env'] if a.startswith('GR8_REUSE_GRID=')])
+        self.assertEqual(grid(PEERS, *store, '--reuse-grid', '64'), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(grid(PEERS, *store, environ={'REUSE_GRID': '64'}), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(grid(PEERS, *store, '--extra-env', 'GR8_REUSE_GRID=64'), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(grid(PEERS, '--kv-store', 'off'), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(grid(PEERS, environ={'KV_STORE': 'off'}), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(grid('10.0.0.1,10.0.0.2,10.0.0.3'), [])
+        self.assertEqual(grid(','.join(f'10.0.0.{i}' for i in range(1, 6))), [])
+        self.assertEqual(grid(','.join(f'10.0.0.{i}' for i in range(1, 7)), '--kv-format', 'int4'), [])
+        for bad in (('--reuse-grid', '32'), ('--reuse-grid', '100'), ('--reuse-grid', '65600'), ('--reuse-grid', 'x'),
+                    ('--reuse', '0', '--reuse-grid', '64'), ('--extra-env', 'GR8_REUSE_ALIGN=0', '--reuse-grid', '64'),
+                    ('--extra-env', 'G6_REUSE_ALIGN=0', '--reuse-grid', '64')):
+            with self.assertRaises(opt.OptionError):
+                grid(PEERS, *bad)
+        with self.assertRaises(opt.OptionError):
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--reuse-grid', '64'], {'GR8_MODEL': 'glm53f'}))
     def test_tp5_prefills_with_pf_own_3(self):
         def env(*argv):
             o = opt.parse(['--no-config', '--peers', ','.join(f'10.0.0.{i}' for i in range(1, 6)), *argv], GLM)

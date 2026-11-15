@@ -123,6 +123,28 @@ int main()
     CHECK(pool.kept_runs() == 3);                             // B, D and A
     Run x = pool.reserve(40000); CHECK(x.first_page == 0 && pool.exclusive_run(x) && pool.kept_runs() == 0);
 
+    // Grid 64: retain and adopt exactly the first 218 complete prefilled pages.
+    {
+        g6rt::PrefixReuse rules; rules.grid = 64;
+        RunPool pool(pages, place, below), mirror(pages, place, below);
+        pool.keep(rules); mirror.keep(rules);
+        const Run a = pool.reserve(rowsA);
+        CHECK(mirror.reserve(rowsA) == a);
+        const auto kept = pool.list(a);
+        const auto st = finished(A, Agen);
+        CHECK(st.pf_end == 14000);
+        pool.retain(a, st); mirror.retain(a, st);
+        const PoolHit h = pool.match(B, rowsB, 20000), hm = mirror.match(B, rowsB, 20000);
+        CHECK(h.skip == 13952 && h.skip / 64 == 218);
+        CHECK(hm.skip == h.skip && hm.age == h.age);
+        const Run b = pool.take(h, rowsB);
+        CHECK(mirror.take(hm, rowsB) == b);
+        const auto adopted = pool.list(b);
+        CHECK(adopted.size() >= 218 && kept.size() >= 218);
+        CHECK(std::equal(kept.begin(), kept.begin() + 218, adopted.begin()));
+        CHECK(pool.list(b) == mirror.list(b) && pool.digest() == mirror.digest());
+    }
+
     std::printf("pool_reuse_test: %s\n", fails ? "FAIL" : "PASS");
     return fails ? 1 : 0;
 }
