@@ -1,9 +1,12 @@
 # Knobs
 
-## DeepSeek prefill diagnostics
+## DeepSeek prefill diagnostics and attention transport
 
 `GR8_DS_MOE_ELOG` defaults to `0`: no expert-count record, host readback or diagnostic stream fence.
-Set `GR8_DS_MOE_ELOG=1` to enable these diagnostics explicitly.
+Set `GR8_DS_MOE_ELOG=1` to enable these diagnostics explicitly. Sequence-parallel prefill now transports
+projected attention inputs losslessly as BF16/FP32; fabric slot capacity is unchanged, but wire payload grows.
+V2 keeps tensor-core index wq_b when `GR8_DS_ATTN_TC=1`; with it off, `GR8_DS41_IDX_WQB_TC` selects a
+full-chunk row threshold (0 keeps the scalar index GEMM). Other tensor-core release defaults are unchanged.
 
 DS41 keeps a prompt-end fallback on every turn when prefix reuse and GR8_DS_CACHE_REPLACE=1 are enabled,
 so a re-tokenized reply or dropped reasoning can reuse that prefix. The next restore or parked resume frees

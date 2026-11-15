@@ -167,12 +167,6 @@ extern "C" {
 void ds41_v2_input_project(const ds41a::Weights* w, ds41a::v2::InputBuf* b, const void* y, int n, int pair, void* st) {
     if (n) ds41a::v2::attn_proj_own(*w, *b, (const ds41a::bf16*)y, nullptr, nullptr, 0, n, pair != 0, (cudaStream_t)st);
 }
-void ds41_v2_input_pack(const ds41a::v2::InputBuf* b, uint8_t* wire, int n, int q, int mode, void* st) {
-    ds41a::v2::pack_input(*b, wire, n, q, mode, (cudaStream_t)st);
-}
-void ds41_v2_input_unpack(const uint8_t* wire, const ds41a::v2::InputBuf* b, int n, int mode, void* st) {
-    ds41a::v2::unpack_input(wire, *b, n, mode, (cudaStream_t)st);
-}
 void ds41_v2_project_rest(const ds41a::Weights* w, ds41a::Cache* c, const ds41a::Scratch* s,
                          const ds41a::v2::InputBuf* b, int n, int heads, void* st, const int* pos) {
     ds41a::v2::attn_proj_rest(*w, *c, *s, *b, n, heads, (cudaStream_t)st, pos);

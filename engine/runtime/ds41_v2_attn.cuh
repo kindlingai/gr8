@@ -6,8 +6,7 @@
 #if G6_MODEL_DS41
 struct Ds41V2Attention {
     int rows = 0, q = 0, heads = 0;
-    ds41a::v2::InputBuf in{};
-    uint8_t *input_send = nullptr, *input_all = nullptr;
+    ds41a::v2::InputBuf own{}, in{};
     uint8_t *output_send = nullptr, *output_recv = nullptr;
     __nv_bfloat16* parts = nullptr;
     int32_t *topk = nullptr, *candidates = nullptr;
@@ -31,9 +30,10 @@ inline void ds41_v2_attn_boot(::ds41::v2::State& v, Model& m, int max_rows)
     x->rows = max_rows;
     x->q = (max_rows + g6nr::NR - 1) / g6nr::NR;
     x->wob.resize(m.nl);
-    x->in.carve(x->alloc<char>(ds41a::v2::InputBuf::bytes(max_rows, x->q)), max_rows, x->q);
-    x->input_send = x->alloc<uint8_t>(size_t(x->q) * ds41a::v2::input_stride(2));
-    x->input_all = x->alloc<uint8_t>(size_t(max_rows) * ds41a::v2::input_stride(2));
+    // Own projections and gathered destinations must not alias: the fabric
+    // publishes all own rows before unpacking the full chunk in global order.
+    x->own.carve(x->alloc<char>(ds41a::v2::InputBuf::bytes(x->q, x->q)), x->q, x->q);
+    x->in.carve(x->alloc<char>(ds41a::v2::InputBuf::bytes(max_rows, 0)), max_rows, 0);
     x->parts = x->alloc<__nv_bfloat16>(size_t(g6nr::NR) * x->q * ds41a::HID);
     x->topk = x->alloc<int32_t>(size_t(x->q) * geom::IDX_TOPK);
     x->candidates = x->alloc<int32_t>(size_t(x->q) * geom::CAND_TOPK_BLOCKS);
@@ -135,8 +135,11 @@ inline void ds41_v2_attn_index(::ds41::v2::State& v, Ds41V2Attention& x, Model& 
         ds41_idx_klen(m.pos + r0, geom::compress_ratio(l), s->klen, n, v.st);
         const auto* q = a->S.qrq + size_t(r0) * ds41a::QA;
         const auto* qs = a->S.qrs + size_t(r0) * ds41a::QA / 32;
-        int rc = ds41_idx_gemm_mx_tc(q, ds41a::QA, qs, ds41a::QA / 32, w.wqb_codes, w.wqb_scales,
-                                    geom::IDX_WQB_OUT, ds41a::QA, s->q_b, geom::IDX_WQB_OUT, n, v.st);
+        int rc = -2;
+        // The threshold belongs to the full chunk, not its smaller owner slice.
+        if (knob::ds_attn_tc() || (s->wqb_tc > 0 && v.g.M >= s->wqb_tc))
+            rc = ds41_idx_gemm_mx_tc(q, ds41a::QA, qs, ds41a::QA / 32, w.wqb_codes, w.wqb_scales,
+                                   geom::IDX_WQB_OUT, ds41a::QA, s->q_b, geom::IDX_WQB_OUT, n, v.st);
         if (rc) ds41_idx_gemm_mx(q, ds41a::QA, qs, ds41a::QA / 32, w.wqb_codes, w.wqb_scales,
                                 geom::IDX_WQB_OUT, ds41a::QA, s->q_b, geom::IDX_WQB_OUT, n, v.st);
         if (v.bf16_tc.idx(n) &&
@@ -181,25 +184,30 @@ inline void ds41_v2_attention(::ds41::v2::State& v, Model& m, int i, const __nv_
     const int mode = geom::has_compressor_gate(l) ? 2 : l == geom::CAND_SOURCE ? 1 : 0;
     const bool comp_tc = (mode == 2) && !a->W.c_wkv8.w && v.bf16_tc.comp(n) &&
                          ::ds41v2tc::can_launch_f32_pair(own_y, ds41a::HID, a->W.c_wkv, a->W.c_wgate,
-                                                         ds41a::HD, ds41a::HID, x->in.ckv, x->in.csc, ds41a::HD, n);
-    ds41_v2_input_project(&a->W, &x->in, own_y, n, mode == 2 && !comp_tc, v.st);
+                                                         ds41a::HD, ds41a::HID, x->own.ckv, x->own.csc, ds41a::HD, n);
+    ds41_v2_input_project(&a->W, &x->own, own_y, n, mode == 2 && !comp_tc, v.st);
     if (comp_tc) {
         G6RT_CK(::ds41v2tc::launch_gemm2_f32(own_y, ds41a::HID, a->W.c_wkv, a->W.c_wgate,
-                                             ds41a::HD, ds41a::HID, x->in.ckv, x->in.csc, ds41a::HD, n, v.st));
+                                             ds41a::HD, ds41a::HID, x->own.ckv, x->own.csc, ds41a::HD, n, v.st));
     }
     if (mode == 1 && n) {
         const auto* s = ds41_idx_detail::find(m, false);
         if (!s) die("DS41 v2 attention: layer20 index binding missing");
         if (v.bf16_tc.idx(n) &&
-            ::ds41v2tc::can_launch_bf16(own_y, ds41a::HID, s->lay[i].cmp_wkv, ds41a::HD, ds41a::HID, x->in.ckv1, ds41a::HD, n))
-            G6RT_CK(::ds41v2tc::launch_gemm_bf16(own_y, ds41a::HID, s->lay[i].cmp_wkv, ds41a::HD, ds41a::HID, x->in.ckv1, ds41a::HD, n, v.st));
+            ::ds41v2tc::can_launch_bf16(own_y, ds41a::HID, s->lay[i].cmp_wkv, ds41a::HD, ds41a::HID, x->own.ckv1, ds41a::HD, n))
+            G6RT_CK(::ds41v2tc::launch_gemm_bf16(own_y, ds41a::HID, s->lay[i].cmp_wkv, ds41a::HD, ds41a::HID, x->own.ckv1, ds41a::HD, n, v.st));
         else
-            ds41_idx_gemv(own_y, ds41a::HID, s->lay[i].cmp_wkv, ds41a::HD, ds41a::HID, x->in.ckv1, ds41a::HD, n, v.st);
+            ds41_idx_gemv(own_y, ds41a::HID, s->lay[i].cmp_wkv, ds41a::HD, ds41a::HID, x->own.ckv1, ds41a::HD, n, v.st);
     }
-    ds41_v2_input_pack(&x->in, x->input_send, n, v.g.Q, mode, v.st);
-    ::ds41::v2::Segment in{x->input_send, x->input_all, size_t(ds41a::v2::input_stride(mode))};
-    ::ds41::v2::all_gather(v, Coll::AttnIn, &in, 1, v.st);
-    ds41_v2_input_unpack(x->input_all, &x->in, v.g.M, mode, v.st);
+    ::ds41::v2::Segment in[] = {
+        {x->own.qa, x->in.qa, size_t(ds41a::QA) * sizeof(__nv_bfloat16)},
+        {x->own.kv0, x->in.kv0, size_t(ds41a::HD) * sizeof(__nv_bfloat16)},
+        {mode == 1 ? static_cast<void*>(x->own.ckv1) : static_cast<void*>(x->own.ckv),
+         mode == 1 ? static_cast<void*>(x->in.ckv1) : static_cast<void*>(x->in.ckv),
+         size_t(ds41a::HD) * (mode == 1 ? sizeof(__nv_bfloat16) : sizeof(float))},
+        {x->own.csc, x->in.csc, size_t(ds41a::HD) * sizeof(float)}
+    };
+    ::ds41::v2::all_gather(v, Coll::AttnIn, in, mode == 0 ? 2 : mode == 1 ? 3 : 4, v.st);
     ds41_v2_attn_project_rest(v, *x, m, i);
     ds41_v2_attn_index(v, *x, m, i, own_y);
     if (ds41_attn_op_core(&m, i, v.g.M, v.st)) die("DS41 v2 attention: core failed");
@@ -250,8 +258,7 @@ inline void ds41_v2_attn_l20_ca_row(::ds41::v2::State& v, Model& m, int i, const
     if(!s || kix<0 || v.g.M>s->rcap || !s->ica[kix] || !s->ca[kix] || !s->lay[i].bound || !s->lay[i].cmp_wkv)
         die("DS41 v2 l20_ca_row: missing layer20 cache binding");
     s->cand_ready=false;
-    static_assert(ds41a::v2::input_stride(2)>=int(ds41a::HD*sizeof(__nv_bfloat16)),"input_send holds BF16 ckv1");
-    auto* ckv1_own=reinterpret_cast<__nv_bfloat16*>(x->input_send);
+    auto* ckv1_own=x->own.ckv1;
     if(v.g.owned) {
         if(v.bf16_tc.idx(v.g.owned) &&
            ::ds41v2tc::can_launch_bf16(own_y,ds41a::HID,s->lay[i].cmp_wkv,ds41a::HD,ds41a::HID,ckv1_own,ds41a::HD,v.g.owned))

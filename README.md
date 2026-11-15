@@ -19,7 +19,9 @@ when `SESS >= 2`, `MTP=3`, `S2_SHARED_WATERFILL=1` and `S2_SHARED_WF_MARGIN=0.02
 back to uniform shared rows and `MTP=1`, and `--sess 1` restores the single-session launch; see
 [FLASH.md](docs/FLASH.md). Other model/topology defaults are unchanged.
 
-DeepSeek expert-count diagnostics are off by default; `GR8_DS_MOE_ELOG=1` enables them.
+DeepSeek sequence-parallel prefill preserves projected attention inputs across ranks without additional
+wire quantization. Expert-count diagnostics are off by default; `GR8_DS_MOE_ELOG=1` enables them.
+This does not disable the release's tensor-core paths or imply whole-model bit equality; see [settings](docs/SETTINGS.md).
 
 ### Switch between the models
 

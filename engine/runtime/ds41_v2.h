@@ -119,6 +119,15 @@ inline WireLayout wire_layout(int Q, const Segment* segments, int count) {
     w.stride = aligned(w.payload + 8, 256);  // per-destination RS/A2A slice + tail
     return w;
 }
+// Native projected attention types: qa/kv0 BF16, optional ratio-1 BF16
+// latent or ratio-2 FP32 latent/gate pair. No extra activation quantization.
+inline WireLayout attn_in_wire_layout(int Q, int mode) {
+    if (mode < 0 || mode > 2) return {};
+    const Segment seg[] = {{nullptr,nullptr,1280*2}, {nullptr,nullptr,512*2},
+                          {nullptr,nullptr,size_t(512)*(mode == 1 ? 2 : 4)},
+                          {nullptr,nullptr,512*4}};
+    return wire_layout(Q,seg,mode == 0 ? 2 : mode == 1 ? 3 : 4);
+}
 // Which part of the final tail belongs to each owner, including ragged chunks
 // where the last 128 rows cross rank boundaries. Never assume rank 3 owns it.
 struct TailSlice { int local = 0, count = 0, destination = 0; };
@@ -137,6 +146,7 @@ inline g6::FabricConfig fabric_config(g6::FabricConfig base,int width,int hidden
     base.ncoll=int(Coll::Count); base.compact=true; base.pool=0;
     base.bulk_bytes=0; base.bulk_flags=0; base.vcap.clear(); base.vdst_k.clear();
     base.run1=int(Coll::Engram); base.run2=int(Coll::Ffn0); base.run3=0;
+    // The largest AttnIn payload is 7680*Q; the existing 8192*Q run covers it.
     base.slot_bytes=std::max({size_t(Q)*8192, size_t(128)*tail_row_bytes, size_t(1)<<20});
     const size_t a2a=std::max(size_t(Q)*2112,size_t(Q)*engram_row_bytes);
     base.slot_bytes1=4*aligned(a2a+8,256)-8;

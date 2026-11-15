@@ -3,9 +3,7 @@
 #pragma once
 #include "ds41_attn_types.h"
 namespace ds41a { namespace v2 {
-// mode: 0 = qa/kv; 1 = + ratio-1 compressor latent; 2 = + ratio-2 compressor pair.
-__host__ __device__ constexpr int input_width(int mode) { return QA + HD + mode * HD; }
-__host__ __device__ constexpr int input_stride(int mode) { return (input_width(mode) * 33 / 32 + 63) & ~63; }
+// Projected inputs retain their native BF16/FP32 representations across the gather.
 __host__ __device__ constexpr int output_width(int heads) { return heads / HPG * OLORA; }
 __host__ __device__ constexpr int output_stride(int heads) { return output_width(heads) * 33 / 32; }
 struct InputBuf
