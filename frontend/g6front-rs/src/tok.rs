@@ -1,17 +1,26 @@
 //! The checkpoint's own tokenizer.json (HF `tokenizers`, the library and version the release pins),
 //! plus the per-token display strings logprob entries need, built once into one arena.
 //!
-//! Long prompts are encoded in parallel. The text is cut only where GLM's GPT-style pre-tokenizer regex always ends
-//! a pre-token: (a) after a `\n` that is followed by an ASCII letter, (b) before a space that follows an ASCII
-//! letter. No alternative of the regex can match across either cut (letter runs and contractions never take a
-//! following space or a preceding newline; newline/space runs never take a letter), the one lookahead (`\s+(?!\S)`)
-//! cannot end there, and the scan to the right restarts at the cut either way. So encoding the pieces separately and
-//! concatenating the ids is the same as encoding the whole text. `par_ok` is only set when the tokenizer has the
-//! shape that argument needs (no normalizer, no truncation/padding, no added token that strips whitespace, contains
-//! a newline or space, or starts with a letter) and a start-up self-check on tricky text agrees; otherwise every
-//! encode is sequential.
+//! Long prompts use parallel cuts after newline before an ASCII letter, or before space after an ASCII letter.
+//! For GLM's GPT-style split these are pre-token boundaries. DeepSeek first isolates digits and CJK/Kana: neither
+//! split matches space, newline or ASCII letters, so these cut regions remain in the same gap. In its final split,
+//! punctuation+ASCII letters and the general letter match end before the space. At newline+letter, alternative E
+//! (`\s+(?!\S)`) could see a new end-of-input in the left piece, but D (`\s*[\r\n]+`) precedes E in leftmost-first
+//! alternation and already consumes the whitespace run ending in newline (D-before-E). Punctuation with trailing
+//! newlines also ends there; the optional prefix of a letter match excludes CR/LF. Added tokens cannot cross either
+//! cut: no stripping, single-word matching, space/CR/LF, or leading ASCII letter is allowed. Only these exact shapes
+//! with no normalization, truncation or padding and a successful sequential/parallel startup check enable `par_ok`.
+//!
+//! Prefix reuse needs a stronger boundary: a previous end-of-input is NOT a safe cut for a continuation. Cache cuts
+//! are before isolated AddedToken turn delimiters, never within ordinary text or the self-overlapping DSML marker.
+//! Startup rejects overlapping/containing delimiters and proper-prefix added tokens. A reused checkpoint must include
+//! the WHOLE delimiter in the common byte prefix, so edits, shortened previews and partial delimiters cannot change
+//! tokenization to its left. The suffix includes the delimiter. Exact full hits additionally require equal lengths.
+//! Entries are immutable under one bounded LRU mutex; encoding and Rayon work always happen outside that lock.
 
+use std::collections::VecDeque;
 use std::path::Path;
+use std::sync::Mutex;
 
 use serde_json::Value;
 use tokenizers::Tokenizer;
@@ -19,12 +28,118 @@ use tokenizers::Tokenizer;
 /// The pre-tokenizer split pattern the parallel-encode cut points are proven for.
 const GLM_PRETOKENIZER_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+// These are the serialized Regex strings, including literal CR/LF in the last pattern.
+const DS_DIGITS_REGEX: &str = "\\p{N}{1,3}";
+const DS_CJK_REGEX: &str = "[一-龥぀-ゟ゠-ヿ]+";
+const DS_TEXT_REGEX: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
 /// Prompts at least this long (bytes) are encoded on the blocking pool so they do not stall the reactor.
 const BLOCKING_BYTES: usize = 20000;
 /// Prompts at least this long (bytes) are split and encoded in parallel when `par_ok`.
 const PAR_MIN_BYTES: usize = 32 << 10;
 /// Target piece size for the parallel encode.
 const PAR_PIECE_BYTES: usize = 16 << 10;
+
+const CACHE_MIN_BYTES: usize = 4096;
+const CACHE_MAX_ENTRIES: usize = 32;
+const CACHE_MAX_BYTES: usize = 32 << 20;
+const TURN_DELIMITERS: [&str; 6] =
+    ["<｜User｜>", "<｜Assistant｜>", "<｜tool▁outputs▁begin｜>", "<|user|>", "<|assistant|>", "<|observation|>"];
+type Checkpoint = (u32, u32, u16); // byte offset, prefix id count, delimiter byte length
+
+struct PrefixEntry {
+    text: Box<str>,
+    ids: Box<[u32]>,
+    checkpoints: Box<[Checkpoint]>,
+}
+impl PrefixEntry {
+    fn bytes(&self) -> usize {
+        self.text.len() + self.ids.len() * 4 + self.checkpoints.len() * 12
+    }
+}
+
+#[derive(Default)]
+struct PrefixCache {
+    entries: VecDeque<PrefixEntry>, // least recently used first
+    bytes: usize,
+    #[cfg(test)]
+    hits: usize,
+}
+
+#[derive(Default)]
+struct PrefixHit {
+    byte_off: usize,
+    ids: Vec<u32>,
+    checkpoints: Vec<Checkpoint>,
+    full: bool,
+}
+
+impl PrefixCache {
+    fn lookup(&mut self, text: &str) -> PrefixHit {
+        let mut best = None;
+        let mut hit = PrefixHit::default();
+        for (i, entry) in self.entries.iter().enumerate().rev() {
+            let common = text.as_bytes().iter().zip(entry.text.as_bytes()).take_while(|(a, b)| a == b).count();
+            if common == text.len() && text.len() == entry.text.len() {
+                hit = PrefixHit { byte_off: common, ids: entry.ids.to_vec(), full: true, checkpoints: Vec::new() };
+                best = Some(i);
+                break;
+            }
+            if let Some(&(off, _, _)) = entry
+                .checkpoints
+                .iter()
+                .rev()
+                .find(|&&(off, _, len)| off as usize + len as usize <= common && off as usize > hit.byte_off)
+            {
+                hit.byte_off = off as usize;
+                // Copy only the winning entry, after the scan.
+                best = Some(i);
+            }
+        }
+        if let Some(i) = best {
+            let entry = self.entries.remove(i).unwrap();
+            if !hit.full {
+                let cut = entry.checkpoints.partition_point(|&(off, _, _)| (off as usize) < hit.byte_off);
+                let count = entry.checkpoints[cut].1 as usize;
+                hit.ids = entry.ids[..count].to_vec();
+                hit.checkpoints = entry.checkpoints[..cut].to_vec();
+            }
+            self.entries.push_back(entry);
+            #[cfg(test)]
+            {
+                self.hits += 1;
+            }
+        }
+        hit
+    }
+
+    fn insert(&mut self, entry: PrefixEntry) {
+        let bytes = entry.bytes();
+        if bytes > CACHE_MAX_BYTES {
+            return;
+        }
+        // Concurrent encodes of the same prompt may finish together; keep just one copy.
+        if let Some(i) = self.entries.iter().position(|e| e.text == entry.text) {
+            self.bytes -= self.entries.remove(i).unwrap().bytes();
+        }
+        while self.entries.len() >= CACHE_MAX_ENTRIES || self.bytes + bytes > CACHE_MAX_BYTES {
+            self.bytes -= self.entries.pop_front().unwrap().bytes();
+        }
+        self.bytes += bytes;
+        self.entries.push_back(entry);
+    }
+}
+
+fn identity_normalizer(tk: &Tokenizer) -> bool {
+    tk.get_normalizer().is_none_or(|n| {
+        serde_json::to_value(n).ok() == Some(serde_json::json!({"type": "Sequence", "normalizers": []}))
+    })
+}
+
+/// Proper suffix/prefix overlap in either direction; full equality is the same isolated token, not an overlap.
+fn overlaps(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    (1..a.len().min(b.len())).any(|n| a[a.len() - n..] == b[..n] || b[b.len() - n..] == a[..n])
+}
 
 pub struct Tok {
     pub tk: &'static Tokenizer,
@@ -42,6 +157,9 @@ pub struct Tok {
     /// without a `</think>` token
     pub think_close: Vec<u32>,
     par_ok: bool,
+    cache_ok: bool,
+    delimiters: Vec<&'static str>,
+    cache: Mutex<PrefixCache>,
     strs: String,
     offs: Vec<u32>,
 }
@@ -155,11 +273,16 @@ impl Tok {
             think_end: tk.token_to_id("</think>"),
             think_close: Vec::new(),
             par_ok: false,
+            cache_ok: false,
+            delimiters: Vec::new(),
+            cache: Mutex::new(PrefixCache::default()),
             strs: String::new(),
             offs: Vec::new(),
         };
         t.build_token_strs();
         t.par_ok = t.check_parallel();
+        t.delimiters = t.check_cache();
+        t.cache_ok = !t.delimiters.is_empty();
         if let Some(end) = t.think_end {
             let mut close = t.encode_seq("\n", false)?;
             close.push(end);
@@ -172,21 +295,35 @@ impl Tok {
     /// Whether the cut points of `split_pieces` are provably safe for this tokenizer, confirmed on sample text.
     fn check_parallel(&self) -> bool {
         let tk = self.tk;
-        // the cut-point argument is about this exact pre-tokenizer: GPT-style regex split, then byte-level without regex
+        let split = |v: &Value, regex: &str| {
+            v.get("type") == Some(&Value::from("Split"))
+                && v.pointer("/pattern/Regex") == Some(&Value::from(regex))
+                && v.get("behavior") == Some(&Value::from("Isolated"))
+                && v.get("invert") == Some(&Value::from(false))
+        };
+        let byte_level = |v: &Value| {
+            v.get("type") == Some(&Value::from("ByteLevel"))
+                && v.get("use_regex") == Some(&Value::from(false))
+                && v.get("add_prefix_space") == Some(&Value::from(false))
+        };
         let pre = tk.get_pre_tokenizer().and_then(|p| serde_json::to_value(p).ok());
         let pre_ok = pre.as_ref().is_some_and(|p| {
-            let steps = p.get("pretokenizers").and_then(Value::as_array);
-            matches!(steps.map(Vec::as_slice), Some([split, bl])
-                if split.get("type") == Some(&Value::from("Split"))
-                    && split.pointer("/pattern/Regex") == Some(&Value::from(GLM_PRETOKENIZER_REGEX))
-                    && split.get("behavior") == Some(&Value::from("Isolated"))
-                    && split.get("invert") == Some(&Value::from(false))
-                    && bl.get("type") == Some(&Value::from("ByteLevel"))
-                    && bl.get("use_regex") == Some(&Value::from(false))
-                    && bl.get("add_prefix_space") == Some(&Value::from(false)))
+            if p.get("type") != Some(&Value::from("Sequence")) {
+                return false;
+            }
+            match p.get("pretokenizers").and_then(Value::as_array).map(Vec::as_slice) {
+                Some([glm, bl]) => split(glm, GLM_PRETOKENIZER_REGEX) && byte_level(bl),
+                Some([digits, cjk, text, bl]) => {
+                    split(digits, DS_DIGITS_REGEX)
+                        && split(cjk, DS_CJK_REGEX)
+                        && split(text, DS_TEXT_REGEX)
+                        && byte_level(bl)
+                }
+                _ => false,
+            }
         });
         let shape_ok = pre_ok
-            && tk.get_normalizer().is_none()
+            && identity_normalizer(tk)
             && tk.get_truncation().is_none()
             && tk.get_padding().is_none()
             && tk.get_added_tokens_decoder().values().all(|a| {
@@ -210,13 +347,111 @@ impl Tok {
         ok
     }
 
+    /// AddedToken extraction isolates every checkpoint from BPE. Restrict to the covered pre-tokenizers and a
+    /// deterministic BPE with ID-preserving post-processing; arbitrary per-sequence processors need their own concatenation proof.
+    fn check_cache(&self) -> Vec<&'static str> {
+        let tk = self.tk;
+        let model = serde_json::to_value(tk.get_model()).unwrap_or(Value::Null);
+        // ByteLevel post-processing changes offsets/sequence IDs only, never token IDs.
+        let processor_ok = tk.get_post_processor().is_none_or(|p| {
+            serde_json::to_value(p).ok().is_some_and(|v| v.get("type") == Some(&Value::from("ByteLevel")))
+        });
+        let added = tk.get_added_tokens_decoder();
+        if !self.par_ok
+            || !identity_normalizer(tk)
+            || tk.get_truncation().is_some()
+            || tk.get_padding().is_some()
+            || !processor_ok
+            || model.get("type") != Some(&Value::from("BPE"))
+            || model.get("dropout").is_some_and(|v| !v.is_null() && v.as_f64() != Some(0.0))
+            || added.values().any(|a| a.lstrip || a.rstrip || a.single_word || a.content.is_empty())
+        {
+            return Vec::new();
+        }
+        let delimiters: Vec<_> =
+            TURN_DELIMITERS.into_iter().filter(|d| added.values().any(|a| a.content == *d)).collect();
+        let tokens: Vec<_> = added.values().map(|a| a.content.as_str()).collect();
+        if delimiters.is_empty()
+            || tokens.iter().any(|a| tokens.iter().any(|b| a.len() < b.len() && b.starts_with(a)))
+            || delimiters
+                .iter()
+                .any(|d| tokens.iter().any(|a| overlaps(d, a) || (d != a && (d.contains(a) || a.contains(d)))))
+        {
+            return Vec::new();
+        }
+        let mut sample = String::from("system: tools and schema\n");
+        for d in &delimiters {
+            sample.push_str(d);
+            sample.push_str("x = 1\n\nhello world 12345 你好 カナ <think>\n");
+        }
+        let mut parallel = false;
+        let segmented = self.encode_segments(&sample, PrefixHit::default(), &delimiters, &mut parallel);
+        if !matches!((segmented, self.encode_seq(&sample, false)), (Ok((a, _)), Ok(b)) if a == b) {
+            log::warn!("prefix encode cache off: checkpoint self-check disagrees");
+            return Vec::new();
+        }
+        delimiters
+    }
+
+    /// Encode after a reused checkpoint, including its delimiter; offsets always come from UTF-8 string matches,
+    /// never from the possibly mid-codepoint common byte prefix. No tokenizer work runs while the LRU is locked.
+    fn encode_segments(
+        &self,
+        text: &str,
+        mut hit: PrefixHit,
+        delimiters: &[&str],
+        parallel: &mut bool,
+    ) -> Result<(Vec<u32>, Vec<Checkpoint>), String> {
+        use rayon::prelude::*;
+        let tail = &text[hit.byte_off..];
+        let mut cuts: Vec<(usize, usize)> = delimiters
+            .iter()
+            .flat_map(|d| tail.match_indices(d).map(move |(off, _)| (hit.byte_off + off, d.len())))
+            .collect();
+        cuts.sort_unstable();
+        let mut starts = vec![hit.byte_off];
+        starts.extend(cuts.iter().map(|&(off, _)| off).filter(|&off| off != hit.byte_off));
+        let segments: Vec<_> = starts
+            .iter()
+            .enumerate()
+            .map(|(i, &off)| &text[off..starts.get(i + 1).copied().unwrap_or(text.len())])
+            .collect();
+        let parts: Vec<_> = if self.par_ok && tail.len() >= PAR_MIN_BYTES && segments.len() > 1 {
+            *parallel = true;
+            segments.par_iter().map(|s| self.encode_uncached(s, false, &mut false)).collect()
+        } else {
+            segments.iter().map(|s| self.encode_uncached(s, false, parallel)).collect()
+        };
+        let mut cut = 0;
+        for (&off, ids) in starts.iter().zip(parts) {
+            if cuts.get(cut).is_some_and(|&(p, _)| p == off) {
+                hit.checkpoints.push((off as u32, hit.ids.len() as u32, cuts[cut].1 as u16));
+                cut += 1;
+            }
+            hit.ids.extend(ids?);
+        }
+        debug_assert!(hit.checkpoints.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].1));
+        Ok((hit.ids, hit.checkpoints))
+    }
+
     /// Encode `text` in pieces of about `piece` bytes, cut where `split_pieces` allows.
     fn encode_par(&self, text: &str, add_special: bool, piece: usize) -> Result<Vec<u32>, String> {
+        self.encode_par_work(text, add_special, piece, &mut false)
+    }
+
+    fn encode_par_work(
+        &self,
+        text: &str,
+        add_special: bool,
+        piece: usize,
+        parallel: &mut bool,
+    ) -> Result<Vec<u32>, String> {
         use rayon::prelude::*;
         let pieces = split_pieces(text, piece);
         if pieces.len() < 2 {
             return self.encode_seq(text, add_special);
         }
+        *parallel = true;
         let parts: Vec<Result<Vec<u32>, String>> = pieces.par_iter().map(|p| self.encode_seq(p, false)).collect();
         let mut ids = Vec::with_capacity(text.len() / 3);
         for p in parts {
@@ -256,9 +491,33 @@ impl Tok {
     }
 
     pub fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>, String> {
-        // a post-processor that adds tokens (none for GLM) would have to run once over the whole sequence
+        self.encode_work(text, add_special, &mut false)
+    }
+
+    fn encode_work(&self, text: &str, add_special: bool, parallel: &mut bool) -> Result<Vec<u32>, String> {
+        if self.cache_ok
+            && (CACHE_MIN_BYTES..=CACHE_MAX_BYTES).contains(&text.len())
+            && !(add_special && self.adds_special())
+        {
+            let hit = self.cache.lock().unwrap().lookup(text);
+            if hit.full {
+                return Ok(hit.ids);
+            }
+            let (ids, checkpoints) = self.encode_segments(text, hit, &self.delimiters, parallel)?;
+            self.cache.lock().unwrap().insert(PrefixEntry {
+                text: text.into(),
+                ids: ids.clone().into_boxed_slice(),
+                checkpoints: checkpoints.into_boxed_slice(),
+            });
+            return Ok(ids);
+        }
+        self.encode_uncached(text, add_special, parallel)
+    }
+
+    fn encode_uncached(&self, text: &str, add_special: bool, parallel: &mut bool) -> Result<Vec<u32>, String> {
+        // A post-processor that adds tokens must run once over the whole sequence.
         if self.par_ok && text.len() >= PAR_MIN_BYTES && !(add_special && self.adds_special()) {
-            return self.encode_par(text, add_special, PAR_PIECE_BYTES);
+            return self.encode_par_work(text, add_special, PAR_PIECE_BYTES, parallel);
         }
         self.encode_seq(text, add_special)
     }
@@ -273,12 +532,15 @@ impl Tok {
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::task::spawn_blocking(move || {
-            let r = self.encode(&text, add_special);
+            let mut parallel = false;
+            let r = self.encode_work(&text, add_special, &mut parallel);
             drop(text);
             let _ = tx.send(r);
             // after the ids are on their way: hand the encode's scratch memory back to the OS (the pieces of a
             // parallel encode allocated on the rayon threads)
-            rayon::broadcast(|_| crate::util::release_memory(true));
+            if parallel {
+                rayon::broadcast(|_| crate::util::release_memory(true));
+            }
             crate::util::release_memory(true);
         });
         rx.await.map_err(|e| e.to_string())?
@@ -329,6 +591,9 @@ fn parallel_sample() -> String {
         "/nothink\n",
         "'s 't 're 've 'm 'll 'd\n",
         "a\u{a0}b\u{2028}c\u{3000}d\n",
+        "<｜User｜>\"id\": \"abc\", /path/to/file.rs\r\n",
+        "<｜Assistant｜><｜tool▁calls▁begin｜><｜tool▁sep｜>你好 カナ ひらがな 123456789\n",
+        "<｜end▁of▁sentence｜>\r\n\n\nNext word\n",
         "end\n",
     ];
     let mut s = String::new();
@@ -529,5 +794,285 @@ mod tests {
                 w[1]
             );
         }
+    }
+}
+
+#[cfg(test)]
+impl Tok {
+    /// Test-only views for the HTTP-level checkpoint test in api.rs.
+    pub(crate) fn encode_seq_for_test(&self, text: &str) -> Vec<u32> {
+        self.encode_seq(text, false).unwrap()
+    }
+    pub(crate) fn cache_hits_for_test(&self) -> usize {
+        self.cache.lock().unwrap().hits
+    }
+    pub(crate) fn cache_on_for_test(&self) -> bool {
+        self.par_ok && self.cache_ok
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod prefix_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tokenizer(ds: bool, extra: &[&str]) -> Tokenizer {
+        let mut vocab = serde_json::Map::new();
+        let mut alphabet: Vec<_> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet().into_iter().collect();
+        alphabet.sort_unstable();
+        for c in alphabet {
+            vocab.insert(c.to_string(), json!(vocab.len()));
+        }
+        // Actual merges make unsafe end-of-input reuse observably wrong, rather than testing only a byte tokenizer.
+        let words = ["hello", "helloworld", "value", "123", "foo", "bar", "word", "words", "ĊĊ", "Ġbar", "Ġword"];
+        let mut merges = Vec::new();
+        for word in words {
+            let mut left = String::new();
+            for c in word.chars() {
+                if left.is_empty() {
+                    left.push(c);
+                    continue;
+                }
+                let joined = format!("{left}{c}");
+                if !vocab.contains_key(&joined) {
+                    vocab.insert(joined.clone(), json!(vocab.len()));
+                    merges.push(json!([left, c.to_string()]));
+                }
+                left = joined;
+            }
+        }
+        let split = |regex| json!({"type":"Split", "pattern":{"Regex":regex}, "behavior":"Isolated", "invert":false});
+        let bl = json!({"type":"ByteLevel", "add_prefix_space":false, "trim_offsets":true, "use_regex":false});
+        let steps = if ds {
+            vec![split(DS_DIGITS_REGEX), split(DS_CJK_REGEX), split(DS_TEXT_REGEX), bl]
+        } else {
+            vec![split(GLM_PRETOKENIZER_REGEX), bl]
+        };
+        let mut tk = Tokenizer::from_bytes(
+            serde_json::to_vec(&json!({
+                "version":"1.0", "truncation":null, "padding":null, "added_tokens":[],
+                "normalizer": if ds { json!({"type":"Sequence", "normalizers":[]}) } else { Value::Null },
+                "pre_tokenizer":{"type":"Sequence", "pretokenizers":steps},
+            "post_processor":{"type":"ByteLevel", "add_prefix_space":true, "trim_offsets":false, "use_regex":true},
+                "decoder":{"type":"ByteLevel", "add_prefix_space":false, "trim_offsets":true, "use_regex":false},
+                "model":{"type":"BPE", "dropout":null, "unk_token":null, "continuing_subword_prefix":null,
+                         "end_of_word_suffix":null, "fuse_unk":false, "byte_fallback":false, "ignore_merges":false,
+                         "vocab":vocab, "merges":merges}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let specials: Vec<_> = TURN_DELIMITERS
+            .iter()
+            .copied()
+            .chain(["｜DSML｜", "<think>", "</think>"])
+            .chain(extra.iter().copied())
+            .map(|s| tokenizers::AddedToken::from(s, true))
+            .collect();
+        tk.add_special_tokens(specials).unwrap();
+        tk
+    }
+
+    fn from_tk(tk: Tokenizer) -> Tok {
+        let tk = Box::leak(Box::new(tk));
+        let mut t = Tok {
+            tk,
+            eos_token: Value::Null,
+            eos_token_id: None,
+            eos_ids: Vec::new(),
+            pad_token: Value::Null,
+            gen_defaults: Default::default(),
+            vocab_size: tk.get_vocab_size(true),
+            think_start: None,
+            think_end: None,
+            think_close: Vec::new(),
+            par_ok: false,
+            cache_ok: false,
+            delimiters: Vec::new(),
+            cache: Mutex::new(PrefixCache::default()),
+            strs: String::new(),
+            offs: Vec::new(),
+        };
+        t.par_ok = t.check_parallel();
+        t.delimiters = t.check_cache();
+        t.cache_ok = !t.delimiters.is_empty();
+        t
+    }
+
+    pub(crate) fn fixture(ds: bool) -> Tok {
+        from_tk(tokenizer(ds, &[]))
+    }
+    fn exact(t: &Tok, text: &str) {
+        assert_eq!(t.encode(text, false).unwrap(), t.encode_seq(text, false).unwrap(), "{} bytes", text.len());
+        let cache = t.cache.lock().unwrap();
+        assert!(cache.entries.len() <= CACHE_MAX_ENTRIES && cache.bytes <= CACHE_MAX_BYTES);
+        assert_eq!(cache.bytes, cache.entries.iter().map(PrefixEntry::bytes).sum::<usize>());
+    }
+
+    #[test]
+    fn covered_shapes_and_checkpoint_boot_checks() {
+        for ds in [false, true] {
+            let t = fixture(ds);
+            assert!(t.par_ok && t.cache_ok);
+            assert!(!t.delimiters.contains(&"｜DSML｜"));
+            assert!(t.tk.token_to_id("｜DSML｜").is_some());
+            for extra in ["<｜User｜>suffix", "<｜User", "｜>overlap", "<think>suffix"] {
+                let t = from_tk(tokenizer(ds, &[extra]));
+                assert!(!t.cache_ok, "must reject {extra}");
+            }
+        }
+        assert!(overlaps("｜DSML｜", "｜DSML｜"));
+        let mut tk = tokenizer(true, &[]);
+        tk.with_normalizer(Some(tokenizers::normalizers::Lowercase)).unwrap();
+        let t = from_tk(tk);
+        assert!(!t.par_ok && !t.cache_ok);
+        let mut tk = tokenizer(true, &[]);
+        tk.add_special_tokens([tokenizers::AddedToken::from("<strip>", true).lstrip(true)]).unwrap();
+        assert!(!from_tk(tk).cache_ok);
+    }
+
+    #[test]
+    fn merge_continuations_shorter_previews_and_reasoning_rewrites() {
+        for ds in [false, true] {
+            let t = fixture(ds);
+            let base = format!("{}<｜User｜>question<｜Assistant｜>", "system schema\n".repeat(400));
+            for (tail, continuation) in [
+                ("x = 1\n", "\nnext"),
+                ("hello", "world"),
+                ("value: 12", "3"),
+                ("foo ", "bar"),
+                ("…a word", "s and more"),
+                ("<think>\n", "more reasoning</think>"),
+            ] {
+                let inserted = format!("{base}{tail}");
+                exact(&t, &inserted);
+                exact(&t, &format!("{inserted}{continuation}"));
+            }
+            let old = format!("{base}…a word<｜User｜>preview");
+            exact(&t, &old);
+            exact(&t, &format!("{base}…a words and more")); // delimiter disappears at the edit
+            exact(&t, &format!("{base}<think>\n"));
+            exact(&t, &format!("{base}</think>"));
+            let real = format!("{base}hello<｜User｜>next<｜Assistant｜>");
+            exact(&t, &format!("{real}synthetic preview<｜User｜>future"));
+            exact(&t, &real);
+            exact(&t, &real[..4200]); // shorter system prefix, no delimiter
+            let earlier = format!("{base}<think>old thoughts</think>answer<｜User｜>next<｜Assistant｜>");
+            exact(&t, &earlier);
+            exact(&t, &earlier.replace("old thoughts", "changed reasoning"));
+            // Common bytes end within a delimiter or a UTF-8 character, not at a usable checkpoint.
+            exact(&t, &format!("{base}abc<｜User｜>old"));
+            exact(&t, &format!("{base}abc<｜Us"));
+            exact(&t, &format!("{base}é"));
+            exact(&t, &format!("{base}ê"));
+            assert!(t.cache.lock().unwrap().hits > 0);
+        }
+    }
+
+    #[test]
+    fn lookup_requires_equal_full_length_or_a_whole_delimiter() {
+        let t = fixture(true);
+        let system = "system schema\n".repeat(400);
+        let text = format!("{system}<｜User｜>hello<｜Assistant｜>tail");
+        exact(&t, &text);
+        let mut cache = t.cache.lock().unwrap();
+        let full = cache.lookup(&text);
+        assert!(full.full && full.byte_off == text.len());
+        let shorter = cache.lookup(&system);
+        assert!(!shorter.full && shorter.byte_off == 0 && shorter.ids.is_empty());
+        let partial = cache.lookup(&format!("{system}<｜User｜>hello<｜Ass"));
+        assert!(!partial.full && partial.byte_off == system.len());
+        let changed = cache.lookup(&format!("{system}<｜User｜>hello<｜Assistant｜>different"));
+        assert!(!changed.full);
+        assert_eq!(changed.byte_off, text.find("<｜Assistant｜>").unwrap());
+        assert_eq!(changed.checkpoints.len(), 1);
+    }
+
+    #[test]
+    fn release_hygiene_tracks_actual_parallel_work() {
+        let t = fixture(true);
+        let text = format!("{}<｜User｜>hello", "some words and code\n".repeat(3000));
+        let mut parallel = false;
+        t.encode_work(&text, false, &mut parallel).unwrap();
+        assert!(parallel);
+        parallel = false;
+        t.encode_work(&text, false, &mut parallel).unwrap();
+        assert!(!parallel, "full cache hit must not broadcast worker memory release");
+        t.encode_work(&format!("{text} world"), false, &mut parallel).unwrap();
+        assert!(!parallel, "short uncached tail must not broadcast");
+        let mut unsupported = fixture(true);
+        unsupported.par_ok = false;
+        unsupported.cache_ok = false;
+        unsupported.encode_work(&text, false, &mut parallel).unwrap();
+        assert!(!parallel);
+        let no_cut = "1".repeat(PAR_MIN_BYTES * 2);
+        t.encode_uncached(&no_cut, false, &mut parallel).unwrap();
+        assert!(!parallel, "eligible length without a safe split is sequential");
+    }
+
+    #[test]
+    fn twenty_turns_concurrent_preview_check_system_and_chat() {
+        let t = fixture(true);
+        let mut text = "system tools schema\n".repeat(300);
+        let mut turns = Vec::new();
+        for i in 0..20 {
+            text.push_str(&format!("<｜User｜>turn {i}: {}<｜Assistant｜><think>plan {i}</think>｜DSML｜tool_call\n{}<｜tool▁outputs▁begin｜>ok",
+                "a b c d ".repeat(300), "x = 123\n".repeat(300)));
+            turns.push(text.clone());
+        }
+        let tokens = t.encode_seq(turns.last().unwrap(), false).unwrap().len();
+        assert!(tokens >= 80_000);
+        eprintln!("TWENTY_TURN_STRESS turns=20 lanes=4 final_tokens={tokens}");
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        std::thread::scope(|scope| {
+            for lane in 0..4 {
+                let (t, turns, pool) = (&t, &turns, &pool);
+                scope.spawn(move || {
+                    use rayon::prelude::*;
+                    for text in turns {
+                        let requests = [
+                            format!("{text}<｜User｜>preview {lane}<｜Assistant｜><think>\n"),
+                            text.clone(),
+                            text[..4200].to_string(),
+                            format!("{text}<｜Assistant｜></think>"),
+                        ];
+                        pool.install(|| requests.par_iter().for_each(|q| exact(t, q)));
+                        exact(t, text);
+                    }
+                });
+            }
+        });
+        assert!(t.cache.lock().unwrap().hits > 0);
+    }
+
+    #[test]
+    fn lru_count_bytes_and_duplicate_insertion_are_bounded() {
+        fn entry(i: usize, n: usize) -> PrefixEntry {
+            PrefixEntry {
+                text: format!("{i:04}{}", "x".repeat(n)).into(),
+                ids: vec![1; n / 4].into(),
+                checkpoints: Box::new([]),
+            }
+        }
+        let mut cache = PrefixCache::default();
+        for i in 0..40 {
+            cache.insert(entry(i, 4096));
+        }
+        assert_eq!(cache.entries.len(), CACHE_MAX_ENTRIES);
+        assert!(cache.entries.front().unwrap().text.starts_with("0008"));
+        let first = cache.entries.front().unwrap().text.to_string();
+        assert!(cache.lookup(&first).full);
+        cache.insert(entry(40, 4096));
+        assert!(cache.entries.iter().any(|e| e.text.as_ref() == first));
+        for i in 0..20 {
+            cache.insert(entry(i, 1 << 20));
+        }
+        assert!(cache.entries.len() < CACHE_MAX_ENTRIES && cache.bytes <= CACHE_MAX_BYTES);
+        let n = cache.entries.len();
+        cache.insert(entry(19, 1 << 20));
+        assert_eq!(cache.entries.len(), n);
+        cache.insert(entry(99, CACHE_MAX_BYTES));
+        assert_eq!(cache.entries.len(), n);
+        assert_eq!(cache.bytes, cache.entries.iter().map(PrefixEntry::bytes).sum::<usize>());
     }
 }

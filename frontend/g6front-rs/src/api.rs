@@ -560,7 +560,8 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     let hf_prompt_ends_think = st.dialect == Dialect::Hf && !cfm_on && pyjson::py_rstrip(&text).ends_with("<think>");
     let thinking_off = th.off || (st.dialect == Dialect::Hf && pyjson::py_rstrip(&text).ends_with("</think>"));
     let (t1, chars) = (std::time::Instant::now(), text.len());
-    // the DeepSeek prompt text opens with its BOS, so no special tokens are added to it
+    // The same Tok checkpoint cache serves chat, /tokenize previews and the shorter system-span query.
+    // The DeepSeek prompt text opens with its BOS, so no special tokens are added to it
     let add_special = !ds && truthy(body.get("add_special_tokens"));
     let prompt = st.tok.aencode(text, add_special).await.map_err(|e| ApiError::new(500, &e, None))?;
     let t2 = std::time::Instant::now();
@@ -1986,5 +1987,198 @@ mod steering_health_tests {
             serde_json::json!([{"profile":"en-zh","digest":"a".repeat(12),"layers":78},
                                                                  {"profile":"zh-en","digest":"b".repeat(12),"layers":77}])
         );
+    }
+}
+
+#[cfg(test)]
+mod http_tokenize_chat_tests {
+    //! HTTP-level: a multi-turn DS41 prompt goes through /tokenize and then /v1/chat/completions on the real router.
+    //! The ids each endpoint produces must equal the sequential encode, and the checkpoint cache must be reused.
+    use std::sync::{Arc, Mutex};
+
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream, UnixListener};
+
+    use super::*;
+    use crate::engine::Engine;
+    use crate::wire::FrameReader;
+
+    fn frame(v: Value) -> Vec<u8> {
+        let b = serde_json::to_vec(&v).unwrap();
+        let mut out = (b.len() as u32).to_be_bytes().to_vec();
+        out.extend(b);
+        out
+    }
+
+    /// A PROTOCOL.md engine that records each generate frame and answers it with `reply`, ending at `length`.
+    async fn fake_engine(reply: Vec<u32>) -> (Arc<Engine>, Arc<Mutex<Vec<Value>>>) {
+        let path = std::env::temp_dir().join(format!("g6front-http-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let gens = Arc::new(Mutex::new(Vec::new()));
+        let g2 = gens.clone();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (rd, mut wr) = sock.into_split();
+            wr.write_all(&frame(json!({"type": "hello", "version": 1, "max_model_len": 1 << 20}))).await.unwrap();
+            let mut r = FrameReader::new(rd);
+            while let Ok(Some(f)) = r.next().await {
+                let v: Value = serde_json::from_slice(&f).unwrap();
+                if v["type"] != "generate" {
+                    continue;
+                }
+                g2.lock().unwrap().push(v.clone());
+                let n = (v["max_tokens"].as_u64().unwrap() as usize).min(reply.len());
+                let id = v["id"].clone();
+                wr.write_all(&frame(json!({"type": "tokens", "id": id, "ids": &reply[..n]}))).await.unwrap();
+                let fin = json!({"type": "finish", "id": id, "reason": "length", "stop_id": null,
+                                 "cached_tokens": 0, "completion_tokens": n});
+                wr.write_all(&frame(fin)).await.unwrap();
+            }
+        });
+        let engine = Engine::new(path.to_string_lossy().into_owned());
+        engine.start();
+        for _ in 0..500 {
+            if engine.ready() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(engine.ready(), "the fake engine did not connect");
+        (engine, gens)
+    }
+
+    /// One HTTP/1.1 POST with Connection: close; the status and the JSON body.
+    async fn post(addr: std::net::SocketAddr, path: &str, body: &Value) -> (u16, Value) {
+        let b = serde_json::to_vec(body).unwrap();
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            b.len()
+        );
+        s.write_all(head.as_bytes()).await.unwrap();
+        s.write_all(&b).await.unwrap();
+        let mut raw = Vec::new();
+        s.read_to_end(&mut raw).await.unwrap();
+        let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+        let status: u16 = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let mut payload = raw[split + 4..].to_vec();
+        if head.contains("transfer-encoding: chunked") {
+            let (mut out, mut rest) = (Vec::new(), &payload[..]);
+            loop {
+                let eol = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+                let n = usize::from_str_radix(std::str::from_utf8(&rest[..eol]).unwrap().trim(), 16).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&rest[eol + 2..eol + 2 + n]);
+                rest = &rest[eol + 4 + n..];
+            }
+            payload = out;
+        }
+        (status, serde_json::from_slice(&payload).unwrap_or(Value::Null))
+    }
+
+    /// The prompt text both handlers render for a DS41 request without tools (dialect::resolve_ds + ds_prompt).
+    fn prompt_text(st: &State, body: &Value) -> String {
+        let body = body.as_object().unwrap();
+        let (th, effort) = dialect::resolve_ds(body, st.thinking, st.ds_effort, st.ds_thinking_default).unwrap();
+        let (agp, cfm) = dialect::ds_gen_flags(body).unwrap();
+        dialect::ds_prompt(body.get("messages"), None, !th.off, effort, agp, cfm).unwrap().0
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tokenize_then_chat_reuses_turn_checkpoints_with_exact_ids() {
+        let mut tok = crate::tok::prefix_tests::fixture(true);
+        assert!(tok.cache_on_for_test());
+        tok.use_single_think_close();
+        let dir = std::env::temp_dir().join(format!("g6front-http-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        tok.tk.save(dir.join("tokenizer.json"), false).unwrap();
+        let grammars = crate::grammar::Grammars::load(&dir, tok.vocab_size).unwrap();
+        let reply: Vec<u32> = "answer".bytes().map(|b| tok.tk.token_to_id(&(b as char).to_string()).unwrap()).collect();
+        let (engine, gens) = fake_engine(reply).await;
+        let st: &'static State = Box::leak(Box::new(State {
+            tok,
+            template: None,
+            dialect: Dialect::Ds41,
+            ds_effort: dialect::DS_DEFAULT_EFFORT,
+            ds_thinking_default: true,
+            forced_tool_thinking: false,
+            ink_effort: None,
+            engine,
+            served: vec!["deepseek-v4.1-flash".into()],
+            model_name: "deepseek-v4.1-flash".into(),
+            model_dir: dir.to_string_lossy().into_owned(),
+            reasoning_fields: &["reasoning_content"],
+            prompt_tokens_details: true,
+            max_model_len_override: 0,
+            default_max_tokens: 0,
+            share_tokens: 0,
+            clamp_max_tokens: false,
+            thinking: thinking::Defaults { effort: None, budget: sampling::Limit::Tokens(0), allow_off: true },
+            grammars,
+            emit_undeclared: true,
+            guard: guard::Config::default(),
+            penalties: sampling::Penalties::default(),
+            boost: None,
+            sequence: None,
+            started: now_secs(),
+            supervisor: None,
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| route(st, req, peer));
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(sock), svc).await;
+                });
+            }
+        });
+
+        let system = "system tools schema: read files, run commands, edit code\n".repeat(120);
+        let mut messages = vec![json!({"role": "system", "content": system})];
+        let mut last_hits = st.tok.cache_hits_for_test();
+        for turn in 0..4 {
+            messages.push(json!({"role": "user", "content": format!("turn {turn}: {}", "a b c d word ".repeat(80))}));
+            let req = json!({"model": "deepseek-v4.1-flash", "messages": messages.clone()});
+            let want = st.tok.encode_seq_for_test(&prompt_text(st, &req));
+
+            let (code, v) = post(addr, "/tokenize", &req).await;
+            assert_eq!(code, 200, "/tokenize turn {turn}: {v}");
+            let ids: Vec<u32> = v["tokens"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+            assert_eq!(ids, want, "/tokenize turn {turn} ids differ from the sequential encode");
+            let hits = st.tok.cache_hits_for_test();
+            if turn > 0 {
+                assert!(hits > last_hits, "/tokenize turn {turn} did not reuse an earlier turn's checkpoint");
+            }
+            last_hits = hits;
+
+            let mut chat = req.clone();
+            chat["max_tokens"] = json!(6);
+            let (code, v) = post(addr, "/v1/chat/completions", &chat).await;
+            assert_eq!(code, 200, "chat turn {turn}: {v}");
+            assert_eq!(v["usage"]["prompt_tokens"].as_u64().unwrap() as usize, want.len());
+            let sent: Vec<u32> = gens.lock().unwrap().last().unwrap()["prompt"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as u32)
+                .collect();
+            assert_eq!(sent, want, "chat turn {turn}: engine prompt differs from the sequential encode");
+            let hits = st.tok.cache_hits_for_test();
+            assert!(hits > last_hits, "chat turn {turn} did not hit the prompt /tokenize cached");
+            last_hits = hits;
+            let content = v["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string();
+            messages.push(json!({"role": "assistant", "content": content}));
+        }
+        assert_eq!(gens.lock().unwrap().len(), 4);
+        eprintln!("HTTP_TOKENIZE_CHAT turns=4 cache_hits={last_hits}");
     }
 }
