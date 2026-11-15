@@ -2358,14 +2358,29 @@ int main(int argc, char** argv)
                                 pool_pages - place, (std::min(pool_pages - place, cap / 64 - cp_R / 64)) * 64, rtt->V);
         }
         int reuse_grid = 0;
-        // the offline loop's rules (prefix_reuse.h), but on by default: the grid rule (exact hits; GR8_REUSE_ALIGN=0 drops it)
+        // the offline loop's rules (prefix_reuse.h), but on by default: the prefill-only grid rule (GR8_REUSE_ALIGN=0 drops it)
         // and NOEND (GR8_REUSE_NOEND=0 restores the prompt >= written_end rule, which refuses replaying a prompt as it is)
         if (reuse_prefix)
         {
             const bool align = knob::reuse_align().value_or(true);
-            if (align && !MP) die("GR8_REUSE_ALIGN=1 needs tensor prefill (--prefill N)");
             PrefixReuse rules;
             rules.strict = knob::reuse_strict(); rules.noend = knob::reuse_noend().value_or(true); rules.grid = align ? MP : 0;
+            const auto rg = knob::reuse_grid();
+            if (rg.has_value())
+            {
+                const int64_t g = *rg;
+                if (knob::reuse_align().has_value() && !*knob::reuse_align())
+                    die("GR8_REUSE_GRID conflicts with GR8_REUSE_ALIGN=0");
+                if (!MP)
+                    die("GR8_REUSE_GRID needs tensor prefill (--prefill N)");
+                if (g < 64 || g % 64 != 0 || g > MP)
+                    die("GR8_REUSE_GRID must be a positive multiple of 64 no larger than --prefill");
+                rules.grid = (int)g;
+            }
+            else
+            {
+                if (align && !MP) die("GR8_REUSE_ALIGN=1 needs tensor prefill (--prefill N)");
+            }
             pool.keep(rules);
             reuse_grid = rules.grid;
             if (knob::pool_log()) pool.log(true);   // one stderr line per pool claim: first page, pages, evicted retained runs
@@ -3323,8 +3338,23 @@ int main(int argc, char** argv)
     {
         reuse.strict = knob::reuse_strict(); reuse.noend = knob::reuse_noend().value_or(false); reuse_poison_on = knob::reuse_poison();
         const bool align = knob::reuse_align().value_or(false);   // retain only whole cold prefill grid cells (prefix_reuse.h)
-        if (align && !MP) die("GR8_REUSE_ALIGN=1 needs tensor prefill (--prefill N)");
         reuse.grid = align ? MP : 0;   // one sub-batch (the lane pairing does not change a row)
+        const auto rg = knob::reuse_grid();
+        if (rg.has_value())
+        {
+            const int64_t g = *rg;
+            if (knob::reuse_align().has_value() && !*knob::reuse_align())
+                die("GR8_REUSE_GRID conflicts with GR8_REUSE_ALIGN=0");
+            if (!MP)
+                die("GR8_REUSE_GRID needs tensor prefill (--prefill N)");
+            if (g < 64 || g % 64 != 0 || g > MP)
+                die("GR8_REUSE_GRID must be a positive multiple of 64 no larger than --prefill");
+            reuse.grid = (int)g;
+        }
+        else
+        {
+            if (align && !MP) die("GR8_REUSE_ALIGN=1 needs tensor prefill (--prefill N)");
+        }
         if (R == 0 && reuse.grid) fprintf(stderr, "# reuse grid %d rows (--prefill %d, lanes %d)\n", reuse.grid, MP, two ? 2 : 1);
     }
     HDump hd = hdump_env();             // reuse diagnostics (reuse_hdump.cuh): default off

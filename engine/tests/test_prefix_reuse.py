@@ -38,6 +38,9 @@ class PrefixReuseTests(unittest.TestCase):
         self.assertIn('for (int a = skip; a < p.first; a += MP)', s)
         # the reuse grid is ONE sub-batch (MP = --prefill = 4096 served), not 2 * MP
         self.assertIn('reuse.grid = align ? MP : 0;', s)
+        self.assertGreaterEqual(s.count('knob::reuse_grid()'), 2)
+        self.assertGreaterEqual(s.count('g % 64 != 0'), 2)
+        self.assertGreaterEqual(s.count('g > MP'), 2)
         self.assertNotIn('2 * MP : MP', s)
         self.assertEqual(s.count('reuse.prefill_rows('), 2)       # both prefill branches (two lanes, one sub-batch)
         for branch in ['reuse.prefill_rows(a, MA + MB, mtp > 0);', 'reuse.prefill_rows(a, M, mtp > 0);']:
