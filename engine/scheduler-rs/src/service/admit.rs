@@ -89,7 +89,7 @@ pub fn lend_idle(resident: u32, queued: usize, retiring: u32) -> bool {
 
 /// The busy guard's grant decision (GR8_BUSY_GUARD=1, docs/ENV.md): a fresh grant whose eviction set (the pool's
 /// busy_view) holds a live retained run — its session has no request in flight but its last response ended under the
-/// idle bound ago — refuses the request with HTTP 429 + Retry-After instead of evicting the run. `hit`: the prompt
+/// idle bound ago (pool.rs Idle) — refuses the request with HTTP 429 + Retry-After instead of evicting the run. `hit`: the prompt
 /// continues its own retained run, which the guard never refuses (the adoption is not an eviction).
 pub fn busy_refuse(guard_on: bool, hit: bool, live_victims: u32) -> bool {
     guard_on && !hit && live_victims > 0
@@ -99,6 +99,11 @@ pub fn busy_refuse(guard_on: bool, hit: bool, live_victims: u32) -> bool {
 /// `free` session slots (a burst at an idle engine queues every arrival before the first admission). 0 = no bound.
 pub fn busy_queue_full(guard_on: bool, bound: u32, queued: usize, free: usize) -> bool {
     guard_on && bound > 0 && queued.saturating_sub(free) >= bound as usize
+}
+
+/// A live-run refusal's Retry-After: the seconds until the last live victim goes idle, rounded up, at least 1.
+pub fn busy_retry_secs(idle_in_ns: i64) -> u64 {
+    (idle_in_ns.max(0) as u64).div_ceil(1_000_000_000).max(1)
 }
 
 /// The busy refusal's once-per-request trace line, like wait_line.
@@ -135,6 +140,8 @@ mod tests {
         // requests the free slots will take do not count: 2 waiting past 4 free slots fill a bound of 2
         assert!(!busy_queue_full(true, 2, 5, 4) && busy_queue_full(true, 2, 6, 4));
         assert!(busy_line(1, 2) && !busy_line(2, 2));
+        // Retry-After: the wait rounded up to whole seconds, at least 1
+        assert_eq!([0, 1, 1_000_000_000, 1_000_000_001, 29_500_000_000].map(busy_retry_secs), [1, 1, 1, 2, 30]);
     }
 
     #[test]

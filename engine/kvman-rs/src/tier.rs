@@ -439,6 +439,7 @@ mod tests {
             rp: 0,
             from: None,
             retired_ns: 0,
+            tool: false,
         };
         let nonstock = Kept {
             list: vec![0],
@@ -450,6 +451,7 @@ mod tests {
             rp: 0,
             from: None,
             retired_ns: 0,
+            tool: false,
         };
         let free = t.free_slots();
         assert!(t.spill(&nonstock, |_, _| panic!("non-stock spill must never read a page")).unwrap().is_none());
@@ -464,6 +466,7 @@ mod tests {
             rp: 0,
             from: None,
             retired_ns: 0,
+            tool: false,
         };
         let ha = t.spill(&a, block).unwrap().unwrap();
         let hb = t.spill(&b, block).unwrap().unwrap();
@@ -481,6 +484,7 @@ mod tests {
                     rp: 0,
                     from: None,
                     retired_ns: 0,
+                    tool: false,
                 },
                 block
             )
@@ -511,6 +515,7 @@ mod tests {
                     rp: 0,
                     from: None,
                     retired_ns: 0,
+                    tool: false,
                 },
                 block,
             )

@@ -317,6 +317,8 @@ pub struct Request {
     pub lp: i32,
     pub plp: i32,
     pub sys: i64,
+    /// the stop ids that end a reply on a tool call (the busy guard's idle bound, pool.rs Idle); empty: none known
+    pub tool_stop: Vec<i32>,
     pub steering: Identity,
     pub ins: Insert,
     pub gram: Grammar,
@@ -374,6 +376,7 @@ pub fn parse(
         lp: -1,
         plp: -1,
         sys: -1,
+        tool_stop: vec![],
         steering: Identity {
             enabled: false,
             profile_digest: [0; 32],
@@ -448,6 +451,11 @@ pub fn parse(
             .ok_or(Msg("invalid sys header"))?;
         next!();
     }
+    if k == b"tstop" {
+        r.tool_stop = request_ids(inp.word().ok_or(Msg("invalid tstop header"))?)?;
+        next!();
+        require(r.tool_stop.len() <= 16, "tstop: at most 16 ids")?;
+    }
     if k == b"ins" {
         let v = inp.word().ok_or(Msg("invalid ins header"))?;
         r.ins = parse_insert(v)?;
@@ -474,7 +482,7 @@ pub fn parse(
         image(v)?;
         next!();
     }
-    require(k.is_empty(), "invalid request header tail (S2 accepts top_p, pen, boost, seqt, seqa, seqg, lp, plp, sys, ins, gram and steer)")?;
+    require(k.is_empty(), "invalid request header tail (S2 accepts top_p, pen, boost, seqt, seqa, seqg, lp, plp, sys, tstop, ins, gram and steer)")?;
     require(r.ins.after < 0 || r.lp < 0, "ins with lp")?;
     r.steering = resolve(&sf)?;
     let g = number(gen)?;
@@ -529,14 +537,14 @@ mod tests {
     #[test]
     fn a_full_request() {
         let r = parse(
-            b"n_gen 9 temp 0.5 seed 7 min 1 stop 3,4 top_p 0.9 plp 2 sys 5 ins 3:-1:8,9\n1,2,3\n",
+            b"n_gen 9 temp 0.5 seed 7 min 1 stop 3,4 top_p 0.9 plp 2 sys 5 tstop 4 ins 3:-1:8,9\n1,2,3\n",
             false,
             &mut off,
             &mut no_img,
         )
         .unwrap();
         assert_eq!((r.n_gen, r.seed, r.min_tokens, r.temp, r.top_p, r.plp, r.sys), (9, 7, 1, 0.5, 0.9, 2, 5));
-        assert_eq!((r.stop, r.prompt, r.ins.tokens), (vec![3, 4], vec![1, 2, 3], vec![8, 9]));
+        assert_eq!((r.stop, r.prompt, r.ins.tokens, r.tool_stop), (vec![3, 4], vec![1, 2, 3], vec![8, 9], vec![4]));
         assert_eq!(
             parse(b"n_gen 9 temp 0.5 seed 7 min 1 stop - lp 2 ins 3:-1:8\n1\n", false, &mut off, &mut no_img).err(),
             Some(Msg("ins with lp"))
@@ -561,7 +569,7 @@ mod tests {
         );
         assert_eq!(
             parse(b"n_gen 9 temp 0 seed 7 min 1 stop - lp 2x\n1\n", false, &mut off, &mut no_img).err(),
-            Some(Msg("invalid request header tail (S2 accepts top_p, pen, boost, seqt, seqa, seqg, lp, plp, sys, ins, gram and steer)"))
+            Some(Msg("invalid request header tail (S2 accepts top_p, pen, boost, seqt, seqa, seqg, lp, plp, sys, tstop, ins, gram and steer)"))
         );
     }
 
@@ -605,7 +613,7 @@ mod tests {
             (b"n_gen 9 temp 0 seed 7 min 1 stop - boost -1 2 10\n1\n", "invalid boost header"),
             (b"n_gen 9 temp 0 seed 7 min 1 stop - boost 1 -2 10\n1\n", "boost: per1k must be 0 or more and max in [0, 20]"),
             (b"n_gen 9 temp 0 seed 7 min 1 stop - boost 1 2 21\n1\n", "boost: per1k must be 0 or more and max in [0, 20]"),
-            (b"n_gen 9 temp 0 seed 7 min 1 stop - lp 1 boost 1 2 10\n1\n", "invalid request header tail (S2 accepts top_p, pen, boost, seqt, seqa, seqg, lp, plp, sys, ins, gram and steer)"),
+            (b"n_gen 9 temp 0 seed 7 min 1 stop - lp 1 boost 1 2 10\n1\n", "invalid request header tail (S2 accepts top_p, pen, boost, seqt, seqa, seqg, lp, plp, sys, tstop, ins, gram and steer)"),
         ] {
             assert_eq!(parse(bad, false, &mut off, &mut no_img).err(), Some(Msg(why)), "{}", String::from_utf8_lossy(bad));
         }
@@ -616,7 +624,7 @@ mod tests {
             (b"n_gen 9 temp 0 seed 7 min 1 stop - pen 2.5 0 0 0 -1\n1\n", "pen: presence and frequency penalties must be in [-2, 2]"),
             (b"n_gen 9 temp 0 seed 7 min 1 stop - pen 0 0 0 -2.5 -1\n1\n", "pen: presence and frequency penalties must be in [-2, 2]"),
             // after lp: the tail
-            (b"n_gen 9 temp 0 seed 7 min 1 stop - lp 2 pen 1 1 0 0 -1\n1\n", "invalid request header tail (S2 accepts top_p, pen, boost, seqt, seqa, seqg, lp, plp, sys, ins, gram and steer)"),
+            (b"n_gen 9 temp 0 seed 7 min 1 stop - lp 2 pen 1 1 0 0 -1\n1\n", "invalid request header tail (S2 accepts top_p, pen, boost, seqt, seqa, seqg, lp, plp, sys, tstop, ins, gram and steer)"),
         ] {
             assert_eq!(parse(bad, false, &mut off, &mut no_img).err(), Some(Msg(why)), "{}", String::from_utf8_lossy(bad));
         }
@@ -645,7 +653,7 @@ mod tests {
         let mut any = |_: &[u8]| -> R<()> { Ok(()) };
         assert_eq!(
             parse(b"n_gen 9 temp 0 seed 7 min 1 stop - img a top_p 0.5\n1\n", false, &mut off, &mut any).err(),
-            Some(Msg("invalid request header tail (S2 accepts top_p, pen, boost, seqt, seqa, seqg, lp, plp, sys, ins, gram and steer)"))
+            Some(Msg("invalid request header tail (S2 accepts top_p, pen, boost, seqt, seqa, seqg, lp, plp, sys, tstop, ins, gram and steer)"))
         );
     }
 

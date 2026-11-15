@@ -37,6 +37,8 @@ struct PrefixReuse
     int lcp = 0;                        // of the last begin(), for the log line
     const char* why = "first";          // last begin(): "hit", or the miss reason first / strict / no-lcp / short / grid
     CacheNamespace cache_namespace{};
+    bool tool_end = false;              // the finished reply ended on one of its request's tool stop ids (s2 retire_run):
+                                        // advice to the head's busy guard (kvman-rs pool.rs Idle), set only at retire
 
     static int common_prefix(const std::vector<int>& a, const std::vector<int>& b)
     {

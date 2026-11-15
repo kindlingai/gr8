@@ -29,7 +29,7 @@ use crate::scheduler::{
     self as sch, Config, Grant, Identity, Key, Request, Run, Shrink, Slot, State, FREE, NOTICE_MAX, PAGE, RETIRING,
 };
 use g6kvman::ffi::Handle;
-use g6kvman::pool::{Namespace, NAMESPACE_BYTES};
+use g6kvman::pool::{Idle, Namespace, NAMESPACE_BYTES};
 use std::collections::BTreeMap;
 use std::ffi::{c_void, CStr};
 use std::io::Write;
@@ -481,8 +481,14 @@ impl Control {
     fn busy_on(&self) -> bool {
         gr8knobs::BUSY_GUARD.get()
     }
-    fn busy_idle_ns(&self) -> i64 {
-        gr8knobs::BUSY_IDLE_SECS.get().saturating_mul(1_000_000_000)
+    fn busy_idle(&self) -> Idle {
+        let ns = |secs: i64| secs.saturating_mul(1_000_000_000);
+        Idle {
+            short_rows: gr8knobs::BUSY_SHORT_TOKENS.get(),
+            short_ns: ns(gr8knobs::BUSY_IDLE_SHORT_SECS.get()),
+            tool_ns: ns(gr8knobs::BUSY_IDLE_TOOL_SECS.get()),
+            finish_ns: ns(gr8knobs::BUSY_IDLE_FINISH_SECS.get()),
+        }
     }
     fn busy_queue_max(&self) -> u32 {
         gr8knobs::BUSY_QUEUE_MAX.get() as u32
@@ -774,7 +780,7 @@ impl Control {
         // session slots is refused at once with the busy answer instead of waiting in silence
         let free = self.c.limit().saturating_sub(self.resident()) as usize;
         if admit::busy_queue_full(self.busy_on(), self.busy_queue_max(), self.queue_len(), free) {
-            self.busy_answer(inn, command.request, queued.id, "intake")?;
+            self.busy_answer(inn, command.request, queued.id, gr8knobs::BUSY_RETRY_AFTER.get() as u64, "intake")?;
             return Ok(());
         }
         // the busy guard's intake refusal (docs/ENV.md GR8_BUSY_*): a fresh arrival whose worst-case grant
@@ -784,11 +790,11 @@ impl Control {
         // (a hook error) keeps the old behaviour: the request queues.
         if self.busy_on() {
             match self.busy_intake(&queued, &ck) {
-                Ok(true) => {
-                    self.busy_answer(inn, command.request, queued.id, "intake")?;
+                Ok(Some(retry)) => {
+                    self.busy_answer(inn, command.request, queued.id, retry, "intake")?;
                     return Ok(());
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(e) => {
                     eline(format!("# s2: request {}: the intake busy view failed, it queues: {e:?}\n", queued.id))
                 }
@@ -818,11 +824,10 @@ impl Control {
     }
 
     // the busy guard's answer to a refused request (docs/ENV.md GR8_BUSY_*): resp.<id> carries the busy end line with
-    // the Retry-After seconds (the shim turns it into HTTP 429 + Retry-After on the front end), the request leaves the
+    // `retry`, the Retry-After seconds (the shim turns it into HTTP 429 + Retry-After on the front end), the request leaves the
     // queue and the control's maps, and the s2 trace records it once. `path` names where the refusal fired ("intake"
     // before the queue, "grant" at the admission's commit); the caller has not granted it.
-    fn busy_answer(&self, inn: &mut Inner, file_id: u64, req_id: u64, path: &str) -> R<()> {
-        let retry = gr8knobs::BUSY_RETRY_AFTER.get();
+    fn busy_answer(&self, inn: &mut Inner, file_id: u64, req_id: u64, retry: u64, path: &str) -> R<()> {
         atomic_file(&self.path(&format!("resp.{file_id}")), format!("end busy -1 0 {retry}\n").as_bytes())?;
         self.queue_cancel(req_id);
         inn.commands.remove(&req_id);
@@ -833,20 +838,20 @@ impl Control {
             if admit::busy_line(inn.busied, req_id) {
                 inn.busied = req_id;
                 let args =
-                    format!("{},{},{}", targ("request", req_id), targ("retry_after", retry as u64), tstr("path", path));
+                    format!("{},{},{}", targ("request", req_id), targ("retry_after", retry), tstr("path", path));
                 t.instant(b"busy", CONTROL, args.as_bytes());
             }
         }
         Ok(())
     }
 
-    // The intake check: Ok(true) when the request is fresh and its grant would evict a live retained run. It makes
+    // The intake check: the Retry-After seconds when the request is fresh and its grant would evict a live retained run. It makes
     // the admission's reads (try_fit, then busy_view) outside a commit, so it records nothing for the observer, and it
     // calls the module's hooks only while the pool retains runs. Only GLM's pool retains runs, and its hooks take the
     // pool's lock for each call.
-    fn busy_intake(&self, queued: &Request, ck: &Checked) -> R<bool> {
+    fn busy_intake(&self, queued: &Request, ck: &Checked) -> R<Option<u64>> {
         if self.pool().lock().kept_runs() == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         let worst = sch::reserve_rows(&self.c, queued).map_err(refused)?;
         let rows = self.admit_rows(queued)?;
@@ -860,10 +865,10 @@ impl Control {
         let mut req = *queued;
         let (_, pre, _) = self.try_fit(&mut req, rows, worst, prompt.as_deref(), &ns, None)?;
         if pre.skip > 0 {
-            return Ok(false); // a turn continuing its own retained run: never refused
+            return Ok(None); // a turn continuing its own retained run: never refused
         }
-        let v = self.pool().lock().busy_view(rows, worst, req.r_rows, self.now_ns(), self.busy_idle_ns());
-        Ok(admit::busy_refuse(true, false, v.live_victims))
+        let v = self.pool().lock().busy_view(rows, worst, req.r_rows, self.now_ns(), &self.busy_idle());
+        Ok(admit::busy_refuse(true, false, v.live_victims).then(|| admit::busy_retry_secs(v.idle_in_ns)))
     }
 
     // inside an admission's commit: queue the ADMITs already written, in cmd order; stop at the first other command (a
@@ -1134,9 +1139,9 @@ impl Control {
                 // request at once with the busy answer instead of evicting it or leaving it queued in silence. A turn
                 // that continues its own retained run (a hit) is never refused: the adoption is not an eviction.
                 if self.busy_on() && pre.skip == 0 {
-                    let v = self.pool().lock().busy_view(rows, worst, r, self.now_ns(), self.busy_idle_ns());
+                    let v = self.pool().lock().busy_view(rows, worst, r, self.now_ns(), &self.busy_idle());
                     if admit::busy_refuse(true, false, v.live_victims) {
-                        self.busy_answer(inn, id, id, "grant")?;
+                        self.busy_answer(inn, id, id, admit::busy_retry_secs(v.idle_in_ns), "grant")?;
                         inn.attempted_head = id;
                         inn.attempted_revision = admit::attempted_revision(st.revision);
                         return Ok(());

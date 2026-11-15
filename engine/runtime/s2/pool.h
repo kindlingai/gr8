@@ -80,8 +80,8 @@ public:
     void retain(const Run& r, const g6rt::PrefixReuse& st) { retain(r, st, st.cache_namespace); }
     void retain(const Run& r, const g6rt::PrefixReuse& st, const g6rt::CacheNamespace& ns) {
         const g6kv_run x = c(r);
-        check(g6kv_retain_namespaced(p_, &x, st.history.data(), st.history.size(), st.valid,
-                                    st.written_end, st.pf_end, ns.data(), ns.size()));
+        check(g6kv_retain_ended(p_, &x, st.history.data(), st.history.size(), st.valid, st.written_end, st.pf_end,
+                                ns.data(), ns.size(), st.tool_end));
     }
     // head, at admission (workers at their grant): the retained run with the longest reusable prefix for `prompt` (limit:
     // rows the prefill may skip) that the request (`rows` now, `worst` at most) can grow from. Ties go to the most recent.

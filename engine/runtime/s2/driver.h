@@ -22,6 +22,7 @@ struct Payload {
     g6rt::steering::Identity steering{};
     g6rt::GrammarSpec gram;
     std::vector<g6rt::ImageIn> images;   // image spans (image_input.h); only on prefilled prompts (Service::images_ok)
+    std::vector<int> tool_stop;          // g6rt::ServeReq::tool_stop
 };
 // One member of a single bounded W pass. Pointers remain valid for Driver::step's synchronous callback.
 struct PrefillPart { const Slot* slot = nullptr; const Payload* payload = nullptr; uint32_t first = 0, rows = 0; };
@@ -283,6 +284,7 @@ public:
     }
     // a live or retiring slot's prompt and the tokens it emitted (prefix reuse history)
     const std::vector<int>& prompt(unsigned slot) const { require(slot < MAX_SESSIONS, "invalid slot"); return m_->payload[slot].prompt; }
+    const std::vector<int>& tool_stop(unsigned slot) const { require(slot < MAX_SESSIONS, "invalid slot"); return m_->payload[slot].tool_stop; }
     std::vector<int> emitted(unsigned slot) const {
         require(slot < MAX_SESSIONS, "invalid slot");
         if (!initialized(slot)) return {};

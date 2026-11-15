@@ -222,6 +222,8 @@ pub struct GenParams {
     pub prompt_logprobs: Option<i64>,
     /// the prompt's system span in tokens (PROTOCOL.md): chat requests only
     pub system_tokens: Option<u64>,
+    /// the stop ids that end a reply on a tool call (PROTOCOL.md `tool_stop_ids`); empty: the field is not sent
+    pub tool_stop_ids: Vec<u32>,
     /// the engine's insert rule (PROTOCOL.md `insert`); only sent when set
     pub insert: Option<InsertRule>,
     /// the reply's grammar (PROTOCOL.md `grammar`); only sent when set, to an engine whose hello says `"grammar": true`
@@ -366,6 +368,16 @@ pub fn generate(id: &str, prompt: &[u32], p: &GenParams) -> Bytes {
         b.extend_from_slice(b",\"system_tokens\":");
         pyjson::int(b, n);
     }
+    if !p.tool_stop_ids.is_empty() {
+        b.extend_from_slice(b",\"tool_stop_ids\":[");
+        for (i, t) in p.tool_stop_ids.iter().enumerate() {
+            if i > 0 {
+                b.push(b',');
+            }
+            pyjson::int(b, *t);
+        }
+        b.push(b']');
+    }
     if let Some(g) = &p.grammar {
         b.extend_from_slice(b",\"grammar\":{\"kind\":");
         pyjson::string(b, g.kind);
@@ -469,6 +481,7 @@ mod tests {
             logprobs: Some(3),
             prompt_logprobs: None,
             system_tokens: Some(2),
+            tool_stop_ids: vec![154829],
             insert: None,
             grammar: None,
             steering_profile: None,
@@ -485,6 +498,7 @@ mod tests {
         assert_eq!(v["temperature"], serde_json::json!(0.0));
         assert_eq!(v["type"], "generate");
         assert_eq!(v["system_tokens"], serde_json::json!(2));
+        assert_eq!(v["tool_stop_ids"], serde_json::json!([154829]));
         let h = r.next().await.unwrap().unwrap();
         let h = head(&h).unwrap();
         assert_eq!((h.kind.as_ref(), h.id.as_deref()), ("cancel", Some("cmpl-1")));

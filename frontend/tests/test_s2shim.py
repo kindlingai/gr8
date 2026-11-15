@@ -111,6 +111,18 @@ class UnitTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 g6s2shim.parse_ready(bad)
 
+    def test_build_request_tool_stop_ids(self):
+        f = {'prompt': [5, 6], 'max_tokens': 4, 'system_tokens': 1, 'tool_stop_ids': [154829],
+             'insert': [{'after_tokens': 0, 'unless_emitted': None, 'tokens': [7]}]}
+        body, err = g6s2shim.build_request(f, 0, tstop=True)
+        self.assertIsNone(err)
+        self.assertIn(b' sys 1 tstop 154829 ins 0:-1:7\n', body)   # the order the engine parses them in
+        # an engine without busy.s2 refuses the field: it never sees it
+        self.assertNotIn(b'tstop', g6s2shim.build_request(f, 0)[0])
+        self.assertNotIn(b'tstop', g6s2shim.build_request({**f, 'tool_stop_ids': []}, 0, tstop=True)[0])
+        for bad in ([-1], [g6s2shim.VOCAB], [True], 5, [1] * 17):
+            self.assertIsNotNone(g6s2shim.build_request({**f, 'tool_stop_ids': bad}, 0, tstop=True)[1], bad)
+
     def test_build_request_images(self):
         import base64
         T = g6s2shim.IMAGE_TOKEN
@@ -800,6 +812,20 @@ class BusyTests(S2Base):
         ids, fin, _ = await c.wait('ok')
         self.assertEqual((len(ids), fin['reason']), (8, 'length'))
         self.assertNotIn('status', fin)
+
+
+class ToolStopTests(S2Base):
+    FAKE = ('--busy-tstop',)
+
+    async def test_the_tool_stop_ids_reach_an_engine_that_wrote_busy_s2(self):
+        c = await self.client()
+        c.send(gen('t', max_tokens=4, stop_ids=[9], tool_stop_ids=[9]))
+        ids, fin, _ = await c.wait('t')
+        self.assertEqual((len(ids), fin['reason']), (4, 'length'))
+        reqs = [f for f in os.listdir(self.dirs[0]) if f.startswith('req.') and not f.endswith('.tmp')]
+        self.assertEqual(len(reqs), 1)
+        with open(os.path.join(self.dirs[0], reqs[0])) as fh:
+            self.assertIn(' tstop 9', fh.readline())
 
 
 class QueueTests(S2Base):

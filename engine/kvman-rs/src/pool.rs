@@ -111,12 +111,37 @@ pub struct Stats {
     pub stalls: u64,
 }
 
-/// busy_view's answer: the retained runs (their ages, oldest first) a reserve on the same state would evict, and how
-/// many of them the caller's clock still counts as live (their last response ended under the guard's idle bound ago).
+/// busy_view's answer: the retained runs (their ages, oldest first) a reserve on the same state would evict, how many
+/// of them the caller's clock still counts as live (their reply ended under their idle bound ago), and the
+/// nanoseconds until the last live one goes idle (0 with none live).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BusyView {
     pub victims: Vec<u64>,
     pub live_victims: u32,
+    pub idle_in_ns: i64,
+}
+
+/// The busy guard's idle bounds, in nanoseconds after a run's retire. A run under `short_rows` valid rows takes
+/// `short_ns` however its reply ended. A longer one takes `tool_ns` when its reply ended on a tool call, else
+/// `finish_ns`. A bound of 0 counts the run idle at once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Idle {
+    pub short_rows: i64,
+    pub short_ns: i64,
+    pub tool_ns: i64,
+    pub finish_ns: i64,
+}
+
+impl Idle {
+    pub fn of(&self, k: &Kept) -> i64 {
+        if i64::from(k.st.valid) < self.short_rows {
+            self.short_ns
+        } else if k.tool {
+            self.tool_ns
+        } else {
+            self.finish_ns
+        }
+    }
 }
 
 /// A retired run: its pages count as free until a reservation evicts it or a hit adopts its start.
@@ -138,6 +163,8 @@ pub struct Kept {
     /// when this process's clock saw the retire, nanoseconds since the pool was built. Advice to the head's busy
     /// guard only (busy_view, called with the caller's clock): never in the digest, and no pool decision reads it.
     pub retired_ns: i64,
+    /// its reply ended on one of the request's tool stop ids. Advice to the busy guard only, as retired_ns.
+    pub tool: bool,
 }
 
 /// Opaque cache identity. STOCK_NAMESPACE (all zero) selects unsteered stock behavior.
@@ -994,11 +1021,11 @@ impl Pool {
     }
 
     /// The busy guard's view of a reserve_r(rows, worst, r) on this state: the retained runs it would evict, oldest
-    /// first, and how many of them retired at most `idle_ns` before `now_ns` (`idle_ns` 0: none). It is a dry run of
+    /// first, and how many of them retired under their `idle` bound before `now_ns`. It is a dry run of
     /// fill_range and evict_for_ids and must pick the same runs (tests/busy.rs). The pool itself never reads a clock,
     /// so every rank's pool stays identical. Where fits_at fails (the head's intake check), the view walks every
     /// retained run and still lacks room.
-    pub fn busy_view(&self, rows: u64, worst: u64, r: u32, now_ns: i64, idle_ns: i64) -> BusyView {
+    pub fn busy_view(&self, rows: u64, worst: u64, r: u32, now_ns: i64, idle: &Idle) -> BusyView {
         let mut victims = Vec::new();
         if let Some(rp) = self.rp_of(r).filter(|&rp| rows != 0 && self.admissible_at(worst, rp)) {
             if !past(worst, rp) {
@@ -1017,9 +1044,13 @@ impl Pool {
                 }
             }
         }
-        let live = |k: &&Kept| idle_ns != 0 && now_ns - k.retired_ns <= idle_ns && victims.contains(&k.age);
-        let live_victims = self.kept.iter().filter(live).count() as u32;
-        BusyView { victims, live_victims }
+        // each live victim's time left until its session goes idle
+        let left = self.kept.iter().filter(|k| victims.contains(&k.age)).filter_map(|k| {
+            let bound = idle.of(k);
+            (bound != 0 && now_ns - k.retired_ns <= bound).then(|| k.retired_ns + bound - now_ns)
+        });
+        let (live_victims, idle_in_ns) = left.fold((0u32, 0i64), |(n, most), ns| (n + 1, most.max(ns)));
+        BusyView { victims, live_victims, idle_in_ns }
     }
 
     // fill_range(need, lo, hi) as a dry run, with kept[..gone] already evicted: the ages of the runs it evicts
@@ -1225,6 +1256,11 @@ impl Pool {
     }
 
     pub fn retain_namespaced(&mut self, r: &Run, st: Finished, namespace: Namespace) -> Result<(), Error> {
+        self.retain_ended(r, st, namespace, false)
+    }
+
+    /// retain_namespaced, with `tool`: the reply ended on one of the request's tool stop ids (Kept::tool).
+    pub fn retain_ended(&mut self, r: &Run, st: Finished, namespace: Namespace, tool: bool) -> Result<(), Error> {
         let (exclusive, hits, span, rp, from) = self.held(r).map(|h| (h.exclusive, h.hits, h.span, h.rp, h.from))?;
         let list = self.remove(r)?;
         if !self.keep || st.valid <= 0 {
@@ -1241,7 +1277,7 @@ impl Pool {
         // for it, and a hit adopts them with the pages (take_hit), or they go when the pool evicts it
         self.age += 1;
         let retired_ns = self.now_ns();
-        self.kept.push(Kept { list, st, age: self.age, exclusive, hits, namespace, rp, from, retired_ns });
+        self.kept.push(Kept { list, st, age: self.age, exclusive, hits, namespace, rp, from, retired_ns, tool });
         Ok(())
     }
 

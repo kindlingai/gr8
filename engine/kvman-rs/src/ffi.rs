@@ -269,15 +269,37 @@ pub unsafe extern "C" fn g6kv_retain_namespaced(
     namespace_: *const u8,
     namespace_bytes: usize,
 ) -> i32 {
+    g6kv_retain_ended(p, r, history, n, valid, written_end, pf_end, namespace_, namespace_bytes, 0)
+}
+
+/// g6kv_retain_namespaced, with `tool` nonzero when the reply ended on one of the request's tool stop ids (the busy
+/// guard's idle bound, Kept::tool).
+///
+/// # Safety
+/// As g6kv_retain_namespaced.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_retain_ended(
+    p: *mut Handle,
+    r: *const Run,
+    history: *const i32,
+    n: usize,
+    valid: i32,
+    written_end: i32,
+    pf_end: i32,
+    namespace_: *const u8,
+    namespace_bytes: usize,
+    tool: i32,
+) -> i32 {
     let Some(namespace) = namespace(namespace_, namespace_bytes) else { return Error::BadArgument.code() };
     let Some(history) = slice(history, n) else { return Error::BadArgument.code() };
     if p.is_null() || r.is_null() {
         return Error::BadArgument.code();
     }
-    code((*p).lock().retain_namespaced(
+    code((*p).lock().retain_ended(
         &*r,
         Finished { history: history.to_vec(), valid, written_end, pf_end },
         namespace,
+        tool != 0,
     ))
 }
 
