@@ -1706,13 +1706,17 @@ int main(int argc, char** argv)
         bc.prefill_min = (uint32_t)pf_min;
         if (pf_min) g6s2::ds41_prefill_lanes(sc, (uint32_t)m.hc_rows, pf_lanes);
         // Bound each prefill quantum while another session decodes. The default quantum remains
-        // unchanged when this knob is zero; the launcher chooses 1024 for DS41 daily serving.
+        // unchanged when this knob is zero; the launcher chooses the serving interleave settings.
         const int64_t decode_pf = knob::s2_decode_pf();
         if (decode_pf) {
             if (decode_pf < 0 || decode_pf % 64 || uint64_t(decode_pf) > sc.prefill_rows)
                 die("DS41: GR8_S2_DECODE_PF must be a multiple of 64 no larger than the prefill width");
             sc.decode_prefill_rows = (uint32_t)decode_pf;
         }
+        static_assert(g6s2::MAX_DECODE_ROUNDS == 64, "GR8_S2_DECODE_ROUNDS takes 0..64 (knobs/serving.yaml)");
+        sc.decode_rounds = (uint32_t)knob::s2_decode_rounds();
+        fprintf(stderr, "# rank %d ds41 s2 interleave: decode_pf %u rows, decode_rounds %u\n",
+                R, sc.decode_prefill_rows, sc.decode_rounds);
         bc.rank = R; bc.ranks = cfg.ips.size(); bc.head_ip = cfg.ips[0];
         bc.directory = s2dir; bc.port = s2port;
         bc.timeout = (unsigned)knob::s2_timeout();
@@ -1790,7 +1794,13 @@ int main(int argc, char** argv)
             die("DS41 v2: the boot's prefill settings differ from the fabric plan's (W, tail, lanes, layer 21)");   // a bug, not a setting
         if (pf_v2) {
             v2engine.boot(m,fabv2,st);
-            fprintf(stderr, "# rank %d GR8_DS_PF_V2=1 own-row conductor W=%d, rangeA=0..20, stock tail=128, dedicated port=%d\n", R, m.hc_rows,cfg.port+104);
+            std::string bf16_tc;
+            for (int mask : v2engine.v.bf16_tc.masks) {
+                if (!bf16_tc.empty()) bf16_tc += ',';
+                bf16_tc += std::to_string(mask);
+            }
+            fprintf(stderr, "# rank %d GR8_DS_PF_V2=1 own-row conductor W=%d, rangeA=0..20, stock tail=128, dedicated port=%d, bf16_tc=%s\n",
+                    R, m.hc_rows, cfg.port+104, bf16_tc.c_str());
         }
         if (pf_min) fprintf(stderr, "# rank %d DS41 prefill bounded replay tail %d (layers >= %d)\n", R, pf_tail, ds41::br::late_layer_start());
         if (pf_min && ds41::br::l20_tail())
