@@ -1769,6 +1769,7 @@ int main(int argc, char** argv)
                 launch_main(k, si.M);   // m.ds_ns > 1 (set by serve_ds41): the ns-session graph
             },
             dsk.on() ? &ds : nullptr};
+        dc.draft_knobs = dsk;
         std::unique_ptr<g6s2::Ds41PrefixCache> ds41_cache;
         if (reuse_prefix) {
             size_t budget_mib = 4096;

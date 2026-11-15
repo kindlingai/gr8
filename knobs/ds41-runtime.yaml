@@ -88,6 +88,17 @@ knobs:
       Temperature of the DSpark confidence head: one positive number for every draft row, or five comma separated, one
       a row. A draft's confidence is the sigmoid of its head score over the temperature. Only GR8_DS_VERIFY_CAP reads
       the confidence; at 1.0 the scores keep their order.
+  GR8_DS_DRAFT_LOG:
+    scope: local
+    kind: flag
+    default: "0"
+    doc: >-
+      Log one bounded DSpark calibration summary per finished request on every rank: verified and accepted drafts,
+      emitted tokens, rows-per-session histogram, cumulative predicted versus realized survival by draft position,
+      and a digest of the executed (session count, rows per session) sequence. Reuses already copied confidence
+      scores; adds no device synchronization. Off by default.
+      Includes host elapsed MAIN time by cohort and rows per session, and draft time, around existing stream fences.
+      Timing values are rank-local diagnostics, not rank-agreement inputs.
   GR8_DS_DEC_STAGE:
     scope: agree
     kind: flag
@@ -413,11 +424,12 @@ knobs:
     scope: local
     kind: int
     default: "0"
-    values: "0..2"
+    values: "0..3"
     doc: >-
       Prints the GPU time of each plan unit (attention, consume, MoE, head, ...) summed over the layers: every eager step,
       and for a captured step graph the mean per step over 16 sampled replays (every 16th replay is read, through
       globaltimer stamps the capture adds around each unit). 2: also one line per unit kind with the time of each layer.
+      3: per-op marks inside each unit (one ops line per layer).
   GR8_DS_STRIPE:
     scope: agree
     kind: flag

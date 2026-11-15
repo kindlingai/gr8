@@ -235,3 +235,9 @@ does not execute a GPU. Live cold/warm output equality, remote service I/O and p
 [KNOWN-ISSUES.md](../KNOWN-ISSUES.md#deepseek-v41-flash) has the open ones: the `./gr8 ds41` route not yet run from a
 clean machine, live validation of tiered KV stores, no JSON-schema masking, recall at 1M tokens, and image requests that hold
 the other chats.
+
+`GR8_DS_DRAFT_LOG=1` enables all-rank, once-per-request DSpark acceptance/calibration summaries (default `0`). They also
+report host elapsed verify time by `(sessions, rows/session)` and draft time around the existing stream fences; logging adds
+no CUDA synchronization and does not change tokens or scheduling. Timings are rank-local diagnostics; compare
+`rps_seq_hash` across ranks. With slot parking on, a request that resumes no parked slot logs one deduplicated
+`# rank R ds41 park_miss slot S lcp N pos P limit L prompt T` line naming the closest parked slot (observation only).

@@ -108,6 +108,10 @@ struct NativeHooks {
     int dfl_kv = 7;
     g6rt::SpecLen dfl_spec;
     s2::DSel dsel;                    // drafter choice (GR8_S2_DSEL)
+    // Optional per-request draft diagnostics. The terminal hook runs once, on every rank.
+    std::function<void(Key, long, int, int, int)> draft_round;
+    std::function<void(Key, unsigned)> draft_emitted;
+    std::function<void(Key)> draft_terminal;
     s2::KStop kstop;                  // solo MTP rounds' draft count (GR8_MTP_KSTOP, GR8_MTP_LPLOG)
     s2::DflReuse dfl_reuse;           // GR8_DFL_REUSE
     s2::NgramSrc ngram;               // GR8_NGRAM: the n-gram table as a draft source (S5, #56)
@@ -399,8 +403,11 @@ public:
         h.run = [&](const s2::Step& step) { return dispatch_.run(step); };
         h.emit = [&](Key k,const int* ids,int n,int row) {
             if (trace_ && n > 0) g6svc_compute_first_token(cmp_.get(), sch::c<g6sch_key>(&k));
-            return sessions_.emit(k,ids,n,row,logprob_);
+            const auto e = sessions_.emit(k,ids,n,row,logprob_);
+            if (native_.draft_emitted) native_.draft_emitted(k, e.count);
+            return e;
         };
+        h.round = native_.draft_round;
         h.prompt = [&](Key k,int M,int pos0) { sessions_.prompt_rows(k,M,pos0,logprob_); };
         h.finished = [&](const Slot& s) { compute_check(g6svc_compute_finished(cmp_.get(), sch::c<g6sch_slot>(&s))); };
         if (m.drained)   // the copies run at a bind, a growth or a retire: all before the next step's round
@@ -413,6 +420,7 @@ public:
                                nullptr, 0};
             g6svc_compute_terminal(cmp_.get(), k.slot, &x);
             sessions_.terminal(k,st);
+            if (native_.draft_terminal) native_.draft_terminal(k);
         };
         if (m.dfl) {
             require(m.dfl_ok && m.dfl_start, "DFlash2 needs dfl_ok, dfl_start and dfl");
