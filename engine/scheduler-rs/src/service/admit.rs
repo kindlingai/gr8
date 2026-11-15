@@ -106,15 +106,6 @@ pub fn busy_line(last: u64, head: u64) -> bool {
     last != head
 }
 
-/// The busy guard's intake decision (docs/ENV.md GR8_BUSY_*): with the guard on, a fresh arrival whose
-/// worst-case grant would evict a live retained run — the pool's busy_view at arrival — is refused at intake, before
-/// it queues, instead of being refused at grant time after its queue wait. The same rule as the grant path
-/// (busy_refuse): a hit continuation is never refused, and no live victim never refuses; the grant path keeps the
-/// check as the backstop, because the pool can change between intake and grant.
-pub fn busy_intake_refuse(guard_on: bool, hit: bool, live_victims: u32) -> bool {
-    busy_refuse(guard_on, hit, live_victims)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,19 +131,6 @@ mod tests {
         assert!(busy_queue_full(true, 8, 8) && busy_queue_full(true, 8, 9));
         assert!(!busy_queue_full(true, 8, 7) && !busy_queue_full(true, 0, 99) && !busy_queue_full(false, 8, 99));
         assert!(busy_line(1, 2) && !busy_line(2, 2));
-    }
-
-    #[test]
-    fn busy_intake_decides_like_the_grant() {
-        // the intake refusal is the grant rule applied at arrival: a fresh arrival with a live victim refuses, a hit
-        // continuation and an all-idle eviction set never do, and the guard off is upstream behaviour
-        assert!(busy_intake_refuse(true, false, 1) && busy_intake_refuse(true, false, 4));
-        assert!(!busy_intake_refuse(true, true, 2) && !busy_intake_refuse(true, false, 0));
-        assert!(!busy_intake_refuse(false, false, 3) && !busy_intake_refuse(false, true, 3));
-        // and it stays the same decision the grant path makes on the same inputs
-        for &(on, hit, v) in &[(true, false, 1), (true, false, 0), (true, true, 2), (false, false, 3)] {
-            assert_eq!(busy_intake_refuse(on, hit, v), busy_refuse(on, hit, v), "intake and grant decide alike");
-        }
     }
 
     #[test]

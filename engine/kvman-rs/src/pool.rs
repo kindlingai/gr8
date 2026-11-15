@@ -993,55 +993,51 @@ impl Pool {
         n <= self.lo_free() as u64 && w <= self.place_online() as u64 && self.safe(Some((n, w)), None)
     }
 
-    /// The busy guard's read-only view: the retained runs a reserve_r(rows, worst, r) on this state would evict (the
-    /// same selection as fill_range/evict_for_ids, as a dry run over no changes), and how many of them are live —
-    /// their retire is `idle_ns` nanoseconds or less before `now_ns` (0 = none are ever live). The head decides a
-    /// busy refusal from this; the pool's own behaviour never reads a clock, so every rank's pool stays identical.
-    /// Call it only where reserve_r would run (fits passed): reserve skips its evictions when fits_at fails.
+    /// The busy guard's view of a reserve_r(rows, worst, r) on this state: the retained runs it would evict, oldest
+    /// first, and how many of them retired at most `idle_ns` before `now_ns` (`idle_ns` 0: none). It is a dry run of
+    /// fill_range and evict_for_ids and must pick the same runs (tests/busy.rs). The pool itself never reads a clock,
+    /// so every rank's pool stays identical. Where fits_at fails (the head's intake check), the view walks every
+    /// retained run and still lacks room.
     pub fn busy_view(&self, rows: u64, worst: u64, r: u32, now_ns: i64, idle_ns: i64) -> BusyView {
-        let mut victims: Vec<u64> = Vec::new();
-        if let Some(rp) = self.rp_of(r) {
-            if rows != 0 && self.admissible_at(worst, rp) {
-                if past(worst, rp) {
-                    if self.nr == 0 {
-                        // an exclusive run takes the whole pool: every retained run goes
-                        victims.extend(self.kept.iter().map(|k| k.age));
-                    } else {
-                        let (main, draft) = self.exclusive_pages(worst, rp);
-                        victims.extend(self.evict_view(main as usize, 0, self.place));
-                        victims.extend(self.evict_view(draft as usize, self.place, self.pages));
-                        if self.window > 0 {
-                            let ids = self.evict_ids_view(draft.div_ceil(self.nr as u64), &victims);
-                            victims.extend(ids);
-                        }
-                    }
-                } else {
-                    victims.extend(self.evict_view(pages_for(rows) as usize, 0, self.place));
+        let mut victims = Vec::new();
+        if let Some(rp) = self.rp_of(r).filter(|&rp| rows != 0 && self.admissible_at(worst, rp)) {
+            if !past(worst, rp) {
+                victims = self.evict_view(pages_for(rows) as usize, 0, self.place, 0);
+            } else if self.nr == 0 {
+                victims = self.kept.iter().map(|k| k.age).collect();
+            } else {
+                let (main, draft) = self.exclusive_pages(worst, rp);
+                victims = self.evict_view(main as usize, 0, self.place, 0);
+                // the drafter's fill walks the runs the main fill left
+                let more = self.evict_view(draft as usize, self.place, self.pages, victims.len());
+                victims.extend(more);
+                if self.window > 0 {
+                    let more = self.evict_ids_view(draft.div_ceil(self.nr as u64), &victims);
+                    victims.extend(more);
                 }
             }
         }
-        let live = |age: u64| {
-            self.kept.iter().find(|k| k.age == age).is_some_and(|k| idle_ns != 0 && now_ns - k.retired_ns <= idle_ns)
-        };
-        let live_victims = victims.iter().filter(|&&a| live(a)).count() as u32;
+        let live = |k: &&Kept| idle_ns != 0 && now_ns - k.retired_ns <= idle_ns && victims.contains(&k.age);
+        let live_victims = self.kept.iter().filter(live).count() as u32;
         BusyView { victims, live_victims }
     }
 
-    /// evict_view: which kept runs a fill_range(need, lo, hi) on this state would evict (its claims walk, oldest
-    /// first), as a dry run. The grant's own adopted pages are the caller's concern (a fresh admission has none).
-    fn evict_view(&self, need: usize, lo: u32, hi: u32) -> Vec<u64> {
+    // fill_range(need, lo, hi) as a dry run, with kept[..gone] already evicted: the ages of the runs it evicts
+    fn evict_view(&self, need: usize, lo: u32, hi: u32, gone: usize) -> Vec<u64> {
         let (lo, hi) = (lo as usize, hi as usize);
+        let left = &self.kept[gone..];
         let mut claims: Vec<u32> = (lo..hi).map(|p| (self.used[p] || !self.online(p as u32)) as u32).collect();
-        for k in &self.kept {
+        for k in left {
             for &p in k.list.iter().filter(|&&p| (p as usize) >= lo && (p as usize) < hi) {
                 claims[p as usize - lo] += 1;
             }
         }
         let mut spare = claims.iter().filter(|&&c| c == 0).count();
         let mut victims = Vec::new();
-        let mut i = 0;
-        while spare < need && i < self.kept.len() {
-            let k = &self.kept[i];
+        for k in left {
+            if spare >= need {
+                break;
+            }
             for &p in k.list.iter().filter(|&&p| (p as usize) >= lo && (p as usize) < hi) {
                 claims[p as usize - lo] -= 1;
                 if claims[p as usize - lo] == 0 {
@@ -1049,29 +1045,21 @@ impl Pool {
                 }
             }
             victims.push(k.age);
-            i += 1;
         }
         victims
     }
 
-    /// evict_ids_view: the kept runs evict_for_ids(need) would take after `gone` (the fills' victims) left, as a dry
-    /// run. ids_free() over kept minus `gone`, then the oldest runs holding records until the need is met.
+    // evict_for_ids(need) as a dry run, with the runs in `gone` already evicted
     fn evict_ids_view(&self, need: u64, gone: &[u64]) -> Vec<u64> {
         let held: u64 = self.held.values().map(|h| self.ids_of(h)).sum();
-        let kept_ids = |ages: &[u64]| {
-            self.kept
-                .iter()
-                .filter(|k| !ages.contains(&k.age))
-                .map(|k| self.kept_ids(k))
-                .sum::<u64>()
-        };
+        let mut gone = gone.to_vec();
         let mut victims = Vec::new();
-        let mut gone: Vec<u64> = gone.to_vec();
-        while self.ids > 0 && (self.ids as u64).saturating_sub(held + kept_ids(&gone)) < need {
-            let Some(i) = self.kept.iter().position(|k| !gone.contains(&k.age) && self.kept_ids(k) > 0) else {
+        loop {
+            let kept: u64 = self.kept.iter().filter(|k| !gone.contains(&k.age)).map(|k| self.kept_ids(k)).sum();
+            if self.ids == 0 || (self.ids as u64).saturating_sub(held + kept) >= need {
                 break;
-            };
-            let k = &self.kept[i];
+            }
+            let Some(k) = self.kept.iter().find(|k| !gone.contains(&k.age) && self.kept_ids(k) > 0) else { break };
             victims.push(k.age);
             gone.push(k.age);
         }

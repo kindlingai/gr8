@@ -74,6 +74,8 @@ class MockEngine:
         self.finished = threading.Event()
         self.tokens = []
         self.finish_on_tokens = False
+        self.busy = None          # Retry-After seconds: refuse every request as the busy guard does
+        self.hold_first = False   # send nothing for a request until its cancel
         self.conn = None
         self.error = None
         self.thread = threading.Thread(target=self.run, daemon=True)
@@ -92,6 +94,12 @@ class MockEngine:
                     msg = json.loads(f.read(struct.unpack('>I', hdr)[0]))
                     if msg['type'] == 'generate':
                         self.requests.put(msg)
+                        if self.busy is not None:
+                            self.send(dict(type='finish', id=msg['id'], reason='error', message='busy',
+                                           status=429, retry_after=self.busy))
+                            continue
+                        if self.hold_first:
+                            continue
                         ids = msg.get('insert', [{}])[0].get('tokens', []) + self.tokens
                         self.send(dict(type='tokens', id=msg['id'], ids=ids))
                         if self.finish_on_tokens:
@@ -346,6 +354,31 @@ class Ds41Api(unittest.TestCase):
         self.assertTrue(f.engine.cancelled.wait(5))
         self.assertFalse(f.engine.finished.is_set())
         f.engine.release_finish.set()
+
+    def test_a_busy_refusal_is_http_429_with_retry_after(self):
+        f = self.front()
+        f.engine.busy = 7
+        for path, body in (('/v1/chat/completions', dict(messages=[{'role': 'user', 'content': 'hi'}], max_tokens=8)),
+                           ('/v1/completions', dict(prompt='x', max_tokens=8))):
+            for stream in (False, True):
+                with self.subTest(path=path, stream=stream):
+                    req = urllib.request.Request(f.url + path, json.dumps(dict(body, stream=stream)).encode(),
+                                                 {'Content-Type': 'application/json'})
+                    with self.assertRaises(urllib.error.HTTPError) as e:
+                        urllib.request.urlopen(req, timeout=10)
+                    self.assertEqual((e.exception.code, e.exception.headers['Retry-After']), (429, '7'))
+                    self.assertEqual(json.loads(e.exception.read())['error']['type'], 'RateLimitError')
+
+    def test_a_stream_dropped_before_its_first_token_cancels_the_engine_request(self):
+        # The stream's response waits for the engine's first frame. A client that leaves before it still cancels.
+        f = self.front()
+        f.engine.hold_first = True
+        body = json.dumps(dict(prompt='x', max_tokens=8, stream=True)).encode()
+        with socket.create_connection(('127.0.0.1', f.port), timeout=5) as s:
+            s.sendall(b'POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n'
+                      b'Content-Length: %d\r\n\r\n' % len(body) + body)
+            f.engine.requests.get(timeout=5)
+        self.assertTrue(f.engine.cancelled.wait(5))
 
 
 if __name__ == '__main__':

@@ -787,6 +787,21 @@ class DeepSeekIdentity(S2Base):
         self.assertFalse(os.path.exists(self.sock))
 
 
+class BusyTests(S2Base):
+    FAKE = ('--busy-max-tokens', '17', '--busy-retry', '9')
+
+    async def test_a_busy_refusal_is_an_error_finish_with_status_429(self):
+        c = await self.client()
+        c.send(gen('b', max_tokens=17))
+        c.send(gen('ok', max_tokens=8))
+        ids, fin, _ = await c.wait('b')
+        self.assertEqual((ids, fin['reason'], fin['status'], fin['retry_after']), ([], 'error', 429, 9))
+        self.assertIn('retry after 9 s', fin['message'])
+        ids, fin, _ = await c.wait('ok')
+        self.assertEqual((len(ids), fin['reason']), (8, 'length'))
+        self.assertNotIn('status', fin)
+
+
 class QueueTests(S2Base):
     FAKE = ('--sessions', '2')
 

@@ -788,7 +788,9 @@ impl Control {
                     return Ok(());
                 }
                 Ok(false) => {}
-                Err(e) => eline(format!("# s2: request {}: the intake busy view failed, it queues: {e:?}\n", queued.id)),
+                Err(e) => {
+                    eline(format!("# s2: request {}: the intake busy view failed, it queues: {e:?}\n", queued.id))
+                }
             }
         }
         if let Some(t) = self.trace() {
@@ -829,24 +831,22 @@ impl Control {
         if let Some(t) = self.trace() {
             if admit::busy_line(inn.busied, req_id) {
                 inn.busied = req_id;
-                let args = format!(
-                    "{},{},{}",
-                    targ("request", req_id),
-                    targ("retry_after", retry as u64),
-                    tstr("path", path)
-                );
+                let args =
+                    format!("{},{},{}", targ("request", req_id), targ("retry_after", retry as u64), tstr("path", path));
                 t.instant(b"busy", CONTROL, args.as_bytes());
             }
         }
         Ok(())
     }
 
-    // The intake-time busy view (docs/ENV.md GR8_BUSY_*): the rows, worst case and R the admission would
-    // compute (try_fit, which also matches the prompt against the retained runs), then the pool's dry run of that
-    // reservation. Ok(true) = the arrival is a fresh request whose grant would evict a live retained run: refuse it
-    // here. Ok(false) = a hit continuation or no live victim: queue it as before. The reads are the ones the
-    // admission attempt itself makes; nothing is reserved and no queue state changes.
+    // The intake check: Ok(true) when the request is fresh and its grant would evict a live retained run. It makes
+    // the admission's reads (try_fit, then busy_view) outside a commit, so it records nothing for the observer, and it
+    // calls the module's hooks only while the pool retains runs. Only GLM's pool retains runs, and its hooks take the
+    // pool's lock for each call.
     fn busy_intake(&self, queued: &Request, ck: &Checked) -> R<bool> {
+        if self.pool().lock().kept_runs() == 0 {
+            return Ok(false);
+        }
         let worst = sch::reserve_rows(&self.c, queued).map_err(refused)?;
         let rows = self.admit_rows(queued)?;
         let ns = cache_namespace(&queued.steering);
@@ -857,12 +857,12 @@ impl Control {
             None
         };
         let mut req = *queued;
-        let (_, pre, _) = self.try_fit(&mut req, rows, worst, prompt.as_deref(), &ns, self.observer())?;
+        let (_, pre, _) = self.try_fit(&mut req, rows, worst, prompt.as_deref(), &ns, None)?;
         if pre.skip > 0 {
-            return Ok(false);   // a turn continuing its own retained run: never refused
+            return Ok(false); // a turn continuing its own retained run: never refused
         }
         let v = self.pool().lock().busy_view(rows, worst, req.r_rows, self.now_ns(), self.busy_idle_ns());
-        Ok(admit::busy_intake_refuse(true, false, v.live_victims))
+        Ok(admit::busy_refuse(true, false, v.live_victims))
     }
 
     // inside an admission's commit: queue the ADMITs already written, in cmd order; stop at the first other command (a
