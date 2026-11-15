@@ -846,6 +846,21 @@ class MaxLenTests(S2Base):
         self.assertEqual((await c.wait('fit'))[1]['reason'], 'length')
 
 
+class CapRowsTests(S2Base):
+    SHIM = ('--cap-rows', '6400')
+
+    async def test_one_request_is_held_to_cap_rows_in_a_larger_pool(self):
+        c = await self.client()
+        self.assertEqual(c.hello['max_model_len'], 6400 - 4)
+        c.send(gen('over', prompt=list(range(6396)), max_tokens=1))
+        _, fin, _ = await c.wait('over')
+        self.assertEqual(fin['reason'], 'error')
+        self.assertIn('too long', fin['message'])
+        self.assertNotIn('6396', self.fake_log())  # refused before an engine request file
+        c.send(gen('fit', prompt=list(range(6395)), max_tokens=1))
+        self.assertEqual((await c.wait('fit'))[1]['reason'], 'length')
+
+
 class PerSlotCapTests(S2Base):
     FAKE = ('--sessions', '2')
     SHIM = ('--sessions', '2', '--capacity-slots', '2')

@@ -654,7 +654,9 @@ class Shim:
     def max_model_len(self):
         # DS41 reserves one fixed CAP slab per session; ready.s2 reports their
         # aggregate pool. Other models share one pool, so capacity_slots=1.
-        room = self.cfg['pool_rows'] // self.a.capacity_slots - self.cfg['guard']
+        # GR8_CAP_TOTAL: the shared pool holds several sessions, one request still at most cap_rows
+        pool = self.cfg['pool_rows'] // self.a.capacity_slots
+        room = (min(pool, self.a.cap_rows) if self.a.cap_rows else pool) - self.cfg['guard']
         return min(self.a.max_model_len, room) if self.a.max_model_len else room
 
     def submit(self, f, writer, mine):
@@ -1002,6 +1004,9 @@ async def main(argv=None):
     ap.add_argument('--sock', default='/run/g6/engine.sock')
     ap.add_argument('--max-model-len', type=int, default=0,
                     help='cap on prompt + max_tokens (0 = pool_rows / capacity_slots - guard, from ready.s2)')
+    ap.add_argument('--cap-rows', type=int, default=0,
+                    help='rows one request may reserve, guard included (the engine\'s --cap); 0 = the pool. Below the '
+                         'pool when GR8_CAP_TOTAL shares it among sessions: the engine fails its epoch on a longer one')
     ap.add_argument('--capacity-slots', type=int, default=1,
                     help='number of fixed per-session capacity slabs in ready.s2 pool_rows (DS41 only; default 1 shared pool)')
     ap.add_argument('--sessions', type=int, default=8,

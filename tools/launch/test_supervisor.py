@@ -442,6 +442,13 @@ class ShimTests(unittest.TestCase):
         a = self.shim_argv('--gr8-model', 'glm53f', '--cap', '1048640', '--max-model-len', '262144')
         self.assertEqual(a[a.index('--max-model-len') + 1], '262144')
 
+    def test_the_shim_holds_one_request_to_cap(self):
+        # GR8_CAP_TOTAL may make the pool larger than --cap; the engine fails its epoch on a longer request
+        a = self.shim_argv('--gr8-model', 'glm53f', '--cap', '131100')
+        self.assertEqual(a[a.index('--cap-rows') + 1], '131072')
+        self.assertNotIn('--cap-rows', self.shim_argv('--gr8-model', 'glm53f'))
+        self.assertNotIn('--cap-rows', self.shim_argv('--gr8-model', 'ds41', '--cap', '262144'))
+
     def test_the_ds41_identity_is_the_engines_own(self):
         geom = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'engine', 'model_geom_ds41.h')).read()
         vocab = int(re.search(r'constexpr int VOCAB = (\d+);', geom).group(1))

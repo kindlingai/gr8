@@ -375,12 +375,18 @@ static size_t scratch_for(int cap)
 {
     return std::max(g6_attn_bind_scratch_need(g6nr::HMIN, cap, MXR, 32), g6_attn_bind_scratch_need(g6nr::HMAX, cap, MXR, 32));
 }
-static std::unique_ptr<Pool> make_pool(Arena& A, const Pack* pk, int rank, int K, int P, void* scr, size_t sb, __half* const* cat)
+// pages > 0 (G6_CP builds): that many physical pages behind the K * P table (g6_attn_bind_create_pages)
+static std::unique_ptr<Pool> make_pool(Arena& A, const Pack* pk, int rank, int K, int P, void* scr, size_t sb, __half* const* cat,
+                                       int pages = 0)
 {
     std::unique_ptr<Pool> pl(new Pool());
     const int cap = K * P * 64;
     for (int l = 0; l < NL; ++l)
     {
+#if defined(G6_CP) && G6_CP
+        if (pages) CKI(g6_attn_bind_create_pages(&pl->ab[l], &pk[l].p, rank, LAYER[l], cap, pages, MXR, 32, ST, scr, sb));
+        else
+#endif
         CKI(g6_attn_bind_create_ext(&pl->ab[l], &pk[l].p, rank, LAYER[l], cap, MXR, 32, ST, scr, sb));
         if (cat) pl->bv[l] = make_view(*pl, A, pl->ab[l], P, cat[l]);
         else
@@ -617,6 +623,66 @@ static void run_rep(const Case& c, uint64_t seed)
             for (int l = 0; l < NL; ++l) ks.need(dev_word(PC->sv[l][slots[j]]->args.error) == 0, "errC");
         }
         report(ks.bad.empty(), "%s, shuffled pages%s", nm, ks.bad.c_str());
+
+#if defined(G6_CP) && G6_CP
+        // E: C's per-session calls on a binding with twice the pages behind the same table (GR8_CAP_TOTAL's drafter):
+        // every run sits in the upper half, past table_size, so each table entry is above it
+        auto PE = make_pool(A, pk, 0, K, P, scr, sb, nullptr, 2 * K * P);
+        const size_t hiK = (size_t)K * P * 64;   // rows below the upper half
+        std::vector<const int*> tabsE((size_t)S2N * NL, nullptr);
+        for (int q = 0; q < K; ++q)
+        {
+            std::vector<int> t(P, -1);
+            for (int i = 0; i < grant[q]; ++i) t[i] = K * P + pm[base[q] + i];
+            const int* dt = A.up(t);
+            for (int l = 0; l < NL; ++l)
+            {
+                PE->sv[l][q]->args.block_table = dt;
+                PE->sv[l][q]->args.index_table = dt;
+                tabsE[(size_t)q * NL + l] = dt;
+            }
+        }
+        for (int l = 0; l < NL; ++l)
+        {
+            CK(cudaMemcpy((char*)PE->ab[l].args.mla_cache + hiK * KV_B, PD->ab[l].args.mla_cache, hiK * KV_B, cudaMemcpyDeviceToDevice));
+            if (l == 0)
+                CK(cudaMemcpy((char*)PE->ab[l].args.index_cache + hiK * IX_B, PD->ab[l].args.index_cache, hiK * IX_B, cudaMemcpyDeviceToDevice));
+        }
+        G6AttnStepCell* cellsE = A.alloc<G6AttnStepCell>((size_t)S2N * NL);
+        G6AttnRow* rowcE = A.alloc<G6AttnRow>((size_t)NL * MXR);
+        for (int l = 0; l < NL; ++l) bc[l].rows = rowcE + (size_t)l * MXR;
+        G6AttnStepCell* cellsEB = A.up(bc);
+        const int** d_tabsE = A.up(tabsE);
+        k_s2_cells<<<1, 128, 0, ST>>>(S2Cells{reinterpret_cast<const uint32_t*>(d_in), cellsE, d_shared, NL, cellsEB, rowcE, d_tabsE, MXR, 2 * K * P});
+        CK(cudaGetLastError());
+        __half* catE[NL];
+        for (int l = 0; l < NL; ++l) catE[l] = A.alloc<__half>((size_t)MXR * heads[l] * 256);
+        std::vector<std::array<G6AttnReplay, NL>> rpE(ns);
+        for (int j = 0; j < ns; ++j)
+            for (int l = 0; l < NL; ++l)
+            {
+                const int q = slots[j];
+                const G6AttnStep st = mkstep(in, l, h.row0[j], h.rows[j], h.ctx[j], heads[l], PE->sv[0][q]->args.indices);
+                memset(&rpE[j][l], 0, sizeof(G6AttnReplay));
+                CKI(g6_attn_bind_replay_init(PE->sv[l][q], &st, cellsE + (size_t)q * NL + l, bucket_of(h.ctx[j], cap), &rpE[j][l], ST));
+            }
+        for (int j = 0; j < ns; ++j)
+            for (int l = 0; l < NL; ++l)
+            {
+                CKI(g6_attn_replay_run(&rpE[j][l], ST));
+                const size_t W = (size_t)heads[l] * 256;
+                CK(cudaMemcpyAsync(catE[l] + (size_t)h.row0[j] * W, PE->sv[l][slots[j]]->args.output, (size_t)h.rows[j] * W * 2, cudaMemcpyDeviceToDevice, ST));
+            }
+        CK(cudaStreamSynchronize(ST));
+        CK(cudaGetLastError());
+        Chk ke;
+        ke.need(PE->ab[0].args.page_count == 2 * K * P && PE->ab[0].args.table_size == K * P, "binding pages");
+        for (int l = 0; l < NL; ++l) ke.rows(catA[l], catE[l], M, (size_t)heads[l] * 256 * 2, "outE" + std::to_string(l));
+        for (int j = 0; j < ns; ++j)
+            for (int l = 0; l < NL; ++l) ke.need(dev_word(PE->sv[l][slots[j]]->args.error) == 0, "errE");
+        report(ke.bad.empty(), "%s, pages past the table%s", nm, ke.bad.c_str());
+        PE->release();
+#endif
     }
 
     // validation of the batched cell: a row at its own context; a repeated position inside one session

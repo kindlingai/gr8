@@ -8,6 +8,15 @@ knobs:
     values: "0..1"
     doc: >-
       Fold the normalized latent Hadamard into release UK and UV weights. Requires int4 KV and BF16 kv_b.
+  GR8_CAP_TOTAL:
+    scope: agree
+    kind: int
+    unset: "--cap"
+    doc: >-
+      The S2 logical page pool in tokens, a multiple of 64 and at least --cap: several sessions of up to --cap tokens
+      share it, while --cap keeps sizing one session's table and the per-request buffers. It sizes the drafter's pages
+      and GR8_RT_STORE's records. Needs GR8_RT_STORE, GR8_RT_LOCAL and GR8_RT_PLACE. For N full sessions: GR8_RT_PLACE x
+      64 + N x (--cap - R).
   GR8_CP:
     scope: agree
     kind: flag

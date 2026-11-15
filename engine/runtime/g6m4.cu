@@ -629,6 +629,9 @@ int main(int argc, char** argv)
     m.wide = wide;
     m.qs.mode = qs_mode;
     m.qs.iq = iq_split;
+    // GR8_CAP_TOTAL: the S2 logical pool in pages (pool_pages > cap / 64 = several sessions of up to --cap share it);
+    // total_place is the place it was checked against, which the pool must have too
+    int pool_pages = cap / 64, total_place = -1;
 #if defined(G6_CP) && G6_CP
     m.cp.on = cp_on; m.cp.R = cp_R; m.cp.R2 = cp_R2; m.cp.s3 = cp_s3; m.cp.colls = cp_colls;
     if (const auto place = knob::rt_place())
@@ -638,6 +641,28 @@ int main(int argc, char** argv)
         if (R == 0) fprintf(stderr, "# rank 0: GR8_RT_PLACE: %d physical pages per rank for the main model (--cap %d is the logical length)\n", m.cp.phys, cap);
     }
 #endif
+    if (const auto total = knob::cap_total())
+    {
+#if !(defined(G6_CP) && G6_CP) || G6_MODEL_FLASH || G6_MODEL_DS41
+        die("GR8_CAP_TOTAL is GLM-5.3 with GR8_CP only");
+#else
+        const std::string e = "GR8_CAP_TOTAL " + std::to_string(*total);
+        if (*total % 64 || *total < cap) die(e + ": a multiple of 64, at least --cap " + std::to_string(cap));
+        if (!s2mode || !cp_on || !knob::rt_store() || !rt_win || !m.cp.phys)
+            die(e + ": needs S2, GR8_CP, GR8_RT_STORE, GR8_RT_LOCAL and GR8_RT_PLACE (KV_ROWS with local= and place=)");
+        pool_pages = (int)(*total / 64);
+        // place as the record ids compute it below (every rank alike)
+        const int rp = cp_R / 64, table = cap / 64, fair = rp + (table - rp) / g6nr::NR, rmin = (cp_R2 ? cp_R2 : cp_R) / 64;
+        total_place = std::min(fair, m.cp.phys);
+        const int one = table - rmin;   // the drafter pages of one full session at the smallest R
+        if (pool_pages - total_place < one)
+            die(e + ": the pages above place (" + std::to_string(pool_pages - total_place) + ") hold less than one full session's tail (" +
+                std::to_string(one) + "); at least " + std::to_string((total_place + one) * 64));
+        if (R == 0)
+            fprintf(stderr, "# rank 0: GR8_CAP_TOTAL: a pool of %d pages (%lld tokens), place %d; %d session(s) of --cap %d fit above place\n",
+                    pool_pages, (long long)*total, total_place, (pool_pages - total_place) / one, cap);
+#endif
+    }
     host_reclaim(R, "after the pack");         // the loaders keep no page cache; this trims the heap they freed
     boot("pack loaded");
 #if G6_MODEL_FLASH
@@ -877,6 +902,9 @@ int main(int argc, char** argv)
         D.d.graph = graph; D.d.in = in_d; D.d.out = out_d;
 #else
         if (mtp_split) { D.d.qs.mode = 1; D.d.qs.iq = true; D.d.qs.eh = true; }   // GR8_MTP_SPLIT: eh_proj, q_a / kv_a / idx, idx_q
+#ifdef DEC_S2
+        if (pool_pages != cap / 64) D.d.kv_pages = pool_pages;   // GR8_CAP_TOTAL: the drafter holds every session's tail
+#endif
         build_draft(D, m, find, cap, fd, dmalloc<u64>(1), st, MP ? pf_attn_rows(MP) : MX);
         if (D.d.qs.on())
         {
@@ -961,7 +989,7 @@ int main(int argc, char** argv)
                 // place as every rank computes it (the tail split differs by a page between ranks): the ids, and so the
                 // pool's digest, must agree
                 const int rp = cp_R / 64, fair = rp + (a0.table_size - rp) / g6nr::NR, place = m.cp.phys ? std::min(fair, m.cp.phys) : fair;
-                ids = (a0.table_size - place + g6nr::NR - 1) / g6nr::NR + s2sess;
+                ids = (std::max(a0.table_size, pool_pages) - place + g6nr::NR - 1) / g6nr::NR + s2sess;   // GR8_CAP_TOTAL: the pool's
                 const int need = 2 * ((MP + 63) / 64 + g6nr::NR - 1) / g6nr::NR + 2;   // a two-lane quantum's pages per rank, its partial ones, a decode page
                 if (rt_win < need) die("GR8_RT_LOCAL " + std::to_string(rt_win) + ": a prefill quantum of --prefill " + std::to_string(MP) +
                                          " rows needs at least " + std::to_string(need) + " window pages");
@@ -983,6 +1011,10 @@ int main(int argc, char** argv)
             rtt = rt_build(m, *rs, std::string("g6m4-") + rt_name_part(host) + "-" + std::to_string(s2epoch) + "-rt-" + tag + (rt_win ? "-rel" : ""),
                            layout + (rt_win ? " released" : ""), L, S, rt_win, ids, rt_win ? rt_rows : 1, false, int4,
                            knob::rt_check(), st);
+            // GR8_RT_SIZE lowers the ids silently; with GR8_CAP_TOTAL that would leave the pool's tails without records
+            if (total_place >= 0 && rtt->V < ids)
+                die("GR8_CAP_TOTAL needs " + std::to_string(ids) + " record ids a rank, the lease (KV_ROWS size=) gives " +
+                    std::to_string(rtt->V) + ": raise size= by " + std::to_string(ids - rtt->V) + " pages of records");
         }
         s2_init(m, s2sess, st);
         s2_init(D.d, s2sess, st);
@@ -2228,10 +2260,12 @@ int main(int argc, char** argv)
     if (s2mode)
     {
         // S2 below R served loop. Pool: logical capacity = cap (a past-R request alone at base 0 reads the table as
-        // built), runs below R placed in the physical pages every rank and model has.
+        // built), runs below R placed in the physical pages every rank and model has. GR8_CAP_TOTAL makes it larger, with
+        // page classes only: each run past R then has its own list, and its table maps its own logical pages.
         g6s2::Config sc;
         sc.epoch = s2epoch;
-        sc.pool_rows = (uint32_t)(cap / 64 * 64);
+        sc.pool_rows = (uint32_t)pool_pages * 64;
+        if (pool_pages != cap / 64) sc.cap_rows = (uint32_t)(cap / 64 * 64);   // GR8_CAP_TOTAL: one request still fits one table
         // one step bounds: a round (every session's mtp + 1 rows), a prompt chunk (sessions.h: chunk <= max_rows) and a
         // DFlash2 verify (dfl_k + 1 rows)
         sc.max_rows = std::min<uint32_t>(MX, std::max<uint32_t>({(uint32_t)s2sess * (uint32_t)(shared_depth + 1), (uint32_t)plan.chunk,
@@ -2271,7 +2305,15 @@ int main(int argc, char** argv)
                         sc.cp_seg ? ", and no session below R (GR8_CP_STEP_SEG)" : "");
         }
         const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
-        g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);
+        g6s2::RunPool pool((uint32_t)pool_pages, (uint32_t)place, (uint32_t)s2_below);
+        if (total_place >= 0)
+        {
+            // the record ids and the pool must see the same place, and the drafter must hold the whole pool
+            if (place != total_place || D.d.s2->pool_pages != pool_pages)
+                die("GR8_CAP_TOTAL: place " + std::to_string(place) + " (checked " + std::to_string(total_place) + "), drafter pages " +
+                    std::to_string(D.d.s2->pool_pages) + " (pool " + std::to_string(pool_pages) + ")");
+            pool.run_limit((uint32_t)(cap / 64));
+        }
         // the pool's R is the CP map's: a run past R takes its own pages — the prefix and its shard below place, the
         // drafter's tail copy above it — instead of the whole pool, and retained runs keep their pages through a long
         // turn. The stores' tail blocks (per_slot) come with --kv-store below.
@@ -2283,7 +2325,7 @@ int main(int argc, char** argv)
             pool.window((uint32_t)rtt->local, (uint32_t)rtt->V, (uint32_t)rt_runs);
             if (R == 0) fprintf(stderr, "# rank 0: GR8_RT_LOCAL: a run past R holds %d prefix + %d window pages below place %d, its whole tail above "
                                         "(%d pages: the longest tail one run can have, %d rows); %d record ids per rank\n", cp_R / 64, rtt->local, place,
-                                cap / 64 - place, (cap / 64 - place) * 64, rtt->V);
+                                pool_pages - place, (std::min(pool_pages - place, cap / 64 - cp_R / 64)) * 64, rtt->V);
         }
         int reuse_grid = 0;
         // the offline loop's rules (prefix_reuse.h), but on by default: the grid rule (exact hits; GR8_REUSE_ALIGN=0 drops it)
@@ -2666,7 +2708,9 @@ int main(int argc, char** argv)
                     const auto [lo, hi, lofree, hifree] = *v;
                     std::string why = "it takes " + std::to_string(lo) + " pages below place (" + std::to_string(lofree) + " free) and its tail of " +
                                       std::to_string(hi) + " above (" + std::to_string(hifree) + " free)";
-                    if (hi > (uint64_t)(cap / 64 - std::min(m.s2->pool_pages, D.d.s2->pool_pages))) why += ": the tail is longer than the drafter class, it never fits";
+                    if (hi > (uint64_t)(std::max(m.s2->pool_pages, D.d.s2->pool_pages) - std::min(m.s2->pool_pages, D.d.s2->pool_pages)))
+                        why += ": the tail is longer than the drafter class, it never fits";
+                    if ((worst + 63) / 64 > (uint64_t)(cap / 64)) why += ": longer than --cap " + std::to_string(cap) + ", it never fits";
                     if ((int)pool.window_runs() >= rt_runs)
                         why += "; the slot pool covers " + std::to_string(rt_runs) + " session(s) past R at once (GR8_RT_POOL), all in use";
                     if (const auto iv = pool.ids_view(worst, r))

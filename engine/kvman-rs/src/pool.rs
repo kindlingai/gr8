@@ -180,6 +180,9 @@ pub struct Pool {
     // with window: the most window runs live at once (the engine's slot pool covers that many sessions' rows of one
     // step), 0 = no limit
     runs: u32,
+    // the most pages one run's worst case may take (one session's page table, --cap / 64), 0 = no limit. A pool larger
+    // than one table (GR8_CAP_TOTAL) needs it: a longer run would get a table that maps only its first pages
+    run_limit: u32,
     version: u32,
     live: u32,
     live_hi: u32, // of live: the pages at or above place (the drafter's tail copies of split runs)
@@ -231,6 +234,7 @@ impl Pool {
             window: 0,
             ids: 0,
             runs: 0,
+            run_limit: 0,
             version: 0,
             live: 0,
             live_hi: 0,
@@ -497,6 +501,25 @@ impl Pool {
         self.ids = ids;
         self.runs = runs;
         Ok(())
+    }
+
+    /// The most pages one run's worst case may take (0 = no limit): one session's page table when the pool is larger.
+    /// Before any reservation.
+    pub fn run_limit(&mut self, pages: u32) -> Result<(), Error> {
+        if self.live != 0 || !self.kept.is_empty() {
+            return Err(Error::BadArgument);
+        }
+        self.run_limit = pages;
+        Ok(())
+    }
+
+    /// The run limit (0 = none).
+    pub fn run_limit_pages(&self) -> u32 {
+        self.run_limit
+    }
+
+    fn over_run_limit(&self, worst: u64) -> bool {
+        self.run_limit > 0 && pages_for(worst) > self.run_limit as u64
     }
 
     /// With window: the window runs live now.
@@ -935,7 +958,7 @@ impl Pool {
 
     fn fits_at(&self, rows: u64, worst: u64, rp: u64) -> bool {
         let (n, w) = (pages_for(rows), pages_for(worst));
-        if rows == 0 || n > w || !self.admissible_at(worst, rp) {
+        if rows == 0 || n > w || !self.admissible_at(worst, rp) || self.over_run_limit(worst) {
             return false;
         }
         if past(worst, rp) {
@@ -1399,6 +1422,9 @@ impl Pool {
         if skip <= 0 || !self.admissible_at(worst, rp) {
             return Err(Error::NoHit);
         }
+        if self.over_run_limit(worst) {
+            return Err(Error::NoRoom);
+        }
         if let Some(t) = from {
             let r = self.take_stored(skip, age, t as usize, rows, worst, rp);
             if r.is_ok() && self.ages_on {
@@ -1497,6 +1523,9 @@ impl Pool {
             h = mix(h, 0x7274_0000_0000_0000 | self.window as u64);   // a pool without the window hashes as before
             h = mix(h, self.ids as u64);
             h = mix(h, self.runs as u64);
+        }
+        if self.run_limit > 0 {
+            h = mix(h, 0x726c_0000_0000_0000 | self.run_limit as u64);   // a pool without the limit hashes as before
         }
         for (p, _) in self.used.iter().enumerate().filter(|(_, &u)| u) {
             h = mix(h, p as u64);
