@@ -24,7 +24,7 @@
 //         ICA planar codes+SF (layers 2, 8, 14, 20), CA rows, shadow KV, C.comp, C.kvs/C.scs, C.ring, hidden states, and next-token logits.
 //   (4) Negative controls: corrupting restored ICA or omitting C.kvs/C.scs at odd p = P - 1 causes immediate state/logit divergence.
 //   (1b) GR8_DS_CACHE_REPLACE (run with it unset and with =0): a request's two entries are siblings and a restore of one frees the
-//       other; a request that restored a request-end entry frees its own prompt-end entry at its end, never another request's
+//       other; eager replacement (GR8_DS_CACHE_DEFER_REPLACE=0) frees its own prompt end at request end, never another request's
 //       prefix entry, other namespace or longer entry; dedup K, budget eviction and an already-evicted sibling stay correct.
 //   (5) --fp4: the same with the GR8_DS_COMP_FP4 layout (C.compq packed rows, ratio-1 layers read S.ca[3], no shadow). Each Part 2 case
 //       prints a DIGEST line (last hidden row hash, greedy tokens); the default run and the --fp4 run must print identical DIGEST lines.
@@ -64,6 +64,7 @@ struct LayerStub {
 };
 
 struct Model {
+    int rank = 0;
     std::vector<LayerStub> layers;
     int* ehist = nullptr;
     Ds41IdxModel* idx_model = nullptr;
@@ -528,11 +529,12 @@ static int run_test() {
                 for (int t = 1; t < 3; ++t) EXPECT(ch.hit_pos[size_t(t)] > 0);
                 if (ch.drops_reasoning) EXPECT(ch.hit_pos[1] == 100 && ch.hit_pos[2] == 100 + 8 + 12);
                 else EXPECT(ch.hit_pos[1] == 100 + 30 && ch.hit_pos[2] == 100 + 30 + 12 + 30);
-                // on: off/tools keep each turn's request end (3), think each turn's prompt end + the last request end (4)
-                EXPECT(live == (on ? (ch.drops_reasoning ? 4u : 3u) : 6u));
+                // Deferred mode also keeps the latest prompt end for off/tools; eager mode drops it after an RE hit.
+                EXPECT(live == (on ? (ch.drops_reasoning || sc.defer_replace_on() ? 4u : 3u) : 6u));
             }
             EXPECT(sc.size() == total && sc.evictions() == 0);
-            EXPECT(sc.replaced() == (on ? 4u : 0u) && sc.siblings() == (on ? 4u : 0u));   // off, tools: 2 + 2 replaced, 1 + 1 siblings; think: 2 siblings
+            EXPECT(sc.replaced() == (on && !sc.defer_replace_on() ? 4u : 0u));
+            EXPECT(sc.siblings() == (on ? (sc.defer_replace_on() ? 6u : 4u) : 0u));
         }
         printf("Part 1b (GR8_DS_CACHE_REPLACE=%d: siblings, replace after a request-end restore, dedup, budget, evicted sibling): PASS\n",
                int(on));

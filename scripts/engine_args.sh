@@ -203,8 +203,9 @@ ds41_defaults() {
   [ "$MTP" = 0 ] || { echo "engine_defaults: MTP=$MTP: DeepSeek-V4.1-Flash-1017 serves with MTP=0 (DSpark serve is not built)" >&2; return 2; }
   # EXACT=1 (exact output): the old prefill stack (layers 0..20 on the range-A path, two lanes, W 4096, GR8_DS_SH_TC unset = 0).
   # The default is the release stack: the v2 sequence-parallel prefill (GR8_DS_PF_V2=1, docs/DEEPSEEK.md), whose tensor-core
-  # shared expert (GR8_DS_SH_TC=1) and v2 BF16 projections (GR8_DS_PF_V2_BF16_TC=7) change the output bits. EXTRA_ENV GR8_DS_PF_V2=0 or GR8_DS_MHC_ROW_SHARD=1 (the 1M-context
-  # setup) also selects the old stack; EXTRA_ENV GR8_DS_PF_V2_BF16_TC=0 keeps the stock v2 BF16 projections.
+  # shared expert (GR8_DS_SH_TC=1) changes output bits; v2 BF16 projections stay on the stock reductions (GR8_DS_PF_V2_BF16_TC=0).
+  # EXTRA_ENV GR8_DS_PF_V2=0 or GR8_DS_MHC_ROW_SHARD=1 (the 1M-context setup) selects the old stack;
+  # EXTRA_ENV GR8_DS_PF_V2_BF16_TC=7 opts into tensor-core BF16 projections, which change output bits.
   EXACT=${EXACT:-0}
   case $EXACT in 0|1) ;; *) echo "engine_defaults: EXACT=$EXACT: 0 (the release stack, v2 prefill) or 1 (exact output, the old prefill)" >&2; return 2 ;; esac
   local kv kvs engram=0 prefix=0 pmin=2 dsmtp=5 pw= old=$EXACT w16k=1
@@ -253,11 +254,18 @@ ds41_defaults() {
   # the same values, so the same bytes out: 0 of 75 qeval outputs differ on 2 boot pairs, 2.1-2.9 GiB a box more free at ready
   # (5 x 262,144), a prefix snapshot at about 1M 882 MiB a rank instead of 3,134 (measured), one-chat decode within the
   # boot spread. EXTRA_ENV GR8_DS_COMP_FP4=0 keeps the BF16 rows.
-  # A 1024-row prefill quantum while another chat decodes keeps those chats writing during a long new prompt.
-  # The caller may override it in EXTRA_ENV or with S2_DECODE_PF; do not exceed a smaller requested W.
-  local dpf=${S2_DECODE_PF:-$((pmin == 0 ? 0 : (pw < 1024 ? pw : 1024)))}
+  # A 4096-row prefill quantum with 16 decode rounds keeps chats writing during a long new prompt.
+  # The caller may override either in EXTRA_ENV or with S2_DECODE_PF / S2_DECODE_ROUNDS; cap the quantum at W.
+  local dpf=${S2_DECODE_PF:-$((pmin == 0 ? 0 : (pw < 4096 ? pw : 4096)))}
+  local effective_dpf=$dpf rounds=
+  for kv in ${kvs[@]+"${kvs[@]}"}; do
+    case $kv in GR8_S2_DECODE_PF=*) effective_dpf=${kv#*=} ;; esac
+  done
+  # No implicit decode burst when interleaving is disabled. An explicit rounds setting still wins.
+  if [ -n "${S2_DECODE_ROUNDS:-}" ]; then rounds=GR8_S2_DECODE_ROUNDS=$S2_DECODE_ROUNDS
+  elif [ "${effective_dpf:-0}" -gt 0 ]; then rounds=GR8_S2_DECODE_ROUNDS=16; fi
   # The prefill stack: 12,288-row v2 default, layer-20 bounded-replay tail hoist, direct quarter publish / dual unpack, and
-  # BF16 tensor-core router, ratio-2 compressor and indexer/cmp_wkv projections (GR8_DS_PF_V2_BF16_TC=7).
+  # stock BF16 router, ratio-2 compressor and indexer/cmp_wkv reductions (GR8_DS_PF_V2_BF16_TC=0).
   # The release stack (default): v2 for layers 0..20 of a W-row chunk on one lane with the 128-row late
   # tail, the tensor-core shared expert v2's FFN reads, v2's own-row gate, its two-rail stripe at 1 MiB and its pipelined
   # attention core; Engram's pread pool at 64 threads (where io_uring is denied); the persistent attention GEMM tile; S2
@@ -268,7 +276,7 @@ ds41_defaults() {
   else
     pfs="GR8_DS_PF_V2=1 GR8_DS_PF_LANES=1 GR8_DS_PF_TAIL=128 GR8_DS_SH_TC=1 GR8_DS_PF_V2_GATE_RO=1 GR8_DS_PF_V2_STRIPE_MIN=1048576"
     pfs="$pfs GR8_DS_PF_V2_ATTN_PIPE=1 GR8_DS_ENGRAM_IO_THREADS=64 GR8_DS_ATTN_TC_TILE=2 GR8_S2_ADMIT_HOLD=${S2_ADMIT_HOLD:-1} GR8_S2_TAIL_FIRST=1"
-    pfs="$pfs GR8_DS_PF_V2_L20_TAIL=1 GR8_DS_PF_V2_SEND_FFN_OPT=3 GR8_DS_PF_V2_BF16_TC=7"
+    pfs="$pfs GR8_DS_PF_V2_L20_TAIL=1 GR8_DS_PF_V2_SEND_FFN_OPT=3 GR8_DS_PF_V2_BF16_TC=0"
     [ "$pw" -gt 8192 ] && pfs="$pfs GR8_DS_PF_V2_W16K=1"
   fi
   # Park finished chats in their session slots instead of copying their state through the prefix cache.
@@ -285,7 +293,7 @@ ds41_defaults() {
   if [ "$REUSE" = 1 ] && [ "$SESS" -ge 2 ] && [ "$cache_mib_zero" = 0 ]; then park=GR8_DS_PARK=1; fi
   DS41_TUNED=
   for kv in GR8_DS_MTP=5 GR8_DS_ENGRAM_MTP=1 GR8_DS_PREFILL_MIN=2 GR8_DS_PREFILL_W=$pw GR8_DS_ATTN_PW=$pw GR8_DS41_IDX_PW=$pw GR8_S2_DECODE_PF=$dpf \
-      $pfs GR8_DS_PF_RS=1 GR8_DS_PF_DIRECT=1 GR8_DS_PF_GATHER=1 GR8_DS_PF_LATE_FINAL=1 GR8_DS_WAIT_K=2 GR8_DS_DEC_STAGE=1 \
+      $rounds $pfs GR8_DS_PF_RS=1 GR8_DS_PF_DIRECT=1 GR8_DS_PF_GATHER=1 GR8_DS_PF_LATE_FINAL=1 GR8_DS_WAIT_K=2 GR8_DS_DEC_STAGE=1 \
       GR8_DS_ATTN_CPA=1 GR8_DS_DSP_GV=1 GR8_DS_RO_ORDER=1 GR8_DS_GATE_RO=1 GR8_DS_ENGRAM_LOOKAHEAD=1 GR8_DS_ATTN_TC=1 \
       GR8_DS_MOE_TC=1 GR8_DS_PF_POOL=4 GR8_DS_SRC_FAST=3 GR8_DS_MOE_PDL=1 GR8_DS41_ADMIT_KEEP_SCRATCH=1 GR8_DS41_PUB16=1 \
       GR8_DS41_GV_QUAD=1 GR8_DS_COMP_FP4=1 $park; do

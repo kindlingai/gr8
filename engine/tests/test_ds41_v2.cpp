@@ -70,6 +70,21 @@ int main() {
         for (int s = 1; s < 4; ++s)
             assert(w.offsets[s] >= w.offsets[s-1] + Q*segments[s-1].row_bytes);
     }
+    for (int Q : {1,17,2048,3072,4096}) for (int mode : {0,1,2}) {
+        const size_t bytes[] = {3584,4608,7680};
+        const auto w=attn_in_wire_layout(Q,mode);
+        assert(w.count==mode+2 && w.payload==bytes[mode]*Q);
+        for(int k=0;k<w.count;++k)assert(w.offsets[k]%16==0);
+        assert(w.payload%16==0 && w.stride%256==0 && w.stride>=w.payload+8);
+    }
+    assert(attn_in_wire_layout(0,0).count==0 && attn_in_wire_layout(1,3).count==0);
+    for(int width=256;width<=16384;width+=256) {
+        g6::FabricConfig base; base.ips={"1","2","3","4"};
+        const auto cfg=fabric_config(base,width,5120,4*5120*4+48*4+5120*2,6352);
+        g6::FabricDev d{}; assert(g6::fab_slot_layout(cfg,int(Coll::Count),&d));
+        for(int mode : {0,1,2})
+            assert(attn_in_wire_layout((width+3)/4,mode).payload+8<=g6::fab_slot_stride(d,int(Coll::AttnIn)));
+    }
     assert(wire_layout(0,segments,4).count == 0);
     assert(wire_layout(1,segments,9).count == 0);
     for (int flags = 0; flags < 16; ++flags) {

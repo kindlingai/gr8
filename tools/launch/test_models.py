@@ -433,9 +433,9 @@ class Ds41Tests(unittest.TestCase):
         self.assertIn('DeepSeek-V4.1 engine variables', str(e.exception))
 
     # the release stack's prefill words (docs/DEEPSEEK.md): the plain default; the fast decode words stay out
-    V2 = ('GR8_DS_PF_V2_L20_TAIL=1', 'GR8_DS_PF_V2_SEND_FFN_OPT=3', 'GR8_DS_PF_V2_BF16_TC=7', 'GR8_DS_PF_V2_W16K=1', 'GR8_DS_PF_V2=1', 'GR8_DS_PF_LANES=1', 'GR8_DS_PF_TAIL=128', 'GR8_DS_SH_TC=1', 'GR8_DS_PREFILL_W=12288', 'GR8_DS_ATTN_PW=12288',
+    V2 = ('GR8_DS_PF_V2_L20_TAIL=1', 'GR8_DS_PF_V2_SEND_FFN_OPT=3', 'GR8_DS_PF_V2_BF16_TC=0', 'GR8_DS_PF_V2_W16K=1', 'GR8_DS_PF_V2=1', 'GR8_DS_PF_LANES=1', 'GR8_DS_PF_TAIL=128', 'GR8_DS_SH_TC=1', 'GR8_DS_PREFILL_W=12288', 'GR8_DS_ATTN_PW=12288',
           'GR8_DS41_IDX_PW=12288', 'GR8_DS_PF_V2_GATE_RO=1', 'GR8_DS_PF_V2_STRIPE_MIN=1048576', 'GR8_DS_PF_V2_ATTN_PIPE=1',
-          'GR8_DS_ENGRAM_IO_THREADS=64', 'GR8_DS_ATTN_TC_TILE=2', 'GR8_S2_ADMIT_HOLD=1', 'GR8_S2_TAIL_FIRST=1', 'GR8_S2_DECODE_PF=1024')
+          'GR8_DS_ENGRAM_IO_THREADS=64', 'GR8_DS_ATTN_TC_TILE=2', 'GR8_S2_ADMIT_HOLD=1', 'GR8_S2_TAIL_FIRST=1', 'GR8_S2_DECODE_PF=4096', 'GR8_S2_DECODE_ROUNDS=16')
     FAST = ('GR8_DS_RELAXED_ACCEPT', 'GR8_DS_MOE_TOPK_DECODE', 'GR8_DS41_HEAD_MX', 'GR8_DS_ATTN_TC_MF')
 
     def test_the_default_prefill_is_the_release_stack(self):
@@ -454,9 +454,9 @@ class Ds41Tests(unittest.TestCase):
             if override.endswith('W16K=0'):
                 self.assertEqual(env.count(override), 1)
 
-    def test_v2_bf16_tc_rollback(self):
-        env = opt.engine_plan(ds41('--extra-env', 'GR8_DS_PF_V2_BF16_TC=0'))['env']
-        self.assertEqual([w for w in env if w.startswith('GR8_DS_PF_V2_BF16_TC=')], ['GR8_DS_PF_V2_BF16_TC=0'])
+    def test_v2_bf16_tc_opt_in(self):
+        env = opt.engine_plan(ds41('--extra-env', 'GR8_DS_PF_V2_BF16_TC=7'))['env']
+        self.assertEqual([w for w in env if w.startswith('GR8_DS_PF_V2_BF16_TC=')], ['GR8_DS_PF_V2_BF16_TC=7'])
         self.assertIn('GR8_DS_PF_V2=1', env)
         self.assertIn('GR8_DS_PREFILL_W=12288', env)
         for argv in (('--exact', '1'), ('--extra-env', 'GR8_DS_PF_V2=0'), ('--extra-env', 'GR8_DS_MHC_ROW_SHARD=1')):
@@ -467,7 +467,7 @@ class Ds41Tests(unittest.TestCase):
         # EXACT=1, EXTRA_ENV GR8_DS_PF_V2=0 and the 1M-context row split: today's stack, two lanes, W 4096, no v2 word
         for argv in (('--exact', '1'), ('--extra-env', 'GR8_DS_PF_V2=0'), ('--extra-env', 'GR8_DS_MHC_ROW_SHARD=1')):
             env = opt.engine_plan(ds41(*argv))['env']
-            for e in ('GR8_DS_PF_LANES=2', 'GR8_DS_PREFILL_W=4096', 'GR8_DS_ATTN_PW=4096', 'GR8_DS41_IDX_PW=4096', 'GR8_S2_DECODE_PF=1024'):
+            for e in ('GR8_DS_PF_LANES=2', 'GR8_DS_PREFILL_W=4096', 'GR8_DS_ATTN_PW=4096', 'GR8_DS41_IDX_PW=4096', 'GR8_S2_DECODE_PF=4096', 'GR8_S2_DECODE_ROUNDS=16'):
                 self.assertIn(e, env)
             for w in ('GR8_DS_PF_V2=1', 'GR8_DS_SH_TC', 'GR8_DS_PF_TAIL', 'GR8_DS_PF_V2_', 'GR8_S2_TAIL_FIRST', 'GR8_S2_ADMIT_HOLD',
                       'GR8_DS_ATTN_TC_TILE', 'GR8_DS_ENGRAM_IO_THREADS'):
@@ -476,7 +476,7 @@ class Ds41Tests(unittest.TestCase):
         exact = [e for e in opt.engine_plan(ds41('--exact', '1'))['env']]
         default = [e for e in opt.engine_plan(ds41())['env'] if not e.startswith(tuple(v.split('=')[0] + '=' for v in self.V2))]
         self.assertEqual([e for e in exact if not e.startswith(('GR8_DS_PF_LANES=', 'GR8_DS_PREFILL_W=', 'GR8_DS_ATTN_PW=',
-                                                                'GR8_DS41_IDX_PW=', 'GR8_S2_DECODE_PF='))], default)
+                                                                'GR8_DS41_IDX_PW=', 'GR8_S2_DECODE_PF=', 'GR8_S2_DECODE_ROUNDS='))], default)
         # an EXTRA_ENV word keeps its value; W follows it on either stack
         env = opt.engine_plan(ds41('--extra-env', 'GR8_DS_PREFILL_W=4096'))['env']
         self.assertIn('GR8_DS_PF_V2=1', env)
@@ -499,7 +499,7 @@ class Ds41Tests(unittest.TestCase):
         self.assertEqual((plan['knobs']['MTP'], plan['knobs']['SESS'], plan['knobs']['CAP']), ('0', '5', '262144'))
         for e in ('GR8_CP=0', 'GR8_DEC_BK=262144', 'GR8_DS_MTP=5', 'GR8_DS_PREFILL_W=12288', 'GR8_DS_ATTN_PW=12288', 'GR8_DS_PF_LANES=1', 'GR8_DS_ATTN_TC=1', 'GR8_DS_MOE_TC=1',
                   'GR8_DS_PF_POOL=4', 'GR8_DS_SRC_FAST=3', 'GR8_DS_MOE_PDL=1', 'GR8_DS41_ADMIT_KEEP_SCRATCH=1', 'GR8_DS41_PUB16=1',
-                  'GR8_DS41_GV_QUAD=1', 'GR8_S2_DECODE_PF=1024', 'GR8_DS_COMP_FP4=1'):
+                  'GR8_DS41_GV_QUAD=1', 'GR8_S2_DECODE_PF=4096', 'GR8_S2_DECODE_ROUNDS=16', 'GR8_DS_COMP_FP4=1'):
             self.assertIn(e, plan['env'])
         self.assertFalse([e for e in plan['env'] if 'PF_STAGE_ASYNC' in e])   # none of the GLM or Flash prefill stack
         self.assertEqual(plan['args'][plan['args'].index('--s2-sessions') + 1], '5')
@@ -527,6 +527,26 @@ class Ds41Tests(unittest.TestCase):
         self.assertIn('GR8_S2_DECODE_PF=512', plan['env'])
         plan = opt.engine_plan(ds41('--sess', '1', '--extra-env', 'GR8_DS_PREFILL_MIN=0'))
         self.assertIn('GR8_S2_DECODE_PF=0', plan['env'])
+
+    def test_ds41_decode_rounds_overrides_and_disabled_quantum(self):
+        for argv in (('--s2-decode-rounds', '8'), ('--extra-env', 'GR8_S2_DECODE_ROUNDS=8')):
+            env = opt.engine_plan(ds41(*argv))['env']
+            self.assertEqual([w for w in env if w.startswith('GR8_S2_DECODE_ROUNDS=')], ['GR8_S2_DECODE_ROUNDS=8'])
+        env = opt.engine_plan(ds41('--s2-decode-rounds', '8', '--extra-env', 'GR8_S2_DECODE_ROUNDS=0'))['env']
+        self.assertEqual([w for w in env if w.startswith('GR8_S2_DECODE_ROUNDS=')], ['GR8_S2_DECODE_ROUNDS=0'])
+        for argv in (('--s2-decode-pf', '0'), ('--extra-env', 'GR8_S2_DECODE_PF=0'),
+                     ('--s2-decode-pf', '4096', '--extra-env', 'GR8_S2_DECODE_PF=0'),
+                     ('--sess', '1', '--extra-env', 'GR8_DS_PREFILL_MIN=0')):
+            env = opt.engine_plan(ds41(*argv))['env']
+            self.assertEqual([w for w in env if w.startswith('GR8_S2_DECODE_PF=')], ['GR8_S2_DECODE_PF=0'])
+            self.assertFalse([w for w in env if w.startswith('GR8_S2_DECODE_ROUNDS=')], argv)
+        for argv in (('--s2-decode-pf', '0', '--s2-decode-rounds', '8'),
+                     ('--extra-env', 'GR8_S2_DECODE_PF=0 GR8_S2_DECODE_ROUNDS=8')):
+            env = opt.engine_plan(ds41(*argv))['env']
+            self.assertEqual([w for w in env if w.startswith('GR8_S2_DECODE_ROUNDS=')], ['GR8_S2_DECODE_ROUNDS=8'])
+        env = opt.engine_plan(ds41('--s2-decode-pf', '0', '--extra-env', 'GR8_S2_DECODE_PF=512'))['env']
+        self.assertIn('GR8_S2_DECODE_PF=512', env)
+        self.assertIn('GR8_S2_DECODE_ROUNDS=16', env)
 
 
 class Ds41ReleaseTests(unittest.TestCase):

@@ -13,11 +13,11 @@ knobs:
   GR8_DS_MOE_ELOG:
     scope: local
     kind: flag
-    default: "1"
+    default: "0"
     legacy: ["DS41_MOE_ELOG"]
     doc: >-
       1: every prefill router call (more than 32 rows) writes the distinct experts of each layer to a device ring that
-      the host reads after the chunk. 0: no record is written.
+      the host reads after the chunk. Default 0: no record, host readback or diagnostic stream fence.
   GR8_DS_MOE_FC1BSTG:
     scope: agree
     kind: flag

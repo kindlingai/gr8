@@ -1,5 +1,18 @@
 # Knobs
 
+## DeepSeek prefill diagnostics and attention transport
+
+`GR8_DS_MOE_ELOG` defaults to `0`: no expert-count record, host readback or diagnostic stream fence.
+Set `GR8_DS_MOE_ELOG=1` to enable these diagnostics explicitly. Sequence-parallel prefill now transports
+projected attention inputs losslessly as BF16/FP32; fabric slot capacity is unchanged, but wire payload grows.
+V2 keeps tensor-core index wq_b when `GR8_DS_ATTN_TC=1`; with it off, `GR8_DS41_IDX_WQB_TC` selects a
+full-chunk row threshold (0 keeps the scalar index GEMM). Other tensor-core release defaults are unchanged.
+
+DS41 keeps a prompt-end fallback on every turn when prefix reuse and GR8_DS_CACHE_REPLACE=1 are enabled,
+so a re-tokenized reply or dropped reasoning can reuse that prefix. The next restore or parked resume frees
+its unused sibling; the cache budget still applies. Roll back to eager replacement after a request-end hit
+with --extra-env GR8_DS_CACHE_DEFER_REPLACE=0. This engine knob defaults to 1 and every rank must agree.
+
 The options of `./gr8 glm53`, the launchers in `scripts/` and the build. Each knob has a name
 (`CAP`) and a flag (`--cap`): the flag is the name in lower case with `-` for `_`, except `--s2-port` for `S2PORT` and
 `--work-dir` for `GR8_WORK_DIR`. The engine's own environment and flags are in [docs/SETTINGS.md](docs/SETTINGS.md), and

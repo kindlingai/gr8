@@ -157,11 +157,17 @@ void engram_admission() {
 constexpr int side_rows=193;
 uint8_t code(int row,int cell,int k,int peer) { return uint8_t(16+(row*7+cell*13+k*3+peer*29)%80); }
 uint8_t scale(int local,int k,int peer) { return uint8_t(120+(local+k+peer)%4); }
-void engram_wire_case(int M) {
+void engram_wire_case(int M,bool column_shard=false,int layer=0) {
+    eg::HashParams hp{};
+    for(int e=0;e<2;++e)for(int c=0;c<24;++c){hp.prime[e][c]=17+2*e;hp.offset[e][c]=c*hp.prime[e][c];}
     Arena a; Inputs input; const auto g=geometry(M,4,3);
     const size_t entries=size_t(M)*24;
     auto ids=a.make<uint32_t>(entries); std::vector<uint32_t> host_ids(entries);
-    for(int r=0;r<M;++r)for(int c=0;c<24;++c)host_ids[size_t(r)*24+c]=((r+c)%5)*side_rows+(r*17+c*11)%side_rows;
+    for(int r=0;r<M;++r)for(int c=0;c<24;++c)host_ids[size_t(r)*24+c]=column_shard?hp.offset[layer][c]+(r*17+c*11)%hp.prime[layer][c]:((r+c)%5)*side_rows+(r*17+c*11)%side_rows;
+    if(column_shard)for(int c=0;c<24;++c)for(int r=0;r<M;++r){
+        int owners=0;for(int peer=0;peer<4;++peer)owners+=eg::ColShard::make(hp,layer,peer,4).at(c,host_ids[size_t(r)*24+c])>=0;
+        insist(owners==1,"every column/ID has exactly one owner");
+    }
     put(ids,host_ids); input.add(ids,entries*4);
     auto recv=a.make<uint8_t>(size_t(4)*g.Q*ew::ROW_BYTES);
     {
@@ -169,15 +175,17 @@ void engram_wire_case(int M) {
         auto scales=packing.make<uint8_t>(side_rows*8);
         Bytes host_stage(entries*256),host_scales(side_rows*8),reference(size_t(M)*ew::ROW_BYTES);
         for(int peer=0;peer<4;++peer) {
+            const auto col=column_shard?eg::ColShard::make(hp,layer,peer,4):eg::ColShard{};
+            insist(col.rows<=side_rows,"compact packed scale budget");
             for(int loc=0;loc<side_rows;++loc)for(int k=0;k<8;++k)host_scales[loc*8+k]=scale(loc,k,peer);
-            for(int r=0;r<M;++r)for(int c=0;c<24;++c)for(int k=0;k<256;++k)host_stage[(size_t(r)*24+c)*256+k]=code(r,c,k,peer);
+            for(int r=0;r<M;++r)for(int c=0;c<24;++c)for(int k=0;k<256;++k)host_stage[(size_t(r)*24+c)*256+k]=column_shard&&c%4!=peer?0xa5:code(r,c,k,peer);
             upload(stage,host_stage); upload(scales,host_scales); check(cudaMemset(send,0xd3,reference.size()));
-            ew::pack<<<M,256>>>(ids,stage,scales,peer*side_rows,side_rows,M,send); sync();
+            ew::pack<<<M,256>>>(ids,stage,scales,peer*side_rows,side_rows,col,M,send); sync();
             std::fill(reference.begin(),reference.end(),0);
             for(int r=0;r<M;++r) {
                 uint32_t header[4]={}; uint8_t* row=reference.data()+size_t(r)*ew::ROW_BYTES;
                 for(int c=0;c<24;++c) {
-                    int loc=int(host_ids[size_t(r)*24+c])-peer*side_rows;
+                    int loc=column_shard?int(col.at(c,host_ids[size_t(r)*24+c])):int(host_ids[size_t(r)*24+c])-peer*side_rows;
                     if(loc<0 || loc>=side_rows)continue;
                     ++header[0]; header[1]|=1u<<c;
                     memcpy(row+16+c*264,host_stage.data()+(size_t(r)*24+c)*256,256);
@@ -196,17 +204,19 @@ void engram_wire_case(int M) {
     Bytes expected(size_t(g.Q)*6144*2,0xd3);
     for(int r=0;r<g.owned;++r)for(int c=0;c<24;++c)for(int k=0;k<256;++k) {
         int global=g.row0+r,owner=host_ids[size_t(global)*24+c]/side_rows,local=host_ids[size_t(global)*24+c]%side_rows;
+        if(column_shard){owner=c%4;local=int(eg::ColShard::make(hp,layer,owner,4).at(c,host_ids[size_t(global)*24+c]));}
         uint16_t bits=owner<4?eg::dequant1(code(global,c,k,owner),scale(local,k/32,owner)):0;
         memcpy(expected.data()+((size_t(r)*24+c)*256+k)*2,&bits,2);
     }
     equal(output,expected,"Engram unpack CPU dequant and ragged padding"); input.verify();
-    int cell=0; while(host_ids[size_t(g.row0)*24+cell]/side_rows>=4)++cell;
-    int peer=host_ids[size_t(g.row0)*24+cell]/side_rows;
+    int cell=0; while(!column_shard&&host_ids[size_t(g.row0)*24+cell]/side_rows>=4)++cell;
+    int peer=column_shard?cell%4:host_ids[size_t(g.row0)*24+cell]/side_rows;
     auto location=recv+size_t(peer)*g.Q*ew::ROW_BYTES+16+cell*264;
     auto changed=download(location,1); changed[0]^=0x80; upload(location,changed);
     ew::unpack<<<dim3(g.owned,24),256>>>(recv,g.Q,g.owned,4,output); sync();
     insist(download(output,expected.size())!=expected,"Engram corrupted wire negative control rejected");
     printf("PASS Engram unpack M=%d rank=3 CPU_exact padded_poison negative_control=rejected\n",M);
+    if(column_shard)printf("COL_SHARD_W16K_PASS layer=%d M=%d bit_mismatches=0 poisoned_foreign=PASS padding=PASS negative_control=rejected\n",layer,M);
 }
 } // namespace
 int main() {
@@ -216,5 +226,6 @@ int main() {
     prepare_contract();
     for(int M:{8193,12288,16384}) { route_api(M); wide_ffn(M); }
     engram_admission(); engram_wire_case(16381); engram_wire_case(16384);
+    for(int e=0;e<2;++e)for(int m:{16381,16384})engram_wire_case(m,true,e);
     summary("w16k_actual_api");
 }

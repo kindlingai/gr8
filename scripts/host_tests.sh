@@ -195,6 +195,13 @@ g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -DG6_MODEL_DS41
 # and with the sibling rule off (GR8_DS_CACHE_REPLACE=0, both dedup settings): PARK=1 frees and keeps what PARK=0 does
 GR8_DS_CACHE_REPLACE=0 "$T/ds41_park_evict_test"
 GR8_DS_CACHE_REPLACE=0 GR8_DS_CACHE_DEDUP=0 "$T/ds41_park_evict_test"
+GR8_DS_CACHE_DEFER_REPLACE=0 "$T/ds41_park_evict_test"
+# Multi-turn fallback, tight 32-slot churn and sibling lifecycle in deferred and rollback modes.
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -Wall -Wextra -DG6_MODEL_DS41=1 -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/test_ds41_prefix_cache.cpp" -o "$T/test_ds41_prefix_cache" "$HL" "$KN" -lpthread -ldl -lm
+"$T/test_ds41_prefix_cache"
+GR8_DS_CACHE_DEFER_REPLACE=0 "$T/test_ds41_prefix_cache"
+GR8_DS_CACHE_REPLACE=0 "$T/test_ds41_prefix_cache"
+GR8_DS_CACHE_DEDUP=0 "$T/test_ds41_prefix_cache"
 # the Driver's prefill quanta: the shortest prompt first, owed quanta, decode rounds between them
 g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/driver_prefill_quantum_test.cpp" -o "$T/driver_prefill_quantum_test" "${KNOBS[@]}"
 "$T/driver_prefill_quantum_test" > /dev/null

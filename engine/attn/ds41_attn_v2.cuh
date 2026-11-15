@@ -1,4 +1,4 @@
-// V2 attention kernels: split projection from gr8 PR2, compact FP8 wire, and split
+// V2 attention kernels: split projection from gr8 PR2, lossless input staging, and split
 // wo_a/wo_b. Included only by the attention TU and the local device test.
 #pragma once
 #include "ds41_attn.cuh"
@@ -32,53 +32,6 @@ inline void comp_row_rest(const Weights& W, Cache& C, const Scratch& S, const In
     comp_row_pool(W, C, S, o.ckv, o.csc, n, start, st, dstart);
 }
 
-// Per-row record: K E4M3 codes followed by K/32 E8M0 scales. A rank owns
-// a contiguous row interval; padded suffix records are zero-valued, never cached.
-__global__ void k_pack_input(InputBuf in, uint8_t* wire, int owned, int q, int mode)
-{
-    const int K = input_width(mode), stride = input_stride(mode);
-    const int lane = threadIdx.x & 31;
-    const size_t b = size_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
-    const int r = b / (K / 32), c = (b % (K / 32)) * 32 + lane;
-    if (r >= q) return;
-    float v = 0;
-    if (r < owned) {
-        if (c < QA) v = __bfloat162float(in.qa[size_t(r) * QA + c]);
-        else if (c < QA + HD) v = __bfloat162float(in.kv0[size_t(r) * HD + c - QA]);
-        else if (mode == 1) v = __bfloat162float(in.ckv1[size_t(r) * HD + c - QA - HD]);
-        else if (c < QA + 2 * HD) v = in.ckv[size_t(r) * HD + c - QA - HD];
-        else v = in.csc[size_t(r) * HD + c - QA - 2 * HD];
-    }
-    uint8_t code, exponent;
-    act_quant_lane(v, code, exponent);
-    wire[size_t(r) * stride + c] = code;
-    if (!lane) wire[size_t(r) * stride + K + c / 32] = exponent;
-}
-__global__ void k_unpack_input(const uint8_t* wire, InputBuf out, int rows, int mode)
-{
-    const int K = input_width(mode), stride = input_stride(mode);
-    const size_t x = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (x >= size_t(rows) * K) return;
-    const int r = x / K, c = x % K;
-    const uint8_t* row = wire + size_t(r) * stride;
-    const float v = f_e4m3(row[c]) * f_e8m0(row[K + c / 32]);
-    if (c < QA) out.qa[size_t(r) * QA + c] = __float2bfloat16_rn(v);
-    else if (c < QA + HD) out.kv0[size_t(r) * HD + c - QA] = __float2bfloat16_rn(v);
-    else if (mode == 1) out.ckv1[size_t(r) * HD + c - QA - HD] = __float2bfloat16_rn(v);
-    else if (c < QA + 2 * HD) out.ckv[size_t(r) * HD + c - QA - HD] = v;
-    else out.csc[size_t(r) * HD + c - QA - 2 * HD] = v;
-}
-inline void pack_input(const InputBuf& in, uint8_t* wire, int owned, int q, int mode, cudaStream_t st)
-{
-    // Initialize alignment bytes too: the fixed-size collective reads the full records.
-    cudaMemsetAsync(wire, 0, size_t(q) * input_stride(mode), st);
-    const size_t warps = size_t(q) * input_width(mode) / 32;
-    if (warps) k_pack_input<<<(warps + 7) / 8, 256, 0, st>>>(in, wire, owned, q, mode);
-}
-inline void unpack_input(const uint8_t* wire, const InputBuf& out, int rows, int mode, cudaStream_t st)
-{
-    if (rows) k_unpack_input<<<(size_t(rows) * input_width(mode) + 255) / 256, 256, 0, st>>>(wire, out, rows, mode);
-}
 // attn_out's first half (attn_out_a); the second half runs after the row-owner all-to-all rather than producing a full-M
 // hidden partial.
 inline void output_a(const Weights& W, const Scratch& S, int rows, int heads, cudaStream_t st, const int* pos)

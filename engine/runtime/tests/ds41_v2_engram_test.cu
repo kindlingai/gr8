@@ -55,34 +55,124 @@ __global__ void rank_sum(const bf16* partial,bf16* out,int M){for(size_t i=size_
 __global__ void compare(const bf16* a,const bf16* b,size_t n,unsigned* bad){for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x)if(__bfloat16_as_ushort(a[i])!=__bfloat16_as_ushort(b[i]))atomicAdd(bad,1u);}
 __global__ void guards(const uint8_t* p,size_t n,unsigned* bad){int i=threadIdx.x;if(i<256&&(p[i]!=0xa5||p[256+n+i]!=0xa5))atomicAdd(bad,1u);}
 __global__ void padding(const bf16* p,size_t n,unsigned* bad){for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x)if(__bfloat16_as_ushort(p[i])!=0xa5a5)atomicAdd(bad,1u);}
+// Count the whole fixture, including full real-hash scales, rather than
+// assuming small M implies small memory. No live device footprint exceeds 2 GiB.
+size_t live_bytes=0,peak_bytes=0;
 template<class U>struct Dev{
     U* p;uint8_t* base;size_t n;
-    explicit Dev(size_t nn):n(nn){CK(cudaMalloc(&base,512+n*sizeof(U)));p=reinterpret_cast<U*>(base+256);poison();}
+    explicit Dev(size_t nn):n(nn){live_bytes+=512+n*sizeof(U);CHECK(live_bytes<(2ull<<30));peak_bytes=std::max(peak_bytes,live_bytes);CK(cudaMalloc(&base,512+n*sizeof(U)));p=reinterpret_cast<U*>(base+256);poison();}
     Dev(const Dev&)=delete;Dev& operator=(const Dev&)=delete;
-    ~Dev(){cudaFree(base);}
+    ~Dev(){cudaFree(base);live_bytes-=512+n*sizeof(U);}
     void poison(){CK(cudaMemset(base,0xa5,512+n*sizeof(U)));}
     void check(unsigned* bad){guards<<<1,256>>>(base,n*sizeof(U),bad);}
 };
 void clean(unsigned* bad){CK(cudaMemset(bad,0,sizeof(unsigned)));}
 void good(unsigned* bad){CK(cudaGetLastError());unsigned n=0;CK(cudaMemcpy(&n,bad,4,cudaMemcpyDeviceToHost));if(n){fprintf(stderr,"mismatches=%u\n",n);exit(1);}}
-struct WireCase{
-    int M,Q,mode;Dev<uint32_t> ids;Dev<uint8_t> stage,scales,send,recv;Dev<bf16> partial,dense,own;Dev<unsigned> bad;
-    WireCase(int m,int md):M(m),Q((m+3)/4),mode(md),ids(size_t(m)*24),stage(size_t(m)*E),scales(PART*8),send(size_t(NR)*m*ew::ROW_BYTES),recv(size_t(NR)*Q*ew::ROW_BYTES),partial(size_t(NR)*m*E),dense(size_t(m)*E),own(size_t(Q)*E),bad(1){
-        clean(bad.p);init_ids<<<64,256>>>(ids.p,M,mode);
-        for(int p=0;p<NR;++p){init_stage<<<256,256>>>(stage.p,M,p);init_scales<<<3,256>>>(scales.p,p);
-            ew::pack<<<M,256>>>(ids.p,stage.p,scales.p,FIRST+p*PART,valid(p,mode),M,send.p+size_t(p)*M*ew::ROW_BYTES);
-            verify_wire<<<256,256>>>(send.p+size_t(p)*M*ew::ROW_BYTES,M,p,mode,bad.p);
-            eg::k_dequant<<<dim3(M,3),256>>>(ids.p,stage.p,scales.p,FIRST+p*PART,valid(p,mode),M,partial.p+size_t(p)*M*E);
-        }
-        rank_sum<<<256,256>>>(partial.p,dense.p,M);
-        for(int dst=0;dst<NR;++dst)assemble(dst);
-        ids.check(bad.p);stage.check(bad.p);scales.check(bad.p);send.check(bad.p);recv.check(bad.p);partial.check(bad.p);dense.check(bad.p);own.check(bad.p);good(bad.p);
-        printf("PASS wire M=%d mode=%d: header/count/mask, FP8/scales, foreign-zero, source-major A2A model, stock rank-sum exact, guards\n",M,mode);
+eg::HashParams compact_hash(){
+    eg::HashParams hp{};
+    for(int e=0;e<2;++e)for(int c=0;c<24;++c){hp.prime[e][c]=17+2*e;hp.offset[e][c]=c*hp.prime[e][c];}
+    return hp;
+}
+__host__ __device__ uint32_t column_id(eg::HashParams hp,int e,int r,int c){
+    const uint32_t n=hp.prime[e][c];
+    return hp.offset[e][c]+(r%3==0?0:r%3==1?n-1:hash32(r*24u+c)%n);
+}
+// Eight base-16 digits identify every (rank,column,within-column row). Scales
+// remain finite and nonzero. Foreign stage bytes intentionally remain stale.
+__host__ __device__ uint8_t column_scale(int p,int c,uint32_t row,int b){
+    const uint32_t key=(row<<7)|(uint32_t(c)<<2)|p;
+    return uint8_t(112+((key>>(4*b))&15));
+}
+__global__ void init_column_ids(uint32_t* ids,int M,eg::HashParams hp,int e){
+    for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<M*24;i+=gridDim.x*blockDim.x)ids[i]=column_id(hp,e,i/24,i%24);
+}
+__global__ void init_column_stage(uint8_t* out,int M,int p){
+    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<size_t(M)*E;i+=size_t(gridDim.x)*blockDim.x){
+        int c=(i%E)/256;out[i]=c%NR==p?uint8_t(1+code(i/E,c,i%256,p)%0x6e):0xa5;
     }
-    void assemble(int dst){auto g=ds41::v2::geometry(M,NR,dst);recv.poison();own.poison();
+}
+__global__ void init_column_scales(uint8_t* out,eg::ColShard col,int p){
+    for(int c=p;c<24;c+=NR)for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<size_t(col.count[c])*8;i+=size_t(gridDim.x)*blockDim.x)
+        out[size_t(col.local[c])*8+i]=column_scale(p,c,i/8,i%8);
+}
+__global__ void verify_column_wire(const uint8_t* out,int M,eg::HashParams hp,int e,eg::ColShard col,int p,unsigned* bad){
+    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<size_t(M)*ew::ROW_BYTES;i+=size_t(gridDim.x)*blockDim.x){
+        const int r=i/ew::ROW_BYTES,b=i%ew::ROW_BYTES;uint8_t want=0;
+        if(b<ew::HEADER){const uint32_t h=b<4?6:b<8?(0x111111u<<p):0;want=uint8_t(h>>((b%4)*8));}
+        else{int c=(b-ew::HEADER)/264,k=(b-ew::HEADER)%264;
+            if(c%NR==p)want=k<256?uint8_t(1+code(r,c,k,p)%0x6e):column_scale(p,c,column_id(hp,e,r,c)-col.first[c],k-256);
+        }
+        if(out[i]!=want)atomicAdd(bad,1u);
+    }
+}
+__global__ void legacy_stats(const bf16* got,const bf16* ref,size_t n,unsigned* stats){
+    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x){
+        const int c=(i%E)/256;bool different=__bfloat16_as_ushort(got[i])!=__bfloat16_as_ushort(ref[i]);
+        if(different)atomicAdd(stats,1u);if(different&&c<10)atomicAdd(stats+1,1u);
+        if(c>=10&&__bfloat162float(got[i])!=0.f)atomicAdd(stats+2,1u);
+        if(c>=10&&__bfloat162float(ref[i])!=0.f)atomicOr(stats+3,1u<<c);
+    }
+}
+__global__ void wire_padding(const uint8_t* p,int Q,int owned,unsigned* bad){
+    for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<size_t(NR)*Q*ew::ROW_BYTES;i+=size_t(gridDim.x)*blockDim.x)
+        if((i/ew::ROW_BYTES)%Q>=owned&&p[i]!=0xa5)atomicAdd(bad,1u);
+}
+size_t scale_rows(const eg::HashParams& hp,int e){
+    size_t n=PART;
+    if(e>=0)for(int p=0;p<NR;++p)n=std::max(n,size_t(eg::ColShard::make(hp,e,p,NR).rows));
+    return n;
+}
+struct WireCase{
+    int M,Q,mode,layer;bool real;eg::HashParams hp;
+    Dev<uint32_t> ids;Dev<uint8_t> stage,scales,send,recv;Dev<bf16> partial,dense,own;Dev<unsigned> bad,negative;
+    WireCase(int m,int md,int e=-1,bool actual=false):M(m),Q((m+3)/4),mode(md),layer(e),real(actual),hp(actual?eg::kHashParams:compact_hash()),ids(size_t(m)*24),stage(size_t(m)*E),scales(scale_rows(hp,e)*8),send(size_t(NR)*m*ew::ROW_BYTES),recv(size_t(NR)*Q*ew::ROW_BYTES),partial(size_t(NR)*m*E),dense(size_t(m)*E),own(size_t(Q)*E),bad(1),negative(4){
+        clean(bad.p);
+        if(layer<0)init_ids<<<64,256>>>(ids.p,M,mode);
+        else{
+            init_column_ids<<<64,256>>>(ids.p,M,hp,layer);
+            for(int c=0;c<24;++c)for(int r=0;r<M;++r){int owners=0;
+                for(int p=0;p<NR;++p){auto col=eg::ColShard::make(hp,layer,p,NR);const auto loc=col.at(c,column_id(hp,layer,r,c));
+                    CHECK((loc>=0)==(p==c%NR));if(loc>=0){CHECK(loc<col.rows);++owners;}}
+                CHECK(owners==1);
+            }
+            // Literal old pack mode applied to packed-column inputs. Keep the
+            // descriptor untouched even for real kHashParams: full s8 is below
+            // the test's 2 GiB budget because the real-hash case uses only M33.
+            fill(true);rank_sum<<<256,256>>>(partial.p,dense.p,M);CK(cudaMemset(negative.p,0,16));
+            for(int dst=0;dst<NR;++dst)assemble(dst,true);
+            unsigned n[4];CK(cudaMemcpy(n,negative.p,16,cudaMemcpyDeviceToHost));
+            CHECK(n[0]>0&&n[1]>0&&n[2]==0&&n[3]==0xfffc00u);good(bad.p);
+            printf("LEGACY_COL_SHARD_BUG_REPRODUCED layer=%d M=%d mismatches=%u zero_cols_10_23=1 fixture=%s earlier_mismatches=%u\n",layer,M,n[0],real?"real_hash":"compact",n[1]);
+        }
+        fill(false);rank_sum<<<256,256>>>(partial.p,dense.p,M);
+        for(int dst=0;dst<NR;++dst)assemble(dst);
+        ids.check(bad.p);stage.check(bad.p);scales.check(bad.p);send.check(bad.p);recv.check(bad.p);partial.check(bad.p);dense.check(bad.p);own.check(bad.p);negative.check(bad.p);good(bad.p);
+        if(layer>=0)printf("COL_SHARD_V2_EXACT_PASS layer=%d M=%d bit_mismatches=0 fixture=%s owners=1 columns=24 ranks=4 guards=PASS padding=PASS\n",layer,M,real?"real_hash":"compact");
+        else printf("PASS wire M=%d mode=%d: header/count/mask, FP8/scales, foreign-zero, source-major A2A model, stock rank-sum exact, guards\n",M,mode);
+    }
+    void fill(bool legacy){
+        send.poison();partial.poison();dense.poison();
+        for(int p=0;p<NR;++p){
+            if(layer<0){init_stage<<<256,256>>>(stage.p,M,p);init_scales<<<3,256>>>(scales.p,p);
+                ew::pack<<<M,256>>>(ids.p,stage.p,scales.p,FIRST+p*PART,valid(p,mode),eg::ColShard{},M,send.p+size_t(p)*M*ew::ROW_BYTES);
+                verify_wire<<<256,256>>>(send.p+size_t(p)*M*ew::ROW_BYTES,M,p,mode,bad.p);
+                eg::k_dequant<<<dim3(M,3),256>>>(ids.p,stage.p,scales.p,FIRST+p*PART,valid(p,mode),M,partial.p+size_t(p)*M*E);
+            }else{auto col=eg::ColShard::make(hp,layer,p,NR);
+                init_column_stage<<<256,256>>>(stage.p,M,p);init_column_scales<<<256,256>>>(scales.p,col,p);
+                ew::pack<<<M,256>>>(ids.p,stage.p,scales.p,hp.offset[layer][p],col.rows,legacy?eg::ColShard{}:col,M,send.p+size_t(p)*M*ew::ROW_BYTES);
+                if(!legacy)verify_column_wire<<<256,256>>>(send.p+size_t(p)*M*ew::ROW_BYTES,M,hp,layer,col,p,bad.p);
+                eg::k_dequant_col<<<dim3(M,3),256>>>(ids.p,stage.p,scales.p,col,M,partial.p+size_t(p)*M*E);
+            }
+        }
+    }
+    void assemble(int dst,bool legacy=false){auto g=ds41::v2::geometry(M,NR,dst);recv.poison();own.poison();
         for(int p=0;p<NR;++p)if(g.owned)CK(cudaMemcpyAsync(recv.p+size_t(p)*Q*ew::ROW_BYTES,send.p+(size_t(p)*M+g.row0)*ew::ROW_BYTES,size_t(g.owned)*ew::ROW_BYTES,cudaMemcpyDeviceToDevice));
-        if(g.owned){ew::unpack<<<dim3(g.owned,24),256>>>(recv.p,Q,g.owned,NR,own.p);compare<<<256,256>>>(own.p,dense.p+size_t(g.row0)*E,size_t(g.owned)*E,bad.p);}
+        if(g.owned){ew::unpack<<<dim3(g.owned,24),256>>>(recv.p,Q,g.owned,NR,own.p);
+            if(legacy)legacy_stats<<<256,256>>>(own.p,dense.p+size_t(g.row0)*E,size_t(g.owned)*E,negative.p);
+            else compare<<<256,256>>>(own.p,dense.p+size_t(g.row0)*E,size_t(g.owned)*E,bad.p);
+        }
         padding<<<64,256>>>(own.p+size_t(g.owned)*E,size_t(Q-g.owned)*E,bad.p);
+        wire_padding<<<64,256>>>(recv.p,Q,g.owned,bad.p);
     }
 };
 __global__ void init_weights(uint8_t* w,uint8_t* s){for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<size_t(K)*E;i+=size_t(gridDim.x)*blockDim.x){uint32_t h=hash32(i+113);w[i]=uint8_t(h%0x60|(h&0x80));}for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<K*(E/32);i+=gridDim.x*blockDim.x)s[i]=uint8_t(116+hash32(i)%4);}
@@ -97,16 +187,21 @@ void project(const bf16* x,int M,const uint8_t* w,const uint8_t* sw,uint8_t* a,u
     eg::k_act_quant_rows<<<(M*(E/32)+7)/8,256>>>(x,M,a,sa);
     CHECK(ds41_gemm_mx_tc(a,E,sa,E/32,w,sw,out,K,M,K,E,nullptr)==0);
 }
-void projection_case(int M,const Dev<uint8_t>& w,const Dev<uint8_t>& sw){
-    WireCase c(M,0);Dev<uint8_t> aq(size_t(M)*E),as(size_t(M)*(E/32)),dead(M);Dev<bf16> kv(size_t(M)*K),ownkv(size_t(c.Q)*K),input(size_t(M)*T),trunk(size_t(M)*T),owntrunk(size_t(c.Q)*T);Dev<float> wg(T),inputf(size_t(M)*T),trunkf(size_t(M)*T),ownf(size_t(c.Q)*T);
-    project(c.dense.p,M,w.p,sw.p,aq.p,as.p,kv.p);
+void projection_case(int M,const Dev<uint8_t>& w,const Dev<uint8_t>& sw,int layer=-1,const Dev<uint8_t>* gv=nullptr){
+    WireCase c(M,0,layer);Dev<uint8_t> aq(size_t(M)*E),as(size_t(M)*(E/32)),dead(M);Dev<bf16> kv(size_t(M)*K),ownkv(size_t(c.Q)*K),input(size_t(M)*T),trunk(size_t(M)*T),owntrunk(size_t(c.Q)*T);Dev<float> wg(T),inputf(size_t(M)*T),trunkf(size_t(M)*T),ownf(size_t(c.Q)*T);
+    Dev<uint32_t> xf(E*4);const ds41a::Fp8Mat W{w.p,sw.p,K,E,gv?gv->p:nullptr};
+    auto project_rows=[&](const bf16* x,int rows,bf16* out){
+        if(gv&&M<=eg::kDecodeRows)CHECK(ds41_attn_project(&W,x,rows,out,K,aq.p,as.p,xf.p,nullptr)==0);
+        else project(x,rows,w.p,sw.p,aq.p,as.p,out);
+    };
+    project_rows(c.dense.p,M,kv.p);
     init_trunk<<<256,256>>>(input.p,inputf.p,M,wg.p,dead.p);
     for(bool images:{false,true}){
         CK(cudaMemcpyAsync(trunk.p,input.p,size_t(M)*T*2,cudaMemcpyDeviceToDevice));CK(cudaMemcpyAsync(trunkf.p,inputf.p,size_t(M)*T*4,cudaMemcpyDeviceToDevice));
         if(images){eg::k_gate_dead<<<dim3(M,4),512>>>(trunk.p,kv.p,wg.p,M,dead.p);eg::k_gate_dead<<<dim3(M,4),512>>>(trunkf.p,kv.p,wg.p,M,dead.p);}
         else {eg::k_gate<<<dim3(M,4),512>>>(trunk.p,kv.p,wg.p,M);eg::k_gate<<<dim3(M,4),512>>>(trunkf.p,kv.p,wg.p,M);}
         for(int dst=0;dst<NR;++dst){auto g=ds41::v2::geometry(M,NR,dst);c.assemble(dst);if(!g.owned)continue;
-            project(c.own.p,g.owned,w.p,sw.p,aq.p,as.p,ownkv.p);compare<<<256,256>>>(ownkv.p,kv.p+size_t(g.row0)*K,size_t(g.owned)*K,c.bad.p);
+            project_rows(c.own.p,g.owned,ownkv.p);compare<<<256,256>>>(ownkv.p,kv.p+size_t(g.row0)*K,size_t(g.owned)*K,c.bad.p);
             CK(cudaMemcpyAsync(owntrunk.p,input.p+size_t(g.row0)*T,size_t(g.owned)*T*2,cudaMemcpyDeviceToDevice));CK(cudaMemcpyAsync(ownf.p,inputf.p+size_t(g.row0)*T,size_t(g.owned)*T*4,cudaMemcpyDeviceToDevice));
             if(images){eg::k_gate_dead<<<dim3(g.owned,4),512>>>(owntrunk.p,ownkv.p,wg.p,g.owned,dead.p+g.row0);eg::k_gate_dead<<<dim3(g.owned,4),512>>>(ownf.p,ownkv.p,wg.p,g.owned,dead.p+g.row0);}
             else {eg::k_gate<<<dim3(g.owned,4),512>>>(owntrunk.p,ownkv.p,wg.p,g.owned);eg::k_gate<<<dim3(g.owned,4),512>>>(ownf.p,ownkv.p,wg.p,g.owned);}
@@ -114,7 +209,9 @@ void projection_case(int M,const Dev<uint8_t>& w,const Dev<uint8_t>& sw){
         }
     }
     aq.check(c.bad.p);as.check(c.bad.p);kv.check(c.bad.p);ownkv.check(c.bad.p);input.check(c.bad.p);trunk.check(c.bad.p);owntrunk.check(c.bad.p);inputf.check(c.bad.p);trunkf.check(c.bad.p);ownf.check(c.bad.p);wg.check(c.bad.p);dead.check(c.bad.p);good(c.bad.p);
-    printf("PASS projection M=%d: actual WKV [25600][6144] TC full-vs-owned exact; stock gate float/bf16 text/image exact (not scalar hook dispatch)\n",M);
+    xf.check(c.bad.p);good(c.bad.p);
+    if(layer>=0)printf("COL_SHARD_PROJECTION_PASS layer=%d M=%d family=%s bit_mismatches=0 float_bf16_text_image=PASS\n",layer,M,gv&&M<=eg::kDecodeRows?"GV":"TC");
+    else printf("PASS projection M=%d: actual WKV [25600][6144] TC full-vs-owned exact; stock gate float/bf16 text/image exact (not scalar hook dispatch)\n",M);
 }
 // Same MXFP8 record layout as stock tests/ds41_attn_test.cu, from gr8.
 __global__ void make_gv_records(const uint8_t* codes,const uint8_t* scales,uint8_t* out){
@@ -133,8 +230,8 @@ __global__ void compare_tolerant(const bf16* got,const bf16* ref,size_t n,unsign
         if(!isfinite(a)||!isfinite(b)||d>.008f*(1+fabsf(b))){unsigned nbad=atomicAdd(bad,1u);if(nbad<8)printf("TOL_FAIL i=%llu got=%g ref=%g diff=%g\n",(unsigned long long)i,a,b,d);}
     }
 }
-void dispatch_case(int M,const Dev<uint8_t>& w,const Dev<uint8_t>& sw,const Dev<uint8_t>& gv,bool old_dispatch){
-    WireCase c(M,0);Dev<uint8_t> aq(size_t(M)*E),as(size_t(M)*(E/32)),dead(M);Dev<uint32_t> xf(E*4);Dev<bf16> kv(size_t(M)*K),ownkv(size_t(c.Q)*K),input(size_t(M)*T),trunk(size_t(M)*T),owntrunk(size_t(c.Q)*T);Dev<float> wg(T),inputf(size_t(M)*T),maxerr(2);Dev<unsigned> changed(2);
+void dispatch_case(int M,const Dev<uint8_t>& w,const Dev<uint8_t>& sw,const Dev<uint8_t>& gv,bool old_dispatch,int layer=-1){
+    WireCase c(M,0,layer);Dev<uint8_t> aq(size_t(M)*E),as(size_t(M)*(E/32)),dead(M);Dev<uint32_t> xf(E*4);Dev<bf16> kv(size_t(M)*K),ownkv(size_t(c.Q)*K),input(size_t(M)*T),trunk(size_t(M)*T),owntrunk(size_t(c.Q)*T);Dev<float> wg(T),inputf(size_t(M)*T),maxerr(2);Dev<unsigned> changed(2);
     CK(cudaMemset(changed.p,0,8));CK(cudaMemset(maxerr.p,0,8));
     const ds41a::Fp8Mat W{w.p,sw.p,K,E,gv.p};
     auto dispatch=[&](const bf16* x,int rows,bf16* out){if((old_dispatch?rows:M)>eg::kDecodeRows)project(x,rows,w.p,sw.p,aq.p,as.p,out);else CHECK(ds41_attn_project(&W,x,rows,out,K,aq.p,as.p,xf.p,nullptr)==0);};
@@ -151,16 +248,40 @@ void dispatch_case(int M,const Dev<uint8_t>& w,const Dev<uint8_t>& sw,const Dev<
 }
 // Compile both op_owned instantiations and verify the uninitialized error path.
 // A live Engram object needs production-compatible hash sidecars; not mocked.
-void uninitialized(){eg::Engram e;eg::EngramHooks h;h.project=[](void*,int,int,void*,const bf16*,bf16*){return 0;};e.set_hooks(h);bool called=false;auto exchange=[&](const uint32_t*,const uint8_t*,const uint8_t*,int64_t,int64_t,bf16*){called=true;return 0;};CHECK(e.op_owned(nullptr,0,1,0,1,(float*)nullptr,nullptr,exchange)==cudaErrorInvalidValue);CHECK(e.op_owned(nullptr,0,1,0,1,(bf16*)nullptr,nullptr,exchange)==cudaErrorInvalidValue);CHECK(!called);}
+void uninitialized(){eg::Engram e;eg::EngramHooks h;h.project=[](void*,int,int,void*,const bf16*,bf16*){return 0;};e.set_hooks(h);bool called=false;auto exchange=[&](const uint32_t*,const uint8_t*,const uint8_t*,int64_t,int64_t,const eg::ColShard&,bf16*){called=true;return 0;};CHECK(e.op_owned(nullptr,0,1,0,1,(float*)nullptr,nullptr,exchange)==cudaErrorInvalidValue);CHECK(e.op_owned(nullptr,0,1,0,1,(bf16*)nullptr,nullptr,exchange)==cudaErrorInvalidValue);CHECK(!called);}
+// Test-only member pointers (explicit instantiation permits private member
+// access). No production test hook, fake sidecars, or device allocation needed.
+struct ReadyTag{using type=bool eg::Engram::*;friend type member(ReadyTag);};
+struct ConfigTag{using type=eg::Config eg::Engram::*;friend type member(ConfigTag);};
+template<class Tag,typename Tag::type P>struct TestMember{friend typename Tag::type member(Tag){return P;}};
+template struct TestMember<ReadyTag,&eg::Engram::ready_>;
+template struct TestMember<ConfigTag,&eg::Engram::cfg_>;
+void mode_contract(){
+    for(int layer=0;layer<2;++layer)for(bool configured:{false,true}){
+        eg::Engram e;eg::EngramHooks h;h.project=[](void*,int,int,void*,const bf16*,bf16*){return 0;};e.set_hooks(h);
+        e.*member(ReadyTag{})=true;(e.*member(ConfigTag{})).knobs.col_shard=configured;
+        const_cast<eg::Sidecar&>(e.sidecar()).t[layer].columns.enabled=!configured;
+        bool called=false;auto exchange=[&](const uint32_t*,const uint8_t*,const uint8_t*,int64_t,int64_t,const eg::ColShard&,bf16*){called=true;return 0;};
+        CHECK(e.op_owned(nullptr,layer,1,0,1,(float*)nullptr,nullptr,exchange)==cudaErrorInvalidValue);
+        CHECK(e.op_owned(nullptr,layer,1,0,1,(bf16*)nullptr,nullptr,exchange)==cudaErrorInvalidValue);CHECK(!called);
+        e.*member(ReadyTag{})=false;
+    }
+    puts("PASS op_owned mode disagreement: both layers/modes/trunks; exchange not called");
+}
 int main(int argc,char** argv){
     const bool old_dispatch=argc==2&&std::strcmp(argv[1],"--old-owned-dispatch")==0;
-    const bool quick=old_dispatch||(argc==2&&std::strcmp(argv[1],"--quick")==0);uninitialized();
+    const bool quick=old_dispatch||(argc==2&&std::strcmp(argv[1],"--quick")==0);uninitialized();mode_contract();
     for(int m:{1,2,5,31,32,33,71,127,128,129,256})for(int mode=0;mode<3;++mode){WireCase c(m,mode);}
     if(!quick)for(int m:{4095,4096,8191,8192})for(int mode=0;mode<3;++mode){WireCase c(m,mode);}
+    if(!quick)for(int e=0;e<2;++e){
+        for(int m:{2,5,33,65,129,4096,8192,12288}){WireCase c(m,0,e);}
+        WireCase real(33,0,e,true);
+    }
     Dev<uint8_t> w(size_t(K)*E),sw(size_t(K)*(E/32));init_weights<<<256,256>>>(w.p,sw.p);
     for(int m:{1,5,33,71,128,129,257})projection_case(m,w,sw);
     Dev<uint8_t> gv(size_t(K/16)*(E/32)*528);make_gv_records<<<(K/16)*(E/32),256>>>(w.p,sw.p,gv.p);
     ds41_attn_set_gv(1,0,0,ds41a::gv_xfrag_launch,ds41a::gv_gemv_launch);
     for(int m:{1,5,33,71,128,129,257})dispatch_case(m,w,sw,gv,old_dispatch);
-    CK(cudaDeviceSynchronize());puts("DS41_V2_ENGRAM_PASS (synthetic kernels/seams; no NVMe/fabric/model/EVAL/speed claim)");
+    if(!quick)for(int e=0;e<2;++e)for(int m:{5,33,257})projection_case(m,w,sw,e,&gv);
+    CK(cudaDeviceSynchronize());printf("COL_SHARD_DEVICE_PEAK bytes=%zu limit=%llu\n",peak_bytes,2ull<<30);puts("DS41_V2_ENGRAM_PASS (synthetic kernels/seams; no NVMe/fabric/model/EVAL/speed claim)");
 }

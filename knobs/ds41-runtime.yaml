@@ -44,20 +44,29 @@ knobs:
       includes short replies: their request end then adds no snapshot. Longer replies' snapshots follow
       GR8_DS_CACHE_REPLACE. Set 0, with GR8_DS_CACHE_REPLACE=0, to keep every snapshot. Larger values may cause short
       follow-ups to re-prefill on the next turn.
+  GR8_DS_CACHE_DEFER_REPLACE:
+    scope: agree
+    kind: flag
+    default: "1"
+    values: "0|1"
+    doc: >-
+      With GR8_DS_CACHE_REPLACE=1, keep a request's prompt-end snapshot linked to its request end until the next turn
+      chooses one, even after a previous request-end hit. A re-tokenized assistant reply or dropped reasoning can then
+      fall back to prompt end. Applies to captured and parked request ends; LRU budget eviction still applies.
+      Set 0 to restore eager prompt-end replacement after a request-end hit. Every rank must agree.
   GR8_DS_CACHE_REPLACE:
     scope: agree
     kind: flag
     default: "1"
     values: "0|1"
     doc: >-
-      A request's two DS41 prefix snapshots (prompt end, request end) are linked. A first turn keeps both until its
-      follow-up. The follow-up's restore of one frees the other, the unused sibling: a chat that sends the reply back
-      (tools, or thinking off) continues from the request-end snapshot, a thinking chat without tools (its next prompt drops
-      the reasoning) from the prompt-end one. A request that restored a request-end snapshot frees its own prompt-end one
-      when it captures its request end. A freed prompt-end snapshot is lost only to prompts that share its prefix and leave
-      the reply (a retry, regenerate or edit); a freed request-end snapshot (its prompt-end sibling was restored) is lost to
-      a later prompt that keeps that reply after all, e.g. a turn with tools after a thinking turn without them. Those
-      prompts prefill again. Set 0 (and GR8_DS_CACHE_DEDUP=0) to keep every snapshot until LRU eviction.
+      Link a request's two DS41 prefix snapshots (prompt end, request end). The follow-up's restore or parked resume of
+      one frees the unused sibling: a chat that sends the reply back unchanged continues from request end; a thinking
+      chat that drops reasoning, or a re-tokenized reply, can use prompt end. GR8_DS_CACHE_DEFER_REPLACE=1 keeps this
+      choice on every turn. Set GR8_DS_CACHE_DEFER_REPLACE=0 for the legacy policy, which frees a request's prompt end
+      eagerly when it finishes after a request-end hit. A freed snapshot is unavailable to later retries, edits or
+      changes to whether reasoning is included; those prompts prefill again. Set 0 (and GR8_DS_CACHE_DEDUP=0) to keep
+      every snapshot until LRU eviction.
   GR8_DS_PARK:
     scope: agree
     kind: flag

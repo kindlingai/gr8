@@ -38,13 +38,13 @@ static std::string ds41_block(const char* path) {
     return out;
 }
 
-// rank `r` of 4 with GR8_DS_COMP_FP4=fp4; exits 0 when it boots, 3 when it refuses (the head writes its error to `why`)
-[[noreturn]] static void rank(unsigned r, int fp4, uint16_t port, const std::string& dir, const std::string& why) {
+// rank `r` of 4 with the named agree-scope flag set to fp4; exits 0 when it boots, 3 when it refuses (the head writes its error to `why`)
+[[noreturn]] static void rank(const char* name, unsigned r, int fp4, uint16_t port, const std::string& dir, const std::string& why) {
     if (r) (void)!std::freopen("/dev/null", "w", stderr);   // a refused worker reports its closed control link
-    // only GR8_DS_COMP_FP4 is set: an agree-scope knob inherited from the caller (GR8_DEC_BK=262144) would change the
+    // only the named flag is set: an agree-scope knob inherited from the caller (GR8_DEC_BK=262144) would change the
     // first word that differs
     ::clearenv();
-    ::setenv("GR8_DS_COMP_FP4", fp4 ? "1" : "0", 1);
+    ::setenv(name, fp4 ? "1" : "0", 1);
     if (knob::init()) std::_Exit(2);
     BootstrapConfig c; c.rank = r; c.ranks = 4; c.timeout = 3; c.head_ip = "127.0.0.1"; c.port = port;
     c.directory = dir + "/r" + std::to_string(r); ::mkdir(c.directory.c_str(), 0700);
@@ -58,14 +58,28 @@ static std::string ds41_block(const char* path) {
     }
 }
 
-// the head's exit code and error text for ranks with these GR8_DS_COMP_FP4 values
-static int boot(const std::vector<int>& fp4, uint16_t port, const std::string& dir, std::string& why) {
+// Ask the kernel for an unused loopback port for each case, not adjacent ports
+// that can overlap another test's listeners or ephemeral client connections.
+static uint16_t free_port() {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) std::abort();
+    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (g6s2::posix_bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a))) std::abort();
+    socklen_t n = sizeof(a);
+    if (::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &n)) std::abort();
+    const uint16_t port = ntohs(a.sin_port);
+    ::close(fd);
+    return port;
+}
+
+// the head's exit code and error text for ranks with these flag values
+static int boot(const std::vector<int>& fp4, uint16_t port, const std::string& dir, std::string& why, const char* name = "GR8_DS_COMP_FP4") {
     ::mkdir(dir.c_str(), 0700);
     const std::string wf = dir + "/why";
     std::vector<pid_t> ps;
     for (unsigned r = 0; r < fp4.size(); ++r) {
         const pid_t p = ::fork();
-        if (p == 0) rank(r, fp4[r], port, dir, wf);
+        if (p == 0) rank(name, r, fp4[r], port, dir, wf);
         ps.push_back(p);
     }
     int head = -1;
@@ -85,14 +99,20 @@ int main(int argc, char** argv) {
     CHECK(blk.find("bc.runtime_signature = g6s2::runtime_signature(sig);") != std::string::npos);
 
     char tmpl[] = "/tmp/ds41agreeXXXXXX"; const std::string dir = mkdtemp(tmpl);
-    const uint16_t port = uint16_t(20000 + getpid() % 20000);
     std::string why;
-    CHECK(boot({1, 1, 1, 1}, port, dir + "/on", why) == 0);
-    CHECK(boot({0, 0, 0, 0}, uint16_t(port + 1), dir + "/off", why) == 0);
-    CHECK(boot({1, 1, 0, 1}, uint16_t(port + 2), dir + "/mixed", why) == 3);
+    CHECK(boot({1, 1, 1, 1}, free_port(), dir + "/on", why) == 0);
+    CHECK(boot({0, 0, 0, 0}, free_port(), dir + "/off", why) == 0);
+    CHECK(boot({1, 1, 0, 1}, free_port(), dir + "/mixed", why) == 3);
     // the head names the first word that differs: rank 2's signature has no " env DS_COMP_FP4=1" at its end
     CHECK(why.find("bootstrap config mismatch: rank 2 has '', the head has 'env'") != std::string::npos);
     std::printf("ds41_agree_knobs_test: mixed FP4 boot refused: %s\n", why.c_str());
+
+    const char* defer = "GR8_DS_CACHE_DEFER_REPLACE";
+    CHECK(boot({1, 1, 1, 1}, free_port(), dir + "/defer-on", why, defer) == 0);
+    CHECK(boot({0, 0, 0, 0}, free_port(), dir + "/defer-off", why, defer) == 0);
+    CHECK(boot({1, 1, 0, 1}, free_port(), dir + "/defer-mixed", why, defer) == 3);
+    CHECK(why.find("bootstrap config mismatch") != std::string::npos);
+    std::printf("ds41_agree_knobs_test: mixed deferred replacement boot refused: %s\n", why.c_str());
 
     if (!fails) std::printf("ds41_agree_knobs_test: PASS\n");
     return fails ? 1 : 0;

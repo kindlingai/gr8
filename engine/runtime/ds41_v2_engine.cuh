@@ -85,8 +85,8 @@ struct Ds41V2Engine {
         m.engram->set_dead(m.vis_n>0?m.vis_flag:nullptr);
         const int e=m.layers[i].l==geom::ENGRAM_L0?0:1;
         const int rc=m.engram->op_owned(&m,e,v.g.M,v.g.row0,v.g.owned,b.streams,v.st,
-            [&](const uint32_t* ids,const uint8_t* stage,const uint8_t* scales,int64_t first,int64_t valid,__nv_bfloat16* emb) {
-                engram_wire::pack<<<v.g.M,256,0,v.st>>>(ids,stage,scales,first,valid,v.g.M,eng_send);
+            [&](const uint32_t* ids,const uint8_t* stage,const uint8_t* scales,int64_t first,int64_t valid,const ::ds41::engram::ColShard& columns,__nv_bfloat16* emb) {
+                engram_wire::pack<<<v.g.M,256,0,v.st>>>(ids,stage,scales,first,valid,columns,v.g.M,eng_send);
                 const Segment seg{eng_send,eng_recv,engram_wire::ROW_BYTES};
                 fork(v,Coll::Engram); all_to_all(v,Coll::Engram,&seg,1,v.cs); record_received(v,Coll::Engram); join(v,Coll::Engram);
                 if(v.g.owned)engram_wire::unpack<<<dim3(v.g.owned,24),256,0,v.st>>>(eng_recv,v.g.Q,v.g.owned,v.g.nr,emb);
