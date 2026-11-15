@@ -95,10 +95,10 @@ pub fn busy_refuse(guard_on: bool, hit: bool, live_victims: u32) -> bool {
     guard_on && !hit && live_victims > 0
 }
 
-/// The busy guard's arrival decision: a request that would join a queue already `queued` deep is refused at once
-/// (it would be left queued past the bound) instead of added. 0 = no bound.
-pub fn busy_queue_full(guard_on: bool, bound: u32, queued: usize) -> bool {
-    guard_on && bound > 0 && queued >= bound as usize
+/// The busy guard's arrival decision: a request is refused at once when `bound` requests already wait past the
+/// `free` session slots (a burst at an idle engine queues every arrival before the first admission). 0 = no bound.
+pub fn busy_queue_full(guard_on: bool, bound: u32, queued: usize, free: usize) -> bool {
+    guard_on && bound > 0 && queued.saturating_sub(free) >= bound as usize
 }
 
 /// The busy refusal's once-per-request trace line, like wait_line.
@@ -128,8 +128,12 @@ mod tests {
         assert!(!busy_refuse(true, true, 2));
         assert!(!busy_refuse(true, false, 0));
         // the queue bound: full at the bound, off at 0, off with the guard off
-        assert!(busy_queue_full(true, 8, 8) && busy_queue_full(true, 8, 9));
-        assert!(!busy_queue_full(true, 8, 7) && !busy_queue_full(true, 0, 99) && !busy_queue_full(false, 8, 99));
+        assert!(busy_queue_full(true, 8, 8, 0) && busy_queue_full(true, 8, 9, 0));
+        assert!(
+            !busy_queue_full(true, 8, 7, 0) && !busy_queue_full(true, 0, 99, 0) && !busy_queue_full(false, 8, 99, 0)
+        );
+        // requests the free slots will take do not count: 2 waiting past 4 free slots fill a bound of 2
+        assert!(!busy_queue_full(true, 2, 5, 4) && busy_queue_full(true, 2, 6, 4));
         assert!(busy_line(1, 2) && !busy_line(2, 2));
     }
 

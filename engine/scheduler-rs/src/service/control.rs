@@ -770,9 +770,10 @@ impl Control {
         let Some(ck) = self.check(command.request, &bytes)? else { return Ok(()) };
         let mut queued = request(command.request, ck.n, ck.n_gen, ck.steering);
         queued.ckpt_at = ck.ckpt_at;
-        // the busy guard's arrival bound (GR8_BUSY_QUEUE_MAX): a request that would join a too-deep queue is refused
-        // at once with the busy answer instead of waiting in silence past the bound
-        if admit::busy_queue_full(self.busy_on(), self.busy_queue_max(), self.queue_len()) {
+        // the busy guard's arrival bound (GR8_BUSY_QUEUE_MAX): a request that would wait behind the bound past the free
+        // session slots is refused at once with the busy answer instead of waiting in silence
+        let free = self.c.limit().saturating_sub(self.resident()) as usize;
+        if admit::busy_queue_full(self.busy_on(), self.busy_queue_max(), self.queue_len(), free) {
             self.busy_answer(inn, command.request, queued.id, "intake")?;
             return Ok(());
         }
