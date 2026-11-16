@@ -51,21 +51,17 @@ t_thinking_on_by_default() {
   ok "$(jqb '.usage.completion_tokens') tok"
 }
 
-# GLM 5.3's template cannot turn thinking off: asking for it is a 400 that says what to use instead, unless the front
-# end runs with --allow-thinking-off (ALLOW_THINKING_OFF=1). GLM-5.3-Flash's can (./gr8 glm53f sets GR8_MODEL). Where
-# thinking off is taken, the reply has content and no reasoning.
+# Thinking off (enable_thinking false or reasoning_effort "none") is taken on every model: GLM renders its lowest
+# effort with the think block open and withholds the reasoning. The reply has content and no reasoning.
 t_thinking_off_refused() {
-  post /v1/chat/completions "$(chat '{"chat_template_kwargs":{"enable_thinking":false}}' 256 'Say hi.')"
-  if [ "$THINKING_OFF" = 1 ] || [ "$STATUS" = 200 ]; then
-    [ "$STATUS" = 200 ] || { BODY="{\"status\": $STATUS}"; check "status should be 200" 'false'; return; }
-    check "content should be present" '(.choices[0].message.content // "") | length > 0' || return
-    check "reasoning should be absent" '(.choices[0].message.reasoning // .choices[0].message.reasoning_content // "") == ""' || return
-    ok "thinking off"; return
-  fi
-  [ "$STATUS" = 400 ] || { BODY="{\"status\": $STATUS}"; check "status should be 400" 'false'; return; }
-  check "error should say thinking cannot be disabled" '.error.message | test("cannot be disabled")' || return
-  check "error should name --allow-thinking-off" '.error.message | test("allow-thinking-off")' || return
-  ok
+  local off
+  for off in '{"chat_template_kwargs":{"enable_thinking":false}}' '{"reasoning_effort":"none"}'; do
+    post /v1/chat/completions "$(chat "$off" 256 'Say hi.')"
+    [ "$STATUS" = 200 ] || { BODY="{\"status\": $STATUS}"; check "status should be 200 for $off" 'false'; return; }
+    check "content should be present for $off" '(.choices[0].message.content // "") | length > 0' || return
+    check "reasoning should be absent for $off" '(.choices[0].message.reasoning // "") == "" and (.choices[0].message.reasoning_content // "") == ""' || return
+  done
+  ok "thinking off"
 }
 
 # A thinking budget makes the reply's Nth token the close of the think block. The answer follows in the content.

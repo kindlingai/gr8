@@ -461,7 +461,14 @@ class Ds41Tests(unittest.TestCase):
             with self.assertRaises(opt.OptionError) as err:
                 ds41('--default-reasoning-effort', e)
             self.assertIn('want a whole number 1 to 100', str(err.exception))
-        # GLM keeps its list: no number, no none
+        # GLM and GLM-5.3-Flash take a name, none too (thinking off at the template's lowest effort), but no number
+        glm = opt.parse(['--no-config', '--peers', PEERS, '--default-reasoning-effort', 'none'], GLM)
+        opt.validate(glm)
+        self.assertEqual(glm.get('DEFAULT_REASONING_EFFORT'), 'none')
+        self.assertEqual(flash('--default-reasoning-effort', 'none').get('DEFAULT_REASONING_EFFORT'), 'none')
+        with self.assertRaises(opt.OptionError) as err:
+            opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-reasoning-effort', '50'], GLM))
+        self.assertIn('want none, minimal, low, medium, high, xhigh or max', str(err.exception))
         for e in ('50', 'none'):
             with self.assertRaises(opt.OptionError):
                 opt.validate(opt.parse(['--no-config', '--peers', PEERS, '--default-reasoning-effort', e], {}))

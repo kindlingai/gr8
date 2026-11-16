@@ -704,7 +704,7 @@ impl GlmParser {
         let reasoning = py_rstrip(&r);
         let content = if calls.is_empty() { c.as_str() } else { py_strip(&c) };
         FullParse {
-            reasoning: (!reasoning.is_empty()).then(|| reasoning.to_string()),
+            reasoning: (self.include_reasoning && !reasoning.is_empty()).then(|| reasoning.to_string()),
             content: (!content.is_empty()).then(|| content.to_string()),
             calls,
         }
@@ -1077,6 +1077,45 @@ mod tests {
         assert_eq!(r.reasoning.as_deref(), Some("Let me think."));
         assert_eq!(r.content.as_deref(), Some("\n\nThe answer."));
         assert!(r.calls.is_empty());
+    }
+
+    /// Thinking off withholds the reasoning: none of it reaches `reasoning` or `content`, whole or streamed.
+    #[test]
+    fn include_reasoning_false_drops_the_reasoning_without_leaking_it_to_content() {
+        let cases: [(&str, Option<&str>, usize); 4] = [
+            ("Secret reasoning step.</think>Clean chat answer.", Some("Clean chat answer."), 0),
+            ("<think>Secret reasoning step.</think>Clean chat answer.", Some("Clean chat answer."), 0),
+            (
+                "Secret reasoning</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>\
+                 </tool_call>",
+                None,
+                1,
+            ),
+            ("Unfinished secret thought", None, 0),
+        ];
+        let new = || GlmParser::new(Some(&tools()), &json!("auto"), false);
+        for (text, want, n_calls) in cases {
+            let f = new().parse_full(text);
+            assert_eq!((f.reasoning.as_deref(), f.content.as_deref(), f.calls.len()), (None, want, n_calls), "{text}");
+            if n_calls == 1 {
+                assert_eq!((f.calls[0].1.as_str(), f.calls[0].2.as_str()), ("get_weather", r#"{"city": "Paris"}"#));
+            }
+            let chars: Vec<char> = text.chars().collect();
+            for size in [1, 2, 5, 64] {
+                let mut p = new();
+                let (mut content, mut calls) = (String::new(), 0);
+                for (i, ch) in chars.chunks(size).enumerate() {
+                    let s: String = ch.iter().collect();
+                    if let Some(d) = p.delta(&s, (i + 1) * size >= chars.len()) {
+                        assert!(d.reasoning.is_none(), "{text} by {size}");
+                        content += d.content.as_deref().unwrap_or("");
+                        calls += d.tool_calls.iter().filter(|t| t.name.is_some()).count();
+                    }
+                }
+                assert!(!content.contains("ecret"), "{text} by {size}: {content}");
+                assert_eq!((content.as_str(), calls), (want.unwrap_or(""), n_calls), "{text} by {size}");
+            }
+        }
     }
 
     #[test]
