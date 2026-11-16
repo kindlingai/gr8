@@ -8,6 +8,13 @@ knobs:
     doc: >-
       The first decode context bucket boundary in tokens. Decode graphs are captured per bucket and GR8_RT_L must be a
       bucket boundary.
+  GR8_DEC_BK_MAX:
+    scope: agree
+    kind: int
+    default: "0"
+    doc: >-
+      The largest doubled decode context bucket: GR8_DEC_BK doubles up to it, then the next bucket is R under CP and the
+      KV pool's cap. Every bucket costs a set of decode graphs (about 0.9 GiB a rank on the 4-box GLM-5.3). 0 = no bound.
   GR8_DEC_EVPROF:
     scope: local
     kind: int

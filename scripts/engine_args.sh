@@ -352,7 +352,7 @@ engine_defaults() {
        tp4_default ROUTE_OVL 1; [ "$MTP" = 0 ] || tp4_default DRAFT_HEAD_I4 1
        tp4_default ATTN_SC2 4; tp4_default ATTN_SC2_TR 2; tp4_default ATTN_CTX2 4; tp4_default ATTN_CTX3 2
        tp4_default ATTN_SEL2 16; tp4_default IDX_GRP 16; tp4_default ATTN_QT 1; tp4_default ATTN_FRONT 1
-       tp4_default IDX_VEC 1; tp4_default DEC_BK 512; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1
+       tp4_default IDX_VEC 1; tp4_default DEC_BK 2048; tp4_default DEC_BK_MAX 32768; [ "$MTP" = 0 ] || tp4_default S2_ADAPT 1
        tp4_default S2_DECODE_PF 4096; tp4_default S2_ADMIT_HOLD 1; tp4_default PF_SELX_CTX 53248
        if [ "${KV_FORMAT:-fp8}" = int4 ]; then
          tp4_default KV4_SC 4; tp4_default KV4_SC_TR 2; tp4_default KV4_QT 1; tp4_default KV4_CTX 2; tp4_default KV4_FUSE_ROT 1
@@ -534,6 +534,7 @@ GR8_CP_S3=1 GR8_CP_PF_VERIFY=1 GR8_CP_PF_HASH2=1 ${EXTRA_ENV:-}"
   # off unless set; on at TP=4. DEC_BK 0 and PF_SELX_CTX 0 leave them to the engine (DEC_BK 2048, selx from 53248)
   ENGINE_ENV="$ENGINE_ENV${IDX_VEC:+ GR8_IDX_VEC=$IDX_VEC}"
   [ "${DEC_BK:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV GR8_DEC_BK=$DEC_BK"
+  [ "${DEC_BK_MAX:-0}" = 0 ] || ENGINE_ENV="$ENGINE_ENV GR8_DEC_BK_MAX=$DEC_BK_MAX"
   ENGINE_ENV="$ENGINE_ENV${S2_ADAPT:+ GR8_S2_ADAPT=$S2_ADAPT}"
   ENGINE_ENV="$ENGINE_ENV${S2_DECODE_PF:+ GR8_S2_DECODE_PF=$S2_DECODE_PF}"
   ENGINE_ENV="$ENGINE_ENV${S2_ADMIT_HOLD:+ GR8_S2_ADMIT_HOLD=$S2_ADMIT_HOLD}"

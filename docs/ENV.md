@@ -54,6 +54,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_CP_STEP_ROWS` | int | `0` | 0..4096 | S2 only: a decode step past R carries at most this many rows and the CP fabric is sized for it instead of the widest S2 step. Sessions past R give the same tokens. |
 | `GR8_CP_STEP_SEG` | flag | `0` | 0\|1 | With GR8_CP_STEP_ROWS, a round past R takes only sessions past R, so a short session never runs the CP path because a long one is resident. |
 | `GR8_DEC_BK` | int | `2048` |  | The first decode context bucket boundary in tokens. Decode graphs are captured per bucket and GR8_RT_L must be a bucket boundary. |
+| `GR8_DEC_BK_MAX` | int | `0` |  | The largest doubled decode context bucket: GR8_DEC_BK doubles up to it, then the next bucket is R under CP and the KV pool's cap. Every bucket costs a set of decode graphs (about 0.9 GiB a rank on the 4-box GLM-5.3). 0 = no bound. |
 | `GR8_DEC_SHARED_SCRATCH` | flag | `0` |  | One decode attention scratch, and one buffer of selected ids and attention output, serve every layer of the main model and the MTP draft, which frees memory for the KV pool. Needs --pfv2. |
 | `GR8_DEC_SPLIT` | int | `0` | 0.. | Captures the decode step as two graphs split at this layer, so the second submission overlaps the first one's GPU time. Needs --graph. 0: one graph. |
 | `GR8_DFL_BODY_I4` | flag | `0` | 0\|1 | The DFlash2 drafter's body GEMVs read INT4 g32 copies of their MXFP8 records, made at boot. Drafts only, +382 MB per rank. Needs --dflash-manifest. |

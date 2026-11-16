@@ -75,5 +75,15 @@ int main()
             std::vector<int>{2048, 4096, 8192, 16384, 32768, 65536, 98304, 131072, 614400}));
     assert((buckets9(2048, 310528, 65536) ==
             std::vector<int>{2048, 4096, 8192, 16384, 32768, 65536, 131072, 310528}));
+    // A bound on the doublings: R and the cap stay boundaries
+    {
+        int out[9] = {};
+        int n = context_buckets(out, 2048, 614400, 16384, 7, 16384);
+        assert((std::vector<int>(out, out + n) == std::vector<int>{2048, 4096, 8192, 16384, 614400}));
+        n = context_buckets(out, 2048, 614400, 16384, 7, 8192);
+        assert((std::vector<int>(out, out + n) == std::vector<int>{2048, 4096, 8192, 16384, 614400}));
+        n = context_buckets(out, 2048, 614400, 0, 7, 32768);
+        assert((std::vector<int>(out, out + n) == std::vector<int>{2048, 4096, 8192, 16384, 32768, 614400}));
+    }
     std::cout << "context_buckets: PASS (R=0/32768 schedule byte-exact; R=98304; BK=4096; 9 slots = 8 for R on the doubling)\n";
 }
