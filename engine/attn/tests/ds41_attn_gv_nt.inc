@@ -12,6 +12,8 @@
 //   ATTN_GV_NT_PREFILL_UNCHANGED   attn_proj + attn_out hook calls: cap 8 (eager / prefill) takes the GEMV at n = 1, 6, 8 and none at
 //                                  n = 9, 16, 29, 32, 33; cap 32 (decode / verify) takes it at 9..32 and none at 33; DSpark stays at 8 rows;
 //                                  v2 attn_proj_own (1-tile InputBuf::xf) stays at 8 rows at cap 32 (n = 8: 1 + 2 hook calls, n = 16: 0 + 0).
+//   SRC_FAST_GEMV2_M32_BITWISE_PASS comp_row's launch_f32gemv2 ([512][5120] wkv + wgate) vs k_f32gemm2 at M = 1..32: true, 0 fp32 bit
+//                                  mismatches, canaries intact; M = 33 refused (false, nothing written).
 #pragma once
 #include "../ds41_attn_dsp.cuh"
 #include "../ds41_attn_v2.cuh"
@@ -527,10 +529,65 @@ inline void gate_prefill_unchanged()
     printf("ATTN_GV_NT_PREFILL_UNCHANGED n=9,16,29,32,33 dsp_cap8=PASS v2_cap8=PASS\n");
 }
 
+// ---- comp_row (GR8_DS_SRC_FAST bit 1): launch_f32gemv2 at M 9..32 in 8-row passes vs k_f32gemm2
+inline void gate_src_fast()
+{
+    Saved keep;
+    Pool P;
+    cudaStream_t st = 0;
+    const int N = HD, K = HID, MM = 33;
+    Rng r(91);
+    auto bf = [&](float amp) { const float v = ((float)(r.next() >> 8) * (1.0f / 16777216.0f) * 2.0f - 1.0f) * amp; uint32_t u; memcpy(&u, &v, 4);
+                               return (uint16_t)((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16); };
+    std::vector<uint16_t> hx((size_t)MM * K), h0((size_t)N * K), h1((size_t)N * K);
+    for (auto& v : hx) v = bf(1.0f);
+    for (auto& v : h0) v = bf(0.03f);
+    for (auto& v : h1) v = bf(0.03f);
+    const bf16* x = (const bf16*)P.up(hx);
+    const bf16* W0 = (const bf16*)P.up(h0);
+    const bf16* W1 = (const bf16*)P.up(h1);
+    const uint32_t FC = 0x7FC0A5A5u;   // an fp32 NaN pattern neither kernel writes
+    const size_t yn = (size_t)MM * N;
+    Guarded<uint32_t> g0 = guarded<uint32_t>(P, yn, FC), g1 = guarded<uint32_t>(P, yn, FC);
+    float *r0 = P.alloc<float>(yn), *r1 = P.alloc<float>(yn);
+    std::vector<uint32_t> e0(yn), e1(yn);
+    long mm = 0;
+    char what[160];
+    for (int M = 1; M <= 32; ++M)
+    {
+        refill(g0, FC);
+        refill(g1, FC);
+        k_f32gemm2<<<dim3(N / FB_N, (M + FB_M - 1) / FB_M, 2), 256, 0, st>>>(x, W0, W1, r0, r1, M, N, K);   // comp_row's fallback launch
+        const bool ok = launch_f32gemv2(x, W0, W1, (float*)g0.p(), (float*)g1.p(), M, N, K, st);
+        GVNT_CK(cudaDeviceSynchronize());
+        GVNT_CK(cudaGetLastError());
+        snprintf(what, sizeof what, "launch_f32gemv2 refused M=%d", M);
+        require(ok, what);
+        GVNT_CK(cudaMemcpy(e0.data(), r0, (size_t)M * N * 4, cudaMemcpyDeviceToHost));
+        GVNT_CK(cudaMemcpy(e1.data(), r1, (size_t)M * N * 4, cudaMemcpyDeviceToHost));
+        const std::vector<uint32_t> a0 = host(g0), a1 = host(g1);
+        long m = 0;
+        for (size_t i = 0; i < (size_t)M * N; ++i) m += (a0[GUARD + i] != e0[i]) + (a1[GUARD + i] != e1[i]);
+        mm += m;
+        snprintf(what, sizeof what, "launch_f32gemv2 M=%d: %ld fp32 bit mismatches vs k_f32gemm2", M, m);
+        require(m == 0, what);
+        snprintf(what, sizeof what, "launch_f32gemv2 M=%d: canary / rows >= M overwritten", M);
+        require(canaries_ok(a0, yn, (size_t)M * N, FC) && canaries_ok(a1, yn, (size_t)M * N, FC), what);
+    }
+    refill(g0, FC);
+    refill(g1, FC);
+    const bool took = launch_f32gemv2(x, W0, W1, (float*)g0.p(), (float*)g1.p(), MM, N, K, st);
+    GVNT_CK(cudaDeviceSynchronize());
+    require(!took, "launch_f32gemv2 took M=33 (k_f32gemm2's rows)");
+    require(canaries_ok(host(g0), yn, 0, FC) && canaries_ok(host(g1), yn, 0, FC), "launch_f32gemv2 M=33 refusal wrote output");
+    printf("SRC_FAST_GEMV2_M32_BITWISE_PASS M=1..32 m33_refused=PASS bit_mismatches=%ld\n", mm);
+}
+
 inline void run_all()
 {
     gate_bitwise();
     gate_prefill_unchanged();
+    gate_src_fast();
 }
 #undef GVNT_CK
 }   // namespace gvnt

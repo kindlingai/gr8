@@ -1,4 +1,4 @@
-// DeepSeek-V4.1-Flash source-layer fast path, part (b): the ratio-2 compressor projections (wkv, wgate) for M <= 8 rows as a thread-per-output GEMV
+// DeepSeek-V4.1-Flash source-layer fast path, part (b): the ratio-2 compressor projections (wkv, wgate) for M <= 32 rows (8-row passes) as a thread-per-output GEMV
 // that is bit-identical to k_f32gemm2 (ds41_attn.cuh): every output element is one sequential fp32 FMA chain over k = 0..K-1 starting at 0.0f, with
 // the same operands (bf16 -> fp32 is exact), so only the schedule changes. GR8_DS_SRC_FAST bit 0 (=1) turns it on, default off.
 //
@@ -40,7 +40,8 @@ DS41_SF_HD float sf_u2f(uint32_t u)
 #endif
 }
 constexpr int SF_R = 3;       // rows per warp
-constexpr int SF_MAXM = 8;    // rows of one pass (the decode and verify case)
+constexpr int SF_MAXM = 8;    // rows of one pass (the decode and verify case; launch_f32gemv2 takes up to SF_MAXR rows in passes of SF_MAXM)
+constexpr int SF_MAXR = 32;   // rows of one launch_f32gemv2 call (a 9..32-row verify step: 2..4 passes); more rows stay on k_f32gemm2
 
 // One lane = one output column. wr = its weight row as SfV4 (K/8 of them); xs = staged x, row r at xs + r * xld8 (SfV4 units); rows r0 .. r0+R-1 < M
 // are summed into acc in k order. nt = K / 64.
@@ -120,13 +121,15 @@ __global__ void __launch_bounds__(96) k_f32gemv2(const __nv_bfloat16* __restrict
         if (r0 + r < M) Y[(size_t)(r0 + r) * N + n] = acc[r];
 }
 
-// false = shape / alignment / smem outside the fast path's contract (the caller launches k_f32gemm2)
+// false = shape / alignment / smem outside the fast path's contract (the caller launches k_f32gemm2). M 9..32: k_f32gemv2 on 8-row passes
+// (rows r0 .. r0+7 of x, Y0, Y1; the rows are independent and each (row, n) is the same one-thread FMA chain, so the outputs are k_f32gemm2's
+// bit for bit). The checks cover every pass before the first launch, so a refusal never leaves a partial result.
 inline bool launch_f32gemv2(const __nv_bfloat16* x, const __nv_bfloat16* W0, const __nv_bfloat16* W1, float* Y0, float* Y1, int M, int N, int K,
                             cudaStream_t st)
 {
-    if (M < 1 || M > SF_MAXM) return false;   // prefill chunks: k_f32gemm2, silently
+    if (M < 1 || M > SF_MAXR) return false;   // prefill chunks: k_f32gemm2, silently
     static bool warned = false;
-    const size_t sm = (size_t)M * K * 2;
+    const size_t sm = (size_t)(M < SF_MAXM ? M : SF_MAXM) * K * 2;   // the largest pass
     if ((N & 31) || (K & 63) || K < 64 || (((uintptr_t)x | (uintptr_t)W0 | (uintptr_t)W1) & 15) || sm > 96 * 1024)
     {
         if (!warned) std::fprintf(stderr, "DS41 GR8_DS_SRC_FAST: compressor GEMV refused (N=%d K=%d M=%d x=%p W0=%p W1=%p): k_f32gemm2 stays\n", N, K, M, (const void*)x, (const void*)W0, (const void*)W1);
@@ -144,8 +147,12 @@ inline bool launch_f32gemv2(const __nv_bfloat16* x, const __nv_bfloat16* W0, con
         }
         set_sm = sm;
     }
-    const int warps = (M + SF_R - 1) / SF_R;
-    k_f32gemv2<SF_R><<<dim3(N / 32, 2), warps * 32, sm, st>>>(x, W0, W1, Y0, Y1, M, N, K);
+    for (int r0 = 0; r0 < M; r0 += SF_MAXM)
+    {
+        const int m = M - r0 < SF_MAXM ? M - r0 : SF_MAXM;
+        const int warps = (m + SF_R - 1) / SF_R;
+        k_f32gemv2<SF_R><<<dim3(N / 32, 2), warps * 32, (size_t)m * K * 2, st>>>(x + (size_t)r0 * K, W0, W1, Y0 + (size_t)r0 * N, Y1 + (size_t)r0 * N, m, N, K);
+    }
     return true;
 }
 #endif
