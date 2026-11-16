@@ -22,6 +22,7 @@
 // Host only, a fake engine.
 // Build: g++ -std=c++17 -O2 -Wall -Wextra -I engine/runtime engine/runtime/s2/tests/batch_ds41_dspark_test.cpp -o /tmp/batch_ds41_dspark_test
 #include "s2_batch.h"
+#include "s2/ds41_draft_stats.h"
 #include "s2/ds41_dspark_round_logic.h"
 #include "../../../engram/engram_ring.h"
 #include <algorithm>
@@ -561,6 +562,29 @@ static int run_ms(int S, int K, int mut, FakeMS** keep = nullptr)
 
 int main()
 {
+    { // All ranks hash exactly the executed widths; calibration is cumulative survival, not marginal confidence.
+        std::array<g6s2::Ds41DraftStats, 4> stats{};
+        std::array<double, 5> lp{}; lp.fill(g6s2::ds41_draft_logp(0.f, 1.0));
+        for (auto& t : stats) { t.observe(4, 2, 1, lp); t.observe(1, 0, 0, lp); }
+        for (const auto& t : stats) {
+            CHECK(t.hash == stats[0].hash && t.rounds == 2 && t.verified == 2 && t.accepted == 1);
+            CHECK(t.hist[2] == 1 && t.hist[0] == 1 && t.observed[0] == 1 && t.observed[1] == 1);
+            CHECK(t.predicted[0] == 0.5 && t.predicted[1] == 0.25 && t.realized[0] == 1 && t.realized[1] == 0);
+            CHECK(t.line(3, 7).find("rank=3 request=0 slot=7") != std::string::npos);
+        }
+        stats[0].verify_time(1, 12, 50.0); // forced multi-token insert: diagnostics must not throw
+        CHECK(stats[0].other_verify_steps == 1 && stats[0].other_verify_us == 50.0);
+        stats[0].verify_time(4, 2, 125); stats[0].verify_time(4, 2, 75); stats[0].draft_time(25);
+        CHECK(stats[0].step_count[3][1] == 2 && stats[0].verify_us[3][1] == 200);
+        CHECK(stats[0].line(0, 0).find("draft_steps=1 draft_us_sum=25 verify_ns_rps_n_us=4:2:2:200") != std::string::npos);
+        CHECK(!stats[0].finish(0, 0).empty());
+        CHECK(stats[0].finish(0, 0).empty()); // terminal + park/retain/retire must not duplicate
+        stats[0] = g6s2::Ds41DraftStats{};
+        CHECK(!stats[0].finish(0, 0).empty()); // slot reuse starts a new request
+        stats[3].observe(4, 1, 0, lp); CHECK(stats[3].hash != stats[0].hash);
+        std::printf("DS41_DRAFT_TELEMETRY: four-rank hash + cumulative calibration PASS\n");
+    }
+
     logic_tests();
     // ---- the sweep: every K, chunk size, prompt length (one chunk, several, remainder, one token), error pattern; skip vs no skip
     long runs = 0, big_tail = 0;

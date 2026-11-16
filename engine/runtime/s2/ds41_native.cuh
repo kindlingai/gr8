@@ -20,9 +20,13 @@
 #include "ds41_prefill.h"
 #include "ds41_prefill_lanes.h"
 #include "ds41_step_layout.h"
+#include "ds41_draft_stats.h"
+#include "ds41_park_miss.h"
+#include "../ds41_dspark.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 namespace g6s2 {
@@ -41,6 +45,7 @@ struct Ds41Context {
     std::function<void(int k, const g6rt::StepIn& si)> launch;
     // DSpark MTP (GR8_DS_MTP): the draft Model and its launch; null = MTP 0 (sc.mtp == 0 exactly when this is null)
     Ds41Dspark* dsp = nullptr;
+    ds41::dsp::Knobs draft_knobs;
     // W-row prefill (GR8_DS_PREFILL_W): enqueue and launch one chunk, no sync (ds41_prefill.h); null = off (prefill_min == 0 exactly then)
     Ds41PrefillFn prefill;
     // After the chunk's stream fence: diagnostic counters and per-layer error words.
@@ -95,6 +100,22 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
     int lp_rows = 0;
     auto fence = [&] { G6RT_CK(cudaStreamSynchronize(c.stream)); };
     NativeHooks h;
+    const bool draft_log = knob::ds_draft_log();
+    std::array<Ds41DraftStats, MAX_SESSIONS> draft_stats{};
+    int draft_ns = 0;
+    if (draft_log) {
+        h.draft_round = [&](Key key, long, int, int a, int k) {
+            std::array<double, 5> lp{};
+            for (int j = 0; round && j < k; ++j)
+                lp[size_t(j)] = ds41_draft_logp(round->confidence(j, int(key.slot)), c.draft_knobs.temp_for(j));
+            draft_stats[key.slot].observe(draft_ns, k, a, lp);
+        };
+        h.draft_emitted = [&](Key key, unsigned n) { draft_stats[key.slot].emitted += n; };
+        h.draft_terminal = [&](Key key) {
+            const auto line = draft_stats[key.slot].finish(c.main.rank, key.slot);
+            if (!line.empty()) std::fprintf(stderr, "%s\n", line.c_str());
+        };
+    }
     if (ck) h.checkpoint = [ck](const g6rt::ServeReq& r) { return ck->system_boundary(r); };
     h.pool.pool = &pool;   // the driver releases runs on it itself when nothing is retained
     auto capture_prompt_end = [&](const Slot& s, const Payload& p, uint32_t end) {
@@ -115,15 +136,21 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
     ds41::lanes::Counter lane_b;   // lane B's fabric sequence: one id per lane-B chunk
     // DS41's module (ModuleOps): its hooks as members over references to the locals they use. The locals outlive it and the service
 #define DS41_CAPTURES(X) X(c) X(sc) X(slots) X(round) X(pool) X(ck) X(ck_mu) X(claimed) X(parked) X(claimed_slot) \
-    X(bound) X(bound_live) X(incoming_sys) X(incoming_prompt) X(checkpoint) X(img_rows) X(snaps) X(lp) X(lp_rows) X(fence) X(capture_prompt_end) X(lane_b)
+    X(bound) X(bound_live) X(incoming_sys) X(incoming_prompt) X(checkpoint) X(img_rows) X(snaps) X(lp) X(lp_rows) X(fence) X(capture_prompt_end) X(lane_b) X(draft_log) X(draft_stats) X(draft_ns)
     DS41_CAPTURES(G6S2_CAPTURE_TYPE)
     struct Ds41Module : ModuleCtx {
         DS41_CAPTURES(G6S2_CAPTURE_REF)
+        void finish_draft(unsigned slot) {
+            if (!draft_log) return;
+            const auto line = draft_stats[slot].finish(c.main.rank, slot);
+            if (!line.empty()) std::fprintf(stderr, "%s\n", line.c_str());
+        }
         void on_retain(const Run& r, const PrefixReuse& st, const CacheNamespace& ns) {
             int q = -1;
             for (int i = 0; i < slots; ++i)
                 if (bound_live[size_t(i)] && bound[size_t(i)] == r) { q = i; break; }
             require(q >= 0, "DS41 prefix retain: run has no bound slot");
+            finish_draft(unsigned(q));
             // DSpark's final MAIN verify may finish without a following DRAFT/comp_commit;
             // only st.valid (which includes draft_end) is safe to snapshot then.
             const uint32_t p = st.history.empty() ? 0u : uint32_t(c.dsp
@@ -141,6 +168,7 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
         }
         void on_park(unsigned slot, const Run& r, const PrefixReuse& st, const CacheNamespace& ns) {
             const int q = int(slot);
+            finish_draft(slot);
             require(q < slots && bound_live[size_t(q)] && bound[size_t(q)] == r, "DS41 park: run has no bound slot");
             const uint32_t p = st.history.empty() ? 0u : uint32_t(c.dsp
                 ? st.valid : std::min<int>(st.main_end, int(st.history.size()) - 1));
@@ -169,6 +197,7 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
             }
         }
         void on_bind(const Grant& g) {
+            if (draft_log) { draft_stats[g.key.slot] = Ds41DraftStats{}; draft_stats[g.key.slot].request = g.req.id; }
             checkpoint[g.key.slot] = g.req.ckpt_at > g.reuse ? g.req.ckpt_at : 0;
             if (slots > 1) {   // a fresh run on slot q: clear that slot's slabs only (the other sessions keep theirs; no step is in flight)
                 const int q = int(g.key.slot);
@@ -259,26 +288,41 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
             }
             if (ck) ck->store_span(0, incoming_sys[0]);
         }
-        void on_retire(const Slot&) { fence(); }
+        void on_retire(const Slot& s) { finish_draft(s.key.slot); fence(); }
         void on_fence() { fence(); }
         int on_bucket(bool, int ctx) { return bucket_of(c.main, ctx); }
         void on_mode(int, int next) { fence(); require(slots > 1 || next == -1 || next == 0, "DS41 non-solo mode"); }
         std::vector<int> on_launch(const Launch& l) {
             require(slots > 1 || (l.solo == 0 && l.step.sess.size() == 1), "DS41 launch is not solo");
-            if (l.step.kind == s2::Step::DRAFT && round) return round->draft_step(l);
-            if (l.step.kind == s2::Step::CHAIN && round) return round->chain_step(l);
+            if (round && (l.step.kind == s2::Step::DRAFT || l.step.kind == s2::Step::CHAIN)) {
+                const bool timed = draft_log && l.step.kind == s2::Step::DRAFT;
+                const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                auto ids = l.step.kind == s2::Step::DRAFT ? round->draft_step(l) : round->chain_step(l);
+                if (timed) {
+                    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+                    for (int q : l.step.sess) draft_stats[size_t(q)].draft_time(us);
+                }
+                return ids;
+            }
             if (l.step.kind != s2::Step::MAIN) return std::vector<int>(size_t(l.step.M()), 0);
             StepIn si{}; S2In h2{};
             native_inputs(l, si, h2);
+            draft_ns = int(l.step.sess.size());
             if (slots > 1) {   // each row's slot; ns sessions of rps rows (ns > 1: the captured ns-session graphs, rps = 1 at MTP 0, 1..k + 1 with DSpark)
                 if (const char* e = ds41_session_rows(h2, slots, int(sc.mtp), bool(round), si)) require(false, e);
                 c.main.ds_ns = h2.ns;
             }
             *c.input = si;
             c.main.ds_moe_decode_step = l.step.scheduler_decode;
+            const bool timed = draft_log && l.step.scheduler_decode;
+            const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             c.enqueue(si);
             c.launch(l.buckets[0], si);
-            fence();
+            fence(); // existing synchronization: opt-in host timing adds no device fence
+            if (timed) {
+                const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+                for (int q : l.step.sess) draft_stats[size_t(q)].verify_time(h2.ns, si.M / h2.ns, us);
+            }
             if (const unsigned e = c.errors()) {      // names the code, the stuck collective and the peer (first Engram light, 10-25: no word reached any log)
                 std::vector<int> ids;
                 for (const auto& y : c.main.layers) ids.push_back(y.l);
@@ -401,9 +445,12 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
         o.prefill_seq = mod::prefill_seq<M, &M::on_prefill_seq2>;
     if (c.prefill_pack) o.prefill_pack = mod::prefill_pack<M, &M::on_prefill_pack>;
     // DS41's pool policy (PoolOps), as its module above
-#define DS41_POOL_CAPTURES(X) X(sc) X(slots) X(pool) X(ck) X(ck_mu) X(claimed) X(parked) X(claimed_slot) X(snaps)
+    const int pool_rank = c.main.rank;
+    G6S2_CAPTURE_TYPE(pool_rank)
+#define DS41_POOL_CAPTURES(X) X(pool_rank) X(sc) X(slots) X(pool) X(ck) X(ck_mu) X(claimed) X(parked) X(claimed_slot) X(snaps)
     struct Ds41Pool : ModuleCtx {
         DS41_POOL_CAPTURES(G6S2_CAPTURE_REF)
+        std::optional<Ds41ParkMissKey> last_miss{};
         uint64_t on_digest() {
             if (!ck) return pool.digest();
             std::lock_guard<std::mutex> l(ck_mu);
@@ -433,6 +480,7 @@ inline void serve_ds41(Ds41Context c, const BootstrapConfig& bc, int chunk) {
                     g6rt::PrefixReuse::common_prefix(k.tokens, prompt) < int(k.pos)) continue;
                 if (q < 0 || k.pos > parked[size_t(q)].pos) q = i;
             }
+            if (q < 0 && sc.park) ds41_park_miss(sc.park, q, parked, slots, ns, prompt, limit, pool_rank, last_miss);
             if (q >= 0 && (!f.hit || parked[size_t(q)].pos >= f.position)) {
                 hit.lcp = std::max(hit.lcp, int(parked[size_t(q)].pos));
                 if (pool.fits(rows, worst, r)) { hit.skip = int(parked[size_t(q)].pos); hit.slot = q; hit.why = "parked"; }
