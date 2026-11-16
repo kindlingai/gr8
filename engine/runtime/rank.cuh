@@ -464,6 +464,10 @@ struct Model
     int* shared = nullptr;            // [nl] device
     char* dscratch = nullptr;         // GR8_DEC_SHARED_SCRATCH=1: the one decode attention scratch of all layers (build)
     size_t dscratch_bytes = 0;
+    // with dscratch: every layer's selected ids [dio_rows][2048] int32 and attention output [dio_rows][HMAX][256] FP16
+    void *dio_ids = nullptr, *dio_out = nullptr;
+    int dio_rows = 0;
+    bool dscratch_lent = false;       // the MTP draft: dscratch and dio_* are the main model's (build_draft)
     unsigned** errs = nullptr;        // [nl] device
     g6::FabricDev f{};
     u64* stepp = nullptr;             // device step counter
@@ -834,9 +838,12 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     m.scratch = dmalloc<char>(bind::scratch_bytes());
     m.sc = bind::scratch_at(m.scratch);
     m.layers = std::vector<Layer>(m.nl);      // sized once: the attention bindings must not move
-    // GR8_DEC_SHARED_SCRATCH=1 (PLAN-600K L1): ONE decode attention scratch for every layer of a main model (decode runs the
-    // layers one after another on one stream; each run re-initializes the scratch). The draft (ids {78}) keeps its own.
-    // The drivers die without --pfv2 (the v1 prefill lanes would run two layers' attention at once).
+    // GR8_DEC_SHARED_SCRATCH=1 (PLAN-600K L1): ONE decode attention scratch, and one set of selected ids and attention
+    // output, for every layer of the main model and the MTP draft. Their attention calls never overlap: decode runs the
+    // layers one after another on one stream, the draft's steps run on that stream after the main step's, and the prefill
+    // lanes take a layer's attention in turn (pf_step2s: A_i, B_i, A_i+1). Each call re-initializes the scratch and writes
+    // its own ids and output before reading them; a reuse layer reads the last full-index layer's ids, which no layer in
+    // between writes. The drivers die without --pfv2 (the v1 prefill lanes would run two layers' attention at once).
     const int attn_rows = max_rows < MX ? MX : max_rows;
 #ifdef DEC_S2
     // S2 pool (decision on the S=1 transition contract): the binding holds s2_pool_slots runs of the reservation;
@@ -856,13 +863,23 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
 #else
     const int cap_ab = capacity;
 #endif
+    if (knob::dec_shared_scratch())
     {
-        if (knob::dec_shared_scratch() && !(m.nl == 1 && ids[0] == geom::MTP_LAYER))
+        const size_t need = std::max(g6_attn_bind_scratch_need(g6nr::HMIN, cap_ab, attn_rows, ATT_QT),
+                                     g6_attn_bind_scratch_need(g6nr::HMAX, cap_ab, attn_rows, ATT_QT));
+        if (!need) die("GR8_DEC_SHARED_SCRATCH: bad attention shape");
+        if (m.dscratch_lent)
         {
-            m.dscratch_bytes = std::max(g6_attn_bind_scratch_need(g6nr::HMIN, cap_ab, attn_rows, ATT_QT),
-                                        g6_attn_bind_scratch_need(g6nr::HMAX, cap_ab, attn_rows, ATT_QT));
-            if (!m.dscratch_bytes) die("GR8_DEC_SHARED_SCRATCH: bad attention shape");
+            if (!(m.nl == 1 && ids[0] == geom::MTP_LAYER)) die("GR8_DEC_SHARED_SCRATCH: only the MTP draft borrows the shared scratch");
+            if (m.dscratch_bytes < need || m.dio_rows < attn_rows) die("GR8_DEC_SHARED_SCRATCH: the main model's scratch is smaller than the draft's");
+        }
+        else
+        {
+            m.dscratch_bytes = need;
             m.dscratch = dmalloc<char>(m.dscratch_bytes);     // zeroed
+            m.dio_rows = attn_rows;
+            m.dio_ids = dmalloc<int>((size_t)attn_rows * 2048);
+            m.dio_out = dmalloc<__half>((size_t)attn_rows * g6nr::HMAX * 256);
         }
     }
     int last_index = -1;
@@ -914,6 +931,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
             for (int d = 0; d < 3; ++d) { w.shape[d] = r.shape[d]; s.shape[d] = rs.shape[d]; }
         };
         y.ap = G6AttnPack{{}, {}, at("kv_a_norm"), at("idx.k_norm.w"), at("idx.k_norm.b"), {}, {}};
+        y.ap.ext_indices = m.dio_ids; y.ap.ext_output = m.dio_out; y.ap.ext_rows = m.dio_rows; y.ap.ext_heads = g6nr::HMAX;
         at_kvb("kv_b.uk", y.ap.uk, y.ap.uks);
         at_kvb("kv_b.uv", y.ap.uv, y.ap.uvs);
         if (!y.ap.uks.data != !y.ap.uvs.data) die("layer " + std::to_string(y.l) + ": kv_b.uk and kv_b.uv differ in form");
@@ -1037,10 +1055,14 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     check_headroom(rank, capacity, true);
     if (m.dscratch)
     {
-        size_t real = m.dscratch_bytes;
+        const size_t io = (size_t)m.dio_rows * 2048 * 4 + (size_t)m.dio_rows * g6nr::HMAX * 256 * 2;
+        size_t real = m.dscratch_lent ? 0 : m.dscratch_bytes + io;
         for (const Layer& y : m.layers) real += y.ab.storage_bytes;
-        fprintf(stderr, "# rank %d: shared decode scratch %.3f GB; attention allocated (storage + shared scratch) %.3f GB\n", rank,
-                m.dscratch_bytes / 1e9, real / 1e9);
+        if (m.dscratch_lent)
+            fprintf(stderr, "# rank %d: attention allocated %.3f GB, on the main model's shared scratch, ids and output\n", rank, real / 1e9);
+        else
+            fprintf(stderr, "# rank %d: shared decode scratch %.3f GB, ids and output %.3f GB; attention allocated (storage + shared) %.3f GB\n",
+                    rank, m.dscratch_bytes / 1e9, io / 1e9, real / 1e9);
     }
     {
         // per-layer expert format: a count on every rank, the layer list on rank 0. Ranks do not compare formats, so a
@@ -2369,6 +2391,12 @@ inline void build_draft(Draft& D, const Model& main, const Find& find, int capac
     D.d.wide = main.wide;
     D.d.eh_in = dmalloc<__half>((size_t)MX * 2 * HID);
     D.d.eh_out = dmalloc<__half>((size_t)MX * HID);
+    if (main.dscratch)   // GR8_DEC_SHARED_SCRATCH: the draft's calls run after the main step's on its stream (build)
+    {
+        D.d.dscratch = main.dscratch; D.d.dscratch_bytes = main.dscratch_bytes;
+        D.d.dio_ids = main.dio_ids; D.d.dio_out = main.dio_out; D.d.dio_rows = main.dio_rows;
+        D.d.dscratch_lent = true;
+    }
     build(D.d, main.rank, std::vector<int>{geom::MTP_LAYER}, find, capacity, f, stepp, st, max_rows);
     // The draft has no CP binding, but its graph indices must use the target context buckets.
     D.d.nbk = main.nbk;

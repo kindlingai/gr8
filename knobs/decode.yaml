@@ -27,8 +27,8 @@ knobs:
     kind: flag
     default: "0"
     doc: >-
-      One decode attention scratch serves every layer of the main model, which frees memory for the KV pool. Needs
-      --pfv2.
+      One decode attention scratch, and one buffer of selected ids and attention output, serve every layer of the main
+      model and the MTP draft, which frees memory for the KV pool. Needs --pfv2.
   GR8_DEC_SPLIT:
     scope: agree
     kind: int

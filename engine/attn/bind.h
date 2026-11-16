@@ -22,6 +22,12 @@ struct G6AttnPack {
     // block scale of every weight row and 128-column block. Both null: uk / uv are BF16.
     G6AttnTensor uks;         // Lnnn.kv_b.uk.scale [H,192,4]; transposed once by binder to [H,4,192]
     G6AttnTensor uvs;         // Lnnn.kv_b.uv.scale [H,256,4]; borrowed unchanged
+    // the call's selected ids [ext_rows,2048] int32 and output [ext_rows,ext_heads,256] FP16, caller-owned and never
+    // freed by release; null = slices of storage. Bindings may share them only if their calls never overlap and a reuse
+    // layer's index layer is the last full-index layer called before it
+    void* ext_indices = nullptr;
+    void* ext_output = nullptr;
+    int ext_rows = 0, ext_heads = 0;
 };
 struct G6AttnStep {
     int rows, context;        // current logical context, NOT allocated capacity

@@ -80,6 +80,9 @@ struct S2Model
     int* zero_list = nullptr;         // [pool_pages] device: the pages s2_reset_pages clears
     G6AttnStepCell* cells = nullptr;  // [S2N][nl] device
     bool batch = true;                // one attention call per layer for the whole step (false: per session)
+    // with batch: the per-session views' one shared ids [MX][S2_SEL] and output [MX][HMAX][256] (never read, see s2_init)
+    int* view_ids = nullptr;
+    __half* view_out = nullptr;
     G6AttnStepCell* bcells = nullptr; // [nl] device: the batched cells, rows = rowcells + l * MX
     G6AttnRow* rowcells = nullptr;    // [nl][MX] device: per step row, its session's bounds and block table
     const int** tabs = nullptr;       // [S2N][nl] device: the slots' block tables (fixed addresses)
@@ -369,10 +372,18 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
             a.table_size = s->table_cap;
             a.page_count = p->args.page_count;
             a.block_table = s->table[q];
-            a.indices = dmalloc<int>((size_t)MX * S2_SEL);
-            a.output = dmalloc<__half>((size_t)MX * a.heads * 256);
+            // with the batch view a session's view runs no attention call (s2_step's callers are the per-session path):
+            // it keeps its table and its reset, and all of them share one ids and output
+            if (s->batch && !s->view_ids)
+            {
+                s->view_ids = dmalloc<int>((size_t)MX * S2_SEL);
+                s->view_out = dmalloc<__half>((size_t)MX * g6nr::HMAX * 256);
+                vbytes += (size_t)MX * S2_SEL * 4 + (size_t)MX * g6nr::HMAX * 256 * 2;
+            }
+            a.indices = s->batch ? s->view_ids : dmalloc<int>((size_t)MX * S2_SEL);
+            a.output = s->batch ? s->view_out : dmalloc<__half>((size_t)MX * a.heads * 256);
             a.error = dmalloc<unsigned>(1);
-            vbytes += (size_t)MX * S2_SEL * 4 + (size_t)MX * a.heads * 256 * 2 + 4;
+            vbytes += (s->batch ? 0 : (size_t)MX * S2_SEL * 4 + (size_t)MX * a.heads * 256 * 2) + 4;
 #if defined(G6_CP) && G6_CP
             a.cp_nr = 0; a.cp_rank = 0;   // S2 below R: replicated path (a no-op on non-CP bindings)
 #endif

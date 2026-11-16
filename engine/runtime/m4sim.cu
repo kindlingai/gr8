@@ -392,6 +392,9 @@ int main(int argc, char** argv)
 #endif
     if (knob::dec_shared_scratch() && !pfv2) die("GR8_DEC_SHARED_SCRATCH=1 needs --pfv2");
     const std::vector<int> layers = parse_ints(layers_s);
+    // the layers share one set of selected ids: after a step it holds the last full-index layer's, not the first layer's
+    if (knob::dec_shared_scratch() && knob::test_idx_dump() && layers.size() > 1)
+        die("GR8_TEST_IDX_DUMP with GR8_DEC_SHARED_SCRATCH=1 needs a single --layers layer");
     if (prompts.empty()) prompts.push_back(g6rt::DEFAULT_PROMPT);
     plan.inv_temp = g6rt::inv_temp(temp);
     if (const std::string e = g6rt::common_check(co, MX, plan.chunk); !e.empty()) die(e);   // the scheduler caps k at 7 whatever MX is

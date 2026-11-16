@@ -148,6 +148,8 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     b.scratch_bytes = g6a_scratch_bytes(&a);
 #endif
     if (!b.scratch_bytes || (ext_scratch && ext_bytes < b.scratch_bytes)) return invalid;
+    const bool ext_io = p->ext_indices || p->ext_output;
+    if (ext_io && !(p->ext_indices && p->ext_output && p->ext_rows >= max_rows && p->ext_heads >= h)) return invalid;
     size_t used = 0;
     auto take = [&](size_t n) { size_t at = used; used = (used + n + 255) & ~size_t(255); return at; };
     const size_t uk = take((size_t)h * 512 * 192 * (fp8 ? 1 : 2));
@@ -158,8 +160,8 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     const int ix_pages = a.page_count;
     const size_t ix = take(full ? (size_t)ix_pages * 64 * g6kv::IDX_ROW : 0);
     const size_t table = take((size_t)a.table_size * sizeof(int));
-    const size_t ids = take((size_t)max_rows * 2048 * sizeof(int));
-    const size_t output = take((size_t)max_rows * h * 256 * 2);
+    const size_t ids = take(ext_io ? 0 : (size_t)max_rows * 2048 * sizeof(int));
+    const size_t output = take(ext_io ? 0 : (size_t)max_rows * h * 256 * 2);
     const size_t error = take(sizeof(unsigned));
     const size_t scratch = take(ext_scratch ? 0 : b.scratch_bytes);   // ext: caller-owned, shared, not freed here
     b.storage_bytes = used;
@@ -168,8 +170,8 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
     char* base = (char*)b.storage;
     a.uk = base + uk; a.uks = fp8 ? (const float*)(base + uks) : nullptr; a.mla_cache = base + kv;
     a.index_cache = full ? base + ix : nullptr;
-    a.block_table = (int*)(base + table); a.indices = (int*)(base + ids);
-    a.output = base + output; a.error = (unsigned*)(base + error);
+    a.block_table = (int*)(base + table); a.indices = ext_io ? (int*)p->ext_indices : (int*)(base + ids);
+    a.output = ext_io ? p->ext_output : base + output; a.error = (unsigned*)(base + error);
     b.scratch = ext_scratch ? ext_scratch : base + scratch;
     cudaStream_t stream = (cudaStream_t)s;
     e = cudaMemsetAsync(b.storage, 0, used, stream);
