@@ -692,20 +692,28 @@ class CanonicalTests(unittest.TestCase):
         self.assertEqual(grid(PEERS, '--reuse-grid', '64', '--extra-env', 'GR8_REUSE_GRID=128'),
                          ['GR8_REUSE_GRID=128', 'GR8_REUSE_GRID=64'])
         self.assertEqual(grid(PEERS, '--kv-format', 'fp8'), [])               # not measured: unchanged
-        # a KV store: not gated with grid 64, so the launcher keeps the --prefill grid; an explicit grid still opts in
+        # a KV store: the same default grid 64, and the same rollbacks
         store = ('--kv-store', 'ssd:/x,size=1G')
-        self.assertEqual(grid(PEERS, *store), [])
-        self.assertEqual(grid(PEERS, environ={'KV_STORE': 'ssd:/x,size=1G'}), [])
+        self.assertEqual(grid(PEERS, *store), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(grid(PEERS, *store, '--kv-keep', 'sessions'), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(grid(PEERS, environ={'KV_STORE': 'ssd:/x,size=1G'}), ['GR8_REUSE_GRID=64'])
         with tempfile.TemporaryDirectory() as d:
             cfg = os.path.join(d, 'cluster.env')
             with open(cfg, 'w') as f:
                 f.write('KV_STORE=ssd:/x,size=1G\n')
             o = opt.parse(['@' + cfg, '--peers', PEERS], GLM)
             opt.validate(o)
-            self.assertFalse([a for a in opt.engine_plan(o)['env'] if a.startswith('GR8_REUSE_GRID=')])
+            self.assertEqual([a for a in opt.engine_plan(o)['env'] if a.startswith('GR8_REUSE_GRID=')], ['GR8_REUSE_GRID=64'])
         self.assertEqual(grid(PEERS, *store, '--reuse-grid', '64'), ['GR8_REUSE_GRID=64'])
-        self.assertEqual(grid(PEERS, *store, environ={'REUSE_GRID': '64'}), ['GR8_REUSE_GRID=64'])
-        self.assertEqual(grid(PEERS, *store, '--extra-env', 'GR8_REUSE_GRID=64'), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(grid(PEERS, *store, '--reuse-grid', '0'), [])
+        self.assertEqual(grid(PEERS, *store, environ={'REUSE_GRID': '0'}), [])
+        self.assertEqual(grid(PEERS, *store, '--reuse-grid', '4096'), ['GR8_REUSE_GRID=4096'])
+        self.assertEqual(grid(PEERS, *store, '--extra-env', 'GR8_REUSE_GRID=4096'), ['GR8_REUSE_GRID=4096'])
+        with self.assertRaises(opt.OptionError):   # a store needs REUSE: --reuse 0 is refused, not a rollback
+            grid(PEERS, *store, '--reuse', '0')
+        self.assertEqual(grid(PEERS, *store, '--extra-env', 'GR8_REUSE_ALIGN=0'), [])
+        self.assertEqual(grid(','.join(f'10.0.0.{i}' for i in range(1, 7)), '--kv-format', 'int4', *store), [])
+        self.assertEqual(grid(PEERS, '--kv-format', 'fp8', *store), [])
         self.assertEqual(grid(PEERS, '--kv-store', 'off'), ['GR8_REUSE_GRID=64'])
         self.assertEqual(grid(PEERS, environ={'KV_STORE': 'off'}), ['GR8_REUSE_GRID=64'])
         self.assertEqual(grid('10.0.0.1,10.0.0.2,10.0.0.3'), [])

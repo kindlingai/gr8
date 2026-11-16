@@ -363,10 +363,10 @@ engine_defaults() {
          local _fold_eff=${KV4_FOLD:-0}
          case " ${EXTRA_ENV:-} " in *" GR8_KV4_FOLD=1 "*) _fold_eff=1 ;; *" GR8_KV4_FOLD=0 "*) _fold_eff=0 ;; esac
          if [ "$_fold_eff" = 1 ]; then tp4_default KV4_TC 1; fi
-         # the prefix-reuse grid: 64-row page hits instead of 4,096-row cold cells (docs/SETTINGS.md), without KV_STORE
-         # (not gated with a store: REUSE_GRID=64 opts in). REUSE_GRID=0 rolls it back; GR8_REUSE_GRID in EXTRA_ENV keeps
-         # its own value, and GR8_REUSE_ALIGN=0 there takes no grid
-         if [ "$REUSE" = 1 ] && { [ -z "${KV_STORE:-}" ] || [ "$KV_STORE" = off ]; }; then
+         # the prefix-reuse grid: 64-row page hits instead of 4,096-row cold cells (docs/SETTINGS.md).
+         # REUSE_GRID=0 rolls it back; GR8_REUSE_GRID in EXTRA_ENV keeps its own value, and GR8_REUSE_ALIGN=0
+         # there takes no grid
+         if [ "$REUSE" = 1 ]; then
            case " ${EXTRA_ENV:-} " in *" GR8_REUSE_ALIGN=0 "*|*" G6_REUSE_ALIGN=0 "*) ;; *) tp4_default REUSE_GRID 64 ;; esac
          fi
        fi ;;

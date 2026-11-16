@@ -178,8 +178,8 @@ knobs:
       keeps [0, floor(min(skip, pf_end) / grid) * grid), or all pf_end rows on an exact prefill replay, so only whole
       prefilled KV pages are reused and decode-written rows are never reused. Below --prefill, the suffix prefill does
       not start on a cold prefill grid boundary (not cold-shaped). Conflicts with GR8_REUSE_ALIGN=0. The launcher
-      (scripts/engine_args.sh, REUSE_GRID) sets 64 on GLM-5.3 at TP=4 with KV_FORMAT=int4 without --kv-store; with
-      --kv-store it keeps the --prefill grid, and --reuse-grid 64 opts in and is not gated.
+      (scripts/engine_args.sh, REUSE_GRID) sets 64 on GLM-5.3 at TP=4 with KV_FORMAT=int4; see docs/SETTINGS.md for
+      the --kv-store write volume and the persist=on index behaviour.
   GR8_REUSE_HDUMP:
     scope: local
     kind: path

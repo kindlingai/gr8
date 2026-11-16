@@ -188,12 +188,20 @@ class ReuseGridOptionsTests(unittest.TestCase):
         for align in ('GR8_REUSE_ALIGN=0', 'G6_REUSE_ALIGN=0'):
             self.assertEqual(self.grid('--extra-env', align), [])
 
-    def test_kv_store_keeps_the_prefill_grid(self):
+    def test_kv_store_takes_the_default_grid(self):
         store = ('--kv-store', 'ssd:/x,size=1G')
-        self.assertEqual(self.grid(*store), [])
-        self.assertEqual(self.grid(*store, '--kv-keep', 'sessions'), [])
-        self.assertEqual(self.grid(*store, '--reuse-grid', '64'), ['GR8_REUSE_GRID=64'])   # opts in, not gated
+        self.assertEqual(self.grid(*store), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(self.grid(*store, '--kv-keep', 'sessions'), ['GR8_REUSE_GRID=64'])
+        self.assertEqual(self.grid(*store, '--reuse-grid', '64'), ['GR8_REUSE_GRID=64'])
         self.assertEqual(self.grid('--kv-store', 'off'), ['GR8_REUSE_GRID=64'])
+        for rollback in (('--reuse-grid', '0'), ('--extra-env', 'GR8_REUSE_ALIGN=0')):
+            self.assertEqual(self.grid(*store, *rollback), [])
+        self.assertEqual(self.grid(*store, '--reuse-grid', '4096'), ['GR8_REUSE_GRID=4096'])
+        self.assertEqual(self.grid(*store, '--extra-env', 'GR8_REUSE_GRID=4096'), ['GR8_REUSE_GRID=4096'])
+        with self.assertRaises(opt.OptionError):   # a store needs REUSE, so --reuse 0 is refused, not a rollback
+            self.grid(*store, '--reuse', '0')
+        for tp, args in ((6, ('--kv-format', 'int4')), (4, ('--kv-format', 'fp8'))):
+            self.assertEqual(self.grid(*args, *store, tp=tp), [])
 
     def test_other_shapes_unchanged(self):
         for tp, args in ((6, ('--kv-format', 'int4')), (3, ('--kv-format', 'int4')), (5, ()), (4, ('--kv-format', 'fp8'))):

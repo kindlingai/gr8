@@ -23,9 +23,9 @@ with `--forced-tool-thinking 1` / `FORCED_TOOL_THINKING=1`. `--default-reasoning
 by default. DS41 also parks finished chats with prefix reuse and at least two sessions; roll back with
 `--extra-env GR8_DS_PARK=0` / `EXTRA_ENV=GR8_DS_PARK=0`. See [DeepSeek](docs/DEEPSEEK.md#forced-tools-and-parked-chats).
 
-GLM-5.3 at TP=4 with `KV_FORMAT=int4` sets `REUSE_GRID=64` (`GR8_REUSE_GRID=64`) without `--kv-store`: a prefix-reuse
-hit keeps whole 64-row pages instead of 4,096-row cells. Roll back with `--reuse-grid 0` / `REUSE_GRID=0`. With
-`--kv-store` the launcher keeps the 4,096-row `--prefill` grid; `--reuse-grid 64` opts in and is not gated. See [docs/SETTINGS.md](docs/SETTINGS.md) (`GR8_REUSE_GRID`).
+GLM-5.3 at TP=4 with `KV_FORMAT=int4` sets `REUSE_GRID=64` (`GR8_REUSE_GRID=64`), with `--kv-store` too: a prefix-reuse
+hit keeps whole 64-row pages instead of 4,096-row cells. With `--kv-store` and `keep=sessions` it writes about 1.9x the
+SSD bytes of the 4,096-row grid. Roll back with `--reuse-grid 0` / `REUSE_GRID=0`. See [docs/SETTINGS.md](docs/SETTINGS.md) (`GR8_REUSE_GRID`).
 
 The launcher prints its options:
 
