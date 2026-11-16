@@ -410,9 +410,8 @@ options:
       REUSE=1: the prefix-reuse grid in rows (GR8_REUSE_GRID): a hit keeps the prefilled prefix cut down to a multiple of
       it, so a turn re-prefills fewer rows. A positive multiple of 64, at most --prefill (4,096 on GLM-5.3; the engine
       refuses a larger one at start). 0 = unset: the --prefill grid (GR8_REUSE_ALIGN=1). GLM-5.3 at TP=4 with
-      KV_FORMAT=int4 defaults to 64 without KV_STORE (docs/SETTINGS.md); roll back with --reuse-grid 0 /
-      REUSE_GRID=0. With KV_STORE the launcher keeps the 4,096-row --prefill grid; --reuse-grid 64 opts in and is not
-      gated. Not with GR8_REUSE_ALIGN=0
+      KV_FORMAT=int4 defaults to 64, with KV_STORE too (with keep=sessions it writes about 1.9x the SSD bytes of the
+      4,096-row grid, docs/SETTINGS.md); roll back with --reuse-grid 0 / REUSE_GRID=0. Not with GR8_REUSE_ALIGN=0
   FLASH_CACHE:
     scope: cluster
     doc: >-
