@@ -40,6 +40,9 @@ g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/comms" "$REPO/engine/
 # slot runs and the compact recv area (fabric.h fab_slot_layout): one run is the old offsets, runs tile the region
 g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_runs_test.cpp" -o "$T/fabric_runs_test"
 "$T/fabric_runs_test"
+# GR8_SPIN_TIMEOUT_S: seconds -> SM cycles; unset keeps the compile-time G6_SPIN_TIMEOUT_CYC (fabric.h spin_timeout_cyc)
+g++ -std=c++17 -O2 -Wall -Wextra -I "$REPO/engine/comms" "$REPO/engine/comms/tests/spin_timeout_test.cpp" -o "$T/spin_timeout_test"
+"$T/spin_timeout_test"
 g++ -std=c++17 -O2 -Wall -Wextra -fsanitize=address,undefined -I "$REPO/engine/comms" "$REPO/engine/comms/tests/fabric_ring_runs_test.cpp" -o "$T/fabric_ring_runs_test"
 "$T/fabric_ring_runs_test"
 g++ -std=c++17 -O2 -Wall -fsanitize=address,undefined -I "$REPO/engine/comms" "$REPO/engine/comms/tests/relay_test.cpp" \

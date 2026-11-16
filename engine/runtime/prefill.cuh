@@ -149,7 +149,7 @@ __global__ void __launch_bounds__(32) k_wait_rs(g6::FabricDev f, const u64* step
         const long long t0 = clock64();
         unsigned it = 0;
         while (glue::ld_acquire_sys(tail) != seq)
-            if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(f.error) != 0 || clock64() - t0 > G6_SPIN_TIMEOUT_CYC))
+            if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(f.error) != 0 || clock64() - t0 > f.spin_cyc))
             {
                 atomicCAS(f.error, 0u, glue::ERR_AR | ((unsigned)c << 8) | (unsigned)p);
                 break;
@@ -364,7 +364,7 @@ __global__ void __launch_bounds__(32) k_wait_ag(g6::FabricDev f, const u64* step
         const long long t0 = clock64();
         unsigned it = 0;
         while (glue::ld_acquire_sys(tail) != seq)
-            if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(f.error) != 0 || clock64() - t0 > G6_SPIN_TIMEOUT_CYC))
+            if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(f.error) != 0 || clock64() - t0 > f.spin_cyc))
             {
                 atomicCAS(f.error, 0u, glue::ERR_AR | ((unsigned)c << 8) | (unsigned)p);
                 break;
@@ -2139,7 +2139,7 @@ __global__ void __launch_bounds__(32) k_cp_pf_wait(g6::BulkDev bd, int k, unsign
     const long long t0 = clock64();
     unsigned it = 0;
     while (glue::ld_acquire_sys(f) < want)
-        if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(bd.error) != 0 || clock64() - t0 > G6_SPIN_TIMEOUT_CYC))
+        if ((++it & 1023u) == 0 && (*reinterpret_cast<volatile unsigned*>(bd.error) != 0 || clock64() - t0 > bd.spin_cyc))
         {
             atomicCAS(bd.error, 0u, code | (unsigned)(k << 8) | (unsigned)p);
             return;

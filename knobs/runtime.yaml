@@ -145,6 +145,18 @@ knobs:
     doc: >-
       Writes rank 0's residual stream after the embedding and after every attention and MLP sublayer of each offline
       main step to this file, in the m4sim dump format.
+  GR8_SPIN_TIMEOUT_S:
+    scope: agree
+    kind: int
+    unset: "the compile-time G6_SPIN_TIMEOUT_CYC (~10 s at GB10 clocks)"
+    values: "1.."
+    doc: >-
+      How long a GPU wait for a peer's fabric rows may spin before it writes the error word and the epoch aborts
+      (the S2 prefill fabric/attention error, the ERR_AR and cp_pf codes). The ~10 s default was sized for decode
+      steps; a prefill quantum under several concurrent long prompts (or a fabric retransmit stall) can hold a
+      peer's rows past it, and one rank's abort stops the whole TP epoch and every in-flight request. Raise it
+      (e.g. 60) on lanes that take such loads. Seconds become SM cycles at the same ~2 GHz estimate the
+      compile-time default documents.
   GR8_TEST_ZERO_DELAY_MS:
     scope: local
     kind: int

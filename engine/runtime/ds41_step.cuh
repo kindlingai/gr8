@@ -70,7 +70,7 @@ struct Ds41RelayBlock : Ds41Block {
                 const long long t0=clock64();
                 unsigned it=0;
                 while(ds41_ld_acquire_gpu(relay)!=seq) {
-                    if((++it&1023u)==0 && (*reinterpret_cast<volatile unsigned*>(f.error)!=0 || clock64()-t0>2*G6_SPIN_TIMEOUT_CYC)) {
+                    if((++it&1023u)==0 && (*reinterpret_cast<volatile unsigned*>(f.error)!=0 || clock64()-t0>2*f.spin_cyc)) {
                         atomicCAS(f.error,0u,glue::ERR_AR|((unsigned)c<<8)|(unsigned)f.rank);   // peer = this rank: the relay word never came
                         break;
                     }

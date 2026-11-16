@@ -13,6 +13,14 @@
 #include <vector>
 #include "../model_geom.h"
 
+// The GPU spin wait cap on a peer's fabric rows, in SM clock cycles. A build gets the compile-time default
+// (~10 s at GB10 clocks) when GR8_SPIN_TIMEOUT_S is unset; tests may override the define on the nvcc command
+// line. GR8_SPIN_TIMEOUT_S (knobs/runtime.yaml) overrides it at boot: fabric.cpp Fabric::init turns seconds
+// into cycles with g6::spin_timeout_cyc (fabric.h) at the same ~2 GHz estimate.
+#ifndef G6_SPIN_TIMEOUT_CYC
+#define G6_SPIN_TIMEOUT_CYC 20000000000LL   // ~10 s at GB10 clocks; tests override
+#endif
+
 namespace g6 {
 
 // What a kernel needs to publish / wait on collective c of a VLayout fabric, both parities resolved on the host
@@ -25,6 +33,7 @@ struct VSlotDev
     unsigned int* error;
     int c, ncoll, nsrc;
     int src[7];
+    unsigned long long spin_cyc = G6_SPIN_TIMEOUT_CYC;   // wait cap on a silent peer (GR8_SPIN_TIMEOUT_S); the compile default when unset
 };
 
 struct VLayout
