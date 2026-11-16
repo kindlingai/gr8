@@ -794,10 +794,19 @@ static Work workspace(const G6Attn& a,void* base){
     Work w{};size_t n=0;const size_t R=std::min(a.rows,a.query_tile),H=a.heads,T=a.context;
     auto alloc=[&](size_t bytes){size_t old=n;n=(n+bytes+255)&~size_t(255);return (void*)((uintptr_t)base+old);};
     w.q=(float*)alloc(R*H*512*4);w.rope=(float*)alloc(R*H*64*4);w.iq=(half*)alloc(R*32*128*2);w.weights=(float*)alloc(R*32*4);
+#ifdef SEL32
+    // select_index never sorts past 32768 here: so holds only threshold_compact32's bins, and io, offsets and the CUB
+    // temp are unused
+    w.si=(float*)alloc(R*T*4);w.so=(float*)alloc(R*((T+RADIX_CHUNK-1)/RADIX_CHUNK)*256*4);w.ii=(int*)alloc(R*T*4);
+#else
     w.si=(float*)alloc(R*T*4);w.so=(float*)alloc(R*T*4);w.ii=(int*)alloc(R*T*4);w.io=(int*)alloc(R*T*4);w.offsets=(int*)alloc((R+1)*4);
+#endif
     w.selected=(uint64_t*)alloc(R*TOP*8);w.selection=(SelectionState*)alloc(R*sizeof(SelectionState));
     w.histogram=(int*)alloc(R*((std::min(T,size_t(32768))+RADIX_CHUNK-1)/RADIX_CHUNK)*256*4);
     w.prob=(float*)alloc(R*H*TOP*4);w.parts=(float*)alloc(R*H*(attn_ctx3_sp()?TOP/attn_ctx3_sp():PART)*512*4);w.context=(float*)alloc(R*H*512*4);
+#ifdef SEL32
+    w.total=n;return w;
+#endif
     size_t b=0;cudaError_t e=cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr,b,w.si,w.so,w.ii,w.io,(int)(R*T),(int)R,w.offsets,w.offsets+1);
     if(e!=cudaSuccess)return Work{};
     // The last query tile can contain one row even when the workspace has R>1.
@@ -832,7 +841,7 @@ static void threshold_compact(const G6Attn& a,Input input,Work& w,int count,cuda
     radix_compact<<<dim3(chunks,count),256,0,stream>>>(input,w.si,w.selection,w.selected);
 }
 #ifdef SEL32
-template<class Input>   // context > 32768: the histogram lives in w.so (R*T*4 B >= R*chunks*1 KB), unused without the full sort
+template<class Input>   // context > 32768: the histogram lives in w.so (R*chunks*1 KB, workspace)
 static void threshold_compact32(const G6Attn& a,Input input,Work& w,int count,cudaStream_t stream){
     const int chunks=(a.context+RADIX_CHUNK-1)/RADIX_CHUNK;int* bins=(int*)w.so;
     for(int pass=0;pass<8;pass++){
