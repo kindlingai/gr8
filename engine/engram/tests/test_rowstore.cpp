@@ -10,9 +10,28 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include "../rowstore.h"
 
 using namespace ds41::engram;
+
+// T10 test seam, in this binary only: a pread() that overlaps the file bytes [g_slow_lo, g_slow_hi) before g_slow_until_ns (steady
+// clock) first sleeps until then, so one fetch of those rows lasts longer than the keepalive's 250 ms active window. The range is
+// one 4 KiB block, so the keepalive's own strided reads almost never hit it. RowStore itself is unchanged.
+static std::atomic<int64_t> g_slow_until_ns{0}, g_slow_lo{0}, g_slow_hi{0};
+static int64_t steady_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+extern "C" ssize_t pread(int fd, void* buf, size_t n, off_t off)
+{
+    const int64_t until = g_slow_until_ns.load(std::memory_order_acquire);
+    const int64_t now = steady_ns();
+    if (until > now && off < g_slow_hi.load(std::memory_order_relaxed) && off + (off_t)n > g_slow_lo.load(std::memory_order_relaxed))
+        std::this_thread::sleep_for(std::chrono::nanoseconds(until - now));
+    return (ssize_t)syscall(SYS_pread64, fd, buf, n, off);
+}
 
 static int g_fail = 0;
 #define CHECK(c, ...) do { if (!(c)) { ++g_fail; fprintf(stderr, "FAIL %s:%d: ", __FILE__, __LINE__); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } } while (0)
@@ -273,6 +292,105 @@ int main(int argc, char** argv)
         std::vector<TableFile> gap = {{"", 0, s1.valid, {{pa, 0, cut, 65536}, {pb, cut + 1, s1.valid - cut - 1, 0}}}};
         RowStore rg;
         CHECK(!rg.open(gap, o, &err) && err.find("consecutive") != std::string::npos, "a gap between runs must fail open: %s", err.c_str());
+    }
+
+    // ---- T9: keepalive (keepalive_ms = 10): reads only while fetches are active, none when idle, fetch results unchanged
+    {
+        StoreOpts off = o;
+        off.cache_bytes = 64ull << 20;
+        off.keepalive_ms = 0;
+        StoreOpts on = off;
+        on.keepalive_ms = 10;
+        RowStore a;
+        std::unique_ptr<RowStore> bp(new RowStore());
+        RowStore& b = *bp;
+        CHECK(a.open(files, off, &err), "open keepalive off: %s", err.c_str());
+        CHECK(b.open(files, on, &err), "open keepalive on: %s", err.c_str());
+        CHECK(!a.keepalive_running(), "keepalive_ms = 0 must not start a thread");
+        CHECK(b.keepalive_running() == b.direct(0), "keepalive runs iff table 0 is O_DIRECT (direct %d running %d)", b.direct(0), b.keepalive_running());
+        std::mt19937_64 rng(7);
+        std::vector<uint32_t> ids(3000);
+        for (auto& x : ids) x = (uint32_t)(s0.first + rng() % s0.valid);
+        std::vector<uint8_t> da(ids.size() * 256), db(ids.size() * 256);
+        auto ms = [](int n) { std::this_thread::sleep_for(std::chrono::milliseconds(n)); };
+        ms(60);
+        CHECK(b.keepalive_stats().reads == 0, "no reads before the first fetch: %llu", (unsigned long long)b.keepalive_stats().reads);
+        FetchStats sa, sb;
+        CHECK(a.fetch(0, ids.data(), ids.size(), da.data(), &sa) == 0 && b.fetch(0, ids.data(), ids.size(), db.data(), &sb) == 0, "keepalive fetch err");
+        CHECK(!memcmp(da.data(), db.data(), da.size()), "keepalive changed fetched rows");
+        CHECK(sa.blocks == sb.blocks && sa.bytes == sb.bytes && sa.miss_uniq == sb.miss_uniq && sa.hits == sb.hits,
+              "keepalive changed fetch stats: blocks %u/%u bytes %llu/%llu", sa.blocks, sb.blocks, (unsigned long long)sa.bytes, (unsigned long long)sb.bytes);
+        if (b.keepalive_running())
+        {
+            CHECK(b.keepalive_blocks() > 0, "no eligible keepalive blocks");
+            for (int i = 0; i < 80; ++i)   // ~400 ms of active all-hit fetches (no drive reads): the keepalive must read
+            {
+                CHECK(b.fetch(0, ids.data(), 64, db.data(), &sb) == 0 && sb.blocks == 0, "active fetch err or read");
+                ms(5);
+            }
+            const RowStore::KeepaliveStats k1 = b.keepalive_stats();
+            // the two counters are read while a tick may be in flight: reads can lead ticks by up to one tick's 4 reads
+            CHECK(k1.reads >= 8 && k1.reads >= 4 * k1.ticks && k1.reads <= 4 * k1.ticks + 4 && k1.errors == 0, "active: ticks %llu reads %llu err %llu",
+                  (unsigned long long)k1.ticks, (unsigned long long)k1.reads, (unsigned long long)k1.errors);
+            for (size_t i = 0; i < 64; ++i) CHECK(same(0, ids[i], &db[i * 256]), "row %zu wrong with keepalive", i);
+            ms(300);   // > the 250 ms active window: the thread parks
+            const uint64_t r1 = b.keepalive_stats().reads;
+            ms(150);
+            const RowStore::KeepaliveStats k_parked = b.keepalive_stats();
+            CHECK(k_parked.reads == r1, "idle keepalive read: %llu -> %llu", (unsigned long long)r1, (unsigned long long)k_parked.reads);
+            CHECK(k_parked.reads == 4 * k_parked.ticks, "parked: ticks %llu reads %llu", (unsigned long long)k_parked.ticks, (unsigned long long)k_parked.reads);
+            printf("keepalive: ticks %llu reads %llu max_us %llu over %llu blocks\n", (unsigned long long)k1.ticks, (unsigned long long)k1.reads,
+                   (unsigned long long)k1.max_us, (unsigned long long)b.keepalive_blocks());
+            CHECK(b.open(files, on, &err) && b.keepalive_running(), "second open must restart the keepalive: %s", err.c_str());
+            CHECK(b.fetch(0, ids.data(), 64, db.data(), &sb) == 0, "fetch after reopen");
+            ms(40);
+            CHECK(b.keepalive_stats().errors == 0, "keepalive error after reopen");
+        }
+        else printf("keepalive: table 0 is not O_DIRECT here; thread checks skipped\n");
+        const auto t0 = std::chrono::steady_clock::now();
+        bp.reset();   // shutdown while active: stop + join must be quick
+        const double ms_down = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        CHECK(ms_down < 100.0, "keepalive shutdown took %.1f ms", ms_down);
+    }
+
+    // ---- T10: a fetch longer than the 250 ms active window must not leave the keepalive parked for the short-gap fetches after it
+    {
+        StoreOpts on = o;
+        on.cache_bytes = 64ull << 20;
+        on.keepalive_ms = 10;
+        RowStore c;
+        CHECK(c.open(files, on, &err), "T10 open: %s", err.c_str());
+        if (c.keepalive_running())
+        {
+            auto ms = [](int n) { std::this_thread::sleep_for(std::chrono::milliseconds(n)); };
+            std::vector<uint32_t> warm(64), cold(8);
+            for (int i = 0; i < 64; ++i) warm[i] = (uint32_t)(s0.first + (int64_t)i * 37);   // rows 0..2331
+            const int64_t c0 = (s0.valid / 2) & ~(int64_t)15;   // 8 rows inside one 4 KiB block of table 0, not in the warm set
+            for (int i = 0; i < 8; ++i) cold[i] = (uint32_t)(s0.first + c0 + i);
+            g_slow_lo.store(c0 * 256);
+            g_slow_hi.store(c0 * 256 + 4096);
+            std::vector<uint8_t> d(64 * 256);
+            FetchStats st;
+            CHECK(c.fetch(0, warm.data(), warm.size(), d.data(), &st) == 0, "T10 warm fetch");
+            ms(20);
+            g_slow_until_ns.store(steady_ns() + 320000000ll, std::memory_order_release);
+            const auto t0 = std::chrono::steady_clock::now();
+            CHECK(c.fetch(0, cold.data(), cold.size(), d.data(), &st) == 0 && st.blocks > 0, "T10 long fetch err or no drive read");
+            const double long_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            g_slow_until_ns.store(0, std::memory_order_release);
+            CHECK(long_ms > 260.0, "T10 long fetch took only %.1f ms (pread seam not active)", long_ms);
+            const RowStore::KeepaliveStats k0 = c.keepalive_stats();
+            for (int i = 0; i < 100; ++i)   // ~0.6 s of all-hit fetches 5 ms apart
+            {
+                CHECK(c.fetch(0, warm.data(), warm.size(), d.data(), &st) == 0 && st.blocks == 0, "T10 short fetch err or read");
+                ms(5);
+            }
+            const RowStore::KeepaliveStats k1 = c.keepalive_stats();
+            CHECK(k1.reads - k0.reads >= 8 && k1.errors == 0, "T10 keepalive parked after a long fetch: reads %llu -> %llu err %llu",
+                  (unsigned long long)k0.reads, (unsigned long long)k1.reads, (unsigned long long)k1.errors);
+            printf("keepalive T10: long fetch %.0f ms, then %llu keepalive reads in 100 short-gap fetches\n", long_ms, (unsigned long long)(k1.reads - k0.reads));
+        }
+        else printf("keepalive T10: table 0 is not O_DIRECT here; skipped\n");
     }
 
     if (g_fail) { fprintf(stderr, "FAILED %d checks\n", g_fail); return 1; }

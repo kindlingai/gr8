@@ -47,6 +47,15 @@ knobs:
       seccomp profile that allows io_uring_setup, io_uring_enter and io_uring_register. The stock Docker
       profile denies those calls with EPERM. A denied setup logs the errno once and uses the pread pool
       sized by GR8_DS_ENGRAM_IO_THREADS (engine/engram/rowstore.h; tested with EPERM and ENOSYS).
+  GR8_DS_ENGRAM_KEEPALIVE_MS:
+    scope: local
+    kind: int
+    default: "15"
+    values: "0..1000"
+    legacy: []
+    doc: >-
+      Reads four 4 KiB blocks every N ms while Engram fetches are active, so the NVMe drive does not enter an idle
+      sleep state between decode steps; 0 disables it, and results do not change.
   GR8_DS_ENGRAM_LOOKAHEAD:
     scope: local
     kind: flag
