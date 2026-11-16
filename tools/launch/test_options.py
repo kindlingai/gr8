@@ -173,8 +173,7 @@ class ValidateTests(unittest.TestCase):
         self.check(['--peers', PEERS, '--ips', 'a,b,c,d'], 'IPS and IPS2 go together')
         self.check(['--peers', PEERS, '--ips', 'a,b', '--ips2', 'a,b'], 'IPS has 2 addresses')
         self.check(['--peers', PEERS, '--default-max-tokens', '4k'], 'want a whole number')
-        self.check(['--peers', PEERS, '--default-reasoning-effort', 'none'], 'cannot turn thinking off')
-        self.check(['--peers', PEERS, '--default-reasoning-effort', 'auto'], 'want minimal, low, medium')
+        self.check(['--peers', PEERS, '--default-reasoning-effort', 'auto'], 'want none, minimal, low, medium')
         for bad in ('-1', '4k', '1.5x', '0.5', '16384|', '16384|0.5', '0.5x|16384', '16384|1.5x', '1|2|0.5x', '0|0.5x'):
             self.check(['--peers', PEERS, '--default-thinking-budget', bad], '--default-thinking-budget')
         self.check(['--peers', PEERS, '--default-thinking-budget', '-1'], 'want a token count')

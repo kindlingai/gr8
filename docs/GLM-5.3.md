@@ -240,18 +240,20 @@ measurements. `./gr8 knobs KV_STORE KV_ROWS` describes every `KV_STORE` and `KV_
 
 ## Thinking
 
-GLM 5.3 always thinks: its chat template has no switch to turn thinking off. A chat request controls how much it thinks
-with these fields:
+GLM 5.3 always thinks: its chat template has no switch to turn thinking off. A chat request controls how much it thinks,
+and whether the reply shows it, with these fields:
 
 | field | values | on GLM 5.3 |
 |---|---|---|
-| `reasoning_effort` (top level, or in `chat_template_kwargs`) | `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | The template names `low`, `high` and `max`. Another value becomes the nearest of those, ties going higher: `minimal` is `low`, `medium` is `high`, `xhigh` is `max`. Unset is `max`. `none` and any other value are a 400 |
+| `reasoning_effort` (top level, or in `chat_template_kwargs`) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | The template names `low`, `high` and `max`. Another value becomes the nearest of those, ties going higher: `minimal` is `low`, `medium` is `high`, `xhigh` is `max`. Unset is `max`. `none` is thinking off (below). Any other value is a 400 |
 | `thinking_budget` | an integer, or null | While the think block is open, the front end puts `\n</think>\n\n` in place of the reply's Nth token (so N-1 reasoning tokens come first), and the answer follows. 0, null or unset takes the server default, as in TensorFold. A negative number is no limit |
-| `chat_template_kwargs.enable_thinking` | `true`; `false` with `--allow-thinking-off 1` | `false` is a 400 that names `reasoning_effort` `low`, `thinking_budget` and `--allow-thinking-off` instead |
+| `chat_template_kwargs.enable_thinking` (else `thinking`) | `true`, `false` | `false` is thinking off: the prompt renders `Reasoning Effort: Low` with the think block open, and the response withholds the reasoning (no `reasoning` or `reasoning_content`, whole or streamed). `true` wins over `reasoning_effort: "none"` |
 | `response_format` | `{"type": "text"}`, `json_object`, `json_schema` (chat) | Without tools the engine masks the reply to the schema's XGrammar grammar (`GRAMMAR=1`), and the front end checks it after generation: the reply's first JSON value, and for `json_schema` the schema ([frontend/README.md](../frontend/README.md)) |
 
 `usage.completion_tokens_details.reasoning_tokens` counts the reply's tokens through its `</think>`.
 `--default-reasoning-effort` and `--default-thinking-budget` set the defaults for requests that name none (`./gr8 knobs DEFAULT_`).
+`--default-reasoning-effort none` makes thinking off the default; a request's own effort or switch wins.
+`--allow-thinking-off` is still accepted and changes nothing.
 The engine puts the close in place of the token itself (an insert rule, PROTOCOL.md), so a cut costs one more main step.
 With an engine from before that, the front end ends the run and continues from the prompt, the reply and the close,
 which prefills the prompt's last partial 4,096-token cell and the reasoning again: 2.5 to 4.2 s at TP=4's cold prefill

@@ -467,8 +467,8 @@ def validate(o):
     elif effort == 'none' and not model.thinking_off:
         raise OptionError('--default-reasoning-effort none: GLM 5.3 cannot turn thinking off (use low, or '
                           '--default-thinking-budget)')
-    elif effort not in (None, 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
-        raise OptionError(f'--default-reasoning-effort {effort}: want minimal, low, medium, high, xhigh or max')
+    elif effort not in (None, 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
+        raise OptionError(f'--default-reasoning-effort {effort}: want none, minimal, low, medium, high, xhigh or max')
     if o.get('CHUNK') is not None and 'CHUNK' not in model.serve_options:
         raise OptionError(f'--chunk: ds41 only (the prompt rows a step of the DeepSeek serve path); ./gr8 {model.name} sets its own')
     if o.get('EAGER') is not None and 'EAGER' not in model.serve_options:

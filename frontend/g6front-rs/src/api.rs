@@ -550,12 +550,10 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         } else {
             st.tpl().render(Some(&messages), tools.as_ref(), kw)?
         };
-        if th.off {
-            text = match st.dialect {
-                Dialect::Hf => dialect::hf_thinking_off(text, agp_on),
-                Dialect::Inkling => text, // the effort line says it; the prompt has no think block to close
-                _ => st.tpl().thinking_off(text, agp_on),
-            };
+        // GLM renders its lowest effort with the think block open, and Inkling's effort line says it: only an hf
+        // template's open think block is closed here
+        if th.off && st.dialect == Dialect::Hf {
+            text = dialect::hf_thinking_off(text, agp_on);
         }
         text
     };
@@ -569,7 +567,7 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
     let system = if ds {
         ds_system_span(st, body.get("messages"), tools.as_ref(), !th.off, ds_effort, &prompt).await
     } else {
-        system_span(st, body.get("messages"), tools.as_ref(), kw_system, add_special, th.off, &prompt).await
+        system_span(st, body.get("messages"), tools.as_ref(), kw_system, add_special, &prompt).await
     };
     let (prompt, system, spans) = if images.is_empty() {
         (prompt, system, Vec::new())
@@ -760,7 +758,6 @@ async fn system_span(
     tools: Option<&Value>,
     mut kw: Map<String, Value>,
     add_special: bool,
-    thinking_off: bool,
     prompt: &[u32],
 ) -> Option<u64> {
     let lead: Vec<Value> = messages?
@@ -774,10 +771,7 @@ async fn system_span(
     }
     kw.insert("add_generation_prompt".into(), Value::Bool(false));
     kw.insert("continue_final_message".into(), Value::Bool(false));
-    let mut text = st.tpl().render(Some(&Value::Array(lead)), tools, kw).ok()?;
-    if thinking_off && st.dialect == Dialect::Glm {
-        text = st.tpl().thinking_off(text, false);
-    }
+    let text = st.tpl().render(Some(&Value::Array(lead)), tools, kw).ok()?;
     let ids = st.tok.aencode(text, add_special).await.ok()?;
     Some(ids.iter().zip(prompt).take_while(|(a, b)| a == b).count() as u64)
 }
@@ -814,7 +808,8 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
         Err(e) => return e.response(),
     };
     let rid = new_id("chatcmpl");
-    let include_reasoning = body.get("include_reasoning").is_none_or(|v| truthy(Some(v)));
+    // thinking off withholds the reasoning, whatever the model still writes in its think block
+    let include_reasoning = !cr.thinking_off && body.get("include_reasoning").is_none_or(|v| truthy(Some(v)));
     let choice_value = cr.choice.as_value();
     let content_first = match (st.tok.think_start, st.tok.think_end) {
         (Some(start), Some(end)) => !think_open(&cr.prompt, start, end),
@@ -1700,12 +1695,8 @@ async fn tokenize(st: &'static State, req: Request<Incoming>) -> Response<HttpBo
                 } else {
                     (st.tpl().render(Some(&msgs), tools.as_ref(), kw)?, Vec::new())
                 };
-                if th.off {
-                    text = match st.dialect {
-                        Dialect::Hf => dialect::hf_thinking_off(text, agp_on),
-                        Dialect::Inkling => text,
-                        _ => st.tpl().thinking_off(text, agp_on),
-                    };
+                if th.off && st.dialect == Dialect::Hf {
+                    text = dialect::hf_thinking_off(text, agp_on);
                 }
                 let ids = st
                     .tok

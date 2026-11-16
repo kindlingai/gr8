@@ -456,9 +456,11 @@ pub fn resolve_hf(
             }
         },
     };
+    // an explicit switch wins, then an explicit effort, then the server default (`--default-reasoning-effort none`)
     let off = match switch {
         Some(s) => !s,
-        None => explicit == Some("none"),
+        None if explicit.is_some() => explicit == Some("none"),
+        None => defaults.effort == Some("none"),
     };
     if off {
         return Ok((
@@ -466,8 +468,9 @@ pub fn resolve_hf(
             Some(false),
         ));
     }
-    let explicit = if explicit == Some("none") { None } else { explicit };
-    let effort = explicit.or(defaults.effort).map(|x| thinking::nearest(x, levels));
+    let explicit = explicit.filter(|x| *x != "none");
+    let default_effort = defaults.effort.filter(|x| *x != "none");
+    let effort = explicit.or(default_effort).map(|x| thinking::nearest(x, levels));
     let (budget, budget_explicit) = match thinking::parse_budget(body.get("thinking_budget"))? {
         None | Some(0) => (defaults.budget, false),
         Some(n) if n < 0 => (Limit::Tokens(0), false),
@@ -951,6 +954,24 @@ mod tests {
         let (th, _) = r(json!({"reasoning_effort": "max"})).unwrap();
         assert_eq!(th.effort, Some("high"));
         assert_eq!(r(json!({"reasoning_effort": "bogus"})).unwrap_err().status, 400);
+    }
+
+    #[test]
+    fn resolve_hf_server_default_none_turns_thinking_off_unless_the_request_says_otherwise() {
+        let levels = ["high", "medium", "low"];
+        let d = thinking::Defaults { effort: Some("none"), budget: Limit::Tokens(0), allow_off: false };
+        let r = |v: Value| resolve_hf(&body(v), &levels, d).unwrap();
+        let (th, sw) = r(json!({}));
+        assert_eq!((th.off, th.effort, sw), (true, None, Some(false)));
+        let (th, sw) = r(json!({"reasoning_effort": null}));
+        assert_eq!((th.off, sw), (true, Some(false)));
+        // an explicit effort or switch wins, and none never reaches the template
+        let (th, sw) = r(json!({"reasoning_effort": "low"}));
+        assert_eq!((th.off, th.effort, sw), (false, Some("low"), None));
+        let (th, sw) = r(json!({"chat_template_kwargs": {"enable_thinking": true}}));
+        assert_eq!((th.off, th.effort, sw), (false, None, Some(true)));
+        let (th, _) = r(json!({"reasoning_effort": "none", "chat_template_kwargs": {"thinking": true}}));
+        assert_eq!((th.off, th.effort), (false, None));
     }
 
     #[test]

@@ -121,8 +121,8 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--enable-prompt-tokens-details] [--log-level LEVEL]
                   [--workers N] [--encode-threads N] [--default-max-tokens N]
                   [--share-tokens N] [--max-connections N]
-                  [--default-reasoning-effort minimal|low|medium|high|xhigh|max (ds41: or none, or an integer 1-100;
-                   inkling: or none, or a number 0.0-0.99)]
+                  [--default-reasoning-effort none|minimal|low|medium|high|xhigh|max (ds41: or an integer 1-100;
+                   inkling: or a number 0.0-0.99)]
                   [--default-thinking-budget N, Fx or N|Fx] [--allow-thinking-off] [--clamp-max-tokens]
                   [--default-presence-penalty SPEC] [--default-frequency-penalty SPEC]
                   [--default-think-end-boost start=S,per1k=P,max=M] [--default-sequence-penalty SPEC]
@@ -363,15 +363,16 @@ async fn serve(args: Args) -> Result<(), String> {
             let effort = args.default_effort.as_deref().map(thinking::parse_default_effort).transpose()?;
             log::info!(
                 "dialect glm: tokenizer + template loaded in {:.0} ms (vocab {}); reasoning efforts the template names: \
-                 {:?}; default effort {:?}, default thinking budget {}, thinking off {}",
+                 {:?}; default effort {:?}, default thinking budget {}, thinking off allowed{}",
                 t0.elapsed().as_secs_f64() * 1e3,
                 tok.vocab_size,
                 template.levels,
                 effort,
                 args.default_budget,
-                if args.allow_thinking_off { "allowed" } else { "refused" }
+                if args.allow_thinking_off { " (--allow-thinking-off is no longer needed)" } else { "" }
             );
-            let d = thinking::Defaults { effort, budget: args.default_budget, allow_off: args.allow_thinking_off };
+            // thinking off renders the lowest effort and withholds the reasoning; --allow-thinking-off is still accepted
+            let d = thinking::Defaults { effort, budget: args.default_budget, allow_off: true };
             (Some(template), d, dialect::DS_DEFAULT_EFFORT)
         }
         dialect::Dialect::Ds41 => {
