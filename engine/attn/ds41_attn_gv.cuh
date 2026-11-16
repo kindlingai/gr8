@@ -218,4 +218,61 @@ inline void gv_gemv_launch_q(const uint32_t* xf, const Fp8Mat& W, bf16* Y, int l
     }
     k_gv_mx_q<<<dim3(ot, groups), ks * 32, 0, st>>>(W.gv, xf, K, ot, ks, M, Y, ldy, y_gs);
 }
+
+// ------------------------------------------------------------------------------------------------ multi-tile decode GEMV (M <= 32)
+// project_rows_nt (ds41_attn.cuh): up to 32 contiguous rows in one weight pass. The fragment table holds nt = ceil(M / 8) row tiles, tile t
+// at xf + t * K * 4 (the ts = K * 4 stride gv_warp_part expects); tile t, lane l (t8 = l / 4) reads row 8 t + t8 and writes 0 at rows >= M,
+// so tile t's words equal k_xfrag_q's in project_rows' pass r0 = 8 t. grid = (K/16*64/256, nt), block 256.
+__global__ void k_xfrag_q_nt(const uint8_t* __restrict__ codes, int ldc, const uint8_t* __restrict__ sc, int lds, int M, int K, uint32_t* __restrict__ xf)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= K / 16 * 64) return;
+    const int tile = blockIdx.y, ks = i >> 6, l = (i >> 1) & 31, reg = i & 1, row = tile * 8 + (l >> 2);
+    const int k0 = ks * 16 + reg * 8 + 2 * (l & 3);
+    uint32_t v = 0;
+    if (row < M)
+    {
+        const uint8_t* c = codes + (size_t)row * ldc + k0;
+        const float s = gvf_e8m0(sc[(size_t)row * lds + (k0 >> 5)]);
+        const float a = fminf(fmaxf(gvf_e4m3(c[0]) * s, -65504.f), 65504.f), b = fminf(fmaxf(gvf_e4m3(c[1]) * s, -65504.f), 65504.f);
+        v = pack_h2(a, b);
+    }
+    xf[(size_t)tile * K * 4 + i] = v;
+}
+// XfragNtFn (1 <= M <= 32)
+inline void gv_xfrag_nt_launch(const uint8_t* codes, int ldc, const uint8_t* sc, int lds, int M, int K, uint32_t* xf, cudaStream_t st)
+{
+    k_xfrag_q_nt<<<dim3((K / 16 * 64 + 255) / 256, (M + 7) / 8), 256, 0, st>>>(codes, ldc, sc, lds, M, K, xf);
+}
+// GemvFn of project_rows_nt (groups 1, 1 <= M <= 32): tpc / ks resolved by gv_gemv_launch's rules, NT = ceil(M / 8) row tiles in one pass
+// (NT 1: k_gv_mx, the 8-row kernel itself; NT 2..4: gv_gemv_lb512<Mxfp8, NT>, <= 512 threads). Records in the quad layout (g_gv_quad; the
+// Engram wkv is never repacked) fall back to one gv_gemv_launch_q per 8-row tile of the same table.
+inline void gv_gemv_nt_launch(const uint32_t* xf, const Fp8Mat& W, bf16* Y, int ldy, int M, int groups, size_t y_gs, cudaStream_t st, int tpc, int ks)
+{
+    if (groups != 1 || M < 1 || M > 32)
+    {
+        fprintf(stderr, "gv_gemv_nt_launch: groups %d M %d (needs groups 1, 1 <= M <= 32)\n", groups, M);
+        abort();
+    }
+    const int nt = (M + 7) / 8;
+    if (g_gv_quad.count(W.gv))
+    {
+        for (int t = 0; t < nt; ++t)
+            gv_gemv_launch_q(xf + (size_t)t * W.K * 4, W, Y + (size_t)t * 8 * ldy, ldy, M - 8 * t < 8 ? M - 8 * t : 8, 1, y_gs, st, tpc, ks);
+        return;
+    }
+    const int K = W.K, ot = W.N / 16;
+    if (!ks || (K / 32) % ks) ks = gv_pick_ks(K);
+    if (tpc < 1) tpc = 1;
+    if (tpc * ks > 16) tpc = 16 / ks > 0 ? 16 / ks : 1;
+    const dim3 grid((ot + tpc - 1) / tpc);
+    const int thr = tpc * ks * 32;
+    switch (nt)
+    {
+    case 1: k_gv_mx<<<dim3(grid.x, 1), thr, 0, st>>>(W.gv, xf, K, ot, tpc, ks, M, Y, ldy, y_gs); break;
+    case 2: gv_gemv_lb512<Mxfp8, 2><<<grid, thr, 0, st>>>(W.gv, xf, K, ot, tpc, ks, M, Y, ldy, gv::O_BF16); break;
+    case 3: gv_gemv_lb512<Mxfp8, 3><<<grid, thr, 0, st>>>(W.gv, xf, K, ot, tpc, ks, M, Y, ldy, gv::O_BF16); break;
+    default: gv_gemv_lb512<Mxfp8, 4><<<grid, thr, 0, st>>>(W.gv, xf, K, ot, tpc, ks, M, Y, ldy, gv::O_BF16); break;
+    }
+}
 }   // namespace ds41a

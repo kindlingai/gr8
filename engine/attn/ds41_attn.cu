@@ -55,6 +55,18 @@ int ds41_attn_project(const ds41a::Fp8Mat* W, const void* x, int rows, void* y, 
 {
     return ds41a::project_rows(*W, (const ds41a::bf16*)x, rows, (ds41a::bf16*)y, ldy, codes, scales, xf, (cudaStream_t)st);
 }
+// project with one weight pass per 32 rows (project_rows_nt): same outputs as ds41_attn_project, bit for bit. scratch: codes u8 [32][K],
+// scales u8 [32][K/32], xf u32 [16K]; needs ds41_attn_set_gv_nt. 0 = ok.
+int ds41_attn_project_nt(const ds41a::Fp8Mat* W, const void* x, int rows, void* y, int ldy, uint8_t* codes, uint8_t* scales, uint32_t* xf, void* st)
+{
+    return ds41a::project_rows_nt(*W, (const ds41a::bf16*)x, rows, (ds41a::bf16*)y, ldy, codes, scales, xf, (cudaStream_t)st);
+}
+// the multi-tile launchers of ds41_attn_gv.cuh (gv_xfrag_nt_launch, gv_gemv_nt_launch) for ds41_attn_project_nt; the tpc / ks of ds41_attn_set_gv apply
+void ds41_attn_set_gv_nt(ds41a::XfragNtFn fn_xfrag_nt, ds41a::GemvFn fn_gemv_nt)
+{
+    ds41a::g_fn_xfrag_nt = fn_xfrag_nt;
+    ds41a::g_fn_gemv_nt = fn_gemv_nt;
+}
 // Decode GEMV switch (a process-wide setting): on = projections at <= 8 rows use the MXFP8 GEMV where the weight has records; tpc / ks = 0 -> defaults.
 // fn_xfrag / fn_gemv: the launchers of ds41_attn_gv.cuh from the rank TU (this TU does not hold the GEMV kernels); also needed by ds41_attn_project.
 void ds41_attn_set_gv(int on, int tpc, int ks, ds41a::XfragFn fn_xfrag, ds41a::GemvFn fn_gemv)
