@@ -1018,9 +1018,10 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
                     ((double)m.cp.one_rows * (NR - 1) * H * 576 * 4 + m.cp.one_bytes) / 1e6);
     }
 #endif
+    // storage_bytes holds a layer's own decode scratch; layers on the shared scratch (m.dscratch) have none in it
     size_t ab = 0;
-    for (const Layer& y : m.layers) ab += y.ab.storage_bytes + y.ab.scratch_bytes;
-    fprintf(stderr, "# rank %d: attention caches + scratch for %d layers at capacity %d: %.3f GB\n", rank, m.nl, capacity, ab / 1e9);
+    for (const Layer& y : m.layers) ab += y.ab.storage_bytes;
+    fprintf(stderr, "# rank %d: attention storage for %d layers at capacity %d: %.3f GB\n", rank, m.nl, capacity, ab / 1e9);
     if (knob::dispram_min_bytes() > 0 && g6dispram::claimed_bytes() < (size_t)knob::dispram_min_bytes())
     {
         const size_t have = g6dispram::claimed_bytes(), req = (size_t)knob::dispram_min_bytes();
@@ -1038,7 +1039,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     {
         size_t real = m.dscratch_bytes;
         for (const Layer& y : m.layers) real += y.ab.storage_bytes;
-        fprintf(stderr, "# rank %d: shared decode scratch %.3f GB; attention allocated (caches + one scratch) %.3f GB\n", rank,
+        fprintf(stderr, "# rank %d: shared decode scratch %.3f GB; attention allocated (storage + shared scratch) %.3f GB\n", rank,
                 m.dscratch_bytes / 1e9, real / 1e9);
     }
     {

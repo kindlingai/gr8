@@ -455,7 +455,7 @@ inline void s2_init(Model& m, int nslots, cudaStream_t st)
     G6RT_CK(g6h2d::copy(s->errs, er.data(), er.size() * sizeof(unsigned*)));
     G6RT_CK(cudaStreamSynchronize(st));
     if (m.rank == 0)
-        fprintf(stderr, "# s2: %d session slots, runs of at most %d pages in a pool of %d pages (%s), %d layers: %.3f GB pool storage, %.3f GB new slot views (%d rows), attention %s\n",
+        fprintf(stderr, "# s2: %d session slots, runs of at most %d pages in a pool of %d pages (%s), %d layers: %.3f GB of their attention storage (allocated at bind), %.3f GB new slot views (%d rows), attention %s\n",
                 nslots, s->run_pages, s->pool_pages, fits ? "contiguous runs, base = slot x run" : "slots unbound until s2_set_pages", m.nl,
                 bytes / 1e9, vbytes / 1e9, MX, s->batch ? "batched (one call per layer)" : "per session");
     m.s2on = true;
