@@ -542,9 +542,14 @@ inline std::pair<void*, size_t> pf_qo_table(const Prefill& P)
     if (P.av.empty() || g6_attn_bind_prefill_cache(P.av.front(), &c, &n) || !c) return {nullptr, 0};
     return {c, n};
 }
+// lend: the MTP draft's prefill (build_draft_prefill) takes the target lane's step buffers, the ones whose contents last
+// only within one prefill step. Its steps run after both target lanes' (pf_draft: on the main stream, after the lanes'
+// fence), and read the target's final rows from the lane's x, which is not lent.
 inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, const g6::FabricDev& f, u64* stepp,
-                          cudaStream_t st = nullptr, Prefill* share = nullptr, G6AttnPrefill* tc_root = nullptr)
+                          cudaStream_t st = nullptr, Prefill* share = nullptr, G6AttnPrefill* tc_root = nullptr,
+                          const Prefill* lend = nullptr)
 {
+    if (lend && (lend->Mmax != Mmax || share)) die("prefill: a lent lane must have the same Mmax and no share");
     if (f.ncoll != 2 && f.ncoll != 5) die("prefill fabric must have two collectives (five in the RS form)");
     P.rs = f.ncoll == 5;
     if (f.stride < pf_slot_bytes(Mmax, P.rs, f.nr) + 8) die("prefill fabric slots are smaller than Mmax rows");
@@ -559,20 +564,20 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
     P.tickets = dmalloc<unsigned>(5);
     P.resid = dmalloc<float>(n * HID);
     P.x = dmalloc<__half>(n * HID);
-    P.x2 = dmalloc<__half>(n * HID);
-    P.q_a = dmalloc<__half>(n * QA);
-    P.q_a_n = dmalloc<__half>(n * QA);
+    P.x2 = lend ? lend->x2 : dmalloc<__half>(n * HID);
+    P.q_a = lend ? lend->q_a : dmalloc<__half>(n * QA);
+    P.q_a_n = lend ? lend->q_a_n : dmalloc<__half>(n * QA);
     P.kv_a = dmalloc<__half>(n * KVA);
-    P.q_b = dmalloc<__half>(n * g6nr::QBW);
-    P.idx_q = dmalloc<__half>(n * IDXQ);
+    P.q_b = lend ? lend->q_b : dmalloc<__half>(n * g6nr::QBW);
+    P.idx_q = lend ? lend->idx_q : dmalloc<__half>(n * IDXQ);
     P.idx_k = dmalloc<__half>(n * IDXK);
     P.idx_w = dmalloc<__half>(n * IDXW);
-    P.logits = dmalloc<float>(n * glue::NEXP);
-    P.part[0] = dmalloc<uint16_t>(n * HID);
-    P.part[1] = dmalloc<uint16_t>(n * HID);
+    P.logits = lend ? lend->logits : dmalloc<float>(n * glue::NEXP);
+    P.part[0] = lend ? lend->part[0] : dmalloc<uint16_t>(n * HID);
+    P.part[1] = lend ? lend->part[1] : dmalloc<uint16_t>(n * HID);
     P.tok = dmalloc<int>(n);
     P.pos = dmalloc<int>(n);
-    P.scratch = dmalloc<char>(bindp::scratch_bytes(Mmax));
+    P.scratch = lend ? lend->scratch : dmalloc<char>(bindp::scratch_bytes(Mmax));
     P.sc = bindp::scratch_at(P.scratch, Mmax);
     if (cublasCreate(&P.blas) != CUBLAS_STATUS_SUCCESS) die("cublasCreate failed");
     if (const std::optional<int64_t> r = knob::pf_blas_rows())
@@ -591,8 +596,8 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
     }
     const bool chunked = P.attn_rows > 0 && P.attn_rows < Mmax;
     if (!chunked) P.attn_rows = Mmax;
-    else P.attn_out = dmalloc<__half>(n * g6nr::QBW);
-    if (chunked || P.ownix || P.qo) P.idx_all = dmalloc<int>(n * 2048);
+    else P.attn_out = lend && lend->attn_out ? lend->attn_out : dmalloc<__half>(n * g6nr::QBW);
+    if (chunked || P.ownix || P.qo) P.idx_all = lend && lend->idx_all ? lend->idx_all : dmalloc<int>(n * 2048);
     if (P.qp) pf_qp_alloc(P, m, Mmax, f, share);
     if (P.qo)
     {
@@ -1754,7 +1759,7 @@ inline void build_draft_prefill(DraftPrefill& Q, Draft& D, const Find& find, int
         root = tc->av.front();
         fprintf(stderr, "# rank %d: GR8_PF_DRAFT_SHARE: MTP draft prefill borrows the target prefill's tensor-core scratch\n", D.d.rank);
     }
-    build_prefill(Q.P, D.d, find, Mmax, f, dmalloc<u64>(1), st, nullptr, root);
+    build_prefill(Q.P, D.d, find, Mmax, f, dmalloc<u64>(1), st, nullptr, root, tc);
     const size_t n = (size_t)Mmax;
     Q.eh_in = dmalloc<__half>(n * 2 * HID);
     Q.eh_out = dmalloc<__half>(n * HID);
