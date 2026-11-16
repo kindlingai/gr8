@@ -151,7 +151,8 @@ inline void pf_qp_states(Prefill& P, Model& m, cudaStream_t st, Prefill* share)
         for (int s = 0; s < R.S; ++s)
         {
             if (!qp_check(R.slot[s])) die("GR8_PF_QP_ROLL: slot " + std::to_string(s) + " shapes");
-            if (int e = g6_attn_qo_create(&R.qa[s], &m.layers[i0].ab, &R.slot[s].uk, &R.slot[s].uv, P.qp_rows, st, s ? R.qa[0] : nullptr))
+            const auto t = s ? std::pair<void*, size_t>{} : pf_qo_table(P);
+            if (int e = g6_attn_qo_create_ext(&R.qa[s], &m.layers[i0].ab, &R.slot[s].uk, &R.slot[s].uv, P.qp_rows, st, s ? R.qa[0] : nullptr, t.first, t.second))
                 die("rank " + std::to_string(m.rank) + ": g6_attn_qo_create (pair, roll slot " + std::to_string(s) + ") failed (" + std::to_string(e) + ")");
             b += g6_attn_qo_bytes(R.qa[s]);
         }
@@ -176,7 +177,8 @@ inline void pf_qp_states(Prefill& P, Model& m, cudaStream_t st, Prefill* share)
         if (!P.qpl[i]) continue;
         QpW& w = (*P.qpw)[i];
         if (!qp_check(w)) die("GR8_PF_OWN=4: layer " + std::to_string(m.layers[i].l) + " has no pair weights");
-        if (int e = g6_attn_qo_create(&P.qa[i], &m.layers[i].ab, &w.uk, &w.uv, P.qp_rows, st, owner))
+        const auto t = owner ? std::pair<void*, size_t>{} : pf_qo_table(P);
+        if (int e = g6_attn_qo_create_ext(&P.qa[i], &m.layers[i].ab, &w.uk, &w.uv, P.qp_rows, st, owner, t.first, t.second))
             die("rank " + std::to_string(m.rank) + " layer " + std::to_string(m.layers[i].l) + ": g6_attn_qo_create (pair) failed (" + std::to_string(e) + ")");
         if (!owner) owner = P.qa[i];
         G6RT_CK(cudaStreamSynchronize(st));      // the FP16 copies are made: the BF16 pair UK / UV can go

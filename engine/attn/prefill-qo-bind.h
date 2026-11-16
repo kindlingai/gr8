@@ -21,6 +21,12 @@ struct G6AttnQoStep {
 // r1 (the R1 variant, compiled in when engine/attn/prefill-qo-r1.cuh exists). No persisting-L2 window is set here.
 extern "C" int g6a_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G6AttnTensor* uk, const G6AttnTensor* uv,
                                  int max_rows, void* stream, G6AttnQo* storage_owner);
+// Same, with the key table [cap][576] FP16 at ext_table (ext_bytes, caller-owned, never freed by release) instead of in
+// the workspace; states created with this one as storage_owner use it too. The prepass writes the table at the start of
+// every call and the call reads it only inside, so ext_table may be memory that other calls use when no QO call runs
+// (the tensor-core prefill's key cache, g6a_bind_prefill_cache).
+extern "C" int g6a_qo_create_ext(G6AttnQo** out, const G6AttnBinding* b, const G6AttnTensor* uk, const G6AttnTensor* uv,
+                                 int max_rows, void* stream, G6AttnQo* storage_owner, void* ext_table, size_t ext_bytes);
 extern "C" int g6a_qo_run(G6AttnQo*, G6AttnBinding*, const G6AttnQoStep*, void* stream);
 extern "C" size_t g6a_qo_bytes(const G6AttnQo*);
 // measurement (gate b): while on, run synchronizes the stream between its stages and adds their wall ms to

@@ -324,6 +324,8 @@ extern "C" int g6a_bind_prefill_profile_read(G6AttnPrefill* p,G6AttnPrefillProfi
     if(!p||!out)return int(cudaErrorInvalidValue);return int(gp::profile_read(p->profile,*out));
 }
 extern "C" size_t g6a_bind_prefill_bytes(const G6AttnPrefill* p){return p?p->bytes:0;}
+extern "C" int g6a_bind_prefill_cache(const G6AttnPrefill* p,void** cache,size_t* bytes){
+    if(!p||!cache||!bytes)return int(cudaErrorInvalidValue);*cache=p->cache;*bytes=(size_t)p->C*576*2;return int(cudaSuccess);}
 extern "C" int g6a_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,const G6AttnStep* step,const G6AttnTrace* trace,void* s){
     if(!p)return int(cudaErrorInvalidValue);gp::profile_reset(p->profile);
     if(p->owner!=b||!step)return int(cudaErrorInvalidValue);int rc=g6a_bind_prepare(b,step,s);if(rc)return rc;G6Attn a=b->args;if(a.rows>p->maxrows||a.context>p->cap)return int(cudaErrorInvalidValue);
