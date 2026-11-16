@@ -805,7 +805,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
 #if defined(G6_CP) && G6_CP
         if (m.cp.on) cp_r = m.cp.step_R();
 #endif
-        m.nbk = context_buckets(m.bk, b, capacity, cp_r, NBK - 2);   // a power-of-two R: the 8-slot list of before
+        m.nbk = context_buckets(m.bk, b, capacity, cp_r, NBK - 2, (int)knob::dec_bk_max());   // a power-of-two R: the 8-slot list of before
     }
     m.cells = dmalloc<G6AttnStepCell>(m.nl);
     m.shared = dmalloc<int>(m.nl);
