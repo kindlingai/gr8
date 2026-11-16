@@ -232,6 +232,12 @@ static ga::Work index_workspace(const G6Attn& a,void* base,bool full){
     w.si=(float*)take(R*T*4);w.ii=(int*)take(R*T*4);
     w.selected=(uint64_t*)take(R*TOP*8);w.selection=(ga::SelectionState*)take(R*sizeof(ga::SelectionState));
     w.histogram=(int*)take(R*((std::min(T,size_t(32768))+ga::RADIX_CHUNK-1)/ga::RADIX_CHUNK)*256*4);
+#ifdef SEL32
+    // select_prefill never sorts: so holds threshold_compact32's bins (R*chunks*1 KB) or selx's candidates
+    // (min(CAPG, T) keys a row), and io, offsets and the CUB temp are unused
+    if(T>32768)w.so=(float*)take(std::max(R*((T+ga::RADIX_CHUNK-1)/ga::RADIX_CHUNK)*256*4,R*std::min(size_t(selx::CAPG),T)*8));
+    w.total=used;return w;
+#endif
     if(T>32768){w.so=(float*)take(R*T*4);w.io=(int*)take(R*T*4);w.offsets=(int*)take((R+1)*4);
         size_t bytes=0,single=0;auto e=cub::DeviceSegmentedRadixSort::SortPairsDescending(nullptr,bytes,w.si,w.so,w.ii,w.io,(int)(R*T),(int)R,w.offsets,w.offsets+1);if(e!=cudaSuccess)return ga::Work{};
         e=cub::DeviceRadixSort::SortPairsDescending(nullptr,single,w.si,w.so,w.ii,w.io,(int)T);if(e!=cudaSuccess)return ga::Work{};
@@ -241,7 +247,7 @@ static ga::Work index_workspace(const G6Attn& a,void* base,bool full){
 // GR8_PF_SELX_CTX (selx.cuh = tp6-spare 446fa62, shared with TP4 verbatim): prefill index tiles with n >= SELX_MINN rows and context
 // >= this select with selx (one CTA per row, sample bound + filter + radix + sort) instead of SEL32: the same ids in the same
 // order (score desc, then id asc, -1 fill). Unset = SEL32 for every tile (today). Strict: an integer 32769..1048576, else exit 2.
-// cand scratch = w.so .. w.io (2 * R * T * 4 B, present for T > 32768, used by SEL32 only as its histogram) -> min(CAPG, T) keys/row.
+// cand scratch = w.so (present for T > 32768, also SEL32's histogram; index_workspace sizes it for both) -> min(CAPG, T) keys/row.
 static constexpr int SELX_MINN=32;   // our gate: selx 1.6-2.0x SEL32 from 53K at n >= 33
 static int selx_ctx(){
     static const int v=[]{const int x=int(knob::pf_selx_ctx());   // default: SELX at 53248 context (v0.7)
