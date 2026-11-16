@@ -468,6 +468,9 @@ struct Model
     void *dio_ids = nullptr, *dio_out = nullptr;
     int dio_rows = 0;
     bool dscratch_lent = false;       // the MTP draft: dscratch and dio_* are the main model's (build_draft)
+    // The main model checks GR8_MEM_MIN as its KV pool is allocated. The MTP draft is built after the prefill lanes, and
+    // both are part of the rest of the boot that floor reserves, so the draft does not check it again.
+    bool headroom = true;
     unsigned** errs = nullptr;        // [nl] device
     g6::FabricDev f{};
     u64* stepp = nullptr;             // device step counter
@@ -949,7 +952,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         else
 #endif
         G6RT_CK(g6_attn_bind_create_ext(&y.ab, &y.ap, rank, y.l, cap_ab, attn_rows, ATT_QT, st, m.dscratch, m.dscratch_bytes));
-        check_headroom(rank, capacity, false);
+        if (m.headroom) check_headroom(rank, capacity, false);
         y.attn_norm = (const __nv_bfloat16*)need(find, lname(y.l, "attn_norm"));
         y.mlp_norm = (const __nv_bfloat16*)need(find, lname(y.l, "mlp_norm"));
         y.q_a_norm = (const __nv_bfloat16*)need(find, lname(y.l, "q_a_norm"));
@@ -1052,7 +1055,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         fprintf(stderr, "# rank %d: dispram: %.1f MiB claimed (%.1f MiB VMM mapped) across %zu attention bindings\n",
                 rank, (double)db / (1024.0 * 1024.0), (double)g6dispram::mapped_bytes() / (1024.0 * 1024.0),
                 g6dispram::claimed_spans());
-    check_headroom(rank, capacity, true);
+    if (m.headroom) check_headroom(rank, capacity, true);
     if (m.dscratch)
     {
         const size_t io = (size_t)m.dio_rows * 2048 * 4 + (size_t)m.dio_rows * g6nr::HMAX * 256 * 2;
@@ -2389,6 +2392,7 @@ inline void build_draft(Draft& D, const Model& main, const Find& find, int capac
     if (!find(G6_MTP_L ".eh.mx.gv").p) die("pack has no " G6_MTP_L ".eh.mx.gv (MTP)");
     #endif
     D.d.wide = main.wide;
+    D.d.headroom = false;
     D.d.eh_in = dmalloc<__half>((size_t)MX * 2 * HID);
     D.d.eh_out = dmalloc<__half>((size_t)MX * HID);
     if (main.dscratch)   // GR8_DEC_SHARED_SCRATCH: the draft's calls run after the main step's on its stream (build)
