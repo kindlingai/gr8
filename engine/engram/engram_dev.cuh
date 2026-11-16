@@ -314,6 +314,7 @@ public:
         hooks_ = c.hooks;
         for (int e = 0; e < kNE; ++e) { wkv_codes_[e] = c.wkv_codes[e]; wkv_scales_[e] = c.wkv_scales[e]; }
         verbose_ = c.knobs.verbose;
+        ka_ms_ = store_.keepalive_running() ? c.knobs.store.keepalive_ms : 0;
         if (c.knobs.lookahead)
         {
             warm_win_in_.assign(mr * kNGram, -1);
@@ -517,6 +518,11 @@ public:
 private:
     struct Job { Engram* self; int e, rows; uint32_t* ids_h; uint8_t* stage_h; };   // the buffers of the set the job was made for
 
+    static void ka_line(const RowStore::KeepaliveStats& k)
+    {
+        fprintf(stderr, "[L001-ka] engram keepalive: ticks %llu reads %llu err %llu max_us %llu\n", (unsigned long long)k.ticks,
+                (unsigned long long)k.reads, (unsigned long long)k.errors, (unsigned long long)k.max_us);
+    }
     static void CUDART_CB fetch_cb(void* p) { Job* j = (Job*)p; j->self->do_fetch(j->e, j->rows, j->ids_h, j->stage_h); }
     void do_fetch(int e, int rows, uint32_t* ids_h, uint8_t* stage_h)
     {
@@ -524,6 +530,17 @@ private:
         const int r = store_.fetch(e, ids_h + (size_t)e * rows * kIds, (size_t)rows * kIds, stage_h, &st);
         if (r) { int z = 0; fail_.compare_exchange_strong(z, r); }
         if (verbose_) fprintf(stderr, "[L%03d] %s\n", kLayerIds[e], RowStore::line(st).c_str());
+        if (verbose_ && e == 0 && ka_ms_ > 0)
+        {   // keepalive counters on their own line: fetch 1, every 32nd L001 fetch, and a new keepalive error
+            const uint64_t n = ka_l001_n_.fetch_add(1, std::memory_order_relaxed) + 1;
+            const RowStore::KeepaliveStats k = store_.keepalive_stats();
+            const uint64_t e0 = ka_err_seen_.load(std::memory_order_relaxed);
+            if (n == 1 || n % 32 == 0 || k.errors > e0)
+            {
+                ka_err_seen_.store(k.errors, std::memory_order_relaxed);
+                ka_line(k);
+            }
+        }
         if (e == 1 && warm_on_ && warm_pending_.load(std::memory_order_acquire))
         {
             bool notify = false;
@@ -634,6 +651,8 @@ private:
     void release()
     {
         if (side_) cudaStreamSynchronize(side_);
+        if (verbose_ && ka_ms_ > 0) ka_line(store_.keepalive_stats());
+        ka_ms_ = 0;
         stop_warm();
         use_lane(0);
         if (alt_.fork) cudaEventDestroy(alt_.fork);
@@ -674,6 +693,8 @@ private:
     RowStore store_;
     EngramHooks hooks_;
     bool ready_ = false, verbose_ = false, tc_ = false, warned_ = false;
+    int ka_ms_ = 0;                                   // keepalive interval when its thread runs (verbose [L001-ka] lines)
+    std::atomic<uint64_t> ka_l001_n_{0}, ka_err_seen_{0};
     const unsigned char* dead_ = nullptr;   // set_dead
     uint8_t *aq_codes_ = nullptr, *aq_scales_ = nullptr;    // the quantized embedding of a W-row chunk (tc_ only)
     const uint8_t* wkv_codes_[kNE] = {};
