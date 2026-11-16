@@ -16,6 +16,8 @@
 #include "../../attn/ds41_attn_gv.cuh"
 extern "C" void ds41_attn_set_gv(int,int,int,ds41a::XfragFn,ds41a::GemvFn);
 extern "C" int ds41_attn_project(const ds41a::Fp8Mat*,const void*,int,void*,int,uint8_t*,uint8_t*,uint32_t*,void*);
+extern "C" int ds41_attn_project_nt(const ds41a::Fp8Mat*,const void*,int,void*,int,uint8_t*,uint8_t*,uint32_t*,void*);
+extern "C" void ds41_attn_set_gv_nt(ds41a::XfragNtFn,ds41a::GemvFn);
 namespace eg=ds41::engram;
 namespace ew=ds41::v2::engram_wire;
 using bf16=__nv_bfloat16;
@@ -189,9 +191,9 @@ void project(const bf16* x,int M,const uint8_t* w,const uint8_t* sw,uint8_t* a,u
 }
 void projection_case(int M,const Dev<uint8_t>& w,const Dev<uint8_t>& sw,int layer=-1,const Dev<uint8_t>* gv=nullptr){
     WireCase c(M,0,layer);Dev<uint8_t> aq(size_t(M)*E),as(size_t(M)*(E/32)),dead(M);Dev<bf16> kv(size_t(M)*K),ownkv(size_t(c.Q)*K),input(size_t(M)*T),trunk(size_t(M)*T),owntrunk(size_t(c.Q)*T);Dev<float> wg(T),inputf(size_t(M)*T),trunkf(size_t(M)*T),ownf(size_t(c.Q)*T);
-    Dev<uint32_t> xf(E*4);const ds41a::Fp8Mat W{w.p,sw.p,K,E,gv?gv->p:nullptr};
+    Dev<uint32_t> xf(16*E);const ds41a::Fp8Mat W{w.p,sw.p,K,E,gv?gv->p:nullptr};
     auto project_rows=[&](const bf16* x,int rows,bf16* out){
-        if(gv&&M<=eg::kDecodeRows)CHECK(ds41_attn_project(&W,x,rows,out,K,aq.p,as.p,xf.p,nullptr)==0);
+        if(gv&&M<=eg::kDecodeRows)CHECK(ds41_attn_project_nt(&W,x,rows,out,K,aq.p,as.p,xf.p,nullptr)==0);
         else project(x,rows,w.p,sw.p,aq.p,as.p,out);
     };
     project_rows(c.dense.p,M,kv.p);
@@ -231,10 +233,10 @@ __global__ void compare_tolerant(const bf16* got,const bf16* ref,size_t n,unsign
     }
 }
 void dispatch_case(int M,const Dev<uint8_t>& w,const Dev<uint8_t>& sw,const Dev<uint8_t>& gv,bool old_dispatch,int layer=-1){
-    WireCase c(M,0,layer);Dev<uint8_t> aq(size_t(M)*E),as(size_t(M)*(E/32)),dead(M);Dev<uint32_t> xf(E*4);Dev<bf16> kv(size_t(M)*K),ownkv(size_t(c.Q)*K),input(size_t(M)*T),trunk(size_t(M)*T),owntrunk(size_t(c.Q)*T);Dev<float> wg(T),inputf(size_t(M)*T),maxerr(2);Dev<unsigned> changed(2);
+    WireCase c(M,0,layer);Dev<uint8_t> aq(size_t(M)*E),as(size_t(M)*(E/32)),dead(M);Dev<uint32_t> xf(16*E);Dev<bf16> kv(size_t(M)*K),ownkv(size_t(c.Q)*K),input(size_t(M)*T),trunk(size_t(M)*T),owntrunk(size_t(c.Q)*T);Dev<float> wg(T),inputf(size_t(M)*T),maxerr(2);Dev<unsigned> changed(2);
     CK(cudaMemset(changed.p,0,8));CK(cudaMemset(maxerr.p,0,8));
     const ds41a::Fp8Mat W{w.p,sw.p,K,E,gv.p};
-    auto dispatch=[&](const bf16* x,int rows,bf16* out){if((old_dispatch?rows:M)>eg::kDecodeRows)project(x,rows,w.p,sw.p,aq.p,as.p,out);else CHECK(ds41_attn_project(&W,x,rows,out,K,aq.p,as.p,xf.p,nullptr)==0);};
+    auto dispatch=[&](const bf16* x,int rows,bf16* out){if((old_dispatch?rows:M)>eg::kDecodeRows)project(x,rows,w.p,sw.p,aq.p,as.p,out);else CHECK(ds41_attn_project_nt(&W,x,rows,out,K,aq.p,as.p,xf.p,nullptr)==0);};
     dispatch(c.dense.p,M,kv.p);init_trunk<<<256,256>>>(input.p,inputf.p,M,wg.p,dead.p);
     CK(cudaMemcpyAsync(trunk.p,input.p,size_t(M)*T*2,cudaMemcpyDeviceToDevice));eg::k_gate_dead<<<dim3(M,4),512>>>(trunk.p,kv.p,wg.p,M,dead.p);
     for(int dst=0;dst<NR;++dst){auto g=ds41::v2::geometry(M,NR,dst);c.assemble(dst);if(!g.owned)continue;
@@ -245,6 +247,59 @@ void dispatch_case(int M,const Dev<uint8_t>& w,const Dev<uint8_t>& sw,const Dev<
     }
     unsigned hc[2];float he[2];CK(cudaMemcpy(hc,changed.p,8,cudaMemcpyDeviceToHost));CK(cudaMemcpy(he,maxerr.p,8,cudaMemcpyDeviceToHost));
     printf("CHECK dispatch M=%d old_owned_threshold=%d: actual TC/small-row-GEMV; kv changed=%u max_abs=%g; gate changed=%u max_abs=%g (%s, not model EVAL)\n",M,int(old_dispatch),hc[0],he[0],hc[1],he[1],old_dispatch?"old-dispatch synthetic tolerance":"bit-exact required");fflush(stdout);good(c.bad.p);
+}
+// project_rows_nt exactness: the single-pass multi-tile wkv projection (ds41_attn_project_nt, NT = ceil(M / 8) <= 4, 32-row passes above)
+// against the 8-row-pass reference (ds41_attn_project) in the same binary, every M = 1..32 plus 33 and 40, under the default launch shape
+// and tpc 2 / ks 8. Weights are the synthetic init_weights records at the real [W.N = 25600][W.K = 6144] shape. The negative control
+// negates row 23's largest-magnitude input at M = 28 (same row absmax, so only that code's sign changes): row 23 must differ, no other row.
+__global__ void init_proj_x(bf16* x,size_t n){for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x){const uint32_t h=hash32(uint32_t(i)*3u+977u);x[i]=__float2bfloat16_rn(float(int(h%4001)-2000)/256.f*float(1+(h>>24)%7));}}
+__global__ void untouched(const bf16* p,size_t n,uint16_t pat,unsigned* bad){for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<n;i+=size_t(gridDim.x)*blockDim.x)if(__bfloat16_as_ushort(p[i])!=pat)atomicAdd(bad,1u);}
+__global__ void row_mismatch(const bf16* a,const bf16* b,int M,unsigned* rows){for(size_t i=size_t(blockIdx.x)*blockDim.x+threadIdx.x;i<size_t(M)*K;i+=size_t(gridDim.x)*blockDim.x)if(__bfloat16_as_ushort(a[i])!=__bfloat16_as_ushort(b[i]))atomicAdd(rows+i/K,1u);}
+unsigned fetch(const unsigned* d){CK(cudaGetLastError());unsigned n=0;CK(cudaMemcpy(&n,d,4,cudaMemcpyDeviceToHost));return n;}
+void project_rows_nt_exactness(const Dev<uint8_t>& w,const Dev<uint8_t>& sw,const Dev<uint8_t>& gv){
+    constexpr int MX=40,NEG_M=28,NEG_ROW=23;
+    const ds41a::Fp8Mat W{w.p,sw.p,K,E,gv.p};   // W.N = K = 25600 outputs, W.K = E = 6144 inputs
+    Dev<bf16> x(size_t(MX)*E),xp(size_t(NEG_M)*E),ref(size_t(MX)*K),got(size_t(MX)*K);
+    Dev<uint8_t> aq8(size_t(8)*E),as8(size_t(8)*(E/32)),aq(size_t(32)*E),as(size_t(32)*(E/32));
+    Dev<uint32_t> xf8(size_t(4)*E),xf(size_t(16)*E);Dev<unsigned> bad(1),rows(MX);
+    init_proj_x<<<256,256>>>(x.p,size_t(MX)*E);CK(cudaGetLastError());
+    const int shapes[2][2]={{0,0},{2,8}};
+    size_t checked=0;
+    for(const auto& sh:shapes){
+        ds41_attn_set_gv(1,sh[0],sh[1],ds41a::gv_xfrag_launch,ds41a::gv_gemv_launch);
+        std::vector<int> ms;for(int m=1;m<=32;++m)ms.push_back(m);ms.push_back(33);ms.push_back(40);
+        for(int M:ms){
+            ref.poison();got.poison();CK(cudaMemset(got.p,0x5a,size_t(MX)*K*2));   // ref inner 0xa5a5, got inner 0x5a5a: equal only where both wrote
+            CHECK(ds41_attn_project(&W,x.p,M,ref.p,K,aq8.p,as8.p,xf8.p,nullptr)==0);
+            CHECK(ds41_attn_project_nt(&W,x.p,M,got.p,K,aq.p,as.p,xf.p,nullptr)==0);
+            clean(bad.p);compare<<<256,256>>>(got.p,ref.p,size_t(M)*K,bad.p);
+            const unsigned mism=fetch(bad.p);
+            clean(bad.p);padding<<<64,256>>>(ref.p+size_t(M)*K,size_t(MX-M)*K,bad.p);untouched<<<64,256>>>(got.p+size_t(M)*K,size_t(MX-M)*K,0x5a5a,bad.p);
+            x.check(bad.p);ref.check(bad.p);got.check(bad.p);aq8.check(bad.p);as8.check(bad.p);aq.check(bad.p);as.check(bad.p);xf8.check(bad.p);xf.check(bad.p);
+            const unsigned gbad=fetch(bad.p);
+            if(mism||gbad){fprintf(stderr,"PROJECT_ROWS_NT_BITWISE_FAIL M=%d tpc=%d ks=%d bit_mismatches=%u guard_or_padding_bad=%u\n",M,sh[0],sh[1],mism,gbad);exit(1);}
+            checked+=size_t(M)*K;
+        }
+    }
+    ds41_attn_set_gv(1,1,0,ds41a::gv_xfrag_launch,ds41a::gv_gemv_launch);   // the default shape again (set_gv keeps tpc on 0: restore 1 explicitly)
+    // negative control at M = 28 (NT 4, rows on both sides of row 23)
+    ref.poison();got.poison();
+    CHECK(ds41_attn_project(&W,x.p,NEG_M,ref.p,K,aq8.p,as8.p,xf8.p,nullptr)==0);
+    CK(cudaMemcpy(xp.p,x.p,size_t(NEG_M)*E*2,cudaMemcpyDeviceToDevice));
+    std::vector<uint16_t> row(E);CK(cudaMemcpy(row.data(),xp.p+size_t(NEG_ROW)*E,size_t(E)*2,cudaMemcpyDeviceToHost));
+    int amax=-1;uint16_t best=0;for(int k=0;k<E;++k){const uint16_t mag=row[k]&0x7fff;if(mag>best){best=mag;amax=k;}}
+    CHECK(amax>=0&&best!=0&&best<0x7f80);
+    const uint16_t flipped=row[amax]^0x8000;CK(cudaMemcpy(xp.p+size_t(NEG_ROW)*E+amax,&flipped,2,cudaMemcpyHostToDevice));
+    CHECK(ds41_attn_project_nt(&W,xp.p,NEG_M,got.p,K,aq.p,as.p,xf.p,nullptr)==0);
+    CK(cudaMemset(rows.p,0,MX*sizeof(unsigned)));row_mismatch<<<256,256>>>(got.p,ref.p,NEG_M,rows.p);CK(cudaGetLastError());
+    std::vector<unsigned> per(MX);CK(cudaMemcpy(per.data(),rows.p,MX*sizeof(unsigned),cudaMemcpyDeviceToHost));
+    unsigned other=0;for(int r=0;r<NEG_M;++r)if(r!=NEG_ROW)other+=per[r];
+    clean(bad.p);x.check(bad.p);xp.check(bad.p);ref.check(bad.p);got.check(bad.p);aq8.check(bad.p);as8.check(bad.p);aq.check(bad.p);as.check(bad.p);xf8.check(bad.p);xf.check(bad.p);rows.check(bad.p);
+    const unsigned gbad=fetch(bad.p);
+    printf("PROJECT_ROWS_NT_NEG_CTRL M=%d row=%d col=%d row23_mismatches=%u other_rows_mismatches=%u guards_bad=%u\n",NEG_M,NEG_ROW,amax,per[NEG_ROW],other,gbad);
+    if(!(per[NEG_ROW]>0&&other==0&&gbad==0)){fprintf(stderr,"PROJECT_ROWS_NT_NEG_CTRL_FAIL\n");exit(1);}
+    printf("NOTE project_rows_nt: synthetic init_weights records at the real [25600][6144] shape; %zu bf16 outputs compared\n",checked);
+    puts("PROJECT_ROWS_NT_BITWISE_PASS M=1..32,33,40 tpc_ks=0x0,2x8 bit_mismatches=0 neg_ctrl=PASS");fflush(stdout);
 }
 // Compile both op_owned instantiations and verify the uninitialized error path.
 // A live Engram object needs production-compatible hash sidecars; not mocked.
@@ -281,6 +336,8 @@ int main(int argc,char** argv){
     for(int m:{1,5,33,71,128,129,257})projection_case(m,w,sw);
     Dev<uint8_t> gv(size_t(K/16)*(E/32)*528);make_gv_records<<<(K/16)*(E/32),256>>>(w.p,sw.p,gv.p);
     ds41_attn_set_gv(1,0,0,ds41a::gv_xfrag_launch,ds41a::gv_gemv_launch);
+    ds41_attn_set_gv_nt(ds41a::gv_xfrag_nt_launch,ds41a::gv_gemv_nt_launch);
+    project_rows_nt_exactness(w,sw,gv);   // always (outside !quick)
     for(int m:{1,5,33,71,128,129,257})dispatch_case(m,w,sw,gv,old_dispatch);
     if(!quick)for(int e=0;e<2;++e)for(int m:{5,33,257})projection_case(m,w,sw,e,&gv);
     CK(cudaDeviceSynchronize());printf("COL_SHARD_DEVICE_PEAK bytes=%zu limit=%llu\n",peak_bytes,2ull<<30);puts("DS41_V2_ENGRAM_PASS (synthetic kernels/seams; no NVMe/fabric/model/EVAL/speed claim)");

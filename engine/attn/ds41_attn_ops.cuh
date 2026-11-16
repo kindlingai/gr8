@@ -51,6 +51,8 @@ void ds41_attn_set_split(int on);
 void ds41_attn_set_win_floor(int pos);
 int ds41_attn_gv_ready(const ds41a::Weights*, int rows);
 int ds41_attn_project(const ds41a::Fp8Mat*, const void* x, int rows, void* y, int ldy, uint8_t* codes, uint8_t* scales, uint32_t* xf, void* st);
+int ds41_attn_project_nt(const ds41a::Fp8Mat*, const void* x, int rows, void* y, int ldy, uint8_t* codes, uint8_t* scales, uint32_t* xf, void* st);
+void ds41_attn_set_gv_nt(ds41a::XfragNtFn fn_xfrag_nt, ds41a::GemvFn fn_gemv_nt);
 }
 
 // GR8_DS_SRC_FAST (default 0 = the generic launches): bit 1 = the ratio-2 compressor GEMV (bit-identical to k_f32gemm2), bit 2 = the indexer wq_b through the MXFP8 GEMV
@@ -148,7 +150,8 @@ inline const __nv_bfloat16* ds41_vec(Model& m, int l, const char* nm, long long 
 }
 
 // Engram, ST_ENGRAM's project hook: kv[rows][25600] = fp8gemm(act_quant(emb[rows][6144]), wkv), wkv = L001 / L014 .engram.wkv [25600][6144]
-// (full on every rank). The dense MXFP8 GEMV of the attention projections: one pass over the weight for up to 8 rows, 8-row passes above.
+// (full on every rank). The dense MXFP8 GEMV of the attention projections, multi-tile: one pass over the weight for up to 32 rows, 32-row
+// passes above (ds41_attn_project_nt; bit-identical to the 8-row passes of ds41_attn_project).
 // Bound with the layer (ds41_attn_bind at l = 1, 14) when the pack has the tensor; the scratch is carved there, so the hook allocates nothing.
 struct Ds41EngramProj { ds41a::Fp8Mat W{}; uint8_t *codes = nullptr, *scales = nullptr; uint32_t* xf = nullptr; };
 inline Ds41EngramProj g_ds41_eng[2];
@@ -162,9 +165,15 @@ inline void ds41_engram_bind(Model& m, int l)
     Ds41EngramProj& q = g_ds41_eng[e];
     q.W = ds41_fp8(m, l, "engram.wkv", N, K);
     if (!q.W.gv) die("DS41 Engram bind: " + p + ".mx.gv missing (the project hook needs the GEMV records)");
-    q.codes = dmalloc<uint8_t>((size_t)8 * K);
-    q.scales = dmalloc<uint8_t>((size_t)8 * K / 32);
-    q.xf = dmalloc<uint32_t>((size_t)K * 4);
+    q.codes = dmalloc<uint8_t>((size_t)32 * K);      // 32 rows (project_rows_nt)
+    q.scales = dmalloc<uint8_t>((size_t)32 * K / 32);
+    q.xf = dmalloc<uint32_t>((size_t)4 * K * 4);      // 4 row tiles
+    static bool nt_set = false;
+    if (!nt_set)
+    {
+        nt_set = true;
+        ds41_attn_set_gv_nt(ds41a::gv_xfrag_nt_launch, ds41a::gv_gemv_nt_launch);
+    }
 }
 // EngramHooks::project (engine/engram/engram_dev.cuh): e = 0 (layer 1) or 1 (layer 14); 0 = ok.
 inline int ds41_engram_project(void* model, int e, int rows, void* stream, const __nv_bfloat16* emb, __nv_bfloat16* kv)
@@ -173,7 +182,7 @@ inline int ds41_engram_project(void* model, int e, int rows, void* stream, const
     if (e < 0 || e > 1 || rows < 1) return 1;
     const Ds41EngramProj& q = g_ds41_eng[e];
     if (!q.W.gv) return ds41::NOTSUP;
-    return ds41_attn_project(&q.W, emb, rows, kv, q.W.N, q.codes, q.scales, q.xf, stream);
+    return ds41_attn_project_nt(&q.W, emb, rows, kv, q.W.N, q.codes, q.scales, q.xf, stream);
 }
 
 // The indexer's per-layer bind/prepare (engine/attn/ds41_idx_ops.cuh, included after this header in ds41_step.cuh): this file owns the table slots

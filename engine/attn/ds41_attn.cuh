@@ -1750,6 +1750,8 @@ inline int g_attn_split = 0; // GR8_DS_ATTN_SPLIT=1, default off; two CTAs per r
 inline int g_gv_tpc = 1, g_gv_ks = 0;   // output tiles per CTA; k-parts per tile (0 = the default pick, gv_pick_ks in ds41_attn_gv.cuh)
 inline XfragFn g_fn_xfrag = nullptr;
 inline GemvFn g_fn_gemv = nullptr;
+inline XfragNtFn g_fn_xfrag_nt = nullptr;   // project_rows_nt's multi-tile hooks (ds41_attn_set_gv_nt)
+inline GemvFn g_fn_gemv_nt = nullptr;
 inline bool use_gv(const Fp8Mat& W, int n) { return g_use_gv && n >= 1 && n <= 8 && W.gv != nullptr && g_fn_xfrag && g_fn_gemv; }
 inline void launch_xfrag(const uint8_t* codes, int ldc, const uint8_t* sc, int lds, int M, int K, int groups, size_t gc, size_t gs, uint32_t* xf, cudaStream_t st)
 {
@@ -1781,6 +1783,22 @@ inline int project_rows(const Fp8Mat& W, const bf16* x, int rows, bf16* y, int l
         launch_act_quant(x + (size_t)r0 * W.K, W.K, codes, W.K, scales, W.K / 32, m, W.K, st);
         launch_xfrag(codes, W.K, scales, W.K / 32, m, W.K, 1, 0, 0, xf, st);
         launch_gemv(xf, W, y + (size_t)r0 * ldy, ldy, m, 1, 0, st);
+    }
+    return 0;
+}
+// project_rows with one weight pass per 32 rows: up to 32 rows are act-quantized at once, their nt = ceil(m / 8) row-tile tables built in one
+// launch, and the GEMV reads the records once for all nt tiles. Tile t's table holds the words project_rows' pass r0 = 8 t builds, and the
+// GEMV runs each tile's stock mma / scale / reduce sequence on its own columns, so every output equals project_rows' bit for bit.
+// codes u8 [32][K], scales u8 [32][K/32], xf u32 [4][K*4] are scratch; W.gv and the multi-tile hooks (ds41_attn_set_gv_nt) required.
+inline int project_rows_nt(const Fp8Mat& W, const bf16* x, int rows, bf16* y, int ldy, uint8_t* codes, uint8_t* scales, uint32_t* xf, cudaStream_t st)
+{
+    if (!W.gv || !g_fn_xfrag_nt || !g_fn_gemv_nt || rows < 1 || (W.K & 31) || (W.N & 15)) return 1;
+    for (int r0 = 0; r0 < rows; r0 += 32)
+    {
+        const int m = rows - r0 < 32 ? rows - r0 : 32;
+        launch_act_quant(x + (size_t)r0 * W.K, W.K, codes, W.K, scales, W.K / 32, m, W.K, st);
+        g_fn_xfrag_nt(codes, W.K, scales, W.K / 32, m, W.K, xf, st);
+        g_fn_gemv_nt(xf, W, y + (size_t)r0 * ldy, ldy, m, 1, 0, st, g_gv_tpc, g_gv_ks);
     }
     return 0;
 }

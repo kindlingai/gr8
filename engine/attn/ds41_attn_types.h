@@ -24,6 +24,9 @@ struct Fp8Mat { const uint8_t* w; const uint8_t* s; int N, K; const uint8_t* gv 
 typedef void (*XfragFn)(const uint8_t* codes, int ldc, const uint8_t* sc, int lds, int M, int K, int groups, size_t gc, size_t gs, uint32_t* xf,
                         cudaStream_t st);
 typedef void (*GemvFn)(const uint32_t* xf, const Fp8Mat& W, bf16* Y, int ldy, int M, int groups, size_t y_gs, cudaStream_t st, int tpc, int ks);
+// Multi-tile hooks (project_rows_nt): xfrag_nt writes nt = ceil(M / 8) <= 4 row-tile tables of M <= 32 contiguous rows (tile t at xf + t * K * 4);
+// the GEMV hook of that path is a GemvFn taking M <= 32 (groups = 1), one weight pass for all nt tiles.
+typedef void (*XfragNtFn)(const uint8_t* codes, int ldc, const uint8_t* sc, int lds, int M, int K, uint32_t* xf, cudaStream_t st);
 struct Weights
 {
     Fp8Mat wq_a, wq_b, wkv, wo_a, wo_b;           // wq_b [heads*512][1280]; wo_a N = 1024, K = 4096 (one group; the pointers cover all groups); wo_b [5120][groups*1024]
