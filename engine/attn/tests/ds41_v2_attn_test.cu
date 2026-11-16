@@ -8,6 +8,7 @@
 #include "../ds41_idx.cuh"
 #include "../../kernels/ds41_v2_bf16_tc.cuh"
 #include "../../tests/ds41_v2_test_support.cuh"
+#include "ds41_attn_gv_nt.inc"   // the M = 9..32 decode GEMV gates, run last (ds41a::gvnt restores every global it changes)
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
@@ -125,5 +126,6 @@ int main() {
     ds41a::g_use_gv=false; ds41a::g_use_tc=true;
     test::output_test(65);test::output_test(128);test::output_test(2);
     CK(cudaGetLastError());
+    ds41a::gvnt::run_all();
     puts("PASS v2 native attention wire/stage suite; model quality and fabric speed NOT measured");
 }

@@ -1289,6 +1289,9 @@ int main(int argc, char** argv)
     };
     if (graph)
     {
+#if G6_MODEL_DS41
+        ds41_attn_set_gv_rows_max(32);   // the decode / verify steps: the attention + idx wq_b GEMV up to 32 rows (8 again before the draft graphs)
+#endif
         for (int k = 0; k < m.nbk; ++k)
         {
             m.cur = k;
@@ -1327,6 +1330,7 @@ int main(int argc, char** argv)
 #endif
         }
 #if G6_MODEL_DS41
+        ds41_attn_set_gv_rows_max(8);
         if (dsk.on())                   // one draft graph per session count: the DS41 layers read the context from their step cells, not from a bucket
         {
             DS.cur = 0;
@@ -1763,7 +1767,14 @@ int main(int argc, char** argv)
             },
             [&]() -> unsigned { return *f.error | cp_error() | ds41_engram_error(m) | (v2engine.v.live ? *v2engine.v.wire.error : 0u); },
             [&](int k, const StepIn& si) {
-                if (!graph) { launch_step(m, si.M, si.context, st, -1, 0, residual_copy); return; }   // eager: the offline loop's launch (rm lambda); reads m.ds_ns
+                if (!graph)   // eager: the offline loop's launch (rm lambda); reads m.ds_ns. Decode / verify steps: GEMV up to 32 rows, then 8 again
+                {
+                    const bool dec = m.ds_moe_decode_step || m.ds_ns > 1;
+                    if (dec) ds41_attn_set_gv_rows_max(32);
+                    launch_step(m, si.M, si.context, st, -1, 0, residual_copy);
+                    if (dec) ds41_attn_set_gv_rows_max(8);
+                    return;
+                }
                 g6s2::require(k >= 0 && k < m.nbk && si.M >= 1 && si.M <= MX &&
                               (m.ds_ns > 1 || (m.ds_moe_decode_step && ds_moe_decode_graph ? exec_dec[k][si.M] : exec[k][si.M])), "DS41 serve graph not captured");
                 launch_main(k, si.M);   // m.ds_ns > 1 (set by serve_ds41): the ns-session graph
