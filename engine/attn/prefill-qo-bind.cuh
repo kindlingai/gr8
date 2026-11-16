@@ -38,6 +38,7 @@ template<bool FOLD=false> __global__ void __launch_bounds__(256) prepass(const u
 
 struct G6AttnQoWork {
     void* data = nullptr; size_t bytes = 0; int cap = 0, max_rows = 0, device = 0;
+    void* ext_table = nullptr;              // g6a_qo_create_ext: the key table is here, not in data
     cublasHandle_t blas = nullptr; std::atomic<unsigned> refs{1};
 };
 struct G6AttnQo {
@@ -169,13 +170,13 @@ inline void qo_dump(const __half* q, int rows, int H, int context, cudaStream_t 
     fprintf(stderr, "qodump dev=%d rows=%d ctx=%d hash=%016llx\n", dev, rows, context, f);
 }
 #endif
-static size_t layout(G6AttnQo& p, void* base) {
+static size_t layout(G6AttnQo& p, void* base, void* ext_table) {
     size_t used = 0; auto take = [&](size_t n) { size_t at = used; used = (used + n + 255) & ~size_t(255); return (void*)((uintptr_t)base + at); };
     size_t C = (size_t)p.cap, R = (size_t)p.max_rows, H = (size_t)p.heads;
 #if PF_QOROPE
     p.rope = (float2*)take(C * 32 * sizeof(float2));   // first, so a non-owner (cap <= owner cap) sees the owner's table
 #endif
-    p.table = (__half*)take(C * 576 * 2); p.bad = (uint8_t*)take(C);
+    p.table = ext_table ? (__half*)ext_table : (__half*)take(C * 576 * 2); p.bad = (uint8_t*)take(C);
     p.q = (__half*)take(R * H * 576 * 2); p.ctx = (float*)take(R * H * 512 * 4); p.ctxh = (__half*)take(R * H * 512 * 2);
     return used;
 }
@@ -190,6 +191,11 @@ inline bool heads_ok(int h) { return h == 64 || (G6_NR == 4 && h == 32); }
 
 extern "C" int g6a_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G6AttnTensor* uk, const G6AttnTensor* uv,
                                  int max_rows, void* s, G6AttnQo* owner) {
+    return g6a_qo_create_ext(out, b, uk, uv, max_rows, s, owner, nullptr, 0);
+}
+extern "C" int g6a_qo_create_ext(G6AttnQo** out, const G6AttnBinding* b, const G6AttnTensor* uk, const G6AttnTensor* uv,
+                                 int max_rows, void* s, G6AttnQo* owner, void* ext_table, size_t ext_bytes) {
+    if (owner && ext_table) return int(cudaErrorInvalidValue);   // a borrower takes its owner's table
     if (!out || *out || !b || !b->storage || !uk || !uv || max_rows <= 0) return int(cudaErrorInvalidValue);
     auto shape = [](const G6AttnTensor* t, int64_t a, int64_t c, int64_t d) { return t->data && t->ndim == 3 && t->shape[0] == a && t->shape[1] == c && t->shape[2] == d; };
     const int heads = uk->ndim == 3 ? (int)uk->shape[0] : 0;
@@ -207,13 +213,16 @@ extern "C" int g6a_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G6Att
     if (gqi::cap_limit > 0 && p->cap > ((gqi::cap_limit + 31) & ~31)) p->cap = (gqi::cap_limit + 31) & ~31;
     int device = 0; cudaError_t e = cudaGetDevice(&device);
     if (e != cudaSuccess) { delete p; return int(e); }
-    const size_t need = gqi::layout(*p, nullptr);
+    void* const table = owner ? (owner->w ? owner->w->ext_table : nullptr) : ext_table;
+    if (!owner && ext_table && ext_bytes < (size_t)p->cap * 576 * 2) { delete p; return int(cudaErrorInvalidValue); }
+    const size_t need = gqi::layout(*p, nullptr, table);
     if (owner) {
         auto w = owner->w;
         if (!w || w->device != device || p->cap > w->cap || max_rows > w->max_rows || need > w->bytes) { delete p; return int(cudaErrorInvalidValue); }
         p->w = w; w->refs.fetch_add(1, std::memory_order_relaxed);
     } else {
         auto w = new G6AttnQoWork; w->bytes = need; w->cap = p->cap; w->max_rows = max_rows; w->device = device;
+        w->ext_table = ext_table;
         e = cudaMalloc(&w->data, need);
         if (e != cudaSuccess) { delete w; delete p; return int(e); }
         int rc = gp::blas_status(cublasCreate(&w->blas));
@@ -221,7 +230,7 @@ extern "C" int g6a_qo_create(G6AttnQo** out, const G6AttnBinding* b, const G6Att
         if (rc) { cudaFree(w->data); delete w; delete p; return rc; }
         p->w = w;
     }
-    gqi::layout(*p, p->w->data);
+    gqi::layout(*p, p->w->data, table);
     p->weight_bytes = (size_t)heads * (512 * 192 + 256 * 512) * 2;
     p->bytes = p->weight_bytes + (owner ? 0 : p->w->bytes);
     e = cudaMalloc(&p->storage, p->weight_bytes);

@@ -34,6 +34,10 @@ extern "C" int g6a_bind_prefill_release(G6AttnPrefill*);
 // destroying the root, its accounting charge disappears but retained scratch
 // remains live until the final borrower is released.
 extern "C" size_t g6a_bind_prefill_bytes(const G6AttnPrefill*);
+// The FP16 key cache [C][576] in the state's scratch (a shared root's, for every borrower). Every call expands it at its
+// start and reads it only inside the call, so a caller may lend it to a path whose calls never overlap these
+// (g6a_qo_create_ext).
+extern "C" int g6a_bind_prefill_cache(const G6AttnPrefill*, void** cache, size_t* bytes);
 // Query effective tile=min(configured tile,max_rows) and frozen dense threshold.
 extern "C" int g6a_bind_prefill_get_config(const G6AttnPrefill*,int* query_tile,int* dense_limit);
 // Diagnostic runners: same computation with optional FP32 stage copies.

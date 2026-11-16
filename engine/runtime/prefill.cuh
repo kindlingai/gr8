@@ -531,6 +531,17 @@ inline void pf_qo_warm(Model& m, Prefill& P, cudaStream_t st)
 inline void pf_qp_alloc(Prefill& P, Model& m, int Mmax, const g6::FabricDev& f, Prefill* share);
 inline void pf_qp_states(Prefill& P, Model& m, cudaStream_t st, Prefill* share);
 inline void pf_qp_warm(Model& m, Prefill& P, cudaStream_t st);
+// The tensor-core prefill's key cache, for the QO key table (GR8_PF_OWN=3 / 4), or none without tensor-core states. Each
+// call of either path writes its table at its start and reads it only inside the call, and the calls never overlap: a
+// lane runs one layer's attention at a time on one path, and the two lanes take each layer's attention in turn
+// (pf_step2s). The QO workspace keeps its RoPE table, which decode reads for the life of the process.
+inline std::pair<void*, size_t> pf_qo_table(const Prefill& P)
+{
+    void* c = nullptr;
+    size_t n = 0;
+    if (P.av.empty() || g6_attn_bind_prefill_cache(P.av.front(), &c, &n) || !c) return {nullptr, 0};
+    return {c, n};
+}
 inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, const g6::FabricDev& f, u64* stepp,
                           cudaStream_t st = nullptr, Prefill* share = nullptr, G6AttnPrefill* tc_root = nullptr)
 {
@@ -652,23 +663,7 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
             for (int i = 0; i < 6; ++i) t.sh_tr[i] = y.T.sh_tr[i];
         }
     }
-    if (P.qp) pf_qp_states(P, m, st, share);
-    if (P.qo && share) P.qa = share->qa;
-    else if (P.qo)
-    {
-        size_t b = 0;
-        for (int i = 0; i < m.nl; ++i)
-        {
-            G6AttnQo* q = nullptr;
-            const QoW& w = (*P.qow)[i];
-            if (int e = g6_attn_qo_create(&q, &m.layers[i].ab, &w.uk, &w.uv, P.qo_rows, st, P.qa.empty() ? nullptr : P.qa.front()))
-                die("rank " + std::to_string(m.rank) + " layer " + std::to_string(m.layers[i].l) + ": g6_attn_qo_create failed (" + std::to_string(e) + ")");
-            P.qa.push_back(q);
-            b += g6_attn_qo_bytes(q);
-        }
-        if (m.rank == 0) fprintf(stderr, "# rank %d: QO attention states (GR8_PF_OWN=3, kernel %s) for %d layers: %.3f GB\n", m.rank,
-                                 knob::pf_qo().c_str(), m.nl, b / 1e9);
-    }
+    // the tensor-core states first: the QO states' key table is their key cache (pf_qo_table)
     if (share)
     {
         P.v2 = share->v2; P.av = share->av;
@@ -690,6 +685,24 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
             b += g6_attn_bind_prefill_bytes(a);
         }
         fprintf(stderr, "# rank %d: tensor-core prefill attention states for %d layers: %.3f GB\n", m.rank, m.nl, b / 1e9);
+    }
+    if (P.qp) pf_qp_states(P, m, st, share);
+    if (P.qo && share) P.qa = share->qa;
+    else if (P.qo)
+    {
+        size_t b = 0;
+        for (int i = 0; i < m.nl; ++i)
+        {
+            G6AttnQo* q = nullptr;
+            const QoW& w = (*P.qow)[i];
+            const auto t = P.qa.empty() ? pf_qo_table(P) : std::pair<void*, size_t>{};
+            if (int e = g6_attn_qo_create_ext(&q, &m.layers[i].ab, &w.uk, &w.uv, P.qo_rows, st, P.qa.empty() ? nullptr : P.qa.front(), t.first, t.second))
+                die("rank " + std::to_string(m.rank) + " layer " + std::to_string(m.layers[i].l) + ": g6_attn_qo_create failed (" + std::to_string(e) + ")");
+            P.qa.push_back(q);
+            b += g6_attn_qo_bytes(q);
+        }
+        if (m.rank == 0) fprintf(stderr, "# rank %d: QO attention states (GR8_PF_OWN=3, kernel %s) for %d layers: %.3f GB\n", m.rank,
+                                 knob::pf_qo().c_str(), m.nl, b / 1e9);
     }
     if (P.qo && !share) pf_qo_warm(m, P, st);   // lanes that share the states share the cuBLAS handle
     if (P.qp && !share && knob::pf_qp_warm()) pf_qp_warm(m, P, st);
