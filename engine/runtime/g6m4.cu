@@ -169,9 +169,13 @@ int main(int argc, char** argv)
     if (knob::init()) return 2;        // every bad GR8_ value and unknown name at once (docs/ENV.md)
     const auto boot_t0 = std::chrono::steady_clock::now();
     int boot_rank = -1;
+    // each phase with the host's memory: GB10's device allocations and pinned buffers both come out of MemAvailable,
+    // so the differences between phases are what each phase took
     auto boot = [&](const char* phase) {
-        fprintf(stderr, "# rank %d: boot %.1f s %s\n", boot_rank,
-                std::chrono::duration<double>(std::chrono::steady_clock::now() - boot_t0).count(), phase);
+        const HostMem hm = host_mem();
+        fprintf(stderr, "# rank %d: boot %.1f s %s; MemAvailable %.2f GiB, engine RSS %.2f GiB\n", boot_rank,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - boot_t0).count(), phase,
+                kb_gib(hm.avail_kb), kb_gib(hm.rss_kb));
     };
     setvbuf(stdout, nullptr, _IOLBF, 0);
     pf_env_check();                    // strict GR8_PF_* choices: a bad value exits before any work
@@ -844,6 +848,7 @@ int main(int argc, char** argv)
         build_prefill(P2, m, find, MP, fp2, dmalloc<u64>(1), st, &P);
 #endif
     }
+    boot("prefill lanes built");
 #if G6_MODEL_FLASH
     if (pool_owner) {
         init_flash_pool_transport(FP.pool_transport, fabix, MP);
@@ -919,6 +924,7 @@ int main(int argc, char** argv)
         DQ.P.attn_rows = pf_attn_rows(MP);
         if (MP) build_draft_prefill(DQ, D, find, MP, fp, pfv2, st, &P);
 #endif
+        boot("MTP draft built");
     }
     Dfl DF;                             // --dflash
     g6::Pack dpack;
@@ -948,6 +954,7 @@ int main(int argc, char** argv)
 #if G6_MODEL_FLASH
         if (pfctx) { FP.dfl_tap = dfl_pf_tap_flash; FP2.dfl_tap = dfl_pf_tap_flash; }
 #endif
+        boot("DFlash drafter built");
     }
     // S2: below R on the CP binding. Session views on the pool, main and draft; today's graphs below
     // are captured with s2on off (the S = 1 path), the S2 graphs later by s2/native.cuh with s2on on.
@@ -1040,6 +1047,7 @@ int main(int argc, char** argv)
         m.s2on = D.d.s2on = false;
     }
 #endif
+    if (s2mode) boot("remote rows and S2 sessions built");
     u64 ls0 = 1;
     double pf_ms = 0;
     long pf_rows = 0;
