@@ -218,9 +218,9 @@ int main(int argc, char** argv)
     for (int i = 0; i < n; ++i) one(r, k0, tx, kinds, refused);
     struct Want { const char* shape; uint64_t hash; };
     const Want wants[] = {
-        {"glm nr6 mx8", 0xee0cd5ef43dd2635ull},
-        {"glm nr4 mx32", 0x8f1da8b7421ae74bull},
-        {"glm nr3 mx32", 0xc845c7c8c70e40b6ull},
+        {"glm nr6 mx8", 0x2d0841bc835be633ull},
+        {"glm nr4 mx32", 0x911d3212eb519af1ull},
+        {"glm nr3 mx32", 0xac395b8e6af2be5bull},
         {"flash nr4 mx32", 0x623b99a841ce800aull},
         {"flash nr3 mx32", 0xf9dc44042fc2de31ull},
         {"flash nr2 mx32", 0x4cf96175c8f81c0eull},

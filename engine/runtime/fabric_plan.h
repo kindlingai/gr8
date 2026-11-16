@@ -348,7 +348,7 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
         cp.ncoll = pf_rs ? 5 : 2;
 #if G6_MODEL_FLASH
         if (in.pf_sp) { cp.slot_bytes = pf_sp_slot_bytes(MP, (int)cfg.ips.size()); cp.ncoll = 4; }
-#else
+#elif !G6_MODEL_DS41
         // GLM's reduce-scatter form: full slots for the reduce-scatters c0 and c2, one rank's rows for the gathers c1 and
         // c3, c4 (pf_slots.h), and no recv slot for the rank's own rows, which it reads from its send slot (glue::peer_slot)
         if (pf_rs)
