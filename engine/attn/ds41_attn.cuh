@@ -1752,7 +1752,15 @@ inline XfragFn g_fn_xfrag = nullptr;
 inline GemvFn g_fn_gemv = nullptr;
 inline XfragNtFn g_fn_xfrag_nt = nullptr;   // project_rows_nt's multi-tile hooks (ds41_attn_set_gv_nt)
 inline GemvFn g_fn_gemv_nt = nullptr;
-inline bool use_gv(const Fp8Mat& W, int n) { return g_use_gv && n >= 1 && n <= 8 && W.gv != nullptr && g_fn_xfrag && g_fn_gemv; }
+// The largest row count that takes the GEMV (ds41_attn_set_gv_rows_max, 8..32): 8 by default and while anything eager runs (every prefill chunk
+// keeps its GEMV <= 8 / GEMM above path); the rank TU sets 32 only while it captures (or eagerly launches) the decode / verify steps, then 8 again.
+// A host global read when a stage is enqueued: a captured graph keeps the value it was captured with. DSpark passes an explicit 8.
+inline int g_gv_rows_max = 8;
+inline void set_gv_rows_max(int max_rows) { g_gv_rows_max = max_rows < 8 ? 8 : max_rows > 32 ? 32 : max_rows; }   // ds41_attn_set_gv_rows_max
+inline bool use_gv(const Fp8Mat& W, int n, int max_rows = g_gv_rows_max)
+{
+    return g_use_gv && n >= 1 && n <= max_rows && W.gv != nullptr && g_fn_xfrag && g_fn_gemv;
+}
 inline void launch_xfrag(const uint8_t* codes, int ldc, const uint8_t* sc, int lds, int M, int K, int groups, size_t gc, size_t gs, uint32_t* xf, cudaStream_t st)
 {
     g_fn_xfrag(codes, ldc, sc, lds, M, K, groups, gc, gs, xf, st);
@@ -1762,10 +1770,11 @@ inline void launch_gemv(const uint32_t* xf, const Fp8Mat& W, bf16* Y, int ldy, i
     g_fn_gemv(xf, W, Y, ldy, M, groups, y_gs, st, tpc ? tpc : g_gv_tpc, ks ? ks : g_gv_ks);
 }
 // one projection: act codes/scales A/SA already quantized -> Y (groups > 1: block-diagonal, as launch_gemm). gv_ready: xf already holds A's table.
+// max_rows: the GEMV row cap (default g_gv_rows_max); a caller whose xf holds one row tile passes 8.
 inline void proj_mm(const Fp8Mat& W, const uint8_t* A, int lda, const uint8_t* SA, int lsa, uint32_t* xf, bool gv_ready, bf16* Y, int ldy, int M, int groups,
-                    size_t a_gs, size_t sa_gs, size_t y_gs, cudaStream_t st)
+                    size_t a_gs, size_t sa_gs, size_t y_gs, cudaStream_t st, int max_rows = g_gv_rows_max)
 {
-    if (use_gv(W, M))
+    if (use_gv(W, M, max_rows))
     {
         if (!gv_ready) launch_xfrag(A, lda, SA, lsa, M, W.K, groups, a_gs, sa_gs, xf, st);
         launch_gemv(xf, W, Y, ldy, M, groups, y_gs, st);

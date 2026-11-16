@@ -43,8 +43,9 @@ inline bool dsp_gv_on()
     if (g_dsp_gv < 0) g_dsp_gv = knob::ds_dsp_gv() ? 1 : 0;
     return g_dsp_gv != 0;
 }
-// the one rule: knob on and ds41a's GEMV rule (g_use_gv, 1..8 rows, gv records, hooks bound)
-inline bool dsp_use_gv(const ds41a::Fp8Mat& W, int rows) { return dsp_gv_on() && ds41a::use_gv(W, rows); }
+// the one rule: knob on and ds41a's GEMV rule (g_use_gv, 1..8 rows, gv records, hooks bound). DSpark keeps the explicit 8-row cap whatever
+// ds41a::g_gv_rows_max is (its blocks are at most BLOCK_MAX = 8 rows a session).
+inline bool dsp_use_gv(const ds41a::Fp8Mat& W, int rows) { return dsp_gv_on() && ds41a::use_gv(W, rows, 8); }
 // Knob on and the GEMV rule fails (more than 8 rows, no gv records, hooks unbound): never hide it behind the GEMM. Tests replace g_dsp_fail.
 inline void dsp_die(const ds41a::Fp8Mat& W, int rows)
 {
@@ -349,7 +350,7 @@ void attn_proj_blk(const ds41a::Weights& W, const Ring& R, const ds41a::Scratch&
     launch_act_quant(S.qr, QA, S.qrq, QA, S.qrs, QA / 32, rows, QA, st);
     dsp_mm(W.wq_b, S.qrq, QA, S.qrs, QA / 32, S.xf_qr, false, S.q, heads * HD, rows, 1, 0, 0, 0, st);
     k_rope_tail_pos<<<(unsigned)(((long)rows * heads * 32 + 255) / 256), 256, 0, st>>>(S.q, (long)heads * HD, rows, heads, pos, W.inv, 0);
-    dsp_mm(W.wkv, S.yq, HID, S.ys, HID / 32, S.xf_y, ds41a::use_gv(W.wq_a, rows), S.kv0, HD, rows, 1, 0, 0, 0, st);   // wq_a built y's table
+    dsp_mm(W.wkv, S.yq, HID, S.ys, HID / 32, S.xf_y, ds41a::use_gv(W.wq_a, rows, 8), S.kv0, HD, rows, 1, 0, 0, 0, st);   // wq_a built y's table
     k_kv_prep_pos<<<rows, 512, 0, st>>>(S.kv0, W.kv_norm, W.inv, pos, rows_per_sess, R.base, R.sess_stride, R.ring_rows, R.sess);
 }
 // attn_core_blk: S.o = block attention of S.q over the session's ring (window + the block's keys). qpos [sessions] = dsp_q.

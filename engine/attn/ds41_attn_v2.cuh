@@ -10,8 +10,8 @@ inline void attn_proj_own(const Weights& W, InputBuf& o, const bf16* y, const ui
     const uint8_t* yq = codes ? codes : o.yq;
     const uint8_t* ys = scales ? scales : o.ys;
     if (!codes) launch_act_quant(y, HID, o.yq, HID, o.ys, HID / 32, n, HID, st);
-    proj_mm(W.wq_a, yq, HID, ys, HID / 32, o.xf, false, o.qa + (size_t)row0 * QA, QA, n, 1, 0, 0, 0, st);
-    proj_mm(W.wkv, yq, HID, ys, HID / 32, o.xf, use_gv(W.wq_a, n), o.kv0 + (size_t)row0 * HD, HD, n, 1, 0, 0, 0, st);   // wq_a built y's table
+    proj_mm(W.wq_a, yq, HID, ys, HID / 32, o.xf, false, o.qa + (size_t)row0 * QA, QA, n, 1, 0, 0, 0, st, 8);   // o.xf holds one row tile
+    proj_mm(W.wkv, yq, HID, ys, HID / 32, o.xf, use_gv(W.wq_a, n, 8), o.kv0 + (size_t)row0 * HD, HD, n, 1, 0, 0, 0, st, 8);   // wq_a built y's table
     if (!pair) return;
     // with an MXFP8 y form the caller pre-dequantized the bf16 y rows, so comp_row_mm's quantization sees the same bytes the
     // full-row path's comp_row sees after its gather-side dequant

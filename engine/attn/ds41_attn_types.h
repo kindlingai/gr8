@@ -56,13 +56,14 @@ struct Scratch
     uint8_t *yq, *ys, *qrq, *qrs, *oq, *os, *oaq, *oas;
     bf16 *qa, *qr, *q, *kv0, *kvrows, *o, *oa, *cnorm;   // cnorm [M][512]: post-norm pre-rope compressed rows of this call (one session: rows 0..(M+1)/2-1)
     float *ckv, *csc;
-    uint32_t *xf_y, *xf_qr, *xf_o, *xf_oa;   // decode GEMV: fp16 B-fragment tables (8 tokens) of the dequantized y / qr / o / oa activations
+    uint32_t *xf_y, *xf_qr, *xf_o, *xf_oa;   // decode GEMV: fp16 B-fragment tables (GV_TILES x 8 tokens) of the dequantized y / qr / o / oa activations
     float* attn_split = nullptr;  // optional, shared W-prefill scratch: [row][head][2 partitions][max,sum,512 partial output]
     // The call's sessions (SESS > 1; set by the op before each call, not by carve). sess = nullptr: one session, slot 0, row r at position
     // start + r. sess != nullptr: row r is at position dstart[r] of slot sess[r]; ns sessions of n / ns rows each, contiguous
     // (session j = rows j*(n/ns) ..), the rows of one session at consecutive positions.
     const int* sess = nullptr;
     int ns = 1;
+    static constexpr int GV_TILES = 4;   // the decode GEMV's row tiles (8 rows each): 32 rows, ds41a::g_gv_rows_max's ceiling
     static size_t al(size_t b) { return (b + 255) & ~(size_t)255; }
     static size_t split_bytes(int M, int heads) { return al((size_t)M * heads * 2 * (HD + 2) * sizeof(float)); }
     static size_t bytes(int M, int heads)
@@ -71,7 +72,7 @@ struct Scratch
         return al((size_t)M * HID) + al((size_t)M * HID / 32) + al((size_t)M * QA) + al((size_t)M * QA / 32) + al((size_t)M * heads * HD) +
                al((size_t)M * heads * HD / 32) + al((size_t)M * G * OLORA) + al((size_t)M * G * OLORA / 32) + 3 * al((size_t)M * QA * 2) +
                2 * al((size_t)M * HD * 2) + 2 * al((size_t)M * heads * HD * 2) + al((size_t)M * G * OLORA * 2) + 2 * al((size_t)M * HD * 4) + al((size_t)M * HD * 2) +
-               al((size_t)HID * 16) + al((size_t)QA * 16) + al((size_t)heads * HD * 16) + al((size_t)G * OLORA * 16);
+               al((size_t)GV_TILES * HID * 16) + al((size_t)GV_TILES * QA * 16) + al((size_t)GV_TILES * heads * HD * 16) + al((size_t)GV_TILES * G * OLORA * 16);
     }
     void carve(void* base, int M, int heads)
     {
@@ -96,10 +97,10 @@ struct Scratch
         ckv = (float*)take((size_t)M * HD * 4);
         csc = (float*)take((size_t)M * HD * 4);
         cnorm = (bf16*)take((size_t)M * HD * 2);
-        xf_y = (uint32_t*)take((size_t)HID * 16);
-        xf_qr = (uint32_t*)take((size_t)QA * 16);
-        xf_o = (uint32_t*)take((size_t)heads * HD * 16);
-        xf_oa = (uint32_t*)take((size_t)G * OLORA * 16);
+        xf_y = (uint32_t*)take((size_t)GV_TILES * HID * 16);
+        xf_qr = (uint32_t*)take((size_t)GV_TILES * QA * 16);
+        xf_o = (uint32_t*)take((size_t)GV_TILES * heads * HD * 16);
+        xf_oa = (uint32_t*)take((size_t)GV_TILES * G * OLORA * 16);
     }
 };
 

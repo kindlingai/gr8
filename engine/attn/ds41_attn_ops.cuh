@@ -49,6 +49,7 @@ void ds41_attn_set_cpasync(int on);
 void ds41_attn_set_pipe(int on);
 void ds41_attn_set_split(int on);
 void ds41_attn_set_win_floor(int pos);
+void ds41_attn_set_gv_rows_max(int max_rows);
 int ds41_attn_gv_ready(const ds41a::Weights*, int rows);
 int ds41_attn_project(const ds41a::Fp8Mat*, const void* x, int rows, void* y, int ldy, uint8_t* codes, uint8_t* scales, uint32_t* xf, void* st);
 int ds41_attn_project_nt(const ds41a::Fp8Mat*, const void* x, int rows, void* y, int ldy, uint8_t* codes, uint8_t* scales, uint32_t* xf, void* st);

@@ -26,7 +26,7 @@ __device__ __forceinline__ float gvf_e4m3(uint8_t c)
 }
 __device__ __forceinline__ float gvf_e8m0(uint8_t b) { return __uint_as_float(b ? ((uint32_t)b << 23) : 0x00400000u); }
 
-// ------------------------------------------------------------------------------------------------ decode GEMV (M <= 8)
+// ------------------------------------------------------------------------------------------------ decode GEMV (M <= 8; M 9..32 below)
 // The decode projections stream the weights once instead of running the 64 x 64 tiled scalar GEMM above (96% of a layer's time at
 // n = 128, and only N/64 CTAs at M = 1): the pack's MXFP8 GV records ([N/16][K/32][528], densev.cuh Mxfp8) are the mma A operand, the
 // activations are the B operand (tokens = the 8 columns). The mma takes fp16, so the B operand is the DEQUANTIZED activation
@@ -71,20 +71,53 @@ inline int gv_pick_ks(int K)
         if ((K / 32) % k == 0) return k;
     return 1;
 }
-// XfragFn
+// multi-tile forms (M 9..32, the decode / verify steps ds41a::g_gv_rows_max admits): defined below
+__global__ void k_xfrag_q_nt(const uint8_t* __restrict__ codes, int ldc, const uint8_t* __restrict__ sc, int lds, int M, int K, size_t gc, size_t gs,
+                             uint32_t* __restrict__ xf);
+template <int NT>
+__global__ void __launch_bounds__(512) k_gv_mx_nt(const uint8_t* __restrict__ stream, const uint32_t* __restrict__ xf, int K, int out_tiles, int tpc, int ks,
+                                                  int M, bf16* y, int ystride, size_t y_gs);
+// XfragFn. M <= 8: k_xfrag_q, one 8-row table per group. M 9..32: k_xfrag_q_nt, nt = ceil(M / 8) row-tile tables per group (group g, tile t
+// at xf + (g * nt + t) * K * 4; tile t's words are the 8-row table of rows 8 t ..).
 inline void gv_xfrag_launch(const uint8_t* codes, int ldc, const uint8_t* sc, int lds, int M, int K, int groups, size_t gc, size_t gs, uint32_t* xf,
                             cudaStream_t st)
 {
-    k_xfrag_q<<<dim3((K / 16 * 64 + 255) / 256, groups), 256, 0, st>>>(codes, ldc, sc, lds, M, K, gc, gs, xf);
+    if (M <= 8)
+    {
+        k_xfrag_q<<<dim3((K / 16 * 64 + 255) / 256, groups), 256, 0, st>>>(codes, ldc, sc, lds, M, K, gc, gs, xf);
+        return;
+    }
+    if (M > 32)
+    {
+        fprintf(stderr, "gv_xfrag_launch: M %d (needs 1 <= M <= 32)\n", M);
+        abort();
+    }
+    k_xfrag_q_nt<<<dim3((K / 16 * 64 + 255) / 256, (M + 7) / 8, groups), 256, 0, st>>>(codes, ldc, sc, lds, M, K, gc, gs, xf);
 }
-// GemvFn (tpc, ks: 0 = default; ks that does not divide K / 32 falls back to gv_pick_ks; tpc * ks <= 16 warps)
+// GemvFn (tpc, ks: 0 = default; ks that does not divide K / 32 falls back to gv_pick_ks; tpc * ks <= 16 warps). M <= 8: k_gv_mx.
+// M 9..32: k_gv_mx_nt<ceil(M / 8)>, one pass over the records for all row tiles (each tile's mma / reduce sequence is k_gv_mx's: same bits).
 inline void gv_gemv_launch(const uint32_t* xf, const Fp8Mat& W, bf16* Y, int ldy, int M, int groups, size_t y_gs, cudaStream_t st, int tpc, int ks)
 {
     const int K = W.K, ot = W.N / 16;
     if (!ks || (K / 32) % ks) ks = gv_pick_ks(K);
     if (tpc < 1) tpc = 1;
     if (tpc * ks > 16) tpc = 16 / ks > 0 ? 16 / ks : 1;
-    k_gv_mx<<<dim3((ot + tpc - 1) / tpc, groups), tpc * ks * 32, 0, st>>>(W.gv, xf, K, ot, tpc, ks, M, Y, ldy, y_gs);
+    const dim3 grid((ot + tpc - 1) / tpc, groups);
+    const int thr = tpc * ks * 32;
+    if (M <= 8)
+    {
+        k_gv_mx<<<grid, thr, 0, st>>>(W.gv, xf, K, ot, tpc, ks, M, Y, ldy, y_gs);
+        return;
+    }
+    switch ((M + 7) / 8)
+    {
+    case 2: k_gv_mx_nt<2><<<grid, thr, 0, st>>>(W.gv, xf, K, ot, tpc, ks, M, Y, ldy, y_gs); break;
+    case 3: k_gv_mx_nt<3><<<grid, thr, 0, st>>>(W.gv, xf, K, ot, tpc, ks, M, Y, ldy, y_gs); break;
+    case 4: k_gv_mx_nt<4><<<grid, thr, 0, st>>>(W.gv, xf, K, ot, tpc, ks, M, Y, ldy, y_gs); break;
+    default:
+        fprintf(stderr, "gv_gemv_launch: M %d (needs 1 <= M <= 32)\n", M);
+        abort();
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ quad records (GR8_DS41_GV_QUAD=1)
@@ -155,28 +188,36 @@ __device__ __forceinline__ void gv_quad_part(const uint8_t* tile, const u32* bf,
         }
     }
 }
-// k_gv_mx at tpc 1 with the quad warp part (the rest is gv_gemv_body<Mxfp8, 1>'s code). grid = (out_tiles, groups), block ks x 32.
+// k_gv_mx at tpc 1 with the quad warp part (the rest is gv_gemv_body<Mxfp8, NT>'s code). grid = (out_tiles, groups), block ks x 32.
+// NT = ceil(M / 8) row tiles (group g's tables at xf + g * NT * K * 4, gv_xfrag_launch's layout); NT 1 is the 8-row kernel.
+template <int NT = 1>
 __global__ void __launch_bounds__(512) k_gv_mx_q(const uint8_t* __restrict__ stream, const uint32_t* __restrict__ xf, int K, int out_tiles, int ks, int M,
                                                  bf16* y, int ystride, size_t y_gs)
 {
     __shared__ float4 red[32][32];
     const int g = blockIdx.y;
     const uint8_t* st = stream + (size_t)g * out_tiles * (K / 32) * 528;
-    const u32* xfrag = xf + (size_t)g * K * 4;
+    const u32* xfrag = xf + (size_t)g * NT * K * 4;
     bf16* yg = y + g * y_gs;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int part = warp % ks, ot = blockIdx.x;
     const int NG2 = K / 32, NGP = NG2 / ks;
     const bool on = ot < out_tiles;
-    float acc[1][4] = {{0.f, 0.f, 0.f, 0.f}};
-    if (on) gv_quad_part<1>(st + (size_t)ot * NG2 * 528, xfrag + lane * 2, K * 4, part * NGP, (part + 1) * NGP, acc);
-    if (ks > 1) gv_reduce<1>(red, acc, on, part, warp, lane, ks);
+    float acc[NT][4];
+    #pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.f;
+    if (on) gv_quad_part<NT>(st + (size_t)ot * NG2 * 528, xfrag + lane * 2, K * 4, part * NGP, (part + 1) * NGP, acc);
+    if (ks > 1) gv_reduce<NT>(red, acc, on, part, warp, lane, ks);
     if (!on || part) return;
     const int r = lane >> 2, c = lane & 3;
     const size_t o = (size_t)ot * 16 + r;
-    const int m0 = 2 * c;
-    if (m0 < M) { gv::put(yg, (size_t)m0 * ystride + o, acc[0][0], gv::O_BF16); gv::put(yg, (size_t)m0 * ystride + o + 8, acc[0][2], gv::O_BF16); }
-    if (m0 + 1 < M) { gv::put(yg, (size_t)(m0 + 1) * ystride + o, acc[0][1], gv::O_BF16); gv::put(yg, (size_t)(m0 + 1) * ystride + o + 8, acc[0][3], gv::O_BF16); }
+    #pragma unroll
+    for (int t = 0; t < NT; ++t)
+    {
+        const int m0 = 8 * t + 2 * c;
+        if (m0 < M) { gv::put(yg, (size_t)m0 * ystride + o, acc[t][0], gv::O_BF16); gv::put(yg, (size_t)m0 * ystride + o + 8, acc[t][2], gv::O_BF16); }
+        if (m0 + 1 < M) { gv::put(yg, (size_t)(m0 + 1) * ystride + o, acc[t][1], gv::O_BF16); gv::put(yg, (size_t)(m0 + 1) * ystride + o + 8, acc[t][3], gv::O_BF16); }
+    }
 }
 inline std::unordered_set<const uint8_t*> g_gv_quad;   // record pointers in the quad layout (only k_gv_mx_q may read them)
 // the launcher's tpc / ks rule (gv_gemv_launch), for the bind-time check
@@ -216,37 +257,59 @@ inline void gv_gemv_launch_q(const uint32_t* xf, const Fp8Mat& W, bf16* Y, int l
         told = true;
         fprintf(stderr, "# GR8_DS41_GV_QUAD=1: %zu weight record sets in the quad layout (k_gv_mx_q)\n", g_gv_quad.size());
     }
-    k_gv_mx_q<<<dim3(ot, groups), ks * 32, 0, st>>>(W.gv, xf, K, ot, ks, M, Y, ldy, y_gs);
+    const dim3 grid(ot, groups);
+    switch ((M + 7) / 8)
+    {
+    case 0:
+    case 1: k_gv_mx_q<1><<<grid, ks * 32, 0, st>>>(W.gv, xf, K, ot, ks, M, Y, ldy, y_gs); break;
+    case 2: k_gv_mx_q<2><<<grid, ks * 32, 0, st>>>(W.gv, xf, K, ot, ks, M, Y, ldy, y_gs); break;
+    case 3: k_gv_mx_q<3><<<grid, ks * 32, 0, st>>>(W.gv, xf, K, ot, ks, M, Y, ldy, y_gs); break;
+    case 4: k_gv_mx_q<4><<<grid, ks * 32, 0, st>>>(W.gv, xf, K, ot, ks, M, Y, ldy, y_gs); break;
+    default:
+        fprintf(stderr, "gv_gemv_launch_q: M %d (needs 1 <= M <= 32)\n", M);
+        abort();
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ multi-tile decode GEMV (M <= 32)
 // project_rows_nt (ds41_attn.cuh): up to 32 contiguous rows in one weight pass. The fragment table holds nt = ceil(M / 8) row tiles, tile t
 // at xf + t * K * 4 (the ts = K * 4 stride gv_warp_part expects); tile t, lane l (t8 = l / 4) reads row 8 t + t8 and writes 0 at rows >= M,
-// so tile t's words equal k_xfrag_q's in project_rows' pass r0 = 8 t. grid = (K/16*64/256, nt), block 256.
-__global__ void k_xfrag_q_nt(const uint8_t* __restrict__ codes, int ldc, const uint8_t* __restrict__ sc, int lds, int M, int K, uint32_t* __restrict__ xf)
+// so tile t's words equal k_xfrag_q's in project_rows' pass r0 = 8 t. Group g = blockIdx.z reads codes + g gc, scales + g gs (k_xfrag_q's
+// block-diagonal rule) and writes its nt tables at xf + g * nt * K * 4. grid = (K/16*64/256, nt, groups), block 256.
+__global__ void k_xfrag_q_nt(const uint8_t* __restrict__ codes, int ldc, const uint8_t* __restrict__ sc, int lds, int M, int K, size_t gc, size_t gs,
+                             uint32_t* __restrict__ xf)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= K / 16 * 64) return;
-    const int tile = blockIdx.y, ks = i >> 6, l = (i >> 1) & 31, reg = i & 1, row = tile * 8 + (l >> 2);
+    const int tile = blockIdx.y, g = blockIdx.z, ks = i >> 6, l = (i >> 1) & 31, reg = i & 1, row = tile * 8 + (l >> 2);
     const int k0 = ks * 16 + reg * 8 + 2 * (l & 3);
     uint32_t v = 0;
     if (row < M)
     {
-        const uint8_t* c = codes + (size_t)row * ldc + k0;
-        const float s = gvf_e8m0(sc[(size_t)row * lds + (k0 >> 5)]);
+        const uint8_t* c = codes + g * gc + (size_t)row * ldc + k0;
+        const float s = gvf_e8m0(sc[g * gs + (size_t)row * lds + (k0 >> 5)]);
         const float a = fminf(fmaxf(gvf_e4m3(c[0]) * s, -65504.f), 65504.f), b = fminf(fmaxf(gvf_e4m3(c[1]) * s, -65504.f), 65504.f);
         v = pack_h2(a, b);
     }
-    xf[(size_t)tile * K * 4 + i] = v;
+    xf[((size_t)g * gridDim.y + tile) * K * 4 + i] = v;
+}
+// k_gv_mx over NT row tiles (gv_gemv_launch at M 9..32): group g's records and NT tables, y + g y_gs. grid = (ceil(out_tiles / tpc), groups).
+template <int NT>
+__global__ void __launch_bounds__(512) k_gv_mx_nt(const uint8_t* __restrict__ stream, const uint32_t* __restrict__ xf, int K, int out_tiles, int tpc, int ks,
+                                                  int M, bf16* y, int ystride, size_t y_gs)
+{
+    const int g = blockIdx.y;
+    gv_gemv_body<Mxfp8, NT>(stream + (size_t)g * out_tiles * (K / 32) * 528, xf + (size_t)g * NT * K * 4, K, out_tiles, tpc, ks, M, y + g * y_gs, ystride,
+                            gv::O_BF16, (int)blockIdx.x);
 }
 // XfragNtFn (1 <= M <= 32)
 inline void gv_xfrag_nt_launch(const uint8_t* codes, int ldc, const uint8_t* sc, int lds, int M, int K, uint32_t* xf, cudaStream_t st)
 {
-    k_xfrag_q_nt<<<dim3((K / 16 * 64 + 255) / 256, (M + 7) / 8), 256, 0, st>>>(codes, ldc, sc, lds, M, K, xf);
+    k_xfrag_q_nt<<<dim3((K / 16 * 64 + 255) / 256, (M + 7) / 8, 1), 256, 0, st>>>(codes, ldc, sc, lds, M, K, 0, 0, xf);
 }
 // GemvFn of project_rows_nt (groups 1, 1 <= M <= 32): tpc / ks resolved by gv_gemv_launch's rules, NT = ceil(M / 8) row tiles in one pass
 // (NT 1: k_gv_mx, the 8-row kernel itself; NT 2..4: gv_gemv_lb512<Mxfp8, NT>, <= 512 threads). Records in the quad layout (g_gv_quad; the
-// Engram wkv is never repacked) fall back to one gv_gemv_launch_q per 8-row tile of the same table.
+// Engram wkv is never repacked) go to gv_gemv_launch_q: k_gv_mx_q<NT>, one pass for all tiles of the same table.
 inline void gv_gemv_nt_launch(const uint32_t* xf, const Fp8Mat& W, bf16* Y, int ldy, int M, int groups, size_t y_gs, cudaStream_t st, int tpc, int ks)
 {
     if (groups != 1 || M < 1 || M > 32)
@@ -257,8 +320,7 @@ inline void gv_gemv_nt_launch(const uint32_t* xf, const Fp8Mat& W, bf16* Y, int 
     const int nt = (M + 7) / 8;
     if (g_gv_quad.count(W.gv))
     {
-        for (int t = 0; t < nt; ++t)
-            gv_gemv_launch_q(xf + (size_t)t * W.K * 4, W, Y + (size_t)t * 8 * ldy, ldy, M - 8 * t < 8 ? M - 8 * t : 8, 1, y_gs, st, tpc, ks);
+        gv_gemv_launch_q(xf, W, Y, ldy, M, 1, y_gs, st, tpc, ks);
         return;
     }
     const int K = W.K, ot = W.N / 16;

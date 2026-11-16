@@ -130,6 +130,12 @@ void ds41_attn_set_win_floor(int pos)
 {
     ds41a::g_win_floor = pos > 0 ? pos : 0;
 }
+// The GEMV row cap (ds41a::g_gv_rows_max), clamped to 8..32: the rank TU sets 32 around the decode / verify step captures (and the eager decode
+// launch) and 8 right after, so prefill chunks of any size keep their path. A captured graph keeps the value it was captured with.
+void ds41_attn_set_gv_rows_max(int max_rows)
+{
+    ds41a::set_gv_rows_max(max_rows);
+}
 // 1 = this layer's wq_b would take the GEMV at `rows` rows (the same switch attn_proj uses), so the idx wq_b can reuse its q_b activation table (S.xf_qr)
 int ds41_attn_gv_ready(const ds41a::Weights* W, int rows)
 {
