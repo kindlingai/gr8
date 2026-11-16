@@ -348,6 +348,18 @@ inline std::string plan(const EngineOptions& eo, const PlanInputs& in, FabricPla
         cp.ncoll = pf_rs ? 5 : 2;
 #if G6_MODEL_FLASH
         if (in.pf_sp) { cp.slot_bytes = pf_sp_slot_bytes(MP, (int)cfg.ips.size()); cp.ncoll = 4; }
+#elif !G6_MODEL_DS41
+        // GLM's reduce-scatter form: full slots for the reduce-scatters c0 and c2, one rank's rows for the gathers c1 and
+        // c3, c4 (pf_slots.h), and no recv slot for the rank's own rows, which it reads from its send slot (glue::peer_slot)
+        if (pf_rs)
+        {
+            const size_t rows = pf_ag_rows(MP, (int)cfg.ips.size());
+            cp.run1 = 1; cp.run2 = 2; cp.run3 = 3;   // c0 | c1 | c2 | c3 c4
+            cp.slot_bytes1 = rows * geom::HID * 2;
+            cp.slot_bytes2 = cp.slot_bytes;
+            cp.slot_bytes3 = rows * pf_ag_row_bytes();
+            cp.compact = true;
+        }
 #endif
         cp.port = cfg.port + port_off;
         if (std::string e = pf_stripe_cfg(cp, eo.pf_ips2); !e.empty()) return e;

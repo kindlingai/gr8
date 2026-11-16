@@ -392,6 +392,8 @@ inline void pf_ag(const g6::FabricDev& f, const u64* stepp, int c, int M, int ro
 // stale idx_k / idx_w columns, never read)
 constexpr int OWN_REC = (QA + KVA + IDXK + IDXW) * 2;
 constexpr int QO_REC = (KVA + IDXK) * 2;           // GR8_PF_OWN=3 record: kv_a [576] | idx_k [128] fp16
+static_assert(OWN_REC == (geom::QA + geom::KVA + geom::IDX_DIM + geom::IDX_HEADS) * 2 && QO_REC <= OWN_REC,
+              "pf_slots.h pf_ag_row_bytes sizes the gathers' slots by OWN_REC");
 struct OwnRec { __half *q_a_n, *kv_a, *idx_k, *idx_w; };
 // QO (GR8_PF_OWN=3): a template parameter, so the OWN=2 instantiations are the served code unchanged
 template <bool QO = false> __device__ __forceinline__ uint4* own_at(const OwnRec& r, int row, int k)     // k: uint4 index inside the record
@@ -538,6 +540,15 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
     P.rs = f.ncoll == 5;
     if (f.stride < pf_slot_bytes(Mmax, P.rs, f.nr) + 8) die("prefill fabric slots are smaller than Mmax rows");
     if (P.rs && pf_ss(f) < pf_ss_min(Mmax, f.nr)) die("prefill fabric RS slices are smaller than ceil(Mmax / nr) rows");
+    if (P.rs)   // slot runs (fabric_plan.h): c2 shares c0's slice size; the gathers hold one rank's rows
+    {
+        const size_t rows = pf_ag_rows(Mmax, f.nr);
+        if (g6::fab_slot_stride(f, 2) != g6::fab_slot_stride(f, 0)) die("prefill fabric: c2's slots differ from c0's");
+        if (g6::fab_slot_stride(f, 1) < rows * HID * 2 + 8) die("prefill fabric: c1's slots are smaller than one rank's rows");
+        for (int c = 3; c < 5; ++c)
+            if (g6::fab_slot_stride(f, c) < rows * pf_ag_row_bytes() + 8)
+                die("prefill fabric: c" + std::to_string(c) + "'s slots are smaller than one rank's records");
+    }
     if (P.own && !P.rs) die("GR8_PF_OWN needs the reduce-scatter form (GR8_PF_RS=1)");
     if (P.ownix && (!P.own || !(share ? share->v2 : P.v2))) die("GR8_PF_OWN=2 needs GR8_PF_RS=1 and --pfv2");
     if (P.qo && (!P.own || P.ownix || !(share ? share->v2 : P.v2) || !P.qow || (int)P.qow->size() != m.nl))
@@ -724,7 +735,7 @@ inline const bindp::Layer& pf_layer(Model& m, Prefill& P, int i, int M)
             {
                 auto rs = [&](int c) {
                     bindp::RsOut o;
-                    o.base = P.f.send + (size_t)c * P.f.stride; o.pstride = (size_t)P.f.ncoll * P.f.stride; o.ss = pf_ss(P.f);
+                    o.base = P.f.send + g6::fab_send_off(P.f, 0, c); o.pstride = g6::fab_slot_base(P.f, P.f.ncoll); o.ss = pf_ss(P.f);
                     o.stepp = P.stepp; o.M = M; o.nr = P.f.nr;
                     return o;
                 };
@@ -1025,7 +1036,7 @@ inline void pf_rshash(Prefill& P, int c, int M, cudaStream_t st)
     G6RT_CK(cudaStreamSynchronize(st));
     u64 step = 0;
     G6RT_CK(cudaMemcpy(&step, P.stepp, 8, cudaMemcpyDeviceToHost));
-    const char* slot = P.f.send + ((size_t)(step & 1) * P.f.ncoll + 2 * c) * P.f.stride;
+    const char* slot = P.f.send + g6::fab_send_off(P.f, (int)(step & 1), 2 * c);
     uint64_t h = 0xcbf29ce484222325ull;
     for (int p = 0; p < P.f.nr; ++p)
     {
@@ -1416,6 +1427,7 @@ inline void pf_consume_x(Model& m, Prefill& P, int i, int M, cudaStream_t st)
 // attention state (two-stream lanes; the event must already be recorded on the host side).
 inline bool pf_ix_next(const Model& m, const Prefill& P, int i) { return P.ownix && i + 1 < m.nl && m.layers[i + 1].indexer; }
 constexpr int IX_ROW = 2048 * 4;
+static_assert(IX_ROW <= HID * 4, "pf_slots.h pf_ag_row_bytes: owner IDs fit the c4 slot");
 inline void pf_ix_score(Model& m, Prefill& P, int i, int M, int context, cudaStream_t st, cudaEvent_t wait_ix = nullptr)
 {
     if (!pf_ix_next(m, P, i)) return;
