@@ -872,8 +872,10 @@ impl Control {
     // fork, or another conversation sharing only its start), since adopting the run drops the rest. A hit on a stored
     // entry evicts nothing.
     fn busy_check(&self, pre: &PoolHit, rows: u64, worst: u64, r: u32) -> Option<u64> {
-        let (now, idle) = (self.now_ns(), self.busy_idle());
+        let idle = self.busy_idle();
         let pool = self.pool().lock();
+        // the pool's clock: its retire stamps count from the pool's build, before this control's start
+        let now = pool.now_ns();
         if pre.skip > 0 {
             let left = if pre.stored { None } else { pool.busy_partial(pre.age, pre.skip, now, &idle) };
             return left.map(admit::busy_retry_secs);
