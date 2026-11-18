@@ -93,17 +93,17 @@ only when it is set. `--model DIR` boots from a local copy of the release instea
 
 | variant | routed experts | default at |
 |---|---|---|
-| `home` | 3.25 bpw: in each layer, the 64 experts with the highest K3 error at K4 and the rest at K3 | TP=4, TP=6 |
-| `bit225` | about 2.25 bpw, down1's size: down projections at K3 in the layers where bits lower KL the most, the rest at K2 | TP=3 |
-| `bit325` | 3.25 bpw, home's size: down projections at K4 in the layers where bits lower KL the most, the rest at K3 (KL 1.5-7% lower than home, decode ~2.5% slower) | |
-| `bit243`, `bit260`, `bit338` | about 2.43, 2.60 and 3.38 bpw, built the same way | |
-| `down1` | about 2.25 bpw | |
-| `up1` | about 4.0 bpw (lower `--cap`) | |
+| `bit400` | 4.00 bpw: every routed expert at K4 | |
+| `bit325` | 3.25 bpw: gate and up at K3; down at K4 except layers 3-8 and 65-77 | TP=4, TP=5, TP=6 |
+| `bit260` | 2.60 bpw: gate and up at K3 in layers 16-45, K2 elsewhere; down at K3 | TP=3 |
+| `bit225` | 2.25 bpw: gate and up at K2; down at K3 except layers 3-8 and 65-77 | TP=3, a release without `bit260` |
+| `bit200`, `bit239`, `bit273`, `bit300`, `bit332`, `bit390` | 2.00, 2.39, 2.73, 3.00, 3.32 and 3.92 bpw | |
 
-The release's model card has each variant's size and its KL against bf16. A release from before the `bit` variants
-boots `down1` at TP=3. `home` and `bit325` do not fit at TP=3: they put 108.7 GB of weights on
-each rank. A boot that would run a box out of memory stops
-while it allocates the KV pool, and names `--cap` and `--variant`.
+The release's model card has each variant's size and its KL against bf16. Release v0.6 removed `home`, `down1`,
+`up1` (now `bit400`), `bit243` and `bit338`. `bit325` and larger do not fit at TP=3: `bit325` puts 99.8 GB of experts on
+the busiest rank, which leaves no room for the KV pool. A boot that would run a box out of memory stops
+while it allocates the KV pool, and names `--cap` and `--variant`. `bit400` puts 91.9 GB of experts on the busiest rank at
+TP=4, which does not fit next to the default decode graphs and KV pool, so it needs lower memory settings.
 
 ## Options worth knowing
 

@@ -879,10 +879,10 @@ options:
   VARIANT:
     scope: cluster
     doc: >-
-      the exlr8 v2 width manifest: bit225, bit243, bit260, bit325, bit338 (routed experts at about 2.25-3.38 bpw, spent
-      where they lower KL against bf16 the most), home (3.25 bpw), down1 (about 2.25), up1 (about 4.0), or a manifest
-      path. A name is exlr8-manifest-<name>.json in the model set or in V2 (directly or under manifests/). At TP=3, a
-      release without bit225 boots down1. Without V2, only home
+      the exlr8 v2 width manifest: bit200, bit225, bit239, bit260, bit273, bit300, bit325, bit332, bit390, bit400
+      (routed experts at 2.00-4.00 bpw, spent where they lower KL against bf16 the most), or a manifest path. A name is
+      exlr8-manifest-<name>.json in the model set or in V2 (directly or under manifests/). Default: bit260 at TP=3 (a
+      release without bit260 boots bit225), bit325 at TP=4, TP=5 and TP=6. Without V2, only home
   V2_DENSE:
     scope: box
     doc: >-

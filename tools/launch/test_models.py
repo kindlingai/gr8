@@ -697,7 +697,7 @@ class RequiredTests(unittest.TestCase):
 
     def test_a_release_of_the_other_model_is_named_before_the_variant(self):
         t = tempfile.mkdtemp()
-        # TP=3 GLM-5.3 wants bit225 or down1, and Flash k4: neither release has the other's, so the variant step would
+        # TP=3 GLM-5.3 wants bit260 or bit225, and Flash k4: neither release has the other's, so the variant step would
         # fail first, on a missing manifest, if the architecture were not checked before it
         for name, arch, peers, want in (
                 ('glm53', 'Glm5NextForConditionalGeneration', '10.0.0.1,10.0.0.2,10.0.0.3', './gr8 glm53f serves it'),
@@ -716,7 +716,7 @@ class RequiredTests(unittest.TestCase):
     def test_the_listing(self):
         glm, flash = models.describe(models.GLM53), models.describe(models.GLM53F)
         self.assertIn('--tp       4, 6, 3 or 5', glm)
-        self.assertIn('TP=3 bit225 else down1', glm)
+        self.assertIn('TP=3 bit260 else bit225', glm)
         self.assertIn(models.GLM53.release, glm)
         self.assertIn('--tp       4, 3, 2 or 1', flash)
         self.assertIn('TP=1 k2', flash)

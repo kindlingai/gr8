@@ -39,7 +39,7 @@ class SteeringHFTests(unittest.TestCase):
         self.put('config.json', json.dumps({'hidden_size': 6144, 'num_hidden_layers': 78,
                                            '_commit_hash': 'model-rev'}).encode())
         self.put('tokenizer_config.json', b'{"_commit_hash":"token-rev"}')
-        self.put('manifests/exlr8-manifest-home.json', json.dumps({'set_id': WEIGHTS, 'layers': {}}).encode())
+        self.put('manifests/exlr8-manifest-bit400.json', json.dumps({'set_id': WEIGHTS, 'layers': {}}).encode())
         self.payload = struct.pack('<6144f', 1., *([0.] * 6143))
         self.manifest = {'schema_version': 1, 'profile_name': 'example', 'scope': 'shared',
                          'layers': [3], 'alphas': [.75],
@@ -88,7 +88,7 @@ class SteeringHFTests(unittest.TestCase):
 
     def opts(self, *extra, selector='hf:default'):
         argv = ['--no-config', '--peers', PEERS, '--model', f'https://huggingface.co/{RELEASE}',
-                '--model-cache', str(self.cache), '--variant', 'home', '--dflash', '0']
+                '--model-cache', str(self.cache), '--variant', 'bit400', '--dflash', '0']
         if selector:
             argv += ['--steering-profile', selector]
         o = options.parse([*argv, *extra], GLM)
