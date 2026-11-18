@@ -25,18 +25,6 @@
 
 namespace kda
 {
-// rank r's heads of layer l at TP nr (loader-rs release.rs Shard::heads: chunk(widths(64, nr), l, r))
-inline void heads(int l, int rank, int nr, int& h0, int& nh)
-{
-    std::vector<int> w(nr);
-    for (int j = 0; j < nr; ++j) w[j] = HEADS / nr + (j < HEADS % nr);
-    const int j = (rank + nr - l % nr) % nr;
-    h0 = 0;
-    for (int i = 0; i < j; ++i) h0 += w[i];
-    nh = w[j];
-}
-inline int nhmax(int nr) { return (HEADS + nr - 1) / nr; }
-
 struct KdaLayer
 {
     int l = -1, li = -1, h0 = 0, nh = 0;

@@ -267,6 +267,15 @@ public:
     // the last capture or restore: blocks, bytes and milliseconds (the log lines)
     struct Last { uint64_t blocks = 0; double ms = 0; } last;
     bool log = true;
+    // an entry's blocks for this view (flash_ckpt_index.h FlashLayout): the store's block is one page of every binding,
+    // rounded up to 4 KiB
+    static FlashLayout layout_of(const FlashStateView& v) {
+        FlashLayout L;
+        L.slot = (v.page_bytes() + 4095) / 4096 * 4096;
+        L.state_bytes = v.state_bytes();
+        for (const auto& b : v.bindings) L.parts.push_back({size_t(b.mla_page16) * 16, b.idx ? size_t(b.idx_page16) * 16 : 0});
+        return L;
+    }
     // spec / name / bytes: as KvTiers::add (name: this rank's lease, never the pool stash's). compat: what makes an entry
     // this engine's (model set, TP, rank, layout, engine build)
     // group: a group lease of `bytes` to start (FlashGroup), else a store of `bytes`. index_path: persist=on, the file
@@ -276,8 +285,9 @@ public:
                      int batch = 32) : v_(std::move(v)), batch_(batch), files_(index_path) {
         if (v_.bindings.empty() || !v_.S || !v_.conv || v_.layers <= 0 || v_.slots <= 0 || v_.pool_pages <= 0) throw std::runtime_error("Flash checkpoint: no state to keep");
         block_ = v_.page_bytes();
-        slot_ = (block_ + 4095) / 4096 * 4096;
-        state_blocks_ = (v_.state_bytes() + slot_ - 1) / slot_;
+        layout_ = layout_of(v_);
+        slot_ = layout_.slot;
+        state_blocks_ = layout_.state_blocks();
         uint64_t n = bytes / slot_;
         if (n < 2 + state_blocks_) throw std::runtime_error("Flash checkpoint store " + spec + " smaller than one entry's state");
         if (group) {
@@ -302,8 +312,6 @@ public:
         fck::ck(cudaHostAlloc(reinterpret_cast<void**>(&host_), slot_ * batch_, cudaHostAllocMapped), "alloc");
         fck::ck(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_dev_), host_, 0), "alloc");
         tk(g6kv_tier_register(t_, host_, slot_ * batch_), "register");
-        layout_.slot = slot_; layout_.state_bytes = v_.state_bytes();
-        for (const auto& b : v_.bindings) layout_.parts.push_back({size_t(b.mla_page16) * 16, b.idx ? size_t(b.idx_page16) * 16 : 0});
         persist_ = files_.on();
         if (files_.on()) {
             uint64_t stale = 0;

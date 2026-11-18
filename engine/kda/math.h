@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 #ifdef __CUDACC__
 #define KDA_HD __host__ __device__ __forceinline__
@@ -31,6 +32,19 @@ constexpr float GATE_LO = -5.f, L2_EPS = 1e-6f, RMS_EPS = 1e-5f;
 constexpr float QSCALE = 0.08838834764831845f;   // DK^-0.5
 KDA_HD constexpr bool is_kda(int l) { return l < 45 && l % 4 != 3; }
 KDA_HD constexpr int kda_slot(int l) { return l - l / 4; }
+
+// rank r's heads of layer l at TP nr (loader-rs release.rs Shard::heads: chunk(widths(64, nr), l, r)). Host only; here
+// so host code (s2/flash_ckpt_rewidth.h) shares the rule
+inline void heads(int l, int rank, int nr, int& h0, int& nh)
+{
+    std::vector<int> w(nr);
+    for (int j = 0; j < nr; ++j) w[j] = HEADS / nr + (j < HEADS % nr);
+    const int j = (rank + nr - l % nr) % nr;
+    h0 = 0;
+    for (int i = 0; i < j; ++i) h0 += w[i];
+    nh = w[j];
+}
+inline int nhmax(int nr) { return (HEADS + nr - 1) / nr; }
 
 // decode kernel shapes
 constexpr int PREP_CH = 64;                // channels per prep CTA (half a head)

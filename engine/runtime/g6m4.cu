@@ -119,6 +119,7 @@
 #include "../comms/progress_cpus.h"
 #include "s2/native.cuh"
 #include "s2/flash_native.cuh"
+#include "s2/flash_ckpt_rewidth.h"   // GR8_KV_REWIDTH: a scale's carry of the Flash checkpoint store
 #if G6_MODEL_DS41
 #include "s2/ds41_native.cuh"
 // the C2 dispatch trace counter lives in attn/ds41_attn.cu: ds41_attn.cuh defines device kernels, so this second
@@ -1486,10 +1487,29 @@ int main(int argc, char** argv)
             static const std::string exe = g6s2::exe_stamp();
             // the cache mode is not in it: the launcher (tools/launch/options.py) and the check above refuse persist=on
             // with terminal, so a persisted entry is always aligned (cold-exact)
-            const std::string compat = "flash set " + set_id + " nr " + std::to_string(g6nr::NR) + " rank " + std::to_string(R) +
-                " cap " + std::to_string(cap) + " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " bindings " +
-                std::to_string(v.bindings.size()) + " state " + std::to_string(v.state_bytes()) + " format " +
-                std::to_string(g6s2::FlashManifest::FORMAT) + " engine " + exe;
+            const auto flash_compat = [&](int nr, int rank, size_t state_bytes) {
+                return "flash set " + set_id + " nr " + std::to_string(nr) + " rank " + std::to_string(rank) + " cap " +
+                    std::to_string(cap) + " mp " + std::to_string(MP) + " lanes " + std::to_string(lanes) + " bindings " +
+                    std::to_string(v.bindings.size()) + " state " + std::to_string(state_bytes) + " format " +
+                    std::to_string(g6s2::FlashManifest::FORMAT) + " engine " + exe;
+            };
+            const std::string compat = flash_compat(g6nr::NR, R, v.state_bytes());
+            // ./gr8 glm53f scale: the store the old width left (*.prev) rewritten for this rank before it opens. A CP binding
+            // keeps only this rank's pages, which another width does not hold: those start empty
+            if (const auto& rw = knob::kv_rewidth(); rw && !index_path.empty())
+            {
+                const bool cp = std::any_of(v.bindings.begin(), v.bindings.end(), [](const g6s2::fck::Binding& b) { return b.cp != 0; });
+                std::string why = "a CP binding (GR8_CP=1) holds this rank's pages only";
+                const g6s2::FlashLayout L = g6s2::FlashCheckpoints::layout_of(v);
+                const int64_t n = cp ? 0 : g6s2::flash_rewidth(std::filesystem::path(index_path).parent_path().string(), *rw, compat,
+                                                               flash_compat, L, g6nr::NR, R, bytes / L.slot, uint32_t(MP * (two ? 2 : 1)),
+                                                               uint64_t(v.pool_pages), why);
+                if (n > 0)
+                    fprintf(stderr, "# rank %d: flash ckpt rewidth carried %lld entries from TP=%s%s%s\n", R, (long long)n,
+                            rw->substr(0, rw->find(',')).c_str(), why.empty() ? "" : "; ", why.c_str());
+                else
+                    fprintf(stderr, "# rank %d: flash ckpt rewidth %s: %s, starting empty\n", R, n == 0 ? "skipped" : "failed", why.c_str());
+            }
             try { ckpt.reset(new g6s2::FlashCheckpoints(v, spec, name, bytes, compat, group ? &*group : nullptr, index_path)); }
             catch (const std::exception& e) { die(std::string("GR8_GLM53F_CACHE: ") + e.what()); }
             // persist=on: the entries are checked on a helper thread and agreed by every rank in serve_flash
