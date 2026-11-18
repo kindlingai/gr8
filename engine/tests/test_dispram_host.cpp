@@ -24,6 +24,27 @@ static void child_test(char* self) {
         int st=0; assert(waitpid(p,&st,0)==p); assert(WIFEXITED(st) && WEXITSTATUS(st)==0);
     }
 }
+static std::string write_temp(const std::string& text) {
+    char p[]="/tmp/gr8-dispram-test-XXXXXX"; int f=mkstemp(p); assert(f>=0);
+    assert(write(f,text.data(),text.size())==static_cast<ssize_t>(text.size())); close(f); return p;
+}
+// DISPRAM_KEY_FILE: each case runs in a child (knobs are read once); "child_key" then talks to a mock lender.
+static void key_child_tests(char* self) {
+    const std::string big=std::string("k")+std::string(4096,' ');
+    const std::pair<const char*,std::string> cases[]={{"child_key"," attic_0123abcd\n"},{"child_badkey","two words"},
+        {"child_badkey","q\"uote"},{"child_badkey",std::string(128,'x')},{"child_badkey",big},{"child_badkey",""},
+        {"child_nokey",""}};
+    for (const auto& c:cases) {
+        std::string key=strcmp(c.first,"child_nokey") ? write_temp(c.second) : temp_path();
+        pid_t p=fork(); assert(p>=0);
+        if (!p) {
+            setenv("GR8_DISPRAM","1",1); setenv("DISPRAM_DISABLE","0",1); setenv("DISPRAM_KEY_FILE",key.c_str(),1);
+            char* args[]={self,const_cast<char*>(c.first),nullptr}; execv(self,args); _exit(99);
+        }
+        int st=0; assert(waitpid(p,&st,0)==p); assert(WIFEXITED(st) && WEXITSTATUS(st)==0); unlink(key.c_str());
+    }
+    puts("PASS dispram key file: trimmed key on every request, bad, oversize, empty and missing files lease nothing");
+}
 #ifdef SOCK_SEQPACKET
 static std::string recv_request(int fd) { char b[4096]; ssize_t n=recv(fd,b,sizeof(b),0); assert(n>0); return std::string(b,n); }
 static void send_reply(int fd,const std::string& text,int nfds=0) {
@@ -191,6 +212,24 @@ int main(int argc,char** argv) {
     if (argc>1) {
         if (!strcmp(argv[1],"child_default")) {
             assert(!knob::dispram() && !knob::dispram_disable() && !enabled());
+        } else if (!strcmp(argv[1],"child_key")) {
+            std::string k; assert(request_key(&k) && k=="attic_0123abcd");
+#ifdef SOCK_SEQPACKET
+            mock_server([](int fd) {
+                assert(recv_request(fd)=="{\"key\":\"attic_0123abcd\",\"op\":\"info\"}");
+                send_reply(fd,"{\"ok\":true,\"size\":2145386496,\"free\":2145386496,\"largest\":2145386496}");
+                assert(recv_request(fd)=="{\"key\":\"attic_0123abcd\",\"op\":\"alloc\",\"size\":2097152}");
+                send_reply(fd,"{\"ok\":true,\"size\":2097152}",1);
+            },[](Client& c) { Info i; Lease l; assert(c.query_info(&i) && i.free_bytes==2145386496ULL); assert(c.lease(GRANULE,&l)); payload(l); });
+#endif
+        } else if (!strcmp(argv[1],"child_badkey") || !strcmp(argv[1],"child_nokey")) {
+            char p[]="/tmp/gr8-dispram-test-XXXXXX"; int err=mkstemp(p); assert(err>=0); unlink(p);
+            int saved=dup(2); assert(dup2(err,2)==2);
+            std::string k; bool got=request_key(&k);
+            { Client c; assert(!c.open_conn(temp_path(),50) && !c.is_open()); }
+            assert(dup2(saved,2)==2); close(saved);
+            char buf[1024]; assert(lseek(err,0,SEEK_SET)==0); ssize_t n=read(err,buf,sizeof(buf)); close(err);
+            assert(!got && n>0 && std::string(buf,n).find("g6: dispram: DISPRAM_KEY_FILE")!=std::string::npos);
         } else if (!strcmp(argv[1],"child_on")) {
             assert(knob::dispram() && !knob::dispram_disable() && enabled());
             assert(socket_path()=="/tmp/dispram-child.sock" && knob::dispram_min_bytes()==1983905792);
@@ -200,7 +239,7 @@ int main(int argc,char** argv) {
         }
         return 0;
     }
-    child_test(argv[0]); int before=count_open_fds();
+    child_test(argv[0]); key_child_tests(argv[0]); int before=count_open_fds();
     uint64_t remain=2145386496ULL; size_t claimed=0; bool seam=false;
     for (int layer=0;layer<78;++layer) { auto p=plan_span(32*1024*1024,GRANULE,remain); remain-=p.carve_bytes; claimed+=p.carve_bytes; seam|=p.carve_bytes && p.tail_bytes; }
     assert(remain==0 && claimed==2145386496ULL && seam);

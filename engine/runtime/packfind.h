@@ -14,7 +14,6 @@
 #include "../loader/g6pack.h"
 #include "../loader/devimage.h"
 #include "../vmm.h"
-#include "../attic.h"
 #ifdef G6_RS_LOADER
 #include "weight_check.cuh"
 #endif
@@ -130,10 +129,7 @@ template <class F> void rs_fill(const g6::Pack& pack, g6::DevImage& img, int ran
     // backing (the GPU's page size) can differ. Falls back to cudaMalloc, with a line saying why.
     static const long vmm = (long)knob::img_vmm();
     void (*release)(void*) = nullptr;
-    // GR8_ATTIC_SOCK (engine/attic.h): G.embed in a slice of the display carveout, the image mapped around it. Unset, or
-    // the lend failed (one line says why): the image as below.
-    dev = g6attic::image(pack, rank, release);
-    if (vmm > 0 && !dev)
+    if (vmm > 0)
     {
         int d = 0;
         size_t gmin = 0, grec = 0;
