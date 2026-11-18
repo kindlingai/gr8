@@ -87,9 +87,47 @@ inline bool json_u64(const std::string& s,const char* key,uint64_t* out) {
     if ((i-a>1 && s[a]=='0') || !json_end(s,i)) return false;
     *out=n; return true;
 }
+// The key every request carries. DISPRAM_KEY_FILE unset: Kindling OS dispramd's key. Set (spark-attic's atticd on
+// stock DGX OS, /etc/spark-attic/key): the file's text with surrounding whitespace trimmed, 1 to 127 printable bytes
+// with no space, quote or backslash. The file is read at most 4 KiB; a larger, unreadable or invalid file leases
+// nothing, after one line saying why (the client then fails open as when no daemon listens).
+constexpr const char* DEFAULT_KEY="kindlingai_1";
+inline bool key_ok(const std::string& k) {
+    if (k.empty() || k.size()>127) return false;
+    for (unsigned char c:k) if (c<0x21 || c>0x7e || c=='"' || c=='\\') return false;
+    return true;
+}
+inline bool read_key_file(const std::string& path,std::string* key,std::string* why) {
+    int fd=::open(path.c_str(),O_RDONLY|O_CLOEXEC);
+    if (fd<0) { *why=std::string("cannot open: ")+std::strerror(errno); return false; }
+    char buf[4097]; size_t n=0;
+    while (n<sizeof(buf)) {
+        ssize_t r=::read(fd,buf+n,sizeof(buf)-n);
+        if (r<0 && errno==EINTR) continue;
+        if (r<0) { *why=std::string("cannot read: ")+std::strerror(errno); ::close(fd); return false; }
+        if (r==0) break;
+        n+=static_cast<size_t>(r);
+    }
+    ::close(fd);
+    if (n>4096) { *why="larger than 4 KiB"; return false; }
+    std::string k(buf,n);
+    size_t a=k.find_first_not_of(" \t\r\n"),b=k.find_last_not_of(" \t\r\n");
+    k=a==std::string::npos ? std::string() : k.substr(a,b-a+1);
+    if (!key_ok(k)) { *why="not a key (1 to 127 printable bytes, no space, quote or backslash)"; return false; }
+    *key=k; return true;
+}
+inline bool request_key(std::string* key) {
+    const auto& path=knob::dispram_key_file();
+    if (!path || path->empty()) { *key=DEFAULT_KEY; return true; }
+    std::string why;
+    if (read_key_file(*path,key,&why)) return true;
+    std::fprintf(stderr,"g6: dispram: DISPRAM_KEY_FILE %s: %s; no lease\n",path->c_str(),why.c_str());
+    std::fflush(stderr); return false;
+}
 class Client {
     int fd_=-1;
     bool broken_=false;
+    std::string key_=DEFAULT_KEY;
     bool exchange(const std::string& request,std::string& reply,int& got,int timeout) {
         got=-1; if (fd_<0 || broken_) return false;
         int flags=0;
@@ -131,6 +169,7 @@ public:
     bool is_open() const { return fd_>=0; }
     bool open_conn(const std::string& path,int timeout_ms=2000) {
         close_conn();
+        if (!request_key(&key_)) return false;
 #ifdef SOCK_SEQPACKET
         sockaddr_un addr{}; addr.sun_family=AF_UNIX;
         if (path.empty() || path.size()>=sizeof(addr.sun_path)) return false;
@@ -163,7 +202,7 @@ public:
     bool query_info(Info* out,int timeout_ms=2000) {
         if (!out) return false;
         std::string reply; int got=-1;
-        bool sent=exchange("{\"key\":\"kindlingai_1\",\"op\":\"info\"}",reply,got,timeout_ms);
+        bool sent=exchange("{\"key\":\""+key_+"\",\"op\":\"info\"}",reply,got,timeout_ms);
         if (got>=0) ::close(got);
         Info info;
         if (!sent || json_has_key(reply,"error") || !json_u64(reply,"free",&info.free_bytes) || !json_u64(reply,"size",&info.size)) { broken_=true; return false; }
@@ -172,7 +211,7 @@ public:
     bool lease(size_t bytes,Lease* out,int timeout_ms=2000) {
         if (fd_<0 || broken_ || !out || bytes<GRANULE || bytes%GRANULE) return false;
         std::string reply; int got=-1; bool ok=false; uint64_t sz=0,base=0;
-        if (!exchange("{\"key\":\"kindlingai_1\",\"op\":\"alloc\",\"size\":"+std::to_string(bytes)+"}",reply,got,timeout_ms)) return false;
+        if (!exchange("{\"key\":\""+key_+"\",\"op\":\"alloc\",\"size\":"+std::to_string(bytes)+"}",reply,got,timeout_ms)) return false;
         if (!json_bool(reply,"ok",&ok)) { if (got>=0) ::close(got); broken_=true; return false; }
         if (!ok) { if (got>=0) ::close(got); return false; }
         if (got<0 || !json_u64(reply,"size",&sz) || sz!=bytes) { if (got>=0) ::close(got); broken_=true; return false; }

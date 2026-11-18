@@ -215,7 +215,9 @@ knobs:
     doc: >-
       0 (default) uses cudaMalloc only; 1 leases available 2 MiB physical granules from Kindling OS dispramd
       (DISPRAM_SOCKET) into GLM-5.3 and non-chunked GLM-5.3-Flash attention KV bindings via CUDA VMM, failing open to
-      cudaMalloc when absent or exhausted (unless GR8_DISPRAM_MIN_BYTES > 0).
+      cudaMalloc when absent or exhausted (unless GR8_DISPRAM_MIN_BYTES > 0). Kindling OS: set only this. Stock DGX
+      OS: spark-attic's atticd (github.com/bertholomus/spark-attic) lends the same carveout with the same protocol;
+      set this, DISPRAM_SOCKET=/run/spark-attic/attic.sock and DISPRAM_KEY_FILE=/etc/spark-attic/key.
   GR8_DISPRAM_MIN_BYTES:
     scope: agree
     kind: int
