@@ -645,6 +645,8 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
         Dialect::Glm => choice.forced_ids(&st.tok, close)?,
     };
     params.gen.system_tokens = system;
+    params.gen.tool_stop_ids =
+        st.tok.tool_stop.iter().copied().filter(|&i| params.gen.stop_ids.contains(&i64::from(i))).collect();
     // a JSON mode with no tools: the engine masks the reply to the grammar (after the think close while the prompt leaves
     // the think block open); the extraction after generation still runs. With tools the grammar would forbid a call
     if rf.kind != "text" && tools.is_none() && st.engine.grammars() {

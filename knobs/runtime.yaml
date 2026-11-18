@@ -7,23 +7,43 @@ knobs:
     default: "0"
     doc: >-
       The busy guard: when granting a request would evict a retained run whose session is not idle (it has a request
-      in flight, or its last response ended under GR8_BUSY_IDLE_SECS ago), the head refuses the request at once with
-      HTTP 429, an OpenAI-shaped error body and Retry-After GR8_BUSY_RETRY_AFTER, instead of evicting the run or
-      leaving the request queued in silence. The refusal fires at intake, before the request queues (its arrival's
-      dry run of the grant finds a live victim), so the client reads it in under a second; the grant-time check
-      stays as the backstop, since the pool can change between the two. A request also gets the refusal when
-      GR8_BUSY_QUEUE_MAX requests already wait past the free session slots. A turn that continues its own retained run (a cache
-      hit) is never refused. The guard governs admissions; a live session's own growth or shrink may still evict as
-      before. 0: off, upstream behaviour.
-  GR8_BUSY_IDLE_SECS:
+      in flight, or its last response ended under its idle bound ago: GR8_BUSY_IDLE_SHORT_SECS,
+      GR8_BUSY_IDLE_TOOL_SECS or GR8_BUSY_IDLE_FINISH_SECS), the head refuses the request at once with HTTP 429, an
+      OpenAI-shaped error body and a Retry-After of the seconds until the last such run goes idle, instead of evicting
+      the run or leaving the request queued in silence. The refusal fires at intake, before the request queues (its
+      arrival's dry run of the grant finds a live victim), so the client reads it in under a second; the grant-time
+      check stays as the backstop, since the pool can change between the two. A request also gets the refusal when
+      GR8_BUSY_QUEUE_MAX requests already wait past the free session slots. A turn that continues its own retained
+      run (a cache hit) is never refused. A hit that reuses less of a live run than that run's own next turn would (a
+      fork that leaves the conversation early, or another conversation sharing only its start) is refused, since
+      adopting the run drops the rest of it. The guard governs admissions; a live session's own growth or shrink may
+      still evict as before. 0: off, upstream behaviour.
+  GR8_BUSY_IDLE_FINISH_SECS:
     scope: agree
     kind: int
-    default: "60"
-    values: "1.."
+    default: "30"
+    values: "0.."
     doc: >-
-      GR8_BUSY_GUARD=1: a session counts as idle when it has no request in flight and its last response ended at
-      least this many seconds ago; only idle sessions' retained runs are evicted. Tune it from the recorded
-      tool-call gaps (the busy trace lines carry each refused request's wait).
+      GR8_BUSY_GUARD=1: the idle bound of a retained run of at least GR8_BUSY_SHORT_TOKENS rows whose reply did not
+      end on a tool call (a stop, the length limit or a cancel): its session counts as idle this many seconds after
+      the reply ended. 0: idle at once.
+  GR8_BUSY_IDLE_SHORT_SECS:
+    scope: agree
+    kind: int
+    default: "5"
+    values: "0.."
+    doc: >-
+      GR8_BUSY_GUARD=1: the idle bound of a retained run under GR8_BUSY_SHORT_TOKENS rows, however its reply ended. A
+      short run is cheap to prefill again. 0: idle at once.
+  GR8_BUSY_IDLE_TOOL_SECS:
+    scope: agree
+    kind: int
+    default: "90"
+    values: "0.."
+    doc: >-
+      GR8_BUSY_GUARD=1: the idle bound of a retained run of at least GR8_BUSY_SHORT_TOKENS rows whose reply ended on
+      one of the request's tool stop ids (the front end's tool_stop_ids, PROTOCOL.md): the client is running the
+      tool and comes back with its result. 0: idle at once.
   GR8_BUSY_QUEUE_MAX:
     scope: agree
     kind: int
@@ -38,7 +58,16 @@ knobs:
     default: "60"
     values: "1.."
     doc: >-
-      GR8_BUSY_GUARD=1: the seconds in a refused request's Retry-After header (HTTP 429) and error body.
+      GR8_BUSY_GUARD=1: the seconds in the Retry-After header (HTTP 429) and error body of a request the queue bound
+      (GR8_BUSY_QUEUE_MAX) refused. A refusal over a live run carries the seconds until that run goes idle instead.
+  GR8_BUSY_SHORT_TOKENS:
+    scope: agree
+    kind: int
+    default: "10000"
+    values: "0.."
+    doc: >-
+      GR8_BUSY_GUARD=1: a retained run holding fewer rows than this (prompt and reply) takes GR8_BUSY_IDLE_SHORT_SECS
+      as its idle bound. 0: no run is short.
   GR8_FABRIC_CONNECT_TRIES:
     scope: local
     kind: int

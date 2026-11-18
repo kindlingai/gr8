@@ -92,7 +92,7 @@ inline g6rt::ServeReq parse_request(const std::string& bytes, const g6rt::steeri
     r.boost_start = p.boost_start; r.boost_per1k = p.boost_per1k; r.boost_max = p.boost_max;
     for (int i = 0; i < g6rt::PEN_SEQ; ++i) r.seq[i] = {p.seq_mult[i], p.seq_base[i], p.seq_cap[i], p.seq_min[i]};
     r.avoid = parse::ints(p.avoid);
-    r.lp = p.lp; r.plp = p.plp; r.sys = p.sys;
+    r.lp = p.lp; r.plp = p.plp; r.sys = p.sys; r.tool_stop = parse::ints(p.tool_stop);
     std::memcpy(static_cast<void*>(&r.steering), &p.steering, sizeof r.steering);
     r.ins.after = p.ins_after; r.ins.unless = p.ins_unless; r.ins.tokens = parse::ints(p.ins_tokens);
     r.gram.kind = g6rt::GrammarSpec::Kind(p.gram_kind); r.gram.strict = p.gram_strict; r.gram.arm = p.gram_arm;
@@ -161,7 +161,7 @@ public:
         const bool decode = g6mod::has(G6_CAP_PROMPT_DECODE) ? ds41_decode_prompt(prefill_min_, r.prompt.size(), r.plp, r.steering.enabled)
                                                              : r.plp >= 0;
         // r.images is empty outside DS41 and Flash: Service::images_ok refuses an image request there before it is queued
-        return {r.prompt, chunk_, decode, r.ins, r.steering, r.gram, r.images};
+        return {r.prompt, chunk_, decode, r.ins, r.steering, r.gram, r.images, r.tool_stop};
     }
     // (row, target, k) -> a row's logprob entry in the last main step (DispatchHooks::logprob)
     using Logprob = std::function<g6rt::LpRow(int, bool, int)>;

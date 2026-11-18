@@ -29,7 +29,7 @@ use crate::scheduler::{
     self as sch, Config, Grant, Identity, Key, Request, Run, Shrink, Slot, State, FREE, NOTICE_MAX, PAGE, RETIRING,
 };
 use g6kvman::ffi::Handle;
-use g6kvman::pool::{Namespace, NAMESPACE_BYTES};
+use g6kvman::pool::{Idle, Namespace, NAMESPACE_BYTES};
 use std::collections::BTreeMap;
 use std::ffi::{c_void, CStr};
 use std::io::Write;
@@ -481,8 +481,14 @@ impl Control {
     fn busy_on(&self) -> bool {
         gr8knobs::BUSY_GUARD.get()
     }
-    fn busy_idle_ns(&self) -> i64 {
-        gr8knobs::BUSY_IDLE_SECS.get().saturating_mul(1_000_000_000)
+    fn busy_idle(&self) -> Idle {
+        let ns = |secs: i64| secs.saturating_mul(1_000_000_000);
+        Idle {
+            short_rows: gr8knobs::BUSY_SHORT_TOKENS.get(),
+            short_ns: ns(gr8knobs::BUSY_IDLE_SHORT_SECS.get()),
+            tool_ns: ns(gr8knobs::BUSY_IDLE_TOOL_SECS.get()),
+            finish_ns: ns(gr8knobs::BUSY_IDLE_FINISH_SECS.get()),
+        }
     }
     fn busy_queue_max(&self) -> u32 {
         gr8knobs::BUSY_QUEUE_MAX.get() as u32
@@ -774,7 +780,7 @@ impl Control {
         // session slots is refused at once with the busy answer instead of waiting in silence
         let free = self.c.limit().saturating_sub(self.resident()) as usize;
         if admit::busy_queue_full(self.busy_on(), self.busy_queue_max(), self.queue_len(), free) {
-            self.busy_answer(inn, command.request, queued.id, "intake")?;
+            self.busy_answer(inn, command.request, queued.id, gr8knobs::BUSY_RETRY_AFTER.get() as u64, "intake")?;
             return Ok(());
         }
         // the busy guard's intake refusal (docs/ENV.md GR8_BUSY_*): a fresh arrival whose worst-case grant
@@ -784,11 +790,11 @@ impl Control {
         // (a hook error) keeps the old behaviour: the request queues.
         if self.busy_on() {
             match self.busy_intake(&queued, &ck) {
-                Ok(true) => {
-                    self.busy_answer(inn, command.request, queued.id, "intake")?;
+                Ok(Some(retry)) => {
+                    self.busy_answer(inn, command.request, queued.id, retry, "intake")?;
                     return Ok(());
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(e) => {
                     eline(format!("# s2: request {}: the intake busy view failed, it queues: {e:?}\n", queued.id))
                 }
@@ -818,11 +824,10 @@ impl Control {
     }
 
     // the busy guard's answer to a refused request (docs/ENV.md GR8_BUSY_*): resp.<id> carries the busy end line with
-    // the Retry-After seconds (the shim turns it into HTTP 429 + Retry-After on the front end), the request leaves the
+    // `retry`, the Retry-After seconds (the shim turns it into HTTP 429 + Retry-After on the front end), the request leaves the
     // queue and the control's maps, and the s2 trace records it once. `path` names where the refusal fired ("intake"
     // before the queue, "grant" at the admission's commit); the caller has not granted it.
-    fn busy_answer(&self, inn: &mut Inner, file_id: u64, req_id: u64, path: &str) -> R<()> {
-        let retry = gr8knobs::BUSY_RETRY_AFTER.get();
+    fn busy_answer(&self, inn: &mut Inner, file_id: u64, req_id: u64, retry: u64, path: &str) -> R<()> {
         atomic_file(&self.path(&format!("resp.{file_id}")), format!("end busy -1 0 {retry}\n").as_bytes())?;
         self.queue_cancel(req_id);
         inn.commands.remove(&req_id);
@@ -833,20 +838,19 @@ impl Control {
             if admit::busy_line(inn.busied, req_id) {
                 inn.busied = req_id;
                 let args =
-                    format!("{},{},{}", targ("request", req_id), targ("retry_after", retry as u64), tstr("path", path));
+                    format!("{},{},{}", targ("request", req_id), targ("retry_after", retry), tstr("path", path));
                 t.instant(b"busy", CONTROL, args.as_bytes());
             }
         }
         Ok(())
     }
 
-    // The intake check: Ok(true) when the request is fresh and its grant would evict a live retained run. It makes
-    // the admission's reads (try_fit, then busy_view) outside a commit, so it records nothing for the observer, and it
-    // calls the module's hooks only while the pool retains runs. Only GLM's pool retains runs, and its hooks take the
-    // pool's lock for each call.
-    fn busy_intake(&self, queued: &Request, ck: &Checked) -> R<bool> {
+    // The intake check: busy_check on the admission's reads (try_fit). It makes them outside a commit, so it records
+    // nothing for the observer, and it calls the module's hooks only while the pool retains runs. Only GLM's pool
+    // retains runs, and its hooks take the pool's lock for each call.
+    fn busy_intake(&self, queued: &Request, ck: &Checked) -> R<Option<u64>> {
         if self.pool().lock().kept_runs() == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         let worst = sch::reserve_rows(&self.c, queued).map_err(refused)?;
         let rows = self.admit_rows(queued)?;
@@ -858,12 +862,26 @@ impl Control {
             None
         };
         let mut req = *queued;
-        let (_, pre, _) = self.try_fit(&mut req, rows, worst, prompt.as_deref(), &ns, None)?;
+        let (r, pre, _) = self.try_fit(&mut req, rows, worst, prompt.as_deref(), &ns, None)?;
+        Ok(self.busy_check(&pre, rows, worst, r))
+    }
+
+    // The busy guard's rule for a grant (docs/ENV.md GR8_BUSY_*): the Retry-After seconds when it must be refused. A
+    // fresh grant is refused when its eviction set (the pool's busy_view) holds a live retained run. A hit on a
+    // retained run is refused when it reuses less of a live run than that run's own next turn would (busy_partial: a
+    // fork, or another conversation sharing only its start), since adopting the run drops the rest. A hit on a stored
+    // entry evicts nothing.
+    fn busy_check(&self, pre: &PoolHit, rows: u64, worst: u64, r: u32) -> Option<u64> {
+        let idle = self.busy_idle();
+        let pool = self.pool().lock();
+        // the pool's clock: its retire stamps count from the pool's build, before this control's start
+        let now = pool.now_ns();
         if pre.skip > 0 {
-            return Ok(false); // a turn continuing its own retained run: never refused
+            let left = if pre.stored { None } else { pool.busy_partial(pre.age, pre.skip, now, &idle) };
+            return left.map(admit::busy_retry_secs);
         }
-        let v = self.pool().lock().busy_view(rows, worst, req.r_rows, self.now_ns(), self.busy_idle_ns());
-        Ok(admit::busy_refuse(true, false, v.live_victims))
+        let v = pool.busy_view(rows, worst, r, now, &idle);
+        admit::busy_refuse(true, v.live_victims).then(|| admit::busy_retry_secs(v.idle_in_ns))
     }
 
     // inside an admission's commit: queue the ADMITs already written, in cmd order; stop at the first other command (a
@@ -1129,18 +1147,13 @@ impl Control {
                 *recall = short_of;
             }
             if admit::grant(fit.why, short_of) {
-                // the busy guard (GR8_BUSY_GUARD=1): a fresh grant whose eviction set (the pool's busy_view, the dry
-                // run of the reservation it would make) holds a retained run whose session is not idle refuses the
-                // request at once with the busy answer instead of evicting it or leaving it queued in silence. A turn
-                // that continues its own retained run (a hit) is never refused: the adoption is not an eviction.
-                if self.busy_on() && pre.skip == 0 {
-                    let v = self.pool().lock().busy_view(rows, worst, r, self.now_ns(), self.busy_idle_ns());
-                    if admit::busy_refuse(true, false, v.live_victims) {
-                        self.busy_answer(inn, id, id, "grant")?;
-                        inn.attempted_head = id;
-                        inn.attempted_revision = admit::attempted_revision(st.revision);
-                        return Ok(());
-                    }
+                // the busy guard (GR8_BUSY_GUARD=1, busy_check): a grant that would evict a live retained run, or
+                // adopt only part of one, gets the busy answer at once instead of evicting it or waiting in silence
+                if let Some(retry) = self.busy_on().then(|| self.busy_check(&pre, rows, worst, r)).flatten() {
+                    self.busy_answer(inn, id, id, retry, "grant")?;
+                    inn.attempted_head = id;
+                    inn.attempted_revision = admit::attempted_revision(st.revision);
+                    return Ok(());
                 }
                 let (mut run, mut skip, mut restored, mut counted) = (Run::default(), 0u32, 0u32, 0u32);
                 let mut parked = -1i32; // park: the parked slot the prompt extends, which the grant takes

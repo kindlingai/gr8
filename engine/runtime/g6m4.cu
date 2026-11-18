@@ -288,6 +288,10 @@ int main(int argc, char** argv)
     const bool fabric_dump = knob::fabric_dump();
     if (!fabric_dump && !grammar_dir.empty() && R == 0)
         if (FILE* f = fopen((s2dir + "/grammar.s2").c_str(), "w")) { fputs("json json_schema\n", f); fclose(f); }
+    // GR8_BUSY_GUARD=1: the head writes busy.s2 next to ready.s2, so the shim sends each request's tool stop ids (the
+    // tstop field), which set a retained run's idle bound (kvman-rs pool.rs Idle)
+    if (!fabric_dump && knob::busy_guard() && R == 0)
+        if (FILE* f = fopen((s2dir + "/busy.s2").c_str(), "w")) { fputs("tstop\n", f); fclose(f); }
 
     if (!fabric_dump) G6RT_CK(cudaSetDeviceFlags(cudaDeviceMapHost));
     // every fabric main creates, in creation order (fabric_plan.h); the plan below sets them up

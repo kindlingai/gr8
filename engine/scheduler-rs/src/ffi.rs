@@ -647,6 +647,7 @@ pub struct ParsedReq {
     pub gram_arm: i32,
     pub schema: *const u8,
     pub schema_n: usize,
+    pub tool_stop: Ints,
 }
 
 /// The caller's steering resolution: null and *out written, or its refusal message (valid until the caller's next call).
@@ -734,6 +735,7 @@ pub unsafe extern "C" fn g6sch_parse_request(
                 gram_arm: r.gram.arm,
                 schema: r.gram.schema.as_ptr(),
                 schema_n: r.gram.schema.len(),
+                tool_stop: ints(&r.tool_stop),
             };
             *handle = Box::into_raw(r);
             std::ptr::null()
@@ -787,6 +789,7 @@ pub unsafe extern "C" fn g6sch_parse_grammar(
                 lp: -1,
                 plp: -1,
                 sys: -1,
+                tool_stop: vec![],
                 steering: Identity {
                     enabled: false,
                     profile_digest: [0; 32],

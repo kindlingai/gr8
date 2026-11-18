@@ -384,7 +384,8 @@ pub fn digest() -> u64 {
             gram_strict,
             gram_arm,
             schema,
-            schema_n
+            schema_n,
+            tool_stop
         }
     );
     layout!(h, crate::flash_lend::Lend { idle_ms, keep, chunk_rows, chunks, idle, lent, since_ns });

@@ -21,7 +21,9 @@ rank needs a FRESH DIR). The head passes each request's bytes and the quit to th
                                                              boost: the frame's think_end_boost; seqt / seqa / seqg: the
                                                              frame's sequence_penalty scopes; all only when the head wrote
                                                              DIR/penalty.s2, boost and seq when that file names them)
-        [sys <system_tokens>] [ins <after>:<unless or -1>:<id,id,...>]      (version 3: the generate frame's insert rule, never with lp)
+        [sys <system_tokens>] [tstop <id,id,...>]           (tstop: the generate frame's tool_stop_ids, only when the head
+                                                             wrote DIR/busy.s2: GR8_BUSY_GUARD=1)
+        [ins <after>:<unless or -1>:<id,id,...>]             (version 3: the generate frame's insert rule, never with lp)
         [img <pos>:<vit_h>:<vit_w>:<key>:<rgb base64>] ...    (one per image, last; only when the head wrote DIR/vision.s2,
                                                              which names the model's image geometry: glm5v, ink2, else DS41's)
         <prompt id,id,...>
@@ -332,8 +334,9 @@ def images_field(images, prompt, model: str = 'ds41') -> tuple[str, str | None]:
     return ''.join(out), None
 
 
-def build_request(f: dict, ordinal: int, steering: dict | None = None, image_model: str = 'ds41'):
-    """-> (req.<id> bytes, error message or None). Validates what g6s2::parse_request / reserve_rows would reject."""
+def build_request(f: dict, ordinal: int, steering: dict | None = None, image_model: str = 'ds41', tstop: bool = False):
+    """-> (req.<id> bytes, error message or None). Validates what g6s2::parse_request / reserve_rows would reject.
+    tstop: the engine takes the tstop field (DIR/busy.s2)."""
     prompt = f.get('prompt') or []
     mt = f.get('max_tokens')
     if not prompt or not isinstance(mt, int) or isinstance(mt, bool) or mt < 1 or mt > INT32_MAX:
@@ -420,6 +423,12 @@ def build_request(f: dict, ordinal: int, steering: dict | None = None, image_mod
         return None, 'system_tokens must be 0..len(prompt)'
     if sys_tokens is not None:
         lps['sys'] = sys_tokens
+    tool_stop = f.get('tool_stop_ids') or []   # advice to the busy guard: an engine without busy.s2 never sees it
+    if not isinstance(tool_stop, list) or len(tool_stop) > 16 or any(
+            not isinstance(i, int) or isinstance(i, bool) or not 0 <= i < VOCAB for i in tool_stop):
+        return None, f'tool_stop_ids must be at most 16 token ids (0..{VOCAB - 1})'
+    if tstop and tool_stop:
+        lps['tstop'] = ','.join(map(str, tool_stop))
     ins, err = insert_field(f.get('insert'))
     if err:
         return None, err
@@ -751,7 +760,8 @@ class Shim:
                     return
                 ordinal = self.next_id
                 self.next_id += 1
-                body, err = build_request(r.f, ordinal, self.cfg['steering'], self.cfg.get('vision_model') or 'ds41')
+                body, err = build_request(r.f, ordinal, self.cfg['steering'], self.cfg.get('vision_model') or 'ds41',
+                                          self.cfg.get('tstop', False))
                 if err:
                     return self.finish(r, 'error', message=err)
                 errs = await self.write_all(f'req.{ordinal}', body)
@@ -941,6 +951,8 @@ class Shim:
                         marker = open(f'{self.a.dir}/penalty.s2').read().split() if self.cfg['penalty'] else []
                         self.cfg['boost'] = 'boost' in marker
                         self.cfg['seq'] = 'seq' in marker
+                        # GR8_BUSY_GUARD=1: the head writes busy.s2 before ready.s2, and takes the tstop field
+                        self.cfg['tstop'] = os.path.exists(f'{self.a.dir}/busy.s2')
                         break
                 except ValueError as e:
                     log.error('%s', e)

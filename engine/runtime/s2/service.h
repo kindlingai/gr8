@@ -293,6 +293,8 @@ class Service {
         g6rt::PrefixReuse st = dispatch_.rows(s.key.slot);
         const auto gen = driver_->emitted(s.key.slot);
         st.finish(driver_->prompt(s.key.slot), gen, int(gen.size()), true);
+        const auto& ts = driver_->tool_stop(s.key.slot);
+        st.tool_end = s.phase == Phase::Retiring && !gen.empty() && std::find(ts.begin(), ts.end(), gen.back()) != ts.end();
         // park: a finished session (not a cancelled one) keeps its slot; the scheduler parks it at the next commit
         if (c_.scheduler.park && s.phase == Phase::Retiring) {
             mod_.park(s.key.slot, s.run, st, g6rt::steering::cache_namespace(s.req.steering));

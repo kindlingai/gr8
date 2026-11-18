@@ -845,6 +845,7 @@ mod tests {
                 logprobs: None,
                 prompt_logprobs: None,
                 system_tokens: None,
+                tool_stop_ids: Vec::new(),
                 insert: None,
                 grammar: None,
                 steering_profile: None,

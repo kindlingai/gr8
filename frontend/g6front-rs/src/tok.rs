@@ -156,6 +156,9 @@ pub struct Tok {
     /// what a thinking budget puts in place of the next token: "\n" + `</think>` + "\n\n" (TensorFold's close); empty
     /// without a `</think>` token
     pub think_close: Vec<u32>,
+    /// the stop ids that end a reply on a tool call: GLM's `<|observation|>` when it is an EOS id, else none (DeepSeek
+    /// ends a call with the EOS that ends any reply)
+    pub tool_stop: Vec<u32>,
     par_ok: bool,
     cache_ok: bool,
     delimiters: Vec<&'static str>,
@@ -272,6 +275,7 @@ impl Tok {
             think_start: tk.token_to_id("<think>"),
             think_end: tk.token_to_id("</think>"),
             think_close: Vec::new(),
+            tool_stop: Vec::new(),
             par_ok: false,
             cache_ok: false,
             delimiters: Vec::new(),
@@ -279,6 +283,8 @@ impl Tok {
             strs: String::new(),
             offs: Vec::new(),
         };
+        t.tool_stop =
+            tk.token_to_id("<|observation|>").filter(|&i| t.eos_ids.contains(&i64::from(i))).into_iter().collect();
         t.build_token_strs();
         t.par_ok = t.check_parallel();
         t.delimiters = t.check_cache();
@@ -886,6 +892,7 @@ pub(crate) mod prefix_tests {
             think_start: None,
             think_end: None,
             think_close: Vec::new(),
+            tool_stop: Vec::new(),
             par_ok: false,
             cache_ok: false,
             delimiters: Vec::new(),

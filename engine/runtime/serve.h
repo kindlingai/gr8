@@ -58,6 +58,7 @@ struct ServeReq
     uint32_t seed = 1234u;
     int lp = -1, plp = -1;        // logprobs / prompt_logprobs: k (0..LP_MAX) or -1 = off
     int64_t sys = -1;             // the system span: the prompt's first tokens that are system message and tools (-1 = unknown)
+    std::vector<int> tool_stop;   // S2 only: the stop ids that end a reply on a tool call (the busy guard's idle bound)
     steering::Identity steering{};
     InsertRule ins;               // S2 only (s2/sessions.h parse_request)
     GrammarSpec gram;             // S2 only: the reply's grammar (grammar.h), off unless the request has one

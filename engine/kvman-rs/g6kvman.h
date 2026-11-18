@@ -79,6 +79,10 @@ int g6kv_match(const g6kv_pool* p, const int32_t* prompt, size_t n, uint64_t row
 // The existing retain/match/count entry points above/below retain all-zero namespace behavior and their ABI.
 int g6kv_retain_namespaced(g6kv_pool* p, const g6kv_run* r, const int32_t* history, size_t n, int32_t valid,
                            int32_t written_end, int32_t pf_end, const uint8_t* namespace_, size_t namespace_bytes);
+// g6kv_retain_namespaced, with tool nonzero when the reply ended on one of the request's tool stop ids (advice to the
+// head's busy guard: the run's idle bound, docs/ENV.md GR8_BUSY_IDLE_TOOL_SECS)
+int g6kv_retain_ended(g6kv_pool* p, const g6kv_run* r, const int32_t* history, size_t n, int32_t valid,
+                      int32_t written_end, int32_t pf_end, const uint8_t* namespace_, size_t namespace_bytes, int32_t tool);
 int g6kv_match_namespaced(const g6kv_pool* p, const int32_t* prompt, size_t n, uint64_t rows, uint64_t worst,
                           int32_t limit, const uint8_t* namespace_, size_t namespace_bytes, g6kv_hit* out);
 // from: -1 for a pool hit, else the tier of a stored one

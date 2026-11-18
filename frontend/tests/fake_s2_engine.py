@@ -65,12 +65,15 @@ def parse_request(data: bytes):
         raise ValueError(f'invalid request header {line!r}')
     r = {'n_gen': number(w[1]), 'temp': float(w[3]), 'seed': number(w[5]), 'min': number(w[7]),
          'stop': [] if w[9] == '-' else [number(x) for x in w[9].split(',')], 'top_p': 1.0, 'lp': None, 'plp': None,
-         'ins': None}
+         'ins': None, 'tstop': []}
     if len(w) >= 12 and w[-2] == 'ins':      # the last field (sessions.h parse_request)
         after, unless, ids = w[-1].split(':')
         r['ins'] = (number(after), -1 if unless == '-1' else number(unless), [number(x) for x in ids.split(',')])
         if not 1 <= len(r['ins'][2]) <= 64 or max(r['ins'][2]) >= VOCAB:
             raise ValueError('invalid ins header')
+        w = w[:-2]
+    if len(w) >= 12 and w[-2] == 'tstop':    # before ins (the busy guard's tool stop ids, busy.s2)
+        r['tstop'] = [number(x) for x in w[-1].split(',')]
         w = w[:-2]
     if len(w) >= 12:
         if w[10] != 'top_p':
@@ -274,6 +277,8 @@ class Fake:
                 if os.path.exists(os.path.join(d, f)):
                     self.die(f'S2 directory {d} is not fresh')
         time.sleep(a.ready_delay)
+        if a.busy_tstop:   # GR8_BUSY_GUARD=1: the head writes busy.s2 before ready.s2
+            open(os.path.join(self.d0, 'busy.s2'), 'w').write('tstop\n')
         tmp = os.path.join(self.d0, 'ready.s2.tmp')
         open(tmp, 'w').write(f'G6S2 {a.ready_version} {a.epoch} {len(a.dirs)} {a.pool_rows} {a.mtp} {self.guard} {a.max_rows} 20\n')
         os.rename(tmp, os.path.join(self.d0, 'ready.s2'))
@@ -317,5 +322,6 @@ if __name__ == '__main__':
     ap.add_argument('--report-reuse', type=int, default=None, help='end every "a" line with this many reused prompt rows (an engine that reports its prefix reuse)')
     ap.add_argument('--busy-max-tokens', type=int, default=0, help='refuse a request with this max_tokens as the busy guard does (0 = never)')
     ap.add_argument('--busy-retry', type=int, default=60, help="the Retry-After seconds on the busy refusal's end line")
+    ap.add_argument('--busy-tstop', action='store_true', help='write busy.s2: the engine takes the tstop field')
     ap.add_argument('--stop-at', type=int, default=0, help='first stop id is token #N of a request that has stop ids (0 = never)')
     sys.exit(Fake(ap.parse_args()).run())

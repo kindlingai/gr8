@@ -176,6 +176,7 @@ fn a_tier_spills_to_a_remote_store() {
         rp: 0,
         from: None,
         retired_ns: 0,
+        tool: false,
     };
     let ha = t.spill(&a, block).unwrap().unwrap();
     assert_eq!(t.spilled()[&ha].slots, vec![0, 1, 2, 3]);

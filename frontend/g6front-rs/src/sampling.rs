@@ -761,6 +761,7 @@ pub fn build(
             logprobs: lp.map(|v| v as i64),
             prompt_logprobs: plp.map(|v| v as i64),
             system_tokens: None,
+            tool_stop_ids: Vec::new(),
             insert: None,
             grammar: None,
             steering_profile: None,

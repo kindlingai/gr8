@@ -60,7 +60,7 @@ inline std::string str(const g6rt::ServeReq& r)
     auto bits = [](float f) { uint32_t b; std::memcpy(&b, &f, 4); return std::to_string(b); };
     std::string s = str(r.prompt) + "|" + str(r.stop) + "|" + std::to_string(r.n_gen) + " " + std::to_string(r.min_tokens) + " " +
                     bits(r.temp) + " " + bits(r.top_p) + " " + std::to_string(r.seed) + " " + std::to_string(r.lp) + " " +
-                    std::to_string(r.plp) + " " + std::to_string(r.sys) + "|" + std::to_string(r.ins.after) + " " +
+                    std::to_string(r.plp) + " " + std::to_string(r.sys) + "|" + str(r.tool_stop) + "|" + std::to_string(r.ins.after) + " " +
                     std::to_string(r.ins.unless) + " " + str(r.ins.tokens) + "|" + std::to_string(int(r.gram.kind)) +
                     std::to_string(r.gram.strict) + " " + std::to_string(r.gram.arm) + " " + r.gram.schema + "|" +
                     std::to_string(r.steering.enabled) + " " + std::to_string(int(r.steering.scope)) + " " +
@@ -530,6 +530,7 @@ inline uint64_t request(uint64_t seed, std::vector<std::string>* lines = nullptr
         if (!U(0, 2)) w.insert(w.end(), {"lp", pick(ints)});
         if (!U(0, 2)) w.insert(w.end(), {"plp", pick(ints)});
         if (!U(0, 2)) w.insert(w.end(), {"sys", pick(ints)});
+        if (!U(0, 3)) w.insert(w.end(), {"tstop", pick(idlists)});
         if (!U(0, 3)) w.insert(w.end(), {"ins", pick({"3:-1:8,9", "3:7:8", "3::8", "3:-1:", "x:-1:1", "2147483648:-1:1", "3:-1",
                                                      "3:99999999999:1", "1:2:" + ones(65)})});
         if (!U(0, 3)) w.insert(w.end(), {"gram", pick({"1:0:-1:", "2:1:5:7b7d", "2:0:-1:7B22", "2:0:-1:7", "2:0:-1:zz", "3:0:-1:", "1:2:-1:",

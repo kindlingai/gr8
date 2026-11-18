@@ -102,6 +102,9 @@ static void parse_tests()
     bool threw = false;
     try { req("n_gen 9 temp 0 seed 1 min 0 stop - " + many); } catch (const std::exception&) { threw = true; }
     CHECK(threw);
+    // the `tstop` field: the stop ids that end a reply on a tool call, carried to the slot's payload at retire
+    CHECK((req("n_gen 9 temp 0 seed 1 min 0 stop 7,8 sys 2 tstop 8 ins 0:-1:5").tool_stop == std::vector<int>{8}));
+    CHECK(req("n_gen 9 temp 0 seed 1 min 0 stop 7,8").tool_stop.empty());
 }
 
 int main()
