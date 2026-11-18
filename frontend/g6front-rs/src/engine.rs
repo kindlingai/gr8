@@ -5,15 +5,15 @@
 //! another's write. Dropping a `Stream` before its `finish` frame sends `cancel`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::wire::{self, FrameReader, GenParams};
 
@@ -46,15 +46,73 @@ pub struct Engine {
     conn: Mutex<Conn>,
     ready: AtomicBool,
     seq: AtomicU64,
+    /// `/internal/hold`: until this instant a request waits for the engine instead of failing (a scale's cutover)
+    hold_until: Mutex<Option<Instant>>,
+    /// wakes the waiters when the hold or `ready` changes
+    changed: Notify,
+    /// requests blocked in `wait_ready`
+    waiting: AtomicUsize,
 }
 
 impl Engine {
     pub fn new(path: String) -> Arc<Engine> {
-        Arc::new(Engine { path, conn: Mutex::default(), ready: AtomicBool::new(false), seq: AtomicU64::new(1) })
+        Arc::new(Engine {
+            path,
+            conn: Mutex::default(),
+            ready: AtomicBool::new(false),
+            seq: AtomicU64::new(1),
+            hold_until: Mutex::new(None),
+            changed: Notify::new(),
+            waiting: AtomicUsize::new(0),
+        })
     }
 
     pub fn ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
+    }
+
+    /// The hold's deadline while one is set and not yet passed.
+    fn held(&self) -> Option<Instant> {
+        self.hold_until.lock().unwrap().filter(|t| Instant::now() < *t)
+    }
+
+    /// Hold new requests for up to `seconds` (0 clears the hold and releases the waiters).
+    pub fn hold(&self, seconds: u64) {
+        *self.hold_until.lock().unwrap() =
+            (seconds > 0).then(|| Instant::now() + Duration::from_secs(seconds.min(86_400)));
+        self.changed.notify_waiters();
+    }
+
+    /// (hold set, requests running on the engine, requests waiting for it)
+    pub fn counts(&self) -> (bool, usize, usize) {
+        let running = self.conn.lock().unwrap().routes.len();
+        (self.held().is_some(), running, self.waiting.load(Ordering::Acquire))
+    }
+
+    /// Whether a new request may go to the engine. With a hold set it first waits until the hold is cleared or its
+    /// deadline passes; with none it answers at once.
+    pub async fn wait_ready(&self) -> bool {
+        if self.held().is_none() {
+            return self.ready();
+        }
+        self.waiting.fetch_add(1, Ordering::AcqRel);
+        struct Waiting<'a>(&'a AtomicUsize);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _w = Waiting(&self.waiting);
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable(); // registered before the check, so no change is missed
+            let Some(deadline) = self.held() else { return self.ready() };
+            tokio::select! {
+                _ = changed => {}
+                _ = tokio::time::sleep_until(deadline.into()) => {}
+            }
+        }
     }
 
     pub fn hello(&self) -> Option<Arc<Value>> {
@@ -106,7 +164,9 @@ impl Engine {
                 log::warn!("engine closed the connection");
             }
             self.fail_all("engine connection lost");
-            tokio::time::sleep(Duration::from_secs_f64(backoff)).await;
+            // a scale's cutover (hold set) brings the new engine up soon: retry often
+            let wait = if self.held().is_some() { 0.25 } else { backoff };
+            tokio::time::sleep(Duration::from_secs_f64(wait)).await;
             // until the first connection the shim is starting (the launchers start the front end early): retry often
             backoff = if ever { (backoff * 2.0).min(5.0) } else { 0.25 };
         }

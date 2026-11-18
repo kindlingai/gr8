@@ -391,11 +391,12 @@ impl State {
         }
     }
 
-    fn require_engine(&self) -> Result<(), ApiError> {
-        if self.engine.ready() {
+    /// Waits through a scale's hold (`/internal/hold`); then 503 with Retry-After when the engine is not connected.
+    async fn require_engine(&self) -> Result<(), ApiError> {
+        if self.engine.wait_ready().await {
             Ok(())
         } else {
-            Err(ApiError::new(503, "engine not connected", None))
+            Err(ApiError { status: 503, message: "engine not connected".into(), param: None, retry_after: Some(5) })
         }
     }
 
@@ -446,6 +447,7 @@ pub async fn route(
         ("/v1/models", &Method::GET | &Method::HEAD) => models(st),
         ("/health", &Method::GET | &Method::HEAD) if deep => health_deep(st, peer).await,
         ("/health", &Method::GET | &Method::HEAD) => health(st),
+        ("/internal/hold", &Method::GET | &Method::POST) => hold(st, &req, peer),
         ("/metrics", &Method::GET | &Method::HEAD) => metrics_route(st).await,
         ("/v1/chat/completions" | "/v1/completions" | "/tokenize" | "/detokenize", _) => {
             let mut r = response(405, "text/plain; charset=utf-8", b"405: Method Not Allowed".to_vec());
@@ -532,7 +534,7 @@ struct ChatReq {
 
 async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8]) -> Result<ChatReq, ApiError> {
     st.check_model(body)?;
-    st.require_engine()?;
+    st.require_engine().await?;
     if truthy(body.get("echo")) {
         return Err(ApiError::bad("echo is not supported by the gr8 front end", Some("echo")));
     }
@@ -1563,7 +1565,7 @@ async fn completions(st: &'static State, req: Request<Incoming>) -> Response<Htt
     };
     let prep = async {
         st.check_model(&body)?;
-        st.require_engine()?;
+        st.require_engine().await?;
         for k in ["echo", "suffix"] {
             if truthy(body.get(k)) {
                 return Err(ApiError::bad(format!("`{k}` is not supported by the gr8 front end"), Some(k)));
@@ -2047,6 +2049,23 @@ async fn health_deep(st: &State, peer: std::net::SocketAddr) -> Response<HttpBod
             json_value(503, serde_json::json!({"ok": false, "error": format!("supervisor {addr}: no answer in 90 s")}))
         }
     }
+}
+
+/// /internal/hold (localhost only; the supervisor's `scale`): POST `?seconds=N` holds new requests up to N s while the
+/// engine is replaced (0 releases them). Both methods answer the hold and the request counts.
+fn hold(st: &State, req: &Request<Incoming>, peer: std::net::SocketAddr) -> Response<HttpBody> {
+    if !peer.ip().is_loopback() {
+        return json_value(403, serde_json::json!({"error": "/internal/hold answers localhost only"}));
+    }
+    if req.method() == Method::POST {
+        let secs = req.uri().query().and_then(|q| q.split('&').find_map(|x| x.strip_prefix("seconds=")));
+        match secs.and_then(|s| s.parse::<u64>().ok()) {
+            Some(n) => st.engine.hold(n),
+            None => return json_value(400, serde_json::json!({"error": "POST /internal/hold?seconds=N"})),
+        }
+    }
+    let (hold, running, waiting) = st.engine.counts();
+    json_value(200, serde_json::json!({"hold": hold, "running": running, "waiting": waiting}))
 }
 
 /// One JSON line to a supervisor's control port, one JSON line back.
