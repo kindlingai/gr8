@@ -50,15 +50,20 @@
 //!
 //! src/rows.rs is the remote attention rows tier (the engine's GR8_RT_STORE): a group's latent rows past L in a
 //! store, and a helper thread that fetches the rows a decode step selects into the engine's resident slots.
+//!
+//! src/rewidth.rs rewrites a persisted SSD store written at another width for this rank (GR8_KV_REWIDTH, `./gr8
+//! <model> scale`), reading the other boxes' blocks through src/peer.rs (`kvman-peer`).
 
 pub mod blocks;
 pub mod canon;
 pub mod ledger;
 pub mod ffi;
+pub mod peer;
 pub mod pool;
 pub mod ram;
 pub mod remote;
 pub mod reuse;
+pub mod rewidth;
 pub mod rows;
 pub mod stash;
 pub mod tier;

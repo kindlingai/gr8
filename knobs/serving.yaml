@@ -129,6 +129,16 @@ knobs:
     doc: >-
       For tests, rank R sleeps the given ms inside every Nth KV tier drain that copies anything, set as
       <rank>:<ms>[:<every>].
+  GR8_KV_REWIDTH:
+    scope: local
+    kind: text
+    unset: "a persisted store written at another width starts empty"
+    doc: >-
+      Set by `./gr8 <model> scale` for one boot, never by hand: before a persisted --kv-store ssd store (GLM-5.3) or
+      the aligned checkpoint store (GLM-5.3-Flash) opens, rewrite the one the old width left (index.prev, *.prev) for
+      this rank, reading the other boxes' blocks from their kvman-peer, as
+      <old_nr>,<old_rank|x>,<token_file>,<peer0>,...,<peer old_nr-1>. A store whose model, R, grid, block layout or
+      engine differ, or a failed rewrite, starts empty as without it.
   GR8_KV_SHARE_PAGES:
     scope: agree
     kind: flag

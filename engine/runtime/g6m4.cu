@@ -2476,6 +2476,20 @@ int main(int argc, char** argv)
                     // the runs the quit stores (below, after service.run) come back at the next boot with their sessions
                     const bool whole = t.ssd() && !index.empty() && keep != "system";
                     kv_whole = kv_whole || whole;
+                    // ./gr8 <model> scale: the store the old width left (index.prev) rewritten for this rank before it opens
+                    // (the first persisted store: the one kvman-peer serves); a rank that fails starts empty, and the ranks'
+                    // agreement on the kept set (below) drops those entries
+                    if (const auto& rw = knob::kv_rewidth(); rw && !index.empty() && !kv_index)
+                    {
+                        const int64_t n = g6kv_rewidth(index.c_str(), compat.c_str(), (uint32_t)g6nr::NR, (uint32_t)R, slots,
+                                                       kvt->blocks().slot_bytes(), rw->c_str());
+                        if (n > 0)
+                            fprintf(stderr, "# rank %d: s2 store %zu: rewidth carried %lld entries from TP=%s\n", R, i, (long long)n,
+                                    rw->substr(0, rw->find(',')).c_str());
+                        else
+                            fprintf(stderr, "# rank %d: s2 store %zu: rewidth %s: %s, starting empty\n", R, i,
+                                    n == 0 ? "skipped" : "failed", g6kv_rewidth_error());
+                    }
                     pool.add_tier(slots, (keep == "system" ? 1 : 2) | (whole ? 4 : 0), index, compat);   // shared prefixes, or those and evicted runs
                     pool.policy((uint32_t)i, 0, keep == "sessions" ? 1 : 0, kvt->blocks().slot_bytes());
                     kv_index = kv_index || !index.empty();

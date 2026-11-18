@@ -47,7 +47,7 @@ COPY engine/kvman-rs engine/kvman-rs
 COPY engine/scheduler-rs engine/scheduler-rs
 RUN mkdir -p /out \
  && cargo build --release --locked --manifest-path engine/Cargo.toml \
- && cp engine/target/release/libg6host.a engine/target/release/kvman-remote /out/ \
+ && cp engine/target/release/libg6host.a engine/target/release/kvman-remote engine/target/release/kvman-peer /out/ \
  && rm -rf engine/target
 
 FROM rust AS knobs
@@ -205,7 +205,7 @@ FROM scratch AS dist-fp8
 COPY --from=engine /out/bin/g6m4 /out/bin/m4sim /bin/
 COPY --from=front /out/g6front-rs /bin/
 COPY --from=loader /out/g6load /bin/
-COPY --from=kvman /out/kvman-remote /bin/
+COPY --from=kvman /out/kvman-remote /out/kvman-peer /bin/
 # the knob table the launcher reads (tools/launch/knobs.py)
 COPY --from=knobs /out/libgr8knobs.so /bin/lib/
 
