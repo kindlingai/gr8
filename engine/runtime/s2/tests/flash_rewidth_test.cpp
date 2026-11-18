@@ -201,8 +201,7 @@ static void scale(const std::string& bin, const std::string& token, const std::v
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: flash_rewidth_test KVMAN_PEER\n"); return 2; }
     const std::string bin = argv[1];
-    const char* tmp = std::getenv("TMPDIR");
-    const std::string root = std::string(tmp ? tmp : "/tmp") + "/flash_rewidth_" + std::to_string(::getpid());
+    const std::string root = (std::filesystem::temp_directory_path() / ("flash_rewidth_" + std::to_string(::getpid()))).string();
     std::filesystem::create_directories(root);
     const std::string token = root + "/token";
     { std::ofstream(token) << "00ff12ab\n"; }
