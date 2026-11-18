@@ -44,6 +44,10 @@ pub struct ChatTemplate {
     pub image_mark: String,
     /// the template writes `<|video|>` for a video part (GLM), so `render_images` can probe with video parts
     video_parts: bool,
+    /// the template source holds the rule that infers reasoning from a `</think>` in an assistant content
+    inline_reasoning: bool,
+    /// a release that keeps control-token spellings in content literal breaks them before the render (`literal.rs`)
+    protect: Option<crate::literal::Protect>,
 }
 
 /// Keyword args the renderer owns; a request cannot override them through chat_template_kwargs.
@@ -117,6 +121,7 @@ impl ChatTemplate {
         let levels = crate::thinking::template_levels(&source);
         let supports_developer = source.contains("\"developer\"") || source.contains("'developer'");
         let video_parts = source.contains(VIDEO_MARK);
+        let inline_reasoning = crate::literal::has_inline_reasoning_rule(&source);
         let mut env = Environment::new();
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
@@ -139,7 +144,17 @@ impl ChatTemplate {
             levels,
             image_mark: IMAGE_MARK.to_string(),
             video_parts,
+            inline_reasoning,
+            protect: None,
         })
+    }
+
+    /// Break the control-token spellings in the caller's strings before every render, for a release that keeps them
+    /// literal in message content (`literal.rs`). The spellings come from the tokenizer (`Tok::literal_spellings`),
+    /// which is also what takes the marks out again in its encode; `None`, for every other release, renders as before.
+    pub fn with_literal_content(mut self, spellings: Option<crate::literal::Spellings>) -> Self {
+        self.protect = spellings.map(|s| crate::literal::Protect::new(s, self.inline_reasoning));
+        self
     }
 
     /// Standard text HF templates consume strings, not GLM's OpenAI content-part lists.
@@ -198,10 +213,16 @@ impl ChatTemplate {
                 }
             }
         }
+        // A release that keeps a control-token spelling in content literal breaks the spellings in every string the
+        // template reads, here, where the messages are what it will render (`literal.rs`).
+        let (conv, tools, documents) = match &self.protect {
+            Some(p) => (p.messages(&conv), tools.map(|t| p.value(t)), p.value(&documents)),
+            None => (conv, tools.cloned(), documents),
+        };
         // render(messages=, tools=, documents=, add_generation_prompt=, continue_final_message=, **special, **kw)
         let mut ctx = Map::new();
         ctx.insert("messages".into(), Value::Array(conv));
-        ctx.insert("tools".into(), tools.cloned().unwrap_or(Value::Null));
+        ctx.insert("tools".into(), tools.unwrap_or(Value::Null));
         ctx.insert("documents".into(), documents);
         ctx.insert("add_generation_prompt".into(), Value::Bool(add_generation_prompt));
         ctx.insert("continue_final_message".into(), Value::Bool(continue_final_message));

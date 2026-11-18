@@ -14,6 +14,7 @@ mod guard;
 mod hfparser;
 mod inkparser;
 mod jsonmode;
+mod literal;
 mod logprobs;
 mod metrics;
 mod parser;
@@ -359,7 +360,8 @@ async fn serve(args: Args) -> Result<(), String> {
                 &PathBuf::from(&args.model_dir),
                 tok.eos_token.clone(),
                 tok.pad_token.clone(),
-            )?;
+            )?
+            .with_literal_content(tok.literal_spellings());
             let effort = args.default_effort.as_deref().map(thinking::parse_default_effort).transpose()?;
             log::info!(
                 "dialect glm: tokenizer + template loaded in {:.0} ms (vocab {}); reasoning efforts the template names: \
@@ -404,7 +406,8 @@ async fn serve(args: Args) -> Result<(), String> {
                 tok.eos_token.clone(),
                 tok.pad_token.clone(),
             )?
-            .hf();
+            .hf()
+            .with_literal_content(tok.literal_spellings());
             tok.think_close = tok.encode("</think>", false)?;
             let effort = args.default_effort.as_deref().map(thinking::parse_default_effort).transpose()?;
             log::info!(
@@ -428,7 +431,8 @@ async fn serve(args: Args) -> Result<(), String> {
                 tok.eos_token.clone(),
                 tok.pad_token.clone(),
             )?
-            .single_text();
+            .single_text()
+            .with_literal_content(tok.literal_spellings());
             tok.use_inkling_thinking()?;
             tok.add_tokenizer_eos();
             ink_effort = args.default_effort.as_deref().map(dialect::parse_inkling_default_effort).transpose()?;

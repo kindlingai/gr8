@@ -20,6 +20,7 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Mutex;
 
 use serde_json::Value;
@@ -135,6 +136,26 @@ fn identity_normalizer(tk: &Tokenizer) -> bool {
     })
 }
 
+/// One sequential encode with the given tokenizer.
+fn encode_one(tk: &Tokenizer, text: &str, add_special: bool) -> Result<Vec<u32>, String> {
+    tk.encode_fast(text, add_special).map(|e| e.get_ids().to_vec()).map_err(|e| e.to_string())
+}
+
+/// `encode_one` in pieces of about `piece` bytes, cut where `split_pieces` allows, on the rayon pool.
+fn encode_pieces(tk: &Tokenizer, text: &str, piece: usize) -> Result<Vec<u32>, String> {
+    use rayon::prelude::*;
+    let pieces = split_pieces(text, piece);
+    if pieces.len() < 2 {
+        return encode_one(tk, text, false);
+    }
+    let parts: Vec<Result<Vec<u32>, String>> = pieces.par_iter().map(|p| encode_one(tk, p, false)).collect();
+    let mut ids = Vec::with_capacity(text.len() / 3);
+    for p in parts {
+        ids.extend_from_slice(&p?);
+    }
+    Ok(ids)
+}
+
 /// Proper suffix/prefix overlap in either direction; full equality is the same isolated token, not an overlap.
 fn overlaps(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -162,6 +183,17 @@ pub struct Tok {
     cache: Mutex<PrefixCache>,
     strs: String,
     offs: Vec<u32>,
+    /// the release keeps a control-token spelling in message content literal (`literal.rs`)
+    literal: Option<Lit>,
+}
+
+/// What the literal-content encode needs: the spellings to split a rendered prompt at, and the same tokenizer with
+/// its added tokens removed, which is how the run between two controls is encoded (`literal.rs`).
+struct Lit {
+    spellings: crate::literal::Spellings,
+    tk: &'static Tokenizer,
+    /// the parallel cuts hold for this copy too (it only has fewer added tokens), self-checked at load
+    par_ok: bool,
 }
 
 fn read_json(p: &Path) -> Result<Value, String> {
@@ -278,11 +310,13 @@ impl Tok {
             cache: Mutex::new(PrefixCache::default()),
             strs: String::new(),
             offs: Vec::new(),
+            literal: None,
         };
         t.build_token_strs();
         t.par_ok = t.check_parallel();
         t.delimiters = t.check_cache();
         t.cache_ok = !t.delimiters.is_empty();
+        t.literal = t.check_literal(&cfg)?;
         if let Some(end) = t.think_end {
             let mut close = t.encode_seq("\n", false)?;
             close.push(end);
@@ -393,6 +427,92 @@ impl Tok {
         delimiters
     }
 
+    /// Whether this release keeps a control-token spelling in message content literal, and what that encode needs.
+    /// `tokenizer_config.json` declares the rule by naming the tokenizer class (`literal::declared`). A run between
+    /// two of the template's own controls is encoded with a copy of this tokenizer that has no added tokens: added
+    /// token extraction already isolates every run from BPE, so that copy gives a run holding no whole spelling the
+    /// ids the stock whole-string encode gives it, and a broken spelling the ordinary BPE of its run. Post-processing
+    /// that adds tokens of its own cannot run over a prompt encoded in pieces, so it leaves the rule off.
+    fn check_literal(&self, tok_cfg: &Value) -> Result<Option<Lit>, String> {
+        if !crate::literal::declared(tok_cfg) {
+            return Ok(None);
+        }
+        let spellings =
+            crate::literal::Spellings::new(self.tk.get_added_tokens_decoder().into_values().map(|a| a.content));
+        if spellings.is_empty() || self.adds_special() {
+            log::warn!(
+                "literal content off: the tokenizer has no added token to protect, or its post-processing adds tokens"
+            );
+            return Ok(None);
+        }
+        let mut spec: Value = serde_json::from_str(&self.tk.to_string(false).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("tokenizer.json: {e}"))?;
+        spec["added_tokens"] = Value::Array(Vec::new());
+        let lit = Tokenizer::from_str(&spec.to_string()).map_err(|e| format!("tokenizer.json: {e}"))?;
+        let lit: &'static Tokenizer = Box::leak(Box::new(lit));
+        let sample = parallel_sample();
+        let par_ok = self.par_ok
+            && matches!((encode_one(lit, &sample, false), encode_pieces(lit, &sample, 64)), (Ok(a), Ok(b)) if a == b);
+        if self.par_ok && !par_ok {
+            log::warn!("literal content: parallel encode off, the copy with no added tokens disagrees with itself");
+        }
+        log::info!(
+            "literal content on: {} added-token spellings in message content stay text (parallel encode {})",
+            spellings.len(),
+            if par_ok { "on" } else { "off" }
+        );
+        Ok(Some(Lit { spellings, tk: lit, par_ok }))
+    }
+
+    /// The spellings to protect before a chat template renders, when this release keeps them literal in content.
+    pub fn literal_spellings(&self) -> Option<crate::literal::Spellings> {
+        self.literal.as_ref().map(|l| l.spellings.clone())
+    }
+
+    /// The literal-content encode of a rendered chat prompt (`literal.rs`): the ids of the spellings that are still
+    /// whole, which are the template's own controls, and between them the runs the marks come out of, encoded with no
+    /// added tokens. `hit` carries a reused prefix and collects the turn-delimiter checkpoints, as `encode_segments`
+    /// does for the stock encode. Every cut is at a control, so a checkpoint is at least as safe as it is there.
+    fn encode_literal(
+        &self,
+        text: &str,
+        mut hit: PrefixHit,
+        l: &Lit,
+        parallel: &mut bool,
+    ) -> Result<(Vec<u32>, Vec<Checkpoint>), String> {
+        let tail = &text[hit.byte_off..];
+        let mut at = 0;
+        for (off, len) in l.spellings.matches(tail) {
+            self.push_run(&mut hit.ids, &tail[at..off], l, parallel)?;
+            let spelling = &tail[off..off + len];
+            let id =
+                self.tk.token_to_id(spelling).ok_or_else(|| format!("no id for the control token {spelling:?}"))?;
+            if self.delimiters.iter().any(|d| *d == spelling) {
+                hit.checkpoints.push(((hit.byte_off + off) as u32, hit.ids.len() as u32, len as u16));
+            }
+            hit.ids.push(id);
+            at = off + len;
+        }
+        self.push_run(&mut hit.ids, &tail[at..], l, parallel)?;
+        debug_assert!(hit.checkpoints.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].1));
+        Ok((hit.ids, hit.checkpoints))
+    }
+
+    /// One run between two controls: the marks out, then BPE with no added tokens, in parallel cuts when it is long.
+    fn push_run(&self, ids: &mut Vec<u32>, run: &str, l: &Lit, parallel: &mut bool) -> Result<(), String> {
+        let run = crate::literal::strip(run);
+        if run.is_empty() {
+            return Ok(());
+        }
+        if l.par_ok && run.len() >= PAR_MIN_BYTES {
+            *parallel = true;
+            ids.extend_from_slice(&encode_pieces(l.tk, &run, PAR_PIECE_BYTES)?);
+        } else {
+            ids.extend_from_slice(&encode_one(l.tk, &run, false)?);
+        }
+        Ok(())
+    }
+
     /// Encode after a reused checkpoint, including its delimiter; offsets always come from UTF-8 string matches,
     /// never from the possibly mid-codepoint common byte prefix. No tokenizer work runs while the LRU is locked.
     fn encode_segments(
@@ -461,7 +581,7 @@ impl Tok {
     }
 
     fn encode_seq(&self, text: &str, add_special: bool) -> Result<Vec<u32>, String> {
-        self.tk.encode_fast(text, add_special).map(|e| e.get_ids().to_vec()).map_err(|e| e.to_string())
+        encode_one(self.tk, text, add_special)
     }
 
     /// `decode([id], skip_special_tokens=False)` for every id, kept in one string arena.
@@ -495,6 +615,10 @@ impl Tok {
     }
 
     fn encode_work(&self, text: &str, add_special: bool, parallel: &mut bool) -> Result<Vec<u32>, String> {
+        // A rendered chat prompt whose content spellings carry the literal mark takes the literal-content encode.
+        // Every other text keeps the release's stock encode, a `/v1/completions` prompt included, as the release's
+        // own tokenizer does for a bare string (`literal.rs`). The two agree on a text with no mark in it.
+        let literal = self.literal.as_ref().filter(|_| text.contains(crate::literal::RESERVED));
         if self.cache_ok
             && (CACHE_MIN_BYTES..=CACHE_MAX_BYTES).contains(&text.len())
             && !(add_special && self.adds_special())
@@ -503,7 +627,10 @@ impl Tok {
             if hit.full {
                 return Ok(hit.ids);
             }
-            let (ids, checkpoints) = self.encode_segments(text, hit, &self.delimiters, parallel)?;
+            let (ids, checkpoints) = match literal {
+                Some(l) => self.encode_literal(text, hit, l, parallel)?,
+                None => self.encode_segments(text, hit, &self.delimiters, parallel)?,
+            };
             self.cache.lock().unwrap().insert(PrefixEntry {
                 text: text.into(),
                 ids: ids.clone().into_boxed_slice(),
@@ -511,7 +638,10 @@ impl Tok {
             });
             return Ok(ids);
         }
-        self.encode_uncached(text, add_special, parallel)
+        match literal {
+            Some(l) => Ok(self.encode_literal(text, PrefixHit::default(), l, parallel)?.0),
+            None => self.encode_uncached(text, add_special, parallel),
+        }
     }
 
     fn encode_uncached(&self, text: &str, add_special: bool, parallel: &mut bool) -> Result<Vec<u32>, String> {
@@ -809,6 +939,18 @@ impl Tok {
     pub(crate) fn cache_on_for_test(&self) -> bool {
         self.par_ok && self.cache_ok
     }
+    /// The literal-content encode of a text the dispatch would not send there, to check the two agree.
+    pub(crate) fn encode_literal_for_test(&self, text: &str) -> Vec<u32> {
+        let l = self.literal.as_ref().expect("the literal-content rule is off");
+        self.encode_literal(text, PrefixHit::default(), l, &mut false).unwrap().0
+    }
+    /// The ids of a run as the copy with no added tokens gives them (`literal.rs`).
+    pub(crate) fn encode_run_for_test(&self, text: &str) -> Vec<u32> {
+        encode_one(self.literal.as_ref().expect("the literal-content rule is off").tk, text, false).unwrap()
+    }
+    pub(crate) fn literal_par_off_for_test(&mut self) {
+        self.literal.as_mut().expect("the literal-content rule is off").par_ok = false;
+    }
 }
 
 #[cfg(test)]
@@ -892,6 +1034,7 @@ pub(crate) mod prefix_tests {
             cache: Mutex::new(PrefixCache::default()),
             strs: String::new(),
             offs: Vec::new(),
+            literal: None,
         };
         t.par_ok = t.check_parallel();
         t.delimiters = t.check_cache();
@@ -901,6 +1044,14 @@ pub(crate) mod prefix_tests {
 
     pub(crate) fn fixture(ds: bool) -> Tok {
         from_tk(tokenizer(ds, &[]))
+    }
+
+    /// The GLM-shaped fixture as a release that declares the literal-content rule (`literal.rs`).
+    fn literal_fixture() -> Tok {
+        let mut t = from_tk(tokenizer(false, &[]));
+        t.literal = t.check_literal(&json!({"auto_map": {"AutoTokenizer": ["tokenization_glm5.Glm5Tokenizer"]}})).unwrap();
+        assert!(t.literal.is_some(), "the rule stayed off");
+        t
     }
     fn exact(t: &Tok, text: &str) {
         assert_eq!(t.encode(text, false).unwrap(), t.encode_seq(text, false).unwrap(), "{} bytes", text.len());
@@ -1074,5 +1225,120 @@ pub(crate) mod prefix_tests {
         cache.insert(entry(99, CACHE_MAX_BYTES));
         assert_eq!(cache.entries.len(), n);
         assert_eq!(cache.bytes, cache.entries.iter().map(PrefixEntry::bytes).sum::<usize>());
+    }
+
+    // ---- literal content (literal.rs) ---------------------------------------------------------------------------
+
+    #[test]
+    fn a_release_names_its_literal_content_tokenizer_class_to_turn_the_rule_on() {
+        let t = fixture(false);
+        assert!(t.check_literal(&json!({"tokenizer_class": "TokenizersBackend"})).unwrap().is_none());
+        assert!(t.check_literal(&Value::Null).unwrap().is_none());
+        assert!(t.literal_spellings().is_none());
+        let t = literal_fixture();
+        let spellings = t.literal_spellings().expect("the rule is on");
+        assert!(spellings.matches("x<|user|>y") == vec![(1, 8)], "the tokenizer's own added tokens are the spellings");
+    }
+
+    #[test]
+    fn a_spelling_in_content_is_text_while_the_templates_own_controls_keep_their_ids() {
+        let t = literal_fixture();
+        let stock = fixture(false);
+        let mark = crate::literal::MARK;
+        let (user, assistant) = (t.tk.token_to_id("<|user|>").unwrap(), t.tk.token_to_id("<|assistant|>").unwrap());
+        let close = t.tk.token_to_id("</think>").unwrap();
+        // the prompt a template renders for a user turn whose content spells a control token
+        let ids = t.encode(&format!("<|user|>hello </{mark}think> word<|assistant|>"), false).unwrap();
+        let want = [vec![user], t.encode_run_for_test("hello </think> word"), vec![assistant]].concat();
+        assert_eq!(ids, want);
+        assert!(!ids.contains(&close), "the content's spelling must not be a control id");
+        // the stock whole-string encode of the same conversation makes it one
+        let today = stock.encode("<|user|>hello </think> word<|assistant|>", false).unwrap();
+        assert!(today.contains(&close) && today.len() < ids.len());
+    }
+
+    #[test]
+    fn a_whole_run_holding_several_broken_spellings_is_encoded_in_one_piece() {
+        let t = literal_fixture();
+        let mark = crate::literal::MARK;
+        let (user, assistant) = (t.tk.token_to_id("<|user|>").unwrap(), t.tk.token_to_id("<|assistant|>").unwrap());
+        let content = "say </think> then <|user|> and <think> words";
+        let marked = content.replace("</think>", &format!("</{mark}think>"));
+        let marked = marked.replace("<|user|>", &format!("<{mark}|user|>"));
+        let marked = marked.replace("<think>", &format!("<{mark}think>"));
+        let ids = t.encode(&format!("<|user|>{marked}<|assistant|>"), false).unwrap();
+        // one encode of the whole run, not one per piece between its broken spellings
+        assert_eq!(ids, [vec![user], t.encode_run_for_test(content), vec![assistant]].concat());
+        for spelling in ["</think>", "<think>"] {
+            assert!(!ids.contains(&t.tk.token_to_id(spelling).unwrap()), "{spelling} became a control id");
+        }
+        // only the template's own `<|user|>` is a control id, not the one in the content
+        assert_eq!(ids.iter().filter(|&&id| id == user).count(), 1);
+    }
+
+    #[test]
+    fn a_callers_own_reserved_character_survives_the_round_trip() {
+        let t = literal_fixture();
+        let (mark, escaped) = (crate::literal::MARK, crate::literal::ESCAPED);
+        let user = t.tk.token_to_id("<|user|>").unwrap();
+        // the content "\u{fdd0}<|user|> \u{fdd0}\u{fdd1}", as the protect step writes it
+        let rendered = format!("<|user|>{escaped}<{mark}|user|> {escaped}\u{fdd1}");
+        let ids = t.encode(&rendered, false).unwrap();
+        assert_eq!(ids, [vec![user], t.encode_run_for_test("\u{fdd0}<|user|> \u{fdd0}\u{fdd1}")].concat());
+    }
+
+    #[test]
+    fn the_literal_and_the_stock_encode_agree_on_a_text_with_no_mark() {
+        let t = literal_fixture();
+        let stock = fixture(false);
+        for text in [
+            "hello world",
+            "<|user|>hello word<|assistant|>",
+            "</think>",
+            "<|user|>a</think>b<|observation|>words<|assistant|>",
+            "",
+        ] {
+            assert_eq!(t.encode(text, false).unwrap(), stock.encode(text, false).unwrap(), "stock path: {text:?}");
+            assert_eq!(t.encode_literal_for_test(text), stock.encode(text, false).unwrap(), "literal path: {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_literal_prompt_reuses_a_turn_checkpoint_with_the_same_ids() {
+        let t = literal_fixture();
+        assert!(t.cache_on_for_test());
+        let mark = crate::literal::MARK;
+        let mut text = format!("<|user|>{}", "hello word value 123 ".repeat(300));
+        for turn in 0..4 {
+            text.push_str(&format!(
+                "<|assistant|>reply </{mark}think> {turn}<|user|>{}",
+                "foo bar words hello ".repeat(300)
+            ));
+            let hits = t.cache_hits_for_test();
+            assert_eq!(t.encode(&text, false).unwrap(), t.encode_literal_for_test(&text), "turn {turn}");
+            if turn > 0 {
+                assert!(t.cache_hits_for_test() > hits, "turn {turn} reused no checkpoint");
+            }
+        }
+    }
+
+    #[test]
+    fn the_parallel_cuts_of_a_long_literal_run_match_its_sequential_encode() {
+        let mut t = literal_fixture();
+        let mark = crate::literal::MARK;
+        let text = format!(
+            "<|user|>{}<{mark}tool_call>{}<|assistant|>",
+            "hello word value 123 you bar\n".repeat(3000),
+            "words foo\n".repeat(3000)
+        );
+        assert!(text.len() > PAR_MIN_BYTES);
+        let mut parallel = false;
+        let fast = t
+            .encode_literal(&text, PrefixHit::default(), t.literal.as_ref().unwrap(), &mut parallel)
+            .unwrap()
+            .0;
+        assert!(parallel, "the long run was not cut");
+        t.literal_par_off_for_test();
+        assert_eq!(fast, t.encode_literal_for_test(&text));
     }
 }
