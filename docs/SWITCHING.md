@@ -207,6 +207,39 @@ per-rank rows pool two ranks over the same three stops:
 - Output after a fast quit: 8 fixed prompts at temperature 0 (`max_tokens=512`) on the next boot gave the same text and
   total token counts as before, 8 of 8.
 
+## Changing width: `./gr8 <model> scale`
+
+`./gr8 glm53 scale --tp N --peers LIST [--drain-timeout S]` (also `glm53f`) moves a serving cluster to another TP or
+set of boxes without failing a request. Run it on any box of the cluster; the head (the first address) must stay first
+in `LIST`. It is an orderly restart of the engines, not an in-process switch:
+
+1. The head plans the new layout (GLM-5.3 with `bin/g6layout plan`, so a box keeps the expert halves it holds) and
+   every box of the new list makes its rank's files ready and runs its checks while the cluster serves. A box new to
+   the cluster joins by running `./gr8 <model> up --tp N --peers LIST` (with the cluster's other options) after the
+   scale has started.
+2. The head's front end holds new requests (`/internal/hold`, frontend/README.md) and waits for the running ones to
+   finish, at most `--drain-timeout` seconds (300). A drain that runs out ends the scale with nothing changed.
+3. Every old engine quits as for `down` (its KV store keeps the pool's runs), and each box serves its store folder to
+   the new ranks through `bin/kvman-peer` on `CONTROL_PORT + 3` (7343 by default). The new member list boots with
+   `GR8_KV_REWIDTH`, which rewrites the store for each new rank before it opens: GLM-5.3's persisted SSD store
+   (`KV_STORE=ssd:...,persist=on`, sessions with `keep=sessions`) and GLM-5.3-Flash's aligned checkpoints
+   (`FLASH_CACHE=aligned` with a persisted SSD store; not with `GR8_CP=1`). A chat's next turn then reads its run from
+   the store instead of prefilling it again. Without such a store the scale works and sessions prefill again.
+4. When the head's API answers, the hold ends and the held requests run on the new width. A box that left exits.
+
+If the new width fails to boot (a refused handshake, an engine that exits, `READY_TMO`), every box of the old list
+puts its store back and boots the old list again, and the held requests run there. A supervisor that dies mid-scale
+is not resumed: `down` and `up` as after any failure.
+
+What the scale keeps the same, so the store's blocks stay valid: the running variant (`--variant`), `SHARE_LIMIT` and
+`REUSE_GRID` are pinned. It refuses `SHAPE=ring`. It changes the running cluster only: it prints the option lines
+(`TP=`, `PEERS=`, the pins) to put into every box's config for later boots, and a mentat cluster runs in peers mode
+after its first scale. Output after a scale is that of a fresh boot at the new width given the same stored state; a
+run that never scaled may give other tokens (another width computes other KV bits).
+
+The pause (hold set to hold cleared) and the drain time of a 4->3 and a 3->4 scale on GB10s are not measured yet;
+`scale` prints both for each run.
+
 ## The GLM-5.3-Flash pair (TP=2)
 
 A two-box pair can also switch between GLM-5.3-Flash at TP=2

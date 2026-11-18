@@ -18,7 +18,8 @@ because `/opt` is otherwise in the RAM overlay.
 
 Set up every box as the README's [What you need](../README.md#what-you-need) says: one GB10 box per rank with nothing
 else holding much memory, a RoCE v2 fabric with two rails (a switch, or at TP=3 or 4 a ring of direct cables), TCP
-ports 7340 and 7341 open between the boxes, and about 90 GB of disk for the model. Turn proactive memory compaction
+ports 7340 and 7341 open between the boxes (and 7343 for `./gr8 <model> scale` with a persisted KV store), and about
+90 GB of disk for the model. Turn proactive memory compaction
 off on every box, as root, once (on DGX OS `/etc/sysctl.d/` holds across reboots, and `vm.compaction_proactiveness=20`
 undoes it; on Kindling OS run `sysctl -w` at boot or put the file in a site layer):
 

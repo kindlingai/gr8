@@ -10,6 +10,15 @@ Format and release rules live in [`RELEASING.md`](RELEASING.md).
 
 Changes merged on `main` since `v1.0.1` that are not yet cut in a numbered `v*` release tag.
 
+- **`./gr8 <model> scale --tp N --peers LIST`** (GLM-5.3 and GLM-5.3-Flash): change a serving cluster's width and
+  boxes by an orderly restart. The front end holds new requests (`POST /internal/hold`, localhost only) while the
+  running ones finish, the old engines quit, and the new member list boots; a failed boot rolls back to the old list.
+  With a persisted SSD KV store the new ranks rewrite the old width's store for themselves (`GR8_KV_REWIDTH`, set by
+  `scale` only; `bin/kvman-peer` serves each box's store to the others), so stored sessions continue without a
+  re-prefill. Default boots are unchanged.
+- The front end's 503 `engine not connected` now carries `Retry-After: 5`.
+- **Breaking changes:** None.
+
 ---
 
 ## [v1.0.1] — 2026-11-12

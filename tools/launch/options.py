@@ -240,6 +240,7 @@ def parse(argv, environ=None):
             values[k], origin[k] = v, f'{model} TP={tp_eff} default'
     opts = Options(values, origin, path, args, switches, warnings)
     opts.named, opts.model_conflict = named, conflict
+    opts.argv = list(argv)   # as given (old names renamed): `scale` boots the same options plus its own
     opts.plain = filev.get('PLAIN', environ.get('PLAIN', ''))   # PLAIN=1 is retired. validate() refuses it
     opts.g6env = sorted(k for k in environ if k.startswith('G6_') and k not in KEYS and k not in IGNORED)
     for k in ('MODEL', 'MODEL_CACHE', 'MODEL_DIR', 'GR8_WORK_DIR', 'V2', 'V2_SLICES', 'V2_WIDTHS', 'VARIANT',
