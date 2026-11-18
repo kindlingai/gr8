@@ -361,6 +361,24 @@ URL=http://127.0.0.1:8100 SUP_PORT=8198 python3 -m unittest tests.test_api   # f
 `[engine] draft_k = 3` in those weights makes g6pseudo report speculative-decoding counters, which
 `return_step_stats` tests read.
 
+## Literal control tokens in message content
+
+A release that ships its own tokenizer class (`tokenizer_config.json` names it in `auto_map.AutoTokenizer`) keeps the
+content spelling of a control token literal: a `</think>` a caller typed is those eight characters, not the control
+id, and everything between two controls the template itself wrote is one BPE run. The front end reproduces that for
+such a release. Before the chat template renders, every added-token spelling in a caller string -- message content,
+the text parts of a content list, tool schemas, tool results, and object keys -- is marked with a reserved character
+(`U+FDD0`, which is escaped where it occurs in the text itself). The rendered prompt is then encoded as the ids of the
+spellings that are still whole, which are the template's own controls, and the runs between them are encoded with a
+copy of the same `tokenizer.json` that has no added tokens, after the marks come out. The template's
+inline-reasoning rule is honoured: the `</think>` that rule splits on is the template's, so it stays a control.
+
+Turn checkpoints still land on the turn delimiters, so the prefix cache and the parallel encode behave as before, and
+only a prompt that carries a mark takes this path, so `/v1/completions` and every release that declares no tokenizer
+class are encoded exactly as before. The declaration decides it, not `--dialect`. `src/literal.rs` holds the marking
+and the spelling match; the gate in docs/TESTING.md replays the release's own tokenization of nine chat requests
+through /v1/chat/completions.
+
 ## Deviations from vLLM
 
 - These return 400: `n>1`, batched prompts, `echo`, `suffix`, `repetition_penalty` other than 1 (`presence_penalty` and `frequency_penalty` work, above), a custom `chat_template`, a `response_format` type other than text, `json_object` and `json_schema`, and a schema the grammar compiler cannot take.

@@ -34,6 +34,7 @@ What the two halves cover, and how to run one part alone:
 | the rank health probe | engine | `python3 -m unittest discover tools/health` |
 | the S2 shim | front end | `cd frontend && python3 -m unittest tests.test_s2shim -v` |
 | the front end | front end | `cd frontend/g6front-rs && cargo test --release` |
+| the literal-content gate: nine chat requests tokenized by the release's own tokenizer (`frontend/tests/literal_golden.py` writes `src/literal_golden.json`), each replayed through /v1/chat/completions and compared id for id; skipped unless the release the golden was built from is at hand | front end | `cd frontend/g6front-rs && GR8_TEST_TOKENIZER_DIR=RELEASE_DIR cargo test --release literal_content_golden` |
 | the pseudo engine's rules (`model/responses.toml`) | front end | `cd frontend/pseudo-engine && cargo test` |
 | the launch: options, model sets, handshake, mentat, the KV node (`./gr8 kv`), and four supervisors with stub engines on 127.0.0.1-4 | front end | `python3 -m unittest discover -s tools/launch` |
 

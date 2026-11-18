@@ -173,6 +173,11 @@ If you are an agent (or developer) building on gr8, start from the matching entr
   Each turn retains a prompt-end fallback for re-tokenized replies, within the cache budget
   (`--extra-env GR8_DS_CACHE_DEFER_REPLACE=0` restores eager replacement after a request-end hit).
   See [DeepSeek defaults and rollbacks](docs/DEEPSEEK.md#forced-tools-and-parked-chats).
+- **A control token a caller typed stays text.** When a release ships its own tokenizer class
+  (`auto_map.AutoTokenizer` in its `tokenizer_config.json`), a `</think>`, `<tool_call>` or `<|user|>` inside message
+  content, a tool schema or a tool result is encoded as the text it is, the way that release's own tokenizer encodes
+  it, instead of becoming the control token's id. Long prompts keep the parallel encode and the prefix cache
+  ([literal control tokens](frontend/README.md#literal-control-tokens-in-message-content)).
 - **Image input.** DeepSeek-V4.1-Flash and GLM-5.3-Flash take images in chat requests (opt-in, `GR8_DS41_VISION=1`,
   [docs/DS41-VISION.md](docs/DS41-VISION.md); `GR8_GLM53F_VISION=1`, [docs/FLASH-VISION.md](docs/FLASH-VISION.md)).
 - **A Docker image.** `ghcr.io/kindlingai/gr8` has the engine for every TP width and all three models, so GLM-5.3 on
