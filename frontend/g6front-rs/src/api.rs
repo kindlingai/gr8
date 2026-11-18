@@ -2181,4 +2181,110 @@ mod http_tokenize_chat_tests {
         assert_eq!(gens.lock().unwrap().len(), 4);
         eprintln!("HTTP_TOKENIZE_CHAT turns=4 cache_hits={last_hits}");
     }
+    /// The literal-content gate: every case in `literal_golden.json` was tokenized by the release's own tokenizer
+    /// (`frontend/tests/literal_golden.py`), so these ids are what the model was trained to see. Each one goes
+    /// through the real router on /v1/chat/completions, and the prompt the engine receives must equal them id for id
+    /// -- rendering and encoding together, not just the encode. Skipped unless the release is at hand:
+    /// GR8_TEST_TOKENIZER_DIR=<the release directory> cargo test --release
+    #[tokio::test]
+    async fn literal_content_golden_ids_through_the_http_path() {
+        let Some(dir) = gr8knobs::TEST_TOKENIZER_DIR.get() else {
+            eprintln!("GR8_TEST_TOKENIZER_DIR not set; skipping");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let golden: Value = serde_json::from_str(include_str!("literal_golden.json")).unwrap();
+        let cfg: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("tokenizer_config.json")).unwrap()).unwrap();
+        let declared = &cfg["auto_map"]["AutoTokenizer"];
+        let declared = declared.as_str().or_else(|| declared.get(0).and_then(|v| v.as_str()));
+        if declared != golden["auto_map"].as_str() {
+            eprintln!(
+                "GR8_TEST_TOKENIZER_DIR declares {declared:?}, not the {:?} literal_golden.json was built from; skipping",
+                golden["auto_map"].as_str()
+            );
+            return;
+        }
+
+        let tok = crate::tok::Tok::load(&dir).unwrap();
+        let spellings = tok.literal_spellings();
+        assert!(spellings.is_some(), "the release declares its own tokenizer but literal content stayed off");
+        let template = crate::template::ChatTemplate::load(&dir, tok.eos_token.clone(), tok.pad_token.clone())
+            .unwrap()
+            .with_literal_content(spellings);
+        let grammars = crate::grammar::Grammars::load(&dir, tok.vocab_size).unwrap();
+        let reply = tok.tk.encode("ok", false).unwrap().get_ids().to_vec();
+        let (engine, gens) = fake_engine(reply).await;
+        let st: &'static State = Box::leak(Box::new(State {
+            tok,
+            template: Some(template),
+            dialect: Dialect::Glm,
+            ds_effort: dialect::DS_DEFAULT_EFFORT,
+            ds_thinking_default: true,
+            forced_tool_thinking: false,
+            ink_effort: None,
+            engine,
+            served: vec!["literal-golden".into()],
+            model_name: "literal-golden".into(),
+            model_dir: dir.to_string_lossy().into_owned(),
+            reasoning_fields: &["reasoning_content"],
+            prompt_tokens_details: true,
+            max_model_len_override: 0,
+            default_max_tokens: 0,
+            share_tokens: 0,
+            clamp_max_tokens: false,
+            thinking: thinking::Defaults { effort: None, budget: sampling::Limit::Tokens(0), allow_off: true },
+            grammars,
+            emit_undeclared: true,
+            guard: guard::Config::default(),
+            penalties: sampling::Penalties::default(),
+            boost: None,
+            sequence: None,
+            started: now_secs(),
+            supervisor: None,
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| route(st, req, peer));
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(sock), svc).await;
+                });
+            }
+        });
+
+        let cases = golden["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for c in cases {
+            let name = c["name"].as_str().unwrap();
+            let mut req = json!({"model": "literal-golden", "messages": c["request"]["messages"], "max_tokens": 1});
+            if c["request"]["tools"].as_array().is_some_and(|t| !t.is_empty()) {
+                req["tools"] = c["request"]["tools"].clone();
+            }
+            let (code, v) = post(addr, "/v1/chat/completions", &req).await;
+            assert_eq!(code, 200, "{name}: {v}");
+            let want: Vec<u32> =
+                c["ids"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u32).collect();
+            let sent: Vec<u32> = gens.lock().unwrap().last().unwrap()["prompt"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap() as u32)
+                .collect();
+            let at = sent.iter().zip(&want).position(|(a, b)| a != b);
+            assert_eq!(
+                sent,
+                want,
+                "{name}: the prompt the engine received is not the release's own tokenization \
+                 ({} ids against {}, first difference at {at:?})",
+                sent.len(),
+                want.len()
+            );
+            assert_eq!(v["usage"]["prompt_tokens"].as_u64().unwrap() as usize, want.len(), "{name}: usage");
+            eprintln!("LITERAL_GOLDEN {name} ids={} exact", want.len());
+        }
+        assert_eq!(gens.lock().unwrap().len(), cases.len());
+    }
 }
