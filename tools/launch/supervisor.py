@@ -35,7 +35,8 @@ import steering_hf
 
 REPO = opt.REPO
 # What the engine gets from the supervisor's environment, besides the plan's own variables.
-ENGINE_ENV_KEEP = ('PATH', 'HOME', 'USER', 'LANG', 'LD_LIBRARY_PATH', 'DISPRAM_DISABLE', 'DISPRAM_SOCKET')
+ENGINE_ENV_KEEP = ('PATH', 'HOME', 'USER', 'LANG', 'LD_LIBRARY_PATH', 'DISPRAM_DISABLE', 'DISPRAM_SOCKET',
+                   'DISPRAM_KEY_FILE')
 ENGINE_ENV_PREFIXES = ('CUDA_', 'NVIDIA_')
 
 
@@ -51,6 +52,23 @@ class DispramFallback(Exception):
     """Retry the cluster once without probed display memory."""
 
 
+def dispram_key(env):
+    """The key a dispram request carries: DISPRAM_KEY_FILE's text, trimmed (engine/dispram_client.h's rule), or
+    Kindling OS dispramd's own key when it is unset. None when the file cannot give a valid key."""
+    path = env.get('DISPRAM_KEY_FILE') or ''
+    if not path:
+        return 'kindlingai_1'
+    try:
+        with open(path, 'rb') as f:
+            raw = f.read(4097)
+    except OSError:
+        return None
+    key = raw.strip(b' \t\r\n')
+    if len(raw) > 4096 or not 1 <= len(key) <= 127 or any(c < 0x21 or c > 0x7e or c in b'"\\' for c in key):
+        return None
+    return key.decode('ascii')
+
+
 def probe_dispram(o, environ=None, timeout=1.0):
     env = os.environ if environ is None else environ
     if o.get('DISPRAM') != '1' or str(env.get('DISPRAM_DISABLE', '')).lower() in ('1', 'true', 'yes', 'on'):
@@ -58,12 +76,15 @@ def probe_dispram(o, environ=None, timeout=1.0):
     kind = getattr(socket, 'SOCK_SEQPACKET', None)
     if kind is None:
         return 0
+    key = dispram_key(env)
+    if key is None:
+        return 0
     conn = None
     try:
         conn = socket.socket(socket.AF_UNIX, kind)
         conn.settimeout(timeout)
         conn.connect(env.get('DISPRAM_SOCKET') or '/run/dispram/dispram.sock')
-        conn.sendall(b'{"key":"kindlingai_1","op":"info"}')
+        conn.sendall(json.dumps({'key': key, 'op': 'info'}, separators=(',', ':')).encode())
         d = json.loads(conn.recv(4096))
         if not isinstance(d, dict):
             return 0

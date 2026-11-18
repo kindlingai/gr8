@@ -1194,6 +1194,42 @@ class DispramTests(unittest.TestCase):
                     self.assertEqual(requests, [{'key': 'kindlingai_1', 'op': 'info'}])
                     self.assertEqual(got, 2145386496 if type(free) is int and free > 0 else 0)
 
+    def test_probe_key_file(self):
+        s = supervisor('--dispram', '1')
+        with tempfile.TemporaryDirectory() as d:
+            key = os.path.join(d, 'key')
+            for text, want in [(b'attic_0123456789abcdef01234567\n', 'attic_0123456789abcdef01234567'), (b'', None),
+                               (b'two words', None), (b'q"uote', None), (b'x' * 128, None), (b'k' + b' ' * 4096, None)]:
+                with open(key, 'wb') as f:
+                    f.write(text)
+                self.assertEqual(S.dispram_key({'DISPRAM_KEY_FILE': key}), want)
+            self.assertEqual(S.dispram_key({}), 'kindlingai_1')
+            self.assertIsNone(S.dispram_key({'DISPRAM_KEY_FILE': os.path.join(d, 'missing')}))
+            with open(key, 'w') as f:
+                f.write(' attic_k \n')
+            path = os.path.join(d, 's')
+            try:
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            except OSError:
+                self.skipTest('Unix seqpacket unsupported')
+            with listener:
+                listener.bind(path)
+                listener.listen()
+                requests = []
+                def server():
+                    with listener.accept()[0] as c:
+                        requests.append(json.loads(c.recv(4096)))
+                        c.sendall(json.dumps({'ok': True, 'size': 2145386496, 'free': 2145386496,
+                                              'largest': 2145386496}).encode())
+                t = threading.Thread(target=server)
+                t.start()
+                got = S.probe_dispram(s.o, {'DISPRAM_SOCKET': path, 'DISPRAM_KEY_FILE': key})
+                t.join(2)
+                self.assertFalse(t.is_alive())
+                self.assertEqual(requests, [{'key': 'attic_k', 'op': 'info'}])
+                self.assertEqual(got, 2145386496)
+            self.assertEqual(S.probe_dispram(s.o, {'DISPRAM_SOCKET': path, 'DISPRAM_KEY_FILE': d + '/missing'}), 0)
+
     def test_cluster_minimum(self):
         for values, expected in [([2145386496]*4, 2145386496), ([2145386496,2145386496,0,2145386496], 0)]:
             s = supervisor()
