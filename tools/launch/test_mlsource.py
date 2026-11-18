@@ -78,7 +78,7 @@ class ModelLoaderTests(unittest.TestCase):
         self.assertEqual(rel.dir, os.path.join(self.store, 'models', NAME, 'main'))
         self.assertEqual((o.get('V2_DENSE'), o.get('V2'), o.get('V2_SLICES')), (rel.dir, rel.v2, rel.slices))
         self.assertEqual(ms.tokenizer, rel.dir)
-        self.assertEqual(v.path, os.path.join(rel.dir, 'manifests', 'exlr8-manifest-home.json'))
+        self.assertEqual(v.path, os.path.join(rel.dir, 'manifests', 'exlr8-manifest-bit325.json'))
         self.assertTrue(rel.check(4, 1, v))
         rel.fetch_rank(4, 1, v)
         self.assertEqual(rel.check(4, 1, v), [])
@@ -91,7 +91,7 @@ class ModelLoaderTests(unittest.TestCase):
         self.assertNotIn('index-slices/tp4/k3/rank0.safetensors', inc)
         self.assertIn('dense/exlr8-vocab.safetensors', inc)
         self.assertEqual({r['path'] for r in body['ranges']},
-                         {f'experts/exlr8-layer-00{l}.k3.safetensors' for l in T.LAYERS})   # home: K3 only
+                         {f'experts/exlr8-layer-00{l}.k3.safetensors' for l in T.LAYERS})   # bit325 (fixture widths): K3 only
         T.same_halves(self.rel, rel.v2, 3, 4, 1, lambda p: 3)
         self.assertFalse(os.path.exists(os.path.join(rel.v2, 'exlr8-layer-003.k2.safetensors')))
         self.assertTrue(any('verified the' in m for m in self.logs), self.logs)
@@ -278,7 +278,7 @@ class ModelLoaderTests(unittest.TestCase):
         for argv in (['formula', '--members', 'a,b,c,d', '--out', t4],
                      ['plan', '--from', t4, '--members', 'a,b,d', '--out', p3]):
             subprocess.run([g6layout] + argv + ['--widths', v.path], check=True, capture_output=True)
-        o, ms, v = self.resolve('--layout', p3, '--variant', 'home', tp=3)
+        o, ms, v = self.resolve('--layout', p3, '--variant', 'bit325', tp=3)
         ms.release.fetch_rank(3, 1, v)
         self.assertEqual(ms.release.check(3, 1, v), [])
         inc = set(self.ml.puts[-1][1]['include'])
@@ -395,7 +395,7 @@ class RealModelLoaderTests(unittest.TestCase):
         ms.release.fetch_rank(4, 1, v)
         self.assertEqual(ms.release.check(4, 1, v), [])
         T.same_halves(rel, ms.release.v2, 3, 4, 1, lambda p: 3)
-        self.assertFalse([x for x in log if 'k2.safetensors' in x])       # home: no K2 bytes from the origin
+        self.assertFalse([x for x in log if 'k2.safetensors' in x])       # bit325 (fixture widths): no K2 bytes from the origin
         # 64 KiB segments: the store holds about the rank's quarter of each width file, not all of it
         k3 = os.path.join(ms.release.v2, 'exlr8-layer-003.k3.safetensors')
         held = os.stat(k3).st_blocks * 512

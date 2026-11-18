@@ -69,7 +69,7 @@ class DrafterTests(unittest.TestCase):
                   mock.patch.object(hfsource, 'converter', lambda: [sys.executable, stub])):
             p.start()
             self.addCleanup(p.stop)
-        self.rel = local_release(os.path.join(self.t, 'local'))
+        self.rel = local_release(os.path.join(self.t, 'local'), variants=('bit400', 'bit325'))
         self.logs = []
 
     def boot(self, *argv, peers=PEERS4):
@@ -230,7 +230,7 @@ class SteeringTests(unittest.TestCase):
     def opts(self, selector='hf:default', *extra):
         o = opt.parse(['--no-config', '--peers', PEERS4, '--model', f'https://huggingface.co/{T.RELEASE}',
                        '--model-cache', self.store, '--fetch', 'model-loader', '--work-dir', self.home,
-                       '--variant', 'home', '--dflash', '0', '--steering-profile', selector, *extra], T.GLM)
+                       '--variant', 'bit400', '--dflash', '0', '--steering-profile', selector, *extra], T.GLM)
         opt.validate(o)
         return o
 

@@ -74,17 +74,19 @@ class Model:
         return ', '.join(self.tp[:-1]) + ' or ' + self.tp[-1] if len(self.tp) > 1 else self.tp[0]
 
 
-# GLM-5.3 variants: home, down1 and up1 follow the TR3 checkpoint's per-expert widths. The bitNNN profiles spend their
-# bits by tensor type, then by layer, in the order that lowered full-vocabulary KL against bf16 the most per byte.
-# The TP=3 default: bit225 is down1's size with 5-10% lower KL against bf16, at par on code and ~2% slower on prose. A
-# release from before it boots down1. home's experts take 99.8 GB of a rank at TP=3, which leaves no room for the KV
-# pool on a 128 GB box. At TP=4 home stays: bit325 lowers KL by 1.5-7% at home's size but decoded ~2.5% slower in
-# three boots each.
+# GLM-5.3 variants: the release's width profiles (v0.6, mul1). Each bitNNN spends its bits by tensor type, then by
+# layer, in the order that lowered full-vocabulary KL against bf16 the most per byte; bit200, bit300 and bit400 are
+# all K2, all K3 and all K4. v0.6 removed home, down1, up1 (now bit400), bit243 and bit338.
+# TP=4, TP=5 and TP=6 take bit325, the old home's size (74.8 GB of experts on the busiest rank at TP=4). bit400 puts
+# 91.9 GB on a rank at TP=4, which does not fit next to the default decode graphs and KV pool: it boots only by name,
+# with lower memory settings. The TP=3 default: bit260 (80.2 GB of experts on the busiest rank; on v0.5 it booted at
+# TP=3 with the default KV pool, smoke and an 87K needle passed; not booted on v0.6). bit325 puts 99.8 GB on a rank at
+# TP=3, which leaves no room for the KV pool on a 128 GB box. A release without bit260 boots bit225.
 GLM53 = Model('glm53', 'GLM-5.3', 'https://huggingface.co/kindlingai/glm-5.3-exlr8-k2-k3-k4', 'g6m4', 'glm',
               ('4', '6', '3', '5'),
-              {'home': 3.25, 'down1': 2.25, 'up1': 4.0,
-               'bit225': 2.25, 'bit243': 2.43, 'bit260': 2.60, 'bit325': 3.25, 'bit338': 3.38},
-              {3: ('bit225', 'down1')}, 'gr8-glm53', 'GlmMoeDsaForCausalLM', True, True, True,
+              {'bit200': 2.0, 'bit225': 2.25, 'bit239': 2.39, 'bit260': 2.60, 'bit273': 2.73,
+               'bit300': 3.0, 'bit325': 3.25, 'bit332': 3.32, 'bit390': 3.92, 'bit400': 4.0},
+              {3: ('bit260', 'bit225'), 4: ('bit325',), 5: ('bit325',), 6: ('bit325',)}, 'gr8-glm53', 'GlmMoeDsaForCausalLM', True, True, True,
               vocab=154880, eos_ids=(154820, 154827, 154829), shim_legacy=True, drafter_url='https://huggingface.co/incoai/GLM-5.3-DFlash2', grammar=True, kv4_fold=True, legacy_identity=True,
               tp_defaults={'4': {'KV_FORMAT': 'int4'}})
 # GLM-5.3-Flash: uniform-width releases, K4 by default. K2 is the width whose experts fit one box (TP=1).

@@ -11,8 +11,8 @@ On each rank, set the same absolute directory for prepare and boot (paths below 
 
 ```sh
 export EXTRA_ENV="GR8_LOAD_COMPACT=$COMPACT_DIR"
-./gr8 glm53 prepare --rank "$RANK" --tp 4 --model "$MODEL" --model-cache "$CACHE" --variant home
-./gr8 glm53 up --tp 4 --model "$MODEL" --model-cache "$CACHE" --variant home
+./gr8 glm53 prepare --rank "$RANK" --tp 4 --model "$MODEL" --model-cache "$CACHE" --variant bit325
+./gr8 glm53 up --tp 4 --model "$MODEL" --model-cache "$CACHE" --variant bit325
 ```
 
 Keep any other `EXTRA_ENV` assignments your configuration needs. `prepare` first

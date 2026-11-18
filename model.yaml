@@ -18,18 +18,19 @@ tp:
 
 per_rank:
   tp4:
-    variant: home               # 3.25 bpw routed experts
+    variant: bit325             # 3.25 bpw routed experts. Numbers below measured on release 0.5 with home, the same size
     weights_gb: 83              # the device image from the release (measured 2026-10-10)
     s2_step_graphs_gib: 2.5     # SESS=8
     kv_pool_tokens: 393216      # CAP
     memavailable_after_boot_gib: 5.6-6.2   # S2 with DFlash2, 8 sessions
   tp3:
-    variant: down1              # 2.25 bpw routed experts; home does not fit next to a KV pool
+    variant: bit260             # 2.60 bpw routed experts; bit325 does not fit next to a KV pool. Numbers below measured
+                                # on release 0.5 with down1 (2.25 bpw)
     weights_gb: 78.4
     kv_pool_tokens: 307200
     memavailable_after_boot_gib: 15.6-17
   tp6:
-    variant: home
+    variant: bit325             # CAP measured on release 0.5 with home, the same size
     kv_pool_tokens: 614400
   notes: >-
     One rank per box and nothing else holding much memory. CAP is the first thing to lower when a box runs short; a
