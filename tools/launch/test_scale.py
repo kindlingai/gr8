@@ -32,7 +32,8 @@ class Scale(unittest.TestCase):
     def setUp(self):
         self.t = tempfile.mkdtemp(prefix='gr8scale-')
         self.rel = make_release(os.path.join(self.t, 'rel'))
-        for name, w in (('home', 3), ('down1', 2), ('up1', 4)):
+        # the release's width profiles as test_e2e.py makes them, and bit260, the TP=3 default (models.py GLM53)
+        for name, w in (('bit325', 3), ('bit260', 3), ('bit200', 2), ('bit390', 4)):
             p = manifest(os.path.join(self.rel, 'manifests', f'exlr8-manifest-{name}.json'), name, w)
             with open(p) as f:
                 m = json.load(f)
