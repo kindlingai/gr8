@@ -44,6 +44,10 @@ pub struct ChatTemplate {
     pub image_mark: String,
     /// the template writes `<|video|>` for a video part (GLM), so `render_images` can probe with video parts
     video_parts: bool,
+    /// the template source holds the rule that infers reasoning from a `</think>` in an assistant content
+    inline_reasoning: bool,
+    /// a release that keeps control-token spellings in content literal breaks them before the render (`literal.rs`)
+    protect: Option<crate::literal::Protect>,
 }
 
 /// Keyword args the renderer owns; a request cannot override them through chat_template_kwargs.
@@ -117,6 +121,7 @@ impl ChatTemplate {
         let levels = crate::thinking::template_levels(&source);
         let supports_developer = source.contains("\"developer\"") || source.contains("'developer'");
         let video_parts = source.contains(VIDEO_MARK);
+        let inline_reasoning = crate::literal::has_inline_reasoning_rule(&source);
         let mut env = Environment::new();
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
@@ -139,7 +144,17 @@ impl ChatTemplate {
             levels,
             image_mark: IMAGE_MARK.to_string(),
             video_parts,
+            inline_reasoning,
+            protect: None,
         })
+    }
+
+    /// Break the control-token spellings in the caller's strings before every render, for a release that keeps them
+    /// literal in message content (`literal.rs`). The spellings come from the tokenizer (`Tok::literal_spellings`),
+    /// which is also what takes the marks out again in its encode; `None`, for every other release, renders as before.
+    pub fn with_literal_content(mut self, spellings: Option<crate::literal::Spellings>) -> Self {
+        self.protect = spellings.map(|s| crate::literal::Protect::new(s, self.inline_reasoning));
+        self
     }
 
     /// Standard text HF templates consume strings, not GLM's OpenAI content-part lists.
@@ -198,10 +213,16 @@ impl ChatTemplate {
                 }
             }
         }
+        // A release that keeps a control-token spelling in content literal breaks the spellings in every string the
+        // template reads, here, where the messages are what it will render (`literal.rs`).
+        let (conv, tools, documents) = match &self.protect {
+            Some(p) => (p.messages(&conv), tools.map(|t| p.value(t)), p.value(&documents)),
+            None => (conv, tools.cloned(), documents),
+        };
         // render(messages=, tools=, documents=, add_generation_prompt=, continue_final_message=, **special, **kw)
         let mut ctx = Map::new();
         ctx.insert("messages".into(), Value::Array(conv));
-        ctx.insert("tools".into(), tools.cloned().unwrap_or(Value::Null));
+        ctx.insert("tools".into(), tools.unwrap_or(Value::Null));
         ctx.insert("documents".into(), documents);
         ctx.insert("add_generation_prompt".into(), Value::Bool(add_generation_prompt));
         ctx.insert("continue_final_message".into(), Value::Bool(continue_final_message));
@@ -402,11 +423,14 @@ fn py_format(out: &mut minijinja::Output, _: &minijinja::State, v: &J) -> Result
 }
 
 /// Python's printable test for repr(), close enough for prompt text: controls, separators other than the space,
-/// format characters and private use are escaped.
+/// format characters, private use and the noncharacters are escaped. U+FDD0..U+FDEF and U+FFFE..U+FFFF are
+/// unassigned (category Cn), so CPython escapes them, and the mark `literal.rs` writes is two of them: a mapping
+/// a template prints with str() therefore holds `\ufdd0\ufdd1` as twelve ASCII characters, as it does under the
+/// release's own tokenizer.
 fn py_printable(c: char) -> bool {
     !matches!(c as u32,
         0..=0x1f | 0x7f..=0xa0 | 0xad | 0x1680 | 0x180e | 0x2000..=0x200f | 0x2028..=0x202f | 0x205f..=0x2064
-        | 0x3000 | 0xd800..=0xf8ff | 0xfeff | 0xfff9..=0xfffb | 0xf0000..)
+        | 0x3000 | 0xd800..=0xf8ff | 0xfdd0..=0xfdef | 0xfeff | 0xfff9..=0xfffb | 0xfffe..=0xffff | 0xf0000..)
 }
 
 fn py_repr_str(out: &mut String, s: &str) {
@@ -912,6 +936,25 @@ mod tests {
 {%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
 {%- for m in messages -%}{%- if m.role == 'user' -%}<|user|>{{ m.content[0].text }}{%- endif -%}{%- endfor -%}
 {%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}"#;
+
+    /// `{{ value }}` of a mapping is Python's `str()`, which calls `repr()` on the strings inside it, and CPython
+    /// escapes an unassigned character: the mark `literal.rs` writes is two of them, so a tool output given as a
+    /// mapping holds `\ufdd0\ufdd1` as text, exactly as it does under the release's own tokenizer.
+    #[test]
+    fn a_mapping_escapes_the_noncharacters_python_escapes() {
+        let t = ChatTemplate::from_source(
+            "{%- for m in messages -%}{{ m['content'][0]['output'] }}{%- endfor -%}".to_string(),
+            Value::Null,
+            Value::Null,
+        )
+        .unwrap();
+        let msg = |v: Value| json!([{"role": "tool", "content": [{"tool_call_id": "c1", "output": v}]}]);
+        let out = t.render(Some(&msg(json!({"k": "see <\u{fdd0}\u{fdd1}/think>"}))), None, Map::new()).unwrap();
+        assert_eq!(out, r"{'k': 'see <\ufdd0\ufdd1/think>'}");
+        // a printable character is still printed as itself
+        let out = t.render(Some(&msg(json!({"k": "plain \u{4f60}"}))), None, Map::new()).unwrap();
+        assert_eq!(out, "{'k': 'plain \u{4f60}'}");
+    }
 
     fn render(t: &ChatTemplate, body: Value) -> String {
         let body = body.as_object().unwrap();
