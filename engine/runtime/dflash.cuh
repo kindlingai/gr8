@@ -39,6 +39,7 @@
 #pragma once
 #include "prefill.cuh"
 #include "../module_info.h"
+#include "dfl_topk.h"
 
 namespace g6rt
 {
@@ -420,7 +421,7 @@ __global__ void __launch_bounds__(1024) k_top_local(TopArgs a)
     for (int k = 0; k < TOPK; ++k)
     {
         float bl = -INFINITY;
-        int bi = 0x7fffffff;
+        int bi = TOP_NONE;
         for (int i = t; i < a.vn; i += 1024)
         {
             bool taken = false;
@@ -440,7 +441,7 @@ __global__ void __launch_bounds__(1024) k_top_local(TopArgs a)
         {
             for (int i = 1; i < 32; ++i) if (cand_before(s_l[i], s_i[i], bl, bi)) { bl = s_l[i]; bi = s_i[i]; }
             s_taken[k] = bi;
-            dst[k] = Cand{bl, a.vlo + bi};
+            dst[k] = Cand{bl, top_id(a.vlo, bi)};   // TOP_NONE: every untaken logit NaN (dfl_topk.h)
         }
         __syncthreads();
     }
@@ -488,7 +489,9 @@ __global__ void __launch_bounds__(256) k_walk(WalkArgs a)
                 bl[at] = x.logit; bi[at] = x.id;
             }
         }
-        for (int k = 0; k < TOPK; ++k) { s_l[w][k] = bl[k]; s_i[w][k] = bi[k]; }
+        bool bad = false;
+        for (int k = 0; k < TOPK; ++k) { s_l[w][k] = bl[k]; s_i[w][k] = walk_id(bi[k], glue::VOCAB, bad); }
+        if (bad) atomicCAS(a.f.error, 0u, ERR_TOPK | ((unsigned)(w + 1) << 8));   // an id outside the vocabulary (dfl_topk.h)
     }
     if (t == 0) s_prev = a.tok[0];
     __syncthreads();
