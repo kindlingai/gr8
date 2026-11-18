@@ -224,6 +224,15 @@ options:
       mode unless the request explicitly enables thinking or its assistant history carries reasoning. 1 keeps the
       server's default thinking mode and closes the think block in the forced insert (the previous behavior).
       Explicit thinking switches and efforts still win; other dialects are unchanged
+  LITERAL_CONTENT:
+    scope: box
+    default: "1"
+    doc: >-
+      the head's front end: 1 = a release that declares its own tokenizer class keeps a control-token spelling in
+      message content literal, as that tokenizer does, so a `</think>` a caller typed is text and not the control
+      id. 0 is the rollback to the stock whole-string encode (the behavior before it): the prompt ids of a request
+      whose content holds such a spelling, and the prefix-cache keys for those prompts, go back to what they were.
+      A release that declares no tokenizer class is unaffected either way
   TOOL_REPEAT_GUARD:
     scope: box
     default: "0"

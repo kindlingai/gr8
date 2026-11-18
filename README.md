@@ -174,9 +174,12 @@ If you are an agent (or developer) building on gr8, start from the matching entr
   (`--extra-env GR8_DS_CACHE_DEFER_REPLACE=0` restores eager replacement after a request-end hit).
   See [DeepSeek defaults and rollbacks](docs/DEEPSEEK.md#forced-tools-and-parked-chats).
 - **A control token a caller typed stays text.** When a release ships its own tokenizer class
-  (`auto_map.AutoTokenizer` in its `tokenizer_config.json`), a `</think>`, `<tool_call>` or `<|user|>` inside message
+  (`auto_map.AutoTokenizer` in its `tokenizer_config.json`), as Sage-S2.1-Flash
+  ([kindlingai/sage-s2.1-flash-exlr8-k4](https://huggingface.co/kindlingai/sage-s2.1-flash-exlr8-k4)) does, a
+  `</think>`, `<tool_call>` or `<|user|>` inside message
   content, a tool schema or a tool result is encoded as the text it is, the way that release's own tokenizer encodes
-  it, instead of becoming the control token's id. Long prompts keep the parallel encode and the prefix cache
+  it, instead of becoming the control token's id. Long prompts keep the parallel encode and the prefix cache.
+  Roll back with `--literal-content 0` / `LITERAL_CONTENT=0`
   ([literal control tokens](frontend/README.md#literal-control-tokens-in-message-content)).
 - **Image input.** DeepSeek-V4.1-Flash and GLM-5.3-Flash take images in chat requests (opt-in, `GR8_DS41_VISION=1`,
   [docs/DS41-VISION.md](docs/DS41-VISION.md); `GR8_GLM53F_VISION=1`, [docs/FLASH-VISION.md](docs/FLASH-VISION.md)).

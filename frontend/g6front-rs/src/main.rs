@@ -107,6 +107,8 @@ struct Args {
     default_budget: sampling::Limit,
     allow_thinking_off: bool,
     forced_tool_thinking: bool,
+    /// 0 turns off the literal-content encode a release declares (`literal.rs`), back to the stock whole-string encode
+    literal_content: bool,
     clamp_max_tokens: bool,
     emit_undeclared: bool,
     supervisor: Option<String>,
@@ -127,7 +129,7 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--default-thinking-budget N, Fx or N|Fx] [--allow-thinking-off] [--clamp-max-tokens]
                   [--default-presence-penalty SPEC] [--default-frequency-penalty SPEC]
                   [--default-think-end-boost start=S,per1k=P,max=M] [--default-sequence-penalty SPEC]
-                  [--forced-tool-thinking 0|1]
+                  [--forced-tool-thinking 0|1] [--literal-content 0|1]
                   [--tool-repeat-guard 0|1] [--tool-repeat-guard-repeats N] [--tool-repeat-guard-temperature F]
                   [--tool-repeat-guard-retries N]
                   [--undeclared-tool-calls text|emit] [--supervisor HOST:PORT]";
@@ -153,6 +155,7 @@ fn parse_args() -> Result<Args, String> {
         default_budget: sampling::Limit::Tokens(0),
         allow_thinking_off: false,
         forced_tool_thinking: false,
+        literal_content: true,
         clamp_max_tokens: false,
         emit_undeclared: true,
         supervisor: None,
@@ -214,6 +217,13 @@ fn parse_args() -> Result<Args, String> {
                     "1" => true,
                     "0" => false,
                     _ => return Err("--forced-tool-thinking: want 0 or 1".into()),
+                }
+            }
+            "--literal-content" => {
+                a.literal_content = match next(&mut i, &flag, inline)?.as_str() {
+                    "1" => true,
+                    "0" => false,
+                    _ => return Err("--literal-content: want 0 or 1".into()),
                 }
             }
             "--tool-repeat-guard" => {
@@ -349,6 +359,9 @@ async fn serve(args: Args) -> Result<(), String> {
     })
     .await
     .map_err(|e| e.to_string())??;
+    if !args.literal_content {
+        tok.without_literal_content(); // --literal-content 0: the stock whole-string encode, as before this release
+    }
     let dialect = args.dialect.unwrap_or_else(|| {
         dialect::Dialect::detect(&PathBuf::from(&args.model_dir), tok.tk.token_to_id("｜DSML｜").is_some())
     });

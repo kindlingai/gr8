@@ -79,10 +79,18 @@ pub fn strip(run: &str) -> Cow<'_, str> {
 }
 
 /// The added-token spellings of a tokenizer, in the order its added vocabulary matches them.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Spellings {
     /// longest first, so a spelling wins over the shorter ones it contains
     all: Vec<String>,
+    /// the bytes a spelling can start with: every other position in the text is skipped without a compare
+    first: [bool; 256],
+}
+
+impl Default for Spellings {
+    fn default() -> Spellings {
+        Spellings { all: Vec::new(), first: [false; 256] }
+    }
 }
 
 impl Spellings {
@@ -93,7 +101,11 @@ impl Spellings {
         all.sort_unstable();
         all.dedup();
         all.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-        Spellings { all }
+        let mut first = [false; 256];
+        for s in &all {
+            first[s.as_bytes()[0] as usize] = true;
+        }
+        Spellings { all, first }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -105,19 +117,25 @@ impl Spellings {
     }
 
     /// The spellings in `text` as `(offset, length)`, leftmost first, the longest at one offset, none overlapping an
-    /// earlier one: the matches an added vocabulary extracts.
+    /// earlier one: the matches an added vocabulary extracts. One pass, so a spelling that can overlap itself or
+    /// another one is still taken leftmost-longest (`match_indices` per spelling skips a self-overlap).
+    /// Only offsets a spelling's own first byte can sit at are compared, and a spelling is valid UTF-8 whose first
+    /// byte is never a continuation byte, so a match can only land on a character boundary.
     pub fn matches(&self, text: &str) -> Vec<(usize, usize)> {
-        let mut found: Vec<(usize, usize)> = Vec::new();
-        for s in &self.all {
-            found.extend(text.match_indices(s.as_str()).map(|(off, m)| (off, m.len())));
-        }
-        found.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-        let mut out: Vec<(usize, usize)> = Vec::with_capacity(found.len());
-        let mut end = 0;
-        for (off, len) in found {
-            if off >= end {
-                out.push((off, len));
-                end = off + len;
+        let text = text.as_bytes();
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let mut at = 0;
+        while at < text.len() {
+            if !self.first[text[at] as usize] {
+                at += 1;
+                continue;
+            }
+            match self.all.iter().find(|s| text[at..].starts_with(s.as_bytes())) {
+                Some(s) => {
+                    out.push((at, s.len()));
+                    at += s.len();
+                }
+                None => at += 1,
             }
         }
         out
@@ -373,6 +391,20 @@ mod tests {
         // at one offset the longest wins: `</think>` over nothing, `<think>` not inside `</think>`
         assert_eq!(s.matches("x</think>y<think>"), vec![(1, 8), (10, 7)]);
         assert_eq!(s.matches("nothing here"), vec![]);
+    }
+
+    /// A spelling that can overlap itself, or whose tail starts another spelling, is still taken leftmost-longest.
+    /// A per-spelling `match_indices` pass skips the second occurrence in `xababab` and misses `abab` at 3.
+    #[test]
+    fn a_spelling_that_overlaps_itself_is_still_found() {
+        let s = Spellings::new(["xa".to_string(), "abab".to_string()]);
+        assert_eq!(s.matches("xababab"), vec![(0, 2), (3, 4)]);
+        // and the longest still wins where both can start
+        let s = Spellings::new(["ab".to_string(), "abab".to_string()]);
+        assert_eq!(s.matches("ababab"), vec![(0, 4), (4, 2)]);
+        // a multi-byte spelling lands only on a character boundary
+        let s = Spellings::new(["\u{4f60}\u{597d}".to_string()]);
+        assert_eq!(s.matches("x\u{4f60}\u{597d}y"), vec![(1, 6)]);
     }
 
     #[test]

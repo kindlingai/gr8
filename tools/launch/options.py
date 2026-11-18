@@ -503,6 +503,8 @@ def validate(o):
             raise OptionError(f'--default-sequence-penalty {o.get("DEFAULT_SEQUENCE_PENALTY")}: {err}')
     if o.get('FORCED_TOOL_THINKING') not in ('0', '1'):
         raise OptionError(f'--forced-tool-thinking {o.get("FORCED_TOOL_THINKING")}: want 0 or 1')
+    if o.get('LITERAL_CONTENT') not in ('0', '1'):
+        raise OptionError(f'--literal-content {o.get("LITERAL_CONTENT")}: want 0 or 1')
     if o.get('TOOL_REPEAT_GUARD') not in ('0', '1'):
         raise OptionError(f'--tool-repeat-guard {o.get("TOOL_REPEAT_GUARD")}: want 0 or 1')
     if not (str(o.get('TOOL_REPEAT_GUARD_REPEATS')).isdigit() and int(o.get('TOOL_REPEAT_GUARD_REPEATS')) >= 1):

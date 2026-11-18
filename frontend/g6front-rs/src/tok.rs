@@ -437,11 +437,26 @@ impl Tok {
         if !crate::literal::declared(tok_cfg) {
             return Ok(None);
         }
-        let spellings =
-            crate::literal::Spellings::new(self.tk.get_added_tokens_decoder().into_values().map(|a| a.content));
+        let added: Vec<_> = self.tk.get_added_tokens_decoder().into_values().collect();
+        let spellings = crate::literal::Spellings::new(added.iter().map(|a| a.content.clone()));
         if spellings.is_empty() || self.adds_special() {
             log::warn!(
                 "literal content off: the tokenizer has no added token to protect, or its post-processing adds tokens"
+            );
+            return Ok(None);
+        }
+        // This encode emits the id of every added token the template wrote and BPEs everything else, so it only
+        // reproduces a vocabulary whose added tokens match as plain text: a one-character token is no spelling (it
+        // cannot be broken after its first character), and lstrip/rstrip/single_word/normalized change where the
+        // real matcher matches. A release with any of those keeps the stock encode.
+        if let Some(a) = added
+            .iter()
+            .find(|a| a.content.chars().count() < 2 || a.lstrip || a.rstrip || a.single_word || a.normalized)
+        {
+            log::warn!(
+                "literal content off: the added token {:?} is one character or carries lstrip/rstrip/single_word/\
+                 normalized, which this encode does not reproduce",
+                a.content
             );
             return Ok(None);
         }
@@ -464,6 +479,15 @@ impl Tok {
         Ok(Some(Lit { spellings, tk: lit, par_ok }))
     }
 
+    /// `--literal-content 0`: forget the rule this release declared and encode as the stock path does. The rollback
+    /// for the literal-content encode; the prompt ids of a request whose content holds a control-token spelling then
+    /// go back to what they were before it, and so do the prefix-cache keys for those prompts.
+    pub fn without_literal_content(&mut self) {
+        if self.literal.take().is_some() {
+            log::warn!("literal content off: --literal-content 0, a control-token spelling in content is a control");
+        }
+    }
+
     /// The spellings to protect before a chat template renders, when this release keeps them literal in content.
     pub fn literal_spellings(&self) -> Option<crate::literal::Spellings> {
         self.literal.as_ref().map(|l| l.spellings.clone())
@@ -480,10 +504,28 @@ impl Tok {
         l: &Lit,
         parallel: &mut bool,
     ) -> Result<(Vec<u32>, Vec<Checkpoint>), String> {
+        use rayon::prelude::*;
         let tail = &text[hit.byte_off..];
+        let controls = l.spellings.matches(tail);
+        // the runs the controls leave: one before each control, then the tail after the last
+        let mut runs: Vec<&str> = Vec::with_capacity(controls.len() + 1);
         let mut at = 0;
-        for (off, len) in l.spellings.matches(tail) {
-            self.push_run(&mut hit.ids, &tail[at..off], l, parallel)?;
+        for &(off, len) in &controls {
+            runs.push(&tail[at..off]);
+            at = off + len;
+        }
+        runs.push(&tail[at..]);
+        // Long text whose controls cut it into several runs encodes them at once, the way `encode_segments` does
+        // with its segments; a single long run still cuts itself into pieces inside `encode_run`.
+        let encoded: Vec<Vec<u32>> = if l.par_ok && tail.len() >= PAR_MIN_BYTES && runs.len() > 1 {
+            *parallel = true;
+            runs.par_iter().map(|r| self.encode_run(r, l, &mut false)).collect::<Result<_, _>>()?
+        } else {
+            runs.iter().map(|r| self.encode_run(r, l, parallel)).collect::<Result<_, _>>()?
+        };
+        for (i, run) in encoded.into_iter().enumerate() {
+            hit.ids.extend(run);
+            let Some(&(off, len)) = controls.get(i) else { break };
             let spelling = &tail[off..off + len];
             let id =
                 self.tk.token_to_id(spelling).ok_or_else(|| format!("no id for the control token {spelling:?}"))?;
@@ -491,26 +533,23 @@ impl Tok {
                 hit.checkpoints.push(((hit.byte_off + off) as u32, hit.ids.len() as u32, len as u16));
             }
             hit.ids.push(id);
-            at = off + len;
         }
-        self.push_run(&mut hit.ids, &tail[at..], l, parallel)?;
         debug_assert!(hit.checkpoints.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].1));
         Ok((hit.ids, hit.checkpoints))
     }
 
     /// One run between two controls: the marks out, then BPE with no added tokens, in parallel cuts when it is long.
-    fn push_run(&self, ids: &mut Vec<u32>, run: &str, l: &Lit, parallel: &mut bool) -> Result<(), String> {
+    fn encode_run(&self, run: &str, l: &Lit, parallel: &mut bool) -> Result<Vec<u32>, String> {
         let run = crate::literal::strip(run);
         if run.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if l.par_ok && run.len() >= PAR_MIN_BYTES {
             *parallel = true;
-            ids.extend_from_slice(&encode_pieces(l.tk, &run, PAR_PIECE_BYTES)?);
+            encode_pieces(l.tk, &run, PAR_PIECE_BYTES)
         } else {
-            ids.extend_from_slice(&encode_one(l.tk, &run, false)?);
+            encode_one(l.tk, &run, false)
         }
-        Ok(())
     }
 
     /// Encode after a reused checkpoint, including its delimiter; offsets always come from UTF-8 string matches,
