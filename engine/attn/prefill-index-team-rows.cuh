@@ -54,12 +54,14 @@ extern "C" int g6a_bind_prefill_index_rows(G6AttnPrefill* p,G6AttnBinding* b,
     for(int start=0;start<a.rows;start+=p->R){int n=std::min(p->R,a.rows-start);
         ga::prep_index<<<dim3(n,32),128,0,st>>>(a,start,w.iq,w.weights);
 #if defined(PF_ISGRT) && PF_ISGRT
-        gp::launch_index_scores_rg(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii,st);
+        const bool clean=gp::isg_clean(a);
+        if(clean){auto e=gp::launch_index_scores_rg_clean(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.histogram,st);if(e!=cudaSuccess)return int(e);}
+        else gp::launch_index_scores_rg(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii,st);
 #else
-        gp::index_scores_grouped<<<dim3((a.context+63)/64,(n+3)/4),256,0,st>>>(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii);
+        const bool clean=false;gp::index_scores_grouped<<<dim3((a.context+63)/64,(n+3)/4),256,0,st>>>(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii);
 #endif
         if(out_scores){auto e=cudaMemcpyAsync(out_scores+(int64_t)start*a.context,w.si,(size_t)n*a.context*4,cudaMemcpyDeviceToDevice,st);if(e!=cudaSuccess)return int(e);}
-        auto e=gp::select_prefill(a,w,start,n,st);if(e!=cudaSuccess)return int(e);
+        auto e=gp::select_prefill(a,w,start,n,st,clean);if(e!=cudaSuccess)return int(e);
     }
     return int(cudaGetLastError());
 }
