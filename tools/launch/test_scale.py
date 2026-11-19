@@ -65,7 +65,7 @@ class Scale(unittest.TestCase):
                 '--ips', ips(n, 1), '--ips2', ips(n, 2), '--model', self.rel, '--work-dir', self.homes[i],
                 '--control-port', str(self.port), '--port', str(self.api), '--py', sys.executable,
                 '--front-bin', os.path.join(HERE, 'stubs', 'front'), '--join-timeout', '60', '--ready-tmo', '60',
-                *self.extra]
+                '--variant', 'bit260', *self.extra]   # bit260: the TP=4 default bit325 does not fit TP=3 (scale_fit)
 
     def gr8(self, i, cmd, *extra, timeout=120):
         args = extra if cmd in ('up', 'scale') else ['--work-dir', self.homes[i], *extra]
@@ -254,6 +254,68 @@ class Scale(unittest.TestCase):
         self.assertIn('this box leaves', log3)
         self.assertIn('served to the new ranks' if peer else 'kvman-peer: the new ranks start', log3)
         self.assertEqual(sorted(os.listdir(os.path.join(self.homes[3], 'store', 'r3'))), ['index'])
+
+
+GLM = {'GR8_MODEL': 'glm53'}
+
+
+class ScalePlan(unittest.TestCase):
+    """What scale_begin checks and pins before a scale starts (supervisor.py scale_pins, scale_fit, on_rpc)."""
+
+    def boot(self, n, *extra):
+        return sv.opt.parse(['--no-config', '--tp', str(n), '--peers', ','.join(LAN[:n]), *extra], GLM)
+
+    def rescale(self, o, n, variant):
+        return sv.opt.parse(sv.scale_argv(o.argv) + ['--tp', str(n), '--peers', ','.join(LAN[:n])] +
+                            sv.scale_pins(o, variant, {}), GLM)
+
+    def test_the_kv_format_of_a_tp_default_is_kept(self):
+        """GLM-5.3 TP=4 resolves int4 KV by default (models.py tp_defaults), TP=3 fp8: the scale keeps int4 both ways,
+        so the engine and its KV row do not change and the store carries."""
+        v = sv.modelset.Variant('bit260')
+        o4 = self.boot(4, '--variant', 'bit260')
+        self.assertEqual((o4.get('KV_FORMAT'), sv.engine_bin(o4)), ('int4', 'g6m4-int4'))
+        o3 = self.rescale(o4, 3, v)
+        sv.opt.validate(o3)
+        self.assertEqual((o3.get('KV_FORMAT'), sv.engine_bin(o3)), ('int4', 'g6m4-int4'))
+        back = self.rescale(o3, 4, v)
+        self.assertEqual((back.get('KV_FORMAT'), sv.engine_bin(back)), ('int4', 'g6m4-int4'))
+        o4 = self.rescale(self.boot(3), 4, v)   # an fp8 TP=3 boot stays fp8 at TP=4, where the default is int4
+        self.assertEqual((o4.get('KV_FORMAT'), sv.engine_bin(o4)), ('fp8', 'g6m4'))
+
+    def test_a_variant_that_does_not_fit_the_new_width_is_refused(self):
+        V = sv.modelset.Variant
+        why = sv.scale_fit(sv.models.GLM53, V('bit325'), '3')
+        self.assertIn('--variant bit325 does not fit a rank at TP=3', why)
+        self.assertIn('--variant bit260', why)
+        self.assertEqual(sv.scale_fit(sv.models.GLM53, V('bit260'), '3'), '')
+        self.assertEqual(sv.scale_fit(sv.models.GLM53, V('bit260'), '4'), '')
+        self.assertEqual(sv.scale_fit(sv.models.GLM53F, V('k2'), '1'), '')
+        self.assertEqual(sv.scale_fit(sv.models.GLM53F, V('k2'), '2'), '')
+        self.assertIn('--variant k2', sv.scale_fit(sv.models.GLM53F, V('k4'), '1'))
+        t = tempfile.mkdtemp(prefix='gr8fit-')
+        self.addCleanup(shutil.rmtree, t, True)
+        for name, w in (('bit260', 3), ('bit225', 2), ('mine', 4)):   # a manifest path: sized against the defaults
+            manifest(os.path.join(t, f'exlr8-manifest-{name}.json'), name, w)
+        path = lambda n: os.path.join(t, f'exlr8-manifest-{n}.json')   # noqa: E731
+        self.assertIn('GB of experts', sv.scale_fit(sv.models.GLM53, V('mine', path('mine')), '3'))
+        self.assertEqual(sv.scale_fit(sv.models.GLM53, V('b', path('bit225')), '3'), '')
+
+    def test_after_a_scale_another_member_list_is_refused_not_retried(self):
+        """A box that hellos with another member list waits (retry) only while a scale runs; after it, the handshake
+        refuses it, so a box with restart: on-failure does not loop."""
+        class Head:
+            def rpc(self, m, peer):
+                return {'t': 'refused', 'field': 'members', 'values': {}, 'exit': 4, 'detail': 'member list'}
+        sup = sv.Supervisor.__new__(sv.Supervisor)
+        sup.allowed = lambda peer: True
+        sup.boot_attempt, sup.rank, sup.members, sup.head, sup.state = 0, 0, LAN[:3], Head(), 'serving'
+        sup.head_ready, sup.stop_ev = threading.Event(), threading.Event()
+        sup.head_ready.set()
+        hello = {'t': 'hello', 'members': LAN[:4], 'attempt': 0}
+        for phase, want in (('switch', 'retry'), ('done', 'refused'), ('failed', 'refused')):
+            sup.scale = {'phase': phase, 'members': LAN[:3], 'old_members': LAN[:4], 'msg': None, 'ready': {}}
+            self.assertEqual(sup.on_rpc(dict(hello), LAN[3])['t'], want, phase)
 
 
 class StorePrep(unittest.TestCase):

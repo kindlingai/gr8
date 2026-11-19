@@ -429,8 +429,10 @@ class Supervisor:
             if self.rank not in (0, None):
                 return {'t': 'refused', 'field': 'rank', 'values': {}, 'exit': 4,
                         'detail': f'{self.lan} is rank {self.rank}, not the head'}
-            if t == 'hello' and self.scale and m.get('members') != self.members:
-                # a hello for another member list while a scale runs: a box that joins it, or a late one
+            if t == 'hello' and self.scale and self.scale['phase'] in ('prepare', 'drain', 'switch') and \
+                    m.get('members') != self.members:
+                # a hello for another member list while a scale runs: a box that joins it, or a late one. After the
+                # scale (done or failed) such a box gets the handshake's refusal, so a restart policy does not loop
                 s = self.scale
                 if s['phase'] in ('prepare', 'drain') and m.get('members') == s['members'] and \
                         peer not in s['old_members'] and s.get('msg'):
@@ -1413,13 +1415,7 @@ class Supervisor:
         if why:
             return {'t': 'error', 'error': why}
         words = [str(w) for w in m.get('argv') or []]
-        pins = ['--variant', self.o.get('VARIANT') or self.variant.name] if self.variant else []
-        knobs = self.tmpl['knobs']
-        if knobs.get('SHARE_LIMIT'):
-            pins += ['--share-limit', knobs['SHARE_LIMIT']]
-        if knobs.get('REUSE_GRID') not in (None, '', '0'):
-            pins += ['--reuse-grid', knobs['REUSE_GRID']]
-        delta = scale_argv(self.scale_words) + words + pins
+        delta = scale_argv(self.scale_words) + words + scale_pins(self.o, self.variant, self.tmpl['knobs'])
         try:
             o = opt.parse(scale_argv(self.o.argv) + delta)
             opt.validate(o)
@@ -1429,13 +1425,19 @@ class Supervisor:
         tp = o.get('TP')
         why = ('scale needs --peers, the new member list' if opt.mode(o) != 'peers' else
                f'TP={tp}: ./gr8 {model.name} serves TP {model.tp_sizes}' if tp not in model.tp else
-               f'the head {self.lan} stays the first member: --peers {self.lan},...' if members[0] != self.lan else '')
+               f'the head {self.lan} stays the first member: --peers {self.lan},...' if members[0] != self.lan else
+               scale_fit(model, self.variant, tp))
         if why:
             return {'t': 'error', 'error': why}
+        try:   # the hold covers a boot of the new width and, when it fails, one of the old (READY_TMO each)
+            ready = max(float(opt.engine_plan(o)['knobs'].get('READY_TMO') or 0),
+                        float(self.tmpl['knobs'].get('READY_TMO') or 0))
+        except (OSError, RuntimeError, ValueError, opt.OptionError):
+            ready = 0.0
         self.scale_n += 1
         s = {'id': f'{self.hs["epoch"]}.{self.scale_n}', 'members': members, 'old_members': list(self.members),
              'argv': delta, 'phase': 'prepare', 'error': '', 'ready': {}, 'msg': None, 'token': secrets.token_hex(16),
-             'drain': float(m.get('drain_timeout') or 300)}
+             'drain': float(m.get('drain_timeout') or 300), 'boot_s': max(900.0, ready + 120)}
         self.scale_seen |= set(members) | set(self.members)
         self.scale = s
         log(f'scale {s["id"]}: TP={self.o.get("TP")} {",".join(self.members)} -> TP={tp} {",".join(members)}')
@@ -1477,7 +1479,7 @@ class Supervisor:
             if bad:
                 raise RuntimeError('; '.join(bad))
             s['phase'] = 'drain'
-            self.front_hold(s['drain'] + 900)
+            self.front_hold(s['drain'] + s['boot_s'])
             s['held'] = time.time()
             log(f'scale {s["id"]}: every box is ready; new requests wait, the running ones finish (up to {s["drain"]:.0f}s)')
             while (h := self.front_hold())['running']:
@@ -1636,11 +1638,20 @@ class Supervisor:
             self.start_peer(p['dir'], os.path.join(self.out, 'scale', 'token'))
         if p['leaves']:
             log(f'scale {p["id"]}: this box leaves; its KV store serves the new ranks until the scale is done')
+            wait = opt_timeout(self.o) + float(self.tmpl['knobs'].get('READY_TMO') or 1800)
+            end = time.monotonic() + wait
             while not self.scale_done.wait(0.5):
                 if self.scale_abort.is_set():
                     return self.rollback()
                 if self.stop_ev.is_set():
                     raise Stop(1 if self.stop_failed else 0, self.stop_why)
+                if time.monotonic() > end:   # the head is gone, or its scale_done never came
+                    self.stop_peer()
+                    if p.get('dir'):
+                        store_undo(p['store'], p['old_rank'], p['rank'], models.of(self.o).checkpoint_cache)
+                    self.pending = None
+                    raise Stop(1, f'scale {p["id"]}: no word from the head within {wait:.0f}s (JOIN_TIMEOUT + '
+                                  'READY_TMO); this box stops')
             self.stop_peer()
             if p.get('dir'):
                 store_undo(p['store'], p['old_rank'], p['rank'], models.of(self.o).checkpoint_cache)
@@ -1696,6 +1707,11 @@ class Supervisor:
             switched = s['phase'] == 'switch'
             s['phase'], s['error'] = 'failed', why
         log(f'scale {s["id"]}: failed: {why}; ' + ('the old member list boots again' if switched else 'nothing changed'))
+        if switched and s.get('held'):   # the old member list's boot: the hold lasts it out
+            try:
+                self.front_hold(s.get('boot_s', 900))
+            except OSError as e:
+                log(f'scale {s["id"]}: the front end did not take the longer hold: {e}')
         if not switched:
             s['closed'] = True
             if s.get('held'):
@@ -1716,12 +1732,23 @@ class Supervisor:
             s['phase'] = 'done'
             self.scale_words = s['argv']
             for a in sorted((set(s['old_members']) | set(s['members'])) - {self.lan}):
-                self.call(a, {'t': 'scale_done', 'id': s['id']})
+                threading.Thread(target=self.send_done, args=(a, s['id']), daemon=True).start()
             self.finish_scale()
             log(f'scale {s["id"]}: done: TP={self.o.get("TP")} {",".join(self.members)} serves; requests waited '
                 f'{s["pause_s"]}s (drain {s.get("drain_s")}s)')
         else:
             log(f'scale {s["id"]}: the old member list serves again; requests waited {s["pause_s"]}s')
+
+    def send_done(self, a, sid, tries=5):
+        """scale_done to box a, again until it answers: a box that misses it keeps its old store and kvman-peer (and a
+        box that leaves would wait for it until its deadline)."""
+        for i in range(tries):
+            r = self.call(a, {'t': 'scale_done', 'id': sid})
+            if r and r.get('t') == 'ok':
+                return True
+            time.sleep(1 + i)
+        log(f'scale {sid}: {a} did not take scale_done after {tries} tries')
+        return False
 
     def release_hold(self, s):
         try:
@@ -1752,14 +1779,32 @@ class Supervisor:
 
     def start_peer(self, d, token):
         """bin/kvman-peer serves this box's KV store folder to the new ranks, on CONTROL_PORT + 3."""
+        self.stop_peer()   # one from a scale whose scale_done never came holds the port
         b = os.path.join(self.home, 'bin', 'kvman-peer')
         if not os.access(b, os.X_OK):
-            log(f'scale: no {b}: the new ranks start their KV stores empty')
+            log(f'scale: warning: no {b}: the new ranks start their KV stores empty (the stored sessions prefill again)')
             return
         listen = f'{self.lan}:{self.port + 3}'
-        with open(os.path.join(self.out, 'kvman-peer.log'), 'ab') as lf:
+        path = os.path.join(self.out, 'kvman-peer.log')
+        start = os.path.getsize(path) if os.path.exists(path) else 0
+        with open(path, 'ab') as lf:
             self.peer_proc = subprocess.Popen([b, '--dir', d, '--listen', listen, '--token-file', token], stdout=lf,
                                               stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+        end = time.monotonic() + 5
+        while time.monotonic() < end and self.peer_proc.poll() is None:   # serving, or exited (a port in use)
+            with open(path, 'rb') as f:
+                f.seek(start)
+                if b'serving' in f.read():
+                    break
+            time.sleep(0.05)
+        if self.peer_proc.poll() is not None:
+            with open(path, 'rb') as f:
+                f.seek(start)
+                why = f.read().decode(errors='replace').strip().splitlines()[-1:] or ['no output']
+            log(f'scale: warning: kvman-peer exited ({exit_status(self.peer_proc.returncode)}: {why[0]}): the new ranks '
+                'start their KV stores empty (the stored sessions prefill again)')
+            self.peer_proc = None
+            return
         log(f'scale: {d} served to the new ranks on {listen} (kvman-peer pid {self.peer_proc.pid})')
 
     def stop_peer(self):
@@ -2048,6 +2093,51 @@ def scale_argv(argv):
             out.append(a)
         i += 1
     return out
+
+
+def scale_pins(o, variant, knobs):
+    """What a scale keeps from the running boot: the variant, the KV format (a TP default such as GLM-5.3's int4 at TP=4
+    would otherwise resolve again at the new width, and another format is another engine and KV row, so the store would
+    not carry), SHARE_LIMIT and REUSE_GRID (the store's R and grid)."""
+    pins = ['--variant', o.get('VARIANT') or variant.name] if variant else []
+    pins += ['--kv-format', o.get('KV_FORMAT') or 'fp8']
+    if knobs.get('SHARE_LIMIT'):
+        pins += ['--share-limit', knobs['SHARE_LIMIT']]
+    if knobs.get('REUSE_GRID') not in (None, '', '0'):
+        pins += ['--reuse-grid', knobs['REUSE_GRID']]
+    return pins
+
+
+def scale_fit(model, variant, tp):
+    """'' when the running variant fits a rank at TP=tp, else why: it must be no larger than the TP's default variants
+    (models.py default_variant), by bits for a named variant and, for a manifest path, by the experts on the busiest
+    rank against the defaults' manifests beside it (none found: not checked)."""
+    defaults = model.default_variant.get(int(tp), ())
+    if not variant or not defaults or variant.name == 'home':
+        return ''
+    if variant.name in model.variants:
+        top = max(model.variants[d] for d in defaults)
+        if model.variants[variant.name] <= top:
+            return ''
+        size = f'{model.variants[variant.name]} bits, over the {top} of the TP={tp} default'
+    else:
+        if not variant.path:
+            return ''
+        d = os.path.dirname(variant.path)
+        found = [p for n in defaults for p in (os.path.join(d, f'exlr8-manifest-{n}.json'),
+                                               os.path.join(d, 'manifests', f'exlr8-manifest-{n}.json'))
+                 if os.path.isfile(p)]
+        if not found:
+            return ''
+        try:
+            have, top = modelset.expert_gb(variant.path, int(tp)), max(modelset.expert_gb(p, int(tp)) for p in found)
+        except (OSError, ValueError, KeyError) as e:
+            return f'--variant {variant.name}: cannot size it at TP={tp}: {e}'
+        if have <= top + 0.05:
+            return ''
+        size = f'{have:.1f} GB of experts on the busiest rank, over the {top:.1f} GB of the TP={tp} default'
+    return (f'--variant {variant.name} does not fit a rank at TP={tp} ({size}): boot the cluster with --variant '
+            f'{defaults[0]} (or one no larger) before it scales to TP={tp}')
 
 
 def scale_store(o):
