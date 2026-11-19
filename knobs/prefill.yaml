@@ -64,6 +64,15 @@ knobs:
     doc: >-
       Sets the context up to which prefill attention takes the dense path. Past it the sparse, indexer-selected path
       runs. 0 means always sparse.
+  GR8_PF_DENSE_OPT:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      1 enables the bit-exact prefill dense GEMM fast path (`pf_dense_opt.cuh`): <=128-reg MXFP8/dtr-copy GEMM with
+      uint32 paired scale loads, constant-127 scale elision on dtr::make_fp8 weights, branchless full-tile loads, and
+      unguarded grouped-raster trellis o_proj (`k_gemm_tr16_clean`). Same bits as stock.
   GR8_PF_DRAFT_SHARE:
     scope: agree
     kind: int

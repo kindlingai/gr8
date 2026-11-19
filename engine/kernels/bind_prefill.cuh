@@ -417,6 +417,7 @@ struct Gemm
     long long tsB = 0, tsG = 0;
     int rgrp = 0;                     // k_gemm_mx8f full-M launches: > 1 = grouped raster of rgrp row blocks (PF_GEMMRF;
                                       // launch sets it from GR8_PF_GEMMG when 0). Launch order only: the same bits.
+    uint8_t const_s = 0, const_s2 = 0; // 1 = weights come from dtr::make_fp8 (all scales == 127; GR8_PF_DENSE_OPT)
 #if G6_MODEL_FLASH
     int h16 = 0;                      // 1: k_gemm_tr_h16 (fp16 m16n8k16 on shx_store_h16 A-fragments + Tr3Lane<4, true> B)
 #endif
@@ -1673,6 +1674,7 @@ inline Gemm with_rgrp(const Gemm& g)
     if (!r.rgrp) r.rgrp = static_cast<int>(knob::pf_gemmg());
     return r;
 }
+#include "pf_dense_opt.cuh"
 inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = RsOut())
 {
     if (!g.on) return;
@@ -1706,6 +1708,7 @@ inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = R
     static int nsm = 0;
     if (!nsm) { int d = 0; cudaGetDevice(&d); cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, d); }
     const bool big = mode == 2 || (mode != 3 && NB * ((RB + 7) / 8) >= 2 * nsm);
+    if (mode == 0 && knob::pf_dense_opt() && pf_dense_opt::try_launch(g, rs, big, nsm, st)) return;
     if (g.tw)                         // dense trellis tiles (k_gemm_tr): never paired, fp16 / BF16 out
     {
 #if G6_MODEL_FLASH
@@ -1770,7 +1773,7 @@ inline void launch_pair(const Gemm& a, const Gemm& b, cudaStream_t st, int mode)
         return;
     }
     Gemm p = a;
-    p.w2 = b.w; p.ws2 = b.ws; p.N2 = b.N; p.y2 = b.y; p.ldy2 = b.ldy; p.bf162 = b.bf16; p.osvh2 = b.osvh;
+    p.w2 = b.w; p.ws2 = b.ws; p.N2 = b.N; p.y2 = b.y; p.ldy2 = b.ldy; p.bf162 = b.bf16; p.osvh2 = b.osvh; p.const_s2 = b.const_s;
     p.x8_2 = b.x8 != a.x8 ? b.x8 : nullptr;
     launch(b.pre, st);
     launch(p, st, mode);
@@ -5857,6 +5860,7 @@ inline const char* dense_trellis(const Tensors& T, int M, const Scratch& sc, con
 #endif
         L.q_b.x8 = sc.x8_up;
         L.q_b.osvh = T.tsvh[0];
+        if (!L.q_b.tw) L.q_b.const_s = 1;
     }
     if (T.tsuh[1] && L.o_proj.on)
     {
@@ -5866,15 +5870,16 @@ inline const char* dense_trellis(const Tensors& T, int M, const Scratch& sc, con
         L.xq_attn.h16 = L.o_proj.h16;
 #endif
         L.o_proj.osvh = T.tsvh[1];
+        if (!L.o_proj.tw) L.o_proj.const_s = 1;
     }
 #if G6_MODEL_FLASH
     if (T.kda_suh[0] || T.kda_suh[1] || T.kda_suh[2])
     {
         for (int i = 0; i < 3; ++i)
             if (!T.kda_suh[i] || !T.kda_svh[i]) return "Flash KDA trellis matrix without its suh / svh";
-        if (L.kda_q.on) { L.xq_x.suh = T.kda_suh[0]; L.xq_x.h16 = L.kda_q.h16; L.kda_q.osvh = T.kda_svh[0]; }
-        if (L.kda_k.on) { L.kda_k.osvh = T.kda_svh[1]; }
-        if (L.kda_v.on) { L.kda_v.osvh = T.kda_svh[2]; }
+        if (L.kda_q.on) { L.xq_x.suh = T.kda_suh[0]; L.xq_x.h16 = L.kda_q.h16; L.kda_q.osvh = T.kda_svh[0]; if (!L.kda_q.tw) L.kda_q.const_s = 1; }
+        if (L.kda_k.on) { L.kda_k.osvh = T.kda_svh[1]; if (!L.kda_k.tw) L.kda_k.const_s = 1; }
+        if (L.kda_v.on) { L.kda_v.osvh = T.kda_svh[2]; if (!L.kda_v.tw) L.kda_v.const_s = 1; }
     }
 #endif
     if (T.tsuh[2] || T.tsuh[3] || T.tsuh[4])
@@ -5913,6 +5918,9 @@ inline const char* dense_trellis(const Tensors& T, int M, const Scratch& sc, con
 #endif
         L.xq_act.on = 0;
         L.down.osvh = T.tsvh[4];
+        if (!L.gate.tw) L.gate.const_s = 1;
+        if (!L.up.tw) L.up.const_s = 1;
+        if (!L.down.tw) L.down.const_s = 1;
     }
     return nullptr;
 }
