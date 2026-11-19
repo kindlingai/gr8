@@ -76,6 +76,19 @@ public:
     // prefix reuse on, with these rules (PrefixReuse strict / noend / grid)
     void keep(const g6rt::PrefixReuse& rules) { g6kv_keep(p_, rules.strict, rules.noend, rules.grid); }
     bool keeping() const { return g6kv_keeping(p_); }
+    // GR8_KV_SHARE_PAGES (before any reservation): live and retained runs share the full pages of a common prefix, and
+    // a hit inside a page queues a copy of its rows below the hit (copies()), run before anything writes the copy
+    void share_pages(bool on) { check(g6kv_share_pages(p_, on)); }
+    bool sharing() const { return g6kv_sharing(p_); }
+    void prefilled(const Run& r, uint32_t rows) { const g6kv_run x = c(r); check(g6kv_prefilled(p_, &x, rows)); }
+    size_t copies_pending() const { return g6kv_copies_pending(p_); }
+    // the queued copies in order (empty with sharing off)
+    std::vector<g6kv_copy> copies() {
+        std::vector<g6kv_copy> v(g6kv_copies_pending(p_)); size_t n = 0;
+        check(g6kv_copies_take(p_, v.data(), v.size(), &n));
+        require(n == v.size(), "pool copies");
+        return v;
+    }
     // a retiring session's run: retained with its finished reuse state (st.valid rows), or released when nothing is valid
     void retain(const Run& r, const g6rt::PrefixReuse& st) { retain(r, st, st.cache_namespace); }
     void retain(const Run& r, const g6rt::PrefixReuse& st, const g6rt::CacheNamespace& ns) {

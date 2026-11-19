@@ -105,6 +105,11 @@ impl Rank {
             }
         }
         self.pool.io_done().unwrap();
+        // GR8_KV_SHARE_PAGES: the copy-on-write copies, after the tier copies (g6m4 on_bind: kv_drain, then s2_copy_rows)
+        for c in self.pool.take_copies() {
+            let src = self.dev[c.from as usize];
+            self.dev[c.to as usize][..c.rows as usize].copy_from_slice(&src[..c.rows as usize]);
+        }
         io
     }
     fn write(&mut self, list: &[u32], from: usize, tokens: &[i32]) {
@@ -813,6 +818,12 @@ impl CpRank {
             }
         }
         self.pool.io_done().unwrap();
+        // GR8_KV_SHARE_PAGES: the copy-on-write copies, after the tier copies (both caches of the page)
+        for c in self.pool.take_copies() {
+            let (a, i) = (self.attn[c.from as usize].clone(), self.idx[c.from as usize].clone());
+            self.attn[c.to as usize][..c.rows as usize].copy_from_slice(&a[..c.rows as usize]);
+            self.idx[c.to as usize][..c.rows as usize].copy_from_slice(&i[..c.rows as usize]);
+        }
         io
     }
 }

@@ -88,6 +88,11 @@ impl Rank {
             }
         }
         self.pool.io_done().unwrap();
+        // GR8_KV_SHARE_PAGES: the copy-on-write copies, after the tier copies (g6m4 on_bind: kv_drain, then s2_copy_rows)
+        for c in self.pool.take_copies() {
+            let src = self.dev[c.from as usize];
+            self.dev[c.to as usize][..c.rows as usize].copy_from_slice(&src[..c.rows as usize]);
+        }
         io
     }
     // the prefill and decode of rows [from, tokens.len()), computed by turn `stamp`

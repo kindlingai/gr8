@@ -20,6 +20,7 @@ mod metrics;
 mod parser;
 mod pyjson;
 mod sampling;
+mod sessions;
 mod template;
 mod thinking;
 mod tok;
@@ -85,6 +86,7 @@ pub struct State {
     pub started: u64,
     /// HOST:PORT of the head's supervisor, which runs the cluster's self-checks for /health?deep
     pub supervisor: Option<String>,
+    pub sessions: Option<sessions::Sessions>,
 }
 
 struct Args {
@@ -116,6 +118,7 @@ struct Args {
     boost: Option<sampling::BoostSpec>,
     sequence: Option<sampling::SeqSpec>,
     guard: guard::Config,
+    session_idle_seconds: u64,
 }
 
 const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--host H] [--port N]
@@ -124,6 +127,7 @@ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--h
                   [--enable-prompt-tokens-details] [--log-level LEVEL]
                   [--workers N] [--encode-threads N] [--default-max-tokens N]
                   [--share-tokens N] [--max-connections N]
+                  [--session-idle-seconds N]
                   [--default-reasoning-effort none|minimal|low|medium|high|xhigh|max (ds41: or an integer 1-100;
                    inkling: or a number 0.0-0.99)]
                   [--default-thinking-budget N, Fx or N|Fx] [--allow-thinking-off] [--clamp-max-tokens]
@@ -163,6 +167,7 @@ fn parse_args() -> Result<Args, String> {
         boost: None,
         sequence: None,
         guard: guard::Config::default(),
+        session_idle_seconds: 3600,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -201,6 +206,13 @@ fn parse_args() -> Result<Args, String> {
             "--max-connections" => {
                 a.max_connections =
                     next(&mut i, &flag, inline)?.parse().map_err(|_| "--max-connections: not a number")?
+            }
+            "--session-idle-seconds" => {
+                a.session_idle_seconds =
+                    next(&mut i, &flag, inline)?.parse().map_err(|_| "--session-idle-seconds: not a number")?;
+                if a.session_idle_seconds == 0 {
+                    return Err("--session-idle-seconds: want 1 or more".into());
+                }
             }
             "--default-reasoning-effort" => {
                 a.default_effort = Some(next(&mut i, &flag, inline)?) // checked once the dialect is known
@@ -481,6 +493,7 @@ async fn serve(args: Args) -> Result<(), String> {
     }
     let engine = engine::Engine::new(args.engine_sock.clone());
     let grammars = grammar::Grammars::load(&PathBuf::from(&args.model_dir), tok.vocab_size)?;
+    let sessions_on = gr8knobs::SESSIONS.get();
     let st: &'static State = Box::leak(Box::new(State {
         tok,
         template,
@@ -508,6 +521,7 @@ async fn serve(args: Args) -> Result<(), String> {
         sequence: args.sequence,
         started: util::now_secs(),
         supervisor: args.supervisor,
+        sessions: sessions_on.then(|| sessions::Sessions::new(std::time::Duration::from_secs(args.session_idle_seconds))),
     }));
     engine.start();
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)

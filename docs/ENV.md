@@ -256,6 +256,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_KV4_SC_TR` | int | `2` | 0\|1\|2 | With GR8_KV4_SC, selects the warp reduction: 0 = per-head warp_sum, 1 = transpose reduction, 2 = eager transpose butterfly. Same bits, G6_KV4 only. |
 | `GR8_KV4_TC` | flag | `0` | 0..1 | Use sixteen-head tensor-core INT4 decode scores and context. 0 selects the non-TC INT4 decode path (GR8_KV4_SC / GR8_KV4_CTX when set, else scalar reference). |
 | `GR8_KVB` | text | `bf16` | bf16\|fp8 | fp8 loads every layer's kv_b (UK / UV) as the release's block FP8 bytes and scales instead of BF16, with the same output bytes. Needs --v2-dense. |
+| `GR8_KV_SHARE_PAGES` | flag | `0` | 0\|1 | With --reuse-prefix under S2, sessions below R share the KV pages of a common prompt prefix: a live session's prefilled prompt pages and a retained run's pages are counted per holder, and a hit that ends inside a page copies only that page's rows below the hit. A shared hit keeps the retained run and skips no rows to the reuse grid. 0 is stock. |
 | `GR8_MHC_BF16` | int | `0` | 0\|1\|2 | Quality test: rounds mHC residual stream writes to BF16, 1 = after both blocks, 2 = only after the MLP block. |
 | `GR8_MOE_TOPK` | int | `8` | 1..8 | Keeps only this many routed experts per token and renormalizes their weights. A model change for screens. |
 | `GR8_MTP_KSTOP` | int | 2 with --serve, DFlash2 and --mtp 2+, else 0 | 0\|1\|2 | A solo session's MTP rounds verify only the drafts the MTP head is confident in: 1 by the GR8_MTP_KSTOP_TAU thresholds, 2 by the drafter choice's MTP estimates. |
@@ -472,6 +473,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
 | `GR8_S2_TIMELINE` | int | `0` |  | S2: every N main steps each rank prints, per decode step kind, the mean GPU span, host input prep, launch call and fence wait. Measurement only. |
 | `GR8_S2_TIMEOUT` | int | `120` | 1..86400 | S2: seconds the bootstrap waits on the control links before a rank gives up. |
 | `GR8_S2_TRACE` | path | off |  | S2: writes a Chrome trace (chrome://tracing, ui.perfetto.dev) of this rank to PATH.r<rank>.json: a span per prefill quantum, prompt tail and decode step, and on the head each request's arrival, wait, admission, first token and finish, in wall-clock microseconds. tools/trace/merge.py joins the ranks and a client's request times. Host clock only. |
+| `GR8_SESSIONS` | flag | `0` | 0\|1 | Enable logical conversation handles and fork routes in the HTTP front end. 0 leaves existing routes and responses unchanged. |
 | `GR8_STEP_TMR` | flag | `0` |  | S2: prints a '# step_tmr' line per decode step with its launch and fence time in us, its graph key, rows and context. |
 | `GR8_TEST_ZERO_DELAY_MS` | int | `0` |  | A test of the zeroing order: every dmalloc zeroing waits behind an N ms kernel on the legacy stream, so a write to new memory not ordered after it loses every time. |
 | `TMPDIR` | path | `/tmp` |  | Where the loader writes its planned rank manifests. |

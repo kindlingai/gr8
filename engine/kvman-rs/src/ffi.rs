@@ -2,7 +2,7 @@
 //! unchanged. Release builds abort on a panic, so none unwinds into C++. Each call on a pool locks it for that call
 //! only, so two threads may call at once. A call never calls out to C++ while it holds the lock.
 
-use crate::pool::{Error, Namespace, Pool, Run, Stats, NAMESPACE_BYTES, STOCK_NAMESPACE};
+use crate::pool::{Error, Namespace, PageCopy, Pool, Run, Stats, NAMESPACE_BYTES, STOCK_NAMESPACE};
 use crate::reuse::{Finished, Rules};
 use crate::stash::{Io, Keep, Part, Policy, TierStats};
 use std::ffi::c_char;
@@ -227,6 +227,64 @@ pub unsafe extern "C" fn g6kv_list(
 #[no_mangle]
 pub unsafe extern "C" fn g6kv_keep(p: *mut Handle, strict: i32, noend: i32, grid: i32) {
     (*p).lock().keep(Rules { strict: strict != 0, noend: noend != 0, grid });
+}
+
+/// GR8_KV_SHARE_PAGES: shared prompt pages on (1) or off (0). Only before any reservation (BadArgument otherwise).
+///
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_share_pages(p: *mut Handle, on: i32) -> i32 {
+    code((*p).lock().share_pages(on != 0))
+}
+
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_sharing(p: *const Handle) -> i32 {
+    (*p).lock().sharing() as i32
+}
+
+/// Live run r's prefill has written rows [0, rows). No-op with sharing off.
+///
+/// # Safety
+/// As g6kv_exclusive, and `r` must be valid for a read.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_prefilled(p: *mut Handle, r: *const Run, rows: u32) -> i32 {
+    if r.is_null() {
+        return Error::BadArgument.code();
+    }
+    code((*p).lock().prefilled(&*r, rows))
+}
+
+/// # Safety
+/// As g6kv_exclusive.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_copies_pending(p: *const Handle) -> usize {
+    (*p).lock().copies_pending()
+}
+
+/// The queued page copies, in order, into `out` (cap of them); `*n` = how many were queued. They are taken only when
+/// all fit (cap >= the pending count), else nothing is taken and the call returns BadArgument with `*n` set.
+///
+/// # Safety
+/// As g6kv_exclusive. `out` must be valid for cap writes (or NULL with cap 0), `n` for a write.
+#[no_mangle]
+pub unsafe extern "C" fn g6kv_copies_take(p: *mut Handle, out: *mut PageCopy, cap: usize, n: *mut usize) -> i32 {
+    if n.is_null() || (out.is_null() && cap > 0) {
+        return Error::BadArgument.code();
+    }
+    let mut p = (*p).lock();
+    let k = p.copies_pending();
+    *n = k;
+    if k > cap {
+        return Error::BadArgument.code();
+    }
+    let c = p.take_copies();
+    if !c.is_empty() {
+        std::ptr::copy_nonoverlapping(c.as_ptr(), out, c.len());
+    }
+    0
 }
 
 /// # Safety

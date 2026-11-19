@@ -1,6 +1,13 @@
 # S2 multi-session serving, context parallelism, the KV pool, its stores and prefix reuse. knobs/README.md describes the fields.
 prefix: "GR8_"
 knobs:
+  GR8_SESSIONS:
+    scope: local
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      Enable logical conversation handles and fork routes in the HTTP front end. 0 leaves existing routes and responses unchanged.
   GR8_KV4_FOLD:
     scope: agree
     kind: flag
@@ -122,6 +129,16 @@ knobs:
     doc: >-
       For tests, rank R sleeps the given ms inside every Nth KV tier drain that copies anything, set as
       <rank>:<ms>[:<every>].
+  GR8_KV_SHARE_PAGES:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      With --reuse-prefix under S2, sessions below R share the KV pages of a common prompt prefix: a live session's
+      prefilled prompt pages and a retained run's pages are counted per holder, and a hit that ends inside a page copies
+      only that page's rows below the hit. A shared hit keeps the retained run and skips no rows to the reuse grid.
+      0 is stock.
   GR8_KV_SHARE_WHEN:
     scope: local
     kind: text
