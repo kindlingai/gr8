@@ -357,6 +357,7 @@ Every rank of one engine must run the same value. The set ones that differ from 
 | `GR8_SPEC_DRAFT` | floats | `8.1,5.5,2.1` |  | S2 with DFlash2: overrides the DFlash2 round, MTP round and each extra MTP chain step costs with three comma- separated nonnegative times in ms. |
 | `GR8_SPEC_TABLE` | floats | built-in measured table |  | S2 with DFlash2: overrides the verify costs for 1..8 rows with eight comma-separated positive times in ms, for the DFlash2 draft count and the drafter choice. |
 | `GR8_TR3_W2ALL` | flag | `0` |  | Uses the window-2 fc1 split (256-thread CTAs, KS1 x2, WG 1) at M > 1 on every MoE layer, not only layers with 2-bit units. Same k ranges and order, so the same bits (bind.cuh k1_split). |
+| `GR8_TR3_WIDE4` | flag | `0` |  | Reorders 4-bit trellis MoE fc1 and fc2 weights in place into 128-bit coalesced wide-K4 order (0 extra bytes) on block-scale expert-tile layers and enables bit-exact per-M wide-K4 decode and prefill MoE kernels. Same bits. |
 | `GR8_V2_SHARED` | text | FP8 copy | trellis | trellis: prefill runs an exlr8 v2 layer's shared expert as a trellis pass instead of from an FP8 copy made at boot, which saves the copy (about 9.7 MB per layer at TP4). |
 | `GR8_WARM` | int | `0` | 0\|1\|2 | Warms the L2 with the next weights while a decode collective waits: 1 = this layer's router and shared fc1 and the next layer's q_a, 2 also kv_a and q_b. Loads only, no output change. |
 

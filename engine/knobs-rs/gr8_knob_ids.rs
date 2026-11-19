@@ -2,7 +2,7 @@
 // change the table, not this file. Each knob's id in the C API of gr8_knobs.h; a NAME<n> family takes n as well.
 
 /// The hash of the table these ids are from (gr8_knobs.h knob::TABLE_HASH).
-pub const TABLE_HASH: u64 = 0xfcf7833fd3cf8161;
+pub const TABLE_HASH: u64 = 0xfdcd6446e62e6e29;
 pub const ATTN_CTX2: u32 = 0;
 pub const ATTN_CTX3: u32 = 1;
 pub const ATTN_CTX3_HG: u32 = 2;
@@ -520,15 +520,16 @@ pub const TEST_VISION_CASES: u32 = 513;
 pub const TEST_ZERO_DELAY_MS: u32 = 514;
 pub const TMPDIR: u32 = 515;
 pub const TR3_W2ALL: u32 = 516;
-pub const V2_SHARED: u32 = 517;
-pub const WARM: u32 = 518;
-pub const WEIGHT_CHECK: u32 = 519;
-pub const WEIGHT_CHECK_FLIP: u32 = 520;
-pub const WIDTHS: u32 = 521;
-pub const WORK_DIR: u32 = 522;
-pub const XGRAMMAR: u32 = 523;
-pub const XGRAMMAR_LIB: u32 = 524;
-pub const XTRACE: u32 = 525;
-pub const XTRACE_OUT: u32 = 526;
-pub const XTRACE_PF: u32 = 527;
-pub const XTRACE_QUIT: u32 = 528;
+pub const TR3_WIDE4: u32 = 517;
+pub const V2_SHARED: u32 = 518;
+pub const WARM: u32 = 519;
+pub const WEIGHT_CHECK: u32 = 520;
+pub const WEIGHT_CHECK_FLIP: u32 = 521;
+pub const WIDTHS: u32 = 522;
+pub const WORK_DIR: u32 = 523;
+pub const XGRAMMAR: u32 = 524;
+pub const XGRAMMAR_LIB: u32 = 525;
+pub const XTRACE: u32 = 526;
+pub const XTRACE_OUT: u32 = 527;
+pub const XTRACE_PF: u32 = 528;
+pub const XTRACE_QUIT: u32 = 529;

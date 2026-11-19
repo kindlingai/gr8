@@ -276,6 +276,14 @@ knobs:
     doc: >-
       Uses the window-2 fc1 split (256-thread CTAs, KS1 x2, WG 1) at M > 1 on every MoE layer, not only layers with
       2-bit units. Same k ranges and order, so the same bits (bind.cuh k1_split).
+  GR8_TR3_WIDE4:
+    scope: agree
+    kind: flag
+    default: "0"
+    legacy: []
+    doc: >-
+      Reorders 4-bit trellis MoE fc1 and fc2 weights in place into 128-bit coalesced wide-K4 order (0 extra bytes) on
+      block-scale expert-tile layers and enables bit-exact per-M wide-K4 decode and prefill MoE kernels. Same bits.
   GR8_WARM:
     scope: agree
     kind: int

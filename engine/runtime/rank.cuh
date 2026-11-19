@@ -901,6 +901,16 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
         {
             bind::widen_fc1(y.T, st);
             if (!knob::nowide2()) bind::widen_fc2(y.T, st);
+#if !G6_MODEL_FLASH && !G6_MODEL_DS41
+            // GR8_TR3_WIDE4=1: in-place K4 wide order (0 extra bytes), only on block-scale expert-tile layers
+            // where prefill uses FP8 shared expert (not GR8_V2_SHARED=trellis segment pass) and fc2 is widened.
+            if (knob::tr3_wide4() && knob::pf_wt() && knob::v2_shared() != "trellis" && !knob::nowide2() &&
+                y.T.t[bind::T_TR3_SG].p)
+            {
+                bind::widen_k4_fc1(y.T, st);
+                bind::widen_k4_fc2(y.T, st);
+            }
+#endif
             G6RT_CK(cudaStreamSynchronize(st));
         }
 #if DEC_I4PAIR

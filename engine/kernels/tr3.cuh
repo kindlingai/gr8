@@ -284,8 +284,11 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
     }
     else if constexpr (!trw_ok<BITS>() && TR3_EARLY)
     {
-        #pragma unroll
-        for (int p = 0; p < TR3_UNR; ++p) na[p] = ld.loadw(base + static_cast<size_t>(p) * 8 * TB, lane);
+        if (!(BS && BITS == 4 && A.t_wide4))
+        {
+            #pragma unroll
+            for (int p = 0; p < TR3_UNR; ++p) na[p] = ld.loadw(base + static_cast<size_t>(p) * 8 * TB, lane);
+        }
     }
 #endif
 
@@ -375,7 +378,34 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
     }
 #else
 #if !defined(TR3_PROBE)
-    if (wide)
+    if (BS && BITS == 4 && A.t_wide4)
+    {
+        if constexpr (BS && BITS == 4)
+        {
+            const uint8_t* g4 = mw + static_cast<size_t>((ks0 + ksq) >> 3) * TR4W_GROUP + (j * 2) * 512 + lane * 16;
+            const int prev_lane = (lane + 31) & 31;
+            for (int s = 0; s < steps; s += 8)
+            {
+                const uint8_t* gp = g4 + static_cast<size_t>(s >> 3) * TR4W_GROUP;
+                #pragma unroll
+                for (int h = 0; h < 2; ++h)
+                {
+                    const uint4 wh = tr4w_ld128(gp + h * 512);
+                    const u32 w[4] = {wh.x, wh.y, wh.z, wh.w};
+                    #pragma unroll
+                    for (int p = 0; p < 4; ++p)
+                    {
+                        const u32 c = w[p];
+                        const u32 pc = __shfl_sync(0xffffffffu, c, prev_lane);
+                        u32 f0[2], f1[2];
+                        Tr3Lane<4, E4, CB>::decode_m((static_cast<u64>(pc) << 32) | c, 28, f0, f1);
+                        mma16816(acc, f0[0], f1[0], f0[1], f1[1], XA0(s + h * 4 + p), XA1(s + h * 4 + p));
+                    }
+                }
+            }
+        }
+    }
+    else if (wide)
     {
         // wide order (tr3_wide.cuh): the warp's 8 tiles of 8 k-steps in three 64-bit loads; the lane's 24 bits per
         // tile come out of its own words, the 13 bits before them from lane - 1. Same states, same mma order as below.
@@ -459,7 +489,7 @@ __device__ __forceinline__ void tr3_fc1_body(const K1Args& A, int plan, int unit
 // FC2 unit = (slot, block b, n-split). Prologue: g,u partial sums -> H*svh -> silu(g)*u -> H(act*suh_d)
 // for the block's 128 intermediate columns; then streams the block's down tiles for its n range.
 // Writes z[slot][b][m][n] fp16 (before the output Hadamard; finalize applies H*svh per block).
-template <int BITS, bool E4 = false, int CB = TR3_MCG>
+template <int BITS, bool E4 = false, int CB = TR3_MCG, bool BS = false>
 __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit, const long long* tr, int mask, u32* smem)
 {
     constexpr int TB = 32 * BITS;
@@ -497,7 +527,7 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
     }
     else if constexpr (!trw_ok<BITS>() && TR3_EARLY)
     {
-        if (Q > 0)
+        if (!(BS && BITS == 4 && A.t_wide42) && Q > 0)
         {
             #pragma unroll
             for (int p = 0; p < TR3_UNR; ++p) na[p] = ld.loadw(tile_ptr(p), lane);
@@ -574,6 +604,39 @@ __device__ __forceinline__ void tr3_fc2_body(const K1Args& A, int plan, int unit
     const bool wr0 = (mask >> (2 * c)) & 1, wr1 = (mask >> (2 * c + 1)) & 1;
     __half* zb = A.z + ((static_cast<size_t>(slot) * A.B + b) * 8 + 2 * c) * HID + nl;   // token 2c; token 2c+1 is +HID
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    if constexpr (BS && BITS == 4)
+    {
+        if (A.t_wide42)
+        {
+            const uint8_t* wg4 = base + static_cast<size_t>(nt0) * TR4W_NT + lane * 16;
+            const int prev_lane = (lane + 31) & 31;
+            for (int i = 0; i < ntiles; ++i)
+            {
+                const uint8_t* np = wg4 + static_cast<size_t>(i) * nwarps * TR4W_NT;
+                #pragma unroll
+                for (int h = 0; h < 2; ++h)
+                {
+                    const uint4 wh = tr4w_ld128(np + h * 512);
+                    const u32 w[4] = {wh.x, wh.y, wh.z, wh.w};
+                    #pragma unroll
+                    for (int p = 0; p < 4; ++p)
+                    {
+                        const u32 ch = w[p];
+                        const u32 pc = __shfl_sync(0xffffffffu, ch, prev_lane);
+                        u32 f0[2], f1[2];
+                        Tr3Lane<4, E4, CB>::decode_m((static_cast<u64>(pc) << 32) | ch, 28, f0, f1);
+                        mma16816(acc, f0[0], f1[0], f0[1], f1[1], ha[(h * 4 + p) * 64], ha[(h * 4 + p) * 64 + 1]);
+                    }
+                }
+                __half* zp = zb + (nt0 + i * nwarps) * 16;
+                if (wr0) { zp[0] = __float2half_rn(acc[0]); zp[8] = __float2half_rn(acc[2]); }
+                if (wr1) { zp[HID] = __float2half_rn(acc[1]); zp[HID + 8] = __float2half_rn(acc[3]); }
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) acc[k] = 0.f;
+            }
+            return;
+        }
+    }
     if (wide)
     {
         // same states, same mma order and the same z stores as the tile loop below

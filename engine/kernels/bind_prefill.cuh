@@ -108,6 +108,8 @@ struct Tensors
     Tensor s[NMX];                    //                the .scales tensor [N][K/32]
     int fc1_wide = 0;                 // set if bind::widen_fc1 ran on this tr3.fc1 (K3 experts in the wide order, tr3_wide.cuh)
     int fc2_wide = 0;                 // set if bind::widen_fc2 ran on this tr3.fc2
+    int fc1_wide4 = 0;                // set if bind::widen_k4_fc1 ran on this tr3.fc1 (K4 experts in wide-K4 order)
+    int fc2_wide4 = 0;                // set if bind::widen_k4_fc2 ran on this tr3.fc2
     int k2 = 1;                       // 2-bit units in the layer (bind::LayerTensors::k2 after bind::scan_widths)
     int k3 = 1;                       // 3-bit units in the layer (bind::LayerTensors::k3 after bind::scan_widths)
     int sh_trellis = 0;               // shared expert as trellis row 256 (bind::LayerTensors::sh_trellis)
@@ -2054,6 +2056,9 @@ struct Expert
     int wtc = 0;                      // 1: k_pf_fc2t sums each token's routes itself (the fused combine) and launch_fin does nothing
     int wt_gmajor = 0;                // 1: k_pf_fc2t's CTAs run group-major (GR8_PF_WT_GMAJOR)
     int* cnt_tg = nullptr;            // [M][HID / 128] the combine's route counters (zeroed by launch_fc2t)
+    int t_wide4 = 0;                  // K4 experts of t_fc1 are in wide-K4 order (GR8_TR3_WIDE4)
+    int t_wide42 = 0;                 // K4 experts of t_fc2 are in wide-K4 order (GR8_TR3_WIDE4)
+    int k3 = 0;                       // 3-bit units in the layer (for strict per-M wide-K4 dispatch)
 };
 
 inline int max_segments(int M) { return (M * TOPK + RS - 1) / RS + NEXP; }
@@ -6098,6 +6103,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
         A.k2 = T.k2;
         A.cb = T.cb;
         A.t_fc1 = static_cast<const uint8_t*>(T.t[T_TR3_FC1].p); A.t_wide = T.fc1_wide; A.t_fc2 = static_cast<const uint8_t*>(T.t[T_TR3_FC2].p); A.t_wide2 = T.fc2_wide;
+        A.t_wide4 = T.fc1_wide4; A.t_wide42 = T.fc2_wide4; A.k3 = T.k3;
         A.t_v1 = static_cast<const __half*>(v1.p); A.t_v2 = static_cast<const __half*>(v2.p); A.t_v3 = static_cast<const __half*>(v3.p);
         A.bs = bsf;
         A.t_sg = static_cast<const __half*>(sgn.p); A.t_v1b = static_cast<const __half*>(v1b.p); A.t_v3b = static_cast<const __half*>(v3b.p);
@@ -6112,9 +6118,9 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
             // (default 6144; slower than k_pf_fc1 below ~5000). Byte-equal to k_pf_fc1.
             // the WM kernels read K4 order only: the widened order (fc1_wide / fc2_wide) differs only for K2 and K3 units
             const bool k4 = !T.k2 && !T.k3;
-            A.wm = A.hx && knob::pf_wm() && M >= knob::pf_wm_min() && (!T.fc1_wide || k4);
+            A.wm = A.hx && knob::pf_wm() && M >= knob::pf_wm_min() && (!T.fc1_wide || k4) && !T.fc1_wide4;
             // GR8_PF_WM2, k_pf_fc2w: byte-equal, ~4% slower than k_pf_fc2v at M 8192 (bench): off
-            A.wm2 = A.wm && A.fc2v2 && knob::pf_wm2() && (!T.fc2_wide || k4);
+            A.wm2 = A.wm && A.fc2v2 && knob::pf_wm2() && (!T.fc2_wide || k4) && !T.fc2_wide4;
         }
         if (A.wm) { A.wt = sc.wt; A.n_wt = sc.n_wt; }
 #endif
@@ -6133,6 +6139,10 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const 
             A.wtiles = sc.wtiles; A.n_wtiles = sc.n_wtiles; A.rr_wp = sc.rr_wp; A.hq8 = sc.hq8; A.hs8 = sc.hs8;
             A.wtc = knob::pf_wt_fuse() ? 1 : 0; A.wt_gmajor = knob::pf_wt_gmajor() ? 1 : 0; A.cnt_tg = sc.cnt_tg;
         }
+        if ((T.fc1_wide4 || T.fc2_wide4) && !A.wtk)
+            return "wide-K4 tr3.fc1/fc2 requires expert-tile prefill (GR8_PF_WT=1, block-scale)";
+        if ((T.fc1_wide4 || T.fc2_wide4) && T.sh_trellis && !T.sh_fp8)
+            return "wide-K4 tr3.fc1/fc2 requires FP8 shared expert in prefill (not GR8_V2_SHARED=trellis)";
         if (T.sh_trellis && T.sh_fp8)
         {
             if (tab.shape[0] != NEXP + 1) return "trellis shared expert without tr3.table row NEXP";
