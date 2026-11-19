@@ -96,6 +96,8 @@ pub struct Generation {
     pub params: Params,
     tok: &'static Tok,
     engine: Option<Arc<Engine>>,
+    /// the request's admission (`Engine::admit`), held until `start` registers its route
+    pub admit: Option<crate::engine::Admit>,
     stream: Option<Stream>,
     detok: Detok,
     detok_skip_special: bool,
@@ -171,6 +173,7 @@ impl Generation {
             params,
             tok,
             engine: None,
+            admit: None,
             stream: None,
             detok: Detok::new(tok, skip_special),
             detok_skip_special: skip_special,
@@ -279,6 +282,7 @@ impl Generation {
             .map_err(|e| ApiError::new(503, &e.0, None))?;
         self.stream = Some(s);
         self.engine = Some(engine.clone());
+        self.admit = None; // the route counts it now
         Ok(())
     }
 

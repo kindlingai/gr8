@@ -207,6 +207,73 @@ per-rank rows pool two ranks over the same three stops:
 - Output after a fast quit: 8 fixed prompts at temperature 0 (`max_tokens=512`) on the next boot gave the same text and
   total token counts as before, 8 of 8.
 
+## Changing width: `./gr8 <model> scale`
+
+`./gr8 glm53 scale --tp N --peers LIST [--drain-timeout S]` (also `glm53f`) moves a serving cluster to another TP or
+set of boxes without failing a request. Run it on any box of the cluster; the head (the first address) must stay first
+in `LIST`. The boot's `--ips`/`--ips2` list the old members' rails and are dropped: give the new list's on the scale
+command when its boxes need them (`--ips A1,B1 --ips2 A2,B2`; none at TP=1). It is an orderly restart of the engines,
+not an in-process switch:
+
+1. The head plans the new layout (GLM-5.3 with `bin/g6layout plan`, so a box keeps the expert halves it holds) and
+   every box of the new list makes its rank's files ready and runs its checks while the cluster serves. A box new to
+   the cluster joins by running `./gr8 <model> up --tp N --peers LIST` (with the cluster's other options) after the
+   scale has started.
+2. The head's front end holds new requests (`/internal/hold`, frontend/README.md) and waits for the running ones to
+   finish, at most `--drain-timeout` seconds (300). A drain that runs out ends the scale with nothing changed.
+3. Every old engine quits as for `down` (its KV store keeps the pool's runs), and each box serves its store folder to
+   the new ranks through `bin/kvman-peer` on `CONTROL_PORT + 3` (7343 by default). The new member list boots with
+   `GR8_KV_REWIDTH`, which rewrites the store for each new rank before it opens: GLM-5.3's persisted SSD store
+   (`KV_STORE=ssd:...,persist=on`, sessions with `keep=sessions`) and GLM-5.3-Flash's aligned checkpoints
+   (`FLASH_CACHE=aligned` with a persisted SSD store; not with `GR8_CP=1`). A chat's next turn then reads its run from
+   the store instead of prefilling it again. Without such a store the scale works and sessions prefill again. The
+   store must be on each box's local disk: the scale moves rank folders within it.
+4. When the head's API answers, the hold ends and the held requests run on the new width. A box that left exits.
+
+If the new width fails to boot (a refused handshake, an engine that exits, `READY_TMO`), every box of the old list
+puts its store back and boots the old list again, and the held requests run there. The hold lasts the drain plus a
+boot (`READY_TMO` + 120 s, at least 900 s), and a rollback sets it again for the old list's boot: clients need a
+request timeout at least that long. A supervisor that dies mid-scale is not resumed: `down` and `up` as after any
+failure; a box that leaves stops after `JOIN_TIMEOUT` + `READY_TMO` without word from the head.
+
+What the scale keeps the same, so the store's blocks stay valid: the running variant (`--variant`), the KV format
+(`--kv-format`, also when a TP default chose it, as int4 at GLM-5.3 TP=4), `SHARE_LIMIT` and `REUSE_GRID` are pinned.
+It refuses `SHAPE=ring`, and a variant larger than the new width's default: a GLM-5.3 cluster that will scale to TP=3
+boots TP=4 with `--variant bit260` (bit325, the TP=4 default, does not fit a rank at TP=3), and names no `--drafter`
+(the drafter does not run at TP=3). It changes the running cluster only: it prints the option lines
+(`TP=`, `PEERS=`, the pins) to put into every box's config for later boots, and a mentat cluster runs in peers mode
+after its first scale. Output after a scale is that of a fresh boot at the new width given the same stored state; a
+run that never scaled may give other tokens (another width computes other KV bits).
+
+Measured on 2026-11-19 with GLM-5.3-Flash on two DGX Sparks (one cable, `--variant k2`, fp8 KV, `--cap 65536`,
+`FLASH_CACHE=aligned` with a persisted `ssd:` store, the warm model on local disk), a request every 0.5 s through the
+head's API the whole time, and three 26.8K-token prompts checkpointed at 24,576 rows before the first scale:
+
+| scale | requests waited (hold set to cleared) | checkpoints carried | a stored prompt again |
+|---|---|---|---|
+| TP=2 -> 1 (`--extra-env GR8_MEM_MIN=6`) | 39.2 s | 3 of 3, verified | 3.1-3.3 s (27.7 s cold at TP=1) |
+| TP=1 -> 2, the second box joining | 46.7 s | 3 of 3 on each rank | 2.1 s (15.8 s cold at TP=2) |
+
+No request failed (0 of 53 not 200 across both scales); the drain took 0 s (the short requests had finished). Two attempts at TP=1
+without `GR8_MEM_MIN=6` stopped at boot with 6.2 and 7.1 GiB left (k2's 93 GB device image, two prefill lanes) and
+rolled back to TP=2: the requests waited 68 s and none failed, and the stored prompts hit again at TP=2. The checkpoint
+carry needs the same `CAP`, prefill rows and lanes at both widths (they are in the store's compatibility line).
+
+Measured on 2026-11-19 with GLM-5.3 on four DGX Sparks on a switch (`--variant bit260`, int4 KV, a persisted `ssd:`
+store of 64G per rank with `keep=sessions`, the warm model on local disk), a request every 1 s through the head's API
+during each scale (0.5 s during the rollback test), and three 32K-34K-token conversations stored before the first scale:
+
+| scale | requests waited (hold set to cleared) | entries carried | a stored prompt again |
+|---|---|---|---|
+| TP=4 -> 3, one box leaving | 77.6 s | 14 on each rank | 0.21-0.22 s (52-57 s cold at TP=3) |
+| TP=3 -> 4, the fourth box joining | 64.6 s | 17 on each rank | 0.16-0.27 s (20-22 s cold at TP=4) |
+
+No request failed (0 of 376 not 200 across both scales); the drain took 0.0-0.5 s. A scale to a width whose rank files
+are not on the boxes fetches them first, while the old width serves, within `JOIN_TIMEOUT`: the first TP=3 needed about
+60 GB per rank. A scale forced to fail after the switch (`--ready-tmo 20`) rolled back to TP=4: the requests waited
+201.0 s, most of it the new engines' 120 s orderly quit, and none failed (0 of 1305); the stored prompts hit again at
+TP=4.
+
 ## The GLM-5.3-Flash pair (TP=2)
 
 A two-box pair can also switch between GLM-5.3-Flash at TP=2

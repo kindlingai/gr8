@@ -119,6 +119,12 @@ the exact 64-token boundary within the system span after `KV_SYSTEM_AFTER` conve
 64 tokens has no shared system checkpoint. Sessions admission requires a continuation hit. See
 [DS41 session stores](docs/DEEPSEEK.md#tiered-session-stores).
 
+Across `./gr8 <model> scale` ([docs/SWITCHING.md](docs/SWITCHING.md#changing-width-gr8-model-scale)) the first
+persisted `ssd:` store (GLM-5.3) or the aligned checkpoint store (GLM-5.3-Flash, `FLASH_CACHE=aligned`) carries to the
+new width: `scale` sets `GR8_KV_REWIDTH` for that one boot and pins `VARIANT`, `KV_FORMAT`, `SHARE_LIMIT` and
+`REUSE_GRID` so the store's engine, row, R and grid stay the same. A plain `up` at another width still starts the store empty, as its compatibility
+line names the width. Flash with `GR8_CP=1` carries nothing.
+
 ## Rank health
 
 The launcher does not run the rank health probe: run `scripts/rank_health.sh` with the same options before a boot if

@@ -321,6 +321,21 @@ int g6kv_canon_import(const uint8_t* blob, size_t n, uint32_t mla_row, uint32_t 
                       uint32_t below_rows, const uint32_t* list, size_t n_list, uint32_t place, uint32_t rank,
                       uint8_t* const* mla, const size_t* mla_bytes, uint8_t* const* idx, const size_t* idx_bytes,
                       uint64_t* written);
+// Another box's persisted store files over `kvman-peer` (src/peer.rs), for a scale's rewrite: open with HOST:PORT and
+// the hex token (NULL on failure), read len bytes of a file at off (0 or -1), a file's size (or -1). Failures name
+// their reason in g6kv_peer_error (this thread's last).
+struct g6kv_peer;
+g6kv_peer* g6kv_peer_open(const char* addr, const char* token);
+int g6kv_peer_read(g6kv_peer* p, const char* name, uint64_t off, uint64_t len, uint8_t* dst);
+int64_t g6kv_peer_size(g6kv_peer* p, const char* name);
+void g6kv_peer_close(g6kv_peer* p);
+const char* g6kv_peer_error();
+// GR8_KV_REWIDTH (src/rewidth.rs): rewrites the persisted store in dir (index.prev, blocks) written at another width
+// for rank `rank` of `nr`, before the store opens. compat = this store's compat line, slots and slot_bytes its size.
+// >0: entries carried; 0: nothing carried (g6kv_rewidth_error says why); -1: error, dir/index untouched.
+int64_t g6kv_rewidth(const char* dir, const char* compat, uint32_t nr, uint32_t rank, uint64_t slots,
+                     uint64_t slot_bytes, const char* spec);
+const char* g6kv_rewidth_error();
 // The host ledger of a box a Flash rank shares with a KV node (src/ledger.rs, kvman-ledger): bytes move between the
 // GPU (side 0), the node (1) and free (2) as one transfer at a time, begin -> released (the giver let go) -> commit
 // (the taker holds them) or abort. Each call is one locked, durable step. 0, or -1 with g6kv_tier_error.

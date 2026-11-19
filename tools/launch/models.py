@@ -68,6 +68,7 @@ class Model:
     build_what_env: str = ''
     int4_row: str = 'int4g32h'
     build_markers: tuple = ()
+    scalable: bool = False      # `./gr8 <name> scale` changes a running cluster's width (an orderly restart that holds requests)
 
     @property
     def tp_sizes(self):
@@ -88,7 +89,7 @@ GLM53 = Model('glm53', 'GLM-5.3', 'https://huggingface.co/kindlingai/glm-5.3-exl
                'bit300': 3.0, 'bit325': 3.25, 'bit332': 3.32, 'bit390': 3.92, 'bit400': 4.0},
               {3: ('bit260', 'bit225'), 4: ('bit325',), 5: ('bit325',), 6: ('bit325',)}, 'gr8-glm53', 'GlmMoeDsaForCausalLM', True, True, True,
               vocab=154880, eos_ids=(154820, 154827, 154829), shim_legacy=True, drafter_url='https://huggingface.co/incoai/GLM-5.3-DFlash2', grammar=True, kv4_fold=True, legacy_identity=True,
-              tp_defaults={'4': {'KV_FORMAT': 'int4'}})
+              tp_defaults={'4': {'KV_FORMAT': 'int4'}}, scalable=True)
 # GLM-5.3-Flash: uniform-width releases, K4 by default. K2 is the width whose experts fit one box (TP=1).
 GLM53F = Model('glm53f', 'GLM-5.3-Flash', 'https://huggingface.co/kindlingai/glm-5.3-flash-exlr8-k2-k3-k4',
                'g6m4_flash', 'flash', ('4', '3', '2', '1'), {'k2': 2.0, 'k3': 3.0, 'k4': 4.0},
@@ -98,7 +99,7 @@ GLM53F = Model('glm53f', 'GLM-5.3-Flash', 'https://huggingface.co/kindlingai/glm
                vocab=154880, eos_ids=(154820, 154827, 154829), shim_legacy=True, drafter_url='https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2', grammar=True, checkpoint_cache=True,
                vision_knob='GR8_GLM53F_VISION',
                build_widths=('1', '2', '3', '4'), build_define='G6_MODEL_FLASH', build_fc2gl=4,
-               int4_row='int4nope', build_markers=('flash kv: borrow-idle, %u of', 'flash ckpt share: now'))
+               int4_row='int4nope', build_markers=('flash kv: borrow-idle, %u of', 'flash ckpt share: now'), scalable=True)
 # DeepSeek-V4.1-Flash-1017 (docs/DEEPSEEK.md): the official weights in the exlr8 native layout (FP8 trunk, MXFP4 routed
 # experts), no width variants, TP=4. Its drafter is DSpark, the checkpoint's MTP layers (GR8_DS_MTP), not DFlash2. The front
 # end speaks the ds41 dialect (DSML tool calls, numeric reasoning effort). A request that names no reasoning effort gets
@@ -128,7 +129,7 @@ INK2 = Model('ink2', 'Inkling-2-Small', 'https://huggingface.co/thinkingmachines
 # a CPU. Its release is a directory with responses.toml and the tokenizer files.
 PSEUDO = Model('pseudo', 'the pseudo engine', '', 'g6pseudo', 'pseudo', ('1', '2', '3', '4'), {}, {}, 'gr8-pseudo',
                'GlmMoeDsaForCausalLM', False, False, False, fabric=False, shim_legacy=True, engine_profile='pseudo', simulator='', second_rail='prefill',
-               vocab=154880, eos_ids=(154820, 154827, 154829))
+               vocab=154880, eos_ids=(154820, 154827, 154829), scalable=True)
 MODELS = {m.name: m for m in (GLM53, GLM53F, DS41, INK2, PSEUDO)}
 
 
@@ -229,7 +230,7 @@ def image_binaries():
     binaries = []
     for m in SERVED:
         binaries += [m.engine, *([m.engine + '-int4'] if m.int4_kv else []), m.simulator]
-    return tuple(dict.fromkeys(b for b in binaries + ['gpuprobe', 'g6front-rs', 'g6load', 'kvman-remote'] if b))
+    return tuple(dict.fromkeys(b for b in binaries + ['gpuprobe', 'g6front-rs', 'g6load', 'kvman-remote', 'kvman-peer'] if b))
 
 
 def query(argv):

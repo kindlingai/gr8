@@ -2301,6 +2301,68 @@ fn decode(p: &[u8]) -> Option<Record> {
     }
 }
 
+/// The live entries of an index's records (in least recently used first order), its counts, the records read and the
+/// bytes they took (a torn or bad record ends the log there).
+fn replay(body: &[u8]) -> (BTreeMap<u64, Entry>, Vec<u64>, BTreeMap<u64, (u32, u64)>, u64, usize) {
+    let mut live: BTreeMap<u64, Entry> = BTreeMap::new();
+    let mut counts: BTreeMap<u64, (u32, u64)> = BTreeMap::new();
+    let mut order: Vec<u64> = Vec::new();
+    let (mut good, mut records) = (0usize, 0u64);
+    let mut c = Cursor(body);
+    while let Some(n) = c.u32() {
+        let (Some(sum), Some(p)) = (c.u64(), c.take(n as usize)) else { break };
+        if fnv_bytes(p) != sum {
+            break;
+        }
+        match decode(p) {
+            Some(Record::Add(e)) => {
+                order.retain(|&i| i != e.id);
+                order.push(e.id);
+                live.insert(e.id, e);
+            }
+            Some(Record::Drop(id)) => {
+                live.remove(&id);
+                order.retain(|&i| i != id);
+            }
+            Some(Record::Count(k, n, clock)) => {
+                counts.insert(k, (n, clock));
+            }
+            None => break,
+        }
+        records += 1;
+        good = body.len() - c.0.len();
+    }
+    (live, order, counts, records, good)
+}
+
+/// An index file's compat line, its live entries (least recently used first) and its prefix counts; None without the
+/// index header (rewidth.rs reads another width's index this way).
+pub fn read_index(raw: &[u8]) -> Option<(String, Vec<Entry>, BTreeMap<u64, (u32, u64)>)> {
+    let nl = raw.iter().position(|&b| b == b'\n')?;
+    let compat = std::str::from_utf8(&raw[..nl]).ok()?.strip_prefix(MAGIC)?.strip_prefix(' ')?.to_string();
+    let (live, order, counts, _, _) = replay(&raw[nl + 1..]);
+    Some((compat, order.iter().filter_map(|i| live.get(i).cloned()).collect(), counts))
+}
+
+/// Writes `dir`/index whole: the header for `compat`, then `entries` in order and the counts, through a temporary file,
+/// synced, then renamed over the index.
+pub fn write_index(dir: &Path, compat: &str, entries: &[Entry], counts: &BTreeMap<u64, (u32, u64)>) -> io::Result<()> {
+    let path = dir.join("index");
+    let tmp = path.with_extension("tmp");
+    let mut f = File::create(&tmp)?;
+    let mut b = format!("{MAGIC} {compat}\n").into_bytes();
+    for e in entries {
+        b.extend(frame(&encode_entry(e)));
+    }
+    for (&k, &(n, clock)) in counts {
+        b.extend(frame(&encode_count(k, n, clock)));
+    }
+    f.write_all(&b)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, &path)?;
+    File::open(dir)?.sync_all()
+}
+
 impl Index {
     /// Opens (or starts) the index in `dir`. A different compat string, or no header, starts it empty.
     pub fn open(dir: &Path, compat: &str) -> io::Result<(Index, Vec<Entry>)> {
@@ -2316,31 +2378,9 @@ impl Index {
         let mut order: Vec<u64> = Vec::new();
         let (mut good, mut records) = (0usize, 0u64);
         if raw.starts_with(head.as_bytes()) {
-            good = head.len();
-            let mut c = Cursor(&raw[good..]);
-            while let Some(n) = c.u32() {
-                let (Some(sum), Some(p)) = (c.u64(), c.take(n as usize)) else { break };
-                if fnv_bytes(p) != sum {
-                    break;
-                }
-                match decode(p) {
-                    Some(Record::Add(e)) => {
-                        order.retain(|&i| i != e.id);
-                        order.push(e.id);
-                        live.insert(e.id, e);
-                    }
-                    Some(Record::Drop(id)) => {
-                        live.remove(&id);
-                        order.retain(|&i| i != id);
-                    }
-                    Some(Record::Count(k, n, clock)) => {
-                        counts.insert(k, (n, clock));
-                    }
-                    None => break,
-                }
-                records += 1;
-                good = raw.len() - c.0.len();
-            }
+            let n;
+            (live, order, counts, records, n) = replay(&raw[head.len()..]);
+            good = head.len() + n;
         } else if !raw.is_empty() {
             // another model, layout, block format or engine build wrote it: its blocks are not this engine's
             let old = raw.split(|&b| b == b'\n').next().unwrap_or_default();

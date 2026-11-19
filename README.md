@@ -276,6 +276,7 @@ a local mentat daemon (`--mentat localhost`, the default).
 |---|---|
 | `up [OPTIONS]` | start this box's supervisor and follow it until the cluster serves |
 | `down`, `restart` | stop every box, or stop and boot again (in Docker: `down`, then `up -d` on every box) |
+| `scale --tp N --peers LIST` | change a serving cluster's width and boxes without failing a request (below) |
 | `status` | every box's state, engine and free memory, and the head's front end and `/health` |
 | `health` | this box alone, in one line: exit 0 when it serves (on the head, also its API's `/health`), else 1. The compose healthcheck, and a Kubernetes `exec` readiness probe on any rank |
 | `logs [rank\|shim\|front\|supervisor] [-f]` | a log from any box |
@@ -292,6 +293,16 @@ When a rank's engine exits, the head stops every box: `status` names the rank an
 supervisor log names the line that says why. Logs are in `out/` on each box (`supervisor.log`, `g6m4.r<r>.err`, and
 `shim.log` and `front.log` on the head). Each boot moves the previous engine logs to `out/prev1`, and keeps the three
 boots before it (`prev1` is the newest), so a restart does not overwrite the boot you want to look at.
+
+`./gr8 glm53 scale --tp 3 --peers A,B,C` (or `glm53f`) moves a serving cluster to another width or set of boxes by an
+orderly restart. Every box of the new list makes its files ready while the cluster serves; then the front end holds
+new requests, the running ones finish (`--drain-timeout`, 300 s by default), the old engines quit and the new list
+boots. Requests sent meanwhile wait and are answered by the new width. With a persisted KV store
+(`KV_STORE=ssd:...,persist=on,keep=sessions`, or Flash's `FLASH_CACHE=aligned` checkpoints) the stored sessions carry
+over, so a chat goes on without a re-prefill. The head stays first in the list; a box new to the cluster runs
+`./gr8 glm53 up --tp 3 --peers A,B,C` once the scale has started. If the new width fails to boot, the old one boots
+again. The scale changes the running cluster only: put the lines it prints into every box's config for later boots.
+[docs/SWITCHING.md](docs/SWITCHING.md#changing-width-gr8-model-scale) has the details.
 
 ## Troubleshooting
 
@@ -316,6 +327,7 @@ The head serves the OpenAI API on port 8100. [frontend/README.md](frontend/READM
 | 8100 | the OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`) | head |
 | 7340 | the supervisors: the handshake before boot, then status, logs and down | every box |
 | 7341 | the multi-session control channel between the ranks | head |
+| 7343 | during `scale` with a persisted KV store: each box serves its store to the new ranks (`bin/kvman-peer`, `CONTROL_PORT + 3`) | every box |
 | 18600-18659 | fabric bootstrap and the per-collective regions | head |
 
 ## Layout

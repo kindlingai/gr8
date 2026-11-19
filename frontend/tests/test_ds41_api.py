@@ -381,5 +381,64 @@ class Ds41Api(unittest.TestCase):
         self.assertTrue(f.engine.cancelled.wait(5))
 
 
+@unittest.skipUnless(BIN.exists(), 'build frontend/g6front-rs in release mode first')
+class Hold(unittest.TestCase):
+    """/internal/hold: a scale's cutover holds new requests until the new engine serves (tools/launch `scale`)."""
+
+    def hold(self, f, seconds=None):
+        q = '' if seconds is None else f'?seconds={seconds}'
+        req = urllib.request.Request(f.url + '/internal/hold' + q, method='GET' if seconds is None else 'POST')
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.load(r)
+
+    def stop_engine(self, f):
+        f.engine.conn.shutdown(socket.SHUT_RDWR)   # the front end sees the engine go
+        f.engine.close()
+        os.unlink(f.home / 'e.sock')
+
+    def chat(self, f, out):
+        body = json.dumps(dict(messages=[{'role': 'user', 'content': 'hi'}], max_tokens=8)).encode()
+        req = urllib.request.Request(f.url + '/v1/chat/completions', body, {'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                out.append((r.status, None))
+        except urllib.error.HTTPError as e:
+            out.append((e.code, e.headers['Retry-After']))
+
+    def test_a_request_waits_through_the_cutover(self):
+        f = Front()
+        self.addCleanup(f.close)
+        self.assertEqual(self.hold(f, 30), {'hold': True, 'running': 0, 'waiting': 0})
+        self.stop_engine(f)
+        out = []
+        t = threading.Thread(target=self.chat, args=(f, out))
+        t.start()
+        for _ in range(100):
+            if self.hold(f)['waiting'] == 1:
+                break
+            time.sleep(0.05)
+        self.assertEqual(self.hold(f)['waiting'], 1)
+        f.engine = MockEngine(f.home / 'e.sock')
+        f.engine.tokens = f.encode('ok')
+        f.engine.finish_on_tokens = True
+        time.sleep(0.6)       # the front end reconnects (every 0.25 s under a hold) but the request still waits
+        self.assertEqual(out, [])
+        self.assertEqual(self.hold(f, 0)['hold'], False)
+        t.join(10)
+        self.assertEqual(out, [(200, None)])
+
+    def test_a_hold_that_runs_out_answers_503_with_retry_after(self):
+        f = Front()
+        self.addCleanup(f.close)
+        self.stop_engine(f)
+        self.hold(f, 1)
+        out = []
+        t0 = time.monotonic()
+        self.chat(f, out)
+        self.assertGreater(time.monotonic() - t0, 0.5)
+        self.assertEqual(out, [(503, '5')])
+        f.engine.close = lambda: None   # already closed
+
+
 if __name__ == '__main__':
     unittest.main()

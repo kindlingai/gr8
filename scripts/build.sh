@@ -84,6 +84,9 @@ if [ -x "$KVNODE_BIN" ]; then cp "$KVNODE_BIN" "$OUT/"; fi
 # the host ledger of a Flash box that lends memory to a KV node (FLASH_KV_DONATE_GIB)
 LEDGER_BIN=$REPO/engine/target/release/kvman-ledger
 if [ -x "$LEDGER_BIN" ]; then cp "$LEDGER_BIN" "$OUT/"; fi
+# the store file service a scale's rewrite reads other boxes' KV stores through (./gr8 <model> scale)
+PEER_BIN=$REPO/engine/target/release/kvman-peer
+if [ -x "$PEER_BIN" ]; then cp "$PEER_BIN" "$OUT/"; fi
 cd "$REPO/engine/runtime"
 [ "${PLAIN:-0}" = 1 ] && { echo "PLAIN=1 is retired: every width has the multi-session path (DEC_S2)"; exit 2; }
 WIDTHS=${GR8_WIDTHS:-${GR8_NR:-1 2 3 4 5 6 8}}

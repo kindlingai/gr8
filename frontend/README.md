@@ -14,6 +14,9 @@ under `frontend/` is the shim (and its frame codec, `wire.py`), not a second fro
 - `GET /v1/models`
 - `GET /health`; `GET /health?deep` (localhost only): the cluster's self-checks, below
 - `GET /metrics`
+- `POST /internal/hold?seconds=N`, `GET /internal/hold` (localhost only; `./gr8 <model> scale` uses it): while a hold
+  is set, a new request waits for the engine instead of failing, until the hold is cleared (`seconds=0`) or runs out
+  (then 503 with `Retry-After: 5`, as any request gets with no engine). Both answer `{"hold":…,"running":…,"waiting":…}`.
 
 ## /health?deep
 

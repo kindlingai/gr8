@@ -336,6 +336,10 @@ TMPDIR="$T" "$T/flash_ckpt_index_test"
 # a rank that checks its entries for longer than the socket timeout
 g++ -std=c++17 -O1 -g -Wall -Wextra -pthread -fsanitize=address,undefined -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/flash_ckpt_agree_test.cpp" -o "$T/flash_ckpt_agree_test" "${KNOBS[@]}"
 TMPDIR="$T" "$T/flash_ckpt_agree_test"
+# GR8_KV_REWIDTH for Flash (s2/flash_ckpt_rewidth.h): four ranks' persisted checkpoints rewritten to TP=2, 1 and back
+# to 4 over loopback kvman-peer servers; each rank's KDA state equals the canonical state sharded at the new width
+g++ -std=c++17 -O2 -Wall -Wextra -pthread -I "$REPO/engine/runtime" "$REPO/engine/runtime/s2/tests/flash_rewidth_test.cpp" -o "$T/flash_rewidth_test" "${KVLIB[@]}"
+TMPDIR="$T" "$T/flash_rewidth_test" "$REPO/engine/target/release/kvman-peer"
 # the KDA carry mode (Args::src per row: the ring, and several sessions in one step) on the CPU model of k_kda_core.
 # Bit for bit across the kernel's M paths, so no FMA contraction (the host compiler would contract each path its own way).
 g++ -std=c++17 -O2 -ffp-contract=off -DG6_MODEL_FLASH=1 "$REPO/engine/kda/tests/kda_carry_cpu_test.cpp" -o "$T/kda_carry_cpu_test" "${KNOBS[@]}"
