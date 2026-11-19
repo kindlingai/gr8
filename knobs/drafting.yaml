@@ -9,6 +9,16 @@ knobs:
     doc: >-
       The DFlash2 drafter's body GEMVs read INT4 g32 copies of their MXFP8 records, made at boot. Drafts only, +382 MB
       per rank. Needs --dflash-manifest.
+  GR8_DFL_DEDUP:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    legacy: []
+    doc: >-
+      In a DFlash2 query step, fuse each layer's context and block kv_proj into one 16-row GEMV, fuse xfrag writes into
+      k_conv and k_silu, and merge selector walk candidates in shared memory without local spills. Bit-identical drafts.
+      Needs --dflash-manifest.
   GR8_DFL_DUMP:
     scope: local
     kind: path
