@@ -44,6 +44,7 @@
 #include "../kernels/glue.cuh"
 #include "../kernels/bind.cuh"
 #include "../kernels/dec_dense_opt.cuh"
+#include "../kernels/dtr_exact_opt.cuh"
 #include "../kernels/l2pf.cuh"
 #include "../kernels/head_i4.cuh"
 #include "../kernels/head2.cuh"
@@ -623,6 +624,7 @@ struct Model
                                       // k_head_local_rx + k_head_relax accept a greedy row's draft by the relaxed rule. Not exact
     QSplit qs;                        // GR8_QA_SPLIT (main model only; mode 0 = today's replicated GEMVs)
     dec_dense_opt::State ddo;         // GR8_DEC_DENSE_OPT (default off): bit-exact fused decode dense kernels
+    dtr_exact_opt::State dteo;        // GR8_DTR_EXACT_OPT (default off): bit-exact dense trellis o_proj & q_b kernels
     bind::K1Ovl ovl;                  // GR8_ROUTE_OVL (route_ovl_init; mode 0 = off): the shared expert's side stream
     bool route_last = false;          // GR8_MTP_LASTROW (MTP draft model only, set before capture): only each session's last row
                                       // of a step takes routed experts (launch_mlp_block, mtp_lastrow_env)
@@ -1122,6 +1124,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     if (!bind::vocab_slice(rank, m.vlo, m.vn)) die("rank must be 0.." + std::to_string(g6nr::NR - 1));
     m.hlog = dmalloc<float>((size_t)MX * m.vn);
     G6RT_CK(dec_dense_opt::setup(m.ddo, m.nl));
+    G6RT_CK(dtr_exact_opt::setup(m.dteo));
 }
 
 // after build, before any launch: the gather fabric (ncoll = m.qs.ncoll(), slots of at least MX rows of the widest wire row);
@@ -1502,12 +1505,18 @@ inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStr
         if (P.on()) qs_get(m, c, M, st);
         return;
     }
-    if (m.ddo.on)
+    if (m.dteo.on || m.ddo.on)
     {
         if (c >= 0 && noiq) qs_put(m, c, M, st);
         bool did_put = false;
-        if (dec_dense_opt::launch_qb_idxq(m.ddo, b, m.sc, m.layers[i].T.mats.q_b, m.q_a_n, M, noiq, qa_rot_done,
-                                          c >= 0 ? &m.qs.g : nullptr, m.stepp, m.qs.tickets, c, did_put, st))
+        bool handled = false;
+        if (m.dteo.on)
+            handled = dtr_exact_opt::launch_qb_idxq(m.dteo, b, m.sc, m.layers[i].T.mats.q_b, m.q_a_n, M, noiq, qa_rot_done,
+                                                    c >= 0 ? &m.qs.g : nullptr, m.stepp, m.qs.tickets, c, did_put, st);
+        if (!handled && m.ddo.on)
+            handled = dec_dense_opt::launch_qb_idxq(m.ddo, b, m.sc, m.layers[i].T.mats.q_b, m.q_a_n, M, noiq, qa_rot_done,
+                                                    c >= 0 ? &m.qs.g : nullptr, m.stepp, m.qs.tickets, c, did_put, st);
+        if (handled)
         {
             if (c >= 0)
             {
@@ -1724,7 +1733,9 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
     G6RT_CK(g6_attn_cp_finish(a, cell, scr, sb, C.part_all, st));
     dmark(DP_ATTN, st);
     bind::launch(b.xf_attn, st);
-    if (!dec_dense_opt::launch_o_proj(m.ddo, b, m.sc, M, st)) bind::launch_o_proj(b, st);
+    if (!dtr_exact_opt::launch_o_proj(m.dteo, b, m.sc, M, st) &&
+        !dec_dense_opt::launch_o_proj(m.ddo, b, m.sc, M, st))
+        bind::launch_o_proj(b, st);
 #ifdef DEC_SLOT
     slot_publish(m, 2 * i, st);
 #else
@@ -1792,7 +1803,9 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
     }
     dmark(DP_ATTN, st);
     bind::launch(b.xf_attn, st);
-    if (!dec_dense_opt::launch_o_proj(m.ddo, b, m.sc, M, st)) bind::launch_o_proj(b, st);
+    if (!dtr_exact_opt::launch_o_proj(m.dteo, b, m.sc, M, st) &&
+        !dec_dense_opt::launch_o_proj(m.ddo, b, m.sc, M, st))
+        bind::launch_o_proj(b, st);
 #ifdef DEC_SLOT
     slot_publish(m, 2 * i, st);
 #else

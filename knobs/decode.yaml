@@ -59,6 +59,15 @@ knobs:
     doc: >-
       Uses the exlr8 release's dense trellis matrices (q_b, o_proj, the dense MLP) where a layer has them. 0 = the int4
       or MXFP8 records, which the layer must then have.
+  GR8_DTR_EXACT_OPT:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      Runs bit-exact dense trellis o_proj and q_b (+ fused idx_q) decode kernels on GLM-5.3 (parallel pre-rotation,
+      512-thread smem-staged xa 1-barrier o_proj direct to send slot for stock_parts in {2, 4}, exact 16-bucket ks=4/ks=2
+      q_b with direct epilogue and fused idx_q+q_b). Same output bits; takes precedence over GR8_DEC_DENSE_OPT on trellis
+      o_proj and q_b when both are enabled.
   GR8_DTR_NBFAST:
     scope: agree
     kind: flag
