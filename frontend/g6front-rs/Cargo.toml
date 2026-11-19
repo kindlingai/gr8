@@ -12,6 +12,7 @@ name = "g6front-rs"
 path = "src/main.rs"
 
 [dependencies]
+gr8-knobs = { path = "../../engine/knobs-rs" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

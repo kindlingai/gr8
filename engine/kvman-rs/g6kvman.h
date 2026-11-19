@@ -69,6 +69,20 @@ int g6kv_list(const g6kv_pool* p, const g6kv_run* r, uint32_t* pages, size_t cap
 // prefix reuse on, with PrefixReuse's strict / noend / grid rules
 void g6kv_keep(g6kv_pool* p, int strict, int noend, int32_t grid);
 int g6kv_keeping(const g6kv_pool* p);
+// GR8_KV_SHARE_PAGES: refcounted prompt pages below R (1 = on), only before any reservation. Live and retained runs
+// share the full pages of a common prefix; a hit that ends inside a page gets a copy of that page's rows below the hit
+// (g6kv_copy), which the engine runs before anything writes the page. prefilled: a live run's rows [0, rows) are
+// written (the driver, every rank), so later prompts may share them
+struct g6kv_copy
+{
+    uint32_t from, to, rows;
+};
+int g6kv_share_pages(g6kv_pool* p, int on);
+int g6kv_sharing(const g6kv_pool* p);
+int g6kv_prefilled(g6kv_pool* p, const g6kv_run* r, uint32_t rows);
+size_t g6kv_copies_pending(const g6kv_pool* p);
+// takes the queued copies in order when cap covers them all (n = how many), else takes none and returns BadArgument
+int g6kv_copies_take(g6kv_pool* p, g6kv_copy* out, size_t cap, size_t* n);
 // retires a run with its session's finished PrefixReuse state, or releases it when valid <= 0 or reuse is off
 int g6kv_retain(g6kv_pool* p, const g6kv_run* r, const int32_t* history, size_t n, int32_t valid, int32_t written_end,
                 int32_t pf_end);

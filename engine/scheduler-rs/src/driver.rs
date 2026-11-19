@@ -530,6 +530,19 @@ impl Driver {
     }
 
     fn grow(&self, s: &S, stalled: &mut [bool; QMAX]) -> Res<()> {
+        // GR8_KV_SHARE_PAGES: a decoding session's prompt rows are all written, so later prompts may share them (every
+        // rank, the same sessions in the same order). Off, the pool is not called
+        if !self.pool.is_null() {
+            let mut p = self.pool()?;
+            if p.sharing() {
+                let mut keys = [Key::default(); QMAX];
+                let nd = sch::decoding_into(s.slots(), &mut keys);
+                for k in &keys[..nd] {
+                    let x = s.slot(k.slot as usize);
+                    p.prefilled(&kv(&x.run), x.prefilled).map_err(pool_err)?;
+                }
+            }
+        }
         if self.h.has_grow || self.u.grow {
             let mut keys = [Key::default(); QMAX];
             let nd = sch::decoding_into(s.slots(), &mut keys);

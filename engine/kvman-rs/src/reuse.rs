@@ -65,7 +65,30 @@ pub struct Begin {
 /// PrefixReuse::begin on a copy of `st`: the rows of `prompt` a session continuing it may skip (limit: rows its
 /// prefill may skip), and the longest common prefix.
 pub fn begin(rules: &Rules, st: &Finished, prompt: &[i32], limit: i32, mtp: bool) -> Begin {
-    let h = &st.history;
+    begin_on(rules, &st.history, st.valid, st.written_end, st.pf_end, prompt, limit, mtp, true)
+}
+
+/// begin() for a hit in the pool's own pages (GR8_KV_SHARE_PAGES, kvman-rs Pool::share_pages): the grid rule is off,
+/// so the skip may end inside a page (skip = min(skip, pf_end) instead of its grid floor). The CUDA prefill starts at
+/// any row; a tier keeps the grid (stash.rs storable), so stored hits still call begin().
+pub fn begin_pool(rules: &Rules, st: &Finished, prompt: &[i32], limit: i32, mtp: bool) -> Begin {
+    begin_on(rules, &st.history, st.valid, st.written_end, st.pf_end, prompt, limit, mtp, false)
+}
+
+/// begin() on the fields of a state: a live run's prompt and prefilled rows (Pool::prefilled) as well as a Finished.
+/// grid = false: begin_pool's rule.
+#[allow(clippy::too_many_arguments)]
+pub fn begin_on(
+    rules: &Rules,
+    h: &[i32],
+    valid: i32,
+    written_end: i32,
+    pf_end: i32,
+    prompt: &[i32],
+    limit: i32,
+    mtp: bool,
+    grid: bool,
+) -> Begin {
     let lcp = h.iter().zip(prompt).take_while(|(a, b)| a == b).count() as i64;
     let mut skip: i64 = 0;
     let mut why;
@@ -74,11 +97,11 @@ pub fn begin(rules: &Rules, st: &Finished, prompt: &[i32], limit: i32, mtp: bool
     } else if rules.strict && !(prompt.len() > h.len() && lcp == h.len() as i64) {
         why = Why::Strict;
     } else {
-        skip = (st.valid as i64).min(if mtp { lcp - 1 } else { lcp }).min(limit as i64);
+        skip = (valid as i64).min(if mtp { lcp - 1 } else { lcp }).min(limit as i64);
         if skip <= 0 {
             skip = 0;
             why = Why::NoLcp;
-        } else if !rules.noend && (prompt.len() as i64) < st.written_end as i64 {
+        } else if !rules.noend && (prompt.len() as i64) < written_end as i64 {
             skip = 0;
             why = Why::Short;
         } else {
@@ -86,8 +109,8 @@ pub fn begin(rules: &Rules, st: &Finished, prompt: &[i32], limit: i32, mtp: bool
         }
     }
     if skip != 0 && rules.grid > 0 {
-        let (pf, grid) = (st.pf_end as i64, rules.grid as i64);
-        skip = if skip >= pf && limit as i64 == pf { pf } else { skip.min(pf) / grid * grid };
+        let (pf, g) = (pf_end as i64, rules.grid as i64);
+        skip = if !grid || (skip >= pf && limit as i64 == pf) { skip.min(pf) } else { skip.min(pf) / g * g };
         if skip == 0 {
             why = Why::Grid;
         }
@@ -98,6 +121,35 @@ pub fn begin(rules: &Rules, st: &Finished, prompt: &[i32], limit: i32, mtp: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_hit_vectors() {
+        // begin_pool: the grid row of grid64_vectors without the floor (skip = min(skip, pf_end)), and the same
+        // misses. (grid, mtp, pf_end, valid, written_end, hist_len, prompt_len, lcp, limit, want_skip, want_why)
+        let cases = [
+            (64, false, 15086, 15150, 15151, 15151, 19668, 15151, 19667, 15086, Why::Hit),
+            (64, true, 15086, 15150, 15151, 15151, 19668, 15151, 19667, 15086, Why::Hit),
+            (64, false, 999, 1030, 1031, 1031, 2192, 191, 2191, 191, Why::Hit),
+            (64, true, 999, 1030, 1031, 1031, 2192, 191, 2191, 190, Why::Hit),
+            (64, false, 999, 1030, 1031, 1031, 2000, 63, 1999, 63, Why::Hit),
+            (64, true, 999, 1030, 1031, 1031, 2000, 64, 1999, 63, Why::Hit),
+            (64, false, 30000, 30000, 30000, 30000, 30128, 30000, 30127, 30000, Why::Hit),
+            (64, true, 30000, 30000, 30000, 30000, 30128, 30000, 30127, 29999, Why::Hit),
+            (64, true, 30000, 30000, 30000, 30001, 30128, 30001, 30127, 30000, Why::Hit),
+            (64, false, 0, 0, 0, 30000, 30128, 30000, 30127, 0, Why::NoLcp),
+            (0, false, 999, 1030, 1031, 1031, 2192, 191, 2191, 191, Why::Hit),
+        ];
+        for (grid, mtp, pf_end, valid, written_end, hist_len, prompt_len, lcp, limit, want_skip, want_why) in cases {
+            let rules = Rules { grid, strict: false, noend: false };
+            let st = Finished { history: vec![1; hist_len], valid, written_end, pf_end };
+            let mut prompt = vec![2; prompt_len];
+            prompt[..lcp].fill(1);
+            let b = begin_pool(&rules, &st, &prompt, limit, mtp);
+            assert_eq!(b, Begin { skip: want_skip, lcp: lcp as i32, why: want_why }, "{grid} {mtp} {pf_end} {lcp}");
+            // the grid rule never gives more than the pool rule
+            assert!(begin(&rules, &st, &prompt, limit, mtp).skip <= b.skip);
+        }
+    }
 
     #[test]
     fn grid64_vectors() {

@@ -424,11 +424,22 @@ pub async fn route(
     req: Request<Incoming>,
     peer: std::net::SocketAddr,
 ) -> Result<Response<HttpBody>, Infallible> {
-    let path = req.uri().path();
+    let path = req.uri().path().to_owned();
     let deep = req.uri().query().is_some_and(|q| q.split('&').any(|x| x == "deep" || x.starts_with("deep=")));
     let m = req.method().clone();
-    let r = match (path, &m) {
+    let r = match (path.as_str(), &m) {
         ("/v1/chat/completions", &Method::POST) => chat(st, req).await,
+        (p, &Method::POST) if st.sessions.is_some() && p.starts_with("/v1/sessions/") && p.ends_with("/forks") => {
+            let id = &p[13..p.len() - 6];
+            session_forks(st, id, req).await
+        }
+        (p, &Method::DELETE) if st.sessions.is_some() && p.starts_with("/v1/sessions/") => {
+            let id = &p[13..];
+            match st.sessions.as_ref().unwrap().delete(id) {
+                Ok(()) => json_value(200, serde_json::json!({"id": id, "deleted": true})),
+                Err(e) => e.response(),
+            }
+        }
         ("/v1/completions", &Method::POST) => completions(st, req).await,
         ("/tokenize", &Method::POST) => tokenize(st, req).await,
         ("/detokenize", &Method::POST) => detokenize(st, req).await,
@@ -449,6 +460,53 @@ pub async fn route(
         _ => response(404, "text/plain; charset=utf-8", b"404: Not Found".to_vec()),
     };
     Ok(r)
+}
+
+async fn session_forks(st: &'static State, id: &str, req: Request<Incoming>) -> Response<HttpBody> {
+    let (body, _) = match read_json_raw(req).await {
+        Ok(b) => b,
+        Err(e) => return e.response(),
+    };
+    let count = match body.get("count").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok()) {
+        Some(n) => n,
+        None => return ApiError::bad("count must be between 1 and 16", Some("count")).response(),
+    };
+    if !(1..=16).contains(&count) {
+        return ApiError::bad("count must be between 1 and 16", Some("count")).response();
+    }
+    let (messages, parent_prompt, mut render, rev) = match st.sessions.as_ref().unwrap().snapshot(id) {
+        Ok(s) => s,
+        Err(e) => return e.response(),
+    };
+    render.insert("messages".into(), Value::Array(messages));
+    render.insert("max_tokens".into(), Value::from(1));
+    let raw = serde_json::to_vec(&render).unwrap_or_default();
+    let candidate = match chat_prepare(st, &render, &raw).await {
+        Ok(c) => c,
+        Err(e) => return e.response(),
+    };
+    let prefix = parent_prompt.iter().zip(&candidate.prompt).take_while(|(a, b)| a == b).count();
+    match st.sessions.as_ref().unwrap().fork(id, count, prefix, rev) {
+        Ok(v) => json_value(200, v),
+        Err(e) => e.response(),
+    }
+}
+
+fn session_render(body: &Map<String, Value>) -> Map<String, Value> {
+    const KEYS: &[&str] = &[
+        "model",
+        "tools",
+        "tool_choice",
+        "chat_template_kwargs",
+        "documents",
+        "reasoning_effort",
+        "thinking",
+        "enable_thinking",
+        "add_generation_prompt",
+        "continue_final_message",
+        "response_format",
+    ];
+    KEYS.iter().filter_map(|&k| body.get(k).map(|v| (k.to_owned(), v.clone()))).collect()
 }
 
 // ---- /v1/chat/completions ----------------------------------------------------------------------------------------
@@ -800,14 +858,60 @@ async fn ds_system_span(
 }
 
 async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> {
-    let (body, raw) = match read_json_raw(req).await {
+    let (mut body, raw) = match read_json_raw(req).await {
         Ok(b) => b,
         Err(e) => return e.response(),
     };
+    let mut session: Option<(String, bool, Vec<Value>)> = None;
+    let create = st.sessions.is_some()
+        && body.get("session").and_then(Value::as_object).and_then(|v| v.get("create")) == Some(&Value::Bool(true));
+    if let Some(store) = &st.sessions {
+        if create && body.contains_key("session_id") {
+            return ApiError::bad("session.create and session_id are exclusive", Some("session")).response();
+        }
+        if let Some(id) = body.get("session_id").and_then(Value::as_str).map(str::to_owned) {
+            let append = match body.get("append_messages").and_then(Value::as_array) {
+                Some(a) if !a.is_empty() => a.clone(),
+                _ => {
+                    return ApiError::bad("append_messages must be a nonempty array", Some("append_messages"))
+                        .response()
+                }
+            };
+            let model = body.get("model").and_then(Value::as_str);
+            let (messages, render) = match store.begin(&id, &append, model) {
+                Ok(m) => m,
+                Err(e) => return e.response(),
+            };
+            for (k, v) in render {
+                body.entry(k).or_insert(v);
+            }
+            body.insert("messages".into(), Value::Array(messages));
+            session = Some((id, false, append));
+        } else if create {
+            let messages = match body.get("messages").and_then(Value::as_array) {
+                Some(a) => a.clone(),
+                None => return ApiError::bad("messages must be an array", Some("messages")).response(),
+            };
+            session = Some((String::new(), true, messages));
+        }
+    }
     let cr = match chat_prepare(st, &body, &raw).await {
         Ok(c) => c,
-        Err(e) => return e.response(),
+        Err(e) => {
+            if let Some((id, false, _)) = &session {
+                st.sessions.as_ref().unwrap().abort(id, false);
+            }
+            return e.response();
+        }
     };
+    if let Some((id, true, messages)) = &mut session {
+        *id = st.sessions.as_ref().unwrap().create(
+            messages.clone(),
+            cr.prompt.clone(),
+            body.get("model").and_then(Value::as_str).unwrap_or(&st.model_name).to_owned(),
+            session_render(&body),
+        );
+    }
     let rid = new_id("chatcmpl");
     // thinking off withholds the reasoning, whatever the model still writes in its think block
     let include_reasoning = !cr.thinking_off && body.get("include_reasoning").is_none_or(|v| truthy(Some(v)));
@@ -907,14 +1011,35 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
         // streamed event must be an HTTP status, not an SSE event after the 200 is out: the response starts only once
         // the engine answered something (PROTOCOL.md "the front end fails them with HTTP 500 / a stream error chunk")
         if let Err(e) = gen.start(&st.engine) {
+            if let Some((id, created, _)) = &session {
+                st.sessions.as_ref().unwrap().abort(id, *created);
+            }
             return e.response();
         }
         let pre = match gen.next().await {
             Ok(p) => p,
-            Err(e) => return e.response(),
+            Err(e) => {
+                if let Some((id, created, _)) = &session {
+                    st.sessions.as_ref().unwrap().abort(id, *created);
+                }
+                return e.response();
+            }
         };
-        let (sse, resp) = Sse::open();
-        tokio::spawn(async move { chat_stream(st, body, gen, parser, guard, rf, sse, pre).await });
+        if pre.as_ref().is_some_and(|s| !s.ids.is_empty()) {
+            if let Some((id, _, _)) = &session {
+                st.sessions.as_ref().unwrap().ready(id);
+            }
+        }
+        let session_parser = session.as_ref().map(|_| new_parser());
+        let (sse, mut resp) = Sse::open();
+        if let Some((id, _, _)) = &session {
+            if let Ok(v) = header::HeaderValue::from_str(id) {
+                resp.headers_mut().insert("x-session-id", v);
+            }
+        }
+        tokio::spawn(
+            async move { chat_stream(st, body, gen, parser, guard, rf, sse, pre, session, session_parser).await },
+        );
         return resp;
     }
     let created = now_secs();
@@ -922,9 +1047,32 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody> 
     // whole text afterwards, which reads the same call), and the guard reads a held call before the reply ends
     let mut watch = (st.dialect == Dialect::Ds41 || guard.is_some()).then(new_parser);
     if let Err(e) = run_to_end(st, &mut gen, watch.as_mut(), guard.as_mut()).await {
+        if let Some((id, created, _)) = &session {
+            st.sessions.as_ref().unwrap().abort(id, *created);
+        }
         return e.response();
     }
-    chat_full(st, &body, &gen, parser, &rf, created)
+    let resp = chat_full(st, &body, &gen, parser, &rf, created, session.as_ref().map(|x| x.0.as_str()));
+    if let Some((id, made, append)) = &session {
+        if let Some(message) = response_message(&resp) {
+            st.sessions.as_ref().unwrap().finish(
+                id,
+                if *made { &[] } else { append },
+                message,
+                gen.prompt.clone(),
+                session_render(&body),
+            );
+        } else {
+            st.sessions.as_ref().unwrap().abort(id, *made);
+        }
+    }
+    resp
+}
+
+fn response_message(resp: &Response<HttpBody>) -> Option<Value> {
+    let HttpBody::Full(Some(bytes)) = resp.body() else { return None };
+    let v: Value = serde_json::from_slice(bytes).ok()?;
+    v.get("choices")?.as_array()?.first()?.get("message").cloned()
 }
 
 async fn run_to_end(
@@ -971,6 +1119,7 @@ fn chat_full(
     mut parser: AnyParser,
     rf: &jsonmode::Rf,
     created: u64,
+    session_id: Option<&str>,
 ) -> Response<HttpBody> {
     let res = &gen.res;
     let mut p = parser.parse_full(&res.text);
@@ -1057,6 +1206,9 @@ fn chat_full(
         c.raw("prompt_token_ids", b"null");
     }
     c.raw("kv_transfer_params", b"null");
+    if let Some(id) = session_id {
+        c.str("session_id", id);
+    }
     if !warnings.is_empty() {
         let w = c.key("warnings");
         w.push(b'[');
@@ -1122,6 +1274,8 @@ async fn chat_stream(
     rf: jsonmode::Rf,
     sse: Sse,
     mut pre: Option<Step>,
+    session: Option<(String, bool, Vec<Value>)>,
+    mut session_parser: Option<AnyParser>,
 ) {
     let created = now_secs();
     let so = body.get("stream_options").and_then(Value::as_object);
@@ -1134,6 +1288,7 @@ async fn chat_stream(
     let mut tools_streamed = false;
     let json_mode = rf.kind != "text";
     let mut held_content = String::new(); // JSON mode: content is withheld until the end, then extracted
+    let mut committed = false;
     let r: Result<(), ApiError> = async {
         // the engine request is already started and its first frame is `pre` (the handler held the HTTP response back
         // for it, so a refusal arrives as the status); None = the engine finished without a token
@@ -1148,6 +1303,9 @@ async fn chat_stream(
                 },
             };
             let Some(step) = step else { break };
+            if !step.ids.is_empty() {
+                if let Some((id, _, _)) = &session { st.sessions.as_ref().unwrap().ready(id); }
+            }
             if first {
                 first = false;
                 let mut o = Vec::with_capacity(256);
@@ -1159,6 +1317,7 @@ async fn chat_stream(
                 if ret_ids {
                     ids_json(c.key("prompt_token_ids"), &gen.prompt);
                 }
+                if let Some((id, _, _)) = &session { c.str("session_id", id); }
                 if continuous {
                     usage(c.key("usage"), gen.res.prompt_tokens, 0, None, false, false, None, None);
                 }
@@ -1208,6 +1367,20 @@ async fn chat_stream(
             }
         }
         gen.finish_stats().await;
+        if let Some((id, made, append)) = &session {
+            if let Some(p) = session_parser.as_mut() {
+                let parsed = p.parse_full(&gen.res.text);
+                let mut message = Map::new();
+                message.insert("role".into(), Value::String("assistant".into()));
+                message.insert("content".into(), parsed.content.map(Value::String).unwrap_or(Value::Null));
+                if !parsed.calls.is_empty() {
+                    message.insert("tool_calls".into(), Value::Array(parsed.calls.into_iter().map(|(id, name, arguments)|
+                        serde_json::json!({"id": id, "type": "function", "function": {"name": name, "arguments": arguments}})).collect()));
+                }
+                st.sessions.as_ref().unwrap().finish(id, if *made { &[] } else { append }, Value::Object(message), gen.prompt.clone(), session_render(&body));
+                committed = true;
+            }
+        }
         if include_usage {
             let res = &gen.res;
             let mut o = Vec::with_capacity(256);
@@ -1231,6 +1404,11 @@ async fn chat_stream(
         Ok(())
     }
     .await;
+    if !committed {
+        if let Some((id, made, _)) = &session {
+            st.sessions.as_ref().unwrap().abort(id, *made);
+        }
+    }
     if let Err(e) = r {
         if sse.send(e.sse()).await.is_err() {
             return;
@@ -2015,7 +2193,10 @@ mod http_tokenize_chat_tests {
 
     /// A PROTOCOL.md engine that records each generate frame and answers it with `reply`, ending at `length`.
     async fn fake_engine(reply: Vec<u32>) -> (Arc<Engine>, Arc<Mutex<Vec<Value>>>) {
-        let path = std::env::temp_dir().join(format!("g6front-http-{}.sock", std::process::id()));
+        // /tmp, not temp_dir(): macOS runners have a long temp_dir and a socket path must fit SUN_LEN (104 bytes)
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::path::PathBuf::from(format!("/tmp/g6f-{}-{n}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
         let gens = Arc::new(Mutex::new(Vec::new()));
@@ -2053,6 +2234,11 @@ mod http_tokenize_chat_tests {
 
     /// One HTTP/1.1 POST with Connection: close; the status and the JSON body.
     async fn post(addr: std::net::SocketAddr, path: &str, body: &Value) -> (u16, Value) {
+        let (status, payload) = post_raw(addr, path, body).await;
+        (status, serde_json::from_slice(&payload).unwrap_or(Value::Null))
+    }
+
+    async fn post_raw(addr: std::net::SocketAddr, path: &str, body: &Value) -> (u16, Vec<u8>) {
         let b = serde_json::to_vec(body).unwrap();
         let mut s = TcpStream::connect(addr).await.unwrap();
         let head = format!(
@@ -2080,7 +2266,7 @@ mod http_tokenize_chat_tests {
             }
             payload = out;
         }
-        (status, serde_json::from_slice(&payload).unwrap_or(Value::Null))
+        (status, payload)
     }
 
     /// The prompt text both handlers render for a DS41 request without tools (dialect::resolve_ds + ds_prompt).
@@ -2129,8 +2315,9 @@ mod http_tokenize_chat_tests {
             sequence: None,
             started: now_secs(),
             supervisor: None,
+            sessions: None,
         }));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
@@ -2141,6 +2328,15 @@ mod http_tokenize_chat_tests {
                 });
             }
         });
+
+        let (off_status, off_body) = post_raw(addr, "/v1/sessions/absent/forks", &json!({"count": 1})).await;
+        assert_eq!((off_status, off_body.as_slice()), (404, b"404: Not Found".as_slice()));
+        let base = json!({"model": st.model_name, "messages": [{"role": "user", "content": "same"}]});
+        let mut with_session = base.clone();
+        with_session["session"] = json!({"create": true});
+        let a = post_raw(addr, "/tokenize", &base).await;
+        let b = post_raw(addr, "/tokenize", &with_session).await;
+        assert_eq!(a, b, "knob off: existing route bytes must not change");
 
         let system = "system tools schema: read files, run commands, edit code\n".repeat(120);
         let mut messages = vec![json!({"role": "system", "content": system})];
@@ -2181,6 +2377,102 @@ mod http_tokenize_chat_tests {
         assert_eq!(gens.lock().unwrap().len(), 4);
         eprintln!("HTTP_TOKENIZE_CHAT turns=4 cache_hits={last_hits}");
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_http_lifecycle() {
+        let tok = crate::tok::prefix_tests::fixture(true);
+        let dir = std::env::temp_dir().join(format!("g6front-session-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        tok.tk.save(dir.join("tokenizer.json"), false).unwrap();
+        let grammars = crate::grammar::Grammars::load(&dir, tok.vocab_size).unwrap();
+        let reply: Vec<u32> = "answer".bytes().map(|b| tok.tk.token_to_id(&(b as char).to_string()).unwrap()).collect();
+        let (engine, gens) = fake_engine(reply).await;
+        let st: &'static State = Box::leak(Box::new(State {
+            tok,
+            template: None,
+            dialect: Dialect::Ds41,
+            ds_effort: dialect::DS_DEFAULT_EFFORT,
+            ds_thinking_default: true,
+            forced_tool_thinking: false,
+            ink_effort: None,
+            engine,
+            served: vec!["model".into()],
+            model_name: "model".into(),
+            model_dir: dir.to_string_lossy().into_owned(),
+            reasoning_fields: &["reasoning_content"],
+            prompt_tokens_details: true,
+            max_model_len_override: 0,
+            default_max_tokens: 0,
+            share_tokens: 0,
+            clamp_max_tokens: false,
+            thinking: thinking::Defaults { effort: None, budget: sampling::Limit::Tokens(0), allow_off: true },
+            grammars,
+            emit_undeclared: true,
+            guard: guard::Config::default(),
+            penalties: sampling::Penalties::default(),
+            boost: None,
+            sequence: None,
+            started: now_secs(),
+            supervisor: None,
+            sessions: Some(crate::sessions::Sessions::new(Duration::from_secs(60))),
+        }));
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (sock, peer) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| route(st, req, peer));
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(sock), svc).await;
+                });
+            }
+        });
+        let (status, made) = post(addr, "/v1/chat/completions", &json!({
+            "model":"model", "session":{"create":true}, "messages":[{"role":"user","content":"base"}], "max_tokens":6
+        })).await;
+        assert_eq!(status, 200, "{made}");
+        let parent = made["session_id"].as_str().unwrap();
+        let (status, forked) = post(addr, &format!("/v1/sessions/{parent}/forks"), &json!({"count":3})).await;
+        assert_eq!(status, 200, "{forked}");
+        assert!(forked["prefix_tokens"].as_u64().unwrap() > 0);
+        let ids = forked["fork_ids"].as_array().unwrap();
+        assert_eq!(ids.len(), 3);
+        let (status, first) = post(addr, "/v1/chat/completions", &json!({
+            "model":"model", "session_id":ids[0], "append_messages":[{"role":"user","content":"branch A"}], "max_tokens":6
+        })).await;
+        assert_eq!(status, 200, "{first}");
+        assert_eq!(first["session_id"], ids[0]);
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        sock.write_all(
+            format!("DELETE /v1/sessions/{parent} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut deleted = Vec::new();
+        sock.read_to_end(&mut deleted).await.unwrap();
+        assert!(String::from_utf8_lossy(&deleted).contains("200 OK"), "{}", String::from_utf8_lossy(&deleted));
+        let (status, second) = post(addr, "/v1/chat/completions", &json!({
+            "model":"model", "session_id":ids[1], "append_messages":[{"role":"user","content":"branch B"}], "max_tokens":6
+        })).await;
+        assert_eq!(status, 200, "{second}");
+        assert_eq!(gens.lock().unwrap().len(), 3);
+        let (status, unknown) = post(addr, "/v1/sessions/missing/forks", &json!({"count":1})).await;
+        assert_eq!(status, 404, "{unknown}");
+        let (status, streamed) = post_raw(
+            addr,
+            "/v1/chat/completions",
+            &json!({
+                "model":"model", "session":{"create":true}, "messages":[{"role":"user","content":"stream"}],
+                "max_tokens":6, "stream":true
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let stream_text = String::from_utf8(streamed).unwrap();
+        assert!(stream_text.contains("\"session_id\":\"sess-"), "{stream_text}");
+        assert!(stream_text.contains("data: [DONE]"), "{stream_text}");
+    }
+
     /// The literal-content gate: every case in `literal_golden.json` was tokenized by the release's own tokenizer
     /// (`frontend/tests/literal_golden.py`), so these ids are what the model was trained to see. Each one goes
     /// through the real router on /v1/chat/completions, and the prompt the engine receives must equal them id for id
@@ -2242,6 +2534,7 @@ mod http_tokenize_chat_tests {
             sequence: None,
             started: now_secs(),
             supervisor: None,
+            sessions: None,
         }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

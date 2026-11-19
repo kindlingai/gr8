@@ -2406,6 +2406,15 @@ int main(int argc, char** argv)
             if (knob::pool_log()) pool.log(true);   // one stderr line per pool claim: first page, pages, evicted retained runs
             if (R == 0) fprintf(stderr, "# s2 reuse on: retired runs kept until a claim overlaps them; grid %d rows\n", rules.grid);
         }
+        // GR8_KV_SHARE_PAGES=1: runs below R share the pages of a common prompt prefix (kvman-rs Pool::share_pages): a live
+        // session's prefilled prompt and retained runs, counted per holder; a hit inside a page copies that page's rows
+        // below the hit (on_bind, on_grown: s2_copy_rows). Every prompt is counted (po.count), so each rank's pool has it
+        if (knob::kv_share_pages())
+        {
+            if (!pool.keeping()) die("GR8_KV_SHARE_PAGES=1 needs prefix reuse (--reuse-prefix)");
+            pool.share_pages(true);
+            if (R == 0) fprintf(stderr, "# s2 GR8_KV_SHARE_PAGES=1: prompt pages shared between sessions below R\n");
+        }
         // --kv-store: block stores below the pool, in flag order, the same number of blocks on every rank. An SSD store lives in
         // PATH/r<rank>; its system prefixes and the counts survive restarts (their index needs --set-id: the blocks belong to
         // one model). A store's keep=, else --kv-keep, sets its keep rule and policy (kvman-rs stash.rs Keep, Policy)
@@ -2842,6 +2851,7 @@ int main(int argc, char** argv)
                 po.tiers = g6s2::pol::tiers<GP, &GP::on_tiers>;
                 po.count = true;
             }
+            if (pool.sharing()) po.count = true;   // GR8_KV_SHARE_PAGES: the pool learns every prompt (its live runs' tokens)
             struct GlmModule : g6s2::ModuleCtx
             {
                 GLM_CAPTURES(G6S2_CAPTURE_REF)
@@ -2850,6 +2860,12 @@ int main(int argc, char** argv)
                 void on_bind(const g6s2::Grant& g) {     // at the admission fence, every rank, main and draft
                     // the store copies the grant queued: evicted runs out before anything writes their pages, a stored run in
                     kv_drain();
+                    // GR8_KV_SHARE_PAGES: then the copy-on-write copies (a hit inside a shared page), before any prefill writes them
+                    if (pool.sharing())
+                    {
+                        const std::vector<g6kv_copy> cs = pool.copies();
+                        for (Model* x : {&m, &D.d}) s2_copy_rows(*x, cs, st);
+                    }
                     if (R == bind_delay_rank && bind_delay_ms)
                     {
                         fprintf(stderr, "# rank %d: GR8_S2_BIND_DELAY: sleeping %d ms after the bind of request %llu at %lld ms\n", R, bind_delay_ms,
@@ -2953,6 +2969,8 @@ int main(int argc, char** argv)
                 }
                 void on_grown(unsigned q, const g6s2::Run& r) {
                     kv_drain();   // runs the growth evicted, out before the zeroing below
+                    // GR8_KV_SHARE_PAGES: a run whose last page another holder shares gets a fresh copy of it (Pool::grow's guard)
+                    const std::vector<g6kv_copy> cs = pool.sharing() ? pool.copies() : std::vector<g6kv_copy>{};
                     if (rtt && rtt->local) rt_gc(*rtt, [&](const std::vector<int>& l) { return pool.is_kept(l); }, st);
                     const std::vector<int> list = pool.list(r);
                     if (rtt && list.size() > m.s2->run[q].size())   // the new pages are cleared: none may stay flagged
@@ -2960,7 +2978,13 @@ int main(int argc, char** argv)
                     for (Model* x : {&m, &D.d})
                     {
                         const std::vector<int> old = x->s2->run[q];
-                        g6s2::require(list.size() > old.size() && std::equal(old.begin(), old.end(), list.begin()), "grown run does not extend the slot's pages");
+                        // GR8_KV_SHARE_PAGES: a copy may replace the old last page (its rows come from the copy). The copies run
+                        // first: a page this growth clears may be a queued copy's source, freed by the growth
+                        const bool cow = !cs.empty() && !old.empty() && list.size() >= old.size() && list[old.size() - 1] != old.back() &&
+                                         std::any_of(cs.begin(), cs.end(), [&](const g6kv_copy& c) { return (int)c.from == old.back() && (int)c.to == list[old.size() - 1]; });
+                        const size_t keep = old.size() - (cow ? 1 : 0);
+                        g6s2::require(list.size() > old.size() && std::equal(old.begin(), old.begin() + keep, list.begin()), "grown run does not extend the slot's pages");
+                        s2_copy_rows(*x, cs, st);
                         s2_zero_pages(*x, std::vector<int>(list.begin() + old.size(), list.end()), st);
                         s2_set_pages(*x, (int)q, list);
                         if (!x->s2on) s2_solo_pages(*x, list);

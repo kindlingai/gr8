@@ -37,6 +37,8 @@
 #include <memory>
 #include <tuple>
 #include "s2_cells.cuh"
+#include "s2/kv_copy_rows.h"
+#include "../kvman-rs/g6kvman.h"
 #include "../knobs-rs/gr8_knobs.h"
 
 namespace g6rt
@@ -78,6 +80,9 @@ struct S2Model
     int rp[S2N] = {};                 // per slot, that run's prefix pages: the R it was granted at / 64 (GR8_CP_R2)
     int* table[S2N] = {};             // [nslots] device: the slot's block table, table_cap entries, shared by every layer's view
     int* zero_list = nullptr;         // [pool_pages] device: the pages s2_reset_pages clears
+    uint4** copy_tab = nullptr;       // GR8_KV_SHARE_PAGES: [2 * nl] device: each pool binding's latent and index cache (s2_copy_rows)
+    g6kvcopy::Copy* copy_buf = nullptr;   // [copy_cap] device: one launch's page copies
+    int copy_cap = 0;
     G6AttnStepCell* cells = nullptr;  // [S2N][nl] device
     bool batch = true;                // one attention call per layer for the whole step (false: per session)
     // with batch: the per-session views' one shared ids [MX][S2_SEL] and output [MX][HMAX][256] (never read, see s2_init)
@@ -553,6 +558,55 @@ inline void s2_copy_pages(Model& m, const std::vector<std::pair<int, int>>& move
             if (g.index_cache)
                 G6RT_CK(cudaMemcpyAsync((char*)g.index_cache + (size_t)b * ix, (const char*)g.index_cache + (size_t)a * ix, ix, cudaMemcpyDeviceToDevice, st));
         }
+    }
+}
+// GR8_KV_SHARE_PAGES: grid (bindings, copies), block 256: rows [0, rows) of page `from` -> page `to` of binding x's latent
+// and index caches (kv_copy_rows.h). No two copies of one launch write one page or read a page another writes.
+__global__ void __launch_bounds__(256) k_kv_copy_page_rows(uint4* const* tab, const g6kvcopy::Copy* copies)
+{
+    g6kvcopy::copy_page_rows<uint4>(tab[2 * blockIdx.x], tab[2 * blockIdx.x + 1], g6kv::ROW, g6kv::IDX_ROW, copies[blockIdx.y],
+                                    threadIdx.x, blockDim.x);
+}
+// the pool's copy-on-write copies (s2/pool.h RunPool::copies(), in order) on the layers' own bindings: one launch per
+// run of copies whose sources no earlier copy of the run writes. Host, at an admission fence or between rounds, on every
+// rank, main AND draft model, after the store copies (kv_drain) and before anything writes a `to` page.
+inline void s2_copy_rows(Model& m, const std::vector<g6kv_copy>& copies, cudaStream_t st)
+{
+    S2Model& s = *m.s2;
+    if (copies.empty()) return;
+    for (const g6kv_copy& c : copies)
+        if (c.from == c.to || c.rows == 0 || c.rows > 64 || (int)c.from >= s.pool_pages || (int)c.to >= s.pool_pages)
+            die("s2_copy_rows: a copy outside the pool, onto itself or of no rows");
+    const int nb = (int)s.pool.size();
+    if (!s.copy_tab)
+    {
+        std::vector<uint4*> t(2 * nb);
+        for (int l = 0; l < nb; ++l)
+        {
+            t[2 * l] = static_cast<uint4*>(s.pool[l]->args.mla_cache);
+            t[2 * l + 1] = static_cast<uint4*>(s.pool[l]->args.index_cache);
+        }
+        s.copy_tab = dmalloc<uint4*>(t.size());
+        G6RT_CK(cudaMemcpy(s.copy_tab, t.data(), t.size() * sizeof(uint4*), cudaMemcpyHostToDevice));
+    }
+    if ((int)copies.size() > s.copy_cap)
+    {
+        if (s.copy_buf) G6RT_CK(cudaFree(s.copy_buf));
+        s.copy_cap = std::max<int>(64, (int)copies.size());
+        s.copy_buf = dmalloc<g6kvcopy::Copy>(s.copy_cap);
+    }
+    std::vector<g6kvcopy::Copy> h(copies.size());
+    for (size_t i = 0; i < copies.size(); ++i) h[i] = {copies[i].from, copies[i].to, copies[i].rows};
+    G6RT_CK(g6h2d::copy(s.copy_buf, h.data(), h.size() * sizeof(g6kvcopy::Copy), st));
+    size_t i = 0;
+    while (i < h.size())
+    {
+        size_t j = i + 1;
+        auto writes = [&](uint32_t p) { for (size_t k = i; k < j; ++k) if (h[k].to == p) return true; return false; };
+        while (j < h.size() && !writes(h[j].from) && !writes(h[j].to)) ++j;
+        k_kv_copy_page_rows<<<dim3((unsigned)nb, (unsigned)(j - i)), 256, 0, st>>>(s.copy_tab, s.copy_buf + i);
+        G6RT_CK(cudaGetLastError());
+        i = j;
     }
 }
 // re-base slot q's run, keeping its pages (s2_relocate)
