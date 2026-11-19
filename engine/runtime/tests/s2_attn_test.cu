@@ -627,7 +627,20 @@ static void run_rep(const Case& c, uint64_t seed)
 #if defined(G6_CP) && G6_CP
         // E: C's per-session calls on a binding with twice the pages behind the same table (GR8_CAP_TOTAL's drafter):
         // every run sits in the upper half, past table_size, so each table entry is above it
-        auto PE = make_pool(A, pk, 0, K, P, scr, sb, nullptr, 2 * K * P);
+        // bound as the drafter is (GR8_DEC_SHARED_SCRATCH: shared ids and output), so the error word follows the table:
+        // filling page_count entries of a table_size table ran into it and past the binding's storage
+        Pack pkx[NL];
+        for (int l = 0; l < NL; ++l)
+        {
+            pkx[l] = pk[l];
+            pkx[l].p.ext_indices = A.alloc<int>((size_t)MXR * 2048);
+            pkx[l].p.ext_output = A.alloc<__half>((size_t)MXR * g6nr::HMAX * 256);
+            pkx[l].p.ext_rows = MXR;
+            pkx[l].p.ext_heads = g6nr::HMAX;
+        }
+        auto PE = make_pool(A, pkx, 0, K, P, scr, sb, nullptr, 2 * K * P);
+        bool errE0 = true;
+        for (int l = 0; l < NL; ++l) errE0 = errE0 && dev_word(PE->ab[l].args.error) == 0;
         const size_t hiK = (size_t)K * P * 64;   // rows below the upper half
         std::vector<const int*> tabsE((size_t)S2N * NL, nullptr);
         for (int q = 0; q < K; ++q)
@@ -677,6 +690,7 @@ static void run_rep(const Case& c, uint64_t seed)
         CK(cudaGetLastError());
         Chk ke;
         ke.need(PE->ab[0].args.page_count == 2 * K * P && PE->ab[0].args.table_size == K * P, "binding pages");
+        ke.need(errE0, "binding error word after create");
         for (int l = 0; l < NL; ++l) ke.rows(catA[l], catE[l], M, (size_t)heads[l] * 256 * 2, "outE" + std::to_string(l));
         for (int j = 0; j < ns; ++j)
             for (int l = 0; l < NL; ++l) ke.need(dev_word(PE->sv[l][slots[j]]->args.error) == 0, "errE");
