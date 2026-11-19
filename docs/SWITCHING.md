@@ -239,8 +239,20 @@ What the scale keeps the same, so the store's blocks stay valid: the running var
 after its first scale. Output after a scale is that of a fresh boot at the new width given the same stored state; a
 run that never scaled may give other tokens (another width computes other KV bits).
 
-The pause (hold set to hold cleared) and the drain time of a 4->3 and a 3->4 scale on GB10s are not measured yet;
-`scale` prints both for each run.
+Measured on 2026-11-19 with GLM-5.3-Flash on two DGX Sparks (one cable, `--variant k2`, fp8 KV, `--cap 65536`,
+`FLASH_CACHE=aligned` with a persisted `ssd:` store, the warm model on local disk), a request every 0.5 s through the
+head's API the whole time, and three 26.8K-token prompts checkpointed at 24,576 rows before the first scale:
+
+| scale | requests waited (hold set to cleared) | checkpoints carried | a stored prompt again |
+|---|---|---|---|
+| TP=2 -> 1 (`--extra-env GR8_MEM_MIN=6`) | 39.2 s | 3 of 3, verified | 3.1-3.3 s (27.7 s cold at TP=1) |
+| TP=1 -> 2, the second box joining | 46.7 s | 3 of 3 on each rank | 2.1 s (15.8 s cold at TP=2) |
+
+No request failed (0 of 53 not 200 across both scales); the drain took 0 s (the short requests had finished). Two attempts at TP=1
+without `GR8_MEM_MIN=6` stopped at boot with 6.2 and 7.1 GiB left (k2's 93 GB device image, two prefill lanes) and
+rolled back to TP=2: the requests waited 68 s and none failed, and the stored prompts hit again at TP=2. The checkpoint
+carry needs the same `CAP`, prefill rows and lanes at both widths (they are in the store's compatibility line). GLM-5.3
+4->3 and 3->4 are not measured yet.
 
 ## The GLM-5.3-Flash pair (TP=2)
 
