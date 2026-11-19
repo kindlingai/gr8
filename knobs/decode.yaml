@@ -15,6 +15,14 @@ knobs:
     doc: >-
       The largest doubled decode context bucket: GR8_DEC_BK doubles up to it, then the next bucket is R under CP and the
       KV pool's cap. Every bucket costs a set of decode graphs (about 0.9 GiB a rank on the 4-box GLM-5.3). 0 = no bound.
+  GR8_DEC_DENSE_OPT:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      Runs the bit-exact fused decode dense kernels on GLM-5.3 (fused layer-input q_a/kv_a/idx_k/idx_w with last-CTA
+      gather publish, single-pass q_a norm + rotation, fused exact idx_q + trellis q_b, and no-scratch trellis o_proj
+      where the k-split matches stock). Same output bits.
   GR8_DEC_EVPROF:
     scope: local
     kind: int
@@ -51,6 +59,15 @@ knobs:
     doc: >-
       Uses the exlr8 release's dense trellis matrices (q_b, o_proj, the dense MLP) where a layer has them. 0 = the int4
       or MXFP8 records, which the layer must then have.
+  GR8_DTR_EXACT_OPT:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      Runs bit-exact dense trellis o_proj and q_b (+ fused idx_q) decode kernels on GLM-5.3 (parallel pre-rotation,
+      512-thread smem-staged xa 1-barrier o_proj direct to send slot for stock_parts in {2, 4}, exact 16-bucket ks=4/ks=2
+      q_b with direct epilogue and fused idx_q+q_b). Same output bits; takes precedence over GR8_DEC_DENSE_OPT on trellis
+      o_proj and q_b when both are enabled.
   GR8_DTR_NBFAST:
     scope: agree
     kind: flag
@@ -204,6 +221,14 @@ knobs:
     values: "0|1|2"
     doc: >-
       Quality test: rounds mHC residual stream writes to BF16, 1 = after both blocks, 2 = only after the MLP block.
+  GR8_MOE_RTR_FIN_OPT:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      Runs bit-exact fused MoE router+plan and reduced-warp K1 finalize decode kernels on GLM-5.3 under a strict per-(TP,
+      M) table (TP6 M=1,2,4,8,16 and TP4 M=2,4,8,16; TP4 M=1 and all other M fall back to stock). Same output bits;
+      stacks cleanly with GR8_TR3_WIDE4=1 and GR8_ROUTE_OVL.
   GR8_MOE_TOPK:
     scope: agree
     kind: int
@@ -268,6 +293,14 @@ knobs:
     doc: >-
       Uses the window-2 fc1 split (256-thread CTAs, KS1 x2, WG 1) at M > 1 on every MoE layer, not only layers with
       2-bit units. Same k ranges and order, so the same bits (bind.cuh k1_split).
+  GR8_TR3_WIDE4:
+    scope: agree
+    kind: flag
+    default: "0"
+    legacy: []
+    doc: >-
+      Reorders 4-bit trellis MoE fc1 and fc2 weights in place into 128-bit coalesced wide-K4 order (0 extra bytes) on
+      block-scale expert-tile layers and enables bit-exact per-M wide-K4 decode and prefill MoE kernels. Same bits.
   GR8_WARM:
     scope: agree
     kind: int

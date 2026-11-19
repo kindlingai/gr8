@@ -41,6 +41,15 @@ knobs:
     doc: >-
       Sets the fewest rows a prefill fc1 pass needs to use the A-operand share. Smaller passes run the stock fc1, with
       the same bytes.
+  GR8_PF_ATTN_OPT:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      1 runs the bit-exact optimized prefill attention kernels (PTX m16n8k16 N=64 indexer score, FP32 fast-reject
+      top-2048 selector, vectorized E4M3 index-key expand, and vectorized INT4 KV prepass; QO core_b_half untouched).
+      Takes precedence over GR8_PF_ISGRT_CLEAN when both are enabled. 0 runs the stock kernels.
   GR8_PF_ATTN_ROWS:
     scope: agree
     kind: int
@@ -64,6 +73,15 @@ knobs:
     doc: >-
       Sets the context up to which prefill attention takes the dense path. Past it the sparse, indexer-selected path
       runs. 0 means always sparse.
+  GR8_PF_DENSE_OPT:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      1 enables the bit-exact prefill dense GEMM fast path (`pf_dense_opt.cuh`): <=128-reg MXFP8/dtr-copy GEMM with
+      uint32 paired scale loads, constant-127 scale elision on dtr::make_fp8 weights, branchless full-tile loads, and
+      unguarded grouped-raster trellis o_proj (`k_gemm_tr16_clean`). Same bits as stock.
   GR8_PF_DRAFT_SHARE:
     scope: agree
     kind: int
@@ -177,6 +195,15 @@ knobs:
     doc: >-
       Sets the rows per CTA of the prefill index-score kernel, rounded down to a multiple of 8 (below 8 means 8). Same
       bits.
+  GR8_PF_ISGRT_CLEAN:
+    scope: agree
+    kind: flag
+    default: "0"
+    values: "0|1"
+    doc: >-
+      1 scores the prefill index with index_scores_rg8_clean when built with PF_ISGRT and 2048 < context <= 32768: no
+      per-key id write and the radix selector's pass-0 histogram counted in the score epilogue, so the selector runs
+      passes 1-5 only. Same scores, same selected ids. 0, other contexts and other builds run the stock kernels.
   GR8_PF_MOE8:
     scope: agree
     kind: flag

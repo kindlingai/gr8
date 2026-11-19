@@ -38,6 +38,8 @@ struct K1Args
     int t_wide;                // K3 experts of t_fc1 are in the wide order (tr3_wide.cuh, k_tr3_widen ran on it)
     const uint8_t* t_fc2;      // at tab[1]: [n blocks][384][8][TB]
     int t_wide2;               // K3 experts of t_fc2 are in the wide order (k_tr3_widen2 ran on it)
+    int t_wide4 = 0;           // K4 experts of t_fc1 are in the wide-K4 order (k_tr4_widen ran on it)
+    int t_wide42 = 0;          // K4 experts of t_fc2 are in the wide-K4 order (k_tr4_widen2 ran on it)
     const __half* t_v1;        // [block row][2][6144]  suh gate, suh up
     const __half* t_v2;        // [block row][3][128]   svh gate, svh up, suh down
     const __half* t_v3;        // [block row][6144]     svh down

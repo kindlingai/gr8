@@ -341,8 +341,14 @@ extern "C" int g6a_qo_run(G6AttnQo* p, G6AttnBinding* b, const G6AttnQoStep* s, 
     gqi::prof_tick(st, 0);
     if (p->kernel == 0) {
 #if G6_KV4
-        if(ga::kv4_fold())gqkv4::prepass<true><<<(s->context + 7) / 8, 256, 0, st>>>((const uint8_t*)b->args.mla_cache, p->table, p->bad, s->context);
-        else gqkv4::prepass<false><<<(s->context + 7) / 8, 256, 0, st>>>((const uint8_t*)b->args.mla_cache, p->table, p->bad, s->context);
+        if (knob::pf_attn_opt()) {
+            if (ga::kv4_fold()) pf_attn_opt::prepass_opt<true><<<(s->context + 7) / 8, 256, 0, st>>>((const uint8_t*)b->args.mla_cache, p->table, p->bad, s->context);
+            else pf_attn_opt::prepass_opt<false><<<(s->context + 7) / 8, 256, 0, st>>>((const uint8_t*)b->args.mla_cache, p->table, p->bad, s->context);
+        } else if (ga::kv4_fold()) {
+            gqkv4::prepass<true><<<(s->context + 7) / 8, 256, 0, st>>>((const uint8_t*)b->args.mla_cache, p->table, p->bad, s->context);
+        } else {
+            gqkv4::prepass<false><<<(s->context + 7) / 8, 256, 0, st>>>((const uint8_t*)b->args.mla_cache, p->table, p->bad, s->context);
+        }
         e = cudaGetLastError();
 #else
         e = gqob::prepass((const uint8_t*)b->args.mla_cache, p->table, p->bad, s->context, st);

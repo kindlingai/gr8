@@ -301,6 +301,7 @@ inline void pf_attn_block_qp(Model& m, Prefill& P, int i, int M, int context, cu
         bindp::Gemm g;
         if (const char* er = bindp::make_gemm(w.qb_c, w.qb_s, e - a0, xq.dst, y0, 0, g)) die(std::string("pair q_b: ") + er);
         g.osvh = trq ? w.qb_svh : nullptr;
+        g.const_s = trq ? 1 : 0;
         bindp::launch(g, st);
     };
     if (no > 0) qb(a0r, r1, P.qp_qb + (size_t)(S - (r0 - a0r)) * 8192);

@@ -50,16 +50,23 @@ extern "C" int g6a_bind_prefill_index_rows(G6AttnPrefill* p,G6AttnBinding* b,
     }
     auto w=gp::index_workspace(a,p->indexwork,true);if(!w.total)return int(cudaErrorInvalidValue);
     int expanded=(a.context+31)&~31;
-    gp::expand_index_rows<<<(expanded+7)/8,256,0,st>>>(a,p->ikey,p->kscale,expanded);
+    const bool opt=knob::pf_attn_opt();
+    if(opt)pf_attn_opt::expand_index_rows_opt<<<(expanded+7)/8,256,0,st>>>(a,p->ikey,p->kscale,expanded);
+    else gp::expand_index_rows<<<(expanded+7)/8,256,0,st>>>(a,p->ikey,p->kscale,expanded);
     for(int start=0;start<a.rows;start+=p->R){int n=std::min(p->R,a.rows-start);
         ga::prep_index<<<dim3(n,32),128,0,st>>>(a,start,w.iq,w.weights);
 #if defined(PF_ISGRT) && PF_ISGRT
-        gp::launch_index_scores_rg(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii,st);
+        const bool clean=!opt&&gp::isg_clean(a);
+        if(opt){auto e=pf_attn_opt::launch_idx_n64(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,st);if(e!=cudaSuccess)return int(e);}
+        else if(clean){auto e=gp::launch_index_scores_rg_clean(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.histogram,st);if(e!=cudaSuccess)return int(e);}
+        else gp::launch_index_scores_rg(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii,st);
 #else
-        gp::index_scores_grouped<<<dim3((a.context+63)/64,(n+3)/4),256,0,st>>>(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii);
+        const bool clean=false;
+        if(opt){auto e=pf_attn_opt::launch_idx_n64(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,st);if(e!=cudaSuccess)return int(e);}
+        else gp::index_scores_grouped<<<dim3((a.context+63)/64,(n+3)/4),256,0,st>>>(a,start,n,w.iq,w.weights,p->ikey,p->kscale,w.si,w.ii);
 #endif
         if(out_scores){auto e=cudaMemcpyAsync(out_scores+(int64_t)start*a.context,w.si,(size_t)n*a.context*4,cudaMemcpyDeviceToDevice,st);if(e!=cudaSuccess)return int(e);}
-        auto e=gp::select_prefill(a,w,start,n,st);if(e!=cudaSuccess)return int(e);
+        auto e=opt?pf_attn_opt::select_prefill(a,w,start,n,st):gp::select_prefill(a,w,start,n,st,clean);if(e!=cudaSuccess)return int(e);
     }
     return int(cudaGetLastError());
 }
