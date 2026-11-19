@@ -599,6 +599,9 @@ __global__ void __launch_bounds__(256) k_walk_dedup(WalkArgs a)
                 bl[at] = x.logit; bi[at] = x.id;
             }
         }
+        bool bad = false;
+        for (int k = 0; k < TOPK; ++k) bi[k] = walk_id(bi[k], glue::VOCAB, bad);
+        if (bad) atomicCAS(a.f.error, 0u, ERR_TOPK | ((unsigned)(w + 1) << 8));   // an id outside the vocabulary (dfl_topk.h)
     }
     if (t == 0) s_prev = a.tok[0];
     __syncthreads();
