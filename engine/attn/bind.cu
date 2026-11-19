@@ -190,8 +190,8 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
         }
         else
 #endif
-        identity_pages<<<(a.page_count + 255) / 256,256,0,stream>>>(
-            (int*)const_cast<int*>(a.block_table), a.page_count);
+        identity_pages<<<(a.table_size + 255) / 256,256,0,stream>>>(
+            (int*)const_cast<int*>(a.block_table), a.table_size);
         if (e == cudaSuccess) e = cudaGetLastError();
     }
     if (e == cudaSuccess) e = cudaMemsetAsync(a.indices, 0xff, (size_t)max_rows * 2048 * 4, stream);
