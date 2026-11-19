@@ -369,6 +369,8 @@ class Supervisor:
         self.scale = self.pending = self.prev = None
         self.scale_go, self.scale_abort, self.scale_done = threading.Event(), threading.Event(), threading.Event()
         self.scale_n = 0
+        # the options every scale this cluster went through added (the head's): a box that joins later boots with them too
+        self.scale_words = []
         self.scale_seen = set()       # every member of a scale, old and new: they keep asking status and logs
         self.peer_proc = None         # bin/kvman-peer
 
@@ -1417,7 +1419,7 @@ class Supervisor:
             pins += ['--share-limit', knobs['SHARE_LIMIT']]
         if knobs.get('REUSE_GRID') not in (None, '', '0'):
             pins += ['--reuse-grid', knobs['REUSE_GRID']]
-        delta = words + pins
+        delta = scale_argv(self.scale_words) + words + pins
         try:
             o = opt.parse(scale_argv(self.o.argv) + delta)
             opt.validate(o)
@@ -1712,6 +1714,7 @@ class Supervisor:
         self.release_hold(s)
         if s['phase'] == 'switch':
             s['phase'] = 'done'
+            self.scale_words = s['argv']
             for a in sorted((set(s['old_members']) | set(s['members'])) - {self.lan}):
                 self.call(a, {'t': 'scale_done', 'id': s['id']})
             self.finish_scale()

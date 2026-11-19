@@ -160,6 +160,27 @@ class Scale(unittest.TestCase):
         st = self.gr8(3, 'status')
         self.assertEqual(st.stdout.count(': serving, engine running'), 4, st.stdout)
 
+    def test_a_box_that_joins_later_boots_with_the_earlier_scales_options(self):
+        """4 -> 3 with --sess 4, then 3 -> 4: box 3's own up names no --sess, and the scale that adds it hands it the
+        first scale's (the handshake compares the engine's arguments)."""
+        self.up(4)
+        rc, out = self.finish(self.scale(1, 3, '--sess', '4'))
+        self.assertEqual(rc, 0, out)
+        self.wait_for(lambda: not running(int(read(os.path.join(self.homes[3], 'out', 'supervisor.pid')))),
+                      'the box that left to exit')
+        p = self.scale(0, 4)
+        self.wait_for(lambda: f'waiting for {LAN[3]}' in read(os.path.join(self.homes[0], 'out', 'supervisor.log')),
+                      'the second scale to start')
+        j = subprocess.Popen([sys.executable, os.path.join(HERE, 'launch.py'), 'up', *self.argv(3, 4)], env=self.env,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        rc, out = self.finish(p)
+        jrc, jout = self.finish(j)
+        self.assertEqual((rc, jrc), (0, 0), f'{out}\n---- joiner:\n{jout}')
+        for i in range(4):
+            with open(os.path.join(self.homes[i], 'out', 'stub.json')) as f:
+                a = json.load(f)['argv']
+            self.assertEqual(a[a.index('--s2-sessions') + 1], '4', i)
+
     def test_a_drain_that_runs_out_changes_nothing(self):
         self.up(4)
         a = []
