@@ -15,6 +15,14 @@ knobs:
     doc: >-
       The largest doubled decode context bucket: GR8_DEC_BK doubles up to it, then the next bucket is R under CP and the
       KV pool's cap. Every bucket costs a set of decode graphs (about 0.9 GiB a rank on the 4-box GLM-5.3). 0 = no bound.
+  GR8_DEC_DENSE_OPT:
+    scope: agree
+    kind: flag
+    default: "0"
+    doc: >-
+      Runs the bit-exact fused decode dense kernels on GLM-5.3 (fused layer-input q_a/kv_a/idx_k/idx_w with last-CTA
+      gather publish, single-pass q_a norm + rotation, fused exact idx_q + trellis q_b, and no-scratch trellis o_proj
+      where the k-split matches stock). Same output bits.
   GR8_DEC_EVPROF:
     scope: local
     kind: int

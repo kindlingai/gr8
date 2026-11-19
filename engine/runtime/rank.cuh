@@ -43,6 +43,7 @@
 #include "host_reclaim.h"
 #include "../kernels/glue.cuh"
 #include "../kernels/bind.cuh"
+#include "../kernels/dec_dense_opt.cuh"
 #include "../kernels/l2pf.cuh"
 #include "../kernels/head_i4.cuh"
 #include "../kernels/head2.cuh"
@@ -621,6 +622,7 @@ struct Model
     relax::Rule rx;                   // GR8_DS_RELAXED_ACCEPT (DS41 main model only, set before capture; rx.on = 0: the exact head):
                                       // k_head_local_rx + k_head_relax accept a greedy row's draft by the relaxed rule. Not exact
     QSplit qs;                        // GR8_QA_SPLIT (main model only; mode 0 = today's replicated GEMVs)
+    dec_dense_opt::State ddo;         // GR8_DEC_DENSE_OPT (default off): bit-exact fused decode dense kernels
     bind::K1Ovl ovl;                  // GR8_ROUTE_OVL (route_ovl_init; mode 0 = off): the shared expert's side stream
     bool route_last = false;          // GR8_MTP_LASTROW (MTP draft model only, set before capture): only each session's last row
                                       // of a step takes routed experts (launch_mlp_block, mtp_lastrow_env)
@@ -1109,6 +1111,7 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
     if (!m.head_t.lm_head.p) die("pack has no G.lm_head.mx.gv");
     if (!bind::vocab_slice(rank, m.vlo, m.vn)) die("rank must be 0.." + std::to_string(g6nr::NR - 1));
     m.hlog = dmalloc<float>((size_t)MX * m.vn);
+    G6RT_CK(dec_dense_opt::setup(m.ddo, m.nl));
 }
 
 // after build, before any launch: the gather fabric (ncoll = m.qs.ncoll(), slots of at least MX rows of the widest wire row);
@@ -1430,32 +1433,47 @@ inline bool posidx_step(Model& m, int i, int M)
 // GR8_QA_SPLIT: this rank's tiles of the input GEMVs, publish, (mode 2: kv_a / idx in full,) gather, q_a norm
 // P (QsPh): the phase the loopback driver wants; the get starts the next phase
 // noiq (posidx_step): idx_q is skipped, so the q_a gather window prefetches from q_b
-inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, QsPh& P, bool noiq = false)
+inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, QsPh& P, bool noiq = false,
+                               bool* qa_rot_done = nullptr)
 {
     const QSplit& Q = m.qs;
     const int c = Q.cqa[i];
     if (P.on())
     {
-        if (b.x_in.n) bind::launch(b.x_in, st);
+        if (Q.mode == 2 && dec_dense_opt::xin_eligible(m.ddo, i, b, y.indexer))
+        {
+            dec_dense_opt::launch_xin(m.ddo, i, b, y.indexer, M, Q.g, m.stepp, Q.tickets, c, st);
+            dmark(DP_QA, st);
+            dmark(DP_IDXKW, st);
+        }
         else
         {
-            bind::launch(b.q_a, st);
-            if (Q.mode == 1) { bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); }
+            if (b.x_in.n) bind::launch(b.x_in, st);
+            else
+            {
+                bind::launch(b.q_a, st);
+                if (Q.mode == 1) { bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); }
+            }
+            qs_put(m, c, M, st);
+            dmark(DP_QA, st);
+            if (Q.mode == 2)
+            {
+                if (b.x_rest.n) bind::launch(b.x_rest, st);
+                else { bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); }
+            }
+            dmark(DP_IDXKW, st);
         }
-        qs_put(m, c, M, st);
-        dmark(DP_QA, st);
-        if (Q.mode == 2)
-        {
-            if (b.x_rest.n) bind::launch(b.x_rest, st);
-            else { bind::launch(b.kv_a, st); bind::launch(b.idx_k, st); bind::launch(b.idx_w, st); }
-        }
-        dmark(DP_IDXKW, st);
         l2pf_window(m, l2pf::W_Q, noiq ? l2pf::T_QB : l2pf::T_IDXQ, i, M, &Q.g, c, (size_t)M * Q.geo[c].wmax * 2, st);
     }
     P.next();
     if (!P.on()) return;
     qs_get(m, c, M, st);
-    glue::k_rmsnorm_rows<__half><<<M, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, glue::RMS_EPS, m.q_a_n, QA);
+    if (m.ddo.on)
+    {
+        dec_dense_opt::launch_qa_norm_rot(m.q_a, y.q_a_norm, m.q_a_n, b, m.sc, y.T.mats.q_b, M, st);
+        if (qa_rot_done) *qa_rot_done = true;
+    }
+    else glue::k_rmsnorm_rows<__half><<<M, 256, 0, st>>>(m.q_a, QA, QA, y.q_a_norm, glue::RMS_EPS, m.q_a_n, QA);
     dmark(DP_QAG, st);
 }
 
@@ -1463,7 +1481,8 @@ inline void launch_layer_in_qs(Model& m, int i, const Layer& y, const bind::Laye
 // published, then q_b while the gather is on the wire, then the gather (the outputs are the same; only the order changes)
 // noiq (posidx_step): no idx_q GEMV. Under GR8_IDXQ_SPLIT its gather still runs (put of the unread idx_q columns, get), so
 // the gather fabric's collectives keep their order and sizes on every rank
-inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStream_t st, QsPh& P, bool noiq = false)
+inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStream_t st, QsPh& P, bool noiq = false,
+                           bool qa_rot_done = false)
 {
     const int c = m.qs.iq ? m.qs.ciq[i] : -1;
     if (!P.on())                              // not this phase: only the gather's get may be (it starts the next one)
@@ -1473,7 +1492,33 @@ inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStr
         if (P.on()) qs_get(m, c, M, st);
         return;
     }
-    bind::launch(b.xf_qa, st);
+    if (m.ddo.on)
+    {
+        if (c >= 0 && noiq) qs_put(m, c, M, st);
+        bool did_put = false;
+        if (dec_dense_opt::launch_qb_idxq(m.ddo, b, m.sc, m.layers[i].T.mats.q_b, m.q_a_n, M, noiq, qa_rot_done,
+                                          c >= 0 ? &m.qs.g : nullptr, m.stepp, m.qs.tickets, c, did_put, st))
+        {
+            if (c >= 0)
+            {
+                if (!noiq && !did_put) qs_put(m, c, M, st);
+                l2pf_window(m, l2pf::W_Q, l2pf::T_UK, i, M, &m.qs.g, c, (size_t)M * m.qs.geo[c].wmax * 2, st);
+                P.next();
+                if (P.on()) qs_get(m, c, M, st);
+            }
+            return;
+        }
+        if (c >= 0 && noiq)
+        {
+            if (!qa_rot_done) bind::launch(b.xf_qa, st);
+            bind::launch_q_b(b, st);
+            l2pf_window(m, l2pf::W_Q, l2pf::T_UK, i, M, &m.qs.g, c, (size_t)M * m.qs.geo[c].wmax * 2, st);
+            P.next();
+            if (P.on()) qs_get(m, c, M, st);
+            return;
+        }
+    }
+    if (!qa_rot_done) bind::launch(b.xf_qa, st);
     if (c < 0)
     {
         bind::launch_q_b(b, st);
@@ -1489,9 +1534,10 @@ inline void launch_qb_idxq(Model& m, int i, const bind::Layer& b, int M, cudaStr
 }
 
 // the GEMVs on the layer input (q_a + its norm, kv_a, the indexer's k and weights): one gv_multi launch when bound
-inline void launch_layer_in(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, QsPh& P, bool noiq = false)
+inline void launch_layer_in(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, QsPh& P, bool noiq = false,
+                            bool* qa_rot_done = nullptr)
 {
-    if (m.qs.mode) { launch_layer_in_qs(m, i, y, b, M, st, P, noiq); return; }
+    if (m.qs.mode) { launch_layer_in_qs(m, i, y, b, M, st, P, noiq, qa_rot_done); return; }
     if (!P.on()) return;
     if (b.x_in.n)
     {
@@ -1565,13 +1611,19 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
         {
             dmark(DP_OTHER, st);
 #ifdef DEC_SLOT
-            if (i == 0) bind::launch(b.xf_x, st);
+            if (i == 0)
+            {
+                bind::Xfrag xf = b.xf_x;
+                if (m.qs.mode == 2 && dec_dense_opt::xin_eligible(m.ddo, i, b, y.indexer)) xf.bf16 = nullptr;
+                bind::launch(xf, st);
+            }
 #else
             bind::launch(b.xf_x, st);
 #endif
         }
-        launch_layer_in(m, i, y, b, M, st, P);
-        launch_qb_idxq(m, i, b, M, st, P);
+        bool qa_rot_done = false;
+        launch_layer_in(m, i, y, b, M, st, P, false, &qa_rot_done);
+        launch_qb_idxq(m, i, b, M, st, P, false, qa_rot_done);
         if (!P.on()) return;                  // an earlier gather phase of phase 0
         dmark(DP_QB, st);
         for (int k = DP_A_APPEND; k <= DP_A_VPROJ; ++k) dmark(k, st);   // the replicated path's attention marks (CP: all in DP_ATTN)
@@ -1662,7 +1714,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
     G6RT_CK(g6_attn_cp_finish(a, cell, scr, sb, C.part_all, st));
     dmark(DP_ATTN, st);
     bind::launch(b.xf_attn, st);
-    bind::launch_o_proj(b, st);
+    if (!dec_dense_opt::launch_o_proj(m.ddo, b, m.sc, M, st)) bind::launch_o_proj(b, st);
 #ifdef DEC_SLOT
     slot_publish(m, 2 * i, st);
 #else
@@ -1698,13 +1750,19 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
     {
         dmark(DP_OTHER, st);
 #ifdef DEC_SLOT
-        if (i == 0) bind::launch(b.xf_x, st);      // later layers: the fragment tables come from launch_consume(2i-1)
+        if (i == 0)
+        {
+            bind::Xfrag xf = b.xf_x;
+            if (m.qs.mode == 2 && dec_dense_opt::xin_eligible(m.ddo, i, b, y.indexer)) xf.bf16 = nullptr;
+            bind::launch(xf, st);      // later layers: the fragment tables come from launch_consume(2i-1)
+        }
 #else
         bind::launch(b.xf_x, st);
 #endif
     }
-    launch_layer_in(m, i, y, b, M, st, P, noiq);
-    launch_qb_idxq(m, i, b, M, st, P, noiq);
+    bool qa_rot_done = false;
+    launch_layer_in(m, i, y, b, M, st, P, noiq, &qa_rot_done);
+    launch_qb_idxq(m, i, b, M, st, P, noiq, qa_rot_done);
     if (!P.on()) return;                      // an earlier gather phase
     dmark(DP_QB, st);
     l2pf_window(m, l2pf::W_T, l2pf::T_UK, i, M, nullptr, 0, 0, st);
@@ -1724,7 +1782,7 @@ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t 
     }
     dmark(DP_ATTN, st);
     bind::launch(b.xf_attn, st);
-    bind::launch_o_proj(b, st);
+    if (!dec_dense_opt::launch_o_proj(m.ddo, b, m.sc, M, st)) bind::launch_o_proj(b, st);
 #ifdef DEC_SLOT
     slot_publish(m, 2 * i, st);
 #else
