@@ -431,6 +431,7 @@ int main(int argc, char** argv)
     // MXFP8 records. Drafts only; +382 MB per rank. In the S2 runtime signature
     const bool dfl_body_i4_on = knob::dfl_body_i4();
     if (dfl_body_i4_on && !dfl) die("GR8_DFL_BODY_I4=1 needs --dflash-manifest");
+    if (knob::dfl_dedup() && !dfl) die("GR8_DFL_DEDUP=1 needs --dflash-manifest");
     // the fabric plan (fabric_plan.h): every fabric's config, and the bring-up's refusals, before the first fabric
     PlanInputs fpi;
     fpi.k = plan_knobs();

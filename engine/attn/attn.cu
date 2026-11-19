@@ -832,10 +832,11 @@ static bool kv4_fuse_rot_active(){
 
 #include "rt.cuh"
 template<class Input>
-static void threshold_compact(const G6Attn& a,Input input,Work& w,int count,cudaStream_t stream){
+// fused0: w.histogram already holds pass 0's counts (gp::index_scores_rg8_clean), so pass 0 runs only its update.
+static void threshold_compact(const G6Attn& a,Input input,Work& w,int count,cudaStream_t stream,bool fused0=false){
     const int chunks=(a.context+RADIX_CHUNK-1)/RADIX_CHUNK;
     for(int pass=0;pass<6;pass++){
-        radix_histogram<<<dim3(chunks,count),256,0,stream>>>(input,w.si,w.selection,w.histogram,pass);
+        if(!(fused0&&pass==0))radix_histogram<<<dim3(chunks,count),256,0,stream>>>(input,w.si,w.selection,w.histogram,pass);
         radix_update<<<count,256,0,stream>>>(input,w.selection,w.histogram,w.selected,pass);
     }
     radix_compact<<<dim3(chunks,count),256,0,stream>>>(input,w.si,w.selection,w.selected);
@@ -862,13 +863,14 @@ static void launch_rank_selected(int rank,Input input,int start,const float* sco
         default:rank_selected<MODE,16><<<dim3(16,count),256,0,st>>>(input,start,scores,selected);break;}
 }
 template<class Input>
-static cudaError_t select_index(const G6Attn& a,Input input,Work& w,int start,int count,cudaStream_t stream,int rank=0){
+static cudaError_t select_index(const G6Attn& a,Input input,Work& w,int start,int count,cudaStream_t stream,int rank=0,bool fused0=false){
+    if(fused0&&(a.context<=TOP||a.context>32768))return cudaErrorInvalidValue;   // fused pass 0 exists only for threshold_compact
     if(a.context<=TOP){
         if(rank)launch_rank_selected<0>(rank,input,start,w.si,w.selected,count,stream);
         else sort_selected<false><<<count,256,0,stream>>>(input,start,w.si,w.selected);
         return cudaGetLastError();}
     if(a.context<=32768){
-        threshold_compact(a,input,w,count,stream);
+        threshold_compact(a,input,w,count,stream,fused0);
         if(rank)launch_rank_selected<1>(rank,input,start,w.si,w.selected,count,stream);
         else sort_selected<true><<<count,256,0,stream>>>(input,start,w.si,w.selected);
         return cudaGetLastError();

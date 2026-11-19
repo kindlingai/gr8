@@ -592,9 +592,677 @@ __global__ void __launch_bounds__(WT_NTH, 1) k_pf_fc2t(Expert A)
 
 inline int wt_tiles(const Expert& A) { return max_wtiles_t(A.M); }   // the grid's tile bound (CTAs past *n_wtiles exit)
 
+// ------------------------------------------------------------------ GR8_TR3_WIDE4: wide-K4 & L2-streaming prefill WT kernels
+template <int CB>
+__device__ __forceinline__ void wt_bfrag_w4(u32 c0, u32 c1, int prev_lane, u32 (&bf)[4])
+{
+    const u32 b0 = __shfl_sync(0xffffffffu, c0, prev_lane);
+    const u32 b1 = __shfl_sync(0xffffffffu, c1, prev_lane);
+    u32 p0[2], p1[2], q0[2], q1[2];
+    Tr3Lane<4, false, CB>::decode_m((static_cast<u64>(b0) << 32) | c0, 28, p0, p1);
+    Tr3Lane<4, false, CB>::decode_m((static_cast<u64>(b1) << 32) | c1, 28, q0, q1);
+    tr3_b8f(p0, p1, q0, q1, bf);
+}
+
+// K4 wide-order fc1t body (0-ULP identical to fc1t_body<4, false>).
+// L2_POL: 0 = standard L2 policy (fallback M); 2 = evict_first on weights and z1 (TP4 K4 M>=4096).
+template <int NM, int CB, int EB, int L2_POL>
+__device__ __forceinline__ void fc1t_w4_body(const Expert& A, const uint8_t* mw, const __half* v1b, int r0, int rows, int b, int mat,
+                                             const int* sRow, unsigned char* sA, unsigned char* sS)
+{
+    constexpr int NB = HID / 128;
+    constexpr size_t WG = TR4W_GROUP;
+    const int t = threadIdx.x, lane = t & 31, warp = (t >> 5) & 7;
+    const int prev_lane = (lane + 31) & 31;
+    const int srow = (lane >> 2) + ((lane & 1) ? 8 : 0);
+    float acc[NM][2][4];
+    #pragma unroll
+    for (int mb = 0; mb < NM; ++mb)
+        #pragma unroll
+        for (int h = 0; h < 2; ++h)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) acc[mb][h][i] = 0.f;
+    const uint8_t* wg = mw + (warp * 2) * 512 + lane * 16;
+    uint4 nw0 = L2_POL >= 1 ? tr4w_ld128_ef(wg) : tr4w_ld128(wg);
+    uint4 nw1 = L2_POL >= 1 ? tr4w_ld128_ef(wg + 512) : tr4w_ld128(wg + 512);
+    auto stage = [&](int kb) {
+        unsigned char* a = sA + (kb & 1) * WT_SA;
+        #pragma unroll
+        for (int ch = t; ch < NM * 128; ch += WT_NTH)
+        {
+            const int r = ch >> 3, k = ch & 7;
+            if (r < rows) pf::cp16(a + r * 128 + ((k ^ (r & 7)) << 4), A.hq8 + static_cast<size_t>(sRow[r]) * HID + kb * 128 + k * 16);
+        }
+        if (t < NM * 16 && t < rows) wt_cp4(sS + (kb & 1) * WT_SS + t * 4, A.hs8 + static_cast<size_t>(sRow[t]) * (HID / 32) + kb * 4);
+        pf::cp_commit();
+    };
+    stage(0);
+    float cprev = 1.f;
+    for (int kb = 0; kb < NB; ++kb)
+    {
+        pf::cp_wait<0>();
+        __syncthreads();
+        if (kb + 1 < NB) stage(kb + 1);
+        const uint4 cw0 = nw0, cw1 = nw1;
+        if (kb + 1 < NB)
+        {
+            const uint8_t* gp = wg + static_cast<size_t>(kb + 1) * WG;
+            if constexpr (L2_POL >= 1) { nw0 = tr4w_ld128_ef(gp); nw1 = tr4w_ld128_ef(gp + 512); }
+            else { nw0 = tr4w_ld128(gp); nw1 = tr4w_ld128(gp + 512); }
+        }
+        const float c = __half2float(v1b[kb]);
+        if (c == 0.f) continue;
+        if (c != cprev) wt_scale(acc, cprev / c);
+        cprev = c;
+        const unsigned char* xs = sA + (kb & 1) * WT_SA;
+        const unsigned char* ss = sS + (kb & 1) * WT_SS;
+        const u32 w4[8] = {cw0.x, cw0.y, cw0.z, cw0.w, cw1.x, cw1.y, cw1.z, cw1.w};
+        #pragma unroll
+        for (int s = 0; s < 4; ++s)
+        {
+            u32 bf[4];
+            wt_bfrag_w4<CB>(w4[2 * s], w4[2 * s + 1], prev_lane, bf);
+            #pragma unroll
+            for (int mb = 0; mb < NM; ++mb)
+            {
+                const int Rl = mb * 16 + (lane & 15), ch = 2 * s + (lane >> 4);
+                u32 a[4];
+                wt_ldsm4(a, xs + Rl * 128 + ((ch ^ (Rl & 7)) << 4));
+                const u32 sa = ss[(mb * 16 + srow) * 4 + s];
+                mma_mx8(acc[mb][0], make_uint4(a[0], a[1], a[2], a[3]), bf[0], bf[1], sa, 127u);
+                mma_mx8(acc[mb][1], make_uint4(a[0], a[1], a[2], a[3]), bf[2], bf[3], sa, 127u);
+            }
+        }
+    }
+    wt_scale(acc, cprev);
+    const int c = lane & 3, r = lane >> 2;
+    #pragma unroll
+    for (int mb = 0; mb < NM; ++mb)
+        #pragma unroll
+        for (int h = 0; h < 2; ++h)
+        {
+            const int col = warp * 16 + h * 8 + 2 * c, row = mb * 16 + r;
+            __half* z = A.z1 + (static_cast<size_t>(r0 + row) * (2 * EB) + b * 2 + mat) * 128 + col;
+            if (row < rows)
+            {
+                const u32 v0 = pack_h2(acc[mb][h][0], acc[mb][h][1]);
+                if constexpr (L2_POL >= 2) tr4w_st32_ef(z, v0);
+                else *reinterpret_cast<u32*>(z) = v0;
+            }
+            if (row + 8 < rows)
+            {
+                const u32 v1 = pack_h2(acc[mb][h][2], acc[mb][h][3]);
+                if constexpr (L2_POL >= 2) tr4w_st32_ef(z + 8 * (2 * EB) * 128, v1);
+                else *reinterpret_cast<u32*>(z + 8 * (2 * EB) * 128) = v1;
+            }
+        }
+}
+
+template <int CB, int EB, int L2_POL>
+__device__ __forceinline__ void fc1t_w4_nm(const Expert& A, const uint8_t* mw, const __half* v1b, int r0, int rows, int b, int mat,
+                                           const int* sRow, unsigned char* sA, unsigned char* sS)
+{
+    switch ((rows + 31) / 32)
+    {
+        case 1: fc1t_w4_body<2, CB, EB, L2_POL>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS); break;
+        case 2: fc1t_w4_body<4, CB, EB, L2_POL>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS); break;
+        case 3: fc1t_w4_body<6, CB, EB, L2_POL>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS); break;
+        case 4: fc1t_w4_body<8, CB, EB, L2_POL>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS); break;
+        case 5: if constexpr (WT_NM > 8) { fc1t_w4_body<10, CB, EB, L2_POL>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS); break; } [[fallthrough]];
+        case 6: if constexpr (WT_NM > 8) { fc1t_w4_body<12, CB, EB, L2_POL>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS); break; } [[fallthrough]];
+        case 7: if constexpr (WT_NM > 8) { fc1t_w4_body<14, CB, EB, L2_POL>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS); break; } [[fallthrough]];
+        default: if constexpr (WT_NM > 8) fc1t_w4_body<16, CB, EB, L2_POL>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS); else fc1t_w4_body<8, CB, EB, L2_POL>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS); break;
+    }
+}
+
+template <int EB, bool K2, int CB, int L2_POL>
+__global__ void __launch_bounds__(WT_NTH, 1) k_pf_fc1t_w4(Expert A)
+{
+    extern __shared__ __align__(16) unsigned char smt[];
+    unsigned char* const sA = smt;
+    unsigned char* const sS = sA + 2 * WT_SA;
+    int* const sRow = reinterpret_cast<int*>(sS + 2 * WT_SS);
+    if (static_cast<int>(blockIdx.y) >= *A.n_wtiles) return;
+    const int* w = A.wtiles + static_cast<size_t>(blockIdx.y) * 3;
+    const long long* tr = A.t_tab + static_cast<size_t>(w[0]) * 6;
+    const int mat = WT_HALVES == 2 ? threadIdx.x >> 8 : blockIdx.x / EB, b = WT_HALVES == 2 ? blockIdx.x : blockIdx.x - (blockIdx.x / EB) * EB;
+    if (b >= static_cast<int>(tr[3])) return;
+    const int r0 = w[1], rows = w[2];
+    if (threadIdx.x < WT_R) sRow[threadIdx.x] = static_cast<int>(threadIdx.x) < rows ? A.rr_row[r0 + threadIdx.x] : 0;
+    __syncthreads();
+    size_t off;
+    const int k = tr3_unit(A.t_kmix, w[0], tr, b * 2 + mat, off);
+    const uint8_t* mw = A.t_fc1 + off;
+    const __half* v1b = A.t_v1b + ((static_cast<size_t>(tr[2]) + b) * 2 + mat) * (HID / 128);
+    if (k == 4) fc1t_w4_nm<CB, EB, L2_POL>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS);
+    else if (k == 3) fc1t_nm<3, true, CB, EB>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS);
+    else if constexpr (K2) fc1t_nm<2, true, CB, EB>(A, mw, v1b, r0, rows, b, mat, sRow, sA, sS);
+}
+
+// Pre-fenced fused combine (0-ULP identical to wt_combine; single CTA fence already issued after all yw writes).
+template <int L2_POL>
+__device__ __forceinline__ void wt_combine_w4(const Expert& A, int G, int tok, bool act, int q, int lane)
+{
+    int last = 0;
+    if (act && q == 0) last = atomicAdd(A.cnt_tg + static_cast<size_t>(tok) * (HID / 128) + G, 1) + 1 == A.topk;
+    last = __shfl_sync(0xffffffffu, last, lane & 24);
+    if (!__any_sync(0xffffffffu, last)) return;
+    if (last) __threadfence();
+    float a[16];
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) a[j] = 0.f;
+    const size_t col = static_cast<size_t>(G) * 128 + q * 16;
+    #pragma unroll
+    for (int k = 0; k < TOPK; ++k)
+    {
+        const int pk = last ? A.pos[tok * TOPK + k] : -1;
+        if (pk < 0) continue;
+        const __half* src = A.yw + static_cast<size_t>(pk) * HID + col;
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
+        {
+            const uint4 r = wt_ldcg(src + j * 8);
+            const u32 rw[4] = {r.x, r.y, r.z, r.w};
+            #pragma unroll
+            for (int e = 0; e < 4; ++e)
+            {
+                const float2 f = __half22float2(as_h2(rw[e]));
+                a[j * 8 + e * 2] += f.x; a[j * 8 + e * 2 + 1] += f.y;
+            }
+        }
+    }
+    __syncwarp();
+    if (last)
+        if (const int pk = A.pos[tok * TOPK + q]; pk >= 0)
+        {
+            wt_discard(A.yw + static_cast<size_t>(pk) * HID + G * 128);
+            wt_discard(A.yw + static_cast<size_t>(pk) * HID + G * 128 + 64);
+        }
+    const __half* ys = A.ysh + static_cast<size_t>(tok) * HID + col;
+    float sh[16];
+    #pragma unroll
+    for (int j = 0; j < 2; ++j)
+    {
+        uint4 r = make_uint4(0u, 0u, 0u, 0u);
+        if (last)
+        {
+            if constexpr (L2_POL >= 2) r = tr4w_ld128_ef(ys + j * 8);
+            else r = *reinterpret_cast<const uint4*>(ys + j * 8);
+        }
+        const u32 rw[4] = {r.x, r.y, r.z, r.w};
+        #pragma unroll
+        for (int e = 0; e < 4; ++e)
+        {
+            const float2 f = __half22float2(as_h2(rw[e]));
+            sh[j * 8 + e * 2] = f.x; sh[j * 8 + e * 2 + 1] = f.y;
+        }
+    }
+    if (A.sh_svh)
+    {
+        had128_l16(sh, lane);
+        const float c = A.sh_sc ? __half2float(A.sh_sc[G]) : 1.f;
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
+        {
+            const uint4 r = *reinterpret_cast<const uint4*>(A.sh_svh + col + j * 8);
+            const u32 rw[4] = {r.x, r.y, r.z, r.w};
+            #pragma unroll
+            for (int e = 0; e < 4; ++e)
+            {
+                const float2 f = __half22float2(as_h2(rw[e]));
+                a[j * 8 + e * 2] += rnd_h(sh[j * 8 + e * 2] * (f.x * c));
+                a[j * 8 + e * 2 + 1] += rnd_h(sh[j * 8 + e * 2 + 1] * (f.y * c));
+            }
+        }
+    }
+    else
+    {
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) a[j] += sh[j];
+    }
+    if (!last) return;
+    uint16_t* dst = (A.rs.base ? rs_row(A.rs, tok, HID) : A.out + static_cast<size_t>(tok) * HID) + col;
+    #pragma unroll
+    for (int j = 0; j < 2; ++j)
+    {
+        uint4 o;
+        o.x = pack_bf2(a[j * 8], a[j * 8 + 1]); o.y = pack_bf2(a[j * 8 + 2], a[j * 8 + 3]);
+        o.z = pack_bf2(a[j * 8 + 4], a[j * 8 + 5]); o.w = pack_bf2(a[j * 8 + 6], a[j * 8 + 7]);
+        if constexpr (L2_POL >= 2) tr4w_st128_ef(dst + j * 8, o);
+        else *reinterpret_cast<uint4*>(dst + j * 8) = o;
+    }
+}
+
+// Fallback wide-K4 fc2t body (stock WT_HALVES schedule, wide-K4 reader, stock L2/combine).
+template <int NM, int CB, int EB>
+__device__ __forceinline__ void fc2t_w4_body(const Expert& A, const long long* tr, int wt, int r0, int rows, int G0, unsigned char* sA)
+{
+    constexpr int SA = F2T_SA, NCH = NM * 4 * (REC / 16);
+    const int t = threadIdx.x, lane = t & 31, warp = (t >> 5) & 7, half = WT_HALVES == 2 ? t >> 8 : 0, G = G0 + half;
+    const int prev_lane = (lane + 31) & 31;
+    const int srow = (lane >> 2) + ((lane & 1) ? 8 : 0), c = lane & 3, r = lane >> 2;
+    const int nb = static_cast<int>(tr[3]);
+    auto wptr = [&](int b) {
+        return A.t_fc2 + tr[1] + static_cast<size_t>(b) * TR4W_MAT + static_cast<size_t>(G * 8 + warp) * TR4W_NT + lane * 16;
+    };
+    const uint8_t* xsrc = A.x2 + static_cast<size_t>(wt) * WT_NM * EB * 4 * REC;
+    auto stage = [&](int b) {
+        unsigned char* d = sA + (b & 1) * SA;
+        for (int ch = t; ch < NCH; ch += WT_NTH)
+        {
+            const int mb = ch / (4 * (REC / 16)), rem = ch - mb * (4 * (REC / 16));
+            pf::cp16(d + ch * 16, xsrc + (static_cast<size_t>(mb) * EB + b) * 4 * REC + rem * 16);
+        }
+        pf::cp_commit();
+    };
+    float acc[NM][2][4];
+    #pragma unroll
+    for (int mb = 0; mb < NM; ++mb)
+        #pragma unroll
+        for (int h = 0; h < 2; ++h)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) acc[mb][h][i] = 0.f;
+    stage(0);
+    uint4 nw0 = tr4w_ld128(wptr(0)), nw1 = tr4w_ld128(wptr(0) + 512);
+    float sprev = 1.f;
+    for (int b = 0; b < nb; ++b)
+    {
+        pf::cp_wait<0>();
+        __syncthreads();
+        if (b + 1 < nb) stage(b + 1);
+        const uint4 cw0 = nw0, cw1 = nw1;
+        if (b + 1 < nb) { nw0 = tr4w_ld128(wptr(b + 1)); nw1 = tr4w_ld128(wptr(b + 1) + 512); }
+        const float sc = __half2float(A.t_v3b[(static_cast<size_t>(tr[2]) + b) * (HID / 128) + G]);
+        if (sc == 0.f) continue;
+        if (sc != sprev) wt_scale(acc, sprev / sc);
+        sprev = sc;
+        const unsigned char* sAb = sA + (b & 1) * SA;
+        const u32 w4[8] = {cw0.x, cw0.y, cw0.z, cw0.w, cw1.x, cw1.y, cw1.z, cw1.w};
+        #pragma unroll
+        for (int s = 0; s < 4; ++s)
+        {
+            u32 bf[4];
+            wt_bfrag_w4<CB>(w4[2 * s], w4[2 * s + 1], prev_lane, bf);
+            #pragma unroll
+            for (int mb = 0; mb < NM; ++mb)
+            {
+                const unsigned char* rec = sAb + (mb * 4 + s) * REC;
+                const uint4 fa = *reinterpret_cast<const uint4*>(rec + lane * 16);
+                const u32 sa = rec[512 + srow];
+                mma_mx8(acc[mb][0], fa, bf[0], bf[1], sa, 127u);
+                mma_mx8(acc[mb][1], fa, bf[2], bf[3], sa, 127u);
+            }
+        }
+    }
+    wt_scale(acc, sprev);
+    __syncthreads();
+    unsigned char* const sZb = sA + half * F2T_SZ;
+    #pragma unroll
+    for (int mb = 0; mb < NM; ++mb)
+        #pragma unroll
+        for (int h = 0; h < 2; ++h)
+        {
+            const int row = mb * 16 + r, ch = warp * 2 + h;
+            *reinterpret_cast<u32*>(sZb + row * 256 + swz16(ch, row) * 16 + 4 * c) = pack_h2(acc[mb][h][0], acc[mb][h][1]);
+            *reinterpret_cast<u32*>(sZb + (row + 8) * 256 + swz16(ch, row + 8) * 16 + 4 * c) = pack_h2(acc[mb][h][2], acc[mb][h][3]);
+        }
+    __syncthreads();
+    const int pr = warp * 4 + (lane >> 3), q = lane & 7;
+    const __half* sgp = A.t_sg + HID + G * 128 + q * 16;
+    float sv[16];
+    #pragma unroll
+    for (int j = 0; j < 2; ++j)
+    {
+        const uint4 sr = *reinterpret_cast<const uint4*>(sgp + j * 8);
+        const u32 sw[4] = {sr.x, sr.y, sr.z, sr.w};
+        #pragma unroll
+        for (int e = 0; e < 4; ++e)
+        {
+            const float2 s2 = __half22float2(as_h2(sw[e]));
+            sv[j * 8 + e * 2] = s2.x; sv[j * 8 + e * 2 + 1] = s2.y;
+        }
+    }
+    #pragma unroll 1
+    for (int p = 0; p < NM / 2; ++p)
+    {
+        if (warp * 4 + p * 32 >= rows) break;
+        const int rp = pr + p * 32;
+        const bool act = rp < rows;
+        float v[16];
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
+        {
+            const uint4 zr = act ? *reinterpret_cast<const uint4*>(sZb + rp * 256 + swz16(q * 2 + j, rp) * 16) : make_uint4(0u, 0u, 0u, 0u);
+            const u32 zw[4] = {zr.x, zr.y, zr.z, zr.w};
+            #pragma unroll
+            for (int e = 0; e < 4; ++e)
+            {
+                const float2 z2 = __half22float2(as_h2(zw[e]));
+                v[j * 8 + e * 2] = z2.x; v[j * 8 + e * 2 + 1] = z2.y;
+            }
+        }
+        had128_l16(v, lane);
+        if (act)
+        {
+            const float w = A.rr_w[r0 + rp];
+            __half* yp = A.yw + static_cast<size_t>(r0 + rp) * HID + G * 128 + q * 16;
+            #pragma unroll
+            for (int j = 0; j < 2; ++j)
+            {
+                uint4 o;
+                o.x = pack_h2(w * (v[j * 8] * sv[j * 8]), w * (v[j * 8 + 1] * sv[j * 8 + 1]));
+                o.y = pack_h2(w * (v[j * 8 + 2] * sv[j * 8 + 2]), w * (v[j * 8 + 3] * sv[j * 8 + 3]));
+                o.z = pack_h2(w * (v[j * 8 + 4] * sv[j * 8 + 4]), w * (v[j * 8 + 5] * sv[j * 8 + 5]));
+                o.w = pack_h2(w * (v[j * 8 + 6] * sv[j * 8 + 6]), w * (v[j * 8 + 7] * sv[j * 8 + 7]));
+                *reinterpret_cast<uint4*>(yp + j * 8) = o;
+            }
+        }
+        if (A.wtc) wt_combine(A, G, act ? A.rr_row[r0 + rp] : 0, act, q, lane);
+    }
+}
+
+template <int CB, int EB>
+__device__ __forceinline__ void fc2t_w4_nm(const Expert& A, const long long* tr, int wt, int r0, int rows, int G, unsigned char* sA)
+{
+    switch ((rows + 31) / 32)
+    {
+        case 1: fc2t_w4_body<2, CB, EB>(A, tr, wt, r0, rows, G, sA); break;
+        case 2: fc2t_w4_body<4, CB, EB>(A, tr, wt, r0, rows, G, sA); break;
+        case 3: fc2t_w4_body<6, CB, EB>(A, tr, wt, r0, rows, G, sA); break;
+        case 4: fc2t_w4_body<8, CB, EB>(A, tr, wt, r0, rows, G, sA); break;
+        case 5: if constexpr (WT_NM > 8) { fc2t_w4_body<10, CB, EB>(A, tr, wt, r0, rows, G, sA); break; } [[fallthrough]];
+        case 6: if constexpr (WT_NM > 8) { fc2t_w4_body<12, CB, EB>(A, tr, wt, r0, rows, G, sA); break; } [[fallthrough]];
+        case 7: if constexpr (WT_NM > 8) { fc2t_w4_body<14, CB, EB>(A, tr, wt, r0, rows, G, sA); break; } [[fallthrough]];
+        default: if constexpr (WT_NM > 8) fc2t_w4_body<16, CB, EB>(A, tr, wt, r0, rows, G, sA); else fc2t_w4_body<8, CB, EB>(A, tr, wt, r0, rows, G, sA); break;
+    }
+}
+
+template <int EB, bool K2, int CB>
+__global__ void __launch_bounds__(WT_NTH, 1) k_pf_fc2t_w4(Expert A)
+{
+    extern __shared__ __align__(16) unsigned char smt[];
+    const int wt = A.wt_gmajor ? blockIdx.x : blockIdx.y, G = WT_HALVES * (A.wt_gmajor ? blockIdx.y : blockIdx.x);
+    if (wt >= *A.n_wtiles) return;
+    const int* w = A.wtiles + static_cast<size_t>(wt) * 3;
+    const long long* tr = A.t_tab + static_cast<size_t>(w[0]) * 6;
+    const int r0 = w[1], rows = w[2];
+    if (tr[4] == 4) fc2t_w4_nm<CB, EB>(A, tr, wt, r0, rows, G, smt);
+    else if (tr[4] == 3) fc2t_nm<3, true, CB, EB>(A, tr, wt, r0, rows, G, smt);
+    else if constexpr (K2) fc2t_nm<2, true, CB, EB>(A, tr, wt, r0, rows, G, smt);
+}
+
+// 256-thread (WT_H=1, 2 CTA/SM) L2-streaming fc2t kernel (strict 5/5 WIN on TP4 & TP6 M>=512/1024/4096).
+// L2_POL=1: evict_first weights (M=1024 / K3 M=512). L2_POL=2: evict_first weights/ysh/out + evict_last yw (M=4096 / K4 M=512).
+template <int BITS, int NM, int CB, int EB, int L2_POL>
+__device__ __forceinline__ void fc2t_h1_body(const Expert& A, const long long* tr, int wt, int r0, int rows, int G, unsigned char* sA)
+{
+    constexpr int TB = 32 * BITS, SA = F2T_SA, NCH = NM * 4 * (REC / 16);
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int prev_lane = (lane + 31) & 31;
+    const int srow = (lane >> 2) + ((lane & 1) ? 8 : 0), c = lane & 3, r = lane >> 2;
+    const int nb = static_cast<int>(tr[3]);
+    auto wptr = [&](int b) {
+        return A.t_fc2 + tr[1] + static_cast<size_t>(b) * (static_cast<size_t>(KSH) * 8 * TB) + static_cast<size_t>(G * 8 + warp) * 8 * TB;
+    };
+    const uint8_t* xsrc = A.x2 + static_cast<size_t>(wt) * WT_NM * EB * 4 * REC;
+    auto stage = [&](int b) {
+        unsigned char* d = sA + (b & 1) * SA;
+        for (int ch = t; ch < NCH; ch += 256)
+        {
+            const int mb = ch / (4 * (REC / 16)), rem = ch - mb * (4 * (REC / 16));
+            pf::cp16(d + ch * 16, xsrc + (static_cast<size_t>(mb) * EB + b) * 4 * REC + rem * 16);
+        }
+        pf::cp_commit();
+    };
+    float acc[NM][2][4];
+    #pragma unroll
+    for (int mb = 0; mb < NM; ++mb)
+        #pragma unroll
+        for (int h = 0; h < 2; ++h)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) acc[mb][h][i] = 0.f;
+    stage(0);
+    uint4 nw4_0 = make_uint4(0u, 0u, 0u, 0u), nw4_1 = make_uint4(0u, 0u, 0u, 0u);
+    u64 nw3[3] = {0, 0, 0};
+    if constexpr (BITS == 4)
+    {
+        const uint8_t* p0 = wptr(0) + lane * 16;
+        nw4_0 = tr4w_ld128_ef(p0); nw4_1 = tr4w_ld128_ef(p0 + 512);
+    }
+    else
+    {
+        const uint8_t* p0 = wptr(0) + lane * 8;
+        #pragma unroll
+        for (int n = 0; n < trw_nw<BITS>(); ++n) nw3[n] = tr4w_ld64_ef(p0 + n * 256);
+    }
+    float sprev = 1.f;
+    for (int b = 0; b < nb; ++b)
+    {
+        pf::cp_wait<0>();
+        __syncthreads();
+        if (b + 1 < nb) stage(b + 1);
+        uint4 cw4_0 = nw4_0, cw4_1 = nw4_1;
+        u64 cw3[3] = {nw3[0], nw3[1], nw3[2]};
+        if constexpr (BITS == 4)
+        {
+            if (b + 1 < nb)
+            {
+                const uint8_t* pn = wptr(b + 1) + lane * 16;
+                nw4_0 = tr4w_ld128_ef(pn); nw4_1 = tr4w_ld128_ef(pn + 512);
+            }
+        }
+        else
+        {
+            if (b + 1 < nb)
+            {
+                const uint8_t* pn = wptr(b + 1) + lane * 8;
+                #pragma unroll
+                for (int n = 0; n < trw_nw<BITS>(); ++n) nw3[n] = tr4w_ld64_ef(pn + n * 256);
+            }
+        }
+        const float sc = __half2float(A.t_v3b[(static_cast<size_t>(tr[2]) + b) * (HID / 128) + G]);
+        if (sc == 0.f) continue;
+        if (sc != sprev) wt_scale(acc, sprev / sc);
+        sprev = sc;
+        const unsigned char* sAb = sA + (b & 1) * SA;
+        const u32 w4[8] = {cw4_0.x, cw4_0.y, cw4_0.z, cw4_0.w, cw4_1.x, cw4_1.y, cw4_1.z, cw4_1.w};
+        #pragma unroll
+        for (int s = 0; s < 4; ++s)
+        {
+            u32 bf[4];
+            if constexpr (BITS == 4) wt_bfrag_w4<CB>(w4[2 * s], w4[2 * s + 1], prev_lane, bf);
+            else
+            {
+                const u32 c0 = trw_chunk<BITS>(cw3, 2 * s), c1 = trw_chunk<BITS>(cw3, 2 * s + 1);
+                const u32 b0 = __shfl_sync(0xffffffffu, c0, prev_lane), b1 = __shfl_sync(0xffffffffu, c1, prev_lane);
+                u32 p0[2], p1[2], q0[2], q1[2];
+                Tr3Lane<BITS, false, CB>::decode_m((static_cast<u64>(b0) << (8 * BITS)) | c0, 7 * BITS, p0, p1);
+                Tr3Lane<BITS, false, CB>::decode_m((static_cast<u64>(b1) << (8 * BITS)) | c1, 7 * BITS, q0, q1);
+                tr3_b8f(p0, p1, q0, q1, bf);
+            }
+            #pragma unroll
+            for (int mb = 0; mb < NM; ++mb)
+            {
+                const unsigned char* rec = sAb + (mb * 4 + s) * REC;
+                const uint4 fa = *reinterpret_cast<const uint4*>(rec + lane * 16);
+                const u32 sa = rec[512 + srow];
+                mma_mx8(acc[mb][0], fa, bf[0], bf[1], sa, 127u);
+                mma_mx8(acc[mb][1], fa, bf[2], bf[3], sa, 127u);
+            }
+        }
+    }
+    wt_scale(acc, sprev);
+    __syncthreads();
+    #pragma unroll
+    for (int mb = 0; mb < NM; ++mb)
+        #pragma unroll
+        for (int h = 0; h < 2; ++h)
+        {
+            const int row = mb * 16 + r, ch = warp * 2 + h;
+            *reinterpret_cast<u32*>(sA + row * 256 + swz16(ch, row) * 16 + 4 * c) = pack_h2(acc[mb][h][0], acc[mb][h][1]);
+            *reinterpret_cast<u32*>(sA + (row + 8) * 256 + swz16(ch, row + 8) * 16 + 4 * c) = pack_h2(acc[mb][h][2], acc[mb][h][3]);
+        }
+    __syncthreads();
+    const int pr = warp * 4 + (lane >> 3), q = lane & 7;
+    const __half* sgp = A.t_sg + HID + G * 128 + q * 16;
+    float sv[16];
+    #pragma unroll
+    for (int j = 0; j < 2; ++j)
+    {
+        const uint4 sr = *reinterpret_cast<const uint4*>(sgp + j * 8);
+        const u32 sw[4] = {sr.x, sr.y, sr.z, sr.w};
+        #pragma unroll
+        for (int e = 0; e < 4; ++e)
+        {
+            const float2 s2 = __half22float2(as_h2(sw[e]));
+            sv[j * 8 + e * 2] = s2.x; sv[j * 8 + e * 2 + 1] = s2.y;
+        }
+    }
+    // Single-fence epilogue: emit all yw passes first, then one fence before fused combine.
+    #pragma unroll 1
+    for (int p = 0; p < NM / 2; ++p)
+    {
+        if (warp * 4 + p * 32 >= rows) break;
+        const int rp = pr + p * 32;
+        const bool act = rp < rows;
+        float v[16];
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
+        {
+            const uint4 zr = act ? *reinterpret_cast<const uint4*>(sA + rp * 256 + swz16(q * 2 + j, rp) * 16) : make_uint4(0u, 0u, 0u, 0u);
+            const u32 zw[4] = {zr.x, zr.y, zr.z, zr.w};
+            #pragma unroll
+            for (int e = 0; e < 4; ++e)
+            {
+                const float2 z2 = __half22float2(as_h2(zw[e]));
+                v[j * 8 + e * 2] = z2.x; v[j * 8 + e * 2 + 1] = z2.y;
+            }
+        }
+        had128_l16(v, lane);
+        if (act)
+        {
+            const float w = A.rr_w[r0 + rp];
+            __half* yp = A.yw + static_cast<size_t>(r0 + rp) * HID + G * 128 + q * 16;
+            #pragma unroll
+            for (int j = 0; j < 2; ++j)
+            {
+                uint4 o;
+                o.x = pack_h2(w * (v[j * 8] * sv[j * 8]), w * (v[j * 8 + 1] * sv[j * 8 + 1]));
+                o.y = pack_h2(w * (v[j * 8 + 2] * sv[j * 8 + 2]), w * (v[j * 8 + 3] * sv[j * 8 + 3]));
+                o.z = pack_h2(w * (v[j * 8 + 4] * sv[j * 8 + 4]), w * (v[j * 8 + 5] * sv[j * 8 + 5]));
+                o.w = pack_h2(w * (v[j * 8 + 6] * sv[j * 8 + 6]), w * (v[j * 8 + 7] * sv[j * 8 + 7]));
+                if constexpr (L2_POL >= 2) tr4w_st128_el(yp + j * 8, o);
+                else *reinterpret_cast<uint4*>(yp + j * 8) = o;
+            }
+        }
+    }
+    if (A.wtc)
+    {
+        __threadfence();
+        __syncwarp();
+        #pragma unroll 1
+        for (int p = 0; p < NM / 2; ++p)
+        {
+            if (warp * 4 + p * 32 >= rows) break;
+            const int rp = pr + p * 32;
+            const bool act = rp < rows;
+            wt_combine_w4<L2_POL>(A, G, act ? A.rr_row[r0 + rp] : 0, act, q, lane);
+        }
+    }
+}
+
+template <int BITS, int CB, int EB, int L2_POL>
+__device__ __forceinline__ void fc2t_h1_nm(const Expert& A, const long long* tr, int wt, int r0, int rows, int G, unsigned char* sA)
+{
+    switch ((rows + 31) / 32)
+    {
+        case 1: fc2t_h1_body<BITS, 2, CB, EB, L2_POL>(A, tr, wt, r0, rows, G, sA); break;
+        case 2: fc2t_h1_body<BITS, 4, CB, EB, L2_POL>(A, tr, wt, r0, rows, G, sA); break;
+        case 3: fc2t_h1_body<BITS, 6, CB, EB, L2_POL>(A, tr, wt, r0, rows, G, sA); break;
+        default: fc2t_h1_body<BITS, 8, CB, EB, L2_POL>(A, tr, wt, r0, rows, G, sA); break;
+    }
+}
+
+template <int EB, bool K2, int CB, int L2_POL, bool SNAKE>
+__global__ void __launch_bounds__(256, 2) k_pf_fc2t_h1(Expert A)
+{
+    extern __shared__ __align__(16) unsigned char smt[];
+    const int nwt = *A.n_wtiles;
+    if (static_cast<int>(blockIdx.x) >= nwt) return;
+    const int wt = SNAKE ? ((blockIdx.y & 1) ? (nwt - 1 - static_cast<int>(blockIdx.x)) : static_cast<int>(blockIdx.x))
+                         : static_cast<int>(blockIdx.x);
+    const int G = static_cast<int>(blockIdx.y);
+    const int* w = A.wtiles + static_cast<size_t>(wt) * 3;
+    const long long* tr = A.t_tab + static_cast<size_t>(w[0]) * 6;
+    const int r0 = w[1], rows = w[2];
+    if (tr[4] == 4) fc2t_h1_nm<4, CB, EB, L2_POL>(A, tr, wt, r0, rows, G, smt);
+    else if (tr[4] == 3) fc2t_h1_nm<3, CB, EB, L2_POL>(A, tr, wt, r0, rows, G, smt);
+    else if constexpr (K2) fc2t_h1_nm<2, CB, EB, L2_POL>(A, tr, wt, r0, rows, G, smt);
+}
+
+constexpr int FC2T_H1_SMEM = 2 * F2T_SA > F2T_SZ ? 2 * F2T_SA : F2T_SZ;
+
+template <int EB, int CB, int L2_POL>
+inline void launch_fc1t_w4_impl(const Expert& A, cudaStream_t st)
+{
+    static bool attr = false;
+    if (!attr)
+    {
+        if (cudaFuncSetAttribute(k_pf_fc1t_w4<EB, false, CB, L2_POL>, cudaFuncAttributeMaxDynamicSharedMemorySize, FC1T_SMEM) != cudaSuccess ||
+            cudaFuncSetAttribute(k_pf_fc1t_w4<EB, true, CB, L2_POL>, cudaFuncAttributeMaxDynamicSharedMemorySize, FC1T_SMEM) != cudaSuccess)
+            fprintf(stderr, "bindp: k_pf_fc1t_w4 cannot take %d B of dynamic shared memory: %s\n", FC1T_SMEM, cudaGetErrorString(cudaGetLastError()));
+        attr = true;
+    }
+    const dim3 g(EB * (2 / WT_HALVES), wt_tiles(A));
+    if (A.k2) k_pf_fc1t_w4<EB, true, CB, L2_POL><<<g, WT_NTH, FC1T_SMEM, st>>>(A);
+    else k_pf_fc1t_w4<EB, false, CB, L2_POL><<<g, WT_NTH, FC1T_SMEM, st>>>(A);
+}
+
+template <int EB, int CB, int L2_POL, bool SNAKE>
+inline void launch_fc2t_h1_impl(const Expert& A, cudaStream_t st)
+{
+    static bool attr = false;
+    if (!attr)
+    {
+        if (cudaFuncSetAttribute(k_pf_fc2t_h1<EB, false, CB, L2_POL, SNAKE>, cudaFuncAttributeMaxDynamicSharedMemorySize, FC2T_H1_SMEM) != cudaSuccess ||
+            cudaFuncSetAttribute(k_pf_fc2t_h1<EB, true, CB, L2_POL, SNAKE>, cudaFuncAttributeMaxDynamicSharedMemorySize, FC2T_H1_SMEM) != cudaSuccess)
+            fprintf(stderr, "bindp: k_pf_fc2t_h1 cannot take %d B of dynamic shared memory: %s\n", FC2T_H1_SMEM, cudaGetErrorString(cudaGetLastError()));
+        attr = true;
+    }
+    const dim3 g(wt_tiles(A), HID / 128);
+    if (A.k2) k_pf_fc2t_h1<EB, true, CB, L2_POL, SNAKE><<<g, 256, FC2T_H1_SMEM, st>>>(A);
+    else k_pf_fc2t_h1<EB, false, CB, L2_POL, SNAKE><<<g, 256, FC2T_H1_SMEM, st>>>(A);
+}
+
+template <int EB, int CB>
+inline void launch_fc2t_w4_impl(const Expert& A, cudaStream_t st)
+{
+    static bool attr = false;
+    if (!attr)
+    {
+        if (cudaFuncSetAttribute(k_pf_fc2t_w4<EB, false, CB>, cudaFuncAttributeMaxDynamicSharedMemorySize, FC2T_SMEM) != cudaSuccess ||
+            cudaFuncSetAttribute(k_pf_fc2t_w4<EB, true, CB>, cudaFuncAttributeMaxDynamicSharedMemorySize, FC2T_SMEM) != cudaSuccess)
+            fprintf(stderr, "bindp: k_pf_fc2t_w4 cannot take %d B of dynamic shared memory: %s\n", FC2T_SMEM, cudaGetErrorString(cudaGetLastError()));
+        attr = true;
+    }
+    const dim3 g = A.wt_gmajor ? dim3(wt_tiles(A), HID / (128 * WT_HALVES)) : dim3(HID / (128 * WT_HALVES), wt_tiles(A));
+    if (A.k2) k_pf_fc2t_w4<EB, true, CB><<<g, WT_NTH, FC2T_SMEM, st>>>(A);
+    else k_pf_fc2t_w4<EB, false, CB><<<g, WT_NTH, FC2T_SMEM, st>>>(A);
+}
+
 template <int EB = g6nr::EB> inline void launch_fc1t(const Expert& A, cudaStream_t st)
 {
     if (!A.hq8_ready) k_pf_hq8<<<((A.M + 7) / 8 * (HID / 128) + 7) / 8, 256, 0, st>>>(A);
+    if (A.t_wide4)
+    {
+        const bool use_ef = (EB == 4 && !A.k3 && A.M >= 4096);
+        tr3_cb_dispatch(A.cb, [&](auto C) {
+            constexpr int CB = decltype(C)::value;
+            if (use_ef) launch_fc1t_w4_impl<EB, CB, 2>(A, st);
+            else launch_fc1t_w4_impl<EB, CB, 0>(A, st);
+        });
+        return;
+    }
     tr3_cb_dispatch(A.cb, [&](auto C) {
         constexpr int CB = decltype(C)::value;
         static bool attr = false;
@@ -617,6 +1285,23 @@ template <int EB = g6nr::EB> inline void launch_fc2t(const Expert& A0, cudaStrea
     Expert A = A0;
     A.wtc = wt_fused(A0) ? 1 : 0;
     if (A.wtc) cudaMemsetAsync(A.cnt_tg, 0, static_cast<size_t>(A.M) * (HID / 128) * sizeof(int), st);
+    if (A.t_wide42)
+    {
+        tr3_cb_dispatch(A.cb, [&](auto C) {
+            constexpr int CB = decltype(C)::value;
+            if constexpr (WT_HALVES == 2 && WT_NM == 8)
+            {
+                if (A.M >= 4096 || (EB == 4 && !A.k3 && A.M >= 512 && A.M < 1024))
+                    launch_fc2t_h1_impl<EB, CB, 2, true>(A, st);
+                else if (A.M >= 1024 || (EB == 4 && A.k3 && A.M >= 512))
+                    launch_fc2t_h1_impl<EB, CB, 1, false>(A, st);
+                else
+                    launch_fc2t_w4_impl<EB, CB>(A, st);
+            }
+            else launch_fc2t_w4_impl<EB, CB>(A, st);
+        });
+        return;
+    }
     tr3_cb_dispatch(A.cb, [&](auto C) {
         constexpr int CB = decltype(C)::value;
         static bool attr = false;
