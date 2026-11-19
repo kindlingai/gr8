@@ -257,8 +257,22 @@ head's API the whole time, and three 26.8K-token prompts checkpointed at 24,576 
 No request failed (0 of 53 not 200 across both scales); the drain took 0 s (the short requests had finished). Two attempts at TP=1
 without `GR8_MEM_MIN=6` stopped at boot with 6.2 and 7.1 GiB left (k2's 93 GB device image, two prefill lanes) and
 rolled back to TP=2: the requests waited 68 s and none failed, and the stored prompts hit again at TP=2. The checkpoint
-carry needs the same `CAP`, prefill rows and lanes at both widths (they are in the store's compatibility line). GLM-5.3
-4->3 and 3->4 are not measured yet.
+carry needs the same `CAP`, prefill rows and lanes at both widths (they are in the store's compatibility line).
+
+Measured on 2026-11-19 with GLM-5.3 on four DGX Sparks on a switch (`--variant bit260`, int4 KV, a persisted `ssd:`
+store of 64G per rank with `keep=sessions`, the warm model on local disk), a request every 1 s through the head's API
+during each scale (0.5 s during the rollback test), and three 32K-34K-token conversations stored before the first scale:
+
+| scale | requests waited (hold set to cleared) | entries carried | a stored prompt again |
+|---|---|---|---|
+| TP=4 -> 3, one box leaving | 77.6 s | 14 on each rank | 0.21-0.22 s (52-57 s cold at TP=3) |
+| TP=3 -> 4, the fourth box joining | 64.6 s | 17 on each rank | 0.16-0.27 s (20-22 s cold at TP=4) |
+
+No request failed (0 of 376 not 200 across both scales); the drain took 0.0-0.5 s. A scale to a width whose rank files
+are not on the boxes fetches them first, while the old width serves, within `JOIN_TIMEOUT`: the first TP=3 needed about
+60 GB per rank. A scale forced to fail after the switch (`--ready-tmo 20`) rolled back to TP=4: the requests waited
+201.0 s, most of it the new engines' 120 s orderly quit, and none failed (0 of 1305); the stored prompts hit again at
+TP=4.
 
 ## The GLM-5.3-Flash pair (TP=2)
 
